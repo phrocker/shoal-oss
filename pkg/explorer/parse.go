@@ -32,6 +32,7 @@ import (
 
 	"github.com/phrocker/shoal-oss/pkg/document"
 	"github.com/phrocker/shoal-oss/pkg/graph"
+	"github.com/phrocker/shoal-oss/pkg/interaction"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
@@ -109,6 +110,11 @@ func parseSourceWithLimits(
 			shoal.ErrorInvalidArgument, "source media type is not supported")
 	}
 	if err := validateMetadata(source.Metadata); err != nil {
+		return parsedSource{}, err
+	}
+	if _, err := interaction.ParseVisibility(
+		source.Metadata[interaction.PropertyVisibility],
+	); err != nil {
 		return parsedSource{}, err
 	}
 
@@ -473,18 +479,26 @@ func assignChildOrder(sections []document.Section, spans []document.Span) {
 
 func materializeGraph(doc document.Document, sections []document.Section,
 	spans []document.Span) ([]graph.Node, []graph.Edge) {
+	// A source declares its visibility once, in ingest metadata. Propagating
+	// it onto every content node is what lets an interaction record derive its
+	// own visibility as the conjunction over the nodes it touched, using the
+	// graph alone. A source with no declared visibility is public.
+	visibility := canonicalVisibility(doc.Metadata[interaction.PropertyVisibility])
 	nodes := []graph.Node{{
 		ID: doc.ID, Kind: "document", Labels: []string{"document"},
 		Properties: shoal.Metadata{"title": doc.Title, "revision_id": string(doc.RevisionID)},
 	}}
+	setVisibility(nodes[0].Properties, visibility)
 	edges := make([]graph.Edge, 0, len(sections)+len(spans))
 	for _, section := range sections {
+		properties := shoal.Metadata{
+			"heading": section.Heading, "document_id": string(doc.ID),
+			"revision_id": string(doc.RevisionID),
+		}
+		setVisibility(properties, visibility)
 		nodes = append(nodes, graph.Node{
 			ID: section.ID, Kind: "section", Labels: []string{"section"},
-			Properties: shoal.Metadata{
-				"heading": section.Heading, "document_id": string(doc.ID),
-				"revision_id": string(doc.RevisionID),
-			},
+			Properties: properties,
 		})
 		parent := section.ParentID
 		if parent == "" {
@@ -493,16 +507,36 @@ func materializeGraph(doc document.Document, sections []document.Section,
 		edges = append(edges, containsEdge(parent, section.ID))
 	}
 	for _, span := range spans {
+		properties := shoal.Metadata{
+			"document_id": string(doc.ID), "revision_id": string(doc.RevisionID),
+			"section_id": string(span.SectionID),
+		}
+		setVisibility(properties, visibility)
 		nodes = append(nodes, graph.Node{
 			ID: span.ID, Kind: "span", Labels: []string{"evidence"},
-			Properties: shoal.Metadata{
-				"document_id": string(doc.ID), "revision_id": string(doc.RevisionID),
-				"section_id": string(span.SectionID),
-			},
+			Properties: properties,
 		})
 		edges = append(edges, containsEdge(span.SectionID, span.ID))
 	}
 	return nodes, edges
+}
+
+func setVisibility(properties shoal.Metadata, expression string) {
+	if expression == "" {
+		return
+	}
+	properties[interaction.PropertyVisibility] = expression
+}
+
+// canonicalVisibility normalizes a declared visibility expression. parseSource
+// has already rejected malformed declarations, so an error here is impossible
+// and is treated as public.
+func canonicalVisibility(expression string) string {
+	labels, err := interaction.ParseVisibility(expression)
+	if err != nil {
+		return ""
+	}
+	return interaction.Expression(labels)
 }
 
 func containsEdge(from, to shoal.ID) graph.Edge {

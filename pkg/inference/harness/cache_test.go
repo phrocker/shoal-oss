@@ -106,7 +106,7 @@ func TestCacheRejectsUnsafeSecretMaterial(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	g, err := NewCachedGenerator(runner, &fakeTools{pack: pack}, budgets(), provenance, nil, cache)
+	g, err := NewCachedGenerator(runner, &fakeTools{pack: pack}, budgets(), provenance, &captureRecorder{}, cache)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -371,7 +371,7 @@ func cachedGeneratorWithIdentity(t *testing.T, runner Runner, pack inference.Con
 	if err != nil {
 		t.Fatal(err)
 	}
-	g, err := NewCachedGenerator(runner, &fakeTools{pack: pack}, b, provenance, nil, cache)
+	g, err := NewCachedGenerator(runner, &fakeTools{pack: pack}, b, provenance, &captureRecorder{}, cache)
 	if err != nil {
 		t.Fatal(err)
 	}

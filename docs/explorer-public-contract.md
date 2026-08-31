@@ -100,6 +100,46 @@ or retaining an unwrapped client remains an explicitly unauthenticated path.
   final nodes by raw node ID and edges by raw edge ID. It does not return
   paths.
 
+## Reserved `interaction.*` namespace
+
+Interaction provenance lives in the same corpus as content, under a reserved
+node-kind and edge-type namespace. Phase 1 of issue #266 defines:
+
+- Node kinds `interaction.session`, `interaction.turn`, `interaction.tool_call`,
+  and `interaction.tombstone`. Content MUST NOT use the `interaction.` kind
+  prefix; ingest and `Connect` reject it.
+- Edge types `interaction.has_turn`, `interaction.has_tool_call`,
+  `interaction.retrieved`, and `interaction.cited`. Retrieved and cited are
+  distinct: retrieval records everything the model was shown, citation records
+  only what the answer referenced. Recording citations alone would understate
+  exposure.
+- Retrieval and graph expansion exclude interaction nodes by default. An
+  interaction node is returned by `Neighborhood` or `BoundedNeighborhood` only
+  when it was an explicit seed in the request, and never by `Retrieve`. The
+  exclusion lives in the retrieval path itself, not in caller convention, so a
+  model cannot cite its own prior output as source evidence.
+- `Interactions` and `InteractionSubgraph` are the explicit, kind-scoped entry
+  points for reading interaction provenance.
+- The `shoal.visibility` property of an interaction node is the conjunction of
+  every visibility label of every source node the session touched, retrieved as
+  well as cited. It is never derived from the asker's grant set, because that
+  would turn a highly cleared asker's session into a covert channel. An
+  unresolvable touched node fails the record rather than defaulting to public.
+  A reviewed declassification path is deferred to a later phase.
+- Capture is part of serving an inference. `EnsureInteractionSink` reports at
+  setup time whether a corpus can durably record interactions; a read-only or
+  offline corpus refuses `ask` outright with a clear diagnostic rather than
+  failing at first write. A recording failure fails the request.
+- Retention is explicit deletion only; there is no TTL. `DeleteInteraction`
+  replaces a session's nodes and edges with an `interaction.tombstone` node
+  carrying the original visibility, so the deletion is itself auditable. A
+  deleted session ID can never be reused.
+- Interaction nodes and edges are excluded from the content snapshot hash, so
+  concurrent capture never invalidates a pinned snapshot.
+- Interaction records are redacted by construction: they carry identities,
+  digests, counts, and source node IDs, never the question, prompt, answer,
+  evidence text, or model-chosen correlation strings.
+
 ## Retrieval requests
 
 ### Normalization and limits

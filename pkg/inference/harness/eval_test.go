@@ -364,7 +364,7 @@ func evalGenerator(t *testing.T, runner Runner, now time.Time, provenance Proven
 		MaxSteps: 4, MaxElapsed: time.Second, MaxInputTokens: 1_000_000, MaxOutputTokens: 10_000,
 		MaxEvidence: 4, MaxGraphHops: 1, MaxGraphNodes: 4, MaxFanout: 1, MaxRepeatedAction: 1,
 	}
-	g, err := NewGenerator(runner, emptyRetrieveTools{}, b, provenance, nil)
+	g, err := NewGenerator(runner, emptyRetrieveTools{}, b, provenance, &captureRecorder{})
 	if err != nil {
 		t.Fatal(err)
 	}

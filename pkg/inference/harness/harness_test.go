@@ -491,12 +491,12 @@ func TestEvidenceBudgetCannotExceedInferenceContract(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := NewGenerator(NewFakeRunner(), &fakeTools{}, b, provenance, nil); !errors.Is(err, ErrInvalid) {
+	if _, err := NewGenerator(NewFakeRunner(), &fakeTools{}, b, provenance, &captureRecorder{}); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("oversized evidence budget error = %v", err)
 	}
 	b = budgets()
 	b.MaxFanout = int(maxUint32Value) + 1
-	if _, err := NewGenerator(NewFakeRunner(), &fakeTools{}, b, provenance, nil); !errors.Is(err, ErrInvalid) {
+	if _, err := NewGenerator(NewFakeRunner(), &fakeTools{}, b, provenance, &captureRecorder{}); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("oversized graph budget error = %v", err)
 	}
 	if uint32RepresentableProduct(int(maxUint32Value), int(maxUint32Value)) {
@@ -690,7 +690,7 @@ func newGeneratorWithBudgets(t *testing.T, runner Runner, tools ToolHost, b Budg
 	if err != nil {
 		t.Fatal(err)
 	}
-	g, err := NewGenerator(runner, tools, b, p, nil)
+	g, err := NewGenerator(runner, tools, b, p, &captureRecorder{})
 	if err != nil {
 		t.Fatal(err)
 	}
