@@ -36,6 +36,7 @@ type rankedSpan struct {
 	record      *persistedDocument
 	span        document.Span
 	score       shoal.Score
+	space       string
 	lexical     shoal.Score
 	tree        shoal.Score
 	graph       shoal.Score
@@ -89,35 +90,47 @@ func (e *Explorer) retrieve(
 		return retrieval.Response{}, shoal.NewError(
 			shoal.ErrorInvalidArgument, "retrieval text has no searchable terms")
 	}
-	var (
-		queryProvenance persistedEmbeddingProvenance
-		queryVector     []float32
-	)
-	if hasVector {
-		e.mu.RLock()
-		if err := e.requireOpen(); err != nil {
-			e.mu.RUnlock()
-			return retrieval.Response{}, err
-		}
-		e.mu.RUnlock()
-		queryProvenance, queryVector, err = e.embedQuery(ctx, request.Text)
-		if err != nil {
-			return retrieval.Response{}, err
-		}
-	}
-
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 	if err := e.requireOpen(); err != nil {
 		return retrieval.Response{}, err
 	}
-	if hasVector {
-		if err := e.ensureEmbeddingSpaceCompatibleLocked(queryProvenance); err != nil {
-			return retrieval.Response{}, err
-		}
-	}
 	documentScope := idSet(request.Scope.DocumentIDs)
 	nodeScope := idSet(request.Scope.NodeIDs)
+	queryVectors := map[string][]float32{}
+	participatingSpaces := []persistedEmbeddingProvenance{}
+	if hasVector {
+		spacesByIdentity, err := e.embeddingSpacesForScanLocked(documentScope, nodeScope)
+		if err != nil {
+			return retrieval.Response{}, err
+		}
+		if len(spacesByIdentity) > e.maxEmbeddingSpaceFanout {
+			return retrieval.Response{}, shoal.NewError(
+				shoal.ErrorUnavailable,
+				"vector retrieval spans too many embedding spaces",
+			)
+		}
+		spaceKeys := make([]string, 0, len(spacesByIdentity))
+		for identity := range spacesByIdentity {
+			spaceKeys = append(spaceKeys, identity)
+		}
+		sort.Strings(spaceKeys)
+		for _, identity := range spaceKeys {
+			space := spacesByIdentity[identity]
+			_, vector, err := e.embedQueryInSpace(ctx, request.Text, space)
+			if err != nil {
+				return retrieval.Response{}, err
+			}
+			queryVectors[identity] = vector
+			participatingSpaces = append(participatingSpaces, space)
+		}
+		if len(participatingSpaces) == 0 {
+			if _, _, err := e.embedQuery(ctx, request.Text); err != nil {
+				return retrieval.Response{}, err
+			}
+		}
+	}
+	mixedVectorSpaces := hasVector && len(participatingSpaces) > 1
 	var ranked []rankedSpan
 	for documentID, revisions := range e.documents {
 		if len(documentScope) > 0 {
@@ -164,12 +177,6 @@ func (e *Explorer) retrieve(
 					"vector retrieval requires embeddings for every eligible span",
 				)
 			}
-			if record.Embeddings.Provenance != queryProvenance {
-				return retrieval.Response{}, incompatibleEmbeddingSpaceError(
-					queryProvenance,
-					record.Embeddings.Provenance,
-				)
-			}
 			spanEmbeddings, err = recordEmbeddingMap(record)
 			if err != nil {
 				return retrieval.Response{}, err
@@ -206,6 +213,13 @@ func (e *Explorer) retrieve(
 						"stored span embeddings are stale or incomplete",
 					)
 				}
+				queryVector := queryVectors[record.Embeddings.Provenance.Identity]
+				if len(queryVector) == 0 {
+					return retrieval.Response{}, shoal.NewError(
+						shoal.ErrorUnavailable,
+						"embedding provider for stored space is unavailable",
+					)
+				}
 				vectorScoreValue, err = vectorScore(queryVector, embedding.Vector)
 				if err != nil {
 					return retrieval.Response{}, err
@@ -222,18 +236,23 @@ func (e *Explorer) retrieve(
 			}
 			ranked = append(ranked, rankedSpan{
 				record: record, span: span, score: score,
+				space:   recordEmbeddingSpace(record),
 				lexical: lexical, tree: treeScore, graph: graphScore,
 				vector: vectorScoreValue,
 				path:   path, activeModes: modes,
 			})
 		}
 	}
-	sort.Slice(ranked, func(i, j int) bool {
-		if ranked[i].score != ranked[j].score {
-			return ranked[i].score > ranked[j].score
-		}
-		return shoal.CompareID(ranked[i].span.ID, ranked[j].span.ID) < 0
-	})
+	if mixedVectorSpaces {
+		applyRankFusion(ranked)
+	} else {
+		sort.Slice(ranked, func(i, j int) bool {
+			if ranked[i].score != ranked[j].score {
+				return ranked[i].score > ranked[j].score
+			}
+			return shoal.CompareID(ranked[i].span.ID, ranked[j].span.ID) < 0
+		})
+	}
 	topK := request.TopK
 	if uint64(topK) < uint64(len(ranked)) {
 		ranked = ranked[:int(topK)]
@@ -270,7 +289,8 @@ func (e *Explorer) retrieve(
 			result.Explanation = &retrieval.Explanation{
 				Modes: append([]retrieval.Mode(nil), match.activeModes...),
 				Summary: "ranked source span using analyzer " + analyzer.Version() +
-					" and scorer " + scorer.Version(),
+					" and scorer " + scorer.Version() +
+					vectorExplainSuffix(hasVector, mixedVectorSpaces, participatingSpaces, e.recallEvidence),
 				Scores: scores,
 			}
 		}
@@ -403,6 +423,124 @@ func pathSearchText(path graph.Path, quote string) string {
 		text.WriteString(edge.Type)
 	}
 	return text.String()
+}
+
+func (e *Explorer) embeddingSpacesForScanLocked(
+	documentScope map[shoal.ID]struct{},
+	nodeScope map[shoal.ID]struct{},
+) (map[string]persistedEmbeddingProvenance, error) {
+	spaces := map[string]persistedEmbeddingProvenance{}
+	for documentID, revisions := range e.documents {
+		if len(documentScope) > 0 {
+			if _, ok := documentScope[documentID]; !ok {
+				continue
+			}
+		}
+		record, err := latestRevision(revisions)
+		if err != nil {
+			return nil, err
+		}
+		if record == nil || len(record.Spans) == 0 {
+			continue
+		}
+		if len(nodeScope) > 0 {
+			sectionByID := make(map[shoal.ID]document.Section, len(record.Sections))
+			for _, section := range record.Sections {
+				sectionByID[section.ID] = section
+			}
+			recordEligible := false
+			for _, span := range record.Spans {
+				if spanInNodeScope(record, sectionByID, span, nodeScope) {
+					recordEligible = true
+					break
+				}
+			}
+			if !recordEligible {
+				continue
+			}
+		}
+		if record.Embeddings == nil {
+			return nil, shoal.NewError(
+				shoal.ErrorUnavailable,
+				"vector retrieval requires embeddings for every eligible span",
+			)
+		}
+		if _, err := recordEmbeddingMap(record); err != nil {
+			return nil, err
+		}
+		spaces[record.Embeddings.Provenance.Identity] = record.Embeddings.Provenance
+	}
+	return spaces, nil
+}
+
+func recordEmbeddingSpace(record *persistedDocument) string {
+	if record == nil || record.Embeddings == nil {
+		return ""
+	}
+	return record.Embeddings.Provenance.Identity
+}
+
+func applyRankFusion(ranked []rankedSpan) {
+	bySpace := map[string][]int{}
+	for i := range ranked {
+		bySpace[ranked[i].space] = append(bySpace[ranked[i].space], i)
+	}
+	for _, indexes := range bySpace {
+		sort.SliceStable(indexes, func(i, j int) bool {
+			left, right := ranked[indexes[i]], ranked[indexes[j]]
+			if left.score != right.score {
+				return left.score > right.score
+			}
+			return shoal.CompareID(left.span.ID, right.span.ID) < 0
+		})
+		for rank, index := range indexes {
+			ranked[index].score = shoal.Score(1.0 / float64(60+rank+1))
+		}
+	}
+	sort.Slice(ranked, func(i, j int) bool {
+		if ranked[i].score != ranked[j].score {
+			return ranked[i].score > ranked[j].score
+		}
+		return shoal.CompareID(ranked[i].span.ID, ranked[j].span.ID) < 0
+	})
+}
+
+func vectorExplainSuffix(
+	hasVector bool,
+	mixed bool,
+	spaces []persistedEmbeddingProvenance,
+	recallEvidence map[string]string,
+) string {
+	if !hasVector {
+		return ""
+	}
+	suffix := "; embedding_spaces=" + strconv.Itoa(len(spaces))
+	if mixed {
+		suffix += "; vector_merge=rank-fusion"
+		if !allSpacesHaveRecallEvidence(spaces, recallEvidence) {
+			suffix += "; recall=unbenchmarked; no recall claim"
+		} else {
+			suffix += "; recall=per-space evidence present"
+		}
+	} else {
+		suffix += "; vector_merge=score"
+	}
+	return suffix
+}
+
+func allSpacesHaveRecallEvidence(
+	spaces []persistedEmbeddingProvenance,
+	recallEvidence map[string]string,
+) bool {
+	if len(spaces) == 0 || len(recallEvidence) == 0 {
+		return false
+	}
+	for _, space := range spaces {
+		if strings.TrimSpace(recallEvidence[space.Identity]) == "" {
+			return false
+		}
+	}
+	return true
 }
 
 func idSet(ids []shoal.ID) map[shoal.ID]struct{} {

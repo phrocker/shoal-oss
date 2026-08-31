@@ -321,6 +321,26 @@ func (e *Engine) SetTableStorageFormat(tableName string, format StorageFormat) e
 	return tbl.setFileFormat(tablet.FileFormat(parsed))
 }
 
+func (e *Engine) SetTableTargetEmbeddingSpace(tableName, identity string) error {
+	e.mu.RLock()
+	tbl, ok := e.tables[tableName]
+	e.mu.RUnlock()
+	if !ok {
+		return fmt.Errorf("engine: table %q not found", tableName)
+	}
+	return tbl.setTargetEmbedding(identity)
+}
+
+func (e *Engine) TableTargetEmbeddingSpace(tableName string) (string, error) {
+	e.mu.RLock()
+	tbl, ok := e.tables[tableName]
+	e.mu.RUnlock()
+	if !ok {
+		return "", fmt.Errorf("engine: table %q not found", tableName)
+	}
+	return tbl.targetEmbedding(), nil
+}
+
 // MigrateTableStorageFormat atomically selects the write format, flushes, and
 // compacts a table so concurrent migrations cannot report a format they did
 // not persist.

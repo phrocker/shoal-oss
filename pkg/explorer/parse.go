@@ -580,6 +580,17 @@ func cloneMetadata(metadata shoal.Metadata) shoal.Metadata {
 	return clone
 }
 
+func cloneStringMap(values map[string]string) map[string]string {
+	if values == nil {
+		return nil
+	}
+	clone := make(map[string]string, len(values))
+	for key, value := range values {
+		clone[key] = value
+	}
+	return clone
+}
+
 func canonicalMetadata(metadata shoal.Metadata) string {
 	keys := make([]string, 0, len(metadata))
 	for key := range metadata {

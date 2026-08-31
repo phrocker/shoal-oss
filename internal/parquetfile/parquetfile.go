@@ -6,6 +6,7 @@ import (
 	"io"
 
 	"github.com/parquet-go/parquet-go"
+	"github.com/phrocker/shoal-oss/internal/embeddingspace"
 	"github.com/phrocker/shoal-oss/internal/iterrt"
 	"github.com/phrocker/shoal-oss/internal/rfile/wire"
 )
@@ -17,6 +18,7 @@ type EncodeOptions struct {
 	PageBufferSize  int
 	Check           func() error
 	Observe         func(int64)
+	EmbeddingSpace  embeddingspace.FileState
 }
 
 // Cell is the Parquet representation of one Accumulo key/value entry.
@@ -57,8 +59,7 @@ func EncodeToWithOptions(w io.Writer, iter iterrt.SortedKeyValueIterator, opts E
 	if pageBufferSize <= 0 {
 		pageBufferSize = 64 << 10
 	}
-	writer := parquet.NewGenericWriter[Cell](
-		w,
+	writerOptions := []parquet.WriterOption{
 		parquet.MaxRowsPerRowGroup(rowsPerGroup),
 		parquet.PageBufferSize(pageBufferSize),
 		parquet.BloomFilters(parquet.SplitBlockFilter(10, "row")),
@@ -70,7 +71,16 @@ func EncodeToWithOptions(w io.Writer, iter iterrt.SortedKeyValueIterator, opts E
 			parquet.Descending("timestamp"),
 			parquet.Descending("deleted"),
 		)),
-	)
+	}
+	if opts.EmbeddingSpace.State != "" {
+		encoded, err := embeddingspace.Encode(opts.EmbeddingSpace)
+		if err != nil {
+			return 0, fmt.Errorf("parquet: encode embedding metadata: %w", err)
+		}
+		writerOptions = append(writerOptions,
+			parquet.KeyValueMetadata(embeddingspace.ParquetMetadataKey, string(encoded)))
+	}
+	writer := parquet.NewGenericWriter[Cell](w, writerOptions...)
 	var count int64
 	batch := make([]Cell, 0, 512)
 	writeBatch := func() error {
@@ -124,6 +134,22 @@ func EncodeToWithOptions(w io.Writer, iter iterrt.SortedKeyValueIterator, opts E
 		return count, fmt.Errorf("parquet: close writer: %w", err)
 	}
 	return count, nil
+}
+
+func ReadEmbeddingSpaceMetadata(src io.ReaderAt, size int64) (embeddingspace.FileState, error) {
+	file, err := parquet.OpenFile(src, size, parquet.ReadBufferSize(64<<10))
+	if err != nil {
+		return embeddingspace.FileState{}, fmt.Errorf("parquet: open file: %w", err)
+	}
+	value, ok := file.Lookup(embeddingspace.ParquetMetadataKey)
+	if !ok {
+		return embeddingspace.Unknown(), nil
+	}
+	state, err := embeddingspace.Decode([]byte(value))
+	if err != nil {
+		return embeddingspace.FileState{}, fmt.Errorf("parquet: parse embedding metadata: %w", err)
+	}
+	return state, nil
 }
 
 // Decode reads a Parquet image into an immutable sorted cell slice.

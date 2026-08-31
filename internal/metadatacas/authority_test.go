@@ -10,6 +10,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/phrocker/shoal-oss/internal/cclient"
+	"github.com/phrocker/shoal-oss/internal/embeddingspace"
 	"github.com/phrocker/shoal-oss/internal/ingestclient"
 	"github.com/phrocker/shoal-oss/internal/ingestrouter"
 	"github.com/phrocker/shoal-oss/internal/metadata"
@@ -84,7 +85,23 @@ func (f *fakeCluster) LocateTable(_ context.Context, tableID string) ([]metadata
 			info.Files = append(info.Files, metadata.FileEntry{
 				Path: file.Path, StartRow: file.StartRow, EndRow: file.EndRow,
 				Size: size, NumEntries: entries, Time: tm, RawQualifier: []byte(cq),
+				Embedding: embeddingspace.NoEmbeddings(),
 			})
+		}
+	}
+	for key, value := range f.cells {
+		cf, cq := splitCell(key)
+		if cf != metadata.CFFileEmbedding {
+			continue
+		}
+		state, err := embeddingspace.Decode(value)
+		if err != nil {
+			return nil, err
+		}
+		for i := range info.Files {
+			if string(info.Files[i].RawQualifier) == cq {
+				info.Files[i].Embedding = state
+			}
 		}
 	}
 	return []metadata.TabletInfo{info}, nil
@@ -282,6 +299,7 @@ func TestAuthorityConcurrentReferencesAndAmbiguousMincCommit(t *testing.T) {
 	file := mincauthority.DataFile{
 		Path: "file:///tables/5/t-1/F0001.rf", Format: "rfile",
 		Size: 42, Entries: 8, StartRow: []byte("a"), EndRow: []byte("z"),
+		Embedding: embeddingspace.Has("space-a"),
 	}
 	outcome, err := authority.Commit(context.Background(), mincauthority.MetadataCommit{
 		Extent: authority.extent, Fence: fence, File: file, RemoveWALs: refs,
@@ -296,6 +314,20 @@ func TestAuthorityConcurrentReferencesAndAmbiguousMincCommit(t *testing.T) {
 	}
 	if len(state.Files[0].StartRow) != 0 || len(state.Files[0].EndRow) != 0 {
 		t.Fatalf("minor compaction installed a fenced file reference: %#v", state.Files[0])
+	}
+	if state.Files[0].Embedding != embeddingspace.Has("space-a") {
+		t.Fatalf("embedding metadata = %+v", state.Files[0].Embedding)
+	}
+	fileQualifier, _, err := encodeFile(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cluster.mu.Lock()
+	_, fileColumn := cluster.cells[cell(metadata.CFFile, string(fileQualifier))]
+	embeddingColumn := cluster.cells[cell(metadata.CFFileEmbedding, string(fileQualifier))]
+	cluster.mu.Unlock()
+	if !fileColumn || len(embeddingColumn) == 0 {
+		t.Fatalf("file and embedding columns were not committed atomically: file=%t embedding=%q", fileColumn, embeddingColumn)
 	}
 }
 

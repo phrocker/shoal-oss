@@ -40,6 +40,7 @@ import (
 	"fmt"
 	"io"
 
+	"github.com/phrocker/shoal-oss/internal/embeddingspace"
 	"github.com/phrocker/shoal-oss/internal/iterrt"
 	"github.com/phrocker/shoal-oss/internal/parquetfile"
 	"github.com/phrocker/shoal-oss/internal/rfile"
@@ -57,9 +58,13 @@ import (
 // a bytes.Reader). A streaming variant is a later optimisation; it does
 // not change the composer's contract.
 type Input struct {
-	Name   string
-	Bytes  []byte
-	Format string
+	Name string
+	// MetadataEmbedding is the authoritative metadata-table state for this
+	// file when the caller has it. If present, it must agree with the file
+	// footer before the input is used.
+	MetadataEmbedding embeddingspace.FileState
+	Bytes             []byte
+	Format            string
 }
 
 // Spec describes a single compaction unit fully: the inputs, the
@@ -211,6 +216,10 @@ func CompactContext(ctx context.Context, spec Spec, observe func(Progress)) (*Re
 		return nil, err
 	}
 	defer closer.Close()
+	outputEmbedding, err := mergedInputEmbeddingSpace(spec.Inputs)
+	if err != nil {
+		return nil, err
+	}
 
 	if spec.OutputFormat == "parquet" {
 		var buf bytes.Buffer
@@ -224,6 +233,7 @@ func CompactContext(ctx context.Context, spec Spec, observe func(Progress)) (*Re
 						observe(Progress{EntriesWritten: written})
 					}
 				},
+				EmbeddingSpace: outputEmbedding,
 			},
 		)
 		if err != nil {
@@ -244,6 +254,7 @@ func CompactContext(ctx context.Context, spec Spec, observe func(Progress)) (*Re
 		Codec:           codec,
 		BlockSize:       spec.BlockSize,
 		AdjacencyEdgeCF: spec.AdjacencyEdgeCF,
+		EmbeddingSpace:  outputEmbedding,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("compaction: new writer: %w", err)
@@ -271,6 +282,53 @@ func CompactContext(ctx context.Context, spec Spec, observe func(Progress)) (*Re
 		return nil, fmt.Errorf("compaction: close writer: %w", err)
 	}
 	return &Result{Output: buf.Bytes(), EntriesWritten: written}, nil
+}
+
+func mergedInputEmbeddingSpace(inputs []Input) (embeddingspace.FileState, error) {
+	if len(inputs) == 0 {
+		return embeddingspace.NoEmbeddings(), nil
+	}
+	states := make([]embeddingspace.FileState, 0, len(inputs))
+	for _, in := range inputs {
+		state, err := inputEmbeddingSpace(in)
+		if err != nil {
+			return embeddingspace.FileState{}, err
+		}
+		if in.MetadataEmbedding.State != "" {
+			if err := embeddingspace.VerifyMetadataMatchesFooter(in.MetadataEmbedding, state); err != nil {
+				return embeddingspace.FileState{}, err
+			}
+			state = in.MetadataEmbedding
+		}
+		states = append(states, state)
+	}
+	return embeddingspace.Compatible("merge embedding spaces", states...)
+}
+
+func inputEmbeddingSpace(in Input) (embeddingspace.FileState, error) {
+	if len(in.Bytes) == 0 {
+		return embeddingspace.FileState{}, fmt.Errorf("compaction: input %q is empty", in.Name)
+	}
+	format := in.Format
+	if format == "" && len(in.Name) >= len(".parquet") && in.Name[len(in.Name)-len(".parquet"):] == ".parquet" {
+		format = "parquet"
+	}
+	if format == "parquet" {
+		return parquetfile.ReadEmbeddingSpaceMetadata(bytes.NewReader(in.Bytes), int64(len(in.Bytes)))
+	}
+	if format != "" && format != "rfile" {
+		return embeddingspace.FileState{}, fmt.Errorf("compaction: unknown input format %q for %q", format, in.Name)
+	}
+	bc, err := bcfile.NewReader(bytes.NewReader(in.Bytes), int64(len(in.Bytes)))
+	if err != nil {
+		return embeddingspace.FileState{}, fmt.Errorf("compaction: bcfile open %q: %w", in.Name, err)
+	}
+	r, err := rfile.Open(bc, block.Default())
+	if err != nil {
+		return embeddingspace.FileState{}, fmt.Errorf("compaction: rfile open %q: %w", in.Name, err)
+	}
+	defer r.Close()
+	return r.EmbeddingSpace(), nil
 }
 
 // StreamCells drains the compaction source for spec — the merged,

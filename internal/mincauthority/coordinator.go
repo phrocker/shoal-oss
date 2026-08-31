@@ -34,6 +34,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/phrocker/shoal-oss/internal/embeddingspace"
 	"github.com/phrocker/shoal-oss/internal/ingestrouter"
 	"github.com/phrocker/shoal-oss/internal/rfile"
 	"github.com/phrocker/shoal-oss/internal/rfile/bcfile"
@@ -66,6 +67,7 @@ type Snapshot struct {
 	Fence       ingestrouter.Fence
 	Boundary    int64
 	TabletTime  string
+	Embedding   embeddingspace.FileState
 	Cells       []Cell
 	CoveredWALs []walauthority.Reference
 }
@@ -92,6 +94,7 @@ type DataFile struct {
 	Size       int64
 	Entries    int64
 	Checksum   string
+	Embedding  embeddingspace.FileState
 	StartRow   []byte
 	EndRow     []byte
 	SnapshotID string
@@ -238,10 +241,17 @@ func (c *Coordinator) Run(ctx context.Context, operationID string) (DataFile, er
 		if err != nil {
 			return DataFile{}, err
 		}
+		if snapshot.Embedding.State == "" {
+			snapshot.Embedding = embeddingspace.NoEmbeddings()
+		}
 		if err := validateSnapshot(snapshot, c.cfg.Extent, c.cfg.Fence); err != nil {
 			return DataFile{}, err
 		}
-		encoded, err = encodeSnapshot(snapshot, c.cfg.WriterOptions)
+		writerOptions := c.cfg.WriterOptions
+		if writerOptions.EmbeddingSpace.State == "" {
+			writerOptions.EmbeddingSpace = snapshot.Embedding
+		}
+		encoded, err = encodeSnapshot(snapshot, writerOptions)
 		if err != nil {
 			return DataFile{}, err
 		}
@@ -463,6 +473,9 @@ func validateSnapshot(s Snapshot, extent ingestrouter.Extent, fence ingestrouter
 			return fmt.Errorf("%w: row %x outside extent", ErrInvalidSnapshot, cell.Key.Row)
 		}
 	}
+	if err := s.Embedding.Validate(); err != nil {
+		return fmt.Errorf("%w: embedding state: %v", ErrInvalidSnapshot, err)
+	}
 	return nil
 }
 
@@ -500,7 +513,8 @@ func describeFile(outputPath string, snapshot Snapshot, data []byte) DataFile {
 	}
 	return DataFile{
 		Path: outputPath, Format: "rfile", Size: int64(len(data)), Entries: int64(len(snapshot.Cells)),
-		Checksum: hex.EncodeToString(sum[:]), StartRow: start, EndRow: end,
+		Checksum: hex.EncodeToString(sum[:]), Embedding: snapshot.Embedding,
+		StartRow: start, EndRow: end,
 		SnapshotID: snapshot.ID, Boundary: snapshot.Boundary,
 	}
 }
@@ -565,7 +579,7 @@ func cloneFile(in DataFile) DataFile {
 
 func equalFile(a, b DataFile) bool {
 	return a.Path == b.Path && a.Format == b.Format && a.Size == b.Size &&
-		a.Entries == b.Entries && a.Checksum == b.Checksum &&
+		a.Entries == b.Entries && a.Checksum == b.Checksum && a.Embedding == b.Embedding &&
 		bytes.Equal(a.StartRow, b.StartRow) && bytes.Equal(a.EndRow, b.EndRow) &&
 		a.SnapshotID == b.SnapshotID && a.Boundary == b.Boundary
 }

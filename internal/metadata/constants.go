@@ -8,7 +8,8 @@ const (
 
 // Column-family + qualifier names from core/.../metadata/schema/MetadataSchema.java.
 const (
-	CFFile            = "file"   // DataFileColumnFamily.STR_NAME
+	CFFile            = "file" // DataFileColumnFamily.STR_NAME
+	CFFileEmbedding   = "file.embedding"
 	CFCurrentLocation = "loc"    // CurrentLocationColumnFamily.STR_NAME
 	CFFutureLocation  = "future" // FutureLocationColumnFamily.STR_NAME
 	CFLog             = "log"    // LogColumnFamily.STR_NAME

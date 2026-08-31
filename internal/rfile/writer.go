@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 
+	"github.com/phrocker/shoal-oss/internal/embeddingspace"
 	"github.com/phrocker/shoal-oss/internal/rfile/adjacency"
 	"github.com/phrocker/shoal-oss/internal/rfile/bcfile"
 	"github.com/phrocker/shoal-oss/internal/rfile/bcfile/block"
@@ -139,6 +140,11 @@ type WriterOptions struct {
 	// not a replacement, so Scan/compaction/parity are unaffected. Empty
 	// produces no adjacency block (stock behavior).
 	AdjacencyEdgeCF string
+
+	// EmbeddingSpace records this file's vector-space state in a small
+	// file-level metadata block. Zero leaves the state unknown for legacy
+	// callers that cannot assert whether the file carries embeddings.
+	EmbeddingSpace embeddingspace.FileState
 }
 
 // NewWriter constructs a Writer over out.
@@ -354,6 +360,16 @@ func (w *Writer) Close() error {
 		}
 		if _, err := w.out.AppendMetaBlock(blockmeta.MetaBlockName, block.CodecNone, bmBuf.Bytes(), int64(bmBuf.Len())); err != nil {
 			return fmt.Errorf("rfile.Close: register %q meta block: %w", blockmeta.MetaBlockName, err)
+		}
+	}
+
+	if w.opts.EmbeddingSpace.State != "" {
+		encoded, err := embeddingspace.Encode(w.opts.EmbeddingSpace)
+		if err != nil {
+			return fmt.Errorf("rfile.Close: encode %q: %w", embeddingspace.RFileMetaBlockName, err)
+		}
+		if _, err := w.out.AppendMetaBlock(embeddingspace.RFileMetaBlockName, block.CodecNone, encoded, int64(len(encoded))); err != nil {
+			return fmt.Errorf("rfile.Close: register %q meta block: %w", embeddingspace.RFileMetaBlockName, err)
 		}
 	}
 

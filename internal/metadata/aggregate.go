@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 
+	"github.com/phrocker/shoal-oss/internal/embeddingspace"
 	"github.com/phrocker/shoal-oss/internal/thrift/gen/data"
 )
 
@@ -46,6 +47,9 @@ func AggregateRows(kvs []*data.TKeyValue) ([]TabletInfo, error) {
 		}
 		tableID, endRow, err := DecodeTabletRow(curRow)
 		if err != nil {
+			return fmt.Errorf("row %q: %w", curRow, err)
+		}
+		if err := finalizeFileEmbeddings(&current); err != nil {
 			return fmt.Errorf("row %q: %w", curRow, err)
 		}
 		current.TableID = tableID
@@ -138,6 +142,12 @@ func applyColumn(t *TabletInfo, kv *data.TKeyValue) error {
 		}
 		// Copy cq so the FileEntry doesn't alias the Thrift buffer.
 		raw := append([]byte(nil), cq...)
+		embedding := embeddingspace.NoEmbeddings()
+		if t.fileEmbeddings != nil {
+			if state, ok := t.fileEmbeddings[string(raw)]; ok {
+				embedding = state
+			}
+		}
 		t.Files = append(t.Files, FileEntry{
 			Path:         stf.Path,
 			StartRow:     stf.StartRow,
@@ -145,8 +155,24 @@ func applyColumn(t *TabletInfo, kv *data.TKeyValue) error {
 			Size:         size,
 			NumEntries:   ne,
 			Time:         time,
+			Embedding:    embedding,
 			RawQualifier: raw,
 		})
+	case CFFileEmbedding:
+		state, err := embeddingspace.Decode(val)
+		if err != nil {
+			return fmt.Errorf("file embedding:%q: %w", cq, err)
+		}
+		raw := append([]byte(nil), cq...)
+		if t.fileEmbeddings == nil {
+			t.fileEmbeddings = make(map[string]embeddingspace.FileState)
+		}
+		t.fileEmbeddings[string(raw)] = state
+		for i := range t.Files {
+			if bytes.Equal(t.Files[i].RawQualifier, raw) {
+				t.Files[i].Embedding = state
+			}
+		}
 	case CFCurrentLocation:
 		// Qualifier = serialized lockID; value = host:port.
 		// We keep the raw qualifier as Session — that's what the server
@@ -205,6 +231,31 @@ func applyColumn(t *TabletInfo, kv *data.TKeyValue) error {
 		// Unknown CF — silently ignore. Forward-compat with newer Accumulo
 		// columns we don't care about for read-fleet purposes.
 	}
+	return nil
+}
+
+func finalizeFileEmbeddings(t *TabletInfo) error {
+	if t == nil {
+		return nil
+	}
+	for i := range t.Files {
+		if t.Files[i].Embedding.State == "" {
+			t.Files[i].Embedding = embeddingspace.NoEmbeddings()
+		}
+	}
+	for qualifier := range t.fileEmbeddings {
+		found := false
+		for _, file := range t.Files {
+			if string(file.RawQualifier) == qualifier {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return fmt.Errorf("orphan %s:%s column", CFFileEmbedding, qualifier)
+		}
+	}
+	t.fileEmbeddings = nil
 	return nil
 }
 

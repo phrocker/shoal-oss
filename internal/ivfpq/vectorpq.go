@@ -16,6 +16,8 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+
+	"github.com/phrocker/shoal-oss/internal/embeddingspace"
 )
 
 // FormatVersion of the VectorPQ serialization. Mirrors
@@ -35,6 +37,7 @@ type VectorPQ struct {
 	dim             int
 	dsub            int
 	codebookVersion int32
+	embeddingSpace  string
 }
 
 // FromBytes parses the Java-serialized VectorPQ wire format:
@@ -151,6 +154,29 @@ func (p *VectorPQ) CodeLength() int { return p.m }
 // so callers can detect stale codebooks vs ones a new ingest stamped.
 func (p *VectorPQ) CodebookVersion() int32 { return p.codebookVersion }
 
+func (p *VectorPQ) WithEmbeddingSpace(identity string) (*VectorPQ, error) {
+	if err := embeddingspace.Has(identity).Validate(); err != nil {
+		return nil, err
+	}
+	clone := *p
+	clone.embeddingSpace = identity
+	return &clone, nil
+}
+
+func (p *VectorPQ) EmbeddingSpaceIdentity() (string, bool) {
+	if p == nil || p.embeddingSpace == "" {
+		return "", false
+	}
+	return p.embeddingSpace, true
+}
+
+func (p *VectorPQ) EnsureQuerySpace(identity string) error {
+	if p == nil || p.embeddingSpace == "" {
+		return nil
+	}
+	return embeddingspace.EnsureSameIdentity("compare product-quantized vectors", p.embeddingSpace, identity)
+}
+
 // InnerProductTable precomputes, for each subspace s and each codebook
 // entry c, the inner product between query[s*dsub:(s+1)*dsub] and
 // codebook[s][c]. Result is [m][ks]. Caller usually does this once per
@@ -170,6 +196,13 @@ func (p *VectorPQ) InnerProductTable(query []float32) ([][]float32, error) {
 		out[s] = row
 	}
 	return out, nil
+}
+
+func (p *VectorPQ) InnerProductTableInSpace(query []float32, identity string) ([][]float32, error) {
+	if err := p.EnsureQuerySpace(identity); err != nil {
+		return nil, err
+	}
+	return p.InnerProductTable(query)
 }
 
 // Dot scores a PQ-encoded vector against the query whose

@@ -301,6 +301,162 @@ func TestClosedExplorerDoesNotCallEmbedderForVectorRequests(t *testing.T) {
 	}
 }
 
+func TestSingleSpaceVectorRetrievalFastPathEmbedsQueryOnce(t *testing.T) {
+	ctx := context.Background()
+	embedder := &countingEmbedder{model: "single", dimensions: 2, identity: "space-single"}
+	corpus, err := OpenWithOptions(t.TempDir(), Options{Embedder: embedder})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer corpus.Close()
+	for _, content := range []string{"alpha single vector", "beta single vector"} {
+		if _, err := corpus.Ingest(ctx, Source{
+			URI:       "file:///" + content + ".txt",
+			MediaType: MediaTypeText,
+			Content:   content,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	before := embedder.calls
+	response, err := corpus.Retrieve(ctx, retrieval.Request{
+		Text:    "single vector",
+		Modes:   []retrieval.Mode{retrieval.ModeVector},
+		Explain: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if embedder.calls-before != 1 {
+		t.Fatalf("query embeddings = %d, want 1", embedder.calls-before)
+	}
+	if len(response.Results) == 0 || response.Results[0].Explanation == nil {
+		t.Fatalf("missing explanation: %+v", response)
+	}
+	summary := response.Results[0].Explanation.Summary
+	if !strings.Contains(summary, "embedding_spaces=1") ||
+		!strings.Contains(summary, "vector_merge=score") ||
+		strings.Contains(summary, "unbenchmarked") {
+		t.Fatalf("single-space explanation = %q", summary)
+	}
+}
+
+func TestMixedSpaceVectorRetrievalUsesDeterministicRankFusion(t *testing.T) {
+	ctx := context.Background()
+	embedA := &countingEmbedder{model: "a", dimensions: 2, identity: "space-a"}
+	embedB := &countingEmbedder{model: "b", dimensions: 2, identity: "space-b"}
+	corpus, err := OpenWithOptions(t.TempDir(), Options{
+		Embedder:                embedA,
+		EmbeddingProviders:      []model.Embedder{embedB},
+		RecallEvidence:          map[string]string{"space-a": "benchmarked"},
+		MaxEmbeddingSpaceFanout: 4,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer corpus.Close()
+	first, err := corpus.Ingest(ctx, Source{URI: "file:///a.txt", MediaType: MediaTypeText, Content: "alpha"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := corpus.Ingest(ctx, Source{URI: "file:///b.txt", MediaType: MediaTypeText, Content: "bravo"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	corpus.mu.Lock()
+	firstRecord := corpus.documents[first.Document.ID][first.Revision.ID]
+	secondRecord := corpus.documents[second.Document.ID][second.Revision.ID]
+	low, high := firstRecord, secondRecord
+	if shoal.CompareID(firstRecord.Spans[0].ID, secondRecord.Spans[0].ID) > 0 {
+		low, high = secondRecord, firstRecord
+	}
+	low.Embeddings.Provenance = persistedEmbeddingProvenance{
+		Provider: "counting", Model: "a", Identity: "space-a", Dimensions: 2,
+	}
+	low.Embeddings.Spans[0].Vector = []float32{0, 1}
+	high.Embeddings.Provenance = persistedEmbeddingProvenance{
+		Provider: "counting", Model: "b", Identity: "space-b", Dimensions: 2,
+	}
+	high.Embeddings.Spans[0].Vector = []float32{1, 0}
+	wantFirst := low.Spans[0].ID
+	corpus.embeddingSpace = embeddingSpaceCache{}
+	corpus.mu.Unlock()
+
+	var previous []shoal.ID
+	for run := 0; run < 3; run++ {
+		response, err := corpus.Retrieve(ctx, retrieval.Request{
+			Text:    "query",
+			Modes:   []retrieval.Mode{retrieval.ModeVector},
+			TopK:    2,
+			Explain: true,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := response.Results[0].ID; got != wantFirst {
+			t.Fatalf("first result = %s, want deterministic RRF tiebreak %s", got, wantFirst)
+		}
+		if response.Results[0].Score != response.Results[1].Score {
+			t.Fatalf("rank fusion scores = %v, want equal per-space rank-one scores", response.Results)
+		}
+		summary := response.Results[0].Explanation.Summary
+		if !strings.Contains(summary, "embedding_spaces=2") ||
+			!strings.Contains(summary, "vector_merge=rank-fusion") ||
+			!strings.Contains(summary, "unbenchmarked; no recall claim") {
+			t.Fatalf("mixed-space explanation = %q", summary)
+		}
+		current := []shoal.ID{response.Results[0].ID, response.Results[1].ID}
+		if previous != nil && (previous[0] != current[0] || previous[1] != current[1]) {
+			t.Fatalf("run %d results = %v, previous = %v", run, current, previous)
+		}
+		previous = current
+	}
+	if embedA.calls != 5 || embedB.calls != 3 {
+		t.Fatalf("provider calls: a=%d b=%d, want a=5 b=3", embedA.calls, embedB.calls)
+	}
+}
+
+func TestVectorRetrievalScopeDoesNotProbeUnscopedEmbeddingSpace(t *testing.T) {
+	ctx := context.Background()
+	embedder := &countingEmbedder{model: "a", dimensions: 2, identity: "space-a"}
+	corpus, err := OpenWithOptions(t.TempDir(), Options{Embedder: embedder})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer corpus.Close()
+	visible, err := corpus.Ingest(ctx, Source{URI: "file:///visible.txt", MediaType: MediaTypeText, Content: "visible"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	hidden, err := corpus.Ingest(ctx, Source{URI: "file:///hidden.txt", MediaType: MediaTypeText, Content: "hidden"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	corpus.mu.Lock()
+	corpus.documents[hidden.Document.ID][hidden.Revision.ID].Embeddings.Provenance =
+		persistedEmbeddingProvenance{Provider: "counting", Model: "b", Identity: "space-b", Dimensions: 2}
+	corpus.embeddingSpace = embeddingSpaceCache{}
+	corpus.mu.Unlock()
+
+	before := embedder.calls
+	response, err := corpus.Retrieve(ctx, retrieval.Request{
+		Text:  "visible",
+		Modes: []retrieval.Mode{retrieval.ModeVector},
+		TopK:  1,
+		Scope: retrieval.Scope{DocumentIDs: []shoal.ID{visible.Document.ID}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(response.Results) != 1 ||
+		response.Results[0].Evidence[0].Citation.DocumentID != visible.Document.ID {
+		t.Fatalf("scoped vector retrieval widened scope: %+v", response)
+	}
+	if embedder.calls-before != 1 {
+		t.Fatalf("query embeddings = %d, want only scoped space", embedder.calls-before)
+	}
+}
+
 type countingEmbedder struct {
 	calls      int
 	model      string

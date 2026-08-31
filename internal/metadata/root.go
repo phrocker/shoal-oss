@@ -3,6 +3,8 @@ package metadata
 import (
 	"encoding/json"
 	"errors"
+
+	"github.com/phrocker/shoal-oss/internal/embeddingspace"
 )
 
 type rootTabletMetadata struct {
@@ -59,8 +61,26 @@ func DecodeRootTabletMetadata(encoded []byte) (TabletInfo, error) {
 		info.Files = append(info.Files, FileEntry{
 			Path: file.Path, StartRow: file.StartRow, EndRow: file.EndRow,
 			Size: size, NumEntries: entries, Time: fileTime,
+			Embedding:    embeddingspace.NoEmbeddings(),
 			RawQualifier: []byte(qualifier),
 		})
+	}
+	for qualifier, value := range root.ColumnValues[CFFileEmbedding] {
+		state, err := embeddingspace.Decode([]byte(value))
+		if err != nil {
+			return TabletInfo{}, err
+		}
+		found := false
+		for i := range info.Files {
+			if string(info.Files[i].RawQualifier) == qualifier {
+				info.Files[i].Embedding = state
+				found = true
+				break
+			}
+		}
+		if !found {
+			return TabletInfo{}, errors.New("metadata: root file embedding column has no matching file")
+		}
 	}
 	return info, nil
 }
