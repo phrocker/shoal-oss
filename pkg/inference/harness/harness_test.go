@@ -456,11 +456,12 @@ func TestEvaluationRecordIsRedactedAndIncludesBudgets(t *testing.T) {
 	if _, err := g.Generate(context.Background(), pack); err != nil {
 		t.Fatal(err)
 	}
-	if recorder.record.Budgets != budgets() || len(recorder.record.ActionKinds) != 1 ||
-		len(recorder.record.ActionUsage) != 1 {
+	captured := recorder.last()
+	if captured.Budgets != budgets() || len(captured.ActionKinds) != 1 ||
+		len(captured.ActionUsage) != 1 {
 		t.Fatal("evaluation record omitted budgets or bounded action data")
 	}
-	encoded := fmt.Sprintf("%+v", recorder.record)
+	encoded := fmt.Sprintf("%+v", captured)
 	if strings.Contains(encoded, string(secretCorrelation)) {
 		t.Fatal("evaluation record retained correlation ID")
 	}
@@ -616,11 +617,25 @@ type fakeTools struct {
 	stale    bool
 }
 
-type captureRecorder struct{ record EvaluationRecord }
+// captureRecorder is shared across goroutines by TestConcurrentGeneration,
+// which calls Generate concurrently, so recording must be synchronized. A real
+// Recorder has the same obligation: capture is on the serving path.
+type captureRecorder struct {
+	mu     sync.Mutex
+	record EvaluationRecord
+}
 
 func (r *captureRecorder) Record(_ context.Context, record EvaluationRecord) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	r.record = record
 	return nil
+}
+
+func (r *captureRecorder) last() EvaluationRecord {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.record
 }
 
 type startCountingRunner struct{ starts int }
