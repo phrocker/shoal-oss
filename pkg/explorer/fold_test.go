@@ -449,6 +449,43 @@ func TestFoldRefusesNonDigestSummary(t *testing.T) {
 	}
 }
 
+// TestSessionIDCannotCollideWithFoldID pins that folds and interaction
+// sessions do not share an identity. Both are written into the same corpus
+// node namespace, so a collision would drop one of them at the next graph
+// rebuild and leave two records claiming one node. Session IDs are
+// caller-supplied, and fold IDs are content-addressed and therefore
+// predictable, so the collision is reachable rather than theoretical.
+func TestSessionIDCannotCollideWithFoldID(t *testing.T) {
+	ctx := context.Background()
+	corpus, restricted, open := foldedCorpus(t, t.TempDir())
+	defer corpus.Close()
+
+	recordedSession(
+		t, corpus, "session-a", []shoal.ID{open[0]}, []shoal.ID{open[0]})
+	recordedSession(
+		t, corpus, "session-b",
+		[]shoal.ID{restricted[0], open[0]}, []shoal.ID{open[0]})
+	fold := foldOf(t, corpus, "session-a", "session-b")
+
+	template := recordedSession(
+		t, corpus, "session-c", []shoal.ID{open[0]}, []shoal.ID{open[0]})
+	colliding := template
+	colliding.ID = fold.FoldID
+
+	err := corpus.RecordInteraction(ctx, colliding)
+	if err == nil {
+		t.Fatal("recording a session under an existing fold ID succeeded")
+	}
+	if !strings.Contains(err.Error(), "fold") {
+		t.Fatalf("error %q does not explain the fold collision", err)
+	}
+
+	// The fold must still resolve to the fold, not to the session.
+	if _, err := corpus.RehydrateFold(ctx, fold.FoldID); err != nil {
+		t.Fatalf("fold no longer rehydrates after collision attempt: %v", err)
+	}
+}
+
 // TestInteractionsTouchingWalksAcrossSessions pins requirement 5: provenance
 // can be walked from a source node to every session and fold that touched it,
 // with the retrieved/cited distinction intact.

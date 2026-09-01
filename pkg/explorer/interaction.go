@@ -127,6 +127,15 @@ func (e *Explorer) RecordInteraction(
 		return shoal.NewError(
 			shoal.ErrorConflict, "interaction session ID already exists")
 	}
+	// Sessions and folds are distinct maps but share one node namespace in the
+	// corpus graph, so an ID taken by either would silently overwrite the other
+	// during a graph rebuild and leave two records claiming one identity.
+	if _, ok := e.folds[session.ID]; ok {
+		return shoal.NewError(
+			shoal.ErrorConflict,
+			"interaction session ID is already used by a fold",
+		)
+	}
 	subgraph, err := session.Subgraph(e.visibilityResolverLocked())
 	if err != nil {
 		return err

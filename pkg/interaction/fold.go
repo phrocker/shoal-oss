@@ -359,9 +359,17 @@ func IsInteractionID(id shoal.ID) bool {
 		string(id)[:len(KindPrefix)] == KindPrefix
 }
 
-// requireSourceNodeID refuses an interaction identity where a source node is
-// expected. This is the same guard the visibility resolver applies, restated
-// where a fold is assembled: derived content is never source evidence.
+// requireSourceNodeID refuses an identity that is self-evidently an
+// interaction node where a source node is expected.
+//
+// This is a weaker check than the one Explorer's visibility resolver applies,
+// and it is not a substitute for it. It can only recognize IDs that carry the
+// reserved prefix; shoal.ID is otherwise opaque, and a caller-supplied session
+// ID such as "session-one" is indistinguishable from a source node ID here.
+// The authoritative guard is kind-based and lives in the resolver, which looks
+// the node up in the corpus and rejects any interaction kind. This restatement
+// exists so that a caller assembling a fold without that resolver still fails
+// on the obvious case rather than silently succeeding.
 func requireSourceNodeID(id shoal.ID) error {
 	if IsInteractionID(id) {
 		return shoal.NewError(

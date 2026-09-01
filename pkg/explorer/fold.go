@@ -165,6 +165,15 @@ func (e *Explorer) FoldInteractions(
 	if existing, ok := e.folds[subgraph.ID]; ok {
 		return foldIdempotentResult(*existing, subgraph)
 	}
+	// A fold and a session must never share an identity: both are written into
+	// the same corpus node namespace, so a collision would drop one of them at
+	// the next graph rebuild.
+	if _, ok := e.interactions[subgraph.ID]; ok {
+		return FoldResult{}, shoal.NewError(
+			shoal.ErrorConflict,
+			"fold identity is already used by an interaction session",
+		)
+	}
 	record := persistedFold{
 		FoldID:        subgraph.ID,
 		Members:       canonical.Members,
@@ -412,8 +421,15 @@ func foldIdempotentResult(
 		)
 	}
 	// Identity covers the folded provenance but not the visibility derived
-	// from it, so a corpus whose labels moved under the fold must fail rather
-	// than quietly serve a stale, possibly wider, visibility.
+	// from it, so re-folding the same members against a corpus whose labels
+	// moved fails here rather than quietly returning a stale visibility.
+	//
+	// This check only runs on this path. Read paths (Folds, RehydrateFold,
+	// FoldSubgraph, provenance traversal) serve the visibility stored at fold
+	// time and do not re-derive it, so a later metadata-only re-ingest that
+	// tightens a source label leaves an already-written fold under-labelled
+	// until it is folded again. Interaction sessions recorded in phase 1 have
+	// the same snapshot semantics; see issue #273.
 	if existing.Visibility != interaction.Expression(subgraph.Visibility) {
 		return FoldResult{}, shoal.NewError(
 			shoal.ErrorConflict,
