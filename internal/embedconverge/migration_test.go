@@ -215,15 +215,23 @@ func TestMigrationAbandonLeavesAConsistentMixedCorpus(t *testing.T) {
 	if len(m.Lease(10)) != 0 {
 		t.Fatal("an abandoned migration must lease nothing")
 	}
-	if err := m.Complete(leased[1], embeddingspace.Has("model-a")); !errors.Is(err, ErrAbandoned) {
+	// leased[1] is still outstanding, so its worker may still land; the
+	// migration must be able to record what that worker actually did.
+	if err := m.Complete(leased[1], embeddingspace.Has("model-a")); err != nil {
+		t.Fatalf("an in-flight lease must still settle after abandonment: %v", err)
+	}
+	// A file that was never leased is refused: abandonment stops new work.
+	unleased := FileRef{Table: "t", Extent: []byte("t;;"), Entry: "f-unknown.rf"}
+	if err := m.Complete(unleased, embeddingspace.Has("model-a")); !errors.Is(err, ErrAbandoned) {
 		t.Fatalf("err = %v, want ErrAbandoned", err)
 	}
 	progress := m.Progress()
 	if !progress.Abandoned {
 		t.Fatal("progress must report the abandonment")
 	}
-	if progress.Converged != 1 {
-		t.Fatalf("Converged = %d, want 1: abandoning must not undo converged work", progress.Converged)
+	if progress.Converged != 2 {
+		t.Fatalf("Converged = %d, want 2: abandoning must not undo or discard settled work",
+			progress.Converged)
 	}
 	// Every file is still in exactly one recorded, valid space: the
 	// corpus is mixed, not half-labelled.
@@ -360,5 +368,84 @@ func TestMigrationIsSafeUnderConcurrentUse(t *testing.T) {
 	}
 	if err := m.Snapshot().Validate(); err != nil {
 		t.Fatalf("the epoch must stay valid under concurrency: %v", err)
+	}
+}
+
+// TestMigrationAbandonDrainsInFlightWork covers finding 8. Abandoning
+// must not simply forget outstanding leases: a worker already inside a
+// compaction can still publish a converged replacement, and if the
+// migration had dropped its lease it would both report no in-flight work
+// and have nowhere to record the file's new space — the record and the
+// corpus would diverge.
+func TestMigrationAbandonDrainsInFlightWork(t *testing.T) {
+	t.Parallel()
+
+	clock := newFakeClock()
+	g := NewGovernor(GovernorOptions{Budget: Budget{MaxFiles: 10}, Now: clock.Now})
+	m := newTestMigration(t, g, clock)
+
+	leased := m.Lease(3)
+	if len(leased) != 3 {
+		t.Fatalf("leased %d files, want 3", len(leased))
+	}
+	if got := g.Stats().SpentFiles; got != 3 {
+		t.Fatalf("SpentFiles = %d, want 3 reserved", got)
+	}
+
+	m.Abandon()
+	if m.Drained() {
+		t.Fatal("a migration with three outstanding leases is not drained")
+	}
+	progress := m.Progress()
+	if !progress.Draining || progress.InFlight != 3 {
+		t.Fatalf("progress = (draining=%v, in_flight=%d), want the leases still tracked",
+			progress.Draining, progress.InFlight)
+	}
+	if len(m.Lease(10)) != 0 {
+		t.Fatal("an abandoned migration must issue no new lease")
+	}
+
+	if err := m.Complete(leased[0], embeddingspace.Has("model-a")); err != nil {
+		t.Fatalf("a converged in-flight file must still be recordable: %v", err)
+	}
+	if err := m.Fail(leased[1], errors.New("provider down")); err != nil {
+		t.Fatalf("a failed in-flight file must still be recordable: %v", err)
+	}
+	if m.Drained() {
+		t.Fatal("one lease is still outstanding")
+	}
+	if err := m.Complete(leased[2], embeddingspace.Has("model-a")); err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+	if !m.Drained() {
+		t.Fatal("every lease has settled, so the migration is drained")
+	}
+	if got := m.Progress(); got.Draining || got.InFlight != 0 {
+		t.Fatalf("progress = (draining=%v, in_flight=%d), want the drain finished",
+			got.Draining, got.InFlight)
+	}
+	// Two converged, one refunded: settling in-flight work must settle
+	// the governor reservation too, not leak it.
+	if got := g.Stats().SpentFiles; got != 2 {
+		t.Fatalf("SpentFiles = %d, want the failed file's permit refunded", got)
+	}
+	// A settled lease is gone: a second publication after the drain is
+	// refused, so a retrying worker cannot re-open an abandoned file.
+	if err := m.Complete(leased[0], embeddingspace.Has("model-a")); !errors.Is(err, ErrAbandoned) {
+		t.Fatalf("err = %v, want ErrAbandoned once the lease has settled", err)
+	}
+}
+
+// TestMigrationNeverDrainsWhenNotAbandoned keeps Drained honest: it is a
+// statement about abandonment, not about idleness.
+func TestMigrationNeverDrainsWhenNotAbandoned(t *testing.T) {
+	t.Parallel()
+
+	m := newTestMigration(t, nil, newFakeClock())
+	if m.Drained() {
+		t.Fatal("a running migration is never drained")
+	}
+	if m.Progress().Draining {
+		t.Fatal("a running migration is never draining")
 	}
 }

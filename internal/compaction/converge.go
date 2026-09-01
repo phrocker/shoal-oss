@@ -8,34 +8,65 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/phrocker/shoal-oss/internal/embeddingspace"
 	"github.com/phrocker/shoal-oss/internal/iterrt"
 )
 
-// Converger re-embeds a compaction's cells into the table's target
-// embedding space. It is the seam between the composer, which knows
-// nothing about vectors, and a migration engine, which owns the
-// embedding provider, the rate limit, the budget and the kill switch.
+// ConvergeRequest describes one compaction's convergence request.
 //
-// Lifecycle for one compaction: Begin once, Convert per cell, End once.
-// End runs even when Begin refused, so budget accounting always settles.
+// It is a struct rather than an argument list because the set of things
+// a Converger has to agree about — target, epoch, input states — grows
+// with the migration protocol, and a struct lets it grow without
+// breaking every implementation.
+type ConvergeRequest struct {
+	// Target is the table's desired embedding space.
+	Target string
+
+	// Epoch identifies the migration snapshot this compaction is acting
+	// for. Empty means the caller is not running an epoch-tracked
+	// migration.
+	//
+	// It exists so a target change cannot make the corpus oscillate. A
+	// Converger belonging to epoch E refuses a compaction stamped E',
+	// and a compaction stamped E' never publishes a file labelled with
+	// E's target, so the two migrations cannot take turns rewriting the
+	// same files in opposite directions.
+	Epoch string
+
+	// Inputs are the per-input states, in Spec.Inputs order.
+	Inputs []embeddingspace.FileState
+}
+
+// Converger admits convergence attempts. It is the seam between the
+// composer, which knows nothing about vectors, and a migration engine,
+// which owns the embedding provider, the rate limit, the budget and the
+// kill switch.
 //
-// Implementations must be safe for concurrent use only if the same
-// Converger is shared across compactions; a single compaction drives
-// them from one goroutine.
+// A Converger is shared across compactions; a ConvergeAttempt is not.
+// Everything a compaction consumes — the rate-limit permit, the file
+// budget reservation, the cell charges — belongs to the attempt, so two
+// concurrent compactions cannot settle each other's accounting.
 type Converger interface {
-	// Begin admits (or refuses) convergence of inputs currently in the
-	// given states toward target.
+	// Begin admits (or refuses) one compaction's convergence.
 	//
 	// Returning an error wrapping
 	// embeddingspace.ErrConvergenceUnavailable is the normal way to say
 	// "not now": the provider is down, the migration is throttled, the
-	// budget is spent, or an operator hit the kill switch. The
-	// compaction then runs unconverged and preserves the inputs' space.
-	// Any other error aborts the compaction.
-	Begin(ctx context.Context, target string, inputs []embeddingspace.FileState) error
+	// budget is spent, the epoch is stale, or an operator hit the kill
+	// switch. The compaction then runs unconverged. Any other error
+	// aborts the compaction.
+	//
+	// A refusal must return a nil ConvergeAttempt and must have settled
+	// whatever it provisionally took, because the caller has nothing to
+	// End. Only a successful Begin creates an obligation to End.
+	Begin(ctx context.Context, req ConvergeRequest) (ConvergeAttempt, error)
+}
 
+// ConvergeAttempt is one compaction's admitted convergence. Exactly one
+// End follows a successful Begin.
+type ConvergeAttempt interface {
 	// Convert rewrites one cell's value so that any vectors it carries
 	// are in the target space. It must return a value that is either
 	// fully in the target space or an error; a partial conversion would
@@ -45,10 +76,10 @@ type Converger interface {
 	// vectors at all, which it should return unchanged.
 	Convert(ctx context.Context, key *iterrt.Key, value []byte) ([]byte, error)
 
-	// End settles one attempt. converted reports whether the output was
-	// actually written in the target space; cells is how many cells were
-	// converted before the attempt ended; err is the failure that ended
-	// it, or nil.
+	// End settles the attempt exactly once. converted reports whether
+	// the output was actually written in the target space; cells is how
+	// many cells were converted before the attempt ended; err is the
+	// failure that ended it, or nil.
 	End(ctx context.Context, converted bool, cells int64, err error)
 }
 
@@ -58,24 +89,46 @@ type Converger interface {
 // which is the expected "provider is unhappy, try later" signal.
 var ErrConvergenceAborted = errors.New("compaction: convergence aborted")
 
+// ErrConvergenceRequired reports a compaction that cannot run at all
+// right now: its inputs carry two different embedding identities, and
+// convergence — the only thing that could reconcile them into one file —
+// is unavailable.
+//
+// There is no correct unconverged output for this case. One compaction
+// produces one file carrying one label, so the alternatives are to
+// re-embed every input into the target (which needs the provider), to
+// label the merged file with an identity whose vectors it only partly
+// contains (silent mislabelling), or to not run. This error is the third
+// option, reported before any work is done.
+//
+// It is retryable, and callers must treat it that way. The inputs are
+// untouched and still individually well labelled, so the tablet stays
+// consistent and queryable; the same compaction succeeds once the
+// provider is reachable, or once an operator gives the node an embedder
+// that can produce the target. It wraps embeddingspace.ErrMismatch, so
+// callers that already classify identity conflicts keep working.
+var ErrConvergenceRequired = errors.New("compaction: convergence required but unavailable")
+
 // convergeAttempt is one compaction's decision about convergence.
 type convergeAttempt struct {
-	converger Converger
-	target    string
-	// active is true only when a Converger admitted the attempt, so the
-	// output may be labelled with target.
-	active bool
+	// attempt is non-nil only when a Converger admitted the attempt, so
+	// the output may be labelled with target.
+	attempt ConvergeAttempt
+	target  string
+	epoch   string
 	// label is what the output file must claim.
 	label embeddingspace.FileState
 	// inputs are the per-input states, in Spec.Inputs order.
 	inputs []embeddingspace.FileState
 }
 
+func (a *convergeAttempt) active() bool { return a != nil && a.attempt != nil }
+
 // planConvergence resolves what this compaction should do about the
 // table's target space, calling Begin when a rewrite is both wanted and
 // possible.
 //
-// Two properties are load bearing here:
+// Three properties are load bearing here:
 //
 //   - Idempotence. When every input already declares the target space,
 //     no Converger is consulted at all, so repeatedly compacting a
@@ -86,18 +139,29 @@ type convergeAttempt struct {
 //     an admitted Converger every cell is rewritten into the target, so
 //     mixed input is legitimate: the output really does contain only
 //     target-space vectors.
+//   - Nothing is spent on a compaction that cannot be published. The
+//     conflict check runs before Begin, so a compaction that would end
+//     in ErrConvergenceRequired never takes a rate-limit permit or a
+//     budget reservation it would only have to give back.
 func planConvergence(
 	ctx context.Context, spec Spec, states []embeddingspace.FileState,
 ) (*convergeAttempt, error) {
-	attempt := &convergeAttempt{
-		converger: spec.Converger,
-		inputs:    states,
-	}
+	attempt := &convergeAttempt{inputs: states, epoch: strings.TrimSpace(spec.EmbeddingEpoch)}
 	target, err := embeddingspace.ParseTarget(spec.TargetEmbeddingSpace)
 	if err != nil {
 		return nil, fmt.Errorf("compaction: %w", err)
 	}
 	attempt.target = target
+	if attempt.epoch != "" && target == "" {
+		// An epoch names the migration an output belongs to, and a
+		// migration is defined by the target it converges toward. An
+		// epoch without a target would stamp outputs with a migration
+		// that cannot exist, which is worse than not stamping them at
+		// all: it would let a coordinator attribute unconverged files to
+		// a migration.
+		return nil, fmt.Errorf(
+			"compaction: embedding epoch %q set without a target embedding space", attempt.epoch)
+	}
 
 	wanted := false
 	for _, state := range states {
@@ -109,43 +173,65 @@ func planConvergence(
 			wanted = true
 		}
 	}
-	if !wanted || attempt.converger == nil {
-		label, err := embeddingspace.Compatible("merge embedding spaces", states...)
-		if err != nil {
-			return nil, err
-		}
-		attempt.label = label
-		return attempt, nil
-	}
 
-	if err := attempt.converger.Begin(ctx, target, states); err != nil {
-		if !errors.Is(err, embeddingspace.ErrConvergenceUnavailable) {
-			return nil, fmt.Errorf("compaction: begin convergence: %w", err)
-		}
-		attempt.converger.End(ctx, false, 0, err)
-		attempt.converger = nil
-		label, mergeErr := embeddingspace.Compatible("merge embedding spaces", states...)
+	// Resolve the unconverged label up front. It is both the answer when
+	// nothing needs converging and the fallback when convergence is
+	// refused, and computing it before Begin is what keeps a doomed
+	// compaction from spending a permit.
+	label, mergeErr := embeddingspace.Compatible("merge embedding spaces", states...)
+	if !wanted || spec.Converger == nil {
 		if mergeErr != nil {
 			return nil, mergeErr
 		}
 		attempt.label = label
 		return attempt, nil
 	}
-	attempt.active = true
+
+	admitted, beginErr := spec.Converger.Begin(ctx, ConvergeRequest{
+		Target: target,
+		Epoch:  spec.EmbeddingEpoch,
+		Inputs: states,
+	})
+	if beginErr != nil {
+		if !errors.Is(beginErr, embeddingspace.ErrConvergenceUnavailable) {
+			return nil, fmt.Errorf("compaction: begin convergence: %w", beginErr)
+		}
+		if mergeErr != nil {
+			return nil, convergenceRequired(mergeErr, beginErr)
+		}
+		attempt.label = label
+		return attempt, nil
+	}
+	if admitted == nil {
+		return nil, fmt.Errorf("compaction: converger admitted the attempt but returned no handle")
+	}
+	attempt.attempt = admitted
 	attempt.label = embeddingspace.Has(target)
 	return attempt, nil
+}
+
+// convergenceRequired reports inputs that only convergence could merge,
+// at a moment when convergence is not available. Both causes are
+// wrapped: the mismatch so existing identity-conflict handling still
+// matches, and ErrConvergenceRequired so a caller can tell "retry this
+// later" apart from "these files must never be compacted together".
+func convergenceRequired(mergeErr, cause error) error {
+	return fmt.Errorf("%w: %w (provider: %v)", ErrConvergenceRequired, mergeErr, cause)
 }
 
 // preserved rebuilds the attempt as an unconverged one after a mid-flight
 // provider failure. The output then claims exactly what the inputs
 // claimed, which is the self-healing outcome: a later compaction, or a
 // forced migration pass, picks the file up again.
-func (a *convergeAttempt) preserved() (*convergeAttempt, error) {
+//
+// When the inputs carry conflicting identities there is no such output,
+// so this reports ErrConvergenceRequired rather than inventing one.
+func (a *convergeAttempt) preserved(cause error) (*convergeAttempt, error) {
 	label, err := embeddingspace.Compatible("merge embedding spaces", a.inputs...)
 	if err != nil {
-		return nil, err
+		return nil, convergenceRequired(err, cause)
 	}
-	return &convergeAttempt{target: a.target, label: label, inputs: a.inputs}, nil
+	return &convergeAttempt{target: a.target, epoch: a.epoch, label: label, inputs: a.inputs}, nil
 }
 
 // verify checks the output label against every input state before the
@@ -167,7 +253,7 @@ func (a *convergeAttempt) verify() error {
 // value, and the second of those is a mislabelled file.
 type convergingIterator struct {
 	source    iterrt.SortedKeyValueIterator
-	converger Converger
+	attempt   ConvergeAttempt
 	ctx       context.Context
 	value     []byte
 	err       error
@@ -175,9 +261,9 @@ type convergingIterator struct {
 }
 
 func newConvergingIterator(
-	ctx context.Context, source iterrt.SortedKeyValueIterator, converger Converger,
+	ctx context.Context, source iterrt.SortedKeyValueIterator, attempt ConvergeAttempt,
 ) *convergingIterator {
-	return &convergingIterator{source: source, converger: converger, ctx: ctx}
+	return &convergingIterator{source: source, attempt: attempt, ctx: ctx}
 }
 
 func (c *convergingIterator) Init(
@@ -215,7 +301,7 @@ func (c *convergingIterator) convert() {
 	if c.err != nil || !c.source.HasTop() {
 		return
 	}
-	converted, err := c.converger.Convert(c.ctx, c.source.GetTopKey(), c.source.GetTopValue())
+	converted, err := c.attempt.Convert(c.ctx, c.source.GetTopKey(), c.source.GetTopValue())
 	if err != nil {
 		c.err = err
 		return
@@ -234,7 +320,7 @@ func (c *convergingIterator) GetTopKey() *iterrt.Key { return c.source.GetTopKey
 func (c *convergingIterator) GetTopValue() []byte { return c.value }
 
 func (c *convergingIterator) DeepCopy(env iterrt.IteratorEnvironment) iterrt.SortedKeyValueIterator {
-	return newConvergingIterator(c.ctx, c.source.DeepCopy(env), c.converger)
+	return newConvergingIterator(c.ctx, c.source.DeepCopy(env), c.attempt)
 }
 
 func (c *convergingIterator) Err() error { return c.err }

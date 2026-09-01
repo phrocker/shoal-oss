@@ -46,7 +46,7 @@ type Migration struct {
 	mu         sync.Mutex
 	epoch      Epoch
 	index      map[string]int
-	leased     map[string]struct{}
+	leased     map[string]*Permit
 	governor   *Governor
 	now        func() time.Time
 	lastChange time.Time
@@ -65,7 +65,7 @@ func NewMigration(epoch Epoch, governor *Governor, now func() time.Time) (*Migra
 	m := &Migration{
 		epoch:      epoch,
 		index:      make(map[string]int, len(epoch.Files)),
-		leased:     make(map[string]struct{}),
+		leased:     make(map[string]*Permit),
 		governor:   governor,
 		now:        now,
 		lastChange: now(),
@@ -74,6 +74,22 @@ func NewMigration(epoch Epoch, governor *Governor, now func() time.Time) (*Migra
 		m.index[file.Ref.Key()] = i
 	}
 	return m, nil
+}
+
+// EpochID reports the snapshot this migration is driving. It is what a
+// compaction must be stamped with for a Converger bound to this epoch to
+// admit it.
+func (m *Migration) EpochID() string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.epoch.ID
+}
+
+// Target reports the embedding space this migration converges toward.
+func (m *Migration) Target() string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.epoch.Target
 }
 
 // Resume rebuilds a migration from a persisted epoch.
@@ -123,12 +139,15 @@ func (m *Migration) Lease(n int) []FileRef {
 		if _, held := m.leased[key]; held {
 			continue
 		}
+		var permit *Permit
 		if m.governor != nil {
-			if err := m.governor.AdmitFile(); err != nil {
+			admitted, err := m.governor.AdmitFile()
+			if err != nil {
 				break
 			}
+			permit = admitted
 		}
-		m.leased[key] = struct{}{}
+		m.leased[key] = permit
 		out = append(out, file.Ref)
 	}
 	return out
@@ -149,14 +168,20 @@ func (m *Migration) Complete(ref FileRef, after embeddingspace.FileState) error 
 	if err != nil {
 		return err
 	}
+	key := ref.Key()
 	if err := after.Validate(); err != nil {
+		// The lease is refunded: nothing was recorded, so nothing was
+		// spent. Holding it would leak a permit out of the budget for
+		// the life of the migration.
+		m.releaseLocked(key, false)
 		return err
 	}
-	delete(m.leased, ref.Key())
+	converged := embeddingspace.Converged(m.epoch.Target, after)
+	m.releaseLocked(key, converged)
 	if file.Status == StatusConverged || file.Status == StatusSkipped {
 		// Idempotence: a duplicate completion for a file that already
 		// reached the target is not an error, and must not re-open it.
-		if embeddingspace.Converged(m.epoch.Target, after) {
+		if converged {
 			return nil
 		}
 		return fmt.Errorf("%w: %s regressed from %s to %s",
@@ -167,7 +192,7 @@ func (m *Migration) Complete(ref FileRef, after embeddingspace.FileState) error 
 	}
 	file.Attempts++
 	file.Current = after
-	if embeddingspace.Converged(m.epoch.Target, after) {
+	if converged {
 		file.Status = StatusConverged
 		file.LastError = ""
 	} else {
@@ -188,7 +213,7 @@ func (m *Migration) Fail(ref FileRef, cause error) error {
 	if err != nil {
 		return err
 	}
-	delete(m.leased, ref.Key())
+	m.releaseLocked(ref.Key(), false)
 	if file.Status == StatusConverged || file.Status == StatusSkipped {
 		return nil
 	}
@@ -201,14 +226,29 @@ func (m *Migration) Fail(ref FileRef, cause error) error {
 	return nil
 }
 
-// Abandon stops the migration for good, leaving the corpus in whatever
-// mixed state it reached.
+// Abandon stops the migration, leaving the corpus in whatever mixed
+// state it reached.
 //
 // This is safe precisely because every file is in exactly one recorded
 // space at every instant: convergence publishes a whole new file with a
 // new label, so there is no moment at which a file is half-labelled.
 // Abandoning is therefore an operator decision, not a recovery
 // procedure.
+//
+// Abandoning refuses *new* leases but deliberately keeps the ones
+// already outstanding. Dropping them would make Progress report no
+// in-flight work while workers were still running, and a worker that
+// then published a converged replacement would have nowhere to record
+// it — the file's real space and the migration's record would diverge,
+// which is exactly the silent mislabelling this package exists to
+// prevent. Complete and Fail therefore still settle a file that was
+// leased before the abandonment; every other file is refused with
+// ErrAbandoned. Drained reports when the last of them has settled.
+//
+// Abandon is not a hard stop. Stopping work already in flight is the
+// Governor's kill switch, which is checked per cell; Abandon is the
+// bookkeeping half of the same operation, and an operator who wants both
+// calls Governor.Stop and then Abandon.
 func (m *Migration) Abandon() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -216,8 +256,16 @@ func (m *Migration) Abandon() {
 		return
 	}
 	m.epoch.Abandoned = true
-	m.leased = make(map[string]struct{})
 	m.lastChange = m.now()
+}
+
+// Drained reports whether abandonment has finished: the migration is
+// abandoned and no lease is still outstanding. A migration that was
+// never abandoned is not drained.
+func (m *Migration) Drained() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.epoch.Abandoned && len(m.leased) == 0
 }
 
 // SpaceCount is the number of epoch files currently in one space.
@@ -240,6 +288,7 @@ type Progress struct {
 	Mode       Mode         `json:"mode"`
 	State      RunState     `json:"state"`
 	Abandoned  bool         `json:"abandoned"`
+	Draining   bool         `json:"draining"`
 	Total      int          `json:"total"`
 	Converged  int          `json:"converged"`
 	Skipped    int          `json:"skipped"`
@@ -266,6 +315,7 @@ func (m *Migration) Progress() Progress {
 		Mode:       m.epoch.Mode,
 		State:      StateRunning,
 		Abandoned:  m.epoch.Abandoned,
+		Draining:   m.epoch.Abandoned && len(m.leased) > 0,
 		Total:      len(m.epoch.Files),
 		InFlight:   len(m.leased),
 		LastChange: m.lastChange,
@@ -345,13 +395,40 @@ func (m *Migration) Snapshot() Epoch {
 	return out
 }
 
+// fileLocked resolves a reference to its epoch file.
+//
+// After abandonment only a file whose lease is still outstanding
+// resolves; everything else is refused. That is what lets an abandoned
+// migration settle work already in flight without accepting new work.
 func (m *Migration) fileLocked(ref FileRef) (*EpochFile, error) {
-	index, ok := m.index[ref.Key()]
+	key := ref.Key()
+	index, ok := m.index[key]
 	if !ok {
 		return nil, fmt.Errorf("%w: %s", ErrUnknownFile, ref.Entry)
 	}
 	if m.epoch.Abandoned {
-		return nil, fmt.Errorf("%w: %s", ErrAbandoned, m.epoch.ID)
+		if _, held := m.leased[key]; !held {
+			return nil, fmt.Errorf("%w: %s", ErrAbandoned, m.epoch.ID)
+		}
 	}
 	return &m.epoch.Files[index], nil
+}
+
+// releaseLocked settles a lease's Governor reservation. converged is
+// whether the file actually reached the target, which is what decides
+// whether the permit is spent or refunded.
+func (m *Migration) releaseLocked(key string, converged bool) {
+	permit, held := m.leased[key]
+	if !held {
+		return
+	}
+	delete(m.leased, key)
+	if permit == nil {
+		return
+	}
+	if converged {
+		permit.Settle(permit.Files())
+	} else {
+		permit.Settle(0)
+	}
 }

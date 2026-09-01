@@ -36,6 +36,13 @@ func (c *fakeClock) Advance(d time.Duration) {
 	c.now = c.now.Add(d)
 }
 
+// admit is the "did it succeed" shorthand the throttle tests want; the
+// permit itself is exercised by the budget tests.
+func admit(g *Governor) error {
+	_, err := g.AdmitFile()
+	return err
+}
+
 func TestGovernorThrottlesAndRefills(t *testing.T) {
 	t.Parallel()
 
@@ -43,11 +50,11 @@ func TestGovernorThrottlesAndRefills(t *testing.T) {
 	g := NewGovernor(GovernorOptions{FilesPerSecond: 2, Burst: 2, Now: clock.Now})
 
 	for i := 0; i < 2; i++ {
-		if err := g.AdmitFile(); err != nil {
+		if err := admit(g); err != nil {
 			t.Fatalf("admission %d must come from the initial burst: %v", i, err)
 		}
 	}
-	err := g.AdmitFile()
+	err := admit(g)
 	if !errors.Is(err, ErrThrottled) {
 		t.Fatalf("err = %v, want ErrThrottled", err)
 	}
@@ -56,24 +63,55 @@ func TestGovernorThrottlesAndRefills(t *testing.T) {
 	}
 
 	clock.Advance(500 * time.Millisecond)
-	if err := g.AdmitFile(); err != nil {
+	if err := admit(g); err != nil {
 		t.Fatalf("one token must have refilled after 500ms at 2/s: %v", err)
 	}
-	if err := g.AdmitFile(); !errors.Is(err, ErrThrottled) {
+	if err := admit(g); !errors.Is(err, ErrThrottled) {
 		t.Fatalf("err = %v, want ErrThrottled after spending the refill", err)
 	}
 
 	clock.Advance(time.Hour)
-	if err := g.AdmitFile(); err != nil {
+	if err := admit(g); err != nil {
 		t.Fatalf("a long idle period must refill: %v", err)
 	}
 	// The bucket is capped at Burst, so an hour of idleness does not
 	// bank an hour of permits.
-	if err := g.AdmitFile(); err != nil {
+	if err := admit(g); err != nil {
 		t.Fatalf("the second burst permit must be available: %v", err)
 	}
-	if err := g.AdmitFile(); !errors.Is(err, ErrThrottled) {
+	if err := admit(g); !errors.Is(err, ErrThrottled) {
 		t.Fatalf("err = %v, want ErrThrottled: the bucket must cap at Burst", err)
+	}
+}
+
+// TestGovernorAdmitFilesIsAllOrNothing is finding 5's throttle half. A
+// multi-file compaction takes one token per file, and a reservation that
+// cannot be met in full takes nothing — a partially admitted compaction
+// would start converging files it has no permit for.
+func TestGovernorAdmitFilesIsAllOrNothing(t *testing.T) {
+	t.Parallel()
+
+	clock := newFakeClock()
+	g := NewGovernor(GovernorOptions{FilesPerSecond: 1, Burst: 3, Now: clock.Now})
+
+	if _, err := g.AdmitFiles(4); !errors.Is(err, ErrThrottled) {
+		t.Fatalf("err = %v, want ErrThrottled: 4 files need 4 tokens", err)
+	}
+	if got := g.Stats().SpentFiles; got != 0 {
+		t.Fatalf("SpentFiles = %d, want a refused reservation to take nothing", got)
+	}
+	permit, err := g.AdmitFiles(3)
+	if err != nil {
+		t.Fatalf("AdmitFiles(3): %v", err)
+	}
+	if permit.Files() != 3 {
+		t.Fatalf("permit.Files() = %d, want 3", permit.Files())
+	}
+	if got := g.Stats().SpentFiles; got != 3 {
+		t.Fatalf("SpentFiles = %d, want 3", got)
+	}
+	if _, err := g.AdmitFiles(0); err == nil {
+		t.Fatal("a zero-file reservation is a caller bug and must be refused")
 	}
 }
 
@@ -82,7 +120,7 @@ func TestGovernorZeroRateIsUnlimited(t *testing.T) {
 
 	g := NewGovernor(GovernorOptions{Now: newFakeClock().Now})
 	for i := 0; i < 100; i++ {
-		if err := g.AdmitFile(); err != nil {
+		if err := admit(g); err != nil {
 			t.Fatalf("admission %d: %v", i, err)
 		}
 	}
@@ -93,12 +131,13 @@ func TestGovernorFileBudgetStopsAdmitting(t *testing.T) {
 
 	g := NewGovernor(GovernorOptions{Budget: Budget{MaxFiles: 2}, Now: newFakeClock().Now})
 	for i := 0; i < 2; i++ {
-		if err := g.AdmitFile(); err != nil {
+		permit, err := g.AdmitFile()
+		if err != nil {
 			t.Fatalf("admission %d: %v", i, err)
 		}
-		g.SettleFile(true, 10)
+		permit.Settle(1)
 	}
-	err := g.AdmitFile()
+	err := admit(g)
 	if !errors.Is(err, ErrBudgetExhausted) {
 		t.Fatalf("err = %v, want ErrBudgetExhausted", err)
 	}
@@ -107,20 +146,81 @@ func TestGovernorFileBudgetStopsAdmitting(t *testing.T) {
 	}
 }
 
+// TestGovernorFileBudgetCountsReservationsNotCompletions is why the
+// budget is charged at admission rather than at settlement: an operator
+// who caps a migration at n files must not be able to have 10n files
+// in flight because none of them has finished yet.
+func TestGovernorFileBudgetCountsReservationsNotCompletions(t *testing.T) {
+	t.Parallel()
+
+	g := NewGovernor(GovernorOptions{Budget: Budget{MaxFiles: 3}, Now: newFakeClock().Now})
+	first, err := g.AdmitFiles(2)
+	if err != nil {
+		t.Fatalf("AdmitFiles(2): %v", err)
+	}
+	if _, err := g.AdmitFiles(2); !errors.Is(err, ErrBudgetExhausted) {
+		t.Fatalf("err = %v, want the outstanding reservation to count", err)
+	}
+	first.Settle(0)
+	if _, err := g.AdmitFiles(2); err != nil {
+		t.Fatalf("a refunded reservation must free the budget: %v", err)
+	}
+}
+
+func TestPermitSettleIsIdempotentAndClamped(t *testing.T) {
+	t.Parallel()
+
+	g := NewGovernor(GovernorOptions{Budget: Budget{MaxFiles: 8}, Now: newFakeClock().Now})
+	permit, err := g.AdmitFiles(4)
+	if err != nil {
+		t.Fatalf("AdmitFiles: %v", err)
+	}
+	permit.Settle(1)
+	if got := g.Stats().SpentFiles; got != 1 {
+		t.Fatalf("SpentFiles = %d, want 3 of 4 refunded", got)
+	}
+	// A second settlement must not refund again, or one attempt would
+	// eat into another's reservation.
+	permit.Settle(0)
+	if got := g.Stats().SpentFiles; got != 1 {
+		t.Fatalf("SpentFiles = %d after a duplicate Settle, want 1", got)
+	}
+
+	other, err := g.AdmitFiles(2)
+	if err != nil {
+		t.Fatalf("AdmitFiles: %v", err)
+	}
+	// Nonsense inputs are clamped rather than trusted: over-reporting
+	// would spend permits nobody reserved and under-reporting is a
+	// refund.
+	other.Settle(99)
+	if got := g.Stats().SpentFiles; got != 3 {
+		t.Fatalf("SpentFiles = %d, want the settlement clamped to the reservation", got)
+	}
+}
+
 func TestGovernorRefundsTheFilePermitWhenConvergenceFailed(t *testing.T) {
 	t.Parallel()
 
 	g := NewGovernor(GovernorOptions{Budget: Budget{MaxFiles: 1}, Now: newFakeClock().Now})
-	if err := g.AdmitFile(); err != nil {
+	permit, err := g.AdmitFile()
+	if err != nil {
 		t.Fatalf("first admission: %v", err)
 	}
 	// A provider outage must not consume the entire file budget.
-	g.SettleFile(false, 3)
-	if err := g.AdmitFile(); err != nil {
+	if err := g.ChargeCells(3); err != nil {
+		t.Fatalf("ChargeCells: %v", err)
+	}
+	permit.Settle(0)
+	permit, err = g.AdmitFile()
+	if err != nil {
 		t.Fatalf("a failed file must be admissible again: %v", err)
 	}
-	g.SettleFile(true, 3)
-	if err := g.AdmitFile(); !errors.Is(err, ErrBudgetExhausted) {
+	if err := g.ChargeCells(3); err != nil {
+		t.Fatalf("ChargeCells: %v", err)
+	}
+	permit.Settle(1)
+	if err := admit(g); !errors.Is(err, ErrBudgetExhausted) {
 		t.Fatalf("err = %v, want ErrBudgetExhausted once the file actually converged", err)
 	}
 	if got := g.Stats().SpentCells; got != 6 {
@@ -132,18 +232,28 @@ func TestGovernorCellBudgetStopsMidFile(t *testing.T) {
 	t.Parallel()
 
 	g := NewGovernor(GovernorOptions{Budget: Budget{MaxCells: 10}, Now: newFakeClock().Now})
-	if err := g.CheckRunning(0); err != nil {
-		t.Fatalf("CheckRunning at zero: %v", err)
+	if err := g.CheckRunning(); err != nil {
+		t.Fatalf("CheckRunning: %v", err)
 	}
-	if err := g.CheckRunning(9); err != nil {
-		t.Fatalf("CheckRunning under budget: %v", err)
+	for i := 0; i < 10; i++ {
+		if err := g.ChargeCell(); err != nil {
+			t.Fatalf("cell %d must be inside a budget of 10: %v", i, err)
+		}
 	}
-	if err := g.CheckRunning(10); !errors.Is(err, ErrBudgetExhausted) {
+	err := g.ChargeCell()
+	if !errors.Is(err, ErrBudgetExhausted) {
 		t.Fatalf("err = %v, want ErrBudgetExhausted at the cap", err)
 	}
-	g.SettleFile(true, 10)
-	if err := g.CheckRunning(0); !errors.Is(err, ErrBudgetExhausted) {
-		t.Fatalf("err = %v, want ErrBudgetExhausted once spent", err)
+	if got := g.Stats().SpentCells; got != 10 {
+		t.Fatalf("SpentCells = %d, want a refused cell to charge nothing", got)
+	}
+	// The kill switch remains independent of the budget: a governor that
+	// is out of cells is still "running".
+	if err := g.CheckRunning(); err != nil {
+		t.Fatalf("CheckRunning = %v, want the budget not to change run state", err)
+	}
+	if err := g.ChargeCells(20); !errors.Is(err, ErrBudgetExhausted) {
+		t.Fatalf("err = %v, want a bulk charge over budget refused", err)
 	}
 }
 
@@ -155,19 +265,25 @@ func TestGovernorPauseIsReversibleAndStopIsNot(t *testing.T) {
 	if got := g.State(); got != StatePaused {
 		t.Fatalf("state = %q, want %q", got, StatePaused)
 	}
-	if err := g.AdmitFile(); !errors.Is(err, ErrPaused) {
+	if err := admit(g); !errors.Is(err, ErrPaused) {
 		t.Fatalf("err = %v, want ErrPaused", err)
 	}
-	if err := g.CheckRunning(0); !errors.Is(err, ErrPaused) {
+	if err := g.CheckRunning(); !errors.Is(err, ErrPaused) {
 		t.Fatalf("CheckRunning err = %v, want ErrPaused", err)
 	}
+	if err := g.ChargeCell(); !errors.Is(err, ErrPaused) {
+		t.Fatalf("ChargeCell err = %v, want ErrPaused", err)
+	}
+	if got := g.Stats().SpentCells; got != 0 {
+		t.Fatalf("SpentCells = %d, want a paused charge to cost nothing", got)
+	}
 	g.Resume()
-	if err := g.AdmitFile(); err != nil {
+	if err := admit(g); err != nil {
 		t.Fatalf("resume must re-admit: %v", err)
 	}
 
 	g.Stop()
-	if err := g.AdmitFile(); !errors.Is(err, ErrStopped) {
+	if err := admit(g); !errors.Is(err, ErrStopped) {
 		t.Fatalf("err = %v, want ErrStopped", err)
 	}
 	// The kill switch is terminal: neither resuming nor pausing may
@@ -177,8 +293,11 @@ func TestGovernorPauseIsReversibleAndStopIsNot(t *testing.T) {
 	if got := g.State(); got != StateStopped {
 		t.Fatalf("state = %q, want %q: stop must be terminal", got, StateStopped)
 	}
-	if err := g.CheckRunning(0); !errors.Is(err, ErrStopped) {
+	if err := g.CheckRunning(); !errors.Is(err, ErrStopped) {
 		t.Fatalf("CheckRunning err = %v, want ErrStopped", err)
+	}
+	if err := g.ChargeCell(); !errors.Is(err, ErrStopped) {
+		t.Fatalf("ChargeCell err = %v, want ErrStopped", err)
 	}
 }
 
@@ -187,11 +306,11 @@ func TestGovernorStatsCountAdmissionsAndRefusals(t *testing.T) {
 
 	clock := newFakeClock()
 	g := NewGovernor(GovernorOptions{FilesPerSecond: 1, Burst: 1, Now: clock.Now})
-	if err := g.AdmitFile(); err != nil {
+	if err := admit(g); err != nil {
 		t.Fatalf("AdmitFile: %v", err)
 	}
-	_ = g.AdmitFile()
-	_ = g.AdmitFile()
+	_ = admit(g)
+	_ = admit(g)
 	stats := g.Stats()
 	if stats.Admitted != 1 {
 		t.Fatalf("Admitted = %d, want 1", stats.Admitted)
@@ -214,9 +333,13 @@ func TestGovernorIsSafeUnderConcurrentUse(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for j := 0; j < 200; j++ {
-				if err := g.AdmitFile(); err == nil {
-					_ = g.CheckRunning(int64(j))
-					g.SettleFile(j%2 == 0, 1)
+				if permit, err := g.AdmitFiles(int64(j%3 + 1)); err == nil {
+					_ = g.CheckRunning()
+					_ = g.ChargeCell()
+					permit.Settle(int64(j % 2))
+					// A duplicate settlement from a racing goroutine
+					// must not double-refund.
+					permit.Settle(0)
 				}
 				_ = g.Stats()
 				_ = g.State()
@@ -233,7 +356,7 @@ func TestGovernorIsSafeUnderConcurrentUse(t *testing.T) {
 	}()
 	wg.Wait()
 	g.Stop()
-	if err := g.AdmitFile(); !errors.Is(err, ErrStopped) {
+	if err := admit(g); !errors.Is(err, ErrStopped) {
 		t.Fatalf("err = %v, want ErrStopped", err)
 	}
 }

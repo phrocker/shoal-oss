@@ -29,7 +29,13 @@ func (c *capturingComposer) Compact(
 	c.mu.Lock()
 	c.spec = spec
 	c.mu.Unlock()
-	return &compaction.Result{Output: []byte("compacted"), EntriesWritten: 1}, nil
+	return &compaction.Result{
+		Output:         []byte("compacted"),
+		EntriesWritten: 1,
+		EmbeddingSpace: embeddingspace.Has("model-a"),
+		Converged:      spec.Converger != nil,
+		EmbeddingEpoch: spec.EmbeddingEpoch,
+	}, nil
 }
 
 func (c *capturingComposer) captured() compaction.Spec {
@@ -40,13 +46,19 @@ func (c *capturingComposer) captured() compaction.Spec {
 
 type noopConverger struct{}
 
-func (noopConverger) Begin(context.Context, string, []embeddingspace.FileState) error { return nil }
+func (noopConverger) Begin(
+	context.Context, compaction.ConvergeRequest,
+) (compaction.ConvergeAttempt, error) {
+	return noopAttempt{}, nil
+}
 
-func (noopConverger) Convert(_ context.Context, _ *iterrt.Key, value []byte) ([]byte, error) {
+type noopAttempt struct{}
+
+func (noopAttempt) Convert(_ context.Context, _ *iterrt.Key, value []byte) ([]byte, error) {
 	return value, nil
 }
 
-func (noopConverger) End(context.Context, bool, int64, error) {}
+func (noopAttempt) End(context.Context, bool, int64, error) {}
 
 func TestExecuteCarriesEmbeddingStateAndConvergerToTheComposer(t *testing.T) {
 	t.Parallel()
@@ -66,11 +78,25 @@ func TestExecuteCarriesEmbeddingStateAndConvergerToTheComposer(t *testing.T) {
 	plan := testPlan(map[string][]byte{"in.rf": image}, "out.rf_tmp")
 	plan.Inputs[0].Embedding = embeddingspace.Has("model-b")
 	plan.TargetEmbeddingSpace = "model-a"
+	plan.EmbeddingEpoch = "epoch-4"
 
-	if _, err := exec.Execute(context.Background(), plan); err != nil {
+	result, err := exec.Execute(context.Background(), plan)
+	if err != nil {
 		t.Fatal(err)
 	}
 	spec := composer.captured()
+	if spec.EmbeddingEpoch != "epoch-4" {
+		t.Fatalf("spec epoch = %q, want epoch-4", spec.EmbeddingEpoch)
+	}
+	// The result carries what the caller must persist for the new file:
+	// its space, whether it was converged, and which migration produced
+	// it.
+	if result.EmbeddingSpace != embeddingspace.Has("model-a") {
+		t.Fatalf("result space = %+v", result.EmbeddingSpace)
+	}
+	if !result.Converged || result.EmbeddingEpoch != "epoch-4" {
+		t.Fatalf("result = (converged=%v, epoch=%q)", result.Converged, result.EmbeddingEpoch)
+	}
 	if len(spec.Inputs) != 1 {
 		t.Fatalf("spec has %d inputs, want 1", len(spec.Inputs))
 	}

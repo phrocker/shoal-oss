@@ -11,6 +11,7 @@ import (
 
 	"github.com/phrocker/shoal-oss/internal/compaction"
 	"github.com/phrocker/shoal-oss/internal/compactjob"
+	"github.com/phrocker/shoal-oss/internal/embeddingspace"
 	"github.com/phrocker/shoal-oss/internal/storage"
 	"github.com/phrocker/shoal-oss/internal/thrift/gen/data"
 )
@@ -158,6 +159,21 @@ type Result struct {
 	Extent     *data.TKeyExtent
 	OutputFile string
 	Stats      Stats
+
+	// EmbeddingSpace is the space the published output is labelled with.
+	// It is what the caller must persist into the file.embedding column
+	// family for the new file.
+	EmbeddingSpace embeddingspace.FileState
+
+	// Converged reports whether this compaction actually re-embedded its
+	// inputs, as opposed to preserving whatever space they already had.
+	Converged bool
+
+	// EmbeddingEpoch is the migration snapshot this output belongs to,
+	// and is set only when Converged. It is what lets a coordinator
+	// attribute a converged file to the migration that produced it and
+	// discard a completion that belongs to a superseded epoch.
+	EmbeddingEpoch string
 }
 
 // Execute recovers the job's exact temporary output path, reads all inputs,
@@ -255,6 +271,9 @@ func (e *Executor) Execute(ctx context.Context, plan *compactjob.Plan) (*Result,
 			FinishedAt:     finished,
 			Duration:       finished.Sub(started),
 		},
+		EmbeddingSpace: compacted.EmbeddingSpace,
+		Converged:      compacted.Converged,
+		EmbeddingEpoch: compacted.EmbeddingEpoch,
 	}, nil
 }
 

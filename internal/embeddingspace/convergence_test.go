@@ -86,7 +86,13 @@ func TestEnsureMonotonicAcceptsOnlyMovementTowardTheTarget(t *testing.T) {
 		{"unchanged is the provider-failure outcome", "model-a", Has("model-b"), Has("model-b"), false},
 		{"reaching the target", "model-a", Has("model-b"), Has("model-a"), false},
 		{"backfill reaching the target", "model-a", NoEmbeddings(), Has("model-a"), false},
-		{"degrading to no_embeddings is fail-closed", "model-a", Has("model-b"), NoEmbeddings(), false},
+		// no_embeddings is a positive assertion that the file holds no
+		// vectors, not a weaker claim than has_embeddings. Accepting it as a
+		// degradation would let a failed convergence mislabel a file that
+		// still holds model-b vectors and hide them from planning forever.
+		{"no_embeddings is not a legal degradation", "model-a", Has("model-b"), NoEmbeddings(), true},
+		{"unknown to no_embeddings is not a legal degradation", "model-a", Unknown(), NoEmbeddings(), true},
+		{"no_embeddings to unknown is legal", "model-a", NoEmbeddings(), Unknown(), false},
 		{"degrading to unknown is fail-closed", "model-a", Has("model-b"), Unknown(), false},
 		{"dropping out of the target", "model-a", Has("model-a"), NoEmbeddings(), true},
 		{"target to a third space", "model-a", Has("model-a"), Has("model-c"), true},
@@ -115,8 +121,11 @@ func TestEnsureMonotonicWithoutATargetStillRefusesANewIdentity(t *testing.T) {
 	if err := EnsureMonotonic("", Has("model-b"), Has("model-c")); !errors.Is(err, ErrNotMonotonic) {
 		t.Fatalf("err = %v, want ErrNotMonotonic", err)
 	}
-	if err := EnsureMonotonic("", Has("model-b"), NoEmbeddings()); err != nil {
-		t.Fatalf("degrading without a target is legal: %v", err)
+	if err := EnsureMonotonic("", Has("model-b"), Unknown()); err != nil {
+		t.Fatalf("degrading to unknown without a target is legal: %v", err)
+	}
+	if err := EnsureMonotonic("", Has("model-b"), NoEmbeddings()); !errors.Is(err, ErrNotMonotonic) {
+		t.Fatalf("err = %v, want ErrNotMonotonic: no_embeddings asserts the vectors are gone", err)
 	}
 }
 

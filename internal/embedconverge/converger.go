@@ -8,6 +8,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 
 	"github.com/phrocker/shoal-oss/internal/compaction"
 	"github.com/phrocker/shoal-oss/internal/embeddingspace"
@@ -50,12 +51,13 @@ func (f RewriterFunc) Rewrite(
 // node: the Governor it holds is what makes the rate limit and budget
 // apply to the node rather than to each job.
 //
-// It holds no per-attempt state, which is what makes sharing safe. The
-// cell count a compaction converted comes back through End rather than
-// being accumulated here, so two concurrent compactions cannot
-// mis-attribute each other's work.
+// It holds no per-attempt state. Everything one compaction consumes —
+// the rate-limit permit, the file reservation, the cells it charges —
+// lives on the attempt Begin returns, so two concurrent compactions can
+// neither mis-attribute nor settle each other's work.
 type Converger struct {
 	target   string
+	epoch    string
 	governor *Governor
 	rewriter Rewriter
 	observer func(Outcome)
@@ -64,24 +66,51 @@ type Converger struct {
 // Outcome reports one compaction's convergence result to an observer.
 type Outcome struct {
 	Target    string
+	Epoch     string
+	Files     int64
 	Converged bool
 	Cells     int64
 	Err       error
 }
 
-// NewConverger builds a Converger for target.
-//
-// target is the identity this Converger's embedder actually produces —
-// it must come from model.EmbeddingSpaceIdentity, never from
-// CacheIdentity. CacheIdentity folds in the provider base URL, the HTTP
-// client, credential identity and the maximum text size, none of which
-// change a single vector: keying convergence on it would make moving an
-// Ollama server to a different port invalidate every embedding in the
-// corpus despite the vectors being bit-identical.
-func NewConverger(
-	target string, governor *Governor, rewriter Rewriter, observer func(Outcome),
-) (*Converger, error) {
-	normalized, err := embeddingspace.ParseTarget(target)
+// ConvergerOptions configures a Converger.
+type ConvergerOptions struct {
+	// Target is the identity this Converger's embedder actually
+	// produces — it must come from model.EmbeddingSpaceIdentity, never
+	// from CacheIdentity. CacheIdentity folds in the provider base URL,
+	// the HTTP client, credential identity and the maximum text size,
+	// none of which change a single vector: keying convergence on it
+	// would make moving an Ollama server to a different port invalidate
+	// every embedding in the corpus despite the vectors being
+	// bit-identical.
+	Target string
+
+	// Epoch binds this Converger to one migration snapshot. Empty means
+	// unbound, which accepts only compactions that are themselves
+	// unstamped.
+	//
+	// Requiring an exact match is what stops a target change from making
+	// the corpus oscillate: after the target moves from A to B a new
+	// epoch is taken, and compactions still carrying the old epoch are
+	// refused rather than publishing A-labelled files into a table that
+	// has moved on. Refusing is safe because a refused compaction still
+	// runs, unconverged, preserving its inputs.
+	Epoch string
+
+	// Governor supplies the rate limit, budget and kill switch.
+	Governor *Governor
+
+	// Rewriter re-embeds cell values.
+	Rewriter Rewriter
+
+	// Observer, when non-nil, is called once per settled attempt. It
+	// must be safe for concurrent use.
+	Observer func(Outcome)
+}
+
+// NewConverger builds a Converger.
+func NewConverger(opts ConvergerOptions) (*Converger, error) {
+	normalized, err := embeddingspace.ParseTarget(opts.Target)
 	if err != nil {
 		return nil, err
 	}
@@ -89,74 +118,129 @@ func NewConverger(
 		return nil, fmt.Errorf("%w: converger needs a target embedding space",
 			embeddingspace.ErrNoTarget)
 	}
-	if governor == nil {
+	if opts.Governor == nil {
 		return nil, fmt.Errorf("embedconverge: converger needs a governor")
 	}
-	if rewriter == nil {
+	if opts.Rewriter == nil {
 		return nil, fmt.Errorf("embedconverge: converger needs a rewriter")
 	}
 	return &Converger{
 		target:   normalized,
-		governor: governor,
-		rewriter: rewriter,
-		observer: observer,
+		epoch:    strings.TrimSpace(opts.Epoch),
+		governor: opts.Governor,
+		rewriter: opts.Rewriter,
+		observer: opts.Observer,
 	}, nil
 }
 
 // Target reports the space this Converger converges to.
 func (c *Converger) Target() string { return c.target }
 
+// Epoch reports the migration snapshot this Converger is bound to, or
+// empty when it is unbound.
+func (c *Converger) Epoch() string { return c.epoch }
+
 // Begin admits one compaction's convergence attempt.
+//
+// Every refusal wraps embeddingspace.ErrConvergenceUnavailable and
+// returns a nil attempt, having taken nothing. That is what makes the
+// accounting sound: there is no path on which a caller settles an
+// attempt that was never admitted.
 func (c *Converger) Begin(
-	ctx context.Context, target string, inputs []embeddingspace.FileState,
-) error {
+	ctx context.Context, req compaction.ConvergeRequest,
+) (compaction.ConvergeAttempt, error) {
 	if err := ctx.Err(); err != nil {
-		return err
+		return nil, err
 	}
-	if strings.TrimSpace(target) != c.target {
+	if strings.TrimSpace(req.Target) != c.target {
 		// The table wants a space this embedder cannot produce. Refusing
 		// as "unavailable" rather than as an error is deliberate: the
 		// compaction still runs and preserves its inputs, and a node
 		// that *can* produce the target converges the file later. Failing
 		// the compaction would let one misconfigured node block every
 		// compaction on the table.
-		return fmt.Errorf("%w: converger produces %q but the table targets %q",
-			embeddingspace.ErrConvergenceUnavailable, c.target, strings.TrimSpace(target))
+		return nil, fmt.Errorf("%w: converger produces %q but the table targets %q",
+			embeddingspace.ErrConvergenceUnavailable, c.target, strings.TrimSpace(req.Target))
 	}
-	if len(inputs) == 0 {
-		return fmt.Errorf("%w: nothing to converge", embeddingspace.ErrConvergenceUnavailable)
+	if epoch := strings.TrimSpace(req.Epoch); epoch != c.epoch {
+		return nil, fmt.Errorf("%w: converger serves epoch %q but the compaction carries %q",
+			embeddingspace.ErrConvergenceUnavailable, c.epoch, epoch)
 	}
-	return c.governor.AdmitFile()
+	if len(req.Inputs) == 0 {
+		return nil, fmt.Errorf("%w: nothing to converge", embeddingspace.ErrConvergenceUnavailable)
+	}
+	permit, err := c.governor.AdmitFiles(int64(len(req.Inputs)))
+	if err != nil {
+		return nil, err
+	}
+	return &convergeAttempt{converger: c, permit: permit}, nil
+}
+
+// convergeAttempt is one compaction's admitted convergence. It owns the
+// Governor reservation for that compaction and nothing else's.
+type convergeAttempt struct {
+	converger *Converger
+	permit    *Permit
+
+	mu    sync.Mutex
+	ended bool
 }
 
 // Convert rewrites one cell.
 //
-// The kill switch is checked here, per cell, rather than only at Begin.
-// A migration over a large corpus can sit inside a single compaction for
-// a long time, and an operator who hits stop should not have to wait for
-// it to finish.
-func (c *Converger) Convert(
+// The kill switch and the cell budget are enforced here, per cell,
+// rather than only at Begin. A migration over a large corpus can sit
+// inside a single compaction for a long time: an operator who hits stop
+// should not have to wait for it to finish, and a cell budget that only
+// settled between files could not bound one enormous file at all.
+func (a *convergeAttempt) Convert(
 	ctx context.Context, key *iterrt.Key, value []byte,
 ) ([]byte, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if err := c.governor.CheckRunning(0); err != nil {
+	// Charged before the provider is called, so a refusal costs nothing
+	// and a charge is never recorded for work that did not happen.
+	if err := a.converger.governor.ChargeCell(); err != nil {
 		return nil, err
 	}
-	converted, err := c.rewriter.Rewrite(ctx, c.target, key, value)
-	if err != nil {
-		return nil, err
-	}
-	return converted, nil
+	return a.converger.rewriter.Rewrite(ctx, a.converger.target, key, value)
 }
 
-// End settles the attempt against the Governor's budget and reports it.
-func (c *Converger) End(ctx context.Context, converted bool, cells int64, err error) {
-	c.governor.SettleFile(converted, cells)
-	if c.observer != nil {
-		c.observer(Outcome{Target: c.target, Converged: converted, Cells: cells, Err: err})
+// End settles the attempt against the Governor's reservation and reports
+// it. It is idempotent.
+//
+// cells is reported to the observer only; conversions were already
+// charged as they happened, so settling them again here would count
+// every cell twice.
+func (a *convergeAttempt) End(_ context.Context, converted bool, cells int64, err error) {
+	a.mu.Lock()
+	if a.ended {
+		a.mu.Unlock()
+		return
+	}
+	a.ended = true
+	a.mu.Unlock()
+
+	files := a.permit.Files()
+	if converted {
+		a.permit.Settle(files)
+	} else {
+		a.permit.Settle(0)
+	}
+	if a.converger.observer != nil {
+		a.converger.observer(Outcome{
+			Target:    a.converger.target,
+			Epoch:     a.converger.epoch,
+			Files:     files,
+			Converged: converted,
+			Cells:     cells,
+			Err:       err,
+		})
 	}
 }
 
-var _ compaction.Converger = (*Converger)(nil)
+var (
+	_ compaction.Converger       = (*Converger)(nil)
+	_ compaction.ConvergeAttempt = (*convergeAttempt)(nil)
+)

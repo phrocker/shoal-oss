@@ -7,9 +7,11 @@ package embedconverge
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/phrocker/shoal-oss/internal/compaction"
 	"github.com/phrocker/shoal-oss/internal/embeddingspace"
 	"github.com/phrocker/shoal-oss/internal/iterrt"
 )
@@ -22,69 +24,256 @@ func passthrough() Rewriter {
 	})
 }
 
+func states(n int) []embeddingspace.FileState {
+	out := make([]embeddingspace.FileState, 0, n)
+	for i := 0; i < n; i++ {
+		out = append(out, embeddingspace.Has("model-b"))
+	}
+	return out
+}
+
+func mustConverger(t *testing.T, opts ConvergerOptions) *Converger {
+	t.Helper()
+	if opts.Rewriter == nil {
+		opts.Rewriter = passthrough()
+	}
+	c, err := NewConverger(opts)
+	if err != nil {
+		t.Fatalf("NewConverger: %v", err)
+	}
+	return c
+}
+
 func TestNewConvergerRequiresATargetAndItsCollaborators(t *testing.T) {
 	t.Parallel()
 
 	g := NewGovernor(GovernorOptions{Now: time.Now})
-	if _, err := NewConverger("  ", g, passthrough(), nil); !errors.Is(err, embeddingspace.ErrNoTarget) {
+	_, err := NewConverger(ConvergerOptions{Target: "  ", Governor: g, Rewriter: passthrough()})
+	if !errors.Is(err, embeddingspace.ErrNoTarget) {
 		t.Fatalf("err = %v, want ErrNoTarget", err)
 	}
-	if _, err := NewConverger("model-a", nil, passthrough(), nil); err == nil {
+	if _, err := NewConverger(ConvergerOptions{Target: "model-a", Rewriter: passthrough()}); err == nil {
 		t.Fatal("a converger without a governor is unthrottled and must be refused")
 	}
-	if _, err := NewConverger("model-a", g, nil, nil); err == nil {
+	if _, err := NewConverger(ConvergerOptions{Target: "model-a", Governor: g}); err == nil {
 		t.Fatal("a converger without a rewriter must be refused")
 	}
-	c, err := NewConverger("  model-a  ", g, passthrough(), nil)
-	if err != nil {
-		t.Fatalf("NewConverger: %v", err)
-	}
+	c := mustConverger(t, ConvergerOptions{Target: "  model-a  ", Governor: g, Epoch: "  e1  "})
 	if c.Target() != "model-a" {
 		t.Fatalf("Target = %q, want %q", c.Target(), "model-a")
+	}
+	if c.Epoch() != "e1" {
+		t.Fatalf("Epoch = %q, want %q", c.Epoch(), "e1")
 	}
 }
 
 func TestConvergerRefusesATargetItCannotProduce(t *testing.T) {
 	t.Parallel()
 
-	c, err := NewConverger("model-a", NewGovernor(GovernorOptions{Now: time.Now}), passthrough(), nil)
-	if err != nil {
-		t.Fatalf("NewConverger: %v", err)
-	}
-	err = c.Begin(context.Background(), "model-z", []embeddingspace.FileState{embeddingspace.NoEmbeddings()})
+	c := mustConverger(t, ConvergerOptions{
+		Target:   "model-a",
+		Governor: NewGovernor(GovernorOptions{Now: time.Now}),
+	})
+	ctx := context.Background()
+
+	_, err := c.Begin(ctx, compaction.ConvergeRequest{Target: "model-z", Inputs: states(1)})
 	if !errors.Is(err, embeddingspace.ErrConvergenceUnavailable) {
 		t.Fatalf("err = %v, want ErrConvergenceUnavailable: a misconfigured node must not fail the compaction", err)
 	}
-	err = c.Begin(context.Background(), "model-a", nil)
+	_, err = c.Begin(ctx, compaction.ConvergeRequest{Target: "model-a"})
 	if !errors.Is(err, embeddingspace.ErrConvergenceUnavailable) {
 		t.Fatalf("err = %v, want ErrConvergenceUnavailable with no inputs", err)
 	}
-	if err := c.Begin(context.Background(), " model-a ", []embeddingspace.FileState{embeddingspace.Unknown()}); err != nil {
+	attempt, err := c.Begin(ctx, compaction.ConvergeRequest{Target: " model-a ", Inputs: states(1)})
+	if err != nil {
 		t.Fatalf("Begin: %v", err)
+	}
+	if attempt == nil {
+		t.Fatal("an admitted Begin must return an attempt")
 	}
 }
 
-func TestConvergerBeginConsumesGovernorAdmission(t *testing.T) {
+// TestConvergerRefusesAMismatchedEpoch is the anti-oscillation guard: a
+// converger serving one migration snapshot must not converge a
+// compaction that belongs to another.
+func TestConvergerRefusesAMismatchedEpoch(t *testing.T) {
 	t.Parallel()
 
-	clock := newFakeClock()
-	g := NewGovernor(GovernorOptions{FilesPerSecond: 1, Burst: 1, Now: clock.Now})
-	c, err := NewConverger("model-a", g, passthrough(), nil)
-	if err != nil {
-		t.Fatalf("NewConverger: %v", err)
+	g := NewGovernor(GovernorOptions{Now: time.Now})
+	c := mustConverger(t, ConvergerOptions{Target: "model-a", Epoch: "epoch-2", Governor: g})
+	ctx := context.Background()
+
+	for _, epoch := range []string{"", "epoch-1"} {
+		_, err := c.Begin(ctx, compaction.ConvergeRequest{
+			Target: "model-a", Epoch: epoch, Inputs: states(1),
+		})
+		if !errors.Is(err, embeddingspace.ErrConvergenceUnavailable) {
+			t.Fatalf("epoch %q: err = %v, want ErrConvergenceUnavailable", epoch, err)
+		}
 	}
-	inputs := []embeddingspace.FileState{embeddingspace.Has("model-b")}
-	if err := c.Begin(context.Background(), "model-a", inputs); err != nil {
-		t.Fatalf("first Begin: %v", err)
+	if got := g.Stats().SpentFiles; got != 0 {
+		t.Fatalf("SpentFiles = %d, want a refused epoch to reserve nothing", got)
 	}
-	if err := c.Begin(context.Background(), "model-a", inputs); !errors.Is(err, ErrThrottled) {
-		t.Fatalf("err = %v, want ErrThrottled", err)
+	if _, err := c.Begin(ctx, compaction.ConvergeRequest{
+		Target: "model-a", Epoch: " epoch-2 ", Inputs: states(1),
+	}); err != nil {
+		t.Fatalf("the matching epoch must be admitted: %v", err)
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	if err := c.Begin(ctx, "model-a", inputs); !errors.Is(err, context.Canceled) {
-		t.Fatalf("err = %v, want context.Canceled", err)
+	// An unbound converger accepts only unstamped compactions.
+	unbound := mustConverger(t, ConvergerOptions{
+		Target: "model-a", Governor: NewGovernor(GovernorOptions{Now: time.Now}),
+	})
+	if _, err := unbound.Begin(ctx, compaction.ConvergeRequest{
+		Target: "model-a", Epoch: "epoch-2", Inputs: states(1),
+	}); !errors.Is(err, embeddingspace.ErrConvergenceUnavailable) {
+		t.Fatalf("err = %v, want an unbound converger to refuse a stamped compaction", err)
+	}
+}
+
+// TestConvergerReservesOnePermitPerInputFile covers finding 5: a
+// compaction merging n files consumes n units of the file budget, not
+// one. Charging one would let a single compaction converge an entire
+// tablet against a budget of one file.
+func TestConvergerReservesOnePermitPerInputFile(t *testing.T) {
+	t.Parallel()
+
+	g := NewGovernor(GovernorOptions{Budget: Budget{MaxFiles: 5}, Now: time.Now})
+	c := mustConverger(t, ConvergerOptions{Target: "model-a", Governor: g})
+	ctx := context.Background()
+
+	attempt, err := c.Begin(ctx, compaction.ConvergeRequest{Target: "model-a", Inputs: states(4)})
+	if err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+	if got := g.Stats().SpentFiles; got != 4 {
+		t.Fatalf("SpentFiles = %d, want 4 — one per input file", got)
+	}
+	// Only one permit is left, so a second four-file compaction cannot be
+	// admitted at all. All-or-nothing matters: a partial reservation
+	// would start work the budget cannot finish.
+	if _, err := c.Begin(ctx, compaction.ConvergeRequest{
+		Target: "model-a", Inputs: states(4),
+	}); !errors.Is(err, ErrBudgetExhausted) {
+		t.Fatalf("err = %v, want ErrBudgetExhausted", err)
+	}
+	if got := g.Stats().SpentFiles; got != 4 {
+		t.Fatalf("SpentFiles = %d, want a refused Begin to reserve nothing", got)
+	}
+	attempt.End(ctx, true, 0, nil)
+	if got := g.Stats().SpentFiles; got != 4 {
+		t.Fatalf("SpentFiles = %d, want a converged attempt to keep all four", got)
+	}
+}
+
+// TestConvergerRefundsEveryPermitOfAFailedAttempt is the other half of
+// finding 5: a provider outage must give back the whole reservation, not
+// one file of it, or a few failures would exhaust the budget.
+func TestConvergerRefundsEveryPermitOfAFailedAttempt(t *testing.T) {
+	t.Parallel()
+
+	g := NewGovernor(GovernorOptions{Budget: Budget{MaxFiles: 4}, Now: time.Now})
+	c := mustConverger(t, ConvergerOptions{Target: "model-a", Governor: g})
+	ctx := context.Background()
+
+	attempt, err := c.Begin(ctx, compaction.ConvergeRequest{Target: "model-a", Inputs: states(4)})
+	if err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+	attempt.End(ctx, false, 3, errors.New("provider down"))
+	if got := g.Stats().SpentFiles; got != 0 {
+		t.Fatalf("SpentFiles = %d, want the whole reservation refunded", got)
+	}
+	if _, err := c.Begin(ctx, compaction.ConvergeRequest{
+		Target: "model-a", Inputs: states(4),
+	}); err != nil {
+		t.Fatalf("the budget must be usable again: %v", err)
+	}
+}
+
+// TestConvergerEndIsAttemptScoped covers finding 2: two concurrent
+// attempts hold separate reservations, so settling one cannot refund the
+// other's, and a double End cannot refund twice.
+func TestConvergerEndIsAttemptScoped(t *testing.T) {
+	t.Parallel()
+
+	var mu sync.Mutex
+	outcomes := 0
+	g := NewGovernor(GovernorOptions{Budget: Budget{MaxFiles: 10}, Now: time.Now})
+	c := mustConverger(t, ConvergerOptions{Target: "model-a", Governor: g, Observer: func(Outcome) {
+		mu.Lock()
+		outcomes++
+		mu.Unlock()
+	}})
+	ctx := context.Background()
+
+	first, err := c.Begin(ctx, compaction.ConvergeRequest{Target: "model-a", Inputs: states(3)})
+	if err != nil {
+		t.Fatalf("first Begin: %v", err)
+	}
+	second, err := c.Begin(ctx, compaction.ConvergeRequest{Target: "model-a", Inputs: states(2)})
+	if err != nil {
+		t.Fatalf("second Begin: %v", err)
+	}
+	if got := g.Stats().SpentFiles; got != 5 {
+		t.Fatalf("SpentFiles = %d, want 5", got)
+	}
+	first.End(ctx, false, 0, errors.New("provider down"))
+	if got := g.Stats().SpentFiles; got != 2 {
+		t.Fatalf("SpentFiles = %d, want only the first attempt's 3 refunded", got)
+	}
+	// Idempotence: a second End must not refund the other attempt's
+	// permits by accident.
+	first.End(ctx, false, 0, nil)
+	if got := g.Stats().SpentFiles; got != 2 {
+		t.Fatalf("SpentFiles = %d after a duplicate End, want 2", got)
+	}
+	second.End(ctx, true, 0, nil)
+	if got := g.Stats().SpentFiles; got != 2 {
+		t.Fatalf("SpentFiles = %d, want the converged attempt to keep its 2", got)
+	}
+	// Three End calls, two attempts: the duplicate must not be reported
+	// either, or migration accounting double-counts every retry.
+	mu.Lock()
+	defer mu.Unlock()
+	if outcomes != 2 {
+		t.Fatalf("observer saw %d outcomes, want 2", outcomes)
+	}
+}
+
+// TestConvergerChargesEveryCellAsItConverts covers finding 6: the cell
+// budget must be able to stop a conversion mid-file, which it cannot do
+// if cells are only counted when the file finishes.
+func TestConvergerChargesEveryCellAsItConverts(t *testing.T) {
+	t.Parallel()
+
+	g := NewGovernor(GovernorOptions{Budget: Budget{MaxCells: 3}, Now: time.Now})
+	c := mustConverger(t, ConvergerOptions{Target: "model-a", Governor: g})
+	ctx := context.Background()
+
+	attempt, err := c.Begin(ctx, compaction.ConvergeRequest{Target: "model-a", Inputs: states(1)})
+	if err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+	for i := 0; i < 3; i++ {
+		if _, err := attempt.Convert(ctx, nil, []byte("cell")); err != nil {
+			t.Fatalf("cell %d: %v", i, err)
+		}
+		if got := g.Stats().SpentCells; got != int64(i+1) {
+			t.Fatalf("after cell %d SpentCells = %d, want %d", i, got, i+1)
+		}
+	}
+	// The budget stops the file mid-stream rather than after it.
+	if _, err := attempt.Convert(ctx, nil, []byte("cell")); !errors.Is(err, ErrBudgetExhausted) {
+		t.Fatalf("err = %v, want ErrBudgetExhausted mid-file", err)
+	}
+	if got := g.Stats().SpentCells; got != 3 {
+		t.Fatalf("SpentCells = %d, want a refused cell to charge nothing", got)
+	}
+	// End reports cells to the observer but must not charge them again.
+	attempt.End(ctx, false, 3, errors.New("budget"))
+	if got := g.Stats().SpentCells; got != 3 {
+		t.Fatalf("SpentCells = %d after End, want cells charged exactly once", got)
 	}
 }
 
@@ -92,11 +281,14 @@ func TestConvergerConvertHonoursTheKillSwitchPerCell(t *testing.T) {
 	t.Parallel()
 
 	g := NewGovernor(GovernorOptions{Now: time.Now})
-	c, err := NewConverger("model-a", g, passthrough(), nil)
+	c := mustConverger(t, ConvergerOptions{Target: "model-a", Governor: g})
+	ctx := context.Background()
+
+	attempt, err := c.Begin(ctx, compaction.ConvergeRequest{Target: "model-a", Inputs: states(1)})
 	if err != nil {
-		t.Fatalf("NewConverger: %v", err)
+		t.Fatalf("Begin: %v", err)
 	}
-	value, err := c.Convert(context.Background(), nil, []byte("cell"))
+	value, err := attempt.Convert(ctx, nil, []byte("cell"))
 	if err != nil {
 		t.Fatalf("Convert: %v", err)
 	}
@@ -105,8 +297,36 @@ func TestConvergerConvertHonoursTheKillSwitchPerCell(t *testing.T) {
 	}
 
 	g.Stop()
-	if _, err := c.Convert(context.Background(), nil, []byte("cell")); !errors.Is(err, ErrStopped) {
+	if _, err := attempt.Convert(ctx, nil, []byte("cell")); !errors.Is(err, ErrStopped) {
 		t.Fatalf("err = %v, want ErrStopped mid-stream", err)
+	}
+}
+
+func TestConvergerBeginRespectsTheRateLimitAndContext(t *testing.T) {
+	t.Parallel()
+
+	clock := newFakeClock()
+	g := NewGovernor(GovernorOptions{FilesPerSecond: 1, Burst: 1, Now: clock.Now})
+	c := mustConverger(t, ConvergerOptions{Target: "model-a", Governor: g})
+	ctx := context.Background()
+
+	if _, err := c.Begin(ctx, compaction.ConvergeRequest{
+		Target: "model-a", Inputs: states(1),
+	}); err != nil {
+		t.Fatalf("first Begin: %v", err)
+	}
+	if _, err := c.Begin(ctx, compaction.ConvergeRequest{
+		Target: "model-a", Inputs: states(1),
+	}); !errors.Is(err, ErrThrottled) {
+		t.Fatalf("err = %v, want ErrThrottled", err)
+	}
+
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := c.Begin(cancelled, compaction.ConvergeRequest{
+		Target: "model-a", Inputs: states(1),
+	}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want context.Canceled", err)
 	}
 }
 
@@ -122,57 +342,124 @@ func TestConvergerConvertReportsRewriterFailure(t *testing.T) {
 		}
 		return nil, boom
 	})
-	c, err := NewConverger("model-a", NewGovernor(GovernorOptions{Now: time.Now}), rewriter, nil)
+	c := mustConverger(t, ConvergerOptions{
+		Target:   "model-a",
+		Governor: NewGovernor(GovernorOptions{Now: time.Now}),
+		Rewriter: rewriter,
+	})
+	ctx := context.Background()
+	attempt, err := c.Begin(ctx, compaction.ConvergeRequest{Target: "model-a", Inputs: states(1)})
 	if err != nil {
-		t.Fatalf("NewConverger: %v", err)
+		t.Fatalf("Begin: %v", err)
 	}
-	if _, err := c.Convert(context.Background(), nil, []byte("cell")); !errors.Is(err, boom) {
+	if _, err := attempt.Convert(ctx, nil, []byte("cell")); !errors.Is(err, boom) {
 		t.Fatalf("err = %v, want the rewriter's error", err)
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
+	cancelled, cancel := context.WithCancel(context.Background())
 	cancel()
-	if _, err := c.Convert(ctx, nil, []byte("cell")); !errors.Is(err, context.Canceled) {
+	if _, err := attempt.Convert(cancelled, nil, []byte("cell")); !errors.Is(err, context.Canceled) {
 		t.Fatalf("err = %v, want context.Canceled", err)
 	}
 }
 
-func TestConvergerEndSettlesTheBudgetAndReports(t *testing.T) {
+func TestConvergerEndReportsTheOutcome(t *testing.T) {
 	t.Parallel()
 
+	var mu sync.Mutex
 	var seen []Outcome
-	g := NewGovernor(GovernorOptions{Budget: Budget{MaxFiles: 1}, Now: time.Now})
-	c, err := NewConverger("model-a", g, passthrough(), func(o Outcome) {
-		seen = append(seen, o)
+	g := NewGovernor(GovernorOptions{Budget: Budget{MaxFiles: 2}, Now: time.Now})
+	c := mustConverger(t, ConvergerOptions{
+		Target:   "model-a",
+		Epoch:    "epoch-9",
+		Governor: g,
+		Observer: func(o Outcome) {
+			mu.Lock()
+			defer mu.Unlock()
+			seen = append(seen, o)
+		},
+	})
+	ctx := context.Background()
+
+	failed, err := c.Begin(ctx, compaction.ConvergeRequest{
+		Target: "model-a", Epoch: "epoch-9", Inputs: states(1),
 	})
 	if err != nil {
-		t.Fatalf("NewConverger: %v", err)
-	}
-	inputs := []embeddingspace.FileState{embeddingspace.Has("model-b")}
-	if err := c.Begin(context.Background(), "model-a", inputs); err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
-	// A failed attempt refunds the file permit, so a provider outage
-	// cannot silently eat the whole budget.
-	c.End(context.Background(), false, 7, errors.New("provider down"))
-	if err := c.Begin(context.Background(), "model-a", inputs); err != nil {
+	failed.End(ctx, false, 7, errors.New("provider down"))
+
+	ok, err := c.Begin(ctx, compaction.ConvergeRequest{
+		Target: "model-a", Epoch: "epoch-9", Inputs: states(1),
+	})
+	if err != nil {
 		t.Fatalf("a failed attempt must leave the file admissible: %v", err)
 	}
-	c.End(context.Background(), true, 5, nil)
-	if err := c.Begin(context.Background(), "model-a", inputs); !errors.Is(err, ErrBudgetExhausted) {
-		t.Fatalf("err = %v, want ErrBudgetExhausted", err)
-	}
+	ok.End(ctx, true, 5, nil)
 
+	mu.Lock()
+	defer mu.Unlock()
 	if len(seen) != 2 {
 		t.Fatalf("observer saw %d outcomes, want 2", len(seen))
 	}
-	if seen[0].Converged || seen[0].Cells != 7 || seen[0].Err == nil {
+	if seen[0].Converged || seen[0].Cells != 7 || seen[0].Err == nil || seen[0].Files != 1 {
 		t.Fatalf("first outcome = %+v", seen[0])
 	}
-	if !seen[1].Converged || seen[1].Cells != 5 || seen[1].Target != "model-a" {
+	if !seen[1].Converged || seen[1].Cells != 5 ||
+		seen[1].Target != "model-a" || seen[1].Epoch != "epoch-9" {
 		t.Fatalf("second outcome = %+v", seen[1])
 	}
-	if got := g.Stats().SpentCells; got != 12 {
-		t.Fatalf("SpentCells = %d, want 12", got)
+}
+
+// TestConvergerIsSafeForConcurrentCompactions exercises the shared-state
+// paths the race detector checks in CI: one Converger, many attempts.
+func TestConvergerIsSafeForConcurrentCompactions(t *testing.T) {
+	t.Parallel()
+
+	g := NewGovernor(GovernorOptions{Now: time.Now})
+	var count int64
+	var mu sync.Mutex
+	c := mustConverger(t, ConvergerOptions{
+		Target:   "model-a",
+		Governor: g,
+		Observer: func(Outcome) {
+			mu.Lock()
+			count++
+			mu.Unlock()
+		},
+	})
+	ctx := context.Background()
+
+	var wg sync.WaitGroup
+	for i := 0; i < 16; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			attempt, err := c.Begin(ctx, compaction.ConvergeRequest{
+				Target: "model-a", Inputs: states(2),
+			})
+			if err != nil {
+				return
+			}
+			for j := 0; j < 8; j++ {
+				if _, err := attempt.Convert(ctx, nil, []byte("cell")); err != nil {
+					break
+				}
+			}
+			attempt.End(ctx, true, 8, nil)
+		}()
+	}
+	wg.Wait()
+
+	mu.Lock()
+	defer mu.Unlock()
+	if count != 16 {
+		t.Fatalf("observer saw %d outcomes, want 16", count)
+	}
+	if got := g.Stats().SpentFiles; got != 32 {
+		t.Fatalf("SpentFiles = %d, want 32", got)
+	}
+	if got := g.Stats().SpentCells; got != 128 {
+		t.Fatalf("SpentCells = %d, want 128", got)
 	}
 }

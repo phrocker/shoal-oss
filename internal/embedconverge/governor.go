@@ -192,64 +192,153 @@ func (g *Governor) Stop() {
 	g.state = StateStopped
 }
 
-// AdmitFile asks for permission to converge one file. The returned error
-// always wraps embeddingspace.ErrConvergenceUnavailable, so a caller
-// that only needs to know "not now" can test for that, while an operator
-// interface can still tell throttling from an exhausted budget.
+// AdmitFiles reserves permission to converge n files as one atomic
+// reservation, returning the Permit that must settle it.
+//
+// The reservation is all-or-nothing. A compaction that merges eight
+// files re-embeds eight files' worth of cells, so charging it one unit
+// of MaxFiles would let a budget of "100 files" convert thousands.
+// Taking the whole reservation up front also means a compaction never
+// starts converging on a budget that cannot cover it.
+//
+// The returned error always wraps
+// embeddingspace.ErrConvergenceUnavailable, so a caller that only needs
+// to know "not now" can test for that, while an operator interface can
+// still tell throttling from an exhausted budget. On error the Permit is
+// nil and nothing was taken, so there is nothing to settle.
 //
 // Admission never blocks. A compaction that is refused runs unconverged
 // and preserves its inputs' space, which is strictly better than holding
 // a compaction slot open waiting for a token.
-func (g *Governor) AdmitFile() error {
+func (g *Governor) AdmitFiles(n int64) (*Permit, error) {
+	if n <= 0 {
+		return nil, fmt.Errorf("%w: nothing to admit", embeddingspace.ErrConvergenceUnavailable)
+	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	if err := g.stateErrorLocked(); err != nil {
 		g.refused++
+		return nil, err
+	}
+	if err := g.fileBudgetErrorLocked(n); err != nil {
+		g.refused++
+		return nil, err
+	}
+	if err := g.cellBudgetErrorLocked(0); err != nil {
+		g.refused++
+		return nil, err
+	}
+	if !g.takeTokensLocked(n) {
+		g.refused++
+		return nil, fmt.Errorf("%w: %w: %d permits requested, %.3f available at %.3f/s",
+			embeddingspace.ErrConvergenceUnavailable, ErrThrottled, n, g.tokens, g.rate)
+	}
+	g.spentFiles += n
+	g.admitted += n
+	return &Permit{governor: g, files: n}, nil
+}
+
+// AdmitFile reserves one file. It is AdmitFiles(1).
+func (g *Governor) AdmitFile() (*Permit, error) { return g.AdmitFiles(1) }
+
+// Permit is one admitted reservation. It belongs to exactly one
+// convergence attempt, which is what keeps concurrent compactions from
+// settling each other's accounting: without it, any attempt reaching a
+// shared Governor could refund a permit it never took, and the file
+// budget would drift upward under concurrency.
+//
+// Settle must be called exactly once; further calls are no-ops so a
+// deferred Settle alongside an explicit one cannot double-refund.
+type Permit struct {
+	mu       sync.Mutex
+	governor *Governor
+	files    int64
+	settled  bool
+}
+
+// Files reports how many file permits this reservation holds.
+func (p *Permit) Files() int64 {
+	if p == nil {
+		return 0
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.files
+}
+
+// Settle closes the reservation, keeping converged of its file permits
+// charged and refunding the rest.
+//
+// Refunding what did not converge is what keeps a provider outage from
+// silently consuming the file budget: the files were not moved, so they
+// must remain admissible. Cells are not settled here — they are charged
+// as they are converted, by ChargeCell, so that MaxCells can stop a
+// migration part way through a file rather than only between files.
+func (p *Permit) Settle(converged int64) {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.settled {
+		return
+	}
+	p.settled = true
+	if converged < 0 {
+		converged = 0
+	}
+	if converged > p.files {
+		converged = p.files
+	}
+	refund := p.files - converged
+	p.governor.refundFiles(refund)
+}
+
+func (g *Governor) refundFiles(n int64) {
+	if n <= 0 {
+		return
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.spentFiles -= n
+	if g.spentFiles < 0 {
+		g.spentFiles = 0
+	}
+}
+
+// CheckRunning is the per-cell kill-switch probe. It is what makes a
+// stop take effect immediately instead of at the end of whatever file is
+// being rewritten.
+func (g *Governor) CheckRunning() error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.stateErrorLocked()
+}
+
+// ChargeCell charges one converted cell against the budget, atomically
+// with the state and budget check.
+//
+// Charging per cell rather than per file is what gives MaxCells any
+// force. A budget only debited when a file finished could not stop a
+// single enormous file from converting far past the cap, and the
+// operator asking for a bounded migration would get an unbounded one.
+func (g *Governor) ChargeCell() error { return g.ChargeCells(1) }
+
+// ChargeCells charges n converted cells.
+func (g *Governor) ChargeCells(n int64) error {
+	if n <= 0 {
+		return nil
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if err := g.stateErrorLocked(); err != nil {
 		return err
 	}
-	if err := g.budgetErrorLocked(0); err != nil {
-		g.refused++
+	if err := g.cellBudgetErrorLocked(n); err != nil {
 		return err
 	}
-	if !g.takeTokenLocked() {
-		g.refused++
-		return fmt.Errorf("%w: %w: %.3f permits available at %.3f/s",
-			embeddingspace.ErrConvergenceUnavailable, ErrThrottled, g.tokens, g.rate)
-	}
-	g.spentFiles++
-	g.admitted++
+	g.spentCells += n
 	return nil
-}
-
-// CheckRunning is the per-cell kill-switch and budget probe. It is what
-// makes a stop take effect immediately instead of at the end of whatever
-// file is being rewritten.
-func (g *Governor) CheckRunning(convertedSoFar int64) error {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	if err := g.stateErrorLocked(); err != nil {
-		return err
-	}
-	return g.budgetErrorLocked(convertedSoFar)
-}
-
-// SettleFile records the outcome of one admitted file. Cells are charged
-// whether or not the file converged: they were embedded either way, and
-// a budget that only counted successes would let a failing provider be
-// retried without limit.
-func (g *Governor) SettleFile(converged bool, cells int64) {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	if cells > 0 {
-		g.spentCells += cells
-	}
-	if !converged && g.spentFiles > 0 {
-		// The file did not converge, so it must be admissible again.
-		// Refunding the file permit is what keeps a provider outage from
-		// silently consuming the whole file budget; the cells it did
-		// convert before failing stay charged.
-		g.spentFiles--
-	}
 }
 
 // Stats is a consistent snapshot of the Governor's counters.
@@ -287,13 +376,17 @@ func (g *Governor) stateErrorLocked() error {
 	}
 }
 
-func (g *Governor) budgetErrorLocked(pendingCells int64) error {
-	if g.budget.MaxFiles > 0 && g.spentFiles >= g.budget.MaxFiles {
-		return fmt.Errorf("%w: %w: %d of %d files admitted",
+func (g *Governor) fileBudgetErrorLocked(pendingFiles int64) error {
+	if g.budget.MaxFiles > 0 && g.spentFiles+pendingFiles > g.budget.MaxFiles {
+		return fmt.Errorf("%w: %w: %d of %d files reserved",
 			embeddingspace.ErrConvergenceUnavailable, ErrBudgetExhausted,
-			g.spentFiles, g.budget.MaxFiles)
+			g.spentFiles+pendingFiles, g.budget.MaxFiles)
 	}
-	if g.budget.MaxCells > 0 && g.spentCells+pendingCells >= g.budget.MaxCells {
+	return nil
+}
+
+func (g *Governor) cellBudgetErrorLocked(pendingCells int64) error {
+	if g.budget.MaxCells > 0 && g.spentCells+pendingCells > g.budget.MaxCells {
 		return fmt.Errorf("%w: %w: %d of %d cells converted",
 			embeddingspace.ErrConvergenceUnavailable, ErrBudgetExhausted,
 			g.spentCells+pendingCells, g.budget.MaxCells)
@@ -301,7 +394,10 @@ func (g *Governor) budgetErrorLocked(pendingCells int64) error {
 	return nil
 }
 
-func (g *Governor) takeTokenLocked() bool {
+// takeTokensLocked spends n permits, or none at all. Partial admission
+// would let a large compaction start converging with a reservation too
+// small to finish it.
+func (g *Governor) takeTokensLocked(n int64) bool {
 	if g.rate <= 0 {
 		return true
 	}
@@ -313,9 +409,9 @@ func (g *Governor) takeTokenLocked() bool {
 		}
 		g.last = now
 	}
-	if g.tokens < 1 {
+	if g.tokens < float64(n) {
 		return false
 	}
-	g.tokens--
+	g.tokens -= float64(n)
 	return true
 }

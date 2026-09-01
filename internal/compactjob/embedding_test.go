@@ -67,25 +67,28 @@ func TestTranslateLeavesUnmentionedInputsUnknown(t *testing.T) {
 	job.Overrides[embeddingspace.JobFileStatesProperty] = states
 
 	plan := mustTranslate(t, job, Options{})
-	// Fail closed: a file the job says nothing about is unknown, not
-	// "has no embeddings". Treating silence as no_embeddings would let a
-	// coordinator that dropped the column silently relabel embedded
-	// files.
-	if got := inputByEntry(t, plan, second).Embedding; got != embeddingspace.Unknown() {
-		t.Fatalf("unmentioned input embedding = %+v, want unknown", got)
+	// A file the job says nothing about is *absent* — the zero
+	// FileState — not an explicit unknown. Absence is still fail-closed:
+	// the composer reads the file footer and never assumes vectors are
+	// usable. What it must not do is manufacture a claim, because a
+	// claim is cross-checked against the footer and a synthesised
+	// "unknown" contradicts every file written before this column
+	// existed.
+	if got := inputByEntry(t, plan, second).Embedding; got != (embeddingspace.FileState{}) {
+		t.Fatalf("unmentioned input embedding = %+v, want the zero FileState", got)
 	}
 	if got := inputByEntry(t, plan, first).Embedding; got != embeddingspace.Has("model-a") {
 		t.Fatalf("first input embedding = %+v, want has_embeddings model-a", got)
 	}
 }
 
-func TestTranslateWithoutTheColumnLeavesEveryInputUnknown(t *testing.T) {
+func TestTranslateWithoutTheColumnLeavesEveryInputAbsent(t *testing.T) {
 	t.Parallel()
 
 	plan := mustTranslate(t, validJob(), Options{})
 	for _, in := range plan.Inputs {
-		if in.Embedding != embeddingspace.Unknown() {
-			t.Fatalf("input %q embedding = %+v, want unknown", in.Entry, in.Embedding)
+		if in.Embedding != (embeddingspace.FileState{}) {
+			t.Fatalf("input %q embedding = %+v, want the zero FileState", in.Entry, in.Embedding)
 		}
 	}
 	if plan.TargetEmbeddingSpace != "" {
@@ -192,12 +195,158 @@ var _ compaction.Converger = planTestConverger{}
 // converger through to the spec.
 type planTestConverger struct{}
 
-func (planTestConverger) Begin(context.Context, string, []embeddingspace.FileState) error {
-	return nil
+func (planTestConverger) Begin(
+	context.Context, compaction.ConvergeRequest,
+) (compaction.ConvergeAttempt, error) {
+	return planTestAttempt{}, nil
 }
 
-func (planTestConverger) Convert(_ context.Context, _ *iterrt.Key, value []byte) ([]byte, error) {
+type planTestAttempt struct{}
+
+func (planTestAttempt) Convert(_ context.Context, _ *iterrt.Key, value []byte) ([]byte, error) {
 	return value, nil
 }
 
-func (planTestConverger) End(context.Context, bool, int64, error) {}
+func (planTestAttempt) End(context.Context, bool, int64, error) {}
+
+// TestEmbeddingOverridesRoundTripsThroughTranslate is finding 1's
+// answer. EncodeFileStates had no producer at all, so the encoder and
+// the decoder were only ever tested against each other. This exercises
+// the real path: build the overrides the way a coordinator must, put
+// them on a job, and translate it.
+//
+// Note the honest caveat: no shoal binary constructs a
+// TExternalCompactionJob today — Accumulo's Java manager does — so this
+// is the seam a future coordinator must use, not a live production call
+// site. See the doc comment on EmbeddingOverrides.
+func TestEmbeddingOverridesRoundTripsThroughTranslate(t *testing.T) {
+	t.Parallel()
+
+	job := validJob()
+	first := job.Files[0].MetadataFileEntry
+	second := job.Files[1].MetadataFileEntry
+	job.Overrides["table.file.compress.type"] = "gz"
+	want := map[string]embeddingspace.FileState{
+		first:  embeddingspace.Has("model-b"),
+		second: embeddingspace.Unknown(),
+	}
+	if err := ApplyEmbeddingOverrides(job, "  model-a  ", " epoch-3 ", want); err != nil {
+		t.Fatalf("ApplyEmbeddingOverrides: %v", err)
+	}
+	// Merging, not replacing: the codec and block size the job already
+	// carried must survive, or the output file changes.
+	if _, ok := job.Overrides["table.file.compress.type"]; !ok {
+		t.Fatalf("overrides lost the pre-existing keys: %v", job.Overrides)
+	}
+
+	plan := mustTranslate(t, job, Options{})
+	if plan.TargetEmbeddingSpace != "model-a" {
+		t.Fatalf("target = %q, want model-a", plan.TargetEmbeddingSpace)
+	}
+	if plan.EmbeddingEpoch != "epoch-3" {
+		t.Fatalf("epoch = %q, want epoch-3", plan.EmbeddingEpoch)
+	}
+	for entry, state := range want {
+		if got := inputByEntry(t, plan, entry).Embedding; got != state {
+			t.Fatalf("%s embedding = %+v, want %+v", entry, got, state)
+		}
+	}
+	if spec := plan.Spec(nil); spec.EmbeddingEpoch != "epoch-3" {
+		t.Fatalf("spec epoch = %q, want epoch-3", spec.EmbeddingEpoch)
+	}
+}
+
+func TestEmbeddingOverridesOmitsWhatItWasNotGiven(t *testing.T) {
+	t.Parallel()
+
+	out, err := EmbeddingOverrides("", "", nil)
+	if err != nil {
+		t.Fatalf("EmbeddingOverrides: %v", err)
+	}
+	if len(out) != 0 {
+		t.Fatalf("overrides = %v, want none", out)
+	}
+
+	if _, err := EmbeddingOverrides(string([]byte{0xff, 0xfe}), "", nil); err == nil {
+		t.Fatal("an invalid target must be refused by the producer, not only by Translate")
+	}
+	longEpoch := string(make([]byte, embeddingspace.MaxJobEpochBytes+1))
+	if _, err := EmbeddingOverrides("model-a", longEpoch, nil); err == nil {
+		t.Fatal("an oversized epoch must be refused")
+	}
+	if err := ApplyEmbeddingOverrides(nil, "model-a", "", nil); err == nil {
+		t.Fatal("a nil job must be refused")
+	}
+}
+
+// TestApplyEmbeddingOverridesClearsStaleKeys proves a caller that stops
+// converging actually stops: a stale target left behind would keep
+// stamping outputs with a migration the table has abandoned.
+func TestApplyEmbeddingOverridesClearsStaleKeys(t *testing.T) {
+	t.Parallel()
+
+	job := validJob()
+	if err := ApplyEmbeddingOverrides(job, "model-a", "epoch-1", nil); err != nil {
+		t.Fatalf("ApplyEmbeddingOverrides: %v", err)
+	}
+	if err := ApplyEmbeddingOverrides(job, "", "", nil); err != nil {
+		t.Fatalf("ApplyEmbeddingOverrides: %v", err)
+	}
+	for _, key := range []string{
+		embeddingspace.TableTargetProperty,
+		embeddingspace.JobEpochProperty,
+		embeddingspace.JobFileStatesProperty,
+	} {
+		if _, ok := job.Overrides[key]; ok {
+			t.Fatalf("override %q survived a cleared assignment", key)
+		}
+	}
+	plan := mustTranslate(t, job, Options{})
+	if plan.TargetEmbeddingSpace != "" || plan.EmbeddingEpoch != "" {
+		t.Fatalf("plan = (target=%q, epoch=%q), want both cleared",
+			plan.TargetEmbeddingSpace, plan.EmbeddingEpoch)
+	}
+}
+
+func TestTranslateEpochOverrideBeatsTheTableProperty(t *testing.T) {
+	t.Parallel()
+
+	job := validJob()
+	job.Overrides[embeddingspace.TableTargetProperty] = "model-a"
+	job.Overrides[embeddingspace.JobEpochProperty] = " epoch-override "
+	plan := mustTranslate(t, job, Options{EmbeddingEpoch: "epoch-table"})
+	if plan.EmbeddingEpoch != "epoch-override" {
+		t.Fatalf("EmbeddingEpoch = %q, want %q", plan.EmbeddingEpoch, "epoch-override")
+	}
+
+	job = validJob()
+	job.Overrides[embeddingspace.TableTargetProperty] = "model-a"
+	plan = mustTranslate(t, job, Options{EmbeddingEpoch: "  epoch-table  "})
+	if plan.EmbeddingEpoch != "epoch-table" {
+		t.Fatalf("EmbeddingEpoch = %q, want %q", plan.EmbeddingEpoch, "epoch-table")
+	}
+}
+
+func TestTranslateRefusesAnOversizedEpoch(t *testing.T) {
+	t.Parallel()
+
+	job := validJob()
+	job.Overrides[embeddingspace.JobEpochProperty] = string(make([]byte, embeddingspace.MaxJobEpochBytes+1))
+	assertRefused(t, job, Options{}, ClassUnsupportedProperty,
+		"overrides["+embeddingspace.JobEpochProperty+"]")
+}
+
+func TestTableOptionsReadTheEmbeddingEpochProperty(t *testing.T) {
+	t.Parallel()
+
+	opts, err := OptionsFromTableProperties(map[string]string{
+		embeddingspace.TableTargetProperty: "model-a",
+		embeddingspace.JobEpochProperty:    "  epoch-5  ",
+	}, Limits{})
+	if err != nil {
+		t.Fatalf("OptionsFromTableProperties: %v", err)
+	}
+	if opts.EmbeddingEpoch != "epoch-5" {
+		t.Fatalf("EmbeddingEpoch = %q, want %q", opts.EmbeddingEpoch, "epoch-5")
+	}
+}

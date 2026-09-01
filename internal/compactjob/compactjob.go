@@ -275,6 +275,11 @@ type Options struct {
 
 	// TargetEmbeddingSpace records the table's desired convergence target.
 	TargetEmbeddingSpace string
+
+	// EmbeddingEpoch records the migration snapshot the table is
+	// currently converging under, when one is configured. A job override
+	// takes precedence over it.
+	EmbeddingEpoch string
 }
 
 // OptionsFromTableProperties resolves the effective table configuration into
@@ -318,6 +323,7 @@ func OptionsFromTableProperties(properties map[string]string, limits Limits) (Op
 
 	opts := Options{Limits: limits}
 	opts.TargetEmbeddingSpace = strings.TrimSpace(properties[embeddingspace.TableTargetProperty])
+	opts.EmbeddingEpoch = strings.TrimSpace(properties[embeddingspace.JobEpochProperty])
 	if raw := properties[propCompressType]; raw != "" {
 		codec, ok := accumuloCodecs[raw]
 		if !ok {
@@ -354,9 +360,14 @@ type InputFile struct {
 	Timestamp int64
 	// Embedding is the file's persisted embedding-space column, carried
 	// through the job's override map (see
-	// embeddingspace.JobFileStatesProperty). It is
-	// embeddingspace.Unknown() when the job says nothing about this
-	// file, which is not the same as saying the file has no embeddings.
+	// embeddingspace.JobFileStatesProperty).
+	//
+	// It is the zero FileState — State "" — when the job says nothing
+	// about this file. That is *absence*, not an explicit unknown: the
+	// coordinator made no claim, so there is nothing to cross-check the
+	// file's footer against and the footer alone decides the input's
+	// space. An explicit embeddingspace.Unknown() is a claim, and one
+	// that must agree with the footer.
 	Embedding embeddingspace.FileState
 }
 
@@ -433,6 +444,13 @@ type Plan struct {
 	// Limits separately. Zero means unlimited.
 	MaxOutputBytes       int64
 	TargetEmbeddingSpace string
+	// EmbeddingEpoch is the migration snapshot this compaction belongs
+	// to, taken from the job override or the table property. It is
+	// stamped onto the output so a converged file can be attributed to
+	// the migration that produced it, and so a converger bound to a
+	// different epoch refuses this compaction rather than publishing a
+	// file labelled with a superseded target.
+	EmbeddingEpoch string
 }
 
 // Spec assembles the compaction.Spec for this plan. inputs must be the
@@ -460,6 +478,7 @@ func (p *Plan) SpecWithConverger(
 		BlockSize:            p.BlockSize,
 		MaxOutputBytes:       p.MaxOutputBytes,
 		TargetEmbeddingSpace: p.TargetEmbeddingSpace,
+		EmbeddingEpoch:       p.EmbeddingEpoch,
 		Converger:            converger,
 	}
 }
@@ -487,6 +506,7 @@ func (p *Plan) LogValue() slog.Value {
 		slog.Int("block_size", p.BlockSize),
 		slog.Int64("max_output_bytes", p.MaxOutputBytes),
 		slog.String("target_embedding_space", p.TargetEmbeddingSpace),
+		slog.String("embedding_epoch", p.EmbeddingEpoch),
 		slog.Any("stack", names),
 	)
 }
@@ -617,7 +637,7 @@ func Translate(job *tabletserver.TExternalCompactionJob, opts Options) (*Plan, e
 	// Runs after the input-capability gate so a job that is too large is
 	// refused for its size rather than for a column it also carries, and
 	// before the plan is built so Inputs already carry their space.
-	target, err := resolveEmbeddingOverrides(job.GetOverrides(), inputs, opts)
+	target, epoch, err := resolveEmbeddingOverrides(job.GetOverrides(), inputs, opts)
 	if err != nil {
 		return nil, err
 	}
@@ -652,6 +672,7 @@ func Translate(job *tabletserver.TExternalCompactionJob, opts Options) (*Plan, e
 		BlockSize:            blockSize,
 		MaxOutputBytes:       opts.Limits.MaxOutputBytes,
 		TargetEmbeddingSpace: target,
+		EmbeddingEpoch:       epoch,
 	}, nil
 }
 
@@ -980,37 +1001,50 @@ func inputFiles(inputs []parsedInput) []InputFile {
 //     means the coordinator and the compactor disagree about what this
 //     job is.
 //
-// An input the column does not mention stays unknown. That is the whole
-// point of the tri-state: a coordinator predating this column tells us
-// nothing, and nothing is not "no embeddings".
+// An input the column does not mention is left *absent* — the zero
+// FileState — not an explicit unknown. The difference matters: a present
+// state is a claim, and the compactor cross-checks every claim against
+// the file's own footer. Synthesising "unknown" for silence would turn
+// every file written before this column existed into a claim that
+// contradicts its footer, and the compaction would fail with an
+// integrity error instead of simply compacting. Absence means "the
+// coordinator said nothing", so the footer alone decides.
 func resolveEmbeddingOverrides(
 	overrides map[string]string, inputs []parsedInput, opts Options,
-) (string, error) {
+) (string, string, error) {
 	target, err := embeddingspace.ParseTarget(opts.TargetEmbeddingSpace)
 	if err != nil {
-		return "", refuse(ClassUnsupportedProperty, embeddingspace.TableTargetProperty,
+		return "", "", refuse(ClassUnsupportedProperty, embeddingspace.TableTargetProperty,
 			"invalid table embedding target: %v", err)
 	}
 	if raw, ok := overrides[embeddingspace.TableTargetProperty]; ok {
 		override, err := embeddingspace.ParseTarget(raw)
 		if err != nil {
-			return "", refuse(ClassUnsupportedProperty,
+			return "", "", refuse(ClassUnsupportedProperty,
 				"overrides["+embeddingspace.TableTargetProperty+"]",
 				"invalid embedding target override: %v", err)
 		}
 		target = override
 	}
 
-	for i := range inputs {
-		inputs[i].file.Embedding = embeddingspace.Unknown()
+	epoch := strings.TrimSpace(opts.EmbeddingEpoch)
+	if raw, ok := overrides[embeddingspace.JobEpochProperty]; ok {
+		epoch = strings.TrimSpace(raw)
 	}
+	if len(epoch) > embeddingspace.MaxJobEpochBytes {
+		return "", "", refuse(ClassUnsupportedProperty,
+			"overrides["+embeddingspace.JobEpochProperty+"]",
+			"embedding epoch is %d bytes, limit %d", len(epoch), embeddingspace.MaxJobEpochBytes)
+	}
+
+	// Deliberately no loop assigning Unknown() here: absent stays absent.
 	raw, ok := overrides[embeddingspace.JobFileStatesProperty]
 	if !ok {
-		return target, nil
+		return target, epoch, nil
 	}
 	states, err := embeddingspace.DecodeFileStates(raw)
 	if err != nil {
-		return "", refuse(ClassMalformedJob,
+		return "", "", refuse(ClassMalformedJob,
 			"overrides["+embeddingspace.JobFileStatesProperty+"]",
 			"invalid per-file embedding column: %v", err)
 	}
@@ -1021,13 +1055,13 @@ func resolveEmbeddingOverrides(
 	for entry, state := range states {
 		index, found := byEntry[entry]
 		if !found {
-			return "", refuse(ClassMalformedJob,
+			return "", "", refuse(ClassMalformedJob,
 				"overrides["+embeddingspace.JobFileStatesProperty+"]",
 				"names a file this job does not compact")
 		}
 		inputs[index].file.Embedding = state
 	}
-	return target, nil
+	return target, epoch, nil
 }
 
 // parseInputs decodes every input entry and checks the job's inputs for
@@ -2043,7 +2077,8 @@ func resolveOutputEncoding(
 		case ignorableOverrides[key]:
 			// Filesystem placement only — cannot change output cells.
 		case key == embeddingspace.TableTargetProperty ||
-			key == embeddingspace.JobFileStatesProperty:
+			key == embeddingspace.JobFileStatesProperty ||
+			key == embeddingspace.JobEpochProperty:
 			// Embedding-space carriage, validated by
 			// resolveEmbeddingOverrides. Listed here only so the
 			// exhaustive default below does not reject a job for

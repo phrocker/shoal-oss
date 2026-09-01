@@ -5,14 +5,17 @@
 package embedconverge
 
 import (
+	"bytes"
+	"encoding/json"
 	"errors"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/phrocker/shoal-oss/internal/embeddingspace"
 )
 
 func ref(entry string) FileRef {
-	return FileRef{Table: "t", Extent: "t;;", Entry: entry}
+	return FileRef{Table: "t", Extent: []byte("t;;"), Entry: entry}
 }
 
 func observations() []Observation {
@@ -36,13 +39,13 @@ func testEpoch(t *testing.T) Epoch {
 func TestFileRefKeyDistinguishesFencedRanges(t *testing.T) {
 	t.Parallel()
 
-	a := FileRef{Table: "t", Extent: "t;;", Entry: "f.rf"}
-	b := FileRef{Table: "t", Extent: "t;;", Entry: "f.rf R:(a,b,c,d)"}
+	a := FileRef{Table: "t", Extent: []byte("t;;"), Entry: "f.rf"}
+	b := FileRef{Table: "t", Extent: []byte("t;;"), Entry: "f.rf R:(a,b,c,d)"}
 	if a.Key() == b.Key() {
 		t.Fatal("two references over one path with different ranges are different files")
 	}
 	// Length prefixing means no concatenation of fields can collide.
-	c := FileRef{Table: "t", Extent: "", Entry: "t;;f.rf"}
+	c := FileRef{Table: "t", Entry: "t;;f.rf"}
 	if a.Key() == c.Key() {
 		t.Fatal("field boundaries must be unambiguous")
 	}
@@ -138,7 +141,7 @@ func TestEpochRoundTrips(t *testing.T) {
 		t.Fatalf("decoded %d files, want %d", len(decoded.Files), len(epoch.Files))
 	}
 	for i := range decoded.Files {
-		if decoded.Files[i] != epoch.Files[i] {
+		if !equalEpochFile(decoded.Files[i], epoch.Files[i]) {
 			t.Fatalf("file %d = %+v, want %+v", i, decoded.Files[i], epoch.Files[i])
 		}
 	}
@@ -200,5 +203,101 @@ func TestEncodeRefusesAnInvalidEpoch(t *testing.T) {
 	epoch.Target = ""
 	if _, err := Encode(epoch); !errors.Is(err, ErrInvalidEpoch) {
 		t.Fatalf("err = %v, want ErrInvalidEpoch", err)
+	}
+}
+
+func equalEpochFile(a, b EpochFile) bool {
+	return a.Ref.Equal(b.Ref) && a.Status == b.Status && a.Current == b.Current &&
+		a.Attempts == b.Attempts && a.LastError == b.LastError
+}
+
+// TestFileRefSurvivesNonUTF8ExtentBytes covers finding 7. A tablet
+// extent is arbitrary row bytes. Persisting it as a Go string sends it
+// through encoding/json, which silently replaces every invalid UTF-8
+// sequence with U+FFFD — so two genuinely different extents decode to
+// the same value, collide in Key, and one file's convergence gets
+// recorded against another's.
+func TestFileRefSurvivesNonUTF8ExtentBytes(t *testing.T) {
+	t.Parallel()
+
+	// Both of these are invalid UTF-8 and both collapse to the same
+	// replacement character under a string round-trip.
+	left := []byte{0x74, 0x3b, 0xff, 0xfe}
+	right := []byte{0x74, 0x3b, 0xff, 0xfd}
+	if utf8.Valid(left) || utf8.Valid(right) {
+		t.Fatal("the test needs genuinely invalid UTF-8 to be meaningful")
+	}
+	leftRef := FileRef{Table: "t", Extent: left, Entry: "f.rf"}
+	rightRef := FileRef{Table: "t", Extent: right, Entry: "f.rf"}
+	if leftRef.Key() == rightRef.Key() {
+		t.Fatal("two distinct extents must not share a key")
+	}
+
+	// The concrete hazard this guards against: had Extent stayed a Go
+	// string, encoding/json would have replaced both byte sequences with
+	// U+FFFD and the two extents would have decoded to the same value.
+	// Asserting it here keeps the test honest about why []byte matters
+	// instead of merely checking that []byte happens to work.
+	var viaString struct {
+		Left  string `json:"left"`
+		Right string `json:"right"`
+	}
+	encodedStrings, err := json.Marshal(map[string]string{
+		"left": string(left), "right": string(right),
+	})
+	if err != nil {
+		t.Fatalf("json.Marshal: %v", err)
+	}
+	if err := json.Unmarshal(encodedStrings, &viaString); err != nil {
+		t.Fatalf("json.Unmarshal: %v", err)
+	}
+	if viaString.Left != viaString.Right {
+		t.Skip("encoding/json no longer collapses invalid UTF-8; the []byte fix is now belt and braces")
+	}
+
+	epoch, err := Snapshot("e1", "t", "model-a", ModeForced, 0, []Observation{
+		{Ref: leftRef, State: embeddingspace.NoEmbeddings()},
+		{Ref: rightRef, State: embeddingspace.NoEmbeddings()},
+	})
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	if len(epoch.Files) != 2 {
+		t.Fatalf("epoch has %d files, want both extents kept apart", len(epoch.Files))
+	}
+
+	raw, err := Encode(epoch)
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+	decoded, err := Decode(raw)
+	if err != nil {
+		t.Fatalf("Decode: %v", err)
+	}
+	if len(decoded.Files) != 2 {
+		t.Fatalf("decoded %d files, want 2", len(decoded.Files))
+	}
+	for i := range decoded.Files {
+		if !bytes.Equal(decoded.Files[i].Ref.Extent, epoch.Files[i].Ref.Extent) {
+			t.Fatalf("file %d extent = %x, want %x",
+				i, decoded.Files[i].Ref.Extent, epoch.Files[i].Ref.Extent)
+		}
+	}
+	if decoded.Files[0].Ref.Key() == decoded.Files[1].Ref.Key() {
+		t.Fatal("the extents collided after a persistence round trip")
+	}
+
+	// The whole point: a migration resumed from the persisted epoch must
+	// still be able to complete each file independently.
+	migration, err := Resume(decoded, nil, nil)
+	if err != nil {
+		t.Fatalf("Resume: %v", err)
+	}
+	if err := migration.Complete(decoded.Files[0].Ref, embeddingspace.Has("model-a")); err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+	progress := migration.Progress()
+	if progress.Converged != 1 || progress.Pending != 1 {
+		t.Fatalf("progress = %+v, want exactly one of the two converged", progress)
 	}
 }

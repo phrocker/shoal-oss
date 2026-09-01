@@ -96,26 +96,28 @@ func PlanConvergence(target string, current FileState) (Decision, error) {
 }
 
 // EnsureMonotonic verifies that a completed convergence step did not
-// move a file away from target, and did not invent an identity the file
-// never held.
+// move a file away from target, and did not make a positive claim the
+// file never earned.
 //
-// Three outcomes are legal:
+// Exactly three outcomes are legal:
 //
 //   - the state is unchanged, which is the provider-failure outcome: a
 //     compaction that could not reach the embedding provider preserves
 //     the input's space rather than mislabelling the output;
 //   - the state is exactly the target, which is convergence;
-//   - the state degraded to no_embeddings or unknown, which is what
-//     merging an embedded file with an unembedded one already produces.
-//     That is fail-closed — the result claims less than before, never
-//     more — and it does not move the file away from the target because
-//     it was not at the target to begin with.
+//   - the state degraded to unknown. That is the only legal degradation,
+//     and it is what merging an embedded file with an unembedded one
+//     already produces (see Compatible). unknown claims nothing, so it
+//     cannot be wrong.
 //
-// Two outcomes are violations: dropping out of the target space, and
-// landing in some third identity. The second is the one that matters
-// most, because a file labelled with an identity whose vectors it does
-// not contain is exactly the silent mislabelling this whole mechanism
-// exists to prevent.
+// Everything else is a violation, including a degrade to no_embeddings.
+// no_embeddings is not a weaker claim than has_embeddings — it is a
+// different positive assertion, "this file holds no vectors at all".
+// Applying it to a file that still holds vectors mislabels the file just
+// as badly as the wrong identity would, and it hides those vectors from
+// planning without anything ever reporting an error. unknown is the
+// fail-closed degradation; no_embeddings is a claim, and a claim has to
+// be earned.
 func EnsureMonotonic(target string, before, after FileState) error {
 	normalized, err := ParseTarget(target)
 	if err != nil {
@@ -133,15 +135,20 @@ func EnsureMonotonic(target string, before, after FileState) error {
 	if normalized != "" && after == Has(normalized) {
 		return nil
 	}
+	if after.State == StateUnknown {
+		return nil
+	}
 	if normalized != "" && before == Has(normalized) {
-		return fmt.Errorf("%w: %s -> %s (target %s)",
+		return fmt.Errorf("%w: %s -> %s left the target %s",
 			ErrNotMonotonic, before.String(), after.String(), Has(normalized).String())
 	}
-	if after.HasEmbeddings() {
-		return fmt.Errorf("%w: %s -> %s is neither the input space nor the target",
-			ErrNotMonotonic, before.String(), after.String())
+	if after.State == StateNoEmbeddings {
+		return fmt.Errorf(
+			"%w: %s -> %s asserts the file holds no vectors; degrade to %s instead",
+			ErrNotMonotonic, before.String(), after.String(), Unknown().String())
 	}
-	return nil
+	return fmt.Errorf("%w: %s -> %s is neither the input space nor the target",
+		ErrNotMonotonic, before.String(), after.String())
 }
 
 // Converged reports whether state has reached target. A file whose space

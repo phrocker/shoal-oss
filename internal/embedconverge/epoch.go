@@ -62,9 +62,17 @@ var ErrInvalidEpoch = errors.New("embedconverge: invalid epoch")
 // two references over one path with different ranges are different
 // files, and collapsing them would let a migration report a file
 // converged when only one of its two references was.
+//
+// Extent is bytes, not a string, because a tablet extent is arbitrary
+// row bytes and need not be valid UTF-8. Persisting it as a Go string
+// would send it through encoding/json, which replaces every invalid byte
+// sequence with U+FFFD — so two genuinely distinct extents could decode
+// to the same value, collide in Key, and let one file's convergence be
+// recorded against another's. A []byte round-trips through JSON as
+// base64 and is byte-exact.
 type FileRef struct {
 	Table  string `json:"table"`
-	Extent string `json:"extent"`
+	Extent []byte `json:"extent,omitempty"`
 	Entry  string `json:"entry"`
 }
 
@@ -73,13 +81,22 @@ type FileRef struct {
 // extent's rows are arbitrary bytes, so no separator is safe.
 func (r FileRef) Key() string {
 	var b strings.Builder
-	for _, part := range []string{r.Table, r.Extent, r.Entry} {
-		b.WriteString(strconv.Itoa(len(part)))
+	writePart := func(n int) {
+		b.WriteString(strconv.Itoa(n))
 		b.WriteByte(':')
-		b.WriteString(part)
 	}
+	writePart(len(r.Table))
+	b.WriteString(r.Table)
+	writePart(len(r.Extent))
+	b.Write(r.Extent)
+	writePart(len(r.Entry))
+	b.WriteString(r.Entry)
 	return b.String()
 }
+
+// Equal reports whether two references name the same file. FileRef holds
+// a byte slice, so it is not comparable with ==.
+func (r FileRef) Equal(other FileRef) bool { return r.Key() == other.Key() }
 
 func (r FileRef) valid() bool { return r.Table != "" && r.Entry != "" }
 
