@@ -83,8 +83,31 @@ The harness implements `inference.Generator`. Its returned result remains
 bound to the supplied context pack and carries canonically verified evidence
 additions, so `InferenceResult.ValidateFor` succeeds for the caller's original
 pack. `Run` additionally returns a `Record` with the exact expanded context and
-full in-memory transcript. Callers must not log that record; only the optional
+full in-memory transcript. Callers must not log that record; only the
 `Recorder` receives the separate redacted `EvaluationRecord`.
+
+### The `Recorder` is required
+
+`NewGenerator` and `NewCachedGenerator` require a non-nil `Recorder` and fail
+construction without one. Capture is part of serving an inference rather than
+an optional observability hook: a request whose interaction cannot be recorded
+fails instead of being served unrecorded. This is a deliberate breaking change
+from the earlier contract, where the recorder was optional and the production
+`ask` path passed `nil`, so every real answer discarded its execution record.
+
+Two obligations follow for any `Recorder` implementation:
+
+- **It must be safe for concurrent use.** `Generate` may be called from many
+  goroutines against one generator, so `Record` may run concurrently. A
+  recorder that mutates unsynchronized state is a data race. `GraphRecorder`
+  satisfies this by holding no mutable state after construction and writing
+  through the corpus mutex.
+- **It must not widen what is recorded.** The `EvaluationRecord` it receives is
+  redacted by construction; a recorder must not re-associate it with prompts,
+  answers, evidence text, or credentials held elsewhere.
+
+Recording happens on the cache-hit path as well as the miss path. A cached
+answer is still an answer that was served, so it still produces a record.
 
 No Copilot, SDK-process, or other hosted execution backend is bundled. Future
 backends can implement `Runner` without changing inference contracts; the

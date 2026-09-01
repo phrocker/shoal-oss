@@ -294,14 +294,20 @@ func (e *Explorer) visibilityResolverLocked() interaction.VisibilityResolver {
 		if !ok {
 			return nil, shoal.NewError(
 				shoal.ErrorUnavailable,
-				"interaction touched a node that is not in the corpus graph; "+
-					"its visibility cannot be derived",
+				"interaction touched node "+string(id)+
+					", which is no longer in the corpus graph, so its visibility "+
+					"cannot be derived; this usually means the node was removed or "+
+					"replaced by a concurrent re-ingest between retrieval and "+
+					"recording. The request fails by design rather than recording "+
+					"an interaction with an under-labelled visibility. Retry the "+
+					"request against the updated corpus",
 			)
 		}
 		if interaction.IsInteractionKind(node.Kind) {
 			return nil, shoal.NewError(
 				shoal.ErrorUnavailable,
-				"interaction cannot treat another interaction node as source evidence",
+				"interaction cannot treat another interaction node as source "+
+					"evidence: node "+string(id)+" has kind "+node.Kind,
 			)
 		}
 		return interaction.NodeVisibility(node)
