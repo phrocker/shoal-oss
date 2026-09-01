@@ -11,6 +11,7 @@ import (
 
 	"github.com/phrocker/shoal-oss/internal/compaction"
 	"github.com/phrocker/shoal-oss/internal/compactjob"
+	"github.com/phrocker/shoal-oss/internal/embeddingspace"
 	"github.com/phrocker/shoal-oss/internal/storage"
 	"github.com/phrocker/shoal-oss/internal/thrift/gen/data"
 )
@@ -78,6 +79,17 @@ type Options struct {
 	Logger               *slog.Logger
 	Now                  func() time.Time
 	Sleep                func(context.Context, time.Duration) error
+
+	// Converger, when non-nil, lets a compaction converge its inputs
+	// toward the table's target embedding space. Nil — the default —
+	// leaves every output carrying the space its inputs agreed on, which
+	// is what a compactor without an embedding provider must do.
+	//
+	// A Converger shared across concurrently executing jobs must be safe
+	// for concurrent use; the Executor makes no attempt to serialise it,
+	// because the throttle and budget it enforces are global to a
+	// migration rather than per job.
+	Converger compaction.Converger
 }
 
 // Executor is stateless and safe for concurrent use when its Store,
@@ -147,6 +159,21 @@ type Result struct {
 	Extent     *data.TKeyExtent
 	OutputFile string
 	Stats      Stats
+
+	// EmbeddingSpace is the space the published output is labelled with.
+	// It is what the caller must persist into the file.embedding column
+	// family for the new file.
+	EmbeddingSpace embeddingspace.FileState
+
+	// Converged reports whether this compaction actually re-embedded its
+	// inputs, as opposed to preserving whatever space they already had.
+	Converged bool
+
+	// EmbeddingEpoch is the migration snapshot this output belongs to,
+	// and is set only when Converged. It is what lets a coordinator
+	// attribute a converged file to the migration that produced it and
+	// discard a completion that belongs to a superseded epoch.
+	EmbeddingEpoch string
 }
 
 // Execute recovers the job's exact temporary output path, reads all inputs,
@@ -182,7 +209,11 @@ func (e *Executor) Execute(ctx context.Context, plan *compactjob.Plan) (*Result,
 		if int64(len(image)) != input.Size {
 			return nil, fmt.Errorf("compactexec: input %s size %d does not match job size %d", input.Path, len(image), input.Size)
 		}
-		inputs = append(inputs, compaction.Input{Name: input.Entry, Bytes: image})
+		inputs = append(inputs, compaction.Input{
+			Name:              input.Entry,
+			Bytes:             image,
+			MetadataEmbedding: input.Embedding,
+		})
 		progress.InputFilesRead++
 		progress.EntriesRead += input.Entries
 		e.report(ctx, started, &progress, PhaseReading)
@@ -190,7 +221,7 @@ func (e *Executor) Execute(ctx context.Context, plan *compactjob.Plan) (*Result,
 
 	var lastReported int64
 	e.report(ctx, started, &progress, PhaseCompacting)
-	compacted, err := e.composer.Compact(ctx, plan.Spec(inputs), func(p compaction.Progress) {
+	compacted, err := e.composer.Compact(ctx, plan.SpecWithConverger(inputs, e.opts.Converger), func(p compaction.Progress) {
 		progress.EntriesWritten = p.EntriesWritten
 		if p.EntriesWritten-lastReported >= e.opts.ProgressEveryEntries {
 			lastReported = p.EntriesWritten
@@ -240,6 +271,9 @@ func (e *Executor) Execute(ctx context.Context, plan *compactjob.Plan) (*Result,
 			FinishedAt:     finished,
 			Duration:       finished.Sub(started),
 		},
+		EmbeddingSpace: compacted.EmbeddingSpace,
+		Converged:      compacted.Converged,
+		EmbeddingEpoch: compacted.EmbeddingEpoch,
 	}, nil
 }
 

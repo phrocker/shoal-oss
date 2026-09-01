@@ -22,6 +22,47 @@ const (
 	RFileMetaBlockName  = "shoal.embedding-space"
 	ParquetMetadataKey  = "shoal.embedding_space"
 	TableTargetProperty = "table.shoal.embedding.target_space"
+
+	// JobFileStatesProperty carries the per-file embedding-space column
+	// through an external compaction job.
+	//
+	// Accumulo's TExternalCompactionJob describes each input with a
+	// DataFileValue and nothing else, and Phase 1 deliberately refused to
+	// extend DataFileValue, so there is no per-file slot on the wire. The
+	// job's property-override map is the only extension point that does
+	// not change the Thrift contract, which is why the column travels as
+	// one property whose value is a JSON object keyed by the exact
+	// metadata file entry each input was named by.
+	//
+	// An input the property does not mention is *absent*, which is
+	// weaker than an explicit unknown: nothing was recorded about it at
+	// all. Absence must not be turned into a recorded "unknown", because
+	// a recorded state is cross-checked against the file footer and a
+	// synthesised one would fail that check for every file written
+	// before this column existed. Absence means "no cross-check
+	// available"; the footer alone decides.
+	JobFileStatesProperty = "table.shoal.embedding.file_states"
+
+	// JobEpochProperty carries the migration epoch a compaction belongs
+	// to through an external compaction job.
+	//
+	// It is what binds an output to the migration that produced it. A
+	// converger serving epoch E refuses a compaction stamped E', so a
+	// target change that opens a new epoch cannot have in-flight
+	// compactions from the old one publish files labelled with the old
+	// target — the corpus converges toward one target at a time instead
+	// of oscillating between two.
+	JobEpochProperty = "table.shoal.embedding.epoch"
+
+	// MaxJobEpochBytes bounds the encoded epoch identifier. Like the
+	// per-file column it arrives from a coordinator before any budget
+	// check has run.
+	MaxJobEpochBytes = 512
+
+	// MaxJobFileStatesBytes bounds the encoded per-file column. The value
+	// arrives from a coordinator and is decoded before any budget check
+	// has run, so it carries its own cap.
+	MaxJobFileStatesBytes = 1 << 20
 )
 
 var (

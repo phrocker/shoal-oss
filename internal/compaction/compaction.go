@@ -59,9 +59,18 @@ import (
 // not change the composer's contract.
 type Input struct {
 	Name string
-	// MetadataEmbedding is the authoritative metadata-table state for this
-	// file when the caller has it. If present, it must agree with the file
-	// footer before the input is used.
+	// MetadataEmbedding is the metadata-table state for this file when
+	// the caller has one. If present it must agree with the file footer
+	// before the input is used, and it then becomes the input's state.
+	//
+	// The zero FileState means the caller has no metadata column for
+	// this file — "nothing recorded", not "recorded as unknown". Absent
+	// leaves the footer as the sole authority; an explicit
+	// embeddingspace.Unknown() is a recorded claim and is cross-checked
+	// like any other. Callers translating a wire payload must preserve
+	// that difference, because collapsing absent into unknown makes
+	// every file written before the column existed fail its integrity
+	// check the first time something compacts it.
 	MetadataEmbedding embeddingspace.FileState
 	Bytes             []byte
 	Format            string
@@ -134,6 +143,28 @@ type Spec struct {
 
 	// OutputFormat selects "rfile" (default) or "parquet".
 	OutputFormat string
+
+	// TargetEmbeddingSpace is the table's convergence target, taken from
+	// the embeddingspace.TableTargetProperty table property. Empty means
+	// the table declares no target, so nothing converges.
+	TargetEmbeddingSpace string
+
+	// EmbeddingEpoch identifies the migration snapshot this compaction
+	// acts for, taken from embeddingspace.JobEpochProperty. Empty means
+	// no epoch-tracked migration is driving this compaction.
+	//
+	// It travels with the target so the two cannot drift apart. A
+	// Converger that belongs to a different epoch refuses the attempt,
+	// which is what stops two migrations with different targets from
+	// rewriting the same files in opposite directions.
+	EmbeddingEpoch string
+
+	// Converger, when non-nil, is allowed to re-embed this compaction's
+	// cells into TargetEmbeddingSpace. Nil disables convergence
+	// entirely, which is what every caller that does not own an
+	// embedding provider should pass: the output then carries whatever
+	// space the inputs agreed on.
+	Converger Converger
 }
 
 // Result reports what a Compact call produced.
@@ -144,6 +175,22 @@ type Result struct {
 	// number of cells the iterator stack surfaced, which may be less
 	// than the sum of input entries (versioning/filtering drops cells).
 	EntriesWritten int64
+	// EmbeddingSpace is the space the output file is labelled with, and
+	// is exactly what was written into the file's footer. A caller
+	// publishing this file must record this same value in the metadata
+	// entry; recording anything else recreates the metadata/footer
+	// disagreement VerifyMetadataMatchesFooter exists to catch.
+	EmbeddingSpace embeddingspace.FileState
+	// Converged reports whether a Converger actually re-embedded this
+	// output into Spec.TargetEmbeddingSpace. False means the output
+	// preserves whatever space the inputs agreed on.
+	Converged bool
+	// EmbeddingEpoch is the migration epoch this output was converged
+	// for. It is set only when Converged is true, so a caller can tell
+	// "this file was moved by epoch E" from "this file merely happens to
+	// be in E's target space", and can discard a result produced for an
+	// epoch that has since been superseded.
+	EmbeddingEpoch string
 }
 
 // Progress is a monotonic snapshot emitted while CompactContext drains the
@@ -204,6 +251,18 @@ func Compact(spec Spec) (*Result, error) {
 // CompactContext is Compact with cooperative cancellation and progress
 // observation. Cancellation is checked before source construction, before
 // each cell is written, and before the final RFile close.
+//
+// When the spec carries a convergence target and a Converger,
+// CompactContext re-embeds the merged stream into that target space and
+// labels the output with it. If the provider refuses, or fails
+// mid-flight, the compaction is recomposed once with convergence off, so
+// the output preserves the inputs' original space instead of failing the
+// compaction or, worse, claiming a space it does not contain.
+//
+// The one case with no unconverged answer is inputs carrying two
+// different identities: no single label describes their merge. That is
+// reported as ErrConvergenceRequired, before any work is done, and is
+// retryable — see that error's documentation.
 func CompactContext(ctx context.Context, spec Spec, observe func(Progress)) (*Result, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -211,16 +270,107 @@ func CompactContext(ctx context.Context, spec Spec, observe func(Progress)) (*Re
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	states, err := inputEmbeddingSpaces(spec.Inputs)
+	if err != nil {
+		return nil, err
+	}
+	attempt, err := planConvergence(ctx, spec, states)
+	if err != nil {
+		return nil, err
+	}
+	if !attempt.active() {
+		if err := attempt.verify(); err != nil {
+			return nil, err
+		}
+		return compactOnce(ctx, spec, observe, attempt)
+	}
+	if err := attempt.verify(); err != nil {
+		attempt.attempt.End(ctx, false, 0, err)
+		return nil, err
+	}
+
+	result, cells, err := compactConverged(ctx, spec, observe, attempt)
+	if err == nil {
+		attempt.attempt.End(ctx, true, cells, nil)
+		return result, nil
+	}
+	attempt.attempt.End(ctx, false, cells, err)
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return nil, ctxErr
+	}
+	if errors.Is(err, ErrConvergenceAborted) || errors.Is(err, ErrOutputTooLarge) {
+		return nil, err
+	}
+	// Provider failure mid-stream. Recompose from the same in-memory
+	// inputs with convergence off; composition is deterministic, so the
+	// unconverged output is exactly what a converger-less compaction
+	// would have produced, and the file keeps the space it arrived with.
+	fallback, fallbackErr := attempt.preserved(err)
+	if fallbackErr != nil {
+		return nil, fallbackErr
+	}
+	if err := fallback.verify(); err != nil {
+		return nil, err
+	}
+	return compactOnce(ctx, spec, observe, fallback)
+}
+
+func compactConverged(
+	ctx context.Context, spec Spec, observe func(Progress), attempt *convergeAttempt,
+) (*Result, int64, error) {
+	top, closer, err := buildSource(spec)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer closer.Close()
+	converting := newConvergingIterator(ctx, top, attempt.attempt)
+	if err := converting.prime(); err != nil {
+		return nil, converting.converted, err
+	}
+	result, err := drain(ctx, spec, observe, converting, attempt)
+	// The conversion error is reported first: a failed conversion stops
+	// the stream, which the writer cannot tell apart from a clean end of
+	// input, so a nil drain error here would publish a truncated file.
+	if convErr := converting.Err(); convErr != nil {
+		return nil, converting.converted, convErr
+	}
+	if err != nil {
+		return nil, converting.converted, err
+	}
+	return result, converting.converted, nil
+}
+
+func compactOnce(
+	ctx context.Context, spec Spec, observe func(Progress), attempt *convergeAttempt,
+) (*Result, error) {
 	top, closer, err := buildSource(spec)
 	if err != nil {
 		return nil, err
 	}
 	defer closer.Close()
-	outputEmbedding, err := mergedInputEmbeddingSpace(spec.Inputs)
-	if err != nil {
-		return nil, err
-	}
+	return drain(ctx, spec, observe, top, attempt)
+}
 
+func drain(
+	ctx context.Context,
+	spec Spec,
+	observe func(Progress),
+	top iterrt.SortedKeyValueIterator,
+	attempt *convergeAttempt,
+) (*Result, error) {
+	outputEmbedding := attempt.label
+	finish := func(output []byte, written int64) *Result {
+		result := &Result{
+			Output:         output,
+			EntriesWritten: written,
+			EmbeddingSpace: outputEmbedding,
+			Converged:      attempt.active(),
+		}
+		if result.Converged {
+			result.EmbeddingEpoch = attempt.epoch
+		}
+		return result
+	}
 	if spec.OutputFormat == "parquet" {
 		var buf bytes.Buffer
 		written, err := parquetfile.EncodeToWithOptions(
@@ -239,7 +389,7 @@ func CompactContext(ctx context.Context, spec Spec, observe func(Progress)) (*Re
 		if err != nil {
 			return nil, fmt.Errorf("compaction: %w", err)
 		}
-		return &Result{Output: buf.Bytes(), EntriesWritten: written}, nil
+		return finish(buf.Bytes(), written), nil
 	}
 	if spec.OutputFormat != "" && spec.OutputFormat != "rfile" {
 		return nil, fmt.Errorf("compaction: unknown output format %q", spec.OutputFormat)
@@ -281,30 +431,43 @@ func CompactContext(ctx context.Context, spec Spec, observe func(Progress)) (*Re
 	if err := w.Close(); err != nil {
 		return nil, fmt.Errorf("compaction: close writer: %w", err)
 	}
-	return &Result{Output: buf.Bytes(), EntriesWritten: written}, nil
+	return finish(buf.Bytes(), written), nil
 }
 
-func mergedInputEmbeddingSpace(inputs []Input) (embeddingspace.FileState, error) {
-	if len(inputs) == 0 {
-		return embeddingspace.NoEmbeddings(), nil
-	}
+// inputEmbeddingSpaces resolves the authoritative space of every input.
+//
+// The file footer is the primary source: it is written by whoever
+// produced the file and travels with it. The metadata-table entry, when
+// the caller supplied one, is a cross-check, and a disagreement is an
+// integrity error rather than something to reconcile.
+//
+// An input whose MetadataEmbedding is the zero FileState carries no
+// metadata column at all — the caller had nothing to say, not "the
+// caller says unknown". There is then nothing to cross-check against and
+// the footer stands alone. That distinction matters: treating an absent
+// column as an explicit unknown would make every file written before the
+// column existed fail its own integrity check the first time it was
+// compacted.
+func inputEmbeddingSpaces(inputs []Input) ([]embeddingspace.FileState, error) {
 	states := make([]embeddingspace.FileState, 0, len(inputs))
 	for _, in := range inputs {
 		state, err := inputEmbeddingSpace(in)
 		if err != nil {
-			return embeddingspace.FileState{}, err
+			return nil, err
 		}
 		if in.MetadataEmbedding.State != "" {
 			if err := embeddingspace.VerifyMetadataMatchesFooter(in.MetadataEmbedding, state); err != nil {
-				return embeddingspace.FileState{}, err
+				return nil, err
 			}
 			state = in.MetadataEmbedding
 		}
 		states = append(states, state)
 	}
-	return embeddingspace.Compatible("merge embedding spaces", states...)
+	return states, nil
 }
 
+// inputEmbeddingSpace resolves one input's declared space from the file
+// itself.
 func inputEmbeddingSpace(in Input) (embeddingspace.FileState, error) {
 	if len(in.Bytes) == 0 {
 		return embeddingspace.FileState{}, fmt.Errorf("compaction: input %q is empty", in.Name)
