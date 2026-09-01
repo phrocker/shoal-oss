@@ -50,6 +50,7 @@ const (
 	documentRow    = "document/"
 	edgeRow        = "edge/"
 	interactionRow = "interaction/"
+	foldRow        = "interaction-fold/"
 
 	embeddedRecordMagic             = "SHOALX2\x00"
 	embeddedEnvelopeVersion         = byte(1)
@@ -58,12 +59,14 @@ const (
 	embeddedRecordSnapshotAnchor    = byte(3)
 	embeddedRecordInteraction       = byte(4)
 	embeddedRecordInteractionSink   = byte(5)
+	embeddedRecordFold              = byte(6)
 	embeddedEnvelopeHeader          = 8 + 1 + 1 + 8 + sha256.Size
 	maxEmbeddedDocumentBytes        = uint64(document.MaxRevisionSourceBytes) * 8
 	maxEmbeddedEdgeBytes            = uint64(2 * 1024 * 1024)
 	maxEmbeddedSnapshotAnchorBytes  = uint64(1024)
 	maxEmbeddedInteractionBytes     = uint64(64 * 1024 * 1024)
 	maxEmbeddedInteractionSinkBytes = uint64(1024)
+	maxEmbeddedFoldBytes            = uint64(64 * 1024 * 1024)
 )
 
 var snapshotAnchorRow = []byte("meta/snapshot-anchor")
@@ -99,6 +102,13 @@ func interactionRecordRow(sessionID shoal.ID) []byte {
 	row := make([]byte, 0, len(interactionRow)+len(sessionID))
 	row = append(row, interactionRow...)
 	row = append(row, []byte(sessionID)...)
+	return row
+}
+
+func foldRecordRow(foldID shoal.ID) []byte {
+	row := make([]byte, 0, len(foldRow)+len(foldID))
+	row = append(row, foldRow...)
+	row = append(row, []byte(foldID)...)
 	return row
 }
 
@@ -144,6 +154,12 @@ func (e *Explorer) load() error {
 		case bytes.HasPrefix(key.Row, []byte(edgeRow)):
 			if err := e.loadEdgeRecord(
 				key.Row, qualifier, scanner.Value(), edgeFormats,
+			); err != nil {
+				return err
+			}
+		case bytes.HasPrefix(key.Row, []byte(foldRow)):
+			if err := e.loadFoldRecord(
+				key.Row, qualifier, scanner.Value(),
 			); err != nil {
 				return err
 			}
@@ -325,6 +341,38 @@ func (e *Explorer) loadInteractionRecord(row, qualifier, encoded []byte) error {
 	return nil
 }
 
+func (e *Explorer) loadFoldRecord(row, qualifier, encoded []byte) error {
+	if !bytes.Equal(qualifier, []byte(recordCQV2)) {
+		return nil
+	}
+	var record persistedFold
+	if err := decodeEmbeddedRecord(
+		encoded, embeddedRecordFold, &record,
+	); err != nil {
+		return shoal.WrapError(shoal.ErrorInternal, "decode explorer fold", err)
+	}
+	if err := validatePersistedFold(record); err != nil {
+		return shoal.WrapError(
+			shoal.ErrorInternal, "stored explorer fold is invalid", err)
+	}
+	if !bytes.Equal(row, foldRecordRow(record.FoldID)) {
+		return shoal.NewError(
+			shoal.ErrorInternal, "stored explorer fold row is invalid")
+	}
+	// A fold row is written at most twice: once when it is folded and once
+	// when it is explicitly deleted. The scan returns raw cells, so both
+	// versions arrive here. A tombstone is terminal because a deleted fold ID
+	// can never be reused; otherwise the first cell seen wins.
+	if existing, ok := e.folds[record.FoldID]; ok {
+		if existing.Deleted || !record.Deleted {
+			return nil
+		}
+	}
+	copy := record
+	e.folds[record.FoldID] = &copy
+	return nil
+}
+
 func (e *Explorer) writeRecord(row []byte, kind byte, value any) error {
 	encoded, err := encodeEmbeddedRecord(kind, value)
 	if err != nil {
@@ -418,6 +466,8 @@ func embeddedRecordMaximum(kind byte) (uint64, error) {
 		return maxEmbeddedInteractionBytes, nil
 	case embeddedRecordInteractionSink:
 		return maxEmbeddedInteractionSinkBytes, nil
+	case embeddedRecordFold:
+		return maxEmbeddedFoldBytes, nil
 	default:
 		return 0, fmt.Errorf("embedded record kind %d is unsupported", kind)
 	}

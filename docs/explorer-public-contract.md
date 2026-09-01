@@ -140,6 +140,64 @@ node-kind and edge-type namespace. Phase 1 of issue #266 defines:
   digests, counts, and source node IDs, never the question, prompt, answer,
   evidence text, or model-chosen correlation strings.
 
+### Fold summaries
+
+Phase 2 of issue #266 adds fold-style summarization, following the public
+`fold` semantics of `phrocker/sag`: a set of recorded sessions collapses into
+one compact vertex that can later be unfolded back into what it replaced.
+
+- A fold is an `interaction.fold` node with `interaction.folds` edges to the
+  sessions it folds, plus `interaction.retrieved` and `interaction.cited` edges
+  to the source nodes those sessions touched. Because the kind and the edge
+  types are in the reserved namespace, every default-exclusion rule that
+  applies to a session applies to a fold unchanged: `Retrieve` never returns
+  one, expansion never discovers one, and the visibility resolver refuses to
+  treat one as source evidence for a later inference. A model cannot cite its
+  own prior summary as though it were a source document.
+- A fold's visibility is the conjunction of every folded session's own
+  visibility and every label of every source node those sessions touched,
+  retrieved as well as cited. Summarizing can therefore only narrow visibility,
+  never widen it. That is precisely why publishing a redacted public summary
+  must be a separate, explicit, reviewed action; **no declassification
+  primitive exists**, and the authority model it would need is still open in
+  issue #128.
+- Fold identity is content-addressed over the canonical folded provenance and
+  the summary digest. The same input always folds to the same vertex, so
+  refolding is idempotent rather than a conflict. Neither the fold time nor the
+  derived visibility participates in identity, so a corpus whose labels moved
+  under an existing fold fails closed instead of serving a stale visibility.
+- `FoldInteractions` names sessions only. The provenance it folds is read from
+  what those sessions actually recorded, never from the caller, so a caller
+  cannot understate what a session was shown and thereby widen the fold.
+- `RehydrateFold` is lossless with respect to provenance: every folded session
+  comes back with its retrieved set and its cited set kept apart. Collapsing
+  the two would understate what the model was shown and make the visibility
+  conjunction unsound.
+- A fold carries no summary text, only the SHA-256 digest of a summary held
+  out-of-band. The digest shape is enforced, not trusted, so the field cannot
+  be used to smuggle evidence-derived text into a node payload.
+- Retention matches sessions: `DeleteFold` leaves an `interaction.tombstone`
+  and drops the folded members, and a session that a live fold summarizes
+  cannot be deleted until that fold is.
+- Folding is an operator action, not part of serving an inference, so it never
+  sits on the request latency path.
+
+### Cross-session provenance traversal
+
+- `InteractionsTouching` lists every session and fold that retrieved or cited a
+  given source node. `RelatedInteractions` walks from one session or fold to
+  every other interaction that touched at least one of the same source nodes.
+- Both are explicit, kind-scoped reads, like `Interactions` and
+  `InteractionSubgraph`. Neither is reachable from `Retrieve` or from expanding
+  a source node's neighborhood: walking provenance is an operator and auditor
+  capability, never something an inference can do to itself.
+- The walk goes interaction to source node to interaction. `InteractionsTouching`
+  refuses an interaction node as its subject, because treating derived content
+  as the origin of a provenance walk is the same mistake as treating it as
+  source evidence.
+- `shoal-explore fold`, `shoal-explore unfold`, and `shoal-explore provenance`
+  are the operator-facing surface for all of the above.
+
 ## Retrieval requests
 
 ### Normalization and limits

@@ -47,7 +47,8 @@ func main() {
 func run(ctx context.Context, args []string, output io.Writer) error {
 	if len(args) == 0 {
 		return errors.New(
-			"usage: shoal-explore <ingest|list|outline|query|ask|connect|neighbors>")
+			"usage: shoal-explore <ingest|list|outline|query|ask|connect|" +
+				"neighbors|fold|unfold|provenance>")
 	}
 	switch args[0] {
 	case "ingest":
@@ -64,6 +65,12 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 		return runConnect(ctx, args[1:], output)
 	case "neighbors":
 		return runNeighbors(ctx, args[1:], output)
+	case "fold":
+		return runFold(ctx, args[1:], output)
+	case "unfold":
+		return runUnfold(ctx, args[1:], output)
+	case "provenance":
+		return runProvenance(ctx, args[1:], output)
 	default:
 		return fmt.Errorf("unknown command %q", args[0])
 	}
