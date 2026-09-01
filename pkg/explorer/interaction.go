@@ -127,6 +127,15 @@ func (e *Explorer) RecordInteraction(
 		return shoal.NewError(
 			shoal.ErrorConflict, "interaction session ID already exists")
 	}
+	// Sessions and folds are distinct maps but share one node namespace in the
+	// corpus graph, so an ID taken by either would silently overwrite the other
+	// during a graph rebuild and leave two records claiming one identity.
+	if _, ok := e.folds[session.ID]; ok {
+		return shoal.NewError(
+			shoal.ErrorConflict,
+			"interaction session ID is already used by a fold",
+		)
+	}
 	subgraph, err := session.Subgraph(e.visibilityResolverLocked())
 	if err != nil {
 		return err
@@ -180,6 +189,16 @@ func (e *Explorer) DeleteInteraction(
 	if existing.Deleted {
 		return interaction.Tombstone{}, shoal.NewError(
 			shoal.ErrorConflict, "interaction session is already deleted")
+	}
+	// A session that a live fold summarizes cannot be deleted out from under
+	// it, because the fold would keep a rehydratable copy of provenance the
+	// operator just asked to destroy. Delete the fold first.
+	if folds := e.foldsReferencingLocked(sessionID); len(folds) > 0 {
+		return interaction.Tombstone{}, shoal.NewError(
+			shoal.ErrorConflict,
+			"interaction session is folded into a summary; "+
+				"delete the fold before deleting the session",
+		)
 	}
 	visibility, err := interaction.ParseVisibility(existing.Visibility)
 	if err != nil {

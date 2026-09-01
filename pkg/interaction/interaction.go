@@ -58,6 +58,7 @@ const (
 	KindTurn      = KindPrefix + "turn"
 	KindToolCall  = KindPrefix + "tool_call"
 	KindTombstone = KindPrefix + "tombstone"
+	KindFold      = KindPrefix + "fold"
 )
 
 // EdgeTypePrefix reserves the interaction edge-type namespace.
@@ -71,6 +72,10 @@ const (
 	EdgeHasToolCall = EdgeTypePrefix + "has_tool_call"
 	EdgeRetrieved   = EdgeTypePrefix + "retrieved"
 	EdgeCited       = EdgeTypePrefix + "cited"
+	// EdgeFolds points from a fold summary to a session it folds. It is what
+	// makes a fold rehydratable and what makes cross-session traversal
+	// possible without widening anything.
+	EdgeFolds = EdgeTypePrefix + "folds"
 )
 
 // Node and edge property keys. Values are identities, digests, counts, and
@@ -109,6 +114,15 @@ const (
 	PropertyPromptVersion = "interaction.prompt_version"
 	PropertyPromptHash    = "interaction.prompt_hash"
 	PropertyToolPolicy    = "interaction.tool_policy"
+
+	// PropertySummaryDigest carries the SHA-256 digest of a fold's
+	// out-of-band summary text. The digest is stored so a fold can be
+	// correlated with the summary it describes; the summary text itself is
+	// never persisted, because it is derived from evidence the record is not
+	// allowed to carry.
+	PropertySummaryDigest = "interaction.summary_digest"
+	PropertyFoldedAt      = "interaction.folded_at"
+	PropertyFoldedCount   = "interaction.folded_session_count"
 )
 
 // LabelInteraction marks every interaction node so label-based consumers can
@@ -122,6 +136,7 @@ const (
 	MaxTouchedNodes      = 65536
 	MaxVisibilityLabels  = 64
 	MaxVisibilityLabelSz = 256
+	MaxFoldMembers       = 4096
 )
 
 // IsInteractionKind reports whether a node kind is in the reserved namespace.

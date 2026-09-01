@@ -45,6 +45,7 @@ type Explorer struct {
 	documents               map[shoal.ID]map[shoal.ID]*persistedDocument
 	edges                   map[shoal.ID]persistedEdge
 	interactions            map[shoal.ID]*persistedInteraction
+	folds                   map[shoal.ID]*persistedFold
 	graphNodes              map[shoal.ID]graph.Node
 	graphEdges              map[shoal.ID]graph.Edge
 	outgoing                map[shoal.ID][]shoal.ID
@@ -170,6 +171,7 @@ func OpenWithOptions(dir string, options Options) (*Explorer, error) {
 		documents:               make(map[shoal.ID]map[shoal.ID]*persistedDocument),
 		edges:                   make(map[shoal.ID]persistedEdge),
 		interactions:            make(map[shoal.ID]*persistedInteraction),
+		folds:                   make(map[shoal.ID]*persistedFold),
 		embedder:                options.Embedder,
 		embedders:               embedders,
 		maxEmbeddingSpaceFanout: maxFanout,
@@ -651,7 +653,25 @@ func (e *Explorer) computeCurrentGraph() (
 			nodes[node.ID] = node
 		}
 	}
+	// Fold summaries are derived content in the same reserved namespace, so
+	// they inherit every default-exclusion rule sessions already have.
+	for _, record := range e.folds {
+		for _, node := range record.Nodes {
+			nodes[node.ID] = node
+		}
+	}
 	for _, record := range e.interactions {
+		for _, edge := range record.Edges {
+			if _, from := nodes[edge.From]; !from {
+				continue
+			}
+			if _, to := nodes[edge.To]; !to {
+				continue
+			}
+			edges[edge.ID] = edge
+		}
+	}
+	for _, record := range e.folds {
 		for _, edge := range record.Edges {
 			if _, from := nodes[edge.From]; !from {
 				continue
