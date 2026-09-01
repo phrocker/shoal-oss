@@ -352,6 +352,12 @@ type InputFile struct {
 	Entries int64
 	// Timestamp is the DataFileValue time field (-1 when absent).
 	Timestamp int64
+	// Embedding is the file's persisted embedding-space column, carried
+	// through the job's override map (see
+	// embeddingspace.JobFileStatesProperty). It is
+	// embeddingspace.Unknown() when the job says nothing about this
+	// file, which is not the same as saying the file has no embeddings.
+	Embedding embeddingspace.FileState
 }
 
 // Iterator is one translated entry of job.iteratorSettings.
@@ -432,15 +438,29 @@ type Plan struct {
 // Spec assembles the compaction.Spec for this plan. inputs must be the
 // RFile images for Plan.Inputs; the caller fetches them (translation is
 // I/O-free by design).
+//
+// converger may be nil, which disables convergence: the output then
+// carries whatever space the inputs agreed on. A caller that owns an
+// embedding provider passes one so this compaction can converge the
+// tablet toward TargetEmbeddingSpace.
 func (p *Plan) Spec(inputs []compaction.Input) compaction.Spec {
+	return p.SpecWithConverger(inputs, nil)
+}
+
+// SpecWithConverger is Spec with a convergence engine attached.
+func (p *Plan) SpecWithConverger(
+	inputs []compaction.Input, converger compaction.Converger,
+) compaction.Spec {
 	return compaction.Spec{
-		Inputs:              inputs,
-		Stack:               p.Stack,
-		Scope:               p.Scope,
-		FullMajorCompaction: p.FullMajorCompaction,
-		Codec:               p.Codec,
-		BlockSize:           p.BlockSize,
-		MaxOutputBytes:      p.MaxOutputBytes,
+		Inputs:               inputs,
+		Stack:                p.Stack,
+		Scope:                p.Scope,
+		FullMajorCompaction:  p.FullMajorCompaction,
+		Codec:                p.Codec,
+		BlockSize:            p.BlockSize,
+		MaxOutputBytes:       p.MaxOutputBytes,
+		TargetEmbeddingSpace: p.TargetEmbeddingSpace,
+		Converger:            converger,
 	}
 }
 
@@ -594,6 +614,14 @@ func Translate(job *tabletserver.TExternalCompactionJob, opts Options) (*Plan, e
 		return nil, err
 	}
 
+	// Runs after the input-capability gate so a job that is too large is
+	// refused for its size rather than for a column it also carries, and
+	// before the plan is built so Inputs already carry their space.
+	target, err := resolveEmbeddingOverrides(job.GetOverrides(), inputs, opts)
+	if err != nil {
+		return nil, err
+	}
+
 	fullMajor := !job.GetPropagateDeletes()
 	iters, err := mapIterators(rawIters, fullMajor)
 	if err != nil {
@@ -623,7 +651,7 @@ func Translate(job *tabletserver.TExternalCompactionJob, opts Options) (*Plan, e
 		Codec:                codec,
 		BlockSize:            blockSize,
 		MaxOutputBytes:       opts.Limits.MaxOutputBytes,
-		TargetEmbeddingSpace: opts.TargetEmbeddingSpace,
+		TargetEmbeddingSpace: target,
 	}, nil
 }
 
@@ -935,6 +963,71 @@ func inputFiles(inputs []parsedInput) []InputFile {
 		out = append(out, in.file)
 	}
 	return out
+}
+
+// resolveEmbeddingOverrides applies the job's embedding-space carriage to
+// the parsed inputs and resolves the table's convergence target.
+//
+// Three refusals live here, and each of them exists because the
+// alternative is a file labelled with a space it does not contain:
+//
+//   - an unparseable or invalid column, rather than treating a corrupt
+//     value as "no information";
+//   - a target space that is not a legal identity, rather than
+//     converging toward something no embedder can produce;
+//   - an entry naming a file this job does not compact, which mirrors
+//     the orphan-column check the metadata reader already performs and
+//     means the coordinator and the compactor disagree about what this
+//     job is.
+//
+// An input the column does not mention stays unknown. That is the whole
+// point of the tri-state: a coordinator predating this column tells us
+// nothing, and nothing is not "no embeddings".
+func resolveEmbeddingOverrides(
+	overrides map[string]string, inputs []parsedInput, opts Options,
+) (string, error) {
+	target, err := embeddingspace.ParseTarget(opts.TargetEmbeddingSpace)
+	if err != nil {
+		return "", refuse(ClassUnsupportedProperty, embeddingspace.TableTargetProperty,
+			"invalid table embedding target: %v", err)
+	}
+	if raw, ok := overrides[embeddingspace.TableTargetProperty]; ok {
+		override, err := embeddingspace.ParseTarget(raw)
+		if err != nil {
+			return "", refuse(ClassUnsupportedProperty,
+				"overrides["+embeddingspace.TableTargetProperty+"]",
+				"invalid embedding target override: %v", err)
+		}
+		target = override
+	}
+
+	for i := range inputs {
+		inputs[i].file.Embedding = embeddingspace.Unknown()
+	}
+	raw, ok := overrides[embeddingspace.JobFileStatesProperty]
+	if !ok {
+		return target, nil
+	}
+	states, err := embeddingspace.DecodeFileStates(raw)
+	if err != nil {
+		return "", refuse(ClassMalformedJob,
+			"overrides["+embeddingspace.JobFileStatesProperty+"]",
+			"invalid per-file embedding column: %v", err)
+	}
+	byEntry := make(map[string]int, len(inputs))
+	for i, in := range inputs {
+		byEntry[in.file.Entry] = i
+	}
+	for entry, state := range states {
+		index, found := byEntry[entry]
+		if !found {
+			return "", refuse(ClassMalformedJob,
+				"overrides["+embeddingspace.JobFileStatesProperty+"]",
+				"names a file this job does not compact")
+		}
+		inputs[index].file.Embedding = state
+	}
+	return target, nil
 }
 
 // parseInputs decodes every input entry and checks the job's inputs for
@@ -1949,6 +2042,13 @@ func resolveOutputEncoding(
 			blockSize = int(blockSizeOverride)
 		case ignorableOverrides[key]:
 			// Filesystem placement only — cannot change output cells.
+		case key == embeddingspace.TableTargetProperty ||
+			key == embeddingspace.JobFileStatesProperty:
+			// Embedding-space carriage, validated by
+			// resolveEmbeddingOverrides. Listed here only so the
+			// exhaustive default below does not reject a job for
+			// carrying a property shoal itself defined; neither key
+			// changes the output's codec or block size.
 		default:
 			return "", 0, refuse(ClassUnsupportedProperty, field,
 				"shoal cannot honor this override when writing the output RFile")

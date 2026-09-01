@@ -22,6 +22,28 @@ const (
 	RFileMetaBlockName  = "shoal.embedding-space"
 	ParquetMetadataKey  = "shoal.embedding_space"
 	TableTargetProperty = "table.shoal.embedding.target_space"
+
+	// JobFileStatesProperty carries the per-file embedding-space column
+	// through an external compaction job.
+	//
+	// Accumulo's TExternalCompactionJob describes each input with a
+	// DataFileValue and nothing else, and Phase 1 deliberately refused to
+	// extend DataFileValue, so there is no per-file slot on the wire. The
+	// job's property-override map is the only extension point that does
+	// not change the Thrift contract, which is why the column travels as
+	// one property whose value is a JSON object keyed by the exact
+	// metadata file entry each input was named by.
+	//
+	// An input the property does not mention is unknown, not
+	// no_embeddings: a coordinator that has never heard of this column
+	// says nothing about it, and reading silence as "this file has no
+	// vectors" would assert something nobody established.
+	JobFileStatesProperty = "table.shoal.embedding.file_states"
+
+	// MaxJobFileStatesBytes bounds the encoded per-file column. The value
+	// arrives from a coordinator and is decoded before any budget check
+	// has run, so it carries its own cap.
+	MaxJobFileStatesBytes = 1 << 20
 )
 
 var (
