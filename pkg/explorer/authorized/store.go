@@ -108,6 +108,13 @@ type PolicyStore interface {
 	Revision(context.Context, shoal.ID, shoal.ID) (RevisionRegistration, bool, error)
 	CurrentRevision(context.Context, shoal.ID) (RevisionRegistration, bool, error)
 	Node(context.Context, shoal.ID) (NodeRegistration, bool, error)
+	// Nodes resolves many node registrations in one round trip and must be
+	// exactly equivalent to calling Node for each identifier. Presence is
+	// reported by map membership exactly as Node reports it by its boolean: an
+	// identifier that is absent from the returned map is unregistered, which
+	// callers must treat as the fail-closed deny path. Implementations must
+	// never report an identifier that was not requested.
+	Nodes(context.Context, []shoal.ID) (map[shoal.ID]NodeRegistration, error)
 	ReserveEdge(context.Context, EdgeRegistration) error
 	RollbackEdgeReservation(context.Context, EdgeRegistration) error
 	PutEdge(context.Context, EdgeRegistration) error
@@ -660,6 +667,46 @@ func (s *MemoryPolicyStore) Node(
 		return NodeRegistration{}, false, catalogUnavailable()
 	}
 	return cloned, true, nil
+}
+
+// Nodes returns the current registrations owning the requested graph nodes in
+// one round trip. It is exactly equivalent to calling Node for each identifier:
+// unregistered identifiers are omitted from the result rather than reported as
+// an error, so absence is the same fail-closed signal Node reports with a false
+// boolean. Repeated identifiers are resolved once.
+func (s *MemoryPolicyStore) Nodes(
+	ctx context.Context,
+	nodeIDs []shoal.ID,
+) (map[shoal.ID]NodeRegistration, error) {
+	if err := contextFailure(ctx); err != nil {
+		return nil, err
+	}
+	for _, nodeID := range nodeIDs {
+		if err := shoal.ValidateRequiredID("graph node ID", nodeID); err != nil {
+			return nil, err
+		}
+	}
+	if s == nil {
+		return nil, catalogUnavailable()
+	}
+	resolved := make(map[shoal.ID]NodeRegistration, len(nodeIDs))
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, nodeID := range nodeIDs {
+		if _, done := resolved[nodeID]; done {
+			continue
+		}
+		registration, ok := s.nodes[nodeID]
+		if !ok {
+			continue
+		}
+		cloned, err := cloneNodeRegistration(registration)
+		if err != nil {
+			return nil, catalogUnavailable()
+		}
+		resolved[nodeID] = cloned
+	}
+	return resolved, nil
 }
 
 // ReserveEdge atomically reserves an application edge identity and rule before

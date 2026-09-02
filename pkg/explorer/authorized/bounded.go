@@ -500,14 +500,19 @@ func (c *Client) filterNeighborhood(
 ) (explorer.Neighborhood, error) {
 	candidates := make(map[shoal.ID]graph.Node, len(raw.Nodes))
 	registrations := make(map[shoal.ID]NodeRegistration, len(raw.Nodes))
+	rawNodeIDs := make([]shoal.ID, 0, len(raw.Nodes))
 	for _, node := range raw.Nodes {
 		if err := node.Validate(); err != nil {
 			return explorer.Neighborhood{}, inconsistentBase()
 		}
-		registration, ok, err := c.policyStore.Node(ctx, node.ID)
-		if err != nil {
-			return explorer.Neighborhood{}, policyCatalogReadError(ctx, err)
-		}
+		rawNodeIDs = append(rawNodeIDs, node.ID)
+	}
+	resolved, err := c.resolveNodes(ctx, rawNodeIDs)
+	if err != nil {
+		return explorer.Neighborhood{}, err
+	}
+	for _, node := range raw.Nodes {
+		registration, ok := resolved[node.ID]
 		if !ok {
 			continue
 		}
@@ -570,8 +575,8 @@ func (c *Client) filterNeighborhood(
 		if !ok || !graphEdgesEqual(registration.Edge, edge) {
 			continue
 		}
-		allowed, err := c.edgeAllows(
-			ctx, registration, decision, auth.OperationNeighborhood, now)
+		allowed, err := edgeAllowsResolved(
+			resolved, registration, decision, auth.OperationNeighborhood, now)
 		if err != nil {
 			return explorer.Neighborhood{}, err
 		}

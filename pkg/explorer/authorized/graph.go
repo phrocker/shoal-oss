@@ -128,14 +128,19 @@ func (c *Client) Neighborhood(
 
 	candidates := make(map[shoal.ID]graph.Node, len(raw.Nodes))
 	registrations := make(map[shoal.ID]NodeRegistration, len(raw.Nodes))
+	rawNodeIDs := make([]shoal.ID, 0, len(raw.Nodes))
 	for _, node := range raw.Nodes {
 		if err := node.Validate(); err != nil {
 			return explorer.Neighborhood{}, inconsistentBase()
 		}
-		registration, ok, err := c.policyStore.Node(ctx, node.ID)
-		if err != nil {
-			return explorer.Neighborhood{}, policyCatalogReadError(ctx, err)
-		}
+		rawNodeIDs = append(rawNodeIDs, node.ID)
+	}
+	resolved, err := c.resolveNodes(ctx, rawNodeIDs)
+	if err != nil {
+		return explorer.Neighborhood{}, err
+	}
+	for _, node := range raw.Nodes {
+		registration, ok := resolved[node.ID]
 		if !ok {
 			continue
 		}
@@ -198,8 +203,8 @@ func (c *Client) Neighborhood(
 		if !ok || !graphEdgesEqual(registration.Edge, edge) {
 			continue
 		}
-		allowed, err := c.edgeAllows(
-			ctx, registration, decision, auth.OperationNeighborhood, now)
+		allowed, err := edgeAllowsResolved(
+			resolved, registration, decision, auth.OperationNeighborhood, now)
 		if err != nil {
 			return explorer.Neighborhood{}, err
 		}
@@ -272,17 +277,90 @@ func (c *Client) edgeAllows(
 	if err != nil || !allowed {
 		return allowed, err
 	}
-	from, ok, err := c.policyStore.Node(ctx, registration.Edge.From)
+	resolved, err := c.resolveNodes(
+		ctx, []shoal.ID{registration.Edge.From, registration.Edge.To})
 	if err != nil {
-		return false, policyCatalogReadError(ctx, err)
+		return false, err
 	}
+	return edgeEndpointsAllow(resolved, registration, decision, operation, now)
+}
+
+// registeredNodes holds the node registrations resolved for one page in a
+// single batch lookup. Membership is the only presence signal, exactly as the
+// boolean returned by PolicyStore.Node is: an identifier that is absent was not
+// registered and therefore denies. A partial or empty batch result consequently
+// authorizes nothing.
+type registeredNodes map[shoal.ID]NodeRegistration
+
+// resolveNodes collapses every identifier a page needs into one policy-store
+// round trip, deduplicating first so the round trip carries distinct nodes
+// rather than one entry per edge endpoint. Identifiers the store does not know
+// are omitted from the result, preserving the fail-closed path a point lookup
+// takes when it reports !ok. Registrations for identifiers that were not
+// requested are discarded so a misbehaving store cannot widen a page.
+func (c *Client) resolveNodes(
+	ctx context.Context,
+	nodeIDs []shoal.ID,
+) (registeredNodes, error) {
+	distinct := make([]shoal.ID, 0, len(nodeIDs))
+	requested := make(map[shoal.ID]struct{}, len(nodeIDs))
+	for _, nodeID := range nodeIDs {
+		if _, duplicate := requested[nodeID]; duplicate {
+			continue
+		}
+		requested[nodeID] = struct{}{}
+		distinct = append(distinct, nodeID)
+	}
+	if len(distinct) == 0 {
+		return registeredNodes{}, nil
+	}
+	batch, err := c.policyStore.Nodes(ctx, distinct)
+	if err != nil {
+		return nil, policyCatalogReadError(ctx, err)
+	}
+	resolved := make(registeredNodes, len(distinct))
+	for _, nodeID := range distinct {
+		registration, ok := batch[nodeID]
+		if !ok {
+			continue
+		}
+		resolved[nodeID] = registration
+	}
+	return resolved, nil
+}
+
+// edgeAllowsResolved authorizes one edge against endpoint registrations that
+// were already batched for the page, issuing no further policy-store round
+// trips.
+func edgeAllowsResolved(
+	resolved registeredNodes,
+	registration EdgeRegistration,
+	decision auth.Decision,
+	operation auth.Operation,
+	now time.Time,
+) (bool, error) {
+	allowed, err := ruleAllows(registration.Rule, decision, operation, now)
+	if err != nil || !allowed {
+		return allowed, err
+	}
+	return edgeEndpointsAllow(resolved, registration, decision, operation, now)
+}
+
+// edgeEndpointsAllow requires both endpoints to be present in the resolved page
+// and allowed. An endpoint missing from resolved denies, exactly as a point
+// lookup reporting !ok denies.
+func edgeEndpointsAllow(
+	resolved registeredNodes,
+	registration EdgeRegistration,
+	decision auth.Decision,
+	operation auth.Operation,
+	now time.Time,
+) (bool, error) {
+	from, ok := resolved[registration.Edge.From]
 	if !ok {
 		return false, nil
 	}
-	to, ok, err := c.policyStore.Node(ctx, registration.Edge.To)
-	if err != nil {
-		return false, policyCatalogReadError(ctx, err)
-	}
+	to, ok := resolved[registration.Edge.To]
 	if !ok {
 		return false, nil
 	}
