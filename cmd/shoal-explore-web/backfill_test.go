@@ -307,7 +307,7 @@ func TestOpenServiceRefusesWhenBackfillFails(t *testing.T) {
 }
 
 // mintSite is one reference to the capability constructor, with the function
-// it appears in. An empty function means package scope.
+// it appears in. Package scope is recorded as "package scope".
 type mintSite struct {
 	file     string
 	function string
@@ -324,9 +324,19 @@ type mintSite struct {
 //
 // Package scope is rejected specifically. A package-level var would mint a
 // valid capability at process init, before any gate runs, in every build.
-// References are matched by resolving each file's import of
-// internal/devbackfill to its local name, so renaming the import does not
-// hide a mint site.
+//
+// Import forms are handled as follows. A qualified import is resolved to every
+// local name the file binds it to -- a file may import the same path more than
+// once, so all of the names are collected, not just the first. A dot import is
+// rejected outright, because it puts NewCapability into file scope where an
+// unqualified call would evade a scan for qualified references; nothing in
+// this module has any reason to dot-import the package, so a flat prohibition
+// is easier to keep true than a second scanner. A blank import is rejected for
+// the same reason: it binds no name of its own, so on its own it cannot reach
+// the constructor -- `_ "…/devbackfill"` plus an unqualified NewCapability()
+// fails to compile with `undefined: NewCapability` -- but permitting it lets a
+// file import the package twice and hide the usable name behind the unusable
+// one.
 //
 // Test files are excluded: they legitimately mint capabilities, and they are
 // not production reachability. Outside the module the barrier is the compiler
@@ -347,6 +357,7 @@ func TestBackfillCapabilityHasOneMintSite(t *testing.T) {
 	}
 
 	var sites []mintSite
+	var unqualified []string
 	fileSet := token.NewFileSet()
 	err = filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
 		if err != nil {
@@ -365,21 +376,31 @@ func TestBackfillCapabilityHasOneMintSite(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		local := importedName(parsed, capabilityPackage)
-		if local == "" {
+		locals, unnamed := importedNames(parsed, capabilityPackage)
+		if len(locals) == 0 && !unnamed {
 			return nil
 		}
 		relative, err := filepath.Rel(root, path)
 		if err != nil {
 			return err
 		}
-		sites = append(sites, mintSites(parsed, relative, local, constructor)...)
+		if unnamed {
+			unqualified = append(unqualified, relative)
+		}
+		sites = append(sites, mintSites(parsed, relative, locals, constructor)...)
 		return nil
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 
+	if len(unqualified) != 0 {
+		t.Fatalf(
+			"%v dot- or blank-import %s, which this test refuses: a dot "+
+				"import makes %s callable unqualified, and a blank import "+
+				"can mask a second, usable import of the same path",
+			unqualified, capabilityPackage, constructor)
+	}
 	if len(sites) != 1 {
 		t.Fatalf(
 			"the development backfill capability is minted %d times, want "+
@@ -399,32 +420,45 @@ func TestBackfillCapabilityHasOneMintSite(t *testing.T) {
 	}
 }
 
-// importedName returns the name the file refers to path by, or "" if the file
-// does not import it. A blank or dot import returns "" because neither can
-// name the constructor.
-func importedName(file *ast.File, path string) string {
+// importedNames returns every local name the file binds path to, and whether
+// the file imports path in a form that binds no usable name of its own: a dot
+// import, which puts the package's exported identifiers into file scope, or a
+// blank import, which binds nothing. Both are reported so the caller can
+// refuse them rather than scan a file whose references it cannot see.
+//
+// A file may import the same path more than once, so every spec is examined.
+func importedNames(file *ast.File, path string) (locals []string, unnamed bool) {
 	for _, spec := range file.Imports {
 		value, err := strconv.Unquote(spec.Path.Value)
 		if err != nil || value != path {
 			continue
 		}
 		if spec.Name == nil {
-			return filepath.Base(path)
+			locals = append(locals, filepath.Base(path))
+			continue
 		}
 		if spec.Name.Name == "_" || spec.Name.Name == "." {
-			return ""
+			unnamed = true
+			continue
 		}
-		return spec.Name.Name
+		locals = append(locals, spec.Name.Name)
 	}
-	return ""
+	return locals, unnamed
 }
 
-// mintSites reports every reference to local.constructor in the file, whether
-// called or merely taken as a value, together with the enclosing function.
+// mintSites reports every reference to constructor qualified by any of locals
+// in the file, whether called or merely taken as a value, together with the
+// enclosing function.
 func mintSites(
 	file *ast.File,
-	relative, local, constructor string,
+	relative string,
+	locals []string,
+	constructor string,
 ) []mintSite {
+	qualifier := make(map[string]bool, len(locals))
+	for _, local := range locals {
+		qualifier[local] = true
+	}
 	var sites []mintSite
 	record := func(function string, node ast.Node) {
 		called := map[ast.Node]bool{}
@@ -438,7 +472,7 @@ func mintSites(
 				return true
 			}
 			ident, ok := selector.X.(*ast.Ident)
-			if !ok || ident.Name != local {
+			if !ok || !qualifier[ident.Name] {
 				return true
 			}
 			sites = append(sites, mintSite{
