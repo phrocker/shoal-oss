@@ -51,6 +51,13 @@ func TestParseRejectsGarbage(t *testing.T) {
 		"has_embeddings: space-a",
 		"no_embeddings:space-a",
 		"unknown:space-a",
+		// A trailing colon is a truncated command line, not a
+		// shorthand. Splitting leaves an empty identity, which
+		// validates for these two states, so without an explicit
+		// refusal "--default-embedding=no_embeddings:" would be read
+		// as a positive assertion the operator never finished making.
+		"no_embeddings:",
+		"unknown:",
 	} {
 		if got, err := Parse(text); err == nil {
 			t.Fatalf("Parse(%q) = %+v, want an error", text, got)

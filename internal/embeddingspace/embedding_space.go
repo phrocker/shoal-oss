@@ -158,6 +158,13 @@ func (s FileState) Validate() error {
 // Parse is the inverse of String, for operator-supplied configuration:
 // "no_embeddings", "unknown", or "has_embeddings:<identity>".
 //
+// The grammar is exactly what String emits, and nothing else. In
+// particular "no_embeddings:" is refused rather than read as
+// "no_embeddings": a trailing colon is a truncated command line, and
+// reading a truncation as a positive assertion is how an operator's
+// typo becomes durable evidence — the failure mode this whole change
+// set exists to remove.
+//
 // The empty string parses to the zero FileState, which callers read as
 // "nothing configured" — distinct from an explicit "unknown", which is a
 // deliberate declaration that the state is not established.
@@ -167,6 +174,10 @@ func Parse(text string) (FileState, error) {
 	}
 	state := FileState{State: State(text)}
 	if kind, identity, ok := strings.Cut(text, ":"); ok {
+		if State(kind) != StateHasEmbeddings {
+			return FileState{}, fmt.Errorf(
+				"%w: %q takes no identity", ErrInvalidState, kind)
+		}
 		state = FileState{State: State(kind), Identity: identity}
 	}
 	if err := state.Validate(); err != nil {

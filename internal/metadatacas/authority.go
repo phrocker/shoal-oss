@@ -537,9 +537,16 @@ func locateMetadataTarget(
 		}
 		if extent.Contains(row) && tablet.Location != nil {
 			return tablet.Location.HostPort, metadata.MetadataTableID, &data.TKeyExtent{
-				Table:      []byte(metadata.MetadataTableID),
-				PrevEndRow: append([]byte(nil), tablet.PrevRow...),
-				EndRow:     append([]byte(nil), tablet.EndRow...),
+				Table: []byte(metadata.MetadataTableID),
+				// bytes.Clone, not append-to-nil, which collapses an
+				// empty-but-present bound to nil. A nil prevEndRow means
+				// the tablet has no lower bound; an empty one means the
+				// bound is the empty row. Losing that after a split on
+				// the empty row addresses the extent at a different
+				// tablet than the one the row was found in, so every
+				// conditional write against it is rejected forever.
+				PrevEndRow: bytes.Clone(tablet.PrevRow),
+				EndRow:     bytes.Clone(tablet.EndRow),
 			}, nil
 		}
 	}

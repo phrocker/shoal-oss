@@ -201,6 +201,40 @@ func TestBackfillWriterRefusesAnEmptyExistingColumn(t *testing.T) {
 	}
 }
 
+// TestLocateMetadataTargetPreservesEmptyBounds: a nil prevEndRow means
+// the tablet has no lower bound; an empty one means the bound is the
+// empty row, which is what a split on the empty row produces. The
+// resolver must not collapse the second into the first — append-to-nil
+// does exactly that — because the extent then addresses a different
+// tablet than the row was found in and every conditional write against
+// it is rejected on every retry, forever.
+func TestLocateMetadataTargetPreservesEmptyBounds(t *testing.T) {
+	reader := emptyBoundReader{}
+	_, _, extent, err := locateMetadataTarget(
+		context.Background(), reader, nil, "5", []byte("5;row"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if extent.PrevEndRow == nil || len(extent.PrevEndRow) != 0 {
+		t.Fatalf("PrevEndRow = %#v, want an empty non-nil bound", extent.PrevEndRow)
+	}
+	if extent.EndRow == nil || len(extent.EndRow) != 0 {
+		t.Fatalf("EndRow = %#v, want an empty non-nil bound", extent.EndRow)
+	}
+}
+
+type emptyBoundReader struct{}
+
+func (emptyBoundReader) LocateTable(context.Context, string) ([]metadata.TabletInfo, error) {
+	return []metadata.TabletInfo{{
+		TableID:    metadata.MetadataTableID,
+		PrevRowSet: true,
+		PrevRow:    []byte{},
+		EndRow:     []byte{},
+		Location:   &metadata.Location{HostPort: "md:9997"},
+	}}, nil
+}
+
 // TestBackfillWriterRefusesTheRootTablet: the root tablet's metadata
 // lives in ZooKeeper and is owned by whichever server hosts it.
 func TestBackfillWriterRefusesTheRootTablet(t *testing.T) {
