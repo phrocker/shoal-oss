@@ -179,6 +179,57 @@ func TestRunKeepsFooterAndMetadataAgreeing(t *testing.T) {
 // not "unset", it is malformed. Testing only State != "" would let it
 // through as if nothing had been configured, silently discarding an
 // operator's intent instead of telling them their config is wrong.
+// TestResumeKeepsTheCheckpointedEmbedding: recovery replays a decision
+// that was already made and checkpointed, so it must not be re-derived
+// from configuration that may have changed since. It changes across
+// exactly the upgrade this PR is: a checkpoint written by the old code
+// carries the implicit no_embeddings, and re-deriving it would make
+// equalFile report "resumed snapshot changed" — which fails resumePending
+// and leaves the tablet unable to open at all.
+func TestResumeKeepsTheCheckpointedEmbedding(t *testing.T) {
+	f := newFixture(t)
+
+	// Build a checkpoint the way the old code would have: the snapshot
+	// declared nothing and the label recorded was no_embeddings. The
+	// crash is injected after the snapshot checkpoint is durable but
+	// before the operation completes, so the resume path is taken.
+	legacy := f.config
+	legacy.DefaultEmbedding = embeddingspace.NoEmbeddings()
+	before, err := New(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.states.failPhase = PhasePublished
+	f.states.failOnce = true
+	if _, err := before.Run(context.Background(), "op-1"); err == nil {
+		t.Fatal("the injected crash did not fire")
+	}
+	checkpoint, err := f.states.Load(context.Background(), "op-1")
+	if err != nil || checkpoint == nil {
+		t.Fatalf("checkpoint = %+v, err = %v", checkpoint, err)
+	}
+	if checkpoint.Phase >= PhaseCommitted {
+		t.Fatalf("checkpoint phase = %v, want the resume path", checkpoint.Phase)
+	}
+	if checkpoint.File.Embedding != embeddingspace.NoEmbeddings() {
+		t.Fatalf("checkpointed embedding = %+v", checkpoint.File.Embedding)
+	}
+
+	// Now resume the same operation with the default removed, as an
+	// upgrade or a flag change would.
+	after, err := New(f.config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resumed, err := after.Run(context.Background(), "op-1")
+	if err != nil {
+		t.Fatalf("resume failed: %v", err)
+	}
+	if resumed.Embedding != embeddingspace.NoEmbeddings() {
+		t.Fatalf("resumed embedding = %+v, want the checkpointed no_embeddings", resumed.Embedding)
+	}
+}
+
 func TestNewRejectsPartialDefaultEmbedding(t *testing.T) {
 	f := newFixture(t)
 	cfg := f.config

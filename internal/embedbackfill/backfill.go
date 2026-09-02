@@ -65,6 +65,17 @@ import (
 const ReasonUnestablishedFooter = "the file's footer does not establish a known embedding state, " +
 	"so it cannot be resolved from metadata"
 
+// ReasonUnverifiableNoEmbeddings is reported for a file whose footer says
+// no_embeddings while the run has not been told to trust that claim.
+//
+// The minor-compaction path fixed by issue #274 fabricated no_embeddings
+// and stamped it into the footer, so such a footer may be that
+// fabrication rather than an observation, and copying it into the column
+// would make the bug's own output durable while reporting the file
+// migrated. See Config.TrustNoEmbeddingsFooters.
+const ReasonUnverifiableNoEmbeddings = "the footer says no_embeddings, but a footer written before " +
+	"issue #274 may have fabricated it; re-run with --trust-no-embeddings-footers to accept it"
+
 // File is one metadata file entry the backfill may have to label.
 type File struct {
 	// TableID and the tablet bounds identify the metadata row the
@@ -133,6 +144,23 @@ type Config struct {
 	// DryRun resolves and reports without writing anything. It is the
 	// safe way to size a migration before committing to it.
 	DryRun bool
+
+	// TrustNoEmbeddingsFooters is an explicit operator assertion that a
+	// no_embeddings footer on this table means what it says.
+	//
+	// It exists because the minor-compaction path fixed by issue #274
+	// fabricated no_embeddings and wrote it into the footer, so for
+	// files produced by that code the footer is not independent evidence
+	// — it is the same unfounded claim, one layer down. Trusting it by
+	// default would let the backfill copy the bug's output into durable
+	// metadata and report the table as migrated.
+	//
+	// An operator who knows the table's ingest pipeline never emitted
+	// vectors can assert that here, exactly as they can with
+	// mincauthority.Config.DefaultEmbedding. Without it those files are
+	// reported unresolvable, by entry and path, so the decision is made
+	// deliberately and on a named set of files.
+	TrustNoEmbeddingsFooters bool
 }
 
 // Unresolved is one file the backfill could not establish a state for.
@@ -174,7 +202,17 @@ type Summary struct {
 }
 
 // Complete reports whether the run left nothing outstanding.
-func (s Summary) Complete() bool { return len(s.Unresolved) == 0 && len(s.Raced) == 0 }
+//
+// A dry run that would have written columns is not complete: nothing was
+// made durable, so the table still refuses compaction. Reporting
+// otherwise would let a script take the CLI's default dry-run mode as
+// evidence that a table needs no migration.
+func (s Summary) Complete() bool {
+	if len(s.Unresolved) != 0 || len(s.Raced) != 0 {
+		return false
+	}
+	return !s.DryRun || s.Resolved == 0
+}
 
 // Run executes one backfill pass.
 //
@@ -218,6 +256,24 @@ func Run(ctx context.Context, cfg Config) (Summary, error) {
 		if !state.Known() {
 			summary.Unresolved = append(summary.Unresolved, Unresolved{
 				Entry: file.Entry, Path: file.Path, Reason: ReasonUnestablishedFooter,
+			})
+			continue
+		}
+		if state == embeddingspace.NoEmbeddings() && !cfg.TrustNoEmbeddingsFooters {
+			// The minor-compaction path this issue fixes fabricated
+			// no_embeddings and stamped it into the footer, so on a file
+			// written before the fix a no_embeddings footer may be that
+			// fabrication rather than an observation. Copying it into
+			// the column would launder the bug's own output into durable
+			// metadata and report the file as migrated, which is the
+			// exact substitution of absence for evidence this whole
+			// change exists to stop.
+			//
+			// has_embeddings was never fabricated, so it is trusted
+			// unconditionally: no version of the writer invented an
+			// identity.
+			summary.Unresolved = append(summary.Unresolved, Unresolved{
+				Entry: file.Entry, Path: file.Path, Reason: ReasonUnverifiableNoEmbeddings,
 			})
 			continue
 		}

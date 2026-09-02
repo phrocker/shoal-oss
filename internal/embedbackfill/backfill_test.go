@@ -104,7 +104,13 @@ func TestRunResolvesFromTheFooter(t *testing.T) {
 		"/t/a.rf": embeddingspace.Has("space-a"),
 		"/t/b.rf": embeddingspace.NoEmbeddings(),
 	}}
-	summary, err := Run(context.Background(), Config{Files: files, Footers: footers, Columns: files})
+	summary, err := Run(context.Background(), Config{
+		Files: files, Footers: footers, Columns: files,
+		// This test is about resolving from footers at all, not about
+		// whether a legacy no_embeddings footer is believable, so it
+		// opts in rather than losing coverage of the no_embeddings path.
+		TrustNoEmbeddingsFooters: true,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -131,7 +137,13 @@ func TestRunIsIdempotent(t *testing.T) {
 		"/t/a.rf": embeddingspace.Has("space-a"),
 		"/t/b.rf": embeddingspace.NoEmbeddings(),
 	}}
-	cfg := Config{Files: files, Footers: footers, Columns: files}
+	cfg := Config{
+		Files: files, Footers: footers, Columns: files,
+		// Idempotence is the property under test; trusting the footer
+		// keeps both files on the resolving path so the second run has
+		// something to be idempotent about.
+		TrustNoEmbeddingsFooters: true,
+	}
 	if _, err := Run(context.Background(), cfg); err != nil {
 		t.Fatal(err)
 	}
@@ -284,6 +296,86 @@ func TestRunDryRunWritesNothing(t *testing.T) {
 	if !strings.Contains(Report(summary), "dry-run") {
 		t.Fatalf("report hides the mode:\n%s", Report(summary))
 	}
+	// A dry run that would have written is not a completed migration.
+	// The CLI defaults to dry-run and exits on Complete(), so reporting
+	// otherwise would let a script read "nothing to do" from a run that
+	// deliberately did nothing.
+	if summary.Complete() {
+		t.Fatal("a dry run with outstanding columns reported itself complete")
+	}
+}
+
+// TestDryRunWithNothingToDoIsComplete is the other half: a table that
+// genuinely needs no migration must not be reported as outstanding
+// forever just because the run was a dry one.
+func TestDryRunWithNothingToDoIsComplete(t *testing.T) {
+	files := &fakeMetadata{files: []File{{
+		TableID: "5", Entry: "a", Path: "/t/a.rf",
+		Metadata: embeddingspace.Has("space-a"),
+	}}}
+	summary, err := Run(context.Background(), Config{
+		Files: files, Footers: &fakeFooters{}, DryRun: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.AlreadyLabelled != 1 || !summary.Complete() {
+		t.Fatalf("summary = %+v", summary)
+	}
+}
+
+// TestLegacyNoEmbeddingsFooterIsNotTrustedByDefault: the pre-#274 minor
+// compaction fabricated no_embeddings and stamped it into the footer, so
+// on a legacy file the footer is not independent evidence — it is the
+// same unfounded claim one layer down. Copying it into the column would
+// make the bug's output durable and report the file migrated.
+func TestLegacyNoEmbeddingsFooterIsNotTrustedByDefault(t *testing.T) {
+	newFiles := func() *fakeMetadata {
+		return &fakeMetadata{files: []File{
+			unknownFile("a", "/t/a.rf"),
+			unknownFile("b", "/t/b.rf"),
+		}}
+	}
+	footers := &fakeFooters{states: map[string]embeddingspace.FileState{
+		"/t/a.rf": embeddingspace.Has("space-a"),
+		"/t/b.rf": embeddingspace.NoEmbeddings(),
+	}}
+
+	files := newFiles()
+	summary, err := Run(context.Background(), Config{Files: files, Footers: footers, Columns: files})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.Resolved != 1 || len(summary.Unresolved) != 1 {
+		t.Fatalf("summary = %+v", summary)
+	}
+	if summary.Unresolved[0].Entry != "b" ||
+		summary.Unresolved[0].Reason != ReasonUnverifiableNoEmbeddings {
+		t.Fatalf("unresolved = %+v", summary.Unresolved[0])
+	}
+	// has_embeddings was never fabricated by any writer, so it is
+	// trusted unconditionally and must not be swept up by the gate.
+	if files.files[0].Metadata != embeddingspace.Has("space-a") {
+		t.Fatalf("file a = %+v, want the footer's identity written", files.files[0].Metadata)
+	}
+	if files.files[1].Metadata.Known() {
+		t.Fatal("an untrusted no_embeddings footer was written into the column")
+	}
+
+	// The operator can assert it, which is the whole escape hatch.
+	files = newFiles()
+	summary, err = Run(context.Background(), Config{
+		Files: files, Footers: footers, Columns: files, TrustNoEmbeddingsFooters: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.Resolved != 2 || len(summary.Unresolved) != 0 {
+		t.Fatalf("opted-in summary = %+v", summary)
+	}
+	if files.files[1].Metadata != embeddingspace.NoEmbeddings() {
+		t.Fatalf("file b = %+v, want no embeddings", files.files[1].Metadata)
+	}
 }
 
 func TestRunRequiresAWriterWhenApplying(t *testing.T) {
@@ -332,6 +424,10 @@ func TestBackfillOverRealFilesLeavesLegacyFilesOutstanding(t *testing.T) {
 	}}
 	summary, err := Run(context.Background(), Config{
 		Files: files, Footers: StorageFooters{Backend: backend}, Columns: files,
+		// The point here is the footerless file, so the file that does
+		// carry a no_embeddings footer opts in rather than being held
+		// back for a different reason and blurring the assertion.
+		TrustNoEmbeddingsFooters: true,
 	})
 	if err != nil {
 		t.Fatal(err)

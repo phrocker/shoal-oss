@@ -298,7 +298,19 @@ func (c *Coordinator) Run(ctx context.Context, operationID string) (DataFile, er
 			// nothing". A partial state such as {Identity: "x"} is
 			// malformed provider output and must reach validateSnapshot
 			// and be rejected, not be quietly replaced by the default.
-			snapshot.Embedding = c.defaultEmbedding()
+			if state != nil && state.File.Embedding != (embeddingspace.FileState{}) {
+				// Resuming replays a decision that was already made and
+				// checkpointed, so it must not be re-derived from
+				// configuration that may have changed since — including
+				// across the upgrade that introduced DefaultEmbedding,
+				// where every in-flight checkpoint carries the old
+				// implicit label. Re-deriving would make equalFile below
+				// report "resumed snapshot changed" and leave the tablet
+				// unable to open.
+				snapshot.Embedding = state.File.Embedding
+			} else {
+				snapshot.Embedding = c.defaultEmbedding()
+			}
 		}
 		if err := validateSnapshot(snapshot, c.cfg.Extent, c.cfg.Fence); err != nil {
 			return DataFile{}, err

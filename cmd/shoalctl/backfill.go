@@ -55,6 +55,9 @@ func runEmbeddingBackfill(args []string, stdout, stderr io.Writer) error {
 	zkTimeout := flags.Duration("zk-timeout", 30*time.Second, "ZooKeeper session timeout")
 	dialTimeout := flags.Duration("dial-timeout", 10*time.Second, "tablet-server dial timeout")
 	dryRun := flags.Bool("dry-run", true, "report what would be written without writing it")
+	trustNoEmbeddings := flags.Bool("trust-no-embeddings-footers", false,
+		"accept a no_embeddings footer as truth; required because a footer written before "+
+			"issue #274 may have fabricated that claim")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -94,6 +97,8 @@ func runEmbeddingBackfill(args []string, stdout, stderr io.Writer) error {
 		Files:   embedbackfill.MetadataFiles{Reader: walker, TableID: *table},
 		Footers: embedbackfill.StorageFooters{Backend: backend},
 		DryRun:  *dryRun,
+
+		TrustNoEmbeddingsFooters: *trustNoEmbeddings,
 	}
 
 	if !*dryRun {

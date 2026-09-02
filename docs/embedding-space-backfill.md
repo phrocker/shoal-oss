@@ -28,7 +28,8 @@ For each file entry in a table:
 | Situation | Outcome |
 | --- | --- |
 | The entry already has a definite `file.embedding` column | left alone, counted as *already labelled* |
-| The file's footer declares a known state | that state is written to `file.embedding`, counted as *resolved* |
+| The footer declares `has_embeddings:<identity>` | that state is written to `file.embedding`, counted as *resolved* |
+| The footer declares `no_embeddings` | written only with `--trust-no-embeddings-footers`; otherwise listed as *unresolvable* — see below |
 | The footer is absent, unreadable, or explicitly `unknown` | left `unknown` and listed individually as *unresolvable* |
 | The entry changed mid-run | not written, listed individually as *raced*; re-run picks it up |
 
@@ -47,6 +48,24 @@ A file whose footer does not establish a known state cannot be resolved
 from metadata alone, so it is reported by name with the reason rather
 than guessed at.
 
+### Legacy `no_embeddings` footers
+
+The minor-compaction path fixed by #274 fabricated `no_embeddings` and
+stamped it into the RFile footer. On a file written by that code the
+footer is therefore **not** independent evidence — it is the same
+unfounded claim one layer down, and copying it into `file.embedding`
+would make the bug's own output durable while reporting the file
+migrated.
+
+The backfill will not do that on its own. A `no_embeddings` footer is
+left unresolvable, named, with the reason given, unless the operator
+passes `--trust-no-embeddings-footers`, which is an explicit assertion
+that this table's ingest pipeline really did emit no vectors — the same
+assertion `--default-embedding` makes going forward.
+
+`has_embeddings` footers are trusted unconditionally: no version of the
+writer ever invented an identity.
+
 ## Running it
 
 ```
@@ -58,9 +77,11 @@ It defaults to `--dry-run=true`, which reports the size and shape of the
 migration without writing anything. Pass `--dry-run=false` to apply.
 Supply the password through `SHOAL_PASSWORD` rather than `--password`.
 
-The command exits non-zero when the run left anything outstanding
-(unresolvable or raced files), so a script cannot treat a partial
-migration as done.
+The command exits non-zero when the run left anything outstanding —
+unresolvable files, raced files, or a dry run that would have written
+columns. A dry run is never reported as a completed migration unless
+there was nothing to write, so the default mode cannot be mistaken for
+evidence that a table needs no migration.
 
 ## Safety and idempotence
 
@@ -118,6 +139,14 @@ coordinator now forces the RFile footer to carry the same state it
 records in metadata — previously a configured writer option could reach
 the footer while the metadata column said something else, which the next
 integrity check rejects.
+
+Changing the flag is safe across a restart. A minor compaction that was
+checkpointed and is being resumed reuses the state recorded in its
+checkpoint rather than re-deriving it from current configuration, so a
+flag change — or the upgrade to this version itself, where every
+in-flight checkpoint carries the old implicit `no_embeddings` — cannot
+make a resumed operation look changed and leave the tablet unable to
+open.
 
 ## Diagnosing a refusal
 
