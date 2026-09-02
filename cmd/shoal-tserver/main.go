@@ -20,6 +20,7 @@ import (
 
 	"github.com/phrocker/shoal-oss/internal/cache"
 	"github.com/phrocker/shoal-oss/internal/cred"
+	"github.com/phrocker/shoal-oss/internal/embeddingspace"
 	"github.com/phrocker/shoal-oss/internal/hostedingest"
 	"github.com/phrocker/shoal-oss/internal/ingestclient"
 	"github.com/phrocker/shoal-oss/internal/ingestrouter"
@@ -79,6 +80,9 @@ func main() {
 	mincRoot := flag.String("minc-root", "shoal/minc", "minor-compaction object prefix")
 	stateRoot := flag.String("state-root", "/var/lib/shoal/minc-state", "durable minor-compaction state directory")
 	flushCells := flag.Int("flush-cells", 1, "memtable cells that trigger minor compaction")
+	defaultEmbedding := flag.String("default-embedding", "",
+		"embedding state recorded for a minor compaction that declares none: "+
+			"no_embeddings, unknown, or has_embeddings:<identity>; empty means unknown")
 	enableIngest := flag.Bool("enable-ingest", false, "advertise TABLET_INGEST after all write authorities initialize")
 	tlsCert := flag.String("tls-cert", "", "server TLS certificate for Thrift and operations listeners")
 	tlsKey := flag.String("tls-key", "", "server TLS private key")
@@ -188,11 +192,16 @@ func main() {
 	if err != nil {
 		die("tablet loader: %v", err)
 	}
+	mincDefaultEmbedding, err := embeddingspace.Parse(*defaultEmbedding)
+	if err != nil {
+		die("-default-embedding: %v", err)
+	}
 	tabletFactory, err := hostedingest.NewFactory(hostedingest.Config{
 		Host: host, ServerAddress: *advertise,
 		WALRoot: *walRoot, MincRoot: *mincRoot, StateRoot: *stateRoot,
 		WALStore: walauthority.NewLocalStore(), Outputs: files,
 		Metadata: metadataFactory, FlushCells: *flushCells,
+		DefaultEmbedding: mincDefaultEmbedding,
 		FlushID: func(ctx context.Context, tableID string) (int64, error) {
 			raw, _, err := session.Get(path.Join(
 				loc.InstancePath(), "tables", tableID, "flush-id",

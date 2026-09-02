@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/phrocker/shoal-oss/internal/embeddingspace"
 	"github.com/phrocker/shoal-oss/internal/ingestrouter"
 	"github.com/phrocker/shoal-oss/internal/metadata"
 	"github.com/phrocker/shoal-oss/internal/mincauthority"
@@ -91,6 +92,13 @@ type Config struct {
 	FlushCells     int
 	Now            func() time.Time
 	NewOperationID func() string
+
+	// DefaultEmbedding is the embedding-space state recorded for a minor
+	// compaction whose snapshot declared none. It is forwarded verbatim
+	// to mincauthority.Config.DefaultEmbedding: with no value configured,
+	// an undeclared output is labelled unknown rather than having a claim
+	// invented for it. See issue #274.
+	DefaultEmbedding embeddingspace.FileState
 }
 
 type Metrics struct {
@@ -146,6 +154,11 @@ func NewFactory(cfg Config) (*Factory, error) {
 	}
 	if cfg.NewOperationID == nil {
 		cfg.NewOperationID = uuid.NewString
+	}
+	if cfg.DefaultEmbedding.State != "" {
+		if err := cfg.DefaultEmbedding.Validate(); err != nil {
+			return nil, fmt.Errorf("hostedingest: default embedding: %w", err)
+		}
 	}
 	return &Factory{cfg: cfg}, nil
 }
@@ -229,6 +242,8 @@ func (f *Factory) Open(
 		Snapshots: tablet, Verifier: recoveryVerifier, Metadata: metadata,
 		Outputs: mincauthority.BackendOutputStore{Backend: f.cfg.Outputs},
 		States:  stateStore,
+
+		DefaultEmbedding: f.cfg.DefaultEmbedding,
 	})
 	if err != nil {
 		_ = wal.Close(context.Background())

@@ -37,33 +37,54 @@ func (m MetadataFiles) List(ctx context.Context) ([]File, error) {
 	if m.Reader == nil || strings.TrimSpace(m.TableID) == "" {
 		return nil, fmt.Errorf("embedbackfill: MetadataFiles needs a reader and a table id")
 	}
+	if m.TableID == metadata.RootTableID {
+		// Refused here rather than at the write, so a dry run validates
+		// the same target an apply would and cannot report a migration
+		// that could never be performed.
+		return nil, metadatacas.ErrRootBackfillUnsupported
+	}
 	tablets, err := m.Reader.LocateTable(ctx, m.TableID)
 	if err != nil {
 		return nil, err
+	}
+	if len(tablets) == 0 {
+		// An unknown table id locates nothing. Reporting a clean
+		// zero-file migration for a typo would tell an operator their
+		// table is done when it was never looked at.
+		return nil, fmt.Errorf("embedbackfill: table %q has no tablets", m.TableID)
 	}
 	out := make([]File, 0)
 	for _, tablet := range tablets {
 		for _, file := range tablet.Files {
 			out = append(out, File{
-				TableID:    tablet.TableID,
-				PrevEndRow: append([]byte(nil), tablet.PrevRow...),
-				EndRow:     append([]byte(nil), tablet.EndRow...),
-				Entry:      string(file.RawQualifier),
-				Path:       file.Path,
-				Qualifier:  append([]byte(nil), file.RawQualifier...),
-				Value:      append([]byte(nil), file.RawValue...),
-				Metadata:   file.Embedding,
+				TableID:        tablet.TableID,
+				PrevEndRow:     append([]byte(nil), tablet.PrevRow...),
+				EndRow:         append([]byte(nil), tablet.EndRow...),
+				Entry:          string(file.RawQualifier),
+				Path:           file.Path,
+				Qualifier:      append([]byte(nil), file.RawQualifier...),
+				Value:          append([]byte(nil), file.RawValue...),
+				Metadata:       file.Embedding,
+				ExistingColumn: append([]byte(nil), file.RawEmbedding...),
 			})
 		}
 	}
 	return out, nil
 }
 
+// ColumnWriter is the metadata compare-and-set seam.
+// *metadatacas.BackfillWriter satisfies it.
+type ColumnWriter interface {
+	WriteFileEmbedding(
+		ctx context.Context, target metadatacas.BackfillTarget, state embeddingspace.FileState,
+	) (bool, error)
+}
+
 // CASColumns writes the file.embedding column through the metadata
 // compare-and-set authority, which is the same path a minor compaction
 // commit uses. Nothing about the backfill gets its own write route.
 type CASColumns struct {
-	Writer *metadatacas.BackfillWriter
+	Writer ColumnWriter
 }
 
 // Write implements Columns.
@@ -74,11 +95,12 @@ func (c CASColumns) Write(
 		return false, fmt.Errorf("embedbackfill: CASColumns needs a writer")
 	}
 	return c.Writer.WriteFileEmbedding(ctx, metadatacas.BackfillTarget{
-		TableID:       file.TableID,
-		PrevEndRow:    file.PrevEndRow,
-		EndRow:        file.EndRow,
-		FileQualifier: file.Qualifier,
-		FileValue:     file.Value,
+		TableID:           file.TableID,
+		PrevEndRow:        file.PrevEndRow,
+		EndRow:            file.EndRow,
+		FileQualifier:     file.Qualifier,
+		FileValue:         file.Value,
+		ExistingEmbedding: file.ExistingColumn,
 	}, state)
 }
 
@@ -93,10 +115,12 @@ type StorageFooters struct {
 	Backend storage.Backend
 }
 
-// FooterState implements Footers. A file with no embedding-space meta
-// block yields embeddingspace.Unknown() and no error — that is the
-// normal shape of a file written before the block existed, and it is
-// precisely the case the backfill must report rather than guess at.
+// FooterState implements Footers. A file whose embedding-space meta
+// block is absent yields embeddingspace.Unknown() and no error — that is
+// the normal shape of a file written before the block existed, and it is
+// precisely the case the backfill must report rather than guess at. A
+// block that is present and explicitly encodes unknown yields the same
+// state, and is treated the same way: neither establishes anything.
 func (s StorageFooters) FooterState(
 	ctx context.Context, path string,
 ) (embeddingspace.FileState, error) {

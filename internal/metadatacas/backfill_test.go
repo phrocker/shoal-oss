@@ -125,6 +125,61 @@ func TestBackfillWriterRefusesToRecordUnknown(t *testing.T) {
 	}
 }
 
+// TestBackfillWriterReplacesAnExplicitUnknownColumn: an explicit unknown
+// column is as uninformative as an absent one, and the compaction
+// refusal tells operators the backfill repairs it — so the write is
+// conditioned on the stored bytes rather than on absence.
+func TestBackfillWriterReplacesAnExplicitUnknownColumn(t *testing.T) {
+	cluster, writer := newBackfillFixture(t)
+	stored, err := embeddingspace.Encode(embeddingspace.Unknown())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cluster.cells[cell(metadata.CFFileEmbedding, backfillEntry)] = stored
+	target := backfillTarget()
+	target.ExistingEmbedding = stored
+
+	applied, err := writer.WriteFileEmbedding(
+		context.Background(), target, embeddingspace.Has("space-a"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !applied {
+		t.Fatal("an explicit unknown column was not repaired")
+	}
+	state, err := embeddingspace.Decode(cluster.cells[cell(metadata.CFFileEmbedding, backfillEntry)])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state != embeddingspace.Has("space-a") {
+		t.Fatalf("column = %+v", state)
+	}
+}
+
+// TestBackfillWriterRefusesToReplaceAnEstablishedColumn: a definite
+// column was written by something with better evidence than a migration
+// tool. A disagreement with the footer is an integrity condition for an
+// operator, not something to silently overwrite.
+func TestBackfillWriterRefusesToReplaceAnEstablishedColumn(t *testing.T) {
+	cluster, writer := newBackfillFixture(t)
+	stored, err := embeddingspace.Encode(embeddingspace.NoEmbeddings())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cluster.cells[cell(metadata.CFFileEmbedding, backfillEntry)] = stored
+	target := backfillTarget()
+	target.ExistingEmbedding = stored
+
+	applied, err := writer.WriteFileEmbedding(
+		context.Background(), target, embeddingspace.Has("space-a"))
+	if applied || err == nil {
+		t.Fatalf("applied = %t, err = %v; an established column must be refused", applied, err)
+	}
+	if string(cluster.cells[cell(metadata.CFFileEmbedding, backfillEntry)]) != string(stored) {
+		t.Fatal("an established column was overwritten")
+	}
+}
+
 // TestBackfillWriterRefusesTheRootTablet: the root tablet's metadata
 // lives in ZooKeeper and is owned by whichever server hosts it.
 func TestBackfillWriterRefusesTheRootTablet(t *testing.T) {

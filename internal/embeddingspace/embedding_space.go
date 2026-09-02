@@ -155,6 +155,26 @@ func (s FileState) Validate() error {
 	return nil
 }
 
+// Parse is the inverse of String, for operator-supplied configuration:
+// "no_embeddings", "unknown", or "has_embeddings:<identity>".
+//
+// The empty string parses to the zero FileState, which callers read as
+// "nothing configured" — distinct from an explicit "unknown", which is a
+// deliberate declaration that the state is not established.
+func Parse(text string) (FileState, error) {
+	if text == "" {
+		return FileState{}, nil
+	}
+	state := FileState{State: State(text)}
+	if kind, identity, ok := strings.Cut(text, ":"); ok {
+		state = FileState{State: State(kind), Identity: identity}
+	}
+	if err := state.Validate(); err != nil {
+		return FileState{}, err
+	}
+	return state, nil
+}
+
 func Encode(s FileState) ([]byte, error) {
 	if err := s.Validate(); err != nil {
 		return nil, err

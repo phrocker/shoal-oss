@@ -77,6 +77,7 @@ func DecodeRootTabletMetadata(encoded []byte) (TabletInfo, error) {
 		for i := range info.Files {
 			if string(info.Files[i].RawQualifier) == qualifier {
 				info.Files[i].Embedding = state
+				info.Files[i].RawEmbedding = []byte(value)
 				found = true
 				break
 			}

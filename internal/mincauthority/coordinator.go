@@ -235,9 +235,20 @@ func New(cfg Config) (*Coordinator, error) {
 // declared none. An operator may configure a positive assertion; with no
 // configuration the output is labelled unknown rather than having a
 // claim invented for it.
+//
+// WriterOptions.EmbeddingSpace is honoured as a second source because it
+// is operator configuration too, and because before issue #274 it was
+// the only way to say anything here. Reading it as the default keeps
+// that intent working, and keeps the footer and the metadata column
+// saying the same thing — previously a set WriterOptions.EmbeddingSpace
+// reached the footer while the metadata column recorded the fabricated
+// no_embeddings, which is a pair the next integrity check rejects.
 func (c *Coordinator) defaultEmbedding() embeddingspace.FileState {
 	if c.cfg.DefaultEmbedding.State != "" {
 		return c.cfg.DefaultEmbedding
+	}
+	if c.cfg.WriterOptions.EmbeddingSpace.State != "" {
+		return c.cfg.WriterOptions.EmbeddingSpace
 	}
 	return embeddingspace.Unknown()
 }
@@ -285,9 +296,14 @@ func (c *Coordinator) Run(ctx context.Context, operationID string) (DataFile, er
 			return DataFile{}, err
 		}
 		writerOptions := c.cfg.WriterOptions
-		if writerOptions.EmbeddingSpace.State == "" {
-			writerOptions.EmbeddingSpace = snapshot.Embedding
-		}
+		// The snapshot's resolved state is the single label for this
+		// output: it is stamped into the RFile footer here and recorded
+		// in the metadata column by describeFile below, and the next
+		// compaction cross-checks the two. Letting WriterOptions carry a
+		// different value would publish a pair guaranteed to fail that
+		// check, so the declaration wins outright rather than only when
+		// the writer option happens to be empty.
+		writerOptions.EmbeddingSpace = snapshot.Embedding
 		encoded, err = encodeSnapshot(snapshot, writerOptions)
 		if err != nil {
 			return DataFile{}, err

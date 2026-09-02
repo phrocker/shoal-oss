@@ -28,9 +28,13 @@ For each file entry in a table:
 | Situation | Outcome |
 | --- | --- |
 | The entry already has a definite `file.embedding` column | left alone, counted as *already labelled* |
-| The file's footer declares a state | that state is written to `file.embedding`, counted as *resolved* |
-| The file's footer is absent or unreadable | left `unknown` and listed individually as *unresolvable* |
-| The entry changed mid-run | not written, counted as *raced*; re-run picks it up |
+| The file's footer declares a known state | that state is written to `file.embedding`, counted as *resolved* |
+| The footer is absent, unreadable, or explicitly `unknown` | left `unknown` and listed individually as *unresolvable* |
+| The entry changed mid-run | not written, listed individually as *raced*; re-run picks it up |
+
+An entry whose column is explicitly `unknown` is treated exactly like one
+with no column: neither establishes anything, and both are repaired by
+the same run.
 
 The authority is the file's own footer meta block
 (`embeddingspace.RFileMetaBlockName`), read through
@@ -39,8 +43,9 @@ produced it. Nothing else is consulted: the backfill never inspects cell
 values to guess whether something looks like a vector, because a guess
 written into durable metadata is the exact failure #274 removes.
 
-A file with no footer cannot be established from metadata alone, so it
-is reported by name with the reason rather than guessed at.
+A file whose footer does not establish a known state cannot be resolved
+from metadata alone, so it is reported by name with the reason rather
+than guessed at.
 
 ## Running it
 
@@ -65,23 +70,35 @@ Every write is conditional on:
   tablet that was examined and has not split;
 * the `file:` entry still holding exactly the bytes that were read, so
   the file has not been replaced by a compaction; and
-* the `file.embedding` column still being absent, so a concurrent writer
-  that established the state first wins.
+* the `file.embedding` column still holding exactly what it held when the
+  file was examined — absent, or an explicit `unknown` — so a concurrent
+  writer that established the state first wins. An established column is
+  never replaced.
 
 A second run therefore writes nothing and reports every file as already
 labelled. The run is safe to interrupt and safe to repeat.
 
 The root tablet is refused (`metadatacas.ErrRootBackfillUnsupported`):
 its metadata lives in ZooKeeper behind a different mutation path owned by
-whichever server hosts it.
+whichever server hosts it. A table id that locates no tablets is also
+refused, so a typo cannot report a completed zero-file migration.
 
 ## Declaring a default instead
 
 An operator who knows an ingest pipeline emits no vectors can say so
-rather than have it inferred. `mincauthority.Config.DefaultEmbedding` is
-the state recorded for a minor-compaction snapshot that declares none.
-When it is unset the recorded state is `unknown`. The configured value is
-validated at construction.
+rather than have it inferred. `shoal-tserver --default-embedding` takes
+`no_embeddings`, `unknown`, or `has_embeddings:<identity>`, and is the
+state recorded for a minor-compaction snapshot that declares none. When
+it is unset the recorded state is `unknown`. The value is validated at
+startup.
+
+Internally that is `hostedingest.Config.DefaultEmbedding` →
+`mincauthority.Config.DefaultEmbedding`. `WriterOptions.EmbeddingSpace`
+is honoured as a fallback default for the same reason, and the
+coordinator now forces the RFile footer to carry the same state it
+records in metadata — previously a configured writer option could reach
+the footer while the metadata column said something else, which the next
+integrity check rejects.
 
 ## Diagnosing a refusal
 

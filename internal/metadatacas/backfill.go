@@ -48,6 +48,17 @@ type BackfillTarget struct {
 	// a precondition, not a payload: if the entry has changed, the file
 	// being labelled is not the file that was examined.
 	FileValue []byte
+
+	// ExistingEmbedding is the exact file.embedding column bytes
+	// currently stored, or nil when the column is absent.
+	//
+	// It is the precondition on the thing being replaced. A nil value
+	// conditions on the column not existing; a non-nil value conditions
+	// on it still holding exactly these bytes. Either way a concurrent
+	// writer that established a state first wins and this run reports a
+	// race rather than overwriting it. Only a column that decodes to
+	// unknown may be replaced — see WriteFileEmbedding.
+	ExistingEmbedding []byte
 }
 
 // BackfillWriter writes explicit file.embedding columns for file entries
@@ -63,12 +74,14 @@ type BackfillTarget struct {
 //     tablet that was examined and has not split;
 //   - the file: entry still holds exactly the bytes that were read, so
 //     the file has not been replaced by a compaction; and
-//   - the file.embedding column is still absent, so a concurrent writer
-//     that established the state first wins and this run reports a race
-//     instead of overwriting it.
+//   - the file.embedding column still holds exactly what it held when
+//     the file was examined — absent, or an explicit unknown — so a
+//     concurrent writer that established the state first wins and this
+//     run reports a race instead of overwriting it.
 //
-// Together those make the write idempotent: a second run finds the
-// column present, the condition fails, and nothing is written.
+// Together those make the write idempotent: a second run finds a
+// definite column, skips the file before reaching here, and nothing is
+// written.
 type BackfillWriter struct {
 	reader  TabletReader
 	locator RootLocator
@@ -116,6 +129,22 @@ func (w *BackfillWriter) WriteFileEmbedding(
 		// the footer that could not produce it.
 		return false, fmt.Errorf("%w: refusing to record %s", ErrInvalidConfig, state.String())
 	}
+	if len(target.ExistingEmbedding) > 0 {
+		// Replacing a column is only ever an upgrade from a non-claim.
+		// Anything that already decodes to a definite state was
+		// established by a writer with better evidence than a migration
+		// tool, and the file's own footer is not grounds to overrule it
+		// — that disagreement is an integrity condition for an operator
+		// to look at, not something to silently paper over.
+		existing, err := embeddingspace.Decode(target.ExistingEmbedding)
+		if err != nil {
+			return false, fmt.Errorf("%w: existing file.embedding column: %w", ErrInvalidConfig, err)
+		}
+		if existing.Known() {
+			return false, fmt.Errorf(
+				"%w: refusing to replace an established %s column", ErrInvalidConfig, existing.String())
+		}
+	}
 	encoded, err := encodeFileEmbedding(state)
 	if err != nil {
 		return false, err
@@ -152,10 +181,12 @@ func (w *BackfillWriter) WriteFileEmbedding(
 			Val: append([]byte(nil), target.FileValue...),
 		},
 		{
-			// Val nil means "this column must be absent".
-			Cf: []byte(metadata.CFFileEmbedding),
-			Cq: append([]byte(nil), target.FileQualifier...),
-			Cv: []byte{},
+			// A nil Val means "this column must be absent"; a non-nil
+			// one means "it must still hold exactly these bytes".
+			Cf:  []byte(metadata.CFFileEmbedding),
+			Cq:  append([]byte(nil), target.FileQualifier...),
+			Cv:  []byte{},
+			Val: append([]byte(nil), target.ExistingEmbedding...),
 		},
 	}
 	status, err := w.writer.ConditionalWrite(ctx, address, tableID, extent,

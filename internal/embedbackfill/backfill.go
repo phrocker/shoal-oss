@@ -28,21 +28,23 @@
 // something looks like a vector: a guess written into durable metadata
 // is exactly the failure this whole change set exists to remove.
 //
-// A file whose footer is *also* absent therefore cannot be resolved from
-// metadata alone. Those files are left unknown and reported
-// individually, with the reason, so an operator knows precisely which
-// files need attention and why. Marking them no_embeddings to make the
-// report look clean would reintroduce the bug.
+// A file whose footer does not establish a known state — the meta block
+// is absent, or present and explicitly unknown — therefore cannot be
+// resolved from metadata alone. Those files are left unknown and
+// reported individually, with the reason, so an operator knows precisely
+// which files need attention and why. Marking them no_embeddings to make
+// the report look clean would reintroduce the bug.
 //
 // # Safety
 //
 // Every write is conditional on the file entry still being present and
-// unchanged, and on the embedding column still being absent. A file that
-// was compacted away mid-run is reported as raced, not written. A file
-// that already carries a column is left alone. Re-running the backfill
-// over an already-backfilled table therefore writes nothing and reports
-// every file as already labelled, which is what makes it safe to run
-// repeatedly and safe to interrupt.
+// unchanged, and on the embedding column still holding exactly what it
+// held when the file was examined — absent, or an explicit unknown. A
+// file that was compacted away mid-run is reported as raced, not
+// written. A file that already carries a definite column is left alone.
+// Re-running the backfill over an already-backfilled table therefore
+// writes nothing and reports every file as already labelled, which is
+// what makes it safe to run repeatedly and safe to interrupt.
 package embedbackfill
 
 import (
@@ -54,10 +56,14 @@ import (
 	"github.com/phrocker/shoal-oss/internal/embeddingspace"
 )
 
-// ReasonNoFooter is reported for a file that carries no embedding-space
-// meta block. It is the one case the backfill deliberately refuses to
-// resolve.
-const ReasonNoFooter = "the file carries no embedding-space footer, so its state cannot be established from metadata"
+// ReasonUnestablishedFooter is reported for a file whose own footer does
+// not establish a known state — the embedding-space meta block is
+// absent, or it is present and explicitly encodes unknown. It is the one
+// case the backfill deliberately refuses to resolve, because there is
+// nothing to copy and inventing a value is the bug this whole change set
+// removes.
+const ReasonUnestablishedFooter = "the file's footer does not establish a known embedding state, " +
+	"so it cannot be resolved from metadata"
 
 // File is one metadata file entry the backfill may have to label.
 type File struct {
@@ -85,6 +91,12 @@ type File struct {
 	// Metadata is the file's current embedding-space state as the
 	// metadata layer reports it. Anything Known() is left alone.
 	Metadata embeddingspace.FileState
+
+	// ExistingColumn is the raw file.embedding column bytes, nil when
+	// the column is absent. Metadata cannot express that difference —
+	// an absent column and one explicitly encoding unknown both decode
+	// to the same state — and a conditional write has to.
+	ExistingColumn []byte
 }
 
 // Files enumerates the candidate file entries.
@@ -150,8 +162,11 @@ type Summary struct {
 	Resolved int
 
 	// Raced were resolvable but their metadata entry changed before the
-	// conditional write landed. Re-running picks them up.
-	Raced int
+	// conditional write landed. Re-running picks them up. They are
+	// listed, not just counted: the run is reported as incomplete
+	// because of them, and an operator told a run is incomplete needs
+	// to be told which files.
+	Raced []Unresolved
 
 	// Unresolved could not be established from metadata alone, sorted by
 	// entry. These are the files that need an operator.
@@ -159,7 +174,7 @@ type Summary struct {
 }
 
 // Complete reports whether the run left nothing outstanding.
-func (s Summary) Complete() bool { return len(s.Unresolved) == 0 && s.Raced == 0 }
+func (s Summary) Complete() bool { return len(s.Unresolved) == 0 && len(s.Raced) == 0 }
 
 // Run executes one backfill pass.
 //
@@ -202,7 +217,7 @@ func Run(ctx context.Context, cfg Config) (Summary, error) {
 		}
 		if !state.Known() {
 			summary.Unresolved = append(summary.Unresolved, Unresolved{
-				Entry: file.Entry, Path: file.Path, Reason: ReasonNoFooter,
+				Entry: file.Entry, Path: file.Path, Reason: ReasonUnestablishedFooter,
 			})
 			continue
 		}
@@ -219,18 +234,26 @@ func Run(ctx context.Context, cfg Config) (Summary, error) {
 			continue
 		}
 		if !applied {
-			summary.Raced++
+			summary.Raced = append(summary.Raced, Unresolved{
+				Entry: file.Entry, Path: file.Path,
+				Reason: "the metadata entry changed before the write landed; re-run to pick it up",
+			})
 			continue
 		}
 		summary.Resolved++
 	}
-	sort.Slice(summary.Unresolved, func(i, j int) bool {
-		if summary.Unresolved[i].Entry != summary.Unresolved[j].Entry {
-			return summary.Unresolved[i].Entry < summary.Unresolved[j].Entry
-		}
-		return summary.Unresolved[i].Path < summary.Unresolved[j].Path
-	})
+	sortUnresolved(summary.Raced)
+	sortUnresolved(summary.Unresolved)
 	return summary, nil
+}
+
+func sortUnresolved(items []Unresolved) {
+	sort.Slice(items, func(i, j int) bool {
+		if items[i].Entry != items[j].Entry {
+			return items[i].Entry < items[j].Entry
+		}
+		return items[i].Path < items[j].Path
+	})
 }
 
 // Report renders a summary for an operator, one line per counter and one
@@ -245,7 +268,10 @@ func Report(summary Summary) string {
 	fmt.Fprintf(&b, "scanned: %d\n", summary.Scanned)
 	fmt.Fprintf(&b, "already labelled: %d\n", summary.AlreadyLabelled)
 	fmt.Fprintf(&b, "resolved: %d\n", summary.Resolved)
-	fmt.Fprintf(&b, "raced (retry): %d\n", summary.Raced)
+	fmt.Fprintf(&b, "raced (retry): %d\n", len(summary.Raced))
+	for _, item := range summary.Raced {
+		fmt.Fprintf(&b, "- %s (%s): %s\n", item.Entry, item.Path, item.Reason)
+	}
 	fmt.Fprintf(&b, "unresolvable: %d\n", len(summary.Unresolved))
 	for _, item := range summary.Unresolved {
 		fmt.Fprintf(&b, "- %s (%s): %s\n", item.Entry, item.Path, item.Reason)

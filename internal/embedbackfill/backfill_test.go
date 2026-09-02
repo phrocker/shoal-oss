@@ -8,11 +8,13 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"reflect"
 	"strings"
 	"testing"
 
 	"github.com/phrocker/shoal-oss/internal/embeddingspace"
 	"github.com/phrocker/shoal-oss/internal/metadata"
+	"github.com/phrocker/shoal-oss/internal/metadatacas"
 	"github.com/phrocker/shoal-oss/internal/rfile"
 	"github.com/phrocker/shoal-oss/internal/rfile/wire"
 	"github.com/phrocker/shoal-oss/internal/storage/memory"
@@ -49,10 +51,12 @@ func (f *fakeMetadata) Write(
 			continue
 		}
 		if f.files[i].Metadata.Known() {
-			// Mirrors the CAS precondition: the column must be absent.
+			// Mirrors the CAS precondition: an established column is
+			// never replaced.
 			return false, nil
 		}
 		f.files[i].Metadata = state
+		f.files[i].ExistingColumn = nil
 		f.writes++
 		return true, nil
 	}
@@ -168,7 +172,7 @@ func TestRunLeavesFooterlessFilesUnresolved(t *testing.T) {
 	if summary.Resolved != 1 || len(summary.Unresolved) != 1 {
 		t.Fatalf("summary = %+v", summary)
 	}
-	if summary.Unresolved[0].Entry != "b" || summary.Unresolved[0].Reason != ReasonNoFooter {
+	if summary.Unresolved[0].Entry != "b" || summary.Unresolved[0].Reason != ReasonUnestablishedFooter {
 		t.Fatalf("unresolved = %+v", summary.Unresolved[0])
 	}
 	if files.files[1].Metadata != embeddingspace.Unknown() {
@@ -220,8 +224,16 @@ func TestRunReportsRacesSeparately(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if summary.Raced != 1 || summary.Resolved != 0 || summary.Complete() {
+	if len(summary.Raced) != 1 || summary.Resolved != 0 || summary.Complete() {
 		t.Fatalf("summary = %+v", summary)
+	}
+	// A run reported as incomplete has to say which files, or the CLI's
+	// non-zero exit points an operator at an empty list.
+	if summary.Raced[0].Entry != "a" {
+		t.Fatalf("raced = %+v", summary.Raced[0])
+	}
+	if !strings.Contains(Report(summary), "a (/t/a.rf)") {
+		t.Fatalf("report does not name the raced file:\n%s", Report(summary))
 	}
 }
 
@@ -385,6 +397,150 @@ type fakeTablets []metadata.TabletInfo
 
 func (f fakeTablets) LocateTable(context.Context, string) ([]metadata.TabletInfo, error) {
 	return []metadata.TabletInfo(f), nil
+}
+
+// TestMetadataFilesDistinguishesAbsentFromExplicitUnknown: both decode
+// to the same FileState, but a conditional write has to tell them apart
+// — "must not exist" and "must still hold these bytes" are different
+// preconditions, and getting it wrong makes an explicit-unknown column
+// unrepairable.
+func TestMetadataFilesDistinguishesAbsentFromExplicitUnknown(t *testing.T) {
+	row := "5;m"
+	absent := `{"path":"hdfs://nn/tables/5/A.rf","startRow":"","endRow":""}`
+	explicit := `{"path":"hdfs://nn/tables/5/B.rf","startRow":"","endRow":""}`
+	encoded, err := embeddingspace.Encode(embeddingspace.Unknown())
+	if err != nil {
+		t.Fatal(err)
+	}
+	tablets, err := metadata.AggregateRows([]*data.TKeyValue{
+		metadataKV(row, metadata.CFFile, absent, "100,10"),
+		metadataKV(row, metadata.CFFile, explicit, "200,20"),
+		metadataKV(row, metadata.CFFileEmbedding, explicit, string(encoded)),
+		metadataKV(row, metadata.CFTabletSection, metadata.CQPrevRow, "\x00"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	listed, err := MetadataFiles{Reader: fakeTablets(tablets), TableID: "5"}.List(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	byEntry := map[string]File{}
+	for _, file := range listed {
+		byEntry[file.Entry] = file
+	}
+	if got := byEntry[absent]; got.Metadata != embeddingspace.Unknown() || len(got.ExistingColumn) != 0 {
+		t.Fatalf("absent column = %+v, want unknown with no stored bytes", got)
+	}
+	got := byEntry[explicit]
+	if got.Metadata != embeddingspace.Unknown() {
+		t.Fatalf("explicit column = %+v", got.Metadata)
+	}
+	if string(got.ExistingColumn) != string(encoded) {
+		t.Fatalf("ExistingColumn = %q, want the stored bytes", got.ExistingColumn)
+	}
+}
+
+// TestMetadataFilesRejectsTargetsItCannotBackfill: a dry run has to
+// validate the same target an apply would, or an operator gets a clean
+// report for a migration that could never be performed. A typo'd table
+// id locates nothing, and reporting that as a completed zero-file
+// migration is the same failure in a different shape.
+func TestMetadataFilesRejectsTargetsItCannotBackfill(t *testing.T) {
+	root := metadata.TabletInfo{TableID: metadata.RootTableID}
+	if _, err := (MetadataFiles{
+		Reader: fakeTablets([]metadata.TabletInfo{root}), TableID: metadata.RootTableID,
+	}).List(context.Background()); !errors.Is(err, metadatacas.ErrRootBackfillUnsupported) {
+		t.Fatalf("root table error = %v, want ErrRootBackfillUnsupported", err)
+	}
+	if _, err := (MetadataFiles{
+		Reader: fakeTablets(nil), TableID: "nosuchtable",
+	}).List(context.Background()); err == nil {
+		t.Fatal("a table that locates no tablets must not report a completed migration")
+	}
+}
+
+// TestRunRepairsAnExplicitUnknownColumn: an explicit unknown column is
+// exactly as uninformative as an absent one, and the compaction refusal
+// tells operators a backfill repairs it. It has to actually do so.
+func TestRunRepairsAnExplicitUnknownColumn(t *testing.T) {
+	encoded, err := embeddingspace.Encode(embeddingspace.Unknown())
+	if err != nil {
+		t.Fatal(err)
+	}
+	file := unknownFile("a", "/t/a.rf")
+	file.ExistingColumn = encoded
+	files := &fakeMetadata{files: []File{file}}
+	footers := &fakeFooters{states: map[string]embeddingspace.FileState{
+		"/t/a.rf": embeddingspace.Has("space-a"),
+	}}
+	summary, err := Run(context.Background(), Config{Files: files, Footers: footers, Columns: files})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.Resolved != 1 || len(summary.Raced) != 0 || !summary.Complete() {
+		t.Fatalf("summary = %+v", summary)
+	}
+	if files.files[0].Metadata != embeddingspace.Has("space-a") {
+		t.Fatalf("column = %+v, want the footer's state", files.files[0].Metadata)
+	}
+}
+
+// TestCASColumnsForwardsEveryPrecondition: the writer's safety rests
+// entirely on the target it is handed, so a dropped field is a silently
+// unconditioned write. In particular the existing column bytes decide
+// whether the write means "must be absent" or "must still be this
+// unknown", and an explicit-unknown column is unrepairable without them.
+func TestCASColumnsForwardsEveryPrecondition(t *testing.T) {
+	encoded, err := embeddingspace.Encode(embeddingspace.Unknown())
+	if err != nil {
+		t.Fatal(err)
+	}
+	file := File{
+		TableID: "5", PrevEndRow: []byte("a"), EndRow: []byte("z"),
+		Entry: "a", Path: "/t/a.rf",
+		Qualifier: []byte("qualifier"), Value: []byte("100,10,-1"),
+		Metadata: embeddingspace.Unknown(), ExistingColumn: encoded,
+	}
+	recorder := &recordingWriter{}
+	applied, err := CASColumns{Writer: recorder}.Write(
+		context.Background(), file, embeddingspace.Has("space-a"))
+	if err != nil || !applied {
+		t.Fatalf("applied = %t, err = %v", applied, err)
+	}
+	want := metadatacas.BackfillTarget{
+		TableID: "5", PrevEndRow: []byte("a"), EndRow: []byte("z"),
+		FileQualifier: []byte("qualifier"), FileValue: []byte("100,10,-1"),
+		ExistingEmbedding: encoded,
+	}
+	if !reflect.DeepEqual(recorder.target, want) {
+		t.Fatalf("target = %+v, want %+v", recorder.target, want)
+	}
+	if recorder.state != embeddingspace.Has("space-a") {
+		t.Fatalf("state = %+v", recorder.state)
+	}
+}
+
+type recordingWriter struct {
+	target metadatacas.BackfillTarget
+	state  embeddingspace.FileState
+}
+
+func (r *recordingWriter) WriteFileEmbedding(
+	_ context.Context, target metadatacas.BackfillTarget, state embeddingspace.FileState,
+) (bool, error) {
+	r.target = target
+	r.state = state
+	return true, nil
+}
+
+func metadataKV(row, cf, cq, value string) *data.TKeyValue {
+	return &data.TKeyValue{
+		Key: &data.TKey{
+			Row: []byte(row), ColFamily: []byte(cf), ColQualifier: []byte(cq),
+		},
+		Value: []byte(value),
+	}
 }
 
 func buildRFile(t *testing.T, state embeddingspace.FileState) []byte {

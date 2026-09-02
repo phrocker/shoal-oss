@@ -102,6 +102,76 @@ func TestRunPrefersDeclaredSnapshotEmbedding(t *testing.T) {
 	}
 }
 
+// TestRunKeepsFooterAndMetadataAgreeing: the footer and the metadata
+// column are cross-checked by VerifyMetadataMatchesFooter on the next
+// compaction, so a configured WriterOptions.EmbeddingSpace must never
+// end up saying something different from the state the coordinator
+// records. A declared snapshot wins over both; with no declaration the
+// writer option is read as the operator's default.
+func TestRunKeepsFooterAndMetadataAgreeing(t *testing.T) {
+	t.Run("declared snapshot overrides the writer option", func(t *testing.T) {
+		f := newFixture(t)
+		f.snapshots.snapshot.Embedding = embeddingspace.Has("space-a")
+		cfg := f.config
+		cfg.WriterOptions.EmbeddingSpace = embeddingspace.Has("space-b")
+		coordinator, err := New(cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		file, err := coordinator.Run(context.Background(), "op-1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if file.Embedding != embeddingspace.Has("space-a") {
+			t.Fatalf("committed embedding = %+v", file.Embedding)
+		}
+		if got := footerEmbedding(t, f, file.Path); got != file.Embedding {
+			t.Fatalf("footer %+v disagrees with metadata %+v", got, file.Embedding)
+		}
+	})
+
+	t.Run("writer option is the default for an undeclared snapshot", func(t *testing.T) {
+		f := newFixture(t)
+		cfg := f.config
+		cfg.WriterOptions.EmbeddingSpace = embeddingspace.Has("space-b")
+		coordinator, err := New(cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		file, err := coordinator.Run(context.Background(), "op-1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if file.Embedding != embeddingspace.Has("space-b") {
+			t.Fatalf("committed embedding = %+v", file.Embedding)
+		}
+		if got := footerEmbedding(t, f, file.Path); got != file.Embedding {
+			t.Fatalf("footer %+v disagrees with metadata %+v", got, file.Embedding)
+		}
+	})
+
+	t.Run("DefaultEmbedding wins over the writer option", func(t *testing.T) {
+		f := newFixture(t)
+		cfg := f.config
+		cfg.WriterOptions.EmbeddingSpace = embeddingspace.Has("space-b")
+		cfg.DefaultEmbedding = embeddingspace.NoEmbeddings()
+		coordinator, err := New(cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		file, err := coordinator.Run(context.Background(), "op-1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if file.Embedding != embeddingspace.NoEmbeddings() {
+			t.Fatalf("committed embedding = %+v", file.Embedding)
+		}
+		if got := footerEmbedding(t, f, file.Path); got != file.Embedding {
+			t.Fatalf("footer %+v disagrees with metadata %+v", got, file.Embedding)
+		}
+	})
+}
+
 // TestNewRejectsInvalidDefaultEmbedding: the default is written into
 // durable metadata, so an unencodable one must be refused at
 // construction rather than at the first flush.
