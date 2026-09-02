@@ -461,7 +461,9 @@ func TestBoundedNeighborhoodBatchesEndpointLookupsPerPage(t *testing.T) {
 
 // TestNeighborhoodRoundTripLatencyTracksBatchCount confirms the fake's injected
 // latency is charged once per round trip, so the recorded counts are the real
-// cost a distributed policy store would pay.
+// cost a distributed policy store would pay. Only the lower bound is measured
+// on the clock, which is deterministic because Sleep guarantees a minimum; the
+// upper bound is asserted on the counters.
 func TestNeighborhoodRoundTripLatencyTracksBatchCount(t *testing.T) {
 	f, client, counting, documents := batchFixture(t, 4)
 	admin := f.admin(t)
@@ -492,9 +494,25 @@ func TestNeighborhoodRoundTripLatencyTracksBatchCount(t *testing.T) {
 	}
 	perItemBaseline := 1 + len(neighborhood.Nodes) +
 		3*len(neighborhood.Edges) + trips.currentRevision
-	if budget := time.Duration(perItemBaseline) * latency; elapsed >= budget {
-		t.Fatalf("elapsed %s reached the %s a lookup per item would cost",
-			elapsed, budget)
+	// The upper bound is asserted on the counters, not the clock. A wall-clock
+	// ceiling is nondeterministic — Sleep guarantees only a minimum, so a
+	// loaded host can push a correctly batched call past any budget — and it is
+	// simultaneously too loose to catch a real regression, because a handful of
+	// reintroduced per-edge lookups stays comfortably under it. The counters
+	// measure the same property exactly.
+	if trips.total() >= perItemBaseline {
+		t.Fatalf("policy store reads = %d, want fewer than the %d per-item lookups",
+			trips.total(), perItemBaseline)
+	}
+	// The baseline comparison alone is loose enough that a few reintroduced
+	// point lookups would still pass it, so the per-item counters this change
+	// drove to zero are pinned directly as well.
+	if trips.edge != 0 {
+		t.Fatalf("per-edge point lookups = %d, want none", trips.edge)
+	}
+	if trips.nodes != 1 || trips.edges != 1 {
+		t.Fatalf("batch lookups = %d node and %d edge, want one of each",
+			trips.nodes, trips.edges)
 	}
 	t.Logf("policy store reads %+v (total %d) cost %s at %s per round trip",
 		trips, trips.total(), elapsed, latency)

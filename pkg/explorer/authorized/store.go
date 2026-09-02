@@ -675,16 +675,22 @@ func (s *MemoryPolicyStore) Node(
 }
 
 // Nodes returns the current registrations owning the requested graph nodes in
-// one round trip. For every identifier it is given it reports exactly what Node
-// reports for that identifier, and it fails with exactly the error the
-// equivalent Node loop fails with, including argument-validation order: each
-// identifier is validated and the receiver rechecked in request order, so a
-// nil receiver is reported before a later malformed identifier is. Unregistered
-// identifiers are omitted from the result rather than reported as an error, so
-// absence is the same fail-closed signal Node reports with a false boolean.
-// Repeated identifiers are looked up once, whether or not they resolve. An
-// empty request additionally checks the context and the receiver, where a Node
-// loop would make no call at all.
+// one round trip. Each identifier is processed in request order and takes
+// exactly the steps Node takes for it — context check, argument validation,
+// then lookup and clone — so both the per-identifier result and the error the
+// batch fails with are the ones the equivalent Node loop produces. A context
+// cancelled partway through the batch, a malformed identifier, and a
+// registration that fails to clone therefore all surface in the same order they
+// would one call at a time. Unregistered identifiers are omitted from the
+// result rather than reported as an error, so absence is the same fail-closed
+// signal Node reports with a false boolean.
+//
+// Two deliberate differences from a literal Node loop remain. Repeated
+// identifiers are looked up once, though the context is still checked for every
+// occurrence. An empty request checks the context and the receiver, where a
+// Node loop would make no call at all. The read lock is also held for the whole
+// batch, so the result is a single consistent snapshot rather than a sequence
+// of independently locked reads.
 func (s *MemoryPolicyStore) Nodes(
 	ctx context.Context,
 	nodeIDs []shoal.ID,
@@ -692,15 +698,16 @@ func (s *MemoryPolicyStore) Nodes(
 	if err := contextFailure(ctx); err != nil {
 		return nil, err
 	}
-	for _, nodeID := range nodeIDs {
-		if err := shoal.ValidateRequiredID("graph node ID", nodeID); err != nil {
-			return nil, err
-		}
-		if s == nil {
-			return nil, catalogUnavailable()
-		}
-	}
 	if s == nil {
+		// A Node loop over a nil receiver fails on its first identifier, but
+		// only after that identifier has been validated.
+		if len(nodeIDs) > 0 {
+			if err := shoal.ValidateRequiredID(
+				"graph node ID", nodeIDs[0],
+			); err != nil {
+				return nil, err
+			}
+		}
 		return nil, catalogUnavailable()
 	}
 	attempted := make(map[shoal.ID]struct{}, len(nodeIDs))
@@ -708,6 +715,12 @@ func (s *MemoryPolicyStore) Nodes(
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	for _, nodeID := range nodeIDs {
+		if err := contextFailure(ctx); err != nil {
+			return nil, err
+		}
+		if err := shoal.ValidateRequiredID("graph node ID", nodeID); err != nil {
+			return nil, err
+		}
 		if _, done := attempted[nodeID]; done {
 			continue
 		}
@@ -865,10 +878,14 @@ func (s *MemoryPolicyStore) Edge(
 }
 
 // Edges returns the requested edge registrations in one round trip under
-// exactly the contract Nodes carries for node registrations: per-identifier
-// results and failure ordering match the equivalent Edge loop, unregistered
-// identifiers are omitted rather than reported as an error, and repeated
-// identifiers are looked up once whether or not they resolve.
+// exactly the contract Nodes carries for node registrations, with Edge in place
+// of Node: each identifier is processed in request order and takes the same
+// steps Edge takes for it, so the per-identifier result and the failing error
+// are the ones the equivalent Edge loop produces, including a context cancelled
+// partway through the batch and a registration that fails to clone.
+// Unregistered identifiers are omitted rather than reported as an error, and
+// the same two deliberate differences apply: repeated identifiers are looked up
+// once, and an empty request still checks the context and the receiver.
 func (s *MemoryPolicyStore) Edges(
 	ctx context.Context,
 	edgeIDs []shoal.ID,
@@ -876,15 +893,14 @@ func (s *MemoryPolicyStore) Edges(
 	if err := contextFailure(ctx); err != nil {
 		return nil, err
 	}
-	for _, edgeID := range edgeIDs {
-		if err := shoal.ValidateRequiredID("graph edge ID", edgeID); err != nil {
-			return nil, err
-		}
-		if s == nil {
-			return nil, catalogUnavailable()
-		}
-	}
 	if s == nil {
+		if len(edgeIDs) > 0 {
+			if err := shoal.ValidateRequiredID(
+				"graph edge ID", edgeIDs[0],
+			); err != nil {
+				return nil, err
+			}
+		}
 		return nil, catalogUnavailable()
 	}
 	attempted := make(map[shoal.ID]struct{}, len(edgeIDs))
@@ -892,6 +908,12 @@ func (s *MemoryPolicyStore) Edges(
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	for _, edgeID := range edgeIDs {
+		if err := contextFailure(ctx); err != nil {
+			return nil, err
+		}
+		if err := shoal.ValidateRequiredID("graph edge ID", edgeID); err != nil {
+			return nil, err
+		}
 		if _, done := attempted[edgeID]; done {
 			continue
 		}

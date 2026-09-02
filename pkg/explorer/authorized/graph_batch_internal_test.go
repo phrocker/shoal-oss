@@ -41,6 +41,29 @@ type recordingNodeStore struct {
 	edgeRequests [][]shoal.ID
 	edgeResult   map[shoal.ID]EdgeRegistration
 	edgeErr      error
+	nodeCalls    int
+	edgeCalls    int
+}
+
+// Node and Edge are overridden purely so a point lookup can be counted rather
+// than reaching the nil embedded store, which lets a test assert that a path
+// issued no unbatched lookups at all.
+func (s *recordingNodeStore) Node(
+	_ context.Context,
+	nodeID shoal.ID,
+) (NodeRegistration, bool, error) {
+	s.nodeCalls++
+	registration, ok := s.result[nodeID]
+	return registration, ok, s.err
+}
+
+func (s *recordingNodeStore) Edge(
+	_ context.Context,
+	edgeID shoal.ID,
+) (EdgeRegistration, bool, error) {
+	s.edgeCalls++
+	registration, ok := s.edgeResult[edgeID]
+	return registration, ok, s.edgeErr
 }
 
 func (s *recordingNodeStore) Nodes(
@@ -470,5 +493,192 @@ func TestMemoryPolicyStoreEdgesMatchesEdgeLoop(t *testing.T) {
 	cancel()
 	if _, err := store.Edges(cancelled, []shoal.ID{"edge-a"}); err == nil {
 		t.Fatal("cancelled context batch edge lookup succeeded")
+	}
+}
+
+// countdownContext reports success for a fixed number of Err checks and then
+// reports cancellation, so a context that becomes cancelled partway through a
+// batch can be exercised deterministically.
+type countdownContext struct {
+	context.Context
+	remaining *int
+}
+
+func (c countdownContext) Err() error {
+	if *c.remaining > 0 {
+		*c.remaining--
+		return nil
+	}
+	return context.Canceled
+}
+
+// corruptRule is a rule that cannot be cloned, because cloning rebuilds the
+// rule from its policies and an empty conjunction is rejected. Storing one
+// makes a registration that Node and Edge report as catalog-unavailable, which
+// is the failure a batch must surface in request order rather than after
+// validating every identifier first.
+func corruptRule() AccessRule { return AccessRule{} }
+
+// TestMemoryPolicyStoreBatchFailsOnTheFirstFailingIdentifier pins the ordering
+// the batch doc comments promise. A Node loop over a corrupt registration
+// followed by a malformed identifier fails on the first with
+// catalog-unavailable, so validating the whole slice up front and surfacing the
+// later invalid identifier instead would break the documented equivalence.
+func TestMemoryPolicyStoreBatchFailsOnTheFirstFailingIdentifier(t *testing.T) {
+	ctx := context.Background()
+	store := NewMemoryPolicyStore()
+	store.initialize()
+	store.nodes["corrupt-node"] = NodeRegistration{Rule: corruptRule()}
+	store.edges["corrupt-edge"] = EdgeRegistration{
+		Edge: graph.Edge{ID: "corrupt-edge", From: "a", To: "b", Type: "link"},
+		Rule: corruptRule(),
+	}
+
+	// The point lookups establish the behaviour the batch must reproduce.
+	if _, _, err := store.Node(ctx, "corrupt-node"); !shoal.IsErrorCode(
+		err, shoal.ErrorUnavailable,
+	) {
+		t.Fatalf("corrupt node point lookup error = %v", err)
+	}
+	if _, _, err := store.Edge(ctx, "corrupt-edge"); !shoal.IsErrorCode(
+		err, shoal.ErrorUnavailable,
+	) {
+		t.Fatalf("corrupt edge point lookup error = %v", err)
+	}
+
+	if _, err := store.Nodes(
+		ctx, []shoal.ID{"corrupt-node", ""},
+	); !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
+		t.Fatalf("node batch error = %v, want the earlier corrupt registration", err)
+	}
+	if _, err := store.Edges(
+		ctx, []shoal.ID{"corrupt-edge", ""},
+	); !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
+		t.Fatalf("edge batch error = %v, want the earlier corrupt registration", err)
+	}
+	// Reversing the order reverses the reported failure, which is what makes
+	// this a request-order guarantee rather than a fixed precedence.
+	if _, err := store.Nodes(
+		ctx, []shoal.ID{"", "corrupt-node"},
+	); !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
+		t.Fatalf("node batch error = %v, want the earlier invalid identifier", err)
+	}
+	if _, err := store.Edges(
+		ctx, []shoal.ID{"", "corrupt-edge"},
+	); !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
+		t.Fatalf("edge batch error = %v, want the earlier invalid identifier", err)
+	}
+}
+
+// TestMemoryPolicyStoreBatchObservesCancellationMidBatch confirms the context
+// is rechecked for every identifier, as a point loop would, instead of once
+// before the batch begins.
+func TestMemoryPolicyStoreBatchObservesCancellationMidBatch(t *testing.T) {
+	store := NewMemoryPolicyStore()
+	budget := 2
+	ctx := countdownContext{Context: context.Background(), remaining: &budget}
+	if _, err := store.Nodes(ctx, []shoal.ID{"node-a"}); err != nil {
+		t.Fatalf("single identifier batch within budget failed: %v", err)
+	}
+	budget = 2
+	if _, err := store.Nodes(
+		ctx, []shoal.ID{"node-a", "node-b"},
+	); !shoal.IsErrorCode(err, shoal.ErrorCanceled) {
+		t.Fatalf("node batch error = %v, want cancellation observed mid-batch", err)
+	}
+	budget = 2
+	if _, err := store.Edges(
+		ctx, []shoal.ID{"edge-a", "edge-b"},
+	); !shoal.IsErrorCode(err, shoal.ErrorCanceled) {
+		t.Fatalf("edge batch error = %v, want cancellation observed mid-batch", err)
+	}
+}
+
+// TestEdgeAllowsBatchesEndpointsInOneRequest guards the edgeAllows path that
+// retrieval validation still uses. The neighborhood round-trip tests only cover
+// edgeAllowsResolved, so without this a revert of edgeAllows to two Node point
+// lookups would break no test. Both endpoints must be resolved in a single
+// deduplicated batch and no point lookup may be issued.
+func TestEdgeAllowsBatchesEndpointsInOneRequest(t *testing.T) {
+	now := time.Date(2026, time.September, 1, 12, 0, 0, 0, time.UTC)
+	rule := batchTestRule(t, "source", "policy")
+	decision := batchTestDecision(t, now)
+	for name, testCase := range map[string]struct {
+		from, to    shoal.ID
+		wantRequest []shoal.ID
+	}{
+		"distinct endpoints": {
+			from: "node-from", to: "node-to",
+			wantRequest: []shoal.ID{"node-from", "node-to"},
+		},
+		"self loop": {
+			from: "node-self", to: "node-self",
+			wantRequest: []shoal.ID{"node-self"},
+		},
+	} {
+		store := &recordingNodeStore{result: map[shoal.ID]NodeRegistration{
+			testCase.from: {Rule: rule},
+			testCase.to:   {Rule: rule},
+		}}
+		client := &Client{policyStore: store}
+		registration := EdgeRegistration{
+			Edge: graph.Edge{
+				ID: "edge", From: testCase.from, To: testCase.to,
+				Type: "link", Weight: 1,
+			},
+			Rule: rule,
+		}
+		allowed, err := client.edgeAllows(
+			context.Background(), registration, decision,
+			auth.OperationNeighborhood, now)
+		if err != nil {
+			t.Fatalf("%s error = %v", name, err)
+		}
+		if !allowed {
+			t.Fatalf("%s denied a fully registered edge", name)
+		}
+		if store.nodeCalls != 0 {
+			t.Fatalf("%s issued %d unbatched Node lookups, want none",
+				name, store.nodeCalls)
+		}
+		if len(store.requests) != 1 {
+			t.Fatalf("%s issued %d batch lookups, want exactly one",
+				name, len(store.requests))
+		}
+		if !reflect.DeepEqual(store.requests[0], testCase.wantRequest) {
+			t.Fatalf("%s batched %#v, want %#v",
+				name, store.requests[0], testCase.wantRequest)
+		}
+	}
+}
+
+// TestEdgeAllowsDeniesEndpointMissingFromBatch keeps the retained edgeAllows
+// path fail-closed: an endpoint the batch omits denies, and the denial is not
+// recovered by falling back to a point lookup.
+func TestEdgeAllowsDeniesEndpointMissingFromBatch(t *testing.T) {
+	now := time.Date(2026, time.September, 1, 12, 0, 0, 0, time.UTC)
+	rule := batchTestRule(t, "source", "policy")
+	decision := batchTestDecision(t, now)
+	store := &recordingNodeStore{result: map[shoal.ID]NodeRegistration{
+		"node-from": {Rule: rule},
+	}}
+	client := &Client{policyStore: store}
+	allowed, err := client.edgeAllows(
+		context.Background(),
+		EdgeRegistration{
+			Edge: graph.Edge{
+				ID: "edge", From: "node-from", To: "node-to", Type: "link",
+			},
+			Rule: rule,
+		},
+		decision, auth.OperationNeighborhood, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if allowed {
+		t.Fatal("edgeAllows authorized an edge whose endpoint the batch omitted")
+	}
+	if store.nodeCalls != 0 {
+		t.Fatalf("edgeAllows fell back to %d point lookups", store.nodeCalls)
 	}
 }
