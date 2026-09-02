@@ -23,10 +23,11 @@ import (
 )
 
 type fakeCluster struct {
-	mu        sync.Mutex
-	cells     map[string][]byte
-	ambiguous bool
-	reject    bool
+	mu          sync.Mutex
+	cells       map[string][]byte
+	ambiguous   bool
+	reject      bool
+	locateCalls int
 }
 
 func newFakeCluster() *fakeCluster {
@@ -44,6 +45,7 @@ func cell(cf, cq string) string { return cf + "\x00" + cq }
 func (f *fakeCluster) LocateTable(_ context.Context, tableID string) ([]metadata.TabletInfo, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.locateCalls++
 	if tableID == metadata.MetadataTableID {
 		return []metadata.TabletInfo{{
 			TableID: metadata.MetadataTableID, PrevRowSet: true,
@@ -85,7 +87,10 @@ func (f *fakeCluster) LocateTable(_ context.Context, tableID string) ([]metadata
 			info.Files = append(info.Files, metadata.FileEntry{
 				Path: file.Path, StartRow: file.StartRow, EndRow: file.EndRow,
 				Size: size, NumEntries: entries, Time: tm, RawQualifier: []byte(cq),
-				Embedding: embeddingspace.NoEmbeddings(),
+				// Mirrors metadata.AggregateRows: a file entry with no
+				// file.embedding column is unknown until the column loop
+				// below decodes one for it (issue #274).
+				Embedding: embeddingspace.Unknown(),
 			})
 		}
 	}

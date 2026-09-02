@@ -24,7 +24,16 @@ type TabletInfo struct {
 	// top of Files so a scan sees writes not yet flushed to an RFile.
 	Logs []LogEntry
 
-	fileEmbeddings map[string]embeddingspace.FileState
+	fileEmbeddings map[string]decodedEmbedding
+}
+
+// decodedEmbedding is one file.embedding column as it was read: the
+// state it decodes to, and the exact bytes it held. The bytes are kept
+// because a conditional writer has to distinguish an absent column from
+// one that explicitly encodes unknown, and the decoded state cannot.
+type decodedEmbedding struct {
+	state embeddingspace.FileState
+	raw   []byte
 }
 
 // LogEntry is one WAL segment referenced by a tablet's "log:" column
@@ -67,4 +76,25 @@ type FileEntry struct {
 	// metadata table. Required if you ever want to delete or update this
 	// entry — Accumulo enforces byte-exact qualifier match for mutations.
 	RawQualifier []byte
+
+	// RawValue preserves the exact DataFileValue bytes.
+	//
+	// Re-encoding Size/NumEntries/Time is not byte-faithful: a value
+	// written as "100,10,-1" decodes to the same fields as "100,10" and
+	// would re-encode as the latter. A conditional mutation compares
+	// values byte for byte, so anything using this entry as a CAS
+	// precondition — the embedding backfill does — must condition on the
+	// bytes that are actually there, not on a reconstruction of them.
+	RawValue []byte
+
+	// RawEmbedding preserves the exact file.embedding column bytes, and
+	// is nil when the column is absent.
+	//
+	// Embedding alone cannot express that difference: an absent column
+	// and a column explicitly encoding unknown both decode to
+	// embeddingspace.Unknown(), which is correct for every consumer that
+	// only asks "what do we know about this file". A writer conditioning
+	// on the column, however, has to distinguish "must not exist" from
+	// "must still hold these bytes", so the raw form is preserved here.
+	RawEmbedding []byte
 }

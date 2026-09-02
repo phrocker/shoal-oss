@@ -142,10 +142,17 @@ func applyColumn(t *TabletInfo, kv *data.TKeyValue) error {
 		}
 		// Copy cq so the FileEntry doesn't alias the Thrift buffer.
 		raw := append([]byte(nil), cq...)
-		embedding := embeddingspace.NoEmbeddings()
+		// No file.embedding column has been decoded for this entry yet.
+		// Absence of the column is absence of information, not a
+		// statement that the file holds no vectors, so the entry starts
+		// out unknown and only an explicitly decoded column may move it
+		// to a positive claim.
+		embedding := embeddingspace.Unknown()
+		var rawEmbedding []byte
 		if t.fileEmbeddings != nil {
-			if state, ok := t.fileEmbeddings[string(raw)]; ok {
-				embedding = state
+			if decoded, ok := t.fileEmbeddings[string(raw)]; ok {
+				embedding = decoded.state
+				rawEmbedding = decoded.raw
 			}
 		}
 		t.Files = append(t.Files, FileEntry{
@@ -157,6 +164,8 @@ func applyColumn(t *TabletInfo, kv *data.TKeyValue) error {
 			Time:         time,
 			Embedding:    embedding,
 			RawQualifier: raw,
+			RawValue:     append([]byte(nil), val...),
+			RawEmbedding: rawEmbedding,
 		})
 	case CFFileEmbedding:
 		state, err := embeddingspace.Decode(val)
@@ -164,13 +173,15 @@ func applyColumn(t *TabletInfo, kv *data.TKeyValue) error {
 			return fmt.Errorf("file embedding:%q: %w", cq, err)
 		}
 		raw := append([]byte(nil), cq...)
+		rawValue := append([]byte(nil), val...)
 		if t.fileEmbeddings == nil {
-			t.fileEmbeddings = make(map[string]embeddingspace.FileState)
+			t.fileEmbeddings = make(map[string]decodedEmbedding)
 		}
-		t.fileEmbeddings[string(raw)] = state
+		t.fileEmbeddings[string(raw)] = decodedEmbedding{state: state, raw: rawValue}
 		for i := range t.Files {
 			if bytes.Equal(t.Files[i].RawQualifier, raw) {
 				t.Files[i].Embedding = state
+				t.Files[i].RawEmbedding = rawValue
 			}
 		}
 	case CFCurrentLocation:
@@ -240,7 +251,11 @@ func finalizeFileEmbeddings(t *TabletInfo) error {
 	}
 	for i := range t.Files {
 		if t.Files[i].Embedding.State == "" {
-			t.Files[i].Embedding = embeddingspace.NoEmbeddings()
+			// A tablet whose file entry never met a file.embedding
+			// column tells us nothing about that file's vectors.
+			// Reporting no_embeddings here would manufacture the one
+			// claim that merges freely with every space.
+			t.Files[i].Embedding = embeddingspace.Unknown()
 		}
 	}
 	for qualifier := range t.fileEmbeddings {

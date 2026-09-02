@@ -17,13 +17,23 @@ type EmbeddingSpaceCount struct {
 	SpanCount int64
 }
 
+// CountEmbeddingSpaces groups a tablet set's files by embedding-space
+// state so an operator can watch a migration converge.
+//
+// unknown is reported as its own bucket rather than folded into
+// no_embeddings. The two are not interchangeable here: no_embeddings is
+// a positive assertion that a file holds no vectors, while unknown means
+// nothing has been recorded about the file at all. Collapsing the second
+// into the first would make a migration read as complete while files
+// nobody has ever classified are still outstanding, which is exactly the
+// signal this function exists to provide.
 func CountEmbeddingSpaces(tablets []TabletInfo) []EmbeddingSpaceCount {
 	counts := map[string]*EmbeddingSpaceCount{}
 	for _, tablet := range tablets {
 		for _, file := range tablet.Files {
 			state := file.Embedding
 			if state.State == "" {
-				state = embeddingspace.NoEmbeddings()
+				state = embeddingspace.Unknown()
 			}
 			key := string(state.State) + "\x00" + state.Identity
 			count := counts[key]

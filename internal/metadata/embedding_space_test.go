@@ -39,8 +39,12 @@ func TestAggregateRowsFileEmbeddingStates(t *testing.T) {
 	if got := out[0].Files[0].Embedding; got != embeddingspace.Has("space-a") {
 		t.Fatalf("file A embedding = %+v", got)
 	}
-	if got := out[0].Files[1].Embedding; got != embeddingspace.NoEmbeddings() {
-		t.Fatalf("file B missing embedding column = %+v, want no embeddings", got)
+	if got := out[0].Files[1].Embedding; got != embeddingspace.Unknown() {
+		// File B has a file: entry and no file.embedding column. Before
+		// issue #274 this asserted no_embeddings, which is a positive
+		// claim the aggregation layer had no basis for. Absence of the
+		// column is absence of information.
+		t.Fatalf("file B missing embedding column = %+v, want unknown", got)
 	}
 	if got := out[0].Files[2].Embedding; got != embeddingspace.Unknown() {
 		t.Fatalf("file C embedding = %+v", got)

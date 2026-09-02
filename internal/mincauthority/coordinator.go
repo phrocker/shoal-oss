@@ -185,6 +185,27 @@ type Config struct {
 	States           StateStore
 	ReconcileTimeout time.Duration
 	WriterOptions    rfile.WriterOptions
+
+	// DefaultEmbedding is the embedding-space state to record for an
+	// output whose Snapshotter declared none.
+	//
+	// This is a write path: whatever lands here is stamped into the
+	// RFile footer meta block and into the file's metadata column, so it
+	// becomes durable evidence. Defaulting it to no_embeddings would
+	// manufacture the positive assertion "this file holds no vectors"
+	// out of a provider that simply said nothing, which is the claim
+	// that merges freely with every embedding space.
+	//
+	// The zero value means "no default configured", and an undeclared
+	// snapshot is then recorded as embeddingspace.Unknown() — absent
+	// information, failing closed. An operator who knows their ingest
+	// pipeline emits no vectors may set this to
+	// embeddingspace.NoEmbeddings() and have that assertion recorded
+	// truthfully, because they are the ones making it.
+	//
+	// It must be a valid embeddingspace.FileState when set; New rejects
+	// anything else rather than writing an unreadable column.
+	DefaultEmbedding embeddingspace.FileState
 }
 
 // Coordinator serializes minor compactions for one hosted tablet.
@@ -202,7 +223,49 @@ func New(cfg Config) (*Coordinator, error) {
 	if cfg.ReconcileTimeout <= 0 {
 		cfg.ReconcileTimeout = 5 * time.Second
 	}
+	if cfg.DefaultEmbedding != (embeddingspace.FileState{}) {
+		// Compared against the whole zero value, not just State: a
+		// partial FileState{Identity: "x"} is malformed configuration,
+		// not an absent one, and must be rejected here rather than
+		// silently ignored as if nothing had been configured.
+		if err := cfg.DefaultEmbedding.Validate(); err != nil {
+			return nil, fmt.Errorf("%w: default embedding: %w", ErrInvalidConfig, err)
+		}
+	}
+	if cfg.WriterOptions.EmbeddingSpace != (embeddingspace.FileState{}) {
+		// defaultEmbedding falls back to this, so it is configuration
+		// with the same authority and must fail the same way. Without
+		// this a malformed value is accepted here, copied into the
+		// snapshot, and only surfaces at the first flush as
+		// ErrInvalidSnapshot — a configuration error reported as
+		// corrupt durable state.
+		if err := cfg.WriterOptions.EmbeddingSpace.Validate(); err != nil {
+			return nil, fmt.Errorf("%w: writer embedding space: %w", ErrInvalidConfig, err)
+		}
+	}
 	return &Coordinator{cfg: cfg}, nil
+}
+
+// defaultEmbedding is the state recorded for a snapshot whose provider
+// declared none. An operator may configure a positive assertion; with no
+// configuration the output is labelled unknown rather than having a
+// claim invented for it.
+//
+// WriterOptions.EmbeddingSpace is honoured as a second source because it
+// is operator configuration too, and because before issue #274 it was
+// the only way to say anything here. Reading it as the default keeps
+// that intent working, and keeps the footer and the metadata column
+// saying the same thing — previously a set WriterOptions.EmbeddingSpace
+// reached the footer while the metadata column recorded the fabricated
+// no_embeddings, which is a pair the next integrity check rejects.
+func (c *Coordinator) defaultEmbedding() embeddingspace.FileState {
+	if c.cfg.DefaultEmbedding != (embeddingspace.FileState{}) {
+		return c.cfg.DefaultEmbedding
+	}
+	if c.cfg.WriterOptions.EmbeddingSpace != (embeddingspace.FileState{}) {
+		return c.cfg.WriterOptions.EmbeddingSpace
+	}
+	return embeddingspace.Unknown()
 }
 
 // Run advances operationID until its RFile is committed and the retained
@@ -241,16 +304,37 @@ func (c *Coordinator) Run(ctx context.Context, operationID string) (DataFile, er
 		if err != nil {
 			return DataFile{}, err
 		}
-		if snapshot.Embedding.State == "" {
-			snapshot.Embedding = embeddingspace.NoEmbeddings()
+		if snapshot.Embedding == (embeddingspace.FileState{}) {
+			// Only the exact zero value means "the provider declared
+			// nothing". A partial state such as {Identity: "x"} is
+			// malformed provider output and must reach validateSnapshot
+			// and be rejected, not be quietly replaced by the default.
+			if state != nil && state.File.Embedding != (embeddingspace.FileState{}) {
+				// Resuming replays a decision that was already made and
+				// checkpointed, so it must not be re-derived from
+				// configuration that may have changed since — including
+				// across the upgrade that introduced DefaultEmbedding,
+				// where every in-flight checkpoint carries the old
+				// implicit label. Re-deriving would make equalFile below
+				// report "resumed snapshot changed" and leave the tablet
+				// unable to open.
+				snapshot.Embedding = state.File.Embedding
+			} else {
+				snapshot.Embedding = c.defaultEmbedding()
+			}
 		}
 		if err := validateSnapshot(snapshot, c.cfg.Extent, c.cfg.Fence); err != nil {
 			return DataFile{}, err
 		}
 		writerOptions := c.cfg.WriterOptions
-		if writerOptions.EmbeddingSpace.State == "" {
-			writerOptions.EmbeddingSpace = snapshot.Embedding
-		}
+		// The snapshot's resolved state is the single label for this
+		// output: it is stamped into the RFile footer here and recorded
+		// in the metadata column by describeFile below, and the next
+		// compaction cross-checks the two. Letting WriterOptions carry a
+		// different value would publish a pair guaranteed to fail that
+		// check, so the declaration wins outright rather than only when
+		// the writer option happens to be empty.
+		writerOptions.EmbeddingSpace = snapshot.Embedding
 		encoded, err = encodeSnapshot(snapshot, writerOptions)
 		if err != nil {
 			return DataFile{}, err

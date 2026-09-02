@@ -503,15 +503,31 @@ func (a *Authority) target(
 	ctx context.Context,
 	row []byte,
 ) (string, string, *data.TKeyExtent, error) {
-	if a.extent.TableID == metadata.MetadataTableID {
-		location, err := a.factory.cfg.RootLocator.RootTabletLocation(ctx)
+	return locateMetadataTarget(ctx, a.factory.cfg.Reader, a.factory.cfg.RootLocator, a.extent.TableID, row)
+}
+
+// locateMetadataTarget resolves which server holds the metadata row a
+// mutation for tableID must be sent to.
+//
+// Rows for the metadata table itself live in the root tablet; rows for
+// every other table live in the metadata table, in whichever tablet
+// contains the row.
+func locateMetadataTarget(
+	ctx context.Context,
+	reader TabletReader,
+	locator RootLocator,
+	tableID string,
+	row []byte,
+) (string, string, *data.TKeyExtent, error) {
+	if tableID == metadata.MetadataTableID {
+		location, err := locator.RootTabletLocation(ctx)
 		if err != nil || location == nil {
 			return "", "", nil, errors.Join(errors.New("metadatacas: root tablet unavailable"), err)
 		}
 		return location.HostPort, metadata.RootTableID,
 			&data.TKeyExtent{Table: []byte(metadata.RootTableID)}, nil
 	}
-	tablets, err := a.factory.cfg.Reader.LocateTable(ctx, metadata.MetadataTableID)
+	tablets, err := reader.LocateTable(ctx, metadata.MetadataTableID)
 	if err != nil {
 		return "", "", nil, err
 	}
@@ -521,9 +537,16 @@ func (a *Authority) target(
 		}
 		if extent.Contains(row) && tablet.Location != nil {
 			return tablet.Location.HostPort, metadata.MetadataTableID, &data.TKeyExtent{
-				Table:      []byte(metadata.MetadataTableID),
-				PrevEndRow: append([]byte(nil), tablet.PrevRow...),
-				EndRow:     append([]byte(nil), tablet.EndRow...),
+				Table: []byte(metadata.MetadataTableID),
+				// bytes.Clone, not append-to-nil, which collapses an
+				// empty-but-present bound to nil. A nil prevEndRow means
+				// the tablet has no lower bound; an empty one means the
+				// bound is the empty row. Losing that after a split on
+				// the empty row addresses the extent at a different
+				// tablet than the one the row was found in, so every
+				// conditional write against it is rejected forever.
+				PrevEndRow: bytes.Clone(tablet.PrevRow),
+				EndRow:     bytes.Clone(tablet.EndRow),
 			}, nil
 		}
 	}
@@ -656,10 +679,25 @@ func encodeFileEmbedding(state embeddingspace.FileState) ([]byte, error) {
 	return embeddingspace.Encode(state)
 }
 
+// normalizedEmbedding fills in the state for a commit that declared
+// none.
+//
+// The column this feeds is durable evidence about a file, so an
+// undeclared commit is recorded as unknown rather than as the positive
+// assertion no_embeddings. An operator who really does know a pipeline
+// emits no vectors declares that upstream — see
+// mincauthority.Config.DefaultEmbedding — instead of having it invented
+// here, where nothing has any basis for the claim.
 func normalizedEmbedding(state embeddingspace.FileState) embeddingspace.FileState {
-	if state.State == "" {
-		return embeddingspace.NoEmbeddings()
+	if state == (embeddingspace.FileState{}) {
+		return embeddingspace.Unknown()
 	}
+	// Anything else is returned untouched, including a malformed partial
+	// state. Only the exact zero value means "declared nothing";
+	// normalizing a partial state would both persist something other
+	// than what the caller supplied, by hiding it from Encode's
+	// validation, and make a malformed reconciliation request compare
+	// equal to a stored unknown.
 	return state
 }
 

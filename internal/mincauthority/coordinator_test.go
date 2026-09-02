@@ -514,6 +514,7 @@ func cloneSnapshot(in Snapshot) Snapshot {
 	return Snapshot{
 		ID: in.ID, Extent: cloneExtent(in.Extent), Fence: in.Fence, Boundary: in.Boundary,
 		Cells: cloneCells(in.Cells), CoveredWALs: cloneRefs(in.CoveredWALs),
+		Embedding: in.Embedding,
 	}
 }
 
