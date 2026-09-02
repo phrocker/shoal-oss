@@ -554,7 +554,23 @@ func (r ExtractionResult) ValidateFor(request ExtractionRequest) error {
 	subjectTypes := make(map[shoal.ID]shoal.ID)
 	subjectTypeCounts := make(map[shoal.ID]uint32)
 	uniqueValues := make(map[string]struct{})
+	requestOntology := OntologyIdentity{
+		schemaID:  request.version.Schema().ID(),
+		versionID: request.version.ID(),
+	}
 	for _, assertion := range r.assertions {
+		switch assertion.ReadUnder(requestOntology) {
+		case OntologySameVersion:
+		case OntologyUnresolved:
+			// The assertion recorded no ontology identity. That is an explicit
+			// unknown, reported by UnresolvedOntologyAssertions, and it is not
+			// filled in from the request here: stamping the pinned version onto
+			// a value that never declared it would manufacture the evidence
+			// this field exists to carry.
+		default:
+			return invalid(
+				"assertion was made under a different ontology version than the request")
+		}
 		subjects[assertion.Subject()] = struct{}{}
 		subjectType, present := assertion.SubjectType()
 		if !present {
@@ -763,6 +779,21 @@ func (r ExtractionResult) Assertions() []Assertion {
 	return cloneAssertions(r.assertions)
 }
 
+// UnresolvedOntologyAssertions returns, in canonical order, the IDs of
+// assertions that record no ontology identity. ValidateFor permits them
+// because the request pins a version the caller can still recover, but it does
+// not stamp that version onto them, so an unresolved assertion is marked and
+// reported rather than quietly adopted.
+func (r ExtractionResult) UnresolvedOntologyAssertions() []shoal.ID {
+	var unresolved []shoal.ID
+	for _, assertion := range r.assertions {
+		if _, known := assertion.Ontology(); !known {
+			unresolved = append(unresolved, assertion.ID())
+		}
+	}
+	return unresolved
+}
+
 func (r ExtractionResult) Proposals() []GovernedProposal {
 	return cloneProposals(r.proposals)
 }
@@ -919,6 +950,8 @@ func assertionPayloadBytes(assertion Assertion) uint64 {
 	size := uint64(len(assertion.subject) + len(assertion.predicate) +
 		len(assertion.subjectType) + len(assertion.objectType) +
 		len(assertion.object.canonical()) + len(assertion.provenance.canonical()) +
+		len(assertion.ontologyIdentity.schemaID) +
+		len(assertion.ontologyIdentity.versionID) +
 		len(canonicalMetadata(assertion.metadata)))
 	for _, evidence := range assertion.evidence {
 		size += evidencePayloadBytes(evidence)
@@ -1143,6 +1176,8 @@ func (c *payloadCounter) addAssertion(assertion Assertion) {
 	c.addString(string(assertion.objectType))
 	c.addValue(assertion.object)
 	c.addProvenance(assertion.provenance)
+	c.addString(string(assertion.ontologyIdentity.schemaID))
+	c.addString(string(assertion.ontologyIdentity.versionID))
 	c.addMetadata(assertion.metadata)
 	for _, evidence := range assertion.evidence {
 		c.addEvidence(evidence)

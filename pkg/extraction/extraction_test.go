@@ -203,6 +203,45 @@ func TestOntologyProvenanceUsesPromptTemplateAndHashMetadata(t *testing.T) {
 	}
 }
 
+// TestOntologyAssertionsRecordThePinnedOntologyVersion covers issue #279: the
+// request pins a version, and every assertion the pipeline emits must record
+// it, so the version is recoverable from the assertion rather than only
+// through the result -> request chain.
+func TestOntologyAssertionsRecordThePinnedOntologyVersion(t *testing.T) {
+	f := newFixture(t)
+	identity, err := ontology.NewOntologyIdentity(f.request.Version)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, result := range map[string]Result{
+		"model": extractWith(t, f.request, validOutput(f)),
+	} {
+		ontologyResult := result.OntologyResult()
+		assertions := ontologyResult.Assertions()
+		if len(assertions) == 0 {
+			t.Fatalf("%s: extraction produced no assertions", name)
+		}
+		for _, assertion := range assertions {
+			recorded, known := assertion.Ontology()
+			if !known {
+				t.Fatalf("%s: assertion %s recorded no ontology version",
+					name, assertion.ID())
+			}
+			if recorded != identity {
+				t.Fatalf("%s: assertion %s recorded %v, want %v",
+					name, assertion.ID(), recorded, identity)
+			}
+			if reading := assertion.ReadUnder(identity); reading != ontology.OntologySameVersion {
+				t.Fatalf("%s: assertion %s reads as %q under the pinned version",
+					name, assertion.ID(), reading)
+			}
+		}
+		if unresolved := ontologyResult.UnresolvedOntologyAssertions(); len(unresolved) != 0 {
+			t.Fatalf("%s: unresolved assertions %v", name, unresolved)
+		}
+	}
+}
+
 func TestProviderFailureHasNoSilentFallback(t *testing.T) {
 	f := newFixture(t)
 	for _, providerErr := range []error{model.ErrUnavailable, model.ErrTimeout} {

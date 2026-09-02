@@ -192,19 +192,16 @@ func anchorID(anchor EvidenceAnchor) (shoal.ID, error) {
 }
 
 // OntologyIdentity identifies an immutable ontology schema snapshot without
-// embedding its definitions in a context pack.
-type OntologyIdentity struct {
-	schemaID  shoal.ID
-	versionID shoal.ID
-}
+// embedding its definitions in a context pack. It is an alias for the identity
+// defined in pkg/ontology, which owns the concept: pkg/inference depends on
+// pkg/ontology, so the identity lives on the side that assertions live on and
+// this package adapts rather than maintaining a parallel notion of sameness.
+type OntologyIdentity = ontology.OntologyIdentity
 
 // NewOntologyIdentity extracts the schema and version identities from a
 // validated ontology version.
 func NewOntologyIdentity(version ontology.OntologyVersion) (OntologyIdentity, error) {
-	if err := version.Validate(); err != nil {
-		return OntologyIdentity{}, err
-	}
-	return NewOntologyIdentityFromIDs(version.Schema().ID(), version.ID())
+	return ontology.NewOntologyIdentity(version)
 }
 
 // NewOntologyIdentityFromIDs creates an ontology identity when the caller
@@ -212,31 +209,8 @@ func NewOntologyIdentity(version ontology.OntologyVersion) (OntologyIdentity, er
 func NewOntologyIdentityFromIDs(
 	schemaID, versionID shoal.ID,
 ) (OntologyIdentity, error) {
-	identity := OntologyIdentity{schemaID: schemaID, versionID: versionID}
-	if err := identity.Validate(); err != nil {
-		return OntologyIdentity{}, err
-	}
-	return identity, nil
+	return ontology.NewOntologyIdentityFromIDs(schemaID, versionID)
 }
-
-func (i OntologyIdentity) Validate() error {
-	if err := ontology.ValidateID(i.schemaID); err != nil {
-		return err
-	}
-	if ontology.IDNamespace(i.schemaID) != "schema" {
-		return invalid("ontology schema ID has an unexpected namespace")
-	}
-	if err := ontology.ValidateID(i.versionID); err != nil {
-		return err
-	}
-	if ontology.IDNamespace(i.versionID) != "ontology-version" {
-		return invalid("ontology version ID has an unexpected namespace")
-	}
-	return nil
-}
-
-func (i OntologyIdentity) SchemaID() shoal.ID  { return i.schemaID }
-func (i OntologyIdentity) VersionID() shoal.ID { return i.versionID }
 
 // SnapshotPin identifies the exact logical knowledge snapshot used to build a
 // context pack.

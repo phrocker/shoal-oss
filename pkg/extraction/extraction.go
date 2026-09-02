@@ -631,6 +631,10 @@ func materialize(request Request, prompt string, mp model.Provenance, raw rawOut
 	if err != nil {
 		return Result{}, fmt.Errorf("extraction: ontology request: %w", err)
 	}
+	ontologyIdentity, err := ontology.NewOntologyIdentity(request.Version)
+	if err != nil {
+		return Result{}, fmt.Errorf("extraction: ontology identity: %w", err)
+	}
 	concepts := map[shoal.ID]ontology.ConceptDefinition{}
 	properties := map[shoal.ID]ontology.PropertyDefinition{}
 	relations := map[shoal.ID]ontology.RelationshipDefinition{}
@@ -717,7 +721,7 @@ func materialize(request Request, prompt string, mp model.Provenance, raw rawOut
 		props, propAssertions, propClaims, err := makeProperties(
 			contractID, typeID, item.Properties, *item.Confidence, anchorIDs, refs,
 			properties, concepts[typeID].Properties(), nodeAnchors, nodeTokens,
-			op, modelProv, promptProv,
+			op, modelProv, promptProv, ontologyIdentity,
 		)
 		if err != nil {
 			return Result{}, fmt.Errorf("extraction: entity %q: %w", key, err)
@@ -806,6 +810,7 @@ func materialize(request Request, prompt string, mp model.Provenance, raw rawOut
 			shoal.Score(*item.Confidence), refs, op, nil,
 			ontology.WithAssertionSubjectType(from.entity.TypeID),
 			ontology.WithAssertionObjectType(to.entity.TypeID),
+			ontology.WithAssertionOntology(ontologyIdentity),
 		)
 		if err != nil {
 			return Result{}, err
@@ -822,7 +827,7 @@ func materialize(request Request, prompt string, mp model.Provenance, raw rawOut
 		props, propAssertions, propClaims, err := makeProperties(
 			assertion.ID(), relation.ID(), item.Properties, *item.Confidence,
 			anchorIDs, refs, properties, relation.Properties(), nodeAnchors,
-			nodeTokens, op, modelProv, promptProv,
+			nodeTokens, op, modelProv, promptProv, ontologyIdentity,
 		)
 		if err != nil {
 			return Result{}, fmt.Errorf("extraction: relation %q: %w", item.TypeID, err)
@@ -945,6 +950,7 @@ func makeProperties(
 	nodeTokens map[string]shoal.ID,
 	op ontology.ExtractionProvenance, mp inference.ModelProvenance,
 	pp inference.PromptProvenance,
+	ontologyIdentity ontology.OntologyIdentity,
 ) ([]Property, []ontology.Assertion, []inference.Claim, error) {
 	allowedSet := map[shoal.ID]struct{}{}
 	for _, id := range allowed {
@@ -984,6 +990,7 @@ func makeProperties(
 		assertion, err := ontology.NewAssertion(
 			subject, id, value, ontology.AssertionInferred, shoal.Score(confidence),
 			refs, op, nil, ontology.WithAssertionSubjectType(subjectType),
+			ontology.WithAssertionOntology(ontologyIdentity),
 		)
 		if err != nil {
 			return nil, nil, nil, err

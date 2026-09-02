@@ -687,23 +687,30 @@ const (
 )
 
 // Assertion is one immutable, cited ontology fact.
+//
+// ontologyIdentity names the ontology snapshot the assertion was made under.
+// Definition IDs are stable across versions by design, so the identity is the
+// only record of which meaning applied. It is unresolved unless a caller
+// supplies it; it is never inferred from ambient state.
 type Assertion struct {
-	id          shoal.ID
-	subject     shoal.ID
-	subjectType shoal.ID
-	predicate   shoal.ID
-	object      Value
-	objectType  shoal.ID
-	origin      AssertionOrigin
-	confidence  shoal.Score
-	evidence    []EvidenceRef
-	provenance  ExtractionProvenance
-	metadata    shoal.Metadata
+	id               shoal.ID
+	subject          shoal.ID
+	subjectType      shoal.ID
+	predicate        shoal.ID
+	object           Value
+	objectType       shoal.ID
+	origin           AssertionOrigin
+	confidence       shoal.Score
+	evidence         []EvidenceRef
+	provenance       ExtractionProvenance
+	ontologyIdentity OntologyIdentity
+	metadata         shoal.Metadata
 }
 
 type assertionOptions struct {
-	subjectType shoal.ID
-	objectType  shoal.ID
+	subjectType      shoal.ID
+	objectType       shoal.ID
+	ontologyIdentity OntologyIdentity
 }
 
 // AssertionOption binds ontology type context to an assertion.
@@ -720,6 +727,17 @@ func WithAssertionSubjectType(subjectType shoal.ID) AssertionOption {
 func WithAssertionObjectType(objectType shoal.ID) AssertionOption {
 	return func(options *assertionOptions) {
 		options.objectType = objectType
+	}
+}
+
+// WithAssertionOntology records the ontology snapshot the assertion was made
+// under. Omitting it leaves the assertion explicitly unresolved rather than
+// binding it to whatever version happens to be current. Callers holding an
+// OntologyVersion build the identity with NewOntologyIdentity, which validates
+// the version rather than silently degrading a malformed one to unresolved.
+func WithAssertionOntology(identity OntologyIdentity) AssertionOption {
+	return func(options *assertionOptions) {
+		options.ontologyIdentity = identity
 	}
 }
 
@@ -745,7 +763,8 @@ func NewAssertion(
 		subject: subject, subjectType: config.subjectType,
 		predicate: predicate, object: object, objectType: config.objectType, origin: origin,
 		confidence: confidence, evidence: cloneEvidence(evidence),
-		provenance: provenance.clone(), metadata: cloneMetadata(metadata),
+		provenance: provenance.clone(), ontologyIdentity: config.ontologyIdentity,
+		metadata: cloneMetadata(metadata),
 	}
 	sort.Slice(assertion.evidence, func(left, right int) bool {
 		return string(assertion.evidence[left].ID()) <
@@ -823,6 +842,11 @@ func (a Assertion) Validate() error {
 	if err := a.provenance.Validate(); err != nil {
 		return err
 	}
+	if a.ontologyIdentity.Known() {
+		if err := a.ontologyIdentity.Validate(); err != nil {
+			return err
+		}
+	}
 	if err := validateMetadata(a.metadata); err != nil {
 		return err
 	}
@@ -873,6 +897,21 @@ func (a Assertion) Provenance() ExtractionProvenance {
 	return a.provenance.clone()
 }
 
+// Ontology returns the ontology snapshot the assertion was made under. The
+// boolean is false when no identity was recorded, which is an explicit unknown
+// and not a claim about any particular version.
+func (a Assertion) Ontology() (OntologyIdentity, bool) {
+	return a.ontologyIdentity, a.ontologyIdentity.Known()
+}
+
+// ReadUnder reports how the assertion's recorded ontology relates to the
+// ontology a reader holds, so reinterpretation under a different version is
+// detectable rather than silent. An assertion that recorded nothing reads as
+// OntologyUnresolved under every reader.
+func (a Assertion) ReadUnder(reader OntologyIdentity) OntologyReading {
+	return ReadOntologyUnder(a.ontologyIdentity, reader)
+}
+
 func (a Assertion) Metadata() shoal.Metadata {
 	return cloneMetadata(a.metadata)
 }
@@ -897,6 +936,9 @@ func assertionID(assertion Assertion) (shoal.ID, error) {
 	if err := assertion.provenance.Validate(); err != nil {
 		return "", err
 	}
+	// A half-populated ontology identity is refused by Assertion.Validate,
+	// which every constructed assertion passes through. It is deliberately not
+	// re-checked here, so that guard has a single reachable enforcement point.
 	evidenceIDs := make([]string, len(assertion.evidence))
 	for index, evidence := range assertion.evidence {
 		if err := evidence.Validate(); err != nil {
@@ -915,6 +957,7 @@ func assertionID(assertion Assertion) (shoal.ID, error) {
 		canonicalFloat(float64(assertion.confidence)),
 		canonicalParts(evidenceIDs...),
 		assertion.provenance.canonical(),
+		assertion.ontologyIdentity.canonical(),
 	)
 }
 
