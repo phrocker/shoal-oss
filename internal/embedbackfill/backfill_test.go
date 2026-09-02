@@ -109,7 +109,7 @@ func TestRunResolvesFromTheFooter(t *testing.T) {
 		// This test is about resolving from footers at all, not about
 		// whether a legacy no_embeddings footer is believable, so it
 		// opts in rather than losing coverage of the no_embeddings path.
-		TrustNoEmbeddingsFooters: true,
+		TrustNoEmbeddings: true,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -142,7 +142,7 @@ func TestRunIsIdempotent(t *testing.T) {
 		// Idempotence is the property under test; trusting the footer
 		// keeps both files on the resolving path so the second run has
 		// something to be idempotent about.
-		TrustNoEmbeddingsFooters: true,
+		TrustNoEmbeddings: true,
 	}
 	if _, err := Run(context.Background(), cfg); err != nil {
 		t.Fatal(err)
@@ -203,8 +203,10 @@ func TestRunLeavesFooterlessFilesUnresolved(t *testing.T) {
 // something else. The backfill fills gaps; it does not arbitrate
 // disagreements, which is what the integrity check is for.
 func TestRunNeverRewritesADeclaredColumn(t *testing.T) {
+	// has_embeddings is trusted unconditionally, so this is the clean
+	// case: an established column the footer disagrees with.
 	declared := unknownFile("a", "/t/a.rf")
-	declared.Metadata = embeddingspace.NoEmbeddings()
+	declared.Metadata = embeddingspace.Has("space-b")
 	files := &fakeMetadata{files: []File{declared}}
 	footers := &fakeFooters{states: map[string]embeddingspace.FileState{
 		"/t/a.rf": embeddingspace.Has("space-a"),
@@ -216,8 +218,76 @@ func TestRunNeverRewritesADeclaredColumn(t *testing.T) {
 	if summary.AlreadyLabelled != 1 || summary.Resolved != 0 || files.writes != 0 {
 		t.Fatalf("summary = %+v writes = %d", summary, files.writes)
 	}
-	if files.files[0].Metadata != embeddingspace.NoEmbeddings() {
+	if files.files[0].Metadata != embeddingspace.Has("space-b") {
 		t.Fatalf("declared column was overwritten with %+v", files.files[0].Metadata)
+	}
+
+	// A no_embeddings column is reported rather than counted as
+	// migrated, because the pre-#274 path fabricated those — but it is
+	// still not rewritten, which is the property under test here.
+	legacy := unknownFile("a", "/t/a.rf")
+	legacy.Metadata = embeddingspace.NoEmbeddings()
+	files = &fakeMetadata{files: []File{legacy}}
+	summary, err = Run(context.Background(), Config{Files: files, Footers: footers, Columns: files})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(summary.Unresolved) != 1 || summary.Resolved != 0 || files.writes != 0 {
+		t.Fatalf("legacy summary = %+v writes = %d", summary, files.writes)
+	}
+	// Reported, not also counted as migrated: a file in both buckets
+	// would let the already-labelled count vouch for the very claim the
+	// unresolvable list exists to question.
+	if summary.AlreadyLabelled != 0 {
+		t.Fatalf("legacy column counted as already labelled: %+v", summary)
+	}
+	if files.files[0].Metadata != embeddingspace.NoEmbeddings() {
+		t.Fatalf("legacy column was overwritten with %+v", files.files[0].Metadata)
+	}
+}
+
+// TestLegacyNoEmbeddingsColumnIsReportedNotSkipped: the pre-#274 commit
+// path fabricated no_embeddings into the file.embedding column as well
+// as the footer, so counting such a column as already labelled would let
+// the migration report complete while convergence keeps trusting the
+// false claim. The backfill cannot repair it — the footer came from the
+// same writer, and the CAS refuses to replace an established column — so
+// naming it for an operator is the only honest outcome.
+func TestLegacyNoEmbeddingsColumnIsReportedNotSkipped(t *testing.T) {
+	newFiles := func() *fakeMetadata {
+		fabricated := unknownFile("a", "/t/a.rf")
+		fabricated.Metadata = embeddingspace.NoEmbeddings()
+		established := unknownFile("b", "/t/b.rf")
+		established.Metadata = embeddingspace.Has("space-a")
+		return &fakeMetadata{files: []File{fabricated, established}}
+	}
+	footers := &fakeFooters{states: map[string]embeddingspace.FileState{}}
+
+	files := newFiles()
+	summary, err := Run(context.Background(), Config{Files: files, Footers: footers, Columns: files})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.AlreadyLabelled != 1 || len(summary.Unresolved) != 1 || summary.Complete() {
+		t.Fatalf("summary = %+v", summary)
+	}
+	if summary.Unresolved[0].Entry != "a" ||
+		summary.Unresolved[0].Reason != ReasonUnverifiableNoEmbeddingsColumn {
+		t.Fatalf("unresolved = %+v", summary.Unresolved[0])
+	}
+	if files.writes != 0 {
+		t.Fatalf("writes = %d; a reported column must still not be rewritten", files.writes)
+	}
+
+	files = newFiles()
+	summary, err = Run(context.Background(), Config{
+		Files: files, Footers: footers, Columns: files, TrustNoEmbeddings: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.AlreadyLabelled != 2 || len(summary.Unresolved) != 0 || !summary.Complete() {
+		t.Fatalf("opted-in summary = %+v", summary)
 	}
 }
 
@@ -365,7 +435,7 @@ func TestLegacyNoEmbeddingsFooterIsNotTrustedByDefault(t *testing.T) {
 	// The operator can assert it, which is the whole escape hatch.
 	files = newFiles()
 	summary, err = Run(context.Background(), Config{
-		Files: files, Footers: footers, Columns: files, TrustNoEmbeddingsFooters: true,
+		Files: files, Footers: footers, Columns: files, TrustNoEmbeddings: true,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -427,7 +497,7 @@ func TestBackfillOverRealFilesLeavesLegacyFilesOutstanding(t *testing.T) {
 		// The point here is the footerless file, so the file that does
 		// carry a no_embeddings footer opts in rather than being held
 		// back for a different reason and blurring the assertion.
-		TrustNoEmbeddingsFooters: true,
+		TrustNoEmbeddings: true,
 	})
 	if err != nil {
 		t.Fatal(err)

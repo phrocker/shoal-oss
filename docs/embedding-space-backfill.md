@@ -27,9 +27,10 @@ For each file entry in a table:
 
 | Situation | Outcome |
 | --- | --- |
-| The entry already has a definite `file.embedding` column | left alone, counted as *already labelled* |
+| The entry already has a definite `has_embeddings` column | left alone, counted as *already labelled* |
+| The entry already has a `no_embeddings` column | see below; without `--trust-no-embeddings` it is listed as *unresolvable* and never rewritten |
 | The footer declares `has_embeddings:<identity>` | that state is written to `file.embedding`, counted as *resolved* |
-| The footer declares `no_embeddings` | written only with `--trust-no-embeddings-footers`; otherwise listed as *unresolvable* — see below |
+| The footer declares `no_embeddings` | written only with `--trust-no-embeddings`; otherwise listed as *unresolvable* — see below |
 | The footer is absent, unreadable, or explicitly `unknown` | left `unknown` and listed individually as *unresolvable* |
 | The entry changed mid-run | not written, listed individually as *raced*; re-run picks it up |
 
@@ -48,23 +49,30 @@ A file whose footer does not establish a known state cannot be resolved
 from metadata alone, so it is reported by name with the reason rather
 than guessed at.
 
-### Legacy `no_embeddings` footers
+### Legacy `no_embeddings` footers and columns
 
 The minor-compaction path fixed by #274 fabricated `no_embeddings` and
-stamped it into the RFile footer. On a file written by that code the
-footer is therefore **not** independent evidence — it is the same
-unfounded claim one layer down, and copying it into `file.embedding`
-would make the bug's own output durable while reporting the file
-migrated.
+stamped it into both the RFile footer and the `file.embedding` column.
+On a file written by that code neither is independent evidence — each is
+the same unfounded claim one layer down, and copying the footer into
+`file.embedding`, or accepting an existing `no_embeddings` column as
+established, would make the bug's own output durable while reporting the
+file migrated.
 
-The backfill will not do that on its own. A `no_embeddings` footer is
-left unresolvable, named, with the reason given, unless the operator
-passes `--trust-no-embeddings-footers`, which is an explicit assertion
+The backfill will not do that on its own. A `no_embeddings` footer, and
+an existing `no_embeddings` column, are each left unresolvable, named,
+with the reason given, unless the operator passes
+`--trust-no-embeddings`, which is an explicit assertion
 that this table's ingest pipeline really did emit no vectors — the same
 assertion `--default-embedding` makes going forward.
 
-`has_embeddings` footers are trusted unconditionally: no version of the
-writer ever invented an identity.
+An existing `no_embeddings` column is reported but never rewritten: the
+backfill only ever adds a column where none is established, so an
+operator who disagrees with a stored value must correct it deliberately
+rather than have a migration silently overwrite it.
+
+`has_embeddings` is trusted unconditionally, in both the footer and the
+column: no version of the writer ever invented an identity.
 
 ## Running it
 

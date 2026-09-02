@@ -72,9 +72,21 @@ const ReasonUnestablishedFooter = "the file's footer does not establish a known 
 // and stamped it into the footer, so such a footer may be that
 // fabrication rather than an observation, and copying it into the column
 // would make the bug's own output durable while reporting the file
-// migrated. See Config.TrustNoEmbeddingsFooters.
+// migrated. See Config.TrustNoEmbeddings.
 const ReasonUnverifiableNoEmbeddings = "the footer says no_embeddings, but a footer written before " +
-	"issue #274 may have fabricated it; re-run with --trust-no-embeddings-footers to accept it"
+	"issue #274 may have fabricated it; re-run with --trust-no-embeddings to accept it"
+
+// ReasonUnverifiableNoEmbeddingsColumn is reported for a file that
+// already carries a no_embeddings file.embedding column.
+//
+// The same pre-#274 commit path wrote that column, so it is no more
+// established than the footer is, and the backfill cannot repair it —
+// the footer would only supply the same claim, and the CAS refuses to
+// replace an established column regardless. It is reported so an
+// operator knows the file exists and can decide, rather than being
+// counted as migrated. See Config.TrustNoEmbeddings.
+const ReasonUnverifiableNoEmbeddingsColumn = "the file.embedding column says no_embeddings, but a " +
+	"column written before issue #274 may have fabricated it; re-run with --trust-no-embeddings to accept it"
 
 // File is one metadata file entry the backfill may have to label.
 type File struct {
@@ -145,22 +157,26 @@ type Config struct {
 	// safe way to size a migration before committing to it.
 	DryRun bool
 
-	// TrustNoEmbeddingsFooters is an explicit operator assertion that a
-	// no_embeddings footer on this table means what it says.
+	// TrustNoEmbeddings is an explicit operator assertion that a
+	// no_embeddings claim about this table means what it says, whether
+	// it appears in a footer or in an existing file.embedding column.
 	//
-	// It exists because the minor-compaction path fixed by issue #274
-	// fabricated no_embeddings and wrote it into the footer, so for
-	// files produced by that code the footer is not independent evidence
-	// — it is the same unfounded claim, one layer down. Trusting it by
-	// default would let the backfill copy the bug's output into durable
-	// metadata and report the table as migrated.
+	// It exists because the paths fixed by issue #274 fabricated
+	// no_embeddings and wrote it into both places, so for files produced
+	// by that code neither is independent evidence — both are the same
+	// unfounded claim. Trusting them by default would let the backfill
+	// copy the bug's output into durable metadata, and report a table as
+	// migrated while convergence keeps trusting a false claim.
 	//
 	// An operator who knows the table's ingest pipeline never emitted
 	// vectors can assert that here, exactly as they can with
 	// mincauthority.Config.DefaultEmbedding. Without it those files are
 	// reported unresolvable, by entry and path, so the decision is made
 	// deliberately and on a named set of files.
-	TrustNoEmbeddingsFooters bool
+	//
+	// has_embeddings is trusted unconditionally and is unaffected: no
+	// version of the writer ever invented an identity.
+	TrustNoEmbeddings bool
 }
 
 // Unresolved is one file the backfill could not establish a state for.
@@ -242,6 +258,23 @@ func Run(ctx context.Context, cfg Config) (Summary, error) {
 			return summary, err
 		}
 		if file.Metadata.Known() {
+			if file.Metadata == embeddingspace.NoEmbeddings() && !cfg.TrustNoEmbeddings {
+				// The pre-#274 commit path fabricated no_embeddings into
+				// the file.embedding column as well as the footer, so an
+				// existing no_embeddings column is not necessarily
+				// established evidence either. Counting it as already
+				// labelled would let the migration report complete while
+				// convergence keeps trusting the false claim.
+				//
+				// The backfill cannot repair it: the footer came from
+				// the same writer, and the CAS refuses to replace an
+				// established column in any case. So it is reported, by
+				// name, for an operator to decide.
+				summary.Unresolved = append(summary.Unresolved, Unresolved{
+					Entry: file.Entry, Path: file.Path, Reason: ReasonUnverifiableNoEmbeddingsColumn,
+				})
+				continue
+			}
 			summary.AlreadyLabelled++
 			continue
 		}
@@ -259,7 +292,7 @@ func Run(ctx context.Context, cfg Config) (Summary, error) {
 			})
 			continue
 		}
-		if state == embeddingspace.NoEmbeddings() && !cfg.TrustNoEmbeddingsFooters {
+		if state == embeddingspace.NoEmbeddings() && !cfg.TrustNoEmbeddings {
 			// The minor-compaction path this issue fixes fabricated
 			// no_embeddings and stamped it into the footer, so on a file
 			// written before the fix a no_embeddings footer may be that
