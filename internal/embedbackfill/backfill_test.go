@@ -93,6 +93,76 @@ func unknownFile(entry, path string) File {
 	}
 }
 
+// TestRunReturnsCancellationFromTheLastFile: the loop's top-of-iteration
+// ctx.Err() check catches a cancellation on every file except the last
+// one, where there is no next iteration to catch it. Recording that as
+// an ordinary per-file failure makes Run return a nil error and a
+// summary that reads like a completed scan of the whole table, so a
+// caller cannot tell a finished pass from an abandoned one.
+func TestRunReturnsCancellationFromTheLastFile(t *testing.T) {
+	t.Run("footer read", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		files := &fakeMetadata{files: []File{unknownFile("a", "/t/a.rf")}}
+		footers := &cancellingFooters{cancel: cancel, ctx: func() context.Context { return ctx }}
+		summary, err := Run(ctx, Config{Files: files, Footers: footers, Columns: files})
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("err = %v, want context.Canceled; summary = %+v", err, summary)
+		}
+	})
+	t.Run("column write", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		files := &fakeMetadata{files: []File{unknownFile("a", "/t/a.rf")}}
+		footers := &fakeFooters{states: map[string]embeddingspace.FileState{
+			"/t/a.rf": embeddingspace.Has("space-a"),
+		}}
+		columns := &cancellingColumns{cancel: cancel, ctx: func() context.Context { return ctx }}
+		summary, err := Run(ctx, Config{Files: files, Footers: footers, Columns: columns})
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("err = %v, want context.Canceled; summary = %+v", err, summary)
+		}
+	})
+}
+
+// TestRunStillToleratesAnOrdinaryFailureOnTheLastFile guards the other
+// side of that check: only a cancelled context aborts the pass. A plain
+// read failure on the last file must still be reported per-file, because
+// one unreadable file must not strand a table's migration.
+func TestRunStillToleratesAnOrdinaryFailureOnTheLastFile(t *testing.T) {
+	files := &fakeMetadata{files: []File{unknownFile("a", "/t/a.rf")}}
+	footers := &fakeFooters{errs: map[string]error{"/t/a.rf": errors.New("storage is down")}}
+	summary, err := Run(context.Background(), Config{Files: files, Footers: footers, Columns: files})
+	if err != nil {
+		t.Fatalf("err = %v; an ordinary failure must not abort the pass", err)
+	}
+	if len(summary.Unresolved) != 1 {
+		t.Fatalf("summary = %+v", summary)
+	}
+}
+
+type cancellingFooters struct {
+	cancel context.CancelFunc
+	ctx    func() context.Context
+}
+
+func (f *cancellingFooters) FooterState(
+	context.Context, string,
+) (embeddingspace.FileState, error) {
+	f.cancel()
+	return embeddingspace.FileState{}, f.ctx().Err()
+}
+
+type cancellingColumns struct {
+	cancel context.CancelFunc
+	ctx    func() context.Context
+}
+
+func (c *cancellingColumns) Write(
+	context.Context, File, embeddingspace.FileState,
+) (bool, error) {
+	c.cancel()
+	return false, c.ctx().Err()
+}
+
 // TestRunResolvesFromTheFooter is the core claim: the footer is the
 // authority, and a resolvable file gets exactly what the footer said.
 func TestRunResolvesFromTheFooter(t *testing.T) {

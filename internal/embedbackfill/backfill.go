@@ -280,6 +280,16 @@ func Run(ctx context.Context, cfg Config) (Summary, error) {
 		}
 		state, err := cfg.Footers.FooterState(ctx, file.Path)
 		if err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				// The per-file tolerance exists so one bad file cannot
+				// strand a table. A cancelled context is not a bad
+				// file: the pass is being torn down and the remaining
+				// files were never examined. Recording it as this
+				// file's problem would, on the last file, let Run
+				// return a nil error and a summary that reads like a
+				// completed scan.
+				return summary, ctxErr
+			}
 			summary.Unresolved = append(summary.Unresolved, Unresolved{
 				Entry: file.Entry, Path: file.Path,
 				Reason: "read the file footer: " + err.Error(),
@@ -316,6 +326,14 @@ func Run(ctx context.Context, cfg Config) (Summary, error) {
 		}
 		applied, err := cfg.Columns.Write(ctx, file, state)
 		if err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				// Same reasoning as the footer read, and it matters
+				// more here: a write that was cut off may or may not
+				// have landed, so reporting it as an ordinary
+				// recoverable failure understates what the operator
+				// needs to know before re-running.
+				return summary, ctxErr
+			}
 			summary.Unresolved = append(summary.Unresolved, Unresolved{
 				Entry: file.Entry, Path: file.Path,
 				Reason: "write the file.embedding column: " + err.Error(),
