@@ -223,7 +223,11 @@ func New(cfg Config) (*Coordinator, error) {
 	if cfg.ReconcileTimeout <= 0 {
 		cfg.ReconcileTimeout = 5 * time.Second
 	}
-	if cfg.DefaultEmbedding.State != "" {
+	if cfg.DefaultEmbedding != (embeddingspace.FileState{}) {
+		// Compared against the whole zero value, not just State: a
+		// partial FileState{Identity: "x"} is malformed configuration,
+		// not an absent one, and must be rejected here rather than
+		// silently ignored as if nothing had been configured.
 		if err := cfg.DefaultEmbedding.Validate(); err != nil {
 			return nil, fmt.Errorf("%w: default embedding: %w", ErrInvalidConfig, err)
 		}
@@ -244,10 +248,10 @@ func New(cfg Config) (*Coordinator, error) {
 // reached the footer while the metadata column recorded the fabricated
 // no_embeddings, which is a pair the next integrity check rejects.
 func (c *Coordinator) defaultEmbedding() embeddingspace.FileState {
-	if c.cfg.DefaultEmbedding.State != "" {
+	if c.cfg.DefaultEmbedding != (embeddingspace.FileState{}) {
 		return c.cfg.DefaultEmbedding
 	}
-	if c.cfg.WriterOptions.EmbeddingSpace.State != "" {
+	if c.cfg.WriterOptions.EmbeddingSpace != (embeddingspace.FileState{}) {
 		return c.cfg.WriterOptions.EmbeddingSpace
 	}
 	return embeddingspace.Unknown()
@@ -289,7 +293,11 @@ func (c *Coordinator) Run(ctx context.Context, operationID string) (DataFile, er
 		if err != nil {
 			return DataFile{}, err
 		}
-		if snapshot.Embedding.State == "" {
+		if snapshot.Embedding == (embeddingspace.FileState{}) {
+			// Only the exact zero value means "the provider declared
+			// nothing". A partial state such as {Identity: "x"} is
+			// malformed provider output and must reach validateSnapshot
+			// and be rejected, not be quietly replaced by the default.
 			snapshot.Embedding = c.defaultEmbedding()
 		}
 		if err := validateSnapshot(snapshot, c.cfg.Extent, c.cfg.Fence); err != nil {

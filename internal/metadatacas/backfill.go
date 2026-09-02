@@ -5,6 +5,7 @@
 package metadatacas
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -186,7 +187,7 @@ func (w *BackfillWriter) WriteFileEmbedding(
 			Cf:  []byte(metadata.CFFileEmbedding),
 			Cq:  append([]byte(nil), target.FileQualifier...),
 			Cv:  []byte{},
-			Val: append([]byte(nil), target.ExistingEmbedding...),
+			Val: bytes.Clone(target.ExistingEmbedding),
 		},
 	}
 	status, err := w.writer.ConditionalWrite(ctx, address, tableID, extent,

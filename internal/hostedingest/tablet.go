@@ -155,7 +155,10 @@ func NewFactory(cfg Config) (*Factory, error) {
 	if cfg.NewOperationID == nil {
 		cfg.NewOperationID = uuid.NewString
 	}
-	if cfg.DefaultEmbedding.State != "" {
+	if cfg.DefaultEmbedding != (embeddingspace.FileState{}) {
+		// Whole-struct comparison: a partial FileState{Identity: "x"}
+		// is malformed startup configuration and must fail fast here,
+		// not be treated as if nothing had been configured.
 		if err := cfg.DefaultEmbedding.Validate(); err != nil {
 			return nil, fmt.Errorf("hostedingest: default embedding: %w", err)
 		}

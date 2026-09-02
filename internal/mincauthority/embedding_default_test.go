@@ -175,6 +175,37 @@ func TestRunKeepsFooterAndMetadataAgreeing(t *testing.T) {
 // TestNewRejectsInvalidDefaultEmbedding: the default is written into
 // durable metadata, so an unencodable one must be refused at
 // construction rather than at the first flush.
+// TestNewRejectsPartialDefaultEmbedding: an identity with no state is
+// not "unset", it is malformed. Testing only State != "" would let it
+// through as if nothing had been configured, silently discarding an
+// operator's intent instead of telling them their config is wrong.
+func TestNewRejectsPartialDefaultEmbedding(t *testing.T) {
+	f := newFixture(t)
+	cfg := f.config
+	cfg.DefaultEmbedding = embeddingspace.FileState{Identity: "space-a"}
+	if _, err := New(cfg); !errors.Is(err, ErrInvalidConfig) {
+		t.Fatalf("New err = %v, want ErrInvalidConfig", err)
+	}
+}
+
+// TestRunRejectsPartialSnapshotEmbedding: the same distinction on the
+// provider side. Only the exact zero value means "declared nothing"; a
+// partial state must reach validateSnapshot and be refused, not be
+// quietly overwritten by the default and published as durable evidence.
+func TestRunRejectsPartialSnapshotEmbedding(t *testing.T) {
+	f := newFixture(t)
+	f.snapshots.snapshot.Embedding = embeddingspace.FileState{Identity: "space-a"}
+	cfg := f.config
+	cfg.DefaultEmbedding = embeddingspace.NoEmbeddings()
+	coordinator, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := coordinator.Run(context.Background(), "op-1"); !errors.Is(err, ErrInvalidSnapshot) {
+		t.Fatalf("Run err = %v, want ErrInvalidSnapshot", err)
+	}
+}
+
 func TestNewRejectsInvalidDefaultEmbedding(t *testing.T) {
 	f := newFixture(t)
 	for _, invalid := range []embeddingspace.FileState{

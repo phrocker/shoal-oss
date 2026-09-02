@@ -103,3 +103,21 @@ func TestNewFactoryRejectsAnInvalidDefaultEmbedding(t *testing.T) {
 		t.Fatal("an invalid default embedding was accepted")
 	}
 }
+
+// TestNewFactoryRejectsAPartialDefaultEmbedding: an identity with no
+// state fails FileState.Validate, so accepting it at startup would mean
+// silently ignoring configuration the operator believes is in effect.
+func TestNewFactoryRejectsAPartialDefaultEmbedding(t *testing.T) {
+	host, _ := hostAssignment(t)
+	root := t.TempDir()
+	_, err := NewFactory(Config{
+		Host: host, ServerAddress: "127.0.0.1:9997",
+		WALRoot: root + "\\wal", MincRoot: "rfiles", StateRoot: root + "\\state",
+		WALStore: walauthority.NewLocalStore(), Outputs: memory.New(),
+		Metadata:         fakeMetadataFactory{metadata: &fakeMetadata{}},
+		DefaultEmbedding: embeddingspace.FileState{Identity: "space-a"},
+	})
+	if err == nil {
+		t.Fatal("a partial default embedding was accepted")
+	}
+}

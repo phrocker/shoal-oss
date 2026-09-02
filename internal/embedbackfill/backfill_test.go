@@ -395,6 +395,53 @@ func TestMetadataFilesCarriesTheRawEntryBytes(t *testing.T) {
 
 type fakeTablets []metadata.TabletInfo
 
+// TestMetadataFilesPreservesTheEmptyPrevRow: metadata encodes an absent
+// prev row (first tablet of a table) as 0x00 and an empty-but-present
+// one as 0x01, and decodePrevRow preserves that as nil vs []byte{}.
+// Collapsing the two makes the CAS precondition encode 0x00 for a tablet
+// whose stored column holds 0x01, so every backfill against the tablet
+// immediately after an empty-row split would be refused as raced
+// forever, with no way for an operator to make progress.
+func TestMetadataFilesPreservesTheEmptyPrevRow(t *testing.T) {
+	entry := `{"path":"hdfs://nn/tables/5/A.rf","startRow":"","endRow":""}`
+	tablets, err := metadata.AggregateRows([]*data.TKeyValue{
+		{
+			Key: &data.TKey{
+				Row: []byte("5;m"), ColFamily: []byte(metadata.CFFile),
+				ColQualifier: []byte(entry),
+			},
+			Value: []byte("100,10"),
+		},
+		{
+			Key: &data.TKey{
+				Row: []byte("5;m"), ColFamily: []byte(metadata.CFTabletSection),
+				ColQualifier: []byte(metadata.CQPrevRow),
+			},
+			// 0x01 with nothing after it: the prev row is the empty row.
+			Value: []byte("\x01"),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	listed, err := MetadataFiles{Reader: fakeTablets(tablets), TableID: "5"}.List(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(listed) != 1 {
+		t.Fatalf("listed = %+v", listed)
+	}
+	if listed[0].PrevEndRow == nil {
+		t.Fatal("PrevEndRow = nil, want a non-nil empty slice: an empty prev row is not an absent one")
+	}
+	if len(listed[0].PrevEndRow) != 0 {
+		t.Fatalf("PrevEndRow = %q, want empty", listed[0].PrevEndRow)
+	}
+	if got := string(metadata.EncodePrevEndRow(listed[0].PrevEndRow)); got != "\x01" {
+		t.Fatalf("re-encoded prev row = %q, want the stored \\x01", got)
+	}
+}
+
 func (f fakeTablets) LocateTable(context.Context, string) ([]metadata.TabletInfo, error) {
 	return []metadata.TabletInfo(f), nil
 }

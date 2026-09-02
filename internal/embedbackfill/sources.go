@@ -5,6 +5,7 @@
 package embedbackfill
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"strings"
@@ -56,16 +57,26 @@ func (m MetadataFiles) List(ctx context.Context) ([]File, error) {
 	out := make([]File, 0)
 	for _, tablet := range tablets {
 		for _, file := range tablet.Files {
+			// bytes.Clone, not append-to-nil: nilness is load-bearing
+			// on both PrevEndRow and ExistingColumn. A nil prev row
+			// means "first tablet of the table" while an empty non-nil
+			// one means "the prev row is the empty row", and
+			// metadata.EncodePrevEndRow encodes those as different
+			// bytes; a nil ExistingColumn means the file.embedding
+			// column is absent while empty non-nil would mean present.
+			// append([]byte(nil), empty...) returns nil and would
+			// collapse both distinctions into a precondition that can
+			// never match, reporting every such file as raced forever.
 			out = append(out, File{
 				TableID:        tablet.TableID,
-				PrevEndRow:     append([]byte(nil), tablet.PrevRow...),
-				EndRow:         append([]byte(nil), tablet.EndRow...),
+				PrevEndRow:     bytes.Clone(tablet.PrevRow),
+				EndRow:         bytes.Clone(tablet.EndRow),
 				Entry:          string(file.RawQualifier),
 				Path:           file.Path,
-				Qualifier:      append([]byte(nil), file.RawQualifier...),
-				Value:          append([]byte(nil), file.RawValue...),
+				Qualifier:      bytes.Clone(file.RawQualifier),
+				Value:          bytes.Clone(file.RawValue),
 				Metadata:       file.Embedding,
-				ExistingColumn: append([]byte(nil), file.RawEmbedding...),
+				ExistingColumn: bytes.Clone(file.RawEmbedding),
 			})
 		}
 	}
