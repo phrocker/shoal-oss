@@ -108,8 +108,10 @@ type PolicyStore interface {
 	Revision(context.Context, shoal.ID, shoal.ID) (RevisionRegistration, bool, error)
 	CurrentRevision(context.Context, shoal.ID) (RevisionRegistration, bool, error)
 	Node(context.Context, shoal.ID) (NodeRegistration, bool, error)
-	// Nodes resolves many node registrations in one round trip and must be
-	// exactly equivalent to calling Node for each identifier. Presence is
+	// Nodes resolves many node registrations in one round trip. For every
+	// identifier it is given it must report exactly what Node would report for
+	// that identifier, and must fail with exactly the error the equivalent Node
+	// loop would fail with, including argument-validation order. Presence is
 	// reported by map membership exactly as Node reports it by its boolean: an
 	// identifier that is absent from the returned map is unregistered, which
 	// callers must treat as the fail-closed deny path. Implementations must
@@ -119,6 +121,9 @@ type PolicyStore interface {
 	RollbackEdgeReservation(context.Context, EdgeRegistration) error
 	PutEdge(context.Context, EdgeRegistration) error
 	Edge(context.Context, shoal.ID) (EdgeRegistration, bool, error)
+	// Edges resolves many edge registrations in one round trip under exactly
+	// the contract Nodes carries for node registrations.
+	Edges(context.Context, []shoal.ID) (map[shoal.ID]EdgeRegistration, error)
 }
 
 type revisionKey struct {
@@ -670,10 +675,16 @@ func (s *MemoryPolicyStore) Node(
 }
 
 // Nodes returns the current registrations owning the requested graph nodes in
-// one round trip. It is exactly equivalent to calling Node for each identifier:
-// unregistered identifiers are omitted from the result rather than reported as
-// an error, so absence is the same fail-closed signal Node reports with a false
-// boolean. Repeated identifiers are resolved once.
+// one round trip. For every identifier it is given it reports exactly what Node
+// reports for that identifier, and it fails with exactly the error the
+// equivalent Node loop fails with, including argument-validation order: each
+// identifier is validated and the receiver rechecked in request order, so a
+// nil receiver is reported before a later malformed identifier is. Unregistered
+// identifiers are omitted from the result rather than reported as an error, so
+// absence is the same fail-closed signal Node reports with a false boolean.
+// Repeated identifiers are looked up once, whether or not they resolve. An
+// empty request additionally checks the context and the receiver, where a Node
+// loop would make no call at all.
 func (s *MemoryPolicyStore) Nodes(
 	ctx context.Context,
 	nodeIDs []shoal.ID,
@@ -685,17 +696,22 @@ func (s *MemoryPolicyStore) Nodes(
 		if err := shoal.ValidateRequiredID("graph node ID", nodeID); err != nil {
 			return nil, err
 		}
+		if s == nil {
+			return nil, catalogUnavailable()
+		}
 	}
 	if s == nil {
 		return nil, catalogUnavailable()
 	}
+	attempted := make(map[shoal.ID]struct{}, len(nodeIDs))
 	resolved := make(map[shoal.ID]NodeRegistration, len(nodeIDs))
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	for _, nodeID := range nodeIDs {
-		if _, done := resolved[nodeID]; done {
+		if _, done := attempted[nodeID]; done {
 			continue
 		}
+		attempted[nodeID] = struct{}{}
 		registration, ok := s.nodes[nodeID]
 		if !ok {
 			continue
@@ -846,6 +862,54 @@ func (s *MemoryPolicyStore) Edge(
 		return EdgeRegistration{}, false, catalogUnavailable()
 	}
 	return cloned, true, nil
+}
+
+// Edges returns the requested edge registrations in one round trip under
+// exactly the contract Nodes carries for node registrations: per-identifier
+// results and failure ordering match the equivalent Edge loop, unregistered
+// identifiers are omitted rather than reported as an error, and repeated
+// identifiers are looked up once whether or not they resolve.
+func (s *MemoryPolicyStore) Edges(
+	ctx context.Context,
+	edgeIDs []shoal.ID,
+) (map[shoal.ID]EdgeRegistration, error) {
+	if err := contextFailure(ctx); err != nil {
+		return nil, err
+	}
+	for _, edgeID := range edgeIDs {
+		if err := shoal.ValidateRequiredID("graph edge ID", edgeID); err != nil {
+			return nil, err
+		}
+		if s == nil {
+			return nil, catalogUnavailable()
+		}
+	}
+	if s == nil {
+		return nil, catalogUnavailable()
+	}
+	attempted := make(map[shoal.ID]struct{}, len(edgeIDs))
+	resolved := make(map[shoal.ID]EdgeRegistration, len(edgeIDs))
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, edgeID := range edgeIDs {
+		if _, done := attempted[edgeID]; done {
+			continue
+		}
+		attempted[edgeID] = struct{}{}
+		registration, ok := s.edges[edgeID]
+		if !ok {
+			registration, ok = s.intrinsicEdges[edgeID]
+		}
+		if !ok {
+			continue
+		}
+		cloned, err := cloneEdgeRegistrationChecked(registration)
+		if err != nil {
+			return nil, catalogUnavailable()
+		}
+		resolved[edgeID] = cloned
+	}
+	return resolved, nil
 }
 
 func (s *MemoryPolicyStore) initialize() {

@@ -35,9 +35,12 @@ import (
 // handling of partial or over-broad results can be asserted directly.
 type recordingNodeStore struct {
 	PolicyStore
-	requests [][]shoal.ID
-	result   map[shoal.ID]NodeRegistration
-	err      error
+	requests     [][]shoal.ID
+	result       map[shoal.ID]NodeRegistration
+	err          error
+	edgeRequests [][]shoal.ID
+	edgeResult   map[shoal.ID]EdgeRegistration
+	edgeErr      error
 }
 
 func (s *recordingNodeStore) Nodes(
@@ -49,6 +52,17 @@ func (s *recordingNodeStore) Nodes(
 		return nil, s.err
 	}
 	return s.result, nil
+}
+
+func (s *recordingNodeStore) Edges(
+	_ context.Context,
+	edgeIDs []shoal.ID,
+) (map[shoal.ID]EdgeRegistration, error) {
+	s.edgeRequests = append(s.edgeRequests, append([]shoal.ID(nil), edgeIDs...))
+	if s.edgeErr != nil {
+		return nil, s.edgeErr
+	}
+	return s.edgeResult, nil
 }
 
 func batchTestRule(t *testing.T, source, policy string) AccessRule {
@@ -289,5 +303,172 @@ func TestMemoryPolicyStoreNodesRejectsInvalidInput(t *testing.T) {
 		context.Background(), []shoal.ID{"node-a"},
 	); !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
 		t.Fatalf("nil store batch lookup error = %v", err)
+	}
+}
+
+// TestMemoryPolicyStoreBatchFailureOrderMatchesPointLoop pins the failure
+// ordering the batch doc comments promise. A Node loop over {"node-a", ""}
+// against a nil store fails on the first identifier with catalog-unavailable,
+// so the batch must report the same rather than validating the whole slice
+// first and surfacing the later invalid identifier instead.
+func TestMemoryPolicyStoreBatchFailureOrderMatchesPointLoop(t *testing.T) {
+	ctx := context.Background()
+	var nilStore *MemoryPolicyStore
+	if _, err := nilStore.Nodes(
+		ctx, []shoal.ID{"node-a", ""},
+	); !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
+		t.Fatalf("nil store node batch error = %v, want catalog unavailable", err)
+	}
+	if _, err := nilStore.Edges(
+		ctx, []shoal.ID{"edge-a", ""},
+	); !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
+		t.Fatalf("nil store edge batch error = %v, want catalog unavailable", err)
+	}
+	// An empty request makes no per-identifier call, so the receiver check is
+	// all that remains and must still reject.
+	if _, err := nilStore.Nodes(ctx, nil); !shoal.IsErrorCode(
+		err, shoal.ErrorUnavailable,
+	) {
+		t.Fatalf("nil store empty node batch error = %v", err)
+	}
+	if _, err := nilStore.Edges(ctx, nil); !shoal.IsErrorCode(
+		err, shoal.ErrorUnavailable,
+	) {
+		t.Fatalf("nil store empty edge batch error = %v", err)
+	}
+	// A live store still reports an invalid identifier, so moving the receiver
+	// check does not weaken argument validation.
+	store := NewMemoryPolicyStore()
+	if _, err := store.Nodes(
+		ctx, []shoal.ID{"node-a", ""},
+	); !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
+		t.Fatalf("invalid node identifier error = %v", err)
+	}
+	if _, err := store.Edges(
+		ctx, []shoal.ID{"edge-a", ""},
+	); !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
+		t.Fatalf("invalid edge identifier error = %v", err)
+	}
+}
+
+// TestResolveEdgesDeduplicatesAndConfinesResults is the edge counterpart of the
+// node batch guard: repeated identifiers cost one round trip, and a store that
+// answers with identifiers the page never asked for cannot widen the page.
+func TestResolveEdgesDeduplicatesAndConfinesResults(t *testing.T) {
+	rule := batchTestRule(t, "source", "policy")
+	store := &recordingNodeStore{edgeResult: map[shoal.ID]EdgeRegistration{
+		"edge-a":          {Rule: rule},
+		"edge-b":          {Rule: rule},
+		"never-asked-for": {Rule: rule},
+	}}
+	client := &Client{policyStore: store}
+	resolved, err := client.resolveEdges(context.Background(), []shoal.ID{
+		"edge-a", "edge-b", "edge-a", "edge-c", "edge-b", "edge-a",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(store.edgeRequests) != 1 {
+		t.Fatalf("batch lookups = %d, want exactly one", len(store.edgeRequests))
+	}
+	wantRequest := []shoal.ID{"edge-a", "edge-b", "edge-c"}
+	if !reflect.DeepEqual(store.edgeRequests[0], wantRequest) {
+		t.Fatalf("batched identifiers = %#v, want %#v", store.edgeRequests[0], wantRequest)
+	}
+	if _, ok := resolved["never-asked-for"]; ok {
+		t.Fatal("batch result admitted a registration that was never requested")
+	}
+	if _, ok := resolved["edge-c"]; ok {
+		t.Fatal("identifier absent from the batch result was reported as resolved")
+	}
+	if len(resolved) != 2 {
+		t.Fatalf("resolved = %#v, want edge-a and edge-b only", resolved)
+	}
+}
+
+// TestResolveEdgesSkipsEmptyBatch keeps a page with no candidate edges from
+// spending a round trip.
+func TestResolveEdgesSkipsEmptyBatch(t *testing.T) {
+	store := &recordingNodeStore{}
+	client := &Client{policyStore: store}
+	resolved, err := client.resolveEdges(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(store.edgeRequests) != 0 {
+		t.Fatalf("batch lookups = %d, want none", len(store.edgeRequests))
+	}
+	if len(resolved) != 0 {
+		t.Fatalf("resolved = %#v, want empty", resolved)
+	}
+}
+
+// TestResolveEdgesPropagatesStoreFailureAsRead confirms a failed edge batch
+// surfaces as a catalog read failure rather than an empty result that would be
+// indistinguishable from every edge being unregistered.
+func TestResolveEdgesPropagatesStoreFailureAsRead(t *testing.T) {
+	store := &recordingNodeStore{edgeErr: catalogUnavailable()}
+	client := &Client{policyStore: store}
+	if _, err := client.resolveEdges(
+		context.Background(), []shoal.ID{"edge-a"},
+	); !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
+		t.Fatalf("batch failure error = %v", err)
+	}
+}
+
+// TestMemoryPolicyStoreEdgesMatchesEdgeLoop pins the batch edge implementation
+// to be equivalent to calling Edge for each identifier, including omitting
+// unregistered identifiers rather than reporting a zero registration.
+func TestMemoryPolicyStoreEdgesMatchesEdgeLoop(t *testing.T) {
+	ctx := context.Background()
+	rule := batchTestRule(t, "source", "policy")
+	store := NewMemoryPolicyStore()
+	if err := store.PutRevision(ctx, RevisionRegistration{
+		DocumentID:    "document",
+		RevisionID:    "revision",
+		NodeIDs:       []shoal.ID{"document", "node-a"},
+		ContentDigest: auth.DigestBytes("test-content", []byte("revision")),
+		Rule:          rule,
+		Current:       true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.PutEdge(ctx, EdgeRegistration{
+		Edge: graph.Edge{
+			ID: "edge-a", From: "document", To: "node-a", Type: "link",
+		},
+		DocumentID: "document", RevisionID: "revision", Rule: rule,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	requested := []shoal.ID{"edge-a", "edge-a", "unregistered"}
+	batch, err := store.Edges(ctx, requested)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected := make(map[shoal.ID]EdgeRegistration)
+	for _, edgeID := range requested {
+		registration, ok, err := store.Edge(ctx, edgeID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !ok {
+			if _, present := batch[edgeID]; present {
+				t.Fatalf("batch reported unregistered edge %q", edgeID)
+			}
+			continue
+		}
+		expected[edgeID] = registration
+	}
+	if !reflect.DeepEqual(batch, expected) {
+		t.Fatalf("batch = %#v, want %#v", batch, expected)
+	}
+	if len(batch) != 1 {
+		t.Fatalf("batch = %#v, want one entry per distinct registered edge", batch)
+	}
+	cancelled, cancel := context.WithCancel(ctx)
+	cancel()
+	if _, err := store.Edges(cancelled, []shoal.ID{"edge-a"}); err == nil {
+		t.Fatal("cancelled context batch edge lookup succeeded")
 	}
 }

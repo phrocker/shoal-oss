@@ -553,6 +553,8 @@ func (c *Client) filterNeighborhood(
 		typeFilter[edgeType] = struct{}{}
 	}
 	admittedEdges := make(map[shoal.ID]graph.Edge, len(raw.Edges))
+	candidateEdges := make([]graph.Edge, 0, len(raw.Edges))
+	candidateEdgeIDs := make([]shoal.ID, 0, len(raw.Edges))
 	for _, edge := range raw.Edges {
 		if err := edge.Validate(); err != nil {
 			return explorer.Neighborhood{}, inconsistentBase()
@@ -568,10 +570,15 @@ func (c *Client) filterNeighborhood(
 		if _, ok := visibleNodes[edge.To]; !ok {
 			continue
 		}
-		registration, ok, err := c.policyStore.Edge(ctx, edge.ID)
-		if err != nil {
-			return explorer.Neighborhood{}, policyCatalogReadError(ctx, err)
-		}
+		candidateEdges = append(candidateEdges, edge)
+		candidateEdgeIDs = append(candidateEdgeIDs, edge.ID)
+	}
+	resolvedEdges, err := c.resolveEdges(ctx, candidateEdgeIDs)
+	if err != nil {
+		return explorer.Neighborhood{}, err
+	}
+	for _, edge := range candidateEdges {
+		registration, ok := resolvedEdges[edge.ID]
 		if !ok || !graphEdgesEqual(registration.Edge, edge) {
 			continue
 		}

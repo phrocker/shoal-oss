@@ -181,6 +181,8 @@ func (c *Client) Neighborhood(
 		typeFilter[edgeType] = struct{}{}
 	}
 	admittedEdges := make(map[shoal.ID]graph.Edge, len(raw.Edges))
+	candidateEdges := make([]graph.Edge, 0, len(raw.Edges))
+	candidateEdgeIDs := make([]shoal.ID, 0, len(raw.Edges))
 	for _, edge := range raw.Edges {
 		if err := edge.Validate(); err != nil {
 			return explorer.Neighborhood{}, inconsistentBase()
@@ -196,10 +198,15 @@ func (c *Client) Neighborhood(
 		if _, ok := visibleNodes[edge.To]; !ok {
 			continue
 		}
-		registration, ok, err := c.policyStore.Edge(ctx, edge.ID)
-		if err != nil {
-			return explorer.Neighborhood{}, policyCatalogReadError(ctx, err)
-		}
+		candidateEdges = append(candidateEdges, edge)
+		candidateEdgeIDs = append(candidateEdgeIDs, edge.ID)
+	}
+	resolvedEdges, err := c.resolveEdges(ctx, candidateEdgeIDs)
+	if err != nil {
+		return explorer.Neighborhood{}, err
+	}
+	for _, edge := range candidateEdges {
+		registration, ok := resolvedEdges[edge.ID]
 		if !ok || !graphEdgesEqual(registration.Edge, edge) {
 			continue
 		}
@@ -325,6 +332,48 @@ func (c *Client) resolveNodes(
 			continue
 		}
 		resolved[nodeID] = registration
+	}
+	return resolved, nil
+}
+
+// registeredEdges holds the edge registrations resolved for one page in a
+// single batch lookup, under the same rule as registeredNodes: membership is
+// the only presence signal, so an identifier that is absent was not registered
+// and denies.
+type registeredEdges map[shoal.ID]EdgeRegistration
+
+// resolveEdges collapses a page's candidate edges into one policy-store round
+// trip under the same discipline as resolveNodes: deduplicate first, skip the
+// round trip entirely when there is nothing to resolve, treat omission from the
+// result as the fail-closed !ok path, and discard registrations for identifiers
+// that were not requested.
+func (c *Client) resolveEdges(
+	ctx context.Context,
+	edgeIDs []shoal.ID,
+) (registeredEdges, error) {
+	distinct := make([]shoal.ID, 0, len(edgeIDs))
+	requested := make(map[shoal.ID]struct{}, len(edgeIDs))
+	for _, edgeID := range edgeIDs {
+		if _, duplicate := requested[edgeID]; duplicate {
+			continue
+		}
+		requested[edgeID] = struct{}{}
+		distinct = append(distinct, edgeID)
+	}
+	if len(distinct) == 0 {
+		return registeredEdges{}, nil
+	}
+	batch, err := c.policyStore.Edges(ctx, distinct)
+	if err != nil {
+		return nil, policyCatalogReadError(ctx, err)
+	}
+	resolved := make(registeredEdges, len(distinct))
+	for _, edgeID := range distinct {
+		registration, ok := batch[edgeID]
+		if !ok {
+			continue
+		}
+		resolved[edgeID] = registration
 	}
 	return resolved, nil
 }
