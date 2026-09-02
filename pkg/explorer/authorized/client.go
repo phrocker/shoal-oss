@@ -663,4 +663,7 @@ func rulesShareDomain(left, right AccessRule) bool {
 	)
 }
 
-var _ explorer.Client = (*Client)(nil)
+var (
+	_ explorer.Client        = (*Client)(nil)
+	_ explorer.BoundedClient = (*Client)(nil)
+)

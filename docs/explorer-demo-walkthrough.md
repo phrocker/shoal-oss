@@ -181,14 +181,32 @@ confirming that traversal crossed the relationship created above.
 ```powershell
 go run .\cmd\shoal-explore-web `
   -data .shoal\explorer-demo `
-  -listen 127.0.0.1:8080
+  -listen 127.0.0.1:8080 `
+  -dev-auth
 ```
 
 Expected observable outcome:
 
 ```text
+Authenticating every request as development principal development-principal@localhost
+Granted 2 pre-existing document(s) in .shoal\explorer-demo to development-principal@localhost: a development-only convenience for -dev-auth on loopback, because the policy catalog is in-memory and does not survive this process (issue #284)
 Shoal Explorer listening at http://127.0.0.1:8080
 ```
+
+Every request must carry an identity. `-dev-auth` mints one fixed development
+principal for callers on this host, and the server refuses to start with
+`-dev-auth` on any listen address that is not loopback-only, so `:8080`,
+`0.0.0.0:8080`, and `[::]:8080` are rejected. Without `-dev-auth` and without a
+real authenticator the server refuses to start at all rather than serve
+anonymously.
+
+The authorized Explorer client enforces the bound decision on every call, and
+its policy catalog lives in memory for the lifetime of the process (issue #284).
+The documents ingested in steps 2 and 3 through the CLI therefore carry no
+catalog registration, which is why `-dev-auth` on a loopback listener grants them
+to the development principal at startup and prints the count above. That startup grant
+is development-only: it is refused for a real authenticator and for any listener
+another host can reach, and it does not persist across restarts.
 
 The default listen address is also `127.0.0.1:8080`, so the explicit
 `-listen` value documents the default. Open <http://127.0.0.1:8080> to use the
