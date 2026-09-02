@@ -127,8 +127,8 @@ func TestBackfillRequiresDevelopmentCapability(t *testing.T) {
 // no metadata, and the stored title rather than the submitted one -- so a
 // selector that has not been shown to ignore the source could be handed input
 // it never saw at ingest and derive a different, possibly wider, rule. Only a
-// selector this package can inspect is accepted; every other one is refused
-// and the corpus stays hidden.
+// selector defined inside that package, which declares source independence, is
+// accepted; every other one is refused and the corpus stays hidden.
 func TestBackfillRefusesUndeclaredSelector(t *testing.T) {
 	f := newFixture(t)
 	if _, err := f.base.Ingest(context.Background(), explorer.Source{

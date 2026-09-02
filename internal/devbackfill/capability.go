@@ -29,11 +29,19 @@
 // which is refused.
 package devbackfill
 
-// Capability is unforgeable evidence that the development-only backfill was
-// requested from the sanctioned startup gate. Only NewCapability produces a
-// granted one: the field is unexported, so a zero value obtained through
-// reflection is not granted, and only code inside this module can reach the
-// constructor at all.
+// Capability admits the development-only backfill. It carries no evidence
+// about its caller: any code inside this module can mint one, and the type
+// alone proves nothing about the gate. What it does provide is a name no
+// module outside this repository can write, which makes the method that takes
+// one uncallable from outside with anything but nil.
+//
+// Only NewCapability produces a granted one. The field is unexported, so a
+// zero value obtained through reflection is not granted; unsafe defeats that,
+// as it defeats any barrier expressible in Go.
+//
+// Restricting minting to the one gated call site is a property of this
+// repository's source, not of this type, and is enforced by
+// TestBackfillCapabilityHasOneMintSite in cmd/shoal-explore-web.
 type Capability struct {
 	granted bool
 }

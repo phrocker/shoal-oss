@@ -106,10 +106,12 @@ func (b *developmentBackfill) run(
 			"refusing to serve: binding the %s development decision failed: %w",
 			developmentSubject, err)
 	}
-	// The capability is minted only here, after newDevelopmentBackfill has
+	// The capability is minted here, after newDevelopmentBackfill has
 	// established the development principal and a loopback listener. It is the
-	// only mint site in the module, and TestBackfillCapabilityHasOneMintSite
-	// keeps it that way.
+	// only mint site in non-test code, which
+	// TestBackfillCapabilityHasOneMintSite enforces by requiring exactly one
+	// reference to the constructor, called from inside this function rather
+	// than at package scope.
 	registered, err := client.BackfillExistingDocumentsForDevelopment(
 		bound, devbackfill.NewCapability())
 	if err != nil {

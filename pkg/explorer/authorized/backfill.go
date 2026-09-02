@@ -29,13 +29,14 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
-// sourceIndependentSelector is a PolicySelector that provably derives its
-// policy without consulting explorer.Source at all.
+// sourceIndependentSelector is a PolicySelector that declares it derives its
+// policy without consulting explorer.Source.
 //
 // The declaring method is unexported, so only a selector defined in this
 // package can claim it. That is deliberate: the claim is a security assertion
 // about code this package can read, not something a caller may assert about
-// its own selector.
+// its own selector. The declaration is not taken on trust -- backfillRule
+// checks it against behaviour for every document it registers.
 type sourceIndependentSelector interface {
 	PolicySelector
 	ignoresIngestSource()
@@ -47,9 +48,12 @@ type sourceIndependentSelector interface {
 // so a reconstructed source cannot change the rule it returns.
 func (s *StaticPolicySelector) ignoresIngestSource() {}
 
-// backfillSourceProbe contrasts with any real source in every field the
-// selector could key on. Deriving the same rule from it and from a document's
-// reconstructed source is evidence at run time that the selector ignored both.
+// backfillSourceProbe differs from the source reconstructed for a stored
+// document in every field of explorer.Source, so a selector that keys on any
+// of them derives a different policy for it. Deriving the same rule from both
+// is evidence that the selector consulted neither; it is not a proof, because
+// a selector could key on the source in some way this one input does not
+// distinguish.
 var backfillSourceProbe = explorer.Source{
 	URI:       "shoal-backfill-probe:source-dependence",
 	Title:     "shoal backfill source-dependence probe",
@@ -190,8 +194,8 @@ func backfillSourceLoss() error {
 
 // existingRevisionRegistration derives the catalog record for a base document
 // using the same view verification, node identity, digest, and intrinsic edge
-// derivation that Ingest performs, so a backfilled registration is
-// indistinguishable from one written at ingest time.
+// derivation that Ingest performs, so the read path verifies a backfilled
+// registration exactly as it verifies one written at ingest time.
 func (c *Client) existingRevisionRegistration(
 	ctx context.Context,
 	summary explorer.DocumentSummary,

@@ -18,12 +18,18 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"go/ast"
+	"go/parser"
+	"go/printer"
+	"go/token"
 	"io"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -300,25 +306,48 @@ func TestOpenServiceRefusesWhenBackfillFails(t *testing.T) {
 	}
 }
 
-// TestBackfillCapabilityHasOneMintSite keeps the development-only backfill as
-// hard to reach inside this module as it already is outside it. Code outside
-// the module cannot name *devbackfill.Capability at all, so the method that
-// takes one is uncallable to it; inside the module the remaining protection is
-// that exactly one gated call site mints the capability. Test files are
-// excluded -- they are not production reachability -- so this fails if any
-// non-test file other than the startup gate mints one.
+// mintSite is one reference to the capability constructor, with the function
+// it appears in. An empty function means package scope.
+type mintSite struct {
+	file     string
+	function string
+	called   bool
+}
+
+// TestBackfillCapabilityHasOneMintSite enforces, across every non-test .go
+// file in the repository, that there is exactly one reference to
+// devbackfill.NewCapability, that it is a call rather than a value taken, that
+// it is in cmd/shoal-explore-web/backfill.go, and that it is inside
+// (*developmentBackfill).run -- the body reached only after
+// newDevelopmentBackfill has established the development authenticator and a
+// loopback listener.
+//
+// Package scope is rejected specifically. A package-level var would mint a
+// valid capability at process init, before any gate runs, in every build.
+// References are matched by resolving each file's import of
+// internal/devbackfill to its local name, so renaming the import does not
+// hide a mint site.
+//
+// Test files are excluded: they legitimately mint capabilities, and they are
+// not production reachability. Outside the module the barrier is the compiler
+// -- the capability type cannot be named at all -- and this test is the
+// in-module half of that.
 //
 // TEMPORARY (issue #284): delete with the backfill.
 func TestBackfillCapabilityHasOneMintSite(t *testing.T) {
-	mint := "devbackfill." + "NewCapability("
+	const (
+		capabilityPackage = "github.com/phrocker/shoal-oss/internal/devbackfill"
+		constructor       = "NewCapability"
+		gateFunction      = "(*developmentBackfill).run"
+	)
+	gateFile := filepath.Join("cmd", "shoal-explore-web", "backfill.go")
 	root, err := filepath.Abs(filepath.Join("..", ".."))
 	if err != nil {
 		t.Fatal(err)
 	}
-	allowed := map[string]bool{
-		filepath.Join("cmd", "shoal-explore-web", "backfill.go"): true,
-	}
-	var found []string
+
+	var sites []mintSite
+	fileSet := token.NewFileSet()
 	err = filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
 		if err != nil {
 			return err
@@ -329,34 +358,125 @@ func TestBackfillCapabilityHasOneMintSite(t *testing.T) {
 			}
 			return nil
 		}
-		if filepath.Ext(path) != ".go" ||
-			strings.HasSuffix(path, "_test.go") {
+		if filepath.Ext(path) != ".go" || strings.HasSuffix(path, "_test.go") {
 			return nil
 		}
-		source, err := os.ReadFile(path)
+		parsed, err := parser.ParseFile(fileSet, path, nil, 0)
 		if err != nil {
 			return err
 		}
-		if !strings.Contains(string(source), mint) {
+		local := importedName(parsed, capabilityPackage)
+		if local == "" {
 			return nil
 		}
 		relative, err := filepath.Rel(root, path)
 		if err != nil {
 			return err
 		}
-		if !allowed[relative] {
-			found = append(found, relative)
-		}
+		sites = append(sites, mintSites(parsed, relative, local, constructor)...)
 		return nil
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(found) != 0 {
+
+	if len(sites) != 1 {
 		t.Fatalf(
-			"the development backfill capability is minted outside the "+
-				"startup gate: %v", found)
+			"the development backfill capability is minted %d times, want "+
+				"exactly 1: %+v", len(sites), sites)
 	}
+	site := sites[0]
+	where := site.function
+	if where == "" {
+		where = "package scope"
+	}
+	if !site.called {
+		t.Fatalf(
+			"the capability constructor is referenced without calling it at "+
+				"%s in %s, which can defer minting past the gate",
+			site.file, where)
+	}
+	if site.file != gateFile || site.function != gateFunction {
+		t.Fatalf(
+			"the capability is minted at %s in %s, want %s in %s",
+			site.file, where, gateFile, gateFunction)
+	}
+}
+
+// importedName returns the name the file refers to path by, or "" if the file
+// does not import it. A blank or dot import returns "" because neither can
+// name the constructor.
+func importedName(file *ast.File, path string) string {
+	for _, spec := range file.Imports {
+		value, err := strconv.Unquote(spec.Path.Value)
+		if err != nil || value != path {
+			continue
+		}
+		if spec.Name == nil {
+			return filepath.Base(path)
+		}
+		if spec.Name.Name == "_" || spec.Name.Name == "." {
+			return ""
+		}
+		return spec.Name.Name
+	}
+	return ""
+}
+
+// mintSites reports every reference to local.constructor in the file, whether
+// called or merely taken as a value, together with the enclosing function.
+func mintSites(
+	file *ast.File,
+	relative, local, constructor string,
+) []mintSite {
+	var sites []mintSite
+	record := func(function string, node ast.Node) {
+		called := map[ast.Node]bool{}
+		ast.Inspect(node, func(inner ast.Node) bool {
+			call, ok := inner.(*ast.CallExpr)
+			if ok {
+				called[call.Fun] = true
+			}
+			selector, ok := inner.(*ast.SelectorExpr)
+			if !ok || selector.Sel.Name != constructor {
+				return true
+			}
+			ident, ok := selector.X.(*ast.Ident)
+			if !ok || ident.Name != local {
+				return true
+			}
+			sites = append(sites, mintSite{
+				file:     relative,
+				function: function,
+				called:   called[ast.Expr(selector)],
+			})
+			return true
+		})
+	}
+	for _, declaration := range file.Decls {
+		function, ok := declaration.(*ast.FuncDecl)
+		if !ok {
+			// Package scope: a var, const, or type declaration.
+			record("", declaration)
+			continue
+		}
+		record(functionName(function), function)
+	}
+	return sites
+}
+
+// functionName renders a function as Name or (Receiver).Name.
+func functionName(function *ast.FuncDecl) string {
+	if function.Recv == nil || len(function.Recv.List) != 1 {
+		return function.Name.Name
+	}
+	var receiver bytes.Buffer
+	if err := printer.Fprint(
+		&receiver, token.NewFileSet(), function.Recv.List[0].Type,
+	); err != nil {
+		return function.Name.Name
+	}
+	return "(" + receiver.String() + ")." + function.Name.Name
 }
 
 // preExistingCorpus writes one document straight to a corpus directory and
