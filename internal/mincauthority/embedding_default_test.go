@@ -257,6 +257,28 @@ func TestRunRejectsPartialSnapshotEmbedding(t *testing.T) {
 	}
 }
 
+// TestNewRejectsInvalidWriterEmbeddingSpace: defaultEmbedding falls
+// back to WriterOptions.EmbeddingSpace, so it carries the same
+// authority and must fail the same way. Validating only
+// DefaultEmbedding would accept a malformed value here, copy it into
+// the snapshot, and report a configuration error at the first flush as
+// ErrInvalidSnapshot — corrupt durable state, which it is not.
+func TestNewRejectsInvalidWriterEmbeddingSpace(t *testing.T) {
+	f := newFixture(t)
+	for _, invalid := range []embeddingspace.FileState{
+		{Identity: "space-a"},
+		{State: "definitely-not-a-state"},
+		{State: embeddingspace.StateHasEmbeddings},
+		{State: embeddingspace.StateNoEmbeddings, Identity: "space-a"},
+	} {
+		cfg := f.config
+		cfg.WriterOptions.EmbeddingSpace = invalid
+		if _, err := New(cfg); !errors.Is(err, ErrInvalidConfig) {
+			t.Fatalf("New(%+v) error = %v, want ErrInvalidConfig", invalid, err)
+		}
+	}
+}
+
 func TestNewRejectsInvalidDefaultEmbedding(t *testing.T) {
 	f := newFixture(t)
 	for _, invalid := range []embeddingspace.FileState{

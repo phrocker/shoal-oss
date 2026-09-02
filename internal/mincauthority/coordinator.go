@@ -232,6 +232,17 @@ func New(cfg Config) (*Coordinator, error) {
 			return nil, fmt.Errorf("%w: default embedding: %w", ErrInvalidConfig, err)
 		}
 	}
+	if cfg.WriterOptions.EmbeddingSpace != (embeddingspace.FileState{}) {
+		// defaultEmbedding falls back to this, so it is configuration
+		// with the same authority and must fail the same way. Without
+		// this a malformed value is accepted here, copied into the
+		// snapshot, and only surfaces at the first flush as
+		// ErrInvalidSnapshot — a configuration error reported as
+		// corrupt durable state.
+		if err := cfg.WriterOptions.EmbeddingSpace.Validate(); err != nil {
+			return nil, fmt.Errorf("%w: writer embedding space: %w", ErrInvalidConfig, err)
+		}
+	}
 	return &Coordinator{cfg: cfg}, nil
 }
 

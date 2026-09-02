@@ -181,7 +181,13 @@ func (w *BackfillWriter) WriteFileEmbedding(
 		// the footer that could not produce it.
 		return false, fmt.Errorf("%w: refusing to record %s", ErrInvalidConfig, state.String())
 	}
-	if len(target.ExistingEmbedding) > 0 {
+	if target.ExistingEmbedding != nil {
+		// Nilness, not length: nil means the column is absent, so a
+		// present-but-empty value is a malformed column, not a missing
+		// one. Testing length would skip decoding it and let the write
+		// replace it, when the contract here is that only a column
+		// decoding to unknown may be replaced.
+		//
 		// Replacing a column is only ever an upgrade from a non-claim.
 		// Anything that already decodes to a definite state was
 		// established by a writer with better evidence than a migration

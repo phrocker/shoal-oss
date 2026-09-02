@@ -180,6 +180,27 @@ func TestBackfillWriterRefusesToReplaceAnEstablishedColumn(t *testing.T) {
 	}
 }
 
+// TestBackfillWriterRefusesAnEmptyExistingColumn: nil means the column
+// is absent; a present-but-empty value is a malformed column. Testing
+// length rather than nilness would conflate the two and let the write
+// replace a value it never decoded, when only a column decoding to
+// unknown may be replaced.
+func TestBackfillWriterRefusesAnEmptyExistingColumn(t *testing.T) {
+	cluster, writer := newBackfillFixture(t)
+	cluster.cells[cell(metadata.CFFileEmbedding, backfillEntry)] = []byte{}
+	target := backfillTarget()
+	target.ExistingEmbedding = []byte{}
+
+	applied, err := writer.WriteFileEmbedding(
+		context.Background(), target, embeddingspace.Has("space-a"))
+	if applied || !errors.Is(err, ErrInvalidConfig) {
+		t.Fatalf("applied = %t, err = %v; a malformed column must be refused", applied, err)
+	}
+	if len(cluster.cells[cell(metadata.CFFileEmbedding, backfillEntry)]) != 0 {
+		t.Fatal("a malformed column was overwritten")
+	}
+}
+
 // TestBackfillWriterRefusesTheRootTablet: the root tablet's metadata
 // lives in ZooKeeper and is owned by whichever server hosts it.
 func TestBackfillWriterRefusesTheRootTablet(t *testing.T) {
