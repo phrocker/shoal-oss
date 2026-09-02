@@ -23,6 +23,17 @@ The orchestrator:
   planned item `inferred` and `proposed`; and
 - returns a publication plan without writing storage.
 
+Every assertion the orchestrator emits records the
+`ontology.OntologyIdentity` -- schema ID plus version ID -- of the version the
+request pinned, so the meaning that applied is recoverable from the assertion
+itself rather than only through the result to request chain. Definition IDs are
+derived from namespace and key alone and are deliberately stable across
+versions, so the recorded identity is the only thing that fixes which meaning
+was in force. `ontology.ExtractionResult.ValidateFor` rejects an assertion that
+records a different version than the request pinned; an assertion that recorded
+nothing is reported by `UnresolvedOntologyAssertions` and is never stamped with
+the request's version.
+
 An existing graph node may only be referenced when its ID occurs in a supplied
 graph evidence path and the output cites that graph anchor. Graph IDs are
 represented in prompts and model output as reversible `node-base64:` tokens,
