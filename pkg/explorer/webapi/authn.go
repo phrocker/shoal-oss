@@ -20,6 +20,7 @@ package webapi
 import (
 	"context"
 	"net/http"
+	"reflect"
 
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
@@ -36,10 +37,15 @@ type Authenticator interface {
 // AuthenticatorFunc adapts a function to the Authenticator contract.
 type AuthenticatorFunc func(*http.Request) (auth.Decision, error)
 
-// Authenticate calls the trusted authenticator function.
+// Authenticate calls the trusted authenticator function. A nil function value
+// denies the request instead of panicking, so an adapter that was never given
+// a function fails closed on every call path rather than crashing the request.
 func (f AuthenticatorFunc) Authenticate(
 	request *http.Request,
 ) (auth.Decision, error) {
+	if f == nil {
+		return auth.Decision{}, authenticationDenied()
+	}
 	return f(request)
 }
 
@@ -59,11 +65,11 @@ func NewAuthenticatedHandler(
 	authenticator Authenticator,
 	binder auth.Binder,
 ) (*Handler, error) {
-	if authenticator == nil {
+	if isAbsentInterface(authenticator) {
 		return nil, shoal.NewError(
 			shoal.ErrorInvalidArgument, "workspace authenticator is required")
 	}
-	if binder == nil {
+	if isAbsentInterface(binder) {
 		return nil, shoal.NewError(
 			shoal.ErrorInvalidArgument, "workspace decision binder is required")
 	}
@@ -81,7 +87,7 @@ func NewAuthenticatedHandler(
 func (h *Handler) authenticate(
 	request *http.Request,
 ) (context.Context, error) {
-	if h.authenticator == nil || h.binder == nil {
+	if isAbsentInterface(h.authenticator) || isAbsentInterface(h.binder) {
 		return nil, authenticationDenied()
 	}
 	decision, err := h.authenticator.Authenticate(request)
@@ -97,4 +103,24 @@ func (h *Handler) authenticate(
 
 func authenticationDenied() error {
 	return shoal.NewError(shoal.ErrorUnauthorized, "authentication required")
+}
+
+// isAbsentInterface reports whether an interface value carries no usable
+// implementation. A typed nil such as AuthenticatorFunc(nil) or a nil pointer
+// receiver is not equal to nil as an interface, so a plain nil comparison
+// admits an adapter whose every call panics. Mandatory authentication must
+// reject that at construction and deny it at request time, never discover it
+// as a crash while serving.
+func isAbsentInterface(value any) bool {
+	if value == nil {
+		return true
+	}
+	reflected := reflect.ValueOf(value)
+	switch reflected.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map,
+		reflect.Pointer, reflect.Slice, reflect.UnsafePointer:
+		return reflected.IsNil()
+	default:
+		return false
+	}
 }

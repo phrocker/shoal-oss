@@ -22,10 +22,13 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/phrocker/shoal-oss/internal/devbackfill"
 	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/explorer/webapi"
@@ -85,12 +88,15 @@ type recordingBackfiller struct {
 	registered int
 	err        error
 	ctx        context.Context
+	capability *devbackfill.Capability
 }
 
-func (b *recordingBackfiller) BackfillExistingDocuments(
+func (b *recordingBackfiller) BackfillExistingDocumentsForDevelopment(
 	ctx context.Context,
+	capability *devbackfill.Capability,
 ) (int, error) {
 	b.ctx = ctx
+	b.capability = capability
 	if b.err != nil {
 		return 0, b.err
 	}
@@ -125,6 +131,10 @@ func TestDevelopmentBackfillBindsAndFailsClosed(t *testing.T) {
 	}
 	if decision.Subject() != developmentSubject {
 		t.Fatalf("backfill subject = %q", decision.Subject())
+	}
+
+	if !succeeding.capability.Granted() {
+		t.Fatal("the backfill ran without the development capability")
 	}
 
 	failing := &recordingBackfiller{err: errors.New("catalog write failed")}
@@ -287,6 +297,65 @@ func TestOpenServiceRefusesWhenBackfillFails(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "refusing to serve") {
 		t.Fatalf("unclear diagnostic: %v", err)
+	}
+}
+
+// TestBackfillCapabilityHasOneMintSite keeps the development-only backfill as
+// hard to reach inside this module as it already is outside it. Code outside
+// the module cannot name *devbackfill.Capability at all, so the method that
+// takes one is uncallable to it; inside the module the remaining protection is
+// that exactly one gated call site mints the capability. Test files are
+// excluded -- they are not production reachability -- so this fails if any
+// non-test file other than the startup gate mints one.
+//
+// TEMPORARY (issue #284): delete with the backfill.
+func TestBackfillCapabilityHasOneMintSite(t *testing.T) {
+	mint := "devbackfill." + "NewCapability("
+	root, err := filepath.Abs(filepath.Join("..", ".."))
+	if err != nil {
+		t.Fatal(err)
+	}
+	allowed := map[string]bool{
+		filepath.Join("cmd", "shoal-explore-web", "backfill.go"): true,
+	}
+	var found []string
+	err = filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if entry.IsDir() {
+			if entry.Name() == ".git" || entry.Name() == "vendor" {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if filepath.Ext(path) != ".go" ||
+			strings.HasSuffix(path, "_test.go") {
+			return nil
+		}
+		source, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		if !strings.Contains(string(source), mint) {
+			return nil
+		}
+		relative, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+		if !allowed[relative] {
+			found = append(found, relative)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(found) != 0 {
+		t.Fatalf(
+			"the development backfill capability is minted outside the "+
+				"startup gate: %v", found)
 	}
 }
 

@@ -23,8 +23,10 @@ import (
 	"context"
 	"testing"
 
+	"github.com/phrocker/shoal-oss/internal/devbackfill"
 	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
+	"github.com/phrocker/shoal-oss/pkg/explorer/authorized"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
@@ -49,7 +51,8 @@ func TestBackfillRegistersUnregisteredBaseDocuments(t *testing.T) {
 		t.Fatalf("unregistered document was visible: %d", len(summaries))
 	}
 
-	registered, err := f.clientA.BackfillExistingDocuments(f.alice(t))
+	registered, err := f.clientA.BackfillExistingDocumentsForDevelopment(
+		f.alice(t), devbackfill.NewCapability())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -82,12 +85,97 @@ func TestBackfillRegistersUnregisteredBaseDocuments(t *testing.T) {
 	}
 
 	// Re-running registers nothing further and leaves the catalog intact.
-	again, err := f.clientA.BackfillExistingDocuments(f.alice(t))
+	again, err := f.clientA.BackfillExistingDocumentsForDevelopment(
+		f.alice(t), devbackfill.NewCapability())
 	if err != nil {
 		t.Fatal(err)
 	}
 	if again != 0 {
 		t.Fatalf("second backfill registered = %d, want 0", again)
+	}
+}
+
+// TestBackfillRequiresDevelopmentCapability proves the module-internal
+// capability is load-bearing. Code outside this module cannot construct one at
+// all, so nil is the only argument it could supply, and nil is refused before
+// anything is resolved or registered.
+func TestBackfillRequiresDevelopmentCapability(t *testing.T) {
+	f := newFixture(t)
+	if _, err := f.base.Ingest(context.Background(), explorer.Source{
+		URI:       "file:///pre-existing.txt",
+		Title:     "Pre-existing",
+		MediaType: explorer.MediaTypeText,
+		Content:   "content written before the catalog existed",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.clientA.BackfillExistingDocumentsForDevelopment(
+		f.alice(t), nil); !shoal.IsErrorCode(err, shoal.ErrorUnauthorized) {
+		t.Fatalf("backfill without the capability error = %v", err)
+	}
+	summaries, err := f.clientA.Documents(f.alice(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(summaries) != 0 {
+		t.Fatalf("a refused backfill still registered content: %d", len(summaries))
+	}
+}
+
+// TestBackfillRefusesUndeclaredSelector proves the backfill will not guess.
+// The source it can reconstruct for a stored document is lossy -- no content,
+// no metadata, and the stored title rather than the submitted one -- so a
+// selector that has not been shown to ignore the source could be handed input
+// it never saw at ingest and derive a different, possibly wider, rule. Only a
+// selector this package can inspect is accepted; every other one is refused
+// and the corpus stays hidden.
+func TestBackfillRefusesUndeclaredSelector(t *testing.T) {
+	f := newFixture(t)
+	if _, err := f.base.Ingest(context.Background(), explorer.Source{
+		URI:       "file:///pre-existing.txt",
+		Title:     "Pre-existing",
+		MediaType: explorer.MediaTypeText,
+		Content:   "content written before the catalog existed",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	static, err := authorized.NewStaticPolicySelector(f.sourceA, f.policyA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The wrapper forwards to a source-independent selector and so derives an
+	// identical rule, but it is opaque to this package and is refused anyway.
+	wrapped := authorized.PolicySelectorFunc(func(
+		ctx context.Context,
+		decision auth.Decision,
+		source explorer.Source,
+	) (auth.Policy, error) {
+		return static.SelectPolicy(ctx, decision, source)
+	})
+	client, err := authorized.NewClient(authorized.Config{
+		Base:               f.base,
+		Resolver:           f.authority.Resolver(),
+		PolicySelector:     wrapped,
+		EdgePolicySelector: static,
+		PolicyStore:        f.store,
+		GenerationReader:   f.reader,
+		Clock:              f.clock.Now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.BackfillExistingDocumentsForDevelopment(
+		f.alice(t),
+		devbackfill.NewCapability(),
+	); !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
+		t.Fatalf("backfill with an undeclared selector error = %v", err)
+	}
+	summaries, err := f.clientA.Documents(f.alice(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(summaries) != 0 {
+		t.Fatalf("a refused backfill still registered content: %d", len(summaries))
 	}
 }
 
@@ -104,8 +192,8 @@ func TestBackfillRequiresAuthorization(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := f.clientA.BackfillExistingDocuments(
-		context.Background()); !shoal.IsErrorCode(err, shoal.ErrorUnauthorized) {
+	if _, err := f.clientA.BackfillExistingDocumentsForDevelopment(
+		context.Background(), devbackfill.NewCapability()); !shoal.IsErrorCode(err, shoal.ErrorUnauthorized) {
 		t.Fatalf("unbound context error = %v", err)
 	}
 	readOnly := f.context(t, f.decision(
@@ -115,8 +203,8 @@ func TestBackfillRequiresAuthorization(t *testing.T) {
 		[][]byte{f.policyA},
 		[]auth.Operation{auth.OperationList, auth.OperationRead},
 	))
-	if _, err := f.clientA.BackfillExistingDocuments(
-		readOnly); !shoal.IsErrorCode(err, shoal.ErrorUnauthorized) {
+	if _, err := f.clientA.BackfillExistingDocumentsForDevelopment(
+		readOnly, devbackfill.NewCapability()); !shoal.IsErrorCode(err, shoal.ErrorUnauthorized) {
 		t.Fatalf("decision without ingest error = %v", err)
 	}
 	summaries, err := f.clientA.Documents(f.alice(t))

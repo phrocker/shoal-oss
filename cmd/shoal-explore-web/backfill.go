@@ -21,13 +21,20 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/phrocker/shoal-oss/internal/devbackfill"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/explorer/webapi"
 )
 
 // policyBackfiller registers corpus content that predates the policy catalog.
+//
+// TEMPORARY (issue #284): the method it names is development scaffolding that
+// requires a module-internal capability, so nothing outside this repository
+// can satisfy this interface. Delete it with the backfill.
 type policyBackfiller interface {
-	BackfillExistingDocuments(context.Context) (int, error)
+	BackfillExistingDocumentsForDevelopment(
+		context.Context, *devbackfill.Capability,
+	) (int, error)
 }
 
 // developmentBackfill grants the documents already on disk to the development
@@ -99,7 +106,12 @@ func (b *developmentBackfill) run(
 			"refusing to serve: binding the %s development decision failed: %w",
 			developmentSubject, err)
 	}
-	registered, err := client.BackfillExistingDocuments(bound)
+	// The capability is minted only here, after newDevelopmentBackfill has
+	// established the development principal and a loopback listener. It is the
+	// only mint site in the module, and TestBackfillCapabilityHasOneMintSite
+	// keeps it that way.
+	registered, err := client.BackfillExistingDocumentsForDevelopment(
+		bound, devbackfill.NewCapability())
 	if err != nil {
 		return 0, fmt.Errorf(
 			"refusing to serve: granting the existing corpus to %s failed, so "+

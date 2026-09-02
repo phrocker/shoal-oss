@@ -372,6 +372,56 @@ func authnSend(t *testing.T, request *http.Request) authnResponse {
 
 // TestUnauthenticatedRequestsAreDenied proves that no route serves anything to
 // a caller whose identity cannot be established.
+// TestNilAuthenticatorAdapterIsRejectedNotPanicked proves the mandatory
+// authentication constructor refuses an adapter that carries no function, and
+// that the adapter itself denies rather than panics if one ever reaches a
+// request. A typed nil is a non-nil interface, so a plain nil comparison would
+// admit it and turn every request into a crash instead of the documented 401.
+func TestNilAuthenticatorAdapterIsRejectedNotPanicked(t *testing.T) {
+	authority := auth.NewAuthority()
+	var absent webapi.AuthenticatorFunc
+	if absent == nil {
+		// Kept explicit: the value is nil as a func but not as an interface.
+		t.Log("the adapter holds no function")
+	}
+	_, err := webapi.NewAuthenticatedHandler(
+		nil, "127.0.0.1:0", absent, authority.Binder())
+	if !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) ||
+		!strings.Contains(err.Error(), "authenticator") {
+		t.Fatalf("nil authenticator adapter error = %v", err)
+	}
+
+	var absentBinder *authnAbsentBinder
+	_, err = webapi.NewAuthenticatedHandler(
+		nil,
+		"127.0.0.1:0",
+		webapi.AuthenticatorFunc(authnAuthenticate),
+		absentBinder,
+	)
+	if !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) ||
+		!strings.Contains(err.Error(), "binder") {
+		t.Fatalf("nil binder error = %v", err)
+	}
+
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/meta", nil)
+	decision, err := absent.Authenticate(request)
+	if !shoal.IsErrorCode(err, shoal.ErrorUnauthorized) {
+		t.Fatalf("nil adapter authenticate error = %v", err)
+	}
+	if decision.Subject() != "" {
+		t.Fatalf("nil adapter returned a subject: %q", decision.Subject())
+	}
+}
+
+// authnAbsentBinder exists only to be used as a typed nil pointer.
+type authnAbsentBinder struct{}
+
+func (*authnAbsentBinder) Bind(
+	ctx context.Context, _ auth.Decision,
+) (context.Context, error) {
+	return ctx, nil
+}
+
 func TestUnauthenticatedRequestsAreDenied(t *testing.T) {
 	fixture := newAuthnFixture(t)
 	for _, route := range fixture.routes(t) {
