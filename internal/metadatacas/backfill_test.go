@@ -209,6 +209,69 @@ func TestBackfillWriterReportsAnAmbiguousOutcome(t *testing.T) {
 	}
 }
 
+// TestBackfillWriterCachesMetadataRouting: Run calls this once per file,
+// and locateMetadataTarget re-derives routing from a LocateTable call,
+// which is a root-tablet scan. Without a cache a table with a million
+// files costs a million routing scans, which is enough for an operator
+// to reasonably decline to run the migration at all.
+//
+// A rejection drops the cache, because a rejection is also what a stale
+// route produces and continuing to send every remaining file to a tablet
+// that moved would be worse than paying for one extra scan.
+func TestBackfillWriterCachesMetadataRouting(t *testing.T) {
+	cluster, writer := newBackfillFixture(t)
+	for i := 0; i < 5; i++ {
+		target := backfillTarget()
+		// A distinct entry each time so the column-absent condition
+		// holds and every write is a real accepted write.
+		entry := backfillEntry[:len(backfillEntry)-1] + `,"n":` + string(rune('0'+i)) + `}`
+		target.FileQualifier = []byte(entry)
+		cluster.mu.Lock()
+		cluster.cells[cell(metadata.CFFile, entry)] = []byte("100,10")
+		cluster.mu.Unlock()
+		applied, err := writer.WriteFileEmbedding(
+			context.Background(), target, embeddingspace.Has("space-a"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !applied {
+			t.Fatalf("write %d was not applied", i)
+		}
+	}
+	cluster.mu.Lock()
+	calls := cluster.locateCalls
+	cluster.mu.Unlock()
+	if calls != 1 {
+		t.Fatalf("LocateTable called %d times for 5 files, want 1: routing must be cached", calls)
+	}
+
+	// A rejected write invalidates, so the next file re-resolves.
+	rejected := backfillTarget()
+	rejected.FileValue = []byte("nope")
+	cluster.mu.Lock()
+	cluster.cells[cell(metadata.CFFile, backfillEntry)] = []byte("100,10")
+	cluster.mu.Unlock()
+	if applied, err := writer.WriteFileEmbedding(
+		context.Background(), rejected, embeddingspace.Has("space-a")); err != nil || applied {
+		t.Fatalf("applied = %v, err = %v; want a rejection", applied, err)
+	}
+	next := backfillTarget()
+	next.FileQualifier = []byte(backfillEntry[:len(backfillEntry)-1] + `,"n":9}`)
+	cluster.mu.Lock()
+	cluster.cells[cell(metadata.CFFile, string(next.FileQualifier))] = []byte("100,10")
+	cluster.mu.Unlock()
+	if applied, err := writer.WriteFileEmbedding(
+		context.Background(), next, embeddingspace.Has("space-a")); err != nil || !applied {
+		t.Fatalf("applied = %v, err = %v; want the follow-up write to land", applied, err)
+	}
+	cluster.mu.Lock()
+	afterReject := cluster.locateCalls
+	cluster.mu.Unlock()
+	if afterReject != 2 {
+		t.Fatalf("LocateTable calls = %d after a rejection, want the cached route dropped", afterReject)
+	}
+}
+
 // TestUndeclaredCommitEncodesUnknown covers the other write path this
 // package owns. encodeFileEmbedding turns a commit into the durable
 // file.embedding column, so a commit that declared nothing must be

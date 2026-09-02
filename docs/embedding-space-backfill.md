@@ -83,6 +83,25 @@ its metadata lives in ZooKeeper behind a different mutation path owned by
 whichever server hosts it. A table id that locates no tablets is also
 refused, so a typo cannot report a completed zero-file migration.
 
+## Cost
+
+Resolving which metadata tablet holds a given row is a root-tablet scan.
+Because the backfill visits every file in a table, doing that per file
+would make a large migration cost one routing scan per file. The writer
+therefore caches the metadata table's routing for the pass.
+
+The cache is only ever an optimisation. It is dropped whenever a write
+fails, is rejected, or returns an ambiguous outcome, and whenever the
+cached routing no longer contains the row being written — so a split or a
+tablet that moved mid-run costs one extra scan rather than stalling or
+misdirecting the remainder of the migration. Correctness never rests on
+the cache: the conditional write's own preconditions decide whether a
+mutation applies.
+
+Each conditional write is its own session, which is the shape of the
+shared `ingestclient` conditional API used by every writer in the tree,
+not something the backfill introduces.
+
 ## Declaring a default instead
 
 An operator who knows an ingest pipeline emits no vectors can say so

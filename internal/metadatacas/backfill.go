@@ -9,6 +9,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"sync/atomic"
 
 	"github.com/phrocker/shoal-oss/internal/cclient"
@@ -88,6 +89,55 @@ type BackfillWriter struct {
 	locator RootLocator
 	writer  ConditionalWriter
 	next    atomic.Int64
+	routes  *metadataRouteCache
+}
+
+// metadataRouteCache memoizes the metadata table's tablet routing for
+// the duration of a backfill pass.
+//
+// locateMetadataTarget re-derives routing from a LocateTable call, which
+// is one root-tablet scan. The tablet authority pays that once per
+// commit, but a backfill visits every file in a table, so the same code
+// would issue a routing scan per file and make a large migration cost
+// millions of avoidable metadata RPCs — enough that an operator would
+// reasonably decline to run it.
+//
+// The cache is only ever an optimisation: it is dropped whenever a write
+// fails or is rejected, so a split or a moved tablet is re-resolved on
+// the next attempt, and the conditional write's own preconditions remain
+// the thing that decides whether a mutation is safe to apply.
+type metadataRouteCache struct {
+	reader  TabletReader
+	mu      sync.Mutex
+	tablets []metadata.TabletInfo
+}
+
+func (c *metadataRouteCache) LocateTable(
+	ctx context.Context, tableID string,
+) ([]metadata.TabletInfo, error) {
+	if tableID != metadata.MetadataTableID {
+		return c.reader.LocateTable(ctx, tableID)
+	}
+	c.mu.Lock()
+	cached := c.tablets
+	c.mu.Unlock()
+	if cached != nil {
+		return cached, nil
+	}
+	tablets, err := c.reader.LocateTable(ctx, tableID)
+	if err != nil {
+		return nil, err
+	}
+	c.mu.Lock()
+	c.tablets = tablets
+	c.mu.Unlock()
+	return tablets, nil
+}
+
+func (c *metadataRouteCache) invalidate() {
+	c.mu.Lock()
+	c.tablets = nil
+	c.mu.Unlock()
 }
 
 // NewBackfillWriter builds a writer over the same seams the tablet
@@ -98,7 +148,8 @@ func NewBackfillWriter(
 	if reader == nil || locator == nil || writer == nil {
 		return nil, ErrInvalidConfig
 	}
-	w := &BackfillWriter{reader: reader, locator: locator, writer: writer}
+	routes := &metadataRouteCache{reader: reader}
+	w := &BackfillWriter{reader: routes, locator: locator, writer: writer, routes: routes}
 	w.next.Store(1)
 	return w, nil
 }
@@ -157,7 +208,15 @@ func (w *BackfillWriter) WriteFileEmbedding(
 	}
 	address, tableID, extent, err := locateMetadataTarget(ctx, w.reader, w.locator, target.TableID, row)
 	if err != nil {
-		return false, err
+		// A cached route that no longer contains the row surfaces here.
+		// Drop it and re-resolve once before giving up, so a split that
+		// happened during the pass costs one extra scan rather than
+		// stalling the whole migration.
+		w.routes.invalidate()
+		address, tableID, extent, err = locateMetadataTarget(ctx, w.reader, w.locator, target.TableID, row)
+		if err != nil {
+			return false, err
+		}
 	}
 	mutation, err := cclient.NewMutation(row)
 	if err != nil {
@@ -195,18 +254,28 @@ func (w *BackfillWriter) WriteFileEmbedding(
 			Conditions: conditions, Mutation: wireMutation, ID: w.next.Add(1),
 		})
 	if err != nil {
+		// The route the write was sent to may be why it failed, so it
+		// is not trusted again.
+		w.routes.invalidate()
 		return false, err
 	}
 	switch status {
 	case ingestclient.ConditionalAccepted:
 		return true, nil
 	case ingestclient.ConditionalRejected:
+		// A rejection is usually a changed entry, but it is also what a
+		// stale route produces. Re-resolving costs one scan and only on
+		// the rare path, which is the right trade against a cache that
+		// could otherwise keep sending every remaining file to a tablet
+		// that moved.
+		w.routes.invalidate()
 		return false, nil
 	default:
 		// An unknown outcome must not be reported as a clean skip: the
 		// write may have landed. Reporting it surfaces the file to the
 		// operator, and the next run's absent-column condition settles
 		// which way it went.
+		w.routes.invalidate()
 		return false, fmt.Errorf("%w: conditional write outcome is unknown", ErrRejected)
 	}
 }

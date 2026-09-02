@@ -126,7 +126,7 @@ func runEmbeddingBackfill(args []string, stdout, stderr io.Writer) error {
 		// outstanding has not converged, and a script that treated this
 		// run as success would move on from a table that still refuses
 		// compaction.
-		return errors.New("backfill incomplete; see the unresolvable entries above")
+		return errors.New("backfill incomplete; see the outstanding entries above")
 	}
 	return nil
 }
