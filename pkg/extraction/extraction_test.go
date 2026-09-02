@@ -213,6 +213,8 @@ func TestOntologyAssertionsRecordThePinnedOntologyVersion(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The heuristic extractor emits entities and no assertions, so the model
+	// path is the only one with an ontology identity to record.
 	for name, result := range map[string]Result{
 		"model": extractWith(t, f.request, validOutput(f)),
 	} {
