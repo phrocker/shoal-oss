@@ -155,13 +155,20 @@ func (r fixedGenerationReader) CurrentPolicyGeneration(
 	return r.generation, nil
 }
 
-// listenAddressIsLoopback reports whether a resolved listener address is bound
-// exclusively to loopback interfaces.
+// lookupListenHost resolves a listen hostname to its addresses. It is a
+// variable so tests can pin the multi-address cases that DNS cannot be relied
+// on to produce.
+var lookupListenHost = net.LookupIP
+
+// listenAddressIsLoopback reports whether a listen address is bound
+// exclusively to loopback interfaces. It resolves names but never binds, so it
+// classifies both the requested flag value and the resolved listener address.
 //
 // An unspecified address binds every interface and is never loopback, so
 // ":8080", "0.0.0.0:8080", and "[::]:8080" are all rejected. Literal addresses
 // are classified by net.IP.IsLoopback. A hostname is loopback only when every
-// address it resolves to is loopback; an unresolvable name is not loopback.
+// address it resolves to is loopback: one non-loopback candidate makes the
+// whole bind non-loopback, and an unresolvable name is not loopback.
 func listenAddressIsLoopback(address string) bool {
 	host, port, err := net.SplitHostPort(address)
 	if err != nil || host == "" || port == "" {
@@ -173,7 +180,7 @@ func listenAddressIsLoopback(address string) bool {
 		}
 		return ip.IsLoopback()
 	}
-	resolved, err := net.LookupIP(host)
+	resolved, err := lookupListenHost(host)
 	if err != nil || len(resolved) == 0 {
 		return false
 	}

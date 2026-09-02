@@ -48,6 +48,11 @@ func main() {
 	}
 }
 
+// listenTCP opens the workspace listener. It is a variable so tests can prove
+// that a refused address is never bound, and that a listener whose resolved
+// address is wider than the requested one is still refused and closed.
+var listenTCP = net.Listen
+
 func run(ctx context.Context, args []string, output io.Writer) error {
 	flags := flag.NewFlagSet("shoal-explore-web", flag.ContinueOnError)
 	backend := flags.String("backend", "embedded", "Explorer backend: embedded or remote")
@@ -94,12 +99,21 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 		return err
 	}
 
-	listener, err := net.Listen("tcp", *listen)
+	// The requested address is classified and refused before anything is
+	// bound, so an address the workspace may not serve never opens a socket
+	// and never prompts an operator to approve exposure the program has
+	// already decided against.
+	if _, err := selectAuthenticator(*developmentAuth, *listen, time.Now); err != nil {
+		return err
+	}
+	listener, err := listenTCP("tcp", *listen)
 	if err != nil {
 		return fmt.Errorf("listen on %s: %w", *listen, err)
 	}
-	// Identity is decided from the resolved listener address, before the
-	// corpus is opened and before any request can be served.
+	// Defence in depth. The resolved listener address is authoritative: it may
+	// be wider than the requested one, and the check above may be incomplete.
+	// Identity is decided from it, and a refusal closes the listener here,
+	// before the corpus is opened and before any request can be served.
 	authenticator, err := selectAuthenticator(
 		*developmentAuth, listener.Addr().String(), time.Now)
 	if err != nil {

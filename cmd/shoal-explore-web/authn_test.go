@@ -21,8 +21,10 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"mime/multipart"
+	"net"
 	"net/http"
 	"strings"
 	"testing"
@@ -57,6 +59,147 @@ func TestListenAddressIsLoopback(t *testing.T) {
 					testCase.address, got, testCase.loopback)
 			}
 		})
+	}
+}
+
+// TestListenAddressIsLoopbackResolvesHostnamesClosed pins the ambiguity rule
+// for names: every resolved address must be loopback, and an unresolvable or
+// empty answer is never loopback. DNS cannot be relied on to produce these
+// answers, so resolution is stubbed.
+func TestListenAddressIsLoopbackResolvesHostnamesClosed(t *testing.T) {
+	original := lookupListenHost
+	t.Cleanup(func() { lookupListenHost = original })
+	cases := []struct {
+		name     string
+		resolved []net.IP
+		err      error
+		loopback bool
+	}{
+		{"only IPv4 loopback", []net.IP{net.ParseIP("127.0.0.1")}, nil, true},
+		{
+			"both loopback families",
+			[]net.IP{net.ParseIP("127.0.0.1"), net.ParseIP("::1")},
+			nil,
+			true,
+		},
+		{
+			"loopback and routable",
+			[]net.IP{net.ParseIP("127.0.0.1"), net.ParseIP("10.0.0.5")},
+			nil,
+			false,
+		},
+		{
+			"routable first",
+			[]net.IP{net.ParseIP("203.0.113.7"), net.ParseIP("127.0.0.1")},
+			nil,
+			false,
+		},
+		{
+			"loopback and unspecified",
+			[]net.IP{net.ParseIP("127.0.0.1"), net.ParseIP("0.0.0.0")},
+			nil,
+			false,
+		},
+		{"no addresses", nil, nil, false},
+		{"resolution failed", nil, errors.New("no such host"), false},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			lookupListenHost = func(string) ([]net.IP, error) {
+				return testCase.resolved, testCase.err
+			}
+			if got := listenAddressIsLoopback(
+				"workspace.example:8080"); got != testCase.loopback {
+				t.Fatalf(
+					"listenAddressIsLoopback = %t, want %t", got, testCase.loopback)
+			}
+		})
+	}
+}
+
+// TestRunRefusesRequestedAddressWithoutBinding proves the refused address is
+// classified before anything is bound, so no socket is ever opened on an
+// address the workspace may not serve.
+func TestRunRefusesRequestedAddressWithoutBinding(t *testing.T) {
+	cases := []struct {
+		name string
+		args []string
+	}{
+		{"all interfaces", []string{"-listen", "0.0.0.0:0", "-dev-auth"}},
+		{"bare port", []string{"-listen", ":0", "-dev-auth"}},
+		{"IPv6 wildcard", []string{"-listen", "[::]:0", "-dev-auth"}},
+		{"routable address", []string{"-listen", "203.0.113.7:0", "-dev-auth"}},
+		{"no authenticator", []string{"-listen", "127.0.0.1:0"}},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			original := listenTCP
+			t.Cleanup(func() { listenTCP = original })
+			bound := false
+			listenTCP = func(network, address string) (net.Listener, error) {
+				bound = true
+				return nil, errors.New("the refused address was bound")
+			}
+			err := runBounded(
+				t, append(append([]string{}, testCase.args...), "-data", t.TempDir()))
+			if err == nil {
+				t.Fatal("a refused address started the server")
+			}
+			if bound {
+				t.Fatalf("the refused address was bound before refusal: %v", err)
+			}
+			if !strings.Contains(err.Error(), "refusing to serve") {
+				t.Fatalf("unclear diagnostic: %v", err)
+			}
+		})
+	}
+}
+
+// widenedListener reports a resolved address wider than the one that was
+// requested, standing in for a bind that opens more than it was asked to.
+type widenedListener struct {
+	net.Listener
+	closed bool
+}
+
+func (l *widenedListener) Addr() net.Addr {
+	return &net.TCPAddr{IP: net.ParseIP("198.51.100.7"), Port: 9999}
+}
+
+func (l *widenedListener) Close() error {
+	l.closed = true
+	return l.Listener.Close()
+}
+
+// TestRunRefusesWidenedResolvedAddress proves the post-bind check is
+// independently load-bearing: a listener whose resolved address is not
+// loopback is refused and closed even though the requested address passed.
+func TestRunRefusesWidenedResolvedAddress(t *testing.T) {
+	original := listenTCP
+	t.Cleanup(func() { listenTCP = original })
+	var widened *widenedListener
+	listenTCP = func(network, address string) (net.Listener, error) {
+		inner, err := original(network, address)
+		if err != nil {
+			return nil, err
+		}
+		widened = &widenedListener{Listener: inner}
+		return widened, nil
+	}
+	err := runBounded(t, []string{
+		"-listen", "127.0.0.1:0", "-dev-auth", "-data", t.TempDir(),
+	})
+	if err == nil {
+		t.Fatal("the server served a listener resolved to a non-loopback address")
+	}
+	if !strings.Contains(err.Error(), "refusing to serve") {
+		t.Fatalf("unclear diagnostic: %v", err)
+	}
+	if widened == nil {
+		t.Fatal("the listener was never opened")
+	}
+	if !widened.closed {
+		t.Fatal("the refused listener was left open")
 	}
 }
 
