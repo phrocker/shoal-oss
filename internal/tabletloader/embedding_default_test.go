@@ -5,6 +5,7 @@
 package tabletloader
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/phrocker/shoal-oss/internal/embeddingspace"
@@ -23,6 +24,25 @@ func TestValidateResolvedFilesAbsentEmbeddingIsUnknown(t *testing.T) {
 	}
 	if got := files[0].Embedding; got != embeddingspace.Unknown() {
 		t.Fatalf("absent embedding = %+v, want unknown", got)
+	}
+}
+
+// TestValidateResolvedFilesRejectsPartialEmbedding: an identity with no
+// state is malformed resolver output, not an absent column. Defaulting
+// it to unknown would hide it from the Validate below and admit an
+// invalid reference into the loaded tablet.
+func TestValidateResolvedFilesRejectsPartialEmbedding(t *testing.T) {
+	files := []DataFile{{
+		Path: "hdfs://nn/tables/2k/A.rf", Size: 10, NumEntries: 1,
+		RawQualifier: []byte("A"),
+		Embedding:    embeddingspace.FileState{Identity: "space-a"},
+	}}
+	err := validateResolvedFiles(files)
+	if !errors.Is(err, ErrInvalidReference) {
+		t.Fatalf("err = %v, want ErrInvalidReference", err)
+	}
+	if got := files[0].Embedding; got == embeddingspace.Unknown() {
+		t.Fatal("a partial state was normalized to unknown instead of refused")
 	}
 }
 

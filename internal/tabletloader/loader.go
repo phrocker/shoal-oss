@@ -400,10 +400,14 @@ func validateConfig(tableID string, snapshot ConfigurationSnapshot) error {
 func validateResolvedFiles(files []DataFile) error {
 	seen := make(map[string]struct{}, len(files))
 	for i, file := range files {
-		if file.Embedding.State == "" {
+		if file.Embedding == (embeddingspace.FileState{}) {
 			// A resolved file that carries no decoded embedding column
 			// is unknown, never no_embeddings: this is a read path and
 			// it has been told nothing.
+			//
+			// Only the exact zero value counts as "no column". A partial
+			// state is malformed resolver output and must reach the
+			// Validate below and be refused, not be quietly replaced.
 			file.Embedding = embeddingspace.Unknown()
 			files[i].Embedding = file.Embedding
 		}

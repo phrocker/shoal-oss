@@ -682,9 +682,15 @@ func encodeFileEmbedding(state embeddingspace.FileState) ([]byte, error) {
 // mincauthority.Config.DefaultEmbedding — instead of having it invented
 // here, where nothing has any basis for the claim.
 func normalizedEmbedding(state embeddingspace.FileState) embeddingspace.FileState {
-	if state.State == "" {
+	if state == (embeddingspace.FileState{}) {
 		return embeddingspace.Unknown()
 	}
+	// Anything else is returned untouched, including a malformed partial
+	// state. Only the exact zero value means "declared nothing";
+	// normalizing a partial state would both persist something other
+	// than what the caller supplied, by hiding it from Encode's
+	// validation, and make a malformed reconciliation request compare
+	// equal to a stored unknown.
 	return state
 }
 

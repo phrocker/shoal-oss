@@ -245,3 +245,21 @@ func TestUndeclaredCommitEncodesUnknown(t *testing.T) {
 		}
 	}
 }
+
+// TestPartialCommitEmbeddingIsRefused: an identity with no state is
+// malformed, not undeclared. Normalizing it to unknown would persist
+// something other than what the caller supplied by hiding it from
+// Encode's validation, and would let a malformed reconciliation request
+// compare equal to a stored unknown and be accepted as consistent.
+func TestPartialCommitEmbeddingIsRefused(t *testing.T) {
+	partial := embeddingspace.FileState{Identity: "space-a"}
+	if _, err := encodeFileEmbedding(partial); err == nil {
+		t.Fatal("a partial embedding state was encoded instead of refused")
+	}
+	if got := normalizedEmbedding(partial); got != partial {
+		t.Fatalf("normalizedEmbedding(%+v) = %+v, want it returned untouched", partial, got)
+	}
+	if got := normalizedEmbedding(embeddingspace.FileState{}); got != embeddingspace.Unknown() {
+		t.Fatalf("normalizedEmbedding(zero) = %+v, want unknown", got)
+	}
+}
