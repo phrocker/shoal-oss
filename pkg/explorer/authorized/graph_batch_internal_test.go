@@ -21,6 +21,7 @@ package authorized
 
 import (
 	"context"
+	"errors"
 	"reflect"
 	"testing"
 	"time"
@@ -570,28 +571,119 @@ func TestMemoryPolicyStoreBatchFailsOnTheFirstFailingIdentifier(t *testing.T) {
 	}
 }
 
-// TestMemoryPolicyStoreBatchObservesCancellationMidBatch confirms the context
-// is rechecked for every identifier, as a point loop would, instead of once
-// before the batch begins.
-func TestMemoryPolicyStoreBatchObservesCancellationMidBatch(t *testing.T) {
+// TestMemoryPolicyStoreBatchSpendsContextChecksLikeAPointLoop compares a batch
+// against the equivalent point loop under a context that tolerates a fixed
+// number of Err checks. Asserting the two agree for every budget pins both
+// halves of the contract at once: the context must be rechecked for every
+// identifier rather than once before the batch, and each identifier must be
+// charged exactly one check rather than the first paying twice for a precheck.
+func TestMemoryPolicyStoreBatchSpendsContextChecksLikeAPointLoop(t *testing.T) {
+	nodeIDs := []shoal.ID{"node-a", "node-b", "node-c"}
+	edgeIDs := []shoal.ID{"edge-a", "edge-b", "edge-c"}
+	for budget := 0; budget <= len(nodeIDs)+1; budget++ {
+		for size := 1; size <= len(nodeIDs); size++ {
+			store := NewMemoryPolicyStore()
+
+			remaining := budget
+			loopCtx := countdownContext{
+				Context: context.Background(), remaining: &remaining,
+			}
+			var wantNodeErr error
+			for _, nodeID := range nodeIDs[:size] {
+				if _, _, err := store.Node(loopCtx, nodeID); err != nil {
+					wantNodeErr = err
+					break
+				}
+			}
+
+			remaining = budget
+			_, gotNodeErr := store.Nodes(loopCtx, nodeIDs[:size])
+			if !sameErrorCode(gotNodeErr, wantNodeErr) {
+				t.Fatalf(
+					"budget %d size %d: Nodes error = %v, Node loop error = %v",
+					budget, size, gotNodeErr, wantNodeErr)
+			}
+
+			remaining = budget
+			var wantEdgeErr error
+			for _, edgeID := range edgeIDs[:size] {
+				if _, _, err := store.Edge(loopCtx, edgeID); err != nil {
+					wantEdgeErr = err
+					break
+				}
+			}
+
+			remaining = budget
+			_, gotEdgeErr := store.Edges(loopCtx, edgeIDs[:size])
+			if !sameErrorCode(gotEdgeErr, wantEdgeErr) {
+				t.Fatalf(
+					"budget %d size %d: Edges error = %v, Edge loop error = %v",
+					budget, size, gotEdgeErr, wantEdgeErr)
+			}
+		}
+	}
+}
+
+// TestMemoryPolicyStoreEmptyBatchStillChecksContext covers the one case the
+// per-identifier check cannot reach. With nothing to iterate, a cancelled
+// context must still be reported rather than answered with an empty result,
+// which would read as "nothing is registered" and silently deny.
+func TestMemoryPolicyStoreEmptyBatchStillChecksContext(t *testing.T) {
 	store := NewMemoryPolicyStore()
-	budget := 2
-	ctx := countdownContext{Context: context.Background(), remaining: &budget}
-	if _, err := store.Nodes(ctx, []shoal.ID{"node-a"}); err != nil {
-		t.Fatalf("single identifier batch within budget failed: %v", err)
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := store.Nodes(cancelled, nil); !shoal.IsErrorCode(
+		err, shoal.ErrorCanceled,
+	) {
+		t.Fatalf("empty node batch error = %v, want cancellation", err)
 	}
-	budget = 2
-	if _, err := store.Nodes(
-		ctx, []shoal.ID{"node-a", "node-b"},
-	); !shoal.IsErrorCode(err, shoal.ErrorCanceled) {
-		t.Fatalf("node batch error = %v, want cancellation observed mid-batch", err)
+	if _, err := store.Edges(cancelled, nil); !shoal.IsErrorCode(
+		err, shoal.ErrorCanceled,
+	) {
+		t.Fatalf("empty edge batch error = %v, want cancellation", err)
 	}
-	budget = 2
-	if _, err := store.Edges(
-		ctx, []shoal.ID{"edge-a", "edge-b"},
-	); !shoal.IsErrorCode(err, shoal.ErrorCanceled) {
-		t.Fatalf("edge batch error = %v, want cancellation observed mid-batch", err)
+	// A live empty request under a healthy context resolves to an empty result
+	// rather than an error.
+	resolvedNodes, err := store.Nodes(context.Background(), nil)
+	if err != nil || len(resolvedNodes) != 0 {
+		t.Fatalf("empty node batch = %#v err = %v", resolvedNodes, err)
 	}
+	resolvedEdges, err := store.Edges(context.Background(), nil)
+	if err != nil || len(resolvedEdges) != 0 {
+		t.Fatalf("empty edge batch = %#v err = %v", resolvedEdges, err)
+	}
+	// A nil receiver reports catalog-unavailable even with nothing to look up.
+	var nilStore *MemoryPolicyStore
+	if _, err := nilStore.Nodes(context.Background(), nil); !shoal.IsErrorCode(
+		err, shoal.ErrorUnavailable,
+	) {
+		t.Fatalf("nil store empty node batch error = %v", err)
+	}
+	if _, err := nilStore.Edges(context.Background(), nil); !shoal.IsErrorCode(
+		err, shoal.ErrorUnavailable,
+	) {
+		t.Fatalf("nil store empty edge batch error = %v", err)
+	}
+}
+
+// sameErrorCode compares two results by shoal error code, treating success as
+// its own outcome, which is the granularity these contracts are stated at.
+func sameErrorCode(left, right error) bool {
+	if (left == nil) != (right == nil) {
+		return false
+	}
+	if left == nil {
+		return true
+	}
+	return shoalErrorCode(left) == shoalErrorCode(right)
+}
+
+func shoalErrorCode(err error) shoal.ErrorCode {
+	var typed *shoal.Error
+	if errors.As(err, &typed) && typed != nil {
+		return typed.Code
+	}
+	return ""
 }
 
 // TestEdgeAllowsBatchesEndpointsInOneRequest guards the edgeAllows path that

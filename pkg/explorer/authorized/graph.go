@@ -295,16 +295,17 @@ func (c *Client) edgeAllows(
 // registeredNodes holds the node registrations resolved for one page in a
 // single batch lookup. Membership is the only presence signal, exactly as the
 // boolean returned by PolicyStore.Node is: an identifier that is absent was not
-// registered and therefore denies. A partial or empty batch result consequently
-// authorizes nothing.
+// registered and therefore denies. A partial result therefore authorizes only
+// the identifiers it does carry, and an empty one authorizes nothing.
 type registeredNodes map[shoal.ID]NodeRegistration
 
-// resolveNodes collapses every identifier a page needs into one policy-store
-// round trip, deduplicating first so the round trip carries distinct nodes
-// rather than one entry per edge endpoint. Identifiers the store does not know
-// are omitted from the result, preserving the fail-closed path a point lookup
-// takes when it reports !ok. Registrations for identifiers that were not
-// requested are discarded so a misbehaving store cannot widen a page.
+// resolveNodes collapses the identifiers it is given into a single policy-store
+// round trip, or none at all when there is nothing to resolve, deduplicating
+// first so the round trip carries distinct nodes rather than one entry per edge
+// endpoint. Identifiers the store does not know are omitted from the result,
+// preserving the fail-closed path a point lookup takes when it reports !ok.
+// Registrations for identifiers that were not requested are discarded so a
+// misbehaving store cannot widen a page.
 func (c *Client) resolveNodes(
 	ctx context.Context,
 	nodeIDs []shoal.ID,

@@ -110,12 +110,17 @@ type PolicyStore interface {
 	Node(context.Context, shoal.ID) (NodeRegistration, bool, error)
 	// Nodes resolves many node registrations in one round trip. For every
 	// identifier it is given it must report exactly what Node would report for
-	// that identifier, and must fail with exactly the error the equivalent Node
-	// loop would fail with, including argument-validation order. Presence is
-	// reported by map membership exactly as Node reports it by its boolean: an
-	// identifier that is absent from the returned map is unregistered, which
-	// callers must treat as the fail-closed deny path. Implementations must
-	// never report an identifier that was not requested.
+	// that identifier, and it must fail with the error the equivalent Node loop
+	// fails with, in the same request order: an earlier identifier's failure
+	// takes precedence over a later one's. Presence is reported by map
+	// membership exactly as Node reports it by its boolean: an identifier that
+	// is absent from the returned map is unregistered, which callers must treat
+	// as the fail-closed deny path. Implementations must never report an
+	// identifier that was not requested.
+	//
+	// Implementations may resolve a repeated identifier once, and may check the
+	// context and their own availability for an empty request where a Node loop
+	// would make no call at all. Callers must not depend on either.
 	Nodes(context.Context, []shoal.ID) (map[shoal.ID]NodeRegistration, error)
 	ReserveEdge(context.Context, EdgeRegistration) error
 	RollbackEdgeReservation(context.Context, EdgeRegistration) error
@@ -678,37 +683,46 @@ func (s *MemoryPolicyStore) Node(
 // one round trip. Each identifier is processed in request order and takes
 // exactly the steps Node takes for it — context check, argument validation,
 // then lookup and clone — so both the per-identifier result and the error the
-// batch fails with are the ones the equivalent Node loop produces. A context
-// cancelled partway through the batch, a malformed identifier, and a
-// registration that fails to clone therefore all surface in the same order they
-// would one call at a time. Unregistered identifiers are omitted from the
-// result rather than reported as an error, so absence is the same fail-closed
-// signal Node reports with a false boolean.
+// batch fails with are the ones the equivalent Node loop produces, and each
+// identifier is charged exactly one context check. A context cancelled partway
+// through the batch, a malformed identifier, and a registration that fails to
+// clone therefore all surface in the same order they would one call at a time.
+// Unregistered identifiers are omitted from the result rather than reported as
+// an error, so absence is the same fail-closed signal Node reports with a false
+// boolean.
 //
-// Two deliberate differences from a literal Node loop remain. Repeated
+// Three deliberate differences from a literal Node loop remain. Repeated
 // identifiers are looked up once, though the context is still checked for every
 // occurrence. An empty request checks the context and the receiver, where a
-// Node loop would make no call at all. The read lock is also held for the whole
-// batch, so the result is a single consistent snapshot rather than a sequence
-// of independently locked reads.
+// Node loop would make no call at all, so a cancelled context is still reported
+// rather than answered with an empty result. The read lock is held for the
+// whole batch, so the result is a single consistent snapshot rather than a
+// sequence of independently locked reads.
 func (s *MemoryPolicyStore) Nodes(
 	ctx context.Context,
 	nodeIDs []shoal.ID,
 ) (map[shoal.ID]NodeRegistration, error) {
-	if err := contextFailure(ctx); err != nil {
-		return nil, err
-	}
-	if s == nil {
-		// A Node loop over a nil receiver fails on its first identifier, but
-		// only after that identifier has been validated.
-		if len(nodeIDs) > 0 {
-			if err := shoal.ValidateRequiredID(
-				"graph node ID", nodeIDs[0],
-			); err != nil {
-				return nil, err
-			}
+	if s == nil || len(nodeIDs) == 0 {
+		// The per-identifier context check below cannot run for these two
+		// cases, so it happens here instead. Doing it unconditionally would
+		// charge the first identifier of a live batch two checks where a Node
+		// loop charges one.
+		if err := contextFailure(ctx); err != nil {
+			return nil, err
 		}
-		return nil, catalogUnavailable()
+		if s == nil {
+			// A Node loop over a nil receiver fails on its first identifier,
+			// but only after that identifier has been validated.
+			if len(nodeIDs) > 0 {
+				if err := shoal.ValidateRequiredID(
+					"graph node ID", nodeIDs[0],
+				); err != nil {
+					return nil, err
+				}
+			}
+			return nil, catalogUnavailable()
+		}
+		return map[shoal.ID]NodeRegistration{}, nil
 	}
 	attempted := make(map[shoal.ID]struct{}, len(nodeIDs))
 	resolved := make(map[shoal.ID]NodeRegistration, len(nodeIDs))
@@ -879,29 +893,33 @@ func (s *MemoryPolicyStore) Edge(
 
 // Edges returns the requested edge registrations in one round trip under
 // exactly the contract Nodes carries for node registrations, with Edge in place
-// of Node: each identifier is processed in request order and takes the same
-// steps Edge takes for it, so the per-identifier result and the failing error
-// are the ones the equivalent Edge loop produces, including a context cancelled
-// partway through the batch and a registration that fails to clone.
-// Unregistered identifiers are omitted rather than reported as an error, and
-// the same two deliberate differences apply: repeated identifiers are looked up
-// once, and an empty request still checks the context and the receiver.
+// of Node: each identifier is processed in request order, takes the same steps
+// Edge takes for it, and is charged exactly one context check, so the
+// per-identifier result and the failing error are the ones the equivalent Edge
+// loop produces, including a context cancelled partway through the batch and a
+// registration that fails to clone. Unregistered identifiers are omitted rather
+// than reported as an error, and the same three deliberate differences apply:
+// repeated identifiers are looked up once, an empty request still checks the
+// context and the receiver, and the read lock is held for the whole batch.
 func (s *MemoryPolicyStore) Edges(
 	ctx context.Context,
 	edgeIDs []shoal.ID,
 ) (map[shoal.ID]EdgeRegistration, error) {
-	if err := contextFailure(ctx); err != nil {
-		return nil, err
-	}
-	if s == nil {
-		if len(edgeIDs) > 0 {
-			if err := shoal.ValidateRequiredID(
-				"graph edge ID", edgeIDs[0],
-			); err != nil {
-				return nil, err
-			}
+	if s == nil || len(edgeIDs) == 0 {
+		if err := contextFailure(ctx); err != nil {
+			return nil, err
 		}
-		return nil, catalogUnavailable()
+		if s == nil {
+			if len(edgeIDs) > 0 {
+				if err := shoal.ValidateRequiredID(
+					"graph edge ID", edgeIDs[0],
+				); err != nil {
+					return nil, err
+				}
+			}
+			return nil, catalogUnavailable()
+		}
+		return map[shoal.ID]EdgeRegistration{}, nil
 	}
 	attempted := make(map[shoal.ID]struct{}, len(edgeIDs))
 	resolved := make(map[shoal.ID]EdgeRegistration, len(edgeIDs))

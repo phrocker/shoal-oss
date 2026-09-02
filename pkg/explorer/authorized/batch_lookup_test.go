@@ -498,8 +498,9 @@ func TestNeighborhoodRoundTripLatencyTracksBatchCount(t *testing.T) {
 	// ceiling is nondeterministic — Sleep guarantees only a minimum, so a
 	// loaded host can push a correctly batched call past any budget — and it is
 	// simultaneously too loose to catch a real regression, because a handful of
-	// reintroduced per-edge lookups stays comfortably under it. The counters
-	// measure the same property exactly.
+	// reintroduced per-edge lookups stays comfortably under it. Round-trip
+	// count is the property this test exists to bound, and the counters measure
+	// it directly rather than through elapsed time.
 	if trips.total() >= perItemBaseline {
 		t.Fatalf("policy store reads = %d, want fewer than the %d per-item lookups",
 			trips.total(), perItemBaseline)
@@ -594,7 +595,9 @@ func TestBoundedNeighborhoodDeniesNodeMissingFromBatchResult(t *testing.T) {
 }
 
 // TestNeighborhoodDeniesEveryEdgeWhenBatchResultIsEmpty verifies a wholesale
-// empty batch result authorizes nothing rather than degrading to an allow.
+// empty batch result authorizes nothing. Because the seed itself is then
+// unresolvable, this surfaces as an inconsistent-base error rather than an
+// empty page, which is still a denial and never a degradation to an allow.
 func TestNeighborhoodDeniesEveryEdgeWhenBatchResultIsEmpty(t *testing.T) {
 	f, client, counting, documents := batchFixture(t, 3)
 	admin := f.admin(t)
