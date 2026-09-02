@@ -401,7 +401,10 @@ func validateResolvedFiles(files []DataFile) error {
 	seen := make(map[string]struct{}, len(files))
 	for i, file := range files {
 		if file.Embedding.State == "" {
-			file.Embedding = embeddingspace.NoEmbeddings()
+			// A resolved file that carries no decoded embedding column
+			// is unknown, never no_embeddings: this is a read path and
+			// it has been told nothing.
+			file.Embedding = embeddingspace.Unknown()
 			files[i].Embedding = file.Embedding
 		}
 		if file.Path == "" || len(file.RawQualifier) == 0 ||

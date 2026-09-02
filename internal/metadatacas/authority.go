@@ -503,15 +503,31 @@ func (a *Authority) target(
 	ctx context.Context,
 	row []byte,
 ) (string, string, *data.TKeyExtent, error) {
-	if a.extent.TableID == metadata.MetadataTableID {
-		location, err := a.factory.cfg.RootLocator.RootTabletLocation(ctx)
+	return locateMetadataTarget(ctx, a.factory.cfg.Reader, a.factory.cfg.RootLocator, a.extent.TableID, row)
+}
+
+// locateMetadataTarget resolves which server holds the metadata row a
+// mutation for tableID must be sent to.
+//
+// Rows for the metadata table itself live in the root tablet; rows for
+// every other table live in the metadata table, in whichever tablet
+// contains the row.
+func locateMetadataTarget(
+	ctx context.Context,
+	reader TabletReader,
+	locator RootLocator,
+	tableID string,
+	row []byte,
+) (string, string, *data.TKeyExtent, error) {
+	if tableID == metadata.MetadataTableID {
+		location, err := locator.RootTabletLocation(ctx)
 		if err != nil || location == nil {
 			return "", "", nil, errors.Join(errors.New("metadatacas: root tablet unavailable"), err)
 		}
 		return location.HostPort, metadata.RootTableID,
 			&data.TKeyExtent{Table: []byte(metadata.RootTableID)}, nil
 	}
-	tablets, err := a.factory.cfg.Reader.LocateTable(ctx, metadata.MetadataTableID)
+	tablets, err := reader.LocateTable(ctx, metadata.MetadataTableID)
 	if err != nil {
 		return "", "", nil, err
 	}
@@ -656,9 +672,18 @@ func encodeFileEmbedding(state embeddingspace.FileState) ([]byte, error) {
 	return embeddingspace.Encode(state)
 }
 
+// normalizedEmbedding fills in the state for a commit that declared
+// none.
+//
+// The column this feeds is durable evidence about a file, so an
+// undeclared commit is recorded as unknown rather than as the positive
+// assertion no_embeddings. An operator who really does know a pipeline
+// emits no vectors declares that upstream — see
+// mincauthority.Config.DefaultEmbedding — instead of having it invented
+// here, where nothing has any basis for the claim.
 func normalizedEmbedding(state embeddingspace.FileState) embeddingspace.FileState {
 	if state.State == "" {
-		return embeddingspace.NoEmbeddings()
+		return embeddingspace.Unknown()
 	}
 	return state
 }

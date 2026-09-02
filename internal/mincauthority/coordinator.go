@@ -185,6 +185,27 @@ type Config struct {
 	States           StateStore
 	ReconcileTimeout time.Duration
 	WriterOptions    rfile.WriterOptions
+
+	// DefaultEmbedding is the embedding-space state to record for an
+	// output whose Snapshotter declared none.
+	//
+	// This is a write path: whatever lands here is stamped into the
+	// RFile footer meta block and into the file's metadata column, so it
+	// becomes durable evidence. Defaulting it to no_embeddings would
+	// manufacture the positive assertion "this file holds no vectors"
+	// out of a provider that simply said nothing, which is the claim
+	// that merges freely with every embedding space.
+	//
+	// The zero value means "no default configured", and an undeclared
+	// snapshot is then recorded as embeddingspace.Unknown() — absent
+	// information, failing closed. An operator who knows their ingest
+	// pipeline emits no vectors may set this to
+	// embeddingspace.NoEmbeddings() and have that assertion recorded
+	// truthfully, because they are the ones making it.
+	//
+	// It must be a valid embeddingspace.FileState when set; New rejects
+	// anything else rather than writing an unreadable column.
+	DefaultEmbedding embeddingspace.FileState
 }
 
 // Coordinator serializes minor compactions for one hosted tablet.
@@ -202,7 +223,23 @@ func New(cfg Config) (*Coordinator, error) {
 	if cfg.ReconcileTimeout <= 0 {
 		cfg.ReconcileTimeout = 5 * time.Second
 	}
+	if cfg.DefaultEmbedding.State != "" {
+		if err := cfg.DefaultEmbedding.Validate(); err != nil {
+			return nil, fmt.Errorf("%w: default embedding: %w", ErrInvalidConfig, err)
+		}
+	}
 	return &Coordinator{cfg: cfg}, nil
+}
+
+// defaultEmbedding is the state recorded for a snapshot whose provider
+// declared none. An operator may configure a positive assertion; with no
+// configuration the output is labelled unknown rather than having a
+// claim invented for it.
+func (c *Coordinator) defaultEmbedding() embeddingspace.FileState {
+	if c.cfg.DefaultEmbedding.State != "" {
+		return c.cfg.DefaultEmbedding
+	}
+	return embeddingspace.Unknown()
 }
 
 // Run advances operationID until its RFile is committed and the retained
@@ -242,7 +279,7 @@ func (c *Coordinator) Run(ctx context.Context, operationID string) (DataFile, er
 			return DataFile{}, err
 		}
 		if snapshot.Embedding.State == "" {
-			snapshot.Embedding = embeddingspace.NoEmbeddings()
+			snapshot.Embedding = c.defaultEmbedding()
 		}
 		if err := validateSnapshot(snapshot, c.cfg.Extent, c.cfg.Fence); err != nil {
 			return DataFile{}, err

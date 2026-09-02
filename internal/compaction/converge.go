@@ -120,6 +120,9 @@ type convergeAttempt struct {
 	label embeddingspace.FileState
 	// inputs are the per-input states, in Spec.Inputs order.
 	inputs []embeddingspace.FileState
+	// names are the input names, in Spec.Inputs order, so a refusal can
+	// say which file it is about rather than only which states clashed.
+	names []string
 }
 
 func (a *convergeAttempt) active() bool { return a != nil && a.attempt != nil }
@@ -146,7 +149,11 @@ func (a *convergeAttempt) active() bool { return a != nil && a.attempt != nil }
 func planConvergence(
 	ctx context.Context, spec Spec, states []embeddingspace.FileState,
 ) (*convergeAttempt, error) {
-	attempt := &convergeAttempt{inputs: states, epoch: strings.TrimSpace(spec.EmbeddingEpoch)}
+	attempt := &convergeAttempt{
+		inputs: states,
+		names:  inputNames(spec.Inputs),
+		epoch:  strings.TrimSpace(spec.EmbeddingEpoch),
+	}
 	target, err := embeddingspace.ParseTarget(spec.TargetEmbeddingSpace)
 	if err != nil {
 		return nil, fmt.Errorf("compaction: %w", err)
@@ -179,6 +186,9 @@ func planConvergence(
 	// refused, and computing it before Begin is what keeps a doomed
 	// compaction from spending a permit.
 	label, mergeErr := embeddingspace.Compatible("merge embedding spaces", states...)
+	if mergeErr != nil {
+		mergeErr = annotateEmbeddingRefusal(mergeErr, attempt.names, states)
+	}
 	if !wanted || spec.Converger == nil {
 		if mergeErr != nil {
 			return nil, mergeErr
@@ -210,6 +220,16 @@ func planConvergence(
 	return attempt, nil
 }
 
+// inputNames extracts the per-input labels a refusal reports, in
+// Spec.Inputs order.
+func inputNames(inputs []Input) []string {
+	names := make([]string, 0, len(inputs))
+	for _, in := range inputs {
+		names = append(names, in.Name)
+	}
+	return names
+}
+
 // convergenceRequired reports inputs that only convergence could merge,
 // at a moment when convergence is not available. Both causes are
 // wrapped: the mismatch so existing identity-conflict handling still
@@ -229,9 +249,11 @@ func convergenceRequired(mergeErr, cause error) error {
 func (a *convergeAttempt) preserved(cause error) (*convergeAttempt, error) {
 	label, err := embeddingspace.Compatible("merge embedding spaces", a.inputs...)
 	if err != nil {
-		return nil, convergenceRequired(err, cause)
+		return nil, convergenceRequired(annotateEmbeddingRefusal(err, a.names, a.inputs), cause)
 	}
-	return &convergeAttempt{target: a.target, epoch: a.epoch, label: label, inputs: a.inputs}, nil
+	return &convergeAttempt{
+		target: a.target, epoch: a.epoch, label: label, inputs: a.inputs, names: a.names,
+	}, nil
 }
 
 // verify checks the output label against every input state before the
@@ -239,7 +261,7 @@ func (a *convergeAttempt) preserved(cause error) (*convergeAttempt, error) {
 func (a *convergeAttempt) verify() error {
 	for _, state := range a.inputs {
 		if err := embeddingspace.EnsureMonotonic(a.target, state, a.label); err != nil {
-			return fmt.Errorf("compaction: %w", err)
+			return annotateEmbeddingRefusal(fmt.Errorf("compaction: %w", err), a.names, a.inputs)
 		}
 	}
 	return a.label.Validate()

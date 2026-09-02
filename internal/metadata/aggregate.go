@@ -142,7 +142,12 @@ func applyColumn(t *TabletInfo, kv *data.TKeyValue) error {
 		}
 		// Copy cq so the FileEntry doesn't alias the Thrift buffer.
 		raw := append([]byte(nil), cq...)
-		embedding := embeddingspace.NoEmbeddings()
+		// No file.embedding column has been decoded for this entry yet.
+		// Absence of the column is absence of information, not a
+		// statement that the file holds no vectors, so the entry starts
+		// out unknown and only an explicitly decoded column may move it
+		// to a positive claim.
+		embedding := embeddingspace.Unknown()
 		if t.fileEmbeddings != nil {
 			if state, ok := t.fileEmbeddings[string(raw)]; ok {
 				embedding = state
@@ -157,6 +162,7 @@ func applyColumn(t *TabletInfo, kv *data.TKeyValue) error {
 			Time:         time,
 			Embedding:    embedding,
 			RawQualifier: raw,
+			RawValue:     append([]byte(nil), val...),
 		})
 	case CFFileEmbedding:
 		state, err := embeddingspace.Decode(val)
@@ -240,7 +246,11 @@ func finalizeFileEmbeddings(t *TabletInfo) error {
 	}
 	for i := range t.Files {
 		if t.Files[i].Embedding.State == "" {
-			t.Files[i].Embedding = embeddingspace.NoEmbeddings()
+			// A tablet whose file entry never met a file.embedding
+			// column tells us nothing about that file's vectors.
+			// Reporting no_embeddings here would manufacture the one
+			// claim that merges freely with every space.
+			t.Files[i].Embedding = embeddingspace.Unknown()
 		}
 	}
 	for qualifier := range t.fileEmbeddings {

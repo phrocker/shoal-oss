@@ -1,0 +1,121 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements. See the NOTICE file distributed
+// with this work for additional information regarding copyright ownership.
+// The ASF licenses this file to you under the Apache License, Version 2.0.
+package mincauthority
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"testing"
+
+	"github.com/phrocker/shoal-oss/internal/embeddingspace"
+	"github.com/phrocker/shoal-oss/internal/rfile"
+	"github.com/phrocker/shoal-oss/internal/rfile/bcfile"
+	"github.com/phrocker/shoal-oss/internal/rfile/bcfile/block"
+)
+
+// footerEmbedding reads back the space the coordinator actually stamped
+// into the published RFile. Asserting on the returned DataFile alone
+// would miss a divergence between the metadata claim and the durable
+// evidence in the file itself.
+func footerEmbedding(t *testing.T, f *fixture, path string) embeddingspace.FileState {
+	t.Helper()
+	raw, err := f.outputs.Read(context.Background(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bc, err := bcfile.NewReader(bytes.NewReader(raw), int64(len(raw)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, err := rfile.ReadEmbeddingSpaceMetadata(bc, block.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return state
+}
+
+// TestRunUndeclaredSnapshotEmbeddingIsUnknown pins issue #274 on the
+// worst site: a snapshot provider that declares nothing must not have
+// "this file holds no vectors" invented for it and written into the
+// RFile footer and the metadata column.
+func TestRunUndeclaredSnapshotEmbeddingIsUnknown(t *testing.T) {
+	f := newFixture(t)
+	file, err := f.coordinator.Run(context.Background(), "op-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if file.Embedding != embeddingspace.Unknown() {
+		t.Fatalf("committed embedding = %+v, want unknown", file.Embedding)
+	}
+	if got := footerEmbedding(t, f, file.Path); got != embeddingspace.Unknown() {
+		t.Fatalf("footer embedding = %+v, want unknown", got)
+	}
+}
+
+// TestRunUsesConfiguredDefaultEmbedding covers the operator escape
+// hatch: someone who knows their ingest pipeline emits no vectors may
+// declare that, and the assertion is then recorded because they made it.
+func TestRunUsesConfiguredDefaultEmbedding(t *testing.T) {
+	f := newFixture(t)
+	cfg := f.config
+	cfg.DefaultEmbedding = embeddingspace.NoEmbeddings()
+	coordinator, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	file, err := coordinator.Run(context.Background(), "op-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if file.Embedding != embeddingspace.NoEmbeddings() {
+		t.Fatalf("committed embedding = %+v, want no embeddings", file.Embedding)
+	}
+	if got := footerEmbedding(t, f, file.Path); got != embeddingspace.NoEmbeddings() {
+		t.Fatalf("footer embedding = %+v, want no embeddings", got)
+	}
+}
+
+// TestRunPrefersDeclaredSnapshotEmbedding: a provider that does declare
+// a state wins over the configured default, which is only a fallback for
+// silence.
+func TestRunPrefersDeclaredSnapshotEmbedding(t *testing.T) {
+	f := newFixture(t)
+	f.snapshots.snapshot.Embedding = embeddingspace.Has("space-a")
+	cfg := f.config
+	cfg.DefaultEmbedding = embeddingspace.NoEmbeddings()
+	coordinator, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	file, err := coordinator.Run(context.Background(), "op-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if file.Embedding != embeddingspace.Has("space-a") {
+		t.Fatalf("committed embedding = %+v, want has space-a", file.Embedding)
+	}
+	if got := footerEmbedding(t, f, file.Path); got != embeddingspace.Has("space-a") {
+		t.Fatalf("footer embedding = %+v, want has space-a", got)
+	}
+}
+
+// TestNewRejectsInvalidDefaultEmbedding: the default is written into
+// durable metadata, so an unencodable one must be refused at
+// construction rather than at the first flush.
+func TestNewRejectsInvalidDefaultEmbedding(t *testing.T) {
+	f := newFixture(t)
+	for _, invalid := range []embeddingspace.FileState{
+		{State: "definitely-not-a-state"},
+		{State: embeddingspace.StateHasEmbeddings},
+		{State: embeddingspace.StateNoEmbeddings, Identity: "space-a"},
+	} {
+		cfg := f.config
+		cfg.DefaultEmbedding = invalid
+		if _, err := New(cfg); !errors.Is(err, ErrInvalidConfig) {
+			t.Fatalf("New(%+v) error = %v, want ErrInvalidConfig", invalid, err)
+		}
+	}
+}

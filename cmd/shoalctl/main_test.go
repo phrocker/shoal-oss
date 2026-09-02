@@ -105,3 +105,38 @@ func TestCommandErrors(t *testing.T) {
 		}
 	}
 }
+
+// TestEmbeddingBackfillCommandIsDispatched pins that the subcommand is
+// reachable through the same switch as the others and that it refuses
+// incomplete invocations before it opens any connection. Everything past
+// argument validation needs a live cluster, so that is the boundary this
+// test can cover.
+func TestEmbeddingBackfillCommandIsDispatched(t *testing.T) {
+	t.Setenv("SHOAL_PASSWORD", "")
+	invalid := [][]string{
+		{"embedding-backfill"},
+		{"embedding-backfill", "--table", "5"},
+		{"embedding-backfill", "--zk", "zk:2181"},
+		{"embedding-backfill", "--zk", "zk:2181", "--table", "5", "extra"},
+		{"embedding-backfill", "--zk", "zk:2181", "--table", "5"},
+	}
+	for _, args := range invalid {
+		err := run(args, &bytes.Buffer{}, &bytes.Buffer{})
+		if err == nil {
+			t.Fatalf("run(%q) succeeded", args)
+		}
+		if strings.Contains(err.Error(), "unknown command") {
+			t.Fatalf("run(%q) was not dispatched: %v", args, err)
+		}
+	}
+
+	var stderr bytes.Buffer
+	if err := run([]string{"embedding-backfill", "--help"}, &bytes.Buffer{}, &stderr); err == nil {
+		t.Fatal("--help should report flag.ErrHelp")
+	}
+	for _, want := range []string{"-dry-run", "-table", "-zk", "-storage"} {
+		if !strings.Contains(stderr.String(), want) {
+			t.Fatalf("usage %q missing %q", stderr.String(), want)
+		}
+	}
+}

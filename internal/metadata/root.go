@@ -61,8 +61,11 @@ func DecodeRootTabletMetadata(encoded []byte) (TabletInfo, error) {
 		info.Files = append(info.Files, FileEntry{
 			Path: file.Path, StartRow: file.StartRow, EndRow: file.EndRow,
 			Size: size, NumEntries: entries, Time: fileTime,
-			Embedding:    embeddingspace.NoEmbeddings(),
+			// Unknown until the file.embedding loop below decodes an
+			// actual column for this qualifier. See aggregate.go.
+			Embedding:    embeddingspace.Unknown(),
 			RawQualifier: []byte(qualifier),
+			RawValue:     []byte(value),
 		})
 	}
 	for qualifier, value := range root.ColumnValues[CFFileEmbedding] {

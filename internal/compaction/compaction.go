@@ -457,7 +457,7 @@ func inputEmbeddingSpaces(inputs []Input) ([]embeddingspace.FileState, error) {
 		}
 		if in.MetadataEmbedding.State != "" {
 			if err := embeddingspace.VerifyMetadataMatchesFooter(in.MetadataEmbedding, state); err != nil {
-				return nil, err
+				return nil, annotateIntegrityRefusal(err, in.Name, in.MetadataEmbedding)
 			}
 			state = in.MetadataEmbedding
 		}

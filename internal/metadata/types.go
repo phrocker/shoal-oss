@@ -67,4 +67,14 @@ type FileEntry struct {
 	// metadata table. Required if you ever want to delete or update this
 	// entry — Accumulo enforces byte-exact qualifier match for mutations.
 	RawQualifier []byte
+
+	// RawValue preserves the exact DataFileValue bytes.
+	//
+	// Re-encoding Size/NumEntries/Time is not byte-faithful: a value
+	// written as "100,10,-1" decodes to the same fields as "100,10" and
+	// would re-encode as the latter. A conditional mutation compares
+	// values byte for byte, so anything using this entry as a CAS
+	// precondition — the embedding backfill does — must condition on the
+	// bytes that are actually there, not on a reconstruction of them.
+	RawValue []byte
 }
