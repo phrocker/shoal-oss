@@ -32,6 +32,7 @@ import (
 	"reflect"
 	"strings"
 
+	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
@@ -45,9 +46,15 @@ type Handler struct {
 	service          Service
 	mux              *http.ServeMux
 	allowedAuthority string
+	authenticator    Authenticator
+	binder           auth.Binder
 }
 
-// NewHandler constructs the standard HTTP transport.
+// NewHandler constructs the standard HTTP transport without caller identity.
+// It performs no authentication: the returned handler serves every request as
+// one implicit anonymous caller and is safe only behind a transport that
+// establishes identity itself. Use NewAuthenticatedHandler to require a
+// per-request trusted decision.
 func NewHandler(service Service, allowedAuthority string) (*Handler, error) {
 	if service == nil {
 		return nil, shoal.NewError(shoal.ErrorInvalidArgument, "workspace service is required")
@@ -76,6 +83,14 @@ func (h *Handler) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	if !strings.EqualFold(request.Host, h.allowedAuthority) {
 		http.Error(writer, "misdirected request", http.StatusMisdirectedRequest)
 		return
+	}
+	if h.authenticator != nil {
+		ctx, err := h.authenticate(request)
+		if err != nil {
+			writeError(writer, err)
+			return
+		}
+		request = request.WithContext(ctx)
 	}
 	h.mux.ServeHTTP(writer, request)
 }

@@ -181,14 +181,29 @@ confirming that traversal crossed the relationship created above.
 ```powershell
 go run .\cmd\shoal-explore-web `
   -data .shoal\explorer-demo `
-  -listen 127.0.0.1:8080
+  -listen 127.0.0.1:8080 `
+  -dev-auth
 ```
 
 Expected observable outcome:
 
 ```text
+Authenticating every request as development principal development-principal@localhost
+Policy catalog is in-memory: documents ingested before this process started are unauthorized and stay hidden until they are ingested again
 Shoal Explorer listening at http://127.0.0.1:8080
 ```
+
+Every request must carry an identity. `-dev-auth` mints one fixed development
+principal for callers on this host, and the server refuses to start with
+`-dev-auth` on any listen address that is not loopback-only, so `:8080`,
+`0.0.0.0:8080`, and `[::]:8080` are rejected. Without `-dev-auth` and without a
+real authenticator the server refuses to start at all rather than serve
+anonymously.
+
+The authorized Explorer client enforces the bound decision on every call, and
+its policy catalog lives in memory for the lifetime of the process. Documents
+ingested by step 3 through the CLI therefore carry no catalog registration and
+stay hidden; upload them again through the workspace to see them listed.
 
 The default listen address is also `127.0.0.1:8080`, so the explicit
 `-listen` value documents the default. Open <http://127.0.0.1:8080> to use the

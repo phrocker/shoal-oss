@@ -103,18 +103,33 @@ over an existing embedded Explorer corpus:
 ```bash
 go run ./cmd/shoal-explore-web \
   -data .shoal/explorer \
-  -listen 127.0.0.1:8080
+  -listen 127.0.0.1:8080 \
+  -dev-auth
 ```
 
-The same browser contract can also be served through another Explorer web API
-endpoint without exposing storage or node topology to the browser:
+Every request is authorized. The transport binds one trusted
+`pkg/explorer/auth` decision per request and serves the corpus through the
+decision-enforcing `pkg/explorer/authorized` client, so a caller sees only the
+documents, spans, edges, and retrieval evidence its decision permits. A request
+that cannot be authenticated is answered `401` and never reaches the service.
 
-```bash
-go run ./cmd/shoal-explore-web \
-  -backend remote \
-  -remote http://127.0.0.1:8081 \
-  -listen 127.0.0.1:8080
-```
+`-dev-auth` is the localhost development authenticator: it mints one fixed,
+clearly-named development principal (`development-principal@localhost`) for
+every request. It is refused unless the resolved listen address is
+loopback-only, so `:8080`, `0.0.0.0:8080`, and `[::]:8080` all cause the server
+to exit with a diagnostic instead of serving. Exposing the workspace beyond
+this host requires supplying a real `webapi.Authenticator`; without one the
+server refuses to start rather than serve anonymously.
+
+The embedded backend registers authorization policy in an in-memory catalog for
+the lifetime of the process, so documents ingested before the server started are
+not authorized and stay hidden until they are ingested through the workspace
+again.
+
+Serving the same browser contract through another Explorer web API endpoint
+(`-backend remote`) is currently refused: there is no way yet to forward the
+caller's decision across that hop, so the upstream call would carry no identity
+at all. The backend is closed rather than left unauthorized.
 
 Open <http://127.0.0.1:8080>. The workspace lists and pages documents,
 preserves the authored hierarchy, retrieves exact revision/span citations and
@@ -128,10 +143,12 @@ contract. Requests and responses carry a snapshot ID and `as_of` value;
 document pages use snapshot-bound cursors, and the server enforces retrieval
 top-k plus graph depth, fanout, and node bounds. Opaque Shoal IDs use
 unpadded base64url on the HTTP wire so every valid ID round-trips. The first
-backend adapts the embedded `pkg/explorer` client; the remote backend proxies
-the same contract, negotiates logical feature capabilities via `/api/v1/meta`,
-advertises the aggregate JSON response budget as `max_response_bytes`, and
-keeps unsupported-feature decisions server-side.
+backend adapts the embedded `pkg/explorer` client behind the authorized client;
+the remote backend proxies the same contract, negotiates logical feature
+capabilities via `/api/v1/meta`, advertises the aggregate JSON response budget
+as `max_response_bytes`, and keeps unsupported-feature decisions server-side,
+but is not selectable from `shoal-explore-web` until it can carry the caller's
+authorization decision upstream.
 
 ### Trees, graphs, and vectors are complementary
 

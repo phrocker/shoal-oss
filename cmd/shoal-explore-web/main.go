@@ -32,6 +32,8 @@ import (
 	"time"
 
 	"github.com/phrocker/shoal-oss/pkg/explorer"
+	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
+	"github.com/phrocker/shoal-oss/pkg/explorer/authorized"
 	"github.com/phrocker/shoal-oss/pkg/explorer/webapi"
 	"github.com/phrocker/shoal-oss/pkg/model"
 )
@@ -72,6 +74,11 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 		"embedding-dimensions", 0,
 		"Embedding dimensions; required for ollama/openai, zero uses fake default",
 	)
+	developmentAuth := flags.Bool(
+		"dev-auth", false,
+		"Authenticate every request as a fixed development principal; "+
+			"refused unless the resolved listen address is loopback-only",
+	)
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -86,17 +93,36 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 	if err != nil {
 		return err
 	}
-	service, cleanup, err := openService(*backend, *data, *remote, embedding)
-	if err != nil {
-		return err
-	}
-	defer cleanup()
 
 	listener, err := net.Listen("tcp", *listen)
 	if err != nil {
 		return fmt.Errorf("listen on %s: %w", *listen, err)
 	}
-	handler, err := webapi.NewHandler(service, listener.Addr().String())
+	// Identity is decided from the resolved listener address, before the
+	// corpus is opened and before any request can be served.
+	authenticator, err := selectAuthenticator(
+		*developmentAuth, listener.Addr().String(), time.Now)
+	if err != nil {
+		listener.Close()
+		return err
+	}
+	authority := auth.NewAuthority()
+	service, cleanup, err := openService(serviceConfig{
+		backend:  *backend,
+		data:     *data,
+		remote:   *remote,
+		embedder: embedding,
+		resolver: authority.Resolver(),
+		clock:    time.Now,
+	})
+	if err != nil {
+		listener.Close()
+		return err
+	}
+	defer cleanup()
+
+	handler, err := webapi.NewAuthenticatedHandler(
+		service, listener.Addr().String(), authenticator, authority.Binder())
 	if err != nil {
 		listener.Close()
 		return err
@@ -107,6 +133,21 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 		ReadTimeout:       15 * time.Second,
 		WriteTimeout:      30 * time.Second,
 		IdleTimeout:       60 * time.Second,
+	}
+	if *developmentAuth {
+		fmt.Fprintf(
+			output,
+			"Authenticating every request as development principal %s\n",
+			developmentSubject,
+		)
+	}
+	if *backend == "embedded" {
+		fmt.Fprintf(
+			output,
+			"Policy catalog is in-memory: documents ingested before this "+
+				"process started are unauthorized and stay hidden until they "+
+				"are ingested again\n",
+		)
 	}
 	fmt.Fprintf(output, "Shoal Explorer listening at http://%s\n", listener.Addr())
 	shutdownDone := make(chan error, 1)
@@ -199,30 +240,81 @@ func (r envCredentialResolver) CacheIdentity() (string, error) {
 	return "env:" + string(r), nil
 }
 
+// serviceConfig carries the backend selection together with the trusted
+// authorization dependencies every backend must enforce.
+type serviceConfig struct {
+	backend  string
+	data     string
+	remote   string
+	embedder model.Embedder
+	resolver auth.Resolver
+	clock    func() time.Time
+}
+
 func openService(
-	backend, data, remote string, embedder model.Embedder,
+	config serviceConfig,
 ) (webapi.Service, func(), error) {
-	switch backend {
+	switch config.backend {
 	case "embedded":
-		corpus, err := explorer.OpenWithOptions(data, explorer.Options{
-			Embedder: embedder,
+		corpus, err := explorer.OpenWithOptions(config.data, explorer.Options{
+			Embedder: config.embedder,
 		})
 		if err != nil {
 			return nil, func() {}, err
 		}
-		service, err := webapi.NewEmbeddedService(corpus)
+		client, err := authorizedClient(corpus, config.resolver, config.clock)
+		if err != nil {
+			corpus.Close()
+			return nil, func() {}, err
+		}
+		service, err := webapi.NewEmbeddedService(client)
 		if err != nil {
 			corpus.Close()
 			return nil, func() {}, err
 		}
 		return service, func() { corpus.Close() }, nil
 	case "remote":
-		service, err := webapi.NewRemoteService(remote, nil)
-		if err != nil {
-			return nil, func() {}, err
-		}
-		return service, func() {}, nil
+		// The remote backend forwards workspace calls to an upstream Explorer
+		// web API over HTTP and has no way to carry the caller's decision
+		// across that hop: webapi.RemoteService is a workspace service, not an
+		// explorer.Client, so authorized.Client cannot wrap it, and no
+		// on-the-wire representation of auth.Decision exists yet. Serving it
+		// would mean authenticating at this edge and then calling upstream
+		// with no identity at all. Refuse rather than leave that path open.
+		return nil, func() {}, fmt.Errorf(
+			"backend remote is unavailable: forwarding the caller's " +
+				"authorization decision to an upstream Explorer is not " +
+				"implemented, so the upstream call would carry no identity " +
+				"(see issue #278, edge identity)")
 	default:
-		return nil, func() {}, fmt.Errorf("unknown backend %q", backend)
+		return nil, func() {}, fmt.Errorf("unknown backend %q", config.backend)
 	}
+}
+
+// authorizedClient wraps the corpus in the decision-enforcing Explorer client.
+// The resolver reads the decision bound by the HTTP transport for the request
+// being served, so authorization is per request rather than per process.
+func authorizedClient(
+	corpus *explorer.Explorer,
+	resolver auth.Resolver,
+	clock func() time.Time,
+) (*authorized.Client, error) {
+	selector, err := authorized.NewStaticPolicySelector(
+		workspaceSourceID, workspaceGrantPolicyID)
+	if err != nil {
+		return nil, err
+	}
+	scorer, _ := any(corpus).(authorized.VectorScorer)
+	return authorized.NewClient(authorized.Config{
+		Base:           corpus,
+		VectorScorer:   scorer,
+		Resolver:       resolver,
+		PolicySelector: selector,
+		PolicyStore:    authorized.NewMemoryPolicyStore(),
+		GenerationReader: fixedGenerationReader{
+			domain:     workspaceAuthorizationDomain,
+			generation: workspacePolicyGeneration,
+		},
+		Clock: clock,
+	})
 }
