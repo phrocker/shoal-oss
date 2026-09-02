@@ -107,18 +107,25 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 		return err
 	}
 	authority := auth.NewAuthority()
-	service, cleanup, err := openService(serviceConfig{
+	// TEMPORARY (issue #284): with no durable PolicyStore, a corpus that
+	// predates this process is invisible. The gate below allows the
+	// development-only repair for -dev-auth on loopback and nothing else.
+	backfill := newDevelopmentBackfill(
+		authenticator, listener.Addr().String(), authority.Binder())
+	opened, err := openService(ctx, serviceConfig{
 		backend:  *backend,
 		data:     *data,
 		remote:   *remote,
 		embedder: embedding,
 		resolver: authority.Resolver(),
 		clock:    time.Now,
+		backfill: backfill,
 	})
 	if err != nil {
 		listener.Close()
 		return err
 	}
+	service, cleanup := opened.service, opened.close
 	defer cleanup()
 
 	handler, err := webapi.NewAuthenticatedHandler(
@@ -142,12 +149,23 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 		)
 	}
 	if *backend == "embedded" {
-		fmt.Fprintf(
-			output,
-			"Policy catalog is in-memory: documents ingested before this "+
-				"process started are unauthorized and stay hidden until they "+
-				"are ingested again\n",
-		)
+		if backfill != nil {
+			fmt.Fprintf(
+				output,
+				"Granted %d pre-existing document(s) in %s to %s: a "+
+					"development-only convenience for -dev-auth on loopback, "+
+					"because the policy catalog is in-memory and does not "+
+					"survive this process (issue #284)\n",
+				opened.backfilled, *data, developmentSubject,
+			)
+		} else {
+			fmt.Fprintf(
+				output,
+				"Policy catalog is in-memory: documents ingested before this "+
+					"process started are unauthorized and stay hidden until "+
+					"they are ingested again (issue #284)\n",
+			)
+		}
 	}
 	fmt.Fprintf(output, "Shoal Explorer listening at http://%s\n", listener.Addr())
 	shutdownDone := make(chan error, 1)
@@ -249,30 +267,56 @@ type serviceConfig struct {
 	embedder model.Embedder
 	resolver auth.Resolver
 	clock    func() time.Time
+	// backfill is nil unless the development principal is serving a loopback
+	// listener. See developmentBackfill and issue #284.
+	backfill *developmentBackfill
+}
+
+// openedService is the constructed workspace service together with what the
+// startup backfill registered, so the operator can be told exactly what the
+// development principal was granted.
+type openedService struct {
+	service    webapi.Service
+	backfilled int
+	close      func()
 }
 
 func openService(
+	ctx context.Context,
 	config serviceConfig,
-) (webapi.Service, func(), error) {
+) (openedService, error) {
+	closed := openedService{close: func() {}}
 	switch config.backend {
 	case "embedded":
 		corpus, err := explorer.OpenWithOptions(config.data, explorer.Options{
 			Embedder: config.embedder,
 		})
 		if err != nil {
-			return nil, func() {}, err
+			return closed, err
 		}
 		client, err := authorizedClient(corpus, config.resolver, config.clock)
 		if err != nil {
 			corpus.Close()
-			return nil, func() {}, err
+			return closed, err
+		}
+		// TEMPORARY (issue #284): registers documents that were ingested
+		// before this process started. A failure here is fatal by design: the
+		// workspace must not serve a corpus it could not finish authorizing.
+		backfilled, err := config.backfill.run(ctx, client)
+		if err != nil {
+			corpus.Close()
+			return closed, err
 		}
 		service, err := webapi.NewEmbeddedService(client)
 		if err != nil {
 			corpus.Close()
-			return nil, func() {}, err
+			return closed, err
 		}
-		return service, func() { corpus.Close() }, nil
+		return openedService{
+			service:    service,
+			backfilled: backfilled,
+			close:      func() { corpus.Close() },
+		}, nil
 	case "remote":
 		// The remote backend forwards workspace calls to an upstream Explorer
 		// web API over HTTP and has no way to carry the caller's decision
@@ -281,13 +325,13 @@ func openService(
 		// on-the-wire representation of auth.Decision exists yet. Serving it
 		// would mean authenticating at this edge and then calling upstream
 		// with no identity at all. Refuse rather than leave that path open.
-		return nil, func() {}, fmt.Errorf(
+		return closed, fmt.Errorf(
 			"backend remote is unavailable: forwarding the caller's " +
 				"authorization decision to an upstream Explorer is not " +
 				"implemented, so the upstream call would carry no identity " +
 				"(see issue #278, edge identity)")
 	default:
-		return nil, func() {}, fmt.Errorf("unknown backend %q", config.backend)
+		return closed, fmt.Errorf("unknown backend %q", config.backend)
 	}
 }
 

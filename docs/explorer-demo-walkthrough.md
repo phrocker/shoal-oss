@@ -189,7 +189,7 @@ Expected observable outcome:
 
 ```text
 Authenticating every request as development principal development-principal@localhost
-Policy catalog is in-memory: documents ingested before this process started are unauthorized and stay hidden until they are ingested again
+Granted 2 pre-existing document(s) in .shoal\explorer-demo to development-principal@localhost: a development-only convenience for -dev-auth on loopback, because the policy catalog is in-memory and does not survive this process (issue #284)
 Shoal Explorer listening at http://127.0.0.1:8080
 ```
 
@@ -201,9 +201,12 @@ real authenticator the server refuses to start at all rather than serve
 anonymously.
 
 The authorized Explorer client enforces the bound decision on every call, and
-its policy catalog lives in memory for the lifetime of the process. Documents
-ingested by step 3 through the CLI therefore carry no catalog registration and
-stay hidden; upload them again through the workspace to see them listed.
+its policy catalog lives in memory for the lifetime of the process (issue #284).
+The documents ingested in steps 2 and 3 through the CLI therefore carry no
+catalog registration, which is why `-dev-auth` on a loopback listener grants them
+to the development principal at startup and prints the count above. That startup grant
+is development-only: it is refused for a real authenticator and for any listener
+another host can reach, and it does not persist across restarts.
 
 The default listen address is also `127.0.0.1:8080`, so the explicit
 `-listen` value documents the default. Open <http://127.0.0.1:8080> to use the

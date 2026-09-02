@@ -122,9 +122,12 @@ this host requires supplying a real `webapi.Authenticator`; without one the
 server refuses to start rather than serve anonymously.
 
 The embedded backend registers authorization policy in an in-memory catalog for
-the lifetime of the process, so documents ingested before the server started are
-not authorized and stay hidden until they are ingested through the workspace
-again.
+the lifetime of the process (issue #284). To keep a restart from presenting an
+empty workspace, `-dev-auth` on a loopback listener grants the documents already
+in the corpus directory to the development principal at startup and reports how
+many. That backfill is refused for any real authenticator and for any listener
+another host can reach, it grants nothing that re-ingesting the same files would
+not, and it does not persist: it runs again on the next start.
 
 Serving the same browser contract through another Explorer web API endpoint
 (`-backend remote`) is currently refused: there is no way yet to forward the

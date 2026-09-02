@@ -89,11 +89,11 @@ func TestDocumentedWebWorkspaceStartServesMeta(t *testing.T) {
 			t.Fatalf("snapshot missing %q: %s", field, string(body))
 		}
 	}
-	// The document above was written straight to the corpus, so the authorized
-	// client holds no policy registration for it and must hide it. Content is
-	// visible only once it is ingested through the authorized workspace.
-	if got, ok := documents["documents"].([]any); !ok || len(got) != 0 {
-		t.Fatalf("unregistered document was served: %s", string(body))
+	// The document above was written straight to the corpus, so it had no
+	// policy registration. -dev-auth on a loopback listener backfills it for
+	// the development principal at startup (issue #284), so it is served.
+	if got, ok := documents["documents"].([]any); !ok || len(got) != 1 {
+		t.Fatalf("backfilled document was not served: %s", string(body))
 	}
 	cancel()
 	select {

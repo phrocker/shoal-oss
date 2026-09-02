@@ -101,6 +101,11 @@ func (a *developmentAuthenticator) Authenticate(
 		return auth.Decision{}, shoal.NewError(
 			shoal.ErrorInvalidArgument, "request is required")
 	}
+	return a.mint()
+}
+
+// mint issues one short-lived development decision.
+func (a *developmentAuthenticator) mint() (auth.Decision, error) {
 	requestID, err := newRequestID()
 	if err != nil {
 		return auth.Decision{}, err
