@@ -386,20 +386,16 @@ func TestBackfillCapabilityHasOneMintSite(t *testing.T) {
 				"exactly 1: %+v", len(sites), sites)
 	}
 	site := sites[0]
-	where := site.function
-	if where == "" {
-		where = "package scope"
-	}
 	if !site.called {
 		t.Fatalf(
 			"the capability constructor is referenced without calling it at "+
 				"%s in %s, which can defer minting past the gate",
-			site.file, where)
+			site.file, site.function)
 	}
 	if site.file != gateFile || site.function != gateFunction {
 		t.Fatalf(
 			"the capability is minted at %s in %s, want %s in %s",
-			site.file, where, gateFile, gateFunction)
+			site.file, site.function, gateFile, gateFunction)
 	}
 }
 
@@ -456,8 +452,9 @@ func mintSites(
 	for _, declaration := range file.Decls {
 		function, ok := declaration.(*ast.FuncDecl)
 		if !ok {
-			// Package scope: a var, const, or type declaration.
-			record("", declaration)
+			// A var, const, or type declaration: minted at process init,
+			// before any gate has run.
+			record("package scope", declaration)
 			continue
 		}
 		record(functionName(function), function)
