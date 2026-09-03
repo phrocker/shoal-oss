@@ -119,9 +119,36 @@ func TestHostAuthoritySupportsMultipleAuthorities(t *testing.T) {
 	if authority.permits("c.invalid:8080") {
 		t.Fatal("an authority outside the list was admitted")
 	}
-	// Guard against accidental suffix matching, a classic bypass.
-	if authority.permits("evila.invalid:8080") || authority.permits("a.invalid.evil:8080") {
-		t.Fatal("a non-listed authority matched by suffix/prefix")
+}
+
+// TestHostAuthorityRejectsSuffixAndPrefixMatches is the dedicated guard against
+// the classic wildcard/suffix bypass: a hostname that merely contains a
+// configured authority as a substring, prefix, or suffix must not match. Kept as
+// its own named test so the property is visible and is not silently lost if the
+// multiple-authorities test is rewritten.
+func TestHostAuthorityRejectsSuffixAndPrefixMatches(t *testing.T) {
+	authority := mustHostAuthority(t, "a.invalid:8080")
+	if authority.permits("evila.invalid:8080") {
+		t.Fatal("a prefixed hostname matched (substring/prefix bypass)")
+	}
+	if authority.permits("a.invalid.evil:8080") {
+		t.Fatal("a suffixed hostname matched (suffix bypass)")
+	}
+}
+
+// TestHostAuthorityNormalizesTrailingDot proves the FQDN-root form (a single
+// trailing dot) is treated as equal to its non-rooted spelling, symmetrically:
+// a rooted request matches a non-rooted authority and vice versa. This fails
+// closed without normalization (a trailing-dot Host would 421), so the test
+// pins a deliberate interop convenience, not a security boundary.
+func TestHostAuthorityNormalizesTrailingDot(t *testing.T) {
+	authority := mustHostAuthority(t, "workspace.invalid:8080")
+	if !authority.permits("workspace.invalid.:8080") {
+		t.Fatal("a trailing-dot request did not match its non-rooted authority")
+	}
+	rooted := mustHostAuthority(t, "workspace.invalid.:8080")
+	if !rooted.permits("workspace.invalid:8080") {
+		t.Fatal("a non-rooted request did not match an FQDN-root authority")
 	}
 }
 

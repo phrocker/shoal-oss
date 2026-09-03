@@ -243,6 +243,19 @@ the default port; include a port only when the client sends one.
 a forwarded host is out of scope here (it needs an authenticated hop and an
 explicit trust boundary) and is not implemented.
 
+A `Host` in FQDN-root form with a single trailing dot (`explorer.example.test.`)
+is treated as equal to its non-rooted spelling — the dot is normalised away on
+both the configured and the request side, so either form matches either. Without
+that normalisation the rooted form would fail closed (a `421`, not a security
+hole); it is normalised only to avoid a confusing outage if a client sends it.
+
+When `-listen` binds a non-loopback or wildcard address and `-allowed-host` is
+unset, the command prints a one-time startup **WARNING** naming the bound
+address and the `421` consequence, before any request is served. This is the
+most common way to trip over the gate; refusals themselves are not logged
+per-request, because the `Host` is attacker-controlled and would invite a log
+flood.
+
 ## The unsafe-configuration guard
 
 The dangerous combination — a shared/public bind with the development

@@ -242,10 +242,20 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 	// headers never carry, so such a deployment must name its external
 	// authority with -allowed-host or every request is refused — a fail-closed
 	// default, safe but requiring explicit configuration behind a proxy.
-	allowedAuthorities := splitCommaList(
-		firstNonEmpty(*allowedHost, os.Getenv("SHOAL_ALLOWED_HOST")))
+	allowedHostConfigured := firstNonEmpty(*allowedHost, os.Getenv("SHOAL_ALLOWED_HOST"))
+	allowedAuthorities := splitCommaList(allowedHostConfigured)
 	if len(allowedAuthorities) == 0 {
 		allowedAuthorities = []string{listener.Addr().String()}
+	}
+	// Surface the most common way an operator trips over this gate — a public
+	// bind with no -allowed-host, which fails closed on every request — as a
+	// startup warning before any traffic arrives. A per-refusal log is
+	// deliberately avoided: the Host is attacker-controlled, so logging each
+	// refusal invites a log flood, and it would not reach an operator any
+	// sooner than this line.
+	if warning := hostAuthorityStartupWarning(
+		listener.Addr().String(), allowedHostConfigured); warning != "" {
+		fmt.Fprintln(output, warning)
 	}
 
 	handler, err := webapi.NewAuthenticatedHandler(
@@ -517,6 +527,29 @@ func policyStoreDir(data string) string {
 
 // firstNonEmpty returns the first argument whose trimmed value is non-empty.
 // It gives command-line flags precedence over their environment fallbacks.
+// hostAuthorityStartupWarning returns an operator warning when the workspace
+// will refuse every request because it bound a non-loopback address but no
+// external host authority was configured — so the host-authority allow-list
+// defaults to the bind address, which real client Host headers never carry. It
+// returns "" for a configuration that will serve: an explicitly configured
+// authority, or the loopback default. The check is on the resolved listen
+// address so a wildcard bind ([::]:port, 0.0.0.0:port) is caught too.
+func hostAuthorityStartupWarning(resolvedListenAddr, configuredAllowedHost string) string {
+	if strings.TrimSpace(configuredAllowedHost) != "" {
+		return ""
+	}
+	if listenAddressIsLoopback(resolvedListenAddr) {
+		return ""
+	}
+	return fmt.Sprintf(
+		"WARNING: bound %s but -allowed-host/SHOAL_ALLOWED_HOST is unset, so "+
+			"the host-authority allow-list defaults to the bind address, which "+
+			"real client Host headers do not carry; every request will be "+
+			"refused with 421 Misdirected Request. Set -allowed-host to the "+
+			"external name(s) clients use to reach this workspace.",
+		resolvedListenAddr)
+}
+
 func firstNonEmpty(values ...string) string {
 	for _, value := range values {
 		if strings.TrimSpace(value) != "" {

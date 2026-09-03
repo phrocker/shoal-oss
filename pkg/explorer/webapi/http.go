@@ -57,6 +57,15 @@ type Handler struct {
 // allowedAuthorities is the exact-match set of Host/:authority values the
 // transport will serve; at least one is required and each must be a host or
 // host:port. It is enforced centrally for every route (see ServeHTTP).
+//
+// The list is variadic rather than a required first authority plus a variadic
+// remainder: the only caller that assembles authorities dynamically
+// (cmd/shoal-explore-web) already holds a []string and spreads it, and a
+// required-first shape would force that caller to hand-split the slice —
+// reintroducing an index/empty-slice footgun at exactly the spot that computes
+// the default. The empty case instead fails closed in newHostAuthority (see the
+// len == 0 guard), turning the lost compile-time check into an equivalent
+// construction-time error that every constructor path inherits.
 func NewHandler(service Service, allowedAuthorities ...string) (*Handler, error) {
 	if service == nil {
 		return nil, shoal.NewError(shoal.ErrorInvalidArgument, "workspace service is required")

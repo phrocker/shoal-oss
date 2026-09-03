@@ -94,35 +94,55 @@ func (a hostAuthority) permits(requestAuthority string) bool {
 }
 
 // normalizeAuthority splits an authority into a lowercased host and an exact
-// port. It uses net.SplitHostPort for the host:port form (which understands
-// bracketed IPv6 literals such as [::1]:8080) and falls back to a bare-host
-// reading — a hostname, an IPv4 literal, or a bracketed IPv6 literal — when no
-// port is present. Empty or otherwise malformed input is rejected rather than
-// guessed at, so both configuration and request parsing stay on the standard
-// library.
+// port, then folds it to a canonical form for comparison. It uses
+// net.SplitHostPort for the host:port form (which understands bracketed IPv6
+// literals such as [::1]:8080) and falls back to a bare-host reading — a
+// hostname, an IPv4 literal, or a bracketed IPv6 literal — when no port is
+// present. Empty or otherwise malformed input is rejected rather than guessed
+// at, so both configuration and request parsing stay on the standard library.
+//
+// The host is lowercased (hostnames are case-insensitive) and a single trailing
+// dot is dropped, so the FQDN-root form "example.test." compares equal to
+// "example.test". Both foldings apply to configured and request authorities
+// alike, keeping the match symmetric.
 func normalizeAuthority(raw string) (normalizedAuthority, bool) {
-	if raw == "" {
+	host, port, ok := splitAuthority(raw)
+	if !ok {
 		return normalizedAuthority{}, false
 	}
-	if host, port, err := net.SplitHostPort(raw); err == nil {
-		if host == "" {
-			return normalizedAuthority{}, false
+	host = strings.ToLower(host)
+	host = strings.TrimSuffix(host, ".")
+	if host == "" {
+		return normalizedAuthority{}, false
+	}
+	return normalizedAuthority{host: host, port: port}, true
+}
+
+// splitAuthority separates an authority into its host and (possibly empty) port
+// without folding either, reporting false for empty or malformed input rather
+// than guessing.
+func splitAuthority(raw string) (host, port string, ok bool) {
+	if raw == "" {
+		return "", "", false
+	}
+	if h, p, err := net.SplitHostPort(raw); err == nil {
+		if h == "" {
+			return "", "", false
 		}
-		return normalizedAuthority{host: strings.ToLower(host), port: port}, true
+		return h, p, true
 	}
 	// No port present (or an unparseable one). Accept a bare host, unwrapping a
 	// bracketed IPv6 literal, and reject anything that still carries bracket or
 	// colon syntax we could not split.
-	host := raw
-	if len(host) >= 2 && host[0] == '[' && host[len(host)-1] == ']' {
-		inner := host[1 : len(host)-1]
+	if len(raw) >= 2 && raw[0] == '[' && raw[len(raw)-1] == ']' {
+		inner := raw[1 : len(raw)-1]
 		if net.ParseIP(inner) == nil {
-			return normalizedAuthority{}, false
+			return "", "", false
 		}
-		return normalizedAuthority{host: strings.ToLower(inner)}, true
+		return inner, "", true
 	}
-	if strings.ContainsAny(host, "[]:") {
-		return normalizedAuthority{}, false
+	if strings.ContainsAny(raw, "[]:") {
+		return "", "", false
 	}
-	return normalizedAuthority{host: strings.ToLower(host)}, true
+	return raw, "", true
 }
