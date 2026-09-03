@@ -493,6 +493,8 @@ Windows and Linux) — the two mechanisms that make embedded stores unsafe on SM
 so Azure Files SMB is a reasonable default, with NFS or AKS + Azure Disk kept as
 escalation paths only if a specific problem shows up. TLS terminates at the App Service front end and the
 app runs the Entra authenticator (`-entra-*` / `SHOAL_ENTRA_*`). The
-host-authority seam (gap #3) still gates **public** exposure: stand the instance
-up and wire identity, but treat the front door as closed until the host-allowlist
-flag lands.
+host-authority gate (gap #3) is closed by **PR #295** (merged to `main` at
+`3670e00`): the template sets `SHOAL_ALLOWED_HOST` to the App Service hostname
+(or your custom domains) so the public bind is serviceable, not refused with 421.
+See the artifact README's host-authority section for the wiring and the honest
+defence-in-depth caveat.

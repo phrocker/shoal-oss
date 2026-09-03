@@ -61,6 +61,9 @@ param entraJwksUri string = ''
 @minValue(1)
 param stateShareQuotaGiB int = 100
 
+@description('Comma-separated exact-match allow-list of external authorities (host or host:port) that the host-authority gate will serve. Leave EMPTY to default to the App Service default hostname so the built-in *.azurewebsites.net endpoint works with no extra config. Set it to name custom domains (for example "explorer.example.test,myapp.azurewebsites.net"). Requires the -allowed-host support added in PR #295.')
+param allowedHosts string = ''
+
 @description('Storage account SKU backing the state file share. Standard_LRS is single-region redundant only; see the backup/DR notes in the README.')
 param storageSkuName string = 'Standard_LRS'
 
@@ -125,50 +128,44 @@ resource plan 'Microsoft.Web/serverfarms@2023-12-01' = {
   }
 }
 
-var baseAppSettings = [
+// Host-authority allow-list (PR #295's -allowed-host / SHOAL_ALLOWED_HOST).
+// When the operator leaves the parameter empty, default to THIS site's own
+// default hostname (for example myapp.azurewebsites.net). That is the exact
+// authority a browser sends: it reaches App Service over HTTPS on the default
+// port 443, so the Host header carries NO port, and PR #295 matches host
+// case-insensitively with the port compared exactly (empty == empty). The
+// allow-list entry is therefore the BARE hostname, never hostname:8098 (8098 is
+// only the internal container port App Service forwards to, never in the public
+// Host header). A non-empty parameter is passed through verbatim so an operator
+// can name custom domains explicitly.
+var effectiveAllowedHosts = empty(allowedHosts) ? site.properties.defaultHostName : allowedHosts
+
+// App settings, as a map for the child `appsettings` config resource. They are
+// set on a separate resource (not inline in siteConfig) precisely so
+// SHOAL_ALLOWED_HOST can reference the site's own defaultHostName without a
+// self-reference cycle.
+var appSettings = union(
   {
-    name: 'WEBSITES_PORT'
-    value: string(containerPort)
-  }
-  {
+    WEBSITES_PORT: string(containerPort)
     // The state root is a bring-your-own Azure Files mount at /var/lib/shoal,
     // not /home, so App Service /home storage is intentionally disabled.
-    name: 'WEBSITES_ENABLE_APP_SERVICE_STORAGE'
-    value: 'false'
+    WEBSITES_ENABLE_APP_SERVICE_STORAGE: 'false'
+    WEBSITES_CONTAINER_START_TIME_LIMIT: '600'
+    // Entra tenant/client/roles arrive as SHOAL_ENTRA_* environment variables,
+    // so no identifiers land on the command line or in shell history.
+    SHOAL_ENTRA_TENANT: entraTenantId
+    SHOAL_ENTRA_CLIENT_ID: entraClientId
+    SHOAL_ENTRA_READER_ROLES: entraReaderRoles
+    SHOAL_ENTRA_CONTRIBUTOR_ROLES: entraContributorRoles
+    SHOAL_ALLOWED_HOST: effectiveAllowedHosts
+  },
+  empty(entraIssuer) ? {} : {
+    SHOAL_ENTRA_ISSUER: entraIssuer
+  },
+  empty(entraJwksUri) ? {} : {
+    SHOAL_ENTRA_JWKS_URI: entraJwksUri
   }
-  {
-    name: 'WEBSITES_CONTAINER_START_TIME_LIMIT'
-    value: '600'
-  }
-  {
-    name: 'SHOAL_ENTRA_TENANT'
-    value: entraTenantId
-  }
-  {
-    name: 'SHOAL_ENTRA_CLIENT_ID'
-    value: entraClientId
-  }
-  {
-    name: 'SHOAL_ENTRA_READER_ROLES'
-    value: entraReaderRoles
-  }
-  {
-    name: 'SHOAL_ENTRA_CONTRIBUTOR_ROLES'
-    value: entraContributorRoles
-  }
-]
-var issuerSetting = empty(entraIssuer) ? [] : [
-  {
-    name: 'SHOAL_ENTRA_ISSUER'
-    value: entraIssuer
-  }
-]
-var jwksSetting = empty(entraJwksUri) ? [] : [
-  {
-    name: 'SHOAL_ENTRA_JWKS_URI'
-    value: entraJwksUri
-  }
-]
+)
 
 resource site 'Microsoft.Web/sites@2023-12-01' = {
   name: siteName
@@ -195,15 +192,20 @@ resource site 'Microsoft.Web/sites@2023-12-01' = {
       numberOfWorkers: 1
       acrUseManagedIdentityCreds: useAcrManagedIdentity
       acrUserManagedIdentityID: useAcrManagedIdentity ? identity.properties.clientId : ''
-      // Entra tenant/client/roles arrive as SHOAL_ENTRA_* environment
-      // variables (app settings), so no identifiers land on the command line
-      // or in shell history. Only the non-secret listen/state flags are passed
-      // here; -listen 0.0.0.0 is required so App Service can reach the app, and
-      // see the host-authority caveat in the README before public exposure.
+      // Only the non-secret listen/state flags are passed here; -listen
+      // 0.0.0.0 is required so App Service can reach the app. Everything else,
+      // including the host-authority allow-list, is an app setting below.
       appCommandLine: '-state-dir ${stateMountPath} -listen 0.0.0.0:${string(containerPort)}'
-      appSettings: concat(baseAppSettings, issuerSetting, jwksSetting)
     }
   }
+}
+
+// App settings live in their own resource so SHOAL_ALLOWED_HOST can default to
+// the site's own defaultHostName without a self-reference cycle.
+resource siteAppSettings 'Microsoft.Web/sites/config@2023-12-01' = {
+  parent: site
+  name: 'appsettings'
+  properties: appSettings
 }
 
 // Mount the Azure Files share at the container state root. The access key is
@@ -224,6 +226,9 @@ resource siteStorage 'Microsoft.Web/sites/config@2023-12-01' = {
 
 @description('Default HTTPS endpoint of the App Service instance (behind platform TLS).')
 output appDefaultHostName string = 'https://${site.properties.defaultHostName}'
+
+@description('Effective host-authority allow-list (SHOAL_ALLOWED_HOST) the gate will serve. When the allowedHosts parameter is empty this is the App Service default hostname.')
+output effectiveAllowedHosts string = effectiveAllowedHosts
 
 @description('Principal (object) ID of the user-assigned managed identity, for role assignments such as AcrPull.')
 output identityPrincipalId string = identity.properties.principalId

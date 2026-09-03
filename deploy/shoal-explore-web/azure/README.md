@@ -204,6 +204,8 @@ the first deploy.
   #   Policy catalog is durable in /var/lib/shoal/policy: ... Persist both the
   #   corpus (/var/lib/shoal/corpus) and this policy directory ...
   #   Shoal Explorer listening at http://0.0.0.0:8098
+  # must NOT appear (host-authority app setting missing — see that section):
+  #   WARNING: bound 0.0.0.0:8098 but -allowed-host/SHOAL_ALLOWED_HOST is unset ...
   ```
 
   (Note: the distroless image has no shell, so `az webapp ssh` is not available —
@@ -332,19 +334,98 @@ so both persist under one mount) ...
 Never "fix" this by deleting the corpus or pointing at a fresh share to make
 startup succeed: that discards data the guard is protecting.
 
-### Public exposure prerequisite (host-authority binding)
+### Host-authority: naming the external authority (required for a public bind)
 
-The webapi layer does **not yet** enforce that the request `Host` matches the
-listener authority, and there is no external-authority/host-allowlist flag on
-`main` yet (a separate change is in flight). The template binds
-`-listen 0.0.0.0:<port>` so App Service can reach the container, which makes the
-expected authority `0.0.0.0:<port>` — real client `Host` headers behind the App
-Service front end will not match. **[Verified]** — gap #3 in the guide and
-`selectAuthenticator` allows the non-loopback bind only because Entra is
-configured. **Consequence:** this deployment is **infrastructure-ready but not
-yet publicly serviceable** — stand it up, wire identity, back it up, but treat
-the front door as closed until the host-allowlist flag lands. When it does, it
-will be one more app setting / `-` flag; the shape here does not change.
+A public bind of `-listen 0.0.0.0:<port>` means the socket's resolved authority
+is `0.0.0.0:<port>`, which no real client `Host` header ever carries. **PR #295**
+adds a central host-authority gate (`pkg/explorer/webapi`) enforced on **every
+route before authentication**: it compares the request `Host`/`:authority`
+against an exact-match allow-list, and answers **`421 Misdirected Request`** to
+anything that does not match. Its default, when unconfigured, is the resolved
+listen address — so on a public bind **every request is refused until you name
+the external authority**. This is a deliberate, correct fail-closed default; it
+is also why the naive template would 421 on every request if we did nothing.
+
+The template configures it for you. **[Verified]** against merged `main`
+(`origin/main` at `3670e00`, where PR #295 landed) —
+`cmd/shoal-explore-web/main.go` and `pkg/explorer/webapi/hostauthority.go` — the
+flag is:
+
+- `-allowed-host` — comma-separated, exact-match allow-list of authorities
+  (host or `host:port`). Host compares case-insensitively; **port compares
+  exactly**, and an entry with no port matches a request whose `Host` has no
+  port. No wildcard, no suffix, and `X-Forwarded-Host` is never trusted.
+- Environment fallback **`SHOAL_ALLOWED_HOST`** — which is what the template
+  sets, keeping the value off the command line for the same reason the Entra
+  identifiers are app settings.
+
+**Why the entry is the bare hostname, not `hostname:8098`.** Reasoned through,
+not guessed: a browser reaches App Service over HTTPS on port **443**, the
+default for the scheme, so it sends `Host: myapp.azurewebsites.net` with **no
+port**. `8098` is only the internal container port App Service forwards to; it
+never appears in the public `Host` header. PR #295 normalizes a portless
+authority to an empty port and matches empty-to-empty, so the correct allow-list
+entry is the **bare host**. Putting `:8098` in the list would match nothing.
+**[Verified]** — `normalizeAuthority`/`permits` in `hostauthority.go`.
+
+**What the template does:**
+
+- `allowedHosts` **empty (default)** → `SHOAL_ALLOWED_HOST` is set to the App
+  Service **default hostname** (`site.properties.defaultHostName`, e.g.
+  `myapp.azurewebsites.net`). The built-in `*.azurewebsites.net` endpoint works
+  with no extra configuration.
+- `allowedHosts` **set** → passed through verbatim, so a custom domain is named
+  explicitly, comma-separated and bare:
+
+  ```bicep
+  param allowedHosts = 'explorer.example.test,myapp.azurewebsites.net'
+  ```
+
+  Include the `azurewebsites.net` name too if you still want the default
+  endpoint to answer. The effective value is surfaced as the
+  `effectiveAllowedHosts` output.
+
+**Honest caveat — this is defence-in-depth, not a bug fix.** I confirmed against
+merged `main` (PR #295) that **nothing in `pkg/explorer/webapi/` derives a URL,
+redirect, or cookie domain from the request `Host` today** — the gate's own
+documentation says it bounds these attacks "regardless of whether any individual
+handler derives a URL from the request host today." So this hardens the edge
+against DNS rebinding, cache poisoning, and virtual-host confusion; it does not
+patch a live data-leak. Do not oversell it. **[Verified]** — `hostauthority.go`
+doc comment and a search of the package.
+
+**One residual [Inference] to smoke-test:** the gate matches whatever `Host`
+App Service forwards to the container. App Service's front end preserves the
+public `Host` header **[Inference — I could not test it from here]**; if a
+platform quirk rewrote it, requests would 421 despite correct config. Verify on
+first deploy: hit `https://<host>/` and a **200/401 means the authority matched;
+a 421 means the forwarded `Host` is not in `SHOAL_ALLOWED_HOST`** — set it to the
+name the client actually sends.
+
+**A useful negative signal (converts part of the inference into something
+observable).** PR #295 also emits a **one-time startup WARNING** — before any
+request is served — when the bind is non-loopback **and** `-allowed-host` /
+`SHOAL_ALLOWED_HOST` is unset. Its exact text (**[Verified]** — merged `main`,
+`hostAuthorityStartupWarning` in `cmd/shoal-explore-web/main.go`) is:
+
+```text
+WARNING: bound 0.0.0.0:8098 but -allowed-host/SHOAL_ALLOWED_HOST is unset, so
+the host-authority allow-list defaults to the bind address, which real client
+Host headers do not carry; every request will be refused with 421 Misdirected
+Request. Set -allowed-host to the external name(s) clients use to reach this
+workspace.
+```
+
+Because this template **always** sets the `SHOAL_ALLOWED_HOST` app setting, that
+warning should **never** appear. So it is a precise diagnostic: if you *do* see
+it in `az webapp log tail`, the app setting did not reach the container (a
+misapplied template, a config resource that failed, or a stale revision), and
+you have found the cause of the 421s before debugging anything else.
+
+> Sequencing note (historical): `-allowed-host` / `SHOAL_ALLOWED_HOST` shipped in
+> **PR #295**, which merged into `main` at `3670e00`. This branch is rebased onto
+> that commit, so the flag exists in the base source; every `[Verified]` tag in
+> this section was re-checked against merged `main`, not the feature branch.
 
 ## Explicitly not supported
 
@@ -368,8 +449,10 @@ template:
    `deploy/k8s` + `deploy/helm` distributed manifests target that world; this
    single-binary path deliberately does not). Adding an external datastore is an
    **owner decision**, not something this deployment should introduce.
-3. **Host-authority / multi-host serving** (gap #3) closed and generalized to a
-   real allowlist. **[Verified]**
+3. **Multi-host / multi-name serving.** The host-authority gate (PR #295) is
+   already the seam: it takes a comma-separated allow-list, so serving several
+   names is configuration, not code. Fronting several *instances* still needs
+   items 1 and 2 first. **[Verified]** — the flag is comma-separated.
 
 Until all three land, the honest ceiling is: **one shared instance, many users**,
 backed up by share snapshots. That is what these artifacts deliver.
