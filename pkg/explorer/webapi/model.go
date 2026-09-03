@@ -47,6 +47,11 @@ const (
 	MaxUploadTotalBytes  uint64 = 9 << 20
 )
 
+const (
+	DefaultChangePageSize uint32 = 25
+	MaxChangePageSize     uint32 = 100
+)
+
 // Capability identifies one browser-visible feature without revealing where or
 // how the backing Explorer service executes it.
 type Capability string
@@ -223,6 +228,33 @@ type IngestFileResult struct {
 type IngestResponse struct {
 	Snapshot Snapshot           `json:"snapshot"`
 	Files    []IngestFileResult `json:"files"`
+}
+
+// ChangesRequest asks for the caller's document change feed. An empty Cursor
+// starts from the beginning of retained history. The cursor is opaque: it
+// carries the caller's resume position and the corpus identity it was minted
+// against, and never exposes a raw sequence number to the client.
+type ChangesRequest struct {
+	Cursor string `json:"cursor,omitempty"`
+	Limit  uint32 `json:"limit,omitempty"`
+}
+
+// WorkspaceChange is one visible document publication reported by the feed. It
+// carries the same summary shape the Documents listing returns, so the feed's
+// disclosure surface is exactly that of the listing it mirrors.
+type WorkspaceChange struct {
+	Kind     string                   `json:"kind"`
+	Document explorer.DocumentSummary `json:"document"`
+}
+
+// ChangesResponse returns an ordered, resumable window of visible changes.
+// NextCursor is always present so a client always has a token to resume from,
+// even when the window is empty. More is a bare liveness hint that a further
+// visible change exists; it is never a count of withheld changes.
+type ChangesResponse struct {
+	Changes    []WorkspaceChange `json:"changes"`
+	NextCursor string            `json:"next_cursor"`
+	More       bool              `json:"more"`
 }
 
 // MetadataResponse advertises server-enforced public bounds.

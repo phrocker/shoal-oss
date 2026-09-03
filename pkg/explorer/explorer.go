@@ -62,6 +62,7 @@ type Explorer struct {
 	snapshot                Snapshot
 	snapshotAnchor          time.Time
 	lastPublicationSequence uint64
+	changeHistoryFloor      uint64
 	readOnly                bool
 	closed                  bool
 }
