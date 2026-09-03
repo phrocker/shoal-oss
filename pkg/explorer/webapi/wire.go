@@ -314,6 +314,69 @@ func (r *DocumentsResponse) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
+func (r ChangesResponse) MarshalJSON() ([]byte, error) {
+	changes := make([]any, 0, len(r.Changes))
+	for _, change := range r.Changes {
+		changes = append(changes, struct {
+			Kind            string       `json:"kind"`
+			Document        wireDocument `json:"document"`
+			Revision        wireRevision `json:"revision"`
+			SourceURI       string       `json:"source_uri"`
+			SourceMediaType string       `json:"source_media_type,omitempty"`
+		}{
+			Kind:            change.Kind,
+			Document:        wireDocumentValue(change.Document.Document),
+			Revision:        wireRevisionValue(change.Document.Revision),
+			SourceURI:       change.Document.SourceURI,
+			SourceMediaType: change.Document.SourceMediaType,
+		})
+	}
+	return json.Marshal(struct {
+		Changes    []any  `json:"changes"`
+		NextCursor string `json:"next_cursor"`
+		More       bool   `json:"more"`
+	}{changes, r.NextCursor, r.More})
+}
+
+func (r *ChangesResponse) UnmarshalJSON(data []byte) error {
+	var wire struct {
+		Changes []struct {
+			Kind            string       `json:"kind"`
+			Document        wireDocument `json:"document"`
+			Revision        wireRevision `json:"revision"`
+			SourceURI       string       `json:"source_uri"`
+			SourceMediaType string       `json:"source_media_type,omitempty"`
+		} `json:"changes"`
+		NextCursor string `json:"next_cursor"`
+		More       bool   `json:"more"`
+	}
+	if err := strictUnmarshal(data, &wire); err != nil {
+		return err
+	}
+	changes := make([]WorkspaceChange, 0, len(wire.Changes))
+	for _, item := range wire.Changes {
+		documentValue, err := documentValue(item.Document)
+		if err != nil {
+			return fmt.Errorf("changes.document: %w", err)
+		}
+		revisionValue, err := revisionValue(item.Revision)
+		if err != nil {
+			return fmt.Errorf("changes.revision: %w", err)
+		}
+		changes = append(changes, WorkspaceChange{
+			Kind: item.Kind,
+			Document: explorer.DocumentSummary{
+				Document: documentValue, Revision: revisionValue,
+				SourceURI: item.SourceURI, SourceMediaType: item.SourceMediaType,
+			},
+		})
+	}
+	*r = ChangesResponse{
+		Changes: changes, NextCursor: wire.NextCursor, More: wire.More,
+	}
+	return nil
+}
+
 func (r DocumentResponse) MarshalJSON() ([]byte, error) {
 	return json.Marshal(struct {
 		Snapshot Snapshot `json:"snapshot"`

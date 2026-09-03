@@ -122,6 +122,7 @@ func (h *Handler) routes() {
 		writeResponse(writer, http.StatusOK, identity)
 	})
 	h.mux.HandleFunc("POST /api/v1/ingest", ingestEndpoint(h.service))
+	h.mux.HandleFunc("POST /api/v1/changes", changesEndpoint(h.service))
 	h.mux.HandleFunc("POST /api/v1/documents", endpoint(h.service.Documents))
 	h.mux.HandleFunc("POST /api/v1/document", endpoint(h.service.Document))
 	h.mux.HandleFunc("POST /api/v1/retrieve", endpoint(h.service.Retrieve))
@@ -182,6 +183,33 @@ func capabilitiesFor(ctx context.Context, service Service) (Capabilities, error)
 		capabilities.Ingest = false
 	}
 	return capabilities, nil
+}
+
+// changesEndpoint serves the resumable document change feed. It is a read, so
+// it needs no workspace-mutation header, but it is gated on the optional
+// ChangeProvider extension so a backend that cannot serve an ordered,
+// authorized feed reports the capability as unavailable rather than serving an
+// unfiltered one.
+func changesEndpoint(service Service) http.HandlerFunc {
+	return func(writer http.ResponseWriter, request *http.Request) {
+		provider, ok := service.(ChangeProvider)
+		if !ok {
+			writeError(writer, shoal.NewError(
+				shoal.ErrorUnavailable, "workspace capability \"changes\" is unavailable"))
+			return
+		}
+		var input ChangesRequest
+		if err := decodeRequest(writer, request, &input); err != nil {
+			writeError(writer, shoal.NewError(shoal.ErrorInvalidArgument, err.Error()))
+			return
+		}
+		response, err := provider.Changes(request.Context(), input)
+		if err != nil {
+			writeError(writer, err)
+			return
+		}
+		writeResponse(writer, http.StatusOK, response)
+	}
 }
 
 func endpoint[Request any, Response any](

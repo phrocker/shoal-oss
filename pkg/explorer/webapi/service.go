@@ -29,6 +29,7 @@ import (
 	"time"
 
 	"github.com/phrocker/shoal-oss/pkg/explorer"
+	"github.com/phrocker/shoal-oss/pkg/explorer/authorized"
 	"github.com/phrocker/shoal-oss/pkg/graph"
 	"github.com/phrocker/shoal-oss/pkg/retrieval"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
@@ -47,6 +48,13 @@ type Service interface {
 // IngestProvider is an optional service extension for mutable browser uploads.
 type IngestProvider interface {
 	Ingest(context.Context, IngestRequest) (IngestResponse, error)
+}
+
+// ChangeProvider is an optional service extension for the resumable document
+// change feed. Services that cannot serve an ordered feed do not implement it,
+// and the transport fails closed with an unavailable error.
+type ChangeProvider interface {
+	Changes(context.Context, ChangesRequest) (ChangesResponse, error)
 }
 
 // CapabilityProvider is an optional service extension for dynamic feature
@@ -83,6 +91,16 @@ type suppressionCountingLister interface {
 	DocumentsWithSuppressed(
 		context.Context,
 	) ([]explorer.DocumentSummary, uint32, error)
+}
+
+// changeFeedBackend is implemented by an authorized backing client that can
+// serve the caller's resumable document change feed. It is optional: a client
+// that does not implement it makes the change capability unavailable rather
+// than serving an unfiltered or unordered feed.
+type changeFeedBackend interface {
+	Changes(
+		context.Context, authorized.ChangeFeedRequest,
+	) (authorized.ChangeFeedPage, error)
 }
 
 // EmbeddedService adapts the public Explorer client to the workspace service.
@@ -169,6 +187,52 @@ func (s *EmbeddedService) documentsCountingSuppressed(
 	}
 	documents, err := s.client.Documents(ctx)
 	return documents, 0, err
+}
+
+// Changes serves the caller's resumable document change feed. The request
+// cursor is an opaque sealed token minted by the authorized layer; this service
+// never reads or constructs it, it only forwards it and returns the sealed
+// cursor the backend produces. The cursor's confidentiality and integrity --
+// and the resynchronise handling for a stale or foreign cursor -- live in
+// authorized.Client.Changes, which holds the per-corpus seal key. No
+// withheld-change count is emitted: see authorized.Client.Changes for why the
+// feed discloses less than the Documents and Retrieve listings.
+func (s *EmbeddedService) Changes(
+	ctx context.Context, request ChangesRequest,
+) (ChangesResponse, error) {
+	backend, ok := s.client.(changeFeedBackend)
+	if !ok {
+		return ChangesResponse{}, shoal.NewError(
+			shoal.ErrorUnavailable, "workspace capability \"changes\" is unavailable")
+	}
+	limit, err := normalizeChangeLimit(request.Limit)
+	if err != nil {
+		return ChangesResponse{}, err
+	}
+	page, err := backend.Changes(ctx, authorized.ChangeFeedRequest{
+		Cursor: request.Cursor,
+		Limit:  int(limit),
+	})
+	if err != nil {
+		return ChangesResponse{}, err
+	}
+	changes := make([]WorkspaceChange, 0, len(page.Changes))
+	for _, change := range page.Changes {
+		changes = append(changes, WorkspaceChange{
+			Kind: string(change.Kind),
+			Document: explorer.DocumentSummary{
+				Document:        change.Document,
+				Revision:        change.Revision,
+				SourceURI:       change.SourceURI,
+				SourceMediaType: change.SourceMediaType,
+			},
+		})
+	}
+	return ChangesResponse{
+		Changes:    changes,
+		NextCursor: page.Cursor,
+		More:       page.More,
+	}, nil
 }
 
 func (s *EmbeddedService) Document(
@@ -472,6 +536,17 @@ func validateRetrievalResponse(response retrieval.Response, query retrieval.Requ
 func encodeCursor(snapshot string, offset int) string {
 	value := snapshot + ":" + strconv.Itoa(offset)
 	return base64.RawURLEncoding.EncodeToString([]byte(value))
+}
+
+func normalizeChangeLimit(limit uint32) (uint32, error) {
+	if limit == 0 {
+		return DefaultChangePageSize, nil
+	}
+	if limit > MaxChangePageSize {
+		return 0, shoal.NewError(
+			shoal.ErrorInvalidArgument, "change page limit exceeds the server bound")
+	}
+	return limit, nil
 }
 
 func decodeCursor(cursor, snapshot string) (int, error) {
