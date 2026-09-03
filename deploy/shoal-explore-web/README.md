@@ -40,4 +40,24 @@ remain available for legacy/custom layouts — see the guide.
 The image (`Dockerfile.shoal-explore-web`, at the repo root) is the same artifact
 a shared instance would run; only the flags differ. For a shared, non-loopback
 instance, supply the Microsoft Entra ID authenticator instead of `-dev-auth`
-(see [Real authentication with Microsoft Entra ID](../../docs/shoal-explore-web-deploy.md#real-authentication-with-microsoft-entra-id)).
+(see [Real authentication with Microsoft Entra ID](../../docs/shoal-explore-web-deploy.md#real-authentication-with-microsoft-entra-id))
+and set `-allowed-host` / `SHOAL_ALLOWED_HOST` to the external name(s) the proxy
+forwards.
+
+## Host authority
+
+The handler refuses any request whose `Host`/`:authority` does not exactly match
+an allow-list (case-insensitive hostname, exact port), returning `421 Misdirected
+Request`. It defaults to the resolved listen address, so the loopback compose
+profile above needs no configuration: it is reached at `http://127.0.0.1:8098`,
+whose `Host` is the bind authority. This local profile uses **host networking**,
+so the container binds `127.0.0.1` directly in the host namespace and that
+default authority is exactly what the browser sends.
+
+A shared instance that binds a wildcard address (`0.0.0.0:<port>`) resolves to an
+authority no real client `Host` carries, so it **fails closed** — every request
+`421`s — until `-allowed-host` names the external authority (for example
+`-allowed-host explorer.example.test`, comma-separated for more than one name).
+`X-Forwarded-Host` is never trusted. See
+[Host authority](../../docs/shoal-explore-web-deploy.md#host-authority-required-for-a-public-bind)
+in the guide.

@@ -128,6 +128,7 @@ mounted volume — never code:
 | Concern            | Local (laptop)                     | Shared instance                              |
 | ------------------ | ---------------------------------- | -------------------------------------------- |
 | Bind address       | `-listen 127.0.0.1:8098` (loopback)| `-listen 0.0.0.0:<port>` (see gaps below)    |
+| Host authority     | default (the resolved listen address) | `-allowed-host <external-name[:port]>` (see below) |
 | Data directory     | `-state-dir /var/lib/shoal` (one mounted volume) | same flag, backed by durable storage |
 | Authenticator      | `-dev-auth` (loopback-only)        | Microsoft Entra ID (`-entra-*`, see below)   |
 | TLS termination    | none (loopback)                    | terminated at an ingress/reverse proxy       |
@@ -192,6 +193,7 @@ is invisible to everyone, so you must assign at least one role to grant access.
 $ docker run --rm --network host -v shoal-explore-state:/var/lib/shoal \
     shoal-explore-web:test \
     -state-dir /var/lib/shoal -listen 0.0.0.0:8098 \
+    -allowed-host explorer.example.test \
     -entra-tenant <tenant-guid> \
     -entra-client-id <application-client-id> \
     -entra-reader-roles Shoal.Reader \
@@ -202,9 +204,57 @@ Shoal Explorer listening at http://0.0.0.0:8098
 
 The IDs above are placeholders — substitute your tenant and application (client)
 IDs. Clients call the API with `Authorization: Bearer <token>`, where the token
-is a v2 Entra token addressed to `<application-client-id>`. See the
-[host-authority gap](#shared--cloud-instance-shape-and-open-gaps) before exposing
-a public bind behind a reverse proxy.
+is a v2 Entra token addressed to `<application-client-id>`. Set `-allowed-host`
+before exposing a public bind behind a reverse proxy (see below).
+
+## Host authority (required for a public bind)
+
+Every request must present a `Host` header (HTTP/1.1) or `:authority` (HTTP/2)
+that matches an allow-list, enforced centrally before routing or handling. The
+match is exact: the hostname compares **case-insensitively** and the port
+**exactly**. There is **no wildcard, no suffix, and no `X-Forwarded-Host` or
+`Forwarded` matching** — each of those is a classic host-authority bypass. A
+mismatch is refused with `421 Misdirected Request` and a fixed body that never
+echoes the submitted host. This bounds cache poisoning, absolute-URL/redirect
+poisoning, virtual-host confusion, and DNS rebinding against a private-network
+listener.
+
+| Flag / environment fallback                | Purpose                                                                   |
+| ------------------------------------------ | ------------------------------------------------------------------------- |
+| `-allowed-host` / `SHOAL_ALLOWED_HOST`     | Comma-separated exact-match list of external authorities (`host` or `host:port`). |
+
+**Default when unset — the resolved listen address (fail-closed).** A loopback
+bind (`127.0.0.1:8098`) therefore serves only requests whose `Host` is that
+loopback authority, preserving the local-first posture with no configuration.
+A **non-loopback or wildcard** bind (`0.0.0.0:<port>`) resolves to a socket
+address real client `Host` headers never carry, so such a deployment **refuses
+every request until `-allowed-host` names the external authority** the proxy or
+client actually sends. That is deliberate: a public bind fails closed rather
+than silently accepting any `Host`.
+
+A deployment behind a reverse proxy that legitimately answers to more than one
+name lists each explicitly, comma-separated (for example
+`-allowed-host explorer.example.test,explorer-internal.example.test`). Because
+TLS terminates at the proxy, the value is usually the port-less external name
+(for example `explorer.example.test`), matching the `Host` the browser sends on
+the default port; include a port only when the client sends one.
+
+`X-Forwarded-Host` is **never** trusted. A proxy story that requires honouring
+a forwarded host is out of scope here (it needs an authenticated hop and an
+explicit trust boundary) and is not implemented.
+
+A `Host` in FQDN-root form with a single trailing dot (`explorer.example.test.`)
+is treated as equal to its non-rooted spelling — the dot is normalised away on
+both the configured and the request side, so either form matches either. Without
+that normalisation the rooted form would fail closed (a `421`, not a security
+hole); it is normalised only to avoid a confusing outage if a client sends it.
+
+When `-listen` binds a non-loopback or wildcard address and `-allowed-host` is
+unset, the command prints a one-time startup **WARNING** naming the bound
+address and the `421` consequence, before any request is served. This is the
+most common way to trip over the gate; refusals themselves are not logged
+per-request, because the `Host` is attacker-controlled and would invite a log
+flood.
 
 ## The unsafe-configuration guard
 
@@ -382,22 +432,26 @@ over:
    on-the-wire representation (issue #278): forwarding would authenticate at the
    edge and then call upstream with no identity. This means **multi-node scaling
    is out of scope**; the target is single instance, many users.
-3. **Host-authority binding.** The handler requires the request `Host` to equal
-   the listener's resolved address (`allowedAuthority`). A public bind of
-   `0.0.0.0:<port>` makes the expected authority `0.0.0.0:<port>`, which real
-   client `Host` headers won't match. A shared instance behind a reverse proxy
-   needs a configurable external authority — a config seam that does not exist
-   yet, so a public bind is not yet end-to-end serviceable even with a valid
-   authenticator.
+3. **Host-authority binding is configurable (this change).** The handler
+   requires the request `Host`/`:authority` to match an exact allow-list. It
+   defaults to the listener's resolved address — so a loopback bind is served
+   with no configuration — and a shared instance behind a reverse proxy sets
+   `-allowed-host` / `SHOAL_ALLOWED_HOST` to the external name(s), decoupling the
+   served authority from the wildcard socket address. See
+   [Host authority](#host-authority-required-for-a-public-bind). Until it is set,
+   a public bind of `0.0.0.0:<port>` fails closed (every request `421`s),
+   because the resolved authority `0.0.0.0:<port>` never matches a real client
+   `Host`.
 4. **Durable policy store (#284 / PR #288) has landed.** The policy catalog now
    persists, and a split-brain guard refuses to start when the corpus holds
    documents but the policy catalog is empty (a lost policy volume). Use
    `-state-dir` so the corpus and policy always persist under one mount.
 
-Until (3) is addressed, a public bind authenticates correctly but rejects
-requests whose `Host` differs from the bind address — safe, but not yet
-serviceable behind a proxy. This is a deliberate fail-closed posture, not a
-packaging defect.
+A public bind is now end-to-end serviceable behind a proxy: run the Entra
+authenticator and set `-allowed-host` to the external name the proxy forwards.
+Omitting `-allowed-host` on a public bind is a deliberate fail-closed posture —
+requests are refused until the external authority is declared — not a packaging
+defect.
 
 ## Azure hosting (one option, not a decision)
 
@@ -420,6 +474,6 @@ must survive restarts and redeploys.
   control, the most operational overhead.
 
 In all three, TLS terminates at the platform ingress and the app runs the Entra
-authenticator (`-entra-*`); the outstanding host-authority seam (gap #3) must be
-closed before a public bind behind the ingress is end-to-end serviceable. Treat
-the above as one sketch, not a recommendation.
+authenticator (`-entra-*`) and sets `-allowed-host` to the external name the
+ingress forwards, so a public bind behind the ingress is end-to-end serviceable.
+Treat the above as one sketch, not a recommendation.
