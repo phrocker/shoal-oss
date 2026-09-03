@@ -175,7 +175,8 @@ func (c *Client) EnsureInitialized(ctx context.Context, options InitializeOption
 		if status == StatusAccepted {
 			return head, nil
 		}
-		if status != StatusRejected && !errors.Is(writeErr, ErrConditionalUnknown) {
+		if status != StatusRejected && !errors.Is(writeErr, ErrConditionalUnknown) &&
+			!resumeAfterDefiniteFailure(writeErr) {
 			return coordination.AllocatorHeadV1{}, classifyUnavailable(writeErr)
 		}
 		ambiguous = ambiguous || errors.Is(writeErr, ErrConditionalUnknown)
@@ -326,7 +327,8 @@ func (c *Client) Reserve(ctx context.Context, request ReserveRequest) (coordinat
 		if status == StatusAccepted {
 			return reservation, nil
 		}
-		if status != StatusRejected && !errors.Is(writeErr, ErrConditionalUnknown) {
+		if status != StatusRejected && !errors.Is(writeErr, ErrConditionalUnknown) &&
+			!resumeAfterDefiniteFailure(writeErr) {
 			return coordination.ReservationV1{}, classifyUnavailable(writeErr)
 		}
 		decision, reconcileErr := c.reconcileAllocation(ctx, predecessor, reservation)
@@ -472,7 +474,8 @@ func (c *Client) applyReservationTransition(ctx context.Context, mutation Mutati
 		if status == StatusAccepted {
 			return nil
 		}
-		if status != StatusRejected && !errors.Is(err, ErrConditionalUnknown) {
+		if status != StatusRejected && !errors.Is(err, ErrConditionalUnknown) &&
+			!resumeAfterDefiniteFailure(err) {
 			return classifyUnavailable(err)
 		}
 		got, readErr := c.Reservation(ctx, terminal.Epoch)
@@ -516,7 +519,8 @@ func (c *Client) createOutcome(ctx context.Context, outcome coordination.EpochOu
 		if status == StatusAccepted {
 			return nil
 		}
-		if status != StatusRejected && !errors.Is(err, ErrConditionalUnknown) {
+		if status != StatusRejected && !errors.Is(err, ErrConditionalUnknown) &&
+			!resumeAfterDefiniteFailure(err) {
 			return classifyUnavailable(err)
 		}
 		got, readErr := c.Outcome(ctx, outcome.Epoch)
@@ -614,7 +618,8 @@ func (c *Client) AdvanceFrontier(ctx context.Context) (coordination.FrontierChec
 		if status == StatusAccepted {
 			return checkpoint, nil
 		}
-		if status != StatusRejected && !errors.Is(writeErr, ErrConditionalUnknown) {
+		if status != StatusRejected && !errors.Is(writeErr, ErrConditionalUnknown) &&
+			!resumeAfterDefiniteFailure(writeErr) {
 			return coordination.FrontierCheckpointV1{}, classifyUnavailable(writeErr)
 		}
 		decision, reconcileErr := c.reconcileCheckpoint(ctx, head, checkpoint, history)
@@ -727,7 +732,8 @@ func (c *Client) Retire(ctx context.Context) (coordination.AllocatorHeadV1, erro
 		if status == StatusAccepted {
 			return next, nil
 		}
-		if status != StatusRejected && !errors.Is(writeErr, ErrConditionalUnknown) {
+		if status != StatusRejected && !errors.Is(writeErr, ErrConditionalUnknown) &&
+			!resumeAfterDefiniteFailure(writeErr) {
 			return coordination.AllocatorHeadV1{}, classifyUnavailable(writeErr)
 		}
 		decision, reconcileErr := c.reconcileRetirement(ctx, head, next, conditions[1:])
@@ -994,6 +1000,18 @@ func classifyUnavailable(err error) error {
 		return err
 	}
 	return errors.Join(ErrUnavailable, err)
+}
+
+// resumeAfterDefiniteFailure reports whether a non-rejected, non-ambiguous
+// CompareAndMutate error should resume through the read-back reconcile path
+// rather than abort. It returns true to resume, and false only for context
+// cancellation, which short-circuits the loop. The Store contract
+// (allocator/store.go) withholds ErrConditionalUnknown unless a mutation may
+// have applied, so any other error means the conditional mutation definitely
+// did not apply and is safe to reconcile and retry - strictly safer than the
+// ambiguous ErrConditionalUnknown case the loops already handle.
+func resumeAfterDefiniteFailure(err error) bool {
+	return !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded)
 }
 
 func incrementHeadGeneration(head *coordination.AllocatorHeadV1) error {

@@ -278,7 +278,8 @@ func (c *Coordinator) claim(ctx context.Context, request Publication) (storedTxn
 		if status == allocator.StatusAccepted {
 			return storedTxn{root: root, lease: lease}, false, nil
 		}
-		if status != allocator.StatusRejected && !errors.Is(writeErr, allocator.ErrConditionalUnknown) {
+		if status != allocator.StatusRejected && !errors.Is(writeErr, allocator.ErrConditionalUnknown) &&
+			!resumeAfterDefiniteFailure(writeErr) {
 			return storedTxn{}, false, errors.Join(ErrUnavailable, writeErr)
 		}
 		existing, readErr := c.readTxn(ctx, request.TXN)
@@ -644,7 +645,8 @@ func (c *Coordinator) applyTxnMutation(
 		if status == allocator.StatusAccepted {
 			return after, nil
 		}
-		if status != allocator.StatusRejected && !errors.Is(writeErr, allocator.ErrConditionalUnknown) {
+		if status != allocator.StatusRejected && !errors.Is(writeErr, allocator.ErrConditionalUnknown) &&
+			!resumeAfterDefiniteFailure(writeErr) {
 			return storedTxn{}, errors.Join(ErrUnavailable, writeErr)
 		}
 		got, readErr := c.readTxn(ctx, txn)
@@ -684,7 +686,8 @@ func (c *Coordinator) writeChunks(ctx context.Context, txn coordination.TXN, chu
 			if status == allocator.StatusAccepted {
 				break
 			}
-			if status != allocator.StatusRejected && !errors.Is(writeErr, allocator.ErrConditionalUnknown) {
+			if status != allocator.StatusRejected && !errors.Is(writeErr, allocator.ErrConditionalUnknown) &&
+				!resumeAfterDefiniteFailure(writeErr) {
 				return errors.Join(ErrUnavailable, writeErr)
 			}
 			cells, readErr := c.store.ReadExact(ctx, []allocator.Coordinate{cell})
@@ -919,7 +922,8 @@ func (c *Coordinator) publishCopies(
 		if status == allocator.StatusAccepted {
 			return after, nil
 		}
-		if status != allocator.StatusRejected && !errors.Is(writeErr, allocator.ErrConditionalUnknown) {
+		if status != allocator.StatusRejected && !errors.Is(writeErr, allocator.ErrConditionalUnknown) &&
+			!resumeAfterDefiniteFailure(writeErr) {
 			return storedTxn{}, errors.Join(ErrUnavailable, writeErr)
 		}
 		decision, got, reconcileErr := c.reconcilePublication(ctx, txn, stored, after, expected)
@@ -1187,4 +1191,16 @@ func classify(err error) error {
 	default:
 		return errors.Join(ErrUnavailable, err)
 	}
+}
+
+// resumeAfterDefiniteFailure reports whether a non-rejected, non-ambiguous
+// CompareAndMutate error should resume through the read-back reconcile path
+// rather than abort. It returns true to resume, and false only for context
+// cancellation, which short-circuits the loop. The Store contract
+// (allocator/store.go) withholds ErrConditionalUnknown unless a mutation may
+// have applied, so any other error means the conditional mutation definitely
+// did not apply and is safe to reconcile and retry - strictly safer than the
+// ambiguous ErrConditionalUnknown case the loops already handle.
+func resumeAfterDefiniteFailure(err error) bool {
+	return !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded)
 }
