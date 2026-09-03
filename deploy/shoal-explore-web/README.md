@@ -20,6 +20,9 @@ Files:
 - `docker-compose.yml` — the local one-command profile (host networking,
   `-state-dir /var/lib/shoal`, single state-root volume `explorer-state`).
 - `.env.example` — copy to `.env` to override `SHOAL_EXPLORE_LISTEN`.
+- `azure/` — Bicep and guidance for a single shared **Azure** instance
+  (App Service for Containers, one writer, Azure Files state root). See
+  [`azure/README.md`](azure/README.md).
 
 ## Volume layout: one state root
 

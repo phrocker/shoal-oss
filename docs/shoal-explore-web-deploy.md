@@ -18,7 +18,7 @@ prerequisites below land) in a shared instance, where the two deployments differ
 - [The unsafe-configuration guard](#the-unsafe-configuration-guard)
 - [Persistence: corpus and authorization both survive](#persistence-corpus-and-authorization-both-survive)
 - [Shared / cloud instance: shape and open gaps](#shared--cloud-instance-shape-and-open-gaps)
-- [Azure hosting (one option, not a decision)](#azure-hosting-one-option-not-a-decision)
+- [Azure hosting: App Service for Containers, single instance](#azure-hosting-app-service-for-containers-single-instance)
 
 ## Image
 
@@ -453,27 +453,42 @@ Omitting `-allowed-host` on a public bind is a deliberate fail-closed posture �
 requests are refused until the external authority is declared — not a packaging
 defect.
 
-## Azure hosting (one option, not a decision)
+## Azure hosting: App Service for Containers, single instance
 
-The hosting shape is **not decided**. The image is portable; the deciding factor
-is **persistent-volume semantics**, because the corpus is a local directory that
-must survive restarts and redeploys.
+The hosting shape **is** decided, and the deciding factor is exactly the one this
+guide has been building toward: a **persistent, single-writer volume** that
+survives restarts and redeploys without ever running two writers against the
+embedded store. The full decision, evidence (tagged verified / documented /
+inferred), and the deployable Bicep live under
+[`deploy/shoal-explore-web/azure/`](../deploy/shoal-explore-web/azure/README.md).
 
-- **Azure Container Apps** — closest to the compose model. Mount an **Azure Files**
-  volume at the state root `/var/lib/shoal` (covering both the corpus and the
-  sibling policy catalog). Caveat: Container Apps runs multiple
-  replicas by default and load-balances across them; this workload is
-  **single-instance** (no shared coordination — see gap #2), so pin
-  `minReplicas: 1` / `maxReplicas: 1`. SMB/Azure Files latency under the storage
-  engine should be validated before committing.
-- **App Service (custom container)** — persistent storage via `WEBSITES_ENABLE_APP_SERVICE_STORAGE`
-  or a mounted Azure Files share at `/var/lib/shoal`. Also single-instance
-  (disable scale-out).
-- **AKS** — a single-replica `Deployment` (or `StatefulSet`) with a
-  `ReadWriteOnce` PVC mounted at the state root `/var/lib/shoal`. The most
-  control, the most operational overhead.
+**Chosen: Azure App Service for Containers, one instance, deploy stop-first.**
+The short version of why:
 
-In all three, TLS terminates at the platform ingress and the app runs the Entra
-authenticator (`-entra-*`) and sets `-allowed-host` to the external name the
-ingress forwards, so a public bind behind the ingress is end-to-end serviceable.
-Treat the above as one sketch, not a recommendation.
+- **Container Apps is rejected.** In single-revision mode it uses zero-downtime
+  deployment, so a new revision is brought up healthy **before** the old one is
+  torn down — the two overlap — and its only persistent storage is Azure Files,
+  which "multiple containers can mount … in another replica, revision, or
+  container app." For a single-writer local store that overlap is data
+  corruption you cannot switch off. (Microsoft Learn: Container Apps application
+  lifecycle; storage mounts.)
+- **App Service is chosen.** It also warm-swaps a new container in before
+  stopping the old, **but** it has a first-class `az webapp stop` / `start`, so a
+  deploy can force the old writer fully down before the new one starts. Its
+  bring-your-own Azure Files mount attaches at the state root `/var/lib/shoal`
+  (App Service forbids mounting at `/` or `/home`, but `/var/lib/shoal` is fine).
+  Single instance is `capacity: 1` + `numberOfWorkers: 1` + no autoscale.
+- **AKS is rejected as overkill.** A `replicas: 1` StatefulSet on a
+  ReadWriteOnce Azure Disk is the *only* option that enforces one writer at the
+  storage layer, and it is the documented escalation path if the Azure Files
+  risks below bite — but running a Kubernetes cluster to host one binary is not
+  justified for this workload.
+
+Two risks are called out honestly in the artifact README and must be smoke-tested
+on first deploy: the non-root uid `65532` writing an SMB mount, and the embedded
+engine's file semantics on SMB (switch to Azure Files NFS, or escalate to AKS +
+Azure Disk, if either fails). TLS terminates at the App Service front end and the
+app runs the Entra authenticator (`-entra-*` / `SHOAL_ENTRA_*`). The
+host-authority seam (gap #3) still gates **public** exposure: stand the instance
+up and wire identity, but treat the front door as closed until the host-allowlist
+flag lands.

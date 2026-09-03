@@ -1,0 +1,302 @@
+# Shoal Explorer on Azure — single shared instance
+
+This directory holds the Azure deployment artifacts for a **single shared,
+multi-user** Shoal Explorer workspace: one Linux container, one persistent
+volume, no external datastore. It extends the platform-neutral packaging in
+[`../README.md`](../README.md) and the full guide in
+[`../../../docs/shoal-explore-web-deploy.md`](../../../docs/shoal-explore-web-deploy.md).
+
+- `main.bicep` — the deployment (App Service plan, Linux container web app,
+  Azure Files share for the state root, user-assigned managed identity, the
+  Azure Files mount at `/var/lib/shoal`).
+- `main.bicepparam` — example parameters, all obvious placeholders.
+
+## How to read the claims in this document
+
+Deployment docs are the easiest place in a repo to write something that has
+never run. Every non-trivial claim below is tagged:
+
+- **[Verified]** — I checked it against this repository (source, image, or an
+  offline template build) on the machine that produced this PR.
+- **[Docs]** — taken from Microsoft's documentation; a link is given.
+- **[Inference]** — my reasoning from the above. Useful, but not tested end to
+  end, because there are no Azure credentials in the environment that produced
+  this PR. **No Azure resource was created or deployed.**
+
+I could not deploy to Azure from here. Treat every **[Docs]** and **[Inference]**
+claim as needing a first-run smoke test in your subscription.
+
+## The deciding question: a persistent, single-writer volume
+
+Shoal's Explorer is an embedded store on a local directory. Two facts drive the
+whole hosting decision:
+
+1. It must run as **exactly one writer.** Two processes writing the same corpus
+   or policy store concurrently is data corruption, not a race you can retry.
+2. PR #288's **split-brain startup guard** means durability is not optional: if
+   the corpus holds documents but the policy catalog is empty (a lost or
+   swapped volume), the server **refuses to start**. A platform that gives you
+   ephemeral or silently re-created storage turns every restart into an outage.
+   **[Verified]** — see `TestOpenServiceRefusesSplitBrainStateDirectory` in
+   `cmd/shoal-explore-web/`.
+
+So the question is not "can it run a container" — all three candidates can — but
+"can it guarantee one writer against one durable volume, including across a
+deploy."
+
+### The three candidates, on that one question
+
+| | Persistent volume | Storage sharing model | Deploy overlap (two writers?) |
+| --- | --- | --- | --- |
+| **App Service for Containers** | Bring-your-own Azure Files mount at a custom path | Azure Files (SMB/NFS), multi-mount | Warm-swap: old container serves until new is ready **[Docs]** — *avoidable* with a stop-first deploy |
+| **Container Apps** | Azure Files (SMB/NFS) env storage | Multi-mount by design | Single-revision mode = zero-downtime = **overlap you cannot turn off** **[Docs]** |
+| **AKS** | RWO Azure Disk PVC on a `replicas: 1` StatefulSet | Block volume, one node at a time | StatefulSet recreates (terminate-before-start); RWO disk blocks a second attach **[Inference]** |
+
+Evidence for each row:
+
+- **Container Apps overlaps on every deploy, and cannot be stopped from doing
+  so.** "When you use single revision mode, Container Apps automatically
+  switches between revisions to support **zero downtime deployment**." **[Docs]**
+  ([application lifecycle](https://learn.microsoft.com/azure/container-apps/application-lifecycle-management)).
+  Zero-downtime means the new revision is brought up healthy **before** the old
+  one is torn down — the two overlap. Its only persistent storage is Azure
+  Files, and "**Multiple containers can mount the same file share, including
+  ones that are in another replica, revision, or container app**" **[Docs]**
+  ([storage mounts](https://learn.microsoft.com/azure/container-apps/storage-mounts)).
+  There is no ReadWriteOnce block option. So during any image or config change
+  two replicas can, and by design do, write the same embedded store at once.
+  **For a single-writer local store this is disqualifying** — you cannot deploy
+  a new image without briefly running two writers. **[Inference, from two
+  [Docs] facts]**
+
+- **App Service also warm-swaps, but you can defeat it.** "While the new
+  container is pulled and started, **App Service continues to serve requests
+  from the old container.** App Service only sends requests to the new container
+  after it starts and is ready" **[Docs]**
+  ([custom container](https://learn.microsoft.com/azure/app-service/configure-custom-container#use-an-image-from-a-network-protected-registry)).
+  So a naive image change overlaps too. The difference that decides this
+  document: App Service has a first-class **stop / start** primitive, so an
+  operator can force *old-fully-stopped-before-new-starts* — see
+  [Single-writer deploys](#single-writer-deploys). Persistent storage is a
+  bring-your-own Azure Files mount at a custom path (**"Mount path … Don't use
+  `/` or `/home`"** — `/var/lib/shoal` is fine) **[Docs]**
+  ([mount Azure Storage](https://learn.microsoft.com/azure/app-service/configure-connect-to-azure-storage?pivots=container-linux)).
+
+- **AKS is the only one that enforces single-writer at the storage layer**, via
+  a ReadWriteOnce Azure Disk that cannot attach to two nodes, plus StatefulSet
+  terminate-before-recreate update semantics. **[Inference]** It is also, for
+  one binary and one volume, **the wrong tool**: you would run and patch a
+  Kubernetes cluster to host a single process. The operational overhead is not
+  justified by this workload. If you ever need a storage-*enforced* guarantee or
+  proper block-device POSIX semantics, this is the escalation path — not the
+  starting point.
+
+### Decision
+
+**Azure App Service for Containers, one instance, deploy stop-first.** It is the
+simplest managed option that can host a persistent volume **and** be pinned to a
+verifiable single writer. Container Apps is rejected on the single-writer
+question above; AKS is rejected as overkill for one binary. This matches the
+prior guide's instinct (Container Apps "runs multiple replicas by default";
+App Service "single-instance") but makes the *why* explicit and evidence-backed.
+
+## Single-instance enforcement
+
+`main.bicep` pins one writer three ways **[Verified — present in the template]**:
+
+- App Service plan `sku.capacity: 1`.
+- Site `siteConfig.numberOfWorkers: 1`.
+- **No `Microsoft.Insights/autoscaleSettings` resource exists in the template.**
+  Do not add one, and do not enable autoscale in the portal. Scaling this app
+  out to two instances would point two writers at one Azure Files share.
+
+**[Inference]** App Service will not run a second worker on its own with
+autoscale absent and capacity 1; the residual overlap risk is deploy-time and
+platform-maintenance events, addressed next.
+
+## Single-writer deploys
+
+A plain image swap warm-overlaps (above). To deploy a new image **without two
+concurrent writers**, stop first:
+
+```console
+az webapp stop  --name <app> --resource-group <rg>
+az webapp config container set --name <app> --resource-group <rg> \
+    --docker-custom-image-name <registry>/shoal-explore-web:<new-pinned-tag>
+az webapp start --name <app> --resource-group <rg>
+```
+
+This trades a short **downtime window** for a guaranteed single writer — which is
+the correct trade for this store, and consistent with "zero-downtime deploy is
+not supported" below. **[Docs]** for the warm-swap behavior; **[Inference]** that
+`stop` fully releases the mount before `start` re-attaches it (App Service stops
+the container on `stop`). Verify on first deploy by confirming the old container
+logs stop before the new container logs begin.
+
+- Do **not** use deployment slots with swap here: a slot runs a second container
+  against the same data before the swap completes. Slots are a two-writer
+  pattern for this workload. **[Inference]**
+- Platform-initiated moves (plan scale, infra maintenance) can still briefly
+  recycle the container. On Azure Files (RWX) nothing at the storage layer
+  blocks a transient second writer. This residual risk is inherent to any
+  RWX-backed PaaS and is the honest reason AKS + RWO disk exists as the
+  escalation path. **[Inference]**
+
+## Identity and secrets
+
+- **No client secret anywhere.** The Entra authenticator validates inbound
+  bearer tokens and **"A client secret is never accepted."** **[Verified]** —
+  `cmd/shoal-explore-web/main.go`. There is no token-issuing flow, so there is
+  no application credential to store, rotate, or leak.
+- **Entra config travels as environment variables, not command-line args.** The
+  template sets `SHOAL_ENTRA_TENANT`, `SHOAL_ENTRA_CLIENT_ID`,
+  `SHOAL_ENTRA_READER_ROLES`, and `SHOAL_ENTRA_CONTRIBUTOR_ROLES` as app
+  settings; `main.go` reads each as a fallback for the matching `-entra-*` flag.
+  **[Verified]** — the six `os.Getenv("SHOAL_ENTRA_*")` fallbacks are in
+  `main.go`; the app command line carries only `-state-dir` and `-listen`, so no
+  tenant/app IDs land in shell history.
+- **Managed identity for platform access.** A user-assigned managed identity is
+  created and attached to the site; set `useAcrManagedIdentity=true` and grant
+  it `AcrPull` on your registry so image pulls need no registry password:
+
+  ```console
+  az role assignment create \
+    --assignee <identityClientId-output> \
+    --role AcrPull \
+    --scope <acr-resource-id>
+  ```
+
+  (Kept out of the template because the registry is usually in another resource
+  group or subscription; cross-scope role assignment belongs in an explicit
+  command.) **[Docs]**/**[Inference]**.
+- **The one credential — the Azure Files key — is never committed.** The mount
+  reads it with `listKeys()` at deploy time. If you prefer it in Key Vault,
+  store the key as a secret and use a Key Vault reference app setting
+  (`@Microsoft.KeyVault(SecretUri=…)`) with `keyVaultReferenceIdentity` set to
+  the managed identity (already wired in the template). **[Docs]**
+  ([Key Vault references](https://learn.microsoft.com/azure/app-service/app-service-key-vault-references)).
+
+## Two risks I could not verify offline (test these first)
+
+Both point to the same first-run smoke test, and both are resolved by the AKS +
+Azure Disk escalation path if they fail:
+
+1. **Non-root user vs. the SMB mount.** The image runs as uid/gid `65532`
+   (non-root) **[Verified]** — Dockerfile `USER 65532:65532`. App Service mounts
+   Azure Files over SMB/CIFS with a fixed ownership; if the mounted
+   `/var/lib/shoal` is not writable by `65532`, the container cannot create
+   `corpus/` and `policy/` and will fail to start. **[Inference]** — I could not
+   test the mount's uid/gid. Confirm the first container start writes both
+   directories.
+2. **SMB semantics under an embedded store.** Shoal's engine does local file
+   operations (rename, directory-as-table). SMB does not guarantee every POSIX
+   semantic a local disk does. **[Inference]** — unverified. If the engine
+   misbehaves on SMB, switch the share to **Azure Files NFS** (Premium
+   `FileStorage` + VNet integration; note Key Vault mount auth is not applicable
+   with NFS) **[Docs]**, or escalate to AKS + Azure Disk (a real block device).
+
+## Operational reality
+
+### Backup and restore — this is the entire durability story
+
+There is **no replication**. Durability is: the Azure Files share, and your
+backups of it. **[Inference — architectural, follows from a single local store.]**
+
+- **Backup:** snapshot the file share on a schedule.
+
+  ```console
+  az storage share snapshot --name <share> --account-name <storageAccount>
+  ```
+
+  Or enable Azure Backup for Azure Files for scheduled, retained snapshots.
+  **[Docs]** ([Azure Files backup](https://learn.microsoft.com/azure/backup/azure-file-share-backup-overview)).
+  A crash-consistent snapshot is fine for restart; for a clean backup, take the
+  snapshot while the app is stopped so no write is mid-flight. **[Inference]**
+- **Restore:** stop the app, restore the share (or repoint the mount to a
+  restored share), start the app. Because the corpus and policy live under **one**
+  share, they restore together and stay consistent — which is exactly what the
+  split-brain guard checks for. **[Inference]**
+- **Redundancy:** `Standard_LRS` is single-region, single-datacenter redundancy.
+  For zone or region resilience choose `Standard_ZRS`/`Standard_GRS`, understanding
+  that cross-region durability is still not application replication. **[Docs]**.
+
+### What a restart looks like
+
+The container restarts against the same share; the corpus and durable policy
+catalog are already there, so the workspace serves the same data. **[Verified]**
+that persistence works given one shared mount — the container/compose restart
+evidence and `TestStateDirLayoutSharesOneMountPoint` in
+`../../../docs/shoal-explore-web-deploy.md`. **[Inference]** that App Service
+re-attaches the *same* Azure Files share on restart (it does, given the mount
+config is unchanged).
+
+### The split-brain refusal — what an operator sees, and recovery
+
+If the policy directory is lost or a different share is mounted, startup fails
+closed (production mode) with:
+
+```text
+refusing to serve a split-brain workspace: corpus <root>/corpus holds N
+document(s) but the durable policy catalog <root>/policy holds no authorization
+registrations. This is the signature of a lost or unmounted policy volume ...
+Restore the policy directory from the same volume as the corpus (use -state-dir
+so both persist under one mount) ...
+```
+
+**[Verified]** — captured from the real `openService` guard path; see the guide.
+
+**Recover by fixing the mount, not the app:**
+
+1. Confirm the site's Azure Storage mount still points at the correct share and
+   mount path `/var/lib/shoal`. A changed/empty share is the usual cause.
+2. If the share was lost, **restore it from a snapshot** (above) so `corpus/`
+   and `policy/` return together, then `az webapp start`.
+3. Only for a corpus first ingested **before** the policy catalog was durable
+   is a re-registration needed — and that path is loopback + `-dev-auth` only,
+   not something you run on the shared instance. **[Verified]** — guard message
+   and `main.go`.
+
+Never "fix" this by deleting the corpus or pointing at a fresh share to make
+startup succeed: that discards data the guard is protecting.
+
+### Public exposure prerequisite (host-authority binding)
+
+The webapi layer does **not yet** enforce that the request `Host` matches the
+listener authority, and there is no external-authority/host-allowlist flag on
+`main` yet (a separate change is in flight). The template binds
+`-listen 0.0.0.0:<port>` so App Service can reach the container, which makes the
+expected authority `0.0.0.0:<port>` — real client `Host` headers behind the App
+Service front end will not match. **[Verified]** — gap #3 in the guide and
+`selectAuthenticator` allows the non-loopback bind only because Entra is
+configured. **Consequence:** this deployment is **infrastructure-ready but not
+yet publicly serviceable** — stand it up, wire identity, back it up, but treat
+the front door as closed until the host-allowlist flag lands. When it does, it
+will be one more app setting / `-` flag; the shape here does not change.
+
+## Explicitly not supported
+
+- **Zero-downtime deploy** — deploys stop the single writer first (above).
+- **Horizontal scale-out** — one writer only; more instances corrupt the store.
+- **Multi-region / active-active** — no replication; a single local store.
+- **`-backend remote` fan-out** — refused in code: `auth.Decision` has no wire
+  form. **[Verified]** — gap #2 in the guide.
+
+## Growth path — what actually has to change to go past one instance
+
+Do not imply this scales horizontally; with one local store it does not. To go
+beyond a single instance you would have to change the **architecture**, not the
+template:
+
+1. **A wire-serializable auth decision** so a front tier can authenticate and
+   call a backend with identity intact (blocks `-backend remote` today —
+   gap #2). **[Verified]**
+2. **A shared/coordinated storage tier** instead of one embedded local store —
+   either an external datastore or Shoal's own distributed tablet path (the
+   `deploy/k8s` + `deploy/helm` distributed manifests target that world; this
+   single-binary path deliberately does not). Adding an external datastore is an
+   **owner decision**, not something this deployment should introduce.
+3. **Host-authority / multi-host serving** (gap #3) closed and generalized to a
+   real allowlist. **[Verified]**
+
+Until all three land, the honest ceiling is: **one shared instance, many users**,
+backed up by share snapshots. That is what these artifacts deliver.
