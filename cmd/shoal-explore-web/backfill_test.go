@@ -53,7 +53,7 @@ func (otherAuthenticator) Authenticate(*http.Request) (auth.Decision, error) {
 // only -dev-auth produces, and a loopback listener.
 func TestDevelopmentBackfillGate(t *testing.T) {
 	authority := auth.NewAuthority()
-	development, err := selectAuthenticator(true, "127.0.0.1:8080", time.Now)
+	development, err := selectAuthenticator(true, entraConfig{}, "127.0.0.1:8080", time.Now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -113,7 +113,7 @@ func (b *recordingBackfiller) BackfillExistingDocumentsForDevelopment(
 // bound decision and that a failure is surfaced instead of swallowed.
 func TestDevelopmentBackfillBindsAndFailsClosed(t *testing.T) {
 	authority := auth.NewAuthority()
-	development, err := selectAuthenticator(true, "127.0.0.1:8080", time.Now)
+	development, err := selectAuthenticator(true, entraConfig{}, "127.0.0.1:8080", time.Now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -178,7 +178,7 @@ func TestBackfillGrantsPreExistingCorpusOnlyWhenGated(t *testing.T) {
 		data := preExistingCorpus(t)
 		ctx := context.Background()
 		authority := auth.NewAuthority()
-		development, err := selectAuthenticator(true, "127.0.0.1:8080", time.Now)
+		development, err := selectAuthenticator(true, entraConfig{}, "127.0.0.1:8080", time.Now)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -589,7 +589,7 @@ func TestOpenServiceRefusesWhenBackfillFails(t *testing.T) {
 	data := preExistingCorpus(t)
 	serving := auth.NewAuthority()
 	foreign := auth.NewAuthority()
-	development, err := selectAuthenticator(true, "127.0.0.1:8080", time.Now)
+	development, err := selectAuthenticator(true, entraConfig{}, "127.0.0.1:8080", time.Now)
 	if err != nil {
 		t.Fatal(err)
 	}

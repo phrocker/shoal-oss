@@ -14,6 +14,7 @@ prerequisites below land) in a shared instance, where the two deployments differ
 - [Local: one command](#local-one-command)
 - [Volume layout: a single state root](#volume-layout-a-single-state-root)
 - [The configuration seam: local vs shared](#the-configuration-seam-local-vs-shared)
+- [Real authentication with Microsoft Entra ID](#real-authentication-with-microsoft-entra-id)
 - [The unsafe-configuration guard](#the-unsafe-configuration-guard)
 - [Persistence: corpus and authorization both survive](#persistence-corpus-and-authorization-both-survive)
 - [Shared / cloud instance: shape and open gaps](#shared--cloud-instance-shape-and-open-gaps)
@@ -128,13 +129,82 @@ mounted volume — never code:
 | ------------------ | ---------------------------------- | -------------------------------------------- |
 | Bind address       | `-listen 127.0.0.1:8098` (loopback)| `-listen 0.0.0.0:<port>` (see gaps below)    |
 | Data directory     | `-state-dir /var/lib/shoal` (one mounted volume) | same flag, backed by durable storage |
-| Authenticator      | `-dev-auth` (loopback-only)        | a real authenticator (**not yet wired**)     |
+| Authenticator      | `-dev-auth` (loopback-only)        | Microsoft Entra ID (`-entra-*`, see below)   |
 | TLS termination    | none (loopback)                    | terminated at an ingress/reverse proxy       |
 | Log format         | Go `log` text to stderr            | same today (no structured-log flag yet)      |
 
 `deploy/shoal-explore-web/.env.example` documents the one value the local compose
 profile parameterises (`SHOAL_EXPLORE_LISTEN`). The remaining columns are the
 seam for a shared instance and are covered under [gaps](#shared--cloud-instance-shape-and-open-gaps).
+
+## Real authentication with Microsoft Entra ID
+
+A shared, non-loopback instance runs the **Microsoft Entra ID (Azure AD)
+authenticator** instead of `-dev-auth`. It validates the OIDC bearer token on
+each request — signature against the tenant's JWKS (fetched, cached, and
+refreshed on rotation), an asymmetric-algorithm allowlist that rejects `alg:
+none` and every symmetric algorithm, exact issuer, exact audience, and
+expiry/not-before with a configurable clock-skew tolerance — and mints a trusted
+per-request decision. `-dev-auth` and the Entra authenticator are **mutually
+exclusive**; supplying both is refused. A validated token unlocks a non-loopback
+listener, which `-dev-auth` never could.
+
+### Required flags
+
+| Flag / environment fallback                        | Purpose                                                             |
+| -------------------------------------------------- | ------------------------------------------------------------------- |
+| `-entra-tenant` / `SHOAL_ENTRA_TENANT`             | Tenant (directory) ID; derives the expected issuer and OIDC discovery. Required unless `-entra-issuer` is set. |
+| `-entra-client-id` / `SHOAL_ENTRA_CLIENT_ID`       | Application (client) ID the token audience must match exactly. **Required.** |
+
+A **client secret is never accepted**: this validates inbound bearer tokens, it
+does not perform any token-issuing flow.
+
+### Authority mapping (required to grant any corpus access)
+
+A validated token proves **identity only**. It confers no corpus access by
+itself. Authority is granted by mapping Entra **app roles** to workspace
+operations, and the mapping is fail-closed:
+
+| Flag / environment fallback                                      | Grant                                       |
+| --------------------------------------------------------------- | ------------------------------------------- |
+| `-entra-reader-roles` / `SHOAL_ENTRA_READER_ROLES`              | list, read, connect, neighborhood, retrieve |
+| `-entra-contributor-roles` / `SHOAL_ENTRA_CONTRIBUTOR_ROLES`    | the reader set **plus** ingest              |
+
+Both take a comma-separated list of app-role values. An authenticated caller
+whose token carries **no configured role** — including a missing `roles` claim —
+is granted **no corpus access at all**: they authenticate, but every registered
+document is invisible to them. An absent or unrecognised role never widens
+access. If neither list is configured, every caller is unmapped and the corpus
+is invisible to everyone, so you must assign at least one role to grant access.
+
+### Optional flags
+
+| Flag / environment fallback                        | Default                                                          |
+| -------------------------------------------------- | --------------------------------------------------------------- |
+| `-entra-issuer` / `SHOAL_ENTRA_ISSUER`             | `https://login.microsoftonline.com/<tenant>/v2.0`               |
+| `-entra-jwks-uri` / `SHOAL_ENTRA_JWKS_URI`         | resolved via OIDC discovery from the issuer                     |
+| `-entra-allowed-algs`                              | `RS256` (any of RS/PS/ES 256/384/512; `HS*` and `none` refused) |
+| `-entra-clock-skew`                                | `60s` (capped at `5m`)                                          |
+
+### Example
+
+```console
+$ docker run --rm --network host -v shoal-explore-state:/var/lib/shoal \
+    shoal-explore-web:test \
+    -state-dir /var/lib/shoal -listen 0.0.0.0:8098 \
+    -entra-tenant <tenant-guid> \
+    -entra-client-id <application-client-id> \
+    -entra-reader-roles Shoal.Reader \
+    -entra-contributor-roles Shoal.Contributor
+Validating Microsoft Entra ID bearer tokens for audience <application-client-id>; unmapped callers receive no corpus access
+Shoal Explorer listening at http://0.0.0.0:8098
+```
+
+The IDs above are placeholders — substitute your tenant and application (client)
+IDs. Clients call the API with `Authorization: Bearer <token>`, where the token
+is a v2 Entra token addressed to `<application-client-id>`. See the
+[host-authority gap](#shared--cloud-instance-shape-and-open-gaps) before exposing
+a public bind behind a reverse proxy.
 
 ## The unsafe-configuration guard
 
@@ -242,9 +312,9 @@ plus the integration tests below.
 
 ### Production-mode proof (backfill disabled)
 
-Production mode (no `-dev-auth`) **cannot start from the container CLI today**:
-`selectAuthenticator` refuses before the corpus is even opened, because no
-non-dev authenticator is wired (gap #1 below). Observed:
+Production mode uses the Entra authenticator; running it **without** either
+`-dev-auth` or an `-entra-*` configuration still fails closed before the corpus
+is opened, because no authenticator is configured. Observed:
 
 ```console
 $ docker run --rm --network host -v shoal-explore-state:/var/lib/shoal \
@@ -304,9 +374,10 @@ The image is shared-instance ready; the *runtime prerequisites* are not all in
 place on `main`. Honest gaps, none of which this deployment work should paper
 over:
 
-1. **No non-development authenticator is wired.** Without `-dev-auth`, startup
-   fails closed demanding a real authenticator (shown above). A shared instance
-   needs one minted at the edge — blocked on **edge identity, issue #278**.
+1. **The Microsoft Entra ID authenticator is wired (issue #278).** Supply the
+   `-entra-*` flags (see [Real authentication with Microsoft Entra ID](#real-authentication-with-microsoft-entra-id))
+   and a non-loopback listener is allowed. Without either `-dev-auth` or an
+   Entra configuration, startup still fails closed demanding an authenticator.
 2. **`-backend remote` is deliberately refused** because `auth.Decision` has no
    on-the-wire representation (issue #278): forwarding would authenticate at the
    edge and then call upstream with no identity. This means **multi-node scaling
@@ -314,16 +385,19 @@ over:
 3. **Host-authority binding.** The handler requires the request `Host` to equal
    the listener's resolved address (`allowedAuthority`). A public bind of
    `0.0.0.0:<port>` makes the expected authority `0.0.0.0:<port>`, which real
-   client `Host` headers won't match. A shared instance needs a configurable
-   external authority — a config seam that does not exist yet.
+   client `Host` headers won't match. A shared instance behind a reverse proxy
+   needs a configurable external authority — a config seam that does not exist
+   yet, so a public bind is not yet end-to-end serviceable even with a valid
+   authenticator.
 4. **Durable policy store (#284 / PR #288) has landed.** The policy catalog now
    persists, and a split-brain guard refuses to start when the corpus holds
    documents but the policy catalog is empty (a lost policy volume). Use
    `-state-dir` so the corpus and policy always persist under one mount.
 
-Until (1) and (3) are addressed, a shared bind either fails closed (no
-authenticator) or rejects requests (host mismatch) — safe, but not yet
-serviceable. This is a deliberate fail-closed posture, not a packaging defect.
+Until (3) is addressed, a public bind authenticates correctly but rejects
+requests whose `Host` differs from the bind address — safe, but not yet
+serviceable behind a proxy. This is a deliberate fail-closed posture, not a
+packaging defect.
 
 ## Azure hosting (one option, not a decision)
 
@@ -345,6 +419,7 @@ must survive restarts and redeploys.
   `ReadWriteOnce` PVC mounted at the state root `/var/lib/shoal`. The most
   control, the most operational overhead.
 
-In all three, TLS terminates at the platform ingress and the app still needs a
-real authenticator (gap #1) before it is exposed. Treat the above as one
-sketch, not a recommendation.
+In all three, TLS terminates at the platform ingress and the app runs the Entra
+authenticator (`-entra-*`); the outstanding host-authority seam (gap #3) must be
+closed before a public bind behind the ingress is end-to-end serviceable. Treat
+the above as one sketch, not a recommendation.
