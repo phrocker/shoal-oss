@@ -20,6 +20,7 @@
 package explorer
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"strings"
@@ -78,4 +79,67 @@ func TestChangesBelowRetentionFloorResynchronises(t *testing.T) {
 	if len(feed.Changes) == 0 || feed.Changes[0].Sequence != 3 {
 		t.Fatalf("boundary feed = %+v, want first change at sequence 3", feed.Changes)
 	}
+}
+
+// TestChangeCursorKeyIsDurableAcrossRestart proves the per-corpus cursor seal
+// key is generated once and persisted, not minted afresh each process. A
+// per-process key would silently invalidate every outstanding cursor on
+// restart -- exactly the resumability property TestChangesCursorSurvivesRestart
+// pins -- so the key must survive a close and reopen byte-for-byte.
+func TestChangeCursorKeyIsDurableAcrossRestart(t *testing.T) {
+	ctx := context.Background()
+	dataDir := t.TempDir()
+
+	corpus, err := Open(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err := corpus.ChangeCursorSealKey(ctx)
+	if err != nil {
+		t.Fatalf("seal key before restart: %v", err)
+	}
+	if len(before) != changeCursorKeyBytes {
+		t.Fatalf("seal key length = %d, want %d", len(before), changeCursorKeyBytes)
+	}
+	// A freshly generated key must not be all zeros: that would mean generation
+	// silently failed and every corpus shared a predictable key.
+	if allZero(before) {
+		t.Fatal("seal key is all zeros; key generation did not run")
+	}
+	if err := corpus.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := Open(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	after, err := reopened.ChangeCursorSealKey(ctx)
+	if err != nil {
+		t.Fatalf("seal key after restart: %v", err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatalf("seal key changed across restart: %x -> %x", before, after)
+	}
+
+	// The accessor must hand back a copy, never the live slice, so a caller
+	// cannot mutate the key held under lock.
+	after[0] ^= 0xFF
+	again, err := reopened.ChangeCursorSealKey(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Equal(again, after) {
+		t.Fatal("accessor returned the live key slice; mutation leaked back in")
+	}
+}
+
+func allZero(b []byte) bool {
+	for _, v := range b {
+		if v != 0 {
+			return false
+		}
+	}
+	return true
 }

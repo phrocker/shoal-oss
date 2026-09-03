@@ -190,12 +190,13 @@ func (s *EmbeddedService) documentsCountingSuppressed(
 }
 
 // Changes serves the caller's resumable document change feed. The request
-// cursor is opaque; it decodes to a resume position and the corpus incarnation
-// it was minted against. A cursor from another corpus, or one that is ahead of
-// the corpus (for example after a restore from an older backup), is rejected by
-// the backend as a resynchronise conflict rather than answered from unrelated
-// data. No withheld-change count is emitted: see authorized.Client.Changes for
-// why the feed discloses less than the Documents and Retrieve listings.
+// cursor is an opaque sealed token minted by the authorized layer; this service
+// never reads or constructs it, it only forwards it and returns the sealed
+// cursor the backend produces. The cursor's confidentiality and integrity --
+// and the resynchronise handling for a stale or foreign cursor -- live in
+// authorized.Client.Changes, which holds the per-corpus seal key. No
+// withheld-change count is emitted: see authorized.Client.Changes for why the
+// feed discloses less than the Documents and Retrieve listings.
 func (s *EmbeddedService) Changes(
 	ctx context.Context, request ChangesRequest,
 ) (ChangesResponse, error) {
@@ -204,18 +205,13 @@ func (s *EmbeddedService) Changes(
 		return ChangesResponse{}, shoal.NewError(
 			shoal.ErrorUnavailable, "workspace capability \"changes\" is unavailable")
 	}
-	since, incarnation, err := decodeChangeCursor(request.Cursor)
-	if err != nil {
-		return ChangesResponse{}, err
-	}
 	limit, err := normalizeChangeLimit(request.Limit)
 	if err != nil {
 		return ChangesResponse{}, err
 	}
 	page, err := backend.Changes(ctx, authorized.ChangeFeedRequest{
-		Since:       since,
-		Limit:       int(limit),
-		Incarnation: incarnation,
+		Cursor: request.Cursor,
+		Limit:  int(limit),
 	})
 	if err != nil {
 		return ChangesResponse{}, err
@@ -234,7 +230,7 @@ func (s *EmbeddedService) Changes(
 	}
 	return ChangesResponse{
 		Changes:    changes,
-		NextCursor: encodeChangeCursor(page.Incarnation, page.Next),
+		NextCursor: page.Cursor,
 		More:       page.More,
 	}, nil
 }
@@ -551,48 +547,6 @@ func normalizeChangeLimit(limit uint32) (uint32, error) {
 			shoal.ErrorInvalidArgument, "change page limit exceeds the server bound")
 	}
 	return limit, nil
-}
-
-type changeCursorPayload struct {
-	Incarnation string `json:"incarnation"`
-	Sequence    string `json:"sequence"`
-}
-
-// encodeChangeCursor produces the opaque resume token. The sequence is a
-// decimal string so it stays exact in JavaScript clients, and it is wrapped in
-// an opaque base64 envelope so clients treat it as a token rather than a
-// number.
-func encodeChangeCursor(incarnation string, sequence uint64) string {
-	encoded, _ := json.Marshal(changeCursorPayload{
-		Incarnation: incarnation,
-		Sequence:    strconv.FormatUint(sequence, 10),
-	})
-	return base64.RawURLEncoding.EncodeToString(encoded)
-}
-
-// decodeChangeCursor parses the opaque resume token into a resume position and
-// the corpus incarnation it was bound to. An empty cursor starts from the
-// beginning with no incarnation binding yet.
-func decodeChangeCursor(cursor string) (uint64, string, error) {
-	if cursor == "" {
-		return 0, "", nil
-	}
-	raw, err := base64.RawURLEncoding.DecodeString(cursor)
-	if err != nil {
-		return 0, "", shoal.NewError(shoal.ErrorInvalidArgument, "invalid change cursor")
-	}
-	var payload changeCursorPayload
-	if err := strictUnmarshal(raw, &payload); err != nil {
-		return 0, "", shoal.NewError(shoal.ErrorInvalidArgument, "invalid change cursor")
-	}
-	if payload.Incarnation == "" {
-		return 0, "", shoal.NewError(shoal.ErrorInvalidArgument, "invalid change cursor")
-	}
-	sequence, err := strconv.ParseUint(payload.Sequence, 10, 64)
-	if err != nil {
-		return 0, "", shoal.NewError(shoal.ErrorInvalidArgument, "invalid change cursor")
-	}
-	return sequence, payload.Incarnation, nil
 }
 
 func decodeCursor(cursor, snapshot string) (int, error) {

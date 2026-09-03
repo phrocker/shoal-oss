@@ -52,6 +52,9 @@ const (
 	DefaultChangeLimit = 128
 	// MaxChangeLimit is the largest raw window a single call will materialize.
 	MaxChangeLimit = 1024
+	// changeCursorKeyBytes is the size of the durable AES-256 key that seals
+	// change-feed cursors.
+	changeCursorKeyBytes = 32
 )
 
 // ChangeKind classifies one reported change. Only document publications are
@@ -110,8 +113,12 @@ type ChangeFeed struct {
 // ChangeReader is the optional embedded feed capability. It is a separate
 // interface, not part of Client, so remote or reduced backends that cannot
 // serve an ordered feed simply do not implement it and callers fail closed.
+// ChangeCursorSealKey returns the durable per-corpus secret an authorization
+// layer uses to seal opaque, unforgeable cursors; it is exposed here so the raw
+// sequence positions never cross the API boundary in the clear.
 type ChangeReader interface {
 	Changes(context.Context, ChangeRequest) (ChangeFeed, error)
+	ChangeCursorSealKey(context.Context) ([]byte, error)
 }
 
 // Changes returns an ordered, resumable window of document publications with
@@ -230,4 +237,24 @@ func (e *Explorer) incarnationLocked() string {
 		[]byte(e.snapshotAnchor.UTC().Format(time.RFC3339Nano))...,
 	))
 	return hex.EncodeToString(sum[:])
+}
+
+// ChangeCursorSealKey returns a copy of the durable per-corpus key used to seal
+// change-feed cursors. It is corpus state, generated once at creation and
+// stable across restart, so an authorization layer can mint opaque cursors that
+// survive reconnects yet cannot be read or forged by a client.
+func (e *Explorer) ChangeCursorSealKey(ctx context.Context) ([]byte, error) {
+	if err := contextError(ctx); err != nil {
+		return nil, err
+	}
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	if err := e.requireOpen(); err != nil {
+		return nil, err
+	}
+	if len(e.changeCursorKey) != changeCursorKeyBytes {
+		return nil, shoal.NewError(
+			shoal.ErrorInternal, "change cursor key is unavailable")
+	}
+	return append([]byte(nil), e.changeCursorKey...), nil
 }

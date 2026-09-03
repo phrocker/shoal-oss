@@ -36,7 +36,9 @@ import (
 // fakeChangeBackend is an authorized backing client that serves only the change
 // feed. It embeds the wide BoundedClient interface (left nil) purely to satisfy
 // the method set NewEmbeddedService requires; only Changes is ever called on
-// the feed path, so the nil methods are never invoked.
+// the feed path, so the nil methods are never invoked. The cursor is opaque to
+// this service, so the fake simply echoes a canned sealed token and records the
+// token it was handed.
 type fakeChangeBackend struct {
 	explorer.BoundedClient
 	page        authorized.ChangeFeedPage
@@ -57,9 +59,8 @@ func (f *fakeChangeBackend) Changes(
 }
 
 // realChanges opens a throwaway corpus, ingests count documents, and returns
-// their change records so wire marshaling operates on genuine documents. It
-// also returns the corpus incarnation the records were minted against.
-func realChanges(t *testing.T, count int) ([]explorer.DocumentChange, string) {
+// their change records so wire marshaling operates on genuine documents.
+func realChanges(t *testing.T, count int) []explorer.DocumentChange {
 	t.Helper()
 	corpus, err := explorer.Open(t.TempDir())
 	if err != nil {
@@ -83,13 +84,13 @@ func realChanges(t *testing.T, count int) ([]explorer.DocumentChange, string) {
 	if len(feed.Changes) != count {
 		t.Fatalf("seeded %d changes, want %d", len(feed.Changes), count)
 	}
-	return feed.Changes, feed.Incarnation
+	return feed.Changes
 }
 
-func TestServiceChangesCursorRoundTripsThroughOpaqueToken(t *testing.T) {
-	changes, incarnation := realChanges(t, 3)
+func TestServiceChangesForwardsOpaqueCursorBothWays(t *testing.T) {
+	changes := realChanges(t, 3)
 	backend := &fakeChangeBackend{page: authorized.ChangeFeedPage{
-		Changes: changes, Next: 3, More: false, Incarnation: incarnation,
+		Changes: changes, Cursor: "sealed-token-1", More: false,
 	}}
 	service, err := webapi.NewEmbeddedService(backend)
 	if err != nil {
@@ -101,10 +102,11 @@ func TestServiceChangesCursorRoundTripsThroughOpaqueToken(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// An empty cursor starts from the beginning with no incarnation binding yet.
-	if backend.lastRequest.Since != 0 || backend.lastRequest.Incarnation != "" {
-		t.Fatalf("first backend request = %+v, want since 0 no incarnation",
-			backend.lastRequest)
+	// The service is a pass-through: an empty request cursor reaches the backend
+	// verbatim, and the backend's sealed cursor is returned unmodified. The
+	// service never reads or rewrites the token.
+	if backend.lastRequest.Cursor != "" {
+		t.Fatalf("first backend cursor = %q, want empty", backend.lastRequest.Cursor)
 	}
 	if len(first.Changes) != 3 {
 		t.Fatalf("changes = %d, want 3", len(first.Changes))
@@ -112,31 +114,27 @@ func TestServiceChangesCursorRoundTripsThroughOpaqueToken(t *testing.T) {
 	if first.Changes[0].Kind != string(explorer.ChangeKindDocumentPublished) {
 		t.Fatalf("kind = %q", first.Changes[0].Kind)
 	}
-	if first.NextCursor == "" {
-		t.Fatal("NextCursor is empty; a client always needs a resume token")
+	if first.NextCursor != "sealed-token-1" {
+		t.Fatalf("NextCursor = %q, want the backend's sealed token verbatim",
+			first.NextCursor)
 	}
 
-	// Replaying the opaque cursor must resume the backend at the last delivered
-	// sequence and rebind it to the same corpus incarnation, without the client
-	// ever seeing the raw number.
-	if _, err := service.Changes(ctx, webapi.ChangesRequest{Cursor: first.NextCursor}); err != nil {
+	// Replaying the opaque cursor forwards it to the backend byte-for-byte.
+	if _, err := service.Changes(ctx, webapi.ChangesRequest{Cursor: "sealed-token-1"}); err != nil {
 		t.Fatal(err)
 	}
-	if backend.lastRequest.Since != 3 {
-		t.Fatalf("resume since = %d, want 3", backend.lastRequest.Since)
-	}
-	if backend.lastRequest.Incarnation != incarnation {
-		t.Fatalf("resume incarnation = %q, want %q",
-			backend.lastRequest.Incarnation, incarnation)
+	if backend.lastRequest.Cursor != "sealed-token-1" {
+		t.Fatalf("resume cursor = %q, want it forwarded verbatim",
+			backend.lastRequest.Cursor)
 	}
 }
 
-func TestServiceChangesTruncatedPageCursorResumesAtFirstUndelivered(t *testing.T) {
-	changes, incarnation := realChanges(t, 3)
-	// The backend delivered only the first two changes and reports More; its
-	// Next is the second sequence, the last delivered one.
+func TestServiceChangesTruncatedPagePassesCursorAndLimit(t *testing.T) {
+	changes := realChanges(t, 3)
+	// The backend delivered only the first two changes, reports More, and hands
+	// back the sealed resume token for the first undelivered change.
 	backend := &fakeChangeBackend{page: authorized.ChangeFeedPage{
-		Changes: changes[:2], Next: 2, More: true, Incarnation: incarnation,
+		Changes: changes[:2], Cursor: "sealed-resume", More: true,
 	}}
 	service, err := webapi.NewEmbeddedService(backend)
 	if err != nil {
@@ -154,14 +152,17 @@ func TestServiceChangesTruncatedPageCursorResumesAtFirstUndelivered(t *testing.T
 	if backend.lastRequest.Limit != 2 {
 		t.Fatalf("backend limit = %d, want 2", backend.lastRequest.Limit)
 	}
+	if page.NextCursor != "sealed-resume" {
+		t.Fatalf("NextCursor = %q, want the backend's resume token", page.NextCursor)
+	}
 
-	// Resuming with the truncated page's cursor must ask the backend to continue
-	// exactly at sequence 2 (exclusive), i.e. the first undelivered change.
+	// Resuming forwards the truncated page's sealed cursor unmodified.
 	if _, err := service.Changes(ctx, webapi.ChangesRequest{Cursor: page.NextCursor}); err != nil {
 		t.Fatal(err)
 	}
-	if backend.lastRequest.Since != 2 {
-		t.Fatalf("resume since = %d, want 2 (first undelivered)", backend.lastRequest.Since)
+	if backend.lastRequest.Cursor != "sealed-resume" {
+		t.Fatalf("resume cursor = %q, want it forwarded verbatim",
+			backend.lastRequest.Cursor)
 	}
 }
 
@@ -182,8 +183,15 @@ func TestServiceChangesRejectsOverLargeLimit(t *testing.T) {
 	}
 }
 
-func TestServiceChangesRejectsMalformedCursor(t *testing.T) {
-	backend := &fakeChangeBackend{}
+// TestServiceChangesPropagatesInvalidCursor confirms the service does not try
+// to interpret the opaque cursor itself: an unopenable token is rejected by the
+// backend (which holds the seal key) and the service forwards both the token
+// and the resulting invalid-argument error without swallowing or reshaping it.
+func TestServiceChangesPropagatesInvalidCursor(t *testing.T) {
+	backend := &fakeChangeBackend{
+		err: shoal.NewError(shoal.ErrorInvalidArgument,
+			"change cursor is invalid; resynchronise"),
+	}
 	service, err := webapi.NewEmbeddedService(backend)
 	if err != nil {
 		t.Fatal(err)
@@ -194,8 +202,13 @@ func TestServiceChangesRejectsMalformedCursor(t *testing.T) {
 	if !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
 		t.Fatalf("error = %v, want invalid_argument", err)
 	}
-	if backend.calls != 0 {
-		t.Fatalf("backend was called %d times for a malformed cursor", backend.calls)
+	if backend.calls != 1 {
+		t.Fatalf("backend calls = %d, want 1 (cursor forwarded, not pre-judged)",
+			backend.calls)
+	}
+	if backend.lastRequest.Cursor != "not-a-valid-token" {
+		t.Fatalf("backend cursor = %q, want it forwarded verbatim",
+			backend.lastRequest.Cursor)
 	}
 }
 
@@ -227,9 +240,9 @@ func TestServiceChangesUnavailableWithoutFeedCapableBackend(t *testing.T) {
 }
 
 func TestHTTPChangesRoundTripAndGating(t *testing.T) {
-	changes, incarnation := realChanges(t, 2)
+	changes := realChanges(t, 2)
 	backend := &fakeChangeBackend{page: authorized.ChangeFeedPage{
-		Changes: changes, Next: 2, More: false, Incarnation: incarnation,
+		Changes: changes, Cursor: "sealed-http", More: false,
 	}}
 	service, err := webapi.NewEmbeddedService(backend)
 	if err != nil {
@@ -267,8 +280,9 @@ func TestHTTPChangesRoundTripAndGating(t *testing.T) {
 		t.Fatalf("http change doc = %s, want %s",
 			decoded.Changes[0].Document.Document.ID, changes[0].Document.ID)
 	}
-	if decoded.NextCursor == "" {
-		t.Fatal("http response omitted NextCursor")
+	if decoded.NextCursor != "sealed-http" {
+		t.Fatalf("http NextCursor = %q, want the backend's sealed token",
+			decoded.NextCursor)
 	}
 
 	// A raw-explorer-backed service must report the capability as unavailable

@@ -60,6 +60,7 @@ const (
 	embeddedRecordInteraction       = byte(4)
 	embeddedRecordInteractionSink   = byte(5)
 	embeddedRecordFold              = byte(6)
+	embeddedRecordCursorKey         = byte(7)
 	embeddedEnvelopeHeader          = 8 + 1 + 1 + 8 + sha256.Size
 	maxEmbeddedDocumentBytes        = uint64(document.MaxRevisionSourceBytes) * 8
 	maxEmbeddedEdgeBytes            = uint64(2 * 1024 * 1024)
@@ -67,14 +68,26 @@ const (
 	maxEmbeddedInteractionBytes     = uint64(64 * 1024 * 1024)
 	maxEmbeddedInteractionSinkBytes = uint64(1024)
 	maxEmbeddedFoldBytes            = uint64(64 * 1024 * 1024)
+	maxEmbeddedCursorKeyBytes       = uint64(1024)
 )
 
 var snapshotAnchorRow = []byte("meta/snapshot-anchor")
+
+var cursorKeyRow = []byte("meta/change-cursor-key")
 
 var interactionSinkRow = []byte("meta/interaction-sink")
 
 type persistedSnapshotAnchor struct {
 	CreatedAt time.Time
+}
+
+// persistedCursorKey holds the durable, per-corpus secret that seals change-feed
+// cursors. It is a random key generated once at corpus creation and persisted
+// with the corpus state, so cursors stay valid across restart and travel with a
+// backup, while a fresh corpus mints an independent key that cannot open another
+// corpus's cursors.
+type persistedCursorKey struct {
+	Key []byte
 }
 
 type documentRevisionKey struct {
@@ -141,6 +154,10 @@ func (e *Explorer) load() error {
 			if err := e.loadSnapshotAnchor(qualifier, scanner.Value()); err != nil {
 				return err
 			}
+		case bytes.Equal(key.Row, cursorKeyRow):
+			if err := e.loadCursorKey(qualifier, scanner.Value()); err != nil {
+				return err
+			}
 		case bytes.HasPrefix(key.Row, []byte(documentRow)):
 			if err := e.loadDocumentRecord(
 				key.Row,
@@ -196,6 +213,23 @@ func (e *Explorer) loadSnapshotAnchor(qualifier, encoded []byte) error {
 		return shoal.NewError(shoal.ErrorInternal, "snapshot anchor time is missing")
 	}
 	e.snapshotAnchor = record.CreatedAt.UTC()
+	return nil
+}
+
+func (e *Explorer) loadCursorKey(qualifier, encoded []byte) error {
+	if !bytes.Equal(qualifier, []byte(recordCQV2)) {
+		return nil
+	}
+	var record persistedCursorKey
+	if err := decodeEmbeddedRecord(
+		encoded, embeddedRecordCursorKey, &record,
+	); err != nil {
+		return shoal.WrapError(shoal.ErrorInternal, "decode change cursor key", err)
+	}
+	if len(record.Key) != changeCursorKeyBytes {
+		return shoal.NewError(shoal.ErrorInternal, "change cursor key has an invalid length")
+	}
+	e.changeCursorKey = append([]byte(nil), record.Key...)
 	return nil
 }
 
@@ -468,6 +502,8 @@ func embeddedRecordMaximum(kind byte) (uint64, error) {
 		return maxEmbeddedInteractionSinkBytes, nil
 	case embeddedRecordFold:
 		return maxEmbeddedFoldBytes, nil
+	case embeddedRecordCursorKey:
+		return maxEmbeddedCursorKeyBytes, nil
 	default:
 		return 0, fmt.Errorf("embedded record kind %d is unsupported", kind)
 	}

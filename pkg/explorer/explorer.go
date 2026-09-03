@@ -21,6 +21,7 @@ package explorer
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
 	"math"
 	"sort"
@@ -63,6 +64,7 @@ type Explorer struct {
 	snapshotAnchor          time.Time
 	lastPublicationSequence uint64
 	changeHistoryFloor      uint64
+	changeCursorKey         []byte
 	readOnly                bool
 	closed                  bool
 }
@@ -189,6 +191,24 @@ func OpenWithOptions(dir string, options Options) (*Explorer, error) {
 			if err := explorer.writeRecord(
 				snapshotAnchorRow, embeddedRecordSnapshotAnchor,
 				persistedSnapshotAnchor{CreatedAt: explorer.snapshotAnchor},
+			); err != nil {
+				_ = eng.Close()
+				return nil, err
+			}
+		}
+	}
+	if len(explorer.changeCursorKey) == 0 {
+		key := make([]byte, changeCursorKeyBytes)
+		if _, err := rand.Read(key); err != nil {
+			_ = eng.Close()
+			return nil, shoal.WrapError(
+				shoal.ErrorInternal, "generate change cursor key", err)
+		}
+		explorer.changeCursorKey = key
+		if !explorer.readOnly {
+			if err := explorer.writeRecord(
+				cursorKeyRow, embeddedRecordCursorKey,
+				persistedCursorKey{Key: key},
 			); err != nil {
 				_ = eng.Close()
 				return nil, err
