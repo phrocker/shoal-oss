@@ -322,3 +322,107 @@ func TestTombstonedRecordKeepsOriginalVisibilityAfterTightening(t *testing.T) {
 		t.Fatalf("tombstone subgraph nodes = %+v", sub.Nodes)
 	}
 }
+
+// TestDeclassifiedSourceStillServesRecord pins the Issue #273 follow-up: a
+// source that is later *loosened* (a label dropped, i.e. declassification) must
+// not make a previously derived record unreadable. The stored record keeps its
+// stricter label, which still covers everything the now-weaker source requires,
+// so the read paths must keep serving it. Comparing by string equality here
+// would refuse and silently lose the record; comparing by authorization
+// coverage (current label set is a subset of the stored set) serves it.
+func TestDeclassifiedSourceStillServesRecord(t *testing.T) {
+	ctx := context.Background()
+	corpus, err := explorer.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer corpus.Close()
+
+	open := ingestVisible(
+		t, corpus, "file:///incident.md", restrictedMarkdown, "incident&secret")
+	recordedSession(t, corpus, "session-secret", open[:1], open[:1])
+
+	// Baseline: the session is readable and carries the conjunction.
+	summaries, err := corpus.Interactions(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := containsSession(summaries, "session-secret"); got == nil {
+		t.Fatal("session-secret was not listed before declassification")
+	} else if got.Visibility != "incident&secret" {
+		t.Fatalf("session-secret visibility = %q, want incident&secret", got.Visibility)
+	}
+
+	// Declassify: re-ingest identical content dropping the "secret" label. The
+	// current revision now only requires "incident", which the stored
+	// "incident&secret" already covers.
+	ingestVisible(t, corpus, "file:///incident.md", restrictedMarkdown, "incident")
+
+	summaries, err = corpus.Interactions(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := containsSession(summaries, "session-secret")
+	if got == nil {
+		t.Fatal("session-secret lost from listing after declassification (data loss)")
+	}
+	// The record is still labelled with its stricter stored visibility; it is
+	// served under the label it was derived at, never downgraded.
+	if got.Visibility != "incident&secret" {
+		t.Fatalf(
+			"session-secret visibility = %q after declassification, want incident&secret",
+			got.Visibility,
+		)
+	}
+	if _, err := corpus.InteractionSubgraph(ctx, "session-secret"); err != nil {
+		t.Fatalf("InteractionSubgraph after declassification = %v, want served", err)
+	}
+	touching, err := corpus.InteractionsTouching(ctx, open[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(touching) != 1 || touching[0].InteractionID != "session-secret" {
+		t.Fatalf("InteractionsTouching after declassification = %+v", touching)
+	}
+}
+
+// TestMixedRelabelWithNewLabelStillRefuses guards the sharp edge of the Issue
+// #273 follow-up: coverage is not "any weaker-or-different label serves". If a
+// relabel drops one label but introduces another the stored record does not
+// carry, the new label is a tightening on that axis and the record must be
+// withheld. This proves the coverage check is a genuine subset test, not a
+// cardinality or "looks looser" shortcut that would reopen the fail-open.
+func TestMixedRelabelWithNewLabelStillRefuses(t *testing.T) {
+	ctx := context.Background()
+	corpus, err := explorer.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer corpus.Close()
+
+	open := ingestVisible(
+		t, corpus, "file:///incident.md", restrictedMarkdown, "incident&secret")
+	recordedSession(t, corpus, "session-secret", open[:1], open[:1])
+
+	if _, err := corpus.InteractionSubgraph(ctx, "session-secret"); err != nil {
+		t.Fatalf("read before relabel = %v", err)
+	}
+
+	// Drop "secret" but add "classified": stored {incident,secret} does not
+	// cover current {incident,classified} because "classified" is new.
+	tighten(t, corpus, "file:///incident.md", restrictedMarkdown, "incident&classified")
+
+	summaries, err := corpus.Interactions(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := containsSession(summaries, "session-secret"); got != nil {
+		t.Fatalf("session-secret still listed after mixed relabel: %+v", got)
+	}
+	if _, err := corpus.InteractionSubgraph(ctx, "session-secret"); !shoal.IsErrorCode(
+		err, shoal.ErrorUnavailable,
+	) {
+		t.Fatalf(
+			"InteractionSubgraph after mixed relabel = %v, want Unavailable", err)
+	}
+}

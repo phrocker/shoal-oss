@@ -224,14 +224,10 @@ func (e *Explorer) RehydrateFold(
 	if err := shoal.ValidateRequiredID("fold ID", foldID); err != nil {
 		return interaction.Fold{}, err
 	}
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	if err := e.requireOpen(); err != nil {
+	if err := e.acquireReadWithGraph(); err != nil {
 		return interaction.Fold{}, err
 	}
-	if err := e.ensureGraphLocked(); err != nil {
-		return interaction.Fold{}, err
-	}
+	defer e.mu.RUnlock()
 	record, ok := e.folds[foldID]
 	if !ok {
 		return interaction.Fold{}, shoal.NewError(
@@ -245,7 +241,7 @@ func (e *Explorer) RehydrateFold(
 	if err != nil {
 		return interaction.Fold{}, err
 	}
-	if current != record.Visibility {
+	if !visibilityCovered(record.Visibility, current) {
 		return interaction.Fold{}, staleDerivedVisibilityError()
 	}
 	fold := interaction.Fold{
@@ -273,24 +269,21 @@ func (e *Explorer) Folds(ctx context.Context) ([]FoldSummary, error) {
 	if err := contextError(ctx); err != nil {
 		return nil, err
 	}
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	if err := e.requireOpen(); err != nil {
+	if err := e.acquireReadWithGraph(); err != nil {
 		return nil, err
 	}
-	if err := e.ensureGraphLocked(); err != nil {
-		return nil, err
-	}
+	defer e.mu.RUnlock()
 	summaries := make([]FoldSummary, 0, len(e.folds))
 	for _, record := range e.folds {
 		if !record.Deleted {
 			current, err := e.currentSubgraphVisibilityLocked(
 				record.Nodes, record.Edges)
-			if err != nil || current != record.Visibility {
+			if err != nil || !visibilityCovered(record.Visibility, current) {
 				// Fail closed at read time: a live fold whose evidence was
 				// reclassified to a stricter label after it was folded is
 				// withheld rather than served under its stale, now
-				// under-labelled visibility. See issue #273.
+				// under-labelled visibility. A merely loosened source still
+				// covers the stored label and is kept. See issue #273.
 				continue
 			}
 		}
@@ -323,14 +316,10 @@ func (e *Explorer) FoldSubgraph(
 	if err := shoal.ValidateRequiredID("fold ID", foldID); err != nil {
 		return Neighborhood{}, err
 	}
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	if err := e.requireOpen(); err != nil {
+	if err := e.acquireReadWithGraph(); err != nil {
 		return Neighborhood{}, err
 	}
-	if err := e.ensureGraphLocked(); err != nil {
-		return Neighborhood{}, err
-	}
+	defer e.mu.RUnlock()
 	record, ok := e.folds[foldID]
 	if !ok {
 		return Neighborhood{}, shoal.NewError(shoal.ErrorNotFound, "fold not found")
@@ -341,7 +330,7 @@ func (e *Explorer) FoldSubgraph(
 		if err != nil {
 			return Neighborhood{}, err
 		}
-		if current != record.Visibility {
+		if !visibilityCovered(record.Visibility, current) {
 			return Neighborhood{}, staleDerivedVisibilityError()
 		}
 	}

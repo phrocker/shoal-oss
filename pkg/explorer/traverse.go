@@ -85,14 +85,10 @@ func (e *Explorer) InteractionsTouching(
 				"not from an interaction node",
 		)
 	}
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	if err := e.requireOpen(); err != nil {
+	if err := e.acquireReadWithGraph(); err != nil {
 		return nil, err
 	}
-	if err := e.ensureGraphLocked(); err != nil {
-		return nil, err
-	}
+	defer e.mu.RUnlock()
 	if node, ok := e.graphNodes[nodeID]; ok &&
 		interaction.IsInteractionKind(node.Kind) {
 		return nil, shoal.NewError(
@@ -144,14 +140,10 @@ func (e *Explorer) RelatedInteractions(
 	); err != nil {
 		return nil, err
 	}
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	if err := e.requireOpen(); err != nil {
+	if err := e.acquireReadWithGraph(); err != nil {
 		return nil, err
 	}
-	if err := e.ensureGraphLocked(); err != nil {
-		return nil, err
-	}
+	defer e.mu.RUnlock()
 	origin, ok := e.interactionViewLocked(interactionID)
 	if !ok {
 		return nil, shoal.NewError(
@@ -275,16 +267,17 @@ func (e *Explorer) eachLiveInteractionLocked(visit func(interactionView)) {
 }
 
 // subgraphVisibilityIsStaleLocked reports whether a live record's stored
-// visibility no longer equals what its touched source nodes require now, or can
+// visibility no longer covers what its touched source nodes require now, or can
 // no longer be derived at all. Provenance traversal withholds stale records so
 // a tightening re-ingest cannot leave a previously derived record disclosed
-// under its now under-labelled stored visibility. See issue #273. The caller
+// under its now under-labelled stored visibility. A merely loosened source
+// still covers the stored label and is not stale. See issue #273. The caller
 // must hold at least e.mu.RLock.
 func (e *Explorer) subgraphVisibilityIsStaleLocked(
 	nodes []graph.Node, edges []graph.Edge, stored string,
 ) bool {
 	current, err := e.currentSubgraphVisibilityLocked(nodes, edges)
-	return err != nil || current != stored
+	return err != nil || !visibilityCovered(stored, current)
 }
 
 func (e *Explorer) interactionViewLocked(id shoal.ID) (interactionView, bool) {
