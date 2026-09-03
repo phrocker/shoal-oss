@@ -57,7 +57,25 @@ var listenTCP = net.Listen
 func run(ctx context.Context, args []string, output io.Writer) error {
 	flags := flag.NewFlagSet("shoal-explore-web", flag.ContinueOnError)
 	backend := flags.String("backend", "embedded", "Explorer backend: embedded or remote")
-	data := flags.String("data", ".shoal/explorer", "Explorer corpus directory")
+	stateDir := flags.String(
+		"state-dir", "",
+		"Recommended workspace state root. The corpus and durable policy "+
+			"catalog are created as corpus/ and policy/ inside it, so mounting "+
+			"this one directory as a volume persists everything a restart "+
+			"needs. Overrides -data when set",
+	)
+	data := flags.String(
+		"data", ".shoal/explorer",
+		"Legacy Explorer corpus directory (used when -state-dir is unset). The "+
+			"durable policy catalog is placed in a sibling directory; both must "+
+			"be persisted for the workspace to survive a restart",
+	)
+	policyDirFlag := flags.String(
+		"policy-dir", "",
+		"Durable policy catalog directory. Overrides the location derived from "+
+			"-state-dir or -data; must be persisted for registrations to "+
+			"survive a restart",
+	)
 	listen := flags.String("listen", "127.0.0.1:8080", "HTTP listen address")
 	remote := flags.String("remote", "", "Remote Explorer web API URL for -backend remote")
 	embeddingProvider := flags.String(
@@ -129,14 +147,16 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 	// nothing else.
 	backfill := newDevelopmentBackfill(
 		authenticator, listener.Addr().String(), authority.Binder())
+	corpusDir, policyDir := resolveWorkspacePaths(*stateDir, *data, *policyDirFlag)
 	opened, err := openService(ctx, serviceConfig{
-		backend:  *backend,
-		data:     *data,
-		remote:   *remote,
-		embedder: embedding,
-		resolver: authority.Resolver(),
-		clock:    time.Now,
-		backfill: backfill,
+		backend:   *backend,
+		data:      corpusDir,
+		policyDir: policyDir,
+		remote:    *remote,
+		embedder:  embedding,
+		resolver:  authority.Resolver(),
+		clock:     time.Now,
+		backfill:  backfill,
 	})
 	if err != nil {
 		listener.Close()
@@ -174,16 +194,17 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 					"loopback of documents ingested before the policy catalog "+
 					"was durable. The catalog now persists, so these "+
 					"registrations survive restarts (issue #284)\n",
-				opened.backfilled, *data, developmentSubject,
+				opened.backfilled, corpusDir, developmentSubject,
 			)
 		} else {
 			fmt.Fprintf(
 				output,
 				"Policy catalog is durable in %s: documents this build "+
-					"ingests stay authorized across restarts. Documents "+
-					"ingested before the catalog was durable stay hidden "+
-					"until re-registered (issue #284)\n",
-				policyStoreDir(*data),
+					"ingests stay authorized across restarts. Persist both the "+
+					"corpus (%s) and this policy directory for the workspace to "+
+					"survive a restart. Documents ingested before the catalog "+
+					"was durable stay hidden until re-registered (issue #284)\n",
+				policyDir, corpusDir,
 			)
 		}
 	}
@@ -281,12 +302,16 @@ func (r envCredentialResolver) CacheIdentity() (string, error) {
 // serviceConfig carries the backend selection together with the trusted
 // authorization dependencies every backend must enforce.
 type serviceConfig struct {
-	backend  string
-	data     string
-	remote   string
-	embedder model.Embedder
-	resolver auth.Resolver
-	clock    func() time.Time
+	backend string
+	data    string
+	// policyDir is the durable policy catalog directory. When empty it is
+	// derived from data as a legacy sibling, so callers that set only data keep
+	// working.
+	policyDir string
+	remote    string
+	embedder  model.Embedder
+	resolver  auth.Resolver
+	clock     func() time.Time
 	// backfill is nil unless the development principal is serving a loopback
 	// listener. See developmentBackfill and issue #284.
 	backfill *developmentBackfill
@@ -314,15 +339,34 @@ func openService(
 		if err != nil {
 			return closed, err
 		}
-		// The policy catalog is durable and lives in a sibling directory, not
-		// a subdirectory of the corpus: the corpus engine treats every
+		// The policy catalog is durable and lives in its own directory, not a
+		// subdirectory of the corpus: the corpus engine treats every
 		// subdirectory as a table, so nesting the store there would corrupt
-		// table discovery. Keying it to the corpus path lets registrations
-		// survive a restart alongside the documents they authorize (#284).
-		store, err := authorized.OpenDurablePolicyStore(policyStoreDir(config.data))
+		// table discovery. A caller that sets only data keeps the legacy
+		// sibling layout; -state-dir/-policy-dir place both under one mount.
+		policyDir := config.policyDir
+		if policyDir == "" {
+			policyDir = policyStoreDir(config.data)
+		}
+		store, err := authorized.OpenDurablePolicyStore(policyDir)
 		if err != nil {
 			corpus.Close()
 			return closed, err
+		}
+		// A non-empty corpus paired with an empty policy catalog is the
+		// signature of a lost or unmounted policy volume: the documents
+		// survived but every authorization registration is gone. Refuse rather
+		// than serve a silently under-authorized workspace. The development
+		// backfill is the sanctioned way to (re)register a pre-durability
+		// corpus, so this guard applies only in production (backfill == nil),
+		// where the two situations are otherwise indistinguishable.
+		if config.backfill == nil {
+			if err := refuseSplitBrainStateDirectory(
+				ctx, corpus, store, config.data, policyDir); err != nil {
+				store.Close()
+				corpus.Close()
+				return closed, err
+			}
 		}
 		client, err := authorizedClient(corpus, store, config.resolver, config.clock)
 		if err != nil {
@@ -378,6 +422,62 @@ func openService(
 // treats every subdirectory of the data directory as a table.
 func policyStoreDir(data string) string {
 	return filepath.Clean(data) + "-policy"
+}
+
+// resolveWorkspacePaths determines the corpus and policy directories from the
+// three location flags. The recommended configuration is a single -state-dir
+// that can be mounted as one volume: the corpus and durable policy catalog live
+// as siblings inside it, so persisting the state root persists both. -data
+// remains for backwards compatibility and derives a sibling policy directory;
+// -policy-dir overrides the policy location explicitly and always wins.
+func resolveWorkspacePaths(stateDir, dataDir, policyDir string) (corpus, policy string) {
+	if stateDir != "" {
+		corpus = filepath.Join(stateDir, "corpus")
+		policy = filepath.Join(stateDir, "policy")
+	} else {
+		corpus = dataDir
+		policy = policyStoreDir(dataDir)
+	}
+	if policyDir != "" {
+		policy = policyDir
+	}
+	return corpus, policy
+}
+
+// refuseSplitBrainStateDirectory rejects a workspace whose corpus holds
+// documents while the durable policy catalog holds no registrations. That pair
+// is what a deployment sees after the policy volume is lost or left unmounted:
+// the documents are present but nobody is authorized to see them. Serving it
+// would present an empty or under-populated corpus and hide the cause, so the
+// program refuses with the paths and remediation an operator needs.
+func refuseSplitBrainStateDirectory(
+	ctx context.Context,
+	corpus *explorer.Explorer,
+	store *authorized.DurablePolicyStore,
+	corpusDir string,
+	policyDir string,
+) error {
+	if store.HasRegistrations() {
+		return nil
+	}
+	documents, err := corpus.Documents(ctx)
+	if err != nil {
+		return err
+	}
+	if len(documents) == 0 {
+		return nil
+	}
+	return fmt.Errorf(
+		"refusing to serve a split-brain workspace: corpus %s holds %d "+
+			"document(s) but the durable policy catalog %s holds no "+
+			"authorization registrations. This is the signature of a lost or "+
+			"unmounted policy volume; every registration was dropped and the "+
+			"workspace would serve an empty or under-populated corpus. Restore "+
+			"the policy directory from the same volume as the corpus (use "+
+			"-state-dir so both persist under one mount), or, for a corpus "+
+			"ingested before the catalog was durable, run once with -dev-auth "+
+			"on a loopback listener to re-register it (issue #284)",
+		corpusDir, len(documents), policyDir)
 }
 
 // authorizedClient wraps the corpus in the decision-enforcing Explorer client.

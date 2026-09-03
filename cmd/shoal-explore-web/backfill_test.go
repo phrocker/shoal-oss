@@ -163,80 +163,89 @@ func TestDevelopmentBackfillBindsAndFailsClosed(t *testing.T) {
 }
 
 // TestBackfillGrantsPreExistingCorpusOnlyWhenGated proves both halves of the
-// bargain: with the gate open a corpus that predates the process is served,
-// and with the gate closed the same corpus stays hidden.
+// bargain for a pre-durability corpus (documents ingested through the raw
+// explorer, so nothing is registered). With the gate open the backfill
+// registers the corpus and it is served. With the gate closed the corpus has
+// documents but the durable policy catalog is empty — indistinguishable from a
+// lost policy volume — so the workspace now refuses to open rather than serve a
+// silently under-authorized corpus.
+//
+// Before the split-brain guard the ungated half opened successfully and served
+// 0 documents: the corpus was silently hidden. After the guard the ungated half
+// fails openService with a diagnostic, which is the behaviour asserted here.
 func TestBackfillGrantsPreExistingCorpusOnlyWhenGated(t *testing.T) {
-	for _, testCase := range []struct {
-		name    string
-		gated   bool
-		visible int
-	}{
-		{"backfilled", true, 1},
-		{"not backfilled", false, 0},
-	} {
-		t.Run(testCase.name, func(t *testing.T) {
-			// Each sub-test gets its own corpus. The policy catalog is now
-			// durable and keyed to the corpus directory, so a shared corpus
-			// would let the gated sub-test's persisted registrations leak into
-			// the ungated one and mask the gate under test.
-			data := preExistingCorpus(t)
-			ctx := context.Background()
-			authority := auth.NewAuthority()
-			var backfill *developmentBackfill
-			if testCase.gated {
-				development, err := selectAuthenticator(
-					true, "127.0.0.1:8080", time.Now)
-				if err != nil {
-					t.Fatal(err)
-				}
-				backfill = newDevelopmentBackfill(
-					development, "127.0.0.1:8080", authority.Binder())
-				if backfill == nil {
-					t.Fatal("the development backfill was refused on loopback")
-				}
-			}
-			opened, err := openService(ctx, serviceConfig{
-				backend:  "embedded",
-				data:     data,
-				resolver: authority.Resolver(),
-				clock:    time.Now,
-				backfill: backfill,
-			})
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer opened.close()
-			if testCase.gated && opened.backfilled != 1 {
-				t.Fatalf("backfilled = %d, want 1", opened.backfilled)
-			}
-			if !testCase.gated && opened.backfilled != 0 {
-				t.Fatalf("backfilled = %d without the gate", opened.backfilled)
-			}
-
-			authenticator, err := newDevelopmentAuthenticator(time.Now)
-			if err != nil {
-				t.Fatal(err)
-			}
-			decision, err := authenticator.mint()
-			if err != nil {
-				t.Fatal(err)
-			}
-			bound, err := authority.Binder().Bind(ctx, decision)
-			if err != nil {
-				t.Fatal(err)
-			}
-			response, err := opened.service.Documents(
-				bound, webapi.DocumentsRequest{Page: webapi.PageRequest{Limit: 10}})
-			if err != nil {
-				t.Fatal(err)
-			}
-			if len(response.Documents) != testCase.visible {
-				t.Fatalf(
-					"visible documents = %d, want %d",
-					len(response.Documents), testCase.visible)
-			}
+	t.Run("backfilled", func(t *testing.T) {
+		data := preExistingCorpus(t)
+		ctx := context.Background()
+		authority := auth.NewAuthority()
+		development, err := selectAuthenticator(true, "127.0.0.1:8080", time.Now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		backfill := newDevelopmentBackfill(
+			development, "127.0.0.1:8080", authority.Binder())
+		if backfill == nil {
+			t.Fatal("the development backfill was refused on loopback")
+		}
+		opened, err := openService(ctx, serviceConfig{
+			backend:  "embedded",
+			data:     data,
+			resolver: authority.Resolver(),
+			clock:    time.Now,
+			backfill: backfill,
 		})
-	}
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer opened.close()
+		if opened.backfilled != 1 {
+			t.Fatalf("backfilled = %d, want 1", opened.backfilled)
+		}
+
+		authenticator, err := newDevelopmentAuthenticator(time.Now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		decision, err := authenticator.mint()
+		if err != nil {
+			t.Fatal(err)
+		}
+		bound, err := authority.Binder().Bind(ctx, decision)
+		if err != nil {
+			t.Fatal(err)
+		}
+		response, err := opened.service.Documents(
+			bound, webapi.DocumentsRequest{Page: webapi.PageRequest{Limit: 10}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(response.Documents) != 1 {
+			t.Fatalf("visible documents = %d, want 1", len(response.Documents))
+		}
+	})
+
+	t.Run("not backfilled", func(t *testing.T) {
+		data := preExistingCorpus(t)
+		opened, err := openService(context.Background(), serviceConfig{
+			backend:  "embedded",
+			data:     data,
+			resolver: auth.NewAuthority().Resolver(),
+			clock:    time.Now,
+			backfill: nil,
+		})
+		if err == nil {
+			opened.close()
+			t.Fatal(
+				"a corpus with no registrations opened without the gate; " +
+					"a lost policy volume would be served silently")
+		}
+		if opened.service != nil {
+			t.Fatal("a refused split-brain workspace still produced a service")
+		}
+		if !strings.Contains(err.Error(), "split-brain workspace") {
+			t.Fatalf("unclear diagnostic: %v", err)
+		}
+	})
 }
 
 // TestDurableCorpusServedAfterRestartWithoutBackfill proves the startup
@@ -343,6 +352,198 @@ func mintDevelopmentDecision(t *testing.T) (auth.Decision, error) {
 		return auth.Decision{}, err
 	}
 	return authenticator.mint()
+}
+
+// ingestOneThroughService ingests a single document through the authorized
+// service so the durable policy catalog records its registration, then closes
+// the process. It is the setup a lost-volume test needs: a corpus whose
+// documents are genuinely registered, so removing the policy directory
+// afterwards reproduces the split-brain signature rather than a pre-durability
+// corpus.
+func ingestOneThroughService(t *testing.T, config serviceConfig) {
+	t.Helper()
+	ctx := context.Background()
+	authority := auth.NewAuthority()
+	config.resolver = authority.Resolver()
+	config.clock = time.Now
+	config.backfill = nil
+	opened, err := openService(ctx, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decision, err := mintDevelopmentDecision(t)
+	if err != nil {
+		opened.close()
+		t.Fatal(err)
+	}
+	ingestCtx, err := authority.Binder().Bind(ctx, decision)
+	if err != nil {
+		opened.close()
+		t.Fatal(err)
+	}
+	provider, ok := opened.service.(webapi.IngestProvider)
+	if !ok {
+		opened.close()
+		t.Fatal("embedded service does not provide ingest")
+	}
+	if _, err := provider.Ingest(ingestCtx, webapi.IngestRequest{
+		Files: []webapi.UploadFile{{
+			Name:    "registered.md",
+			Content: []byte("# Registered\n\nIngested through the service.\n"),
+		}},
+	}); err != nil {
+		opened.close()
+		t.Fatal(err)
+	}
+	opened.close()
+}
+
+// TestOpenServiceRefusesSplitBrainStateDirectory reproduces a lost policy
+// volume: a document is ingested through the service (so the durable catalog
+// records its registration), the process closes, the policy directory is
+// removed, and the process reopens the same corpus in production (backfill
+// nil).
+//
+// Before the split-brain guard this reopened successfully and served 0
+// documents — the corpus was present but every registration was gone, so the
+// workspace silently served an under-populated corpus and the backfill could
+// partially mask the loss. After the guard openService refuses with a
+// diagnostic naming the corpus, the document count, and the empty policy
+// directory, so the lost volume is diagnosed instead of hidden.
+func TestOpenServiceRefusesSplitBrainStateDirectory(t *testing.T) {
+	data := t.TempDir()
+	ingestOneThroughService(t, serviceConfig{backend: "embedded", data: data})
+
+	// The lost volume: the corpus survives, the policy catalog does not.
+	if err := os.RemoveAll(policyStoreDir(data)); err != nil {
+		t.Fatal(err)
+	}
+
+	opened, err := openService(context.Background(), serviceConfig{
+		backend:  "embedded",
+		data:     data,
+		resolver: auth.NewAuthority().Resolver(),
+		clock:    time.Now,
+		backfill: nil,
+	})
+	if err == nil {
+		opened.close()
+		t.Fatal(
+			"a corpus whose policy volume was lost opened without refusal; " +
+				"it would serve a silently under-authorized corpus")
+	}
+	if opened.service != nil {
+		t.Fatal("a refused split-brain workspace still produced a service")
+	}
+	if !strings.Contains(err.Error(), "split-brain workspace") {
+		t.Fatalf("unclear diagnostic: %v", err)
+	}
+}
+
+// TestStateDirLayoutSharesOneMountPoint proves the recommended layout keeps the
+// corpus and durable policy catalog as siblings inside a single state root, so
+// mounting that one directory as a volume persists both. A document is ingested
+// under the state root and served after a restart with the backfill disabled;
+// the split-brain guard does not fire because both directories share the mount.
+func TestStateDirLayoutSharesOneMountPoint(t *testing.T) {
+	root := t.TempDir()
+	corpus, policy := resolveWorkspacePaths(root, ".shoal/explorer", "")
+	if corpus != filepath.Join(root, "corpus") {
+		t.Fatalf("corpus = %q, want %q", corpus, filepath.Join(root, "corpus"))
+	}
+	if policy != filepath.Join(root, "policy") {
+		t.Fatalf("policy = %q, want %q", policy, filepath.Join(root, "policy"))
+	}
+
+	ingestOneThroughService(t, serviceConfig{
+		backend: "embedded", data: corpus, policyDir: policy})
+
+	ctx := context.Background()
+	authority := auth.NewAuthority()
+	opened, err := openService(ctx, serviceConfig{
+		backend:   "embedded",
+		data:      corpus,
+		policyDir: policy,
+		resolver:  authority.Resolver(),
+		clock:     time.Now,
+		backfill:  nil,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer opened.close()
+
+	decision, err := mintDevelopmentDecision(t)
+	if err != nil {
+		t.Fatal(err)
+	}
+	readCtx, err := authority.Binder().Bind(ctx, decision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := opened.service.Documents(
+		readCtx, webapi.DocumentsRequest{Page: webapi.PageRequest{Limit: 10}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(response.Documents) != 1 {
+		t.Fatalf(
+			"documents served from the state root after restart = %d, want 1",
+			len(response.Documents))
+	}
+}
+
+// TestResolveWorkspacePathsPrecedence pins the three-flag precedence: -state-dir
+// nests corpus/ and policy/ under one mount, -data keeps the legacy sibling
+// layout, and -policy-dir overrides the policy location in either case.
+func TestResolveWorkspacePathsPrecedence(t *testing.T) {
+	for _, testCase := range []struct {
+		name       string
+		stateDir   string
+		dataDir    string
+		policyDir  string
+		wantCorpus string
+		wantPolicy string
+	}{
+		{
+			name:       "legacy data sibling",
+			dataDir:    filepath.Join("var", "data"),
+			wantCorpus: filepath.Join("var", "data"),
+			wantPolicy: policyStoreDir(filepath.Join("var", "data")),
+		},
+		{
+			name:       "state root nests both",
+			stateDir:   filepath.Join("var", "state"),
+			dataDir:    filepath.Join("var", "data"),
+			wantCorpus: filepath.Join("var", "state", "corpus"),
+			wantPolicy: filepath.Join("var", "state", "policy"),
+		},
+		{
+			name:       "policy dir overrides state root",
+			stateDir:   filepath.Join("var", "state"),
+			policyDir:  filepath.Join("mnt", "policy"),
+			wantCorpus: filepath.Join("var", "state", "corpus"),
+			wantPolicy: filepath.Join("mnt", "policy"),
+		},
+		{
+			name:       "policy dir overrides data sibling",
+			dataDir:    filepath.Join("var", "data"),
+			policyDir:  filepath.Join("mnt", "policy"),
+			wantCorpus: filepath.Join("var", "data"),
+			wantPolicy: filepath.Join("mnt", "policy"),
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			corpus, policy := resolveWorkspacePaths(
+				testCase.stateDir, testCase.dataDir, testCase.policyDir)
+			if corpus != testCase.wantCorpus {
+				t.Fatalf("corpus = %q, want %q", corpus, testCase.wantCorpus)
+			}
+			if policy != testCase.wantPolicy {
+				t.Fatalf("policy = %q, want %q", policy, testCase.wantPolicy)
+			}
+		})
+	}
 }
 
 // TestRunBackfillsPreExistingCorpusOverHTTP is the end-to-end proof that a

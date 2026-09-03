@@ -658,6 +658,15 @@ func (s *DurablePolicyStore) memoryStore() *MemoryPolicyStore {
 	return s.memory
 }
 
+// HasRegistrations reports whether the catalog holds any revision
+// registration. Immediately after open it reflects what was reconstructed from
+// disk: false on a non-empty corpus is the signature of a lost or unmounted
+// policy volume, which the caller uses to refuse to serve rather than present a
+// silently under-authorized workspace.
+func (s *DurablePolicyStore) HasRegistrations() bool {
+	return s.memoryStore().registrationCount() > 0
+}
+
 func (s *DurablePolicyStore) nextSeq() uint64 {
 	s.seq++
 	return s.seq
@@ -785,6 +794,15 @@ func (s *DurablePolicyStore) writeRow(row []byte, kind byte, value any) error {
 }
 
 // --- snapshot helpers reading the memory store under its own lock ---
+
+func (s *MemoryPolicyStore) registrationCount() int {
+	if s == nil {
+		return 0
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return len(s.revisions)
+}
 
 func (s *MemoryPolicyStore) snapshotSourceClaim(
 	sourceURI string,
