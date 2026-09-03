@@ -166,22 +166,65 @@ func checkIndeterminateCAS(fault CASFault) (int, error) {
 //
 // It additionally surfaces a LIVENESS gap discovered by this harness: a bare
 // unavailability at the epoch-reservation or frontier-advance CAS wedges the
-// transaction so that neither retry nor recovery converges. That gap is
-// reported (not asserted away); the safety invariants above still hold for it.
+// transaction so that neither retry nor recovery converges. The gap and its
+// head-damage profile are regression-locked (asserted, not merely logged): the
+// set of wedged ordinals and the subset that leaks an epoch are pinned to the
+// currently observed behaviour, so a future change to the resumability gap
+// fails this suite loudly and forces the harness to be updated deliberately.
 func RunPartitionSuite(t *testing.T) {
 	t.Helper()
-	wedged, err := checkControlPlaneUnavailability()
+	wedged, leaked, err := checkControlPlaneUnavailability()
 	if err != nil {
 		t.Fatalf("partition safety: %v", err)
 	}
 	if err := checkRecoveryConverges(); err != nil {
 		t.Fatalf("recovery convergence: %v", err)
 	}
-	if len(wedged) != 0 {
-		t.Logf("DISCOVERED LIVENESS GAP: bare unavailability at CAS ordinals %v wedged the "+
-			"transaction (no convergence via retry or recovery); allocator frontier stayed at 0 "+
-			"so no visibility corruption occurred. Reported for the owner to triage.", wedged)
+	if !equalInts(wedged, expectedWedgedOrdinals) {
+		t.Fatalf("wedged CAS ordinals = %v, want %v; the discovered liveness gap changed - "+
+			"if the resumability gap was fixed this is expected, update the harness deliberately", wedged, expectedWedgedOrdinals)
 	}
+	if !equalInts(leaked, expectedEpochLeakOrdinals) {
+		t.Fatalf("epoch-leak ordinals = %v, want %v; the head-damage profile of the gap changed - "+
+			"update the harness deliberately", leaked, expectedEpochLeakOrdinals)
+	}
+	t.Logf("DISCOVERED LIVENESS GAP (regression-locked): bare unavailability wedged the transaction at "+
+		"CAS ordinals %v with no convergence via retry or recovery. Frontier stayed 0 at every wedged "+
+		"ordinal (no visibility corruption). Head damage: ordinal(s) %v leaked one epoch "+
+		"(NextEpoch=%d, a reserved-but-unused epoch); the remaining wedged ordinal(s) left NextEpoch=%d "+
+		"(no leak, only the frontier lags). Reported for the owner to triage.",
+		wedged, leaked, wedgedNextEpochMax, cleanNextEpoch)
+}
+
+// Known-current behaviour of the discovered liveness gap, regression-locked so a
+// future fix to the resumability gap breaks this suite loudly rather than
+// passing silently. Ordinal 6 is the allocator epoch-reservation CAS (wedges in
+// GUARDS_ACQUIRED and leaks a reserved epoch); ordinal 13 is the frontier-advance
+// CAS (wedges in COMMITTED, no leak - only the frontier lags).
+var (
+	expectedWedgedOrdinals    = []int{6, 13}
+	expectedEpochLeakOrdinals = []int{6}
+)
+
+// cleanNextEpoch is the allocator NextEpoch after a single committed epoch (one
+// epoch reserved). wedgedNextEpochMax bounds how far NextEpoch may run ahead at
+// a wedged ordinal: at most one additional epoch may leak (NextEpoch=3, observed
+// only at the epoch-reservation CAS). Anything beyond is unaccounted leakage.
+const (
+	cleanNextEpoch     = 2
+	wedgedNextEpochMax = 3
+)
+
+func equalInts(a, b []int) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // convergenceOutcome captures how a publish under an injected fault ultimately
@@ -193,33 +236,43 @@ type convergenceOutcome struct {
 }
 
 // checkControlPlaneUnavailability sweeps a bare unavailability across CAS
-// ordinals. For each ordinal it returns whether SAFETY held and records the
-// ordinals that failed to converge (the liveness gap). A non-nil error means a
-// genuine corruption was observed and the suite must fail.
-func checkControlPlaneUnavailability() ([]int, error) {
-	var wedged []int
+// ordinals. For each ordinal it enforces SAFETY (a converged publish is fully
+// consistent; a wedged publish never advanced the frontier) and a head-state
+// BOUND (a wedged publish leaves NextEpoch within [cleanNextEpoch,
+// wedgedNextEpochMax], i.e. at most one leaked epoch). It returns the ordinals
+// that failed to converge (the liveness gap) and the subset of those that leaked
+// an epoch. A non-nil error means a genuine corruption was observed and the
+// suite must fail.
+func checkControlPlaneUnavailability() (wedged, leaked []int, err error) {
 	for position := 0; position < casProbeDepth; position++ {
-		outcome, fired, err := publishUnderBareUnavailability(position)
-		if err != nil {
-			return nil, fmt.Errorf("position %d: %w", position, err)
+		outcome, fired, perr := publishUnderBareUnavailability(position)
+		if perr != nil {
+			return nil, nil, fmt.Errorf("position %d: %w", position, perr)
 		}
 		if !fired {
 			continue
 		}
 		if outcome.converged {
 			// A converged publish must be fully consistent.
-			if outcome.frontier != 1 || outcome.nextEpoch != 2 {
-				return nil, fmt.Errorf("position %d converged with inconsistent allocator head: frontier=%d next=%d", position, outcome.frontier, outcome.nextEpoch)
+			if outcome.frontier != 1 || outcome.nextEpoch != cleanNextEpoch {
+				return nil, nil, fmt.Errorf("position %d converged with inconsistent allocator head: frontier=%d next=%d", position, outcome.frontier, outcome.nextEpoch)
 			}
 			continue
 		}
-		// Wedged: the safety requirement is that nothing became visible.
+		// Wedged. SAFETY: nothing may have become visible.
 		if outcome.frontier != 0 {
-			return nil, fmt.Errorf("position %d wedged but advanced the frontier to %d (visibility corruption)", position, outcome.frontier)
+			return nil, nil, fmt.Errorf("position %d wedged but advanced the frontier to %d (visibility corruption)", position, outcome.frontier)
+		}
+		// BOUND: at most one epoch may have leaked at a wedged ordinal.
+		if outcome.nextEpoch < cleanNextEpoch || outcome.nextEpoch > wedgedNextEpochMax {
+			return nil, nil, fmt.Errorf("position %d wedged with NextEpoch=%d outside [%d,%d] (unaccounted epoch leakage)", position, outcome.nextEpoch, cleanNextEpoch, wedgedNextEpochMax)
 		}
 		wedged = append(wedged, position)
+		if outcome.nextEpoch == wedgedNextEpochMax {
+			leaked = append(leaked, position)
+		}
 	}
-	return wedged, nil
+	return wedged, leaked, nil
 }
 
 // publishUnderBareUnavailability injects CASUnavailable at position, then makes
