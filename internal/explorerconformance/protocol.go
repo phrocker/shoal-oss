@@ -164,13 +164,13 @@ func checkIndeterminateCAS(fault CASFault) (int, error) {
 // second epoch ever becomes visible, and a converged publish is idempotent. It
 // also proves that a data-plane partition is recovered by a fresh owner.
 //
-// It additionally surfaces a LIVENESS gap discovered by this harness: a bare
-// unavailability at the epoch-reservation or frontier-advance CAS wedges the
-// transaction so that neither retry nor recovery converges. The gap and its
-// head-damage profile are regression-locked (asserted, not merely logged): the
-// set of wedged ordinals and the subset that leaks an epoch are pinned to the
-// currently observed behaviour, so a future change to the resumability gap
-// fails this suite loudly and forces the harness to be updated deliberately.
+// It additionally regression-locks the LIVENESS property that this harness was
+// built to discover: a bare unavailability at any CAS ordinal - including the
+// epoch-reservation and frontier-advance CAS that previously wedged - must
+// resume via retry or recovery to a single committed epoch. The set of wedged
+// ordinals and the subset that leaks an epoch are pinned (asserted, not merely
+// logged), so a regression that reintroduces the gap fails this suite loudly
+// and forces the harness to be updated deliberately.
 func RunPartitionSuite(t *testing.T) {
 	t.Helper()
 	wedged, leaked, err := checkControlPlaneUnavailability()
@@ -188,22 +188,32 @@ func RunPartitionSuite(t *testing.T) {
 		t.Fatalf("epoch-leak ordinals = %v, want %v; the head-damage profile of the gap changed - "+
 			"update the harness deliberately", leaked, expectedEpochLeakOrdinals)
 	}
-	t.Logf("DISCOVERED LIVENESS GAP (regression-locked): bare unavailability wedged the transaction at "+
-		"CAS ordinals %v with no convergence via retry or recovery. Frontier stayed 0 at every wedged "+
-		"ordinal (no visibility corruption). Head damage: ordinal(s) %v leaked one epoch "+
-		"(NextEpoch=%d, a reserved-but-unused epoch); the remaining wedged ordinal(s) left NextEpoch=%d "+
-		"(no leak, only the frontier lags). Reported for the owner to triage.",
-		wedged, leaked, wedgedNextEpochMax, cleanNextEpoch)
+	if len(wedged) == 0 {
+		t.Logf("RESUMABILITY HOLDS (regression-locked): definite unavailability at every probed CAS "+
+			"ordinal converged to a single committed epoch via retry or recovery, with no epoch leak "+
+			"(NextEpoch=%d) and no premature visibility. The previously discovered liveness gap at the "+
+			"epoch-reservation and frontier-advance CAS is closed.", cleanNextEpoch)
+	} else {
+		t.Logf("LIVENESS GAP (regression-locked): bare unavailability wedged the transaction at "+
+			"CAS ordinals %v with no convergence via retry or recovery. Frontier stayed 0 at every wedged "+
+			"ordinal (no visibility corruption). Head damage: ordinal(s) %v leaked one epoch "+
+			"(NextEpoch=%d, a reserved-but-unused epoch); the remaining wedged ordinal(s) left NextEpoch=%d "+
+			"(no leak, only the frontier lags). Reported for the owner to triage.",
+			wedged, leaked, wedgedNextEpochMax, cleanNextEpoch)
+	}
 }
 
-// Known-current behaviour of the discovered liveness gap, regression-locked so a
-// future fix to the resumability gap breaks this suite loudly rather than
-// passing silently. Ordinal 6 is the allocator epoch-reservation CAS (wedges in
-// GUARDS_ACQUIRED and leaks a reserved epoch); ordinal 13 is the frontier-advance
-// CAS (wedges in COMMITTED, no leak - only the frontier lags).
+// Regression-locked behaviour of the control-plane unavailability sweep. The
+// resumability gap this harness discovered (PR #286) has since been fixed
+// (PR fix/cas-resumability): a definite unavailability at every probed CAS
+// ordinal now resumes to a single committed epoch, so no ordinal wedges and none
+// leaks an epoch. These sets are pinned empty so a regression that reintroduces
+// a wedge or leak breaks this suite loudly. (Historically ordinal 6 was the
+// epoch-reservation CAS - wedged in GUARDS_ACQUIRED and leaked a reserved epoch;
+// ordinal 13 was the frontier-advance CAS - wedged in COMMITTED, no leak.)
 var (
-	expectedWedgedOrdinals    = []int{6, 13}
-	expectedEpochLeakOrdinals = []int{6}
+	expectedWedgedOrdinals    = []int{}
+	expectedEpochLeakOrdinals = []int{}
 )
 
 // cleanNextEpoch is the allocator NextEpoch after a single committed epoch (one
