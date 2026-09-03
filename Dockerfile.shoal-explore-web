@@ -35,7 +35,7 @@ RUN --mount=type=cache,target=/go/pkg/mod \
     go build -trimpath \
       -ldflags="-s -w -buildid= -X main.version=${VERSION}" \
       -o /out/shoal-explore-web ./cmd/shoal-explore-web \
- && mkdir -p /out/data
+ && mkdir -p /out/state/corpus
 
 FROM gcr.io/distroless/static-debian12:nonroot AS runtime
 
@@ -52,18 +52,28 @@ LABEL org.opencontainers.image.title="shoal-explore-web" \
       org.opencontainers.image.created="${CREATED}"
 
 COPY --from=build /out/shoal-explore-web /usr/local/bin/shoal-explore-web
-# The corpus lives on a declared volume so a container restart preserves it.
-COPY --from=build --chown=65532:65532 /out/data /var/lib/shoal/explorer
+# A SINGLE state root holds ALL persistent state and is the declared volume, so
+# one mount survives a restart regardless of how state is subdivided:
+#   /var/lib/shoal/corpus         document corpus (the -data directory)
+#   /var/lib/shoal/corpus-policy  authorization catalog once #284/#288 lands;
+#                                 derived as filepath.Clean(-data)+"-policy",
+#                                 a SIBLING of the corpus, so it must live under
+#                                 the same mounted root and never inside -data
+#                                 (the engine treats every -data subdirectory as
+#                                 a table). See docs/shoal-explore-web-deploy.md.
+# Mounting the corpus directory alone would drop the authorization catalog on
+# restart; mounting the state root keeps both.
+COPY --from=build --chown=65532:65532 /out/state /var/lib/shoal
 
 WORKDIR /var/lib/shoal
 # distroless:nonroot is uid/gid 65532. Running as a fixed non-root account keeps
 # the image from ever executing as root.
 USER 65532:65532
-VOLUME ["/var/lib/shoal/explorer"]
+VOLUME ["/var/lib/shoal"]
 EXPOSE 8098
 STOPSIGNAL SIGTERM
 ENTRYPOINT ["/usr/local/bin/shoal-explore-web"]
 # Safe default: loopback bind with the loopback-gated development authenticator.
 # A public bind (-listen 0.0.0.0:...) with -dev-auth is refused at startup by
 # the command itself; see selectAuthenticator in cmd/shoal-explore-web/authn.go.
-CMD ["-data", "/var/lib/shoal/explorer", "-listen", "127.0.0.1:8098", "-dev-auth"]
+CMD ["-data", "/var/lib/shoal/corpus", "-listen", "127.0.0.1:8098", "-dev-auth"]

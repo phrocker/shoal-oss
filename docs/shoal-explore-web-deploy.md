@@ -12,6 +12,7 @@ prerequisites below land) in a shared instance, where the two deployments differ
 
 - [Image](#image)
 - [Local: one command](#local-one-command)
+- [Volume layout: a single state root](#volume-layout-a-single-state-root)
 - [The configuration seam: local vs shared](#the-configuration-seam-local-vs-shared)
 - [The unsafe-configuration guard](#the-unsafe-configuration-guard)
 - [Persistence and the #284 caveat](#persistence-and-the-284-caveat)
@@ -26,8 +27,8 @@ prerequisites below land) in a shared instance, where the two deployments differ
   repo's `go.work` pins a newer toolchain than the base image; the command
   itself builds on 1.25).
 - **runtime stage** `gcr.io/distroless/static-debian12:nonroot` — runs as uid/gid
-  `65532`, contains only the stripped binary and an empty, `65532`-owned corpus
-  directory. `/var/lib/shoal/explorer` is a declared `VOLUME`.
+  `65532`, contains only the stripped binary and an empty, `65532`-owned state
+  root. `/var/lib/shoal` (the whole state root) is a declared `VOLUME`.
 
 ```console
 $ docker build -f Dockerfile.shoal-explore-web -t shoal-explore-web:test --build-arg VERSION=deploy-test .
@@ -35,8 +36,8 @@ $ docker build -f Dockerfile.shoal-explore-web -t shoal-explore-web:test --build
  => naming to docker.io/library/shoal-explore-web:test
 
 $ docker image inspect shoal-explore-web:test \
-    --format 'Size={{.Size}} User={{.Config.User}} Volumes={{json .Config.Volumes}}'
-Size=7097222 User=65532:65532 Volumes={"/var/lib/shoal/explorer":{}}
+    --format 'Size={{.Size}} User={{.Config.User}} Cmd={{json .Config.Cmd}} Volumes={{json .Config.Volumes}}'
+Size=7097160 User=65532:65532 Cmd=["-data","/var/lib/shoal/corpus","-listen","127.0.0.1:8098","-dev-auth"] Volumes={"/var/lib/shoal":{}}
 ```
 
 The image is ~7 MB, runs as non-root, and embeds no secrets: `Config.Env` is only
@@ -77,9 +78,40 @@ compose file therefore uses `network_mode: host`:
   (`go run ./cmd/shoal-explore-web -dev-auth`), or enable Docker Desktop host
   networking.
 
-The corpus lives on the named volume `explorer-data`, so `docker compose down`
-followed by `up`, or any container restart, preserves it. `docker compose down -v`
-deletes it.
+The persistent state lives on the named volume `explorer-state` mounted at the
+state root `/var/lib/shoal`, so `docker compose down` followed by `up`, or any
+container restart, preserves it. `docker compose down -v` deletes it.
+
+## Volume layout: a single state root
+
+Mount the **state root** `/var/lib/shoal`, never the corpus directory. All
+persistent state lives under one mount:
+
+```
+/var/lib/shoal/                 <- the declared VOLUME (mount THIS)
+├── corpus/                     <- the document corpus (-data)
+│   └── _shoal_explorer/        <- the corpus engine's table
+└── corpus-policy/              <- the authorization catalog (once #284/#288 lands)
+```
+
+The authorization catalog is a **sibling** of the corpus, not a child of it: the
+durable policy store (issue #284, PR #288) derives its directory as
+`filepath.Clean(-data) + "-policy"`. It cannot nest inside `-data` because the
+corpus engine treats every subdirectory of the data directory as a table and
+would misread the catalog as table data.
+
+The consequence is the whole point of this layout: **mounting only the corpus
+directory would preserve documents but drop every authorization registration on
+restart** — the workspace would then serve an empty or under-populated result
+set, which the temporary startup backfill can partially mask, making the failure
+look like something else. Mounting the state root keeps both. It is also robust
+to the pending change to a `<state-root>/corpus` + `<state-root>/policy` layout
+with an explicit policy-directory flag: both still fall under `/var/lib/shoal`.
+
+The default `-data` is `/var/lib/shoal/corpus`; the image declares `/var/lib/shoal`
+(not `/var/lib/shoal/corpus`) as the volume, and the state root is owned by
+`65532` so the non-root process creates `corpus/` and the sibling `corpus-policy/`
+at runtime.
 
 ## The configuration seam: local vs shared
 
@@ -89,7 +121,7 @@ mounted volume — never code:
 | Concern            | Local (laptop)                     | Shared instance                              |
 | ------------------ | ---------------------------------- | -------------------------------------------- |
 | Bind address       | `-listen 127.0.0.1:8098` (loopback)| `-listen 0.0.0.0:<port>` (see gaps below)    |
-| Data directory     | `-data /var/lib/shoal/explorer` (declared volume) | same flag, backed by durable storage |
+| Data directory     | `-data /var/lib/shoal/corpus` (under the state-root volume) | same flag, backed by durable storage |
 | Authenticator      | `-dev-auth` (loopback-only)        | a real authenticator (**not yet wired**)     |
 | TLS termination    | none (loopback)                    | terminated at an ingress/reverse proxy       |
 | Log format         | Go `log` text to stderr            | same today (no structured-log flag yet)      |
@@ -121,7 +153,7 @@ No authenticator at all is also refused (the workspace never serves anonymously)
 
 ```console
 $ docker run --rm --network host shoal-explore-web:test \
-    -data /var/lib/shoal/explorer -listen 127.0.0.1:8099
+    -data /var/lib/shoal/corpus -listen 127.0.0.1:8099
 shoal-explore-web: refusing to serve 127.0.0.1:8099 without authentication: no
 authenticator is configured; pass -dev-auth to mint the
 development-principal@localhost development principal on a loopback listener, or
@@ -135,61 +167,83 @@ requested), closing the listener before the corpus is opened.
 
 ## Persistence and the #284 caveat
 
-The restart test proves the volume works, but you must be precise about what it
-proves. Two facts are distinct:
+The restart test proves the volume works, but you must be precise about *which*
+directories you mounted and *what* survived. Three facts are distinct:
 
-1. **The volume preserved the corpus on disk.**
+1. **The volume preserved the corpus bytes on disk.**
 2. **The workspace served that corpus after restart.**
+3. **The authorization state survived on its own.**
 
-On `main` today, document data is durable (Shoal storage engine) but the
-*authorization* policy catalog is an in-process map (issue #284). A startup
+The layout above is designed so a single mount (`/var/lib/shoal`) covers both the
+corpus and the authorization catalog. On `main` today, document data is durable
+(Shoal storage engine) but the *authorization* policy catalog is an in-process
+map (issue #284) — there is **no on-disk policy directory yet**. A startup
 **backfill**, gated to `-dev-auth` on a loopback listener, re-registers the
-on-disk documents for the development principal at every start — so under the
-local profile, restart serves the corpus, but only because the backfill rebuilds
+on-disk documents for the development principal at every start, so under the
+local profile a restart serves the corpus, but only because the backfill rebuilds
 the in-memory authorization each time.
 
-Observed end-to-end (Docker Desktop, host-network curl helper):
+Observed end-to-end (Docker Desktop, host-network curl helper). **Mount:** the
+named volume `shoal-explore-state` at `/var/lib/shoal` (the state root) — the
+corpus directory itself was *not* mounted directly.
 
 ```console
+$ docker run -d --name shoal-explore-test --network host \
+    -v shoal-explore-state:/var/lib/shoal shoal-explore-web:test
+
 # seed one document
 $ docker run --rm --network host -v "$PWD/seed:/seed:ro" curlimages/curl -s \
     -X POST http://127.0.0.1:8098/api/v1/ingest \
     -H "X-Shoal-Workspace-Request: 1" \
     -F "file=@/seed/seed.md;type=text/markdown"
-{"snapshot":{"id":"2ab74122b4f13cb59c6dc13e8b41c5a856649374741fb7f12a19911f6047d036", ...}}
+{"snapshot":{"id":"b7ece0950ac4662adfa51e2e119b61c334f4278951cf1010b859aac86a702176", ...}}
 
-# before restart: 1 document served
-$ docker run --rm --network host -v "$PWD/seed:/seed:ro" curlimages/curl -s \
-    -X POST http://127.0.0.1:8098/api/v1/documents \
-    -H "X-Shoal-Workspace-Request: 1" -H "Content-Type: application/json" \
-    -d '{"page":{"limit":10}}'
-{"snapshot":{"id":"2ab74122...","...":"..."},"documents":[{"document":{"title":"seed.md", ...}}]}
+# before restart: seed.md served
 
 $ docker restart shoal-explore-test
 # logs after restart:
-#   Granted 1 pre-existing document(s) in /var/lib/shoal/explorer to development-principal@localhost ...
+#   Granted 1 pre-existing document(s) in /var/lib/shoal/corpus to development-principal@localhost ...
 #   Shoal Explorer listening at http://127.0.0.1:8098
 
-# after restart: SAME snapshot id, document still served
+# after restart: SAME snapshot id b7ece095..., seed.md still served
 $ docker run --rm --network host -v "$PWD/seed:/seed:ro" curlimages/curl -s \
     -X POST http://127.0.0.1:8098/api/v1/documents \
     -H "X-Shoal-Workspace-Request: 1" -H "Content-Type: application/json" \
     -d '{"page":{"limit":10}}'
-{"snapshot":{"id":"2ab74122...","...":"..."},"documents":[{"document":{"title":"seed.md", ...}}]}
+{"snapshot":{"id":"b7ece095...","...":"..."},"documents":[{"document":{"title":"seed.md", ...}}]}
+
+# what is actually on the mounted state-root volume:
+$ docker run --rm -v shoal-explore-state:/state --entrypoint sh curlimages/curl \
+    -c "ls -1 /state; echo ---; ls -1 /state/corpus; echo ---; \
+        test -d /state/corpus-policy && echo policy:YES || echo policy:NO"
+corpus
+---
+_shoal_explorer
+---
+policy:NO
 ```
 
-The snapshot id `2ab74122…` is identical before and after restart, and the
+The snapshot id `b7ece095…` is identical before and after restart, and the
 post-restart log reports `Granted 1 pre-existing document(s)` — the corpus was on
-disk and the dev-auth backfill re-authorized it.
+disk under `/var/lib/shoal/corpus` and the dev-auth backfill re-authorized it.
 
-**What this proves:** the named volume preserved the corpus across a restart, and
-the local `-dev-auth` profile serves it again.
-**What it does not prove:** that authorization survives on its own. It does not —
-the policy catalog is in-memory and is reconstructed by the backfill each start
-(#284). In a deployment **without** the backfill (any non-dev authenticator), a
-restart would preserve the corpus on disk but serve an **empty** result set until
-each document is ingested again. Do not read the green restart test as "policy
-persistence works."
+**What this proves (facts 1 and 2):** the single state-root mount preserved the
+corpus on disk and the local `-dev-auth` profile served it again.
+
+**What is unverified (fact 3), honestly:** the authorization half. This branch
+does **not** include the durable policy store (#284 / PR #288), so no
+`corpus-policy/` directory exists yet — the on-disk listing above shows only
+`corpus/`, `policy:NO`. The policy catalog is in-memory and is reconstructed by
+the dev-only backfill each start. I could not exercise authorization-state
+persistence here and did not fake it. The volume layout is nevertheless correct
+in advance: when #288 lands, `corpus-policy/` is created as a sibling of
+`corpus/` **inside** the already-mounted `/var/lib/shoal`, so the same single
+mount will carry it across restarts.
+
+Do not read the green restart test as "policy persistence works." Without the
+backfill (any non-dev authenticator), a restart on today's `main` would preserve
+the corpus on disk but serve an **empty** result set until each document is
+ingested again.
 
 ## Shared / cloud instance: shape and open gaps
 
@@ -223,15 +277,18 @@ is **persistent-volume semantics**, because the corpus is a local directory that
 must survive restarts and redeploys.
 
 - **Azure Container Apps** — closest to the compose model. Mount an **Azure Files**
-  volume at `/var/lib/shoal/explorer`. Caveat: Container Apps runs multiple
+  volume at the state root `/var/lib/shoal` (covering both the corpus and the
+  sibling policy catalog). Caveat: Container Apps runs multiple
   replicas by default and load-balances across them; this workload is
   **single-instance** (no shared coordination — see gap #2), so pin
   `minReplicas: 1` / `maxReplicas: 1`. SMB/Azure Files latency under the storage
   engine should be validated before committing.
 - **App Service (custom container)** — persistent storage via `WEBSITES_ENABLE_APP_SERVICE_STORAGE`
-  or a mounted Azure Files share. Also single-instance (disable scale-out).
+  or a mounted Azure Files share at `/var/lib/shoal`. Also single-instance
+  (disable scale-out).
 - **AKS** — a single-replica `Deployment` (or `StatefulSet`) with a
-  `ReadWriteOnce` PVC. The most control, the most operational overhead.
+  `ReadWriteOnce` PVC mounted at the state root `/var/lib/shoal`. The most
+  control, the most operational overhead.
 
 In all three, TLS terminates at the platform ingress and the app still needs a
 real authenticator (gap #1) before it is exposed. Treat the above as one
