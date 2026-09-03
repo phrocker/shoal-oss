@@ -484,10 +484,14 @@ The short version of why:
   risks below bite — but running a Kubernetes cluster to host one binary is not
   justified for this workload.
 
-Two risks are called out honestly in the artifact README and must be smoke-tested
-on first deploy: the non-root uid `65532` writing an SMB mount, and the embedded
-engine's file semantics on SMB (switch to Azure Files NFS, or escalate to AKS +
-Azure Disk, if either fails). TLS terminates at the App Service front end and the
+Two Azure Files risks are sized honestly in the artifact README. The genuine
+gate is the non-root uid `65532` writing an SMB mount (a first-boot check settles
+it). The SMB-semantics worry is **largely retired by evidence**: this binary has
+no memory-mapped I/O anywhere in the tree and never reaches the only `flock` code
+(`internal/promotion`, absent from `go list -deps ./cmd/shoal-explore-web` on both
+Windows and Linux) — the two mechanisms that make embedded stores unsafe on SMB —
+so Azure Files SMB is a reasonable default, with NFS or AKS + Azure Disk kept as
+escalation paths only if a specific problem shows up. TLS terminates at the App Service front end and the
 app runs the Entra authenticator (`-entra-*` / `SHOAL_ENTRA_*`). The
 host-authority seam (gap #3) still gates **public** exposure: stand the instance
 up and wire identity, but treat the front door as closed until the host-allowlist

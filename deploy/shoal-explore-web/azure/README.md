@@ -176,24 +176,97 @@ logs stop before the new container logs begin.
   the managed identity (already wired in the template). **[Docs]**
   ([Key Vault references](https://learn.microsoft.com/azure/app-service/app-service-key-vault-references)).
 
-## Two risks I could not verify offline (test these first)
+## The two Azure Files risks, sized honestly
 
-Both point to the same first-run smoke test, and both are resolved by the AKS +
-Azure Disk escalation path if they fail:
+Whether Azure Files is safe or corrupting for this store is *the* question, so it
+gets a sized answer rather than a shrug. One risk is now largely retired by
+evidence from this repository; the other is the genuine gating unknown.
 
-1. **Non-root user vs. the SMB mount.** The image runs as uid/gid `65532`
-   (non-root) **[Verified]** — Dockerfile `USER 65532:65532`. App Service mounts
-   Azure Files over SMB/CIFS with a fixed ownership; if the mounted
-   `/var/lib/shoal` is not writable by `65532`, the container cannot create
-   `corpus/` and `policy/` and will fail to start. **[Inference]** — I could not
-   test the mount's uid/gid. Confirm the first container start writes both
-   directories.
-2. **SMB semantics under an embedded store.** Shoal's engine does local file
-   operations (rename, directory-as-table). SMB does not guarantee every POSIX
-   semantic a local disk does. **[Inference]** — unverified. If the engine
-   misbehaves on SMB, switch the share to **Azure Files NFS** (Premium
-   `FileStorage` + VNet integration; note Key Vault mount auth is not applicable
-   with NFS) **[Docs]**, or escalate to AKS + Azure Disk (a real block device).
+### Risk 1 (the real gate): non-root user vs. the SMB mount
+
+The image runs as uid/gid `65532` (non-root) **[Verified]** — `USER 65532:65532`
+in `Dockerfile.shoal-explore-web` (at the repository root, not under `deploy/`).
+App Service mounts Azure Files over SMB/CIFS with a fixed ownership; if the
+mounted `/var/lib/shoal` is not writable by `65532`, the container cannot create
+`corpus/` and `policy/` and will fail to start. **[Inference]** — I could not
+test the mount's uid/gid from here, so treat this as the one unknown that gates
+the first deploy.
+
+**Settle it in under a minute after first start** with either check:
+
+- **From the app's log stream** — a healthy first boot prints the durable-catalog
+  line and the listening line; a mount-permission failure prints an
+  open/create error instead and the container never reaches "listening":
+
+  ```console
+  az webapp log tail --name <app> --resource-group <rg>
+  # expect, on success:
+  #   Policy catalog is durable in /var/lib/shoal/policy: ... Persist both the
+  #   corpus (/var/lib/shoal/corpus) and this policy directory ...
+  #   Shoal Explorer listening at http://0.0.0.0:8098
+  ```
+
+  (Note: the distroless image has no shell, so `az webapp ssh` is not available —
+  the log stream and the share listing below are the checks that work.)
+
+- **From the storage side** — confirm the non-root process actually wrote to the
+  share. Because the share is mounted at the state root, `corpus/` and `policy/`
+  appear at the share root:
+
+  ```console
+  az storage file list --account-name <storageAccount> --share-name shoal-state \
+      --path . -o table
+  # expect two directories: corpus  policy
+  ```
+
+If neither directory appears, the mount is not writable by `65532`: this is a
+mount-ownership problem, not an application bug. Escalate to AKS + Azure Disk
+(where `securityContext.fsGroup` sets mount ownership) rather than changing app
+code.
+
+### Risk 2 (largely retired): SMB semantics under the store
+
+The classic reasons an embedded store corrupts on SMB/CIFS are **memory-mapped
+files** and **POSIX/BSD advisory locks** — the mechanisms SQLite, BoltDB and
+LevelDB all cite when they document network shares as unsafe. **Neither is
+present on this binary's path.** **[Verified]** — properties of this repository,
+checkable offline:
+
+- **No memory-mapped I/O anywhere in the tree.** A repo-wide search for
+  `Mmap`/`syscall.Mmap`/`unix.Mmap` returns nothing; `internal/engine` in
+  particular has none. The store's durability path is instead
+  fsync-then-atomic-rename-over-temp (`tmp.Sync()` then `os.Rename(tmp, path)` at
+  `internal/engine/table.go:385,392` and `internal/engine/rfile_sync.go:245`) —
+  the single most network-filesystem-tolerant write pattern there is.
+- **No advisory file locking on this binary's path.** The only `flock`/
+  `LockFileEx` call sites in the entire repository are in
+  `internal/promotion/intent_lock_unix.go` and `intent_lock_windows.go`, and
+  `internal/promotion` **is not in this binary's dependency closure**.
+
+Reproduce both offline:
+
+```console
+# 1) The lock code lives only in internal/promotion, and this binary never
+#    imports it (empty output = not reachable), on either target OS:
+go list -deps ./cmd/shoal-explore-web | Select-String 'internal/promotion|internal/tserver'
+$env:GOOS='linux'; go list -deps ./cmd/shoal-explore-web | Select-String 'internal/promotion'; Remove-Item Env:GOOS
+
+# 2) No memory-mapped I/O anywhere in the repo:
+Get-ChildItem -Recurse -Filter *.go | Select-String 'syscall\.Mmap|unix\.Mmap|\bMmap\b'
+```
+
+One honesty note so a future reader is not misled: on the **Linux** deploy target
+`golang.org/x/sys/unix` *is* in the closure (the Go runtime and other packages
+pull it in), so "`x/sys/unix` is absent" is a Windows-only artifact and is **not**
+the proof. The durable proof is that `internal/promotion` — the only package that
+actually calls `flock` — is absent from the closure on both Windows and Linux, so
+the `flock` code is unreachable regardless of whether `x/sys/unix` is linked.
+
+**Net:** the two mechanisms that make embedded stores unsafe on SMB are not on
+this path, so Azure Files SMB is a reasonable default for this binary. Keep
+**Azure Files NFS** (Premium `FileStorage` + VNet integration; Key Vault mount
+auth is not applicable with NFS) **[Docs]** and AKS + Azure Disk as escalation
+paths **only if a specific problem is observed** — not as the expected remedy.
 
 ## Operational reality
 
