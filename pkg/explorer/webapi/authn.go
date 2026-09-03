@@ -59,11 +59,15 @@ func (f AuthenticatorFunc) Authenticate(
 // service's Explorer client was constructed with; identity is carried per
 // request through the context capability rather than through process state, so
 // the transport scales unchanged from one to many instances.
+//
+// allowedAuthorities is the exact-match host-authority allow-list applied to
+// every request before authentication (see NewHandler and ServeHTTP); at least
+// one is required.
 func NewAuthenticatedHandler(
 	service Service,
-	allowedAuthority string,
 	authenticator Authenticator,
 	binder auth.Binder,
+	allowedAuthorities ...string,
 ) (*Handler, error) {
 	if isAbsentInterface(authenticator) {
 		return nil, shoal.NewError(
@@ -73,7 +77,7 @@ func NewAuthenticatedHandler(
 		return nil, shoal.NewError(
 			shoal.ErrorInvalidArgument, "workspace decision binder is required")
 	}
-	handler, err := NewHandler(service, allowedAuthority)
+	handler, err := NewHandler(service, allowedAuthorities...)
 	if err != nil {
 		return nil, err
 	}

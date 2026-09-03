@@ -115,9 +115,9 @@ func newAuthnFixture(t *testing.T) *authnFixture {
 	server := httptest.NewUnstartedServer(nil)
 	handler, err := webapi.NewAuthenticatedHandler(
 		service,
-		server.Listener.Addr().String(),
 		webapi.AuthenticatorFunc(authnAuthenticate),
 		authority.Binder(),
+		server.Listener.Addr().String(),
 	)
 	if err != nil {
 		server.Close()
@@ -385,7 +385,7 @@ func TestNilAuthenticatorAdapterIsRejectedNotPanicked(t *testing.T) {
 		t.Log("the adapter holds no function")
 	}
 	_, err := webapi.NewAuthenticatedHandler(
-		nil, "127.0.0.1:0", absent, authority.Binder())
+		nil, absent, authority.Binder(), "127.0.0.1:0")
 	if !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) ||
 		!strings.Contains(err.Error(), "authenticator") {
 		t.Fatalf("nil authenticator adapter error = %v", err)
@@ -394,9 +394,9 @@ func TestNilAuthenticatorAdapterIsRejectedNotPanicked(t *testing.T) {
 	var absentBinder *authnAbsentBinder
 	_, err = webapi.NewAuthenticatedHandler(
 		nil,
-		"127.0.0.1:0",
 		webapi.AuthenticatorFunc(authnAuthenticate),
 		absentBinder,
+		"127.0.0.1:0",
 	)
 	if !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) ||
 		!strings.Contains(err.Error(), "binder") {

@@ -78,6 +78,18 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 			"survive a restart",
 	)
 	listen := flags.String("listen", "127.0.0.1:8080", "HTTP listen address")
+	allowedHost := flags.String(
+		"allowed-host", "",
+		"Comma-separated exact-match allow-list of external authorities (host "+
+			"or host:port) an inbound request's Host/:authority must match; the "+
+			"hostname compares case-insensitively and the port exactly. No "+
+			"wildcard or suffix matching, and X-Forwarded-Host is never "+
+			"trusted. Required for a non-loopback or wildcard -listen, whose "+
+			"resolved socket address real client Host headers never carry; a "+
+			"public bind refuses every request until this names the external "+
+			"authority. Defaults to the resolved listen address; environment "+
+			"fallback SHOAL_ALLOWED_HOST",
+	)
 	remote := flags.String("remote", "", "Remote Explorer web API URL for -backend remote")
 	embeddingProvider := flags.String(
 		"embedding-provider", "",
@@ -223,8 +235,21 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 	service, cleanup := opened.service, opened.close
 	defer cleanup()
 
+	// The host-authority allow-list defaults to the resolved listen address,
+	// preserving the local-first posture: a loopback bind serves only requests
+	// whose Host is that loopback authority. A non-loopback or wildcard bind
+	// resolves to an address (for example 0.0.0.0:<port>) that real client Host
+	// headers never carry, so such a deployment must name its external
+	// authority with -allowed-host or every request is refused — a fail-closed
+	// default, safe but requiring explicit configuration behind a proxy.
+	allowedAuthorities := splitCommaList(
+		firstNonEmpty(*allowedHost, os.Getenv("SHOAL_ALLOWED_HOST")))
+	if len(allowedAuthorities) == 0 {
+		allowedAuthorities = []string{listener.Addr().String()}
+	}
+
 	handler, err := webapi.NewAuthenticatedHandler(
-		service, listener.Addr().String(), authenticator, authority.Binder())
+		service, authenticator, authority.Binder(), allowedAuthorities...)
 	if err != nil {
 		listener.Close()
 		return err
