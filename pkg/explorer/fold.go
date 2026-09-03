@@ -224,9 +224,12 @@ func (e *Explorer) RehydrateFold(
 	if err := shoal.ValidateRequiredID("fold ID", foldID); err != nil {
 		return interaction.Fold{}, err
 	}
-	e.mu.RLock()
-	defer e.mu.RUnlock()
+	e.mu.Lock()
+	defer e.mu.Unlock()
 	if err := e.requireOpen(); err != nil {
+		return interaction.Fold{}, err
+	}
+	if err := e.ensureGraphLocked(); err != nil {
 		return interaction.Fold{}, err
 	}
 	record, ok := e.folds[foldID]
@@ -237,6 +240,13 @@ func (e *Explorer) RehydrateFold(
 	if record.Deleted {
 		return interaction.Fold{}, shoal.NewError(
 			shoal.ErrorConflict, "fold was explicitly deleted")
+	}
+	current, err := e.currentSubgraphVisibilityLocked(record.Nodes, record.Edges)
+	if err != nil {
+		return interaction.Fold{}, err
+	}
+	if current != record.Visibility {
+		return interaction.Fold{}, staleDerivedVisibilityError()
 	}
 	fold := interaction.Fold{
 		Members:       cloneFoldMembers(record.Members),
@@ -263,13 +273,27 @@ func (e *Explorer) Folds(ctx context.Context) ([]FoldSummary, error) {
 	if err := contextError(ctx); err != nil {
 		return nil, err
 	}
-	e.mu.RLock()
-	defer e.mu.RUnlock()
+	e.mu.Lock()
+	defer e.mu.Unlock()
 	if err := e.requireOpen(); err != nil {
+		return nil, err
+	}
+	if err := e.ensureGraphLocked(); err != nil {
 		return nil, err
 	}
 	summaries := make([]FoldSummary, 0, len(e.folds))
 	for _, record := range e.folds {
+		if !record.Deleted {
+			current, err := e.currentSubgraphVisibilityLocked(
+				record.Nodes, record.Edges)
+			if err != nil || current != record.Visibility {
+				// Fail closed at read time: a live fold whose evidence was
+				// reclassified to a stricter label after it was folded is
+				// withheld rather than served under its stale, now
+				// under-labelled visibility. See issue #273.
+				continue
+			}
+		}
 		summaries = append(summaries, FoldSummary{
 			FoldID:        record.FoldID,
 			FoldedAt:      record.FoldedAt,
@@ -299,14 +323,27 @@ func (e *Explorer) FoldSubgraph(
 	if err := shoal.ValidateRequiredID("fold ID", foldID); err != nil {
 		return Neighborhood{}, err
 	}
-	e.mu.RLock()
-	defer e.mu.RUnlock()
+	e.mu.Lock()
+	defer e.mu.Unlock()
 	if err := e.requireOpen(); err != nil {
+		return Neighborhood{}, err
+	}
+	if err := e.ensureGraphLocked(); err != nil {
 		return Neighborhood{}, err
 	}
 	record, ok := e.folds[foldID]
 	if !ok {
 		return Neighborhood{}, shoal.NewError(shoal.ErrorNotFound, "fold not found")
+	}
+	if !record.Deleted {
+		current, err := e.currentSubgraphVisibilityLocked(
+			record.Nodes, record.Edges)
+		if err != nil {
+			return Neighborhood{}, err
+		}
+		if current != record.Visibility {
+			return Neighborhood{}, staleDerivedVisibilityError()
+		}
 	}
 	result := Neighborhood{
 		Nodes: make([]graph.Node, 0, len(record.Nodes)),
@@ -424,12 +461,13 @@ func foldIdempotentResult(
 	// from it, so re-folding the same members against a corpus whose labels
 	// moved fails here rather than quietly returning a stale visibility.
 	//
-	// This check only runs on this path. Read paths (Folds, RehydrateFold,
-	// FoldSubgraph, provenance traversal) serve the visibility stored at fold
-	// time and do not re-derive it, so a later metadata-only re-ingest that
-	// tightens a source label leaves an already-written fold under-labelled
-	// until it is folded again. Interaction sessions recorded in phase 1 have
-	// the same snapshot semantics; see issue #273.
+	// Read paths (Folds, RehydrateFold, FoldSubgraph) and the interaction read
+	// paths (Interactions, InteractionSubgraph) now re-derive visibility from
+	// current source labels on every read and fail closed when the stored value
+	// no longer matches, so a later metadata-only re-ingest that tightens a
+	// source label no longer leaves an already-written fold or session
+	// under-labelled and readable. See issue #273. Tombstones are exempt: a
+	// deleted record carries its original visibility by design.
 	if existing.Visibility != interaction.Expression(subgraph.Visibility) {
 		return FoldResult{}, shoal.NewError(
 			shoal.ErrorConflict,

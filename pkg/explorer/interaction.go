@@ -245,13 +245,27 @@ func (e *Explorer) Interactions(ctx context.Context) ([]InteractionSummary, erro
 	if err := contextError(ctx); err != nil {
 		return nil, err
 	}
-	e.mu.RLock()
-	defer e.mu.RUnlock()
+	e.mu.Lock()
+	defer e.mu.Unlock()
 	if err := e.requireOpen(); err != nil {
+		return nil, err
+	}
+	if err := e.ensureGraphLocked(); err != nil {
 		return nil, err
 	}
 	summaries := make([]InteractionSummary, 0, len(e.interactions))
 	for _, record := range e.interactions {
+		if !record.Deleted {
+			current, err := e.currentSubgraphVisibilityLocked(
+				record.Nodes, record.Edges)
+			if err != nil || current != record.Visibility {
+				// Fail closed at read time: a live session whose evidence was
+				// reclassified to a stricter label after it was recorded is
+				// withheld rather than served under its stale, now
+				// under-labelled visibility. See issue #273.
+				continue
+			}
+		}
 		summaries = append(summaries, InteractionSummary{
 			SessionID:  record.SessionID,
 			RecordedAt: record.RecordedAt,
@@ -281,15 +295,28 @@ func (e *Explorer) InteractionSubgraph(
 	); err != nil {
 		return Neighborhood{}, err
 	}
-	e.mu.RLock()
-	defer e.mu.RUnlock()
+	e.mu.Lock()
+	defer e.mu.Unlock()
 	if err := e.requireOpen(); err != nil {
+		return Neighborhood{}, err
+	}
+	if err := e.ensureGraphLocked(); err != nil {
 		return Neighborhood{}, err
 	}
 	record, ok := e.interactions[sessionID]
 	if !ok {
 		return Neighborhood{}, shoal.NewError(
 			shoal.ErrorNotFound, "interaction session not found")
+	}
+	if !record.Deleted {
+		current, err := e.currentSubgraphVisibilityLocked(
+			record.Nodes, record.Edges)
+		if err != nil {
+			return Neighborhood{}, err
+		}
+		if current != record.Visibility {
+			return Neighborhood{}, staleDerivedVisibilityError()
+		}
 	}
 	result := Neighborhood{
 		Nodes: make([]graph.Node, 0, len(record.Nodes)),
@@ -331,6 +358,73 @@ func (e *Explorer) visibilityResolverLocked() interaction.VisibilityResolver {
 		}
 		return interaction.NodeVisibility(node)
 	}
+}
+
+// currentSubgraphVisibilityLocked re-derives, from the current corpus graph,
+// the visibility a stored interaction or fold record now requires: the
+// conjunction over the current declared labels of every source node it
+// retrieved or cited, recovered from the record's own persisted subgraph. It
+// fails closed if any touched node can no longer be resolved, exactly as the
+// write path does, so a read never serves an under-labelled derived record.
+//
+// This is sound for folds as well as sessions: at write time a fold's stored
+// visibility is the conjunction of every folded session's visibility and every
+// touched source label, and each folded session's visibility is itself the
+// conjunction over that session's touched labels, which are a subset of the
+// fold's touched labels. The touched-label conjunction therefore reproduces the
+// stored value when nothing has moved. The caller must hold at least e.mu.RLock
+// and the current graph must be initialized.
+func (e *Explorer) currentSubgraphVisibilityLocked(
+	nodes []graph.Node, edges []graph.Edge,
+) (string, error) {
+	touched := interaction.TouchedNodes(nodes, edges)
+	ids := make(
+		[]shoal.ID, 0,
+		len(touched.RetrievedNodeIDs)+len(touched.CitedNodeIDs),
+	)
+	ids = append(ids, touched.RetrievedNodeIDs...)
+	ids = append(ids, touched.CitedNodeIDs...)
+	labels, err := e.conjoinNodeVisibilityLocked(ids)
+	if err != nil {
+		return "", err
+	}
+	return interaction.Expression(labels), nil
+}
+
+// conjoinNodeVisibilityLocked resolves every node's current declared visibility
+// and returns their conjunction, failing closed on the first node that cannot
+// be resolved. The caller must hold at least e.mu.RLock.
+func (e *Explorer) conjoinNodeVisibilityLocked(
+	ids []shoal.ID,
+) ([]string, error) {
+	resolve := e.visibilityResolverLocked()
+	sets := make([][]string, 0, len(ids))
+	for _, id := range ids {
+		labels, err := resolve(id)
+		if err != nil {
+			return nil, err
+		}
+		normalized, err := interaction.Conjoin(labels)
+		if err != nil {
+			return nil, err
+		}
+		sets = append(sets, normalized)
+	}
+	return interaction.Conjoin(sets...)
+}
+
+// staleDerivedVisibilityError is the fail-closed refusal returned by a fold or
+// interaction read path when a live record's stored visibility no longer equals
+// the visibility its touched source nodes require now. Serving the stored value
+// would disclose a record whose evidence was reclassified to a stricter label
+// after the record was written; see issue #273.
+func staleDerivedVisibilityError() error {
+	return shoal.NewError(
+		shoal.ErrorUnavailable,
+		"derived record visibility no longer matches current source labels; "+
+			"its evidence was reclassified after the record was written, so the "+
+			"record must be refolded or re-recorded before it can be served",
+	)
 }
 
 func (e *Explorer) requireWritableLocked() error {

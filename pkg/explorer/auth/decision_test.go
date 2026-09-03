@@ -381,6 +381,45 @@ func TestAuthorizeFailsClosedAndObjectDenialIsNonDisclosing(t *testing.T) {
 	}
 }
 
+// TestAuthorizeChecksDomainBeforeSource guards the ordering in
+// authorizeResource: the authorization domain is a fail-closed tenancy
+// primitive and must be checked before source or policy membership. The
+// discriminating request is wrong-domain AND hidden-source at once. Because
+// AuthorizeObject maps a domain (request-level) denial to Unauthorized but a
+// source (resource-level) denial to a non-disclosing NotFound, domain-first
+// ordering yields Unauthorized here; if source were checked first this would
+// leak as NotFound. Reordering the two checks makes this test fail.
+func TestAuthorizeChecksDomainBeforeSource(t *testing.T) {
+	decision := mustDecision(t, baseDecisionConfig())
+	wrongDomainHiddenSource := auth.ResourceRequest{
+		AuthorizationDomain: []byte("other-domain"),
+		SourceID:            []byte("source-hidden"),
+		PolicyID:            []byte("policy-a"),
+		ObjectID:            "object-secret",
+	}
+	if err := decision.AuthorizeObject(
+		auth.OperationRead, wrongDomainHiddenSource, testNow,
+	); !shoal.IsErrorCode(err, shoal.ErrorUnauthorized) {
+		t.Fatalf(
+			"AuthorizeObject(wrong domain + hidden source) = %v, want "+
+				"Unauthorized (domain checked first)", err,
+		)
+	}
+	// A hidden source within the correct domain is the resource-level case and
+	// must instead be a non-disclosing NotFound, confirming the two denial
+	// classes are genuinely distinguished rather than collapsed.
+	hiddenSourceRightDomain := wrongDomainHiddenSource
+	hiddenSourceRightDomain.AuthorizationDomain = []byte("domain-secret")
+	if err := decision.AuthorizeObject(
+		auth.OperationRead, hiddenSourceRightDomain, testNow,
+	); !shoal.IsErrorCode(err, shoal.ErrorNotFound) {
+		t.Fatalf(
+			"AuthorizeObject(hidden source, right domain) = %v, want NotFound",
+			err,
+		)
+	}
+}
+
 func TestDecisionIntersectsRequestedProjectionWithoutDisclosingHiddenGrants(t *testing.T) {
 	decision := mustDecision(t, baseDecisionConfig())
 	sources, err := decision.IntersectSourceIDs(

@@ -85,9 +85,12 @@ func (e *Explorer) InteractionsTouching(
 				"not from an interaction node",
 		)
 	}
-	e.mu.RLock()
-	defer e.mu.RUnlock()
+	e.mu.Lock()
+	defer e.mu.Unlock()
 	if err := e.requireOpen(); err != nil {
+		return nil, err
+	}
+	if err := e.ensureGraphLocked(); err != nil {
 		return nil, err
 	}
 	if node, ok := e.graphNodes[nodeID]; ok &&
@@ -141,15 +144,22 @@ func (e *Explorer) RelatedInteractions(
 	); err != nil {
 		return nil, err
 	}
-	e.mu.RLock()
-	defer e.mu.RUnlock()
+	e.mu.Lock()
+	defer e.mu.Unlock()
 	if err := e.requireOpen(); err != nil {
+		return nil, err
+	}
+	if err := e.ensureGraphLocked(); err != nil {
 		return nil, err
 	}
 	origin, ok := e.interactionViewLocked(interactionID)
 	if !ok {
 		return nil, shoal.NewError(
 			shoal.ErrorNotFound, "interaction not found")
+	}
+	if e.subgraphVisibilityIsStaleLocked(
+		origin.nodes, origin.edges, origin.visibility) {
+		return nil, staleDerivedVisibilityError()
 	}
 	originTouched := interaction.TouchedNodes(origin.nodes, origin.edges)
 	originRetrieved := idSet(originTouched.RetrievedNodeIDs)
@@ -232,6 +242,10 @@ func (e *Explorer) eachLiveInteractionLocked(visit func(interactionView)) {
 		if record.Deleted {
 			continue
 		}
+		if e.subgraphVisibilityIsStaleLocked(
+			record.Nodes, record.Edges, record.Visibility) {
+			continue
+		}
 		visit(interactionView{
 			id:         record.SessionID,
 			kind:       interaction.KindSession,
@@ -245,6 +259,10 @@ func (e *Explorer) eachLiveInteractionLocked(visit func(interactionView)) {
 		if record.Deleted {
 			continue
 		}
+		if e.subgraphVisibilityIsStaleLocked(
+			record.Nodes, record.Edges, record.Visibility) {
+			continue
+		}
 		visit(interactionView{
 			id:         record.FoldID,
 			kind:       interaction.KindFold,
@@ -254,6 +272,19 @@ func (e *Explorer) eachLiveInteractionLocked(visit func(interactionView)) {
 			visibility: record.Visibility,
 		})
 	}
+}
+
+// subgraphVisibilityIsStaleLocked reports whether a live record's stored
+// visibility no longer equals what its touched source nodes require now, or can
+// no longer be derived at all. Provenance traversal withholds stale records so
+// a tightening re-ingest cannot leave a previously derived record disclosed
+// under its now under-labelled stored visibility. See issue #273. The caller
+// must hold at least e.mu.RLock.
+func (e *Explorer) subgraphVisibilityIsStaleLocked(
+	nodes []graph.Node, edges []graph.Edge, stored string,
+) bool {
+	current, err := e.currentSubgraphVisibilityLocked(nodes, edges)
+	return err != nil || current != stored
 }
 
 func (e *Explorer) interactionViewLocked(id shoal.ID) (interactionView, bool) {
