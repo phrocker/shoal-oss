@@ -29,6 +29,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -103,8 +104,65 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 		"Authenticate every request as a fixed development principal; "+
 			"refused unless the resolved listen address is loopback-only",
 	)
+	entraTenant := flags.String(
+		"entra-tenant", "",
+		"Microsoft Entra ID (Azure AD) tenant/directory ID. Derives the "+
+			"expected issuer and OIDC discovery document. Enables the real "+
+			"authenticator; environment fallback SHOAL_ENTRA_TENANT",
+	)
+	entraIssuer := flags.String(
+		"entra-issuer", "",
+		"Override the expected token issuer (exact match). Defaults to "+
+			"https://login.microsoftonline.com/<tenant>/v2.0; environment "+
+			"fallback SHOAL_ENTRA_ISSUER",
+	)
+	entraClientID := flags.String(
+		"entra-client-id", "",
+		"Application (client) ID the token audience must match exactly. "+
+			"Required for the Entra authenticator; environment fallback "+
+			"SHOAL_ENTRA_CLIENT_ID. A client secret is never accepted",
+	)
+	entraJWKSURI := flags.String(
+		"entra-jwks-uri", "",
+		"Override the JWKS URI instead of resolving it via OIDC discovery; "+
+			"environment fallback SHOAL_ENTRA_JWKS_URI",
+	)
+	entraAllowedAlgs := flags.String(
+		"entra-allowed-algs", "",
+		"Comma-separated allowlist of asymmetric signing algorithms "+
+			"(e.g. RS256,ES256). Defaults to RS256. HS* and none are always "+
+			"rejected",
+	)
+	entraClockSkew := flags.Duration(
+		"entra-clock-skew", 0,
+		"Tolerated clock skew for token expiry/not-before checks; defaults to "+
+			"60s and is capped at 5m",
+	)
+	entraReaderRoles := flags.String(
+		"entra-reader-roles", "",
+		"Comma-separated Entra app-role values granted read-only workspace "+
+			"access; environment fallback SHOAL_ENTRA_READER_ROLES",
+	)
+	entraContributorRoles := flags.String(
+		"entra-contributor-roles", "",
+		"Comma-separated Entra app-role values granted read and ingest "+
+			"access; environment fallback SHOAL_ENTRA_CONTRIBUTOR_ROLES",
+	)
 	if err := flags.Parse(args); err != nil {
 		return err
+	}
+
+	entra := entraConfig{
+		tenantID:          firstNonEmpty(*entraTenant, os.Getenv("SHOAL_ENTRA_TENANT")),
+		issuer:            firstNonEmpty(*entraIssuer, os.Getenv("SHOAL_ENTRA_ISSUER")),
+		audience:          firstNonEmpty(*entraClientID, os.Getenv("SHOAL_ENTRA_CLIENT_ID")),
+		jwksURI:           firstNonEmpty(*entraJWKSURI, os.Getenv("SHOAL_ENTRA_JWKS_URI")),
+		allowedAlgorithms: splitCommaList(*entraAllowedAlgs),
+		clockSkew:         *entraClockSkew,
+		readerRoles: splitCommaList(
+			firstNonEmpty(*entraReaderRoles, os.Getenv("SHOAL_ENTRA_READER_ROLES"))),
+		contributorRoles: splitCommaList(firstNonEmpty(
+			*entraContributorRoles, os.Getenv("SHOAL_ENTRA_CONTRIBUTOR_ROLES"))),
 	}
 
 	embedding, err := embeddingConfig{
@@ -122,7 +180,7 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 	// bound, so an address the workspace may not serve never opens a socket
 	// and never prompts an operator to approve exposure the program has
 	// already decided against.
-	if _, err := selectAuthenticator(*developmentAuth, *listen, time.Now); err != nil {
+	if _, err := selectAuthenticator(*developmentAuth, entra, *listen, time.Now); err != nil {
 		return err
 	}
 	listener, err := listenTCP("tcp", *listen)
@@ -134,7 +192,7 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 	// Identity is decided from it, and a refusal closes the listener here,
 	// before the corpus is opened and before any request can be served.
 	authenticator, err := selectAuthenticator(
-		*developmentAuth, listener.Addr().String(), time.Now)
+		*developmentAuth, entra, listener.Addr().String(), time.Now)
 	if err != nil {
 		listener.Close()
 		return err
@@ -183,6 +241,14 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 			output,
 			"Authenticating every request as development principal %s\n",
 			developmentSubject,
+		)
+	}
+	if entra.configured() {
+		fmt.Fprintf(
+			output,
+			"Validating Microsoft Entra ID bearer tokens for audience %s; "+
+				"unmapped callers receive no corpus access\n",
+			entra.audience,
 		)
 	}
 	if *backend == "embedded" {
@@ -422,6 +488,33 @@ func openService(
 // treats every subdirectory of the data directory as a table.
 func policyStoreDir(data string) string {
 	return filepath.Clean(data) + "-policy"
+}
+
+// firstNonEmpty returns the first argument whose trimmed value is non-empty.
+// It gives command-line flags precedence over their environment fallbacks.
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+// splitCommaList splits a comma-separated flag value into trimmed, non-empty
+// items. An empty input yields a nil slice.
+func splitCommaList(value string) []string {
+	if strings.TrimSpace(value) == "" {
+		return nil
+	}
+	parts := strings.Split(value, ",")
+	items := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if trimmed := strings.TrimSpace(part); trimmed != "" {
+			items = append(items, trimmed)
+		}
+	}
+	return items
 }
 
 // resolveWorkspacePaths determines the corpus and policy directories from the

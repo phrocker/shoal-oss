@@ -38,6 +38,6 @@ mode) rather than serving an under-authorized corpus. `-data` and `-policy-dir`
 remain available for legacy/custom layouts — see the guide.
 
 The image (`Dockerfile.shoal-explore-web`, at the repo root) is the same artifact
-a shared instance would run; only the flags differ. The shared path still has open
-prerequisites (a real authenticator, host-authority config) documented in the
-guide.
+a shared instance would run; only the flags differ. For a shared, non-loopback
+instance, supply the Microsoft Entra ID authenticator instead of `-dev-auth`
+(see [Real authentication with Microsoft Entra ID](../../docs/shoal-explore-web-deploy.md#real-authentication-with-microsoft-entra-id)).

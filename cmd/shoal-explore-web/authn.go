@@ -193,13 +193,40 @@ func listenAddressIsLoopback(address string) bool {
 }
 
 // selectAuthenticator fails closed. The workspace refuses to serve any request
-// without a trusted decision, and refuses the development principal on any
-// listener that is reachable from another host.
+// without a trusted decision. It returns the real Entra authenticator when
+// Entra configuration is supplied, which unlocks a non-loopback listener; it
+// returns the development principal only for -dev-auth on a loopback listener;
+// and it refuses supplying both, which is a configuration error rather than a
+// silent preference of one over the other.
 func selectAuthenticator(
 	developmentAuth bool,
+	entra entraConfig,
 	address string,
 	clock func() time.Time,
 ) (webapi.Authenticator, error) {
+	entraConfigured := entra.configured()
+	if developmentAuth && entraConfigured {
+		return nil, fmt.Errorf(
+			"refusing to serve %s: -dev-auth and the Entra authenticator are "+
+				"mutually exclusive. -dev-auth mints the %s development "+
+				"principal on a loopback listener only, while the Entra "+
+				"authenticator validates real bearer tokens for a public "+
+				"listener. Configure exactly one",
+			address, developmentSubject,
+		)
+	}
+	if entraConfigured {
+		// A validated Entra token is trusted on any listener, so a non-loopback
+		// bind is allowed here: this is the unlock the development principal
+		// could never provide.
+		authenticator, err := newEntraAuthenticator(entra, clock)
+		if err != nil {
+			return nil, fmt.Errorf(
+				"refusing to serve %s with the Entra authenticator: %w",
+				address, err)
+		}
+		return authenticator, nil
+	}
 	if !developmentAuth {
 		return nil, fmt.Errorf(
 			"refusing to serve %s without authentication: no authenticator is "+
