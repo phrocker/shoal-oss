@@ -313,6 +313,127 @@ assert.match(mixed.ids["documents-status"].textContent, /1 document is withheld/
 `)
 }
 
+func TestStaticWorkspacePkceUsesS256Challenge(t *testing.T) {
+	runNodeUITest(t, `
+const scenario = await runScenario({documents: true, retrieve: true});
+// RFC 7636 appendix B test vector pins base64url(SHA-256(verifier)).
+const verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+const challenge = await scenario.ctx.pkceChallengeFromVerifier(verifier);
+assert.strictEqual(challenge, "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM");
+
+const url = scenario.ctx.buildAuthorizeUrl(
+  {authority: "https://login.microsoftonline.com/tenant", client_id: "client-1", scope: "openid profile"},
+  {redirectUri: "https://app.example/", state: "state-xyz", nonce: "nonce-abc", codeChallenge: challenge});
+assert.match(url, /code_challenge_method=S256/);
+assert.match(url, /response_type=code/);
+assert.match(url, /state=state-xyz/);
+assert.match(url, /nonce=nonce-abc/);
+assert.match(url, /code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM/);
+// The plain method must never be emitted.
+assert.strictEqual(/code_challenge_method=plain/.test(url), false);
+`)
+}
+
+func TestStaticWorkspaceLoginRejectsMismatchedState(t *testing.T) {
+	runNodeUITest(t, `
+const scenario = await runScenario({documents: true, retrieve: true});
+const config = {authority: "https://login.microsoftonline.com/tenant", client_id: "client-1", scope: "openid"};
+
+// verifyCallbackState is exact and refuses a missing stored value.
+assert.strictEqual(scenario.ctx.verifyCallbackState("s", "s"), true);
+assert.strictEqual(scenario.ctx.verifyCallbackState("s", "other"), false);
+assert.strictEqual(scenario.ctx.verifyCallbackState("s", ""), false);
+assert.strictEqual(scenario.ctx.verifyCallbackState("s", undefined), false);
+
+// A mismatched callback must be rejected BEFORE the token endpoint is called.
+let calls = 0;
+const deps = {fetch: async () => { calls++; return {ok: true, json: async () => ({access_token: "leaked"})}; }};
+let threw = false;
+try {
+  await scenario.ctx.exchangeAuthorizationCode(
+    config, {code: "c", state: "attacker"}, {state: "mine", verifier: "v", redirectUri: "https://app/"}, deps);
+} catch (_) { threw = true; }
+assert.strictEqual(threw, true, "mismatched state must reject");
+assert.strictEqual(calls, 0, "token endpoint must not be called on state mismatch");
+
+// A matching callback exchanges the code and returns the token.
+let tokenBody = null;
+const okDeps = {fetch: async (url, options) => { tokenBody = options.body; return {ok: true, json: async () => ({access_token: "good-token"})}; }};
+const token = await scenario.ctx.exchangeAuthorizationCode(
+  config, {code: "auth-code", state: "mine"}, {state: "mine", verifier: "verifier-1", redirectUri: "https://app/"}, okDeps);
+assert.strictEqual(token, "good-token");
+assert.match(tokenBody, /grant_type=authorization_code/);
+assert.match(tokenBody, /code_verifier=verifier-1/);
+assert.match(tokenBody, /code=auth-code/);
+`)
+}
+
+func TestStaticWorkspaceReauthenticationIsDistinctFromDenial(t *testing.T) {
+	runNodeUITest(t, `
+const scenario = await runScenario({documents: true, retrieve: true});
+
+// The bearer challenge is the sole re-authentication signal.
+const challenged = {headers: {get: (n) => n.toLowerCase() === "www-authenticate" ? "Bearer" : null}};
+const unchallenged = {headers: {get: () => null}};
+assert.strictEqual(scenario.ctx.challengedForBearer(challenged), true);
+assert.strictEqual(scenario.ctx.challengedForBearer(unchallenged), false);
+
+// A token expiry re-authenticates and is NOT a denial.
+const expiry = {status: 401, reauthenticate: true, code: "unauthorized"};
+assert.strictEqual(scenario.ctx.needsReauthentication(expiry), true);
+assert.strictEqual(scenario.ctx.isDenied(expiry), false);
+
+// A governance 401 with no challenge is a denial and never re-auth.
+const governance = {status: 401, code: "unauthorized"};
+assert.strictEqual(scenario.ctx.needsReauthentication(governance), false);
+assert.strictEqual(scenario.ctx.isDenied(governance), true);
+
+// Integration: a challenged 401 renders as re-auth, not access denied.
+const reauth = await runScenario(
+  {documents: true, retrieve: true}, [],
+  {retrieveError: {status: 401, wwwAuthenticate: true, statusText: "Unauthorized", body: {code: "unauthorized", message: "authentication required"}}});
+reauth.ids.query.value = "classified";
+await reauth.ids.search.onsubmit({preventDefault() {}});
+assert.strictEqual(reauth.ids["evidence-status"].className, "reauth");
+assert.match(reauth.ids["evidence-status"].textContent, /sign in again/);
+assert.strictEqual(/Access denied/.test(reauth.ids["evidence-status"].textContent), false);
+
+// A governance 401 with no challenge still renders as access denied.
+const denied = await runScenario(
+  {documents: true, retrieve: true}, [],
+  {retrieveError: {status: 401, statusText: "Unauthorized", body: {code: "unauthorized", message: "authorization denied"}}});
+denied.ids.query.value = "classified";
+await denied.ids.search.onsubmit({preventDefault() {}});
+assert.strictEqual(denied.ids["evidence-status"].className, "denied");
+assert.match(denied.ids["evidence-status"].textContent, /Access denied/);
+`)
+}
+
+func TestStaticWorkspaceAuthHeaderOmittedWithoutToken(t *testing.T) {
+	runNodeUITest(t, `
+const scenario = await runScenario({documents: true, retrieve: true});
+// With no token acquired (the -dev-auth path), no Authorization header is sent.
+assert.strictEqual(Object.keys(scenario.ctx.authHeaders()).length, 0);
+assert.strictEqual(scenario.ctx.authHeaders().authorization, undefined);
+`)
+}
+
+func TestStaticWorkspaceTokenIsNeverPersisted(t *testing.T) {
+	app := readStaticAsset(t, "static/app.js")
+	if strings.Contains(app, "localStorage") {
+		t.Fatal("app.js must never touch localStorage; the access token is memory-only")
+	}
+	if strings.Count(app, "sessionStorage.setItem") != 1 ||
+		!strings.Contains(app, "sessionStorage.setItem(LOGIN_FLOW_KEY") {
+		t.Fatal("the only sessionStorage write must be the single-use login flow")
+	}
+	for _, line := range strings.Split(app, "\n") {
+		if strings.Contains(line, "setItem") && strings.Contains(line, "accessToken") {
+			t.Fatalf("access token must not be written to storage: %q", line)
+		}
+	}
+}
+
 func TestStaticWorkspaceResponsiveHeaderWrapsBeforeTabletWidths(t *testing.T) {
 	html := readStaticAsset(t, "static/index.html")
 	style := readStaticAsset(t, "static/style.css")
@@ -380,7 +501,16 @@ const app = fs.readFileSync("static/app.js", "utf8") +
   "\nthis.deniedText = deniedText;" +
   "\nthis.emptyRetrievalText = emptyRetrievalText;" +
   "\nthis.emptyDocumentsText = emptyDocumentsText;" +
-  "\nthis.suppressionClause = suppressionClause;";
+  "\nthis.suppressionClause = suppressionClause;" +
+  "\nthis.needsReauthentication = needsReauthentication;" +
+  "\nthis.challengedForBearer = challengedForBearer;" +
+  "\nthis.authHeaders = authHeaders;" +
+  "\nthis.base64UrlEncode = base64UrlEncode;" +
+  "\nthis.pkceChallengeFromVerifier = pkceChallengeFromVerifier;" +
+  "\nthis.buildAuthorizeUrl = buildAuthorizeUrl;" +
+  "\nthis.verifyCallbackState = verifyCallbackState;" +
+  "\nthis.callbackParams = callbackParams;" +
+  "\nthis.exchangeAuthorizationCode = exchangeAuthorizationCode;";
 
 class ClassList {
   constructor(element) { this.element = element; }
@@ -459,9 +589,22 @@ function matches(element, selector) {
 }
 
 function response(value, options = {}) {
+  const headers = options.headers || {};
   return {
     ok: options.ok !== undefined ? options.ok : true,
+    status: options.status !== undefined
+      ? options.status
+      : (options.ok === false ? 400 : 200),
     statusText: options.statusText || "OK",
+    headers: {
+      get(name) {
+        const found = headers[String(name).toLowerCase()];
+        return found === undefined ? null : found;
+      },
+      has(name) {
+        return Object.prototype.hasOwnProperty.call(headers, String(name).toLowerCase());
+      },
+    },
     json: async () => value,
   };
 }
@@ -548,8 +691,15 @@ async function runScenario(capabilities, documents = [], scenarioOptions = {}) {
     ResizeObserver: class { constructor(callback) { this.callback = callback; } observe() {} },
     devicePixelRatio: 1,
     URL,
+    crypto: require("crypto").webcrypto,
+    TextEncoder,
     fetch: async (url, requestOptions = {}) => {
       if (url === "/api/v1/meta") return response({capabilities});
+      if (url === "/api/v1/auth-config") {
+        return response("authConfig" in scenarioOptions
+          ? scenarioOptions.authConfig
+          : {configured: false});
+      }
       if (url === "/api/v1/identity") {
         if (scenarioOptions.identityError) {
           return response(scenarioOptions.identityError.body || {}, {
@@ -591,9 +741,12 @@ async function runScenario(capabilities, documents = [], scenarioOptions = {}) {
       if (url.endsWith("/retrieve")) {
         retrieveBody = JSON.parse(requestOptions.body);
         if (scenarioOptions.retrieveError) {
-          return response(scenarioOptions.retrieveError.body || {}, {
+          const failure = scenarioOptions.retrieveError;
+          return response(failure.body || {}, {
             ok: false,
-            statusText: scenarioOptions.retrieveError.statusText || "Error",
+            status: failure.status,
+            statusText: failure.statusText || "Error",
+            headers: failure.wwwAuthenticate ? {"www-authenticate": "Bearer"} : {},
           });
         }
         return response({

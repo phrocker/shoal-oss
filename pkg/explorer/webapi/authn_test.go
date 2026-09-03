@@ -282,8 +282,18 @@ func (f *authnFixture) routes(t *testing.T) []authnRoute {
 				EdgeTypes: []string{"informs"},
 			}),
 		},
+	}
+}
+
+// publicRoutes are the request lines the transport serves without a trusted
+// decision: the HTML shell, the static assets, and the non-secret auth-config
+// endpoint. They are enumerated separately from routes so the denial test can
+// assert they are reachable unauthenticated while every API route is not.
+func (f *authnFixture) publicRoutes() []authnRoute {
+	return []authnRoute{
 		{"workspace", http.MethodGet, "/", ""},
 		{"assets", http.MethodGet, "/assets/app.js", ""},
+		{"auth-config", http.MethodGet, "/api/v1/auth-config", ""},
 	}
 }
 
@@ -433,6 +443,19 @@ func TestUnauthenticatedRequestsAreDenied(t *testing.T) {
 			fixture.assertDenied(t, response.body)
 		})
 	}
+	// The shell, its assets and the non-secret auth-config endpoint are the only
+	// routes reachable without a decision, so the browser can load and begin a
+	// login. They must not be denied here, or a real authenticator makes the UI
+	// itself unreachable.
+	for _, route := range fixture.publicRoutes() {
+		t.Run("public/"+route.name, func(t *testing.T) {
+			response := fixture.do(t, route.method, route.path, "", route.body)
+			if response.status != http.StatusOK {
+				t.Fatalf("public route %s status = %d body = %s",
+					route.path, response.status, response.body)
+			}
+		})
+	}
 	t.Run("ingest", func(t *testing.T) {
 		response := fixture.upload(t, "")
 		if response.status != http.StatusUnauthorized {
@@ -459,6 +482,16 @@ func TestAuthenticatedRequestsAreServed(t *testing.T) {
 	fixture := newAuthnFixture(t)
 	for _, route := range fixture.routes(t) {
 		t.Run(route.name, func(t *testing.T) {
+			response := fixture.do(
+				t, route.method, route.path, "granted", route.body)
+			if response.status != http.StatusOK {
+				t.Fatalf("status = %d body = %s", response.status, response.body)
+			}
+		})
+	}
+	// The public routes serve identically whether or not a principal is bound.
+	for _, route := range fixture.publicRoutes() {
+		t.Run("public/"+route.name, func(t *testing.T) {
 			response := fixture.do(
 				t, route.method, route.path, "granted", route.body)
 			if response.status != http.StatusOK {

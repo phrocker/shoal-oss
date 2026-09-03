@@ -21,3 +21,7 @@
 .denied::before{content:"\26D4  "}
 .withheld{padding:10px;border:1px solid var(--evidence);border-left:4px solid var(--evidence);border-radius:6px;background:rgba(255,209,102,.08);color:var(--text)}
 .withheld::before{content:"\26A0  "}
+.reauth{padding:10px;border:1px solid var(--accent);border-left:4px solid var(--accent);border-radius:6px;background:rgba(120,170,255,.09);color:var(--text)}
+.reauth::before{content:"\21BB  "}
+.login{flex:0 0 auto;align-self:center;border:1px solid var(--accent);background:#12233a;color:var(--accent);border-radius:999px;padding:5px 14px;font-size:12px;font-weight:600;white-space:nowrap}
+.login[hidden]{display:none}

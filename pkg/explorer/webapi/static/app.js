@@ -10,6 +10,9 @@ const state = {
   sourceURIs: new Map(),
   selected: null,
   identity: null,
+  accessToken: null,
+  auth: {configured: false},
+  reauthRequired: false,
   capabilities: {
     documents: false,
     document: false,
@@ -37,7 +40,7 @@ let uploadLoading = false;
 async function api(path, body) {
   const response = await fetch(`/api/v1/${path}`, {
     method: "POST",
-    headers: {"content-type": "application/json"},
+    headers: {"content-type": "application/json", ...authHeaders()},
     body: JSON.stringify(body),
   });
   const value = await response.json();
@@ -49,9 +52,10 @@ async function api(path, body) {
 // tell an authorization denial apart from any other failure. The workspace
 // must never render a denial as if it were a generic error or an empty result.
 function apiError(value, response) {
-  const error = new Error((value && value.message) || response.statusText);
+  const error = new Error((value && value.message) || (response && response.statusText) || "request failed");
   error.code = (value && value.code) || "";
   error.status = response ? response.status : 0;
+  error.reauthenticate = challengedForBearer(response);
   return error;
 }
 
@@ -61,7 +65,308 @@ function apiError(value, response) {
 // indistinguishable at the server between "hidden from you" and "absent", so
 // it is never claimed here as a denial.
 function isDenied(error) {
-  return Boolean(error) && (error.code === "unauthorized" || error.status === 401);
+  if (!error) return false;
+  // A re-authentication signal is a token problem, never an authorization
+  // denial. It must not read as "access denied", which would misdescribe the
+  // governance state, so it is excluded here before the unauthorized test.
+  if (needsReauthentication(error)) return false;
+  return error.code === "unauthorized" || error.status === 401;
+}
+
+// authHeaders adds the bearer token to an API request only when one has been
+// acquired in memory. With -dev-auth no token exists, so the header is absent
+// and the request is byte-identical to the local development path.
+function authHeaders() {
+  return state.accessToken ? {authorization: `Bearer ${state.accessToken}`} : {};
+}
+
+// challengedForBearer reports whether the transport answered with the standard
+// bearer challenge. The central gate sets WWW-Authenticate: Bearer only when
+// authentication itself failed (no or expired token); an authorization denial
+// from the service is also HTTP 401 but carries no such header. This header is
+// therefore the only reliable way to tell "sign in again" apart from "you are
+// authenticated but not permitted": the UI never infers it from status alone.
+function challengedForBearer(response) {
+  if (!response || !response.headers || typeof response.headers.get !== "function") {
+    return false;
+  }
+  const header = response.headers.get("WWW-Authenticate") || "";
+  return header.toLowerCase().includes("bearer");
+}
+
+// needsReauthentication reports whether an error means the caller must obtain a
+// fresh token, as opposed to being denied. It requires both a 401 status and
+// the bearer challenge, so a governance 401 (no challenge) is never treated as
+// a token expiry and never triggers a login redirect.
+function needsReauthentication(error) {
+  return Boolean(error) && error.status === 401 && error.reauthenticate === true;
+}
+
+// reauthenticationText states plainly that a token expiry is not an
+// authorization decision, so re-authentication never reads as a denial and the
+// governance wording elsewhere is not undermined.
+function reauthenticationText() {
+  return "Your sign-in has expired or is not established. This is not an " +
+    "authorization denial — sign in again to continue. Your access to the " +
+    "workspace is unchanged.";
+}
+
+// handleReauthentication surfaces the sign-in affordance again after a token
+// expiry. It never makes a security decision: the server remains the only
+// enforcement point. It is a no-op when no login is configured (the -dev-auth
+// path) or when the shell has no login control (the test harness).
+function handleReauthentication() {
+  state.reauthRequired = true;
+  if (!state.auth || !state.auth.configured) return;
+  const button = document.getElementById("login");
+  if (!button) return;
+  button.hidden = false;
+  button.textContent = "Sign in again";
+}
+
+function trimTrailingSlash(value) {
+  return String(value || "").replace(/\/+$/, "");
+}
+
+// base64UrlEncode encodes bytes as unpadded base64url (RFC 4648 §5), the
+// encoding PKCE requires for the code verifier and challenge. It avoids btoa so
+// it is pure and testable without a browser global.
+function base64UrlEncode(bytes) {
+  const alphabet =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+  let out = "";
+  for (let index = 0; index < bytes.length; index += 3) {
+    const b0 = bytes[index];
+    const b1 = index + 1 < bytes.length ? bytes[index + 1] : 0;
+    const b2 = index + 2 < bytes.length ? bytes[index + 2] : 0;
+    out += alphabet[b0 >> 2];
+    out += alphabet[((b0 & 3) << 4) | (b1 >> 4)];
+    if (index + 1 < bytes.length) out += alphabet[((b1 & 15) << 2) | (b2 >> 6)];
+    if (index + 2 < bytes.length) out += alphabet[b2 & 63];
+  }
+  return out;
+}
+
+// randomUrlToken returns a cryptographically random base64url string for the
+// PKCE verifier, the CSRF state and the OIDC nonce.
+function randomUrlToken(byteLength) {
+  const bytes = new Uint8Array(byteLength);
+  crypto.getRandomValues(bytes);
+  return base64UrlEncode(bytes);
+}
+
+// PKCE_METHOD is S256 and is the only challenge method this client emits. The
+// plain method is deliberately absent: downgrading to plain would let anyone
+// who observes the redirect replay the authorization code. Nothing here ever
+// produces or accepts "plain".
+const PKCE_METHOD = "S256";
+
+// pkceChallengeFromVerifier derives the S256 challenge: base64url(SHA-256(v)).
+async function pkceChallengeFromVerifier(verifier) {
+  const data = new TextEncoder().encode(verifier);
+  const digest = await crypto.subtle.digest("SHA-256", data);
+  return base64UrlEncode(new Uint8Array(digest));
+}
+
+function encodeForm(pairs) {
+  return pairs
+    .map(([key, value]) => `${encodeURIComponent(key)}=${encodeURIComponent(value)}`)
+    .join("&");
+}
+
+// buildAuthorizeUrl composes the Authorization Code + PKCE request. The
+// challenge method is fixed to S256 by construction.
+function buildAuthorizeUrl(config, params) {
+  const authorize = `${trimTrailingSlash(config.authority)}/oauth2/v2.0/authorize`;
+  const query = encodeForm([
+    ["client_id", config.client_id],
+    ["response_type", "code"],
+    ["redirect_uri", params.redirectUri],
+    ["response_mode", "query"],
+    ["scope", config.scope],
+    ["state", params.state],
+    ["nonce", params.nonce],
+    ["code_challenge", params.codeChallenge],
+    ["code_challenge_method", PKCE_METHOD],
+  ]);
+  return `${authorize}?${query}`;
+}
+
+// verifyCallbackState is the CSRF defence on the redirect. It accepts a
+// callback only when the returned state exactly matches the value generated and
+// stored before redirecting. A missing stored value never matches, so a forged
+// callback with no prior login attempt is refused.
+function verifyCallbackState(returnedState, expectedState) {
+  return Boolean(expectedState) && returnedState === expectedState;
+}
+
+// callbackParams parses a redirect query string into a flat map without relying
+// on URLSearchParams, so it is pure and testable in any environment.
+function callbackParams(search) {
+  const params = {};
+  const query = String(search || "").replace(/^\?/, "");
+  if (!query) return params;
+  for (const pair of query.split("&")) {
+    if (!pair) continue;
+    const eq = pair.indexOf("=");
+    const rawKey = eq < 0 ? pair : pair.slice(0, eq);
+    const rawValue = eq < 0 ? "" : pair.slice(eq + 1);
+    params[decodeURIComponent(rawKey)] =
+      decodeURIComponent(rawValue.replace(/\+/g, " "));
+  }
+  return params;
+}
+
+// exchangeAuthorizationCode verifies state and then swaps the code for an
+// access token. State is checked BEFORE the code is presented, so a mismatched
+// or forged callback never reaches the network. deps.fetch is injected so the
+// exchange is exercisable without a browser. The returned token is handed back
+// to the caller and never written to storage.
+async function exchangeAuthorizationCode(config, callback, stored, deps) {
+  if (!verifyCallbackState(callback.state, stored && stored.state)) {
+    throw new Error("login state did not match; the callback was rejected");
+  }
+  const endpoint = `${trimTrailingSlash(config.authority)}/oauth2/v2.0/token`;
+  const body = encodeForm([
+    ["client_id", config.client_id],
+    ["grant_type", "authorization_code"],
+    ["code", callback.code],
+    ["redirect_uri", stored.redirectUri],
+    ["code_verifier", stored.verifier],
+    ["scope", config.scope],
+  ]);
+  const response = await deps.fetch(endpoint, {
+    method: "POST",
+    headers: {
+      "content-type": "application/x-www-form-urlencoded",
+      "accept": "application/json",
+    },
+    body,
+  });
+  const value = await response.json();
+  if (!response.ok) {
+    throw new Error(
+      (value && (value.error_description || value.error)) || "token request failed");
+  }
+  return value.access_token;
+}
+
+const LOGIN_FLOW_KEY = "shoal-login-flow";
+
+function browserEnvironment() {
+  return typeof window !== "undefined" &&
+    typeof window.location !== "undefined" &&
+    typeof window.sessionStorage !== "undefined";
+}
+
+function redirectUri() {
+  return `${window.location.origin}/`;
+}
+
+function readLoginFlow() {
+  try {
+    return JSON.parse(window.sessionStorage.getItem(LOGIN_FLOW_KEY) || "null");
+  } catch (_) {
+    return null;
+  }
+}
+
+function clearLoginFlow() {
+  try {
+    window.sessionStorage.removeItem(LOGIN_FLOW_KEY);
+  } catch (_) {
+    // Storage may be unavailable; the flow is single-use regardless.
+  }
+}
+
+function clearCallbackFromUrl() {
+  if (typeof window.history === "undefined" || !window.history.replaceState) return;
+  window.history.replaceState({}, document.title, window.location.pathname);
+}
+
+// beginLogin starts the interactive Authorization Code + PKCE flow. The
+// verifier, state and nonce are single-use login-flow artifacts — not the
+// credential — and must survive the full-page redirect, so they live briefly in
+// sessionStorage and are cleared the instant the callback is consumed. The
+// access token itself is never written to any storage (see
+// completeLoginFromRedirect); it is held in memory only.
+async function beginLogin() {
+  if (!browserEnvironment() || !state.auth || !state.auth.configured) return;
+  const verifier = randomUrlToken(48);
+  const codeChallenge = await pkceChallengeFromVerifier(verifier);
+  const flow = {
+    verifier,
+    state: randomUrlToken(24),
+    nonce: randomUrlToken(24),
+    redirectUri: redirectUri(),
+  };
+  window.sessionStorage.setItem(LOGIN_FLOW_KEY, JSON.stringify(flow));
+  window.location.assign(buildAuthorizeUrl(state.auth, {
+    redirectUri: flow.redirectUri,
+    state: flow.state,
+    nonce: flow.nonce,
+    codeChallenge,
+  }));
+}
+
+// completeLoginFromRedirect finishes a login when the page was loaded as an
+// OIDC redirect callback. It consumes and clears the stored flow and strips the
+// code from the address bar before doing anything else, then exchanges the code
+// for a token that is kept in memory only.
+async function completeLoginFromRedirect(config) {
+  if (!browserEnvironment()) return false;
+  const params = callbackParams(window.location.search);
+  if (!params.code && !params.error) return false;
+  const stored = readLoginFlow();
+  clearLoginFlow();
+  clearCallbackFromUrl();
+  if (params.error) {
+    throw new Error(params.error_description || params.error);
+  }
+  const token = await exchangeAuthorizationCode(config, params, stored, {
+    fetch: (url, options) => fetch(url, options),
+  });
+  if (!token) throw new Error("token endpoint returned no access token");
+  state.accessToken = token;
+  state.reauthRequired = false;
+  return true;
+}
+
+async function loadAuthConfig() {
+  try {
+    const response = await fetch("/api/v1/auth-config", {
+      headers: {"accept": "application/json"},
+    });
+    if (!response.ok) return {configured: false};
+    return await response.json();
+  } catch (_) {
+    return {configured: false};
+  }
+}
+
+// configureLoginUI reveals the sign-in control only when a login is configured
+// and the caller holds no token yet. With -dev-auth the config reports
+// unconfigured, so no login UI renders at all and the local path is unchanged.
+function configureLoginUI(config) {
+  const button = document.getElementById("login");
+  if (!button) return;
+  if (!config || !config.configured) {
+    button.hidden = true;
+    return;
+  }
+  button.onclick = () => { beginLogin(); };
+  button.hidden = Boolean(state.accessToken);
+  button.textContent = "Sign in";
+}
+
+function renderLoginError(error) {
+  const container = document.getElementById("identity");
+  if (!container) return;
+  setMessage(
+    container,
+    `Sign-in could not be completed: ${error && error.message ? error.message : String(error)}.`,
+    "error",
+  );
 }
 
 function identitySubjectLabel(identity) {
@@ -114,7 +419,7 @@ function suppressionClause(count, identity) {
 }
 
 async function loadMeta() {
-  const response = await fetch("/api/v1/meta", {headers: {"accept": "application/json"}});
+  const response = await fetch("/api/v1/meta", {headers: {"accept": "application/json", ...authHeaders()}});
   const value = await response.json();
   if (!response.ok) throw apiError(value, response);
   state.capabilities = {...state.capabilities, ...(value.capabilities || {})};
@@ -128,7 +433,7 @@ async function loadMeta() {
 
 async function loadIdentity() {
   try {
-    const response = await fetch("/api/v1/identity", {headers: {"accept": "application/json"}});
+    const response = await fetch("/api/v1/identity", {headers: {"accept": "application/json", ...authHeaders()}});
     const value = await response.json();
     if (!response.ok) throw apiError(value, response);
     state.identity = value;
@@ -249,6 +554,15 @@ function formatExpiry(value) {
 
 function renderIdentityError(error) {
   const container = $("identity");
+  if (needsReauthentication(error)) {
+    handleReauthentication();
+    container.className = "identity identity-unknown";
+    setMessage(container, reauthenticationText(), "reauth");
+    const badge = $("identity-badge");
+    badge.hidden = true;
+    badge.textContent = "";
+    return;
+  }
   container.className = "identity identity-unknown";
   setMessage(
     container,
@@ -380,6 +694,15 @@ function showError(element, error) {
 // other failure. A denied action gets the "denied" treatment and reports true;
 // every other error falls back to the generic error rendering.
 function showActionError(element, error, action) {
+  if (needsReauthentication(error)) {
+    handleReauthentication();
+    if (element.getAttribute && element.getAttribute("role") === "status") {
+      setStatus(element, reauthenticationText(), "reauth");
+    } else {
+      setMessage(element, reauthenticationText(), "reauth");
+    }
+    return true;
+  }
   if (isDenied(error)) {
     if (element.getAttribute && element.getAttribute("role") === "status") {
       setStatus(element, deniedText(action, state.identity), "denied");
@@ -476,17 +799,17 @@ async function uploadFiles(fileList) {
     for (const file of files) body.append("files", file, file.name);
     const response = await fetch("/api/v1/ingest", {
       method: "POST",
-      headers: {"accept": "application/json", "x-shoal-workspace-request": "1"},
+      headers: {"accept": "application/json", "x-shoal-workspace-request": "1", ...authHeaders()},
       body,
     });
     const value = await response.json();
-    if (!response.ok) throw new Error(value.message || response.statusText);
+    if (!response.ok) throw apiError(value, response);
     clearSnapshotDependentViews();
     pin(value.snapshot);
     renderUploadResults(value.files || []);
     await loadDocuments(true);
   } catch (error) {
-    showError($("upload-status"), error);
+    showActionError($("upload-status"), error, "upload files");
     clearSnapshotDependentViews();
     clearPinnedSnapshot();
     await loadDocuments(true);
@@ -907,7 +1230,10 @@ async function expandIDs(ids, cursor = "") {
     draw();
   } catch (error) {
     if (generation !== graphGeneration) return;
-    if (isDenied(error)) {
+    if (needsReauthentication(error)) {
+      handleReauthentication();
+      $("graph-status").textContent = reauthenticationText();
+    } else if (isDenied(error)) {
       $("graph-status").textContent = deniedText("expand this neighborhood", state.identity);
     } else {
       $("graph-status").textContent = `Graph expansion failed: ${error.message || String(error)}`;
@@ -942,7 +1268,10 @@ $("find-path").onclick = async () => {
     draw();
   } catch (error) {
     if (generation !== graphGeneration) return;
-    if (isDenied(error)) {
+    if (needsReauthentication(error)) {
+      handleReauthentication();
+      $("graph-status").textContent = reauthenticationText();
+    } else if (isDenied(error)) {
       $("graph-status").textContent = deniedText("find a path", state.identity);
     } else {
       $("graph-status").textContent = `Path finding failed: ${error.message || String(error)}`;
@@ -1125,7 +1454,25 @@ new ResizeObserver(() => {
 }).observe(canvas);
 renderGraphList();
 applyCapabilities();
-loadIdentity();
-loadMeta()
-  .then(() => loadDocuments())
-  .catch((error) => showError($("documents"), error));
+
+// bootstrap resolves any login before the first identity/data calls so those
+// calls carry a bearer token when one is configured. With -dev-auth the config
+// reports unconfigured, no login UI renders, and the sequence is the same as
+// before: identity, then metadata, then documents.
+async function bootstrap() {
+  const config = await loadAuthConfig();
+  state.auth = config;
+  configureLoginUI(config);
+  if (config.configured) {
+    try {
+      await completeLoginFromRedirect(config);
+    } catch (error) {
+      renderLoginError(error);
+    }
+  }
+  loadIdentity();
+  loadMeta()
+    .then(() => loadDocuments())
+    .catch((error) => showError($("documents"), error));
+}
+bootstrap();
