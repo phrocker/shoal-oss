@@ -136,6 +136,93 @@ assert.strictEqual(scenario.ctx.sourceLabel(webURI, "doc"), "example.test / guid
 `)
 }
 
+func TestStaticWorkspaceIdentityIsSurfaced(t *testing.T) {
+	runNodeUITest(t, `
+const scenario = await runScenario({documents: true, document: true, retrieve: true});
+const badge = scenario.ids["identity-badge"];
+assert.strictEqual(badge.hidden, false);
+assert.match(badge.textContent, /development-principal@localhost/);
+const panel = renderedText(scenario.ids.identity);
+assert.match(panel, /You are/);
+assert.match(panel, /development-principal@localhost/);
+assert.match(panel, /Shared governed workspace/);
+assert.match(panel, /retrieve/);
+assert.match(panel, /neighborhood/);
+assert.match(panel, /no client-side identity switch/);
+
+const anon = await runScenario(
+  {documents: true}, [], {identity: {authenticated: false, operations: []}});
+assert.strictEqual(anon.ids["identity-badge"].hidden, true);
+assert.match(renderedText(anon.ids.identity), /without an established identity/);
+
+const broken = await runScenario(
+  {documents: true}, [],
+  {identityError: {statusText: "Service Unavailable", body: {code: "unavailable", message: "identity down"}}});
+assert.strictEqual(broken.ids["identity-badge"].hidden, true);
+assert.strictEqual(broken.ids.identity.className, "identity identity-unknown");
+assert.match(renderedText(broken.ids.identity), /Identity is unavailable/);
+`)
+}
+
+func TestStaticWorkspaceDistinguishesDeniedFromEmpty(t *testing.T) {
+	runNodeUITest(t, `
+const scenario = await runScenario({documents: true, retrieve: true});
+assert.strictEqual(scenario.ctx.isDenied({code: "unauthorized"}), true);
+assert.strictEqual(scenario.ctx.isDenied({status: 401}), true);
+assert.strictEqual(scenario.ctx.isDenied({code: "not_found", status: 404}), false);
+assert.strictEqual(scenario.ctx.isDenied({code: "internal", status: 500}), false);
+assert.strictEqual(scenario.ctx.isDenied(null), false);
+
+const identity = {authenticated: true, subject: "alice@localhost", operations: ["retrieve"]};
+const denied = scenario.ctx.deniedText("run this retrieval", identity);
+const empty = scenario.ctx.emptyRetrievalText(identity);
+assert.notStrictEqual(denied, empty);
+assert.match(denied, /Access denied/);
+assert.match(denied, /not an empty result/);
+assert.match(denied, /alice@localhost/);
+assert.match(empty, /No evidence matched/);
+assert.match(empty, /alice@localhost/);
+`)
+}
+
+func TestStaticWorkspaceRetrievalDeniedStateRendersDistinctly(t *testing.T) {
+	runNodeUITest(t, `
+const denied = await runScenario(
+  {documents: true, retrieve: true}, [],
+  {retrieveError: {statusText: "Unauthorized", body: {code: "unauthorized", message: "operation retrieve is not authorized"}}});
+denied.ids.query.value = "classified";
+await denied.ids.search.onsubmit({preventDefault() {}});
+assert.strictEqual(denied.ids["evidence-status"].className, "denied");
+assert.match(denied.ids["evidence-status"].textContent, /Access denied/);
+assert.strictEqual(denied.ids["evidence-results"].children.length, 0);
+
+const empty = await runScenario({documents: true, retrieve: true});
+empty.ids.query.value = "nothing here";
+await empty.ids.search.onsubmit({preventDefault() {}});
+assert.strictEqual(empty.ids["evidence-status"].className, "empty-state");
+assert.match(empty.ids["evidence-status"].textContent, /No evidence matched/);
+assert.notStrictEqual(
+  empty.ids["evidence-status"].className, denied.ids["evidence-status"].className);
+
+const failed = await runScenario(
+  {documents: true, retrieve: true}, [],
+  {retrieveError: {statusText: "Internal", body: {code: "internal", message: "boom"}}});
+failed.ids.query.value = "boom";
+await failed.ids.search.onsubmit({preventDefault() {}});
+assert.strictEqual(failed.ids["evidence-status"].className, "error");
+assert.match(failed.ids["evidence-status"].textContent, /boom/);
+`)
+}
+
+func TestStaticWorkspaceEmptyDocumentsNamesTheIdentity(t *testing.T) {
+	runNodeUITest(t, `
+const scenario = await runScenario({documents: true, document: true});
+assert.strictEqual(scenario.ids["documents-status"].className, "empty-state");
+assert.match(scenario.ids["documents-status"].textContent, /No documents are visible/);
+assert.match(scenario.ids["documents-status"].textContent, /development-principal@localhost/);
+`)
+}
+
 func TestStaticWorkspaceResponsiveHeaderWrapsBeforeTabletWidths(t *testing.T) {
 	html := readStaticAsset(t, "static/index.html")
 	style := readStaticAsset(t, "static/style.css")
@@ -175,6 +262,13 @@ func readStaticAsset(t *testing.T, path string) string {
 func runNodeUITest(t *testing.T, assertions string) {
 	t.Helper()
 	if _, err := exec.LookPath("node"); err != nil {
+		// Asymmetric on purpose: a developer laptop without Node may skip these
+		// executable UI checks, but CI must never let them silently vanish into
+		// a green run. GitHub Actions always sets CI, so there a missing node is
+		// a hard failure rather than a skip.
+		if os.Getenv("CI") != "" {
+			t.Fatal("node is required for executable static UI checks in CI")
+		}
 		t.Skip("node is not available for executable static UI checks")
 	}
 	script := uiHarnessScript(assertions)
@@ -190,7 +284,12 @@ func uiHarnessScript(assertions string) string {
 const assert = require("assert");
 const fs = require("fs");
 const vm = require("vm");
-const app = fs.readFileSync("static/app.js", "utf8") + "\nthis.sourceLabel = sourceLabel;";
+const app = fs.readFileSync("static/app.js", "utf8") +
+  "\nthis.sourceLabel = sourceLabel;" +
+  "\nthis.isDenied = isDenied;" +
+  "\nthis.deniedText = deniedText;" +
+  "\nthis.emptyRetrievalText = emptyRetrievalText;" +
+  "\nthis.emptyDocumentsText = emptyDocumentsText;";
 
 class ClassList {
   constructor(element) { this.element = element; }
@@ -254,6 +353,12 @@ function descendants(element) {
   return out;
 }
 
+function renderedText(element) {
+  return [element, ...descendants(element)]
+    .map((node) => (node && node.textContent) || "")
+    .join(" ");
+}
+
 function matches(element, selector) {
   if (selector === ".doc") return element.className.split(/\s+/).includes("doc");
   if (selector === ".doc-card") return element.className.split(/\s+/).includes("doc-card");
@@ -311,9 +416,9 @@ function makeDocument(capabilities, documents) {
     "upload-section", "upload", "upload-drop", "upload-files", "upload-button",
     "upload-status", "upload-results",
     "documents", "documents-status", "more", "graph-nodes", "graph-edges", "canvas",
-    "selection", "hierarchy", "hierarchy-status", "snapshot",
+    "selection", "hierarchy", "hierarchy-status", "snapshot", "identity", "identity-badge",
   ]) ids[id] = new Element(id === "canvas" ? "canvas" : "div", id);
-  for (const id of ["documents-status", "hierarchy-status", "evidence-status", "vector-mode-status", "upload-status"]) {
+  for (const id of ["documents-status", "hierarchy-status", "evidence-status", "vector-mode-status", "upload-status", "identity"]) {
     ids[id].setAttribute("role", "status");
   }
   ids.query.value = "";
@@ -354,6 +459,24 @@ async function runScenario(capabilities, documents = [], scenarioOptions = {}) {
     URL,
     fetch: async (url, requestOptions = {}) => {
       if (url === "/api/v1/meta") return response({capabilities});
+      if (url === "/api/v1/identity") {
+        if (scenarioOptions.identityError) {
+          return response(scenarioOptions.identityError.body || {}, {
+            ok: false,
+            statusText: scenarioOptions.identityError.statusText || "Error",
+          });
+        }
+        return response("identity" in scenarioOptions ? scenarioOptions.identity : {
+          authenticated: true,
+          subject: "development-principal@localhost",
+          actor: "shoal-explore-web-dev-auth",
+          authorization_domain: "shoal-explore-web",
+          operations: ["ingest", "list", "read", "connect", "neighborhood", "retrieve"],
+          policy_generation: 1,
+          audit_purpose: "localhost development workspace",
+          request_id: "dev-request-abc123",
+        });
+      }
       if (url.endsWith("/documents")) {
         const sequence = scenarioOptions.documentResponses || [documents];
         const docs = sequence[Math.min(documentCalls, sequence.length - 1)];
@@ -373,13 +496,20 @@ async function runScenario(capabilities, documents = [], scenarioOptions = {}) {
       }
       if (url.endsWith("/retrieve")) {
         retrieveBody = JSON.parse(requestOptions.body);
-        return response({snapshot, retrieval: {results: []}});
+        if (scenarioOptions.retrieveError) {
+          return response(scenarioOptions.retrieveError.body || {}, {
+            ok: false,
+            statusText: scenarioOptions.retrieveError.statusText || "Error",
+          });
+        }
+        return response({snapshot, retrieval: {results: scenarioOptions.retrievalResults || []}});
       }
       throw new Error("unexpected fetch " + url);
     },
   };
   vm.createContext(ctx);
   vm.runInContext(app, ctx);
+  await new Promise((resolve) => setImmediate(resolve));
   await new Promise((resolve) => setImmediate(resolve));
   await new Promise((resolve) => setImmediate(resolve));
   return {
