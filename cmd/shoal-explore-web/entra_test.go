@@ -622,6 +622,73 @@ func TestEntraErrorNeverContainsRawToken(t *testing.T) {
 	}
 }
 
+// TestEntraAuthenticateCollapsesReasonsAtBoundary pins the exported trust
+// boundary: Authenticate must return one and the same generic denial for every
+// distinct internal failure reason. Distinct causes must be indistinguishable
+// at the boundary, so a caller probing the endpoint cannot use the error as an
+// oracle to tell "unknown kid" from "expired" from "wrong audience". This is a
+// separate property from "no raw token leaks" (proved elsewhere): here the leak
+// would be *which guard rejected*, which has reconnaissance value.
+//
+// The failure mode this guards against is a well-meaning future edit that, while
+// debugging a login problem, returns the specific error from Authenticate
+// instead of the generic denial. That change would keep every other test green;
+// this one fails it, because the returned error becomes errors.Is-identifiable
+// as a specific sentinel and the per-cause messages diverge.
+func TestEntraAuthenticateCollapsesReasonsAtBoundary(t *testing.T) {
+	issuer := newFakeIssuer(t)
+	now := time.Now()
+	authenticator := newTestAuthenticator(t, issuer.testConfig(fixedClock(now)))
+
+	expired := issuer.defaultClaims(now)
+	expired["exp"] = now.Add(-2 * time.Hour).Unix()
+	wrongAudience := issuer.defaultClaims(now)
+	wrongAudience["aud"] = "some-other-client-id"
+
+	cases := []struct {
+		name  string
+		token string
+	}{
+		{"expired", issuer.signRS256(t, testKID, expired)},
+		{"wrong audience", issuer.signRS256(t, testKID, wrongAudience)},
+		{"unknown kid", issuer.signRS256(t, "unknown-kid", issuer.defaultClaims(now))},
+	}
+
+	// The specific sentinels the internal path surfaces for these causes. The
+	// boundary error must not be errors.Is-identifiable as any of them.
+	forbidden := []struct {
+		name string
+		err  error
+	}{
+		{"jwt.ErrTokenExpired", jwt.ErrTokenExpired},
+		{"jwt.ErrTokenInvalidAudience", jwt.ErrTokenInvalidAudience},
+		{"errNoMatchingKey", errNoMatchingKey},
+	}
+
+	genericMessage := entraDenied().Error()
+	for _, testCase := range cases {
+		_, err := authenticator.Authenticate(bearerRequest(testCase.token))
+		if err == nil {
+			t.Fatalf("%s: the boundary accepted an invalid token", testCase.name)
+		}
+		for _, sentinel := range forbidden {
+			if errors.Is(err, sentinel.err) {
+				t.Fatalf(
+					"%s: the boundary leaked the specific reason %s; distinct "+
+						"causes must be indistinguishable at the boundary",
+					testCase.name, sentinel.name)
+			}
+		}
+		// Every distinct cause must yield the identical generic denial, so the
+		// error text cannot be used as an oracle either.
+		if got := err.Error(); got != genericMessage {
+			t.Fatalf(
+				"%s: boundary error %q is not the generic denial %q; the reason "+
+					"leaks", testCase.name, got, genericMessage)
+		}
+	}
+}
+
 // TestEntraRejectsMissingOrMalformedBearer proves the header parsing fails
 // closed without echoing any credential.
 func TestEntraRejectsMissingOrMalformedBearer(t *testing.T) {
