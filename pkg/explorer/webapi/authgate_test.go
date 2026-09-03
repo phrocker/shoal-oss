@@ -123,6 +123,54 @@ func TestAuthGateRequiresAuthenticationForAPIRoutes(t *testing.T) {
 	}
 }
 
+// TestAuthGateAuthenticatesTraversalIntoAPIRoutes is the end-to-end companion to
+// TestPubliclyReachableNormalizesTraversal. net/http delivers the raw path to
+// the gate, so a request that traverses out of /assets onto an API route must
+// still be authenticated. The client is configured NOT to follow redirects, so
+// the assertion is made on the FIRST response the gate produces. With the gate's
+// path.Clean intact that first response is a 401 with a bearer challenge (the
+// gate resolved the same API route the mux would). If path.Clean is lost, the
+// gate treats the request as a public asset, skips authentication, and the mux
+// then redirects the traversal to the real handler — so the first response stops
+// being a 401 and this test fails. Asserting the specific 401 + bearer, rather
+// than merely "not 200", keeps the reason precise: the request was refused
+// because authentication is required, not for some unrelated reason.
+func TestAuthGateAuthenticatesTraversalIntoAPIRoutes(t *testing.T) {
+	fixture := newAuthnFixture(t)
+	client := *fixture.server.Client()
+	client.CheckRedirect = func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+	targets := []string{
+		"/assets/../api/v1/meta",
+		"/assets/../api/v1/identity",
+		"/assets/../../api/v1/meta",
+		"/assets/%2e%2e/api/v1/meta",
+	}
+	for _, target := range targets {
+		request, err := http.NewRequest(http.MethodGet, fixture.server.URL+target, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		response, err := client.Do(request)
+		if err != nil {
+			t.Fatalf("GET %s: %v", target, err)
+		}
+		func() {
+			defer response.Body.Close()
+			if response.StatusCode != http.StatusUnauthorized {
+				t.Fatalf("GET %s first-response status = %d, want 401 "+
+					"(traversal must not be served as a public asset)",
+					target, response.StatusCode)
+			}
+			if got := response.Header.Get("WWW-Authenticate"); !strings.Contains(
+				strings.ToLower(got), "bearer") {
+				t.Fatalf("GET %s missing bearer challenge, got %q", target, got)
+			}
+		}()
+	}
+}
+
 // TestAuthGateDistinguishesReauthenticationFromDenial is the crux of the
 // re-authenticate-vs-denied contract. Both are HTTP 401, so they are told apart
 // only by the bearer challenge the gate sets and the service does not: a token

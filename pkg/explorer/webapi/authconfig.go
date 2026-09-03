@@ -123,6 +123,17 @@ func authorityOrigin(authority string) string {
 // /assets/../api/v1/documents is judged as the API route it resolves to, not as
 // an asset, and remains authenticated.
 //
+// The path.Clean call is load-bearing and non-obvious, so it must not be
+// removed. net/http hands ServeHTTP the raw, un-normalized request path, but the
+// ServeMux that routes the request afterward cleans it. Without the Clean here
+// the gate and the router disagree about which route a request is: the gate
+// would see /assets/../api/v1/meta as an asset and skip authentication, then the
+// mux would resolve it to the real /api/v1/meta handler. That disagreement is
+// the vulnerability, and it is invisible from reading either the gate or the mux
+// alone. Cleaning here makes the gate judge the same route the mux will serve.
+// TestPubliclyReachableNormalizesTraversal and
+// TestAuthGateAuthenticatesTraversalIntoAPIRoutes pin this in both directions.
+//
 // This does not bypass the host-authority gate, which runs first and
 // unconditionally in ServeHTTP; it only decides whether authentication is
 // required for a request the host gate has already admitted.
