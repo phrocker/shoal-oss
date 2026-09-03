@@ -239,6 +239,112 @@ func TestBackfillGrantsPreExistingCorpusOnlyWhenGated(t *testing.T) {
 	}
 }
 
+// TestDurableCorpusServedAfterRestartWithoutBackfill proves the startup
+// backfill is not load-bearing once registrations persist. A document is
+// ingested through the authorized service of one process — so the durable
+// policy catalog records its registration — and then a second process opens the
+// same corpus with the backfill explicitly disabled and still serves the
+// document. Contrast preExistingCorpus, which ingests through the raw explorer
+// (registering nothing) and therefore does need the backfill: that is exactly
+// the pre-durability corpus the backfill exists to migrate. The two processes
+// use independent authorities, so this is a genuine restart rather than shared
+// in-memory state.
+func TestDurableCorpusServedAfterRestartWithoutBackfill(t *testing.T) {
+	data := t.TempDir()
+	ctx := context.Background()
+
+	ingestAuthority := auth.NewAuthority()
+	first, err := openService(ctx, serviceConfig{
+		backend:  "embedded",
+		data:     data,
+		resolver: ingestAuthority.Resolver(),
+		clock:    time.Now,
+		backfill: nil,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.backfilled != 0 {
+		t.Fatalf("a nil backfill ran during ingest: %d", first.backfilled)
+	}
+
+	ingestDecision, err := mintDevelopmentDecision(t)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ingestCtx, err := ingestAuthority.Binder().Bind(ctx, ingestDecision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider, ok := first.service.(webapi.IngestProvider)
+	if !ok {
+		first.close()
+		t.Fatal("embedded service does not provide ingest")
+	}
+	ingested, err := provider.Ingest(ingestCtx, webapi.IngestRequest{
+		Files: []webapi.UploadFile{{
+			Name:    "durable.md",
+			Content: []byte("# Durable\n\nIngested by a durable-backed process.\n"),
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ingested.Files) != 1 {
+		t.Fatalf("ingest result files = %#v, want one", ingested.Files)
+	}
+	first.close()
+
+	// Restart: a fresh authority and the backfill explicitly disabled. If the
+	// backfill were papering over a non-durable catalog, the corpus would be
+	// invisible here.
+	readAuthority := auth.NewAuthority()
+	second, err := openService(ctx, serviceConfig{
+		backend:  "embedded",
+		data:     data,
+		resolver: readAuthority.Resolver(),
+		clock:    time.Now,
+		backfill: nil,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.close()
+	if second.backfilled != 0 {
+		t.Fatalf("a nil backfill ran after restart: %d", second.backfilled)
+	}
+
+	readDecision, err := mintDevelopmentDecision(t)
+	if err != nil {
+		t.Fatal(err)
+	}
+	readCtx, err := readAuthority.Binder().Bind(ctx, readDecision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := second.service.Documents(
+		readCtx, webapi.DocumentsRequest{Page: webapi.PageRequest{Limit: 10}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(response.Documents) != 1 {
+		t.Fatalf(
+			"documents served after restart without backfill = %d, want 1",
+			len(response.Documents))
+	}
+}
+
+// mintDevelopmentDecision mints a development-principal decision carrying the
+// workspace policy the authorized client enforces.
+func mintDevelopmentDecision(t *testing.T) (auth.Decision, error) {
+	t.Helper()
+	authenticator, err := newDevelopmentAuthenticator(time.Now)
+	if err != nil {
+		return auth.Decision{}, err
+	}
+	return authenticator.mint()
+}
+
 // TestRunBackfillsPreExistingCorpusOverHTTP is the end-to-end proof that a
 // restarted workspace serves the corpus it already holds.
 func TestRunBackfillsPreExistingCorpusOverHTTP(t *testing.T) {
