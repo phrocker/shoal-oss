@@ -1,9 +1,9 @@
 # shoal-explore-web deployment
 
-Single-instance Shoal Explorer workspace: one binary, one data directory, no
+Single-instance Shoal Explorer workspace: one binary, one state directory, no
 external datastore. See [`docs/shoal-explore-web-deploy.md`](../../docs/shoal-explore-web-deploy.md)
 for the full guide (image, configuration seam, the unsafe-configuration guard,
-the persistence/#284 caveat, and Azure options).
+persistence and the split-brain guard, and Azure options).
 
 ## Local, one command
 
@@ -17,28 +17,27 @@ the Docker VM — see the guide.
 
 Files:
 
-- `docker-compose.yml` — the local one-command profile (host networking, single
-  state-root volume `explorer-state` mounted at `/var/lib/shoal`).
+- `docker-compose.yml` — the local one-command profile (host networking,
+  `-state-dir /var/lib/shoal`, single state-root volume `explorer-state`).
 - `.env.example` — copy to `.env` to override `SHOAL_EXPLORE_LISTEN`.
 
 ## Volume layout: one state root
 
-The volume is the **state root** `/var/lib/shoal`, not the corpus directory. All
-persistent state lives under it:
+Configure `-state-dir /var/lib/shoal` and mount that one directory. **Persist
+`/var/lib/shoal` and both the corpus and the authorization catalog survive a
+restart:**
 
-- `/var/lib/shoal/corpus` — the document corpus (`-data`).
-- `/var/lib/shoal/corpus-policy` — the authorization catalog once the durable
-  policy store (#284 / PR #288) lands. It is derived as
-  `filepath.Clean(-data)+"-policy"`, a **sibling** of the corpus (the engine
-  treats every `-data` subdirectory as a table, so it cannot nest), and so falls
-  under the same single mount.
+- `/var/lib/shoal/corpus` — the document corpus.
+- `/var/lib/shoal/policy` — the durable authorization catalog (#284 / PR #288). It
+  is a **sibling** of the corpus, never inside it (the engine treats every corpus
+  subdirectory as a table), and falls under the same single mount.
 
-Mounting the corpus directory alone would preserve documents but drop every
-authorization registration on restart. Mounting the state root keeps both,
-robustly, under either the current sibling layout or a future
-`<state-root>/corpus` + `<state-root>/policy` layout.
+Mounting the corpus directory alone would drop every authorization registration
+on restart; the command's split-brain guard then refuses to start (in production
+mode) rather than serving an under-authorized corpus. `-data` and `-policy-dir`
+remain available for legacy/custom layouts — see the guide.
 
 The image (`Dockerfile.shoal-explore-web`, at the repo root) is the same artifact
-a shared instance would run; only the flags differ. The shared path has open
-prerequisites (a real authenticator, host-authority config, durable policy
-store) documented in the guide.
+a shared instance would run; only the flags differ. The shared path still has open
+prerequisites (a real authenticator, host-authority config) documented in the
+guide.

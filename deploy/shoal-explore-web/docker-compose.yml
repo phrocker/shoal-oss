@@ -25,15 +25,15 @@ services:
     # reach a loopback-only listener, so we share the host network namespace.
     network_mode: host
     command:
-      - "-data=/var/lib/shoal/corpus"
+      - "-state-dir=/var/lib/shoal"
       - "-listen=${SHOAL_EXPLORE_LISTEN:-127.0.0.1:8098}"
       - "-dev-auth"
     volumes:
-      # Mount the SINGLE state root, not the corpus directory. The corpus lives
-      # at /var/lib/shoal/corpus and the authorization catalog (once #284/#288
-      # lands) at the sibling /var/lib/shoal/corpus-policy; both are under this
-      # one mount, so `docker compose down` + `up` and any restart preserve all
-      # persistent state. Remove it explicitly with `docker compose down -v`.
+      # Mount the SINGLE state root. -state-dir places the corpus at
+      # /var/lib/shoal/corpus and the durable authorization catalog at the
+      # sibling /var/lib/shoal/policy; both are under this one mount, so
+      # `docker compose down` + `up` and any restart preserve all persistent
+      # state. Remove it explicitly with `docker compose down -v`.
       - explorer-state:/var/lib/shoal
     restart: unless-stopped
     stop_signal: SIGTERM

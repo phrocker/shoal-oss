@@ -15,7 +15,7 @@ prerequisites below land) in a shared instance, where the two deployments differ
 - [Volume layout: a single state root](#volume-layout-a-single-state-root)
 - [The configuration seam: local vs shared](#the-configuration-seam-local-vs-shared)
 - [The unsafe-configuration guard](#the-unsafe-configuration-guard)
-- [Persistence and the #284 caveat](#persistence-and-the-284-caveat)
+- [Persistence: corpus and authorization both survive](#persistence-corpus-and-authorization-both-survive)
 - [Shared / cloud instance: shape and open gaps](#shared--cloud-instance-shape-and-open-gaps)
 - [Azure hosting (one option, not a decision)](#azure-hosting-one-option-not-a-decision)
 
@@ -37,7 +37,7 @@ $ docker build -f Dockerfile.shoal-explore-web -t shoal-explore-web:test --build
 
 $ docker image inspect shoal-explore-web:test \
     --format 'Size={{.Size}} User={{.Config.User}} Cmd={{json .Config.Cmd}} Volumes={{json .Config.Volumes}}'
-Size=7097160 User=65532:65532 Cmd=["-data","/var/lib/shoal/corpus","-listen","127.0.0.1:8098","-dev-auth"] Volumes={"/var/lib/shoal":{}}
+Size=7127891 User=65532:65532 Cmd=["-state-dir","/var/lib/shoal","-listen","127.0.0.1:8098","-dev-auth"] Volumes={"/var/lib/shoal":{}}
 ```
 
 The image is ~7 MB, runs as non-root, and embeds no secrets: `Config.Env` is only
@@ -84,33 +84,39 @@ container restart, preserves it. `docker compose down -v` deletes it.
 
 ## Volume layout: a single state root
 
-Mount the **state root** `/var/lib/shoal`, never the corpus directory. All
-persistent state lives under one mount:
+Configure the workspace with **`-state-dir /var/lib/shoal`** (the recommended
+flag from PR #288) and mount that one directory as the volume. The command places
+both persistent directories inside it:
 
 ```
-/var/lib/shoal/                 <- the declared VOLUME (mount THIS)
-├── corpus/                     <- the document corpus (-data)
-│   └── _shoal_explorer/        <- the corpus engine's table
-└── corpus-policy/              <- the authorization catalog (once #284/#288 lands)
+/var/lib/shoal/                 <- the declared VOLUME (mount THIS, persist THIS)
+├── corpus/                      <- the document corpus
+│   └── _shoal_explorer/         <- the corpus engine's table
+└── policy/                      <- the durable authorization catalog (#284/#288)
+    └── _shoal_policy/           <- the policy store's table
 ```
 
-The authorization catalog is a **sibling** of the corpus, not a child of it: the
-durable policy store (issue #284, PR #288) derives its directory as
-`filepath.Clean(-data) + "-policy"`. It cannot nest inside `-data` because the
-corpus engine treats every subdirectory of the data directory as a table and
-would misread the catalog as table data.
+**One sentence: persist `/var/lib/shoal` — the whole state root — and both the
+corpus and the authorization catalog survive a restart.**
 
-The consequence is the whole point of this layout: **mounting only the corpus
-directory would preserve documents but drop every authorization registration on
-restart** — the workspace would then serve an empty or under-populated result
-set, which the temporary startup backfill can partially mask, making the failure
-look like something else. Mounting the state root keeps both. It is also robust
-to the pending change to a `<state-root>/corpus` + `<state-root>/policy` layout
-with an explicit policy-directory flag: both still fall under `/var/lib/shoal`.
+The authorization catalog is a **sibling** of the corpus, never a child of it:
+the corpus engine treats every subdirectory of the corpus directory as a table,
+so nesting the catalog there would corrupt table discovery. `-state-dir` keeps
+them as siblings under one mount, which removes the earlier string-suffix
+coupling entirely.
 
-The default `-data` is `/var/lib/shoal/corpus`; the image declares `/var/lib/shoal`
-(not `/var/lib/shoal/corpus`) as the volume, and the state root is owned by
-`65532` so the non-root process creates `corpus/` and the sibling `corpus-policy/`
+Flag precedence (see `resolveWorkspacePaths` and `TestResolveWorkspacePathsPrecedence`):
+
+- **`-state-dir <root>`** (recommended) → corpus `<root>/corpus`, policy `<root>/policy`.
+- **`-data <dir>`** (legacy, backwards compatible) → corpus `<dir>`, policy the
+  sibling `filepath.Clean(<dir>)+"-policy"`. Both must be persisted.
+- **`-policy-dir <dir>`** overrides the policy location and always wins.
+
+**Mounting only the corpus directory** would preserve documents but drop every
+authorization registration on restart. On this build that is not a silent
+failure: the split-brain guard (below) refuses to start. Mounting the state root
+keeps both. The image declares `/var/lib/shoal` (not a subdirectory) as the
+volume, owned by `65532`, so the non-root process creates `corpus/` and `policy/`
 at runtime.
 
 ## The configuration seam: local vs shared
@@ -121,7 +127,7 @@ mounted volume — never code:
 | Concern            | Local (laptop)                     | Shared instance                              |
 | ------------------ | ---------------------------------- | -------------------------------------------- |
 | Bind address       | `-listen 127.0.0.1:8098` (loopback)| `-listen 0.0.0.0:<port>` (see gaps below)    |
-| Data directory     | `-data /var/lib/shoal/corpus` (under the state-root volume) | same flag, backed by durable storage |
+| Data directory     | `-state-dir /var/lib/shoal` (one mounted volume) | same flag, backed by durable storage |
 | Authenticator      | `-dev-auth` (loopback-only)        | a real authenticator (**not yet wired**)     |
 | TLS termination    | none (loopback)                    | terminated at an ingress/reverse proxy       |
 | Log format         | Go `log` text to stderr            | same today (no structured-log flag yet)      |
@@ -141,7 +147,7 @@ Public bind + `-dev-auth` is refused:
 
 ```console
 $ docker run --rm --network host shoal-explore-web:test \
-    -data /var/lib/shoal/explorer -listen 0.0.0.0:8099 -dev-auth
+    -state-dir /var/lib/shoal -listen 0.0.0.0:8099 -dev-auth
 shoal-explore-web: refusing to serve 0.0.0.0:8099 with -dev-auth: the
 development-principal@localhost development principal is granted the whole
 workspace corpus and is only safe on a loopback listener; bind 127.0.0.1 or
@@ -153,7 +159,7 @@ No authenticator at all is also refused (the workspace never serves anonymously)
 
 ```console
 $ docker run --rm --network host shoal-explore-web:test \
-    -data /var/lib/shoal/corpus -listen 127.0.0.1:8099
+    -state-dir /var/lib/shoal -listen 127.0.0.1:8099
 shoal-explore-web: refusing to serve 127.0.0.1:8099 without authentication: no
 authenticator is configured; pass -dev-auth to mint the
 development-principal@localhost development principal on a loopback listener, or
@@ -165,85 +171,132 @@ The check runs twice: once on the requested flag value before anything binds,
 and again on the listener's *resolved* address (which may be wider than
 requested), closing the listener before the corpus is opened.
 
-## Persistence and the #284 caveat
+## Persistence: corpus and authorization both survive
 
-The restart test proves the volume works, but you must be precise about *which*
-directories you mounted and *what* survived. Three facts are distinct:
+Be precise about which directories were mounted and what survived. Three facts
+are distinct:
 
 1. **The volume preserved the corpus bytes on disk.**
 2. **The workspace served that corpus after restart.**
-3. **The authorization state survived on its own.**
+3. **The authorization registrations survived — not rebuilt from scratch.**
 
-The layout above is designed so a single mount (`/var/lib/shoal`) covers both the
-corpus and the authorization catalog. On `main` today, document data is durable
-(Shoal storage engine) but the *authorization* policy catalog is an in-process
-map (issue #284) — there is **no on-disk policy directory yet**. A startup
-**backfill**, gated to `-dev-auth` on a loopback listener, re-registers the
-on-disk documents for the development principal at every start, so under the
-local profile a restart serves the corpus, but only because the backfill rebuilds
-the in-memory authorization each time.
+With PR #288 merged the policy catalog is durable, and `-state-dir /var/lib/shoal`
+places `corpus/` and `policy/` under one mount, so all three hold.
 
-Observed end-to-end (Docker Desktop, host-network curl helper). **Mount:** the
-named volume `shoal-explore-state` at `/var/lib/shoal` (the state root) — the
-corpus directory itself was *not* mounted directly.
+### Observed under `-dev-auth` (the container / compose profile)
+
+**Mount:** the named volume `shoal-explore-state` at `/var/lib/shoal` (the state
+root); `-state-dir /var/lib/shoal`.
 
 ```console
 $ docker run -d --name shoal-explore-test --network host \
     -v shoal-explore-state:/var/lib/shoal shoal-explore-web:test
+# first-start log:
+#   Granted 0 pre-existing document(s) in /var/lib/shoal/corpus to development-principal@localhost ...
+#   Shoal Explorer listening at http://127.0.0.1:8098
 
 # seed one document
 $ docker run --rm --network host -v "$PWD/seed:/seed:ro" curlimages/curl -s \
     -X POST http://127.0.0.1:8098/api/v1/ingest \
     -H "X-Shoal-Workspace-Request: 1" \
     -F "file=@/seed/seed.md;type=text/markdown"
-{"snapshot":{"id":"b7ece0950ac4662adfa51e2e119b61c334f4278951cf1010b859aac86a702176", ...}}
-
+{"snapshot":{"id":"23f7a8e4cc666a53...", ...}}
 # before restart: seed.md served
 
 $ docker restart shoal-explore-test
-# logs after restart:
-#   Granted 1 pre-existing document(s) in /var/lib/shoal/corpus to development-principal@localhost ...
+# post-restart log:
+#   Granted 0 pre-existing document(s) in /var/lib/shoal/corpus to development-principal@localhost ...
 #   Shoal Explorer listening at http://127.0.0.1:8098
 
-# after restart: SAME snapshot id b7ece095..., seed.md still served
+# after restart: seed.md still served
 $ docker run --rm --network host -v "$PWD/seed:/seed:ro" curlimages/curl -s \
     -X POST http://127.0.0.1:8098/api/v1/documents \
     -H "X-Shoal-Workspace-Request: 1" -H "Content-Type: application/json" \
     -d '{"page":{"limit":10}}'
-{"snapshot":{"id":"b7ece095...","...":"..."},"documents":[{"document":{"title":"seed.md", ...}}]}
+{ ... "documents":[{"document":{"title":"seed.md", ...}}]}
 
-# what is actually on the mounted state-root volume:
+# both directories are present on the mounted state root:
 $ docker run --rm -v shoal-explore-state:/state --entrypoint sh curlimages/curl \
-    -c "ls -1 /state; echo ---; ls -1 /state/corpus; echo ---; \
-        test -d /state/corpus-policy && echo policy:YES || echo policy:NO"
+    -c "ls -1 /state; echo ---; ls -1 /state/corpus; echo ---; ls -1 /state/policy"
 corpus
+policy
 ---
 _shoal_explorer
 ---
-policy:NO
+_shoal_policy
 ```
 
-The snapshot id `b7ece095…` is identical before and after restart, and the
-post-restart log reports `Granted 1 pre-existing document(s)` — the corpus was on
-disk under `/var/lib/shoal/corpus` and the dev-auth backfill re-authorized it.
+Note the post-restart log: **`Granted 0 pre-existing document(s)`**. On the
+pre-#288 build this line read `Granted 1` — the in-memory catalog had lost the
+registration and the backfill re-created it. Now it is `0`: the durable policy
+store already held the registration, so the backfill had nothing to migrate. Both
+`corpus/` and `policy/` are present on the single mounted volume.
 
-**What this proves (facts 1 and 2):** the single state-root mount preserved the
-corpus on disk and the local `-dev-auth` profile served it again.
+**Caveat, stated plainly:** this profile runs `-dev-auth`, and the split-brain
+guard is **bypassed whenever the dev backfill is active**. A green restart test
+*under `-dev-auth`* does not by itself demonstrate that a production container
+survives a restart, because the backfill would re-register a lost corpus and mask
+the loss. The `Granted 0` line is good evidence the durable store carried the
+registration, but the authoritative proof of production behaviour is the guard
+plus the integration tests below.
 
-**What is unverified (fact 3), honestly:** the authorization half. This branch
-does **not** include the durable policy store (#284 / PR #288), so no
-`corpus-policy/` directory exists yet — the on-disk listing above shows only
-`corpus/`, `policy:NO`. The policy catalog is in-memory and is reconstructed by
-the dev-only backfill each start. I could not exercise authorization-state
-persistence here and did not fake it. The volume layout is nevertheless correct
-in advance: when #288 lands, `corpus-policy/` is created as a sibling of
-`corpus/` **inside** the already-mounted `/var/lib/shoal`, so the same single
-mount will carry it across restarts.
+### Production-mode proof (backfill disabled)
 
-Do not read the green restart test as "policy persistence works." Without the
-backfill (any non-dev authenticator), a restart on today's `main` would preserve
-the corpus on disk but serve an **empty** result set until each document is
-ingested again.
+Production mode (no `-dev-auth`) **cannot start from the container CLI today**:
+`selectAuthenticator` refuses before the corpus is even opened, because no
+non-dev authenticator is wired (gap #1 below). Observed:
+
+```console
+$ docker run --rm --network host -v shoal-explore-state:/var/lib/shoal \
+    shoal-explore-web:test -state-dir /var/lib/shoal -listen 127.0.0.1:8098
+shoal-explore-web: refusing to serve 127.0.0.1:8098 without authentication: no
+authenticator is configured; pass -dev-auth ...
+# exit code 1
+```
+
+So the durable-persistence and split-brain behaviours are proven where they are
+reachable — the package's integration tests, which drive `openService` with
+`backfill: nil` (production):
+
+- **`TestStateDirLayoutSharesOneMountPoint`** — ingests under a `-state-dir` root,
+  reopens with the backfill disabled, and serves the document after the reopen;
+  the guard does not fire because `corpus/` and `policy/` shared the mount. This
+  is fact 3 in production mode: **the authorization registrations survived on
+  their own.**
+- **`TestOpenServiceRefusesSplitBrainStateDirectory`** — ingests, removes the
+  policy directory (a lost/unmounted policy volume), reopens in production, and
+  asserts the guard refuses.
+
+```console
+$ go test ./cmd/shoal-explore-web/ -run 'SplitBrain|StateDir' -v
+--- PASS: TestOpenServiceRefusesSplitBrainStateDirectory (0.06s)
+--- PASS: TestStateDirLayoutSharesOneMountPoint (0.06s)
+```
+
+### The guard message (what a lost policy volume produces)
+
+Captured by driving the real `openService` guard path (ingest under a state root,
+delete `policy/`, reopen with `backfill: nil`):
+
+```text
+refusing to serve a split-brain workspace: corpus <root>/corpus holds 1
+document(s) but the durable policy catalog <root>/policy holds no authorization
+registrations. This is the signature of a lost or unmounted policy volume; every
+registration was dropped and the workspace would serve an empty or
+under-populated corpus. Restore the policy directory from the same volume as the
+corpus (use -state-dir so both persist under one mount), or, for a corpus
+ingested before the catalog was durable, run once with -dev-auth on a loopback
+listener to re-register it (issue #284)
+```
+
+### Did the guard fire in the restart test?
+
+**No — and that is expected.** The container restart test runs `-dev-auth`, which
+activates the dev backfill and bypasses the guard by design. The guard protects
+the production path (`backfill == nil`), which is currently unreachable from the
+container CLI (it refuses earlier, above) and is exercised by the two tests. If a
+future production deployment mounts only the corpus directory, the guard turns
+that silent misconfiguration into a hard startup refusal with the message above.
 
 ## Shared / cloud instance: shape and open gaps
 
@@ -263,8 +316,10 @@ over:
    `0.0.0.0:<port>` makes the expected authority `0.0.0.0:<port>`, which real
    client `Host` headers won't match. A shared instance needs a configurable
    external authority — a config seam that does not exist yet.
-4. **Durable policy store (#284)** must land before restarts serve a shared
-   corpus without a dev-only backfill.
+4. **Durable policy store (#284 / PR #288) has landed.** The policy catalog now
+   persists, and a split-brain guard refuses to start when the corpus holds
+   documents but the policy catalog is empty (a lost policy volume). Use
+   `-state-dir` so the corpus and policy always persist under one mount.
 
 Until (1) and (3) are addressed, a shared bind either fails closed (no
 authenticator) or rejects requests (host mismatch) — safe, but not yet

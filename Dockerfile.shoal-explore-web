@@ -35,7 +35,7 @@ RUN --mount=type=cache,target=/go/pkg/mod \
     go build -trimpath \
       -ldflags="-s -w -buildid= -X main.version=${VERSION}" \
       -o /out/shoal-explore-web ./cmd/shoal-explore-web \
- && mkdir -p /out/state/corpus
+ && mkdir -p /out/state
 
 FROM gcr.io/distroless/static-debian12:nonroot AS runtime
 
@@ -53,16 +53,15 @@ LABEL org.opencontainers.image.title="shoal-explore-web" \
 
 COPY --from=build /out/shoal-explore-web /usr/local/bin/shoal-explore-web
 # A SINGLE state root holds ALL persistent state and is the declared volume, so
-# one mount survives a restart regardless of how state is subdivided:
-#   /var/lib/shoal/corpus         document corpus (the -data directory)
-#   /var/lib/shoal/corpus-policy  authorization catalog once #284/#288 lands;
-#                                 derived as filepath.Clean(-data)+"-policy",
-#                                 a SIBLING of the corpus, so it must live under
-#                                 the same mounted root and never inside -data
-#                                 (the engine treats every -data subdirectory as
-#                                 a table). See docs/shoal-explore-web-deploy.md.
-# Mounting the corpus directory alone would drop the authorization catalog on
-# restart; mounting the state root keeps both.
+# one mount survives a restart. With -state-dir the command places both
+# directories inside it:
+#   /var/lib/shoal/corpus   document corpus
+#   /var/lib/shoal/policy   durable authorization catalog (#284/#288)
+# The policy catalog must be a sibling of the corpus, never inside it: the
+# corpus engine treats every corpus subdirectory as a table. Mounting the corpus
+# directory alone would drop the authorization catalog on restart and the
+# command's split-brain guard would refuse to serve; mounting the state root
+# keeps both. See docs/shoal-explore-web-deploy.md.
 COPY --from=build --chown=65532:65532 /out/state /var/lib/shoal
 
 WORKDIR /var/lib/shoal
@@ -73,7 +72,8 @@ VOLUME ["/var/lib/shoal"]
 EXPOSE 8098
 STOPSIGNAL SIGTERM
 ENTRYPOINT ["/usr/local/bin/shoal-explore-web"]
-# Safe default: loopback bind with the loopback-gated development authenticator.
-# A public bind (-listen 0.0.0.0:...) with -dev-auth is refused at startup by
-# the command itself; see selectAuthenticator in cmd/shoal-explore-web/authn.go.
-CMD ["-data", "/var/lib/shoal/corpus", "-listen", "127.0.0.1:8098", "-dev-auth"]
+# Safe default: loopback bind with the loopback-gated development authenticator,
+# and the recommended single state root. A public bind (-listen 0.0.0.0:...) with
+# -dev-auth is refused at startup by the command itself; see selectAuthenticator
+# in cmd/shoal-explore-web/authn.go.
+CMD ["-state-dir", "/var/lib/shoal", "-listen", "127.0.0.1:8098", "-dev-auth"]
