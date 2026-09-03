@@ -19,10 +19,12 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"crypto/rsa"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"math/big"
 	"net/http"
 	"net/http/httptest"
@@ -298,6 +300,14 @@ func TestEntraUnrecognisedRoleGetsNoCorpus(t *testing.T) {
 }
 
 // TestEntraRejectsAlgNone proves an unsigned token (alg: none) is rejected.
+// TestEntraRejectsAlgNone proves a token with "alg: none" is rejected, and
+// asserts the *specific* reason: the parser's WithValidMethods allowlist
+// refuses the method before the keyfunc runs, surfacing as
+// jwt.ErrTokenSignatureInvalid. Asserting the reason (not merely "an error
+// occurred") makes this test sensitive to the allowlist: if WithValidMethods
+// is removed, the none token instead reaches the keyfunc and is rejected by the
+// signing-method switch default arm (errUnexpectedSigningMethod, wrapped as
+// ErrTokenUnverifiable), so this assertion fails — the guard is observable.
 func TestEntraRejectsAlgNone(t *testing.T) {
 	issuer := newFakeIssuer(t)
 	now := time.Now()
@@ -309,14 +319,22 @@ func TestEntraRejectsAlgNone(t *testing.T) {
 	if err != nil {
 		t.Fatalf("sign none token: %v", err)
 	}
-	if _, err := authenticator.Authenticate(bearerRequest(signed)); err == nil {
-		t.Fatal("a token with alg: none was accepted")
+	_, err = authenticator.authenticate(bearerRequest(signed))
+	if !errors.Is(err, jwt.ErrTokenSignatureInvalid) {
+		t.Fatalf(
+			"alg:none was not rejected by the method allowlist "+
+				"(want ErrTokenSignatureInvalid): %v", err)
 	}
 }
 
 // TestEntraRejectsAlgorithmConfusion proves an HS256 token whose HMAC secret is
-// the issuer's RSA public key is rejected. Accepting it would be the classic
-// RS256/HS256 confusion bypass.
+// the issuer's RSA public key is rejected — the classic RS256/HS256 confusion
+// bypass. Like the alg:none test, it asserts the specific reason so the guard
+// is observable: WithValidMethods refuses HS256 before the keyfunc, surfacing
+// as jwt.ErrTokenSignatureInvalid. Remove that allowlist and the forged token
+// reaches the keyfunc, which rejects it via the default arm with a *different*
+// error (errUnexpectedSigningMethod / ErrTokenUnverifiable) — failing this
+// assertion. So deleting either algorithm guard changes an observable outcome.
 func TestEntraRejectsAlgorithmConfusion(t *testing.T) {
 	issuer := newFakeIssuer(t)
 	now := time.Now()
@@ -332,13 +350,60 @@ func TestEntraRejectsAlgorithmConfusion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("sign HS256 token: %v", err)
 	}
-	if _, err := authenticator.Authenticate(bearerRequest(forged)); err == nil {
-		t.Fatal("an HS256 algorithm-confusion token was accepted")
+	_, err = authenticator.authenticate(bearerRequest(forged))
+	if !errors.Is(err, jwt.ErrTokenSignatureInvalid) {
+		t.Fatalf(
+			"HS256 confusion token was not rejected by the method allowlist "+
+				"(want ErrTokenSignatureInvalid): %v", err)
+	}
+}
+
+// TestEntraKeyfuncRejectsMismatchedSigningMethod exercises the *second*
+// algorithm guard directly: the keyfunc's signing-method switch. WithValidMethods
+// short-circuits real requests before the keyfunc for a disallowed method, so
+// the switch's default arm is only reachable by calling the keyfunc directly
+// with a fabricated token. This test does exactly that, asserting the specific
+// sentinels, so deleting the default arm (an HMAC method would then be handed
+// the RSA key — the algorithm-confusion hole) fails this test, and deleting the
+// key-type bind fails the second assertion.
+func TestEntraKeyfuncRejectsMismatchedSigningMethod(t *testing.T) {
+	issuer := newFakeIssuer(t)
+	now := time.Now()
+	authenticator := newTestAuthenticator(t, issuer.testConfig(fixedClock(now)))
+
+	// Prime the JWKS cache with the issuer's real RSA key for testKID.
+	valid := issuer.signRS256(t, testKID, issuer.defaultClaims(now))
+	if _, err := authenticator.authenticate(bearerRequest(valid)); err != nil {
+		t.Fatalf("priming token unexpectedly rejected: %v", err)
+	}
+
+	keyFunc := authenticator.keyFuncForContext(context.Background())
+
+	hmacToken := &jwt.Token{
+		Header: map[string]interface{}{"alg": "HS256", "kid": testKID},
+		Method: jwt.SigningMethodHS256,
+	}
+	if _, err := keyFunc(hmacToken); !errors.Is(err, errUnexpectedSigningMethod) {
+		t.Fatalf(
+			"keyfunc did not reject an HMAC method via the switch default arm "+
+				"(want errUnexpectedSigningMethod): %v", err)
+	}
+
+	ecToken := &jwt.Token{
+		Header: map[string]interface{}{"alg": "ES256", "kid": testKID},
+		Method: jwt.SigningMethodES256,
+	}
+	if _, err := keyFunc(ecToken); !errors.Is(err, errKeyMethodMismatch) {
+		t.Fatalf(
+			"keyfunc did not reject an ECDSA method against an RSA key "+
+				"(want errKeyMethodMismatch): %v", err)
 	}
 }
 
 // TestEntraRejectsWrongAudience proves a token addressed to another application
-// is rejected.
+// is rejected. The audience check is owned by the library (configured via
+// jwt.WithAudience); this test asserts the specific ErrTokenInvalidAudience so
+// it fails if that option is removed rather than passing on any error.
 func TestEntraRejectsWrongAudience(t *testing.T) {
 	issuer := newFakeIssuer(t)
 	now := time.Now()
@@ -346,14 +411,18 @@ func TestEntraRejectsWrongAudience(t *testing.T) {
 
 	claims := issuer.defaultClaims(now)
 	claims["aud"] = "some-other-client-id"
-	if _, err := authenticator.Authenticate(
-		bearerRequest(issuer.signRS256(t, testKID, claims))); err == nil {
-		t.Fatal("a token with the wrong audience was accepted")
+	_, err := authenticator.authenticate(
+		bearerRequest(issuer.signRS256(t, testKID, claims)))
+	if !errors.Is(err, jwt.ErrTokenInvalidAudience) {
+		t.Fatalf(
+			"wrong audience not rejected as such "+
+				"(want ErrTokenInvalidAudience): %v", err)
 	}
 }
 
 // TestEntraRejectsWrongIssuer proves a token minted by another issuer is
-// rejected even if it is otherwise well formed.
+// rejected even if it is otherwise well formed. The issuer check is owned by
+// the library (jwt.WithIssuer); this asserts the specific ErrTokenInvalidIssuer.
 func TestEntraRejectsWrongIssuer(t *testing.T) {
 	issuer := newFakeIssuer(t)
 	now := time.Now()
@@ -361,14 +430,19 @@ func TestEntraRejectsWrongIssuer(t *testing.T) {
 
 	claims := issuer.defaultClaims(now)
 	claims["iss"] = "https://login.microsoftonline.com/evil/v2.0"
-	if _, err := authenticator.Authenticate(
-		bearerRequest(issuer.signRS256(t, testKID, claims))); err == nil {
-		t.Fatal("a token with the wrong issuer was accepted")
+	_, err := authenticator.authenticate(
+		bearerRequest(issuer.signRS256(t, testKID, claims)))
+	if !errors.Is(err, jwt.ErrTokenInvalidIssuer) {
+		t.Fatalf(
+			"wrong issuer not rejected as such "+
+				"(want ErrTokenInvalidIssuer): %v", err)
 	}
 }
 
 // TestEntraRejectsExpiredToken proves a token expired beyond the skew is
 // rejected, while TestEntraAcceptsWithinClockSkew proves the skew is honoured.
+// Expiry is owned by the library (jwt.WithExpirationRequired + WithLeeway);
+// this asserts the specific ErrTokenExpired.
 func TestEntraRejectsExpiredToken(t *testing.T) {
 	issuer := newFakeIssuer(t)
 	now := time.Now()
@@ -376,9 +450,10 @@ func TestEntraRejectsExpiredToken(t *testing.T) {
 
 	claims := issuer.defaultClaims(now)
 	claims["exp"] = now.Add(-2 * time.Hour).Unix()
-	if _, err := authenticator.Authenticate(
-		bearerRequest(issuer.signRS256(t, testKID, claims))); err == nil {
-		t.Fatal("an expired token was accepted")
+	_, err := authenticator.authenticate(
+		bearerRequest(issuer.signRS256(t, testKID, claims)))
+	if !errors.Is(err, jwt.ErrTokenExpired) {
+		t.Fatalf("expired token not rejected as such (want ErrTokenExpired): %v", err)
 	}
 }
 
@@ -398,7 +473,8 @@ func TestEntraAcceptsWithinClockSkew(t *testing.T) {
 }
 
 // TestEntraRejectsNotYetValid proves a token whose nbf is in the future is
-// rejected.
+// rejected. The nbf check is owned by the library; this asserts the specific
+// ErrTokenNotValidYet.
 func TestEntraRejectsNotYetValid(t *testing.T) {
 	issuer := newFakeIssuer(t)
 	now := time.Now()
@@ -406,15 +482,20 @@ func TestEntraRejectsNotYetValid(t *testing.T) {
 
 	claims := issuer.defaultClaims(now)
 	claims["nbf"] = now.Add(2 * time.Hour).Unix()
-	if _, err := authenticator.Authenticate(
-		bearerRequest(issuer.signRS256(t, testKID, claims))); err == nil {
-		t.Fatal("a not-yet-valid token was accepted")
+	_, err := authenticator.authenticate(
+		bearerRequest(issuer.signRS256(t, testKID, claims)))
+	if !errors.Is(err, jwt.ErrTokenNotValidYet) {
+		t.Fatalf(
+			"not-yet-valid token not rejected as such "+
+				"(want ErrTokenNotValidYet): %v", err)
 	}
 }
 
 // TestEntraRejectsBadSignature proves a token whose signature does not verify
 // against the advertised key is rejected. The kid names a real key, but the
-// token is signed by a different key.
+// token is signed by a different key. Signature verification is owned by the
+// library once the keyfunc supplies the correct key; this asserts the specific
+// ErrTokenSignatureInvalid so it fails if verification is somehow bypassed.
 func TestEntraRejectsBadSignature(t *testing.T) {
 	issuer := newFakeIssuer(t)
 	now := time.Now()
@@ -430,8 +511,11 @@ func TestEntraRejectsBadSignature(t *testing.T) {
 	if err != nil {
 		t.Fatalf("sign forged token: %v", err)
 	}
-	if _, err := authenticator.Authenticate(bearerRequest(forged)); err == nil {
-		t.Fatal("a token with an invalid signature was accepted")
+	_, err = authenticator.authenticate(bearerRequest(forged))
+	if !errors.Is(err, jwt.ErrTokenSignatureInvalid) {
+		t.Fatalf(
+			"bad signature not rejected as such "+
+				"(want ErrTokenSignatureInvalid): %v", err)
 	}
 }
 
@@ -447,8 +531,11 @@ func TestEntraUnknownKidDoesNotStorm(t *testing.T) {
 	for i := 0; i < 50; i++ {
 		claims := issuer.defaultClaims(now)
 		token := issuer.signRS256(t, "unknown-kid", claims)
-		if _, err := authenticator.Authenticate(bearerRequest(token)); err == nil {
-			t.Fatal("a token with an unknown key identifier was accepted")
+		_, err := authenticator.authenticate(bearerRequest(token))
+		if !errors.Is(err, errNoMatchingKey) {
+			t.Fatalf(
+				"unknown key identifier not rejected by our key lookup "+
+					"(want errNoMatchingKey): %v", err)
 		}
 	}
 	if hits := issuer.discoveryCount(); hits > 1 {
@@ -522,6 +609,16 @@ func TestEntraErrorNeverContainsRawToken(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), valid) {
 		t.Fatalf("error echoed the raw token: %v", err)
+	}
+
+	// The internal path returns the specific reason; assert even that
+	// token-free error never embeds the credential.
+	_, internalErr := authenticator.authenticate(bearerRequest(valid))
+	if internalErr == nil {
+		t.Fatal("a wrong-audience token was accepted on the internal path")
+	}
+	if strings.Contains(internalErr.Error(), valid) {
+		t.Fatalf("specific error echoed the raw token: %v", internalErr)
 	}
 }
 

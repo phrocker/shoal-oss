@@ -88,6 +88,45 @@ var supportedEntraAlgorithms = map[string]struct{}{
 	"ES256": {}, "ES384": {}, "ES512": {},
 }
 
+// Package-level sentinel errors are returned by the internal validation path so
+// a test can assert the *specific* reason a token was rejected, not merely that
+// some error occurred. They are stable pointer identities; errors.Is matches
+// them by identity because shoal.Error defines no Is method. The public
+// Authenticate method never returns these directly: it collapses every failure
+// to a generic denial (see entraDenied) so no reason and no token-derived
+// detail crosses the trust boundary. These carry only fixed strings and never
+// embed the raw token.
+var (
+	// errMissingBearer is returned when no usable bearer credential is present.
+	errMissingBearer = shoal.NewError(
+		shoal.ErrorUnauthorized, "authorization bearer token is required")
+	// errMissingKeyID is returned when the token header carries no key id.
+	errMissingKeyID = shoal.NewError(
+		shoal.ErrorUnauthorized, "token is missing a key identifier")
+	// errUnexpectedSigningMethod is returned by the keyfunc's signing-method
+	// switch default arm: the resolved method is not one of the accepted
+	// asymmetric families. This is one of the two independent algorithm guards
+	// (the other is the parser's WithValidMethods allowlist).
+	errUnexpectedSigningMethod = shoal.NewError(
+		shoal.ErrorUnauthorized, "unexpected token signing method")
+	// errKeyMethodMismatch is returned when the resolved key type does not
+	// match the token's signing-method family (e.g. an RSA method resolving a
+	// non-RSA key).
+	errKeyMethodMismatch = shoal.NewError(
+		shoal.ErrorUnauthorized, "signing key does not match the signing method")
+	// errNoMatchingKey is returned when no signing key matches the token's key
+	// identifier, including when the fetch-storm guard refuses a fresh fetch.
+	errNoMatchingKey = shoal.NewError(
+		shoal.ErrorUnauthorized, "no signing key matches the token key identifier")
+	// errMissingSubject is returned when a verified token carries no usable
+	// subject or object identifier.
+	errMissingSubject = shoal.NewError(
+		shoal.ErrorUnauthorized, "token has no usable subject")
+	// errMissingExpiry is returned when a verified token carries no expiry.
+	errMissingExpiry = shoal.NewError(
+		shoal.ErrorUnauthorized, "token has no expiry")
+)
+
 // entraReaderOperations is the authority granted to a mapped reader. It permits
 // discovery and retrieval but not ingestion.
 var entraReaderOperations = []auth.Operation{
@@ -163,14 +202,13 @@ func (c entraConfig) configured() bool {
 // entraAuthenticator validates Entra bearer tokens against the issuer's JWKS
 // and mints a conservatively-scoped decision per request.
 type entraAuthenticator struct {
-	parser            *jwt.Parser
-	keys              *jwksCache
-	expectedIssuer    string
-	expectedAudience  string
-	allowedAlgorithms map[string]struct{}
-	readerRoles       map[string]struct{}
-	contributorRoles  map[string]struct{}
-	clock             func() time.Time
+	parser           *jwt.Parser
+	keys             *jwksCache
+	expectedIssuer   string
+	expectedAudience string
+	readerRoles      map[string]struct{}
+	contributorRoles map[string]struct{}
+	clock            func() time.Time
 }
 
 func newEntraAuthenticator(
@@ -255,12 +293,11 @@ func newEntraAuthenticator(
 			clock:              clock,
 			minRefreshInterval: entraJWKSMinRefreshInterval,
 		},
-		expectedIssuer:    issuer,
-		expectedAudience:  audience,
-		allowedAlgorithms: algorithms,
-		readerRoles:       readerRoles,
-		contributorRoles:  contributorRoles,
-		clock:             clock,
+		expectedIssuer:   issuer,
+		expectedAudience: audience,
+		readerRoles:      readerRoles,
+		contributorRoles: contributorRoles,
+		clock:            clock,
 	}, nil
 }
 
@@ -303,8 +340,30 @@ func normalizeRoleSet(flagName string, configured []string) (map[string]struct{}
 }
 
 // Authenticate validates the request's bearer token and mints one decision. It
-// never logs, echoes, or embeds the raw token in any returned error.
+// is the trust boundary: it collapses every validation failure to a single
+// generic denial so no rejection reason and no token-derived detail (least of
+// all the raw token) can cross into an error, log line, or HTTP response. The
+// specific, token-free reason is available to in-package tests via authenticate.
 func (a *entraAuthenticator) Authenticate(
+	request *http.Request,
+) (auth.Decision, error) {
+	decision, err := a.authenticate(request)
+	if err != nil {
+		if shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
+			// A programming error (e.g. a nil request) is not an authentication
+			// failure; surface it as-is. It never contains a token.
+			return auth.Decision{}, err
+		}
+		return auth.Decision{}, entraDenied()
+	}
+	return decision, nil
+}
+
+// authenticate performs the real validation and returns the specific,
+// token-free reason on failure. It is unexported and used by Authenticate and
+// by in-package tests that assert *which* guard rejected a token. None of the
+// errors it returns embed the raw token.
+func (a *entraAuthenticator) authenticate(
 	request *http.Request,
 ) (auth.Decision, error) {
 	if request == nil {
@@ -319,50 +378,48 @@ func (a *entraAuthenticator) Authenticate(
 	claims := &entraClaims{}
 	keyFunc := a.keyFuncForContext(ctx)
 	if _, err := a.parser.ParseWithClaims(raw, claims, keyFunc); err != nil {
-		// The library error can reference claim values but never the raw
-		// token; we still return a generic denial so no token-derived detail
-		// crosses the boundary.
-		return auth.Decision{}, entraDenied()
+		return auth.Decision{}, err
 	}
 	return a.mint(claims)
 }
 
 // keyFuncForContext returns a jwt.Keyfunc bound to the request context so JWKS
 // fetches honour request cancellation.
+//
+// Algorithm safety rests on two independent, observable layers and neither is
+// this keyfunc re-checking the header algorithm string (a third, redundant
+// check would silently absorb the loss of either real layer, which is exactly
+// how an algorithm-confusion test can pass while proving nothing):
+//
+//  1. The parser's jwt.WithValidMethods allowlist rejects any token whose
+//     algorithm is outside the configured asymmetric set (HS*, none, ...)
+//     before this keyfunc is ever called.
+//  2. The signing-method switch below binds the resolved key type to the
+//     method family and its default arm rejects anything else. If the
+//     allowlist were removed, a forged HS256 token would reach here and this
+//     switch would reject it via the default arm — a different, assertable
+//     reason, so removing either layer changes an observable outcome.
 func (a *entraAuthenticator) keyFuncForContext(ctx context.Context) jwt.Keyfunc {
 	return func(token *jwt.Token) (interface{}, error) {
-		algorithm, _ := token.Header["alg"].(string)
-		if _, ok := a.allowedAlgorithms[algorithm]; !ok {
-			return nil, shoal.NewError(
-				shoal.ErrorUnauthorized, "unexpected signing algorithm")
-		}
 		kid, _ := token.Header["kid"].(string)
 		if strings.TrimSpace(kid) == "" {
-			return nil, shoal.NewError(
-				shoal.ErrorUnauthorized, "token is missing a key identifier")
+			return nil, errMissingKeyID
 		}
 		key, err := a.keys.keyForID(ctx, kid)
 		if err != nil {
 			return nil, err
 		}
-		// Bind the key type to the signing method family. Even though the
-		// method is already restricted to the asymmetric allowlist, this makes
-		// an algorithm-confusion attempt fail closed a second way: an RSA
-		// method must resolve an RSA key and an ECDSA method an ECDSA key.
 		switch token.Method.(type) {
 		case *jwt.SigningMethodRSA, *jwt.SigningMethodRSAPSS:
 			if _, ok := key.(*rsa.PublicKey); !ok {
-				return nil, shoal.NewError(
-					shoal.ErrorUnauthorized, "key does not match signing method")
+				return nil, errKeyMethodMismatch
 			}
 		case *jwt.SigningMethodECDSA:
 			if _, ok := key.(*ecdsa.PublicKey); !ok {
-				return nil, shoal.NewError(
-					shoal.ErrorUnauthorized, "key does not match signing method")
+				return nil, errKeyMethodMismatch
 			}
 		default:
-			return nil, shoal.NewError(
-				shoal.ErrorUnauthorized, "unexpected signing method")
+			return nil, errUnexpectedSigningMethod
 		}
 		return key, nil
 	}
@@ -372,11 +429,11 @@ func (a *entraAuthenticator) keyFuncForContext(ctx context.Context) jwt.Keyfunc 
 func (a *entraAuthenticator) mint(claims *entraClaims) (auth.Decision, error) {
 	subject := claims.subject()
 	if subject == "" {
-		return auth.Decision{}, entraDenied()
+		return auth.Decision{}, errMissingSubject
 	}
 	expiry := claims.expiry()
 	if expiry.IsZero() {
-		return auth.Decision{}, entraDenied()
+		return auth.Decision{}, errMissingExpiry
 	}
 	operations, sources, policies := a.authority(claims.Roles)
 	requestID, err := newEntraRequestID()
@@ -464,20 +521,20 @@ func (c *entraClaims) expiry() time.Time {
 }
 
 // bearerToken extracts the bearer credential from the Authorization header. It
-// returns a generic denial that never contains the token.
+// returns a token-free sentinel that never contains the credential.
 func bearerToken(request *http.Request) (string, error) {
 	header := request.Header.Get("Authorization")
 	if header == "" {
-		return "", entraDenied()
+		return "", errMissingBearer
 	}
 	const prefix = "bearer "
 	if len(header) <= len(prefix) ||
 		!strings.EqualFold(header[:len(prefix)], prefix) {
-		return "", entraDenied()
+		return "", errMissingBearer
 	}
 	token := strings.TrimSpace(header[len(prefix):])
 	if token == "" {
-		return "", entraDenied()
+		return "", errMissingBearer
 	}
 	return token, nil
 }
@@ -531,8 +588,7 @@ func (c *jwksCache) keyForID(
 	if c.fetched && now.Sub(c.lastAttempt) < c.minRefreshInterval {
 		// Refuse rather than fetch: a recent attempt already ran, so an
 		// unknown key identifier fails closed instead of triggering a storm.
-		return nil, shoal.NewError(
-			shoal.ErrorUnauthorized, "no signing key matches the token")
+		return nil, errNoMatchingKey
 	}
 	c.lastAttempt = now
 	c.fetched = true
@@ -544,8 +600,7 @@ func (c *jwksCache) keyForID(
 	if key, ok := keys[kid]; ok {
 		return key, nil
 	}
-	return nil, shoal.NewError(
-		shoal.ErrorUnauthorized, "no signing key matches the token")
+	return nil, errNoMatchingKey
 }
 
 // fetch resolves the JWKS URI (via static override or OIDC discovery) and loads
