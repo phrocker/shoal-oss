@@ -273,7 +273,8 @@ func (r DocumentsResponse) MarshalJSON() ([]byte, error) {
 		Snapshot   Snapshot `json:"snapshot"`
 		Documents  []any    `json:"documents"`
 		NextCursor string   `json:"next_cursor,omitempty"`
-	}{r.Snapshot, documents, r.NextCursor})
+		Suppressed uint32   `json:"suppressed,omitempty"`
+	}{r.Snapshot, documents, r.NextCursor, r.Suppressed})
 }
 
 func (r *DocumentsResponse) UnmarshalJSON(data []byte) error {
@@ -286,6 +287,7 @@ func (r *DocumentsResponse) UnmarshalJSON(data []byte) error {
 			SourceMediaType string       `json:"source_media_type,omitempty"`
 		} `json:"documents"`
 		NextCursor string `json:"next_cursor,omitempty"`
+		Suppressed uint32 `json:"suppressed,omitempty"`
 	}
 	if err := strictUnmarshal(data, &wire); err != nil {
 		return err
@@ -307,6 +309,7 @@ func (r *DocumentsResponse) UnmarshalJSON(data []byte) error {
 	}
 	*r = DocumentsResponse{
 		Snapshot: wire.Snapshot, Documents: documents, NextCursor: wire.NextCursor,
+		Suppressed: wire.Suppressed,
 	}
 	return nil
 }
@@ -392,12 +395,13 @@ func (r RetrievalResponse) MarshalJSON() ([]byte, error) {
 		})
 	}
 	return json.Marshal(struct {
-		Snapshot  Snapshot `json:"snapshot"`
-		Retrieval any      `json:"retrieval"`
+		Snapshot   Snapshot `json:"snapshot"`
+		Retrieval  any      `json:"retrieval"`
+		Suppressed uint32   `json:"suppressed,omitempty"`
 	}{r.Snapshot, struct {
 		RequestID string `json:"request_id,omitempty"`
 		Results   []any  `json:"results"`
-	}{encodeOptionalID(r.Retrieval.RequestID), results}})
+	}{encodeOptionalID(r.Retrieval.RequestID), results}, r.Suppressed})
 }
 
 func (r *RetrievalResponse) UnmarshalJSON(data []byte) error {
@@ -417,6 +421,7 @@ func (r *RetrievalResponse) UnmarshalJSON(data []byte) error {
 				Explanation *wireExplanation `json:"explanation,omitempty"`
 			} `json:"results"`
 		} `json:"retrieval"`
+		Suppressed uint32 `json:"suppressed,omitempty"`
 	}
 	if err := strictUnmarshal(data, &wire); err != nil {
 		return err
@@ -452,8 +457,9 @@ func (r *RetrievalResponse) UnmarshalJSON(data []byte) error {
 		})
 	}
 	*r = RetrievalResponse{
-		Snapshot:  wire.Snapshot,
-		Retrieval: retrieval.Response{RequestID: requestID, Results: results},
+		Snapshot:   wire.Snapshot,
+		Retrieval:  retrieval.Response{RequestID: requestID, Results: results},
+		Suppressed: wire.Suppressed,
 	}
 	return nil
 }

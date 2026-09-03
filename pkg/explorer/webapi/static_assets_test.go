@@ -220,6 +220,96 @@ const scenario = await runScenario({documents: true, document: true});
 assert.strictEqual(scenario.ids["documents-status"].className, "empty-state");
 assert.match(scenario.ids["documents-status"].textContent, /No documents are visible/);
 assert.match(scenario.ids["documents-status"].textContent, /development-principal@localhost/);
+assert.match(scenario.ids["documents-status"].textContent, /No documents were withheld/);
+`)
+}
+
+func TestStaticWorkspaceSuppressionClauseDistinguishesThreeCounts(t *testing.T) {
+	runNodeUITest(t, `
+const scenario = await runScenario({documents: true, retrieve: true});
+const identity = {authenticated: true, subject: "alice@localhost", operations: ["retrieve"]};
+
+const none = scenario.ctx.suppressionClause(0, identity);
+assert.match(none, /No documents were withheld/);
+assert.match(none, /alice@localhost/);
+assert.doesNotMatch(none, /[1-9]/);
+
+const one = scenario.ctx.suppressionClause(1, identity);
+assert.match(one, /1 document is withheld/);
+assert.match(one, /not a confirmation that nothing exists/);
+assert.match(one, /alice@localhost/);
+
+const many = scenario.ctx.suppressionClause(3, identity);
+assert.match(many, /3 documents are withheld/);
+
+// The three states must never render identically.
+assert.notStrictEqual(none, one);
+assert.notStrictEqual(one, many);
+`)
+}
+
+func TestStaticWorkspaceRetrievalReportsWithheldContext(t *testing.T) {
+	runNodeUITest(t, `
+// State 1: results, nothing withheld.
+const clean = await runScenario(
+  {documents: true, retrieve: true}, [],
+  {retrievalResults: [{id: "span-1", score: 0.9, evidence: []}], retrievalSuppressed: 0});
+clean.ids.query.value = "alpha";
+await clean.ids.search.onsubmit({preventDefault() {}});
+assert.strictEqual(clean.ids["evidence-status"].className, "muted");
+assert.match(clean.ids["evidence-status"].textContent, /Showing 1 evidence result/);
+assert.match(clean.ids["evidence-status"].textContent, /No documents were withheld/);
+
+// State 2: results, some withheld.
+const some = await runScenario(
+  {documents: true, retrieve: true}, [],
+  {retrievalResults: [{id: "span-1", score: 0.9, evidence: []}], retrievalSuppressed: 2});
+some.ids.query.value = "alpha";
+await some.ids.search.onsubmit({preventDefault() {}});
+assert.strictEqual(some.ids["evidence-status"].className, "withheld");
+assert.match(some.ids["evidence-status"].textContent, /Showing 1 evidence result/);
+assert.match(some.ids["evidence-status"].textContent, /2 documents are withheld/);
+assert.strictEqual(some.ids["evidence-results"].children.length, 1);
+
+// State 3: no results, yet withheld — the case that used to read as flat empty.
+const only = await runScenario(
+  {documents: true, retrieve: true}, [],
+  {retrievalResults: [], retrievalSuppressed: 4});
+only.ids.query.value = "alpha";
+await only.ids.search.onsubmit({preventDefault() {}});
+assert.strictEqual(only.ids["evidence-status"].className, "withheld");
+assert.match(only.ids["evidence-status"].textContent, /No evidence matched/);
+assert.match(only.ids["evidence-status"].textContent, /4 documents are withheld/);
+assert.strictEqual(only.ids["evidence-results"].children.length, 0);
+
+// The withheld state must be visually distinct from both a denial and a plain
+// empty result.
+assert.notStrictEqual(only.ids["evidence-status"].className, "denied");
+assert.notStrictEqual(only.ids["evidence-status"].className, "empty-state");
+`)
+}
+
+func TestStaticWorkspaceDocumentsReportWithheldContext(t *testing.T) {
+	runNodeUITest(t, `
+// No visible documents but some withheld.
+const onlyWithheld = await runScenario(
+  {documents: true, document: true}, [], {documentsSuppressed: 5});
+assert.strictEqual(onlyWithheld.ids["documents-status"].className, "withheld");
+assert.match(onlyWithheld.ids["documents-status"].textContent, /No documents are visible/);
+assert.match(onlyWithheld.ids["documents-status"].textContent, /5 documents are withheld/);
+
+// Visible documents plus some withheld.
+const visibleDocs = [{
+  document: {id: "doc-1", title: "Visible"},
+  revision: {id: "rev-1"},
+  source_uri: "file:///visible.txt",
+}];
+const mixed = await runScenario(
+  {documents: true, document: true}, [],
+  {documentResponses: [visibleDocs], documentsSuppressed: 1});
+assert.strictEqual(mixed.ids["documents-status"].className, "withheld");
+assert.match(mixed.ids["documents-status"].textContent, /Showing 1 document/);
+assert.match(mixed.ids["documents-status"].textContent, /1 document is withheld/);
 `)
 }
 
@@ -289,7 +379,8 @@ const app = fs.readFileSync("static/app.js", "utf8") +
   "\nthis.isDenied = isDenied;" +
   "\nthis.deniedText = deniedText;" +
   "\nthis.emptyRetrievalText = emptyRetrievalText;" +
-  "\nthis.emptyDocumentsText = emptyDocumentsText;";
+  "\nthis.emptyDocumentsText = emptyDocumentsText;" +
+  "\nthis.suppressionClause = suppressionClause;";
 
 class ClassList {
   constructor(element) { this.element = element; }
@@ -482,7 +573,10 @@ async function runScenario(capabilities, documents = [], scenarioOptions = {}) {
         const docs = sequence[Math.min(documentCalls, sequence.length - 1)];
         const documentSnapshot = scenarioOptions.documentSnapshot || snapshot;
         documentCalls++;
-        return response({snapshot: documentSnapshot, documents: docs, next_cursor: ""});
+        return response({
+          snapshot: documentSnapshot, documents: docs, next_cursor: "",
+          suppressed: scenarioOptions.documentsSuppressed || 0,
+        });
       }
       if (url === "/api/v1/ingest") {
         uploadRequest = {url, options: requestOptions};
@@ -502,7 +596,11 @@ async function runScenario(capabilities, documents = [], scenarioOptions = {}) {
             statusText: scenarioOptions.retrieveError.statusText || "Error",
           });
         }
-        return response({snapshot, retrieval: {results: scenarioOptions.retrievalResults || []}});
+        return response({
+          snapshot,
+          retrieval: {results: scenarioOptions.retrievalResults || []},
+          suppressed: scenarioOptions.retrievalSuppressed || 0,
+        });
       }
       throw new Error("unexpected fetch " + url);
     },

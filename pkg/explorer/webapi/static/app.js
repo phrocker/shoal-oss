@@ -78,17 +78,39 @@ function deniedText(action, identity) {
 
 // emptyRetrievalText describes a genuine empty match while making the
 // identity scope explicit, because the server filters unauthorized content
-// silently and never reports how much it withheld.
+// silently. Whether context was withheld is stated separately by
+// suppressionClause, so this text no longer claims nothing was withheld.
 function emptyRetrievalText(identity) {
   return `No evidence matched for ${identitySubjectLabel(identity)}. ` +
     `Results are scoped to this identity; content you are not authorized to see ` +
-    `is never included or counted here.`;
+    `is never included here.`;
 }
 
 function emptyDocumentsText(identity) {
   return `No documents are visible to ${identitySubjectLabel(identity)}. ` +
     `The corpus is shared and filtered per identity, so this may mean nothing ` +
     `was ingested or that nothing here is authorized for you.`;
+}
+
+// suppressionClause states, in plain language, whether authorization withheld
+// context from this identity. It reveals only a count: the server discloses how
+// many documents were withheld and never what they are. The zero case is stated
+// explicitly so the three states — results with nothing withheld, results with
+// some withheld, and nothing-but-withheld — never read the same. The wording is
+// careful not to overclaim: a positive count is withheld context, never a claim
+// that nothing exists, and it is scoped to authorization withholding, which is
+// the only thing the server counts.
+function suppressionClause(count, identity) {
+  const withheld = Number(count) || 0;
+  const who = identitySubjectLabel(identity);
+  if (withheld <= 0) {
+    return ` No documents were withheld from ${who} by authorization.`;
+  }
+  const noun = withheld === 1 ? "document" : "documents";
+  const verb = withheld === 1 ? "is" : "are";
+  return ` ${withheld} ${noun} ${verb} withheld from ${who} by authorization and ` +
+    `not shown. This counts withheld context and is not a confirmation that ` +
+    `nothing exists; nothing about the withheld ${noun} is disclosed.`;
 }
 
 async function loadMeta() {
@@ -402,10 +424,20 @@ async function loadDocuments(reset = true) {
     pin(response.snapshot);
     if (reset) $("documents").replaceChildren();
     const documents = response.documents || [];
+    const suppressed = response.suppressed || 0;
     if (documents.length === 0 && reset) {
-      setStatus($("documents-status"), emptyDocumentsText(state.identity), "empty-state");
+      setStatus(
+        $("documents-status"),
+        emptyDocumentsText(state.identity) + suppressionClause(suppressed, state.identity),
+        suppressed > 0 ? "withheld" : "empty-state",
+      );
     } else {
-      setStatus($("documents-status"), `Showing ${$("documents").children.length + documents.length} document(s).`);
+      const total = $("documents").children.length + documents.length;
+      setStatus(
+        $("documents-status"),
+        `Showing ${total} document(s).` + suppressionClause(suppressed, state.identity),
+        suppressed > 0 ? "withheld" : "muted",
+      );
     }
     const fragment = document.createDocumentFragment();
     for (const item of documents) fragment.append(createDocumentCard(item));
@@ -740,7 +772,7 @@ $("search").onsubmit = async (event) => {
     });
     if (generation !== searchGeneration) return;
     pin(response.snapshot);
-    renderEvidence(response.retrieval);
+    renderEvidence(response.retrieval, response.suppressed || 0);
   } catch (error) {
     if (generation === searchGeneration) {
       $("evidence-results").replaceChildren();
@@ -749,15 +781,25 @@ $("search").onsubmit = async (event) => {
   }
 };
 
-function renderEvidence(response) {
+function renderEvidence(response, suppressed = 0) {
   const results = response.results || [];
+  const withheld = Number(suppressed) || 0;
   if (results.length === 0) {
     $("evidence-results").replaceChildren();
-    setStatus($("evidence-status"), emptyRetrievalText(state.identity), "empty-state");
+    setStatus(
+      $("evidence-status"),
+      emptyRetrievalText(state.identity) + suppressionClause(withheld, state.identity),
+      withheld > 0 ? "withheld" : "empty-state",
+    );
     draw();
     return;
   }
-  setStatus($("evidence-status"), `Showing ${results.length} evidence result(s).`);
+  setStatus(
+    $("evidence-status"),
+    `Showing ${results.length} evidence result(s).` +
+      suppressionClause(withheld, state.identity),
+    withheld > 0 ? "withheld" : "muted",
+  );
   const fragment = document.createDocumentFragment();
   results.forEach((result) => {
     const element = document.createElement("article");

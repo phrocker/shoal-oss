@@ -33,6 +33,31 @@ import (
 func (c *Client) Documents(
 	ctx context.Context,
 ) ([]explorer.DocumentSummary, error) {
+	var suppressed uint32
+	return c.documents(ctx, &suppressed)
+}
+
+// DocumentsWithSuppressed lists the same authorized documents as Documents and
+// additionally reports how many current documents this identity was denied and
+// therefore never listed. The count comes from the exact same authorization
+// gate Documents enforces; it is reporting only and never changes which
+// summaries are returned. See the counting site in documents and the webapi
+// emission point for the amplification risk this disclosure carries.
+func (c *Client) DocumentsWithSuppressed(
+	ctx context.Context,
+) ([]explorer.DocumentSummary, uint32, error) {
+	var suppressed uint32
+	summaries, err := c.documents(ctx, &suppressed)
+	if err != nil {
+		return nil, 0, err
+	}
+	return summaries, suppressed, nil
+}
+
+func (c *Client) documents(
+	ctx context.Context,
+	suppressed *uint32,
+) ([]explorer.DocumentSummary, error) {
 	decision, guard, now, err := c.begin(ctx, auth.OperationList)
 	if err != nil {
 		return nil, err
@@ -51,7 +76,20 @@ func (c *Client) Documents(
 		if err != nil {
 			return nil, policyCatalogReadError(ctx, err)
 		}
-		if !ok || registration.RevisionID != summary.Revision.ID {
+		if !ok {
+			// A document present in the corpus but covered by no policy grant
+			// is withheld from every caller: that is an authorization outcome,
+			// so it is counted. This is deliberately asymmetric with the
+			// stale-revision drop just below, which is an availability lag, not
+			// a policy decision about this caller, and is not counted. Counting
+			// !ok is also the signal that reveals a lost or empty policy
+			// catalog, where the corpus is intact but every document falls
+			// through here; without it a fully withheld corpus would read as
+			// "nothing withheld". The record is still dropped exactly as before.
+			*suppressed++
+			continue
+		}
+		if registration.RevisionID != summary.Revision.ID {
 			continue
 		}
 		allowed, err := ruleAllows(
@@ -60,6 +98,11 @@ func (c *Client) Documents(
 			return nil, err
 		}
 		if !allowed {
+			// Accounting beside the enforcement branch, not within it: the
+			// record is still dropped exactly as before. Counting a document
+			// the identity's rule denies is unambiguous authorization
+			// suppression, alongside the missing-grant case counted above.
+			*suppressed++
 			continue
 		}
 		view, err := c.base.Document(

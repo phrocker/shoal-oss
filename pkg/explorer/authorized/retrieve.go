@@ -33,6 +33,33 @@ func (c *Client) Retrieve(
 	ctx context.Context,
 	request retrieval.Request,
 ) (retrieval.Response, error) {
+	var suppressed uint32
+	return c.retrieve(ctx, request, &suppressed)
+}
+
+// RetrieveWithSuppressed performs the identical authorized retrieval as
+// Retrieve and additionally reports how many current documents this identity
+// was denied and therefore never searched. The count is derived from the exact
+// same authorization gate Retrieve enforces; it is reporting only and never
+// changes which results are returned. See the counting site in retrieve and the
+// webapi emission point for the amplification risk this disclosure carries.
+func (c *Client) RetrieveWithSuppressed(
+	ctx context.Context,
+	request retrieval.Request,
+) (retrieval.Response, uint32, error) {
+	var suppressed uint32
+	response, err := c.retrieve(ctx, request, &suppressed)
+	if err != nil {
+		return retrieval.Response{}, 0, err
+	}
+	return response, suppressed, nil
+}
+
+func (c *Client) retrieve(
+	ctx context.Context,
+	request retrieval.Request,
+	suppressed *uint32,
+) (retrieval.Response, error) {
 	normalized, err := request.Normalize()
 	if err != nil {
 		return retrieval.Response{}, err
@@ -65,7 +92,20 @@ func (c *Client) Retrieve(
 		if err != nil {
 			return retrieval.Response{}, policyCatalogReadError(ctx, err)
 		}
-		if !ok || registration.RevisionID != summary.Revision.ID {
+		if !ok {
+			// A document present in the corpus but covered by no policy grant
+			// is withheld from every caller: that is an authorization outcome,
+			// so it is counted. This is deliberately asymmetric with the
+			// stale-revision drop just below, which is an availability lag, not
+			// a policy decision about this caller, and is not counted. Counting
+			// !ok is also the signal that reveals a lost or empty policy
+			// catalog, where the corpus is intact but every document falls
+			// through here; without it a fully withheld corpus would read as
+			// "nothing withheld". The record is still dropped exactly as before.
+			*suppressed++
+			continue
+		}
+		if registration.RevisionID != summary.Revision.ID {
 			continue
 		}
 		allowed, err := ruleAllows(
@@ -74,6 +114,11 @@ func (c *Client) Retrieve(
 			return retrieval.Response{}, err
 		}
 		if !allowed {
+			// Accounting beside the enforcement branch, not within it: the
+			// record is still dropped exactly as before. Counting a document
+			// the identity's rule denies is unambiguous authorization
+			// suppression, alongside the missing-grant case counted above.
+			*suppressed++
 			continue
 		}
 		if _, duplicate := visible[summary.Document.ID]; duplicate {

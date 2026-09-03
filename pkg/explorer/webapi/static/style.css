@@ -19,3 +19,5 @@
 .identity-unknown p,.error{color:var(--danger)}
 .denied{padding:10px;border:1px solid var(--danger);border-left:4px solid var(--danger);border-radius:6px;background:rgba(255,140,140,.09);color:var(--danger)}
 .denied::before{content:"\26D4  "}
+.withheld{padding:10px;border:1px solid var(--evidence);border-left:4px solid var(--evidence);border-radius:6px;background:rgba(255,209,102,.08);color:var(--text)}
+.withheld::before{content:"\26A0  "}

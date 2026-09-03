@@ -128,6 +128,9 @@ type DocumentsResponse struct {
 	Snapshot   Snapshot                   `json:"snapshot"`
 	Documents  []explorer.DocumentSummary `json:"documents"`
 	NextCursor string                     `json:"next_cursor,omitempty"`
+	// Suppressed reports how many current documents authorization withheld from
+	// this identity. It is a count only and never names what was withheld.
+	Suppressed uint32 `json:"suppressed,omitempty"`
 }
 
 // DocumentRequest fetches one immutable hierarchy.
@@ -153,6 +156,10 @@ type RetrievalRequest struct {
 type RetrievalResponse struct {
 	Snapshot  Snapshot           `json:"snapshot"`
 	Retrieval retrieval.Response `json:"retrieval"`
+	// Suppressed reports how many current documents authorization withheld from
+	// this identity and therefore never searched. It is a count only and never
+	// names what was withheld.
+	Suppressed uint32 `json:"suppressed,omitempty"`
 }
 
 // NeighborhoodRequest asks for a bounded graph expansion.
