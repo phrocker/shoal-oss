@@ -1195,10 +1195,12 @@ func classify(err error) error {
 
 // resumeAfterDefiniteFailure reports whether a non-rejected, non-ambiguous
 // CompareAndMutate error should resume through the read-back reconcile path
-// rather than abort. The Store contract (allocator/store.go) withholds
-// allocator.ErrConditionalUnknown unless a mutation may have applied, so any
-// other error means the conditional mutation definitely did not apply and is
-// safe to reconcile and retry. Only context cancellation short-circuits.
+// rather than abort. It returns true to resume, and false only for context
+// cancellation, which short-circuits the loop. The Store contract
+// (allocator/store.go) withholds ErrConditionalUnknown unless a mutation may
+// have applied, so any other error means the conditional mutation definitely
+// did not apply and is safe to reconcile and retry - strictly safer than the
+// ambiguous ErrConditionalUnknown case the loops already handle.
 func resumeAfterDefiniteFailure(err error) bool {
 	return !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded)
 }

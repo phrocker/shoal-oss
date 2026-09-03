@@ -1003,13 +1003,13 @@ func classifyUnavailable(err error) error {
 }
 
 // resumeAfterDefiniteFailure reports whether a non-rejected, non-ambiguous
-// CompareAndMutate error must abort immediately instead of resuming through the
-// read-back reconcile path. Per the Store contract (store.go), an
-// implementation returns ErrConditionalUnknown only when a mutation may have
-// applied; any other error therefore means the conditional mutation did not
-// apply. Such a definite failure is strictly safer to reconcile than the
-// ambiguous case the loops already handle, so only context cancellation
-// short-circuits the loop.
+// CompareAndMutate error should resume through the read-back reconcile path
+// rather than abort. It returns true to resume, and false only for context
+// cancellation, which short-circuits the loop. The Store contract
+// (allocator/store.go) withholds ErrConditionalUnknown unless a mutation may
+// have applied, so any other error means the conditional mutation definitely
+// did not apply and is safe to reconcile and retry - strictly safer than the
+// ambiguous ErrConditionalUnknown case the loops already handle.
 func resumeAfterDefiniteFailure(err error) bool {
 	return !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded)
 }
