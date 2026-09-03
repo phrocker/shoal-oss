@@ -76,7 +76,20 @@ func (c *Client) documents(
 		if err != nil {
 			return nil, policyCatalogReadError(ctx, err)
 		}
-		if !ok || registration.RevisionID != summary.Revision.ID {
+		if !ok {
+			// A document present in the corpus but covered by no policy grant
+			// is withheld from every caller: that is an authorization outcome,
+			// so it is counted. This is deliberately asymmetric with the
+			// stale-revision drop just below, which is an availability lag, not
+			// a policy decision about this caller, and is not counted. Counting
+			// !ok is also the signal that reveals a lost or empty policy
+			// catalog, where the corpus is intact but every document falls
+			// through here; without it a fully withheld corpus would read as
+			// "nothing withheld". The record is still dropped exactly as before.
+			*suppressed++
+			continue
+		}
+		if registration.RevisionID != summary.Revision.ID {
 			continue
 		}
 		allowed, err := ruleAllows(
@@ -88,8 +101,7 @@ func (c *Client) documents(
 			// Accounting beside the enforcement branch, not within it: the
 			// record is still dropped exactly as before. Counting a document
 			// the identity's rule denies is unambiguous authorization
-			// suppression, distinct from a stale or missing registration, which
-			// is handled by the continue above and is deliberately not counted.
+			// suppression, alongside the missing-grant case counted above.
 			*suppressed++
 			continue
 		}

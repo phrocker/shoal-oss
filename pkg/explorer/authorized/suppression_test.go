@@ -20,9 +20,11 @@
 package authorized_test
 
 import (
+	"context"
 	"testing"
 
 	"github.com/phrocker/shoal-oss/pkg/explorer"
+	"github.com/phrocker/shoal-oss/pkg/explorer/authorized"
 	"github.com/phrocker/shoal-oss/pkg/retrieval"
 )
 
@@ -150,5 +152,59 @@ func TestRetrieveWithSuppressedReportsWithheldWhenNoResults(t *testing.T) {
 	}
 	if suppressed != 1 {
 		t.Fatalf("no-results suppressed = %d, want 1", suppressed)
+	}
+}
+
+// TestSuppressedCountsDocumentsWithNoPolicyGrant is the regression lock for a
+// lost or empty policy catalog: the corpus is intact but the policy store holds
+// zero registrations, so every document drops through the missing-grant (!ok)
+// branch. The count must equal the document total, not zero — otherwise a fully
+// withheld corpus would reassure the user that nothing was withheld at the
+// moment the system is most wrong.
+func TestSuppressedCountsDocumentsWithNoPolicyGrant(t *testing.T) {
+	f := newFixture(t)
+	ingestVisibleAndHidden(t, f)
+
+	baseSummaries, err := f.base.Documents(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	total := uint32(len(baseSummaries))
+	if total == 0 {
+		t.Fatal("expected the base corpus to hold documents")
+	}
+
+	// A client over the same intact corpus but a fresh, empty policy store: no
+	// document has any registration, exactly as a detached policy volume looks.
+	orphaned := f.newClient(
+		t, f.base, authorized.NewMemoryPolicyStore(), f.sourceA, f.policyA, nil)
+
+	summaries, suppressed, err := orphaned.DocumentsWithSuppressed(f.admin(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(summaries) != 0 {
+		t.Fatalf("expected no visible documents, got %#v", summaries)
+	}
+	if suppressed != total {
+		t.Fatalf("empty-catalog documents suppressed = %d, want %d",
+			suppressed, total)
+	}
+
+	response, retrieveSuppressed, err := orphaned.RetrieveWithSuppressed(
+		f.admin(t), retrieval.Request{
+			Text:  "alpha beta",
+			Modes: []retrieval.Mode{retrieval.ModeLexical},
+			TopK:  5,
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(response.Results) != 0 {
+		t.Fatalf("expected no results, got %#v", response)
+	}
+	if retrieveSuppressed != total {
+		t.Fatalf("empty-catalog retrieve suppressed = %d, want %d",
+			retrieveSuppressed, total)
 	}
 }
