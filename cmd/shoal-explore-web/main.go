@@ -160,6 +160,13 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 		"Comma-separated Entra app-role values granted read and ingest "+
 			"access; environment fallback SHOAL_ENTRA_CONTRIBUTOR_ROLES",
 	)
+	entraScope := flags.String(
+		"entra-scope", "",
+		"Space-delimited OAuth scope the browser requests during interactive "+
+			"login. Defaults to 'openid profile <client-id>/.default'; "+
+			"environment fallback SHOAL_ENTRA_SCOPE. Not used for token "+
+			"validation, only for the browser login redirect",
+	)
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -263,6 +270,14 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 	if err != nil {
 		listener.Close()
 		return err
+	}
+	// A configured Entra authenticator means the browser must acquire a token
+	// interactively, so publish the non-secret login parameters. With -dev-auth
+	// this is skipped: the auth-config endpoint reports unconfigured and the UI
+	// renders no login flow, keeping local development a single command.
+	if entra.configured() {
+		handler.SetBrowserAuthConfig(browserAuthConfig(
+			entra, firstNonEmpty(*entraScope, os.Getenv("SHOAL_ENTRA_SCOPE"))))
 	}
 	server := &http.Server{
 		Handler:           handler,
@@ -557,6 +572,37 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+// browserAuthConfig derives the non-secret parameters a browser needs for an
+// interactive Authorization Code + PKCE login from the validated Entra
+// configuration. Nothing here is a secret: the client ID, tenant, scope and
+// authority all appear in the address bar of an ordinary OIDC redirect. When
+// the operator does not override the scope, the browser requests the API's own
+// default scope alongside the OIDC scopes so the resulting access token is
+// audienced to this application.
+func browserAuthConfig(entra entraConfig, scope string) *webapi.BrowserAuthConfig {
+	clientID := strings.TrimSpace(entra.audience)
+	if strings.TrimSpace(scope) == "" {
+		scope = "openid profile " + clientID + "/.default"
+	}
+	return &webapi.BrowserAuthConfig{
+		TenantID:  strings.TrimSpace(entra.tenantID),
+		ClientID:  clientID,
+		Scope:     scope,
+		Authority: entraAuthorityBase(entra),
+	}
+}
+
+// entraAuthorityBase returns the OIDC authority base — without the /v2.0 issuer
+// suffix — that the browser derives its authorize and token endpoints from. It
+// prefers the tenant, falling back to the configured issuer when the issuer was
+// overridden without a tenant.
+func entraAuthorityBase(entra entraConfig) string {
+	if tenant := strings.TrimSpace(entra.tenantID); tenant != "" {
+		return "https://login.microsoftonline.com/" + tenant
+	}
+	return strings.TrimSuffix(strings.TrimSpace(entra.issuer), "/v2.0")
 }
 
 // splitCommaList splits a comma-separated flag value into trimmed, non-empty

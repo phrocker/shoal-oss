@@ -46,6 +46,7 @@ type Handler struct {
 	authority     hostAuthority
 	authenticator Authenticator
 	binder        auth.Binder
+	browserAuth   *BrowserAuthConfig
 }
 
 // NewHandler constructs the standard HTTP transport without caller identity.
@@ -88,15 +89,22 @@ func (h *Handler) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	writer.Header().Set(
 		"Content-Security-Policy",
 		"default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; "+
-			"connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'",
+			"connect-src "+h.connectSources()+"; object-src 'none'; base-uri 'none'; frame-ancestors 'none'",
 	)
 	if !h.authority.permits(request.Host) {
 		http.Error(writer, "misdirected request", http.StatusMisdirectedRequest)
 		return
 	}
-	if h.authenticator != nil {
+	if h.authenticator != nil && !h.publiclyReachable(request) {
 		ctx, err := h.authenticate(request)
 		if err != nil {
+			// A failed authentication gate is a re-authenticate signal, not an
+			// authorization denial. Mark it with the standard bearer challenge
+			// so the browser can tell "present a fresh token" apart from
+			// "authenticated but not permitted", which the service reports as
+			// its own 401 with no challenge header. Both are 401, so app.js
+			// keys re-authentication off this header, never off status alone.
+			writer.Header().Set("WWW-Authenticate", "Bearer")
 			writeError(writer, err)
 			return
 		}
@@ -121,6 +129,7 @@ func (h *Handler) routes() {
 		}
 		writeResponse(writer, http.StatusOK, identity)
 	})
+	h.mux.HandleFunc("GET /api/v1/auth-config", h.authConfigEndpoint)
 	h.mux.HandleFunc("POST /api/v1/ingest", ingestEndpoint(h.service))
 	h.mux.HandleFunc("POST /api/v1/changes", changesEndpoint(h.service))
 	h.mux.HandleFunc("POST /api/v1/documents", endpoint(h.service.Documents))

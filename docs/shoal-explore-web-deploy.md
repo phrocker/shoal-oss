@@ -15,6 +15,7 @@ prerequisites below land) in a shared instance, where the two deployments differ
 - [Volume layout: a single state root](#volume-layout-a-single-state-root)
 - [The configuration seam: local vs shared](#the-configuration-seam-local-vs-shared)
 - [Real authentication with Microsoft Entra ID](#real-authentication-with-microsoft-entra-id)
+- [Browser login (Authorization Code + PKCE)](#browser-login-authorization-code--pkce)
 - [The unsafe-configuration guard](#the-unsafe-configuration-guard)
 - [Persistence: corpus and authorization both survive](#persistence-corpus-and-authorization-both-survive)
 - [Shared / cloud instance: shape and open gaps](#shared--cloud-instance-shape-and-open-gaps)
@@ -186,6 +187,7 @@ is invisible to everyone, so you must assign at least one role to grant access.
 | `-entra-jwks-uri` / `SHOAL_ENTRA_JWKS_URI`         | resolved via OIDC discovery from the issuer                     |
 | `-entra-allowed-algs`                              | `RS256` (any of RS/PS/ES 256/384/512; `HS*` and `none` refused) |
 | `-entra-clock-skew`                                | `60s` (capped at `5m`)                                          |
+| `-entra-scope` / `SHOAL_ENTRA_SCOPE`               | `openid profile <client-id>/.default` (browser login only)      |
 
 ### Example
 
@@ -206,6 +208,60 @@ The IDs above are placeholders — substitute your tenant and application (clien
 IDs. Clients call the API with `Authorization: Bearer <token>`, where the token
 is a v2 Entra token addressed to `<application-client-id>`. Set `-allowed-host`
 before exposing a public bind behind a reverse proxy (see below).
+
+## Browser login (Authorization Code + PKCE)
+
+When an Entra authenticator is configured, **every** route except the HTML
+shell, its static assets, and `GET /api/v1/auth-config` requires a bearer token.
+The embedded web UI acquires one itself with an OAuth 2.0 **Authorization Code
+flow with PKCE (S256 only)** — a public-client flow with no client secret. The
+access token is held **in memory only**; it is never written to `localStorage`,
+`sessionStorage`, or a cookie.
+
+The UI bootstraps by reading `GET /api/v1/auth-config`, which is unauthenticated
+and returns only the **non-secret** login parameters — tenant ID, client ID,
+scope, and authority origin — and nothing about the corpus, the policy catalog,
+or any principal. Under `-dev-auth` it reports `{"configured":false}` and the UI
+renders no login control at all, so local development stays a single command.
+
+### App registration: a required operator step
+
+This flow needs an Entra **app registration with a Single-Page Application (SPA)
+platform** whose **Redirect URI is the deployed origin's root** (for example
+`https://explorer.example.test/`). The SPA platform is what makes Entra issue
+tokens to a public client over CORS with PKCE and no secret; a "Web" platform
+registration will **not** work for a browser flow. This is a portal step an
+operator must perform by hand — it cannot be inferred from, or created by, the
+container image or the deployment template.
+
+Concretely, in **Entra ID → App registrations → your app → Authentication**:
+
+1. **Add a platform → Single-page application.**
+2. Set the **Redirect URI** to the deployed origin's root, e.g.
+   `https://explorer.example.test/`. It must match the browser's origin exactly,
+   including scheme and any non-default port.
+3. Ensure the API/scope the UI requests (`-entra-scope`, default
+   `openid profile <client-id>/.default`) is consented for the tenant.
+
+The `-entra-scope` flag controls only the scope string the **browser** requests
+during the redirect; it is not used for server-side token validation.
+
+**Verified vs inferred (per the honesty convention in this repo):**
+
+- **Verified locally:** with `-dev-auth`, `auth-config` reports
+  `{"configured":false}`, CSP `connect-src` stays `'self'`, and no login control
+  renders. With an Entra authenticator configured, the shell, assets, and
+  `auth-config` load without a token; every `/api/v1/*` route (including a
+  non-existent one) returns `401` with `WWW-Authenticate: Bearer`; `auth-config`
+  returns exactly the four non-secret fields; and CSP `connect-src` gains the
+  authority **origin** only (no tenant path). These were exercised against a
+  running binary with a placeholder tenant/client.
+- **Inferred, not verified against a live tenant:** the default scope
+  `openid profile <client-id>/.default`, the SPA-platform requirement, and the
+  exact redirect-URI matching are stated from Entra's documented behaviour and
+  have not been driven end-to-end through a real Microsoft Entra tenant here. An
+  operator should confirm the scope and redirect URI against their own
+  registration.
 
 ## Host authority (required for a public bind)
 
