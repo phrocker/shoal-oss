@@ -166,7 +166,6 @@ func TestDevelopmentBackfillBindsAndFailsClosed(t *testing.T) {
 // bargain: with the gate open a corpus that predates the process is served,
 // and with the gate closed the same corpus stays hidden.
 func TestBackfillGrantsPreExistingCorpusOnlyWhenGated(t *testing.T) {
-	data := preExistingCorpus(t)
 	for _, testCase := range []struct {
 		name    string
 		gated   bool
@@ -176,6 +175,11 @@ func TestBackfillGrantsPreExistingCorpusOnlyWhenGated(t *testing.T) {
 		{"not backfilled", false, 0},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
+			// Each sub-test gets its own corpus. The policy catalog is now
+			// durable and keyed to the corpus directory, so a shared corpus
+			// would let the gated sub-test's persisted registrations leak into
+			// the ungated one and mask the gate under test.
+			data := preExistingCorpus(t)
 			ctx := context.Background()
 			authority := auth.NewAuthority()
 			var backfill *developmentBackfill

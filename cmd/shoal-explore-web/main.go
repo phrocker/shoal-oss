@@ -28,6 +28,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -121,9 +122,11 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 		return err
 	}
 	authority := auth.NewAuthority()
-	// TEMPORARY (issue #284): with no durable PolicyStore, a corpus that
-	// predates this process is invisible. The gate below allows the
-	// development-only repair for -dev-auth on loopback and nothing else.
+	// The policy catalog is durable, so documents ingested by this build stay
+	// authorized across restarts (issue #284). The gate below still allows a
+	// development-only, one-time migration for a corpus whose documents were
+	// ingested before the catalog was durable, for -dev-auth on loopback and
+	// nothing else.
 	backfill := newDevelopmentBackfill(
 		authenticator, listener.Addr().String(), authority.Binder())
 	opened, err := openService(ctx, serviceConfig{
@@ -167,17 +170,20 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 			fmt.Fprintf(
 				output,
 				"Granted %d pre-existing document(s) in %s to %s: a "+
-					"development-only convenience for -dev-auth on loopback, "+
-					"because the policy catalog is in-memory and does not "+
-					"survive this process (issue #284)\n",
+					"development-only, one-time migration for -dev-auth on "+
+					"loopback of documents ingested before the policy catalog "+
+					"was durable. The catalog now persists, so these "+
+					"registrations survive restarts (issue #284)\n",
 				opened.backfilled, *data, developmentSubject,
 			)
 		} else {
 			fmt.Fprintf(
 				output,
-				"Policy catalog is in-memory: documents ingested before this "+
-					"process started are unauthorized and stay hidden until "+
-					"they are ingested again (issue #284)\n",
+				"Policy catalog is durable in %s: documents this build "+
+					"ingests stay authorized across restarts. Documents "+
+					"ingested before the catalog was durable stay hidden "+
+					"until re-registered (issue #284)\n",
+				policyStoreDir(*data),
 			)
 		}
 	}
@@ -308,28 +314,46 @@ func openService(
 		if err != nil {
 			return closed, err
 		}
-		client, err := authorizedClient(corpus, config.resolver, config.clock)
+		// The policy catalog is durable and lives in a sibling directory, not
+		// a subdirectory of the corpus: the corpus engine treats every
+		// subdirectory as a table, so nesting the store there would corrupt
+		// table discovery. Keying it to the corpus path lets registrations
+		// survive a restart alongside the documents they authorize (#284).
+		store, err := authorized.OpenDurablePolicyStore(policyStoreDir(config.data))
 		if err != nil {
 			corpus.Close()
 			return closed, err
 		}
-		// TEMPORARY (issue #284): registers documents that were ingested
-		// before this process started. A failure here is fatal by design: the
-		// workspace must not serve a corpus it could not finish authorizing.
+		client, err := authorizedClient(corpus, store, config.resolver, config.clock)
+		if err != nil {
+			store.Close()
+			corpus.Close()
+			return closed, err
+		}
+		// The development-only backfill migrates a corpus whose documents were
+		// ingested before the policy catalog was durable: their authorization
+		// registrations are absent until re-registered once. A failure here is
+		// fatal by design: the workspace must not serve a corpus it could not
+		// finish authorizing.
 		backfilled, err := config.backfill.run(ctx, client)
 		if err != nil {
+			store.Close()
 			corpus.Close()
 			return closed, err
 		}
 		service, err := webapi.NewEmbeddedService(client)
 		if err != nil {
+			store.Close()
 			corpus.Close()
 			return closed, err
 		}
 		return openedService{
 			service:    service,
 			backfilled: backfilled,
-			close:      func() { corpus.Close() },
+			close: func() {
+				store.Close()
+				corpus.Close()
+			},
 		}, nil
 	case "remote":
 		// The remote backend forwards workspace calls to an upstream Explorer
@@ -349,11 +373,21 @@ func openService(
 	}
 }
 
+// policyStoreDir derives the durable policy catalog's directory from the corpus
+// data directory. It is a sibling rather than a child because the corpus engine
+// treats every subdirectory of the data directory as a table.
+func policyStoreDir(data string) string {
+	return filepath.Clean(data) + "-policy"
+}
+
 // authorizedClient wraps the corpus in the decision-enforcing Explorer client.
 // The resolver reads the decision bound by the HTTP transport for the request
-// being served, so authorization is per request rather than per process.
+// being served, so authorization is per request rather than per process. The
+// policy store is supplied by the caller so its lifetime is owned alongside the
+// corpus.
 func authorizedClient(
 	corpus *explorer.Explorer,
+	store authorized.PolicyStore,
 	resolver auth.Resolver,
 	clock func() time.Time,
 ) (*authorized.Client, error) {
@@ -368,7 +402,7 @@ func authorizedClient(
 		VectorScorer:   scorer,
 		Resolver:       resolver,
 		PolicySelector: selector,
-		PolicyStore:    authorized.NewMemoryPolicyStore(),
+		PolicyStore:    store,
 		GenerationReader: fixedGenerationReader{
 			domain:     workspaceAuthorizationDomain,
 			generation: workspacePolicyGeneration,
