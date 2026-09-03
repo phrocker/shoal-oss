@@ -198,6 +198,14 @@ func OpenWithOptions(dir string, options Options) (*Explorer, error) {
 		}
 	}
 	if len(explorer.changeCursorKey) == 0 {
+		// The change-feed cursor seal key is generated once, on first open, and
+		// persisted as corpus state so cursors stay valid across restart. Key
+		// rotation is deliberately unimplemented: a single durable key is
+		// sufficient for a single-instance workspace, and rotating would require
+		// versioned cursors (a key version tag in the sealed payload so an old
+		// cursor can still be opened with the retired key). A wiped or recreated
+		// corpus mints a fresh key, which is the intended behaviour -- stale
+		// cursors then fail authentication and the client is told to resynchronise.
 		key := make([]byte, changeCursorKeyBytes)
 		if _, err := rand.Read(key); err != nil {
 			_ = eng.Close()

@@ -243,6 +243,18 @@ func (e *Explorer) incarnationLocked() string {
 // change-feed cursors. It is corpus state, generated once at creation and
 // stable across restart, so an authorization layer can mint opaque cursors that
 // survive reconnects yet cannot be read or forged by a client.
+//
+// What this key is and is not, for the operator who finds a 32-byte secret in
+// the state directory: it protects only the confidentiality and integrity of
+// change-feed cursors. It is NOT an access-control secret. Possessing, losing,
+// or leaking it grants no access to any document -- the per-change
+// authorization gate in the authorized layer runs on every reported change
+// regardless of the cursor, so a forged or replayed cursor still cannot surface
+// a change the caller may not see. Its only job is to stop a client from
+// reading or forging the sequence positions a cursor encodes. Consequently a
+// wiped or recreated corpus mints a fresh key, and stale cursors sealed under
+// the old key then fail authentication and are told to resynchronise rather
+// than being answered from unrelated data.
 func (e *Explorer) ChangeCursorSealKey(ctx context.Context) ([]byte, error) {
 	if err := contextError(ctx); err != nil {
 		return nil, err
