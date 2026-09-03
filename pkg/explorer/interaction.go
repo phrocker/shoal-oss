@@ -245,13 +245,24 @@ func (e *Explorer) Interactions(ctx context.Context) ([]InteractionSummary, erro
 	if err := contextError(ctx); err != nil {
 		return nil, err
 	}
-	e.mu.RLock()
-	defer e.mu.RUnlock()
-	if err := e.requireOpen(); err != nil {
+	if err := e.acquireReadWithGraph(); err != nil {
 		return nil, err
 	}
+	defer e.mu.RUnlock()
 	summaries := make([]InteractionSummary, 0, len(e.interactions))
 	for _, record := range e.interactions {
+		if !record.Deleted {
+			current, err := e.currentSubgraphVisibilityLocked(
+				record.Nodes, record.Edges)
+			if err != nil || !visibilityCovered(record.Visibility, current) {
+				// Fail closed at read time: a live session whose evidence was
+				// reclassified to a stricter label after it was recorded is
+				// withheld rather than served under its stale, now
+				// under-labelled visibility. A merely loosened source still
+				// covers the stored label and is kept. See issue #273.
+				continue
+			}
+		}
 		summaries = append(summaries, InteractionSummary{
 			SessionID:  record.SessionID,
 			RecordedAt: record.RecordedAt,
@@ -281,15 +292,24 @@ func (e *Explorer) InteractionSubgraph(
 	); err != nil {
 		return Neighborhood{}, err
 	}
-	e.mu.RLock()
-	defer e.mu.RUnlock()
-	if err := e.requireOpen(); err != nil {
+	if err := e.acquireReadWithGraph(); err != nil {
 		return Neighborhood{}, err
 	}
+	defer e.mu.RUnlock()
 	record, ok := e.interactions[sessionID]
 	if !ok {
 		return Neighborhood{}, shoal.NewError(
 			shoal.ErrorNotFound, "interaction session not found")
+	}
+	if !record.Deleted {
+		current, err := e.currentSubgraphVisibilityLocked(
+			record.Nodes, record.Edges)
+		if err != nil {
+			return Neighborhood{}, err
+		}
+		if !visibilityCovered(record.Visibility, current) {
+			return Neighborhood{}, staleDerivedVisibilityError()
+		}
 	}
 	result := Neighborhood{
 		Nodes: make([]graph.Node, 0, len(record.Nodes)),
@@ -331,6 +351,162 @@ func (e *Explorer) visibilityResolverLocked() interaction.VisibilityResolver {
 		}
 		return interaction.NodeVisibility(node)
 	}
+}
+
+// currentSubgraphVisibilityLocked re-derives, from the current corpus graph,
+// the visibility a stored interaction or fold record now requires: the
+// conjunction over the current declared labels of every source node it
+// retrieved or cited, recovered from the record's own persisted subgraph. It
+// fails closed if any touched node can no longer be resolved, exactly as the
+// write path does, so a read never serves an under-labelled derived record.
+//
+// This is sound for folds as well as sessions: at write time a fold's stored
+// visibility is the conjunction of every folded session's visibility and every
+// touched source label, and each folded session's visibility is itself the
+// conjunction over that session's touched labels, which are a subset of the
+// fold's touched labels. The touched-label conjunction therefore reproduces the
+// stored value when nothing has moved. The caller must hold at least e.mu.RLock
+// and the current graph must be initialized.
+func (e *Explorer) currentSubgraphVisibilityLocked(
+	nodes []graph.Node, edges []graph.Edge,
+) (string, error) {
+	touched := interaction.TouchedNodes(nodes, edges)
+	ids := make(
+		[]shoal.ID, 0,
+		len(touched.RetrievedNodeIDs)+len(touched.CitedNodeIDs),
+	)
+	ids = append(ids, touched.RetrievedNodeIDs...)
+	ids = append(ids, touched.CitedNodeIDs...)
+	labels, err := e.conjoinNodeVisibilityLocked(ids)
+	if err != nil {
+		return "", err
+	}
+	return interaction.Expression(labels), nil
+}
+
+// conjoinNodeVisibilityLocked resolves every node's current declared visibility
+// and returns their conjunction, failing closed on the first node that cannot
+// be resolved. The caller must hold at least e.mu.RLock.
+func (e *Explorer) conjoinNodeVisibilityLocked(
+	ids []shoal.ID,
+) ([]string, error) {
+	resolve := e.visibilityResolverLocked()
+	sets := make([][]string, 0, len(ids))
+	for _, id := range ids {
+		labels, err := resolve(id)
+		if err != nil {
+			return nil, err
+		}
+		normalized, err := interaction.Conjoin(labels)
+		if err != nil {
+			return nil, err
+		}
+		sets = append(sets, normalized)
+	}
+	return interaction.Conjoin(sets...)
+}
+
+// staleDerivedVisibilityError is the fail-closed refusal returned by a fold or
+// interaction read path when a live record's stored visibility no longer covers
+// the visibility its touched source nodes require now. Serving the stored value
+// would disclose a record whose evidence was reclassified to a stricter label
+// after the record was written; see issue #273.
+func staleDerivedVisibilityError() error {
+	return shoal.NewError(
+		shoal.ErrorUnavailable,
+		"derived record visibility no longer covers current source labels; "+
+			"its evidence was reclassified to a stricter label after the record "+
+			"was written, so the record must be refolded or re-recorded before "+
+			"it can be served",
+	)
+}
+
+// visibilityCovered reports whether a record's stored visibility still
+// dominates the visibility its evidence requires now: every label the current
+// source labels demand is already carried by the stored expression. When true,
+// no reader authorized by the stored (served) visibility is one the current
+// labels would deny, so the record is safe to serve even though its evidence
+// moved. Visibility is a pure conjunction of labels, so domination is exactly
+// current-label-set ⊆ stored-label-set.
+//
+// A tightened source introduces a label the stored visibility lacks and is not
+// covered: the issue #273 fail-open, still refused. A loosened or declassified
+// source only drops labels and stays covered, so the record keeps being served
+// under its stricter stored visibility instead of becoming permanently
+// unreadable. Comparison is by authorization semantics, never string equality,
+// but it is strictly narrower than "any mismatch": a new label always refuses.
+func visibilityCovered(storedExpr, currentExpr string) bool {
+	stored, err := interaction.ParseVisibility(storedExpr)
+	if err != nil {
+		return false
+	}
+	current, err := interaction.ParseVisibility(currentExpr)
+	if err != nil {
+		return false
+	}
+	storedSet := make(map[string]struct{}, len(stored))
+	for _, label := range stored {
+		storedSet[label] = struct{}{}
+	}
+	for _, label := range current {
+		if _, ok := storedSet[label]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+// acquireReadWithGraph takes a read lock with the current graph guaranteed to
+// be built, so concurrent readers of interactions, folds and provenance run in
+// parallel. The current graph is never de-initialized once built, so only the
+// first reader after an open or reopen pays the one-time build under the write
+// lock; every reader after that proceeds directly under the read lock. On a nil
+// return the caller holds e.mu.RLock and must release it; on a non-nil error no
+// lock is held.
+func (e *Explorer) acquireReadWithGraph() error {
+	e.mu.RLock()
+	if err := e.requireOpen(); err != nil {
+		e.mu.RUnlock()
+		return err
+	}
+	if e.graphInitialized {
+		if e.graphErr != nil {
+			err := e.graphErr
+			e.mu.RUnlock()
+			return err
+		}
+		return nil
+	}
+	e.mu.RUnlock()
+
+	// First reader after open: build the current graph once under the write
+	// lock. A concurrent reader may win this race; ensureGraphLocked then
+	// short-circuits on the already-set graphInitialized flag.
+	e.mu.Lock()
+	if err := e.requireOpen(); err != nil {
+		e.mu.Unlock()
+		return err
+	}
+	if err := e.ensureGraphLocked(); err != nil {
+		e.mu.Unlock()
+		return err
+	}
+	e.mu.Unlock()
+
+	// Re-acquire the read lock for the read itself. The graph is only ever
+	// built, never torn down, so it is still initialized here even if another
+	// goroutine rebuilt it (for example an interleaved ingest) in between.
+	e.mu.RLock()
+	if err := e.requireOpen(); err != nil {
+		e.mu.RUnlock()
+		return err
+	}
+	if e.graphErr != nil {
+		err := e.graphErr
+		e.mu.RUnlock()
+		return err
+	}
+	return nil
 }
 
 func (e *Explorer) requireWritableLocked() error {

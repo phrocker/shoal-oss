@@ -45,7 +45,7 @@ Retry the failing request with exponential backoff.
 // ingestVisible ingests one source with a declared visibility expression and
 // returns the span node IDs it materialized.
 func ingestVisible(
-	t *testing.T, corpus *explorer.Explorer, uri, content, visibility string,
+	t testing.TB, corpus *explorer.Explorer, uri, content, visibility string,
 ) []shoal.ID {
 	t.Helper()
 	source := explorer.Source{
@@ -83,7 +83,7 @@ func ingestVisible(
 }
 
 func recordedSession(
-	t *testing.T,
+	t testing.TB,
 	corpus *explorer.Explorer,
 	id shoal.ID,
 	retrieved []shoal.ID,
