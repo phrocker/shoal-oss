@@ -104,6 +104,13 @@ func (h *Handler) routes() {
 		}
 		writeResponse(writer, http.StatusOK, metadata)
 	})
+	h.mux.HandleFunc("GET /api/v1/identity", func(writer http.ResponseWriter, request *http.Request) {
+		identity, ok := identityFromContext(request.Context())
+		if !ok {
+			identity = unauthenticatedIdentity()
+		}
+		writeResponse(writer, http.StatusOK, identity)
+	})
 	h.mux.HandleFunc("POST /api/v1/ingest", ingestEndpoint(h.service))
 	h.mux.HandleFunc("POST /api/v1/documents", endpoint(h.service.Documents))
 	h.mux.HandleFunc("POST /api/v1/document", endpoint(h.service.Document))

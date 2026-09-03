@@ -9,6 +9,7 @@ const state = {
   graphCursors: new Map(),
   sourceURIs: new Map(),
   selected: null,
+  identity: null,
   capabilities: {
     documents: false,
     document: false,
@@ -40,14 +41,60 @@ async function api(path, body) {
     body: JSON.stringify(body),
   });
   const value = await response.json();
-  if (!response.ok) throw new Error(value.message || response.statusText);
+  if (!response.ok) throw apiError(value, response);
   return value;
+}
+
+// apiError preserves the server's structured error envelope so callers can
+// tell an authorization denial apart from any other failure. The workspace
+// must never render a denial as if it were a generic error or an empty result.
+function apiError(value, response) {
+  const error = new Error((value && value.message) || response.statusText);
+  error.code = (value && value.code) || "";
+  error.status = response ? response.status : 0;
+  return error;
+}
+
+// isDenied reports whether an error is an explicit authorization denial the
+// server signalled, as opposed to a match that simply returned nothing. Only
+// the unambiguous unauthorized signal counts: a 404 is deliberately
+// indistinguishable at the server between "hidden from you" and "absent", so
+// it is never claimed here as a denial.
+function isDenied(error) {
+  return Boolean(error) && (error.code === "unauthorized" || error.status === 401);
+}
+
+function identitySubjectLabel(identity) {
+  if (identity && identity.authenticated && identity.subject) return identity.subject;
+  return "the current identity";
+}
+
+// deniedText describes an explicit denial and states plainly that it is a
+// denial and not an empty result, so the two never read the same.
+function deniedText(action, identity) {
+  return `Access denied — ${identitySubjectLabel(identity)} is not authorized to ` +
+    `${action}. This is a denial, not an empty result.`;
+}
+
+// emptyRetrievalText describes a genuine empty match while making the
+// identity scope explicit, because the server filters unauthorized content
+// silently and never reports how much it withheld.
+function emptyRetrievalText(identity) {
+  return `No evidence matched for ${identitySubjectLabel(identity)}. ` +
+    `Results are scoped to this identity; content you are not authorized to see ` +
+    `is never included or counted here.`;
+}
+
+function emptyDocumentsText(identity) {
+  return `No documents are visible to ${identitySubjectLabel(identity)}. ` +
+    `The corpus is shared and filtered per identity, so this may mean nothing ` +
+    `was ingested or that nothing here is authorized for you.`;
 }
 
 async function loadMeta() {
   const response = await fetch("/api/v1/meta", {headers: {"accept": "application/json"}});
   const value = await response.json();
-  if (!response.ok) throw new Error(value.message || response.statusText);
+  if (!response.ok) throw apiError(value, response);
   state.capabilities = {...state.capabilities, ...(value.capabilities || {})};
   state.uploadLimits = {
     max_upload_files: value.max_upload_files || 0,
@@ -55,6 +102,141 @@ async function loadMeta() {
     max_upload_total_bytes: value.max_upload_total_bytes || 0,
   };
   applyCapabilities();
+}
+
+async function loadIdentity() {
+  try {
+    const response = await fetch("/api/v1/identity", {headers: {"accept": "application/json"}});
+    const value = await response.json();
+    if (!response.ok) throw apiError(value, response);
+    state.identity = value;
+    renderIdentity(value);
+  } catch (error) {
+    state.identity = null;
+    renderIdentityError(error);
+  }
+}
+
+function renderIdentity(identity) {
+  const container = $("identity");
+  const badge = $("identity-badge");
+  container.className = "identity";
+  if (!identity || !identity.authenticated) {
+    container.classList.add("identity-anon");
+    setMessage(
+      container,
+      "This workspace is serving requests without an established identity. " +
+        "Results are not attributed to any principal.",
+    );
+    badge.hidden = true;
+    badge.textContent = "";
+    return;
+  }
+
+  badge.hidden = false;
+  badge.textContent = `▲ ${identity.subject}`;
+  badge.title = `Signed in as ${identity.subject}. Shared governed workspace — ` +
+    "every result is scoped to this identity.";
+
+  const fragment = document.createDocumentFragment();
+
+  const who = document.createElement("div");
+  who.className = "identity-who";
+  const label = document.createElement("span");
+  label.className = "identity-label";
+  label.textContent = "You are";
+  const subject = document.createElement("strong");
+  subject.className = "identity-subject";
+  subject.textContent = identity.subject;
+  subject.title = identity.subject;
+  who.append(label, subject);
+  fragment.append(who);
+
+  const shared = document.createElement("p");
+  shared.className = "identity-shared";
+  shared.textContent =
+    "Shared governed workspace. Every result below is retrieved as this " +
+    "identity, so what you see is exactly what you are authorized to see.";
+  fragment.append(shared);
+
+  fragment.append(identityChips("Authorized operations", identity.operations || []));
+
+  const details = document.createElement("dl");
+  details.className = "identity-facts";
+  appendFact(details, "Actor", identity.actor);
+  appendFact(details, "Domain", identity.authorization_domain);
+  appendFact(details, "Policy gen", identity.policy_generation
+    ? String(identity.policy_generation) : "");
+  appendFact(details, "Session ends", formatExpiry(identity.authentication_expires));
+  appendFact(details, "Purpose", identity.audit_purpose);
+  appendFact(details, "Request", identity.request_id);
+  if (details.children.length > 0) fragment.append(details);
+
+  const note = document.createElement("p");
+  note.className = "identity-note muted";
+  note.textContent =
+    "Identity is assigned by the server, not chosen here. This build " +
+    "authenticates every request as one development principal over a loopback " +
+    "listener, so there is no client-side identity switch.";
+  fragment.append(note);
+
+  container.replaceChildren(fragment);
+}
+
+function identityChips(legendText, values) {
+  const group = document.createElement("div");
+  group.className = "identity-chips";
+  group.setAttribute("role", "group");
+  group.setAttribute("aria-label", legendText);
+  const legend = document.createElement("span");
+  legend.className = "identity-label";
+  legend.textContent = legendText;
+  group.append(legend);
+  if (values.length === 0) {
+    const none = document.createElement("span");
+    none.className = "chip chip-empty";
+    none.textContent = "none";
+    group.append(none);
+    return group;
+  }
+  for (const value of values) {
+    const chip = document.createElement("span");
+    chip.className = "chip";
+    chip.textContent = value;
+    group.append(chip);
+  }
+  return group;
+}
+
+function appendFact(list, term, value) {
+  if (!value) return;
+  const dt = document.createElement("dt");
+  dt.textContent = term;
+  const dd = document.createElement("dd");
+  dd.textContent = value;
+  dd.title = value;
+  list.append(dt, dd);
+}
+
+function formatExpiry(value) {
+  if (!value) return "";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "";
+  return date.toLocaleTimeString([], {hour: "2-digit", minute: "2-digit"});
+}
+
+function renderIdentityError(error) {
+  const container = $("identity");
+  container.className = "identity identity-unknown";
+  setMessage(
+    container,
+    `Identity is unavailable: ${error && error.message ? error.message : String(error)}. ` +
+      "Result sets below cannot be attributed to a principal.",
+    "error",
+  );
+  const badge = $("identity-badge");
+  badge.hidden = true;
+  badge.textContent = "";
 }
 
 function capability(name) {
@@ -172,6 +354,22 @@ function showError(element, error) {
   setMessage(element, error.message || String(error), "error");
 }
 
+// showActionError renders an explicit authorization denial distinctly from any
+// other failure. A denied action gets the "denied" treatment and reports true;
+// every other error falls back to the generic error rendering.
+function showActionError(element, error, action) {
+  if (isDenied(error)) {
+    if (element.getAttribute && element.getAttribute("role") === "status") {
+      setStatus(element, deniedText(action, state.identity), "denied");
+    } else {
+      setMessage(element, deniedText(action, state.identity), "denied");
+    }
+    return true;
+  }
+  showError(element, error);
+  return false;
+}
+
 function pin(snapshot) {
   state.snapshot = snapshot;
   $("snapshot").textContent =
@@ -205,7 +403,7 @@ async function loadDocuments(reset = true) {
     if (reset) $("documents").replaceChildren();
     const documents = response.documents || [];
     if (documents.length === 0 && reset) {
-      setStatus($("documents-status"), "No documents have been ingested yet.", "empty-state");
+      setStatus($("documents-status"), emptyDocumentsText(state.identity), "empty-state");
     } else {
       setStatus($("documents-status"), `Showing ${$("documents").children.length + documents.length} document(s).`);
     }
@@ -215,7 +413,10 @@ async function loadDocuments(reset = true) {
     state.cursor = response.next_cursor || "";
     $("more").hidden = !state.cursor;
   } catch (error) {
-    if (generation === documentsGeneration) showError($("documents-status"), error);
+    if (generation === documentsGeneration) {
+      if (isDenied(error)) $("documents").replaceChildren();
+      showActionError($("documents-status"), error, "list documents");
+    }
   } finally {
     documentsLoading = false;
     $("documents").setAttribute("aria-busy", "false");
@@ -435,7 +636,7 @@ async function loadDocument(documentID, revisionID) {
     mergeGraph({nodes: [nodeFromDocument(response.document.document)], edges: []});
     draw();
   } catch (error) {
-    if (generation === documentGeneration) showError($("hierarchy-status"), error);
+    if (generation === documentGeneration) showActionError($("hierarchy-status"), error, "open this document");
   } finally {
     if (generation === documentGeneration) $("hierarchy").setAttribute("aria-busy", "false");
   }
@@ -541,7 +742,10 @@ $("search").onsubmit = async (event) => {
     pin(response.snapshot);
     renderEvidence(response.retrieval);
   } catch (error) {
-    if (generation === searchGeneration) showError($("evidence-status"), error);
+    if (generation === searchGeneration) {
+      $("evidence-results").replaceChildren();
+      showActionError($("evidence-status"), error, "run this retrieval");
+    }
   }
 };
 
@@ -549,7 +753,7 @@ function renderEvidence(response) {
   const results = response.results || [];
   if (results.length === 0) {
     $("evidence-results").replaceChildren();
-    setStatus($("evidence-status"), "No evidence matched.", "empty-state");
+    setStatus($("evidence-status"), emptyRetrievalText(state.identity), "empty-state");
     draw();
     return;
   }
@@ -661,8 +865,12 @@ async function expandIDs(ids, cursor = "") {
     draw();
   } catch (error) {
     if (generation !== graphGeneration) return;
-    $("graph-status").textContent = `Graph expansion failed: ${error.message || String(error)}`;
-    showError($("selection"), error);
+    if (isDenied(error)) {
+      $("graph-status").textContent = deniedText("expand this neighborhood", state.identity);
+    } else {
+      $("graph-status").textContent = `Graph expansion failed: ${error.message || String(error)}`;
+    }
+    showActionError($("selection"), error, "expand this neighborhood");
   }
 }
 
@@ -692,8 +900,12 @@ $("find-path").onclick = async () => {
     draw();
   } catch (error) {
     if (generation !== graphGeneration) return;
-    $("graph-status").textContent = `Path finding failed: ${error.message || String(error)}`;
-    showError($("selection"), error);
+    if (isDenied(error)) {
+      $("graph-status").textContent = deniedText("find a path", state.identity);
+    } else {
+      $("graph-status").textContent = `Path finding failed: ${error.message || String(error)}`;
+    }
+    showActionError($("selection"), error, "find a path");
   }
 };
 
@@ -871,6 +1083,7 @@ new ResizeObserver(() => {
 }).observe(canvas);
 renderGraphList();
 applyCapabilities();
+loadIdentity();
 loadMeta()
   .then(() => loadDocuments())
   .catch((error) => showError($("documents"), error));

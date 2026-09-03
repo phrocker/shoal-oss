@@ -98,7 +98,10 @@ func (h *Handler) authenticate(
 	if err != nil || ctx == nil {
 		return nil, authenticationDenied()
 	}
-	return ctx, nil
+	// Surface only what the transport already trusts. The identity endpoint
+	// reads this projection to show the caller who they are; enforcement stays
+	// with the authorized Explorer client behind the resolver.
+	return withIdentity(ctx, decision), nil
 }
 
 func authenticationDenied() error {

@@ -8,7 +8,7 @@
 </head>
 <body>
   <header>
-    <div class="brand"><strong>Shoal Explorer</strong><span id="snapshot" aria-live="polite">loading snapshot…</span></div>
+    <div class="brand"><strong>Shoal Explorer</strong><span id="snapshot" aria-live="polite">loading snapshot…</span><span id="identity-badge" class="identity-badge" role="status" aria-live="polite" hidden></span></div>
     <form id="search" aria-describedby="query-help vector-mode-status">
       <label class="sr-only" for="query">Retrieval query</label>
       <input id="query" required placeholder="Retrieve cited evidence…" autocomplete="off">
@@ -68,7 +68,16 @@
         </div>
       </div>
     </section>
-    <aside class="right"><h2>Selection</h2><div id="selection" class="muted" aria-live="polite">Select evidence, a hierarchy section, or a graph node.</div></aside>
+    <aside class="right">
+      <section id="identity-panel" aria-labelledby="identity-heading">
+        <h2 id="identity-heading">Identity</h2>
+        <div id="identity" role="status" aria-live="polite">Identifying…</div>
+      </section>
+      <section aria-labelledby="selection-heading">
+        <h2 id="selection-heading">Selection</h2>
+        <div id="selection" class="muted" aria-live="polite">Select evidence, a hierarchy section, or a graph node.</div>
+      </section>
+    </aside>
   </main>
   <script src="/assets/app.js"></script>
 </body>

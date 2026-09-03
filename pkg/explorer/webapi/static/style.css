@@ -4,3 +4,18 @@
 @media(max-width:1100px){header{align-items:stretch}form{flex-basis:100%;max-width:none}main{grid-template-columns:230px minmax(0,1fr);height:auto;min-height:calc(100vh - 58px)}.right{grid-column:1/-1;border-top:1px solid var(--line);border-right:0}}
 @media(max-width:720px){header{padding:10px}.brand{white-space:normal;flex-wrap:wrap}form{min-width:0}#search-button{flex:1 1 100%}main{display:block;height:auto}.left{height:auto}.center{min-height:700px}#graph-list{grid-template-columns:1fr}}
 .sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
+.identity-badge{display:inline-flex;align-items:center;max-width:22rem;padding:3px 9px;border:1px solid var(--accent);border-radius:999px;background:#12233a;color:var(--accent);font-size:12px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.identity-badge[hidden]{display:none}
+#identity-panel .identity-label{display:block;font-size:11px;text-transform:uppercase;letter-spacing:.07em;color:var(--muted);margin-bottom:3px}
+.identity-who{display:flex;flex-direction:column;gap:2px;padding:9px;border:1px solid var(--accent);border-radius:6px;background:#12233a}
+.identity-subject{font-size:15px;color:var(--text);overflow-wrap:anywhere}
+.identity-shared{margin:9px 0;color:var(--muted);font-size:12px}
+.identity-chips{margin:9px 0}.identity-chips .chip{margin:0 5px 5px 0}
+.chip{display:inline-block;padding:2px 8px;border:1px solid var(--line);border-radius:999px;background:#0f192b;color:var(--text);font-size:11px}
+.chip-empty{color:var(--danger);border-color:var(--danger)}
+.identity-facts{display:grid;grid-template-columns:minmax(64px,auto) minmax(0,1fr);gap:4px 8px;margin:9px 0;font-size:12px}
+.identity-facts dt{color:var(--muted)}.identity-facts dd{margin:0;overflow-wrap:anywhere}
+.identity-note{margin:9px 0 0;font-size:11px}
+.identity-unknown p,.error{color:var(--danger)}
+.denied{padding:10px;border:1px solid var(--danger);border-left:4px solid var(--danger);border-radius:6px;background:rgba(255,140,140,.09);color:var(--danger)}
+.denied::before{content:"\26D4  "}
