@@ -262,6 +262,13 @@ func readStaticAsset(t *testing.T, path string) string {
 func runNodeUITest(t *testing.T, assertions string) {
 	t.Helper()
 	if _, err := exec.LookPath("node"); err != nil {
+		// Asymmetric on purpose: a developer laptop without Node may skip these
+		// executable UI checks, but CI must never let them silently vanish into
+		// a green run. GitHub Actions always sets CI, so there a missing node is
+		// a hard failure rather than a skip.
+		if os.Getenv("CI") != "" {
+			t.Fatal("node is required for executable static UI checks in CI")
+		}
 		t.Skip("node is not available for executable static UI checks")
 	}
 	script := uiHarnessScript(assertions)
