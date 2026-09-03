@@ -33,6 +33,33 @@ func (c *Client) Retrieve(
 	ctx context.Context,
 	request retrieval.Request,
 ) (retrieval.Response, error) {
+	var suppressed uint32
+	return c.retrieve(ctx, request, &suppressed)
+}
+
+// RetrieveWithSuppressed performs the identical authorized retrieval as
+// Retrieve and additionally reports how many current documents this identity
+// was denied and therefore never searched. The count is derived from the exact
+// same authorization gate Retrieve enforces; it is reporting only and never
+// changes which results are returned. See the counting site in retrieve and the
+// webapi emission point for the amplification risk this disclosure carries.
+func (c *Client) RetrieveWithSuppressed(
+	ctx context.Context,
+	request retrieval.Request,
+) (retrieval.Response, uint32, error) {
+	var suppressed uint32
+	response, err := c.retrieve(ctx, request, &suppressed)
+	if err != nil {
+		return retrieval.Response{}, 0, err
+	}
+	return response, suppressed, nil
+}
+
+func (c *Client) retrieve(
+	ctx context.Context,
+	request retrieval.Request,
+	suppressed *uint32,
+) (retrieval.Response, error) {
 	normalized, err := request.Normalize()
 	if err != nil {
 		return retrieval.Response{}, err
@@ -74,6 +101,12 @@ func (c *Client) Retrieve(
 			return retrieval.Response{}, err
 		}
 		if !allowed {
+			// Accounting beside the enforcement branch, not within it: the
+			// record is still dropped exactly as before. Counting a document
+			// the identity's rule denies is unambiguous authorization
+			// suppression, distinct from a stale or missing registration, which
+			// is handled by the continue above and is deliberately not counted.
+			*suppressed++
 			continue
 		}
 		if _, duplicate := visible[summary.Document.ID]; duplicate {

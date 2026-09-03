@@ -66,6 +66,25 @@ type vectorAvailabilityProvider interface {
 	VectorAvailable(context.Context) (bool, error)
 }
 
+// suppressionCountingRetriever is implemented by an authorized backing client
+// that can report, alongside a retrieval, how many current documents
+// authorization withheld from the caller. It is optional: a client that does
+// not implement it is treated as withholding nothing, so the signal fails
+// closed to "0 withheld" rather than fabricating a count.
+type suppressionCountingRetriever interface {
+	RetrieveWithSuppressed(
+		context.Context, retrieval.Request,
+	) (retrieval.Response, uint32, error)
+}
+
+// suppressionCountingLister is the Documents-listing counterpart to
+// suppressionCountingRetriever and is optional under the same fail-closed rule.
+type suppressionCountingLister interface {
+	DocumentsWithSuppressed(
+		context.Context,
+	) ([]explorer.DocumentSummary, uint32, error)
+}
+
 // EmbeddedService adapts the public Explorer client to the workspace service.
 type EmbeddedService struct {
 	client explorer.BoundedClient
@@ -110,7 +129,7 @@ func (s *EmbeddedService) Documents(
 	if err != nil {
 		return DocumentsResponse{}, err
 	}
-	documents, err := s.client.Documents(ctx)
+	documents, suppressed, err := s.documentsCountingSuppressed(ctx)
 	if err != nil {
 		return DocumentsResponse{}, err
 	}
@@ -126,13 +145,30 @@ func (s *EmbeddedService) Documents(
 		end = len(documents)
 	}
 	response := DocumentsResponse{
-		Snapshot:  snapshot,
-		Documents: append([]explorer.DocumentSummary(nil), documents[offset:end]...),
+		Snapshot:   snapshot,
+		Documents:  append([]explorer.DocumentSummary(nil), documents[offset:end]...),
+		Suppressed: suppressed,
 	}
 	if end < len(documents) {
 		response.NextCursor = encodeCursor(snapshot.ID, end)
 	}
 	return response, nil
+}
+
+// documentsCountingSuppressed lists the authorized documents and, when the
+// backing client can report it, the corpus-wide number of current documents
+// authorization withheld from this identity. See retrieveCountingSuppressed for
+// the amplification risk of disclosing this count; the same caveat applies to
+// the document listing, whose withheld count reveals roughly how much of the
+// shared corpus the identity cannot see.
+func (s *EmbeddedService) documentsCountingSuppressed(
+	ctx context.Context,
+) ([]explorer.DocumentSummary, uint32, error) {
+	if counter, ok := s.client.(suppressionCountingLister); ok {
+		return counter.DocumentsWithSuppressed(ctx)
+	}
+	documents, err := s.client.Documents(ctx)
+	return documents, 0, err
 }
 
 func (s *EmbeddedService) Document(
@@ -174,7 +210,7 @@ func (s *EmbeddedService) Retrieve(
 	// The embedded backend is already pinned by the snapshot identity and does
 	// not implement historical publication-frontier reads.
 	query.AsOf = time.Time{}
-	response, err := s.client.Retrieve(ctx, query)
+	response, suppressed, err := s.retrieveCountingSuppressed(ctx, query)
 	if err != nil {
 		return RetrievalResponse{}, err
 	}
@@ -185,7 +221,32 @@ func (s *EmbeddedService) Retrieve(
 	if err := s.confirmSnapshot(ctx, snapshot); err != nil {
 		return RetrievalResponse{}, err
 	}
-	return RetrievalResponse{Snapshot: snapshot, Retrieval: response}, nil
+	return RetrievalResponse{
+		Snapshot: snapshot, Retrieval: response, Suppressed: suppressed,
+	}, nil
+}
+
+// retrieveCountingSuppressed runs the authorized retrieval and, when the backing
+// client can report it, the number of current documents authorization withheld
+// from this identity and therefore never searched.
+//
+// Amplification risk. This count is a real disclosure. Because a caller can
+// re-run retrieval as the corpus changes, and vary the request, and watch the
+// number move, the count is a coarse oracle for the existence and rough volume
+// of content the caller is not allowed to read. The count is the entire leak —
+// no identifiers, labels, or snippets accompany it — but it is still a leak. It
+// is emitted deliberately, on an explicit product decision, so a short or empty
+// answer can never be silently mistaken for "nothing exists". A future policy
+// control may need to coarsen or suppress this count for sensitive
+// authorization domains; that control is intentionally not built here.
+func (s *EmbeddedService) retrieveCountingSuppressed(
+	ctx context.Context, query retrieval.Request,
+) (retrieval.Response, uint32, error) {
+	if counter, ok := s.client.(suppressionCountingRetriever); ok {
+		return counter.RetrieveWithSuppressed(ctx, query)
+	}
+	response, err := s.client.Retrieve(ctx, query)
+	return response, 0, err
 }
 
 func (s *EmbeddedService) Neighborhood(

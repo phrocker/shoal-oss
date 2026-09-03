@@ -33,6 +33,31 @@ import (
 func (c *Client) Documents(
 	ctx context.Context,
 ) ([]explorer.DocumentSummary, error) {
+	var suppressed uint32
+	return c.documents(ctx, &suppressed)
+}
+
+// DocumentsWithSuppressed lists the same authorized documents as Documents and
+// additionally reports how many current documents this identity was denied and
+// therefore never listed. The count comes from the exact same authorization
+// gate Documents enforces; it is reporting only and never changes which
+// summaries are returned. See the counting site in documents and the webapi
+// emission point for the amplification risk this disclosure carries.
+func (c *Client) DocumentsWithSuppressed(
+	ctx context.Context,
+) ([]explorer.DocumentSummary, uint32, error) {
+	var suppressed uint32
+	summaries, err := c.documents(ctx, &suppressed)
+	if err != nil {
+		return nil, 0, err
+	}
+	return summaries, suppressed, nil
+}
+
+func (c *Client) documents(
+	ctx context.Context,
+	suppressed *uint32,
+) ([]explorer.DocumentSummary, error) {
 	decision, guard, now, err := c.begin(ctx, auth.OperationList)
 	if err != nil {
 		return nil, err
@@ -60,6 +85,12 @@ func (c *Client) Documents(
 			return nil, err
 		}
 		if !allowed {
+			// Accounting beside the enforcement branch, not within it: the
+			// record is still dropped exactly as before. Counting a document
+			// the identity's rule denies is unambiguous authorization
+			// suppression, distinct from a stale or missing registration, which
+			// is handled by the continue above and is deliberately not counted.
+			*suppressed++
 			continue
 		}
 		view, err := c.base.Document(
