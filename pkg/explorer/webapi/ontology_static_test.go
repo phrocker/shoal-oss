@@ -178,6 +178,162 @@ assert.match(jsonEditor.value, /"properties":/);
 `)
 }
 
+func TestStaticWorkspaceOntologyProposalEditorPrepopulatesActiveOntologyOnSubmit(t *testing.T) {
+	runOntologyUITest(t, `
+const createdProposals = [];
+const rendered = await runOntologyScenario({
+  configured: true,
+  identity: {known: true, schema_id: "schema-rich", version_id: "version-rich", reading: "same_version"},
+  schema: {id: "schema-rich", key: "workspace", name: "Workspace"},
+  version: {id: "version-rich", version: "v1", created_at: "2026-09-04T00:00:00Z"},
+  concepts: [
+    {id: "concept-person", key: "person", name: "Person", properties: ["property-name"]},
+    {id: "concept-org", key: "organization", name: "Organization", properties: ["property-name"]},
+  ],
+  relationships: [{
+    id: "relationship-member-of",
+    key: "member_of",
+    name: "Member of",
+    directed: true,
+    from_concepts: ["concept-person"],
+    to_concepts: ["concept-org"],
+    properties: ["property-role"],
+  }],
+  properties: [
+    {id: "property-name", key: "name", name: "Name", value_type: "string", constraints: [{kind: "required"}]},
+    {id: "property-role", key: "role", name: "Role", value_type: "string", constraints: []},
+  ],
+  limits: {},
+}, {createdProposals});
+const form = descendants(rendered.ids["ontology-details"])
+  .find((node) => node.className === "ontology-proposal-form");
+assert.ok(form);
+const rationale = descendants(form)
+  .find((node) => node.tagName === "TEXTAREA" && node.placeholder);
+rationale.value = "change one concept name";
+const conceptName = descendants(form)
+  .filter((node) => node.className === "ontology-proposal-concept-name")[0];
+if (conceptName) {
+  conceptName.value = "Human";
+  conceptName.oninput();
+}
+await form.onsubmit({preventDefault() {}});
+assert.strictEqual(createdProposals.length, 1);
+const proposed = createdProposals[0].proposed_version;
+assert.strictEqual(proposed.concepts.length, 2);
+assert.strictEqual(proposed.relationships.length, 1);
+assert.strictEqual(proposed.properties.length, 2);
+assert.deepStrictEqual(proposed.concepts.map((concept) => concept.key), ["person", "organization"]);
+assert.deepStrictEqual(proposed.relationships[0].from_concepts, ["person"]);
+assert.deepStrictEqual(proposed.relationships[0].to_concepts, ["organization"]);
+assert.deepStrictEqual(proposed.relationships[0].properties, ["role"]);
+assert.deepStrictEqual(proposed.properties.map((property) => property.key), ["name", "role"]);
+assert.deepStrictEqual(proposed.properties[0].constraints, [{kind: "required"}]);
+assert.strictEqual(proposed.concepts[0].name, "Human");
+assert.strictEqual(descendants(form).filter((node) => node.className === "ontology-remove-concept").length, 2);
+assert.strictEqual(descendants(form).filter((node) => node.className === "ontology-remove-relationship").length, 1);
+assert.strictEqual(descendants(form).filter((node) => node.className === "ontology-remove-property").length, 2);
+`)
+}
+
+func TestStaticWorkspaceOntologyProposalEditorRoundTripsRawAndForms(t *testing.T) {
+	runOntologyUITest(t, `
+const rendered = await runOntologyScenario({
+  configured: true,
+  identity: {known: true, schema_id: "schema-rich", version_id: "version-rich", reading: "same_version"},
+  schema: {id: "schema-rich", key: "workspace", name: "Workspace"},
+  version: {id: "version-rich", version: "v1", created_at: "2026-09-04T00:00:00Z"},
+  concepts: [{
+    id: "concept-person",
+    key: "person",
+    name: "Person",
+    description: "A known person",
+    properties: ["property-name"],
+  }],
+  relationships: [{
+    id: "relationship-ref",
+    key: "referenced_in",
+    name: "Referenced in",
+    description: "A citation join",
+    directed: true,
+    from_concepts: ["concept-person"],
+    to_concepts: ["concept-person"],
+    properties: ["property-name"],
+  }],
+  properties: [{
+    id: "property-name",
+    key: "name",
+    name: "Name",
+    description: "Display name",
+    value_type: "string",
+    constraints: [{kind: "allowed_values", allowed_values: [
+      {type: "string", value: "Alice"},
+      {type: "string", value: "Bob"},
+    ]}],
+  }],
+  limits: {},
+});
+const form = descendants(rendered.ids["ontology-details"])
+  .find((node) => node.className === "ontology-proposal-form");
+const rawButton = descendants(form)
+  .find((node) => node.tagName === "BUTTON" && node.textContent === "Raw JSON");
+const formButton = descendants(form)
+  .find((node) => node.tagName === "BUTTON" && node.textContent === "Form editor");
+const propertyDescription = descendants(form)
+  .find((node) => node.className === "ontology-proposal-property-description");
+propertyDescription.value = "Edited display name";
+propertyDescription.oninput();
+rawButton.onclick();
+const raw = descendants(form).find((node) => node.className === "ontology-proposal-json");
+let draft = JSON.parse(raw.value);
+assert.strictEqual(draft.properties[0].description, "Edited display name");
+assert.deepStrictEqual(draft.properties[0].constraints, [{kind: "allowed_values", allowed_values: [
+  {type: "string", value: "Alice"},
+  {type: "string", value: "Bob"},
+]}]);
+assert.strictEqual(draft.concepts[0].description, "A known person");
+assert.deepStrictEqual(draft.concepts[0].properties, ["name"]);
+assert.strictEqual(draft.relationships[0].description, "A citation join");
+assert.deepStrictEqual(draft.relationships[0].from_concepts, ["person"]);
+draft.concepts[0].description = "Raw edited person";
+draft.relationships[0].properties = ["name"];
+raw.value = JSON.stringify(draft, null, 2);
+formButton.onclick();
+const conceptDescription = descendants(form)
+  .find((node) => node.className === "ontology-proposal-concept-description");
+assert.strictEqual(conceptDescription.value, "Raw edited person");
+rawButton.onclick();
+draft = JSON.parse(raw.value);
+assert.strictEqual(draft.concepts[0].description, "Raw edited person");
+assert.deepStrictEqual(draft.properties[0].constraints[0].allowed_values.map((value) => value.value), ["Alice", "Bob"]);
+assert.deepStrictEqual(draft.relationships[0].properties, ["name"]);
+`)
+}
+
+func TestStaticWorkspaceOntologyProposalEditorBoundsErrorDoesNotTruncate(t *testing.T) {
+	runOntologyUITest(t, `
+const createdProposals = [];
+const rendered = await runOntologyScenario({
+  configured: true,
+  identity: {known: true, schema_id: "schema-rich", version_id: "version-rich", reading: "same_version"},
+  schema: {id: "schema-rich", key: "workspace", name: "Workspace"},
+  version: {id: "version-rich", version: "v1", created_at: "2026-09-04T00:00:00Z"},
+  concepts: [],
+  relationships: [],
+  properties: [{id: "property-name", key: "name", name: "Name", value_type: "string", constraints: []}],
+  limits: {max_properties: 1},
+}, {createdProposals});
+const form = descendants(rendered.ids["ontology-details"])
+  .find((node) => node.className === "ontology-proposal-form");
+const addProperty = descendants(form)
+  .find((node) => node.tagName === "BUTTON" && node.textContent === "Add property");
+addProperty.onclick();
+await form.onsubmit({preventDefault() {}});
+assert.strictEqual(createdProposals.length, 0);
+assert.match(renderedText(form), /property count 2 exceeds limit 1/);
+`)
+}
+
 func TestStaticWorkspaceOntologyProposalBlastRadius(t *testing.T) {
 	runOntologyUITest(t, `
 const rendered = await runOntologyScenario({
@@ -388,7 +544,7 @@ function makeDocument() {
     "query", "search", "search-button", "modes", "mode-vector", "mode-vector-control",
     "vector-mode-status", "evidence", "evidence-status", "evidence-results", "expand",
     "continue-expansion", "path-from", "path-to", "find-path", "graph-status",
-    "upload-section", "upload", "upload-drop", "upload-files", "upload-button",
+    "upload-section", "upload", "upload-drop", "upload-files", "upload-directory", "upload-button",
     "upload-status", "upload-results", "documents", "documents-status", "more",
     "graph-nodes", "graph-edges", "canvas", "selection", "hierarchy",
     "hierarchy-status", "snapshot", "identity", "identity-badge", "ontology",
@@ -401,6 +557,7 @@ function makeDocument() {
   ids.search = new Element("form", "search");
   ids.upload = new Element("form", "upload");
   ids["upload-files"] = new Element("input", "upload-files");
+  ids["upload-directory"] = new Element("input", "upload-directory");
   ids["upload-button"] = new Element("button", "upload-button");
   ids["upload-drop"] = new Element("label", "upload-drop");
   ids["search-button"] = new Element("button", "search-button");
@@ -430,7 +587,8 @@ async function runOntologyScenario(ontology, options = {}) {
     URL,
     crypto: require("crypto").webcrypto,
     TextEncoder,
-    fetch: async (url) => {
+    fetch: async (url, request = {}) => {
+      const method = String(request.method || "GET").toUpperCase();
       if (url === "/api/v1/auth-config") return response({configured: false});
       if (url === "/api/v1/identity") return response({
         authenticated: true,
@@ -448,6 +606,23 @@ async function runOntologyScenario(ontology, options = {}) {
           });
         }
         return response(ontology);
+      }
+      if (url === "/api/v1/ontology/proposals" && method === "POST") {
+        const body = JSON.parse(request.body || "{}");
+        if (options.createdProposals) options.createdProposals.push(body);
+        const proposal = {
+          id: "proposal-created",
+          base_schema_id: ontology && ontology.identity && ontology.identity.schema_id,
+          base_version_id: ontology && ontology.identity && ontology.identity.version_id,
+          proposed_by: "development-principal@localhost",
+          rationale: body.rationale || "",
+          created_at: "2026-09-04T00:03:00Z",
+          updated_at: "2026-09-04T00:03:00Z",
+          state: "draft",
+          proposed_ontology: {identity: {version_id: "version-created"}},
+          transitions: [],
+        };
+        return response({proposal}, {status: 201});
       }
       if (url === "/api/v1/ontology/proposals") {
         if (options.proposalsError) {
@@ -468,7 +643,12 @@ async function runOntologyScenario(ontology, options = {}) {
         if (!value) return response({code: "not_found", message: "not found"}, {ok: false, status: 404});
         return response({blast_radius: value});
       }
-      if (url === "/api/v1/meta") return response({capabilities: {documents: true}});
+      if (url === "/api/v1/meta") return response({
+        max_upload_files: 8,
+        max_upload_file_bytes: 1048576,
+        max_upload_total_bytes: 9437184,
+        capabilities: {documents: true},
+      });
       if (url.endsWith("/documents")) return response({snapshot, documents: [], next_cursor: ""});
       throw new Error("unexpected fetch " + url);
     },

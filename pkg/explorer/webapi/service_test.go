@@ -576,7 +576,7 @@ func TestHTTPIngestUploadsDocumentsAndSourceCode(t *testing.T) {
 	}
 }
 
-func TestHTTPExtractPublishesUploadedSkillGraph(t *testing.T) {
+func TestHTTPIngestRecognizesSkillFiles(t *testing.T) {
 	corpus, err := explorer.Open(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -584,9 +584,6 @@ func TestHTTPExtractPublishesUploadedSkillGraph(t *testing.T) {
 	defer corpus.Close()
 	service, err := webapi.NewEmbeddedService(corpus)
 	if err != nil {
-		t.Fatal(err)
-	}
-	if err := service.SetOntologyVersion(webapiSkillsOntologyVersion(t)); err != nil {
 		t.Fatal(err)
 	}
 	server := httptest.NewUnstartedServer(nil)
@@ -599,37 +596,42 @@ func TestHTTPExtractPublishesUploadedSkillGraph(t *testing.T) {
 	server.Start()
 	defer server.Close()
 
-	uploaded := postMultipart(t, server.URL+"/api/v1/ingest", uploadFixture{
-		name: "SKILL.md", content: "# Demo Skill\n\nTools:\n- demo-cli\n\nCapabilities:\n- Graph extraction\n",
-		mediaType: explorer.MediaTypeMarkdown,
-	})
-	if uploaded.StatusCode != http.StatusOK {
-		t.Fatalf("upload status = %s: %s", uploaded.Status, uploaded.body)
+	response := postMultipart(t, server.URL+"/api/v1/ingest",
+		uploadFixture{
+			name: "skills__alpha__SKILL.md",
+			content: "---\n" +
+				"name: alpha\n" +
+				"description: Alpha skill for upload testing.\n" +
+				"---\n\n" +
+				"# Alpha\n",
+		},
+		uploadFixture{
+			name: "skills__broken__SKILL.md",
+			content: "---\n" +
+				"name: broken\n" +
+				"---\n\n" +
+				"# Broken\n",
+		},
+	)
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("skill upload status = %s: %s", response.Status, response.body)
 	}
 	var ingested webapi.IngestResponse
-	if err := json.Unmarshal(uploaded.body, &ingested); err != nil {
+	if err := json.Unmarshal(response.body, &ingested); err != nil {
 		t.Fatal(err)
 	}
-	body, err := json.Marshal(webapi.ExtractRequest{
-		Snapshot:   ingested.Snapshot,
-		DocumentID: ingested.Files[0].Document.ID,
-		RevisionID: ingested.Files[0].Revision.ID,
-	})
-	if err != nil {
-		t.Fatal(err)
+	if len(ingested.Files) != 2 {
+		t.Fatalf("skill upload response file count = %d, want 2: %+v", len(ingested.Files), ingested)
 	}
-	data := postJSON(t, server.URL+"/api/v1/extract", string(body))
-	var extracted webapi.ExtractResponse
-	if err := json.Unmarshal(data, &extracted); err != nil {
-		t.Fatal(err)
+	valid := ingested.Files[0].SkillFile
+	if valid == nil || !valid.Expected || !valid.Recognized ||
+		valid.Name != "alpha" || valid.Description != "Alpha skill for upload testing." {
+		t.Fatalf("valid skill metadata was not recognized: %+v", valid)
 	}
-	if extracted.EntityCount != 3 || extracted.RelationCount != 2 {
-		t.Fatalf("extract response counts = entities:%d relations:%d, want 3 and 2",
-			extracted.EntityCount, extracted.RelationCount)
-	}
-	if extracted.GraphNodeCount != 3 || extracted.GraphEdgeCount != 5 {
-		t.Fatalf("extract graph counts = nodes:%d edges:%d, want 3 and 5",
-			extracted.GraphNodeCount, extracted.GraphEdgeCount)
+	invalid := ingested.Files[1].SkillFile
+	if invalid == nil || !invalid.Expected || invalid.Recognized ||
+		!strings.Contains(invalid.Message, "frontmatter must include non-empty name and description") {
+		t.Fatalf("invalid SKILL.md did not get actionable metadata: %+v", invalid)
 	}
 }
 
@@ -1457,63 +1459,6 @@ func testRemoteService(
 	return remote, cleanup, first, second
 }
 
-func webapiSkillsOntologyVersion(t *testing.T) ontology.OntologyVersion {
-	t.Helper()
-	name, err := ontology.NewPropertyDefinition(
-		"name", "Name", "Human-readable name", ontology.ValueString, nil, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	skill, err := ontology.NewConceptDefinition(
-		"skill", "Skill", "Agent skill", []shoal.ID{name.ID()}, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	tool, err := ontology.NewConceptDefinition(
-		"tool", "Tool", "Usable tool", []shoal.ID{name.ID()}, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	capability, err := ontology.NewConceptDefinition(
-		"capability", "Capability", "Provided capability", []shoal.ID{name.ID()}, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	providesTool, err := ontology.NewRelationshipDefinition(
-		"provides_tool", "Provides tool", "Skill provides tool",
-		[]shoal.ID{skill.ID()}, []shoal.ID{tool.ID()}, nil, true, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	providesCapability, err := ontology.NewRelationshipDefinition(
-		"provides_capability", "Provides capability", "Skill provides capability",
-		[]shoal.ID{skill.ID()}, []shoal.ID{capability.ID()}, nil, true, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	dependsOn, err := ontology.NewRelationshipDefinition(
-		"depends_on", "Depends on", "Skill depends on skill",
-		[]shoal.ID{skill.ID()}, []shoal.ID{skill.ID()}, nil, true, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	schema, err := ontology.NewOntologySchema(
-		"agent-skills-web", "Agent Skills Web", "Web API skill ontology", nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	version, err := ontology.NewOntologyVersion(
-		schema, "v1", time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
-		[]ontology.ConceptDefinition{skill, tool, capability},
-		[]ontology.RelationshipDefinition{providesTool, providesCapability, dependsOn},
-		[]ontology.PropertyDefinition{name}, nil,
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return version
-}
-
 func serveRemoteService(
 	t *testing.T,
 	service webapi.Service,
@@ -1746,3 +1691,119 @@ func assertViewSpansMatchSource(t *testing.T, view explorer.SectionView, source 
 		t.Fatal("document view did not contain any exact spans")
 	}
 }
+
+func TestHTTPExtractPublishesUploadedSkillGraph(t *testing.T) {
+	corpus, err := explorer.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer corpus.Close()
+	service, err := webapi.NewEmbeddedService(corpus)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := service.SetOntologyVersion(webapiSkillsOntologyVersion(t)); err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewUnstartedServer(nil)
+	handler, err := webapi.NewHandler(service, server.Listener.Addr().String())
+	if err != nil {
+		server.Close()
+		t.Fatal(err)
+	}
+	server.Config.Handler = handler
+	server.Start()
+	defer server.Close()
+
+	uploaded := postMultipart(t, server.URL+"/api/v1/ingest", uploadFixture{
+		name: "SKILL.md", content: "# Demo Skill\n\nTools:\n- demo-cli\n\nCapabilities:\n- Graph extraction\n",
+		mediaType: explorer.MediaTypeMarkdown,
+	})
+	if uploaded.StatusCode != http.StatusOK {
+		t.Fatalf("upload status = %s: %s", uploaded.Status, uploaded.body)
+	}
+	var ingested webapi.IngestResponse
+	if err := json.Unmarshal(uploaded.body, &ingested); err != nil {
+		t.Fatal(err)
+	}
+	body, err := json.Marshal(webapi.ExtractRequest{
+		Snapshot:   ingested.Snapshot,
+		DocumentID: ingested.Files[0].Document.ID,
+		RevisionID: ingested.Files[0].Revision.ID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	data := postJSON(t, server.URL+"/api/v1/extract", string(body))
+	var extracted webapi.ExtractResponse
+	if err := json.Unmarshal(data, &extracted); err != nil {
+		t.Fatal(err)
+	}
+	if extracted.EntityCount != 3 || extracted.RelationCount != 2 {
+		t.Fatalf("extract response counts = entities:%d relations:%d, want 3 and 2",
+			extracted.EntityCount, extracted.RelationCount)
+	}
+	if extracted.GraphNodeCount != 3 || extracted.GraphEdgeCount != 5 {
+		t.Fatalf("extract graph counts = nodes:%d edges:%d, want 3 and 5",
+			extracted.GraphNodeCount, extracted.GraphEdgeCount)
+	}
+}
+
+
+func webapiSkillsOntologyVersion(t *testing.T) ontology.OntologyVersion {
+	t.Helper()
+	name, err := ontology.NewPropertyDefinition(
+		"name", "Name", "Human-readable name", ontology.ValueString, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	skill, err := ontology.NewConceptDefinition(
+		"skill", "Skill", "Agent skill", []shoal.ID{name.ID()}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tool, err := ontology.NewConceptDefinition(
+		"tool", "Tool", "Usable tool", []shoal.ID{name.ID()}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	capability, err := ontology.NewConceptDefinition(
+		"capability", "Capability", "Provided capability", []shoal.ID{name.ID()}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	providesTool, err := ontology.NewRelationshipDefinition(
+		"provides_tool", "Provides tool", "Skill provides tool",
+		[]shoal.ID{skill.ID()}, []shoal.ID{tool.ID()}, nil, true, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	providesCapability, err := ontology.NewRelationshipDefinition(
+		"provides_capability", "Provides capability", "Skill provides capability",
+		[]shoal.ID{skill.ID()}, []shoal.ID{capability.ID()}, nil, true, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dependsOn, err := ontology.NewRelationshipDefinition(
+		"depends_on", "Depends on", "Skill depends on skill",
+		[]shoal.ID{skill.ID()}, []shoal.ID{skill.ID()}, nil, true, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	schema, err := ontology.NewOntologySchema(
+		"agent-skills-web", "Agent Skills Web", "Web API skill ontology", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, err := ontology.NewOntologyVersion(
+		schema, "v1", time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
+		[]ontology.ConceptDefinition{skill, tool, capability},
+		[]ontology.RelationshipDefinition{providesTool, providesCapability, dependsOn},
+		[]ontology.PropertyDefinition{name}, nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return version
+}
+

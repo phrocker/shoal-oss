@@ -229,6 +229,17 @@ type IngestFileResult struct {
 	Revision     document.Revision          `json:"revision"`
 	SectionCount int                        `json:"section_count"`
 	SpanCount    int                        `json:"span_count"`
+	SkillFile    *SkillFileResult           `json:"skill_file,omitempty"`
+}
+
+// SkillFileResult describes whether a markdown upload matches the agent skill
+// file convention. It is upload metadata only; extraction remains separate.
+type SkillFileResult struct {
+	Expected    bool   `json:"expected"`
+	Recognized  bool   `json:"recognized"`
+	Name        string `json:"name,omitempty"`
+	Description string `json:"description,omitempty"`
+	Message     string `json:"message"`
 }
 
 // IngestResponse returns the fresh snapshot after a successful ingest batch.

@@ -732,10 +732,27 @@ function ontologyProposalForm(ontology) {
   const form = document.createElement("form");
   form.className = "ontology-proposal-form";
 
+  const limits = (ontology && ontology.limits) || {};
+  // This active-ontology draft seed is load-bearing; TestStaticWorkspaceOntologyProposalEditorPrepopulatesActiveOntologyOnSubmit
+  // pins that opening the editor and changing one field still submits every
+  // currently active concept, relationship, property, and constraint.
+  const editor = {
+    draft: ontologyDraftFromActive(
+      ontology,
+      proposalVersionSuffix(ontology && ontology.version && ontology.version.version),
+    ),
+    errors: {},
+  };
+
   const versionLabel = document.createElement("label");
   versionLabel.textContent = "Proposed version";
   const version = document.createElement("input");
-  version.value = proposalVersionSuffix(ontology && ontology.version && ontology.version.version);
+  version.className = "ontology-proposal-version";
+  version.value = editor.draft.version;
+  version.oninput = () => {
+    editor.draft.version = version.value;
+    refreshDraftJSON(draft, editor.draft);
+  };
   versionLabel.append(version);
 
   const rationaleLabel = document.createElement("label");
@@ -744,18 +761,33 @@ function ontologyProposalForm(ontology) {
   rationale.placeholder = "Why should this ontology refinement be considered?";
   rationaleLabel.append(rationale);
 
+  const modeControls = document.createElement("div");
+  modeControls.className = "ontology-proposal-modes";
+  const formMode = document.createElement("button");
+  formMode.type = "button";
+  formMode.textContent = "Form editor";
+  const rawMode = document.createElement("button");
+  rawMode.type = "button";
+  rawMode.textContent = "Raw JSON";
+  modeControls.append(formMode, rawMode);
+
+  const builder = document.createElement("div");
+  builder.className = "ontology-proposal-builder";
+
   const draftLabel = document.createElement("label");
   draftLabel.textContent = "Proposed ontology JSON";
+  draftLabel.hidden = true;
   const draft = document.createElement("textarea");
   draft.className = "ontology-proposal-json";
-  draft.value = JSON.stringify(ontologyDraftFromActive(ontology, version.value), null, 2);
-  version.onchange = () => {
+  refreshDraftJSON(draft, editor.draft);
+  draft.oninput = () => {
     try {
-      const value = JSON.parse(draft.value);
-      value.version = version.value;
-      draft.value = JSON.stringify(value, null, 2);
-    } catch (_) {
-      // Leave hand-edited JSON alone; submit will surface the parse error.
+      const parsed = parseProposalDraft(draft.value, limits);
+      editor.draft = parsed;
+      version.value = parsed.version || "";
+      setStatus(status, "Raw JSON is valid and ready to sync back to the form.", "muted");
+    } catch (error) {
+      setStatus(status, `Raw proposal JSON is invalid: ${error.message || String(error)}.`, "error");
     }
   };
   draftLabel.append(draft);
@@ -767,14 +799,481 @@ function ontologyProposalForm(ontology) {
   status.setAttribute("role", "status");
   status.className = "muted";
   status.textContent =
-    "Drafts are immutable proposals. Edit the JSON before creating one.";
+    "Draft is pre-populated from the active ontology. Use Remove controls for deliberate deletions.";
+
+  formMode.onclick = () => {
+    try {
+      // This raw-to-form parse is load-bearing; TestStaticWorkspaceOntologyProposalEditorRoundTripsRawAndForms
+      // pins that power-user JSON edits are rendered back into per-element
+      // forms without losing optional fields.
+      editor.draft = parseProposalDraft(draft.value, limits);
+      version.value = editor.draft.version || "";
+      renderProposalBuilder(builder, editor, draft, status, limits);
+      builder.hidden = false;
+      draftLabel.hidden = true;
+      formMode.disabled = true;
+      rawMode.disabled = false;
+      setStatus(status, "Form editor synced from raw JSON.", "muted");
+    } catch (error) {
+      setStatus(status, `Raw proposal JSON is invalid: ${error.message || String(error)}.`, "error");
+    }
+  };
+  rawMode.onclick = () => {
+    const error = proposalEditorError(editor);
+    if (error) {
+      setStatus(status, error, "error");
+      return;
+    }
+    try {
+      validateProposalDraftBounds(editor.draft, limits);
+      refreshDraftJSON(draft, editor.draft);
+      builder.hidden = true;
+      draftLabel.hidden = false;
+      formMode.disabled = false;
+      rawMode.disabled = true;
+      setStatus(status, "Raw JSON view is synced from the per-element forms.", "muted");
+    } catch (error) {
+      setStatus(status, `Proposal exceeds ontology bounds: ${error.message || String(error)}.`, "error");
+    }
+  };
 
   form.onsubmit = async (event) => {
     event.preventDefault();
-    await createOntologyProposal(version, rationale, draft, status, submit);
+    if (!draftLabel.hidden) {
+      try {
+        editor.draft = parseProposalDraft(draft.value, limits);
+      } catch (error) {
+        setStatus(status, `Proposal JSON is invalid: ${error.message || String(error)}.`, "error");
+        return;
+      }
+    }
+    const error = proposalEditorError(editor);
+    if (error) {
+      setStatus(status, error, "error");
+      return;
+    }
+    try {
+      // This bound check is load-bearing; TestStaticWorkspaceOntologyProposalEditorBoundsErrorDoesNotTruncate
+      // pins that the UI reports over-limit drafts instead of silently
+      // dropping excess elements before POSTing the proposal.
+      validateProposalDraftBounds(editor.draft, limits);
+    } catch (error) {
+      setStatus(status, `Proposal exceeds ontology bounds: ${error.message || String(error)}.`, "error");
+      return;
+    }
+    await createOntologyProposal(version, rationale, editor.draft, status, submit);
   };
-  form.append(versionLabel, rationaleLabel, draftLabel, submit, status);
+  renderProposalBuilder(builder, editor, draft, status, limits);
+  formMode.disabled = true;
+  form.append(versionLabel, rationaleLabel, modeControls, builder, draftLabel, submit, status);
   return form;
+}
+
+function renderProposalBuilder(container, editor, raw, status, limits) {
+  editor.errors = {};
+  container.replaceChildren(
+    ontologyProposalElementSection(
+      "Properties",
+      "property",
+      editor.draft.properties,
+      "No properties. Removing all properties is allowed only when it is visible here.",
+      (property, index) => propertyDraftEditor(property, index, editor, raw, status),
+      () => {
+        editor.draft.properties.push({
+          key: "", name: "", description: "", value_type: "string", constraints: [],
+        });
+      },
+      container,
+      editor,
+      raw,
+      status,
+      limits,
+    ),
+    ontologyProposalElementSection(
+      "Concepts",
+      "concept",
+      editor.draft.concepts,
+      "No concepts. Removing all concepts is allowed only when it is visible here.",
+      (concept, index) => conceptDraftEditor(concept, index, editor, raw),
+      () => {
+        editor.draft.concepts.push({key: "", name: "", description: "", properties: []});
+      },
+      container,
+      editor,
+      raw,
+      status,
+      limits,
+    ),
+    ontologyProposalElementSection(
+      "Relationships",
+      "relationship",
+      editor.draft.relationships,
+      "No relationships. Removing all relationships is allowed only when it is visible here.",
+      (relationship, index) => relationshipDraftEditor(relationship, index, editor, raw),
+      () => {
+        editor.draft.relationships.push({
+          key: "", name: "", description: "", from_concepts: [], to_concepts: [],
+          properties: [], directed: true,
+        });
+      },
+      container,
+      editor,
+      raw,
+      status,
+      limits,
+    ),
+  );
+}
+
+function ontologyProposalElementSection(
+  title,
+  kind,
+  values,
+  emptyText,
+  renderItem,
+  addItem,
+  container,
+  editor,
+  raw,
+  status,
+  limits,
+) {
+  const section = document.createElement("section");
+  section.className = "ontology-proposal-elements";
+  const heading = document.createElement("h4");
+  heading.textContent = `${title} (${values.length})`;
+  const add = document.createElement("button");
+  add.type = "button";
+  add.textContent = `Add ${kind}`;
+  add.onclick = () => {
+    addItem();
+    refreshDraftJSON(raw, editor.draft);
+    renderProposalBuilder(container, editor, raw, status, limits);
+  };
+  section.append(heading, add);
+  if (values.length === 0) {
+    const empty = document.createElement("p");
+    empty.className = "empty-state";
+    empty.textContent = emptyText;
+    section.append(empty);
+    return section;
+  }
+  const list = document.createElement("div");
+  list.className = "ontology-proposal-element-list";
+  values.forEach((value, index) => {
+    const card = renderItem(value, index);
+    // This explicit per-element remove control is load-bearing; TestStaticWorkspaceOntologyProposalEditorPrepopulatesActiveOntologyOnSubmit
+    // pins that deletion is visible as an action rather than an accidental
+    // omission from the generated draft.
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = `ontology-remove-${kind}`;
+    remove.textContent = `Remove ${kind}`;
+    remove.onclick = () => {
+      values.splice(index, 1);
+      refreshDraftJSON(raw, editor.draft);
+      renderProposalBuilder(container, editor, raw, status, limits);
+      setStatus(status, `${kind} removed from draft. This deletion will appear in blast radius after creation.`, "withheld");
+    };
+    card.append(remove);
+    list.append(card);
+  });
+  section.append(list);
+  return section;
+}
+
+function propertyDraftEditor(property, index, editor, raw, status) {
+  const card = proposalDraftCard("property", property.key, index);
+  card.append(
+    proposalInput("ontology-proposal-property-key", "Key", property.key, (value) => {
+      property.key = value;
+      refreshDraftJSON(raw, editor.draft);
+    }),
+    proposalInput("ontology-proposal-property-name", "Name", property.name, (value) => {
+      property.name = value;
+      refreshDraftJSON(raw, editor.draft);
+    }),
+    proposalTextarea(
+      "ontology-proposal-property-description",
+      "Description",
+      property.description || "",
+      (value) => {
+        property.description = value;
+        refreshDraftJSON(raw, editor.draft);
+      },
+    ),
+    proposalInput(
+      "ontology-proposal-property-value-type",
+      "Value type",
+      property.value_type || "string",
+      (value) => {
+        property.value_type = value;
+        refreshDraftJSON(raw, editor.draft);
+      },
+      "string, integer, number, boolean, timestamp, or reference",
+    ),
+    proposalTextarea(
+      "ontology-proposal-property-constraints",
+      "Constraints JSON",
+      JSON.stringify(property.constraints || [], null, 2),
+      (value) => {
+        try {
+          const constraints = JSON.parse(value || "[]");
+          if (!Array.isArray(constraints)) throw new Error("constraints must be an array");
+          property.constraints = constraints;
+          setProposalEditorError(editor, `property-${index}-constraints`, "");
+          refreshDraftJSON(raw, editor.draft);
+        } catch (error) {
+          setProposalEditorError(
+            editor,
+            `property-${index}-constraints`,
+            `Property ${property.key || index + 1} constraints JSON is invalid: ${error.message || String(error)}.`,
+          );
+          setStatus(status, proposalEditorError(editor), "error");
+        }
+      },
+    ),
+  );
+  return card;
+}
+
+function conceptDraftEditor(concept, index, editor, raw) {
+  const card = proposalDraftCard("concept", concept.key, index);
+  card.append(
+    proposalInput("ontology-proposal-concept-key", "Key", concept.key, (value) => {
+      concept.key = value;
+      refreshDraftJSON(raw, editor.draft);
+    }),
+    proposalInput("ontology-proposal-concept-name", "Name", concept.name, (value) => {
+      concept.name = value;
+      refreshDraftJSON(raw, editor.draft);
+    }),
+    proposalTextarea(
+      "ontology-proposal-concept-description",
+      "Description",
+      concept.description || "",
+      (value) => {
+        concept.description = value;
+        refreshDraftJSON(raw, editor.draft);
+      },
+    ),
+    proposalTextarea(
+      "ontology-proposal-concept-properties",
+      "Property keys",
+      keyListText(concept.properties),
+      (value) => {
+        concept.properties = parseKeyList(value);
+        refreshDraftJSON(raw, editor.draft);
+      },
+    ),
+  );
+  return card;
+}
+
+function relationshipDraftEditor(relationship, index, editor, raw) {
+  const card = proposalDraftCard("relationship", relationship.key, index);
+  card.append(
+    proposalInput("ontology-proposal-relationship-key", "Key", relationship.key, (value) => {
+      relationship.key = value;
+      refreshDraftJSON(raw, editor.draft);
+    }),
+    proposalInput("ontology-proposal-relationship-name", "Name", relationship.name, (value) => {
+      relationship.name = value;
+      refreshDraftJSON(raw, editor.draft);
+    }),
+    proposalTextarea(
+      "ontology-proposal-relationship-description",
+      "Description",
+      relationship.description || "",
+      (value) => {
+        relationship.description = value;
+        refreshDraftJSON(raw, editor.draft);
+      },
+    ),
+    proposalTextarea(
+      "ontology-proposal-relationship-from",
+      "From concept keys",
+      keyListText(relationship.from_concepts),
+      (value) => {
+        relationship.from_concepts = parseKeyList(value);
+        refreshDraftJSON(raw, editor.draft);
+      },
+    ),
+    proposalTextarea(
+      "ontology-proposal-relationship-to",
+      "To concept keys",
+      keyListText(relationship.to_concepts),
+      (value) => {
+        relationship.to_concepts = parseKeyList(value);
+        refreshDraftJSON(raw, editor.draft);
+      },
+    ),
+    proposalTextarea(
+      "ontology-proposal-relationship-properties",
+      "Property keys",
+      keyListText(relationship.properties),
+      (value) => {
+        relationship.properties = parseKeyList(value);
+        refreshDraftJSON(raw, editor.draft);
+      },
+    ),
+    proposalCheckbox("ontology-proposal-relationship-directed", "Directed", relationship.directed === true, (value) => {
+      relationship.directed = value;
+      refreshDraftJSON(raw, editor.draft);
+    }),
+  );
+  return card;
+}
+
+function proposalDraftCard(kind, key, index) {
+  const card = document.createElement("article");
+  card.className = `ontology-proposal-element ontology-proposal-${kind}`;
+  const heading = document.createElement("h5");
+  heading.textContent = `${kind} ${key || index + 1}`;
+  card.append(heading);
+  return card;
+}
+
+function proposalInput(className, labelText, value, oninput, placeholder = "") {
+  const label = document.createElement("label");
+  label.textContent = labelText;
+  const input = document.createElement("input");
+  input.className = className;
+  input.value = value || "";
+  input.placeholder = placeholder;
+  input.oninput = () => oninput(input.value);
+  label.append(input);
+  return label;
+}
+
+function proposalTextarea(className, labelText, value, oninput) {
+  const label = document.createElement("label");
+  label.textContent = labelText;
+  const input = document.createElement("textarea");
+  input.className = className;
+  input.value = value || "";
+  input.oninput = () => oninput(input.value);
+  label.append(input);
+  return label;
+}
+
+function proposalCheckbox(className, labelText, checked, onchange) {
+  const label = document.createElement("label");
+  label.className = "ontology-proposal-checkbox";
+  const input = document.createElement("input");
+  input.className = className;
+  input.type = "checkbox";
+  input.checked = checked;
+  input.onchange = () => onchange(input.checked);
+  label.append(input);
+  const text = document.createElement("span");
+  text.textContent = labelText;
+  label.append(text);
+  return label;
+}
+
+function setProposalEditorError(editor, key, message) {
+  if (message) editor.errors[key] = message;
+  else delete editor.errors[key];
+}
+
+function proposalEditorError(editor) {
+  const keys = Object.keys(editor.errors).sort();
+  return keys.length === 0 ? "" : editor.errors[keys[0]];
+}
+
+function keyListText(values) {
+  return (values || []).join(", ");
+}
+
+function parseKeyList(value) {
+  return String(value || "")
+    .split(/[,\n]+/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function refreshDraftJSON(raw, draft) {
+  raw.value = JSON.stringify(draft, null, 2);
+}
+
+function parseProposalDraft(text, limits) {
+  const draft = JSON.parse(text);
+  normalizeProposalDraft(draft);
+  return draft;
+}
+
+function normalizeProposalDraft(draft) {
+  if (!draft || typeof draft !== "object" || Array.isArray(draft)) {
+    throw new Error("proposal draft must be an object");
+  }
+  draft.version = String(draft.version || "");
+  draft.properties = Array.isArray(draft.properties) ? draft.properties : [];
+  draft.concepts = Array.isArray(draft.concepts) ? draft.concepts : [];
+  draft.relationships = Array.isArray(draft.relationships) ? draft.relationships : [];
+  for (const property of draft.properties) {
+    property.constraints = Array.isArray(property.constraints) ? property.constraints : [];
+  }
+  for (const concept of draft.concepts) {
+    concept.properties = Array.isArray(concept.properties) ? concept.properties : [];
+  }
+  for (const relationship of draft.relationships) {
+    relationship.from_concepts = Array.isArray(relationship.from_concepts) ? relationship.from_concepts : [];
+    relationship.to_concepts = Array.isArray(relationship.to_concepts) ? relationship.to_concepts : [];
+    relationship.properties = Array.isArray(relationship.properties) ? relationship.properties : [];
+    relationship.directed = relationship.directed === true;
+  }
+}
+
+function validateProposalDraftBounds(draft, limits) {
+  const bound = (name) => Number(limits && limits[name] || 0);
+  enforceDraftBound("concept", (draft.concepts || []).length, bound("max_concepts"));
+  enforceDraftBound("relationship", (draft.relationships || []).length, bound("max_relationships"));
+  enforceDraftBound("property", (draft.properties || []).length, bound("max_properties"));
+  for (const concept of draft.concepts || []) {
+    enforceDraftBound(
+      `concept ${concept.key || ""} property`,
+      (concept.properties || []).length,
+      bound("max_definition_properties"),
+    );
+  }
+  for (const relationship of draft.relationships || []) {
+    enforceDraftBound(
+      `relationship ${relationship.key || ""} from concept`,
+      (relationship.from_concepts || []).length,
+      bound("max_relationship_endpoint_sets"),
+    );
+    enforceDraftBound(
+      `relationship ${relationship.key || ""} to concept`,
+      (relationship.to_concepts || []).length,
+      bound("max_relationship_endpoint_sets"),
+    );
+    enforceDraftBound(
+      `relationship ${relationship.key || ""} property`,
+      (relationship.properties || []).length,
+      bound("max_definition_properties"),
+    );
+  }
+  for (const property of draft.properties || []) {
+    enforceDraftBound(
+      `property ${property.key || ""} constraint`,
+      (property.constraints || []).length,
+      bound("max_constraints_per_property"),
+    );
+    for (const constraint of property.constraints || []) {
+      enforceDraftBound(
+        `property ${property.key || ""} allowed value`,
+        (constraint.allowed_values || []).length,
+        bound("max_allowed_values"),
+      );
+    }
+  }
+}
+
+function enforceDraftBound(label, count, limit) {
+  if (limit > 0 && count > limit) {
+    throw new Error(`${label} count ${count} exceeds limit ${limit}`);
+  }
 }
 
 function ontologyProposalCard(proposal) {
@@ -975,7 +1474,9 @@ function proposalActionsForState(stateName) {
 async function createOntologyProposal(version, rationale, draft, status, button) {
   let proposed;
   try {
-    proposed = JSON.parse(draft.value);
+    proposed = draft && typeof draft.value === "string"
+      ? JSON.parse(draft.value)
+      : JSON.parse(JSON.stringify(draft));
   } catch (error) {
     setStatus(status, `Proposal JSON is invalid: ${error.message || String(error)}.`, "error");
     return;
@@ -1323,6 +1824,7 @@ function applyIngestCapability() {
   const canIngest = capability("ingest");
   $("upload-section").hidden = !canIngest;
   $("upload-files").disabled = !canIngest || uploadLoading;
+  $("upload-directory").disabled = !canIngest || uploadLoading;
   $("upload-button").disabled = !canIngest || uploadLoading;
   if (!canIngest) {
     $("upload-results").replaceChildren();
@@ -1481,31 +1983,213 @@ async function uploadFiles(fileList) {
   uploadLoading = true;
   applyIngestCapability();
   $("upload-results").replaceChildren();
-  setStatus($("upload-status"), `Uploading ${files.length} file(s)…`);
+  setStatus($("upload-status"), `Preparing ${files.length} file(s)…`);
   try {
-    const body = new FormData();
-    for (const file of files) body.append("files", file, file.name);
-    const response = await fetch("/api/v1/ingest", {
-      method: "POST",
-      headers: {"accept": "application/json", "x-shoal-workspace-request": "1", ...authHeaders()},
-      body,
-    });
-    const value = await response.json();
-    if (!response.ok) throw apiError(value, response);
-    clearSnapshotDependentViews();
-    pin(value.snapshot);
-    renderUploadResults(value.files || []);
-    await loadDocuments(true);
+    const plan = planUpload(files);
+    const results = [...plan.skipped];
+    let uploaded = 0;
+    let failed = 0;
+    const failureMessages = [];
+    let latestSnapshot = null;
+    for (let index = 0; index < plan.batches.length; index++) {
+      const batch = plan.batches[index];
+      setStatus(
+        $("upload-status"),
+        `Uploading batch ${index + 1} of ${plan.batches.length} (${batch.length} file(s))…`,
+      );
+      try {
+        const value = await uploadBatch(batch);
+        const uploadedFiles = value.files || [];
+        uploaded += uploadedFiles.length;
+        results.push(...uploadedFiles);
+        latestSnapshot = value.snapshot || latestSnapshot;
+      } catch (error) {
+        failed += batch.length;
+        failureMessages.push(error.message || String(error));
+        // This append is load-bearing; TestStaticWorkspaceUploadReportsMidBatchFailure pins
+        // that earlier successful batches remain visible when a later batch fails.
+        results.push(...batch.map((entry) => failedUploadResult(entry, error)));
+      }
+    }
+    if (uploaded > 0 || failed > 0) {
+      // This reset is load-bearing; TestStaticWorkspaceUploadReportsMidBatchFailure pins
+      // that document views refresh from upload state without discarding partial results.
+      clearSnapshotDependentViews();
+      if (latestSnapshot) {
+        // This pin is load-bearing; TestStaticWorkspaceUploadReportsMidBatchFailure pins
+        // that the document refresh uses the last successful upload snapshot.
+        pin(latestSnapshot);
+      } else {
+        clearPinnedSnapshot();
+      }
+      renderUploadResults(results, uploadSummary(files.length, uploaded, failed, plan.skipped.length, failureMessages));
+      await loadDocuments(true);
+    } else {
+      renderUploadResults(results, uploadSummary(files.length, uploaded, failed, plan.skipped.length, failureMessages));
+    }
   } catch (error) {
     showActionError($("upload-status"), error, "upload files");
-    clearSnapshotDependentViews();
-    clearPinnedSnapshot();
-    await loadDocuments(true);
   } finally {
     uploadLoading = false;
     applyIngestCapability();
     $("upload-files").value = "";
+    $("upload-directory").value = "";
   }
+}
+
+function planUpload(files) {
+  const bounds = uploadBounds();
+  const entries = uploadEntries(files);
+  const batches = [];
+  const skipped = [];
+  let batch = [];
+  let batchBytes = 0;
+  for (const entry of entries) {
+    if (entry.size > bounds.maxFileBytes) {
+      // This branch is load-bearing; TestStaticWorkspaceDirectoryUploadSkipsOversizedFiles
+      // pins that one oversized directory file is reported without aborting its siblings.
+      skipped.push(skippedUploadResult(entry, `exceeds the per-file limit of ${formatBytes(bounds.maxFileBytes)}`));
+      continue;
+    }
+    if (entry.size > bounds.maxTotalBytes) {
+      skipped.push(skippedUploadResult(entry, `exceeds the per-request limit of ${formatBytes(bounds.maxTotalBytes)}`));
+      continue;
+    }
+    if (batch.length > 0 &&
+      (batch.length >= bounds.maxFiles || batchBytes + entry.size > bounds.maxTotalBytes)) {
+      // This boundary is load-bearing; TestStaticWorkspaceDirectoryUploadBatchesAtServerLimit
+      // pins that MaxUploadFiles + 1 creates a second request instead of truncating.
+      batches.push(batch);
+      batch = [];
+      batchBytes = 0;
+    }
+    if (batch.length >= bounds.maxFiles || batchBytes + entry.size > bounds.maxTotalBytes) {
+      throw new Error("Upload bounds cannot fit a file into a request; no files were truncated.");
+    }
+    batch.push(entry);
+    batchBytes += entry.size;
+  }
+  if (batch.length > 0) batches.push(batch);
+  return {batches, skipped};
+}
+
+function uploadBounds() {
+  const maxFiles = Number(state.uploadLimits.max_upload_files) || 0;
+  const maxFileBytes = Number(state.uploadLimits.max_upload_file_bytes) || 0;
+  const maxTotalBytes = Number(state.uploadLimits.max_upload_total_bytes) || 0;
+  if (maxFiles <= 0 || maxFileBytes <= 0 || maxTotalBytes <= 0) {
+    // This error is load-bearing; TestStaticWorkspaceUploadRequiresMetadataBounds pins
+    // that missing /api/v1/meta bounds stop upload instead of silently truncating files.
+    throw new Error("Upload bounds are unavailable from /api/v1/meta; reload before uploading.");
+  }
+  return {maxFiles, maxFileBytes, maxTotalBytes};
+}
+
+function uploadEntries(files) {
+  const entries = files.map((file, index) => {
+    const sourcePath = uploadSourcePath(file, index);
+    return {
+      file,
+      index,
+      sourcePath,
+      // This name derivation is load-bearing; TestStaticWorkspaceDirectoryUploadRenamesSkillCollisions
+      // pins that repeated SKILL.md basenames from different directories reach the server uniquely.
+      uploadName: safeUploadName(sourcePath, index),
+      size: Math.max(0, Number(file.size) || 0),
+    };
+  });
+  // This sort is load-bearing; TestStaticWorkspaceDirectoryUploadRenamesSkillCollisions
+  // pins deterministic directory batch order independent of browser FileList order.
+  entries.sort((left, right) =>
+    left.sourcePath.localeCompare(right.sourcePath) || left.index - right.index);
+  const seen = new Map();
+  for (const entry of entries) {
+    const count = (seen.get(entry.uploadName) || 0) + 1;
+    seen.set(entry.uploadName, count);
+    if (count > 1) entry.uploadName = `${count}__${entry.uploadName}`;
+  }
+  return entries;
+}
+
+function uploadSourcePath(file, index) {
+  const relative = String((file && file.webkitRelativePath) || "").trim();
+  const name = String((file && file.name) || `upload-${index + 1}.txt`).trim();
+  return relative || name || `upload-${index + 1}.txt`;
+}
+
+function safeUploadName(sourcePath, index) {
+  const parts = String(sourcePath || "")
+    .split(/[\\/]+/)
+    .map(safeUploadSegment)
+    .filter(Boolean);
+  const name = parts.join("__") || `upload-${index + 1}.txt`;
+  return safeUploadSegment(name);
+}
+
+function safeUploadSegment(segment) {
+  let value = String(segment || "")
+    .trim()
+    .replace(/[\u0000-\u001f\u007f-\u009f\u00ad\u061c\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff<>:"|?*]/g, "_")
+    .replace(/\.\.+/g, "._")
+    .replace(/[. ]+$/g, "");
+  if (!value) value = "file";
+  if (/^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$/i.test(value)) {
+    value = `${value}_`;
+  }
+  return value;
+}
+
+async function uploadBatch(batch) {
+  const body = new FormData();
+  for (const entry of batch) body.append("files", entry.file, entry.uploadName);
+  const response = await fetch("/api/v1/ingest", {
+    method: "POST",
+    headers: {"accept": "application/json", "x-shoal-workspace-request": "1", ...authHeaders()},
+    body,
+  });
+  const value = await response.json();
+  if (!response.ok) throw apiError(value, response);
+  return value;
+}
+
+function skippedUploadResult(entry, reason) {
+  return {
+    name: entry.uploadName,
+    original_name: entry.sourcePath,
+    disposition: "skipped",
+    media_type: "",
+    span_count: 0,
+    message: `Skipped ${entry.sourcePath}: ${formatBytes(entry.size)} ${reason}.`,
+  };
+}
+
+function failedUploadResult(entry, error) {
+  return {
+    name: entry.uploadName,
+    original_name: entry.sourcePath,
+    disposition: "failed",
+    media_type: "",
+    span_count: 0,
+    message: `Failed ${entry.sourcePath}: ${error.message || String(error)}`,
+  };
+}
+
+function uploadSummary(total, uploaded, failed, skipped, failureMessages = []) {
+  if (failed > 0 || skipped > 0) {
+    const parts = [`Uploaded ${uploaded} of ${total} file(s)`];
+    if (failed > 0) parts.push(`${failed} failed`);
+    if (skipped > 0) parts.push(`${skipped} skipped`);
+    const detail = failureMessages.length > 0 ? `: ${failureMessages[0]}` : "";
+    return `${parts.join("; ")}${detail}.`;
+  }
+  return `Uploaded ${uploaded} file(s).`;
+}
+
+function formatBytes(bytes) {
+  const size = Number(bytes) || 0;
+  if (size >= 1024 * 1024) return `${(size / (1024 * 1024)).toFixed(1)} MiB`;
+  if (size >= 1024) return `${Math.ceil(size / 1024)} KiB`;
+  return `${size} B`;
 }
 
 function clearPinnedSnapshot() {
@@ -1537,34 +2221,63 @@ function clearSnapshotDependentViews() {
   draw();
 }
 
-function renderUploadResults(files) {
+function renderUploadResults(files, statusText = "") {
   const results = $("upload-results");
   results.replaceChildren();
   if (files.length === 0) {
     setStatus($("upload-status"), "No files were ingested.", "empty-state");
     return;
   }
-  setStatus($("upload-status"), `Uploaded ${files.length} file(s).`);
+  setStatus($("upload-status"), statusText || `Uploaded ${files.length} file(s).`);
   for (const file of files) {
     const item = document.createElement("li");
-    item.textContent = `${file.name}: ${file.disposition} (${file.media_type}, ` +
-      `${file.span_count} span(s))`;
+    const details = [];
+    if (file.media_type) details.push(file.media_type);
+    if (file.span_count !== undefined) details.push(`${file.span_count} span(s)`);
+    let text = `${file.name}: ${file.disposition}`;
+    if (details.length > 0) text += ` (${details.join(", ")})`;
+    if (file.original_name && file.original_name !== file.name) text += ` from ${file.original_name}`;
+    if (file.message) text += `. ${file.message}`;
+    // This rendering is load-bearing; TestStaticWorkspaceDirectoryUploadRenamesSkillCollisions
+    // pins that recognized agent skill metadata is visible per file.
+    if (file.skill_file) text += `. ${skillFileText(file.skill_file)}`;
+    item.textContent = text;
     results.append(item);
   }
 }
 
+function skillFileText(value) {
+  if (value.recognized) {
+    return `Agent skill file recognized: ${value.name} — ${value.description}`;
+  }
+  if (value.expected) {
+    return value.message || "Expected an agent skills file, but it was not recognized.";
+  }
+  return value.message || "Markdown skills metadata was inspected.";
+}
+
 $("upload").onsubmit = async (event) => {
   event.preventDefault();
-  await uploadFiles($("upload-files").files);
+  await uploadFiles(selectedUploadFiles());
 };
 
-$("upload-files").onchange = () => {
-  const count = $("upload-files").files ? $("upload-files").files.length : 0;
+function selectedUploadFiles() {
+  return [
+    ...($("upload-files").files || []),
+    ...($("upload-directory").files || []),
+  ];
+}
+
+function updateUploadReadyStatus() {
+  const count = selectedUploadFiles().length;
   setStatus(
     $("upload-status"),
     count ? `${count} file(s) ready to upload.` : uploadLimitText(),
   );
-};
+}
+
+$("upload-files").onchange = updateUploadReadyStatus;
+$("upload-directory").onchange = updateUploadReadyStatus;
 
 $("upload-drop").ondragover = (event) => {
   event.preventDefault();

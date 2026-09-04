@@ -21,11 +21,13 @@ package authorized
 
 import (
 	"context"
+	"strings"
 	"time"
 
 	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/graph"
+	"github.com/phrocker/shoal-oss/pkg/ontology"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
@@ -115,6 +117,9 @@ func (c *Client) Neighborhood(
 		return explorer.Neighborhood{}, err
 	}
 	for _, nodeID := range normalized.NodeIDs {
+		if possibleProvenanceNodeID(nodeID) {
+			continue
+		}
 		if _, err := c.authorizedNode(
 			ctx, nodeID, decision, auth.OperationNeighborhood, now); err != nil {
 			return explorer.Neighborhood{}, err
@@ -125,7 +130,7 @@ func (c *Client) Neighborhood(
 		return explorer.Neighborhood{}, directBaseError(err)
 	}
 	result, err := c.filterNeighborhood(
-		ctx, raw, normalized, explorer.GraphDirectionBoth, decision, now)
+		ctx, raw, normalized, explorer.GraphDirectionBoth, decision, now, false)
 	if err != nil {
 		return explorer.Neighborhood{}, err
 	}
@@ -291,6 +296,11 @@ func edgeEndpointsAllow(
 		return toAllowed, err
 	}
 	return true, nil
+}
+
+func possibleProvenanceNodeID(nodeID shoal.ID) bool {
+	return strings.HasPrefix(string(nodeID), "producer_") ||
+		ontology.IDNamespace(nodeID) == "assertion"
 }
 
 func (c *Client) authorizedNode(

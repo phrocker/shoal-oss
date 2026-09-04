@@ -501,6 +501,12 @@ func (e *Explorer) Connect(ctx context.Context, edge graph.Edge) error {
 			"applications cannot create edges in the reserved interaction namespace",
 		)
 	}
+	if graph.IsProvenanceEdgeType(edge.Type) {
+		return shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			"applications cannot create edges in the reserved provenance namespace",
+		)
+	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if err := e.requireOpen(); err != nil {
@@ -519,6 +525,11 @@ func (e *Explorer) Connect(ctx context.Context, edge graph.Edge) error {
 			shoal.ErrorInvalidArgument,
 			"applications cannot attach edges to interaction nodes",
 		)
+	} else if graph.IsProvenanceKind(node.Kind) {
+		return shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			"applications cannot attach edges to provenance nodes",
+		)
 	}
 	if node, ok := e.graphNodes[edge.To]; !ok {
 		return shoal.NewError(shoal.ErrorNotFound, "edge target node not found")
@@ -526,6 +537,11 @@ func (e *Explorer) Connect(ctx context.Context, edge graph.Edge) error {
 		return shoal.NewError(
 			shoal.ErrorInvalidArgument,
 			"applications cannot attach edges to interaction nodes",
+		)
+	} else if graph.IsProvenanceKind(node.Kind) {
+		return shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			"applications cannot attach edges to provenance nodes",
 		)
 	}
 	if existing, ok := e.graphEdges[edge.ID]; ok {
@@ -793,6 +809,31 @@ func (e *Explorer) computeCurrentGraph() (
 		}
 		edges[edge.ID] = edge
 		assertions[edge.ID] = assertion
+		producer, assertionNode, derivationEdge, ok, err :=
+			producerGraphElementsForAssertion(assertion)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		if !ok {
+			continue
+		}
+		// Load-bearing: TestLatentLinkProducerProvenanceReachableFromBoundedGraph
+		// pins that live latent reads materialize producer nodes, assertion
+		// nodes, and derivation edges in the cached graph.
+		if err := putDerivedGraphNode(nodes, producer); err != nil {
+			return nil, nil, nil, err
+		}
+		if err := putDerivedGraphNode(nodes, assertionNode); err != nil {
+			return nil, nil, nil, err
+		}
+		if existing, exists := edges[derivationEdge.ID]; exists &&
+			!edgesEqual(existing, derivationEdge) {
+			return nil, nil, nil, shoal.NewError(
+				shoal.ErrorConflict,
+				"producer derivation edge ID already has different content",
+			)
+		}
+		edges[derivationEdge.ID] = derivationEdge
 	}
 	for _, record := range e.interactions {
 		for _, edge := range record.Edges {
@@ -983,6 +1024,17 @@ func edgesEqual(left, right graph.Edge) bool {
 		}
 	}
 	return true
+}
+
+func putDerivedGraphNode(nodes map[shoal.ID]graph.Node, node graph.Node) error {
+	if existing, exists := nodes[node.ID]; exists && !nodesEqual(existing, node) {
+		return shoal.NewError(
+			shoal.ErrorConflict,
+			"derived graph node ID already has different content",
+		)
+	}
+	nodes[node.ID] = node
+	return nil
 }
 
 func nodesEqual(left, right graph.Node) bool {
