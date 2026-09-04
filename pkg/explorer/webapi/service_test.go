@@ -1749,7 +1749,6 @@ func TestHTTPExtractPublishesUploadedSkillGraph(t *testing.T) {
 	}
 }
 
-
 func webapiSkillsOntologyVersion(t *testing.T) ontology.OntologyVersion {
 	t.Helper()
 	name, err := ontology.NewPropertyDefinition(
@@ -1806,4 +1805,3 @@ func webapiSkillsOntologyVersion(t *testing.T) ontology.OntologyVersion {
 	}
 	return version
 }
-
