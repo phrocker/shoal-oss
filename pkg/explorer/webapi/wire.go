@@ -29,6 +29,7 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/document"
 	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/graph"
+	"github.com/phrocker/shoal-oss/pkg/ontology"
 	"github.com/phrocker/shoal-oss/pkg/retrieval"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
@@ -123,8 +124,70 @@ type wireCitation struct {
 }
 
 type wireNeighborhood struct {
-	Nodes []wireNode `json:"nodes"`
-	Edges []wireEdge `json:"edges"`
+	Nodes      []wireNode      `json:"nodes"`
+	Edges      []wireEdge      `json:"edges"`
+	Assertions []wireAssertion `json:"assertions,omitempty"`
+}
+
+type wireAssertion struct {
+	ID          string                   `json:"id"`
+	Subject     string                   `json:"subject"`
+	SubjectType string                   `json:"subject_type,omitempty"`
+	Predicate   string                   `json:"predicate"`
+	Object      wireOntologyValue        `json:"object"`
+	ObjectType  string                   `json:"object_type,omitempty"`
+	Origin      ontology.AssertionOrigin `json:"origin"`
+	Confidence  shoal.Score              `json:"confidence"`
+	Evidence    []wireEvidenceRef        `json:"evidence"`
+	Provenance  wireExtractionProvenance `json:"provenance"`
+	Ontology    *wireOntologyIdentity    `json:"ontology,omitempty"`
+	Metadata    wireMetadata             `json:"metadata,omitempty"`
+}
+
+type wireOntologyValue struct {
+	Type      ontology.ValueType `json:"type"`
+	Text      string             `json:"text,omitempty"`
+	Integer   int64              `json:"integer,omitempty"`
+	Number    float64            `json:"number,omitempty"`
+	Boolean   *bool              `json:"boolean,omitempty"`
+	Timestamp time.Time          `json:"timestamp,omitempty"`
+	Reference string             `json:"reference,omitempty"`
+}
+
+type wireEvidenceRef struct {
+	ID         string                   `json:"id"`
+	Derivation *wireAssertionDerivation `json:"derivation,omitempty"`
+	Metadata   wireMetadata             `json:"metadata,omitempty"`
+}
+
+type wireAssertionDerivation struct {
+	ID                    string       `json:"id"`
+	EmbeddingModel        string       `json:"embedding_model"`
+	EmbeddingModelVersion string       `json:"embedding_model_version"`
+	SimilarityMetric      string       `json:"similarity_metric"`
+	Threshold             shoal.Score  `json:"threshold"`
+	TessellationCell      string       `json:"tessellation_cell"`
+	Score                 shoal.Score  `json:"score"`
+	SourceEndpoint        string       `json:"source_endpoint"`
+	TargetEndpoint        string       `json:"target_endpoint"`
+	IteratorName          string       `json:"iterator_name"`
+	IteratorOptions       wireMetadata `json:"iterator_options,omitempty"`
+}
+
+type wireExtractionProvenance struct {
+	Provider         string       `json:"provider"`
+	Model            string       `json:"model"`
+	ModelVersion     string       `json:"model_version"`
+	Prompt           string       `json:"prompt"`
+	PromptVersion    string       `json:"prompt_version"`
+	Extractor        string       `json:"extractor"`
+	ExtractorVersion string       `json:"extractor_version"`
+	Metadata         wireMetadata `json:"metadata,omitempty"`
+}
+
+type wireOntologyIdentity struct {
+	SchemaID  string `json:"schema_id"`
+	VersionID string `json:"version_id"`
 }
 
 type wireMetadataEntry struct {
@@ -558,16 +621,22 @@ func (r *NeighborhoodResponse) UnmarshalJSON(data []byte) error {
 }
 
 func (r PathResponse) MarshalJSON() ([]byte, error) {
+	assertions := make([]wireAssertion, 0, len(r.Assertions))
+	for _, assertion := range r.Assertions {
+		assertions = append(assertions, wireAssertionValue(assertion))
+	}
 	return json.Marshal(struct {
-		Snapshot Snapshot `json:"snapshot"`
-		Path     wirePath `json:"path"`
-	}{r.Snapshot, wirePathValue(r.Path)})
+		Snapshot   Snapshot        `json:"snapshot"`
+		Path       wirePath        `json:"path"`
+		Assertions []wireAssertion `json:"assertions,omitempty"`
+	}{r.Snapshot, wirePathValue(r.Path), assertions})
 }
 
 func (r *PathResponse) UnmarshalJSON(data []byte) error {
 	var wire struct {
-		Snapshot Snapshot `json:"snapshot"`
-		Path     wirePath `json:"path"`
+		Snapshot   Snapshot        `json:"snapshot"`
+		Path       wirePath        `json:"path"`
+		Assertions []wireAssertion `json:"assertions,omitempty"`
 	}
 	if err := strictUnmarshal(data, &wire); err != nil {
 		return err
@@ -576,7 +645,17 @@ func (r *PathResponse) UnmarshalJSON(data []byte) error {
 	if err != nil {
 		return err
 	}
-	*r = PathResponse{Snapshot: wire.Snapshot, Path: path}
+	assertions := make([]ontology.Assertion, 0, len(wire.Assertions))
+	for _, item := range wire.Assertions {
+		assertion, err := assertionValue(item)
+		if err != nil {
+			return err
+		}
+		assertions = append(assertions, assertion)
+	}
+	*r = PathResponse{
+		Snapshot: wire.Snapshot, Path: path, Assertions: assertions,
+	}
 	return nil
 }
 
@@ -804,13 +883,17 @@ func wireSpanValue(value document.Span) wireSpan {
 func wireNeighborhoodValue(value explorer.Neighborhood) wireNeighborhood {
 	nodes := make([]wireNode, 0, len(value.Nodes))
 	edges := make([]wireEdge, 0, len(value.Edges))
+	assertions := make([]wireAssertion, 0, len(value.Assertions))
 	for _, node := range value.Nodes {
 		nodes = append(nodes, wireNodeValue(node))
 	}
 	for _, edge := range value.Edges {
 		edges = append(edges, wireEdgeValue(edge))
 	}
-	return wireNeighborhood{Nodes: nodes, Edges: edges}
+	for _, assertion := range value.Assertions {
+		assertions = append(assertions, wireAssertionValue(assertion))
+	}
+	return wireNeighborhood{Nodes: nodes, Edges: edges, Assertions: assertions}
 }
 
 func wirePathValue(value graph.Path) wirePath {
@@ -878,6 +961,102 @@ func wireMetadataValue(value shoal.Metadata) wireMetadata {
 		})
 	}
 	return metadata
+}
+
+func wireAssertionValue(value ontology.Assertion) wireAssertion {
+	subjectType, _ := value.SubjectType()
+	objectType, _ := value.ObjectType()
+	evidence := make([]wireEvidenceRef, 0, len(value.Evidence()))
+	for _, item := range value.Evidence() {
+		evidence = append(evidence, wireEvidenceRefValue(item))
+	}
+	var identity *wireOntologyIdentity
+	if ontologyIdentity, ok := value.Ontology(); ok {
+		identity = &wireOntologyIdentity{
+			SchemaID:  encodeID(ontologyIdentity.SchemaID()),
+			VersionID: encodeID(ontologyIdentity.VersionID()),
+		}
+	}
+	return wireAssertion{
+		ID:          encodeID(value.ID()),
+		Subject:     encodeID(value.Subject()),
+		SubjectType: encodeOptionalID(subjectType),
+		Predicate:   encodeID(value.Predicate()),
+		Object:      wireOntologyValueValue(value.Object()),
+		ObjectType:  encodeOptionalID(objectType),
+		Origin:      value.Origin(),
+		Confidence:  value.Confidence(),
+		Evidence:    evidence,
+		Provenance:  wireExtractionProvenanceValue(value.Provenance()),
+		Ontology:    identity,
+		Metadata:    wireMetadataValue(value.Metadata()),
+	}
+}
+
+func wireOntologyValueValue(value ontology.Value) wireOntologyValue {
+	wire := wireOntologyValue{Type: value.Type()}
+	switch value.Type() {
+	case ontology.ValueString:
+		wire.Text, _ = value.StringValue()
+	case ontology.ValueInteger:
+		wire.Integer, _ = value.IntegerValue()
+	case ontology.ValueNumber:
+		wire.Number, _ = value.NumberValue()
+	case ontology.ValueBoolean:
+		boolean, _ := value.BooleanValue()
+		wire.Boolean = &boolean
+	case ontology.ValueTimestamp:
+		wire.Timestamp, _ = value.TimestampValue()
+	case ontology.ValueReference:
+		reference, _ := value.ReferenceValue()
+		wire.Reference = encodeID(reference)
+	}
+	return wire
+}
+
+func wireEvidenceRefValue(value ontology.EvidenceRef) wireEvidenceRef {
+	var derivation *wireAssertionDerivation
+	if got, ok := value.Derivation(); ok {
+		wire := wireAssertionDerivationValue(got)
+		derivation = &wire
+	}
+	return wireEvidenceRef{
+		ID: encodeID(value.ID()), Derivation: derivation,
+		Metadata: wireMetadataValue(value.Metadata()),
+	}
+}
+
+func wireAssertionDerivationValue(
+	value ontology.AssertionDerivation,
+) wireAssertionDerivation {
+	return wireAssertionDerivation{
+		ID:                    encodeID(value.ID()),
+		EmbeddingModel:        value.EmbeddingModel(),
+		EmbeddingModelVersion: value.EmbeddingModelVersion(),
+		SimilarityMetric:      value.SimilarityMetric(),
+		Threshold:             value.Threshold(),
+		TessellationCell:      value.TessellationCell(),
+		Score:                 value.Score(),
+		SourceEndpoint:        encodeID(value.SourceEndpoint()),
+		TargetEndpoint:        encodeID(value.TargetEndpoint()),
+		IteratorName:          value.IteratorName(),
+		IteratorOptions:       wireMetadataValue(value.IteratorOptions()),
+	}
+}
+
+func wireExtractionProvenanceValue(
+	value ontology.ExtractionProvenance,
+) wireExtractionProvenance {
+	return wireExtractionProvenance{
+		Provider:         value.Provider(),
+		Model:            value.Model(),
+		ModelVersion:     value.ModelVersion(),
+		Prompt:           value.Prompt(),
+		PromptVersion:    value.PromptVersion(),
+		Extractor:        value.Extractor(),
+		ExtractorVersion: value.ExtractorVersion(),
+		Metadata:         wireMetadataValue(value.Metadata()),
+	}
 }
 
 func documentValue(value wireDocument) (document.Document, error) {
@@ -1019,7 +1198,17 @@ func neighborhoodValue(value wireNeighborhood) (explorer.Neighborhood, error) {
 		}
 		edges = append(edges, edge)
 	}
-	return explorer.Neighborhood{Nodes: nodes, Edges: edges}, nil
+	assertions := make([]ontology.Assertion, 0, len(value.Assertions))
+	for _, item := range value.Assertions {
+		assertion, err := assertionValue(item)
+		if err != nil {
+			return explorer.Neighborhood{}, fmt.Errorf("assertions: %w", err)
+		}
+		assertions = append(assertions, assertion)
+	}
+	return explorer.Neighborhood{
+		Nodes: nodes, Edges: edges, Assertions: assertions,
+	}, nil
 }
 
 func pathValue(value wirePath) (graph.Path, error) {
@@ -1077,6 +1266,199 @@ func edgeValue(value wireEdge) (graph.Edge, error) {
 		ID: id, From: from, To: to, Type: value.Type,
 		Weight: value.Weight, Properties: metadata,
 	}, nil
+}
+
+func assertionValue(value wireAssertion) (ontology.Assertion, error) {
+	subject, err := decodeID(value.Subject)
+	if err != nil {
+		return ontology.Assertion{}, fmt.Errorf("subject: %w", err)
+	}
+	subjectType, err := decodeOptionalID(value.SubjectType)
+	if err != nil {
+		return ontology.Assertion{}, fmt.Errorf("subject_type: %w", err)
+	}
+	predicate, err := decodeID(value.Predicate)
+	if err != nil {
+		return ontology.Assertion{}, fmt.Errorf("predicate: %w", err)
+	}
+	object, err := ontologyValue(value.Object)
+	if err != nil {
+		return ontology.Assertion{}, fmt.Errorf("object: %w", err)
+	}
+	objectType, err := decodeOptionalID(value.ObjectType)
+	if err != nil {
+		return ontology.Assertion{}, fmt.Errorf("object_type: %w", err)
+	}
+	evidence := make([]ontology.EvidenceRef, 0, len(value.Evidence))
+	for _, item := range value.Evidence {
+		ref, err := evidenceRefValue(item)
+		if err != nil {
+			return ontology.Assertion{}, fmt.Errorf("evidence: %w", err)
+		}
+		evidence = append(evidence, ref)
+	}
+	provenance, err := extractionProvenanceValue(value.Provenance)
+	if err != nil {
+		return ontology.Assertion{}, fmt.Errorf("provenance: %w", err)
+	}
+	metadata, err := metadataValue(value.Metadata)
+	if err != nil {
+		return ontology.Assertion{}, fmt.Errorf("metadata: %w", err)
+	}
+	options := make([]ontology.AssertionOption, 0, 3)
+	if subjectType != "" {
+		options = append(options, ontology.WithAssertionSubjectType(subjectType))
+	}
+	if objectType != "" {
+		options = append(options, ontology.WithAssertionObjectType(objectType))
+	}
+	if value.Ontology != nil {
+		identity, err := ontologyIdentityValue(*value.Ontology)
+		if err != nil {
+			return ontology.Assertion{}, fmt.Errorf("ontology: %w", err)
+		}
+		options = append(options, ontology.WithAssertionOntology(identity))
+	}
+	assertion, err := ontology.NewAssertion(
+		subject, predicate, object, value.Origin, value.Confidence,
+		evidence, provenance, metadata, options...,
+	)
+	if err != nil {
+		return ontology.Assertion{}, err
+	}
+	id, err := decodeID(value.ID)
+	if err != nil {
+		return ontology.Assertion{}, fmt.Errorf("id: %w", err)
+	}
+	if assertion.ID() != id {
+		return ontology.Assertion{}, fmt.Errorf("id does not match assertion content")
+	}
+	return assertion, nil
+}
+
+func ontologyValue(value wireOntologyValue) (ontology.Value, error) {
+	switch value.Type {
+	case ontology.ValueString:
+		return ontology.NewStringValue(value.Text)
+	case ontology.ValueInteger:
+		return ontology.NewIntegerValue(value.Integer), nil
+	case ontology.ValueNumber:
+		return ontology.NewNumberValue(value.Number)
+	case ontology.ValueBoolean:
+		if value.Boolean == nil {
+			return ontology.Value{}, fmt.Errorf("boolean is required")
+		}
+		return ontology.NewBooleanValue(*value.Boolean), nil
+	case ontology.ValueTimestamp:
+		return ontology.NewTimestampValue(value.Timestamp)
+	case ontology.ValueReference:
+		reference, err := decodeID(value.Reference)
+		if err != nil {
+			return ontology.Value{}, fmt.Errorf("reference: %w", err)
+		}
+		return ontology.NewReferenceValue(reference)
+	default:
+		return ontology.Value{}, fmt.Errorf("unknown value type %q", value.Type)
+	}
+}
+
+func evidenceRefValue(value wireEvidenceRef) (ontology.EvidenceRef, error) {
+	if value.Derivation == nil {
+		return ontology.EvidenceRef{}, fmt.Errorf("derivation is required")
+	}
+	derivation, err := assertionDerivationValue(*value.Derivation)
+	if err != nil {
+		return ontology.EvidenceRef{}, fmt.Errorf("derivation: %w", err)
+	}
+	metadata, err := metadataValue(value.Metadata)
+	if err != nil {
+		return ontology.EvidenceRef{}, fmt.Errorf("metadata: %w", err)
+	}
+	ref, err := ontology.NewDerivationEvidenceRef(derivation, metadata)
+	if err != nil {
+		return ontology.EvidenceRef{}, err
+	}
+	id, err := decodeID(value.ID)
+	if err != nil {
+		return ontology.EvidenceRef{}, fmt.Errorf("id: %w", err)
+	}
+	if ref.ID() != id {
+		return ontology.EvidenceRef{}, fmt.Errorf("id does not match evidence content")
+	}
+	return ref, nil
+}
+
+func assertionDerivationValue(
+	value wireAssertionDerivation,
+) (ontology.AssertionDerivation, error) {
+	source, err := decodeID(value.SourceEndpoint)
+	if err != nil {
+		return ontology.AssertionDerivation{}, fmt.Errorf("source_endpoint: %w", err)
+	}
+	target, err := decodeID(value.TargetEndpoint)
+	if err != nil {
+		return ontology.AssertionDerivation{}, fmt.Errorf("target_endpoint: %w", err)
+	}
+	options, err := metadataValue(value.IteratorOptions)
+	if err != nil {
+		return ontology.AssertionDerivation{}, fmt.Errorf("iterator_options: %w", err)
+	}
+	derivation, err := ontology.NewAssertionDerivation(
+		value.EmbeddingModel,
+		value.EmbeddingModelVersion,
+		value.SimilarityMetric,
+		value.Threshold,
+		value.TessellationCell,
+		value.Score,
+		source,
+		target,
+		value.IteratorName,
+		options,
+	)
+	if err != nil {
+		return ontology.AssertionDerivation{}, err
+	}
+	id, err := decodeID(value.ID)
+	if err != nil {
+		return ontology.AssertionDerivation{}, fmt.Errorf("id: %w", err)
+	}
+	if derivation.ID() != id {
+		return ontology.AssertionDerivation{}, fmt.Errorf("id does not match derivation content")
+	}
+	return derivation, nil
+}
+
+func extractionProvenanceValue(
+	value wireExtractionProvenance,
+) (ontology.ExtractionProvenance, error) {
+	metadata, err := metadataValue(value.Metadata)
+	if err != nil {
+		return ontology.ExtractionProvenance{}, fmt.Errorf("metadata: %w", err)
+	}
+	return ontology.NewExtractionProvenance(
+		value.Provider,
+		value.Model,
+		value.ModelVersion,
+		value.Prompt,
+		value.PromptVersion,
+		value.Extractor,
+		value.ExtractorVersion,
+		metadata,
+	)
+}
+
+func ontologyIdentityValue(
+	value wireOntologyIdentity,
+) (ontology.OntologyIdentity, error) {
+	schemaID, err := decodeID(value.SchemaID)
+	if err != nil {
+		return ontology.OntologyIdentity{}, fmt.Errorf("schema_id: %w", err)
+	}
+	versionID, err := decodeID(value.VersionID)
+	if err != nil {
+		return ontology.OntologyIdentity{}, fmt.Errorf("version_id: %w", err)
+	}
+	return ontology.NewOntologyIdentityFromIDs(schemaID, versionID)
 }
 
 func citationValue(value wireCitation) (document.Citation, error) {

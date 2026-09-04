@@ -293,6 +293,7 @@ func TestAuthorizedBoundedPageUsesNormalizedSeedCount(t *testing.T) {
 	result := authorizedBoundedPage(
 		map[shoal.ID]graph.Node{"node-seed": {ID: "node-seed", Kind: "entity"}},
 		nil,
+		nil,
 		explorer.BoundedNeighborhoodRequest{
 			NodeIDs: []shoal.ID{"node-seed", "node-seed"},
 			Depth:   1, Fanout: 1, MaxNodes: 1,

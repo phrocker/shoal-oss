@@ -25,6 +25,7 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/document"
 	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/graph"
+	"github.com/phrocker/shoal-oss/pkg/ontology"
 	"github.com/phrocker/shoal-oss/pkg/retrieval"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
@@ -198,8 +199,9 @@ type PathRequest struct {
 
 // PathResponse contains the selected explanation path.
 type PathResponse struct {
-	Snapshot Snapshot   `json:"snapshot"`
-	Path     graph.Path `json:"path"`
+	Snapshot   Snapshot             `json:"snapshot"`
+	Path       graph.Path           `json:"path"`
+	Assertions []ontology.Assertion `json:"assertions,omitempty"`
 }
 
 // UploadFile carries one bounded, untrusted browser file after HTTP parsing.

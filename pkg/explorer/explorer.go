@@ -35,6 +35,7 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/graph"
 	"github.com/phrocker/shoal-oss/pkg/interaction"
 	"github.com/phrocker/shoal-oss/pkg/model"
+	"github.com/phrocker/shoal-oss/pkg/ontology"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
@@ -50,6 +51,7 @@ type Explorer struct {
 	ontologyProposals       map[shoal.ID]*persistedOntologyProposal
 	graphNodes              map[shoal.ID]graph.Node
 	graphEdges              map[shoal.ID]graph.Edge
+	graphAssertions         map[shoal.ID]ontology.Assertion
 	outgoing                map[shoal.ID][]shoal.ID
 	incoming                map[shoal.ID][]shoal.ID
 	graphErr                error
@@ -59,6 +61,8 @@ type Explorer struct {
 	maxEmbeddingSpaceFanout int
 	recallEvidence          map[string]string
 	embeddingSpace          embeddingSpaceCache
+	latentLinkProjection    LatentLinkAssertionProjection
+	maxLatentAssertions     uint32
 	vectorProbeMu           sync.Mutex
 	vectorAvailability      vectorAvailabilityCache
 	snapshot                Snapshot
@@ -127,6 +131,15 @@ type Options struct {
 	// RecallEvidence records benchmark evidence per embedding-space identity.
 	RecallEvidence map[string]string
 
+	// LatentLinkProjection configures how latent-edge iterator link cells are
+	// presented as derived ontology assertions. A zero value uses Shoal's
+	// default latent-link ontology and projection provenance.
+	LatentLinkProjection LatentLinkAssertionProjection
+
+	// MaxLatentDerivedAssertionsPerGraphRead bounds the latent assertions one
+	// graph read may project. Zero uses DefaultMaxLatentDerivedAssertionsPerGraphRead.
+	MaxLatentDerivedAssertionsPerGraphRead uint32
+
 	// ReadOnly opens the corpus for reading only. A read-only corpus refuses
 	// every mutation, including interaction capture, so it cannot serve an
 	// inference: capture is part of serving one. Callers that need to serve
@@ -152,6 +165,15 @@ func OpenWithOptions(dir string, options Options) (*Explorer, error) {
 	maxFanout := options.MaxEmbeddingSpaceFanout
 	if maxFanout <= 0 {
 		maxFanout = 8
+	}
+	latentProjection, err := latentLinkProjectionForOptions(
+		options.LatentLinkProjection)
+	if err != nil {
+		return nil, err
+	}
+	maxLatentAssertions := options.MaxLatentDerivedAssertionsPerGraphRead
+	if maxLatentAssertions == 0 {
+		maxLatentAssertions = DefaultMaxLatentDerivedAssertionsPerGraphRead
 	}
 	eng, err := engine.Open(dir, engine.Options{})
 	if err != nil {
@@ -181,6 +203,8 @@ func OpenWithOptions(dir string, options Options) (*Explorer, error) {
 		embedders:               embedders,
 		maxEmbeddingSpaceFanout: maxFanout,
 		recallEvidence:          cloneStringMap(options.RecallEvidence),
+		latentLinkProjection:    latentProjection,
+		maxLatentAssertions:     maxLatentAssertions,
 		readOnly:                options.ReadOnly,
 	}
 	if err := explorer.load(); err != nil {
@@ -593,8 +617,9 @@ func (e *Explorer) Neighborhood(
 		frontier = next
 	}
 	result := Neighborhood{
-		Nodes: make([]graph.Node, 0, len(seen)),
-		Edges: make([]graph.Edge, 0, len(selectedEdges)),
+		Nodes:      make([]graph.Node, 0, len(seen)),
+		Edges:      make([]graph.Edge, 0, len(selectedEdges)),
+		Assertions: make([]ontology.Assertion, 0, len(selectedEdges)),
 	}
 	for id := range seen {
 		result.Nodes = append(result.Nodes, cloneNode(nodes[id]))
@@ -602,6 +627,7 @@ func (e *Explorer) Neighborhood(
 	for _, edge := range selectedEdges {
 		result.Edges = append(result.Edges, cloneEdge(edge))
 	}
+	result.Assertions = e.assertionsForEdgesLocked(selectedEdges)
 	sort.Slice(result.Nodes, func(i, j int) bool {
 		return shoal.CompareID(result.Nodes[i].ID, result.Nodes[j].ID) < 0
 	})
@@ -646,14 +672,16 @@ func excludedInteractionEdge(
 func (e *Explorer) computeCurrentGraph() (
 	map[shoal.ID]graph.Node,
 	map[shoal.ID]graph.Edge,
+	map[shoal.ID]ontology.Assertion,
 	error,
 ) {
 	nodes := make(map[shoal.ID]graph.Node)
 	edges := make(map[shoal.ID]graph.Edge)
+	assertions := make(map[shoal.ID]ontology.Assertion)
 	for _, revisions := range e.documents {
 		record, err := latestRevision(revisions)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 		if record == nil {
 			continue
@@ -691,6 +719,33 @@ func (e *Explorer) computeCurrentGraph() (
 			nodes[node.ID] = node
 		}
 	}
+	latentAssertions, err := e.latentLinkAssertionsLocked()
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	for _, assertion := range latentAssertions {
+		edge, ok, err := latentAssertionGraphEdge(assertion)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		if !ok {
+			continue
+		}
+		if _, from := nodes[edge.From]; !from {
+			continue
+		}
+		if _, to := nodes[edge.To]; !to {
+			continue
+		}
+		if existing, exists := edges[edge.ID]; exists && !edgesEqual(existing, edge) {
+			return nil, nil, nil, shoal.NewError(
+				shoal.ErrorConflict,
+				"derived assertion edge ID already has different content",
+			)
+		}
+		edges[edge.ID] = edge
+		assertions[edge.ID] = assertion
+	}
 	for _, record := range e.interactions {
 		for _, edge := range record.Edges {
 			if _, from := nodes[edge.From]; !from {
@@ -713,7 +768,7 @@ func (e *Explorer) computeCurrentGraph() (
 			edges[edge.ID] = edge
 		}
 	}
-	return nodes, edges, nil
+	return nodes, edges, assertions, nil
 }
 
 func (e *Explorer) ensureGraphLocked() error {
@@ -724,10 +779,11 @@ func (e *Explorer) ensureGraphLocked() error {
 }
 
 func (e *Explorer) rebuildCurrentGraphLocked() error {
-	nodes, edges, err := e.computeCurrentGraph()
+	nodes, edges, assertions, err := e.computeCurrentGraph()
 	if err != nil {
 		e.graphNodes = make(map[shoal.ID]graph.Node)
 		e.graphEdges = make(map[shoal.ID]graph.Edge)
+		e.graphAssertions = make(map[shoal.ID]ontology.Assertion)
 		e.outgoing = make(map[shoal.ID][]shoal.ID)
 		e.incoming = make(map[shoal.ID][]shoal.ID)
 		e.graphErr = err
@@ -751,7 +807,7 @@ func (e *Explorer) rebuildCurrentGraphLocked() error {
 			return shoal.CompareID(incoming[id][i], incoming[id][j]) < 0
 		})
 	}
-	e.graphNodes, e.graphEdges = nodes, edges
+	e.graphNodes, e.graphEdges, e.graphAssertions = nodes, edges, assertions
 	e.outgoing, e.incoming = outgoing, incoming
 	e.graphErr = nil
 	e.graphInitialized = true

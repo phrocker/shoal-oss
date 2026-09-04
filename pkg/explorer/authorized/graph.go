@@ -21,7 +21,6 @@ package authorized
 
 import (
 	"context"
-	"sort"
 	"time"
 
 	"github.com/phrocker/shoal-oss/pkg/explorer"
@@ -125,148 +124,11 @@ func (c *Client) Neighborhood(
 	if err != nil {
 		return explorer.Neighborhood{}, directBaseError(err)
 	}
-
-	candidates := make(map[shoal.ID]graph.Node, len(raw.Nodes))
-	registrations := make(map[shoal.ID]NodeRegistration, len(raw.Nodes))
-	rawNodeIDs := make([]shoal.ID, 0, len(raw.Nodes))
-	for _, node := range raw.Nodes {
-		if err := node.Validate(); err != nil {
-			return explorer.Neighborhood{}, inconsistentBase()
-		}
-		rawNodeIDs = append(rawNodeIDs, node.ID)
-	}
-	resolved, err := c.resolveNodes(ctx, rawNodeIDs)
+	result, err := c.filterNeighborhood(
+		ctx, raw, normalized, explorer.GraphDirectionBoth, decision, now)
 	if err != nil {
 		return explorer.Neighborhood{}, err
 	}
-	for _, node := range raw.Nodes {
-		registration, ok := resolved[node.ID]
-		if !ok {
-			continue
-		}
-		allowed, err := ruleAllows(
-			registration.Rule, decision, auth.OperationNeighborhood, now)
-		if err != nil {
-			return explorer.Neighborhood{}, err
-		}
-		if !allowed {
-			continue
-		}
-		if _, duplicate := candidates[node.ID]; duplicate {
-			return explorer.Neighborhood{}, inconsistentBase()
-		}
-		candidates[node.ID] = cloneGraphNode(node)
-		registrations[node.ID] = registration
-	}
-	canonicalNodes, err := c.canonicalRegisteredNodes(ctx, registrations)
-	if err != nil {
-		return explorer.Neighborhood{}, err
-	}
-	visibleNodes := make(map[shoal.ID]graph.Node, len(candidates))
-	for nodeID, node := range candidates {
-		canonical, ok := canonicalNodes[nodeID]
-		if !ok || !graphNodesEqual(canonical, node) {
-			return explorer.Neighborhood{}, inconsistentBase()
-		}
-		visibleNodes[nodeID] = node
-	}
-	for _, seed := range normalized.NodeIDs {
-		if _, ok := visibleNodes[seed]; !ok {
-			return explorer.Neighborhood{}, inconsistentBase()
-		}
-	}
-
-	typeFilter := make(map[string]struct{}, len(normalized.EdgeTypes))
-	for _, edgeType := range normalized.EdgeTypes {
-		typeFilter[edgeType] = struct{}{}
-	}
-	admittedEdges := make(map[shoal.ID]graph.Edge, len(raw.Edges))
-	candidateEdges := make([]graph.Edge, 0, len(raw.Edges))
-	candidateEdgeIDs := make([]shoal.ID, 0, len(raw.Edges))
-	for _, edge := range raw.Edges {
-		if err := edge.Validate(); err != nil {
-			return explorer.Neighborhood{}, inconsistentBase()
-		}
-		if len(typeFilter) > 0 {
-			if _, ok := typeFilter[edge.Type]; !ok {
-				continue
-			}
-		}
-		if _, ok := visibleNodes[edge.From]; !ok {
-			continue
-		}
-		if _, ok := visibleNodes[edge.To]; !ok {
-			continue
-		}
-		candidateEdges = append(candidateEdges, edge)
-		candidateEdgeIDs = append(candidateEdgeIDs, edge.ID)
-	}
-	resolvedEdges, err := c.resolveEdges(ctx, candidateEdgeIDs)
-	if err != nil {
-		return explorer.Neighborhood{}, err
-	}
-	for _, edge := range candidateEdges {
-		registration, ok := resolvedEdges[edge.ID]
-		if !ok || !graphEdgesEqual(registration.Edge, edge) {
-			continue
-		}
-		allowed, err := edgeAllowsResolved(
-			resolved, registration, decision, auth.OperationNeighborhood, now)
-		if err != nil {
-			return explorer.Neighborhood{}, err
-		}
-		if !allowed {
-			continue
-		}
-		if _, duplicate := admittedEdges[edge.ID]; duplicate {
-			return explorer.Neighborhood{}, inconsistentBase()
-		}
-		admittedEdges[edge.ID] = cloneGraphEdge(edge)
-	}
-
-	reachable := make(map[shoal.ID]struct{}, len(normalized.NodeIDs))
-	frontier := make(map[shoal.ID]struct{}, len(normalized.NodeIDs))
-	for _, seed := range normalized.NodeIDs {
-		reachable[seed] = struct{}{}
-		frontier[seed] = struct{}{}
-	}
-	selectedEdges := make(map[shoal.ID]graph.Edge)
-	for depth := uint32(0); depth < normalized.Depth && len(frontier) > 0; depth++ {
-		next := make(map[shoal.ID]struct{})
-		for edgeID, edge := range admittedEdges {
-			_, from := frontier[edge.From]
-			_, to := frontier[edge.To]
-			if !from && !to {
-				continue
-			}
-			selectedEdges[edgeID] = edge
-			for _, nodeID := range []shoal.ID{edge.From, edge.To} {
-				if _, seen := reachable[nodeID]; seen {
-					continue
-				}
-				reachable[nodeID] = struct{}{}
-				next[nodeID] = struct{}{}
-			}
-		}
-		frontier = next
-	}
-
-	result := explorer.Neighborhood{
-		Nodes: make([]graph.Node, 0, len(reachable)),
-		Edges: make([]graph.Edge, 0, len(selectedEdges)),
-	}
-	for nodeID := range reachable {
-		result.Nodes = append(result.Nodes, cloneGraphNode(visibleNodes[nodeID]))
-	}
-	for _, edge := range selectedEdges {
-		result.Edges = append(result.Edges, cloneGraphEdge(edge))
-	}
-	sort.Slice(result.Nodes, func(left, right int) bool {
-		return shoal.CompareID(result.Nodes[left].ID, result.Nodes[right].ID) < 0
-	})
-	sort.Slice(result.Edges, func(left, right int) bool {
-		return shoal.CompareID(result.Edges[left].ID, result.Edges[right].ID) < 0
-	})
 	if err := guard.Check(ctx); err != nil {
 		return explorer.Neighborhood{}, err
 	}
@@ -414,10 +276,16 @@ func edgeEndpointsAllow(
 	if !ok {
 		return false, nil
 	}
+	// Load-bearing: TestAuthorizedLatentAssertionWithholdsUnauthorizedSource
+	// pins that a derived assertion cannot reveal an unauthorized source
+	// endpoint through an incoming graph read.
 	fromAllowed, err := ruleAllows(from.Rule, decision, operation, now)
 	if err != nil || !fromAllowed {
 		return fromAllowed, err
 	}
+	// Load-bearing: TestAuthorizedLatentAssertionWithholdsUnauthorizedTarget
+	// pins that a derived assertion cannot reveal an unauthorized target
+	// endpoint through an outgoing graph read.
 	toAllowed, err := ruleAllows(to.Rule, decision, operation, now)
 	if err != nil || !toAllowed {
 		return toAllowed, err

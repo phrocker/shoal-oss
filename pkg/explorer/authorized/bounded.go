@@ -30,6 +30,7 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/graph"
 	"github.com/phrocker/shoal-oss/pkg/inference"
+	"github.com/phrocker/shoal-oss/pkg/ontology"
 	"github.com/phrocker/shoal-oss/pkg/retrieval"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
@@ -342,6 +343,7 @@ func (c *Client) boundedAuthorizedNeighborhoodPage(
 	}
 	nodes := make(map[shoal.ID]graph.Node)
 	edges := make(map[shoal.ID]graph.Edge)
+	assertions := make(map[shoal.ID]ontology.Assertion)
 	after := request.AfterEdgeID
 	exhaustedScanLimit := true
 	scannedEdges := uint32(0)
@@ -379,6 +381,11 @@ func (c *Client) boundedAuthorizedNeighborhoodPage(
 				edges[edge.ID] = cloneGraphEdge(edge)
 			}
 		}
+		for _, assertion := range filtered.Assertions {
+			if _, ok := assertions[assertion.ID()]; !ok {
+				assertions[assertion.ID()] = assertion
+			}
+		}
 		if len(edges) > int(request.Fanout) {
 			exhaustedScanLimit = false
 			break
@@ -399,7 +406,8 @@ func (c *Client) boundedAuthorizedNeighborhoodPage(
 	if err := guard.Check(ctx); err != nil {
 		return explorer.BoundedNeighborhood{}, err
 	}
-	return authorizedBoundedPage(nodes, edges, request, len(normalized.NodeIDs)), nil
+	return authorizedBoundedPage(
+		nodes, edges, assertions, request, len(normalized.NodeIDs)), nil
 }
 
 func authorizedScanEdgeLimit(request explorer.BoundedNeighborhoodRequest) uint32 {
@@ -415,6 +423,7 @@ func authorizedScanEdgeLimit(request explorer.BoundedNeighborhoodRequest) uint32
 func authorizedBoundedPage(
 	nodes map[shoal.ID]graph.Node,
 	edges map[shoal.ID]graph.Edge,
+	assertions map[shoal.ID]ontology.Assertion,
 	request explorer.BoundedNeighborhoodRequest,
 	seedCount int,
 ) explorer.BoundedNeighborhood {
@@ -476,9 +485,20 @@ func authorizedBoundedPage(
 	if !continuation {
 		nextAfter = ""
 	}
+	selectedAssertions := make([]ontology.Assertion, 0, len(selectedEdges))
+	for _, edge := range selectedEdges {
+		if assertion, ok := assertions[edge.ID]; ok {
+			selectedAssertions = append(selectedAssertions, assertion)
+		}
+	}
+	sort.Slice(selectedAssertions, func(left, right int) bool {
+		return shoal.CompareID(selectedAssertions[left].ID(), selectedAssertions[right].ID()) < 0
+	})
 	return explorer.BoundedNeighborhood{
-		Neighborhood: explorer.Neighborhood{Nodes: resultNodes, Edges: selectedEdges},
-		Truncated:    truncated, NextAfterEdgeID: nextAfter, Continuation: continuation,
+		Neighborhood: explorer.Neighborhood{
+			Nodes: resultNodes, Edges: selectedEdges, Assertions: selectedAssertions,
+		},
+		Truncated: truncated, NextAfterEdgeID: nextAfter, Continuation: continuation,
 	}
 }
 
@@ -500,11 +520,16 @@ func (c *Client) filterNeighborhood(
 ) (explorer.Neighborhood, error) {
 	candidates := make(map[shoal.ID]graph.Node, len(raw.Nodes))
 	registrations := make(map[shoal.ID]NodeRegistration, len(raw.Nodes))
+	rawNodes := make(map[shoal.ID]graph.Node, len(raw.Nodes))
 	rawNodeIDs := make([]shoal.ID, 0, len(raw.Nodes))
 	for _, node := range raw.Nodes {
 		if err := node.Validate(); err != nil {
 			return explorer.Neighborhood{}, inconsistentBase()
 		}
+		if _, duplicate := rawNodes[node.ID]; duplicate {
+			return explorer.Neighborhood{}, inconsistentBase()
+		}
+		rawNodes[node.ID] = cloneGraphNode(node)
 		rawNodeIDs = append(rawNodeIDs, node.ID)
 	}
 	resolved, err := c.resolveNodes(ctx, rawNodeIDs)
@@ -552,7 +577,12 @@ func (c *Client) filterNeighborhood(
 	for _, edgeType := range normalized.EdgeTypes {
 		typeFilter[edgeType] = struct{}{}
 	}
+	derivedAssertions, err := derivedAssertionsByEdge(raw.Assertions)
+	if err != nil {
+		return explorer.Neighborhood{}, err
+	}
 	admittedEdges := make(map[shoal.ID]graph.Edge, len(raw.Edges))
+	admittedAssertions := make(map[shoal.ID]ontology.Assertion, len(raw.Assertions))
 	candidateEdges := make([]graph.Edge, 0, len(raw.Edges))
 	candidateEdgeIDs := make([]shoal.ID, 0, len(raw.Edges))
 	for _, edge := range raw.Edges {
@@ -563,6 +593,20 @@ func (c *Client) filterNeighborhood(
 			if _, ok := typeFilter[edge.Type]; !ok {
 				continue
 			}
+		}
+		if assertion, ok := derivedAssertions[edge.ID]; ok {
+			allowed, err := c.derivedAssertionEndpointsAllow(
+				ctx, rawNodes, visibleNodes, resolved, assertion, decision,
+				auth.OperationNeighborhood, now)
+			if err != nil {
+				return explorer.Neighborhood{}, err
+			}
+			if !allowed || !derivedAssertionMatchesEdge(assertion, edge) {
+				continue
+			}
+			admittedEdges[edge.ID] = cloneGraphEdge(edge)
+			admittedAssertions[edge.ID] = assertion
+			continue
 		}
 		if _, ok := visibleNodes[edge.From]; !ok {
 			continue
@@ -623,8 +667,9 @@ func (c *Client) filterNeighborhood(
 	}
 
 	result := explorer.Neighborhood{
-		Nodes: make([]graph.Node, 0, len(reachable)),
-		Edges: make([]graph.Edge, 0, len(selectedEdges)),
+		Nodes:      make([]graph.Node, 0, len(reachable)),
+		Edges:      make([]graph.Edge, 0, len(selectedEdges)),
+		Assertions: make([]ontology.Assertion, 0, len(selectedEdges)),
 	}
 	for nodeID := range reachable {
 		result.Nodes = append(result.Nodes, cloneGraphNode(visibleNodes[nodeID]))
@@ -632,11 +677,19 @@ func (c *Client) filterNeighborhood(
 	for _, edge := range selectedEdges {
 		result.Edges = append(result.Edges, cloneGraphEdge(edge))
 	}
+	for edgeID := range selectedEdges {
+		if assertion, ok := admittedAssertions[edgeID]; ok {
+			result.Assertions = append(result.Assertions, assertion)
+		}
+	}
 	sort.Slice(result.Nodes, func(left, right int) bool {
 		return shoal.CompareID(result.Nodes[left].ID, result.Nodes[right].ID) < 0
 	})
 	sort.Slice(result.Edges, func(left, right int) bool {
 		return shoal.CompareID(result.Edges[left].ID, result.Edges[right].ID) < 0
+	})
+	sort.Slice(result.Assertions, func(left, right int) bool {
+		return shoal.CompareID(result.Assertions[left].ID(), result.Assertions[right].ID()) < 0
 	})
 	return result, nil
 }
@@ -668,4 +721,83 @@ func reachableThrough(
 		}
 	}
 	return nil
+}
+
+func derivedAssertionsByEdge(
+	assertions []ontology.Assertion,
+) (map[shoal.ID]ontology.Assertion, error) {
+	byEdge := make(map[shoal.ID]ontology.Assertion, len(assertions))
+	for _, assertion := range assertions {
+		if err := assertion.Validate(); err != nil {
+			return nil, inconsistentBase()
+		}
+		if assertion.Origin() != ontology.AssertionDerived {
+			return nil, inconsistentBase()
+		}
+		if _, ok := assertion.Object().ReferenceValue(); !ok {
+			return nil, inconsistentBase()
+		}
+		if _, duplicate := byEdge[assertion.ID()]; duplicate {
+			return nil, inconsistentBase()
+		}
+		byEdge[assertion.ID()] = assertion
+	}
+	return byEdge, nil
+}
+
+func derivedAssertionMatchesEdge(assertion ontology.Assertion, edge graph.Edge) bool {
+	target, ok := assertion.Object().ReferenceValue()
+	if !ok {
+		return false
+	}
+	return edge.ID == assertion.ID() &&
+		edge.From == assertion.Subject() &&
+		edge.To == target &&
+		edge.Type == string(assertion.Predicate()) &&
+		scoresEqual(edge.Weight, assertion.Confidence())
+}
+
+func (c *Client) derivedAssertionEndpointsAllow(
+	ctx context.Context,
+	rawNodes map[shoal.ID]graph.Node,
+	visibleNodes map[shoal.ID]graph.Node,
+	resolved registeredNodes,
+	assertion ontology.Assertion,
+	decision auth.Decision,
+	operation auth.Operation,
+	now time.Time,
+) (bool, error) {
+	target, ok := assertion.Object().ReferenceValue()
+	if !ok {
+		return false, nil
+	}
+	allowed, err := edgeEndpointsAllow(
+		resolved,
+		EdgeRegistration{Edge: graph.Edge{
+			ID: assertion.ID(), From: assertion.Subject(), To: target,
+			Type: string(assertion.Predicate()), Weight: assertion.Confidence(),
+		}},
+		decision,
+		operation,
+		now,
+	)
+	if err != nil || !allowed {
+		return allowed, err
+	}
+	registrations := map[shoal.ID]NodeRegistration{
+		assertion.Subject(): resolved[assertion.Subject()],
+		target:              resolved[target],
+	}
+	canonical, err := c.canonicalRegisteredNodes(ctx, registrations)
+	if err != nil {
+		return false, err
+	}
+	for _, nodeID := range []shoal.ID{assertion.Subject(), target} {
+		node, ok := rawNodes[nodeID]
+		if !ok || !graphNodesEqual(canonical[nodeID], node) {
+			return false, inconsistentBase()
+		}
+		visibleNodes[nodeID] = cloneGraphNode(node)
+	}
+	return true, nil
 }
