@@ -306,6 +306,138 @@ func TestAuthorizedProducerProvenanceDoesNotAggregateHiddenAssertions(t *testing
 	}
 }
 
+func TestAuthorizedUnboundedNeighborhoodProducerSeedRequiresAuthorization(t *testing.T) {
+	f := newFixture(t)
+	admin := f.admin(t)
+	source, err := f.clientA.Ingest(admin, explorer.Source{
+		URI: "file:///unbounded-producer-visible-source.txt", MediaType: explorer.MediaTypeText,
+		Content: "visible unbounded producer source",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	target, err := f.clientA.Ingest(admin, explorer.Source{
+		URI: "file:///unbounded-producer-visible-target.txt", MediaType: explorer.MediaTypeText,
+		Content: "visible unbounded producer target",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bobSource, err := f.clientB.Ingest(admin, explorer.Source{
+		URI: "file:///unbounded-producer-bob-source.txt", MediaType: explorer.MediaTypeText,
+		Content: "bob unbounded producer source",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bobTarget, err := f.clientB.Ingest(admin, explorer.Source{
+		URI: "file:///unbounded-producer-bob-target.txt", MediaType: explorer.MediaTypeText,
+		Content: "bob unbounded producer target",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.base.PutLatentLinkCells(admin, []explorer.LatentLinkCell{
+		authorizedLatentCell(source.Document.ID, target.Document.ID, 42),
+		authorizedLatentCell(bobSource.Document.ID, bobTarget.Document.ID, 43),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	aliceSource, err := f.clientA.Neighborhood(
+		f.alice(t),
+		explorer.NeighborhoodRequest{
+			NodeIDs: []shoal.ID{source.Document.ID},
+			Depth:   1,
+			EdgeTypes: []string{
+				authorizedLatentEdgeType(t),
+			},
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(aliceSource.Assertions) != 1 {
+		t.Fatalf("alice unbounded source graph = %+v, want one derived assertion",
+			aliceSource)
+	}
+	assertionID := aliceSource.Assertions[0].ID()
+	aliceAssertion, err := f.clientA.Neighborhood(
+		f.alice(t),
+		explorer.NeighborhoodRequest{
+			NodeIDs:   []shoal.ID{assertionID},
+			Depth:     1,
+			EdgeTypes: []string{graph.EdgeTypeProduced},
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(aliceAssertion.Edges) != 1 || len(aliceAssertion.Assertions) != 1 {
+		t.Fatalf("alice unbounded assertion provenance = %+v, want one producer edge",
+			aliceAssertion)
+	}
+	producerID := aliceAssertion.Edges[0].From
+	aliceProducer, err := f.clientA.Neighborhood(
+		f.alice(t),
+		explorer.NeighborhoodRequest{
+			NodeIDs:   []shoal.ID{producerID},
+			Depth:     1,
+			EdgeTypes: []string{graph.EdgeTypeProduced},
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(aliceProducer.Edges) != 1 ||
+		len(aliceProducer.Assertions) != 1 ||
+		aliceProducer.Assertions[0].ID() != assertionID {
+		t.Fatalf("alice unbounded producer graph = %+v, want only her produced assertion",
+			aliceProducer)
+	}
+
+	noAccess := f.context(t, f.decision(
+		t, "unbounded-no-access", nil, nil, allOperations))
+	_, err = f.clientA.Neighborhood(
+		noAccess,
+		explorer.NeighborhoodRequest{
+			NodeIDs:   []shoal.ID{producerID},
+			Depth:     1,
+			EdgeTypes: []string{graph.EdgeTypeProduced},
+		},
+	)
+	if !shoal.IsErrorCode(err, shoal.ErrorNotFound) {
+		t.Fatalf("no-access unbounded producer error = %v, want not found instead of empty results", err)
+	}
+}
+
+func TestAuthorizedFabricatedProducerPrefixDoesNotBypassAuthorization(t *testing.T) {
+	f := newFixture(t)
+	prefixedID := shoal.ID("producer_not-a-real-producer")
+	ordinaryID := shoal.ID("not-a-real-node")
+	_, prefixedErr := f.clientA.Neighborhood(
+		f.alice(t),
+		explorer.NeighborhoodRequest{
+			NodeIDs:   []shoal.ID{prefixedID},
+			Depth:     1,
+			EdgeTypes: []string{graph.EdgeTypeProduced},
+		},
+	)
+	_, ordinaryErr := f.clientA.Neighborhood(
+		f.alice(t),
+		explorer.NeighborhoodRequest{
+			NodeIDs:   []shoal.ID{ordinaryID},
+			Depth:     1,
+			EdgeTypes: []string{graph.EdgeTypeProduced},
+		},
+	)
+	if !shoal.IsErrorCode(prefixedErr, shoal.ErrorNotFound) ||
+		!shoal.IsErrorCode(ordinaryErr, shoal.ErrorNotFound) ||
+		prefixedErr.Error() != ordinaryErr.Error() {
+		t.Fatalf("fabricated producer error = %v, ordinary missing error = %v; want same not-found shape",
+			prefixedErr, ordinaryErr)
+	}
+}
+
 func authorizedLatentEdgeType(t *testing.T) string {
 	t.Helper()
 	projection, err := explorer.DefaultLatentLinkAssertionProjection()

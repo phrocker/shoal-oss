@@ -704,6 +704,11 @@ func (c *Client) filterNeighborhood(
 				missingProvenanceSeed = true
 				continue
 			}
+			// Load-bearing:
+			// TestAuthorizedUnboundedNeighborhoodProducerSeedRequiresAuthorization
+			// pins that this unbounded Neighborhood-only seed guard returns
+			// not-found rather than empty. Empty success is an existence oracle,
+			// and Neighborhood has no post-filter provenance seed check.
 			return explorer.Neighborhood{}, auth.ObjectNotFound()
 		}
 		return explorer.Neighborhood{}, inconsistentBase()
