@@ -169,6 +169,33 @@
       ]
     },
     {
+      "name": "causalInference",
+      "javaClasses": [
+        "org.apache.accumulo.core.graph.CausalInferenceEngine"
+      ],
+      "contexts": [
+        "scan"
+      ],
+      "activeContexts": [
+        "scan"
+      ],
+      "optionKeys": [
+        "query.b64",
+        "startVertex",
+        "direction",
+        "maxDepth",
+        "threshold",
+        "edgeType",
+        "maxVertices",
+        "vertexCF",
+        "embeddingCQ",
+        "edgeCFPrefix",
+        "inverseEdgeCFPrefix",
+        "resultCF",
+        "resultCQ"
+      ]
+    },
+    {
       "name": "termIndex",
       "contexts": [
         "scan"

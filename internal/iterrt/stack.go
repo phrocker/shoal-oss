@@ -61,6 +61,12 @@ const (
 	// Options: dampingFactor, maxIterations, edgeType, maxVertices,
 	// convergenceThreshold, vertexCF, edgeCFPrefix, labelCQ, rankCQ.
 	IterGraphRank = "graphRank"
+	// IterCausalInference is a terminal scan iterator that traces one greedy
+	// causal chain from startVertex and emits a single JSON result cell.
+	// Options: query.b64, startVertex, direction, maxDepth, threshold,
+	// edgeType, maxVertices, vertexCF, embeddingCQ, edgeCFPrefix,
+	// inverseEdgeCFPrefix, resultCF, resultCQ.
+	IterCausalInference = "causalInference"
 	// IterTermIndex is the term-index (keyword) pushdown iterator: it
 	// resolves posting rows to primary rows and emits the primary rows'
 	// cells. Options: termCount, term.<i>, primaryPrefix, idSource, postingCF.
