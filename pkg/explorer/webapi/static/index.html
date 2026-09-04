@@ -33,6 +33,11 @@
             <span>Drop Markdown, text, or source files here.</span>
             <input id="upload-files" type="file" multiple>
           </label>
+          <!-- TestStaticWorkspaceDirectoryPickerMarkup pins webkitdirectory for browser directory selection. -->
+          <label for="upload-directory">
+            <span>Choose a directory to upload its files in bounded batches.</span>
+            <input id="upload-directory" type="file" webkitdirectory multiple>
+          </label>
           <button id="upload-button" type="submit">Upload</button>
         </form>
         <p id="upload-status" class="muted" role="status" aria-live="polite"></p>

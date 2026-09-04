@@ -41,6 +41,7 @@ const (
 type preparedUpload struct {
 	name      string
 	mediaType string
+	skillFile *SkillFileResult
 	source    explorer.Source
 }
 
@@ -66,6 +67,7 @@ func (s *EmbeddedService) Ingest(
 			Revision:     result.Revision,
 			SectionCount: result.SectionCount,
 			SpanCount:    result.SpanCount,
+			SkillFile:    item.skillFile,
 		})
 	}
 	snapshot, err := s.client.Snapshot(ctx)
@@ -113,6 +115,7 @@ func prepareUploads(request IngestRequest) ([]preparedUpload, error) {
 			return nil, err
 		}
 		content := string(file.Content)
+		skillFile := inspectUploadSkillFile(name, mediaType, content)
 		source := explorer.Source{
 			URI:       "upload://workspace/" + url.PathEscape(name),
 			Title:     name,
@@ -130,6 +133,7 @@ func prepareUploads(request IngestRequest) ([]preparedUpload, error) {
 		prepared = append(prepared, preparedUpload{
 			name:      name,
 			mediaType: mediaType,
+			skillFile: skillFile,
 			source:    source,
 		})
 	}
@@ -225,4 +229,78 @@ func knownExplorerMediaType(mediaType string) bool {
 	default:
 		return false
 	}
+}
+
+func inspectUploadSkillFile(
+	name string, mediaType string, content string,
+) *SkillFileResult {
+	if mediaType != explorer.MediaTypeMarkdown {
+		return nil
+	}
+	// This branch is load-bearing; TestHTTPIngestRecognizesSkillFiles pins that
+	// directory-safe names ending in "__SKILL.md" are still treated as expected
+	// skill files after the browser removes path separators.
+	expected := expectedSkillUploadName(name)
+	values, frontmatter := parseSkillFrontmatter(content)
+	skillName := strings.TrimSpace(values["name"])
+	description := strings.TrimSpace(values["description"])
+	recognized := expected && frontmatter && skillName != "" && description != ""
+	if recognized {
+		return &SkillFileResult{
+			Expected:    true,
+			Recognized:  true,
+			Name:        skillName,
+			Description: description,
+			Message:     "Recognized agent skills file with YAML frontmatter name and description.",
+		}
+	}
+	if expected {
+		return &SkillFileResult{
+			Expected:   true,
+			Recognized: false,
+			Message: "Expected an agent skills file because the filename is SKILL.md, " +
+				"but YAML frontmatter must include non-empty name and description fields.",
+		}
+	}
+	return nil
+}
+
+func expectedSkillUploadName(name string) bool {
+	lower := strings.ToLower(name)
+	return lower == "skill.md" || strings.HasSuffix(lower, "__skill.md")
+}
+
+func parseSkillFrontmatter(content string) (map[string]string, bool) {
+	normalized := strings.ReplaceAll(content, "\r\n", "\n")
+	normalized = strings.ReplaceAll(normalized, "\r", "\n")
+	if !strings.HasPrefix(normalized, "---\n") {
+		return nil, false
+	}
+	values := make(map[string]string)
+	for _, line := range strings.Split(normalized[len("---\n"):], "\n") {
+		if line == "---" {
+			return values, true
+		}
+		key, value, ok := strings.Cut(line, ":")
+		if !ok {
+			continue
+		}
+		key = strings.TrimSpace(strings.ToLower(key))
+		switch key {
+		case "name", "description":
+			values[key] = trimYAMLScalar(value)
+		}
+	}
+	return nil, false
+}
+
+func trimYAMLScalar(value string) string {
+	trimmed := strings.TrimSpace(value)
+	if len(trimmed) >= 2 {
+		quote := trimmed[0]
+		if (quote == '"' || quote == '\'') && trimmed[len(trimmed)-1] == quote {
+			return strings.TrimSpace(trimmed[1 : len(trimmed)-1])
+		}
+	}
+	return trimmed
 }

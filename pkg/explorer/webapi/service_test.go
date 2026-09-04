@@ -575,6 +575,65 @@ func TestHTTPIngestUploadsDocumentsAndSourceCode(t *testing.T) {
 	}
 }
 
+func TestHTTPIngestRecognizesSkillFiles(t *testing.T) {
+	corpus, err := explorer.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer corpus.Close()
+	service, err := webapi.NewEmbeddedService(corpus)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewUnstartedServer(nil)
+	handler, err := webapi.NewHandler(service, server.Listener.Addr().String())
+	if err != nil {
+		server.Close()
+		t.Fatal(err)
+	}
+	server.Config.Handler = handler
+	server.Start()
+	defer server.Close()
+
+	response := postMultipart(t, server.URL+"/api/v1/ingest",
+		uploadFixture{
+			name: "skills__alpha__SKILL.md",
+			content: "---\n" +
+				"name: alpha\n" +
+				"description: Alpha skill for upload testing.\n" +
+				"---\n\n" +
+				"# Alpha\n",
+		},
+		uploadFixture{
+			name: "skills__broken__SKILL.md",
+			content: "---\n" +
+				"name: broken\n" +
+				"---\n\n" +
+				"# Broken\n",
+		},
+	)
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("skill upload status = %s: %s", response.Status, response.body)
+	}
+	var ingested webapi.IngestResponse
+	if err := json.Unmarshal(response.body, &ingested); err != nil {
+		t.Fatal(err)
+	}
+	if len(ingested.Files) != 2 {
+		t.Fatalf("skill upload response file count = %d, want 2: %+v", len(ingested.Files), ingested)
+	}
+	valid := ingested.Files[0].SkillFile
+	if valid == nil || !valid.Expected || !valid.Recognized ||
+		valid.Name != "alpha" || valid.Description != "Alpha skill for upload testing." {
+		t.Fatalf("valid skill metadata was not recognized: %+v", valid)
+	}
+	invalid := ingested.Files[1].SkillFile
+	if invalid == nil || !invalid.Expected || invalid.Recognized ||
+		!strings.Contains(invalid.Message, "frontmatter must include non-empty name and description") {
+		t.Fatalf("invalid SKILL.md did not get actionable metadata: %+v", invalid)
+	}
+}
+
 func TestHTTPIngestRejectsUntrustedUploads(t *testing.T) {
 	corpus, err := explorer.Open(t.TempDir())
 	if err != nil {
