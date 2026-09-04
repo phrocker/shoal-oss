@@ -249,6 +249,94 @@ func TestGraphRank_MaxVerticesSkipsComputation(t *testing.T) {
 	}
 }
 
+// graphRankPartialMajcInput is a graph that provably yields ranks under a full
+// major compaction, so the suppression tests below cannot pass vacuously.
+func graphRankPartialMajcInput() []kv {
+	return sortGraphRankInput([]kv{
+		{mk("A", "V", "_label", "", 1), []byte("alpha")},
+		{mk("A", "E_link", "B", "", 2), []byte("{}")},
+		{mk("B", "V", "_label", "", 3), []byte("bravo")},
+	})
+}
+
+func initGraphRankEnv(t *testing.T, src SortedKeyValueIterator, opts map[string]string, env IteratorEnvironment) *GraphRankIterator {
+	t.Helper()
+	g := NewGraphRankIterator()
+	if err := g.Init(src, opts, env); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	return g
+}
+
+// TestGraphRank_FullMajcEmitsRanks is the control for the suppression tests:
+// it proves graphRankPartialMajcInput does produce rank cells when the
+// compaction sees the whole table.
+func TestGraphRank_FullMajcEmitsRanks(t *testing.T) {
+	cells := graphRankPartialMajcInput()
+	g := initGraphRankEnv(t, newSliceSource(cells...), map[string]string{GraphRankMaxIterations: "1"},
+		IteratorEnvironment{Scope: ScopeMajc, FullMajorCompaction: true})
+	if err := g.Seek(InfiniteRange(), nil, false); err != nil {
+		t.Fatalf("Seek: %v", err)
+	}
+	got, err := drain(g)
+	if err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+	if ranks := graphRankRankCells(t, got, "V", "_rank"); len(ranks) != 2 {
+		t.Fatalf("rank count on full majc = %d, want 2", len(ranks))
+	}
+}
+
+// TestGraphRank_PartialMajcSuppressesRankEmission pins that PageRank is not
+// materialized during a partial major compaction, which sees only the files
+// being compacted rather than the whole graph.
+func TestGraphRank_PartialMajcSuppressesRankEmission(t *testing.T) {
+	cells := graphRankPartialMajcInput()
+	g := initGraphRankEnv(t, newSliceSource(cells...), map[string]string{GraphRankMaxIterations: "1"},
+		IteratorEnvironment{Scope: ScopeMajc, FullMajorCompaction: false})
+	if err := g.Seek(InfiniteRange(), nil, false); err != nil {
+		t.Fatalf("Seek: %v", err)
+	}
+	got, err := drain(g)
+	if err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+	if ranks := graphRankRankCells(t, got, "V", "_rank"); len(ranks) != 0 {
+		t.Fatalf("rank count on partial majc = %d, want 0", len(ranks))
+	}
+	if len(got) != len(cells) {
+		t.Fatalf("output count = %d, want source cells passed through unchanged (%d)", len(got), len(cells))
+	}
+	for i, cell := range got {
+		if cell.k.Compare(cells[i].k) != 0 || !bytes.Equal(cell.v, cells[i].v) {
+			t.Fatalf("cell %d = %v/%q, want %v/%q", i, cell.k, cell.v, cells[i].k, cells[i].v)
+		}
+	}
+}
+
+// TestGraphRank_PartialMajcDeepCopyStaysSuppressed pins that a copy cannot
+// regain rank emission the original suppressed, even when DeepCopy is handed a
+// full-compaction environment.
+func TestGraphRank_PartialMajcDeepCopyStaysSuppressed(t *testing.T) {
+	cells := graphRankPartialMajcInput()
+	g := initGraphRankEnv(t, newSliceSource(cells...), map[string]string{GraphRankMaxIterations: "1"},
+		IteratorEnvironment{Scope: ScopeMajc, FullMajorCompaction: false})
+	copied, ok := g.DeepCopy(IteratorEnvironment{Scope: ScopeMajc, FullMajorCompaction: true}).(*GraphRankIterator)
+	if !ok {
+		t.Fatal("DeepCopy did not return *GraphRankIterator")
+	}
+	if err := copied.Seek(InfiniteRange(), nil, false); err != nil {
+		t.Fatalf("Seek: %v", err)
+	}
+	got, err := drain(copied)
+	if err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+	if ranks := graphRankRankCells(t, got, "V", "_rank"); len(ranks) != 0 {
+		t.Fatalf("rank count after DeepCopy = %d, want 0", len(ranks))
+	}
+}
+
 func TestGraphRank_DerivedTimestamps(t *testing.T) {
 	cells := sortGraphRankInput([]kv{
 		{mk("A", "V", "_label", "", 10), []byte("alpha")},
