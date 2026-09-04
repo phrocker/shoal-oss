@@ -256,6 +256,30 @@ var (
 		},
 		{
 			capability: IteratorCapability{
+				Name:           IterCausalInference,
+				JavaClasses:    []string{"org.apache.accumulo.core.graph.CausalInferenceEngine"},
+				Contexts:       []CapabilityContext{ContextScan},
+				ActiveContexts: []CapabilityContext{ContextScan},
+				OptionKeys: []string{
+					CausalInferenceQuery,
+					CausalInferenceStartVertex,
+					CausalInferenceDirection,
+					CausalInferenceMaxDepth,
+					CausalInferenceThreshold,
+					CausalInferenceEdgeType,
+					CausalInferenceMaxVertices,
+					CausalInferenceVertexCF,
+					CausalInferenceEmbeddingCQ,
+					CausalInferenceEdgeCFPrefix,
+					CausalInferenceInverseEdgeCFPrefix,
+					CausalInferenceResultCF,
+					CausalInferenceResultCQ,
+				},
+			},
+			new: func() SortedKeyValueIterator { return NewCausalInferenceIterator() },
+		},
+		{
+			capability: IteratorCapability{
 				Name:           IterTermIndex,
 				Contexts:       []CapabilityContext{ContextScan},
 				ActiveContexts: []CapabilityContext{ContextScan},

@@ -598,6 +598,7 @@ async function loadOntology() {
       const proposalValue = await proposalResponse.json();
       if (!proposalResponse.ok) throw apiError(proposalValue, proposalResponse);
       proposals = proposalValue;
+      await loadProposalBlastRadii(proposals);
     } catch (error) {
       proposalsError = error;
     }
@@ -611,6 +612,26 @@ async function loadOntology() {
     state.ontologyProposals = null;
     renderOntologyError(error);
   }
+}
+
+async function loadProposalBlastRadii(proposalsResponse) {
+  const proposals = (proposalsResponse && proposalsResponse.proposals) || [];
+  await Promise.all(proposals.map(async (proposal) => {
+    try {
+      const response = await fetch(
+        `/api/v1/ontology/proposals/${encodeURIComponent(proposal.id)}/blast-radius`,
+        {headers: {"accept": "application/json", ...authHeaders()}},
+      );
+      const value = await response.json();
+      if (!response.ok) throw apiError(value, response);
+      // This assignment is load-bearing; TestStaticWorkspaceOntologyProposalBlastRadius
+      // pins that reviewers see the server-computed blast radius before using
+      // approval or publish controls.
+      proposal.blast_radius = value.blast_radius || value;
+    } catch (error) {
+      proposal.blast_radius_error = error;
+    }
+  }));
 }
 
 function renderOntology(ontology, proposals = {proposals: [], limits: {}}, proposalsError = null) {
@@ -790,8 +811,117 @@ function ontologyProposalCard(proposal) {
       history.append(item);
     }
   }
-  card.append(history, ontologyProposalActions(proposal));
+  card.append(ontologyBlastRadiusPanel(proposal), history, ontologyProposalActions(proposal));
   return card;
+}
+
+function ontologyBlastRadiusPanel(proposal) {
+  const section = document.createElement("section");
+  section.className = "ontology-blast-radius";
+  const heading = document.createElement("h5");
+  heading.textContent = "Blast radius";
+  section.append(heading);
+  if (proposal.blast_radius_error) {
+    const error = proposal.blast_radius_error;
+    const status = document.createElement("p");
+    if (needsReauthentication(error)) {
+      handleReauthentication();
+      status.className = "reauth";
+      status.textContent = reauthenticationText();
+    } else if (isDenied(error)) {
+      status.className = "denied";
+      status.textContent = deniedText("review ontology proposal blast radius", state.identity);
+    } else {
+      status.className = "error";
+      status.textContent = `Blast radius unavailable: ${error.message || String(error)}.`;
+    }
+    section.append(status);
+    return section;
+  }
+  const blast = proposal.blast_radius;
+  if (!blast) {
+    const missing = document.createElement("p");
+    missing.className = "muted";
+    missing.textContent = "Blast radius was not loaded.";
+    section.append(missing);
+    return section;
+  }
+  const summary = blast.summary || {};
+  const overview = document.createElement("p");
+  overview.className = (summary.destructive_changes || 0) > 0 ? "withheld" : "muted";
+  overview.textContent = `Blast radius: ${summary.destructive_changes || 0} destructive ` +
+    `change(s), ${summary.additive_changes || 0} additive change(s).`;
+  section.append(overview);
+  const groups = [
+    ["Removed concepts", blast.removed_concepts || [], (item) =>
+      `${blastConceptName(item)} removed`],
+    ["Removed relationships", blast.removed_relationships || [], (item) =>
+      `${blastRelationName(item)} removed`],
+    ["Removed properties", blast.removed_properties || [], (item) =>
+      `${blastPropertyName(item)} removed`],
+    ["Changed concepts", blast.changed_concepts || [], (item) =>
+      `${blastConceptName(item.before)} changed ${fieldList(item.fields)}`],
+    ["Changed relationships", blast.changed_relationships || [], (item) =>
+      `${blastRelationName(item.before)} changed ${fieldList(item.fields)}`],
+    ["Changed properties", blast.changed_properties || [], (item) =>
+      `${blastPropertyName(item.before)} changed ${fieldList(item.fields)}`],
+    ["Added concepts", blast.added_concepts || [], (item) =>
+      `${blastConceptName(item)} added`],
+    ["Added relationships", blast.added_relationships || [], (item) =>
+      `${blastRelationName(item)} added`],
+    ["Added properties", blast.added_properties || [], (item) =>
+      `${blastPropertyName(item)} added`],
+  ];
+  let rendered = false;
+  for (const [title, values, render] of groups) {
+    if (values.length === 0) continue;
+    rendered = true;
+    section.append(blastRadiusGroup(title, values, render));
+  }
+  if (!rendered) {
+    const none = document.createElement("p");
+    none.className = "muted";
+    none.textContent = "No structural ontology changes detected.";
+    section.append(none);
+  }
+  return section;
+}
+
+function blastRadiusGroup(title, values, render) {
+  const details = document.createElement("details");
+  details.open = true;
+  const summary = document.createElement("summary");
+  summary.textContent = `${title} (${values.length})`;
+  const list = document.createElement("ul");
+  list.className = "ontology-blast-list";
+  for (const value of values) {
+    const item = document.createElement("li");
+    item.textContent = render(value);
+    list.append(item);
+  }
+  details.append(summary, list);
+  return details;
+}
+
+function fieldList(fields) {
+  return (fields || []).length > 0 ? (fields || []).join(", ") : "definition";
+}
+
+function blastConceptName(concept) {
+  return blastDefinitionName(concept, "concept");
+}
+
+function blastRelationName(relationship) {
+  return blastDefinitionName(relationship, "relationship");
+}
+
+function blastPropertyName(property) {
+  return blastDefinitionName(property, "property");
+}
+
+function blastDefinitionName(value, fallback) {
+  if (!value) return fallback;
+  return `${value.name || value.key || fallback} (${value.key || shortLabel(value.id)})`;
 }
 
 function ontologyProposalActions(proposal) {
