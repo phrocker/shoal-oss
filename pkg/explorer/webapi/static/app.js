@@ -731,10 +731,27 @@ function ontologyProposalForm(ontology) {
   const form = document.createElement("form");
   form.className = "ontology-proposal-form";
 
+  const limits = (ontology && ontology.limits) || {};
+  // This active-ontology draft seed is load-bearing; TestStaticWorkspaceOntologyProposalEditorPrepopulatesActiveOntologyOnSubmit
+  // pins that opening the editor and changing one field still submits every
+  // currently active concept, relationship, property, and constraint.
+  const editor = {
+    draft: ontologyDraftFromActive(
+      ontology,
+      proposalVersionSuffix(ontology && ontology.version && ontology.version.version),
+    ),
+    errors: {},
+  };
+
   const versionLabel = document.createElement("label");
   versionLabel.textContent = "Proposed version";
   const version = document.createElement("input");
-  version.value = proposalVersionSuffix(ontology && ontology.version && ontology.version.version);
+  version.className = "ontology-proposal-version";
+  version.value = editor.draft.version;
+  version.oninput = () => {
+    editor.draft.version = version.value;
+    refreshDraftJSON(draft, editor.draft);
+  };
   versionLabel.append(version);
 
   const rationaleLabel = document.createElement("label");
@@ -743,18 +760,33 @@ function ontologyProposalForm(ontology) {
   rationale.placeholder = "Why should this ontology refinement be considered?";
   rationaleLabel.append(rationale);
 
+  const modeControls = document.createElement("div");
+  modeControls.className = "ontology-proposal-modes";
+  const formMode = document.createElement("button");
+  formMode.type = "button";
+  formMode.textContent = "Form editor";
+  const rawMode = document.createElement("button");
+  rawMode.type = "button";
+  rawMode.textContent = "Raw JSON";
+  modeControls.append(formMode, rawMode);
+
+  const builder = document.createElement("div");
+  builder.className = "ontology-proposal-builder";
+
   const draftLabel = document.createElement("label");
   draftLabel.textContent = "Proposed ontology JSON";
+  draftLabel.hidden = true;
   const draft = document.createElement("textarea");
   draft.className = "ontology-proposal-json";
-  draft.value = JSON.stringify(ontologyDraftFromActive(ontology, version.value), null, 2);
-  version.onchange = () => {
+  refreshDraftJSON(draft, editor.draft);
+  draft.oninput = () => {
     try {
-      const value = JSON.parse(draft.value);
-      value.version = version.value;
-      draft.value = JSON.stringify(value, null, 2);
-    } catch (_) {
-      // Leave hand-edited JSON alone; submit will surface the parse error.
+      const parsed = parseProposalDraft(draft.value, limits);
+      editor.draft = parsed;
+      version.value = parsed.version || "";
+      setStatus(status, "Raw JSON is valid and ready to sync back to the form.", "muted");
+    } catch (error) {
+      setStatus(status, `Raw proposal JSON is invalid: ${error.message || String(error)}.`, "error");
     }
   };
   draftLabel.append(draft);
@@ -766,14 +798,481 @@ function ontologyProposalForm(ontology) {
   status.setAttribute("role", "status");
   status.className = "muted";
   status.textContent =
-    "Drafts are immutable proposals. Edit the JSON before creating one.";
+    "Draft is pre-populated from the active ontology. Use Remove controls for deliberate deletions.";
+
+  formMode.onclick = () => {
+    try {
+      // This raw-to-form parse is load-bearing; TestStaticWorkspaceOntologyProposalEditorRoundTripsRawAndForms
+      // pins that power-user JSON edits are rendered back into per-element
+      // forms without losing optional fields.
+      editor.draft = parseProposalDraft(draft.value, limits);
+      version.value = editor.draft.version || "";
+      renderProposalBuilder(builder, editor, draft, status, limits);
+      builder.hidden = false;
+      draftLabel.hidden = true;
+      formMode.disabled = true;
+      rawMode.disabled = false;
+      setStatus(status, "Form editor synced from raw JSON.", "muted");
+    } catch (error) {
+      setStatus(status, `Raw proposal JSON is invalid: ${error.message || String(error)}.`, "error");
+    }
+  };
+  rawMode.onclick = () => {
+    const error = proposalEditorError(editor);
+    if (error) {
+      setStatus(status, error, "error");
+      return;
+    }
+    try {
+      validateProposalDraftBounds(editor.draft, limits);
+      refreshDraftJSON(draft, editor.draft);
+      builder.hidden = true;
+      draftLabel.hidden = false;
+      formMode.disabled = false;
+      rawMode.disabled = true;
+      setStatus(status, "Raw JSON view is synced from the per-element forms.", "muted");
+    } catch (error) {
+      setStatus(status, `Proposal exceeds ontology bounds: ${error.message || String(error)}.`, "error");
+    }
+  };
 
   form.onsubmit = async (event) => {
     event.preventDefault();
-    await createOntologyProposal(version, rationale, draft, status, submit);
+    if (!draftLabel.hidden) {
+      try {
+        editor.draft = parseProposalDraft(draft.value, limits);
+      } catch (error) {
+        setStatus(status, `Proposal JSON is invalid: ${error.message || String(error)}.`, "error");
+        return;
+      }
+    }
+    const error = proposalEditorError(editor);
+    if (error) {
+      setStatus(status, error, "error");
+      return;
+    }
+    try {
+      // This bound check is load-bearing; TestStaticWorkspaceOntologyProposalEditorBoundsErrorDoesNotTruncate
+      // pins that the UI reports over-limit drafts instead of silently
+      // dropping excess elements before POSTing the proposal.
+      validateProposalDraftBounds(editor.draft, limits);
+    } catch (error) {
+      setStatus(status, `Proposal exceeds ontology bounds: ${error.message || String(error)}.`, "error");
+      return;
+    }
+    await createOntologyProposal(version, rationale, editor.draft, status, submit);
   };
-  form.append(versionLabel, rationaleLabel, draftLabel, submit, status);
+  renderProposalBuilder(builder, editor, draft, status, limits);
+  formMode.disabled = true;
+  form.append(versionLabel, rationaleLabel, modeControls, builder, draftLabel, submit, status);
   return form;
+}
+
+function renderProposalBuilder(container, editor, raw, status, limits) {
+  editor.errors = {};
+  container.replaceChildren(
+    ontologyProposalElementSection(
+      "Properties",
+      "property",
+      editor.draft.properties,
+      "No properties. Removing all properties is allowed only when it is visible here.",
+      (property, index) => propertyDraftEditor(property, index, editor, raw, status),
+      () => {
+        editor.draft.properties.push({
+          key: "", name: "", description: "", value_type: "string", constraints: [],
+        });
+      },
+      container,
+      editor,
+      raw,
+      status,
+      limits,
+    ),
+    ontologyProposalElementSection(
+      "Concepts",
+      "concept",
+      editor.draft.concepts,
+      "No concepts. Removing all concepts is allowed only when it is visible here.",
+      (concept, index) => conceptDraftEditor(concept, index, editor, raw),
+      () => {
+        editor.draft.concepts.push({key: "", name: "", description: "", properties: []});
+      },
+      container,
+      editor,
+      raw,
+      status,
+      limits,
+    ),
+    ontologyProposalElementSection(
+      "Relationships",
+      "relationship",
+      editor.draft.relationships,
+      "No relationships. Removing all relationships is allowed only when it is visible here.",
+      (relationship, index) => relationshipDraftEditor(relationship, index, editor, raw),
+      () => {
+        editor.draft.relationships.push({
+          key: "", name: "", description: "", from_concepts: [], to_concepts: [],
+          properties: [], directed: true,
+        });
+      },
+      container,
+      editor,
+      raw,
+      status,
+      limits,
+    ),
+  );
+}
+
+function ontologyProposalElementSection(
+  title,
+  kind,
+  values,
+  emptyText,
+  renderItem,
+  addItem,
+  container,
+  editor,
+  raw,
+  status,
+  limits,
+) {
+  const section = document.createElement("section");
+  section.className = "ontology-proposal-elements";
+  const heading = document.createElement("h4");
+  heading.textContent = `${title} (${values.length})`;
+  const add = document.createElement("button");
+  add.type = "button";
+  add.textContent = `Add ${kind}`;
+  add.onclick = () => {
+    addItem();
+    refreshDraftJSON(raw, editor.draft);
+    renderProposalBuilder(container, editor, raw, status, limits);
+  };
+  section.append(heading, add);
+  if (values.length === 0) {
+    const empty = document.createElement("p");
+    empty.className = "empty-state";
+    empty.textContent = emptyText;
+    section.append(empty);
+    return section;
+  }
+  const list = document.createElement("div");
+  list.className = "ontology-proposal-element-list";
+  values.forEach((value, index) => {
+    const card = renderItem(value, index);
+    // This explicit per-element remove control is load-bearing; TestStaticWorkspaceOntologyProposalEditorPrepopulatesActiveOntologyOnSubmit
+    // pins that deletion is visible as an action rather than an accidental
+    // omission from the generated draft.
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = `ontology-remove-${kind}`;
+    remove.textContent = `Remove ${kind}`;
+    remove.onclick = () => {
+      values.splice(index, 1);
+      refreshDraftJSON(raw, editor.draft);
+      renderProposalBuilder(container, editor, raw, status, limits);
+      setStatus(status, `${kind} removed from draft. This deletion will appear in blast radius after creation.`, "withheld");
+    };
+    card.append(remove);
+    list.append(card);
+  });
+  section.append(list);
+  return section;
+}
+
+function propertyDraftEditor(property, index, editor, raw, status) {
+  const card = proposalDraftCard("property", property.key, index);
+  card.append(
+    proposalInput("ontology-proposal-property-key", "Key", property.key, (value) => {
+      property.key = value;
+      refreshDraftJSON(raw, editor.draft);
+    }),
+    proposalInput("ontology-proposal-property-name", "Name", property.name, (value) => {
+      property.name = value;
+      refreshDraftJSON(raw, editor.draft);
+    }),
+    proposalTextarea(
+      "ontology-proposal-property-description",
+      "Description",
+      property.description || "",
+      (value) => {
+        property.description = value;
+        refreshDraftJSON(raw, editor.draft);
+      },
+    ),
+    proposalInput(
+      "ontology-proposal-property-value-type",
+      "Value type",
+      property.value_type || "string",
+      (value) => {
+        property.value_type = value;
+        refreshDraftJSON(raw, editor.draft);
+      },
+      "string, integer, number, boolean, timestamp, or reference",
+    ),
+    proposalTextarea(
+      "ontology-proposal-property-constraints",
+      "Constraints JSON",
+      JSON.stringify(property.constraints || [], null, 2),
+      (value) => {
+        try {
+          const constraints = JSON.parse(value || "[]");
+          if (!Array.isArray(constraints)) throw new Error("constraints must be an array");
+          property.constraints = constraints;
+          setProposalEditorError(editor, `property-${index}-constraints`, "");
+          refreshDraftJSON(raw, editor.draft);
+        } catch (error) {
+          setProposalEditorError(
+            editor,
+            `property-${index}-constraints`,
+            `Property ${property.key || index + 1} constraints JSON is invalid: ${error.message || String(error)}.`,
+          );
+          setStatus(status, proposalEditorError(editor), "error");
+        }
+      },
+    ),
+  );
+  return card;
+}
+
+function conceptDraftEditor(concept, index, editor, raw) {
+  const card = proposalDraftCard("concept", concept.key, index);
+  card.append(
+    proposalInput("ontology-proposal-concept-key", "Key", concept.key, (value) => {
+      concept.key = value;
+      refreshDraftJSON(raw, editor.draft);
+    }),
+    proposalInput("ontology-proposal-concept-name", "Name", concept.name, (value) => {
+      concept.name = value;
+      refreshDraftJSON(raw, editor.draft);
+    }),
+    proposalTextarea(
+      "ontology-proposal-concept-description",
+      "Description",
+      concept.description || "",
+      (value) => {
+        concept.description = value;
+        refreshDraftJSON(raw, editor.draft);
+      },
+    ),
+    proposalTextarea(
+      "ontology-proposal-concept-properties",
+      "Property keys",
+      keyListText(concept.properties),
+      (value) => {
+        concept.properties = parseKeyList(value);
+        refreshDraftJSON(raw, editor.draft);
+      },
+    ),
+  );
+  return card;
+}
+
+function relationshipDraftEditor(relationship, index, editor, raw) {
+  const card = proposalDraftCard("relationship", relationship.key, index);
+  card.append(
+    proposalInput("ontology-proposal-relationship-key", "Key", relationship.key, (value) => {
+      relationship.key = value;
+      refreshDraftJSON(raw, editor.draft);
+    }),
+    proposalInput("ontology-proposal-relationship-name", "Name", relationship.name, (value) => {
+      relationship.name = value;
+      refreshDraftJSON(raw, editor.draft);
+    }),
+    proposalTextarea(
+      "ontology-proposal-relationship-description",
+      "Description",
+      relationship.description || "",
+      (value) => {
+        relationship.description = value;
+        refreshDraftJSON(raw, editor.draft);
+      },
+    ),
+    proposalTextarea(
+      "ontology-proposal-relationship-from",
+      "From concept keys",
+      keyListText(relationship.from_concepts),
+      (value) => {
+        relationship.from_concepts = parseKeyList(value);
+        refreshDraftJSON(raw, editor.draft);
+      },
+    ),
+    proposalTextarea(
+      "ontology-proposal-relationship-to",
+      "To concept keys",
+      keyListText(relationship.to_concepts),
+      (value) => {
+        relationship.to_concepts = parseKeyList(value);
+        refreshDraftJSON(raw, editor.draft);
+      },
+    ),
+    proposalTextarea(
+      "ontology-proposal-relationship-properties",
+      "Property keys",
+      keyListText(relationship.properties),
+      (value) => {
+        relationship.properties = parseKeyList(value);
+        refreshDraftJSON(raw, editor.draft);
+      },
+    ),
+    proposalCheckbox("ontology-proposal-relationship-directed", "Directed", relationship.directed === true, (value) => {
+      relationship.directed = value;
+      refreshDraftJSON(raw, editor.draft);
+    }),
+  );
+  return card;
+}
+
+function proposalDraftCard(kind, key, index) {
+  const card = document.createElement("article");
+  card.className = `ontology-proposal-element ontology-proposal-${kind}`;
+  const heading = document.createElement("h5");
+  heading.textContent = `${kind} ${key || index + 1}`;
+  card.append(heading);
+  return card;
+}
+
+function proposalInput(className, labelText, value, oninput, placeholder = "") {
+  const label = document.createElement("label");
+  label.textContent = labelText;
+  const input = document.createElement("input");
+  input.className = className;
+  input.value = value || "";
+  input.placeholder = placeholder;
+  input.oninput = () => oninput(input.value);
+  label.append(input);
+  return label;
+}
+
+function proposalTextarea(className, labelText, value, oninput) {
+  const label = document.createElement("label");
+  label.textContent = labelText;
+  const input = document.createElement("textarea");
+  input.className = className;
+  input.value = value || "";
+  input.oninput = () => oninput(input.value);
+  label.append(input);
+  return label;
+}
+
+function proposalCheckbox(className, labelText, checked, onchange) {
+  const label = document.createElement("label");
+  label.className = "ontology-proposal-checkbox";
+  const input = document.createElement("input");
+  input.className = className;
+  input.type = "checkbox";
+  input.checked = checked;
+  input.onchange = () => onchange(input.checked);
+  label.append(input);
+  const text = document.createElement("span");
+  text.textContent = labelText;
+  label.append(text);
+  return label;
+}
+
+function setProposalEditorError(editor, key, message) {
+  if (message) editor.errors[key] = message;
+  else delete editor.errors[key];
+}
+
+function proposalEditorError(editor) {
+  const keys = Object.keys(editor.errors).sort();
+  return keys.length === 0 ? "" : editor.errors[keys[0]];
+}
+
+function keyListText(values) {
+  return (values || []).join(", ");
+}
+
+function parseKeyList(value) {
+  return String(value || "")
+    .split(/[,\n]+/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function refreshDraftJSON(raw, draft) {
+  raw.value = JSON.stringify(draft, null, 2);
+}
+
+function parseProposalDraft(text, limits) {
+  const draft = JSON.parse(text);
+  normalizeProposalDraft(draft);
+  return draft;
+}
+
+function normalizeProposalDraft(draft) {
+  if (!draft || typeof draft !== "object" || Array.isArray(draft)) {
+    throw new Error("proposal draft must be an object");
+  }
+  draft.version = String(draft.version || "");
+  draft.properties = Array.isArray(draft.properties) ? draft.properties : [];
+  draft.concepts = Array.isArray(draft.concepts) ? draft.concepts : [];
+  draft.relationships = Array.isArray(draft.relationships) ? draft.relationships : [];
+  for (const property of draft.properties) {
+    property.constraints = Array.isArray(property.constraints) ? property.constraints : [];
+  }
+  for (const concept of draft.concepts) {
+    concept.properties = Array.isArray(concept.properties) ? concept.properties : [];
+  }
+  for (const relationship of draft.relationships) {
+    relationship.from_concepts = Array.isArray(relationship.from_concepts) ? relationship.from_concepts : [];
+    relationship.to_concepts = Array.isArray(relationship.to_concepts) ? relationship.to_concepts : [];
+    relationship.properties = Array.isArray(relationship.properties) ? relationship.properties : [];
+    relationship.directed = relationship.directed === true;
+  }
+}
+
+function validateProposalDraftBounds(draft, limits) {
+  const bound = (name) => Number(limits && limits[name] || 0);
+  enforceDraftBound("concept", (draft.concepts || []).length, bound("max_concepts"));
+  enforceDraftBound("relationship", (draft.relationships || []).length, bound("max_relationships"));
+  enforceDraftBound("property", (draft.properties || []).length, bound("max_properties"));
+  for (const concept of draft.concepts || []) {
+    enforceDraftBound(
+      `concept ${concept.key || ""} property`,
+      (concept.properties || []).length,
+      bound("max_definition_properties"),
+    );
+  }
+  for (const relationship of draft.relationships || []) {
+    enforceDraftBound(
+      `relationship ${relationship.key || ""} from concept`,
+      (relationship.from_concepts || []).length,
+      bound("max_relationship_endpoint_sets"),
+    );
+    enforceDraftBound(
+      `relationship ${relationship.key || ""} to concept`,
+      (relationship.to_concepts || []).length,
+      bound("max_relationship_endpoint_sets"),
+    );
+    enforceDraftBound(
+      `relationship ${relationship.key || ""} property`,
+      (relationship.properties || []).length,
+      bound("max_definition_properties"),
+    );
+  }
+  for (const property of draft.properties || []) {
+    enforceDraftBound(
+      `property ${property.key || ""} constraint`,
+      (property.constraints || []).length,
+      bound("max_constraints_per_property"),
+    );
+    for (const constraint of property.constraints || []) {
+      enforceDraftBound(
+        `property ${property.key || ""} allowed value`,
+        (constraint.allowed_values || []).length,
+        bound("max_allowed_values"),
+      );
+    }
+  }
+}
+
+function enforceDraftBound(label, count, limit) {
+  if (limit > 0 && count > limit) {
+    throw new Error(`${label} count ${count} exceeds limit ${limit}`);
+  }
 }
 
 function ontologyProposalCard(proposal) {
@@ -974,7 +1473,9 @@ function proposalActionsForState(stateName) {
 async function createOntologyProposal(version, rationale, draft, status, button) {
   let proposed;
   try {
-    proposed = JSON.parse(draft.value);
+    proposed = draft && typeof draft.value === "string"
+      ? JSON.parse(draft.value)
+      : JSON.parse(JSON.stringify(draft));
   } catch (error) {
     setStatus(status, `Proposal JSON is invalid: ${error.message || String(error)}.`, "error");
     return;
