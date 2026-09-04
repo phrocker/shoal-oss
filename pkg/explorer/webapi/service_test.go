@@ -1815,11 +1815,14 @@ func TestHTTPExtractRoundTripsWireEncodedIdentifiers(t *testing.T) {
 	body := fmt.Sprintf(`{"snapshot":%s,"document_id":%q,"revision_id":%q}`,
 		ingestWire.Snapshot, documentID, revisionID)
 	var extractWire struct {
-		Snapshot      json.RawMessage `json:"snapshot"`
-		DocumentID    string          `json:"document_id"`
-		RevisionID    string          `json:"revision_id"`
-		EntityCount   int             `json:"entity_count"`
-		EntityNodeIDs []string        `json:"entity_node_ids"`
+		Snapshot            json.RawMessage `json:"snapshot"`
+		DocumentID          string          `json:"document_id"`
+		RevisionID          string          `json:"revision_id"`
+		ExtractionID        string          `json:"extraction_id"`
+		EntityCount         int             `json:"entity_count"`
+		EntityNodeIDs       []string        `json:"entity_node_ids"`
+		RelationCount       int             `json:"relation_count"`
+		RelationshipEdgeIDs []string        `json:"relationship_edge_ids"`
 	}
 	if err := json.Unmarshal(postJSON(t, server.URL+"/api/v1/extract", body), &extractWire); err != nil {
 		t.Fatal(err)
@@ -1836,13 +1839,19 @@ func TestHTTPExtractRoundTripsWireEncodedIdentifiers(t *testing.T) {
 		t.Fatalf("extract response entities = %d, node ids = %d, want 3 and 3",
 			extractWire.EntityCount, len(extractWire.EntityNodeIDs))
 	}
-	for _, id := range extractWire.EntityNodeIDs {
+	if extractWire.RelationCount != 2 || len(extractWire.RelationshipEdgeIDs) != 2 {
+		t.Fatalf("extract response relations = %d, edge ids = %d, want 2 and 2",
+			extractWire.RelationCount, len(extractWire.RelationshipEdgeIDs))
+	}
+	encoded := append([]string{extractWire.ExtractionID}, extractWire.EntityNodeIDs...)
+	encoded = append(encoded, extractWire.RelationshipEdgeIDs...)
+	for _, id := range encoded {
 		decoded, err := base64.RawURLEncoding.DecodeString(id)
 		if err != nil {
-			t.Fatalf("entity node id %q is not unpadded base64url: %v", id, err)
+			t.Fatalf("extract response id %q is not unpadded base64url: %v", id, err)
 		}
-		if string(decoded) == id {
-			t.Fatalf("entity node id %q is not wire encoded", id)
+		if len(decoded) == 0 || string(decoded) == id {
+			t.Fatalf("extract response id %q is not wire encoded", id)
 		}
 	}
 
