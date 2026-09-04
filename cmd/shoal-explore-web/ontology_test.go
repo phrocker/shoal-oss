@@ -141,6 +141,73 @@ func TestOntologyProposalLifecycleUsesStartedEmbeddedWorkspace(t *testing.T) {
 	}
 }
 
+func TestOntologyProposalBlastRadiusUsesStartedEmbeddedWorkspace(t *testing.T) {
+	data := t.TempDir()
+	ontologyPath := writeWorkspaceOntologyFile(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	output := &lockedBuffer{}
+	done := make(chan error, 1)
+	go func() {
+		done <- run(ctx, []string{
+			"-data", data,
+			"-listen", "127.0.0.1:0",
+			"-dev-auth",
+			"-ontology-file", ontologyPath,
+		}, output)
+	}()
+	baseURL := waitForListeningURL(t, output)
+	getMeta(t, baseURL)
+
+	created := postOntologyProposalJSON(t, baseURL, "/api/v1/ontology/proposals", []byte(`{
+  "rationale": "exercise startup blast radius wiring",
+  "proposed_version": {
+    "version": "v2",
+    "properties": [
+      {"key": "name", "name": "Name", "value_type": "string"}
+    ],
+    "concepts": [
+      {"key": "person", "name": "Person", "properties": ["name"]}
+    ],
+    "relationships": []
+  }
+}`))
+	proposal, ok := created["proposal"].(map[string]any)
+	if !ok || proposal["state"] != "draft" {
+		t.Fatalf("started workspace proposal creation = %v", created)
+	}
+	proposalID, _ := proposal["id"].(string)
+	body := getOntologyJSON(
+		t, baseURL+"/api/v1/ontology/proposals/"+proposalID+"/blast-radius")
+	var decoded map[string]any
+	if err := json.Unmarshal(body, &decoded); err != nil {
+		t.Fatalf("decode blast radius %s: %v", body, err)
+	}
+	blast, ok := decoded["blast_radius"].(map[string]any)
+	if !ok {
+		t.Fatalf("started workspace blast radius response = %s", body)
+	}
+	removed, ok := blast["removed_relationships"].([]any)
+	if !ok || len(removed) != 1 {
+		t.Fatalf("started workspace blast radius did not report removed relationship: %s", body)
+	}
+	summary, _ := blast["summary"].(map[string]any)
+	if _, exists := summary["counts_computed"]; exists {
+		t.Fatalf("started workspace blast radius exposed unimplemented counts: %v", summary)
+	}
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("server did not shut down")
+	}
+}
+
 func writeWorkspaceOntologyFile(t *testing.T) string {
 	t.Helper()
 	ontologyPath := filepath.Join(t.TempDir(), "ontology.json")
