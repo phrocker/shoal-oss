@@ -177,7 +177,7 @@ func TestProjectLatentLinkAssertionsSkipsNonLinkCells(t *testing.T) {
 
 func TestProjectLatentLinkAssertionsSkipsDeletedLinkCells(t *testing.T) {
 	projection := latentProjectionFixture(t)
-	deleted := latentCell("cell-a:entity:deleted", "entity:target", "not-a-score")
+	deleted := latentCell("cell-a:entity:deleted", "entity:target", "0.95")
 	deleted.Deleted = true
 
 	assertions, err := ProjectLatentLinkAssertions(
