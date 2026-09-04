@@ -144,6 +144,31 @@
       ]
     },
     {
+      "name": "graphRank",
+      "javaClasses": [
+        "org.apache.accumulo.core.graph.GraphRankIterator"
+      ],
+      "contexts": [
+        "majc",
+        "offline"
+      ],
+      "activeContexts": [
+        "majc",
+        "offline"
+      ],
+      "optionKeys": [
+        "dampingFactor",
+        "maxIterations",
+        "edgeType",
+        "maxVertices",
+        "convergenceThreshold",
+        "vertexCF",
+        "edgeCFPrefix",
+        "labelCQ",
+        "rankCQ"
+      ]
+    },
+    {
       "name": "termIndex",
       "contexts": [
         "scan"
