@@ -249,6 +249,10 @@ func (e *Explorer) TransitionOntologyProposal(
 		return ontology.GovernedProposal{}, shoal.WrapError(
 			shoal.ErrorInternal, "stored ontology proposal is invalid", err)
 	}
+	// This advance is load-bearing; TestOntologyProposalTransitionsSurviveCoarseClockGranularity
+	// pins that back-to-back transitions still record strictly increasing times
+	// on platforms whose wall clock does not tick between two reads.
+	at = advanceProposalTransitionTime(current, at)
 	// This call is load-bearing; TestOntologyProposalEndpointRejectsIllegalTransition
 	// pins that the web API drives ontology.GovernedProposal.Transition instead
 	// of carrying a second state machine in the transport or storage layer.
@@ -279,6 +283,24 @@ func (e *Explorer) TransitionOntologyProposal(
 	}
 	record.transitions = nextTransitions
 	return updated, nil
+}
+
+// advanceProposalTransitionTime returns the earliest time that keeps a
+// proposal's lifecycle strictly ordered. Callers derive at from the wall
+// clock, whose granularity on some platforms is coarser than the interval
+// between two consecutive transitions, so at can equal the preceding
+// timestamp even though real time moved forward.
+func advanceProposalTransitionTime(
+	current ontology.GovernedProposal, at time.Time,
+) time.Time {
+	previous := current.CreatedAt()
+	if transitions := current.Transitions(); len(transitions) > 0 {
+		previous = transitions[len(transitions)-1].At()
+	}
+	if at.After(previous) {
+		return at
+	}
+	return previous.Add(time.Nanosecond)
 }
 
 func (e *Explorer) loadOntologyProposalRecord(row, qualifier, encoded []byte) error {
