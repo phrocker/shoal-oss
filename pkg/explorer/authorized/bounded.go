@@ -36,6 +36,7 @@ import (
 )
 
 const vectorCapabilityProbeText = "shoal vector capability probe"
+const graphAssertionEdgeIDMetadata = "shoal.graph.edge_id"
 
 func (c *Client) Snapshot(ctx context.Context) (explorer.Snapshot, error) {
 	bounded, err := c.boundedBase()
@@ -627,7 +628,8 @@ func (c *Client) filterNeighborhood(
 				continue
 			}
 		}
-		if assertion, ok := derivedAssertions[edge.ID]; ok {
+		assertion, hasAssertion := derivedAssertions[edge.ID]
+		if hasAssertion && assertion.Origin() == ontology.AssertionDerived {
 			allowed, err := c.derivedAssertionEndpointsAllow(
 				ctx, rawNodes, visibleNodes, resolved, assertion, decision,
 				auth.OperationNeighborhood, now)
@@ -693,6 +695,10 @@ func (c *Client) filterNeighborhood(
 			return explorer.Neighborhood{}, inconsistentBase()
 		}
 		admittedEdges[edge.ID] = cloneGraphEdge(edge)
+		assertion, hasAssertion := derivedAssertions[edge.ID]
+		if hasAssertion {
+			admittedAssertions[edge.ID] = assertion
+		}
 	}
 	missingProvenanceSeed := false
 	for _, seed := range normalized.NodeIDs {
@@ -809,7 +815,19 @@ func derivedAssertionsByEdge(
 			return nil, inconsistentBase()
 		}
 		if assertion.Origin() != ontology.AssertionDerived {
-			return nil, inconsistentBase()
+			edgeID := shoal.ID(assertion.Metadata()[graphAssertionEdgeIDMetadata])
+			if edgeID == "" {
+				// This skip is load-bearing; TestExtractDocumentAuthorizationControlsDerivedGraph pins that cited inferred extraction assertions do not make authorized graph reads fail closed.
+				continue
+			}
+			if err := shoal.ValidateRequiredID("assertion graph edge ID", edgeID); err != nil {
+				return nil, inconsistentBase()
+			}
+			if _, duplicate := byEdge[edgeID]; duplicate {
+				return nil, inconsistentBase()
+			}
+			byEdge[edgeID] = assertion
+			continue
 		}
 		if _, ok := assertion.Object().ReferenceValue(); !ok {
 			return nil, inconsistentBase()

@@ -28,6 +28,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
+	"github.com/phrocker/shoal-oss/pkg/extraction"
 	"github.com/phrocker/shoal-oss/pkg/graph"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
@@ -49,6 +50,7 @@ type RevisionRegistration struct {
 type NodeRegistration struct {
 	DocumentID shoal.ID
 	RevisionID shoal.ID
+	Node       graph.Node
 	Rule       AccessRule
 }
 
@@ -105,6 +107,7 @@ type PolicyStore interface {
 	PendSourceClaim(context.Context, SourcePolicyClaim) error
 	RollbackSourceClaim(context.Context, SourcePolicyClaim) error
 	PutRevision(context.Context, RevisionRegistration) error
+	PutNode(context.Context, shoal.ID, NodeRegistration) error
 	Revision(context.Context, shoal.ID, shoal.ID) (RevisionRegistration, bool, error)
 	CurrentRevision(context.Context, shoal.ID) (RevisionRegistration, bool, error)
 	Node(context.Context, shoal.ID) (NodeRegistration, bool, error)
@@ -592,6 +595,50 @@ func (s *MemoryPolicyStore) PutRevision(
 		s.replaceCurrent(key, normalized)
 	}
 	return nil
+}
+
+// PutNode registers an extracted graph node under the source revision rule
+// that authorized its publication. The node registration is idempotent for the
+// same owner and rule, but it never widens or rewrites a previously registered
+// node.
+func (s *MemoryPolicyStore) PutNode(
+	ctx context.Context,
+	nodeID shoal.ID,
+	registration NodeRegistration,
+) error {
+	if err := contextFailure(ctx); err != nil {
+		return err
+	}
+	normalized, err := normalizeNodeRegistration(nodeID, registration)
+	if err != nil {
+		return err
+	}
+	if s == nil {
+		return catalogUnavailable()
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.initialize()
+	if existing, ok := s.nodes[nodeID]; ok {
+		if nodeRegistrationsEqual(existing, normalized) {
+			return nil
+		}
+		// This same-rule merge is load-bearing; TestAuthorizedExtractDocumentSameTenantSharedEntityCollapses pins that shared derived entities collapse across a tenant's skill files without widening access.
+		if existing.Rule.equal(normalized.Rule) &&
+			derivedEntityNodesEqual(existing.Node, normalized.Node) {
+			return nil
+		}
+		return catalogConflict()
+	}
+	s.nodes[nodeID] = normalized
+	return nil
+}
+
+func derivedEntityNodesEqual(left, right graph.Node) bool {
+	return left.ID != "" &&
+		left.Properties[extraction.GraphPropertyEntityKey] != "" &&
+		left.Properties[extraction.GraphPropertyOntologyConceptID] != "" &&
+		graphNodesEqual(left, right)
 }
 
 // Revision returns one exact immutable revision registration.
@@ -1229,6 +1276,45 @@ func normalizeRevisionRegistration(
 	}, nil
 }
 
+func normalizeNodeRegistration(
+	nodeID shoal.ID,
+	registration NodeRegistration,
+) (NodeRegistration, error) {
+	if err := shoal.ValidateRequiredID("graph node ID", nodeID); err != nil {
+		return NodeRegistration{}, err
+	}
+	if err := shoal.ValidateRequiredID(
+		"document ID", registration.DocumentID,
+	); err != nil {
+		return NodeRegistration{}, err
+	}
+	if err := shoal.ValidateRequiredID(
+		"revision ID", registration.RevisionID,
+	); err != nil {
+		return NodeRegistration{}, err
+	}
+	rule, err := registration.Rule.clone()
+	if err != nil {
+		return NodeRegistration{}, err
+	}
+	node := graph.Node{}
+	if registration.Node.ID != "" {
+		if registration.Node.ID != nodeID {
+			return NodeRegistration{}, catalogConflict()
+		}
+		if err := registration.Node.Validate(); err != nil {
+			return NodeRegistration{}, err
+		}
+		node = cloneGraphNode(registration.Node)
+	}
+	return NodeRegistration{
+		DocumentID: registration.DocumentID,
+		RevisionID: registration.RevisionID,
+		Node:       node,
+		Rule:       rule,
+	}, nil
+}
+
 func normalizeApplicationEdgeRegistration(
 	registration EdgeRegistration,
 ) (EdgeRegistration, error) {
@@ -1277,6 +1363,13 @@ func edgeRegistrationsEqual(left, right EdgeRegistration) bool {
 		left.Rule.equal(right.Rule)
 }
 
+func nodeRegistrationsEqual(left, right NodeRegistration) bool {
+	return left.DocumentID == right.DocumentID &&
+		left.RevisionID == right.RevisionID &&
+		graphNodesEqual(left.Node, right.Node) &&
+		left.Rule.equal(right.Rule)
+}
+
 func cloneRevisionRegistration(
 	registration RevisionRegistration,
 ) RevisionRegistration {
@@ -1298,6 +1391,7 @@ func cloneNodeRegistration(
 		return NodeRegistration{}, err
 	}
 	registration.Rule = rule
+	registration.Node = cloneGraphNode(registration.Node)
 	return registration, nil
 }
 

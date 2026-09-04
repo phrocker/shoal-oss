@@ -198,6 +198,8 @@ func (h *Handler) routes() {
 	})
 	h.mux.HandleFunc("GET /api/v1/auth-config", h.authConfigEndpoint)
 	h.mux.HandleFunc("POST /api/v1/ingest", ingestEndpoint(h.service))
+	// This route registration is load-bearing; TestHTTPExtractPublishesUploadedSkillGraph pins extraction as an explicit user-triggered action.
+	h.mux.HandleFunc("POST /api/v1/extract", extractEndpoint(h.service))
 	h.mux.HandleFunc("POST /api/v1/changes", changesEndpoint(h.service))
 	h.mux.HandleFunc("POST /api/v1/documents", endpoint(h.service.Documents))
 	h.mux.HandleFunc("POST /api/v1/document", endpoint(h.service.Document))
@@ -227,6 +229,9 @@ func metadataFor(ctx context.Context, service Service) (MetadataResponse, error)
 		if _, ok := service.(IngestProvider); !ok {
 			metadata.Capabilities.Ingest = false
 		}
+		if _, ok := service.(ExtractionProvider); !ok {
+			metadata.Capabilities.Extraction = false
+		}
 		return metadata, nil
 	}
 	capabilities, err := capabilitiesFor(ctx, service)
@@ -249,6 +254,9 @@ func capabilitiesFor(ctx context.Context, service Service) (Capabilities, error)
 		if _, ok := service.(IngestProvider); !ok {
 			capabilities.Ingest = false
 		}
+		if _, ok := service.(ExtractionProvider); !ok {
+			capabilities.Extraction = false
+		}
 		return capabilities, nil
 	}
 	capabilities, err := provider.Capabilities(ctx)
@@ -258,7 +266,32 @@ func capabilitiesFor(ctx context.Context, service Service) (Capabilities, error)
 	if _, ok := service.(IngestProvider); !ok {
 		capabilities.Ingest = false
 	}
+	if _, ok := service.(ExtractionProvider); !ok {
+		capabilities.Extraction = false
+	}
 	return capabilities, nil
+}
+
+func extractEndpoint(service Service) http.HandlerFunc {
+	return func(writer http.ResponseWriter, request *http.Request) {
+		provider, ok := service.(ExtractionProvider)
+		if !ok {
+			writeError(writer, shoal.NewError(
+				shoal.ErrorUnavailable, "workspace capability \"extraction\" is unavailable"))
+			return
+		}
+		var input ExtractRequest
+		if err := decodeRequest(writer, request, &input); err != nil {
+			writeError(writer, shoal.NewError(shoal.ErrorInvalidArgument, err.Error()))
+			return
+		}
+		response, err := provider.Extract(request.Context(), input)
+		if err != nil {
+			writeError(writer, err)
+			return
+		}
+		writeResponse(writer, http.StatusOK, response)
+	}
 }
 
 // changesEndpoint serves the resumable document change feed. It is a read, so

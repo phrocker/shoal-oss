@@ -308,14 +308,15 @@ func TestUndirectedRelationNormalizesWholePayload(t *testing.T) {
 	}
 }
 
-func TestEntityIdentityIncludesPromptScope(t *testing.T) {
+func TestEntityIdentityIgnoresPromptScopeForResolution(t *testing.T) {
 	f := newFixture(t)
 	first := extractWith(t, f.request, validOutput(f)).PublicationPlan()
 	changed := f.request
 	changed.Instructions = "Extract only explicitly named work relationships."
 	second := extractWith(t, changed, validOutput(f)).PublicationPlan()
-	if first.Entities[0].ID == second.Entities[0].ID {
-		t.Fatal("entity identity collapsed independent prompt scopes")
+	if first.Entities[0].ID != second.Entities[0].ID {
+		t.Fatalf("entity identity changed across prompt scopes: %s != %s",
+			first.Entities[0].ID, second.Entities[0].ID)
 	}
 }
 

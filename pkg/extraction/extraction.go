@@ -43,6 +43,11 @@ const (
 	DefaultMaxRelations   = 2048
 	DefaultMaxProperties  = 256
 	DefaultMaxStringBytes = 64 << 10
+
+	GraphPropertyOntologyConceptID  = "shoal.ontology.concept_id"
+	GraphPropertyOntologyConceptKey = "shoal.ontology.concept_key"
+	GraphPropertyEntityKey          = "shoal.ontology.entity_key"
+	GraphPropertyEntityNamespace    = "shoal.ontology.entity_namespace"
 )
 
 var (
@@ -114,10 +119,11 @@ func (l Limits) normalized() (Limits, error) {
 }
 
 type Request struct {
-	Version      ontology.OntologyVersion
-	Context      inference.ContextPack
-	Instructions string
-	Limits       Limits
+	Version         ontology.OntologyVersion
+	Context         inference.ContextPack
+	Instructions    string
+	EntityNamespace string
+	Limits          Limits
 }
 
 func (r Request) Validate() error {
@@ -136,6 +142,9 @@ func (r Request) Validate() error {
 	}
 	if len(r.Instructions) > int(ontology.DefaultExtractionLimits().MaxInstructionBytes) {
 		return errors.New("extraction: instructions exceed the byte limit")
+	}
+	if !utf8.ValidString(r.EntityNamespace) || len(r.EntityNamespace) > 4096 {
+		return errors.New("extraction: entity namespace must be valid bounded UTF-8")
 	}
 	_, err := r.Limits.normalized()
 	return err
@@ -702,9 +711,13 @@ func materialize(request Request, prompt string, mp model.Provenance, raw rawOut
 				return Result{}, err
 			}
 		} else {
+			// This scoped type/key identity is load-bearing; TestAuthorizedExtractDocumentCrossTenantSharedEntityGetsDistinctNodes pins authorization-scope isolation while TestEntityIdentityIgnoresPromptScopeForResolution pins prompt-independent resolution.
+			idParts := []string{string(typeID), key}
+			if request.EntityNamespace != "" {
+				idParts = append([]string{request.EntityNamespace}, idParts...)
+			}
 			id, err = ontology.NewStableID(
-				"inferred-entity", string(request.Version.ID()),
-				hash, string(typeID), key,
+				"inferred-entity", idParts...,
 			)
 			if err != nil {
 				return Result{}, err
@@ -1240,6 +1253,9 @@ func (h HeuristicExtractor) Extract(_ context.Context, request Request) (Result,
 	if err := request.Validate(); err != nil {
 		return Result{}, err
 	}
+	if ids, ok := skillOntologyIDs(request.Version); ok {
+		return h.extractSkillOntology(request, ids)
+	}
 	if _, ok := conceptByID(request.Version, h.ConceptType); !ok {
 		return Result{}, errors.New("extraction: heuristic concept type is not in the ontology")
 	}
@@ -1286,6 +1302,344 @@ func (h HeuristicExtractor) Extract(_ context.Context, request Request) (Result,
 		return Result{}, err
 	}
 	return materialize(request, prompt, model.Provenance{Provider: HeuristicProvider, Model: HeuristicModel}, rawOutput{Entities: entities}, "heuristic")
+}
+
+type skillIDs struct {
+	skill, tool, capability          shoal.ID
+	name, description                shoal.ID
+	providesTool, providesCapability shoal.ID
+	dependsOn                        shoal.ID
+}
+
+type skillCandidate struct {
+	key, name, typeName string
+	typeID              shoal.ID
+	anchorID            shoal.ID
+	existingToken       string
+	existingAnchorID    shoal.ID
+}
+
+type relationCandidate struct {
+	typeID       shoal.ID
+	fromKey      string
+	toKey        string
+	anchorID     shoal.ID
+	sortableType string
+}
+
+func skillOntologyIDs(version ontology.OntologyVersion) (skillIDs, bool) {
+	var ids skillIDs
+	for _, concept := range version.Concepts() {
+		switch concept.Key() {
+		case "skill":
+			ids.skill = concept.ID()
+		case "tool":
+			ids.tool = concept.ID()
+		case "capability", "feature":
+			ids.capability = concept.ID()
+		}
+	}
+	for _, property := range version.Properties() {
+		switch property.Key() {
+		case "name":
+			ids.name = property.ID()
+		case "description":
+			ids.description = property.ID()
+		}
+	}
+	for _, relationship := range version.Relationships() {
+		switch relationship.Key() {
+		case "provides_tool":
+			ids.providesTool = relationship.ID()
+		case "provides_capability", "provides_feature":
+			ids.providesCapability = relationship.ID()
+		case "depends_on":
+			ids.dependsOn = relationship.ID()
+		}
+	}
+	return ids, ids.skill != "" && ids.tool != "" && ids.capability != "" && ids.name != ""
+}
+
+func (h HeuristicExtractor) extractSkillOntology(request Request, ids skillIDs) (Result, error) {
+	limits, _ := request.Limits.normalized()
+	existing := existingOntologyNodes(request.Context)
+	var skills, tools, capabilities []skillCandidate
+	var dependencies []skillCandidate
+	for _, anchor := range request.Context.Evidence() {
+		_, quote, ok := anchor.Document()
+		if !ok {
+			continue
+		}
+		skillName := markdownTitle(quote)
+		if skillName == "" {
+			skillName = firstNamedValue(quote, "name")
+		}
+		if skillName != "" {
+			skills = append(skills, newSkillCandidate(
+				skillName, "skill", ids.skill, anchor.ID(), existing))
+		}
+		tools = append(tools, extractNamedList(
+			quote, []string{"tools", "tooling"}, "tool", ids.tool, anchor.ID(), existing)...)
+		capabilities = append(capabilities, extractNamedList(
+			quote, []string{"capabilities", "features", "feature"}, "capability", ids.capability, anchor.ID(), existing)...)
+		dependencies = append(dependencies, extractNamedList(
+			quote, []string{"dependencies", "depends on", "requires", "prerequisites"}, "skill", ids.skill, anchor.ID(), existing)...)
+	}
+	skills = uniqueCandidates(skills)
+	tools = uniqueCandidates(tools)
+	capabilities = uniqueCandidates(capabilities)
+	dependencies = uniqueCandidates(dependencies)
+	if len(skills) == 0 {
+		return Result{}, errors.New("extraction: heuristic found no skill entity")
+	}
+	candidates := uniqueCandidates(append(append(append(skills, tools...), capabilities...), dependencies...))
+	if len(candidates) > limits.MaxEntities {
+		return Result{}, errors.New("extraction: output exceeds item count limit")
+	}
+	entities := make([]rawEntity, 0, len(candidates))
+	for _, candidate := range candidates {
+		entity := rawEntity{
+			Key: candidate.key, TypeID: string(candidate.typeID),
+			Properties: []rawProperty{stringProperty(ids.name, candidate.name)},
+			Confidence: floatPointer(0.6), EvidenceAnchorIDs: []string{string(candidate.anchorID)},
+		}
+		if candidate.existingToken != "" {
+			entity.ExistingNodeID = candidate.existingToken
+			entity.EvidenceAnchorIDs = append(entity.EvidenceAnchorIDs, string(candidate.existingAnchorID))
+			sort.Strings(entity.EvidenceAnchorIDs)
+		}
+		entities = append(entities, entity)
+	}
+	relations := make([]rawRelation, 0, len(tools)+len(capabilities)+len(dependencies))
+	skillKey := skills[0].key
+	if ids.providesTool != "" {
+		for _, tool := range tools {
+			relations = append(relations, rawRelation{
+				TypeID: string(ids.providesTool), FromKey: skillKey, ToKey: tool.key,
+				Properties: []rawProperty{}, Confidence: floatPointer(0.55),
+				EvidenceAnchorIDs: []string{string(tool.anchorID)},
+			})
+		}
+	}
+	if ids.providesCapability != "" {
+		for _, capability := range capabilities {
+			relations = append(relations, rawRelation{
+				TypeID: string(ids.providesCapability), FromKey: skillKey, ToKey: capability.key,
+				Properties: []rawProperty{}, Confidence: floatPointer(0.55),
+				EvidenceAnchorIDs: []string{string(capability.anchorID)},
+			})
+		}
+	}
+	if ids.dependsOn != "" {
+		for _, dependency := range dependencies {
+			if dependency.key == skillKey {
+				continue
+			}
+			relations = append(relations, rawRelation{
+				TypeID: string(ids.dependsOn), FromKey: skillKey, ToKey: dependency.key,
+				Properties: []rawProperty{}, Confidence: floatPointer(0.5),
+				EvidenceAnchorIDs: []string{string(dependency.anchorID)},
+			})
+		}
+	}
+	sort.Slice(relations, func(i, j int) bool {
+		if relations[i].TypeID != relations[j].TypeID {
+			return relations[i].TypeID < relations[j].TypeID
+		}
+		if relations[i].FromKey != relations[j].FromKey {
+			return relations[i].FromKey < relations[j].FromKey
+		}
+		return relations[i].ToKey < relations[j].ToKey
+	})
+	if len(entities) == 0 && len(relations) == 0 {
+		return Result{}, errors.New("extraction: heuristic found no grounded entities")
+	}
+	prompt, err := BuildPrompt(request)
+	if err != nil {
+		return Result{}, err
+	}
+	return materialize(
+		request, prompt,
+		model.Provenance{Provider: HeuristicProvider, Model: "deterministic-skill-markdown"},
+		rawOutput{Entities: entities, Relations: relations},
+		"heuristic",
+	)
+}
+
+func newSkillCandidate(
+	name, typeName string,
+	typeID shoal.ID,
+	anchorID shoal.ID,
+	existing map[string]existingNode,
+) skillCandidate {
+	key := canonicalEntityKey(name)
+	candidate := skillCandidate{
+		key: key, name: strings.TrimSpace(name), typeName: typeName,
+		typeID: typeID, anchorID: anchorID,
+	}
+	if match, ok := existing[string(typeID)+"\x00"+key]; ok {
+		candidate.existingToken = graphNodeToken(match.id)
+		candidate.existingAnchorID = match.anchorID
+	}
+	return candidate
+}
+
+func uniqueCandidates(values []skillCandidate) []skillCandidate {
+	sort.Slice(values, func(i, j int) bool {
+		if values[i].typeName != values[j].typeName {
+			return values[i].typeName < values[j].typeName
+		}
+		return values[i].key < values[j].key
+	})
+	unique := values[:0]
+	seen := map[string]struct{}{}
+	for _, value := range values {
+		if value.key == "" || !entityKeyPattern.MatchString(value.key) {
+			continue
+		}
+		k := string(value.typeID) + "\x00" + value.key
+		if _, ok := seen[k]; ok {
+			continue
+		}
+		seen[k] = struct{}{}
+		unique = append(unique, value)
+	}
+	return unique
+}
+
+func stringProperty(id shoal.ID, value string) rawProperty {
+	encoded, _ := json.Marshal(value)
+	return rawProperty{
+		PropertyID: string(id),
+		Value:      rawValue{Type: string(ontology.ValueString), Value: encoded},
+	}
+}
+
+type existingNode struct {
+	id       shoal.ID
+	anchorID shoal.ID
+}
+
+func existingOntologyNodes(pack inference.ContextPack) map[string]existingNode {
+	result := map[string]existingNode{}
+	for _, anchor := range pack.Evidence() {
+		path, ok := anchor.Path()
+		if !ok || len(path.Nodes) != 1 {
+			continue
+		}
+		node := path.Nodes[0]
+		typeID := node.Properties[GraphPropertyOntologyConceptID]
+		key := node.Properties[GraphPropertyEntityKey]
+		if typeID == "" || key == "" {
+			continue
+		}
+		mapKey := typeID + "\x00" + key
+		if previous, ok := result[mapKey]; ok && string(previous.id) <= string(node.ID) {
+			continue
+		}
+		result[mapKey] = existingNode{id: node.ID, anchorID: anchor.ID()}
+	}
+	return result
+}
+
+func markdownTitle(text string) string {
+	for _, line := range strings.Split(text, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "# ") {
+			return cleanListItem(strings.TrimSpace(strings.TrimPrefix(trimmed, "# ")))
+		}
+	}
+	return ""
+}
+
+func firstNamedValue(text, name string) string {
+	prefix := strings.ToLower(name) + ":"
+	for _, line := range strings.Split(text, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(strings.ToLower(trimmed), prefix) {
+			return cleanListItem(strings.TrimSpace(trimmed[len(prefix):]))
+		}
+	}
+	return ""
+}
+
+func extractNamedList(
+	text string,
+	headings []string,
+	typeName string,
+	typeID shoal.ID,
+	anchorID shoal.ID,
+	existing map[string]existingNode,
+) []skillCandidate {
+	headingSet := map[string]struct{}{}
+	for _, heading := range headings {
+		headingSet[heading] = struct{}{}
+	}
+	var out []skillCandidate
+	inSection := false
+	for _, line := range strings.Split(text, "\n") {
+		trimmed := strings.TrimSpace(line)
+		// This heading normalization is load-bearing; TestExtractDocumentPublishesSkillGraph pins colon-headed skill sections such as "Tools:".
+		lower := strings.ToLower(strings.Trim(trimmed, "# "))
+		if strings.HasPrefix(trimmed, "#") {
+			_, inSection = headingSet[strings.TrimSuffix(lower, ":")]
+			continue
+		}
+		if strings.HasSuffix(lower, ":") {
+			_, inSection = headingSet[strings.TrimSuffix(lower, ":")]
+			if inSection {
+				continue
+			}
+		}
+		if !inSection {
+			for heading := range headingSet {
+				prefix := heading + ":"
+				if strings.HasPrefix(strings.ToLower(trimmed), prefix) {
+					for _, item := range splitInlineList(trimmed[len(prefix):]) {
+						out = append(out, newSkillCandidate(item, typeName, typeID, anchorID, existing))
+					}
+				}
+			}
+			continue
+		}
+		if strings.HasPrefix(trimmed, "- ") || strings.HasPrefix(trimmed, "* ") {
+			item := cleanListItem(trimmed[2:])
+			if item != "" {
+				out = append(out, newSkillCandidate(item, typeName, typeID, anchorID, existing))
+			}
+		}
+	}
+	return out
+}
+
+func splitInlineList(text string) []string {
+	fields := strings.FieldsFunc(text, func(r rune) bool {
+		return r == ',' || r == ';'
+	})
+	out := make([]string, 0, len(fields))
+	for _, field := range fields {
+		if cleaned := cleanListItem(field); cleaned != "" {
+			out = append(out, cleaned)
+		}
+	}
+	return out
+}
+
+func cleanListItem(text string) string {
+	value := strings.TrimSpace(text)
+	value = strings.Trim(value, "`*_[]()")
+	if i := strings.Index(value, " - "); i >= 0 {
+		value = strings.TrimSpace(value[:i])
+	}
+	if i := strings.Index(value, ": "); i >= 0 {
+		value = strings.TrimSpace(value[:i])
+	}
+	return strings.Trim(value, " .,\t\r\n")
+}
+
+func canonicalEntityKey(name string) string {
+	key := strings.ToLower(heuristicKeySanitizer.ReplaceAllString(strings.TrimSpace(name), "_"))
+	return strings.Trim(key, "_")
 }
 
 func conceptByID(version ontology.OntologyVersion, id shoal.ID) (ontology.ConceptDefinition, bool) {

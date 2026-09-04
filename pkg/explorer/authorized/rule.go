@@ -133,6 +133,16 @@ func (r AccessRule) String() string {
 		).String() + "}"
 }
 
+func (r AccessRule) extractionEntityNamespace() string {
+	if len(r.keys) == 0 {
+		return ""
+	}
+	return auth.DigestBytes(
+		"explorer-extraction-entity-namespace-v1",
+		logicalRuleBytes(r.keys),
+	).String()
+}
+
 func (r AccessRule) clone() (AccessRule, error) {
 	return NewAccessRule(r.policies...)
 }

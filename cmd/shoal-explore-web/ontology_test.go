@@ -29,6 +29,18 @@ import (
 	"time"
 )
 
+func TestSkillsOntologyFileLoads(t *testing.T) {
+	version, err := loadOntologyVersionFile(
+		filepath.Join("..", "..", "docs", "skills-ontology.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(version.Concepts()) != 3 || len(version.Relationships()) != 3 {
+		t.Fatalf("skills ontology shape = %d concepts, %d relationships; want 3 and 3",
+			len(version.Concepts()), len(version.Relationships()))
+	}
+}
+
 func TestOntologyFileConfiguresWebWorkspaceEndpoint(t *testing.T) {
 	data := t.TempDir()
 	ontologyPath := writeWorkspaceOntologyFile(t)
