@@ -27,6 +27,7 @@ import (
 
 	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/explorer/webapi"
+	"github.com/phrocker/shoal-oss/pkg/graph"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
@@ -79,6 +80,43 @@ func TestLatentAssertionsUseStartedEmbeddedWorkspaceReadPath(t *testing.T) {
 	derivation, ok := evidence[0].(map[string]any)["derivation"].(map[string]any)
 	if !ok || derivation["iterator_name"] != explorer.LatentLinkDefaultIteratorName {
 		t.Fatalf("derivation did not survive HTTP read path: %v", evidence[0])
+	}
+	var typed webapi.NeighborhoodResponse
+	if err := json.Unmarshal(body, &typed); err != nil {
+		t.Fatalf("decode typed neighborhood %s: %v", body, err)
+	}
+	assertionID := typed.Neighborhood.Assertions[0].ID()
+	producerRequest, err := json.Marshal(webapi.NeighborhoodRequest{
+		NodeIDs: []shoal.ID{assertionID},
+		Depth:   1, Fanout: 8, MaxNodes: 8,
+		EdgeTypes: []string{graph.EdgeTypeProduced},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	body = postJSON(t, baseURL+"/api/v1/neighborhood", string(producerRequest))
+	if err := json.Unmarshal(body, &decoded); err != nil {
+		t.Fatalf("decode producer neighborhood %s: %v", body, err)
+	}
+	neighborhood, ok = decoded["neighborhood"].(map[string]any)
+	if !ok {
+		t.Fatalf("producer neighborhood response missing graph: %s", body)
+	}
+	nodes, ok := neighborhood["nodes"].([]any)
+	if !ok || len(nodes) != 2 {
+		t.Fatalf("producer provenance nodes = %v in %s", neighborhood["nodes"], body)
+	}
+	edges, ok := neighborhood["edges"].([]any)
+	if !ok || len(edges) != 1 {
+		t.Fatalf("producer provenance edges = %v in %s", neighborhood["edges"], body)
+	}
+	producedEdge, ok := edges[0].(map[string]any)
+	if !ok || producedEdge["type"] != graph.EdgeTypeProduced {
+		t.Fatalf("producer derivation edge did not survive HTTP read path: %v", edges[0])
+	}
+	assertions, ok = neighborhood["assertions"].([]any)
+	if !ok || len(assertions) != 1 {
+		t.Fatalf("producer assertion list = %v in %s", neighborhood["assertions"], body)
 	}
 
 	cancel()

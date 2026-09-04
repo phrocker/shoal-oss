@@ -288,6 +288,9 @@ func (c *Client) BoundedNeighborhood(
 		return explorer.BoundedNeighborhood{}, err
 	}
 	for _, nodeID := range normalized.NodeIDs {
+		if possibleProvenanceNodeID(nodeID) {
+			continue
+		}
 		if _, err := c.authorizedNode(
 			ctx, nodeID, decision, auth.OperationNeighborhood, now); err != nil {
 			return explorer.BoundedNeighborhood{}, err
@@ -305,7 +308,8 @@ func (c *Client) BoundedNeighborhood(
 	if err != nil {
 		return explorer.BoundedNeighborhood{}, directBaseError(err)
 	}
-	filtered, err := c.filterNeighborhood(ctx, raw.Neighborhood, normalized, direction, decision, now)
+	filtered, err := c.filterNeighborhood(
+		ctx, raw.Neighborhood, normalized, direction, decision, now, false)
 	if err != nil {
 		return explorer.BoundedNeighborhood{}, err
 	}
@@ -319,6 +323,11 @@ func (c *Client) BoundedNeighborhood(
 }
 
 const maxAuthorizedBoundedScanPages = 1024
+
+const (
+	derivedAssertionPropertyAssertionID  = "ontology.assertion.id"
+	derivedAssertionPropertyDerivationID = "ontology.assertion.derivation.id"
+)
 
 func authorizedCursorEligible(normalized explorer.NeighborhoodRequest) bool {
 	return len(normalized.NodeIDs) == 1 && normalized.Depth == 1
@@ -367,7 +376,8 @@ func (c *Client) boundedAuthorizedNeighborhoodPage(
 			return explorer.BoundedNeighborhood{}, directBaseError(err)
 		}
 		scannedEdges += uint32(len(raw.Neighborhood.Edges))
-		filtered, err := c.filterNeighborhood(ctx, raw.Neighborhood, normalized, direction, decision, now)
+		filtered, err := c.filterNeighborhood(
+			ctx, raw.Neighborhood, normalized, direction, decision, now, true)
 		if err != nil {
 			return explorer.BoundedNeighborhood{}, err
 		}
@@ -402,6 +412,14 @@ func (c *Client) boundedAuthorizedNeighborhoodPage(
 	if exhaustedScanLimit {
 		return explorer.BoundedNeighborhood{}, shoal.NewError(
 			shoal.ErrorUnavailable, "authorized bounded graph scan limit exhausted")
+	}
+	for _, nodeID := range normalized.NodeIDs {
+		if _, ok := nodes[nodeID]; ok {
+			continue
+		}
+		if possibleProvenanceNodeID(nodeID) {
+			return explorer.BoundedNeighborhood{}, auth.ObjectNotFound()
+		}
 	}
 	if err := guard.Check(ctx); err != nil {
 		return explorer.BoundedNeighborhood{}, err
@@ -486,10 +504,29 @@ func authorizedBoundedPage(
 		nextAfter = ""
 	}
 	selectedAssertions := make([]ontology.Assertion, 0, len(selectedEdges))
+	seenAssertions := make(map[shoal.ID]struct{}, len(selectedEdges))
 	for _, edge := range selectedEdges {
 		if assertion, ok := assertions[edge.ID]; ok {
+			seenAssertions[assertion.ID()] = struct{}{}
 			selectedAssertions = append(selectedAssertions, assertion)
+			continue
 		}
+		if edge.Type != graph.EdgeTypeProduced {
+			continue
+		}
+		assertionID, ok := edge.Properties[derivedAssertionPropertyAssertionID]
+		if !ok {
+			continue
+		}
+		assertion, ok := assertions[shoal.ID(assertionID)]
+		if !ok {
+			continue
+		}
+		if _, duplicate := seenAssertions[assertion.ID()]; duplicate {
+			continue
+		}
+		seenAssertions[assertion.ID()] = struct{}{}
+		selectedAssertions = append(selectedAssertions, assertion)
 	}
 	sort.Slice(selectedAssertions, func(left, right int) bool {
 		return shoal.CompareID(selectedAssertions[left].ID(), selectedAssertions[right].ID()) < 0
@@ -517,6 +554,7 @@ func (c *Client) filterNeighborhood(
 	direction explorer.GraphDirection,
 	decision auth.Decision,
 	now time.Time,
+	allowMissingProvenanceSeeds bool,
 ) (explorer.Neighborhood, error) {
 	candidates := make(map[shoal.ID]graph.Node, len(raw.Nodes))
 	registrations := make(map[shoal.ID]NodeRegistration, len(raw.Nodes))
@@ -567,11 +605,6 @@ func (c *Client) filterNeighborhood(
 		}
 		visibleNodes[nodeID] = node
 	}
-	for _, seed := range normalized.NodeIDs {
-		if _, ok := visibleNodes[seed]; !ok {
-			return explorer.Neighborhood{}, inconsistentBase()
-		}
-	}
 
 	typeFilter := make(map[string]struct{}, len(normalized.EdgeTypes))
 	for _, edgeType := range normalized.EdgeTypes {
@@ -608,6 +641,28 @@ func (c *Client) filterNeighborhood(
 			admittedAssertions[edge.ID] = assertion
 			continue
 		}
+		if edge.Type == graph.EdgeTypeProduced {
+			assertion, ok := derivedAssertions[edge.To]
+			if !ok {
+				return explorer.Neighborhood{}, inconsistentBase()
+			}
+			allowed, err := c.derivedAssertionAllows(
+				ctx, assertion, decision, auth.OperationNeighborhood, now)
+			if err != nil {
+				return explorer.Neighborhood{}, err
+			}
+			if !allowed || !producerDerivationEdgeMatches(edge, rawNodes, assertion) {
+				continue
+			}
+			// Load-bearing: TestAuthorizedProducerProvenanceDoesNotAggregateHiddenAssertions
+			// pins that producer and assertion nodes are admitted only through
+			// an already authorized produced assertion.
+			visibleNodes[edge.From] = cloneGraphNode(rawNodes[edge.From])
+			visibleNodes[edge.To] = cloneGraphNode(rawNodes[edge.To])
+			admittedEdges[edge.ID] = cloneGraphEdge(edge)
+			admittedAssertions[edge.ID] = assertion
+			continue
+		}
 		if _, ok := visibleNodes[edge.From]; !ok {
 			continue
 		}
@@ -638,6 +693,23 @@ func (c *Client) filterNeighborhood(
 			return explorer.Neighborhood{}, inconsistentBase()
 		}
 		admittedEdges[edge.ID] = cloneGraphEdge(edge)
+	}
+	missingProvenanceSeed := false
+	for _, seed := range normalized.NodeIDs {
+		if _, ok := visibleNodes[seed]; ok {
+			continue
+		}
+		if node, ok := rawNodes[seed]; ok && graph.IsProvenanceKind(node.Kind) {
+			if allowMissingProvenanceSeeds {
+				missingProvenanceSeed = true
+				continue
+			}
+			return explorer.Neighborhood{}, auth.ObjectNotFound()
+		}
+		return explorer.Neighborhood{}, inconsistentBase()
+	}
+	if missingProvenanceSeed {
+		return explorer.Neighborhood{}, nil
 	}
 
 	reachable := make(map[shoal.ID]struct{}, len(normalized.NodeIDs))
@@ -757,6 +829,34 @@ func derivedAssertionMatchesEdge(assertion ontology.Assertion, edge graph.Edge) 
 		scoresEqual(edge.Weight, assertion.Confidence())
 }
 
+func producerDerivationEdgeMatches(
+	edge graph.Edge,
+	rawNodes map[shoal.ID]graph.Node,
+	assertion ontology.Assertion,
+) bool {
+	producer, ok := rawNodes[edge.From]
+	if !ok || producer.Kind != graph.NodeKindProducer {
+		return false
+	}
+	assertionNode, ok := rawNodes[edge.To]
+	if !ok || assertionNode.Kind != graph.NodeKindDerivedAssertion {
+		return false
+	}
+	if assertionNode.ID != assertion.ID() {
+		return false
+	}
+	assertionID, ok := edge.Properties[derivedAssertionPropertyAssertionID]
+	if !ok || shoal.ID(assertionID) != assertion.ID() {
+		return false
+	}
+	derivation, ok := assertion.Evidence()[0].Derivation()
+	if !ok {
+		return false
+	}
+	return edge.Properties[derivedAssertionPropertyDerivationID] ==
+		string(derivation.ID())
+}
+
 func (c *Client) derivedAssertionEndpointsAllow(
 	ctx context.Context,
 	rawNodes map[shoal.ID]graph.Node,
@@ -798,6 +898,45 @@ func (c *Client) derivedAssertionEndpointsAllow(
 			return false, inconsistentBase()
 		}
 		visibleNodes[nodeID] = cloneGraphNode(node)
+	}
+	return true, nil
+}
+
+func (c *Client) derivedAssertionAllows(
+	ctx context.Context,
+	assertion ontology.Assertion,
+	decision auth.Decision,
+	operation auth.Operation,
+	now time.Time,
+) (bool, error) {
+	target, ok := assertion.Object().ReferenceValue()
+	if !ok {
+		return false, nil
+	}
+	resolved, err := c.resolveNodes(ctx, []shoal.ID{assertion.Subject(), target})
+	if err != nil {
+		return false, err
+	}
+	allowed, err := edgeEndpointsAllow(
+		resolved,
+		EdgeRegistration{Edge: graph.Edge{
+			ID: assertion.ID(), From: assertion.Subject(), To: target,
+			Type: string(assertion.Predicate()), Weight: assertion.Confidence(),
+		}},
+		decision,
+		operation,
+		now,
+	)
+	if err != nil || !allowed {
+		return allowed, err
+	}
+	registrations := map[shoal.ID]NodeRegistration{
+		assertion.Subject(): resolved[assertion.Subject()],
+		target:              resolved[target],
+	}
+	_, err = c.canonicalRegisteredNodes(ctx, registrations)
+	if err != nil {
+		return false, err
 	}
 	return true, nil
 }
