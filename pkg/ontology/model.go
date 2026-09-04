@@ -342,14 +342,188 @@ func (c Constraint) canonical() string {
 	)
 }
 
-// EvidenceRef identifies exact immutable source evidence.
+// AssertionDerivation records how a derived assertion can be recomputed.
+type AssertionDerivation struct {
+	id                    shoal.ID
+	embeddingModel        string
+	embeddingModelVersion string
+	similarityMetric      string
+	threshold             shoal.Score
+	tessellationCell      string
+	score                 shoal.Score
+	sourceEndpoint        shoal.ID
+	targetEndpoint        shoal.ID
+	iteratorName          string
+	iteratorOptions       shoal.Metadata
+}
+
+// NewAssertionDerivation creates a reproducible derivation record.
+func NewAssertionDerivation(
+	embeddingModel, embeddingModelVersion, similarityMetric string,
+	threshold shoal.Score,
+	tessellationCell string,
+	score shoal.Score,
+	sourceEndpoint, targetEndpoint shoal.ID,
+	iteratorName string,
+	iteratorOptions shoal.Metadata,
+) (AssertionDerivation, error) {
+	derivation := AssertionDerivation{
+		embeddingModel:        embeddingModel,
+		embeddingModelVersion: embeddingModelVersion,
+		similarityMetric:      similarityMetric,
+		threshold:             threshold,
+		tessellationCell:      tessellationCell,
+		score:                 score,
+		sourceEndpoint:        sourceEndpoint,
+		targetEndpoint:        targetEndpoint,
+		iteratorName:          iteratorName,
+		iteratorOptions:       cloneMetadata(iteratorOptions),
+	}
+	id, err := derivationID(derivation)
+	if err != nil {
+		return AssertionDerivation{}, err
+	}
+	derivation.id = id
+	if err := derivation.Validate(); err != nil {
+		return AssertionDerivation{}, err
+	}
+	return derivation, nil
+}
+
+// Validate checks derivation identity and recomputation inputs.
+func (d AssertionDerivation) Validate() error {
+	if err := validateTypedID(d.id, "derivation"); err != nil {
+		return err
+	}
+	if err := validateDerivationFields(d); err != nil {
+		return err
+	}
+	expected, err := derivationID(d)
+	if err != nil || expected != d.id {
+		return invalid("derivation ID is not canonical")
+	}
+	return nil
+}
+
+func (d AssertionDerivation) ID() shoal.ID {
+	return d.id
+}
+
+func (d AssertionDerivation) EmbeddingModel() string {
+	return d.embeddingModel
+}
+
+func (d AssertionDerivation) EmbeddingModelVersion() string {
+	return d.embeddingModelVersion
+}
+
+func (d AssertionDerivation) SimilarityMetric() string {
+	return d.similarityMetric
+}
+
+func (d AssertionDerivation) Threshold() shoal.Score {
+	return d.threshold
+}
+
+func (d AssertionDerivation) TessellationCell() string {
+	return d.tessellationCell
+}
+
+func (d AssertionDerivation) Score() shoal.Score {
+	return d.score
+}
+
+func (d AssertionDerivation) SourceEndpoint() shoal.ID {
+	return d.sourceEndpoint
+}
+
+func (d AssertionDerivation) TargetEndpoint() shoal.ID {
+	return d.targetEndpoint
+}
+
+func (d AssertionDerivation) IteratorName() string {
+	return d.iteratorName
+}
+
+func (d AssertionDerivation) IteratorOptions() shoal.Metadata {
+	return cloneMetadata(d.iteratorOptions)
+}
+
+func (d AssertionDerivation) clone() AssertionDerivation {
+	d.iteratorOptions = cloneMetadata(d.iteratorOptions)
+	return d
+}
+
+func (d AssertionDerivation) canonical() string {
+	// Load-bearing: TestAssertionDerivationIDIsCanonicalAndContentDerived
+	// pins that every recomputation field below participates in identity.
+	return canonicalParts(
+		d.embeddingModel,
+		d.embeddingModelVersion,
+		d.similarityMetric,
+		canonicalFloat(float64(d.threshold)),
+		d.tessellationCell,
+		canonicalFloat(float64(d.score)),
+		string(d.sourceEndpoint),
+		string(d.targetEndpoint),
+		d.iteratorName,
+		canonicalMetadata(d.iteratorOptions),
+	)
+}
+
+func derivationID(derivation AssertionDerivation) (shoal.ID, error) {
+	if err := validateDerivationFields(derivation); err != nil {
+		return "", err
+	}
+	return deriveID("derivation", derivation.canonical())
+}
+
+func validateDerivationFields(derivation AssertionDerivation) error {
+	if !requiredWire(derivation.embeddingModel) {
+		return invalid("derivation embedding model is required")
+	}
+	if !requiredWire(derivation.embeddingModelVersion) {
+		return invalid("derivation embedding model version is required")
+	}
+	if !requiredWire(derivation.similarityMetric) {
+		return invalid("derivation similarity metric is required")
+	}
+	if err := validateFinite(float64(derivation.threshold), "derivation threshold"); err != nil {
+		return err
+	}
+	if !requiredWire(derivation.tessellationCell) {
+		return invalid("derivation tessellation cell is required")
+	}
+	if err := validateFinite(float64(derivation.score), "derivation score"); err != nil {
+		return err
+	}
+	// Load-bearing: TestDerivationRejectsScoreBelowThreshold pins that a
+	// derivation only represents an edge emitted at or above its threshold.
+	if derivation.score < derivation.threshold {
+		return invalid("derivation score must meet or exceed threshold")
+	}
+	if err := validateReference(derivation.sourceEndpoint, "derivation source endpoint"); err != nil {
+		return err
+	}
+	if err := validateReference(derivation.targetEndpoint, "derivation target endpoint"); err != nil {
+		return err
+	}
+	if !requiredWire(derivation.iteratorName) {
+		return invalid("derivation iterator name is required")
+	}
+	return validateMetadata(derivation.iteratorOptions)
+}
+
+// EvidenceRef identifies exact immutable source evidence or a derivation.
 type EvidenceRef struct {
-	id       shoal.ID
-	citation document.Citation
-	quote    string
-	path     graph.Path
-	hasPath  bool
-	metadata shoal.Metadata
+	id            shoal.ID
+	citation      document.Citation
+	quote         string
+	path          graph.Path
+	hasPath       bool
+	derivation    AssertionDerivation
+	hasDerivation bool
+	metadata      shoal.Metadata
 }
 
 type evidenceOptions struct {
@@ -399,10 +573,46 @@ func NewEvidenceRef(
 	return evidence, nil
 }
 
-// Validate checks the citation, quote, metadata, and canonical identity.
+// NewDerivationEvidenceRef creates derivation-backed evidence.
+func NewDerivationEvidenceRef(
+	derivation AssertionDerivation, metadata shoal.Metadata,
+) (EvidenceRef, error) {
+	evidence := EvidenceRef{
+		derivation:    derivation.clone(),
+		hasDerivation: true,
+		metadata:      cloneMetadata(metadata),
+	}
+	id, err := derivedEvidenceID(evidence.derivation)
+	if err != nil {
+		return EvidenceRef{}, err
+	}
+	evidence.id = id
+	if err := evidence.Validate(); err != nil {
+		return EvidenceRef{}, err
+	}
+	return evidence, nil
+}
+
+// Validate checks the evidence payload, metadata, and canonical identity.
 func (e EvidenceRef) Validate() error {
 	if err := validateTypedID(e.id, "evidence"); err != nil {
 		return err
+	}
+	if e.hasDerivation {
+		if e.citation != (document.Citation{}) || e.quote != "" || e.hasPath {
+			return invalid("derivation evidence cannot include citation fields")
+		}
+		if err := e.derivation.Validate(); err != nil {
+			return err
+		}
+		if err := validateMetadata(e.metadata); err != nil {
+			return err
+		}
+		expected, err := derivedEvidenceID(e.derivation)
+		if err != nil || expected != e.id {
+			return invalid("evidence ID is not canonical")
+		}
+		return nil
 	}
 	if err := validateCitation(e.citation); err != nil {
 		return err
@@ -441,14 +651,26 @@ func (e EvidenceRef) Path() (graph.Path, bool) {
 	return cloneGraphPath(e.path), e.hasPath
 }
 
+func (e EvidenceRef) Derivation() (AssertionDerivation, bool) {
+	return e.derivation.clone(), e.hasDerivation
+}
+
 func (e EvidenceRef) Metadata() shoal.Metadata {
 	return cloneMetadata(e.metadata)
 }
 
 func (e EvidenceRef) clone() EvidenceRef {
 	e.path = cloneGraphPath(e.path)
+	e.derivation = e.derivation.clone()
 	e.metadata = cloneMetadata(e.metadata)
 	return e
+}
+
+func derivedEvidenceID(derivation AssertionDerivation) (shoal.ID, error) {
+	if err := derivation.Validate(); err != nil {
+		return "", err
+	}
+	return deriveID("evidence", "derivation", string(derivation.ID()))
 }
 
 func evidenceID(
@@ -678,15 +900,19 @@ func (p ExtractionProvenance) canonical() string {
 	)
 }
 
-// AssertionOrigin distinguishes directly stated facts from inferred facts.
+// AssertionOrigin distinguishes stated, inferred, and reproducibly derived facts.
 type AssertionOrigin string
 
 const (
 	AssertionExplicit AssertionOrigin = "explicit"
 	AssertionInferred AssertionOrigin = "inferred"
+	AssertionDerived  AssertionOrigin = "derived"
 )
 
-// Assertion is one immutable, cited ontology fact.
+// Assertion is one immutable, attributable ontology fact.
+//
+// Explicit and inferred assertions remain document-cited. Derived assertions
+// are backed by exactly one reproducible derivation record.
 //
 // ontologyIdentity names the ontology snapshot the assertion was made under.
 // Definition IDs are stable across versions by design, so the identity is the
@@ -741,7 +967,7 @@ func WithAssertionOntology(identity OntologyIdentity) AssertionOption {
 	}
 }
 
-// NewAssertion creates a cited explicit or inferred assertion.
+// NewAssertion creates an explicit, inferred, or derived assertion.
 func NewAssertion(
 	subject shoal.ID,
 	predicate shoal.ID,
@@ -781,7 +1007,7 @@ func NewAssertion(
 	return assertion, nil
 }
 
-// Validate checks assertion identity, provenance, citations, and confidence.
+// Validate checks assertion identity, provenance, evidence, and confidence.
 func (a Assertion) Validate() error {
 	if err := validateTypedID(a.id, "assertion"); err != nil {
 		return err
@@ -817,7 +1043,7 @@ func (a Assertion) Validate() error {
 		}
 	}
 	switch a.origin {
-	case AssertionExplicit, AssertionInferred:
+	case AssertionExplicit, AssertionInferred, AssertionDerived:
 	default:
 		return invalid("invalid assertion origin")
 	}
@@ -828,11 +1054,28 @@ func (a Assertion) Validate() error {
 		return invalid("assertion confidence must be between zero and one")
 	}
 	if len(a.evidence) == 0 {
+		if a.origin == AssertionDerived {
+			return invalid("derived assertion requires derivation evidence")
+		}
 		return invalid("assertion requires cited evidence")
+	}
+	// Load-bearing: TestDerivedAssertionRejectsMultipleDerivations pins that a
+	// derived assertion is attributable to one reproducible derivation record.
+	if a.origin == AssertionDerived && len(a.evidence) != 1 {
+		return invalid("derived assertion requires exactly one derivation evidence")
 	}
 	for index, evidence := range a.evidence {
 		if err := evidence.Validate(); err != nil {
 			return err
+		}
+		// Load-bearing: TestDerivedAssertionRejectsCitationEvidence and
+		// TestCitedAssertionsRejectDerivationEvidence pin that assertion
+		// origins cannot silently swap or mix evidence kinds.
+		if a.origin == AssertionDerived && !evidence.hasDerivation {
+			return invalid("derived assertion requires derivation evidence")
+		}
+		if a.origin != AssertionDerived && evidence.hasDerivation {
+			return invalid("cited assertion cannot use derivation evidence")
 		}
 		if index > 0 &&
 			string(a.evidence[index-1].ID()) >= string(evidence.ID()) {
