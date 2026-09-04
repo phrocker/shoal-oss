@@ -29,6 +29,7 @@ import (
 
 	"github.com/phrocker/shoal-oss/pkg/document"
 	"github.com/phrocker/shoal-oss/pkg/graph"
+	"github.com/phrocker/shoal-oss/pkg/ontology"
 	"github.com/phrocker/shoal-oss/pkg/retrieval"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
@@ -155,8 +156,9 @@ func (r NeighborhoodRequest) Normalize() (NeighborhoodRequest, error) {
 
 // Neighborhood is a deterministic graph subgraph.
 type Neighborhood struct {
-	Nodes []graph.Node
-	Edges []graph.Edge
+	Nodes      []graph.Node
+	Edges      []graph.Edge
+	Assertions []ontology.Assertion
 }
 
 // Snapshot identifies one immutable logical corpus frontier.

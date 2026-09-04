@@ -428,7 +428,10 @@ func (s *EmbeddedService) Path(
 	if err := s.confirmSnapshot(ctx, snapshot); err != nil {
 		return PathResponse{}, err
 	}
-	return PathResponse{Snapshot: snapshot, Path: path}, nil
+	return PathResponse{
+		Snapshot: snapshot, Path: path,
+		Assertions: assertionsForPath(path, bounded.Neighborhood.Assertions),
+	}, nil
 }
 
 func (s *EmbeddedService) pin(
@@ -718,6 +721,26 @@ func directedPath(
 		path.Nodes = append(path.Nodes, nodes[id])
 	}
 	return path, nil
+}
+
+func assertionsForPath(
+	path graph.Path,
+	assertions []ontology.Assertion,
+) []ontology.Assertion {
+	if len(assertions) == 0 || len(path.Edges) == 0 {
+		return nil
+	}
+	byID := make(map[shoal.ID]ontology.Assertion, len(assertions))
+	for _, assertion := range assertions {
+		byID[assertion.ID()] = assertion
+	}
+	selected := make([]ontology.Assertion, 0, len(path.Edges))
+	for _, edge := range path.Edges {
+		if assertion, ok := byID[edge.ID]; ok {
+			selected = append(selected, assertion)
+		}
+	}
+	return selected
 }
 
 var _ Service = (*EmbeddedService)(nil)

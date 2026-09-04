@@ -27,6 +27,7 @@ import (
 
 	"github.com/phrocker/shoal-oss/pkg/graph"
 	"github.com/phrocker/shoal-oss/pkg/interaction"
+	"github.com/phrocker/shoal-oss/pkg/ontology"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
@@ -176,8 +177,9 @@ func (e *Explorer) BoundedNeighborhood(
 		frontier = next
 	}
 	result := Neighborhood{
-		Nodes: make([]graph.Node, 0, len(nodes)),
-		Edges: make([]graph.Edge, 0, len(edges)),
+		Nodes:      make([]graph.Node, 0, len(nodes)),
+		Edges:      make([]graph.Edge, 0, len(edges)),
+		Assertions: make([]ontology.Assertion, 0, len(edges)),
 	}
 	for _, node := range nodes {
 		result.Nodes = append(result.Nodes, node)
@@ -185,6 +187,7 @@ func (e *Explorer) BoundedNeighborhood(
 	for _, edge := range edges {
 		result.Edges = append(result.Edges, edge)
 	}
+	result.Assertions = e.assertionsForEdgesLocked(edges)
 	sort.Slice(result.Nodes, func(i, j int) bool {
 		return shoal.CompareID(result.Nodes[i].ID, result.Nodes[j].ID) < 0
 	})
