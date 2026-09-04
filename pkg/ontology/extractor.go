@@ -198,6 +198,11 @@ func (r ExtractionRequest) Validate() error {
 		if err := evidence.Validate(); err != nil {
 			return err
 		}
+		// Load-bearing: TestExtractionRequestRejectsDerivationEvidence keeps
+		// extraction prompts document-cited even though assertions can be derived.
+		if evidence.hasDerivation {
+			return invalid("extraction request requires cited evidence")
+		}
 		if uint64(len(evidence.Quote())) > uint64(r.limits.MaxQuoteBytes) {
 			return invalid("evidence quote exceeds request limit")
 		}
@@ -310,6 +315,9 @@ func extractionRequestID(request ExtractionRequest) (shoal.ID, error) {
 	for index, evidence := range request.evidence {
 		if err := evidence.Validate(); err != nil {
 			return "", err
+		}
+		if evidence.hasDerivation {
+			return "", invalid("extraction request requires cited evidence")
 		}
 		evidenceIDs[index] = canonicalParts(
 			string(evidence.ID()), canonicalMetadata(evidence.metadata))
@@ -937,6 +945,10 @@ func ontologyVersionPayloadBytes(version OntologyVersion) uint64 {
 }
 
 func evidencePayloadBytes(evidence EvidenceRef) uint64 {
+	if evidence.hasDerivation {
+		return uint64(len(evidence.derivation.canonical()) +
+			len(canonicalMetadata(evidence.metadata)))
+	}
 	return uint64(len(canonicalCitation(evidence.citation)) +
 		len(evidence.quote) + len(canonicalGraphPath(evidence.path)) +
 		len(canonicalMetadata(evidence.metadata)))
@@ -993,6 +1005,11 @@ func preflightExtractionRequest(
 	counter.addProvenance(provenance)
 	counter.addMetadata(metadata)
 	for _, item := range evidence {
+		// Load-bearing: TestExtractionRequestRejectsDerivationEvidence keeps
+		// extraction prompts document-cited even though assertions can be derived.
+		if item.hasDerivation {
+			return invalid("extraction request requires cited evidence")
+		}
 		if uint64(len(item.quote)) > uint64(limits.MaxQuoteBytes) {
 			return invalid("evidence quote exceeds request limit")
 		}
@@ -1135,6 +1152,11 @@ func (c *payloadCounter) addVersion(version OntologyVersion) {
 }
 
 func (c *payloadCounter) addEvidence(evidence EvidenceRef) {
+	if evidence.hasDerivation {
+		c.addDerivation(evidence.derivation)
+		c.addMetadata(evidence.metadata)
+		return
+	}
 	c.addString(string(evidence.citation.DocumentID))
 	c.addString(string(evidence.citation.RevisionID))
 	c.addString(string(evidence.citation.SectionID))
@@ -1156,6 +1178,19 @@ func (c *payloadCounter) addEvidence(evidence EvidenceRef) {
 		c.addString(edge.Type)
 		c.addMetadata(edge.Properties)
 	}
+}
+
+func (c *payloadCounter) addDerivation(derivation AssertionDerivation) {
+	c.addString(derivation.embeddingModel)
+	c.addString(derivation.embeddingModelVersion)
+	c.addString(derivation.similarityMetric)
+	c.addString(canonicalFloat(float64(derivation.threshold)))
+	c.addString(derivation.tessellationCell)
+	c.addString(canonicalFloat(float64(derivation.score)))
+	c.addString(string(derivation.sourceEndpoint))
+	c.addString(string(derivation.targetEndpoint))
+	c.addString(derivation.iteratorName)
+	c.addMetadata(derivation.iteratorOptions)
 }
 
 func (c *payloadCounter) addProvenance(provenance ExtractionProvenance) {
@@ -1234,6 +1269,9 @@ func validateBoundedEvidenceMetadata(
 ) error {
 	if err := validateBoundedMetadata(evidence.metadata, limits); err != nil {
 		return err
+	}
+	if evidence.hasDerivation {
+		return validateBoundedMetadata(evidence.derivation.iteratorOptions, limits)
 	}
 	if !evidence.hasPath {
 		return nil
