@@ -28,6 +28,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
+	"github.com/phrocker/shoal-oss/pkg/extraction"
 	"github.com/phrocker/shoal-oss/pkg/graph"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
@@ -622,10 +623,22 @@ func (s *MemoryPolicyStore) PutNode(
 		if nodeRegistrationsEqual(existing, normalized) {
 			return nil
 		}
+		// This same-rule merge is load-bearing; TestAuthorizedExtractDocumentSameTenantSharedEntityCollapses pins that shared derived entities collapse across a tenant's skill files without widening access.
+		if existing.Rule.equal(normalized.Rule) &&
+			derivedEntityNodesEqual(existing.Node, normalized.Node) {
+			return nil
+		}
 		return catalogConflict()
 	}
 	s.nodes[nodeID] = normalized
 	return nil
+}
+
+func derivedEntityNodesEqual(left, right graph.Node) bool {
+	return left.ID != "" &&
+		left.Properties[extraction.GraphPropertyEntityKey] != "" &&
+		left.Properties[extraction.GraphPropertyOntologyConceptID] != "" &&
+		graphNodesEqual(left, right)
 }
 
 // Revision returns one exact immutable revision registration.

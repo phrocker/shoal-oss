@@ -28,6 +28,14 @@ import (
 )
 
 type extractionBackend interface {
+	PlanExtractDocument(
+		context.Context,
+		explorer.ExtractionRequest,
+	) (explorer.ExtractionResult, error)
+	CommitExtraction(
+		context.Context,
+		explorer.ExtractionResult,
+	) (explorer.ExtractionResult, error)
 	ExtractDocument(
 		context.Context,
 		explorer.ExtractionRequest,
@@ -72,7 +80,9 @@ func (c *Client) ExtractDocument(
 		return explorer.ExtractionResult{}, auth.ObjectNotFound()
 	}
 	request.RevisionID = source.RevisionID
-	result, err := backend.ExtractDocument(ctx, request)
+	// This namespace is load-bearing; TestAuthorizedExtractDocumentCrossTenantSharedEntityGetsDistinctNodes pins that attacker-chosen entity keys cannot collide across authorization scopes.
+	request.EntityNamespace = source.Rule.extractionEntityNamespace()
+	result, err := backend.PlanExtractDocument(ctx, request)
 	if err != nil {
 		return explorer.ExtractionResult{}, directBaseError(err)
 	}
@@ -85,7 +95,7 @@ func (c *Client) ExtractDocument(
 		// This node registration is load-bearing; TestExtractDocumentAuthorizationControlsDerivedGraph pins that extracted entities remain governed by their source document rule.
 		nodeRegistration.Node = node
 		if err := c.policyStore.PutNode(ctx, node.ID, nodeRegistration); err != nil {
-			return explorer.ExtractionResult{}, policyCatalogWriteError(ctx, err)
+			return explorer.ExtractionResult{}, extractionCatalogWriteError(ctx, err)
 		}
 	}
 	edgeRule := mustCloneRule(source.Rule)
@@ -95,14 +105,26 @@ func (c *Client) ExtractDocument(
 			Edge: edge,
 			Rule: edgeRule,
 		}); err != nil {
-			return explorer.ExtractionResult{}, policyCatalogWriteError(ctx, err)
+			return explorer.ExtractionResult{}, extractionCatalogWriteError(ctx, err)
 		}
 	}
 	if err := guard.Check(ctx); err != nil {
 		return explorer.ExtractionResult{}, err
 	}
+	// This ordering is load-bearing; TestExtractDocumentRegistrationFailureDoesNotCommitGraph pins that policy registration failure cannot leave orphan graph mutations.
+	result, err = backend.CommitExtraction(ctx, result)
+	if err != nil {
+		return explorer.ExtractionResult{}, directBaseError(err)
+	}
 	c.invalidateAuthorizedVectorAvailability()
 	return result, nil
+}
+
+func extractionCatalogWriteError(ctx context.Context, err error) error {
+	if shoal.IsErrorCode(err, shoal.ErrorConflict) {
+		return auth.ObjectNotFound()
+	}
+	return policyCatalogWriteError(ctx, err)
 }
 
 var _ interface {

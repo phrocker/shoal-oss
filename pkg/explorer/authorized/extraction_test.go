@@ -20,10 +20,14 @@
 package authorized_test
 
 import (
+	"context"
+	"fmt"
 	"testing"
 	"time"
 
 	"github.com/phrocker/shoal-oss/pkg/explorer"
+	"github.com/phrocker/shoal-oss/pkg/explorer/authorized"
+	"github.com/phrocker/shoal-oss/pkg/extraction"
 	"github.com/phrocker/shoal-oss/pkg/graph"
 	"github.com/phrocker/shoal-oss/pkg/ontology"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
@@ -37,6 +41,155 @@ Tools:
 Capabilities:
 - Secret graph extraction
 `
+
+func TestAuthorizedExtractDocumentSameTenantSharedEntityCollapses(t *testing.T) {
+	f := newFixture(t)
+	version := authorizedSkillsOntologyVersion(t)
+	first := ingestAuthorizedSkill(t, f.clientA, f.admin(t), "alpha", "shared-cli")
+	firstExtracted, err := f.clientA.ExtractDocument(f.alice(t), explorer.ExtractionRequest{
+		DocumentID: first.Document.ID, RevisionID: first.Revision.ID, Version: version,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second := ingestAuthorizedSkill(t, f.clientA, f.admin(t), "beta", "shared-cli")
+	secondExtracted, err := f.clientA.ExtractDocument(f.alice(t), explorer.ExtractionRequest{
+		DocumentID: second.Document.ID, RevisionID: second.Revision.ID, Version: version,
+	})
+	if err != nil {
+		t.Fatalf("same-tenant shared extraction failed; shared entities must merge under the same rule: %v", err)
+	}
+	firstTool := extractedNodeWithKey(t, firstExtracted.GraphNodes, "shared_cli")
+	secondTool := extractedNodeWithKey(t, secondExtracted.GraphNodes, "shared_cli")
+	if firstTool != secondTool {
+		t.Fatalf("same-tenant shared entity IDs differ: %s != %s", firstTool, secondTool)
+	}
+	neighborhood, err := f.clientA.Neighborhood(f.alice(t), explorer.NeighborhoodRequest{
+		NodeIDs: []shoal.ID{first.Document.ID, second.Document.ID}, Depth: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if countNodesWithEntityKey(neighborhood.Nodes, "shared_cli") != 1 {
+		t.Fatalf("same-tenant shared entity node count = %d, want 1",
+			countNodesWithEntityKey(neighborhood.Nodes, "shared_cli"))
+	}
+}
+
+func TestAuthorizedExtractDocumentCrossTenantSharedEntityGetsDistinctNodes(t *testing.T) {
+	f := newFixture(t)
+	version := authorizedSkillsOntologyVersion(t)
+	aliceDoc := ingestAuthorizedSkill(t, f.clientA, f.admin(t), "alice", "shared-cli")
+	aliceExtracted, err := f.clientA.ExtractDocument(f.alice(t), explorer.ExtractionRequest{
+		DocumentID: aliceDoc.Document.ID, RevisionID: aliceDoc.Revision.ID, Version: version,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bobDoc := ingestAuthorizedSkill(t, f.clientB, f.admin(t), "bob", "shared-cli")
+	bobExtracted, err := f.clientB.ExtractDocument(f.bob(t), explorer.ExtractionRequest{
+		DocumentID: bobDoc.Document.ID, RevisionID: bobDoc.Revision.ID, Version: version,
+	})
+	if err != nil {
+		t.Fatalf("cross-tenant shared extraction failed; entity namespace should isolate policy registrations: %v", err)
+	}
+	aliceTool := extractedNodeWithKey(t, aliceExtracted.GraphNodes, "shared_cli")
+	bobTool := extractedNodeWithKey(t, bobExtracted.GraphNodes, "shared_cli")
+	if aliceTool == bobTool {
+		t.Fatalf("cross-tenant shared entity ID = %s, want tenant-scoped IDs", aliceTool)
+	}
+	aliceGraph, err := f.clientA.Neighborhood(f.alice(t), explorer.NeighborhoodRequest{
+		NodeIDs: []shoal.ID{aliceDoc.Document.ID}, Depth: 2,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hasNode(aliceGraph, bobDoc.Document.ID) || hasNode(aliceGraph, bobTool) {
+		t.Fatalf("alice graph leaked bob node IDs: %+v", aliceGraph.Nodes)
+	}
+	bobNamespace := bobExtracted.GraphNodes[0].Properties[extraction.GraphPropertyEntityNamespace]
+	if got := countNodesWithEntityKey(aliceGraph.Nodes, "shared_cli"); got != 1 {
+		t.Fatalf("alice graph shared entity count = %d, want 1", got)
+	}
+	for _, node := range aliceGraph.Nodes {
+		if node.Properties[extraction.GraphPropertyEntityNamespace] == bobNamespace {
+			t.Fatalf("alice graph leaked bob entity namespace property: %+v", node)
+		}
+	}
+	for _, edge := range aliceGraph.Edges {
+		if edge.From == bobDoc.Document.ID || edge.To == bobDoc.Document.ID ||
+			edge.From == bobTool || edge.To == bobTool {
+			t.Fatalf("alice graph leaked bob edge endpoint: %+v", edge)
+		}
+	}
+	for _, assertion := range aliceGraph.Assertions {
+		target, _ := assertion.Object().ReferenceValue()
+		if assertion.Subject() == bobTool || target == bobTool {
+			t.Fatalf("alice graph leaked bob assertion: %+v", assertion)
+		}
+	}
+}
+
+func TestExtractDocumentPolicyConflictUsesNonDisclosingError(t *testing.T) {
+	f := newFixture(t)
+	ordinaryHidden, err := f.clientB.Ingest(f.admin(t), explorer.Source{
+		URI: "file:///hidden/SKILL.md", MediaType: explorer.MediaTypeMarkdown,
+		Content: authorizedSkillMarkdown,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, ordinary := f.clientA.ExtractDocument(f.alice(t), explorer.ExtractionRequest{
+		DocumentID: ordinaryHidden.Document.ID,
+		RevisionID: ordinaryHidden.Revision.ID,
+		Version:    authorizedSkillsOntologyVersion(t),
+	})
+	if !shoal.IsErrorCode(ordinary, shoal.ErrorNotFound) {
+		t.Fatalf("ordinary unreadable extraction error = %v", ordinary)
+	}
+	readable := ingestAuthorizedSkill(t, f.clientA, f.admin(t), "conflict", "foreign-owned-key")
+	conflictClient := f.newClient(t, f.base, conflictPutNodeStore{PolicyStore: f.store}, f.sourceA, f.policyA, nil)
+	_, conflict := conflictClient.ExtractDocument(f.alice(t), explorer.ExtractionRequest{
+		DocumentID: readable.Document.ID,
+		RevisionID: readable.Revision.ID,
+		Version:    authorizedSkillsOntologyVersion(t),
+	})
+	if fmt.Sprint(conflict) != fmt.Sprint(ordinary) ||
+		!shoal.IsErrorCode(conflict, shoal.ErrorNotFound) {
+		t.Fatalf("conflict error %q differs from ordinary unreadable error %q",
+			conflict, ordinary)
+	}
+}
+
+func TestExtractDocumentRegistrationFailureDoesNotCommitGraph(t *testing.T) {
+	f := newFixture(t)
+	readable := ingestAuthorizedSkill(t, f.clientA, f.admin(t), "atomic", "atomic-cli")
+	failing := f.newClient(
+		t, f.base,
+		failingPutNodeStore{
+			PolicyStore: f.store,
+			err:         shoal.NewError(shoal.ErrorUnavailable, "forced put node failure"),
+		},
+		f.sourceA, f.policyA, nil,
+	)
+	_, err := failing.ExtractDocument(f.alice(t), explorer.ExtractionRequest{
+		DocumentID: readable.Document.ID,
+		RevisionID: readable.Revision.ID,
+		Version:    authorizedSkillsOntologyVersion(t),
+	})
+	if !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
+		t.Fatalf("forced registration failure error = %v", err)
+	}
+	raw, err := f.base.Neighborhood(context.Background(), explorer.NeighborhoodRequest{
+		NodeIDs: []shoal.ID{readable.Document.ID}, Depth: 2,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := countNodesWithEntityKey(raw.Nodes, "atomic_cli"); got != 0 {
+		t.Fatalf("registration failure committed %d orphaned derived node(s)", got)
+	}
+}
 
 func TestExtractDocumentAuthorizationControlsDerivedGraph(t *testing.T) {
 	f := newFixture(t)
@@ -196,4 +349,69 @@ func countAuthorizedEdgesOfType(edges []graph.Edge, edgeType string) int {
 		}
 	}
 	return count
+}
+
+func ingestAuthorizedSkill(
+	t *testing.T,
+	client *authorized.Client,
+	ctx context.Context,
+	name string,
+	tool string,
+) explorer.IngestResult {
+	t.Helper()
+	result, err := client.Ingest(ctx, explorer.Source{
+		URI:       "file:///" + name + "/SKILL.md",
+		MediaType: explorer.MediaTypeMarkdown,
+		Content:   "# " + name + " Skill\n\nTools:\n- " + tool + "\n\nCapabilities:\n- " + name + " feature\n",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return result
+}
+
+func extractedNodeWithKey(t *testing.T, nodes []graph.Node, key string) shoal.ID {
+	t.Helper()
+	for _, node := range nodes {
+		if node.Properties[extraction.GraphPropertyEntityKey] == key {
+			return node.ID
+		}
+	}
+	t.Fatalf("node with entity key %q not found in %+v", key, nodes)
+	return ""
+}
+
+func countNodesWithEntityKey(nodes []graph.Node, key string) int {
+	count := 0
+	for _, node := range nodes {
+		if node.Properties[extraction.GraphPropertyEntityKey] == key {
+			count++
+		}
+	}
+	return count
+}
+
+type conflictPutNodeStore struct {
+	authorized.PolicyStore
+}
+
+func (s conflictPutNodeStore) PutNode(
+	context.Context,
+	shoal.ID,
+	authorized.NodeRegistration,
+) error {
+	return shoal.NewError(shoal.ErrorConflict, "authorization policy catalog conflict")
+}
+
+type failingPutNodeStore struct {
+	authorized.PolicyStore
+	err error
+}
+
+func (s failingPutNodeStore) PutNode(
+	context.Context,
+	shoal.ID,
+	authorized.NodeRegistration,
+) error {
+	return s.err
 }

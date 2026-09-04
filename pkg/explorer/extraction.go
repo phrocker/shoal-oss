@@ -40,12 +40,13 @@ const extractionSourceEdgeType = "extracted_entity"
 // ExtractionRequest selects one already-ingested document revision for an
 // explicit ontology-constrained extraction pass.
 type ExtractionRequest struct {
-	DocumentID   shoal.ID
-	RevisionID   shoal.ID
-	Version      ontology.OntologyVersion
-	Instructions string
-	Limits       extraction.Limits
-	Generator    model.TextGenerator
+	DocumentID      shoal.ID
+	RevisionID      shoal.ID
+	Version         ontology.OntologyVersion
+	Instructions    string
+	EntityNamespace string
+	Limits          extraction.Limits
+	Generator       model.TextGenerator
 }
 
 // ExtractionResult describes the graph publication performed by an explicit
@@ -66,6 +67,7 @@ type ExtractionResult struct {
 	GraphEdges          []graph.Edge
 	Snapshot            Snapshot
 	Plan                extraction.PublicationPlan
+	record              persistedExtraction
 }
 
 type persistedExtraction struct {
@@ -153,6 +155,19 @@ func (e *Explorer) ExtractDocument(
 	ctx context.Context,
 	request ExtractionRequest,
 ) (ExtractionResult, error) {
+	planned, err := e.PlanExtractDocument(ctx, request)
+	if err != nil {
+		return ExtractionResult{}, err
+	}
+	return e.CommitExtraction(ctx, planned)
+}
+
+// PlanExtractDocument runs extraction and builds the graph publication without
+// committing it, so authorized callers can register policy before graph state.
+func (e *Explorer) PlanExtractDocument(
+	ctx context.Context,
+	request ExtractionRequest,
+) (ExtractionResult, error) {
 	if err := contextError(ctx); err != nil {
 		return ExtractionResult{}, err
 	}
@@ -183,11 +198,13 @@ func (e *Explorer) ExtractDocument(
 		e.mu.Unlock()
 		return ExtractionResult{}, err
 	}
-	pack, err := e.extractionContextLocked(record, request.Version)
+	pack, err := e.extractionContextLocked(
+		record, request.Version, request.EntityNamespace)
 	if err != nil {
 		e.mu.Unlock()
 		return ExtractionResult{}, err
 	}
+	snapshot := e.snapshot
 	e.mu.Unlock()
 
 	instructions := strings.TrimSpace(request.Instructions)
@@ -195,10 +212,11 @@ func (e *Explorer) ExtractDocument(
 		instructions = "Extract ontology entities and relationships grounded in this uploaded document."
 	}
 	extractionRequest := extraction.Request{
-		Version:      request.Version,
-		Context:      pack,
-		Instructions: instructions,
-		Limits:       request.Limits,
+		Version:         request.Version,
+		Context:         pack,
+		Instructions:    instructions,
+		EntityNamespace: request.EntityNamespace,
+		Limits:          request.Limits,
 	}
 	var extractionResult extraction.Result
 	if request.Generator != nil {
@@ -212,8 +230,21 @@ func (e *Explorer) ExtractDocument(
 		return ExtractionResult{}, err
 	}
 	plan := extractionResult.PublicationPlan()
-	published, err := extractionPublication(record, request.Version, plan, extractionResult)
+	published, err := extractionPublication(
+		record, request.Version, request.EntityNamespace, plan, extractionResult)
 	if err != nil {
+		return ExtractionResult{}, err
+	}
+	return extractionSummaryLocked(plan, published, snapshot), nil
+}
+
+// CommitExtraction publishes a previously planned extraction.
+func (e *Explorer) CommitExtraction(
+	ctx context.Context,
+	planned ExtractionResult,
+) (ExtractionResult, error) {
+	published := planned.record
+	if err := validatePersistedExtraction(published); err != nil {
 		return ExtractionResult{}, err
 	}
 	e.mu.Lock()
@@ -224,11 +255,11 @@ func (e *Explorer) ExtractDocument(
 	if err := e.requireWritableLocked(); err != nil {
 		return ExtractionResult{}, err
 	}
-	current, err := e.documentRecordLocked(record.Document.ID, record.Revision.ID)
+	current, err := e.documentRecordLocked(published.DocumentID, published.RevisionID)
 	if err != nil {
 		return ExtractionResult{}, err
 	}
-	if current.Revision.ID != record.Revision.ID {
+	if current.Revision.ID != published.RevisionID {
 		return ExtractionResult{}, shoal.NewError(
 			shoal.ErrorConflict, "document changed before extraction publication")
 	}
@@ -245,7 +276,7 @@ func (e *Explorer) ExtractDocument(
 			return ExtractionResult{}, err
 		}
 	}
-	return extractionSummaryLocked(plan, published, e.snapshot), nil
+	return extractionSummaryLocked(planned.Plan, published, e.snapshot), nil
 }
 
 func (e *Explorer) documentRecordLocked(
@@ -264,6 +295,7 @@ func (e *Explorer) documentRecordLocked(
 func (e *Explorer) extractionContextLocked(
 	record *persistedDocument,
 	version ontology.OntologyVersion,
+	entityNamespace string,
 ) (inference.ContextPack, error) {
 	identity, err := inference.NewOntologyIdentity(version)
 	if err != nil {
@@ -287,6 +319,10 @@ func (e *Explorer) extractionContextLocked(
 	for id, node := range e.graphNodes {
 		if node.Properties[extraction.GraphPropertyEntityKey] == "" ||
 			node.Properties[extraction.GraphPropertyOntologyConceptID] == "" {
+			continue
+		}
+		if entityNamespace != "" &&
+			node.Properties[extraction.GraphPropertyEntityNamespace] != entityNamespace {
 			continue
 		}
 		// This existing entity context is load-bearing; TestExtractDocumentRerunReusesSkillEntities pins rerun reuse instead of duplicate creation.
@@ -321,6 +357,7 @@ func (e *Explorer) extractionContextLocked(
 func extractionPublication(
 	source *persistedDocument,
 	version ontology.OntologyVersion,
+	entityNamespace string,
 	plan extraction.PublicationPlan,
 	result extraction.Result,
 ) (persistedExtraction, error) {
@@ -348,6 +385,9 @@ func extractionPublication(
 				extraction.GraphPropertyEntityKey:          entity.Key,
 				"confidence":                               fmt.Sprintf("%.6f", entity.Confidence),
 			},
+		}
+		if entityNamespace != "" {
+			node.Properties[extraction.GraphPropertyEntityNamespace] = entityNamespace
 		}
 		sort.Strings(node.Labels)
 		if err := node.Validate(); err != nil {
@@ -479,6 +519,7 @@ func extractionSummaryLocked(
 		RelationshipEdgeIDs: relationshipIDs,
 		GraphNodes:          cloneNodes(record.Nodes), GraphEdges: cloneEdges(record.Edges),
 		Snapshot: snapshot, Plan: plan,
+		record: record,
 	}
 }
 

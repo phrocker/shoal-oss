@@ -47,6 +47,7 @@ const (
 	GraphPropertyOntologyConceptID  = "shoal.ontology.concept_id"
 	GraphPropertyOntologyConceptKey = "shoal.ontology.concept_key"
 	GraphPropertyEntityKey          = "shoal.ontology.entity_key"
+	GraphPropertyEntityNamespace    = "shoal.ontology.entity_namespace"
 )
 
 var (
@@ -118,10 +119,11 @@ func (l Limits) normalized() (Limits, error) {
 }
 
 type Request struct {
-	Version      ontology.OntologyVersion
-	Context      inference.ContextPack
-	Instructions string
-	Limits       Limits
+	Version         ontology.OntologyVersion
+	Context         inference.ContextPack
+	Instructions    string
+	EntityNamespace string
+	Limits          Limits
 }
 
 func (r Request) Validate() error {
@@ -140,6 +142,9 @@ func (r Request) Validate() error {
 	}
 	if len(r.Instructions) > int(ontology.DefaultExtractionLimits().MaxInstructionBytes) {
 		return errors.New("extraction: instructions exceed the byte limit")
+	}
+	if !utf8.ValidString(r.EntityNamespace) || len(r.EntityNamespace) > 4096 {
+		return errors.New("extraction: entity namespace must be valid bounded UTF-8")
 	}
 	_, err := r.Limits.normalized()
 	return err
@@ -706,9 +711,13 @@ func materialize(request Request, prompt string, mp model.Provenance, raw rawOut
 				return Result{}, err
 			}
 		} else {
-			// This type/key-only identity is load-bearing; TestEntityIdentityIgnoresPromptScopeForResolution and TestExtractDocumentCollapsesSharedToolAcrossSkillFiles pin cross-document resolution.
+			// This scoped type/key identity is load-bearing; TestAuthorizedExtractDocumentCrossTenantSharedEntityGetsDistinctNodes pins authorization-scope isolation while TestEntityIdentityIgnoresPromptScopeForResolution pins prompt-independent resolution.
+			idParts := []string{string(typeID), key}
+			if request.EntityNamespace != "" {
+				idParts = append([]string{request.EntityNamespace}, idParts...)
+			}
 			id, err = ontology.NewStableID(
-				"inferred-entity", string(typeID), key,
+				"inferred-entity", idParts...,
 			)
 			if err != nil {
 				return Result{}, err
