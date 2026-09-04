@@ -178,6 +178,66 @@ assert.match(jsonEditor.value, /"properties":/);
 `)
 }
 
+func TestStaticWorkspaceOntologyProposalBlastRadius(t *testing.T) {
+	runOntologyUITest(t, `
+const rendered = await runOntologyScenario({
+  configured: true,
+  identity: {known: true, schema_id: "schema-rich", version_id: "version-rich", reading: "same_version"},
+  schema: {id: "schema-rich", key: "workspace", name: "Workspace"},
+  version: {id: "version-rich", version: "v1", created_at: "2026-09-04T00:00:00Z"},
+  concepts: [{id: "concept-person", key: "person", name: "Person", properties: ["property-name"]}],
+  relationships: [],
+  properties: [{id: "property-name", key: "name", name: "Name", value_type: "string", constraints: []}],
+  limits: {},
+}, {
+  proposals: {
+    proposals: [{
+      id: "proposal-1",
+      base_schema_id: "schema-rich",
+      base_version_id: "version-rich",
+      proposed_by: "development-principal@localhost",
+      rationale: "remove case files",
+      created_at: "2026-09-04T00:01:00Z",
+      updated_at: "2026-09-04T00:02:00Z",
+      state: "submitted",
+      proposed_ontology: {identity: {version_id: "version-v2"}},
+      transitions: [{from: "draft", to: "submitted", actor: "author", note: "ready"}],
+    }],
+    limits: {},
+  },
+  blastRadii: {
+    "proposal-1": {
+      proposal_id: "proposal-1",
+      active_version_id: "version-rich",
+      proposed_version_id: "version-v2",
+      summary: {destructive_changes: 3, additive_changes: 1, counts_computed: false},
+      removed_concepts: [{concept: {id: "concept-case", key: "case_file", name: "Case file", properties: []}, impact: {computed: false}}],
+      removed_relationships: [{relationship: {id: "relationship-referenced", key: "referenced_in", name: "Referenced in"}, impact: {computed: false}}],
+      removed_properties: [],
+      changed_concepts: [],
+      changed_relationships: [{before: {id: "relationship-member", key: "member_of", name: "Member of"}, after: {id: "relationship-member", key: "member_of", name: "Member of"}, fields: ["to_concepts"], impact: {computed: false}}],
+      changed_properties: [],
+      added_concepts: [{id: "concept-vessel", key: "vessel", name: "Vessel", properties: []}],
+      added_relationships: [],
+      added_properties: [],
+      limits: {},
+    },
+  },
+});
+const text = renderedText(rendered.ids["ontology-details"]);
+assert.match(text, /Blast radius/);
+assert.match(text, /3 destructive change/);
+assert.match(text, /Removed concepts/);
+assert.match(text, /Case file \(case_file\) removed/);
+assert.match(text, /Changed relationships/);
+assert.match(text, /Member of \(member_of\) changed to_concepts/);
+assert.match(text, /Added concepts/);
+assert.match(text, /Vessel \(vessel\) added/);
+assert.match(text, /assertion impact counts not computed/);
+assert.doesNotMatch(text, /0 asserted/);
+`)
+}
+
 func runOntologyUITest(t *testing.T, assertions string) {
 	t.Helper()
 	if _, err := exec.LookPath("node"); err != nil {
@@ -400,6 +460,13 @@ async function runOntologyScenario(ontology, options = {}) {
           });
         }
         return response(options.proposals || {proposals: [], limits: {}});
+      }
+      const blastRadius = String(url).match(/^\/api\/v1\/ontology\/proposals\/([^/]+)\/blast-radius$/);
+      if (blastRadius) {
+        const proposalID = decodeURIComponent(blastRadius[1]);
+        const value = options.blastRadii && options.blastRadii[proposalID];
+        if (!value) return response({code: "not_found", message: "not found"}, {ok: false, status: 404});
+        return response({blast_radius: value});
       }
       if (url === "/api/v1/meta") return response({capabilities: {documents: true}});
       if (url.endsWith("/documents")) return response({snapshot, documents: [], next_cursor: ""});

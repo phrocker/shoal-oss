@@ -36,6 +36,7 @@ func TestOntologyEndpointIsNotPubliclyReachable(t *testing.T) {
 		{http.MethodGet, "/api/v1/ontology"},
 		{http.MethodGet, "/api/v1/ontology/proposals"},
 		{http.MethodPost, "/api/v1/ontology/proposals"},
+		{http.MethodGet, "/api/v1/ontology/proposals/cHJvcG9zYWw/blast-radius"},
 		{http.MethodPost, "/api/v1/ontology/proposals/cHJvcG9zYWw/transition"},
 	} {
 		request := httptest.NewRequest(testCase.method, testCase.path, nil)

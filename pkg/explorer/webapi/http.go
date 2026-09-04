@@ -158,6 +158,24 @@ func (h *Handler) routes() {
 		}
 		writeResponse(writer, http.StatusCreated, proposal)
 	})
+	// This GET route is load-bearing; TestOntologyProposalBlastRadiusUsesStartedEmbeddedWorkspace
+	// pins that the blast-radius surface is reachable through the real
+	// cmd/shoal-explore-web startup path and EmbeddedService, not only test doubles.
+	h.mux.HandleFunc("GET /api/v1/ontology/proposals/{proposal}/blast-radius", func(writer http.ResponseWriter, request *http.Request) {
+		proposalID, err := decodeID(request.PathValue("proposal"))
+		if err != nil {
+			writeError(writer, shoal.NewError(
+				shoal.ErrorInvalidArgument, "ontology proposal ID "+err.Error()))
+			return
+		}
+		blastRadius, err := ontologyProposalBlastRadiusFor(
+			request.Context(), h.service, proposalID)
+		if err != nil {
+			writeError(writer, err)
+			return
+		}
+		writeResponse(writer, http.StatusOK, blastRadius)
+	})
 	h.mux.HandleFunc("POST /api/v1/ontology/proposals/{proposal}/transition", func(writer http.ResponseWriter, request *http.Request) {
 		proposalID, err := decodeID(request.PathValue("proposal"))
 		if err != nil {

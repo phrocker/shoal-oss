@@ -350,6 +350,117 @@ func TestOntologyProposalPublishUpdatesActiveOntology(t *testing.T) {
 	}
 }
 
+func TestOntologyProposalBlastRadiusReportsStructuralDiffAndUnknownCounts(t *testing.T) {
+	corpus, err := explorer.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer corpus.Close()
+	_, server := ontologyProposalServer(t, corpus, blastRadiusOntologyVersion(t))
+
+	created := createOntologyProposalWithRequest(
+		t, server, blastRadiusProposalRequest())
+	report, encoded := getOntologyProposalBlastRadius(t, server, created.ID)
+	if report.ProposalID != created.ID ||
+		report.Summary.DestructiveChanges != 6 ||
+		report.Summary.AdditiveChanges != 3 ||
+		report.Summary.CountsComputed {
+		t.Fatalf("blast radius summary = %+v for proposal %q", report.Summary, report.ProposalID)
+	}
+	if bytes.Contains(encoded, []byte("asserted_count")) ||
+		bytes.Contains(encoded, []byte("derived_count")) {
+		t.Fatalf("not-computed impact counts emitted false zeros: %s", encoded)
+	}
+	if got := conceptImpactByKey(report.RemovedConcepts, "case_file"); got == nil ||
+		got.Impact.Computed ||
+		got.Impact.AssertedCount != nil ||
+		got.Impact.DerivedCount != nil {
+		t.Fatalf("removed case_file impact = %+v, want explicit not computed", got)
+	}
+	if got := relationImpactByKey(report.RemovedRelationships, "referenced_in"); got == nil ||
+		got.Impact.Computed {
+		t.Fatalf("removed referenced_in impact = %+v, want explicit not computed", got)
+	}
+	if got := propertyImpactByKey(report.RemovedProperties, "role"); got == nil ||
+		got.Impact.Computed {
+		t.Fatalf("removed role impact = %+v, want explicit not computed", got)
+	}
+	if got := conceptChangeByKey(report.ChangedConcepts, "person"); got == nil ||
+		!equalStrings(got.Fields, []string{"properties"}) ||
+		got.Impact.Computed {
+		t.Fatalf("changed person = %+v, want property-set change with unknown impact", got)
+	}
+	if got := relationChangeByKey(report.ChangedRelationships, "member_of"); got == nil ||
+		!equalStrings(got.Fields, []string{"to_concepts", "directed", "properties"}) ||
+		got.Impact.Computed {
+		t.Fatalf("changed member_of = %+v, want endpoint/direction/property change", got)
+	}
+	if got := propertyChangeByKey(report.ChangedProperties, "name"); got == nil ||
+		!equalStrings(got.Fields, []string{"value_type"}) ||
+		got.Impact.Computed {
+		t.Fatalf("changed name = %+v, want value-type change with unknown impact", got)
+	}
+	if conceptByKey(report.AddedConcepts, "vessel") == nil ||
+		relationByKey(report.AddedRelationships, "port_call") == nil ||
+		propertyByKey(report.AddedProperties, "imo") == nil {
+		t.Fatalf("added blast radius entries = concepts %+v relationships %+v properties %+v",
+			report.AddedConcepts, report.AddedRelationships, report.AddedProperties)
+	}
+}
+
+func TestOntologyProposalBlastRadiusRejectsOversizedActiveOntology(t *testing.T) {
+	corpus, err := explorer.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer corpus.Close()
+	_, server := ontologyProposalServer(t, corpus, oversizedOntologyVersion(t))
+	created := createOntologyProposalWithRequest(t, server, webapi.CreateOntologyProposalRequest{
+		Rationale: "replace oversized active ontology with a bounded proposal",
+		ProposedVersion: webapi.OntologyProposalVersionDraft{
+			Version: "v2",
+		},
+	})
+
+	response, err := server.Client().Get(
+		server.URL + "/api/v1/ontology/proposals/" + created.ID + "/blast-radius")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusServiceUnavailable {
+		data, _ := io.ReadAll(response.Body)
+		t.Fatalf("oversized active blast radius status = %d, want 503: %s",
+			response.StatusCode, data)
+	}
+}
+
+func TestOntologyProposalBlastRadiusRejectsOverLimitReport(t *testing.T) {
+	corpus, err := explorer.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer corpus.Close()
+	active := disjointPropertyOntologyVersion(t, "active", webapi.MaxOntologyProperties)
+	_, server := ontologyProposalServer(t, corpus, active)
+	created := createOntologyProposalWithRequest(
+		t, server,
+		disjointPropertyProposalRequest("proposed", webapi.MaxOntologyProperties),
+	)
+
+	response, err := server.Client().Get(
+		server.URL + "/api/v1/ontology/proposals/" + created.ID + "/blast-radius")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusServiceUnavailable {
+		data, _ := io.ReadAll(response.Body)
+		t.Fatalf("over-limit blast radius status = %d, want 503: %s",
+			response.StatusCode, data)
+	}
+}
+
 func ontologyProposalServer(
 	t *testing.T,
 	corpus *explorer.Explorer,
@@ -381,7 +492,16 @@ func createOntologyProposal(
 	version string,
 ) webapi.OntologyProposalProjection {
 	t.Helper()
-	body := mustJSON(t, ontologyProposalRequest(version))
+	return createOntologyProposalWithRequest(t, server, ontologyProposalRequest(version))
+}
+
+func createOntologyProposalWithRequest(
+	t *testing.T,
+	server *httptest.Server,
+	request webapi.CreateOntologyProposalRequest,
+) webapi.OntologyProposalProjection {
+	t.Helper()
+	body := mustJSON(t, request)
 	response, err := server.Client().Post(
 		server.URL+"/api/v1/ontology/proposals",
 		"application/json",
@@ -401,6 +521,32 @@ func createOntologyProposal(
 		t.Fatal(err)
 	}
 	return out.Proposal
+}
+
+func getOntologyProposalBlastRadius(
+	t *testing.T,
+	server *httptest.Server,
+	proposalID string,
+) (webapi.OntologyBlastRadiusReport, []byte) {
+	t.Helper()
+	response, err := server.Client().Get(
+		server.URL + "/api/v1/ontology/proposals/" + proposalID + "/blast-radius")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	data, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("blast radius status = %d, want 200: %s", response.StatusCode, data)
+	}
+	var out webapi.OntologyBlastRadiusResponse
+	if err := json.Unmarshal(data, &out); err != nil {
+		t.Fatal(err)
+	}
+	return out.BlastRadius, data
 }
 
 func transitionOntologyProposal(
@@ -481,6 +627,162 @@ func ontologyProposalRequest(version string) webapi.CreateOntologyProposalReques
 	}
 }
 
+func blastRadiusProposalRequest() webapi.CreateOntologyProposalRequest {
+	return webapi.CreateOntologyProposalRequest{
+		Rationale: "show destructive ontology consequences",
+		ProposedVersion: webapi.OntologyProposalVersionDraft{
+			Version: "v2",
+			Properties: []webapi.OntologyProposalPropertyDraft{
+				{Key: "name", Name: "Name", ValueType: ontology.ValueNumber},
+				{Key: "age", Name: "Age", ValueType: ontology.ValueInteger},
+				{Key: "imo", Name: "IMO", ValueType: ontology.ValueString},
+			},
+			Concepts: []webapi.OntologyProposalConceptDraft{
+				{Key: "person", Name: "Person", Properties: []string{"name"}},
+				{Key: "organization", Name: "Organization", Properties: []string{"name"}},
+				{Key: "vessel", Name: "Vessel", Properties: []string{"name", "imo"}},
+			},
+			Relationships: []webapi.OntologyProposalRelationshipDraft{
+				{
+					Key:          "member_of",
+					Name:         "Member of",
+					FromConcepts: []string{"person"},
+					ToConcepts:   []string{"vessel"},
+					Directed:     false,
+				},
+				{
+					Key:          "port_call",
+					Name:         "Port call",
+					FromConcepts: []string{"vessel"},
+					ToConcepts:   []string{"organization"},
+					Directed:     true,
+				},
+			},
+		},
+	}
+}
+
+func blastRadiusOntologyVersion(t *testing.T) ontology.OntologyVersion {
+	t.Helper()
+	name, err := ontology.NewPropertyDefinition(
+		"name", "Name", "", ontology.ValueString, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	age, err := ontology.NewPropertyDefinition(
+		"age", "Age", "", ontology.ValueInteger, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	role, err := ontology.NewPropertyDefinition(
+		"role", "Role", "", ontology.ValueString, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	person, err := ontology.NewConceptDefinition(
+		"person", "Person", "", []shoal.ID{name.ID(), age.ID()}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	organization, err := ontology.NewConceptDefinition(
+		"organization", "Organization", "", []shoal.ID{name.ID()}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	caseFile, err := ontology.NewConceptDefinition(
+		"case_file", "Case file", "", []shoal.ID{name.ID()}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	memberOf, err := ontology.NewRelationshipDefinition(
+		"member_of", "Member of", "",
+		[]shoal.ID{person.ID()}, []shoal.ID{organization.ID()},
+		[]shoal.ID{role.ID()}, true, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	referencedIn, err := ontology.NewRelationshipDefinition(
+		"referenced_in", "Referenced in", "",
+		[]shoal.ID{person.ID()}, []shoal.ID{caseFile.ID()},
+		[]shoal.ID{role.ID()}, true, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	schema, err := ontology.NewOntologySchema("workspace", "Workspace", "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, err := ontology.NewOntologyVersion(
+		schema, "v1", time.Date(2026, 9, 4, 0, 0, 0, 0, time.UTC),
+		[]ontology.ConceptDefinition{person, organization, caseFile},
+		[]ontology.RelationshipDefinition{memberOf, referencedIn},
+		[]ontology.PropertyDefinition{name, age, role},
+		nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return version
+}
+
+func disjointPropertyOntologyVersion(
+	t *testing.T,
+	prefix string,
+	propertyCount uint32,
+) ontology.OntologyVersion {
+	t.Helper()
+	properties := make([]ontology.PropertyDefinition, 0, propertyCount)
+	for index := uint32(0); index < propertyCount; index++ {
+		key := prefix + "_property_" + strconvUint(index)
+		property, err := ontology.NewPropertyDefinition(
+			key, "Property "+strconvUint(index), "", ontology.ValueString, nil, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		properties = append(properties, property)
+	}
+	concept, err := ontology.NewConceptDefinition(
+		prefix+"_concept", "Concept", "", nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	schema, err := ontology.NewOntologySchema("workspace", "Workspace", "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, err := ontology.NewOntologyVersion(
+		schema, "v1", time.Date(2026, 9, 4, 0, 0, 0, 0, time.UTC),
+		[]ontology.ConceptDefinition{concept}, nil, properties, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return version
+}
+
+func disjointPropertyProposalRequest(
+	prefix string,
+	propertyCount uint32,
+) webapi.CreateOntologyProposalRequest {
+	properties := make([]webapi.OntologyProposalPropertyDraft, 0, propertyCount)
+	for index := uint32(0); index < propertyCount; index++ {
+		properties = append(properties, webapi.OntologyProposalPropertyDraft{
+			Key:       prefix + "_property_" + strconvUint(index),
+			Name:      "Property " + strconvUint(index),
+			ValueType: ontology.ValueString,
+		})
+	}
+	return webapi.CreateOntologyProposalRequest{
+		Rationale: "exercise blast radius report bounds",
+		ProposedVersion: webapi.OntologyProposalVersionDraft{
+			Version:    "v2",
+			Properties: properties,
+			Concepts: []webapi.OntologyProposalConceptDraft{
+				{Key: prefix + "_concept", Name: "Concept"},
+			},
+		},
+	}
+}
+
 func assertionUnderOntology(
 	t *testing.T,
 	identity ontology.OntologyIdentity,
@@ -521,6 +823,114 @@ func assertionUnderOntology(
 		t.Fatal(err)
 	}
 	return assertion
+}
+
+func conceptImpactByKey(
+	values []webapi.OntologyConceptImpactProjection,
+	key string,
+) *webapi.OntologyConceptImpactProjection {
+	for index := range values {
+		if values[index].Concept.Key == key {
+			return &values[index]
+		}
+	}
+	return nil
+}
+
+func relationImpactByKey(
+	values []webapi.OntologyRelationImpactProjection,
+	key string,
+) *webapi.OntologyRelationImpactProjection {
+	for index := range values {
+		if values[index].Relationship.Key == key {
+			return &values[index]
+		}
+	}
+	return nil
+}
+
+func propertyImpactByKey(
+	values []webapi.OntologyPropertyImpactProjection,
+	key string,
+) *webapi.OntologyPropertyImpactProjection {
+	for index := range values {
+		if values[index].Property.Key == key {
+			return &values[index]
+		}
+	}
+	return nil
+}
+
+func conceptChangeByKey(
+	values []webapi.OntologyConceptChangeProjection,
+	key string,
+) *webapi.OntologyConceptChangeProjection {
+	for index := range values {
+		if values[index].Before.Key == key {
+			return &values[index]
+		}
+	}
+	return nil
+}
+
+func relationChangeByKey(
+	values []webapi.OntologyRelationChangeProjection,
+	key string,
+) *webapi.OntologyRelationChangeProjection {
+	for index := range values {
+		if values[index].Before.Key == key {
+			return &values[index]
+		}
+	}
+	return nil
+}
+
+func propertyChangeByKey(
+	values []webapi.OntologyPropertyChangeProjection,
+	key string,
+) *webapi.OntologyPropertyChangeProjection {
+	for index := range values {
+		if values[index].Before.Key == key {
+			return &values[index]
+		}
+	}
+	return nil
+}
+
+func conceptByKey(
+	values []webapi.OntologyConceptProjection,
+	key string,
+) *webapi.OntologyConceptProjection {
+	for index := range values {
+		if values[index].Key == key {
+			return &values[index]
+		}
+	}
+	return nil
+}
+
+func relationByKey(
+	values []webapi.OntologyRelationProjection,
+	key string,
+) *webapi.OntologyRelationProjection {
+	for index := range values {
+		if values[index].Key == key {
+			return &values[index]
+		}
+	}
+	return nil
+}
+
+func propertyByKey(
+	values []webapi.OntologyPropertyProjection,
+	key string,
+) *webapi.OntologyPropertyProjection {
+	for index := range values {
+		if values[index].Key == key {
+			return &values[index]
+		}
+	}
+	return nil
 }
 
 func mustJSON(t *testing.T, value any) []byte {
