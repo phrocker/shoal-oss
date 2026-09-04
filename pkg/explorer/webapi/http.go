@@ -129,6 +129,14 @@ func (h *Handler) routes() {
 		}
 		writeResponse(writer, http.StatusOK, identity)
 	})
+	h.mux.HandleFunc("GET /api/v1/ontology", func(writer http.ResponseWriter, request *http.Request) {
+		ontology, err := ontologyFor(request.Context(), h.service)
+		if err != nil {
+			writeError(writer, err)
+			return
+		}
+		writeResponse(writer, http.StatusOK, ontology)
+	})
 	h.mux.HandleFunc("GET /api/v1/auth-config", h.authConfigEndpoint)
 	h.mux.HandleFunc("POST /api/v1/ingest", ingestEndpoint(h.service))
 	h.mux.HandleFunc("POST /api/v1/changes", changesEndpoint(h.service))
