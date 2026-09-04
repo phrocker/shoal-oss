@@ -535,6 +535,9 @@ func openService(
 			return closed, err
 		}
 		if config.ontology != nil {
+			// This call is load-bearing; TestOntologyProposalLifecycleUsesStartedEmbeddedWorkspace
+			// pins that startup wires -ontology-file into the real EmbeddedService
+			// path used by proposal creation, not only into an injected test double.
 			if err := service.SetOntologyVersion(*config.ontology); err != nil {
 				store.Close()
 				corpus.Close()
