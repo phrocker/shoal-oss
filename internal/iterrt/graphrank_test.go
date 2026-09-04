@@ -210,6 +210,26 @@ func TestGraphRank_EdgeTypeFilter(t *testing.T) {
 	assertClose(t, "filtered rank B", graphRankFloat(t, ranks, "B"), 0.3333333333333333)
 }
 
+func TestGraphRank_DuplicateEdgesCountForOutDegree(t *testing.T) {
+	cells := sortGraphRankInput([]kv{
+		{mk("A", "V", "_label", "", 1), []byte("alpha")},
+		{mk("A", "E_link", "B", "", 4), []byte("edge duplicate newer")},
+		{mk("A", "E_link", "B", "", 3), []byte("edge duplicate older")},
+		{mk("A", "E_link", "C", "", 2), []byte("edge distinct")},
+		{mk("B", "V", "_label", "", 5), []byte("bravo")},
+		{mk("C", "V", "_label", "", 6), []byte("charlie")},
+	})
+	g := initGraphRank(t, newSliceSource(cells...), map[string]string{GraphRankMaxIterations: "1"})
+	got, err := drain(g)
+	if err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+	ranks := graphRankRankCells(t, got, "V", "_rank")
+	assertClose(t, "rank A", graphRankFloat(t, ranks, "A"), 0.05)
+	assertClose(t, "rank B", graphRankFloat(t, ranks, "B"), 0.14444444444444443)
+	assertClose(t, "rank C", graphRankFloat(t, ranks, "C"), 0.14444444444444443)
+}
+
 func TestGraphRank_MaxVerticesSkipsComputation(t *testing.T) {
 	cells := sortGraphRankInput([]kv{
 		{mk("A", "V", "_label", "", 1), []byte("alpha")},
@@ -289,6 +309,41 @@ func TestGraphRank_OutputSortedByKey(t *testing.T) {
 		if got[i-1].k.Compare(got[i].k) > 0 {
 			t.Fatalf("output not sorted at index %d: %+v then %+v", i, got[i-1].k, got[i].k)
 		}
+	}
+}
+
+func TestGraphRank_ConvergenceThresholdStopsIterations(t *testing.T) {
+	cells := sortGraphRankInput([]kv{
+		{mk("A", "V", "_label", "", 1), []byte("alpha")},
+		{mk("A", "E_link", "B", "", 2), []byte("{}")},
+		{mk("B", "V", "_label", "", 3), []byte("bravo")},
+	})
+
+	converged := initGraphRank(t, newSliceSource(cells...), map[string]string{
+		GraphRankMaxIterations:        "10",
+		GraphRankConvergenceThreshold: "0.0001",
+	})
+	convergedCells, err := drain(converged)
+	if err != nil {
+		t.Fatalf("converged drain: %v", err)
+	}
+	convergedRanks := graphRankRankCells(t, convergedCells, "V", "_rank")
+	assertClose(t, "converged rank A", graphRankFloat(t, convergedRanks, "A"), 0.07500000000000001)
+	assertClose(t, "converged rank B", graphRankFloat(t, convergedRanks, "B"), 0.13875)
+
+	early := initGraphRank(t, newSliceSource(cells...), map[string]string{
+		GraphRankMaxIterations:        "10",
+		GraphRankConvergenceThreshold: "0.5",
+	})
+	earlyCells, err := drain(early)
+	if err != nil {
+		t.Fatalf("early drain: %v", err)
+	}
+	earlyRanks := graphRankRankCells(t, earlyCells, "V", "_rank")
+	assertClose(t, "early rank A", graphRankFloat(t, earlyRanks, "A"), 0.07500000000000001)
+	assertClose(t, "early rank B", graphRankFloat(t, earlyRanks, "B"), 0.5)
+	if graphRankFloat(t, earlyRanks, "B") == graphRankFloat(t, convergedRanks, "B") {
+		t.Fatalf("high convergenceThreshold did not truncate before the converged rank")
 	}
 }
 

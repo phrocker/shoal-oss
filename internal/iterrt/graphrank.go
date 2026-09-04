@@ -216,12 +216,14 @@ func (g *GraphRankIterator) Seek(r Range, columnFamilies [][]byte, inclusive boo
 
 		if strings.HasPrefix(cf, g.edgeCFPrefix) {
 			if g.edgeType == "" || cf == g.edgeCFPrefix+g.edgeType {
+				// Load-bearing Java parity: TestGraphRank_DuplicateEdgesCountForOutDegree pins outgoing List vs incoming Set asymmetry.
 				outgoing[row] = append(outgoing[row], cq)
 				sources := incoming[cq]
 				if sources == nil {
 					sources = map[string]struct{}{}
 					incoming[cq] = sources
 				}
+				// Load-bearing Java parity: TestGraphRank_DuplicateEdgesCountForOutDegree pins outgoing List vs incoming Set asymmetry.
 				sources[row] = struct{}{}
 			}
 		}
