@@ -20,6 +20,7 @@ package webapi_test
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -1746,6 +1747,135 @@ func TestHTTPExtractPublishesUploadedSkillGraph(t *testing.T) {
 	if extracted.GraphNodeCount != 3 || extracted.GraphEdgeCount != 5 {
 		t.Fatalf("extract graph counts = nodes:%d edges:%d, want 3 and 5",
 			extracted.GraphNodeCount, extracted.GraphEdgeCount)
+	}
+}
+
+// TestHTTPExtractRoundTripsWireEncodedIdentifiers pins the exact bytes the
+// browser exchanges with /api/v1/extract. The static client forwards the
+// identifiers it received from /api/v1/ingest verbatim, so extract must accept
+// the same wire encoding every other endpoint accepts and must answer with
+// identifiers that can be fed straight back in as neighborhood seeds.
+func TestHTTPExtractRoundTripsWireEncodedIdentifiers(t *testing.T) {
+	corpus, err := explorer.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer corpus.Close()
+	service, err := webapi.NewEmbeddedService(corpus)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := service.SetOntologyVersion(webapiSkillsOntologyVersion(t)); err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewUnstartedServer(nil)
+	handler, err := webapi.NewHandler(service, server.Listener.Addr().String())
+	if err != nil {
+		server.Close()
+		t.Fatal(err)
+	}
+	server.Config.Handler = handler
+	server.Start()
+	defer server.Close()
+
+	uploaded := postMultipart(t, server.URL+"/api/v1/ingest", uploadFixture{
+		name: "SKILL.md", content: "# Demo Skill\n\nTools:\n- demo-cli\n\nCapabilities:\n- Graph extraction\n",
+		mediaType: explorer.MediaTypeMarkdown,
+	})
+	if uploaded.StatusCode != http.StatusOK {
+		t.Fatalf("upload status = %s: %s", uploaded.Status, uploaded.body)
+	}
+	var ingestWire struct {
+		Snapshot json.RawMessage `json:"snapshot"`
+		Files    []struct {
+			Document struct {
+				ID string `json:"id"`
+			} `json:"document"`
+			Revision struct {
+				ID string `json:"id"`
+			} `json:"revision"`
+		} `json:"files"`
+	}
+	if err := json.Unmarshal(uploaded.body, &ingestWire); err != nil {
+		t.Fatal(err)
+	}
+	if len(ingestWire.Files) != 1 {
+		t.Fatalf("ingest files = %d, want 1", len(ingestWire.Files))
+	}
+	documentID := ingestWire.Files[0].Document.ID
+	revisionID := ingestWire.Files[0].Revision.ID
+	decodedDocumentID, err := base64.RawURLEncoding.DecodeString(documentID)
+	if err != nil {
+		t.Fatalf("ingest document id %q is not unpadded base64url: %v", documentID, err)
+	}
+	if string(decodedDocumentID) == documentID {
+		t.Fatalf("ingest document id %q is not wire encoded", documentID)
+	}
+
+	body := fmt.Sprintf(`{"snapshot":%s,"document_id":%q,"revision_id":%q}`,
+		ingestWire.Snapshot, documentID, revisionID)
+	var extractWire struct {
+		Snapshot            json.RawMessage `json:"snapshot"`
+		DocumentID          string          `json:"document_id"`
+		RevisionID          string          `json:"revision_id"`
+		ExtractionID        string          `json:"extraction_id"`
+		EntityCount         int             `json:"entity_count"`
+		EntityNodeIDs       []string        `json:"entity_node_ids"`
+		RelationCount       int             `json:"relation_count"`
+		RelationshipEdgeIDs []string        `json:"relationship_edge_ids"`
+	}
+	if err := json.Unmarshal(postJSON(t, server.URL+"/api/v1/extract", body), &extractWire); err != nil {
+		t.Fatal(err)
+	}
+	if extractWire.DocumentID != documentID {
+		t.Fatalf("extract response document_id = %q, want the wire form %q",
+			extractWire.DocumentID, documentID)
+	}
+	if extractWire.RevisionID != revisionID {
+		t.Fatalf("extract response revision_id = %q, want the wire form %q",
+			extractWire.RevisionID, revisionID)
+	}
+	if extractWire.EntityCount != 3 || len(extractWire.EntityNodeIDs) != 3 {
+		t.Fatalf("extract response entities = %d, node ids = %d, want 3 and 3",
+			extractWire.EntityCount, len(extractWire.EntityNodeIDs))
+	}
+	if extractWire.RelationCount != 2 || len(extractWire.RelationshipEdgeIDs) != 2 {
+		t.Fatalf("extract response relations = %d, edge ids = %d, want 2 and 2",
+			extractWire.RelationCount, len(extractWire.RelationshipEdgeIDs))
+	}
+	encoded := append([]string{extractWire.ExtractionID}, extractWire.EntityNodeIDs...)
+	encoded = append(encoded, extractWire.RelationshipEdgeIDs...)
+	for _, id := range encoded {
+		decoded, err := base64.RawURLEncoding.DecodeString(id)
+		if err != nil {
+			t.Fatalf("extract response id %q is not unpadded base64url: %v", id, err)
+		}
+		if len(decoded) == 0 || string(decoded) == id {
+			t.Fatalf("extract response id %q is not wire encoded", id)
+		}
+	}
+
+	seeds, err := json.Marshal(extractWire.EntityNodeIDs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	neighborhood := fmt.Sprintf(`{"snapshot":%s,"node_ids":%s,"depth":1}`,
+		extractWire.Snapshot, seeds)
+	var neighborhoodWire struct {
+		Neighborhood struct {
+			Nodes []struct {
+				ID string `json:"id"`
+			} `json:"nodes"`
+		} `json:"neighborhood"`
+	}
+	if err := json.Unmarshal(
+		postJSON(t, server.URL+"/api/v1/neighborhood", neighborhood), &neighborhoodWire,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if len(neighborhoodWire.Neighborhood.Nodes) < len(extractWire.EntityNodeIDs) {
+		t.Fatalf("neighborhood seeded by extract returned %d nodes, want at least %d",
+			len(neighborhoodWire.Neighborhood.Nodes), len(extractWire.EntityNodeIDs))
 	}
 }
 
