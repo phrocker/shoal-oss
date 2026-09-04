@@ -23,6 +23,7 @@ import (
 	"context"
 	"sort"
 	"strconv"
+	"strings"
 
 	"github.com/phrocker/shoal-oss/internal/cclient"
 	"github.com/phrocker/shoal-oss/internal/engine"
@@ -41,6 +42,22 @@ const (
 	latentAssertionEdgePropertyOrigin       = "ontology.assertion.origin"
 	latentAssertionEdgePropertyAssertionID  = "ontology.assertion.id"
 	latentAssertionEdgePropertyDerivationID = "ontology.assertion.derivation.id"
+
+	producerPropertyProvider           = "ontology.producer.provider"
+	producerPropertyModel              = "ontology.producer.model"
+	producerPropertyModelVersion       = "ontology.producer.model_version"
+	producerPropertyPrompt             = "ontology.producer.prompt"
+	producerPropertyPromptVersion      = "ontology.producer.prompt_version"
+	producerPropertyExtractor          = "ontology.producer.extractor"
+	producerPropertyExtractorVersion   = "ontology.producer.extractor_version"
+	producerPropertyProvenanceMetadata = "ontology.producer.provenance.metadata"
+	producerPropertyEmbeddingModel     = "ontology.producer.embedding_model"
+	producerPropertyEmbeddingVersion   = "ontology.producer.embedding_model_version"
+	producerPropertySimilarityMetric   = "ontology.producer.similarity_metric"
+	producerPropertyThreshold          = "ontology.producer.threshold"
+	producerPropertyTessellationCell   = "ontology.producer.tessellation_cell"
+	producerPropertyIteratorName       = "ontology.producer.iterator_name"
+	producerPropertyIteratorOptions    = "ontology.producer.iterator_options"
 )
 
 // DefaultLatentLinkAssertionProjection returns the built-in ontology identity
@@ -280,14 +297,194 @@ func latentAssertionGraphEdge(
 	return edge, true, nil
 }
 
+func producerGraphElementsForAssertion(
+	assertion ontology.Assertion,
+) (graph.Node, graph.Node, graph.Edge, bool, error) {
+	if assertion.Origin() != ontology.AssertionDerived {
+		return graph.Node{}, graph.Node{}, graph.Edge{}, false, nil
+	}
+	target, ok := assertion.Object().ReferenceValue()
+	if !ok {
+		return graph.Node{}, graph.Node{}, graph.Edge{}, false, nil
+	}
+	derivation, ok := derivedAssertionDerivation(assertion)
+	if !ok {
+		return graph.Node{}, graph.Node{}, graph.Edge{}, false, nil
+	}
+	producer, err := producerGraphNode(assertion, derivation)
+	if err != nil {
+		return graph.Node{}, graph.Node{}, graph.Edge{}, false, err
+	}
+	assertionNode := graph.Node{
+		ID:     assertion.ID(),
+		Kind:   graph.NodeKindDerivedAssertion,
+		Labels: []string{string(assertion.Predicate())},
+		Properties: shoal.Metadata{
+			latentAssertionEdgePropertyOrigin:       string(assertion.Origin()),
+			latentAssertionEdgePropertyAssertionID:  string(assertion.ID()),
+			latentAssertionEdgePropertyDerivationID: string(derivation.ID()),
+			"ontology.assertion.subject":            string(assertion.Subject()),
+			"ontology.assertion.predicate":          string(assertion.Predicate()),
+			"ontology.assertion.object.reference":   string(target),
+		},
+	}
+	if err := assertionNode.Validate(); err != nil {
+		return graph.Node{}, graph.Node{}, graph.Edge{}, false, err
+	}
+	edgeID := shoal.ID(stableID(
+		"edge", string(producer.ID), graph.EdgeTypeProduced, string(assertion.ID())))
+	derivationEdge := graph.Edge{
+		ID:     edgeID,
+		From:   producer.ID,
+		To:     assertion.ID(),
+		Type:   graph.EdgeTypeProduced,
+		Weight: 1,
+		Properties: shoal.Metadata{
+			latentAssertionEdgePropertyAssertionID:  string(assertion.ID()),
+			latentAssertionEdgePropertyDerivationID: string(derivation.ID()),
+		},
+	}
+	if err := derivationEdge.Validate(); err != nil {
+		return graph.Node{}, graph.Node{}, graph.Edge{}, false, err
+	}
+	return producer, assertionNode, derivationEdge, true, nil
+}
+
+func producerGraphNode(
+	assertion ontology.Assertion,
+	derivation ontology.AssertionDerivation,
+) (graph.Node, error) {
+	provenance := assertion.Provenance()
+	threshold := strconv.FormatFloat(float64(derivation.Threshold()), 'g', -1, 64)
+	identity := []string{
+		producerPropertyProvider, provenance.Provider(),
+		producerPropertyModel, provenance.Model(),
+		producerPropertyModelVersion, provenance.ModelVersion(),
+		producerPropertyPrompt, provenance.Prompt(),
+		producerPropertyPromptVersion, provenance.PromptVersion(),
+		producerPropertyExtractor, provenance.Extractor(),
+		producerPropertyExtractorVersion, provenance.ExtractorVersion(),
+		producerPropertyEmbeddingModel, derivation.EmbeddingModel(),
+		producerPropertyEmbeddingVersion, derivation.EmbeddingModelVersion(),
+		producerPropertySimilarityMetric, derivation.SimilarityMetric(),
+		producerPropertyThreshold, threshold,
+		producerPropertyTessellationCell, derivation.TessellationCell(),
+		producerPropertyIteratorName, derivation.IteratorName(),
+	}
+	// Load-bearing: TestProducerGraphNodeIDCanonicalizesMetadataAndOptions
+	// pins that map iteration order cannot influence producer identity.
+	identity = appendMetadataIdentityParts(
+		identity, producerPropertyProvenanceMetadata, provenance.Metadata())
+	// Load-bearing: TestProducerGraphNodeIDCanonicalizesMetadataAndOptions
+	// pins that iteratorOptions are sorted before they feed a graph node ID.
+	identity = appendMetadataIdentityParts(
+		identity, producerPropertyIteratorOptions, derivation.IteratorOptions())
+	id := shoal.ID(stableID("producer", identity...))
+	node := graph.Node{
+		ID:     id,
+		Kind:   graph.NodeKindProducer,
+		Labels: []string{provenance.Extractor(), derivation.IteratorName()},
+		Properties: shoal.Metadata{
+			producerPropertyProvider:           provenance.Provider(),
+			producerPropertyModel:              provenance.Model(),
+			producerPropertyModelVersion:       provenance.ModelVersion(),
+			producerPropertyPrompt:             provenance.Prompt(),
+			producerPropertyPromptVersion:      provenance.PromptVersion(),
+			producerPropertyExtractor:          provenance.Extractor(),
+			producerPropertyExtractorVersion:   provenance.ExtractorVersion(),
+			producerPropertyProvenanceMetadata: metadataIdentityString(provenance.Metadata()),
+			producerPropertyEmbeddingModel:     derivation.EmbeddingModel(),
+			producerPropertyEmbeddingVersion:   derivation.EmbeddingModelVersion(),
+			producerPropertySimilarityMetric:   derivation.SimilarityMetric(),
+			producerPropertyThreshold:          threshold,
+			producerPropertyTessellationCell:   derivation.TessellationCell(),
+			producerPropertyIteratorName:       derivation.IteratorName(),
+			producerPropertyIteratorOptions:    metadataIdentityString(derivation.IteratorOptions()),
+		},
+	}
+	if err := node.Validate(); err != nil {
+		return graph.Node{}, err
+	}
+	return node, nil
+}
+
+func derivedAssertionDerivation(
+	assertion ontology.Assertion,
+) (ontology.AssertionDerivation, bool) {
+	evidence := assertion.Evidence()
+	if len(evidence) != 1 {
+		return ontology.AssertionDerivation{}, false
+	}
+	return evidence[0].Derivation()
+}
+
+func appendMetadataIdentityParts(
+	parts []string,
+	name string,
+	metadata shoal.Metadata,
+) []string {
+	keys := make([]string, 0, len(metadata))
+	for key := range metadata {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	parts = append(parts, name, strconv.Itoa(len(keys)))
+	for _, key := range keys {
+		parts = append(parts, key, metadata[key])
+	}
+	return parts
+}
+
+func metadataIdentityString(metadata shoal.Metadata) string {
+	keys := make([]string, 0, len(metadata))
+	for key := range metadata {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	var builder strings.Builder
+	builder.WriteString(strconv.Itoa(len(keys)))
+	for _, key := range keys {
+		builder.WriteByte('|')
+		builder.WriteString(strconv.Itoa(len(key)))
+		builder.WriteByte(':')
+		builder.WriteString(key)
+		value := metadata[key]
+		builder.WriteByte('=')
+		builder.WriteString(strconv.Itoa(len(value)))
+		builder.WriteByte(':')
+		builder.WriteString(value)
+	}
+	return builder.String()
+}
+
 func (e *Explorer) assertionsForEdgesLocked(
 	edges map[shoal.ID]graph.Edge,
 ) []ontology.Assertion {
+	seen := make(map[shoal.ID]struct{}, len(edges))
 	ids := make([]shoal.ID, 0, len(edges))
 	for id := range edges {
 		if _, ok := e.graphAssertions[id]; ok {
+			seen[id] = struct{}{}
 			ids = append(ids, id)
+			continue
 		}
+		edge := e.graphEdges[id]
+		if edge.Type != graph.EdgeTypeProduced {
+			continue
+		}
+		assertionID, ok := edge.Properties[latentAssertionEdgePropertyAssertionID]
+		if !ok {
+			continue
+		}
+		id := shoal.ID(assertionID)
+		if _, ok := e.graphAssertions[id]; !ok {
+			continue
+		}
+		if _, duplicate := seen[id]; duplicate {
+			continue
+		}
+		seen[id] = struct{}{}
+		ids = append(ids, id)
 	}
 	sortIDs(ids)
 	assertions := make([]ontology.Assertion, 0, len(ids))
