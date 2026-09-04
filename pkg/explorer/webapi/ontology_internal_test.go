@@ -29,9 +29,20 @@ func TestOntologyEndpointIsNotPubliclyReachable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	request := httptest.NewRequest(http.MethodGet, "/api/v1/ontology", nil)
-	if handler.publiclyReachable(request) {
-		t.Fatal("GET /api/v1/ontology is public, want authenticated API route")
+	for _, testCase := range []struct {
+		method string
+		path   string
+	}{
+		{http.MethodGet, "/api/v1/ontology"},
+		{http.MethodGet, "/api/v1/ontology/proposals"},
+		{http.MethodPost, "/api/v1/ontology/proposals"},
+		{http.MethodPost, "/api/v1/ontology/proposals/cHJvcG9zYWw/transition"},
+	} {
+		request := httptest.NewRequest(testCase.method, testCase.path, nil)
+		if handler.publiclyReachable(request) {
+			t.Fatalf("%s %s is public, want authenticated API route",
+				testCase.method, testCase.path)
+		}
 	}
 }
 

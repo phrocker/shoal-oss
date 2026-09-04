@@ -67,6 +67,25 @@ assert.strictEqual(denied.ids["ontology-status"].className, "denied");
 assert.match(denied.ids["ontology-status"].textContent, /Access denied/);
 assert.match(denied.ids["ontology-status"].textContent, /not an empty result/);
 assert.strictEqual(denied.ids["ontology-details"].children.length, 0);
+
+const proposalDenied = await runOntologyScenario({
+  configured: true,
+  identity: {known: true, schema_id: "schema-empty", version_id: "version-empty", reading: "same_version"},
+  schema: {id: "schema-empty", key: "empty", name: "Empty"},
+  version: {id: "version-empty", version: "v1", created_at: "2026-09-04T00:00:00Z"},
+  concepts: [],
+  relationships: [],
+  properties: [],
+  limits: {},
+}, {
+  proposalsError: {
+    status: 401,
+    statusText: "Unauthorized",
+    body: {code: "unauthorized", message: "operation list ontology proposals is not authorized"},
+  },
+});
+assert.match(renderedText(proposalDenied.ids["ontology-details"]), /Access denied/);
+assert.match(renderedText(proposalDenied.ids["ontology-details"]), /not an empty result/);
 `)
 }
 
@@ -112,6 +131,50 @@ assert.match(text, /Directed relationship/);
 assert.match(text, /Role/);
 assert.match(text, /required/);
 assert.match(text, /allowed_values: string Alice, string Bob/);
+`)
+}
+
+func TestStaticWorkspaceOntologyProposalLifecycleControls(t *testing.T) {
+	runOntologyUITest(t, `
+const rendered = await runOntologyScenario({
+  configured: true,
+  identity: {known: true, schema_id: "schema-rich", version_id: "version-rich", reading: "same_version"},
+  schema: {id: "schema-rich", key: "workspace", name: "Workspace"},
+  version: {id: "version-rich", version: "v1", created_at: "2026-09-04T00:00:00Z"},
+  concepts: [{id: "concept-person", key: "person", name: "Person", properties: ["property-name"]}],
+  relationships: [],
+  properties: [{id: "property-name", key: "name", name: "Name", value_type: "string", constraints: []}],
+  limits: {},
+}, {
+  proposals: {
+    proposals: [{
+      id: "proposal-1",
+      base_schema_id: "schema-rich",
+      base_version_id: "version-rich",
+      proposed_by: "development-principal@localhost",
+      rationale: "add organization joins",
+      created_at: "2026-09-04T00:01:00Z",
+      updated_at: "2026-09-04T00:02:00Z",
+      state: "submitted",
+      proposed_ontology: {identity: {version_id: "version-v2"}},
+      transitions: [{from: "draft", to: "submitted", actor: "author", note: "ready"}],
+    }],
+    limits: {},
+  },
+});
+const text = renderedText(rendered.ids["ontology-details"]);
+assert.match(text, /Governed proposals/);
+assert.match(text, /Create draft proposal/);
+assert.match(text, /submitted proposal/);
+assert.match(text, /draft → submitted/);
+assert.match(text, /Approve/);
+assert.match(text, /Reject/);
+assert.match(text, /Withdraw/);
+const jsonEditor = descendants(rendered.ids["ontology-details"])
+  .find((node) => node.className === "ontology-proposal-json");
+assert.ok(jsonEditor);
+assert.match(jsonEditor.value, /"version": "v2"/);
+assert.match(jsonEditor.value, /"properties":/);
 `)
 }
 
@@ -325,6 +388,18 @@ async function runOntologyScenario(ontology, options = {}) {
           });
         }
         return response(ontology);
+      }
+      if (url === "/api/v1/ontology/proposals") {
+        if (options.proposalsError) {
+          const failure = options.proposalsError;
+          return response(failure.body || {}, {
+            ok: false,
+            status: failure.status,
+            statusText: failure.statusText || "Error",
+            headers: failure.wwwAuthenticate ? {"www-authenticate": "Bearer"} : {},
+          });
+        }
+        return response(options.proposals || {proposals: [], limits: {}});
       }
       if (url === "/api/v1/meta") return response({capabilities: {documents: true}});
       if (url.endsWith("/documents")) return response({snapshot, documents: [], next_cursor: ""});

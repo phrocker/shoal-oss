@@ -144,6 +144,8 @@ func (s *EmbeddedService) SetOntologyVersion(version ontology.OntologyVersion) e
 		return err
 	}
 	cloned := version
+	s.ontologyMu.Lock()
+	defer s.ontologyMu.Unlock()
 	s.ontologyVersion = &cloned
 	return nil
 }
@@ -158,6 +160,8 @@ func (s *EmbeddedService) ActiveOntology(
 	if err := ctx.Err(); err != nil {
 		return ontology.OntologyVersion{}, false, err
 	}
+	s.ontologyMu.RLock()
+	defer s.ontologyMu.RUnlock()
 	if s.ontologyVersion == nil {
 		return ontology.OntologyVersion{}, false, nil
 	}

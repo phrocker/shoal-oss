@@ -13,6 +13,7 @@ const state = {
   accessToken: null,
   auth: {configured: false},
   ontology: null,
+  ontologyProposals: null,
   reauthRequired: false,
   capabilities: {
     documents: false,
@@ -588,17 +589,31 @@ async function loadOntology() {
     });
     const value = await response.json();
     if (!response.ok) throw apiError(value, response);
+    let proposals = {proposals: [], limits: {}};
+    let proposalsError = null;
+    try {
+      const proposalResponse = await fetch("/api/v1/ontology/proposals", {
+        headers: {"accept": "application/json", ...authHeaders()},
+      });
+      const proposalValue = await proposalResponse.json();
+      if (!proposalResponse.ok) throw apiError(proposalValue, proposalResponse);
+      proposals = proposalValue;
+    } catch (error) {
+      proposalsError = error;
+    }
     if (generation !== ontologyGeneration) return;
     state.ontology = value;
-    renderOntology(value);
+    state.ontologyProposals = proposalsError ? null : proposals;
+    renderOntology(value, proposals, proposalsError);
   } catch (error) {
     if (generation !== ontologyGeneration) return;
     state.ontology = null;
+    state.ontologyProposals = null;
     renderOntologyError(error);
   }
 }
 
-function renderOntology(ontology) {
+function renderOntology(ontology, proposals = {proposals: [], limits: {}}, proposalsError = null) {
   const status = $("ontology-status");
   const details = $("ontology-details");
   if (!status || !details) return;
@@ -647,7 +662,288 @@ function renderOntology(ontology) {
     "This active ontology has no properties or constraints.",
     propertyCard,
   ));
+  fragment.append(ontologyProposalPanel(ontology, proposals, proposalsError));
   details.replaceChildren(fragment);
+}
+
+function ontologyProposalPanel(ontology, proposalsResponse, proposalsError) {
+  const section = document.createElement("section");
+  section.className = "ontology-section ontology-governance";
+  const heading = document.createElement("h3");
+  heading.textContent = "Governed proposals";
+  section.append(heading, ontologyProposalForm(ontology));
+
+  const status = document.createElement("p");
+  status.setAttribute("role", "status");
+  if (proposalsError) {
+    if (needsReauthentication(proposalsError)) {
+      handleReauthentication();
+      status.className = "reauth";
+      status.textContent = reauthenticationText();
+    } else if (isDenied(proposalsError)) {
+      status.className = "denied";
+      status.textContent = deniedText("review ontology proposals", state.identity);
+    } else {
+      status.className = "error";
+      status.textContent = `Ontology proposals are unavailable: ${proposalsError.message || String(proposalsError)}.`;
+    }
+    section.append(status);
+    return section;
+  }
+
+  const proposals = (proposalsResponse && proposalsResponse.proposals) || [];
+  status.className = proposals.length === 0 ? "empty-state" : "muted";
+  status.textContent = proposals.length === 0
+    ? "No governed ontology proposals exist. This is an empty proposal list, not an authorization denial."
+    : `Showing ${proposals.length} governed ontology proposal(s).`;
+  section.append(status);
+  if (proposals.length === 0) return section;
+
+  const list = document.createElement("div");
+  list.className = "ontology-list";
+  for (const proposal of proposals) list.append(ontologyProposalCard(proposal));
+  section.append(list);
+  return section;
+}
+
+function ontologyProposalForm(ontology) {
+  const form = document.createElement("form");
+  form.className = "ontology-proposal-form";
+
+  const versionLabel = document.createElement("label");
+  versionLabel.textContent = "Proposed version";
+  const version = document.createElement("input");
+  version.value = proposalVersionSuffix(ontology && ontology.version && ontology.version.version);
+  versionLabel.append(version);
+
+  const rationaleLabel = document.createElement("label");
+  rationaleLabel.textContent = "Rationale";
+  const rationale = document.createElement("textarea");
+  rationale.placeholder = "Why should this ontology refinement be considered?";
+  rationaleLabel.append(rationale);
+
+  const draftLabel = document.createElement("label");
+  draftLabel.textContent = "Proposed ontology JSON";
+  const draft = document.createElement("textarea");
+  draft.className = "ontology-proposal-json";
+  draft.value = JSON.stringify(ontologyDraftFromActive(ontology, version.value), null, 2);
+  version.onchange = () => {
+    try {
+      const value = JSON.parse(draft.value);
+      value.version = version.value;
+      draft.value = JSON.stringify(value, null, 2);
+    } catch (_) {
+      // Leave hand-edited JSON alone; submit will surface the parse error.
+    }
+  };
+  draftLabel.append(draft);
+
+  const submit = document.createElement("button");
+  submit.type = "submit";
+  submit.textContent = "Create draft proposal";
+  const status = document.createElement("p");
+  status.setAttribute("role", "status");
+  status.className = "muted";
+  status.textContent =
+    "Drafts are immutable proposals. Edit the JSON before creating one.";
+
+  form.onsubmit = async (event) => {
+    event.preventDefault();
+    await createOntologyProposal(version, rationale, draft, status, submit);
+  };
+  form.append(versionLabel, rationaleLabel, draftLabel, submit, status);
+  return form;
+}
+
+function ontologyProposalCard(proposal) {
+  const card = document.createElement("article");
+  card.className = "ontology-card ontology-proposal-card";
+  const heading = document.createElement("h4");
+  heading.textContent = `${proposal.state || "unknown"} proposal`;
+  heading.title = proposal.id || "";
+  const summary = document.createElement("p");
+  const proposed = proposal.proposed_ontology || {};
+  summary.className = "muted";
+  summary.textContent = `Proposes ${shortLabel(proposed.identity && proposed.identity.version_id)} ` +
+    `by ${proposal.proposed_by || "unknown"}: ${proposal.rationale || "no rationale"}`;
+  card.append(heading, summary);
+
+  const facts = document.createElement("dl");
+  facts.className = "identity-facts";
+  appendFact(facts, "Base version", proposal.base_version_id);
+  appendFact(facts, "Created", proposal.created_at);
+  appendFact(facts, "Updated", proposal.updated_at);
+  card.append(facts);
+
+  const transitions = proposal.transitions || [];
+  const history = document.createElement("ol");
+  history.className = "ontology-transitions";
+  if (transitions.length === 0) {
+    const item = document.createElement("li");
+    item.textContent = "Draft created; no governance transitions recorded yet.";
+    history.append(item);
+  } else {
+    for (const transition of transitions) {
+      const item = document.createElement("li");
+      item.textContent = `${transition.from} → ${transition.to} by ` +
+        `${transition.actor}: ${transition.note}`;
+      history.append(item);
+    }
+  }
+  card.append(history, ontologyProposalActions(proposal));
+  return card;
+}
+
+function ontologyProposalActions(proposal) {
+  const group = document.createElement("div");
+  group.className = "ontology-proposal-actions";
+  const note = document.createElement("input");
+  note.placeholder = "Transition note";
+  group.append(note);
+  const actions = proposalActionsForState(proposal.state);
+  for (const action of actions) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.textContent = action.label;
+    button.onclick = async () => {
+      await transitionOntologyProposal(
+        proposal.id,
+        action.state,
+        note.value || `Ontology proposal ${action.state} from Explorer UI.`,
+        group,
+      );
+    };
+    group.append(button);
+  }
+  if (actions.length === 0) {
+    const done = document.createElement("span");
+    done.className = "muted";
+    done.textContent = "Terminal state.";
+    group.append(done);
+  }
+  return group;
+}
+
+function proposalActionsForState(stateName) {
+  switch (stateName) {
+  case "draft":
+    return [{state: "submitted", label: "Submit"}, {state: "withdrawn", label: "Withdraw"}];
+  case "submitted":
+    return [
+      {state: "approved", label: "Approve"},
+      {state: "rejected", label: "Reject"},
+      {state: "withdrawn", label: "Withdraw"},
+    ];
+  case "approved":
+    return [{state: "published", label: "Publish"}, {state: "withdrawn", label: "Withdraw"}];
+  default:
+    return [];
+  }
+}
+
+async function createOntologyProposal(version, rationale, draft, status, button) {
+  let proposed;
+  try {
+    proposed = JSON.parse(draft.value);
+  } catch (error) {
+    setStatus(status, `Proposal JSON is invalid: ${error.message || String(error)}.`, "error");
+    return;
+  }
+  proposed.version = version.value;
+  button.disabled = true;
+  setStatus(status, "Creating draft proposal…");
+  try {
+    const response = await fetch("/api/v1/ontology/proposals", {
+      method: "POST",
+      headers: {
+        "accept": "application/json",
+        "content-type": "application/json",
+        "x-shoal-workspace-request": "1",
+        ...authHeaders(),
+      },
+      body: JSON.stringify({rationale: rationale.value, proposed_version: proposed}),
+    });
+    const value = await response.json();
+    if (!response.ok) throw apiError(value, response);
+    setStatus(status, "Draft proposal created.");
+    await loadOntology();
+  } catch (error) {
+    showActionError(status, error, "create ontology proposals");
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function transitionOntologyProposal(proposalID, nextState, note, container) {
+  setMessage(container, `Moving proposal to ${nextState}…`);
+  try {
+    const response = await fetch(`/api/v1/ontology/proposals/${encodeURIComponent(proposalID)}/transition`, {
+      method: "POST",
+      headers: {
+        "accept": "application/json",
+        "content-type": "application/json",
+        "x-shoal-workspace-request": "1",
+        ...authHeaders(),
+      },
+      body: JSON.stringify({state: nextState, note}),
+    });
+    const value = await response.json();
+    if (!response.ok) throw apiError(value, response);
+    await loadOntology();
+  } catch (error) {
+    showActionError(container, error, `move ontology proposal to ${nextState}`);
+  }
+}
+
+function ontologyDraftFromActive(ontology, version) {
+  const properties = ontology.properties || [];
+  const concepts = ontology.concepts || [];
+  const relationships = ontology.relationships || [];
+  const propertyKeys = new Map(properties.map((property) => [property.id, property.key]));
+  const conceptKeys = new Map(concepts.map((concept) => [concept.id, concept.key]));
+  return {
+    version,
+    properties: properties.map((property) => ({
+      key: property.key,
+      name: property.name,
+      description: property.description || "",
+      value_type: property.value_type,
+      constraints: (property.constraints || []).map(ontologyConstraintDraft),
+    })),
+    concepts: concepts.map((concept) => ({
+      key: concept.key,
+      name: concept.name,
+      description: concept.description || "",
+      properties: (concept.properties || []).map((id) => propertyKeys.get(id) || id),
+    })),
+    relationships: relationships.map((relationship) => ({
+      key: relationship.key,
+      name: relationship.name,
+      description: relationship.description || "",
+      from_concepts: (relationship.from_concepts || []).map((id) => conceptKeys.get(id) || id),
+      to_concepts: (relationship.to_concepts || []).map((id) => conceptKeys.get(id) || id),
+      properties: (relationship.properties || []).map((id) => propertyKeys.get(id) || id),
+      directed: relationship.directed === true,
+    })),
+  };
+}
+
+function ontologyConstraintDraft(constraint) {
+  const draft = {kind: constraint.kind};
+  if (Object.prototype.hasOwnProperty.call(constraint, "count")) draft.count = constraint.count;
+  if (constraint.value) draft.value = constraint.value;
+  if (constraint.pattern) draft.pattern = constraint.pattern;
+  if ((constraint.allowed_values || []).length > 0) {
+    draft.allowed_values = constraint.allowed_values;
+  }
+  return draft;
+}
+
+function proposalVersionSuffix(base) {
+  const value = String(base || "").trim();
+  const match = value.match(/^v(\d+)$/i);
+  if (match) return `v${Number(match[1]) + 1}`;
+  return value ? `${value}-proposal` : "proposal";
 }
 
 function ontologyIdentityFacts(ontology) {
