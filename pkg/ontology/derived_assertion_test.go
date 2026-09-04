@@ -204,6 +204,42 @@ func TestDerivationRejectsScoreBelowThreshold(t *testing.T) {
 		t, err, "derivation score must meet or exceed threshold")
 }
 
+func TestDerivationConstructorDoesNotAliasCallerOptions(t *testing.T) {
+	caller := shoal.Metadata{"maxPairs": "512"}
+	derivation, err := newDerivation(t, derivationArgs{iteratorOptions: caller})
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := derivation.ID()
+
+	caller["maxPairs"] = "1"
+
+	if got := derivation.IteratorOptions()["maxPairs"]; got != "512" {
+		t.Fatalf("derivation observed caller mutation: maxPairs=%q, want 512", got)
+	}
+	if after := derivation.ID(); after != before {
+		t.Fatalf("derivation ID changed after caller mutation: got %q, want %q", after, before)
+	}
+}
+
+func TestDerivationAccessorDoesNotLeakInternalOptions(t *testing.T) {
+	derivation, err := newDerivation(
+		t, derivationArgs{iteratorOptions: shoal.Metadata{"maxPairs": "512"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := derivation.ID()
+
+	derivation.IteratorOptions()["maxPairs"] = "1"
+
+	if got := derivation.IteratorOptions()["maxPairs"]; got != "512" {
+		t.Fatalf("accessor leaked internal map: maxPairs=%q, want 512", got)
+	}
+	if after := derivation.ID(); after != before {
+		t.Fatalf("derivation ID changed after accessor mutation: got %q, want %q", after, before)
+	}
+}
+
 func mustDerivationEvidence(t *testing.T) ontology.EvidenceRef {
 	t.Helper()
 	evidence, err := ontology.NewDerivationEvidenceRef(

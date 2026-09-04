@@ -377,7 +377,9 @@ func NewAssertionDerivation(
 		sourceEndpoint:        sourceEndpoint,
 		targetEndpoint:        targetEndpoint,
 		iteratorName:          iteratorName,
-		iteratorOptions:       cloneMetadata(iteratorOptions),
+		// Load-bearing: TestDerivationConstructorDoesNotAliasCallerOptions
+		// pins that caller map mutations cannot alter derivation provenance.
+		iteratorOptions: cloneMetadata(iteratorOptions),
 	}
 	id, err := derivationID(derivation)
 	if err != nil {
@@ -446,10 +448,14 @@ func (d AssertionDerivation) IteratorName() string {
 }
 
 func (d AssertionDerivation) IteratorOptions() shoal.Metadata {
+	// Load-bearing: TestDerivationAccessorDoesNotLeakInternalOptions pins
+	// that callers cannot mutate the derivation provenance through accessors.
 	return cloneMetadata(d.iteratorOptions)
 }
 
 func (d AssertionDerivation) clone() AssertionDerivation {
+	// Load-bearing: TestAssertionDerivationCloneDoesNotAliasOptions pins
+	// that cloned derivations do not share mutable provenance options.
 	d.iteratorOptions = cloneMetadata(d.iteratorOptions)
 	return d
 }
