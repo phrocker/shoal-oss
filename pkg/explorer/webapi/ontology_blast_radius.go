@@ -55,6 +55,11 @@ type OntologyBlastRadiusReport struct {
 	Limits               OntologyBlastRadiusLimits          `json:"limits"`
 }
 
+// This summary intentionally contains only structural counts. The absence of
+// assertion impact/count fields is load-bearing;
+// TestOntologyProposalBlastRadiusHasNoUnimplementedImpactCountScaffold pins
+// that decorative count scaffolding is not emitted without a real, authorized
+// stored-assertion counter.
 type OntologyBlastRadiusSummary struct {
 	RemovedConcepts      uint32 `json:"removed_concepts"`
 	RemovedRelationships uint32 `json:"removed_relationships"`

@@ -24,6 +24,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"sync"
 	"testing"
 	"time"
@@ -398,6 +399,27 @@ func TestOntologyProposalBlastRadiusReportsStructuralDiffWithoutDecorativeCounts
 		propertyByKey(report.AddedProperties, "imo") == nil {
 		t.Fatalf("added blast radius entries = concepts %+v relationships %+v properties %+v",
 			report.AddedConcepts, report.AddedRelationships, report.AddedProperties)
+	}
+}
+
+func TestOntologyProposalBlastRadiusHasNoUnimplementedImpactCountScaffold(t *testing.T) {
+	source, err := os.ReadFile("ontology_blast_radius.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, forbidden := range [][]byte{
+		[]byte("OntologyAssertionImpactCounts"),
+		[]byte("ontologyAssertionImpactCounter"),
+		[]byte("changedOntologyElementIDs"),
+		[]byte("OntologyAssertionImpactProjection"),
+		[]byte("CountsComputed"),
+		[]byte("asserted_count"),
+		[]byte("derived_count"),
+		[]byte(`json:"impact"`),
+	} {
+		if bytes.Contains(source, forbidden) {
+			t.Fatalf("blast-radius source contains unimplemented assertion-count scaffold %q", forbidden)
+		}
 	}
 }
 
