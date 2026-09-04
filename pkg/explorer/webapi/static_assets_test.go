@@ -114,6 +114,256 @@ assert.match(failed.ids["upload-status"].textContent, /upload failed/);
 `)
 }
 
+func TestStaticWorkspaceDirectoryPickerMarkup(t *testing.T) {
+	index := readStaticAsset(t, "static/index.html")
+	if !strings.Contains(index, `id="upload-directory" type="file" webkitdirectory multiple`) {
+		t.Fatalf("directory picker input must use webkitdirectory for browser directory selection")
+	}
+}
+
+func TestStaticWorkspaceDirectoryUploadRenamesSkillCollisions(t *testing.T) {
+	runNodeUITest(t, `
+const scenario = await runScenario(
+  {documents: true, document: true, ingest: true},
+  [],
+  {
+    ingestResponse: {
+      snapshot: {id: "skillupload", as_of: "2026-08-29T01:00:00Z", frontier: 3},
+      files: [
+        {
+          name: "skills__alpha__SKILL.md", disposition: "applied", media_type: "text/markdown", span_count: 1,
+          skill_file: {expected: true, recognized: true, name: "alpha", description: "Alpha skill", message: "Recognized agent skills file."},
+        },
+        {
+          name: "skills__beta__SKILL.md", disposition: "applied", media_type: "text/markdown", span_count: 1,
+          skill_file: {expected: true, recognized: true, name: "beta", description: "Beta skill", message: "Recognized agent skills file."},
+        },
+      ],
+    },
+  },
+);
+scenario.ids["upload-directory"].files = [
+  {name: "SKILL.md", webkitRelativePath: "skills/beta/SKILL.md", size: 10},
+  {name: "SKILL.md", webkitRelativePath: "skills/alpha/SKILL.md", size: 10},
+];
+await scenario.ids.upload.onsubmit({preventDefault() {}});
+assert.deepStrictEqual(
+  scenario.uploadRequest.options.body.parts.map((part) => part.filename),
+  ["skills__alpha__SKILL.md", "skills__beta__SKILL.md"],
+  "directory SKILL.md filenames must be unique and deterministically sorted",
+);
+assert.match(
+  renderedText(scenario.ids["upload-results"]),
+  /Agent skill file recognized: alpha/,
+  "recognized skill metadata must be surfaced in upload results",
+);
+`)
+}
+
+func TestStaticWorkspaceDirectoryUploadBatchesAtServerLimit(t *testing.T) {
+	runNodeUITest(t, `
+function uploadResponse(names, id) {
+  return {
+    snapshot: {id, as_of: "2026-08-29T01:00:00Z", frontier: Number(id.replace("snap", ""))},
+    files: names.map((name) => ({
+      name, disposition: "applied", media_type: "text/plain", span_count: 1,
+    })),
+  };
+}
+
+const eightNames = Array.from({length: 8}, (_, index) => "file-" + String(index).padStart(2, "0") + ".txt");
+const eight = await runScenario(
+  {documents: true, document: true, ingest: true},
+  [],
+  {ingestResponses: [uploadResponse(eightNames, "snap8")]},
+);
+eight.ids["upload-directory"].files = eightNames.map((name) => ({name, webkitRelativePath: "dir/" + name, size: 1}));
+await eight.ids.upload.onsubmit({preventDefault() {}});
+assert.strictEqual(eight.uploadRequests.length, 1, "exactly MaxUploadFiles must stay in one request");
+assert.strictEqual(eight.uploadRequests[0].options.body.parts.length, 8, "the full MaxUploadFiles batch must be sent");
+
+const nineNames = Array.from({length: 9}, (_, index) => "file-" + String(index).padStart(2, "0") + ".txt");
+const nine = await runScenario(
+  {documents: true, document: true, ingest: true},
+  [],
+  {ingestResponses: [uploadResponse(nineNames.slice(0, 8), "snap8"), uploadResponse(nineNames.slice(8), "snap9")]},
+);
+nine.ids["upload-directory"].files = nineNames.map((name) => ({name, webkitRelativePath: "dir/" + name, size: 1}));
+await nine.ids.upload.onsubmit({preventDefault() {}});
+assert.deepStrictEqual(
+  nine.uploadRequests.map((request) => request.options.body.parts.length),
+  [8, 1],
+  "MaxUploadFiles plus one must create a second request rather than truncate",
+);
+`)
+}
+
+func TestStaticWorkspaceDirectoryUploadBatchesRealisticSkillDirectory(t *testing.T) {
+	runNodeUITest(t, `
+const names = Array.from({length: 24}, (_, index) => "skills__skill-" + String(index).padStart(2, "0") + "__SKILL.md");
+function uploadResponse(batchNames, id) {
+  return {
+    snapshot: {id, as_of: "2026-08-29T01:00:00Z", frontier: Number(id.replace("snap", ""))},
+    files: batchNames.map((name, index) => ({
+      name,
+      disposition: "applied",
+      media_type: "text/markdown",
+      span_count: 1,
+      skill_file: {
+        expected: true,
+        recognized: true,
+        name: "skill-" + String(index).padStart(2, "0"),
+        description: "Generated skill",
+        message: "Recognized agent skills file.",
+      },
+    })),
+  };
+}
+const scenario = await runScenario(
+  {documents: true, document: true, ingest: true},
+  [],
+  {
+    ingestResponses: [
+      uploadResponse(names.slice(0, 8), "snap1"),
+      uploadResponse(names.slice(8, 16), "snap2"),
+      uploadResponse(names.slice(16), "snap3"),
+    ],
+  },
+);
+scenario.ids["upload-directory"].files = Array.from({length: 24}, (_, index) => ({
+  name: "SKILL.md",
+  webkitRelativePath: "skills/skill-" + String(index).padStart(2, "0") + "/SKILL.md",
+  size: 20,
+}));
+await scenario.ids.upload.onsubmit({preventDefault() {}});
+assert.deepStrictEqual(
+  scenario.uploadRequests.map((request) => request.options.body.parts.length),
+  [8, 8, 8],
+  "twenty-four directory files must upload as three bounded requests",
+);
+assert.strictEqual(
+  new Set(scenario.uploadRequests.flatMap((request) => request.options.body.parts.map((part) => part.filename))).size,
+  24,
+  "all generated directory upload filenames must be unique across batches",
+);
+assert.match(
+  scenario.ids["upload-status"].textContent,
+  /Uploaded 24 file\(s\)/,
+  "successful realistic skills directory upload must report all files",
+);
+`)
+}
+
+func TestStaticWorkspaceDirectoryUploadSkipsOversizedFiles(t *testing.T) {
+	runNodeUITest(t, `
+const scenario = await runScenario(
+  {documents: true, document: true, ingest: true},
+  [],
+  {
+    meta: {max_upload_files: 8, max_upload_file_bytes: 10, max_upload_total_bytes: 30},
+    ingestResponse: {
+      snapshot: {id: "smallfiles", as_of: "2026-08-29T01:00:00Z", frontier: 4},
+      files: [
+        {name: "dir__a.txt", disposition: "applied", media_type: "text/plain", span_count: 1},
+        {name: "dir__c.txt", disposition: "applied", media_type: "text/plain", span_count: 1},
+      ],
+    },
+  },
+);
+scenario.ids["upload-directory"].files = [
+  {name: "a.txt", webkitRelativePath: "dir/a.txt", size: 5},
+  {name: "b.txt", webkitRelativePath: "dir/b.txt", size: 11},
+  {name: "c.txt", webkitRelativePath: "dir/c.txt", size: 5},
+];
+await scenario.ids.upload.onsubmit({preventDefault() {}});
+assert.deepStrictEqual(
+  scenario.uploadRequest.options.body.parts.map((part) => part.filename),
+  ["dir__a.txt", "dir__c.txt"],
+  "oversized file must be skipped without aborting valid siblings",
+);
+assert.match(
+  scenario.ids["upload-status"].textContent,
+  /Uploaded 2 of 3 file\(s\); 1 skipped/,
+  "partial directory upload must report skipped oversized files",
+);
+assert.match(
+  renderedText(scenario.ids["upload-results"]),
+  /Skipped dir\/b\.txt: 11 B exceeds the per-file limit of 10 B/,
+  "oversized skipped result must include the actionable size limit",
+);
+`)
+}
+
+func TestStaticWorkspaceUploadReportsMidBatchFailure(t *testing.T) {
+	runNodeUITest(t, `
+function names(start, count) {
+  return Array.from({length: count}, (_, offset) => "dir__file-" + (start + offset) + ".txt");
+}
+function uploadResponse(batchNames, id) {
+  return {
+    snapshot: {id, as_of: "2026-08-29T01:00:00Z", frontier: Number(id.replace("snap", ""))},
+    files: batchNames.map((name) => ({
+      name, disposition: "applied", media_type: "text/plain", span_count: 1,
+    })),
+  };
+}
+const scenario = await runScenario(
+  {documents: true, document: true, ingest: true},
+  [],
+  {
+    meta: {max_upload_files: 2, max_upload_file_bytes: 100, max_upload_total_bytes: 200},
+    ingestResponses: [uploadResponse(names(0, 2), "snap1"), null, uploadResponse(names(4, 2), "snap3")],
+    ingestErrors: [null, {statusText: "Bad Request", body: {message: "batch two rejected"}}],
+  },
+);
+scenario.ids["upload-directory"].files = Array.from({length: 6}, (_, index) => ({
+  name: "file-" + index + ".txt",
+  webkitRelativePath: "dir/file-" + index + ".txt",
+  size: 1,
+}));
+await scenario.ids.upload.onsubmit({preventDefault() {}});
+assert.deepStrictEqual(
+  scenario.uploadRequests.map((request) => request.options.body.parts.map((part) => part.filename)),
+  [names(0, 2), names(2, 2), names(4, 2)],
+  "mid-sequence failure must not stop later bounded upload batches",
+);
+assert.match(
+  scenario.ids["upload-status"].textContent,
+  /Uploaded 4 of 6 file\(s\); 2 failed/,
+  "mid-sequence failure must summarize prior successes and failed batch files",
+);
+assert.match(
+  renderedText(scenario.ids["upload-results"]),
+  /Failed dir\/file-2\.txt: batch two rejected/,
+  "failed batch files must be visible beside successful batches",
+);
+const finalDocumentRequest = scenario.documentBodies[scenario.documentBodies.length - 1];
+assert.strictEqual(
+  finalDocumentRequest.snapshot.id,
+  "snap3",
+  "document refresh must use the last successful upload snapshot after a later failure",
+);
+`)
+}
+
+func TestStaticWorkspaceUploadRequiresMetadataBounds(t *testing.T) {
+	runNodeUITest(t, `
+const scenario = await runScenario(
+  {documents: true, document: true, ingest: true},
+  [],
+  {meta: {max_upload_files: 0}},
+);
+scenario.ids["upload-files"].files = [{name: "guide.md", size: 1}];
+await scenario.ids.upload.onsubmit({preventDefault() {}});
+assert.strictEqual(scenario.uploadRequests.length, 0, "missing upload bounds must not send an unbounded request");
+assert.match(
+  scenario.ids["upload-status"].textContent,
+  /Upload bounds are unavailable from \/api\/v1\/meta/,
+  "missing upload bounds must error clearly",
+);
+`)
+}
+
 func TestStaticWorkspaceSourceLabelsCollapseHostPaths(t *testing.T) {
 	runNodeUITest(t, `
 const fileURI = "file:///C:/Dev/shoal-web/docs/explorer-demo-guide.md";
@@ -647,7 +897,7 @@ function makeDocument(capabilities, documents) {
     "query", "search", "search-button", "modes", "mode-vector", "mode-vector-control",
     "vector-mode-status", "evidence", "evidence-status", "evidence-results", "expand",
     "continue-expansion", "path-from", "path-to", "find-path", "graph-status",
-    "upload-section", "upload", "upload-drop", "upload-files", "upload-button",
+    "upload-section", "upload", "upload-drop", "upload-files", "upload-directory", "upload-button",
     "upload-status", "upload-results",
     "documents", "documents-status", "more", "graph-nodes", "graph-edges", "canvas",
     "selection", "hierarchy", "hierarchy-status", "snapshot", "identity", "identity-badge",
@@ -659,6 +909,7 @@ function makeDocument(capabilities, documents) {
   ids.search = new Element("form", "search");
   ids.upload = new Element("form", "upload");
   ids["upload-files"] = new Element("input", "upload-files");
+  ids["upload-directory"] = new Element("input", "upload-directory");
   ids["upload-button"] = new Element("button", "upload-button");
   ids["upload-drop"] = new Element("label", "upload-drop");
   ids["search-button"] = new Element("button", "search-button");
@@ -682,7 +933,8 @@ function makeDocument(capabilities, documents) {
 async function runScenario(capabilities, documents = [], scenarioOptions = {}) {
   const dom = makeDocument(capabilities, documents);
   let retrieveBody = null;
-  let uploadRequest = null;
+  const uploadRequests = [];
+  const documentBodies = [];
   let documentCalls = 0;
   const snapshot = {id: "snapshot123456", as_of: "2026-08-29T00:00:00Z", frontier: 1};
   const ctx = {
@@ -694,7 +946,13 @@ async function runScenario(capabilities, documents = [], scenarioOptions = {}) {
     crypto: require("crypto").webcrypto,
     TextEncoder,
     fetch: async (url, requestOptions = {}) => {
-      if (url === "/api/v1/meta") return response({capabilities});
+      if (url === "/api/v1/meta") return response({
+        max_upload_files: 8,
+        max_upload_file_bytes: 1048576,
+        max_upload_total_bytes: 9437184,
+        capabilities,
+        ...(scenarioOptions.meta || {}),
+      });
       if (url === "/api/v1/auth-config") {
         return response("authConfig" in scenarioOptions
           ? scenarioOptions.authConfig
@@ -719,6 +977,7 @@ async function runScenario(capabilities, documents = [], scenarioOptions = {}) {
         });
       }
       if (url.endsWith("/documents")) {
+        if (requestOptions.body) documentBodies.push(JSON.parse(requestOptions.body));
         const sequence = scenarioOptions.documentResponses || [documents];
         const docs = sequence[Math.min(documentCalls, sequence.length - 1)];
         const documentSnapshot = scenarioOptions.documentSnapshot || snapshot;
@@ -729,14 +988,18 @@ async function runScenario(capabilities, documents = [], scenarioOptions = {}) {
         });
       }
       if (url === "/api/v1/ingest") {
-        uploadRequest = {url, options: requestOptions};
-        if (scenarioOptions.ingestError) {
-          return response(scenarioOptions.ingestError.body, {
+        uploadRequests.push({url, options: requestOptions});
+        const index = uploadRequests.length - 1;
+        const errors = scenarioOptions.ingestErrors || [];
+        const error = errors[index] || scenarioOptions.ingestError;
+        if (error) {
+          return response(error.body, {
             ok: false,
-            statusText: scenarioOptions.ingestError.statusText,
+            statusText: error.statusText,
           });
         }
-        return response(scenarioOptions.ingestResponse);
+        const responses = scenarioOptions.ingestResponses || [];
+        return response(responses[index] || scenarioOptions.ingestResponse);
       }
       if (url.endsWith("/retrieve")) {
         retrieveBody = JSON.parse(requestOptions.body);
@@ -766,7 +1029,9 @@ async function runScenario(capabilities, documents = [], scenarioOptions = {}) {
   return {
     ctx, ids: dom.ids,
     get retrieveBody() { return retrieveBody; },
-    get uploadRequest() { return uploadRequest; },
+    get uploadRequest() { return uploadRequests[0] || null; },
+    get uploadRequests() { return uploadRequests; },
+    get documentBodies() { return documentBodies; },
   };
 }
 

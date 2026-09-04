@@ -544,7 +544,7 @@ function makeDocument() {
     "query", "search", "search-button", "modes", "mode-vector", "mode-vector-control",
     "vector-mode-status", "evidence", "evidence-status", "evidence-results", "expand",
     "continue-expansion", "path-from", "path-to", "find-path", "graph-status",
-    "upload-section", "upload", "upload-drop", "upload-files", "upload-button",
+    "upload-section", "upload", "upload-drop", "upload-files", "upload-directory", "upload-button",
     "upload-status", "upload-results", "documents", "documents-status", "more",
     "graph-nodes", "graph-edges", "canvas", "selection", "hierarchy",
     "hierarchy-status", "snapshot", "identity", "identity-badge", "ontology",
@@ -557,6 +557,7 @@ function makeDocument() {
   ids.search = new Element("form", "search");
   ids.upload = new Element("form", "upload");
   ids["upload-files"] = new Element("input", "upload-files");
+  ids["upload-directory"] = new Element("input", "upload-directory");
   ids["upload-button"] = new Element("button", "upload-button");
   ids["upload-drop"] = new Element("label", "upload-drop");
   ids["search-button"] = new Element("button", "search-button");
@@ -642,7 +643,12 @@ async function runOntologyScenario(ontology, options = {}) {
         if (!value) return response({code: "not_found", message: "not found"}, {ok: false, status: 404});
         return response({blast_radius: value});
       }
-      if (url === "/api/v1/meta") return response({capabilities: {documents: true}});
+      if (url === "/api/v1/meta") return response({
+        max_upload_files: 8,
+        max_upload_file_bytes: 1048576,
+        max_upload_total_bytes: 9437184,
+        capabilities: {documents: true},
+      });
       if (url.endsWith("/documents")) return response({snapshot, documents: [], next_cursor: ""});
       throw new Error("unexpected fetch " + url);
     },

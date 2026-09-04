@@ -1819,6 +1819,7 @@ function applyIngestCapability() {
   const canIngest = capability("ingest");
   $("upload-section").hidden = !canIngest;
   $("upload-files").disabled = !canIngest || uploadLoading;
+  $("upload-directory").disabled = !canIngest || uploadLoading;
   $("upload-button").disabled = !canIngest || uploadLoading;
   if (!canIngest) {
     $("upload-results").replaceChildren();
@@ -1977,31 +1978,213 @@ async function uploadFiles(fileList) {
   uploadLoading = true;
   applyIngestCapability();
   $("upload-results").replaceChildren();
-  setStatus($("upload-status"), `Uploading ${files.length} file(s)…`);
+  setStatus($("upload-status"), `Preparing ${files.length} file(s)…`);
   try {
-    const body = new FormData();
-    for (const file of files) body.append("files", file, file.name);
-    const response = await fetch("/api/v1/ingest", {
-      method: "POST",
-      headers: {"accept": "application/json", "x-shoal-workspace-request": "1", ...authHeaders()},
-      body,
-    });
-    const value = await response.json();
-    if (!response.ok) throw apiError(value, response);
-    clearSnapshotDependentViews();
-    pin(value.snapshot);
-    renderUploadResults(value.files || []);
-    await loadDocuments(true);
+    const plan = planUpload(files);
+    const results = [...plan.skipped];
+    let uploaded = 0;
+    let failed = 0;
+    const failureMessages = [];
+    let latestSnapshot = null;
+    for (let index = 0; index < plan.batches.length; index++) {
+      const batch = plan.batches[index];
+      setStatus(
+        $("upload-status"),
+        `Uploading batch ${index + 1} of ${plan.batches.length} (${batch.length} file(s))…`,
+      );
+      try {
+        const value = await uploadBatch(batch);
+        const uploadedFiles = value.files || [];
+        uploaded += uploadedFiles.length;
+        results.push(...uploadedFiles);
+        latestSnapshot = value.snapshot || latestSnapshot;
+      } catch (error) {
+        failed += batch.length;
+        failureMessages.push(error.message || String(error));
+        // This append is load-bearing; TestStaticWorkspaceUploadReportsMidBatchFailure pins
+        // that earlier successful batches remain visible when a later batch fails.
+        results.push(...batch.map((entry) => failedUploadResult(entry, error)));
+      }
+    }
+    if (uploaded > 0 || failed > 0) {
+      // This reset is load-bearing; TestStaticWorkspaceUploadReportsMidBatchFailure pins
+      // that document views refresh from upload state without discarding partial results.
+      clearSnapshotDependentViews();
+      if (latestSnapshot) {
+        // This pin is load-bearing; TestStaticWorkspaceUploadReportsMidBatchFailure pins
+        // that the document refresh uses the last successful upload snapshot.
+        pin(latestSnapshot);
+      } else {
+        clearPinnedSnapshot();
+      }
+      renderUploadResults(results, uploadSummary(files.length, uploaded, failed, plan.skipped.length, failureMessages));
+      await loadDocuments(true);
+    } else {
+      renderUploadResults(results, uploadSummary(files.length, uploaded, failed, plan.skipped.length, failureMessages));
+    }
   } catch (error) {
     showActionError($("upload-status"), error, "upload files");
-    clearSnapshotDependentViews();
-    clearPinnedSnapshot();
-    await loadDocuments(true);
   } finally {
     uploadLoading = false;
     applyIngestCapability();
     $("upload-files").value = "";
+    $("upload-directory").value = "";
   }
+}
+
+function planUpload(files) {
+  const bounds = uploadBounds();
+  const entries = uploadEntries(files);
+  const batches = [];
+  const skipped = [];
+  let batch = [];
+  let batchBytes = 0;
+  for (const entry of entries) {
+    if (entry.size > bounds.maxFileBytes) {
+      // This branch is load-bearing; TestStaticWorkspaceDirectoryUploadSkipsOversizedFiles
+      // pins that one oversized directory file is reported without aborting its siblings.
+      skipped.push(skippedUploadResult(entry, `exceeds the per-file limit of ${formatBytes(bounds.maxFileBytes)}`));
+      continue;
+    }
+    if (entry.size > bounds.maxTotalBytes) {
+      skipped.push(skippedUploadResult(entry, `exceeds the per-request limit of ${formatBytes(bounds.maxTotalBytes)}`));
+      continue;
+    }
+    if (batch.length > 0 &&
+      (batch.length >= bounds.maxFiles || batchBytes + entry.size > bounds.maxTotalBytes)) {
+      // This boundary is load-bearing; TestStaticWorkspaceDirectoryUploadBatchesAtServerLimit
+      // pins that MaxUploadFiles + 1 creates a second request instead of truncating.
+      batches.push(batch);
+      batch = [];
+      batchBytes = 0;
+    }
+    if (batch.length >= bounds.maxFiles || batchBytes + entry.size > bounds.maxTotalBytes) {
+      throw new Error("Upload bounds cannot fit a file into a request; no files were truncated.");
+    }
+    batch.push(entry);
+    batchBytes += entry.size;
+  }
+  if (batch.length > 0) batches.push(batch);
+  return {batches, skipped};
+}
+
+function uploadBounds() {
+  const maxFiles = Number(state.uploadLimits.max_upload_files) || 0;
+  const maxFileBytes = Number(state.uploadLimits.max_upload_file_bytes) || 0;
+  const maxTotalBytes = Number(state.uploadLimits.max_upload_total_bytes) || 0;
+  if (maxFiles <= 0 || maxFileBytes <= 0 || maxTotalBytes <= 0) {
+    // This error is load-bearing; TestStaticWorkspaceUploadRequiresMetadataBounds pins
+    // that missing /api/v1/meta bounds stop upload instead of silently truncating files.
+    throw new Error("Upload bounds are unavailable from /api/v1/meta; reload before uploading.");
+  }
+  return {maxFiles, maxFileBytes, maxTotalBytes};
+}
+
+function uploadEntries(files) {
+  const entries = files.map((file, index) => {
+    const sourcePath = uploadSourcePath(file, index);
+    return {
+      file,
+      index,
+      sourcePath,
+      // This name derivation is load-bearing; TestStaticWorkspaceDirectoryUploadRenamesSkillCollisions
+      // pins that repeated SKILL.md basenames from different directories reach the server uniquely.
+      uploadName: safeUploadName(sourcePath, index),
+      size: Math.max(0, Number(file.size) || 0),
+    };
+  });
+  // This sort is load-bearing; TestStaticWorkspaceDirectoryUploadRenamesSkillCollisions
+  // pins deterministic directory batch order independent of browser FileList order.
+  entries.sort((left, right) =>
+    left.sourcePath.localeCompare(right.sourcePath) || left.index - right.index);
+  const seen = new Map();
+  for (const entry of entries) {
+    const count = (seen.get(entry.uploadName) || 0) + 1;
+    seen.set(entry.uploadName, count);
+    if (count > 1) entry.uploadName = `${count}__${entry.uploadName}`;
+  }
+  return entries;
+}
+
+function uploadSourcePath(file, index) {
+  const relative = String((file && file.webkitRelativePath) || "").trim();
+  const name = String((file && file.name) || `upload-${index + 1}.txt`).trim();
+  return relative || name || `upload-${index + 1}.txt`;
+}
+
+function safeUploadName(sourcePath, index) {
+  const parts = String(sourcePath || "")
+    .split(/[\\/]+/)
+    .map(safeUploadSegment)
+    .filter(Boolean);
+  const name = parts.join("__") || `upload-${index + 1}.txt`;
+  return safeUploadSegment(name);
+}
+
+function safeUploadSegment(segment) {
+  let value = String(segment || "")
+    .trim()
+    .replace(/[\u0000-\u001f\u007f-\u009f\u00ad\u061c\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff<>:"|?*]/g, "_")
+    .replace(/\.\.+/g, "._")
+    .replace(/[. ]+$/g, "");
+  if (!value) value = "file";
+  if (/^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$/i.test(value)) {
+    value = `${value}_`;
+  }
+  return value;
+}
+
+async function uploadBatch(batch) {
+  const body = new FormData();
+  for (const entry of batch) body.append("files", entry.file, entry.uploadName);
+  const response = await fetch("/api/v1/ingest", {
+    method: "POST",
+    headers: {"accept": "application/json", "x-shoal-workspace-request": "1", ...authHeaders()},
+    body,
+  });
+  const value = await response.json();
+  if (!response.ok) throw apiError(value, response);
+  return value;
+}
+
+function skippedUploadResult(entry, reason) {
+  return {
+    name: entry.uploadName,
+    original_name: entry.sourcePath,
+    disposition: "skipped",
+    media_type: "",
+    span_count: 0,
+    message: `Skipped ${entry.sourcePath}: ${formatBytes(entry.size)} ${reason}.`,
+  };
+}
+
+function failedUploadResult(entry, error) {
+  return {
+    name: entry.uploadName,
+    original_name: entry.sourcePath,
+    disposition: "failed",
+    media_type: "",
+    span_count: 0,
+    message: `Failed ${entry.sourcePath}: ${error.message || String(error)}`,
+  };
+}
+
+function uploadSummary(total, uploaded, failed, skipped, failureMessages = []) {
+  if (failed > 0 || skipped > 0) {
+    const parts = [`Uploaded ${uploaded} of ${total} file(s)`];
+    if (failed > 0) parts.push(`${failed} failed`);
+    if (skipped > 0) parts.push(`${skipped} skipped`);
+    const detail = failureMessages.length > 0 ? `: ${failureMessages[0]}` : "";
+    return `${parts.join("; ")}${detail}.`;
+  }
+  return `Uploaded ${uploaded} file(s).`;
+}
+
+function formatBytes(bytes) {
+  const size = Number(bytes) || 0;
+  if (size >= 1024 * 1024) return `${(size / (1024 * 1024)).toFixed(1)} MiB`;
+  if (size >= 1024) return `${Math.ceil(size / 1024)} KiB`;
+  return `${size} B`;
 }
 
 function clearPinnedSnapshot() {
@@ -2033,34 +2216,63 @@ function clearSnapshotDependentViews() {
   draw();
 }
 
-function renderUploadResults(files) {
+function renderUploadResults(files, statusText = "") {
   const results = $("upload-results");
   results.replaceChildren();
   if (files.length === 0) {
     setStatus($("upload-status"), "No files were ingested.", "empty-state");
     return;
   }
-  setStatus($("upload-status"), `Uploaded ${files.length} file(s).`);
+  setStatus($("upload-status"), statusText || `Uploaded ${files.length} file(s).`);
   for (const file of files) {
     const item = document.createElement("li");
-    item.textContent = `${file.name}: ${file.disposition} (${file.media_type}, ` +
-      `${file.span_count} span(s))`;
+    const details = [];
+    if (file.media_type) details.push(file.media_type);
+    if (file.span_count !== undefined) details.push(`${file.span_count} span(s)`);
+    let text = `${file.name}: ${file.disposition}`;
+    if (details.length > 0) text += ` (${details.join(", ")})`;
+    if (file.original_name && file.original_name !== file.name) text += ` from ${file.original_name}`;
+    if (file.message) text += `. ${file.message}`;
+    // This rendering is load-bearing; TestStaticWorkspaceDirectoryUploadRenamesSkillCollisions
+    // pins that recognized agent skill metadata is visible per file.
+    if (file.skill_file) text += `. ${skillFileText(file.skill_file)}`;
+    item.textContent = text;
     results.append(item);
   }
 }
 
+function skillFileText(value) {
+  if (value.recognized) {
+    return `Agent skill file recognized: ${value.name} — ${value.description}`;
+  }
+  if (value.expected) {
+    return value.message || "Expected an agent skills file, but it was not recognized.";
+  }
+  return value.message || "Markdown skills metadata was inspected.";
+}
+
 $("upload").onsubmit = async (event) => {
   event.preventDefault();
-  await uploadFiles($("upload-files").files);
+  await uploadFiles(selectedUploadFiles());
 };
 
-$("upload-files").onchange = () => {
-  const count = $("upload-files").files ? $("upload-files").files.length : 0;
+function selectedUploadFiles() {
+  return [
+    ...($("upload-files").files || []),
+    ...($("upload-directory").files || []),
+  ];
+}
+
+function updateUploadReadyStatus() {
+  const count = selectedUploadFiles().length;
   setStatus(
     $("upload-status"),
     count ? `${count} file(s) ready to upload.` : uploadLimitText(),
   );
-};
+}
+
+$("upload-files").onchange = updateUploadReadyStatus;
+$("upload-directory").onchange = updateUploadReadyStatus;
 
 $("upload-drop").ondragover = (event) => {
   event.preventDefault();

@@ -670,11 +670,13 @@ func (r IngestResponse) MarshalJSON() ([]byte, error) {
 			Revision     wireRevision               `json:"revision"`
 			SectionCount int                        `json:"section_count"`
 			SpanCount    int                        `json:"span_count"`
+			SkillFile    *SkillFileResult           `json:"skill_file,omitempty"`
 		}{
 			Name: file.Name, MediaType: file.MediaType, Disposition: file.Disposition,
 			Document:     wireDocumentValue(file.Document),
 			Revision:     wireRevisionValue(file.Revision),
 			SectionCount: file.SectionCount, SpanCount: file.SpanCount,
+			SkillFile: file.SkillFile,
 		})
 	}
 	return json.Marshal(struct {
@@ -694,6 +696,7 @@ func (r *IngestResponse) UnmarshalJSON(data []byte) error {
 			Revision     wireRevision               `json:"revision"`
 			SectionCount int                        `json:"section_count"`
 			SpanCount    int                        `json:"span_count"`
+			SkillFile    *SkillFileResult           `json:"skill_file,omitempty"`
 		} `json:"files"`
 	}
 	if err := strictUnmarshal(data, &wire); err != nil {
@@ -713,6 +716,7 @@ func (r *IngestResponse) UnmarshalJSON(data []byte) error {
 			Name: item.Name, MediaType: item.MediaType, Disposition: item.Disposition,
 			Document: documentValue, Revision: revisionValue,
 			SectionCount: item.SectionCount, SpanCount: item.SpanCount,
+			SkillFile: item.SkillFile,
 		})
 	}
 	*r = IngestResponse{Snapshot: wire.Snapshot, Files: files}
