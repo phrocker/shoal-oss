@@ -210,12 +210,12 @@ const rendered = await runOntologyScenario({
       proposal_id: "proposal-1",
       active_version_id: "version-rich",
       proposed_version_id: "version-v2",
-      summary: {destructive_changes: 3, additive_changes: 1, counts_computed: false},
-      removed_concepts: [{concept: {id: "concept-case", key: "case_file", name: "Case file", properties: []}, impact: {computed: false}}],
-      removed_relationships: [{relationship: {id: "relationship-referenced", key: "referenced_in", name: "Referenced in"}, impact: {computed: false}}],
+      summary: {destructive_changes: 3, additive_changes: 1},
+      removed_concepts: [{id: "concept-case", key: "case_file", name: "Case file", properties: []}],
+      removed_relationships: [{id: "relationship-referenced", key: "referenced_in", name: "Referenced in"}],
       removed_properties: [],
       changed_concepts: [],
-      changed_relationships: [{before: {id: "relationship-member", key: "member_of", name: "Member of"}, after: {id: "relationship-member", key: "member_of", name: "Member of"}, fields: ["to_concepts"], impact: {computed: false}}],
+      changed_relationships: [{before: {id: "relationship-member", key: "member_of", name: "Member of"}, after: {id: "relationship-member", key: "member_of", name: "Member of"}, fields: ["to_concepts"]}],
       changed_properties: [],
       added_concepts: [{id: "concept-vessel", key: "vessel", name: "Vessel", properties: []}],
       added_relationships: [],
@@ -233,7 +233,7 @@ assert.match(text, /Changed relationships/);
 assert.match(text, /Member of \(member_of\) changed to_concepts/);
 assert.match(text, /Added concepts/);
 assert.match(text, /Vessel \(vessel\) added/);
-assert.match(text, /assertion impact counts not computed/);
+assert.doesNotMatch(text, /assertion impact counts/);
 assert.doesNotMatch(text, /0 asserted/);
 `)
 }

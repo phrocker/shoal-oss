@@ -852,26 +852,19 @@ function ontologyBlastRadiusPanel(proposal) {
   overview.textContent = `Blast radius: ${summary.destructive_changes || 0} destructive ` +
     `change(s), ${summary.additive_changes || 0} additive change(s).`;
   section.append(overview);
-  if (summary.counts_computed === false) {
-    const counts = document.createElement("p");
-    counts.className = "muted";
-    counts.textContent =
-      "Assertion impact counts are not computed for this workspace; no zero-impact claim is being made.";
-    section.append(counts);
-  }
   const groups = [
     ["Removed concepts", blast.removed_concepts || [], (item) =>
-      `${blastConceptName(item.concept)} removed; ${impactText(item.impact)}`],
+      `${blastConceptName(item)} removed`],
     ["Removed relationships", blast.removed_relationships || [], (item) =>
-      `${blastRelationName(item.relationship)} removed; ${impactText(item.impact)}`],
+      `${blastRelationName(item)} removed`],
     ["Removed properties", blast.removed_properties || [], (item) =>
-      `${blastPropertyName(item.property)} removed; ${impactText(item.impact)}`],
+      `${blastPropertyName(item)} removed`],
     ["Changed concepts", blast.changed_concepts || [], (item) =>
-      `${blastConceptName(item.before)} changed ${fieldList(item.fields)}; ${impactText(item.impact)}`],
+      `${blastConceptName(item.before)} changed ${fieldList(item.fields)}`],
     ["Changed relationships", blast.changed_relationships || [], (item) =>
-      `${blastRelationName(item.before)} changed ${fieldList(item.fields)}; ${impactText(item.impact)}`],
+      `${blastRelationName(item.before)} changed ${fieldList(item.fields)}`],
     ["Changed properties", blast.changed_properties || [], (item) =>
-      `${blastPropertyName(item.before)} changed ${fieldList(item.fields)}; ${impactText(item.impact)}`],
+      `${blastPropertyName(item.before)} changed ${fieldList(item.fields)}`],
     ["Added concepts", blast.added_concepts || [], (item) =>
       `${blastConceptName(item)} added`],
     ["Added relationships", blast.added_relationships || [], (item) =>
@@ -908,14 +901,6 @@ function blastRadiusGroup(title, values, render) {
   }
   details.append(summary, list);
   return details;
-}
-
-function impactText(impact) {
-  if (!impact || impact.computed !== true) {
-    return "assertion impact counts not computed";
-  }
-  return `${impact.asserted_count || 0} asserted assertion(s), ` +
-    `${impact.derived_count || 0} derived assertion(s) affected`;
 }
 
 function fieldList(fields) {

@@ -33,13 +33,6 @@ type OntologyProposalBlastRadiusProvider interface {
 	OntologyProposalBlastRadius(context.Context, shoal.ID) (OntologyBlastRadiusReport, error)
 }
 
-type ontologyAssertionImpactCounter interface {
-	OntologyAssertionImpactCounts(
-		context.Context,
-		[]shoal.ID,
-	) (map[shoal.ID]OntologyAssertionImpactProjection, error)
-}
-
 type OntologyBlastRadiusResponse struct {
 	BlastRadius OntologyBlastRadiusReport `json:"blast_radius"`
 }
@@ -50,9 +43,9 @@ type OntologyBlastRadiusReport struct {
 	BaseVersionID        string                             `json:"base_version_id,omitempty"`
 	ProposedVersionID    string                             `json:"proposed_version_id"`
 	Summary              OntologyBlastRadiusSummary         `json:"summary"`
-	RemovedConcepts      []OntologyConceptImpactProjection  `json:"removed_concepts"`
-	RemovedRelationships []OntologyRelationImpactProjection `json:"removed_relationships"`
-	RemovedProperties    []OntologyPropertyImpactProjection `json:"removed_properties"`
+	RemovedConcepts      []OntologyConceptProjection        `json:"removed_concepts"`
+	RemovedRelationships []OntologyRelationProjection       `json:"removed_relationships"`
+	RemovedProperties    []OntologyPropertyProjection       `json:"removed_properties"`
 	ChangedConcepts      []OntologyConceptChangeProjection  `json:"changed_concepts"`
 	ChangedRelationships []OntologyRelationChangeProjection `json:"changed_relationships"`
 	ChangedProperties    []OntologyPropertyChangeProjection `json:"changed_properties"`
@@ -74,7 +67,6 @@ type OntologyBlastRadiusSummary struct {
 	AddedProperties      uint32 `json:"added_properties"`
 	DestructiveChanges   uint32 `json:"destructive_changes"`
 	AdditiveChanges      uint32 `json:"additive_changes"`
-	CountsComputed       bool   `json:"counts_computed"`
 }
 
 type OntologyBlastRadiusLimits struct {
@@ -86,46 +78,22 @@ type OntologyBlastRadiusLimits struct {
 	MaxRelationshipEndpointSet uint32 `json:"max_relationship_endpoint_sets"`
 }
 
-type OntologyAssertionImpactProjection struct {
-	Computed      bool    `json:"computed"`
-	AssertedCount *uint64 `json:"asserted_count,omitempty"`
-	DerivedCount  *uint64 `json:"derived_count,omitempty"`
-}
-
-type OntologyConceptImpactProjection struct {
-	Concept OntologyConceptProjection         `json:"concept"`
-	Impact  OntologyAssertionImpactProjection `json:"impact"`
-}
-
-type OntologyRelationImpactProjection struct {
-	Relationship OntologyRelationProjection        `json:"relationship"`
-	Impact       OntologyAssertionImpactProjection `json:"impact"`
-}
-
-type OntologyPropertyImpactProjection struct {
-	Property OntologyPropertyProjection        `json:"property"`
-	Impact   OntologyAssertionImpactProjection `json:"impact"`
-}
-
 type OntologyConceptChangeProjection struct {
-	Before OntologyConceptProjection         `json:"before"`
-	After  OntologyConceptProjection         `json:"after"`
-	Fields []string                          `json:"fields"`
-	Impact OntologyAssertionImpactProjection `json:"impact"`
+	Before OntologyConceptProjection `json:"before"`
+	After  OntologyConceptProjection `json:"after"`
+	Fields []string                  `json:"fields"`
 }
 
 type OntologyRelationChangeProjection struct {
-	Before OntologyRelationProjection        `json:"before"`
-	After  OntologyRelationProjection        `json:"after"`
-	Fields []string                          `json:"fields"`
-	Impact OntologyAssertionImpactProjection `json:"impact"`
+	Before OntologyRelationProjection `json:"before"`
+	After  OntologyRelationProjection `json:"after"`
+	Fields []string                   `json:"fields"`
 }
 
 type OntologyPropertyChangeProjection struct {
-	Before OntologyPropertyProjection        `json:"before"`
-	After  OntologyPropertyProjection        `json:"after"`
-	Fields []string                          `json:"fields"`
-	Impact OntologyAssertionImpactProjection `json:"impact"`
+	Before OntologyPropertyProjection `json:"before"`
+	After  OntologyPropertyProjection `json:"after"`
+	Fields []string                   `json:"fields"`
 }
 
 func (s *EmbeddedService) OntologyProposalBlastRadius(
@@ -157,11 +125,7 @@ func (s *EmbeddedService) OntologyProposalBlastRadius(
 		if proposal.ID() != proposalID {
 			continue
 		}
-		counts, err := ontologyImpactCounts(ctx, s.client, active, proposal.ProposedVersion())
-		if err != nil {
-			return OntologyBlastRadiusReport{}, err
-		}
-		return computeOntologyBlastRadius(active, proposal, counts)
+		return computeOntologyBlastRadius(active, proposal)
 	}
 	return OntologyBlastRadiusReport{}, shoal.NewError(
 		shoal.ErrorNotFound, "ontology proposal not found")
@@ -184,24 +148,9 @@ func ontologyProposalBlastRadiusFor(
 	return OntologyBlastRadiusResponse{BlastRadius: report}, nil
 }
 
-func ontologyImpactCounts(
-	ctx context.Context,
-	client any,
-	active ontology.OntologyVersion,
-	proposed ontology.OntologyVersion,
-) (map[shoal.ID]OntologyAssertionImpactProjection, error) {
-	counter, ok := client.(ontologyAssertionImpactCounter)
-	if !ok {
-		return nil, nil
-	}
-	ids := changedOntologyElementIDs(active, proposed)
-	return counter.OntologyAssertionImpactCounts(ctx, ids)
-}
-
 func computeOntologyBlastRadius(
 	active ontology.OntologyVersion,
 	proposal ontology.GovernedProposal,
-	counts map[shoal.ID]OntologyAssertionImpactProjection,
 ) (OntologyBlastRadiusReport, error) {
 	if err := proposal.Validate(); err != nil {
 		return OntologyBlastRadiusReport{}, err
@@ -214,9 +163,9 @@ func computeOntologyBlastRadius(
 		ProposalID:           encodeID(proposal.ID()),
 		ActiveVersionID:      encodeID(active.ID()),
 		ProposedVersionID:    encodeID(proposed.ID()),
-		RemovedConcepts:      []OntologyConceptImpactProjection{},
-		RemovedRelationships: []OntologyRelationImpactProjection{},
-		RemovedProperties:    []OntologyPropertyImpactProjection{},
+		RemovedConcepts:      []OntologyConceptProjection{},
+		RemovedRelationships: []OntologyRelationProjection{},
+		RemovedProperties:    []OntologyPropertyProjection{},
 		ChangedConcepts:      []OntologyConceptChangeProjection{},
 		ChangedRelationships: []OntologyRelationChangeProjection{},
 		ChangedProperties:    []OntologyPropertyChangeProjection{},
@@ -242,9 +191,7 @@ func computeOntologyBlastRadius(
 			if err != nil {
 				return OntologyBlastRadiusReport{}, err
 			}
-			report.RemovedConcepts = append(report.RemovedConcepts, OntologyConceptImpactProjection{
-				Concept: projected, Impact: impactFor(counts, concept.ID()),
-			})
+			report.RemovedConcepts = append(report.RemovedConcepts, projected)
 			continue
 		}
 		fields := changedConceptFields(concept, after)
@@ -261,7 +208,6 @@ func computeOntologyBlastRadius(
 		}
 		report.ChangedConcepts = append(report.ChangedConcepts, OntologyConceptChangeProjection{
 			Before: beforeProjected, After: afterProjected, Fields: fields,
-			Impact: impactFor(counts, concept.ID()),
 		})
 	}
 	for _, relationship := range active.Relationships() {
@@ -273,9 +219,7 @@ func computeOntologyBlastRadius(
 			}
 			report.RemovedRelationships = append(
 				report.RemovedRelationships,
-				OntologyRelationImpactProjection{
-					Relationship: projected, Impact: impactFor(counts, relationship.ID()),
-				},
+				projected,
 			)
 			continue
 		}
@@ -293,7 +237,6 @@ func computeOntologyBlastRadius(
 		}
 		report.ChangedRelationships = append(report.ChangedRelationships, OntologyRelationChangeProjection{
 			Before: beforeProjected, After: afterProjected, Fields: fields,
-			Impact: impactFor(counts, relationship.ID()),
 		})
 	}
 	for _, property := range active.Properties() {
@@ -303,9 +246,7 @@ func computeOntologyBlastRadius(
 			if err != nil {
 				return OntologyBlastRadiusReport{}, err
 			}
-			report.RemovedProperties = append(report.RemovedProperties, OntologyPropertyImpactProjection{
-				Property: projected, Impact: impactFor(counts, property.ID()),
-			})
+			report.RemovedProperties = append(report.RemovedProperties, projected)
 			continue
 		}
 		fields := changedPropertyFields(property, after)
@@ -322,7 +263,6 @@ func computeOntologyBlastRadius(
 		}
 		report.ChangedProperties = append(report.ChangedProperties, OntologyPropertyChangeProjection{
 			Before: beforeProjected, After: afterProjected, Fields: fields,
-			Impact: impactFor(counts, property.ID()),
 		})
 	}
 	for _, concept := range proposed.Concepts() {
@@ -394,39 +334,10 @@ func propertiesByID(version ontology.OntologyVersion) map[shoal.ID]ontology.Prop
 	return result
 }
 
-func changedOntologyElementIDs(
-	active ontology.OntologyVersion,
-	proposed ontology.OntologyVersion,
-) []shoal.ID {
-	ids := []shoal.ID{}
-	proposedConcepts := conceptsByID(proposed)
-	proposedRelationships := relationshipsByID(proposed)
-	proposedProperties := propertiesByID(proposed)
-	for _, concept := range active.Concepts() {
-		after, exists := proposedConcepts[concept.ID()]
-		if !exists || len(changedConceptFields(concept, after)) > 0 {
-			ids = append(ids, concept.ID())
-		}
-	}
-	for _, relationship := range active.Relationships() {
-		after, exists := proposedRelationships[relationship.ID()]
-		if !exists || len(changedRelationshipFields(relationship, after)) > 0 {
-			ids = append(ids, relationship.ID())
-		}
-	}
-	for _, property := range active.Properties() {
-		after, exists := proposedProperties[property.ID()]
-		if !exists || len(changedPropertyFields(property, after)) > 0 {
-			ids = append(ids, property.ID())
-		}
-	}
-	return ids
-}
-
 func changedConceptFields(
 	before, after ontology.ConceptDefinition,
 ) []string {
-	// This property-set comparison is load-bearing; TestOntologyProposalBlastRadiusReportsStructuralDiffAndUnknownCounts
+	// This property-set comparison is load-bearing; TestOntologyProposalBlastRadiusReportsStructuralDiffWithoutDecorativeCounts
 	// pins that narrowing a concept's declared properties is reported before
 	// governance transitions can publish it.
 	if reflect.DeepEqual(before.Properties(), after.Properties()) {
@@ -442,7 +353,7 @@ func changedRelationshipFields(
 	if !reflect.DeepEqual(before.FromConcepts(), after.FromConcepts()) {
 		fields = append(fields, "from_concepts")
 	}
-	// This endpoint-set comparison is load-bearing; TestOntologyProposalBlastRadiusReportsStructuralDiffAndUnknownCounts
+	// This endpoint-set comparison is load-bearing; TestOntologyProposalBlastRadiusReportsStructuralDiffWithoutDecorativeCounts
 	// pins that changing a relationship's target concepts is reported because
 	// narrowed joins can orphan existing relationship assertions.
 	if !reflect.DeepEqual(before.ToConcepts(), after.ToConcepts()) {
@@ -461,7 +372,7 @@ func changedPropertyFields(
 	before, after ontology.PropertyDefinition,
 ) []string {
 	fields := []string{}
-	// This value-type comparison is load-bearing; TestOntologyProposalBlastRadiusReportsStructuralDiffAndUnknownCounts
+	// This value-type comparison is load-bearing; TestOntologyProposalBlastRadiusReportsStructuralDiffWithoutDecorativeCounts
 	// pins that property type changes are reported because stored values may no
 	// longer validate under the proposed ontology.
 	if before.ValueType() != after.ValueType() {
@@ -519,19 +430,6 @@ func projectPropertyDefinition(
 	}, nil
 }
 
-func impactFor(
-	counts map[shoal.ID]OntologyAssertionImpactProjection,
-	id shoal.ID,
-) OntologyAssertionImpactProjection {
-	if impact, ok := counts[id]; ok {
-		return impact
-	}
-	// This explicit false is load-bearing; TestOntologyProposalBlastRadiusReportsStructuralDiffAndUnknownCounts
-	// pins that missing corpus counts render as "not computed" instead of a
-	// misleading zero asserted/derived impact.
-	return OntologyAssertionImpactProjection{Computed: false}
-}
-
 func ontologyBlastRadiusSummary(
 	report OntologyBlastRadiusReport,
 ) OntologyBlastRadiusSummary {
@@ -552,42 +450,7 @@ func ontologyBlastRadiusSummary(
 		summary.ChangedProperties
 	summary.AdditiveChanges = summary.AddedConcepts +
 		summary.AddedRelationships + summary.AddedProperties
-	summary.CountsComputed = allImpactCountsComputed(report)
 	return summary
-}
-
-func allImpactCountsComputed(report OntologyBlastRadiusReport) bool {
-	for _, item := range report.RemovedConcepts {
-		if !item.Impact.Computed {
-			return false
-		}
-	}
-	for _, item := range report.RemovedRelationships {
-		if !item.Impact.Computed {
-			return false
-		}
-	}
-	for _, item := range report.RemovedProperties {
-		if !item.Impact.Computed {
-			return false
-		}
-	}
-	for _, item := range report.ChangedConcepts {
-		if !item.Impact.Computed {
-			return false
-		}
-	}
-	for _, item := range report.ChangedRelationships {
-		if !item.Impact.Computed {
-			return false
-		}
-	}
-	for _, item := range report.ChangedProperties {
-		if !item.Impact.Computed {
-			return false
-		}
-	}
-	return true
 }
 
 func enforceOntologyBlastRadiusBounds(report OntologyBlastRadiusReport) error {

@@ -350,7 +350,7 @@ func TestOntologyProposalPublishUpdatesActiveOntology(t *testing.T) {
 	}
 }
 
-func TestOntologyProposalBlastRadiusReportsStructuralDiffAndUnknownCounts(t *testing.T) {
+func TestOntologyProposalBlastRadiusReportsStructuralDiffWithoutDecorativeCounts(t *testing.T) {
 	corpus, err := explorer.Open(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -363,42 +363,35 @@ func TestOntologyProposalBlastRadiusReportsStructuralDiffAndUnknownCounts(t *tes
 	report, encoded := getOntologyProposalBlastRadius(t, server, created.ID)
 	if report.ProposalID != created.ID ||
 		report.Summary.DestructiveChanges != 6 ||
-		report.Summary.AdditiveChanges != 3 ||
-		report.Summary.CountsComputed {
+		report.Summary.AdditiveChanges != 3 {
 		t.Fatalf("blast radius summary = %+v for proposal %q", report.Summary, report.ProposalID)
 	}
 	if bytes.Contains(encoded, []byte("asserted_count")) ||
-		bytes.Contains(encoded, []byte("derived_count")) {
-		t.Fatalf("not-computed impact counts emitted false zeros: %s", encoded)
+		bytes.Contains(encoded, []byte("derived_count")) ||
+		bytes.Contains(encoded, []byte(`"impact"`)) ||
+		bytes.Contains(encoded, []byte("counts_computed")) {
+		t.Fatalf("blast radius emitted unimplemented assertion counts: %s", encoded)
 	}
-	if got := conceptImpactByKey(report.RemovedConcepts, "case_file"); got == nil ||
-		got.Impact.Computed ||
-		got.Impact.AssertedCount != nil ||
-		got.Impact.DerivedCount != nil {
-		t.Fatalf("removed case_file impact = %+v, want explicit not computed", got)
+	if got := conceptByKey(report.RemovedConcepts, "case_file"); got == nil {
+		t.Fatalf("removed case_file = %+v, want structural removal", report.RemovedConcepts)
 	}
-	if got := relationImpactByKey(report.RemovedRelationships, "referenced_in"); got == nil ||
-		got.Impact.Computed {
-		t.Fatalf("removed referenced_in impact = %+v, want explicit not computed", got)
+	if got := relationByKey(report.RemovedRelationships, "referenced_in"); got == nil {
+		t.Fatalf("removed referenced_in = %+v, want structural removal", report.RemovedRelationships)
 	}
-	if got := propertyImpactByKey(report.RemovedProperties, "role"); got == nil ||
-		got.Impact.Computed {
-		t.Fatalf("removed role impact = %+v, want explicit not computed", got)
+	if got := propertyByKey(report.RemovedProperties, "role"); got == nil {
+		t.Fatalf("removed role = %+v, want structural removal", report.RemovedProperties)
 	}
 	if got := conceptChangeByKey(report.ChangedConcepts, "person"); got == nil ||
-		!equalStrings(got.Fields, []string{"properties"}) ||
-		got.Impact.Computed {
-		t.Fatalf("changed person = %+v, want property-set change with unknown impact", got)
+		!equalStrings(got.Fields, []string{"properties"}) {
+		t.Fatalf("changed person = %+v, want property-set change", got)
 	}
 	if got := relationChangeByKey(report.ChangedRelationships, "member_of"); got == nil ||
-		!equalStrings(got.Fields, []string{"to_concepts", "directed", "properties"}) ||
-		got.Impact.Computed {
+		!equalStrings(got.Fields, []string{"to_concepts", "directed", "properties"}) {
 		t.Fatalf("changed member_of = %+v, want endpoint/direction/property change", got)
 	}
 	if got := propertyChangeByKey(report.ChangedProperties, "name"); got == nil ||
-		!equalStrings(got.Fields, []string{"value_type"}) ||
-		got.Impact.Computed {
-		t.Fatalf("changed name = %+v, want value-type change with unknown impact", got)
+		!equalStrings(got.Fields, []string{"value_type"}) {
+		t.Fatalf("changed name = %+v, want value-type change", got)
 	}
 	if conceptByKey(report.AddedConcepts, "vessel") == nil ||
 		relationByKey(report.AddedRelationships, "port_call") == nil ||
@@ -823,42 +816,6 @@ func assertionUnderOntology(
 		t.Fatal(err)
 	}
 	return assertion
-}
-
-func conceptImpactByKey(
-	values []webapi.OntologyConceptImpactProjection,
-	key string,
-) *webapi.OntologyConceptImpactProjection {
-	for index := range values {
-		if values[index].Concept.Key == key {
-			return &values[index]
-		}
-	}
-	return nil
-}
-
-func relationImpactByKey(
-	values []webapi.OntologyRelationImpactProjection,
-	key string,
-) *webapi.OntologyRelationImpactProjection {
-	for index := range values {
-		if values[index].Relationship.Key == key {
-			return &values[index]
-		}
-	}
-	return nil
-}
-
-func propertyImpactByKey(
-	values []webapi.OntologyPropertyImpactProjection,
-	key string,
-) *webapi.OntologyPropertyImpactProjection {
-	for index := range values {
-		if values[index].Property.Key == key {
-			return &values[index]
-		}
-	}
-	return nil
 }
 
 func conceptChangeByKey(

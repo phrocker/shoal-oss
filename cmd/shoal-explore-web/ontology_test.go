@@ -193,8 +193,8 @@ func TestOntologyProposalBlastRadiusUsesStartedEmbeddedWorkspace(t *testing.T) {
 		t.Fatalf("started workspace blast radius did not report removed relationship: %s", body)
 	}
 	summary, _ := blast["summary"].(map[string]any)
-	if summary["counts_computed"] != false {
-		t.Fatalf("started workspace blast radius counts = %v, want not computed", summary)
+	if _, exists := summary["counts_computed"]; exists {
+		t.Fatalf("started workspace blast radius exposed unimplemented counts: %v", summary)
 	}
 
 	cancel()
