@@ -156,6 +156,9 @@ type wireOntologyValue struct {
 
 type wireEvidenceRef struct {
 	ID         string                   `json:"id"`
+	Citation   *wireCitation            `json:"citation,omitempty"`
+	Quote      string                   `json:"quote,omitempty"`
+	Path       *wirePath                `json:"path,omitempty"`
 	Derivation *wireAssertionDerivation `json:"derivation,omitempty"`
 	Metadata   wireMetadata             `json:"metadata,omitempty"`
 }
@@ -1020,9 +1023,20 @@ func wireEvidenceRefValue(value ontology.EvidenceRef) wireEvidenceRef {
 		wire := wireAssertionDerivationValue(got)
 		derivation = &wire
 	}
+	var citation *wireCitation
+	var path *wirePath
+	if derivation == nil {
+		wire := wireCitationValue(value.Citation())
+		citation = &wire
+		if got, ok := value.Path(); ok {
+			wirePath := wirePathValue(got)
+			path = &wirePath
+		}
+	}
 	return wireEvidenceRef{
-		ID: encodeID(value.ID()), Derivation: derivation,
-		Metadata: wireMetadataValue(value.Metadata()),
+		ID: encodeID(value.ID()), Citation: citation, Quote: value.Quote(), Path: path,
+		Derivation: derivation,
+		Metadata:   wireMetadataValue(value.Metadata()),
 	}
 }
 
@@ -1363,20 +1377,40 @@ func ontologyValue(value wireOntologyValue) (ontology.Value, error) {
 }
 
 func evidenceRefValue(value wireEvidenceRef) (ontology.EvidenceRef, error) {
-	if value.Derivation == nil {
-		return ontology.EvidenceRef{}, fmt.Errorf("derivation is required")
-	}
-	derivation, err := assertionDerivationValue(*value.Derivation)
-	if err != nil {
-		return ontology.EvidenceRef{}, fmt.Errorf("derivation: %w", err)
-	}
 	metadata, err := metadataValue(value.Metadata)
 	if err != nil {
 		return ontology.EvidenceRef{}, fmt.Errorf("metadata: %w", err)
 	}
-	ref, err := ontology.NewDerivationEvidenceRef(derivation, metadata)
-	if err != nil {
-		return ontology.EvidenceRef{}, err
+	var ref ontology.EvidenceRef
+	if value.Derivation != nil {
+		derivation, err := assertionDerivationValue(*value.Derivation)
+		if err != nil {
+			return ontology.EvidenceRef{}, fmt.Errorf("derivation: %w", err)
+		}
+		ref, err = ontology.NewDerivationEvidenceRef(derivation, metadata)
+		if err != nil {
+			return ontology.EvidenceRef{}, err
+		}
+	} else {
+		if value.Citation == nil {
+			return ontology.EvidenceRef{}, fmt.Errorf("citation is required")
+		}
+		citation, err := citationValue(*value.Citation)
+		if err != nil {
+			return ontology.EvidenceRef{}, fmt.Errorf("citation: %w", err)
+		}
+		var options []ontology.EvidenceOption
+		if value.Path != nil {
+			path, err := pathValue(*value.Path)
+			if err != nil {
+				return ontology.EvidenceRef{}, fmt.Errorf("path: %w", err)
+			}
+			options = append(options, ontology.WithEvidencePath(path))
+		}
+		ref, err = ontology.NewEvidenceRef(citation, value.Quote, metadata, options...)
+		if err != nil {
+			return ontology.EvidenceRef{}, err
+		}
 	}
 	id, err := decodeID(value.ID)
 	if err != nil {

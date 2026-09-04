@@ -708,7 +708,7 @@ var (
 		"AcquireMutation": {}, "CompareAndSwapSourceClaim": {},
 		"CommitSourceClaim": {}, "PendSourceClaim": {}, "RollbackSourceClaim": {},
 		"PutRevision": {}, "ReserveEdge": {}, "RollbackEdgeReservation": {},
-		"PutEdge": {},
+		"PutEdge": {}, "PutNode": {},
 	}
 )
 

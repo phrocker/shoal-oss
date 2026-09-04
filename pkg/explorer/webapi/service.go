@@ -52,6 +52,10 @@ type IngestProvider interface {
 	Ingest(context.Context, IngestRequest) (IngestResponse, error)
 }
 
+type ExtractionProvider interface {
+	Extract(context.Context, ExtractRequest) (ExtractResponse, error)
+}
+
 // ChangeProvider is an optional service extension for the resumable document
 // change feed. Services that cannot serve an ordered feed do not implement it,
 // and the transport fails closed with an unavailable error.
@@ -125,6 +129,14 @@ func NewEmbeddedService(client explorer.BoundedClient) (*EmbeddedService, error)
 func (s *EmbeddedService) Capabilities(ctx context.Context) (Capabilities, error) {
 	capabilities := AllCapabilities()
 	capabilities.Vector = false
+	if _, ok := s.client.(interface {
+		ExtractDocument(
+			context.Context,
+			explorer.ExtractionRequest,
+		) (explorer.ExtractionResult, error)
+	}); !ok {
+		capabilities.Extraction = false
+	}
 	provider, ok := s.client.(vectorAvailabilityProvider)
 	if !ok {
 		return capabilities, nil
@@ -135,6 +147,54 @@ func (s *EmbeddedService) Capabilities(ctx context.Context) (Capabilities, error
 	}
 	capabilities.Vector = available
 	return capabilities, nil
+}
+
+func (s *EmbeddedService) Extract(
+	ctx context.Context,
+	request ExtractRequest,
+) (ExtractResponse, error) {
+	if _, err := s.pin(ctx, request.Snapshot); err != nil {
+		return ExtractResponse{}, err
+	}
+	version, configured, err := s.ActiveOntology(ctx)
+	if err != nil {
+		return ExtractResponse{}, err
+	}
+	if !configured {
+		return ExtractResponse{}, shoal.NewError(
+			shoal.ErrorInvalidArgument, "an active ontology is required for extraction")
+	}
+	backend, ok := s.client.(interface {
+		ExtractDocument(
+			context.Context,
+			explorer.ExtractionRequest,
+		) (explorer.ExtractionResult, error)
+	})
+	if !ok {
+		return ExtractResponse{}, shoal.NewError(
+			shoal.ErrorUnavailable, "workspace capability \"extraction\" is unavailable")
+	}
+	result, err := backend.ExtractDocument(ctx, explorer.ExtractionRequest{
+		DocumentID: request.DocumentID, RevisionID: request.RevisionID,
+		Version: version, Instructions: request.Instructions,
+	})
+	if err != nil {
+		return ExtractResponse{}, err
+	}
+	responseSnapshot := fromExplorerSnapshot(result.Snapshot)
+	if err := s.confirmSnapshot(ctx, responseSnapshot); err != nil {
+		return ExtractResponse{}, err
+	}
+	return ExtractResponse{
+		Snapshot:   responseSnapshot,
+		DocumentID: result.DocumentID, RevisionID: result.RevisionID,
+		ExtractionID: result.ExtractionID, EntityCount: result.EntityCount,
+		RelationCount: result.RelationCount, GraphNodeCount: result.GraphNodeCount,
+		GraphEdgeCount: result.GraphEdgeCount, CreatedEntities: result.CreatedEntities,
+		ReusedEntities:      result.ReusedEntities,
+		EntityNodeIDs:       append([]shoal.ID(nil), result.EntityNodeIDs...),
+		RelationshipEdgeIDs: append([]shoal.ID(nil), result.RelationshipEdgeIDs...),
+	}, nil
 }
 
 func (s *EmbeddedService) Documents(

@@ -376,6 +376,11 @@ func (c *Client) canonicalRegisteredNodes(
 	}
 	nodes := make(map[shoal.ID]graph.Node, len(registrations))
 	for nodeID, registration := range registrations {
+		if registration.Node.ID != "" {
+			// This registered-node branch is load-bearing; TestExtractDocumentAuthorizationControlsDerivedGraph pins neighborhood filtering for extracted nodes outside document-section canonical nodes.
+			nodes[nodeID] = cloneGraphNode(registration.Node)
+			continue
+		}
 		canonical := canonicalDocuments[registration.DocumentID]
 		node, ok := canonical.nodes[nodeID]
 		if !ok {

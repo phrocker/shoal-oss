@@ -48,6 +48,7 @@ type Explorer struct {
 	edges                   map[shoal.ID]persistedEdge
 	interactions            map[shoal.ID]*persistedInteraction
 	folds                   map[shoal.ID]*persistedFold
+	extractions             map[shoal.ID]*persistedExtraction
 	ontologyProposals       map[shoal.ID]*persistedOntologyProposal
 	graphNodes              map[shoal.ID]graph.Node
 	graphEdges              map[shoal.ID]graph.Edge
@@ -198,6 +199,7 @@ func OpenWithOptions(dir string, options Options) (*Explorer, error) {
 		edges:                   make(map[shoal.ID]persistedEdge),
 		interactions:            make(map[shoal.ID]*persistedInteraction),
 		folds:                   make(map[shoal.ID]*persistedFold),
+		extractions:             make(map[shoal.ID]*persistedExtraction),
 		ontologyProposals:       make(map[shoal.ID]*persistedOntologyProposal),
 		embedder:                options.Embedder,
 		embedders:               embedders,
@@ -703,6 +705,52 @@ func (e *Explorer) computeCurrentGraph() (
 		}
 		edges[id] = edge
 	}
+	extractionIDs := make([]shoal.ID, 0, len(e.extractions))
+	for id := range e.extractions {
+		extractionIDs = append(extractionIDs, id)
+	}
+	sort.Slice(extractionIDs, func(i, j int) bool {
+		return shoal.CompareID(extractionIDs[i], extractionIDs[j]) < 0
+	})
+	for _, id := range extractionIDs {
+		record := e.extractions[id]
+		if record == nil {
+			continue
+		}
+		if _, ok := nodes[record.DocumentID]; !ok {
+			continue
+		}
+		for _, node := range record.Nodes {
+			if existing, exists := nodes[node.ID]; exists && !nodesEqual(existing, node) {
+				continue
+			}
+			nodes[node.ID] = node
+		}
+		for _, edge := range record.Edges {
+			if _, from := nodes[edge.From]; !from {
+				continue
+			}
+			if _, to := nodes[edge.To]; !to {
+				continue
+			}
+			if existing, exists := edges[edge.ID]; exists && !edgesEqual(existing, edge) {
+				return nil, nil, nil, shoal.NewError(
+					shoal.ErrorConflict,
+					"extraction edge ID already has different content",
+				)
+			}
+			edges[edge.ID] = edge
+		}
+		for _, persisted := range record.Assertions {
+			assertion, err := restoreAssertion(persisted)
+			if err != nil {
+				return nil, nil, nil, err
+			}
+			if _, ok := edges[persisted.EdgeID]; ok {
+				assertions[persisted.EdgeID] = assertion
+			}
+		}
+	}
 	// Interaction nodes share the corpus graph but are excluded from
 	// retrieval and from expansion that did not explicitly seed them. An
 	// interaction edge whose source endpoint disappeared (a superseded
@@ -928,6 +976,25 @@ func edgesEqual(left, right graph.Edge) bool {
 		left.Type != right.Type || left.Weight != right.Weight ||
 		len(left.Properties) != len(right.Properties) {
 		return false
+	}
+	for key, value := range left.Properties {
+		if right.Properties[key] != value {
+			return false
+		}
+	}
+	return true
+}
+
+func nodesEqual(left, right graph.Node) bool {
+	if left.ID != right.ID || left.Kind != right.Kind ||
+		len(left.Labels) != len(right.Labels) ||
+		len(left.Properties) != len(right.Properties) {
+		return false
+	}
+	for index := range left.Labels {
+		if left.Labels[index] != right.Labels[index] {
+			return false
+		}
 	}
 	for key, value := range left.Properties {
 		if right.Properties[key] != value {

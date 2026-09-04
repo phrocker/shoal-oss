@@ -75,6 +75,7 @@ const (
 	policyRowCurrent       = "current/"
 	policyRowEdge          = "edge/"
 	policyRowEdgeClaim     = "edgeclaim/"
+	policyRowNode          = "node/"
 	policyRowSourceVersion = "meta/source-version"
 
 	// The policy envelope is deliberately separate from the Explorer document
@@ -90,6 +91,7 @@ const (
 	policyKindEdge          = byte(4)
 	policyKindEdgeClaim     = byte(5)
 	policyKindSourceVersion = byte(6)
+	policyKindNode          = byte(7)
 
 	policyEnvelopeHeader = 8 + 1 + 1 + 8 + sha256.Size
 	maxPolicyRecordBytes = uint64(64 << 20)
@@ -142,6 +144,22 @@ type persistedEdge struct {
 	DocumentID string
 	RevisionID string
 	Rule       persistedRule
+}
+
+type persistedNode struct {
+	Seq        uint64
+	NodeID     string
+	DocumentID string
+	RevisionID string
+	Node       persistedGraphNode
+	Rule       persistedRule
+}
+
+type persistedGraphNode struct {
+	ID         string
+	Kind       string
+	Labels     []string
+	Properties map[string]string
 }
 
 type persistedSourceVersion struct {
@@ -215,6 +233,7 @@ func (s *DurablePolicyStore) load() error {
 	currents := make(map[string]persistedCurrent)
 	edges := make(map[string]persistedEdge)
 	edgeClaims := make(map[string]persistedEdge)
+	nodes := make(map[string]persistedNode)
 	var (
 		versionRecord persistedSourceVersion
 		haveVersion   bool
@@ -302,6 +321,17 @@ func (s *DurablePolicyStore) load() error {
 				edges[rowStr] = record
 			}
 			maxSeq = maxUint64(maxSeq, record.Seq)
+		case bytes.HasPrefix(row, []byte(policyRowNode)):
+			var record persistedNode
+			if err := decodePolicyRecord(
+				value, policyKindNode, &record,
+			); err != nil {
+				return corruptPolicyRecord("node", err)
+			}
+			if prev, ok := nodes[rowStr]; !ok || record.Seq >= prev.Seq {
+				nodes[rowStr] = record
+			}
+			maxSeq = maxUint64(maxSeq, record.Seq)
 		}
 		if err := scanner.Advance(); err != nil {
 			return shoal.WrapError(shoal.ErrorInternal, "advance policy scan", err)
@@ -309,7 +339,7 @@ func (s *DurablePolicyStore) load() error {
 	}
 
 	if err := s.reconstruct(
-		sourceClaims, revisions, currents, edges, edgeClaims,
+		sourceClaims, revisions, currents, edges, edgeClaims, nodes,
 		versionRecord, haveVersion,
 	); err != nil {
 		return err
@@ -329,6 +359,7 @@ func (s *DurablePolicyStore) reconstruct(
 	currents map[string]persistedCurrent,
 	edges map[string]persistedEdge,
 	edgeClaims map[string]persistedEdge,
+	nodes map[string]persistedNode,
 	versionRecord persistedSourceVersion,
 	haveVersion bool,
 ) error {
@@ -433,6 +464,13 @@ func (s *DurablePolicyStore) reconstruct(
 			return corruptPolicyRecord("edge reservation", err)
 		}
 		memory.edgeClaims[registration.Edge.ID] = registration
+	}
+	for _, record := range nodes {
+		registration, err := nodeRegistrationFromPersisted(record)
+		if err != nil {
+			return corruptPolicyRecord("node", err)
+		}
+		memory.nodes[shoal.ID(record.NodeID)] = registration
 	}
 	return nil
 }
@@ -545,6 +583,24 @@ func (s *DurablePolicyStore) PutRevision(
 		return err
 	}
 	return s.persistRevision(registration.DocumentID, registration.RevisionID)
+}
+
+// PutNode registers an extracted graph node in memory and persists the node
+// registration.
+func (s *DurablePolicyStore) PutNode(
+	ctx context.Context,
+	nodeID shoal.ID,
+	registration NodeRegistration,
+) error {
+	if s == nil {
+		return (*MemoryPolicyStore)(nil).PutNode(ctx, nodeID, registration)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.memory.PutNode(ctx, nodeID, registration); err != nil {
+		return err
+	}
+	return s.persistNode(nodeID)
 }
 
 // Revision is a pure read delegated to the memory store.
@@ -751,6 +807,26 @@ func (s *DurablePolicyStore) persistRevision(
 		policyCurrentRow(documentID), policyKindCurrent, current)
 }
 
+func (s *DurablePolicyStore) persistNode(nodeID shoal.ID) error {
+	registration, ok := s.memory.snapshotNode(nodeID)
+	if !ok {
+		return catalogUnavailable()
+	}
+	rule, err := ruleToPersisted(registration.Rule)
+	if err != nil {
+		return catalogUnavailable()
+	}
+	record := persistedNode{
+		Seq:        s.nextSeq(),
+		NodeID:     string(nodeID),
+		DocumentID: string(registration.DocumentID),
+		RevisionID: string(registration.RevisionID),
+		Node:       graphNodeToPersisted(registration.Node),
+		Rule:       rule,
+	}
+	return s.writeRow(policyNodeRow(nodeID), policyKindNode, record)
+}
+
 func (s *DurablePolicyStore) persistApplicationEdge(edgeID shoal.ID) error {
 	registration, ok := s.memory.snapshotApplicationEdge(edgeID)
 	if !ok {
@@ -844,6 +920,22 @@ func (s *MemoryPolicyStore) snapshotCurrent(
 		return "", false
 	}
 	return key.revisionID, true
+}
+
+func (s *MemoryPolicyStore) snapshotNode(
+	nodeID shoal.ID,
+) (NodeRegistration, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	registration, ok := s.nodes[nodeID]
+	if !ok {
+		return NodeRegistration{}, false
+	}
+	cloned, err := cloneNodeRegistration(registration)
+	if err != nil {
+		return NodeRegistration{}, false
+	}
+	return cloned, true
 }
 
 func (s *MemoryPolicyStore) snapshotApplicationEdge(
@@ -1023,6 +1115,39 @@ func edgeRegistrationFromPersisted(
 	}, nil
 }
 
+func nodeRegistrationFromPersisted(
+	record persistedNode,
+) (NodeRegistration, error) {
+	rule, err := ruleFromPersisted(record.Rule)
+	if err != nil {
+		return NodeRegistration{}, err
+	}
+	return normalizeNodeRegistration(shoal.ID(record.NodeID), NodeRegistration{
+		DocumentID: shoal.ID(record.DocumentID),
+		RevisionID: shoal.ID(record.RevisionID),
+		Node:       graphNodeFromPersisted(record.Node),
+		Rule:       rule,
+	})
+}
+
+func graphNodeToPersisted(node graph.Node) persistedGraphNode {
+	return persistedGraphNode{
+		ID:         string(node.ID),
+		Kind:       node.Kind,
+		Labels:     append([]string(nil), node.Labels...),
+		Properties: cloneStringMap(node.Properties),
+	}
+}
+
+func graphNodeFromPersisted(record persistedGraphNode) graph.Node {
+	return graph.Node{
+		ID:         shoal.ID(record.ID),
+		Kind:       record.Kind,
+		Labels:     append([]string(nil), record.Labels...),
+		Properties: shoal.Metadata(cloneStringMap(record.Properties)),
+	}
+}
+
 func graphEdgeToPersisted(edge graph.Edge) persistedGraphEdge {
 	return persistedGraphEdge{
 		ID:         string(edge.ID),
@@ -1127,6 +1252,10 @@ func policyRevisionRow(key revisionKey) []byte {
 
 func policyCurrentRow(documentID shoal.ID) []byte {
 	return append([]byte(policyRowCurrent), string(documentID)...)
+}
+
+func policyNodeRow(nodeID shoal.ID) []byte {
+	return append([]byte(policyRowNode), string(nodeID)...)
 }
 
 func policyEdgeRow(edgeID shoal.ID) []byte {

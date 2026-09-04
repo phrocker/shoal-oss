@@ -65,6 +65,7 @@ const (
 	CapabilityNeighborhood Capability = "neighborhood"
 	CapabilityPath         Capability = "path"
 	CapabilityIngest       Capability = "ingest"
+	CapabilityExtraction   Capability = "extraction"
 )
 
 // Capabilities advertises only stable logical features supported by a backend.
@@ -76,6 +77,7 @@ type Capabilities struct {
 	Neighborhood bool `json:"neighborhood"`
 	Path         bool `json:"path"`
 	Ingest       bool `json:"ingest"`
+	Extraction   bool `json:"extraction"`
 }
 
 // AllCapabilities returns the complete feature set implemented by the embedded
@@ -84,6 +86,7 @@ func AllCapabilities() Capabilities {
 	return Capabilities{
 		Documents: true, Document: true, Retrieve: true,
 		Vector: false, Neighborhood: true, Path: true, Ingest: true,
+		Extraction: true,
 	}
 }
 
@@ -104,6 +107,8 @@ func (c Capabilities) Supports(capability Capability) bool {
 		return c.Path
 	case CapabilityIngest:
 		return c.Ingest
+	case CapabilityExtraction:
+		return c.Extraction
 	default:
 		return false
 	}
@@ -230,6 +235,28 @@ type IngestFileResult struct {
 type IngestResponse struct {
 	Snapshot Snapshot           `json:"snapshot"`
 	Files    []IngestFileResult `json:"files"`
+}
+
+type ExtractRequest struct {
+	Snapshot     Snapshot `json:"snapshot"`
+	DocumentID   shoal.ID `json:"document_id"`
+	RevisionID   shoal.ID `json:"revision_id,omitempty"`
+	Instructions string   `json:"instructions,omitempty"`
+}
+
+type ExtractResponse struct {
+	Snapshot            Snapshot   `json:"snapshot"`
+	DocumentID          shoal.ID   `json:"document_id"`
+	RevisionID          shoal.ID   `json:"revision_id"`
+	ExtractionID        shoal.ID   `json:"extraction_id"`
+	EntityCount         int        `json:"entity_count"`
+	RelationCount       int        `json:"relation_count"`
+	GraphNodeCount      int        `json:"graph_node_count"`
+	GraphEdgeCount      int        `json:"graph_edge_count"`
+	CreatedEntities     int        `json:"created_entities"`
+	ReusedEntities      int        `json:"reused_entities"`
+	EntityNodeIDs       []shoal.ID `json:"entity_node_ids"`
+	RelationshipEdgeIDs []shoal.ID `json:"relationship_edge_ids"`
 }
 
 // ChangesRequest asks for the caller's document change feed. An empty Cursor

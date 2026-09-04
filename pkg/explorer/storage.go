@@ -52,6 +52,7 @@ const (
 	edgeRow        = "edge/"
 	interactionRow = "interaction/"
 	foldRow        = "interaction-fold/"
+	extractionRow  = "extraction/"
 	proposalRow    = "ontology-proposal/"
 	transitionRow  = "ontology-proposal-transition/"
 
@@ -66,6 +67,7 @@ const (
 	embeddedRecordCursorKey            = byte(7)
 	embeddedRecordOntologyProposal     = byte(8)
 	embeddedRecordProposalTransition   = byte(9)
+	embeddedRecordExtraction           = byte(10)
 	embeddedEnvelopeHeader             = 8 + 1 + 1 + 8 + sha256.Size
 	maxEmbeddedDocumentBytes           = uint64(document.MaxRevisionSourceBytes) * 8
 	maxEmbeddedEdgeBytes               = uint64(2 * 1024 * 1024)
@@ -76,6 +78,7 @@ const (
 	maxEmbeddedCursorKeyBytes          = uint64(1024)
 	maxEmbeddedOntologyProposalBytes   = uint64(16 * 1024 * 1024)
 	maxEmbeddedProposalTransitionBytes = uint64(64 * 1024)
+	maxEmbeddedExtractionBytes         = uint64(16 * 1024 * 1024)
 )
 
 var snapshotAnchorRow = []byte("meta/snapshot-anchor")
@@ -129,6 +132,13 @@ func foldRecordRow(foldID shoal.ID) []byte {
 	row := make([]byte, 0, len(foldRow)+len(foldID))
 	row = append(row, foldRow...)
 	row = append(row, []byte(foldID)...)
+	return row
+}
+
+func extractionRecordRow(extractionID shoal.ID) []byte {
+	row := make([]byte, 0, len(extractionRow)+len(extractionID))
+	row = append(row, []byte(extractionRow)...)
+	row = append(row, []byte(extractionID)...)
 	return row
 }
 
@@ -199,6 +209,12 @@ func (e *Explorer) load() error {
 			}
 		case bytes.HasPrefix(key.Row, []byte(foldRow)):
 			if err := e.loadFoldRecord(
+				key.Row, qualifier, scanner.Value(),
+			); err != nil {
+				return err
+			}
+		case bytes.HasPrefix(key.Row, []byte(extractionRow)):
+			if err := e.loadExtractionRecord(
 				key.Row, qualifier, scanner.Value(),
 			); err != nil {
 				return err
@@ -549,6 +565,8 @@ func embeddedRecordMaximum(kind byte) (uint64, error) {
 		return maxEmbeddedOntologyProposalBytes, nil
 	case embeddedRecordProposalTransition:
 		return maxEmbeddedProposalTransitionBytes, nil
+	case embeddedRecordExtraction:
+		return maxEmbeddedExtractionBytes, nil
 	default:
 		return 0, fmt.Errorf("embedded record kind %d is unsupported", kind)
 	}

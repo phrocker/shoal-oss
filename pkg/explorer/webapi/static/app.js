@@ -23,6 +23,7 @@ const state = {
     path: false,
     vector_retrieval: false,
     ingest: false,
+    extraction: false,
   },
   uploadLimits: {
     max_upload_files: 0,
@@ -1312,6 +1313,10 @@ function applyCapabilities() {
     $("more").hidden = true;
   }
   applyIngestCapability();
+  document.querySelectorAll("[data-extract-document]").forEach((button) => {
+    button.hidden = !capability("extraction");
+    button.disabled = !capability("extraction");
+  });
 }
 
 function applyIngestCapability() {
@@ -1608,6 +1613,18 @@ function createDocumentCard(item) {
     button.append(media);
   }
   card.append(button);
+  if (capability("extraction")) {
+    const extract = document.createElement("button");
+    extract.type = "button";
+    extract.className = "extract-skill";
+    extract.dataset.extractDocument = documentID;
+    extract.textContent = "Extract skills";
+    // Load-bearing UI action; TestStaticWorkspaceUploadBehavior pins that extraction is explicitly user-triggered after upload.
+    extract.onclick = async () => {
+      await extractDocument(documentID, item.revision && item.revision.id, card);
+    };
+    card.append(extract);
+  }
 
   if (sourceURI) {
     const details = document.createElement("details");
@@ -1618,6 +1635,36 @@ function createDocumentCard(item) {
     code.textContent = sourceURI;
     details.append(summary, code);
     card.append(details);
+  }
+
+  async function extractDocument(documentID, revisionID, card) {
+    if (!capability("extraction")) return;
+    const status = document.createElement("p");
+    status.className = "muted";
+    status.setAttribute("role", "status");
+    status.textContent = "Extracting ontology entities…";
+    card.append(status);
+    try {
+      const response = await api("extract", {
+        snapshot: state.snapshot,
+        document_id: documentID,
+        revision_id: revisionID,
+      });
+      clearSnapshotDependentViews();
+      pin(response.snapshot);
+      setStatus(
+        status,
+        `Extracted ${response.entity_count || 0} entit(ies), ` +
+          `${response.relation_count || 0} ontology relation(s), and ` +
+          `${response.graph_edge_count || 0} graph edge(s).`,
+      );
+      await loadDocuments(true);
+      if ((response.entity_node_ids || []).length > 0 && capability("neighborhood")) {
+        await expandIDs([documentID]);
+      }
+    } catch (error) {
+      showActionError(status, error, "extract ontology entities from this document");
+    }
   }
   updateDocumentCardSelection(card);
   return card;

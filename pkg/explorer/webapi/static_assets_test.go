@@ -103,6 +103,27 @@ assert.match(uploaded.ids["upload-results"].children[1].textContent, /main\.go: 
 assert.strictEqual(uploaded.ids.documents.children.length, 1);
 assert.match(uploaded.ids.snapshot.textContent, /uploadsnap/);
 
+const extracted = await runScenario(
+  {documents: true, document: true, extraction: true},
+  [{document: {id: "skill-doc", title: "SKILL.md"}, revision: {id: "skill-rev"}}],
+  {extractResponse: {
+    snapshot: {id: "extractsnap", as_of: "2026-08-29T00:00:01Z", frontier: 2},
+    entity_count: 3,
+    relation_count: 2,
+    graph_edge_count: 5,
+    entity_node_ids: ["entity-1"],
+  }, documentSnapshot: {id: "extractsnap", as_of: "2026-08-29T00:00:01Z", frontier: 2}},
+);
+const extractCard = extracted.ids.documents.children[0];
+const extractButton = extractCard.children[1];
+assert.strictEqual(extractButton.textContent, "Extract skills");
+await extractButton.onclick();
+assert.ok(extracted.extractRequest, "extract button should POST /api/v1/extract");
+assert.strictEqual(extracted.extractRequest.document_id, "skill-doc");
+assert.strictEqual(extracted.extractRequest.revision_id, "skill-rev");
+assert.match(renderedText(extractCard), /Extracted 3 entit\(ies\), 2 ontology relation\(s\), and 5 graph edge\(s\)/);
+assert.match(extracted.ids.snapshot.textContent, /extractsna/);
+
 const failed = await runScenario(
   {documents: true, document: true, ingest: true},
   [],
@@ -683,6 +704,7 @@ async function runScenario(capabilities, documents = [], scenarioOptions = {}) {
   const dom = makeDocument(capabilities, documents);
   let retrieveBody = null;
   let uploadRequest = null;
+  let extractRequest = null;
   let documentCalls = 0;
   const snapshot = {id: "snapshot123456", as_of: "2026-08-29T00:00:00Z", frontier: 1};
   const ctx = {
@@ -738,6 +760,16 @@ async function runScenario(capabilities, documents = [], scenarioOptions = {}) {
         }
         return response(scenarioOptions.ingestResponse);
       }
+      if (url.endsWith("/extract")) {
+        extractRequest = JSON.parse(requestOptions.body);
+        if (scenarioOptions.extractError) {
+          return response(scenarioOptions.extractError.body || {}, {
+            ok: false,
+            statusText: scenarioOptions.extractError.statusText || "Error",
+          });
+        }
+        return response(scenarioOptions.extractResponse || {snapshot});
+      }
       if (url.endsWith("/retrieve")) {
         retrieveBody = JSON.parse(requestOptions.body);
         if (scenarioOptions.retrieveError) {
@@ -767,6 +799,7 @@ async function runScenario(capabilities, documents = [], scenarioOptions = {}) {
     ctx, ids: dom.ids,
     get retrieveBody() { return retrieveBody; },
     get uploadRequest() { return uploadRequest; },
+    get extractRequest() { return extractRequest; },
   };
 }
 

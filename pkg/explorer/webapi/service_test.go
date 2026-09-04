@@ -37,6 +37,7 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/explorer/webapi"
 	"github.com/phrocker/shoal-oss/pkg/graph"
 	"github.com/phrocker/shoal-oss/pkg/model"
+	"github.com/phrocker/shoal-oss/pkg/ontology"
 	"github.com/phrocker/shoal-oss/pkg/retrieval"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
@@ -572,6 +573,63 @@ func TestHTTPIngestUploadsDocumentsAndSourceCode(t *testing.T) {
 	}
 	if !bytes.Contains(documents, []byte(`"source_media_type":"text/x-source-code"`)) {
 		t.Fatalf("documents response did not expose source media type: %s", documents)
+	}
+}
+
+func TestHTTPExtractPublishesUploadedSkillGraph(t *testing.T) {
+	corpus, err := explorer.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer corpus.Close()
+	service, err := webapi.NewEmbeddedService(corpus)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := service.SetOntologyVersion(webapiSkillsOntologyVersion(t)); err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewUnstartedServer(nil)
+	handler, err := webapi.NewHandler(service, server.Listener.Addr().String())
+	if err != nil {
+		server.Close()
+		t.Fatal(err)
+	}
+	server.Config.Handler = handler
+	server.Start()
+	defer server.Close()
+
+	uploaded := postMultipart(t, server.URL+"/api/v1/ingest", uploadFixture{
+		name: "SKILL.md", content: "# Demo Skill\n\nTools:\n- demo-cli\n\nCapabilities:\n- Graph extraction\n",
+		mediaType: explorer.MediaTypeMarkdown,
+	})
+	if uploaded.StatusCode != http.StatusOK {
+		t.Fatalf("upload status = %s: %s", uploaded.Status, uploaded.body)
+	}
+	var ingested webapi.IngestResponse
+	if err := json.Unmarshal(uploaded.body, &ingested); err != nil {
+		t.Fatal(err)
+	}
+	body, err := json.Marshal(webapi.ExtractRequest{
+		Snapshot:   ingested.Snapshot,
+		DocumentID: ingested.Files[0].Document.ID,
+		RevisionID: ingested.Files[0].Revision.ID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	data := postJSON(t, server.URL+"/api/v1/extract", string(body))
+	var extracted webapi.ExtractResponse
+	if err := json.Unmarshal(data, &extracted); err != nil {
+		t.Fatal(err)
+	}
+	if extracted.EntityCount != 3 || extracted.RelationCount != 2 {
+		t.Fatalf("extract response counts = entities:%d relations:%d, want 3 and 2",
+			extracted.EntityCount, extracted.RelationCount)
+	}
+	if extracted.GraphNodeCount != 3 || extracted.GraphEdgeCount != 5 {
+		t.Fatalf("extract graph counts = nodes:%d edges:%d, want 3 and 5",
+			extracted.GraphNodeCount, extracted.GraphEdgeCount)
 	}
 }
 
@@ -1397,6 +1455,63 @@ func testRemoteService(
 		corpus.Close()
 	}
 	return remote, cleanup, first, second
+}
+
+func webapiSkillsOntologyVersion(t *testing.T) ontology.OntologyVersion {
+	t.Helper()
+	name, err := ontology.NewPropertyDefinition(
+		"name", "Name", "Human-readable name", ontology.ValueString, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	skill, err := ontology.NewConceptDefinition(
+		"skill", "Skill", "Agent skill", []shoal.ID{name.ID()}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tool, err := ontology.NewConceptDefinition(
+		"tool", "Tool", "Usable tool", []shoal.ID{name.ID()}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	capability, err := ontology.NewConceptDefinition(
+		"capability", "Capability", "Provided capability", []shoal.ID{name.ID()}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	providesTool, err := ontology.NewRelationshipDefinition(
+		"provides_tool", "Provides tool", "Skill provides tool",
+		[]shoal.ID{skill.ID()}, []shoal.ID{tool.ID()}, nil, true, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	providesCapability, err := ontology.NewRelationshipDefinition(
+		"provides_capability", "Provides capability", "Skill provides capability",
+		[]shoal.ID{skill.ID()}, []shoal.ID{capability.ID()}, nil, true, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dependsOn, err := ontology.NewRelationshipDefinition(
+		"depends_on", "Depends on", "Skill depends on skill",
+		[]shoal.ID{skill.ID()}, []shoal.ID{skill.ID()}, nil, true, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	schema, err := ontology.NewOntologySchema(
+		"agent-skills-web", "Agent Skills Web", "Web API skill ontology", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, err := ontology.NewOntologyVersion(
+		schema, "v1", time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
+		[]ontology.ConceptDefinition{skill, tool, capability},
+		[]ontology.RelationshipDefinition{providesTool, providesCapability, dependsOn},
+		[]ontology.PropertyDefinition{name}, nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return version
 }
 
 func serveRemoteService(

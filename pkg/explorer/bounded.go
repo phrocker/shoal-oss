@@ -336,6 +336,11 @@ func (e *Explorer) refreshSnapshotLocked() {
 			asOf = record.PublishedAt
 		}
 	}
+	for _, record := range e.extractions {
+		if record != nil && record.PublishedAt.After(asOf) {
+			asOf = record.PublishedAt
+		}
+	}
 	sum := hash.Sum(nil)
 	e.snapshot = Snapshot{
 		ID: hex.EncodeToString(sum), AsOf: asOf.UTC(),
