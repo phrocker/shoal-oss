@@ -236,6 +236,26 @@ var (
 		},
 		{
 			capability: IteratorCapability{
+				Name:           IterGraphRank,
+				JavaClasses:    []string{"org.apache.accumulo.core.graph.GraphRankIterator"},
+				Contexts:       []CapabilityContext{ContextMajc, ContextOffline},
+				ActiveContexts: []CapabilityContext{ContextMajc, ContextOffline},
+				OptionKeys: []string{
+					GraphRankDampingFactor,
+					GraphRankMaxIterations,
+					GraphRankEdgeType,
+					GraphRankMaxVertices,
+					GraphRankConvergenceThreshold,
+					GraphRankVertexCF,
+					GraphRankEdgeCFPrefix,
+					GraphRankLabelCQ,
+					GraphRankRankCQ,
+				},
+			},
+			new: func() SortedKeyValueIterator { return NewGraphRankIterator() },
+		},
+		{
+			capability: IteratorCapability{
 				Name:           IterTermIndex,
 				Contexts:       []CapabilityContext{ContextScan},
 				ActiveContexts: []CapabilityContext{ContextScan},

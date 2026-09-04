@@ -12,6 +12,7 @@ const state = {
   identity: null,
   accessToken: null,
   auth: {configured: false},
+  ontology: null,
   reauthRequired: false,
   capabilities: {
     documents: false,
@@ -36,6 +37,7 @@ let graphGeneration = 0;
 let documentsLoading = false;
 let documentsRefreshQueued = false;
 let uploadLoading = false;
+let ontologyGeneration = 0;
 
 async function api(path, body) {
   const response = await fetch(`/api/v1/${path}`, {
@@ -573,6 +575,261 @@ function renderIdentityError(error) {
   const badge = $("identity-badge");
   badge.hidden = true;
   badge.textContent = "";
+}
+
+async function loadOntology() {
+  const status = $("ontology-status");
+  if (!status) return;
+  const generation = ++ontologyGeneration;
+  setStatus(status, "Loading active ontology…");
+  try {
+    const response = await fetch("/api/v1/ontology", {
+      headers: {"accept": "application/json", ...authHeaders()},
+    });
+    const value = await response.json();
+    if (!response.ok) throw apiError(value, response);
+    if (generation !== ontologyGeneration) return;
+    state.ontology = value;
+    renderOntology(value);
+  } catch (error) {
+    if (generation !== ontologyGeneration) return;
+    state.ontology = null;
+    renderOntologyError(error);
+  }
+}
+
+function renderOntology(ontology) {
+  const status = $("ontology-status");
+  const details = $("ontology-details");
+  if (!status || !details) return;
+  details.replaceChildren();
+  if (!ontology || !ontology.configured) {
+    setStatus(
+      status,
+      "No active ontology is configured. This is an explicit unconfigured state, " +
+        "not an empty ontology and not a loading failure.",
+      "empty-state",
+    );
+    return;
+  }
+
+  const concepts = ontology.concepts || [];
+  const relationships = ontology.relationships || [];
+  const properties = ontology.properties || [];
+  setStatus(
+    status,
+    `Active ontology ${shortLabel(ontology.identity && ontology.identity.schema_id)} / ` +
+      `${shortLabel(ontology.identity && ontology.identity.version_id)}: ` +
+      `${concepts.length} concept(s), ${relationships.length} relationship(s), ` +
+      `${properties.length} property definition(s).`,
+    "muted",
+  );
+
+  const conceptMap = new Map(concepts.map((concept) => [concept.id, concept]));
+  const propertyMap = new Map(properties.map((property) => [property.id, property]));
+  const fragment = document.createDocumentFragment();
+  fragment.append(ontologyIdentityFacts(ontology));
+  fragment.append(ontologySection(
+    "Declared joins",
+    relationships,
+    "This active ontology declares no relationships. It is configured, but it has no joins yet.",
+    (relationship) => relationshipCard(relationship, conceptMap, propertyMap),
+  ));
+  fragment.append(ontologySection(
+    "Concepts",
+    concepts,
+    "This active ontology has no concepts.",
+    (concept) => conceptCard(concept, propertyMap),
+  ));
+  fragment.append(ontologySection(
+    "Properties and constraints",
+    properties,
+    "This active ontology has no properties or constraints.",
+    propertyCard,
+  ));
+  details.replaceChildren(fragment);
+}
+
+function ontologyIdentityFacts(ontology) {
+  const section = document.createElement("section");
+  section.className = "ontology-identity";
+  const heading = document.createElement("h3");
+  heading.textContent = "Active identity";
+  const facts = document.createElement("dl");
+  facts.className = "identity-facts";
+  appendFact(facts, "Schema ID", ontology.identity && ontology.identity.schema_id);
+  appendFact(facts, "Version ID", ontology.identity && ontology.identity.version_id);
+  appendFact(facts, "Reading", ontology.identity && ontology.identity.reading);
+  appendFact(facts, "Schema", ontology.schema && ontology.schema.name);
+  appendFact(facts, "Version", ontology.version && ontology.version.version);
+  appendFact(facts, "Created", ontology.version && ontology.version.created_at);
+  section.append(heading, facts);
+  return section;
+}
+
+function ontologySection(title, values, emptyText, renderItem) {
+  const section = document.createElement("section");
+  section.className = "ontology-section";
+  const heading = document.createElement("h3");
+  heading.textContent = title;
+  section.append(heading);
+  if (values.length === 0) {
+    const empty = document.createElement("p");
+    empty.className = "empty-state";
+    empty.textContent = emptyText;
+    section.append(empty);
+    return section;
+  }
+  const list = document.createElement("div");
+  list.className = "ontology-list";
+  for (const value of values) list.append(renderItem(value));
+  section.append(list);
+  return section;
+}
+
+function relationshipCard(relationship, conceptMap, propertyMap) {
+  const card = ontologyCard(relationship);
+  const join = document.createElement("p");
+  join.className = "ontology-join";
+  const arrow = relationship.directed ? "→" : "↔";
+  join.textContent = `${conceptNames(relationship.from_concepts, conceptMap)} ` +
+    `${arrow} ${conceptNames(relationship.to_concepts, conceptMap)}`;
+  card.append(join);
+  const direction = document.createElement("p");
+  direction.className = "muted";
+  direction.textContent = relationship.directed
+    ? "Directed relationship: source concepts join to target concepts."
+    : "Undirected relationship: either endpoint set may be read from the other.";
+  card.append(direction);
+  appendPropertyChips(card, relationship.properties || [], propertyMap);
+  return card;
+}
+
+function conceptCard(concept, propertyMap) {
+  const card = ontologyCard(concept);
+  appendPropertyChips(card, concept.properties || [], propertyMap);
+  return card;
+}
+
+function propertyCard(property) {
+  const card = ontologyCard(property);
+  const type = document.createElement("p");
+  type.className = "muted";
+  type.textContent = `Value type: ${property.value_type || "unknown"}`;
+  card.append(type);
+  const constraints = property.constraints || [];
+  if (constraints.length === 0) {
+    const none = document.createElement("p");
+    none.className = "muted";
+    none.textContent = "No constraints.";
+    card.append(none);
+    return card;
+  }
+  const list = document.createElement("ul");
+  list.className = "ontology-constraints";
+  for (const constraint of constraints) {
+    const item = document.createElement("li");
+    item.textContent = constraintText(constraint);
+    list.append(item);
+  }
+  card.append(list);
+  return card;
+}
+
+function ontologyCard(value) {
+  const card = document.createElement("article");
+  card.className = "ontology-card";
+  const heading = document.createElement("h4");
+  heading.textContent = value.name || value.key || shortLabel(value.id);
+  heading.title = value.id || "";
+  card.append(heading);
+  if (value.description) {
+    const description = document.createElement("p");
+    description.className = "muted";
+    description.textContent = value.description;
+    card.append(description);
+  }
+  const id = document.createElement("code");
+  id.textContent = value.id || "";
+  id.title = value.id || "";
+  card.append(id);
+  return card;
+}
+
+function appendPropertyChips(card, propertyIDs, propertyMap) {
+  const group = document.createElement("div");
+  group.className = "identity-chips";
+  const label = document.createElement("span");
+  label.className = "identity-label";
+  label.textContent = "Properties";
+  group.append(label);
+  if (propertyIDs.length === 0) {
+    const none = document.createElement("span");
+    none.className = "chip chip-empty";
+    none.textContent = "none";
+    group.append(none);
+  } else {
+    for (const id of propertyIDs) {
+      const chip = document.createElement("span");
+      chip.className = "chip";
+      const property = propertyMap.get(id);
+      chip.textContent = property ? property.name : shortLabel(id);
+      chip.title = id;
+      group.append(chip);
+    }
+  }
+  card.append(group);
+}
+
+function conceptNames(ids, conceptMap) {
+  const names = (ids || []).map((id) => {
+    const concept = conceptMap.get(id);
+    return concept ? concept.name : shortLabel(id);
+  });
+  return names.length === 0 ? "(none)" : names.join(", ");
+}
+
+function constraintText(constraint) {
+  const kind = constraint.kind || "constraint";
+  if (Object.prototype.hasOwnProperty.call(constraint, "count")) {
+    return `${kind}: ${constraint.count}`;
+  }
+  if (constraint.value) {
+    return `${kind}: ${formatOntologyValue(constraint.value)}`;
+  }
+  if (constraint.pattern) {
+    return `${kind}: ${constraint.pattern}`;
+  }
+  if ((constraint.allowed_values || []).length > 0) {
+    return `${kind}: ${(constraint.allowed_values || []).map(formatOntologyValue).join(", ")}`;
+  }
+  return kind;
+}
+
+function formatOntologyValue(value) {
+  if (!value) return "";
+  return `${value.type || "value"} ${String(value.value)}`;
+}
+
+function renderOntologyError(error) {
+  const status = $("ontology-status");
+  const details = $("ontology-details");
+  if (!status || !details) return;
+  details.replaceChildren();
+  if (needsReauthentication(error)) {
+    handleReauthentication();
+    setStatus(status, reauthenticationText(), "reauth");
+    return;
+  }
+  if (isDenied(error)) {
+    setStatus(status, deniedText("describe the active ontology", state.identity), "denied");
+    return;
+  }
+  setStatus(
+    status,
+    `Ontology is unavailable: ${error && error.message ? error.message : String(error)}.`,
+    "error",
+  );
 }
 
 function capability(name) {
@@ -1471,6 +1728,7 @@ async function bootstrap() {
     }
   }
   loadIdentity();
+  loadOntology();
   loadMeta()
     .then(() => loadDocuments())
     .catch((error) => showError($("documents"), error));

@@ -56,6 +56,11 @@ const (
 	// "edge.sem:". Options: similarityThreshold, edgeCF, embeddingCF,
 	// embeddingCQ, maxEdgesPerVertex, maxVectors, direction, inverseEdgeCF.
 	IterSemanticEdge = "semanticEdge"
+	// IterGraphRank is the graph-table majc iterator that runs PageRank over
+	// vertex rows and outgoing edge column families, emitting V:_rank cells.
+	// Options: dampingFactor, maxIterations, edgeType, maxVertices,
+	// convergenceThreshold, vertexCF, edgeCFPrefix, labelCQ, rankCQ.
+	IterGraphRank = "graphRank"
 	// IterTermIndex is the term-index (keyword) pushdown iterator: it
 	// resolves posting rows to primary rows and emits the primary rows'
 	// cells. Options: termCount, term.<i>, primaryPrefix, idSource, postingCF.
