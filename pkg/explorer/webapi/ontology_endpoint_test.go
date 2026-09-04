@@ -29,6 +29,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/explorer/webapi"
 	"github.com/phrocker/shoal-oss/pkg/ontology"
@@ -219,6 +220,32 @@ func TestOntologyEndpointShapeAndBounds(t *testing.T) {
 	}
 	if bytes.Contains(encoded, []byte("metadata")) {
 		t.Fatalf("ontology JSON leaked unsupported metadata field: %s", encoded)
+	}
+}
+
+func TestOntologyEndpointUsesEmbeddedServiceConfiguredOntology(t *testing.T) {
+	corpus, err := explorer.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer corpus.Close()
+	service, err := webapi.NewEmbeddedService(corpus)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := service.SetOntologyVersion(richOntologyVersion(t)); err != nil {
+		t.Fatal(err)
+	}
+
+	response := getOntologyResponse(t, service)
+	if !response.Configured {
+		t.Fatalf("embedded service ontology configured = false, want true")
+	}
+	if response.Identity.Reading != string(ontology.OntologySameVersion) ||
+		len(response.Concepts) == 0 ||
+		len(response.Relationships) == 0 ||
+		len(response.Properties) == 0 {
+		t.Fatalf("embedded service ontology response = %+v", response)
 	}
 }
 
