@@ -749,6 +749,130 @@ func (r *DocumentRequest) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
+func (r ExtractRequest) MarshalJSON() ([]byte, error) {
+	return json.Marshal(struct {
+		Snapshot     Snapshot `json:"snapshot"`
+		DocumentID   string   `json:"document_id"`
+		RevisionID   string   `json:"revision_id,omitempty"`
+		Instructions string   `json:"instructions,omitempty"`
+	}{
+		Snapshot: r.Snapshot, DocumentID: encodeID(r.DocumentID),
+		RevisionID: encodeOptionalID(r.RevisionID), Instructions: r.Instructions,
+	})
+}
+
+func (r *ExtractRequest) UnmarshalJSON(data []byte) error {
+	var wire struct {
+		Snapshot     Snapshot `json:"snapshot"`
+		DocumentID   string   `json:"document_id"`
+		RevisionID   string   `json:"revision_id,omitempty"`
+		Instructions string   `json:"instructions,omitempty"`
+	}
+	if err := strictUnmarshal(data, &wire); err != nil {
+		return err
+	}
+	documentID, err := decodeID(wire.DocumentID)
+	if err != nil {
+		return fmt.Errorf("document_id: %w", err)
+	}
+	revisionID, err := decodeOptionalID(wire.RevisionID)
+	if err != nil {
+		return fmt.Errorf("revision_id: %w", err)
+	}
+	*r = ExtractRequest{
+		Snapshot: wire.Snapshot, DocumentID: documentID, RevisionID: revisionID,
+		Instructions: wire.Instructions,
+	}
+	return nil
+}
+
+func (r ExtractResponse) MarshalJSON() ([]byte, error) {
+	entityNodeIDs := make([]string, 0, len(r.EntityNodeIDs))
+	for _, id := range r.EntityNodeIDs {
+		entityNodeIDs = append(entityNodeIDs, encodeID(id))
+	}
+	relationshipEdgeIDs := make([]string, 0, len(r.RelationshipEdgeIDs))
+	for _, id := range r.RelationshipEdgeIDs {
+		relationshipEdgeIDs = append(relationshipEdgeIDs, encodeID(id))
+	}
+	return json.Marshal(struct {
+		Snapshot            Snapshot `json:"snapshot"`
+		DocumentID          string   `json:"document_id"`
+		RevisionID          string   `json:"revision_id"`
+		ExtractionID        string   `json:"extraction_id"`
+		EntityCount         int      `json:"entity_count"`
+		RelationCount       int      `json:"relation_count"`
+		GraphNodeCount      int      `json:"graph_node_count"`
+		GraphEdgeCount      int      `json:"graph_edge_count"`
+		CreatedEntities     int      `json:"created_entities"`
+		ReusedEntities      int      `json:"reused_entities"`
+		EntityNodeIDs       []string `json:"entity_node_ids"`
+		RelationshipEdgeIDs []string `json:"relationship_edge_ids"`
+	}{
+		Snapshot:            r.Snapshot,
+		DocumentID:          encodeID(r.DocumentID),
+		RevisionID:          encodeOptionalID(r.RevisionID),
+		ExtractionID:        encodeOptionalID(r.ExtractionID),
+		EntityCount:         r.EntityCount,
+		RelationCount:       r.RelationCount,
+		GraphNodeCount:      r.GraphNodeCount,
+		GraphEdgeCount:      r.GraphEdgeCount,
+		CreatedEntities:     r.CreatedEntities,
+		ReusedEntities:      r.ReusedEntities,
+		EntityNodeIDs:       entityNodeIDs,
+		RelationshipEdgeIDs: relationshipEdgeIDs,
+	})
+}
+
+func (r *ExtractResponse) UnmarshalJSON(data []byte) error {
+	var wire struct {
+		Snapshot            Snapshot `json:"snapshot"`
+		DocumentID          string   `json:"document_id"`
+		RevisionID          string   `json:"revision_id"`
+		ExtractionID        string   `json:"extraction_id"`
+		EntityCount         int      `json:"entity_count"`
+		RelationCount       int      `json:"relation_count"`
+		GraphNodeCount      int      `json:"graph_node_count"`
+		GraphEdgeCount      int      `json:"graph_edge_count"`
+		CreatedEntities     int      `json:"created_entities"`
+		ReusedEntities      int      `json:"reused_entities"`
+		EntityNodeIDs       []string `json:"entity_node_ids"`
+		RelationshipEdgeIDs []string `json:"relationship_edge_ids"`
+	}
+	if err := strictUnmarshal(data, &wire); err != nil {
+		return err
+	}
+	documentID, err := decodeID(wire.DocumentID)
+	if err != nil {
+		return fmt.Errorf("document_id: %w", err)
+	}
+	revisionID, err := decodeOptionalID(wire.RevisionID)
+	if err != nil {
+		return fmt.Errorf("revision_id: %w", err)
+	}
+	extractionID, err := decodeOptionalID(wire.ExtractionID)
+	if err != nil {
+		return fmt.Errorf("extraction_id: %w", err)
+	}
+	entityNodeIDs, err := decodeIDs(wire.EntityNodeIDs)
+	if err != nil {
+		return fmt.Errorf("entity_node_ids: %w", err)
+	}
+	relationshipEdgeIDs, err := decodeIDs(wire.RelationshipEdgeIDs)
+	if err != nil {
+		return fmt.Errorf("relationship_edge_ids: %w", err)
+	}
+	*r = ExtractResponse{
+		Snapshot: wire.Snapshot, DocumentID: documentID, RevisionID: revisionID,
+		ExtractionID: extractionID, EntityCount: wire.EntityCount,
+		RelationCount: wire.RelationCount, GraphNodeCount: wire.GraphNodeCount,
+		GraphEdgeCount: wire.GraphEdgeCount, CreatedEntities: wire.CreatedEntities,
+		ReusedEntities: wire.ReusedEntities, EntityNodeIDs: entityNodeIDs,
+		RelationshipEdgeIDs: relationshipEdgeIDs,
+	}
+	return nil
+}
+
 func (r *NeighborhoodRequest) UnmarshalJSON(data []byte) error {
 	var wire struct {
 		Snapshot  Snapshot `json:"snapshot"`
