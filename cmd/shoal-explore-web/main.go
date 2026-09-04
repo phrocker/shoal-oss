@@ -38,6 +38,7 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/explorer/authorized"
 	"github.com/phrocker/shoal-oss/pkg/explorer/webapi"
 	"github.com/phrocker/shoal-oss/pkg/model"
+	"github.com/phrocker/shoal-oss/pkg/ontology"
 )
 
 func main() {
@@ -167,6 +168,13 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 			"environment fallback SHOAL_ENTRA_SCOPE. Not used for token "+
 			"validation, only for the browser login redirect",
 	)
+	ontologyFile := flags.String(
+		"ontology-file", "",
+		"Optional JSON file containing the active ontology schema, version, "+
+			"concepts, relationships, properties, and constraints to describe "+
+			"read-only at /api/v1/ontology; environment fallback "+
+			"SHOAL_ONTOLOGY_FILE",
+	)
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -193,6 +201,14 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 	}.embedder()
 	if err != nil {
 		return err
+	}
+	var activeOntology *ontology.OntologyVersion
+	if path := firstNonEmpty(*ontologyFile, os.Getenv("SHOAL_ONTOLOGY_FILE")); path != "" {
+		version, err := loadOntologyVersionFile(path)
+		if err != nil {
+			return err
+		}
+		activeOntology = &version
 	}
 
 	// The requested address is classified and refused before anything is
@@ -234,6 +250,7 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 		resolver:  authority.Resolver(),
 		clock:     time.Now,
 		backfill:  backfill,
+		ontology:  activeOntology,
 	})
 	if err != nil {
 		listener.Close()
@@ -302,6 +319,13 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 		)
 	}
 	if *backend == "embedded" {
+		if activeOntology != nil {
+			fmt.Fprintf(
+				output,
+				"Active ontology %s / %s is configured for read-only description\n",
+				activeOntology.Schema().ID(), activeOntology.ID(),
+			)
+		}
 		if backfill != nil {
 			fmt.Fprintf(
 				output,
@@ -431,6 +455,9 @@ type serviceConfig struct {
 	// backfill is nil unless the development principal is serving a loopback
 	// listener. See developmentBackfill and issue #284.
 	backfill *developmentBackfill
+	// ontology is an optional immutable snapshot configured at startup for the
+	// read-only ontology description endpoint.
+	ontology *ontology.OntologyVersion
 }
 
 // openedService is the constructed workspace service together with what the
@@ -506,6 +533,16 @@ func openService(
 			store.Close()
 			corpus.Close()
 			return closed, err
+		}
+		if config.ontology != nil {
+			// This call is load-bearing; TestOntologyProposalLifecycleUsesStartedEmbeddedWorkspace
+			// pins that startup wires -ontology-file into the real EmbeddedService
+			// path used by proposal creation, not only into an injected test double.
+			if err := service.SetOntologyVersion(*config.ontology); err != nil {
+				store.Close()
+				corpus.Close()
+				return closed, err
+			}
 		}
 		return openedService{
 			service:    service,

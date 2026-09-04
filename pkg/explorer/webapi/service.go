@@ -26,11 +26,13 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/explorer/authorized"
 	"github.com/phrocker/shoal-oss/pkg/graph"
+	"github.com/phrocker/shoal-oss/pkg/ontology"
 	"github.com/phrocker/shoal-oss/pkg/retrieval"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
@@ -105,7 +107,10 @@ type changeFeedBackend interface {
 
 // EmbeddedService adapts the public Explorer client to the workspace service.
 type EmbeddedService struct {
-	client explorer.BoundedClient
+	client          explorer.BoundedClient
+	ontologyMu      sync.RWMutex
+	ontologyVersion *ontology.OntologyVersion
+	clock           func() time.Time
 }
 
 // NewEmbeddedService creates a local service without exposing the embedded
@@ -114,7 +119,7 @@ func NewEmbeddedService(client explorer.BoundedClient) (*EmbeddedService, error)
 	if client == nil {
 		return nil, shoal.NewError(shoal.ErrorInvalidArgument, "explorer client is required")
 	}
-	return &EmbeddedService{client: client}, nil
+	return &EmbeddedService{client: client, clock: time.Now}, nil
 }
 
 func (s *EmbeddedService) Capabilities(ctx context.Context) (Capabilities, error) {

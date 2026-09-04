@@ -27,6 +27,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -51,24 +52,30 @@ const (
 	edgeRow        = "edge/"
 	interactionRow = "interaction/"
 	foldRow        = "interaction-fold/"
+	proposalRow    = "ontology-proposal/"
+	transitionRow  = "ontology-proposal-transition/"
 
-	embeddedRecordMagic             = "SHOALX2\x00"
-	embeddedEnvelopeVersion         = byte(1)
-	embeddedRecordDocument          = byte(1)
-	embeddedRecordEdge              = byte(2)
-	embeddedRecordSnapshotAnchor    = byte(3)
-	embeddedRecordInteraction       = byte(4)
-	embeddedRecordInteractionSink   = byte(5)
-	embeddedRecordFold              = byte(6)
-	embeddedRecordCursorKey         = byte(7)
-	embeddedEnvelopeHeader          = 8 + 1 + 1 + 8 + sha256.Size
-	maxEmbeddedDocumentBytes        = uint64(document.MaxRevisionSourceBytes) * 8
-	maxEmbeddedEdgeBytes            = uint64(2 * 1024 * 1024)
-	maxEmbeddedSnapshotAnchorBytes  = uint64(1024)
-	maxEmbeddedInteractionBytes     = uint64(64 * 1024 * 1024)
-	maxEmbeddedInteractionSinkBytes = uint64(1024)
-	maxEmbeddedFoldBytes            = uint64(64 * 1024 * 1024)
-	maxEmbeddedCursorKeyBytes       = uint64(1024)
+	embeddedRecordMagic                = "SHOALX2\x00"
+	embeddedEnvelopeVersion            = byte(1)
+	embeddedRecordDocument             = byte(1)
+	embeddedRecordEdge                 = byte(2)
+	embeddedRecordSnapshotAnchor       = byte(3)
+	embeddedRecordInteraction          = byte(4)
+	embeddedRecordInteractionSink      = byte(5)
+	embeddedRecordFold                 = byte(6)
+	embeddedRecordCursorKey            = byte(7)
+	embeddedRecordOntologyProposal     = byte(8)
+	embeddedRecordProposalTransition   = byte(9)
+	embeddedEnvelopeHeader             = 8 + 1 + 1 + 8 + sha256.Size
+	maxEmbeddedDocumentBytes           = uint64(document.MaxRevisionSourceBytes) * 8
+	maxEmbeddedEdgeBytes               = uint64(2 * 1024 * 1024)
+	maxEmbeddedSnapshotAnchorBytes     = uint64(1024)
+	maxEmbeddedInteractionBytes        = uint64(64 * 1024 * 1024)
+	maxEmbeddedInteractionSinkBytes    = uint64(1024)
+	maxEmbeddedFoldBytes               = uint64(64 * 1024 * 1024)
+	maxEmbeddedCursorKeyBytes          = uint64(1024)
+	maxEmbeddedOntologyProposalBytes   = uint64(16 * 1024 * 1024)
+	maxEmbeddedProposalTransitionBytes = uint64(64 * 1024)
 )
 
 var snapshotAnchorRow = []byte("meta/snapshot-anchor")
@@ -122,6 +129,22 @@ func foldRecordRow(foldID shoal.ID) []byte {
 	row := make([]byte, 0, len(foldRow)+len(foldID))
 	row = append(row, foldRow...)
 	row = append(row, []byte(foldID)...)
+	return row
+}
+
+func ontologyProposalRecordRow(proposalID shoal.ID) []byte {
+	row := make([]byte, 0, len(proposalRow)+len(proposalID))
+	row = append(row, []byte(proposalRow)...)
+	row = append(row, []byte(proposalID)...)
+	return row
+}
+
+func ontologyProposalTransitionRecordRow(proposalID shoal.ID, sequence uint32) []byte {
+	row := make([]byte, 0, len(transitionRow)+len(proposalID)+1+10)
+	row = append(row, []byte(transitionRow)...)
+	row = append(row, []byte(proposalID)...)
+	row = append(row, '/')
+	row = strconv.AppendUint(row, uint64(sequence), 10)
 	return row
 }
 
@@ -180,6 +203,18 @@ func (e *Explorer) load() error {
 			); err != nil {
 				return err
 			}
+		case bytes.HasPrefix(key.Row, []byte(proposalRow)):
+			if err := e.loadOntologyProposalRecord(
+				key.Row, qualifier, scanner.Value(),
+			); err != nil {
+				return err
+			}
+		case bytes.HasPrefix(key.Row, []byte(transitionRow)):
+			if err := e.loadOntologyProposalTransitionRecord(
+				key.Row, qualifier, scanner.Value(),
+			); err != nil {
+				return err
+			}
 		case bytes.HasPrefix(key.Row, []byte(interactionRow)):
 			if err := e.loadInteractionRecord(
 				key.Row, qualifier, scanner.Value(),
@@ -189,6 +224,12 @@ func (e *Explorer) load() error {
 		}
 		if err := scanner.Advance(); err != nil {
 			return shoal.WrapError(shoal.ErrorInternal, "advance explorer scan", err)
+		}
+	}
+	for _, proposal := range e.ontologyProposals {
+		if _, err := proposal.proposal(); err != nil {
+			return shoal.WrapError(
+				shoal.ErrorInternal, "stored ontology proposal is invalid", err)
 		}
 	}
 	space, found, err := e.embeddingSpaceLocked()
@@ -504,6 +545,10 @@ func embeddedRecordMaximum(kind byte) (uint64, error) {
 		return maxEmbeddedFoldBytes, nil
 	case embeddedRecordCursorKey:
 		return maxEmbeddedCursorKeyBytes, nil
+	case embeddedRecordOntologyProposal:
+		return maxEmbeddedOntologyProposalBytes, nil
+	case embeddedRecordProposalTransition:
+		return maxEmbeddedProposalTransitionBytes, nil
 	default:
 		return 0, fmt.Errorf("embedded record kind %d is unsupported", kind)
 	}

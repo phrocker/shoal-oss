@@ -129,6 +129,55 @@ func (h *Handler) routes() {
 		}
 		writeResponse(writer, http.StatusOK, identity)
 	})
+	h.mux.HandleFunc("GET /api/v1/ontology", func(writer http.ResponseWriter, request *http.Request) {
+		ontology, err := ontologyFor(request.Context(), h.service)
+		if err != nil {
+			writeError(writer, err)
+			return
+		}
+		writeResponse(writer, http.StatusOK, ontology)
+	})
+	h.mux.HandleFunc("GET /api/v1/ontology/proposals", func(writer http.ResponseWriter, request *http.Request) {
+		proposals, err := ontologyProposalsFor(request.Context(), h.service)
+		if err != nil {
+			writeError(writer, err)
+			return
+		}
+		writeResponse(writer, http.StatusOK, proposals)
+	})
+	h.mux.HandleFunc("POST /api/v1/ontology/proposals", func(writer http.ResponseWriter, request *http.Request) {
+		var input CreateOntologyProposalRequest
+		if err := decodeRequest(writer, request, &input); err != nil {
+			writeError(writer, shoal.NewError(shoal.ErrorInvalidArgument, err.Error()))
+			return
+		}
+		proposal, err := createOntologyProposalFor(request.Context(), h.service, input)
+		if err != nil {
+			writeError(writer, err)
+			return
+		}
+		writeResponse(writer, http.StatusCreated, proposal)
+	})
+	h.mux.HandleFunc("POST /api/v1/ontology/proposals/{proposal}/transition", func(writer http.ResponseWriter, request *http.Request) {
+		proposalID, err := decodeID(request.PathValue("proposal"))
+		if err != nil {
+			writeError(writer, shoal.NewError(
+				shoal.ErrorInvalidArgument, "ontology proposal ID "+err.Error()))
+			return
+		}
+		var input TransitionOntologyProposalRequest
+		if err := decodeRequest(writer, request, &input); err != nil {
+			writeError(writer, shoal.NewError(shoal.ErrorInvalidArgument, err.Error()))
+			return
+		}
+		proposal, err := transitionOntologyProposalFor(
+			request.Context(), h.service, proposalID, input)
+		if err != nil {
+			writeError(writer, err)
+			return
+		}
+		writeResponse(writer, http.StatusOK, proposal)
+	})
 	h.mux.HandleFunc("GET /api/v1/auth-config", h.authConfigEndpoint)
 	h.mux.HandleFunc("POST /api/v1/ingest", ingestEndpoint(h.service))
 	h.mux.HandleFunc("POST /api/v1/changes", changesEndpoint(h.service))

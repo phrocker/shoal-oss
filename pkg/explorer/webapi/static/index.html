@@ -42,7 +42,7 @@
       <section><h2>Hierarchy</h2><p id="hierarchy-status" class="muted" role="status" aria-live="polite">Select a document.</p><div id="hierarchy" class="tree"></div></section>
     </aside>
     <section class="center">
-      <div class="tabs" role="tablist" aria-label="Explorer views"><button id="tab-evidence" class="tab active" data-panel="evidence" role="tab" aria-controls="evidence" aria-selected="true" type="button">Evidence</button><button id="tab-graph" class="tab" data-panel="graph" role="tab" aria-controls="graph" aria-selected="false" tabindex="-1" type="button">Graph</button></div>
+      <div class="tabs" role="tablist" aria-label="Explorer views"><button id="tab-evidence" class="tab active" data-panel="evidence" role="tab" aria-controls="evidence" aria-selected="true" type="button">Evidence</button><button id="tab-graph" class="tab" data-panel="graph" role="tab" aria-controls="graph" aria-selected="false" tabindex="-1" type="button">Graph</button><button id="tab-ontology" class="tab" data-panel="ontology" role="tab" aria-controls="ontology" aria-selected="false" tabindex="-1" type="button">Ontology</button></div>
       <div id="evidence" class="panel active" role="tabpanel" aria-labelledby="tab-evidence"><p id="evidence-status" class="muted" role="status" aria-live="polite">Run a retrieval query to inspect exact evidence and explanations.</p><div id="evidence-results"></div></div>
       <div id="graph" class="panel" role="tabpanel" aria-labelledby="tab-graph">
         <div class="graph-tools">
@@ -66,6 +66,10 @@
             <ul id="graph-edges"></ul>
           </section>
         </div>
+      </div>
+      <div id="ontology" class="panel" role="tabpanel" aria-labelledby="tab-ontology">
+        <p id="ontology-status" class="muted" role="status" aria-live="polite">Loading active ontology…</p>
+        <div id="ontology-details"></div>
       </div>
     </section>
     <aside class="right">

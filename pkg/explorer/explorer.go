@@ -47,6 +47,7 @@ type Explorer struct {
 	edges                   map[shoal.ID]persistedEdge
 	interactions            map[shoal.ID]*persistedInteraction
 	folds                   map[shoal.ID]*persistedFold
+	ontologyProposals       map[shoal.ID]*persistedOntologyProposal
 	graphNodes              map[shoal.ID]graph.Node
 	graphEdges              map[shoal.ID]graph.Edge
 	outgoing                map[shoal.ID][]shoal.ID
@@ -175,6 +176,7 @@ func OpenWithOptions(dir string, options Options) (*Explorer, error) {
 		edges:                   make(map[shoal.ID]persistedEdge),
 		interactions:            make(map[shoal.ID]*persistedInteraction),
 		folds:                   make(map[shoal.ID]*persistedFold),
+		ontologyProposals:       make(map[shoal.ID]*persistedOntologyProposal),
 		embedder:                options.Embedder,
 		embedders:               embedders,
 		maxEmbeddingSpaceFanout: maxFanout,
