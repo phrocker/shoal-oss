@@ -76,8 +76,8 @@ type LatentLinkAssertionProjection struct {
 }
 
 // ProjectLatentLinkAssertions turns latent-edge link cells into derived
-// ontology assertions. Non-link cells are ignored so callers can pass a mixed
-// graph-index scan without pre-filtering.
+// ontology assertions. Non-link and deleted cells are ignored so callers can
+// pass a mixed graph-index scan without pre-filtering.
 func ProjectLatentLinkAssertions(
 	cells []LatentLinkCell,
 	projection LatentLinkAssertionProjection,
@@ -98,6 +98,11 @@ func ProjectLatentLinkAssertions(
 		if !bytes.Equal(cell.ColumnFamily, []byte(normalized.LinkColumnFamily)) {
 			// Load-bearing: TestProjectLatentLinkAssertionsSkipsNonLinkCells pins
 			// that mixed graph scans do not try to project embedding cells.
+			continue
+		}
+		if cell.Deleted {
+			// Load-bearing: TestProjectLatentLinkAssertionsSkipsDeletedLinkCells
+			// pins that tombstoned link cells do not become positive assertions.
 			continue
 		}
 		tessellationCell, source, target, err := latentLinkEndpoints(cell)

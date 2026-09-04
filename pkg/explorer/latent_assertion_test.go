@@ -175,6 +175,23 @@ func TestProjectLatentLinkAssertionsSkipsNonLinkCells(t *testing.T) {
 	}
 }
 
+func TestProjectLatentLinkAssertionsSkipsDeletedLinkCells(t *testing.T) {
+	projection := latentProjectionFixture(t)
+	deleted := latentCell("cell-a:entity:deleted", "entity:target", "not-a-score")
+	deleted.Deleted = true
+
+	assertions, err := ProjectLatentLinkAssertions(
+		[]LatentLinkCell{deleted, latentCell("cell-a:entity:live", "entity:target", "0.91")},
+		projection,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(assertions) != 1 || assertions[0].Subject() != "entity:live" {
+		t.Fatalf("assertions = %+v, want only live link cell", assertions)
+	}
+}
+
 func TestProjectLatentLinkAssertionsPreservesCustomLinkColumnFamily(t *testing.T) {
 	projection := latentProjectionFixture(t)
 	projection.LinkColumnFamily = "edge.custom:"
