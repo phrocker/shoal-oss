@@ -77,6 +77,10 @@ type GraphRankIterator struct {
 	labelCQ      string
 	rankCQ       string
 
+	// suppressRankEmission is set when the iterator runs over a partial view
+	// of the table. See Init.
+	suppressRankEmission bool
+
 	out      []Cell
 	outIndex int
 	err      error
@@ -171,6 +175,14 @@ func (g *GraphRankIterator) Init(source SortedKeyValueIterator, options map[stri
 	if s := options[GraphRankRankCQ]; s != "" {
 		g.rankCQ = s
 	}
+
+	// PageRank is a global algorithm: every vertex's score depends on the whole
+	// graph. A non-full major compaction only sees the subset of files being
+	// compacted, so ranks computed there would be wrong for the table as a
+	// whole -- and would be persisted as though authoritative. Suppress
+	// emission and pass source cells through untouched in that case.
+	// Load-bearing: TestGraphRank_PartialMajcSuppressesRankEmission.
+	g.suppressRankEmission = env.Scope == ScopeMajc && !env.FullMajorCompaction
 	return nil
 }
 
@@ -232,6 +244,13 @@ func (g *GraphRankIterator) Seek(r Range, columnFamilies [][]byte, inclusive boo
 			g.err = err
 			return err
 		}
+	}
+
+	if g.suppressRankEmission {
+		// Load-bearing: TestGraphRank_PartialMajcSuppressesRankEmission pins
+		// that a partial major compaction rewrites source cells unchanged.
+		g.sortOut()
+		return nil
 	}
 
 	if len(vertices) > g.maxVertices || len(vertices) == 0 {
@@ -355,5 +374,10 @@ func (g *GraphRankIterator) DeepCopy(env IteratorEnvironment) SortedKeyValueIter
 		edgeCFPrefix:         g.edgeCFPrefix,
 		labelCQ:              g.labelCQ,
 		rankCQ:               g.rankCQ,
+		// Inherited rather than re-derived from env, matching
+		// DeletingIterator.DeepCopy's handling of propagateDeletes: a copy must
+		// never silently regain rank emission the original suppressed.
+		// Load-bearing: TestGraphRank_PartialMajcDeepCopyStaysSuppressed.
+		suppressRankEmission: g.suppressRankEmission,
 	}
 }
