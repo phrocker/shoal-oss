@@ -99,6 +99,26 @@ type suppressionCountingLister interface {
 	) ([]explorer.DocumentSummary, uint32, error)
 }
 
+// disclosureCountingRetriever is implemented by an authorized backing client
+// that can report, alongside a retrieval, both withholding reason classes: plain
+// authorization denials and mosaic co-occurrence restrictions. It is preferred
+// over suppressionCountingRetriever when available so the two counts stay
+// distinguishable end to end; a client that implements only the older interface
+// still reports the denial count.
+type disclosureCountingRetriever interface {
+	RetrieveWithDisclosure(
+		context.Context, retrieval.Request,
+	) (retrieval.Response, authorized.Disclosure, error)
+}
+
+// disclosureCountingLister is the Documents-listing counterpart to
+// disclosureCountingRetriever under the same preference rule.
+type disclosureCountingLister interface {
+	DocumentsWithDisclosure(
+		context.Context,
+	) ([]explorer.DocumentSummary, authorized.Disclosure, error)
+}
+
 // changeFeedBackend is implemented by an authorized backing client that can
 // serve the caller's resumable document change feed. It is optional: a client
 // that does not implement it makes the change capability unavailable rather
@@ -212,7 +232,7 @@ func (s *EmbeddedService) Documents(
 	if err != nil {
 		return DocumentsResponse{}, err
 	}
-	documents, suppressed, err := s.documentsCountingSuppressed(ctx)
+	documents, disclosure, err := s.documentsCountingDisclosure(ctx)
 	if err != nil {
 		return DocumentsResponse{}, err
 	}
@@ -230,7 +250,8 @@ func (s *EmbeddedService) Documents(
 	response := DocumentsResponse{
 		Snapshot:   snapshot,
 		Documents:  append([]explorer.DocumentSummary(nil), documents[offset:end]...),
-		Suppressed: suppressed,
+		Suppressed: disclosure.Suppressed,
+		Restricted: disclosure.Restricted,
 	}
 	if end < len(documents) {
 		response.NextCursor = encodeCursor(snapshot.ID, end)
@@ -238,20 +259,26 @@ func (s *EmbeddedService) Documents(
 	return response, nil
 }
 
-// documentsCountingSuppressed lists the authorized documents and, when the
-// backing client can report it, the corpus-wide number of current documents
-// authorization withheld from this identity. See retrieveCountingSuppressed for
-// the amplification risk of disclosing this count; the same caveat applies to
-// the document listing, whose withheld count reveals roughly how much of the
-// shared corpus the identity cannot see.
-func (s *EmbeddedService) documentsCountingSuppressed(
+// documentsCountingDisclosure lists the authorized documents and, when the
+// backing client can report it, the corpus-wide counts of current documents
+// withheld from this identity, split by reason class: plain authorization
+// denials and mosaic co-occurrence restrictions. See retrieveCountingDisclosure
+// for the amplification risk of disclosing these counts; the same caveat applies
+// to the document listing. A client that reports only the older suppression
+// count still contributes the denial count with a zero restriction count, and a
+// client that reports neither withholds nothing.
+func (s *EmbeddedService) documentsCountingDisclosure(
 	ctx context.Context,
-) ([]explorer.DocumentSummary, uint32, error) {
+) ([]explorer.DocumentSummary, authorized.Disclosure, error) {
+	if counter, ok := s.client.(disclosureCountingLister); ok {
+		return counter.DocumentsWithDisclosure(ctx)
+	}
 	if counter, ok := s.client.(suppressionCountingLister); ok {
-		return counter.DocumentsWithSuppressed(ctx)
+		documents, suppressed, err := counter.DocumentsWithSuppressed(ctx)
+		return documents, authorized.Disclosure{Suppressed: suppressed}, err
 	}
 	documents, err := s.client.Documents(ctx)
-	return documents, 0, err
+	return documents, authorized.Disclosure{}, err
 }
 
 // Changes serves the caller's resumable document change feed. The request
@@ -339,7 +366,7 @@ func (s *EmbeddedService) Retrieve(
 	// The embedded backend is already pinned by the snapshot identity and does
 	// not implement historical publication-frontier reads.
 	query.AsOf = time.Time{}
-	response, suppressed, err := s.retrieveCountingSuppressed(ctx, query)
+	response, disclosure, err := s.retrieveCountingDisclosure(ctx, query)
 	if err != nil {
 		return RetrievalResponse{}, err
 	}
@@ -351,31 +378,44 @@ func (s *EmbeddedService) Retrieve(
 		return RetrievalResponse{}, err
 	}
 	return RetrievalResponse{
-		Snapshot: snapshot, Retrieval: response, Suppressed: suppressed,
+		Snapshot: snapshot, Retrieval: response,
+		Suppressed: disclosure.Suppressed, Restricted: disclosure.Restricted,
 	}, nil
 }
 
-// retrieveCountingSuppressed runs the authorized retrieval and, when the backing
-// client can report it, the number of current documents authorization withheld
-// from this identity and therefore never searched.
+// retrieveCountingDisclosure runs the authorized retrieval and, when the backing
+// client can report it, the counts of current documents withheld from this
+// identity and therefore never searched, split by reason class: plain
+// authorization denials (Suppressed) and mosaic co-occurrence restrictions
+// (Restricted).
 //
-// Amplification risk. This count is a real disclosure. Because a caller can
-// re-run retrieval as the corpus changes, and vary the request, and watch the
-// number move, the count is a coarse oracle for the existence and rough volume
-// of content the caller is not allowed to read. The count is the entire leak —
-// no identifiers, labels, or snippets accompany it — but it is still a leak. It
-// is emitted deliberately, on an explicit product decision, so a short or empty
-// answer can never be silently mistaken for "nothing exists". A future policy
-// control may need to coarsen or suppress this count for sensitive
-// authorization domains; that control is intentionally not built here.
-func (s *EmbeddedService) retrieveCountingSuppressed(
+// Amplification risk. The Suppressed count is a real disclosure. Because a
+// caller can re-run retrieval as the corpus changes, and vary the request, and
+// watch the number move, it is a coarse oracle for the existence and rough
+// volume of content the caller is not allowed to read. The count is the entire
+// leak — no identifiers, labels, or snippets accompany it — but it is still a
+// leak. It is emitted deliberately so a short or empty answer can never be
+// silently mistaken for "nothing exists".
+//
+// The Restricted count is deliberately narrower: it only ever counts documents
+// the caller is individually authorized to read, withheld to prevent
+// aggregation. It therefore discloses nothing about content the caller is not
+// cleared to read, and cannot become an existence oracle for unauthorized
+// content the way a caller-distinguishable denial signal could. It names no
+// domain and no document. See docs and app.js for how the two counts are
+// surfaced as distinct reason classes.
+func (s *EmbeddedService) retrieveCountingDisclosure(
 	ctx context.Context, query retrieval.Request,
-) (retrieval.Response, uint32, error) {
+) (retrieval.Response, authorized.Disclosure, error) {
+	if counter, ok := s.client.(disclosureCountingRetriever); ok {
+		return counter.RetrieveWithDisclosure(ctx, query)
+	}
 	if counter, ok := s.client.(suppressionCountingRetriever); ok {
-		return counter.RetrieveWithSuppressed(ctx, query)
+		response, suppressed, err := counter.RetrieveWithSuppressed(ctx, query)
+		return response, authorized.Disclosure{Suppressed: suppressed}, err
 	}
 	response, err := s.client.Retrieve(ctx, query)
-	return response, 0, err
+	return response, authorized.Disclosure{}, err
 }
 
 func (s *EmbeddedService) Neighborhood(

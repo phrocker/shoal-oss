@@ -422,6 +422,29 @@ function suppressionClause(count, identity) {
     `nothing exists; nothing about the withheld ${noun} is disclosed.`;
 }
 
+// restrictionClause states, in plain language, whether the mosaic co-occurrence
+// budget withheld results from this identity. It is deliberately distinct from
+// suppressionClause: these are documents the identity IS authorized to read
+// individually, withheld only because observing too many distinct sensitivity
+// domains together is an inference risk. It reveals only a count and never which
+// domains or documents were involved, so it cannot become an oracle for content
+// the identity is not cleared to read. The zero case is stated explicitly so a
+// restriction never reads the same as a plain authorization withholding.
+function restrictionClause(count, identity) {
+  const restricted = Number(count) || 0;
+  const who = identitySubjectLabel(identity);
+  if (restricted <= 0) {
+    return "";
+  }
+  const noun = restricted === 1 ? "document" : "documents";
+  const verb = restricted === 1 ? "is" : "are";
+  return ` ${restricted} ${noun} ${verb} restricted for ${who} by the ` +
+    `co-occurrence budget: you are authorized to read ${restricted === 1 ? "it" : "them"} ` +
+    `individually, but ${restricted === 1 ? "it was" : "they were"} withheld to ` +
+    `limit how many distinct sensitivity domains you observe together. This is a ` +
+    `restriction, not a denial, and nothing about the withheld ${noun} is disclosed.`;
+}
+
 async function loadMeta() {
   const response = await fetch("/api/v1/meta", {headers: {"accept": "application/json", ...authHeaders()}});
   const value = await response.json();
@@ -1938,18 +1961,24 @@ async function loadDocuments(reset = true) {
     if (reset) $("documents").replaceChildren();
     const documents = response.documents || [];
     const suppressed = response.suppressed || 0;
+    const restricted = response.restricted || 0;
+    const className = restricted > 0 ? "restricted" : suppressed > 0 ? "withheld" : null;
     if (documents.length === 0 && reset) {
       setStatus(
         $("documents-status"),
-        emptyDocumentsText(state.identity) + suppressionClause(suppressed, state.identity),
-        suppressed > 0 ? "withheld" : "empty-state",
+        emptyDocumentsText(state.identity) +
+          suppressionClause(suppressed, state.identity) +
+          restrictionClause(restricted, state.identity),
+        className || "empty-state",
       );
     } else {
       const total = $("documents").children.length + documents.length;
       setStatus(
         $("documents-status"),
-        `Showing ${total} document(s).` + suppressionClause(suppressed, state.identity),
-        suppressed > 0 ? "withheld" : "muted",
+        `Showing ${total} document(s).` +
+          suppressionClause(suppressed, state.identity) +
+          restrictionClause(restricted, state.identity),
+        className || "muted",
       );
     }
     const fragment = document.createDocumentFragment();
@@ -2538,7 +2567,7 @@ $("search").onsubmit = async (event) => {
     });
     if (generation !== searchGeneration) return;
     pin(response.snapshot);
-    renderEvidence(response.retrieval, response.suppressed || 0);
+    renderEvidence(response.retrieval, response.suppressed || 0, response.restricted || 0);
   } catch (error) {
     if (generation === searchGeneration) {
       $("evidence-results").replaceChildren();
@@ -2547,15 +2576,19 @@ $("search").onsubmit = async (event) => {
   }
 };
 
-function renderEvidence(response, suppressed = 0) {
+function renderEvidence(response, suppressed = 0, restricted = 0) {
   const results = response.results || [];
   const withheld = Number(suppressed) || 0;
+  const barred = Number(restricted) || 0;
+  const className = barred > 0 ? "restricted" : withheld > 0 ? "withheld" : null;
   if (results.length === 0) {
     $("evidence-results").replaceChildren();
     setStatus(
       $("evidence-status"),
-      emptyRetrievalText(state.identity) + suppressionClause(withheld, state.identity),
-      withheld > 0 ? "withheld" : "empty-state",
+      emptyRetrievalText(state.identity) +
+        suppressionClause(withheld, state.identity) +
+        restrictionClause(barred, state.identity),
+      className || "empty-state",
     );
     draw();
     return;
@@ -2563,8 +2596,9 @@ function renderEvidence(response, suppressed = 0) {
   setStatus(
     $("evidence-status"),
     `Showing ${results.length} evidence result(s).` +
-      suppressionClause(withheld, state.identity),
-    withheld > 0 ? "withheld" : "muted",
+      suppressionClause(withheld, state.identity) +
+      restrictionClause(barred, state.identity),
+    className || "muted",
   );
   const fragment = document.createDocumentFragment();
   results.forEach((result) => {

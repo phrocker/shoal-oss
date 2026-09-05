@@ -33,8 +33,8 @@ import (
 func (c *Client) Documents(
 	ctx context.Context,
 ) ([]explorer.DocumentSummary, error) {
-	var suppressed uint32
-	return c.documents(ctx, &suppressed)
+	var disclosure Disclosure
+	return c.documents(ctx, &disclosure)
 }
 
 // DocumentsWithSuppressed lists the same authorized documents as Documents and
@@ -46,17 +46,33 @@ func (c *Client) Documents(
 func (c *Client) DocumentsWithSuppressed(
 	ctx context.Context,
 ) ([]explorer.DocumentSummary, uint32, error) {
-	var suppressed uint32
-	summaries, err := c.documents(ctx, &suppressed)
+	var disclosure Disclosure
+	summaries, err := c.documents(ctx, &disclosure)
 	if err != nil {
 		return nil, 0, err
 	}
-	return summaries, suppressed, nil
+	return summaries, disclosure.Suppressed, nil
+}
+
+// DocumentsWithDisclosure lists the same authorized documents as Documents and
+// additionally reports both withholding reason classes: authorization denials
+// (Suppressed) and mosaic co-occurrence restrictions (Restricted). The two
+// counts are kept apart so a caller can tell a plain denial from a
+// co-occurrence restriction; neither ever names what was withheld.
+func (c *Client) DocumentsWithDisclosure(
+	ctx context.Context,
+) ([]explorer.DocumentSummary, Disclosure, error) {
+	var disclosure Disclosure
+	summaries, err := c.documents(ctx, &disclosure)
+	if err != nil {
+		return nil, Disclosure{}, err
+	}
+	return summaries, disclosure, nil
 }
 
 func (c *Client) documents(
 	ctx context.Context,
-	suppressed *uint32,
+	disclosure *Disclosure,
 ) ([]explorer.DocumentSummary, error) {
 	decision, guard, now, err := c.begin(ctx, auth.OperationList)
 	if err != nil {
@@ -66,7 +82,12 @@ func (c *Client) documents(
 	if err != nil {
 		return nil, err
 	}
-	visible := make([]explorer.DocumentSummary, 0, len(summaries))
+	type authorizedDocument struct {
+		registration RevisionRegistration
+	}
+	order := make([]shoal.ID, 0, len(summaries))
+	authorizedDocuments := make(
+		map[shoal.ID]authorizedDocument, len(summaries))
 	for _, summary := range summaries {
 		if err := validateSummary(summary); err != nil {
 			return nil, inconsistentBase()
@@ -86,7 +107,7 @@ func (c *Client) documents(
 			// catalog, where the corpus is intact but every document falls
 			// through here; without it a fully withheld corpus would read as
 			// "nothing withheld". The record is still dropped exactly as before.
-			*suppressed++
+			disclosure.Suppressed++
 			continue
 		}
 		if registration.RevisionID != summary.Revision.ID {
@@ -102,9 +123,34 @@ func (c *Client) documents(
 			// record is still dropped exactly as before. Counting a document
 			// the identity's rule denies is unambiguous authorization
 			// suppression, alongside the missing-grant case counted above.
-			*suppressed++
+			disclosure.Suppressed++
 			continue
 		}
+		order = append(order, summary.Document.ID)
+		authorizedDocuments[summary.Document.ID] = authorizedDocument{
+			registration: registration,
+		}
+	}
+
+	restricted, err := c.restrictCoOccurrence(
+		ctx, decision, now, order, func(documentID shoal.ID) string {
+			return authorizedDocuments[documentID].registration.Rule.
+				sensitivityDomain()
+		})
+	if err != nil {
+		return nil, err
+	}
+
+	visible := make([]explorer.DocumentSummary, 0, len(order))
+	for _, documentID := range order {
+		if _, ok := restricted.allowed[documentID]; !ok {
+			// Load-bearing: the identity is individually authorized for this
+			// document, but its sensitivity domain exceeds the co-occurrence
+			// budget, so it is withheld here exactly as a denial would be.
+			// TestMosaicBudgetDocumentsWithholdsCrossDomain pins the skip.
+			continue
+		}
+		registration := authorizedDocuments[documentID].registration
 		view, err := c.base.Document(
 			ctx, registration.DocumentID, registration.RevisionID)
 		if err != nil {
@@ -125,6 +171,7 @@ func (c *Client) documents(
 			SourceMediaType: sourceMediaType,
 		})
 	}
+	disclosure.Restricted += restricted.restricted
 	if err := guard.Check(ctx); err != nil {
 		return nil, err
 	}

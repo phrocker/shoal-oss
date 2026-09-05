@@ -48,6 +48,12 @@ type Config struct {
 	PolicyStore        PolicyStore
 	GenerationReader   auth.GenerationReader
 	Clock              func() time.Time
+	// Mosaic optionally enables the sensitivity-domain co-occurrence budget
+	// that defends against the mosaic effect. A zero MaxDomains disables it; a
+	// nonzero MaxDomains requires PolicyStore to implement CoOccurrenceLedger
+	// and a positive Window, so an enabled-but-unbacked control fails closed at
+	// construction.
+	Mosaic MosaicBudget
 }
 
 // Client enforces trusted-context authorization around an Explorer client.
@@ -60,8 +66,11 @@ type Client struct {
 	policyStore        PolicyStore
 	generationReader   auth.GenerationReader
 	clock              func() time.Time
+	mosaic             MosaicBudget
+	ledger             CoOccurrenceLedger
 	mutationMu         sync.Mutex
 	vectorMu           sync.Mutex
+	budgetMu           sync.Mutex
 	vectorAvailability authorizedVectorAvailabilityCache
 }
 
@@ -100,6 +109,17 @@ func NewClient(config Config) (*Client, error) {
 			return nil, dependencyRequired("edge policy selector")
 		}
 	}
+	var ledger CoOccurrenceLedger
+	if config.Mosaic.enabled() {
+		if config.Mosaic.Window <= 0 {
+			return nil, dependencyRequired("mosaic co-occurrence window")
+		}
+		var ok bool
+		ledger, ok = config.PolicyStore.(CoOccurrenceLedger)
+		if !ok || isNilDependency(ledger) {
+			return nil, dependencyRequired("co-occurrence ledger")
+		}
+	}
 	return &Client{
 		base:               config.Base,
 		vectorScorer:       config.VectorScorer,
@@ -109,6 +129,8 @@ func NewClient(config Config) (*Client, error) {
 		policyStore:        config.PolicyStore,
 		generationReader:   config.GenerationReader,
 		clock:              config.Clock,
+		mosaic:             config.Mosaic,
+		ledger:             ledger,
 	}, nil
 }
 

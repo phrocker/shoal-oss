@@ -33,8 +33,8 @@ func (c *Client) Retrieve(
 	ctx context.Context,
 	request retrieval.Request,
 ) (retrieval.Response, error) {
-	var suppressed uint32
-	return c.retrieve(ctx, request, &suppressed)
+	var disclosure Disclosure
+	return c.retrieve(ctx, request, &disclosure)
 }
 
 // RetrieveWithSuppressed performs the identical authorized retrieval as
@@ -47,18 +47,36 @@ func (c *Client) RetrieveWithSuppressed(
 	ctx context.Context,
 	request retrieval.Request,
 ) (retrieval.Response, uint32, error) {
-	var suppressed uint32
-	response, err := c.retrieve(ctx, request, &suppressed)
+	var disclosure Disclosure
+	response, err := c.retrieve(ctx, request, &disclosure)
 	if err != nil {
 		return retrieval.Response{}, 0, err
 	}
-	return response, suppressed, nil
+	return response, disclosure.Suppressed, nil
+}
+
+// RetrieveWithDisclosure performs the identical authorized retrieval as
+// Retrieve and additionally reports both withholding reason classes:
+// authorization denials (Suppressed) and mosaic co-occurrence restrictions
+// (Restricted). The two counts are kept apart so a caller can tell a plain
+// denial from a co-occurrence restriction; neither ever names what was
+// withheld.
+func (c *Client) RetrieveWithDisclosure(
+	ctx context.Context,
+	request retrieval.Request,
+) (retrieval.Response, Disclosure, error) {
+	var disclosure Disclosure
+	response, err := c.retrieve(ctx, request, &disclosure)
+	if err != nil {
+		return retrieval.Response{}, Disclosure{}, err
+	}
+	return response, disclosure, nil
 }
 
 func (c *Client) retrieve(
 	ctx context.Context,
 	request retrieval.Request,
-	suppressed *uint32,
+	disclosure *Disclosure,
 ) (retrieval.Response, error) {
 	normalized, err := request.Normalize()
 	if err != nil {
@@ -102,7 +120,7 @@ func (c *Client) retrieve(
 			// catalog, where the corpus is intact but every document falls
 			// through here; without it a fully withheld corpus would read as
 			// "nothing withheld". The record is still dropped exactly as before.
-			*suppressed++
+			disclosure.Suppressed++
 			continue
 		}
 		if registration.RevisionID != summary.Revision.ID {
@@ -118,7 +136,7 @@ func (c *Client) retrieve(
 			// record is still dropped exactly as before. Counting a document
 			// the identity's rule denies is unambiguous authorization
 			// suppression, alongside the missing-grant case counted above.
-			*suppressed++
+			disclosure.Suppressed++
 			continue
 		}
 		if _, duplicate := visible[summary.Document.ID]; duplicate {
@@ -126,6 +144,33 @@ func (c *Client) retrieve(
 		}
 		visible[summary.Document.ID] = registration
 		visibleOrder = append(visibleOrder, summary.Document.ID)
+	}
+
+	restricted, err := c.restrictCoOccurrence(
+		ctx, decision, now, visibleOrder, func(documentID shoal.ID) string {
+			return visible[documentID].Rule.sensitivityDomain()
+		})
+	if err != nil {
+		return retrieval.Response{}, err
+	}
+	disclosure.Restricted += restricted.restricted
+	if len(restricted.allowed) != len(visibleOrder) {
+		// Load-bearing: documents whose sensitivity domain exceeds the
+		// co-occurrence budget are dropped from the projection so the base
+		// scorer never searches them, exactly as an authorization denial is.
+		// TestMosaicBudgetRetrieveWithholdsCrossDomain pins this filtering.
+		filteredOrder := make([]shoal.ID, 0, len(restricted.allowed))
+		filteredVisible := make(
+			map[shoal.ID]RevisionRegistration, len(restricted.allowed))
+		for _, documentID := range visibleOrder {
+			if _, ok := restricted.allowed[documentID]; !ok {
+				continue
+			}
+			filteredOrder = append(filteredOrder, documentID)
+			filteredVisible[documentID] = visible[documentID]
+		}
+		visibleOrder = filteredOrder
+		visible = filteredVisible
 	}
 
 	documentIDs := visibleOrder
