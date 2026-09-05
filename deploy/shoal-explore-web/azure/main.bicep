@@ -73,10 +73,10 @@ param entraTenantId string = ''
 param entraClientId string = ''
 
 @description('Deprecated compatibility parameter: former reader app-role values.')
-param entraReaderRoles string = ''
+param entraReaderRoles string = 'Shoal.Reader'
 
 @description('Deprecated compatibility parameter: former contributor app-role values.')
-param entraContributorRoles string = ''
+param entraContributorRoles string = 'Shoal.Contributor'
 
 @description('Deprecated compatibility parameter: former exact issuer override.')
 param entraIssuer string = ''
@@ -170,9 +170,10 @@ resource plan 'Microsoft.Web/serverfarms@2023-12-01' = {
 // can name custom domains explicitly.
 var effectiveAllowedHosts = empty(allowedHosts) ? site.properties.defaultHostName : allowedHosts
 var oidcConfigured = !empty(oidcIssuer) || !empty(oidcAudience) || !empty(oidcAuthorizationClaim) || !empty(oidcDiscoveryUrl) || !empty(oidcJwksUri) || !empty(oidcBrowserClientId) || !empty(oidcBrowserScope)
-var legacyEntraConfigured = !empty(entraTenantId) || !empty(entraClientId) || !empty(entraIssuer) || !empty(entraJwksUri) || !empty(entraReaderRoles) || !empty(entraContributorRoles) || !empty(entraScope)
-var effectiveEntraReaderRoles = legacyEntraConfigured && empty(entraReaderRoles) ? 'Shoal.Reader' : entraReaderRoles
-var effectiveEntraContributorRoles = legacyEntraConfigured && empty(entraContributorRoles) ? 'Shoal.Contributor' : entraContributorRoles
+// Role parameters retain their historical non-empty defaults, so they cannot
+// participate in this activation test. Once another legacy parameter opts in,
+// their exact values (including an explicit empty string) are passed through.
+var legacyEntraConfigured = !empty(entraTenantId) || !empty(entraClientId) || !empty(entraIssuer) || !empty(entraJwksUri) || !empty(entraScope)
 
 // App settings, as a map for the child `appsettings` config resource. They are
 // set on a separate resource (not inline in siteConfig) precisely so
@@ -209,8 +210,8 @@ var appSettings = union(
   !legacyEntraConfigured ? {} : {
     SHOAL_ENTRA_TENANT: entraTenantId
     SHOAL_ENTRA_CLIENT_ID: entraClientId
-    SHOAL_ENTRA_READER_ROLES: effectiveEntraReaderRoles
-    SHOAL_ENTRA_CONTRIBUTOR_ROLES: effectiveEntraContributorRoles
+    SHOAL_ENTRA_READER_ROLES: entraReaderRoles
+    SHOAL_ENTRA_CONTRIBUTOR_ROLES: entraContributorRoles
   },
   empty(entraIssuer) ? {} : {
     SHOAL_ENTRA_ISSUER: entraIssuer

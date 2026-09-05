@@ -429,12 +429,14 @@ func TestAzureTemplateRetainsDeprecatedEntraParameters(t *testing.T) {
 	for _, want := range []string{
 		"param entraTenantId string",
 		"param entraClientId string",
-		"param entraReaderRoles string",
-		"param entraContributorRoles string",
+		"param entraReaderRoles string = 'Shoal.Reader'",
+		"param entraContributorRoles string = 'Shoal.Contributor'",
 		"param entraIssuer string",
 		"param entraJwksUri string",
 		"SHOAL_ENTRA_TENANT: entraTenantId",
 		"SHOAL_ENTRA_CLIENT_ID: entraClientId",
+		"SHOAL_ENTRA_READER_ROLES: entraReaderRoles",
+		"SHOAL_ENTRA_CONTRIBUTOR_ROLES: entraContributorRoles",
 	} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("Azure compatibility template missing %q", want)

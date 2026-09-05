@@ -1189,7 +1189,8 @@ type jwksCache struct {
 // keyForID returns the public key for a key identifier. A miss refreshes at
 // most once per minRefreshInterval, while a hit refreshes once maxCacheAge has
 // elapsed so issuer-side key removal takes effect within a bounded interval.
-// The mutex is held across the fetch so concurrent refreshes collapse to one.
+// The mutex protects refresh state but is released before network I/O;
+// refreshing and refreshDone collapse concurrent callers onto one shared fetch.
 func (c *jwksCache) keyForID(
 	ctx context.Context,
 	kid string,
