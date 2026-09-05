@@ -47,10 +47,26 @@ func buildApplication(
 	if err != nil {
 		return nil, err
 	}
+	var optionalTools []mcp.OptionalToolProvider
+	if identityAllows(config.identity, auth.OperationAnalyticsRead) {
+		limits, available := service.AnalyticsLimits()
+		if !available {
+			return nil, errors.Join(
+				fmt.Errorf("analytics was authorized but its provider is unavailable"),
+				closeWorkspace(),
+			)
+		}
+		provider, providerErr := mcp.NewAnalyticsTool(service, limits)
+		if providerErr != nil {
+			return nil, errors.Join(providerErr, closeWorkspace())
+		}
+		optionalTools = append(optionalTools, provider)
+	}
 	server, err := mcp.NewServer(mcp.Config{
-		Service:   service,
-		Authority: authority,
-		Decisions: identity,
+		Service:       service,
+		Authority:     authority,
+		Decisions:     identity,
+		OptionalTools: optionalTools,
 		ServerInfo: mcp.Implementation{
 			Name:        "shoal-mcp",
 			Title:       "Shoal Explorer MCP",
@@ -74,6 +90,15 @@ func buildApplication(
 		return nil, errors.Join(err, closeWorkspace())
 	}
 	return app, nil
+}
+
+func identityAllows(config identityConfig, operation auth.Operation) bool {
+	for _, allowed := range config.operations {
+		if allowed == operation {
+			return true
+		}
+	}
+	return false
 }
 
 func openWorkspace(

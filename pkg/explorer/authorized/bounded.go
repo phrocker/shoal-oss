@@ -303,14 +303,16 @@ func (c *Client) BoundedNeighborhood(
 	}
 	if authorizedCursorEligible(normalized) {
 		return c.boundedAuthorizedNeighborhoodPage(
-			ctx, bounded, request, normalized, decision, guard, now, direction)
+			ctx, bounded, request, normalized, decision, guard, now, direction,
+			auth.OperationNeighborhood)
 	}
 	raw, err := bounded.BoundedNeighborhood(ctx, request)
 	if err != nil {
 		return explorer.BoundedNeighborhood{}, directBaseError(err)
 	}
 	filtered, err := c.filterNeighborhood(
-		ctx, raw.Neighborhood, normalized, direction, decision, now, false)
+		ctx, raw.Neighborhood, normalized, direction, decision, now, false,
+		auth.OperationNeighborhood)
 	if err != nil {
 		return explorer.BoundedNeighborhood{}, err
 	}
@@ -350,6 +352,7 @@ func (c *Client) boundedAuthorizedNeighborhoodPage(
 	guard auth.GenerationGuard,
 	now time.Time,
 	direction explorer.GraphDirection,
+	operation auth.Operation,
 ) (explorer.BoundedNeighborhood, error) {
 	scan := request
 	scan.Depth = 1
@@ -385,7 +388,8 @@ func (c *Client) boundedAuthorizedNeighborhoodPage(
 		}
 		scannedEdges += uint32(len(raw.Neighborhood.Edges))
 		filtered, err := c.filterNeighborhood(
-			ctx, raw.Neighborhood, normalized, direction, decision, now, true)
+			ctx, raw.Neighborhood, normalized, direction, decision, now, true,
+			operation)
 		if err != nil {
 			return explorer.BoundedNeighborhood{}, err
 		}
@@ -572,6 +576,7 @@ func (c *Client) filterNeighborhood(
 	decision auth.Decision,
 	now time.Time,
 	allowMissingProvenanceSeeds bool,
+	operation auth.Operation,
 ) (explorer.Neighborhood, error) {
 	candidates := make(map[shoal.ID]graph.Node, len(raw.Nodes))
 	registrations := make(map[shoal.ID]NodeRegistration, len(raw.Nodes))
@@ -597,7 +602,7 @@ func (c *Client) filterNeighborhood(
 			continue
 		}
 		allowed, err := ruleAllows(
-			registration.Rule, decision, auth.OperationNeighborhood, now)
+			registration.Rule, decision, operation, now)
 		if err != nil {
 			return explorer.Neighborhood{}, err
 		}
@@ -648,7 +653,7 @@ func (c *Client) filterNeighborhood(
 		if hasAssertion && assertion.Origin() == ontology.AssertionDerived {
 			allowed, err := c.derivedAssertionEndpointsAllow(
 				ctx, rawNodes, visibleNodes, resolved, assertion, decision,
-				auth.OperationNeighborhood, now)
+				operation, now)
 			if err != nil {
 				return explorer.Neighborhood{}, err
 			}
@@ -665,7 +670,7 @@ func (c *Client) filterNeighborhood(
 				return explorer.Neighborhood{}, inconsistentBase()
 			}
 			allowed, err := c.derivedAssertionAllows(
-				ctx, assertion, decision, auth.OperationNeighborhood, now)
+				ctx, assertion, decision, operation, now)
 			if err != nil {
 				return explorer.Neighborhood{}, err
 			}
@@ -700,7 +705,7 @@ func (c *Client) filterNeighborhood(
 			continue
 		}
 		allowed, err := edgeAllowsResolved(
-			resolved, registration, decision, auth.OperationNeighborhood, now)
+			resolved, registration, decision, operation, now)
 		if err != nil {
 			return explorer.Neighborhood{}, err
 		}
