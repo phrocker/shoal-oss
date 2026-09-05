@@ -18,29 +18,35 @@
 package webapi
 
 import (
+	"net"
 	"net/http"
 	"net/url"
 	"path"
+	"strconv"
 	"strings"
 )
 
 // BrowserAuthConfig carries the non-secret parameters a browser needs to begin
 // an OIDC Authorization Code + PKCE login against a configured identity
-// provider. Every field appears in the address bar of an ordinary OIDC redirect
-// and none is a secret: there is deliberately no client secret here. The
-// browser performs a public-client PKCE exchange and the server only validates
-// the bearer token that results; it never issues one.
+// provider. Every field is public OIDC metadata or a public-client parameter;
+// there is deliberately no client secret here. The browser performs a
+// public-client PKCE exchange and the server only validates the bearer token
+// that results; it never issues one.
 type BrowserAuthConfig struct {
-	// TenantID is the directory identifier, surfaced for display only.
+	// TenantID is retained for source and wire compatibility with the former
+	// provider-specific browser contract. New integrations should leave it
+	// empty and use the endpoint fields.
 	TenantID string
-	// ClientID is the public application (client) ID the browser authenticates
-	// as and that the resulting token is audienced to.
+	// ClientID is the public application identifier the browser authenticates as.
 	ClientID string
 	// Scope is the space-delimited scope string the browser requests.
 	Scope string
-	// Authority is the OIDC authority base, for example
-	// https://login.microsoftonline.com/<tenant>. The browser derives the
-	// authorize and token endpoints from it.
+	// AuthorizationEndpoint is the exact OIDC authorization endpoint.
+	AuthorizationEndpoint string
+	// TokenEndpoint is the exact OIDC token endpoint.
+	TokenEndpoint string
+	// Authority is retained for compatibility. When endpoint fields are empty,
+	// the former v2 authorization and token paths are derived from this base.
 	Authority string
 }
 
@@ -50,11 +56,13 @@ type BrowserAuthConfig struct {
 // When no interactive login is configured it reports Configured false and the
 // browser renders no login UI at all, which is the correct state for -dev-auth.
 type AuthConfigResponse struct {
-	Configured bool   `json:"configured"`
-	TenantID   string `json:"tenant_id,omitempty"`
-	ClientID   string `json:"client_id,omitempty"`
-	Scope      string `json:"scope,omitempty"`
-	Authority  string `json:"authority,omitempty"`
+	Configured            bool   `json:"configured"`
+	TenantID              string `json:"tenant_id,omitempty"`
+	ClientID              string `json:"client_id,omitempty"`
+	Scope                 string `json:"scope,omitempty"`
+	Authority             string `json:"authority,omitempty"`
+	AuthorizationEndpoint string `json:"authorization_endpoint,omitempty"`
+	TokenEndpoint         string `json:"token_endpoint,omitempty"`
 }
 
 // SetBrowserAuthConfig supplies the non-secret parameters a browser needs to
@@ -74,39 +82,95 @@ func (h *Handler) authConfigEndpoint(writer http.ResponseWriter, _ *http.Request
 		writeResponse(writer, http.StatusOK, AuthConfigResponse{Configured: false})
 		return
 	}
+	authorizationEndpoint, tokenEndpoint := h.browserAuth.endpoints()
 	writeResponse(writer, http.StatusOK, AuthConfigResponse{
-		Configured: true,
-		TenantID:   h.browserAuth.TenantID,
-		ClientID:   h.browserAuth.ClientID,
-		Scope:      h.browserAuth.Scope,
-		Authority:  h.browserAuth.Authority,
+		Configured:            true,
+		TenantID:              h.browserAuth.TenantID,
+		ClientID:              h.browserAuth.ClientID,
+		Scope:                 h.browserAuth.Scope,
+		Authority:             h.browserAuth.Authority,
+		AuthorizationEndpoint: authorizationEndpoint,
+		TokenEndpoint:         tokenEndpoint,
 	})
+}
+
+func (c *BrowserAuthConfig) endpoints() (string, string) {
+	if c == nil {
+		return "", ""
+	}
+	authorizationEndpoint := strings.TrimSpace(c.AuthorizationEndpoint)
+	tokenEndpoint := strings.TrimSpace(c.TokenEndpoint)
+	authority := strings.TrimRight(strings.TrimSpace(c.Authority), "/")
+	if authority != "" {
+		if authorizationEndpoint == "" {
+			authorizationEndpoint = authority + "/oauth2/v2.0/authorize"
+		}
+		if tokenEndpoint == "" {
+			tokenEndpoint = authority + "/oauth2/v2.0/token"
+		}
+	}
+	return authorizationEndpoint, tokenEndpoint
 }
 
 // connectSources is the connect-src value for the Content-Security-Policy. With
 // no interactive login configured it is exactly 'self', byte-identical to the
-// local development posture. When a login is configured the browser must POST
-// the PKCE token exchange to the identity provider, so exactly that provider's
-// origin — scheme and host only, derived from the configured authority — is
-// added and nothing wider. A malformed or non-https authority contributes
+// local development posture. When a login is configured, only the token
+// endpoint origin is added because it is the sole cross-origin fetch; the
+// authorization endpoint is reached by top-level navigation and does not need
+// connect-src permission. A malformed or non-https token endpoint contributes
 // nothing, failing closed to 'self'.
 func (h *Handler) connectSources() string {
 	if h.browserAuth == nil {
 		return "'self'"
 	}
-	origin := authorityOrigin(h.browserAuth.Authority)
+	_, tokenEndpoint := h.browserAuth.endpoints()
+	origin := endpointOrigin(tokenEndpoint)
 	if origin == "" {
 		return "'self'"
 	}
 	return "'self' " + origin
 }
 
-func authorityOrigin(authority string) string {
-	parsed, err := url.Parse(strings.TrimSpace(authority))
-	if err != nil || parsed.Scheme != "https" || parsed.Host == "" {
+func endpointOrigin(endpoint string) string {
+	parsed, err := url.Parse(strings.TrimSpace(endpoint))
+	if err != nil || parsed.Scheme != "https" || parsed.Host == "" ||
+		parsed.User != nil || strings.ContainsAny(
+		parsed.Host, "*'\"; \t\r\n\\",
+	) || !validEndpointHost(parsed.Hostname()) {
 		return ""
 	}
+	if port := parsed.Port(); port != "" {
+		number, err := strconv.Atoi(port)
+		if err != nil || number < 1 || number > 65535 {
+			return ""
+		}
+	}
 	return parsed.Scheme + "://" + parsed.Host
+}
+
+func validEndpointHost(host string) bool {
+	if net.ParseIP(host) != nil {
+		return true
+	}
+	host = strings.TrimSuffix(host, ".")
+	if host == "" || len(host) > 253 {
+		return false
+	}
+	for _, label := range strings.Split(host, ".") {
+		if len(label) == 0 || len(label) > 63 ||
+			label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		for _, character := range label {
+			if (character < 'a' || character > 'z') &&
+				(character < 'A' || character > 'Z') &&
+				(character < '0' || character > '9') &&
+				character != '-' {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // publiclyReachable is the fail-closed allowlist of request lines the transport

@@ -6,8 +6,8 @@
 // backed by a bring-your-own Azure Files share so the corpus and the durable
 // policy catalog survive restarts as one mount.
 //
-// It contains NO secrets. The Microsoft Entra ID authenticator validates inbound
-// bearer tokens and never accepts a client secret (verified in
+// It contains NO secrets. The OIDC authenticator validates inbound bearer
+// tokens and never accepts a client secret (verified in
 // cmd/shoal-explore-web/main.go), so there is no application credential to store.
 // The only credential is the Azure Files access key used to mount the share; it
 // is resolved at deploy time with listKeys() and is never written to the
@@ -39,23 +39,53 @@ param useAcrManagedIdentity bool = true
 @description('App Service plan SKU name. Must be a plan that supports Always On and custom containers (for example P0v3, P1v3).')
 param planSkuName string = 'P1v3'
 
-@description('Microsoft Entra ID tenant (directory) ID. Placeholder GUID by default; override per environment.')
-param entraTenantId string
+@description('Exact OIDC token issuer.')
+param oidcIssuer string = ''
 
-@description('Application (client) ID the inbound token audience must match exactly.')
-param entraClientId string
+@description('Comma-separated accepted OIDC token audiences.')
+param oidcAudience string = ''
 
-@description('Comma-separated Entra app-role values granted read-only workspace access.')
+@description('Top-level token claim whose string values map to workspace authority.')
+param oidcAuthorizationClaim string = ''
+
+@description('Comma-separated authorization-claim values granted read-only workspace access.')
+param oidcReaderValues string = 'reader'
+
+@description('Comma-separated authorization-claim values granted read and ingest access.')
+param oidcContributorValues string = 'contributor'
+
+@description('Optional OIDC discovery URL override. Empty derives it from the issuer.')
+param oidcDiscoveryUrl string = ''
+
+@description('Optional JWKS URI override. Empty resolves via OIDC discovery.')
+param oidcJwksUri string = ''
+
+@description('Optional public-client identifier enabling browser Authorization Code + PKCE login.')
+param oidcBrowserClientId string = ''
+
+@description('Browser login scope. Required when oidcBrowserClientId is set.')
+param oidcBrowserScope string = ''
+
+@description('Deprecated compatibility parameter: former Entra tenant ID.')
+param entraTenantId string = ''
+
+@description('Deprecated compatibility parameter: former Entra client ID.')
+param entraClientId string = ''
+
+@description('Deprecated compatibility parameter: former reader app-role values.')
 param entraReaderRoles string = 'Shoal.Reader'
 
-@description('Comma-separated Entra app-role values granted read and ingest access.')
+@description('Deprecated compatibility parameter: former contributor app-role values.')
 param entraContributorRoles string = 'Shoal.Contributor'
 
-@description('Optional exact token issuer override. Empty uses https://login.microsoftonline.com/<tenant>/v2.0.')
+@description('Deprecated compatibility parameter: former exact issuer override.')
 param entraIssuer string = ''
 
-@description('Optional JWKS URI override. Empty resolves via OIDC discovery from the issuer.')
+@description('Deprecated compatibility parameter: former JWKS URI override.')
 param entraJwksUri string = ''
+
+@description('Deprecated compatibility parameter: former browser scope override.')
+param entraScope string = ''
 
 @description('Azure Files share quota in GiB for the state root (corpus + policy).')
 @minValue(1)
@@ -139,6 +169,11 @@ resource plan 'Microsoft.Web/serverfarms@2023-12-01' = {
 // Host header). A non-empty parameter is passed through verbatim so an operator
 // can name custom domains explicitly.
 var effectiveAllowedHosts = empty(allowedHosts) ? site.properties.defaultHostName : allowedHosts
+var oidcConfigured = !empty(oidcIssuer) || !empty(oidcAudience) || !empty(oidcAuthorizationClaim) || !empty(oidcDiscoveryUrl) || !empty(oidcJwksUri) || !empty(oidcBrowserClientId) || !empty(oidcBrowserScope)
+// Role parameters retain their historical non-empty defaults, so they cannot
+// participate in this activation test. Once another legacy parameter opts in,
+// their exact values (including an explicit empty string) are passed through.
+var legacyEntraConfigured = !empty(entraTenantId) || !empty(entraClientId) || !empty(entraIssuer) || !empty(entraJwksUri) || !empty(entraScope)
 
 // App settings, as a map for the child `appsettings` config resource. They are
 // set on a separate resource (not inline in siteConfig) precisely so
@@ -151,19 +186,41 @@ var appSettings = union(
     // not /home, so App Service /home storage is intentionally disabled.
     WEBSITES_ENABLE_APP_SERVICE_STORAGE: 'false'
     WEBSITES_CONTAINER_START_TIME_LIMIT: '600'
-    // Entra tenant/client/roles arrive as SHOAL_ENTRA_* environment variables,
-    // so no identifiers land on the command line or in shell history.
+    SHOAL_ALLOWED_HOST: effectiveAllowedHosts
+  },
+  !oidcConfigured ? {} : {
+    // OIDC validation and claim mapping arrive as SHOAL_OIDC_* environment
+    // variables, so identifiers do not land on the command line.
+    SHOAL_OIDC_ISSUER: oidcIssuer
+    SHOAL_OIDC_AUDIENCE: oidcAudience
+    SHOAL_OIDC_AUTHORIZATION_CLAIM: oidcAuthorizationClaim
+    SHOAL_OIDC_READER_VALUES: oidcReaderValues
+    SHOAL_OIDC_CONTRIBUTOR_VALUES: oidcContributorValues
+  },
+  empty(oidcDiscoveryUrl) ? {} : {
+    SHOAL_OIDC_DISCOVERY_URL: oidcDiscoveryUrl
+  },
+  empty(oidcJwksUri) ? {} : {
+    SHOAL_OIDC_JWKS_URI: oidcJwksUri
+  },
+  empty(oidcBrowserClientId) && empty(oidcBrowserScope) ? {} : {
+    SHOAL_OIDC_BROWSER_CLIENT_ID: oidcBrowserClientId
+    SHOAL_OIDC_BROWSER_SCOPE: oidcBrowserScope
+  },
+  !legacyEntraConfigured ? {} : {
     SHOAL_ENTRA_TENANT: entraTenantId
     SHOAL_ENTRA_CLIENT_ID: entraClientId
     SHOAL_ENTRA_READER_ROLES: entraReaderRoles
     SHOAL_ENTRA_CONTRIBUTOR_ROLES: entraContributorRoles
-    SHOAL_ALLOWED_HOST: effectiveAllowedHosts
   },
   empty(entraIssuer) ? {} : {
     SHOAL_ENTRA_ISSUER: entraIssuer
   },
   empty(entraJwksUri) ? {} : {
     SHOAL_ENTRA_JWKS_URI: entraJwksUri
+  },
+  empty(entraScope) ? {} : {
+    SHOAL_ENTRA_SCOPE: entraScope
   }
 )
 

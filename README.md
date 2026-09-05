@@ -118,8 +118,9 @@ clearly-named development principal (`development-principal@localhost`) for
 every request. It is refused unless the resolved listen address is
 loopback-only, so `:8080`, `0.0.0.0:8080`, and `[::]:8080` all cause the server
 to exit with a diagnostic instead of serving. Exposing the workspace beyond
-this host requires supplying a real `webapi.Authenticator`; without one the
-server refuses to start rather than serve anonymously.
+this host requires the provider-neutral OIDC authenticator (`-oidc-*`; see
+[`docs/shoal-explore-web-deploy.md`](docs/shoal-explore-web-deploy.md)); without
+it the server refuses to start rather than serve anonymously.
 
 The embedded backend registers authorization policy in an in-memory catalog for
 the lifetime of the process (issue #284). To keep a restart from presenting an

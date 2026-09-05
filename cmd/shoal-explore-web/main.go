@@ -129,56 +129,138 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 		"Window over which the -mosaic-budget distinct-domain count accumulates "+
 			"for an identity before it resets",
 	)
-	entraTenant := flags.String(
-		"entra-tenant", "",
-		"Microsoft Entra ID (Azure AD) tenant/directory ID. Derives the "+
-			"expected issuer and OIDC discovery document. Enables the real "+
-			"authenticator; environment fallback SHOAL_ENTRA_TENANT",
+	oidcIssuer := flags.String(
+		"oidc-issuer", "",
+		"Exact OIDC token issuer. Required for OIDC authentication; "+
+			"environment fallback SHOAL_OIDC_ISSUER",
 	)
-	entraIssuer := flags.String(
-		"entra-issuer", "",
-		"Override the expected token issuer (exact match). Defaults to "+
-			"https://login.microsoftonline.com/<tenant>/v2.0; environment "+
-			"fallback SHOAL_ENTRA_ISSUER",
+	oidcDiscoveryURL := flags.String(
+		"oidc-discovery-url", "",
+		"OIDC discovery document URL. Defaults to <issuer>/.well-known/"+
+			"openid-configuration; environment fallback SHOAL_OIDC_DISCOVERY_URL",
 	)
-	entraClientID := flags.String(
-		"entra-client-id", "",
-		"Application (client) ID the token audience must match exactly. "+
-			"Required for the Entra authenticator; environment fallback "+
-			"SHOAL_ENTRA_CLIENT_ID. A client secret is never accepted",
+	oidcAudiences := flags.String(
+		"oidc-audience", "",
+		"Comma-separated token audiences; at least one exact match is required. "+
+			"Environment fallback SHOAL_OIDC_AUDIENCE",
 	)
-	entraJWKSURI := flags.String(
-		"entra-jwks-uri", "",
-		"Override the JWKS URI instead of resolving it via OIDC discovery; "+
-			"environment fallback SHOAL_ENTRA_JWKS_URI",
+	oidcJWKSURI := flags.String(
+		"oidc-jwks-uri", "",
+		"JWKS URI override. When empty, jwks_uri is read from OIDC discovery; "+
+			"environment fallback SHOAL_OIDC_JWKS_URI",
 	)
-	entraAllowedAlgs := flags.String(
-		"entra-allowed-algs", "",
+	oidcAllowedAlgs := flags.String(
+		"oidc-allowed-algs", "",
 		"Comma-separated allowlist of asymmetric signing algorithms "+
-			"(e.g. RS256,ES256). Defaults to RS256. HS* and none are always "+
-			"rejected",
+			"(for example RS256,ES256). Defaults to RS256. HS* and none are "+
+			"always rejected",
 	)
-	entraClockSkew := flags.Duration(
-		"entra-clock-skew", 0,
+	oidcClockSkew := flags.Duration(
+		"oidc-clock-skew", 0,
 		"Tolerated clock skew for token expiry/not-before checks; defaults to "+
 			"60s and is capped at 5m",
 	)
+	oidcSubjectClaim := flags.String(
+		"oidc-subject-claim", "",
+		"Top-level claim used as the subject identity. Defaults to sub; "+
+			"environment fallback SHOAL_OIDC_SUBJECT_CLAIM",
+	)
+	oidcActorClaim := flags.String(
+		"oidc-actor-claim", "",
+		"Optional required claim mapped to the decision actor; environment "+
+			"fallback SHOAL_OIDC_ACTOR_CLAIM",
+	)
+	oidcClientIDClaim := flags.String(
+		"oidc-client-id-claim", "",
+		"Optional required claim mapped to the decision client identity; "+
+			"environment fallback SHOAL_OIDC_CLIENT_ID_CLAIM",
+	)
+	oidcDelegationClaim := flags.String(
+		"oidc-delegation-claim", "",
+		"Optional required string or string-array claim mapped in order to the "+
+			"decision delegation chain; environment fallback "+
+			"SHOAL_OIDC_DELEGATION_CLAIM",
+	)
+	oidcAuthorizationClaim := flags.String(
+		"oidc-authorization-claim", "",
+		"Required string or string-array claim whose values are mapped to "+
+			"workspace authority; environment fallback "+
+			"SHOAL_OIDC_AUTHORIZATION_CLAIM",
+	)
+	oidcReaderValues := flags.String(
+		"oidc-reader-values", "",
+		"Comma-separated authorization-claim values granted read-only "+
+			"workspace access; environment fallback SHOAL_OIDC_READER_VALUES",
+	)
+	oidcContributorValues := flags.String(
+		"oidc-contributor-values", "",
+		"Comma-separated authorization-claim values granted read and ingest "+
+			"access; environment fallback SHOAL_OIDC_CONTRIBUTOR_VALUES",
+	)
+	oidcBrowserClientID := flags.String(
+		"oidc-browser-client-id", "",
+		"Optional public-client ID enabling browser Authorization Code + PKCE; "+
+			"environment fallback SHOAL_OIDC_BROWSER_CLIENT_ID",
+	)
+	oidcBrowserScope := flags.String(
+		"oidc-browser-scope", "",
+		"Space-delimited scope requested by browser login; required with "+
+			"-oidc-browser-client-id; environment fallback "+
+			"SHOAL_OIDC_BROWSER_SCOPE",
+	)
+	oidcAuthorizationEndpoint := flags.String(
+		"oidc-authorization-endpoint", "",
+		"Authorization endpoint override for browser login; otherwise read "+
+			"from discovery. Environment fallback "+
+			"SHOAL_OIDC_AUTHORIZATION_ENDPOINT",
+	)
+	oidcTokenEndpoint := flags.String(
+		"oidc-token-endpoint", "",
+		"Token endpoint override for browser login; otherwise read from "+
+			"discovery. Environment fallback SHOAL_OIDC_TOKEN_ENDPOINT",
+	)
+	entraTenant := flags.String(
+		"entra-tenant", "",
+		"Deprecated compatibility alias for the former Entra tenant setting; "+
+			"environment fallback SHOAL_ENTRA_TENANT",
+	)
+	entraIssuer := flags.String(
+		"entra-issuer", "",
+		"Deprecated compatibility alias for -oidc-issuer; environment fallback "+
+			"SHOAL_ENTRA_ISSUER",
+	)
+	entraClientID := flags.String(
+		"entra-client-id", "",
+		"Deprecated compatibility alias for the OIDC audience and browser "+
+			"client ID; environment fallback SHOAL_ENTRA_CLIENT_ID",
+	)
+	entraJWKSURI := flags.String(
+		"entra-jwks-uri", "",
+		"Deprecated compatibility alias for -oidc-jwks-uri; environment "+
+			"fallback SHOAL_ENTRA_JWKS_URI",
+	)
+	entraAllowedAlgs := flags.String(
+		"entra-allowed-algs", "",
+		"Deprecated compatibility alias for -oidc-allowed-algs",
+	)
+	entraClockSkew := flags.Duration(
+		"entra-clock-skew", 0,
+		"Deprecated compatibility alias for -oidc-clock-skew",
+	)
 	entraReaderRoles := flags.String(
 		"entra-reader-roles", "",
-		"Comma-separated Entra app-role values granted read-only workspace "+
-			"access; environment fallback SHOAL_ENTRA_READER_ROLES",
+		"Deprecated compatibility alias mapping the roles claim to reader "+
+			"authority; environment fallback SHOAL_ENTRA_READER_ROLES",
 	)
 	entraContributorRoles := flags.String(
 		"entra-contributor-roles", "",
-		"Comma-separated Entra app-role values granted read and ingest "+
-			"access; environment fallback SHOAL_ENTRA_CONTRIBUTOR_ROLES",
+		"Deprecated compatibility alias mapping the roles claim to contributor "+
+			"authority; environment fallback SHOAL_ENTRA_CONTRIBUTOR_ROLES",
 	)
 	entraScope := flags.String(
 		"entra-scope", "",
-		"Space-delimited OAuth scope the browser requests during interactive "+
-			"login. Defaults to 'openid profile <client-id>/.default'; "+
-			"environment fallback SHOAL_ENTRA_SCOPE. Not used for token "+
-			"validation, only for the browser login redirect",
+		"Deprecated browser-scope compatibility alias; environment fallback "+
+			"SHOAL_ENTRA_SCOPE",
 	)
 	ontologyFile := flags.String(
 		"ontology-file", "",
@@ -191,18 +273,63 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 		return err
 	}
 
-	entra := entraConfig{
-		tenantID:          firstNonEmpty(*entraTenant, os.Getenv("SHOAL_ENTRA_TENANT")),
-		issuer:            firstNonEmpty(*entraIssuer, os.Getenv("SHOAL_ENTRA_ISSUER")),
-		audience:          firstNonEmpty(*entraClientID, os.Getenv("SHOAL_ENTRA_CLIENT_ID")),
-		jwksURI:           firstNonEmpty(*entraJWKSURI, os.Getenv("SHOAL_ENTRA_JWKS_URI")),
-		allowedAlgorithms: splitCommaList(*entraAllowedAlgs),
-		clockSkew:         *entraClockSkew,
-		readerRoles: splitCommaList(
-			firstNonEmpty(*entraReaderRoles, os.Getenv("SHOAL_ENTRA_READER_ROLES"))),
+	oidc := applyLegacyEntraCompatibility(oidcConfig{
+		issuer: firstNonEmpty(
+			*oidcIssuer, os.Getenv("SHOAL_OIDC_ISSUER")),
+		discoveryURL: firstNonEmpty(
+			*oidcDiscoveryURL, os.Getenv("SHOAL_OIDC_DISCOVERY_URL")),
+		audiences: splitCommaList(firstNonEmpty(
+			*oidcAudiences, os.Getenv("SHOAL_OIDC_AUDIENCE"))),
+		jwksURI: firstNonEmpty(
+			*oidcJWKSURI, os.Getenv("SHOAL_OIDC_JWKS_URI")),
+		allowedAlgorithms: splitCommaList(firstNonEmpty(
+			*oidcAllowedAlgs, os.Getenv("SHOAL_OIDC_ALLOWED_ALGS"))),
+		clockSkew: *oidcClockSkew,
+		subjectClaim: firstNonEmpty(
+			*oidcSubjectClaim, os.Getenv("SHOAL_OIDC_SUBJECT_CLAIM")),
+		actorClaim: firstNonEmpty(
+			*oidcActorClaim, os.Getenv("SHOAL_OIDC_ACTOR_CLAIM")),
+		clientIDClaim: firstNonEmpty(
+			*oidcClientIDClaim, os.Getenv("SHOAL_OIDC_CLIENT_ID_CLAIM")),
+		delegationClaim: firstNonEmpty(
+			*oidcDelegationClaim, os.Getenv("SHOAL_OIDC_DELEGATION_CLAIM")),
+		authorizationClaim: firstNonEmpty(
+			*oidcAuthorizationClaim,
+			os.Getenv("SHOAL_OIDC_AUTHORIZATION_CLAIM")),
+		readerClaimValues: splitCommaList(firstNonEmpty(
+			*oidcReaderValues, os.Getenv("SHOAL_OIDC_READER_VALUES"))),
+		contributorValues: splitCommaList(firstNonEmpty(
+			*oidcContributorValues,
+			os.Getenv("SHOAL_OIDC_CONTRIBUTOR_VALUES"))),
+		browserClientID: firstNonEmpty(
+			*oidcBrowserClientID, os.Getenv("SHOAL_OIDC_BROWSER_CLIENT_ID")),
+		browserScope: firstNonEmpty(
+			*oidcBrowserScope, os.Getenv("SHOAL_OIDC_BROWSER_SCOPE")),
+		authorizationEndpoint: firstNonEmpty(
+			*oidcAuthorizationEndpoint,
+			os.Getenv("SHOAL_OIDC_AUTHORIZATION_ENDPOINT")),
+		tokenEndpoint: firstNonEmpty(
+			*oidcTokenEndpoint, os.Getenv("SHOAL_OIDC_TOKEN_ENDPOINT")),
+	}, legacyEntraConfig{
+		tenantID: firstNonEmpty(
+			*entraTenant, os.Getenv("SHOAL_ENTRA_TENANT")),
+		issuer: firstNonEmpty(
+			*entraIssuer, os.Getenv("SHOAL_ENTRA_ISSUER")),
+		audience: firstNonEmpty(
+			*entraClientID, os.Getenv("SHOAL_ENTRA_CLIENT_ID")),
+		jwksURI: firstNonEmpty(
+			*entraJWKSURI, os.Getenv("SHOAL_ENTRA_JWKS_URI")),
+		allowedAlgorithms: splitCommaList(firstNonEmpty(
+			*entraAllowedAlgs, os.Getenv("SHOAL_ENTRA_ALLOWED_ALGS"))),
+		clockSkew: *entraClockSkew,
+		readerRoles: splitCommaList(firstNonEmpty(
+			*entraReaderRoles, os.Getenv("SHOAL_ENTRA_READER_ROLES"))),
 		contributorRoles: splitCommaList(firstNonEmpty(
-			*entraContributorRoles, os.Getenv("SHOAL_ENTRA_CONTRIBUTOR_ROLES"))),
-	}
+			*entraContributorRoles,
+			os.Getenv("SHOAL_ENTRA_CONTRIBUTOR_ROLES"))),
+		scope: firstNonEmpty(
+			*entraScope, os.Getenv("SHOAL_ENTRA_SCOPE")),
+	})
 
 	embedding, err := embeddingConfig{
 		provider:   *embeddingProvider,
@@ -227,7 +354,7 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 	// bound, so an address the workspace may not serve never opens a socket
 	// and never prompts an operator to approve exposure the program has
 	// already decided against.
-	if _, err := selectAuthenticator(*developmentAuth, entra, *listen, time.Now); err != nil {
+	if _, err := selectAuthenticator(*developmentAuth, oidc, *listen, time.Now); err != nil {
 		return err
 	}
 	listener, err := listenTCP("tcp", *listen)
@@ -239,10 +366,20 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 	// Identity is decided from it, and a refusal closes the listener here,
 	// before the corpus is opened and before any request can be served.
 	authenticator, err := selectAuthenticator(
-		*developmentAuth, entra, listener.Addr().String(), time.Now)
+		*developmentAuth, oidc, listener.Addr().String(), time.Now)
 	if err != nil {
 		listener.Close()
 		return err
+	}
+	var browserAuth *webapi.BrowserAuthConfig
+	if oidcAuthenticator, ok := authenticator.(*oidcAuthenticator); ok {
+		browserAuth, err = oidcAuthenticator.browserAuthConfig(ctx)
+		if err != nil {
+			listener.Close()
+			return fmt.Errorf(
+				"refusing to serve %s with OIDC browser login: %w",
+				listener.Addr(), err)
+		}
 	}
 	authority := auth.NewAuthority()
 	// The policy catalog is durable, so documents ingested by this build stay
@@ -304,13 +441,11 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 		listener.Close()
 		return err
 	}
-	// A configured Entra authenticator means the browser must acquire a token
-	// interactively, so publish the non-secret login parameters. With -dev-auth
-	// this is skipped: the auth-config endpoint reports unconfigured and the UI
-	// renders no login flow, keeping local development a single command.
-	if entra.configured() {
-		handler.SetBrowserAuthConfig(browserAuthConfig(
-			entra, firstNonEmpty(*entraScope, os.Getenv("SHOAL_ENTRA_SCOPE"))))
+	// Browser login is optional and publishes only non-secret OIDC parameters.
+	// With -dev-auth, or an API-only OIDC configuration, auth-config reports
+	// unconfigured and the UI renders no login flow.
+	if browserAuth != nil {
+		handler.SetBrowserAuthConfig(browserAuth)
 	}
 	server := &http.Server{
 		Handler:           handler,
@@ -326,12 +461,12 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 			developmentSubject,
 		)
 	}
-	if entra.configured() {
+	if oidc.configured() {
 		fmt.Fprintf(
 			output,
-			"Validating Microsoft Entra ID bearer tokens for audience %s; "+
-				"unmapped callers receive no corpus access\n",
-			entra.audience,
+			"Validating OIDC bearer tokens for audience(s) %s; "+
+				"unmapped authorization claims are denied\n",
+			strings.Join(oidc.audiences, ","),
 		)
 	}
 	if *backend == "embedded" {
@@ -629,37 +764,6 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
-}
-
-// browserAuthConfig derives the non-secret parameters a browser needs for an
-// interactive Authorization Code + PKCE login from the validated Entra
-// configuration. Nothing here is a secret: the client ID, tenant, scope and
-// authority all appear in the address bar of an ordinary OIDC redirect. When
-// the operator does not override the scope, the browser requests the API's own
-// default scope alongside the OIDC scopes so the resulting access token is
-// audienced to this application.
-func browserAuthConfig(entra entraConfig, scope string) *webapi.BrowserAuthConfig {
-	clientID := strings.TrimSpace(entra.audience)
-	if strings.TrimSpace(scope) == "" {
-		scope = "openid profile " + clientID + "/.default"
-	}
-	return &webapi.BrowserAuthConfig{
-		TenantID:  strings.TrimSpace(entra.tenantID),
-		ClientID:  clientID,
-		Scope:     scope,
-		Authority: entraAuthorityBase(entra),
-	}
-}
-
-// entraAuthorityBase returns the OIDC authority base — without the /v2.0 issuer
-// suffix — that the browser derives its authorize and token endpoints from. It
-// prefers the tenant, falling back to the configured issuer when the issuer was
-// overridden without a tenant.
-func entraAuthorityBase(entra entraConfig) string {
-	if tenant := strings.TrimSpace(entra.tenantID); tenant != "" {
-		return "https://login.microsoftonline.com/" + tenant
-	}
-	return strings.TrimSuffix(strings.TrimSpace(entra.issuer), "/v2.0")
 }
 
 // splitCommaList splits a comma-separated flag value into trimmed, non-empty
