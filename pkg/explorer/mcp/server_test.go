@@ -110,6 +110,43 @@ func TestInitializedNotificationIsSilentAndCannotRunEarly(t *testing.T) {
 	}
 }
 
+func TestExplicitNullIDIsInvalidAndReadableErrorIDsArePreserved(t *testing.T) {
+	server, _ := newTestServer(t, &stubService{}, nil)
+	input := strings.Join([]string{
+		`{"jsonrpc":"2.0","id":null,"method":"ping"}`,
+		`{"jsonrpc":"2.0","id":"bad-\u0031","method":7}`,
+	}, "\n") + "\n"
+	var output bytes.Buffer
+	if err := server.Serve(
+		context.Background(), strings.NewReader(input), &output,
+	); err != nil {
+		t.Fatal(err)
+	}
+	lines := nonemptyLines(output.String())
+	if len(lines) != 2 {
+		t.Fatalf("responses = %d, want 2: %s", len(lines), output.String())
+	}
+	if !strings.Contains(lines[0], `"id":null`) {
+		t.Fatalf("null-ID error did not carry null ID: %s", lines[0])
+	}
+	var nullID Response
+	mustUnmarshal(t, lines[0], &nullID)
+	if nullID.Error == nil ||
+		nullID.Error.Code != codeInvalidRequest ||
+		nullID.Error.Message != "invalid request ID" {
+		t.Fatalf("null-ID response = %+v", nullID)
+	}
+	if !strings.Contains(lines[1], `"id":"bad-\u0031"`) {
+		t.Fatalf("readable raw ID was not preserved: %s", lines[1])
+	}
+	var invalidShape Response
+	mustUnmarshal(t, lines[1], &invalidShape)
+	if invalidShape.Error == nil ||
+		invalidShape.Error.Code != codeInvalidRequest {
+		t.Fatalf("invalid-shape response = %+v", invalidShape)
+	}
+}
+
 func TestPingIsAvailableThroughoutHandshake(t *testing.T) {
 	server, _ := newTestServer(t, &stubService{}, nil)
 	ping := func(id string) {

@@ -283,8 +283,11 @@ func protocolFailureID(raw []byte, failure *Error) (json.RawMessage, bool) {
 	if err := json.Unmarshal(raw, &envelope); err != nil {
 		return json.RawMessage("null"), true
 	}
-	if len(envelope.ID) == 0 || string(envelope.ID) == "null" {
+	if len(envelope.ID) == 0 {
 		return nil, false
+	}
+	if string(envelope.ID) == "null" {
+		return envelope.ID, true
 	}
 	if !validRequestID(envelope.ID) {
 		return json.RawMessage("null"), true

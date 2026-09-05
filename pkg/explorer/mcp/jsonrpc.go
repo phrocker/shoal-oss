@@ -51,11 +51,11 @@ const (
 const maxMessageBytes = 16 << 20
 
 // Request is an inbound JSON-RPC 2.0 message. ID is kept as raw JSON because
-// the specification permits a string, a number, or null, and a response must
-// echo the client's spelling exactly rather than a re-encoded equivalent.
+// the specification permits a string or number, and a response must echo the
+// client's spelling exactly rather than a re-encoded equivalent.
 //
-// A message with no ID is a notification: it expects no reply, and the server
-// must stay silent even on failure.
+// A message with no ID is a notification. An explicit null ID is an invalid
+// request in MCP 2025-11-25, not a notification.
 type Request struct {
 	JSONRPC string          `json:"jsonrpc"`
 	ID      json.RawMessage `json:"id,omitempty"`
@@ -63,13 +63,9 @@ type Request struct {
 	Params  json.RawMessage `json:"params,omitempty"`
 }
 
-// isNotification reports whether the message expects no response. Absent and
-// literal-null IDs are both notifications under the specification.
+// isNotification reports whether the message expects no response.
 func (r Request) isNotification() bool {
-	if len(r.ID) == 0 {
-		return true
-	}
-	return string(r.ID) == "null"
+	return len(r.ID) == 0
 }
 
 // Response is an outbound JSON-RPC 2.0 message. Exactly one of Result or Error
@@ -256,7 +252,7 @@ func decodeRequest(raw []byte) (Request, *Error) {
 }
 
 func validRequestID(id json.RawMessage) bool {
-	if len(id) == 0 || string(id) == "null" {
+	if len(id) == 0 {
 		return true
 	}
 	switch id[0] {
@@ -265,8 +261,71 @@ func validRequestID(id json.RawMessage) bool {
 		return json.Unmarshal(id, &value) == nil
 	case '-', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9':
 		var value json.Number
-		return json.Unmarshal(id, &value) == nil
+		return json.Unmarshal(id, &value) == nil && integerJSONNumber(id)
 	default:
 		return false
 	}
+}
+
+// integerJSONNumber accepts every JSON numeric spelling whose mathematical
+// value is integral. This preserves spellings such as 1.2300e+04 while
+// rejecting fractional IDs that JSON-RPC warns are not interoperable.
+func integerJSONNumber(value []byte) bool {
+	start := 0
+	if len(value) > 0 && value[0] == '-' {
+		start = 1
+	}
+	exponentIndex := len(value)
+	decimalIndex := -1
+	for index := start; index < len(value); index++ {
+		if value[index] == '.' {
+			decimalIndex = index
+			continue
+		}
+		if value[index] == 'e' || value[index] == 'E' {
+			exponentIndex = index
+			break
+		}
+	}
+	fractionDigits := 0
+	if decimalIndex >= 0 {
+		fractionDigits = exponentIndex - decimalIndex - 1
+	}
+	exponent := 0
+	if exponentIndex < len(value) {
+		index := exponentIndex + 1
+		negative := false
+		if value[index] == '+' || value[index] == '-' {
+			negative = value[index] == '-'
+			index++
+		}
+		for ; index < len(value); index++ {
+			if exponent <= len(value) {
+				exponent = exponent*10 + int(value[index]-'0')
+			}
+		}
+		if negative {
+			exponent = -exponent
+		}
+	}
+	requiredZeros := fractionDigits - exponent
+	if requiredZeros <= 0 {
+		return true
+	}
+	for index := exponentIndex - 1; index >= start; index-- {
+		if value[index] == '.' {
+			continue
+		}
+		if requiredZeros > 0 {
+			if value[index] != '0' {
+				return false
+			}
+			requiredZeros--
+			continue
+		}
+		if value[index] != '0' {
+			return true
+		}
+	}
+	return true
 }

@@ -32,7 +32,6 @@ func TestJSONRPCRequestResponseRoundTripPreservesID(t *testing.T) {
 	}{
 		{name: "string", id: `"request-\u0031"`},
 		{name: "number", id: `1.2300e+04`},
-		{name: "null", id: `null`},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -79,14 +78,6 @@ func TestJSONRPCNotificationsAreSilentOnSuccessAndFailure(t *testing.T) {
 				Method:  "tools/call",
 			},
 		},
-		{
-			name: "literal null ID",
-			request: Request{
-				JSONRPC: jsonRPCVersion,
-				ID:      json.RawMessage("null"),
-				Method:  "tools/call",
-			},
-		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -118,11 +109,29 @@ func TestJSONRPCRequestIDsAreNotNotifications(t *testing.T) {
 	for _, id := range []json.RawMessage{
 		json.RawMessage(`""`),
 		json.RawMessage(`0`),
+		json.RawMessage(`null`),
 		json.RawMessage(`false`),
 	} {
 		request := Request{ID: id}
 		if request.isNotification() {
 			t.Fatalf("ID %s was classified as a notification", id)
+		}
+	}
+}
+
+func TestJSONRPCRequestIDValidation(t *testing.T) {
+	for _, id := range []string{
+		`"request"`, `0`, `-1`, `1.0`, `1e2`, `1.2300e+04`, `0.1e1`, `0e-999`,
+	} {
+		if !validRequestID(json.RawMessage(id)) {
+			t.Fatalf("valid request ID %s was rejected", id)
+		}
+	}
+	for _, id := range []string{
+		`null`, `false`, `{}`, `[]`, `1.5`, `1e-2`, `1.20e0`,
+	} {
+		if validRequestID(json.RawMessage(id)) {
+			t.Fatalf("invalid request ID %s was accepted", id)
 		}
 	}
 }
@@ -184,6 +193,24 @@ func TestJSONRPCDecodeRequestValidation(t *testing.T) {
 			input:   `{"jsonrpc":"2.0","id":1}`,
 			code:    codeInvalidRequest,
 			message: "method is required",
+		},
+		{
+			name:    "null ID",
+			input:   `{"jsonrpc":"2.0","id":null,"method":"tools/list"}`,
+			code:    codeInvalidRequest,
+			message: "invalid request ID",
+		},
+		{
+			name:    "boolean ID",
+			input:   `{"jsonrpc":"2.0","id":false,"method":"tools/list"}`,
+			code:    codeInvalidRequest,
+			message: "invalid request ID",
+		},
+		{
+			name:    "fractional ID",
+			input:   `{"jsonrpc":"2.0","id":1.5,"method":"tools/list"}`,
+			code:    codeInvalidRequest,
+			message: "invalid request ID",
 		},
 		{
 			name:    "empty method",
