@@ -195,6 +195,24 @@ Issuer and endpoint URLs require HTTPS. Loopback HTTP is available only to the
 in-process test seam, not to production command configuration. A client secret
 is never accepted.
 
+### Migration from the former provider-specific configuration
+
+The former `-entra-*` flags and `SHOAL_ENTRA_*` settings are not retained as
+aliases. A deployment that supplies only those names now fails closed as
+unconfigured, so update configuration atomically with the new binary:
+
+| Former setting | Provider-neutral replacement |
+| --- | --- |
+| tenant | `-oidc-issuer` / `SHOAL_OIDC_ISSUER`, set to the discovery document's exact issuer |
+| client ID | `-oidc-audience` / `SHOAL_OIDC_AUDIENCE`; also set `-oidc-browser-client-id` for browser login |
+| reader/contributor roles | `-oidc-authorization-claim roles` plus the corresponding reader/contributor values |
+| issuer, JWKS URI, allowed algorithms, clock skew | the same-named `-oidc-*` options |
+| browser scope | `-oidc-browser-scope` / `SHOAL_OIDC_BROWSER_SCOPE` |
+
+This migration changes configuration names, not the authorization path:
+verified claims still mint an `auth.Decision` that must pass the matching binder
+and resolver before any service operation runs.
+
 ### Example
 
 ```console

@@ -21,7 +21,6 @@ import (
 	"net/http"
 	"net/url"
 	"path"
-	"sort"
 	"strings"
 )
 
@@ -83,31 +82,20 @@ func (h *Handler) authConfigEndpoint(writer http.ResponseWriter, _ *http.Request
 
 // connectSources is the connect-src value for the Content-Security-Policy. With
 // no interactive login configured it is exactly 'self', byte-identical to the
-// local development posture. When a login is configured, exactly the origins
-// of its authorization and token endpoints are added. Malformed or non-https
-// endpoints contribute nothing, failing closed to 'self'.
+// local development posture. When a login is configured, only the token
+// endpoint origin is added because it is the sole cross-origin fetch; the
+// authorization endpoint is reached by top-level navigation and does not need
+// connect-src permission. A malformed or non-https token endpoint contributes
+// nothing, failing closed to 'self'.
 func (h *Handler) connectSources() string {
 	if h.browserAuth == nil {
 		return "'self'"
 	}
-	origins := make(map[string]struct{}, 2)
-	for _, endpoint := range []string{
-		h.browserAuth.AuthorizationEndpoint,
-		h.browserAuth.TokenEndpoint,
-	} {
-		if origin := endpointOrigin(endpoint); origin != "" {
-			origins[origin] = struct{}{}
-		}
-	}
-	if len(origins) == 0 {
+	origin := endpointOrigin(h.browserAuth.TokenEndpoint)
+	if origin == "" {
 		return "'self'"
 	}
-	sorted := make([]string, 0, len(origins))
-	for origin := range origins {
-		sorted = append(sorted, origin)
-	}
-	sort.Strings(sorted)
-	return "'self' " + strings.Join(sorted, " ")
+	return "'self' " + origin
 }
 
 func endpointOrigin(endpoint string) string {

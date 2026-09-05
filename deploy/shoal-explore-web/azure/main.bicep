@@ -175,7 +175,7 @@ var appSettings = union(
   empty(oidcJwksUri) ? {} : {
     SHOAL_OIDC_JWKS_URI: oidcJwksUri
   },
-  empty(oidcBrowserClientId) ? {} : {
+  empty(oidcBrowserClientId) && empty(oidcBrowserScope) ? {} : {
     SHOAL_OIDC_BROWSER_CLIENT_ID: oidcBrowserClientId
     SHOAL_OIDC_BROWSER_SCOPE: oidcBrowserScope
   }

@@ -666,12 +666,14 @@ assert.strictEqual(challenge, "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM");
 
 const url = scenario.ctx.buildAuthorizeUrl(
   {authorization_endpoint: "https://identity.example/authorize?prompt=login", client_id: "client-1", scope: "openid profile"},
-  {redirectUri: "https://app.example/", state: "state-xyz", nonce: "nonce-abc", codeChallenge: challenge});
+  {redirectUri: "https://app.example/", state: "state-xyz", codeChallenge: challenge});
 assert.match(url, /code_challenge_method=S256/);
 assert.match(url, /^https:\/\/identity\.example\/authorize\?prompt=login&/);
 assert.match(url, /response_type=code/);
 assert.match(url, /state=state-xyz/);
-assert.match(url, /nonce=nonce-abc/);
+// The UI consumes only the access token and never processes an ID token, so it
+// must not send an OIDC nonce that it cannot validate.
+assert.strictEqual(/[?&]nonce=/.test(url), false);
 assert.match(url, /code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM/);
 // The plain method must never be emitted.
 assert.strictEqual(/code_challenge_method=plain/.test(url), false);

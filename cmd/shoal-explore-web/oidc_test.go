@@ -487,9 +487,17 @@ func TestOIDCAcceptsWithinClockSkew(t *testing.T) {
 	authenticator := newTestOIDCAuthenticator(t, config)
 	claims := issuer.defaultClaims(now)
 	claims["exp"] = now.Add(-30 * time.Second).Unix()
-	if _, err := authenticator.Authenticate(bearerRequest(
-		issuer.signRS256(t, testKID, claims))); err != nil {
+	decision, err := authenticator.Authenticate(bearerRequest(
+		issuer.signRS256(t, testKID, claims)))
+	if err != nil {
 		t.Fatalf("token within clock skew was rejected: %v", err)
+	}
+	authority, err := auth.NewAuthorityWithClock(fixedClock(now))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := authority.Binder().Bind(context.Background(), decision); err != nil {
+		t.Fatalf("decision within clock skew was rejected by binder: %v", err)
 	}
 }
 
@@ -628,6 +636,43 @@ func TestOIDCUnknownKIDDoesNotStormAndRotationRefreshes(t *testing.T) {
 	if discoveryHits != 2 || jwksHits != 2 {
 		t.Fatalf(
 			"rotation fetches = discovery %d JWKS %d, want 2 and 2",
+			discoveryHits, jwksHits)
+	}
+}
+
+func TestOIDCCachedKeyRemovalTakesEffectWithinBound(t *testing.T) {
+	issuer := newFakeOIDCIssuer(t)
+	base := time.Now()
+	clockValue := base
+	config := issuer.testConfig(func() time.Time { return clockValue })
+	authenticator := newTestOIDCAuthenticator(t, config)
+	token := issuer.signRS256(t, testKID, issuer.defaultClaims(base))
+
+	if _, err := authenticator.Authenticate(bearerRequest(token)); err != nil {
+		t.Fatalf("initial token rejected: %v", err)
+	}
+	issuer.mu.Lock()
+	delete(issuer.keys, testKID)
+	replacement, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		issuer.mu.Unlock()
+		t.Fatal(err)
+	}
+	issuer.keys["replacement-key"] = replacement
+	issuer.mu.Unlock()
+
+	clockValue = base.Add(oidcJWKSMaxCacheAge - time.Second)
+	if _, err := authenticator.Authenticate(bearerRequest(token)); err != nil {
+		t.Fatalf("fresh cached key rejected before refresh bound: %v", err)
+	}
+	clockValue = base.Add(oidcJWKSMaxCacheAge + time.Second)
+	if _, err := authenticator.Authenticate(bearerRequest(token)); err == nil {
+		t.Fatal("removed signing key remained trusted past the cache bound")
+	}
+	discoveryHits, jwksHits := issuer.counts()
+	if discoveryHits != 2 || jwksHits != 2 {
+		t.Fatalf(
+			"bounded refresh fetches = discovery %d JWKS %d, want 2 and 2",
 			discoveryHits, jwksHits)
 	}
 }

@@ -300,7 +300,8 @@ func TestAuthConfigReportsConfiguredValues(t *testing.T) {
 
 // TestContentSecurityPolicyScopesToConfiguredEndpoints proves connect-src stays
 // at the strict local default unless login is configured, then admits only the
-// configured endpoint origins.
+// token endpoint origin used by the cross-origin fetch. The authorization
+// endpoint is a top-level navigation and must not widen connect-src.
 func TestContentSecurityPolicyScopesToConfiguredEndpoints(t *testing.T) {
 	baseline := newStubServer(t, nil)
 	response, _ := getJSON(t, baseline, "/api/v1/auth-config")
@@ -321,9 +322,12 @@ func TestContentSecurityPolicyScopesToConfiguredEndpoints(t *testing.T) {
 	csp := response.Header.Get("Content-Security-Policy")
 	if !strings.Contains(
 		csp,
-		"connect-src 'self' https://identity.example https://tokens.example;",
+		"connect-src 'self' https://tokens.example;",
 	) {
-		t.Fatalf("configured CSP = %q, want endpoint origins in connect-src", csp)
+		t.Fatalf("configured CSP = %q, want token origin in connect-src", csp)
+	}
+	if strings.Contains(csp, "https://identity.example") {
+		t.Fatalf("authorization origin unnecessarily widened connect-src: %q", csp)
 	}
 	if strings.Contains(csp, "/tenant/") || strings.Contains(csp, "/oauth/") {
 		t.Fatalf("CSP leaked endpoint paths, must be origins only: %q", csp)

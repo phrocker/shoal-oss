@@ -249,7 +249,6 @@ function buildAuthorizeUrl(config, params) {
     ["response_mode", "query"],
     ["scope", config.scope],
     ["state", params.state],
-    ["nonce", params.nonce],
     ["code_challenge", params.codeChallenge],
     ["code_challenge_method", PKCE_METHOD],
   ]);
@@ -361,7 +360,6 @@ async function beginLogin() {
   const flow = {
     verifier,
     state: randomUrlToken(24),
-    nonce: randomUrlToken(24),
     redirectUri: redirectUri(),
   };
   window.sessionStorage.setItem(LOGIN_FLOW_KEY, JSON.stringify(flow));

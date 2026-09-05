@@ -65,6 +65,11 @@ const (
 	// key identifiers cannot induce an unbounded fetch storm. Legitimate key
 	// rotation is still picked up within this interval.
 	oidcJWKSMinRefreshInterval = 5 * time.Minute
+	// oidcJWKSMaxCacheAge bounds how long a cached signing key remains trusted.
+	// Once the set is this old, even a cache hit must refresh successfully
+	// before the key can be used, so removing a compromised key at the issuer
+	// takes effect within a bounded interval.
+	oidcJWKSMaxCacheAge = 15 * time.Minute
 	// oidcHTTPTimeout bounds every discovery and JWKS fetch.
 	oidcHTTPTimeout = 10 * time.Second
 	// oidcMetadataMaxBytes bounds a JWKS or discovery response so a hostile or
@@ -224,6 +229,7 @@ type oidcAuthenticator struct {
 	authorizationClaim    string
 	readerClaimValues     map[string]struct{}
 	contributorValues     map[string]struct{}
+	authenticationLeeway  time.Duration
 	browserClientID       string
 	browserScope          string
 	authorizationEndpoint string
@@ -356,6 +362,7 @@ func newOIDCAuthenticator(
 			httpClient:         httpClient,
 			clock:              clock,
 			minRefreshInterval: oidcJWKSMinRefreshInterval,
+			maxCacheAge:        oidcJWKSMaxCacheAge,
 			allowHTTP:          allowLoopbackHTTP,
 		},
 		expectedIssuer:        issuer,
@@ -366,6 +373,7 @@ func newOIDCAuthenticator(
 		authorizationClaim:    authorizationClaim,
 		readerClaimValues:     readerClaimValues,
 		contributorValues:     contributorValues,
+		authenticationLeeway:  skew,
 		browserClientID:       strings.TrimSpace(config.browserClientID),
 		browserScope:          strings.TrimSpace(config.browserScope),
 		authorizationEndpoint: strings.TrimSpace(config.authorizationEndpoint),
@@ -697,16 +705,19 @@ func (a *oidcAuthenticator) mint(claims jwt.MapClaims) (auth.Decision, error) {
 		return auth.Decision{}, err
 	}
 	decision, err := auth.NewDecision(auth.DecisionConfig{
-		Subject:               a.identity(subject),
-		Actor:                 actor,
-		ClientID:              clientID,
-		OnBehalfOf:            onBehalfOf,
-		AuthorizationDomain:   workspaceAuthorizationDomain,
-		AllowedOperations:     operations,
-		PermittedSourceIDs:    sources,
-		PermittedPolicyIDs:    policies,
-		PolicyGeneration:      workspacePolicyGeneration,
-		AuthenticationExpires: expiration.Time.UTC(),
+		Subject:             a.identity(subject),
+		Actor:               actor,
+		ClientID:            clientID,
+		OnBehalfOf:          onBehalfOf,
+		AuthorizationDomain: workspaceAuthorizationDomain,
+		AllowedOperations:   operations,
+		PermittedSourceIDs:  sources,
+		PermittedPolicyIDs:  policies,
+		PolicyGeneration:    workspacePolicyGeneration,
+		// The parser accepts through exp+leeway. Give the request-scoped
+		// decision the same boundary so the binder does not immediately reject
+		// a token the parser accepted within the configured clock skew.
+		AuthenticationExpires: expiration.Time.UTC().Add(a.authenticationLeeway),
 		RequestID:             requestID,
 		AuditPurpose:          oidcAuditPurpose,
 	})
@@ -927,29 +938,40 @@ type jwksCache struct {
 	allowHTTP     bool
 	// minRefreshInterval is the shortest time between fetch attempts.
 	minRefreshInterval time.Duration
+	// maxCacheAge is the longest time a fetched key set remains trusted.
+	maxCacheAge time.Duration
 
 	mu          sync.Mutex
 	keys        map[string]crypto.PublicKey
 	fetched     bool
 	lastAttempt time.Time
+	lastSuccess time.Time
 }
 
-// keyForID returns the public key for a key identifier, refreshing at most once
-// per minRefreshInterval on a miss. The mutex is held across the fetch so
-// concurrent misses collapse to a single refresh rather than a stampede.
+// keyForID returns the public key for a key identifier. A miss refreshes at
+// most once per minRefreshInterval, while a hit refreshes once maxCacheAge has
+// elapsed so issuer-side key removal takes effect within a bounded interval.
+// The mutex is held across the fetch so concurrent refreshes collapse to one.
 func (c *jwksCache) keyForID(
 	ctx context.Context,
 	kid string,
 ) (crypto.PublicKey, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if key, ok := c.keys[kid]; ok {
+	now := c.clock()
+	key, keyFound := c.keys[kid]
+	cacheAge := now.Sub(c.lastSuccess)
+	cacheFresh := !c.lastSuccess.IsZero() &&
+		cacheAge >= 0 && cacheAge < c.maxCacheAge
+	if keyFound && cacheFresh {
 		return key, nil
 	}
-	now := c.clock()
-	if c.fetched && now.Sub(c.lastAttempt) < c.minRefreshInterval {
+	sinceAttempt := now.Sub(c.lastAttempt)
+	if c.fetched && sinceAttempt >= 0 &&
+		sinceAttempt < c.minRefreshInterval {
 		// Refuse rather than fetch: a recent attempt already ran, so an
-		// unknown key identifier fails closed instead of triggering a storm.
+		// unknown key or stale cached key fails closed instead of triggering a
+		// storm or continuing to trust a key the issuer may have removed.
 		return nil, errNoMatchingKey
 	}
 	refreshMetadata := c.fetched
@@ -960,6 +982,7 @@ func (c *jwksCache) keyForID(
 		return nil, err
 	}
 	c.keys = keys
+	c.lastSuccess = now
 	if key, ok := keys[kid]; ok {
 		return key, nil
 	}
