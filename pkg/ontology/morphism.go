@@ -212,6 +212,9 @@ func (m OntologyMorphism) Validate() error {
 		if err := evidence.Validate(); err != nil {
 			return err
 		}
+		if _, derived := evidence.Derivation(); derived {
+			return invalid("morphism evidence must cite an immutable source observation")
+		}
 		if i > 0 && m.evidence[i-1].ID() >= evidence.ID() {
 			return invalid("morphism evidence must be unique and ordered")
 		}
@@ -239,6 +242,9 @@ func (m OntologyMorphism) Validate() error {
 		if len(m.sources) != 1 || len(m.targets) < 2 {
 			return invalid("split requires one source and multiple targets")
 		}
+		if !sameDefinitionNamespace(m.sources, m.targets) {
+			return invalid("split source and targets must have the same definition kind")
+		}
 		if err := m.discriminator.Validate(); err != nil {
 			return err
 		}
@@ -256,9 +262,13 @@ func (m OntologyMorphism) Validate() error {
 		if len(m.sources) < 2 || len(m.targets) != 1 {
 			return invalid("merge requires multiple sources and one target")
 		}
+		if !sameDefinitionNamespace(m.targets, m.sources) {
+			return invalid("merge sources and target must have the same definition kind")
+		}
 	default:
 		return invalid("unknown morphism kind")
 	}
+
 	for _, id := range append(append([]shoal.ID(nil), m.sources...), m.targets...) {
 		if ValidateID(id) != nil {
 			return invalid("morphism definition identity is invalid")
@@ -272,6 +282,22 @@ func (m OntologyMorphism) Validate() error {
 		return invalid("morphism ID is not canonical")
 	}
 	return nil
+}
+
+func sameDefinitionNamespace(reference, values []shoal.ID) bool {
+	if len(reference) == 0 {
+		return false
+	}
+	namespace := IDNamespace(reference[0])
+	if namespace != "concept" && namespace != "relationship" && namespace != "property" {
+		return false
+	}
+	for _, id := range append(append([]shoal.ID(nil), reference...), values...) {
+		if IDNamespace(id) != namespace {
+			return false
+		}
+	}
+	return true
 }
 
 func validateMorphismIDs(values []shoal.ID, name string) error {
@@ -645,6 +671,20 @@ func (l OntologyLens) validateInterpretation(
 		}
 		if !definitionExists(l.target, interpretation.subjectType) {
 			return invalid("property subject type is absent from selected ontology")
+		}
+		owners := make([]shoal.ID, 0)
+		for _, concept := range l.target.concepts {
+			if containsID(concept.Properties(), interpretation.predicate) {
+				owners = append(owners, concept.ID())
+			}
+		}
+		for _, relationship := range l.target.relationships {
+			if containsID(relationship.Properties(), interpretation.predicate) {
+				owners = append(owners, relationship.ID())
+			}
+		}
+		if len(owners) > 0 && !containsID(canonicalizeIDs(owners), interpretation.subjectType) {
+			return invalid("property does not apply to the selected subject type")
 		}
 	default:
 		return invalid("predicate is absent from selected ontology")

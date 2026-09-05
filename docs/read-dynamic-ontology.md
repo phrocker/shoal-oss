@@ -1,8 +1,11 @@
 # Read-time dynamic ontology
 
-Issue #279 is implemented as a conservative, governed read-time lens over
-immutable assertions. The source graph remains schema-neutral and ingestion is
-not rejected merely because an unrelated ontology does not describe it.
+This change implements the backend and governance portion of issue #279 as a
+conservative read-time lens over immutable assertions. The source graph remains
+schema-neutral and ingestion is not rejected merely because an unrelated
+ontology does not describe it. Host integrations can select a lens through
+`auth.DecisionConfig.SelectedOntology`; first-party workspace settings and UI
+selection are intentionally tracked separately and are not claimed here.
 
 ## Source-evidence matrix
 
