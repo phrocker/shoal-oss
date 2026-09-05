@@ -63,6 +63,20 @@ type WorkspaceSettingsProvider interface {
 	) (workspace.EffectiveDecision, error)
 }
 
+type effectiveWorkspaceSettingsContextKey struct{}
+
+// EffectiveWorkspaceSettings returns the authenticated workspace settings
+// effect already applied by Handler.ServeHTTP. Additive mounted transports can
+// consume its budgets, output policies, and cache dimensions without
+// re-resolving settings or replacing the issuer decision.
+func EffectiveWorkspaceSettings(
+	ctx context.Context,
+) (workspace.EffectiveDecision, bool) {
+	effective, ok := ctx.Value(
+		effectiveWorkspaceSettingsContextKey{}).(workspace.EffectiveDecision)
+	return effective, ok
+}
+
 // SetWorkspaceSettingsProvider enables the settings routes on a constructed
 // handler. Authentication and host-authority checks remain centralized in
 // ServeHTTP.
@@ -103,15 +117,18 @@ func (h *Handler) applyWorkspaceSettings(
 		return nil, shoal.NewError(
 			shoal.ErrorInvalidArgument, "workspace settings header "+err.Error())
 	}
-	decision, err := h.workspaceSettings.ApplyDecision(
-		request.Context(), workspaceID)
+	effective, err := h.workspaceSettings.Apply(
+		request.Context(), workspaceID, workspace.MaximumLimits(), nil)
 	if err != nil {
 		return nil, err
 	}
+	decision := effective.Decision()
 	ctx, err := h.binder.Bind(request.Context(), decision)
 	if err != nil || ctx == nil {
 		return nil, authenticationDenied()
 	}
+	ctx = context.WithValue(
+		ctx, effectiveWorkspaceSettingsContextKey{}, effective)
 	return withIdentity(ctx, decision), nil
 }
 
