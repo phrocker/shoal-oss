@@ -442,8 +442,8 @@ func TestOptionalProviderAbsenceFailsClosed(t *testing.T) {
 	if response.Error == nil || response.Error.Code != codeInvalidParams {
 		t.Fatalf("absent optional tool response = %+v", response)
 	}
-	if calls != 1 {
-		t.Fatalf("decision calls = %d, want 1", calls)
+	if calls != 0 {
+		t.Fatalf("decision calls = %d, want 0", calls)
 	}
 }
 
@@ -806,6 +806,16 @@ func TestToolCallRateLimitRunsBeforeAuthorizationAndDispatch(t *testing.T) {
 	if decisionCalls != 1 || serviceCalls != 1 {
 		t.Fatalf("calls after rejection: decisions=%d service=%d", decisionCalls, serviceCalls)
 	}
+	unknown := callToolRequest(t, server, "shoal.unknown", `{}`)
+	if unknown.Error == nil || unknown.Error.Code != codeInvalidParams {
+		t.Fatalf("rate-limited unknown tool response = %+v", unknown)
+	}
+	if decisionCalls != 1 || serviceCalls != 1 {
+		t.Fatalf(
+			"unknown tool reached authorization or dispatch: decisions=%d service=%d",
+			decisionCalls, serviceCalls,
+		)
+	}
 	now = now.Add(time.Minute)
 	third := decodeToolResult(t, callToolRequest(t, server, ToolDocuments, `{}`))
 	if third.IsError || decisionCalls != 2 || serviceCalls != 2 {
@@ -813,6 +823,37 @@ func TestToolCallRateLimitRunsBeforeAuthorizationAndDispatch(t *testing.T) {
 			"calls after reset: result=%+v decisions=%d service=%d",
 			third, decisionCalls, serviceCalls,
 		)
+	}
+}
+
+func TestInitializeRejectsMalformedStandardClientCapabilities(t *testing.T) {
+	server, _ := newTestServer(t, &stubService{}, nil)
+	response := server.handle(context.Background(), Request{
+		JSONRPC: jsonRPCVersion,
+		ID:      json.RawMessage("1"),
+		Method:  "initialize",
+		Params: json.RawMessage(`{
+			"protocolVersion":"2025-11-25",
+			"capabilities":{"roots":5,"vendor.extension":true},
+			"clientInfo":{"name":"test","version":"1"}
+		}`),
+	})
+	if response == nil || response.Error == nil ||
+		response.Error.Code != codeInvalidParams {
+		t.Fatalf("malformed capabilities response = %+v", response)
+	}
+	response = server.handle(context.Background(), Request{
+		JSONRPC: jsonRPCVersion,
+		ID:      json.RawMessage("2"),
+		Method:  "initialize",
+		Params: json.RawMessage(`{
+			"protocolVersion":"2025-11-25",
+			"capabilities":{"roots":{},"vendor.extension":true},
+			"clientInfo":{"name":"test","version":"1"}
+		}`),
+	})
+	if response == nil || response.Error != nil {
+		t.Fatalf("valid capabilities response = %+v", response)
 	}
 }
 

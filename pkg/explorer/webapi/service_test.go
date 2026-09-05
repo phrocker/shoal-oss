@@ -822,7 +822,8 @@ func TestMetadataAdvertisesCapabilities(t *testing.T) {
 		!metadata.Capabilities.Supports(webapi.CapabilityRetrieve) ||
 		!metadata.Capabilities.Supports(webapi.CapabilityPath) ||
 		metadata.Capabilities.Supports(webapi.CapabilityVector) ||
-		!metadata.Capabilities.Supports(webapi.CapabilityIngest) {
+		!metadata.Capabilities.Supports(webapi.CapabilityIngest) ||
+		metadata.Capabilities.Supports(webapi.CapabilityChanges) {
 		t.Fatalf("metadata = %+v", metadata)
 	}
 
@@ -844,8 +845,9 @@ func TestMetadataAdvertisesCapabilities(t *testing.T) {
 	if err := json.NewDecoder(response.Body).Decode(&metadata); err != nil {
 		t.Fatal(err)
 	}
-	if metadata.Capabilities.Supports(webapi.CapabilityIngest) {
-		t.Fatalf("ingest did not fail closed for non-ingest provider: %+v", metadata.Capabilities)
+	if metadata.Capabilities.Supports(webapi.CapabilityIngest) ||
+		metadata.Capabilities.Supports(webapi.CapabilityChanges) {
+		t.Fatalf("optional capabilities did not fail closed: %+v", metadata.Capabilities)
 	}
 }
 

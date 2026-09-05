@@ -372,6 +372,7 @@ func (s *Server) initialize(request Request) *Response {
 	if err := strictDecode(request.Params, &params); err != nil ||
 		params.ProtocolVersion == "" ||
 		params.Capabilities == nil ||
+		!validClientCapabilities(params.Capabilities) ||
 		strings.TrimSpace(params.ClientInfo.Name) == "" ||
 		strings.TrimSpace(params.ClientInfo.Version) == "" {
 		response := newErrorResponse(
@@ -396,6 +397,26 @@ func negotiateProtocolVersion(requested string) string {
 		return requested
 	}
 	return ProtocolVersion
+}
+
+func validClientCapabilities(capabilities map[string]json.RawMessage) bool {
+	standard := map[string]struct{}{
+		"elicitation":  {},
+		"experimental": {},
+		"roots":        {},
+		"sampling":     {},
+		"tasks":        {},
+	}
+	for name, raw := range capabilities {
+		if _, known := standard[name]; !known {
+			continue
+		}
+		var object map[string]json.RawMessage
+		if err := strictDecode(raw, &object); err != nil || object == nil {
+			return false
+		}
+	}
+	return true
 }
 
 func (s *Server) handleNotification(request Request) {
@@ -441,6 +462,12 @@ func (s *Server) callTool(ctx context.Context, request Request) *Response {
 			request.ID, newError(codeInvalidParams, "invalid tools/call params"))
 		return &response
 	}
+	tool, ok := s.toolsByName[params.Name]
+	if !ok {
+		response := newErrorResponse(
+			request.ID, newError(codeInvalidParams, "unknown tool"))
+		return &response
+	}
 	if !s.toolCallLimit.Allow() {
 		response := newResponse(request.ID, s.toolErrorResult(shoal.NewError(
 			shoal.ErrorUnavailable, "tool call rate limit exceeded")))
@@ -450,12 +477,6 @@ func (s *Server) callTool(ctx context.Context, request Request) *Response {
 	bound, err := s.authorizedContext(ctx)
 	if err != nil {
 		response := newResponse(request.ID, s.toolErrorResult(err))
-		return &response
-	}
-	tool, ok := s.toolsByName[params.Name]
-	if !ok {
-		response := newErrorResponse(
-			request.ID, newError(codeInvalidParams, "unknown tool"))
 		return &response
 	}
 	arguments := params.Arguments
