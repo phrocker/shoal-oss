@@ -130,7 +130,8 @@ func (c *Client) Neighborhood(
 		return explorer.Neighborhood{}, directBaseError(err)
 	}
 	result, err := c.filterNeighborhood(
-		ctx, raw, normalized, explorer.GraphDirectionBoth, decision, now, false)
+		ctx, raw, normalized, explorer.GraphDirectionBoth, decision, now, false,
+		auth.OperationNeighborhood)
 	if err != nil {
 		return explorer.Neighborhood{}, err
 	}

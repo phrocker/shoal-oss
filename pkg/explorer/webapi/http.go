@@ -209,6 +209,7 @@ func (h *Handler) routes() {
 	h.mux.HandleFunc("POST /api/v1/retrieve", endpoint(h.service.Retrieve))
 	h.mux.HandleFunc("POST /api/v1/neighborhood", endpoint(h.service.Neighborhood))
 	h.mux.HandleFunc("POST /api/v1/path", endpoint(h.service.Path))
+	h.mux.HandleFunc("POST /api/v1/analytics", analyticsEndpoint(h.service))
 
 	content, _ := fs.Sub(staticFiles, "static")
 	h.mux.Handle("GET /assets/", http.StripPrefix("/assets/", http.FileServer(http.FS(content))))
@@ -238,19 +239,30 @@ func metadataFor(ctx context.Context, service Service) (MetadataResponse, error)
 		if _, ok := service.(ChangeProvider); !ok {
 			metadata.Capabilities.Changes = false
 		}
+		if _, limits, ok := analyticsProvider(service); ok {
+			metadata.Capabilities.Analytics = true
+			metadata.AnalyticsLimits = &limits
+		} else {
+			metadata.Capabilities.Analytics = false
+			metadata.AnalyticsLimits = nil
+		}
 		return metadata, nil
 	}
 	capabilities, err := capabilitiesFor(ctx, service)
 	if err != nil {
 		return MetadataResponse{}, err
 	}
-	return MetadataResponse{
+	metadata := MetadataResponse{
 		MaxPageSize: MaxPageSize, MaxTopK: MaxTopK, MaxDepth: MaxDepth,
 		MaxFanout: MaxFanout, MaxNodes: MaxNodes, MaxEdgeTypes: MaxEdgeTypes,
 		MaxResponseBytes: MaxResponseBytes, MaxUploadFiles: MaxUploadFiles,
 		MaxUploadFileBytes: MaxUploadFileBytes, MaxUploadTotalBytes: MaxUploadTotalBytes,
 		Capabilities: capabilities,
-	}, nil
+	}
+	if _, limits, ok := analyticsProvider(service); ok {
+		metadata.AnalyticsLimits = &limits
+	}
+	return metadata, nil
 }
 
 func capabilitiesFor(ctx context.Context, service Service) (Capabilities, error) {
@@ -266,6 +278,9 @@ func capabilitiesFor(ctx context.Context, service Service) (Capabilities, error)
 		if _, ok := service.(ChangeProvider); !ok {
 			capabilities.Changes = false
 		}
+		if _, _, ok := analyticsProvider(service); !ok {
+			capabilities.Analytics = false
+		}
 		return capabilities, nil
 	}
 	capabilities, err := provider.Capabilities(ctx)
@@ -280,6 +295,9 @@ func capabilitiesFor(ctx context.Context, service Service) (Capabilities, error)
 	}
 	if _, ok := service.(ChangeProvider); !ok {
 		capabilities.Changes = false
+	}
+	if _, _, ok := analyticsProvider(service); !ok {
+		capabilities.Analytics = false
 	}
 	return capabilities, nil
 }

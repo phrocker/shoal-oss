@@ -24,6 +24,7 @@ import (
 
 	"github.com/phrocker/shoal-oss/pkg/document"
 	"github.com/phrocker/shoal-oss/pkg/explorer"
+	"github.com/phrocker/shoal-oss/pkg/explorer/analytics"
 	"github.com/phrocker/shoal-oss/pkg/graph"
 	"github.com/phrocker/shoal-oss/pkg/ontology"
 	"github.com/phrocker/shoal-oss/pkg/retrieval"
@@ -67,6 +68,7 @@ const (
 	CapabilityIngest       Capability = "ingest"
 	CapabilityExtraction   Capability = "extraction"
 	CapabilityChanges      Capability = "changes"
+	CapabilityAnalytics    Capability = "analytics"
 )
 
 // Capabilities advertises only stable logical features supported by a backend.
@@ -80,6 +82,7 @@ type Capabilities struct {
 	Ingest       bool `json:"ingest"`
 	Extraction   bool `json:"extraction"`
 	Changes      bool `json:"changes"`
+	Analytics    bool `json:"analytics"`
 }
 
 // AllCapabilities returns the complete feature set implemented by the embedded
@@ -88,7 +91,7 @@ func AllCapabilities() Capabilities {
 	return Capabilities{
 		Documents: true, Document: true, Retrieve: true,
 		Vector: false, Neighborhood: true, Path: true, Ingest: true,
-		Extraction: true, Changes: true,
+		Extraction: true, Changes: true, Analytics: true,
 	}
 }
 
@@ -113,6 +116,8 @@ func (c Capabilities) Supports(capability Capability) bool {
 		return c.Extraction
 	case CapabilityChanges:
 		return c.Changes
+	case CapabilityAnalytics:
+		return c.Analytics
 	default:
 		return false
 	}
@@ -378,15 +383,16 @@ type ChangesResponse struct {
 
 // MetadataResponse advertises server-enforced public bounds.
 type MetadataResponse struct {
-	MaxPageSize         uint32       `json:"max_page_size"`
-	MaxTopK             uint32       `json:"max_top_k"`
-	MaxDepth            uint32       `json:"max_depth"`
-	MaxFanout           uint32       `json:"max_fanout"`
-	MaxNodes            uint32       `json:"max_nodes"`
-	MaxEdgeTypes        uint32       `json:"max_edge_types"`
-	MaxResponseBytes    uint64       `json:"max_response_bytes"`
-	MaxUploadFiles      uint32       `json:"max_upload_files"`
-	MaxUploadFileBytes  uint64       `json:"max_upload_file_bytes"`
-	MaxUploadTotalBytes uint64       `json:"max_upload_total_bytes"`
-	Capabilities        Capabilities `json:"capabilities"`
+	MaxPageSize         uint32            `json:"max_page_size"`
+	MaxTopK             uint32            `json:"max_top_k"`
+	MaxDepth            uint32            `json:"max_depth"`
+	MaxFanout           uint32            `json:"max_fanout"`
+	MaxNodes            uint32            `json:"max_nodes"`
+	MaxEdgeTypes        uint32            `json:"max_edge_types"`
+	MaxResponseBytes    uint64            `json:"max_response_bytes"`
+	MaxUploadFiles      uint32            `json:"max_upload_files"`
+	MaxUploadFileBytes  uint64            `json:"max_upload_file_bytes"`
+	MaxUploadTotalBytes uint64            `json:"max_upload_total_bytes"`
+	AnalyticsLimits     *analytics.Limits `json:"analytics_limits,omitempty"`
+	Capabilities        Capabilities      `json:"capabilities"`
 }

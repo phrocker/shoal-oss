@@ -34,6 +34,7 @@ import (
 
 	"github.com/phrocker/shoal-oss/pkg/document"
 	"github.com/phrocker/shoal-oss/pkg/explorer"
+	exploreranalytics "github.com/phrocker/shoal-oss/pkg/explorer/analytics"
 	"github.com/phrocker/shoal-oss/pkg/graph"
 	"github.com/phrocker/shoal-oss/pkg/retrieval"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
@@ -422,6 +423,48 @@ func (s *RemoteService) Path(ctx context.Context, request PathRequest) (PathResp
 			return PathResponse{}, remoteContractError(
 				"remote path contains an excluded edge type", nil)
 		}
+	}
+	return response, nil
+}
+
+// Analytics invokes the upstream authorized bounded analytics provider. The
+// upstream must advertise both the capability and its exact runtime limits.
+func (s *RemoteService) Analytics(
+	ctx context.Context,
+	request AnalyticsRequest,
+) (AnalyticsResponse, error) {
+	metadata, err := s.Metadata(ctx)
+	if err != nil {
+		return AnalyticsResponse{}, err
+	}
+	if !metadata.Capabilities.Analytics || metadata.AnalyticsLimits == nil {
+		return AnalyticsResponse{}, shoal.NewError(
+			shoal.ErrorUnavailable, "workspace capability \"analytics\" is unavailable")
+	}
+	analyticsRequest := exploreranalytics.Request{
+		SnapshotID: request.Snapshot.ID,
+		Scope:      request.Scope, PageRank: request.PageRank,
+	}
+	if err := exploreranalytics.ValidateRequest(
+		analyticsRequest, *metadata.AnalyticsLimits); err != nil {
+		return AnalyticsResponse{}, err
+	}
+	var response AnalyticsResponse
+	if err := s.post(
+		ctx, CapabilityAnalytics, "analytics", request, &response,
+		maxRemoteResponseBytes,
+	); err != nil {
+		return AnalyticsResponse{}, err
+	}
+	if response.Snapshot.ID == "" ||
+		response.Snapshot.ID != response.Analytics.Scope.SnapshotID {
+		return AnalyticsResponse{}, remoteContractError(
+			"remote analytics snapshot is inconsistent", nil)
+	}
+	if err := exploreranalytics.ValidateResult(
+		analyticsRequest, response.Analytics, *metadata.AnalyticsLimits); err != nil {
+		return AnalyticsResponse{}, remoteContractError(
+			"remote analytics response is invalid", err)
 	}
 	return response, nil
 }

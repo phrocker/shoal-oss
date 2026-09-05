@@ -30,6 +30,7 @@ import (
 	"time"
 
 	"github.com/phrocker/shoal-oss/pkg/explorer"
+	exploreranalytics "github.com/phrocker/shoal-oss/pkg/explorer/analytics"
 	"github.com/phrocker/shoal-oss/pkg/explorer/authorized"
 	"github.com/phrocker/shoal-oss/pkg/graph"
 	"github.com/phrocker/shoal-oss/pkg/ontology"
@@ -158,6 +159,7 @@ type changeFeedBackend interface {
 // EmbeddedService adapts the public Explorer client to the workspace service.
 type EmbeddedService struct {
 	client          explorer.BoundedClient
+	analytics       *exploreranalytics.Service
 	ontologyMu      sync.RWMutex
 	ontologyVersion *ontology.OntologyVersion
 	clock           func() time.Time
@@ -169,7 +171,19 @@ func NewEmbeddedService(client explorer.BoundedClient) (*EmbeddedService, error)
 	if client == nil {
 		return nil, shoal.NewError(shoal.ErrorInvalidArgument, "explorer client is required")
 	}
-	return &EmbeddedService{client: client, clock: time.Now}, nil
+	service := &EmbeddedService{client: client, clock: time.Now}
+	if materializer, ok := client.(exploreranalytics.Materializer); ok {
+		analyticsService, err := exploreranalytics.NewService(
+			exploreranalytics.Config{
+				Source: materializer, Limits: exploreranalytics.DefaultLimits(),
+			},
+		)
+		if err != nil {
+			return nil, err
+		}
+		service.analytics = analyticsService
+	}
+	return service, nil
 }
 
 func (s *EmbeddedService) Capabilities(ctx context.Context) (Capabilities, error) {
@@ -181,6 +195,7 @@ func (s *EmbeddedService) Capabilities(ctx context.Context) (Capabilities, error
 	if !s.ChangesAvailable() {
 		capabilities.Changes = false
 	}
+	capabilities.Analytics = s.AnalyticsAvailable()
 	provider, ok := s.client.(vectorAvailabilityProvider)
 	if !ok {
 		return capabilities, nil
