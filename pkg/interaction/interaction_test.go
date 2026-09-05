@@ -21,6 +21,7 @@ package interaction_test
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -104,10 +105,12 @@ func TestSubgraphDistinguishesRetrievedFromCited(t *testing.T) {
 		kinds[node.Kind]++
 	}
 	if kinds[interaction.KindSession] != 1 ||
+		kinds[interaction.KindInference] != 1 ||
 		kinds[interaction.KindTurn] != 1 ||
 		kinds[interaction.KindToolCall] != 1 {
 		t.Fatalf("node kinds = %v", kinds)
 	}
+
 	retrieved, cited := map[shoal.ID]bool{}, map[shoal.ID]bool{}
 	for _, edge := range sub.Edges {
 		switch edge.Type {
@@ -122,6 +125,96 @@ func TestSubgraphDistinguishesRetrievedFromCited(t *testing.T) {
 	}
 	if !cited["span-a"] || cited["span-b"] {
 		t.Fatalf("cited edges = %v", cited)
+	}
+}
+
+func TestSubgraphPersistsExecutionPinsOnAddressableInference(t *testing.T) {
+	recordedAt := time.Date(2026, time.September, 5, 20, 1, 2, 345, time.UTC)
+	snapshotAt := recordedAt.Add(-time.Minute)
+	expiresAt := recordedAt.Add(time.Hour)
+	session := interaction.Session{
+		ID:                       "session-pinned",
+		RecordedAt:               recordedAt,
+		SnapshotID:               "snapshot-17",
+		SnapshotAsOf:             snapshotAt,
+		AuthorizationFingerprint: "auth-sha256:0123456789abcdef",
+		AuthorizationExpiresAt:   expiresAt,
+		EmbeddingSpaceID:         "embedding-space-v3",
+		SeedNodeIDs:              []shoal.ID{"span-a"},
+	}
+	subgraph, err := session.Subgraph(func(shoal.ID) ([]string, error) {
+		return []string{"restricted"}, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	inferenceID := interaction.InferenceID(session.ID)
+	var inferenceNodeFound, inferenceEdgeFound bool
+	for _, node := range subgraph.Nodes {
+		if node.ID != inferenceID {
+			continue
+		}
+		inferenceNodeFound = node.Kind == interaction.KindInference &&
+			node.Properties[interaction.PropertySnapshotID] == "snapshot-17" &&
+			node.Properties[interaction.PropertySnapshotAsOf] ==
+				snapshotAt.Format(time.RFC3339Nano) &&
+			node.Properties[interaction.PropertyAuthFingerprint] ==
+				"auth-sha256:0123456789abcdef" &&
+			node.Properties[interaction.PropertyAuthExpiresAt] ==
+				expiresAt.Format(time.RFC3339Nano) &&
+			node.Properties[interaction.PropertyEmbeddingSpace] ==
+				"embedding-space-v3"
+	}
+	for _, edge := range subgraph.Edges {
+		if edge.Type == interaction.EdgeHasInference &&
+			edge.From == session.ID && edge.To == inferenceID {
+			inferenceEdgeFound = true
+		}
+	}
+	if !inferenceNodeFound || !inferenceEdgeFound {
+		t.Fatalf("inference node=%t edge=%t subgraph=%+v",
+			inferenceNodeFound, inferenceEdgeFound, subgraph)
+	}
+}
+
+func TestVisibilityAndProvenanceHaveNoSemanticCountCap(t *testing.T) {
+	const count = 80
+	ids := make([]shoal.ID, count)
+	for index := range ids {
+		ids[index] = shoal.ID(fmt.Sprintf("span-%03d", index))
+	}
+	session := interaction.Session{
+		ID:           "session-uncapped",
+		RecordedAt:   time.Unix(1700000000, 0).UTC(),
+		SeedNodeIDs:  ids,
+		CitedNodeIDs: []shoal.ID{ids[len(ids)-1]},
+	}
+	subgraph, err := session.Subgraph(func(id shoal.ID) ([]string, error) {
+		return []string{"label-" + strings.TrimPrefix(string(id), "span-")}, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(subgraph.TouchedNodeIDs) != count ||
+		len(subgraph.Visibility) != count {
+		t.Fatalf("touched=%d visibility=%d, want %d",
+			len(subgraph.TouchedNodeIDs), len(subgraph.Visibility), count)
+	}
+	retrieved, cited := 0, 0
+	for _, edge := range subgraph.Edges {
+		switch edge.Type {
+		case interaction.EdgeRetrieved:
+			retrieved++
+		case interaction.EdgeCited:
+			cited++
+		}
+	}
+	if retrieved != count || cited != 1 {
+		t.Fatalf("retrieved=%d cited=%d, want %d and 1",
+			retrieved, cited, count)
+	}
+	if subgraph.TouchedNodeIDs[len(subgraph.TouchedNodeIDs)-1] != ids[count-1] {
+		t.Fatal("late source was dropped from the provenance union")
 	}
 }
 
@@ -175,7 +268,7 @@ func TestSessionValidateRejectsMalformedSessions(t *testing.T) {
 
 func TestKindAndEdgeNamespaceDetection(t *testing.T) {
 	for _, kind := range []string{
-		interaction.KindSession, interaction.KindTurn,
+		interaction.KindSession, interaction.KindInference, interaction.KindTurn,
 		interaction.KindToolCall, interaction.KindTombstone,
 	} {
 		if !interaction.IsInteractionKind(kind) {

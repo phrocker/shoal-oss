@@ -60,11 +60,12 @@ const (
 	DefaultMaxProvenanceBytes = 64 * 1024
 	DefaultMaxHierarchyDepth  = 16
 
-	metadataBuilderKey   = "shoal.context.builder"
-	metadataRequestKey   = "shoal.context.retrieval_request_id"
-	metadataRetrievalKey = "shoal.context.retrieval_identity"
-	metadataPolicyKey    = "shoal.context.policy_id"
-	builderVersion       = "explorer-context/v1"
+	metadataBuilderKey        = "shoal.context.builder"
+	metadataRequestKey        = "shoal.context.retrieval_request_id"
+	metadataRetrievalKey      = "shoal.context.retrieval_identity"
+	metadataPolicyKey         = "shoal.context.policy_id"
+	metadataEmbeddingSpaceKey = "shoal.context.embedding_space_id"
+	builderVersion            = "explorer-context/v1"
 )
 
 // Reader is the stable, authorization-enforcing Explorer seam needed for
@@ -100,7 +101,12 @@ type Pins struct {
 	Snapshot      inference.SnapshotPin
 	Authorization inference.AuthPin
 	PolicyID      shoal.ID
-	Ontology      *inference.OntologyIdentity
+	// EmbeddingSpaceID is the opaque identity of the vector space used to
+	// assemble the evidence. For mixed-space retrieval it is the caller's
+	// stable identity for that exact set. Empty means no vector space
+	// participated.
+	EmbeddingSpaceID shoal.ID
+	Ontology         *inference.OntologyIdentity
 }
 
 // InitialRequest contains one retrieval operation and optional pre-hydrated
@@ -218,7 +224,8 @@ func (b Builder) Build(ctx context.Context, input InitialRequest) (inference.Con
 		return inference.ContextPack{}, err
 	}
 	metadata, err := provenanceMetadata(
-		input.Metadata, request, response, input.Pins.PolicyID, limits)
+		input.Metadata, request, response, input.Pins.PolicyID,
+		input.Pins.EmbeddingSpaceID, limits)
 	if err != nil {
 		return inference.ContextPack{}, err
 	}
@@ -920,9 +927,15 @@ func provenanceMetadata(
 	request retrieval.Request,
 	response retrieval.Response,
 	policyID shoal.ID,
+	embeddingSpaceID shoal.ID,
 	limits Limits,
 ) (shoal.Metadata, error) {
 	if err := shoal.ValidateRequiredID("policy ID", policyID); err != nil {
+		return nil, err
+	}
+	if err := shoal.ValidateOptionalID(
+		"embedding space ID", embeddingSpaceID,
+	); err != nil {
 		return nil, err
 	}
 	metadata := cloneMetadata(input)
@@ -930,7 +943,8 @@ func provenanceMetadata(
 		metadata = make(shoal.Metadata)
 	}
 	for _, key := range []string{
-		metadataBuilderKey, metadataRequestKey, metadataRetrievalKey, metadataPolicyKey,
+		metadataBuilderKey, metadataRequestKey, metadataRetrievalKey,
+		metadataPolicyKey, metadataEmbeddingSpaceKey,
 	} {
 		if _, exists := metadata[key]; exists {
 			return nil, invalid("context metadata uses a reserved builder key")
@@ -944,6 +958,9 @@ func provenanceMetadata(
 	metadata[metadataRequestKey] = encodeID(response.RequestID)
 	metadata[metadataRetrievalKey] = identity
 	metadata[metadataPolicyKey] = encodeID(policyID)
+	if embeddingSpaceID != "" {
+		metadata[metadataEmbeddingSpaceKey] = encodeID(embeddingSpaceID)
+	}
 	if metadataBytes(metadata) > limits.MaxProvenanceBytes {
 		return nil, invalid("context metadata and provenance exceed the byte bound")
 	}
@@ -951,6 +968,29 @@ func provenanceMetadata(
 		return nil, err
 	}
 	return metadata, nil
+}
+
+// EmbeddingSpaceID returns the trusted opaque vector-space identity pinned by
+// Builder when the context was assembled. The boolean is false for non-vector
+// contexts. Malformed reserved metadata fails closed.
+func EmbeddingSpaceID(pack inference.ContextPack) (shoal.ID, bool, error) {
+	value := pack.Metadata()[metadataEmbeddingSpaceKey]
+	if value == "" {
+		return "", false, nil
+	}
+	const prefix = "hex:"
+	if !strings.HasPrefix(value, prefix) {
+		return "", false, invalid("context embedding space identity is invalid")
+	}
+	decoded, err := hex.DecodeString(strings.TrimPrefix(value, prefix))
+	if err != nil {
+		return "", false, invalid("context embedding space identity is invalid")
+	}
+	id := shoal.ID(decoded)
+	if err := shoal.ValidateRequiredID("embedding space ID", id); err != nil {
+		return "", false, err
+	}
+	return id, true, nil
 }
 
 func preflightResponse(

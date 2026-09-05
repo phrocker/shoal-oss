@@ -182,14 +182,12 @@ func (f Fold) Validate() error {
 	if err := validateSummaryDigest(f.SummaryDigest); err != nil {
 		return err
 	}
-	touched := 0
 	for _, member := range f.Members {
 		if err := shoal.ValidateRequiredID(
 			"fold session ID", member.SessionID,
 		); err != nil {
 			return err
 		}
-		touched += len(member.RetrievedNodeIDs) + len(member.CitedNodeIDs)
 		for _, id := range member.RetrievedNodeIDs {
 			if err := shoal.ValidateRequiredID(
 				"fold retrieved node ID", id,
@@ -208,12 +206,6 @@ func (f Fold) Validate() error {
 				return err
 			}
 		}
-	}
-	if touched > MaxTouchedNodes {
-		return shoal.NewError(
-			shoal.ErrorInvalidArgument,
-			"fold exceeds the public touched-node bound",
-		)
 	}
 	return nil
 }
@@ -315,7 +307,7 @@ func (f Fold) Subgraph(resolve VisibilityResolver) (FoldSubgraph, error) {
 		},
 	}
 	setIfPresent(node.Properties, PropertySummaryDigest, canonical.SummaryDigest)
-	setIfPresent(node.Properties, PropertyVisibility, Expression(visibility))
+	setVisibility(node.Properties, visibility)
 
 	edges := make([]graph.Edge, 0, len(canonical.Members)+len(touched))
 	for _, member := range canonical.Members {

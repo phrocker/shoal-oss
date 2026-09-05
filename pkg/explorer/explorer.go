@@ -71,6 +71,7 @@ type Explorer struct {
 	lastPublicationSequence uint64
 	changeHistoryFloor      uint64
 	changeCursorKey         []byte
+	interactionRecordWriter func([]byte, byte, any) error
 	readOnly                bool
 	closed                  bool
 }
@@ -209,6 +210,7 @@ func OpenWithOptions(dir string, options Options) (*Explorer, error) {
 		maxLatentAssertions:     maxLatentAssertions,
 		readOnly:                options.ReadOnly,
 	}
+	explorer.interactionRecordWriter = explorer.writeRecord
 	if err := explorer.load(); err != nil {
 		_ = eng.Close()
 		return nil, err

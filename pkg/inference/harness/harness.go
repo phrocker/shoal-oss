@@ -33,6 +33,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/phrocker/shoal-oss/pkg/contextpack"
 	"github.com/phrocker/shoal-oss/pkg/inference"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
@@ -602,15 +603,21 @@ type EvaluationRecord struct {
 	ActionKinds []ActionKind
 	ActionUsage []Usage
 
-	// TranscriptID, RequestID, ContextPackID, and ResultID are derived
-	// identities. QueryDigest is a one-way digest of the question, present so
-	// records can be correlated without persisting the question itself.
-	TranscriptID  shoal.ID
-	RequestID     shoal.ID
-	ContextPackID shoal.ID
-	ResultID      shoal.ID
-	QueryDigest   string
-	StopReason    StopReason
+	// TranscriptID, RequestID, ContextPackID, ResultID, SnapshotID,
+	// AuthorizationFingerprint, and EmbeddingSpaceID are opaque identities.
+	// QueryDigest is a one-way digest of the question, present so records can
+	// be correlated without persisting the question itself.
+	TranscriptID             shoal.ID
+	RequestID                shoal.ID
+	ContextPackID            shoal.ID
+	ResultID                 shoal.ID
+	QueryDigest              string
+	StopReason               StopReason
+	SnapshotID               shoal.ID
+	SnapshotAsOf             time.Time
+	AuthorizationFingerprint shoal.ID
+	AuthorizationExpiresAt   time.Time
+	EmbeddingSpaceID         shoal.ID
 
 	// SeedNodeIDs are source graph nodes the session was shown before its
 	// first turn. CitedNodeIDs are the source graph nodes the final answer
@@ -742,7 +749,12 @@ func (g *Generator) Run(ctx context.Context, pack inference.ContextPack) (Record
 					return earlyFinish(StopReasonInvalid, "authorization", err)
 				}
 				if err := validateCachedRecord(cached, request, pack); err == nil {
-					if err := g.recorder.Record(runCtx, evaluationRecord(cached)); err != nil {
+					evaluation, recordErr := evaluationRecord(cached)
+					if recordErr != nil {
+						return earlyFinish(
+							stopReasonFor(recordErr), "recorder", recordErr)
+					}
+					if err := g.recorder.Record(runCtx, evaluation); err != nil {
 						return earlyFinish(stopReasonFor(err), "recorder", err)
 					}
 					if err := runCtx.Err(); err != nil {
@@ -934,7 +946,14 @@ func (g *Generator) Run(ctx context.Context, pack inference.ContextPack) (Record
 				Request: request, Transcript: cloneTranscript(transcript),
 				Result: result, Trace: cloneRunTrace(trace),
 			}
-			if err := g.recorder.Record(runCtx, evaluationRecord(record)); err != nil {
+			evaluation, recordErr := evaluationRecord(record)
+			if recordErr != nil {
+				return finish(
+					stopReasonFor(recordErr), step, "recorder",
+					inference.InferenceResult{}, recordErr,
+				)
+			}
+			if err := g.recorder.Record(runCtx, evaluation); err != nil {
 				return finish(stopReasonFor(err), step, "recorder", inference.InferenceResult{}, err)
 			}
 			if err := runCtx.Err(); err != nil {
@@ -1127,19 +1146,29 @@ func cloneRunTrace(trace RunTrace) RunTrace {
 	return trace
 }
 
-func evaluationRecord(record Record) EvaluationRecord {
+func evaluationRecord(record Record) (EvaluationRecord, error) {
+	embeddingSpaceID, _, err := contextpack.EmbeddingSpaceID(
+		record.Request.context)
+	if err != nil {
+		return EvaluationRecord{}, err
+	}
 	evaluation := EvaluationRecord{
 		Provenance:  record.Request.provenance,
 		Budgets:     record.Request.budgets,
 		ActionKinds: make([]ActionKind, 0, len(record.Transcript.exchanges)+1),
 		ActionUsage: make([]Usage, 0, len(record.Transcript.exchanges)+1),
 
-		TranscriptID:  record.Transcript.id,
-		RequestID:     record.Request.id,
-		ContextPackID: record.Request.context.ID(),
-		ResultID:      record.Result.ID(),
-		QueryDigest:   digestString(record.Request.context.Query()),
-		StopReason:    record.Trace.StopReason,
+		TranscriptID:             record.Transcript.id,
+		RequestID:                record.Request.id,
+		ContextPackID:            record.Request.context.ID(),
+		ResultID:                 record.Result.ID(),
+		QueryDigest:              digestString(record.Request.context.Query()),
+		StopReason:               record.Trace.StopReason,
+		SnapshotID:               record.Request.context.Snapshot().ID(),
+		SnapshotAsOf:             record.Request.context.Snapshot().AsOf(),
+		AuthorizationFingerprint: record.Request.context.Authorization().Fingerprint(),
+		AuthorizationExpiresAt:   record.Request.context.Authorization().ExpiresAt(),
+		EmbeddingSpaceID:         embeddingSpaceID,
 	}
 	if evaluation.StopReason == "" && record.Transcript.final != nil {
 		evaluation.StopReason = StopReasonStop
@@ -1184,7 +1213,7 @@ func evaluationRecord(record Record) EvaluationRecord {
 	}
 	evaluation.CitedNodeIDs = citedSourceNodeIDs(
 		record.Result, record.Transcript.context.Evidence())
-	return evaluation
+	return evaluation, nil
 }
 
 // sourceNodeIDs projects evidence anchors onto the source graph nodes they

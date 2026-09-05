@@ -21,6 +21,7 @@ package explorer_test
 
 import (
 	"context"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -91,8 +92,13 @@ func recordedSession(
 ) interaction.Session {
 	t.Helper()
 	session := interaction.Session{
-		ID:         id,
-		RecordedAt: time.Unix(1700000000, 0).UTC(),
+		ID:                       id,
+		RecordedAt:               time.Unix(1700000000, 0).UTC(),
+		SnapshotID:               "snapshot-observed",
+		SnapshotAsOf:             time.Unix(1699999900, 0).UTC(),
+		AuthorizationFingerprint: "auth-sha256:test",
+		AuthorizationExpiresAt:   time.Unix(1700003600, 0).UTC(),
+		EmbeddingSpaceID:         "embedding-space-test",
 		Provenance: interaction.Provenance{
 			Harness:  "shoal.harness.v1",
 			Provider: "fake",
@@ -126,6 +132,7 @@ func TestInteractionVisibilityIsConjunctionOfTouchedSpans(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	defer corpus.Close()
 
 	restricted := ingestVisible(
@@ -190,6 +197,91 @@ func TestInteractionVisibilityIsConjunctionOfTouchedSpans(t *testing.T) {
 	}
 	if citedRestricted {
 		t.Fatal("restricted span was not cited but has a cited edge")
+	}
+}
+
+func TestInteractionHydratesAllProvenanceWithoutMovingSnapshot(t *testing.T) {
+	ctx := context.Background()
+	dataDir := t.TempDir()
+	corpus, err := explorer.Open(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var source strings.Builder
+	for index := 0; index < 25; index++ {
+		source.WriteString("# Section ")
+		source.WriteString(strconv.Itoa(index))
+		source.WriteString("\n\nsource token ")
+		source.WriteString(strconv.Itoa(index))
+		source.WriteString("\n\n")
+	}
+	spans := ingestVisible(
+		t, corpus, "file:///many.md", source.String(), "ops")
+	if len(spans) < 21 {
+		t.Fatalf("ingest produced %d spans, want at least 21", len(spans))
+	}
+	before, err := corpus.Snapshot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := recordedSession(
+		t, corpus, "session-durable", spans, []shoal.ID{spans[len(spans)-1]})
+	after, err := corpus.Snapshot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if before != after {
+		t.Fatalf("interaction write moved content snapshot: before=%+v after=%+v",
+			before, after)
+	}
+	if err := corpus.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := explorer.Open(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	hydrated, err := reopened.Interaction(ctx, session.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hydrated.SnapshotID != session.SnapshotID ||
+		!hydrated.SnapshotAsOf.Equal(session.SnapshotAsOf) ||
+		hydrated.AuthorizationFingerprint != session.AuthorizationFingerprint ||
+		!hydrated.AuthorizationExpiresAt.Equal(session.AuthorizationExpiresAt) ||
+		hydrated.EmbeddingSpaceID != session.EmbeddingSpaceID {
+		t.Fatalf("hydrated pins = %+v, want %+v", hydrated, session)
+	}
+	if len(hydrated.SeedNodeIDs) != len(spans) ||
+		hydrated.SeedNodeIDs[len(hydrated.SeedNodeIDs)-1] != spans[len(spans)-1] {
+		t.Fatalf("hydrated retrieved IDs = %d, late source was lost",
+			len(hydrated.SeedNodeIDs))
+	}
+	subgraph, err := reopened.InteractionSubgraph(ctx, session.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	retrieved, cited := 0, 0
+	inferenceFound := false
+	for _, node := range subgraph.Nodes {
+		if node.ID == interaction.InferenceID(session.ID) &&
+			node.Kind == interaction.KindInference {
+			inferenceFound = true
+		}
+	}
+	for _, edge := range subgraph.Edges {
+		switch edge.Type {
+		case interaction.EdgeRetrieved:
+			retrieved++
+		case interaction.EdgeCited:
+			cited++
+		}
+	}
+	if !inferenceFound || retrieved != len(spans)*2 || cited != 1 {
+		t.Fatalf("inference=%t retrieved=%d cited=%d",
+			inferenceFound, retrieved, cited)
 	}
 }
 

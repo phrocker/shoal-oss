@@ -102,9 +102,32 @@ func InteractionSession(
 	); err != nil {
 		return interaction.Session{}, err
 	}
+	if err := validateLogicalID(
+		"evaluation snapshot ID", record.SnapshotID,
+	); err != nil {
+		return interaction.Session{}, err
+	}
+	if record.SnapshotAsOf.IsZero() {
+		return interaction.Session{}, invalid("evaluation snapshot time is required")
+	}
+	if err := validateLogicalID(
+		"evaluation authorization fingerprint",
+		record.AuthorizationFingerprint,
+	); err != nil {
+		return interaction.Session{}, err
+	}
+	if record.AuthorizationExpiresAt.IsZero() {
+		return interaction.Session{}, invalid(
+			"evaluation authorization expiry is required")
+	}
 	session := interaction.Session{
-		ID:         interaction.SessionID(record.TranscriptID, recordedAt),
-		RecordedAt: recordedAt.UTC(),
+		ID:                       interaction.SessionID(record.TranscriptID, recordedAt),
+		RecordedAt:               recordedAt.UTC(),
+		SnapshotID:               record.SnapshotID,
+		SnapshotAsOf:             record.SnapshotAsOf,
+		AuthorizationFingerprint: record.AuthorizationFingerprint,
+		AuthorizationExpiresAt:   record.AuthorizationExpiresAt,
+		EmbeddingSpaceID:         record.EmbeddingSpaceID,
 		Provenance: interaction.Provenance{
 			Harness:      record.Provenance.Harness(),
 			Provider:     record.Provenance.Provider(),

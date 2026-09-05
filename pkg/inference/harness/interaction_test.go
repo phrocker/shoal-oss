@@ -166,6 +166,36 @@ func TestNewGraphRecorderChecksSinkAtSetup(t *testing.T) {
 	}
 }
 
+func TestInteractionSessionPreservesExecutionPins(t *testing.T) {
+	model, prompt := provenanceParts(t)
+	provenance, err := NewProvenance(
+		"fake-harness", model, prompt, "grounded-tools-v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshotAt := fixedTime.Add(-time.Minute)
+	expiresAt := fixedTime.Add(time.Hour)
+	session, err := InteractionSession(EvaluationRecord{
+		Provenance:               provenance,
+		TranscriptID:             "transcript-pinned",
+		SnapshotID:               "snapshot-pinned",
+		SnapshotAsOf:             snapshotAt,
+		AuthorizationFingerprint: "auth-sha256:pinned",
+		AuthorizationExpiresAt:   expiresAt,
+		EmbeddingSpaceID:         "embedding-space-v3",
+	}, fixedTime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if session.SnapshotID != "snapshot-pinned" ||
+		!session.SnapshotAsOf.Equal(snapshotAt) ||
+		session.AuthorizationFingerprint != "auth-sha256:pinned" ||
+		!session.AuthorizationExpiresAt.Equal(expiresAt) ||
+		session.EmbeddingSpaceID != "embedding-space-v3" {
+		t.Fatalf("session pins = %+v", session)
+	}
+}
+
 // TestGraphRecorderRecordsThroughTheSink pins the end-to-end projection and
 // that sink failures propagate.
 func TestGraphRecorderRecordsThroughTheSink(t *testing.T) {
@@ -211,6 +241,12 @@ func TestGraphRecorderRecordsThroughTheSink(t *testing.T) {
 	if session.Provenance.Harness != "fake-harness" ||
 		session.Provenance.Model != "fake-model" {
 		t.Fatalf("session provenance = %+v", session.Provenance)
+	}
+	if session.SnapshotID != pack.Snapshot().ID() ||
+		!session.SnapshotAsOf.Equal(pack.Snapshot().AsOf()) ||
+		session.AuthorizationFingerprint != pack.Authorization().Fingerprint() ||
+		!session.AuthorizationExpiresAt.Equal(pack.Authorization().ExpiresAt()) {
+		t.Fatalf("session execution pins = %+v", session)
 	}
 	if len(session.Turns) == 0 {
 		t.Fatal("session recorded no turns")

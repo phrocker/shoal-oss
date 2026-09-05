@@ -32,27 +32,57 @@ import (
 // InteractionSummary describes one recorded or tombstoned interaction session
 // without materializing its subgraph.
 type InteractionSummary struct {
-	SessionID  shoal.ID
-	RecordedAt time.Time
-	Visibility string
-	NodeCount  int
-	EdgeCount  int
-	Deleted    bool
-	DeletedAt  time.Time
+	SessionID                shoal.ID
+	InferenceID              shoal.ID
+	RecordedAt               time.Time
+	SnapshotID               shoal.ID
+	SnapshotAsOf             time.Time
+	AuthorizationFingerprint shoal.ID
+	AuthorizationExpiresAt   time.Time
+	EmbeddingSpaceID         shoal.ID
+	Visibility               string
+	NodeCount                int
+	EdgeCount                int
+	Deleted                  bool
+	DeletedAt                time.Time
 }
 
 type persistedInteraction struct {
-	SessionID  shoal.ID
-	Nodes      []graph.Node
-	Edges      []graph.Edge
-	Visibility string
-	RecordedAt time.Time
-	Deleted    bool
-	DeletedAt  time.Time
+	SessionID                shoal.ID
+	Session                  interaction.Session
+	SnapshotID               shoal.ID
+	SnapshotAsOf             time.Time
+	AuthorizationFingerprint shoal.ID
+	AuthorizationExpiresAt   time.Time
+	EmbeddingSpaceID         shoal.ID
+	Nodes                    []graph.Node
+	Edges                    []graph.Edge
+	Visibility               string
+	RecordedAt               time.Time
+	Deleted                  bool
+	DeletedAt                time.Time
 }
 
 type persistedInteractionSink struct {
 	CheckedAt time.Time
+}
+
+// InteractionWriter is the durable append boundary consumed by production
+// inference recorders. Implementations must fail closed on an unavailable
+// sink and preserve indeterminate-commit errors unless the exact write can be
+// read back.
+type InteractionWriter interface {
+	EnsureInteractionSink(context.Context) error
+	RecordInteraction(context.Context, interaction.Session) error
+}
+
+// InteractionReader is the explicit opt-in surface for derived interaction
+// data. These methods are intentionally absent from Client, so source
+// retrieval cannot begin returning derived nodes by interface expansion.
+type InteractionReader interface {
+	Interactions(context.Context) ([]InteractionSummary, error)
+	Interaction(context.Context, shoal.ID) (interaction.Session, error)
+	InteractionSubgraph(context.Context, shoal.ID) (Neighborhood, error)
 }
 
 // EnsureInteractionSink verifies at setup time that this corpus can durably
@@ -75,7 +105,7 @@ func (e *Explorer) EnsureInteractionSink(ctx context.Context) error {
 				"inference requires a writable interaction sink",
 		)
 	}
-	if err := e.writeRecord(
+	if err := e.writeInteractionRecord(
 		interactionSinkRow,
 		embeddedRecordInteractionSink,
 		persistedInteractionSink{CheckedAt: time.Now().UTC()},
@@ -103,9 +133,11 @@ func (e *Explorer) RecordInteraction(
 	if err := contextError(ctx); err != nil {
 		return err
 	}
-	if err := session.Validate(); err != nil {
+	canonical, err := session.Canonical()
+	if err != nil {
 		return err
 	}
+	session = canonical
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if err := e.requireOpen(); err != nil {
@@ -141,16 +173,22 @@ func (e *Explorer) RecordInteraction(
 		return err
 	}
 	record := persistedInteraction{
-		SessionID:  session.ID,
-		Nodes:      subgraph.Nodes,
-		Edges:      subgraph.Edges,
-		Visibility: interaction.Expression(subgraph.Visibility),
-		RecordedAt: session.RecordedAt.UTC(),
+		SessionID:                session.ID,
+		Session:                  session,
+		SnapshotID:               session.SnapshotID,
+		SnapshotAsOf:             session.SnapshotAsOf,
+		AuthorizationFingerprint: session.AuthorizationFingerprint,
+		AuthorizationExpiresAt:   session.AuthorizationExpiresAt,
+		EmbeddingSpaceID:         session.EmbeddingSpaceID,
+		Nodes:                    subgraph.Nodes,
+		Edges:                    subgraph.Edges,
+		Visibility:               interaction.Expression(subgraph.Visibility),
+		RecordedAt:               session.RecordedAt.UTC(),
 	}
 	if err := validatePersistedInteraction(record); err != nil {
 		return err
 	}
-	if err := e.writeRecord(
+	if err := e.writeInteractionRecord(
 		interactionRecordRow(session.ID), embeddedRecordInteraction, record,
 	); err != nil {
 		return err
@@ -216,17 +254,22 @@ func (e *Explorer) DeleteInteraction(
 		return interaction.Tombstone{}, err
 	}
 	record := persistedInteraction{
-		SessionID:  sessionID,
-		Nodes:      []graph.Node{node},
-		Visibility: existing.Visibility,
-		RecordedAt: existing.RecordedAt,
-		Deleted:    true,
-		DeletedAt:  tombstone.DeletedAt,
+		SessionID:                sessionID,
+		SnapshotID:               existing.SnapshotID,
+		SnapshotAsOf:             existing.SnapshotAsOf,
+		AuthorizationFingerprint: existing.AuthorizationFingerprint,
+		AuthorizationExpiresAt:   existing.AuthorizationExpiresAt,
+		EmbeddingSpaceID:         existing.EmbeddingSpaceID,
+		Nodes:                    []graph.Node{node},
+		Visibility:               existing.Visibility,
+		RecordedAt:               existing.RecordedAt,
+		Deleted:                  true,
+		DeletedAt:                tombstone.DeletedAt,
 	}
 	if err := validatePersistedInteraction(record); err != nil {
 		return interaction.Tombstone{}, err
 	}
-	if err := e.writeRecord(
+	if err := e.writeInteractionRecord(
 		interactionRecordRow(sessionID), embeddedRecordInteraction, record,
 	); err != nil {
 		return interaction.Tombstone{}, err
@@ -264,19 +307,70 @@ func (e *Explorer) Interactions(ctx context.Context) ([]InteractionSummary, erro
 			}
 		}
 		summaries = append(summaries, InteractionSummary{
-			SessionID:  record.SessionID,
-			RecordedAt: record.RecordedAt,
-			Visibility: record.Visibility,
-			NodeCount:  len(record.Nodes),
-			EdgeCount:  len(record.Edges),
-			Deleted:    record.Deleted,
-			DeletedAt:  record.DeletedAt,
+			SessionID:                record.SessionID,
+			InferenceID:              interaction.InferenceID(record.SessionID),
+			RecordedAt:               record.RecordedAt,
+			SnapshotID:               record.SnapshotID,
+			SnapshotAsOf:             record.SnapshotAsOf,
+			AuthorizationFingerprint: record.AuthorizationFingerprint,
+			AuthorizationExpiresAt:   record.AuthorizationExpiresAt,
+			EmbeddingSpaceID:         record.EmbeddingSpaceID,
+			Visibility:               record.Visibility,
+			NodeCount:                len(record.Nodes),
+			EdgeCount:                len(record.Edges),
+			Deleted:                  record.Deleted,
+			DeletedAt:                record.DeletedAt,
 		})
 	}
 	sort.Slice(summaries, func(i, j int) bool {
 		return shoal.CompareID(summaries[i].SessionID, summaries[j].SessionID) < 0
 	})
 	return summaries, nil
+}
+
+// Interaction returns the typed, redacted session record. This is an explicit
+// derived-data view: default retrieval never reaches it. Source visibility is
+// re-evaluated before hydration, so a later source tightening or revocation
+// fails closed rather than serving the record under its observed label.
+func (e *Explorer) Interaction(
+	ctx context.Context, sessionID shoal.ID,
+) (interaction.Session, error) {
+	if err := contextError(ctx); err != nil {
+		return interaction.Session{}, err
+	}
+	if err := shoal.ValidateRequiredID(
+		"interaction session ID", sessionID,
+	); err != nil {
+		return interaction.Session{}, err
+	}
+	if err := e.acquireReadWithGraph(); err != nil {
+		return interaction.Session{}, err
+	}
+	defer e.mu.RUnlock()
+	record, ok := e.interactions[sessionID]
+	if !ok {
+		return interaction.Session{}, shoal.NewError(
+			shoal.ErrorNotFound, "interaction session not found")
+	}
+	if record.Deleted {
+		return interaction.Session{}, shoal.NewError(
+			shoal.ErrorConflict, "interaction session was explicitly deleted")
+	}
+	current, err := e.currentSubgraphVisibilityLocked(
+		record.Nodes, record.Edges)
+	if err != nil {
+		return interaction.Session{}, err
+	}
+	if !visibilityCovered(record.Visibility, current) {
+		return interaction.Session{}, staleDerivedVisibilityError()
+	}
+	if record.Session.ID == "" {
+		return interaction.Session{}, shoal.NewError(
+			shoal.ErrorUnavailable,
+			"legacy interaction record has no typed session payload",
+		)
+	}
+	return cloneInteractionSession(record.Session), nil
 }
 
 // InteractionSubgraph returns one recorded session's nodes and edges. This is
@@ -534,6 +628,30 @@ func validatePersistedInteraction(record persistedInteraction) error {
 		return shoal.NewError(
 			shoal.ErrorInternal, "stored interaction deletion time is missing")
 	}
+	if !record.Deleted && record.Session.ID != "" {
+		if err := record.Session.Validate(); err != nil {
+			return err
+		}
+		if record.Session.ID != record.SessionID ||
+			!record.Session.RecordedAt.UTC().Equal(record.RecordedAt.UTC()) {
+			return shoal.NewError(
+				shoal.ErrorInternal,
+				"stored interaction typed session does not match its envelope",
+			)
+		}
+		if record.Session.SnapshotID != record.SnapshotID ||
+			!record.Session.SnapshotAsOf.UTC().Equal(record.SnapshotAsOf.UTC()) ||
+			record.Session.AuthorizationFingerprint !=
+				record.AuthorizationFingerprint ||
+			!record.Session.AuthorizationExpiresAt.UTC().Equal(
+				record.AuthorizationExpiresAt.UTC()) ||
+			record.Session.EmbeddingSpaceID != record.EmbeddingSpaceID {
+			return shoal.NewError(
+				shoal.ErrorInternal,
+				"stored interaction execution pins do not match its envelope",
+			)
+		}
+	}
 	if len(record.Nodes) == 0 {
 		return shoal.NewError(
 			shoal.ErrorInternal, "stored interaction has no nodes")
@@ -561,4 +679,21 @@ func validatePersistedInteraction(record persistedInteraction) error {
 		}
 	}
 	return nil
+}
+
+func cloneInteractionSession(session interaction.Session) interaction.Session {
+	cloned := session
+	cloned.SeedNodeIDs = append([]shoal.ID(nil), session.SeedNodeIDs...)
+	cloned.CitedNodeIDs = append([]shoal.ID(nil), session.CitedNodeIDs...)
+	cloned.Turns = make([]interaction.Turn, len(session.Turns))
+	for index, turn := range session.Turns {
+		cloned.Turns[index] = turn
+		if turn.ToolCall != nil {
+			call := *turn.ToolCall
+			call.RetrievedNodeIDs = append(
+				[]shoal.ID(nil), turn.ToolCall.RetrievedNodeIDs...)
+			cloned.Turns[index].ToolCall = &call
+		}
+	}
+	return cloned
 }

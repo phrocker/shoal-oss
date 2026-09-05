@@ -47,6 +47,7 @@ func TestBuildFromEmbeddedExplorerExactEvidenceAndDeterminism(t *testing.T) {
 		Request: request, Response: response, Pins: pins,
 		Metadata: shoal.Metadata{"application": "test"},
 	}
+
 	first, err := builder.Build(context.Background(), input)
 	if err != nil {
 		t.Fatal(err)
@@ -117,6 +118,25 @@ func TestBuildFromEmbeddedExplorerExactEvidenceAndDeterminism(t *testing.T) {
 	}
 	if first.ID() != reorderedModes.ID() {
 		t.Fatal("retrieval mode order changed canonical pack identity")
+	}
+}
+
+func TestBuildPinsEmbeddingSpaceIdentity(t *testing.T) {
+	client, request, response, pins := embeddedFixture(t)
+	pins.EmbeddingSpaceID = "embedding-space-v3"
+	pack, err := (Builder{Reader: client}).Build(
+		context.Background(),
+		InitialRequest{Request: request, Response: response, Pins: pins},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity, ok, err := EmbeddingSpaceID(pack)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || identity != pins.EmbeddingSpaceID {
+		t.Fatalf("embedding space = %q, %t", identity, ok)
 	}
 }
 

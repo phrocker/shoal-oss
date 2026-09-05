@@ -186,7 +186,7 @@ func (e *Explorer) FoldInteractions(
 	if err := validatePersistedFold(record); err != nil {
 		return FoldResult{}, err
 	}
-	if err := e.writeRecord(
+	if err := e.writeInteractionRecord(
 		foldRecordRow(record.FoldID), embeddedRecordFold, record,
 	); err != nil {
 		return FoldResult{}, err
@@ -405,7 +405,7 @@ func (e *Explorer) DeleteFold(
 	if err := validatePersistedFold(record); err != nil {
 		return interaction.Tombstone{}, err
 	}
-	if err := e.writeRecord(
+	if err := e.writeInteractionRecord(
 		foldRecordRow(foldID), embeddedRecordFold, record,
 	); err != nil {
 		return interaction.Tombstone{}, err
