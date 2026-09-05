@@ -54,20 +54,36 @@ func (c *Client) EnsureInteractionSink(ctx context.Context) error {
 func (c *Client) RecordInteraction(
 	ctx context.Context, session interaction.Session,
 ) error {
+	_, err := c.recordInteraction(ctx, session)
+	return err
+}
+
+// RecordInteractionResult records one interaction and returns the exact
+// trusted session accepted for persistence, including actor, delegation, and
+// derived reason metadata supplied by the bound authorization Decision.
+func (c *Client) RecordInteractionResult(
+	ctx context.Context, session interaction.Session,
+) (interaction.Session, error) {
+	return c.recordInteraction(ctx, session)
+}
+
+func (c *Client) recordInteraction(
+	ctx context.Context, session interaction.Session,
+) (interaction.Session, error) {
 	writer, err := c.interactionWriter()
 	if err != nil {
-		return err
+		return interaction.Session{}, err
 	}
 	canonical, err := session.Canonical()
 	if err != nil {
-		return err
+		return interaction.Session{}, err
 	}
 	decision, guard, now, err := c.begin(ctx, auth.OperationRetrieve)
 	if err != nil {
-		return err
+		return interaction.Session{}, err
 	}
 	if !interactionPinMatchesDecision(canonical, decision) {
-		return authorizationDenied()
+		return interaction.Session{}, authorizationDenied()
 	}
 	canonical.Actor = interaction.ActorContext{
 		SubjectID:  decision.Subject(),
@@ -80,25 +96,28 @@ func (c *Client) RecordInteraction(
 		canonical.Reason, err = interaction.NewReason(
 			"audit_purpose", decision.AuditPurpose())
 		if err != nil {
-			return authorizationDenied()
+			return interaction.Session{}, authorizationDenied()
 		}
 	}
 	canonical, err = canonical.Canonical()
 	if err != nil {
-		return err
+		return interaction.Session{}, err
 	}
 	if err := c.authorizeInteractionSources(
 		ctx, canonical.TouchedNodeIDs(), decision, auth.OperationRetrieve, now,
 	); err != nil {
-		return err
+		return interaction.Session{}, err
 	}
 	if err := guard.Check(ctx); err != nil {
-		return err
+		return interaction.Session{}, err
 	}
 	if err := writer.RecordInteraction(ctx, canonical); err != nil {
-		return directBaseError(err)
+		return interaction.Session{}, directBaseError(err)
 	}
-	return guard.Check(ctx)
+	if err := guard.Check(ctx); err != nil {
+		return interaction.Session{}, err
+	}
+	return canonical, nil
 }
 
 // Interactions lists only derived records whose complete current source set
@@ -298,6 +317,7 @@ func (c *Client) interactionReader() (explorer.InteractionReader, error) {
 }
 
 var (
-	_ explorer.InteractionWriter = (*Client)(nil)
-	_ explorer.InteractionReader = (*Client)(nil)
+	_ explorer.InteractionWriter       = (*Client)(nil)
+	_ explorer.InteractionResultWriter = (*Client)(nil)
+	_ explorer.InteractionReader       = (*Client)(nil)
 )

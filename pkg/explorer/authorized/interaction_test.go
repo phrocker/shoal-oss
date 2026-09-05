@@ -198,8 +198,22 @@ func TestAuthorizedInteractionEnrichesTrustedActorDelegationAndReason(t *testing
 		AuthorizationExpiresAt:   decision.AuthenticationExpires(),
 		SeedNodeIDs:              []shoal.ID{firstSpanID(t, view)},
 	}
-	if err := f.clientA.RecordInteraction(ctx, session); err != nil {
+	recorder, err := interaction.NewRecorder(ctx, f.clientA)
+	if err != nil {
 		t.Fatal(err)
+	}
+	returned, err := recorder.Record(ctx, session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if returned.Actor.SubjectID != decision.Subject() ||
+		returned.Actor.ActorID != decision.Actor() ||
+		returned.Actor.ClientID != decision.ClientID() ||
+		len(returned.Actor.OnBehalfOf) != 2 ||
+		returned.Reason.Code != "audit_purpose" ||
+		returned.Reason.Digest !=
+			interaction.Digest(decision.AuditPurpose()) {
+		t.Fatalf("recorder returned untrusted metadata = %+v", returned)
 	}
 	hydrated, err := f.base.Interaction(ctx, session.ID)
 	if err != nil {

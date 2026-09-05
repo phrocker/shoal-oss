@@ -34,6 +34,7 @@ type recorderSink struct {
 	recordErr error
 	ensured   int
 	recorded  []interaction.Session
+	result    interaction.Session
 }
 
 func (s *recorderSink) EnsureInteractionSink(context.Context) error {
@@ -46,6 +47,18 @@ func (s *recorderSink) RecordInteraction(
 ) error {
 	s.recorded = append(s.recorded, session)
 	return s.recordErr
+}
+
+func (s *recorderSink) RecordInteractionResult(
+	ctx context.Context, session interaction.Session,
+) (interaction.Session, error) {
+	if err := s.RecordInteraction(ctx, session); err != nil {
+		return interaction.Session{}, err
+	}
+	if s.result.ID != "" {
+		return s.result, nil
+	}
+	return session, nil
 }
 
 func TestProductRecorderIsFailClosedAndCanonical(t *testing.T) {
@@ -83,6 +96,32 @@ func TestProductRecorderIsFailClosedAndCanonical(t *testing.T) {
 		t.Fatalf("canonical recorded session = %+v", recorded)
 	}
 
+	sink.result = recorded
+	sink.result.ID = "session-enriched"
+	sink.result.RecordedAt = fixed.Add(time.Second)
+	sink.result.Operation = interaction.OperationToolCall
+	sink.result.Actor = interaction.ActorContext{
+		SubjectID: "trusted-subject",
+		ActorID:   "trusted-actor",
+	}
+	returned, err := recorder.Record(ctx, interaction.Session{
+		ID:         "session-enriched",
+		RecordedAt: fixed.Add(time.Second),
+		Operation:  interaction.OperationToolCall,
+		Actor: interaction.ActorContext{
+			SubjectID: "forged-subject",
+			ActorID:   "forged-actor",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if returned.Actor.SubjectID != "trusted-subject" ||
+		returned.Actor.ActorID != "trusted-actor" {
+		t.Fatalf("recorder returned caller metadata: %+v", returned.Actor)
+	}
+	sink.result = interaction.Session{}
+
 	sink.recordErr = errors.New("durable sink unavailable")
 	if _, err := recorder.Record(ctx, interaction.Session{
 		ID:        "session-failing",
@@ -96,6 +135,13 @@ func TestProductRecorderIsFailClosedAndCanonical(t *testing.T) {
 		err, unavailable.ensureErr,
 	) {
 		t.Fatalf("setup error = %v", err)
+	}
+
+	var typedNil *recorderSink
+	if _, err := interaction.NewRecorder(
+		ctx, typedNil,
+	); !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
+		t.Fatalf("typed-nil sink error = %v", err)
 	}
 }
 

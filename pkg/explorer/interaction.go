@@ -82,6 +82,15 @@ type InteractionWriter interface {
 	RecordInteraction(context.Context, interaction.Session) error
 }
 
+// InteractionResultWriter extends InteractionWriter for product adapters that
+// must receive the exact canonical session accepted for persistence.
+type InteractionResultWriter interface {
+	InteractionWriter
+	RecordInteractionResult(
+		context.Context, interaction.Session,
+	) (interaction.Session, error)
+}
+
 // InteractionReader is the explicit opt-in surface for derived interaction
 // data. These methods are intentionally absent from Client, so source
 // retrieval cannot begin returning derived nodes by interface expansion.
@@ -204,6 +213,21 @@ func (e *Explorer) RecordInteraction(
 	}
 	e.interactions[session.ID] = &record
 	return e.rebuildCurrentGraphLocked()
+}
+
+// RecordInteractionResult records a session and returns the exact canonical
+// value accepted for persistence. The returned value is independently owned.
+func (e *Explorer) RecordInteractionResult(
+	ctx context.Context, session interaction.Session,
+) (interaction.Session, error) {
+	canonical, err := session.Canonical()
+	if err != nil {
+		return interaction.Session{}, err
+	}
+	if err := e.RecordInteraction(ctx, canonical); err != nil {
+		return interaction.Session{}, err
+	}
+	return cloneInteractionSession(canonical), nil
 }
 
 // DeleteInteraction removes one interaction session's nodes and edges and

@@ -21,6 +21,7 @@ package interaction
 
 import (
 	"context"
+	"reflect"
 	"time"
 
 	"github.com/phrocker/shoal-oss/pkg/shoal"
@@ -33,23 +34,31 @@ type Sink interface {
 	RecordInteraction(context.Context, Session) error
 }
 
+// ResultSink extends Sink for product recorders that return the exact session
+// accepted for persistence. Authorization-enforcing sinks use this result to
+// expose trusted actor/reason enrichment rather than caller-supplied values.
+type ResultSink interface {
+	Sink
+	RecordInteractionResult(context.Context, Session) (Session, error)
+}
+
 // Recorder is the product-level fail-closed recorder for retrieval, chat, MCP,
 // and other non-harness adapters. It canonicalizes a typed Session, supplies a
 // UTC timestamp when one is absent, and returns only after the sink accepts the
 // durable record.
 type Recorder struct {
-	sink Sink
+	sink ResultSink
 	now  func() time.Time
 }
 
 // NewRecorder verifies the sink during setup so a product surface cannot begin
 // serving interactions without durable capture.
-func NewRecorder(ctx context.Context, sink Sink) (*Recorder, error) {
+func NewRecorder(ctx context.Context, sink ResultSink) (*Recorder, error) {
 	if ctx == nil {
 		return nil, shoal.NewError(
 			shoal.ErrorInvalidArgument, "context is required")
 	}
-	if sink == nil {
+	if isNilSink(sink) {
 		return nil, shoal.NewError(
 			shoal.ErrorInvalidArgument, "interaction sink is required")
 	}
@@ -79,7 +88,7 @@ func (r *Recorder) SetClock(now func() time.Time) error {
 func (r *Recorder) Record(
 	ctx context.Context, session Session,
 ) (Session, error) {
-	if r == nil || r.sink == nil {
+	if r == nil || isNilSink(r.sink) {
 		return Session{}, shoal.NewError(
 			shoal.ErrorInvalidArgument, "interaction recorder is required")
 	}
@@ -90,8 +99,19 @@ func (r *Recorder) Record(
 	if err != nil {
 		return Session{}, err
 	}
-	if err := r.sink.RecordInteraction(ctx, canonical); err != nil {
-		return Session{}, err
+	return r.sink.RecordInteractionResult(ctx, canonical)
+}
+
+func isNilSink(sink ResultSink) bool {
+	if sink == nil {
+		return true
 	}
-	return canonical, nil
+	value := reflect.ValueOf(sink)
+	switch value.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map,
+		reflect.Pointer, reflect.Slice:
+		return value.IsNil()
+	default:
+		return false
+	}
 }
