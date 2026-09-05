@@ -206,14 +206,14 @@ func TestRunRefusesWidenedResolvedAddress(t *testing.T) {
 // TestSelectAuthenticatorFailsClosed proves the workspace never serves without
 // an authenticator and never mints the development principal off-host.
 func TestSelectAuthenticatorFailsClosed(t *testing.T) {
-	if _, err := selectAuthenticator(false, entraConfig{}, "127.0.0.1:8080", time.Now); err == nil {
+	if _, err := selectAuthenticator(false, oidcConfig{}, "127.0.0.1:8080", time.Now); err == nil {
 		t.Fatal("loopback without an authenticator was accepted")
 	}
-	if _, err := selectAuthenticator(false, entraConfig{}, "0.0.0.0:8080", time.Now); err == nil {
+	if _, err := selectAuthenticator(false, oidcConfig{}, "0.0.0.0:8080", time.Now); err == nil {
 		t.Fatal("non-loopback without an authenticator was accepted")
 	}
 	for _, address := range []string{":8080", "0.0.0.0:8080", "[::]:8080", "10.0.0.5:8080"} {
-		authenticator, err := selectAuthenticator(true, entraConfig{}, address, time.Now)
+		authenticator, err := selectAuthenticator(true, oidcConfig{}, address, time.Now)
 		if err == nil {
 			t.Fatalf("-dev-auth was accepted on %s", address)
 		}
@@ -224,7 +224,7 @@ func TestSelectAuthenticatorFailsClosed(t *testing.T) {
 			t.Fatalf("unclear diagnostic for %s: %v", address, err)
 		}
 	}
-	authenticator, err := selectAuthenticator(true, entraConfig{}, "127.0.0.1:8080", time.Now)
+	authenticator, err := selectAuthenticator(true, oidcConfig{}, "127.0.0.1:8080", time.Now)
 	if err != nil {
 		t.Fatal(err)
 	}

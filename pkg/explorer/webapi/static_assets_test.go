@@ -665,9 +665,10 @@ const challenge = await scenario.ctx.pkceChallengeFromVerifier(verifier);
 assert.strictEqual(challenge, "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM");
 
 const url = scenario.ctx.buildAuthorizeUrl(
-  {authority: "https://login.microsoftonline.com/tenant", client_id: "client-1", scope: "openid profile"},
+  {authorization_endpoint: "https://identity.example/authorize?prompt=login", client_id: "client-1", scope: "openid profile"},
   {redirectUri: "https://app.example/", state: "state-xyz", nonce: "nonce-abc", codeChallenge: challenge});
 assert.match(url, /code_challenge_method=S256/);
+assert.match(url, /^https:\/\/identity\.example\/authorize\?prompt=login&/);
 assert.match(url, /response_type=code/);
 assert.match(url, /state=state-xyz/);
 assert.match(url, /nonce=nonce-abc/);
@@ -680,7 +681,7 @@ assert.strictEqual(/code_challenge_method=plain/.test(url), false);
 func TestStaticWorkspaceLoginRejectsMismatchedState(t *testing.T) {
 	runNodeUITest(t, `
 const scenario = await runScenario({documents: true, retrieve: true});
-const config = {authority: "https://login.microsoftonline.com/tenant", client_id: "client-1", scope: "openid"};
+const config = {token_endpoint: "https://identity.example/token", client_id: "client-1", scope: "openid"};
 
 // verifyCallbackState is exact and refuses a missing stored value.
 assert.strictEqual(scenario.ctx.verifyCallbackState("s", "s"), true);
@@ -700,11 +701,13 @@ assert.strictEqual(threw, true, "mismatched state must reject");
 assert.strictEqual(calls, 0, "token endpoint must not be called on state mismatch");
 
 // A matching callback exchanges the code and returns the token.
+let tokenURL = null;
 let tokenBody = null;
-const okDeps = {fetch: async (url, options) => { tokenBody = options.body; return {ok: true, json: async () => ({access_token: "good-token"})}; }};
+const okDeps = {fetch: async (url, options) => { tokenURL = url; tokenBody = options.body; return {ok: true, json: async () => ({access_token: "good-token"})}; }};
 const token = await scenario.ctx.exchangeAuthorizationCode(
   config, {code: "auth-code", state: "mine"}, {state: "mine", verifier: "verifier-1", redirectUri: "https://app/"}, okDeps);
 assert.strictEqual(token, "good-token");
+assert.strictEqual(tokenURL, "https://identity.example/token");
 assert.match(tokenBody, /grant_type=authorization_code/);
 assert.match(tokenBody, /code_verifier=verifier-1/);
 assert.match(tokenBody, /code=auth-code/);

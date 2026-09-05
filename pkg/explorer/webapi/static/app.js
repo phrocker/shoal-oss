@@ -131,10 +131,6 @@ function handleReauthentication() {
   button.textContent = "Sign in again";
 }
 
-function trimTrailingSlash(value) {
-  return String(value || "").replace(/\/+$/, "");
-}
-
 // base64UrlEncode encodes bytes as unpadded base64url (RFC 4648 §5), the
 // encoding PKCE requires for the code verifier and challenge. It avoids btoa so
 // it is pure and testable without a browser global.
@@ -246,7 +242,6 @@ function encodeForm(pairs) {
 // buildAuthorizeUrl composes the Authorization Code + PKCE request. The
 // challenge method is fixed to S256 by construction.
 function buildAuthorizeUrl(config, params) {
-  const authorize = `${trimTrailingSlash(config.authority)}/oauth2/v2.0/authorize`;
   const query = encodeForm([
     ["client_id", config.client_id],
     ["response_type", "code"],
@@ -258,7 +253,8 @@ function buildAuthorizeUrl(config, params) {
     ["code_challenge", params.codeChallenge],
     ["code_challenge_method", PKCE_METHOD],
   ]);
-  return `${authorize}?${query}`;
+  const separator = config.authorization_endpoint.includes("?") ? "&" : "?";
+  return `${config.authorization_endpoint}${separator}${query}`;
 }
 
 // verifyCallbackState is the CSRF defence on the redirect. It accepts a
@@ -295,7 +291,6 @@ async function exchangeAuthorizationCode(config, callback, stored, deps) {
   if (!verifyCallbackState(callback.state, stored && stored.state)) {
     throw new Error("login state did not match; the callback was rejected");
   }
-  const endpoint = `${trimTrailingSlash(config.authority)}/oauth2/v2.0/token`;
   const body = encodeForm([
     ["client_id", config.client_id],
     ["grant_type", "authorization_code"],
@@ -304,7 +299,7 @@ async function exchangeAuthorizationCode(config, callback, stored, deps) {
     ["code_verifier", stored.verifier],
     ["scope", config.scope],
   ]);
-  const response = await deps.fetch(endpoint, {
+  const response = await deps.fetch(config.token_endpoint, {
     method: "POST",
     headers: {
       "content-type": "application/x-www-form-urlencoded",

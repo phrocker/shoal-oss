@@ -275,10 +275,10 @@ func TestAuthConfigReportsUnconfiguredWithoutBrowserAuth(t *testing.T) {
 func TestAuthConfigReportsConfiguredValues(t *testing.T) {
 	server := newStubServer(t, func(handler *webapi.Handler) {
 		handler.SetBrowserAuthConfig(&webapi.BrowserAuthConfig{
-			TenantID:  "tenant-123",
-			ClientID:  "client-456",
-			Scope:     "openid profile client-456/.default",
-			Authority: "https://login.microsoftonline.com/tenant-123",
+			ClientID:              "client-456",
+			Scope:                 "openid profile shoal.read",
+			AuthorizationEndpoint: "https://identity.example/authorize",
+			TokenEndpoint:         "https://tokens.example/token",
 		})
 	})
 	response, body := getJSON(t, server, "/api/v1/auth-config")
@@ -287,10 +287,10 @@ func TestAuthConfigReportsConfiguredValues(t *testing.T) {
 	}
 	for _, want := range []string{
 		`"configured":true`,
-		`"tenant_id":"tenant-123"`,
 		`"client_id":"client-456"`,
-		`"scope":"openid profile client-456/.default"`,
-		`"authority":"https://login.microsoftonline.com/tenant-123"`,
+		`"scope":"openid profile shoal.read"`,
+		`"authorization_endpoint":"https://identity.example/authorize"`,
+		`"token_endpoint":"https://tokens.example/token"`,
 	} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("auth-config = %s, missing %s", body, want)
@@ -298,10 +298,10 @@ func TestAuthConfigReportsConfiguredValues(t *testing.T) {
 	}
 }
 
-// TestContentSecurityPolicyScopesToConfiguredAuthority proves the connect-src
-// directive stays at the strict local default unless a login is configured, and
-// then admits only the configured provider's origin — never a wider host.
-func TestContentSecurityPolicyScopesToConfiguredAuthority(t *testing.T) {
+// TestContentSecurityPolicyScopesToConfiguredEndpoints proves connect-src stays
+// at the strict local default unless login is configured, then admits only the
+// configured endpoint origins.
+func TestContentSecurityPolicyScopesToConfiguredEndpoints(t *testing.T) {
 	baseline := newStubServer(t, nil)
 	response, _ := getJSON(t, baseline, "/api/v1/auth-config")
 	if csp := response.Header.Get("Content-Security-Policy"); !strings.Contains(
@@ -311,18 +311,21 @@ func TestContentSecurityPolicyScopesToConfiguredAuthority(t *testing.T) {
 
 	configured := newStubServer(t, func(handler *webapi.Handler) {
 		handler.SetBrowserAuthConfig(&webapi.BrowserAuthConfig{
-			TenantID:  "tenant-123",
-			ClientID:  "client-456",
-			Scope:     "openid",
-			Authority: "https://login.microsoftonline.com/tenant-123",
+			ClientID:              "client-456",
+			Scope:                 "openid",
+			AuthorizationEndpoint: "https://identity.example/tenant/authorize",
+			TokenEndpoint:         "https://tokens.example/oauth/token",
 		})
 	})
 	response, _ = getJSON(t, configured, "/api/v1/auth-config")
 	csp := response.Header.Get("Content-Security-Policy")
-	if !strings.Contains(csp, "connect-src 'self' https://login.microsoftonline.com;") {
-		t.Fatalf("configured CSP = %q, want the authority origin in connect-src", csp)
+	if !strings.Contains(
+		csp,
+		"connect-src 'self' https://identity.example https://tokens.example;",
+	) {
+		t.Fatalf("configured CSP = %q, want endpoint origins in connect-src", csp)
 	}
-	if strings.Contains(csp, "tenant-123") {
-		t.Fatalf("CSP leaked the authority path, must be origin only: %q", csp)
+	if strings.Contains(csp, "/tenant/") || strings.Contains(csp, "/oauth/") {
+		t.Fatalf("CSP leaked endpoint paths, must be origins only: %q", csp)
 	}
 }

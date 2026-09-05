@@ -144,17 +144,18 @@ logs stop before the new container logs begin.
 
 ## Identity and secrets
 
-- **No client secret anywhere.** The Entra authenticator validates inbound
+- **No client secret anywhere.** The OIDC authenticator validates inbound
   bearer tokens and **"A client secret is never accepted."** **[Verified]** —
   `cmd/shoal-explore-web/main.go`. There is no token-issuing flow, so there is
   no application credential to store, rotate, or leak.
-- **Entra config travels as environment variables, not command-line args.** The
-  template sets `SHOAL_ENTRA_TENANT`, `SHOAL_ENTRA_CLIENT_ID`,
-  `SHOAL_ENTRA_READER_ROLES`, and `SHOAL_ENTRA_CONTRIBUTOR_ROLES` as app
-  settings; `main.go` reads each as a fallback for the matching `-entra-*` flag.
-  **[Verified]** — the six `os.Getenv("SHOAL_ENTRA_*")` fallbacks are in
-  `main.go`; the app command line carries only `-state-dir` and `-listen`, so no
-  tenant/app IDs land in shell history.
+- **OIDC config travels as environment variables, not command-line args.** The
+  template sets `SHOAL_OIDC_ISSUER`, `SHOAL_OIDC_AUDIENCE`,
+  `SHOAL_OIDC_AUTHORIZATION_CLAIM`, `SHOAL_OIDC_READER_VALUES`, and
+  `SHOAL_OIDC_CONTRIBUTOR_VALUES` as app settings; `main.go` reads each as a
+  fallback for the matching `-oidc-*` flag. Optional discovery, JWKS, and
+  browser-login settings use the same generic prefix. **[Verified]** — the app
+  command line carries only `-state-dir` and `-listen`, so OIDC identifiers do
+  not land in shell history.
 - **Managed identity for platform access.** A user-assigned managed identity is
   created and attached to the site; set `useAcrManagedIdentity=true` and grant
   it `AcrPull` on your registry so image pulls need no registry password:
@@ -356,7 +357,7 @@ flag is:
   exactly**, and an entry with no port matches a request whose `Host` has no
   port. No wildcard, no suffix, and `X-Forwarded-Host` is never trusted.
 - Environment fallback **`SHOAL_ALLOWED_HOST`** — which is what the template
-  sets, keeping the value off the command line for the same reason the Entra
+  sets, keeping the value off the command line for the same reason the OIDC
   identifiers are app settings.
 
 **Why the entry is the bare hostname, not `hostname:8098`.** Reasoned through,

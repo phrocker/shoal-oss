@@ -14,7 +14,7 @@ prerequisites below land) in a shared instance, where the two deployments differ
 - [Local: one command](#local-one-command)
 - [Volume layout: a single state root](#volume-layout-a-single-state-root)
 - [The configuration seam: local vs shared](#the-configuration-seam-local-vs-shared)
-- [Real authentication with Microsoft Entra ID](#real-authentication-with-microsoft-entra-id)
+- [Provider-neutral OIDC authentication](#provider-neutral-oidc-authentication)
 - [Browser login (Authorization Code + PKCE)](#browser-login-authorization-code--pkce)
 - [The unsafe-configuration guard](#the-unsafe-configuration-guard)
 - [Persistence: corpus and authorization both survive](#persistence-corpus-and-authorization-both-survive)
@@ -131,7 +131,7 @@ mounted volume — never code:
 | Bind address       | `-listen 127.0.0.1:8098` (loopback)| `-listen 0.0.0.0:<port>` (see gaps below)    |
 | Host authority     | default (the resolved listen address) | `-allowed-host <external-name[:port]>` (see below) |
 | Data directory     | `-state-dir /var/lib/shoal` (one mounted volume) | same flag, backed by durable storage |
-| Authenticator      | `-dev-auth` (loopback-only)        | Microsoft Entra ID (`-entra-*`, see below)   |
+| Authenticator      | `-dev-auth` (loopback-only)        | OpenID Connect (`-oidc-*`, see below)        |
 | TLS termination    | none (loopback)                    | terminated at an ingress/reverse proxy       |
 | Log format         | Go `log` text to stderr            | same today (no structured-log flag yet)      |
 
@@ -139,55 +139,61 @@ mounted volume — never code:
 profile parameterises (`SHOAL_EXPLORE_LISTEN`). The remaining columns are the
 seam for a shared instance and are covered under [gaps](#shared--cloud-instance-shape-and-open-gaps).
 
-## Real authentication with Microsoft Entra ID
+## Provider-neutral OIDC authentication
 
-A shared, non-loopback instance runs the **Microsoft Entra ID (Azure AD)
-authenticator** instead of `-dev-auth`. It validates the OIDC bearer token on
-each request — signature against the tenant's JWKS (fetched, cached, and
-refreshed on rotation), an asymmetric-algorithm allowlist that rejects `alg:
-none` and every symmetric algorithm, exact issuer, exact audience, and
-expiry/not-before with a configurable clock-skew tolerance — and mints a trusted
-per-request decision. `-dev-auth` and the Entra authenticator are **mutually
-exclusive**; supplying both is refused. A validated token unlocks a non-loopback
-listener, which `-dev-auth` never could.
+A shared, non-loopback instance runs the standards-based OIDC authenticator
+instead of `-dev-auth`. It validates every bearer token before minting an
+`auth.Decision`: asymmetric signature and key identifier, configured algorithm
+allow-list, exact issuer, one of the configured audiences, expiry, and
+not-before. Signing keys are fetched from `jwks_uri`, cached, and refreshed on a
+bounded cadence when an unknown key identifier appears. `alg: none` and all
+HMAC algorithms are always refused.
 
-### Required flags
+`-dev-auth` and OIDC are mutually exclusive. Missing or partial OIDC
+configuration, unavailable or inconsistent discovery metadata, unavailable or
+malformed JWKS, malformed claims, and unmapped authorization values all fail
+closed. Authentication never falls back to anonymous or development authority.
 
-| Flag / environment fallback                        | Purpose                                                             |
-| -------------------------------------------------- | ------------------------------------------------------------------- |
-| `-entra-tenant` / `SHOAL_ENTRA_TENANT`             | Tenant (directory) ID; derives the expected issuer and OIDC discovery. Required unless `-entra-issuer` is set. |
-| `-entra-client-id` / `SHOAL_ENTRA_CLIENT_ID`       | Application (client) ID the token audience must match exactly. **Required.** |
+### Required token validation and claim mapping
 
-A **client secret is never accepted**: this validates inbound bearer tokens, it
-does not perform any token-issuing flow.
+| Flag / environment fallback | Purpose |
+| --- | --- |
+| `-oidc-issuer` / `SHOAL_OIDC_ISSUER` | Exact issuer required in both the discovery document and token. |
+| `-oidc-audience` / `SHOAL_OIDC_AUDIENCE` | Comma-separated accepted token audiences; at least one exact match is required. |
+| `-oidc-authorization-claim` / `SHOAL_OIDC_AUTHORIZATION_CLAIM` | Exact top-level string or string-array claim whose values are mapped to authority. |
+| `-oidc-reader-values` / `SHOAL_OIDC_READER_VALUES` | Comma-separated claim values granting list, read, connect, neighborhood, and retrieve. |
+| `-oidc-contributor-values` / `SHOAL_OIDC_CONTRIBUTOR_VALUES` | Comma-separated claim values granting the reader operations plus ingest. |
 
-### Authority mapping (required to grant any corpus access)
+At least one reader or contributor value is required. A missing, malformed, or
+unmapped authorization claim is denied before a service operation runs.
+Authentication alone never grants corpus access.
 
-A validated token proves **identity only**. It confers no corpus access by
-itself. Authority is granted by mapping Entra **app roles** to workspace
-operations, and the mapping is fail-closed:
+The subject defaults to the standard `sub` claim. Optional exact top-level
+claim mappings preserve richer decision identity and delegation:
 
-| Flag / environment fallback                                      | Grant                                       |
-| --------------------------------------------------------------- | ------------------------------------------- |
-| `-entra-reader-roles` / `SHOAL_ENTRA_READER_ROLES`              | list, read, connect, neighborhood, retrieve |
-| `-entra-contributor-roles` / `SHOAL_ENTRA_CONTRIBUTOR_ROLES`    | the reader set **plus** ingest              |
+| Flag / environment fallback | Decision field |
+| --- | --- |
+| `-oidc-subject-claim` / `SHOAL_OIDC_SUBJECT_CLAIM` | `Subject` (default `sub`) |
+| `-oidc-actor-claim` / `SHOAL_OIDC_ACTOR_CLAIM` | `Actor` |
+| `-oidc-client-id-claim` / `SHOAL_OIDC_CLIENT_ID_CLAIM` | `ClientID` |
+| `-oidc-delegation-claim` / `SHOAL_OIDC_DELEGATION_CLAIM` | ordered `OnBehalfOf` chain; accepts a string or string array |
 
-Both take a comma-separated list of app-role values. An authenticated caller
-whose token carries **no configured role** — including a missing `roles` claim —
-is granted **no corpus access at all**: they authenticate, but every registered
-document is invisible to them. An absent or unrecognised role never widens
-access. If neither list is configured, every caller is unmapped and the corpus
-is invisible to everyone, so you must assign at least one role to grant access.
+When an optional mapping is configured, that claim becomes required and must
+have the expected string shape. Token-derived identities are namespaced by the
+validated issuer so subjects from different issuers cannot collide.
 
-### Optional flags
+### Discovery, keys, and validation options
 
-| Flag / environment fallback                        | Default                                                          |
-| -------------------------------------------------- | --------------------------------------------------------------- |
-| `-entra-issuer` / `SHOAL_ENTRA_ISSUER`             | `https://login.microsoftonline.com/<tenant>/v2.0`               |
-| `-entra-jwks-uri` / `SHOAL_ENTRA_JWKS_URI`         | resolved via OIDC discovery from the issuer                     |
-| `-entra-allowed-algs`                              | `RS256` (any of RS/PS/ES 256/384/512; `HS*` and `none` refused) |
-| `-entra-clock-skew`                                | `60s` (capped at `5m`)                                          |
-| `-entra-scope` / `SHOAL_ENTRA_SCOPE`               | `openid profile <client-id>/.default` (browser login only)      |
+| Flag / environment fallback | Default |
+| --- | --- |
+| `-oidc-discovery-url` / `SHOAL_OIDC_DISCOVERY_URL` | `<issuer>/.well-known/openid-configuration` |
+| `-oidc-jwks-uri` / `SHOAL_OIDC_JWKS_URI` | `jwks_uri` from discovery |
+| `-oidc-allowed-algs` / `SHOAL_OIDC_ALLOWED_ALGS` | `RS256`; RS/PS/ES 256/384/512 are supported |
+| `-oidc-clock-skew` | `60s`, capped at `5m` |
+
+Issuer and endpoint URLs require HTTPS. Loopback HTTP is available only to the
+in-process test seam, not to production command configuration. A client secret
+is never accepted.
 
 ### Example
 
@@ -196,72 +202,40 @@ $ docker run --rm --network host -v shoal-explore-state:/var/lib/shoal \
     shoal-explore-web:test \
     -state-dir /var/lib/shoal -listen 0.0.0.0:8098 \
     -allowed-host explorer.example.test \
-    -entra-tenant <tenant-guid> \
-    -entra-client-id <application-client-id> \
-    -entra-reader-roles Shoal.Reader \
-    -entra-contributor-roles Shoal.Contributor
-Validating Microsoft Entra ID bearer tokens for audience <application-client-id>; unmapped callers receive no corpus access
+    -oidc-issuer https://identity.example.test \
+    -oidc-audience shoal-api \
+    -oidc-authorization-claim access \
+    -oidc-reader-values reader \
+    -oidc-contributor-values contributor
+Validating OIDC bearer tokens for audience(s) shoal-api; unmapped authorization claims are denied
 Shoal Explorer listening at http://0.0.0.0:8098
 ```
 
-The IDs above are placeholders — substitute your tenant and application (client)
-IDs. Clients call the API with `Authorization: Bearer <token>`, where the token
-is a v2 Entra token addressed to `<application-client-id>`. Set `-allowed-host`
-before exposing a public bind behind a reverse proxy (see below).
+Clients call the API with a bearer token issued by the configured issuer and
+addressed to one of the configured audiences. Set `-allowed-host` before
+exposing a public bind behind a reverse proxy (see below).
 
 ## Browser login (Authorization Code + PKCE)
 
-When an Entra authenticator is configured, **every** route except the HTML
-shell, its static assets, and `GET /api/v1/auth-config` requires a bearer token.
-The embedded web UI acquires one itself with an OAuth 2.0 **Authorization Code
-flow with PKCE (S256 only)** — a public-client flow with no client secret. The
-access token is held **in memory only**; it is never written to `localStorage`,
-`sessionStorage`, or a cookie.
+Browser login is optional. Set `-oidc-browser-client-id` and
+`-oidc-browser-scope` to enable the embedded UI's OAuth 2.0 Authorization Code
+flow with PKCE (S256 only). The access token is held in memory only; it is never
+written to `localStorage`, `sessionStorage`, or a cookie.
 
 The UI bootstraps by reading `GET /api/v1/auth-config`, which is unauthenticated
-and returns only the **non-secret** login parameters — tenant ID, client ID,
-scope, and authority origin — and nothing about the corpus, the policy catalog,
-or any principal. Under `-dev-auth` it reports `{"configured":false}` and the UI
-renders no login control at all, so local development stays a single command.
+and returns only the non-secret client ID, scope, authorization endpoint, and
+token endpoint. Endpoints come from OIDC discovery unless overridden with
+`-oidc-authorization-endpoint` / `SHOAL_OIDC_AUTHORIZATION_ENDPOINT` and
+`-oidc-token-endpoint` / `SHOAL_OIDC_TOKEN_ENDPOINT`. Under `-dev-auth`, or an
+API-only OIDC configuration without a browser client ID, it reports
+`{"configured":false}` and renders no login control.
 
-### App registration: a required operator step
-
-This flow needs an Entra **app registration with a Single-Page Application (SPA)
-platform** whose **Redirect URI is the deployed origin's root** (for example
-`https://explorer.example.test/`). The SPA platform is what makes Entra issue
-tokens to a public client over CORS with PKCE and no secret; a "Web" platform
-registration will **not** work for a browser flow. This is a portal step an
-operator must perform by hand — it cannot be inferred from, or created by, the
-container image or the deployment template.
-
-Concretely, in **Entra ID → App registrations → your app → Authentication**:
-
-1. **Add a platform → Single-page application.**
-2. Set the **Redirect URI** to the deployed origin's root, e.g.
-   `https://explorer.example.test/`. It must match the browser's origin exactly,
-   including scheme and any non-default port.
-3. Ensure the API/scope the UI requests (`-entra-scope`, default
-   `openid profile <client-id>/.default`) is consented for the tenant.
-
-The `-entra-scope` flag controls only the scope string the **browser** requests
-during the redirect; it is not used for server-side token validation.
-
-**Verified vs inferred (per the honesty convention in this repo):**
-
-- **Verified locally:** with `-dev-auth`, `auth-config` reports
-  `{"configured":false}`, CSP `connect-src` stays `'self'`, and no login control
-  renders. With an Entra authenticator configured, the shell, assets, and
-  `auth-config` load without a token; every `/api/v1/*` route (including a
-  non-existent one) returns `401` with `WWW-Authenticate: Bearer`; `auth-config`
-  returns exactly the four non-secret fields; and CSP `connect-src` gains the
-  authority **origin** only (no tenant path). These were exercised against a
-  running binary with a placeholder tenant/client.
-- **Inferred, not verified against a live tenant:** the default scope
-  `openid profile <client-id>/.default`, the SPA-platform requirement, and the
-  exact redirect-URI matching are stated from Entra's documented behaviour and
-  have not been driven end-to-end through a real Microsoft Entra tenant here. An
-  operator should confirm the scope and redirect URI against their own
-  registration.
+Register the deployed origin's root (for example
+`https://explorer.example.test/`) as an allowed redirect URI for a public client
+at the chosen identity provider, permit CORS for the token endpoint, and grant
+the scopes named by `-oidc-browser-scope`. The browser sends no client secret.
+The server validates the resulting access token independently against its
+issuer, audience, signature, time, and claim-mapping configuration.
 
 ## Host authority (required for a public bind)
 
@@ -418,8 +392,8 @@ plus the integration tests below.
 
 ### Production-mode proof (backfill disabled)
 
-Production mode uses the Entra authenticator; running it **without** either
-`-dev-auth` or an `-entra-*` configuration still fails closed before the corpus
+Production mode uses the OIDC authenticator; running it **without** either
+`-dev-auth` or an `-oidc-*` configuration still fails closed before the corpus
 is opened, because no authenticator is configured. Observed:
 
 ```console
@@ -480,10 +454,10 @@ The image is shared-instance ready; the *runtime prerequisites* are not all in
 place on `main`. Honest gaps, none of which this deployment work should paper
 over:
 
-1. **The Microsoft Entra ID authenticator is wired (issue #278).** Supply the
-   `-entra-*` flags (see [Real authentication with Microsoft Entra ID](#real-authentication-with-microsoft-entra-id))
+1. **The provider-neutral OIDC authenticator is wired (issue #315).** Supply the
+   `-oidc-*` flags (see [Provider-neutral OIDC authentication](#provider-neutral-oidc-authentication))
    and a non-loopback listener is allowed. Without either `-dev-auth` or an
-   Entra configuration, startup still fails closed demanding an authenticator.
+   OIDC configuration, startup still fails closed demanding an authenticator.
 2. **`-backend remote` is deliberately refused** because `auth.Decision` has no
    on-the-wire representation (issue #278): forwarding would authenticate at the
    edge and then call upstream with no identity. This means **multi-node scaling
@@ -503,7 +477,7 @@ over:
    documents but the policy catalog is empty (a lost policy volume). Use
    `-state-dir` so the corpus and policy always persist under one mount.
 
-A public bind is now end-to-end serviceable behind a proxy: run the Entra
+A public bind is now end-to-end serviceable behind a proxy: run the OIDC
 authenticator and set `-allowed-host` to the external name the proxy forwards.
 Omitting `-allowed-host` on a public bind is a deliberate fail-closed posture —
 requests are refused until the external authority is declared — not a packaging
@@ -548,7 +522,7 @@ no memory-mapped I/O anywhere in the tree and never reaches the only `flock` cod
 Windows and Linux) — the two mechanisms that make embedded stores unsafe on SMB —
 so Azure Files SMB is a reasonable default, with NFS or AKS + Azure Disk kept as
 escalation paths only if a specific problem shows up. TLS terminates at the App Service front end and the
-app runs the Entra authenticator (`-entra-*` / `SHOAL_ENTRA_*`). The
+app runs the OIDC authenticator (`-oidc-*` / `SHOAL_OIDC_*`). The
 host-authority gate (gap #3) is closed by **PR #295** (merged to `main` at
 `3670e00`): the template sets `SHOAL_ALLOWED_HOST` to the App Service hostname
 (or your custom domains) so the public bind is serviceable, not refused with 421.

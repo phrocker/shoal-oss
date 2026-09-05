@@ -21,27 +21,25 @@ import (
 	"net/http"
 	"net/url"
 	"path"
+	"sort"
 	"strings"
 )
 
 // BrowserAuthConfig carries the non-secret parameters a browser needs to begin
 // an OIDC Authorization Code + PKCE login against a configured identity
-// provider. Every field appears in the address bar of an ordinary OIDC redirect
-// and none is a secret: there is deliberately no client secret here. The
-// browser performs a public-client PKCE exchange and the server only validates
-// the bearer token that results; it never issues one.
+// provider. Every field is public OIDC metadata or a public-client parameter;
+// there is deliberately no client secret here. The browser performs a
+// public-client PKCE exchange and the server only validates the bearer token
+// that results; it never issues one.
 type BrowserAuthConfig struct {
-	// TenantID is the directory identifier, surfaced for display only.
-	TenantID string
-	// ClientID is the public application (client) ID the browser authenticates
-	// as and that the resulting token is audienced to.
+	// ClientID is the public application identifier the browser authenticates as.
 	ClientID string
 	// Scope is the space-delimited scope string the browser requests.
 	Scope string
-	// Authority is the OIDC authority base, for example
-	// https://login.microsoftonline.com/<tenant>. The browser derives the
-	// authorize and token endpoints from it.
-	Authority string
+	// AuthorizationEndpoint is the exact OIDC authorization endpoint.
+	AuthorizationEndpoint string
+	// TokenEndpoint is the exact OIDC token endpoint.
+	TokenEndpoint string
 }
 
 // AuthConfigResponse is the body of GET /api/v1/auth-config. It is unauthenticated
@@ -50,11 +48,11 @@ type BrowserAuthConfig struct {
 // When no interactive login is configured it reports Configured false and the
 // browser renders no login UI at all, which is the correct state for -dev-auth.
 type AuthConfigResponse struct {
-	Configured bool   `json:"configured"`
-	TenantID   string `json:"tenant_id,omitempty"`
-	ClientID   string `json:"client_id,omitempty"`
-	Scope      string `json:"scope,omitempty"`
-	Authority  string `json:"authority,omitempty"`
+	Configured            bool   `json:"configured"`
+	ClientID              string `json:"client_id,omitempty"`
+	Scope                 string `json:"scope,omitempty"`
+	AuthorizationEndpoint string `json:"authorization_endpoint,omitempty"`
+	TokenEndpoint         string `json:"token_endpoint,omitempty"`
 }
 
 // SetBrowserAuthConfig supplies the non-secret parameters a browser needs to
@@ -75,35 +73,47 @@ func (h *Handler) authConfigEndpoint(writer http.ResponseWriter, _ *http.Request
 		return
 	}
 	writeResponse(writer, http.StatusOK, AuthConfigResponse{
-		Configured: true,
-		TenantID:   h.browserAuth.TenantID,
-		ClientID:   h.browserAuth.ClientID,
-		Scope:      h.browserAuth.Scope,
-		Authority:  h.browserAuth.Authority,
+		Configured:            true,
+		ClientID:              h.browserAuth.ClientID,
+		Scope:                 h.browserAuth.Scope,
+		AuthorizationEndpoint: h.browserAuth.AuthorizationEndpoint,
+		TokenEndpoint:         h.browserAuth.TokenEndpoint,
 	})
 }
 
 // connectSources is the connect-src value for the Content-Security-Policy. With
 // no interactive login configured it is exactly 'self', byte-identical to the
-// local development posture. When a login is configured the browser must POST
-// the PKCE token exchange to the identity provider, so exactly that provider's
-// origin — scheme and host only, derived from the configured authority — is
-// added and nothing wider. A malformed or non-https authority contributes
-// nothing, failing closed to 'self'.
+// local development posture. When a login is configured, exactly the origins
+// of its authorization and token endpoints are added. Malformed or non-https
+// endpoints contribute nothing, failing closed to 'self'.
 func (h *Handler) connectSources() string {
 	if h.browserAuth == nil {
 		return "'self'"
 	}
-	origin := authorityOrigin(h.browserAuth.Authority)
-	if origin == "" {
+	origins := make(map[string]struct{}, 2)
+	for _, endpoint := range []string{
+		h.browserAuth.AuthorizationEndpoint,
+		h.browserAuth.TokenEndpoint,
+	} {
+		if origin := endpointOrigin(endpoint); origin != "" {
+			origins[origin] = struct{}{}
+		}
+	}
+	if len(origins) == 0 {
 		return "'self'"
 	}
-	return "'self' " + origin
+	sorted := make([]string, 0, len(origins))
+	for origin := range origins {
+		sorted = append(sorted, origin)
+	}
+	sort.Strings(sorted)
+	return "'self' " + strings.Join(sorted, " ")
 }
 
-func authorityOrigin(authority string) string {
-	parsed, err := url.Parse(strings.TrimSpace(authority))
-	if err != nil || parsed.Scheme != "https" || parsed.Host == "" {
+func endpointOrigin(endpoint string) string {
+	parsed, err := url.Parse(strings.TrimSpace(endpoint))
+	if err != nil || parsed.Scheme != "https" || parsed.Host == "" ||
+		parsed.User != nil {
 		return ""
 	}
 	return parsed.Scheme + "://" + parsed.Host

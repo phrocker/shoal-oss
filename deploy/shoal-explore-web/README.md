@@ -42,8 +42,8 @@ remain available for legacy/custom layouts — see the guide.
 
 The image (`Dockerfile.shoal-explore-web`, at the repo root) is the same artifact
 a shared instance would run; only the flags differ. For a shared, non-loopback
-instance, supply the Microsoft Entra ID authenticator instead of `-dev-auth`
-(see [Real authentication with Microsoft Entra ID](../../docs/shoal-explore-web-deploy.md#real-authentication-with-microsoft-entra-id))
+instance, supply the provider-neutral OIDC authenticator instead of `-dev-auth`
+(see [Provider-neutral OIDC authentication](../../docs/shoal-explore-web-deploy.md#provider-neutral-oidc-authentication))
 and set `-allowed-host` / `SHOAL_ALLOWED_HOST` to the external name(s) the proxy
 forwards.
 

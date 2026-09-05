@@ -1,0 +1,1038 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements. See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership. The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License. You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied. See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+package main
+
+import (
+	"bytes"
+	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"math/big"
+	"net/http"
+	"net/http/httptest"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/golang-jwt/jwt/v5"
+	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
+	"github.com/phrocker/shoal-oss/pkg/explorer/webapi"
+	"github.com/phrocker/shoal-oss/pkg/shoal"
+)
+
+const (
+	testAudience = "shoal-api"
+	testKID      = "test-signing-key-1"
+	testSubject  = "user-123"
+)
+
+type fakeOIDCIssuer struct {
+	server *httptest.Server
+	keys   map[string]*rsa.PrivateKey
+
+	mu                sync.Mutex
+	discoveryHits     int
+	jwksHits          int
+	discoveryStatus   int
+	jwksStatus        int
+	discoveryIssuer   string
+	discoveryJWKSURI  string
+	authorizationPath string
+	tokenPath         string
+}
+
+func newFakeOIDCIssuer(t *testing.T) *fakeOIDCIssuer {
+	t.Helper()
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("generate signing key: %v", err)
+	}
+	issuer := &fakeOIDCIssuer{
+		keys:              map[string]*rsa.PrivateKey{testKID: key},
+		discoveryStatus:   http.StatusOK,
+		jwksStatus:        http.StatusOK,
+		authorizationPath: "/authorize",
+		tokenPath:         "/token",
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/.well-known/openid-configuration", issuer.serveDiscovery)
+	mux.HandleFunc("/metadata", issuer.serveDiscovery)
+	mux.HandleFunc("/keys", issuer.serveJWKS)
+	issuer.server = httptest.NewServer(mux)
+	t.Cleanup(issuer.server.Close)
+	return issuer
+}
+
+func (f *fakeOIDCIssuer) serveDiscovery(
+	writer http.ResponseWriter,
+	_ *http.Request,
+) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.discoveryHits++
+	if f.discoveryStatus != http.StatusOK {
+		writer.WriteHeader(f.discoveryStatus)
+		return
+	}
+	issuer := f.discoveryIssuer
+	if issuer == "" {
+		issuer = f.server.URL
+	}
+	jwksURI := f.discoveryJWKSURI
+	if jwksURI == "" {
+		jwksURI = f.server.URL + "/keys"
+	}
+	writer.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(writer).Encode(oidcMetadata{
+		Issuer:                issuer,
+		JWKSURI:               jwksURI,
+		AuthorizationEndpoint: f.server.URL + f.authorizationPath,
+		TokenEndpoint:         f.server.URL + f.tokenPath,
+	})
+}
+
+func (f *fakeOIDCIssuer) serveJWKS(
+	writer http.ResponseWriter,
+	_ *http.Request,
+) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.jwksHits++
+	if f.jwksStatus != http.StatusOK {
+		writer.WriteHeader(f.jwksStatus)
+		return
+	}
+	writer.Header().Set("Content-Type", "application/json")
+	_, _ = writer.Write(f.jwksJSONLocked())
+}
+
+func (f *fakeOIDCIssuer) jwksJSONLocked() []byte {
+	type webKey struct {
+		Kty string `json:"kty"`
+		Kid string `json:"kid"`
+		Use string `json:"use"`
+		Alg string `json:"alg"`
+		N   string `json:"n"`
+		E   string `json:"e"`
+	}
+	document := struct {
+		Keys []webKey `json:"keys"`
+	}{}
+	for kid, key := range f.keys {
+		document.Keys = append(document.Keys, webKey{
+			Kty: "RSA",
+			Kid: kid,
+			Use: "sig",
+			Alg: "RS256",
+			N:   base64.RawURLEncoding.EncodeToString(key.PublicKey.N.Bytes()),
+			E: base64.RawURLEncoding.EncodeToString(
+				big.NewInt(int64(key.PublicKey.E)).Bytes()),
+		})
+	}
+	raw, _ := json.Marshal(document)
+	return raw
+}
+
+func (f *fakeOIDCIssuer) counts() (int, int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.discoveryHits, f.jwksHits
+}
+
+func (f *fakeOIDCIssuer) defaultClaims(now time.Time) jwt.MapClaims {
+	return jwt.MapClaims{
+		"iss":    f.server.URL,
+		"aud":    []string{testAudience, "another-audience"},
+		"sub":    testSubject,
+		"access": []string{"reader"},
+		"iat":    now.Add(-time.Minute).Unix(),
+		"nbf":    now.Add(-time.Minute).Unix(),
+		"exp":    now.Add(time.Hour).Unix(),
+	}
+}
+
+func (f *fakeOIDCIssuer) signRS256(
+	t *testing.T,
+	kid string,
+	claims jwt.MapClaims,
+) string {
+	t.Helper()
+	f.mu.Lock()
+	key := f.keys[kid]
+	f.mu.Unlock()
+	if key == nil {
+		var err error
+		key, err = rsa.GenerateKey(rand.Reader, 2048)
+		if err != nil {
+			t.Fatalf("generate ephemeral key: %v", err)
+		}
+	}
+	token := jwt.NewWithClaims(jwt.SigningMethodRS256, claims)
+	token.Header["kid"] = kid
+	signed, err := token.SignedString(key)
+	if err != nil {
+		t.Fatalf("sign token: %v", err)
+	}
+	return signed
+}
+
+func (f *fakeOIDCIssuer) testConfig(clock func() time.Time) oidcConfig {
+	return oidcConfig{
+		issuer:             f.server.URL,
+		audiences:          []string{testAudience},
+		authorizationClaim: "access",
+		readerClaimValues:  []string{"reader"},
+		contributorValues:  []string{"writer"},
+		httpClient:         f.server.Client(),
+		clock:              clock,
+	}
+}
+
+func fixedClock(at time.Time) func() time.Time {
+	return func() time.Time { return at }
+}
+
+func bearerRequest(token string) *http.Request {
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/meta", nil)
+	request.Header.Set("Authorization", "Bearer "+token)
+	return request
+}
+
+func newTestOIDCAuthenticator(
+	t *testing.T,
+	config oidcConfig,
+) *oidcAuthenticator {
+	t.Helper()
+	authenticator, err := newOIDCAuthenticator(config, time.Now)
+	if err != nil {
+		t.Fatalf("newOIDCAuthenticator: %v", err)
+	}
+	return authenticator
+}
+
+func TestOIDCValidTokenMintsReaderDecision(t *testing.T) {
+	issuer := newFakeOIDCIssuer(t)
+	now := time.Now()
+	authenticator := newTestOIDCAuthenticator(
+		t, issuer.testConfig(fixedClock(now)))
+	token := issuer.signRS256(t, testKID, issuer.defaultClaims(now))
+
+	decision, err := authenticator.Authenticate(bearerRequest(token))
+	if err != nil {
+		t.Fatalf("valid token rejected: %v", err)
+	}
+	wantSubject := "oidc:" + issuer.server.URL + "#" + testSubject
+	if decision.Subject() != shoal.ID(wantSubject) {
+		t.Fatalf("subject = %q, want %q", decision.Subject(), wantSubject)
+	}
+	if decision.Actor() != oidcActor {
+		t.Fatalf("actor = %q, want %q", decision.Actor(), oidcActor)
+	}
+	if !grantsWorkspaceSource(decision) {
+		t.Fatal("mapped reader was not granted the workspace source")
+	}
+	if operationsContain(decision.AllowedOperations(), auth.OperationIngest) {
+		t.Fatal("reader was granted ingest")
+	}
+	if !operationsContain(decision.AllowedOperations(), auth.OperationRead) {
+		t.Fatal("reader was not granted read")
+	}
+	if !strings.HasPrefix(string(decision.RequestID()), "oidc-request-") {
+		t.Fatalf("request ID = %q", decision.RequestID())
+	}
+	second, err := authenticator.Authenticate(bearerRequest(token))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.RequestID() == decision.RequestID() {
+		t.Fatal("two requests shared one request identity")
+	}
+}
+
+func TestOIDCClaimMappingPreservesIdentityAndDelegation(t *testing.T) {
+	issuer := newFakeOIDCIssuer(t)
+	now := time.Now()
+	config := issuer.testConfig(fixedClock(now))
+	config.subjectClaim = "principal"
+	config.actorClaim = "actor"
+	config.clientIDClaim = "client"
+	config.delegationClaim = "delegation"
+	authenticator := newTestOIDCAuthenticator(t, config)
+
+	claims := issuer.defaultClaims(now)
+	delete(claims, "sub")
+	claims["principal"] = "principal-7"
+	claims["actor"] = "service-4"
+	claims["client"] = "client-9"
+	claims["delegation"] = []string{"delegate-a", "delegate-b"}
+	claims["access"] = "writer"
+	decision, err := authenticator.Authenticate(
+		bearerRequest(issuer.signRS256(t, testKID, claims)))
+	if err != nil {
+		t.Fatalf("mapped token rejected: %v", err)
+	}
+	prefix := "oidc:" + issuer.server.URL + "#"
+	if decision.Subject() != shoal.ID(prefix+"principal-7") ||
+		decision.Actor() != shoal.ID(prefix+"service-4") ||
+		decision.ClientID() != shoal.ID(prefix+"client-9") {
+		t.Fatalf(
+			"mapped identity = subject %q actor %q client %q",
+			decision.Subject(), decision.Actor(), decision.ClientID())
+	}
+	wantDelegation := []shoal.ID{
+		shoal.ID(prefix + "delegate-a"),
+		shoal.ID(prefix + "delegate-b"),
+	}
+	gotDelegation := decision.OnBehalfOf()
+	if len(gotDelegation) != len(wantDelegation) {
+		t.Fatalf("delegation = %q", gotDelegation)
+	}
+	for index := range wantDelegation {
+		if gotDelegation[index] != wantDelegation[index] {
+			t.Fatalf("delegation = %q, want %q", gotDelegation, wantDelegation)
+		}
+	}
+	if !operationsContain(decision.AllowedOperations(), auth.OperationIngest) {
+		t.Fatal("contributor mapping did not grant ingest")
+	}
+}
+
+func TestOIDCRejectsMalformedConfiguredIdentityClaims(t *testing.T) {
+	issuer := newFakeOIDCIssuer(t)
+	now := time.Now()
+	cases := []struct {
+		name       string
+		claimName  string
+		claimValue any
+		configure  func(*oidcConfig)
+	}{
+		{
+			name:       "actor",
+			claimName:  "actor",
+			claimValue: 7,
+			configure: func(config *oidcConfig) {
+				config.actorClaim = "actor"
+			},
+		},
+		{
+			name:       "client",
+			claimName:  "client",
+			claimValue: []string{"not-a-string"},
+			configure: func(config *oidcConfig) {
+				config.clientIDClaim = "client"
+			},
+		},
+		{
+			name:       "delegation",
+			claimName:  "delegation",
+			claimValue: []any{"delegate", 7},
+			configure: func(config *oidcConfig) {
+				config.delegationClaim = "delegation"
+			},
+		},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			config := issuer.testConfig(fixedClock(now))
+			testCase.configure(&config)
+			authenticator := newTestOIDCAuthenticator(t, config)
+			claims := issuer.defaultClaims(now)
+			claims[testCase.claimName] = testCase.claimValue
+			_, err := authenticator.authenticate(bearerRequest(
+				issuer.signRS256(t, testKID, claims)))
+			if !errors.Is(err, errMalformedClaim) {
+				t.Fatalf("malformed %s claim error = %v", testCase.name, err)
+			}
+		})
+	}
+}
+
+func TestOIDCRejectsUnmappedAndMalformedClaims(t *testing.T) {
+	issuer := newFakeOIDCIssuer(t)
+	now := time.Now()
+	authenticator := newTestOIDCAuthenticator(
+		t, issuer.testConfig(fixedClock(now)))
+	cases := []struct {
+		name string
+		edit func(jwt.MapClaims)
+		want error
+	}{
+		{
+			name: "missing authorization claim",
+			edit: func(claims jwt.MapClaims) { delete(claims, "access") },
+			want: errMissingMappedClaim,
+		},
+		{
+			name: "unmapped authorization value",
+			edit: func(claims jwt.MapClaims) { claims["access"] = []string{"unknown"} },
+			want: errUnmappedAuthorization,
+		},
+		{
+			name: "malformed authorization claim",
+			edit: func(claims jwt.MapClaims) { claims["access"] = []any{"reader", 7} },
+			want: errMalformedClaim,
+		},
+		{
+			name: "missing subject",
+			edit: func(claims jwt.MapClaims) { delete(claims, "sub") },
+			want: errMissingSubject,
+		},
+		{
+			name: "malformed subject",
+			edit: func(claims jwt.MapClaims) { claims["sub"] = 42 },
+			want: errMalformedClaim,
+		},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			claims := issuer.defaultClaims(now)
+			testCase.edit(claims)
+			token := issuer.signRS256(t, testKID, claims)
+			_, err := authenticator.authenticate(bearerRequest(token))
+			if !errors.Is(err, testCase.want) {
+				t.Fatalf("error = %v, want %v", err, testCase.want)
+			}
+			if _, err := authenticator.Authenticate(bearerRequest(token)); err == nil {
+				t.Fatal("invalid or unmapped claims crossed the public boundary")
+			}
+		})
+	}
+}
+
+func TestOIDCRejectsIssuerAudienceAndTimeFailures(t *testing.T) {
+	issuer := newFakeOIDCIssuer(t)
+	now := time.Now()
+	tests := []struct {
+		name string
+		edit func(jwt.MapClaims)
+		want error
+	}{
+		{
+			name: "issuer",
+			edit: func(claims jwt.MapClaims) { claims["iss"] = "https://issuer.invalid" },
+			want: jwt.ErrTokenInvalidIssuer,
+		},
+		{
+			name: "audience",
+			edit: func(claims jwt.MapClaims) { claims["aud"] = "other-api" },
+			want: jwt.ErrTokenInvalidAudience,
+		},
+		{
+			name: "expiry",
+			edit: func(claims jwt.MapClaims) {
+				claims["exp"] = now.Add(-2 * time.Hour).Unix()
+			},
+			want: jwt.ErrTokenExpired,
+		},
+		{
+			name: "not before",
+			edit: func(claims jwt.MapClaims) {
+				claims["nbf"] = now.Add(2 * time.Hour).Unix()
+			},
+			want: jwt.ErrTokenNotValidYet,
+		},
+	}
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			authenticator := newTestOIDCAuthenticator(
+				t, issuer.testConfig(fixedClock(now)))
+			claims := issuer.defaultClaims(now)
+			testCase.edit(claims)
+			_, err := authenticator.authenticate(bearerRequest(
+				issuer.signRS256(t, testKID, claims)))
+			if !errors.Is(err, testCase.want) {
+				t.Fatalf("error = %v, want %v", err, testCase.want)
+			}
+		})
+	}
+}
+
+func TestOIDCAcceptsAnyConfiguredAudience(t *testing.T) {
+	issuer := newFakeOIDCIssuer(t)
+	now := time.Now()
+	config := issuer.testConfig(fixedClock(now))
+	config.audiences = []string{"unused-audience", testAudience}
+	authenticator := newTestOIDCAuthenticator(t, config)
+	if _, err := authenticator.Authenticate(bearerRequest(
+		issuer.signRS256(t, testKID, issuer.defaultClaims(now)))); err != nil {
+		t.Fatalf("configured audience in aud array was rejected: %v", err)
+	}
+}
+
+func TestOIDCAcceptsWithinClockSkew(t *testing.T) {
+	issuer := newFakeOIDCIssuer(t)
+	now := time.Now()
+	config := issuer.testConfig(fixedClock(now))
+	config.clockSkew = time.Minute
+	authenticator := newTestOIDCAuthenticator(t, config)
+	claims := issuer.defaultClaims(now)
+	claims["exp"] = now.Add(-30 * time.Second).Unix()
+	if _, err := authenticator.Authenticate(bearerRequest(
+		issuer.signRS256(t, testKID, claims))); err != nil {
+		t.Fatalf("token within clock skew was rejected: %v", err)
+	}
+}
+
+func TestOIDCRejectsSignatureAlgorithmAndKeyFailures(t *testing.T) {
+	issuer := newFakeOIDCIssuer(t)
+	now := time.Now()
+	authenticator := newTestOIDCAuthenticator(
+		t, issuer.testConfig(fixedClock(now)))
+
+	attacker, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	badSignature := jwt.NewWithClaims(
+		jwt.SigningMethodRS256, issuer.defaultClaims(now))
+	badSignature.Header["kid"] = testKID
+	forged, err := badSignature.SignedString(attacker)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := authenticator.authenticate(
+		bearerRequest(forged)); !errors.Is(err, jwt.ErrTokenSignatureInvalid) {
+		t.Fatalf("bad signature error = %v", err)
+	}
+
+	missingKID := jwt.NewWithClaims(
+		jwt.SigningMethodRS256, issuer.defaultClaims(now))
+	unsignedKid, err := missingKID.SignedString(issuer.keys[testKID])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := authenticator.authenticate(
+		bearerRequest(unsignedKid)); !errors.Is(err, errMissingKeyID) {
+		t.Fatalf("missing kid error = %v", err)
+	}
+
+	none := jwt.NewWithClaims(jwt.SigningMethodNone, issuer.defaultClaims(now))
+	none.Header["kid"] = testKID
+	unsigned, err := none.SignedString(jwt.UnsafeAllowNoneSignatureType)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := authenticator.authenticate(
+		bearerRequest(unsigned)); !errors.Is(err, jwt.ErrTokenSignatureInvalid) {
+		t.Fatalf("alg:none error = %v", err)
+	}
+
+	issuer.mu.Lock()
+	publicN := issuer.keys[testKID].PublicKey.N.Bytes()
+	issuer.mu.Unlock()
+	hmac := jwt.NewWithClaims(jwt.SigningMethodHS256, issuer.defaultClaims(now))
+	hmac.Header["kid"] = testKID
+	confused, err := hmac.SignedString(publicN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := authenticator.authenticate(
+		bearerRequest(confused)); !errors.Is(err, jwt.ErrTokenSignatureInvalid) {
+		t.Fatalf("algorithm-confusion error = %v", err)
+	}
+}
+
+func TestOIDCKeyfuncRejectsMismatchedSigningMethod(t *testing.T) {
+	issuer := newFakeOIDCIssuer(t)
+	now := time.Now()
+	authenticator := newTestOIDCAuthenticator(
+		t, issuer.testConfig(fixedClock(now)))
+	if _, err := authenticator.authenticate(bearerRequest(
+		issuer.signRS256(t, testKID, issuer.defaultClaims(now)))); err != nil {
+		t.Fatal(err)
+	}
+	keyFunc := authenticator.keyFuncForContext(context.Background())
+	hmac := &jwt.Token{
+		Header: map[string]any{"kid": testKID},
+		Method: jwt.SigningMethodHS256,
+	}
+	if _, err := keyFunc(hmac); !errors.Is(err, errUnexpectedSigningMethod) {
+		t.Fatalf("HMAC method error = %v", err)
+	}
+	ecdsa := &jwt.Token{
+		Header: map[string]any{"kid": testKID},
+		Method: jwt.SigningMethodES256,
+	}
+	if _, err := keyFunc(ecdsa); !errors.Is(err, errKeyMethodMismatch) {
+		t.Fatalf("ECDSA/RSA mismatch error = %v", err)
+	}
+}
+
+func TestOIDCUnknownKIDDoesNotStormAndRotationRefreshes(t *testing.T) {
+	issuer := newFakeOIDCIssuer(t)
+	base := time.Now()
+	clockValue := base
+	config := issuer.testConfig(func() time.Time { return clockValue })
+	authenticator := newTestOIDCAuthenticator(t, config)
+
+	unknownToken := issuer.signRS256(
+		t, "unknown-kid", issuer.defaultClaims(clockValue))
+	start := make(chan struct{})
+	errorsSeen := make(chan error, 20)
+	var wait sync.WaitGroup
+	for range 20 {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			<-start
+			_, err := authenticator.authenticate(bearerRequest(unknownToken))
+			errorsSeen <- err
+		}()
+	}
+	close(start)
+	wait.Wait()
+	close(errorsSeen)
+	for err := range errorsSeen {
+		if !errors.Is(err, errNoMatchingKey) {
+			t.Fatalf("unknown kid error = %v", err)
+		}
+	}
+	discoveryHits, jwksHits := issuer.counts()
+	if discoveryHits != 1 || jwksHits != 1 {
+		t.Fatalf("metadata fetches = discovery %d JWKS %d", discoveryHits, jwksHits)
+	}
+
+	rotated, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	issuer.mu.Lock()
+	issuer.keys["rotated-key"] = rotated
+	issuer.mu.Unlock()
+	clockValue = base.Add(oidcJWKSMinRefreshInterval + time.Second)
+	if _, err := authenticator.Authenticate(bearerRequest(
+		issuer.signRS256(t, "rotated-key", issuer.defaultClaims(clockValue)))); err != nil {
+		t.Fatalf("rotated key not accepted after refresh: %v", err)
+	}
+	discoveryHits, jwksHits = issuer.counts()
+	if discoveryHits != 2 || jwksHits != 2 {
+		t.Fatalf(
+			"rotation fetches = discovery %d JWKS %d, want 2 and 2",
+			discoveryHits, jwksHits)
+	}
+}
+
+func TestOIDCDiscoveryAndJWKSFailuresFailClosed(t *testing.T) {
+	now := time.Now()
+	t.Run("discovery unavailable", func(t *testing.T) {
+		issuer := newFakeOIDCIssuer(t)
+		issuer.mu.Lock()
+		issuer.discoveryStatus = http.StatusServiceUnavailable
+		issuer.mu.Unlock()
+		authenticator := newTestOIDCAuthenticator(
+			t, issuer.testConfig(fixedClock(now)))
+		_, err := authenticator.authenticate(bearerRequest(
+			issuer.signRS256(t, testKID, issuer.defaultClaims(now))))
+		if !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
+			t.Fatalf("discovery failure = %v", err)
+		}
+	})
+	t.Run("discovery issuer mismatch", func(t *testing.T) {
+		issuer := newFakeOIDCIssuer(t)
+		issuer.mu.Lock()
+		issuer.discoveryIssuer = "https://issuer.invalid"
+		issuer.mu.Unlock()
+		authenticator := newTestOIDCAuthenticator(
+			t, issuer.testConfig(fixedClock(now)))
+		_, err := authenticator.authenticate(bearerRequest(
+			issuer.signRS256(t, testKID, issuer.defaultClaims(now))))
+		if !shoal.IsErrorCode(err, shoal.ErrorUnauthorized) {
+			t.Fatalf("discovery issuer mismatch = %v", err)
+		}
+	})
+	t.Run("JWKS unavailable", func(t *testing.T) {
+		issuer := newFakeOIDCIssuer(t)
+		issuer.mu.Lock()
+		issuer.jwksStatus = http.StatusServiceUnavailable
+		issuer.mu.Unlock()
+		authenticator := newTestOIDCAuthenticator(
+			t, issuer.testConfig(fixedClock(now)))
+		_, err := authenticator.authenticate(bearerRequest(
+			issuer.signRS256(t, testKID, issuer.defaultClaims(now))))
+		if !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
+			t.Fatalf("JWKS failure = %v", err)
+		}
+	})
+}
+
+func TestOIDCBrowserConfigUsesDiscoveryEndpoints(t *testing.T) {
+	issuer := newFakeOIDCIssuer(t)
+	config := issuer.testConfig(time.Now)
+	config.discoveryURL = issuer.server.URL + "/metadata"
+	config.browserClientID = "browser-client"
+	config.browserScope = "openid profile shoal.read"
+	authenticator := newTestOIDCAuthenticator(t, config)
+	browser, err := authenticator.browserAuthConfig(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if browser.ClientID != config.browserClientID ||
+		browser.Scope != config.browserScope ||
+		browser.AuthorizationEndpoint != issuer.server.URL+"/authorize" ||
+		browser.TokenEndpoint != issuer.server.URL+"/token" {
+		t.Fatalf("browser config = %+v", browser)
+	}
+}
+
+func TestOIDCStaticJWKSOverrideSkipsDiscovery(t *testing.T) {
+	issuer := newFakeOIDCIssuer(t)
+	now := time.Now()
+	config := issuer.testConfig(fixedClock(now))
+	config.jwksURI = issuer.server.URL + "/keys"
+	authenticator := newTestOIDCAuthenticator(t, config)
+	if _, err := authenticator.Authenticate(bearerRequest(
+		issuer.signRS256(t, testKID, issuer.defaultClaims(now)))); err != nil {
+		t.Fatalf("static JWKS token rejected: %v", err)
+	}
+	discoveryHits, jwksHits := issuer.counts()
+	if discoveryHits != 0 || jwksHits != 1 {
+		t.Fatalf(
+			"static JWKS fetches = discovery %d JWKS %d, want 0 and 1",
+			discoveryHits, jwksHits)
+	}
+}
+
+func TestParseJWKSRejectsMalformedOrAmbiguousSets(t *testing.T) {
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := base64.RawURLEncoding.EncodeToString(key.PublicKey.N.Bytes())
+	e := base64.RawURLEncoding.EncodeToString(
+		big.NewInt(int64(key.PublicKey.E)).Bytes())
+	for _, testCase := range []struct {
+		name string
+		body string
+	}{
+		{"malformed JSON", `{`},
+		{"no usable keys", `{"keys":[{"kty":"oct","kid":"symmetric"}]}`},
+		{
+			"non-signing key",
+			`{"keys":[{"kty":"RSA","kid":"key","use":"enc","n":"` +
+				n + `","e":"` + e + `"}]}`,
+		},
+		{
+			"duplicate key identifier",
+			`{"keys":[` +
+				`{"kty":"RSA","kid":"duplicate","n":"` + n + `","e":"` + e + `"},` +
+				`{"kty":"RSA","kid":"duplicate","n":"` + n + `","e":"` + e + `"}` +
+				`]}`,
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			if _, err := parseJWKS([]byte(testCase.body)); err == nil {
+				t.Fatal("malformed or ambiguous JWKS was accepted")
+			}
+		})
+	}
+}
+
+func TestOIDCAuthenticatorValidatesConfig(t *testing.T) {
+	valid := oidcConfig{
+		issuer:             "https://issuer.example",
+		audiences:          []string{testAudience},
+		authorizationClaim: "access",
+		readerClaimValues:  []string{"reader"},
+	}
+	cases := []struct {
+		name   string
+		change func(*oidcConfig)
+	}{
+		{"missing issuer", func(config *oidcConfig) { config.issuer = "" }},
+		{"insecure issuer", func(config *oidcConfig) { config.issuer = "http://issuer.example" }},
+		{"missing audience", func(config *oidcConfig) { config.audiences = nil }},
+		{"missing authorization claim", func(config *oidcConfig) {
+			config.authorizationClaim = ""
+		}},
+		{"missing authorization values", func(config *oidcConfig) {
+			config.readerClaimValues = nil
+		}},
+		{"symmetric algorithm", func(config *oidcConfig) {
+			config.allowedAlgorithms = []string{"HS256"}
+		}},
+		{"none algorithm", func(config *oidcConfig) {
+			config.allowedAlgorithms = []string{"none"}
+		}},
+		{"excessive skew", func(config *oidcConfig) {
+			config.clockSkew = time.Hour
+		}},
+		{"browser scope without client", func(config *oidcConfig) {
+			config.browserScope = "openid"
+		}},
+		{"browser client without scope", func(config *oidcConfig) {
+			config.browserClientID = "browser-client"
+		}},
+		{"malformed discovery URL", func(config *oidcConfig) {
+			config.discoveryURL = "relative"
+		}},
+		{"malformed claim name", func(config *oidcConfig) {
+			config.subjectClaim = "bad\nclaim"
+		}},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			config := valid
+			testCase.change(&config)
+			if _, err := newOIDCAuthenticator(config, time.Now); err == nil {
+				t.Fatal("invalid OIDC configuration was accepted")
+			}
+		})
+	}
+}
+
+func TestOIDCBoundaryCollapsesErrorsAndNeverLeaksToken(t *testing.T) {
+	issuer := newFakeOIDCIssuer(t)
+	now := time.Now()
+	authenticator := newTestOIDCAuthenticator(
+		t, issuer.testConfig(fixedClock(now)))
+	expired := issuer.defaultClaims(now)
+	expired["exp"] = now.Add(-2 * time.Hour).Unix()
+	unmapped := issuer.defaultClaims(now)
+	unmapped["access"] = "unknown"
+	tokens := []string{
+		"secret-garbage-token",
+		issuer.signRS256(t, testKID, expired),
+		issuer.signRS256(t, testKID, unmapped),
+		issuer.signRS256(t, "unknown-kid", issuer.defaultClaims(now)),
+	}
+	for _, token := range tokens {
+		_, err := authenticator.Authenticate(bearerRequest(token))
+		if err == nil {
+			t.Fatal("invalid token was accepted")
+		}
+		if err.Error() != oidcDenied().Error() {
+			t.Fatalf("boundary error = %q", err)
+		}
+		if strings.Contains(err.Error(), token) {
+			t.Fatal("boundary error disclosed raw token")
+		}
+	}
+}
+
+func TestOIDCRejectsMissingOrMalformedBearer(t *testing.T) {
+	issuer := newFakeOIDCIssuer(t)
+	authenticator := newTestOIDCAuthenticator(
+		t, issuer.testConfig(fixedClock(time.Now())))
+	for _, header := range []string{"", "opaque-token", "Basic abc", "Bearer "} {
+		request := httptest.NewRequest(http.MethodGet, "/api/v1/meta", nil)
+		if header != "" {
+			request.Header.Set("Authorization", header)
+		}
+		if _, err := authenticator.Authenticate(request); err == nil {
+			t.Fatalf("header %q was accepted", header)
+		}
+	}
+}
+
+func TestSelectAuthenticatorOIDCAllowsNonLoopbackAndRejectsConflict(t *testing.T) {
+	config := oidcConfig{
+		issuer:             "https://issuer.example",
+		audiences:          []string{testAudience},
+		authorizationClaim: "access",
+		readerClaimValues:  []string{"reader"},
+	}
+	for _, address := range []string{"0.0.0.0:8080", "10.0.0.5:8080", "[::]:8080"} {
+		authenticator, err := selectAuthenticator(false, config, address, time.Now)
+		if err != nil {
+			t.Fatalf("OIDC authenticator refused on %s: %v", address, err)
+		}
+		if _, ok := authenticator.(*oidcAuthenticator); !ok {
+			t.Fatalf("authenticator = %T", authenticator)
+		}
+	}
+	if authenticator, err := selectAuthenticator(
+		true, config, "127.0.0.1:8080", time.Now,
+	); err == nil || authenticator != nil {
+		t.Fatal("-dev-auth and OIDC were not rejected as mutually exclusive")
+	}
+}
+
+func TestOIDCAuthenticatorNeverGetsDevelopmentBackfill(t *testing.T) {
+	config := oidcConfig{
+		issuer:             "https://issuer.example",
+		audiences:          []string{testAudience},
+		authorizationClaim: "access",
+		readerClaimValues:  []string{"reader"},
+	}
+	authenticator, err := selectAuthenticator(
+		false, config, "0.0.0.0:8080", time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	backfill := newDevelopmentBackfill(
+		authenticator, "127.0.0.1:8080", auth.NewAuthority().Binder())
+	if backfill != nil {
+		t.Fatal("the OIDC authenticator was granted a development backfill")
+	}
+}
+
+func TestOIDCRequestFlowsThroughBinderResolverAndUnmappedStopsAtGate(
+	t *testing.T,
+) {
+	issuer := newFakeOIDCIssuer(t)
+	now := time.Now()
+	authenticator := newTestOIDCAuthenticator(
+		t, issuer.testConfig(fixedClock(now)))
+
+	authority := auth.NewAuthority()
+	root := t.TempDir()
+	opened, err := openService(context.Background(), serviceConfig{
+		backend:   "embedded",
+		data:      filepath.Join(root, "corpus"),
+		policyDir: filepath.Join(root, "policy"),
+		resolver:  authority.Resolver(),
+		clock:     fixedClock(now),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer opened.close()
+	handler, err := webapi.NewAuthenticatedHandler(
+		opened.service, authenticator, authority.Binder(), "workspace.test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	token := issuer.signRS256(t, testKID, issuer.defaultClaims(now))
+	request := httptest.NewRequest(
+		http.MethodPost,
+		"http://workspace.test/api/v1/documents",
+		strings.NewReader(`{"page":{"limit":10}}`),
+	)
+	request.Host = "workspace.test"
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Authorization", "Bearer "+token)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("verified OIDC request status = %d body = %s",
+			response.Code, response.Body.String())
+	}
+
+	counter := &countingService{}
+	gated, err := webapi.NewAuthenticatedHandler(
+		counter, authenticator, authority.Binder(), "workspace.test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	unmapped := issuer.defaultClaims(now)
+	unmapped["access"] = "unknown"
+	request = httptest.NewRequest(
+		http.MethodPost,
+		"http://workspace.test/api/v1/documents",
+		strings.NewReader(`{"page":{"limit":10}}`),
+	)
+	request.Host = "workspace.test"
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Authorization", "Bearer "+
+		issuer.signRS256(t, testKID, unmapped))
+	response = httptest.NewRecorder()
+	gated.ServeHTTP(response, request)
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("unmapped token status = %d", response.Code)
+	}
+	if counter.calls != 0 {
+		t.Fatalf("unmapped token reached %d service operations", counter.calls)
+	}
+
+	request = httptest.NewRequest(
+		http.MethodPost,
+		"http://workspace.test/api/v1/documents",
+		strings.NewReader(`{"page":{"limit":10}}`),
+	)
+	request.Host = "workspace.test"
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Authorization", "Bearer malformed-token")
+	response = httptest.NewRecorder()
+	gated.ServeHTTP(response, request)
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("malformed token status = %d", response.Code)
+	}
+	if counter.calls != 0 {
+		t.Fatalf("malformed token reached %d service operations", counter.calls)
+	}
+}
+
+type countingService struct {
+	calls int
+}
+
+func (s *countingService) Documents(
+	context.Context,
+	webapi.DocumentsRequest,
+) (webapi.DocumentsResponse, error) {
+	s.calls++
+	return webapi.DocumentsResponse{}, nil
+}
+
+func (s *countingService) Document(
+	context.Context,
+	webapi.DocumentRequest,
+) (webapi.DocumentResponse, error) {
+	s.calls++
+	return webapi.DocumentResponse{}, nil
+}
+
+func (s *countingService) Retrieve(
+	context.Context,
+	webapi.RetrievalRequest,
+) (webapi.RetrievalResponse, error) {
+	s.calls++
+	return webapi.RetrievalResponse{}, nil
+}
+
+func (s *countingService) Neighborhood(
+	context.Context,
+	webapi.NeighborhoodRequest,
+) (webapi.NeighborhoodResponse, error) {
+	s.calls++
+	return webapi.NeighborhoodResponse{}, nil
+}
+
+func (s *countingService) Path(
+	context.Context,
+	webapi.PathRequest,
+) (webapi.PathResponse, error) {
+	s.calls++
+	return webapi.PathResponse{}, nil
+}
+
+func operationsContain(operations []auth.Operation, target auth.Operation) bool {
+	for _, operation := range operations {
+		if operation == target {
+			return true
+		}
+	}
+	return false
+}
+
+func grantsWorkspaceSource(decision auth.Decision) bool {
+	for _, source := range decision.PermittedSourceIDs() {
+		if bytes.Equal(source, workspaceSourceID) {
+			return true
+		}
+	}
+	return false
+}
+
+var _ webapi.Authenticator = (*oidcAuthenticator)(nil)
+var _ webapi.Service = (*countingService)(nil)
