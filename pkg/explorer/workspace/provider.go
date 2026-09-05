@@ -37,6 +37,7 @@ import (
 // Implementations must consult trusted governed state, never ambient request
 // text.
 type OntologyChoices interface {
+	ListOntologyChoices(context.Context, auth.Decision) ([]OntologyChoice, error)
 	AuthorizeOntology(context.Context, auth.Decision, ontology.OntologyIdentity) error
 }
 
@@ -49,6 +50,7 @@ type CeilingResolver interface {
 // StaticOntologyChoices is an exact, immutable set of governable identities.
 type StaticOntologyChoices struct {
 	identities map[ontology.OntologyIdentity]struct{}
+	active     ontology.OntologyIdentity
 }
 
 // NewStaticOntologyChoices constructs an exact configured choice set.
@@ -65,6 +67,54 @@ func NewStaticOntologyChoices(
 		result.identities[identity] = struct{}{}
 	}
 	return result, nil
+}
+
+// NewStaticOntologyChoicesWithActive constructs an exact configured choice set
+// and marks the trusted active pointer without owning or mutating it.
+func NewStaticOntologyChoicesWithActive(
+	active ontology.OntologyIdentity,
+	identities ...ontology.OntologyIdentity,
+) (StaticOntologyChoices, error) {
+	if err := active.Validate(); err != nil {
+		return StaticOntologyChoices{}, err
+	}
+	choices, err := NewStaticOntologyChoices(
+		append([]ontology.OntologyIdentity{active}, identities...)...)
+	if err != nil {
+		return StaticOntologyChoices{}, err
+	}
+	choices.active = active
+	return choices, nil
+}
+
+// ListOntologyChoices returns only configured governable identities.
+func (c StaticOntologyChoices) ListOntologyChoices(
+	ctx context.Context,
+	_ auth.Decision,
+) ([]OntologyChoice, error) {
+	if err := validateContext(ctx); err != nil {
+		return nil, err
+	}
+	choices := make([]OntologyChoice, 0, len(c.identities))
+	for identity := range c.identities {
+		choices = append(choices, OntologyChoice{
+			Identity: identity,
+			Active:   c.active.Known() && identity == c.active,
+		})
+	}
+	sort.Slice(choices, func(i, j int) bool {
+		if comparison := shoal.CompareID(
+			choices[i].Identity.SchemaID(),
+			choices[j].Identity.SchemaID(),
+		); comparison != 0 {
+			return comparison < 0
+		}
+		return shoal.CompareID(
+			choices[i].Identity.VersionID(),
+			choices[j].Identity.VersionID(),
+		) < 0
+	})
+	return choices, nil
 }
 
 // AuthorizeOntology accepts only an exact configured identity.
@@ -192,6 +242,143 @@ func (p *Provider) Update(
 		request.ExpectedRevision, request.MutationID, candidate)
 }
 
+// OntologyChoice is one caller-eligible immutable lens. Active is projected
+// from the trusted ontology provider; settings never mutate that pointer.
+type OntologyChoice struct {
+	Identity ontology.OntologyIdentity
+	Active   bool
+}
+
+// OntologyChoiceSet describes the choices visible to one caller for one
+// workspace, together with that workspace's current selection.
+type OntologyChoiceSet struct {
+	WorkspaceID      shoal.ID
+	SettingsID       shoal.ID
+	SettingsRevision uint64
+	SelectedOntology OntologySelection
+	Choices          []OntologyChoice
+}
+
+// ListOntologyChoices returns only choices authorized for the current issuer
+// decision. Existing workspace ownership is checked before choices are read.
+func (p *Provider) ListOntologyChoices(
+	ctx context.Context,
+	workspaceID shoal.ID,
+) (OntologyChoiceSet, error) {
+	decision, _, err := p.authorize(
+		ctx, auth.OperationWorkspaceSettingsRead, workspaceID)
+	if err != nil {
+		return OntologyChoiceSet{}, err
+	}
+	if absent(p.ontologyChoices) {
+		return OntologyChoiceSet{}, shoal.NewError(
+			shoal.ErrorUnavailable, "workspace ontology choices are unavailable")
+	}
+	result := OntologyChoiceSet{WorkspaceID: workspaceID}
+	settings, loadErr := p.store.Load(ctx, workspaceID)
+	switch {
+	case loadErr == nil:
+		if settings.Owner != decision.Subject() ||
+			!bytes.Equal(
+				settings.AuthorizationDomain, decision.AuthorizationDomain()) {
+			return OntologyChoiceSet{}, authDenied()
+		}
+		result.SettingsID = settings.SettingsID
+		result.SettingsRevision = settings.Revision
+		result.SelectedOntology = settings.Narrowing.SelectedOntology
+	case shoal.IsErrorCode(loadErr, shoal.ErrorNotFound):
+	default:
+		return OntologyChoiceSet{}, loadErr
+	}
+	choices, err := p.ontologyChoices.ListOntologyChoices(ctx, decision)
+	if err != nil {
+		return OntologyChoiceSet{}, err
+	}
+	choices, err = normalizeOntologyChoices(choices)
+	if err != nil {
+		return OntologyChoiceSet{}, err
+	}
+	for _, choice := range choices {
+		if err := p.ontologyChoices.AuthorizeOntology(
+			ctx, decision, choice.Identity); err != nil {
+			return OntologyChoiceSet{}, authDenied()
+		}
+	}
+	if result.SelectedOntology.Present {
+		if err := p.ontologyChoices.AuthorizeOntology(
+			ctx, decision, result.SelectedOntology.Identity); err != nil {
+			return OntologyChoiceSet{}, authDenied()
+		}
+		found := false
+		for _, choice := range choices {
+			if choice.Identity == result.SelectedOntology.Identity {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return OntologyChoiceSet{}, authDenied()
+		}
+	}
+	result.Choices = choices
+	return result, nil
+}
+
+// SelectOntology atomically changes only the selected lens, preserving every
+// existing operation, scope, budget, and output policy setting.
+func (p *Provider) SelectOntology(
+	ctx context.Context,
+	workspaceID shoal.ID,
+	expectedRevision uint64,
+	mutationID shoal.ID,
+	identity ontology.OntologyIdentity,
+) (Settings, error) {
+	decision, now, err := p.authorize(
+		ctx, auth.OperationWorkspaceSettingsWrite, workspaceID)
+	if err != nil {
+		return Settings{}, err
+	}
+	if err := shoal.ValidateRequiredID("settings mutation ID", mutationID); err != nil {
+		return Settings{}, err
+	}
+	if absent(p.ontologyChoices) ||
+		p.ontologyChoices.AuthorizeOntology(ctx, decision, identity) != nil {
+		return Settings{}, authDenied()
+	}
+	var current Settings
+	current, loadErr := p.store.Load(ctx, workspaceID)
+	switch {
+	case loadErr == nil:
+		if current.Owner != decision.Subject() ||
+			!bytes.Equal(
+				current.AuthorizationDomain, decision.AuthorizationDomain()) {
+			return Settings{}, authDenied()
+		}
+	case shoal.IsErrorCode(loadErr, shoal.ErrorNotFound):
+		if expectedRevision != 0 {
+			return Settings{}, versionConflict()
+		}
+	default:
+		return Settings{}, loadErr
+	}
+	update := updateNarrowing(current.Narrowing)
+	update.SelectedOntology = OntologySelection{
+		Present: true, Identity: identity,
+	}
+	candidate, err := p.normalizeUpdate(ctx, decision, now, update)
+	if err != nil {
+		return Settings{}, err
+	}
+	if loadErr == nil && current.Revision == expectedRevision {
+		if err := ensureMonotonic(current.Narrowing, candidate); err != nil {
+			return Settings{}, err
+		}
+	}
+	return p.store.CompareAndSwap(
+		ctx, workspaceID, decision.Subject(), decision.AuthorizationDomain(),
+		expectedRevision, mutationID, candidate)
+}
+
 // Effective returns a currently revalidated decision plus budget, output label,
 // and cache-partition effects for one owned workspace.
 func (p *Provider) Effective(
@@ -243,6 +430,19 @@ func (p *Provider) Apply(
 		options.ServiceCeiling = &ceiling
 	}
 	return DeriveEffectiveDecision(ctx, decision, settings, options)
+}
+
+// ApplyDecision returns the current caller decision with only the selected
+// workspace's durable authorization and ontology narrowing applied.
+func (p *Provider) ApplyDecision(
+	ctx context.Context,
+	workspaceID shoal.ID,
+) (auth.Decision, error) {
+	effective, err := p.Apply(ctx, workspaceID, MaximumLimits(), nil)
+	if err != nil {
+		return auth.Decision{}, err
+	}
+	return effective.Decision(), nil
 }
 
 func (p *Provider) authorize(
@@ -635,6 +835,79 @@ func validateDecisionSelections(
 		return authDenied()
 	}
 	return nil
+}
+
+func normalizeOntologyChoices(
+	choices []OntologyChoice,
+) ([]OntologyChoice, error) {
+	if len(choices) > auth.MaxDecisionGrantIDs {
+		return nil, invalid("ontology choices exceed the public ID bound")
+	}
+	result := append([]OntologyChoice(nil), choices...)
+	for _, choice := range result {
+		if err := choice.Identity.Validate(); err != nil {
+			return nil, err
+		}
+	}
+	sort.Slice(result, func(i, j int) bool {
+		if comparison := shoal.CompareID(
+			result[i].Identity.SchemaID(),
+			result[j].Identity.SchemaID(),
+		); comparison != 0 {
+			return comparison < 0
+		}
+		return shoal.CompareID(
+			result[i].Identity.VersionID(),
+			result[j].Identity.VersionID(),
+		) < 0
+	})
+	normalized := result[:0]
+	active := false
+	for _, choice := range result {
+		if len(normalized) > 0 &&
+			normalized[len(normalized)-1].Identity == choice.Identity {
+			return nil, invalid("ontology choices contain duplicate identities")
+		}
+		if choice.Active {
+			if active {
+				return nil, invalid("ontology choices contain multiple active identities")
+			}
+			active = true
+		}
+		normalized = append(normalized, choice)
+	}
+	return normalized, nil
+}
+
+func updateNarrowing(value Narrowing) UpdateNarrowing {
+	result := UpdateNarrowing{
+		AllowedOperations: OperationSelection{
+			Present: value.AllowedOperations.Present,
+			Values: append(
+				[]auth.Operation(nil), value.AllowedOperations.Values...),
+		},
+		PermittedSourceIDs: IDSelection{
+			Present: value.PermittedSourceIDs.Present,
+			Values:  cloneByteSlices(value.PermittedSourceIDs.Values),
+		},
+		PermittedPolicyIDs: IDSelection{
+			Present: value.PermittedPolicyIDs.Present,
+			Values:  cloneByteSlices(value.PermittedPolicyIDs.Values),
+		},
+		Budgets:          cloneBudgets(value.Budgets),
+		SelectedOntology: value.SelectedOntology,
+	}
+	for _, policy := range value.OutputPolicies {
+		result.OutputPolicies = append(
+			result.OutputPolicies,
+			OutputPolicySpec{
+				SourceID:      policy.SourceID(),
+				GrantPolicyID: policy.GrantPolicyID(),
+				Epoch:         policy.Epoch(),
+			},
+		)
+	}
+	return result
 }
 
 func ensureMonotonic(previous, next Narrowing) error {

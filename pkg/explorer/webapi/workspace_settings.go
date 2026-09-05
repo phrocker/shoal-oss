@@ -21,11 +21,18 @@ package webapi
 
 import (
 	"context"
+	"net/http"
+	"strings"
 
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/explorer/workspace"
+	"github.com/phrocker/shoal-oss/pkg/ontology"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
+
+// WorkspaceIDHeader selects the owned durable workspace settings applied to a
+// non-settings API request. Its value is one canonical opaque wire ID.
+const WorkspaceIDHeader = "Shoal-Workspace-ID"
 
 // WorkspaceSettingsProvider is the transport-neutral settings extension used
 // by the HTTP endpoint and future chat/MCP adapters.
@@ -36,6 +43,18 @@ type WorkspaceSettingsProvider interface {
 		shoal.ID,
 		workspace.UpdateRequest,
 	) (workspace.Settings, error)
+	ListOntologyChoices(
+		context.Context,
+		shoal.ID,
+	) (workspace.OntologyChoiceSet, error)
+	SelectOntology(
+		context.Context,
+		shoal.ID,
+		uint64,
+		shoal.ID,
+		ontology.OntologyIdentity,
+	) (workspace.Settings, error)
+	ApplyDecision(context.Context, shoal.ID) (auth.Decision, error)
 	Apply(
 		context.Context,
 		shoal.ID,
@@ -66,4 +85,38 @@ func (h *Handler) SetWorkspaceSettingsProvider(
 	}
 	h.workspaceSettings = provider
 	return nil
+}
+
+func (h *Handler) applyWorkspaceSettings(
+	request *http.Request,
+) (context.Context, error) {
+	if isAbsentInterface(h.workspaceSettings) ||
+		isWorkspaceSettingsManagementPath(request.URL.Path) {
+		return request.Context(), nil
+	}
+	encoded := request.Header.Get(WorkspaceIDHeader)
+	if encoded == "" {
+		return request.Context(), nil
+	}
+	workspaceID, err := decodeID(encoded)
+	if err != nil {
+		return nil, shoal.NewError(
+			shoal.ErrorInvalidArgument, "workspace settings header "+err.Error())
+	}
+	decision, err := h.workspaceSettings.ApplyDecision(
+		request.Context(), workspaceID)
+	if err != nil {
+		return nil, err
+	}
+	ctx, err := h.binder.Bind(request.Context(), decision)
+	if err != nil || ctx == nil {
+		return nil, authenticationDenied()
+	}
+	return withIdentity(ctx, decision), nil
+}
+
+func isWorkspaceSettingsManagementPath(path string) bool {
+	return strings.HasPrefix(path, "/api/v1/workspaces/") &&
+		(strings.HasSuffix(path, "/settings") ||
+			strings.HasSuffix(path, "/settings/lens"))
 }

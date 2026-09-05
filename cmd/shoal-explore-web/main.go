@@ -744,7 +744,7 @@ func openService(
 				corpus.Close()
 				return closed, err
 			}
-			configured, err := workspace.NewStaticOntologyChoices(identity)
+			configured, err := workspace.NewStaticOntologyChoicesWithActive(identity)
 			if err != nil {
 				settingsStore.Close()
 				store.Close()
