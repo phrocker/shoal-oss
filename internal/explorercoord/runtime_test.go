@@ -22,12 +22,14 @@ package explorercoord
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/phrocker/shoal-oss/internal/cclient"
 	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/explorer/coordination"
 	"github.com/phrocker/shoal-oss/pkg/explorer/coordination/allocator"
@@ -350,6 +352,161 @@ func TestRuntimeReconcilesAmbiguousCommitCAS(t *testing.T) {
 	}
 }
 
+func TestRecordPublicationUsesStableDocumentExpectedHead(t *testing.T) {
+	config := testRuntimeConfig(t, testDirectory(t))
+	runtime, err := Open(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.Close()
+	first := testRecordPublication("document", "revision-1", "one", nil)
+	if _, err := runtime.PublishRecord(context.Background(), first); err != nil {
+		t.Fatal(err)
+	}
+	head, err := runtime.RecordHead(context.Background(), 'D', []byte("document"))
+	if err != nil || head == nil || !bytes.Equal(head.WinnerID, []byte("revision-1")) {
+		t.Fatalf("first document head = %#v, %v", head, err)
+	}
+	left := testRecordPublication("document", "revision-2a", "left", head)
+	right := testRecordPublication("document", "revision-2b", "right", head)
+	type outcome struct {
+		request explorer.RecordPublication
+		result  explorer.RecordPublicationResult
+		err     error
+	}
+	outcomes := make(chan outcome, 2)
+	var wait sync.WaitGroup
+	for _, request := range []explorer.RecordPublication{left, right} {
+		request := request
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			result, err := runtime.PublishRecord(context.Background(), request)
+			outcomes <- outcome{request: request, result: result, err: err}
+		}()
+	}
+	wait.Wait()
+	close(outcomes)
+	successes, failures := 0, 0
+	var loser explorer.RecordPublication
+	for outcome := range outcomes {
+		if outcome.err == nil {
+			successes++
+		} else {
+			failures++
+			loser = outcome.request
+		}
+	}
+	if successes != 1 || failures != 1 {
+		t.Fatalf("divergent publications = successes %d failures %d", successes, failures)
+	}
+	if _, err := runtime.PublishRecord(context.Background(), loser); err == nil ||
+		!errors.Is(err, transaction.ErrConflict) {
+		t.Fatalf("stale expected-head retry = %v", err)
+	}
+	head, err = runtime.RecordHead(context.Background(), 'D', []byte("document"))
+	if err != nil || head == nil ||
+		(!bytes.Equal(head.WinnerID, []byte("revision-2a")) &&
+			!bytes.Equal(head.WinnerID, []byte("revision-2b"))) {
+		t.Fatalf("winning document head = %#v, %v", head, err)
+	}
+}
+
+func TestExplorerLoadHidesUncommittedAndPoisonedPhysicalRevision(t *testing.T) {
+	directory := testDirectory(t)
+	config := testRuntimeConfig(t, directory)
+	fired := false
+	config.testStageHook = func(stage recoveryStage) error {
+		if stage == recoveryStagePhysical && !fired {
+			fired = true
+			return context.Canceled
+		}
+		return nil
+	}
+	embedded, err := OpenExplorer(config, explorer.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := explorer.Source{
+		URI: "file:///staged.md", Title: "Staged",
+		MediaType: explorer.MediaTypeMarkdown, Content: "# Staged\n\nNot committed.\n",
+	}
+	analyzed, err := explorer.AnalyzeSource(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := embedded.Explorer.Ingest(context.Background(), source); err == nil ||
+		!explorer.IsIndeterminateCommit(err) {
+		t.Fatalf("physical-stage ingest = %v", err)
+	}
+	if err := embedded.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	config.testStageHook = nil
+	config.DisableRecoveryOnOpen = true
+	runtime, err := Open(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	corpus, err := explorer.OpenWithEmbeddedEngine(runtime.engine, explorer.Options{}, runtime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	documents, err := corpus.Documents(context.Background())
+	if err != nil || len(documents) != 0 {
+		t.Fatalf("uncommitted documents = %#v, %v", documents, err)
+	}
+	if err := corpus.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	row := []byte("document/" + string(analyzed.Document.ID) + "/" + string(analyzed.Revision.ID))
+	key := sha256.Sum256(append([]byte("explorer-document-record-v1\x00"), row...))
+	txn, err := DeriveTXN(
+		config.Domain, []byte("explorer-document-record-v1"), key[:],
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := runtime.Inspect(context.Background(), txn)
+	if err != nil || snapshot.Root.Epoch == 0 {
+		t.Fatalf("staged transaction = %#v, %v", snapshot, err)
+	}
+	corrupt, err := cclient.NewMutation(row)
+	if err != nil {
+		t.Fatal(err)
+	}
+	corrupt.Put(
+		[]byte("record"), []byte("v2"), nil,
+		int64(snapshot.Root.Epoch), []byte("corrupt-uncommitted-record"),
+	)
+	if err := runtime.engine.Write(explorer.EmbeddedTableName, []*cclient.Mutation{corrupt}); err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.Recover(context.Background()); !errors.Is(err, transaction.ErrQuarantined) {
+		t.Fatalf("poison staged transaction = %v", err)
+	}
+	snapshot, err = runtime.Inspect(context.Background(), txn)
+	if err != nil || snapshot.Root.State != coordination.StatePoisoned {
+		t.Fatalf("poisoned transaction = %#v, %v", snapshot, err)
+	}
+	if err := runtime.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	config.DisableRecoveryOnOpen = false
+	reopened, err := OpenExplorer(config, explorer.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	documents, err = reopened.Explorer.Documents(context.Background())
+	if err != nil || len(documents) != 0 {
+		t.Fatalf("poisoned physical documents = %#v, %v", documents, err)
+	}
+}
+
 func TestRecoveryRejectsCorruptCheckpoint(t *testing.T) {
 	config := testRuntimeConfig(t, testDirectory(t))
 	runtime, err := Open(config)
@@ -483,4 +640,31 @@ func testIntent(
 		}},
 		Results: []ResultIdentity{{Kind: []byte("record"), ID: []byte("record/one")}},
 	}
+}
+
+func testRecordPublication(
+	document, revision, value string,
+	head *explorer.RecordPublicationHead,
+) explorer.RecordPublication {
+	request := explorer.RecordPublication{
+		Operation:       []byte("document-test-v1"),
+		Token:           []byte(revision),
+		Table:           "records",
+		Row:             []byte("document/" + document + "/" + revision),
+		Family:          []byte("record"),
+		Qualifier:       []byte("v1"),
+		Value:           []byte(value),
+		EntityKind:      'D',
+		EntityID:        []byte(document),
+		WinnerID:        []byte(revision),
+		Partition:       []byte(document),
+		LogicalPolicyID: []byte("embedded/default"),
+		ResultKind:      []byte("document-revision"),
+		ResultID:        []byte(revision),
+	}
+	if head != nil {
+		request.ExpectedEpoch = head.Epoch
+		request.ExpectedDigest = head.LogicalDigest
+	}
+	return request
 }

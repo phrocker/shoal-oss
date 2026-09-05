@@ -21,6 +21,7 @@ package explorer
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/gob"
@@ -311,6 +312,15 @@ func (e *Explorer) loadDocumentRecord(
 		}
 		format = 1
 	case bytes.Equal(qualifier, []byte(recordCQV2)):
+		committed, err := e.documentRecordCommitted(
+			context.Background(), row, encoded,
+		)
+		if err != nil {
+			return err
+		}
+		if !committed {
+			return nil
+		}
 		if err := decodeEmbeddedRecord(
 			encoded, embeddedRecordDocument, &record,
 		); err != nil {

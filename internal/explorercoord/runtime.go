@@ -308,6 +308,13 @@ func (r *Runtime) compose(config Config, physicalWriter transaction.PhysicalWrit
 func (r *Runtime) Publish(ctx context.Context, request Request) (Result, error) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
+	return r.publishLocked(ctx, request)
+}
+
+func (r *Runtime) publishLocked(
+	ctx context.Context,
+	request Request,
+) (Result, error) {
 	if r.closed {
 		return Result{}, transaction.ErrUnavailable
 	}
@@ -362,11 +369,114 @@ func (r *Runtime) PublishRecord(
 	ctx context.Context,
 	request explorer.RecordPublication,
 ) (explorer.RecordPublicationResult, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if r.closed {
+		return explorer.RecordPublicationResult{}, transaction.PublicError(transaction.ErrUnavailable)
+	}
 	lpart, err := Partition(r.domain, request.Partition)
 	if err != nil {
 		return explorer.RecordPublicationResult{}, transaction.PublicError(err)
 	}
-	result, err := r.Publish(ctx, Request{Intent: Intent{
+	intent, err := r.recordIntent(ctx, request, lpart)
+	if err != nil {
+		return explorer.RecordPublicationResult{}, transaction.PublicError(err)
+	}
+	result, err := r.publishLocked(ctx, Request{Intent: intent})
+	if err != nil {
+		public := transaction.PublicError(err)
+		if errors.Is(err, ErrIndeterminatePublication) {
+			public = explorer.MarkIndeterminateCommit(public)
+		}
+		return explorer.RecordPublicationResult{}, public
+	}
+	return explorer.RecordPublicationResult{Epoch: result.Epoch, Unchanged: result.Unchanged}, nil
+}
+
+func (r *Runtime) RecordCommitted(
+	ctx context.Context,
+	request explorer.RecordPublication,
+) (bool, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if r.closed {
+		return false, transaction.ErrUnavailable
+	}
+	txn, err := DeriveTXN(r.domain, request.Operation, request.Token)
+	if err != nil {
+		return false, err
+	}
+	record, err := r.intents.Load(ctx, txn)
+	if errors.Is(err, transaction.ErrNotFound) {
+		// A record without a durable intent predates transactional publication.
+		// New configured writes always persist intent first, so this cannot
+		// silently admit a staged record produced by this runtime.
+		return true, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	epoch, complete, err := r.intents.Completed(ctx, txn, record.LogicalDigest)
+	if err != nil || !complete {
+		return false, err
+	}
+	snapshot, err := r.coordinator.Inspect(ctx, txn)
+	if err != nil {
+		return false, err
+	}
+	if snapshot.Root.State != coordination.StateCommitted ||
+		snapshot.Root.Epoch != epoch ||
+		snapshot.Root.LogicalDigest != record.LogicalDigest {
+		return false, nil
+	}
+	if !intentContainsRecordCell(record.Intent, request) {
+		return false, fmt.Errorf("%w: committed record disagrees with its durable intent", transaction.ErrInternal)
+	}
+	return true, nil
+}
+
+func (r *Runtime) recordIntent(
+	ctx context.Context,
+	request explorer.RecordPublication,
+	lpart coordination.LPART,
+) (Intent, error) {
+	txn, err := DeriveTXN(r.domain, request.Operation, request.Token)
+	if err != nil {
+		return Intent{}, err
+	}
+	if stored, loadErr := r.intents.Load(ctx, txn); loadErr == nil {
+		if !r.intentMatchesRecord(stored.Intent, request) ||
+			stored.Intent.Guards[0].ExpectedEpoch != request.ExpectedEpoch ||
+			stored.Intent.Guards[0].ExpectedDigest != request.ExpectedDigest {
+			return Intent{}, transaction.ErrConflict
+		}
+		return cloneIntent(stored.Intent), nil
+	} else if !errors.Is(loadErr, transaction.ErrNotFound) {
+		return Intent{}, loadErr
+	}
+	entity := guard.Entity{
+		Kind: request.EntityKind,
+		ID:   append(coordination.EntityID(nil), request.EntityID...),
+	}
+	head, _, err := r.guards.Read(ctx, entity)
+	if err != nil {
+		return Intent{}, err
+	}
+	mode := guard.ModeAbsentOrIdentical
+	if head == nil {
+		if request.ExpectedEpoch != 0 ||
+			request.ExpectedDigest != (coordination.Digest{}) {
+			return Intent{}, transaction.ErrConflict
+		}
+	} else {
+		if request.ExpectedEpoch == 0 ||
+			head.Epoch != request.ExpectedEpoch ||
+			head.LogicalDigest != request.ExpectedDigest {
+			return Intent{}, transaction.ErrConflict
+		}
+		mode = guard.ModeMutate
+	}
+	return Intent{
 		Operation: append([]byte(nil), request.Operation...),
 		Token:     append([]byte(nil), request.Token...),
 		Cells: []Cell{{
@@ -379,10 +489,12 @@ func (r *Runtime) PublishRecord(
 		}},
 		Guards: []GuardIntent{{
 			Entity: guard.Entity{
-				Kind: request.EntityKind,
-				ID:   append(coordination.EntityID(nil), request.EntityID...),
+				Kind: entity.Kind,
+				ID:   append(coordination.EntityID(nil), entity.ID...),
 			},
-			Mode: guard.ModeAbsentOrIdentical, DesiredState: guard.StateLive,
+			Mode: mode, ExpectedEpoch: request.ExpectedEpoch,
+			ExpectedDigest:  request.ExpectedDigest,
+			DesiredState:    guard.StateLive,
 			DesiredWinnerID: append([]byte(nil), request.WinnerID...),
 			LPART:           lpart, LogicalPolicyID: append([]byte(nil), request.LogicalPolicyID...),
 			RetirementGeneration: 1,
@@ -391,15 +503,76 @@ func (r *Runtime) PublishRecord(
 			Kind: append([]byte(nil), request.ResultKind...),
 			ID:   append([]byte(nil), request.ResultID...),
 		}},
-	}})
+	}, nil
+}
+
+func (r *Runtime) RecordHead(
+	ctx context.Context,
+	kind byte,
+	id []byte,
+) (*explorer.RecordPublicationHead, error) {
+	head, _, err := r.ReadEntity(ctx, guard.Entity{
+		Kind: kind, ID: append(coordination.EntityID(nil), id...),
+	})
 	if err != nil {
-		public := transaction.PublicError(err)
-		if errors.Is(err, ErrIndeterminatePublication) {
-			public = explorer.MarkIndeterminateCommit(public)
-		}
-		return explorer.RecordPublicationResult{}, public
+		return nil, err
 	}
-	return explorer.RecordPublicationResult{Epoch: result.Epoch, Unchanged: result.Unchanged}, nil
+	if head == nil {
+		return nil, nil
+	}
+	return &explorer.RecordPublicationHead{
+		Epoch: head.Epoch, LogicalDigest: head.LogicalDigest,
+		WinnerID: append([]byte(nil), head.WinnerID...),
+	}, nil
+}
+
+func (r *Runtime) intentMatchesRecord(
+	intent Intent,
+	request explorer.RecordPublication,
+) bool {
+	if !bytes.Equal(intent.Operation, request.Operation) ||
+		!bytes.Equal(intent.Token, request.Token) ||
+		len(intent.Cells) != 1 || len(intent.Guards) != 1 || len(intent.Results) != 1 {
+		return false
+	}
+	cell := intent.Cells[0]
+	entity := intent.Guards[0]
+	result := intent.Results[0]
+	lpart, err := Partition(r.domain, request.Partition)
+	if err != nil {
+		return false
+	}
+	return cell.Table == request.Table &&
+		bytes.Equal(cell.Row, request.Row) &&
+		bytes.Equal(cell.Family, request.Family) &&
+		bytes.Equal(cell.Qualifier, request.Qualifier) &&
+		bytes.Equal(cell.Visibility, request.Visibility) &&
+		bytes.Equal(cell.Value, request.Value) &&
+		bytes.Equal(cell.LPART, lpart) &&
+		entity.Entity.Kind == request.EntityKind &&
+		bytes.Equal(entity.Entity.ID, request.EntityID) &&
+		bytes.Equal(entity.DesiredWinnerID, request.WinnerID) &&
+		bytes.Equal(entity.LPART, lpart) &&
+		bytes.Equal(entity.LogicalPolicyID, request.LogicalPolicyID) &&
+		bytes.Equal(result.Kind, request.ResultKind) &&
+		bytes.Equal(result.ID, request.ResultID)
+}
+
+func intentContainsRecordCell(
+	intent Intent,
+	request explorer.RecordPublication,
+) bool {
+	for _, cell := range intent.Cells {
+		if cell.Table == request.Table &&
+			bytes.Equal(cell.Row, request.Row) &&
+			bytes.Equal(cell.Family, request.Family) &&
+			bytes.Equal(cell.Qualifier, request.Qualifier) &&
+			bytes.Equal(cell.Visibility, request.Visibility) &&
+			bytes.Equal(cell.Value, request.Value) {
+			return true
+		}
+	}
+	return false
 }
 
 // RecoverPage processes one bounded page of durable intents and transaction

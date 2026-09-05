@@ -361,6 +361,10 @@ func (e *Explorer) ingest(
 		}
 	}
 	e.mu.RUnlock()
+	publicationHead, err := e.documentRecordHead(ctx, []byte(parsed.document.ID))
+	if err != nil {
+		return IngestResult{}, err
+	}
 	embeddings, err := e.embedParsedSpans(ctx, parsed.spans)
 	if err != nil {
 		return IngestResult{}, err
@@ -408,6 +412,7 @@ func (e *Explorer) ingest(
 	record.PublicationSequence = e.lastPublicationSequence
 	if err := e.writeDocumentRecord(
 		ctx, documentRecordRow(record.Document.ID, record.Revision.ID), record,
+		publicationHead,
 	); err != nil {
 		return IngestResult{}, err
 	}

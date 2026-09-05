@@ -49,11 +49,19 @@ type RecordPublication struct {
 	LogicalPolicyID []byte
 	ResultKind      []byte
 	ResultID        []byte
+	ExpectedEpoch   coordination.Epoch
+	ExpectedDigest  coordination.Digest
 }
 
 type RecordPublicationResult struct {
 	Epoch     coordination.Epoch
 	Unchanged bool
+}
+
+type RecordPublicationHead struct {
+	Epoch         coordination.Epoch
+	LogicalDigest coordination.Digest
+	WinnerID      []byte
 }
 
 // RecordPublicationAdapter durably publishes one immutable Explorer record.
@@ -62,42 +70,113 @@ type RecordPublicationResult struct {
 // readback or return an indeterminate-commit error.
 type RecordPublicationAdapter interface {
 	PublishRecord(context.Context, RecordPublication) (RecordPublicationResult, error)
+	RecordCommitted(context.Context, RecordPublication) (bool, error)
+	RecordHead(context.Context, byte, []byte) (*RecordPublicationHead, error)
 }
 
 var embeddedDefaultPolicy = []byte("embedded/default")
+
+func documentRecordKey(row []byte) []byte {
+	key := sha256.Sum256(append([]byte("explorer-document-record-v1\x00"), row...))
+	return append([]byte(nil), key[:]...)
+}
+
+func documentRecordPublication(
+	row, encoded []byte,
+	record *persistedDocument,
+	head *RecordPublicationHead,
+) RecordPublication {
+	recordKey := documentRecordKey(row)
+	request := RecordPublication{
+		Operation:       []byte("explorer-document-record-v1"),
+		Token:           recordKey,
+		Table:           EmbeddedTableName,
+		Row:             append([]byte(nil), row...),
+		Family:          []byte(recordCF),
+		Qualifier:       []byte(recordCQV2),
+		Value:           append([]byte(nil), encoded...),
+		EntityKind:      'D',
+		EntityID:        []byte(record.Document.ID),
+		WinnerID:        []byte(record.Revision.ID),
+		Partition:       []byte(record.Document.ID),
+		LogicalPolicyID: append([]byte(nil), embeddedDefaultPolicy...),
+		ResultKind:      []byte("document-revision"),
+		ResultID:        []byte(record.Revision.ID),
+	}
+	if head != nil {
+		request.ExpectedEpoch = head.Epoch
+		request.ExpectedDigest = head.LogicalDigest
+	}
+	return request
+}
+
+func documentRecordCommitProbe(row, encoded []byte) RecordPublication {
+	return RecordPublication{
+		Operation: []byte("explorer-document-record-v1"),
+		Token:     documentRecordKey(row),
+		Table:     EmbeddedTableName,
+		Row:       append([]byte(nil), row...),
+		Family:    []byte(recordCF),
+		Qualifier: []byte(recordCQV2),
+		Value:     append([]byte(nil), encoded...),
+	}
+}
+
+func (e *Explorer) documentRecordHead(
+	ctx context.Context,
+	documentID []byte,
+) (*RecordPublicationHead, error) {
+	if e.publication == nil {
+		return nil, nil
+	}
+	head, err := e.publication.RecordHead(ctx, 'D', documentID)
+	if err != nil {
+		return nil, shoal.WrapError(
+			shoal.ErrorUnavailable, "read transactional document head", err,
+		)
+	}
+	return head, nil
+}
 
 func (e *Explorer) writeDocumentRecord(
 	ctx context.Context,
 	row []byte,
 	record *persistedDocument,
+	head *RecordPublicationHead,
 ) error {
 	encoded, err := encodeEmbeddedRecord(embeddedRecordDocument, record)
 	if err != nil {
 		return shoal.WrapError(shoal.ErrorInternal, "encode explorer record", err)
 	}
-	// The adopted manifest format bounds one physical value to 1 MiB. Keep
-	// larger legacy document envelopes on the established record path until a
-	// chunked document encoding is defined; do not pretend they are covered by
-	// the transaction fence.
-	if e.publication == nil || len(encoded) > coordination.MaxManifestValueBytes {
+	if e.publication == nil {
 		return e.writeEncodedRecord(row, encoded)
 	}
-	recordKey := sha256.Sum256(append([]byte("explorer-document-record-v1\x00"), row...))
-	_, err = e.publication.PublishRecord(ctx, RecordPublication{
-		Operation:       []byte("explorer-document-record-v1"),
-		Token:           append([]byte(nil), recordKey[:]...),
-		Table:           EmbeddedTableName,
-		Row:             append([]byte(nil), row...),
-		Family:          []byte(recordCF),
-		Qualifier:       []byte(recordCQV2),
-		Value:           encoded,
-		EntityKind:      'D',
-		EntityID:        append([]byte(nil), recordKey[:]...),
-		WinnerID:        []byte(record.Revision.ID),
-		Partition:       append([]byte(nil), recordKey[:]...),
-		LogicalPolicyID: append([]byte(nil), embeddedDefaultPolicy...),
-		ResultKind:      []byte("document-revision"),
-		ResultID:        []byte(record.Revision.ID),
-	})
+	if len(encoded) > coordination.MaxManifestValueBytes {
+		return shoal.NewError(
+			shoal.ErrorUnavailable,
+			"transactional document record exceeds the embedded publication bound",
+		)
+	}
+	_, err = e.publication.PublishRecord(
+		ctx, documentRecordPublication(row, encoded, record, head),
+	)
 	return err
+}
+
+func (e *Explorer) documentRecordCommitted(
+	ctx context.Context,
+	row, encoded []byte,
+) (bool, error) {
+	if e.publication == nil {
+		return true, nil
+	}
+	committed, err := e.publication.RecordCommitted(
+		ctx, documentRecordCommitProbe(row, encoded),
+	)
+	if err != nil {
+		return false, shoal.WrapError(
+			shoal.ErrorInternal, "verify transactional document record", err,
+		)
+	}
+	return committed, nil
 }
