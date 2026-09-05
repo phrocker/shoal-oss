@@ -153,6 +153,23 @@ as `max_response_bytes`, and keeps unsupported-feature decisions server-side,
 but is not selectable from `shoal-explore-web` until it can carry the caller's
 authorization decision upstream.
 
+### MCP stdio workspace
+
+`shoal-mcp` serves a real embedded, authorized Explorer workspace over
+newline-delimited JSON-RPC on stdin/stdout:
+
+```bash
+go run ./cmd/shoal-mcp -state-dir .shoal/mcp -dev-auth
+```
+
+Stdout is reserved for MCP protocol messages and diagnostics go only to stderr.
+Identity is supplied by trusted process configuration in stdio v1 and rebound
+with a fresh request ID for each tool call. All callers connected to one process
+therefore share that configured identity; independently authenticated remote
+callers require a future HTTP transport. Tool-call recording is not
+implemented. See [`docs/mcp-stdio.md`](docs/mcp-stdio.md) for configuration,
+storage policy, limitations, and a no-cluster smoke invocation.
+
 ### Trees, graphs, and vectors are complementary
 
 A document tree is an excellent way to preserve a source's authored
