@@ -164,6 +164,7 @@ type MemoryPolicyStore struct {
 	intrinsicEdges map[shoal.ID]EdgeRegistration
 	edgeClaims     map[shoal.ID]EdgeRegistration
 	edges          map[shoal.ID]EdgeRegistration
+	coOccurrence   map[string]CoOccurrenceRecord
 }
 
 // NewMemoryPolicyStore constructs an empty reference catalog.
@@ -177,6 +178,7 @@ func NewMemoryPolicyStore() *MemoryPolicyStore {
 		intrinsicEdges: make(map[shoal.ID]EdgeRegistration),
 		edgeClaims:     make(map[shoal.ID]EdgeRegistration),
 		edges:          make(map[shoal.ID]EdgeRegistration),
+		coOccurrence:   make(map[string]CoOccurrenceRecord),
 	}
 }
 
@@ -999,6 +1001,67 @@ func (s *MemoryPolicyStore) Edges(
 	return resolved, nil
 }
 
+// LoadCoOccurrence returns the persisted mosaic co-occurrence state for an
+// identity key, reporting membership by its boolean exactly as the graph reads
+// do. The returned slice is an independent copy.
+func (s *MemoryPolicyStore) LoadCoOccurrence(
+	ctx context.Context,
+	key string,
+) (CoOccurrenceRecord, bool, error) {
+	if err := contextFailure(ctx); err != nil {
+		return CoOccurrenceRecord{}, false, err
+	}
+	if s == nil {
+		return CoOccurrenceRecord{}, false, catalogUnavailable()
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	record, ok := s.coOccurrence[key]
+	if !ok {
+		return CoOccurrenceRecord{}, false, nil
+	}
+	return cloneCoOccurrenceRecord(record), true, nil
+}
+
+// StoreCoOccurrence overwrites the identity's mosaic co-occurrence state
+// atomically with an independent copy of the record.
+func (s *MemoryPolicyStore) StoreCoOccurrence(
+	ctx context.Context,
+	key string,
+	record CoOccurrenceRecord,
+) error {
+	if err := contextFailure(ctx); err != nil {
+		return err
+	}
+	if s == nil {
+		return catalogUnavailable()
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.initialize()
+	s.coOccurrence[key] = cloneCoOccurrenceRecord(record)
+	return nil
+}
+
+func (s *MemoryPolicyStore) snapshotCoOccurrence(
+	key string,
+) (CoOccurrenceRecord, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	record, ok := s.coOccurrence[key]
+	if !ok {
+		return CoOccurrenceRecord{}, false
+	}
+	return cloneCoOccurrenceRecord(record), true
+}
+
+func cloneCoOccurrenceRecord(record CoOccurrenceRecord) CoOccurrenceRecord {
+	return CoOccurrenceRecord{
+		WindowStart: record.WindowStart,
+		Domains:     append([]string(nil), record.Domains...),
+	}
+}
+
 func (s *MemoryPolicyStore) initialize() {
 	if s.sourceClaims == nil {
 		s.sourceClaims = make(map[string]sourceClaimState)
@@ -1023,6 +1086,9 @@ func (s *MemoryPolicyStore) initialize() {
 	}
 	if s.edges == nil {
 		s.edges = make(map[shoal.ID]EdgeRegistration)
+	}
+	if s.coOccurrence == nil {
+		s.coOccurrence = make(map[string]CoOccurrenceRecord)
 	}
 }
 

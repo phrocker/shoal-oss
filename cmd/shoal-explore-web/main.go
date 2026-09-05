@@ -117,6 +117,18 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 		"Authenticate every request as a fixed development principal; "+
 			"refused unless the resolved listen address is loopback-only",
 	)
+	mosaicBudget := flags.Uint(
+		"mosaic-budget", 0,
+		"Sensitivity-domain co-occurrence budget defending against the mosaic "+
+			"effect: the maximum number of distinct sensitivity domains one "+
+			"identity may observe together within -mosaic-window before further "+
+			"cross-domain results are withheld. Zero disables the control",
+	)
+	mosaicWindow := flags.Duration(
+		"mosaic-window", time.Hour,
+		"Window over which the -mosaic-budget distinct-domain count accumulates "+
+			"for an identity before it resets",
+	)
 	entraTenant := flags.String(
 		"entra-tenant", "",
 		"Microsoft Entra ID (Azure AD) tenant/directory ID. Derives the "+
@@ -251,6 +263,10 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 		clock:     time.Now,
 		backfill:  backfill,
 		ontology:  activeOntology,
+		mosaic: authorized.MosaicBudget{
+			MaxDomains: uint32(*mosaicBudget),
+			Window:     *mosaicWindow,
+		},
 	})
 	if err != nil {
 		listener.Close()
@@ -458,6 +474,9 @@ type serviceConfig struct {
 	// ontology is an optional immutable snapshot configured at startup for the
 	// read-only ontology description endpoint.
 	ontology *ontology.OntologyVersion
+	// mosaic configures the sensitivity-domain co-occurrence budget. A zero
+	// MaxDomains disables the control.
+	mosaic authorized.MosaicBudget
 }
 
 // openedService is the constructed workspace service together with what the
@@ -511,7 +530,8 @@ func openService(
 				return closed, err
 			}
 		}
-		client, err := authorizedClient(corpus, store, config.resolver, config.clock)
+		client, err := authorizedClient(
+			corpus, store, config.resolver, config.clock, config.mosaic)
 		if err != nil {
 			store.Close()
 			corpus.Close()
@@ -724,6 +744,7 @@ func authorizedClient(
 	store authorized.PolicyStore,
 	resolver auth.Resolver,
 	clock func() time.Time,
+	mosaic authorized.MosaicBudget,
 ) (*authorized.Client, error) {
 	selector, err := authorized.NewStaticPolicySelector(
 		workspaceSourceID, workspaceGrantPolicyID)
@@ -741,6 +762,7 @@ func authorizedClient(
 			domain:     workspaceAuthorizationDomain,
 			generation: workspacePolicyGeneration,
 		},
-		Clock: clock,
+		Clock:  clock,
+		Mosaic: mosaic,
 	})
 }

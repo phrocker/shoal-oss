@@ -28,6 +28,7 @@ import (
 	"fmt"
 	"io"
 	"sync"
+	"time"
 
 	"github.com/phrocker/shoal-oss/internal/cclient"
 	"github.com/phrocker/shoal-oss/internal/engine"
@@ -77,6 +78,7 @@ const (
 	policyRowEdgeClaim     = "edgeclaim/"
 	policyRowNode          = "node/"
 	policyRowSourceVersion = "meta/source-version"
+	policyRowCoOccurrence  = "mosaic/"
 
 	// The policy envelope is deliberately separate from the Explorer document
 	// envelope (SHOALX2). Its magic, envelope version, record kind, big-endian
@@ -92,6 +94,7 @@ const (
 	policyKindEdgeClaim     = byte(5)
 	policyKindSourceVersion = byte(6)
 	policyKindNode          = byte(7)
+	policyKindCoOccurrence  = byte(8)
 
 	policyEnvelopeHeader = 8 + 1 + 1 + 8 + sha256.Size
 	maxPolicyRecordBytes = uint64(64 << 20)
@@ -167,6 +170,13 @@ type persistedSourceVersion struct {
 	Version uint64
 }
 
+type persistedCoOccurrence struct {
+	Seq                 uint64
+	Key                 string
+	WindowStartUnixNano int64
+	Domains             []string
+}
+
 // OpenDurablePolicyStore opens or creates a durable policy catalog rooted at
 // dir. It reconstructs the catalog from any previously persisted records; a
 // record that fails to decode or validate fails closed by refusing to open.
@@ -234,6 +244,7 @@ func (s *DurablePolicyStore) load() error {
 	edges := make(map[string]persistedEdge)
 	edgeClaims := make(map[string]persistedEdge)
 	nodes := make(map[string]persistedNode)
+	coOccurrences := make(map[string]persistedCoOccurrence)
 	var (
 		versionRecord persistedSourceVersion
 		haveVersion   bool
@@ -321,6 +332,17 @@ func (s *DurablePolicyStore) load() error {
 				edges[rowStr] = record
 			}
 			maxSeq = maxUint64(maxSeq, record.Seq)
+		case bytes.HasPrefix(row, []byte(policyRowCoOccurrence)):
+			var record persistedCoOccurrence
+			if err := decodePolicyRecord(
+				value, policyKindCoOccurrence, &record,
+			); err != nil {
+				return corruptPolicyRecord("co-occurrence", err)
+			}
+			if prev, ok := coOccurrences[rowStr]; !ok || record.Seq >= prev.Seq {
+				coOccurrences[rowStr] = record
+			}
+			maxSeq = maxUint64(maxSeq, record.Seq)
 		case bytes.HasPrefix(row, []byte(policyRowNode)):
 			var record persistedNode
 			if err := decodePolicyRecord(
@@ -340,7 +362,7 @@ func (s *DurablePolicyStore) load() error {
 
 	if err := s.reconstruct(
 		sourceClaims, revisions, currents, edges, edgeClaims, nodes,
-		versionRecord, haveVersion,
+		coOccurrences, versionRecord, haveVersion,
 	); err != nil {
 		return err
 	}
@@ -360,6 +382,7 @@ func (s *DurablePolicyStore) reconstruct(
 	edges map[string]persistedEdge,
 	edgeClaims map[string]persistedEdge,
 	nodes map[string]persistedNode,
+	coOccurrences map[string]persistedCoOccurrence,
 	versionRecord persistedSourceVersion,
 	haveVersion bool,
 ) error {
@@ -471,6 +494,12 @@ func (s *DurablePolicyStore) reconstruct(
 			return corruptPolicyRecord("node", err)
 		}
 		memory.nodes[shoal.ID(record.NodeID)] = registration
+	}
+	for _, record := range coOccurrences {
+		memory.coOccurrence[record.Key] = CoOccurrenceRecord{
+			WindowStart: time.Unix(0, record.WindowStartUnixNano).UTC(),
+			Domains:     append([]string(nil), record.Domains...),
+		}
 	}
 	return nil
 }
@@ -707,6 +736,35 @@ func (s *DurablePolicyStore) Edges(
 	return s.memoryStore().Edges(ctx, edgeIDs)
 }
 
+// LoadCoOccurrence is a pure read delegated to the memory store, whose state was
+// reconstructed from the engine on open.
+func (s *DurablePolicyStore) LoadCoOccurrence(
+	ctx context.Context,
+	key string,
+) (CoOccurrenceRecord, bool, error) {
+	return s.memoryStore().LoadCoOccurrence(ctx, key)
+}
+
+// StoreCoOccurrence updates the identity's mosaic co-occurrence state in memory
+// and writes it through to the engine so the co-occurrence budget survives
+// restarts. The mutation and its persistence are serialized together under mu,
+// exactly like every other durable write.
+func (s *DurablePolicyStore) StoreCoOccurrence(
+	ctx context.Context,
+	key string,
+	record CoOccurrenceRecord,
+) error {
+	if s == nil {
+		return (*MemoryPolicyStore)(nil).StoreCoOccurrence(ctx, key, record)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.memory.StoreCoOccurrence(ctx, key, record); err != nil {
+		return err
+	}
+	return s.persistCoOccurrence(key)
+}
+
 func (s *DurablePolicyStore) memoryStore() *MemoryPolicyStore {
 	if s == nil {
 		return nil
@@ -825,6 +883,20 @@ func (s *DurablePolicyStore) persistNode(nodeID shoal.ID) error {
 		Rule:       rule,
 	}
 	return s.writeRow(policyNodeRow(nodeID), policyKindNode, record)
+}
+
+func (s *DurablePolicyStore) persistCoOccurrence(key string) error {
+	record, ok := s.memory.snapshotCoOccurrence(key)
+	if !ok {
+		return catalogUnavailable()
+	}
+	return s.writeRow(policyCoOccurrenceRow(key), policyKindCoOccurrence,
+		persistedCoOccurrence{
+			Seq:                 s.nextSeq(),
+			Key:                 key,
+			WindowStartUnixNano: record.WindowStart.UnixNano(),
+			Domains:             append([]string(nil), record.Domains...),
+		})
 }
 
 func (s *DurablePolicyStore) persistApplicationEdge(edgeID shoal.ID) error {
@@ -1238,6 +1310,10 @@ func metadataFromStringMap(values map[string]string) shoal.Metadata {
 
 func policySourceClaimRow(sourceURI string) []byte {
 	return append([]byte(policyRowSourceClaim), sourceURI...)
+}
+
+func policyCoOccurrenceRow(key string) []byte {
+	return append([]byte(policyRowCoOccurrence), key...)
 }
 
 func policyRevisionRow(key revisionKey) []byte {

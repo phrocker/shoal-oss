@@ -340,7 +340,8 @@ func (r DocumentsResponse) MarshalJSON() ([]byte, error) {
 		Documents  []any    `json:"documents"`
 		NextCursor string   `json:"next_cursor,omitempty"`
 		Suppressed uint32   `json:"suppressed,omitempty"`
-	}{r.Snapshot, documents, r.NextCursor, r.Suppressed})
+		Restricted uint32   `json:"restricted,omitempty"`
+	}{r.Snapshot, documents, r.NextCursor, r.Suppressed, r.Restricted})
 }
 
 func (r *DocumentsResponse) UnmarshalJSON(data []byte) error {
@@ -354,6 +355,7 @@ func (r *DocumentsResponse) UnmarshalJSON(data []byte) error {
 		} `json:"documents"`
 		NextCursor string `json:"next_cursor,omitempty"`
 		Suppressed uint32 `json:"suppressed,omitempty"`
+		Restricted uint32 `json:"restricted,omitempty"`
 	}
 	if err := strictUnmarshal(data, &wire); err != nil {
 		return err
@@ -375,7 +377,7 @@ func (r *DocumentsResponse) UnmarshalJSON(data []byte) error {
 	}
 	*r = DocumentsResponse{
 		Snapshot: wire.Snapshot, Documents: documents, NextCursor: wire.NextCursor,
-		Suppressed: wire.Suppressed,
+		Suppressed: wire.Suppressed, Restricted: wire.Restricted,
 	}
 	return nil
 }
@@ -527,10 +529,11 @@ func (r RetrievalResponse) MarshalJSON() ([]byte, error) {
 		Snapshot   Snapshot `json:"snapshot"`
 		Retrieval  any      `json:"retrieval"`
 		Suppressed uint32   `json:"suppressed,omitempty"`
+		Restricted uint32   `json:"restricted,omitempty"`
 	}{r.Snapshot, struct {
 		RequestID string `json:"request_id,omitempty"`
 		Results   []any  `json:"results"`
-	}{encodeOptionalID(r.Retrieval.RequestID), results}, r.Suppressed})
+	}{encodeOptionalID(r.Retrieval.RequestID), results}, r.Suppressed, r.Restricted})
 }
 
 func (r *RetrievalResponse) UnmarshalJSON(data []byte) error {
@@ -551,6 +554,7 @@ func (r *RetrievalResponse) UnmarshalJSON(data []byte) error {
 			} `json:"results"`
 		} `json:"retrieval"`
 		Suppressed uint32 `json:"suppressed,omitempty"`
+		Restricted uint32 `json:"restricted,omitempty"`
 	}
 	if err := strictUnmarshal(data, &wire); err != nil {
 		return err
@@ -589,6 +593,7 @@ func (r *RetrievalResponse) UnmarshalJSON(data []byte) error {
 		Snapshot:   wire.Snapshot,
 		Retrieval:  retrieval.Response{RequestID: requestID, Results: results},
 		Suppressed: wire.Suppressed,
+		Restricted: wire.Restricted,
 	}
 	return nil
 }

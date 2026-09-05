@@ -519,6 +519,78 @@ assert.notStrictEqual(one, many);
 `)
 }
 
+func TestStaticWorkspaceRestrictionClauseIsDistinctFromSuppression(t *testing.T) {
+	runNodeUITest(t, `
+const scenario = await runScenario({documents: true, retrieve: true});
+const identity = {authenticated: true, subject: "alice@localhost", operations: ["retrieve"]};
+
+// The zero case adds nothing, so an unrestricted read is byte-identical to the
+// pre-mosaic wording.
+const none = scenario.ctx.restrictionClause(0, identity);
+assert.strictEqual(none, "");
+
+const one = scenario.ctx.restrictionClause(1, identity);
+assert.match(one, /1 document is restricted/);
+assert.match(one, /co-occurrence budget/);
+assert.match(one, /restriction, not a denial/);
+assert.match(one, /alice@localhost/);
+
+const many = scenario.ctx.restrictionClause(3, identity);
+assert.match(many, /3 documents are restricted/);
+
+// A restriction must never read the same as an authorization withholding: the
+// two reason classes use different vocabulary for the same count.
+const suppressedOne = scenario.ctx.suppressionClause(1, identity);
+assert.notStrictEqual(one, suppressedOne);
+assert.doesNotMatch(suppressedOne, /co-occurrence budget/);
+assert.doesNotMatch(one, /nothing exists/);
+
+// The restriction wording discloses only a count, never a domain or document.
+assert.doesNotMatch(one, /file:/);
+`)
+}
+
+func TestStaticWorkspaceRestrictionRendersDistinctClassName(t *testing.T) {
+	runNodeUITest(t, `
+const visibleDocs = [{
+  document: {id: "doc-1", title: "Visible"},
+  revision: {id: "rev-1"},
+  source_uri: "file:///visible.txt",
+}];
+
+// Documents: a restriction renders the dedicated "restricted" class, distinct
+// from a plain authorization withholding ("withheld"), a denial, and empty.
+const docs = await runScenario(
+  {documents: true, document: true}, [],
+  {documentResponses: [visibleDocs], documentsRestricted: 1});
+assert.strictEqual(docs.ids["documents-status"].className, "restricted");
+assert.match(docs.ids["documents-status"].textContent, /1 document is restricted/);
+assert.match(docs.ids["documents-status"].textContent, /co-occurrence budget/);
+assert.notStrictEqual(docs.ids["documents-status"].className, "withheld");
+assert.notStrictEqual(docs.ids["documents-status"].className, "denied");
+assert.notStrictEqual(docs.ids["documents-status"].className, "empty-state");
+
+// A restriction takes visual precedence over a co-occurring suppression so the
+// stronger, distinguishing signal is what the operator sees.
+const both = await runScenario(
+  {documents: true, document: true}, [],
+  {documentResponses: [visibleDocs], documentsRestricted: 1, documentsSuppressed: 2});
+assert.strictEqual(both.ids["documents-status"].className, "restricted");
+assert.match(both.ids["documents-status"].textContent, /1 document is restricted/);
+
+// Evidence: the retrieval panel mirrors the same distinct class.
+const evidence = await runScenario(
+  {documents: true, retrieve: true}, [],
+  {retrievalResults: [{id: "span-1", score: 0.9, evidence: []}], retrievalRestricted: 1});
+evidence.ids.query.value = "alpha";
+await evidence.ids.search.onsubmit({preventDefault() {}});
+assert.strictEqual(evidence.ids["evidence-status"].className, "restricted");
+assert.match(evidence.ids["evidence-status"].textContent, /1 document is restricted/);
+assert.notStrictEqual(evidence.ids["evidence-status"].className, "withheld");
+assert.notStrictEqual(evidence.ids["evidence-status"].className, "denied");
+`)
+}
+
 func TestStaticWorkspaceRetrievalReportsWithheldContext(t *testing.T) {
 	runNodeUITest(t, `
 // State 1: results, nothing withheld.
@@ -1007,6 +1079,7 @@ async function runScenario(capabilities, documents = [], scenarioOptions = {}) {
         return response({
           snapshot: documentSnapshot, documents: docs, next_cursor: "",
           suppressed: scenarioOptions.documentsSuppressed || 0,
+          restricted: scenarioOptions.documentsRestricted || 0,
         });
       }
       if (url === "/api/v1/ingest") {
@@ -1048,6 +1121,7 @@ async function runScenario(capabilities, documents = [], scenarioOptions = {}) {
           snapshot,
           retrieval: {results: scenarioOptions.retrievalResults || []},
           suppressed: scenarioOptions.retrievalSuppressed || 0,
+          restricted: scenarioOptions.retrievalRestricted || 0,
         });
       }
       throw new Error("unexpected fetch " + url);

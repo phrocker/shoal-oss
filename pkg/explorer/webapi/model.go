@@ -142,6 +142,12 @@ type DocumentsResponse struct {
 	// Suppressed reports how many current documents authorization withheld from
 	// this identity. It is a count only and never names what was withheld.
 	Suppressed uint32 `json:"suppressed,omitempty"`
+	// Restricted reports how many current documents the mosaic co-occurrence
+	// budget withheld from this identity. Unlike Suppressed, these are documents
+	// the identity is individually authorized to read but that were withheld to
+	// keep it within its distinct sensitivity-domain budget. It is a count only
+	// and never names what was withheld, nor which domains were involved.
+	Restricted uint32 `json:"restricted,omitempty"`
 }
 
 // DocumentRequest fetches one immutable hierarchy.
@@ -171,6 +177,12 @@ type RetrievalResponse struct {
 	// this identity and therefore never searched. It is a count only and never
 	// names what was withheld.
 	Suppressed uint32 `json:"suppressed,omitempty"`
+	// Restricted reports how many current documents the mosaic co-occurrence
+	// budget withheld from this identity and therefore never searched. These are
+	// documents the identity is individually authorized to read but that were
+	// withheld to keep it within its distinct sensitivity-domain budget. It is a
+	// count only and never names what was withheld, nor which domains.
+	Restricted uint32 `json:"restricted,omitempty"`
 }
 
 // NeighborhoodRequest asks for a bounded graph expansion.
