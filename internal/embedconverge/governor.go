@@ -92,9 +92,17 @@ type GovernorOptions struct {
 	// hosted provider must be given a real rate.
 	FilesPerSecond float64
 
-	// Burst is the most admissions that may happen back to back after an
-	// idle period. Values below one are raised to one, because a bucket
-	// that cannot hold a single permit never admits anything.
+	// Burst is the reusable token capacity after an idle period. Values
+	// below one are raised to one, because a bucket that cannot hold a
+	// single permit never admits anything.
+	//
+	// One atomic AdmitFiles request may be wider than Burst. Such a
+	// request may overdraw a non-negative bucket and borrows the excess
+	// permits from future refill, so a compaction merge width larger than
+	// Burst is delayed by the rate limit rather than refused forever.
+	// Only one overdraft can be outstanding: a negative balance refuses
+	// every later request until refill repays it. This prevents the
+	// exception from increasing the sustained rate.
 	Burst float64
 
 	// Budget bounds total consumption. The zero value is unlimited.
@@ -210,6 +218,10 @@ func (g *Governor) Stop() {
 // Admission never blocks. A compaction that is refused runs unconverged
 // and preserves its inputs' space, which is strictly better than holding
 // a compaction slot open waiting for a token.
+//
+// A reservation wider than Burst is not permanently impossible. When
+// there is no existing rate debt it is admitted once, atomically, and
+// the bucket goes negative until refill repays the borrowed capacity.
 func (g *Governor) AdmitFiles(n int64) (*Permit, error) {
 	if n <= 0 {
 		return nil, fmt.Errorf("%w: nothing to admit", embeddingspace.ErrConvergenceUnavailable)
@@ -230,8 +242,7 @@ func (g *Governor) AdmitFiles(n int64) (*Permit, error) {
 	}
 	if !g.takeTokensLocked(n) {
 		g.refused++
-		return nil, fmt.Errorf("%w: %w: %d permits requested, %.3f available at %.3f/s",
-			embeddingspace.ErrConvergenceUnavailable, ErrThrottled, n, g.tokens, g.rate)
+		return nil, g.throttledErrorLocked(n)
 	}
 	g.spentFiles += n
 	g.admitted += n
@@ -397,6 +408,17 @@ func (g *Governor) cellBudgetErrorLocked(pendingCells int64) error {
 // takeTokensLocked spends n permits, or none at all. Partial admission
 // would let a large compaction start converging with a reservation too
 // small to finish it.
+//
+// A request wider than the bucket is the important exception to the
+// ordinary token-bucket rule. Refusing it forever would starve every
+// lazy compaction whose merge width exceeds Burst. Instead, a bucket
+// with no existing debt may admit it atomically and go negative by the
+// excess. That negative balance is rate debt: refill pays it back before
+// another oversized request can proceed, preserving the sustained rate
+// without a waiter queue, retry allocation, or partially admitted
+// compaction. A stream of smaller admissions cannot permanently starve
+// a wide request because any non-negative balance is sufficient for the
+// one bounded overdraft.
 func (g *Governor) takeTokensLocked(n int64) bool {
 	if g.rate <= 0 {
 		return true
@@ -409,9 +431,32 @@ func (g *Governor) takeTokensLocked(n int64) bool {
 		}
 		g.last = now
 	}
-	if g.tokens < float64(n) {
+	required := float64(n)
+	if required > g.burst {
+		if g.tokens < 0 {
+			return false
+		}
+		g.tokens -= required
+		return true
+	}
+	if g.tokens < required {
 		return false
 	}
-	g.tokens -= float64(n)
+	g.tokens -= required
 	return true
+}
+
+func (g *Governor) throttledErrorLocked(n int64) error {
+	if required := float64(n); required > g.burst {
+		waitSeconds := -g.tokens / g.rate
+		if waitSeconds < 0 {
+			waitSeconds = 0
+		}
+		return fmt.Errorf(
+			"%w: %w: atomic %d-file reservation exceeds burst %.3f with rate debt outstanding; retry after at least %.3fs without another admission (rate balance %.3f at %.3f/s)",
+			embeddingspace.ErrConvergenceUnavailable, ErrThrottled,
+			n, g.burst, waitSeconds, g.tokens, g.rate)
+	}
+	return fmt.Errorf("%w: %w: %d permits requested, %.3f available at %.3f/s",
+		embeddingspace.ErrConvergenceUnavailable, ErrThrottled, n, g.tokens, g.rate)
 }
