@@ -48,6 +48,7 @@ type commandConfig struct {
 	corpusDir          string
 	policyDir          string
 	contextBudgetBytes int
+	toolCallsPerMinute int
 	identity           identityConfig
 }
 
@@ -289,6 +290,14 @@ func parseCommandConfig(
 		),
 		"Positive compatibility-text context budget in bytes (environment: SHOAL_MCP_CONTEXT_BUDGET_BYTES)",
 	)
+	toolCallsPerMinuteValue := flags.String(
+		"tool-calls-per-minute",
+		firstNonEmpty(
+			getenv("SHOAL_MCP_TOOL_CALLS_PER_MINUTE"),
+			strconv.Itoa(mcp.DefaultToolCallsPerMinute),
+		),
+		"Positive per-process MCP tool-call limit (environment: SHOAL_MCP_TOOL_CALLS_PER_MINUTE)",
+	)
 	if err := flags.Parse(args); err != nil {
 		return zero, err
 	}
@@ -315,6 +324,15 @@ func parseCommandConfig(
 			webapi.MaxResponseBytes,
 		)
 	}
+	toolCallsPerMinute, err := strconv.ParseInt(
+		strings.TrimSpace(*toolCallsPerMinuteValue), 10, 32)
+	if err != nil || toolCallsPerMinute <= 0 ||
+		toolCallsPerMinute > mcp.MaxToolCallsPerMinute {
+		return zero, fmt.Errorf(
+			"tool calls per minute must be between 1 and %d",
+			mcp.MaxToolCallsPerMinute,
+		)
+	}
 	identity, err := configureIdentity(identityOptions{
 		development:      *development,
 		subject:          *subject,
@@ -339,6 +357,7 @@ func parseCommandConfig(
 		corpusDir:          corpus,
 		policyDir:          policy,
 		contextBudgetBytes: int(contextBudgetBytes),
+		toolCallsPerMinute: int(toolCallsPerMinute),
 		identity:           identity,
 	}, nil
 }

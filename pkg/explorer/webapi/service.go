@@ -52,12 +52,18 @@ type IngestProvider interface {
 	Ingest(context.Context, IngestRequest) (IngestResponse, error)
 }
 
+// IngestAvailabilityProvider reports whether an IngestProvider can currently
+// accept calls without additional capability negotiation.
+type IngestAvailabilityProvider interface {
+	IngestAvailable() bool
+}
+
 type ExtractionProvider interface {
 	Extract(context.Context, ExtractRequest) (ExtractResponse, error)
 }
 
-// ExtractionAvailabilityProvider reports whether an ExtractionProvider is
-// currently configured for successful extraction.
+// ExtractionAvailabilityProvider reports whether an ExtractionProvider has
+// the runtime configuration required to accept calls.
 type ExtractionAvailabilityProvider interface {
 	ExtractionAvailable() bool
 }
@@ -75,6 +81,12 @@ type RecomputeProvider interface {
 // and the transport fails closed with an unavailable error.
 type ChangeProvider interface {
 	Changes(context.Context, ChangesRequest) (ChangesResponse, error)
+}
+
+// ChangeAvailabilityProvider reports whether a ChangeProvider has an ordered,
+// authorized change-feed backend.
+type ChangeAvailabilityProvider interface {
+	ChangesAvailable() bool
 }
 
 // CapabilityProvider is an optional service extension for dynamic feature
@@ -166,6 +178,9 @@ func (s *EmbeddedService) Capabilities(ctx context.Context) (Capabilities, error
 	if !s.ExtractionAvailable() {
 		capabilities.Extraction = false
 	}
+	if !s.ChangesAvailable() {
+		capabilities.Changes = false
+	}
 	provider, ok := s.client.(vectorAvailabilityProvider)
 	if !ok {
 		return capabilities, nil
@@ -176,6 +191,11 @@ func (s *EmbeddedService) Capabilities(ctx context.Context) (Capabilities, error
 	}
 	capabilities.Vector = available
 	return capabilities, nil
+}
+
+// IngestAvailable reports whether the embedded client can accept ingestion.
+func (s *EmbeddedService) IngestAvailable() bool {
+	return s != nil && s.client != nil
 }
 
 // ExtractionAvailable reports whether the service has both an extraction
@@ -195,6 +215,16 @@ func (s *EmbeddedService) ExtractionAvailable() bool {
 	s.ontologyMu.RLock()
 	defer s.ontologyMu.RUnlock()
 	return s.ontologyVersion != nil
+}
+
+// ChangesAvailable reports whether the embedded client can serve the ordered,
+// authorized change feed.
+func (s *EmbeddedService) ChangesAvailable() bool {
+	if s == nil {
+		return false
+	}
+	_, ok := s.client.(changeFeedBackend)
+	return ok
 }
 
 func (s *EmbeddedService) Extract(

@@ -48,6 +48,7 @@ directories together.
 | `-data` | `SHOAL_MCP_DATA` | Corpus directory when `-state-dir` is unset; defaults to `.shoal/explorer` |
 | `-policy-dir` | `SHOAL_MCP_POLICY_DIR` | Explicit durable policy directory |
 | `-context-budget-bytes` | `SHOAL_MCP_CONTEXT_BUDGET_BYTES` | Compatibility-text context budget; defaults to 1 MiB |
+| `-tool-calls-per-minute` | `SHOAL_MCP_TOOL_CALLS_PER_MINUTE` | Per-process tool-call limit; defaults to 120 |
 
 If an existing corpus contains documents but the selected policy catalog has
 no registrations, startup is refused. Restore the matching policy directory or
@@ -87,6 +88,10 @@ every `tools/call`, but every caller connected to the same process uses the same
 configured identity. Stdio cannot independently authenticate remote callers.
 A future HTTP transport is required for independently authenticated per-call
 remote callers.
+
+The server enforces a fixed-window, per-process tool-call limit before
+authorization and dispatch. Exceeding the configured per-minute limit returns
+a bounded `unavailable` tool error without invoking the workspace.
 
 ## Tool surface and recording
 

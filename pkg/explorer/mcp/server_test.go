@@ -272,20 +272,20 @@ func TestToolAdvertisementTracksOptionalProviders(t *testing.T) {
 	}
 }
 
-func TestExtractionToolRequiresAvailableCapability(t *testing.T) {
-	service := &unavailableExtractionService{allOptionalService: &allOptionalService{
+func TestOptionalToolsRespectRuntimeCapabilities(t *testing.T) {
+	service := &limitedOptionalService{allOptionalService: &allOptionalService{
 		stubService: &stubService{}, calls: make(map[string]int),
 	}}
 	server, _ := newTestServer(t, service, nil)
 	makeReady(t, server)
 	names := listedToolNames(t, server)
-	if containsString(names, ToolExtract) {
-		t.Fatalf("unavailable extraction tool was advertised: %v", names)
-	}
-	for _, name := range []string{ToolIngest, ToolRecompute, ToolChanges} {
-		if !containsString(names, name) {
-			t.Fatalf("available optional tool %q was omitted: %v", name, names)
+	for _, name := range []string{ToolIngest, ToolExtract, ToolChanges} {
+		if containsString(names, name) {
+			t.Fatalf("unavailable optional tool %q was advertised: %v", name, names)
 		}
+	}
+	if !containsString(names, ToolRecompute) {
+		t.Fatalf("available recompute tool was omitted: %v", names)
 	}
 }
 
@@ -766,6 +766,56 @@ func TestAuthorizationFailuresDoNotInvokeService(t *testing.T) {
 	}
 }
 
+func TestToolCallRateLimitRunsBeforeAuthorizationAndDispatch(t *testing.T) {
+	now := time.Date(2026, 9, 5, 15, 0, 0, 0, time.UTC)
+	decisionCalls := 0
+	serviceCalls := 0
+	server, err := NewServer(Config{
+		Service: &stubService{
+			documents: func(
+				context.Context,
+				webapi.DocumentsRequest,
+			) (webapi.DocumentsResponse, error) {
+				serviceCalls++
+				return webapi.DocumentsResponse{}, nil
+			},
+		},
+		Authority: auth.NewAuthority(),
+		Decisions: DecisionProviderFunc(func(context.Context) (auth.Decision, error) {
+			decisionCalls++
+			return testDecision(t), nil
+		}),
+		ToolCallsPerMinute: 1,
+		requestIDFactory:   sequentialRequestIDs(),
+		toolCallClock:      func() time.Time { return now },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	makeReady(t, server)
+
+	first := decodeToolResult(t, callToolRequest(t, server, ToolDocuments, `{}`))
+	if first.IsError {
+		t.Fatalf("first rate-limited call failed: %s", first.StructuredContent)
+	}
+	second := decodeToolResult(t, callToolRequest(t, server, ToolDocuments, `{}`))
+	if !second.IsError ||
+		!strings.Contains(string(second.StructuredContent), "rate limit exceeded") {
+		t.Fatalf("second rate-limited call = %+v", second)
+	}
+	if decisionCalls != 1 || serviceCalls != 1 {
+		t.Fatalf("calls after rejection: decisions=%d service=%d", decisionCalls, serviceCalls)
+	}
+	now = now.Add(time.Minute)
+	third := decodeToolResult(t, callToolRequest(t, server, ToolDocuments, `{}`))
+	if third.IsError || decisionCalls != 2 || serviceCalls != 2 {
+		t.Fatalf(
+			"calls after reset: result=%+v decisions=%d service=%d",
+			third, decisionCalls, serviceCalls,
+		)
+	}
+}
+
 func TestToolResultCompressionRunsOnResponsePath(t *testing.T) {
 	compressor := &recordingCompressor{}
 	authority := auth.NewAuthority()
@@ -846,6 +896,13 @@ func TestCompressionFailurePreservesStructuredSuccess(t *testing.T) {
 	if result.IsError || len(result.Content) != 0 ||
 		!strings.Contains(string(result.StructuredContent), `"id":"snapshot"`) {
 		t.Fatalf("compression failure changed successful result: %+v", result)
+	}
+	encoded, err := json.Marshal(result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(encoded), `"content":[]`) {
+		t.Fatalf("compression fallback content is not an array: %s", encoded)
 	}
 	if serviceCalls != 1 {
 		t.Fatalf("service calls = %d, want 1", serviceCalls)
@@ -1179,6 +1236,12 @@ func TestNewServerRejectsInvalidExtensionConfiguration(t *testing.T) {
 	}); err == nil {
 		t.Fatal("oversized context budget was accepted")
 	}
+	if _, err := NewServer(Config{
+		Service: &stubService{}, Authority: authority, Decisions: decisions,
+		ToolCallsPerMinute: MaxToolCallsPerMinute + 1,
+	}); err == nil {
+		t.Fatal("oversized tool call rate limit was accepted")
+	}
 }
 
 func TestOptionalToolArgumentsAreValidatedBeforeDispatch(t *testing.T) {
@@ -1410,11 +1473,19 @@ type allOptionalService struct {
 	calls map[string]int
 }
 
-type unavailableExtractionService struct {
+type limitedOptionalService struct {
 	*allOptionalService
 }
 
-func (*unavailableExtractionService) ExtractionAvailable() bool {
+func (*limitedOptionalService) IngestAvailable() bool {
+	return false
+}
+
+func (*limitedOptionalService) ExtractionAvailable() bool {
+	return false
+}
+
+func (*limitedOptionalService) ChangesAvailable() bool {
 	return false
 }
 

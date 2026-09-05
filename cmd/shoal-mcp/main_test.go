@@ -85,6 +85,7 @@ func TestParseCommandConfigFailsClosedAndSupportsEnvironment(t *testing.T) {
 		"SHOAL_MCP_IDENTITY_LIFETIME":      "10m",
 		"SHOAL_MCP_IDENTITY_AUDIT_PURPOSE": "configured stdio identity",
 		"SHOAL_MCP_CONTEXT_BUDGET_BYTES":   "8192",
+		"SHOAL_MCP_TOOL_CALLS_PER_MINUTE":  "7",
 	}
 	config, err := parseCommandConfig(
 		nil, io.Discard, func(name string) string { return environment[name] })
@@ -102,7 +103,8 @@ func TestParseCommandConfigFailsClosedAndSupportsEnvironment(t *testing.T) {
 	if config.identity.subject != "configured-subject" ||
 		config.identity.policyGeneration != 2 ||
 		config.identity.lifetime != 10*time.Minute ||
-		config.contextBudgetBytes != 8192 {
+		config.contextBudgetBytes != 8192 ||
+		config.toolCallsPerMinute != 7 {
 		t.Fatalf("identity config = %+v", config.identity)
 	}
 
@@ -128,6 +130,19 @@ func TestParseCommandConfigFailsClosedAndSupportsEnvironment(t *testing.T) {
 	if _, err := parseCommandConfig(nil, io.Discard, invalidBudget); err == nil ||
 		!strings.Contains(err.Error(), "context budget") {
 		t.Fatalf("invalid context budget error = %v", err)
+	}
+	invalidRate := func(name string) string {
+		if name == "SHOAL_MCP_DEV_AUTH" {
+			return "true"
+		}
+		if name == "SHOAL_MCP_TOOL_CALLS_PER_MINUTE" {
+			return "0"
+		}
+		return ""
+	}
+	if _, err := parseCommandConfig(nil, io.Discard, invalidRate); err == nil ||
+		!strings.Contains(err.Error(), "tool calls per minute") {
+		t.Fatalf("invalid tool call rate error = %v", err)
 	}
 }
 

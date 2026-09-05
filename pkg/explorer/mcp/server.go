@@ -29,6 +29,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/explorer/webapi"
@@ -47,6 +48,9 @@ const (
 	// structured tool result. StructuredContent remains complete.
 	DefaultContextBudgetBytes = 1 << 20
 	maxContextBudgetBytes     = int(webapi.MaxResponseBytes)
+	// DefaultToolCallsPerMinute bounds work accepted from one stdio process.
+	DefaultToolCallsPerMinute = 120
+	MaxToolCallsPerMinute     = 100_000
 )
 
 // Implementation identifies an MCP client or server implementation.
@@ -108,7 +112,10 @@ type Config struct {
 	// ContextBudgetBytes defaults to DefaultContextBudgetBytes and cannot exceed
 	// the web API's public response bound.
 	ContextBudgetBytes int
+	// ToolCallsPerMinute defaults to DefaultToolCallsPerMinute.
+	ToolCallsPerMinute int
 	requestIDFactory   func() (shoal.ID, error)
+	toolCallClock      func() time.Time
 }
 
 type serverState uint8
@@ -129,6 +136,7 @@ type Server struct {
 	requestID     func() (shoal.ID, error)
 	compressor    ContextCompressor
 	contextBudget int
+	toolCallLimit *fixedWindowLimiter
 	tools         []registeredTool
 	toolsByName   map[string]registeredTool
 	stateMu       sync.Mutex
@@ -188,6 +196,19 @@ func NewServer(config Config) (*Server, error) {
 		return nil, shoal.NewError(
 			shoal.ErrorInvalidArgument, "MCP context budget is invalid")
 	}
+	toolCallsPerMinute := config.ToolCallsPerMinute
+	if toolCallsPerMinute == 0 {
+		toolCallsPerMinute = DefaultToolCallsPerMinute
+	}
+	if toolCallsPerMinute < 0 ||
+		toolCallsPerMinute > MaxToolCallsPerMinute {
+		return nil, shoal.NewError(
+			shoal.ErrorInvalidArgument, "MCP tool call rate limit is invalid")
+	}
+	toolCallClock := config.toolCallClock
+	if toolCallClock == nil {
+		toolCallClock = time.Now
+	}
 	tools, err := serviceTools(config.Service, config.OptionalTools)
 	if err != nil {
 		return nil, err
@@ -208,6 +229,8 @@ func NewServer(config Config) (*Server, error) {
 		serverInfo:   serverInfo,
 		instructions: instructions, requestID: requestID,
 		compressor: compressor, contextBudget: contextBudget,
+		toolCallLimit: newFixedWindowLimiter(
+			toolCallsPerMinute, time.Minute, toolCallClock),
 		tools: tools, toolsByName: byName, state: stateAwaitInitialize,
 	}, nil
 }
@@ -418,6 +441,11 @@ func (s *Server) callTool(ctx context.Context, request Request) *Response {
 			request.ID, newError(codeInvalidParams, "invalid tools/call params"))
 		return &response
 	}
+	if !s.toolCallLimit.Allow() {
+		response := newResponse(request.ID, s.toolErrorResult(shoal.NewError(
+			shoal.ErrorUnavailable, "tool call rate limit exceeded")))
+		return &response
+	}
 
 	bound, err := s.authorizedContext(ctx)
 	if err != nil {
@@ -452,6 +480,43 @@ func (s *Server) callTool(ctx context.Context, request Request) *Response {
 	}
 	response := newResponse(request.ID, result)
 	return &response
+}
+
+type fixedWindowLimiter struct {
+	mu          sync.Mutex
+	limit       int
+	window      time.Duration
+	now         func() time.Time
+	windowStart time.Time
+	count       int
+}
+
+func newFixedWindowLimiter(
+	limit int,
+	window time.Duration,
+	now func() time.Time,
+) *fixedWindowLimiter {
+	return &fixedWindowLimiter{limit: limit, window: window, now: now}
+}
+
+func (l *fixedWindowLimiter) Allow() bool {
+	if l == nil || l.limit <= 0 || l.window <= 0 || l.now == nil {
+		return false
+	}
+	now := l.now()
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.windowStart.IsZero() ||
+		now.Before(l.windowStart) ||
+		now.Sub(l.windowStart) >= l.window {
+		l.windowStart = now
+		l.count = 0
+	}
+	if l.count >= l.limit {
+		return false
+	}
+	l.count++
+	return true
 }
 
 func (s *Server) authorizedContext(ctx context.Context) (context.Context, error) {

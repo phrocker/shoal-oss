@@ -387,7 +387,8 @@ func mandatoryServiceTools(service webapi.Service) []registeredTool {
 
 func optionalServiceTools(service webapi.Service) []registeredTool {
 	var tools []registeredTool
-	if provider, ok := service.(webapi.IngestProvider); ok && !isAbsent(provider) {
+	if provider, ok := service.(webapi.IngestProvider); ok && !isAbsent(provider) &&
+		ingestionAvailable(service) {
 		provider := provider
 		tools = append(tools, registeredTool{
 			definition: Tool{
@@ -464,7 +465,8 @@ func optionalServiceTools(service webapi.Service) []registeredTool {
 			},
 		})
 	}
-	if provider, ok := service.(webapi.ChangeProvider); ok && !isAbsent(provider) {
+	if provider, ok := service.(webapi.ChangeProvider); ok && !isAbsent(provider) &&
+		changesAvailable(service) {
 		provider := provider
 		tools = append(tools, registeredTool{
 			definition: Tool{
@@ -489,9 +491,19 @@ func optionalServiceTools(service webapi.Service) []registeredTool {
 	return tools
 }
 
+func ingestionAvailable(service webapi.Service) bool {
+	availability, ok := service.(webapi.IngestAvailabilityProvider)
+	return !ok || (!isAbsent(availability) && availability.IngestAvailable())
+}
+
 func extractionAvailable(service webapi.Service) bool {
 	availability, ok := service.(webapi.ExtractionAvailabilityProvider)
 	return !ok || (!isAbsent(availability) && availability.ExtractionAvailable())
+}
+
+func changesAvailable(service webapi.Service) bool {
+	availability, ok := service.(webapi.ChangeAvailabilityProvider)
+	return !ok || (!isAbsent(availability) && availability.ChangesAvailable())
 }
 
 func readOnlyAnnotations() *ToolAnnotations {
@@ -621,6 +633,7 @@ func (s *Server) toolSuccessResult(value any) (ToolResult, error) {
 	result, err := s.packToolResult(encoded)
 	if err != nil {
 		return ToolResult{
+			Content:           []TextContent{},
 			StructuredContent: append(json.RawMessage(nil), encoded...),
 			IsError:           false,
 		}, nil

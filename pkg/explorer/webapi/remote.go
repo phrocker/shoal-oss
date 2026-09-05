@@ -94,6 +94,13 @@ func (s *RemoteService) Metadata(ctx context.Context) (MetadataResponse, error) 
 	return s.metadata(ctx)
 }
 
+// IngestAvailable returns false because remote capability negotiation requires
+// a request context. Callers that snapshot a context-free tool surface must
+// fail closed rather than advertise ingestion unconditionally.
+func (*RemoteService) IngestAvailable() bool {
+	return false
+}
+
 func (s *RemoteService) Ingest(
 	ctx context.Context, request IngestRequest,
 ) (IngestResponse, error) {

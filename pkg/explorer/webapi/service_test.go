@@ -852,21 +852,16 @@ func TestMetadataAdvertisesCapabilities(t *testing.T) {
 func TestEmbeddedExtractionAvailabilityRequiresOntology(t *testing.T) {
 	service, corpus, _, _ := testService(t)
 	defer corpus.Close()
-	if service.ExtractionAvailable() {
-		t.Fatal("extraction was available without an active ontology")
-	}
 	capabilities, err := service.Capabilities(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if capabilities.Supports(webapi.CapabilityExtraction) {
+	if capabilities.Supports(webapi.CapabilityExtraction) ||
+		capabilities.Supports(webapi.CapabilityChanges) {
 		t.Fatalf("unconfigured extraction capability = %+v", capabilities)
 	}
 	if err := service.SetOntologyVersion(webapiSkillsOntologyVersion(t)); err != nil {
 		t.Fatal(err)
-	}
-	if !service.ExtractionAvailable() {
-		t.Fatal("extraction remained unavailable after ontology configuration")
 	}
 	capabilities, err = service.Capabilities(context.Background())
 	if err != nil {

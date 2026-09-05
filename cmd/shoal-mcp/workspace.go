@@ -64,6 +64,7 @@ func buildApplication(
 			"is required for independently authenticated per-call remote callers. " +
 			"Tool-call recording is not implemented.",
 		ContextBudgetBytes: config.contextBudgetBytes,
+		ToolCallsPerMinute: config.toolCallsPerMinute,
 	})
 	if err != nil {
 		return nil, errors.Join(err, closeWorkspace())
