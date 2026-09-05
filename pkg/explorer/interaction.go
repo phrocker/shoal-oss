@@ -187,6 +187,9 @@ func (e *Explorer) RecordInteraction(
 	if err != nil {
 		return err
 	}
+	if err := e.requireInteractionIDsAvailableLocked(subgraph); err != nil {
+		return err
+	}
 	record := persistedInteraction{
 		SessionID:                session.ID,
 		Session:                  session,
@@ -203,6 +206,7 @@ func (e *Explorer) RecordInteraction(
 		Visibility:               interaction.Expression(subgraph.Visibility),
 		RecordedAt:               session.RecordedAt.UTC(),
 	}
+
 	if err := validatePersistedInteraction(record); err != nil {
 		return err
 	}
@@ -213,6 +217,30 @@ func (e *Explorer) RecordInteraction(
 	}
 	e.interactions[session.ID] = &record
 	return e.rebuildCurrentGraphLocked()
+}
+
+func (e *Explorer) requireInteractionIDsAvailableLocked(
+	subgraph interaction.Subgraph,
+) error {
+	for _, node := range subgraph.Nodes {
+		if existing, ok := e.graphNodes[node.ID]; ok {
+			return shoal.NewError(
+				shoal.ErrorConflict,
+				"interaction node ID collides with existing graph node "+
+					string(existing.ID),
+			)
+		}
+	}
+	for _, edge := range subgraph.Edges {
+		if existing, ok := e.graphEdges[edge.ID]; ok {
+			return shoal.NewError(
+				shoal.ErrorConflict,
+				"interaction edge ID collides with existing graph edge "+
+					string(existing.ID),
+			)
+		}
+	}
+	return nil
 }
 
 // RecordInteractionResult records a session and returns the exact canonical
@@ -342,9 +370,8 @@ func (e *Explorer) Interactions(ctx context.Context) ([]InteractionSummary, erro
 				continue
 			}
 		}
-		summaries = append(summaries, InteractionSummary{
+		summary := InteractionSummary{
 			SessionID:                record.SessionID,
-			InferenceID:              interaction.InferenceID(record.SessionID),
 			RecordedAt:               record.RecordedAt,
 			SnapshotID:               record.SnapshotID,
 			SnapshotAsOf:             record.SnapshotAsOf,
@@ -359,7 +386,11 @@ func (e *Explorer) Interactions(ctx context.Context) ([]InteractionSummary, erro
 			EdgeCount:                len(record.Edges),
 			Deleted:                  record.Deleted,
 			DeletedAt:                record.DeletedAt,
-		})
+		}
+		if record.Operation.HasInference() {
+			summary.InferenceID = interaction.InferenceID(record.SessionID)
+		}
+		summaries = append(summaries, summary)
 	}
 	sort.Slice(summaries, func(i, j int) bool {
 		return shoal.CompareID(summaries[i].SessionID, summaries[j].SessionID) < 0

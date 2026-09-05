@@ -514,12 +514,21 @@ func (e *Explorer) writeInteractionRecord(
 }
 
 func (e *Explorer) hasExactRecord(row, expected []byte) (bool, error) {
-	scanner, err := e.engine.Scan(
+	committed := false
+	err := e.engine.LookupRows(
 		explorerTable,
-		iterrt.InfiniteRange(),
+		[][]byte{append([]byte(nil), row...)},
 		engine.ScanOptions{
 			ColumnFamilies:          [][]byte{[]byte(recordCF)},
 			ColumnFamiliesInclusive: true,
+		},
+		func(_ int, key *iterrt.Key, value []byte) {
+			if committed ||
+				!bytes.Equal(key.ColumnQualifier, []byte(recordCQV2)) {
+				return
+			}
+			committed = equivalentEmbeddedRecord(
+				key.Row, value, expected)
 		},
 	)
 	if err != nil {
@@ -529,25 +538,7 @@ func (e *Explorer) hasExactRecord(row, expected []byte) (bool, error) {
 			err,
 		)
 	}
-	defer scanner.Close()
-	for scanner.Next() {
-		key := scanner.Key()
-		if bytes.Equal(key.Row, row) &&
-			bytes.Equal(key.ColumnQualifier, []byte(recordCQV2)) &&
-			equivalentEmbeddedRecord(
-				key.Row, scanner.Value(), expected,
-			) {
-			return true, nil
-		}
-		if err := scanner.Advance(); err != nil {
-			return false, shoal.WrapError(
-				shoal.ErrorUnavailable,
-				"advance interaction write verification",
-				err,
-			)
-		}
-	}
-	return false, nil
+	return committed, nil
 }
 
 func equivalentEmbeddedRecord(row, stored, expected []byte) bool {

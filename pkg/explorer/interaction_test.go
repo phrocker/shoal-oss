@@ -300,8 +300,7 @@ func TestGenericRecorderSurvivesRestartAndStaysSourceOnly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	recordedAt := time.Date(
-		2026, time.September, 5, 22, 30, 0, 123, time.UTC)
+	recordedAt := before.AsOf.Add(time.Second)
 	recorder, err := interaction.NewRecorder(ctx, corpus)
 	if err != nil {
 		t.Fatal(err)
@@ -332,7 +331,7 @@ func TestGenericRecorderSurvivesRestartAndStaysSourceOnly(t *testing.T) {
 		SnapshotID:               shoal.ID(before.ID),
 		SnapshotAsOf:             before.AsOf,
 		AuthorizationFingerprint: "auth-sha256:generic-recorder",
-		AuthorizationExpiresAt:   recordedAt.Add(time.Hour),
+		AuthorizationExpiresAt:   before.AsOf.Add(time.Hour),
 		SeedNodeIDs:              spans,
 	})
 	if err != nil {
@@ -372,6 +371,13 @@ func TestGenericRecorderSurvivesRestartAndStaysSourceOnly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	summaries, err := reopened.Interactions(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(summaries) != 1 || summaries[0].InferenceID != "" {
+		t.Fatalf("generic interaction summary = %+v", summaries)
+	}
 	if hydrated.Operation != interaction.OperationRetrieval ||
 		hydrated.Actor.SubjectID != "subject-1" ||
 		hydrated.Actor.ActorID != "agent-1" ||
@@ -388,6 +394,36 @@ func TestGenericRecorderSurvivesRestartAndStaysSourceOnly(t *testing.T) {
 		if node.Kind == interaction.KindInference {
 			t.Fatal("generic retrieval acquired an inference node after restart")
 		}
+	}
+
+}
+
+func TestGeneratedInteractionNodeIDsCannotCollide(t *testing.T) {
+	ctx := context.Background()
+	corpus, err := explorer.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer corpus.Close()
+	spans := ingestVisible(
+		t, corpus, "file:///collision.md", publicMarkdown, "ops")
+
+	const futureSessionID shoal.ID = "future-session"
+	collidingID := interaction.InferenceID(futureSessionID)
+	recordedSession(
+		t, corpus, collidingID, spans[:1], spans[:1])
+	session := recordedSession(
+		t, corpus, "template-session", spans[:1], spans[:1])
+	session.ID = futureSessionID
+	if err := corpus.RecordInteraction(
+		ctx, session,
+	); !shoal.IsErrorCode(err, shoal.ErrorConflict) {
+		t.Fatalf("generated inference-node collision = %v", err)
+	}
+	if _, err := corpus.Interaction(
+		ctx, collidingID,
+	); err != nil {
+		t.Fatalf("existing interaction was damaged by collision: %v", err)
 	}
 }
 

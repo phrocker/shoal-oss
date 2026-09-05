@@ -184,6 +184,11 @@ func TestAuthorizedInteractionEnrichesTrustedActorDelegationAndReason(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
+	spoofedReason, err := interaction.NewReason(
+		"spoofed_reason", "caller-controlled explanation")
+	if err != nil {
+		t.Fatal(err)
+	}
 	session := interaction.Session{
 		ID:         "session-actor-context",
 		RecordedAt: f.clock.Now(),
@@ -192,6 +197,7 @@ func TestAuthorizedInteractionEnrichesTrustedActorDelegationAndReason(t *testing
 			SubjectID: "spoofed-subject",
 			ActorID:   "spoofed-actor",
 		},
+		Reason:                   spoofedReason,
 		SnapshotID:               shoal.ID(snapshot.ID),
 		SnapshotAsOf:             snapshot.AsOf,
 		AuthorizationFingerprint: shoal.ID(fingerprint.String()),
@@ -267,6 +273,7 @@ func TestAuthorizedInteractionRecorderRejectsWrongPin(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	snapshot, err := f.base.Snapshot(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -307,5 +314,88 @@ func TestAuthorizedInteractionRecorderRejectsWrongPin(t *testing.T) {
 		ctx, session.ID,
 	); !shoal.IsErrorCode(err, shoal.ErrorNotFound) {
 		t.Fatalf("rejected interaction was persisted: %v", err)
+	}
+}
+
+func TestAuthorizedTombstoneSubgraphDoesNotLeakExistence(t *testing.T) {
+	f := newFixture(t)
+	receipt, err := f.clientA.Ingest(f.admin(t), explorer.Source{
+		URI:       "file:///deleted-interaction.txt",
+		MediaType: explorer.MediaTypeText,
+		Content:   "deleted interaction evidence",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := f.base.Snapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.clock.Set(snapshot.AsOf.Add(time.Second))
+	decision := f.decision(
+		t,
+		"deletion-reader",
+		[][]byte{f.sourceA},
+		[][]byte{f.policyA},
+		[]auth.Operation{
+			auth.OperationRead,
+			auth.OperationRetrieve,
+			auth.OperationValidate,
+		},
+	)
+	ctx := f.context(t, decision)
+	view, err := f.clientA.Document(
+		ctx, receipt.Document.ID, receipt.Revision.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fingerprint, err := auth.AuthorizationFingerprint(decision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := interaction.Session{
+		ID:                       "session-deleted-authorized",
+		RecordedAt:               f.clock.Now(),
+		SnapshotID:               shoal.ID(snapshot.ID),
+		SnapshotAsOf:             snapshot.AsOf,
+		AuthorizationFingerprint: shoal.ID(fingerprint.String()),
+		AuthorizationExpiresAt:   decision.AuthenticationExpires(),
+		SeedNodeIDs:              []shoal.ID{firstSpanID(t, view)},
+	}
+	if err := f.clientA.RecordInteraction(ctx, session); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.base.DeleteInteraction(ctx, session.ID); err != nil {
+		t.Fatal(err)
+	}
+	subgraph, err := f.clientA.InteractionSubgraph(ctx, session.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(subgraph.Nodes) != 1 ||
+		subgraph.Nodes[0].Kind != interaction.KindTombstone {
+		t.Fatalf("authorized tombstone subgraph = %+v", subgraph)
+	}
+	if _, err := f.clientA.Interaction(
+		ctx, session.ID,
+	); !shoal.IsErrorCode(err, shoal.ErrorNotFound) {
+		t.Fatalf("typed deleted interaction read = %v", err)
+	}
+
+	bobDecision := f.decision(
+		t,
+		"other-reader",
+		[][]byte{f.sourceB},
+		[][]byte{f.policyB},
+		[]auth.Operation{
+			auth.OperationRead,
+			auth.OperationRetrieve,
+			auth.OperationValidate,
+		},
+	)
+	if _, err := f.clientB.InteractionSubgraph(
+		f.context(t, bobDecision), session.ID,
+	); !shoal.IsErrorCode(err, shoal.ErrorNotFound) {
+		t.Fatalf("unauthorized tombstone read leaked existence: %v", err)
 	}
 }

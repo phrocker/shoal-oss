@@ -91,8 +91,8 @@ func (c *Client) recordInteraction(
 		ClientID:   decision.ClientID(),
 		OnBehalfOf: decision.OnBehalfOf(),
 	}
-	if canonical.Reason == (interaction.Reason{}) &&
-		decision.AuditPurpose() != "" {
+	canonical.Reason = interaction.Reason{}
+	if decision.AuditPurpose() != "" {
 		canonical.Reason, err = interaction.NewReason(
 			"audit_purpose", decision.AuditPurpose())
 		if err != nil {
@@ -187,7 +187,8 @@ func (c *Client) Interaction(
 	}
 	session, err := reader.Interaction(ctx, sessionID)
 	if err != nil {
-		if shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
+		if shoal.IsErrorCode(err, shoal.ErrorUnavailable) ||
+			shoal.IsErrorCode(err, shoal.ErrorConflict) {
 			return interaction.Session{}, auth.ObjectNotFound()
 		}
 		return interaction.Session{}, directBaseError(err)
@@ -218,6 +219,33 @@ func (c *Client) InteractionSubgraph(
 	decision, guard, now, err := c.begin(ctx, auth.OperationRead)
 	if err != nil {
 		return explorer.Neighborhood{}, err
+	}
+	summaries, err := reader.Interactions(ctx)
+	if err != nil {
+		return explorer.Neighborhood{}, directBaseError(err)
+	}
+	var summary *explorer.InteractionSummary
+	for index := range summaries {
+		if summaries[index].SessionID == sessionID {
+			summary = &summaries[index]
+			break
+		}
+	}
+	if summary == nil {
+		return explorer.Neighborhood{}, auth.ObjectNotFound()
+	}
+	if summary.Deleted {
+		if !summaryFingerprintMatchesDecision(*summary, decision) {
+			return explorer.Neighborhood{}, auth.ObjectNotFound()
+		}
+		subgraph, readErr := reader.InteractionSubgraph(ctx, sessionID)
+		if readErr != nil {
+			return explorer.Neighborhood{}, directBaseError(readErr)
+		}
+		if err := guard.Check(ctx); err != nil {
+			return explorer.Neighborhood{}, err
+		}
+		return subgraph, nil
 	}
 	session, err := reader.Interaction(ctx, sessionID)
 	if err != nil {
