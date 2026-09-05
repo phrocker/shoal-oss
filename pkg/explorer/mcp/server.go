@@ -43,6 +43,10 @@ const ProtocolVersion = "2025-11-25"
 const (
 	defaultServerName    = "shoal"
 	defaultServerVersion = "1"
+	// DefaultContextBudgetBytes bounds the duplicate text rendering of a
+	// structured tool result. StructuredContent remains complete.
+	DefaultContextBudgetBytes = 1 << 20
+	maxContextBudgetBytes     = int(webapi.MaxResponseBytes)
 )
 
 // Implementation identifies an MCP client or server implementation.
@@ -76,10 +80,8 @@ func (f DecisionProviderFunc) Decision(ctx context.Context) (auth.Decision, erro
 	return f(ctx)
 }
 
-// OptionalToolProvider is the extension seam for optional MCP capabilities,
-// including native Go context compression. A provider is advertised only when
-// it is supplied at construction. Its name must stay distinct from Shoal's
-// provenance "fold" operation.
+// OptionalToolProvider is the extension seam for optional MCP capabilities. A
+// provider is advertised only when it is supplied at construction.
 //
 // Call receives the same freshly authorized context as built-in tools. The
 // returned value must encode as a JSON object so it can be carried as MCP
@@ -91,13 +93,19 @@ type OptionalToolProvider interface {
 
 // Config constructs one MCP stdio server.
 type Config struct {
-	Service          webapi.Service
-	Authority        *auth.Authority
-	Decisions        DecisionProvider
-	ServerInfo       Implementation
-	OptionalTools    []OptionalToolProvider
-	Instructions     string
-	requestIDFactory func() (shoal.ID, error)
+	Service       webapi.Service
+	Authority     *auth.Authority
+	Decisions     DecisionProvider
+	ServerInfo    Implementation
+	OptionalTools []OptionalToolProvider
+	Instructions  string
+	// ContextCompressor controls the compatibility text rendering of structured
+	// results. Nil selects NativeContextCompressor.
+	ContextCompressor ContextCompressor
+	// ContextBudgetBytes defaults to DefaultContextBudgetBytes and cannot exceed
+	// the web API's public response bound.
+	ContextBudgetBytes int
+	requestIDFactory   func() (shoal.ID, error)
 }
 
 type serverState uint8
@@ -111,15 +119,17 @@ const (
 // Server implements the initialization-handshake MCP lifecycle over
 // newline-delimited JSON-RPC.
 type Server struct {
-	binder       auth.Binder
-	decisions    DecisionProvider
-	serverInfo   Implementation
-	instructions string
-	requestID    func() (shoal.ID, error)
-	tools        []registeredTool
-	toolsByName  map[string]registeredTool
-	stateMu      sync.Mutex
-	state        serverState
+	binder        auth.Binder
+	decisions     DecisionProvider
+	serverInfo    Implementation
+	instructions  string
+	requestID     func() (shoal.ID, error)
+	compressor    ContextCompressor
+	contextBudget int
+	tools         []registeredTool
+	toolsByName   map[string]registeredTool
+	stateMu       sync.Mutex
+	state         serverState
 }
 
 type registeredTool struct {
@@ -143,7 +153,7 @@ func NewServer(config Config) (*Server, error) {
 		return nil, shoal.NewError(
 			shoal.ErrorInvalidArgument, "MCP decision provider is required")
 	}
-	serverInfo := config.ServerInfo
+	serverInfo := cloneImplementation(config.ServerInfo)
 	if serverInfo.Name == "" {
 		serverInfo.Name = defaultServerName
 	}
@@ -159,6 +169,21 @@ func NewServer(config Config) (*Server, error) {
 	if requestID == nil {
 		requestID = randomRequestID
 	}
+	compressor := config.ContextCompressor
+	if compressor == nil {
+		compressor = NativeContextCompressor{}
+	} else if isAbsent(compressor) {
+		return nil, shoal.NewError(
+			shoal.ErrorInvalidArgument, "MCP context compressor is required")
+	}
+	contextBudget := config.ContextBudgetBytes
+	if contextBudget == 0 {
+		contextBudget = DefaultContextBudgetBytes
+	}
+	if contextBudget < 0 || contextBudget > maxContextBudgetBytes {
+		return nil, shoal.NewError(
+			shoal.ErrorInvalidArgument, "MCP context budget is invalid")
+	}
 	tools, err := serviceTools(config.Service, config.OptionalTools)
 	if err != nil {
 		return nil, err
@@ -172,14 +197,25 @@ func NewServer(config Config) (*Server, error) {
 		instructions += " "
 	}
 	instructions += "Shoal tools are authorized independently for every call. " +
-		"Context compression is an optional native Go capability and is distinct " +
+		"Context compression is applied to large compatibility text results and is distinct " +
 		"from Shoal provenance fold. Tool-call recording is deferred in v1."
 	return &Server{
 		binder: config.Authority.Binder(), decisions: config.Decisions,
 		serverInfo:   serverInfo,
 		instructions: instructions, requestID: requestID,
+		compressor: compressor, contextBudget: contextBudget,
 		tools: tools, toolsByName: byName, state: stateAwaitInitialize,
 	}, nil
+}
+
+func cloneImplementation(value Implementation) Implementation {
+	cloned := value
+	cloned.Icons = append([]Icon(nil), value.Icons...)
+	for index := range cloned.Icons {
+		cloned.Icons[index].Sizes = append(
+			[]string(nil), value.Icons[index].Sizes...)
+	}
+	return cloned
 }
 
 // Serve processes newline-delimited JSON-RPC until input closes, the context is
@@ -188,7 +224,10 @@ func (s *Server) Serve(ctx context.Context, input io.Reader, output io.Writer) e
 	if s == nil {
 		return shoal.NewError(shoal.ErrorInvalidArgument, "MCP server is required")
 	}
-	if input == nil || output == nil {
+	if ctx == nil {
+		return shoal.NewError(shoal.ErrorInvalidArgument, "MCP context is required")
+	}
+	if isAbsent(input) || isAbsent(output) {
 		return shoal.NewError(
 			shoal.ErrorInvalidArgument, "MCP input and output are required")
 	}
@@ -203,10 +242,11 @@ func (s *Server) Serve(ctx context.Context, input io.Reader, output io.Writer) e
 		}
 		if err != nil {
 			if errors.Is(err, errMessageTooLarge) {
-				_ = codec.writeMessage(newErrorResponse(
+				writeErr := codec.writeMessage(newErrorResponse(
 					json.RawMessage("null"),
-					newError(codeParseError, "invalid JSON"),
+					newError(codeInvalidRequest, "message exceeds maximum size"),
 				))
+				return errors.Join(err, writeErr)
 			}
 			return err
 		}
@@ -370,7 +410,7 @@ func (s *Server) callTool(ctx context.Context, request Request) *Response {
 
 	bound, err := s.authorizedContext(ctx)
 	if err != nil {
-		response := newResponse(request.ID, toolErrorResult(err))
+		response := newResponse(request.ID, s.toolErrorResult(err))
 		return &response
 	}
 	tool, ok := s.toolsByName[params.Name]
@@ -385,12 +425,12 @@ func (s *Server) callTool(ctx context.Context, request Request) *Response {
 	}
 	value, err := tool.call(bound, arguments)
 	if err != nil {
-		response := newResponse(request.ID, toolErrorResult(err))
+		response := newResponse(request.ID, s.toolErrorResult(err))
 		return &response
 	}
-	result, err := toolSuccessResult(value)
+	result, err := s.toolSuccessResult(value)
 	if err != nil {
-		result = toolErrorResult(err)
+		result = s.toolErrorResult(err)
 	}
 	response := newResponse(request.ID, result)
 	return &response
@@ -519,6 +559,10 @@ func serviceTools(
 		definition := provider.Tool()
 		if err := validateTool(definition); err != nil {
 			return nil, err
+		}
+		if _, reserved := reservedServiceToolNames[definition.Name]; reserved {
+			return nil, shoal.NewError(
+				shoal.ErrorInvalidArgument, "reserved MCP tool name")
 		}
 		provider := provider
 		tools = append(tools, registeredTool{

@@ -63,6 +63,7 @@ func buildApplication(
 			"independently authenticate remote callers; a future HTTP transport " +
 			"is required for independently authenticated per-call remote callers. " +
 			"Tool-call recording is not implemented.",
+		ContextBudgetBytes: config.contextBudgetBytes,
 	})
 	if err != nil {
 		return nil, errors.Join(err, closeWorkspace())

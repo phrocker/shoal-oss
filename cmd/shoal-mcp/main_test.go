@@ -83,6 +83,7 @@ func TestParseCommandConfigFailsClosedAndSupportsEnvironment(t *testing.T) {
 		"SHOAL_MCP_IDENTITY_GENERATION":    "2",
 		"SHOAL_MCP_IDENTITY_LIFETIME":      "10m",
 		"SHOAL_MCP_IDENTITY_AUDIT_PURPOSE": "configured stdio identity",
+		"SHOAL_MCP_CONTEXT_BUDGET_BYTES":   "8192",
 	}
 	config, err := parseCommandConfig(
 		nil, io.Discard, func(name string) string { return environment[name] })
@@ -95,7 +96,8 @@ func TestParseCommandConfigFailsClosedAndSupportsEnvironment(t *testing.T) {
 	}
 	if config.identity.subject != "configured-subject" ||
 		config.identity.policyGeneration != 2 ||
-		config.identity.lifetime != 10*time.Minute {
+		config.identity.lifetime != 10*time.Minute ||
+		config.contextBudgetBytes != 8192 {
 		t.Fatalf("identity config = %+v", config.identity)
 	}
 
@@ -108,6 +110,19 @@ func TestParseCommandConfigFailsClosedAndSupportsEnvironment(t *testing.T) {
 	if _, err := parseCommandConfig(nil, io.Discard, invalidBool); err == nil ||
 		!strings.Contains(err.Error(), "must be a boolean") {
 		t.Fatalf("invalid environment boolean error = %v", err)
+	}
+	invalidBudget := func(name string) string {
+		if name == "SHOAL_MCP_DEV_AUTH" {
+			return "true"
+		}
+		if name == "SHOAL_MCP_CONTEXT_BUDGET_BYTES" {
+			return "0"
+		}
+		return ""
+	}
+	if _, err := parseCommandConfig(nil, io.Discard, invalidBudget); err == nil ||
+		!strings.Contains(err.Error(), "context budget") {
+		t.Fatalf("invalid context budget error = %v", err)
 	}
 }
 
@@ -340,6 +355,44 @@ func TestApplicationRejectsTypedNilAndPropagatesServeAndCloseErrors(t *testing.T
 		},
 	)
 	if !errors.Is(err, serveFailure) || !errors.Is(err, closeFailure) {
+		t.Fatalf("run error = %v", err)
+	}
+	if closed.Load() != 1 {
+		t.Fatalf("close calls = %d", closed.Load())
+	}
+}
+
+func TestRunClosesPartiallyBuiltApplication(t *testing.T) {
+	buildFailure := errors.New("build failed")
+	closeFailure := errors.New("close failed")
+	var closed atomic.Int32
+	err := runWith(
+		context.Background(),
+		[]string{"-dev-auth", "-state-dir", t.TempDir()},
+		strings.NewReader(""),
+		io.Discard,
+		io.Discard,
+		runtimeDependencies{
+			getenv: func(string) string { return "" },
+			build: func(
+				context.Context,
+				commandConfig,
+			) (*application, error) {
+				app, err := newApplication(
+					&fakeServer{},
+					func() error {
+						closed.Add(1)
+						return closeFailure
+					},
+				)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return app, buildFailure
+			},
+		},
+	)
+	if !errors.Is(err, buildFailure) || !errors.Is(err, closeFailure) {
 		t.Fatalf("run error = %v", err)
 	}
 	if closed.Load() != 1 {

@@ -167,8 +167,10 @@ Identity is supplied by trusted process configuration in stdio v1 and rebound
 with a fresh request ID for each tool call. All callers connected to one process
 therefore share that configured identity; independently authenticated remote
 callers require a future HTTP transport. Tool-call recording is not
-implemented. See [`docs/mcp-stdio.md`](docs/mcp-stdio.md) for configuration,
-storage policy, limitations, and a no-cluster smoke invocation.
+implemented. The structured result remains complete while duplicate text
+rendering is context-budgeted by the native compressor; this is not Shoal's
+provenance `fold`. See [`docs/mcp-stdio.md`](docs/mcp-stdio.md) for
+configuration, storage policy, limitations, and a no-cluster smoke invocation.
 
 ### Trees, graphs, and vectors are complementary
 

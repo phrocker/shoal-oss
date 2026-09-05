@@ -40,6 +40,18 @@ const (
 	ToolChanges      = "shoal.changes"
 )
 
+var reservedServiceToolNames = map[string]struct{}{
+	ToolDocuments:    {},
+	ToolDocument:     {},
+	ToolRetrieve:     {},
+	ToolNeighborhood: {},
+	ToolPath:         {},
+	ToolIngest:       {},
+	ToolExtract:      {},
+	ToolRecompute:    {},
+	ToolChanges:      {},
+}
+
 var (
 	documentsSchema = json.RawMessage(`{
 		"type":"object",
@@ -74,7 +86,7 @@ var (
 			"document_id":{"type":"string","description":"Base64url Shoal document ID"},
 			"revision_id":{"type":"string","description":"Optional base64url revision ID"}
 		},
-		"required":["snapshot","document_id"],
+		"required":["document_id"],
 		"additionalProperties":false,
 		"$defs":{
 			"snapshot":{
@@ -117,7 +129,7 @@ var (
 				"additionalProperties":false
 			}
 		},
-		"required":["snapshot","query"],
+		"required":["query"],
 		"additionalProperties":false,
 		"$defs":{
 			"snapshot":{
@@ -142,7 +154,7 @@ var (
 			"edge_types":{"type":"array","items":{"type":"string"},"maxItems":64},
 			"cursor":{"type":"string"}
 		},
-		"required":["snapshot","node_ids"],
+		"required":["node_ids"],
 		"additionalProperties":false,
 		"$defs":{
 			"snapshot":{
@@ -166,7 +178,7 @@ var (
 			"fanout":{"type":"integer","minimum":0,"maximum":50},
 			"edge_types":{"type":"array","items":{"type":"string"},"maxItems":64}
 		},
-		"required":["snapshot","from","to"],
+		"required":["from","to"],
 		"additionalProperties":false,
 		"$defs":{
 			"snapshot":{
@@ -209,7 +221,7 @@ var (
 			"revision_id":{"type":"string"},
 			"instructions":{"type":"string"}
 		},
-		"required":["snapshot","document_id"],
+		"required":["document_id"],
 		"additionalProperties":false,
 		"$defs":{
 			"snapshot":{
@@ -230,7 +242,7 @@ var (
 			"assertion_id":{"type":"string"},
 			"digest":{"type":"string"}
 		},
-		"required":["snapshot","assertion_id"],
+		"required":["assertion_id"],
 		"additionalProperties":false,
 		"$defs":{
 			"snapshot":{
@@ -435,7 +447,7 @@ func decodeToolArguments(
 	return nil
 }
 
-func toolSuccessResult(value any) (ToolResult, error) {
+func (s *Server) toolSuccessResult(value any) (ToolResult, error) {
 	encoded, err := json.Marshal(value)
 	if err != nil {
 		return ToolResult{}, shoal.NewError(
@@ -446,11 +458,11 @@ func toolSuccessResult(value any) (ToolResult, error) {
 		return ToolResult{}, shoal.NewError(
 			shoal.ErrorInternal, "tool result must be a JSON object")
 	}
-	return ToolResult{
-		Content:           []TextContent{{Type: "text", Text: string(encoded)}},
-		StructuredContent: append(json.RawMessage(nil), encoded...),
-		IsError:           false,
-	}, nil
+	if uint64(len(encoded)) > webapi.MaxResponseBytes {
+		return ToolResult{}, shoal.NewError(
+			shoal.ErrorUnavailable, "tool result exceeds the server bound")
+	}
+	return s.packToolResult(encoded)
 }
 
 type structuredToolFailure struct {
@@ -462,17 +474,105 @@ type toolFailure struct {
 	Message string `json:"message"`
 }
 
-func toolErrorResult(err error) ToolResult {
+func (s *Server) toolErrorResult(err error) ToolResult {
 	failure := publicToolFailure(err)
 	encoded, marshalErr := json.Marshal(structuredToolFailure{Error: failure})
 	if marshalErr != nil {
 		encoded = []byte(`{"error":{"code":"internal","message":"tool execution failed"}}`)
 	}
+	// Errors are never context-compressed. Their complete structured and text
+	// forms are required so budget pressure cannot turn failure into
+	// success-shaped or missing content.
 	return ToolResult{
 		Content:           []TextContent{{Type: "text", Text: string(encoded)}},
 		StructuredContent: append(json.RawMessage(nil), encoded...),
 		IsError:           true,
 	}
+}
+
+func (s *Server) packToolResult(encoded []byte) (ToolResult, error) {
+	if s == nil || isAbsent(s.compressor) || s.contextBudget < 0 {
+		return ToolResult{}, shoal.NewError(
+			shoal.ErrorInternal, "context compression is unavailable")
+	}
+	compressed, err := s.compressor.CompressContext(CompressionInput{
+		BudgetBytes: s.contextBudget,
+		Items: []CompressionItem{{
+			ID:       "tool-result",
+			Sequence: 1,
+			Content: ContextContent{
+				Type: ContextContentJSON,
+				Data: string(encoded),
+			},
+		}},
+	})
+	if err != nil {
+		return ToolResult{}, shoal.WrapError(
+			shoal.ErrorInternal, "compress tool result", err)
+	}
+	if err := validatePackedToolResult(compressed, encoded, s.contextBudget); err != nil {
+		return ToolResult{}, err
+	}
+	content := make([]TextContent, 0, 1)
+	if !compressed.Items[0].Omitted {
+		content = append(content, TextContent{
+			Type: "text",
+			Text: compressed.Items[0].Content.Data,
+		})
+	}
+	return ToolResult{
+		Content:           content,
+		StructuredContent: append(json.RawMessage(nil), encoded...),
+		IsError:           false,
+	}, nil
+}
+
+func validatePackedToolResult(
+	compressed CompressionOutput,
+	encoded []byte,
+	budget int,
+) error {
+	if len(compressed.Items) != 1 {
+		return shoal.NewError(
+			shoal.ErrorInternal, "context compressor returned an invalid result")
+	}
+	item := compressed.Items[0]
+	if item.ID != "tool-result" || item.Sequence != 1 ||
+		item.Required || item.IsError ||
+		len(item.Visibility) != 0 ||
+		len(item.RetrievedSourceIDs) != 0 ||
+		len(item.CitedSourceIDs) != 0 ||
+		len(compressed.Sources) != 0 ||
+		len(compressed.RetrievedSourceIDs) != 0 ||
+		len(compressed.CitedSourceIDs) != 0 ||
+		len(compressed.Visibility) != 0 {
+		return shoal.NewError(
+			shoal.ErrorInternal, "context compressor changed tool result semantics")
+	}
+	if compressed.BudgetBytes != budget ||
+		compressed.InputBytes != len(encoded) ||
+		compressed.WasCompressed != item.Omitted {
+		return shoal.NewError(
+			shoal.ErrorInternal, "context compressor returned invalid accounting")
+	}
+	if item.Omitted {
+		if item.Content.Type != "" || item.Content.Data != "" ||
+			compressed.OutputBytes != 0 ||
+			len(compressed.OmittedItemIDs) != 1 ||
+			compressed.OmittedItemIDs[0] != "tool-result" {
+			return shoal.NewError(
+				shoal.ErrorInternal, "context compressor returned invalid omitted content")
+		}
+		return nil
+	}
+	if item.Content.Type != ContextContentJSON ||
+		item.Content.Data != string(encoded) ||
+		compressed.OutputBytes != len(encoded) ||
+		len(compressed.OmittedItemIDs) != 0 {
+		return shoal.NewError(
+			shoal.ErrorInternal, "context compressor changed tool result content")
+	}
+	return nil
 }
 
 func publicToolFailure(err error) toolFailure {
@@ -526,9 +626,18 @@ func validateTool(tool Tool) error {
 			shoal.ErrorInvalidArgument, "optional MCP tool description is required")
 	}
 	var schema map[string]any
-	if err := json.Unmarshal(tool.InputSchema, &schema); err != nil || schema == nil {
+	if err := json.Unmarshal(tool.InputSchema, &schema); err != nil ||
+		schema == nil || schema["type"] != "object" {
 		return shoal.NewError(
 			shoal.ErrorInvalidArgument, "optional MCP tool input schema is invalid")
+	}
+	if len(tool.OutputSchema) != 0 {
+		var outputSchema map[string]any
+		if err := json.Unmarshal(tool.OutputSchema, &outputSchema); err != nil ||
+			outputSchema == nil || outputSchema["type"] != "object" {
+			return shoal.NewError(
+				shoal.ErrorInvalidArgument, "optional MCP tool output schema is invalid")
+		}
 	}
 	return nil
 }

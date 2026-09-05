@@ -20,12 +20,16 @@ package mcp
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"io"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/phrocker/shoal-oss/pkg/document"
+	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/explorer/webapi"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
@@ -207,6 +211,40 @@ func TestChangeToolRequiresServiceChangeProvider(t *testing.T) {
 	}
 }
 
+func TestChangeToolForwardsOnlyPublicationCursor(t *testing.T) {
+	var received webapi.ChangesRequest
+	server, _ := newTestServer(t, &changesService{
+		stubService: &stubService{},
+		changes: func(
+			_ context.Context,
+			request webapi.ChangesRequest,
+		) (webapi.ChangesResponse, error) {
+			received = request
+			return webapi.ChangesResponse{NextCursor: "next"}, nil
+		},
+	}, nil)
+	makeReady(t, server)
+
+	response := callToolRequest(
+		t, server, ToolChanges, `{"cursor":"sealed-publication-cursor","limit":7}`)
+	if response.Error != nil || decodeToolResult(t, response).IsError {
+		t.Fatalf("change call failed: %+v", response)
+	}
+	if received.Cursor != "sealed-publication-cursor" || received.Limit != 7 {
+		t.Fatalf("change request = %+v", received)
+	}
+	response = callToolRequest(
+		t, server, ToolChanges,
+		`{"cursor":"sealed-publication-cursor","frontier":"9"}`,
+	)
+	if response.Error != nil {
+		t.Fatalf("invalid arguments became a protocol error: %+v", response.Error)
+	}
+	if result := decodeToolResult(t, response); !result.IsError {
+		t.Fatalf("snapshot frontier was accepted as a change cursor: %+v", result)
+	}
+}
+
 func TestMandatoryToolsDispatchToServiceReadPaths(t *testing.T) {
 	called := make(map[string]int)
 	service := &stubService{
@@ -253,10 +291,10 @@ func TestMandatoryToolsDispatchToServiceReadPaths(t *testing.T) {
 		arguments string
 	}{
 		{ToolDocuments, `{}`},
-		{ToolDocument, `{"snapshot":{},"document_id":"ZG9j"}`},
-		{ToolRetrieve, `{"snapshot":{},"query":{"text":"query"}}`},
-		{ToolNeighborhood, `{"snapshot":{},"node_ids":["bm9kZQ"]}`},
-		{ToolPath, `{"snapshot":{},"from":"ZnJvbQ","to":"dG8"}`},
+		{ToolDocument, `{"document_id":"ZG9j"}`},
+		{ToolRetrieve, `{"query":{"text":"query"}}`},
+		{ToolNeighborhood, `{"node_ids":["bm9kZQ"]}`},
+		{ToolPath, `{"from":"ZnJvbQ","to":"dG8"}`},
 	}
 	for _, call := range calls {
 		response := callToolRequest(t, server, call.name, call.arguments)
@@ -437,6 +475,249 @@ func TestToolArgumentValidationIsStructured(t *testing.T) {
 	}
 }
 
+func TestToolResultCompressionRunsOnResponsePath(t *testing.T) {
+	compressor := &recordingCompressor{}
+	authority := auth.NewAuthority()
+	service := &stubService{
+		documents: func(
+			context.Context,
+			webapi.DocumentsRequest,
+		) (webapi.DocumentsResponse, error) {
+			return webapi.DocumentsResponse{
+				Snapshot: webapi.Snapshot{ID: strings.Repeat("s", 64)},
+			}, nil
+		},
+	}
+	server, err := NewServer(Config{
+		Service: service, Authority: authority,
+		Decisions: DecisionProviderFunc(func(context.Context) (auth.Decision, error) {
+			return testDecision(t), nil
+		}),
+		ContextCompressor:  compressor,
+		ContextBudgetBytes: 8,
+		requestIDFactory:   sequentialRequestIDs(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	makeReady(t, server)
+
+	response := callToolRequest(t, server, ToolDocuments, `{}`)
+	result := decodeToolResult(t, response)
+	if result.IsError {
+		t.Fatalf("compressed success became an error: %s", result.StructuredContent)
+	}
+	if len(result.Content) != 0 {
+		t.Fatalf("oversized compatibility mirror was not compressed: %+v", result.Content)
+	}
+	var structured webapi.DocumentsResponse
+	if err := json.Unmarshal(result.StructuredContent, &structured); err != nil {
+		t.Fatalf("decode structured result: %v", err)
+	}
+	if structured.Snapshot.ID != strings.Repeat("s", 64) {
+		t.Fatalf("structured result was changed: %+v", structured)
+	}
+	if len(compressor.inputs) != 1 ||
+		compressor.inputs[0].BudgetBytes != 8 ||
+		len(compressor.inputs[0].Items) != 1 ||
+		compressor.inputs[0].Items[0].IsError {
+		t.Fatalf("compression input = %+v", compressor.inputs)
+	}
+}
+
+func TestToolErrorsBypassCompressionAndPreserveErrorSemantics(t *testing.T) {
+	compressor := &recordingCompressor{}
+	authority := auth.NewAuthority()
+	server, err := NewServer(Config{
+		Service: &stubService{
+			documents: func(
+				context.Context,
+				webapi.DocumentsRequest,
+			) (webapi.DocumentsResponse, error) {
+				return webapi.DocumentsResponse{}, shoal.NewError(
+					shoal.ErrorNotFound, "not found")
+			},
+		},
+		Authority: authority,
+		Decisions: DecisionProviderFunc(func(context.Context) (auth.Decision, error) {
+			return testDecision(t), nil
+		}),
+		ContextCompressor:  compressor,
+		ContextBudgetBytes: 1,
+		requestIDFactory:   sequentialRequestIDs(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	makeReady(t, server)
+
+	result := decodeToolResult(t, callToolRequest(t, server, ToolDocuments, `{}`))
+	if !result.IsError || len(result.Content) != 1 {
+		t.Fatalf("tool error was compressed away: %+v", result)
+	}
+	if len(compressor.inputs) != 0 {
+		t.Fatalf("tool error was sent through compression: %+v", compressor.inputs)
+	}
+}
+
+func TestToolWireConversionsPreserveOpaqueIDsAndMetadata(t *testing.T) {
+	documentID := shoal.ID(string([]byte{0xff, 0x00, 'd'}))
+	revisionID := shoal.ID(string([]byte{0xfe, 0x00, 'r'}))
+	rootID := shoal.ID(string([]byte{0xfd, 0x00, 's'}))
+	metadataKey := string([]byte{0xfc, 0x00, 'k'})
+	metadataValue := string([]byte{0xfb, 0x00, 'v'})
+	var received shoal.ID
+	service := &stubService{
+		document: func(
+			_ context.Context,
+			request webapi.DocumentRequest,
+		) (webapi.DocumentResponse, error) {
+			received = request.DocumentID
+			return webapi.DocumentResponse{}, nil
+		},
+		documents: func(
+			context.Context,
+			webapi.DocumentsRequest,
+		) (webapi.DocumentsResponse, error) {
+			return webapi.DocumentsResponse{
+				Documents: []explorer.DocumentSummary{{
+					Document: document.Document{
+						ID: documentID, RevisionID: revisionID,
+						RootSectionID: rootID,
+						Metadata:      shoal.Metadata{metadataKey: metadataValue},
+					},
+					Revision: document.Revision{
+						ID: revisionID, DocumentID: documentID,
+					},
+				}},
+			}, nil
+		},
+	}
+	server, _ := newTestServer(t, service, nil)
+	makeReady(t, server)
+
+	encodedDocumentID := base64.RawURLEncoding.EncodeToString([]byte(documentID))
+	result := decodeToolResult(
+		t,
+		callToolRequest(
+			t, server, ToolDocument,
+			`{"snapshot":{},"document_id":"`+encodedDocumentID+`"}`,
+		),
+	)
+	if result.IsError || received != documentID {
+		t.Fatalf("opaque request ID = %q, result = %+v", received, result)
+	}
+
+	result = decodeToolResult(t, callToolRequest(t, server, ToolDocuments, `{}`))
+	var wire struct {
+		Documents []struct {
+			Document struct {
+				ID       string `json:"id"`
+				Metadata []struct {
+					Key   string `json:"key"`
+					Value string `json:"value"`
+				} `json:"metadata"`
+			} `json:"document"`
+		} `json:"documents"`
+	}
+	if err := json.Unmarshal(result.StructuredContent, &wire); err != nil {
+		t.Fatal(err)
+	}
+	if len(wire.Documents) != 1 ||
+		wire.Documents[0].Document.ID != encodedDocumentID ||
+		len(wire.Documents[0].Document.Metadata) != 1 ||
+		wire.Documents[0].Document.Metadata[0].Key !=
+			base64.RawURLEncoding.EncodeToString([]byte(metadataKey)) ||
+		wire.Documents[0].Document.Metadata[0].Value !=
+			base64.RawURLEncoding.EncodeToString([]byte(metadataValue)) {
+		t.Fatalf("opaque wire result = %+v", wire)
+	}
+}
+
+func TestServeRejectsNilContextAndTypedNilStreams(t *testing.T) {
+	server, _ := newTestServer(t, &stubService{}, nil)
+	if err := server.Serve(nil, strings.NewReader(""), io.Discard); err == nil {
+		t.Fatal("nil context was accepted")
+	}
+	var typedNilReader *bytes.Reader
+	if err := server.Serve(
+		context.Background(), typedNilReader, io.Discard,
+	); err == nil {
+		t.Fatal("typed-nil input was accepted")
+	}
+	var typedNilWriter *bytes.Buffer
+	if err := server.Serve(
+		context.Background(), strings.NewReader(""), typedNilWriter,
+	); err == nil {
+		t.Fatal("typed-nil output was accepted")
+	}
+}
+
+func TestServeRejectsOversizedInputWithProtocolError(t *testing.T) {
+	server, _ := newTestServer(t, &stubService{}, nil)
+	var output bytes.Buffer
+	err := server.Serve(
+		context.Background(),
+		strings.NewReader(strings.Repeat("x", maxMessageBytes+1)),
+		&output,
+	)
+	if !errors.Is(err, errMessageTooLarge) {
+		t.Fatalf("Serve error = %v", err)
+	}
+	lines := nonemptyLines(output.String())
+	if len(lines) != 1 {
+		t.Fatalf("oversize responses = %d: %q", len(lines), output.String())
+	}
+	var response Response
+	mustUnmarshal(t, lines[0], &response)
+	if response.Error == nil ||
+		response.Error.Code != codeInvalidRequest ||
+		response.Error.Message != "message exceeds maximum size" ||
+		string(response.ID) != "null" {
+		t.Fatalf("oversize response = %+v", response)
+	}
+}
+
+func TestNewServerRejectsInvalidExtensionConfiguration(t *testing.T) {
+	authority := auth.NewAuthority()
+	decisions := DecisionProviderFunc(func(context.Context) (auth.Decision, error) {
+		return testDecision(t), nil
+	})
+	invalidSchema := optionalProvider{tool: Tool{
+		Name: "invalid", Description: "invalid schema",
+		InputSchema: json.RawMessage(`{"type":"array"}`),
+	}}
+	if _, err := NewServer(Config{
+		Service: &stubService{}, Authority: authority, Decisions: decisions,
+		OptionalTools: []OptionalToolProvider{invalidSchema},
+	}); err == nil {
+		t.Fatal("non-object tool input schema was accepted")
+	}
+	spoofedChanges := optionalProvider{tool: Tool{
+		Name: ToolChanges, Description: "spoofed changes",
+		InputSchema: json.RawMessage(`{"type":"object"}`),
+	}}
+	if _, err := NewServer(Config{
+		Service: &stubService{}, Authority: authority, Decisions: decisions,
+		OptionalTools: []OptionalToolProvider{spoofedChanges},
+	}); err == nil {
+		t.Fatal("reserved change tool was accepted without ChangeProvider")
+	}
+	var typedNilCompressor *recordingCompressor
+	if _, err := NewServer(Config{
+		Service: &stubService{}, Authority: authority, Decisions: decisions,
+		ContextCompressor: typedNilCompressor,
+	}); err == nil {
+		t.Fatal("typed-nil context compressor was accepted")
+	}
+	if _, err := NewServer(Config{
+		Service: &stubService{}, Authority: authority, Decisions: decisions,
+		ContextBudgetBytes: maxContextBudgetBytes + 1,
+	}); err == nil {
+		t.Fatal("oversized context budget was accepted")
+	}
+}
+
 type stubService struct {
 	documents func(
 		context.Context,
@@ -512,12 +793,19 @@ func (s *stubService) Path(
 
 type changesService struct {
 	*stubService
+	changes func(
+		context.Context,
+		webapi.ChangesRequest,
+	) (webapi.ChangesResponse, error)
 }
 
-func (*changesService) Changes(
-	context.Context,
-	webapi.ChangesRequest,
+func (s *changesService) Changes(
+	ctx context.Context,
+	request webapi.ChangesRequest,
 ) (webapi.ChangesResponse, error) {
+	if s.changes != nil {
+		return s.changes(ctx, request)
+	}
 	return webapi.ChangesResponse{NextCursor: "next"}, nil
 }
 
@@ -536,6 +824,17 @@ func (optionalProvider) Call(
 	return struct {
 		Compressed bool `json:"compressed"`
 	}{Compressed: true}, nil
+}
+
+type recordingCompressor struct {
+	inputs []CompressionInput
+}
+
+func (c *recordingCompressor) CompressContext(
+	input CompressionInput,
+) (CompressionOutput, error) {
+	c.inputs = append(c.inputs, input)
+	return CompressContext(input)
 }
 
 func newTestServer(

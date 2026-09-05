@@ -48,7 +48,7 @@ const (
 // channel but not an unbounded one: without a cap, a malformed or hostile peer
 // can drive this process out of memory with one unterminated line. The limit
 // is deliberately generous relative to any real tool call.
-const maxMessageBytes = 8 << 20
+const maxMessageBytes = 16 << 20
 
 // Request is an inbound JSON-RPC 2.0 message. ID is kept as raw JSON because
 // the specification permits a string, a number, or null, and a response must
@@ -163,7 +163,11 @@ func (c *codec) readMessage() ([]byte, error) {
 		var line []byte
 		for {
 			chunk, err := c.reader.ReadSlice('\n')
-			if len(line)+len(chunk) > maxMessageBytes {
+			limit := maxMessageBytes
+			if err == nil && len(chunk) > 0 && chunk[len(chunk)-1] == '\n' {
+				limit++
+			}
+			if len(line)+len(chunk) > limit {
 				return nil, errMessageTooLarge
 			}
 			line = append(line, chunk...)

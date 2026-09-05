@@ -105,6 +105,8 @@ type ListToolsResult struct {
 }
 
 // TextContent is the backwards-compatible JSON rendering of structuredContent.
+// Large success payloads may omit this duplicate mirror after context
+// compression; StructuredContent remains the authoritative full result.
 type TextContent struct {
 	Type string `json:"type"`
 	Text string `json:"text"`

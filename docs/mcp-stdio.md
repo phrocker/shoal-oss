@@ -37,6 +37,7 @@ directories together.
 | `-state-dir` | `SHOAL_MCP_STATE_DIR` | Recommended state root containing `corpus/` and `policy/` |
 | `-data` | `SHOAL_MCP_DATA` | Corpus directory when `-state-dir` is unset; defaults to `.shoal/explorer` |
 | `-policy-dir` | `SHOAL_MCP_POLICY_DIR` | Explicit durable policy directory |
+| `-context-budget-bytes` | `SHOAL_MCP_CONTEXT_BUDGET_BYTES` | Compatibility-text context budget; defaults to 1 MiB |
 
 If an existing corpus contains documents but the selected policy catalog has
 no registrations, startup is refused. Restore the matching policy directory or
@@ -87,3 +88,10 @@ recomputation, and the authorized changes feed in addition to the read tools.
 
 Tool-call recording is not implemented. The server does not claim to record or
 persist MCP invocations.
+
+Successful tool results always carry the complete web API wire object in
+`structuredContent`. The server also runs the compatibility text mirror through
+the native context compressor with a 1 MiB budget. Results above that budget
+omit only the duplicate text block; they do not truncate structured data,
+source identities, citations, visibility, or errors. This context compression
+is separate from Shoal's provenance `fold`.

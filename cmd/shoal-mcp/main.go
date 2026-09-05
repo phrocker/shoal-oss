@@ -33,6 +33,9 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/phrocker/shoal-oss/pkg/explorer/mcp"
+	"github.com/phrocker/shoal-oss/pkg/explorer/webapi"
 )
 
 const (
@@ -41,9 +44,10 @@ const (
 )
 
 type commandConfig struct {
-	corpusDir string
-	policyDir string
-	identity  identityConfig
+	corpusDir          string
+	policyDir          string
+	contextBudgetBytes int
+	identity           identityConfig
 }
 
 type runtimeDependencies struct {
@@ -108,6 +112,9 @@ func runWith(
 	}
 	app, err := deps.build(ctx, config)
 	if err != nil {
+		if app != nil {
+			return errors.Join(err, app.Close())
+		}
 		return err
 	}
 	if app == nil {
@@ -273,6 +280,14 @@ func parseCommandConfig(
 		"identity-audit-purpose", getenv("SHOAL_MCP_IDENTITY_AUDIT_PURPOSE"),
 		"Optional trusted audit purpose (environment: SHOAL_MCP_IDENTITY_AUDIT_PURPOSE)",
 	)
+	contextBudget := flags.String(
+		"context-budget-bytes",
+		firstNonEmpty(
+			getenv("SHOAL_MCP_CONTEXT_BUDGET_BYTES"),
+			strconv.Itoa(mcp.DefaultContextBudgetBytes),
+		),
+		"Positive compatibility-text context budget in bytes (environment: SHOAL_MCP_CONTEXT_BUDGET_BYTES)",
+	)
 	if err := flags.Parse(args); err != nil {
 		return zero, err
 	}
@@ -289,6 +304,15 @@ func parseCommandConfig(
 	decisionLifetime, err := time.ParseDuration(strings.TrimSpace(*lifetime))
 	if err != nil || decisionLifetime <= 0 {
 		return zero, fmt.Errorf("identity lifetime must be a positive duration")
+	}
+	contextBudgetBytes, err := strconv.ParseUint(
+		strings.TrimSpace(*contextBudget), 10, 63)
+	if err != nil || contextBudgetBytes == 0 ||
+		contextBudgetBytes > webapi.MaxResponseBytes {
+		return zero, fmt.Errorf(
+			"context budget must be between 1 and %d bytes",
+			webapi.MaxResponseBytes,
+		)
 	}
 	identity, err := configureIdentity(identityOptions{
 		development:      *development,
@@ -311,9 +335,10 @@ func parseCommandConfig(
 		return zero, err
 	}
 	return commandConfig{
-		corpusDir: corpus,
-		policyDir: policy,
-		identity:  identity,
+		corpusDir:          corpus,
+		policyDir:          policy,
+		contextBudgetBytes: int(contextBudgetBytes),
+		identity:           identity,
 	}, nil
 }
 
