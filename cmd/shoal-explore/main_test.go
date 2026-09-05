@@ -261,7 +261,8 @@ func TestAskMarkdownEscapesOnceAndUsesCodeSpans(t *testing.T) {
 	const (
 		answer = "Résumé_budget -> <script>alert(\"x\")</script> & [link](javascript:alert(1)) *bold*\n" +
 			"# heading\n- item\n1. item\n> quote\nsafe + plus!\nordinary text\n===\nanother line\n--\n" +
-			"#hashtag\n---version\n-- -\n###### heading\n####### heading"
+			"#hashtag\n---version\n-- -\n###### heading\n####### heading\n" +
+			"    *space* <script>alert(2)</script>\n\t# tabbed & [link](javascript:alert(2))"
 		errorText = "budget_exhausted ->\n\n<img src=x onerror=alert(1)>"
 	)
 	response := askOutput{
@@ -311,10 +312,13 @@ func TestAskMarkdownEscapesOnceAndUsesCodeSpans(t *testing.T) {
 		t.Fatal(err)
 	}
 	rendered := output.String()
+	indent := strings.Repeat("\u00a0", 4)
 	for _, want := range []string{
 		"Résumé\\_budget -> \\<script>alert(\"x\")\\</script> \\& \\[link\\](javascript:alert(1)) \\*bold\\*",
 		"\\# heading\n\\- item\n1\\. item\n\\> quote\nsafe + plus!\nordinary text\n\\===\nanother line\n\\--\n" +
-			"#hashtag\n---version\n\\-- -\n\\###### heading\n####### heading",
+			"#hashtag\n---version\n\\-- -\n\\###### heading\n####### heading\n" +
+			indent + "\\*space\\* \\<script>alert(2)\\</script>\n" +
+			indent + "\\# tabbed \\& \\[link\\](javascript:alert(2))",
 		"- authorization: `role_admin -> tenant_日本`",
 		"- `subject` `predicate` `budget_exhausted -> <b>unsafe</b>` (confidence 0.5; evidence `evidence_α, evidence_[β]`)",
 		"- `unresolved`: `input_*_[x]` (`<script>alert(1)</script> budget_exhausted ->`)",

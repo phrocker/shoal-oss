@@ -1040,6 +1040,8 @@ func markdownProse(value any) string {
 		if i > 0 {
 			builder.WriteByte('\n')
 		}
+		indent, line := markdownVisibleIndent(line)
+		builder.WriteString(indent)
 		blockMarker := markdownBlockMarker(line)
 		for index, r := range line {
 			if index == blockMarker || strings.ContainsRune("\\`*_<&[]|", r) {
@@ -1049,6 +1051,26 @@ func markdownProse(value any) string {
 		}
 	}
 	return builder.String()
+}
+
+func markdownVisibleIndent(line string) (string, string) {
+	index := 0
+	columns := 0
+	for index < len(line) {
+		switch line[index] {
+		case ' ':
+			columns++
+		case '\t':
+			columns += 4 - columns%4
+		default:
+			if columns < 4 {
+				return "", line
+			}
+			return strings.Repeat("\u00a0", columns), line[index:]
+		}
+		index++
+	}
+	return "", line
 }
 
 func markdownBlockMarker(line string) int {
