@@ -4,6 +4,14 @@
 newline-delimited JSON-RPC MCP server on standard input and standard output.
 It does not require a live Accumulo cluster or any network service.
 
+This command implements the handshake-era MCP `2025-11-25` protocol: clients
+must send `initialize`, receive the server's negotiated version, and then send
+`notifications/initialized`. It supports no other protocol version. When a
+client proposes an unsupported version, the initialize response selects
+`2025-11-25`; a client that does not support that version must disconnect.
+The later sessionless `2026-07-28` protocol is intentionally not claimed and
+requires a separate future transport implementation.
+
 ```bash
 go run ./cmd/shoal-mcp \
   -state-dir .shoal/mcp \

@@ -24,7 +24,9 @@ import (
 	"errors"
 	"strings"
 
+	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/explorer/webapi"
+	"github.com/phrocker/shoal-oss/pkg/ontology"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
@@ -83,8 +85,8 @@ var (
 		"type":"object",
 		"properties":{
 			"snapshot":{"$ref":"#/$defs/snapshot"},
-			"document_id":{"type":"string","description":"Base64url Shoal document ID"},
-			"revision_id":{"type":"string","description":"Optional base64url revision ID"}
+			"document_id":{"type":"string","minLength":1,"maxLength":1366,"pattern":"^[A-Za-z0-9_-]+$","description":"Base64url Shoal document ID"},
+			"revision_id":{"type":"string","maxLength":1366,"pattern":"^[A-Za-z0-9_-]*$","description":"Optional base64url revision ID"}
 		},
 		"required":["document_id"],
 		"additionalProperties":false,
@@ -107,18 +109,17 @@ var (
 			"query":{
 				"type":"object",
 				"properties":{
-					"text":{"type":"string"},
+					"text":{"type":"string","maxLength":16384},
 					"top_k":{"type":"integer","minimum":0,"maximum":50},
 					"modes":{
 						"type":"array",
-						"items":{"enum":["lexical","vector","tree","graph"]},
-						"maxItems":4
+						"items":{"enum":["lexical","vector","tree","graph"]}
 					},
 					"scope":{
 						"type":"object",
 						"properties":{
-							"document_ids":{"type":"array","items":{"type":"string"}},
-							"node_ids":{"type":"array","items":{"type":"string"}}
+							"document_ids":{"type":"array","items":{"type":"string","minLength":1,"maxLength":1366,"pattern":"^[A-Za-z0-9_-]+$"}},
+							"node_ids":{"type":"array","items":{"type":"string","minLength":1,"maxLength":1366,"pattern":"^[A-Za-z0-9_-]+$"}}
 						},
 						"additionalProperties":false
 					},
@@ -147,11 +148,11 @@ var (
 		"type":"object",
 		"properties":{
 			"snapshot":{"$ref":"#/$defs/snapshot"},
-			"node_ids":{"type":"array","items":{"type":"string"},"minItems":1},
+			"node_ids":{"type":"array","items":{"type":"string","minLength":1,"maxLength":1366,"pattern":"^[A-Za-z0-9_-]+$"},"minItems":1},
 			"depth":{"type":"integer","minimum":0,"maximum":4},
 			"fanout":{"type":"integer","minimum":0,"maximum":50},
 			"max_nodes":{"type":"integer","minimum":0,"maximum":250},
-			"edge_types":{"type":"array","items":{"type":"string"},"maxItems":64},
+			"edge_types":{"type":"array","items":{"type":"string"}},
 			"cursor":{"type":"string"}
 		},
 		"required":["node_ids"],
@@ -172,11 +173,11 @@ var (
 		"type":"object",
 		"properties":{
 			"snapshot":{"$ref":"#/$defs/snapshot"},
-			"from":{"type":"string"},
-			"to":{"type":"string"},
+			"from":{"type":"string","minLength":1,"maxLength":1366,"pattern":"^[A-Za-z0-9_-]+$"},
+			"to":{"type":"string","minLength":1,"maxLength":1366,"pattern":"^[A-Za-z0-9_-]+$"},
 			"max_depth":{"type":"integer","minimum":0,"maximum":4},
 			"fanout":{"type":"integer","minimum":0,"maximum":50},
-			"edge_types":{"type":"array","items":{"type":"string"},"maxItems":64}
+			"edge_types":{"type":"array","items":{"type":"string"}}
 		},
 		"required":["from","to"],
 		"additionalProperties":false,
@@ -200,8 +201,8 @@ var (
 				"items":{
 					"type":"object",
 					"properties":{
-						"name":{"type":"string"},
-						"content":{"type":"string","contentEncoding":"base64"}
+						"name":{"type":"string","minLength":1,"maxLength":4096},
+						"content":{"type":"string","maxLength":1398104,"contentEncoding":"base64"}
 					},
 					"required":["name","content"],
 					"additionalProperties":false
@@ -217,9 +218,9 @@ var (
 		"type":"object",
 		"properties":{
 			"snapshot":{"$ref":"#/$defs/snapshot"},
-			"document_id":{"type":"string"},
-			"revision_id":{"type":"string"},
-			"instructions":{"type":"string"}
+			"document_id":{"type":"string","minLength":1,"maxLength":1366,"pattern":"^[A-Za-z0-9_-]+$"},
+			"revision_id":{"type":"string","maxLength":1366,"pattern":"^[A-Za-z0-9_-]*$"},
+			"instructions":{"type":"string","maxLength":65536}
 		},
 		"required":["document_id"],
 		"additionalProperties":false,
@@ -239,7 +240,7 @@ var (
 		"type":"object",
 		"properties":{
 			"snapshot":{"$ref":"#/$defs/snapshot"},
-			"assertion_id":{"type":"string"},
+			"assertion_id":{"type":"string","minLength":1,"maxLength":1366,"pattern":"^[A-Za-z0-9_-]+$"},
 			"digest":{"type":"string"}
 		},
 		"required":["assertion_id"],
@@ -283,6 +284,9 @@ func mandatoryServiceTools(service webapi.Service) []registeredTool {
 				if err := decodeToolArguments(raw, &request, ToolDocuments); err != nil {
 					return nil, err
 				}
+				if request.Page.Limit > webapi.MaxPageSize {
+					return nil, invalidToolArguments(ToolDocuments)
+				}
 				return service.Documents(ctx, request)
 			},
 		},
@@ -297,6 +301,16 @@ func mandatoryServiceTools(service webapi.Service) []registeredTool {
 				var request webapi.DocumentRequest
 				if err := decodeToolArguments(raw, &request, ToolDocument); err != nil {
 					return nil, err
+				}
+				if err := shoal.ValidateRequiredID(
+					"document ID", request.DocumentID,
+				); err != nil {
+					return nil, invalidToolArguments(ToolDocument)
+				}
+				if err := shoal.ValidateOptionalID(
+					"revision ID", request.RevisionID,
+				); err != nil {
+					return nil, invalidToolArguments(ToolDocument)
 				}
 				return service.Document(ctx, request)
 			},
@@ -313,6 +327,10 @@ func mandatoryServiceTools(service webapi.Service) []registeredTool {
 				if err := decodeToolArguments(raw, &request, ToolRetrieve); err != nil {
 					return nil, err
 				}
+				if _, err := request.Query.Normalize(); err != nil ||
+					request.Query.TopK > webapi.MaxTopK {
+					return nil, invalidToolArguments(ToolRetrieve)
+				}
 				return service.Retrieve(ctx, request)
 			},
 		},
@@ -328,6 +346,9 @@ func mandatoryServiceTools(service webapi.Service) []registeredTool {
 				if err := decodeToolArguments(raw, &request, ToolNeighborhood); err != nil {
 					return nil, err
 				}
+				if err := validateNeighborhoodArguments(request); err != nil {
+					return nil, invalidToolArguments(ToolNeighborhood)
+				}
 				return service.Neighborhood(ctx, request)
 			},
 		},
@@ -342,6 +363,9 @@ func mandatoryServiceTools(service webapi.Service) []registeredTool {
 				var request webapi.PathRequest
 				if err := decodeToolArguments(raw, &request, ToolPath); err != nil {
 					return nil, err
+				}
+				if err := validatePathArguments(request); err != nil {
+					return nil, invalidToolArguments(ToolPath)
 				}
 				return service.Path(ctx, request)
 			},
@@ -367,6 +391,9 @@ func optionalServiceTools(service webapi.Service) []registeredTool {
 				if err := decodeToolArguments(raw, &request, ToolIngest); err != nil {
 					return nil, err
 				}
+				if err := validateIngestArguments(request); err != nil {
+					return nil, invalidToolArguments(ToolIngest)
+				}
 				return provider.Ingest(ctx, request)
 			},
 		})
@@ -387,6 +414,20 @@ func optionalServiceTools(service webapi.Service) []registeredTool {
 				if err := decodeToolArguments(raw, &request, ToolExtract); err != nil {
 					return nil, err
 				}
+				if err := shoal.ValidateRequiredID(
+					"document ID", request.DocumentID,
+				); err != nil {
+					return nil, invalidToolArguments(ToolExtract)
+				}
+				if err := shoal.ValidateOptionalID(
+					"revision ID", request.RevisionID,
+				); err != nil {
+					return nil, invalidToolArguments(ToolExtract)
+				}
+				if uint64(len(request.Instructions)) >
+					uint64(ontology.DefaultExtractionLimits().MaxInstructionBytes) {
+					return nil, invalidToolArguments(ToolExtract)
+				}
 				return provider.Extract(ctx, request)
 			},
 		})
@@ -404,6 +445,11 @@ func optionalServiceTools(service webapi.Service) []registeredTool {
 				var request webapi.RecomputeDerivationRequest
 				if err := decodeToolArguments(raw, &request, ToolRecompute); err != nil {
 					return nil, err
+				}
+				if err := shoal.ValidateRequiredID(
+					"assertion ID", request.AssertionID,
+				); err != nil {
+					return nil, invalidToolArguments(ToolRecompute)
 				}
 				return provider.Recompute(ctx, request)
 			},
@@ -424,6 +470,9 @@ func optionalServiceTools(service webapi.Service) []registeredTool {
 				if err := decodeToolArguments(raw, &request, ToolChanges); err != nil {
 					return nil, err
 				}
+				if request.Limit > webapi.MaxChangePageSize {
+					return nil, invalidToolArguments(ToolChanges)
+				}
 				return provider.Changes(ctx, request)
 			},
 		})
@@ -443,6 +492,80 @@ func decodeToolArguments(
 	if err := strictDecode(raw, value); err != nil {
 		return shoal.NewError(
 			shoal.ErrorInvalidArgument, toolName+" arguments are invalid")
+	}
+	return nil
+}
+
+func invalidToolArguments(toolName string) error {
+	return shoal.NewError(
+		shoal.ErrorInvalidArgument, toolName+" arguments are invalid")
+}
+
+func validateNeighborhoodArguments(request webapi.NeighborhoodRequest) error {
+	normalized, err := (explorer.NeighborhoodRequest{
+		NodeIDs:   request.NodeIDs,
+		Depth:     request.Depth,
+		EdgeTypes: request.EdgeTypes,
+	}).Normalize()
+	if err != nil {
+		return err
+	}
+	if len(request.NodeIDs) == 0 ||
+		request.Depth > webapi.MaxDepth ||
+		request.Fanout > webapi.MaxFanout ||
+		request.MaxNodes > webapi.MaxNodes ||
+		uint32(len(normalized.EdgeTypes)) > webapi.MaxEdgeTypes {
+		return errors.New("invalid neighborhood bounds")
+	}
+	maxNodes := request.MaxNodes
+	if maxNodes == 0 {
+		maxNodes = webapi.DefaultMaxNodes
+	}
+	if uint32(len(normalized.NodeIDs)) > maxNodes {
+		return errors.New("too many neighborhood seeds")
+	}
+	return nil
+}
+
+func validatePathArguments(request webapi.PathRequest) error {
+	if err := shoal.ValidateRequiredID("path source ID", request.From); err != nil {
+		return err
+	}
+	if err := shoal.ValidateRequiredID("path target ID", request.To); err != nil {
+		return err
+	}
+	normalized, err := (explorer.NeighborhoodRequest{
+		NodeIDs:   []shoal.ID{request.From},
+		Depth:     request.MaxDepth,
+		EdgeTypes: request.EdgeTypes,
+	}).Normalize()
+	if err != nil {
+		return err
+	}
+	if request.MaxDepth > webapi.MaxDepth ||
+		request.Fanout > webapi.MaxFanout ||
+		uint32(len(normalized.EdgeTypes)) > webapi.MaxEdgeTypes {
+		return errors.New("invalid path bounds")
+	}
+	return nil
+}
+
+func validateIngestArguments(request webapi.IngestRequest) error {
+	if len(request.Files) == 0 ||
+		uint32(len(request.Files)) > webapi.MaxUploadFiles {
+		return errors.New("invalid upload file count")
+	}
+	var total uint64
+	for _, file := range request.Files {
+		size := uint64(len(file.Content))
+		if strings.TrimSpace(file.Name) == "" ||
+			size > webapi.MaxUploadFileBytes {
+			return errors.New("invalid upload file")
+		}
+		total += size
+		if total > webapi.MaxUploadTotalBytes {
+			return errors.New("upload exceeds total bound")
+		}
 	}
 	return nil
 }

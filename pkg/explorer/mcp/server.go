@@ -351,10 +351,7 @@ func (s *Server) initialize(request Request) *Response {
 			request.ID, newError(codeInvalidParams, "invalid initialize params"))
 		return &response
 	}
-	negotiated := ProtocolVersion
-	if params.ProtocolVersion == ProtocolVersion {
-		negotiated = params.ProtocolVersion
-	}
+	negotiated := negotiateProtocolVersion(params.ProtocolVersion)
 	s.state = stateAwaitInitialized
 	response := newResponse(request.ID, InitializeResult{
 		ProtocolVersion: negotiated,
@@ -365,6 +362,13 @@ func (s *Server) initialize(request Request) *Response {
 		Instructions: s.instructions,
 	})
 	return &response
+}
+
+func negotiateProtocolVersion(requested string) string {
+	if requested == ProtocolVersion {
+		return requested
+	}
+	return ProtocolVersion
 }
 
 func (s *Server) handleNotification(request Request) {

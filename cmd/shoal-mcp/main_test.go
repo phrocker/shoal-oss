@@ -271,8 +271,10 @@ func TestProcessIdentityIsBoundFreshForEveryToolCall(t *testing.T) {
 		t.Fatalf("tool calls shared request ID %q", service.requestIDs[0])
 	}
 	for _, requestID := range service.requestIDs {
-		if !strings.HasPrefix(string(requestID), "mcp-") ||
-			requestID == processTemplateRequestID {
+		if err := shoal.ValidateRequiredID("tool call request ID", requestID); err != nil {
+			t.Fatalf("invalid tool call request ID %q: %v", requestID, err)
+		}
+		if requestID == processTemplateRequestID {
 			t.Fatalf("tool call request ID = %q", requestID)
 		}
 	}
@@ -359,6 +361,37 @@ func TestApplicationRejectsTypedNilAndPropagatesServeAndCloseErrors(t *testing.T
 	}
 	if closed.Load() != 1 {
 		t.Fatalf("close calls = %d", closed.Load())
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("startup failure wrote stdout: %q", stdout.String())
+	}
+}
+
+func TestStartupFailureKeepsStdoutPure(t *testing.T) {
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	startupFailure := errors.New("startup failed")
+	err := runWith(
+		context.Background(),
+		[]string{"-dev-auth", "-state-dir", t.TempDir()},
+		strings.NewReader(""),
+		&stdout,
+		&stderr,
+		runtimeDependencies{
+			getenv: func(string) string { return "" },
+			build: func(
+				context.Context,
+				commandConfig,
+			) (*application, error) {
+				return nil, startupFailure
+			},
+		},
+	)
+	if !errors.Is(err, startupFailure) {
+		t.Fatalf("startup error = %v", err)
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("startup failure wrote stdout: %q", stdout.String())
 	}
 }
 

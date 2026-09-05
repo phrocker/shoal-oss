@@ -32,6 +32,7 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/explorer/webapi"
+	"github.com/phrocker/shoal-oss/pkg/retrieval"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
@@ -87,6 +88,64 @@ func TestServeNegotiatesVersionAndEnforcesInitializationOrdering(t *testing.T) {
 	if after.Error != nil {
 		t.Fatalf("post-initialization tools/list error = %+v", after.Error)
 	}
+}
+
+func TestInitializeNegotiatesOnlySupportedHandshakeVersion(t *testing.T) {
+	if ProtocolVersion != "2025-11-25" {
+		t.Fatalf("protocol version = %q", ProtocolVersion)
+	}
+	for _, requested := range []string{
+		ProtocolVersion,
+		"2024-11-05",
+		"2026-07-28",
+		"2099-01-01",
+	} {
+		server, _ := newTestServer(t, &stubService{}, nil)
+		response := server.handle(context.Background(), Request{
+			JSONRPC: jsonRPCVersion,
+			ID:      json.RawMessage("1"),
+			Method:  "initialize",
+			Params: json.RawMessage(
+				`{"protocolVersion":"` + requested +
+					`","capabilities":{},"clientInfo":{"name":"test","version":"1"}}`,
+			),
+		})
+		if response == nil || response.Error != nil {
+			t.Fatalf("initialize(%q) = %+v", requested, response)
+		}
+		var result InitializeResult
+		mustUnmarshal(t, string(response.Result), &result)
+		if result.ProtocolVersion != ProtocolVersion {
+			t.Fatalf(
+				"initialize(%q) negotiated %q, want %q",
+				requested, result.ProtocolVersion, ProtocolVersion,
+			)
+		}
+	}
+}
+
+func TestInvalidInitializeDoesNotAdvanceState(t *testing.T) {
+	server, _ := newTestServer(t, &stubService{}, nil)
+	invalid := server.handle(context.Background(), Request{
+		JSONRPC: jsonRPCVersion,
+		ID:      json.RawMessage("1"),
+		Method:  "initialize",
+		Params:  json.RawMessage(`{"protocolVersion":"2025-11-25"}`),
+	})
+	if invalid == nil || invalid.Error == nil ||
+		invalid.Error.Code != codeInvalidParams {
+		t.Fatalf("invalid initialize = %+v", invalid)
+	}
+	before := server.handle(context.Background(), Request{
+		JSONRPC: jsonRPCVersion,
+		ID:      json.RawMessage("2"),
+		Method:  "tools/list",
+	})
+	if before == nil || before.Error == nil ||
+		before.Error.Code != codeInvalidRequest {
+		t.Fatalf("state advanced after invalid initialize: %+v", before)
+	}
+	makeReady(t, server)
 }
 
 func TestInitializedNotificationIsSilentAndCannotRunEarly(t *testing.T) {
@@ -445,6 +504,10 @@ func TestEveryToolCallBindsFreshDecisionAndRequestID(t *testing.T) {
 			if decision.Subject() != "subject" || decision.Actor() != "actor" {
 				t.Fatalf("bound identity = %q/%q", decision.Subject(), decision.Actor())
 			}
+			if decision.PolicyGeneration() != 1 {
+				t.Fatalf(
+					"bound policy generation = %d", decision.PolicyGeneration())
+			}
 			return webapi.DocumentsResponse{}, nil
 		},
 	}
@@ -512,6 +575,177 @@ func TestToolArgumentValidationIsStructured(t *testing.T) {
 	}
 }
 
+func TestUnknownWrongAndOversizedToolArgumentsDoNotInvokeService(t *testing.T) {
+	calls := make(map[string]int)
+	base := &stubService{
+		documents: func(
+			context.Context,
+			webapi.DocumentsRequest,
+		) (webapi.DocumentsResponse, error) {
+			calls[ToolDocuments]++
+			return webapi.DocumentsResponse{}, nil
+		},
+		document: func(
+			context.Context,
+			webapi.DocumentRequest,
+		) (webapi.DocumentResponse, error) {
+			calls[ToolDocument]++
+			return webapi.DocumentResponse{}, nil
+		},
+		retrieve: func(
+			context.Context,
+			webapi.RetrievalRequest,
+		) (webapi.RetrievalResponse, error) {
+			calls[ToolRetrieve]++
+			return webapi.RetrievalResponse{}, nil
+		},
+		neighborhood: func(
+			context.Context,
+			webapi.NeighborhoodRequest,
+		) (webapi.NeighborhoodResponse, error) {
+			calls[ToolNeighborhood]++
+			return webapi.NeighborhoodResponse{}, nil
+		},
+		path: func(
+			context.Context,
+			webapi.PathRequest,
+		) (webapi.PathResponse, error) {
+			calls[ToolPath]++
+			return webapi.PathResponse{}, nil
+		},
+	}
+	service := &allOptionalService{stubService: base, calls: calls}
+	server, _ := newTestServer(t, service, nil)
+	makeReady(t, server)
+
+	unknown := callToolRequest(t, server, "shoal.unknown", `{}`)
+	if unknown.Error == nil || unknown.Error.Code != codeInvalidParams {
+		t.Fatalf("unknown tool response = %+v", unknown)
+	}
+	wrongShape := server.handle(context.Background(), Request{
+		JSONRPC: jsonRPCVersion,
+		ID:      json.RawMessage("9"),
+		Method:  "tools/call",
+		Params: json.RawMessage(
+			`{"name":"shoal.documents","arguments":[]}`,
+		),
+	})
+	if wrongShape == nil || wrongShape.Error == nil ||
+		wrongShape.Error.Code != codeInvalidParams {
+		t.Fatalf("wrong argument shape response = %+v", wrongShape)
+	}
+
+	oversizedID := base64.RawURLEncoding.EncodeToString(
+		[]byte(strings.Repeat("x", shoal.MaxIDBytes+1)))
+	largeContent := base64.StdEncoding.EncodeToString(
+		[]byte(strings.Repeat("x", int(webapi.MaxUploadFileBytes)+1)))
+	cases := []struct {
+		name      string
+		arguments string
+	}{
+		{ToolDocuments, `{"page":{"limit":101}}`},
+		{ToolDocument, `{"document_id":"` + oversizedID + `"}`},
+		{ToolRetrieve, `{"query":{"text":"query","top_k":51}}`},
+		{ToolNeighborhood, `{"node_ids":["bm9kZQ"],"max_nodes":251}`},
+		{ToolPath, `{"from":"ZnJvbQ","to":"dG8","fanout":51}`},
+		{ToolIngest, `{"files":[{"name":"large.txt","content":"` + largeContent + `"}]}`},
+		{ToolExtract, `{"document_id":"` + oversizedID + `"}`},
+		{ToolRecompute, `{"assertion_id":"` + oversizedID + `"}`},
+		{ToolChanges, `{"limit":101}`},
+	}
+	for _, test := range cases {
+		response := callToolRequest(t, server, test.name, test.arguments)
+		if response.Error != nil {
+			t.Fatalf("%s validation became protocol error: %+v", test.name, response.Error)
+		}
+		if result := decodeToolResult(t, response); !result.IsError {
+			t.Fatalf("%s oversized arguments were accepted: %+v", test.name, result)
+		}
+	}
+	for name, count := range calls {
+		if count != 0 {
+			t.Fatalf("%s service calls = %d, want 0", name, count)
+		}
+	}
+}
+
+func TestAuthorizationFailuresDoNotInvokeService(t *testing.T) {
+	tests := []struct {
+		name      string
+		decisions DecisionProvider
+		requestID func() (shoal.ID, error)
+		wantCode  shoal.ErrorCode
+	}{
+		{
+			name: "provider failure",
+			decisions: DecisionProviderFunc(func(context.Context) (auth.Decision, error) {
+				return auth.Decision{}, errors.New("private identity detail")
+			}),
+			wantCode: shoal.ErrorUnauthorized,
+		},
+		{
+			name: "expired decision",
+			decisions: DecisionProviderFunc(func(context.Context) (auth.Decision, error) {
+				return decisionWithExpiry(t, time.Now().Add(-time.Minute)), nil
+			}),
+			wantCode: shoal.ErrorUnauthorized,
+		},
+		{
+			name: "request ID failure",
+			decisions: DecisionProviderFunc(func(context.Context) (auth.Decision, error) {
+				return testDecision(t), nil
+			}),
+			requestID: func() (shoal.ID, error) {
+				return "", errors.New("entropy unavailable")
+			},
+			wantCode: shoal.ErrorUnavailable,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			serviceCalls := 0
+			server, err := NewServer(Config{
+				Service: &stubService{
+					documents: func(
+						context.Context,
+						webapi.DocumentsRequest,
+					) (webapi.DocumentsResponse, error) {
+						serviceCalls++
+						return webapi.DocumentsResponse{}, nil
+					},
+				},
+				Authority:        auth.NewAuthority(),
+				Decisions:        test.decisions,
+				requestIDFactory: test.requestID,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			makeReady(t, server)
+			result := decodeToolResult(
+				t, callToolRequest(t, server, ToolDocuments, `{}`))
+			if !result.IsError {
+				t.Fatalf("authorization failure succeeded: %+v", result)
+			}
+			var failure structuredToolFailure
+			mustUnmarshal(t, string(result.StructuredContent), &failure)
+			if failure.Error.Code != string(test.wantCode) {
+				t.Fatalf("failure = %+v, want %q", failure, test.wantCode)
+			}
+			if strings.Contains(
+				string(result.StructuredContent), "private identity detail",
+			) || strings.Contains(
+				string(result.StructuredContent), "entropy unavailable",
+			) {
+				t.Fatalf("private error leaked: %s", result.StructuredContent)
+			}
+			if serviceCalls != 0 {
+				t.Fatalf("service calls = %d, want 0", serviceCalls)
+			}
+		})
+	}
+}
+
 func TestToolResultCompressionRunsOnResponsePath(t *testing.T) {
 	compressor := &recordingCompressor{}
 	authority := auth.NewAuthority()
@@ -559,6 +793,73 @@ func TestToolResultCompressionRunsOnResponsePath(t *testing.T) {
 		len(compressor.inputs[0].Items) != 1 ||
 		compressor.inputs[0].Items[0].IsError {
 		t.Fatalf("compression input = %+v", compressor.inputs)
+	}
+}
+
+func TestCompressedRetrievalPreservesCitationsAndOpaqueIDs(t *testing.T) {
+	resultID := shoal.ID(string([]byte{0xff, 0x00, 'r'}))
+	documentID := shoal.ID(string([]byte{0xfe, 0x00, 'd'}))
+	revisionID := shoal.ID(string([]byte{0xfd, 0x00, 'v'}))
+	sectionID := shoal.ID(string([]byte{0xfc, 0x00, 's'}))
+	service := &stubService{
+		retrieve: func(
+			context.Context,
+			webapi.RetrievalRequest,
+		) (webapi.RetrievalResponse, error) {
+			return webapi.RetrievalResponse{
+				Retrieval: retrieval.Response{
+					RequestID: "retrieval-request",
+					Results: []retrieval.Result{{
+						ID: resultID,
+						Evidence: []retrieval.Evidence{{
+							Citation: document.Citation{
+								DocumentID: documentID,
+								RevisionID: revisionID,
+								SectionID:  sectionID,
+							},
+						}},
+					}},
+				},
+			}, nil
+		},
+	}
+	authority := auth.NewAuthority()
+	server, err := NewServer(Config{
+		Service: service, Authority: authority,
+		Decisions: DecisionProviderFunc(func(context.Context) (auth.Decision, error) {
+			return testDecision(t), nil
+		}),
+		ContextBudgetBytes: 8,
+		requestIDFactory:   sequentialRequestIDs(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	makeReady(t, server)
+
+	result := decodeToolResult(
+		t,
+		callToolRequest(
+			t, server, ToolRetrieve, `{"query":{"text":"query"}}`,
+		),
+	)
+	if result.IsError || len(result.Content) != 0 {
+		t.Fatalf("compressed retrieval = %+v", result)
+	}
+	var decoded webapi.RetrievalResponse
+	if err := json.Unmarshal(result.StructuredContent, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if len(decoded.Retrieval.Results) != 1 ||
+		decoded.Retrieval.Results[0].ID != resultID ||
+		len(decoded.Retrieval.Results[0].Evidence) != 1 {
+		t.Fatalf("retrieval provenance was changed: %+v", decoded.Retrieval)
+	}
+	citation := decoded.Retrieval.Results[0].Evidence[0].Citation
+	if citation.DocumentID != documentID ||
+		citation.RevisionID != revisionID ||
+		citation.SectionID != sectionID {
+		t.Fatalf("citation IDs were changed: %+v", citation)
 	}
 }
 
@@ -846,6 +1147,43 @@ func (s *changesService) Changes(
 	return webapi.ChangesResponse{NextCursor: "next"}, nil
 }
 
+type allOptionalService struct {
+	*stubService
+	calls map[string]int
+}
+
+func (s *allOptionalService) Ingest(
+	context.Context,
+	webapi.IngestRequest,
+) (webapi.IngestResponse, error) {
+	s.calls[ToolIngest]++
+	return webapi.IngestResponse{}, nil
+}
+
+func (s *allOptionalService) Extract(
+	context.Context,
+	webapi.ExtractRequest,
+) (webapi.ExtractResponse, error) {
+	s.calls[ToolExtract]++
+	return webapi.ExtractResponse{}, nil
+}
+
+func (s *allOptionalService) Recompute(
+	context.Context,
+	webapi.RecomputeDerivationRequest,
+) (webapi.RecomputeDerivationResponse, error) {
+	s.calls[ToolRecompute]++
+	return webapi.RecomputeDerivationResponse{}, nil
+}
+
+func (s *allOptionalService) Changes(
+	context.Context,
+	webapi.ChangesRequest,
+) (webapi.ChangesResponse, error) {
+	s.calls[ToolChanges]++
+	return webapi.ChangesResponse{}, nil
+}
+
 type optionalProvider struct {
 	tool Tool
 }
@@ -897,6 +1235,11 @@ func newTestServer(
 
 func testDecision(t *testing.T) auth.Decision {
 	t.Helper()
+	return decisionWithExpiry(t, time.Now().Add(time.Hour))
+}
+
+func decisionWithExpiry(t *testing.T, expires time.Time) auth.Decision {
+	t.Helper()
 	decision, err := auth.NewDecision(auth.DecisionConfig{
 		Subject: "subject", Actor: "actor",
 		AuthorizationDomain: []byte("domain"),
@@ -912,7 +1255,7 @@ func testDecision(t *testing.T) auth.Decision {
 		PermittedSourceIDs:    [][]byte{[]byte("source")},
 		PermittedPolicyIDs:    [][]byte{[]byte("policy")},
 		PolicyGeneration:      1,
-		AuthenticationExpires: time.Now().Add(time.Hour),
+		AuthenticationExpires: expires,
 		RequestID:             "template-request",
 	})
 	if err != nil {
