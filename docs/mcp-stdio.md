@@ -13,7 +13,9 @@ go run ./cmd/shoal-mcp \
 An MCP client should launch the command as a subprocess and exchange one
 JSON-RPC message per line. Standard output is reserved exclusively for protocol
 messages. Flag help, startup failures, storage failures, and other diagnostics
-are written to standard error.
+are written to standard error. A single inbound JSON-RPC message is limited to
+16 MiB and is rejected whole if it exceeds that bound; messages are never
+truncated and interpreted as partial requests.
 
 This shell smoke test performs the MCP initialization handshake and lists the
 tools against a local embedded workspace:
