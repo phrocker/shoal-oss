@@ -111,13 +111,19 @@ func (c *Client) recordInteraction(
 	if err := guard.Check(ctx); err != nil {
 		return interaction.Session{}, err
 	}
-	if err := writer.RecordInteraction(ctx, canonical); err != nil {
+	persisted := canonical
+	if resultWriter, ok := writer.(interaction.ResultSink); ok {
+		persisted, err = resultWriter.RecordInteractionResult(ctx, canonical)
+	} else {
+		err = writer.RecordInteraction(ctx, canonical)
+	}
+	if err != nil {
 		return interaction.Session{}, directBaseError(err)
 	}
 	if err := guard.Check(ctx); err != nil {
 		return interaction.Session{}, err
 	}
-	return canonical, nil
+	return persisted, nil
 }
 
 // Interactions lists only derived records whose complete current source set
