@@ -377,24 +377,5 @@ func requireSourceNodeID(id shoal.ID) error {
 // a caller cannot use the field to smuggle prompt or answer text, or a
 // model-chosen correlation string, into a node payload.
 func validateSummaryDigest(digest string) error {
-	if digest == "" {
-		return nil
-	}
-	if len(digest) != 64 {
-		return shoal.NewError(
-			shoal.ErrorInvalidArgument,
-			"fold summary digest must be a SHA-256 digest in lowercase hex",
-		)
-	}
-	for i := 0; i < len(digest); i++ {
-		c := digest[i]
-		if (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') {
-			continue
-		}
-		return shoal.NewError(
-			shoal.ErrorInvalidArgument,
-			"fold summary digest must be a SHA-256 digest in lowercase hex",
-		)
-	}
-	return nil
+	return validateDigest("fold summary digest", digest, true)
 }

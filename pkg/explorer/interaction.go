@@ -40,6 +40,9 @@ type InteractionSummary struct {
 	AuthorizationFingerprint shoal.ID
 	AuthorizationExpiresAt   time.Time
 	EmbeddingSpaceID         shoal.ID
+	Operation                interaction.Operation
+	Actor                    interaction.ActorContext
+	Reason                   interaction.Reason
 	Visibility               string
 	NodeCount                int
 	EdgeCount                int
@@ -55,6 +58,9 @@ type persistedInteraction struct {
 	AuthorizationFingerprint shoal.ID
 	AuthorizationExpiresAt   time.Time
 	EmbeddingSpaceID         shoal.ID
+	Operation                interaction.Operation
+	Actor                    interaction.ActorContext
+	Reason                   interaction.Reason
 	Nodes                    []graph.Node
 	Edges                    []graph.Edge
 	Visibility               string
@@ -180,6 +186,9 @@ func (e *Explorer) RecordInteraction(
 		AuthorizationFingerprint: session.AuthorizationFingerprint,
 		AuthorizationExpiresAt:   session.AuthorizationExpiresAt,
 		EmbeddingSpaceID:         session.EmbeddingSpaceID,
+		Operation:                session.Operation,
+		Actor:                    session.Actor,
+		Reason:                   session.Reason,
 		Nodes:                    subgraph.Nodes,
 		Edges:                    subgraph.Edges,
 		Visibility:               interaction.Expression(subgraph.Visibility),
@@ -260,6 +269,9 @@ func (e *Explorer) DeleteInteraction(
 		AuthorizationFingerprint: existing.AuthorizationFingerprint,
 		AuthorizationExpiresAt:   existing.AuthorizationExpiresAt,
 		EmbeddingSpaceID:         existing.EmbeddingSpaceID,
+		Operation:                existing.Operation,
+		Actor:                    existing.Actor,
+		Reason:                   existing.Reason,
 		Nodes:                    []graph.Node{node},
 		Visibility:               existing.Visibility,
 		RecordedAt:               existing.RecordedAt,
@@ -315,6 +327,9 @@ func (e *Explorer) Interactions(ctx context.Context) ([]InteractionSummary, erro
 			AuthorizationFingerprint: record.AuthorizationFingerprint,
 			AuthorizationExpiresAt:   record.AuthorizationExpiresAt,
 			EmbeddingSpaceID:         record.EmbeddingSpaceID,
+			Operation:                record.Operation,
+			Actor:                    cloneActorContext(record.Actor),
+			Reason:                   record.Reason,
 			Visibility:               record.Visibility,
 			NodeCount:                len(record.Nodes),
 			EdgeCount:                len(record.Edges),
@@ -621,6 +636,17 @@ func validatePersistedInteraction(record persistedInteraction) error {
 		return shoal.NewError(
 			shoal.ErrorInternal, "stored interaction time is missing")
 	}
+	if record.Operation != "" {
+		if err := record.Operation.Validate(); err != nil {
+			return err
+		}
+	}
+	if err := record.Actor.Validate(); err != nil {
+		return err
+	}
+	if err := record.Reason.Validate(); err != nil {
+		return err
+	}
 	if _, err := interaction.ParseVisibility(record.Visibility); err != nil {
 		return err
 	}
@@ -649,6 +675,18 @@ func validatePersistedInteraction(record persistedInteraction) error {
 			return shoal.NewError(
 				shoal.ErrorInternal,
 				"stored interaction execution pins do not match its envelope",
+			)
+		}
+		if record.Session.Operation != record.Operation ||
+			record.Session.Actor.SubjectID != record.Actor.SubjectID ||
+			record.Session.Actor.ActorID != record.Actor.ActorID ||
+			record.Session.Actor.ClientID != record.Actor.ClientID ||
+			!equalIDs(
+				record.Session.Actor.OnBehalfOf, record.Actor.OnBehalfOf) ||
+			record.Session.Reason != record.Reason {
+			return shoal.NewError(
+				shoal.ErrorInternal,
+				"stored interaction actor metadata does not match its envelope",
 			)
 		}
 	}
@@ -683,6 +721,7 @@ func validatePersistedInteraction(record persistedInteraction) error {
 
 func cloneInteractionSession(session interaction.Session) interaction.Session {
 	cloned := session
+	cloned.Actor = cloneActorContext(session.Actor)
 	cloned.SeedNodeIDs = append([]shoal.ID(nil), session.SeedNodeIDs...)
 	cloned.CitedNodeIDs = append([]shoal.ID(nil), session.CitedNodeIDs...)
 	cloned.Turns = make([]interaction.Turn, len(session.Turns))
@@ -696,4 +735,21 @@ func cloneInteractionSession(session interaction.Session) interaction.Session {
 		}
 	}
 	return cloned
+}
+
+func cloneActorContext(actor interaction.ActorContext) interaction.ActorContext {
+	actor.OnBehalfOf = append([]shoal.ID(nil), actor.OnBehalfOf...)
+	return actor
+}
+
+func equalIDs(left, right []shoal.ID) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
 }

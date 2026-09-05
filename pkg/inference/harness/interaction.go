@@ -27,13 +27,9 @@ import (
 )
 
 // InteractionSink is the durable corpus boundary a graph-backed recorder
-// writes through. *explorer.Explorer implements it.
-type InteractionSink interface {
-	// EnsureInteractionSink must report at setup time, not at first write,
-	// whether interactions can be durably recorded.
-	EnsureInteractionSink(context.Context) error
-	RecordInteraction(context.Context, interaction.Session) error
-}
+// writes through. It aliases the product-level interaction sink so inference,
+// retrieval, chat, and MCP adapters share one persistence contract.
+type InteractionSink = interaction.Sink
 
 // GraphRecorder writes execution records into the corpus graph under the
 // reserved interaction.* namespace.
@@ -123,6 +119,7 @@ func InteractionSession(
 	session := interaction.Session{
 		ID:                       interaction.SessionID(record.TranscriptID, recordedAt),
 		RecordedAt:               recordedAt.UTC(),
+		Operation:                interaction.OperationInference,
 		SnapshotID:               record.SnapshotID,
 		SnapshotAsOf:             record.SnapshotAsOf,
 		AuthorizationFingerprint: record.AuthorizationFingerprint,

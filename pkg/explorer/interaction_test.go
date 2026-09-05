@@ -207,6 +207,8 @@ func TestInteractionHydratesAllProvenanceWithoutMovingSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer corpus.Close()
+
 	var source strings.Builder
 	for index := 0; index < 25; index++ {
 		source.WriteString("# Section ")
@@ -282,6 +284,110 @@ func TestInteractionHydratesAllProvenanceWithoutMovingSnapshot(t *testing.T) {
 	if !inferenceFound || retrieved != len(spans)*2 || cited != 1 {
 		t.Fatalf("inference=%t retrieved=%d cited=%d",
 			inferenceFound, retrieved, cited)
+	}
+}
+
+func TestGenericRecorderSurvivesRestartAndStaysSourceOnly(t *testing.T) {
+	ctx := context.Background()
+	dataDir := t.TempDir()
+	corpus, err := explorer.Open(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	spans := ingestVisible(
+		t, corpus, "file:///generic-retrieval.md", publicMarkdown, "ops")
+	before, err := corpus.Snapshot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recordedAt := time.Date(
+		2026, time.September, 5, 22, 30, 0, 123, time.UTC)
+	recorder, err := interaction.NewRecorder(ctx, corpus)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := recorder.SetClock(func() time.Time { return recordedAt }); err != nil {
+		t.Fatal(err)
+	}
+	sessionID, err := interaction.OperationSessionID(
+		interaction.OperationRetrieval, "retrieval-request-1", recordedAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reason, err := interaction.NewReason(
+		"retrieve_context", "assemble grounded context")
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorded, err := recorder.Record(ctx, interaction.Session{
+		ID:        sessionID,
+		Operation: interaction.OperationRetrieval,
+		Actor: interaction.ActorContext{
+			SubjectID:  "subject-1",
+			ActorID:    "agent-1",
+			ClientID:   "client-1",
+			OnBehalfOf: []shoal.ID{"delegate-1", "delegate-2"},
+		},
+		Reason:                   reason,
+		SnapshotID:               shoal.ID(before.ID),
+		SnapshotAsOf:             before.AsOf,
+		AuthorizationFingerprint: "auth-sha256:generic-recorder",
+		AuthorizationExpiresAt:   recordedAt.Add(time.Hour),
+		SeedNodeIDs:              spans,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	after, err := corpus.Snapshot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if before != after {
+		t.Fatalf("generic recorder moved snapshot: before=%+v after=%+v",
+			before, after)
+	}
+	response, err := corpus.Retrieve(ctx, retrieval.Request{
+		Text:  "exponential backoff",
+		TopK:  50,
+		Modes: []retrieval.Mode{retrieval.ModeLexical},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, result := range response.Results {
+		if interaction.IsInteractionID(result.ID) {
+			t.Fatalf("default retrieval returned derived result %q", result.ID)
+		}
+	}
+	if err := corpus.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := explorer.Open(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	hydrated, err := reopened.Interaction(ctx, recorded.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hydrated.Operation != interaction.OperationRetrieval ||
+		hydrated.Actor.SubjectID != "subject-1" ||
+		hydrated.Actor.ActorID != "agent-1" ||
+		hydrated.Actor.ClientID != "client-1" ||
+		len(hydrated.Actor.OnBehalfOf) != 2 ||
+		hydrated.Reason != reason {
+		t.Fatalf("restarted interaction = %+v", hydrated)
+	}
+	subgraph, err := reopened.InteractionSubgraph(ctx, recorded.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, node := range subgraph.Nodes {
+		if node.Kind == interaction.KindInference {
+			t.Fatal("generic retrieval acquired an inference node after restart")
+		}
 	}
 }
 

@@ -69,6 +69,24 @@ func (c *Client) RecordInteraction(
 	if !interactionPinMatchesDecision(canonical, decision) {
 		return authorizationDenied()
 	}
+	canonical.Actor = interaction.ActorContext{
+		SubjectID:  decision.Subject(),
+		ActorID:    decision.Actor(),
+		ClientID:   decision.ClientID(),
+		OnBehalfOf: decision.OnBehalfOf(),
+	}
+	if canonical.Reason == (interaction.Reason{}) &&
+		decision.AuditPurpose() != "" {
+		canonical.Reason, err = interaction.NewReason(
+			"audit_purpose", decision.AuditPurpose())
+		if err != nil {
+			return authorizationDenied()
+		}
+	}
+	canonical, err = canonical.Canonical()
+	if err != nil {
+		return err
+	}
 	if err := c.authorizeInteractionSources(
 		ctx, canonical.TouchedNodeIDs(), decision, auth.OperationRetrieve, now,
 	); err != nil {
