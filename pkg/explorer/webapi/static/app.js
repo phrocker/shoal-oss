@@ -287,6 +287,12 @@ function callbackParams(search) {
 // exchange is exercisable without a browser. The returned token is handed back
 // to the caller and never written to storage.
 async function exchangeAuthorizationCode(config, callback, stored, deps) {
+  const now = deps && typeof deps.now === "function" ? deps.now() : Date.now();
+  if (!stored || !Number.isFinite(stored.createdAt) ||
+      stored.createdAt > now ||
+      now - stored.createdAt > LOGIN_FLOW_MAX_AGE_MS) {
+    throw new Error("login attempt expired; start sign-in again");
+  }
   if (!verifyCallbackState(callback.state, stored && stored.state)) {
     throw new Error("login state did not match; the callback was rejected");
   }
@@ -315,6 +321,7 @@ async function exchangeAuthorizationCode(config, callback, stored, deps) {
 }
 
 const LOGIN_FLOW_KEY = "shoal-login-flow";
+const LOGIN_FLOW_MAX_AGE_MS = 10 * 60 * 1000;
 
 function browserEnvironment() {
   return typeof window !== "undefined" &&
@@ -361,6 +368,7 @@ async function beginLogin() {
     verifier,
     state: randomUrlToken(24),
     redirectUri: redirectUri(),
+    createdAt: Date.now(),
   };
   window.sessionStorage.setItem(LOGIN_FLOW_KEY, JSON.stringify(flow));
   window.location.assign(buildAuthorizeUrl(state.auth, {

@@ -116,6 +116,10 @@ var (
 	// non-RSA key).
 	errKeyMethodMismatch = shoal.NewError(
 		shoal.ErrorUnauthorized, "signing key does not match the signing method")
+	// errKeyAlgorithmMismatch is returned when a JWK's optional alg constraint
+	// does not match the token header algorithm.
+	errKeyAlgorithmMismatch = shoal.NewError(
+		shoal.ErrorUnauthorized, "signing key does not allow the token algorithm")
 	// errNoMatchingKey is returned when no signing key matches the token's key
 	// identifier, including when the fetch-storm guard refuses a fresh fetch.
 	errNoMatchingKey = shoal.NewError(
@@ -668,21 +672,26 @@ func (a *oidcAuthenticator) keyFuncForContext(ctx context.Context) jwt.Keyfunc {
 		if strings.TrimSpace(kid) == "" {
 			return nil, errMissingKeyID
 		}
-		key, err := a.keys.keyForID(ctx, kid)
+		var rsaMethod bool
+		switch token.Method.(type) {
+		case *jwt.SigningMethodRSA, *jwt.SigningMethodRSAPSS:
+			rsaMethod = true
+		case *jwt.SigningMethodECDSA:
+		default:
+			return nil, errUnexpectedSigningMethod
+		}
+		key, err := a.keys.keyForID(ctx, kid, token.Method.Alg())
 		if err != nil {
 			return nil, err
 		}
-		switch token.Method.(type) {
-		case *jwt.SigningMethodRSA, *jwt.SigningMethodRSAPSS:
+		if rsaMethod {
 			if _, ok := key.(*rsa.PublicKey); !ok {
 				return nil, errKeyMethodMismatch
 			}
-		case *jwt.SigningMethodECDSA:
+		} else {
 			if _, ok := key.(*ecdsa.PublicKey); !ok {
 				return nil, errKeyMethodMismatch
 			}
-		default:
-			return nil, errUnexpectedSigningMethod
 		}
 		return key, nil
 	}
@@ -984,7 +993,7 @@ type jwksCache struct {
 	maxCacheAge time.Duration
 
 	mu          sync.Mutex
-	keys        map[string]crypto.PublicKey
+	keys        map[string]jwksSigningKey
 	fetched     bool
 	lastAttempt time.Time
 	lastSuccess time.Time
@@ -1000,6 +1009,7 @@ type jwksCache struct {
 func (c *jwksCache) keyForID(
 	ctx context.Context,
 	kid string,
+	algorithm string,
 ) (crypto.PublicKey, error) {
 	for {
 		if err := ctx.Err(); err != nil {
@@ -1013,7 +1023,10 @@ func (c *jwksCache) keyForID(
 			cacheAge >= 0 && cacheAge < c.maxCacheAge
 		if keyFound && cacheFresh {
 			c.mu.Unlock()
-			return key, nil
+			if key.algorithm != "" && key.algorithm != algorithm {
+				return nil, errKeyAlgorithmMismatch
+			}
+			return key.publicKey, nil
 		}
 		if c.refreshing {
 			done := c.refreshDone
@@ -1079,7 +1092,7 @@ func (c *jwksCache) refresh(refreshMetadata bool, done chan struct{}) {
 func (c *jwksCache) fetch(
 	ctx context.Context,
 	refreshMetadata bool,
-) (map[string]crypto.PublicKey, error) {
+) (map[string]jwksSigningKey, error) {
 	jwksURI := c.staticJWKSURI
 	if jwksURI == "" {
 		metadata, err := c.metadata.get(ctx, refreshMetadata)
@@ -1157,6 +1170,7 @@ type jsonWebKey struct {
 	Kid    string   `json:"kid"`
 	Use    string   `json:"use"`
 	KeyOps []string `json:"key_ops"`
+	Alg    string   `json:"alg"`
 	N      string   `json:"n"`
 	E      string   `json:"e"`
 	Crv    string   `json:"crv"`
@@ -1167,7 +1181,12 @@ type jsonWebKey struct {
 // parseJWKS builds a key-identifier-keyed map of public keys from a JWKS
 // document. Entries without a key identifier or of an unsupported type are
 // skipped rather than failing the whole set.
-func parseJWKS(body []byte) (map[string]crypto.PublicKey, error) {
+type jwksSigningKey struct {
+	publicKey crypto.PublicKey
+	algorithm string
+}
+
+func parseJWKS(body []byte) (map[string]jwksSigningKey, error) {
 	var set struct {
 		Keys []jsonWebKey `json:"keys"`
 	}
@@ -1175,7 +1194,7 @@ func parseJWKS(body []byte) (map[string]crypto.PublicKey, error) {
 		return nil, shoal.WrapError(
 			shoal.ErrorUnavailable, "invalid JWKS document", err)
 	}
-	keys := make(map[string]crypto.PublicKey, len(set.Keys))
+	keys := make(map[string]jwksSigningKey, len(set.Keys))
 	seenKeyIDs := make(map[string]struct{}, len(set.Keys))
 	for _, entry := range set.Keys {
 		if strings.TrimSpace(entry.Kid) == "" {
@@ -1199,13 +1218,19 @@ func parseJWKS(body []byte) (map[string]crypto.PublicKey, error) {
 			if err != nil {
 				continue
 			}
-			keys[entry.Kid] = key
+			keys[entry.Kid] = jwksSigningKey{
+				publicKey: key,
+				algorithm: strings.TrimSpace(entry.Alg),
+			}
 		case "EC":
 			key, err := entry.ecKey()
 			if err != nil {
 				continue
 			}
-			keys[entry.Kid] = key
+			keys[entry.Kid] = jwksSigningKey{
+				publicKey: key,
+				algorithm: strings.TrimSpace(entry.Alg),
+			}
 		default:
 			continue
 		}

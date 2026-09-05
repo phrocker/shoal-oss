@@ -160,7 +160,6 @@ func (f *fakeOIDCIssuer) jwksJSONLocked() []byte {
 			Kty: "RSA",
 			Kid: kid,
 			Use: "sig",
-			Alg: "RS256",
 			N:   base64.RawURLEncoding.EncodeToString(key.PublicKey.N.Bytes()),
 			E: base64.RawURLEncoding.EncodeToString(
 				big.NewInt(int64(key.PublicKey.E)).Bytes()),
@@ -721,6 +720,52 @@ func TestOIDCKeyfuncRejectsMismatchedSigningMethod(t *testing.T) {
 	}
 	if _, err := keyFunc(ecdsa); !errors.Is(err, errKeyMethodMismatch) {
 		t.Fatalf("ECDSA/RSA mismatch error = %v", err)
+	}
+}
+
+func TestOIDCJWKAlgorithmConstraintIsEnforced(t *testing.T) {
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := base64.RawURLEncoding.EncodeToString(key.PublicKey.N.Bytes())
+	e := base64.RawURLEncoding.EncodeToString(
+		big.NewInt(int64(key.PublicKey.E)).Bytes())
+	document := `{"keys":[{"kty":"RSA","kid":"` + testKID +
+		`","use":"sig","alg":"RS256","n":"` + n + `","e":"` + e + `"}]}`
+	server := httptest.NewServer(http.HandlerFunc(
+		func(writer http.ResponseWriter, _ *http.Request) {
+			writer.Header().Set("Content-Type", "application/json")
+			_, _ = writer.Write([]byte(document))
+		},
+	))
+	defer server.Close()
+
+	now := time.Now()
+	config := oidcConfig{
+		issuer:             server.URL,
+		audiences:          []string{testAudience},
+		jwksURI:            server.URL,
+		allowedAlgorithms:  []string{"RS256", "PS256"},
+		authorizationClaim: "access",
+		readerClaimValues:  []string{"reader"},
+		httpClient:         server.Client(),
+		clock:              fixedClock(now),
+	}
+	claims := jwt.MapClaims{
+		"iss": server.URL, "aud": testAudience, "sub": testSubject,
+		"access": "reader", "exp": now.Add(time.Hour).Unix(),
+	}
+	pss := jwt.NewWithClaims(jwt.SigningMethodPS256, claims)
+	pss.Header["kid"] = testKID
+	signed, err := pss.SignedString(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	authenticator := newTestOIDCAuthenticator(t, config)
+	if _, err := authenticator.authenticate(
+		bearerRequest(signed)); !errors.Is(err, errKeyAlgorithmMismatch) {
+		t.Fatalf("JWK algorithm mismatch error = %v", err)
 	}
 }
 
