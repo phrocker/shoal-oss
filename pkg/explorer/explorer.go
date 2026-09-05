@@ -72,6 +72,8 @@ type Explorer struct {
 	changeHistoryFloor      uint64
 	changeCursorKey         []byte
 	readOnly                bool
+	publication             RecordPublicationAdapter
+	ownsEngine              bool
 	closed                  bool
 }
 
@@ -159,6 +161,38 @@ func OpenWithOptions(dir string, options Options) (*Explorer, error) {
 	if strings.TrimSpace(dir) == "" {
 		return nil, shoal.NewError(shoal.ErrorInvalidArgument, "data directory is required")
 	}
+	eng, err := engine.Open(dir, engine.Options{})
+	if err != nil {
+		return nil, shoal.WrapError(shoal.ErrorUnavailable, "open explorer storage", err)
+	}
+	explorer, err := openWithEngine(eng, options, nil)
+	if err != nil {
+		_ = eng.Close()
+		return nil, err
+	}
+	explorer.ownsEngine = true
+	return explorer, nil
+}
+
+// OpenWithEmbeddedEngine opens Explorer on an engine whose lifetime is owned
+// by the caller. It is intended for the in-process transaction runtime, which
+// must share one engine handle with both coordination and physical writes.
+func OpenWithEmbeddedEngine(
+	eng *engine.Engine,
+	options Options,
+	publication RecordPublicationAdapter,
+) (*Explorer, error) {
+	if eng == nil {
+		return nil, shoal.NewError(shoal.ErrorInvalidArgument, "embedded engine is required")
+	}
+	return openWithEngine(eng, options, publication)
+}
+
+func openWithEngine(
+	eng *engine.Engine,
+	options Options,
+	publication RecordPublicationAdapter,
+) (*Explorer, error) {
 	embedders, err := embeddingProviderMap(options)
 	if err != nil {
 		return nil, err
@@ -176,10 +210,6 @@ func OpenWithOptions(dir string, options Options) (*Explorer, error) {
 	if maxLatentAssertions == 0 {
 		maxLatentAssertions = DefaultMaxLatentDerivedAssertionsPerGraphRead
 	}
-	eng, err := engine.Open(dir, engine.Options{})
-	if err != nil {
-		return nil, shoal.WrapError(shoal.ErrorUnavailable, "open explorer storage", err)
-	}
 	found := false
 	for _, table := range eng.TableNames() {
 		if table == explorerTable {
@@ -189,7 +219,6 @@ func OpenWithOptions(dir string, options Options) (*Explorer, error) {
 	}
 	if !found {
 		if err := eng.CreateTable(explorerTable, engine.TableOptions{}); err != nil {
-			_ = eng.Close()
 			return nil, shoal.WrapError(shoal.ErrorInternal, "create explorer table", err)
 		}
 	}
@@ -208,9 +237,9 @@ func OpenWithOptions(dir string, options Options) (*Explorer, error) {
 		latentLinkProjection:    latentProjection,
 		maxLatentAssertions:     maxLatentAssertions,
 		readOnly:                options.ReadOnly,
+		publication:             publication,
 	}
 	if err := explorer.load(); err != nil {
-		_ = eng.Close()
 		return nil, err
 	}
 	if explorer.snapshotAnchor.IsZero() {
@@ -220,7 +249,6 @@ func OpenWithOptions(dir string, options Options) (*Explorer, error) {
 				snapshotAnchorRow, embeddedRecordSnapshotAnchor,
 				persistedSnapshotAnchor{CreatedAt: explorer.snapshotAnchor},
 			); err != nil {
-				_ = eng.Close()
 				return nil, err
 			}
 		}
@@ -236,7 +264,6 @@ func OpenWithOptions(dir string, options Options) (*Explorer, error) {
 		// cursors then fail authentication and the client is told to resynchronise.
 		key := make([]byte, changeCursorKeyBytes)
 		if _, err := rand.Read(key); err != nil {
-			_ = eng.Close()
 			return nil, shoal.WrapError(
 				shoal.ErrorInternal, "generate change cursor key", err)
 		}
@@ -246,7 +273,6 @@ func OpenWithOptions(dir string, options Options) (*Explorer, error) {
 				cursorKeyRow, embeddedRecordCursorKey,
 				persistedCursorKey{Key: key},
 			); err != nil {
-				_ = eng.Close()
 				return nil, err
 			}
 		}
@@ -262,8 +288,10 @@ func (e *Explorer) Close() error {
 		return nil
 	}
 	e.closed = true
-	if err := e.engine.Close(); err != nil {
-		return shoal.WrapError(shoal.ErrorInternal, "close explorer storage", err)
+	if e.ownsEngine {
+		if err := e.engine.Close(); err != nil {
+			return shoal.WrapError(shoal.ErrorInternal, "close explorer storage", err)
+		}
 	}
 	return nil
 }
@@ -378,10 +406,8 @@ func (e *Explorer) ingest(
 	// publication sequences must never be reused.
 	e.lastPublicationSequence++
 	record.PublicationSequence = e.lastPublicationSequence
-	if err := e.writeRecord(
-		documentRecordRow(record.Document.ID, record.Revision.ID),
-		embeddedRecordDocument,
-		record,
+	if err := e.writeDocumentRecord(
+		ctx, documentRecordRow(record.Document.ID, record.Revision.ID), record,
 	); err != nil {
 		return IngestResult{}, err
 	}
