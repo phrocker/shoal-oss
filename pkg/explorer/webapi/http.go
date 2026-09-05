@@ -235,6 +235,9 @@ func metadataFor(ctx context.Context, service Service) (MetadataResponse, error)
 		if _, ok := service.(ExtractionProvider); !ok {
 			metadata.Capabilities.Extraction = false
 		}
+		if _, ok := service.(ChangeProvider); !ok {
+			metadata.Capabilities.Changes = false
+		}
 		return metadata, nil
 	}
 	capabilities, err := capabilitiesFor(ctx, service)
@@ -260,6 +263,9 @@ func capabilitiesFor(ctx context.Context, service Service) (Capabilities, error)
 		if _, ok := service.(ExtractionProvider); !ok {
 			capabilities.Extraction = false
 		}
+		if _, ok := service.(ChangeProvider); !ok {
+			capabilities.Changes = false
+		}
 		return capabilities, nil
 	}
 	capabilities, err := provider.Capabilities(ctx)
@@ -271,6 +277,9 @@ func capabilitiesFor(ctx context.Context, service Service) (Capabilities, error)
 	}
 	if _, ok := service.(ExtractionProvider); !ok {
 		capabilities.Extraction = false
+	}
+	if _, ok := service.(ChangeProvider); !ok {
+		capabilities.Changes = false
 	}
 	return capabilities, nil
 }

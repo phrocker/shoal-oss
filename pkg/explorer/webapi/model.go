@@ -66,6 +66,7 @@ const (
 	CapabilityPath         Capability = "path"
 	CapabilityIngest       Capability = "ingest"
 	CapabilityExtraction   Capability = "extraction"
+	CapabilityChanges      Capability = "changes"
 )
 
 // Capabilities advertises only stable logical features supported by a backend.
@@ -78,6 +79,7 @@ type Capabilities struct {
 	Path         bool `json:"path"`
 	Ingest       bool `json:"ingest"`
 	Extraction   bool `json:"extraction"`
+	Changes      bool `json:"changes"`
 }
 
 // AllCapabilities returns the complete feature set implemented by the embedded
@@ -86,7 +88,7 @@ func AllCapabilities() Capabilities {
 	return Capabilities{
 		Documents: true, Document: true, Retrieve: true,
 		Vector: false, Neighborhood: true, Path: true, Ingest: true,
-		Extraction: true,
+		Extraction: true, Changes: true,
 	}
 }
 
@@ -109,6 +111,8 @@ func (c Capabilities) Supports(capability Capability) bool {
 		return c.Ingest
 	case CapabilityExtraction:
 		return c.Extraction
+	case CapabilityChanges:
+		return c.Changes
 	default:
 		return false
 	}
