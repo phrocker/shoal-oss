@@ -244,6 +244,9 @@ func TestAskMarkdownAndNoEvidenceOutput(t *testing.T) {
 }
 
 func TestAskMarkdownCodePadsBacktickBoundaries(t *testing.T) {
+	if rendered := markdownCode(""); rendered != "" {
+		t.Fatalf("empty markdown code span = %q", rendered)
+	}
 	rendered := markdownCode("`model`")
 	if rendered != "`` `model` ``" {
 		t.Fatalf("markdown code span = %q", rendered)

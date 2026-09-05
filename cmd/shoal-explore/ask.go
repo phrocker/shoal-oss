@@ -1137,6 +1137,9 @@ func markdownSetextUnderline(line string) bool {
 func markdownCode(value any) string {
 	text := sanitizeMarkdownText(fmt.Sprint(value))
 	text = strings.ReplaceAll(text, "\n", " ")
+	if text == "" {
+		return ""
+	}
 	maxTicks := 0
 	current := 0
 	for _, r := range text {
