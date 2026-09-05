@@ -24,6 +24,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -368,34 +369,69 @@ func resolveStatePaths(
 	if strings.TrimSpace(corpus) == "" || strings.TrimSpace(policyDir) == "" {
 		return "", "", fmt.Errorf("corpus and policy directories are required")
 	}
-	corpus = filepath.Clean(corpus)
-	policyDir = filepath.Clean(policyDir)
+	var err error
+	corpus, err = canonicalStateDirectory("corpus", corpus)
+	if err != nil {
+		return "", "", err
+	}
+	policyDir, err = canonicalStateDirectory("policy", policyDir)
+	if err != nil {
+		return "", "", err
+	}
 	if err := requireSeparateStateDirectories(corpus, policyDir); err != nil {
 		return "", "", err
 	}
 	return corpus, policyDir, nil
 }
 
+func canonicalStateDirectory(label string, directory string) (string, error) {
+	absolute, err := filepath.Abs(directory)
+	if err != nil {
+		return "", fmt.Errorf("resolve %s directory: %w", label, err)
+	}
+	current := filepath.Clean(absolute)
+	var missing []string
+	for {
+		resolved, resolveErr := filepath.EvalSymlinks(current)
+		if resolveErr == nil {
+			for index := len(missing) - 1; index >= 0; index-- {
+				resolved = filepath.Join(resolved, missing[index])
+			}
+			return filepath.Clean(resolved), nil
+		}
+		if !errors.Is(resolveErr, fs.ErrNotExist) {
+			return "", fmt.Errorf(
+				"resolve %s directory symlinks: %w", label, resolveErr)
+		}
+		if _, statErr := os.Lstat(current); statErr == nil {
+			return "", fmt.Errorf(
+				"resolve %s directory symlinks: %w", label, resolveErr)
+		} else if !errors.Is(statErr, fs.ErrNotExist) {
+			return "", fmt.Errorf(
+				"inspect %s directory: %w", label, statErr)
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			return "", fmt.Errorf(
+				"resolve %s directory symlinks: %w", label, resolveErr)
+		}
+		missing = append(missing, filepath.Base(current))
+		current = parent
+	}
+}
+
 func requireSeparateStateDirectories(corpusDir string, policyDir string) error {
-	corpus, err := filepath.Abs(corpusDir)
-	if err != nil {
-		return fmt.Errorf("resolve corpus directory: %w", err)
-	}
-	policy, err := filepath.Abs(policyDir)
-	if err != nil {
-		return fmt.Errorf("resolve policy directory: %w", err)
-	}
-	corpusContainsPolicy, err := pathContains(corpus, policy)
+	corpusContainsPolicy, err := pathContains(corpusDir, policyDir)
 	if err != nil {
 		return err
 	}
-	policyContainsCorpus, err := pathContains(policy, corpus)
+	policyContainsCorpus, err := pathContains(policyDir, corpusDir)
 	if err != nil {
 		return err
 	}
 	if corpusContainsPolicy || policyContainsCorpus {
 		return fmt.Errorf(
-			"corpus and policy directories must be separate siblings, not equal or nested")
+			"corpus and policy directories must be separate and neither equal nor nested")
 	}
 	return nil
 }

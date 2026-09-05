@@ -85,7 +85,9 @@ func (f DecisionProviderFunc) Decision(ctx context.Context) (auth.Decision, erro
 //
 // Call receives the same freshly authorized context as built-in tools. The
 // returned value must encode as a JSON object so it can be carried as MCP
-// structuredContent.
+// structuredContent. Optional tools must omit outputSchema until this server
+// can validate results against it, and execution must be nil or explicitly
+// forbid task mode.
 type OptionalToolProvider interface {
 	Tool() Tool
 	Call(context.Context, json.RawMessage) (any, error)

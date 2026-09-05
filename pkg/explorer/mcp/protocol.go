@@ -93,8 +93,8 @@ type ToolAnnotations struct {
 	OpenWorldHint   bool `json:"openWorldHint"`
 }
 
-// ToolExecution describes optional task support. Shoal's synchronous tools do
-// not set this field and therefore use MCP's forbidden default.
+// ToolExecution describes optional task support. Shoal only accepts the
+// synchronous "forbidden" mode until task requests and results are supported.
 type ToolExecution struct {
 	TaskSupport string `json:"taskSupport"`
 }

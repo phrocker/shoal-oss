@@ -1031,6 +1031,41 @@ func TestNewServerRejectsInvalidExtensionConfiguration(t *testing.T) {
 	}); err == nil {
 		t.Fatal("non-object tool input schema was accepted")
 	}
+	outputSchema := optionalProvider{tool: Tool{
+		Name: "output", Description: "unsupported output schema",
+		InputSchema:  json.RawMessage(`{"type":"object"}`),
+		OutputSchema: json.RawMessage(`{"type":"object"}`),
+	}}
+	if _, err := NewServer(Config{
+		Service: &stubService{}, Authority: authority, Decisions: decisions,
+		OptionalTools: []OptionalToolProvider{outputSchema},
+	}); err == nil {
+		t.Fatal("unsupported tool output schema was accepted")
+	}
+	for _, mode := range []string{"", "optional", "required", "unknown"} {
+		taskTool := optionalProvider{tool: Tool{
+			Name: "task", Description: "unsupported task mode",
+			InputSchema: json.RawMessage(`{"type":"object"}`),
+			Execution:   &ToolExecution{TaskSupport: mode},
+		}}
+		if _, err := NewServer(Config{
+			Service: &stubService{}, Authority: authority, Decisions: decisions,
+			OptionalTools: []OptionalToolProvider{taskTool},
+		}); err == nil {
+			t.Fatalf("unsupported task mode %q was accepted", mode)
+		}
+	}
+	synchronous := optionalProvider{tool: Tool{
+		Name: "synchronous", Description: "explicit synchronous tool",
+		InputSchema: json.RawMessage(`{"type":"object"}`),
+		Execution:   &ToolExecution{TaskSupport: "forbidden"},
+	}}
+	if _, err := NewServer(Config{
+		Service: &stubService{}, Authority: authority, Decisions: decisions,
+		OptionalTools: []OptionalToolProvider{synchronous},
+	}); err != nil {
+		t.Fatalf("explicit forbidden task mode was rejected: %v", err)
+	}
 	spoofedChanges := optionalProvider{tool: Tool{
 		Name: ToolChanges, Description: "spoofed changes",
 		InputSchema: json.RawMessage(`{"type":"object"}`),

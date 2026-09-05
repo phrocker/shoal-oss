@@ -755,12 +755,14 @@ func validateTool(tool Tool) error {
 			shoal.ErrorInvalidArgument, "optional MCP tool input schema is invalid")
 	}
 	if len(tool.OutputSchema) != 0 {
-		var outputSchema map[string]any
-		if err := json.Unmarshal(tool.OutputSchema, &outputSchema); err != nil ||
-			outputSchema == nil || outputSchema["type"] != "object" {
-			return shoal.NewError(
-				shoal.ErrorInvalidArgument, "optional MCP tool output schema is invalid")
-		}
+		return shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			"optional MCP tool output schemas are not supported")
+	}
+	if tool.Execution != nil && tool.Execution.TaskSupport != "forbidden" {
+		return shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			"optional MCP tool task execution is not supported")
 	}
 	return nil
 }

@@ -24,6 +24,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -67,7 +68,7 @@ func TestParseCommandConfigFailsClosedAndSupportsEnvironment(t *testing.T) {
 	}
 	if _, _, err := resolveStatePaths(
 		"", filepath.Join("state", "corpus"), filepath.Join("state", "corpus", "policy"),
-	); err == nil || !strings.Contains(err.Error(), "separate siblings") {
+	); err == nil || !strings.Contains(err.Error(), "separate and neither equal nor nested") {
 		t.Fatalf("nested state directory error = %v", err)
 	}
 
@@ -90,8 +91,12 @@ func TestParseCommandConfigFailsClosedAndSupportsEnvironment(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if config.corpusDir != filepath.Join(root, "corpus") ||
-		config.policyDir != filepath.Join(root, "policy") {
+	canonicalRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config.corpusDir != filepath.Join(canonicalRoot, "corpus") ||
+		config.policyDir != filepath.Join(canonicalRoot, "policy") {
 		t.Fatalf("state paths = %q, %q", config.corpusDir, config.policyDir)
 	}
 	if config.identity.subject != "configured-subject" ||
@@ -123,6 +128,24 @@ func TestParseCommandConfigFailsClosedAndSupportsEnvironment(t *testing.T) {
 	if _, err := parseCommandConfig(nil, io.Discard, invalidBudget); err == nil ||
 		!strings.Contains(err.Error(), "context budget") {
 		t.Fatalf("invalid context budget error = %v", err)
+	}
+}
+
+func TestResolveStatePathsRejectsSymlinkAliases(t *testing.T) {
+	root := t.TempDir()
+	realRoot := filepath.Join(root, "real")
+	if err := os.MkdirAll(realRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(root, "alias")
+	if err := os.Symlink(realRoot, alias); err != nil {
+		t.Skipf("directory symlinks unavailable: %v", err)
+	}
+	corpus := filepath.Join(realRoot, "corpus")
+	policy := filepath.Join(alias, "corpus", "policy")
+	if _, _, err := resolveStatePaths("", corpus, policy); err == nil ||
+		!strings.Contains(err.Error(), "separate and neither equal nor nested") {
+		t.Fatalf("symlink-aliased nested state directory error = %v", err)
 	}
 }
 
