@@ -87,6 +87,32 @@ spaces, and fan-out refusals without exposing query text or vector bytes.
 Single-space retrieval keeps score ordering; mixed-space retrieval uses
 deterministic rank fusion and never compares raw scores across models.
 
+The core observer is an operator surface for an unwrapped `Explorer`; its space
+identities are storage identities and are not safe to forward across an
+authorization boundary. `pkg/explorer/authorized.Client` replaces any
+request-context core observer only after it has resolved the request
+`Decision`, read current policy registrations, and removed unauthorized and
+mosaic-restricted documents. `RetrieveWithReport` and
+`authorized.WithEmbeddingQueryObserver` then expose one request-local report:
+
+- only distinct spaces in that caller-authorized candidate projection appear;
+- each visible space is named by a process-keyed opaque pseudonym, not by
+  provider, model, version, dimensions, or the persisted space identity;
+- `unavailable`, `not_attempted`, and `not_completed` are explicit states, and
+  fan-out refusal and degradation are explicit flags;
+- authorization suppression and mosaic restriction are booleans derived from
+  the separately permitted document counts; no withheld space count or
+  identity is added;
+- a hidden-only projection invokes no embedding provider and reports no space;
+- policy generation is rechecked before the report is released. Cancellation,
+  expiry, revocation, or an unreadable generation scrubs space IDs and
+  per-space activity counters from the callback/error report.
+
+The pseudonym is stable for repeated requests in one process and rotates on
+restart to resist offline guessing of low-entropy provider/model combinations.
+Neither the core nor authorized observer payload contains prompt text,
+credentials, source text, quotes, or vector bytes.
+
 ## Recall contract
 
 Configuration is not a recall claim. `BenchmarkRecall` compares approximate

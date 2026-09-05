@@ -64,7 +64,7 @@ type Explorer struct {
 	queryEmbeddingCache     map[embeddingQueryCacheKey]cachedQueryEmbedding
 	queryEmbeddingOrder     []embeddingQueryCacheKey
 	maxQueryEmbeddingCache  int
-	embeddingQueryObserver  func(EmbeddingQueryEvent)
+	embeddingQueryObserver  EmbeddingQueryObserver
 	recallEvidence          map[string]string
 	embeddingSpace          embeddingSpaceCache
 	latentLinkProjection    LatentLinkAssertionProjection
@@ -129,6 +129,48 @@ type EmbeddingQueryEvent struct {
 	FanoutExceeded  bool
 }
 
+// EmbeddingQueryObserver receives one query event. Events contain no query
+// text, vector bytes, provider credentials, or source content.
+type EmbeddingQueryObserver func(EmbeddingQueryEvent)
+
+type embeddingQueryObservation struct {
+	observer EmbeddingQueryObserver
+}
+
+type embeddingQueryObservationKey struct{}
+
+// WithEmbeddingQueryObserver binds one observer to ctx. The binding replaces
+// any earlier request observer and is inherited only by calls using the
+// returned context. Authorization wrappers use this seam after projecting
+// source scope so raw space identities never cross the authorization boundary.
+func WithEmbeddingQueryObserver(
+	ctx context.Context,
+	observer EmbeddingQueryObserver,
+) context.Context {
+	return context.WithValue(
+		ctx,
+		embeddingQueryObservationKey{},
+		embeddingQueryObservation{observer: observer},
+	)
+}
+
+// ReportEmbeddingQueryEvent delivers an event to the observer bound to ctx.
+// Trusted vector implementations may use this to participate in request-local
+// reporting without installing process-global state.
+func ReportEmbeddingQueryEvent(ctx context.Context, event EmbeddingQueryEvent) {
+	observation, ok := ctx.Value(embeddingQueryObservationKey{}).(embeddingQueryObservation)
+	if !ok || observation.observer == nil {
+		return
+	}
+	observation.observer(cloneEmbeddingQueryEvent(event))
+}
+
+func cloneEmbeddingQueryEvent(event EmbeddingQueryEvent) EmbeddingQueryEvent {
+	event.SpaceIdentities = append([]string(nil), event.SpaceIdentities...)
+	event.Unavailable = append([]string(nil), event.Unavailable...)
+	return event
+}
+
 // Options configures optional embedded Explorer features.
 type Options struct {
 	// Embedder enables vector indexing and retrieval. It must also implement
@@ -152,7 +194,7 @@ type Options struct {
 
 	// EmbeddingQueryObserver receives one bounded fan-out summary per vector
 	// retrieval or vector-score request. It must be safe for concurrent use.
-	EmbeddingQueryObserver func(EmbeddingQueryEvent)
+	EmbeddingQueryObserver EmbeddingQueryObserver
 
 	// RecallEvidence records benchmark evidence per embedding-space identity.
 	RecallEvidence map[string]string

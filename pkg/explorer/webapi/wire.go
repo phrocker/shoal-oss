@@ -28,6 +28,7 @@ import (
 
 	"github.com/phrocker/shoal-oss/pkg/document"
 	"github.com/phrocker/shoal-oss/pkg/explorer"
+	"github.com/phrocker/shoal-oss/pkg/explorer/authorized"
 	"github.com/phrocker/shoal-oss/pkg/graph"
 	"github.com/phrocker/shoal-oss/pkg/ontology"
 	"github.com/phrocker/shoal-oss/pkg/retrieval"
@@ -547,10 +548,13 @@ func (r RetrievalResponse) MarshalJSON() ([]byte, error) {
 		Retrieval  any      `json:"retrieval"`
 		Suppressed uint32   `json:"suppressed,omitempty"`
 		Restricted uint32   `json:"restricted,omitempty"`
+		Embedding  any      `json:"embedding,omitempty"`
 	}{r.Snapshot, struct {
 		RequestID string `json:"request_id,omitempty"`
 		Results   []any  `json:"results"`
-	}{encodeOptionalID(r.Retrieval.RequestID), results}, r.Suppressed, r.Restricted})
+	}{
+		encodeOptionalID(r.Retrieval.RequestID), results,
+	}, r.Suppressed, r.Restricted, wireEmbeddingQueryReportValue(r.Embedding)})
 }
 
 func (r *RetrievalResponse) UnmarshalJSON(data []byte) error {
@@ -570,8 +574,9 @@ func (r *RetrievalResponse) UnmarshalJSON(data []byte) error {
 				Explanation *wireExplanation `json:"explanation,omitempty"`
 			} `json:"results"`
 		} `json:"retrieval"`
-		Suppressed uint32 `json:"suppressed,omitempty"`
-		Restricted uint32 `json:"restricted,omitempty"`
+		Suppressed uint32                    `json:"suppressed,omitempty"`
+		Restricted uint32                    `json:"restricted,omitempty"`
+		Embedding  *wireEmbeddingQueryReport `json:"embedding,omitempty"`
 	}
 	if err := strictUnmarshal(data, &wire); err != nil {
 		return err
@@ -606,13 +611,106 @@ func (r *RetrievalResponse) UnmarshalJSON(data []byte) error {
 			Explanation: explanationValue(item.Explanation),
 		})
 	}
+	embedding, err := embeddingQueryReportValue(wire.Embedding)
+	if err != nil {
+		return fmt.Errorf("embedding: %w", err)
+	}
 	*r = RetrievalResponse{
 		Snapshot:   wire.Snapshot,
 		Retrieval:  retrieval.Response{RequestID: requestID, Results: results},
 		Suppressed: wire.Suppressed,
 		Restricted: wire.Restricted,
+		Embedding:  embedding,
 	}
 	return nil
+}
+
+type wireEmbeddingQueryReport struct {
+	Spaces         []wireEmbeddingSpace `json:"spaces"`
+	FanoutLimit    uint32               `json:"fanout_limit,omitempty"`
+	CacheHits      uint32               `json:"cache_hits,omitempty"`
+	ProviderCalls  uint32               `json:"provider_calls,omitempty"`
+	Observed       bool                 `json:"observed"`
+	Suppressed     bool                 `json:"suppressed,omitempty"`
+	Restricted     bool                 `json:"restricted,omitempty"`
+	Degraded       bool                 `json:"degraded,omitempty"`
+	FanoutExceeded bool                 `json:"fanout_exceeded,omitempty"`
+}
+
+type wireEmbeddingSpace struct {
+	ID     string                          `json:"id"`
+	Status authorized.EmbeddingSpaceStatus `json:"status"`
+}
+
+func wireEmbeddingQueryReportValue(
+	report *authorized.EmbeddingQueryReport,
+) *wireEmbeddingQueryReport {
+	if report == nil {
+		return nil
+	}
+	spaces := make([]wireEmbeddingSpace, 0, len(report.Spaces))
+	for _, space := range report.Spaces {
+		spaces = append(spaces, wireEmbeddingSpace{
+			ID: encodeID(space.ID), Status: space.Status,
+		})
+	}
+	return &wireEmbeddingQueryReport{
+		Spaces: spaces, FanoutLimit: report.FanoutLimit,
+		CacheHits: report.CacheHits, ProviderCalls: report.ProviderCalls,
+		Observed: report.Observed, Suppressed: report.Suppressed,
+		Restricted: report.Restricted, Degraded: report.Degraded,
+		FanoutExceeded: report.FanoutExceeded,
+	}
+}
+
+func embeddingQueryReportValue(
+	wire *wireEmbeddingQueryReport,
+) (*authorized.EmbeddingQueryReport, error) {
+	if wire == nil {
+		return nil, nil
+	}
+	report := &authorized.EmbeddingQueryReport{
+		FanoutLimit: wire.FanoutLimit,
+		CacheHits:   wire.CacheHits, ProviderCalls: wire.ProviderCalls,
+		Observed: wire.Observed, Suppressed: wire.Suppressed,
+		Restricted: wire.Restricted, Degraded: wire.Degraded,
+		FanoutExceeded: wire.FanoutExceeded,
+	}
+	seen := make(map[shoal.ID]struct{}, len(wire.Spaces))
+	for _, item := range wire.Spaces {
+		id, err := decodeID(item.ID)
+		if err != nil {
+			return nil, fmt.Errorf("spaces.id: %w", err)
+		}
+		switch item.Status {
+		case authorized.EmbeddingSpaceAvailable,
+			authorized.EmbeddingSpaceUnavailable,
+			authorized.EmbeddingSpaceNotAttempted,
+			authorized.EmbeddingSpaceNotCompleted:
+		default:
+			return nil, fmt.Errorf("spaces.status: unknown status")
+		}
+		if _, duplicate := seen[id]; duplicate {
+			return nil, fmt.Errorf("spaces.id: duplicate identifier")
+		}
+		seen[id] = struct{}{}
+		report.Spaces = append(report.Spaces, authorized.EmbeddingSpaceReport{
+			ID: id, Status: item.Status,
+		})
+	}
+	if !report.Observed && len(report.Spaces) > 0 {
+		return nil, fmt.Errorf("spaces require observed embedding activity")
+	}
+	if report.FanoutExceeded && !report.Degraded {
+		return nil, fmt.Errorf("fanout_exceeded requires degraded")
+	}
+	for _, space := range report.Spaces {
+		if space.Status != authorized.EmbeddingSpaceAvailable &&
+			!report.Degraded {
+			return nil, fmt.Errorf("non-available space requires degraded")
+		}
+	}
+	return report, nil
 }
 
 func (r NeighborhoodResponse) MarshalJSON() ([]byte, error) {

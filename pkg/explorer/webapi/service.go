@@ -137,6 +137,14 @@ type disclosureCountingRetriever interface {
 	) (retrieval.Response, authorized.Disclosure, error)
 }
 
+// reportingRetriever is the authorized retrieval extension that preserves
+// request-local embedding-space observability, including on provider failure.
+type reportingRetriever interface {
+	RetrieveWithReport(
+		context.Context, retrieval.Request,
+	) (retrieval.Response, authorized.RetrievalReport, error)
+}
+
 // disclosureCountingLister is the Documents-listing counterpart to
 // disclosureCountingRetriever under the same preference rule.
 type disclosureCountingLister interface {
@@ -480,7 +488,7 @@ func (s *EmbeddedService) Documents(
 // documentsCountingDisclosure lists the authorized documents and, when the
 // backing client can report it, the corpus-wide counts of current documents
 // withheld from this identity, split by reason class: plain authorization
-// denials and mosaic co-occurrence restrictions. See retrieveCountingDisclosure
+// denials and mosaic co-occurrence restrictions. See retrieveReporting
 // for the amplification risk of disclosing these counts; the same caveat applies
 // to the document listing. A client that reports only the older suppression
 // count still contributes the denial count with a zero restriction count, and a
@@ -584,8 +592,11 @@ func (s *EmbeddedService) Retrieve(
 	// The embedded backend is already pinned by the snapshot identity and does
 	// not implement historical publication-frontier reads.
 	query.AsOf = time.Time{}
-	response, disclosure, err := s.retrieveCountingDisclosure(ctx, query)
+	response, report, err := s.retrieveReporting(ctx, query)
 	if err != nil {
+		if report.Embedding != nil {
+			return RetrievalResponse{}, newEmbeddingQueryError(err, *report.Embedding)
+		}
 		return RetrievalResponse{}, err
 	}
 	if err := validateRetrievalResponse(response, query); err != nil {
@@ -597,15 +608,15 @@ func (s *EmbeddedService) Retrieve(
 	}
 	return RetrievalResponse{
 		Snapshot: snapshot, Retrieval: response,
-		Suppressed: disclosure.Suppressed, Restricted: disclosure.Restricted,
+		Suppressed: report.Disclosure.Suppressed,
+		Restricted: report.Disclosure.Restricted,
+		Embedding:  report.Embedding,
 	}, nil
 }
 
-// retrieveCountingDisclosure runs the authorized retrieval and, when the backing
-// client can report it, the counts of current documents withheld from this
-// identity and therefore never searched, split by reason class: plain
-// authorization denials (Suppressed) and mosaic co-occurrence restrictions
-// (Restricted).
+// retrieveReporting runs the authorized retrieval and, when the backing client
+// can report it, preserves both document withholding counts and request-local
+// authorized embedding-space outcomes.
 //
 // Amplification risk. The Suppressed count is a real disclosure. Because a
 // caller can re-run retrieval as the corpus changes, and vary the request, and
@@ -622,18 +633,24 @@ func (s *EmbeddedService) Retrieve(
 // content the way a caller-distinguishable denial signal could. It names no
 // domain and no document. See docs and app.js for how the two counts are
 // surfaced as distinct reason classes.
-func (s *EmbeddedService) retrieveCountingDisclosure(
+func (s *EmbeddedService) retrieveReporting(
 	ctx context.Context, query retrieval.Request,
-) (retrieval.Response, authorized.Disclosure, error) {
+) (retrieval.Response, authorized.RetrievalReport, error) {
+	if reporter, ok := s.client.(reportingRetriever); ok {
+		return reporter.RetrieveWithReport(ctx, query)
+	}
 	if counter, ok := s.client.(disclosureCountingRetriever); ok {
-		return counter.RetrieveWithDisclosure(ctx, query)
+		response, disclosure, err := counter.RetrieveWithDisclosure(ctx, query)
+		return response, authorized.RetrievalReport{Disclosure: disclosure}, err
 	}
 	if counter, ok := s.client.(suppressionCountingRetriever); ok {
 		response, suppressed, err := counter.RetrieveWithSuppressed(ctx, query)
-		return response, authorized.Disclosure{Suppressed: suppressed}, err
+		return response, authorized.RetrievalReport{
+			Disclosure: authorized.Disclosure{Suppressed: suppressed},
+		}, err
 	}
 	response, err := s.client.Retrieve(ctx, query)
-	return response, authorized.Disclosure{}, err
+	return response, authorized.RetrievalReport{}, err
 }
 
 func (s *EmbeddedService) Neighborhood(

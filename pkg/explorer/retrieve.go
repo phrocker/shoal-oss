@@ -95,7 +95,7 @@ func (e *Explorer) retrieve(
 	var observeQuery bool
 	defer func() {
 		if observeQuery {
-			e.observeEmbeddingQuery(queryEvent)
+			e.observeEmbeddingQuery(ctx, queryEvent)
 		}
 	}()
 	e.mu.RLock()

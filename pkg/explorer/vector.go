@@ -231,7 +231,7 @@ func (e *Explorer) VectorScores(
 	if len(request.Citations) == 0 {
 		e.mu.RUnlock()
 		_, _, event, err := e.embedQueriesForSpaces(ctx, request.Text, nil)
-		e.observeEmbeddingQuery(event)
+		e.observeEmbeddingQuery(ctx, event)
 		if err != nil {
 			return nil, err
 		}
@@ -241,7 +241,7 @@ func (e *Explorer) VectorScores(
 	var observeQuery bool
 	defer func() {
 		if observeQuery {
-			e.observeEmbeddingQuery(queryEvent)
+			e.observeEmbeddingQuery(ctx, queryEvent)
 		}
 	}()
 	defer e.mu.RUnlock()
@@ -695,13 +695,14 @@ func (e *Explorer) cacheQueryEmbedding(
 	e.queryEmbeddingOrder = append(e.queryEmbeddingOrder, key)
 }
 
-func (e *Explorer) observeEmbeddingQuery(event EmbeddingQueryEvent) {
-	if e.embeddingQueryObserver == nil {
-		return
+func (e *Explorer) observeEmbeddingQuery(
+	ctx context.Context,
+	event EmbeddingQueryEvent,
+) {
+	ReportEmbeddingQueryEvent(ctx, event)
+	if e.embeddingQueryObserver != nil {
+		e.embeddingQueryObserver(cloneEmbeddingQueryEvent(event))
 	}
-	event.SpaceIdentities = append([]string(nil), event.SpaceIdentities...)
-	event.Unavailable = append([]string(nil), event.Unavailable...)
-	e.embeddingQueryObserver(event)
 }
 
 func conflictingEmbeddingProvenanceError(
