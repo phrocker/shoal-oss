@@ -1059,6 +1059,9 @@ func markdownBlockMarker(line string) int {
 	if start >= len(line) {
 		return -1
 	}
+	if markdownSetextUnderline(line[start:]) {
+		return start
+	}
 	switch line[start] {
 	case '>', '#':
 		return start
@@ -1085,8 +1088,26 @@ func markdownBlockMarker(line string) int {
 	return -1
 }
 
+func markdownSetextUnderline(line string) bool {
+	if line == "" || (line[0] != '=' && line[0] != '-') {
+		return false
+	}
+	marker := line[0]
+	index := 0
+	for index < len(line) && line[index] == marker {
+		index++
+	}
+	for ; index < len(line); index++ {
+		if line[index] != ' ' && line[index] != '\t' {
+			return false
+		}
+	}
+	return true
+}
+
 func markdownCode(value any) string {
 	text := sanitizeMarkdownText(fmt.Sprint(value))
+	text = strings.ReplaceAll(text, "\n", " ")
 	maxTicks := 0
 	current := 0
 	for _, r := range text {
