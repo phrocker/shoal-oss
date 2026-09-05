@@ -20,6 +20,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/rsa"
 	"encoding/base64"
@@ -59,6 +61,8 @@ type fakeOIDCIssuer struct {
 	discoveryJWKSURI  string
 	authorizationPath string
 	tokenPath         string
+	jwksStarted       chan<- struct{}
+	jwksRelease       <-chan struct{}
 }
 
 func newFakeOIDCIssuer(t *testing.T) *fakeOIDCIssuer {
@@ -116,14 +120,27 @@ func (f *fakeOIDCIssuer) serveJWKS(
 	_ *http.Request,
 ) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.jwksHits++
-	if f.jwksStatus != http.StatusOK {
-		writer.WriteHeader(f.jwksStatus)
+	status := f.jwksStatus
+	body := f.jwksJSONLocked()
+	started := f.jwksStarted
+	release := f.jwksRelease
+	f.mu.Unlock()
+	if started != nil {
+		select {
+		case started <- struct{}{}:
+		default:
+		}
+	}
+	if release != nil {
+		<-release
+	}
+	if status != http.StatusOK {
+		writer.WriteHeader(status)
 		return
 	}
 	writer.Header().Set("Content-Type", "application/json")
-	_, _ = writer.Write(f.jwksJSONLocked())
+	_, _ = writer.Write(body)
 }
 
 func (f *fakeOIDCIssuer) jwksJSONLocked() []byte {
@@ -281,10 +298,10 @@ func TestOIDCClaimMappingPreservesIdentityAndDelegation(t *testing.T) {
 
 	claims := issuer.defaultClaims(now)
 	delete(claims, "sub")
-	claims["principal"] = "principal-7"
-	claims["actor"] = "service-4"
-	claims["client"] = "client-9"
-	claims["delegation"] = []string{"delegate-a", "delegate-b"}
+	claims["principal"] = " principal-7 "
+	claims["actor"] = " service-4 "
+	claims["client"] = " client-9 "
+	claims["delegation"] = []string{" delegate-a ", "delegate-b"}
 	claims["access"] = "writer"
 	decision, err := authenticator.Authenticate(
 		bearerRequest(issuer.signRS256(t, testKID, claims)))
@@ -292,15 +309,15 @@ func TestOIDCClaimMappingPreservesIdentityAndDelegation(t *testing.T) {
 		t.Fatalf("mapped token rejected: %v", err)
 	}
 	prefix := "oidc:" + issuer.server.URL + "#"
-	if decision.Subject() != shoal.ID(prefix+"principal-7") ||
-		decision.Actor() != shoal.ID(prefix+"service-4") ||
-		decision.ClientID() != shoal.ID(prefix+"client-9") {
+	if decision.Subject() != shoal.ID(prefix+" principal-7 ") ||
+		decision.Actor() != shoal.ID(prefix+" service-4 ") ||
+		decision.ClientID() != shoal.ID(prefix+" client-9 ") {
 		t.Fatalf(
 			"mapped identity = subject %q actor %q client %q",
 			decision.Subject(), decision.Actor(), decision.ClientID())
 	}
 	wantDelegation := []shoal.ID{
-		shoal.ID(prefix + "delegate-a"),
+		shoal.ID(prefix + " delegate-a "),
 		shoal.ID(prefix + "delegate-b"),
 	}
 	gotDelegation := decision.OnBehalfOf()
@@ -385,6 +402,11 @@ func TestOIDCRejectsUnmappedAndMalformedClaims(t *testing.T) {
 		{
 			name: "unmapped authorization value",
 			edit: func(claims jwt.MapClaims) { claims["access"] = []string{"unknown"} },
+			want: errUnmappedAuthorization,
+		},
+		{
+			name: "authorization value is not whitespace-normalized",
+			edit: func(claims jwt.MapClaims) { claims["access"] = []string{" reader "} },
 			want: errUnmappedAuthorization,
 		},
 		{
@@ -560,6 +582,122 @@ func TestOIDCRejectsSignatureAlgorithmAndKeyFailures(t *testing.T) {
 	}
 }
 
+func TestOIDCAcceptsConfiguredPSSAndECDSAAlgorithms(t *testing.T) {
+	tests := []struct {
+		name       string
+		method     jwt.SigningMethod
+		privateKey func(*testing.T) (any, jsonWebKey)
+	}{
+		{
+			name:   "PS256",
+			method: jwt.SigningMethodPS256,
+			privateKey: func(t *testing.T) (any, jsonWebKey) {
+				key, err := rsa.GenerateKey(rand.Reader, 2048)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return key, jsonWebKey{
+					Kty: "RSA", Kid: testKID, Use: "sig",
+					KeyOps: []string{"verify"},
+					N:      base64.RawURLEncoding.EncodeToString(key.PublicKey.N.Bytes()),
+					E: base64.RawURLEncoding.EncodeToString(
+						big.NewInt(int64(key.PublicKey.E)).Bytes()),
+				}
+			},
+		},
+		{
+			name:   "ES256",
+			method: jwt.SigningMethodES256,
+			privateKey: func(t *testing.T) (any, jsonWebKey) {
+				return testECSigningKey(t, elliptic.P256(), "P-256")
+			},
+		},
+		{
+			name:   "ES384",
+			method: jwt.SigningMethodES384,
+			privateKey: func(t *testing.T) (any, jsonWebKey) {
+				return testECSigningKey(t, elliptic.P384(), "P-384")
+			},
+		},
+		{
+			name:   "ES512",
+			method: jwt.SigningMethodES512,
+			privateKey: func(t *testing.T) (any, jsonWebKey) {
+				return testECSigningKey(t, elliptic.P521(), "P-521")
+			},
+		},
+	}
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			privateKey, key := testCase.privateKey(t)
+			document, err := json.Marshal(struct {
+				Keys []jsonWebKey `json:"keys"`
+			}{Keys: []jsonWebKey{key}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			server := httptest.NewServer(http.HandlerFunc(
+				func(writer http.ResponseWriter, _ *http.Request) {
+					writer.Header().Set("Content-Type", "application/json")
+					_, _ = writer.Write(document)
+				},
+			))
+			defer server.Close()
+
+			now := time.Now()
+			config := oidcConfig{
+				issuer:             server.URL,
+				audiences:          []string{testAudience},
+				jwksURI:            server.URL,
+				allowedAlgorithms:  []string{testCase.method.Alg()},
+				authorizationClaim: "access",
+				readerClaimValues:  []string{"reader"},
+				httpClient:         server.Client(),
+				clock:              fixedClock(now),
+			}
+			claims := jwt.MapClaims{
+				"iss": server.URL, "aud": testAudience, "sub": testSubject,
+				"access": "reader", "exp": now.Add(time.Hour).Unix(),
+			}
+			token := jwt.NewWithClaims(testCase.method, claims)
+			token.Header["kid"] = testKID
+			signed, err := token.SignedString(privateKey)
+			if err != nil {
+				t.Fatal(err)
+			}
+			authenticator := newTestOIDCAuthenticator(t, config)
+			if _, err := authenticator.Authenticate(
+				bearerRequest(signed)); err != nil {
+				t.Fatalf("configured %s token rejected: %v", testCase.name, err)
+			}
+
+			config.allowedAlgorithms = []string{"RS256"}
+			rejecting := newTestOIDCAuthenticator(t, config)
+			if _, err := rejecting.Authenticate(bearerRequest(signed)); err == nil {
+				t.Fatalf("%s token bypassed the configured allowlist", testCase.name)
+			}
+		})
+	}
+}
+
+func testECSigningKey(
+	t *testing.T,
+	curve elliptic.Curve,
+	name string,
+) (any, jsonWebKey) {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(curve, rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return key, jsonWebKey{
+		Kty: "EC", Kid: testKID, Use: "sig", KeyOps: []string{"verify"},
+		Crv: name,
+		X:   base64.RawURLEncoding.EncodeToString(key.PublicKey.X.Bytes()),
+		Y:   base64.RawURLEncoding.EncodeToString(key.PublicKey.Y.Bytes()),
+	}
+}
+
 func TestOIDCKeyfuncRejectsMismatchedSigningMethod(t *testing.T) {
 	issuer := newFakeOIDCIssuer(t)
 	now := time.Now()
@@ -673,6 +811,66 @@ func TestOIDCCachedKeyRemovalTakesEffectWithinBound(t *testing.T) {
 	if discoveryHits != 2 || jwksHits != 2 {
 		t.Fatalf(
 			"bounded refresh fetches = discovery %d JWKS %d, want 2 and 2",
+			discoveryHits, jwksHits)
+	}
+}
+
+func TestOIDCSharedRefreshOutlivesTriggeringRequest(t *testing.T) {
+	issuer := newFakeOIDCIssuer(t)
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseRefresh := func() { releaseOnce.Do(func() { close(release) }) }
+	t.Cleanup(releaseRefresh)
+	issuer.mu.Lock()
+	issuer.jwksStarted = started
+	issuer.jwksRelease = release
+	issuer.mu.Unlock()
+
+	now := time.Now()
+	authenticator := newTestOIDCAuthenticator(
+		t, issuer.testConfig(fixedClock(now)))
+	token := issuer.signRS256(t, testKID, issuer.defaultClaims(now))
+	ctx, cancel := context.WithCancel(context.Background())
+	request := bearerRequest(token).WithContext(ctx)
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := authenticator.authenticate(request)
+		firstDone <- err
+	}()
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("JWKS refresh did not start")
+	}
+	cancel()
+	select {
+	case err := <-firstDone:
+		if err == nil {
+			t.Fatal("canceled triggering request was accepted")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("canceled triggering request remained blocked on shared refresh")
+	}
+
+	secondDone := make(chan error, 1)
+	go func() {
+		_, err := authenticator.Authenticate(bearerRequest(token))
+		secondDone <- err
+	}()
+	releaseRefresh()
+	select {
+	case err := <-secondDone:
+		if err != nil {
+			t.Fatalf("shared refresh was poisoned by caller cancellation: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("legitimate request did not receive shared refresh result")
+	}
+	discoveryHits, jwksHits := issuer.counts()
+	if discoveryHits != 1 || jwksHits != 1 {
+		t.Fatalf(
+			"shared refresh fetches = discovery %d JWKS %d, want 1 and 1",
 			discoveryHits, jwksHits)
 	}
 }
@@ -805,6 +1003,10 @@ func TestOIDCAuthenticatorValidatesConfig(t *testing.T) {
 	}{
 		{"missing issuer", func(config *oidcConfig) { config.issuer = "" }},
 		{"insecure issuer", func(config *oidcConfig) { config.issuer = "http://issuer.example" }},
+		{"wildcard issuer", func(config *oidcConfig) { config.issuer = "https://*" }},
+		{"invalid DNS issuer", func(config *oidcConfig) {
+			config.issuer = "https://bad_host.example"
+		}},
 		{"missing audience", func(config *oidcConfig) { config.audiences = nil }},
 		{"missing authorization claim", func(config *oidcConfig) {
 			config.authorizationClaim = ""

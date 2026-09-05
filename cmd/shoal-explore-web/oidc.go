@@ -33,6 +33,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -497,6 +498,10 @@ func validateOIDCEndpoint(name, raw string, allowLoopbackHTTP bool) error {
 		return shoal.NewError(
 			shoal.ErrorInvalidArgument, "issuer must not contain a query")
 	}
+	if !validOIDCEndpointHost(parsed) {
+		return shoal.NewError(
+			shoal.ErrorInvalidArgument, name+" must use a valid IP or DNS host")
+	}
 	if parsed.Scheme == "https" {
 		return nil
 	}
@@ -511,6 +516,44 @@ func validateOIDCEndpoint(name, raw string, allowLoopbackHTTP bool) error {
 	}
 	return shoal.NewError(
 		shoal.ErrorInvalidArgument, name+" must use https")
+}
+
+func validOIDCEndpointHost(parsed *url.URL) bool {
+	if parsed == nil || strings.ContainsAny(parsed.Host, "*'\"; \t\r\n\\") {
+		return false
+	}
+	host := parsed.Hostname()
+	if host == "" {
+		return false
+	}
+	if port := parsed.Port(); port != "" {
+		number, err := strconv.Atoi(port)
+		if err != nil || number < 1 || number > 65535 {
+			return false
+		}
+	}
+	if net.ParseIP(host) != nil {
+		return true
+	}
+	host = strings.TrimSuffix(host, ".")
+	if host == "" || len(host) > 253 {
+		return false
+	}
+	for _, label := range strings.Split(host, ".") {
+		if len(label) == 0 || len(label) > 63 ||
+			label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		for _, character := range label {
+			if (character < 'a' || character > 'z') &&
+				(character < 'A' || character > 'Z') &&
+				(character < '0' || character > '9') &&
+				character != '-' {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func (a *oidcAuthenticator) browserAuthConfig(
@@ -754,7 +797,7 @@ func hasMappedValue(tokenValues []string, configured map[string]struct{}) bool {
 		return false
 	}
 	for _, value := range tokenValues {
-		if _, ok := configured[strings.TrimSpace(value)]; ok {
+		if _, ok := configured[value]; ok {
 			return true
 		}
 	}
@@ -770,8 +813,7 @@ func requiredStringClaim(claims jwt.MapClaims, name string) (string, error) {
 	if !ok {
 		return "", errMalformedClaim
 	}
-	text = strings.TrimSpace(text)
-	if text == "" {
+	if strings.TrimSpace(text) == "" {
 		return "", errMissingMappedClaim
 	}
 	return text, nil
@@ -802,8 +844,8 @@ func requiredStringListClaim(claims jwt.MapClaims, name string) ([]string, error
 	}
 	result := make([]string, 0, len(raw))
 	for _, item := range raw {
-		if text := strings.TrimSpace(item); text != "" {
-			result = append(result, text)
+		if strings.TrimSpace(item) != "" {
+			result = append(result, item)
 		}
 	}
 	if len(result) == 0 {
@@ -946,6 +988,9 @@ type jwksCache struct {
 	fetched     bool
 	lastAttempt time.Time
 	lastSuccess time.Time
+	refreshing  bool
+	refreshDone chan struct{}
+	refreshErr  error
 }
 
 // keyForID returns the public key for a key identifier. A miss refreshes at
@@ -956,37 +1001,77 @@ func (c *jwksCache) keyForID(
 	ctx context.Context,
 	kid string,
 ) (crypto.PublicKey, error) {
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		c.mu.Lock()
+		now := c.clock()
+		key, keyFound := c.keys[kid]
+		cacheAge := now.Sub(c.lastSuccess)
+		cacheFresh := !c.lastSuccess.IsZero() &&
+			cacheAge >= 0 && cacheAge < c.maxCacheAge
+		if keyFound && cacheFresh {
+			c.mu.Unlock()
+			return key, nil
+		}
+		if c.refreshing {
+			done := c.refreshDone
+			c.mu.Unlock()
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-done:
+				continue
+			}
+		}
+		sinceAttempt := now.Sub(c.lastAttempt)
+		if c.fetched && sinceAttempt >= 0 &&
+			sinceAttempt < c.minRefreshInterval {
+			// Refuse rather than fetch: a recent attempt already ran, so an
+			// unknown key or stale cached key fails closed instead of
+			// triggering a storm or continuing to trust a removed key.
+			err := c.refreshErr
+			c.mu.Unlock()
+			if err != nil {
+				return nil, err
+			}
+			return nil, errNoMatchingKey
+		}
+		refreshMetadata := c.fetched
+		c.lastAttempt = now
+		c.fetched = true
+		c.refreshing = true
+		c.refreshDone = make(chan struct{})
+		done := c.refreshDone
+		c.mu.Unlock()
+
+		// Refresh is shared process state, so it must not inherit the first
+		// untrusted caller's cancellation. A cache-owned timeout bounds the
+		// work, while each caller can stop waiting through its own context.
+		go c.refresh(refreshMetadata, done)
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-done:
+		}
+	}
+}
+
+func (c *jwksCache) refresh(refreshMetadata bool, done chan struct{}) {
+	ctx, cancel := context.WithTimeout(context.Background(), oidcHTTPTimeout)
+	keys, err := c.fetch(ctx, refreshMetadata)
+	cancel()
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	now := c.clock()
-	key, keyFound := c.keys[kid]
-	cacheAge := now.Sub(c.lastSuccess)
-	cacheFresh := !c.lastSuccess.IsZero() &&
-		cacheAge >= 0 && cacheAge < c.maxCacheAge
-	if keyFound && cacheFresh {
-		return key, nil
+	if err == nil {
+		c.keys = keys
+		c.lastSuccess = c.clock()
 	}
-	sinceAttempt := now.Sub(c.lastAttempt)
-	if c.fetched && sinceAttempt >= 0 &&
-		sinceAttempt < c.minRefreshInterval {
-		// Refuse rather than fetch: a recent attempt already ran, so an
-		// unknown key or stale cached key fails closed instead of triggering a
-		// storm or continuing to trust a key the issuer may have removed.
-		return nil, errNoMatchingKey
-	}
-	refreshMetadata := c.fetched
-	c.lastAttempt = now
-	c.fetched = true
-	keys, err := c.fetch(ctx, refreshMetadata)
-	if err != nil {
-		return nil, err
-	}
-	c.keys = keys
-	c.lastSuccess = now
-	if key, ok := keys[kid]; ok {
-		return key, nil
-	}
-	return nil, errNoMatchingKey
+	c.refreshErr = err
+	c.refreshing = false
+	close(done)
 }
 
 // fetch resolves the JWKS URI (via static override or OIDC discovery) and loads

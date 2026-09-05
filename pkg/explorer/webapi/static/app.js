@@ -348,8 +348,8 @@ function clearCallbackFromUrl() {
 }
 
 // beginLogin starts the interactive Authorization Code + PKCE flow. The
-// verifier, state and nonce are single-use login-flow artifacts — not the
-// credential — and must survive the full-page redirect, so they live briefly in
+// verifier and state are single-use login-flow artifacts — not the credential —
+// and must survive the full-page redirect, so they live briefly in
 // sessionStorage and are cleared the instant the callback is consumed. The
 // access token itself is never written to any storage (see
 // completeLoginFromRedirect); it is held in memory only.
@@ -366,7 +366,6 @@ async function beginLogin() {
   window.location.assign(buildAuthorizeUrl(state.auth, {
     redirectUri: flow.redirectUri,
     state: flow.state,
-    nonce: flow.nonce,
     codeChallenge,
   }));
 }

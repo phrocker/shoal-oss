@@ -18,9 +18,11 @@
 package webapi
 
 import (
+	"net"
 	"net/http"
 	"net/url"
 	"path"
+	"strconv"
 	"strings"
 )
 
@@ -101,10 +103,43 @@ func (h *Handler) connectSources() string {
 func endpointOrigin(endpoint string) string {
 	parsed, err := url.Parse(strings.TrimSpace(endpoint))
 	if err != nil || parsed.Scheme != "https" || parsed.Host == "" ||
-		parsed.User != nil {
+		parsed.User != nil || strings.ContainsAny(
+		parsed.Host, "*'\"; \t\r\n\\",
+	) || !validEndpointHost(parsed.Hostname()) {
 		return ""
 	}
+	if port := parsed.Port(); port != "" {
+		number, err := strconv.Atoi(port)
+		if err != nil || number < 1 || number > 65535 {
+			return ""
+		}
+	}
 	return parsed.Scheme + "://" + parsed.Host
+}
+
+func validEndpointHost(host string) bool {
+	if net.ParseIP(host) != nil {
+		return true
+	}
+	host = strings.TrimSuffix(host, ".")
+	if host == "" || len(host) > 253 {
+		return false
+	}
+	for _, label := range strings.Split(host, ".") {
+		if len(label) == 0 || len(label) > 63 ||
+			label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		for _, character := range label {
+			if (character < 'a' || character > 'z') &&
+				(character < 'A' || character > 'Z') &&
+				(character < '0' || character > '9') &&
+				character != '-' {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // publiclyReachable is the fail-closed allowlist of request lines the transport

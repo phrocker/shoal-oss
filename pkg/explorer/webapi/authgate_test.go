@@ -332,4 +332,19 @@ func TestContentSecurityPolicyScopesToConfiguredEndpoints(t *testing.T) {
 	if strings.Contains(csp, "/tenant/") || strings.Contains(csp, "/oauth/") {
 		t.Fatalf("CSP leaked endpoint paths, must be origins only: %q", csp)
 	}
+
+	wildcard := newStubServer(t, func(handler *webapi.Handler) {
+		handler.SetBrowserAuthConfig(&webapi.BrowserAuthConfig{
+			ClientID:              "client-456",
+			Scope:                 "openid",
+			AuthorizationEndpoint: "https://identity.example/authorize",
+			TokenEndpoint:         "https://*/token",
+		})
+	})
+	response, _ = getJSON(t, wildcard, "/api/v1/auth-config")
+	csp = response.Header.Get("Content-Security-Policy")
+	if !strings.Contains(csp, "connect-src 'self';") ||
+		strings.Contains(csp, "https://*") {
+		t.Fatalf("wildcard token endpoint widened CSP: %q", csp)
+	}
 }
