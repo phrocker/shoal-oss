@@ -498,15 +498,16 @@ func TestAsOfRequiresHistoricalScannerContract(t *testing.T) {
 }
 
 func TestConfiguredVectorIndexDeclaresAndRunsDistributedApproximateSearch(t *testing.T) {
+	const embeddingSpace = "test-provider:test-model-v1:4:l2"
 	store := vectorindex.NewMemoryStore()
 	manager := vectorindex.New(store, vectorindex.Config{
 		NList: 2, Subspaces: 2, CentroidsPerSpace: 2, MaxIterations: 8,
 		Seed: 9, ShardCount: 2,
 	})
 	records := []vectorindex.VectorRecord{
-		{ID: "evt:a", Vector: []float32{1, 0, 0, 0}, Timestamp: 10, Visibility: "public",
+		{ID: "evt:a", Vector: []float32{1, 0, 0, 0}, EmbeddingSpace: embeddingSpace, Timestamp: 10, Visibility: "public",
 			Document: vectorindex.DocumentRef{Row: "evt:a"}},
-		{ID: "evt:b", Vector: []float32{0, 1, 0, 0}, Timestamp: 10, Visibility: "secret",
+		{ID: "evt:b", Vector: []float32{0, 1, 0, 0}, EmbeddingSpace: embeddingSpace, Timestamp: 10, Visibility: "secret",
 			Document: vectorindex.DocumentRef{Row: "evt:b"}},
 	}
 	if _, err := manager.Build(context.Background(), "graph_ivf", records, 10); err != nil {
@@ -523,6 +524,7 @@ func TestConfiguredVectorIndexDeclaresAndRunsDistributedApproximateSearch(t *tes
 	}
 	hits, evidence, err := backend.SearchVector(context.Background(), shoalql.VectorSearchRequest{
 		Index: "graph_ivf", Query: []float32{1, 0, 0, 0}, TopK: 2, NProbe: 2,
+		EmbeddingSpace: embeddingSpace,
 	})
 	if err != nil {
 		t.Fatal(err)

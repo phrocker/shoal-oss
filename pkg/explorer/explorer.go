@@ -60,6 +60,11 @@ type Explorer struct {
 	embedder                model.Embedder
 	embedders               map[string]model.Embedder
 	maxEmbeddingSpaceFanout int
+	queryEmbeddingMu        sync.Mutex
+	queryEmbeddingCache     map[embeddingQueryCacheKey]cachedQueryEmbedding
+	queryEmbeddingOrder     []embeddingQueryCacheKey
+	maxQueryEmbeddingCache  int
+	embeddingQueryObserver  func(EmbeddingQueryEvent)
 	recallEvidence          map[string]string
 	embeddingSpace          embeddingSpaceCache
 	latentLinkProjection    LatentLinkAssertionProjection
@@ -112,6 +117,18 @@ type persistedEdge struct {
 	PublishedAt time.Time
 }
 
+// EmbeddingQueryEvent is one operator-visible multi-space query outcome.
+// It contains stable space identities and counters only, never query text,
+// vector bytes, provider credentials, or source content.
+type EmbeddingQueryEvent struct {
+	SpaceIdentities []string
+	FanoutLimit     int
+	CacheHits       int
+	ProviderCalls   int
+	Unavailable     []string
+	FanoutExceeded  bool
+}
+
 // Options configures optional embedded Explorer features.
 type Options struct {
 	// Embedder enables vector indexing and retrieval. It must also implement
@@ -128,6 +145,14 @@ type Options struct {
 	// MaxEmbeddingSpaceFanout bounds provider calls for one vector query. Zero
 	// defaults to eight distinct spaces.
 	MaxEmbeddingSpaceFanout int
+
+	// MaxEmbeddingQueryCacheEntries bounds cached query vectors across every
+	// embedding space. Zero defaults to 256 entries.
+	MaxEmbeddingQueryCacheEntries int
+
+	// EmbeddingQueryObserver receives one bounded fan-out summary per vector
+	// retrieval or vector-score request. It must be safe for concurrent use.
+	EmbeddingQueryObserver func(EmbeddingQueryEvent)
 
 	// RecallEvidence records benchmark evidence per embedding-space identity.
 	RecallEvidence map[string]string
@@ -167,6 +192,10 @@ func OpenWithOptions(dir string, options Options) (*Explorer, error) {
 	if maxFanout <= 0 {
 		maxFanout = 8
 	}
+	maxQueryCache := options.MaxEmbeddingQueryCacheEntries
+	if maxQueryCache <= 0 {
+		maxQueryCache = 256
+	}
 	latentProjection, err := latentLinkProjectionForOptions(
 		options.LatentLinkProjection)
 	if err != nil {
@@ -204,6 +233,9 @@ func OpenWithOptions(dir string, options Options) (*Explorer, error) {
 		embedder:                options.Embedder,
 		embedders:               embedders,
 		maxEmbeddingSpaceFanout: maxFanout,
+		queryEmbeddingCache:     make(map[embeddingQueryCacheKey]cachedQueryEmbedding),
+		maxQueryEmbeddingCache:  maxQueryCache,
+		embeddingQueryObserver:  options.EmbeddingQueryObserver,
 		recallEvidence:          cloneStringMap(options.RecallEvidence),
 		latentLinkProjection:    latentProjection,
 		maxLatentAssertions:     maxLatentAssertions,

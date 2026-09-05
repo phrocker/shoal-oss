@@ -91,6 +91,13 @@ func (e *Explorer) retrieve(
 		return retrieval.Response{}, shoal.NewError(
 			shoal.ErrorInvalidArgument, "retrieval text has no searchable terms")
 	}
+	var queryEvent EmbeddingQueryEvent
+	var observeQuery bool
+	defer func() {
+		if observeQuery {
+			e.observeEmbeddingQuery(queryEvent)
+		}
+	}()
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 	if err := e.requireOpen(); err != nil {
@@ -105,30 +112,11 @@ func (e *Explorer) retrieve(
 		if err != nil {
 			return retrieval.Response{}, err
 		}
-		if len(spacesByIdentity) > e.maxEmbeddingSpaceFanout {
-			return retrieval.Response{}, shoal.NewError(
-				shoal.ErrorUnavailable,
-				"vector retrieval spans too many embedding spaces",
-			)
-		}
-		spaceKeys := make([]string, 0, len(spacesByIdentity))
-		for identity := range spacesByIdentity {
-			spaceKeys = append(spaceKeys, identity)
-		}
-		sort.Strings(spaceKeys)
-		for _, identity := range spaceKeys {
-			space := spacesByIdentity[identity]
-			_, vector, err := e.embedQueryInSpace(ctx, request.Text, space)
-			if err != nil {
-				return retrieval.Response{}, err
-			}
-			queryVectors[identity] = vector
-			participatingSpaces = append(participatingSpaces, space)
-		}
-		if len(participatingSpaces) == 0 {
-			if _, _, err := e.embedQuery(ctx, request.Text); err != nil {
-				return retrieval.Response{}, err
-			}
+		queryVectors, participatingSpaces, queryEvent, err =
+			e.embedQueriesForSpaces(ctx, request.Text, spacesByIdentity)
+		observeQuery = true
+		if err != nil {
+			return retrieval.Response{}, err
 		}
 	}
 	mixedVectorSpaces := hasVector && len(participatingSpaces) > 1
@@ -477,7 +465,12 @@ func (e *Explorer) embeddingSpacesForScanLocked(
 		if _, err := recordEmbeddingMap(record); err != nil {
 			return nil, err
 		}
-		spaces[record.Embeddings.Provenance.Identity] = record.Embeddings.Provenance
+		current := record.Embeddings.Provenance
+		if existing, ok := spaces[current.Identity]; ok &&
+			existing != current {
+			return nil, conflictingEmbeddingProvenanceError(existing, current)
+		}
+		spaces[current.Identity] = current
 	}
 	return spaces, nil
 }

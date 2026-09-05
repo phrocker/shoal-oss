@@ -43,11 +43,12 @@ const (
 )
 
 type VectorOptions struct {
-	Mode          VectorMode
-	Index         string
-	NProbe        int
-	Freshness     vectorindex.Freshness
-	ExactFallback bool
+	Mode           VectorMode
+	Index          string
+	EmbeddingSpace string
+	NProbe         int
+	Freshness      vectorindex.Freshness
+	ExactFallback  bool
 }
 
 // OutColKind classifies how the executor materializes an output column.
@@ -164,13 +165,14 @@ type Plan struct {
 	// type, and the union of all field names encountered.
 	DocStar bool
 
-	VectorMode          VectorMode
-	VectorIndex         string
-	VectorQuery         []float32
-	VectorTopK          int
-	VectorNProbe        int
-	VectorFreshness     vectorindex.Freshness
-	VectorExactFallback bool
+	VectorMode           VectorMode
+	VectorIndex          string
+	VectorQuery          []float32
+	VectorEmbeddingSpace string
+	VectorTopK           int
+	VectorNProbe         int
+	VectorFreshness      vectorindex.Freshness
+	VectorExactFallback  bool
 }
 
 // DocTerm is one indexed document predicate: FIELD = Value (exact).
@@ -354,6 +356,7 @@ func planDocument(ctx context.Context, stmt *SelectStmt, dm documentModel, opts 
 			p.VectorIndex = opts.Vector.Index
 		}
 		p.VectorQuery = append([]float32(nil), vec...)
+		p.VectorEmbeddingSpace = opts.Vector.EmbeddingSpace
 		p.VectorTopK = topK
 		p.VectorNProbe = opts.Vector.NProbe
 		p.VectorFreshness = opts.Vector.Freshness
@@ -450,6 +453,7 @@ func planVectorKNN(ctx context.Context, stmt *SelectStmt, binding TableBinding, 
 		p.VectorIndex = p.Table + "_ivf"
 	}
 	p.VectorQuery = append([]float32(nil), vec...)
+	p.VectorEmbeddingSpace = opts.Vector.EmbeddingSpace
 	p.VectorTopK = topK
 	p.VectorNProbe = opts.Vector.NProbe
 	p.VectorFreshness = opts.Vector.Freshness

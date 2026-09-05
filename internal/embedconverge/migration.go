@@ -273,6 +273,7 @@ type SpaceCount struct {
 	State    embeddingspace.State `json:"state"`
 	Identity string               `json:"identity,omitempty"`
 	Files    int                  `json:"files"`
+	Spans    int64                `json:"spans"`
 }
 
 // Progress is what an operator watches.
@@ -342,6 +343,7 @@ func (m *Migration) Progress() Progress {
 			counts[key] = count
 		}
 		count.Files++
+		count.Spans += file.Spans
 	}
 	out.Spaces = make([]SpaceCount, 0, len(counts))
 	for _, count := range counts {

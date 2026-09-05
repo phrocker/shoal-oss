@@ -78,6 +78,7 @@ type VectorExplainBackend interface {
 type VectorSearchRequest struct {
 	Index            string
 	Query            []float32
+	EmbeddingSpace   string
 	TopK             int
 	NProbe           int
 	AsOf             *int64
@@ -280,7 +281,8 @@ func (e *Executor) runExactVectorKNN(ctx context.Context, p *Plan) (*Result, err
 func (e *Executor) runApproxVectorKNN(ctx context.Context, p *Plan, backend ApproximateVectorBackend) (*Result, error) {
 	hits, _, err := backend.SearchVector(ctx, VectorSearchRequest{
 		Index: p.VectorIndex, Query: append([]float32(nil), p.VectorQuery...),
-		TopK: p.VectorTopK, NProbe: p.VectorNProbe, AsOf: p.AsOf,
+		EmbeddingSpace: p.VectorEmbeddingSpace,
+		TopK:           p.VectorTopK, NProbe: p.VectorNProbe, AsOf: p.AsOf,
 		Freshness: p.VectorFreshness, ExactFallback: p.VectorExactFallback,
 	})
 	if err != nil {

@@ -20,10 +20,10 @@ func ref(entry string) FileRef {
 
 func observations() []Observation {
 	return []Observation{
-		{Ref: ref("f-old.rf"), State: embeddingspace.Has("model-b")},
-		{Ref: ref("f-target.rf"), State: embeddingspace.Has("model-a")},
-		{Ref: ref("f-none.rf"), State: embeddingspace.NoEmbeddings()},
-		{Ref: ref("f-unknown.rf"), State: embeddingspace.Unknown()},
+		{Ref: ref("f-old.rf"), State: embeddingspace.Has("model-b"), Spans: 10},
+		{Ref: ref("f-target.rf"), State: embeddingspace.Has("model-a"), Spans: 20},
+		{Ref: ref("f-none.rf"), State: embeddingspace.NoEmbeddings(), Spans: 30},
+		{Ref: ref("f-unknown.rf"), State: embeddingspace.Unknown(), Spans: 40},
 	}
 }
 
@@ -105,6 +105,11 @@ func TestSnapshotRefusesUnusableInput(t *testing.T) {
 		{"invalid state", func() (Epoch, error) {
 			return Snapshot("e", "t", "model-a", ModeLazy, 0, []Observation{
 				{Ref: ref("f.rf"), State: embeddingspace.FileState{State: "bogus"}},
+			})
+		}},
+		{"negative spans", func() (Epoch, error) {
+			return Snapshot("e", "t", "model-a", ModeLazy, 0, []Observation{
+				{Ref: ref("f.rf"), State: embeddingspace.NoEmbeddings(), Spans: -1},
 			})
 		}},
 		{"no entry", func() (Epoch, error) {
@@ -207,8 +212,10 @@ func TestEncodeRefusesAnInvalidEpoch(t *testing.T) {
 }
 
 func equalEpochFile(a, b EpochFile) bool {
-	return a.Ref.Equal(b.Ref) && a.Status == b.Status && a.Current == b.Current &&
-		a.Attempts == b.Attempts && a.LastError == b.LastError
+	return a.Ref.Equal(b.Ref) && a.Status == b.Status &&
+		a.Observed == b.Observed && a.Current == b.Current &&
+		a.Attempts == b.Attempts && a.Spans == b.Spans &&
+		a.LastError == b.LastError
 }
 
 // TestFileRefSurvivesNonUTF8ExtentBytes covers finding 7. A tablet

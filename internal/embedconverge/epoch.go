@@ -105,6 +105,8 @@ func (r FileRef) valid() bool { return r.Table != "" && r.Entry != "" }
 type Observation struct {
 	Ref   FileRef
 	State embeddingspace.FileState
+	// Spans is the metadata entry count used for per-space migration progress.
+	Spans int64
 }
 
 // EpochFile is one file's entry in a frozen migration set.
@@ -118,6 +120,7 @@ type EpochFile struct {
 	Current  embeddingspace.FileState `json:"current"`
 	Status   FileStatus               `json:"status"`
 	Attempts int                      `json:"attempts,omitempty"`
+	Spans    int64                    `json:"spans,omitempty"`
 	// LastError is the most recent failure, retained so an operator can
 	// see *why* a migration stalled rather than only that it did.
 	LastError string `json:"last_error,omitempty"`
@@ -191,6 +194,11 @@ func Snapshot(
 		if err := item.State.Validate(); err != nil {
 			return Epoch{}, fmt.Errorf("%w: %v", ErrInvalidEpoch, err)
 		}
+		if item.Spans < 0 {
+			return Epoch{}, fmt.Errorf(
+				"%w: file %q has negative span count %d",
+				ErrInvalidEpoch, item.Ref.Entry, item.Spans)
+		}
 		key := item.Ref.Key()
 		if _, dup := seen[key]; dup {
 			return Epoch{}, fmt.Errorf("%w: duplicate file reference %q", ErrInvalidEpoch, item.Ref.Entry)
@@ -206,6 +214,7 @@ func Snapshot(
 			Observed: item.State,
 			Current:  item.State,
 			Status:   status,
+			Spans:    item.Spans,
 		})
 	}
 	sort.Slice(epoch.Files, func(i, j int) bool {
@@ -249,6 +258,11 @@ func (e Epoch) Validate() error {
 		}
 		if err := file.Current.Validate(); err != nil {
 			return fmt.Errorf("%w: %v", ErrInvalidEpoch, err)
+		}
+		if file.Spans < 0 {
+			return fmt.Errorf(
+				"%w: file %q has negative span count %d",
+				ErrInvalidEpoch, file.Ref.Entry, file.Spans)
 		}
 		switch file.Status {
 		case StatusPending, StatusSkipped, StatusConverged, StatusDeferred:

@@ -13,10 +13,12 @@ import (
 	"fmt"
 	"math"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/phrocker/shoal-oss/accumulo"
+	"github.com/phrocker/shoal-oss/internal/embeddingspace"
 	"github.com/phrocker/shoal-oss/internal/ivfpq"
 )
 
@@ -25,6 +27,7 @@ var (
 	ErrStale              = errors.New("vectorindex: index freshness contract not met")
 	ErrExactFallback      = errors.New("vectorindex: exact fallback required")
 	ErrGenerationConflict = errors.New("vectorindex: active generation changed")
+	ErrEmbeddingSpace     = errors.New("vectorindex: embedding space identity required")
 )
 
 type DocumentRef struct {
@@ -36,12 +39,13 @@ type DocumentRef struct {
 }
 
 type VectorRecord struct {
-	ID         string      `json:"id"`
-	Vector     []float32   `json:"-"`
-	Document   DocumentRef `json:"document"`
-	Visibility string      `json:"visibility,omitempty"`
-	Timestamp  int64       `json:"timestamp"`
-	Tombstone  bool        `json:"tombstone,omitempty"`
+	ID             string      `json:"id"`
+	Vector         []float32   `json:"-"`
+	EmbeddingSpace string      `json:"embedding_space,omitempty"`
+	Document       DocumentRef `json:"document"`
+	Visibility     string      `json:"visibility,omitempty"`
+	Timestamp      int64       `json:"timestamp"`
+	Tombstone      bool        `json:"tombstone,omitempty"`
 }
 
 type Posting struct {
@@ -76,6 +80,7 @@ type Manifest struct {
 	Generation        uint64         `json:"generation"`
 	ParentGeneration  uint64         `json:"parent_generation,omitempty"`
 	CodebookVersion   string         `json:"codebook_version"`
+	EmbeddingSpace    string         `json:"embedding_space"`
 	Dimension         int            `json:"dimension"`
 	NList             int            `json:"nlist"`
 	Subspaces         int            `json:"subspaces"`
@@ -181,6 +186,10 @@ func (m *Manager) build(ctx context.Context, index string, records []VectorRecor
 		}
 	}
 	sort.Slice(live, func(i, j int) bool { return live[i].ID < live[j].ID })
+	embeddingSpace, err := embeddingSpaceForRecords("train vector index", live)
+	if err != nil {
+		return Manifest{}, err
+	}
 	cfg, err := m.cfg.normalized(len(live))
 	if err != nil {
 		return Manifest{}, err
@@ -202,17 +211,20 @@ func (m *Manager) build(ctx context.Context, index string, records []VectorRecor
 	if cfg.CentroidsPerSpace > len(sample) {
 		cfg.CentroidsPerSpace = len(sample)
 	}
-	version := codebookDigest(sample, cfg)
+	version := codebookDigest(sample, cfg, embeddingSpace)
 	versionNumber := int32(binary.BigEndian.Uint32(mustDecodePrefix(version, 4)) & 0x7fffffff)
 	vectors := make([][]float32, len(sample))
 	for i := range sample {
 		vectors[i] = sample[i].Vector
 	}
-	centroids, err := ivfpq.TrainCentroids(vectors, cfg.NList, cfg.MaxIterations, cfg.Seed, versionNumber)
+	centroids, err := ivfpq.TrainCentroidsInSpace(
+		vectors, cfg.NList, cfg.MaxIterations, cfg.Seed, versionNumber, embeddingSpace)
 	if err != nil {
 		return Manifest{}, err
 	}
-	pq, err := ivfpq.TrainPQ(vectors, cfg.Subspaces, cfg.CentroidsPerSpace, cfg.MaxIterations, cfg.Seed, versionNumber)
+	pq, err := ivfpq.TrainPQInSpace(
+		vectors, cfg.Subspaces, cfg.CentroidsPerSpace, cfg.MaxIterations,
+		cfg.Seed, versionNumber, embeddingSpace)
 	if err != nil {
 		return Manifest{}, err
 	}
@@ -235,8 +247,9 @@ func (m *Manager) build(ctx context.Context, index string, records []VectorRecor
 	centroidBytes, _ := centroids.Bytes()
 	pqBytes, _ := pq.Bytes()
 	manifest := Manifest{
-		FormatVersion: 1, Index: index, Generation: generation, ParentGeneration: parent,
-		CodebookVersion: version, Dimension: dim, NList: cfg.NList, Subspaces: cfg.Subspaces,
+		FormatVersion: 2, Index: index, Generation: generation, ParentGeneration: parent,
+		CodebookVersion: version, EmbeddingSpace: embeddingSpace,
+		Dimension: dim, NList: cfg.NList, Subspaces: cfg.Subspaces,
 		CentroidsPerSpace: cfg.CentroidsPerSpace, ShardCount: cfg.ShardCount,
 		SourceWatermark: sourceWatermark, IndexedWatermark: sourceWatermark,
 		CreatedAtUnixMS: cfg.CreatedAt().UTC().UnixMilli(), Lineage: append([]uint64(nil), lineage...),
@@ -257,11 +270,22 @@ func (m *Manager) Update(ctx context.Context, index string, changes []VectorReco
 	if err != nil {
 		return Manifest{}, err
 	}
+	if err := validateManifestEmbeddingSpace(active.Manifest); err != nil {
+		return Manifest{}, err
+	}
 	centroids, err := ivfpq.CentroidsFromBytes(active.Centroids)
 	if err != nil {
 		return Manifest{}, err
 	}
+	centroids, err = centroids.WithEmbeddingSpace(active.Manifest.EmbeddingSpace)
+	if err != nil {
+		return Manifest{}, err
+	}
 	pq, err := ivfpq.FromBytes(active.PQ)
+	if err != nil {
+		return Manifest{}, err
+	}
+	pq, err = pq.WithEmbeddingSpace(active.Manifest.EmbeddingSpace)
 	if err != nil {
 		return Manifest{}, err
 	}
@@ -275,9 +299,24 @@ func (m *Manager) Update(ctx context.Context, index string, changes []VectorReco
 			return Manifest{}, errors.New("vectorindex: update has empty id")
 		}
 		if change.Tombstone {
+			if change.EmbeddingSpace != "" {
+				if err := embeddingspace.EnsureSameIdentity(
+					"update vector index", active.Manifest.EmbeddingSpace,
+					change.EmbeddingSpace); err != nil {
+					return Manifest{}, err
+				}
+			}
 			postings = append(postings, postingFor(change, 0, active.Manifest.ShardCount, active.Manifest.CodebookVersion, nil))
 			tombstones++
 			continue
+		}
+		if err := requireEmbeddingSpace("update vector index", change.EmbeddingSpace); err != nil {
+			return Manifest{}, err
+		}
+		if err := embeddingspace.EnsureSameIdentity(
+			"update vector index", active.Manifest.EmbeddingSpace,
+			change.EmbeddingSpace); err != nil {
+			return Manifest{}, err
 		}
 		if len(change.Vector) != active.Manifest.Dimension {
 			return Manifest{}, fmt.Errorf("vectorindex: update %q dimension %d, want %d", change.ID, len(change.Vector), active.Manifest.Dimension)
@@ -312,6 +351,9 @@ func (m *Manager) Update(ctx context.Context, index string, changes []VectorReco
 func (m *Manager) Compact(ctx context.Context, index string, beforeTimestamp int64) (Manifest, error) {
 	active, err := m.store.Active(ctx, index)
 	if err != nil {
+		return Manifest{}, err
+	}
+	if err := validateManifestEmbeddingSpace(active.Manifest); err != nil {
 		return Manifest{}, err
 	}
 	latest := map[string]Posting{}
@@ -357,6 +399,9 @@ func (m *Manager) SetRecallContract(ctx context.Context, index string, recall Re
 	if err != nil {
 		return Manifest{}, err
 	}
+	if err := validateManifestEmbeddingSpace(active.Manifest); err != nil {
+		return Manifest{}, err
+	}
 	manifest := active.Manifest
 	manifest.ParentGeneration = manifest.Generation
 	manifest.Generation++
@@ -379,6 +424,7 @@ type Freshness struct {
 
 type Query struct {
 	Vector         []float32
+	EmbeddingSpace string
 	TopK           int
 	NProbe         int
 	Authorizations map[string]bool
@@ -400,6 +446,7 @@ type Evidence struct {
 	Index              string         `json:"index"`
 	Generation         uint64         `json:"generation"`
 	CodebookVersion    string         `json:"codebook_version"`
+	EmbeddingSpace     string         `json:"embedding_space"`
 	IndexedWatermark   int64          `json:"indexed_watermark"`
 	SourceWatermark    int64          `json:"source_watermark"`
 	NProbe             int            `json:"nprobe"`
@@ -420,8 +467,8 @@ func (e Evidence) Explain() string {
 		recall = fmt.Sprintf("measured recall@%d=%.4f minimum=%.4f corpus=%s ref=%s",
 			e.Recall.TopK, e.Recall.Measured, e.Recall.Minimum, e.Recall.Corpus, e.Recall.BenchmarkRef)
 	}
-	return fmt.Sprintf("ivf-pq index=%s generation=%d codebook=%s watermark=%d/%d nprobe=%d clusters=%v shards=%v candidates=%d merge=%s fallback=%t reason=%q recall=%s",
-		e.Index, e.Generation, e.CodebookVersion, e.IndexedWatermark, e.SourceWatermark,
+	return fmt.Sprintf("ivf-pq index=%s generation=%d space=%s codebook=%s watermark=%d/%d nprobe=%d clusters=%v shards=%v candidates=%d merge=%s fallback=%t reason=%q recall=%s",
+		e.Index, e.Generation, e.EmbeddingSpace, e.CodebookVersion, e.IndexedWatermark, e.SourceWatermark,
 		e.NProbe, e.Clusters, e.Shards, e.CandidateCount, e.DeterministicMerge,
 		e.ExactFallback, e.FallbackReason, recall)
 }
@@ -431,14 +478,26 @@ func (m *Manager) Search(ctx context.Context, index string, query Query) ([]Hit,
 	if err != nil {
 		return nil, Evidence{}, err
 	}
+	if err := validateManifestEmbeddingSpace(active.Manifest); err != nil {
+		return nil, Evidence{}, err
+	}
 	evidence := Evidence{
 		Index: index, Generation: active.Manifest.Generation, CodebookVersion: active.Manifest.CodebookVersion,
+		EmbeddingSpace:   active.Manifest.EmbeddingSpace,
 		IndexedWatermark: active.Manifest.IndexedWatermark, SourceWatermark: query.Freshness.SourceWatermark,
 		Recall: active.Manifest.Recall, RecallClaimed: active.Manifest.Recall.Benchmarked(),
 		DeterministicMerge: "score descending, document id ascending",
 	}
 	if evidence.SourceWatermark == 0 {
 		evidence.SourceWatermark = active.Manifest.SourceWatermark
+	}
+	if err := requireEmbeddingSpace("compare vector query", query.EmbeddingSpace); err != nil {
+		return nil, evidence, err
+	}
+	if err := embeddingspace.EnsureSameIdentity(
+		"compare vector query", active.Manifest.EmbeddingSpace,
+		query.EmbeddingSpace); err != nil {
+		return nil, evidence, err
 	}
 	if reason := staleReason(active.Manifest, query.Freshness); reason != "" {
 		evidence.ExactFallback = query.ExactFallback
@@ -455,7 +514,15 @@ func (m *Manager) Search(ctx context.Context, index string, query Query) ([]Hit,
 	if err != nil {
 		return nil, evidence, err
 	}
+	centroids, err = centroids.WithEmbeddingSpace(active.Manifest.EmbeddingSpace)
+	if err != nil {
+		return nil, evidence, err
+	}
 	pq, err := ivfpq.FromBytes(active.PQ)
+	if err != nil {
+		return nil, evidence, err
+	}
+	pq, err = pq.WithEmbeddingSpace(active.Manifest.EmbeddingSpace)
 	if err != nil {
 		return nil, evidence, err
 	}
@@ -466,7 +533,10 @@ func (m *Manager) Search(ctx context.Context, index string, query Query) ([]Hit,
 	if query.NProbe <= 0 {
 		query.NProbe = min(8, active.Manifest.NList)
 	}
-	clusters := centroids.NProbe(vec, query.NProbe)
+	clusters, err := centroids.NProbeInSpace(vec, query.NProbe, query.EmbeddingSpace)
+	if err != nil {
+		return nil, evidence, err
+	}
 	evidence.NProbe, evidence.Clusters = len(clusters), append([]int(nil), clusters...)
 	clusterSet := make(map[int]bool, len(clusters))
 	shardSet := map[int]bool{}
@@ -478,7 +548,7 @@ func (m *Manager) Search(ctx context.Context, index string, query Query) ([]Hit,
 		evidence.Shards = append(evidence.Shards, shard)
 	}
 	sort.Ints(evidence.Shards)
-	ip, err := pq.InnerProductTable(vec)
+	ip, err := pq.InnerProductTableInSpace(vec, query.EmbeddingSpace)
 	if err != nil {
 		return nil, evidence, err
 	}
@@ -545,6 +615,9 @@ func documentIdentity(document DocumentRef) string {
 func (m *Manager) Describe(ctx context.Context, index string) (Manifest, error) {
 	snapshot, err := m.store.Active(ctx, index)
 	if err != nil {
+		return Manifest{}, err
+	}
+	if err := validateManifestEmbeddingSpace(snapshot.Manifest); err != nil {
 		return Manifest{}, err
 	}
 	return snapshot.Manifest, nil
@@ -648,9 +721,12 @@ func deterministicSample(records []VectorRecord, maximum int, seed int64) []Vect
 	return out
 }
 
-func codebookDigest(records []VectorRecord, cfg Config) string {
+func codebookDigest(records []VectorRecord, cfg Config, embeddingSpace string) string {
 	h := sha256.New()
 	var buf [8]byte
+	binary.BigEndian.PutUint64(buf[:], uint64(len(embeddingSpace)))
+	_, _ = h.Write(buf[:])
+	_, _ = h.Write([]byte(embeddingSpace))
 	for _, v := range []int64{int64(cfg.NList), int64(cfg.Subspaces), int64(cfg.CentroidsPerSpace), int64(cfg.MaxIterations), cfg.Seed} {
 		binary.BigEndian.PutUint64(buf[:], uint64(v))
 		_, _ = h.Write(buf[:])
@@ -663,6 +739,43 @@ func codebookDigest(records []VectorRecord, cfg Config) string {
 		}
 	}
 	return hex.EncodeToString(h.Sum(nil)[:16])
+}
+
+func embeddingSpaceForRecords(operation string, records []VectorRecord) (string, error) {
+	if len(records) == 0 {
+		return "", fmt.Errorf("%w: %s has no live vectors", ErrEmbeddingSpace, operation)
+	}
+	identity := records[0].EmbeddingSpace
+	if err := requireEmbeddingSpace(operation, identity); err != nil {
+		return "", err
+	}
+	for _, record := range records[1:] {
+		if err := requireEmbeddingSpace(operation, record.EmbeddingSpace); err != nil {
+			return "", err
+		}
+		if err := embeddingspace.EnsureSameIdentity(
+			operation, identity, record.EmbeddingSpace); err != nil {
+			return "", err
+		}
+	}
+	return identity, nil
+}
+
+func requireEmbeddingSpace(operation, identity string) error {
+	if strings.TrimSpace(identity) == "" {
+		return fmt.Errorf("%w: %s", ErrEmbeddingSpace, operation)
+	}
+	if err := embeddingspace.Has(identity).Validate(); err != nil {
+		return fmt.Errorf("%s: %w", operation, err)
+	}
+	return nil
+}
+
+func validateManifestEmbeddingSpace(manifest Manifest) error {
+	if err := requireEmbeddingSpace("read vector index manifest", manifest.EmbeddingSpace); err != nil {
+		return err
+	}
+	return nil
 }
 
 func mustDecodePrefix(value string, bytes int) []byte {

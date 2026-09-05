@@ -11,7 +11,11 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/phrocker/shoal-oss/internal/embeddingspace"
 )
+
+const testEmbeddingSpace = "test-provider:test-model-v1:normalized"
 
 func testConfig() Config {
 	return Config{
@@ -32,7 +36,8 @@ func corpus(n int) []VectorRecord {
 			float32(math.Cos(5 * angle)), float32(math.Sin(5 * angle)),
 		}
 		out[i] = VectorRecord{
-			ID: fmt.Sprintf("doc-%03d", i), Vector: vector, Timestamp: int64(100 + i),
+			ID: fmt.Sprintf("doc-%03d", i), Vector: vector,
+			EmbeddingSpace: testEmbeddingSpace, Timestamp: int64(100 + i),
 			Document: DocumentRef{
 				Row: fmt.Sprintf("evt:%03d", i), Shard: fmt.Sprintf("20240101_%d", i%5),
 				Datatype: "email", UID: fmt.Sprintf("u%03d", i),
@@ -104,7 +109,10 @@ func TestApproximateRecallContractRequiresBenchmark(t *testing.T) {
 	if _, err := manager.SetRecallContract(ctx, "docs_ivf", result.Recall); err != nil {
 		t.Fatal(err)
 	}
-	_, evidence, err := manager.Search(ctx, "docs_ivf", Query{Vector: records[7].Vector, TopK: 10, NProbe: 8})
+	_, evidence, err := manager.Search(ctx, "docs_ivf", Query{
+		Vector: records[7].Vector, EmbeddingSpace: testEmbeddingSpace,
+		TopK: 10, NProbe: 8,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -120,23 +128,27 @@ func TestUpdatesVisibilityAsOfTombstonesAndFreshness(t *testing.T) {
 	store := NewMemoryStore()
 	manager := New(store, cfg)
 	base := []VectorRecord{
-		{ID: "a", Vector: []float32{1, 0, 0, 0}, Timestamp: 10, Document: DocumentRef{Row: "evt:a"}},
-		{ID: "b", Vector: []float32{0, 1, 0, 0}, Timestamp: 10, Document: DocumentRef{Row: "evt:b"}},
+		{ID: "a", Vector: []float32{1, 0, 0, 0}, EmbeddingSpace: testEmbeddingSpace, Timestamp: 10, Document: DocumentRef{Row: "evt:a"}},
+		{ID: "b", Vector: []float32{0, 1, 0, 0}, EmbeddingSpace: testEmbeddingSpace, Timestamp: 10, Document: DocumentRef{Row: "evt:b"}},
 	}
 	if _, err := manager.Build(ctx, "idx", base, 10); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := manager.Update(ctx, "idx", []VectorRecord{
-		{ID: "a", Vector: []float32{0, 1, 0, 0}, Timestamp: 20, Visibility: "secret", Document: DocumentRef{Row: "evt:a"}},
+		{ID: "a", Vector: []float32{0, 1, 0, 0}, EmbeddingSpace: testEmbeddingSpace, Timestamp: 20, Visibility: "secret", Document: DocumentRef{Row: "evt:a"}},
 	}, 20); err != nil {
 		t.Fatal(err)
 	}
-	hits, _, err := manager.Search(ctx, "idx", Query{Vector: []float32{1, 0, 0, 0}, TopK: 2, NProbe: 2})
+	hits, _, err := manager.Search(ctx, "idx", Query{
+		Vector: []float32{1, 0, 0, 0}, EmbeddingSpace: testEmbeddingSpace,
+		TopK: 2, NProbe: 2,
+	})
 	if err != nil || len(hits) == 0 || hits[0].ID != "a" {
 		t.Fatalf("public view should retain old visible version: hits=%v err=%v", hits, err)
 	}
 	hits, _, err = manager.Search(ctx, "idx", Query{
-		Vector: []float32{0, 1, 0, 0}, TopK: 2, NProbe: 2,
+		Vector: []float32{0, 1, 0, 0}, EmbeddingSpace: testEmbeddingSpace,
+		TopK: 2, NProbe: 2,
 		Authorizations: map[string]bool{"secret": true},
 	})
 	if err != nil || len(hits) == 0 || hits[0].ID != "a" {
@@ -145,7 +157,10 @@ func TestUpdatesVisibilityAsOfTombstonesAndFreshness(t *testing.T) {
 	if _, err := manager.Update(ctx, "idx", []VectorRecord{{ID: "a", Timestamp: 30, Tombstone: true}}, 30); err != nil {
 		t.Fatal(err)
 	}
-	hits, _, err = manager.Search(ctx, "idx", Query{Vector: []float32{1, 0, 0, 0}, TopK: 2, NProbe: 2})
+	hits, _, err = manager.Search(ctx, "idx", Query{
+		Vector: []float32{1, 0, 0, 0}, EmbeddingSpace: testEmbeddingSpace,
+		TopK: 2, NProbe: 2,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -156,13 +171,15 @@ func TestUpdatesVisibilityAsOfTombstonesAndFreshness(t *testing.T) {
 	}
 	asOf := int64(25)
 	hits, _, err = manager.Search(ctx, "idx", Query{
-		Vector: []float32{1, 0, 0, 0}, TopK: 2, NProbe: 2, AsOf: &asOf,
+		Vector: []float32{1, 0, 0, 0}, EmbeddingSpace: testEmbeddingSpace,
+		TopK: 2, NProbe: 2, AsOf: &asOf,
 	})
 	if err != nil || len(hits) == 0 || hits[0].ID != "a" {
 		t.Fatalf("AS OF should recover pre-tombstone version: hits=%v err=%v", hits, err)
 	}
 	_, evidence, err := manager.Search(ctx, "idx", Query{
-		Vector: []float32{1, 0, 0, 0}, TopK: 1, NProbe: 1,
+		Vector: []float32{1, 0, 0, 0}, EmbeddingSpace: testEmbeddingSpace,
+		TopK: 1, NProbe: 1,
 		Freshness: Freshness{SourceWatermark: 50, MaxLag: 5}, ExactFallback: true,
 	})
 	if !errors.Is(err, ErrExactFallback) || !evidence.ExactFallback || evidence.FallbackReason == "" {
@@ -200,7 +217,10 @@ func TestReplayParityLocalMixedAndAccumuloOrder(t *testing.T) {
 		if err := store.Import(ctx, stream); err != nil {
 			t.Fatalf("%s import: %v", name, err)
 		}
-		hits, _, err := New(store, testConfig()).Search(ctx, "idx", Query{Vector: records[17].Vector, TopK: 12, NProbe: 8})
+		hits, _, err := New(store, testConfig()).Search(ctx, "idx", Query{
+			Vector: records[17].Vector, EmbeddingSpace: testEmbeddingSpace,
+			TopK: 12, NProbe: 8,
+		})
 		if err != nil {
 			t.Fatalf("%s search: %v", name, err)
 		}
@@ -223,7 +243,10 @@ func TestCancellationFaultAtomicityAndGenerationRace(t *testing.T) {
 
 	cancelled, cancel := context.WithCancel(ctx)
 	cancel()
-	if _, _, err := manager.Search(cancelled, "idx", Query{Vector: records[0].Vector, TopK: 10, NProbe: 8}); !errors.Is(err, context.Canceled) {
+	if _, _, err := manager.Search(cancelled, "idx", Query{
+		Vector: records[0].Vector, EmbeddingSpace: testEmbeddingSpace,
+		TopK: 10, NProbe: 8,
+	}); !errors.Is(err, context.Canceled) {
 		t.Fatalf("cancel error = %v", err)
 	}
 
@@ -233,7 +256,10 @@ func TestCancellationFaultAtomicityAndGenerationRace(t *testing.T) {
 		}
 		return nil
 	}
-	if _, err := manager.Update(ctx, "idx", []VectorRecord{{ID: "new", Vector: records[0].Vector, Timestamp: 999}}, 2); err == nil {
+	if _, err := manager.Update(ctx, "idx", []VectorRecord{{
+		ID: "new", Vector: records[0].Vector,
+		EmbeddingSpace: testEmbeddingSpace, Timestamp: 999,
+	}}, 2); err == nil {
 		t.Fatal("faulted update succeeded")
 	}
 	store.Fail = nil
@@ -252,7 +278,8 @@ func TestCancellationFaultAtomicityAndGenerationRace(t *testing.T) {
 			defer wg.Done()
 			<-start
 			_, err := manager.Update(ctx, "idx", []VectorRecord{{
-				ID: fmt.Sprintf("race-%d", i), Vector: records[i].Vector, Timestamp: int64(2000 + i),
+				ID: fmt.Sprintf("race-%d", i), Vector: records[i].Vector,
+				EmbeddingSpace: testEmbeddingSpace, Timestamp: int64(2000 + i),
 			}}, 3)
 			switch {
 			case err == nil:
@@ -268,5 +295,133 @@ func TestCancellationFaultAtomicityAndGenerationRace(t *testing.T) {
 	wg.Wait()
 	if successes.Load() != 1 || conflicts.Load() != 1 {
 		t.Fatalf("successes=%d conflicts=%d", successes.Load(), conflicts.Load())
+	}
+}
+
+func TestEmbeddingSpaceContractRejectsSameDimensionDifferentModel(t *testing.T) {
+	ctx := context.Background()
+	store := NewMemoryStore()
+	manager := New(store, testConfig())
+	records := corpus(32)
+	records[1].EmbeddingSpace = "test-provider:different-model-v1:normalized"
+	if _, err := manager.Build(ctx, "idx", records, 1); !errors.Is(err, embeddingspace.ErrMismatch) {
+		t.Fatalf("Build error = %v, want ErrMismatch", err)
+	}
+
+	records[1].EmbeddingSpace = testEmbeddingSpace
+	manifest, err := manager.Build(ctx, "idx", records, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if manifest.EmbeddingSpace != testEmbeddingSpace {
+		t.Fatalf("manifest embedding space = %q", manifest.EmbeddingSpace)
+	}
+	_, evidence, err := manager.Search(ctx, "idx", Query{
+		Vector:         records[0].Vector,
+		EmbeddingSpace: "test-provider:different-model-v1:normalized",
+		TopK:           1,
+	})
+	if !errors.Is(err, embeddingspace.ErrMismatch) {
+		t.Fatalf("Search error = %v, want ErrMismatch", err)
+	}
+	if evidence.EmbeddingSpace != testEmbeddingSpace {
+		t.Fatalf("evidence embedding space = %q", evidence.EmbeddingSpace)
+	}
+	if _, err := manager.Update(ctx, "idx", []VectorRecord{{
+		ID: "new", Vector: records[0].Vector,
+		EmbeddingSpace: "test-provider:different-model-v1:normalized",
+		Timestamp:      99,
+	}}, 2); !errors.Is(err, embeddingspace.ErrMismatch) {
+		t.Fatalf("Update error = %v, want ErrMismatch", err)
+	}
+}
+
+func TestEmbeddingSpaceContractFailsClosedOnUnknown(t *testing.T) {
+	ctx := context.Background()
+	records := corpus(16)
+	records[0].EmbeddingSpace = ""
+	if _, err := New(NewMemoryStore(), testConfig()).Build(
+		ctx, "idx", records, 1); !errors.Is(err, ErrEmbeddingSpace) {
+		t.Fatalf("Build error = %v, want ErrEmbeddingSpace", err)
+	}
+
+	store := NewMemoryStore()
+	manager := New(store, testConfig())
+	records[0].EmbeddingSpace = testEmbeddingSpace
+	if _, err := manager.Build(ctx, "idx", records, 1); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := manager.Search(ctx, "idx", Query{
+		Vector: records[0].Vector, TopK: 1,
+	}); !errors.Is(err, ErrEmbeddingSpace) {
+		t.Fatalf("Search error = %v, want ErrEmbeddingSpace", err)
+	}
+}
+
+func TestManifestRecordCarriesEmbeddingSpaceWithoutIndexBody(t *testing.T) {
+	ctx := context.Background()
+	store := NewMemoryStore()
+	manifest, err := New(store, testConfig()).Build(
+		ctx, "idx", corpus(16), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var manifestRecord Record
+	for _, record := range store.Export("idx", 0) {
+		if record.CF == recordCFManifest {
+			manifestRecord = record
+			break
+		}
+	}
+	if manifestRecord.CF == "" {
+		t.Fatal("manifest record not found")
+	}
+	decoded, err := DecodeSnapshot([]Record{manifestRecord})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decoded.Manifest.EmbeddingSpace != testEmbeddingSpace ||
+		decoded.Manifest.EmbeddingSpace != manifest.EmbeddingSpace {
+		t.Fatalf("decoded manifest space = %q", decoded.Manifest.EmbeddingSpace)
+	}
+
+	otherRecords := corpus(16)
+	for i := range otherRecords {
+		otherRecords[i].EmbeddingSpace =
+			"test-provider:different-model-v1:normalized"
+	}
+	other, err := New(NewMemoryStore(), testConfig()).Build(
+		ctx, "idx", otherRecords, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if other.CodebookVersion == manifest.CodebookVersion {
+		t.Fatal("different embedding spaces shared a codebook version")
+	}
+}
+
+func TestLegacyManifestWithoutEmbeddingSpaceFailsClosed(t *testing.T) {
+	store := NewMemoryStore()
+	if err := store.Commit(context.Background(), Snapshot{Manifest: Manifest{
+		FormatVersion: 1,
+		Index:         "legacy",
+		Generation:    1,
+		Dimension:     2,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	_, _, err := New(store, testConfig()).Search(
+		context.Background(),
+		"legacy",
+		Query{
+			Vector: []float32{1, 0}, EmbeddingSpace: testEmbeddingSpace,
+		},
+	)
+	if !errors.Is(err, ErrEmbeddingSpace) {
+		t.Fatalf("Search error = %v, want ErrEmbeddingSpace", err)
+	}
+	if _, err := New(store, testConfig()).Describe(
+		context.Background(), "legacy"); !errors.Is(err, ErrEmbeddingSpace) {
+		t.Fatalf("Describe error = %v, want ErrEmbeddingSpace", err)
 	}
 }
