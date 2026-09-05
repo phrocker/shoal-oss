@@ -250,6 +250,89 @@ func TestAskMarkdownCodePadsBacktickBoundaries(t *testing.T) {
 	}
 }
 
+func TestAskMarkdownEscapesOnceAndUsesCodeSpans(t *testing.T) {
+	const (
+		answer = "Résumé_budget -> <script>alert(\"x\")</script> & [link](javascript:alert(1)) *bold*\n" +
+			"# heading\n- item\n1. item\n> quote\nsafe + plus!"
+		errorText = "<img src=x onerror=alert(1)> budget_exhausted ->"
+	)
+	response := askOutput{
+		Answer: answer,
+		Execution: askExecution{
+			Authorization: "role_admin -> tenant_日本",
+		},
+		Claims: []askClaim{{
+			Subject:    askID("subject"),
+			Predicate:  askID("predicate"),
+			Object:     askValue{Value: "budget_exhausted -> <b>unsafe</b>"},
+			Confidence: 0.5,
+			EvidenceIDs: []askID{
+				"evidence_α",
+				"evidence_[β]",
+			},
+		}},
+		Issues: []askIssue{{
+			Kind:   inference.IssueUnresolved,
+			Input:  "input_*_[x]",
+			Reason: "<script>alert(1)</script> budget_exhausted ->",
+		}},
+		Evidence: []askEvidence{{
+			ID:   askID("evidence_α"),
+			Kind: inference.AnchorGraph,
+			Path: &askPath{
+				Nodes: []askNode{{ID: askID("node_α")}, {ID: askID("node_[β]")}},
+				Edges: []askEdge{{ID: askID("edge_一")}, {ID: askID("edge_*_二")}},
+			},
+		}},
+		DetailedTrace: &askDetailedTrace{
+			Iterations: []askIterationTrace{{
+				Index:       1,
+				Failure:     errorText,
+				EvidenceIDs: []askID{"evidence_α", "evidence_[β]"},
+			}},
+			Failures: []harness.FailureTrace{{
+				Iteration: 1,
+				Operation: "tool_call",
+				Error:     errorText,
+			}},
+		},
+	}
+
+	var output bytes.Buffer
+	if err := writeAskMarkdown(&output, response); err != nil {
+		t.Fatal(err)
+	}
+	rendered := output.String()
+	for _, want := range []string{
+		"Résumé\\_budget -> \\<script>alert(\"x\")\\</script> \\& \\[link\\](javascript:alert(1)) \\*bold\\*",
+		"\\# heading\n\\- item\n1\\. item\n\\> quote\nsafe + plus!",
+		"- authorization: `role_admin -> tenant_日本`",
+		"- `subject` `predicate` `budget_exhausted -> <b>unsafe</b>` (confidence 0.5; evidence `evidence_α, evidence_[β]`)",
+		"- `unresolved`: `input_*_[x]` (`<script>alert(1)</script> budget_exhausted ->`)",
+		"- graph path nodes: `node_α -> node_[β]`",
+		"- graph path edges: `edge_一 -> edge_*_二`",
+		"evidence `evidence_α, evidence_[β]`, failure `<img src=x onerror=alert(1)> budget_exhausted ->`",
+		"- iteration 1 `tool_call`: `<img src=x onerror=alert(1)> budget_exhausted ->`",
+	} {
+		if !strings.Contains(rendered, want) {
+			t.Errorf("markdown missing %q:\n%s", want, rendered)
+		}
+	}
+	for _, unwanted := range []string{
+		"&lt;",
+		"&gt;",
+		"&amp;",
+		"budget\\_exhausted",
+		"\\-&gt;",
+		"\n<script>",
+		": <img src=x onerror=alert(1)>",
+	} {
+		if strings.Contains(rendered, unwanted) {
+			t.Errorf("markdown contains unsafe or double-escaped %q:\n%s", unwanted, rendered)
+		}
+	}
+}
+
 func TestAskBudgetExhaustionReportsStopReason(t *testing.T) {
 	data := ingestAskFixture(t)
 	var output bytes.Buffer
