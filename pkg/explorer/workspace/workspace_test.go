@@ -65,6 +65,37 @@ func (r staticCeilingResolver) ResolveServiceCeiling(
 	return r.ceiling, nil
 }
 
+type callerOntologyChoices struct {
+	bySubject map[shoal.ID][]OntologyChoice
+}
+
+func (c callerOntologyChoices) ListOntologyChoices(
+	ctx context.Context,
+	decision auth.Decision,
+) ([]OntologyChoice, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return append([]OntologyChoice(nil), c.bySubject[decision.Subject()]...), nil
+}
+
+func (c callerOntologyChoices) AuthorizeOntology(
+	ctx context.Context,
+	decision auth.Decision,
+	identity ontology.OntologyIdentity,
+) error {
+	choices, err := c.ListOntologyChoices(ctx, decision)
+	if err != nil {
+		return err
+	}
+	for _, choice := range choices {
+		if choice.Identity == identity {
+			return nil
+		}
+	}
+	return authDenied()
+}
+
 func TestProviderAppliesOnlyNarrowingAndPreservesDecision(t *testing.T) {
 	ctx := context.Background()
 	store, err := OpenDurableStore(t.TempDir())
@@ -475,6 +506,121 @@ func TestProviderRequiresGovernedOntologyChoice(t *testing.T) {
 		},
 	}); !shoal.IsErrorCode(err, shoal.ErrorUnauthorized) {
 		t.Fatalf("ungoverned ontology error = %v", err)
+	}
+}
+
+func TestSelectableLensPreservesSettingsAndDoesNotLeakAcrossCallers(t *testing.T) {
+	store, err := OpenDurableStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	first, second := testOntologies(t)
+	resolver := &mutableResolver{decision: testDecision(t, decisionOptions{})}
+	callerChoices := callerOntologyChoices{
+		bySubject: map[shoal.ID][]OntologyChoice{
+			"owner": {
+				{Identity: first, Active: true},
+				{Identity: second},
+			},
+			"other-owner": {
+				{Identity: second, Active: true},
+			},
+		},
+	}
+	provider, err := NewProvider(store, ProviderOptions{
+		Resolver:        resolver,
+		OntologyChoices: callerChoices,
+		Clock:           func() time.Time { return testNow },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	topK := uint32(4)
+	created, err := provider.Update(context.Background(), "lens-workspace", UpdateRequest{
+		MutationID: "lens-create",
+		Narrowing: UpdateNarrowing{
+			PermittedSourceIDs: IDSelection{
+				Present: true, Values: [][]byte{[]byte("source-a")},
+			},
+			Budgets: Budgets{RetrievalTopK: &topK},
+			OutputPolicies: []OutputPolicySpec{{
+				SourceID:      []byte("source-a"),
+				GrantPolicyID: []byte("policy-a"), Epoch: 1,
+			}},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	choices, err := provider.ListOntologyChoices(
+		context.Background(), "lens-workspace")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(choices.Choices) != 2 || !choices.Choices[0].Active ||
+		choices.SettingsRevision != created.Revision {
+		t.Fatalf("owner choices = %#v", choices)
+	}
+	selected, err := provider.SelectOntology(
+		context.Background(), "lens-workspace", created.Revision,
+		"lens-select", second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if selected.Revision != 2 ||
+		!selected.Narrowing.PermittedSourceIDs.Present ||
+		!equalBytes(
+			selected.Narrowing.PermittedSourceIDs.Values,
+			created.Narrowing.PermittedSourceIDs.Values,
+		) ||
+		selected.Narrowing.Budgets.RetrievalTopK == nil ||
+		*selected.Narrowing.Budgets.RetrievalTopK != topK ||
+		len(selected.Narrowing.OutputPolicies) != 1 {
+		t.Fatalf("lens selection did not preserve settings: %#v", selected)
+	}
+	effective, err := provider.Apply(
+		context.Background(), "lens-workspace", testLimits(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if selectedIdentity, ok := effective.Decision().SelectedOntology(); !ok || selectedIdentity != second {
+		t.Fatal("selected lens was not bound into the issuer decision")
+	}
+	if effective.Decision().Actor() != "actor" ||
+		effective.Decision().RequestID() != "request" ||
+		effective.Decision().AuditPurpose() != "workspace test" {
+		t.Fatal("lens selection replaced issuer decision identity")
+	}
+
+	resolver.set(testDecision(t, decisionOptions{subject: "other-owner"}))
+	if _, err := provider.ListOntologyChoices(
+		context.Background(), "lens-workspace",
+	); !shoal.IsErrorCode(err, shoal.ErrorUnauthorized) {
+		t.Fatalf("cross-caller lens listing error = %v", err)
+	}
+	otherChoices, err := provider.ListOntologyChoices(
+		context.Background(), "unowned-workspace")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(otherChoices.Choices) != 1 ||
+		otherChoices.Choices[0].Identity != second {
+		t.Fatalf("other caller choices leaked owner choices: %#v", otherChoices)
+	}
+	resolver.set(testDecision(t, decisionOptions{}))
+	callerChoices.bySubject["owner"] = []OntologyChoice{
+		{Identity: first, Active: true},
+	}
+	if _, err := provider.Apply(
+		context.Background(), "lens-workspace", testLimits(), nil,
+	); !shoal.IsErrorCode(err, shoal.ErrorUnauthorized) {
+		t.Fatalf("revoked selected lens apply error = %v", err)
+	}
+	if _, err := provider.ListOntologyChoices(
+		context.Background(), "lens-workspace",
+	); !shoal.IsErrorCode(err, shoal.ErrorUnauthorized) {
+		t.Fatalf("revoked selected lens listing error = %v", err)
 	}
 }
 

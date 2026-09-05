@@ -75,6 +75,25 @@ type WorkspaceOntologyIdentity struct {
 	VersionID string `json:"version_id"`
 }
 
+type WorkspaceOntologyChoice struct {
+	WorkspaceOntologyIdentity
+	Active bool `json:"active"`
+}
+
+type WorkspaceOntologyChoicesResponse struct {
+	WorkspaceID      string                     `json:"workspace_id"`
+	SettingsID       string                     `json:"settings_id,omitempty"`
+	SettingsRevision uint64                     `json:"settings_revision"`
+	SelectedOntology *WorkspaceOntologyIdentity `json:"selected_ontology,omitempty"`
+	Choices          []WorkspaceOntologyChoice  `json:"choices"`
+}
+
+type WorkspaceOntologySelectionRequest struct {
+	ExpectedRevision uint64                    `json:"expected_revision"`
+	MutationID       string                    `json:"mutation_id"`
+	SelectedOntology WorkspaceOntologyIdentity `json:"selected_ontology"`
+}
+
 func (h *Handler) registerWorkspaceSettingsRoutes() {
 	h.mux.HandleFunc(
 		"GET /api/v1/workspaces/{workspace}/settings",
@@ -83,6 +102,14 @@ func (h *Handler) registerWorkspaceSettingsRoutes() {
 	h.mux.HandleFunc(
 		"PUT /api/v1/workspaces/{workspace}/settings",
 		h.putWorkspaceSettings,
+	)
+	h.mux.HandleFunc(
+		"GET /api/v1/workspaces/{workspace}/settings/lens",
+		h.getWorkspaceLens,
+	)
+	h.mux.HandleFunc(
+		"PUT /api/v1/workspaces/{workspace}/settings/lens",
+		h.putWorkspaceLens,
 	)
 }
 
@@ -161,6 +188,85 @@ func (h *Handler) putWorkspaceSettings(
 	writeResponse(writer, status, response)
 }
 
+func (h *Handler) getWorkspaceLens(
+	writer http.ResponseWriter,
+	request *http.Request,
+) {
+	if isAbsentInterface(h.workspaceSettings) {
+		writeError(writer, shoal.NewError(
+			shoal.ErrorUnavailable, "workspace settings are unavailable"))
+		return
+	}
+	workspaceID, err := decodeID(request.PathValue("workspace"))
+	if err != nil {
+		writeError(writer, shoal.NewError(
+			shoal.ErrorInvalidArgument, "workspace ID "+err.Error()))
+		return
+	}
+	choices, err := h.workspaceSettings.ListOntologyChoices(
+		request.Context(), workspaceID)
+	if err != nil {
+		writeError(writer, err)
+		return
+	}
+	writeResponse(writer, http.StatusOK, workspaceOntologyChoicesResponse(choices))
+}
+
+func (h *Handler) putWorkspaceLens(
+	writer http.ResponseWriter,
+	request *http.Request,
+) {
+	if isAbsentInterface(h.workspaceSettings) {
+		writeError(writer, shoal.NewError(
+			shoal.ErrorUnavailable, "workspace settings are unavailable"))
+		return
+	}
+	if err := requireSameOrigin(request); err != nil {
+		writeError(writer, err)
+		return
+	}
+	workspaceID, err := decodeID(request.PathValue("workspace"))
+	if err != nil {
+		writeError(writer, shoal.NewError(
+			shoal.ErrorInvalidArgument, "workspace ID "+err.Error()))
+		return
+	}
+	var input WorkspaceOntologySelectionRequest
+	if err := decodeRequest(writer, request, &input); err != nil {
+		writeError(writer, shoal.NewError(shoal.ErrorInvalidArgument, err.Error()))
+		return
+	}
+	mutationID, err := decodeID(input.MutationID)
+	if err != nil {
+		writeError(writer, shoal.NewError(
+			shoal.ErrorInvalidArgument, "mutation_id: "+err.Error()))
+		return
+	}
+	identity, err := workspaceOntologyIdentityValue(input.SelectedOntology)
+	if err != nil {
+		writeError(writer, shoal.NewError(
+			shoal.ErrorInvalidArgument, "selected_ontology: "+err.Error()))
+		return
+	}
+	settings, err := h.workspaceSettings.SelectOntology(
+		request.Context(), workspaceID, input.ExpectedRevision,
+		mutationID, identity)
+	if err != nil {
+		writeError(writer, err)
+		return
+	}
+	response, err := workspaceSettingsResponse(settings)
+	if err != nil {
+		writeError(writer, err)
+		return
+	}
+	status := http.StatusOK
+	if settings.Revision == 1 {
+		status = http.StatusCreated
+	}
+	writeResponse(writer, status, response)
+}
+
 func workspaceSettingsUpdate(
 	value WorkspaceSettingsUpdateRequest,
 ) (workspace.UpdateRequest, error) {
@@ -214,17 +320,8 @@ func workspaceSettingsUpdate(
 	}
 	var selected workspace.OntologySelection
 	if settings.SelectedOntology != nil {
-		schemaID, err := decodeID(settings.SelectedOntology.SchemaID)
-		if err != nil {
-			return workspace.UpdateRequest{}, fmt.Errorf(
-				"selected_ontology.schema_id: %w", err)
-		}
-		versionID, err := decodeID(settings.SelectedOntology.VersionID)
-		if err != nil {
-			return workspace.UpdateRequest{}, fmt.Errorf(
-				"selected_ontology.version_id: %w", err)
-		}
-		identity, err := ontology.NewOntologyIdentityFromIDs(schemaID, versionID)
+		identity, err := workspaceOntologyIdentityValue(
+			*settings.SelectedOntology)
 		if err != nil {
 			return workspace.UpdateRequest{}, fmt.Errorf(
 				"selected_ontology: %w", err)
@@ -251,6 +348,49 @@ func workspaceSettingsUpdate(
 			SelectedOntology: selected,
 		},
 	}, nil
+}
+
+func workspaceOntologyChoicesResponse(
+	value workspace.OntologyChoiceSet,
+) WorkspaceOntologyChoicesResponse {
+	response := WorkspaceOntologyChoicesResponse{
+		WorkspaceID:      encodeID(value.WorkspaceID),
+		SettingsRevision: value.SettingsRevision,
+		Choices:          make([]WorkspaceOntologyChoice, 0, len(value.Choices)),
+	}
+	if value.SettingsID != "" {
+		response.SettingsID = encodeID(value.SettingsID)
+	}
+	if value.SelectedOntology.Present {
+		response.SelectedOntology = &WorkspaceOntologyIdentity{
+			SchemaID:  encodeID(value.SelectedOntology.Identity.SchemaID()),
+			VersionID: encodeID(value.SelectedOntology.Identity.VersionID()),
+		}
+	}
+	for _, choice := range value.Choices {
+		response.Choices = append(response.Choices, WorkspaceOntologyChoice{
+			WorkspaceOntologyIdentity: WorkspaceOntologyIdentity{
+				SchemaID:  encodeID(choice.Identity.SchemaID()),
+				VersionID: encodeID(choice.Identity.VersionID()),
+			},
+			Active: choice.Active,
+		})
+	}
+	return response
+}
+
+func workspaceOntologyIdentityValue(
+	value WorkspaceOntologyIdentity,
+) (ontology.OntologyIdentity, error) {
+	schemaID, err := decodeID(value.SchemaID)
+	if err != nil {
+		return ontology.OntologyIdentity{}, fmt.Errorf("schema_id: %w", err)
+	}
+	versionID, err := decodeID(value.VersionID)
+	if err != nil {
+		return ontology.OntologyIdentity{}, fmt.Errorf("version_id: %w", err)
+	}
+	return ontology.NewOntologyIdentityFromIDs(schemaID, versionID)
 }
 
 func workspaceSettingsResponse(

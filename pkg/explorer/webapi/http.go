@@ -110,6 +110,12 @@ func (h *Handler) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 			return
 		}
 		request = request.WithContext(ctx)
+		ctx, err = h.applyWorkspaceSettings(request)
+		if err != nil {
+			writeError(writer, err)
+			return
+		}
+		request = request.WithContext(ctx)
 	}
 	h.mux.ServeHTTP(writer, request)
 }

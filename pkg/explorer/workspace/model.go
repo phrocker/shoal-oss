@@ -75,6 +75,17 @@ type Limits struct {
 	OutputBytes   uint64
 }
 
+// MaximumLimits returns the public workspace budget ceilings.
+func MaximumLimits() Limits {
+	return Limits{
+		RetrievalTopK: MaxRetrievalTopK,
+		GraphDepth:    MaxGraphDepth,
+		GraphFanout:   MaxGraphFanout,
+		GraphNodes:    MaxGraphNodes,
+		OutputBytes:   MaxOutputBytes,
+	}
+}
+
 // OutputPolicySpec identifies an existing authorization policy whose labels
 // must be conjoined onto outputs. The provider supplies the caller's trusted
 // authorization domain and, for service callers, service role.
