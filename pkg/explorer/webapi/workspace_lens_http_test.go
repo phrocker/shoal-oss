@@ -38,6 +38,20 @@ type httpCallerOntologyChoices struct {
 	bySubject map[shoal.ID][]workspace.OntologyChoice
 }
 
+type lensObservingService struct {
+	settingsStubService
+	effective workspace.EffectiveDecision
+	found     bool
+}
+
+func (s *lensObservingService) Documents(
+	ctx context.Context,
+	_ webapi.DocumentsRequest,
+) (webapi.DocumentsResponse, error) {
+	s.effective, s.found = webapi.EffectiveWorkspaceSettings(ctx)
+	return webapi.DocumentsResponse{}, nil
+}
+
 func (c httpCallerOntologyChoices) ListOntologyChoices(
 	ctx context.Context,
 	decision auth.Decision,
@@ -93,8 +107,9 @@ func TestHTTPSelectableLensIsPerCallerAndPreservesSettings(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	service := &lensObservingService{}
 	handler, err := webapi.NewAuthenticatedHandler(
-		settingsStubService{},
+		service,
 		webapi.AuthenticatorFunc(func(request *http.Request) (auth.Decision, error) {
 			return settingsHTTPDecision(
 				t, now, shoal.ID(request.Header.Get("X-Test-Subject"))), nil
@@ -267,6 +282,20 @@ func TestHTTPSelectableLensIsPerCallerAndPreservesSettings(t *testing.T) {
 		t.Fatalf("cross-caller effective status = %d, challenge = %q, body = %s",
 			crossCaller.Code, crossCaller.Header().Get("WWW-Authenticate"),
 			crossCaller.Body.String())
+	}
+	documents := settingsWorkspaceRequest(
+		t, handler, http.MethodPost, "/api/v1/documents",
+		map[string]any{}, "owner", workspacePath)
+	if documents.Code != http.StatusOK {
+		t.Fatalf("effective documents status = %d, body = %s",
+			documents.Code, documents.Body.String())
+	}
+	if !service.found ||
+		service.effective.Revision() != selected.Revision ||
+		service.effective.Limits().RetrievalTopK != topK ||
+		service.effective.SettingsID() == "" {
+		t.Fatalf("mounted transport effective settings = found %v, %#v",
+			service.found, service.effective)
 	}
 }
 
