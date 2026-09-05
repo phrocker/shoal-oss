@@ -166,6 +166,9 @@ func (c *codec) readMessage() ([]byte, error) {
 			limit := maxMessageBytes
 			if err == nil && len(chunk) > 0 && chunk[len(chunk)-1] == '\n' {
 				limit++
+				if len(chunk) > 1 && chunk[len(chunk)-2] == '\r' {
+					limit++
+				}
 			}
 			if len(line)+len(chunk) > limit {
 				return nil, errMessageTooLarge

@@ -139,13 +139,18 @@ func TestJSONRPCCodecRejectsOversizedMessageWithoutTruncating(t *testing.T) {
 }
 
 func TestJSONRPCCodecAcceptsMaximumSizedMessage(t *testing.T) {
-	input := strings.NewReader(strings.Repeat("x", maxMessageBytes) + "\n")
-	message, err := newCodec(input, &bytes.Buffer{}).readMessage()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(message) != maxMessageBytes {
-		t.Fatalf("message length = %d, want %d", len(message), maxMessageBytes)
+	for _, terminator := range []string{"", "\n", "\r\n"} {
+		input := strings.NewReader(strings.Repeat("x", maxMessageBytes) + terminator)
+		message, err := newCodec(input, &bytes.Buffer{}).readMessage()
+		if err != nil {
+			t.Fatalf("terminator %q: %v", terminator, err)
+		}
+		if len(message) != maxMessageBytes {
+			t.Fatalf(
+				"terminator %q message length = %d, want %d",
+				terminator, len(message), maxMessageBytes,
+			)
+		}
 	}
 }
 
