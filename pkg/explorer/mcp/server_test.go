@@ -1018,6 +1018,29 @@ func TestServeRejectsOversizedInputWithProtocolError(t *testing.T) {
 	}
 }
 
+func TestServeRespondsToInvalidIDLessRequest(t *testing.T) {
+	server, _ := newTestServer(t, &stubService{}, nil)
+	var output bytes.Buffer
+	if err := server.Serve(
+		context.Background(),
+		strings.NewReader("{\"jsonrpc\":\"2.0\"}\n"),
+		&output,
+	); err != nil {
+		t.Fatal(err)
+	}
+	lines := nonemptyLines(output.String())
+	if len(lines) != 1 {
+		t.Fatalf("invalid request responses = %d: %q", len(lines), output.String())
+	}
+	var response Response
+	mustUnmarshal(t, lines[0], &response)
+	if response.Error == nil ||
+		response.Error.Code != codeInvalidRequest ||
+		string(response.ID) != "null" {
+		t.Fatalf("invalid request response = %+v", response)
+	}
+}
+
 func TestNewServerRejectsInvalidExtensionConfiguration(t *testing.T) {
 	authority := auth.NewAuthority()
 	decisions := DecisionProviderFunc(func(context.Context) (auth.Decision, error) {
@@ -1101,6 +1124,99 @@ func TestNewServerRejectsInvalidExtensionConfiguration(t *testing.T) {
 		ContextBudgetBytes: maxContextBudgetBytes + 1,
 	}); err == nil {
 		t.Fatal("oversized context budget was accepted")
+	}
+}
+
+func TestOptionalToolArgumentsAreValidatedBeforeDispatch(t *testing.T) {
+	calls := 0
+	provider := optionalProvider{
+		tool: Tool{
+			Name: "bounded", Description: "bounded optional tool",
+			InputSchema: json.RawMessage(`{
+				"type":"object",
+				"properties":{
+					"limit":{"type":"integer","minimum":1,"maximum":3},
+					"mode":{"type":"string","enum":["brief","full"]},
+					"tags":{"type":"array","items":{"type":"string"},"maxItems":2}
+				},
+				"required":["limit"],
+				"additionalProperties":false
+			}`),
+		},
+		call: func(context.Context, json.RawMessage) (any, error) {
+			calls++
+			return struct {
+				Accepted bool `json:"accepted"`
+			}{Accepted: true}, nil
+		},
+	}
+	server, _ := newTestServer(
+		t, &stubService{}, []OptionalToolProvider{provider})
+	makeReady(t, server)
+	for _, arguments := range []string{
+		`{}`,
+		`{"limit":"2"}`,
+		`{"limit":4}`,
+		`{"limit":2,"mode":"unknown"}`,
+		`{"limit":2,"tags":["a","b","c"]}`,
+		`{"limit":2,"extra":true}`,
+	} {
+		response := callToolRequest(t, server, "bounded", arguments)
+		if response.Error != nil {
+			t.Fatalf("invalid arguments became protocol error: %+v", response.Error)
+		}
+		if result := decodeToolResult(t, response); !result.IsError {
+			t.Fatalf("invalid arguments %s were accepted", arguments)
+		}
+	}
+	if calls != 0 {
+		t.Fatalf("provider calls after invalid arguments = %d", calls)
+	}
+	response := callToolRequest(
+		t, server, "bounded",
+		`{"limit":2,"mode":"brief","tags":["one","two"]}`,
+	)
+	if response.Error != nil {
+		t.Fatalf("valid arguments protocol error = %+v", response.Error)
+	}
+	if result := decodeToolResult(t, response); result.IsError {
+		t.Fatalf("valid arguments tool error = %s", result.StructuredContent)
+	}
+	if calls != 1 {
+		t.Fatalf("provider calls = %d, want 1", calls)
+	}
+}
+
+func TestToolErrorResultBoundsPublicFailures(t *testing.T) {
+	server, _ := newTestServer(t, &stubService{}, nil)
+	result := server.toolErrorResult(shoal.NewError(
+		shoal.ErrorInvalidArgument,
+		strings.Repeat("x", maxToolFailureMessageBytes+1),
+	))
+	if !result.IsError ||
+		uint64(len(result.StructuredContent)) > webapi.MaxResponseBytes {
+		t.Fatalf("bounded error result = %+v", result)
+	}
+	var failure structuredToolFailure
+	mustUnmarshal(t, string(result.StructuredContent), &failure)
+	if failure.Error.Code != string(shoal.ErrorInternal) ||
+		failure.Error.Message != "tool execution failed" {
+		t.Fatalf("bounded failure = %+v", failure)
+	}
+}
+
+func TestByteBoundedSchemasDoNotAdvertiseCharacterLimits(t *testing.T) {
+	for name, schema := range map[string]json.RawMessage{
+		"retrieval":  retrieveSchema,
+		"extraction": extractSchema,
+	} {
+		text := string(schema)
+		if strings.Contains(text, `"maxLength":16384`) ||
+			strings.Contains(text, `"maxLength":65536`) ||
+			!strings.Contains(text, "maximum ") ||
+			!strings.Contains(text, " bytes") {
+			t.Fatalf("%s schema does not describe its byte bound: %s", name, text)
+		}
 	}
 }
 
@@ -1274,16 +1390,20 @@ func (s *allOptionalService) Changes(
 
 type optionalProvider struct {
 	tool Tool
+	call func(context.Context, json.RawMessage) (any, error)
 }
 
 func (p optionalProvider) Tool() Tool {
 	return p.tool
 }
 
-func (optionalProvider) Call(
-	context.Context,
-	json.RawMessage,
+func (p optionalProvider) Call(
+	ctx context.Context,
+	arguments json.RawMessage,
 ) (any, error) {
+	if p.call != nil {
+		return p.call(ctx, arguments)
+	}
 	return struct {
 		Compressed bool `json:"compressed"`
 	}{Compressed: true}, nil

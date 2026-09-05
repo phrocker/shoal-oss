@@ -22,6 +22,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
+	"math/big"
 	"strings"
 	"unicode/utf8"
 
@@ -43,7 +45,13 @@ const (
 	ToolChanges      = "shoal.changes"
 
 	// Keep this aligned with ingestSchema's name.maxLength.
-	maxUploadFilenameRunes = 4096
+	maxUploadFilenameRunes     = 4096
+	maxOptionalToolSchemaBytes = 64 << 10
+	maxOptionalToolSchemaDepth = 32
+	maxOptionalToolProperties  = 256
+	maxOptionalToolEnumValues  = 256
+	maxToolFailureCodeBytes    = 128
+	maxToolFailureMessageBytes = 4096
 )
 
 var reservedServiceToolNames = map[string]struct{}{
@@ -113,7 +121,7 @@ var (
 			"query":{
 				"type":"object",
 				"properties":{
-					"text":{"type":"string","maxLength":16384},
+					"text":{"type":"string","description":"UTF-8 query; maximum 16384 bytes"},
 					"top_k":{"type":"integer","minimum":0,"maximum":50},
 					"modes":{
 						"type":"array",
@@ -224,7 +232,7 @@ var (
 			"snapshot":{"$ref":"#/$defs/snapshot"},
 			"document_id":{"type":"string","minLength":1,"maxLength":1366,"pattern":"^[A-Za-z0-9_-]+$"},
 			"revision_id":{"type":"string","maxLength":1366,"pattern":"^[A-Za-z0-9_-]*$"},
-			"instructions":{"type":"string","maxLength":65536}
+			"instructions":{"type":"string","description":"UTF-8 instructions; maximum 65536 bytes"}
 		},
 		"required":["document_id"],
 		"additionalProperties":false,
@@ -617,9 +625,9 @@ type toolFailure struct {
 }
 
 func (s *Server) toolErrorResult(err error) ToolResult {
-	failure := publicToolFailure(err)
+	failure := boundedToolFailure(publicToolFailure(err))
 	encoded, marshalErr := json.Marshal(structuredToolFailure{Error: failure})
-	if marshalErr != nil {
+	if marshalErr != nil || uint64(len(encoded)) > webapi.MaxResponseBytes {
 		encoded = []byte(`{"error":{"code":"internal","message":"tool execution failed"}}`)
 	}
 	// Errors are never context-compressed. Their complete structured and text
@@ -630,6 +638,17 @@ func (s *Server) toolErrorResult(err error) ToolResult {
 		StructuredContent: append(json.RawMessage(nil), encoded...),
 		IsError:           true,
 	}
+}
+
+func boundedToolFailure(failure toolFailure) toolFailure {
+	if !utf8.ValidString(failure.Code) ||
+		!utf8.ValidString(failure.Message) ||
+		len(failure.Code) > maxToolFailureCodeBytes ||
+		len(failure.Message) > maxToolFailureMessageBytes {
+		return toolFailure{
+			Code: string(shoal.ErrorInternal), Message: "tool execution failed"}
+	}
+	return failure
 }
 
 func (s *Server) packToolResult(encoded []byte) (ToolResult, error) {
@@ -747,9 +766,9 @@ func publicToolFailure(err error) toolFailure {
 		Code: string(shoal.ErrorInternal), Message: "tool execution failed"}
 }
 
-func validateTool(tool Tool) error {
+func validateTool(tool Tool) (*optionalToolInputSchema, error) {
 	if len(tool.Name) == 0 || len(tool.Name) > 128 {
-		return shoal.NewError(
+		return nil, shoal.NewError(
 			shoal.ErrorInvalidArgument, "optional MCP tool name is invalid")
 	}
 	for index := 0; index < len(tool.Name); index++ {
@@ -760,28 +779,29 @@ func validateTool(tool Tool) error {
 			character == '_' || character == '-' || character == '.' {
 			continue
 		}
-		return shoal.NewError(
+		return nil, shoal.NewError(
 			shoal.ErrorInvalidArgument, "optional MCP tool name is invalid")
 	}
 	if strings.TrimSpace(tool.Description) == "" {
-		return shoal.NewError(
+		return nil, shoal.NewError(
 			shoal.ErrorInvalidArgument, "optional MCP tool description is required")
 	}
-	if err := validateOptionalToolInputSchema(tool.InputSchema); err != nil {
-		return shoal.NewError(
+	inputSchema, err := parseOptionalToolInputSchema(tool.InputSchema)
+	if err != nil {
+		return nil, shoal.NewError(
 			shoal.ErrorInvalidArgument, "optional MCP tool input schema is invalid")
 	}
 	if len(tool.OutputSchema) != 0 {
-		return shoal.NewError(
+		return nil, shoal.NewError(
 			shoal.ErrorInvalidArgument,
 			"optional MCP tool output schemas are not supported")
 	}
 	if tool.Execution != nil && tool.Execution.TaskSupport != "forbidden" {
-		return shoal.NewError(
+		return nil, shoal.NewError(
 			shoal.ErrorInvalidArgument,
 			"optional MCP tool task execution is not supported")
 	}
-	return nil
+	return &inputSchema, nil
 }
 
 // optionalToolInputSchema is the deliberately limited JSON Schema subset that
@@ -796,26 +816,44 @@ type optionalToolInputSchema struct {
 	AdditionalProperties *bool                              `json:"additionalProperties,omitempty"`
 	Items                *optionalToolInputSchema           `json:"items,omitempty"`
 	Enum                 []json.RawMessage                  `json:"enum,omitempty"`
-	Minimum              *float64                           `json:"minimum,omitempty"`
-	Maximum              *float64                           `json:"maximum,omitempty"`
+	Minimum              *json.Number                       `json:"minimum,omitempty"`
+	Maximum              *json.Number                       `json:"maximum,omitempty"`
 	MinLength            *int                               `json:"minLength,omitempty"`
 	MaxLength            *int                               `json:"maxLength,omitempty"`
 	MinItems             *int                               `json:"minItems,omitempty"`
 	MaxItems             *int                               `json:"maxItems,omitempty"`
 }
 
-func validateOptionalToolInputSchema(raw json.RawMessage) error {
+func parseOptionalToolInputSchema(
+	raw json.RawMessage,
+) (optionalToolInputSchema, error) {
+	var zero optionalToolInputSchema
+	if len(raw) > maxOptionalToolSchemaBytes {
+		return zero, errors.New("schema exceeds size limit")
+	}
 	var schema optionalToolInputSchema
 	if err := strictDecode(raw, &schema); err != nil {
-		return err
+		return zero, err
 	}
 	if schema.Type != "object" {
-		return errors.New("top-level schema must describe an object")
+		return zero, errors.New("top-level schema must describe an object")
 	}
-	return validateOptionalToolSchemaNode(schema)
+	if err := validateOptionalToolSchemaNode(schema, 1); err != nil {
+		return zero, err
+	}
+	return schema, nil
 }
 
-func validateOptionalToolSchemaNode(schema optionalToolInputSchema) error {
+func validateOptionalToolSchemaNode(
+	schema optionalToolInputSchema,
+	depth int,
+) error {
+	if depth > maxOptionalToolSchemaDepth ||
+		len(schema.Properties) > maxOptionalToolProperties ||
+		len(schema.Required) > maxOptionalToolProperties ||
+		len(schema.Enum) > maxOptionalToolEnumValues {
+		return errors.New("schema exceeds structural limits")
+	}
 	switch schema.Type {
 	case "object":
 		if schema.Items != nil || hasScalarSchemaBounds(schema) {
@@ -825,7 +863,7 @@ func validateOptionalToolSchemaNode(schema optionalToolInputSchema) error {
 			if strings.TrimSpace(name) == "" {
 				return errors.New("object schema has an empty property name")
 			}
-			if err := validateOptionalToolSchemaNode(property); err != nil {
+			if err := validateOptionalToolSchemaNode(property, depth+1); err != nil {
 				return err
 			}
 		}
@@ -845,7 +883,7 @@ func validateOptionalToolSchemaNode(schema optionalToolInputSchema) error {
 			hasStringOrNumberSchemaBounds(schema) {
 			return errors.New("array schema has incompatible keywords")
 		}
-		if err := validateOptionalToolSchemaNode(*schema.Items); err != nil {
+		if err := validateOptionalToolSchemaNode(*schema.Items, depth+1); err != nil {
 			return err
 		}
 		if err := validateNonnegativeBounds(schema.MinItems, schema.MaxItems); err != nil {
@@ -868,9 +906,18 @@ func validateOptionalToolSchemaNode(schema optionalToolInputSchema) error {
 			schema.MinItems != nil || schema.MaxItems != nil {
 			return errors.New("numeric schema has incompatible keywords")
 		}
-		if schema.Minimum != nil && schema.Maximum != nil &&
-			*schema.Minimum > *schema.Maximum {
-			return errors.New("numeric schema bounds are inverted")
+		if schema.Minimum != nil && schema.Maximum != nil {
+			minimum, err := jsonNumberRat(*schema.Minimum)
+			if err != nil {
+				return err
+			}
+			maximum, err := jsonNumberRat(*schema.Maximum)
+			if err != nil {
+				return err
+			}
+			if minimum.Cmp(maximum) > 0 {
+				return errors.New("numeric schema bounds are inverted")
+			}
 		}
 	case "boolean":
 		if schema.Items != nil || len(schema.Properties) != 0 ||
@@ -883,6 +930,19 @@ func validateOptionalToolSchemaNode(schema optionalToolInputSchema) error {
 	}
 	if schema.Enum != nil && len(schema.Enum) == 0 {
 		return errors.New("schema enum is empty")
+	}
+	if schema.Enum != nil {
+		withoutEnum := schema
+		withoutEnum.Enum = nil
+		for _, encoded := range schema.Enum {
+			value, err := decodeOptionalToolValue(encoded)
+			if err != nil {
+				return err
+			}
+			if err := validateOptionalToolValue(value, withoutEnum); err != nil {
+				return errors.New("schema enum value is invalid")
+			}
+		}
 	}
 	return nil
 }
@@ -904,6 +964,189 @@ func validateNonnegativeBounds(minimum *int, maximum *int) error {
 		return errors.New("schema bounds are invalid")
 	}
 	return nil
+}
+
+func validateOptionalToolArguments(
+	raw json.RawMessage,
+	schema optionalToolInputSchema,
+) error {
+	value, err := decodeOptionalToolValue(raw)
+	if err != nil {
+		return err
+	}
+	return validateOptionalToolValue(value, schema)
+}
+
+func decodeOptionalToolValue(raw json.RawMessage) (any, error) {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	var value any
+	if err := decoder.Decode(&value); err != nil {
+		return nil, err
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return nil, errors.New("multiple JSON values")
+		}
+		return nil, err
+	}
+	return value, nil
+}
+
+func validateOptionalToolValue(value any, schema optionalToolInputSchema) error {
+	if schema.Enum != nil {
+		matched := false
+		for _, encoded := range schema.Enum {
+			allowed, err := decodeOptionalToolValue(encoded)
+			if err != nil {
+				return err
+			}
+			if optionalToolValuesEqual(value, allowed) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			return errors.New("value is outside the schema enum")
+		}
+	}
+	switch schema.Type {
+	case "object":
+		object, ok := value.(map[string]any)
+		if !ok {
+			return errors.New("value is not an object")
+		}
+		for _, name := range schema.Required {
+			if _, ok := object[name]; !ok {
+				return errors.New("required property is missing")
+			}
+		}
+		for name, item := range object {
+			property, ok := schema.Properties[name]
+			if !ok {
+				if schema.AdditionalProperties != nil &&
+					!*schema.AdditionalProperties {
+					return errors.New("additional property is not allowed")
+				}
+				continue
+			}
+			if err := validateOptionalToolValue(item, property); err != nil {
+				return err
+			}
+		}
+	case "array":
+		array, ok := value.([]any)
+		if !ok {
+			return errors.New("value is not an array")
+		}
+		if schema.MinItems != nil && len(array) < *schema.MinItems ||
+			schema.MaxItems != nil && len(array) > *schema.MaxItems {
+			return errors.New("array length is outside schema bounds")
+		}
+		for _, item := range array {
+			if err := validateOptionalToolValue(item, *schema.Items); err != nil {
+				return err
+			}
+		}
+	case "string":
+		text, ok := value.(string)
+		if !ok {
+			return errors.New("value is not a string")
+		}
+		length := utf8.RuneCountInString(text)
+		if schema.MinLength != nil && length < *schema.MinLength ||
+			schema.MaxLength != nil && length > *schema.MaxLength {
+			return errors.New("string length is outside schema bounds")
+		}
+	case "integer", "number":
+		number, ok := value.(json.Number)
+		if !ok {
+			return errors.New("value is not a number")
+		}
+		rational, err := jsonNumberRat(number)
+		if err != nil {
+			return err
+		}
+		if schema.Type == "integer" && !rational.IsInt() {
+			return errors.New("value is not an integer")
+		}
+		if schema.Minimum != nil {
+			minimum, err := jsonNumberRat(*schema.Minimum)
+			if err != nil {
+				return err
+			}
+			if rational.Cmp(minimum) < 0 {
+				return errors.New("number is below schema minimum")
+			}
+		}
+		if schema.Maximum != nil {
+			maximum, err := jsonNumberRat(*schema.Maximum)
+			if err != nil {
+				return err
+			}
+			if rational.Cmp(maximum) > 0 {
+				return errors.New("number is above schema maximum")
+			}
+		}
+	case "boolean":
+		if _, ok := value.(bool); !ok {
+			return errors.New("value is not a boolean")
+		}
+	default:
+		return errors.New("schema type is unsupported")
+	}
+	return nil
+}
+
+func optionalToolValuesEqual(left any, right any) bool {
+	leftNumber, leftIsNumber := left.(json.Number)
+	rightNumber, rightIsNumber := right.(json.Number)
+	if leftIsNumber || rightIsNumber {
+		if !leftIsNumber || !rightIsNumber {
+			return false
+		}
+		leftRational, leftErr := jsonNumberRat(leftNumber)
+		rightRational, rightErr := jsonNumberRat(rightNumber)
+		return leftErr == nil && rightErr == nil &&
+			leftRational.Cmp(rightRational) == 0
+	}
+	leftObject, leftIsObject := left.(map[string]any)
+	rightObject, rightIsObject := right.(map[string]any)
+	if leftIsObject || rightIsObject {
+		if !leftIsObject || !rightIsObject || len(leftObject) != len(rightObject) {
+			return false
+		}
+		for key, leftValue := range leftObject {
+			rightValue, ok := rightObject[key]
+			if !ok || !optionalToolValuesEqual(leftValue, rightValue) {
+				return false
+			}
+		}
+		return true
+	}
+	leftArray, leftIsArray := left.([]any)
+	rightArray, rightIsArray := right.([]any)
+	if leftIsArray || rightIsArray {
+		if !leftIsArray || !rightIsArray || len(leftArray) != len(rightArray) {
+			return false
+		}
+		for index := range leftArray {
+			if !optionalToolValuesEqual(leftArray[index], rightArray[index]) {
+				return false
+			}
+		}
+		return true
+	}
+	return left == right
+}
+
+func jsonNumberRat(number json.Number) (*big.Rat, error) {
+	rational, ok := new(big.Rat).SetString(number.String())
+	if !ok {
+		return nil, errors.New("invalid JSON number")
+	}
+	return rational, nil
 }
 
 func cloneTool(tool Tool) Tool {

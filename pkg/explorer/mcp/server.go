@@ -86,7 +86,7 @@ func (f DecisionProviderFunc) Decision(ctx context.Context) (auth.Decision, erro
 // Call receives the same freshly authorized context as built-in tools. The
 // returned value must encode as a JSON object so it can be carried as MCP
 // structuredContent. InputSchema is restricted to the validated subset in
-// validateOptionalToolInputSchema. Optional tools must omit outputSchema until
+// parseOptionalToolInputSchema. Optional tools must omit outputSchema until
 // this server can validate results against it, and execution must be nil or
 // explicitly forbid task mode.
 type OptionalToolProvider interface {
@@ -136,8 +136,9 @@ type Server struct {
 }
 
 type registeredTool struct {
-	definition Tool
-	call       func(context.Context, json.RawMessage) (any, error)
+	definition  Tool
+	inputSchema *optionalToolInputSchema
+	call        func(context.Context, json.RawMessage) (any, error)
 }
 
 // NewServer validates and snapshots the available tool surface. Optional tools
@@ -287,7 +288,7 @@ func protocolFailureID(raw []byte, failure *Error) (json.RawMessage, bool) {
 		return json.RawMessage("null"), true
 	}
 	if len(envelope.ID) == 0 {
-		return nil, false
+		return json.RawMessage("null"), true
 	}
 	if string(envelope.ID) == "null" {
 		return envelope.ID, true
@@ -433,6 +434,13 @@ func (s *Server) callTool(ctx context.Context, request Request) *Response {
 	if len(arguments) == 0 {
 		arguments = json.RawMessage("{}")
 	}
+	if tool.inputSchema != nil {
+		if err := validateOptionalToolArguments(arguments, *tool.inputSchema); err != nil {
+			response := newResponse(
+				request.ID, s.toolErrorResult(invalidToolArguments(params.Name)))
+			return &response
+		}
+	}
 	value, err := tool.call(bound, arguments)
 	if err != nil {
 		response := newResponse(request.ID, s.toolErrorResult(err))
@@ -567,7 +575,8 @@ func serviceTools(
 				shoal.ErrorInvalidArgument, "optional MCP tool provider is required")
 		}
 		definition := provider.Tool()
-		if err := validateTool(definition); err != nil {
+		inputSchema, err := validateTool(definition)
+		if err != nil {
 			return nil, err
 		}
 		if _, reserved := reservedServiceToolNames[definition.Name]; reserved {
@@ -576,7 +585,8 @@ func serviceTools(
 		}
 		provider := provider
 		tools = append(tools, registeredTool{
-			definition: cloneTool(definition),
+			definition:  cloneTool(definition),
+			inputSchema: inputSchema,
 			call: func(ctx context.Context, arguments json.RawMessage) (any, error) {
 				return provider.Call(ctx, append(json.RawMessage(nil), arguments...))
 			},
