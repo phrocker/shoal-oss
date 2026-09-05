@@ -21,6 +21,7 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"testing"
 	"time"
@@ -174,4 +175,107 @@ func seedStartedLatentWorkspace(t *testing.T, data string) shoal.ID {
 		t.Fatal(err)
 	}
 	return sourceID
+}
+
+// TestRecomputeUsesStartedEmbeddedWorkspaceReadPath pins that the recompute
+// endpoint reaches derivations through the production authorization wrapper the
+// deployed binary installs, not a bare pkg/explorer client. It runs the real
+// server (run + -dev-auth), reads the assertion id the browser would select,
+// and posts the literal recompute wire bytes the browser sends.
+func TestRecomputeUsesStartedEmbeddedWorkspaceReadPath(t *testing.T) {
+	data := t.TempDir()
+	sourceID := seedStartedLatentWorkspace(t, data)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	output := &lockedBuffer{}
+	done := make(chan error, 1)
+	go func() {
+		done <- run(ctx, []string{
+			"-data", data,
+			"-listen", "127.0.0.1:0",
+			"-dev-auth",
+		}, output)
+	}()
+	baseURL := waitForListeningURL(t, output)
+	getMeta(t, baseURL)
+
+	request, err := json.Marshal(webapi.NeighborhoodRequest{
+		NodeIDs: []shoal.ID{sourceID},
+		Depth:   1, Fanout: 8, MaxNodes: 8,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var neighborhood webapi.NeighborhoodResponse
+	if err := json.Unmarshal(
+		postJSON(t, baseURL+"/api/v1/neighborhood", string(request)), &neighborhood,
+	); err != nil {
+		t.Fatalf("decode neighborhood: %v", err)
+	}
+	if len(neighborhood.Neighborhood.Assertions) != 1 {
+		t.Fatalf("started workspace assertions = %d, want 1",
+			len(neighborhood.Neighborhood.Assertions))
+	}
+	assertionID := neighborhood.Neighborhood.Assertions[0].ID()
+	assertionWire := base64.RawURLEncoding.EncodeToString([]byte(assertionID))
+
+	// Baseline: an empty caller digest reports unchanged and returns the fresh
+	// digest plus the derivation detail, read through the authorized path.
+	first := recomputeThroughStartedServer(t, baseURL, assertionWire, "")
+	if !first.Unchanged {
+		t.Fatalf("baseline recompute unchanged = false, want true: %+v", first)
+	}
+	if first.Detail.Origin != "derived" {
+		t.Fatalf("recompute detail origin = %q, want derived", first.Detail.Origin)
+	}
+	if first.Detail.IteratorName != explorer.LatentLinkDefaultIteratorName {
+		t.Fatalf("recompute detail iterator = %q, want the projection iterator",
+			first.Detail.IteratorName)
+	}
+	if first.Digest == "" {
+		t.Fatalf("baseline recompute produced an empty digest")
+	}
+
+	// Re-running the same derivation is byte-identical, so recompute with the
+	// captured digest reports unchanged through the same authorized path.
+	second := recomputeThroughStartedServer(t, baseURL, assertionWire, first.Digest)
+	if !second.Unchanged || second.Digest != first.Digest {
+		t.Fatalf("stable recompute reported drift: %+v", second)
+	}
+
+	// A stale caller digest reports drift while the fresh digest stays stable.
+	stale := recomputeThroughStartedServer(t, baseURL, assertionWire, "stale-digest")
+	if stale.Unchanged {
+		t.Fatalf("recompute with a stale digest reported unchanged: %+v", stale)
+	}
+	if stale.Digest != first.Digest {
+		t.Fatalf("recompute digest depended on the caller digest: %q vs %q",
+			stale.Digest, first.Digest)
+	}
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("server did not shut down")
+	}
+}
+
+func recomputeThroughStartedServer(
+	t *testing.T, baseURL, assertionWire, digest string,
+) webapi.RecomputeDerivationResponse {
+	t.Helper()
+	body := `{"snapshot":{"id":"","as_of":"0001-01-01T00:00:00Z","frontier":"0"},` +
+		`"assertion_id":"` + assertionWire + `","digest":"` + digest + `"}`
+	var response webapi.RecomputeDerivationResponse
+	if err := json.Unmarshal(
+		postJSON(t, baseURL+"/api/v1/derivation/recompute", body), &response,
+	); err != nil {
+		t.Fatalf("decode recompute response: %v", err)
+	}
+	return response
 }

@@ -853,7 +853,14 @@ const app = fs.readFileSync("static/app.js", "utf8") +
   "\nthis.buildAuthorizeUrl = buildAuthorizeUrl;" +
   "\nthis.verifyCallbackState = verifyCallbackState;" +
   "\nthis.callbackParams = callbackParams;" +
-  "\nthis.exchangeAuthorizationCode = exchangeAuthorizationCode;";
+  "\nthis.exchangeAuthorizationCode = exchangeAuthorizationCode;" +
+  "\nthis.base64UrlDecode = base64UrlDecode;" +
+  "\nthis.mergeGraph = mergeGraph;" +
+  "\nthis.selectEdge = selectEdge;" +
+  "\nthis.edgeIsDerived = edgeIsDerived;" +
+  "\nthis.edgeDerivationScore = edgeDerivationScore;" +
+  "\nthis.renderGraphList = renderGraphList;" +
+  "\nthis.state = state;";
 
 class ClassList {
   constructor(element) { this.element = element; }
@@ -906,6 +913,7 @@ class Element {
 const canvasContext = {
   setTransform() {}, clearRect() {}, beginPath() {}, moveTo() {}, lineTo() {},
   stroke() {}, fillText() {}, arc() {}, fill() {},
+  save() {}, restore() {}, setLineDash() {},
 };
 
 function descendants(element) {
@@ -1028,6 +1036,8 @@ async function runScenario(capabilities, documents = [], scenarioOptions = {}) {
   let retrieveBody = null;
   const uploadRequests = [];
   const documentBodies = [];
+  const neighborhoodRequests = [];
+  const recomputeRequests = [];
   let extractRequest = null;
   let documentCalls = 0;
   const snapshot = {id: "snapshot123456", as_of: "2026-08-29T00:00:00Z", frontier: 1};
@@ -1124,6 +1134,31 @@ async function runScenario(capabilities, documents = [], scenarioOptions = {}) {
           restricted: scenarioOptions.retrievalRestricted || 0,
         });
       }
+      if (url.endsWith("/neighborhood")) {
+        neighborhoodRequests.push(JSON.parse(requestOptions.body));
+        if (scenarioOptions.neighborhoodError) {
+          return response(scenarioOptions.neighborhoodError.body || {}, {
+            ok: false,
+            statusText: scenarioOptions.neighborhoodError.statusText || "Error",
+          });
+        }
+        return response(scenarioOptions.neighborhoodResponse || {snapshot, neighborhood: {nodes: [], edges: []}});
+      }
+      if (url.endsWith("/derivation/recompute")) {
+        recomputeRequests.push(JSON.parse(requestOptions.body));
+        const index = recomputeRequests.length - 1;
+        const errors = scenarioOptions.recomputeErrors || [];
+        const error = errors[index] || scenarioOptions.recomputeError;
+        if (error) {
+          return response(error.body || {}, {
+            ok: false,
+            status: error.status,
+            statusText: error.statusText || "Error",
+          });
+        }
+        const responses = scenarioOptions.recomputeResponses || [];
+        return response(responses[index] || scenarioOptions.recomputeResponse || {snapshot, unchanged: true, digest: "digest", detail: {}});
+      }
       throw new Error("unexpected fetch " + url);
     },
   };
@@ -1139,6 +1174,8 @@ async function runScenario(capabilities, documents = [], scenarioOptions = {}) {
     get uploadRequests() { return uploadRequests; },
     get documentBodies() { return documentBodies; },
     get extractRequest() { return extractRequest; },
+    get neighborhoodRequests() { return neighborhoodRequests; },
+    get recomputeRequests() { return recomputeRequests; },
   };
 }
 
@@ -1146,4 +1183,206 @@ async function runScenario(capabilities, documents = [], scenarioOptions = {}) {
 ` + assertions + `
 })().catch((error) => { console.error(error.stack || error); process.exit(1); });
 `
+}
+
+func TestStaticWorkspaceDecodesWireMetadataWithoutBrowserGlobals(t *testing.T) {
+	runNodeUITest(t, `
+const scenario = await runScenario({documents: true, neighborhood: true});
+const decode = scenario.ctx.base64UrlDecode;
+const encode = scenario.ctx.base64UrlEncode;
+const encoder = new TextEncoder();
+for (const sample of ["", "derived", "ontology.assertion.origin", "0.91", "latent-similar-to", "café ☕"]) {
+  const roundTrip = decode(encode(encoder.encode(sample)));
+  assert.strictEqual(roundTrip, sample, "base64UrlDecode must invert base64UrlEncode for " + JSON.stringify(sample));
+}
+`)
+}
+
+func TestStaticWorkspaceDistinguishesDerivedEdgesInGraphList(t *testing.T) {
+	runNodeUITest(t, `
+const scenario = await runScenario({documents: true, neighborhood: true});
+const enc = (value) => scenario.ctx.base64UrlEncode(new TextEncoder().encode(value));
+const prop = (key, value) => ({key: enc(key), value: enc(value)});
+
+const derivedEdge = {
+  id: "assertion-wire-id", from: "node-a", to: "node-b", type: "latent-similar-to",
+  properties: [
+    prop("ontology.assertion.origin", "derived"),
+    prop("ontology.assertion.id", "assertion:abc"),
+    prop("ontology.assertion.derivation.id", "derivation:xyz"),
+    prop("ontology.assertion.derivation.score", "0.91"),
+  ],
+};
+const assertedEdge = {
+  id: "asserted-edge", from: "node-a", to: "node-b", type: "mentions",
+  properties: [prop("ontology.assertion.origin", "asserted")],
+};
+
+// The edge property is authoritative, so detection must work from the edge
+// alone even before any assertion detail is delivered.
+assert.strictEqual(scenario.ctx.edgeIsDerived(derivedEdge), true);
+assert.strictEqual(scenario.ctx.edgeIsDerived(assertedEdge), false);
+assert.strictEqual(scenario.ctx.edgeDerivationScore(derivedEdge), 0.91);
+assert.strictEqual(scenario.ctx.edgeDerivationScore(assertedEdge), null);
+
+scenario.ctx.mergeGraph({
+  nodes: [{id: "node-a", labels: ["A"]}, {id: "node-b", labels: ["B"]}],
+  edges: [derivedEdge, assertedEdge],
+});
+const buttons = scenario.ids["graph-edges"].querySelectorAll("button");
+assert.strictEqual(buttons.length, 2, "each edge renders as a selectable button");
+const derivedButton = buttons.find((button) => button.className.split(/\s+/).includes("derived"));
+const assertedButton = buttons.find((button) => !button.className.split(/\s+/).includes("derived"));
+assert.ok(derivedButton, "the derived edge must carry the derived class");
+assert.match(derivedButton.textContent, /^◆/, "the derived edge must be marked distinctly");
+assert.match(derivedButton.getAttribute("aria-label"), /^Derived edge,/);
+assert.doesNotMatch(assertedButton.textContent, /^◆/, "the asserted edge must not be marked derived");
+`)
+}
+
+func TestStaticWorkspaceInspectsDerivedEdgeProducerAndScore(t *testing.T) {
+	runNodeUITest(t, `
+const scenario = await runScenario({documents: true, neighborhood: true});
+const enc = (value) => scenario.ctx.base64UrlEncode(new TextEncoder().encode(value));
+const prop = (key, value) => ({key: enc(key), value: enc(value)});
+
+const edge = {
+  id: "assertion-wire-id", from: "node-a", to: "node-b", type: "latent-similar-to",
+  properties: [
+    prop("ontology.assertion.origin", "derived"),
+    prop("ontology.assertion.derivation.id", "derivation:xyz"),
+    prop("ontology.assertion.derivation.score", "0.91"),
+  ],
+};
+const assertion = {
+  id: "assertion-wire-id", origin: "derived",
+  evidence: [{derivation: {
+    id: "derivation:xyz", embedding_model: "unit-embed", embedding_model_version: "v1",
+    similarity_metric: "cosine", threshold: 0.85, tessellation_cell: "cell-a",
+    iterator_name: "latent-similar-to", score: 0.91,
+    iterator_options: [prop("similarityThreshold", "0.85"), prop("maxPairsPerCell", "128")],
+  }}],
+  provenance: {provider: "unit-provider", model: "unit-model", model_version: "v2"},
+};
+scenario.ctx.mergeGraph({
+  nodes: [{id: "node-a", labels: ["A"]}, {id: "node-b", labels: ["B"]}],
+  edges: [edge], assertions: [assertion],
+});
+scenario.ctx.selectEdge("assertion-wire-id");
+const panel = renderedText(scenario.ids.selection);
+assert.match(panel, /derived \(latent similarity\)/);
+assert.match(panel, /0\.91/, "the similarity score must be shown");
+assert.match(panel, /unit-embed \(v1\)/, "the embedding model and version must be shown");
+assert.match(panel, /cosine/, "the similarity metric must be shown");
+assert.match(panel, /cell-a/, "the tessellation cell must be shown");
+assert.match(panel, /latent-similar-to/, "the iterator name must be shown");
+assert.match(panel, /similarityThreshold=0\.85/, "iterator options must be decoded and shown");
+assert.match(panel, /derivation:xyz/, "the derivation id must be shown");
+assert.match(panel, /unit-provider/, "the producer identity must be shown");
+assert.strictEqual(scenario.ctx.state.selectedEdge, "assertion-wire-id");
+assert.strictEqual(scenario.ctx.state.selected, null, "selecting an edge clears the node selection");
+
+// An asserted edge exposes no producer and no recompute affordance.
+const assertedEdge = {
+  id: "asserted-edge", from: "node-a", to: "node-b", type: "mentions",
+  properties: [prop("ontology.assertion.origin", "asserted")],
+};
+scenario.ctx.mergeGraph({nodes: [], edges: [assertedEdge]});
+scenario.ctx.selectEdge("asserted-edge");
+assert.strictEqual(
+  scenario.ids.selection.querySelectorAll("button").length, 0,
+  "an asserted edge must not offer a recompute button");
+`)
+}
+
+func TestStaticWorkspaceRecomputeConfirmsDeterministicReproduction(t *testing.T) {
+	runNodeUITest(t, `
+const snapshot = {id: "recomputesnap", as_of: "2026-09-04T12:00:00Z", frontier: 7};
+const scenario = await runScenario(
+  {documents: true, neighborhood: true},
+  [],
+  {recomputeResponses: [
+    {snapshot, unchanged: true, digest: "digest-one", detail: {origin: "derived", score: 0.91}},
+    {snapshot, unchanged: true, digest: "digest-one", detail: {origin: "derived", score: 0.91}},
+  ]},
+);
+const enc = (value) => scenario.ctx.base64UrlEncode(new TextEncoder().encode(value));
+const prop = (key, value) => ({key: enc(key), value: enc(value)});
+const edge = {
+  id: "assertion-wire-id", from: "node-a", to: "node-b", type: "latent-similar-to",
+  properties: [
+    prop("ontology.assertion.origin", "derived"),
+    prop("ontology.assertion.derivation.score", "0.91"),
+  ],
+};
+scenario.ctx.mergeGraph({
+  nodes: [{id: "node-a"}, {id: "node-b"}], edges: [edge],
+});
+scenario.ctx.selectEdge("assertion-wire-id");
+const recomputeButton = scenario.ids.selection.querySelectorAll("button")[0];
+assert.ok(recomputeButton, "a derived edge must offer a recompute button");
+
+await recomputeButton.onclick();
+assert.strictEqual(scenario.recomputeRequests.length, 1);
+assert.strictEqual(
+  scenario.recomputeRequests[0].assertion_id, "assertion-wire-id",
+  "the browser must post the wire assertion id verbatim, not a decoded form");
+assert.strictEqual(
+  scenario.recomputeRequests[0].digest, "",
+  "the first recompute captures a baseline with no prior digest");
+assert.match(renderedText(scenario.ids.selection), /Captured digest/);
+
+await recomputeButton.onclick();
+assert.strictEqual(
+  scenario.recomputeRequests[1].digest, "digest-one",
+  "the second recompute posts the captured digest to verify reproduction");
+assert.match(renderedText(scenario.ids.selection), /Reproduced byte-identically/);
+`)
+}
+
+func TestStaticWorkspaceRecomputeSurfacesChangedInputs(t *testing.T) {
+	runNodeUITest(t, `
+const snapshot = {id: "recomputesnap", as_of: "2026-09-04T12:00:00Z", frontier: 7};
+
+const changed = await runScenario(
+  {documents: true, neighborhood: true},
+  [],
+  {recomputeResponses: [
+    {snapshot, unchanged: true, digest: "digest-one", detail: {origin: "derived", score: 0.91}},
+    {snapshot, unchanged: false, digest: "digest-two", detail: {origin: "derived", score: 0.42}},
+  ]},
+);
+const enc = (value) => changed.ctx.base64UrlEncode(new TextEncoder().encode(value));
+const prop = (key, value) => ({key: enc(key), value: enc(value)});
+const edge = {
+  id: "assertion-wire-id", from: "node-a", to: "node-b", type: "latent-similar-to",
+  properties: [prop("ontology.assertion.origin", "derived"), prop("ontology.assertion.derivation.score", "0.91")],
+};
+changed.ctx.mergeGraph({nodes: [{id: "node-a"}, {id: "node-b"}], edges: [edge]});
+changed.ctx.selectEdge("assertion-wire-id");
+const changedButton = changed.ids.selection.querySelectorAll("button")[0];
+await changedButton.onclick();
+await changedButton.onclick();
+const changedText = renderedText(changed.ids.selection);
+assert.match(changedText, /Inputs changed/);
+assert.match(changedText, /0\.42/, "the changed similarity score must be reported");
+
+// A derivation whose content-addressed identity no longer reproduces fails
+// closed with not-found, which the inspector reports as a changed input.
+const gone = await runScenario(
+  {documents: true, neighborhood: true},
+  [],
+  {recomputeError: {status: 404, statusText: "Not Found", body: {code: "not_found", message: "gone"}}},
+);
+const goneEnc = (value) => gone.ctx.base64UrlEncode(new TextEncoder().encode(value));
+const goneProp = (key, value) => ({key: goneEnc(key), value: goneEnc(value)});
+const goneEdge = {
+  id: "assertion-wire-id", from: "node-a", to: "node-b", type: "latent-similar-to",
+  properties: [goneProp("ontology.assertion.origin", "derived")],
+};
+gone.ctx.mergeGraph({nodes: [{id: "node-a"}, {id: "node-b"}], edges: [goneEdge]});
+gone.ctx.selectEdge("assertion-wire-id");
+await gone.ids.selection.querySelectorAll("button")[0].onclick();
+assert.match(renderedText(gone.ids.selection), /no longer reproduces/);
+`)
 }

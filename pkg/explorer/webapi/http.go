@@ -200,6 +200,9 @@ func (h *Handler) routes() {
 	h.mux.HandleFunc("POST /api/v1/ingest", ingestEndpoint(h.service))
 	// This route registration is load-bearing; TestHTTPExtractPublishesUploadedSkillGraph pins extraction as an explicit user-triggered action.
 	h.mux.HandleFunc("POST /api/v1/extract", extractEndpoint(h.service))
+	// This route registration is load-bearing; TestHTTPRecomputeReDerivesLatentAssertion
+	// pins that recomputing a derived edge is an explicit user-triggered action.
+	h.mux.HandleFunc("POST /api/v1/derivation/recompute", recomputeEndpoint(h.service))
 	h.mux.HandleFunc("POST /api/v1/changes", changesEndpoint(h.service))
 	h.mux.HandleFunc("POST /api/v1/documents", endpoint(h.service.Documents))
 	h.mux.HandleFunc("POST /api/v1/document", endpoint(h.service.Document))
@@ -286,6 +289,32 @@ func extractEndpoint(service Service) http.HandlerFunc {
 			return
 		}
 		response, err := provider.Extract(request.Context(), input)
+		if err != nil {
+			writeError(writer, err)
+			return
+		}
+		writeResponse(writer, http.StatusOK, response)
+	}
+}
+
+// recomputeEndpoint re-runs the deterministic derivation behind a latent
+// similarity assertion. It is gated on the optional RecomputeProvider extension
+// so a backend that cannot re-derive reports the action as unavailable rather
+// than answering with a fabricated result.
+func recomputeEndpoint(service Service) http.HandlerFunc {
+	return func(writer http.ResponseWriter, request *http.Request) {
+		provider, ok := service.(RecomputeProvider)
+		if !ok {
+			writeError(writer, shoal.NewError(
+				shoal.ErrorUnavailable, "workspace capability \"recompute\" is unavailable"))
+			return
+		}
+		var input RecomputeDerivationRequest
+		if err := decodeRequest(writer, request, &input); err != nil {
+			writeError(writer, shoal.NewError(shoal.ErrorInvalidArgument, err.Error()))
+			return
+		}
+		response, err := provider.Recompute(request.Context(), input)
 		if err != nil {
 			writeError(writer, err)
 			return

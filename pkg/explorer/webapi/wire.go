@@ -177,6 +177,23 @@ type wireAssertionDerivation struct {
 	IteratorOptions       wireMetadata `json:"iterator_options,omitempty"`
 }
 
+type wireDerivationDetail struct {
+	AssertionID           string       `json:"assertion_id"`
+	DerivationID          string       `json:"derivation_id"`
+	Origin                string       `json:"origin"`
+	Score                 float64      `json:"score"`
+	EmbeddingModel        string       `json:"embedding_model"`
+	EmbeddingModelVersion string       `json:"embedding_model_version"`
+	SimilarityMetric      string       `json:"similarity_metric"`
+	Threshold             float64      `json:"threshold"`
+	TessellationCell      string       `json:"tessellation_cell"`
+	IteratorName          string       `json:"iterator_name"`
+	IteratorOptions       wireMetadata `json:"iterator_options,omitempty"`
+	Provider              string       `json:"provider"`
+	Model                 string       `json:"model"`
+	ModelVersion          string       `json:"model_version"`
+}
+
 type wireExtractionProvenance struct {
 	Provider         string       `json:"provider"`
 	Model            string       `json:"model"`
@@ -878,6 +895,68 @@ func (r *ExtractResponse) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
+func (r RecomputeDerivationRequest) MarshalJSON() ([]byte, error) {
+	return json.Marshal(struct {
+		Snapshot    Snapshot `json:"snapshot"`
+		AssertionID string   `json:"assertion_id"`
+		Digest      string   `json:"digest,omitempty"`
+	}{
+		Snapshot: r.Snapshot, AssertionID: encodeID(r.AssertionID), Digest: r.Digest,
+	})
+}
+
+func (r *RecomputeDerivationRequest) UnmarshalJSON(data []byte) error {
+	var wire struct {
+		Snapshot    Snapshot `json:"snapshot"`
+		AssertionID string   `json:"assertion_id"`
+		Digest      string   `json:"digest,omitempty"`
+	}
+	if err := strictUnmarshal(data, &wire); err != nil {
+		return err
+	}
+	assertionID, err := decodeID(wire.AssertionID)
+	if err != nil {
+		return fmt.Errorf("assertion_id: %w", err)
+	}
+	*r = RecomputeDerivationRequest{
+		Snapshot: wire.Snapshot, AssertionID: assertionID, Digest: wire.Digest,
+	}
+	return nil
+}
+
+func (r RecomputeDerivationResponse) MarshalJSON() ([]byte, error) {
+	return json.Marshal(struct {
+		Snapshot  Snapshot             `json:"snapshot"`
+		Unchanged bool                 `json:"unchanged"`
+		Digest    string               `json:"digest"`
+		Detail    wireDerivationDetail `json:"detail"`
+	}{
+		Snapshot: r.Snapshot, Unchanged: r.Unchanged, Digest: r.Digest,
+		Detail: wireDerivationDetailValue(r.Detail),
+	})
+}
+
+func (r *RecomputeDerivationResponse) UnmarshalJSON(data []byte) error {
+	var wire struct {
+		Snapshot  Snapshot             `json:"snapshot"`
+		Unchanged bool                 `json:"unchanged"`
+		Digest    string               `json:"digest"`
+		Detail    wireDerivationDetail `json:"detail"`
+	}
+	if err := strictUnmarshal(data, &wire); err != nil {
+		return err
+	}
+	detail, err := derivationDetailValue(wire.Detail)
+	if err != nil {
+		return fmt.Errorf("detail: %w", err)
+	}
+	*r = RecomputeDerivationResponse{
+		Snapshot: wire.Snapshot, Unchanged: wire.Unchanged, Digest: wire.Digest,
+		Detail: detail,
+	}
+	return nil
+}
+
 func (r *NeighborhoodRequest) UnmarshalJSON(data []byte) error {
 	var wire struct {
 		Snapshot  Snapshot `json:"snapshot"`
@@ -1204,6 +1283,56 @@ func wireExtractionProvenanceValue(
 		ExtractorVersion: value.ExtractorVersion(),
 		Metadata:         wireMetadataValue(value.Metadata()),
 	}
+}
+
+func wireDerivationDetailValue(value DerivationDetail) wireDerivationDetail {
+	return wireDerivationDetail{
+		AssertionID:           encodeID(value.AssertionID),
+		DerivationID:          encodeOptionalID(value.DerivationID),
+		Origin:                value.Origin,
+		Score:                 value.Score,
+		EmbeddingModel:        value.EmbeddingModel,
+		EmbeddingModelVersion: value.EmbeddingModelVersion,
+		SimilarityMetric:      value.SimilarityMetric,
+		Threshold:             value.Threshold,
+		TessellationCell:      value.TessellationCell,
+		IteratorName:          value.IteratorName,
+		IteratorOptions:       wireMetadataValue(value.IteratorOptions),
+		Provider:              value.Provider,
+		Model:                 value.Model,
+		ModelVersion:          value.ModelVersion,
+	}
+}
+
+func derivationDetailValue(value wireDerivationDetail) (DerivationDetail, error) {
+	assertionID, err := decodeID(value.AssertionID)
+	if err != nil {
+		return DerivationDetail{}, fmt.Errorf("assertion_id: %w", err)
+	}
+	derivationID, err := decodeOptionalID(value.DerivationID)
+	if err != nil {
+		return DerivationDetail{}, fmt.Errorf("derivation_id: %w", err)
+	}
+	iteratorOptions, err := metadataValue(value.IteratorOptions)
+	if err != nil {
+		return DerivationDetail{}, fmt.Errorf("iterator_options: %w", err)
+	}
+	return DerivationDetail{
+		AssertionID:           assertionID,
+		DerivationID:          derivationID,
+		Origin:                value.Origin,
+		Score:                 value.Score,
+		EmbeddingModel:        value.EmbeddingModel,
+		EmbeddingModelVersion: value.EmbeddingModelVersion,
+		SimilarityMetric:      value.SimilarityMetric,
+		Threshold:             value.Threshold,
+		TessellationCell:      value.TessellationCell,
+		IteratorName:          value.IteratorName,
+		IteratorOptions:       iteratorOptions,
+		Provider:              value.Provider,
+		Model:                 value.Model,
+		ModelVersion:          value.ModelVersion,
+	}, nil
 }
 
 func documentValue(value wireDocument) (document.Document, error) {
