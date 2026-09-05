@@ -118,6 +118,16 @@ func (r ServiceRole) Allows(operation Operation) bool {
 		return operation == OperationRead || operation == OperationConnect ||
 			operation == OperationValidate
 	case ServiceRoleMigration:
+		return isLegacyMigrationOperation(operation)
+	default:
+		return false
+	}
+}
+
+func isLegacyMigrationOperation(operation Operation) bool {
+	switch operation {
+	case OperationIngest, OperationList, OperationRead, OperationConnect,
+		OperationNeighborhood, OperationRetrieve, OperationValidate:
 		return true
 	default:
 		return false
