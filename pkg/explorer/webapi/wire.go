@@ -617,19 +617,22 @@ func (r *RetrievalResponse) UnmarshalJSON(data []byte) error {
 
 func (r NeighborhoodResponse) MarshalJSON() ([]byte, error) {
 	return json.Marshal(struct {
-		Snapshot     Snapshot `json:"snapshot"`
-		Neighborhood any      `json:"neighborhood"`
-		Truncated    bool     `json:"truncated"`
-		NextCursor   string   `json:"next_cursor,omitempty"`
-	}{r.Snapshot, wireNeighborhoodValue(r.Neighborhood), r.Truncated, r.NextCursor})
+		Snapshot                Snapshot                       `json:"snapshot"`
+		Neighborhood            any                            `json:"neighborhood"`
+		OntologyInterpretations []OntologyInterpretationReport `json:"ontology_interpretations,omitempty"`
+		Truncated               bool                           `json:"truncated"`
+		NextCursor              string                         `json:"next_cursor,omitempty"`
+	}{r.Snapshot, wireNeighborhoodValue(r.Neighborhood), r.OntologyInterpretations,
+		r.Truncated, r.NextCursor})
 }
 
 func (r *NeighborhoodResponse) UnmarshalJSON(data []byte) error {
 	var wire struct {
-		Snapshot     Snapshot         `json:"snapshot"`
-		Neighborhood wireNeighborhood `json:"neighborhood"`
-		Truncated    bool             `json:"truncated"`
-		NextCursor   string           `json:"next_cursor,omitempty"`
+		Snapshot                Snapshot                       `json:"snapshot"`
+		Neighborhood            wireNeighborhood               `json:"neighborhood"`
+		OntologyInterpretations []OntologyInterpretationReport `json:"ontology_interpretations,omitempty"`
+		Truncated               bool                           `json:"truncated"`
+		NextCursor              string                         `json:"next_cursor,omitempty"`
 	}
 	if err := strictUnmarshal(data, &wire); err != nil {
 		return err
@@ -640,7 +643,8 @@ func (r *NeighborhoodResponse) UnmarshalJSON(data []byte) error {
 	}
 	*r = NeighborhoodResponse{
 		Snapshot: wire.Snapshot, Neighborhood: neighborhood,
-		Truncated: wire.Truncated, NextCursor: wire.NextCursor,
+		OntologyInterpretations: wire.OntologyInterpretations,
+		Truncated:               wire.Truncated, NextCursor: wire.NextCursor,
 	}
 	return nil
 }

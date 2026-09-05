@@ -25,6 +25,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/phrocker/shoal-oss/pkg/document"
+	"github.com/phrocker/shoal-oss/pkg/graph"
 	"github.com/phrocker/shoal-oss/pkg/ontology"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
@@ -79,6 +81,7 @@ type OntologyProposalProjection struct {
 	State            string                         `json:"state"`
 	ProposedOntology OntologyResponse               `json:"proposed_ontology"`
 	Transitions      []ProposalTransitionProjection `json:"transitions"`
+	Morphisms        []OntologyMorphismProjection   `json:"morphisms,omitempty"`
 }
 
 type ProposalTransitionProjection struct {
@@ -102,6 +105,45 @@ type OntologyProposalLimits struct {
 type CreateOntologyProposalRequest struct {
 	Rationale       string                       `json:"rationale"`
 	ProposedVersion OntologyProposalVersionDraft `json:"proposed_version"`
+	Morphisms       []OntologyMorphismDraft      `json:"morphisms,omitempty"`
+}
+
+type OntologyMorphismDraft struct {
+	Kind          ontology.MorphismKind           `json:"kind"`
+	Sources       []shoal.ID                      `json:"sources"`
+	Targets       []shoal.ID                      `json:"targets"`
+	Discriminator *OntologyDiscriminatorDraft     `json:"discriminator,omitempty"`
+	Evidence      []OntologyMorphismEvidenceDraft `json:"evidence"`
+	Rationale     string                          `json:"rationale"`
+	Metadata      shoal.Metadata                  `json:"metadata,omitempty"`
+}
+
+type OntologyDiscriminatorDraft struct {
+	MetadataKey string              `json:"metadata_key"`
+	Choices     map[string]shoal.ID `json:"choices"`
+}
+
+type OntologyMorphismEvidenceDraft struct {
+	Citation document.Citation `json:"citation"`
+	Quote    string            `json:"quote,omitempty"`
+	Path     *graph.Path       `json:"path,omitempty"`
+	Metadata shoal.Metadata    `json:"metadata,omitempty"`
+}
+
+type OntologyMorphismProjection struct {
+	ID            string                      `json:"id"`
+	Kind          ontology.MorphismKind       `json:"kind"`
+	Safety        ontology.MorphismSafety     `json:"safety"`
+	SourceSchema  string                      `json:"source_schema_id"`
+	SourceVersion string                      `json:"source_version_id"`
+	TargetSchema  string                      `json:"target_schema_id"`
+	TargetVersion string                      `json:"target_version_id"`
+	Sources       []shoal.ID                  `json:"sources"`
+	Targets       []shoal.ID                  `json:"targets"`
+	Discriminator *OntologyDiscriminatorDraft `json:"discriminator,omitempty"`
+	EvidenceIDs   []string                    `json:"evidence_ids"`
+	Rationale     string                      `json:"rationale"`
+	Metadata      shoal.Metadata              `json:"metadata,omitempty"`
 }
 
 type TransitionOntologyProposalRequest struct {
@@ -191,8 +233,13 @@ func (s *EmbeddedService) CreateOntologyProposal(
 	if err := enforceOntologyBounds(proposed); err != nil {
 		return ontology.GovernedProposal{}, err
 	}
-	proposal, err := ontology.NewGovernedProposal(
-		base.Schema(), base, proposed, ontologyActor(ctx), request.Rationale, now, nil)
+	morphisms, err := ontologyMorphismsFromDraft(base, proposed, request.Morphisms)
+	if err != nil {
+		return ontology.GovernedProposal{}, err
+	}
+	proposal, err := ontology.NewGovernedProposalWithMorphisms(
+		base.Schema(), base, proposed, morphisms,
+		ontologyActor(ctx), request.Rationale, now, nil)
 	if err != nil {
 		return ontology.GovernedProposal{}, err
 	}
@@ -200,6 +247,52 @@ func (s *EmbeddedService) CreateOntologyProposal(
 		return ontology.GovernedProposal{}, err
 	}
 	return proposal, nil
+}
+
+func ontologyMorphismsFromDraft(
+	base, proposed ontology.OntologyVersion,
+	drafts []OntologyMorphismDraft,
+) ([]ontology.OntologyMorphism, error) {
+	if len(drafts) > ontology.MaxProposalMorphisms {
+		return nil, shoal.NewError(
+			shoal.ErrorInvalidArgument, "proposal morphisms exceed the public bound")
+	}
+	out := make([]ontology.OntologyMorphism, 0, len(drafts))
+	for _, draft := range drafts {
+		evidence := make([]ontology.EvidenceRef, 0, len(draft.Evidence))
+		for _, item := range draft.Evidence {
+			var options []ontology.EvidenceOption
+			if item.Path != nil {
+				options = append(options, ontology.WithEvidencePath(*item.Path))
+			}
+			ref, err := ontology.NewEvidenceRef(
+				item.Citation, item.Quote, item.Metadata, options...)
+			if err != nil {
+				return nil, err
+			}
+			evidence = append(evidence, ref)
+		}
+		var discriminator ontology.MorphismDiscriminator
+		var err error
+		if draft.Discriminator != nil {
+			discriminator, err = ontology.NewMorphismDiscriminator(
+				draft.Discriminator.MetadataKey, draft.Discriminator.Choices)
+			if err != nil {
+				return nil, err
+			}
+		}
+		morphism, err := ontology.NewOntologyMorphism(ontology.MorphismConfig{
+			Kind: draft.Kind, SourceVersion: base, TargetVersion: proposed,
+			Sources: draft.Sources, Targets: draft.Targets,
+			Discriminator: discriminator, Evidence: evidence,
+			Rationale: draft.Rationale, Metadata: draft.Metadata,
+		})
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, morphism)
+	}
+	return out, nil
 }
 
 func (s *EmbeddedService) TransitionOntologyProposal(
@@ -359,6 +452,30 @@ func projectOntologyProposal(
 			Actor: transition.Actor(),
 			Note:  transition.Note(),
 			At:    transition.At(),
+		})
+	}
+	for _, morphism := range proposal.Morphisms() {
+		evidence := morphism.Evidence()
+		evidenceIDs := make([]string, len(evidence))
+		for index, item := range evidence {
+			evidenceIDs[index] = encodeID(item.ID())
+		}
+		var discriminator *OntologyDiscriminatorDraft
+		if morphism.Kind() == ontology.MorphismSplit {
+			value := morphism.Discriminator()
+			discriminator = &OntologyDiscriminatorDraft{
+				MetadataKey: value.MetadataKey(), Choices: value.Choices(),
+			}
+		}
+		projected.Morphisms = append(projected.Morphisms, OntologyMorphismProjection{
+			ID: encodeID(morphism.ID()), Kind: morphism.Kind(), Safety: morphism.Safety(),
+			SourceSchema:  encodeID(morphism.Source().SchemaID()),
+			SourceVersion: encodeID(morphism.Source().VersionID()),
+			TargetSchema:  encodeID(morphism.Target().SchemaID()),
+			TargetVersion: encodeID(morphism.Target().VersionID()),
+			Sources:       morphism.Sources(), Targets: morphism.Targets(),
+			Discriminator: discriminator, EvidenceIDs: evidenceIDs,
+			Rationale: morphism.Rationale(), Metadata: morphism.Metadata(),
 		})
 	}
 	return projected, nil

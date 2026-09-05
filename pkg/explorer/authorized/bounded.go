@@ -318,6 +318,10 @@ func (c *Client) BoundedNeighborhood(
 		return explorer.BoundedNeighborhood{}, err
 	}
 	raw.Neighborhood = filtered
+	raw.Neighborhood, err = c.applyOntologyLens(ctx, raw.Neighborhood, decision)
+	if err != nil {
+		return explorer.BoundedNeighborhood{}, err
+	}
 	raw.NextAfterEdgeID = ""
 	raw.Continuation = false
 	return raw, nil
@@ -425,8 +429,14 @@ func (c *Client) boundedAuthorizedNeighborhoodPage(
 	if err := guard.Check(ctx); err != nil {
 		return explorer.BoundedNeighborhood{}, err
 	}
-	return authorizedBoundedPage(
-		nodes, edges, assertions, request, len(normalized.NodeIDs)), nil
+	result := authorizedBoundedPage(
+		nodes, edges, assertions, request, len(normalized.NodeIDs))
+	interpreted, interpretErr := c.applyOntologyLens(ctx, result.Neighborhood, decision)
+	if interpretErr != nil {
+		return explorer.BoundedNeighborhood{}, interpretErr
+	}
+	result.Neighborhood = interpreted
+	return result, nil
 }
 
 func authorizedScanEdgeLimit(request explorer.BoundedNeighborhoodRequest) uint32 {

@@ -56,7 +56,19 @@ type persistedOntologyProposal struct {
 	Rationale       string
 	CreatedAt       time.Time
 	Metadata        shoal.Metadata
+	Morphisms       []persistedOntologyMorphism
 	transitions     []persistedProposalTransition
+}
+
+type persistedOntologyMorphism struct {
+	Kind             ontology.MorphismKind
+	Sources          []shoal.ID
+	Targets          []shoal.ID
+	DiscriminatorKey string
+	Discriminator    map[string]shoal.ID
+	Evidence         []persistedEvidenceRef
+	Rationale        string
+	Metadata         shoal.Metadata
 }
 
 type persistedOntologySchema struct {
@@ -423,8 +435,17 @@ func (p *persistedOntologyProposal) proposalBase() (ontology.GovernedProposal, e
 	if err != nil {
 		return ontology.GovernedProposal{}, err
 	}
-	proposal, err := ontology.NewGovernedProposal(
-		schema, base, proposed, p.ProposedBy, p.Rationale, p.CreatedAt, p.Metadata)
+	morphisms := make([]ontology.OntologyMorphism, 0, len(p.Morphisms))
+	for _, item := range p.Morphisms {
+		morphism, err := restoreOntologyMorphism(item, base, proposed)
+		if err != nil {
+			return ontology.GovernedProposal{}, err
+		}
+		morphisms = append(morphisms, morphism)
+	}
+	proposal, err := ontology.NewGovernedProposalWithMorphisms(
+		schema, base, proposed, morphisms,
+		p.ProposedBy, p.Rationale, p.CreatedAt, p.Metadata)
 	if err != nil {
 		return ontology.GovernedProposal{}, err
 	}
@@ -470,7 +491,73 @@ func persistOntologyProposal(
 		CreatedAt:       proposal.CreatedAt(),
 		Metadata:        proposal.Metadata(),
 	}
+	for _, morphism := range proposal.Morphisms() {
+		persisted, err := persistOntologyMorphism(morphism)
+		if err != nil {
+			return persistedOntologyProposal{}, err
+		}
+		record.Morphisms = append(record.Morphisms, persisted)
+	}
 	return record, nil
+}
+
+func persistOntologyMorphism(
+	morphism ontology.OntologyMorphism,
+) (persistedOntologyMorphism, error) {
+	record := persistedOntologyMorphism{
+		Kind: morphism.Kind(), Sources: morphism.Sources(), Targets: morphism.Targets(),
+		DiscriminatorKey: morphism.Discriminator().MetadataKey(),
+		Discriminator:    morphism.Discriminator().Choices(),
+		Rationale:        morphism.Rationale(), Metadata: morphism.Metadata(),
+	}
+	for _, evidence := range morphism.Evidence() {
+		if _, derived := evidence.Derivation(); derived {
+			return persistedOntologyMorphism{}, shoal.NewError(
+				shoal.ErrorInvalidArgument,
+				"ontology morphism persistence requires citation evidence",
+			)
+		}
+		path, hasPath := evidence.Path()
+		record.Evidence = append(record.Evidence, persistedEvidenceRef{
+			Citation: evidence.Citation(), Quote: evidence.Quote(),
+			Path: path, HasPath: hasPath, Metadata: evidence.Metadata(),
+		})
+	}
+	return record, nil
+}
+
+func restoreOntologyMorphism(
+	record persistedOntologyMorphism,
+	source, target ontology.OntologyVersion,
+) (ontology.OntologyMorphism, error) {
+	evidence := make([]ontology.EvidenceRef, 0, len(record.Evidence))
+	for _, item := range record.Evidence {
+		var options []ontology.EvidenceOption
+		if item.HasPath {
+			options = append(options, ontology.WithEvidencePath(item.Path))
+		}
+		ref, err := ontology.NewEvidenceRef(
+			item.Citation, item.Quote, item.Metadata, options...)
+		if err != nil {
+			return ontology.OntologyMorphism{}, err
+		}
+		evidence = append(evidence, ref)
+	}
+	var discriminator ontology.MorphismDiscriminator
+	var err error
+	if record.Kind == ontology.MorphismSplit {
+		discriminator, err = ontology.NewMorphismDiscriminator(
+			record.DiscriminatorKey, record.Discriminator)
+		if err != nil {
+			return ontology.OntologyMorphism{}, err
+		}
+	}
+	return ontology.NewOntologyMorphism(ontology.MorphismConfig{
+		Kind: record.Kind, SourceVersion: source, TargetVersion: target,
+		Sources: record.Sources, Targets: record.Targets,
+		Discriminator: discriminator, Evidence: evidence,
+		Rationale: record.Rationale, Metadata: record.Metadata,
+	})
 }
 
 func persistOntologySchema(schema ontology.OntologySchema) persistedOntologySchema {
