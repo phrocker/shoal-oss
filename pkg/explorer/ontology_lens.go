@@ -51,6 +51,8 @@ func (e *Explorer) InterpretAssertions(
 	}
 	var target ontology.OntologyVersion
 	var morphisms []ontology.OntologyMorphism
+	publishedTransitions := make(map[string]struct{})
+	ambiguousPublication := false
 	for _, record := range e.ontologyProposals {
 		proposal, err := record.proposal()
 		if err != nil {
@@ -58,6 +60,14 @@ func (e *Explorer) InterpretAssertions(
 		}
 		if proposal.State() != ontology.ProposalPublished {
 			continue
+		}
+		baseID, hasBase := proposal.BaseVersionID()
+		if hasBase {
+			key := string(baseID) + "->" + string(proposal.ProposedVersion().ID())
+			if _, duplicate := publishedTransitions[key]; duplicate {
+				ambiguousPublication = true
+			}
+			publishedTransitions[key] = struct{}{}
 		}
 		if identity, _ := ontology.NewOntologyIdentity(proposal.ProposedVersion()); identity == selected {
 			target = proposal.ProposedVersion()
@@ -74,6 +84,13 @@ func (e *Explorer) InterpretAssertions(
 		morphisms = append(morphisms, proposal.Morphisms()...)
 	}
 	out := make([]ontology.AssertionInterpretation, 0, len(assertions))
+	if ambiguousPublication {
+		for _, assertion := range assertions {
+			out = append(out, ontology.UnresolvedInterpretation(
+				assertion, selected, "multiple proposals published the same ontology transition"))
+		}
+		return out, nil
+	}
 	if target.ID() == "" {
 		for _, assertion := range assertions {
 			out = append(out, ontology.UnresolvedInterpretation(

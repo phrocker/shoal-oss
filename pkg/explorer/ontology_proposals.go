@@ -261,6 +261,29 @@ func (e *Explorer) TransitionOntologyProposal(
 		return ontology.GovernedProposal{}, shoal.WrapError(
 			shoal.ErrorInternal, "stored ontology proposal is invalid", err)
 	}
+	if next == ontology.ProposalPublished {
+		for otherID, otherRecord := range e.ontologyProposals {
+			if otherID == proposalID {
+				continue
+			}
+			other, restoreErr := otherRecord.proposal()
+			if restoreErr != nil {
+				return ontology.GovernedProposal{}, shoal.WrapError(
+					shoal.ErrorInternal, "stored ontology proposal is invalid", restoreErr)
+			}
+			otherBase, otherHasBase := other.BaseVersionID()
+			currentBase, currentHasBase := current.BaseVersionID()
+			if other.State() == ontology.ProposalPublished &&
+				otherHasBase == currentHasBase &&
+				otherBase == currentBase &&
+				other.ProposedVersion().ID() == current.ProposedVersion().ID() {
+				return ontology.GovernedProposal{}, shoal.NewError(
+					shoal.ErrorConflict,
+					"another proposal already published this ontology transition",
+				)
+			}
+		}
+	}
 	// This advance is load-bearing; TestOntologyProposalTransitionsSurviveCoarseClockGranularity
 	// pins that back-to-back transitions still record strictly increasing times
 	// on platforms whose wall clock does not tick between two reads.
