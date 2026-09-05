@@ -1062,12 +1062,18 @@ func markdownBlockMarker(line string) int {
 	if markdownSetextUnderline(line[start:]) {
 		return start
 	}
-	switch line[start] {
-	case '>', '#':
+	if markdownHyphenThematicBreak(line[start:]) {
 		return start
+	}
+	switch line[start] {
+	case '>':
+		return start
+	case '#':
+		if markdownATXHeading(line[start:]) {
+			return start
+		}
 	case '+', '-':
-		if start+1 == len(line) || line[start+1] == ' ' || line[start+1] == '\t' ||
-			strings.HasPrefix(line[start:], "---") {
+		if start+1 == len(line) || line[start+1] == ' ' || line[start+1] == '\t' {
 			return start
 		}
 	case '~':
@@ -1086,6 +1092,29 @@ func markdownBlockMarker(line string) int {
 		return digitEnd
 	}
 	return -1
+}
+
+func markdownATXHeading(line string) bool {
+	count := 0
+	for count < len(line) && line[count] == '#' {
+		count++
+	}
+	return count >= 1 && count <= 6 &&
+		(count == len(line) || line[count] == ' ' || line[count] == '\t')
+}
+
+func markdownHyphenThematicBreak(line string) bool {
+	count := 0
+	for _, r := range line {
+		switch r {
+		case '-':
+			count++
+		case ' ', '\t':
+		default:
+			return false
+		}
+	}
+	return count >= 3
 }
 
 func markdownSetextUnderline(line string) bool {
