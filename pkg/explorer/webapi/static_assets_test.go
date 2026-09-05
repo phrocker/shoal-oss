@@ -665,12 +665,15 @@ const challenge = await scenario.ctx.pkceChallengeFromVerifier(verifier);
 assert.strictEqual(challenge, "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM");
 
 const url = scenario.ctx.buildAuthorizeUrl(
-  {authority: "https://login.microsoftonline.com/tenant", client_id: "client-1", scope: "openid profile"},
-  {redirectUri: "https://app.example/", state: "state-xyz", nonce: "nonce-abc", codeChallenge: challenge});
+  {authorization_endpoint: "https://identity.example/authorize?prompt=login", client_id: "client-1", scope: "openid profile"},
+  {redirectUri: "https://app.example/", state: "state-xyz", codeChallenge: challenge});
 assert.match(url, /code_challenge_method=S256/);
+assert.match(url, /^https:\/\/identity\.example\/authorize\?prompt=login&/);
 assert.match(url, /response_type=code/);
 assert.match(url, /state=state-xyz/);
-assert.match(url, /nonce=nonce-abc/);
+// The UI consumes only the access token and never processes an ID token, so it
+// must not send an OIDC nonce that it cannot validate.
+assert.strictEqual(/[?&]nonce=/.test(url), false);
 assert.match(url, /code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM/);
 // The plain method must never be emitted.
 assert.strictEqual(/code_challenge_method=plain/.test(url), false);
@@ -680,7 +683,8 @@ assert.strictEqual(/code_challenge_method=plain/.test(url), false);
 func TestStaticWorkspaceLoginRejectsMismatchedState(t *testing.T) {
 	runNodeUITest(t, `
 const scenario = await runScenario({documents: true, retrieve: true});
-const config = {authority: "https://login.microsoftonline.com/tenant", client_id: "client-1", scope: "openid"};
+const config = {token_endpoint: "https://identity.example/token", client_id: "client-1", scope: "openid"};
+const now = 1735689600000;
 
 // verifyCallbackState is exact and refuses a missing stored value.
 assert.strictEqual(scenario.ctx.verifyCallbackState("s", "s"), true);
@@ -694,20 +698,42 @@ const deps = {fetch: async () => { calls++; return {ok: true, json: async () => 
 let threw = false;
 try {
   await scenario.ctx.exchangeAuthorizationCode(
-    config, {code: "c", state: "attacker"}, {state: "mine", verifier: "v", redirectUri: "https://app/"}, deps);
+    config, {code: "c", state: "attacker"},
+    {state: "mine", verifier: "v", redirectUri: "https://app/", createdAt: now},
+    {...deps, now: () => now});
 } catch (_) { threw = true; }
 assert.strictEqual(threw, true, "mismatched state must reject");
 assert.strictEqual(calls, 0, "token endpoint must not be called on state mismatch");
 
 // A matching callback exchanges the code and returns the token.
+let tokenURL = null;
 let tokenBody = null;
-const okDeps = {fetch: async (url, options) => { tokenBody = options.body; return {ok: true, json: async () => ({access_token: "good-token"})}; }};
+const okDeps = {fetch: async (url, options) => { tokenURL = url; tokenBody = options.body; return {ok: true, json: async () => ({access_token: "good-token"})}; }};
 const token = await scenario.ctx.exchangeAuthorizationCode(
-  config, {code: "auth-code", state: "mine"}, {state: "mine", verifier: "verifier-1", redirectUri: "https://app/"}, okDeps);
+  config, {code: "auth-code", state: "mine"},
+  {state: "mine", verifier: "verifier-1", redirectUri: "https://app/", createdAt: now},
+  {...okDeps, now: () => now});
 assert.strictEqual(token, "good-token");
+assert.strictEqual(tokenURL, "https://identity.example/token");
 assert.match(tokenBody, /grant_type=authorization_code/);
 assert.match(tokenBody, /code_verifier=verifier-1/);
 assert.match(tokenBody, /code=auth-code/);
+
+// An expired or legacy timestamp-free flow is rejected before any network call.
+for (const stored of [
+  {state: "mine", verifier: "v", redirectUri: "https://app/", createdAt: now - (11 * 60 * 1000)},
+  {state: "mine", verifier: "v", redirectUri: "https://app/"},
+]) {
+  let expiredCalls = 0;
+  let expired = false;
+  try {
+    await scenario.ctx.exchangeAuthorizationCode(
+      config, {code: "c", state: "mine"}, stored,
+      {fetch: async () => { expiredCalls++; }, now: () => now});
+  } catch (_) { expired = true; }
+  assert.strictEqual(expired, true, "expired login flow must reject");
+  assert.strictEqual(expiredCalls, 0, "expired login flow must not reach token endpoint");
+}
 `)
 }
 
