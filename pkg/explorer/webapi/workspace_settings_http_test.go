@@ -1,0 +1,383 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements. See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership. The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License. You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied. See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+package webapi_test
+
+import (
+	"bytes"
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
+	"github.com/phrocker/shoal-oss/pkg/explorer/webapi"
+	"github.com/phrocker/shoal-oss/pkg/explorer/workspace"
+	"github.com/phrocker/shoal-oss/pkg/shoal"
+)
+
+type settingsStubService struct{}
+
+func (settingsStubService) Documents(
+	context.Context,
+	webapi.DocumentsRequest,
+) (webapi.DocumentsResponse, error) {
+	return webapi.DocumentsResponse{}, nil
+}
+
+func (settingsStubService) Document(
+	context.Context,
+	webapi.DocumentRequest,
+) (webapi.DocumentResponse, error) {
+	return webapi.DocumentResponse{}, nil
+}
+
+func (settingsStubService) Retrieve(
+	context.Context,
+	webapi.RetrievalRequest,
+) (webapi.RetrievalResponse, error) {
+	return webapi.RetrievalResponse{}, nil
+}
+
+func (settingsStubService) Neighborhood(
+	context.Context,
+	webapi.NeighborhoodRequest,
+) (webapi.NeighborhoodResponse, error) {
+	return webapi.NeighborhoodResponse{}, nil
+}
+
+func (settingsStubService) Path(
+	context.Context,
+	webapi.PathRequest,
+) (webapi.PathResponse, error) {
+	return webapi.PathResponse{}, nil
+}
+
+func TestHTTPWorkspaceSettingsRoundTripAuthorizationAndRestart(t *testing.T) {
+	now := time.Date(2026, 9, 5, 18, 0, 0, 0, time.UTC)
+	dir := filepath.Join(t.TempDir(), "settings")
+	authority, err := auth.NewAuthorityWithClock(func() time.Time { return now })
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := workspace.OpenDurableStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider, err := workspace.NewProvider(store, workspace.ProviderOptions{
+		Resolver: authority.Resolver(),
+		Clock:    func() time.Time { return now },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	authenticator := webapi.AuthenticatorFunc(func(
+		request *http.Request,
+	) (auth.Decision, error) {
+		subject := shoal.ID(request.Header.Get("X-Test-Subject"))
+		if subject == "" {
+			subject = "owner"
+		}
+		return settingsHTTPDecision(t, now, subject), nil
+	})
+	handler, err := webapi.NewAuthenticatedHandler(
+		settingsStubService{}, authenticator, authority.Binder(), "example.test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := handler.SetWorkspaceSettingsProvider(provider); err != nil {
+		t.Fatal(err)
+	}
+
+	workspacePath := base64.RawURLEncoding.EncodeToString([]byte("workspace-http"))
+	mutationID := base64.RawURLEncoding.EncodeToString([]byte("mutation-http"))
+	sourceID, _ := auth.EncodeComponent([]byte("source-a"))
+	policyID, _ := auth.EncodeComponent([]byte("policy-a"))
+	body := map[string]any{
+		"expected_revision": uint64(0),
+		"mutation_id":       mutationID,
+		"settings": map[string]any{
+			"permitted_source_ids": []string{},
+			"permitted_policy_ids": []string{policyID},
+			"budgets": map[string]any{
+				"retrieval_top_k": uint32(8),
+			},
+			"output_policies": []map[string]any{{
+				"source_id": sourceID, "grant_policy_id": policyID,
+				"epoch": int64(1),
+			}},
+		},
+	}
+	response := settingsRequest(
+		t, handler, http.MethodPut,
+		"/api/v1/workspaces/"+workspacePath+"/settings", body, "owner", "http://example.test")
+	if response.Code != http.StatusCreated {
+		t.Fatalf("PUT status = %d, body = %s", response.Code, response.Body.String())
+	}
+	var created webapi.WorkspaceSettingsResponse
+	if err := json.Unmarshal(response.Body.Bytes(), &created); err != nil {
+		t.Fatal(err)
+	}
+	if created.Revision != 1 ||
+		created.Settings.PermittedSourceIDs == nil ||
+		len(*created.Settings.PermittedSourceIDs) != 0 {
+		t.Fatalf("created response = %#v", created)
+	}
+
+	response = settingsRequest(
+		t, handler, http.MethodGet,
+		"/api/v1/workspaces/"+workspacePath+"/settings", nil, "owner", "")
+	if response.Code != http.StatusOK {
+		t.Fatalf("GET status = %d, body = %s", response.Code, response.Body.String())
+	}
+	var read webapi.WorkspaceSettingsResponse
+	if err := json.Unmarshal(response.Body.Bytes(), &read); err != nil {
+		t.Fatal(err)
+	}
+	if read.SettingsID != created.SettingsID ||
+		read.LastMutationID != created.LastMutationID ||
+		read.Settings.Budgets.RetrievalTopK == nil ||
+		*read.Settings.Budgets.RetrievalTopK != 8 {
+		t.Fatalf("read response = %#v", read)
+	}
+
+	response = settingsRequest(
+		t, handler, http.MethodGet,
+		"/api/v1/workspaces/"+workspacePath+"/settings", nil, "other", "")
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("cross-owner GET status = %d, body = %s",
+			response.Code, response.Body.String())
+	}
+	response = settingsRequest(
+		t, handler, http.MethodPut,
+		"/api/v1/workspaces/"+workspacePath+"/settings", body, "other", "http://example.test")
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("cross-owner PUT status = %d, body = %s",
+			response.Code, response.Body.String())
+	}
+
+	staleBody := cloneJSONMap(t, body)
+	staleBody["mutation_id"] = base64.RawURLEncoding.EncodeToString([]byte("stale"))
+	response = settingsRequest(
+		t, handler, http.MethodPut,
+		"/api/v1/workspaces/"+workspacePath+"/settings",
+		staleBody, "owner", "http://example.test")
+	if response.Code != http.StatusConflict {
+		t.Fatalf("stale PUT status = %d, body = %s",
+			response.Code, response.Body.String())
+	}
+	response = settingsRequest(
+		t, handler, http.MethodPut,
+		"/api/v1/workspaces/"+workspacePath+"/settings",
+		body, "owner", "https://attacker.example")
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("cross-origin PUT status = %d, body = %s",
+			response.Code, response.Body.String())
+	}
+
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := workspace.OpenDurableStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	restartedProvider, err := workspace.NewProvider(
+		reopened,
+		workspace.ProviderOptions{
+			Resolver: authority.Resolver(),
+			Clock:    func() time.Time { return now },
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restartedHandler, err := webapi.NewAuthenticatedHandler(
+		settingsStubService{}, authenticator, authority.Binder(), "example.test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := restartedHandler.SetWorkspaceSettingsProvider(
+		restartedProvider); err != nil {
+		t.Fatal(err)
+	}
+	response = settingsRequest(
+		t, restartedHandler, http.MethodGet,
+		"/api/v1/workspaces/"+workspacePath+"/settings", nil, "owner", "")
+	if response.Code != http.StatusOK {
+		t.Fatalf("restart GET status = %d, body = %s",
+			response.Code, response.Body.String())
+	}
+	var restarted webapi.WorkspaceSettingsResponse
+	if err := json.Unmarshal(response.Body.Bytes(), &restarted); err != nil {
+		t.Fatal(err)
+	}
+	if restarted.Settings.PermittedSourceIDs == nil ||
+		len(*restarted.Settings.PermittedSourceIDs) != 0 {
+		t.Fatalf("restart collapsed explicit empty scope: %#v", restarted)
+	}
+}
+
+func TestHTTPWorkspaceSettingsRejectsBoundsAndUnknownFields(t *testing.T) {
+	now := time.Date(2026, 9, 5, 18, 0, 0, 0, time.UTC)
+	authority, _ := auth.NewAuthorityWithClock(func() time.Time { return now })
+	store, err := workspace.OpenDurableStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	provider, err := workspace.NewProvider(store, workspace.ProviderOptions{
+		Resolver: authority.Resolver(), Clock: func() time.Time { return now },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	plain, err := webapi.NewHandler(settingsStubService{}, "example.test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := plain.SetWorkspaceSettingsProvider(provider); !shoal.IsErrorCode(
+		err, shoal.ErrorInvalidArgument,
+	) {
+		t.Fatalf("unauthenticated settings handler error = %v", err)
+	}
+	handler, err := webapi.NewAuthenticatedHandler(
+		settingsStubService{},
+		webapi.AuthenticatorFunc(func(*http.Request) (auth.Decision, error) {
+			return settingsHTTPDecision(t, now, "owner"), nil
+		}),
+		authority.Binder(),
+		"example.test",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := handler.SetWorkspaceSettingsProvider(provider); err != nil {
+		t.Fatal(err)
+	}
+	path := "/api/v1/workspaces/" +
+		base64.RawURLEncoding.EncodeToString([]byte("bounded")) + "/settings"
+	for _, test := range []struct {
+		name string
+		body map[string]any
+	}{
+		{
+			name: "budget",
+			body: map[string]any{
+				"expected_revision": 0,
+				"mutation_id":       base64.RawURLEncoding.EncodeToString([]byte("budget")),
+				"settings": map[string]any{
+					"budgets": map[string]any{
+						"retrieval_top_k": workspace.MaxRetrievalTopK + 1,
+					},
+				},
+			},
+		},
+		{
+			name: "unknown field",
+			body: map[string]any{
+				"expected_revision": 0,
+				"mutation_id":       base64.RawURLEncoding.EncodeToString([]byte("unknown")),
+				"settings":          map[string]any{"ambient_lens": "forbidden"},
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			response := settingsRequest(
+				t, handler, http.MethodPut, path, test.body, "owner",
+				"http://example.test")
+			if response.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, body = %s",
+					response.Code, response.Body.String())
+			}
+		})
+	}
+}
+
+func settingsHTTPDecision(
+	t *testing.T,
+	now time.Time,
+	subject shoal.ID,
+) auth.Decision {
+	t.Helper()
+	decision, err := auth.NewDecision(auth.DecisionConfig{
+		Subject: subject, Actor: "actor",
+		AuthorizationDomain: []byte("domain"),
+		AllowedOperations: []auth.Operation{
+			auth.OperationRead,
+			auth.OperationWorkspaceSettingsRead,
+			auth.OperationWorkspaceSettingsWrite,
+		},
+		PermittedSourceIDs:    [][]byte{[]byte("source-a")},
+		PermittedPolicyIDs:    [][]byte{[]byte("policy-a")},
+		PolicyGeneration:      1,
+		AuthenticationExpires: now.Add(time.Hour),
+		RequestID:             "request",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return decision
+}
+
+func settingsRequest(
+	t *testing.T,
+	handler http.Handler,
+	method, path string,
+	body map[string]any,
+	subject, origin string,
+) *httptest.ResponseRecorder {
+	t.Helper()
+	var encoded []byte
+	if body != nil {
+		var err error
+		encoded, err = json.Marshal(body)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	request := httptest.NewRequest(method, "http://example.test"+path, bytes.NewReader(encoded))
+	request.Host = "example.test"
+	request.Header.Set("X-Test-Subject", subject)
+	if body != nil {
+		request.Header.Set("Content-Type", "application/json")
+	}
+	if origin != "" {
+		request.Header.Set("Origin", origin)
+	}
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	return response
+}
+
+func cloneJSONMap(t *testing.T, value map[string]any) map[string]any {
+	t.Helper()
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var result map[string]any
+	if err := json.Unmarshal(encoded, &result); err != nil {
+		t.Fatal(err)
+	}
+	return result
+}

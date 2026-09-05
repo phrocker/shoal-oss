@@ -40,6 +40,7 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/explorer/coordination"
 	"github.com/phrocker/shoal-oss/pkg/explorer/coordination/transaction"
 	"github.com/phrocker/shoal-oss/pkg/explorer/webapi"
+	"github.com/phrocker/shoal-oss/pkg/explorer/workspace"
 	"github.com/phrocker/shoal-oss/pkg/model"
 	"github.com/phrocker/shoal-oss/pkg/ontology"
 )
@@ -65,15 +66,16 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 	stateDir := flags.String(
 		"state-dir", "",
 		"Recommended workspace state root. The corpus and durable policy "+
-			"catalog are created as corpus/ and policy/ inside it, so mounting "+
+			"catalog and settings are created as corpus/, policy/, and settings/ "+
+			"inside it, so mounting "+
 			"this one directory as a volume persists everything a restart "+
 			"needs. Overrides -data when set",
 	)
 	data := flags.String(
 		"data", ".shoal/explorer",
 		"Legacy Explorer corpus directory (used when -state-dir is unset). The "+
-			"durable policy catalog is placed in a sibling directory; both must "+
-			"be persisted for the workspace to survive a restart",
+			"durable policy catalog and workspace settings are placed in sibling "+
+			"directories; all must be persisted for the workspace to survive a restart",
 	)
 	policyDirFlag := flags.String(
 		"policy-dir", "",
@@ -444,6 +446,12 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 		listener.Close()
 		return err
 	}
+	if opened.settings != nil {
+		if err := handler.SetWorkspaceSettingsProvider(opened.settings); err != nil {
+			listener.Close()
+			return err
+		}
+	}
 	// Browser login is optional and publishes only non-secret OIDC parameters.
 	// With -dev-auth, or an API-only OIDC configuration, auth-config reports
 	// unconfigured and the UI renders no login flow.
@@ -622,6 +630,7 @@ type serviceConfig struct {
 // development principal was granted.
 type openedService struct {
 	service    webapi.Service
+	settings   webapi.WorkspaceSettingsProvider
 	backfilled int
 	close      func()
 }
@@ -719,10 +728,51 @@ func openService(
 				return closed, err
 			}
 		}
+		settingsStore, err := workspace.OpenDurableStore(
+			workspaceSettingsStoreDir(config.data))
+		if err != nil {
+			store.Close()
+			corpus.Close()
+			return closed, err
+		}
+		var choices workspace.OntologyChoices
+		if config.ontology != nil {
+			identity, err := ontology.NewOntologyIdentity(*config.ontology)
+			if err != nil {
+				settingsStore.Close()
+				store.Close()
+				corpus.Close()
+				return closed, err
+			}
+			configured, err := workspace.NewStaticOntologyChoices(identity)
+			if err != nil {
+				settingsStore.Close()
+				store.Close()
+				corpus.Close()
+				return closed, err
+			}
+			choices = configured
+		}
+		settingsProvider, err := workspace.NewProvider(
+			settingsStore,
+			workspace.ProviderOptions{
+				Resolver:        config.resolver,
+				OntologyChoices: choices,
+				Clock:           config.clock,
+			},
+		)
+		if err != nil {
+			settingsStore.Close()
+			store.Close()
+			corpus.Close()
+			return closed, err
+		}
 		return openedService{
 			service:    service,
+			settings:   settingsProvider,
 			backfilled: backfilled,
 			close: func() {
+				settingsStore.Close()
 				store.Close()
 				embedded.Close()
 			},
@@ -750,6 +800,16 @@ func openService(
 // treats every subdirectory of the data directory as a table.
 func policyStoreDir(data string) string {
 	return filepath.Clean(data) + "-policy"
+}
+
+// workspaceSettingsStoreDir keeps settings outside the corpus engine while
+// placing them under the same recommended state root.
+func workspaceSettingsStoreDir(data string) string {
+	clean := filepath.Clean(data)
+	if filepath.Base(clean) == "corpus" {
+		return filepath.Join(filepath.Dir(clean), "settings")
+	}
+	return clean + "-settings"
 }
 
 // firstNonEmpty returns the first argument whose trimmed value is non-empty.
