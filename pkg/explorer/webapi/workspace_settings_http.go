@@ -1,0 +1,386 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements. See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership. The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License. You may obtain a copy of the License at
+ *
+ *     https://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied. See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+package webapi
+
+import (
+	"fmt"
+	"net"
+	"net/http"
+	"net/url"
+	"strings"
+
+	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
+	"github.com/phrocker/shoal-oss/pkg/explorer/workspace"
+	"github.com/phrocker/shoal-oss/pkg/ontology"
+	"github.com/phrocker/shoal-oss/pkg/shoal"
+)
+
+type WorkspaceSettingsResponse struct {
+	WorkspaceID    string                     `json:"workspace_id"`
+	SettingsID     string                     `json:"settings_id"`
+	Owner          string                     `json:"owner"`
+	Revision       uint64                     `json:"revision"`
+	LastMutationID string                     `json:"last_mutation_id"`
+	Settings       WorkspaceSettingsNarrowing `json:"settings"`
+}
+
+type WorkspaceSettingsUpdateRequest struct {
+	ExpectedRevision uint64                      `json:"expected_revision"`
+	MutationID       string                      `json:"mutation_id"`
+	Settings         *WorkspaceSettingsNarrowing `json:"settings"`
+}
+
+type WorkspaceSettingsNarrowing struct {
+	AllowedOperations  *[]string                  `json:"allowed_operations,omitempty"`
+	PermittedSourceIDs *[]string                  `json:"permitted_source_ids,omitempty"`
+	PermittedPolicyIDs *[]string                  `json:"permitted_policy_ids,omitempty"`
+	Budgets            WorkspaceSettingsBudgets   `json:"budgets,omitempty"`
+	OutputPolicies     []WorkspaceOutputPolicy    `json:"output_policies,omitempty"`
+	SelectedOntology   *WorkspaceOntologyIdentity `json:"selected_ontology,omitempty"`
+}
+
+type WorkspaceSettingsBudgets struct {
+	RetrievalTopK *uint32 `json:"retrieval_top_k,omitempty"`
+	GraphDepth    *uint32 `json:"graph_depth,omitempty"`
+	GraphFanout   *uint32 `json:"graph_fanout,omitempty"`
+	GraphNodes    *uint32 `json:"graph_nodes,omitempty"`
+	OutputBytes   *uint64 `json:"output_bytes,omitempty"`
+}
+
+type WorkspaceOutputPolicy struct {
+	SourceID      string `json:"source_id"`
+	GrantPolicyID string `json:"grant_policy_id"`
+	Epoch         int64  `json:"epoch"`
+}
+
+type WorkspaceOntologyIdentity struct {
+	SchemaID  string `json:"schema_id"`
+	VersionID string `json:"version_id"`
+}
+
+func (h *Handler) registerWorkspaceSettingsRoutes() {
+	h.mux.HandleFunc(
+		"GET /api/v1/workspaces/{workspace}/settings",
+		h.getWorkspaceSettings,
+	)
+	h.mux.HandleFunc(
+		"PUT /api/v1/workspaces/{workspace}/settings",
+		h.putWorkspaceSettings,
+	)
+}
+
+func (h *Handler) getWorkspaceSettings(
+	writer http.ResponseWriter,
+	request *http.Request,
+) {
+	if isAbsentInterface(h.workspaceSettings) {
+		writeError(writer, shoal.NewError(
+			shoal.ErrorUnavailable, "workspace settings are unavailable"))
+		return
+	}
+	workspaceID, err := decodeID(request.PathValue("workspace"))
+	if err != nil {
+		writeError(writer, shoal.NewError(
+			shoal.ErrorInvalidArgument, "workspace ID "+err.Error()))
+		return
+	}
+	settings, err := h.workspaceSettings.Get(request.Context(), workspaceID)
+	if err != nil {
+		writeError(writer, err)
+		return
+	}
+	response, err := workspaceSettingsResponse(settings)
+	if err != nil {
+		writeError(writer, err)
+		return
+	}
+	writeResponse(writer, http.StatusOK, response)
+}
+
+func (h *Handler) putWorkspaceSettings(
+	writer http.ResponseWriter,
+	request *http.Request,
+) {
+	if isAbsentInterface(h.workspaceSettings) {
+		writeError(writer, shoal.NewError(
+			shoal.ErrorUnavailable, "workspace settings are unavailable"))
+		return
+	}
+	if err := requireSameOrigin(request); err != nil {
+		writeError(writer, err)
+		return
+	}
+	workspaceID, err := decodeID(request.PathValue("workspace"))
+	if err != nil {
+		writeError(writer, shoal.NewError(
+			shoal.ErrorInvalidArgument, "workspace ID "+err.Error()))
+		return
+	}
+	var input WorkspaceSettingsUpdateRequest
+	if err := decodeRequest(writer, request, &input); err != nil {
+		writeError(writer, shoal.NewError(shoal.ErrorInvalidArgument, err.Error()))
+		return
+	}
+	update, err := workspaceSettingsUpdate(input)
+	if err != nil {
+		writeError(writer, shoal.NewError(shoal.ErrorInvalidArgument, err.Error()))
+		return
+	}
+	settings, err := h.workspaceSettings.Update(
+		request.Context(), workspaceID, update)
+	if err != nil {
+		writeError(writer, err)
+		return
+	}
+	response, err := workspaceSettingsResponse(settings)
+	if err != nil {
+		writeError(writer, err)
+		return
+	}
+	status := http.StatusOK
+	if settings.Revision == 1 {
+		status = http.StatusCreated
+	}
+	writeResponse(writer, status, response)
+}
+
+func workspaceSettingsUpdate(
+	value WorkspaceSettingsUpdateRequest,
+) (workspace.UpdateRequest, error) {
+	mutationID, err := decodeID(value.MutationID)
+	if err != nil {
+		return workspace.UpdateRequest{}, fmt.Errorf("mutation_id: %w", err)
+	}
+	if value.Settings == nil {
+		return workspace.UpdateRequest{}, fmt.Errorf("settings is required")
+	}
+	settings := *value.Settings
+	operations := workspace.OperationSelection{}
+	if settings.AllowedOperations != nil {
+		operations.Present = true
+		for index, name := range *settings.AllowedOperations {
+			operation, err := auth.ParseOperation(name)
+			if err != nil {
+				return workspace.UpdateRequest{}, fmt.Errorf(
+					"allowed_operations[%d]: %w", index, err)
+			}
+			operations.Values = append(operations.Values, operation)
+		}
+	}
+	sources, err := decodeComponentSelection(settings.PermittedSourceIDs)
+	if err != nil {
+		return workspace.UpdateRequest{}, fmt.Errorf(
+			"permitted_source_ids: %w", err)
+	}
+	policies, err := decodeComponentSelection(settings.PermittedPolicyIDs)
+	if err != nil {
+		return workspace.UpdateRequest{}, fmt.Errorf(
+			"permitted_policy_ids: %w", err)
+	}
+	outputPolicies := make(
+		[]workspace.OutputPolicySpec, 0, len(settings.OutputPolicies))
+	for index, policy := range settings.OutputPolicies {
+		sourceID, err := auth.DecodeComponent(policy.SourceID)
+		if err != nil {
+			return workspace.UpdateRequest{}, fmt.Errorf(
+				"output_policies[%d].source_id: %w", index, err)
+		}
+		grantPolicyID, err := auth.DecodeComponent(policy.GrantPolicyID)
+		if err != nil {
+			return workspace.UpdateRequest{}, fmt.Errorf(
+				"output_policies[%d].grant_policy_id: %w", index, err)
+		}
+		outputPolicies = append(outputPolicies, workspace.OutputPolicySpec{
+			SourceID: sourceID, GrantPolicyID: grantPolicyID,
+			Epoch: policy.Epoch,
+		})
+	}
+	var selected workspace.OntologySelection
+	if settings.SelectedOntology != nil {
+		schemaID, err := decodeID(settings.SelectedOntology.SchemaID)
+		if err != nil {
+			return workspace.UpdateRequest{}, fmt.Errorf(
+				"selected_ontology.schema_id: %w", err)
+		}
+		versionID, err := decodeID(settings.SelectedOntology.VersionID)
+		if err != nil {
+			return workspace.UpdateRequest{}, fmt.Errorf(
+				"selected_ontology.version_id: %w", err)
+		}
+		identity, err := ontology.NewOntologyIdentityFromIDs(schemaID, versionID)
+		if err != nil {
+			return workspace.UpdateRequest{}, fmt.Errorf(
+				"selected_ontology: %w", err)
+		}
+		selected = workspace.OntologySelection{
+			Present: true, Identity: identity,
+		}
+	}
+	return workspace.UpdateRequest{
+		ExpectedRevision: value.ExpectedRevision,
+		MutationID:       mutationID,
+		Narrowing: workspace.UpdateNarrowing{
+			AllowedOperations:  operations,
+			PermittedSourceIDs: sources,
+			PermittedPolicyIDs: policies,
+			Budgets: workspace.Budgets{
+				RetrievalTopK: settings.Budgets.RetrievalTopK,
+				GraphDepth:    settings.Budgets.GraphDepth,
+				GraphFanout:   settings.Budgets.GraphFanout,
+				GraphNodes:    settings.Budgets.GraphNodes,
+				OutputBytes:   settings.Budgets.OutputBytes,
+			},
+			OutputPolicies:   outputPolicies,
+			SelectedOntology: selected,
+		},
+	}, nil
+}
+
+func workspaceSettingsResponse(
+	value workspace.Settings,
+) (WorkspaceSettingsResponse, error) {
+	settings := WorkspaceSettingsNarrowing{
+		Budgets: WorkspaceSettingsBudgets{
+			RetrievalTopK: value.Narrowing.Budgets.RetrievalTopK,
+			GraphDepth:    value.Narrowing.Budgets.GraphDepth,
+			GraphFanout:   value.Narrowing.Budgets.GraphFanout,
+			GraphNodes:    value.Narrowing.Budgets.GraphNodes,
+			OutputBytes:   value.Narrowing.Budgets.OutputBytes,
+		},
+	}
+	if value.Narrowing.AllowedOperations.Present {
+		values := make([]string, 0, len(value.Narrowing.AllowedOperations.Values))
+		for _, operation := range value.Narrowing.AllowedOperations.Values {
+			values = append(values, string(operation))
+		}
+		settings.AllowedOperations = &values
+	}
+	var err error
+	settings.PermittedSourceIDs, err = encodeComponentSelection(
+		value.Narrowing.PermittedSourceIDs)
+	if err != nil {
+		return WorkspaceSettingsResponse{}, err
+	}
+	settings.PermittedPolicyIDs, err = encodeComponentSelection(
+		value.Narrowing.PermittedPolicyIDs)
+	if err != nil {
+		return WorkspaceSettingsResponse{}, err
+	}
+	for _, policy := range value.Narrowing.OutputPolicies {
+		sourceID, err := auth.EncodeComponent(policy.SourceID())
+		if err != nil {
+			return WorkspaceSettingsResponse{}, err
+		}
+		grantPolicyID, err := auth.EncodeComponent(policy.GrantPolicyID())
+		if err != nil {
+			return WorkspaceSettingsResponse{}, err
+		}
+		settings.OutputPolicies = append(
+			settings.OutputPolicies,
+			WorkspaceOutputPolicy{
+				SourceID: sourceID, GrantPolicyID: grantPolicyID,
+				Epoch: policy.Epoch(),
+			},
+		)
+	}
+	if value.Narrowing.SelectedOntology.Present {
+		settings.SelectedOntology = &WorkspaceOntologyIdentity{
+			SchemaID: encodeID(
+				value.Narrowing.SelectedOntology.Identity.SchemaID()),
+			VersionID: encodeID(
+				value.Narrowing.SelectedOntology.Identity.VersionID()),
+		}
+	}
+	return WorkspaceSettingsResponse{
+		WorkspaceID:    encodeID(value.WorkspaceID),
+		SettingsID:     encodeID(value.SettingsID),
+		Owner:          encodeID(value.Owner),
+		Revision:       value.Revision,
+		LastMutationID: encodeID(value.LastMutationID),
+		Settings:       settings,
+	}, nil
+}
+
+func decodeComponentSelection(values *[]string) (workspace.IDSelection, error) {
+	if values == nil {
+		return workspace.IDSelection{}, nil
+	}
+	selection := workspace.IDSelection{Present: true}
+	for index, value := range *values {
+		decoded, err := auth.DecodeComponent(value)
+		if err != nil {
+			return workspace.IDSelection{}, fmt.Errorf("[%d]: %w", index, err)
+		}
+		selection.Values = append(selection.Values, decoded)
+	}
+	return selection, nil
+}
+
+func encodeComponentSelection(
+	selection workspace.IDSelection,
+) (*[]string, error) {
+	if !selection.Present {
+		return nil, nil
+	}
+	values := make([]string, 0, len(selection.Values))
+	for _, value := range selection.Values {
+		encoded, err := auth.EncodeComponent(value)
+		if err != nil {
+			return nil, err
+		}
+		values = append(values, encoded)
+	}
+	return &values, nil
+}
+
+func requireSameOrigin(request *http.Request) error {
+	switch site := request.Header.Get("Sec-Fetch-Site"); site {
+	case "", "none", "same-origin":
+	default:
+		return shoal.NewError(
+			shoal.ErrorUnauthorized, "cross-origin settings mutation denied")
+	}
+	origin := request.Header.Get("Origin")
+	if origin == "" {
+		return nil
+	}
+	parsed, err := url.Parse(origin)
+	if err != nil || parsed.User != nil ||
+		(parsed.Scheme != "http" && parsed.Scheme != "https") ||
+		parsed.Path != "" || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return shoal.NewError(
+			shoal.ErrorUnauthorized, "cross-origin settings mutation denied")
+	}
+	if !sameAuthority(parsed.Host, request.Host) {
+		return shoal.NewError(
+			shoal.ErrorUnauthorized, "cross-origin settings mutation denied")
+	}
+	return nil
+}
+
+func sameAuthority(left, right string) bool {
+	leftHost, leftPort, leftErr := net.SplitHostPort(left)
+	rightHost, rightPort, rightErr := net.SplitHostPort(right)
+	if leftErr == nil || rightErr == nil {
+		return leftErr == nil && rightErr == nil &&
+			strings.EqualFold(leftHost, rightHost) && leftPort == rightPort
+	}
+	return strings.EqualFold(left, right)
+}
