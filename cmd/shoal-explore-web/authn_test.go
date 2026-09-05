@@ -131,6 +131,7 @@ func TestRunRefusesRequestedAddressWithoutBinding(t *testing.T) {
 		{"routable address", []string{"-listen", "203.0.113.7:0", "-dev-auth"}},
 		{"no authenticator", []string{"-listen", "127.0.0.1:0"}},
 	}
+
 	for _, testCase := range cases {
 		t.Run(testCase.name, func(t *testing.T) {
 			original := listenTCP
@@ -152,6 +153,44 @@ func TestRunRefusesRequestedAddressWithoutBinding(t *testing.T) {
 				t.Fatalf("unclear diagnostic: %v", err)
 			}
 		})
+	}
+}
+
+func TestRunAcceptsDeprecatedEntraFlags(t *testing.T) {
+	err := run(context.Background(), []string{
+		"-entra-tenant", "tenant-123",
+		"-entra-issuer", "http://invalid.example",
+		"-entra-client-id", "client-456",
+		"-entra-jwks-uri", "https://keys.example/jwks",
+		"-entra-allowed-algs", "RS256",
+		"-entra-clock-skew", "30s",
+		"-entra-reader-roles", "Shoal.Reader",
+		"-entra-contributor-roles", "Shoal.Contributor",
+		"-entra-scope", "openid profile",
+	}, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "issuer must use https") {
+		t.Fatalf("deprecated Entra flags were not parsed and translated: %v", err)
+	}
+}
+
+func TestRunAcceptsDeprecatedEntraEnvironment(t *testing.T) {
+	for _, name := range []string{
+		"SHOAL_OIDC_ISSUER", "SHOAL_OIDC_AUDIENCE",
+		"SHOAL_OIDC_AUTHORIZATION_CLAIM", "SHOAL_OIDC_READER_VALUES",
+		"SHOAL_OIDC_CONTRIBUTOR_VALUES",
+	} {
+		t.Setenv(name, "")
+	}
+	t.Setenv("SHOAL_ENTRA_TENANT", "tenant-123")
+	t.Setenv("SHOAL_ENTRA_ISSUER", "http://invalid.example")
+	t.Setenv("SHOAL_ENTRA_CLIENT_ID", "client-456")
+	t.Setenv("SHOAL_ENTRA_JWKS_URI", "https://keys.example/jwks")
+	t.Setenv("SHOAL_ENTRA_READER_ROLES", "Shoal.Reader")
+	t.Setenv("SHOAL_ENTRA_CONTRIBUTOR_ROLES", "Shoal.Contributor")
+	t.Setenv("SHOAL_ENTRA_SCOPE", "openid profile")
+	err := run(context.Background(), nil, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "issuer must use https") {
+		t.Fatalf("deprecated Entra environment was not translated: %v", err)
 	}
 }
 

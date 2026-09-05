@@ -30,6 +30,7 @@ import (
 	"math/big"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -282,6 +283,162 @@ func TestOIDCValidTokenMintsReaderDecision(t *testing.T) {
 	}
 	if second.RequestID() == decision.RequestID() {
 		t.Fatal("two requests shared one request identity")
+	}
+}
+
+func TestLegacyEntraCompatibilityPreservesBehavior(t *testing.T) {
+	issuer := newFakeOIDCIssuer(t)
+	now := time.Now()
+	config := applyLegacyEntraCompatibility(oidcConfig{
+		httpClient: issuer.server.Client(),
+		clock:      fixedClock(now),
+	}, legacyEntraConfig{
+		issuer:           issuer.server.URL,
+		audience:         testAudience,
+		readerRoles:      []string{"Shoal.Reader"},
+		contributorRoles: []string{"Shoal.Contributor"},
+	})
+	if config.subjectClaim != "oid" || config.subjectFallbackClaim != "sub" ||
+		config.authorizationClaim != "roles" ||
+		config.identityPrefix != legacyEntraPrefix ||
+		config.defaultActor != legacyEntraActor ||
+		config.browserClientID != testAudience ||
+		config.browserScope != "openid profile "+testAudience+"/.default" {
+		t.Fatalf("legacy translation = %+v", config)
+	}
+	authenticator := newTestOIDCAuthenticator(t, config)
+	claims := issuer.defaultClaims(now)
+	delete(claims, "access")
+	claims["oid"] = " object-123 "
+	claims["roles"] = []string{" Shoal.Reader "}
+	decision, err := authenticator.Authenticate(bearerRequest(
+		issuer.signRS256(t, testKID, claims)))
+	if err != nil {
+		t.Fatalf("legacy role token rejected: %v", err)
+	}
+	if decision.Subject() != "entra:object-123" ||
+		decision.Actor() != legacyEntraActor ||
+		!operationsContain(decision.AllowedOperations(), auth.OperationRead) {
+		t.Fatalf(
+			"legacy decision = subject %q actor %q operations %v",
+			decision.Subject(), decision.Actor(), decision.AllowedOperations())
+	}
+
+	delete(claims, "oid")
+	delete(claims, "roles")
+	decision, err = authenticator.Authenticate(bearerRequest(
+		issuer.signRS256(t, testKID, claims)))
+	if err != nil {
+		t.Fatalf("legacy sub fallback/unmapped token rejected: %v", err)
+	}
+	if decision.Subject() != "entra:"+testSubject ||
+		!operationsContain(decision.AllowedOperations(), auth.OperationList) ||
+		grantsWorkspaceSource(decision) {
+		t.Fatalf(
+			"legacy unmapped decision = subject %q operations %v sources %q",
+			decision.Subject(), decision.AllowedOperations(),
+			decision.PermittedSourceIDs())
+	}
+}
+
+func TestLegacyEntraTenantDerivesIssuerAndBrowserDefaults(t *testing.T) {
+	config := applyLegacyEntraCompatibility(oidcConfig{}, legacyEntraConfig{
+		tenantID:    "tenant-123",
+		audience:    "client-456",
+		readerRoles: []string{"reader"},
+	})
+	if config.issuer !=
+		"https://login.microsoftonline.com/tenant-123/v2.0" {
+		t.Fatalf("derived issuer = %q", config.issuer)
+	}
+	if config.authorizationEndpoint !=
+		"https://login.microsoftonline.com/tenant-123/oauth2/v2.0/authorize" ||
+		config.tokenEndpoint !=
+			"https://login.microsoftonline.com/tenant-123/oauth2/v2.0/token" ||
+		config.legacyTenantID != "tenant-123" ||
+		config.legacyAuthority !=
+			"https://login.microsoftonline.com/tenant-123" {
+		t.Fatalf("legacy browser defaults = %+v", config)
+	}
+}
+
+func TestLegacyEntraWithoutRoleMappingsRemainsFailClosed(t *testing.T) {
+	issuer := newFakeOIDCIssuer(t)
+	now := time.Now()
+	config := applyLegacyEntraCompatibility(oidcConfig{
+		httpClient: issuer.server.Client(),
+		clock:      fixedClock(now),
+	}, legacyEntraConfig{
+		issuer:   issuer.server.URL,
+		audience: testAudience,
+	})
+	authenticator := newTestOIDCAuthenticator(t, config)
+	claims := issuer.defaultClaims(now)
+	delete(claims, "access")
+	decision, err := authenticator.Authenticate(bearerRequest(
+		issuer.signRS256(t, testKID, claims)))
+	if err != nil {
+		t.Fatalf("legacy token without role mappings rejected: %v", err)
+	}
+	if !operationsContain(decision.AllowedOperations(), auth.OperationList) ||
+		grantsWorkspaceSource(decision) {
+		t.Fatalf(
+			"legacy no-role decision = operations %v sources %q",
+			decision.AllowedOperations(), decision.PermittedSourceIDs())
+	}
+}
+
+func TestLegacyEntraRejectsScalarRolesClaim(t *testing.T) {
+	issuer := newFakeOIDCIssuer(t)
+	now := time.Now()
+	config := applyLegacyEntraCompatibility(oidcConfig{
+		httpClient: issuer.server.Client(),
+		clock:      fixedClock(now),
+	}, legacyEntraConfig{
+		issuer:      issuer.server.URL,
+		audience:    testAudience,
+		readerRoles: []string{"Shoal.Reader"},
+	})
+	authenticator := newTestOIDCAuthenticator(t, config)
+	claims := issuer.defaultClaims(now)
+	delete(claims, "access")
+	claims["roles"] = "Shoal.Reader"
+	if _, err := authenticator.authenticate(bearerRequest(
+		issuer.signRS256(t, testKID, claims),
+	)); !errors.Is(err, errMalformedClaim) {
+		t.Fatalf("legacy scalar roles error = %v", err)
+	}
+}
+
+func TestLegacyOptionAloneDoesNotEnableAuthentication(t *testing.T) {
+	config := applyLegacyEntraCompatibility(oidcConfig{}, legacyEntraConfig{
+		allowedAlgorithms: []string{"RS256"},
+	})
+	if config.configured() {
+		t.Fatalf("standalone legacy algorithm unexpectedly enabled OIDC: %+v", config)
+	}
+}
+
+func TestAzureTemplateRetainsDeprecatedEntraParameters(t *testing.T) {
+	body, err := os.ReadFile(filepath.Join(
+		"..", "..", "deploy", "shoal-explore-web", "azure", "main.bicep"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(body)
+	for _, want := range []string{
+		"param entraTenantId string",
+		"param entraClientId string",
+		"param entraReaderRoles string",
+		"param entraContributorRoles string",
+		"param entraIssuer string",
+		"param entraJwksUri string",
+		"SHOAL_ENTRA_TENANT: entraTenantId",
+		"SHOAL_ENTRA_CLIENT_ID: entraClientId",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("Azure compatibility template missing %q", want)
+		}
 	}
 }
 

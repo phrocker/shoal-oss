@@ -219,6 +219,49 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 		"Token endpoint override for browser login; otherwise read from "+
 			"discovery. Environment fallback SHOAL_OIDC_TOKEN_ENDPOINT",
 	)
+	entraTenant := flags.String(
+		"entra-tenant", "",
+		"Deprecated compatibility alias for the former Entra tenant setting; "+
+			"environment fallback SHOAL_ENTRA_TENANT",
+	)
+	entraIssuer := flags.String(
+		"entra-issuer", "",
+		"Deprecated compatibility alias for -oidc-issuer; environment fallback "+
+			"SHOAL_ENTRA_ISSUER",
+	)
+	entraClientID := flags.String(
+		"entra-client-id", "",
+		"Deprecated compatibility alias for the OIDC audience and browser "+
+			"client ID; environment fallback SHOAL_ENTRA_CLIENT_ID",
+	)
+	entraJWKSURI := flags.String(
+		"entra-jwks-uri", "",
+		"Deprecated compatibility alias for -oidc-jwks-uri; environment "+
+			"fallback SHOAL_ENTRA_JWKS_URI",
+	)
+	entraAllowedAlgs := flags.String(
+		"entra-allowed-algs", "",
+		"Deprecated compatibility alias for -oidc-allowed-algs",
+	)
+	entraClockSkew := flags.Duration(
+		"entra-clock-skew", 0,
+		"Deprecated compatibility alias for -oidc-clock-skew",
+	)
+	entraReaderRoles := flags.String(
+		"entra-reader-roles", "",
+		"Deprecated compatibility alias mapping the roles claim to reader "+
+			"authority; environment fallback SHOAL_ENTRA_READER_ROLES",
+	)
+	entraContributorRoles := flags.String(
+		"entra-contributor-roles", "",
+		"Deprecated compatibility alias mapping the roles claim to contributor "+
+			"authority; environment fallback SHOAL_ENTRA_CONTRIBUTOR_ROLES",
+	)
+	entraScope := flags.String(
+		"entra-scope", "",
+		"Deprecated browser-scope compatibility alias; environment fallback "+
+			"SHOAL_ENTRA_SCOPE",
+	)
 	ontologyFile := flags.String(
 		"ontology-file", "",
 		"Optional JSON file containing the active ontology schema, version, "+
@@ -230,7 +273,7 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 		return err
 	}
 
-	oidc := oidcConfig{
+	oidc := applyLegacyEntraCompatibility(oidcConfig{
 		issuer: firstNonEmpty(
 			*oidcIssuer, os.Getenv("SHOAL_OIDC_ISSUER")),
 		discoveryURL: firstNonEmpty(
@@ -267,7 +310,26 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 			os.Getenv("SHOAL_OIDC_AUTHORIZATION_ENDPOINT")),
 		tokenEndpoint: firstNonEmpty(
 			*oidcTokenEndpoint, os.Getenv("SHOAL_OIDC_TOKEN_ENDPOINT")),
-	}
+	}, legacyEntraConfig{
+		tenantID: firstNonEmpty(
+			*entraTenant, os.Getenv("SHOAL_ENTRA_TENANT")),
+		issuer: firstNonEmpty(
+			*entraIssuer, os.Getenv("SHOAL_ENTRA_ISSUER")),
+		audience: firstNonEmpty(
+			*entraClientID, os.Getenv("SHOAL_ENTRA_CLIENT_ID")),
+		jwksURI: firstNonEmpty(
+			*entraJWKSURI, os.Getenv("SHOAL_ENTRA_JWKS_URI")),
+		allowedAlgorithms: splitCommaList(firstNonEmpty(
+			*entraAllowedAlgs, os.Getenv("SHOAL_ENTRA_ALLOWED_ALGS"))),
+		clockSkew: *entraClockSkew,
+		readerRoles: splitCommaList(firstNonEmpty(
+			*entraReaderRoles, os.Getenv("SHOAL_ENTRA_READER_ROLES"))),
+		contributorRoles: splitCommaList(firstNonEmpty(
+			*entraContributorRoles,
+			os.Getenv("SHOAL_ENTRA_CONTRIBUTOR_ROLES"))),
+		scope: firstNonEmpty(
+			*entraScope, os.Getenv("SHOAL_ENTRA_SCOPE")),
+	})
 
 	embedding, err := embeddingConfig{
 		provider:   *embeddingProvider,

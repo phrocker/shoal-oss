@@ -33,6 +33,10 @@ import (
 // public-client PKCE exchange and the server only validates the bearer token
 // that results; it never issues one.
 type BrowserAuthConfig struct {
+	// TenantID is retained for source and wire compatibility with the former
+	// provider-specific browser contract. New integrations should leave it
+	// empty and use the endpoint fields.
+	TenantID string
 	// ClientID is the public application identifier the browser authenticates as.
 	ClientID string
 	// Scope is the space-delimited scope string the browser requests.
@@ -41,6 +45,9 @@ type BrowserAuthConfig struct {
 	AuthorizationEndpoint string
 	// TokenEndpoint is the exact OIDC token endpoint.
 	TokenEndpoint string
+	// Authority is retained for compatibility. When endpoint fields are empty,
+	// the former v2 authorization and token paths are derived from this base.
+	Authority string
 }
 
 // AuthConfigResponse is the body of GET /api/v1/auth-config. It is unauthenticated
@@ -50,8 +57,10 @@ type BrowserAuthConfig struct {
 // browser renders no login UI at all, which is the correct state for -dev-auth.
 type AuthConfigResponse struct {
 	Configured            bool   `json:"configured"`
+	TenantID              string `json:"tenant_id,omitempty"`
 	ClientID              string `json:"client_id,omitempty"`
 	Scope                 string `json:"scope,omitempty"`
+	Authority             string `json:"authority,omitempty"`
 	AuthorizationEndpoint string `json:"authorization_endpoint,omitempty"`
 	TokenEndpoint         string `json:"token_endpoint,omitempty"`
 }
@@ -73,13 +82,34 @@ func (h *Handler) authConfigEndpoint(writer http.ResponseWriter, _ *http.Request
 		writeResponse(writer, http.StatusOK, AuthConfigResponse{Configured: false})
 		return
 	}
+	authorizationEndpoint, tokenEndpoint := h.browserAuth.endpoints()
 	writeResponse(writer, http.StatusOK, AuthConfigResponse{
 		Configured:            true,
+		TenantID:              h.browserAuth.TenantID,
 		ClientID:              h.browserAuth.ClientID,
 		Scope:                 h.browserAuth.Scope,
-		AuthorizationEndpoint: h.browserAuth.AuthorizationEndpoint,
-		TokenEndpoint:         h.browserAuth.TokenEndpoint,
+		Authority:             h.browserAuth.Authority,
+		AuthorizationEndpoint: authorizationEndpoint,
+		TokenEndpoint:         tokenEndpoint,
 	})
+}
+
+func (c *BrowserAuthConfig) endpoints() (string, string) {
+	if c == nil {
+		return "", ""
+	}
+	authorizationEndpoint := strings.TrimSpace(c.AuthorizationEndpoint)
+	tokenEndpoint := strings.TrimSpace(c.TokenEndpoint)
+	authority := strings.TrimRight(strings.TrimSpace(c.Authority), "/")
+	if authority != "" {
+		if authorizationEndpoint == "" {
+			authorizationEndpoint = authority + "/oauth2/v2.0/authorize"
+		}
+		if tokenEndpoint == "" {
+			tokenEndpoint = authority + "/oauth2/v2.0/token"
+		}
+	}
+	return authorizationEndpoint, tokenEndpoint
 }
 
 // connectSources is the connect-src value for the Content-Security-Policy. With
@@ -93,7 +123,8 @@ func (h *Handler) connectSources() string {
 	if h.browserAuth == nil {
 		return "'self'"
 	}
-	origin := endpointOrigin(h.browserAuth.TokenEndpoint)
+	_, tokenEndpoint := h.browserAuth.endpoints()
+	origin := endpointOrigin(tokenEndpoint)
 	if origin == "" {
 		return "'self'"
 	}

@@ -27,6 +27,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math/big"
@@ -52,6 +53,9 @@ const (
 	oidcActor          shoal.ID = "shoal-explore-web-oidc"
 	oidcAuditPurpose            = "oidc-authenticated workspace access"
 	oidcIdentityPrefix          = "oidc:"
+	legacyEntraActor   shoal.ID = "shoal-explore-web-entra"
+	legacyEntraPurpose          = "entra-authenticated workspace access"
+	legacyEntraPrefix           = "entra:"
 
 	// defaultOIDCClockSkew tolerates small clock differences between this
 	// instance and the issuer without widening the validity window materially.
@@ -187,13 +191,14 @@ type oidcConfig struct {
 	// Claim names are exact, top-level JWT claim keys. subjectClaim defaults to
 	// the standard "sub" claim. authorizationClaim and at least one mapped
 	// value are required.
-	subjectClaim       string
-	actorClaim         string
-	clientIDClaim      string
-	delegationClaim    string
-	authorizationClaim string
-	readerClaimValues  []string
-	contributorValues  []string
+	subjectClaim         string
+	subjectFallbackClaim string
+	actorClaim           string
+	clientIDClaim        string
+	delegationClaim      string
+	authorizationClaim   string
+	readerClaimValues    []string
+	contributorValues    []string
 	// Browser login is optional. When browserClientID is set, browserScope is
 	// required and endpoints are either supplied explicitly or read from OIDC
 	// discovery metadata.
@@ -201,6 +206,17 @@ type oidcConfig struct {
 	browserScope          string
 	authorizationEndpoint string
 	tokenEndpoint         string
+	// Compatibility fields preserve the former Entra configuration and
+	// decision contract while routing it through this OIDC implementation.
+	identityPrefix             string
+	defaultActor               shoal.ID
+	auditPurpose               string
+	allowUnmappedAuthorization bool
+	trimAuthorizationValues    bool
+	trimIdentityValues         bool
+	authorizationArrayOnly     bool
+	legacyTenantID             string
+	legacyAuthority            string
 
 	// httpClient and clock are injected by tests; production leaves them nil.
 	httpClient *http.Client
@@ -214,6 +230,7 @@ func (c oidcConfig) configured() bool {
 	return c.issuer != "" || c.discoveryURL != "" || len(c.audiences) > 0 ||
 		c.jwksURI != "" || len(c.allowedAlgorithms) > 0 ||
 		c.clockSkew != 0 || c.subjectClaim != "" || c.actorClaim != "" ||
+		c.subjectFallbackClaim != "" ||
 		c.clientIDClaim != "" || c.delegationClaim != "" ||
 		c.authorizationClaim != "" || len(c.readerClaimValues) > 0 ||
 		len(c.contributorValues) > 0 || c.browserClientID != "" ||
@@ -224,21 +241,31 @@ func (c oidcConfig) configured() bool {
 // oidcAuthenticator validates bearer tokens against the issuer's JWKS
 // and mints a conservatively-scoped decision per request.
 type oidcAuthenticator struct {
-	parser                *jwt.Parser
-	keys                  *jwksCache
-	expectedIssuer        string
-	subjectClaim          string
-	actorClaim            string
-	clientIDClaim         string
-	delegationClaim       string
-	authorizationClaim    string
-	readerClaimValues     map[string]struct{}
-	contributorValues     map[string]struct{}
-	authenticationLeeway  time.Duration
-	browserClientID       string
-	browserScope          string
-	authorizationEndpoint string
-	tokenEndpoint         string
+	parser                     *jwt.Parser
+	keys                       *jwksCache
+	expectedIssuer             string
+	subjectClaim               string
+	subjectFallbackClaim       string
+	actorClaim                 string
+	clientIDClaim              string
+	delegationClaim            string
+	authorizationClaim         string
+	readerClaimValues          map[string]struct{}
+	contributorValues          map[string]struct{}
+	authenticationLeeway       time.Duration
+	identityPrefix             string
+	defaultActor               shoal.ID
+	auditPurpose               string
+	allowUnmappedAuthorization bool
+	trimAuthorizationValues    bool
+	trimIdentityValues         bool
+	authorizationArrayOnly     bool
+	legacyTenantID             string
+	legacyAuthority            string
+	browserClientID            string
+	browserScope               string
+	authorizationEndpoint      string
+	tokenEndpoint              string
 }
 
 func newOIDCAuthenticator(
@@ -285,6 +312,11 @@ func newOIDCAuthenticator(
 	if err != nil {
 		return nil, err
 	}
+	subjectFallbackClaim, err := normalizeClaimName(
+		"legacy subject fallback claim", config.subjectFallbackClaim, "", false)
+	if err != nil {
+		return nil, err
+	}
 	actorClaim, err := normalizeClaimName(
 		"-oidc-actor-claim", config.actorClaim, "", false)
 	if err != nil {
@@ -307,7 +339,8 @@ func newOIDCAuthenticator(
 	}
 	readerClaimValues := normalizeValueSet(config.readerClaimValues)
 	contributorValues := normalizeValueSet(config.contributorValues)
-	if len(readerClaimValues) == 0 && len(contributorValues) == 0 {
+	if len(readerClaimValues) == 0 && len(contributorValues) == 0 &&
+		!config.allowUnmappedAuthorization {
 		return nil, shoal.NewError(
 			shoal.ErrorInvalidArgument,
 			"at least one -oidc-reader-values or -oidc-contributor-values "+
@@ -370,19 +403,29 @@ func newOIDCAuthenticator(
 			maxCacheAge:        oidcJWKSMaxCacheAge,
 			allowHTTP:          allowLoopbackHTTP,
 		},
-		expectedIssuer:        issuer,
-		subjectClaim:          subjectClaim,
-		actorClaim:            actorClaim,
-		clientIDClaim:         clientIDClaim,
-		delegationClaim:       delegationClaim,
-		authorizationClaim:    authorizationClaim,
-		readerClaimValues:     readerClaimValues,
-		contributorValues:     contributorValues,
-		authenticationLeeway:  skew,
-		browserClientID:       strings.TrimSpace(config.browserClientID),
-		browserScope:          strings.TrimSpace(config.browserScope),
-		authorizationEndpoint: strings.TrimSpace(config.authorizationEndpoint),
-		tokenEndpoint:         strings.TrimSpace(config.tokenEndpoint),
+		expectedIssuer:             issuer,
+		subjectClaim:               subjectClaim,
+		subjectFallbackClaim:       subjectFallbackClaim,
+		actorClaim:                 actorClaim,
+		clientIDClaim:              clientIDClaim,
+		delegationClaim:            delegationClaim,
+		authorizationClaim:         authorizationClaim,
+		readerClaimValues:          readerClaimValues,
+		contributorValues:          contributorValues,
+		authenticationLeeway:       skew,
+		identityPrefix:             firstNonEmpty(config.identityPrefix, oidcIdentityPrefix+issuer+"#"),
+		defaultActor:               firstNonZeroID(config.defaultActor, oidcActor),
+		auditPurpose:               firstNonEmpty(config.auditPurpose, oidcAuditPurpose),
+		allowUnmappedAuthorization: config.allowUnmappedAuthorization,
+		trimAuthorizationValues:    config.trimAuthorizationValues,
+		trimIdentityValues:         config.trimIdentityValues,
+		authorizationArrayOnly:     config.authorizationArrayOnly,
+		legacyTenantID:             strings.TrimSpace(config.legacyTenantID),
+		legacyAuthority:            strings.TrimSpace(config.legacyAuthority),
+		browserClientID:            strings.TrimSpace(config.browserClientID),
+		browserScope:               strings.TrimSpace(config.browserScope),
+		authorizationEndpoint:      strings.TrimSpace(config.authorizationEndpoint),
+		tokenEndpoint:              strings.TrimSpace(config.tokenEndpoint),
 	}, nil
 }
 
@@ -600,8 +643,10 @@ func (a *oidcAuthenticator) browserAuthConfig(
 		return nil, err
 	}
 	return &webapi.BrowserAuthConfig{
+		TenantID:              a.legacyTenantID,
 		ClientID:              a.browserClientID,
 		Scope:                 a.browserScope,
+		Authority:             a.legacyAuthority,
 		AuthorizationEndpoint: authorizationEndpoint,
 		TokenEndpoint:         tokenEndpoint,
 	}, nil
@@ -700,6 +745,9 @@ func (a *oidcAuthenticator) keyFuncForContext(ctx context.Context) jwt.Keyfunc {
 // mint maps validated claims to a conservatively-scoped decision.
 func (a *oidcAuthenticator) mint(claims jwt.MapClaims) (auth.Decision, error) {
 	subject, err := requiredStringClaim(claims, a.subjectClaim)
+	if errors.Is(err, errMissingMappedClaim) && a.subjectFallbackClaim != "" {
+		subject, err = requiredStringClaim(claims, a.subjectFallbackClaim)
+	}
 	if err != nil {
 		if err == errMissingMappedClaim {
 			return auth.Decision{}, errMissingSubject
@@ -717,14 +765,23 @@ func (a *oidcAuthenticator) mint(claims jwt.MapClaims) (auth.Decision, error) {
 	authorizationValues, err := requiredStringListClaim(
 		claims, a.authorizationClaim)
 	if err != nil {
-		return auth.Decision{}, err
+		if !(a.allowUnmappedAuthorization &&
+			errors.Is(err, errMissingMappedClaim)) {
+			return auth.Decision{}, err
+		}
+		authorizationValues = nil
+	}
+	if a.authorizationArrayOnly {
+		if _, scalar := claims[a.authorizationClaim].(string); scalar {
+			return auth.Decision{}, errMalformedClaim
+		}
 	}
 	operations, sources, policies, mapped := a.authority(authorizationValues)
 	if !mapped {
 		return auth.Decision{}, errUnmappedAuthorization
 	}
 
-	actor := oidcActor
+	actor := a.defaultActor
 	if a.actorClaim != "" {
 		value, err := requiredStringClaim(claims, a.actorClaim)
 		if err != nil {
@@ -771,7 +828,7 @@ func (a *oidcAuthenticator) mint(claims jwt.MapClaims) (auth.Decision, error) {
 		// a token the parser accepted within the configured clock skew.
 		AuthenticationExpires: expiration.Time.UTC().Add(a.authenticationLeeway),
 		RequestID:             requestID,
-		AuditPurpose:          oidcAuditPurpose,
+		AuditPurpose:          a.auditPurpose,
 	})
 	if err != nil {
 		return auth.Decision{}, err
@@ -785,6 +842,13 @@ func (a *oidcAuthenticator) mint(claims jwt.MapClaims) (auth.Decision, error) {
 func (a *oidcAuthenticator) authority(
 	values []string,
 ) ([]auth.Operation, [][]byte, [][]byte, bool) {
+	if a.trimAuthorizationValues {
+		trimmed := make([]string, 0, len(values))
+		for _, value := range values {
+			trimmed = append(trimmed, strings.TrimSpace(value))
+		}
+		values = trimmed
+	}
 	if hasMappedValue(values, a.contributorValues) {
 		return oidcContributorOperations,
 			[][]byte{workspaceSourceID},
@@ -796,6 +860,9 @@ func (a *oidcAuthenticator) authority(
 			[][]byte{workspaceSourceID},
 			[][]byte{workspaceGrantPolicyID},
 			true
+	}
+	if a.allowUnmappedAuthorization {
+		return []auth.Operation{auth.OperationList}, nil, nil, true
 	}
 	return nil, nil, nil, false
 }
@@ -864,7 +931,124 @@ func requiredStringListClaim(claims jwt.MapClaims, name string) ([]string, error
 }
 
 func (a *oidcAuthenticator) identity(value string) shoal.ID {
-	return shoal.ID(oidcIdentityPrefix + a.expectedIssuer + "#" + value)
+	if a.trimIdentityValues {
+		value = strings.TrimSpace(value)
+	}
+	return shoal.ID(a.identityPrefix + value)
+}
+
+type legacyEntraConfig struct {
+	tenantID          string
+	issuer            string
+	audience          string
+	jwksURI           string
+	allowedAlgorithms []string
+	clockSkew         time.Duration
+	readerRoles       []string
+	contributorRoles  []string
+	scope             string
+}
+
+func (c legacyEntraConfig) configured() bool {
+	return c.authConfigured() || strings.TrimSpace(c.scope) != ""
+}
+
+func (c legacyEntraConfig) authConfigured() bool {
+	return strings.TrimSpace(c.tenantID) != "" ||
+		strings.TrimSpace(c.issuer) != "" ||
+		strings.TrimSpace(c.audience) != "" ||
+		strings.TrimSpace(c.jwksURI) != "" ||
+		len(c.readerRoles) > 0 || len(c.contributorRoles) > 0
+}
+
+// applyLegacyEntraCompatibility translates the deprecated provider-specific
+// configuration into the provider-neutral OIDC model. New OIDC settings win
+// field-by-field, allowing an operator to migrate without a flag-day while
+// preserving the old issuer, claims, identity, role, and browser defaults.
+func applyLegacyEntraCompatibility(
+	config oidcConfig,
+	legacy legacyEntraConfig,
+) oidcConfig {
+	if !legacy.configured() {
+		return config
+	}
+	modernConfigured := config.configured()
+	tenant := strings.TrimSpace(legacy.tenantID)
+	issuer := strings.TrimSpace(legacy.issuer)
+	if issuer == "" && tenant != "" {
+		issuer = "https://login.microsoftonline.com/" + tenant + "/v2.0"
+	}
+	if strings.TrimSpace(config.issuer) == "" {
+		config.issuer = issuer
+	}
+	if len(config.audiences) == 0 && strings.TrimSpace(legacy.audience) != "" {
+		config.audiences = []string{strings.TrimSpace(legacy.audience)}
+	}
+	if strings.TrimSpace(config.jwksURI) == "" {
+		config.jwksURI = strings.TrimSpace(legacy.jwksURI)
+	}
+	if len(config.allowedAlgorithms) == 0 &&
+		(legacy.authConfigured() || modernConfigured) {
+		config.allowedAlgorithms = legacy.allowedAlgorithms
+	}
+	if config.clockSkew == 0 && (legacy.authConfigured() || modernConfigured) {
+		config.clockSkew = legacy.clockSkew
+	}
+	if legacy.authConfigured() && strings.TrimSpace(config.subjectClaim) == "" {
+		config.subjectClaim = "oid"
+		config.subjectFallbackClaim = "sub"
+		config.identityPrefix = legacyEntraPrefix
+		config.defaultActor = legacyEntraActor
+		config.auditPurpose = legacyEntraPurpose
+		config.trimIdentityValues = true
+	}
+	if legacy.authConfigured() &&
+		strings.TrimSpace(config.authorizationClaim) == "" {
+		config.authorizationClaim = "roles"
+		config.allowUnmappedAuthorization = true
+		config.trimAuthorizationValues = true
+		config.authorizationArrayOnly = true
+	}
+	if len(config.readerClaimValues) == 0 {
+		config.readerClaimValues = legacy.readerRoles
+	}
+	if len(config.contributorValues) == 0 {
+		config.contributorValues = legacy.contributorRoles
+	}
+	clientID := strings.TrimSpace(legacy.audience)
+	if strings.TrimSpace(config.browserClientID) == "" {
+		config.browserClientID = clientID
+	}
+	if strings.TrimSpace(config.browserScope) == "" && clientID != "" {
+		config.browserScope = strings.TrimSpace(legacy.scope)
+		if config.browserScope == "" {
+			config.browserScope = "openid profile " + clientID + "/.default"
+		}
+	}
+	authority := legacyEntraAuthority(tenant, issuer)
+	if strings.TrimSpace(config.authorizationEndpoint) == "" && authority != "" {
+		config.authorizationEndpoint = authority + "/oauth2/v2.0/authorize"
+	}
+	if strings.TrimSpace(config.tokenEndpoint) == "" && authority != "" {
+		config.tokenEndpoint = authority + "/oauth2/v2.0/token"
+	}
+	config.legacyTenantID = tenant
+	config.legacyAuthority = authority
+	return config
+}
+
+func legacyEntraAuthority(tenant, issuer string) string {
+	if tenant != "" {
+		return "https://login.microsoftonline.com/" + tenant
+	}
+	return strings.TrimSuffix(strings.TrimSpace(issuer), "/v2.0")
+}
+
+func firstNonZeroID(value, fallback shoal.ID) shoal.ID {
+	if value != "" {
+		return value
+	}
+	return fallback
 }
 
 // bearerToken extracts the bearer credential from the Authorization header. It

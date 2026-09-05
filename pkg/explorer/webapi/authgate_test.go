@@ -285,6 +285,7 @@ func TestAuthConfigReportsConfiguredValues(t *testing.T) {
 	if response.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, want 200", response.StatusCode)
 	}
+
 	for _, want := range []string{
 		`"configured":true`,
 		`"client_id":"client-456"`,
@@ -295,6 +296,35 @@ func TestAuthConfigReportsConfiguredValues(t *testing.T) {
 		if !strings.Contains(body, want) {
 			t.Fatalf("auth-config = %s, missing %s", body, want)
 		}
+	}
+}
+
+func TestAuthConfigPreservesDeprecatedBrowserFields(t *testing.T) {
+	server := newStubServer(t, func(handler *webapi.Handler) {
+		handler.SetBrowserAuthConfig(&webapi.BrowserAuthConfig{
+			TenantID:  "tenant-123",
+			ClientID:  "client-456",
+			Scope:     "openid profile client-456/.default",
+			Authority: "https://login.example/tenant-123",
+		})
+	})
+	response, body := getJSON(t, server, "/api/v1/auth-config")
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", response.StatusCode)
+	}
+	for _, want := range []string{
+		`"tenant_id":"tenant-123"`,
+		`"authority":"https://login.example/tenant-123"`,
+		`"authorization_endpoint":"https://login.example/tenant-123/oauth2/v2.0/authorize"`,
+		`"token_endpoint":"https://login.example/tenant-123/oauth2/v2.0/token"`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("legacy auth-config = %s, missing %s", body, want)
+		}
+	}
+	csp := response.Header.Get("Content-Security-Policy")
+	if !strings.Contains(csp, "connect-src 'self' https://login.example;") {
+		t.Fatalf("legacy CSP = %q", csp)
 	}
 }
 

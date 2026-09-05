@@ -41,6 +41,10 @@ param oidcJwksUri = ''
 param oidcBrowserClientId = ''
 param oidcBrowserScope = ''
 
+// Existing parameter files using entraTenantId/entraClientId and related
+// entra* names continue to compile against main.bicep. Those names are
+// deprecated compatibility aliases; prefer the oidc* parameters above.
+
 // Host-authority allow-list (PR #295's -allowed-host / SHOAL_ALLOWED_HOST).
 // EMPTY (the default) makes the template use the App Service default hostname,
 // so the built-in *.azurewebsites.net endpoint works with no extra config.

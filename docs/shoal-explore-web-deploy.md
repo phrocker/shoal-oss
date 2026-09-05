@@ -197,9 +197,12 @@ is never accepted.
 
 ### Migration from the former provider-specific configuration
 
-The former `-entra-*` flags and `SHOAL_ENTRA_*` settings are not retained as
-aliases. A deployment that supplies only those names now fails closed as
-unconfigured, so update configuration atomically with the new binary:
+The former `-entra-*` flags, `SHOAL_ENTRA_*` settings, Azure Bicep parameters,
+and browser `tenant_id` / `authority` response fields remain available as
+**deprecated compatibility aliases**. They are translated into the OIDC
+implementation rather than selecting a separate authenticator. New `-oidc-*`
+values take precedence field-by-field, so configuration can be migrated
+incrementally:
 
 | Former setting | Provider-neutral replacement |
 | --- | --- |
@@ -209,9 +212,18 @@ unconfigured, so update configuration atomically with the new binary:
 | issuer, JWKS URI, allowed algorithms, clock skew | the same-named `-oidc-*` options |
 | browser scope | `-oidc-browser-scope` / `SHOAL_OIDC_BROWSER_SCOPE` |
 
-This migration changes configuration names, not the authorization path:
-verified claims still mint an `auth.Decision` that must pass the matching binder
-and resolver before any service operation runs.
+Compatibility mode preserves the old issuer derivation
+(`https://login.microsoftonline.com/<tenant>/v2.0`), `oid`-then-`sub` subject
+selection, `roles` claim mapping, `entra:` identity namespace, unmapped
+list-only/no-corpus decision, browser scope
+`openid profile <client-id>/.default`, and v2 authorization/token endpoint
+defaults. The deprecated exported `BrowserAuthConfig.TenantID` and `Authority`
+fields and their JSON wire fields are retained; generic endpoint fields are
+published alongside them.
+
+This changes configuration names, not the authorization path: both modern and
+compatibility inputs use the OIDC validator and mint an `auth.Decision` that
+must pass the matching binder and resolver before any service operation runs.
 
 ### Example
 

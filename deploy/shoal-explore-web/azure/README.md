@@ -156,6 +156,13 @@ logs stop before the new container logs begin.
   browser-login settings use the same generic prefix. **[Verified]** — the app
   command line carries only `-state-dir` and `-listen`, so OIDC identifiers do
   not land in shell history.
+- **Existing Entra-named deployments remain accepted during migration.** The
+  deprecated `entraTenantId`, `entraClientId`, `entraReaderRoles`,
+  `entraContributorRoles`, `entraIssuer`, `entraJwksUri`, and `entraScope`
+  Bicep parameters still emit their matching `SHOAL_ENTRA_*` settings. The
+  command translates those settings into the same OIDC validator, preserving
+  the former issuer, role, identity, and browser defaults. Prefer the
+  `oidc*` parameters for new deployments.
 - **Managed identity for platform access.** A user-assigned managed identity is
   created and attached to the site; set `useAcrManagedIdentity=true` and grant
   it `AcrPull` on your registry so image pulls need no registry password:

@@ -40,13 +40,13 @@ param useAcrManagedIdentity bool = true
 param planSkuName string = 'P1v3'
 
 @description('Exact OIDC token issuer.')
-param oidcIssuer string
+param oidcIssuer string = ''
 
 @description('Comma-separated accepted OIDC token audiences.')
-param oidcAudience string
+param oidcAudience string = ''
 
 @description('Top-level token claim whose string values map to workspace authority.')
-param oidcAuthorizationClaim string
+param oidcAuthorizationClaim string = ''
 
 @description('Comma-separated authorization-claim values granted read-only workspace access.')
 param oidcReaderValues string = 'reader'
@@ -65,6 +65,27 @@ param oidcBrowserClientId string = ''
 
 @description('Browser login scope. Required when oidcBrowserClientId is set.')
 param oidcBrowserScope string = ''
+
+@description('Deprecated compatibility parameter: former Entra tenant ID.')
+param entraTenantId string = ''
+
+@description('Deprecated compatibility parameter: former Entra client ID.')
+param entraClientId string = ''
+
+@description('Deprecated compatibility parameter: former reader app-role values.')
+param entraReaderRoles string = ''
+
+@description('Deprecated compatibility parameter: former contributor app-role values.')
+param entraContributorRoles string = ''
+
+@description('Deprecated compatibility parameter: former exact issuer override.')
+param entraIssuer string = ''
+
+@description('Deprecated compatibility parameter: former JWKS URI override.')
+param entraJwksUri string = ''
+
+@description('Deprecated compatibility parameter: former browser scope override.')
+param entraScope string = ''
 
 @description('Azure Files share quota in GiB for the state root (corpus + policy).')
 @minValue(1)
@@ -148,6 +169,10 @@ resource plan 'Microsoft.Web/serverfarms@2023-12-01' = {
 // Host header). A non-empty parameter is passed through verbatim so an operator
 // can name custom domains explicitly.
 var effectiveAllowedHosts = empty(allowedHosts) ? site.properties.defaultHostName : allowedHosts
+var oidcConfigured = !empty(oidcIssuer) || !empty(oidcAudience) || !empty(oidcAuthorizationClaim) || !empty(oidcDiscoveryUrl) || !empty(oidcJwksUri) || !empty(oidcBrowserClientId) || !empty(oidcBrowserScope)
+var legacyEntraConfigured = !empty(entraTenantId) || !empty(entraClientId) || !empty(entraIssuer) || !empty(entraJwksUri) || !empty(entraReaderRoles) || !empty(entraContributorRoles) || !empty(entraScope)
+var effectiveEntraReaderRoles = legacyEntraConfigured && empty(entraReaderRoles) ? 'Shoal.Reader' : entraReaderRoles
+var effectiveEntraContributorRoles = legacyEntraConfigured && empty(entraContributorRoles) ? 'Shoal.Contributor' : entraContributorRoles
 
 // App settings, as a map for the child `appsettings` config resource. They are
 // set on a separate resource (not inline in siteConfig) precisely so
@@ -160,6 +185,9 @@ var appSettings = union(
     // not /home, so App Service /home storage is intentionally disabled.
     WEBSITES_ENABLE_APP_SERVICE_STORAGE: 'false'
     WEBSITES_CONTAINER_START_TIME_LIMIT: '600'
+    SHOAL_ALLOWED_HOST: effectiveAllowedHosts
+  },
+  !oidcConfigured ? {} : {
     // OIDC validation and claim mapping arrive as SHOAL_OIDC_* environment
     // variables, so identifiers do not land on the command line.
     SHOAL_OIDC_ISSUER: oidcIssuer
@@ -167,7 +195,6 @@ var appSettings = union(
     SHOAL_OIDC_AUTHORIZATION_CLAIM: oidcAuthorizationClaim
     SHOAL_OIDC_READER_VALUES: oidcReaderValues
     SHOAL_OIDC_CONTRIBUTOR_VALUES: oidcContributorValues
-    SHOAL_ALLOWED_HOST: effectiveAllowedHosts
   },
   empty(oidcDiscoveryUrl) ? {} : {
     SHOAL_OIDC_DISCOVERY_URL: oidcDiscoveryUrl
@@ -178,6 +205,21 @@ var appSettings = union(
   empty(oidcBrowserClientId) && empty(oidcBrowserScope) ? {} : {
     SHOAL_OIDC_BROWSER_CLIENT_ID: oidcBrowserClientId
     SHOAL_OIDC_BROWSER_SCOPE: oidcBrowserScope
+  },
+  !legacyEntraConfigured ? {} : {
+    SHOAL_ENTRA_TENANT: entraTenantId
+    SHOAL_ENTRA_CLIENT_ID: entraClientId
+    SHOAL_ENTRA_READER_ROLES: effectiveEntraReaderRoles
+    SHOAL_ENTRA_CONTRIBUTOR_ROLES: effectiveEntraContributorRoles
+  },
+  empty(entraIssuer) ? {} : {
+    SHOAL_ENTRA_ISSUER: entraIssuer
+  },
+  empty(entraJwksUri) ? {} : {
+    SHOAL_ENTRA_JWKS_URI: entraJwksUri
+  },
+  empty(entraScope) ? {} : {
+    SHOAL_ENTRA_SCOPE: entraScope
   }
 )
 
