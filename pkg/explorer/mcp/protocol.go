@@ -87,10 +87,10 @@ type Tool struct {
 
 // ToolAnnotations describe behavioral hints. They are not authorization input.
 type ToolAnnotations struct {
-	ReadOnlyHint    bool `json:"readOnlyHint"`
-	DestructiveHint bool `json:"destructiveHint"`
-	IdempotentHint  bool `json:"idempotentHint"`
-	OpenWorldHint   bool `json:"openWorldHint"`
+	ReadOnlyHint    *bool `json:"readOnlyHint,omitempty"`
+	DestructiveHint *bool `json:"destructiveHint,omitempty"`
+	IdempotentHint  *bool `json:"idempotentHint,omitempty"`
+	OpenWorldHint   *bool `json:"openWorldHint,omitempty"`
 }
 
 // ToolExecution describes optional task support. Shoal only accepts the

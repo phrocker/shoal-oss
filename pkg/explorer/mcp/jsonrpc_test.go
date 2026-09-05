@@ -237,6 +237,18 @@ func TestJSONRPCDecodeRequestValidation(t *testing.T) {
 	}
 }
 
+func TestJSONRPCDecodeRequestRejectsInvalidUTF8(t *testing.T) {
+	raw := append(
+		[]byte(`{"jsonrpc":"2.0","id":1,"method":"`),
+		0xff,
+	)
+	raw = append(raw, []byte(`"}`)...)
+	if request, failure := decodeRequest(raw); failure == nil ||
+		failure.Code != codeParseError {
+		t.Fatalf("invalid UTF-8 request = %+v, failure = %+v", request, failure)
+	}
+}
+
 func TestJSONRPCProtocolErrorsRemainDistinctFromToolErrors(t *testing.T) {
 	protocolCodes := []int{
 		codeParseError,

@@ -23,6 +23,7 @@ import (
 	"encoding/json"
 	"errors"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/explorer/webapi"
@@ -40,6 +41,9 @@ const (
 	ToolExtract      = "shoal.extract"
 	ToolRecompute    = "shoal.recompute"
 	ToolChanges      = "shoal.changes"
+
+	// Keep this aligned with ingestSchema's name.maxLength.
+	maxUploadFilenameRunes = 4096
 )
 
 var reservedServiceToolNames = map[string]struct{}{
@@ -382,9 +386,7 @@ func optionalServiceTools(service webapi.Service) []registeredTool {
 				Name: ToolIngest, Title: "Ingest Shoal documents",
 				Description: "Ingest a bounded batch when the workspace implements ingestion.",
 				InputSchema: cloneJSON(ingestSchema),
-				Annotations: &ToolAnnotations{
-					DestructiveHint: false, IdempotentHint: true,
-				},
+				Annotations: mutatingAnnotations(true),
 			},
 			call: func(ctx context.Context, raw json.RawMessage) (any, error) {
 				var request webapi.IngestRequest
@@ -405,9 +407,7 @@ func optionalServiceTools(service webapi.Service) []registeredTool {
 				Name: ToolExtract, Title: "Extract Shoal knowledge",
 				Description: "Run explicit extraction when the workspace implements it.",
 				InputSchema: cloneJSON(extractSchema),
-				Annotations: &ToolAnnotations{
-					DestructiveHint: false, IdempotentHint: true,
-				},
+				Annotations: mutatingAnnotations(true),
 			},
 			call: func(ctx context.Context, raw json.RawMessage) (any, error) {
 				var request webapi.ExtractRequest
@@ -481,7 +481,25 @@ func optionalServiceTools(service webapi.Service) []registeredTool {
 }
 
 func readOnlyAnnotations() *ToolAnnotations {
-	return &ToolAnnotations{ReadOnlyHint: true, IdempotentHint: true}
+	return &ToolAnnotations{
+		ReadOnlyHint:    boolHint(true),
+		DestructiveHint: boolHint(false),
+		IdempotentHint:  boolHint(true),
+		OpenWorldHint:   boolHint(false),
+	}
+}
+
+func mutatingAnnotations(idempotent bool) *ToolAnnotations {
+	return &ToolAnnotations{
+		ReadOnlyHint:    boolHint(false),
+		DestructiveHint: boolHint(true),
+		IdempotentHint:  boolHint(idempotent),
+		OpenWorldHint:   boolHint(false),
+	}
+}
+
+func boolHint(value bool) *bool {
+	return &value
 }
 
 func decodeToolArguments(
@@ -559,6 +577,7 @@ func validateIngestArguments(request webapi.IngestRequest) error {
 	for _, file := range request.Files {
 		size := uint64(len(file.Content))
 		if strings.TrimSpace(file.Name) == "" ||
+			utf8.RuneCountInString(file.Name) > maxUploadFilenameRunes ||
 			size > webapi.MaxUploadFileBytes {
 			return errors.New("invalid upload file")
 		}
@@ -748,9 +767,7 @@ func validateTool(tool Tool) error {
 		return shoal.NewError(
 			shoal.ErrorInvalidArgument, "optional MCP tool description is required")
 	}
-	var schema map[string]any
-	if err := json.Unmarshal(tool.InputSchema, &schema); err != nil ||
-		schema == nil || schema["type"] != "object" {
+	if err := validateOptionalToolInputSchema(tool.InputSchema); err != nil {
 		return shoal.NewError(
 			shoal.ErrorInvalidArgument, "optional MCP tool input schema is invalid")
 	}
@@ -767,6 +784,128 @@ func validateTool(tool Tool) error {
 	return nil
 }
 
+// optionalToolInputSchema is the deliberately limited JSON Schema subset that
+// extension providers may advertise. Strict decoding rejects unsupported
+// keywords instead of forwarding a schema the server cannot validate.
+type optionalToolInputSchema struct {
+	Type                 string                             `json:"type"`
+	Title                string                             `json:"title,omitempty"`
+	Description          string                             `json:"description,omitempty"`
+	Properties           map[string]optionalToolInputSchema `json:"properties,omitempty"`
+	Required             []string                           `json:"required,omitempty"`
+	AdditionalProperties *bool                              `json:"additionalProperties,omitempty"`
+	Items                *optionalToolInputSchema           `json:"items,omitempty"`
+	Enum                 []json.RawMessage                  `json:"enum,omitempty"`
+	Minimum              *float64                           `json:"minimum,omitempty"`
+	Maximum              *float64                           `json:"maximum,omitempty"`
+	MinLength            *int                               `json:"minLength,omitempty"`
+	MaxLength            *int                               `json:"maxLength,omitempty"`
+	MinItems             *int                               `json:"minItems,omitempty"`
+	MaxItems             *int                               `json:"maxItems,omitempty"`
+}
+
+func validateOptionalToolInputSchema(raw json.RawMessage) error {
+	var schema optionalToolInputSchema
+	if err := strictDecode(raw, &schema); err != nil {
+		return err
+	}
+	if schema.Type != "object" {
+		return errors.New("top-level schema must describe an object")
+	}
+	return validateOptionalToolSchemaNode(schema)
+}
+
+func validateOptionalToolSchemaNode(schema optionalToolInputSchema) error {
+	switch schema.Type {
+	case "object":
+		if schema.Items != nil || hasScalarSchemaBounds(schema) {
+			return errors.New("object schema has incompatible keywords")
+		}
+		for name, property := range schema.Properties {
+			if strings.TrimSpace(name) == "" {
+				return errors.New("object schema has an empty property name")
+			}
+			if err := validateOptionalToolSchemaNode(property); err != nil {
+				return err
+			}
+		}
+		required := make(map[string]struct{}, len(schema.Required))
+		for _, name := range schema.Required {
+			if _, ok := schema.Properties[name]; !ok {
+				return errors.New("required property is not declared")
+			}
+			if _, duplicate := required[name]; duplicate {
+				return errors.New("required property is duplicated")
+			}
+			required[name] = struct{}{}
+		}
+	case "array":
+		if schema.Items == nil || len(schema.Properties) != 0 ||
+			len(schema.Required) != 0 || schema.AdditionalProperties != nil ||
+			hasStringOrNumberSchemaBounds(schema) {
+			return errors.New("array schema has incompatible keywords")
+		}
+		if err := validateOptionalToolSchemaNode(*schema.Items); err != nil {
+			return err
+		}
+		if err := validateNonnegativeBounds(schema.MinItems, schema.MaxItems); err != nil {
+			return err
+		}
+	case "string":
+		if schema.Items != nil || len(schema.Properties) != 0 ||
+			len(schema.Required) != 0 || schema.AdditionalProperties != nil ||
+			schema.Minimum != nil || schema.Maximum != nil ||
+			schema.MinItems != nil || schema.MaxItems != nil {
+			return errors.New("string schema has incompatible keywords")
+		}
+		if err := validateNonnegativeBounds(schema.MinLength, schema.MaxLength); err != nil {
+			return err
+		}
+	case "integer", "number":
+		if schema.Items != nil || len(schema.Properties) != 0 ||
+			len(schema.Required) != 0 || schema.AdditionalProperties != nil ||
+			schema.MinLength != nil || schema.MaxLength != nil ||
+			schema.MinItems != nil || schema.MaxItems != nil {
+			return errors.New("numeric schema has incompatible keywords")
+		}
+		if schema.Minimum != nil && schema.Maximum != nil &&
+			*schema.Minimum > *schema.Maximum {
+			return errors.New("numeric schema bounds are inverted")
+		}
+	case "boolean":
+		if schema.Items != nil || len(schema.Properties) != 0 ||
+			len(schema.Required) != 0 || schema.AdditionalProperties != nil ||
+			hasScalarSchemaBounds(schema) {
+			return errors.New("boolean schema has incompatible keywords")
+		}
+	default:
+		return errors.New("schema type is unsupported")
+	}
+	if schema.Enum != nil && len(schema.Enum) == 0 {
+		return errors.New("schema enum is empty")
+	}
+	return nil
+}
+
+func hasScalarSchemaBounds(schema optionalToolInputSchema) bool {
+	return hasStringOrNumberSchemaBounds(schema) ||
+		schema.MinItems != nil || schema.MaxItems != nil
+}
+
+func hasStringOrNumberSchemaBounds(schema optionalToolInputSchema) bool {
+	return schema.Minimum != nil || schema.Maximum != nil ||
+		schema.MinLength != nil || schema.MaxLength != nil
+}
+
+func validateNonnegativeBounds(minimum *int, maximum *int) error {
+	if (minimum != nil && *minimum < 0) ||
+		(maximum != nil && *maximum < 0) ||
+		(minimum != nil && maximum != nil && *minimum > *maximum) {
+		return errors.New("schema bounds are invalid")
+	}
+	return nil
+}
+
 func cloneTool(tool Tool) Tool {
 	cloned := tool
 	cloned.InputSchema = cloneJSON(tool.InputSchema)
@@ -777,6 +916,10 @@ func cloneTool(tool Tool) Tool {
 	}
 	if tool.Annotations != nil {
 		annotations := *tool.Annotations
+		annotations.ReadOnlyHint = cloneBool(tool.Annotations.ReadOnlyHint)
+		annotations.DestructiveHint = cloneBool(tool.Annotations.DestructiveHint)
+		annotations.IdempotentHint = cloneBool(tool.Annotations.IdempotentHint)
+		annotations.OpenWorldHint = cloneBool(tool.Annotations.OpenWorldHint)
 		cloned.Annotations = &annotations
 	}
 	if tool.Execution != nil {
@@ -784,6 +927,14 @@ func cloneTool(tool Tool) Tool {
 		cloned.Execution = &execution
 	}
 	return cloned
+}
+
+func cloneBool(value *bool) *bool {
+	if value == nil {
+		return nil
+	}
+	cloned := *value
+	return &cloned
 }
 
 func cloneJSON(value json.RawMessage) json.RawMessage {

@@ -639,6 +639,7 @@ func TestUnknownWrongAndOversizedToolArgumentsDoNotInvokeService(t *testing.T) {
 		[]byte(strings.Repeat("x", shoal.MaxIDBytes+1)))
 	largeContent := base64.StdEncoding.EncodeToString(
 		[]byte(strings.Repeat("x", int(webapi.MaxUploadFileBytes)+1)))
+	largeFilename := strings.Repeat("x", maxUploadFilenameRunes+1)
 	cases := []struct {
 		name      string
 		arguments string
@@ -649,6 +650,7 @@ func TestUnknownWrongAndOversizedToolArgumentsDoNotInvokeService(t *testing.T) {
 		{ToolNeighborhood, `{"node_ids":["bm9kZQ"],"max_nodes":251}`},
 		{ToolPath, `{"from":"ZnJvbQ","to":"dG8","fanout":51}`},
 		{ToolIngest, `{"files":[{"name":"large.txt","content":"` + largeContent + `"}]}`},
+		{ToolIngest, `{"files":[{"name":"` + largeFilename + `","content":""}]}`},
 		{ToolExtract, `{"document_id":"` + oversizedID + `"}`},
 		{ToolRecompute, `{"assertion_id":"` + oversizedID + `"}`},
 		{ToolChanges, `{"limit":101}`},
@@ -1031,6 +1033,17 @@ func TestNewServerRejectsInvalidExtensionConfiguration(t *testing.T) {
 	}); err == nil {
 		t.Fatal("non-object tool input schema was accepted")
 	}
+	invalidProperties := optionalProvider{tool: Tool{
+		Name: "invalid-properties", Description: "invalid properties",
+		InputSchema: json.RawMessage(
+			`{"type":"object","properties":5}`),
+	}}
+	if _, err := NewServer(Config{
+		Service: &stubService{}, Authority: authority, Decisions: decisions,
+		OptionalTools: []OptionalToolProvider{invalidProperties},
+	}); err == nil {
+		t.Fatal("malformed tool properties schema was accepted")
+	}
 	outputSchema := optionalProvider{tool: Tool{
 		Name: "output", Description: "unsupported output schema",
 		InputSchema:  json.RawMessage(`{"type":"object"}`),
@@ -1088,6 +1101,46 @@ func TestNewServerRejectsInvalidExtensionConfiguration(t *testing.T) {
 		ContextBudgetBytes: maxContextBudgetBytes + 1,
 	}); err == nil {
 		t.Fatal("oversized context budget was accepted")
+	}
+}
+
+func TestToolAnnotationsPreserveOmittedHints(t *testing.T) {
+	tool := Tool{
+		Name: "annotations", Description: "annotation serialization",
+		InputSchema: json.RawMessage(`{"type":"object"}`),
+		Annotations: &ToolAnnotations{ReadOnlyHint: boolHint(true)},
+	}
+	encoded, err := json.Marshal(tool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(encoded)
+	if !strings.Contains(text, `"readOnlyHint":true`) {
+		t.Fatalf("read-only hint missing: %s", encoded)
+	}
+	for _, omitted := range []string{
+		`"destructiveHint"`, `"idempotentHint"`, `"openWorldHint"`,
+	} {
+		if strings.Contains(text, omitted) {
+			t.Fatalf("omitted hint %s was serialized: %s", omitted, encoded)
+		}
+	}
+
+	service := &allOptionalService{
+		stubService: &stubService{}, calls: make(map[string]int),
+	}
+	server, _ := newTestServer(t, service, nil)
+	var ingest *Tool
+	for index := range server.tools {
+		if server.tools[index].definition.Name == ToolIngest {
+			ingest = &server.tools[index].definition
+			break
+		}
+	}
+	if ingest == nil || ingest.Annotations == nil ||
+		ingest.Annotations.DestructiveHint == nil ||
+		!*ingest.Annotations.DestructiveHint {
+		t.Fatalf("ingest destructive annotation = %+v", ingest)
 	}
 }
 

@@ -23,6 +23,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"unicode/utf8"
 )
 
 // jsonRPCVersion is the only envelope version this transport accepts. A
@@ -227,7 +228,7 @@ func isSpace(b byte) bool {
 // strict: a message that does not declare JSON-RPC 2.0, or that carries no
 // method, is rejected rather than processed on a guess.
 func decodeRequest(raw []byte) (Request, *Error) {
-	if !json.Valid(raw) {
+	if !utf8.Valid(raw) || !json.Valid(raw) {
 		return Request{}, newError(codeParseError, "invalid JSON")
 	}
 	trimmed := trimSpace(raw)
