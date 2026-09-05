@@ -480,17 +480,16 @@ func (c *Client) authorizedVectorScores(
 
 func authorizedVectorError(err error) error {
 	switch {
-	case errors.Is(err, context.Canceled):
+	case errors.Is(err, context.Canceled),
+		shoal.IsErrorCode(err, shoal.ErrorCanceled):
 		return shoal.WrapError(shoal.ErrorCanceled, "authorized vector retrieval canceled", context.Canceled)
-	case errors.Is(err, context.DeadlineExceeded):
+	case errors.Is(err, context.DeadlineExceeded),
+		shoal.IsErrorCode(err, shoal.ErrorDeadline):
 		return shoal.WrapError(
 			shoal.ErrorDeadline,
 			"authorized vector retrieval deadline exceeded",
 			context.DeadlineExceeded,
 		)
-	case shoal.IsErrorCode(err, shoal.ErrorCanceled),
-		shoal.IsErrorCode(err, shoal.ErrorDeadline):
-		return err
 	case shoal.IsErrorCode(err, shoal.ErrorInvalidArgument):
 		return shoal.NewError(
 			shoal.ErrorInvalidArgument,
