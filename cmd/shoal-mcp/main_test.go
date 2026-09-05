@@ -224,13 +224,15 @@ func TestStdioSmokeUsesEmbeddedExplorerAndKeepsStdoutPure(t *testing.T) {
 		mcp.ToolNeighborhood,
 		mcp.ToolPath,
 		mcp.ToolIngest,
-		mcp.ToolExtract,
 		mcp.ToolRecompute,
 		mcp.ToolChanges,
 	} {
 		if !names[name] {
 			t.Fatalf("implemented tool %q was not advertised: %v", name, names)
 		}
+	}
+	if names[mcp.ToolExtract] {
+		t.Fatalf("unconfigured extraction tool was advertised: %v", names)
 	}
 
 	var ingested mcp.ToolResult

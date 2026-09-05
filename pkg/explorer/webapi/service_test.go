@@ -849,6 +849,34 @@ func TestMetadataAdvertisesCapabilities(t *testing.T) {
 	}
 }
 
+func TestEmbeddedExtractionAvailabilityRequiresOntology(t *testing.T) {
+	service, corpus, _, _ := testService(t)
+	defer corpus.Close()
+	if service.ExtractionAvailable() {
+		t.Fatal("extraction was available without an active ontology")
+	}
+	capabilities, err := service.Capabilities(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if capabilities.Supports(webapi.CapabilityExtraction) {
+		t.Fatalf("unconfigured extraction capability = %+v", capabilities)
+	}
+	if err := service.SetOntologyVersion(webapiSkillsOntologyVersion(t)); err != nil {
+		t.Fatal(err)
+	}
+	if !service.ExtractionAvailable() {
+		t.Fatal("extraction remained unavailable after ontology configuration")
+	}
+	capabilities, err = service.Capabilities(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !capabilities.Supports(webapi.CapabilityExtraction) {
+		t.Fatalf("configured extraction capability = %+v", capabilities)
+	}
+}
+
 func TestMetadataAdvertisesVectorOnlyWhenAvailable(t *testing.T) {
 	dataDir := t.TempDir()
 	corpus, err := explorer.OpenWithOptions(dataDir, explorer.Options{

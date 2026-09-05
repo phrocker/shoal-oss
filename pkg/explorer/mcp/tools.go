@@ -408,7 +408,8 @@ func optionalServiceTools(service webapi.Service) []registeredTool {
 			},
 		})
 	}
-	if provider, ok := service.(webapi.ExtractionProvider); ok && !isAbsent(provider) {
+	if provider, ok := service.(webapi.ExtractionProvider); ok && !isAbsent(provider) &&
+		extractionAvailable(service) {
 		provider := provider
 		tools = append(tools, registeredTool{
 			definition: Tool{
@@ -486,6 +487,11 @@ func optionalServiceTools(service webapi.Service) []registeredTool {
 		})
 	}
 	return tools
+}
+
+func extractionAvailable(service webapi.Service) bool {
+	availability, ok := service.(webapi.ExtractionAvailabilityProvider)
+	return !ok || (!isAbsent(availability) && availability.ExtractionAvailable())
 }
 
 func readOnlyAnnotations() *ToolAnnotations {
@@ -612,7 +618,14 @@ func (s *Server) toolSuccessResult(value any) (ToolResult, error) {
 		return ToolResult{}, shoal.NewError(
 			shoal.ErrorUnavailable, "tool result exceeds the server bound")
 	}
-	return s.packToolResult(encoded)
+	result, err := s.packToolResult(encoded)
+	if err != nil {
+		return ToolResult{
+			StructuredContent: append(json.RawMessage(nil), encoded...),
+			IsError:           false,
+		}, nil
+	}
+	return result, nil
 }
 
 type structuredToolFailure struct {

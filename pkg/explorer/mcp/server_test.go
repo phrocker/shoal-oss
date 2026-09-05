@@ -49,6 +49,7 @@ func TestServeNegotiatesVersionAndEnforcesInitializationOrdering(t *testing.T) {
 	if err := server.Serve(context.Background(), strings.NewReader(input), &output); err != nil {
 		t.Fatalf("Serve: %v", err)
 	}
+
 	lines := nonemptyLines(output.String())
 	if len(lines) != 4 {
 		t.Fatalf("responses = %d, want 4:\n%s", len(lines), output.String())
@@ -267,6 +268,23 @@ func TestToolAdvertisementTracksOptionalProviders(t *testing.T) {
 	for _, absent := range []string{ToolIngest, ToolExtract, ToolRecompute} {
 		if containsString(names, absent) {
 			t.Fatalf("unimplemented optional tool %q was advertised", absent)
+		}
+	}
+}
+
+func TestExtractionToolRequiresAvailableCapability(t *testing.T) {
+	service := &unavailableExtractionService{allOptionalService: &allOptionalService{
+		stubService: &stubService{}, calls: make(map[string]int),
+	}}
+	server, _ := newTestServer(t, service, nil)
+	makeReady(t, server)
+	names := listedToolNames(t, server)
+	if containsString(names, ToolExtract) {
+		t.Fatalf("unavailable extraction tool was advertised: %v", names)
+	}
+	for _, name := range []string{ToolIngest, ToolRecompute, ToolChanges} {
+		if !containsString(names, name) {
+			t.Fatalf("available optional tool %q was omitted: %v", name, names)
 		}
 	}
 }
@@ -795,6 +813,42 @@ func TestToolResultCompressionRunsOnResponsePath(t *testing.T) {
 		len(compressor.inputs[0].Items) != 1 ||
 		compressor.inputs[0].Items[0].IsError {
 		t.Fatalf("compression input = %+v", compressor.inputs)
+	}
+}
+
+func TestCompressionFailurePreservesStructuredSuccess(t *testing.T) {
+	serviceCalls := 0
+	server, err := NewServer(Config{
+		Service: &stubService{
+			documents: func(
+				context.Context,
+				webapi.DocumentsRequest,
+			) (webapi.DocumentsResponse, error) {
+				serviceCalls++
+				return webapi.DocumentsResponse{
+					Snapshot: webapi.Snapshot{ID: "snapshot"},
+				}, nil
+			},
+		},
+		Authority: auth.NewAuthority(),
+		Decisions: DecisionProviderFunc(func(context.Context) (auth.Decision, error) {
+			return testDecision(t), nil
+		}),
+		ContextCompressor: failingCompressor{},
+		requestIDFactory:  sequentialRequestIDs(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	makeReady(t, server)
+
+	result := decodeToolResult(t, callToolRequest(t, server, ToolDocuments, `{}`))
+	if result.IsError || len(result.Content) != 0 ||
+		!strings.Contains(string(result.StructuredContent), `"id":"snapshot"`) {
+		t.Fatalf("compression failure changed successful result: %+v", result)
+	}
+	if serviceCalls != 1 {
+		t.Fatalf("service calls = %d, want 1", serviceCalls)
 	}
 }
 
@@ -1356,6 +1410,14 @@ type allOptionalService struct {
 	calls map[string]int
 }
 
+type unavailableExtractionService struct {
+	*allOptionalService
+}
+
+func (*unavailableExtractionService) ExtractionAvailable() bool {
+	return false
+}
+
 func (s *allOptionalService) Ingest(
 	context.Context,
 	webapi.IngestRequest,
@@ -1418,6 +1480,14 @@ func (c *recordingCompressor) CompressContext(
 ) (CompressionOutput, error) {
 	c.inputs = append(c.inputs, input)
 	return CompressContext(input)
+}
+
+type failingCompressor struct{}
+
+func (failingCompressor) CompressContext(
+	CompressionInput,
+) (CompressionOutput, error) {
+	return CompressionOutput{}, errors.New("compression failed")
 }
 
 func newTestServer(

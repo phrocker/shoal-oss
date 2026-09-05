@@ -93,8 +93,10 @@ remote callers.
 The command constructs a real embedded `Explorer`, wraps it with the authorized
 client, and serves it through `webapi.EmbeddedService`. Optional tools are
 advertised only when that service implements their public capability
-interfaces; the embedded service currently supplies ingestion, extraction,
-recomputation, and the authorized changes feed in addition to the read tools.
+interfaces and any required runtime configuration is active. The embedded
+service currently supplies ingestion, recomputation, and the authorized
+changes feed in addition to the read tools. Extraction is not advertised by
+this launcher because it has no active ontology configuration.
 
 Tool-call recording is not implemented. The server does not claim to record or
 persist MCP invocations.

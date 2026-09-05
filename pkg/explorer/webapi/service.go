@@ -56,6 +56,12 @@ type ExtractionProvider interface {
 	Extract(context.Context, ExtractRequest) (ExtractResponse, error)
 }
 
+// ExtractionAvailabilityProvider reports whether an ExtractionProvider is
+// currently configured for successful extraction.
+type ExtractionAvailabilityProvider interface {
+	ExtractionAvailable() bool
+}
+
 // RecomputeProvider is an optional service extension that re-runs the
 // deterministic derivation behind a latent similarity assertion. Services that
 // cannot re-derive do not implement it, and the transport fails closed with an
@@ -157,12 +163,7 @@ func NewEmbeddedService(client explorer.BoundedClient) (*EmbeddedService, error)
 func (s *EmbeddedService) Capabilities(ctx context.Context) (Capabilities, error) {
 	capabilities := AllCapabilities()
 	capabilities.Vector = false
-	if _, ok := s.client.(interface {
-		ExtractDocument(
-			context.Context,
-			explorer.ExtractionRequest,
-		) (explorer.ExtractionResult, error)
-	}); !ok {
+	if !s.ExtractionAvailable() {
 		capabilities.Extraction = false
 	}
 	provider, ok := s.client.(vectorAvailabilityProvider)
@@ -175,6 +176,25 @@ func (s *EmbeddedService) Capabilities(ctx context.Context) (Capabilities, error
 	}
 	capabilities.Vector = available
 	return capabilities, nil
+}
+
+// ExtractionAvailable reports whether the service has both an extraction
+// backend and an active ontology.
+func (s *EmbeddedService) ExtractionAvailable() bool {
+	if s == nil {
+		return false
+	}
+	if _, ok := s.client.(interface {
+		ExtractDocument(
+			context.Context,
+			explorer.ExtractionRequest,
+		) (explorer.ExtractionResult, error)
+	}); !ok {
+		return false
+	}
+	s.ontologyMu.RLock()
+	defer s.ontologyMu.RUnlock()
+	return s.ontologyVersion != nil
 }
 
 func (s *EmbeddedService) Extract(
