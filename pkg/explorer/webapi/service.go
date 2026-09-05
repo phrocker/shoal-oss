@@ -56,6 +56,14 @@ type ExtractionProvider interface {
 	Extract(context.Context, ExtractRequest) (ExtractResponse, error)
 }
 
+// RecomputeProvider is an optional service extension that re-runs the
+// deterministic derivation behind a latent similarity assertion. Services that
+// cannot re-derive do not implement it, and the transport fails closed with an
+// unavailable error rather than fabricating a result.
+type RecomputeProvider interface {
+	Recompute(context.Context, RecomputeDerivationRequest) (RecomputeDerivationResponse, error)
+}
+
 // ChangeProvider is an optional service extension for the resumable document
 // change feed. Services that cannot serve an ordered feed do not implement it,
 // and the transport fails closed with an unavailable error.
@@ -215,6 +223,166 @@ func (s *EmbeddedService) Extract(
 		EntityNodeIDs:       append([]shoal.ID(nil), result.EntityNodeIDs...),
 		RelationshipEdgeIDs: append([]shoal.ID(nil), result.RelationshipEdgeIDs...),
 	}, nil
+}
+
+// Recompute re-runs the deterministic derivation behind a latent similarity
+// assertion against the current corpus frontier and reports whether it
+// reproduced the caller's prior digest byte-for-byte. It reads through the same
+// bounded, authorized graph path the browser reads, so a caller can only
+// recompute a derivation it is authorized to see.
+func (s *EmbeddedService) Recompute(
+	ctx context.Context,
+	request RecomputeDerivationRequest,
+) (RecomputeDerivationResponse, error) {
+	if err := shoal.ValidateRequiredID(
+		"derived assertion ID", request.AssertionID); err != nil {
+		return RecomputeDerivationResponse{}, err
+	}
+	before, err := s.client.Snapshot(ctx)
+	if err != nil {
+		return RecomputeDerivationResponse{}, err
+	}
+	snapshot := fromExplorerSnapshot(before)
+	assertion, err := s.rederiveAssertion(ctx, request.AssertionID)
+	if err != nil {
+		return RecomputeDerivationResponse{}, err
+	}
+	if err := s.confirmSnapshot(ctx, snapshot); err != nil {
+		return RecomputeDerivationResponse{}, err
+	}
+	detail, err := derivationDetail(assertion)
+	if err != nil {
+		return RecomputeDerivationResponse{}, err
+	}
+	digest := derivationDigest(detail)
+	// An empty caller digest is a baseline capture with nothing to compare, so
+	// it reports unchanged. A non-empty digest reports unchanged only when the
+	// fresh re-derivation is byte-identical to what the caller already holds.
+	unchanged := request.Digest == "" || request.Digest == digest
+	return RecomputeDerivationResponse{
+		Snapshot: snapshot, Unchanged: unchanged, Digest: digest, Detail: detail,
+	}, nil
+}
+
+// rederiveAssertion re-reads the derived assertion for id through the bounded
+// authorized graph, following the producer→assertion provenance edge so the
+// read exercises the same materialization the browser graph does.
+func (s *EmbeddedService) rederiveAssertion(
+	ctx context.Context, id shoal.ID,
+) (ontology.Assertion, error) {
+	result, err := s.client.BoundedNeighborhood(ctx, explorer.BoundedNeighborhoodRequest{
+		NodeIDs: []shoal.ID{id}, Depth: 1, Fanout: MaxFanout, MaxNodes: MaxNodes,
+		EdgeTypes: []string{graph.EdgeTypeProduced},
+		Direction: explorer.GraphDirectionIncoming,
+	})
+	if err != nil {
+		return ontology.Assertion{}, err
+	}
+	for _, assertion := range result.Neighborhood.Assertions {
+		if assertion.ID() == id {
+			return assertion, nil
+		}
+	}
+	return ontology.Assertion{}, shoal.NewError(
+		shoal.ErrorNotFound,
+		"derived assertion is not present at the current snapshot",
+	)
+}
+
+func derivationDetail(assertion ontology.Assertion) (DerivationDetail, error) {
+	if assertion.Origin() != ontology.AssertionDerived {
+		return DerivationDetail{}, shoal.NewError(
+			shoal.ErrorNotFound, "assertion is not derived")
+	}
+	evidence := assertion.Evidence()
+	if len(evidence) != 1 {
+		return DerivationDetail{}, shoal.NewError(
+			shoal.ErrorNotFound, "derived assertion evidence is missing")
+	}
+	derivation, ok := evidence[0].Derivation()
+	if !ok {
+		return DerivationDetail{}, shoal.NewError(
+			shoal.ErrorNotFound, "derived assertion derivation is missing")
+	}
+	provenance := assertion.Provenance()
+	return DerivationDetail{
+		AssertionID:           assertion.ID(),
+		DerivationID:          derivation.ID(),
+		Origin:                string(assertion.Origin()),
+		Score:                 float64(derivation.Score()),
+		EmbeddingModel:        derivation.EmbeddingModel(),
+		EmbeddingModelVersion: derivation.EmbeddingModelVersion(),
+		SimilarityMetric:      derivation.SimilarityMetric(),
+		Threshold:             float64(derivation.Threshold()),
+		TessellationCell:      derivation.TessellationCell(),
+		IteratorName:          derivation.IteratorName(),
+		IteratorOptions:       derivation.IteratorOptions(),
+		Provider:              provenance.Provider(),
+		Model:                 provenance.Model(),
+		ModelVersion:          provenance.ModelVersion(),
+	}, nil
+}
+
+// derivationDigest is the deterministic fingerprint that makes "recompute"
+// meaningful: identical derivation inputs always fold to the same digest, and
+// any changed input changes it. Every field is length-prefixed so no value can
+// impersonate a field boundary, and iterator options are canonicalized so map
+// iteration order cannot perturb the digest.
+func derivationDigest(detail DerivationDetail) string {
+	var builder strings.Builder
+	writeField := func(name, value string) {
+		builder.WriteString(strconv.Itoa(len(name)))
+		builder.WriteByte(':')
+		builder.WriteString(name)
+		builder.WriteByte('=')
+		builder.WriteString(strconv.Itoa(len(value)))
+		builder.WriteByte(':')
+		builder.WriteString(value)
+		builder.WriteByte('|')
+	}
+	writeField("assertion_id", string(detail.AssertionID))
+	writeField("derivation_id", string(detail.DerivationID))
+	writeField("origin", detail.Origin)
+	writeField("score", strconv.FormatFloat(detail.Score, 'g', -1, 64))
+	writeField("embedding_model", detail.EmbeddingModel)
+	writeField("embedding_model_version", detail.EmbeddingModelVersion)
+	writeField("similarity_metric", detail.SimilarityMetric)
+	writeField("threshold", strconv.FormatFloat(detail.Threshold, 'g', -1, 64))
+	writeField("tessellation_cell", detail.TessellationCell)
+	writeField("iterator_name", detail.IteratorName)
+	writeField("provider", detail.Provider)
+	writeField("model", detail.Model)
+	writeField("model_version", detail.ModelVersion)
+	writeField("iterator_options", canonicalDerivationMetadata(detail.IteratorOptions))
+	sum := sha256.Sum256([]byte(builder.String()))
+	return hex.EncodeToString(sum[:])
+}
+
+func canonicalDerivationMetadata(metadata shoal.Metadata) string {
+	keys := make([]string, 0, len(metadata))
+	for key := range metadata {
+		keys = append(keys, key)
+	}
+	// Load-bearing: TestRecomputeDigestIsStableAcrossCalls pins that map
+	// iteration order cannot change the digest, so these keys must be sorted.
+	sort.Strings(keys)
+	var builder strings.Builder
+	builder.WriteString(strconv.Itoa(len(keys)))
+	for _, key := range keys {
+		value := metadata[key]
+		builder.WriteByte('|')
+		// Load-bearing: TestRecomputeDigestSeparatesMetadataBoundaries pins that
+		// each dynamic key and value is length-prefixed, so a delimiter inside a
+		// value cannot impersonate the boundary to the next option.
+		builder.WriteString(strconv.Itoa(len(key)))
+		builder.WriteByte(':')
+		builder.WriteString(key)
+		builder.WriteByte('=')
+		builder.WriteString(strconv.Itoa(len(value)))
+		builder.WriteByte(':')
+		builder.WriteString(value)
+	}
+	return builder.String()
 }
 
 func (s *EmbeddedService) Documents(
@@ -844,3 +1012,5 @@ func assertionsForPath(
 }
 
 var _ Service = (*EmbeddedService)(nil)
+var _ ExtractionProvider = (*EmbeddedService)(nil)
+var _ RecomputeProvider = (*EmbeddedService)(nil)

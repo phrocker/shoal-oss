@@ -282,6 +282,51 @@ type ExtractResponse struct {
 	RelationshipEdgeIDs []shoal.ID `json:"relationship_edge_ids"`
 }
 
+// RecomputeDerivationRequest asks the workspace to re-run the deterministic
+// derivation that produced a latent, similarity-derived ontology assertion. The
+// caller passes AssertionID (the derived edge's ontology.assertion.id) and the
+// Digest it currently displays. An empty Digest means the caller holds no prior
+// digest yet, so the response captures a baseline instead of reporting drift.
+type RecomputeDerivationRequest struct {
+	Snapshot    Snapshot `json:"snapshot"`
+	AssertionID shoal.ID `json:"assertion_id"`
+	Digest      string   `json:"digest,omitempty"`
+}
+
+// RecomputeDerivationResponse returns the freshly re-derived derivation detail,
+// a deterministic Digest over that detail, and whether re-running the
+// derivation reproduced the caller's prior digest byte-for-byte. Unchanged is
+// true when the caller's Digest matches the fresh Digest (or the caller held no
+// prior digest); it is false when the inputs changed, and Detail then carries
+// the new derivation so the caller can see exactly what changed.
+type RecomputeDerivationResponse struct {
+	Snapshot  Snapshot         `json:"snapshot"`
+	Unchanged bool             `json:"unchanged"`
+	Digest    string           `json:"digest"`
+	Detail    DerivationDetail `json:"detail"`
+}
+
+// DerivationDetail describes how a latent similarity assertion was derived: the
+// producer identity (embedding model and version, similarity metric, threshold,
+// tessellation cell, iterator name and options), the similarity score, and the
+// derivation and assertion identifiers.
+type DerivationDetail struct {
+	AssertionID           shoal.ID       `json:"assertion_id"`
+	DerivationID          shoal.ID       `json:"derivation_id"`
+	Origin                string         `json:"origin"`
+	Score                 float64        `json:"score"`
+	EmbeddingModel        string         `json:"embedding_model"`
+	EmbeddingModelVersion string         `json:"embedding_model_version"`
+	SimilarityMetric      string         `json:"similarity_metric"`
+	Threshold             float64        `json:"threshold"`
+	TessellationCell      string         `json:"tessellation_cell"`
+	IteratorName          string         `json:"iterator_name"`
+	IteratorOptions       shoal.Metadata `json:"iterator_options,omitempty"`
+	Provider              string         `json:"provider"`
+	Model                 string         `json:"model"`
+	ModelVersion          string         `json:"model_version"`
+}
+
 // ChangesRequest asks for the caller's document change feed. An empty Cursor
 // starts from the beginning of retained history. The cursor is opaque: it
 // carries the caller's resume position and the corpus identity it was minted

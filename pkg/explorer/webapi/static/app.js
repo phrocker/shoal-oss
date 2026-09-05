@@ -6,9 +6,12 @@ const state = {
   selectedSectionID: "",
   nodes: new Map(),
   edges: new Map(),
+  assertions: new Map(),
   graphCursors: new Map(),
   sourceURIs: new Map(),
   selected: null,
+  selectedEdge: null,
+  derivationDigests: new Map(),
   identity: null,
   accessToken: null,
   auth: {configured: false},
@@ -151,8 +154,70 @@ function base64UrlEncode(bytes) {
   return out;
 }
 
-// randomUrlToken returns a cryptographically random base64url string for the
-// PKCE verifier, the CSRF state and the OIDC nonce.
+// base64UrlLookup maps a base64url character code to its 6-bit value, with -1
+// for any character outside the alphabet. It is the inverse of the alphabet in
+// base64UrlEncode and, like it, avoids atob so decoding stays pure and testable
+// without a browser global.
+const base64UrlLookup = (() => {
+  const alphabet =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+  const table = new Int16Array(128).fill(-1);
+  for (let index = 0; index < alphabet.length; index += 1) {
+    table[alphabet.charCodeAt(index)] = index;
+  }
+  return table;
+})();
+
+// utf8BytesToString decodes a UTF-8 byte array to a string without TextDecoder,
+// which the executable UI harness does not provide. Wire metadata values are
+// arbitrary bytes, so this handles the full range rather than assuming ASCII.
+function utf8BytesToString(bytes) {
+  let out = "";
+  let index = 0;
+  while (index < bytes.length) {
+    const lead = bytes[index++];
+    if (lead < 0x80) {
+      out += String.fromCharCode(lead);
+    } else if (lead < 0xe0) {
+      const b1 = bytes[index++] & 0x3f;
+      out += String.fromCharCode(((lead & 0x1f) << 6) | b1);
+    } else if (lead < 0xf0) {
+      const b1 = bytes[index++] & 0x3f;
+      const b2 = bytes[index++] & 0x3f;
+      out += String.fromCharCode(((lead & 0x0f) << 12) | (b1 << 6) | b2);
+    } else {
+      const b1 = bytes[index++] & 0x3f;
+      const b2 = bytes[index++] & 0x3f;
+      const b3 = bytes[index++] & 0x3f;
+      const point =
+        (((lead & 0x07) << 18) | (b1 << 12) | (b2 << 6) | b3) - 0x10000;
+      out += String.fromCharCode(0xd800 + (point >> 10), 0xdc00 + (point & 0x3ff));
+    }
+  }
+  return out;
+}
+
+// base64UrlDecode is the inverse of base64UrlEncode: it turns the unpadded
+// base64url the wire uses for every identifier and every metadata key and value
+// back into its decoded string. The webapi encodes metadata keys AND values, so
+// the graph cannot read an edge's origin or score without decoding here.
+function base64UrlDecode(text) {
+  const clean = String(text || "");
+  const bytes = [];
+  let buffer = 0;
+  let bits = 0;
+  for (let index = 0; index < clean.length; index += 1) {
+    const value = base64UrlLookup[clean.charCodeAt(index)];
+    if (value === undefined || value < 0) continue;
+    buffer = (buffer << 6) | value;
+    bits += 6;
+    if (bits >= 8) {
+      bits -= 8;
+      bytes.push((buffer >> bits) & 0xff);
+    }
+  }
+  return utf8BytesToString(bytes);
+}
 function randomUrlToken(byteLength) {
   const bytes = new Uint8Array(byteLength);
   crypto.getRandomValues(bytes);
@@ -2657,6 +2722,13 @@ function selectEvidence(result, evidence) {
 }
 
 function showSelection(entries) {
+  $("selection").classList.remove("muted");
+  $("selection").replaceChildren(kvBlock(entries));
+}
+
+// kvBlock renders a label/value grid. It is shared by every selection inspector
+// so a graph node, a piece of evidence and a derived edge all read identically.
+function kvBlock(entries) {
   const container = document.createElement("div");
   container.className = "kv";
   for (const [key, value] of entries) {
@@ -2667,14 +2739,56 @@ function showSelection(entries) {
     text.title = text.textContent;
     container.append(label, text);
   }
-  $("selection").classList.remove("muted");
-  $("selection").replaceChildren(container);
+  return container;
+}
+
+// Property keys latentAssertionGraphEdge stamps on a derived edge. The origin
+// key is authoritative and always present on the edge itself, so the graph can
+// tell a derived edge from an asserted one without the assertion list.
+const EDGE_PROPERTY_ORIGIN = "ontology.assertion.origin";
+const EDGE_PROPERTY_ASSERTION_ID = "ontology.assertion.id";
+const EDGE_PROPERTY_DERIVATION_ID = "ontology.assertion.derivation.id";
+const EDGE_PROPERTY_DERIVATION_SCORE = "ontology.assertion.derivation.score";
+const GRAPH_DERIVED_ORIGIN = "derived";
+
+// decodedEdgeProperties turns an edge's wire properties — a list of base64url
+// key/value pairs — into a decoded string map. It memoizes on the edge so the
+// per-frame draw loop never re-decodes, and a fresh expansion replaces the edge
+// object and so refreshes the cache.
+function decodedEdgeProperties(edge) {
+  if (!edge) return {};
+  if (edge._decodedProperties) return edge._decodedProperties;
+  const decoded = {};
+  for (const entry of edge.properties || []) {
+    if (!entry) continue;
+    decoded[base64UrlDecode(entry.key)] = base64UrlDecode(entry.value);
+  }
+  edge._decodedProperties = decoded;
+  return decoded;
+}
+
+// edgeIsDerived reports whether an edge carries a latent, similarity-derived
+// ontology assertion rather than one asserted from a document.
+function edgeIsDerived(edge) {
+  return decodedEdgeProperties(edge)[EDGE_PROPERTY_ORIGIN] === GRAPH_DERIVED_ORIGIN;
+}
+
+// edgeDerivationScore reads the similarity score the producer recorded on a
+// derived edge, or null when the edge is not derived or carries no score.
+function edgeDerivationScore(edge) {
+  const raw = decodedEdgeProperties(edge)[EDGE_PROPERTY_DERIVATION_SCORE];
+  if (raw === undefined || raw === "") return null;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) ? parsed : null;
 }
 
 function mergeGraph(graph) {
   const previousNodeCount = state.nodes.size;
   for (const node of graph.nodes || []) state.nodes.set(node.id, node);
   for (const edge of graph.edges || []) state.edges.set(edge.id, edge);
+  for (const assertion of graph.assertions || []) {
+    state.assertions.set(assertion.id, assertion);
+  }
   if (state.nodes.size !== previousNodeCount) positions.clear();
   renderGraphList();
 }
@@ -2812,11 +2926,21 @@ function renderGraphList() {
       const item = document.createElement("li");
       const from = state.nodes.get(edge.from);
       const to = state.nodes.get(edge.to);
-      item.textContent = `${nodeName(from, edge.from)} → ${nodeName(to, edge.to)} (${edge.type})`;
-      item.setAttribute(
+      const derived = edgeIsDerived(edge);
+      const label = `${nodeName(from, edge.from)} → ${nodeName(to, edge.to)} (${edge.type})`;
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = derived ? "graph-edge derived" : "graph-edge";
+      button.textContent = derived ? `◆ ${label}` : label;
+      button.title = button.textContent;
+      button.setAttribute("aria-pressed", String(edge.id === state.selectedEdge));
+      button.setAttribute(
         "aria-label",
-        `${nodeName(from, edge.from)} ${edge.from} to ${nodeName(to, edge.to)} ${edge.to}, ${edge.type}`,
+        `${derived ? "Derived edge, " : ""}${nodeName(from, edge.from)} ${edge.from} ` +
+          `to ${nodeName(to, edge.to)} ${edge.to}, ${edge.type}`,
       );
+      button.onclick = () => selectEdge(edge.id);
+      item.append(button);
       edgesElement.append(item);
     }
   }
@@ -2828,6 +2952,7 @@ function nodeName(node, fallback) {
 
 function selectNode(id) {
   state.selected = id;
+  state.selectedEdge = null;
   $("expand").disabled = !id || !capability("neighborhood");
   updateContinueButton();
   const node = state.nodes.get(id);
@@ -2846,6 +2971,185 @@ function selectNode(id) {
 
   renderGraphList();
   draw();
+}
+
+// selectEdge opens the derivation inspector for a graph edge. Selecting an edge
+// clears any node selection so the neighborhood expansion controls, which act
+// on a node, do not appear to apply to the edge.
+function selectEdge(id) {
+  const edge = state.edges.get(id);
+  if (!edge) {
+    selectNode(null);
+    return;
+  }
+  state.selectedEdge = id;
+  state.selected = null;
+  $("expand").disabled = true;
+  updateContinueButton();
+  renderDerivationInspector(edge);
+  renderGraphList();
+  draw();
+}
+
+// renderDerivationInspector shows how a selected edge's assertion was derived —
+// the producer identity, the similarity score and the derivation id — and, for
+// a derived edge, offers a deterministic recompute. An asserted edge shows its
+// plain endpoints and no producer, so a reader can see at a glance that it was
+// stated rather than inferred.
+function renderDerivationInspector(edge) {
+  const selection = $("selection");
+  selection.classList.remove("muted");
+  const properties = decodedEdgeProperties(edge);
+  const derived = edgeIsDerived(edge);
+  const from = state.nodes.get(edge.from);
+  const to = state.nodes.get(edge.to);
+  const entries = [
+    ["Edge", `${nodeName(from, edge.from)} → ${nodeName(to, edge.to)}`],
+    ["Type", edge.type],
+    [
+      "Origin",
+      derived
+        ? "derived (latent similarity)"
+        : properties[EDGE_PROPERTY_ORIGIN] || "asserted",
+    ],
+  ];
+  if (!derived) {
+    selection.replaceChildren(kvBlock(entries));
+    return;
+  }
+  const score = edgeDerivationScore(edge);
+  if (score !== null) entries.push(["Similarity score", score]);
+  if (properties[EDGE_PROPERTY_DERIVATION_ID]) {
+    entries.push(["Derivation ID", properties[EDGE_PROPERTY_DERIVATION_ID]]);
+  }
+  entries.push(["Assertion ID", edge.id]);
+  const assertion = state.assertions.get(edge.id);
+  const derivation =
+    assertion && assertion.evidence && assertion.evidence[0]
+      ? assertion.evidence[0].derivation
+      : null;
+  if (derivation) {
+    if (derivation.embedding_model) {
+      entries.push(["Embedding model", derivationModelLabel(derivation)]);
+    }
+    if (derivation.similarity_metric) {
+      entries.push(["Similarity metric", derivation.similarity_metric]);
+    }
+    if (derivation.threshold !== undefined && derivation.threshold !== null) {
+      entries.push(["Threshold", derivation.threshold]);
+    }
+    if (derivation.tessellation_cell) {
+      entries.push(["Tessellation cell", derivation.tessellation_cell]);
+    }
+    if (derivation.iterator_name) {
+      entries.push(["Iterator", derivation.iterator_name]);
+    }
+    const options = decodeMetadataList(derivation.iterator_options);
+    if (options) entries.push(["Iterator options", options]);
+  }
+  if (assertion && assertion.provenance && assertion.provenance.provider) {
+    entries.push(["Producer", providerLabel(assertion.provenance)]);
+  }
+  const inspector = document.createElement("div");
+  inspector.className = "derivation-inspector";
+  inspector.append(kvBlock(entries), buildRecomputeControl(edge.id));
+  selection.replaceChildren(inspector);
+}
+
+function derivationModelLabel(derivation) {
+  return derivation.embedding_model_version
+    ? `${derivation.embedding_model} (${derivation.embedding_model_version})`
+    : derivation.embedding_model;
+}
+
+function providerLabel(provenance) {
+  return [provenance.provider, provenance.model, provenance.model_version]
+    .filter(Boolean)
+    .join(" · ");
+}
+
+// decodeMetadataList renders a wire metadata list (base64url key/value pairs)
+// as a readable "key=value" summary for the inspector.
+function decodeMetadataList(entries) {
+  if (!entries || entries.length === 0) return "";
+  return entries
+    .map((entry) => `${base64UrlDecode(entry.key)}=${base64UrlDecode(entry.value)}`)
+    .join(", ");
+}
+
+// buildRecomputeControl renders the recompute affordance. The first recompute
+// of an edge captures its digest; a second recompute confirms the derivation
+// reproduces that digest byte-for-byte, which is the deterministic guarantee
+// the feature exists to surface.
+function buildRecomputeControl(assertionID) {
+  const wrap = document.createElement("div");
+  wrap.className = "recompute";
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "recompute-button";
+  button.textContent = "Recompute derivation";
+  const status = document.createElement("p");
+  status.className = "recompute-status muted";
+  status.setAttribute("role", "status");
+  status.textContent = state.derivationDigests.has(assertionID)
+    ? "Recompute again to confirm this derivation still reproduces byte-identically."
+    : "Recompute re-runs the derivation and captures its deterministic digest.";
+  button.onclick = () => recomputeDerivation(assertionID, button, status);
+  wrap.append(button, status);
+  return wrap;
+}
+
+async function recomputeDerivation(assertionID, button, status) {
+  button.disabled = true;
+  status.className = "recompute-status muted";
+  status.textContent = "Recomputing…";
+  const priorDigest = state.derivationDigests.get(assertionID) || "";
+  try {
+    const response = await api("derivation/recompute", {
+      snapshot: state.snapshot,
+      assertion_id: assertionID,
+      digest: priorDigest,
+    });
+    pin(response.snapshot);
+    state.derivationDigests.set(assertionID, response.digest);
+    if (!priorDigest) {
+      status.className = "recompute-status muted";
+      status.textContent =
+        `Captured digest ${shortLabel(response.digest)}. ` +
+        "Recompute again to verify it reproduces byte-identically.";
+    } else if (response.unchanged) {
+      status.className = "recompute-status ok";
+      status.textContent =
+        `Reproduced byte-identically — digest ${shortLabel(response.digest)} unchanged.`;
+    } else {
+      status.className = "recompute-status changed";
+      const score = response.detail ? response.detail.score : "?";
+      status.textContent =
+        `Inputs changed — new digest ${shortLabel(response.digest)}, ` +
+        `similarity score is now ${score}.`;
+    }
+  } catch (error) {
+    if (needsReauthentication(error)) {
+      handleReauthentication();
+      status.className = "recompute-status muted";
+      status.textContent = reauthenticationText();
+    } else if (isDenied(error)) {
+      status.className = "recompute-status error";
+      status.textContent = deniedText("recompute this derivation", state.identity);
+    } else if (error && error.code === "unavailable") {
+      status.className = "recompute-status muted";
+      status.textContent = "Recompute is unavailable on this workspace.";
+    } else if (error && (error.status === 404 || error.code === "not_found")) {
+      status.className = "recompute-status changed";
+      status.textContent =
+        "Inputs changed — this derivation no longer reproduces at the current snapshot.";
+    } else {
+      status.className = "recompute-status error";
+      status.textContent = `Recompute failed: ${error.message || String(error)}`;
+    }
+  } finally {
+    button.disabled = false;
+  }
 }
 
 function updateContinueButton() {
@@ -2886,17 +3190,27 @@ function draw() {
   });
   context.clearRect(0, 0, rectangle.width, rectangle.height);
   if (nodes.length === 0) return;
-  context.strokeStyle = "#536a8d";
   for (const edge of state.edges.values()) {
     const from = positions.get(edge.from);
     const to = positions.get(edge.to);
     if (!from || !to) continue;
+    const derived = edgeIsDerived(edge);
+    const selected = edge.id === state.selectedEdge;
+    context.save();
+    // Derived edges are dashed and amber so a latent similarity assertion is
+    // never mistaken for an asserted relationship at a glance.
+    context.setLineDash(derived ? [6, 4] : []);
+    context.lineWidth = selected ? 2.5 : 1;
+    context.strokeStyle = derived ? "#f6c667" : selected ? "#ffd166" : "#536a8d";
     context.beginPath();
     context.moveTo(from.x, from.y);
     context.lineTo(to.x, to.y);
     context.stroke();
-    context.fillStyle = "#8fa3bf";
-    context.fillText(shortLabel(edge.type), (from.x + to.x) / 2, (from.y + to.y) / 2);
+    context.restore();
+    const score = derived ? edgeDerivationScore(edge) : null;
+    const label = score !== null ? `${edge.type} ~${score}` : edge.type;
+    context.fillStyle = derived ? "#f6c667" : "#8fa3bf";
+    context.fillText(shortLabel(label), (from.x + to.x) / 2, (from.y + to.y) / 2);
   }
   for (const node of nodes) {
     const position = positions.get(node.id);
