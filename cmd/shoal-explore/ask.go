@@ -23,7 +23,6 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"html"
 	"io"
 	"net/http"
 	"os"
@@ -934,12 +933,12 @@ func writeAskMarkdown(output io.Writer, response askOutput) error {
 		_, err := fmt.Fprintf(output, format, args...)
 		return err
 	}
-	if err := write("# Answer\n\n%s\n\n", markdownInline(response.Answer)); err != nil {
+	if err := write("# Answer\n\n%s\n\n", markdownProse(response.Answer)); err != nil {
 		return err
 	}
 	if err := write("## Run\n\n- stop reason: %s\n- mode: %s\n- snapshot pinned: %s\n- authorization enforced: %s\n- authorization: %s\n- provider: %s\n- model: %s\n- prompt: %s %s %s\n- tool policy: %s\n\n",
 		markdownCode(response.StopReason), markdownCode(response.Execution.Mode), markdownCode(response.Execution.SnapshotPinned),
-		markdownCode(response.Execution.AuthorizationEnforced), markdownInline(response.Execution.Authorization),
+		markdownCode(response.Execution.AuthorizationEnforced), markdownCode(response.Execution.Authorization),
 		markdownCode(response.Provenance.Provider), markdownCode(response.Provenance.Model),
 		markdownCode(response.Provenance.PromptTemplate), markdownCode(response.Provenance.PromptVersion),
 		markdownCode(response.Provenance.PromptHash), markdownCode(response.Provenance.ToolPolicy)); err != nil {
@@ -955,8 +954,8 @@ func writeAskMarkdown(output io.Writer, response askOutput) error {
 	}
 	for _, claim := range response.Claims {
 		if err := write("- %s %s %s (confidence %.3g; evidence %s)\n",
-			markdownCode(claim.Subject), markdownCode(claim.Predicate), markdownInline(claim.Object.Value),
-			claim.Confidence, markdownInline(strings.Join(idsToStrings(claim.EvidenceIDs), ", "))); err != nil {
+			markdownCode(claim.Subject), markdownCode(claim.Predicate), markdownCode(claim.Object.Value),
+			claim.Confidence, markdownCode(strings.Join(idsToStrings(claim.EvidenceIDs), ", "))); err != nil {
 			return err
 		}
 	}
@@ -969,7 +968,7 @@ func writeAskMarkdown(output io.Writer, response askOutput) error {
 		}
 	}
 	for _, issue := range response.Issues {
-		if err := write("- %s: %s (%s)\n", markdownCode(issue.Kind), markdownInline(issue.Input), markdownInline(issue.Reason)); err != nil {
+		if err := write("- %s: %s (%s)\n", markdownCode(issue.Kind), markdownCode(issue.Input), markdownCode(issue.Reason)); err != nil {
 			return err
 		}
 	}
@@ -996,7 +995,7 @@ func writeAskMarkdown(output io.Writer, response askOutput) error {
 		}
 		if evidence.Path != nil {
 			if err := write("- graph path nodes: %s\n- graph path edges: %s\n\n",
-				markdownInline(pathNodeIDs(*evidence.Path)), markdownInline(pathEdgeIDs(*evidence.Path))); err != nil {
+				markdownCode(pathNodeIDs(*evidence.Path)), markdownCode(pathEdgeIDs(*evidence.Path))); err != nil {
 				return err
 			}
 		}
@@ -1015,8 +1014,8 @@ func writeAskMarkdown(output io.Writer, response askOutput) error {
 	for _, iteration := range response.DetailedTrace.Iterations {
 		if err := write("- iteration %d: decision %s, correlation %s, usage %s, evidence %s, failure %s\n",
 			iteration.Index, markdownCode(iteration.Decision), markdownCode(iteration.CorrelationID),
-			markdownCode(fmt.Sprintf("%+v", iteration.Usage)), markdownInline(strings.Join(idsToStrings(iteration.EvidenceIDs), ", ")),
-			markdownInline(iteration.Failure)); err != nil {
+			markdownCode(fmt.Sprintf("%+v", iteration.Usage)), markdownCode(strings.Join(idsToStrings(iteration.EvidenceIDs), ", ")),
+			markdownCode(iteration.Failure)); err != nil {
 			return err
 		}
 	}
@@ -1027,39 +1026,142 @@ func writeAskMarkdown(output io.Writer, response askOutput) error {
 		return err
 	}
 	for _, failure := range response.DetailedTrace.Failures {
-		if err := write("- iteration %d %s: %s\n", failure.Iteration, markdownCode(failure.Operation), markdownInline(failure.Error)); err != nil {
+		if err := write("- iteration %d %s: %s\n", failure.Iteration, markdownCode(failure.Operation), markdownCode(failure.Error)); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func markdownInline(value any) string {
-	escaped := html.EscapeString(sanitizeMarkdownText(fmt.Sprint(value)))
-	replacer := strings.NewReplacer(
-		"\\", "\\\\",
-		"`", "\\`",
-		"*", "\\*",
-		"_", "\\_",
-		"{", "\\{",
-		"}", "\\}",
-		"[", "\\[",
-		"]", "\\]",
-		"(", "\\(",
-		")", "\\)",
-		"#", "\\#",
-		"+", "\\+",
-		"-", "\\-",
-		".", "\\.",
-		"!", "\\!",
-		"|", "\\|",
-		">", "\\>",
-	)
-	return replacer.Replace(escaped)
+func markdownProse(value any) string {
+	lines := strings.Split(sanitizeMarkdownText(fmt.Sprint(value)), "\n")
+	var builder strings.Builder
+	for i, line := range lines {
+		if i > 0 {
+			builder.WriteByte('\n')
+		}
+		indent, line := markdownVisibleIndent(line)
+		builder.WriteString(indent)
+		blockMarker := markdownBlockMarker(line)
+		for index, r := range line {
+			if index == blockMarker || strings.ContainsRune("\\`*_<&[]|", r) {
+				builder.WriteByte('\\')
+			}
+			builder.WriteRune(r)
+		}
+	}
+	return builder.String()
+}
+
+func markdownVisibleIndent(line string) (string, string) {
+	index := 0
+	columns := 0
+	for index < len(line) {
+		switch line[index] {
+		case ' ':
+			columns++
+		case '\t':
+			columns += 4 - columns%4
+		default:
+			if columns < 4 {
+				return "", line
+			}
+			return strings.Repeat("\u00a0", columns), line[index:]
+		}
+		index++
+	}
+	return "", line
+}
+
+func markdownBlockMarker(line string) int {
+	start := 0
+	for start < len(line) && start < 3 && line[start] == ' ' {
+		start++
+	}
+	if start >= len(line) {
+		return -1
+	}
+	if markdownSetextUnderline(line[start:]) {
+		return start
+	}
+	if markdownHyphenThematicBreak(line[start:]) {
+		return start
+	}
+	switch line[start] {
+	case '>':
+		return start
+	case '#':
+		if markdownATXHeading(line[start:]) {
+			return start
+		}
+	case '+', '-':
+		if start+1 == len(line) || line[start+1] == ' ' || line[start+1] == '\t' {
+			return start
+		}
+	case '~':
+		if strings.HasPrefix(line[start:], "~~~") {
+			return start
+		}
+	}
+	digitEnd := start
+	for digitEnd < len(line) && digitEnd-start < 9 &&
+		line[digitEnd] >= '0' && line[digitEnd] <= '9' {
+		digitEnd++
+	}
+	if digitEnd > start && digitEnd < len(line) &&
+		(line[digitEnd] == '.' || line[digitEnd] == ')') &&
+		(digitEnd+1 == len(line) || line[digitEnd+1] == ' ' || line[digitEnd+1] == '\t') {
+		return digitEnd
+	}
+	return -1
+}
+
+func markdownATXHeading(line string) bool {
+	count := 0
+	for count < len(line) && line[count] == '#' {
+		count++
+	}
+	return count >= 1 && count <= 6 &&
+		(count == len(line) || line[count] == ' ' || line[count] == '\t')
+}
+
+func markdownHyphenThematicBreak(line string) bool {
+	count := 0
+	for _, r := range line {
+		switch r {
+		case '-':
+			count++
+		case ' ', '\t':
+		default:
+			return false
+		}
+	}
+	return count >= 3
+}
+
+func markdownSetextUnderline(line string) bool {
+	if line == "" || (line[0] != '=' && line[0] != '-') {
+		return false
+	}
+	marker := line[0]
+	index := 0
+	for index < len(line) && line[index] == marker {
+		index++
+	}
+	for ; index < len(line); index++ {
+		if line[index] != ' ' && line[index] != '\t' {
+			return false
+		}
+	}
+	return true
 }
 
 func markdownCode(value any) string {
 	text := sanitizeMarkdownText(fmt.Sprint(value))
+	text = strings.ReplaceAll(text, "\n", " ")
+	if text == "" {
+		return ""
+	}
 	maxTicks := 0
 	current := 0
 	for _, r := range text {
