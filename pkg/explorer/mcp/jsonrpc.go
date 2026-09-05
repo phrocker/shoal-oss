@@ -77,7 +77,7 @@ func (r Request) isNotification() bool {
 // that invariant cannot be violated by field assignment at a call site.
 type Response struct {
 	JSONRPC string          `json:"jsonrpc"`
-	ID      json.RawMessage `json:"id,omitempty"`
+	ID      json.RawMessage `json:"id"`
 	Result  json.RawMessage `json:"result,omitempty"`
 	Error   *Error          `json:"error,omitempty"`
 }
@@ -224,9 +224,19 @@ func isSpace(b byte) bool {
 // strict: a message that does not declare JSON-RPC 2.0, or that carries no
 // method, is rejected rather than processed on a guess.
 func decodeRequest(raw []byte) (Request, *Error) {
+	if !json.Valid(raw) {
+		return Request{}, newError(codeParseError, "invalid JSON")
+	}
+	trimmed := trimSpace(raw)
+	if len(trimmed) == 0 || trimmed[0] != '{' {
+		return Request{}, newError(codeInvalidRequest, "invalid request")
+	}
 	var request Request
 	if err := json.Unmarshal(raw, &request); err != nil {
-		return Request{}, newError(codeParseError, "invalid JSON")
+		return Request{}, newError(codeInvalidRequest, "invalid request")
+	}
+	if !validRequestID(request.ID) {
+		return Request{}, newError(codeInvalidRequest, "invalid request ID")
 	}
 	if request.JSONRPC != jsonRPCVersion {
 		return Request{}, newError(
@@ -236,4 +246,20 @@ func decodeRequest(raw []byte) (Request, *Error) {
 		return Request{}, newError(codeInvalidRequest, "method is required")
 	}
 	return request, nil
+}
+
+func validRequestID(id json.RawMessage) bool {
+	if len(id) == 0 || string(id) == "null" {
+		return true
+	}
+	switch id[0] {
+	case '"':
+		var value string
+		return json.Unmarshal(id, &value) == nil
+	case '-', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9':
+		var value json.Number
+		return json.Unmarshal(id, &value) == nil
+	default:
+		return false
+	}
 }

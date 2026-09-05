@@ -1,0 +1,542 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements. See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership. The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License. You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied. See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+package mcp
+
+import (
+	"bytes"
+	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"io"
+	"reflect"
+	"sort"
+	"strings"
+	"sync"
+
+	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
+	"github.com/phrocker/shoal-oss/pkg/explorer/webapi"
+	"github.com/phrocker/shoal-oss/pkg/shoal"
+)
+
+// ProtocolVersion is the newest initialization-handshake MCP revision this
+// server implements. Newer sessionless MCP revisions use a different lifecycle
+// and are intentionally not guessed at by this stdio server.
+const ProtocolVersion = "2025-11-25"
+
+const (
+	defaultServerName    = "shoal"
+	defaultServerVersion = "1"
+)
+
+// Implementation identifies an MCP client or server implementation.
+type Implementation struct {
+	Name        string `json:"name"`
+	Title       string `json:"title,omitempty"`
+	Version     string `json:"version"`
+	Description string `json:"description,omitempty"`
+	Icons       []Icon `json:"icons,omitempty"`
+	WebsiteURL  string `json:"websiteUrl,omitempty"`
+}
+
+// DecisionProvider resolves trusted caller identity for one tool invocation.
+// The server invokes it for every tools/call request, then constructs a new
+// auth.Decision with a server-generated RequestID before binding that decision
+// through Config.Authority. Providers must not derive grants from untrusted
+// tool arguments.
+type DecisionProvider interface {
+	Decision(context.Context) (auth.Decision, error)
+}
+
+// DecisionProviderFunc adapts a function to DecisionProvider.
+type DecisionProviderFunc func(context.Context) (auth.Decision, error)
+
+// Decision calls the trusted provider function.
+func (f DecisionProviderFunc) Decision(ctx context.Context) (auth.Decision, error) {
+	if f == nil {
+		return auth.Decision{}, shoal.NewError(
+			shoal.ErrorUnauthorized, "authorization denied")
+	}
+	return f(ctx)
+}
+
+// OptionalToolProvider is the extension seam for optional MCP capabilities,
+// including native Go context compression. A provider is advertised only when
+// it is supplied at construction. Its name must stay distinct from Shoal's
+// provenance "fold" operation.
+//
+// Call receives the same freshly authorized context as built-in tools. The
+// returned value must encode as a JSON object so it can be carried as MCP
+// structuredContent.
+type OptionalToolProvider interface {
+	Tool() Tool
+	Call(context.Context, json.RawMessage) (any, error)
+}
+
+// Config constructs one MCP stdio server.
+type Config struct {
+	Service          webapi.Service
+	Authority        *auth.Authority
+	Decisions        DecisionProvider
+	ServerInfo       Implementation
+	OptionalTools    []OptionalToolProvider
+	Instructions     string
+	requestIDFactory func() (shoal.ID, error)
+}
+
+type serverState uint8
+
+const (
+	stateAwaitInitialize serverState = iota
+	stateAwaitInitialized
+	stateReady
+)
+
+// Server implements the initialization-handshake MCP lifecycle over
+// newline-delimited JSON-RPC.
+type Server struct {
+	binder       auth.Binder
+	decisions    DecisionProvider
+	serverInfo   Implementation
+	instructions string
+	requestID    func() (shoal.ID, error)
+	tools        []registeredTool
+	toolsByName  map[string]registeredTool
+	stateMu      sync.Mutex
+	state        serverState
+}
+
+type registeredTool struct {
+	definition Tool
+	call       func(context.Context, json.RawMessage) (any, error)
+}
+
+// NewServer validates and snapshots the available tool surface. Optional tools
+// cannot appear later without constructing a new server, so listChanged is
+// truthfully advertised as false.
+func NewServer(config Config) (*Server, error) {
+	if isAbsent(config.Service) {
+		return nil, shoal.NewError(
+			shoal.ErrorInvalidArgument, "MCP workspace service is required")
+	}
+	if config.Authority == nil {
+		return nil, shoal.NewError(
+			shoal.ErrorInvalidArgument, "MCP authorization authority is required")
+	}
+	if isAbsent(config.Decisions) {
+		return nil, shoal.NewError(
+			shoal.ErrorInvalidArgument, "MCP decision provider is required")
+	}
+	serverInfo := config.ServerInfo
+	if serverInfo.Name == "" {
+		serverInfo.Name = defaultServerName
+	}
+	if serverInfo.Version == "" {
+		serverInfo.Version = defaultServerVersion
+	}
+	if strings.TrimSpace(serverInfo.Name) == "" ||
+		strings.TrimSpace(serverInfo.Version) == "" {
+		return nil, shoal.NewError(
+			shoal.ErrorInvalidArgument, "MCP server name and version are required")
+	}
+	requestID := config.requestIDFactory
+	if requestID == nil {
+		requestID = randomRequestID
+	}
+	tools, err := serviceTools(config.Service, config.OptionalTools)
+	if err != nil {
+		return nil, err
+	}
+	byName := make(map[string]registeredTool, len(tools))
+	for _, tool := range tools {
+		byName[tool.definition.Name] = tool
+	}
+	instructions := strings.TrimSpace(config.Instructions)
+	if instructions != "" {
+		instructions += " "
+	}
+	instructions += "Shoal tools are authorized independently for every call. " +
+		"Context compression is an optional native Go capability and is distinct " +
+		"from Shoal provenance fold. Tool-call recording is deferred in v1."
+	return &Server{
+		binder: config.Authority.Binder(), decisions: config.Decisions,
+		serverInfo:   serverInfo,
+		instructions: instructions, requestID: requestID,
+		tools: tools, toolsByName: byName, state: stateAwaitInitialize,
+	}, nil
+}
+
+// Serve processes newline-delimited JSON-RPC until input closes, the context is
+// canceled between messages, or a transport error prevents continued framing.
+func (s *Server) Serve(ctx context.Context, input io.Reader, output io.Writer) error {
+	if s == nil {
+		return shoal.NewError(shoal.ErrorInvalidArgument, "MCP server is required")
+	}
+	if input == nil || output == nil {
+		return shoal.NewError(
+			shoal.ErrorInvalidArgument, "MCP input and output are required")
+	}
+	codec := newCodec(input, output)
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		raw, err := codec.readMessage()
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
+		if err != nil {
+			if errors.Is(err, errMessageTooLarge) {
+				_ = codec.writeMessage(newErrorResponse(
+					json.RawMessage("null"),
+					newError(codeParseError, "invalid JSON"),
+				))
+			}
+			return err
+		}
+		request, failure := decodeRequest(raw)
+		if failure != nil {
+			id, respond := protocolFailureID(raw, failure)
+			if respond {
+				if err := codec.writeMessage(newErrorResponse(id, failure)); err != nil {
+					return err
+				}
+			}
+			continue
+		}
+		response := s.handle(ctx, request)
+		if response == nil {
+			continue
+		}
+		if err := codec.writeMessage(*response); err != nil {
+			return err
+		}
+	}
+}
+
+func protocolFailureID(raw []byte, failure *Error) (json.RawMessage, bool) {
+	if failure == nil {
+		return nil, false
+	}
+	if failure.Code == codeParseError {
+		return json.RawMessage("null"), true
+	}
+	var envelope struct {
+		ID json.RawMessage `json:"id"`
+	}
+	if err := json.Unmarshal(raw, &envelope); err != nil {
+		return json.RawMessage("null"), true
+	}
+	if len(envelope.ID) == 0 || string(envelope.ID) == "null" {
+		return nil, false
+	}
+	if !validRequestID(envelope.ID) {
+		return json.RawMessage("null"), true
+	}
+	return envelope.ID, true
+}
+
+func (s *Server) handle(ctx context.Context, request Request) *Response {
+	if request.isNotification() {
+		s.handleNotification(request)
+		return nil
+	}
+	switch request.Method {
+	case "initialize":
+		return s.initialize(request)
+	case "ping":
+		if !validEmptyParams(request.Params) {
+			response := newErrorResponse(
+				request.ID, newError(codeInvalidParams, "invalid ping params"))
+			return &response
+		}
+		response := newResponse(request.ID, struct{}{})
+		return &response
+	case "notifications/initialized":
+		response := newErrorResponse(
+			request.ID, newError(codeInvalidRequest, "initialized must be a notification"))
+		return &response
+	}
+	if !s.ready() {
+		response := newErrorResponse(
+			request.ID, newError(codeInvalidRequest, "server is not initialized"))
+		return &response
+	}
+	switch request.Method {
+	case "tools/list":
+		return s.listTools(request)
+	case "tools/call":
+		return s.callTool(ctx, request)
+	default:
+		response := newErrorResponse(
+			request.ID, newError(codeMethodNotFound, "method not found"))
+		return &response
+	}
+}
+
+func (s *Server) initialize(request Request) *Response {
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
+	if s.state != stateAwaitInitialize {
+		response := newErrorResponse(
+			request.ID, newError(codeInvalidRequest, "server is already initialized"))
+		return &response
+	}
+	var params InitializeParams
+	if err := strictDecode(request.Params, &params); err != nil ||
+		params.ProtocolVersion == "" ||
+		params.Capabilities == nil ||
+		strings.TrimSpace(params.ClientInfo.Name) == "" ||
+		strings.TrimSpace(params.ClientInfo.Version) == "" {
+		response := newErrorResponse(
+			request.ID, newError(codeInvalidParams, "invalid initialize params"))
+		return &response
+	}
+	negotiated := ProtocolVersion
+	if params.ProtocolVersion == ProtocolVersion {
+		negotiated = params.ProtocolVersion
+	}
+	s.state = stateAwaitInitialized
+	response := newResponse(request.ID, InitializeResult{
+		ProtocolVersion: negotiated,
+		Capabilities: ServerCapabilities{
+			Tools: &ToolsCapability{ListChanged: false},
+		},
+		ServerInfo:   s.serverInfo,
+		Instructions: s.instructions,
+	})
+	return &response
+}
+
+func (s *Server) handleNotification(request Request) {
+	if request.Method != "notifications/initialized" ||
+		!validEmptyParams(request.Params) {
+		return
+	}
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
+	if s.state == stateAwaitInitialized {
+		s.state = stateReady
+	}
+}
+
+func (s *Server) ready() bool {
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
+	return s.state == stateReady
+}
+
+func (s *Server) listTools(request Request) *Response {
+	var params ListToolsParams
+	if err := strictDecodeOptional(request.Params, &params); err != nil ||
+		params.Cursor != "" {
+		response := newErrorResponse(
+			request.ID, newError(codeInvalidParams, "invalid tools/list params"))
+		return &response
+	}
+	definitions := make([]Tool, len(s.tools))
+	for index := range s.tools {
+		definitions[index] = s.tools[index].definition
+	}
+	response := newResponse(request.ID, ListToolsResult{Tools: definitions})
+	return &response
+}
+
+func (s *Server) callTool(ctx context.Context, request Request) *Response {
+	var params CallToolParams
+	if err := strictDecode(request.Params, &params); err != nil ||
+		strings.TrimSpace(params.Name) == "" ||
+		!argumentsObject(params.Arguments) {
+		response := newErrorResponse(
+			request.ID, newError(codeInvalidParams, "invalid tools/call params"))
+		return &response
+	}
+
+	bound, err := s.authorizedContext(ctx)
+	if err != nil {
+		response := newResponse(request.ID, toolErrorResult(err))
+		return &response
+	}
+	tool, ok := s.toolsByName[params.Name]
+	if !ok {
+		response := newErrorResponse(
+			request.ID, newError(codeInvalidParams, "unknown tool"))
+		return &response
+	}
+	arguments := params.Arguments
+	if len(arguments) == 0 {
+		arguments = json.RawMessage("{}")
+	}
+	value, err := tool.call(bound, arguments)
+	if err != nil {
+		response := newResponse(request.ID, toolErrorResult(err))
+		return &response
+	}
+	result, err := toolSuccessResult(value)
+	if err != nil {
+		result = toolErrorResult(err)
+	}
+	response := newResponse(request.ID, result)
+	return &response
+}
+
+func (s *Server) authorizedContext(ctx context.Context) (context.Context, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	template, err := s.decisions.Decision(ctx)
+	if err != nil {
+		if contextErr := ctx.Err(); contextErr != nil {
+			return nil, contextErr
+		}
+		return nil, shoal.NewError(shoal.ErrorUnauthorized, "authorization denied")
+	}
+	requestID, err := s.requestID()
+	if err != nil {
+		return nil, shoal.NewError(
+			shoal.ErrorUnavailable, "request identity unavailable")
+	}
+	if err := shoal.ValidateRequiredID("MCP request ID", requestID); err != nil {
+		return nil, shoal.NewError(
+			shoal.ErrorUnavailable, "request identity unavailable")
+	}
+	decision, err := auth.NewDecision(auth.DecisionConfig{
+		Subject:                template.Subject(),
+		Actor:                  template.Actor(),
+		ClientID:               template.ClientID(),
+		OnBehalfOf:             template.OnBehalfOf(),
+		AuthorizationDomain:    template.AuthorizationDomain(),
+		AllowedOperations:      template.AllowedOperations(),
+		PermittedSourceIDs:     template.PermittedSourceIDs(),
+		PermittedPolicyIDs:     template.PermittedPolicyIDs(),
+		PolicyGeneration:       template.PolicyGeneration(),
+		AuthenticationExpires:  template.AuthenticationExpires(),
+		RequestID:              requestID,
+		CorrelationID:          template.CorrelationID(),
+		AuditPurpose:           template.AuditPurpose(),
+		ServiceRole:            template.ServiceRole(),
+		ServiceCeilingIdentity: template.ServiceCeilingIdentity(),
+	})
+	if err != nil {
+		return nil, shoal.NewError(shoal.ErrorUnauthorized, "authorization denied")
+	}
+	bound, err := s.binder.Bind(ctx, decision)
+	if err != nil || bound == nil {
+		if contextErr := ctx.Err(); contextErr != nil {
+			return nil, contextErr
+		}
+		return nil, shoal.NewError(shoal.ErrorUnauthorized, "authorization denied")
+	}
+	return bound, nil
+}
+
+func randomRequestID() (shoal.ID, error) {
+	var random [16]byte
+	if _, err := rand.Read(random[:]); err != nil {
+		return "", err
+	}
+	return shoal.ID("mcp-" + hex.EncodeToString(random[:])), nil
+}
+
+func strictDecode(raw json.RawMessage, value any) error {
+	if len(bytes.TrimSpace(raw)) == 0 || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return errors.New("missing params")
+	}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(value); err != nil {
+		return err
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return errors.New("multiple JSON values")
+		}
+		return err
+	}
+	return nil
+}
+
+func strictDecodeOptional(raw json.RawMessage, value any) error {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil
+	}
+	return strictDecode(raw, value)
+}
+
+func validEmptyParams(raw json.RawMessage) bool {
+	var params EmptyParams
+	return strictDecodeOptional(raw, &params) == nil
+}
+
+func argumentsObject(raw json.RawMessage) bool {
+	trimmed := bytes.TrimSpace(raw)
+	return len(trimmed) == 0 || (len(trimmed) > 1 && trimmed[0] == '{')
+}
+
+func isAbsent(value any) bool {
+	if value == nil {
+		return true
+	}
+	reflected := reflect.ValueOf(value)
+	switch reflected.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map,
+		reflect.Pointer, reflect.Slice, reflect.UnsafePointer:
+		return reflected.IsNil()
+	default:
+		return false
+	}
+}
+
+func serviceTools(
+	service webapi.Service,
+	optional []OptionalToolProvider,
+) ([]registeredTool, error) {
+	tools := mandatoryServiceTools(service)
+	tools = append(tools, optionalServiceTools(service)...)
+	for _, provider := range optional {
+		if isAbsent(provider) {
+			return nil, shoal.NewError(
+				shoal.ErrorInvalidArgument, "optional MCP tool provider is required")
+		}
+		definition := provider.Tool()
+		if err := validateTool(definition); err != nil {
+			return nil, err
+		}
+		provider := provider
+		tools = append(tools, registeredTool{
+			definition: cloneTool(definition),
+			call: func(ctx context.Context, arguments json.RawMessage) (any, error) {
+				return provider.Call(ctx, append(json.RawMessage(nil), arguments...))
+			},
+		})
+	}
+	sort.Slice(tools, func(left, right int) bool {
+		return tools[left].definition.Name < tools[right].definition.Name
+	})
+	for index := range tools {
+		if index > 0 &&
+			tools[index-1].definition.Name == tools[index].definition.Name {
+			return nil, shoal.NewError(
+				shoal.ErrorInvalidArgument, "duplicate MCP tool name")
+		}
+	}
+	return tools, nil
+}

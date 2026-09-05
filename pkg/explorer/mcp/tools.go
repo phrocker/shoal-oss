@@ -1,0 +1,557 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements. See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership. The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License. You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied. See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+package mcp
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"strings"
+
+	"github.com/phrocker/shoal-oss/pkg/explorer/webapi"
+	"github.com/phrocker/shoal-oss/pkg/shoal"
+)
+
+const (
+	ToolDocuments    = "shoal.documents"
+	ToolDocument     = "shoal.document"
+	ToolRetrieve     = "shoal.retrieve"
+	ToolNeighborhood = "shoal.neighborhood"
+	ToolPath         = "shoal.path"
+	ToolIngest       = "shoal.ingest"
+	ToolExtract      = "shoal.extract"
+	ToolRecompute    = "shoal.recompute"
+	ToolChanges      = "shoal.changes"
+)
+
+var (
+	documentsSchema = json.RawMessage(`{
+		"type":"object",
+		"properties":{
+			"snapshot":{"$ref":"#/$defs/snapshot"},
+			"page":{
+				"type":"object",
+				"properties":{
+					"limit":{"type":"integer","minimum":0,"maximum":100},
+					"cursor":{"type":"string"}
+				},
+				"additionalProperties":false
+			}
+		},
+		"additionalProperties":false,
+		"$defs":{
+			"snapshot":{
+				"type":"object",
+				"properties":{
+					"id":{"type":"string"},
+					"as_of":{"type":"string","format":"date-time"},
+					"frontier":{"type":"string","pattern":"^[0-9]+$"}
+				},
+				"additionalProperties":false
+			}
+		}
+	}`)
+	documentSchema = json.RawMessage(`{
+		"type":"object",
+		"properties":{
+			"snapshot":{"$ref":"#/$defs/snapshot"},
+			"document_id":{"type":"string","description":"Base64url Shoal document ID"},
+			"revision_id":{"type":"string","description":"Optional base64url revision ID"}
+		},
+		"required":["snapshot","document_id"],
+		"additionalProperties":false,
+		"$defs":{
+			"snapshot":{
+				"type":"object",
+				"properties":{
+					"id":{"type":"string"},
+					"as_of":{"type":"string","format":"date-time"},
+					"frontier":{"type":"string","pattern":"^[0-9]+$"}
+				},
+				"additionalProperties":false
+			}
+		}
+	}`)
+	retrieveSchema = json.RawMessage(`{
+		"type":"object",
+		"properties":{
+			"snapshot":{"$ref":"#/$defs/snapshot"},
+			"query":{
+				"type":"object",
+				"properties":{
+					"text":{"type":"string"},
+					"top_k":{"type":"integer","minimum":0,"maximum":50},
+					"modes":{
+						"type":"array",
+						"items":{"enum":["lexical","vector","tree","graph"]},
+						"maxItems":4
+					},
+					"scope":{
+						"type":"object",
+						"properties":{
+							"document_ids":{"type":"array","items":{"type":"string"}},
+							"node_ids":{"type":"array","items":{"type":"string"}}
+						},
+						"additionalProperties":false
+					},
+					"as_of":{"type":"string","format":"date-time"},
+					"explain":{"type":"boolean"}
+				},
+				"required":["text"],
+				"additionalProperties":false
+			}
+		},
+		"required":["snapshot","query"],
+		"additionalProperties":false,
+		"$defs":{
+			"snapshot":{
+				"type":"object",
+				"properties":{
+					"id":{"type":"string"},
+					"as_of":{"type":"string","format":"date-time"},
+					"frontier":{"type":"string","pattern":"^[0-9]+$"}
+				},
+				"additionalProperties":false
+			}
+		}
+	}`)
+	neighborhoodSchema = json.RawMessage(`{
+		"type":"object",
+		"properties":{
+			"snapshot":{"$ref":"#/$defs/snapshot"},
+			"node_ids":{"type":"array","items":{"type":"string"},"minItems":1},
+			"depth":{"type":"integer","minimum":0,"maximum":4},
+			"fanout":{"type":"integer","minimum":0,"maximum":50},
+			"max_nodes":{"type":"integer","minimum":0,"maximum":250},
+			"edge_types":{"type":"array","items":{"type":"string"},"maxItems":64},
+			"cursor":{"type":"string"}
+		},
+		"required":["snapshot","node_ids"],
+		"additionalProperties":false,
+		"$defs":{
+			"snapshot":{
+				"type":"object",
+				"properties":{
+					"id":{"type":"string"},
+					"as_of":{"type":"string","format":"date-time"},
+					"frontier":{"type":"string","pattern":"^[0-9]+$"}
+				},
+				"additionalProperties":false
+			}
+		}
+	}`)
+	pathSchema = json.RawMessage(`{
+		"type":"object",
+		"properties":{
+			"snapshot":{"$ref":"#/$defs/snapshot"},
+			"from":{"type":"string"},
+			"to":{"type":"string"},
+			"max_depth":{"type":"integer","minimum":0,"maximum":4},
+			"fanout":{"type":"integer","minimum":0,"maximum":50},
+			"edge_types":{"type":"array","items":{"type":"string"},"maxItems":64}
+		},
+		"required":["snapshot","from","to"],
+		"additionalProperties":false,
+		"$defs":{
+			"snapshot":{
+				"type":"object",
+				"properties":{
+					"id":{"type":"string"},
+					"as_of":{"type":"string","format":"date-time"},
+					"frontier":{"type":"string","pattern":"^[0-9]+$"}
+				},
+				"additionalProperties":false
+			}
+		}
+	}`)
+	ingestSchema = json.RawMessage(`{
+		"type":"object",
+		"properties":{
+			"files":{
+				"type":"array",
+				"items":{
+					"type":"object",
+					"properties":{
+						"name":{"type":"string"},
+						"content":{"type":"string","contentEncoding":"base64"}
+					},
+					"required":["name","content"],
+					"additionalProperties":false
+				},
+				"minItems":1,
+				"maxItems":8
+			}
+		},
+		"required":["files"],
+		"additionalProperties":false
+	}`)
+	extractSchema = json.RawMessage(`{
+		"type":"object",
+		"properties":{
+			"snapshot":{"$ref":"#/$defs/snapshot"},
+			"document_id":{"type":"string"},
+			"revision_id":{"type":"string"},
+			"instructions":{"type":"string"}
+		},
+		"required":["snapshot","document_id"],
+		"additionalProperties":false,
+		"$defs":{
+			"snapshot":{
+				"type":"object",
+				"properties":{
+					"id":{"type":"string"},
+					"as_of":{"type":"string","format":"date-time"},
+					"frontier":{"type":"string","pattern":"^[0-9]+$"}
+				},
+				"additionalProperties":false
+			}
+		}
+	}`)
+	recomputeSchema = json.RawMessage(`{
+		"type":"object",
+		"properties":{
+			"snapshot":{"$ref":"#/$defs/snapshot"},
+			"assertion_id":{"type":"string"},
+			"digest":{"type":"string"}
+		},
+		"required":["snapshot","assertion_id"],
+		"additionalProperties":false,
+		"$defs":{
+			"snapshot":{
+				"type":"object",
+				"properties":{
+					"id":{"type":"string"},
+					"as_of":{"type":"string","format":"date-time"},
+					"frontier":{"type":"string","pattern":"^[0-9]+$"}
+				},
+				"additionalProperties":false
+			}
+		}
+	}`)
+	changesSchema = json.RawMessage(`{
+		"type":"object",
+		"properties":{
+			"cursor":{
+				"type":"string",
+				"description":"Opaque authorized change-feed cursor; this is not Snapshot.frontier"
+			},
+			"limit":{"type":"integer","minimum":0,"maximum":100}
+		},
+		"additionalProperties":false
+	}`)
+)
+
+func mandatoryServiceTools(service webapi.Service) []registeredTool {
+	return []registeredTool{
+		{
+			definition: Tool{
+				Name: ToolDocuments, Title: "List Shoal documents",
+				Description: "List an authorized page of current Shoal documents.",
+				InputSchema: cloneJSON(documentsSchema),
+				Annotations: readOnlyAnnotations(),
+			},
+			call: func(ctx context.Context, raw json.RawMessage) (any, error) {
+				var request webapi.DocumentsRequest
+				if err := decodeToolArguments(raw, &request, ToolDocuments); err != nil {
+					return nil, err
+				}
+				return service.Documents(ctx, request)
+			},
+		},
+		{
+			definition: Tool{
+				Name: ToolDocument, Title: "Read a Shoal document",
+				Description: "Read one authorized immutable Shoal document hierarchy.",
+				InputSchema: cloneJSON(documentSchema),
+				Annotations: readOnlyAnnotations(),
+			},
+			call: func(ctx context.Context, raw json.RawMessage) (any, error) {
+				var request webapi.DocumentRequest
+				if err := decodeToolArguments(raw, &request, ToolDocument); err != nil {
+					return nil, err
+				}
+				return service.Document(ctx, request)
+			},
+		},
+		{
+			definition: Tool{
+				Name: ToolRetrieve, Title: "Retrieve Shoal knowledge",
+				Description: "Run an authorized bounded retrieval and return structured evidence.",
+				InputSchema: cloneJSON(retrieveSchema),
+				Annotations: readOnlyAnnotations(),
+			},
+			call: func(ctx context.Context, raw json.RawMessage) (any, error) {
+				var request webapi.RetrievalRequest
+				if err := decodeToolArguments(raw, &request, ToolRetrieve); err != nil {
+					return nil, err
+				}
+				return service.Retrieve(ctx, request)
+			},
+		},
+		{
+			definition: Tool{
+				Name: ToolNeighborhood, Title: "Explore a Shoal neighborhood",
+				Description: "Expand an authorized bounded graph neighborhood.",
+				InputSchema: cloneJSON(neighborhoodSchema),
+				Annotations: readOnlyAnnotations(),
+			},
+			call: func(ctx context.Context, raw json.RawMessage) (any, error) {
+				var request webapi.NeighborhoodRequest
+				if err := decodeToolArguments(raw, &request, ToolNeighborhood); err != nil {
+					return nil, err
+				}
+				return service.Neighborhood(ctx, request)
+			},
+		},
+		{
+			definition: Tool{
+				Name: ToolPath, Title: "Find a Shoal path",
+				Description: "Find one authorized bounded directed explanation path.",
+				InputSchema: cloneJSON(pathSchema),
+				Annotations: readOnlyAnnotations(),
+			},
+			call: func(ctx context.Context, raw json.RawMessage) (any, error) {
+				var request webapi.PathRequest
+				if err := decodeToolArguments(raw, &request, ToolPath); err != nil {
+					return nil, err
+				}
+				return service.Path(ctx, request)
+			},
+		},
+	}
+}
+
+func optionalServiceTools(service webapi.Service) []registeredTool {
+	var tools []registeredTool
+	if provider, ok := service.(webapi.IngestProvider); ok && !isAbsent(provider) {
+		provider := provider
+		tools = append(tools, registeredTool{
+			definition: Tool{
+				Name: ToolIngest, Title: "Ingest Shoal documents",
+				Description: "Ingest a bounded batch when the workspace implements ingestion.",
+				InputSchema: cloneJSON(ingestSchema),
+				Annotations: &ToolAnnotations{
+					DestructiveHint: false, IdempotentHint: true,
+				},
+			},
+			call: func(ctx context.Context, raw json.RawMessage) (any, error) {
+				var request webapi.IngestRequest
+				if err := decodeToolArguments(raw, &request, ToolIngest); err != nil {
+					return nil, err
+				}
+				return provider.Ingest(ctx, request)
+			},
+		})
+	}
+	if provider, ok := service.(webapi.ExtractionProvider); ok && !isAbsent(provider) {
+		provider := provider
+		tools = append(tools, registeredTool{
+			definition: Tool{
+				Name: ToolExtract, Title: "Extract Shoal knowledge",
+				Description: "Run explicit extraction when the workspace implements it.",
+				InputSchema: cloneJSON(extractSchema),
+				Annotations: &ToolAnnotations{
+					DestructiveHint: false, IdempotentHint: true,
+				},
+			},
+			call: func(ctx context.Context, raw json.RawMessage) (any, error) {
+				var request webapi.ExtractRequest
+				if err := decodeToolArguments(raw, &request, ToolExtract); err != nil {
+					return nil, err
+				}
+				return provider.Extract(ctx, request)
+			},
+		})
+	}
+	if provider, ok := service.(webapi.RecomputeProvider); ok && !isAbsent(provider) {
+		provider := provider
+		tools = append(tools, registeredTool{
+			definition: Tool{
+				Name: ToolRecompute, Title: "Recompute a Shoal derivation",
+				Description: "Recompute derivation evidence when the workspace implements it.",
+				InputSchema: cloneJSON(recomputeSchema),
+				Annotations: readOnlyAnnotations(),
+			},
+			call: func(ctx context.Context, raw json.RawMessage) (any, error) {
+				var request webapi.RecomputeDerivationRequest
+				if err := decodeToolArguments(raw, &request, ToolRecompute); err != nil {
+					return nil, err
+				}
+				return provider.Recompute(ctx, request)
+			},
+		})
+	}
+	if provider, ok := service.(webapi.ChangeProvider); ok && !isAbsent(provider) {
+		provider := provider
+		tools = append(tools, registeredTool{
+			definition: Tool{
+				Name: ToolChanges, Title: "Read Shoal document changes",
+				Description: "Read the authorized resumable document-publication feed. " +
+					"Its opaque cursor is independent of the snapshot content frontier.",
+				InputSchema: cloneJSON(changesSchema),
+				Annotations: readOnlyAnnotations(),
+			},
+			call: func(ctx context.Context, raw json.RawMessage) (any, error) {
+				var request webapi.ChangesRequest
+				if err := decodeToolArguments(raw, &request, ToolChanges); err != nil {
+					return nil, err
+				}
+				return provider.Changes(ctx, request)
+			},
+		})
+	}
+	return tools
+}
+
+func readOnlyAnnotations() *ToolAnnotations {
+	return &ToolAnnotations{ReadOnlyHint: true, IdempotentHint: true}
+}
+
+func decodeToolArguments(
+	raw json.RawMessage,
+	value any,
+	toolName string,
+) error {
+	if err := strictDecode(raw, value); err != nil {
+		return shoal.NewError(
+			shoal.ErrorInvalidArgument, toolName+" arguments are invalid")
+	}
+	return nil
+}
+
+func toolSuccessResult(value any) (ToolResult, error) {
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return ToolResult{}, shoal.NewError(
+			shoal.ErrorInternal, "tool result could not be encoded")
+	}
+	trimmed := bytes.TrimSpace(encoded)
+	if len(trimmed) == 0 || trimmed[0] != '{' {
+		return ToolResult{}, shoal.NewError(
+			shoal.ErrorInternal, "tool result must be a JSON object")
+	}
+	return ToolResult{
+		Content:           []TextContent{{Type: "text", Text: string(encoded)}},
+		StructuredContent: append(json.RawMessage(nil), encoded...),
+		IsError:           false,
+	}, nil
+}
+
+type structuredToolFailure struct {
+	Error toolFailure `json:"error"`
+}
+
+type toolFailure struct {
+	Code    string `json:"code"`
+	Message string `json:"message"`
+}
+
+func toolErrorResult(err error) ToolResult {
+	failure := publicToolFailure(err)
+	encoded, marshalErr := json.Marshal(structuredToolFailure{Error: failure})
+	if marshalErr != nil {
+		encoded = []byte(`{"error":{"code":"internal","message":"tool execution failed"}}`)
+	}
+	return ToolResult{
+		Content:           []TextContent{{Type: "text", Text: string(encoded)}},
+		StructuredContent: append(json.RawMessage(nil), encoded...),
+		IsError:           true,
+	}
+}
+
+func publicToolFailure(err error) toolFailure {
+	if errors.Is(err, context.Canceled) {
+		return toolFailure{
+			Code: string(shoal.ErrorCanceled), Message: "tool execution canceled"}
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return toolFailure{
+			Code: string(shoal.ErrorDeadline), Message: "tool execution deadline exceeded"}
+	}
+	var public *shoal.Error
+	if errors.As(err, &public) && public != nil {
+		switch public.Code {
+		case shoal.ErrorUnauthorized:
+			return toolFailure{
+				Code: string(public.Code), Message: "authorization denied"}
+		case shoal.ErrorInternal:
+			return toolFailure{
+				Code: string(public.Code), Message: "tool execution failed"}
+		default:
+			message := strings.TrimSpace(public.Message)
+			if message == "" {
+				message = string(public.Code)
+			}
+			return toolFailure{Code: string(public.Code), Message: message}
+		}
+	}
+	return toolFailure{
+		Code: string(shoal.ErrorInternal), Message: "tool execution failed"}
+}
+
+func validateTool(tool Tool) error {
+	if len(tool.Name) == 0 || len(tool.Name) > 128 {
+		return shoal.NewError(
+			shoal.ErrorInvalidArgument, "optional MCP tool name is invalid")
+	}
+	for index := 0; index < len(tool.Name); index++ {
+		character := tool.Name[index]
+		if (character >= 'a' && character <= 'z') ||
+			(character >= 'A' && character <= 'Z') ||
+			(character >= '0' && character <= '9') ||
+			character == '_' || character == '-' || character == '.' {
+			continue
+		}
+		return shoal.NewError(
+			shoal.ErrorInvalidArgument, "optional MCP tool name is invalid")
+	}
+	if strings.TrimSpace(tool.Description) == "" {
+		return shoal.NewError(
+			shoal.ErrorInvalidArgument, "optional MCP tool description is required")
+	}
+	var schema map[string]any
+	if err := json.Unmarshal(tool.InputSchema, &schema); err != nil || schema == nil {
+		return shoal.NewError(
+			shoal.ErrorInvalidArgument, "optional MCP tool input schema is invalid")
+	}
+	return nil
+}
+
+func cloneTool(tool Tool) Tool {
+	cloned := tool
+	cloned.InputSchema = cloneJSON(tool.InputSchema)
+	cloned.OutputSchema = cloneJSON(tool.OutputSchema)
+	cloned.Icons = append([]Icon(nil), tool.Icons...)
+	for index := range cloned.Icons {
+		cloned.Icons[index].Sizes = append([]string(nil), tool.Icons[index].Sizes...)
+	}
+	if tool.Annotations != nil {
+		annotations := *tool.Annotations
+		cloned.Annotations = &annotations
+	}
+	if tool.Execution != nil {
+		execution := *tool.Execution
+		cloned.Execution = &execution
+	}
+	return cloned
+}
+
+func cloneJSON(value json.RawMessage) json.RawMessage {
+	return append(json.RawMessage(nil), value...)
+}
