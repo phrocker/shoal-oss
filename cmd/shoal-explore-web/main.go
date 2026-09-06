@@ -877,11 +877,16 @@ func authorizedClient(
 	}
 	scorer, _ := any(corpus).(authorized.VectorScorer)
 	return authorized.NewClient(authorized.Config{
-		Base:           corpus,
-		VectorScorer:   scorer,
-		Resolver:       resolver,
-		PolicySelector: selector,
-		PolicyStore:    store,
+		Base:                  corpus,
+		VectorScorer:          scorer,
+		OntologyInterpreter:   corpus,
+		OntologyProposalStore: corpus,
+		InteractionWriter:     corpus,
+		InteractionReader:     corpus,
+		SnapshotValidator:     corpus,
+		Resolver:              resolver,
+		PolicySelector:        selector,
+		PolicyStore:           store,
 		GenerationReader: fixedGenerationReader{
 			domain:     workspaceAuthorizationDomain,
 			generation: workspacePolicyGeneration,

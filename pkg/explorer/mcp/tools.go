@@ -844,6 +844,7 @@ type optionalToolInputSchema struct {
 	Enum                 []json.RawMessage                  `json:"enum,omitempty"`
 	Minimum              *json.Number                       `json:"minimum,omitempty"`
 	Maximum              *json.Number                       `json:"maximum,omitempty"`
+	ExclusiveMaximum     *json.Number                       `json:"exclusiveMaximum,omitempty"`
 	MinLength            *int                               `json:"minLength,omitempty"`
 	MaxLength            *int                               `json:"maxLength,omitempty"`
 	MinItems             *int                               `json:"minItems,omitempty"`
@@ -881,6 +882,13 @@ func validateOptionalToolSchemaNode(
 		return errors.New("schema exceeds structural limits")
 	}
 	switch schema.Type {
+	case "":
+		if len(schema.Properties) != 0 || len(schema.Required) != 0 ||
+			schema.AdditionalProperties != nil || schema.Items != nil ||
+			schema.Enum != nil || hasScalarSchemaBounds(schema) {
+			return errors.New("untyped schema has validation keywords")
+		}
+		return nil
 	case "object":
 		if schema.Items != nil || hasScalarSchemaBounds(schema) {
 			return errors.New("object schema has incompatible keywords")
@@ -919,6 +927,7 @@ func validateOptionalToolSchemaNode(
 		if schema.Items != nil || len(schema.Properties) != 0 ||
 			len(schema.Required) != 0 || schema.AdditionalProperties != nil ||
 			schema.Minimum != nil || schema.Maximum != nil ||
+			schema.ExclusiveMaximum != nil ||
 			schema.MinItems != nil || schema.MaxItems != nil {
 			return errors.New("string schema has incompatible keywords")
 		}
@@ -932,16 +941,27 @@ func validateOptionalToolSchemaNode(
 			schema.MinItems != nil || schema.MaxItems != nil {
 			return errors.New("numeric schema has incompatible keywords")
 		}
-		if schema.Minimum != nil && schema.Maximum != nil {
+		if schema.Maximum != nil && schema.ExclusiveMaximum != nil {
+			return errors.New("numeric schema has conflicting upper bounds")
+		}
+		if schema.Minimum != nil &&
+			(schema.Maximum != nil || schema.ExclusiveMaximum != nil) {
 			minimum, err := jsonNumberRat(*schema.Minimum)
 			if err != nil {
 				return err
 			}
-			maximum, err := jsonNumberRat(*schema.Maximum)
+			upper := schema.Maximum
+			exclusive := false
+			if upper == nil {
+				upper = schema.ExclusiveMaximum
+				exclusive = true
+			}
+			maximum, err := jsonNumberRat(*upper)
 			if err != nil {
 				return err
 			}
-			if minimum.Cmp(maximum) > 0 {
+			comparison := minimum.Cmp(maximum)
+			if comparison > 0 || exclusive && comparison == 0 {
 				return errors.New("numeric schema bounds are inverted")
 			}
 		}
@@ -980,6 +1000,7 @@ func hasScalarSchemaBounds(schema optionalToolInputSchema) bool {
 
 func hasStringOrNumberSchemaBounds(schema optionalToolInputSchema) bool {
 	return schema.Minimum != nil || schema.Maximum != nil ||
+		schema.ExclusiveMaximum != nil ||
 		schema.MinLength != nil || schema.MaxLength != nil
 }
 
@@ -1038,6 +1059,8 @@ func validateOptionalToolValue(value any, schema optionalToolInputSchema) error 
 		}
 	}
 	switch schema.Type {
+	case "":
+		return nil
 	case "object":
 		object, ok := value.(map[string]any)
 		if !ok {
@@ -1113,6 +1136,15 @@ func validateOptionalToolValue(value any, schema optionalToolInputSchema) error 
 			}
 			if rational.Cmp(maximum) > 0 {
 				return errors.New("number is above schema maximum")
+			}
+		}
+		if schema.ExclusiveMaximum != nil {
+			maximum, err := jsonNumberRat(*schema.ExclusiveMaximum)
+			if err != nil {
+				return err
+			}
+			if rational.Cmp(maximum) >= 0 {
+				return errors.New("number is at or above schema exclusive maximum")
 			}
 		}
 	case "boolean":

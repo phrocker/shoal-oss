@@ -31,8 +31,24 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/graph"
+	"github.com/phrocker/shoal-oss/pkg/interaction"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
+
+// SnapshotValidator verifies corpus frontiers pinned into interaction records.
+type SnapshotValidator interface {
+	ValidateSnapshot(context.Context, shoal.ID, time.Time, []shoal.ID) error
+}
+
+// EvidenceSnapshotValidator additionally binds exact source evidence to the
+// pinned corpus frontier.
+type EvidenceSnapshotValidator interface {
+	SnapshotValidator
+	ValidateEvidenceSnapshot(
+		context.Context, shoal.ID, time.Time, []shoal.ID, []shoal.ID,
+		[]interaction.EvidenceReference,
+	) error
+}
 
 // Config supplies the trusted dependencies for an authorization-enforcing
 // Explorer client.
@@ -41,13 +57,33 @@ type Config struct {
 	// VectorScorer is an optional explicitly trusted scorer for authorized
 	// vector retrieval validation. It is intentionally separate from Base:
 	// Base responses are treated as untrusted and validated canonically.
-	VectorScorer       VectorScorer
-	Resolver           auth.Resolver
-	PolicySelector     PolicySelector
-	EdgePolicySelector EdgePolicySelector
-	PolicyStore        PolicyStore
-	GenerationReader   auth.GenerationReader
-	Clock              func() time.Time
+	VectorScorer VectorScorer
+	// InteractionWriter is the explicitly trusted durable sink for
+	// interaction records. It is separate from Base because Base responses
+	// and mutation acknowledgements are not authorization evidence.
+	InteractionWriter explorer.InteractionWriter
+	// InteractionReader is the explicitly trusted source for durable
+	// interaction envelopes. It is intentionally separate from Base because
+	// authorization decisions for derived views depend on the stored source
+	// set and authorization fingerprint.
+	InteractionReader explorer.InteractionReader
+	// SnapshotValidator is the explicitly trusted verifier for historical
+	// corpus frontiers pinned into interaction records.
+	SnapshotValidator SnapshotValidator
+	// OntologyInterpreter is an optional explicitly trusted read-time
+	// interpreter. It is separate from Base because Base graph responses are
+	// untrusted and must never be allowed to inject interpretations.
+	OntologyInterpreter explorer.OntologyInterpreter
+	// OntologyProposalStore is the optional explicitly trusted governance
+	// store. It is separate from Base because proposal state, evidence, and
+	// citation bytes participate in authorization decisions.
+	OntologyProposalStore explorer.OntologyProposalStore
+	Resolver              auth.Resolver
+	PolicySelector        PolicySelector
+	EdgePolicySelector    EdgePolicySelector
+	PolicyStore           PolicyStore
+	GenerationReader      auth.GenerationReader
+	Clock                 func() time.Time
 	// Mosaic optionally enables the sensitivity-domain co-occurrence budget
 	// that defends against the mosaic effect. A zero MaxDomains disables it; a
 	// nonzero MaxDomains requires PolicyStore to implement CoOccurrenceLedger
@@ -58,20 +94,25 @@ type Config struct {
 
 // Client enforces trusted-context authorization around an Explorer client.
 type Client struct {
-	base               explorer.Client
-	vectorScorer       VectorScorer
-	resolver           auth.Resolver
-	policySelector     PolicySelector
-	edgePolicySelector EdgePolicySelector
-	policyStore        PolicyStore
-	generationReader   auth.GenerationReader
-	clock              func() time.Time
-	mosaic             MosaicBudget
-	ledger             CoOccurrenceLedger
-	mutationMu         sync.Mutex
-	vectorMu           sync.Mutex
-	budgetMu           sync.Mutex
-	vectorAvailability authorizedVectorAvailabilityCache
+	base                explorer.Client
+	vectorScorer        VectorScorer
+	interactionSink     explorer.InteractionWriter
+	interactionSource   explorer.InteractionReader
+	snapshotValidator   SnapshotValidator
+	ontologyInterpreter explorer.OntologyInterpreter
+	ontologyProposals   explorer.OntologyProposalStore
+	resolver            auth.Resolver
+	policySelector      PolicySelector
+	edgePolicySelector  EdgePolicySelector
+	policyStore         PolicyStore
+	generationReader    auth.GenerationReader
+	clock               func() time.Time
+	mosaic              MosaicBudget
+	ledger              CoOccurrenceLedger
+	mutationMu          sync.Mutex
+	vectorMu            sync.Mutex
+	budgetMu            sync.Mutex
+	vectorAvailability  authorizedVectorAvailabilityCache
 }
 
 type authorizedVectorAvailabilityCache struct {
@@ -101,6 +142,16 @@ func NewClient(config Config) (*Client, error) {
 	if config.Clock == nil {
 		return nil, dependencyRequired("clock")
 	}
+	hasInteractionWriter := !isNilDependency(config.InteractionWriter)
+	hasInteractionReader := !isNilDependency(config.InteractionReader)
+	hasSnapshotValidator := !isNilDependency(config.SnapshotValidator)
+	if hasInteractionWriter && (!hasInteractionReader || !hasSnapshotValidator) {
+		return nil, dependencyRequired(
+			"trusted interaction writer, reader, and snapshot validator")
+	}
+	if hasSnapshotValidator && !hasInteractionWriter {
+		return nil, dependencyRequired("trusted interaction writer")
+	}
 	edgeSelector := config.EdgePolicySelector
 	if isNilDependency(edgeSelector) {
 		var ok bool
@@ -121,16 +172,21 @@ func NewClient(config Config) (*Client, error) {
 		}
 	}
 	return &Client{
-		base:               config.Base,
-		vectorScorer:       config.VectorScorer,
-		resolver:           config.Resolver,
-		policySelector:     config.PolicySelector,
-		edgePolicySelector: edgeSelector,
-		policyStore:        config.PolicyStore,
-		generationReader:   config.GenerationReader,
-		clock:              config.Clock,
-		mosaic:             config.Mosaic,
-		ledger:             ledger,
+		base:                config.Base,
+		vectorScorer:        config.VectorScorer,
+		interactionSink:     config.InteractionWriter,
+		interactionSource:   config.InteractionReader,
+		snapshotValidator:   config.SnapshotValidator,
+		ontologyInterpreter: config.OntologyInterpreter,
+		ontologyProposals:   config.OntologyProposalStore,
+		resolver:            config.Resolver,
+		policySelector:      config.PolicySelector,
+		edgePolicySelector:  edgeSelector,
+		policyStore:         config.PolicyStore,
+		generationReader:    config.GenerationReader,
+		clock:               config.Clock,
+		mosaic:              config.Mosaic,
+		ledger:              ledger,
 	}, nil
 }
 
@@ -409,10 +465,12 @@ func (c *Client) authorizeLegacySource(
 	if !found {
 		return nil
 	}
-	registration, ok, err := c.policyStore.CurrentRevision(ctx, documentID)
+	currentRevisions, err := c.resolveCurrentRevisions(
+		ctx, []shoal.ID{documentID})
 	if err != nil {
-		return policyCatalogReadError(ctx, err)
+		return err
 	}
+	registration, ok := currentRevisions[documentID]
 	if !ok {
 		return catalogUnavailable()
 	}
@@ -468,6 +526,49 @@ func (c *Client) begin(
 		return auth.Decision{}, auth.GenerationGuard{}, time.Time{}, err
 	}
 	return decision, guard, now, nil
+}
+
+// beginAny authorizes a setup-time operation that is not tied to one specific
+// operation. It still requires a live, in-domain credential and a policy
+// generation guard, but accepts any operation the decision itself grants, so
+// an action-only grant is not rejected the way pinning setup to Retrieve
+// would reject it. A decision that grants nothing is denied.
+func (c *Client) beginAny(ctx context.Context) (auth.GenerationGuard, error) {
+	if err := contextFailure(ctx); err != nil {
+		return auth.GenerationGuard{}, err
+	}
+	decision, err := c.resolver.Resolve(ctx)
+	if err != nil {
+		return auth.GenerationGuard{}, resolverFailure(ctx, err)
+	}
+	now := c.clock()
+	if now.IsZero() {
+		return auth.GenerationGuard{}, authorizationDenied()
+	}
+	request := auth.ResourceRequest{
+		AuthorizationDomain: decision.AuthorizationDomain(),
+	}
+	granted := false
+	for _, operation := range decision.AllowedOperations() {
+		if err := decision.Authorize(operation, request, now); err == nil {
+			granted = true
+			break
+		}
+	}
+	if !granted {
+		if contextErr := contextFailure(ctx); contextErr != nil {
+			return auth.GenerationGuard{}, contextErr
+		}
+		return auth.GenerationGuard{}, authorizationDenied()
+	}
+	guard, err := auth.NewGenerationGuard(decision, c.generationReader)
+	if err != nil {
+		return auth.GenerationGuard{}, authorizationDenied()
+	}
+	if err := guard.Check(ctx); err != nil {
+		return auth.GenerationGuard{}, err
+	}
+	return guard, nil
 }
 
 func (c *Client) selectIngestRule(

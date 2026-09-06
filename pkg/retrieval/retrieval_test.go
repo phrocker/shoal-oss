@@ -284,6 +284,7 @@ func TestResponseRejectsDuplicateEvidenceOrderingKey(t *testing.T) {
 	}); !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
 		t.Fatalf("duplicate evidence ordering key error = %v", err)
 	}
+
 }
 
 func testEvidence(documentID, spanID shoal.ID, score shoal.Score) retrieval.Evidence {

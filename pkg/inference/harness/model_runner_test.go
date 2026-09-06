@@ -425,7 +425,8 @@ func TestModelPromptIncludesPriorEmptyToolDetailsAndBudgets(t *testing.T) {
 	}
 	action = mustRetrieveUsage(t, "retrieved", 1, Usage{InputTokens: 2, OutputTokens: 3})
 	transcript = newTranscript(request)
-	transcript.context, err = addAnchors(transcript.context, result.anchors)
+	transcript.context, err = addAnchors(
+		transcript.context, result.anchors)
 	if err != nil {
 		t.Fatal(err)
 	}

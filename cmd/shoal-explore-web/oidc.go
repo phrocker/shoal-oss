@@ -157,6 +157,7 @@ var oidcReaderOperations = []auth.Operation{
 	auth.OperationConnect,
 	auth.OperationNeighborhood,
 	auth.OperationRetrieve,
+	auth.OperationAnalyticsRead,
 }
 
 // oidcContributorOperations additionally permits ingestion. It matches the
@@ -168,6 +169,7 @@ var oidcContributorOperations = []auth.Operation{
 	auth.OperationConnect,
 	auth.OperationNeighborhood,
 	auth.OperationRetrieve,
+	auth.OperationAnalyticsRead,
 }
 
 // oidcConfig is the operator-supplied, provider-neutral configuration. A

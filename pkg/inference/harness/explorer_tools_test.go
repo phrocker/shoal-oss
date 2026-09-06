@@ -31,6 +31,7 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/graph"
 	"github.com/phrocker/shoal-oss/pkg/inference"
+	"github.com/phrocker/shoal-oss/pkg/ontology"
 	"github.com/phrocker/shoal-oss/pkg/retrieval"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
@@ -169,8 +170,15 @@ func TestExplorerToolHostAllowsFanoutOneMultiHopPath(t *testing.T) {
 
 func TestExplorerToolHostAllowsEmptyRetrieveResult(t *testing.T) {
 	pack, _, _ := fixture(t)
-	client := &boundedClientStub{}
-	host := &ExplorerToolHost{Client: client}
+	client := &boundedClientStub{
+		retrieveResponse: retrieval.Response{},
+		embeddingEvent: explorer.EmbeddingQueryEvent{
+			SpaceIdentities: []string{"candidate-space"},
+			Completed:       []string{"candidate-space"},
+		},
+	}
+	host := &ExplorerToolHost{
+		Client: client, RetrievalModes: []retrieval.Mode{retrieval.ModeVector}}
 	request, err := NewRetrieveRequest("no hits", 1)
 	if err != nil {
 		t.Fatal(err)
@@ -188,6 +196,38 @@ func TestExplorerToolHostAllowsEmptyRetrieveResult(t *testing.T) {
 	}
 	if len(result.Anchors()) != 0 || !client.retrieve.AsOf.Equal(pack.Snapshot().AsOf()) {
 		t.Fatalf("empty retrieve was not pinned and empty: %#v", result)
+	}
+	if got := result.EmbeddingSpaces(); len(got.Identities) != 0 ||
+		got.Digest != "" {
+		t.Fatalf("empty result embedding spaces = %+v", got)
+	}
+}
+
+func TestEmbeddingParticipationCollectorUsesOnlyParticipatingSpaces(t *testing.T) {
+	collector := &embeddingParticipationCollector{}
+	collector.observe(explorer.EmbeddingQueryEvent{
+		SpaceIdentities: []string{"candidate-only", "space-b", "space-a"},
+		Completed:       []string{"candidate-only", "space-b", "space-a"},
+		Participating:   []string{"space-b", "space-a"},
+	})
+	got, err := collector.result(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Identities) != 2 ||
+		got.Identities[0] != "space-a" ||
+		got.Identities[1] != "space-b" ||
+		got.Digest == "" {
+		t.Fatalf("participating embedding spaces = %+v", got)
+	}
+
+	empty := &embeddingParticipationCollector{}
+	empty.observe(explorer.EmbeddingQueryEvent{
+		SpaceIdentities: []string{"candidate-only"},
+		Completed:       []string{"candidate-only"},
+	})
+	if _, err := empty.result(true); err == nil {
+		t.Fatal("scored vector result without participation was accepted")
 	}
 }
 
@@ -394,6 +434,88 @@ func TestGraphAnchorsFromNeighborhoodKeepsMultiHopPaths(t *testing.T) {
 	}
 }
 
+func TestGraphAnchorsFromNeighborhoodPreservesAuthoritativeAssertions(
+	t *testing.T,
+) {
+	evidence, err := ontology.NewEvidenceRef(
+		document.Citation{
+			DocumentID: "document-1", RevisionID: "revision-1",
+			SectionID: "section-1", SpanID: "span-1",
+			Range: document.SourceRange{
+				Start: document.SourcePosition{Offset: 0, Page: 1},
+				End:   document.SourcePosition{Offset: 7, Page: 1},
+			},
+		},
+		"node-a",
+		nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	provenance, err := ontology.NewExtractionProvenance(
+		"provider", "model", "v1", "prompt", "v1", "extractor", "v1", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	concept, err := ontology.NewConceptDefinition(
+		"graph-node", "Graph Node", "A graph node", nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	relationship, err := ontology.NewRelationshipDefinition(
+		"related", "Related", "Relates graph nodes",
+		[]shoal.ID{concept.ID()}, []shoal.ID{concept.ID()}, nil, true, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	value, err := ontology.NewReferenceValue("node-b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, origin := range []ontology.AssertionOrigin{
+		ontology.AssertionExplicit,
+		ontology.AssertionInferred,
+	} {
+		assertion, assertionErr := ontology.NewAssertion(
+			"node-a", relationship.ID(), value, origin, 1,
+			[]ontology.EvidenceRef{evidence}, provenance,
+			shoal.Metadata{"shoal.graph.edge_id": "edge-a-b"},
+		)
+		if assertionErr != nil {
+			t.Fatal(assertionErr)
+		}
+		anchors, anchorErr := graphAnchorsFromNeighborhood(
+			"node-a",
+			explorer.Neighborhood{
+				Nodes: []graph.Node{
+					{ID: "node-a", Kind: "entity"},
+					{ID: "node-b", Kind: "entity"},
+				},
+				Edges: []graph.Edge{{
+					ID: "edge-a-b", From: "node-a", To: "node-b",
+					Type: string(relationship.ID()), Weight: 1,
+				}},
+				Assertions: []ontology.Assertion{assertion},
+			},
+			1,
+			1,
+		)
+		if anchorErr != nil {
+			t.Fatal(anchorErr)
+		}
+		reference, referenceErr := anchors[0].EvidenceReference()
+		if referenceErr != nil {
+			t.Fatal(referenceErr)
+		}
+		if len(reference.Assertions) != 1 ||
+			reference.Assertions[0].AssertionID != assertion.ID() ||
+			reference.Assertions[0].EdgeID != "edge-a-b" ||
+			reference.Assertions[0].Origin != origin {
+			t.Fatalf("%s assertion reference = %#v", origin, reference.Assertions)
+		}
+	}
+}
+
 func TestGraphAnchorsFromNeighborhoodBoundsCyclicPaths(t *testing.T) {
 	anchors, err := graphAnchorsFromNeighborhood("node-a", explorer.Neighborhood{
 		Nodes: []graph.Node{
@@ -522,6 +644,7 @@ type boundedClientStub struct {
 	last              explorer.BoundedNeighborhoodRequest
 	retrieve          retrieval.Request
 	retrieveResponse  retrieval.Response
+	embeddingEvent    explorer.EmbeddingQueryEvent
 	snapshot          explorer.Snapshot
 	boundedResponse   explorer.BoundedNeighborhood
 	neighborhoodCalls int
@@ -533,8 +656,9 @@ type unavailableBoundedClient struct {
 
 func (*unavailableBoundedClient) BoundedAvailable() bool { return false }
 
-func (b *boundedClientStub) Retrieve(_ context.Context, request retrieval.Request) (retrieval.Response, error) {
+func (b *boundedClientStub) Retrieve(ctx context.Context, request retrieval.Request) (retrieval.Response, error) {
 	b.retrieve = request
+	explorer.ReportEmbeddingQueryEvent(ctx, b.embeddingEvent)
 	return b.retrieveResponse, nil
 }
 

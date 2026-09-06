@@ -30,8 +30,10 @@ import (
 	"time"
 
 	"github.com/phrocker/shoal-oss/pkg/explorer"
+	exploreranalytics "github.com/phrocker/shoal-oss/pkg/explorer/analytics"
 	"github.com/phrocker/shoal-oss/pkg/explorer/authorized"
 	"github.com/phrocker/shoal-oss/pkg/graph"
+	"github.com/phrocker/shoal-oss/pkg/interaction"
 	"github.com/phrocker/shoal-oss/pkg/ontology"
 	"github.com/phrocker/shoal-oss/pkg/retrieval"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
@@ -165,10 +167,12 @@ type changeFeedBackend interface {
 
 // EmbeddedService adapts the public Explorer client to the workspace service.
 type EmbeddedService struct {
-	client          explorer.BoundedClient
-	ontologyMu      sync.RWMutex
-	ontologyVersion *ontology.OntologyVersion
-	clock           func() time.Time
+	client            explorer.BoundedClient
+	analytics         *exploreranalytics.Service
+	ontologyMu        sync.RWMutex
+	ontologyPublishMu sync.Mutex
+	ontologyVersion   *ontology.OntologyVersion
+	clock             func() time.Time
 }
 
 // NewEmbeddedService creates a local service without exposing the embedded
@@ -177,7 +181,40 @@ func NewEmbeddedService(client explorer.BoundedClient) (*EmbeddedService, error)
 	if client == nil {
 		return nil, shoal.NewError(shoal.ErrorInvalidArgument, "explorer client is required")
 	}
-	return &EmbeddedService{client: client, clock: time.Now}, nil
+	service := &EmbeddedService{client: client, clock: time.Now}
+	if materializer, ok := client.(exploreranalytics.Materializer); ok {
+		sinkProvider, ok := client.(interface {
+			AnalyticsInteractionSink() interaction.ResultSink
+		})
+		if !ok {
+			return service, nil
+		}
+		sink := sinkProvider.AnalyticsInteractionSink()
+		if sink == nil {
+			return service, nil
+		}
+		sharedRecorder, err := interaction.NewRecorder(
+			context.Background(), sink)
+		if err != nil {
+			return nil, err
+		}
+		recorder, err := exploreranalytics.NewInteractionRecorder(
+			sharedRecorder, service.clock)
+		if err != nil {
+			return nil, err
+		}
+		analyticsService, err := exploreranalytics.NewService(
+			exploreranalytics.Config{
+				Source: materializer, Limits: exploreranalytics.DefaultLimits(),
+				Recorder: recorder, RequireRecording: true,
+			},
+		)
+		if err != nil {
+			return nil, err
+		}
+		service.analytics = analyticsService
+	}
+	return service, nil
 }
 
 func (s *EmbeddedService) Capabilities(ctx context.Context) (Capabilities, error) {
@@ -189,6 +226,7 @@ func (s *EmbeddedService) Capabilities(ctx context.Context) (Capabilities, error
 	if !s.ChangesAvailable() {
 		capabilities.Changes = false
 	}
+	capabilities.Analytics = s.AnalyticsAvailable()
 	provider, ok := s.client.(vectorAvailabilityProvider)
 	if !ok {
 		return capabilities, nil
@@ -242,7 +280,7 @@ func (s *EmbeddedService) Extract(
 	if _, err := s.pin(ctx, request.Snapshot); err != nil {
 		return ExtractResponse{}, err
 	}
-	version, configured, err := s.ActiveOntology(ctx)
+	version, configured, err := s.activeOntologyForMutation(ctx)
 	if err != nil {
 		return ExtractResponse{}, err
 	}
@@ -707,6 +745,8 @@ func (s *EmbeddedService) Neighborhood(
 	}
 	response := NeighborhoodResponse{
 		Snapshot: snapshot, Neighborhood: result.Neighborhood,
+		OntologyInterpretations: ontologyInterpretationReports(
+			result.Neighborhood.Interpretations),
 		Truncated: result.Truncated,
 	}
 	if result.Continuation {
@@ -714,6 +754,41 @@ func (s *EmbeddedService) Neighborhood(
 			snapshot.ID, normalizedRequest, result.NextAfterEdgeID)
 	}
 	return response, nil
+}
+
+func ontologyInterpretationReports(
+	values []ontology.AssertionInterpretation,
+) []OntologyInterpretationReport {
+	if len(values) == 0 {
+		return nil
+	}
+	out := make([]OntologyInterpretationReport, 0, len(values))
+	for _, value := range values {
+		original := value.Original()
+		originalSubject, _ := original.SubjectType()
+		originalObject, _ := original.ObjectType()
+		subject, _ := value.SubjectType()
+		object, _ := value.ObjectType()
+		applied := value.AppliedMorphisms()
+		appliedStrings := make([]string, len(applied))
+		for i, id := range applied {
+			appliedStrings[i] = encodeID(id)
+		}
+		reader := value.Reader()
+		out = append(out, OntologyInterpretationReport{
+			AssertionID: encodeID(original.ID()),
+			SchemaID:    encodeID(reader.SchemaID()), VersionID: encodeID(reader.VersionID()),
+			Reading: value.Reading(), Status: value.Status(),
+			OriginalSubjectType: encodeOptionalID(originalSubject),
+			SubjectType:         encodeOptionalID(subject),
+			OriginalPredicate:   encodeID(original.Predicate()),
+			Predicate:           encodeID(value.Predicate()),
+			OriginalObjectType:  encodeOptionalID(originalObject),
+			ObjectType:          encodeOptionalID(object),
+			AppliedMorphisms:    appliedStrings, Reason: value.Reason(),
+		})
+	}
+	return out
 }
 
 func (s *EmbeddedService) Path(
@@ -763,10 +838,34 @@ func (s *EmbeddedService) Path(
 	if err := s.confirmSnapshot(ctx, snapshot); err != nil {
 		return PathResponse{}, err
 	}
+	assertions := assertionsForPath(path, bounded.Neighborhood.Assertions)
 	return PathResponse{
 		Snapshot: snapshot, Path: path,
-		Assertions: assertionsForPath(path, bounded.Neighborhood.Assertions),
+		Assertions: assertions,
+		OntologyInterpretations: ontologyInterpretationReports(
+			interpretationsForAssertions(
+				assertions, bounded.Neighborhood.Interpretations)),
 	}, nil
+}
+
+func interpretationsForAssertions(
+	assertions []ontology.Assertion,
+	interpretations []ontology.AssertionInterpretation,
+) []ontology.AssertionInterpretation {
+	if len(assertions) == 0 || len(interpretations) == 0 {
+		return nil
+	}
+	selected := make(map[shoal.ID]struct{}, len(assertions))
+	for _, assertion := range assertions {
+		selected[assertion.ID()] = struct{}{}
+	}
+	out := make([]ontology.AssertionInterpretation, 0, len(assertions))
+	for _, interpretation := range interpretations {
+		if _, ok := selected[interpretation.Original().ID()]; ok {
+			out = append(out, interpretation)
+		}
+	}
+	return out
 }
 
 func (s *EmbeddedService) pin(

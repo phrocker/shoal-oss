@@ -560,6 +560,7 @@ func (s *Server) authorizedContext(ctx context.Context) (context.Context, error)
 		return nil, shoal.NewError(
 			shoal.ErrorUnavailable, "request identity unavailable")
 	}
+	selectedOntology, _ := template.SelectedOntology()
 	decision, err := auth.NewDecision(auth.DecisionConfig{
 		Subject:                template.Subject(),
 		Actor:                  template.Actor(),
@@ -576,6 +577,7 @@ func (s *Server) authorizedContext(ctx context.Context) (context.Context, error)
 		AuditPurpose:           template.AuditPurpose(),
 		ServiceRole:            template.ServiceRole(),
 		ServiceCeilingIdentity: template.ServiceCeilingIdentity(),
+		SelectedOntology:       selectedOntology,
 	})
 	if err != nil {
 		return nil, shoal.NewError(shoal.ErrorUnauthorized, "authorization denied")

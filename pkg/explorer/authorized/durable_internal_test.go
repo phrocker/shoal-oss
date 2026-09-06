@@ -67,13 +67,10 @@ func seedDurableStore(t *testing.T, store *DurablePolicyStore) {
 	}
 }
 
-// TestDurablePolicyStoreReloadPreservesBatchedNodeAndEdgeSemantics reopens a
-// persisted store and proves the reconstructed catalog answers a batched Nodes
-// and Edges request exactly as a point-by-point Node/Edge loop would — the
-// batched, fully-interleaved semantics PR #281 introduced and this store must
-// preserve. It asserts on the observable round-trip result, not on internal
-// call counts.
-func TestDurablePolicyStoreReloadPreservesBatchedNodeAndEdgeSemantics(t *testing.T) {
+// TestDurablePolicyStoreReloadPreservesBatchSemantics reopens a persisted
+// store and proves the reconstructed catalog answers batched revision, node,
+// and edge requests exactly as their point-by-point loops would.
+func TestDurablePolicyStoreReloadPreservesBatchSemantics(t *testing.T) {
 	dir := t.TempDir()
 	store, err := OpenDurablePolicyStore(dir)
 	if err != nil {
@@ -89,6 +86,36 @@ func TestDurablePolicyStoreReloadPreservesBatchedNodeAndEdgeSemantics(t *testing
 	}
 	defer reopened.Close()
 	ctx := context.Background()
+
+	requestedDocuments := []shoal.ID{"document", "document", "unregistered"}
+	batchRevisions, err := reopened.CurrentRevisions(ctx, requestedDocuments)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expectedRevisions := make(map[shoal.ID]RevisionRegistration)
+	for _, documentID := range requestedDocuments {
+		registration, ok, err := reopened.CurrentRevision(ctx, documentID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !ok {
+			if _, present := batchRevisions[documentID]; present {
+				t.Fatalf(
+					"batch reported unregistered document %q after reload",
+					documentID)
+			}
+			continue
+		}
+		expectedRevisions[documentID] = registration
+	}
+	if !reflect.DeepEqual(batchRevisions, expectedRevisions) {
+		t.Fatalf("reloaded revision batch = %#v, want %#v",
+			batchRevisions, expectedRevisions)
+	}
+	if len(batchRevisions) != 1 {
+		t.Fatalf("reloaded revision batch = %#v, want one document",
+			batchRevisions)
+	}
 
 	requestedNodes := []shoal.ID{"document", "node-a", "node-a", "unregistered"}
 	batchNodes, err := reopened.Nodes(ctx, requestedNodes)
@@ -174,10 +201,20 @@ func TestDurablePolicyStoreReloadRejectsInvalidBatchInput(t *testing.T) {
 	); !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
 		t.Fatalf("empty edge identifier error = %v", err)
 	}
+	if _, err := reopened.CurrentRevisions(
+		context.Background(), []shoal.ID{"document", ""},
+	); !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
+		t.Fatalf("empty document identifier error = %v", err)
+	}
 	cancelled, cancel := context.WithCancel(context.Background())
 	cancel()
 	if _, err := reopened.Nodes(cancelled, []shoal.ID{"document"}); err == nil {
 		t.Fatal("cancelled context batch lookup succeeded")
+	}
+	if _, err := reopened.CurrentRevisions(
+		cancelled, []shoal.ID{"document"},
+	); err == nil {
+		t.Fatal("cancelled context revision batch lookup succeeded")
 	}
 }
 
