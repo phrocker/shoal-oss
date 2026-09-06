@@ -920,7 +920,8 @@ func (r *Runtime) expectedHeadResolution(
 	foundExpected := false
 	busy := false
 	for _, expected := range intent.Guards {
-		if expected.Mode != guard.ModeMutate &&
+		if expected.Mode != guard.ModeAbsentOrIdentical &&
+			expected.Mode != guard.ModeMutate &&
 			expected.Mode != guard.ModeRetire {
 			continue
 		}
@@ -929,9 +930,15 @@ func (r *Runtime) expectedHeadResolution(
 		if err != nil {
 			return false, false, err
 		}
-		if head == nil || head.Epoch != expected.ExpectedEpoch ||
-			head.LogicalDigest != expected.ExpectedDigest {
-			return true, false, nil
+		if expected.Mode == guard.ModeAbsentOrIdentical {
+			if head != nil {
+				return true, false, nil
+			}
+		} else {
+			if head == nil || head.Epoch != expected.ExpectedEpoch ||
+				head.LogicalDigest != expected.ExpectedDigest {
+				return true, false, nil
+			}
 		}
 		if pending != nil && pending.Active &&
 			!bytes.Equal(pending.Intent.TXN, txn) {

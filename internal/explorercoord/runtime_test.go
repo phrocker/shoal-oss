@@ -715,6 +715,56 @@ func TestRecordPublicationUsesStableDocumentExpectedHead(t *testing.T) {
 	}
 }
 
+func TestConcurrentFirstDocumentPublicationsResolveWithoutIndeterminate(t *testing.T) {
+	config := testRuntimeConfig(t, testDirectory(t))
+	runtime, err := Open(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	left := testRecordPublication("new-document", "revision-a", "left", nil)
+	right := testRecordPublication("new-document", "revision-b", "right", nil)
+	errs := make(chan error, 2)
+	var wait sync.WaitGroup
+	for _, request := range []explorer.RecordPublication{left, right} {
+		request := request
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			_, err := runtime.PublishRecord(context.Background(), request)
+			errs <- err
+		}()
+	}
+	wait.Wait()
+	close(errs)
+	successes, conflicts := 0, 0
+	for err := range errs {
+		switch {
+		case err == nil:
+			successes++
+		case errors.Is(err, transaction.ErrConflict) &&
+			!explorer.IsIndeterminateCommit(err):
+			conflicts++
+		default:
+			t.Fatalf("unexpected first-publication result: %v", err)
+		}
+	}
+	if successes != 1 || conflicts != 1 {
+		t.Fatalf("first publications successes=%d conflicts=%d", successes, conflicts)
+	}
+	if err := runtime.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(config)
+	if err != nil {
+		t.Fatalf("reopen after first-publication conflict = %v", err)
+	}
+	defer reopened.Close()
+	candidates, _, err := reopened.intents.Candidates(context.Background(), nil, 1)
+	if err != nil || len(candidates) != 0 {
+		t.Fatalf("pending first-publication candidates = %#v, %v", candidates, err)
+	}
+}
+
 func TestExplorerLoadHidesUncommittedAndPoisonedPhysicalRevision(t *testing.T) {
 	directory := testDirectory(t)
 	config := testRuntimeConfig(t, directory)
