@@ -68,3 +68,14 @@ func TestDefaultEmbeddingRejectsPartialStateAndBufferedRelabel(t *testing.T) {
 		t.Fatalf("SetDefaultEmbedding buffered relabel error = %v", err)
 	}
 }
+
+func TestUniqueCompactionBaseAvoidsExistingOutputNames(t *testing.T) {
+	const extension = ".rf"
+	existing := map[string]struct{}{
+		"C0000000000100-000.rf": {},
+		"C0000000000101-001.rf": {},
+	}
+	if got := uniqueCompactionBase(100, 2, extension, existing); got != 102 {
+		t.Fatalf("unique base = %d, want 102", got)
+	}
+}

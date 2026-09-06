@@ -778,7 +778,16 @@ func (t *Tablet) Compact(stack []iterrt.IterSpec) error {
 			_ = removeObject(t.backend, output.path)
 		}
 	}
-	base := time.Now().UnixMilli()
+	existingNames := cloneObsolete(t.obsolete)
+	for _, path := range t.files {
+		existingNames[filepath.Base(path)] = struct{}{}
+	}
+	base := uniqueCompactionBase(
+		time.Now().UnixMilli(),
+		len(groupKeys),
+		t.opts.FileFormat.extension(),
+		existingNames,
+	)
 	for index, key := range groupKeys {
 		group := groupsByState[key]
 		result, err := compaction.Compact(compaction.Spec{
@@ -853,6 +862,28 @@ func (t *Tablet) Compact(stack []iterrt.IterSpec) error {
 	}
 
 	return nil
+}
+
+func uniqueCompactionBase(
+	base int64,
+	outputs int,
+	extension string,
+	existing map[string]struct{},
+) int64 {
+	for {
+		collision := false
+		for index := 0; index < outputs; index++ {
+			name := fmt.Sprintf("C%013d-%03d%s", base, index, extension)
+			if _, found := existing[name]; found {
+				collision = true
+				break
+			}
+		}
+		if !collision {
+			return base
+		}
+		base++
+	}
 }
 
 func embeddingStateFromImage(
