@@ -199,16 +199,54 @@ func (ix *IvfIndex) SearchInSpace(
 		if err != nil {
 			return nil, fmt.Errorf("agentmem: scan IVF cluster %d: %w", c, err)
 		}
+		type posting struct {
+			code       []byte
+			version    int32
+			hasVersion bool
+		}
+		postings := make(map[string]*posting)
 		for _, cell := range cells {
-			if string(cell.ColumnFamily) != ivfpq.ColFam || string(cell.ColumnQualifier) != ivfpq.QualPQCode {
+			if string(cell.ColumnFamily) != ivfpq.ColFam {
 				continue
 			}
-			vid := ivfpq.ExtractVertexID(string(cell.Row))
+			row := string(cell.Row)
+			entry := postings[row]
+			if entry == nil {
+				entry = &posting{}
+				postings[row] = entry
+			}
+			switch string(cell.ColumnQualifier) {
+			case ivfpq.QualPQCode:
+				entry.code = append([]byte(nil), cell.Value...)
+			case ivfpq.QualCodebookVersion:
+				value, err := strconv.Atoi(strings.TrimSpace(string(cell.Value)))
+				if err != nil {
+					continue
+				}
+				entry.version = int32(value)
+				entry.hasVersion = true
+			}
+		}
+		rows := make([]string, 0, len(postings))
+		for row := range postings {
+			rows = append(rows, row)
+		}
+		sort.Strings(rows)
+		for _, row := range rows {
+			entry := postings[row]
+			if !entry.hasVersion ||
+				entry.version != ix.version ||
+				len(entry.code) == 0 {
+				continue
+			}
+			vid := ivfpq.ExtractVertexID(row)
 			if seen[vid] {
 				continue
 			}
 			seen[vid] = true
-			hits = append(hits, scored{row: vid, score: ix.pq.Dot(cell.Value, ipTable)})
+			hits = append(hits, scored{
+				row: vid, score: ix.pq.Dot(entry.code, ipTable),
+			})
 		}
 	}
 
