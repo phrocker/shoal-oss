@@ -122,10 +122,15 @@ func NewClient(config Config) (*Client, error) {
 		return nil, dependencyRequired("clock")
 	}
 	hasInteractionWriter := !isNilDependency(config.InteractionWriter)
+	hasInteractionReader := !isNilDependency(config.InteractionReader)
 	hasSnapshotValidator := !isNilDependency(config.SnapshotValidator)
-	if hasInteractionWriter != hasSnapshotValidator {
+	if hasInteractionWriter &&
+		(!hasInteractionReader || !hasSnapshotValidator) {
 		return nil, dependencyRequired(
-			"trusted interaction writer and snapshot validator")
+			"trusted interaction writer, reader, and snapshot validator")
+	}
+	if hasSnapshotValidator && !hasInteractionWriter {
+		return nil, dependencyRequired("trusted interaction writer")
 	}
 	edgeSelector := config.EdgePolicySelector
 	if isNilDependency(edgeSelector) {

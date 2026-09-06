@@ -594,7 +594,7 @@ func (e *Explorer) Connect(ctx context.Context, edge graph.Edge) error {
 	sort.Slice(e.incoming[edge.To], func(i, j int) bool {
 		return shoal.CompareID(e.incoming[edge.To][i], e.incoming[edge.To][j]) < 0
 	})
-	e.refreshSnapshotLocked()
+	e.refreshTrustedSnapshotLocked()
 	return nil
 }
 
@@ -958,8 +958,7 @@ func (e *Explorer) rebuildCurrentGraphLocked() error {
 	e.outgoing, e.incoming = outgoing, incoming
 	e.graphErr = nil
 	e.graphInitialized = true
-	e.refreshSnapshotLocked()
-	e.snapshotHistory[e.snapshot.ID] = e.snapshot.AsOf
+	e.refreshTrustedSnapshotLocked()
 	return nil
 }
 

@@ -381,6 +381,13 @@ func (e *Explorer) refreshSnapshotLocked() {
 	}
 }
 
+func (e *Explorer) refreshTrustedSnapshotLocked() {
+	e.refreshSnapshotLocked()
+	if e.snapshotHistory != nil {
+		e.snapshotHistory[e.snapshot.ID] = e.snapshot.AsOf
+	}
+}
+
 type snapshotWriter interface {
 	Write([]byte) (int, error)
 }

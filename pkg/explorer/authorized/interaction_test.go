@@ -21,6 +21,7 @@ package authorized_test
 
 import (
 	"context"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -77,6 +78,18 @@ type countingInteractionBase struct {
 	*explorer.Explorer
 	recordCalls  int
 	recordsCalls int
+}
+
+type rejectingSnapshotValidator struct {
+	calls int
+}
+
+func (v *rejectingSnapshotValidator) ValidateSnapshot(
+	context.Context, shoal.ID, time.Time,
+) error {
+	v.calls++
+	return shoal.NewError(
+		shoal.ErrorConflict, "historical snapshot registry unavailable")
 }
 
 func (b *countingInteractionBase) InteractionRecord(
@@ -456,6 +469,62 @@ func TestAuthorizedInteractionAcceptsTrustedHistoricalSnapshot(t *testing.T) {
 		f.context(t, decision), session,
 	); err != nil {
 		t.Fatalf("trusted historical snapshot was rejected: %v", err)
+	}
+}
+
+func TestAuthorizedExactRetryUsesTrustedDurableRecord(t *testing.T) {
+	f := newFixture(t)
+	snapshot, err := f.base.Snapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.clock.Set(snapshot.AsOf.Add(time.Second))
+	decision := f.decision(
+		t, "retry-recorder",
+		[][]byte{f.sourceA}, [][]byte{f.policyA},
+		[]auth.Operation{auth.OperationRetrieve},
+	)
+	fingerprint, err := auth.AuthorizationFingerprint(decision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := interaction.Session{
+		ID:         interaction.DerivedID("session", "authorized-retry"),
+		RecordedAt: f.clock.Now(), Operation: interaction.OperationRetrieval,
+		SnapshotID: shoal.ID(snapshot.ID), SnapshotAsOf: snapshot.AsOf,
+		AuthorizationFingerprint: shoal.ID(fingerprint.String()),
+		AuthorizationExpiresAt:   decision.AuthenticationExpires(),
+	}
+	ctx := f.context(t, decision)
+	first, err := f.clientA.RecordInteractionResult(ctx, session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	selector, err := authorized.NewStaticPolicySelector(f.sourceA, f.policyA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	validator := &rejectingSnapshotValidator{}
+	retryClient, err := authorized.NewClient(authorized.Config{
+		Base: f.base, VectorScorer: f.base,
+		InteractionWriter: f.base, InteractionReader: f.base,
+		SnapshotValidator: validator,
+		Resolver:          f.authority.Resolver(), PolicySelector: selector,
+		PolicyStore: f.store, GenerationReader: f.reader, Clock: f.clock.Now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	retried, err := retryClient.RecordInteractionResult(ctx, session)
+	if err != nil {
+		t.Fatalf("exact durable retry was rejected: %v", err)
+	}
+	if !reflect.DeepEqual(retried, first) {
+		t.Fatalf("retry result differs: got %+v want %+v", retried, first)
+	}
+	if validator.calls != 0 {
+		t.Fatalf("exact retry consulted snapshot validator %d times",
+			validator.calls)
 	}
 }
 

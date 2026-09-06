@@ -86,17 +86,6 @@ func (c *Client) recordInteraction(
 	if !interactionPinMatchesDecision(canonical, decision, now) {
 		return interaction.Session{}, authorizationDenied()
 	}
-	if isNilDependency(c.snapshotValidator) {
-		return interaction.Session{}, shoal.NewError(
-			shoal.ErrorUnavailable,
-			"trusted interaction snapshot validator is unavailable",
-		)
-	}
-	if err := c.snapshotValidator.ValidateSnapshot(
-		ctx, canonical.SnapshotID, canonical.SnapshotAsOf,
-	); err != nil {
-		return interaction.Session{}, directBaseError(err)
-	}
 	canonical.Actor = interaction.ActorContext{
 		SubjectID:  decision.Subject(),
 		ActorID:    decision.Actor(),
@@ -119,6 +108,45 @@ func (c *Client) recordInteraction(
 		ctx, canonical.TouchedNodeIDs(), decision, auth.OperationRetrieve, now,
 	); err != nil {
 		return interaction.Session{}, err
+	}
+	reader, err := c.interactionReader()
+	if err != nil {
+		return interaction.Session{}, err
+	}
+	existing, readErr := reader.InteractionRecord(ctx, canonical.ID)
+	switch {
+	case readErr == nil:
+		if existing.Summary.Deleted || existing.Session.ID == "" {
+			return interaction.Session{}, shoal.NewError(
+				shoal.ErrorConflict,
+				"interaction session ID is not available for an exact retry",
+			)
+		}
+		existingCanonical, canonicalErr := existing.Session.Canonical()
+		if canonicalErr != nil ||
+			!reflect.DeepEqual(existingCanonical, canonical) {
+			return interaction.Session{}, shoal.NewError(
+				shoal.ErrorConflict,
+				"interaction session ID already exists with different content",
+			)
+		}
+		if err := guard.Check(ctx); err != nil {
+			return interaction.Session{}, err
+		}
+		return existingCanonical, nil
+	case !shoal.IsErrorCode(readErr, shoal.ErrorNotFound):
+		return interaction.Session{}, directBaseError(readErr)
+	}
+	if isNilDependency(c.snapshotValidator) {
+		return interaction.Session{}, shoal.NewError(
+			shoal.ErrorUnavailable,
+			"trusted interaction snapshot validator is unavailable",
+		)
+	}
+	if err := c.snapshotValidator.ValidateSnapshot(
+		ctx, canonical.SnapshotID, canonical.SnapshotAsOf,
+	); err != nil {
+		return interaction.Session{}, directBaseError(err)
 	}
 	if err := guard.Check(ctx); err != nil {
 		return interaction.Session{}, err
