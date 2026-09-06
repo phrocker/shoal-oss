@@ -162,6 +162,11 @@ func (e *Explorer) FoldInteractions(
 	if err != nil {
 		return FoldResult{}, err
 	}
+	if _, exists := e.folds[subgraph.ID]; !exists {
+		if err := e.reconcilePersistedFoldLocked(subgraph.ID); err != nil {
+			return FoldResult{}, err
+		}
+	}
 	if existing, ok := e.folds[subgraph.ID]; ok {
 		return foldIdempotentResult(*existing, subgraph)
 	}
@@ -377,6 +382,9 @@ func (e *Explorer) DeleteFold(
 		return interaction.Tombstone{}, err
 	}
 	if err := e.requireWritableLocked(); err != nil {
+		return interaction.Tombstone{}, err
+	}
+	if err := e.reconcilePersistedFoldLocked(foldID); err != nil {
 		return interaction.Tombstone{}, err
 	}
 	existing, ok := e.folds[foldID]

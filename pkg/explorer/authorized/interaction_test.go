@@ -389,6 +389,16 @@ func TestAuthorizedInteractionRecorderRejectsWrongPin(t *testing.T) {
 	); !shoal.IsErrorCode(err, shoal.ErrorConflict) {
 		t.Fatalf("forged snapshot record = %v", err)
 	}
+	session.ID = "session-expired-pin"
+	session.SnapshotID = shoal.ID(snapshot.ID)
+	session.SnapshotAsOf = snapshot.AsOf
+	session.RecordedAt = snapshot.AsOf
+	session.AuthorizationExpiresAt = snapshot.AsOf.Add(500 * time.Millisecond)
+	if err := f.clientA.RecordInteraction(
+		ctx, session,
+	); !shoal.IsErrorCode(err, shoal.ErrorUnauthorized) {
+		t.Fatalf("expired authorization pin record = %v", err)
+	}
 }
 
 func TestAuthorizedTombstoneSubgraphDoesNotLeakExistence(t *testing.T) {

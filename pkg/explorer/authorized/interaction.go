@@ -83,7 +83,7 @@ func (c *Client) recordInteraction(
 	if err != nil {
 		return interaction.Session{}, err
 	}
-	if !interactionPinMatchesDecision(canonical, decision) {
+	if !interactionPinMatchesDecision(canonical, decision, now) {
 		return interaction.Session{}, authorizationDenied()
 	}
 	bounded, err := c.boundedBase()
@@ -400,13 +400,16 @@ func interactionSourcesAllow(
 }
 
 func interactionPinMatchesDecision(
-	session interaction.Session, decision auth.Decision,
+	session interaction.Session, decision auth.Decision, now time.Time,
 ) bool {
 	fingerprint, err := auth.AuthorizationFingerprint(decision)
 	if err != nil {
 		return false
 	}
+	// A runtime pin may deliberately be shorter than its enclosing credential,
+	// but it must still be live now and may never outlive that credential.
 	return session.AuthorizationFingerprint == shoal.ID(fingerprint.String()) &&
+		now.Before(session.AuthorizationExpiresAt) &&
 		!decision.AuthenticationExpires().Before(session.AuthorizationExpiresAt)
 }
 

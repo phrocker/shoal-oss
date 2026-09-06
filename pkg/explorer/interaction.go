@@ -176,6 +176,11 @@ func (e *Explorer) RecordInteraction(
 	if err := e.ensureGraphLocked(); err != nil {
 		return err
 	}
+	if _, exists := e.interactions[session.ID]; !exists {
+		if err := e.reconcilePersistedInteractionLocked(session.ID); err != nil {
+			return err
+		}
+	}
 	if existing, ok := e.interactions[session.ID]; ok {
 		if existing.Deleted {
 			return shoal.NewError(
@@ -324,6 +329,122 @@ func (e *Explorer) reserveInteractionRecordGraphIDsLocked(
 	e.interactionNodeIDs[interaction.TombstoneID(recordID)] = struct{}{}
 }
 
+func (e *Explorer) reconcilePersistedInteractionLocked(
+	sessionID shoal.ID,
+) error {
+	record, found, err := e.lookupPersistedInteraction(sessionID)
+	if err != nil || !found {
+		return err
+	}
+	if current, ok := e.interactions[sessionID]; ok {
+		if persistedInteractionsEqual(*current, record) ||
+			(current.Deleted && !record.Deleted) {
+			return nil
+		}
+		if !current.Deleted && !record.Deleted {
+			return shoal.NewError(
+				shoal.ErrorConflict,
+				"durable interaction session has different live content",
+			)
+		}
+	}
+	copy := record
+	e.reserveInteractionRecordGraphIDsLocked(
+		copy.SessionID, copy.Nodes, copy.Edges)
+	e.interactions[sessionID] = &copy
+	if err := e.rebuildCurrentGraphLocked(); err != nil {
+		return MarkCommittedInteraction(err)
+	}
+	return nil
+}
+
+func (e *Explorer) reconcilePersistedFoldLocked(foldID shoal.ID) error {
+	record, found, err := e.lookupPersistedFold(foldID)
+	if err != nil || !found {
+		return err
+	}
+	if current, ok := e.folds[foldID]; ok {
+		if persistedFoldsEqual(*current, record) ||
+			(current.Deleted && !record.Deleted) {
+			return nil
+		}
+		if !current.Deleted && !record.Deleted {
+			return shoal.NewError(
+				shoal.ErrorConflict,
+				"durable fold has different live content",
+			)
+		}
+	}
+	copy := record
+	e.reserveInteractionRecordGraphIDsLocked(
+		copy.FoldID, copy.Nodes, copy.Edges)
+	e.folds[foldID] = &copy
+	if err := e.rebuildCurrentGraphLocked(); err != nil {
+		return MarkCommittedInteraction(err)
+	}
+	return nil
+}
+
+func persistedInteractionsEqual(
+	left, right persistedInteraction,
+) bool {
+	switch {
+	case left.Session.ID == "" && right.Session.ID == "":
+	case left.Session.ID == "" || right.Session.ID == "":
+		return false
+	default:
+		leftSession, leftErr := left.Session.Canonical()
+		rightSession, rightErr := right.Session.Canonical()
+		if leftErr != nil || rightErr != nil {
+			return false
+		}
+		left.Session = leftSession
+		right.Session = rightSession
+	}
+	if len(left.Nodes) == 0 {
+		left.Nodes = nil
+	}
+	if len(right.Nodes) == 0 {
+		right.Nodes = nil
+	}
+	if len(left.Edges) == 0 {
+		left.Edges = nil
+	}
+	if len(right.Edges) == 0 {
+		right.Edges = nil
+	}
+	return reflect.DeepEqual(left, right)
+}
+
+func persistedFoldsEqual(left, right persistedFold) bool {
+	leftFold, leftErr := (interaction.Fold{
+		Members: left.Members, SummaryDigest: left.SummaryDigest,
+		FoldedAt: left.FoldedAt,
+	}).Canonical()
+	rightFold, rightErr := (interaction.Fold{
+		Members: right.Members, SummaryDigest: right.SummaryDigest,
+		FoldedAt: right.FoldedAt,
+	}).Canonical()
+	if leftErr != nil || rightErr != nil {
+		return false
+	}
+	left.Members = leftFold.Members
+	right.Members = rightFold.Members
+	if len(left.Nodes) == 0 {
+		left.Nodes = nil
+	}
+	if len(right.Nodes) == 0 {
+		right.Nodes = nil
+	}
+	if len(left.Edges) == 0 {
+		left.Edges = nil
+	}
+	if len(right.Edges) == 0 {
+		right.Edges = nil
+	}
+	return reflect.DeepEqual(left, right)
+}
+
 // RecordInteractionResult records a session and returns the exact canonical
 // value accepted for persistence. The returned value is independently owned.
 func (e *Explorer) RecordInteractionResult(
@@ -359,6 +480,9 @@ func (e *Explorer) DeleteInteraction(
 		return interaction.Tombstone{}, err
 	}
 	if err := e.requireWritableLocked(); err != nil {
+		return interaction.Tombstone{}, err
+	}
+	if err := e.reconcilePersistedInteractionLocked(sessionID); err != nil {
 		return interaction.Tombstone{}, err
 	}
 	existing, ok := e.interactions[sessionID]

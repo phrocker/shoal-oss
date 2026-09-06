@@ -363,21 +363,37 @@ func (e *Explorer) VectorEmbeddingSpaceIDs(
 		return []shoal.ID{id}, nil
 	}
 	spaces := make(map[shoal.ID]struct{})
+	embeddingMaps := make(
+		map[documentRevisionKey]map[shoal.ID]persistedSpanEmbedding)
+	spanMaps := make(map[documentRevisionKey]map[shoal.ID]document.Span)
 	for _, citation := range request.Citations {
-		record := e.documents[citation.DocumentID][citation.RevisionID]
+		key := documentRevisionKey{
+			documentID: citation.DocumentID,
+			revisionID: citation.RevisionID,
+		}
+		record := e.documents[key.documentID][key.revisionID]
 		if record == nil || record.Embeddings == nil {
 			return nil, shoal.NewError(
 				shoal.ErrorUnavailable,
 				"vector scoring requires embeddings for every cited span",
 			)
 		}
-		embeddings, err := recordEmbeddingMap(record)
-		if err != nil {
-			return nil, err
+		embeddings := embeddingMaps[key]
+		if embeddings == nil {
+			var err error
+			embeddings, err = recordEmbeddingMap(record)
+			if err != nil {
+				return nil, err
+			}
+			embeddingMaps[key] = embeddings
 		}
-		spans := make(map[shoal.ID]document.Span, len(record.Spans))
-		for _, span := range record.Spans {
-			spans[span.ID] = span
+		spans := spanMaps[key]
+		if spans == nil {
+			spans = make(map[shoal.ID]document.Span, len(record.Spans))
+			for _, span := range record.Spans {
+				spans[span.ID] = span
+			}
+			spanMaps[key] = spans
 		}
 		span, ok := spans[citation.SpanID]
 		embedding, embedded := embeddings[citation.SpanID]

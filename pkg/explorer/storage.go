@@ -558,6 +558,100 @@ func (e *Explorer) hasExactRecord(row, expected []byte) (bool, error) {
 	return committed, nil
 }
 
+func (e *Explorer) lookupPersistedInteraction(
+	sessionID shoal.ID,
+) (persistedInteraction, bool, error) {
+	var record persistedInteraction
+	found, err := e.lookupEmbeddedRecord(
+		interactionRecordRow(sessionID),
+		embeddedRecordInteraction,
+		&record,
+	)
+	if err != nil || !found {
+		return persistedInteraction{}, found, err
+	}
+	if err := validatePersistedInteraction(record); err != nil {
+		return persistedInteraction{}, false, shoal.WrapError(
+			shoal.ErrorInternal,
+			"stored explorer interaction is invalid",
+			err,
+		)
+	}
+	if record.SessionID != sessionID {
+		return persistedInteraction{}, false, shoal.NewError(
+			shoal.ErrorInternal,
+			"stored explorer interaction row is invalid",
+		)
+	}
+	return record, true, nil
+}
+
+func (e *Explorer) lookupPersistedFold(
+	foldID shoal.ID,
+) (persistedFold, bool, error) {
+	var record persistedFold
+	found, err := e.lookupEmbeddedRecord(
+		foldRecordRow(foldID),
+		embeddedRecordFold,
+		&record,
+	)
+	if err != nil || !found {
+		return persistedFold{}, found, err
+	}
+	if err := validatePersistedFold(record); err != nil {
+		return persistedFold{}, false, shoal.WrapError(
+			shoal.ErrorInternal,
+			"stored explorer fold is invalid",
+			err,
+		)
+	}
+	if record.FoldID != foldID {
+		return persistedFold{}, false, shoal.NewError(
+			shoal.ErrorInternal,
+			"stored explorer fold row is invalid",
+		)
+	}
+	return record, true, nil
+}
+
+func (e *Explorer) lookupEmbeddedRecord(
+	row []byte, kind byte, target any,
+) (bool, error) {
+	found := false
+	var decodeErr error
+	err := e.engine.LookupRows(
+		explorerTable,
+		[][]byte{append([]byte(nil), row...)},
+		engine.ScanOptions{
+			ColumnFamilies:          [][]byte{[]byte(recordCF)},
+			ColumnFamiliesInclusive: true,
+		},
+		func(_ int, key *iterrt.Key, value []byte) {
+			if found || decodeErr != nil ||
+				!bytes.Equal(key.ColumnQualifier, []byte(recordCQV2)) {
+				return
+			}
+			decodeErr = decodeEmbeddedRecord(value, kind, target)
+			found = decodeErr == nil
+		},
+	)
+	if err != nil {
+		return false, shoal.WrapError(
+			shoal.ErrorUnavailable,
+			"read committed interaction record",
+			err,
+		)
+	}
+	if decodeErr != nil {
+		return false, shoal.WrapError(
+			shoal.ErrorInternal,
+			"decode committed interaction record",
+			decodeErr,
+		)
+	}
+	return found, nil
+}
+
 func equivalentEmbeddedRecord(row, stored, expected []byte) bool {
 	if bytes.Equal(stored, expected) {
 		return true
