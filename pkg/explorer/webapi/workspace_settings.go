@@ -214,24 +214,93 @@ func applyWorkspaceRequestLimits(ctx context.Context, request any) {
 	limits := effective.Limits()
 	switch value := request.(type) {
 	case *RetrievalRequest:
-		value.Query.TopK = lowerRequestLimit(
-			value.Query.TopK, retrieval.DefaultTopK, limits.RetrievalTopK)
+		narrowed := ClampWorkspaceRequestLimits(
+			workspace.Limits{RetrievalTopK: value.Query.TopK},
+			workspace.Limits{RetrievalTopK: retrieval.DefaultTopK},
+			limits,
+		)
+		value.Query.TopK = narrowed.RetrievalTopK
 	case *NeighborhoodRequest:
-		value.Depth = lowerRequestLimit(
-			value.Depth, DefaultDepth, limits.GraphDepth)
-		value.Fanout = lowerRequestLimit(
-			value.Fanout, DefaultFanout, limits.GraphFanout)
-		value.MaxNodes = lowerRequestLimit(
-			value.MaxNodes, DefaultMaxNodes, limits.GraphNodes)
+		narrowed := ClampWorkspaceRequestLimits(
+			workspace.Limits{
+				GraphDepth:  value.Depth,
+				GraphFanout: value.Fanout,
+				GraphNodes:  value.MaxNodes,
+			},
+			workspace.Limits{
+				GraphDepth:  DefaultDepth,
+				GraphFanout: DefaultFanout,
+				GraphNodes:  DefaultMaxNodes,
+			},
+			limits,
+		)
+		value.Depth = narrowed.GraphDepth
+		value.Fanout = narrowed.GraphFanout
+		value.MaxNodes = narrowed.GraphNodes
 	case *PathRequest:
-		value.MaxDepth = lowerRequestLimit(
-			value.MaxDepth, DefaultDepth, limits.GraphDepth)
-		value.Fanout = lowerRequestLimit(
-			value.Fanout, DefaultFanout, limits.GraphFanout)
+		narrowed := ClampWorkspaceRequestLimits(
+			workspace.Limits{
+				GraphDepth:  value.MaxDepth,
+				GraphFanout: value.Fanout,
+			},
+			workspace.Limits{
+				GraphDepth:  DefaultDepth,
+				GraphFanout: DefaultFanout,
+			},
+			limits,
+		)
+		value.MaxDepth = narrowed.GraphDepth
+		value.Fanout = narrowed.GraphFanout
+	}
+}
+
+// ClampWorkspaceRequestLimits replaces zero request values with their defaults
+// and lowers every request dimension to its effective workspace maximum.
+func ClampWorkspaceRequestLimits(
+	requested workspace.Limits,
+	defaults workspace.Limits,
+	maximum workspace.Limits,
+) workspace.Limits {
+	return workspace.Limits{
+		RetrievalTopK: lowerRequestLimit(
+			requested.RetrievalTopK,
+			defaults.RetrievalTopK,
+			maximum.RetrievalTopK,
+		),
+		GraphDepth: lowerRequestLimit(
+			requested.GraphDepth,
+			defaults.GraphDepth,
+			maximum.GraphDepth,
+		),
+		GraphFanout: lowerRequestLimit(
+			requested.GraphFanout,
+			defaults.GraphFanout,
+			maximum.GraphFanout,
+		),
+		GraphNodes: lowerRequestLimit(
+			requested.GraphNodes,
+			defaults.GraphNodes,
+			maximum.GraphNodes,
+		),
+		OutputBytes: lowerRequestByteLimit(
+			requested.OutputBytes,
+			defaults.OutputBytes,
+			maximum.OutputBytes,
+		),
 	}
 }
 
 func lowerRequestLimit(value, defaultValue, maximum uint32) uint32 {
+	if value == 0 {
+		value = defaultValue
+	}
+	if value > maximum {
+		return maximum
+	}
+	return value
+}
+
+func lowerRequestByteLimit(value, defaultValue, maximum uint64) uint64 {
 	if value == 0 {
 		value = defaultValue
 	}
