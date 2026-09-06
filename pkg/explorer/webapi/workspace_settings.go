@@ -213,12 +213,10 @@ func workspaceIDFromHeader(
 			"workspace settings header must contain one canonical opaque ID",
 		)
 	}
-	workspaceID, err := decodeID(values[0])
-	if err != nil || encodeID(workspaceID) != values[0] {
-		return "", false, shoal.NewError(
-			shoal.ErrorInvalidArgument,
-			"workspace settings header must contain one canonical opaque ID",
-		)
+	workspaceID, err := decodeWorkspaceOpaqueID(
+		"workspace settings header", values[0])
+	if err != nil {
+		return "", false, err
 	}
 	return workspaceID, true, nil
 }

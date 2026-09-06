@@ -121,10 +121,10 @@ func (h *Handler) getWorkspaceSettings(
 			shoal.ErrorUnavailable, "workspace settings are unavailable"))
 		return
 	}
-	workspaceID, err := decodeID(request.PathValue("workspace"))
+	workspaceID, err := decodeWorkspaceOpaqueID(
+		"workspace ID", request.PathValue("workspace"))
 	if err != nil {
-		writeError(writer, shoal.NewError(
-			shoal.ErrorInvalidArgument, "workspace ID "+err.Error()))
+		writeError(writer, err)
 		return
 	}
 	settings, err := h.workspaceSettings.Get(request.Context(), workspaceID)
@@ -153,10 +153,10 @@ func (h *Handler) putWorkspaceSettings(
 		writeError(writer, err)
 		return
 	}
-	workspaceID, err := decodeID(request.PathValue("workspace"))
+	workspaceID, err := decodeWorkspaceOpaqueID(
+		"workspace ID", request.PathValue("workspace"))
 	if err != nil {
-		writeError(writer, shoal.NewError(
-			shoal.ErrorInvalidArgument, "workspace ID "+err.Error()))
+		writeError(writer, err)
 		return
 	}
 	var input WorkspaceSettingsUpdateRequest
@@ -196,10 +196,10 @@ func (h *Handler) getWorkspaceLens(
 			shoal.ErrorUnavailable, "workspace settings are unavailable"))
 		return
 	}
-	workspaceID, err := decodeID(request.PathValue("workspace"))
+	workspaceID, err := decodeWorkspaceOpaqueID(
+		"workspace ID", request.PathValue("workspace"))
 	if err != nil {
-		writeError(writer, shoal.NewError(
-			shoal.ErrorInvalidArgument, "workspace ID "+err.Error()))
+		writeError(writer, err)
 		return
 	}
 	choices, err := h.workspaceSettings.ListOntologyChoices(
@@ -229,10 +229,10 @@ func (h *Handler) putWorkspaceLens(
 		writeError(writer, err)
 		return
 	}
-	workspaceID, err := decodeID(request.PathValue("workspace"))
+	workspaceID, err := decodeWorkspaceOpaqueID(
+		"workspace ID", request.PathValue("workspace"))
 	if err != nil {
-		writeError(writer, shoal.NewError(
-			shoal.ErrorInvalidArgument, "workspace ID "+err.Error()))
+		writeError(writer, err)
 		return
 	}
 	var input WorkspaceOntologySelectionRequest
@@ -240,10 +240,10 @@ func (h *Handler) putWorkspaceLens(
 		writeError(writer, shoal.NewError(shoal.ErrorInvalidArgument, err.Error()))
 		return
 	}
-	mutationID, err := decodeID(input.MutationID)
+	mutationID, err := decodeWorkspaceOpaqueID(
+		"mutation_id", input.MutationID)
 	if err != nil {
-		writeError(writer, shoal.NewError(
-			shoal.ErrorInvalidArgument, "mutation_id: "+err.Error()))
+		writeError(writer, err)
 		return
 	}
 	identity, err := workspaceOntologyIdentityValue(input.SelectedOntology)
@@ -274,9 +274,10 @@ func (h *Handler) putWorkspaceLens(
 func workspaceSettingsUpdate(
 	value WorkspaceSettingsUpdateRequest,
 ) (workspace.UpdateRequest, error) {
-	mutationID, err := decodeID(value.MutationID)
+	mutationID, err := decodeWorkspaceOpaqueID(
+		"mutation_id", value.MutationID)
 	if err != nil {
-		return workspace.UpdateRequest{}, fmt.Errorf("mutation_id: %w", err)
+		return workspace.UpdateRequest{}, err
 	}
 	if value.Settings == nil {
 		return workspace.UpdateRequest{}, fmt.Errorf("settings is required")
@@ -413,6 +414,24 @@ func workspaceOntologyIdentityValue(
 			"selected ontology must use the canonical identity projection")
 	}
 	return identity, nil
+}
+
+func decodeWorkspaceOpaqueID(name, value string) (shoal.ID, error) {
+	decoded, err := decodeID(value)
+	if err != nil {
+		return "", shoal.NewError(
+			shoal.ErrorInvalidArgument, name+" "+err.Error())
+	}
+	if encodeID(decoded) != value {
+		return "", shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			name+" must be canonical unpadded base64url",
+		)
+	}
+	if err := shoal.ValidateRequiredID(name, decoded); err != nil {
+		return "", err
+	}
+	return decoded, nil
 }
 
 func workspaceSettingsResponse(
