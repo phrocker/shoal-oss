@@ -21,7 +21,6 @@ package webapi
 
 import (
 	"fmt"
-	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -549,24 +548,35 @@ func requireSameOrigin(request *http.Request) error {
 		return shoal.NewError(
 			shoal.ErrorUnauthorized, "cross-origin settings mutation denied")
 	}
-	requestScheme := "http"
-	if request.TLS != nil {
-		requestScheme = "https"
-	}
-	if !strings.EqualFold(parsed.Scheme, requestScheme) ||
-		!sameAuthority(parsed.Host, request.Host) {
+	if !sameOriginAuthority(parsed, request.Host) {
 		return shoal.NewError(
 			shoal.ErrorUnauthorized, "cross-origin settings mutation denied")
 	}
 	return nil
 }
 
-func sameAuthority(left, right string) bool {
-	leftHost, leftPort, leftErr := net.SplitHostPort(left)
-	rightHost, rightPort, rightErr := net.SplitHostPort(right)
-	if leftErr == nil || rightErr == nil {
-		return leftErr == nil && rightErr == nil &&
-			strings.EqualFold(leftHost, rightHost) && leftPort == rightPort
+func sameOriginAuthority(origin *url.URL, requestAuthority string) bool {
+	requestURL, err := url.Parse("//" + requestAuthority)
+	if err != nil || requestURL.Host == "" || requestURL.User != nil ||
+		requestURL.Path != "" || requestURL.RawQuery != "" ||
+		requestURL.Fragment != "" {
+		return false
 	}
-	return strings.EqualFold(left, right)
+	return strings.EqualFold(origin.Hostname(), requestURL.Hostname()) &&
+		originPort(origin.Scheme, origin.Port()) ==
+			originPort(origin.Scheme, requestURL.Port())
+}
+
+func originPort(scheme, port string) string {
+	if port != "" {
+		return port
+	}
+	switch strings.ToLower(scheme) {
+	case "http":
+		return "80"
+	case "https":
+		return "443"
+	default:
+		return ""
+	}
 }

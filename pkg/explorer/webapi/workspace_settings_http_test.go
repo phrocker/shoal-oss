@@ -237,10 +237,26 @@ func TestHTTPWorkspaceSettingsRoundTripAuthorizationAndRestart(t *testing.T) {
 		t.Fatalf("cross-origin PUT status = %d, body = %s",
 			response.Code, response.Body.String())
 	}
-	response = settingsRequest(
+	response = settingsRequestWithFetchSite(
 		t, handler, http.MethodPut,
 		"/api/v1/workspaces/"+workspacePath+"/settings",
-		body, "owner", "https://example.test")
+		body, "owner", "https://example.test", "same-origin")
+	if response.Code != http.StatusCreated {
+		t.Fatalf("TLS-terminating proxy PUT status = %d, body = %s",
+			response.Code, response.Body.String())
+	}
+	response = settingsRequestWithFetchSite(
+		t, handler, http.MethodPut,
+		"/api/v1/workspaces/"+workspacePath+"/settings",
+		body, "owner", "https://example.test:443", "same-origin")
+	if response.Code != http.StatusCreated {
+		t.Fatalf("default-port proxy PUT status = %d, body = %s",
+			response.Code, response.Body.String())
+	}
+	response = settingsRequestWithFetchSite(
+		t, handler, http.MethodPut,
+		"/api/v1/workspaces/"+workspacePath+"/settings",
+		body, "owner", "https://example.test", "same-site")
 	if response.Code != http.StatusUnauthorized {
 		t.Fatalf("cross-scheme PUT status = %d, body = %s",
 			response.Code, response.Body.String())
@@ -555,6 +571,17 @@ func settingsRequest(
 	body any,
 	subject, origin string,
 ) *httptest.ResponseRecorder {
+	return settingsRequestWithFetchSite(
+		t, handler, method, path, body, subject, origin, "")
+}
+
+func settingsRequestWithFetchSite(
+	t *testing.T,
+	handler http.Handler,
+	method, path string,
+	body any,
+	subject, origin, fetchSite string,
+) *httptest.ResponseRecorder {
 	t.Helper()
 	var encoded []byte
 	if body != nil {
@@ -572,6 +599,9 @@ func settingsRequest(
 	}
 	if origin != "" {
 		request.Header.Set("Origin", origin)
+	}
+	if fetchSite != "" {
+		request.Header.Set("Sec-Fetch-Site", fetchSite)
 	}
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, request)

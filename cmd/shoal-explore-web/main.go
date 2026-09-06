@@ -66,16 +66,17 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 	stateDir := flags.String(
 		"state-dir", "",
 		"Recommended workspace state root. The corpus and durable policy "+
-			"catalog and settings are created as corpus/, policy/, and settings/ "+
-			"inside it, so mounting "+
+			"catalog are created as corpus/ and policy/ inside it; workspace "+
+			"settings are stored in corpus/, so mounting "+
 			"this one directory as a volume persists everything a restart "+
 			"needs. Overrides -data when set",
 	)
 	data := flags.String(
 		"data", ".shoal/explorer",
 		"Legacy Explorer corpus directory (used when -state-dir is unset). The "+
-			"durable policy catalog and workspace settings are placed in sibling "+
-			"directories; all must be persisted for the workspace to survive a restart",
+			"durable policy catalog is placed in a sibling directory; workspace "+
+			"settings are stored in the corpus, and both directories must be "+
+			"persisted for the workspace to survive a restart",
 	)
 	policyDirFlag := flags.String(
 		"policy-dir", "",
