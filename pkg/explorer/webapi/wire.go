@@ -740,13 +740,11 @@ func (r NeighborhoodResponse) MarshalJSON() ([]byte, error) {
 		OntologyInterpretations []OntologyInterpretationReport `json:"ontology_interpretations,omitempty"`
 		Truncated               bool                           `json:"truncated"`
 		NextCursor              string                         `json:"next_cursor,omitempty"`
-		ScannedEdges            *uint32                        `json:"scanned_edges,omitempty"`
 	}{
 		Snapshot:                r.Snapshot,
 		Neighborhood:            wireNeighborhoodValue(r.Neighborhood),
 		OntologyInterpretations: r.OntologyInterpretations,
 		Truncated:               r.Truncated, NextCursor: r.NextCursor,
-		ScannedEdges: cloneUint32(r.ScannedEdges),
 	})
 }
 

@@ -464,14 +464,21 @@ func TestExplicitCapabilityProviderCanDisableAnalyticsExtension(t *testing.T) {
 
 func TestNeighborhoodWireDistinguishesKnownZeroFromUnknownScanCount(t *testing.T) {
 	zero := uint32(0)
-	known, err := json.Marshal(webapi.NeighborhoodResponse{
+	public, err := json.Marshal(webapi.NeighborhoodResponse{
 		ScannedEdges: &zero,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
+	if bytes.Contains(public, []byte(`"scanned_edges"`)) {
+		t.Fatalf("public scan count was exposed: %s", public)
+	}
+	known := append(
+		append([]byte(nil), bytes.TrimSuffix(public, []byte("}"))...),
+		[]byte(`,"scanned_edges":0}`)...,
+	)
 	if !bytes.Contains(known, []byte(`"scanned_edges":0`)) {
-		t.Fatalf("known zero scan count was omitted: %s", known)
+		t.Fatalf("known zero test wire was not constructed: %s", known)
 	}
 	var decodedKnown webapi.NeighborhoodResponse
 	if err := json.Unmarshal(known, &decodedKnown); err != nil {
