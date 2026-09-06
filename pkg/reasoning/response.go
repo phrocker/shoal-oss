@@ -495,7 +495,10 @@ func (r Response) Validate() error {
 		!r.session.RecordedAt.Equal(r.recordedAt) {
 		return invalid("reasoning response session identity is inconsistent")
 	}
-	fingerprint := responseFingerprint(r.data)
+	fingerprint, err := responseFingerprint(r.data)
+	if err != nil {
+		return err
+	}
 	if fingerprint != r.data.fingerprint {
 		return invalid("reasoning response verification fingerprint is not canonical")
 	}
@@ -846,7 +849,10 @@ func (b *Builder) assemble(
 		claims:                    claims,
 		issues:                    issues,
 	}
-	data.fingerprint = responseFingerprint(data)
+	data.fingerprint, err = responseFingerprint(data)
+	if err != nil {
+		return responseData{}, err
+	}
 	return data, nil
 }
 
@@ -1110,7 +1116,7 @@ func retrievedSessionEvidence(
 	for _, value := range byAnchor {
 		result = append(result, value)
 	}
-	return canonicalInteractionEvidence(result), nil
+	return canonicalInteractionEvidence(result)
 }
 
 func captureMetadata(data responseData) CaptureMetadata {
@@ -1136,7 +1142,7 @@ func captureMetadata(data responseData) CaptureMetadata {
 	}
 }
 
-func responseFingerprint(data responseData) string {
+func responseFingerprint(data responseData) (string, error) {
 	return ResponseFingerprint(responseIdentity(data))
 }
 
@@ -1190,7 +1196,16 @@ func responseIdentity(data responseData) ResponseIdentity {
 
 // ResponseFingerprint derives the canonical verification fingerprint shared
 // by immutable responses and strict transport adapters.
-func ResponseFingerprint(identity ResponseIdentity) string {
+func ResponseFingerprint(identity ResponseIdentity) (string, error) {
+	retrievedEvidence, err := canonicalInteractionEvidence(
+		identity.RetrievedEvidence)
+	if err != nil {
+		return "", fmt.Errorf("retrieved evidence: %w", err)
+	}
+	citedEvidence, err := canonicalInteractionEvidence(identity.CitedEvidence)
+	if err != nil {
+		return "", fmt.Errorf("cited evidence: %w", err)
+	}
 	retrievedSourceIDs := append(
 		[]shoal.ID(nil), identity.RetrievedSourceIDs...)
 	sort.Slice(retrievedSourceIDs, func(i, j int) bool {
@@ -1259,10 +1274,10 @@ func ResponseFingerprint(identity ResponseIdentity) string {
 			parts = append(parts, "source-visibility", visibility)
 		}
 	}
-	for _, reference := range canonicalInteractionEvidence(identity.RetrievedEvidence) {
+	for _, reference := range retrievedEvidence {
 		parts = append(parts, interactionEvidenceParts("retrieved-evidence", reference)...)
 	}
-	for _, reference := range canonicalInteractionEvidence(identity.CitedEvidence) {
+	for _, reference := range citedEvidence {
 		parts = append(parts, interactionEvidenceParts("cited-evidence", reference)...)
 	}
 	for _, evidence := range evidenceItems {
@@ -1297,7 +1312,7 @@ func ResponseFingerprint(identity ResponseIdentity) string {
 			string(issue.OutcomeID),
 			issue.Input, issue.Reason)
 	}
-	return string(deriveID("reasoning-verification", parts...))
+	return string(deriveID("reasoning-verification", parts...)), nil
 }
 
 // CanonicalResponseID derives the stable ID for a durably captured response.
@@ -1313,11 +1328,15 @@ func CanonicalResponseID(
 	if recordedAt.IsZero() {
 		return "", invalid("reasoning response recording time is required")
 	}
+	fingerprint, err := ResponseFingerprint(identity)
+	if err != nil {
+		return "", err
+	}
 	return deriveID(
 		"reasoning-response",
 		string(sessionID),
 		recordedAt.UTC().Format(time.RFC3339Nano),
-		ResponseFingerprint(identity),
+		fingerprint,
 	), nil
 }
 
@@ -1475,27 +1494,45 @@ func cloneInteractionEvidence(
 ) []interaction.EvidenceReference {
 	result := make([]interaction.EvidenceReference, len(values))
 	for index, value := range values {
-		result[index], _ = value.Canonical()
+		result[index] = value
+		result[index].NodeIDs = append([]shoal.ID(nil), value.NodeIDs...)
+		result[index].EdgeIDs = append([]shoal.ID(nil), value.EdgeIDs...)
+		result[index].Assertions = append(
+			[]interaction.AssertionReference(nil), value.Assertions...)
 	}
 	return result
 }
 
 func canonicalInteractionEvidence(
 	values []interaction.EvidenceReference,
-) []interaction.EvidenceReference {
-	result := cloneInteractionEvidence(values)
+) ([]interaction.EvidenceReference, error) {
+	result := make([]interaction.EvidenceReference, len(values))
+	for index, value := range values {
+		canonical, err := value.Canonical()
+		if err != nil {
+			return nil, err
+		}
+		result[index] = canonical
+	}
 	sort.Slice(result, func(i, j int) bool {
 		return shoal.CompareID(
 			result[i].AnchorID, result[j].AnchorID) < 0
 	})
-	return result
+	return result, nil
 }
 
 func equalInteractionEvidence(
 	left, right []interaction.EvidenceReference,
 ) bool {
-	left = canonicalInteractionEvidence(left)
-	right = canonicalInteractionEvidence(right)
+	var err error
+	left, err = canonicalInteractionEvidence(left)
+	if err != nil {
+		return false
+	}
+	right, err = canonicalInteractionEvidence(right)
+	if err != nil {
+		return false
+	}
 	if len(left) != len(right) {
 		return false
 	}

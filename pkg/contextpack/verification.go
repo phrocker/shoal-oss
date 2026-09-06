@@ -127,6 +127,10 @@ func (a VerifiedAnchor) EvidenceReference() (
 			return interaction.EvidenceReference{}, invalid(
 				"verified document evidence is unavailable")
 		}
+		if citation.SectionID == "" || citation.SpanID == "" {
+			return interaction.EvidenceReference{}, invalid(
+				"interaction evidence projection requires explicit section and span identities")
+		}
 		reference.Kind = interaction.EvidenceDocument
 		reference.Citation = citation
 	case inference.AnchorGraph:

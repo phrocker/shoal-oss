@@ -20,8 +20,11 @@
 package reasoning
 
 import (
+	"strings"
 	"testing"
+	"time"
 
+	"github.com/phrocker/shoal-oss/pkg/interaction"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
@@ -33,9 +36,34 @@ func TestResponseFingerprintIncludesPerSourceVisibility(t *testing.T) {
 			visibility: []string{"internal"},
 		}},
 	}
-	internal := responseFingerprint(data)
+	internal, err := responseFingerprint(data)
+	if err != nil {
+		t.Fatal(err)
+	}
 	data.sources[0].visibility = []string{"secret"}
-	if secret := responseFingerprint(data); secret == internal {
+	secret, err := responseFingerprint(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if secret == internal {
 		t.Fatal("per-source visibility did not change response fingerprint")
+	}
+}
+
+func TestCanonicalResponseIdentityRejectsMalformedEvidence(t *testing.T) {
+	identity := ResponseIdentity{
+		RetrievedEvidence: []interaction.EvidenceReference{{
+			AnchorID: "anchor",
+			Kind:     interaction.EvidenceDocument,
+		}},
+	}
+	if _, err := ResponseFingerprint(identity); err == nil ||
+		!strings.Contains(err.Error(), "retrieved evidence") {
+		t.Fatalf("fingerprint error = %v", err)
+	}
+	if _, err := CanonicalResponseID(
+		"session", time.Unix(1, 0), identity,
+	); err == nil || !strings.Contains(err.Error(), "retrieved evidence") {
+		t.Fatalf("response ID error = %v", err)
 	}
 }

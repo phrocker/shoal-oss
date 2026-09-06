@@ -42,6 +42,7 @@ import (
 
 const (
 	ontologyRelationshipIDProperty  = "ontology_relationship_id"
+	ontologyAssertionIDProperty     = "ontology.assertion.id"
 	ontologyAssertionOriginProperty = "ontology.assertion.origin"
 
 	// MaxCitationEnvelopeBytes bounds one encoded provider request/response.
@@ -1650,6 +1651,12 @@ func validateCitationEvidence(evidence CitationEvidence) error {
 		if err := evidence.Citation.Validate(); err != nil {
 			return err
 		}
+		if evidence.Citation.SectionID == "" ||
+			evidence.Citation.SpanID == "" {
+			return shoal.NewError(
+				shoal.ErrorInvalidArgument,
+				"citation evidence requires explicit section and span identities")
+		}
 		if len(evidence.SourceIDs) != 3 {
 			return shoal.NewError(
 				shoal.ErrorInvalidArgument,
@@ -1818,6 +1825,7 @@ func validateCitationEvidence(evidence CitationEvidence) error {
 			hasAssertion := len(assertions) > 0
 			hasAssertionMarker :=
 				edge.Properties[ontologyRelationshipIDProperty] != "" ||
+					edge.Properties[ontologyAssertionIDProperty] != "" ||
 					edge.Properties[ontologyAssertionOriginProperty] != ""
 			if hasAssertionMarker && !hasAssertion {
 				return shoal.NewError(
@@ -1830,6 +1838,15 @@ func validateCitationEvidence(evidence CitationEvidence) error {
 						return shoal.NewError(
 							shoal.ErrorInvalidArgument,
 							"graph path assertion origin does not match its edge")
+					}
+				}
+			}
+			if assertionID := edge.Properties[ontologyAssertionIDProperty]; hasAssertion && assertionID != "" {
+				for _, assertion := range assertions {
+					if shoal.ID(assertionID) != assertion.AssertionID {
+						return shoal.NewError(
+							shoal.ErrorInvalidArgument,
+							"graph path assertion ID does not match its edge")
 					}
 				}
 			}

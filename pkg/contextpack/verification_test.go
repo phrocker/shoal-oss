@@ -288,6 +288,63 @@ func TestVerifyResultProjectsGraphAdditionAssertionsAndVisibility(t *testing.T) 
 	}
 }
 
+func TestVerifiedDocumentReferenceRequiresExplicitSourceRoles(t *testing.T) {
+	client, request, response, pins := embeddedFixture(t)
+	pack, err := (Builder{Reader: client}).Build(
+		context.Background(), InitialRequest{
+			Request: request, Response: response, Pins: pins,
+			Selection: EvidenceSelection{Documents: true},
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	citation := response.Results[0].Evidence[0].Citation
+	quote := response.Results[0].Evidence[0].Quote
+	citation.SpanID = ""
+	addition, err := inference.NewDocumentAnchor(citation, quote)
+	if err != nil {
+		t.Fatal(err)
+	}
+	issue, err := inference.NewIssue(
+		inference.IssueUnsupported, "input", "reason",
+		[]shoal.ID{addition.ID()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := inference.NewExtendedInferenceResult(
+		pack, []inference.EvidenceAnchor{addition}, nil,
+		[]inference.Issue{issue}, pack.Snapshot().AsOf().Add(time.Second), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader := &verificationSnapshotReader{
+		Explorer: client,
+		snapshot: explorer.Snapshot{
+			ID: string(pack.Snapshot().ID()), AsOf: pack.Snapshot().AsOf(),
+		},
+		authorization: pack.Authorization(),
+	}
+	verified, err := (Builder{Reader: reader}).VerifyResult(
+		context.Background(), pack, result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, anchor := range verified.Anchors() {
+		if anchor.Anchor().ID() != addition.ID() {
+			continue
+		}
+		if _, err := anchor.EvidenceReference(); err == nil ||
+			!strings.Contains(
+				err.Error(),
+				"requires explicit section and span identities",
+			) {
+			t.Fatalf("incomplete source role projection error = %v", err)
+		}
+		return
+	}
+	t.Fatal("verified result omitted document evidence addition")
+}
+
 type verificationSnapshotReader struct {
 	*explorer.Explorer
 	snapshot      explorer.Snapshot

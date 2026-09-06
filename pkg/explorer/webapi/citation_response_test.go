@@ -304,11 +304,12 @@ func TestCitationEnvelopeOpaqueIDRoundTrip(t *testing.T) {
 			citation := *candidate.Evidence[0].Citation
 			omit(&citation)
 			candidate.Evidence[0].Citation = &citation
-			reanchorCitationDocumentEnvelope(t, &candidate)
-			if _, err := json.Marshal(candidate); err != nil {
-				t.Fatalf(
-					"valid citation with omitted %s ID: %v; anchor=%q sources=%+v",
-					name, err, candidate.Evidence[0].AnchorID, candidate.Sources)
+			if err := candidate.Validate(); err == nil ||
+				!strings.Contains(
+					err.Error(),
+					"requires explicit section and span identities",
+				) {
+				t.Fatalf("omitted %s identity error = %v", name, err)
 			}
 		})
 	}
@@ -715,6 +716,7 @@ func TestCitationEnvelopeAssertionReferencesRoundTrip(t *testing.T) {
 			Type: "related", Weight: 1,
 			Properties: shoal.Metadata{
 				ontologyRelationshipIDProperty:  "relationship",
+				ontologyAssertionIDProperty:     "assertion",
 				ontologyAssertionOriginProperty: string(ontology.AssertionInferred),
 			},
 		}},
@@ -890,6 +892,10 @@ func TestCitationEnvelopeAssertionReferencesRoundTrip(t *testing.T) {
 			value.Evidence[0].Path.Edges[0].Properties[ontologyAssertionOriginProperty] =
 				string(ontology.AssertionExplicit)
 		},
+		"mismatched assertion identity": func(value *CitationEnvelope) {
+			value.Evidence[0].Path.Edges[0].Properties[ontologyAssertionIDProperty] =
+				"different-assertion"
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			var invalid CitationEnvelope
@@ -897,8 +903,11 @@ func TestCitationEnvelopeAssertionReferencesRoundTrip(t *testing.T) {
 				t.Fatal(err)
 			}
 			mutate(&invalid)
-			reanchorCitationGraphEnvelope(t, &invalid)
-			if _, err := json.Marshal(invalid); err == nil {
+			validationErr := reanchorCitationGraphEnvelope(t, &invalid)
+			if validationErr == nil {
+				_, validationErr = json.Marshal(invalid)
+			}
+			if validationErr == nil {
 				t.Fatal("invalid graph citation semantics were accepted")
 			}
 		})
@@ -940,7 +949,7 @@ func TestCitationEvidenceAllowsAssertionAcrossMultipleEdges(t *testing.T) {
 func reanchorCitationGraphEnvelope(
 	t *testing.T,
 	envelope *CitationEnvelope,
-) {
+) error {
 	t.Helper()
 	oldAnchorID := envelope.Evidence[0].AnchorID
 	assertions := make(
@@ -1013,55 +1022,7 @@ func reanchorCitationGraphEnvelope(
 		envelope.RecordedAt,
 		citationResponseIdentity(*envelope),
 	)
-	if err != nil {
-		t.Fatal(err)
-	}
-}
-
-func reanchorCitationDocumentEnvelope(
-	t *testing.T,
-	envelope *CitationEnvelope,
-) {
-	t.Helper()
-	oldAnchorID := envelope.Evidence[0].AnchorID
-	anchor, err := inference.NewDocumentAnchor(
-		*envelope.Evidence[0].Citation,
-		envelope.Evidence[0].Quote,
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	newAnchorID := anchor.ID()
-	envelope.Evidence[0].AnchorID = newAnchorID
-	for sourceIndex := range envelope.Sources {
-		for anchorIndex, anchorID := range envelope.Sources[sourceIndex].AnchorIDs {
-			if anchorID == oldAnchorID {
-				envelope.Sources[sourceIndex].AnchorIDs[anchorIndex] = newAnchorID
-			}
-		}
-	}
-	for claimIndex := range envelope.Claims {
-		for anchorIndex, anchorID := range envelope.Claims[claimIndex].CitationAnchorIDs {
-			if anchorID == oldAnchorID {
-				envelope.Claims[claimIndex].CitationAnchorIDs[anchorIndex] =
-					newAnchorID
-			}
-		}
-		canonicalID, err := citationClaimCanonicalID(
-			envelope.Claims[claimIndex])
-		if err != nil {
-			t.Fatal(err)
-		}
-		envelope.Claims[claimIndex].ID = canonicalID
-	}
-	envelope.ID, err = reasoning.CanonicalResponseID(
-		envelope.SessionID,
-		envelope.RecordedAt,
-		citationResponseIdentity(*envelope),
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
+	return err
 }
 
 func citationClaimCanonicalID(claim CitationClaim) (shoal.ID, error) {
