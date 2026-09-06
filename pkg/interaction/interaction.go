@@ -279,7 +279,8 @@ func (e AssertionEvidence) Validate() error {
 			)
 		}
 	}
-	switch ontology.AssertionOrigin(e.Origin) {
+	origin := ontology.AssertionOrigin(e.Origin)
+	switch origin {
 	case ontology.AssertionExplicit,
 		ontology.AssertionInferred,
 		ontology.AssertionDerived:
@@ -287,17 +288,31 @@ func (e AssertionEvidence) Validate() error {
 		return shoal.NewError(
 			shoal.ErrorInvalidArgument, "assertion evidence origin is invalid")
 	}
-	if ontology.AssertionOrigin(e.Origin) == ontology.AssertionDerived &&
+	if origin == ontology.AssertionDerived &&
 		(e.ObjectReference == "" || e.DerivationID == "") {
 		return shoal.NewError(
 			shoal.ErrorInvalidArgument,
 			"derived assertion evidence is incomplete",
 		)
 	}
+	if origin != ontology.AssertionDerived &&
+		(e.DerivationID != "" ||
+			math.Float64bits(float64(e.DerivationScore)) != 0) {
+		return shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			"non-derived assertion evidence has derivation fields",
+		)
+	}
 	if err := shoal.ValidateFiniteScore(
 		"assertion evidence confidence", e.Confidence,
 	); err != nil {
 		return err
+	}
+	if e.Confidence < 0 || e.Confidence > 1 {
+		return shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			"assertion evidence confidence must be between zero and one",
+		)
 	}
 	return shoal.ValidateFiniteScore(
 		"assertion evidence derivation score", e.DerivationScore)

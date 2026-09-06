@@ -30,6 +30,7 @@ import (
 
 	"github.com/phrocker/shoal-oss/pkg/graph"
 	"github.com/phrocker/shoal-oss/pkg/interaction"
+	"github.com/phrocker/shoal-oss/pkg/ontology"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
@@ -52,6 +53,37 @@ func TestAssertionEvidenceEqualDistinguishesSignedZeroScores(t *testing.T) {
 		if interaction.AssertionEvidenceEqual(base, changed) {
 			t.Fatalf("signed-zero mutation considered equal: %#v", changed)
 		}
+	}
+}
+
+func TestAssertionEvidenceRejectsImpossibleProjection(t *testing.T) {
+	valid := interaction.AssertionEvidence{
+		ID: "assertion:one", Subject: "subject", Predicate: "property:name",
+		Origin: string(ontology.AssertionExplicit), Confidence: 0.5,
+	}
+	for name, mutate := range map[string]func(*interaction.AssertionEvidence){
+		"confidence below zero": func(value *interaction.AssertionEvidence) {
+			value.Confidence = -0.1
+		},
+		"confidence above one": func(value *interaction.AssertionEvidence) {
+			value.Confidence = 1.1
+		},
+		"non-derived derivation ID": func(value *interaction.AssertionEvidence) {
+			value.DerivationID = "derivation:one"
+		},
+		"non-derived derivation score": func(value *interaction.AssertionEvidence) {
+			value.DerivationScore = 0.5
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			evidence := valid
+			mutate(&evidence)
+			if err := evidence.Validate(); !shoal.IsErrorCode(
+				err, shoal.ErrorInvalidArgument,
+			) {
+				t.Fatalf("error = %v", err)
+			}
+		})
 	}
 }
 
