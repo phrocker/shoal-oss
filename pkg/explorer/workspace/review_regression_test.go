@@ -438,10 +438,9 @@ func TestReviewServiceWriterOutputPolicyIsConsumerNeutral(t *testing.T) {
 		},
 	})
 	reader := testDecision(t, decisionOptions{
-		serviceRole: auth.ServiceRoleWorkspaceReader,
+		serviceRole: auth.ServiceRoleDataRead,
 		ceilingID:   "data-reader-ceiling",
 		operations: []auth.Operation{
-			auth.OperationWorkspaceSettingsRead,
 			auth.OperationRead,
 			auth.OperationRetrieve,
 		},
@@ -461,7 +460,7 @@ func TestReviewServiceWriterOutputPolicyIsConsumerNeutral(t *testing.T) {
 		GenerationReader: testGenerationReader{generation: 7},
 		CeilingResolver: roleCeilingResolver{
 			auth.ServiceRoleWorkspaceSettingsWrite: writerCeiling,
-			auth.ServiceRoleWorkspaceReader:        readerCeiling,
+			auth.ServiceRoleDataRead:               readerCeiling,
 		},
 		Clock: func() time.Time { return testNow },
 	})
