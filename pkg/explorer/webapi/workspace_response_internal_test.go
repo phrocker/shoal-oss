@@ -112,6 +112,16 @@ func TestRemoteIngestMarksUnknownPostDispatchOutcomes(t *testing.T) {
 				}, nil
 			},
 		},
+		{
+			name: "malformed failure",
+			ingest: func() (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusBadGateway,
+					Header:     make(http.Header),
+					Body:       io.NopCloser(strings.NewReader("{")),
+				}, nil
+			},
+		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			metadata, err := json.Marshal(MetadataResponse{
@@ -157,6 +167,66 @@ func TestRemoteIngestMarksUnknownPostDispatchOutcomes(t *testing.T) {
 				t.Fatalf("remote ingest error = %v", err)
 			}
 		})
+	}
+}
+
+func TestRemoteIngestKeepsVerifiedConflictDeterminate(t *testing.T) {
+	metadata, err := json.Marshal(MetadataResponse{
+		MaxPageSize:         MaxPageSize,
+		MaxTopK:             MaxTopK,
+		MaxDepth:            MaxDepth,
+		MaxFanout:           MaxFanout,
+		MaxNodes:            MaxNodes,
+		MaxEdgeTypes:        MaxEdgeTypes,
+		MaxResponseBytes:    MaxResponseBytes,
+		MaxUploadFiles:      MaxUploadFiles,
+		MaxUploadFileBytes:  MaxUploadFileBytes,
+		MaxUploadTotalBytes: MaxUploadTotalBytes,
+		Capabilities:        AllCapabilities(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	conflict, err := json.Marshal(struct {
+		Code    shoal.ErrorCode `json:"code"`
+		Message string          `json:"message"`
+	}{
+		Code:    shoal.ErrorConflict,
+		Message: "conflict: duplicate upload",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	calls := 0
+	client := &http.Client{Transport: roundTripFunc(func(
+		request *http.Request,
+	) (*http.Response, error) {
+		calls++
+		if calls == 1 {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     make(http.Header),
+				Body:       io.NopCloser(bytes.NewReader(metadata)),
+			}, nil
+		}
+		return &http.Response{
+			StatusCode: http.StatusConflict,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(bytes.NewReader(conflict)),
+		}, nil
+	})}
+	remote, err := NewRemoteService("http://remote.example", client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = remote.Ingest(context.Background(), IngestRequest{
+		Files: []UploadFile{{
+			Name: "note.txt", Content: []byte("hello"),
+		}},
+	})
+	if explorer.IsIndeterminateCommit(err) ||
+		!shoal.IsErrorCode(err, shoal.ErrorConflict) {
+		t.Fatalf("verified conflict error = %v", err)
 	}
 }
 

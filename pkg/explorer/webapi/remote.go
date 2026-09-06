@@ -153,7 +153,11 @@ func (s *RemoteService) Ingest(
 	}
 	defer httpResponse.Body.Close()
 	if httpResponse.StatusCode < 200 || httpResponse.StatusCode >= 300 {
-		return IngestResponse{}, decodeRemoteError(httpResponse)
+		remoteErr, verified := decodeRemoteErrorOutcome(httpResponse)
+		if !verified && !explorer.IsIndeterminateCommit(remoteErr) {
+			remoteErr = explorer.MarkIndeterminateCommit(remoteErr)
+		}
+		return IngestResponse{}, remoteErr
 	}
 	var response IngestResponse
 	if err := decodeOneJSON(httpResponse.Body, &response, maxRemoteResponseBytes); err != nil {
@@ -1118,6 +1122,11 @@ func (e responseReadError) Unwrap() error {
 }
 
 func decodeRemoteError(response *http.Response) error {
+	decoded, _ := decodeRemoteErrorOutcome(response)
+	return decoded
+}
+
+func decodeRemoteErrorOutcome(response *http.Response) (error, bool) {
 	var payload struct {
 		Code          shoal.ErrorCode           `json:"code"`
 		Message       string                    `json:"message"`
@@ -1133,8 +1142,8 @@ func decodeRemoteError(response *http.Response) error {
 				response.StatusCode,
 				"remote workspace error code does not match status",
 			)
-			return markRemoteIndeterminate(
-				mismatch, indeterminate || payload.Indeterminate)
+			explicit := indeterminate || payload.Indeterminate
+			return markRemoteIndeterminate(mismatch, explicit), explicit
 		}
 		message := trimErrorCode(payload.Code, payload.Message)
 		var decoded error
@@ -1167,15 +1176,16 @@ func decodeRemoteError(response *http.Response) error {
 			decoded = newEmbeddingQueryError(decoded, *report)
 		}
 		return markRemoteIndeterminate(
-			decoded, indeterminate || payload.Indeterminate)
+			decoded, indeterminate || payload.Indeterminate), true
 	}
 	if err != nil && isRemoteTransportDecodeError(err) {
 		return markRemoteIndeterminate(shoal.WrapError(
 			remoteDecodeCode(err), "read remote workspace error response", err),
-			indeterminate)
+			indeterminate), indeterminate
 	}
 	return markRemoteIndeterminate(errorFromHTTPStatus(
-		response.StatusCode, "remote workspace request failed"), indeterminate)
+		response.StatusCode, "remote workspace request failed"),
+		indeterminate), indeterminate
 }
 
 func markRemoteIndeterminate(err error, indeterminate bool) error {
