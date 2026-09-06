@@ -23,10 +23,13 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"sort"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/phrocker/shoal-oss/internal/cclient"
 	"github.com/phrocker/shoal-oss/pkg/explorer/coordination"
 	"github.com/phrocker/shoal-oss/pkg/explorer/coordination/allocator"
 	"github.com/phrocker/shoal-oss/pkg/explorer/coordination/guard"
@@ -814,6 +817,202 @@ func TestRecoveryRestoresAmbiguousRecordAttemptBinding(t *testing.T) {
 				t.Fatalf("retry duplicated recovered publication = %#v, %v", after, err)
 			}
 		})
+	}
+}
+
+func TestRecoverySerializesHighConcurrencyPendingIndexUpdates(t *testing.T) {
+	config := testRuntimeConfig(t, testDirectory(t))
+	config.RecoveryLimit = 64
+	config.RecoveryConcurrency = 32
+	config.testStageHook = func(stage recoveryStage) error {
+		if stage == recoveryStageIntent {
+			return context.Canceled
+		}
+		return nil
+	}
+	runtime, err := Open(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const publications = 32
+	for index := 0; index < publications; index++ {
+		row := []byte(fmt.Sprintf("recovery-index/%02d", index))
+		intent := committedReadIntent(
+			t,
+			config.Domain,
+			fmt.Sprintf("recovery-index-%02d", index),
+			row,
+			[]byte("value"),
+			guard.ModeAbsentOrIdentical,
+			0,
+			coordination.Digest{},
+		)
+		if _, err := runtime.Publish(
+			context.Background(),
+			Request{Intent: intent},
+		); !errors.Is(err, ErrIndeterminatePublication) {
+			t.Fatalf("stage pending publication %d = %v", index, err)
+		}
+	}
+	if err := runtime.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	config.testStageHook = nil
+	reopened, err := Open(config)
+	if err != nil {
+		t.Fatalf("high-concurrency recovery open = %v", err)
+	}
+	defer reopened.Close()
+	if pending, err := reopened.PendingPublications(
+		context.Background(),
+	); err != nil || pending {
+		t.Fatalf("pending after high-concurrency recovery = %v, %v", pending, err)
+	}
+}
+
+func TestPendingIndexSupportsMaximumRecoveryConcurrency(t *testing.T) {
+	config := testRuntimeConfig(t, testDirectory(t))
+	runtime, err := Open(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.Close()
+	const workers = 64
+	txns := make([]coordination.TXN, 0, workers)
+	for index := 0; index < workers; index++ {
+		txn, err := DeriveTXN(
+			config.Domain,
+			[]byte("index-concurrency"),
+			[]byte(fmt.Sprintf("token-%03d", index)),
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := runtime.intents.addPending(
+			context.Background(),
+			txn,
+		); err != nil {
+			t.Fatal(err)
+		}
+		txns = append(txns, txn)
+	}
+	start := make(chan struct{})
+	errs := make(chan error, workers)
+	var wait sync.WaitGroup
+	for _, txn := range txns {
+		txn := append(coordination.TXN(nil), txn...)
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			<-start
+			errs <- runtime.intents.removePending(context.Background(), txn)
+		}()
+	}
+	close(start)
+	wait.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent pending index removal = %v", err)
+		}
+	}
+	if err := runtime.intents.IndexPending(context.Background(), 1, 1); err != nil {
+		t.Fatal(err)
+	}
+	if runtime.intents.HasPending() {
+		t.Fatal("pending index retained entries after concurrent removal")
+	}
+}
+
+func TestTerminalRecordAttemptCanAdvanceToNewRetryGeneration(t *testing.T) {
+	config := testRuntimeConfig(t, testDirectory(t))
+	fired := false
+	config.testStageHook = func(stage recoveryStage) error {
+		if stage == recoveryStagePhysical && !fired {
+			fired = true
+			return context.Canceled
+		}
+		return nil
+	}
+	runtime, err := Open(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := testRecordPublication("document", "revision", "first-envelope", nil)
+	if _, err := runtime.PublishRecord(
+		context.Background(),
+		first,
+	); !errors.Is(err, ErrIndeterminatePublication) {
+		t.Fatalf("stage first record attempt = %v", err)
+	}
+	firstTXN, found, err := runtime.intents.Attempt(
+		context.Background(),
+		first.RecordKey,
+	)
+	if err != nil || !found {
+		t.Fatalf("first record attempt binding = %x, %v, %v", firstTXN, found, err)
+	}
+	snapshot, err := runtime.Inspect(context.Background(), firstTXN)
+	if err != nil || snapshot.Root.Epoch == 0 {
+		t.Fatalf("first staged transaction = %#v, %v", snapshot, err)
+	}
+	corrupt, err := cclient.NewMutation(first.Row)
+	if err != nil {
+		t.Fatal(err)
+	}
+	corrupt.Put(
+		first.Family,
+		first.Qualifier,
+		first.Visibility,
+		int64(snapshot.Root.Epoch),
+		[]byte("corrupt"),
+	)
+	if err := runtime.engine.Write(
+		first.Table,
+		[]*cclient.Mutation{corrupt},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.Recover(context.Background()); err != nil {
+		t.Fatalf("poison first record attempt = %v", err)
+	}
+	snapshot, err = runtime.Inspect(context.Background(), firstTXN)
+	if err != nil || snapshot.Root.State != coordination.StatePoisoned {
+		t.Fatalf("terminal first record attempt = %#v, %v", snapshot, err)
+	}
+	if attempt, err := runtime.RecordAttempt(
+		context.Background(),
+		first,
+	); err != nil || attempt != nil {
+		t.Fatalf("terminal record attempt remained reusable = %#v, %v", attempt, err)
+	}
+	if err := runtime.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	config.testStageHook = nil
+	reopened, err := Open(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	retry := first
+	retry.Value = []byte("second-envelope")
+	result, err := reopened.PublishRecord(context.Background(), retry)
+	if err != nil || result.Epoch <= snapshot.Root.Epoch {
+		t.Fatalf("retry after terminal attempt = %#v, %v", result, err)
+	}
+	retryTXN, found, err := reopened.intents.Attempt(
+		context.Background(),
+		retry.RecordKey,
+	)
+	if err != nil || !found || bytes.Equal(retryTXN, firstTXN) {
+		t.Fatalf("retry attempt generation = %x, %v, %v", retryTXN, found, err)
+	}
+	replayed, err := reopened.PublishRecord(context.Background(), retry)
+	if err != nil || !replayed.Unchanged || replayed.Epoch != result.Epoch {
+		t.Fatalf("terminal retry replay = %#v, %v", replayed, err)
 	}
 }
 

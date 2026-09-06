@@ -100,12 +100,13 @@ type ResultIdentity struct {
 // Intent is the durable logical input to a publication. It is normalized and
 // canonically encoded before any transaction-root or physical mutation.
 type Intent struct {
-	Operation []byte           `json:"operation"`
-	Token     []byte           `json:"token"`
-	RecordKey []byte           `json:"record_key,omitempty"`
-	Cells     []Cell           `json:"cells"`
-	Guards    []GuardIntent    `json:"guards,omitempty"`
-	Results   []ResultIdentity `json:"results,omitempty"`
+	Operation   []byte           `json:"operation"`
+	Token       []byte           `json:"token"`
+	RecordKey   []byte           `json:"record_key,omitempty"`
+	RecordToken []byte           `json:"record_token,omitempty"`
+	Cells       []Cell           `json:"cells"`
+	Guards      []GuardIntent    `json:"guards,omitempty"`
+	Results     []ResultIdentity `json:"results,omitempty"`
 }
 
 // LogicalDigest returns the digest used for idempotent intent comparison and
@@ -138,6 +139,7 @@ type IntentStore struct {
 	domain     coordination.DomainID
 	visibility []byte
 	store      allocator.Store
+	indexMu    sync.Mutex
 	pendingMu  sync.RWMutex
 	pending    map[string]struct{}
 }
@@ -409,7 +411,9 @@ func (s *IntentStore) Candidates(
 			return nil, nil, errors.New("explorer coordination: invalid intent recovery cursor")
 		}
 	}
+	s.indexMu.Lock()
 	index, _, _, err := s.readPendingIndex(ctx)
+	s.indexMu.Unlock()
 	if err != nil {
 		return nil, nil, err
 	}
@@ -442,8 +446,10 @@ func (s *IntentStore) IndexPending(
 			errors.New("pending intent index bounds are invalid"),
 		)
 	}
+	s.indexMu.Lock()
 	index, _, _, err := s.readPendingIndex(ctx)
 	if err != nil {
+		s.indexMu.Unlock()
 		return err
 	}
 	s.pendingMu.Lock()
@@ -452,6 +458,7 @@ func (s *IntentStore) IndexPending(
 		s.pending[string(txn)] = struct{}{}
 	}
 	s.pendingMu.Unlock()
+	s.indexMu.Unlock()
 	return nil
 }
 
@@ -506,6 +513,8 @@ func (s *IntentStore) updatePendingIndex(
 	if err := txn.Validate(); err != nil {
 		return errors.Join(transaction.ErrInvalid, err)
 	}
+	s.indexMu.Lock()
+	defer s.indexMu.Unlock()
 	for attempt := 0; attempt <= 7; attempt++ {
 		index, encoded, found, err := s.readPendingIndex(ctx)
 		if err != nil {
@@ -1035,6 +1044,9 @@ func validateIntent(intent Intent) error {
 	if len(intent.RecordKey) > coordination.MaxOpaqueIDBytes {
 		return errors.Join(transaction.ErrInvalid, errors.New("record key exceeds its bound"))
 	}
+	if len(intent.RecordToken) > coordination.MaxOpaqueIDBytes {
+		return errors.Join(transaction.ErrInvalid, errors.New("record token exceeds its bound"))
+	}
 	if len(intent.Cells) == 0 || len(intent.Cells) > maxIntentCells {
 		return errors.Join(transaction.ErrInvalid, errors.New("intent cell count is outside its bound"))
 	}
@@ -1307,12 +1319,13 @@ func buildPlan(intent Intent, logical coordination.Digest) (transaction.Plan, er
 
 func cloneIntent(intent Intent) Intent {
 	result := Intent{
-		Operation: append([]byte(nil), intent.Operation...),
-		Token:     append([]byte(nil), intent.Token...),
-		RecordKey: append([]byte(nil), intent.RecordKey...),
-		Cells:     append([]Cell(nil), intent.Cells...),
-		Guards:    append([]GuardIntent(nil), intent.Guards...),
-		Results:   append([]ResultIdentity(nil), intent.Results...),
+		Operation:   append([]byte(nil), intent.Operation...),
+		Token:       append([]byte(nil), intent.Token...),
+		RecordKey:   append([]byte(nil), intent.RecordKey...),
+		RecordToken: append([]byte(nil), intent.RecordToken...),
+		Cells:       append([]Cell(nil), intent.Cells...),
+		Guards:      append([]GuardIntent(nil), intent.Guards...),
+		Results:     append([]ResultIdentity(nil), intent.Results...),
 	}
 	for index := range result.Cells {
 		source := intent.Cells[index]

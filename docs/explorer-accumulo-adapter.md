@@ -1807,10 +1807,12 @@ checks therefore inspect only outstanding work; completed corpus history does
 not consume the recovery page budget or make each ingest scan old tombstones.
 A record publication also stores its stable record-key binding in the canonical
 intent, allowing recovery to restore or verify an ambiguous alias before any
-physical publication. A retry of an Explorer document publication reloads the
-exact encoded attempted record, including its original publication time,
-sequence, and expected entity head, instead of regenerating transient values
-under the same TXN.
+physical publication. A non-committed terminal attempt is released and its TXN
+is folded into the next deterministic retry token before the record key is
+rebound. A retry of an active or committed Explorer document publication
+reloads the exact encoded attempted record, including its original publication
+time, sequence, and expected entity head, instead of regenerating transient
+values under the same TXN.
 
 The transaction runtime accepts only `localwal.SyncFull`. `SyncNormal` and
 `SyncOff` are rejected before the engine is opened because coordination and

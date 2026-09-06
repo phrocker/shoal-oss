@@ -22,6 +22,7 @@ package explorercoord
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"sort"
@@ -600,7 +601,11 @@ func (r *Runtime) recordIntent(
 	recordKey []byte,
 	lpart coordination.LPART,
 ) (Intent, error) {
-	txn, err := DeriveTXN(r.domain, request.Operation, request.Token)
+	token, err := r.recordIntentToken(ctx, request, recordKey)
+	if err != nil {
+		return Intent{}, err
+	}
+	txn, err := DeriveTXN(r.domain, request.Operation, token)
 	if err != nil {
 		return Intent{}, err
 	}
@@ -637,9 +642,10 @@ func (r *Runtime) recordIntent(
 		mode = guard.ModeMutate
 	}
 	return Intent{
-		Operation: append([]byte(nil), request.Operation...),
-		Token:     append([]byte(nil), request.Token...),
-		RecordKey: append([]byte(nil), recordKey...),
+		Operation:   append([]byte(nil), request.Operation...),
+		Token:       append([]byte(nil), token...),
+		RecordKey:   append([]byte(nil), recordKey...),
+		RecordToken: append([]byte(nil), request.Token...),
 		Cells: []Cell{{
 			Table: request.Table, Row: append([]byte(nil), request.Row...),
 			Family:     append([]byte(nil), request.Family...),
@@ -665,6 +671,53 @@ func (r *Runtime) recordIntent(
 			ID:   append([]byte(nil), request.ResultID...),
 		}},
 	}, nil
+}
+
+func (r *Runtime) recordIntentToken(
+	ctx context.Context,
+	request explorer.RecordPublication,
+	recordKey []byte,
+) ([]byte, error) {
+	current, found, err := r.intents.Attempt(ctx, recordKey)
+	if err != nil {
+		return nil, err
+	}
+	if !found {
+		return append([]byte(nil), request.Token...), nil
+	}
+	record, err := r.intents.Load(ctx, current)
+	if err != nil {
+		return nil, err
+	}
+	if r.intentMatchesRecord(record.Intent, request) {
+		expected := record.Intent.Guards[0]
+		if expected.ExpectedEpoch != request.ExpectedEpoch ||
+			expected.ExpectedDigest != request.ExpectedDigest {
+			return nil, transaction.ErrConflict
+		}
+		return append([]byte(nil), record.Intent.Token...), nil
+	}
+	snapshot, err := r.coordinator.Inspect(ctx, current)
+	if err != nil {
+		return nil, err
+	}
+	if !snapshot.Root.State.Terminal() ||
+		snapshot.Root.State == coordination.StateCommitted {
+		return nil, transaction.ErrConflict
+	}
+	if err := r.settleTerminalGuards(
+		ctx,
+		current,
+		record.Intent,
+		snapshot.Root.State,
+	); err != nil {
+		return nil, err
+	}
+	hash := sha256.New()
+	writeDigestPart(hash, []byte("shoal-record-retry-v1"))
+	writeDigestPart(hash, request.Token)
+	writeDigestPart(hash, current)
+	return hash.Sum(nil), nil
 }
 
 func (r *Runtime) RecordHead(
@@ -798,7 +851,7 @@ func (r *Runtime) intentMatchesRecord(
 	request explorer.RecordPublication,
 ) bool {
 	if !bytes.Equal(intent.Operation, request.Operation) ||
-		!bytes.Equal(intent.Token, request.Token) ||
+		!bytes.Equal(intent.RecordToken, request.Token) ||
 		len(intent.Cells) != 1 || len(intent.Guards) != 1 || len(intent.Results) != 1 {
 		return false
 	}
@@ -968,6 +1021,14 @@ func (r *Runtime) recoverIntent(ctx context.Context, txn coordination.TXN) error
 	switch {
 	case inspectErr == nil && snapshot.Root.State.Terminal() &&
 		snapshot.Root.State != coordination.StateCommitted:
+		if err := r.settleTerminalGuards(
+			ctx,
+			txn,
+			record.Intent,
+			snapshot.Root.State,
+		); err != nil {
+			return err
+		}
 		return r.intents.Settle(ctx, txn, record.LogicalDigest)
 	case inspectErr == nil && snapshot.Root.State.Nonterminal() &&
 		snapshot.Lease.LeaseUntil.After(r.clock().UTC()) &&
@@ -989,6 +1050,14 @@ func (r *Runtime) recoverIntent(ctx context.Context, txn coordination.TXN) error
 		snapshot, inspectErr := r.coordinator.Inspect(ctx, txn)
 		if inspectErr == nil && snapshot.Root.State.Terminal() &&
 			snapshot.Root.State != coordination.StateCommitted {
+			if settleErr := r.settleTerminalGuards(
+				ctx,
+				txn,
+				record.Intent,
+				snapshot.Root.State,
+			); settleErr != nil {
+				return errors.Join(err, settleErr)
+			}
 			return r.intents.Settle(ctx, txn, record.LogicalDigest)
 		}
 		if inspectErr != nil && !errors.Is(inspectErr, transaction.ErrNotFound) {
@@ -1002,6 +1071,32 @@ func (r *Runtime) recoverIntent(ctx context.Context, txn coordination.TXN) error
 		return err
 	}
 	return r.intents.Settle(ctx, record.TXN, record.LogicalDigest)
+}
+
+func (r *Runtime) settleTerminalGuards(
+	ctx context.Context,
+	txn coordination.TXN,
+	intent Intent,
+	state coordination.TxnState,
+) error {
+	for _, expected := range intent.Guards {
+		_, pending, err := r.guards.Read(ctx, expected.Entity)
+		if err != nil {
+			return err
+		}
+		if pending == nil || !pending.Active ||
+			!bytes.Equal(pending.Intent.TXN, txn) {
+			continue
+		}
+		if err := r.guards.Abort(
+			ctx,
+			*pending,
+			state == coordination.StateConflicted,
+		); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (r *Runtime) recoverPending(
