@@ -110,8 +110,8 @@ func TestActionRecorderRejectsAbsentAndDivergentResult(t *testing.T) {
 		!explorer.IsCommittedInteraction(err) {
 		t.Fatalf("divergent result error = %v", err)
 	}
-	if got := sink.sessions[0].AuthorizationOperation; got != "" {
-		t.Fatalf("unpinned authorization operation = %q", got)
+	if got := sink.sessions[0].AuthorizationOperation; got != string(auth.OperationDispatch) {
+		t.Fatalf("authorization operation = %q", got)
 	}
 }
 

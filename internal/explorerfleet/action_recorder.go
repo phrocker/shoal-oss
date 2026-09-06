@@ -67,6 +67,7 @@ func (r *ActionRecorder) RecordAction(
 	}
 	requested := interaction.Session{
 		ID: actionSessionID(audit), Operation: interaction.OperationToolCall,
+		AuthorizationOperation: string(audit.Operation),
 		QueryDigest: interaction.Digest(
 			string(audit.Operation) + ":" + audit.Phase),
 		RequestID:  audit.Record.RequestID,
@@ -85,7 +86,6 @@ func (r *ActionRecorder) RecordAction(
 		}},
 	}
 	if len(evidence) > 0 {
-		requested.AuthorizationOperation = string(audit.Operation)
 		requested.SnapshotID = audit.Record.EvidenceSnapshotID
 		requested.SnapshotAsOf = audit.Record.EvidenceSnapshotAsOf
 		requested.AuthorizationFingerprint = shoal.ID(
