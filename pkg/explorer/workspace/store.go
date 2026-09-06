@@ -275,6 +275,14 @@ func (s *DurableStore) CompareAndSwap(
 		if current.Revision != expectedRevision {
 			return Settings{}, versionConflict()
 		}
+		currentSettings, err := settingsFromPersisted(current)
+		if err != nil {
+			return Settings{}, corruptSettings(err)
+		}
+		if err := ensureMonotonic(
+			currentSettings.Narrowing, normalized); err != nil {
+			return Settings{}, err
+		}
 	} else if expectedRevision != 0 {
 		return Settings{}, versionConflict()
 	}

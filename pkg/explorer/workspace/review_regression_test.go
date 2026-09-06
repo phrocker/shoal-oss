@@ -642,3 +642,45 @@ func TestReviewSettingsRejectConcurrentDirectoryOpen(t *testing.T) {
 		t.Fatal("two independent settings engines accepted the same WAL directory")
 	}
 }
+
+func TestReviewStoreCASRechecksMonotonicityAtAcceptedRevision(t *testing.T) {
+	store, err := OpenDurableStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if _, err := store.CompareAndSwap(
+		context.Background(), "race-monotonic", "owner", []byte("domain"),
+		0, "create", Narrowing{},
+	); err != nil {
+		t.Fatal(err)
+	}
+	topK := uint32(5)
+	narrowed, err := store.CompareAndSwap(
+		context.Background(), "race-monotonic", "owner", []byte("domain"),
+		1, "narrow", Narrowing{
+			Budgets: Budgets{RetrievalTopK: &topK},
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if narrowed.Revision != 2 {
+		t.Fatalf("narrowed revision = %d", narrowed.Revision)
+	}
+	if _, err := store.CompareAndSwap(
+		context.Background(), "race-monotonic", "owner", []byte("domain"),
+		2, "stale-future", Narrowing{},
+	); !shoal.IsErrorCode(err, shoal.ErrorUnauthorized) {
+		t.Fatalf("store widening error = %v", err)
+	}
+	current, err := store.Load(context.Background(), "race-monotonic")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.Revision != 2 ||
+		current.Narrowing.Budgets.RetrievalTopK == nil ||
+		*current.Narrowing.Budgets.RetrievalTopK != topK {
+		t.Fatalf("current settings = %#v", current)
+	}
+}
