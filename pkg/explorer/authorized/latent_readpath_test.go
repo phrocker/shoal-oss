@@ -43,6 +43,12 @@ type pagedCountingCanonicalBase struct {
 	pageCalls int
 }
 
+type mutatingDocumentsCanonicalBase struct {
+	*explorer.Explorer
+	documentsCalls int
+	mutated        bool
+}
+
 func (b *countingCanonicalBase) Documents(
 	ctx context.Context,
 ) ([]explorer.DocumentSummary, error) {
@@ -55,6 +61,29 @@ func (b *countingCanonicalBase) Document(
 ) (explorer.DocumentView, error) {
 	b.documentCalls++
 	return b.Explorer.Document(ctx, documentID, revisionID)
+}
+
+func (b *mutatingDocumentsCanonicalBase) Documents(
+	ctx context.Context,
+) ([]explorer.DocumentSummary, error) {
+	documents, err := b.Explorer.Documents(ctx)
+	b.documentsCalls++
+	if err != nil || b.mutated || b.documentsCalls < 2 {
+		return documents, err
+	}
+	b.mutated = true
+	return documents, nil
+}
+
+func (b *mutatingDocumentsCanonicalBase) Snapshot(
+	ctx context.Context,
+) (explorer.Snapshot, error) {
+	snapshot, err := b.Explorer.Snapshot(ctx)
+	if err == nil && b.mutated {
+		snapshot.ID += "-after-documents"
+		snapshot.Frontier++
+	}
+	return snapshot, err
 }
 
 func (b *pagedCountingCanonicalBase) BoundedNeighborhood(
@@ -149,6 +178,39 @@ func TestAuthorizedDerivedAssertionsShareCanonicalNodeHydration(t *testing.T) {
 			"canonical hydration calls = Documents:%d Document:%d, want 2 and 3",
 			counted.documentsCalls, counted.documentCalls,
 		)
+	}
+}
+
+func TestAuthorizedBoundedSnapshotPrecedesCanonicalIndex(t *testing.T) {
+	f := newFixture(t)
+	source, err := f.clientA.Ingest(f.admin(t), explorer.Source{
+		URI:       "file:///snapshot-ordering-source.txt",
+		MediaType: explorer.MediaTypeText,
+		Content:   "snapshot ordering source",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := &mutatingDocumentsCanonicalBase{
+		Explorer: f.base,
+	}
+	client := f.newClient(t, base, f.store, f.sourceA, f.policyA, nil)
+	_, err = client.BoundedNeighborhood(
+		f.alice(t),
+		explorer.BoundedNeighborhoodRequest{
+			NodeIDs:         []shoal.ID{source.Document.ID},
+			Depth:           1,
+			Fanout:          10,
+			MaxNodes:        10,
+			MaxScannedEdges: 10,
+			Direction:       explorer.GraphDirectionBoth,
+		},
+	)
+	if !shoal.IsErrorCode(err, shoal.ErrorConflict) {
+		t.Fatalf("bounded snapshot ordering error = %v, want conflict", err)
+	}
+	if !base.mutated {
+		t.Fatal("canonical index did not trigger test mutation")
 	}
 }
 

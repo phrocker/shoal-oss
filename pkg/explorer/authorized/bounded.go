@@ -290,7 +290,7 @@ func (c *Client) BoundedNeighborhood(
 	if authorizedCursorEligible(normalized) {
 		return c.boundedAuthorizedNeighborhoodPage(
 			ctx, bounded, request, normalized, decision, guard, now, direction,
-			auth.OperationNeighborhood, true)
+			auth.OperationNeighborhood, true, true)
 	}
 	raw, err := bounded.BoundedNeighborhood(ctx, request)
 	if err != nil {
@@ -402,16 +402,20 @@ func (c *Client) boundedAuthorizedNeighborhoodPage(
 	direction explorer.GraphDirection,
 	operation auth.Operation,
 	applyLens bool,
+	validateSnapshot bool,
 ) (explorer.BoundedNeighborhood, error) {
-	ctx = withNeighborhoodAuthorizationCache(ctx)
+	var before explorer.Snapshot
 	var err error
+	if validateSnapshot {
+		before, err = bounded.Snapshot(ctx)
+		if err != nil {
+			return explorer.BoundedNeighborhood{}, directBaseError(err)
+		}
+	}
+	ctx = withNeighborhoodAuthorizationCache(ctx)
 	ctx, err = c.withCanonicalDocumentIndex(ctx)
 	if err != nil {
 		return explorer.BoundedNeighborhood{}, err
-	}
-	before, err := bounded.Snapshot(ctx)
-	if err != nil {
-		return explorer.BoundedNeighborhood{}, directBaseError(err)
 	}
 	scan := request
 	scan.Depth = 1
@@ -525,13 +529,15 @@ func (c *Client) boundedAuthorizedNeighborhoodPage(
 	if err := guard.Check(ctx); err != nil {
 		return explorer.BoundedNeighborhood{}, err
 	}
-	afterSnapshot, err := bounded.Snapshot(ctx)
-	if err != nil {
-		return explorer.BoundedNeighborhood{}, directBaseError(err)
-	}
-	if before != afterSnapshot {
-		return explorer.BoundedNeighborhood{}, shoal.NewError(
-			shoal.ErrorConflict, "corpus changed while scanning bounded graph")
+	if validateSnapshot {
+		afterSnapshot, snapshotErr := bounded.Snapshot(ctx)
+		if snapshotErr != nil {
+			return explorer.BoundedNeighborhood{}, directBaseError(snapshotErr)
+		}
+		if before != afterSnapshot {
+			return explorer.BoundedNeighborhood{}, shoal.NewError(
+				shoal.ErrorConflict, "corpus changed while scanning bounded graph")
+		}
 	}
 	result := authorizedBoundedPage(
 		nodes, edges, assertions, request, len(normalized.NodeIDs))
