@@ -169,6 +169,15 @@ func TestMountAuthenticatedRejectsUnsafeConfigurationAtomically(t *testing.T) {
 	); !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
 		t.Fatalf("normalized public mount error = %v", err)
 	}
+	for _, pattern := range []string{
+		"/api/v1/foo/../bar/", "/api/v1/meta", "/api/v1/ontology/custom/",
+	} {
+		if err := handler.MountAuthenticated(
+			pattern, http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}),
+		); !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
+			t.Fatalf("unsafe mount %q error = %v", pattern, err)
+		}
+	}
 	first := http.HandlerFunc(func(http.ResponseWriter, *http.Request) {})
 	if err := handler.MountAuthenticated("/mounted/", first); err != nil {
 		t.Fatal(err)
@@ -177,6 +186,11 @@ func TestMountAuthenticatedRejectsUnsafeConfigurationAtomically(t *testing.T) {
 		"/mounted/", http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}),
 	); !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
 		t.Fatalf("duplicate mount error = %v", err)
+	}
+	if err := handler.MountAuthenticated(
+		"/mounted", http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}),
+	); !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
+		t.Fatalf("normalized duplicate mount error = %v", err)
 	}
 	if reflect.ValueOf(handler.mountedHandler("/mounted/path")).Pointer() !=
 		reflect.ValueOf(first).Pointer() {

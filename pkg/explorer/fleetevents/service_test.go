@@ -33,6 +33,14 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
+func TestDeriveIDLengthFramesOpaqueParts(t *testing.T) {
+	left := deriveID("opaque", []byte{'a', 0, 'b'}, []byte("c"))
+	right := deriveID("opaque", []byte("a"), []byte{'b', 0, 'c'})
+	if bytes.Equal(left, right) {
+		t.Fatal("length-distinct opaque identity parts collided")
+	}
+}
+
 func TestCursorTamperCrossSubscriberAndRevocation(t *testing.T) {
 	now := time.Date(2026, 9, 5, 20, 0, 0, 0, time.UTC)
 	backend := &memoryBackend{}

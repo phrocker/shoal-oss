@@ -23,7 +23,9 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"errors"
+	"hash"
 	"time"
 
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
@@ -593,10 +595,16 @@ func nonDisclosingSubscriptionError(err error) error {
 
 func deriveID(tag string, parts ...[]byte) []byte {
 	hash := sha256.New()
-	hash.Write([]byte(tag))
+	writeHashField(hash, []byte(tag))
 	for _, part := range parts {
-		hash.Write([]byte{0})
-		hash.Write(part)
+		writeHashField(hash, part)
 	}
 	return hash.Sum(nil)
+}
+
+func writeHashField(hash hash.Hash, value []byte) {
+	var size [8]byte
+	binary.BigEndian.PutUint64(size[:], uint64(len(value)))
+	_, _ = hash.Write(size[:])
+	_, _ = hash.Write(value)
 }

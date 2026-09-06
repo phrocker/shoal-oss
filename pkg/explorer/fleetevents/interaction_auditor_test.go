@@ -84,13 +84,10 @@ func TestInteractionAuditorRecordsRedactedAction(t *testing.T) {
 		sink.sessions[0].Actor.ClientID != "" ||
 		len(sink.sessions[0].Actor.OnBehalfOf) != 0 ||
 		sink.sessions[0].Reason != (interaction.Reason{}) ||
-		len(sink.sessions[0].TouchedNodeIDs()) != 6 {
+		len(sink.sessions[0].TouchedNodeIDs()) != 1 {
 		t.Fatalf("session = %#v", sink.sessions)
 	}
-	if got := sink.sessions[0].TouchedNodeIDs(); got[0] != "anchor-a" ||
-		got[1] != "edge-a" || got[2] != "node-a" ||
-		got[3] != "object-a" || got[4] != "object-b" ||
-		got[5] != "revision-a" {
+	if got := sink.sessions[0].TouchedNodeIDs(); got[0] != "node-a" {
 		t.Fatalf("evidence = %#v", sink.sessions[0].TouchedNodeIDs())
 	}
 }

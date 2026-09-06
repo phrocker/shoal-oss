@@ -22,6 +22,7 @@ package authorized
 import (
 	"context"
 	"reflect"
+	"strings"
 	"time"
 
 	"github.com/phrocker/shoal-oss/pkg/explorer"
@@ -167,6 +168,8 @@ func (c *Client) recordInteraction(
 		retryCanonical.RecordedAt = existingCanonical.RecordedAt
 		retryCanonical.Actor = existingCanonical.Actor
 		retryCanonical.Reason = existingCanonical.Reason
+		retryCanonical.SnapshotID = existingCanonical.SnapshotID
+		retryCanonical.SnapshotAsOf = existingCanonical.SnapshotAsOf
 		retryCanonical, retryErr := retryCanonical.Canonical()
 		currentActor := interaction.ActorContext{
 			SubjectID:  decision.Subject(),
@@ -190,7 +193,7 @@ func (c *Client) recordInteraction(
 			existingCanonical.TouchedNodeIDs(),
 			existingCanonical.TouchedEdgeIDs(),
 			decision,
-			auth.OperationRetrieve,
+			interactionEvidenceOperation(existingCanonical, authorizationOperation),
 			now,
 		); err != nil {
 			return interaction.Session{}, err
@@ -233,11 +236,12 @@ func (c *Client) recordInteraction(
 		canonical.TouchedNodeIDs(),
 		canonical.TouchedEdgeIDs(),
 		decision,
-		auth.OperationRetrieve,
+		interactionEvidenceOperation(canonical, authorizationOperation),
 		now,
 	); err != nil {
 		return interaction.Session{}, err
 	}
+
 	if isNilDependency(c.snapshotValidator) {
 		return interaction.Session{}, shoal.NewError(
 			shoal.ErrorUnavailable,
@@ -343,6 +347,18 @@ func (c *Client) recordInteraction(
 			authorizationDenied())
 	}
 	return persisted, nil
+}
+
+func interactionEvidenceOperation(
+	session interaction.Session, authorized auth.Operation,
+) auth.Operation {
+	for _, turn := range session.Turns {
+		if turn.ToolCall != nil &&
+			strings.HasPrefix(turn.ToolCall.Kind, "fleet.") {
+			return authorized
+		}
+	}
+	return auth.OperationRetrieve
 }
 
 func postCommitInteractionError(

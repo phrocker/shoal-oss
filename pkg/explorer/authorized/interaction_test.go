@@ -1001,8 +1001,11 @@ func TestAuthorizedExactRetrySurvivesPolicyGenerationRefresh(t *testing.T) {
 		[]auth.Operation{auth.OperationRetrieve},
 		2,
 	)
+	retry := session
+	retry.SnapshotID = "newer-snapshot"
+	retry.SnapshotAsOf = retry.SnapshotAsOf.Add(time.Minute)
 	retried, err := f.clientA.RecordInteractionResult(
-		f.context(t, refreshed), session)
+		f.context(t, refreshed), retry)
 	if err != nil {
 		t.Fatalf("exact retry after policy refresh was rejected: %v", err)
 	}
@@ -1011,7 +1014,7 @@ func TestAuthorizedExactRetrySurvivesPolicyGenerationRefresh(t *testing.T) {
 	}
 
 	divergent := session
-	divergent.SnapshotAsOf = divergent.SnapshotAsOf.Add(time.Nanosecond)
+	divergent.QueryDigest = "different"
 	if _, err := f.clientA.RecordInteractionResult(
 		f.context(t, refreshed), divergent,
 	); !shoal.IsErrorCode(err, shoal.ErrorConflict) {

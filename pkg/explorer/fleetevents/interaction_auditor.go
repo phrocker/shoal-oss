@@ -21,6 +21,7 @@ package fleetevents
 
 import (
 	"context"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"reflect"
@@ -62,16 +63,10 @@ func (a *InteractionAuditor) RecordFleetAction(ctx context.Context, record Audit
 	if err != nil {
 		return err
 	}
-	evidenceIDs := make([]shoal.ID, 0, len(record.Evidence)*5)
+	evidenceIDs := make([]shoal.ID, 0, len(record.Evidence))
 	for _, evidence := range record.Evidence {
-		evidenceIDs = append(evidenceIDs, evidence.ObjectID)
-		for _, id := range []shoal.ID{
-			evidence.NodeID, evidence.EdgeID,
-			evidence.AnchorID, evidence.RevisionID,
-		} {
-			if id != "" {
-				evidenceIDs = append(evidenceIDs, id)
-			}
+		if evidence.NodeID != "" {
+			evidenceIDs = append(evidenceIDs, evidence.NodeID)
 		}
 	}
 	session := interaction.Session{
@@ -81,9 +76,8 @@ func (a *InteractionAuditor) RecordFleetAction(ctx context.Context, record Audit
 		AuthorizationExpiresAt: record.AuthorizationExpiresAt,
 		AuthorizationOperation: string(record.Operation),
 		SnapshotID:             shoal.ID(snapshot.ID), SnapshotAsOf: snapshot.AsOf,
-		RequestID: record.RequestID,
-		QueryDigest: interaction.Digest(
-			string(record.ActionID) + "\x00" + string(record.CorrelationID)),
+		RequestID:   record.RequestID,
+		QueryDigest: interaction.Digest(hex.EncodeToString(auditDigest(record))),
 		SeedNodeIDs: evidenceIDs,
 		Turns: []interaction.Turn{{
 			Index: 0, Decision: string(record.Operation),
@@ -113,6 +107,8 @@ func sameFleetReceipt(expected, persisted interaction.Session) bool {
 	expected.RecordedAt = persisted.RecordedAt
 	expected.Actor = persisted.Actor
 	expected.Reason = persisted.Reason
+	expected.SnapshotID = persisted.SnapshotID
+	expected.SnapshotAsOf = persisted.SnapshotAsOf
 	canonicalExpected, err := expected.Canonical()
 	if err != nil {
 		return false
@@ -122,4 +118,31 @@ func sameFleetReceipt(expected, persisted interaction.Session) bool {
 		return false
 	}
 	return reflect.DeepEqual(canonicalExpected, canonicalPersisted)
+}
+
+func auditDigest(record AuditRecord) []byte {
+	parts := [][]byte{
+		[]byte(record.Operation), record.ActionID, []byte(record.RequestID),
+		record.CorrelationID, record.ObjectID, encodedUint64(uint64(len(record.Evidence))),
+	}
+	for _, evidence := range record.Evidence {
+		parts = append(parts,
+			evidence.SourceID, evidence.PolicyID, []byte(evidence.ObjectID),
+			[]byte(evidence.NodeID), []byte(evidence.EdgeID),
+			[]byte(evidence.AnchorID), []byte(evidence.RevisionID),
+		)
+		parts = append(parts, encodedUint64(uint64(evidence.Start)),
+			encodedUint64(uint64(evidence.End)),
+			encodedUint64(uint64(len(evidence.Visibility))))
+		for _, visibility := range evidence.Visibility {
+			parts = append(parts, []byte(visibility))
+		}
+	}
+	return deriveID("fleet-action-audit-v2", parts...)
+}
+
+func encodedUint64(value uint64) []byte {
+	encoded := make([]byte, 8)
+	binary.BigEndian.PutUint64(encoded, value)
+	return encoded
 }

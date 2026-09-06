@@ -49,20 +49,45 @@ func (h *Handler) MountAuthenticated(
 			"authenticated mount requires authentication dependencies")
 	}
 	cleaned := path.Clean(pattern)
-	if !strings.HasPrefix(pattern, "/") || pattern == "/" ||
+	canonical := cleaned
+	if strings.HasSuffix(pattern, "/") && canonical != "/" {
+		canonical += "/"
+	}
+	if !strings.HasPrefix(pattern, "/") || pattern == "/" || pattern != canonical ||
 		cleaned == "/api/v1/auth-config" ||
-		cleaned == "/assets" || strings.HasPrefix(cleaned, "/assets/") {
+		cleaned == "/assets" || strings.HasPrefix(cleaned, "/assets/") ||
+		conflictsWithWorkspaceRoute(cleaned) {
 		return shoal.NewError(
 			shoal.ErrorInvalidArgument, "authenticated mount pattern is invalid")
 	}
-	if _, exists := h.authenticatedMounts[pattern]; exists {
-		return shoal.NewError(
-			shoal.ErrorInvalidArgument,
-			"authenticated mount pattern conflicts with an existing route")
+	root := strings.TrimSuffix(pattern, "/")
+	for mounted := range h.authenticatedMounts {
+		if strings.TrimSuffix(mounted, "/") == root {
+			return shoal.NewError(
+				shoal.ErrorInvalidArgument,
+				"authenticated mount pattern conflicts with an existing route")
+		}
 	}
 	h.authenticatedMounts[pattern] = handler
 	if validator, ok := handler.(preAuthenticationValidator); ok {
 		h.preAuth[pattern] = validator
 	}
 	return nil
+}
+
+func conflictsWithWorkspaceRoute(mount string) bool {
+	protected := []string{
+		"/api/v1/meta", "/api/v1/identity", "/api/v1/ontology",
+		"/api/v1/auth-config", "/api/v1/ingest", "/api/v1/extract",
+		"/api/v1/derivation/recompute", "/api/v1/changes",
+		"/api/v1/documents", "/api/v1/document", "/api/v1/retrieve",
+		"/api/v1/neighborhood", "/api/v1/path", "/api/v1/analytics",
+	}
+	for _, route := range protected {
+		if mount == route || strings.HasPrefix(route, mount+"/") ||
+			strings.HasPrefix(mount, route+"/") {
+			return true
+		}
+	}
+	return false
 }
