@@ -150,6 +150,18 @@ func TestOntologyInterpretationReportsUseOpaqueIDCodec(t *testing.T) {
 		reports[0].Predicate != encodeID(property.ID()) {
 		t.Fatalf("interpretation report IDs = %#v", reports)
 	}
+	projected, err := ProjectOntologyIdentity(identity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := ParseOntologyIdentityProjection(projected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parsed != identity || projected.SchemaID != encodeID(identity.SchemaID()) ||
+		projected.VersionID != encodeID(identity.VersionID()) {
+		t.Fatalf("identity projection round trip = %#v / %v", projected, parsed)
+	}
 }
 
 type allowlistStubService struct{}
