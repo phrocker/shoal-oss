@@ -30,23 +30,26 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
-// EnsureInteractionSink verifies only the configured durable write path.
-// Authorization is operation-specific and is therefore enforced by
-// RecordInteractionResult after the Session declares AuthorizationOperation;
-// requiring Retrieve here would incorrectly reject evidence-empty privileged
-// action recorders during setup.
+// EnsureInteractionSink verifies the caller's credential and the configured
+// durable write path. Setup is not pinned to one operation: authorization for
+// the recorded work is operation-specific and is enforced by
+// RecordInteractionResult once the Session declares AuthorizationOperation,
+// and requiring Retrieve here would incorrectly reject evidence-empty
+// privileged action recorders. It still requires a live credential that grants
+// something, because the base sink probe is a durable write.
 func (c *Client) EnsureInteractionSink(ctx context.Context) error {
-	if err := contextFailure(ctx); err != nil {
+	writer, err := c.interactionWriter()
+	if err != nil {
 		return err
 	}
-	writer, err := c.interactionWriter()
+	guard, err := c.beginAny(ctx)
 	if err != nil {
 		return err
 	}
 	if err := writer.EnsureInteractionSink(ctx); err != nil {
 		return directBaseError(err)
 	}
-	return contextFailure(ctx)
+	return guard.Check(ctx)
 }
 
 // RecordInteraction appends one redacted interaction after verifying that its

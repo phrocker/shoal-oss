@@ -457,6 +457,27 @@ func TestAuthorizedInteractionReauthorizesExactSourceEdge(t *testing.T) {
 	}
 }
 
+func TestAuthorizedRecorderSetupRequiresLiveCredential(t *testing.T) {
+	f := newFixture(t)
+	if err := f.clientA.EnsureInteractionSink(
+		context.Background(),
+	); !shoal.IsErrorCode(err, shoal.ErrorUnauthorized) {
+		t.Fatalf("credential-less recorder setup = %v", err)
+	}
+	expired := f.decision(
+		t, "expired-recorder",
+		[][]byte{f.sourceA}, [][]byte{f.policyA},
+		[]auth.Operation{auth.OperationConnect},
+	)
+	ctx := f.context(t, expired)
+	f.clock.Set(expired.AuthenticationExpires().Add(time.Second))
+	if err := f.clientA.EnsureInteractionSink(
+		ctx,
+	); !shoal.IsErrorCode(err, shoal.ErrorUnauthorized) {
+		t.Fatalf("expired recorder setup = %v", err)
+	}
+}
+
 func TestAuthorizedRecorderSetupSupportsEvidenceEmptyActionOnlyGrant(t *testing.T) {
 	f := newFixture(t)
 	snapshot, err := f.base.Snapshot(context.Background())
