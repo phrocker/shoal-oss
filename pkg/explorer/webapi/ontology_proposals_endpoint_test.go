@@ -464,6 +464,21 @@ func TestOntologyProposalMorphismUsesKeyReferencesAndWireCodecs(t *testing.T) {
 	request := ontologyProposalRequest("v2")
 	request.ProposedVersion.Relationships[0].Key = "belongs_to"
 	request.ProposedVersion.Relationships[0].Name = "Belongs to"
+	evidenceDraft := webapi.OntologyMorphismEvidenceDraft{
+		Citation: document.Citation{
+			DocumentID: "document:opaque/value", RevisionID: "revision:opaque/value",
+			SectionID: "section:opaque/value", SpanID: "span:opaque/value",
+			Range: document.SourceRange{
+				Start: document.SourcePosition{Offset: 0, Page: 1},
+				End:   document.SourcePosition{Offset: 4, Page: 1},
+			},
+		},
+		Quote: "rename evidence",
+		Path: &graph.Path{Nodes: []graph.Node{{
+			ID: "node:opaque/value", Kind: "evidence",
+		}}},
+		Metadata: shoal.Metadata{"source": "test"},
+	}
 	request.Morphisms = []webapi.OntologyMorphismDraft{{
 		Kind: ontology.MorphismRename,
 		Sources: []webapi.OntologyDefinitionReferenceDraft{{
@@ -472,26 +487,12 @@ func TestOntologyProposalMorphismUsesKeyReferencesAndWireCodecs(t *testing.T) {
 		Targets: []webapi.OntologyDefinitionReferenceDraft{{
 			Namespace: "relationship", Key: "belongs_to",
 		}},
-		Evidence: []webapi.OntologyMorphismEvidenceDraft{{
-			Citation: document.Citation{
-				DocumentID: "doc", RevisionID: "rev",
-				SectionID: "section", SpanID: "span",
-				Range: document.SourceRange{
-					Start: document.SourcePosition{Offset: 0, Page: 1},
-					End:   document.SourcePosition{Offset: 4, Page: 1},
-				},
-			},
-			Quote: "rename evidence",
-			Path: &graph.Path{Nodes: []graph.Node{{
-				ID: "node", Kind: "evidence",
-			}}},
-			Metadata: shoal.Metadata{"source": "test"},
-		}},
+		Evidence:  []webapi.OntologyMorphismEvidenceDraft{evidenceDraft},
 		Rationale: "rename the relationship",
 	}}
 	encoded := mustJSON(t, request)
-	if bytes.Contains(encoded, []byte(`"document_id":"doc"`)) ||
-		bytes.Contains(encoded, []byte(`"id":"node"`)) ||
+	if bytes.Contains(encoded, []byte(`"document_id":"document:opaque/value"`)) ||
+		bytes.Contains(encoded, []byte(`"id":"node:opaque/value"`)) ||
 		bytes.Contains(encoded, []byte(`"metadata":{"source"`)) {
 		t.Fatalf("morphism evidence bypassed wire codecs: %s", encoded)
 	}
@@ -513,9 +514,72 @@ func TestOntologyProposalMorphismUsesKeyReferencesAndWireCodecs(t *testing.T) {
 	}
 	projected := created.Morphisms[0]
 	wantSource := base64.RawURLEncoding.EncodeToString([]byte(sourceID))
+	var evidenceOptions []ontology.EvidenceOption
+	if evidenceDraft.Path != nil {
+		evidenceOptions = append(
+			evidenceOptions, ontology.WithEvidencePath(*evidenceDraft.Path))
+	}
+	expectedEvidence, err := ontology.NewEvidenceRef(
+		evidenceDraft.Citation, evidenceDraft.Quote,
+		evidenceDraft.Metadata, evidenceOptions...)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(projected.Sources) != 1 || projected.Sources[0] != wantSource ||
-		len(projected.Targets) != 1 || projected.Targets[0] != targetID {
+		len(projected.Targets) != 1 || projected.Targets[0] != targetID ||
+		len(projected.EvidenceIDs) != 1 ||
+		projected.EvidenceIDs[0] != base64.RawURLEncoding.EncodeToString(
+			[]byte(expectedEvidence.ID())) {
 		t.Fatalf("projected morphism IDs = %+v", projected)
+	}
+}
+
+func TestOntologyProposalMorphismEmptyDefinitionsReturnBadRequest(t *testing.T) {
+	for _, missing := range []string{"sources", "targets"} {
+		t.Run(missing, func(t *testing.T) {
+			corpus, err := explorer.Open(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer corpus.Close()
+			_, server := ontologyProposalServer(t, corpus, richOntologyVersion(t))
+			request := ontologyProposalRequest("v2")
+			source := []webapi.OntologyDefinitionReferenceDraft{{
+				Namespace: "relationship", Key: "member_of",
+			}}
+			target := append([]webapi.OntologyDefinitionReferenceDraft(nil), source...)
+			if missing == "sources" {
+				source = nil
+			} else {
+				target = nil
+			}
+			request.Morphisms = []webapi.OntologyMorphismDraft{{
+				Kind: ontology.MorphismRename, Sources: source, Targets: target,
+				Evidence: []webapi.OntologyMorphismEvidenceDraft{{
+					Citation: document.Citation{
+						DocumentID: "doc", RevisionID: "rev",
+						SectionID: "section", SpanID: "span",
+						Range: document.SourceRange{
+							Start: document.SourcePosition{Offset: 0, Page: 1},
+							End:   document.SourcePosition{Offset: 4, Page: 1},
+						},
+					},
+				}},
+				Rationale: "malformed mapping",
+			}}
+			response, err := server.Client().Post(
+				server.URL+"/api/v1/ontology/proposals", "application/json",
+				bytes.NewReader(mustJSON(t, request)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer response.Body.Close()
+			if response.StatusCode != http.StatusBadRequest {
+				data, _ := io.ReadAll(response.Body)
+				t.Fatalf("empty %s status = %d, want 400: %s",
+					missing, response.StatusCode, data)
+			}
+		})
 	}
 }
 
