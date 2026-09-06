@@ -102,7 +102,7 @@ func TestLatentLinkProducerProvenanceReachableFromBoundedGraph(t *testing.T) {
 		t.Fatal("missing derivation")
 	}
 	producer, assertionNode, producedEdge, ok, err :=
-		producerGraphElementsForAssertion(assertion)
+		ProducerGraphElementsForAssertion(assertion)
 	if err != nil {
 		t.Fatal(err)
 	}

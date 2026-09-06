@@ -1053,27 +1053,20 @@ func producerDerivationEdgeMatches(
 	rawNodes map[shoal.ID]graph.Node,
 	assertion ontology.Assertion,
 ) bool {
-	producer, ok := rawNodes[edge.From]
-	if !ok || producer.Kind != graph.NodeKindProducer {
+	producer, assertionNode, producedEdge, ok, err :=
+		explorer.ProducerGraphElementsForAssertion(assertion)
+	if err != nil || !ok || !graphEdgesEqual(producedEdge, edge) {
 		return false
 	}
-	assertionNode, ok := rawNodes[edge.To]
-	if !ok || assertionNode.Kind != graph.NodeKindDerivedAssertion {
+	rawProducer, ok := rawNodes[producer.ID]
+	if !ok || !graphNodesEqual(rawProducer, producer) {
 		return false
 	}
-	if assertionNode.ID != assertion.ID() {
+	rawAssertion, ok := rawNodes[assertionNode.ID]
+	if !ok || !graphNodesEqual(rawAssertion, assertionNode) {
 		return false
 	}
-	assertionID, ok := edge.Properties[derivedAssertionPropertyAssertionID]
-	if !ok || shoal.ID(assertionID) != assertion.ID() {
-		return false
-	}
-	derivation, ok := assertion.Evidence()[0].Derivation()
-	if !ok {
-		return false
-	}
-	return edge.Properties[derivedAssertionPropertyDerivationID] ==
-		string(derivation.ID())
+	return true
 }
 
 func derivedAssertionEndpointsAllow(
