@@ -92,7 +92,7 @@ func AllCapabilities() Capabilities {
 	return Capabilities{
 		Documents: true, Document: true, Retrieve: true,
 		Vector: false, Neighborhood: true, Path: true, Ingest: true,
-		Extraction: true, Changes: true, Analytics: true,
+		Extraction: true, Changes: true, Analytics: false,
 	}
 }
 
@@ -428,16 +428,17 @@ type ChangesResponse struct {
 
 // MetadataResponse advertises server-enforced public bounds.
 type MetadataResponse struct {
-	MaxPageSize         uint32            `json:"max_page_size"`
-	MaxTopK             uint32            `json:"max_top_k"`
-	MaxDepth            uint32            `json:"max_depth"`
-	MaxFanout           uint32            `json:"max_fanout"`
-	MaxNodes            uint32            `json:"max_nodes"`
-	MaxEdgeTypes        uint32            `json:"max_edge_types"`
-	MaxResponseBytes    uint64            `json:"max_response_bytes"`
-	MaxUploadFiles      uint32            `json:"max_upload_files"`
-	MaxUploadFileBytes  uint64            `json:"max_upload_file_bytes"`
-	MaxUploadTotalBytes uint64            `json:"max_upload_total_bytes"`
-	AnalyticsLimits     *analytics.Limits `json:"analytics_limits,omitempty"`
-	Capabilities        Capabilities      `json:"capabilities"`
+	MaxPageSize                uint32            `json:"max_page_size"`
+	MaxTopK                    uint32            `json:"max_top_k"`
+	MaxDepth                   uint32            `json:"max_depth"`
+	MaxFanout                  uint32            `json:"max_fanout"`
+	MaxNodes                   uint32            `json:"max_nodes"`
+	MaxEdgeTypes               uint32            `json:"max_edge_types"`
+	MaxResponseBytes           uint64            `json:"max_response_bytes"`
+	MaxUploadFiles             uint32            `json:"max_upload_files"`
+	MaxUploadFileBytes         uint64            `json:"max_upload_file_bytes"`
+	MaxUploadTotalBytes        uint64            `json:"max_upload_total_bytes"`
+	AnalyticsLimits            *analytics.Limits `json:"analytics_limits,omitempty"`
+	AnalyticsRecordingRequired bool              `json:"analytics_recording_required,omitempty"`
+	Capabilities               Capabilities      `json:"capabilities"`
 }

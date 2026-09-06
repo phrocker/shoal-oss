@@ -437,7 +437,8 @@ func (s *RemoteService) Analytics(
 	if err != nil {
 		return AnalyticsResponse{}, err
 	}
-	if !metadata.Capabilities.Analytics || metadata.AnalyticsLimits == nil {
+	if !metadata.Capabilities.Analytics || metadata.AnalyticsLimits == nil ||
+		!metadata.AnalyticsRecordingRequired {
 		return AnalyticsResponse{}, shoal.NewError(
 			shoal.ErrorUnavailable, "workspace capability \"analytics\" is unavailable")
 	}
@@ -465,6 +466,11 @@ func (s *RemoteService) Analytics(
 		analyticsRequest, response.Analytics, *metadata.AnalyticsLimits); err != nil {
 		return AnalyticsResponse{}, remoteContractError(
 			"remote analytics response is invalid", err)
+	}
+	if !response.Analytics.Recording.Required ||
+		!response.Analytics.Recording.Recorded {
+		return AnalyticsResponse{}, remoteContractError(
+			"remote analytics response was not durably recorded", nil)
 	}
 	return response, nil
 }
@@ -580,17 +586,19 @@ func minInt64(left, right int64) int64 {
 
 func decodeRemoteMetadata(reader io.Reader) (MetadataResponse, error) {
 	var wire struct {
-		MaxPageSize         uint32        `json:"max_page_size"`
-		MaxTopK             uint32        `json:"max_top_k"`
-		MaxDepth            uint32        `json:"max_depth"`
-		MaxFanout           uint32        `json:"max_fanout"`
-		MaxNodes            uint32        `json:"max_nodes"`
-		MaxEdgeTypes        uint32        `json:"max_edge_types,omitempty"`
-		MaxResponseBytes    uint64        `json:"max_response_bytes,omitempty"`
-		MaxUploadFiles      uint32        `json:"max_upload_files,omitempty"`
-		MaxUploadFileBytes  uint64        `json:"max_upload_file_bytes,omitempty"`
-		MaxUploadTotalBytes uint64        `json:"max_upload_total_bytes,omitempty"`
-		Capabilities        *Capabilities `json:"capabilities,omitempty"`
+		MaxPageSize                uint32                    `json:"max_page_size"`
+		MaxTopK                    uint32                    `json:"max_top_k"`
+		MaxDepth                   uint32                    `json:"max_depth"`
+		MaxFanout                  uint32                    `json:"max_fanout"`
+		MaxNodes                   uint32                    `json:"max_nodes"`
+		MaxEdgeTypes               uint32                    `json:"max_edge_types,omitempty"`
+		MaxResponseBytes           uint64                    `json:"max_response_bytes,omitempty"`
+		MaxUploadFiles             uint32                    `json:"max_upload_files,omitempty"`
+		MaxUploadFileBytes         uint64                    `json:"max_upload_file_bytes,omitempty"`
+		MaxUploadTotalBytes        uint64                    `json:"max_upload_total_bytes,omitempty"`
+		AnalyticsLimits            *exploreranalytics.Limits `json:"analytics_limits,omitempty"`
+		AnalyticsRecordingRequired bool                      `json:"analytics_recording_required,omitempty"`
+		Capabilities               *Capabilities             `json:"capabilities,omitempty"`
 	}
 	if err := decodeOneJSON(reader, &wire, maxRemoteMetadataResponseBytes); err != nil {
 		return MetadataResponse{}, err
@@ -617,13 +625,27 @@ func decodeRemoteMetadata(reader io.Reader) (MetadataResponse, error) {
 			wire.MaxUploadTotalBytes == 0) {
 		return MetadataResponse{}, errors.New("remote workspace upload bounds are incomplete")
 	}
+	if wire.AnalyticsLimits != nil {
+		if err := wire.AnalyticsLimits.Validate(); err != nil {
+			return MetadataResponse{}, errors.New(
+				"remote workspace analytics limits are invalid")
+		}
+	}
+	if capabilities.Analytics &&
+		(wire.AnalyticsLimits == nil || !wire.AnalyticsRecordingRequired) {
+		return MetadataResponse{}, errors.New(
+			"remote workspace analytics metadata is incomplete")
+	}
 	return MetadataResponse{
 		MaxPageSize: MaxPageSize, MaxTopK: MaxTopK,
 		MaxDepth: MaxDepth, MaxFanout: MaxFanout,
 		MaxNodes: MaxNodes, MaxEdgeTypes: MaxEdgeTypes,
 		MaxResponseBytes: MaxResponseBytes,
 		MaxUploadFiles:   MaxUploadFiles, MaxUploadFileBytes: MaxUploadFileBytes,
-		MaxUploadTotalBytes: MaxUploadTotalBytes, Capabilities: capabilities,
+		MaxUploadTotalBytes:        MaxUploadTotalBytes,
+		AnalyticsLimits:            wire.AnalyticsLimits,
+		AnalyticsRecordingRequired: wire.AnalyticsRecordingRequired,
+		Capabilities:               capabilities,
 	}, nil
 }
 

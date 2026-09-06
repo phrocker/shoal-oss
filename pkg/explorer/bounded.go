@@ -708,6 +708,7 @@ func (e *Explorer) BoundedNeighborhood(
 	nextAfter := request.AfterEdgeID
 	continuation := false
 	stopExpansion := false
+	scannedEdges := uint32(0)
 	for level := uint32(0); level < normalized.Depth && len(frontier) > 0; level++ {
 		next := make([]shoal.ID, 0)
 		for _, seed := range frontier {
@@ -724,6 +725,9 @@ func (e *Explorer) BoundedNeighborhood(
 				}
 			}
 			for _, edgeID := range edgeIDs {
+				if scannedEdges < math.MaxUint32 {
+					scannedEdges++
+				}
 				edge := e.graphEdges[edgeID]
 				if len(typeFilter) > 0 {
 					if _, ok := typeFilter[edge.Type]; !ok {
@@ -797,6 +801,7 @@ func (e *Explorer) BoundedNeighborhood(
 	return BoundedNeighborhood{
 		Neighborhood: result, Truncated: truncated,
 		NextAfterEdgeID: nextAfter, Continuation: continuation,
+		ScannedEdges: scannedEdges,
 	}, nil
 }
 

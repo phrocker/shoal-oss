@@ -32,6 +32,7 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/explorer/analytics"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/explorer/webapi"
+	"github.com/phrocker/shoal-oss/pkg/graph"
 	"github.com/phrocker/shoal-oss/pkg/ontology"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
@@ -230,10 +231,165 @@ func TestEmbeddedAnalyticsIsUnavailableWithoutRequiredRecorderSink(t *testing.T)
 	}
 }
 
+func TestRemoteAnalyticsDecodesLimitsAndInvokesUpstream(t *testing.T) {
+	limits := analytics.DefaultLimits()
+	var fingerprint auth.Fingerprint
+	fingerprint[0] = 1
+	source := &remoteAnalyticsMaterializer{materialization: analytics.Materialization{
+		Snapshot: explorer.Snapshot{
+			ID: "internal", AsOf: time.Now().UTC(), Frontier: 1,
+		},
+		Neighborhood: explorer.Neighborhood{
+			Nodes: []graph.Node{{ID: "node"}},
+		},
+		AuthorizationFingerprint: fingerprint,
+		PolicyGeneration:         1, RequestID: "request",
+		AuthorizationExpiresAt: time.Now().UTC().Add(time.Hour),
+		Complete:               true,
+	}}
+	core, err := analytics.NewService(analytics.Config{
+		Source: source, Limits: limits,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := webapi.AnalyticsRequest{Scope: analytics.Scope{
+		NodeIDs: []shoal.ID{"node"}, Depth: 1,
+		Direction: explorer.GraphDirectionBoth,
+		Fanout:    4, MaxNodes: 8, MaxEdges: 16,
+		MaxScannedEdgesPerNode: 32,
+	}}
+	result, err := core.Run(context.Background(), analytics.Request{
+		Scope: request.Scope,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result.Recording = analytics.RecordingStatus{
+		Recorded: true, Required: true,
+		InteractionID: "interaction-remote",
+	}
+	expected := webapi.AnalyticsResponse{
+		Snapshot:  webapi.AnalyticsSnapshot{ID: result.Scope.SnapshotID},
+		Analytics: result,
+	}
+	analyticsCalled := false
+	upstream := httptest.NewServer(http.HandlerFunc(func(
+		writer http.ResponseWriter,
+		httpRequest *http.Request,
+	) {
+		switch {
+		case httpRequest.Method == http.MethodGet &&
+			httpRequest.URL.Path == "/api/v1/meta":
+			writeJSON(t, writer, webapi.MetadataResponse{
+				MaxPageSize: webapi.MaxPageSize, MaxTopK: webapi.MaxTopK,
+				MaxDepth: webapi.MaxDepth, MaxFanout: webapi.MaxFanout,
+				MaxNodes:                   webapi.MaxNodes,
+				AnalyticsLimits:            &limits,
+				AnalyticsRecordingRequired: true,
+				Capabilities:               webapi.Capabilities{Analytics: true},
+			})
+		case httpRequest.Method == http.MethodPost &&
+			httpRequest.URL.Path == "/api/v1/analytics":
+			analyticsCalled = true
+			var received webapi.AnalyticsRequest
+			if err := json.NewDecoder(httpRequest.Body).Decode(&received); err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(received, request) {
+				t.Fatalf("remote request = %#v, want %#v", received, request)
+			}
+			writeJSON(t, writer, expected)
+		default:
+			http.NotFound(writer, httpRequest)
+		}
+	}))
+	defer upstream.Close()
+	remote, err := webapi.NewRemoteService(upstream.URL, upstream.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := remote.Analytics(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !analyticsCalled || !reflect.DeepEqual(got, expected) {
+		t.Fatalf("remote analytics = %#v, called=%t", got, analyticsCalled)
+	}
+}
+
+func TestRemoteMetadataRequiresValidRecordedAnalyticsLimits(t *testing.T) {
+	valid := analytics.DefaultLimits()
+	invalid := valid
+	invalid.MaxEdges = 0
+	tests := []webapi.MetadataResponse{
+		{
+			MaxPageSize: webapi.MaxPageSize, MaxTopK: webapi.MaxTopK,
+			MaxDepth: webapi.MaxDepth, MaxFanout: webapi.MaxFanout,
+			MaxNodes:                   webapi.MaxNodes,
+			AnalyticsRecordingRequired: true,
+			Capabilities:               webapi.Capabilities{Analytics: true},
+		},
+		{
+			MaxPageSize: webapi.MaxPageSize, MaxTopK: webapi.MaxTopK,
+			MaxDepth: webapi.MaxDepth, MaxFanout: webapi.MaxFanout,
+			MaxNodes: webapi.MaxNodes, AnalyticsLimits: &invalid,
+			AnalyticsRecordingRequired: true,
+			Capabilities:               webapi.Capabilities{Analytics: true},
+		},
+		{
+			MaxPageSize: webapi.MaxPageSize, MaxTopK: webapi.MaxTopK,
+			MaxDepth: webapi.MaxDepth, MaxFanout: webapi.MaxFanout,
+			MaxNodes: webapi.MaxNodes, AnalyticsLimits: &valid,
+			Capabilities: webapi.Capabilities{Analytics: true},
+		},
+	}
+	for index, metadata := range tests {
+		t.Run(string(rune('a'+index)), func(t *testing.T) {
+			upstream := httptest.NewServer(http.HandlerFunc(func(
+				writer http.ResponseWriter,
+				request *http.Request,
+			) {
+				writeJSON(t, writer, metadata)
+			}))
+			defer upstream.Close()
+			remote, err := webapi.NewRemoteService(
+				upstream.URL, upstream.Client())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := remote.Metadata(
+				context.Background(),
+			); !shoal.IsErrorCode(err, shoal.ErrorInternal) {
+				t.Fatalf("metadata error = %v", err)
+			}
+		})
+	}
+}
+
 type analyticsRouteService struct {
 	gateStubService
 	resolver auth.Resolver
 	calls    int
+}
+
+type remoteAnalyticsMaterializer struct {
+	materialization analytics.Materialization
+}
+
+func (s *remoteAnalyticsMaterializer) MaterializeAnalytics(
+	context.Context,
+	explorer.BoundedNeighborhoodRequest,
+	uint32,
+) (analytics.Materialization, error) {
+	return s.materialization, nil
+}
+
+func (*remoteAnalyticsMaterializer) RevalidateAnalytics(
+	context.Context,
+	analytics.Materialization,
+) error {
+	return nil
 }
 
 type recordlessAnalyticsClient struct {
