@@ -160,7 +160,9 @@ func (f *fixture) newClient(
 	client, err := authorized.NewClient(authorized.Config{
 		Base:               base,
 		VectorScorer:       trustedVectorScorer(base),
+		InteractionWriter:  trustedInteractionWriter(base),
 		InteractionReader:  trustedInteractionReader(base),
+		SnapshotReader:     trustedSnapshotReader(base),
 		Resolver:           f.authority.Resolver(),
 		PolicySelector:     selector,
 		EdgePolicySelector: edgeSelector,
@@ -181,6 +183,16 @@ func trustedVectorScorer(base explorer.Client) authorized.VectorScorer {
 
 func trustedInteractionReader(base explorer.Client) explorer.InteractionReader {
 	reader, _ := base.(explorer.InteractionReader)
+	return reader
+}
+
+func trustedInteractionWriter(base explorer.Client) explorer.InteractionWriter {
+	writer, _ := base.(explorer.InteractionWriter)
+	return writer
+}
+
+func trustedSnapshotReader(base explorer.Client) authorized.SnapshotReader {
+	reader, _ := base.(authorized.SnapshotReader)
 	return reader
 }
 
@@ -471,7 +483,29 @@ func TestAuthorizedEmptyVectorRetrievalCarriesProvenance(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	clientA := f.newClient(t, base, f.store, f.sourceA, f.policyA, nil)
+	retrieveCalls := 0
+	untrusted := &hookClient{
+		Client: base,
+		retrieve: func(
+			context.Context, retrieval.Request,
+		) (retrieval.Response, error) {
+			retrieveCalls++
+			return retrieval.Response{}, errors.New(
+				"empty authorized retrieval reached the untrusted base")
+		},
+	}
+	selector, err := authorized.NewStaticPolicySelector(f.sourceA, f.policyA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientA, err := authorized.NewClient(authorized.Config{
+		Base: untrusted, VectorScorer: base,
+		Resolver: f.authority.Resolver(), PolicySelector: selector,
+		PolicyStore: f.store, GenerationReader: f.reader, Clock: f.clock.Now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	response, err := clientA.Retrieve(f.alice(t), retrieval.Request{
 		Text:  "hidden vector evidence",
 		TopK:  1,
@@ -484,6 +518,9 @@ func TestAuthorizedEmptyVectorRetrievalCarriesProvenance(t *testing.T) {
 		response.EmbeddingSpaceID == "" ||
 		len(response.EmbeddingSpaceIDs) == 0 {
 		t.Fatalf("authorized empty vector response = %+v", response)
+	}
+	if retrieveCalls != 0 {
+		t.Fatalf("untrusted base retrieval calls = %d", retrieveCalls)
 	}
 }
 

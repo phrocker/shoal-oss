@@ -796,4 +796,9 @@ func TestInteractionReadsRequireExplicitTrustedReader(t *testing.T) {
 	); !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
 		t.Fatalf("implicit base interaction reader error = %v", err)
 	}
+	if err := client.EnsureInteractionSink(
+		f.context(t, decision),
+	); !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
+		t.Fatalf("implicit base interaction writer error = %v", err)
+	}
 }

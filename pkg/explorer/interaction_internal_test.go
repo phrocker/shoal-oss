@@ -261,3 +261,80 @@ func TestDeleteRetryAdoptsCommittedTombstone(t *testing.T) {
 		t.Fatalf("committed tombstone was not adopted: %+v", got)
 	}
 }
+
+func TestFoldLoadRejectsConflictingLiveVersions(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	corpus, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := interaction.Session{
+		ID:         interaction.DerivedID("session", "fold-live-conflict"),
+		RecordedAt: time.Unix(1700000000, 0).UTC(),
+		Operation:  interaction.OperationRetrieval,
+	}
+	if err := corpus.RecordInteraction(ctx, session); err != nil {
+		t.Fatal(err)
+	}
+	result, err := corpus.FoldInteractions(ctx, FoldRequest{
+		SessionIDs:    []shoal.ID{session.ID},
+		SummaryDigest: interaction.Digest("conflicting fold"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	conflicting := *corpus.folds[result.FoldID]
+	conflicting.FoldedAt = conflicting.FoldedAt.Add(time.Second)
+	if err := validatePersistedFold(conflicting); err != nil {
+		t.Fatal(err)
+	}
+	if err := corpus.writeRecord(
+		foldRecordRow(result.FoldID), embeddedRecordFold, conflicting,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := corpus.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if reopened, err := Open(dir); err == nil {
+		_ = reopened.Close()
+		t.Fatal("conflicting durable live fold versions were accepted")
+	}
+}
+
+func TestExactReadbackChecksOnlyCurrentVersion(t *testing.T) {
+	corpus, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer corpus.Close()
+	older := persistedInteractionSink{
+		CheckedAt: time.Unix(1700000000, 0).UTC(),
+	}
+	expected, err := encodeEmbeddedRecord(
+		embeddedRecordInteractionSink, older)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := corpus.writeRecord(
+		interactionSinkRow, embeddedRecordInteractionSink, older,
+	); err != nil {
+		t.Fatal(err)
+	}
+	newer := persistedInteractionSink{
+		CheckedAt: older.CheckedAt.Add(time.Second),
+	}
+	if err := corpus.writeRecord(
+		interactionSinkRow, embeddedRecordInteractionSink, newer,
+	); err != nil {
+		t.Fatal(err)
+	}
+	committed, err := corpus.hasExactRecord(interactionSinkRow, expected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if committed {
+		t.Fatal("historical matching value masked the current durable value")
+	}
+}

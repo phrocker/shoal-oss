@@ -61,19 +61,13 @@ type VectorScorer interface {
 	VectorScores(
 		context.Context, explorer.VectorScoreRequest,
 	) (map[shoal.ID]shoal.Score, error)
-}
-
-// VectorEmbeddingSpaceResolver reports the canonical trusted vector-space
-// constituents used for the same request passed to VectorScorer.
-type VectorEmbeddingSpaceResolver interface {
 	VectorEmbeddingSpaceIDs(
 		context.Context, explorer.VectorScoreRequest,
 	) ([]shoal.ID, error)
 }
 
 func (c *Client) authorizedVectorScoringAvailable() bool {
-	return !isNilDependency(c.vectorScorer) &&
-		!isNilDependency(c.vectorSpaceResolver)
+	return !isNilDependency(c.vectorScorer)
 }
 
 func (c *Client) probeAuthorizedVector(
@@ -95,13 +89,7 @@ func (c *Client) probeAuthorizedVector(
 	if err != nil {
 		return nil, directBaseError(err)
 	}
-	if isNilDependency(c.vectorSpaceResolver) {
-		return nil, shoal.NewError(
-			shoal.ErrorUnavailable,
-			"authorized vector retrieval requires trusted embedding provenance",
-		)
-	}
-	ids, err := c.vectorSpaceResolver.VectorEmbeddingSpaceIDs(
+	ids, err := c.vectorScorer.VectorEmbeddingSpaceIDs(
 		ctx, scoreRequest)
 	if err != nil {
 		return nil, directBaseError(err)
@@ -501,13 +489,7 @@ func (c *Client) authorizedVectorScores(
 	if len(scores) != len(citations) {
 		return nil, nil, inconsistentRetrieval()
 	}
-	if isNilDependency(c.vectorSpaceResolver) {
-		return nil, nil, shoal.NewError(
-			shoal.ErrorUnavailable,
-			"authorized vector retrieval requires trusted embedding provenance",
-		)
-	}
-	embeddingSpaceIDs, err := c.vectorSpaceResolver.VectorEmbeddingSpaceIDs(
+	embeddingSpaceIDs, err := c.vectorScorer.VectorEmbeddingSpaceIDs(
 		ctx, scoreRequest)
 	if err != nil {
 		return nil, nil, directBaseError(err)

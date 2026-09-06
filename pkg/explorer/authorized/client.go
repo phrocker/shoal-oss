@@ -34,6 +34,12 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
+// SnapshotReader is the trusted source of the corpus frontier pinned into an
+// interaction record.
+type SnapshotReader interface {
+	Snapshot(context.Context) (explorer.Snapshot, error)
+}
+
 // Config supplies the trusted dependencies for an authorization-enforcing
 // Explorer client.
 type Config struct {
@@ -42,11 +48,18 @@ type Config struct {
 	// vector retrieval validation. It is intentionally separate from Base:
 	// Base responses are treated as untrusted and validated canonically.
 	VectorScorer VectorScorer
+	// InteractionWriter is the explicitly trusted durable sink for
+	// interaction records. It is separate from Base because Base responses
+	// and mutation acknowledgements are not authorization evidence.
+	InteractionWriter explorer.InteractionWriter
 	// InteractionReader is the explicitly trusted source for durable
 	// interaction envelopes. It is intentionally separate from Base because
 	// authorization decisions for derived views depend on the stored source
 	// set and authorization fingerprint.
-	InteractionReader  explorer.InteractionReader
+	InteractionReader explorer.InteractionReader
+	// SnapshotReader is the explicitly trusted source for the corpus frontier
+	// pinned into an interaction record.
+	SnapshotReader     SnapshotReader
 	Resolver           auth.Resolver
 	PolicySelector     PolicySelector
 	EdgePolicySelector EdgePolicySelector
@@ -63,22 +76,23 @@ type Config struct {
 
 // Client enforces trusted-context authorization around an Explorer client.
 type Client struct {
-	base                explorer.Client
-	vectorScorer        VectorScorer
-	vectorSpaceResolver VectorEmbeddingSpaceResolver
-	interactionSource   explorer.InteractionReader
-	resolver            auth.Resolver
-	policySelector      PolicySelector
-	edgePolicySelector  EdgePolicySelector
-	policyStore         PolicyStore
-	generationReader    auth.GenerationReader
-	clock               func() time.Time
-	mosaic              MosaicBudget
-	ledger              CoOccurrenceLedger
-	mutationMu          sync.Mutex
-	vectorMu            sync.Mutex
-	budgetMu            sync.Mutex
-	vectorAvailability  authorizedVectorAvailabilityCache
+	base               explorer.Client
+	vectorScorer       VectorScorer
+	interactionSink    explorer.InteractionWriter
+	interactionSource  explorer.InteractionReader
+	snapshotSource     SnapshotReader
+	resolver           auth.Resolver
+	policySelector     PolicySelector
+	edgePolicySelector EdgePolicySelector
+	policyStore        PolicyStore
+	generationReader   auth.GenerationReader
+	clock              func() time.Time
+	mosaic             MosaicBudget
+	ledger             CoOccurrenceLedger
+	mutationMu         sync.Mutex
+	vectorMu           sync.Mutex
+	budgetMu           sync.Mutex
+	vectorAvailability authorizedVectorAvailabilityCache
 }
 
 type authorizedVectorAvailabilityCache struct {
@@ -108,15 +122,11 @@ func NewClient(config Config) (*Client, error) {
 	if config.Clock == nil {
 		return nil, dependencyRequired("clock")
 	}
-	var vectorSpaceResolver VectorEmbeddingSpaceResolver
-	if !isNilDependency(config.VectorScorer) {
-		var ok bool
-		vectorSpaceResolver, ok =
-			config.VectorScorer.(VectorEmbeddingSpaceResolver)
-		if !ok || isNilDependency(vectorSpaceResolver) {
-			return nil, dependencyRequired(
-				"trusted vector embedding provenance")
-		}
+	hasInteractionWriter := !isNilDependency(config.InteractionWriter)
+	hasSnapshotReader := !isNilDependency(config.SnapshotReader)
+	if hasInteractionWriter != hasSnapshotReader {
+		return nil, dependencyRequired(
+			"trusted interaction writer and snapshot reader")
 	}
 	edgeSelector := config.EdgePolicySelector
 	if isNilDependency(edgeSelector) {
@@ -138,18 +148,19 @@ func NewClient(config Config) (*Client, error) {
 		}
 	}
 	return &Client{
-		base:                config.Base,
-		vectorScorer:        config.VectorScorer,
-		vectorSpaceResolver: vectorSpaceResolver,
-		interactionSource:   config.InteractionReader,
-		resolver:            config.Resolver,
-		policySelector:      config.PolicySelector,
-		edgePolicySelector:  edgeSelector,
-		policyStore:         config.PolicyStore,
-		generationReader:    config.GenerationReader,
-		clock:               config.Clock,
-		mosaic:              config.Mosaic,
-		ledger:              ledger,
+		base:               config.Base,
+		vectorScorer:       config.VectorScorer,
+		interactionSink:    config.InteractionWriter,
+		interactionSource:  config.InteractionReader,
+		snapshotSource:     config.SnapshotReader,
+		resolver:           config.Resolver,
+		policySelector:     config.PolicySelector,
+		edgePolicySelector: edgeSelector,
+		policyStore:        config.PolicyStore,
+		generationReader:   config.GenerationReader,
+		clock:              config.Clock,
+		mosaic:             config.Mosaic,
+		ledger:             ledger,
 	}, nil
 }
 

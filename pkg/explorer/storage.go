@@ -469,6 +469,19 @@ func (e *Explorer) loadFoldRecord(row, qualifier, encoded []byte) error {
 	}
 	e.reserveInteractionRecordGraphIDsLocked(
 		record.FoldID, record.Nodes, record.Edges)
+	if !record.Deleted {
+		if live, ok := e.foldLiveRecords[record.FoldID]; ok {
+			if !persistedFoldsEqual(*live, record) {
+				return shoal.NewError(
+					shoal.ErrorInternal,
+					"stored fold has conflicting live versions",
+				)
+			}
+		} else {
+			live := record
+			e.foldLiveRecords[record.FoldID] = &live
+		}
+	}
 	// A fold row is written at most twice: once when it is folded and once
 	// when it is explicitly deleted. The scan returns raw cells, so both
 	// versions arrive here. A tombstone is terminal because a deleted fold ID
@@ -532,6 +545,7 @@ func (e *Explorer) writeInteractionRecord(
 
 func (e *Explorer) hasExactRecord(row, expected []byte) (bool, error) {
 	committed := false
+	examined := false
 	err := e.engine.LookupRows(
 		explorerTable,
 		[][]byte{append([]byte(nil), row...)},
@@ -540,10 +554,11 @@ func (e *Explorer) hasExactRecord(row, expected []byte) (bool, error) {
 			ColumnFamiliesInclusive: true,
 		},
 		func(_ int, key *iterrt.Key, value []byte) {
-			if committed ||
+			if examined ||
 				!bytes.Equal(key.ColumnQualifier, []byte(recordCQV2)) {
 				return
 			}
+			examined = true
 			committed = equivalentEmbeddedRecord(
 				key.Row, value, expected)
 		},

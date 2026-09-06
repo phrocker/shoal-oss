@@ -86,11 +86,13 @@ func (c *Client) recordInteraction(
 	if !interactionPinMatchesDecision(canonical, decision, now) {
 		return interaction.Session{}, authorizationDenied()
 	}
-	bounded, err := c.boundedBase()
-	if err != nil {
-		return interaction.Session{}, err
+	if isNilDependency(c.snapshotSource) {
+		return interaction.Session{}, shoal.NewError(
+			shoal.ErrorUnavailable,
+			"trusted interaction snapshot reader is unavailable",
+		)
 	}
-	snapshot, err := bounded.Snapshot(ctx)
+	snapshot, err := c.snapshotSource.Snapshot(ctx)
 	if err != nil {
 		return interaction.Session{}, directBaseError(err)
 	}
@@ -424,14 +426,13 @@ func summaryFingerprintMatchesDecision(
 }
 
 func (c *Client) interactionWriter() (explorer.InteractionWriter, error) {
-	writer, ok := c.base.(explorer.InteractionWriter)
-	if !ok || isNilDependency(writer) {
+	if isNilDependency(c.interactionSink) {
 		return nil, shoal.NewError(
 			shoal.ErrorUnavailable,
-			"underlying Explorer has no durable interaction writer",
+			"trusted interaction writer is unavailable",
 		)
 	}
-	return writer, nil
+	return c.interactionSink, nil
 }
 
 func (c *Client) interactionReader() (explorer.InteractionReader, error) {
