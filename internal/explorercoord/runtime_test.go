@@ -236,6 +236,9 @@ func TestRecordAttemptAliasGenerationSurvivesSeparateRFiles(t *testing.T) {
 	if err := eng.Flush("coord"); err != nil {
 		t.Fatal(err)
 	}
+	if err := eng.Compact("coord", nil); err != nil {
+		t.Fatal(err)
+	}
 	if err := eng.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -254,6 +257,57 @@ func TestRecordAttemptAliasGenerationSurvivesSeparateRFiles(t *testing.T) {
 	got, found, err := intents.Attempt(context.Background(), key)
 	if err != nil || !found || !bytes.Equal(got, newTxn) {
 		t.Fatalf("reopened attempt alias = %q, %v, %v; cells=%#v", got, found, err, cells)
+	}
+}
+
+func TestRecordAttemptAliasConcurrentRebindHasOneWinner(t *testing.T) {
+	eng, store := openTestEngineStore(t, "coord")
+	defer eng.Close()
+	intents, err := NewIntentStore(coordination.DomainID("domain"), nil, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := []byte("document/revision")
+	oldTxn := coordination.TXN("old")
+	if err := intents.SetAttempt(context.Background(), key, nil, oldTxn); err != nil {
+		t.Fatal(err)
+	}
+	candidates := []coordination.TXN{
+		coordination.TXN("new-a"),
+		coordination.TXN("new-b"),
+	}
+	errs := make(chan error, len(candidates))
+	var wait sync.WaitGroup
+	for _, candidate := range candidates {
+		candidate := candidate
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			errs <- intents.SetAttempt(
+				context.Background(), key, oldTxn, candidate,
+			)
+		}()
+	}
+	wait.Wait()
+	close(errs)
+	successes, conflicts := 0, 0
+	for err := range errs {
+		switch {
+		case err == nil:
+			successes++
+		case errors.Is(err, transaction.ErrConflict):
+			conflicts++
+		default:
+			t.Fatalf("concurrent alias rebind = %v", err)
+		}
+	}
+	if successes != 1 || conflicts != 1 {
+		t.Fatalf("alias rebind successes=%d conflicts=%d", successes, conflicts)
+	}
+	got, found, err := intents.Attempt(context.Background(), key)
+	if err != nil || !found ||
+		(!bytes.Equal(got, candidates[0]) && !bytes.Equal(got, candidates[1])) {
+		t.Fatalf("alias rebind winner = %q, %v, %v", got, found, err)
 	}
 }
 
