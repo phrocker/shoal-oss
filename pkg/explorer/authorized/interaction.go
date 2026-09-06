@@ -640,9 +640,40 @@ func (c *Client) authorizeAnalyticsInteractionEvidence(
 	if err != nil {
 		return nil, err
 	}
+	sourceGraph, err := c.base.Neighborhood(ctx, explorer.NeighborhoodRequest{
+		NodeIDs: nodeIDs, Depth: 1,
+	})
+	if err != nil {
+		return nil, directBaseError(err)
+	}
+	sourceNodes := make(map[shoal.ID]graph.Node, len(sourceGraph.Nodes))
+	for _, node := range sourceGraph.Nodes {
+		sourceNodes[node.ID] = node
+	}
+	sourceEdges := make(map[shoal.ID]graph.Edge, len(sourceGraph.Edges))
+	for _, edge := range sourceGraph.Edges {
+		sourceEdges[edge.ID] = edge
+	}
+	sourceAssertions := make(map[shoal.ID]interaction.AssertionEvidence)
+	for _, assertion := range sourceGraph.Assertions {
+		evidence := assertionInteractionEvidence(assertion)
+		sourceAssertions[evidence.ID] = evidence
+	}
+	for _, assertion := range raw.Assertions {
+		if sourceAssertions[assertion.ID] != assertion {
+			return nil, auth.ObjectNotFound()
+		}
+	}
+	for _, node := range raw.Nodes {
+		if graph.IsProvenanceKind(node.Kind) &&
+			!graphNodesEqual(sourceNodes[node.ID], node) {
+			return nil, auth.ObjectNotFound()
+		}
+	}
 	candidateEdgeIDs := make([]shoal.ID, 0, len(raw.Edges))
 	for _, edge := range raw.Edges {
-		if _, derived := assertionsByEdge[edge.ID]; derived ||
+		if assertion, derived := assertionsByEdge[edge.ID]; (derived &&
+			assertion.Origin == string(ontology.AssertionDerived)) ||
 			edge.Type == graph.EdgeTypeProduced {
 			continue
 		}
@@ -658,6 +689,12 @@ func (c *Client) authorizeAnalyticsInteractionEvidence(
 	for _, edge := range raw.Edges {
 		if err := edge.Validate(); err != nil {
 			return nil, inconsistentBase()
+		}
+		if graph.IsProvenanceKind(rawNodes[edge.From].Kind) ||
+			graph.IsProvenanceKind(rawNodes[edge.To].Kind) {
+			if !graphEdgesEqual(sourceEdges[edge.ID], edge) {
+				return nil, auth.ObjectNotFound()
+			}
 		}
 		if assertion, ok := assertionsByEdge[edge.ID]; ok &&
 			assertion.Origin == string(ontology.AssertionDerived) {
@@ -773,6 +810,7 @@ func interactionAssertionsByEdge(
 		if err := assertion.Validate(); err != nil {
 			return nil, inconsistentBase()
 		}
+
 		edgeID := assertion.GraphEdgeID
 		if assertion.Origin == string(ontology.AssertionDerived) {
 			edgeID = assertion.ID
@@ -786,6 +824,24 @@ func interactionAssertionsByEdge(
 		result[edgeID] = assertion
 	}
 	return result, nil
+}
+
+func assertionInteractionEvidence(assertion ontology.Assertion) interaction.AssertionEvidence {
+	target, _ := assertion.Object().ReferenceValue()
+	evidence := interaction.AssertionEvidence{
+		ID: assertion.ID(), Subject: assertion.Subject(),
+		Predicate: assertion.Predicate(), ObjectReference: target,
+		Origin: string(assertion.Origin()), Confidence: assertion.Confidence(),
+		GraphEdgeID: shoal.ID(assertion.Metadata()["graph.edge.id"]),
+	}
+	for _, item := range assertion.Evidence() {
+		if derivation, ok := item.Derivation(); ok {
+			evidence.DerivationID = derivation.ID()
+			evidence.DerivationScore = derivation.Score()
+			break
+		}
+	}
+	return evidence
 }
 
 func (c *Client) interactionAssertionAllows(
