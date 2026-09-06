@@ -74,24 +74,25 @@ func (c *GovernedOntologyChoices) ListOntologyChoices(
 	ctx context.Context,
 	_ auth.Decision,
 ) ([]workspace.OntologyChoice, error) {
-	if c.configured == nil {
+	catalog, configured, err := c.catalog(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if !configured {
 		return []workspace.OntologyChoice{}, nil
 	}
-	proposals, err := c.source.OntologyProposals(ctx)
-	if err != nil {
-		return nil, err
-	}
-	catalog, err := boundedOntologyCatalog(*c.configured, proposals)
-	if err != nil {
-		return nil, err
-	}
 	active := catalog.ActiveIdentity()
-	identities := catalog.Identities()
-	choices := make([]workspace.OntologyChoice, 0, len(identities))
-	for index := len(identities) - 1; index >= 0; index-- {
-		identity := identities[index]
+	versions := catalog.Versions()
+	choices := make([]workspace.OntologyChoice, 0, len(versions))
+	for index := len(versions) - 1; index >= 0; index-- {
+		version := versions[index]
+		identity, err := ontology.NewOntologyIdentity(version)
+		if err != nil {
+			return nil, err
+		}
 		choices = append(choices, workspace.OntologyChoice{
 			Identity: identity,
+			Version:  version.Version(),
 			Active:   identity == active,
 		})
 	}
@@ -102,22 +103,37 @@ func (c *GovernedOntologyChoices) ListOntologyChoices(
 // eligibility snapshot.
 func (c *GovernedOntologyChoices) AuthorizeOntology(
 	ctx context.Context,
-	decision auth.Decision,
+	_ auth.Decision,
 	identity ontology.OntologyIdentity,
 ) error {
 	if err := identity.Validate(); err != nil {
 		return err
 	}
-	choices, err := c.ListOntologyChoices(ctx, decision)
+	catalog, configured, err := c.catalog(ctx)
 	if err != nil {
 		return err
 	}
-	for _, choice := range choices {
-		if choice.Identity == identity {
-			return nil
-		}
+	if configured && catalog.Contains(identity) {
+		return nil
 	}
 	return shoal.NewError(shoal.ErrorUnauthorized, "authorization denied")
+}
+
+func (c *GovernedOntologyChoices) catalog(
+	ctx context.Context,
+) (ontology.PublishedCatalog, bool, error) {
+	if c.configured == nil {
+		return ontology.PublishedCatalog{}, false, nil
+	}
+	proposals, err := c.source.OntologyProposals(ctx)
+	if err != nil {
+		return ontology.PublishedCatalog{}, false, err
+	}
+	catalog, err := boundedOntologyCatalog(*c.configured, proposals)
+	if err != nil {
+		return ontology.PublishedCatalog{}, false, err
+	}
+	return catalog, true, nil
 }
 
 func absentGovernedOntologyProposalSource(

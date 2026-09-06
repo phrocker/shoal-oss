@@ -152,14 +152,18 @@
     return value;
   }
 
+  function identityKey(identity) {
+    return `${identity.schema_id}.${identity.version_id}`;
+  }
+
   function choiceKey(choice) {
-    return `${choice.schema_id}.${choice.version_id}`;
+    return identityKey(choice.identity);
   }
 
   function renderChoices(value) {
     lensState = value;
     const selected = value.selected_ontology
-      ? choiceKey(value.selected_ontology)
+      ? identityKey(value.selected_ontology)
       : "";
     elements.lens.replaceChildren();
     let defaultValue = selected;
@@ -170,8 +174,9 @@
       option.textContent =
         `${isSelected ? "Selected · " : ""}` +
         `${choice.active ? "Active · " : ""}` +
-        `${shortOpaqueID(choice.schema_id)} / ` +
-        shortOpaqueID(choice.version_id);
+        `${choice.version ? `${choice.version} · ` : ""}` +
+        `${shortOpaqueID(choice.identity.schema_id)} / ` +
+        shortOpaqueID(choice.identity.version_id);
       elements.lens.append(option);
       if (!defaultValue && choice.active) defaultValue = option.value;
     }
@@ -256,10 +261,7 @@
           body: JSON.stringify({
             expected_revision: Number(lensState.settings_revision || 0),
             mutation_id: mutationID(),
-            selected_ontology: {
-              schema_id: selected.schema_id,
-              version_id: selected.version_id,
-            },
+            selected_ontology: selected.identity,
           }),
         },
       );

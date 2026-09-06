@@ -268,6 +268,7 @@ func (p *Provider) Update(
 // from the trusted ontology provider; settings never mutate that pointer.
 type OntologyChoice struct {
 	Identity ontology.OntologyIdentity
+	Version  string
 	Active   bool
 }
 

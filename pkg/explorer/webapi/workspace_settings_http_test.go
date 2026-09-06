@@ -32,6 +32,7 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/explorer/webapi"
 	"github.com/phrocker/shoal-oss/pkg/explorer/workspace"
+	"github.com/phrocker/shoal-oss/pkg/ontology"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
@@ -336,6 +337,20 @@ func TestHTTPWorkspaceSettingsRejectsBoundsAndUnknownFields(t *testing.T) {
 				"expected_revision": 0,
 				"mutation_id":       base64.RawURLEncoding.EncodeToString([]byte("unknown")),
 				"settings":          map[string]any{"ambient_lens": "forbidden"},
+			},
+		},
+		{
+			name: "unknown ontology selection",
+			body: map[string]any{
+				"expected_revision": 0,
+				"mutation_id": base64.RawURLEncoding.EncodeToString(
+					[]byte("unknown-ontology")),
+				"settings": map[string]any{
+					"selected_ontology": map[string]any{
+						"known":   false,
+						"reading": string(ontology.OntologyUnresolved),
+					},
+				},
 			},
 		},
 	} {
