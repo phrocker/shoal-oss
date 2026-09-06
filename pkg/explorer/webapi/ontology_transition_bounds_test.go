@@ -26,6 +26,7 @@ func TestOntologyHTTPTransitionBoundsPrecedeCommit(t *testing.T) {
 	}{
 		{"evidence", MaxEvidencePerResult, ontologyEvidenceBoundProposal},
 		{"discriminator", MaxOntologyConcepts, ontologyDiscriminatorBoundProposal},
+		{"definitions", MaxOntologyProperties, ontologyMorphismDefinitionBoundProposal},
 		{"concepts", MaxOntologyConcepts, ontologyConceptBoundProposal},
 	} {
 		for _, oversized := range []bool{false, true} {

@@ -33,6 +33,7 @@ type OntologyProjectionLimits struct {
 	MaxConstraintsPerProperty   uint32
 	MaxAllowedValues            uint32
 	MaxTransitions              uint32
+	MaxMorphismDefinitions      uint32
 	MaxMorphismEvidence         uint32
 	MaxDiscriminatorChoices     uint32
 }
@@ -106,6 +107,20 @@ func (l OntologyProjectionLimits) ValidateProposal(proposal ontology.GovernedPro
 		return err
 	}
 	for _, morphism := range proposal.Morphisms() {
+		if err := ontologyProjectionBound(
+			"morphism source definition",
+			len(morphism.Sources()),
+			l.MaxMorphismDefinitions,
+		); err != nil {
+			return err
+		}
+		if err := ontologyProjectionBound(
+			"morphism target definition",
+			len(morphism.Targets()),
+			l.MaxMorphismDefinitions,
+		); err != nil {
+			return err
+		}
 		if err := ontologyProjectionBound(
 			"morphism evidence", len(morphism.Evidence()), l.MaxMorphismEvidence,
 		); err != nil {

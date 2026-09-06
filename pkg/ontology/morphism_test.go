@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/phrocker/shoal-oss/pkg/document"
+	"github.com/phrocker/shoal-oss/pkg/graph"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
@@ -700,6 +701,89 @@ func TestOntologyLensTraversesBeyondLegacyDepth(t *testing.T) {
 		f.evidence, f.provenance)
 	if read := lens.Read(assertion); !read.Resolved() {
 		t.Fatalf("governed 40-hop lens read = %#v", read)
+	}
+}
+
+func TestExtractionResultBoundsMorphismEvidenceDetails(t *testing.T) {
+	f := newMorphismFixture(t)
+	for _, test := range []struct {
+		name     string
+		limits   func(ExtractionLimits) ExtractionLimits
+		evidence func(*testing.T) EvidenceRef
+	}{
+		{
+			name: "quote",
+			limits: func(limits ExtractionLimits) ExtractionLimits {
+				limits.MaxQuoteBytes = uint32(len(f.evidence.Quote()))
+				return limits
+			},
+			evidence: func(t *testing.T) EvidenceRef {
+				evidence, err := NewEvidenceRef(
+					f.evidence.Citation(), f.evidence.Quote()+"x", nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return evidence
+			},
+		},
+		{
+			name: "path",
+			limits: func(limits ExtractionLimits) ExtractionLimits {
+				limits.MaxPathNodes = 1
+				limits.MaxPathEdges = 1
+				return limits
+			},
+			evidence: func(t *testing.T) EvidenceRef {
+				path := graph.Path{
+					Nodes: []graph.Node{
+						{ID: "node-a", Kind: "entity"},
+						{ID: "node-b", Kind: "entity"},
+					},
+					Edges: []graph.Edge{{
+						ID: "edge", From: "node-a", To: "node-b",
+						Type: "related", Weight: 1,
+					}},
+				}
+				evidence, err := NewEvidenceRef(
+					f.evidence.Citation(), f.evidence.Quote(), nil,
+					WithEvidencePath(path))
+				if err != nil {
+					t.Fatal(err)
+				}
+				return evidence
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			limits := test.limits(DefaultExtractionLimits())
+			request, err := NewExtractionRequest(
+				f.renameFrom, []EvidenceRef{f.evidence},
+				"extract", f.provenance, limits, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			morphism := mustMorphism(t, MorphismConfig{
+				Kind:          MorphismRename,
+				SourceVersion: f.renameFrom, TargetVersion: f.renameTo,
+				Sources:   []shoal.ID{f.oldRel.ID()},
+				Targets:   []shoal.ID{f.newRel.ID()},
+				Evidence:  []EvidenceRef{test.evidence(t)},
+				Rationale: "bounded evidence",
+			})
+			proposal, err := NewGovernedProposalWithMorphisms(
+				f.renameFrom.Schema(), f.renameFrom, f.renameTo,
+				[]OntologyMorphism{morphism}, "extractor", "proposal",
+				f.renameTo.CreatedAt().Add(time.Second), nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := NewExtractionResult(
+				request, nil, []GovernedProposal{proposal},
+				f.renameTo.CreatedAt().Add(2*time.Second), nil,
+			); err == nil {
+				t.Fatal("oversized morphism evidence was accepted")
+			}
+		})
 	}
 }
 

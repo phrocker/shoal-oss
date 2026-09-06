@@ -341,7 +341,9 @@ func ontologyProjectionLimits() explorer.OntologyProjectionLimits {
 		MaxRelationshipEndpointSets: MaxOntologyRelationshipEndpointSets,
 		MaxConstraintsPerProperty:   MaxOntologyConstraintsPerProperty,
 		MaxAllowedValues:            MaxOntologyAllowedValues, MaxTransitions: MaxOntologyProposalTransitions,
-		MaxMorphismEvidence: MaxEvidencePerResult, MaxDiscriminatorChoices: MaxOntologyConcepts,
+		MaxMorphismDefinitions:  MaxOntologyProperties,
+		MaxMorphismEvidence:     MaxEvidencePerResult,
+		MaxDiscriminatorChoices: MaxOntologyConcepts,
 	}
 }
 

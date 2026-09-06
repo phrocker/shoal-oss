@@ -480,11 +480,12 @@ func (r ExtractionResult) Validate() error {
 				return err
 			}
 			for _, evidence := range morphism.Evidence() {
-				if err := validateBoundedEvidenceMetadata(evidence, r.limits); err != nil {
+				if err := validateBoundedEvidence(evidence, r.limits); err != nil {
 					return err
 				}
 			}
 		}
+
 		if proposalPayloadBytes(proposal) > uint64(r.limits.MaxPayloadBytes) {
 			return invalid("proposal payload exceeds result limit")
 		}
@@ -498,6 +499,29 @@ func (r ExtractionResult) Validate() error {
 		return invalid("extraction result ID is not canonical")
 	}
 	return nil
+}
+
+func validateBoundedEvidence(evidence EvidenceRef, limits ExtractionLimits) error {
+	if uint64(len(evidence.Quote())) > uint64(limits.MaxQuoteBytes) {
+		return invalid("evidence quote exceeds result limit")
+	}
+	if path, present := evidence.Path(); present {
+		if uint64(len(path.Nodes)) > uint64(limits.MaxPathNodes) ||
+			uint64(len(path.Edges)) > uint64(limits.MaxPathEdges) {
+			return invalid("evidence graph path exceeds result limit")
+		}
+		for _, node := range path.Nodes {
+			if err := validateBoundedMetadata(node.Properties, limits); err != nil {
+				return err
+			}
+		}
+		for _, edge := range path.Edges {
+			if err := validateBoundedMetadata(edge.Properties, limits); err != nil {
+				return err
+			}
+		}
+	}
+	return validateBoundedEvidenceMetadata(evidence, limits)
 }
 
 // ValidateFor verifies that the result only cites request evidence and only

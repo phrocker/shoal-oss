@@ -102,6 +102,7 @@ type ProposalTransitionProjection struct {
 type OntologyProposalLimits struct {
 	MaxProposals              uint32 `json:"max_proposals"`
 	MaxTransitions            uint32 `json:"max_transitions"`
+	MaxMorphismDefinitions    uint32 `json:"max_morphism_definitions"`
 	MaxMorphisms              uint32 `json:"max_morphisms"`
 	MaxMorphismEvidence       uint32 `json:"max_morphism_evidence"`
 	MaxDiscriminatorChoices   uint32 `json:"max_discriminator_choices"`
@@ -872,6 +873,7 @@ func ontologyProposalLimits() OntologyProposalLimits {
 	return OntologyProposalLimits{
 		MaxProposals:              MaxOntologyProposals,
 		MaxTransitions:            MaxOntologyProposalTransitions,
+		MaxMorphismDefinitions:    MaxOntologyProperties,
 		MaxMorphisms:              ontology.MaxProposalMorphisms,
 		MaxMorphismEvidence:       MaxEvidencePerResult,
 		MaxDiscriminatorChoices:   MaxOntologyConcepts,

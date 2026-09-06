@@ -403,6 +403,70 @@ func TestActiveOntologyDoesNotDependOnProposalBodyReads(t *testing.T) {
 	}
 }
 
+func ontologyMorphismDefinitionBoundProposal(
+	t *testing.T, count uint32,
+) (ontology.GovernedProposal, ontology.OntologyVersion) {
+	t.Helper()
+	schema, err := ontology.NewOntologySchema(
+		"definition-bound", "Definition Bound", "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	at := time.Date(2026, 9, 6, 3, 0, 0, 0, time.UTC)
+	sources := make([]ontology.PropertyDefinition, 0, count)
+	sourceIDs := make([]shoal.ID, 0, count)
+	for index := uint32(0); index < count; index++ {
+		property, err := ontology.NewPropertyDefinition(
+			fmt.Sprintf("source-%03d", index),
+			fmt.Sprintf("Source %03d", index),
+			"", ontology.ValueString, nil, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sources = append(sources, property)
+		sourceIDs = append(sourceIDs, property.ID())
+	}
+	targetProperty, err := ontology.NewPropertyDefinition(
+		"target", "Target", "", ontology.ValueString, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base, err := ontology.NewOntologyVersion(
+		schema, "1", at, nil, nil, sources, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target, err := ontology.NewOntologyVersion(
+		schema, "2", at.Add(time.Second), nil, nil,
+		[]ontology.PropertyDefinition{targetProperty}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	evidence, err := ontology.NewEvidenceRef(document.Citation{
+		DocumentID: "doc", RevisionID: "rev", SectionID: "section",
+		Range: document.SourceRange{},
+	}, "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	morphism, err := ontology.NewOntologyMorphism(ontology.MorphismConfig{
+		Kind: ontology.MorphismMerge, SourceVersion: base, TargetVersion: target,
+		Sources: sourceIDs, Targets: []shoal.ID{targetProperty.ID()},
+		Evidence:  []ontology.EvidenceRef{evidence},
+		Rationale: "bounded property merge",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	proposal, err := ontology.NewGovernedProposalWithMorphisms(
+		schema, base, target, []ontology.OntologyMorphism{morphism},
+		"author", "proposal", at.Add(2*time.Second), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return proposal, base
+}
+
 type unreadableOntologyProposalClient struct {
 	*explorer.Explorer
 }
