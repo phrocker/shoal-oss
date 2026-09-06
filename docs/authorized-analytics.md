@@ -8,11 +8,13 @@ stored compaction rank cells.
 
 - HTTP: `POST /api/v1/analytics`
 - MCP: `shoal.analytics`
-- Authorization: `analytics_read`, plus the source and policy grants required
-  by every returned node and edge
+- Authorization: `analytics_read` for the analytics operation and `retrieve`
+  for its recorded evidence, plus the source and policy grants required by
+  every returned node and edge
 
 The MCP tool is advertised only when its provider and validated runtime limits
-are installed and the launcher identity explicitly includes `analytics_read`.
+are installed and the launcher identity explicitly includes `analytics_read`
+and `retrieve`.
 The stdio identity keeps its configured source and policy ID bounds unchanged.
 The HTTP metadata response reports the provider capability and limits.
 
