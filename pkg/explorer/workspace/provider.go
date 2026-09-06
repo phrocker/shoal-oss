@@ -34,9 +34,9 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
-// OntologyChoices authorizes a settings-selected immutable ontology identity.
-// Implementations must consult trusted governed state, never ambient request
-// text.
+// OntologyChoices returns one caller-authorized governed snapshot and
+// authorizes a settings-selected immutable ontology identity. Implementations
+// must consult trusted governed state, never ambient request text.
 type OntologyChoices interface {
 	ListOntologyChoices(context.Context, auth.Decision) ([]OntologyChoice, error)
 	AuthorizeOntology(context.Context, auth.Decision, ontology.OntologyIdentity) error
@@ -320,17 +320,7 @@ func (p *Provider) ListOntologyChoices(
 	if err != nil {
 		return OntologyChoiceSet{}, err
 	}
-	for _, choice := range choices {
-		if err := p.ontologyChoices.AuthorizeOntology(
-			ctx, check.decision, choice.Identity); err != nil {
-			return OntologyChoiceSet{}, authDenied()
-		}
-	}
 	if result.SelectedOntology.Present {
-		if err := p.ontologyChoices.AuthorizeOntology(
-			ctx, check.decision, result.SelectedOntology.Identity); err != nil {
-			return OntologyChoiceSet{}, authDenied()
-		}
 		found := false
 		for _, choice := range choices {
 			if choice.Identity == result.SelectedOntology.Identity {
