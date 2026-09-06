@@ -268,13 +268,33 @@ func TestOntologyMorphismRejectsInvalidShapeBeforeSemanticLookup(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := NewOntologyMorphism(MorphismConfig{
-		Kind: MorphismRename, SourceVersion: f.renameFrom, TargetVersion: f.renameTo,
-		Sources: []shoal.ID{f.oldRel.ID()}, Targets: []shoal.ID{f.newRel.ID()},
-		Discriminator: discriminator,
-		Evidence:      []EvidenceRef{f.evidence}, Rationale: "invalid discriminator",
-	}); err == nil || !strings.Contains(err.Error(), "only split") {
-		t.Fatalf("rename discriminator error = %v", err)
+	tests := []MorphismConfig{
+		{
+			Kind: MorphismWiden, SourceVersion: f.v1, TargetVersion: f.v2,
+			Sources: []shoal.ID{f.v1rel.ID()}, Targets: []shoal.ID{f.v2rel.ID()},
+		},
+		{
+			Kind: MorphismNarrow, SourceVersion: f.v2, TargetVersion: f.v1,
+			Sources: []shoal.ID{f.v2rel.ID()}, Targets: []shoal.ID{f.v1rel.ID()},
+		},
+		{
+			Kind: MorphismRename, SourceVersion: f.renameFrom, TargetVersion: f.renameTo,
+			Sources: []shoal.ID{f.oldRel.ID()}, Targets: []shoal.ID{f.newRel.ID()},
+		},
+		{
+			Kind: MorphismMerge, SourceVersion: f.splitTo, TargetVersion: f.splitFrom,
+			Sources: []shoal.ID{f.person.ID(), f.org.ID()},
+			Targets: []shoal.ID{f.party.ID()},
+		},
+	}
+	for _, config := range tests {
+		config.Discriminator = discriminator
+		config.Evidence = []EvidenceRef{f.evidence}
+		config.Rationale = "invalid discriminator"
+		if _, err := NewOntologyMorphism(config); err == nil ||
+			!strings.Contains(err.Error(), "only split") {
+			t.Fatalf("%s discriminator error = %v", config.Kind, err)
+		}
 	}
 }
 
