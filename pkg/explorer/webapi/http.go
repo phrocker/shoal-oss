@@ -29,12 +29,22 @@ import (
 	"mime"
 	"net/http"
 	"reflect"
+	"strings"
 
+	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
 const maxRequestBytes = 32 << 20
+
+const (
+	// CommitOutcomeHeader reports whether a failed mutation may have committed.
+	CommitOutcomeHeader = "Shoal-Commit-Outcome"
+	// CommitOutcomeIndeterminate tells clients to inspect state or retry with
+	// the same idempotency key rather than assuming rollback.
+	CommitOutcomeIndeterminate = "indeterminate"
+)
 
 //go:embed static/*
 var staticFiles embed.FS
@@ -116,6 +126,13 @@ func (h *Handler) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 			return
 		}
 		request = request.WithContext(ctx)
+		if _, ok := EffectiveWorkspaceSettings(ctx); ok &&
+			strings.HasPrefix(request.URL.Path, "/api/v1/") {
+			writer = workspaceResponseWriter{
+				ResponseWriter:   writer,
+				maxResponseBytes: responseLimitForContext(ctx),
+			}
+		}
 	}
 	h.mux.ServeHTTP(writer, request)
 }
@@ -127,6 +144,7 @@ func (h *Handler) routes() {
 			writeError(writer, err)
 			return
 		}
+		metadata = applyWorkspaceMetadataLimits(request.Context(), metadata)
 		writeResponse(writer, http.StatusOK, metadata)
 	})
 	h.mux.HandleFunc("GET /api/v1/identity", func(writer http.ResponseWriter, request *http.Request) {
@@ -396,6 +414,7 @@ func endpoint[Request any, Response any](
 			writeError(writer, shoal.NewError(shoal.ErrorInvalidArgument, err.Error()))
 			return
 		}
+		applyWorkspaceRequestLimits(request.Context(), &input)
 		response, err := call(request.Context(), input)
 		if err != nil {
 			writeError(writer, err)
@@ -425,7 +444,7 @@ func decodeRequest(writer http.ResponseWriter, request *http.Request, value any)
 
 func writeResponse(writer http.ResponseWriter, status int, value any) {
 	var body limitedResponseBuffer
-	body.limit = int64(MaxResponseBytes)
+	body.limit = int64(responseLimitFor(writer))
 	if err := json.NewEncoder(&body).Encode(value); err != nil {
 		writer.Header().Set("Content-Type", "application/json; charset=utf-8")
 		writer.WriteHeader(http.StatusInternalServerError)
@@ -458,21 +477,28 @@ func (b *limitedResponseBuffer) Write(p []byte) (int, error) {
 func writeError(writer http.ResponseWriter, err error) {
 	status := http.StatusInternalServerError
 	code := primaryErrorCode(err)
-	switch code {
-	case shoal.ErrorInvalidArgument:
-		status, code = http.StatusBadRequest, shoal.ErrorInvalidArgument
-	case shoal.ErrorNotFound:
-		status, code = http.StatusNotFound, shoal.ErrorNotFound
-	case shoal.ErrorConflict:
-		status, code = http.StatusConflict, shoal.ErrorConflict
-	case shoal.ErrorUnauthorized:
-		status, code = http.StatusUnauthorized, shoal.ErrorUnauthorized
-	case shoal.ErrorUnavailable:
+	indeterminate := explorer.IsIndeterminateCommit(err)
+	if indeterminate {
+		writer.Header().Set(
+			CommitOutcomeHeader, CommitOutcomeIndeterminate)
 		status, code = http.StatusServiceUnavailable, shoal.ErrorUnavailable
-	case shoal.ErrorCanceled:
-		status, code = 499, shoal.ErrorCanceled
-	case shoal.ErrorDeadline:
-		status, code = http.StatusGatewayTimeout, shoal.ErrorDeadline
+	} else {
+		switch code {
+		case shoal.ErrorInvalidArgument:
+			status, code = http.StatusBadRequest, shoal.ErrorInvalidArgument
+		case shoal.ErrorNotFound:
+			status, code = http.StatusNotFound, shoal.ErrorNotFound
+		case shoal.ErrorConflict:
+			status, code = http.StatusConflict, shoal.ErrorConflict
+		case shoal.ErrorUnauthorized:
+			status, code = http.StatusUnauthorized, shoal.ErrorUnauthorized
+		case shoal.ErrorUnavailable:
+			status, code = http.StatusServiceUnavailable, shoal.ErrorUnavailable
+		case shoal.ErrorCanceled:
+			status, code = 499, shoal.ErrorCanceled
+		case shoal.ErrorDeadline:
+			status, code = http.StatusGatewayTimeout, shoal.ErrorDeadline
+		}
 	}
 	var embedding *wireEmbeddingQueryReport
 	var embeddingErr *EmbeddingQueryError
@@ -481,10 +507,14 @@ func writeError(writer http.ResponseWriter, err error) {
 		embedding = wireEmbeddingQueryReportValue(&report)
 	}
 	writeResponse(writer, status, struct {
-		Code      shoal.ErrorCode           `json:"code"`
-		Message   string                    `json:"message"`
-		Embedding *wireEmbeddingQueryReport `json:"embedding,omitempty"`
-	}{Code: code, Message: err.Error(), Embedding: embedding})
+		Code          shoal.ErrorCode           `json:"code"`
+		Message       string                    `json:"message"`
+		Embedding     *wireEmbeddingQueryReport `json:"embedding,omitempty"`
+		Indeterminate bool                       `json:"indeterminate,omitempty"`
+	}{
+		Code: code, Message: err.Error(),
+		Embedding: embedding, Indeterminate: indeterminate,
+	})
 }
 
 func primaryErrorCode(err error) shoal.ErrorCode {

@@ -27,6 +27,7 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/explorer/workspace"
 	"github.com/phrocker/shoal-oss/pkg/ontology"
+	"github.com/phrocker/shoal-oss/pkg/retrieval"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
@@ -75,6 +76,15 @@ func EffectiveWorkspaceSettings(
 	effective, ok := ctx.Value(
 		effectiveWorkspaceSettingsContextKey{}).(workspace.EffectiveDecision)
 	return effective, ok
+}
+
+type workspaceResponseWriter struct {
+	http.ResponseWriter
+	maxResponseBytes uint64
+}
+
+func (w workspaceResponseWriter) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
 }
 
 // SetWorkspaceSettingsProvider enables the settings routes on a constructed
@@ -130,6 +140,82 @@ func (h *Handler) applyWorkspaceSettings(
 	ctx = context.WithValue(
 		ctx, effectiveWorkspaceSettingsContextKey{}, effective)
 	return withIdentity(ctx, decision), nil
+}
+
+func applyWorkspaceRequestLimits(ctx context.Context, request any) {
+	effective, ok := EffectiveWorkspaceSettings(ctx)
+	if !ok {
+		return
+	}
+	limits := effective.Limits()
+	switch value := request.(type) {
+	case *RetrievalRequest:
+		value.Query.TopK = lowerRequestLimit(
+			value.Query.TopK, retrieval.DefaultTopK, limits.RetrievalTopK)
+	case *NeighborhoodRequest:
+		value.Depth = lowerRequestLimit(
+			value.Depth, DefaultDepth, limits.GraphDepth)
+		value.Fanout = lowerRequestLimit(
+			value.Fanout, DefaultFanout, limits.GraphFanout)
+		value.MaxNodes = lowerRequestLimit(
+			value.MaxNodes, DefaultMaxNodes, limits.GraphNodes)
+	case *PathRequest:
+		value.MaxDepth = lowerRequestLimit(
+			value.MaxDepth, DefaultDepth, limits.GraphDepth)
+		value.Fanout = lowerRequestLimit(
+			value.Fanout, DefaultFanout, limits.GraphFanout)
+	}
+}
+
+func lowerRequestLimit(value, defaultValue, maximum uint32) uint32 {
+	if value == 0 {
+		value = defaultValue
+	}
+	if value > maximum {
+		return maximum
+	}
+	return value
+}
+
+func effectiveGraphNodeLimit(ctx context.Context, fallback uint32) uint32 {
+	effective, ok := EffectiveWorkspaceSettings(ctx)
+	if !ok || effective.Limits().GraphNodes >= fallback {
+		return fallback
+	}
+	return effective.Limits().GraphNodes
+}
+
+func applyWorkspaceMetadataLimits(
+	ctx context.Context,
+	metadata MetadataResponse,
+) MetadataResponse {
+	effective, ok := EffectiveWorkspaceSettings(ctx)
+	if !ok {
+		return metadata
+	}
+	limits := effective.Limits()
+	metadata.MaxTopK = min(metadata.MaxTopK, limits.RetrievalTopK)
+	metadata.MaxDepth = min(metadata.MaxDepth, limits.GraphDepth)
+	metadata.MaxFanout = min(metadata.MaxFanout, limits.GraphFanout)
+	metadata.MaxNodes = min(metadata.MaxNodes, limits.GraphNodes)
+	metadata.MaxResponseBytes = min(
+		metadata.MaxResponseBytes, limits.OutputBytes)
+	return metadata
+}
+
+func responseLimitFor(writer http.ResponseWriter) uint64 {
+	if limited, ok := writer.(workspaceResponseWriter); ok {
+		return limited.maxResponseBytes
+	}
+	return MaxResponseBytes
+}
+
+func responseLimitForContext(ctx context.Context) uint64 {
+	effective, ok := EffectiveWorkspaceSettings(ctx)
+	if !ok {
+		return MaxResponseBytes
+	}
+	return effective.Limits().OutputBytes
 }
 
 func isWorkspaceSettingsManagementPath(path string) bool {
