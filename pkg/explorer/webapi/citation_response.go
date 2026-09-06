@@ -1900,11 +1900,7 @@ func validateCitationEvidenceVisibility(
 	if err != nil {
 		return err
 	}
-	matches := equalCitationStrings(evidence.Visibility, required)
-	if evidence.Path == nil {
-		matches = visibilityCovers(required, evidence.Visibility)
-	}
-	if !matches {
+	if !equalCitationStrings(evidence.Visibility, required) {
 		return shoal.NewError(
 			shoal.ErrorInvalidArgument,
 			"citation evidence visibility does not match its sources")

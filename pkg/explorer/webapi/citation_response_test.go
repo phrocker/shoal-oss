@@ -272,10 +272,20 @@ func TestCitationEnvelopeOpaqueIDRoundTrip(t *testing.T) {
 	if _, err := json.Marshal(hiddenSource); err == nil {
 		t.Fatal("source visibility omitted from effective output label")
 	}
+	underLabeledEvidence := original
+	underLabeledEvidence.Evidence = append(
+		[]CitationEvidence(nil), original.Evidence...)
+	underLabeledEvidence.Evidence[0].Visibility = nil
+	if _, err := json.Marshal(underLabeledEvidence); err == nil {
+		t.Fatal("document evidence omitted source visibility")
+	}
 	mergedVisibility := original
 	mergedVisibility.Sources = append(
 		[]CitationSource(nil), original.Sources...)
 	mergedVisibility.Sources[0].Visibility = []string{"internal", "secret"}
+	mergedVisibility.Evidence = append(
+		[]CitationEvidence(nil), original.Evidence...)
+	mergedVisibility.Evidence[0].Visibility = []string{"internal", "secret"}
 	mergedVisibility.EffectiveVisibility = []string{"api", "internal", "secret"}
 	mergedVisibility.ID, err = reasoning.CanonicalResponseID(
 		mergedVisibility.SessionID,

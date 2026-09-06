@@ -1197,6 +1197,10 @@ func responseIdentity(data responseData) ResponseIdentity {
 // ResponseFingerprint derives the canonical verification fingerprint shared
 // by immutable responses and strict transport adapters.
 func ResponseFingerprint(identity ResponseIdentity) (string, error) {
+	embeddingSpaces, err := identity.EmbeddingSpaces.Canonical()
+	if err != nil {
+		return "", fmt.Errorf("embedding spaces: %w", err)
+	}
 	retrievedEvidence, err := canonicalInteractionEvidence(
 		identity.RetrievedEvidence)
 	if err != nil {
@@ -1246,10 +1250,10 @@ func ResponseFingerprint(identity ResponseIdentity) (string, error) {
 		identity.SnapshotAsOf.UTC().Format(time.RFC3339Nano),
 		string(identity.AuthorizationFingerprint),
 		identity.AuthorizationExpiresAt.UTC().Format(time.RFC3339Nano),
-		identity.EmbeddingSpaces.Digest,
+		embeddingSpaces.Digest,
 		identity.GeneratedAt.UTC().Format(time.RFC3339Nano),
 	}
-	for _, embeddingSpace := range identity.EmbeddingSpaces.Identities {
+	for _, embeddingSpace := range embeddingSpaces.Identities {
 		parts = append(parts, "embedding-space", embeddingSpace)
 	}
 	for _, visibility := range identity.EffectiveVisibility {

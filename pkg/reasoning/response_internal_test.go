@@ -86,3 +86,29 @@ func TestInteractionEvidenceEqualityPreservesGraphOrder(t *testing.T) {
 		t.Fatal("reordered graph edges compared equal")
 	}
 }
+
+func TestResponseFingerprintCanonicalizesEmbeddingSpaceSet(t *testing.T) {
+	canonical, err := interaction.NewEmbeddingSpaceSet(
+		[]string{"space-b", "space-a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	left, err := ResponseFingerprint(ResponseIdentity{
+		EmbeddingSpaces: canonical,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	right, err := ResponseFingerprint(ResponseIdentity{
+		EmbeddingSpaces: interaction.EmbeddingSpaceSet{
+			Identities: []string{"space-b", "space-a", "space-b"},
+			Digest:     canonical.Digest,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if left != right {
+		t.Fatal("semantically identical embedding-space sets changed fingerprint")
+	}
+}
