@@ -765,6 +765,108 @@ func TestConcurrentFirstDocumentPublicationsResolveWithoutIndeterminate(t *testi
 	}
 }
 
+func TestConcurrentIdenticalFirstPublicationIsIdempotent(t *testing.T) {
+	config := testRuntimeConfig(t, testDirectory(t))
+	runtime, err := Open(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.Close()
+	intent := testIntent(
+		t, config.Domain, "create", "same-token", "same-value",
+		guard.ModeAbsentOrIdentical, 0, coordination.Digest{},
+	)
+	results := make(chan Result, 2)
+	errs := make(chan error, 2)
+	var wait sync.WaitGroup
+	for range 2 {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			result, err := runtime.Publish(
+				context.Background(), Request{Intent: intent},
+			)
+			results <- result
+			errs <- err
+		}()
+	}
+	wait.Wait()
+	close(results)
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("identical concurrent publication = %v", err)
+		}
+	}
+	var epoch coordination.Epoch
+	unchanged := 0
+	for result := range results {
+		if epoch == 0 {
+			epoch = result.Epoch
+		}
+		if result.Epoch != epoch {
+			t.Fatalf("identical publications used epochs %d and %d", epoch, result.Epoch)
+		}
+		if result.Unchanged {
+			unchanged++
+		}
+	}
+	if unchanged != 1 {
+		t.Fatalf("unchanged identical publications = %d, want 1", unchanged)
+	}
+}
+
+func TestAbsentPublicationRetriesAfterForeignPendingRelease(t *testing.T) {
+	config := testRuntimeConfig(t, testDirectory(t))
+	runtime, err := Open(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.Close()
+	intent := testIntent(
+		t, config.Domain, "create", "after-release", "value",
+		guard.ModeAbsentOrIdentical, 0, coordination.Digest{},
+	)
+	digest, err := LogicalDigest(intent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := buildPlan(intent, digest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	item := plan.Guards[0]
+	foreign, err := runtime.guards.Acquire(context.Background(), guard.Intent{
+		Entity: item.Entity, TXN: coordination.TXN("foreign"),
+		Owner: coordination.OwnerID("foreign"), LeaseUntil: time.Now().UTC().Add(time.Minute),
+		Fence: 1, AuthorityGeneration: config.Authority.Generation,
+		AuthorityFence:       config.Authority.Fence,
+		RetentionGeneration:  config.Authority.RetentionGeneration,
+		RetirementGeneration: item.RetirementGeneration,
+		HistoryFloor:         config.Authority.HistoryFloor,
+		Mode:                 guard.ModeAbsentOrIdentical, DesiredState: item.DesiredState,
+		DesiredWinnerID: item.DesiredWinnerID, DesiredDigest: item.DesiredDigest,
+		LPART: item.LPART, LogicalPolicyID: item.LogicalPolicyID,
+		ManifestChunk: item.ManifestChunk, ManifestEntry: item.ManifestEntry,
+		Ordinal: item.Ordinal, PhysicalDigest: item.PhysicalDigest,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	released := make(chan error, 1)
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		released <- runtime.guards.Abort(context.Background(), foreign.Pending, false)
+	}()
+	result, err := runtime.Publish(context.Background(), Request{Intent: intent})
+	if err != nil || result.Epoch == 0 {
+		t.Fatalf("publication after pending release = %#v, %v", result, err)
+	}
+	if err := <-released; err != nil {
+		t.Fatalf("release foreign guard = %v", err)
+	}
+}
+
 func TestExplorerLoadHidesUncommittedAndPoisonedPhysicalRevision(t *testing.T) {
 	directory := testDirectory(t)
 	config := testRuntimeConfig(t, directory)
