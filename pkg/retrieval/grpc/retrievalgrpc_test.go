@@ -53,8 +53,8 @@ func (f fakeRetriever) Retrieve(
 
 func TestInProcessAndLoopbackParity(t *testing.T) {
 	request := retrieval.Request{
-		Text:  "why did the deployment fail?",
-		TopK:  3,
+		Text: "why did the deployment fail?",
+		TopK: 3,
 		Modes: []retrieval.Mode{
 			retrieval.ModeLexical, retrieval.ModeVector, retrieval.ModeGraph,
 		},
