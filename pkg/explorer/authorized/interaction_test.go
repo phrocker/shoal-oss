@@ -85,7 +85,7 @@ type rejectingSnapshotValidator struct {
 }
 
 func (v *rejectingSnapshotValidator) ValidateSnapshot(
-	context.Context, shoal.ID, time.Time,
+	context.Context, shoal.ID, time.Time, []shoal.ID,
 ) error {
 	v.calls++
 	return shoal.NewError(

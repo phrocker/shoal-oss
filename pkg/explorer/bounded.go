@@ -55,7 +55,7 @@ func (e *Explorer) Snapshot(ctx context.Context) (Snapshot, error) {
 // frontier observed from this Explorer instance. Historical frontiers remain
 // valid after unrelated content publications during the process lifetime.
 func (e *Explorer) ValidateSnapshot(
-	ctx context.Context, id shoal.ID, asOf time.Time,
+	ctx context.Context, id shoal.ID, asOf time.Time, nodeIDs []shoal.ID,
 ) error {
 	if err := contextError(ctx); err != nil {
 		return err
@@ -75,18 +75,33 @@ func (e *Explorer) ValidateSnapshot(
 	if err := e.ensureGraphLocked(); err != nil {
 		return err
 	}
-	observedAt, ok := e.snapshotHistory[string(id)]
-	if !ok || !observedAt.Equal(asOf.UTC()) {
+	record, ok := e.snapshotHistory[string(id)]
+	if !ok || !record.AsOf.Equal(asOf.UTC()) {
 		return shoal.NewError(
 			shoal.ErrorConflict, "snapshot pin is not a trusted corpus frontier")
+	}
+	for _, nodeID := range nodeIDs {
+		index := sort.Search(len(record.NodeIDs), func(index int) bool {
+			return shoal.CompareID(record.NodeIDs[index], nodeID) >= 0
+		})
+		if index == len(record.NodeIDs) || record.NodeIDs[index] != nodeID {
+			return shoal.NewError(
+				shoal.ErrorConflict,
+				"interaction source was not present in the pinned snapshot",
+			)
+		}
 	}
 	return nil
 }
 
 func (e *Explorer) registerSnapshotLocked(snapshot Snapshot) error {
 	id := shoal.ID(snapshot.ID)
-	if observedAt, ok := e.snapshotHistory[snapshot.ID]; ok {
-		if observedAt.Equal(snapshot.AsOf.UTC()) {
+	record := persistedSnapshot{
+		ID: id, AsOf: snapshot.AsOf.UTC(),
+		NodeIDs: e.snapshotSourceNodeIDsLocked(),
+	}
+	if existing, ok := e.snapshotHistory[snapshot.ID]; ok {
+		if persistedSnapshotsEqual(existing, record) {
 			return nil
 		}
 		return shoal.NewError(
@@ -95,10 +110,9 @@ func (e *Explorer) registerSnapshotLocked(snapshot Snapshot) error {
 		)
 	}
 	if e.readOnly {
-		e.snapshotHistory[snapshot.ID] = snapshot.AsOf.UTC()
+		e.snapshotHistory[snapshot.ID] = record
 		return nil
 	}
-	record := persistedSnapshot{ID: id, AsOf: snapshot.AsOf.UTC()}
 	accepted, err := e.conditionalInteractionRecord(
 		snapshotRecordRow(id),
 		embeddedRecordSnapshot,
@@ -116,16 +130,30 @@ func (e *Explorer) registerSnapshotLocked(snapshot Snapshot) error {
 		if err != nil {
 			return err
 		}
-		if !found || current.ID != id ||
-			!current.AsOf.UTC().Equal(record.AsOf) {
+		current.AsOf = current.AsOf.UTC()
+		if !found || !persistedSnapshotsEqual(current, record) {
 			return shoal.NewError(
 				shoal.ErrorConflict,
 				"snapshot ID is already registered with different content",
 			)
 		}
 	}
-	e.snapshotHistory[snapshot.ID] = snapshot.AsOf.UTC()
+	record.NodeIDs = append([]shoal.ID(nil), record.NodeIDs...)
+	e.snapshotHistory[snapshot.ID] = record
 	return nil
+}
+
+func (e *Explorer) snapshotSourceNodeIDsLocked() []shoal.ID {
+	nodeIDs := make([]shoal.ID, 0, len(e.graphNodes))
+	for id, node := range e.graphNodes {
+		if !interaction.IsInteractionKind(node.Kind) {
+			nodeIDs = append(nodeIDs, id)
+		}
+	}
+	sort.Slice(nodeIDs, func(i, j int) bool {
+		return shoal.CompareID(nodeIDs[i], nodeIDs[j]) < 0
+	})
+	return nodeIDs
 }
 
 // BoundedNeighborhood expands the cached adjacency index without scanning or

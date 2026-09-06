@@ -84,7 +84,7 @@ const (
 	maxEmbeddedOntologyProposalBytes   = uint64(16 * 1024 * 1024)
 	maxEmbeddedProposalTransitionBytes = uint64(64 * 1024)
 	maxEmbeddedExtractionBytes         = uint64(16 * 1024 * 1024)
-	maxEmbeddedSnapshotBytes           = uint64(1024)
+	maxEmbeddedSnapshotBytes           = uint64(64 * 1024 * 1024)
 )
 
 var snapshotAnchorRow = []byte("meta/snapshot-anchor")
@@ -98,8 +98,9 @@ type persistedSnapshotAnchor struct {
 }
 
 type persistedSnapshot struct {
-	ID   shoal.ID
-	AsOf time.Time
+	ID      shoal.ID
+	AsOf    time.Time
+	NodeIDs []shoal.ID
 }
 
 // persistedCursorKey holds the durable, per-corpus secret that seals change-feed
@@ -319,14 +320,29 @@ func (e *Explorer) loadSnapshotRecord(
 		return shoal.NewError(
 			shoal.ErrorInternal, "stored snapshot record is invalid")
 	}
-	if existing, ok := e.snapshotHistory[string(record.ID)]; ok &&
-		!existing.Equal(record.AsOf.UTC()) {
-		return shoal.NewError(
-			shoal.ErrorInternal,
-			"stored snapshot ID has conflicting observation times",
-		)
+	for index, nodeID := range record.NodeIDs {
+		if err := shoal.ValidateRequiredID(
+			"snapshot source node ID", nodeID,
+		); err != nil {
+			return shoal.WrapError(
+				shoal.ErrorInternal, "stored snapshot is invalid", err)
+		}
+		if index > 0 &&
+			shoal.CompareID(record.NodeIDs[index-1], nodeID) >= 0 {
+			return shoal.NewError(
+				shoal.ErrorInternal,
+				"stored snapshot source node IDs are not canonical",
+			)
+		}
 	}
-	e.snapshotHistory[string(record.ID)] = record.AsOf.UTC()
+	record.AsOf = record.AsOf.UTC()
+	if existing, ok := e.snapshotHistory[string(record.ID)]; ok &&
+		!persistedSnapshotsEqual(existing, record) {
+		return shoal.NewError(
+			shoal.ErrorInternal, "stored snapshot ID has conflicting content")
+	}
+	record.NodeIDs = append([]shoal.ID(nil), record.NodeIDs...)
+	e.snapshotHistory[string(record.ID)] = record
 	return nil
 }
 
@@ -677,7 +693,11 @@ func (e *Explorer) conditionalInteractionRecord(
 	if committed {
 		return true, nil
 	}
-	found, readErr := e.hasCurrentRecord(row)
+	winnerQualifier := recordCQV2
+	if writeDeleteMarker {
+		winnerQualifier = recordDeleteCQ
+	}
+	found, readErr := e.hasCurrentQualifier(row, winnerQualifier)
 	if readErr != nil {
 		return false, errors.Join(indeterminate, readErr)
 	}
@@ -717,7 +737,9 @@ func (e *Explorer) hasExactRecord(row, expected []byte) (bool, error) {
 	return committed, nil
 }
 
-func (e *Explorer) hasCurrentRecord(row []byte) (bool, error) {
+func (e *Explorer) hasCurrentQualifier(
+	row []byte, qualifier string,
+) (bool, error) {
 	found := false
 	err := e.engine.LookupRows(
 		explorerTable,
@@ -728,7 +750,7 @@ func (e *Explorer) hasCurrentRecord(row []byte) (bool, error) {
 		},
 		func(_ int, key *iterrt.Key, _ []byte) {
 			if !found &&
-				bytes.Equal(key.ColumnQualifier, []byte(recordCQV2)) {
+				bytes.Equal(key.ColumnQualifier, []byte(qualifier)) {
 				found = true
 			}
 		},
@@ -877,11 +899,23 @@ func equivalentEmbeddedRecord(row, stored, expected []byte) bool {
 			decodeEmbeddedRecord(
 				expected, embeddedRecordSnapshot, &right,
 			) == nil &&
-			left.ID == right.ID &&
-			left.AsOf.UTC().Equal(right.AsOf.UTC())
+			persistedSnapshotsEqual(left, right)
 	default:
 		return false
 	}
+}
+
+func persistedSnapshotsEqual(left, right persistedSnapshot) bool {
+	if left.ID != right.ID || !left.AsOf.UTC().Equal(right.AsOf.UTC()) ||
+		len(left.NodeIDs) != len(right.NodeIDs) {
+		return false
+	}
+	for index := range left.NodeIDs {
+		if left.NodeIDs[index] != right.NodeIDs[index] {
+			return false
+		}
+	}
+	return true
 }
 
 func encodeEmbeddedRecord(kind byte, value any) ([]byte, error) {

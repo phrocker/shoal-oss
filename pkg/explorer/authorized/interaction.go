@@ -145,6 +145,7 @@ func (c *Client) recordInteraction(
 	}
 	if err := c.snapshotValidator.ValidateSnapshot(
 		ctx, canonical.SnapshotID, canonical.SnapshotAsOf,
+		canonical.TouchedNodeIDs(),
 	); err != nil {
 		return interaction.Session{}, directBaseError(err)
 	}

@@ -36,7 +36,9 @@ import (
 
 // SnapshotValidator verifies corpus frontiers pinned into interaction records.
 type SnapshotValidator interface {
-	ValidateSnapshot(context.Context, shoal.ID, time.Time) error
+	ValidateSnapshot(
+		context.Context, shoal.ID, time.Time, []shoal.ID,
+	) error
 }
 
 // Config supplies the trusted dependencies for an authorization-enforcing

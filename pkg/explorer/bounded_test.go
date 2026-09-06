@@ -62,20 +62,32 @@ func TestHistoricalSnapshotValidationSurvivesRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := corpus.Ingest(ctx, Source{
+	firstReceipt, err := corpus.Ingest(ctx, Source{
 		URI: "file:///snapshot-one.txt", MediaType: MediaTypeText,
 		Content: "snapshot one",
-	}); err != nil {
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstView, err := corpus.Document(
+		ctx, firstReceipt.Document.ID, firstReceipt.Revision.ID)
+	if err != nil {
 		t.Fatal(err)
 	}
 	first, err := corpus.Snapshot(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := corpus.Ingest(ctx, Source{
+	secondReceipt, err := corpus.Ingest(ctx, Source{
 		URI: "file:///snapshot-two.txt", MediaType: MediaTypeText,
 		Content: "snapshot two",
-	}); err != nil {
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondView, err := corpus.Document(
+		ctx, secondReceipt.Document.ID, secondReceipt.Revision.ID)
+	if err != nil {
 		t.Fatal(err)
 	}
 	if _, err := corpus.Snapshot(ctx); err != nil {
@@ -91,13 +103,20 @@ func TestHistoricalSnapshotValidationSurvivesRestart(t *testing.T) {
 	defer reopened.Close()
 	if err := reopened.ValidateSnapshot(
 		ctx, shoal.ID(first.ID), first.AsOf,
+		[]shoal.ID{firstView.Root.Spans[0].ID},
 	); err != nil {
 		t.Fatalf("historical snapshot was not durable: %v", err)
 	}
 	if err := reopened.ValidateSnapshot(
-		ctx, "forged-snapshot", first.AsOf,
+		ctx, "forged-snapshot", first.AsOf, nil,
 	); !shoal.IsErrorCode(err, shoal.ErrorConflict) {
 		t.Fatalf("forged snapshot validation error = %v", err)
+	}
+	if err := reopened.ValidateSnapshot(
+		ctx, shoal.ID(first.ID), first.AsOf,
+		[]shoal.ID{secondView.Root.Spans[0].ID},
+	); !shoal.IsErrorCode(err, shoal.ErrorConflict) {
+		t.Fatalf("post-snapshot source validation error = %v", err)
 	}
 }
 

@@ -71,7 +71,7 @@ type Explorer struct {
 	vectorProbeMu           sync.Mutex
 	vectorAvailability      vectorAvailabilityCache
 	snapshot                Snapshot
-	snapshotHistory         map[string]time.Time
+	snapshotHistory         map[string]persistedSnapshot
 	snapshotAnchor          time.Time
 	lastPublicationSequence uint64
 	changeHistoryFloor      uint64
@@ -217,7 +217,7 @@ func OpenWithOptions(dir string, options Options) (*Explorer, error) {
 		recallEvidence:          cloneStringMap(options.RecallEvidence),
 		latentLinkProjection:    latentProjection,
 		maxLatentAssertions:     maxLatentAssertions,
-		snapshotHistory:         make(map[string]time.Time),
+		snapshotHistory:         make(map[string]persistedSnapshot),
 		readOnly:                options.ReadOnly,
 	}
 	if err := explorer.load(); err != nil {
