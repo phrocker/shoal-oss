@@ -208,7 +208,8 @@ func (e *Explorer) load() error {
 	for scanner.Next() {
 		key := scanner.Key()
 		qualifier := key.ColumnQualifier
-		if bytes.Equal(qualifier, []byte(recordCQV1)) {
+		if bytes.Equal(qualifier, []byte(recordCQV1)) &&
+			!bytes.HasPrefix(key.Row, []byte(documentRow)) {
 			if err := validateStrictJSONStringEncoding(scanner.Value()); err != nil {
 				return shoal.WrapError(
 					shoal.ErrorInternal,
@@ -481,6 +482,13 @@ func (e *Explorer) loadDocumentRecord(
 	}
 	switch {
 	case bytes.Equal(qualifier, []byte(recordCQV1)):
+		if err := validateStrictJSONStringEncoding(encoded); err != nil {
+			return shoal.WrapError(
+				shoal.ErrorInternal,
+				"stored explorer record has invalid JSON string encoding",
+				err,
+			)
+		}
 		if err := json.Unmarshal(encoded, &record); err != nil {
 			return shoal.WrapError(shoal.ErrorInternal, "decode explorer document", err)
 		}
