@@ -680,16 +680,32 @@ func TestNoResponseBeforeDurableCaptureSucceeds(t *testing.T) {
 	success := &captureSink{enrich: func(session interaction.Session) interaction.Session {
 		trustedActor.OnBehalfOf = []shoal.ID{"trusted-delegate"}
 		session.Actor = trustedActor
-		session.Turns = []interaction.Turn{{
-			Index: 0,
-			ToolCall: &interaction.ToolCall{
-				Kind: "retrieve", RetrievedNodeIDs: session.SeedNodeIDs,
-				RetrievedEvidence: session.SeedEvidence,
-			},
-		}}
 		return session
 	}}
-	captured := capture(t, prepared, success)
+	recorder, err = interaction.NewRecorder(context.Background(), success)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := recorder.SetClock(func() time.Time {
+		return prepared.CaptureMetadata().GeneratedAt().Add(time.Minute)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	session := captureSession(t, prepared)
+	session.Turns = []interaction.Turn{{
+		Index: 0,
+		ToolCall: &interaction.ToolCall{
+			Kind: "retrieve", RetrievedNodeIDs: session.SeedNodeIDs,
+			RetrievedEvidence: session.SeedEvidence,
+		},
+	}}
+	captured, err := prepared.Capture(context.Background(), recorder, session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if success.records != 1 {
+		t.Fatalf("record count = %d", success.records)
+	}
 	if captured.RecordedSession().Actor.SubjectID != trustedActor.SubjectID ||
 		captured.RecordedSession().Actor.ActorID != trustedActor.ActorID {
 		t.Fatal("captured response did not retain trusted persisted enrichment")
