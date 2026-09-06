@@ -25,10 +25,13 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/phrocker/shoal-oss/accumulo"
+	"github.com/phrocker/shoal-oss/internal/dirlock"
 	"github.com/phrocker/shoal-oss/internal/engine"
 	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
@@ -650,6 +653,40 @@ func TestReviewSettingsRejectConcurrentDirectoryOpen(t *testing.T) {
 	if err == nil {
 		defer second.Close()
 		t.Fatal("two independent settings engines accepted the same WAL directory")
+	}
+}
+
+func TestReviewSettingsStoreRejectsPathAliasAndReopensAfterClose(t *testing.T) {
+	root := t.TempDir()
+	directory := filepath.Join(root, "settings")
+	aliasParent := filepath.Join(root, "alias")
+	if err := os.MkdirAll(directory, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(aliasParent, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(aliasParent, "..", "settings")
+	first, err := OpenDurableStore(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second, err := OpenDurableStore(alias); !errors.Is(err, dirlock.ErrLocked) ||
+		!shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
+		if second != nil {
+			_ = second.Close()
+		}
+		t.Fatalf("path-alias open error = %v", err)
+	}
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := OpenDurableStore(directory)
+	if err != nil {
+		t.Fatalf("reopen after close: %v", err)
+	}
+	if err := reopened.Close(); err != nil {
+		t.Fatal(err)
 	}
 }
 
