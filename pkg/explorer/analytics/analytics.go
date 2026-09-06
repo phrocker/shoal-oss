@@ -370,8 +370,8 @@ func ValidateResult(request Request, result Result, limits Limits) error {
 	}
 	seenUnresolved := make(map[shoal.ID]struct{}, len(scope.UnresolvedAssertions))
 	for index, unresolved := range scope.UnresolvedAssertions {
-		if err := shoal.ValidateRequiredID(
-			"unresolved assertion ID", unresolved.AssertionID); err != nil {
+		if err := ontology.ValidateID(unresolved.AssertionID); err != nil ||
+			ontology.IDNamespace(unresolved.AssertionID) != "assertion" {
 			return shoal.NewError(
 				shoal.ErrorInternal, "analytics response assertion ID is invalid")
 		}
@@ -396,6 +396,13 @@ func ValidateResult(request Request, result Result, limits Limits) error {
 				shoal.ErrorInternal, "analytics response assertions are not canonical")
 		}
 		seenUnresolved[unresolved.AssertionID] = struct{}{}
+	}
+	if uint64(scope.ResolvedAssertionCount)+
+		uint64(len(scope.UnresolvedAssertions)) > uint64(scope.EdgeCount) {
+		return shoal.NewError(
+			shoal.ErrorInternal,
+			"analytics response assertion totals exceed the materialized edges",
+		)
 	}
 	if result.PageRank.DampingFactor != normalized.PageRank.DampingFactor ||
 		result.PageRank.ConvergenceTolerance !=

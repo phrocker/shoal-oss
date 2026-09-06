@@ -230,12 +230,7 @@ func validateAnalyticsEvidenceBytes(
 		}
 	}
 	for _, assertion := range neighborhood.Assertions {
-		evidence := analyticsAssertionEvidence([]ontology.Assertion{assertion})
-		if len(evidence) != 1 {
-			return shoal.NewError(
-				shoal.ErrorInternal, "analytics assertion evidence is inconsistent")
-		}
-		if err := add(evidence[0]); err != nil {
+		if err := add(InteractionAssertionEvidence(assertion)); err != nil {
 			return err
 		}
 	}
@@ -250,24 +245,32 @@ func analyticsAssertionEvidence(
 	}
 	result := make([]interaction.AssertionEvidence, 0, len(assertions))
 	for _, assertion := range assertions {
-		target, _ := assertion.Object().ReferenceValue()
-		evidence := interaction.AssertionEvidence{
-			ID: assertion.ID(), Subject: assertion.Subject(),
-			Predicate: assertion.Predicate(), ObjectReference: target,
-			Origin: string(assertion.Origin()), Confidence: assertion.Confidence(),
-			GraphEdgeID: shoal.ID(
-				assertion.Metadata()[graphAssertionEdgeIDMetadata]),
-		}
-		for _, item := range assertion.Evidence() {
-			if derivation, ok := item.Derivation(); ok {
-				evidence.DerivationID = derivation.ID()
-				evidence.DerivationScore = derivation.Score()
-				break
-			}
-		}
-		result = append(result, evidence)
+		result = append(result, InteractionAssertionEvidence(assertion))
 	}
 	return result
+}
+
+// InteractionAssertionEvidence projects an ontology assertion into the exact
+// durable evidence representation used by analytics interaction records.
+func InteractionAssertionEvidence(
+	assertion ontology.Assertion,
+) interaction.AssertionEvidence {
+	target, _ := assertion.Object().ReferenceValue()
+	evidence := interaction.AssertionEvidence{
+		ID: assertion.ID(), Subject: assertion.Subject(),
+		Predicate: assertion.Predicate(), ObjectReference: target,
+		Origin: string(assertion.Origin()), Confidence: assertion.Confidence(),
+		GraphEdgeID: shoal.ID(
+			assertion.Metadata()[graphAssertionEdgeIDMetadata]),
+	}
+	for _, item := range assertion.Evidence() {
+		if derivation, ok := item.Derivation(); ok {
+			evidence.DerivationID = derivation.ID()
+			evidence.DerivationScore = derivation.Score()
+			break
+		}
+	}
+	return evidence
 }
 
 func recordedAssertionEvidence(
