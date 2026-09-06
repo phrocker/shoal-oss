@@ -430,6 +430,14 @@ func ValidateResult(request Request, result Result, limits Limits) error {
 		inSum += uint64(node.InDegree)
 		outSum += uint64(node.OutDegree)
 	}
+	for _, seedID := range normalized.Scope.NodeIDs {
+		if _, ok := seenNodes[seedID]; !ok {
+			return shoal.NewError(
+				shoal.ErrorInternal,
+				"analytics response omits a requested seed node",
+			)
+		}
+	}
 	if inSum != uint64(scope.EdgeCount) || outSum != uint64(scope.EdgeCount) ||
 		(scope.NodeCount > 0 && math.Abs(rankSum-1) > 1e-8) {
 		return shoal.NewError(
