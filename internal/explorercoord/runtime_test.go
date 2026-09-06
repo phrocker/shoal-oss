@@ -227,11 +227,20 @@ func TestRecordAttemptAliasGenerationSurvivesSeparateRFiles(t *testing.T) {
 	if err := intents.SetAttempt(context.Background(), key, nil, oldTxn); err != nil {
 		t.Fatal(err)
 	}
+	stale, found, err := intents.readAttempt(context.Background(), key)
+	if err != nil || !found {
+		t.Fatalf("read initial alias = %#v, %v, %v", stale, found, err)
+	}
 	if err := eng.Flush("coord"); err != nil {
 		t.Fatal(err)
 	}
 	if err := intents.SetAttempt(context.Background(), key, oldTxn, newTxn); err != nil {
 		t.Fatal(err)
+	}
+	if err := intents.setAttempt(
+		context.Background(), key, stale, coordination.TXN("stale"),
+	); !errors.Is(err, transaction.ErrConflict) {
+		t.Fatalf("stale alias generation = %v", err)
 	}
 	if err := eng.Flush("coord"); err != nil {
 		t.Fatal(err)

@@ -463,25 +463,38 @@ func (s *IntentStore) Attempt(
 	ctx context.Context,
 	key []byte,
 ) (coordination.TXN, bool, error) {
+	binding, found, err := s.readAttempt(ctx, key)
+	return binding.txn, found, err
+}
+
+type attemptBinding struct {
+	txn        coordination.TXN
+	generation int64
+}
+
+func (s *IntentStore) readAttempt(
+	ctx context.Context,
+	key []byte,
+) (attemptBinding, bool, error) {
 	coordinate, err := s.attemptCoordinate(key)
 	if err != nil {
-		return nil, false, err
+		return attemptBinding{}, false, err
 	}
 	cells, err := s.store.ReadExact(ctx, []allocator.Coordinate{coordinate})
 	if err != nil {
-		return nil, false, errors.Join(transaction.ErrUnavailable, err)
+		return attemptBinding{}, false, errors.Join(transaction.ErrUnavailable, err)
 	}
 	if len(cells) == 0 {
-		return nil, false, nil
+		return attemptBinding{}, false, nil
 	}
 	if len(cells) != 1 || cells[0].Timestamp < intentVersion {
-		return nil, false, fmt.Errorf("%w: record attempt binding is invalid", transaction.ErrInternal)
+		return attemptBinding{}, false, fmt.Errorf("%w: record attempt binding is invalid", transaction.ErrInternal)
 	}
 	txn := coordination.TXN(append([]byte(nil), cells[0].Value...))
 	if err := txn.Validate(); err != nil {
-		return nil, false, fmt.Errorf("%w: record attempt transaction is invalid", transaction.ErrInternal)
+		return attemptBinding{}, false, fmt.Errorf("%w: record attempt transaction is invalid", transaction.ErrInternal)
 	}
-	return txn, true, nil
+	return attemptBinding{txn: txn, generation: cells[0].Timestamp}, true, nil
 }
 
 func (s *IntentStore) SetAttempt(
@@ -489,28 +502,43 @@ func (s *IntentStore) SetAttempt(
 	key []byte,
 	previous, next coordination.TXN,
 ) error {
+	current, found, err := s.readAttempt(ctx, key)
+	if err != nil {
+		return err
+	}
+	if len(previous) == 0 {
+		if found {
+			return transaction.ErrConflict
+		}
+		return s.setAttempt(ctx, key, attemptBinding{}, next)
+	}
+	if !found || !bytes.Equal(current.txn, previous) {
+		return transaction.ErrConflict
+	}
+	return s.setAttempt(ctx, key, current, next)
+}
+
+func (s *IntentStore) setAttempt(
+	ctx context.Context,
+	key []byte,
+	previous attemptBinding,
+	next coordination.TXN,
+) error {
 	coordinate, err := s.attemptCoordinate(key)
 	if err != nil {
 		return err
 	}
 	condition := allocator.Condition{Coordinate: coordinate, Absent: true}
 	generation := int64(intentVersion)
-	if len(previous) != 0 {
-		cells, readErr := s.store.ReadExact(ctx, []allocator.Coordinate{coordinate})
-		if readErr != nil {
-			return errors.Join(transaction.ErrUnavailable, readErr)
-		}
-		if len(cells) != 1 || !bytes.Equal(cells[0].Value, previous) {
-			return transaction.ErrConflict
-		}
-		if cells[0].Timestamp == math.MaxInt64 {
+	if len(previous.txn) != 0 {
+		if previous.generation == math.MaxInt64 {
 			return errors.Join(transaction.ErrInvalid, errors.New("record attempt generation is exhausted"))
 		}
 		condition = allocator.Condition{
-			Coordinate: coordinate, Value: cells[0].Value,
-			Timestamp: cells[0].Timestamp, TimestampSet: true,
+			Coordinate: coordinate, Value: previous.txn,
+			Timestamp: previous.generation, TimestampSet: true,
 		}
-		generation = cells[0].Timestamp + 1
+		generation = previous.generation + 1
 	}
 	mutation := allocator.Mutation{
 		Row:        coordinate.Row,
@@ -523,11 +551,12 @@ func (s *IntentStore) SetAttempt(
 	if status == allocator.StatusAccepted {
 		return nil
 	}
-	current, found, readErr := s.Attempt(ctx, key)
+	current, found, readErr := s.readAttempt(ctx, key)
 	if readErr != nil {
 		return errors.Join(transaction.ErrUnavailable, writeErr, readErr)
 	}
-	if found && bytes.Equal(current, next) {
+	if found && bytes.Equal(current.txn, next) &&
+		current.generation == generation {
 		return nil
 	}
 	if status == allocator.StatusRejected {

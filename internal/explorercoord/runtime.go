@@ -660,17 +660,17 @@ func (r *Runtime) bindRecordAttempt(
 	key []byte,
 	txn coordination.TXN,
 ) error {
-	current, found, err := r.intents.Attempt(ctx, key)
+	current, found, err := r.intents.readAttempt(ctx, key)
 	if err != nil {
 		return err
 	}
 	if !found {
 		return r.intents.SetAttempt(ctx, key, nil, txn)
 	}
-	if bytes.Equal(current, txn) {
+	if bytes.Equal(current.txn, txn) {
 		return nil
 	}
-	snapshot, err := r.coordinator.Inspect(ctx, current)
+	snapshot, err := r.coordinator.Inspect(ctx, current.txn)
 	if err != nil {
 		return err
 	}
@@ -678,7 +678,7 @@ func (r *Runtime) bindRecordAttempt(
 		snapshot.Root.State == coordination.StateCommitted {
 		return transaction.ErrConflict
 	}
-	return r.intents.SetAttempt(ctx, key, current, txn)
+	return r.intents.setAttempt(ctx, key, current, txn)
 }
 
 func (r *Runtime) intentMatchesRecord(
