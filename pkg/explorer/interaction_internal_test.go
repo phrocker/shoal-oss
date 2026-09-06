@@ -506,39 +506,35 @@ func TestFoldRetryAdoptsCommittedRecordAfterSourceChange(t *testing.T) {
 			}
 			summaryDigest := interaction.Digest(
 				"fold source change " + test.name)
-			fold := interaction.Fold{
-				Members: []interaction.FoldMember{{
-					SessionID: session.ID,
-					RetrievedNodeIDs: []shoal.ID{
-						view.Root.Spans[0].ID,
-					},
-					Visibility: []string{"open"},
-				}},
+			write := corpus.writeRecord
+			foldWrites := 0
+			var accepted persistedFold
+			corpus.interactionRecordWriter = func(
+				row []byte, kind byte, value any,
+			) error {
+				if fold, ok := value.(persistedFold); ok &&
+					!fold.Deleted {
+					foldWrites++
+					if foldWrites > 1 {
+						return errors.New("unexpected second fold write")
+					}
+					accepted = fold
+					if err := write(row, kind, value); err != nil {
+						return err
+					}
+					return errors.New("simulated committed fold error")
+				}
+				return write(row, kind, value)
+			}
+			if _, err := corpus.FoldInteractions(ctx, FoldRequest{
+				SessionIDs:    []shoal.ID{session.ID},
 				SummaryDigest: summaryDigest,
-				FoldedAt:      time.Unix(1700000100, 0).UTC(),
+			}); err == nil {
+				t.Fatalf("initial fold error = %v", err)
 			}
-			subgraph, err := fold.Subgraph(
-				corpus.visibilityResolverLocked())
-			if err != nil {
-				t.Fatal(err)
-			}
-			canonical, err := fold.Canonical()
-			if err != nil {
-				t.Fatal(err)
-			}
-			record := persistedFold{
-				FoldID: subgraph.ID, Members: canonical.Members,
-				SummaryDigest: canonical.SummaryDigest,
-				Nodes:         subgraph.Nodes, Edges: subgraph.Edges,
-				Visibility: interaction.Expression(subgraph.Visibility),
-				FoldedAt:   fold.FoldedAt,
-			}
-			if err := corpus.writeRecord(
-				foldRecordRow(record.FoldID),
-				embeddedRecordFold,
-				record,
-			); err != nil {
-				t.Fatal(err)
+			if accepted.FoldID == "" || foldWrites != 1 {
+				t.Fatalf("accepted fold = %+v, writes = %d",
+					accepted, foldWrites)
 			}
 			test.change(t, corpus, source, session.ID)
 			result, err := corpus.FoldInteractions(ctx, FoldRequest{
@@ -549,8 +545,9 @@ func TestFoldRetryAdoptsCommittedRecordAfterSourceChange(t *testing.T) {
 				t.Fatalf("committed fold retry was not adopted: %v", err)
 			}
 			if result.Created ||
-				!result.FoldedAt.Equal(record.FoldedAt) ||
-				result.Visibility != record.Visibility {
+				!result.FoldedAt.Equal(accepted.FoldedAt) ||
+				result.Visibility != accepted.Visibility ||
+				foldWrites != 1 {
 				t.Fatalf("reconciled fold result = %+v", result)
 			}
 		})
@@ -814,5 +811,75 @@ func TestSnapshotObjectDigestSeparatesOpaqueBytes(t *testing.T) {
 	}
 	if _, err := snapshotObjectDigest("unsupported"); err == nil {
 		t.Fatal("expected an error for an unknown snapshot object")
+	}
+}
+
+// TestDeletedFoldMemberProvenanceIsNotRehydratable pins that a fold whose
+// create returned an indeterminate commit cannot be used to recover the
+// provenance of a member session that was deleted before the fold was
+// reconciled. The in-memory guard in DeleteInteraction cannot see that fold,
+// so the retention contract has to hold at the exposure points too.
+func TestDeletedFoldMemberProvenanceIsNotRehydratable(t *testing.T) {
+	ctx := context.Background()
+	corpus, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer corpus.Close()
+	receipt, err := corpus.Ingest(ctx, Source{
+		URI:       "file:///deleted-fold-member.txt",
+		MediaType: MediaTypeText,
+		Content:   "folded member source",
+		Metadata: shoal.Metadata{
+			interaction.PropertyVisibility: "open",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	view, err := corpus.Document(ctx, receipt.Document.ID, receipt.Revision.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := interaction.Session{
+		ID:          interaction.DerivedID("session", "deleted-fold-member"),
+		RecordedAt:  time.Unix(1700000000, 0).UTC(),
+		Operation:   interaction.OperationRetrieval,
+		SeedNodeIDs: []shoal.ID{view.Root.Spans[0].ID},
+	}
+	if err := corpus.RecordInteraction(ctx, session); err != nil {
+		t.Fatal(err)
+	}
+	request := FoldRequest{
+		SessionIDs:    []shoal.ID{session.ID},
+		SummaryDigest: interaction.Digest("deleted fold member"),
+	}
+	write := corpus.writeRecord
+	corpus.interactionRecordWriter = func(
+		row []byte, kind byte, value any,
+	) error {
+		if fold, ok := value.(persistedFold); ok && !fold.Deleted {
+			if err := write(row, kind, value); err != nil {
+				return err
+			}
+			return errors.New("simulated committed fold error")
+		}
+		return write(row, kind, value)
+	}
+	if _, err := corpus.FoldInteractions(ctx, request); err == nil {
+		t.Fatal("expected the simulated committed fold error")
+	}
+	if _, err := corpus.DeleteInteraction(ctx, session.ID); err != nil {
+		t.Fatal(err)
+	}
+	result, err := corpus.FoldInteractions(ctx, request)
+	if err != nil {
+		t.Fatalf("committed fold retry was not adopted: %v", err)
+	}
+	if _, err := corpus.RehydrateFold(ctx, result.FoldID); err == nil {
+		t.Fatal("rehydrated the provenance of a deleted session")
+	}
+	if _, err := corpus.FoldSubgraph(ctx, result.FoldID); err == nil {
+		t.Fatal("served the subgraph of a deleted session's provenance")
 	}
 }
