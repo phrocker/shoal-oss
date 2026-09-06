@@ -441,19 +441,19 @@ func (r *Runtime) PublishRecord(
 	if err := r.validatePhysicalTable(request.Table); err != nil {
 		return explorer.RecordPublicationResult{}, transaction.PublicError(err)
 	}
-	lpart, err := Partition(r.domain, request.Partition)
-	if err != nil {
-		return explorer.RecordPublicationResult{}, transaction.PublicError(err)
-	}
-	intent, err := r.recordIntent(ctx, request, lpart)
-	if err != nil {
-		return explorer.RecordPublicationResult{}, transaction.PublicError(err)
-	}
 	recordKey := request.RecordKey
 	if len(recordKey) == 0 {
 		recordKey = request.Token
 	}
 	if _, err := r.intents.attemptCoordinate(recordKey); err != nil {
+		return explorer.RecordPublicationResult{}, transaction.PublicError(err)
+	}
+	lpart, err := Partition(r.domain, request.Partition)
+	if err != nil {
+		return explorer.RecordPublicationResult{}, transaction.PublicError(err)
+	}
+	intent, err := r.recordIntent(ctx, request, recordKey, lpart)
+	if err != nil {
 		return explorer.RecordPublicationResult{}, transaction.PublicError(err)
 	}
 	if err := r.persistRecordAttempt(ctx, intent, recordKey); err != nil {
@@ -597,6 +597,7 @@ func (r *Runtime) RecordCommitted(
 func (r *Runtime) recordIntent(
 	ctx context.Context,
 	request explorer.RecordPublication,
+	recordKey []byte,
 	lpart coordination.LPART,
 ) (Intent, error) {
 	txn, err := DeriveTXN(r.domain, request.Operation, request.Token)
@@ -638,6 +639,7 @@ func (r *Runtime) recordIntent(
 	return Intent{
 		Operation: append([]byte(nil), request.Operation...),
 		Token:     append([]byte(nil), request.Token...),
+		RecordKey: append([]byte(nil), recordKey...),
 		Cells: []Cell{{
 			Table: request.Table, Row: append([]byte(nil), request.Row...),
 			Family:     append([]byte(nil), request.Family...),
@@ -800,6 +802,13 @@ func (r *Runtime) intentMatchesRecord(
 		len(intent.Cells) != 1 || len(intent.Guards) != 1 || len(intent.Results) != 1 {
 		return false
 	}
+	recordKey := request.RecordKey
+	if len(recordKey) == 0 {
+		recordKey = request.Token
+	}
+	if !bytes.Equal(intent.RecordKey, recordKey) {
+		return false
+	}
 	cell := intent.Cells[0]
 	entity := intent.Guards[0]
 	result := intent.Results[0]
@@ -929,6 +938,24 @@ func (r *Runtime) recoverIntent(ctx context.Context, txn coordination.TXN) error
 	}
 	if err := r.validateIntentTables(record.Intent); err != nil {
 		return err
+	}
+	if len(record.Intent.RecordKey) != 0 {
+		if err := r.bindRecordAttempt(
+			ctx,
+			record.Intent.RecordKey,
+			record.TXN,
+		); err != nil {
+			classified := classifyIntentPersistenceFailure(err)
+			if errors.Is(classified, transaction.ErrConflict) &&
+				!errors.Is(classified, ErrIndeterminatePublication) {
+				return r.intents.Settle(
+					ctx,
+					record.TXN,
+					record.LogicalDigest,
+				)
+			}
+			return classified
+		}
 	}
 	if _, complete, err := r.intents.Completed(ctx, txn, record.LogicalDigest); err != nil {
 		return err

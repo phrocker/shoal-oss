@@ -1804,10 +1804,13 @@ so a crash can create only a safe false positive that recovery removes; it
 cannot hide a durable pending intent. Completion or a non-committed terminal
 state removes the transaction from the index. Startup and steady-state pending
 checks therefore inspect only outstanding work; completed corpus history does
-not consume the recovery page budget or make each ingest scan old tombstones. A retry of
-an Explorer document publication reloads the exact encoded attempted record,
-including its original publication time, sequence, and expected entity head,
-instead of regenerating transient values under the same TXN.
+not consume the recovery page budget or make each ingest scan old tombstones.
+A record publication also stores its stable record-key binding in the canonical
+intent, allowing recovery to restore or verify an ambiguous alias before any
+physical publication. A retry of an Explorer document publication reloads the
+exact encoded attempted record, including its original publication time,
+sequence, and expected entity head, instead of regenerating transient values
+under the same TXN.
 
 The transaction runtime accepts only `localwal.SyncFull`. `SyncNormal` and
 `SyncOff` are rejected before the engine is opened because coordination and

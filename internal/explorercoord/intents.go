@@ -102,6 +102,7 @@ type ResultIdentity struct {
 type Intent struct {
 	Operation []byte           `json:"operation"`
 	Token     []byte           `json:"token"`
+	RecordKey []byte           `json:"record_key,omitempty"`
 	Cells     []Cell           `json:"cells"`
 	Guards    []GuardIntent    `json:"guards,omitempty"`
 	Results   []ResultIdentity `json:"results,omitempty"`
@@ -1031,6 +1032,9 @@ func validateIntent(intent Intent) error {
 		len(intent.Token) == 0 || len(intent.Token) > coordination.MaxOpaqueIDBytes {
 		return errors.Join(transaction.ErrInvalid, errors.New("operation and token are outside their bounds"))
 	}
+	if len(intent.RecordKey) > coordination.MaxOpaqueIDBytes {
+		return errors.Join(transaction.ErrInvalid, errors.New("record key exceeds its bound"))
+	}
 	if len(intent.Cells) == 0 || len(intent.Cells) > maxIntentCells {
 		return errors.Join(transaction.ErrInvalid, errors.New("intent cell count is outside its bound"))
 	}
@@ -1305,6 +1309,7 @@ func cloneIntent(intent Intent) Intent {
 	result := Intent{
 		Operation: append([]byte(nil), intent.Operation...),
 		Token:     append([]byte(nil), intent.Token...),
+		RecordKey: append([]byte(nil), intent.RecordKey...),
 		Cells:     append([]Cell(nil), intent.Cells...),
 		Guards:    append([]GuardIntent(nil), intent.Guards...),
 		Results:   append([]ResultIdentity(nil), intent.Results...),

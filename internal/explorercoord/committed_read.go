@@ -153,7 +153,9 @@ func (r *Runtime) ScanCommitted(
 		len(request.Family) > coordination.MaxCoordinateBytes ||
 		len(request.Qualifier) == 0 ||
 		len(request.Qualifier) > coordination.MaxCoordinateBytes ||
-		len(request.Visibility) > coordination.MaxCoordinateBytes {
+		len(request.Visibility) > coordination.MaxCoordinateBytes ||
+		len(request.StartRow) > coordination.MaxCoordinateBytes ||
+		len(request.StartAfterRow) > coordination.MaxCoordinateBytes {
 		return CommittedPage{}, errors.Join(
 			transaction.ErrInvalid,
 			errors.New("committed scan coordinate is outside its bound"),

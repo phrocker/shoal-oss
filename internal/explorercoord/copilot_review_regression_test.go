@@ -723,6 +723,100 @@ func TestCommittedScanDefaultWorkBoundSupportsMaximumLimit(t *testing.T) {
 	}
 }
 
+func TestCommittedScanRejectsOversizedCursors(t *testing.T) {
+	config := testRuntimeConfig(t, testDirectory(t))
+	runtime, err := Open(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.Close()
+	oversized := bytes.Repeat([]byte{'x'}, coordination.MaxCoordinateBytes+1)
+	for name, applyCursor := range map[string]func(*CommittedScanRequest){
+		"start row": func(request *CommittedScanRequest) {
+			request.StartRow = oversized
+		},
+		"exclusive start row": func(request *CommittedScanRequest) {
+			request.StartAfterRow = oversized
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			request := CommittedScanRequest{
+				Table:     "records",
+				RowPrefix: []byte("x"),
+				Family:    []byte("record"),
+				Qualifier: []byte("v1"),
+				Limit:     1,
+			}
+			applyCursor(&request)
+			if _, err := runtime.ScanCommitted(
+				context.Background(),
+				request,
+			); !errors.Is(err, transaction.ErrInvalid) {
+				t.Fatalf("oversized committed scan cursor = %v", err)
+			}
+		})
+	}
+}
+
+func TestRecoveryRestoresAmbiguousRecordAttemptBinding(t *testing.T) {
+	for _, applied := range []bool{false, true} {
+		t.Run(map[bool]string{false: "not applied", true: "applied"}[applied], func(t *testing.T) {
+			config := testRuntimeConfig(t, testDirectory(t))
+			runtime, err := Open(config)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer runtime.Close()
+			faults := &ambiguousAttemptStore{
+				EngineStore: runtime.store,
+				apply:       applied,
+			}
+			runtime.intents.store = faults
+			request := testRecordPublication(
+				"document",
+				"revision",
+				"value",
+				nil,
+			)
+			if _, err := runtime.PublishRecord(
+				context.Background(),
+				request,
+			); !errors.Is(err, ErrIndeterminatePublication) ||
+				!errors.Is(err, allocator.ErrConditionalUnknown) {
+				t.Fatalf("ambiguous record binding = %v", err)
+			}
+
+			runtime.intents.store = runtime.store
+			if err := runtime.Recover(context.Background()); err != nil {
+				t.Fatalf("recover ambiguous record binding = %v", err)
+			}
+			attempt, err := runtime.RecordAttempt(context.Background(), request)
+			if err != nil || attempt == nil ||
+				!bytes.Equal(attempt.Value, request.Value) ||
+				attempt.ExpectedEpoch != request.ExpectedEpoch ||
+				attempt.ExpectedDigest != request.ExpectedDigest {
+				t.Fatalf("recovered record attempt = %#v, %v", attempt, err)
+			}
+			head, err := runtime.RecordHead(
+				context.Background(),
+				request.EntityKind,
+				request.EntityID,
+			)
+			if err != nil || head == nil {
+				t.Fatalf("recovered record head = %#v, %v", head, err)
+			}
+			retry, err := runtime.PublishRecord(context.Background(), request)
+			if err != nil || !retry.Unchanged || retry.Epoch != head.Epoch {
+				t.Fatalf("exact retry after binding recovery = %#v, %v", retry, err)
+			}
+			after, err := runtime.CurrentHead(context.Background())
+			if err != nil || after.Frontier != head.Epoch {
+				t.Fatalf("retry duplicated recovered publication = %#v, %v", after, err)
+			}
+		})
+	}
+}
+
 type ambiguousIntentStore struct {
 	*EngineStore
 	ambiguous    bool
@@ -805,4 +899,41 @@ func (s *blockingIntentStore) CompareAndMutate(
 		}
 	}
 	return s.EngineStore.CompareAndMutate(ctx, mutation)
+}
+
+type ambiguousAttemptStore struct {
+	*EngineStore
+	apply        bool
+	ambiguous    bool
+	failReadback bool
+}
+
+func (s *ambiguousAttemptStore) CompareAndMutate(
+	ctx context.Context,
+	mutation allocator.Mutation,
+) (allocator.Status, error) {
+	if s.ambiguous || !bytes.HasPrefix(mutation.Row, attemptRowMagic) {
+		return s.EngineStore.CompareAndMutate(ctx, mutation)
+	}
+	s.ambiguous = true
+	s.failReadback = true
+	if s.apply {
+		status, err := s.EngineStore.CompareAndMutate(ctx, mutation)
+		if err != nil || status != allocator.StatusAccepted {
+			return status, err
+		}
+	}
+	return allocator.StatusUnknown, allocator.ErrConditionalUnknown
+}
+
+func (s *ambiguousAttemptStore) ReadExact(
+	ctx context.Context,
+	coordinates []allocator.Coordinate,
+) ([]allocator.Cell, error) {
+	if s.failReadback && len(coordinates) == 1 &&
+		bytes.HasPrefix(coordinates[0].Row, attemptRowMagic) {
+		s.failReadback = false
+		return nil, errors.New("injected attempt binding readback failure")
+	}
+	return s.EngineStore.ReadExact(ctx, coordinates)
 }
