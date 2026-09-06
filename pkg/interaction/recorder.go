@@ -93,12 +93,61 @@ func (r *Recorder) Record(
 		return Session{}, shoal.NewError(
 			shoal.ErrorInvalidArgument, "interaction recorder is required")
 	}
-	session.RecordedAt = r.now().UTC()
+	recordedAt := r.now().UTC()
+	if !session.AuthorizationExpiresAt.IsZero() &&
+		!recordedAt.Before(session.AuthorizationExpiresAt) {
+		return Session{}, shoal.NewError(
+			shoal.ErrorUnauthorized,
+			"interaction authorization expired before recording",
+		)
+	}
+	session.RecordedAt = recordedAt
 	canonical, err := session.Canonical()
 	if err != nil {
 		return Session{}, err
 	}
-	return r.sink.RecordInteractionResult(ctx, canonical)
+	persisted, err := r.sink.RecordInteractionResult(ctx, canonical)
+	if err != nil {
+		return Session{}, err
+	}
+	persisted, err = persisted.Canonical()
+	if err != nil {
+		return Session{}, MarkCommittedRecord(
+			shoal.WrapError(
+				shoal.ErrorInternal,
+				"durable interaction sink returned an invalid session",
+				err,
+			),
+		)
+	}
+	deliveredAt := r.now().UTC()
+	if deliveredAt.IsZero() {
+		return persisted, MarkCommittedRecord(
+			shoal.NewError(
+				shoal.ErrorInternal,
+				"trusted interaction recorder clock is unavailable after persistence",
+			),
+		)
+	}
+	if !persisted.AuthorizationExpiresAt.IsZero() &&
+		!deliveredAt.Before(persisted.AuthorizationExpiresAt) {
+		return persisted, MarkCommittedRecord(
+			shoal.NewError(
+				shoal.ErrorUnauthorized,
+				"interaction authorization expired after durable recording",
+			),
+		)
+	}
+	if err := ctx.Err(); err != nil {
+		return persisted, MarkCommittedRecord(
+			shoal.WrapError(
+				shoal.ErrorUnavailable,
+				"interaction recording completed after request cancellation",
+				err,
+			),
+		)
+	}
+	return persisted, nil
 }
 
 func isNilSink(sink ResultSink) bool {

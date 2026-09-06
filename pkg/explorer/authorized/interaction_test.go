@@ -652,6 +652,51 @@ func TestAuthorizedExactRetryUsesTrustedDurableRecord(t *testing.T) {
 	}
 }
 
+func TestAuthorizedInteractionMarksPostSinkExpiryCommitted(t *testing.T) {
+	f := newFixture(t)
+	snapshot, err := f.base.Snapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.clock.Set(snapshot.AsOf.Add(time.Second))
+	decision := f.decision(
+		t, "post-sink-expiry",
+		[][]byte{f.sourceA}, [][]byte{f.policyA},
+		[]auth.Operation{auth.OperationRetrieve},
+	)
+	fingerprint, err := auth.AuthorizationFingerprint(decision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := &generationChangingInteractionBase{Explorer: f.base}
+	base.after = func() {
+		f.clock.Set(decision.AuthenticationExpires())
+	}
+	client := f.newClient(
+		t, base, f.store, f.sourceA, f.policyA, nil)
+	session := interaction.Session{
+		ID:                       interaction.DerivedID("session", "post-sink-expiry"),
+		Operation:                interaction.OperationRetrieval,
+		SnapshotID:               shoal.ID(snapshot.ID),
+		SnapshotAsOf:             snapshot.AsOf,
+		AuthorizationFingerprint: shoal.ID(fingerprint.String()),
+		AuthorizationExpiresAt:   decision.AuthenticationExpires(),
+	}
+	recorded, err := client.RecordInteractionResult(
+		f.context(t, decision), session)
+	if !explorer.IsCommittedInteraction(err) ||
+		!shoal.IsErrorCode(err, shoal.ErrorUnauthorized) {
+		t.Fatalf("post-sink expiry error = %v", err)
+	}
+	if recorded.ID != session.ID {
+		t.Fatalf("committed session = %+v", recorded)
+	}
+	if _, err := f.base.InteractionRecord(
+		context.Background(), session.ID); err != nil {
+		t.Fatalf("committed record unavailable: %v", err)
+	}
+}
+
 func TestAuthorizedTombstoneSubgraphDoesNotLeakExistence(t *testing.T) {
 	f := newFixture(t)
 	receipt, err := f.clientA.Ingest(f.admin(t), explorer.Source{

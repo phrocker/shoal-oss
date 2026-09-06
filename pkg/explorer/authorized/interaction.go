@@ -141,6 +141,13 @@ func (c *Client) recordInteraction(
 		if err := guard.Check(ctx); err != nil {
 			return interaction.Session{}, err
 		}
+		deliveredAt := c.clock().UTC()
+		if deliveredAt.IsZero() ||
+			!interactionPinMatchesDecision(
+				existingCanonical, decision, deliveredAt,
+			) {
+			return interaction.Session{}, authorizationDenied()
+		}
 		return existingCanonical, nil
 	case !shoal.IsErrorCode(readErr, shoal.ErrorNotFound):
 		return interaction.Session{}, directBaseError(readErr)
@@ -177,6 +184,16 @@ func (c *Client) recordInteraction(
 	if err := guard.Check(ctx); err != nil {
 		return interaction.Session{}, err
 	}
+	admittedAt := c.clock().UTC()
+	if admittedAt.IsZero() ||
+		!interactionPinMatchesDecision(canonical, decision, admittedAt) {
+		return interaction.Session{}, authorizationDenied()
+	}
+	canonical.RecordedAt = admittedAt
+	canonical, err = canonical.Canonical()
+	if err != nil {
+		return interaction.Session{}, err
+	}
 	persisted := canonical
 	if resultWriter, ok := writer.(interaction.ResultSink); ok {
 		persisted, err = resultWriter.RecordInteractionResult(ctx, canonical)
@@ -184,23 +201,30 @@ func (c *Client) recordInteraction(
 		err = writer.RecordInteraction(ctx, canonical)
 	}
 	if err != nil {
-		return interaction.Session{}, directBaseError(err)
-	}
-	if err := guard.Check(ctx); err != nil {
-		return interaction.Session{}, explorer.MarkCommittedInteraction(err)
+		return persisted, directBaseError(err)
 	}
 	if _, ok := writer.(interaction.ResultSink); ok {
 		returned, canonicalErr := persisted.Canonical()
 		if canonicalErr != nil || !reflect.DeepEqual(returned, canonical) {
-			return interaction.Session{}, explorer.MarkCommittedInteraction(
+			return persisted, explorer.MarkCommittedInteraction(
 				shoal.NewError(
 					shoal.ErrorInternal,
 					"durable interaction sink returned a different record",
 				),
 			)
 		}
+		persisted = returned
 	}
-	return canonical, nil
+	if err := guard.Check(ctx); err != nil {
+		return persisted, explorer.MarkCommittedInteraction(err)
+	}
+	deliveredAt := c.clock().UTC()
+	if deliveredAt.IsZero() ||
+		!interactionPinMatchesDecision(persisted, decision, deliveredAt) {
+		return persisted, explorer.MarkCommittedInteraction(
+			authorizationDenied())
+	}
+	return persisted, nil
 }
 
 // Interactions lists only derived records whose complete current source set
