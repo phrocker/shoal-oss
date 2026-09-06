@@ -37,6 +37,7 @@ import (
 
 const vectorCapabilityProbeText = "shoal vector capability probe"
 const graphAssertionEdgeIDMetadata = "shoal.graph.edge_id"
+const extractionRelationshipIDProperty = "ontology_relationship_id"
 
 func (c *Client) Snapshot(ctx context.Context) (explorer.Snapshot, error) {
 	bounded, err := c.boundedBase()
@@ -755,6 +756,11 @@ func (c *Client) filterNeighborhood(
 		}
 		admittedEdges[edge.ID] = cloneGraphEdge(edge)
 		assertion, hasAssertion := derivedAssertions[edge.ID]
+		if operation == auth.OperationAnalyticsRead &&
+			edge.Properties[extractionRelationshipIDProperty] != "" &&
+			(!hasAssertion || !extractionAssertionMatchesEdge(assertion, edge)) {
+			return explorer.Neighborhood{}, inconsistentBase()
+		}
 		if hasAssertion {
 			admittedAssertions[edge.ID] = assertion
 		}
@@ -908,6 +914,21 @@ func derivedAssertionMatchesEdge(assertion ontology.Assertion, edge graph.Edge) 
 		edge.From == assertion.Subject() &&
 		edge.To == target &&
 		edge.Type == string(assertion.Predicate()) &&
+		scoresEqual(edge.Weight, assertion.Confidence())
+}
+
+func extractionAssertionMatchesEdge(
+	assertion ontology.Assertion,
+	edge graph.Edge,
+) bool {
+	target, ok := assertion.Object().ReferenceValue()
+	if !ok {
+		return false
+	}
+	return edge.From == assertion.Subject() &&
+		edge.To == target &&
+		edge.Properties[extractionRelationshipIDProperty] ==
+			string(assertion.Predicate()) &&
 		scoresEqual(edge.Weight, assertion.Confidence())
 }
 
