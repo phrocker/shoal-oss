@@ -265,6 +265,53 @@ func TestAuthorizedAnalyticsRevalidatesGenerationAfterRecording(t *testing.T) {
 	}
 }
 
+func TestAuthorizedAnalyticsRechecksGenerationAfterOntologyLens(t *testing.T) {
+	fixture := newAnalyticsFixture(t)
+	seed := fixture.ingest(t, fixture.clientA, "memory://a1", "alpha")
+	schema, err := ontology.NewOntologySchema("analytics", "Analytics", "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, err := ontology.NewOntologyVersion(
+		schema, "1", fixture.now, nil, nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lens, _ := ontology.NewOntologyIdentity(version)
+	selector, err := authorized.NewStaticPolicySelector(
+		fixture.sourceA, fixture.policyA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, err := authorized.NewClient(authorized.Config{
+		Base: &generationChangingLensBase{
+			Explorer: fixture.base, generations: fixture.generations,
+			domain: fixture.domain,
+		},
+		Resolver:       fixture.authority.Resolver(),
+		PolicySelector: selector, PolicyStore: fixture.store,
+		GenerationReader: fixture.generations,
+		Clock:            func() time.Time { return fixture.now },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	service, err := analytics.NewService(analytics.Config{
+		Source: client, Limits: analytics.DefaultLimits(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = service.Run(
+		fixture.readContext(
+			t, "alice", fixture.sourceA, fixture.policyA, lens),
+		analyticsRequest(seed),
+	)
+	if !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
+		t.Fatalf("post-lens generation change error = %v", err)
+	}
+}
+
 type analyticsFixture struct {
 	now         time.Time
 	base        *explorer.Explorer
@@ -293,6 +340,21 @@ func (f recorderFunc) RecordAnalytics(
 	result analytics.Result,
 ) error {
 	return f(ctx, request, result)
+}
+
+type generationChangingLensBase struct {
+	*explorer.Explorer
+	generations *analyticsGenerationReader
+	domain      []byte
+}
+
+func (b *generationChangingLensBase) InterpretAssertions(
+	ctx context.Context,
+	assertions []ontology.Assertion,
+	selected ontology.OntologyIdentity,
+) ([]ontology.AssertionInterpretation, error) {
+	b.generations.Set(b.domain, 2)
+	return b.Explorer.InterpretAssertions(ctx, assertions, selected)
 }
 
 func (r *analyticsRecorder) RecordAnalytics(
