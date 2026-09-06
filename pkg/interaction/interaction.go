@@ -181,8 +181,9 @@ func IsInteractionEdgeType(edgeType string) bool {
 // source graph nodes the call put in front of the model, not only the ones it
 // went on to cite.
 type ToolCall struct {
-	Kind             string
-	RetrievedNodeIDs []shoal.ID
+	Kind              string
+	RetrievedNodeIDs  []shoal.ID
+	RetrievedEvidence []EvidenceReference
 }
 
 // Operation identifies the product interaction represented by a session.
@@ -366,10 +367,12 @@ type Session struct {
 
 	// SeedNodeIDs are source nodes the session was shown before its first
 	// turn. They count as retrieved.
-	SeedNodeIDs []shoal.ID
-	Turns       []Turn
+	SeedNodeIDs  []shoal.ID
+	SeedEvidence []EvidenceReference
+	Turns        []Turn
 	// CitedNodeIDs are source nodes the final answer actually cited.
-	CitedNodeIDs []shoal.ID
+	CitedNodeIDs  []shoal.ID
+	CitedEvidence []EvidenceReference
 }
 
 // Subgraph is the materialized interaction record: its own nodes, its edges to
@@ -646,10 +649,32 @@ func (s Session) Validate() error {
 		if err := shoal.ValidateRequiredID("interaction seed node ID", id); err != nil {
 			return err
 		}
+		for _, evidence := range s.SeedEvidence {
+			if err := evidence.Validate(); err != nil {
+				return err
+			}
+		}
+		if len(s.SeedEvidence) > 0 &&
+			!equalIDs(dedupeIDs(s.SeedNodeIDs), evidenceNodeIDs(s.SeedEvidence)) {
+			return shoal.NewError(
+				shoal.ErrorInvalidArgument,
+				"interaction seed nodes do not match seed evidence")
+		}
 	}
 	for _, id := range s.CitedNodeIDs {
 		if err := shoal.ValidateRequiredID("interaction cited node ID", id); err != nil {
 			return err
+		}
+		for _, evidence := range s.CitedEvidence {
+			if err := evidence.Validate(); err != nil {
+				return err
+			}
+		}
+		if len(s.CitedEvidence) > 0 &&
+			!equalIDs(dedupeIDs(s.CitedNodeIDs), evidenceNodeIDs(s.CitedEvidence)) {
+			return shoal.NewError(
+				shoal.ErrorInvalidArgument,
+				"interaction cited nodes do not match cited evidence")
 		}
 	}
 	turnIndexes := make(map[int]struct{}, len(s.Turns))
@@ -693,6 +718,20 @@ func (s Session) Validate() error {
 				return err
 			}
 		}
+		for _, evidence := range turn.ToolCall.RetrievedEvidence {
+			if err := evidence.Validate(); err != nil {
+				return err
+			}
+		}
+		if len(turn.ToolCall.RetrievedEvidence) > 0 &&
+			!equalIDs(
+				dedupeIDs(turn.ToolCall.RetrievedNodeIDs),
+				evidenceNodeIDs(turn.ToolCall.RetrievedEvidence),
+			) {
+			return shoal.NewError(
+				shoal.ErrorInvalidArgument,
+				"interaction tool nodes do not match retrieved evidence")
+		}
 	}
 	return nil
 }
@@ -705,6 +744,7 @@ func (s Session) Canonical() (Session, error) {
 		return Session{}, err
 	}
 	canonical := s
+	var err error
 	if canonical.Operation == "" {
 		canonical.Operation = OperationInference
 	}
@@ -714,13 +754,26 @@ func (s Session) Canonical() (Session, error) {
 	canonical.Actor.OnBehalfOf = append(
 		[]shoal.ID(nil), s.Actor.OnBehalfOf...)
 	canonical.SeedNodeIDs = dedupeIDs(s.SeedNodeIDs)
+	canonical.SeedEvidence, err = canonicalEvidenceReferences(s.SeedEvidence)
+	if err != nil {
+		return Session{}, err
+	}
 	canonical.CitedNodeIDs = dedupeIDs(s.CitedNodeIDs)
+	canonical.CitedEvidence, err = canonicalEvidenceReferences(s.CitedEvidence)
+	if err != nil {
+		return Session{}, err
+	}
 	canonical.Turns = make([]Turn, len(s.Turns))
 	for index, turn := range s.Turns {
 		canonical.Turns[index] = turn
 		if turn.ToolCall != nil {
 			call := *turn.ToolCall
 			call.RetrievedNodeIDs = dedupeIDs(turn.ToolCall.RetrievedNodeIDs)
+			call.RetrievedEvidence, err = canonicalEvidenceReferences(
+				turn.ToolCall.RetrievedEvidence)
+			if err != nil {
+				return Session{}, err
+			}
 			canonical.Turns[index].ToolCall = &call
 		}
 	}
@@ -739,6 +792,20 @@ func (s Session) TouchedNodeIDs() []shoal.ID {
 	for _, turn := range s.Turns {
 		if turn.ToolCall != nil {
 			ids = append(ids, turn.ToolCall.RetrievedNodeIDs...)
+		}
+	}
+	return dedupeIDs(ids)
+}
+
+// TouchedEdgeIDs returns every exact source graph edge referenced by retrieved
+// or cited evidence.
+func (s Session) TouchedEdgeIDs() []shoal.ID {
+	ids := evidenceEdgeIDs(s.SeedEvidence)
+	ids = append(ids, evidenceEdgeIDs(s.CitedEvidence)...)
+	for _, turn := range s.Turns {
+		if turn.ToolCall != nil {
+			ids = append(ids,
+				evidenceEdgeIDs(turn.ToolCall.RetrievedEvidence)...)
 		}
 	}
 	return dedupeIDs(ids)
