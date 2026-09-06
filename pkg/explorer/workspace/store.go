@@ -44,9 +44,10 @@ import (
 )
 
 const (
-	settingsTable = "_shoal_workspace_settings"
-	settingsCF    = "settings"
-	settingsCQ    = "v1"
+	settingsTable    = "_shoal_workspace_settings"
+	settingsCF       = "settings"
+	settingsCQ       = "v1"
+	settingsLockFile = ".shoal-workspace-settings.lock"
 
 	settingsRecordMagic     = "SHOALWS1"
 	settingsEnvelopeVersion = byte(1)
@@ -114,7 +115,7 @@ func OpenDurableStore(dir string) (*DurableStore, error) {
 	if strings.TrimSpace(dir) == "" {
 		return nil, invalid("settings directory is required")
 	}
-	lock, err := dirlock.Acquire(dir, ".shoal-workspace.lock")
+	lock, err := dirlock.Acquire(dir, settingsLockFile)
 	if err != nil {
 		message := "acquire workspace settings directory ownership"
 		if errors.Is(err, dirlock.ErrLocked) {

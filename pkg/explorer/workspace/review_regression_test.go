@@ -648,6 +648,9 @@ func TestReviewSettingsRejectConcurrentDirectoryOpen(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if _, err := os.Stat(filepath.Join(directory, settingsLockFile)); err != nil {
+		t.Fatalf("settings lock file: %v", err)
+	}
 	defer first.Close()
 	second, err := OpenDurableStore(directory)
 	if err == nil {
