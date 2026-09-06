@@ -578,12 +578,23 @@ func (s *analyticsRouteService) Analytics(
 				Fanout: request.Scope.Fanout, MaxNodes: request.Scope.MaxNodes,
 				MaxEdges:               request.Scope.MaxEdges,
 				MaxScannedEdgesPerNode: request.Scope.MaxScannedEdgesPerNode,
+				NodeCount:              1,
 				Complete:               true,
 			},
+			Nodes: []analytics.NodeSummary{{
+				NodeID: "node", PageRank: 1,
+				WeakComponentID: "component-sha256:1fd9520a06abfed7821c68b3626a8ff3dcca5d4da5d663da612324802ebc821f",
+			}},
+			WeaklyConnectedComponents: []analytics.ComponentSummary{{
+				ID:        "component-sha256:1fd9520a06abfed7821c68b3626a8ff3dcca5d4da5d663da612324802ebc821f",
+				NodeIDs:   []shoal.ID{"node"},
+				NodeCount: 1,
+			}},
 			PageRank: analytics.PageRankSummary{
 				DampingFactor:        analytics.DefaultDampingFactor,
 				ConvergenceTolerance: analytics.DefaultConvergenceTolerance,
-				MaxIterations:        analytics.DefaultMaxIterations, Converged: true,
+				MaxIterations:        analytics.DefaultMaxIterations,
+				Iterations:           1, Converged: true,
 			},
 			Recording: analytics.RecordingStatus{
 				Recorded: true, Required: true,

@@ -21,6 +21,7 @@ package explorer
 
 import (
 	"context"
+	"math"
 	"sort"
 	"time"
 
@@ -225,7 +226,9 @@ func exactInteractionNodeEqual(left, right graph.Node) bool {
 
 func exactInteractionEdgeEqual(left, right graph.Edge) bool {
 	if left.ID != right.ID || left.From != right.From || left.To != right.To ||
-		left.Type != right.Type || left.Weight != right.Weight ||
+		left.Type != right.Type ||
+		math.Float64bits(float64(left.Weight)) !=
+			math.Float64bits(float64(right.Weight)) ||
 		len(left.Properties) != len(right.Properties) {
 		return false
 	}
