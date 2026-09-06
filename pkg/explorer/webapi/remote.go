@@ -464,8 +464,8 @@ func (s *RemoteService) Analytics(
 	}
 	if err := ValidateAnalyticsResponse(
 		request, response, *metadata.AnalyticsLimits); err != nil {
-		return AnalyticsResponse{}, remoteContractError(
-			"remote analytics response is invalid", err)
+		return AnalyticsResponse{}, explorer.MarkIndeterminateCommit(
+			remoteContractError("remote analytics response is invalid", err))
 	}
 	return response, nil
 }
