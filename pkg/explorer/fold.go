@@ -251,6 +251,25 @@ func (e *Explorer) FoldInteractions(
 	}, nil
 }
 
+// requireLiveFoldMembersLocked refuses to expose a fold's provenance once any
+// member session has been explicitly deleted. Deletion normally cannot happen
+// while a live fold references the session, but a fold whose create returned an
+// indeterminate commit is durable while absent from the in-memory index that
+// guard consults, so the member can be deleted before the fold is reconciled.
+// A deleted session must not keep a rehydratable copy of what it recorded.
+func (e *Explorer) requireLiveFoldMembersLocked(record persistedFold) error {
+	for _, member := range record.Members {
+		if existing, ok := e.interactions[member.SessionID]; ok &&
+			existing.Deleted {
+			return shoal.NewError(
+				shoal.ErrorConflict,
+				"fold member session was explicitly deleted",
+			)
+		}
+	}
+	return nil
+}
+
 func (e *Explorer) foldInteractionRecordLocked(
 	sessionID shoal.ID,
 ) (*persistedInteraction, bool, error) {
@@ -273,7 +292,8 @@ func (e *Explorer) foldInteractionRecordLocked(
 // was shown and make the visibility conjunction unsound.
 //
 // It fails closed. A fold whose stored content no longer hashes to its own
-// identity, or a deleted fold, is refused rather than partially returned.
+// identity, a deleted fold, or a fold whose member session was explicitly
+// deleted is refused rather than partially returned.
 func (e *Explorer) RehydrateFold(
 	ctx context.Context, foldID shoal.ID,
 ) (interaction.Fold, error) {
@@ -295,6 +315,9 @@ func (e *Explorer) RehydrateFold(
 	if record.Deleted {
 		return interaction.Fold{}, shoal.NewError(
 			shoal.ErrorConflict, "fold was explicitly deleted")
+	}
+	if err := e.requireLiveFoldMembersLocked(*record); err != nil {
+		return interaction.Fold{}, err
 	}
 	current, err := e.currentSubgraphVisibilityLocked(record.Nodes, record.Edges)
 	if err != nil {
@@ -391,6 +414,9 @@ func (e *Explorer) FoldSubgraph(
 		}
 		if !visibilityCovered(record.Visibility, current) {
 			return Neighborhood{}, staleDerivedVisibilityError()
+		}
+		if err := e.requireLiveFoldMembersLocked(*record); err != nil {
+			return Neighborhood{}, err
 		}
 	}
 	result := Neighborhood{
