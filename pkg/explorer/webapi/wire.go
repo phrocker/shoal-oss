@@ -666,7 +666,6 @@ func wireEmbeddingQueryReportValue(
 	}
 	return &wireEmbeddingQueryReport{
 		Spaces: spaces, FanoutLimit: report.FanoutLimit,
-		CacheHits: report.CacheHits, ProviderCalls: report.ProviderCalls,
 		Observed: report.Observed, Suppressed: report.Suppressed,
 		Restricted: report.Restricted, Degraded: report.Degraded,
 		FanoutExceeded: report.FanoutExceeded,
@@ -679,10 +678,13 @@ func embeddingQueryReportValue(
 	if wire == nil {
 		return nil, nil
 	}
+	if wire.CacheHits != 0 || wire.ProviderCalls != 0 {
+		return nil, fmt.Errorf(
+			"embedding cache/provider counters are operator-only")
+	}
 	report := &authorized.EmbeddingQueryReport{
 		FanoutLimit: wire.FanoutLimit,
-		CacheHits:   wire.CacheHits, ProviderCalls: wire.ProviderCalls,
-		Observed: wire.Observed, Suppressed: wire.Suppressed,
+		Observed:    wire.Observed, Suppressed: wire.Suppressed,
 		Restricted: wire.Restricted, Degraded: wire.Degraded,
 		FanoutExceeded: wire.FanoutExceeded,
 	}

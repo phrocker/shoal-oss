@@ -44,7 +44,7 @@ func testEmbeddingReport() authorized.EmbeddingQueryReport {
 			ID:     shoal.ID([]byte{0x00, 0xff, 0x10}),
 			Status: authorized.EmbeddingSpaceUnavailable,
 		}},
-		FanoutLimit: 8, ProviderCalls: 1, Observed: true, Degraded: true,
+		FanoutLimit: 8, Observed: true, Degraded: true,
 	}
 }
 
