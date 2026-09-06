@@ -79,7 +79,7 @@ func TestNarrowServiceRolesCanApplyOwnedWorkspaceRestrictions(t *testing.T) {
 			provider, err := NewProvider(store, ProviderOptions{
 				Resolver:         &mutableResolver{decision: base},
 				GenerationReader: testGenerationReader{generation: 7},
-				CeilingResolver:   roleCeilingResolver{test.role: ceiling},
+				CeilingResolver:  roleCeilingResolver{test.role: ceiling},
 				Clock:            func() time.Time { return testNow },
 			})
 			if err != nil {
