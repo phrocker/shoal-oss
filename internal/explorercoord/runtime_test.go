@@ -697,6 +697,28 @@ func TestRuntimeRequiresFullPerWriteWALSync(t *testing.T) {
 	_ = runtime.Close()
 }
 
+func TestPublishDoesNotHealCallerCancellation(t *testing.T) {
+	config := testRuntimeConfig(t, testDirectory(t))
+	runtime, err := Open(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	intent := testIntent(
+		t, config.Domain, "create", "canceled", "value",
+		guard.ModeAbsentOrIdentical, 0, coordination.Digest{},
+	)
+	if _, err := runtime.Publish(ctx, Request{Intent: intent}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled publication = %v", err)
+	}
+	txn, _ := DeriveTXN(config.Domain, intent.Operation, intent.Token)
+	if _, err := runtime.Inspect(context.Background(), txn); !errors.Is(err, transaction.ErrNotFound) {
+		t.Fatalf("canceled publication persisted transaction = %v", err)
+	}
+}
+
 func TestRecoveryPageBoundIgnoresCompletedHistory(t *testing.T) {
 	directory := testDirectory(t)
 	config := testRuntimeConfig(t, directory)

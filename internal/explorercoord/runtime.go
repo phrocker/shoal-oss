@@ -371,7 +371,9 @@ func (r *Runtime) publishLocked(
 		Owner: owner, LeaseUntil: leaseUntil, Authority: cloneAuthority(r.authority),
 	}
 	result, err := r.coordinator.Publish(ctx, publication)
-	if err != nil && errors.Is(err, transaction.ErrUnavailable) {
+	if err != nil && errors.Is(err, transaction.ErrUnavailable) &&
+		!errors.Is(err, context.Canceled) &&
+		!errors.Is(err, context.DeadlineExceeded) {
 		advanced, available, checkErr := r.waitForExpectedResolution(
 			ctx, record.TXN, record.Intent,
 		)
