@@ -27,13 +27,9 @@ import (
 )
 
 // InteractionSink is the durable corpus boundary a graph-backed recorder
-// writes through. *explorer.Explorer implements it.
-type InteractionSink interface {
-	// EnsureInteractionSink must report at setup time, not at first write,
-	// whether interactions can be durably recorded.
-	EnsureInteractionSink(context.Context) error
-	RecordInteraction(context.Context, interaction.Session) error
-}
+// writes through. It aliases the product-level interaction sink so inference,
+// retrieval, chat, and MCP adapters share one persistence contract.
+type InteractionSink = interaction.Sink
 
 // GraphRecorder writes execution records into the corpus graph under the
 // reserved interaction.* namespace.
@@ -102,9 +98,33 @@ func InteractionSession(
 	); err != nil {
 		return interaction.Session{}, err
 	}
+	if err := validateLogicalID(
+		"evaluation snapshot ID", record.SnapshotID,
+	); err != nil {
+		return interaction.Session{}, err
+	}
+	if record.SnapshotAsOf.IsZero() {
+		return interaction.Session{}, invalid("evaluation snapshot time is required")
+	}
+	if err := validateLogicalID(
+		"evaluation authorization fingerprint",
+		record.AuthorizationFingerprint,
+	); err != nil {
+		return interaction.Session{}, err
+	}
+	if record.AuthorizationExpiresAt.IsZero() {
+		return interaction.Session{}, invalid(
+			"evaluation authorization expiry is required")
+	}
 	session := interaction.Session{
-		ID:         interaction.SessionID(record.TranscriptID, recordedAt),
-		RecordedAt: recordedAt.UTC(),
+		ID:                       interaction.SessionID(record.TranscriptID, recordedAt),
+		RecordedAt:               recordedAt.UTC(),
+		Operation:                interaction.OperationInference,
+		SnapshotID:               record.SnapshotID,
+		SnapshotAsOf:             record.SnapshotAsOf,
+		AuthorizationFingerprint: record.AuthorizationFingerprint,
+		AuthorizationExpiresAt:   record.AuthorizationExpiresAt,
+		EmbeddingSpaceID:         record.EmbeddingSpaceID,
 		Provenance: interaction.Provenance{
 			Harness:      record.Provenance.Harness(),
 			Provider:     record.Provenance.Provider(),

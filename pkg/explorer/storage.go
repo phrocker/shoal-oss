@@ -25,8 +25,10 @@ import (
 	"encoding/binary"
 	"encoding/gob"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"reflect"
 	"strconv"
 	"strings"
 	"time"
@@ -480,6 +482,100 @@ func (e *Explorer) writeRecord(row []byte, kind byte, value any) error {
 		)
 	}
 	return nil
+}
+
+// writeInteractionRecord appends an interaction-family record and resolves a
+// storage error whose commit outcome is indeterminate by reading the exact
+// cell back. A byte-identical durable value is success; absence or a different
+// value preserves the indeterminate error so inference still fails closed.
+func (e *Explorer) writeInteractionRecord(
+	row []byte, kind byte, value any,
+) error {
+	writer := e.interactionRecordWriter
+	if writer == nil {
+		writer = e.writeRecord
+	}
+	err := writer(row, kind, value)
+	if err == nil || !IsIndeterminateCommit(err) {
+		return err
+	}
+	expected, encodeErr := encodeEmbeddedRecord(kind, value)
+	if encodeErr != nil {
+		return errors.Join(err, encodeErr)
+	}
+	committed, readErr := e.hasExactRecord(row, expected)
+	if readErr != nil {
+		return errors.Join(err, readErr)
+	}
+	if committed {
+		return nil
+	}
+	return err
+}
+
+func (e *Explorer) hasExactRecord(row, expected []byte) (bool, error) {
+	committed := false
+	err := e.engine.LookupRows(
+		explorerTable,
+		[][]byte{append([]byte(nil), row...)},
+		engine.ScanOptions{
+			ColumnFamilies:          [][]byte{[]byte(recordCF)},
+			ColumnFamiliesInclusive: true,
+		},
+		func(_ int, key *iterrt.Key, value []byte) {
+			if committed ||
+				!bytes.Equal(key.ColumnQualifier, []byte(recordCQV2)) {
+				return
+			}
+			committed = equivalentEmbeddedRecord(
+				key.Row, value, expected)
+		},
+	)
+	if err != nil {
+		return false, shoal.WrapError(
+			shoal.ErrorUnavailable,
+			"verify indeterminate interaction write",
+			err,
+		)
+	}
+	return committed, nil
+}
+
+func equivalentEmbeddedRecord(row, stored, expected []byte) bool {
+	if bytes.Equal(stored, expected) {
+		return true
+	}
+	switch {
+	case bytes.Equal(row, interactionSinkRow):
+		var left, right persistedInteractionSink
+		return decodeEmbeddedRecord(
+			stored, embeddedRecordInteractionSink, &left,
+		) == nil &&
+			decodeEmbeddedRecord(
+				expected, embeddedRecordInteractionSink, &right,
+			) == nil &&
+			reflect.DeepEqual(left, right)
+	case bytes.HasPrefix(row, []byte(interactionRow)):
+		var left, right persistedInteraction
+		return decodeEmbeddedRecord(
+			stored, embeddedRecordInteraction, &left,
+		) == nil &&
+			decodeEmbeddedRecord(
+				expected, embeddedRecordInteraction, &right,
+			) == nil &&
+			reflect.DeepEqual(left, right)
+	case bytes.HasPrefix(row, []byte(foldRow)):
+		var left, right persistedFold
+		return decodeEmbeddedRecord(
+			stored, embeddedRecordFold, &left,
+		) == nil &&
+			decodeEmbeddedRecord(
+				expected, embeddedRecordFold, &right,
+			) == nil &&
+			reflect.DeepEqual(left, right)
+	default:
+		return false
+	}
 }
 
 func encodeEmbeddedRecord(kind byte, value any) ([]byte, error) {

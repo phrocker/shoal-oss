@@ -174,6 +174,15 @@ func (e *Explorer) FoldInteractions(
 			"fold identity is already used by an interaction session",
 		)
 	}
+	reservedNodes := append([]graph.Node(nil), subgraph.Nodes...)
+	reservedNodes = append(reservedNodes, graph.Node{
+		ID: interaction.TombstoneID(subgraph.ID),
+	})
+	if err := e.requireInteractionGraphIDsAvailableLocked(
+		reservedNodes, subgraph.Edges,
+	); err != nil {
+		return FoldResult{}, err
+	}
 	record := persistedFold{
 		FoldID:        subgraph.ID,
 		Members:       canonical.Members,
@@ -186,14 +195,14 @@ func (e *Explorer) FoldInteractions(
 	if err := validatePersistedFold(record); err != nil {
 		return FoldResult{}, err
 	}
-	if err := e.writeRecord(
+	if err := e.writeInteractionRecord(
 		foldRecordRow(record.FoldID), embeddedRecordFold, record,
 	); err != nil {
 		return FoldResult{}, err
 	}
 	e.folds[record.FoldID] = &record
 	if err := e.rebuildCurrentGraphLocked(); err != nil {
-		return FoldResult{}, err
+		return FoldResult{}, MarkCommittedInteraction(err)
 	}
 	return FoldResult{
 		FoldID:         record.FoldID,
@@ -392,6 +401,11 @@ func (e *Explorer) DeleteFold(
 	if err != nil {
 		return interaction.Tombstone{}, err
 	}
+	if err := e.requireInteractionGraphIDsAvailableLocked(
+		[]graph.Node{node}, nil,
+	); err != nil {
+		return interaction.Tombstone{}, err
+	}
 	// The members are dropped, not retained beside the tombstone: a deleted
 	// fold must not keep a rehydratable copy of what it folded.
 	record := persistedFold{
@@ -405,14 +419,14 @@ func (e *Explorer) DeleteFold(
 	if err := validatePersistedFold(record); err != nil {
 		return interaction.Tombstone{}, err
 	}
-	if err := e.writeRecord(
+	if err := e.writeInteractionRecord(
 		foldRecordRow(foldID), embeddedRecordFold, record,
 	); err != nil {
 		return interaction.Tombstone{}, err
 	}
 	e.folds[foldID] = &record
 	if err := e.rebuildCurrentGraphLocked(); err != nil {
-		return interaction.Tombstone{}, err
+		return interaction.Tombstone{}, MarkCommittedInteraction(err)
 	}
 	return tombstone, nil
 }
