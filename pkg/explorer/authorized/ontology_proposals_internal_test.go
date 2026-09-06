@@ -222,18 +222,28 @@ func TestOntologyProposalEvidenceRequiresObjectAuthorization(t *testing.T) {
 		t.Fatalf("visible proposals = %#v, want only source-a evidence", visible)
 	}
 
-	rejected, _ := ontologyEvidenceProposal(
-		t, schema, baseVersion, 5, deniedCitation, at)
-	if err := client.CreateOntologyProposal(
-		ctx, rejected, baseVersion,
-	); !shoal.IsErrorCode(err, shoal.ErrorNotFound) {
-		t.Fatalf("unauthorized evidence create = %v, want non-disclosing not found", err)
+	allowed, _ := ontologyEvidenceProposal(
+		t, schema, baseVersion, 5, allowedEvidence, at)
+	if err := client.CreateOntologyProposal(ctx, allowed, baseVersion); err != nil {
+		t.Fatalf("authorized evidence create = %v", err)
+	}
+	for index, evidence := range []ontology.EvidenceRef{
+		deniedCitation, deniedPath,
+	} {
+		rejected, _ := ontologyEvidenceProposal(
+			t, schema, baseVersion, index+6, evidence, at)
+		if err := client.CreateOntologyProposal(
+			ctx, rejected, baseVersion,
+		); !shoal.IsErrorCode(err, shoal.ErrorNotFound) {
+			t.Fatalf("unauthorized evidence create %d = %v, want non-disclosing not found",
+				index, err)
+		}
 	}
 	stored, err := corpus.OntologyProposals(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(stored) != 3 {
+	if len(stored) != 4 {
 		t.Fatalf("unauthorized evidence proposal persisted: %d proposals", len(stored))
 	}
 
