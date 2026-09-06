@@ -617,7 +617,11 @@ func TestCursorExpiresAndAEADIsRequired(t *testing.T) {
 	if _, err := codec.open(value, now.Add(time.Minute)); !errors.Is(err, ErrCursorInvalid) {
 		t.Fatalf("expired cursor error = %v", err)
 	}
-	mutated := value[:len(value)-1] + "A"
+	replacement := byte('A')
+	if value[len(value)-1] == replacement {
+		replacement = 'B'
+	}
+	mutated := value[:len(value)-1] + string(replacement)
 	if _, err := codec.open(mutated, now); !errors.Is(err, ErrCursorInvalid) {
 		t.Fatalf("unauthenticated mutation error = %v", err)
 	}
