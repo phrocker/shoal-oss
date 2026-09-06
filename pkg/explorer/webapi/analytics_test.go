@@ -32,6 +32,7 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/explorer/analytics"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/explorer/webapi"
+	"github.com/phrocker/shoal-oss/pkg/ontology"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
@@ -147,6 +148,58 @@ func TestAnalyticsWireRoundTripsOpaqueIDs(t *testing.T) {
 	}
 	if !reflect.DeepEqual(decoded, request) {
 		t.Fatalf("round trip:\n got %#v\nwant %#v", decoded, request)
+	}
+}
+
+func TestAnalyticsResponseWireRoundTripsOpaqueIDs(t *testing.T) {
+	opaque := shoal.ID([]byte{0xff, 0x00})
+	response := webapi.AnalyticsResponse{
+		Snapshot: webapi.AnalyticsSnapshot{ID: "analytics-sha256:pin"},
+		Analytics: analytics.Result{
+			Scope: analytics.ScopeMetadata{
+				SnapshotID:               "analytics-sha256:pin",
+				AuthorizationFingerprint: "auth-sha256:scope",
+				PolicyGeneration:         1, SeedNodeIDs: []shoal.ID{opaque},
+				Depth: 1, Direction: explorer.GraphDirectionBoth,
+				Fanout: 2, MaxNodes: 3, MaxEdges: 4,
+				MaxScannedEdgesPerNode: 5,
+				UnresolvedAssertions: []analytics.UnresolvedSemantic{{
+					AssertionID: opaque,
+					Reading:     ontology.OntologyUnresolved,
+					Reason:      "ontology identity was not recorded",
+				}},
+				NodeCount: 1, Complete: true,
+			},
+			Nodes: []analytics.NodeSummary{{
+				NodeID: opaque, PageRank: 1,
+				WeakComponentID: "component-sha256:test",
+			}},
+			WeaklyConnectedComponents: []analytics.ComponentSummary{{
+				ID: "component-sha256:test", NodeIDs: []shoal.ID{opaque},
+				NodeCount: 1,
+			}},
+			PageRank: analytics.PageRankSummary{
+				DampingFactor:        analytics.DefaultDampingFactor,
+				ConvergenceTolerance: analytics.DefaultConvergenceTolerance,
+				MaxIterations:        analytics.DefaultMaxIterations,
+				Iterations:           1, Converged: true,
+			},
+			Recording: analytics.RecordingStatus{Recorded: false, Required: false},
+		},
+	}
+	encoded, err := json.Marshal(response)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(encoded, []byte{0xff}) {
+		t.Fatalf("opaque response ID was emitted without encoding: %q", encoded)
+	}
+	var decoded webapi.AnalyticsResponse
+	if err := json.Unmarshal(encoded, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(decoded, response) {
+		t.Fatalf("round trip:\n got %#v\nwant %#v", decoded, response)
 	}
 }
 
