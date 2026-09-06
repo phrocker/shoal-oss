@@ -28,22 +28,31 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
-type mutableGovernedOntologySource struct {
-	proposals []ontology.GovernedProposal
+type mutableGovernedOntologyCatalog struct {
+	configured *ontology.OntologyVersion
+	proposals  []ontology.GovernedProposal
 }
 
-func (s *mutableGovernedOntologySource) OntologyProposals(
+func (s *mutableGovernedOntologyCatalog) OntologyCatalog(
 	context.Context,
-) ([]ontology.GovernedProposal, error) {
-	return append([]ontology.GovernedProposal(nil), s.proposals...), nil
+) (ontology.PublishedCatalog, bool, error) {
+	if s.configured == nil {
+		return ontology.PublishedCatalog{}, false, nil
+	}
+	catalog, err := boundedOntologyCatalog(*s.configured, s.proposals)
+	if err != nil {
+		return ontology.PublishedCatalog{}, false, err
+	}
+	return catalog, true, nil
 }
 
 func TestGovernedOntologyChoicesUsesLivePublishedAncestry(t *testing.T) {
 	first, second, third, published := governedOntologyFixture(t)
-	source := &mutableGovernedOntologySource{
-		proposals: []ontology.GovernedProposal{published},
+	source := &mutableGovernedOntologyCatalog{
+		configured: &first,
+		proposals:  []ontology.GovernedProposal{published},
 	}
-	choices, err := NewGovernedOntologyChoices(&first, source)
+	choices, err := NewGovernedOntologyChoices(source)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -110,8 +119,8 @@ func TestGovernedOntologyChoicesUsesLivePublishedAncestry(t *testing.T) {
 }
 
 func TestGovernedOntologyChoicesWithoutConfiguredRootIsEmpty(t *testing.T) {
-	source := &mutableGovernedOntologySource{}
-	choices, err := NewGovernedOntologyChoices(nil, source)
+	source := &mutableGovernedOntologyCatalog{}
+	choices, err := NewGovernedOntologyChoices(source)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -135,8 +144,11 @@ func TestPublishedOntologyHistoryAcceptsExactBound(t *testing.T) {
 	if active.ID() != expected.ID() {
 		t.Fatalf("active = %s, want %s", active.ID(), expected.ID())
 	}
-	source := &mutableGovernedOntologySource{proposals: proposals}
-	choices, err := NewGovernedOntologyChoices(&configured, source)
+	source := &mutableGovernedOntologyCatalog{
+		configured: &configured,
+		proposals:  proposals,
+	}
+	choices, err := NewGovernedOntologyChoices(source)
 	if err != nil {
 		t.Fatal(err)
 	}
