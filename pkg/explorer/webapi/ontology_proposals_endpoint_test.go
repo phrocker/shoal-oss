@@ -576,7 +576,15 @@ func TestOntologyProposalMorphismUsesKeyReferencesAndWireCodecs(t *testing.T) {
 		len(projected.Targets) != 1 || projected.Targets[0] != targetID ||
 		len(projected.EvidenceIDs) != 1 ||
 		projected.EvidenceIDs[0] != base64.RawURLEncoding.EncodeToString(
-			[]byte(expectedEvidence.ID())) {
+			[]byte(expectedEvidence.ID())) ||
+		len(projected.Evidence) != 1 ||
+		projected.Evidence[0].ID != projected.EvidenceIDs[0] ||
+		projected.Evidence[0].Citation != evidenceDraft.Citation ||
+		projected.Evidence[0].Quote != evidenceDraft.Quote ||
+		projected.Evidence[0].Metadata["source"] != "test" ||
+		projected.Evidence[0].Path == nil ||
+		len(projected.Evidence[0].Path.Nodes) != 1 ||
+		projected.Evidence[0].Path.Nodes[0].ID != "node:opaque/value" {
 		t.Fatalf("projected morphism IDs = %+v", projected)
 	}
 	if !reflect.DeepEqual(projected.Metadata, metadata) {

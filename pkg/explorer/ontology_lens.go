@@ -51,7 +51,7 @@ func (e *Explorer) InterpretAssertions(
 	}
 	var target ontology.OntologyVersion
 	var morphisms []ontology.OntologyMorphism
-	var transitions []ontology.OntologyTransition
+	transitions := make([]ontology.OntologyTransition, 0)
 	publishedTransitions := make(map[string]struct{})
 	ambiguousPublication := false
 	for _, record := range e.ontologyProposals {

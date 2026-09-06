@@ -578,6 +578,7 @@ func NewOntologyLensWithTransitions(
 	}
 	identity, _ := NewOntologyIdentity(target)
 	lens := OntologyLens{target: target.clone(), identity: identity}
+	inferTransitions := transitions == nil
 	grouped := make(map[string]*ontologyLensTransition)
 	addTransition := func(source, target OntologyIdentity) *ontologyLensTransition {
 		key := source.String() + "->" + target.String()
@@ -602,7 +603,14 @@ func NewOntologyLensWithTransitions(
 		if morphism.Source().SchemaID() != identity.SchemaID() {
 			continue
 		}
-		edge := addTransition(morphism.Source(), morphism.Target())
+		key := morphism.Source().String() + "->" + morphism.Target().String()
+		edge := grouped[key]
+		if edge == nil {
+			if !inferTransitions {
+				continue
+			}
+			edge = addTransition(morphism.Source(), morphism.Target())
+		}
 		edge.morphisms = append(edge.morphisms, morphism.clone())
 	}
 	for _, transition := range grouped {
@@ -644,26 +652,28 @@ func (l OntologyLens) Read(assertion Assertion) AssertionInterpretation {
 	if !ok {
 		return UnresolvedInterpretation(assertion, l.identity, "no unique published morphism path")
 	}
+	applied := make(map[shoal.ID]struct{})
 	for _, step := range path {
 		var reason string
-		result.subjectType, reason = mapDefinition(
+		var matched []shoal.ID
+		result.subjectType, matched, reason = mapDefinition(
 			result.subjectType, assertion.metadata, step.morphisms)
 		if reason != "" {
 			return UnresolvedInterpretation(assertion, l.identity, reason)
 		}
-		result.predicate, reason = mapDefinition(
+		appendAppliedMorphisms(&result.applied, applied, matched)
+		result.predicate, matched, reason = mapDefinition(
 			result.predicate, assertion.metadata, step.morphisms)
 		if reason != "" {
 			return UnresolvedInterpretation(assertion, l.identity, reason)
 		}
-		result.objectType, reason = mapDefinition(
+		appendAppliedMorphisms(&result.applied, applied, matched)
+		result.objectType, matched, reason = mapDefinition(
 			result.objectType, assertion.metadata, step.morphisms)
 		if reason != "" {
 			return UnresolvedInterpretation(assertion, l.identity, reason)
 		}
-		for _, morphism := range step.morphisms {
-			result.applied = append(result.applied, morphism.ID())
-		}
+		appendAppliedMorphisms(&result.applied, applied, matched)
 	}
 	if err := l.validateInterpretation(assertion, result); err != nil {
 		return UnresolvedInterpretation(assertion, l.identity, err.Error())
@@ -723,15 +733,17 @@ func (l OntologyLens) uniquePath(
 
 func mapDefinition(
 	id shoal.ID, metadata shoal.Metadata, morphisms []OntologyMorphism,
-) (shoal.ID, string) {
+) (shoal.ID, []shoal.ID, string) {
 	if id == "" {
-		return "", ""
+		return "", nil, ""
 	}
 	var mapped shoal.ID
+	var applied []shoal.ID
 	for _, m := range morphisms {
 		if !containsID(m.sources, id) {
 			continue
 		}
+		applied = append(applied, m.ID())
 		next := id
 		switch m.kind {
 		case MorphismRename, MorphismMerge:
@@ -740,19 +752,33 @@ func mapDefinition(
 			var ok bool
 			next, ok = m.discriminator.resolve(metadata)
 			if !ok {
-				return "", "split discriminator is absent or unrecognized"
+				return "", nil, "split discriminator is absent or unrecognized"
 			}
 		case MorphismWiden, MorphismNarrow:
 		}
 		if mapped != "" && mapped != next {
-			return "", "multiple morphisms give incompatible meanings"
+			return "", nil, "multiple morphisms give incompatible meanings"
 		}
 		mapped = next
 	}
 	if mapped == "" {
-		return id, ""
+		return id, nil, ""
 	}
-	return mapped, ""
+	return mapped, applied, ""
+}
+
+func appendAppliedMorphisms(
+	target *[]shoal.ID,
+	seen map[shoal.ID]struct{},
+	values []shoal.ID,
+) {
+	for _, id := range values {
+		if _, duplicate := seen[id]; duplicate {
+			continue
+		}
+		seen[id] = struct{}{}
+		*target = append(*target, id)
+	}
 }
 
 func (l OntologyLens) validateInterpretation(
