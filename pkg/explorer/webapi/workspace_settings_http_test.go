@@ -145,6 +145,11 @@ func TestHTTPWorkspaceSettingsRoundTripAuthorizationAndRestart(t *testing.T) {
 	if err := handler.SetWorkspaceSettingsProvider(provider); err != nil {
 		t.Fatal(err)
 	}
+	if err := handler.MountWorkspaceSettings(
+		webapi.WorkspaceSettingsHTTPConfig{Provider: provider},
+	); !shoal.IsErrorCode(err, shoal.ErrorConflict) {
+		t.Fatalf("duplicate mount error = %v, want conflict", err)
+	}
 
 	workspacePath := base64.RawURLEncoding.EncodeToString([]byte("workspace-http"))
 	mutationID := base64.RawURLEncoding.EncodeToString([]byte("mutation-http"))
@@ -394,6 +399,55 @@ func TestHTTPWorkspaceSettingsReportsIndeterminateCommit(t *testing.T) {
 	}
 	if envelope.Code != shoal.ErrorUnavailable || !envelope.Indeterminate {
 		t.Fatalf("indeterminate envelope = %#v", envelope)
+	}
+}
+
+func TestWorkspaceSettingsHTTPHandlerIsIndependentlyMountable(t *testing.T) {
+	if _, err := webapi.NewWorkspaceSettingsHTTPHandler(
+		webapi.WorkspaceSettingsHTTPConfig{},
+	); !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
+		t.Fatalf("nil provider error = %v, want invalid_argument", err)
+	}
+
+	now := time.Date(2026, 9, 6, 9, 0, 0, 0, time.UTC)
+	authority, _ := auth.NewAuthorityWithClock(func() time.Time { return now })
+	store, err := workspace.OpenDurableStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	provider, err := workspace.NewProvider(
+		store, settingsProviderOptions(authority.Resolver(), now))
+	if err != nil {
+		t.Fatal(err)
+	}
+	decision := settingsHTTPDecision(t, now, "owner")
+	ctx, err := authority.Binder().Bind(context.Background(), decision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := provider.Update(ctx, "mounted", workspace.UpdateRequest{
+		MutationID: "create-mounted",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	handler, err := webapi.NewWorkspaceSettingsHTTPHandler(
+		webapi.WorkspaceSettingsHTTPConfig{Provider: provider})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(
+		http.MethodGet,
+		"http://example.test/api/v1/workspaces/"+
+			base64.RawURLEncoding.EncodeToString([]byte("mounted"))+
+			"/settings",
+		nil,
+	).WithContext(ctx)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("mounted settings status = %d, body = %s",
+			response.Code, response.Body.String())
 	}
 }
 
