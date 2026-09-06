@@ -79,6 +79,36 @@ type publicationProof struct {
 	plan      transaction.Plan
 }
 
+// ReadCommittedCell hydrates one exact physical coordinate at a required
+// committed epoch. The bool is false when that exact committed version does
+// not exist; a newer row sharing the byte prefix is never returned.
+func (r *Runtime) ReadCommittedCell(
+	ctx context.Context,
+	table string,
+	row, family, qualifier, visibility []byte,
+	epoch coordination.Epoch,
+) (CommittedCell, bool, error) {
+	if err := epoch.Validate(); err != nil {
+		return CommittedCell{}, false, errors.Join(transaction.ErrInvalid, err)
+	}
+	page, err := r.ScanCommitted(ctx, CommittedScanRequest{
+		Table: table, RowPrefix: append([]byte(nil), row...),
+		Family:     append([]byte(nil), family...),
+		Qualifier:  append([]byte(nil), qualifier...),
+		Visibility: append([]byte(nil), visibility...),
+		Frontier:   epoch, Limit: 1, MaxScanned: MaxCommittedScanCells,
+	})
+	if err != nil {
+		return CommittedCell{}, false, err
+	}
+	if len(page.Cells) == 0 ||
+		!bytes.Equal(page.Cells[0].Cell.Coordinate.Row, row) ||
+		page.Cells[0].Epoch != epoch {
+		return CommittedCell{}, false, nil
+	}
+	return page.Cells[0], true, nil
+}
+
 // Committed reports whether a transaction completed publication, checkpoint,
 // and guard finalization at the exact durable logical digest.
 func (r *Runtime) Committed(

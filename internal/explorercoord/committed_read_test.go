@@ -172,6 +172,20 @@ func TestScanCommittedPagesBoundsAndDetectsPhysicalMutation(t *testing.T) {
 		!bytes.Equal(second.Cells[0].Cell.Coordinate.Row, []byte("event/b")) {
 		t.Fatalf("second committed page = %#v, %v", second, err)
 	}
+	exact, found, err := runtime.ReadCommittedCell(
+		context.Background(), "records", []byte("event/b"),
+		[]byte("event"), []byte("record"), nil, second.Cells[0].Epoch,
+	)
+	if err != nil || !found ||
+		!bytes.Equal(exact.Cell.Value, second.Cells[0].Cell.Value) {
+		t.Fatalf("exact committed cell = %#v, %v, %v", exact, found, err)
+	}
+	if _, found, err := runtime.ReadCommittedCell(
+		context.Background(), "records", []byte("event/b"),
+		[]byte("event"), []byte("record"), nil, second.Cells[0].Epoch+1,
+	); err == nil || found {
+		t.Fatalf("unavailable future epoch = found %v, err %v", found, err)
+	}
 	if _, err := runtime.ScanCommitted(context.Background(), CommittedScanRequest{
 		Table: "unconfigured", RowPrefix: []byte("event/"),
 		Family: []byte("event"), Qualifier: []byte("record"), Limit: 1,
