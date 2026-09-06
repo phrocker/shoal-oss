@@ -223,6 +223,42 @@ func (c *Client) edgeAllows(
 // the identifiers it does carry, and an empty one authorizes nothing.
 type registeredNodes map[shoal.ID]NodeRegistration
 
+type currentRevisions map[shoal.ID]RevisionRegistration
+
+// resolveCurrentRevisions resolves distinct document identifiers in one
+// policy-store round trip. Omitted registrations retain the point lookup's
+// fail-closed !ok meaning, and results for unrequested identifiers are ignored.
+func (c *Client) resolveCurrentRevisions(
+	ctx context.Context,
+	documentIDs []shoal.ID,
+) (currentRevisions, error) {
+	distinct := make([]shoal.ID, 0, len(documentIDs))
+	requested := make(map[shoal.ID]struct{}, len(documentIDs))
+	for _, documentID := range documentIDs {
+		if _, duplicate := requested[documentID]; duplicate {
+			continue
+		}
+		requested[documentID] = struct{}{}
+		distinct = append(distinct, documentID)
+	}
+	if len(distinct) == 0 {
+		return currentRevisions{}, nil
+	}
+	batch, err := c.policyStore.CurrentRevisions(ctx, distinct)
+	if err != nil {
+		return nil, policyCatalogReadError(ctx, err)
+	}
+	resolved := make(currentRevisions, len(distinct))
+	for _, documentID := range distinct {
+		registration, ok := batch[documentID]
+		if !ok {
+			continue
+		}
+		resolved[documentID] = registration
+	}
+	return resolved, nil
+}
+
 // resolveNodes collapses the identifiers it is given into a single policy-store
 // round trip, or none at all when there is nothing to resolve, deduplicating
 // first so the round trip carries distinct nodes rather than one entry per edge
@@ -413,14 +449,19 @@ func (c *Client) canonicalRegisteredNodes(
 	}
 	canonicalDocuments := make(
 		map[shoal.ID]*canonicalRetrievalDocument, len(required))
+	documentIDs := make([]shoal.ID, 0, len(required))
 	for documentID, revisionID := range required {
 		if currentBase[documentID] != revisionID {
 			return nil, auth.ObjectNotFound()
 		}
-		current, ok, err := c.policyStore.CurrentRevision(ctx, documentID)
-		if err != nil {
-			return nil, policyCatalogReadError(ctx, err)
-		}
+		documentIDs = append(documentIDs, documentID)
+	}
+	currentRevisions, err := c.resolveCurrentRevisions(ctx, documentIDs)
+	if err != nil {
+		return nil, err
+	}
+	for documentID, revisionID := range required {
+		current, ok := currentRevisions[documentID]
 		if !ok || current.RevisionID != revisionID {
 			return nil, auth.ObjectNotFound()
 		}

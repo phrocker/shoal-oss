@@ -110,6 +110,12 @@ type PolicyStore interface {
 	PutNode(context.Context, shoal.ID, NodeRegistration) error
 	Revision(context.Context, shoal.ID, shoal.ID) (RevisionRegistration, bool, error)
 	CurrentRevision(context.Context, shoal.ID) (RevisionRegistration, bool, error)
+	// CurrentRevisions resolves the current revision registrations for many
+	// documents in one round trip under exactly the contract Nodes carries for
+	// node registrations.
+	CurrentRevisions(
+		context.Context, []shoal.ID,
+	) (map[shoal.ID]RevisionRegistration, error)
 	Node(context.Context, shoal.ID) (NodeRegistration, bool, error)
 	// Nodes resolves many node registrations in one round trip. For every
 	// identifier it is given it must report exactly what Node would report for
@@ -699,6 +705,61 @@ func (s *MemoryPolicyStore) CurrentRevision(
 	cloned := cloneRevisionRegistration(registration)
 	cloned.Current = true
 	return cloned, true, nil
+}
+
+// CurrentRevisions returns the exact current registrations for the requested
+// documents in one round trip. Each identifier is processed in request order
+// with the same validation, lookup, and clone semantics as CurrentRevision.
+// Repeated identifiers are attempted once after their first successful
+// validation, and unregistered identifiers are omitted from the result.
+func (s *MemoryPolicyStore) CurrentRevisions(
+	ctx context.Context,
+	documentIDs []shoal.ID,
+) (map[shoal.ID]RevisionRegistration, error) {
+	if s == nil || len(documentIDs) == 0 {
+		if err := contextFailure(ctx); err != nil {
+			return nil, err
+		}
+		if s == nil {
+			if len(documentIDs) > 0 {
+				if err := shoal.ValidateRequiredID(
+					"document ID", documentIDs[0],
+				); err != nil {
+					return nil, err
+				}
+			}
+			return nil, catalogUnavailable()
+		}
+		return map[shoal.ID]RevisionRegistration{}, nil
+	}
+	attempted := make(map[shoal.ID]struct{}, len(documentIDs))
+	resolved := make(map[shoal.ID]RevisionRegistration, len(documentIDs))
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, documentID := range documentIDs {
+		if err := contextFailure(ctx); err != nil {
+			return nil, err
+		}
+		if err := shoal.ValidateRequiredID("document ID", documentID); err != nil {
+			return nil, err
+		}
+		if _, done := attempted[documentID]; done {
+			continue
+		}
+		attempted[documentID] = struct{}{}
+		key, ok := s.current[documentID]
+		if !ok {
+			continue
+		}
+		registration, ok := s.revisions[key]
+		if !ok {
+			return nil, catalogUnavailable()
+		}
+		cloned := cloneRevisionRegistration(registration)
+		cloned.Current = true
+		resolved[documentID] = cloned
+	}
+	return resolved, nil
 }
 
 // Node returns the current registration owning a graph node.
