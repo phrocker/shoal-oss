@@ -22,6 +22,7 @@ package harness
 import (
 	"context"
 	"fmt"
+	"math"
 	"reflect"
 	"sort"
 	"strconv"
@@ -34,6 +35,7 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/graph"
 	"github.com/phrocker/shoal-oss/pkg/inference"
 	"github.com/phrocker/shoal-oss/pkg/interaction"
+	"github.com/phrocker/shoal-oss/pkg/ontology"
 	"github.com/phrocker/shoal-oss/pkg/retrieval"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
@@ -834,6 +836,7 @@ func graphAnchorsFromNeighborhood(
 		return shoal.CompareID(edges[i].ID, edges[j].ID) < 0
 	})
 	outgoing := make(map[shoal.ID][]graph.Edge)
+	edgesByID := make(map[shoal.ID]graph.Edge, len(edges))
 	seenEdges := make(map[shoal.ID]struct{}, len(edges))
 	for _, edge := range edges {
 		if err := edge.Validate(); err != nil {
@@ -843,7 +846,13 @@ func graphAnchorsFromNeighborhood(
 			return nil, invalid("bounded neighborhood has duplicate edge ID")
 		}
 		seenEdges[edge.ID] = struct{}{}
+		edgesByID[edge.ID] = edge
 		outgoing[edge.From] = append(outgoing[edge.From], edge)
+	}
+	assertionsByEdge, err := graphAssertionsByEdge(
+		neighborhood.Assertions, edgesByID)
+	if err != nil {
+		return nil, err
 	}
 	type queuedPath struct {
 		nodes []graph.Node
@@ -884,10 +893,16 @@ func graphAnchorsFromNeighborhood(
 				edges: append(append([]graph.Edge(nil), current.edges...), edge),
 				seen:  nextSeen,
 			}
-			anchor, err := inference.NewGraphAnchor(graph.Path{
+			path := graph.Path{
 				Nodes: nextPath.nodes,
 				Edges: nextPath.edges,
-			})
+			}
+			var assertions []interaction.AssertionReference
+			for _, pathEdge := range nextPath.edges {
+				assertions = append(assertions, assertionsByEdge[pathEdge.ID]...)
+			}
+			anchor, err := inference.NewGraphAnchorWithAssertions(
+				path, assertions)
 			if err != nil {
 				return nil, fmt.Errorf("%w: %v", ErrInvalid, err)
 			}
@@ -909,4 +924,78 @@ func graphAnchorsFromNeighborhood(
 		}
 	}
 	return anchors, nil
+}
+
+func graphAssertionsByEdge(
+	assertions []ontology.Assertion,
+	edges map[shoal.ID]graph.Edge,
+) (map[shoal.ID][]interaction.AssertionReference, error) {
+	const assertionEdgeIDProperty = "shoal.graph.edge_id"
+	result := make(map[shoal.ID][]interaction.AssertionReference)
+	for _, assertion := range assertions {
+		if err := assertion.Validate(); err != nil {
+			return nil, err
+		}
+		if assertion.Origin() == ontology.AssertionDerived {
+			return nil, invalid(
+				"derived assertion cannot be used as source graph evidence")
+		}
+		matched := make(map[shoal.ID]struct{})
+		if edgeID := shoal.ID(
+			assertion.Metadata()[assertionEdgeIDProperty]); edgeID != "" {
+			if edge, ok := edges[edgeID]; ok {
+				if !graphAssertionMatchesEdge(assertion, edge) {
+					return nil, invalid(
+						"graph assertion does not match its authoritative edge")
+				}
+				matched[edgeID] = struct{}{}
+			}
+		}
+		if edge, ok := edges[assertion.ID()]; ok {
+			if !graphAssertionMatchesEdge(assertion, edge) {
+				return nil, invalid(
+					"graph assertion does not match its authoritative edge")
+			}
+			matched[assertion.ID()] = struct{}{}
+		}
+		if len(matched) == 0 {
+			return nil, invalid(
+				"graph assertion has no authoritative neighborhood edge")
+		}
+		for edgeID := range matched {
+			result[edgeID] = append(
+				result[edgeID],
+				interaction.AssertionReference{
+					AssertionID: assertion.ID(),
+					EdgeID:      edgeID,
+					Origin:      assertion.Origin(),
+				},
+			)
+		}
+	}
+	for edgeID := range result {
+		sort.Slice(result[edgeID], func(i, j int) bool {
+			if compared := shoal.CompareID(
+				result[edgeID][i].AssertionID,
+				result[edgeID][j].AssertionID,
+			); compared != 0 {
+				return compared < 0
+			}
+			return result[edgeID][i].Origin < result[edgeID][j].Origin
+		})
+	}
+	return result, nil
+}
+
+func graphAssertionMatchesEdge(
+	assertion ontology.Assertion,
+	edge graph.Edge,
+) bool {
+	target, ok := assertion.Object().ReferenceValue()
+	return ok &&
+		edge.From == assertion.Subject() &&
+		edge.To == target &&
+		edge.Type == string(assertion.Predicate()) &&
+		math.Float64bits(float64(edge.Weight)) ==
+			math.Float64bits(float64(assertion.Confidence()))
 }
