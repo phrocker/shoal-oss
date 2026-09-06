@@ -269,6 +269,18 @@ func (s *IntentStore) Put(
 				}
 				return existing, true, nil
 			}
+			active, pendingErr := s.hasPendingMarker(ctx, existing)
+			if pendingErr != nil {
+				return storedIntent{}, false, pendingErr
+			}
+			if !active {
+				if removeErr := s.removePending(ctx, txn); removeErr != nil {
+					return storedIntent{}, false, errors.Join(
+						transaction.ErrConflict,
+						removeErr,
+					)
+				}
+			}
 			return storedIntent{}, false, transaction.ErrConflict
 		}
 		if !errors.Is(readErr, transaction.ErrNotFound) {
@@ -918,6 +930,29 @@ func (s *IntentStore) ensurePending(
 		return false, transaction.ErrConflict
 	}
 	return false, errors.Join(transaction.ErrUnavailable, allocator.ErrConditionalUnknown, writeErr)
+}
+
+func (s *IntentStore) hasPendingMarker(
+	ctx context.Context,
+	record storedIntent,
+) (bool, error) {
+	coordinate := s.pendingCoordinate(record.TXN)
+	cells, err := s.store.ReadExact(ctx, []allocator.Coordinate{coordinate})
+	if err != nil {
+		return false, errors.Join(transaction.ErrUnavailable, err)
+	}
+	if len(cells) == 0 {
+		return false, nil
+	}
+	if len(cells) != 1 ||
+		cells[0].Timestamp != intentVersion ||
+		!bytes.Equal(cells[0].Value, record.LogicalDigest[:]) {
+		return false, fmt.Errorf(
+			"%w: pending intent marker is invalid",
+			transaction.ErrInternal,
+		)
+	}
+	return true, nil
 }
 
 func (s *IntentStore) Settle(

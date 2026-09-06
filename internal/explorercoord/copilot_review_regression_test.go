@@ -842,6 +842,45 @@ func TestSuccessfulRecoveryRefreshesPendingCache(t *testing.T) {
 	}
 }
 
+func TestCompletedIntentConflictDoesNotReopenPendingIndex(t *testing.T) {
+	config := testRuntimeConfig(t, testDirectory(t))
+	runtime, err := Open(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.Close()
+	intent := testIntent(
+		t,
+		config.Domain,
+		"completed-conflict",
+		"token",
+		"original",
+		guard.ModeAbsentOrIdentical,
+		0,
+		coordination.Digest{},
+	)
+	if _, err := runtime.Publish(
+		context.Background(),
+		Request{Intent: intent},
+	); err != nil {
+		t.Fatal(err)
+	}
+	divergent := cloneIntent(intent)
+	divergent.Cells[0].Value = []byte("divergent")
+	if _, err := runtime.Publish(
+		context.Background(),
+		Request{Intent: divergent},
+	); !errors.Is(err, transaction.ErrConflict) ||
+		errors.Is(err, ErrIndeterminatePublication) {
+		t.Fatalf("divergent completed replay = %v", err)
+	}
+	if pending, err := runtime.PendingPublications(
+		context.Background(),
+	); err != nil || pending {
+		t.Fatalf("pending after completed replay conflict = %v, %v", pending, err)
+	}
+}
+
 func TestCommittedScanDefaultWorkBoundSupportsMaximumLimit(t *testing.T) {
 	config := testRuntimeConfig(t, testDirectory(t))
 	runtime, err := Open(config)
