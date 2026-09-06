@@ -426,8 +426,7 @@ func (p *Provider) Apply(
 	baseLimits Limits,
 	baseOutputPolicies []auth.Policy,
 ) (EffectiveDecision, error) {
-	check, err := p.authorize(
-		ctx, auth.OperationWorkspaceSettingsRead, workspaceID)
+	check, err := p.authorizeApplication(ctx, workspaceID)
 	if err != nil {
 		return EffectiveDecision{}, err
 	}
@@ -446,7 +445,8 @@ func (p *Provider) Apply(
 		return EffectiveDecision{}, err
 	}
 	options := ApplyOptions{
-		Now: p.clock(), BaseLimits: baseLimits,
+		Now: p.clock(), Operation: check.operation,
+		BaseLimits:         baseLimits,
 		BaseOutputPolicies: baseOutputPolicies,
 		OntologyChoices:    p.ontologyChoices,
 	}
@@ -505,6 +505,34 @@ func (p *Provider) authorize(
 	if err != nil {
 		return authorizationCheck{}, err
 	}
+	return p.authorizeDecision(ctx, decision, operation, workspaceID)
+}
+
+func (p *Provider) authorizeApplication(
+	ctx context.Context,
+	workspaceID shoal.ID,
+) (authorizationCheck, error) {
+	if err := shoal.ValidateRequiredID("workspace ID", workspaceID); err != nil {
+		return authorizationCheck{}, err
+	}
+	decision, err := p.resolver.Resolve(ctx)
+	if err != nil {
+		return authorizationCheck{}, err
+	}
+	operations := decision.AllowedOperations()
+	if len(operations) == 0 {
+		return authorizationCheck{}, authDenied()
+	}
+	return p.authorizeDecision(
+		ctx, decision, operations[0], workspaceID)
+}
+
+func (p *Provider) authorizeDecision(
+	ctx context.Context,
+	decision auth.Decision,
+	operation auth.Operation,
+	workspaceID shoal.ID,
+) (authorizationCheck, error) {
 	guard, err := auth.NewGenerationGuard(decision, p.generationReader)
 	if err != nil {
 		return authorizationCheck{}, authDenied()
@@ -663,6 +691,7 @@ func (p *Provider) normalizeUpdate(
 // ApplyOptions supplies trusted non-settings limits and output policies.
 type ApplyOptions struct {
 	Now                time.Time
+	Operation          auth.Operation
 	BaseLimits         Limits
 	BaseOutputPolicies []auth.Policy
 	ServiceCeiling     *auth.ServiceCeiling
@@ -737,8 +766,16 @@ func DeriveEffectiveDecision(
 	if options.Now.IsZero() {
 		return EffectiveDecision{}, invalid("application time is required")
 	}
+	operation := options.Operation
+	if operation == "" {
+		operations := base.AllowedOperations()
+		if len(operations) == 0 {
+			return EffectiveDecision{}, authDenied()
+		}
+		operation = operations[0]
+	}
 	if err := base.Authorize(
-		auth.OperationWorkspaceSettingsRead,
+		operation,
 		auth.ResourceRequest{
 			AuthorizationDomain: base.AuthorizationDomain(),
 			ObjectID:            settings.WorkspaceID,
@@ -791,7 +828,7 @@ func DeriveEffectiveDecision(
 			return EffectiveDecision{}, err
 		}
 		if err := authorizeOutputPolicy(
-			base, policy, options.ServiceCeiling, options.Now); err != nil {
+			base, operation, policy, options.ServiceCeiling, options.Now); err != nil {
 			return EffectiveDecision{}, authDenied()
 		}
 		settingsOutputPolicies = append(settingsOutputPolicies, policy)
@@ -806,7 +843,7 @@ func DeriveEffectiveDecision(
 	}
 	for _, policy := range options.BaseOutputPolicies {
 		if err := authorizeOutputPolicy(
-			base, policy, options.ServiceCeiling, options.Now); err != nil {
+			base, operation, policy, options.ServiceCeiling, options.Now); err != nil {
 			return EffectiveDecision{}, authDenied()
 		}
 	}
@@ -876,12 +913,13 @@ func Apply(
 
 func authorizeOutputPolicy(
 	decision auth.Decision,
+	operation auth.Operation,
 	policy auth.Policy,
 	ceiling *auth.ServiceCeiling,
 	now time.Time,
 ) error {
 	if err := decision.Authorize(
-		auth.OperationWorkspaceSettingsRead,
+		operation,
 		auth.ResourceRequest{
 			AuthorizationDomain: policy.AuthorizationDomain(),
 			SourceID:            policy.SourceID(),
@@ -905,7 +943,7 @@ func authorizeOutputPolicy(
 			return authDenied()
 		}
 		_, err = auth.DeriveScannerAuthorizations(
-			decision, auth.OperationWorkspaceSettingsRead,
+			decision, operation,
 			servicePolicy, *ceiling, now)
 		return err
 	}
