@@ -483,6 +483,47 @@ func TestOntologyInterpretationsMustMatchAuthorizedAssertions(t *testing.T) {
 	}
 }
 
+func TestOntologyLensRequiresExplicitTrustedInterpreter(t *testing.T) {
+	client, base := authorizedPaginationClient(t, false)
+	schema, _ := ontology.NewOntologySchema("trusted", "Trusted", "", nil)
+	version, _ := ontology.NewOntologyVersion(
+		schema, "1", time.Date(2026, time.September, 6, 0, 0, 0, 0, time.UTC),
+		nil, nil, nil, nil)
+	selected, _ := ontology.NewOntologyIdentity(version)
+	decision, err := auth.NewDecision(auth.DecisionConfig{
+		Subject: "subject", Actor: "actor",
+		AuthorizationDomain: []byte("domain"),
+		AllowedOperations:   []auth.Operation{auth.OperationNeighborhood},
+		PermittedSourceIDs:  [][]byte{[]byte("source")},
+		PermittedPolicyIDs:  [][]byte{[]byte("policy")},
+		PolicyGeneration:    1,
+		AuthenticationExpires: time.Date(
+			2026, time.September, 6, 1, 0, 0, 0, time.UTC),
+		RequestID: "request", SelectedOntology: selected,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	called := false
+	base.interpret = func() { called = true }
+	result, err := client.applyOntologyLens(
+		context.Background(), explorer.Neighborhood{}, decision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if called || len(result.Interpretations) != 0 {
+		t.Fatal("untrusted base interpreter supplied ontology results")
+	}
+	client.ontologyInterpreter = base
+	if _, err := client.applyOntologyLens(
+		context.Background(), explorer.Neighborhood{}, decision); err != nil {
+		t.Fatal(err)
+	}
+	if !called {
+		t.Fatal("explicit trusted interpreter was not invoked")
+	}
+}
+
 func authorizedPaginationClient(t *testing.T, hiddenOnly bool) (*Client, *pagedBoundedBase) {
 	t.Helper()
 	ctx := context.Background()

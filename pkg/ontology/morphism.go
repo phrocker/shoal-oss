@@ -522,8 +522,16 @@ type OntologyTransition struct {
 }
 
 func NewOntologyTransition(
-	source, target OntologyIdentity,
+	sourceVersion, targetVersion OntologyVersion,
+	morphisms []OntologyMorphism,
 ) (OntologyTransition, error) {
+	if err := validateProposalEvolution(
+		sourceVersion, targetVersion, morphisms,
+	); err != nil {
+		return OntologyTransition{}, err
+	}
+	source, _ := NewOntologyIdentity(sourceVersion)
+	target, _ := NewOntologyIdentity(targetVersion)
 	transition := OntologyTransition{source: source, target: target}
 	if err := transition.Validate(); err != nil {
 		return OntologyTransition{}, err

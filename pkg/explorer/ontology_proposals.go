@@ -39,7 +39,6 @@ const MaxOntologyProposals uint32 = 256
 // MaxOntologyProposals; identical retries do not consume another slot.
 type OntologyProposalStore interface {
 	OntologyProposals(context.Context) ([]ontology.GovernedProposal, error)
-	OntologyProposalsForMutation(context.Context) ([]ontology.GovernedProposal, error)
 	CreateOntologyProposal(
 		context.Context, ontology.GovernedProposal, ontology.OntologyVersion,
 	) error
@@ -51,15 +50,6 @@ type OntologyProposalStore interface {
 		string,
 		time.Time,
 	) (ontology.GovernedProposal, error)
-}
-
-// OntologyProposalsForMutation returns the same immutable snapshot as
-// OntologyProposals. Authorization wrappers expose it under mutation authority
-// so publication CAS does not require a separate read grant.
-func (e *Explorer) OntologyProposalsForMutation(
-	ctx context.Context,
-) ([]ontology.GovernedProposal, error) {
-	return e.OntologyProposals(ctx)
 }
 
 type persistedOntologyProposal struct {
@@ -174,6 +164,9 @@ func (e *Explorer) OntologyProposals(
 	if err := e.requireOpen(); err != nil {
 		return nil, err
 	}
+	if err := e.requireCertainOntologyMutationLocked(); err != nil {
+		return nil, err
+	}
 	proposals := make([]ontology.GovernedProposal, 0, len(e.ontologyProposals))
 	for _, record := range e.ontologyProposals {
 		proposal, err := record.proposal()
@@ -224,6 +217,9 @@ func (e *Explorer) CreateOntologyProposal(
 	if err := e.requireWritableLocked(); err != nil {
 		return err
 	}
+	if err := e.requireCertainOntologyMutationLocked(); err != nil {
+		return err
+	}
 	if existing := e.ontologyProposals[proposal.ID()]; existing != nil {
 		if existing.sameBase(record) {
 			return nil
@@ -240,6 +236,9 @@ func (e *Explorer) CreateOntologyProposal(
 		embeddedRecordOntologyProposal,
 		record,
 	); err != nil {
+		if IsIndeterminateCommit(err) {
+			e.ontologyMutationIndeterminate = true
+		}
 		return err
 	}
 	copy := record
@@ -270,6 +269,9 @@ func (e *Explorer) TransitionOntologyProposal(
 	if err := e.requireWritableLocked(); err != nil {
 		return ontology.GovernedProposal{}, err
 	}
+	if err := e.requireCertainOntologyMutationLocked(); err != nil {
+		return ontology.GovernedProposal{}, err
+	}
 	record := e.ontologyProposals[proposalID]
 	if record == nil {
 		return ontology.GovernedProposal{}, shoal.NewError(
@@ -281,7 +283,7 @@ func (e *Explorer) TransitionOntologyProposal(
 			shoal.ErrorInternal, "stored ontology proposal is invalid", err)
 	}
 	if next == ontology.ProposalPublished {
-		currentBase, currentHasBase := current.BaseVersionID()
+		publishedVersions := make(map[shoal.ID]struct{})
 		for otherID, otherRecord := range e.ontologyProposals {
 			if otherID == proposalID {
 				continue
@@ -292,8 +294,16 @@ func (e *Explorer) TransitionOntologyProposal(
 					shoal.ErrorInternal, "stored ontology proposal is invalid", restoreErr)
 			}
 			otherBase, otherHasBase := other.BaseVersionID()
-			if other.State() == ontology.ProposalPublished &&
-				otherHasBase == currentHasBase &&
+			currentBase, currentHasBase := current.BaseVersionID()
+			if other.State() != ontology.ProposalPublished ||
+				other.Schema().ID() != current.Schema().ID() {
+				continue
+			}
+			publishedVersions[other.ProposedVersion().ID()] = struct{}{}
+			if otherHasBase {
+				publishedVersions[otherBase] = struct{}{}
+			}
+			if otherHasBase == currentHasBase &&
 				otherBase == currentBase {
 				return ontology.GovernedProposal{}, shoal.NewError(
 					shoal.ErrorConflict,
@@ -301,22 +311,11 @@ func (e *Explorer) TransitionOntologyProposal(
 				)
 			}
 		}
-		if currentHasBase {
-			cyclic, cycleErr := e.publishedOntologyPathLocked(
-				current.Schema().ID(),
-				current.ProposedVersion().ID(),
-				currentBase,
-				proposalID,
+		if _, cycle := publishedVersions[current.ProposedVersion().ID()]; cycle {
+			return ontology.GovernedProposal{}, shoal.NewError(
+				shoal.ErrorConflict,
+				"ontology publication target already exists in published history",
 			)
-			if cycleErr != nil {
-				return ontology.GovernedProposal{}, cycleErr
-			}
-			if cyclic {
-				return ontology.GovernedProposal{}, shoal.NewError(
-					shoal.ErrorConflict,
-					"ontology publication would create a cycle",
-				)
-			}
 		}
 	}
 	// This advance is load-bearing; TestOntologyProposalTransitionsSurviveCoarseClockGranularity
@@ -330,7 +329,6 @@ func (e *Explorer) TransitionOntologyProposal(
 	if err != nil {
 		return ontology.GovernedProposal{}, err
 	}
-
 	if len(record.transitions) == math.MaxUint32 {
 		return ontology.GovernedProposal{}, shoal.NewError(
 			shoal.ErrorUnavailable, "ontology proposal transition sequence is exhausted")
@@ -350,50 +348,23 @@ func (e *Explorer) TransitionOntologyProposal(
 		embeddedRecordProposalTransition,
 		persisted,
 	); err != nil {
+		if IsIndeterminateCommit(err) {
+			e.ontologyMutationIndeterminate = true
+		}
 		return ontology.GovernedProposal{}, err
 	}
 	record.transitions = nextTransitions
 	return updated, nil
 }
 
-func (e *Explorer) publishedOntologyPathLocked(
-	schemaID, from, to, excludedProposalID shoal.ID,
-) (bool, error) {
-	outgoing := make(map[shoal.ID][]shoal.ID)
-	for id, record := range e.ontologyProposals {
-		if id == excludedProposalID {
-			continue
-		}
-		proposal, err := record.proposal()
-		if err != nil {
-			return false, shoal.WrapError(
-				shoal.ErrorInternal,
-				"stored ontology proposal is invalid",
-				err,
-			)
-		}
-		base, hasBase := proposal.BaseVersionID()
-		if proposal.State() != ontology.ProposalPublished ||
-			proposal.Schema().ID() != schemaID || !hasBase {
-			continue
-		}
-		outgoing[base] = append(outgoing[base], proposal.ProposedVersion().ID())
+func (e *Explorer) requireCertainOntologyMutationLocked() error {
+	if !e.ontologyMutationIndeterminate {
+		return nil
 	}
-	pending := []shoal.ID{from}
-	visited := make(map[shoal.ID]struct{})
-	for len(pending) > 0 {
-		current := pending[len(pending)-1]
-		pending = pending[:len(pending)-1]
-		if current == to {
-			return true, nil
-		}
-		if _, seen := visited[current]; seen {
-			continue
-		}
-		visited[current] = struct{}{}
-		pending = append(pending, outgoing[current]...)
-	}
-	return false, nil
+	return shoal.NewError(
+		shoal.ErrorUnavailable,
+		"ontology mutation outcome is indeterminate; reopen the corpus before retrying",
+	)
 }
 
 // advanceProposalTransitionTime returns the earliest time that keeps a

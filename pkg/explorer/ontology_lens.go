@@ -51,7 +51,9 @@ func (e *Explorer) InterpretAssertions(
 	}
 	var target ontology.OntologyVersion
 	var morphisms []ontology.OntologyMorphism
-	var transitions []ontology.OntologyTransition
+	transitions := make([]ontology.OntologyTransition, 0)
+	publishedTransitions := make(map[string]struct{})
+	ambiguousPublication := false
 	for _, record := range e.ontologyProposals {
 		proposal, err := record.proposal()
 		if err != nil {
@@ -65,23 +67,11 @@ func (e *Explorer) InterpretAssertions(
 		}
 		baseID, hasBase := proposal.BaseVersionID()
 		if hasBase {
-			source, identityErr := ontology.NewOntologyIdentityFromIDs(
-				proposal.Schema().ID(), baseID)
-			if identityErr != nil {
-				return nil, identityErr
+			key := string(baseID)
+			if _, duplicate := publishedTransitions[key]; duplicate {
+				ambiguousPublication = true
 			}
-			targetIdentity, identityErr := ontology.NewOntologyIdentity(
-				proposal.ProposedVersion())
-			if identityErr != nil {
-				return nil, identityErr
-			}
-			transition, transitionErr := ontology.NewOntologyTransition(
-				source, targetIdentity)
-			if transitionErr != nil {
-				return nil, transitionErr
-			}
-			transitions = append(transitions, transition)
-			morphisms = append(morphisms, proposal.Morphisms()...)
+			publishedTransitions[key] = struct{}{}
 		}
 		if identity, _ := ontology.NewOntologyIdentity(proposal.ProposedVersion()); identity == selected {
 			target = proposal.ProposedVersion()
@@ -94,9 +84,22 @@ func (e *Explorer) InterpretAssertions(
 			if identity, _ := ontology.NewOntologyIdentity(base); identity == selected {
 				target = base
 			}
+			transition, transitionErr := ontology.NewOntologyTransition(
+				base, proposal.ProposedVersion(), proposal.Morphisms())
+			if transitionErr == nil {
+				transitions = append(transitions, transition)
+			}
 		}
+		morphisms = append(morphisms, proposal.Morphisms()...)
 	}
 	out := make([]ontology.AssertionInterpretation, 0, len(assertions))
+	if ambiguousPublication {
+		for _, assertion := range assertions {
+			out = append(out, ontology.UnresolvedInterpretation(
+				assertion, selected, "multiple proposals published the same ontology transition"))
+		}
+		return out, nil
+	}
 	if target.ID() == "" {
 		for _, assertion := range assertions {
 			out = append(out, ontology.ReadAssertionUnder(assertion, selected))
