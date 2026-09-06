@@ -9,6 +9,7 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/phrocker/shoal-oss/internal/cclient"
 	"github.com/phrocker/shoal-oss/internal/embeddingspace"
 	"github.com/phrocker/shoal-oss/internal/iterrt"
 )
@@ -38,5 +39,32 @@ func TestDirectVectorScanRequiresEngineMetadataValidation(t *testing.T) {
 	)
 	if !errors.Is(err, embeddingspace.ErrQueryMetadataMissing) {
 		t.Fatalf("direct tablet vector scan error = %v", err)
+	}
+}
+
+func TestDefaultEmbeddingRejectsPartialStateAndBufferedRelabel(t *testing.T) {
+	partial := embeddingspace.FileState{Identity: "space-a"}
+	if _, err := Open(t.TempDir(), Options{
+		DefaultEmbedding: partial,
+	}); !errors.Is(err, embeddingspace.ErrInvalidState) {
+		t.Fatalf("Open partial state error = %v", err)
+	}
+
+	tablet, err := Open(t.TempDir(), Options{
+		DefaultEmbedding: embeddingspace.Has("space-a"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tablet.Close()
+	mutation, _ := cclient.NewMutation([]byte("row"))
+	mutation.PutLatest([]byte("vec"), nil, nil, []byte("value"))
+	if err := tablet.Write([]*cclient.Mutation{mutation}); err != nil {
+		t.Fatal(err)
+	}
+	if err := tablet.SetDefaultEmbedding(
+		embeddingspace.Has("space-b"),
+	); !errors.Is(err, ErrEmbeddingStateChangeWithUnflushedData) {
+		t.Fatalf("SetDefaultEmbedding buffered relabel error = %v", err)
 	}
 }

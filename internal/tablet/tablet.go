@@ -71,6 +71,9 @@ import (
 // against write amplification for bulk ingest workloads.
 const DefaultFlushThreshold = 256_000
 
+var ErrEmbeddingStateChangeWithUnflushedData = errors.New(
+	"tablet: cannot change default embedding state with unflushed data")
+
 type FileFormat string
 
 const (
@@ -204,7 +207,7 @@ func Open(dir string, opts Options) (*Tablet, error) {
 		return nil, err
 	}
 	opts.FileFormat = format
-	if opts.DefaultEmbedding.State != "" {
+	if opts.DefaultEmbedding != (embeddingspace.FileState{}) {
 		if err := opts.DefaultEmbedding.Validate(); err != nil {
 			return nil, fmt.Errorf("tablet: invalid default embedding state: %w", err)
 		}
@@ -976,14 +979,19 @@ func (t *Tablet) SetFileFormat(format FileFormat) error {
 // SetDefaultEmbedding changes the actual embedding state stamped on future
 // flushes. Existing immutable files keep their own self-describing state.
 func (t *Tablet) SetDefaultEmbedding(state embeddingspace.FileState) error {
-	if state.State != "" {
+	if state != (embeddingspace.FileState{}) {
 		if err := state.Validate(); err != nil {
 			return err
 		}
 	}
 	t.mu.Lock()
+	defer t.mu.Unlock()
+	if cells := t.active.Len(); cells > 0 {
+		return fmt.Errorf(
+			"%w: tablet has %d unflushed cells",
+			ErrEmbeddingStateChangeWithUnflushedData, cells)
+	}
 	t.opts.DefaultEmbedding = state
-	t.mu.Unlock()
 	return nil
 }
 

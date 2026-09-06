@@ -214,3 +214,25 @@ func TestOrdinaryWritesShareEmbeddingStateGate(t *testing.T) {
 		t.Fatal("ordinary write waited for a peer read lock")
 	}
 }
+
+func TestTableDefaultEmbeddingRejectsPartialState(t *testing.T) {
+	eng, err := Open(t.TempDir(), Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close()
+	partial := embeddingspace.FileState{Identity: "space-a"}
+	if err := eng.CreateTable("partial", TableOptions{
+		DefaultEmbedding: partial,
+	}); !errors.Is(err, embeddingspace.ErrInvalidState) {
+		t.Fatalf("CreateTable partial state error = %v", err)
+	}
+	if err := eng.CreateTable("valid", TableOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := eng.SetTableDefaultEmbedding(
+		"valid", partial,
+	); !errors.Is(err, embeddingspace.ErrInvalidState) {
+		t.Fatalf("SetTableDefaultEmbedding partial state error = %v", err)
+	}
+}

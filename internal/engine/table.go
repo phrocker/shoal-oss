@@ -176,15 +176,15 @@ func createTable(dir, name string, opts TableOptions, logger *slog.Logger, rfCac
 		return nil, err
 	}
 	opts.TabletOptions.FileFormat = format
-	if opts.DefaultEmbedding.State == "" {
+	if opts.DefaultEmbedding == (embeddingspace.FileState{}) {
 		opts.DefaultEmbedding = opts.TabletOptions.DefaultEmbedding
-	} else if opts.TabletOptions.DefaultEmbedding.State != "" &&
+	} else if opts.TabletOptions.DefaultEmbedding != (embeddingspace.FileState{}) &&
 		opts.TabletOptions.DefaultEmbedding != opts.DefaultEmbedding {
 		return nil, fmt.Errorf(
 			"table: conflicting default embedding states %s and %s",
 			opts.DefaultEmbedding, opts.TabletOptions.DefaultEmbedding)
 	}
-	if opts.DefaultEmbedding.State != "" {
+	if opts.DefaultEmbedding != (embeddingspace.FileState{}) {
 		if err := opts.DefaultEmbedding.Validate(); err != nil {
 			return nil, fmt.Errorf("table: invalid default embedding state: %w", err)
 		}
@@ -387,7 +387,7 @@ func readTableManifest(dir string) (tableManifest, error) {
 		return tableManifest{}, err
 	}
 	manifest.FileFormat = format
-	if manifest.DefaultEmbedding.State != "" {
+	if manifest.DefaultEmbedding != (embeddingspace.FileState{}) {
 		if err := manifest.DefaultEmbedding.Validate(); err != nil {
 			return tableManifest{}, fmt.Errorf(
 				"table: invalid default embedding state: %w", err)
@@ -466,7 +466,7 @@ func (t *table) setFileFormatLocked(format tablet.FileFormat) error {
 }
 
 func (t *table) setDefaultEmbedding(state embeddingspace.FileState) error {
-	if state.State != "" {
+	if state != (embeddingspace.FileState{}) {
 		if err := state.Validate(); err != nil {
 			return err
 		}

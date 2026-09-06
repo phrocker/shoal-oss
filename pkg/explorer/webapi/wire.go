@@ -711,8 +711,13 @@ func embeddingQueryReportValue(
 			ID: id, Status: item.Status,
 		})
 	}
-	if !report.Observed && len(report.Spaces) > 0 {
-		return nil, fmt.Errorf("spaces require observed embedding activity")
+	if !report.Observed &&
+		(len(report.Spaces) > 0 ||
+			report.CacheHits > 0 ||
+			report.ProviderCalls > 0 ||
+			report.FanoutExceeded) {
+		return nil, fmt.Errorf(
+			"embedding activity requires observed embedding activity")
 	}
 	if report.FanoutExceeded && !report.Degraded {
 		return nil, fmt.Errorf("fanout_exceeded requires degraded")

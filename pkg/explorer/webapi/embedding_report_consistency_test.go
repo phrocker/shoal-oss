@@ -53,3 +53,16 @@ func TestRetrievalResponseRejectsEmbeddingDisclosureFlagMismatch(t *testing.T) {
 		})
 	}
 }
+
+func TestEmbeddingReportRejectsActivityWithoutObservation(t *testing.T) {
+	tests := []wireEmbeddingQueryReport{
+		{CacheHits: 1},
+		{ProviderCalls: 1},
+		{FanoutExceeded: true, Degraded: true},
+	}
+	for _, wire := range tests {
+		if _, err := embeddingQueryReportValue(&wire); err == nil {
+			t.Fatalf("unobserved activity accepted: %+v", wire)
+		}
+	}
+}
