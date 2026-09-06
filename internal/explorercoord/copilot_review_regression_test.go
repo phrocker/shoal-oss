@@ -629,6 +629,162 @@ func TestRecordCommittedUsesFullPublicationProof(t *testing.T) {
 	}
 }
 
+func TestReadCommittedCellSupportsMaximumOpaqueRow(t *testing.T) {
+	config := testRuntimeConfig(t, testDirectory(t))
+	runtime, err := Open(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.Close()
+	row := bytes.Repeat([]byte{0xff}, coordination.MaxCoordinateBytes)
+	intent := testIntent(
+		t,
+		config.Domain,
+		"maximum-row",
+		"token",
+		"value",
+		guard.ModeAbsentOrIdentical,
+		0,
+		coordination.Digest{},
+	)
+	intent.Cells[0].Row = row
+	intent.Cells[0].Family = []byte("event")
+	intent.Cells[0].Qualifier = []byte("record")
+	result, err := runtime.Publish(
+		context.Background(),
+		Request{Intent: intent},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cell, found, err := runtime.ReadCommittedCell(
+		context.Background(),
+		"records",
+		row,
+		[]byte("event"),
+		[]byte("record"),
+		nil,
+		result.Epoch,
+	)
+	if err != nil || !found ||
+		!bytes.Equal(cell.Cell.Coordinate.Row, row) ||
+		!bytes.Equal(cell.Cell.Value, []byte("value")) {
+		t.Fatalf("maximum-row committed cell = %#v, %v, %v", cell, found, err)
+	}
+}
+
+func TestCommittedScanRejectsUnauthenticatedCommittedEpochTombstone(t *testing.T) {
+	config := testRuntimeConfig(t, testDirectory(t))
+	runtime, err := Open(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.Close()
+	targetRow := []byte("event/target")
+	first := committedReadIntent(
+		t,
+		config.Domain,
+		"target",
+		targetRow,
+		[]byte("target"),
+		guard.ModeAbsentOrIdentical,
+		0,
+		coordination.Digest{},
+	)
+	if _, err := runtime.Publish(
+		context.Background(),
+		Request{Intent: first},
+	); err != nil {
+		t.Fatal(err)
+	}
+	second := committedReadIntent(
+		t,
+		config.Domain,
+		"other",
+		[]byte("event/other"),
+		[]byte("other"),
+		guard.ModeAbsentOrIdentical,
+		0,
+		coordination.Digest{},
+	)
+	secondResult, err := runtime.Publish(
+		context.Background(),
+		Request{Intent: second},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tombstone, err := cclient.NewMutation(targetRow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tombstone.Delete(
+		[]byte("event"),
+		[]byte("record"),
+		nil,
+		int64(secondResult.Epoch),
+	)
+	if err := runtime.engine.Write(
+		"records",
+		[]*cclient.Mutation{tombstone},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runtime.ScanCommitted(
+		context.Background(),
+		CommittedScanRequest{
+			Table:      "records",
+			RowPrefix:  []byte("event/target"),
+			Family:     []byte("event"),
+			Qualifier:  []byte("record"),
+			Frontier:   secondResult.Epoch,
+			Limit:      1,
+			MaxScanned: 16,
+		},
+	); !errors.Is(err, transaction.ErrInternal) {
+		t.Fatalf("unauthenticated committed-epoch tombstone = %v", err)
+	}
+}
+
+func TestRecordPreflightFailureAfterPersistenceIsIndeterminate(t *testing.T) {
+	config := testRuntimeConfig(t, testDirectory(t))
+	runtime, err := Open(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	faults := &cancelAfterAttemptStore{
+		EngineStore: runtime.store,
+		cancel:      cancel,
+	}
+	runtime.intents.store = faults
+	request := testRecordPublication("document", "revision", "value", nil)
+	if _, err := runtime.PublishRecord(
+		ctx,
+		request,
+	); !errors.Is(err, context.Canceled) ||
+		!explorer.IsIndeterminateCommit(err) {
+		t.Fatalf("post-persistence canceled preflight = %v", err)
+	}
+
+	runtime.intents.store = runtime.store
+	if pending, err := runtime.PendingPublications(
+		context.Background(),
+	); err != nil || !pending {
+		t.Fatalf("pending after canceled preflight = %v, %v", pending, err)
+	}
+	if err := runtime.Recover(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if committed, err := runtime.RecordCommitted(
+		context.Background(),
+		request,
+	); err != nil || !committed {
+		t.Fatalf("recovered canceled preflight = %v, %v", committed, err)
+	}
+}
+
 func TestExplorerLegacyMigrationDoesNotGrandfatherTransactionalResidue(t *testing.T) {
 	directory := testDirectory(t)
 	legacy, err := explorer.Open(directory)
@@ -1312,6 +1468,27 @@ func (s *ambiguousAttemptStore) ReadExact(
 		return nil, errors.New("injected attempt binding readback failure")
 	}
 	return s.EngineStore.ReadExact(ctx, coordinates)
+}
+
+type cancelAfterAttemptStore struct {
+	*EngineStore
+	cancel   context.CancelFunc
+	canceled bool
+}
+
+func (s *cancelAfterAttemptStore) CompareAndMutate(
+	ctx context.Context,
+	mutation allocator.Mutation,
+) (allocator.Status, error) {
+	status, err := s.EngineStore.CompareAndMutate(ctx, mutation)
+	if !s.canceled &&
+		err == nil &&
+		status == allocator.StatusAccepted &&
+		bytes.HasPrefix(mutation.Row, attemptRowMagic) {
+		s.canceled = true
+		s.cancel()
+	}
+	return status, err
 }
 
 func deleteEpochOutcome(

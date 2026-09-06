@@ -458,12 +458,18 @@ func (r *Runtime) PublishRecord(
 	if err != nil {
 		return explorer.RecordPublicationResult{}, transaction.PublicError(err)
 	}
+	txn, err := DeriveTXN(r.domain, intent.Operation, intent.Token)
+	if err != nil {
+		return explorer.RecordPublicationResult{}, transaction.PublicError(err)
+	}
 	if err := r.persistRecordAttempt(ctx, intent, recordKey); err != nil {
 		return explorer.RecordPublicationResult{}, recordPublicationError(err)
 	}
 	result, err := r.publishLocked(ctx, Request{Intent: intent})
 	if err != nil {
-		return explorer.RecordPublicationResult{}, recordPublicationError(err)
+		return explorer.RecordPublicationResult{}, recordPublicationError(
+			r.classifyPersistedPublicationFailure(ctx, txn, err),
+		)
 	}
 	return explorer.RecordPublicationResult{Epoch: result.Epoch, Unchanged: result.Unchanged}, nil
 }
@@ -1206,6 +1212,26 @@ func (r *Runtime) classifyPublishFailure(
 	if inspectErr == nil && snapshot.Root.State.Terminal() &&
 		snapshot.Root.State != coordination.StateCommitted {
 		return err
+	}
+	return errors.Join(ErrIndeterminatePublication, err)
+}
+
+func (r *Runtime) classifyPersistedPublicationFailure(
+	ctx context.Context,
+	txn coordination.TXN,
+	err error,
+) error {
+	if errors.Is(err, ErrIndeterminatePublication) {
+		return err
+	}
+	snapshot, inspectErr := r.coordinator.Inspect(ctx, txn)
+	if inspectErr == nil &&
+		snapshot.Root.State.Terminal() &&
+		snapshot.Root.State != coordination.StateCommitted {
+		return err
+	}
+	if inspectErr != nil && !errors.Is(inspectErr, transaction.ErrNotFound) {
+		return errors.Join(ErrIndeterminatePublication, err, inspectErr)
 	}
 	return errors.Join(ErrIndeterminatePublication, err)
 }

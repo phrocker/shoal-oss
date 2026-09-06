@@ -95,22 +95,91 @@ func (r *Runtime) ReadCommittedCell(
 	if err := epoch.Validate(); err != nil {
 		return CommittedCell{}, false, errors.Join(transaction.ErrInvalid, err)
 	}
-	page, err := r.ScanCommitted(ctx, CommittedScanRequest{
-		Table: table, RowPrefix: append([]byte(nil), row...),
-		Family:     append([]byte(nil), family...),
-		Qualifier:  append([]byte(nil), qualifier...),
-		Visibility: append([]byte(nil), visibility...),
-		Frontier:   epoch, Limit: 1, MaxScanned: MaxCommittedScanCells,
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if r.closed {
+		return CommittedCell{}, false, transaction.ErrUnavailable
+	}
+	if _, allowed := r.physicalTables[table]; !allowed {
+		return CommittedCell{}, false, errors.Join(
+			transaction.ErrInvalid,
+			errors.New("committed read table was not configured for the runtime"),
+		)
+	}
+	if len(row) == 0 || len(row) > coordination.MaxCoordinateBytes ||
+		len(family) == 0 || len(family) > coordination.MaxCoordinateBytes ||
+		len(qualifier) == 0 || len(qualifier) > coordination.MaxCoordinateBytes ||
+		len(visibility) > coordination.MaxCoordinateBytes {
+		return CommittedCell{}, false, errors.Join(
+			transaction.ErrInvalid,
+			errors.New("committed read coordinate is outside its bound"),
+		)
+	}
+	head, err := r.allocator.CurrentHead(ctx)
+	if err != nil {
+		return CommittedCell{}, false, err
+	}
+	if epoch > head.Frontier {
+		return CommittedCell{}, false, errors.Join(
+			transaction.ErrUnavailable,
+			errors.New("requested committed epoch is not available"),
+		)
+	}
+	if epoch < head.HistoryFloor {
+		return CommittedCell{}, false, errors.Join(
+			transaction.ErrConflict,
+			errors.New("requested committed epoch is below the history floor"),
+		)
+	}
+	scanner, err := r.engine.Scan(table, exactRowRange(row), engine.ScanOptions{
+		ColumnFamilies:          [][]byte{append([]byte(nil), family...)},
+		ColumnFamiliesInclusive: true,
 	})
 	if err != nil {
 		return CommittedCell{}, false, err
 	}
-	if len(page.Cells) == 0 ||
-		!bytes.Equal(page.Cells[0].Cell.Coordinate.Row, row) ||
-		page.Cells[0].Epoch != epoch {
+	defer scanner.Close()
+	versions := make([]physicalVersion, 0, 4)
+	scanned := 0
+	for scanner.Next() {
+		if err := ctx.Err(); err != nil {
+			return CommittedCell{}, false, err
+		}
+		scanned++
+		if scanned > MaxCommittedScanCells {
+			return CommittedCell{}, false, errors.Join(
+				transaction.ErrUnavailable,
+				errors.New("committed exact read work limit exhausted"),
+			)
+		}
+		key := scanner.Key()
+		if bytes.Equal(key.Row, row) &&
+			bytes.Equal(key.ColumnFamily, family) &&
+			bytes.Equal(key.ColumnQualifier, qualifier) &&
+			bytes.Equal(key.ColumnVisibility, visibility) {
+			versions = append(versions, physicalVersion{
+				key:   *key.Clone(),
+				value: append([]byte(nil), scanner.Value()...),
+			})
+		}
+		if err := scanner.Advance(); err != nil {
+			return CommittedCell{}, false, err
+		}
+	}
+	cell, found, err := r.selectCommittedVersion(
+		ctx,
+		table,
+		versions,
+		epoch,
+		make(map[coordination.Epoch]publicationProof),
+	)
+	if err != nil {
+		return CommittedCell{}, false, err
+	}
+	if !found || cell.Epoch != epoch {
 		return CommittedCell{}, false, nil
 	}
-	return page.Cells[0], true, nil
+	return cell, true, nil
 }
 
 // Committed reports whether a transaction completed publication, checkpoint,
@@ -370,7 +439,10 @@ func (r *Runtime) selectCommittedVersion(
 					}
 				}
 				if deleted {
-					return CommittedCell{}, false, nil
+					return CommittedCell{}, false, fmt.Errorf(
+						"%w: committed physical cell is shadowed by an unauthenticated tombstone",
+						transaction.ErrInternal,
+					)
 				}
 				version := versions[index]
 				if !planContainsEpochCell(proof.plan, table, epoch, version) {
