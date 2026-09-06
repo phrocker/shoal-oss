@@ -86,6 +86,7 @@ func (r *InteractionRecorder) RecordAnalytics(
 			record.Materialization.PolicyGeneration ||
 		record.Materialization.RequestID == "" ||
 		record.Materialization.AuthorizationExpiresAt.IsZero() ||
+		record.Materialization.Snapshot.ID == "" ||
 		record.Materialization.Snapshot.AsOf.IsZero() {
 		return RecordingReceipt{}, shoal.NewError(
 			shoal.ErrorInternal, "analytics recording pins are inconsistent")
@@ -119,7 +120,6 @@ func (r *InteractionRecorder) RecordAnalytics(
 	sort.Slice(edges, func(i, j int) bool {
 		return shoal.CompareID(edges[i].ID, edges[j].ID) < 0
 	})
-	assertions := analyticsAssertionEvidence(neighborhood.Assertions)
 	if uint32(len(nodeIDs)) != record.Result.Scope.NodeCount ||
 		uint32(len(edges)) != record.Result.Scope.EdgeCount ||
 		!resultCoversNodes(record.Result, nodeIDs) {
@@ -140,28 +140,32 @@ func (r *InteractionRecorder) RecordAnalytics(
 	if err != nil {
 		return RecordingReceipt{}, err
 	}
+	resultID := analyticsResultID(record.Result)
+	evidence, err := analyticsEvidenceReference(
+		resultID, nodeIDs, edges, neighborhood.Assertions)
+	if err != nil {
+		return RecordingReceipt{}, err
+	}
 	session := interaction.Session{
 		ID:           sessionID,
 		RecordedAt:   recordedAt,
 		Operation:    interaction.OperationToolCall,
-		SnapshotID:   shoal.ID(record.Result.Scope.SnapshotID),
+		SnapshotID:   shoal.ID(record.Materialization.Snapshot.ID),
 		SnapshotAsOf: record.Materialization.Snapshot.AsOf,
 		AuthorizationFingerprint: shoal.ID(
 			record.Materialization.AuthorizationFingerprint.String()),
 		AuthorizationExpiresAt: record.Materialization.AuthorizationExpiresAt,
 		RequestID:              record.Materialization.RequestID,
 		QueryDigest:            analyticsRequestDigest(record.Request),
-		ResultID:               analyticsResultID(record.Result),
+		ResultID:               resultID,
 		StopReason:             "completed",
 		SeedNodeIDs:            append([]shoal.ID(nil), record.Request.Scope.NodeIDs...),
 		Turns: []interaction.Turn{{
 			Index: 0, Decision: "completed",
 			ToolCall: &interaction.ToolCall{
-				Kind:                analyticsToolKind,
-				RetrievedNodeIDs:    nodeIDs,
-				RetrievedNodes:      neighborhood.Nodes,
-				RetrievedEdges:      edges,
-				RetrievedAssertions: assertions,
+				Kind:              analyticsToolKind,
+				RetrievedNodeIDs:  nodeIDs,
+				RetrievedEvidence: []interaction.EvidenceReference{evidence},
 			},
 		}},
 		Provenance: interaction.Provenance{
@@ -179,19 +183,21 @@ func (r *InteractionRecorder) RecordAnalytics(
 		return RecordingReceipt{}, err
 	}
 	if persisted.ID != sessionID ||
+		persisted.SnapshotID != session.SnapshotID ||
+		!persisted.SnapshotAsOf.UTC().Equal(session.SnapshotAsOf.UTC()) ||
 		persisted.AuthorizationFingerprint != session.AuthorizationFingerprint ||
 		!persisted.AuthorizationExpiresAt.Equal(session.AuthorizationExpiresAt) ||
 		persisted.RequestID != session.RequestID ||
 		persisted.OntologySchemaID != session.OntologySchemaID ||
 		persisted.OntologyVersionID != session.OntologyVersionID ||
 		persisted.Actor.SubjectID == "" || persisted.Actor.ActorID == "" ||
-		len(persisted.RequiredVisibility) == 0 ||
 		!equalIDs(persisted.TouchedNodeIDs(), nodeIDs) ||
 		!equalIDs(persisted.TouchedEdgeIDs(), edgeIDs(edges)) ||
-		!equalGraphNodes(recordedSourceNodes(persisted), neighborhood.Nodes) ||
-		!equalGraphEdges(recordedSourceEdges(persisted), edges) ||
-		!equalAssertionEvidence(
-			recordedAssertionEvidence(persisted), assertions) {
+		!equalAssertionReferences(
+			persisted.TouchedAssertions(), evidence.Assertions) ||
+		!equalEvidenceReferences(
+			recordedEvidenceReferences(persisted),
+			[]interaction.EvidenceReference{evidence}) {
 		return RecordingReceipt{}, explorer.MarkIndeterminateCommit(
 			shoal.NewError(
 				shoal.ErrorInternal,
@@ -234,81 +240,99 @@ func validateAnalyticsEvidenceBytes(
 		}
 	}
 	for _, assertion := range neighborhood.Assertions {
-		if err := add(InteractionAssertionEvidence(assertion)); err != nil {
+		if err := add(assertion); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func analyticsAssertionEvidence(
+func analyticsEvidenceReference(
+	anchorID shoal.ID,
+	nodeIDs []shoal.ID,
+	edges []graph.Edge,
 	assertions []ontology.Assertion,
-) []interaction.AssertionEvidence {
-	if len(assertions) == 0 {
-		return nil
-	}
-	result := make([]interaction.AssertionEvidence, 0, len(assertions))
+) (interaction.EvidenceReference, error) {
+	references := make([]interaction.AssertionReference, 0, len(assertions))
 	for _, assertion := range assertions {
-		result = append(result, InteractionAssertionEvidence(assertion))
+		reference, err := InteractionAssertionEvidence(assertion)
+		if err != nil {
+			return interaction.EvidenceReference{}, err
+		}
+		references = append(references, reference)
 	}
-	return result
+	return (interaction.EvidenceReference{
+		AnchorID:   anchorID,
+		Kind:       interaction.EvidenceGraph,
+		NodeIDs:    append([]shoal.ID(nil), nodeIDs...),
+		EdgeIDs:    edgeIDs(edges),
+		Assertions: references,
+	}).Canonical()
 }
 
 // InteractionAssertionEvidence projects an ontology assertion into the exact
 // durable evidence representation used by analytics interaction records.
 func InteractionAssertionEvidence(
 	assertion ontology.Assertion,
-) interaction.AssertionEvidence {
-	target, _ := assertion.Object().ReferenceValue()
-	evidence := interaction.AssertionEvidence{
-		ID: assertion.ID(), Subject: assertion.Subject(),
-		Predicate: assertion.Predicate(), ObjectReference: target,
-		Origin: string(assertion.Origin()), Confidence: assertion.Confidence(),
-		GraphEdgeID: shoal.ID(
-			assertion.Metadata()[graphAssertionEdgeIDMetadata]),
+) (interaction.AssertionReference, error) {
+	edgeID := shoal.ID(assertion.Metadata()[graphAssertionEdgeIDMetadata])
+	if edgeID == "" {
+		return interaction.AssertionReference{}, shoal.NewError(
+			shoal.ErrorInternal,
+			"analytics assertion is not bound to an exact graph edge",
+		)
 	}
-	for _, item := range assertion.Evidence() {
-		if derivation, ok := item.Derivation(); ok {
-			evidence.DerivationID = derivation.ID()
-			evidence.DerivationScore = derivation.Score()
-			break
-		}
-	}
-	return evidence
+	return interaction.AssertionReference{
+		AssertionID: assertion.ID(),
+		EdgeID:      edgeID,
+		Origin:      assertion.Origin(),
+	}, nil
 }
 
-func recordedAssertionEvidence(
+func recordedEvidenceReferences(
 	session interaction.Session,
-) []interaction.AssertionEvidence {
-	var assertions []interaction.AssertionEvidence
+) []interaction.EvidenceReference {
+	var references []interaction.EvidenceReference
 	for _, turn := range session.Turns {
 		if turn.ToolCall != nil {
-			assertions = append(
-				assertions, turn.ToolCall.RetrievedAssertions...)
+			references = append(
+				references, turn.ToolCall.RetrievedEvidence...)
 		}
 	}
-	sort.Slice(assertions, func(i, j int) bool {
-		return shoal.CompareID(assertions[i].ID, assertions[j].ID) < 0
-	})
-	return assertions
+	return references
 }
 
-func equalAssertionEvidence(
-	left, right []interaction.AssertionEvidence,
+func equalEvidenceReferences(
+	left, right []interaction.EvidenceReference,
 ) bool {
 	if len(left) != len(right) {
 		return false
 	}
-	left = append([]interaction.AssertionEvidence(nil), left...)
-	right = append([]interaction.AssertionEvidence(nil), right...)
-	sort.Slice(left, func(i, j int) bool {
-		return shoal.CompareID(left[i].ID, left[j].ID) < 0
-	})
-	sort.Slice(right, func(i, j int) bool {
-		return shoal.CompareID(right[i].ID, right[j].ID) < 0
-	})
 	for index := range left {
-		if !interaction.AssertionEvidenceEqual(left[index], right[index]) {
+		leftCanonical, leftErr := left[index].Canonical()
+		rightCanonical, rightErr := right[index].Canonical()
+		if leftErr != nil || rightErr != nil ||
+			!equalIDs(leftCanonical.NodeIDs, rightCanonical.NodeIDs) ||
+			!equalIDs(leftCanonical.EdgeIDs, rightCanonical.EdgeIDs) ||
+			leftCanonical.AnchorID != rightCanonical.AnchorID ||
+			leftCanonical.Kind != rightCanonical.Kind ||
+			leftCanonical.Citation != rightCanonical.Citation ||
+			!equalAssertionReferences(
+				leftCanonical.Assertions, rightCanonical.Assertions) {
+			return false
+		}
+	}
+	return true
+}
+
+func equalAssertionReferences(
+	left, right []interaction.AssertionReference,
+) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
 			return false
 		}
 	}
@@ -345,90 +369,6 @@ func edgeIDs(edges []graph.Edge) []shoal.ID {
 		ids[index] = edge.ID
 	}
 	return ids
-}
-
-func recordedSourceNodes(session interaction.Session) []graph.Node {
-	var nodes []graph.Node
-	for _, turn := range session.Turns {
-		if turn.ToolCall != nil {
-			nodes = append(nodes, turn.ToolCall.RetrievedNodes...)
-		}
-	}
-	sort.Slice(nodes, func(i, j int) bool {
-		return shoal.CompareID(nodes[i].ID, nodes[j].ID) < 0
-	})
-	return nodes
-}
-
-func recordedSourceEdges(session interaction.Session) []graph.Edge {
-	edges := append([]graph.Edge(nil), session.CitedEdges...)
-	for _, turn := range session.Turns {
-		if turn.ToolCall != nil {
-			edges = append(edges, turn.ToolCall.RetrievedEdges...)
-		}
-	}
-	sort.Slice(edges, func(i, j int) bool {
-		return shoal.CompareID(edges[i].ID, edges[j].ID) < 0
-	})
-	return edges
-}
-
-func equalGraphNodes(left, right []graph.Node) bool {
-	if len(left) != len(right) {
-		return false
-	}
-	left = append([]graph.Node(nil), left...)
-	right = append([]graph.Node(nil), right...)
-	sort.Slice(left, func(i, j int) bool {
-		return shoal.CompareID(left[i].ID, left[j].ID) < 0
-	})
-	sort.Slice(right, func(i, j int) bool {
-		return shoal.CompareID(right[i].ID, right[j].ID) < 0
-	})
-	for index := range left {
-		if left[index].ID != right[index].ID ||
-			left[index].Kind != right[index].Kind ||
-			len(left[index].Labels) != len(right[index].Labels) ||
-			len(left[index].Properties) != len(right[index].Properties) {
-			return false
-		}
-		for labelIndex := range left[index].Labels {
-			if left[index].Labels[labelIndex] != right[index].Labels[labelIndex] {
-				return false
-			}
-		}
-		for key, value := range left[index].Properties {
-			other, ok := right[index].Properties[key]
-			if !ok || other != value {
-				return false
-			}
-		}
-	}
-	return true
-}
-
-func equalGraphEdges(left, right []graph.Edge) bool {
-	if len(left) != len(right) {
-		return false
-	}
-	for index := range left {
-		if left[index].ID != right[index].ID ||
-			left[index].From != right[index].From ||
-			left[index].To != right[index].To ||
-			left[index].Type != right[index].Type ||
-			math.Float64bits(float64(left[index].Weight)) !=
-				math.Float64bits(float64(right[index].Weight)) ||
-			len(left[index].Properties) != len(right[index].Properties) {
-			return false
-		}
-		for key, value := range left[index].Properties {
-			other, ok := right[index].Properties[key]
-			if !ok || other != value {
-				return false
-			}
-		}
-	}
-	return true
 }
 
 func analyticsRequestDigest(request Request) string {

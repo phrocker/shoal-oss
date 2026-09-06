@@ -36,7 +36,6 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/graph"
-	"github.com/phrocker/shoal-oss/pkg/interaction"
 	"github.com/phrocker/shoal-oss/pkg/ontology"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
@@ -1088,26 +1087,38 @@ func authorizedScopeSnapshotID(
 		writeUint64(&encoded, math.Float64bits(float64(edge.Weight)))
 		writeMetadata(&encoded, edge.Properties)
 	}
-	assertions := make(
-		[]interaction.AssertionEvidence, len(neighborhood.Assertions))
-	for index, assertion := range neighborhood.Assertions {
-		assertions[index] = InteractionAssertionEvidence(assertion)
-	}
+	assertions := append(
+		[]ontology.Assertion(nil), neighborhood.Assertions...)
 	sort.Slice(assertions, func(i, j int) bool {
-		return shoal.CompareID(assertions[i].ID, assertions[j].ID) < 0
+		return shoal.CompareID(assertions[i].ID(), assertions[j].ID()) < 0
 	})
 	writeUint64(&encoded, uint64(len(assertions)))
 	for _, assertion := range assertions {
 		writeText(&encoded, "assertion")
-		writeBytes(&encoded, []byte(assertion.ID))
-		writeBytes(&encoded, []byte(assertion.Subject))
-		writeBytes(&encoded, []byte(assertion.Predicate))
-		writeBytes(&encoded, []byte(assertion.ObjectReference))
-		writeText(&encoded, assertion.Origin)
-		writeUint64(&encoded, math.Float64bits(float64(assertion.Confidence)))
-		writeBytes(&encoded, []byte(assertion.GraphEdgeID))
-		writeBytes(&encoded, []byte(assertion.DerivationID))
-		writeUint64(&encoded, math.Float64bits(float64(assertion.DerivationScore)))
+		writeBytes(&encoded, []byte(assertion.ID()))
+		writeBytes(&encoded, []byte(assertion.Subject()))
+		writeBytes(&encoded, []byte(assertion.Predicate()))
+		target, _ := assertion.Object().ReferenceValue()
+		writeBytes(&encoded, []byte(target))
+		writeText(&encoded, string(assertion.Origin()))
+		writeUint64(
+			&encoded, math.Float64bits(float64(assertion.Confidence())))
+		writeBytes(
+			&encoded,
+			[]byte(assertion.Metadata()[graphAssertionEdgeIDMetadata]),
+		)
+		var derivationID shoal.ID
+		var derivationScore shoal.Score
+		for _, item := range assertion.Evidence() {
+			if derivation, ok := item.Derivation(); ok {
+				derivationID = derivation.ID()
+				derivationScore = derivation.Score()
+				break
+			}
+		}
+		writeBytes(&encoded, []byte(derivationID))
+		writeUint64(
+			&encoded, math.Float64bits(float64(derivationScore)))
 	}
 	interpretations := append(
 		[]ontology.AssertionInterpretation(nil), neighborhood.Interpretations...)
