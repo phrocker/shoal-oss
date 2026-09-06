@@ -64,6 +64,7 @@ type Config struct {
 	RecoveryRounds        int
 	RecoveryBackoff       time.Duration
 	RecoveryMaxPages      int
+	ContentionWait        time.Duration
 	DisableRecoveryOnOpen bool
 	testStageHook         func(recoveryStage) error
 }
@@ -111,6 +112,7 @@ type Runtime struct {
 	recoveryConcurrency int
 	recoveryRounds      int
 	recoveryBackoff     time.Duration
+	contentionWait      time.Duration
 	intentCursor        []byte
 }
 
@@ -189,6 +191,12 @@ func Open(config Config) (*Runtime, error) {
 	}
 	if config.RecoveryMaxPages < 1 {
 		return nil, errors.Join(transaction.ErrInvalid, errors.New("recovery page bound is invalid"))
+	}
+	if config.ContentionWait == 0 {
+		config.ContentionWait = 2 * time.Second
+	}
+	if config.ContentionWait < 0 || config.ContentionWait > time.Minute {
+		return nil, errors.Join(transaction.ErrInvalid, errors.New("contention wait is outside its bound"))
 	}
 	if err := os.MkdirAll(config.Directory, 0o755); err != nil {
 		return nil, fmt.Errorf("explorer coordination: create runtime directory: %w", err)
@@ -287,6 +295,7 @@ func Open(config Config) (*Runtime, error) {
 		lease: config.Lease, clock: config.Clock, recoveryLimit: config.RecoveryLimit,
 		recoveryPages: config.RecoveryMaxPages, recoveryConcurrency: config.RecoveryConcurrency,
 		recoveryRounds: config.RecoveryRounds, recoveryBackoff: config.RecoveryBackoff,
+		contentionWait: config.ContentionWait,
 	}
 	if err := runtime.compose(config, physicalWriter); err != nil {
 		return closeOnError(err)
@@ -371,10 +380,21 @@ func (r *Runtime) publishLocked(
 			return Result{}, errors.Join(ErrIndeterminatePublication, err)
 		}
 	}
-	result, err := r.coordinator.Publish(ctx, transaction.Publication{
+	publication := transaction.Publication{
 		TXN: record.TXN, Token: record.Intent.Token, LogicalDigest: record.LogicalDigest,
 		Owner: owner, LeaseUntil: leaseUntil, Authority: cloneAuthority(r.authority),
-	})
+	}
+	result, err := r.coordinator.Publish(ctx, publication)
+	if err != nil && errors.Is(err, transaction.ErrUnavailable) {
+		advanced, available, checkErr := r.waitForExpectedResolution(
+			ctx, record.TXN, record.Intent,
+		)
+		if checkErr != nil {
+			err = errors.Join(err, checkErr)
+		} else if advanced || available {
+			result, err = r.coordinator.Publish(ctx, publication)
+		}
+	}
 	if err != nil {
 		classified := r.classifyPublishFailure(ctx, record.TXN, err)
 		if !errors.Is(classified, ErrIndeterminatePublication) {
@@ -769,6 +789,13 @@ func (r *Runtime) recoverIntent(ctx context.Context, txn coordination.TXN) error
 		return inspectErr
 	}
 	if err != nil {
+		if errors.Is(err, transaction.ErrConflict) {
+			snapshot, inspectErr := r.coordinator.Inspect(ctx, txn)
+			if inspectErr == nil && snapshot.Root.State.Terminal() &&
+				snapshot.Root.State != coordination.StateCommitted {
+				return r.intents.Settle(ctx, txn, record.LogicalDigest)
+			}
+		}
 		return err
 	}
 	if err := r.intents.Complete(
@@ -797,6 +824,62 @@ func (r *Runtime) recoverPending(
 		}
 	}
 	return transaction.ErrUnavailable
+}
+
+func (r *Runtime) waitForExpectedResolution(
+	ctx context.Context,
+	txn coordination.TXN,
+	intent Intent,
+) (advanced bool, available bool, err error) {
+	if r.contentionWait == 0 {
+		return false, false, nil
+	}
+	timeout := time.NewTimer(r.contentionWait)
+	defer timeout.Stop()
+	ticker := time.NewTicker(5 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		advanced, available, err = r.expectedHeadResolution(ctx, txn, intent)
+		if err != nil || advanced || available {
+			return advanced, available, err
+		}
+		select {
+		case <-ctx.Done():
+			return false, false, ctx.Err()
+		case <-timeout.C:
+			return false, false, nil
+		case <-ticker.C:
+		}
+	}
+}
+
+func (r *Runtime) expectedHeadResolution(
+	ctx context.Context,
+	txn coordination.TXN,
+	intent Intent,
+) (advanced bool, available bool, err error) {
+	foundExpected := false
+	busy := false
+	for _, expected := range intent.Guards {
+		if expected.Mode != guard.ModeMutate &&
+			expected.Mode != guard.ModeRetire {
+			continue
+		}
+		foundExpected = true
+		head, pending, err := r.guards.Read(ctx, expected.Entity)
+		if err != nil {
+			return false, false, err
+		}
+		if head == nil || head.Epoch != expected.ExpectedEpoch ||
+			head.LogicalDigest != expected.ExpectedDigest {
+			return true, false, nil
+		}
+		if pending != nil && pending.Active &&
+			!bytes.Equal(pending.Intent.TXN, txn) {
+			busy = true
+		}
+	}
+	return false, foundExpected && !busy, nil
 }
 
 func (r *Runtime) classifyPublishFailure(

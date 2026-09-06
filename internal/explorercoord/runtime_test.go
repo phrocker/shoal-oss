@@ -45,7 +45,6 @@ func TestRuntimePublishesRetriesAndRejectsConcurrentDivergence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer runtime.Close()
 
 	base := testIntent(t, config.Domain, "create", "base", "v1", guard.ModeAbsentOrIdentical, 0, coordination.Digest{})
 	baseResult, err := runtime.Publish(context.Background(), Request{Intent: base})
@@ -83,6 +82,7 @@ func TestRuntimePublishesRetriesAndRejectsConcurrentDivergence(t *testing.T) {
 	close(outcomes)
 	successes := 0
 	var loser Intent
+	var loserErr error
 	for outcome := range outcomes {
 		if outcome.err == nil {
 			successes++
@@ -93,9 +93,14 @@ func TestRuntimePublishesRetriesAndRejectsConcurrentDivergence(t *testing.T) {
 		} else {
 			loser = right
 		}
+		loserErr = outcome.err
 	}
 	if successes != 1 {
 		t.Fatalf("concurrent successful updates = %d, want 1", successes)
+	}
+	if !errors.Is(loserErr, transaction.ErrConflict) ||
+		errors.Is(loserErr, ErrIndeterminatePublication) {
+		t.Fatalf("concurrent losing update = %v", loserErr)
 	}
 	if _, err := runtime.Publish(context.Background(), Request{Intent: loser}); !errors.Is(err, transaction.ErrConflict) {
 		t.Fatalf("losing expected-value update = %v", err)
@@ -107,6 +112,14 @@ func TestRuntimePublishesRetriesAndRejectsConcurrentDivergence(t *testing.T) {
 		(pending != nil && pending.Active) {
 		t.Fatalf("winning entity state = head %#v pending %#v err %v", head, pending, err)
 	}
+	if err := runtime.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(config)
+	if err != nil {
+		t.Fatalf("reopen after guard conflict = %v", err)
+	}
+	defer reopened.Close()
 }
 
 func TestIntentStoreCanonicalReplayPagingAndDigestMutation(t *testing.T) {
