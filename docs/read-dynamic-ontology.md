@@ -65,6 +65,9 @@ selection are intentionally tracked separately and are not claimed here.
   dependency. Proposal state, evidence references, and canonical citation
   bytes used by authorization are never accepted from the untrusted graph
   `Base`.
+- Citation-backed governance evidence may omit its quote. A supplied quote
+  must exactly match the cited immutable source bytes; omitting it never
+  skips citation validation or source authorization.
 - `explorer.OntologyProposalMutationStateProvider` exposes only the active
   ontology and a requested proposal's base identity to ingest-authorized
   mutation preflight. Mutation callers do not receive the governed proposal

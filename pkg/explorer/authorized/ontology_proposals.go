@@ -378,7 +378,7 @@ func (c *Client) ontologyEvidenceAllows(
 		}
 		return false, directBaseError(err)
 	}
-	if quote != evidence.Quote() {
+	if evidence.Quote() != "" && quote != evidence.Quote() {
 		return false, nil
 	}
 	path, hasPath := evidence.Path()
