@@ -50,7 +50,7 @@ func TestExtractionRejectsReservedInteractionNamespaces(t *testing.T) {
 	withEdge := base
 	withEdge.Nodes = []graph.Node{{ID: "ordinary-node", Kind: "entity"}}
 	withEdge.Edges = []graph.Edge{{
-		ID: interaction.DerivedID("edge", "squat"),
+		ID:   interaction.DerivedID("edge", "squat"),
 		From: base.DocumentID, To: "ordinary-node", Type: "related",
 	}}
 	if err := validatePersistedExtraction(withEdge); err == nil {

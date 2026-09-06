@@ -86,22 +86,16 @@ func (c *Client) recordInteraction(
 	if !interactionPinMatchesDecision(canonical, decision, now) {
 		return interaction.Session{}, authorizationDenied()
 	}
-	if isNilDependency(c.snapshotSource) {
+	if isNilDependency(c.snapshotValidator) {
 		return interaction.Session{}, shoal.NewError(
 			shoal.ErrorUnavailable,
-			"trusted interaction snapshot reader is unavailable",
+			"trusted interaction snapshot validator is unavailable",
 		)
 	}
-	snapshot, err := c.snapshotSource.Snapshot(ctx)
-	if err != nil {
+	if err := c.snapshotValidator.ValidateSnapshot(
+		ctx, canonical.SnapshotID, canonical.SnapshotAsOf,
+	); err != nil {
 		return interaction.Session{}, directBaseError(err)
-	}
-	if canonical.SnapshotID != shoal.ID(snapshot.ID) ||
-		!canonical.SnapshotAsOf.UTC().Equal(snapshot.AsOf.UTC()) {
-		return interaction.Session{}, shoal.NewError(
-			shoal.ErrorConflict,
-			"interaction observed snapshot is no longer current",
-		)
 	}
 	canonical.Actor = interaction.ActorContext{
 		SubjectID:  decision.Subject(),

@@ -34,10 +34,9 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
-// SnapshotReader is the trusted source of the corpus frontier pinned into an
-// interaction record.
-type SnapshotReader interface {
-	Snapshot(context.Context) (explorer.Snapshot, error)
+// SnapshotValidator verifies corpus frontiers pinned into interaction records.
+type SnapshotValidator interface {
+	ValidateSnapshot(context.Context, shoal.ID, time.Time) error
 }
 
 // Config supplies the trusted dependencies for an authorization-enforcing
@@ -57,9 +56,9 @@ type Config struct {
 	// authorization decisions for derived views depend on the stored source
 	// set and authorization fingerprint.
 	InteractionReader explorer.InteractionReader
-	// SnapshotReader is the explicitly trusted source for the corpus frontier
-	// pinned into an interaction record.
-	SnapshotReader     SnapshotReader
+	// SnapshotValidator is the explicitly trusted verifier for historical
+	// corpus frontiers pinned into interaction records.
+	SnapshotValidator  SnapshotValidator
 	Resolver           auth.Resolver
 	PolicySelector     PolicySelector
 	EdgePolicySelector EdgePolicySelector
@@ -80,7 +79,7 @@ type Client struct {
 	vectorScorer       VectorScorer
 	interactionSink    explorer.InteractionWriter
 	interactionSource  explorer.InteractionReader
-	snapshotSource     SnapshotReader
+	snapshotValidator  SnapshotValidator
 	resolver           auth.Resolver
 	policySelector     PolicySelector
 	edgePolicySelector EdgePolicySelector
@@ -123,10 +122,10 @@ func NewClient(config Config) (*Client, error) {
 		return nil, dependencyRequired("clock")
 	}
 	hasInteractionWriter := !isNilDependency(config.InteractionWriter)
-	hasSnapshotReader := !isNilDependency(config.SnapshotReader)
-	if hasInteractionWriter != hasSnapshotReader {
+	hasSnapshotValidator := !isNilDependency(config.SnapshotValidator)
+	if hasInteractionWriter != hasSnapshotValidator {
 		return nil, dependencyRequired(
-			"trusted interaction writer and snapshot reader")
+			"trusted interaction writer and snapshot validator")
 	}
 	edgeSelector := config.EdgePolicySelector
 	if isNilDependency(edgeSelector) {
@@ -152,7 +151,7 @@ func NewClient(config Config) (*Client, error) {
 		vectorScorer:       config.VectorScorer,
 		interactionSink:    config.InteractionWriter,
 		interactionSource:  config.InteractionReader,
-		snapshotSource:     config.SnapshotReader,
+		snapshotValidator:  config.SnapshotValidator,
 		resolver:           config.Resolver,
 		policySelector:     config.PolicySelector,
 		edgePolicySelector: edgeSelector,

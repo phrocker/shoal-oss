@@ -24,6 +24,7 @@ import (
 	"encoding/hex"
 	"math"
 	"sort"
+	"time"
 
 	"github.com/phrocker/shoal-oss/pkg/graph"
 	"github.com/phrocker/shoal-oss/pkg/interaction"
@@ -45,6 +46,38 @@ func (e *Explorer) Snapshot(ctx context.Context) (Snapshot, error) {
 		return Snapshot{}, err
 	}
 	return e.snapshot, nil
+}
+
+// ValidateSnapshot verifies that a snapshot pin names a genuine corpus
+// frontier observed from this Explorer instance. Historical frontiers remain
+// valid after unrelated content publications during the process lifetime.
+func (e *Explorer) ValidateSnapshot(
+	ctx context.Context, id shoal.ID, asOf time.Time,
+) error {
+	if err := contextError(ctx); err != nil {
+		return err
+	}
+	if err := shoal.ValidateRequiredID("snapshot ID", id); err != nil {
+		return err
+	}
+	if asOf.IsZero() {
+		return shoal.NewError(
+			shoal.ErrorInvalidArgument, "snapshot time is required")
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if err := e.requireOpen(); err != nil {
+		return err
+	}
+	if err := e.ensureGraphLocked(); err != nil {
+		return err
+	}
+	observedAt, ok := e.snapshotHistory[string(id)]
+	if !ok || !observedAt.Equal(asOf.UTC()) {
+		return shoal.NewError(
+			shoal.ErrorConflict, "snapshot pin is not a trusted corpus frontier")
+	}
+	return nil
 }
 
 // BoundedNeighborhood expands the cached adjacency index without scanning or

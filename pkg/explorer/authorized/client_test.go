@@ -162,7 +162,7 @@ func (f *fixture) newClient(
 		VectorScorer:       trustedVectorScorer(base),
 		InteractionWriter:  trustedInteractionWriter(base),
 		InteractionReader:  trustedInteractionReader(base),
-		SnapshotReader:     trustedSnapshotReader(base),
+		SnapshotValidator:  trustedSnapshotValidator(base),
 		Resolver:           f.authority.Resolver(),
 		PolicySelector:     selector,
 		EdgePolicySelector: edgeSelector,
@@ -191,9 +191,9 @@ func trustedInteractionWriter(base explorer.Client) explorer.InteractionWriter {
 	return writer
 }
 
-func trustedSnapshotReader(base explorer.Client) authorized.SnapshotReader {
-	reader, _ := base.(authorized.SnapshotReader)
-	return reader
+func trustedSnapshotValidator(base explorer.Client) authorized.SnapshotValidator {
+	validator, _ := base.(authorized.SnapshotValidator)
+	return validator
 }
 
 func (f *fixture) decision(

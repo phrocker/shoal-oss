@@ -71,6 +71,7 @@ type Explorer struct {
 	vectorProbeMu           sync.Mutex
 	vectorAvailability      vectorAvailabilityCache
 	snapshot                Snapshot
+	snapshotHistory         map[string]time.Time
 	snapshotAnchor          time.Time
 	lastPublicationSequence uint64
 	changeHistoryFloor      uint64
@@ -216,6 +217,7 @@ func OpenWithOptions(dir string, options Options) (*Explorer, error) {
 		recallEvidence:          cloneStringMap(options.RecallEvidence),
 		latentLinkProjection:    latentProjection,
 		maxLatentAssertions:     maxLatentAssertions,
+		snapshotHistory:         make(map[string]time.Time),
 		readOnly:                options.ReadOnly,
 	}
 	explorer.interactionRecordWriter = explorer.writeRecord
@@ -957,6 +959,7 @@ func (e *Explorer) rebuildCurrentGraphLocked() error {
 	e.graphErr = nil
 	e.graphInitialized = true
 	e.refreshSnapshotLocked()
+	e.snapshotHistory[e.snapshot.ID] = e.snapshot.AsOf
 	return nil
 }
 

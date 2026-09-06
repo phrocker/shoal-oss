@@ -401,6 +401,64 @@ func TestAuthorizedInteractionRecorderRejectsWrongPin(t *testing.T) {
 	}
 }
 
+func TestAuthorizedInteractionAcceptsTrustedHistoricalSnapshot(t *testing.T) {
+	f := newFixture(t)
+	receipt, err := f.clientA.Ingest(f.admin(t), explorer.Source{
+		URI:       "file:///historical-interaction.txt",
+		MediaType: explorer.MediaTypeText,
+		Content:   "historical interaction evidence",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := f.base.Snapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	view, err := f.clientA.Document(
+		f.alice(t), receipt.Document.ID, receipt.Revision.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.clientA.Ingest(f.admin(t), explorer.Source{
+		URI:       "file:///unrelated-later.txt",
+		MediaType: explorer.MediaTypeText,
+		Content:   "unrelated later publication",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	current, err := f.base.Snapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.ID == snapshot.ID {
+		t.Fatal("unrelated publication did not advance the snapshot")
+	}
+	f.clock.Set(snapshot.AsOf.Add(time.Second))
+	decision := f.decision(
+		t, "historical-recorder",
+		[][]byte{f.sourceA}, [][]byte{f.policyA},
+		[]auth.Operation{auth.OperationRetrieve},
+	)
+	fingerprint, err := auth.AuthorizationFingerprint(decision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := interaction.Session{
+		ID:         interaction.DerivedID("session", "historical-snapshot"),
+		RecordedAt: f.clock.Now(), Operation: interaction.OperationRetrieval,
+		SnapshotID: shoal.ID(snapshot.ID), SnapshotAsOf: snapshot.AsOf,
+		AuthorizationFingerprint: shoal.ID(fingerprint.String()),
+		AuthorizationExpiresAt:   decision.AuthenticationExpires(),
+		SeedNodeIDs:              []shoal.ID{firstSpanID(t, view)},
+	}
+	if err := f.clientA.RecordInteraction(
+		f.context(t, decision), session,
+	); err != nil {
+		t.Fatalf("trusted historical snapshot was rejected: %v", err)
+	}
+}
+
 func TestAuthorizedTombstoneSubgraphDoesNotLeakExistence(t *testing.T) {
 	f := newFixture(t)
 	receipt, err := f.clientA.Ingest(f.admin(t), explorer.Source{
