@@ -128,6 +128,19 @@ type reviewCeilingResolver struct {
 	after   func()
 }
 
+type roleCeilingResolver map[auth.ServiceRole]auth.ServiceCeiling
+
+func (r roleCeilingResolver) ResolveServiceCeiling(
+	_ context.Context,
+	decision auth.Decision,
+) (auth.ServiceCeiling, error) {
+	ceiling, ok := r[decision.ServiceRole()]
+	if !ok {
+		return auth.ServiceCeiling{}, authDenied()
+	}
+	return ceiling, nil
+}
+
 func (r reviewCeilingResolver) ResolveServiceCeiling(
 	context.Context,
 	auth.Decision,
@@ -414,6 +427,100 @@ func TestReviewSettingsRecheckAfterOntologyAndCeilingCalls(t *testing.T) {
 			t.Fatalf("ceiling-expired update persisted: %v", err)
 		}
 	})
+}
+
+func TestReviewServiceWriterOutputPolicyIsConsumerNeutral(t *testing.T) {
+	writer := testDecision(t, decisionOptions{
+		serviceRole: auth.ServiceRoleWorkspaceSettingsWrite,
+		ceilingID:   "writer-ceiling",
+		operations: []auth.Operation{
+			auth.OperationWorkspaceSettingsWrite,
+		},
+	})
+	reader := testDecision(t, decisionOptions{
+		serviceRole: auth.ServiceRoleWorkspaceSettingsRead,
+		ceilingID:   "reader-ceiling",
+		operations: []auth.Operation{
+			auth.OperationWorkspaceSettingsRead,
+		},
+	})
+	writerCeiling := serviceCeilingForDecision(
+		t, writer, "source-a", "policy-a", 1)
+	readerCeiling := serviceCeilingForDecision(
+		t, reader, "source-a", "policy-a", 1)
+	store, err := OpenDurableStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	resolver := &mutableResolver{decision: writer}
+	provider, err := NewProvider(store, ProviderOptions{
+		Resolver:         resolver,
+		GenerationReader: testGenerationReader{generation: 7},
+		CeilingResolver: roleCeilingResolver{
+			auth.ServiceRoleWorkspaceSettingsWrite: writerCeiling,
+			auth.ServiceRoleWorkspaceSettingsRead:  readerCeiling,
+		},
+		Clock: func() time.Time { return testNow },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err := provider.Update(
+		context.Background(), "service-output",
+		UpdateRequest{
+			MutationID: "writer",
+			Narrowing: UpdateNarrowing{
+				OutputPolicies: []OutputPolicySpec{{
+					SourceID:      []byte("source-a"),
+					GrantPolicyID: []byte("policy-a"),
+					Epoch:         1,
+				}},
+			},
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(created.Narrowing.OutputPolicies) != 1 ||
+		created.Narrowing.OutputPolicies[0].ServiceRole() != "" {
+		t.Fatalf("persisted output policy role = %q",
+			created.Narrowing.OutputPolicies[0].ServiceRole())
+	}
+	resolver.set(reader)
+	effective, err := provider.Apply(
+		context.Background(), "service-output", MaximumLimits(), nil)
+	if err != nil {
+		t.Fatalf("reader apply: %v", err)
+	}
+	if len(effective.OutputPolicies()) != 1 ||
+		effective.OutputPolicies()[0].ServiceRole() != "" {
+		t.Fatalf("effective output policies = %#v", effective.OutputPolicies())
+	}
+}
+
+func serviceCeilingForDecision(
+	t *testing.T,
+	decision auth.Decision,
+	source, policy string,
+	epoch int64,
+) auth.ServiceCeiling {
+	t.Helper()
+	servicePolicy := testPolicy(t, decision, source, policy, epoch)
+	visibility, err := servicePolicy.Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ceiling, err := auth.NewServiceCeiling(auth.ServiceCeilingConfig{
+		Identity: decision.ServiceCeilingIdentity(),
+		Role:     decision.ServiceRole(),
+		Authorizations: accumulo.NewAuthorizations(
+			bytes.Split(visibility, []byte("&"))...),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ceiling
 }
 
 func TestReviewSettingsPostCommitExpiryReturnsResultAndIndeterminate(t *testing.T) {
