@@ -31,6 +31,7 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/graph"
 	"github.com/phrocker/shoal-oss/pkg/inference"
+	"github.com/phrocker/shoal-oss/pkg/ontology"
 	"github.com/phrocker/shoal-oss/pkg/retrieval"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
@@ -430,6 +431,88 @@ func TestGraphAnchorsFromNeighborhoodKeepsMultiHopPaths(t *testing.T) {
 	path, ok := anchors[1].Path()
 	if !ok || len(path.Edges) != 2 || path.Nodes[0].ID != "node-a" || path.Nodes[2].ID != "node-c" {
 		t.Fatalf("multi-hop path omitted: %#v", path)
+	}
+}
+
+func TestGraphAnchorsFromNeighborhoodPreservesAuthoritativeAssertions(
+	t *testing.T,
+) {
+	evidence, err := ontology.NewEvidenceRef(
+		document.Citation{
+			DocumentID: "document-1", RevisionID: "revision-1",
+			SectionID: "section-1", SpanID: "span-1",
+			Range: document.SourceRange{
+				Start: document.SourcePosition{Offset: 0, Page: 1},
+				End:   document.SourcePosition{Offset: 7, Page: 1},
+			},
+		},
+		"node-a",
+		nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	provenance, err := ontology.NewExtractionProvenance(
+		"provider", "model", "v1", "prompt", "v1", "extractor", "v1", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	concept, err := ontology.NewConceptDefinition(
+		"graph-node", "Graph Node", "A graph node", nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	relationship, err := ontology.NewRelationshipDefinition(
+		"related", "Related", "Relates graph nodes",
+		[]shoal.ID{concept.ID()}, []shoal.ID{concept.ID()}, nil, true, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	value, err := ontology.NewReferenceValue("node-b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, origin := range []ontology.AssertionOrigin{
+		ontology.AssertionExplicit,
+		ontology.AssertionInferred,
+	} {
+		assertion, assertionErr := ontology.NewAssertion(
+			"node-a", relationship.ID(), value, origin, 1,
+			[]ontology.EvidenceRef{evidence}, provenance,
+			shoal.Metadata{"shoal.graph.edge_id": "edge-a-b"},
+		)
+		if assertionErr != nil {
+			t.Fatal(assertionErr)
+		}
+		anchors, anchorErr := graphAnchorsFromNeighborhood(
+			"node-a",
+			explorer.Neighborhood{
+				Nodes: []graph.Node{
+					{ID: "node-a", Kind: "entity"},
+					{ID: "node-b", Kind: "entity"},
+				},
+				Edges: []graph.Edge{{
+					ID: "edge-a-b", From: "node-a", To: "node-b",
+					Type: string(relationship.ID()), Weight: 1,
+				}},
+				Assertions: []ontology.Assertion{assertion},
+			},
+			1,
+			1,
+		)
+		if anchorErr != nil {
+			t.Fatal(anchorErr)
+		}
+		reference, referenceErr := anchors[0].EvidenceReference()
+		if referenceErr != nil {
+			t.Fatal(referenceErr)
+		}
+		if len(reference.Assertions) != 1 ||
+			reference.Assertions[0].AssertionID != assertion.ID() ||
+			reference.Assertions[0].EdgeID != "edge-a-b" ||
+			reference.Assertions[0].Origin != origin {
+			t.Fatalf("%s assertion reference = %#v", origin, reference.Assertions)
+		}
 	}
 }
 
