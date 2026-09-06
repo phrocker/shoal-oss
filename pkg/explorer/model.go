@@ -156,9 +156,10 @@ func (r NeighborhoodRequest) Normalize() (NeighborhoodRequest, error) {
 
 // Neighborhood is a deterministic graph subgraph.
 type Neighborhood struct {
-	Nodes      []graph.Node
-	Edges      []graph.Edge
-	Assertions []ontology.Assertion
+	Nodes           []graph.Node
+	Edges           []graph.Edge
+	Assertions      []ontology.Assertion
+	Interpretations []ontology.AssertionInterpretation
 }
 
 // Snapshot identifies one immutable logical corpus frontier.

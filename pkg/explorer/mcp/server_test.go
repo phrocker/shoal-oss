@@ -32,6 +32,7 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/explorer/webapi"
+	"github.com/phrocker/shoal-oss/pkg/ontology"
 	"github.com/phrocker/shoal-oss/pkg/retrieval"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
@@ -509,6 +510,9 @@ func TestEveryToolCallBindsFreshDecisionAndRequestID(t *testing.T) {
 	resolver := authority.Resolver()
 	var decisions int
 	var observed []shoal.ID
+	selected := testOntologyIdentity(t)
+	template := decisionWithExpiryAndOntology(
+		t, time.Now().Add(time.Hour), selected)
 	service := &stubService{
 		documents: func(
 			ctx context.Context,
@@ -526,6 +530,10 @@ func TestEveryToolCallBindsFreshDecisionAndRequestID(t *testing.T) {
 				t.Fatalf(
 					"bound policy generation = %d", decision.PolicyGeneration())
 			}
+			ontologyIdentity, known := decision.SelectedOntology()
+			if !known || ontologyIdentity != selected {
+				t.Fatalf("bound ontology = %v, known = %v", ontologyIdentity, known)
+			}
 			return webapi.DocumentsResponse{}, nil
 		},
 	}
@@ -533,7 +541,7 @@ func TestEveryToolCallBindsFreshDecisionAndRequestID(t *testing.T) {
 		Service: service, Authority: authority,
 		Decisions: DecisionProviderFunc(func(context.Context) (auth.Decision, error) {
 			decisions++
-			return testDecision(t), nil
+			return template, nil
 		}),
 		requestIDFactory: sequentialRequestIDs(),
 	})
@@ -551,8 +559,47 @@ func TestEveryToolCallBindsFreshDecisionAndRequestID(t *testing.T) {
 		t.Fatalf("decision resolutions = %d, want 2", decisions)
 	}
 	assertIDs(t, observed, []shoal.ID{"request-1", "request-2"})
-	if observed[0] == testDecision(t).RequestID() {
+	if observed[0] == template.RequestID() {
 		t.Fatalf("template request ID was reused")
+	}
+}
+
+func TestToolCallPreservesNoLensDefault(t *testing.T) {
+	authority := auth.NewAuthority()
+	resolver := authority.Resolver()
+	template := testDecision(t)
+	service := &stubService{
+		documents: func(
+			ctx context.Context,
+			_ webapi.DocumentsRequest,
+		) (webapi.DocumentsResponse, error) {
+			decision, err := resolver.Resolve(ctx)
+			if err != nil {
+				return webapi.DocumentsResponse{}, err
+			}
+			if _, known := decision.SelectedOntology(); known {
+				t.Fatal("tool call invented an ontology selection")
+			}
+			if decision.RequestID() == template.RequestID() {
+				t.Fatal("tool call reused the template request ID")
+			}
+			return webapi.DocumentsResponse{}, nil
+		},
+	}
+	server, err := NewServer(Config{
+		Service: service, Authority: authority,
+		Decisions: DecisionProviderFunc(func(context.Context) (auth.Decision, error) {
+			return template, nil
+		}),
+		requestIDFactory: sequentialRequestIDs(),
+	})
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	makeReady(t, server)
+	response := callToolRequest(t, server, ToolDocuments, `{}`)
+	if response.Error != nil || decodeToolResult(t, response).IsError {
+		t.Fatalf("tools/call failed: %+v", response)
 	}
 }
 
@@ -1630,6 +1677,16 @@ func testDecision(t *testing.T) auth.Decision {
 
 func decisionWithExpiry(t *testing.T, expires time.Time) auth.Decision {
 	t.Helper()
+	return decisionWithExpiryAndOntology(
+		t, expires, ontology.UnknownOntology())
+}
+
+func decisionWithExpiryAndOntology(
+	t *testing.T,
+	expires time.Time,
+	selected ontology.OntologyIdentity,
+) auth.Decision {
+	t.Helper()
 	decision, err := auth.NewDecision(auth.DecisionConfig{
 		Subject: "subject", Actor: "actor",
 		AuthorizationDomain: []byte("domain"),
@@ -1647,11 +1704,31 @@ func decisionWithExpiry(t *testing.T, expires time.Time) auth.Decision {
 		PolicyGeneration:      1,
 		AuthenticationExpires: expires,
 		RequestID:             "template-request",
+		SelectedOntology:      selected,
 	})
 	if err != nil {
 		t.Fatalf("NewDecision: %v", err)
 	}
 	return decision
+}
+
+func testOntologyIdentity(t *testing.T) ontology.OntologyIdentity {
+	t.Helper()
+	schema, err := ontology.NewOntologySchema("mcp-test", "MCP Test", "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, err := ontology.NewOntologyVersion(
+		schema, "1", time.Date(2026, 9, 6, 0, 0, 0, 0, time.UTC),
+		nil, nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity, err := ontology.NewOntologyIdentity(version)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return identity
 }
 
 func sequentialRequestIDs() func() (shoal.ID, error) {

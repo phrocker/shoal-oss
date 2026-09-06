@@ -690,6 +690,8 @@ func (s *EmbeddedService) Neighborhood(
 	}
 	response := NeighborhoodResponse{
 		Snapshot: snapshot, Neighborhood: result.Neighborhood,
+		OntologyInterpretations: ontologyInterpretationReports(
+			result.Neighborhood.Interpretations),
 		Truncated: result.Truncated,
 	}
 	if result.Continuation {
@@ -697,6 +699,38 @@ func (s *EmbeddedService) Neighborhood(
 			snapshot.ID, normalizedRequest, result.NextAfterEdgeID)
 	}
 	return response, nil
+}
+
+func ontologyInterpretationReports(
+	values []ontology.AssertionInterpretation,
+) []OntologyInterpretationReport {
+	if len(values) == 0 {
+		return nil
+	}
+	out := make([]OntologyInterpretationReport, 0, len(values))
+	for _, value := range values {
+		original := value.Original()
+		originalSubject, _ := original.SubjectType()
+		originalObject, _ := original.ObjectType()
+		subject, _ := value.SubjectType()
+		object, _ := value.ObjectType()
+		applied := value.AppliedMorphisms()
+		appliedStrings := make([]string, len(applied))
+		for i, id := range applied {
+			appliedStrings[i] = string(id)
+		}
+		reader := value.Reader()
+		out = append(out, OntologyInterpretationReport{
+			AssertionID: string(original.ID()),
+			SchemaID:    string(reader.SchemaID()), VersionID: string(reader.VersionID()),
+			Reading: value.Reading(), Status: value.Status(),
+			OriginalSubjectType: string(originalSubject), SubjectType: string(subject),
+			OriginalPredicate: string(original.Predicate()), Predicate: string(value.Predicate()),
+			OriginalObjectType: string(originalObject), ObjectType: string(object),
+			AppliedMorphisms: appliedStrings, Reason: value.Reason(),
+		})
+	}
+	return out
 }
 
 func (s *EmbeddedService) Path(
@@ -746,10 +780,34 @@ func (s *EmbeddedService) Path(
 	if err := s.confirmSnapshot(ctx, snapshot); err != nil {
 		return PathResponse{}, err
 	}
+	assertions := assertionsForPath(path, bounded.Neighborhood.Assertions)
 	return PathResponse{
 		Snapshot: snapshot, Path: path,
-		Assertions: assertionsForPath(path, bounded.Neighborhood.Assertions),
+		Assertions: assertions,
+		OntologyInterpretations: ontologyInterpretationReports(
+			interpretationsForAssertions(
+				assertions, bounded.Neighborhood.Interpretations)),
 	}, nil
+}
+
+func interpretationsForAssertions(
+	assertions []ontology.Assertion,
+	interpretations []ontology.AssertionInterpretation,
+) []ontology.AssertionInterpretation {
+	if len(assertions) == 0 || len(interpretations) == 0 {
+		return nil
+	}
+	selected := make(map[shoal.ID]struct{}, len(assertions))
+	for _, assertion := range assertions {
+		selected[assertion.ID()] = struct{}{}
+	}
+	out := make([]ontology.AssertionInterpretation, 0, len(assertions))
+	for _, interpretation := range interpretations {
+		if _, ok := selected[interpretation.Original().ID()]; ok {
+			out = append(out, interpretation)
+		}
+	}
+	return out
 }
 
 func (s *EmbeddedService) pin(

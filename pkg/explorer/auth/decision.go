@@ -24,6 +24,7 @@ import (
 	"sort"
 	"time"
 
+	"github.com/phrocker/shoal-oss/pkg/ontology"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
@@ -44,6 +45,7 @@ type DecisionConfig struct {
 	AuditPurpose           string
 	ServiceRole            ServiceRole
 	ServiceCeilingIdentity shoal.ID
+	SelectedOntology       ontology.OntologyIdentity
 }
 
 // Decision is an immutable trusted authorization decision.
@@ -63,6 +65,7 @@ type Decision struct {
 	auditPurpose           string
 	serviceRole            ServiceRole
 	serviceCeilingIdentity shoal.ID
+	selectedOntology       ontology.OntologyIdentity
 }
 
 // NewDecision validates, canonicalizes, and defensively owns a trusted
@@ -139,6 +142,11 @@ func NewDecision(config DecisionConfig) (Decision, error) {
 	if err := validateOptionalSemantic("audit purpose", config.AuditPurpose); err != nil {
 		return Decision{}, err
 	}
+	if config.SelectedOntology.Known() {
+		if err := config.SelectedOntology.Validate(); err != nil {
+			return Decision{}, err
+		}
+	}
 	if config.ServiceRole == "" {
 		if config.ServiceCeilingIdentity != "" {
 			return Decision{}, shoal.NewError(
@@ -181,6 +189,7 @@ func NewDecision(config DecisionConfig) (Decision, error) {
 		auditPurpose:           config.AuditPurpose,
 		serviceRole:            config.ServiceRole,
 		serviceCeilingIdentity: config.ServiceCeilingIdentity,
+		selectedOntology:       config.SelectedOntology,
 	}, nil
 }
 
@@ -261,6 +270,12 @@ func (d Decision) ServiceRole() ServiceRole { return d.serviceRole }
 // ServiceCeilingIdentity returns the optional configured ceiling identity.
 func (d Decision) ServiceCeilingIdentity() shoal.ID {
 	return d.serviceCeilingIdentity
+}
+
+// SelectedOntology returns the immutable read-time ontology lens selected for
+// this decision. The boolean is false when reads retain legacy no-lens behavior.
+func (d Decision) SelectedOntology() (ontology.OntologyIdentity, bool) {
+	return d.selectedOntology, d.selectedOntology.Known()
 }
 
 // TrustedService reports whether the decision carries a validated service
@@ -481,6 +496,7 @@ func (d Decision) cloneValidated() (Decision, error) {
 		AuditPurpose:           d.auditPurpose,
 		ServiceRole:            d.serviceRole,
 		ServiceCeilingIdentity: d.serviceCeilingIdentity,
+		SelectedOntology:       d.selectedOntology,
 	})
 }
 

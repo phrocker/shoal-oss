@@ -202,10 +202,27 @@ type NeighborhoodRequest struct {
 
 // NeighborhoodResponse returns only the bounded subgraph requested.
 type NeighborhoodResponse struct {
-	Snapshot     Snapshot              `json:"snapshot"`
-	Neighborhood explorer.Neighborhood `json:"neighborhood"`
-	Truncated    bool                  `json:"truncated"`
-	NextCursor   string                `json:"next_cursor,omitempty"`
+	Snapshot                Snapshot                       `json:"snapshot"`
+	Neighborhood            explorer.Neighborhood          `json:"neighborhood"`
+	OntologyInterpretations []OntologyInterpretationReport `json:"ontology_interpretations,omitempty"`
+	Truncated               bool                           `json:"truncated"`
+	NextCursor              string                         `json:"next_cursor,omitempty"`
+}
+
+type OntologyInterpretationReport struct {
+	AssertionID         string                        `json:"assertion_id"`
+	SchemaID            string                        `json:"schema_id"`
+	VersionID           string                        `json:"version_id"`
+	Reading             ontology.OntologyReading      `json:"reading"`
+	Status              ontology.InterpretationStatus `json:"status"`
+	OriginalSubjectType string                        `json:"original_subject_type,omitempty"`
+	SubjectType         string                        `json:"subject_type,omitempty"`
+	OriginalPredicate   string                        `json:"original_predicate"`
+	Predicate           string                        `json:"predicate"`
+	OriginalObjectType  string                        `json:"original_object_type,omitempty"`
+	ObjectType          string                        `json:"object_type,omitempty"`
+	AppliedMorphisms    []string                      `json:"applied_morphisms,omitempty"`
+	Reason              string                        `json:"reason,omitempty"`
 }
 
 // PathRequest asks for one bounded directed path.
@@ -220,9 +237,10 @@ type PathRequest struct {
 
 // PathResponse contains the selected explanation path.
 type PathResponse struct {
-	Snapshot   Snapshot             `json:"snapshot"`
-	Path       graph.Path           `json:"path"`
-	Assertions []ontology.Assertion `json:"assertions,omitempty"`
+	Snapshot                Snapshot                       `json:"snapshot"`
+	Path                    graph.Path                     `json:"path"`
+	Assertions              []ontology.Assertion           `json:"assertions,omitempty"`
+	OntologyInterpretations []OntologyInterpretationReport `json:"ontology_interpretations,omitempty"`
 }
 
 // UploadFile carries one bounded, untrusted browser file after HTTP parsing.
