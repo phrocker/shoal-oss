@@ -687,33 +687,33 @@ func (s Session) Validate() error {
 		if err := shoal.ValidateRequiredID("interaction seed node ID", id); err != nil {
 			return err
 		}
-		for _, evidence := range s.SeedEvidence {
-			if err := evidence.Validate(); err != nil {
-				return err
-			}
+	}
+	for _, evidence := range s.SeedEvidence {
+		if err := evidence.Validate(); err != nil {
+			return err
 		}
-		if len(s.SeedEvidence) > 0 &&
-			!equalIDs(dedupeIDs(s.SeedNodeIDs), evidenceNodeIDs(s.SeedEvidence)) {
-			return shoal.NewError(
-				shoal.ErrorInvalidArgument,
-				"interaction seed nodes do not match seed evidence")
-		}
+	}
+	if len(s.SeedEvidence) > 0 &&
+		!equalIDs(dedupeIDs(s.SeedNodeIDs), evidenceNodeIDs(s.SeedEvidence)) {
+		return shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			"interaction seed nodes do not match seed evidence")
 	}
 	for _, id := range s.CitedNodeIDs {
 		if err := shoal.ValidateRequiredID("interaction cited node ID", id); err != nil {
 			return err
 		}
-		for _, evidence := range s.CitedEvidence {
-			if err := evidence.Validate(); err != nil {
-				return err
-			}
+	}
+	for _, evidence := range s.CitedEvidence {
+		if err := evidence.Validate(); err != nil {
+			return err
 		}
-		if len(s.CitedEvidence) > 0 &&
-			!equalIDs(dedupeIDs(s.CitedNodeIDs), evidenceNodeIDs(s.CitedEvidence)) {
-			return shoal.NewError(
-				shoal.ErrorInvalidArgument,
-				"interaction cited nodes do not match cited evidence")
-		}
+	}
+	if len(s.CitedEvidence) > 0 &&
+		!equalIDs(dedupeIDs(s.CitedNodeIDs), evidenceNodeIDs(s.CitedEvidence)) {
+		return shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			"interaction cited nodes do not match cited evidence")
 	}
 	turnIndexes := make(map[int]struct{}, len(s.Turns))
 	for _, turn := range s.Turns {

@@ -1048,6 +1048,10 @@ func (g *Generator) Run(ctx context.Context, pack inference.ContextPack) (Record
 				)
 			}
 			if err := g.recorder.Record(runCtx, evaluation); err != nil {
+				if interaction.IsCommittedRecord(err) {
+					recordCommitted = true
+					err = explorer.MarkCommittedInteraction(err)
+				}
 				return finish(stopReasonFor(err), step, "recorder", inference.InferenceResult{}, err)
 			}
 			recordCommitted = true

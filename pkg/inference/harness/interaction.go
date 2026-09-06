@@ -101,8 +101,8 @@ func (r *GraphRecorder) Record(ctx context.Context, record EvaluationRecord) err
 			return err
 		}
 		if _, err := persisted.Canonical(); err != nil {
-			return invalid(
-				"interaction sink returned an invalid persisted session")
+			return interaction.MarkCommittedRecord(invalid(
+				"interaction sink returned an invalid persisted session"))
 		}
 		return nil
 	}

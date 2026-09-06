@@ -84,3 +84,42 @@ func TestSessionSubgraphRequiresAndConjoinsExactEdgeVisibility(t *testing.T) {
 		t.Fatalf("touched edges = %v", subgraph.TouchedEdgeIDs)
 	}
 }
+
+func TestSessionRejectsEvidenceWithoutDeclaredSourceNodes(t *testing.T) {
+	recordedAt := time.Unix(1700000000, 0).UTC()
+	seeded := interaction.Session{
+		ID:         interaction.DerivedID("session", "seed-evidence-only"),
+		RecordedAt: recordedAt,
+		Operation:  interaction.OperationRetrieval,
+		SeedEvidence: []interaction.EvidenceReference{{
+			AnchorID: "anchor-1", Kind: interaction.EvidenceGraph,
+			NodeIDs: []shoal.ID{"restricted-node"},
+		}},
+	}
+	if err := seeded.Validate(); err == nil {
+		t.Fatal("seed evidence without declared seed nodes was accepted")
+	}
+	cited := interaction.Session{
+		ID:         interaction.DerivedID("session", "cited-evidence-only"),
+		RecordedAt: recordedAt,
+		Operation:  interaction.OperationRetrieval,
+		CitedEvidence: []interaction.EvidenceReference{{
+			AnchorID: "anchor-1", Kind: interaction.EvidenceGraph,
+			NodeIDs: []shoal.ID{"restricted-node"},
+		}},
+	}
+	if err := cited.Validate(); err == nil {
+		t.Fatal("cited evidence without declared cited nodes was accepted")
+	}
+	invalidEvidence := interaction.Session{
+		ID:         interaction.DerivedID("session", "invalid-evidence"),
+		RecordedAt: recordedAt,
+		Operation:  interaction.OperationRetrieval,
+		SeedEvidence: []interaction.EvidenceReference{{
+			Kind: interaction.EvidenceGraph,
+		}},
+	}
+	if err := invalidEvidence.Validate(); err == nil {
+		t.Fatal("unvalidated seed evidence was accepted")
+	}
+}
