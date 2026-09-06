@@ -755,6 +755,9 @@ func (e EffectiveDecision) CacheDimensions() map[string]uint64 {
 
 // OutputVisibility conjoins all base and settings-added output policies.
 func (e EffectiveDecision) OutputVisibility() ([]byte, error) {
+	if len(e.outputPolicies) == 0 {
+		return nil, nil
+	}
 	return auth.ConjoinPolicies(e.outputPolicies...)
 }
 

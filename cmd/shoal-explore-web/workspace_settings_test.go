@@ -59,23 +59,9 @@ func TestOpenServiceWiresDurableWorkspaceSettings(t *testing.T) {
 		backend: "embedded", data: corpus, policyDir: policy,
 		resolver: resolver, clock: func() time.Time { return now },
 	}
-	blocker, err := workspace.OpenDurableStore(
-		workspaceSettingsStoreDir(corpus))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if failed, err := openService(
-		context.Background(), config,
-	); err == nil {
-		failed.close()
-		t.Fatal("startup succeeded while the settings directory was owned")
-	}
-	if err := blocker.Close(); err != nil {
-		t.Fatal(err)
-	}
 	opened, err := openService(context.Background(), config)
 	if err != nil {
-		t.Fatalf("startup failure retained the runtime lock: %v", err)
+		t.Fatal(err)
 	}
 	if opened.settings == nil {
 		t.Fatal("embedded startup did not expose workspace settings")
@@ -93,8 +79,8 @@ func TestOpenServiceWiresDurableWorkspaceSettings(t *testing.T) {
 		t.Fatal(err)
 	}
 	opened.close()
-	if _, err := os.Stat(filepath.Join(root, "settings")); err != nil {
-		t.Fatalf("durable settings directory: %v", err)
+	if _, err := os.Stat(filepath.Join(root, "settings")); !os.IsNotExist(err) {
+		t.Fatalf("settings opened a separate engine directory: %v", err)
 	}
 
 	reopened, err := openService(context.Background(), config)

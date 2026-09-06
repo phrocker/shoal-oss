@@ -733,8 +733,8 @@ func openService(
 				return closed, err
 			}
 		}
-		settingsStore, err := workspace.OpenDurableStore(
-			workspaceSettingsStoreDir(config.data))
+		settingsStore, err := workspace.NewDurableStoreWithEngine(
+			embedded.Runtime.EmbeddedEngine())
 		if err != nil {
 			store.Close()
 			embedded.Close()
@@ -795,16 +795,6 @@ func openService(
 // treats every subdirectory of the data directory as a table.
 func policyStoreDir(data string) string {
 	return filepath.Clean(data) + "-policy"
-}
-
-// workspaceSettingsStoreDir keeps settings outside the corpus engine while
-// placing them under the same recommended state root.
-func workspaceSettingsStoreDir(data string) string {
-	clean := filepath.Clean(data)
-	if filepath.Base(clean) == "corpus" {
-		return filepath.Join(filepath.Dir(clean), "settings")
-	}
-	return clean + "-settings"
 }
 
 // firstNonEmpty returns the first argument whose trimmed value is non-empty.
