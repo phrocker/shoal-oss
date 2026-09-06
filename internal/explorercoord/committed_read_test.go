@@ -110,8 +110,8 @@ func TestScanCommittedPinsFrontierAndSkipsPoisonedNewerVersion(t *testing.T) {
 	if err := runtime.engine.Write("records", []*cclient.Mutation{corrupt}); err != nil {
 		t.Fatal(err)
 	}
-	if err := runtime.Recover(context.Background()); !errors.Is(err, transaction.ErrQuarantined) {
-		t.Fatalf("poison third publication = %v", err)
+	if err := runtime.Recover(context.Background()); err != nil {
+		t.Fatalf("settle poisoned third publication = %v", err)
 	}
 	if _, err := runtime.allocator.AdvanceFrontier(context.Background()); err != nil {
 		t.Fatalf("advance across poisoned outcome: %v", err)
@@ -164,11 +164,12 @@ func TestScanCommittedPagesBoundsAndDetectsPhysicalMutation(t *testing.T) {
 		t.Fatalf("first committed page = %#v, %v", first, err)
 	}
 	second, err := runtime.ScanCommitted(context.Background(), CommittedScanRequest{
-		Table: "records", RowPrefix: []byte("event/"), StartRow: first.NextRow,
+		Table: "records", RowPrefix: []byte("event/"), StartAfterRow: first.NextRow,
 		Family: []byte("event"), Qualifier: []byte("record"),
 		Frontier: first.Frontier, Limit: 1,
 	})
 	if err != nil || len(second.Cells) != 1 || len(second.NextRow) != 0 ||
+		second.HistoryFloor != 1 ||
 		!bytes.Equal(second.Cells[0].Cell.Coordinate.Row, []byte("event/b")) {
 		t.Fatalf("second committed page = %#v, %v", second, err)
 	}
