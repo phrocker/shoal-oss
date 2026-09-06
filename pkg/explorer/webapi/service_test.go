@@ -191,6 +191,10 @@ func assertServiceBoundsAndSnapshot(
 		len(neighborhood.Neighborhood.Edges) > 1 {
 		t.Fatalf("%s unbounded neighborhood = %+v", name, neighborhood)
 	}
+	if neighborhood.ScannedEdges != nil {
+		t.Fatalf("%s exposed internal scan count = %v",
+			name, *neighborhood.ScannedEdges)
+	}
 	nodeIDs := map[shoal.ID]bool{}
 	for _, node := range neighborhood.Neighborhood.Nodes {
 		nodeIDs[node.ID] = true
