@@ -453,6 +453,73 @@ func TestOntologyProposalPublishRejectsStaleBase(t *testing.T) {
 	}
 }
 
+func TestOntologyProposalConcurrentPublishHasSingleWinner(t *testing.T) {
+	corpus, err := explorer.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer corpus.Close()
+	_, server := ontologyProposalServer(t, corpus, richOntologyVersion(t))
+	first := createOntologyProposal(t, server, "v2")
+	second := createOntologyProposal(t, server, "v3")
+	for _, proposal := range []webapi.OntologyProposalProjection{first, second} {
+		_ = transitionOntologyProposal(
+			t, server, proposal.ID, string(ontology.ProposalSubmitted))
+		_ = transitionOntologyProposal(
+			t, server, proposal.ID, string(ontology.ProposalApproved))
+	}
+
+	start := make(chan struct{})
+	statuses := make(chan int, 2)
+	for _, proposalID := range []string{first.ID, second.ID} {
+		proposalID := proposalID
+		go func() {
+			<-start
+			body := bytes.NewBufferString(
+				`{"state":"published","note":"concurrent publish"}`)
+			response, requestErr := server.Client().Post(
+				server.URL+"/api/v1/ontology/proposals/"+proposalID+"/transition",
+				"application/json", body)
+			if requestErr != nil {
+				statuses <- 0
+				return
+			}
+			defer response.Body.Close()
+			statuses <- response.StatusCode
+		}()
+	}
+	close(start)
+	successes := 0
+	conflicts := 0
+	for range 2 {
+		switch status := <-statuses; status {
+		case http.StatusOK:
+			successes++
+		case http.StatusConflict:
+			conflicts++
+		default:
+			t.Fatalf("concurrent publish status = %d", status)
+		}
+	}
+	if successes != 1 || conflicts != 1 {
+		t.Fatalf("concurrent publishes = %d successes, %d conflicts", successes, conflicts)
+	}
+	proposals := getOntologyProposals(t, server)
+	published := 0
+	approved := 0
+	for _, proposal := range proposals.Proposals {
+		switch proposal.State {
+		case string(ontology.ProposalPublished):
+			published++
+		case string(ontology.ProposalApproved):
+			approved++
+		}
+	}
+	if published != 1 || approved != 1 {
+		t.Fatalf("concurrent proposal states = %+v", proposals.Proposals)
+	}
+}
+
 func TestOntologyProposalMorphismUsesKeyReferencesAndWireCodecs(t *testing.T) {
 	corpus, err := explorer.Open(t.TempDir())
 	if err != nil {
