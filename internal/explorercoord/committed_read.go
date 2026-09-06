@@ -490,6 +490,24 @@ func (r *Runtime) committedLocked(
 		snapshot.Root.LogicalDigest != logicalDigest {
 		return Result{}, false, nil
 	}
+	outcome, err := r.allocator.Outcome(ctx, epoch)
+	if err != nil {
+		if errors.Is(err, allocator.ErrNotFound) ||
+			errors.Is(err, allocator.ErrCorruption) {
+			return Result{}, false, errors.Join(
+				transaction.ErrInternal,
+				fmt.Errorf("read committed epoch outcome: %w", err),
+			)
+		}
+		return Result{}, false, fmt.Errorf(
+			"read committed epoch outcome: %w",
+			err,
+		)
+	}
+	if outcome.State != coordination.StateCommitted ||
+		!bytes.Equal(outcome.TXN, txn) {
+		return Result{}, false, nil
+	}
 	head, err := r.allocator.CurrentHead(ctx)
 	if err != nil {
 		return Result{}, false, err

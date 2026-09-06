@@ -514,6 +514,193 @@ func TestCommittedProofPreservesOperationalReadErrors(t *testing.T) {
 	}
 }
 
+func TestCommittedRequiresImmutableEpochOutcome(t *testing.T) {
+	config := testRuntimeConfig(t, testDirectory(t))
+	runtime, err := Open(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.Close()
+	intent := testIntent(
+		t,
+		config.Domain,
+		"committed-outcome",
+		"token",
+		"value",
+		guard.ModeAbsentOrIdentical,
+		0,
+		coordination.Digest{},
+	)
+	result, err := runtime.Publish(
+		context.Background(),
+		Request{Intent: intent},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, committed, err := runtime.Committed(
+		context.Background(),
+		result.TXN,
+		result.LogicalDigest,
+	); err != nil || !committed {
+		t.Fatalf("initial committed proof = %v, %v", committed, err)
+	}
+
+	row, err := coordination.OutcomeRow(config.Domain, result.Epoch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	coordinate := allocator.Coordinate{
+		Row:       row,
+		Family:    []byte("o"),
+		Qualifier: []byte("terminal"),
+	}
+	cells, err := runtime.store.ReadExact(
+		context.Background(),
+		[]allocator.Coordinate{coordinate},
+	)
+	if err != nil || len(cells) != 1 {
+		t.Fatalf("read outcome = %#v, %v", cells, err)
+	}
+	status, err := runtime.store.CompareAndMutate(
+		context.Background(),
+		allocator.Mutation{
+			Row: row,
+			Conditions: []allocator.Condition{{
+				Coordinate:   coordinate,
+				Value:        cells[0].Value,
+				Timestamp:    cells[0].Timestamp,
+				TimestampSet: true,
+			}},
+			Updates: []allocator.Update{{
+				Coordinate: coordinate,
+				Delete:     true,
+				Timestamp:  cells[0].Timestamp + 1,
+			}},
+		},
+	)
+	if err != nil || status != allocator.StatusAccepted {
+		t.Fatalf("delete immutable outcome = %v, %v", status, err)
+	}
+	if _, committed, err := runtime.Committed(
+		context.Background(),
+		result.TXN,
+		result.LogicalDigest,
+	); committed || !errors.Is(err, transaction.ErrInternal) {
+		t.Fatalf("committed proof without outcome = %v, %v", committed, err)
+	}
+}
+
+func TestGenericPublishSerializesPendingRegistrationWithRecovery(t *testing.T) {
+	config := testRuntimeConfig(t, testDirectory(t))
+	fired := false
+	config.testStageHook = func(stage recoveryStage) error {
+		if stage == recoveryStageIntent && !fired {
+			fired = true
+			return context.Canceled
+		}
+		return nil
+	}
+	runtime, err := Open(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.Close()
+	blocking := &blockingIntentStore{
+		EngineStore: runtime.store,
+		entered:     make(chan struct{}),
+		release:     make(chan struct{}),
+	}
+	runtime.intents.store = blocking
+	intent := testIntent(
+		t,
+		config.Domain,
+		"generic-recovery-race",
+		"token",
+		"value",
+		guard.ModeAbsentOrIdentical,
+		0,
+		coordination.Digest{},
+	)
+	publishDone := make(chan error, 1)
+	go func() {
+		_, err := runtime.Publish(
+			context.Background(),
+			Request{Intent: intent},
+		)
+		publishDone <- err
+	}()
+	select {
+	case <-blocking.entered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("generic publication did not reach intent persistence")
+	}
+
+	recoverDone := make(chan error, 1)
+	go func() {
+		recoverDone <- runtime.Recover(context.Background())
+	}()
+	var earlyRecovery error
+	recoveredEarly := false
+	select {
+	case earlyRecovery = <-recoverDone:
+		recoveredEarly = true
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(blocking.release)
+	if err := <-publishDone; !errors.Is(err, ErrIndeterminatePublication) {
+		t.Fatalf("staged generic publication = %v", err)
+	}
+	if recoveredEarly {
+		t.Fatalf("recovery passed index-before-intent window: %v", earlyRecovery)
+	}
+	if err := <-recoverDone; err != nil {
+		t.Fatalf("recover serialized generic publication = %v", err)
+	}
+	digest, err := LogicalDigest(intent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	txn, err := DeriveTXN(config.Domain, intent.Operation, intent.Token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, committed, err := runtime.Committed(
+		context.Background(),
+		txn,
+		digest,
+	); err != nil || !committed {
+		t.Fatalf("serialized recovered publication = %v, %v", committed, err)
+	}
+}
+
+func TestSuccessfulRecoveryRefreshesPendingCache(t *testing.T) {
+	config := testRuntimeConfig(t, testDirectory(t))
+	runtime, err := Open(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.Close()
+	txn, err := DeriveTXN(config.Domain, []byte("stale-cache"), []byte("token"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime.intents.markPending(txn)
+	if pending, err := runtime.PendingPublications(
+		context.Background(),
+	); err != nil || !pending {
+		t.Fatalf("seed stale pending cache = %v, %v", pending, err)
+	}
+	if err := runtime.Recover(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if pending, err := runtime.PendingPublications(
+		context.Background(),
+	); err != nil || pending {
+		t.Fatalf("refreshed pending cache = %v, %v", pending, err)
+	}
+}
+
 type ambiguousIntentStore struct {
 	*EngineStore
 	ambiguous    bool
@@ -573,4 +760,27 @@ func (s *readFailIntentStore) ReadExact(
 	[]allocator.Coordinate,
 ) ([]allocator.Cell, error) {
 	return nil, s.err
+}
+
+type blockingIntentStore struct {
+	*EngineStore
+	entered chan struct{}
+	release chan struct{}
+	blocked bool
+}
+
+func (s *blockingIntentStore) CompareAndMutate(
+	ctx context.Context,
+	mutation allocator.Mutation,
+) (allocator.Status, error) {
+	if !s.blocked && bytes.HasPrefix(mutation.Row, intentRowMagic) {
+		s.blocked = true
+		close(s.entered)
+		select {
+		case <-s.release:
+		case <-ctx.Done():
+			return allocator.StatusUnknown, ctx.Err()
+		}
+	}
+	return s.EngineStore.CompareAndMutate(ctx, mutation)
 }

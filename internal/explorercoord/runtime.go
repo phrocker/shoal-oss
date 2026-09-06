@@ -374,9 +374,9 @@ func (r *Runtime) publishLocked(
 	if err := r.validateIntentTables(request.Intent); err != nil {
 		return Result{}, err
 	}
-	record, _, err := r.intents.Put(ctx, request.Intent)
+	record, err := r.persistIntent(ctx, request.Intent)
 	if err != nil {
-		return Result{}, classifyIntentPersistenceFailure(err)
+		return Result{}, err
 	}
 	if hook := runtimeStageHook(r.protocolStore); hook != nil {
 		if err := hook(recoveryStageIntent); err != nil {
@@ -464,6 +464,19 @@ func (r *Runtime) PublishRecord(
 		return explorer.RecordPublicationResult{}, recordPublicationError(err)
 	}
 	return explorer.RecordPublicationResult{Epoch: result.Epoch, Unchanged: result.Unchanged}, nil
+}
+
+func (r *Runtime) persistIntent(
+	ctx context.Context,
+	intent Intent,
+) (storedIntent, error) {
+	r.recoveryMu.Lock()
+	defer r.recoveryMu.Unlock()
+	record, _, err := r.intents.Put(ctx, intent)
+	if err != nil {
+		return storedIntent{}, classifyIntentPersistenceFailure(err)
+	}
+	return record, nil
 }
 
 func (r *Runtime) persistRecordAttempt(
@@ -876,6 +889,15 @@ send:
 	}
 	if combined != nil {
 		return len(next) != 0, combined
+	}
+	if len(next) == 0 {
+		if err := r.intents.IndexPending(
+			ctx,
+			r.recoveryLimit,
+			r.recoveryPages,
+		); err != nil {
+			return false, errors.Join(transaction.ErrUnavailable, err)
+		}
 	}
 	r.intentCursor = append(r.intentCursor[:0], next...)
 	if len(next) == 0 {
