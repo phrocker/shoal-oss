@@ -129,6 +129,31 @@ func (c *Client) OntologyProposalMutationState(
 	return state, nil
 }
 
+func (c *Client) OntologyActiveState(
+	ctx context.Context,
+	configured ontology.OntologyVersion,
+) (ontology.OntologyVersion, error) {
+	provider, ok := c.base.(explorer.OntologyActiveStateProvider)
+	if !ok {
+		return ontology.OntologyVersion{}, shoal.NewError(
+			shoal.ErrorUnavailable,
+			"workspace capability \"active ontology state\" is unavailable",
+		)
+	}
+	_, guard, _, err := c.begin(ctx, auth.OperationRead)
+	if err != nil {
+		return ontology.OntologyVersion{}, err
+	}
+	active, err := provider.OntologyActiveState(ctx, configured)
+	if err != nil {
+		return ontology.OntologyVersion{}, directBaseError(err)
+	}
+	if err := guard.Check(ctx); err != nil {
+		return ontology.OntologyVersion{}, err
+	}
+	return active, nil
+}
+
 func (c *Client) TransitionOntologyProposal(
 	ctx context.Context,
 	proposalID shoal.ID,

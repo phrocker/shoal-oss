@@ -342,6 +342,62 @@ func TestOntologyProposalProjectionRejectsOversizedEvidence(t *testing.T) {
 	}
 }
 
+func TestActiveOntologyDoesNotDependOnProposalBodyReads(t *testing.T) {
+	ctx := context.Background()
+	corpus, err := explorer.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer corpus.Close()
+	base := ontologyBoundVersion(t, 0)
+	target := ontologyBoundVersion(t, 1)
+	proposal := ontologyBoundProposal(t, base, target)
+	if err := corpus.CreateOntologyProposal(ctx, proposal, base); err != nil {
+		t.Fatal(err)
+	}
+	for index, state := range []ontology.ProposalState{
+		ontology.ProposalSubmitted,
+		ontology.ProposalApproved,
+		ontology.ProposalPublished,
+	} {
+		proposal, err = corpus.TransitionOntologyProposal(
+			ctx, proposal.ID(), state, "governor", "publish",
+			proposal.CreatedAt().Add(time.Duration(index+1)*time.Second))
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	service, err := NewEmbeddedService(&unreadableOntologyProposalClient{
+		Explorer: corpus,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := service.SetOntologyVersion(base); err != nil {
+		t.Fatal(err)
+	}
+	active, configured, err := service.ActiveOntology(ctx)
+	if err != nil || !configured || active.ID() != target.ID() {
+		t.Fatalf("active ontology = %q, %v, %v", active.ID(), configured, err)
+	}
+	active, configured, err = service.activeOntologyForMutation(ctx)
+	if err != nil || !configured || active.ID() != target.ID() {
+		t.Fatalf("mutation active ontology = %q, %v, %v",
+			active.ID(), configured, err)
+	}
+}
+
+type unreadableOntologyProposalClient struct {
+	*explorer.Explorer
+}
+
+func (*unreadableOntologyProposalClient) OntologyProposals(
+	context.Context,
+) ([]ontology.GovernedProposal, error) {
+	return nil, shoal.NewError(
+		shoal.ErrorUnauthorized, "proposal bodies are not readable")
+}
+
 func ontologyBoundVersion(t *testing.T, index int) ontology.OntologyVersion {
 	t.Helper()
 	schema, err := ontology.NewOntologySchema("bounded", "Bounded", "", nil)

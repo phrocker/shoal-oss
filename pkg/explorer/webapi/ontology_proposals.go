@@ -649,6 +649,27 @@ func (s *EmbeddedService) ontologyMutationSnapshot(
 	return state, true, nil
 }
 
+func (s *EmbeddedService) activeOntologyForMutation(
+	ctx context.Context,
+) (ontology.OntologyVersion, bool, error) {
+	s.ontologyMu.RLock()
+	if s.ontologyVersion == nil {
+		s.ontologyMu.RUnlock()
+		return ontology.OntologyVersion{}, false, nil
+	}
+	configured := *s.ontologyVersion
+	s.ontologyMu.RUnlock()
+	provider, ok := s.client.(explorer.OntologyProposalMutationStateProvider)
+	if !ok {
+		return configured, true, nil
+	}
+	state, err := provider.OntologyProposalMutationState(ctx, configured, "")
+	if err != nil {
+		return ontology.OntologyVersion{}, false, err
+	}
+	return state.Active(), true, nil
+}
+
 func ontologyProposalsFor(
 	ctx context.Context,
 	service Service,

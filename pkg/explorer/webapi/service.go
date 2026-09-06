@@ -235,7 +235,7 @@ func (s *EmbeddedService) Extract(
 	if _, err := s.pin(ctx, request.Snapshot); err != nil {
 		return ExtractResponse{}, err
 	}
-	version, configured, err := s.ActiveOntology(ctx)
+	version, configured, err := s.activeOntologyForMutation(ctx)
 	if err != nil {
 		return ExtractResponse{}, err
 	}

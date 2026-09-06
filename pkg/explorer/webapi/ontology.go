@@ -23,6 +23,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/ontology"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
@@ -204,9 +205,27 @@ func (s *EmbeddedService) SetOntologyVersion(version ontology.OntologyVersion) e
 func (s *EmbeddedService) ActiveOntology(
 	ctx context.Context,
 ) (ontology.OntologyVersion, bool, error) {
-	catalog, configured, err := s.OntologyCatalog(ctx)
-	if err != nil || !configured {
-		return ontology.OntologyVersion{}, configured, err
+	if ctx == nil {
+		return ontology.OntologyVersion{}, false, shoal.NewError(
+			shoal.ErrorInvalidArgument, "context is required")
+	}
+	if err := ctx.Err(); err != nil {
+		return ontology.OntologyVersion{}, false, err
+	}
+	s.ontologyMu.RLock()
+	if s.ontologyVersion == nil {
+		s.ontologyMu.RUnlock()
+		return ontology.OntologyVersion{}, false, nil
+	}
+	configured := *s.ontologyVersion
+	s.ontologyMu.RUnlock()
+	if provider, ok := s.client.(explorer.OntologyActiveStateProvider); ok {
+		active, err := provider.OntologyActiveState(ctx, configured)
+		return active, true, err
+	}
+	catalog, _, err := s.OntologyCatalog(ctx)
+	if err != nil {
+		return ontology.OntologyVersion{}, false, err
 	}
 	return catalog.Active(), true, nil
 }

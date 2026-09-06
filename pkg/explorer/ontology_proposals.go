@@ -60,6 +60,14 @@ type OntologyProposalMutationStateProvider interface {
 	) (OntologyProposalMutationState, error)
 }
 
+// OntologyActiveStateProvider returns the global durable active tip without
+// exposing proposal bodies or evidence.
+type OntologyActiveStateProvider interface {
+	OntologyActiveState(
+		context.Context, ontology.OntologyVersion,
+	) (ontology.OntologyVersion, error)
+}
+
 // OntologyProposalEvidenceProvider returns only the immutable evidence needed
 // to authorize a requested proposal mutation.
 type OntologyProposalEvidenceProvider interface {
@@ -280,6 +288,19 @@ func (e *Explorer) OntologyProposalMutationState(
 	}
 	state.active = catalog.Active()
 	return state, nil
+}
+
+// OntologyActiveState returns the active tip rooted at configured without
+// exposing the proposal corpus used to derive it.
+func (e *Explorer) OntologyActiveState(
+	ctx context.Context,
+	configured ontology.OntologyVersion,
+) (ontology.OntologyVersion, error) {
+	state, err := e.OntologyProposalMutationState(ctx, configured, "")
+	if err != nil {
+		return ontology.OntologyVersion{}, err
+	}
+	return state.Active(), nil
 }
 
 // OntologyProposalEvidence returns independent evidence values for one

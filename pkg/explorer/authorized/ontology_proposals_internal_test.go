@@ -244,8 +244,28 @@ func TestOntologyProposalEvidenceRequiresObjectAuthorization(t *testing.T) {
 		visible[0].Morphisms()[0].Evidence()[0].ID() != allowedEvidence.ID() {
 		t.Fatalf("visible proposals = %#v, want only source-a evidence", visible)
 	}
+	published := deniedProposals[0]
+	for index, state := range []ontology.ProposalState{
+		ontology.ProposalSubmitted,
+		ontology.ProposalApproved,
+		ontology.ProposalPublished,
+	} {
+		published, err = corpus.TransitionOntologyProposal(
+			ctx, published.ID(), state, "governor", "publish",
+			at.Add(time.Duration(index+2)*time.Minute))
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	active, err := client.OntologyActiveState(ctx, baseVersion)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if active.ID() != published.ProposedVersion().ID() {
+		t.Fatalf("active ontology was filtered by hidden evidence: %q", active.ID())
+	}
 	if _, err := client.TransitionOntologyProposal(
-		ctx, deniedProposals[0].ID(), ontology.ProposalSubmitted,
+		ctx, deniedProposals[1].ID(), ontology.ProposalSubmitted,
 		"governor", "unauthorized evidence", at.Add(time.Minute),
 	); !shoal.IsErrorCode(err, shoal.ErrorNotFound) {
 		t.Fatalf("unauthorized evidence transition = %v, want non-disclosing not found", err)
@@ -287,7 +307,11 @@ func TestOntologyProposalEvidenceRequiresObjectAuthorization(t *testing.T) {
 		t.Fatalf("unauthorized evidence proposal persisted: %d proposals", len(stored))
 	}
 	for _, proposal := range stored {
-		if proposal.State() != ontology.ProposalDraft {
+		if proposal.ID() == published.ID() {
+			if proposal.State() != ontology.ProposalPublished {
+				t.Fatalf("published proposal state = %s", proposal.State())
+			}
+		} else if proposal.State() != ontology.ProposalDraft {
 			t.Fatalf("unauthorized evidence transition changed proposal: %#v", proposal)
 		}
 	}

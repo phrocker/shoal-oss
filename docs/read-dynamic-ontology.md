@@ -65,6 +65,10 @@ selection are intentionally tracked separately and are not claimed here.
   ontology and a requested proposal's base identity to ingest-authorized
   mutation preflight. Mutation callers do not receive the governed proposal
   corpus and do not need unrelated read authority.
+- `explorer.OntologyActiveStateProvider` derives the global durable active tip
+  without proposal bodies. Extraction uses the ingest-authorized mutation
+  state, while selectable proposal/catalog views apply read and evidence
+  authorization independently.
 - `webapi.NeighborhoodResponse.OntologyInterpretations` and
   `webapi.PathResponse.OntologyInterpretations` expose effective and original
   identities, safety-path IDs, and unresolved reasons.
