@@ -307,20 +307,32 @@ func TestOntologyLensRejectsRemovedPropertyOwnership(t *testing.T) {
 	targetPerson, _ := NewConceptDefinition("person", "Person", "", nil, nil)
 	source, err := NewOntologyVersion(
 		f.v1.Schema(), "ownership-1", f.v1.CreatedAt().Add(10*time.Second),
-		[]ConceptDefinition{f.person, f.org}, nil, []PropertyDefinition{f.name}, nil)
+		[]ConceptDefinition{f.person, f.org},
+		[]RelationshipDefinition{f.oldRel},
+		[]PropertyDefinition{f.name}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	target, err := NewOntologyVersion(
 		f.v1.Schema(), "ownership-2", f.v1.CreatedAt().Add(11*time.Second),
-		[]ConceptDefinition{targetPerson, f.org}, nil, []PropertyDefinition{f.name}, nil)
+		[]ConceptDefinition{targetPerson, f.org},
+		[]RelationshipDefinition{f.newRel},
+		[]PropertyDefinition{f.name}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := NewOntologyTransition(source, target, nil); err == nil {
+	unrelated := mustMorphism(t, MorphismConfig{
+		Kind: MorphismRename, SourceVersion: source, TargetVersion: target,
+		Sources: []shoal.ID{f.oldRel.ID()}, Targets: []shoal.ID{f.newRel.ID()},
+		Evidence: []EvidenceRef{f.evidence}, Rationale: "unrelated rename",
+	})
+	if _, err := NewOntologyTransition(
+		source, target, []OntologyMorphism{unrelated},
+	); err == nil {
 		t.Fatal("ownership-removing identity-only transition was accepted")
 	}
-	lens, err := NewOntologyLensWithTransitions(target, nil, nil)
+	lens, err := NewOntologyLensWithTransitions(
+		target, []OntologyTransition{}, []OntologyMorphism{unrelated})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -418,6 +430,63 @@ func TestProposalAllowsOnlyOptionalAdditiveConceptProperties(t *testing.T) {
 	if _, err := NewOntologyTransition(source, requiredTarget, nil); err == nil ||
 		!strings.Contains(err.Error(), "retained concept") {
 		t.Fatalf("required additive property error = %v", err)
+	}
+}
+
+func TestOntologyLensReportsOnlyMorphismsAppliedToAssertion(t *testing.T) {
+	f := newMorphismFixture(t)
+	otherOld, _ := NewRelationshipDefinition(
+		"assigned-to", "Assigned To", "", []shoal.ID{f.person.ID()},
+		[]shoal.ID{f.org.ID()}, nil, true, nil)
+	otherNew, _ := NewRelationshipDefinition(
+		"allocated-to", "Allocated To", "", []shoal.ID{f.person.ID()},
+		[]shoal.ID{f.org.ID()}, nil, true, nil)
+	source, err := NewOntologyVersion(
+		f.renameFrom.Schema(), "multi-rename-1",
+		f.renameFrom.CreatedAt().Add(20*time.Second),
+		[]ConceptDefinition{f.person, f.org},
+		[]RelationshipDefinition{f.oldRel, otherOld},
+		[]PropertyDefinition{f.name}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target, err := NewOntologyVersion(
+		f.renameFrom.Schema(), "multi-rename-2",
+		f.renameFrom.CreatedAt().Add(21*time.Second),
+		[]ConceptDefinition{f.person, f.org},
+		[]RelationshipDefinition{f.newRel, otherNew},
+		[]PropertyDefinition{f.name}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	used := mustMorphism(t, MorphismConfig{
+		Kind: MorphismRename, SourceVersion: source, TargetVersion: target,
+		Sources: []shoal.ID{f.oldRel.ID()}, Targets: []shoal.ID{f.newRel.ID()},
+		Evidence: []EvidenceRef{f.evidence}, Rationale: "rename used relationship",
+	})
+	unrelated := mustMorphism(t, MorphismConfig{
+		Kind: MorphismRename, SourceVersion: source, TargetVersion: target,
+		Sources: []shoal.ID{otherOld.ID()}, Targets: []shoal.ID{otherNew.ID()},
+		Evidence: []EvidenceRef{f.evidence}, Rationale: "rename unrelated relationship",
+	})
+	transition, err := NewOntologyTransition(
+		source, target, []OntologyMorphism{used, unrelated})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lens, err := NewOntologyLensWithTransitions(
+		target, []OntologyTransition{transition},
+		[]OntologyMorphism{used, unrelated})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertion := mustRelationshipAssertion(
+		t, f.person.ID(), f.oldRel.ID(), f.org.ID(),
+		source, f.evidence, f.provenance)
+	read := lens.Read(assertion)
+	applied := read.AppliedMorphisms()
+	if !read.Resolved() || len(applied) != 1 || applied[0] != used.ID() {
+		t.Fatalf("applied morphisms = %v, want only %s", applied, used.ID())
 	}
 }
 

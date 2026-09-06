@@ -27,7 +27,7 @@ import (
 )
 
 const (
-	MaxLensTransitions              = MaxPublishedOntologyVersions
+	MaxLensTransitions              = 32
 	MaxMorphismEvidence             = 256
 	MaxMorphismDiscriminatorChoices = 4096
 )
@@ -525,13 +525,28 @@ func NewOntologyTransition(
 	sourceVersion, targetVersion OntologyVersion,
 	morphisms []OntologyMorphism,
 ) (OntologyTransition, error) {
+	if err := sourceVersion.Validate(); err != nil {
+		return OntologyTransition{}, err
+	}
+	if err := targetVersion.Validate(); err != nil {
+		return OntologyTransition{}, err
+	}
+	source, _ := NewOntologyIdentity(sourceVersion)
+	target, _ := NewOntologyIdentity(targetVersion)
+	for _, morphism := range morphisms {
+		if err := morphism.Validate(); err != nil {
+			return OntologyTransition{}, err
+		}
+		if morphism.Source() != source || morphism.Target() != target {
+			return OntologyTransition{}, invalid(
+				"transition morphism does not connect its source and target versions")
+		}
+	}
 	if err := validateProposalEvolution(
 		sourceVersion, targetVersion, morphisms,
 	); err != nil {
 		return OntologyTransition{}, err
 	}
-	source, _ := NewOntologyIdentity(sourceVersion)
-	target, _ := NewOntologyIdentity(targetVersion)
 	transition := OntologyTransition{source: source, target: target}
 	if err := transition.Validate(); err != nil {
 		return OntologyTransition{}, err
@@ -578,6 +593,7 @@ func NewOntologyLensWithTransitions(
 	}
 	identity, _ := NewOntologyIdentity(target)
 	lens := OntologyLens{target: target.clone(), identity: identity}
+	inferTransitions := transitions == nil
 	grouped := make(map[string]*ontologyLensTransition)
 	addTransition := func(source, target OntologyIdentity) *ontologyLensTransition {
 		key := source.String() + "->" + target.String()
@@ -602,7 +618,14 @@ func NewOntologyLensWithTransitions(
 		if morphism.Source().SchemaID() != identity.SchemaID() {
 			continue
 		}
-		edge := addTransition(morphism.Source(), morphism.Target())
+		key := morphism.Source().String() + "->" + morphism.Target().String()
+		edge := grouped[key]
+		if edge == nil {
+			if !inferTransitions {
+				continue
+			}
+			edge = addTransition(morphism.Source(), morphism.Target())
+		}
 		edge.morphisms = append(edge.morphisms, morphism.clone())
 	}
 	for _, transition := range grouped {
@@ -644,29 +667,28 @@ func (l OntologyLens) Read(assertion Assertion) AssertionInterpretation {
 	if !ok {
 		return UnresolvedInterpretation(assertion, l.identity, "no unique published morphism path")
 	}
+	applied := make(map[shoal.ID]struct{})
 	for _, step := range path {
-		var (
-			applied []shoal.ID
-			reason  string
-		)
-		result.subjectType, applied, reason = mapDefinition(
+		var reason string
+		var matched []shoal.ID
+		result.subjectType, matched, reason = mapDefinition(
 			result.subjectType, assertion.metadata, step.morphisms)
 		if reason != "" {
 			return UnresolvedInterpretation(assertion, l.identity, reason)
 		}
-		result.applied = appendUniqueIDs(result.applied, applied)
-		result.predicate, applied, reason = mapDefinition(
+		appendAppliedMorphisms(&result.applied, applied, matched)
+		result.predicate, matched, reason = mapDefinition(
 			result.predicate, assertion.metadata, step.morphisms)
 		if reason != "" {
 			return UnresolvedInterpretation(assertion, l.identity, reason)
 		}
-		result.applied = appendUniqueIDs(result.applied, applied)
-		result.objectType, applied, reason = mapDefinition(
+		appendAppliedMorphisms(&result.applied, applied, matched)
+		result.objectType, matched, reason = mapDefinition(
 			result.objectType, assertion.metadata, step.morphisms)
 		if reason != "" {
 			return UnresolvedInterpretation(assertion, l.identity, reason)
 		}
-		result.applied = appendUniqueIDs(result.applied, applied)
+		appendAppliedMorphisms(&result.applied, applied, matched)
 	}
 	if err := l.validateInterpretation(assertion, result); err != nil {
 		return UnresolvedInterpretation(assertion, l.identity, err.Error())
@@ -736,7 +758,7 @@ func mapDefinition(
 		if !containsID(m.sources, id) {
 			continue
 		}
-		applied = appendUniqueIDs(applied, []shoal.ID{m.ID()})
+		applied = append(applied, m.ID())
 		next := id
 		switch m.kind {
 		case MorphismRename, MorphismMerge:
@@ -760,21 +782,18 @@ func mapDefinition(
 	return mapped, applied, ""
 }
 
-func appendUniqueIDs(existing, additional []shoal.ID) []shoal.ID {
-	for _, id := range additional {
-		duplicate := false
-		for _, candidate := range existing {
-			if candidate == id {
-				duplicate = true
-				break
-			}
-		}
-		if duplicate {
+func appendAppliedMorphisms(
+	target *[]shoal.ID,
+	seen map[shoal.ID]struct{},
+	values []shoal.ID,
+) {
+	for _, id := range values {
+		if _, duplicate := seen[id]; duplicate {
 			continue
 		}
-		existing = append(existing, id)
+		seen[id] = struct{}{}
+		*target = append(*target, id)
 	}
-	return existing
 }
 
 func (l OntologyLens) validateInterpretation(
@@ -807,29 +826,22 @@ func (l OntologyLens) validateInterpretation(
 		if !definitionExists(l.target, interpretation.subjectType) {
 			return invalid("property subject type is absent from selected ontology")
 		}
-		if !propertyAppliesTo(
-			l.target, interpretation.predicate, interpretation.subjectType,
-		) {
-			return invalid("property does not apply to subject type in selected ontology")
+		owners := make([]shoal.ID, 0)
+		for _, concept := range l.target.concepts {
+			if containsID(concept.Properties(), interpretation.predicate) {
+				owners = append(owners, concept.ID())
+			}
+		}
+		for _, relationship := range l.target.relationships {
+			if containsID(relationship.Properties(), interpretation.predicate) {
+				owners = append(owners, relationship.ID())
+			}
+		}
+		if len(owners) > 0 && !containsID(canonicalizeIDs(owners), interpretation.subjectType) {
+			return invalid("property does not apply to the selected subject type")
 		}
 	default:
 		return invalid("predicate is absent from selected ontology")
 	}
 	return nil
-}
-
-func propertyAppliesTo(
-	version OntologyVersion,
-	propertyID, subjectTypeID shoal.ID,
-) bool {
-	switch IDNamespace(subjectTypeID) {
-	case "concept":
-		definition, ok := version.concept(subjectTypeID)
-		return ok && containsID(definition.Properties(), propertyID)
-	case "relationship":
-		definition, ok := version.relationship(subjectTypeID)
-		return ok && containsID(definition.Properties(), propertyID)
-	default:
-		return false
-	}
 }
