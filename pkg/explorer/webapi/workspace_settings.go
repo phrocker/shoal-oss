@@ -430,6 +430,10 @@ func isWorkspaceSettingsManagementPath(path string) bool {
 }
 
 func requestMayCommit(method, path string) bool {
+	if method == http.MethodDelete {
+		return strings.HasPrefix(
+			path, "/api/v1/fleet/events/subscriptions/")
+	}
 	if method != http.MethodPost {
 		return false
 	}
@@ -438,10 +442,21 @@ func requestMayCommit(method, path string) bool {
 		"/api/v1/extract",
 		"/api/v1/derivation/recompute",
 		"/api/v1/ontology/proposals",
-		"/api/v1/analytics":
+		"/api/v1/analytics",
+		"/api/v1/fleet/agents",
+		"/api/v1/fleet/actions",
+		"/api/v1/fleet/actions/invoke",
+		"/api/v1/fleet/events/subscriptions",
+		"/api/v1/fleet/events/publish":
 		return true
 	default:
-		return strings.HasPrefix(path, "/api/v1/ontology/proposals/") &&
-			strings.HasSuffix(path, "/transition")
+		return (strings.HasPrefix(path, "/api/v1/ontology/proposals/") &&
+			strings.HasSuffix(path, "/transition")) ||
+			(strings.HasPrefix(path, "/api/v1/fleet/agents/") &&
+				(strings.HasSuffix(path, "/heartbeat") ||
+					strings.HasSuffix(path, "/revoke"))) ||
+			(strings.HasPrefix(path, "/api/v1/fleet/actions/") &&
+				(strings.HasSuffix(path, "/claim") ||
+					strings.HasSuffix(path, "/cancel")))
 	}
 }

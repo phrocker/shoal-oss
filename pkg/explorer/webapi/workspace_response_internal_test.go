@@ -48,8 +48,39 @@ func TestWorkspaceSettingsClampAnalyticsAndMarkResponseLoss(t *testing.T) {
 		request.Scope.MaxNodes != 25 {
 		t.Fatalf("analytics workspace limits = %#v", request.Scope)
 	}
-	if !requestMayCommit(http.MethodPost, "/api/v1/analytics") {
-		t.Fatal("analytics response loss must be indeterminate after recording")
+	for _, test := range []struct {
+		method string
+		path   string
+	}{
+		{http.MethodPost, "/api/v1/analytics"},
+		{http.MethodPost, "/api/v1/fleet/agents"},
+		{http.MethodPost, "/api/v1/fleet/agents/agent/heartbeat"},
+		{http.MethodPost, "/api/v1/fleet/agents/agent/revoke"},
+		{http.MethodPost, "/api/v1/fleet/actions"},
+		{http.MethodPost, "/api/v1/fleet/actions/invoke"},
+		{http.MethodPost, "/api/v1/fleet/actions/action/claim"},
+		{http.MethodPost, "/api/v1/fleet/actions/action/cancel"},
+		{http.MethodPost, "/api/v1/fleet/events/subscriptions"},
+		{http.MethodDelete, "/api/v1/fleet/events/subscriptions/subscription"},
+		{http.MethodPost, "/api/v1/fleet/events/publish"},
+	} {
+		if !requestMayCommit(test.method, test.path) {
+			t.Fatalf("%s %s response loss must be indeterminate",
+				test.method, test.path)
+		}
+	}
+	for _, test := range []struct {
+		method string
+		path   string
+	}{
+		{http.MethodPost, "/api/v1/fleet/actions/pull"},
+		{http.MethodPost, "/api/v1/fleet/actions/action/status"},
+		{http.MethodPost, "/api/v1/fleet/agents/resolve"},
+		{http.MethodPost, "/api/v1/fleet/agents/agent/resolve"},
+	} {
+		if requestMayCommit(test.method, test.path) {
+			t.Fatalf("%s %s is read-only", test.method, test.path)
+		}
 	}
 }
 
