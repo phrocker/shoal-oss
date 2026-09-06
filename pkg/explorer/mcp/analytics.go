@@ -89,8 +89,8 @@ func NewAnalyticsTool(
 			"page_rank":{
 				"type":"object",
 				"properties":{
-					"damping_factor":{"type":"number","minimum":0,"maximum":1},
-					"convergence_tolerance":{"type":"number","minimum":%g,"maximum":1},
+					"damping_factor":{"type":"number","minimum":0,"exclusiveMaximum":1},
+					"convergence_tolerance":{"type":"number","minimum":%g,"exclusiveMaximum":1},
 					"max_iterations":{"type":"integer","minimum":1,"maximum":%d}
 				},
 				"additionalProperties":false

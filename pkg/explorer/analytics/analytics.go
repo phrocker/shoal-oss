@@ -810,10 +810,12 @@ func normalizePageRank(options PageRankOptions, limits Limits) (PageRankOptions,
 		options.DampingFactor = DefaultDampingFactor
 	}
 	if options.ConvergenceTolerance == 0 {
-		options.ConvergenceTolerance = DefaultConvergenceTolerance
+		options.ConvergenceTolerance = math.Max(
+			DefaultConvergenceTolerance, limits.MinPageRankTolerance)
 	}
 	if options.MaxIterations == 0 {
-		options.MaxIterations = DefaultMaxIterations
+		options.MaxIterations = min(
+			DefaultMaxIterations, limits.MaxPageRankIterations)
 	}
 	if math.IsNaN(options.DampingFactor) ||
 		math.IsInf(options.DampingFactor, 0) ||

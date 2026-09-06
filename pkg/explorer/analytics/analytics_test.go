@@ -271,6 +271,21 @@ func TestValidateRequestBoundsExtremes(t *testing.T) {
 	}
 }
 
+func TestNormalizePageRankDefaultsRespectProviderLimits(t *testing.T) {
+	limits := DefaultLimits()
+	limits.MaxPageRankIterations = 10
+	limits.MinPageRankTolerance = 1e-8
+	normalized, err := normalizePageRank(PageRankOptions{}, limits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if normalized.DampingFactor != DefaultDampingFactor ||
+		normalized.ConvergenceTolerance != limits.MinPageRankTolerance ||
+		normalized.MaxIterations != limits.MaxPageRankIterations {
+		t.Fatalf("normalized defaults = %#v", normalized)
+	}
+}
+
 func TestServiceRejectsProviderMarkedIncomplete(t *testing.T) {
 	source := &staticMaterializer{materialization: Materialization{}}
 	service, err := NewService(Config{Source: source, Limits: DefaultLimits()})

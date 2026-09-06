@@ -146,7 +146,7 @@ func (c *Client) materializeAnalyticsNeighborhood(
 	nodes := make(map[shoal.ID]graph.Node, len(request.NodeIDs))
 	edges := make(map[shoal.ID]graph.Edge)
 	assertions := make(map[shoal.ID]ontology.Assertion)
-	evidenceBytes := uint64(0)
+	evidenceBytes := uint64(2)
 	charge := func(value any) error {
 		encoded, err := json.Marshal(value)
 		if err != nil {
