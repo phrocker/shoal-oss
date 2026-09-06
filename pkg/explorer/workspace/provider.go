@@ -42,6 +42,32 @@ type OntologyChoices interface {
 	AuthorizeOntology(context.Context, auth.Decision, ontology.OntologyIdentity) error
 }
 
+// OperationOntologyChoices authorizes a selected ontology under the exact
+// operation whose decision is being narrowed.
+type OperationOntologyChoices interface {
+	OntologyChoices
+	AuthorizeOntologyForOperation(
+		context.Context,
+		auth.Decision,
+		ontology.OntologyIdentity,
+		auth.Operation,
+	) error
+}
+
+func authorizeOntologyForOperation(
+	ctx context.Context,
+	choices OntologyChoices,
+	decision auth.Decision,
+	identity ontology.OntologyIdentity,
+	operation auth.Operation,
+) error {
+	if operationChoices, ok := choices.(OperationOntologyChoices); ok {
+		return operationChoices.AuthorizeOntologyForOperation(
+			ctx, decision, identity, operation)
+	}
+	return choices.AuthorizeOntology(ctx, decision, identity)
+}
+
 // CeilingResolver returns the configured ceiling for a trusted service
 // decision. User decisions do not require a service ceiling.
 type CeilingResolver interface {
@@ -370,8 +396,10 @@ func (p *Provider) SelectOntology(
 		return Settings{}, err
 	}
 	if absent(p.ontologyChoices) ||
-		p.ontologyChoices.AuthorizeOntology(
-			ctx, check.decision, identity) != nil {
+		authorizeOntologyForOperation(
+			ctx, p.ontologyChoices, check.decision, identity,
+			auth.OperationWorkspaceSettingsWrite,
+		) != nil {
 		return Settings{}, authDenied()
 	}
 	var current Settings
@@ -631,8 +659,10 @@ func (p *Provider) normalizeUpdate(
 		if absent(p.ontologyChoices) {
 			return Narrowing{}, authDenied()
 		}
-		if err := p.ontologyChoices.AuthorizeOntology(
-			ctx, decision, ontologySelection.Identity); err != nil {
+		if err := authorizeOntologyForOperation(
+			ctx, p.ontologyChoices, decision, ontologySelection.Identity,
+			auth.OperationWorkspaceSettingsWrite,
+		); err != nil {
 			return Narrowing{}, authDenied()
 		}
 	}
@@ -836,8 +866,10 @@ func DeriveEffectiveDecision(
 		if absent(options.OntologyChoices) {
 			return EffectiveDecision{}, authDenied()
 		}
-		if err := options.OntologyChoices.AuthorizeOntology(
-			ctx, base, narrowing.SelectedOntology.Identity); err != nil {
+		if err := authorizeOntologyForOperation(
+			ctx, options.OntologyChoices, base,
+			narrowing.SelectedOntology.Identity, operation,
+		); err != nil {
 			return EffectiveDecision{}, authDenied()
 		}
 		selected = narrowing.SelectedOntology.Identity

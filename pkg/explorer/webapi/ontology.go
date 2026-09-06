@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/phrocker/shoal-oss/pkg/explorer"
+	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/ontology"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
@@ -53,6 +54,16 @@ type ActiveOntologyProvider interface {
 // semantics.
 type OntologyCatalogProvider interface {
 	OntologyCatalog(context.Context) (ontology.PublishedCatalog, bool, error)
+}
+
+// OntologySelectionAuthorizer checks one published identity under the exact
+// operation whose decision is being narrowed without exposing the catalog.
+type OntologySelectionAuthorizer interface {
+	AuthorizeOntologySelection(
+		context.Context,
+		ontology.OntologyIdentity,
+		auth.Operation,
+	) error
 }
 
 // OntologyResponse is the stable browser contract for the currently active
@@ -261,6 +272,54 @@ func (s *EmbeddedService) OntologyCatalog(
 	}
 	catalog, err := boundedOntologyCatalog(configured, nil)
 	return catalog, true, err
+}
+
+// AuthorizeOntologySelection checks one governed published identity without
+// requiring the caller to have workspace-settings catalog read authority.
+func (s *EmbeddedService) AuthorizeOntologySelection(
+	ctx context.Context,
+	identity ontology.OntologyIdentity,
+	operation auth.Operation,
+) error {
+	if ctx == nil {
+		return shoal.NewError(shoal.ErrorInvalidArgument, "context is required")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := identity.Validate(); err != nil {
+		return err
+	}
+	if err := operation.Validate(); err != nil {
+		return err
+	}
+	s.ontologyMu.RLock()
+	if s.ontologyVersion == nil {
+		s.ontologyMu.RUnlock()
+		return auth.ObjectNotFound()
+	}
+	configured := *s.ontologyVersion
+	s.ontologyMu.RUnlock()
+	provider, ok := s.client.(interface {
+		AuthorizePublishedOntology(
+			context.Context,
+			ontology.OntologyVersion,
+			ontology.OntologyIdentity,
+			auth.Operation,
+		) error
+	})
+	if ok {
+		return provider.AuthorizePublishedOntology(
+			ctx, configured, identity, operation)
+	}
+	catalog, configuredSet, err := s.OntologyCatalog(ctx)
+	if err != nil {
+		return err
+	}
+	if !configuredSet || !catalog.Contains(identity) {
+		return auth.ObjectNotFound()
+	}
+	return nil
 }
 
 func boundedOntologyCatalog(
