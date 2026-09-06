@@ -457,6 +457,129 @@ func TestAuthorizedInteractionReauthorizesExactSourceEdge(t *testing.T) {
 	}
 }
 
+func TestAuthorizedRecorderSetupRequiresLiveCredential(t *testing.T) {
+	f := newFixture(t)
+	if err := f.clientA.EnsureInteractionSink(
+		context.Background(),
+	); !shoal.IsErrorCode(err, shoal.ErrorUnauthorized) {
+		t.Fatalf("credential-less recorder setup = %v", err)
+	}
+	expired := f.decision(
+		t, "expired-recorder",
+		[][]byte{f.sourceA}, [][]byte{f.policyA},
+		[]auth.Operation{auth.OperationConnect},
+	)
+	ctx := f.context(t, expired)
+	f.clock.Set(expired.AuthenticationExpires().Add(time.Second))
+	if err := f.clientA.EnsureInteractionSink(
+		ctx,
+	); !shoal.IsErrorCode(err, shoal.ErrorUnauthorized) {
+		t.Fatalf("expired recorder setup = %v", err)
+	}
+}
+
+func TestAuthorizedRecorderSetupSupportsEvidenceEmptyActionOnlyGrant(t *testing.T) {
+	f := newFixture(t)
+	snapshot, err := f.base.Snapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.clock.Set(snapshot.AsOf.Add(time.Second))
+	decision := f.decision(
+		t, "action-only-recorder",
+		[][]byte{f.sourceA}, [][]byte{f.policyA},
+		[]auth.Operation{auth.OperationConnect},
+	)
+	ctx := f.context(t, decision)
+	recorder, err := interaction.NewRecorder(ctx, f.clientA)
+	if err != nil {
+		t.Fatalf("action-only recorder setup = %v", err)
+	}
+	if err := recorder.SetClock(f.clock.Now); err != nil {
+		t.Fatal(err)
+	}
+	fingerprint, err := auth.AuthorizationFingerprint(decision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := interaction.Session{
+		ID: interaction.DerivedID(
+			"session", "action-only-recorder"),
+		Operation:                interaction.OperationToolCall,
+		AuthorizationOperation:   string(auth.OperationConnect),
+		SnapshotID:               shoal.ID(snapshot.ID),
+		SnapshotAsOf:             snapshot.AsOf,
+		AuthorizationFingerprint: shoal.ID(fingerprint.String()),
+		AuthorizationExpiresAt:   decision.AuthenticationExpires(),
+		Turns: []interaction.Turn{{
+			Index: 0, Decision: string(auth.OperationConnect),
+			ToolCall: &interaction.ToolCall{
+				Kind: string(auth.OperationConnect),
+			},
+		}},
+	}
+	persisted, err := recorder.Record(ctx, request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if persisted.AuthorizationOperation !=
+		string(auth.OperationConnect) ||
+		persisted.Actor.SubjectID != decision.Subject() ||
+		persisted.Actor.ActorID != decision.Actor() ||
+		len(persisted.TouchedNodeIDs()) != 0 {
+		t.Fatalf("action-only persisted session = %+v", persisted)
+	}
+}
+
+func TestAuthorizedInteractionPreservesNarrowerExpiry(t *testing.T) {
+	f := newFixture(t)
+	snapshot, err := f.base.Snapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.clock.Set(snapshot.AsOf.Add(time.Second))
+	decision := f.decision(
+		t, "narrow-expiry",
+		[][]byte{f.sourceA}, [][]byte{f.policyA},
+		[]auth.Operation{auth.OperationRetrieve},
+	)
+	fingerprint, err := auth.AuthorizationFingerprint(decision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	narrowExpiry := f.clock.Now().Add(5 * time.Minute)
+	session := interaction.Session{
+		ID:                       interaction.DerivedID("session", "narrow-expiry"),
+		Operation:                interaction.OperationRetrieval,
+		SnapshotID:               shoal.ID(snapshot.ID),
+		SnapshotAsOf:             snapshot.AsOf,
+		AuthorizationFingerprint: shoal.ID(fingerprint.String()),
+		AuthorizationExpiresAt:   narrowExpiry,
+	}
+	persisted, err := f.clientA.RecordInteractionResult(
+		f.context(t, decision), session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !persisted.AuthorizationExpiresAt.Equal(narrowExpiry) {
+		t.Fatalf("persisted expiry = %v, want %v",
+			persisted.AuthorizationExpiresAt, narrowExpiry)
+	}
+	record, err := f.base.InteractionRecord(
+		context.Background(), session.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !record.Session.AuthorizationExpiresAt.Equal(narrowExpiry) ||
+		!record.Summary.AuthorizationExpiresAt.Equal(narrowExpiry) {
+		t.Fatalf("durable expiry = session %v summary %v, want %v",
+			record.Session.AuthorizationExpiresAt,
+			record.Summary.AuthorizationExpiresAt,
+			narrowExpiry,
+		)
+	}
+}
+
 func TestAuthorizedInteractionEnrichesTrustedActorDelegationAndReason(t *testing.T) {
 	f := newFixture(t)
 	receipt, err := f.clientA.Ingest(f.admin(t), explorer.Source{

@@ -30,15 +30,19 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
-// EnsureInteractionSink verifies both the caller's current authorization pin
-// and the base corpus's durable write path. This makes *Client directly usable
-// with harness.NewGraphRecorder without bypassing the authorization wrapper.
+// EnsureInteractionSink verifies the caller's credential and the configured
+// durable write path. Setup is not pinned to one operation: authorization for
+// the recorded work is operation-specific and is enforced by
+// RecordInteractionResult once the Session declares AuthorizationOperation,
+// and requiring Retrieve here would incorrectly reject evidence-empty
+// privileged action recorders. It still requires a live credential that grants
+// something, because the base sink probe is a durable write.
 func (c *Client) EnsureInteractionSink(ctx context.Context) error {
-	writer, err := c.interactionWriter()
+	guard, err := c.beginAny(ctx)
 	if err != nil {
 		return err
 	}
-	_, guard, _, err := c.begin(ctx, auth.OperationRetrieve)
+	writer, err := c.interactionWriter()
 	if err != nil {
 		return err
 	}
@@ -285,6 +289,25 @@ func (c *Client) recordInteraction(
 					"durable interaction sink returned a different record",
 				),
 			)
+		}
+		if !returned.RecordedAt.Equal(canonical.RecordedAt) {
+			// Only a durable retry winner may replace the admitted timestamp.
+			stored, readErr := reader.InteractionRecord(ctx, canonical.ID)
+			if readErr != nil {
+				return persisted, explorer.MarkCommittedInteraction(
+					explorer.MarkIndeterminateCommit(directBaseError(readErr)),
+				)
+			}
+			durable, durableErr := stored.Session.Canonical()
+			if stored.Summary.Deleted || durableErr != nil ||
+				!reflect.DeepEqual(durable, returned) {
+				return persisted, explorer.MarkCommittedInteraction(
+					shoal.NewError(
+						shoal.ErrorInternal,
+						"durable interaction sink returned an unverified timestamp",
+					),
+				)
+			}
 		}
 		persisted = returned
 	}

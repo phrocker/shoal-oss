@@ -469,6 +469,66 @@ func TestAuthorizedVectorRetrievalProjection(t *testing.T) {
 	}
 }
 
+func TestAuthorizedEmptyVectorRetrievalDoesNotProbeProvider(t *testing.T) {
+	f := newFixture(t)
+	base, err := explorer.OpenWithOptions(t.TempDir(), explorer.Options{
+		Embedder: model.FakeEmbedder{Model: "authorized-empty", Dimensions: 8},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = base.Close() })
+	clientB := f.newClient(t, base, f.store, f.sourceB, f.policyB, nil)
+	if _, err := clientB.Ingest(f.admin(t), explorer.Source{
+		URI:       "file:///hidden-vector-only.txt",
+		MediaType: explorer.MediaTypeText,
+		Content:   "hidden vector evidence",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	retrieveCalls := 0
+	untrusted := &hookClient{
+		Client: base,
+		retrieve: func(
+			context.Context, retrieval.Request,
+		) (retrieval.Response, error) {
+			retrieveCalls++
+			return retrieval.Response{}, errors.New(
+				"empty authorized retrieval reached the untrusted base")
+		},
+	}
+	selector, err := authorized.NewStaticPolicySelector(f.sourceA, f.policyA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scorer := &countingVectorScorer{VectorScorer: base}
+	clientA, err := authorized.NewClient(authorized.Config{
+		Base: untrusted, VectorScorer: scorer,
+		Resolver: f.authority.Resolver(), PolicySelector: selector,
+		PolicyStore: f.store, GenerationReader: f.reader, Clock: f.clock.Now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := clientA.Retrieve(f.alice(t), retrieval.Request{
+		Text:  "hidden vector evidence",
+		TopK:  1,
+		Modes: []retrieval.Mode{retrieval.ModeVector},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(response.Results) != 0 {
+		t.Fatalf("authorized empty vector response = %+v", response)
+	}
+	if scorer.calls != 0 {
+		t.Fatalf("trusted vector scorer calls = %d, want 0", scorer.calls)
+	}
+	if retrieveCalls != 0 {
+		t.Fatalf("untrusted base retrieval calls = %d", retrieveCalls)
+	}
+}
+
 func TestAuthorizedVectorRetrievalUsesTrustedScorer(t *testing.T) {
 	f := newFixture(t)
 	base, err := explorer.OpenWithOptions(t.TempDir(), explorer.Options{

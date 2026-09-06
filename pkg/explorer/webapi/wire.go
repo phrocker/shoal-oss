@@ -626,8 +626,11 @@ func (r *RetrievalResponse) UnmarshalJSON(data []byte) error {
 		}
 	}
 	*r = RetrievalResponse{
-		Snapshot:   wire.Snapshot,
-		Retrieval:  retrieval.Response{RequestID: requestID, Results: results},
+		Snapshot: wire.Snapshot,
+		Retrieval: retrieval.Response{
+			RequestID: requestID,
+			Results:   results,
+		},
 		Suppressed: wire.Suppressed,
 		Restricted: wire.Restricted,
 		Embedding:  embedding,

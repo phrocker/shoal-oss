@@ -123,28 +123,7 @@ func (c *Client) VectorAvailable(ctx context.Context) (bool, error) {
 	}
 	available := true
 	if len(visibleOrder) == 0 {
-		_, err = c.authorizedVectorScores(
-			ctx,
-			retrieval.Request{
-				Text:  vectorCapabilityProbeText,
-				Modes: []retrieval.Mode{retrieval.ModeVector},
-			},
-			corpus,
-			nil,
-		)
-		if err != nil {
-			switch {
-			case shoal.IsErrorCode(err, shoal.ErrorCanceled),
-				shoal.IsErrorCode(err, shoal.ErrorDeadline):
-				return false, err
-			case shoal.IsErrorCode(err, shoal.ErrorUnavailable),
-				shoal.IsErrorCode(err, shoal.ErrorConflict),
-				shoal.IsErrorCode(err, shoal.ErrorInvalidArgument):
-				available = false
-			default:
-				return false, err
-			}
-		}
+		available = false
 	} else {
 		probe := retrieval.Request{
 			Text:  vectorCapabilityProbeText,

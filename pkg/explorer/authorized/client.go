@@ -57,9 +57,18 @@ type Config struct {
 	// VectorScorer is an optional explicitly trusted scorer for authorized
 	// vector retrieval validation. It is intentionally separate from Base:
 	// Base responses are treated as untrusted and validated canonically.
-	VectorScorer      VectorScorer
+	VectorScorer VectorScorer
+	// InteractionWriter is the explicitly trusted durable sink for
+	// interaction records. It is separate from Base because Base responses
+	// and mutation acknowledgements are not authorization evidence.
 	InteractionWriter explorer.InteractionWriter
+	// InteractionReader is the explicitly trusted source for durable
+	// interaction envelopes. It is intentionally separate from Base because
+	// authorization decisions for derived views depend on the stored source
+	// set and authorization fingerprint.
 	InteractionReader explorer.InteractionReader
+	// SnapshotValidator is the explicitly trusted verifier for historical
+	// corpus frontiers pinned into interaction records.
 	SnapshotValidator SnapshotValidator
 	// OntologyInterpreter is an optional explicitly trusted read-time
 	// interpreter. It is separate from Base because Base graph responses are
@@ -515,6 +524,49 @@ func (c *Client) begin(
 		return auth.Decision{}, auth.GenerationGuard{}, time.Time{}, err
 	}
 	return decision, guard, now, nil
+}
+
+// beginAny authorizes a setup-time operation that is not tied to one specific
+// operation. It still requires a live, in-domain credential and a policy
+// generation guard, but accepts any operation the decision itself grants, so
+// an action-only grant is not rejected the way pinning setup to Retrieve
+// would reject it. A decision that grants nothing is denied.
+func (c *Client) beginAny(ctx context.Context) (auth.GenerationGuard, error) {
+	if err := contextFailure(ctx); err != nil {
+		return auth.GenerationGuard{}, err
+	}
+	decision, err := c.resolver.Resolve(ctx)
+	if err != nil {
+		return auth.GenerationGuard{}, resolverFailure(ctx, err)
+	}
+	now := c.clock()
+	if now.IsZero() {
+		return auth.GenerationGuard{}, authorizationDenied()
+	}
+	request := auth.ResourceRequest{
+		AuthorizationDomain: decision.AuthorizationDomain(),
+	}
+	granted := false
+	for _, operation := range decision.AllowedOperations() {
+		if err := decision.Authorize(operation, request, now); err == nil {
+			granted = true
+			break
+		}
+	}
+	if !granted {
+		if contextErr := contextFailure(ctx); contextErr != nil {
+			return auth.GenerationGuard{}, contextErr
+		}
+		return auth.GenerationGuard{}, authorizationDenied()
+	}
+	guard, err := auth.NewGenerationGuard(decision, c.generationReader)
+	if err != nil {
+		return auth.GenerationGuard{}, authorizationDenied()
+	}
+	if err := guard.Check(ctx); err != nil {
+		return auth.GenerationGuard{}, err
+	}
+	return guard, nil
 }
 
 func (c *Client) selectIngestRule(

@@ -124,6 +124,17 @@ Two obligations follow for any `Recorder` implementation:
 Recording happens on the cache-hit path as well as the miss path. A cached
 answer is still an answer that was served, so it still produces a record.
 
+An authorized result sink may return an earlier `RecordedAt` for an exact
+concurrent retry only when a trusted durable point-read confirms the entire
+returned session. This verification does not require an additional read grant.
+A failed post-write verification cannot produce success or imply rollback;
+an unavailable durable read preserves both committed and indeterminate markers.
+
+Both the product recorder and harness compare successful result-sink receipts
+with the requested canonical session. Only trusted time, actor, reason, and a
+previously unspecified authorization operation may be enriched. Changed work,
+evidence, or pins fail with a committed marker rather than reporting success.
+
 No Copilot, SDK-process, or other hosted execution backend is bundled. Future
 backends can implement `Runner` without changing inference contracts; the
 package deliberately includes no arbitrary subprocess runner.
