@@ -100,6 +100,7 @@ func (r *generationReader) SetError(err error) {
 }
 
 type fixture struct {
+	dataDir   string
 	base      *explorer.Explorer
 	store     *authorized.MemoryPolicyStore
 	clock     *fakeClock
@@ -122,12 +123,14 @@ func newFixture(t *testing.T) *fixture {
 	if err != nil {
 		t.Fatal(err)
 	}
-	base, err := explorer.Open(t.TempDir())
+	dataDir := t.TempDir()
+	base, err := explorer.Open(dataDir)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = base.Close() })
 	f := &fixture{
+		dataDir:   dataDir,
 		base:      base,
 		store:     authorized.NewMemoryPolicyStore(),
 		clock:     clock,

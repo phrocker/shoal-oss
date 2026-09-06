@@ -652,6 +652,82 @@ func TestAuthorizedExactRetryUsesTrustedDurableRecord(t *testing.T) {
 	}
 }
 
+func TestAuthorizedResultSinkExactRetryAfterReopen(t *testing.T) {
+	f := newFixture(t)
+	snapshot, err := f.base.Snapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstTime := snapshot.AsOf.Add(time.Second)
+	f.clock.Set(firstTime)
+	decision := f.decision(
+		t, "restart-retry",
+		[][]byte{f.sourceA}, [][]byte{f.policyA},
+		[]auth.Operation{auth.OperationRetrieve},
+	)
+	fingerprint, err := auth.AuthorizationFingerprint(decision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := interaction.Session{
+		ID:                       interaction.DerivedID("session", "authorized-restart-retry"),
+		RecordedAt:               snapshot.AsOf.Add(-time.Hour),
+		Operation:                interaction.OperationRetrieval,
+		SnapshotID:               shoal.ID(snapshot.ID),
+		SnapshotAsOf:             snapshot.AsOf,
+		AuthorizationFingerprint: shoal.ID(fingerprint.String()),
+		AuthorizationExpiresAt:   decision.AuthenticationExpires(),
+	}
+	ctx := f.context(t, decision)
+	recorder, err := interaction.NewRecorder(ctx, f.clientA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := recorder.SetClock(f.clock.Now); err != nil {
+		t.Fatal(err)
+	}
+	first, err := recorder.Record(ctx, session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !first.RecordedAt.Equal(firstTime) {
+		t.Fatalf("first accepted time = %v", first.RecordedAt)
+	}
+	if err := f.base.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := explorer.Open(f.dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = reopened.Close() })
+	retryClient := f.newClient(
+		t, reopened, f.store, f.sourceA, f.policyA, nil)
+	retryRecorder, err := interaction.NewRecorder(ctx, retryClient)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.clock.Set(firstTime.Add(time.Minute))
+	if err := retryRecorder.SetClock(f.clock.Now); err != nil {
+		t.Fatal(err)
+	}
+	session.RecordedAt = firstTime.Add(24 * time.Hour)
+	retried, err := retryRecorder.Record(ctx, session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(retried, first) {
+		t.Fatalf("reopened retry = %+v, want %+v", retried, first)
+	}
+	records, err := reopened.InteractionRecords(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 1 {
+		t.Fatalf("durable record count = %d", len(records))
+	}
+}
+
 func TestAuthorizedInteractionMarksPostSinkExpiryCommitted(t *testing.T) {
 	f := newFixture(t)
 	snapshot, err := f.base.Snapshot(context.Background())
