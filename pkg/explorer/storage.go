@@ -710,6 +710,10 @@ func validatePersistedDocument(record persistedDocument) error {
 		if !utf8.ValidString(node.Kind) {
 			return fmt.Errorf("graph node kind is invalid")
 		}
+		if interaction.IsInteractionID(node.ID) {
+			return fmt.Errorf(
+				"content cannot use the reserved interaction node ID namespace")
+		}
 		if interaction.IsInteractionKind(node.Kind) {
 			return fmt.Errorf("content cannot use the reserved interaction node kind namespace")
 		}
@@ -722,6 +726,10 @@ func validatePersistedDocument(record persistedDocument) error {
 	for _, edge := range record.Edges {
 		if err := validatePersistedEdge(edge); err != nil {
 			return err
+		}
+		if interaction.IsInteractionID(edge.ID) {
+			return fmt.Errorf(
+				"content cannot use the reserved interaction edge ID namespace")
 		}
 		if interaction.IsInteractionEdgeType(edge.Type) {
 			return fmt.Errorf("content cannot use the reserved interaction edge type namespace")

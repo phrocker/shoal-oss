@@ -263,6 +263,46 @@ func (e *Explorer) requireInteractionGraphIDsAvailableLocked(
 	return nil
 }
 
+func (e *Explorer) requireSourceGraphIDsAvailableLocked(
+	nodes []graph.Node, edges []graph.Edge,
+) error {
+	nodeIDs := make(map[shoal.ID]struct{})
+	edgeIDs := make(map[shoal.ID]struct{})
+	for _, record := range e.interactions {
+		for _, node := range record.Nodes {
+			nodeIDs[node.ID] = struct{}{}
+		}
+		for _, edge := range record.Edges {
+			edgeIDs[edge.ID] = struct{}{}
+		}
+	}
+	for _, record := range e.folds {
+		for _, node := range record.Nodes {
+			nodeIDs[node.ID] = struct{}{}
+		}
+		for _, edge := range record.Edges {
+			edgeIDs[edge.ID] = struct{}{}
+		}
+	}
+	for _, node := range nodes {
+		if _, exists := nodeIDs[node.ID]; exists {
+			return shoal.NewError(
+				shoal.ErrorConflict,
+				"source node ID collides with an interaction node",
+			)
+		}
+	}
+	for _, edge := range edges {
+		if _, exists := edgeIDs[edge.ID]; exists {
+			return shoal.NewError(
+				shoal.ErrorConflict,
+				"source edge ID collides with an interaction edge",
+			)
+		}
+	}
+	return nil
+}
+
 // RecordInteractionResult records a session and returns the exact canonical
 // value accepted for persistence. The returned value is independently owned.
 func (e *Explorer) RecordInteractionResult(

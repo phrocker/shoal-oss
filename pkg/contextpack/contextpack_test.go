@@ -161,6 +161,27 @@ func TestBuildPinsEmbeddingSpaceIdentity(t *testing.T) {
 	); err == nil {
 		t.Fatal("mismatched trusted embedding-space pin was accepted")
 	}
+
+	pins.EmbeddingSpaceID = response.EmbeddingSpaceID
+	pins.EmbeddingSpaceIDs = nil
+	if _, err := (Builder{Reader: client}).Build(
+		context.Background(),
+		InitialRequest{Request: request, Response: response, Pins: pins},
+	); err == nil {
+		t.Fatal("aggregate-only trusted embedding-space pin was accepted")
+	}
+
+	_, lexical, lexicalResponse, lexicalPins := embeddedFixture(t)
+	lexicalPins.EmbeddingSpaceID = response.EmbeddingSpaceID
+	lexicalPins.EmbeddingSpaceIDs = []shoal.ID{constituent}
+	if _, err := (Builder{Reader: client}).Build(
+		context.Background(),
+		InitialRequest{
+			Request: lexical, Response: lexicalResponse, Pins: lexicalPins,
+		},
+	); err == nil {
+		t.Fatal("non-vector retrieval accepted embedding-space pins")
+	}
 }
 
 func TestMergeEmbeddingSpaceMetadataIsASetUnion(t *testing.T) {

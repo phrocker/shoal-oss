@@ -41,7 +41,12 @@ type Config struct {
 	// VectorScorer is an optional explicitly trusted scorer for authorized
 	// vector retrieval validation. It is intentionally separate from Base:
 	// Base responses are treated as untrusted and validated canonically.
-	VectorScorer       VectorScorer
+	VectorScorer VectorScorer
+	// InteractionReader is the explicitly trusted source for durable
+	// interaction envelopes. It is intentionally separate from Base because
+	// authorization decisions for derived views depend on the stored source
+	// set and authorization fingerprint.
+	InteractionReader  explorer.InteractionReader
 	Resolver           auth.Resolver
 	PolicySelector     PolicySelector
 	EdgePolicySelector EdgePolicySelector
@@ -60,6 +65,7 @@ type Config struct {
 type Client struct {
 	base               explorer.Client
 	vectorScorer       VectorScorer
+	interactionSource  explorer.InteractionReader
 	resolver           auth.Resolver
 	policySelector     PolicySelector
 	edgePolicySelector EdgePolicySelector
@@ -123,6 +129,7 @@ func NewClient(config Config) (*Client, error) {
 	return &Client{
 		base:               config.Base,
 		vectorScorer:       config.VectorScorer,
+		interactionSource:  config.InteractionReader,
 		resolver:           config.Resolver,
 		policySelector:     config.PolicySelector,
 		edgePolicySelector: edgeSelector,

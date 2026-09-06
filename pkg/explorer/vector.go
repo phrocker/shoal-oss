@@ -34,6 +34,7 @@ import (
 	"github.com/phrocker/shoal-oss/internal/embeddingspace"
 	"github.com/phrocker/shoal-oss/pkg/document"
 	"github.com/phrocker/shoal-oss/pkg/model"
+	"github.com/phrocker/shoal-oss/pkg/retrieval"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
@@ -329,6 +330,77 @@ func (e *Explorer) VectorScores(
 		}
 	}
 	return scores, nil
+}
+
+// VectorEmbeddingSpaceIDs returns the canonical embedding-space constituents
+// used by VectorScores for the same trusted request.
+func (e *Explorer) VectorEmbeddingSpaceIDs(
+	ctx context.Context,
+	request VectorScoreRequest,
+) ([]shoal.ID, error) {
+	if err := contextError(ctx); err != nil {
+		return nil, err
+	}
+	for _, citation := range request.Citations {
+		if err := citation.Validate(); err != nil {
+			return nil, err
+		}
+	}
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	if err := e.requireOpen(); err != nil {
+		return nil, err
+	}
+	if len(request.Citations) == 0 {
+		identity, err := e.embeddingIdentity()
+		if err != nil {
+			return nil, err
+		}
+		id, err := retrieval.EmbeddingSpaceIdentityID(identity)
+		if err != nil {
+			return nil, err
+		}
+		return []shoal.ID{id}, nil
+	}
+	spaces := make(map[shoal.ID]struct{})
+	for _, citation := range request.Citations {
+		record := e.documents[citation.DocumentID][citation.RevisionID]
+		if record == nil || record.Embeddings == nil {
+			return nil, shoal.NewError(
+				shoal.ErrorUnavailable,
+				"vector scoring requires embeddings for every cited span",
+			)
+		}
+		embeddings, err := recordEmbeddingMap(record)
+		if err != nil {
+			return nil, err
+		}
+		spans := make(map[shoal.ID]document.Span, len(record.Spans))
+		for _, span := range record.Spans {
+			spans[span.ID] = span
+		}
+		span, ok := spans[citation.SpanID]
+		embedding, embedded := embeddings[citation.SpanID]
+		if !ok || !embedded || span.SectionID != citation.SectionID ||
+			span.Range != citation.Range || !embeddingMatchesSpan(embedding, span) {
+			return nil, shoal.NewError(
+				shoal.ErrorNotFound, "vector score citation span not found")
+		}
+		id, err := retrieval.EmbeddingSpaceIdentityID(
+			record.Embeddings.Provenance.Identity)
+		if err != nil {
+			return nil, err
+		}
+		spaces[id] = struct{}{}
+	}
+	ids := make([]shoal.ID, 0, len(spaces))
+	for id := range spaces {
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool {
+		return shoal.CompareID(ids[i], ids[j]) < 0
+	})
+	return ids, nil
 }
 
 func (e *Explorer) cacheVectorAvailability(

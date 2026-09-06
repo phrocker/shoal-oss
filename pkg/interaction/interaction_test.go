@@ -75,7 +75,7 @@ func TestParseVisibilityRoundTripsAndRejectsBadLabels(t *testing.T) {
 
 func TestSubgraphDistinguishesRetrievedFromCited(t *testing.T) {
 	session := interaction.Session{
-		ID:         "session-1",
+		ID:         interaction.DerivedID("session", "1"),
 		RecordedAt: time.Unix(1700000000, 0).UTC(),
 		Turns: []interaction.Turn{{
 			Index:    0,
@@ -135,7 +135,7 @@ func TestSubgraphPersistsExecutionPinsOnAddressableInference(t *testing.T) {
 	snapshotAt := recordedAt.Add(-time.Minute)
 	expiresAt := recordedAt.Add(time.Hour)
 	session := interaction.Session{
-		ID:                       "session-pinned",
+		ID:                       interaction.DerivedID("session", "pinned"),
 		RecordedAt:               recordedAt,
 		SnapshotID:               "snapshot-17",
 		SnapshotAsOf:             snapshotAt,
@@ -186,7 +186,7 @@ func TestVisibilityAndProvenanceHaveNoSemanticCountCap(t *testing.T) {
 		ids[index] = shoal.ID(fmt.Sprintf("span-%03d", index))
 	}
 	session := interaction.Session{
-		ID:           "session-uncapped",
+		ID:           interaction.DerivedID("session", "uncapped"),
 		RecordedAt:   time.Unix(1700000000, 0).UTC(),
 		SeedNodeIDs:  ids,
 		CitedNodeIDs: []shoal.ID{ids[len(ids)-1]},
@@ -232,7 +232,7 @@ func TestOversizedVisibilityIsDigestMarkedAndFailsClosed(t *testing.T) {
 			"label-%03d-%s", index, strings.Repeat("x", 56))
 	}
 	session := interaction.Session{
-		ID:          "session-large-visibility",
+		ID:          interaction.DerivedID("session", "large-visibility"),
 		RecordedAt:  time.Unix(1700000000, 0).UTC(),
 		SeedNodeIDs: ids,
 	}
@@ -270,7 +270,7 @@ func TestOversizedVisibilityIsDigestMarkedAndFailsClosed(t *testing.T) {
 // unresolvable node produces an error, never a silently public node.
 func TestSubgraphFailsClosedWhenVisibilityCannotBeResolved(t *testing.T) {
 	session := interaction.Session{
-		ID:           "session-2",
+		ID:           interaction.DerivedID("session", "2"),
 		RecordedAt:   time.Unix(1700000000, 0).UTC(),
 		CitedNodeIDs: []shoal.ID{"span-missing"},
 	}
@@ -286,7 +286,7 @@ func TestSubgraphFailsClosedWhenVisibilityCannotBeResolved(t *testing.T) {
 
 func TestSessionValidateRejectsMalformedSessions(t *testing.T) {
 	valid := interaction.Session{
-		ID:         "session-3",
+		ID:         interaction.DerivedID("session", "3"),
 		RecordedAt: time.Unix(1700000000, 0).UTC(),
 	}
 	if err := valid.Validate(); err != nil {

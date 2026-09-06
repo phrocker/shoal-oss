@@ -364,6 +364,11 @@ func (e *Explorer) ingest(
 		return IngestResult{}, shoal.NewError(
 			shoal.ErrorUnavailable, "embedded publication sequence is exhausted")
 	}
+	if err := e.requireSourceGraphIDsAvailableLocked(
+		record.Nodes, record.Edges,
+	); err != nil {
+		return IngestResult{}, err
+	}
 	if record.Embeddings != nil {
 		if err := e.ensureEmbeddingSpaceCompatibleLocked(
 			record.Embeddings.Provenance,
@@ -551,6 +556,11 @@ func (e *Explorer) Connect(ctx context.Context, edge graph.Edge) error {
 			return nil
 		}
 		return shoal.NewError(shoal.ErrorConflict, "edge ID already has different content")
+	}
+	if err := e.requireSourceGraphIDsAvailableLocked(
+		nil, []graph.Edge{edge},
+	); err != nil {
+		return err
 	}
 	record := persistedEdge{Edge: cloneEdge(edge), PublishedAt: time.Now().UTC()}
 	if err := e.writeRecord(edgeRecordRow(edge.ID), embeddedRecordEdge, record); err != nil {
@@ -775,6 +785,13 @@ func (e *Explorer) computeCurrentGraph() (
 	// revision) is dropped so the graph stays connected and valid.
 	for _, record := range e.interactions {
 		for _, node := range record.Nodes {
+			if existing, exists := nodes[node.ID]; exists &&
+				!nodesEqual(existing, node) {
+				return nil, nil, nil, shoal.NewError(
+					shoal.ErrorConflict,
+					"interaction node ID collides with source graph node",
+				)
+			}
 			nodes[node.ID] = node
 		}
 	}
@@ -782,6 +799,13 @@ func (e *Explorer) computeCurrentGraph() (
 	// they inherit every default-exclusion rule sessions already have.
 	for _, record := range e.folds {
 		for _, node := range record.Nodes {
+			if existing, exists := nodes[node.ID]; exists &&
+				!nodesEqual(existing, node) {
+				return nil, nil, nil, shoal.NewError(
+					shoal.ErrorConflict,
+					"fold node ID collides with existing graph node",
+				)
+			}
 			nodes[node.ID] = node
 		}
 	}
@@ -845,6 +869,13 @@ func (e *Explorer) computeCurrentGraph() (
 			if _, to := nodes[edge.To]; !to {
 				continue
 			}
+			if existing, exists := edges[edge.ID]; exists &&
+				!edgesEqual(existing, edge) {
+				return nil, nil, nil, shoal.NewError(
+					shoal.ErrorConflict,
+					"interaction edge ID collides with source graph edge",
+				)
+			}
 			edges[edge.ID] = edge
 		}
 	}
@@ -855,6 +886,13 @@ func (e *Explorer) computeCurrentGraph() (
 			}
 			if _, to := nodes[edge.To]; !to {
 				continue
+			}
+			if existing, exists := edges[edge.ID]; exists &&
+				!edgesEqual(existing, edge) {
+				return nil, nil, nil, shoal.NewError(
+					shoal.ErrorConflict,
+					"fold edge ID collides with existing graph edge",
+				)
 			}
 			edges[edge.ID] = edge
 		}

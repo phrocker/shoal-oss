@@ -21,6 +21,7 @@ package authorized
 
 import (
 	"context"
+	"reflect"
 	"time"
 
 	"github.com/phrocker/shoal-oss/pkg/explorer"
@@ -123,7 +124,18 @@ func (c *Client) recordInteraction(
 	if err := guard.Check(ctx); err != nil {
 		return interaction.Session{}, explorer.MarkCommittedInteraction(err)
 	}
-	return persisted, nil
+	if _, ok := writer.(interaction.ResultSink); ok {
+		returned, canonicalErr := persisted.Canonical()
+		if canonicalErr != nil || !reflect.DeepEqual(returned, canonical) {
+			return interaction.Session{}, explorer.MarkCommittedInteraction(
+				shoal.NewError(
+					shoal.ErrorInternal,
+					"durable interaction sink returned a different record",
+				),
+			)
+		}
+	}
+	return canonical, nil
 }
 
 // Interactions lists only derived records whose complete current source set
@@ -405,14 +417,13 @@ func (c *Client) interactionWriter() (explorer.InteractionWriter, error) {
 }
 
 func (c *Client) interactionReader() (explorer.InteractionReader, error) {
-	reader, ok := c.base.(explorer.InteractionReader)
-	if !ok || isNilDependency(reader) {
+	if isNilDependency(c.interactionSource) {
 		return nil, shoal.NewError(
 			shoal.ErrorUnavailable,
-			"underlying Explorer has no interaction reader",
+			"trusted interaction reader is unavailable",
 		)
 	}
-	return reader, nil
+	return c.interactionSource, nil
 }
 
 var (

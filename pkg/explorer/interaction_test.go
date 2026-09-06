@@ -434,6 +434,52 @@ func TestGeneratedInteractionNodeIDsCannotCollide(t *testing.T) {
 	}
 }
 
+func TestFutureSourceCannotCollideWithRecordedSessionID(t *testing.T) {
+	ctx := context.Background()
+	futureSource := explorer.Source{
+		URI:       "file:///future-collision.txt",
+		MediaType: explorer.MediaTypeText,
+		Content:   "future source collision",
+	}
+	probe, err := explorer.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt, err := probe.Ingest(ctx, futureSource)
+	if err != nil {
+		t.Fatal(err)
+	}
+	view, err := probe.Document(ctx, receipt.Document.ID, receipt.Revision.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	futureNodeID := view.Root.Spans[0].ID
+	if err := probe.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	corpus, err := explorer.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer corpus.Close()
+	if err := corpus.RecordInteraction(ctx, interaction.Session{
+		ID:         futureNodeID,
+		RecordedAt: time.Unix(1700000000, 0).UTC(),
+		Operation:  interaction.OperationRetrieval,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := corpus.Ingest(
+		ctx, futureSource,
+	); !shoal.IsErrorCode(err, shoal.ErrorConflict) {
+		t.Fatalf("future source collision error = %v", err)
+	}
+	if _, err := corpus.Interaction(ctx, futureNodeID); err != nil {
+		t.Fatalf("collision attempt damaged interaction: %v", err)
+	}
+}
+
 func TestOversizedVisibilityPersistsAcrossRestart(t *testing.T) {
 	ctx := context.Background()
 	dataDir := t.TempDir()

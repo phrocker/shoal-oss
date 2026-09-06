@@ -122,7 +122,7 @@ func (c *Client) VectorAvailable(ctx context.Context) (bool, error) {
 	}
 	available := true
 	if len(visibleOrder) == 0 {
-		_, err = c.authorizedVectorScores(
+		_, _, err = c.authorizedVectorScores(
 			ctx,
 			retrieval.Request{
 				Text:  vectorCapabilityProbeText,

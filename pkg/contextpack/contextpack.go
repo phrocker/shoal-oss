@@ -229,33 +229,43 @@ func (b Builder) Build(ctx context.Context, input InitialRequest) (inference.Con
 		return inference.ContextPack{}, err
 	}
 	embeddingSpaceID := input.Pins.EmbeddingSpaceID
-	embeddingSpaceIDs := append(
-		[]shoal.ID(nil), input.Pins.EmbeddingSpaceIDs...)
-	if response.EmbeddingSpaceID != "" {
-		if embeddingSpaceID != "" &&
-			embeddingSpaceID != response.EmbeddingSpaceID {
+	embeddingSpaceIDs, err := normalizeEmbeddingSpaceIDs(
+		input.Pins.EmbeddingSpaceIDs)
+	if err != nil {
+		return inference.ContextPack{}, err
+	}
+	hasPinnedEmbeddingSpace := embeddingSpaceID != "" ||
+		len(embeddingSpaceIDs) > 0
+	if hasPinnedEmbeddingSpace &&
+		(embeddingSpaceID == "" || len(embeddingSpaceIDs) == 0) {
+		return inference.ContextPack{}, invalid(
+			"trusted embedding-space pin requires aggregate and constituents")
+	}
+	if !request.HasMode(retrieval.ModeVector) && hasPinnedEmbeddingSpace {
+		return inference.ContextPack{}, invalid(
+			"non-vector retrieval cannot carry an embedding-space pin")
+	}
+	if hasPinnedEmbeddingSpace {
+		expected, deriveErr := retrieval.EmbeddingSpaceSetID(
+			embeddingSpaceIDs...)
+		if deriveErr != nil {
+			return inference.ContextPack{}, deriveErr
+		}
+		if embeddingSpaceID != expected {
+			return inference.ContextPack{}, invalid(
+				"embedding space set identity is not canonical")
+		}
+	}
+	if request.HasMode(retrieval.ModeVector) {
+		if hasPinnedEmbeddingSpace &&
+			(embeddingSpaceID != response.EmbeddingSpaceID ||
+				!equalIDs(embeddingSpaceIDs, response.EmbeddingSpaceIDs)) {
 			return inference.ContextPack{}, invalid(
 				"retrieval embedding space does not match the trusted pin")
 		}
 		embeddingSpaceID = response.EmbeddingSpaceID
 		embeddingSpaceIDs = append(
 			[]shoal.ID(nil), response.EmbeddingSpaceIDs...)
-	}
-	embeddingSpaceIDs, err = normalizeEmbeddingSpaceIDs(embeddingSpaceIDs)
-	if err != nil {
-		return inference.ContextPack{}, err
-	}
-	if len(embeddingSpaceIDs) > 0 {
-		expected, deriveErr := retrieval.EmbeddingSpaceSetID(
-			embeddingSpaceIDs...)
-		if deriveErr != nil {
-			return inference.ContextPack{}, deriveErr
-		}
-		if embeddingSpaceID != "" && embeddingSpaceID != expected {
-			return inference.ContextPack{}, invalid(
-				"embedding space set identity is not canonical")
-		}
-		embeddingSpaceID = expected
 	}
 	input.Pins.EmbeddingSpaceID = embeddingSpaceID
 	input.Pins.EmbeddingSpaceIDs = embeddingSpaceIDs
@@ -1127,6 +1137,18 @@ func normalizeEmbeddingSpaceIDs(ids []shoal.ID) ([]shoal.ID, error) {
 		unique = append(unique, id)
 	}
 	return unique, nil
+}
+
+func equalIDs(left, right []shoal.ID) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
 }
 
 // MergeEmbeddingSpaceMetadata returns independently owned context metadata

@@ -63,29 +63,57 @@ type VectorScorer interface {
 	) (map[shoal.ID]shoal.Score, error)
 }
 
+type vectorEmbeddingSpaceResolver interface {
+	VectorEmbeddingSpaceIDs(
+		context.Context, explorer.VectorScoreRequest,
+	) ([]shoal.ID, error)
+}
+
 func (c *Client) authorizedVectorScoringAvailable() bool {
-	return !isNilDependency(c.vectorScorer)
+	if isNilDependency(c.vectorScorer) {
+		return false
+	}
+	resolver, ok := c.vectorScorer.(vectorEmbeddingSpaceResolver)
+	return ok && !isNilDependency(resolver)
 }
 
 func (c *Client) probeAuthorizedVector(
 	ctx context.Context, request retrieval.Request,
-) error {
+) ([]shoal.ID, error) {
 	if !request.HasMode(retrieval.ModeVector) {
-		return nil
+		return nil, nil
 	}
 	if isNilDependency(c.vectorScorer) {
-		return shoal.NewError(
+		return nil, shoal.NewError(
 			shoal.ErrorUnavailable,
 			"authorized vector retrieval requires trusted vector validation",
 		)
 	}
-	_, err := c.vectorScorer.VectorScores(ctx, explorer.VectorScoreRequest{
+	scoreRequest := explorer.VectorScoreRequest{
 		Text: request.Text,
-	})
-	if err != nil {
-		return directBaseError(err)
 	}
-	return nil
+	_, err := c.vectorScorer.VectorScores(ctx, scoreRequest)
+	if err != nil {
+		return nil, directBaseError(err)
+	}
+	resolver, ok := c.vectorScorer.(vectorEmbeddingSpaceResolver)
+	if !ok || isNilDependency(resolver) {
+		return nil, shoal.NewError(
+			shoal.ErrorUnavailable,
+			"authorized vector retrieval requires trusted embedding provenance",
+		)
+	}
+	ids, err := resolver.VectorEmbeddingSpaceIDs(ctx, scoreRequest)
+	if err != nil {
+		return nil, directBaseError(err)
+	}
+	if len(ids) == 0 {
+		return nil, inconsistentRetrieval()
+	}
+	if _, err := retrieval.EmbeddingSpaceSetID(ids...); err != nil {
+		return nil, inconsistentRetrieval()
+	}
+	return append([]shoal.ID(nil), ids...), nil
 }
 
 func (c *Client) hydrateRetrievalCorpus(
@@ -291,9 +319,18 @@ func (c *Client) validateRetrievedResponse(
 	for _, nodeID := range request.Scope.NodeIDs {
 		nodeScope[nodeID] = struct{}{}
 	}
-	vectorScores, err := c.authorizedVectorScores(ctx, request, corpus, nodeScope)
+	vectorScores, embeddingSpaceIDs, err := c.authorizedVectorScores(
+		ctx, request, corpus, nodeScope)
 	if err != nil {
 		return err
+	}
+	if request.HasMode(retrieval.ModeVector) {
+		expected, err := retrieval.EmbeddingSpaceSetID(embeddingSpaceIDs...)
+		if err != nil ||
+			!equalIDs(response.EmbeddingSpaceIDs, embeddingSpaceIDs) ||
+			response.EmbeddingSpaceID != expected {
+			return inconsistentRetrieval()
+		}
 	}
 	expectedIDs := make([]shoal.ID, 0)
 	expectedResults := make([]retrieval.Result, 0)
@@ -428,12 +465,12 @@ func (c *Client) authorizedVectorScores(
 	request retrieval.Request,
 	corpus *canonicalRetrievalCorpus,
 	nodeScope map[shoal.ID]struct{},
-) (map[shoal.ID]shoal.Score, error) {
+) (map[shoal.ID]shoal.Score, []shoal.ID, error) {
 	if !request.HasMode(retrieval.ModeVector) {
-		return nil, nil
+		return nil, nil, nil
 	}
 	if isNilDependency(c.vectorScorer) {
-		return nil, shoal.NewError(
+		return nil, nil, shoal.NewError(
 			shoal.ErrorUnavailable,
 			"authorized vector retrieval requires trusted vector validation",
 		)
@@ -454,17 +491,48 @@ func (c *Client) authorizedVectorScores(
 			})
 		}
 	}
-	scores, err := c.vectorScorer.VectorScores(ctx, explorer.VectorScoreRequest{
+	scoreRequest := explorer.VectorScoreRequest{
 		Text:      request.Text,
 		Citations: citations,
-	})
+	}
+	scores, err := c.vectorScorer.VectorScores(ctx, scoreRequest)
 	if err != nil {
-		return nil, directBaseError(err)
+		return nil, nil, directBaseError(err)
 	}
 	if len(scores) != len(citations) {
-		return nil, inconsistentRetrieval()
+		return nil, nil, inconsistentRetrieval()
 	}
-	return scores, nil
+	resolver, ok := c.vectorScorer.(vectorEmbeddingSpaceResolver)
+	if !ok || isNilDependency(resolver) {
+		return nil, nil, shoal.NewError(
+			shoal.ErrorUnavailable,
+			"authorized vector retrieval requires trusted embedding provenance",
+		)
+	}
+	embeddingSpaceIDs, err := resolver.VectorEmbeddingSpaceIDs(
+		ctx, scoreRequest)
+	if err != nil {
+		return nil, nil, directBaseError(err)
+	}
+	if len(embeddingSpaceIDs) == 0 {
+		return nil, nil, inconsistentRetrieval()
+	}
+	if _, err := retrieval.EmbeddingSpaceSetID(embeddingSpaceIDs...); err != nil {
+		return nil, nil, inconsistentRetrieval()
+	}
+	return scores, append([]shoal.ID(nil), embeddingSpaceIDs...), nil
+}
+
+func equalIDs(left, right []shoal.ID) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
 }
 
 func applyCanonicalVectorScore(
