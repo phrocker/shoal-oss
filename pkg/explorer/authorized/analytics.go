@@ -19,6 +19,7 @@ package authorized
 
 import (
 	"context"
+	"encoding/json"
 	"sort"
 	"time"
 
@@ -38,6 +39,7 @@ func (c *Client) MaterializeAnalytics(
 	ctx context.Context,
 	request explorer.BoundedNeighborhoodRequest,
 	maxEdges uint32,
+	maxEvidenceBytes uint64,
 ) (exploreranalytics.Materialization, error) {
 	bounded, err := c.boundedBase()
 	if err != nil {
@@ -45,7 +47,7 @@ func (c *Client) MaterializeAnalytics(
 	}
 	if request.Depth == 0 || request.Fanout == 0 ||
 		request.MaxNodes == 0 || request.MaxScannedEdges == 0 ||
-		maxEdges == 0 {
+		maxEdges == 0 || maxEvidenceBytes == 0 {
 		return exploreranalytics.Materialization{}, shoal.NewError(
 			shoal.ErrorInvalidArgument, "analytics graph limits must be nonzero")
 	}
@@ -96,7 +98,7 @@ func (c *Client) MaterializeAnalytics(
 		return exploreranalytics.Materialization{}, directBaseError(err)
 	}
 	neighborhood, err := c.materializeAnalyticsNeighborhood(
-		ctx, bounded, request, maxEdges, decision, guard, now)
+		ctx, bounded, request, maxEdges, maxEvidenceBytes, decision, guard, now)
 	if err != nil {
 		return exploreranalytics.Materialization{}, err
 	}
@@ -136,6 +138,7 @@ func (c *Client) materializeAnalyticsNeighborhood(
 	bounded explorer.BoundedClient,
 	request explorer.BoundedNeighborhoodRequest,
 	maxEdges uint32,
+	maxEvidenceBytes uint64,
 	decision auth.Decision,
 	guard auth.GenerationGuard,
 	now time.Time,
@@ -143,6 +146,22 @@ func (c *Client) materializeAnalyticsNeighborhood(
 	nodes := make(map[shoal.ID]graph.Node, len(request.NodeIDs))
 	edges := make(map[shoal.ID]graph.Edge)
 	assertions := make(map[shoal.ID]ontology.Assertion)
+	evidenceBytes := uint64(0)
+	charge := func(value any) error {
+		encoded, err := json.Marshal(value)
+		if err != nil {
+			return inconsistentBase()
+		}
+		size := uint64(len(encoded)) + 1
+		if size > maxEvidenceBytes || evidenceBytes > maxEvidenceBytes-size {
+			return shoal.NewError(
+				shoal.ErrorUnavailable,
+				"authorized analytics evidence exceeds max_evidence_bytes",
+			)
+		}
+		evidenceBytes += size
+		return nil
+	}
 	seen := make(map[shoal.ID]struct{}, len(request.NodeIDs))
 	frontier := append([]shoal.ID(nil), request.NodeIDs...)
 	sort.Slice(frontier, func(i, j int) bool {
@@ -195,6 +214,9 @@ func (c *Client) materializeAnalyticsNeighborhood(
 						"authorized analytics subgraph exceeds max_nodes",
 					)
 				}
+				if err := charge(node); err != nil {
+					return explorer.Neighborhood{}, err
+				}
 				nodes[node.ID] = cloneGraphNode(node)
 			}
 			if _, ok := nodes[seed]; !ok {
@@ -208,6 +230,9 @@ func (c *Client) materializeAnalyticsNeighborhood(
 							"authorized analytics subgraph exceeds max_edges",
 						)
 					}
+					if err := charge(edge); err != nil {
+						return explorer.Neighborhood{}, err
+					}
 					edges[edge.ID] = cloneGraphEdge(edge)
 				}
 				other, ok := analyticsNeighbor(seed, edge, request.Direction)
@@ -219,7 +244,12 @@ func (c *Client) materializeAnalyticsNeighborhood(
 				}
 			}
 			for _, assertion := range page.Neighborhood.Assertions {
-				assertions[assertion.ID()] = assertion
+				if _, exists := assertions[assertion.ID()]; !exists {
+					if err := charge(assertion); err != nil {
+						return explorer.Neighborhood{}, err
+					}
+					assertions[assertion.ID()] = assertion
+				}
 			}
 		}
 		frontier = frontier[:0]

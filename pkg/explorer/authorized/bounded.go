@@ -430,8 +430,12 @@ func (c *Client) boundedAuthorizedNeighborhoodPage(
 			}
 		}
 		for _, assertion := range filtered.Assertions {
-			if _, ok := assertions[assertion.ID()]; !ok {
-				assertions[assertion.ID()] = assertion
+			key := assertion.ID()
+			if edgeID := assertion.Metadata()[graphAssertionEdgeIDMetadata]; edgeID != "" {
+				key = shoal.ID(edgeID)
+			}
+			if _, ok := assertions[key]; !ok {
+				assertions[key] = assertion
 			}
 		}
 		if len(edges) > int(request.Fanout) {

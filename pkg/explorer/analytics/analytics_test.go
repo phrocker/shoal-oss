@@ -378,6 +378,7 @@ func (s *staticMaterializer) MaterializeAnalytics(
 	context.Context,
 	explorer.BoundedNeighborhoodRequest,
 	uint32,
+	uint64,
 ) (Materialization, error) {
 	return s.materialization, nil
 }

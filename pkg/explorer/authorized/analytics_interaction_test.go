@@ -123,6 +123,10 @@ func TestAnalyticsRecorderReauthorizesExtractedRelationshipEvidence(t *testing.T
 		t.Fatalf("recorded edge IDs = %d, result edge count = %d",
 			len(recorded.TouchedEdgeIDs()), result.Scope.EdgeCount)
 	}
+	assertionCount := len(recorded.Turns[0].ToolCall.RetrievedAssertions)
+	if assertionCount == 0 {
+		t.Fatal("recorded analytics evidence omitted extracted assertions")
+	}
 }
 
 func interactionErrorChain(err error) string {
