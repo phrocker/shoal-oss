@@ -46,6 +46,44 @@ func TestAnalyzeEmptyGraph(t *testing.T) {
 	}
 }
 
+func TestAnalyticsResultIDIncludesPageRankContract(t *testing.T) {
+	base := Result{
+		Scope: ScopeMetadata{
+			SnapshotID: "snapshot", Complete: true,
+		},
+		Nodes: []NodeSummary{{
+			NodeID: "node", Degree: 0, PageRank: 1,
+		}},
+		PageRank: PageRankSummary{
+			DampingFactor:        0.85,
+			ConvergenceTolerance: 1e-9,
+			MaxIterations:        100,
+			Iterations:           10,
+			Converged:            true,
+		},
+	}
+	baseID := analyticsResultID(base)
+	mutations := []struct {
+		name   string
+		mutate func(*Result)
+	}{
+		{"damping", func(result *Result) { result.PageRank.DampingFactor = 0.9 }},
+		{"tolerance", func(result *Result) { result.PageRank.ConvergenceTolerance = 1e-6 }},
+		{"maximum iterations", func(result *Result) { result.PageRank.MaxIterations = 101 }},
+		{"actual iterations", func(result *Result) { result.PageRank.Iterations = 11 }},
+		{"convergence", func(result *Result) { result.PageRank.Converged = false }},
+	}
+	for _, test := range mutations {
+		t.Run(test.name, func(t *testing.T) {
+			changed := base
+			test.mutate(&changed)
+			if got := analyticsResultID(changed); got == baseID {
+				t.Fatalf("result ID did not change for %s", test.name)
+			}
+		})
+	}
+}
+
 func TestAnalyzeDanglingGraphConvergesAndPreservesMass(t *testing.T) {
 	got, err := Analyze(context.Background(), explorer.Neighborhood{
 		Nodes: []graph.Node{{ID: "A"}, {ID: "B"}},

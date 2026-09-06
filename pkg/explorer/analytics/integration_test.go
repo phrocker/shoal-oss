@@ -344,7 +344,9 @@ func TestEmbeddedAnalyticsDurablyRecordsCompleteAuthorizedEvidence(t *testing.T)
 		recorded.Reason.Code != "audit_purpose" ||
 		recorded.Reason.Digest != interaction.Digest(decision.AuditPurpose()) ||
 		recorded.AuthorizationExpiresAt != decision.AuthenticationExpires() ||
-		recorded.AuthorizationOperation != string(auth.OperationAnalyticsRead) {
+		recorded.AuthorizationOperation != string(auth.OperationAnalyticsRead) ||
+		recorded.OntologySchemaID != lens.SchemaID() ||
+		recorded.OntologyVersionID != lens.VersionID() {
 		t.Fatalf("trusted interaction metadata = %+v", recorded)
 	}
 	if len(recorded.Turns) != 1 || recorded.Turns[0].ToolCall == nil ||
@@ -370,6 +372,10 @@ func TestEmbeddedAnalyticsDurablyRecordsCompleteAuthorizedEvidence(t *testing.T)
 		recorded.Turns[0].ToolCall.RetrievedEvidence,
 	) {
 		t.Fatalf("recovered interaction evidence = %+v", recovered)
+	}
+	if recovered.OntologySchemaID != lens.SchemaID() ||
+		recovered.OntologyVersionID != lens.VersionID() {
+		t.Fatalf("recovered ontology pin = %+v", recovered)
 	}
 }
 

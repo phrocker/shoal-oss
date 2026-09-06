@@ -158,6 +158,8 @@ func (r *InteractionRecorder) RecordAnalytics(
 			record.Materialization.AuthorizationFingerprint.String()),
 		AuthorizationExpiresAt: record.Materialization.AuthorizationExpiresAt,
 		AuthorizationOperation: string(auth.OperationAnalyticsRead),
+		OntologySchemaID:       record.Materialization.SelectedOntology.SchemaID(),
+		OntologyVersionID:      record.Materialization.SelectedOntology.VersionID(),
 		RequestID:              record.Materialization.RequestID,
 		QueryDigest:            analyticsRequestDigest(record.Request),
 		ResultID:               resultID,
@@ -187,6 +189,8 @@ func (r *InteractionRecorder) RecordAnalytics(
 		persisted.AuthorizationFingerprint != session.AuthorizationFingerprint ||
 		!persisted.AuthorizationExpiresAt.Equal(session.AuthorizationExpiresAt) ||
 		persisted.AuthorizationOperation != session.AuthorizationOperation ||
+		persisted.OntologySchemaID != session.OntologySchemaID ||
+		persisted.OntologyVersionID != session.OntologyVersionID ||
 		persisted.RequestID != session.RequestID ||
 		persisted.Actor.SubjectID == "" || persisted.Actor.ActorID == "" ||
 		!equalIDs(persisted.TouchedNodeIDs(), nodeIDs) ||
@@ -458,16 +462,73 @@ func analyticsRequestDigest(request Request) string {
 
 func analyticsResultID(result Result) shoal.ID {
 	var encoded bytes.Buffer
-	writeText(&encoded, "authorized-analytics-result-v1")
+	writeText(&encoded, "authorized-analytics-result-v2")
 	writeText(&encoded, result.Scope.SnapshotID)
+	writeText(&encoded, result.Scope.AuthorizationFingerprint)
+	writeUint64(&encoded, uint64(result.Scope.PolicyGeneration))
+	if result.Scope.Ontology != nil {
+		writeText(&encoded, string(result.Scope.Ontology.SchemaID))
+		writeText(&encoded, string(result.Scope.Ontology.VersionID))
+	} else {
+		writeText(&encoded, "")
+		writeText(&encoded, "")
+	}
+	writeUint64(&encoded, uint64(len(result.Scope.SeedNodeIDs)))
+	for _, nodeID := range result.Scope.SeedNodeIDs {
+		writeText(&encoded, string(nodeID))
+	}
+	writeUint64(&encoded, uint64(result.Scope.Depth))
+	writeText(&encoded, string(result.Scope.Direction))
+	writeUint64(&encoded, uint64(result.Scope.Fanout))
+	writeUint64(&encoded, uint64(result.Scope.MaxNodes))
+	writeUint64(&encoded, uint64(result.Scope.MaxEdges))
+	writeUint64(&encoded, uint64(result.Scope.MaxScannedEdgesPerNode))
+	writeUint64(&encoded, uint64(len(result.Scope.EdgeTypes)))
+	for _, edgeType := range result.Scope.EdgeTypes {
+		writeText(&encoded, edgeType)
+	}
+	writeUint64(&encoded, uint64(result.Scope.NodeCount))
+	writeUint64(&encoded, uint64(result.Scope.EdgeCount))
+	writeUint64(&encoded, uint64(result.Scope.ResolvedAssertionCount))
+	writeUint64(&encoded, uint64(len(result.Scope.UnresolvedAssertions)))
+	for _, unresolved := range result.Scope.UnresolvedAssertions {
+		writeText(&encoded, string(unresolved.AssertionID))
+		writeText(&encoded, string(unresolved.Reading))
+		writeText(&encoded, unresolved.Reason)
+	}
+	if result.Scope.Complete {
+		writeUint64(&encoded, 1)
+	} else {
+		writeUint64(&encoded, 0)
+	}
+	writeUint64(&encoded, uint64(len(result.Nodes)))
 	for _, node := range result.Nodes {
 		writeBytes(&encoded, []byte(node.NodeID))
 		writeUint64(&encoded, uint64(node.InDegree))
 		writeUint64(&encoded, uint64(node.OutDegree))
+		writeUint64(&encoded, uint64(node.Degree))
 		writeUint64(&encoded, math.Float64bits(node.PageRank))
 		writeText(&encoded, node.WeakComponentID)
 	}
+	writeUint64(&encoded, uint64(len(result.WeaklyConnectedComponents)))
+	for _, component := range result.WeaklyConnectedComponents {
+		writeText(&encoded, component.ID)
+		writeUint64(&encoded, uint64(len(component.NodeIDs)))
+		for _, nodeID := range component.NodeIDs {
+			writeText(&encoded, string(nodeID))
+		}
+		writeUint64(&encoded, uint64(component.NodeCount))
+		writeUint64(&encoded, uint64(component.EdgeCount))
+	}
+	writeUint64(&encoded, math.Float64bits(result.PageRank.DampingFactor))
+	writeUint64(&encoded, math.Float64bits(result.PageRank.ConvergenceTolerance))
+	writeUint64(&encoded, uint64(result.PageRank.MaxIterations))
 	writeUint64(&encoded, uint64(result.PageRank.Iterations))
+	if result.PageRank.Converged {
+		writeUint64(&encoded, 1)
+	} else {
+		writeUint64(&encoded, 0)
+	}
 	return interaction.DerivedID(
 		"analytics_result", interaction.Digest(encoded.String()))
 }
