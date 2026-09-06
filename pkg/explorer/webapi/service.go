@@ -749,10 +749,6 @@ func (s *EmbeddedService) Neighborhood(
 			result.Neighborhood.Interpretations),
 		Truncated: result.Truncated,
 	}
-	if result.ScannedEdgesKnown {
-		scannedEdges := result.ScannedEdges
-		response.ScannedEdges = &scannedEdges
-	}
 	if result.Continuation {
 		response.NextCursor = encodeGraphCursor(
 			snapshot.ID, normalizedRequest, result.NextAfterEdgeID)
