@@ -55,7 +55,9 @@ func TestInProcessAndLoopbackParity(t *testing.T) {
 	request := retrieval.Request{
 		Text:  "why did the deployment fail?",
 		TopK:  3,
-		Modes: []retrieval.Mode{retrieval.ModeLexical, retrieval.ModeGraph},
+		Modes: []retrieval.Mode{
+			retrieval.ModeLexical, retrieval.ModeVector, retrieval.ModeGraph,
+		},
 		Scope: retrieval.Scope{
 			DocumentIDs: []shoal.ID{"doc-1"},
 			NodeIDs:     []shoal.ID{"node-1"},

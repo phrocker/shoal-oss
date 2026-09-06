@@ -325,6 +325,20 @@ func TestVectorResponseRequiresEmbeddingSpaceID(t *testing.T) {
 	}); !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
 		t.Fatalf("missing vector embedding space error = %v", err)
 	}
+	if err := (retrieval.Response{
+		EmbeddingSpaceID: "aggregate-only",
+	}).ValidateFor(retrieval.Request{
+		Text: "query", Modes: []retrieval.Mode{retrieval.ModeVector},
+	}); !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
+		t.Fatalf("aggregate-only vector embedding space error = %v", err)
+	}
+	if err := (retrieval.Response{
+		EmbeddingSpaceID: "lexical-space",
+	}).ValidateFor(retrieval.Request{
+		Text: "query", Modes: []retrieval.Mode{retrieval.ModeLexical},
+	}); !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
+		t.Fatalf("non-vector embedding space error = %v", err)
+	}
 }
 
 func testEvidence(documentID, spanID shoal.ID, score shoal.Score) retrieval.Evidence {

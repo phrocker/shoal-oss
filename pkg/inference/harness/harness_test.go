@@ -62,6 +62,17 @@ func TestAddAnchorsCarriesEmbeddingSpaceIntoTranscriptContext(t *testing.T) {
 	}
 }
 
+func TestToolResultRejectsAggregateWithoutConstituents(t *testing.T) {
+	pack, _, _ := fixture(t)
+	if _, err := NewToolResultWithEmbeddingSpaces(
+		"retrieve", ActionRetrieve, nil,
+		pack.Snapshot(), pack.Authorization(),
+		"aggregate-only", nil,
+	); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("aggregate-only tool result error = %v", err)
+	}
+}
+
 func TestSuccessfulTraceAndCanonicalTranscript(t *testing.T) {
 	pack, initial, additions := fixture(t)
 	embeddingSpace, err := retrieval.EmbeddingSpaceIdentityID("space-v3")

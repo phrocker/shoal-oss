@@ -264,10 +264,18 @@ func (r Response) ValidateFor(request Request) error {
 	); err != nil {
 		return err
 	}
-	if normalized.HasMode(ModeVector) && r.EmbeddingSpaceID == "" {
+	if normalized.HasMode(ModeVector) {
+		if r.EmbeddingSpaceID == "" || len(r.EmbeddingSpaceIDs) == 0 {
+			return shoal.NewError(
+				shoal.ErrorInvalidArgument,
+				"vector retrieval response requires canonical embedding "+
+					"space constituents",
+			)
+		}
+	} else if r.EmbeddingSpaceID != "" || len(r.EmbeddingSpaceIDs) > 0 {
 		return shoal.NewError(
 			shoal.ErrorInvalidArgument,
-			"vector retrieval response requires an embedding space ID",
+			"non-vector retrieval response cannot carry embedding space provenance",
 		)
 	}
 	if len(r.EmbeddingSpaceIDs) > MaxScopeIDs {
@@ -354,10 +362,8 @@ func (r Response) ValidateFor(request Request) error {
 	return nil
 }
 
-// EmbeddingSpaceSetID returns a stable opaque identity for the exact set of
-// embedding spaces that participated in retrieval. Input order and duplicate
-// identities do not affect the result. An empty set means no vector space
-// participated and returns the empty ID.
+// EmbeddingSpaceIdentityID hashes one provider-defined embedding-space
+// identity into a stable opaque constituent ID.
 func EmbeddingSpaceIdentityID(identity string) (shoal.ID, error) {
 	if !utf8.ValidString(identity) || strings.TrimSpace(identity) == "" ||
 		len(identity) > shoal.MaxSemanticStringBytes {

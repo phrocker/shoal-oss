@@ -1144,19 +1144,29 @@ func MergeEmbeddingSpaceMetadata(
 		}
 	}
 	merged := cloneMetadata(metadata)
-	if len(next) == 0 {
-		return merged, nil
-	}
 	current, err := embeddingSpaceIDsFromMetadata(merged)
 	if err != nil {
 		return nil, err
 	}
-	if len(current) == 0 {
-		if legacy, found, readErr := embeddingSpaceIDFromMetadata(merged); readErr != nil {
-			return nil, readErr
-		} else if found {
-			current = []shoal.ID{legacy}
+	currentIdentity, found, err := embeddingSpaceIDFromMetadata(merged)
+	if err != nil {
+		return nil, err
+	}
+	if len(current) > 0 {
+		expected, deriveErr := retrieval.EmbeddingSpaceSetID(current...)
+		if deriveErr != nil {
+			return nil, deriveErr
 		}
+		if !found || currentIdentity != expected {
+			return nil, invalid(
+				"context embedding space set identity is not canonical")
+		}
+	} else if found && len(next) > 0 {
+		return nil, invalid(
+			"aggregate-only embedding space provenance cannot be merged")
+	}
+	if len(next) == 0 {
+		return merged, nil
 	}
 	constituents := append(current, next...)
 	sort.Slice(constituents, func(i, j int) bool {

@@ -480,6 +480,14 @@ func (r ToolResult) validate() error {
 	); err != nil {
 		return err
 	}
+	if r.embeddingSpaceID != "" && len(r.embeddingSpaceIDs) == 0 {
+		return invalid(
+			"tool result embedding space requires canonical constituents")
+	}
+	if r.embeddingSpaceID == "" && len(r.embeddingSpaceIDs) > 0 {
+		return invalid(
+			"tool result embedding space constituents require an aggregate ID")
+	}
 	for index, id := range r.embeddingSpaceIDs {
 		if err := shoal.ValidateRequiredID(
 			"tool result embedding space constituent ID", id,

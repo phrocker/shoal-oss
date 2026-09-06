@@ -206,6 +206,21 @@ func TestMergeEmbeddingSpaceMetadataIsASetUnion(t *testing.T) {
 	if !ok || got != want {
 		t.Fatalf("merged set ID = %q, %t, want %q", got, ok, want)
 	}
+	corrupt := cloneMetadata(metadata)
+	corrupt[metadataEmbeddingSpaceKey] = encodeID(spaceA)
+	if _, err := MergeEmbeddingSpaceMetadata(
+		corrupt, []shoal.ID{spaceA},
+	); err == nil {
+		t.Fatal("mismatched aggregate and constituents were repaired")
+	}
+	legacy := shoal.Metadata{
+		metadataEmbeddingSpaceKey: encodeID(want),
+	}
+	if _, err := MergeEmbeddingSpaceMetadata(
+		legacy, []shoal.ID{spaceA},
+	); err == nil {
+		t.Fatal("aggregate-only provenance was merged without constituents")
+	}
 }
 
 func TestBuildDocumentGraphAndMixedSelection(t *testing.T) {
