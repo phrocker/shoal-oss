@@ -1792,10 +1792,12 @@ containing cells, expected entity states, and result identities. It:
 5. independently reads exact physical versions before publication;
 6. marks completion only after outcome, checkpoint, and guard finalization.
 
-Recovery first enumerates durable intent rows and then transaction-root bands.
-Both scans use bounded row cursors, not `Snapshot.Frontier`; repeated recovery
-is idempotent. An unavailable or canceled call after intent persistence is an
-indeterminate publication, never an implicit rollback.
+Recovery pages the canonical live-pending transaction index and then
+authoritatively loads each referenced intent and inspects its transaction root.
+The cursor is derived from ordered pending transaction IDs, never
+`Snapshot.Frontier`; repeated recovery is idempotent. An unavailable or
+canceled call after intent persistence is an indeterminate publication, never
+an implicit rollback.
 
 The embedded implementation maintains a row-atomic pending marker beside each
 new durable intent and a canonical, generation-fenced index containing only
