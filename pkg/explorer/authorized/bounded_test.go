@@ -318,6 +318,25 @@ func TestBoundedNeighborhoodDoesNotTrustUnderreportedScanCount(t *testing.T) {
 	}
 }
 
+func TestBoundedNeighborhoodRejectsScanCountAbovePageFanout(t *testing.T) {
+	client, base := authorizedPaginationClient(t, false)
+	base.overreportedScans = true
+	_, err := client.BoundedNeighborhood(
+		context.Background(),
+		explorer.BoundedNeighborhoodRequest{
+			NodeIDs: []shoal.ID{"node-seed"}, Depth: 1,
+			Fanout: 1, MaxNodes: 2, MaxScannedEdges: 2,
+			Direction: explorer.GraphDirectionOutgoing,
+		},
+	)
+	if !shoal.IsErrorCode(err, shoal.ErrorInternal) {
+		t.Fatalf("overreported scan error = %v", err)
+	}
+	if base.calls != 1 {
+		t.Fatalf("overreported scan calls = %d, want 1", base.calls)
+	}
+}
+
 func TestBoundedNeighborhoodPreservesKnownZeroScanCount(t *testing.T) {
 	client, base := authorizedPaginationClient(t, false)
 	base.knownZero = true
@@ -597,6 +616,7 @@ type pagedBoundedBase struct {
 	knownZeroContinuation        bool
 	advanceWithoutContinuation   bool
 	underreportedScans           bool
+	overreportedScans            bool
 	truncatedWithoutContinuation bool
 	interpret                    func()
 }
@@ -665,6 +685,14 @@ func (b *pagedBoundedBase) BoundedNeighborhood(
 			},
 			Truncated: true, NextAfterEdgeID: "edge-progress",
 			Continuation: true, ScannedEdges: 1, ScannedEdgesKnown: true,
+		}, nil
+	}
+	if b.overreportedScans {
+		return explorer.BoundedNeighborhood{
+			Neighborhood: explorer.Neighborhood{
+				Nodes: []graph.Node{b.nodes["node-seed"]},
+			},
+			ScannedEdges: 2, ScannedEdgesKnown: true,
 		}, nil
 	}
 	if b.advanceWithoutContinuation {

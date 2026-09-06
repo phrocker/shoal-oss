@@ -401,7 +401,7 @@ func (c *Client) boundedAuthorizedNeighborhoodPage(
 		}
 		if raw.ScannedEdgesKnown &&
 			(raw.ScannedEdges < uint32(len(raw.Neighborhood.Edges)) ||
-				raw.ScannedEdges > remainingScan) {
+				raw.ScannedEdges > scan.Fanout) {
 			return explorer.BoundedNeighborhood{}, inconsistentBase()
 		}
 		// The base is not trusted to report how much suppressed adjacency it

@@ -89,6 +89,31 @@ func TestNonAnalyticsInteractionRejectsUnverifiedExactEvidence(t *testing.T) {
 		t.Fatalf("ordinary retrieval record = %v", err)
 	}
 
+	ordinaryAnalyticsTool := base
+	ordinaryAnalyticsTool.ID = "session-ordinary-analytics-tool"
+	ordinaryAnalyticsTool.Provenance.ToolPolicy =
+		string(auth.OperationAnalyticsRead)
+	ordinaryAnalyticsTool.Turns = []interaction.Turn{{
+		Index: 0,
+		ToolCall: &interaction.ToolCall{
+			Kind: "analytics", RetrievedNodeIDs: []shoal.ID{nodeID},
+		},
+	}}
+	if err := f.clientA.RecordInteraction(
+		ctx, ordinaryAnalyticsTool,
+	); err != nil {
+		t.Fatalf("ordinary analytics-named tool record = %v", err)
+	}
+	storedOrdinary, err := f.base.Interaction(
+		context.Background(), ordinaryAnalyticsTool.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if storedOrdinary.Provenance.ToolPolicy ==
+		string(auth.OperationAnalyticsRead) {
+		t.Fatal("ordinary interaction retained trusted analytics marker")
+	}
+
 	withNode := base
 	withNode.ID = "session-exact-node"
 	withNode.Turns = []interaction.Turn{{

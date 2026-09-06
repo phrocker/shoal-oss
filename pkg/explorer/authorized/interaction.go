@@ -184,6 +184,12 @@ func (c *Client) recordInteractionForOperation(
 		return interaction.Session{}, authorizationDenied()
 	}
 	canonical.AuthorizationFingerprint = shoal.ID(fingerprint.String())
+	if operation == auth.OperationAnalyticsRead {
+		canonical.Provenance.ToolPolicy = string(auth.OperationAnalyticsRead)
+	} else if canonical.Provenance.ToolPolicy ==
+		string(auth.OperationAnalyticsRead) {
+		canonical.Provenance.ToolPolicy = ""
+	}
 	canonical.OntologySchemaID = ""
 	canonical.OntologyVersionID = ""
 	if selected, ok := decision.SelectedOntology(); ok {
@@ -614,6 +620,9 @@ func analyticsInteractionEvidence(
 	session interaction.Session,
 ) (analyticsInteractionGraph, bool, error) {
 	var evidence analyticsInteractionGraph
+	if session.Provenance.ToolPolicy != string(auth.OperationAnalyticsRead) {
+		return evidence, false, nil
+	}
 	analyticsCalls := 0
 	for _, turn := range session.Turns {
 		if turn.ToolCall != nil && turn.ToolCall.Kind == "analytics" {

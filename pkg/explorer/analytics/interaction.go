@@ -183,7 +183,7 @@ func (r *InteractionRecorder) RecordAnalytics(
 		persisted.SnapshotID != session.SnapshotID ||
 		!persisted.SnapshotAsOf.UTC().Equal(session.SnapshotAsOf.UTC()) ||
 		persisted.AuthorizationFingerprint != session.AuthorizationFingerprint ||
-		persisted.AuthorizationExpiresAt != session.AuthorizationExpiresAt ||
+		!persisted.AuthorizationExpiresAt.Equal(session.AuthorizationExpiresAt) ||
 		persisted.RequestID != session.RequestID ||
 		persisted.OntologySchemaID != session.OntologySchemaID ||
 		persisted.OntologyVersionID != session.OntologyVersionID ||
