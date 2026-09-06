@@ -107,7 +107,7 @@ func TestAnalyticsRecorderReauthorizesExtractedRelationshipEvidence(t *testing.T
 		"analytics-reader",
 		[][]byte{f.sourceA},
 		[][]byte{f.policyA},
-		[]auth.Operation{auth.OperationAnalyticsRead},
+		[]auth.Operation{auth.OperationAnalyticsRead, auth.OperationRetrieve},
 	))
 	_, err = omittingService.Run(omittingContext, analytics.Request{
 		Scope: analytics.Scope{
@@ -134,7 +134,7 @@ func TestAnalyticsRecorderReauthorizesExtractedRelationshipEvidence(t *testing.T
 		"analytics-reader",
 		[][]byte{f.sourceA},
 		[][]byte{f.policyA},
-		[]auth.Operation{auth.OperationAnalyticsRead},
+		[]auth.Operation{auth.OperationAnalyticsRead, auth.OperationRetrieve},
 	)
 	ctx := f.context(t, decision)
 	sink := client.AnalyticsInteractionSink()
@@ -240,7 +240,7 @@ func TestAnalyticsForgedSinkResultIsIndeterminate(t *testing.T) {
 		"analytics-indeterminate",
 		[][]byte{f.sourceA},
 		[][]byte{f.policyA},
-		[]auth.Operation{auth.OperationAnalyticsRead},
+		[]auth.Operation{auth.OperationAnalyticsRead, auth.OperationRetrieve},
 	)
 	ctx := f.context(t, decision)
 	shared, err := interaction.NewRecorder(
@@ -294,7 +294,7 @@ func TestAnalyticsCommittedSinkFailureIsIndeterminate(t *testing.T) {
 		"analytics-committed",
 		[][]byte{f.sourceA},
 		[][]byte{f.policyA},
-		[]auth.Operation{auth.OperationAnalyticsRead},
+		[]auth.Operation{auth.OperationAnalyticsRead, auth.OperationRetrieve},
 	)
 	ctx := f.context(t, decision)
 	shared, err := interaction.NewRecorder(
