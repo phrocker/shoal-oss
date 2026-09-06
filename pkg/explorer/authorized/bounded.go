@@ -365,6 +365,7 @@ func (c *Client) boundedAuthorizedNeighborhoodPage(
 	exhaustedScanLimit := true
 	incompleteWithoutCursor := false
 	scannedEdges := uint32(0)
+	scannedEdgesKnown := true
 	scanLimit := authorizedScanEdgeLimit(request)
 	for page := 0; page < maxAuthorizedBoundedScanPages && scannedEdges < scanLimit; page++ {
 		if err := ctx.Err(); err != nil {
@@ -388,12 +389,13 @@ func (c *Client) boundedAuthorizedNeighborhoodPage(
 			incompleteWithoutCursor = true
 		}
 		consumed := raw.ScannedEdges
-		if consumed == 0 {
+		if !raw.ScannedEdgesKnown {
 			// Older or remote bounded implementations cannot prove how many
 			// adjacency entries were suppressed before materialization.
 			// Charge the full requested page rather than allowing hidden or
 			// reserved edges to bypass the authorization scan budget.
 			consumed = scan.Fanout
+			scannedEdgesKnown = false
 		}
 		if consumed < uint32(len(raw.Neighborhood.Edges)) ||
 			consumed > remainingScan {
@@ -453,6 +455,7 @@ func (c *Client) boundedAuthorizedNeighborhoodPage(
 		nodes, edges, assertions, request, len(normalized.NodeIDs))
 	result.Truncated = result.Truncated || incompleteWithoutCursor
 	result.ScannedEdges = scannedEdges
+	result.ScannedEdgesKnown = scannedEdgesKnown
 	interpreted, interpretErr := c.applyOntologyLens(ctx, result.Neighborhood, decision)
 	if interpretErr != nil {
 		return explorer.BoundedNeighborhood{}, interpretErr

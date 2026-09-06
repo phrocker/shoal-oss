@@ -345,6 +345,11 @@ func (s *RemoteService) Neighborhood(
 	); err != nil {
 		return NeighborhoodResponse{}, err
 	}
+	if response.ScannedEdges != nil &&
+		*response.ScannedEdges < uint32(len(response.Neighborhood.Edges)) {
+		return NeighborhoodResponse{}, remoteContractError(
+			"remote graph scan count is smaller than the returned edge count", nil)
+	}
 	if response.NextCursor != "" {
 		if !response.Truncated {
 			return NeighborhoodResponse{}, remoteContractError(

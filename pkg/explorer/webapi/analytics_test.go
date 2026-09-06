@@ -367,10 +367,139 @@ func TestRemoteMetadataRequiresValidRecordedAnalyticsLimits(t *testing.T) {
 	}
 }
 
+func TestExtensionOnlyAnalyticsAdvertisesAndServesRemoteClients(t *testing.T) {
+	service := &analyticsRouteService{}
+	server := httptest.NewUnstartedServer(nil)
+	handler, err := webapi.NewHandler(
+		service, server.Listener.Addr().String())
+	if err != nil {
+		server.Close()
+		t.Fatal(err)
+	}
+	server.Config.Handler = handler
+	server.Start()
+	defer server.Close()
+
+	remote, err := webapi.NewRemoteService(server.URL, server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	metadata, err := remote.Metadata(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !metadata.Capabilities.Analytics ||
+		metadata.AnalyticsLimits == nil ||
+		!metadata.AnalyticsRecordingRequired {
+		t.Fatalf("extension-only metadata = %+v", metadata)
+	}
+	request := webapi.AnalyticsRequest{Scope: analytics.Scope{
+		NodeIDs: []shoal.ID{"node"}, Depth: 1,
+		Direction: explorer.GraphDirectionBoth,
+		Fanout:    4, MaxNodes: 8, MaxEdges: 16,
+		MaxScannedEdgesPerNode: 32,
+	}}
+	if _, err := remote.Analytics(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	if service.calls != 1 {
+		t.Fatalf("remote analytics calls = %d, want 1", service.calls)
+	}
+}
+
+func TestExplicitCapabilityProviderCanDisableAnalyticsExtension(t *testing.T) {
+	service := &disabledAnalyticsService{
+		analyticsRouteService: &analyticsRouteService{},
+	}
+	server := httptest.NewUnstartedServer(nil)
+	handler, err := webapi.NewHandler(
+		service, server.Listener.Addr().String())
+	if err != nil {
+		server.Close()
+		t.Fatal(err)
+	}
+	server.Config.Handler = handler
+	server.Start()
+	defer server.Close()
+
+	remote, err := webapi.NewRemoteService(server.URL, server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	metadata, err := remote.Metadata(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if metadata.Capabilities.Analytics ||
+		metadata.AnalyticsLimits != nil ||
+		metadata.AnalyticsRecordingRequired {
+		t.Fatalf("explicit-disabled metadata = %+v", metadata)
+	}
+	request := webapi.AnalyticsRequest{Scope: analytics.Scope{
+		NodeIDs: []shoal.ID{"node"}, Depth: 1,
+		Direction: explorer.GraphDirectionBoth,
+		Fanout:    4, MaxNodes: 8, MaxEdges: 16,
+		MaxScannedEdgesPerNode: 32,
+	}}
+	if _, err := remote.Analytics(
+		context.Background(), request,
+	); !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
+		t.Fatalf("explicit-disabled analytics error = %v", err)
+	}
+	if service.calls != 0 {
+		t.Fatalf("disabled analytics reached provider %d times", service.calls)
+	}
+}
+
+func TestNeighborhoodWireDistinguishesKnownZeroFromUnknownScanCount(t *testing.T) {
+	zero := uint32(0)
+	known, err := json.Marshal(webapi.NeighborhoodResponse{
+		ScannedEdges: &zero,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(known, []byte(`"scanned_edges":0`)) {
+		t.Fatalf("known zero scan count was omitted: %s", known)
+	}
+	var decodedKnown webapi.NeighborhoodResponse
+	if err := json.Unmarshal(known, &decodedKnown); err != nil {
+		t.Fatal(err)
+	}
+	if decodedKnown.ScannedEdges == nil || *decodedKnown.ScannedEdges != 0 {
+		t.Fatalf("known zero scan count = %#v", decodedKnown.ScannedEdges)
+	}
+
+	unknown, err := json.Marshal(webapi.NeighborhoodResponse{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(unknown, []byte(`"scanned_edges"`)) {
+		t.Fatalf("unknown scan count was advertised: %s", unknown)
+	}
+	var decodedUnknown webapi.NeighborhoodResponse
+	if err := json.Unmarshal(unknown, &decodedUnknown); err != nil {
+		t.Fatal(err)
+	}
+	if decodedUnknown.ScannedEdges != nil {
+		t.Fatalf("unknown scan count became known: %#v", decodedUnknown.ScannedEdges)
+	}
+}
+
 type analyticsRouteService struct {
 	gateStubService
 	resolver auth.Resolver
 	calls    int
+}
+
+type disabledAnalyticsService struct {
+	*analyticsRouteService
+}
+
+func (*disabledAnalyticsService) Capabilities(
+	context.Context,
+) (webapi.Capabilities, error) {
+	return webapi.Capabilities{Analytics: false}, nil
 }
 
 type remoteAnalyticsMaterializer struct {
@@ -423,16 +552,18 @@ func (s *analyticsRouteService) Analytics(
 	ctx context.Context,
 	request webapi.AnalyticsRequest,
 ) (webapi.AnalyticsResponse, error) {
-	decision, err := s.resolver.Resolve(ctx)
-	if err != nil {
-		return webapi.AnalyticsResponse{}, err
-	}
-	if err := decision.Authorize(
-		auth.OperationAnalyticsRead,
-		auth.ResourceRequest{AuthorizationDomain: decision.AuthorizationDomain()},
-		time.Date(2026, time.September, 5, 18, 0, 0, 0, time.UTC),
-	); err != nil {
-		return webapi.AnalyticsResponse{}, err
+	if s.resolver != nil {
+		decision, err := s.resolver.Resolve(ctx)
+		if err != nil {
+			return webapi.AnalyticsResponse{}, err
+		}
+		if err := decision.Authorize(
+			auth.OperationAnalyticsRead,
+			auth.ResourceRequest{AuthorizationDomain: decision.AuthorizationDomain()},
+			time.Date(2026, time.September, 5, 18, 0, 0, 0, time.UTC),
+		); err != nil {
+			return webapi.AnalyticsResponse{}, err
+		}
 	}
 	s.calls++
 	return webapi.AnalyticsResponse{

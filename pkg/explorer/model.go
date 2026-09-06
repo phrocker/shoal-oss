@@ -202,7 +202,8 @@ type BoundedNeighborhood struct {
 	Continuation    bool
 	// ScannedEdges is the number of adjacency entries consumed to produce
 	// this page, including entries suppressed before materialization.
-	ScannedEdges uint32
+	ScannedEdges      uint32
+	ScannedEdgesKnown bool
 }
 
 // BoundedClient is the backend boundary required by scalable Explorer

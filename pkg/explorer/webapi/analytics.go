@@ -114,6 +114,16 @@ func (s *EmbeddedService) Analytics(
 
 func analyticsEndpoint(service Service) http.HandlerFunc {
 	return func(writer http.ResponseWriter, request *http.Request) {
+		capabilities, err := capabilitiesFor(request.Context(), service)
+		if err != nil {
+			writeError(writer, err)
+			return
+		}
+		if !capabilities.Analytics {
+			writeError(writer, shoal.NewError(
+				shoal.ErrorUnavailable, "workspace capability \"analytics\" is unavailable"))
+			return
+		}
 		provider, limits, ok := analyticsProvider(service)
 		if !ok {
 			writeError(writer, shoal.NewError(

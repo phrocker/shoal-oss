@@ -160,6 +160,9 @@ func TestBoundedNeighborhoodPagesPastHiddenEdges(t *testing.T) {
 	if got.Continuation || got.Truncated || got.NextAfterEdgeID != "" {
 		t.Fatalf("hidden base pagination leaked through result flags: %#v", got)
 	}
+	if got.ScannedEdgesKnown || got.ScannedEdges != 2 {
+		t.Fatalf("legacy scan accounting = %#v", got)
+	}
 }
 
 func TestVerifyDocumentViewRegistrationAcceptsLegacyDigest(t *testing.T) {
@@ -292,6 +295,25 @@ func TestBoundedNeighborhoodChargesSuppressedEdgesAgainstScanLimit(t *testing.T)
 	}
 	if base.calls != 2 {
 		t.Fatalf("suppressed-edge page calls = %d, want 2", base.calls)
+	}
+}
+
+func TestBoundedNeighborhoodPreservesKnownZeroScanCount(t *testing.T) {
+	client, base := authorizedPaginationClient(t, false)
+	base.knownZero = true
+	result, err := client.BoundedNeighborhood(
+		context.Background(),
+		explorer.BoundedNeighborhoodRequest{
+			NodeIDs: []shoal.ID{"node-seed"}, Depth: 1,
+			Fanout: 1, MaxNodes: 2, MaxScannedEdges: 1,
+			Direction: explorer.GraphDirectionOutgoing,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.ScannedEdgesKnown || result.ScannedEdges != 0 {
+		t.Fatalf("known zero scan count = %#v", result)
 	}
 }
 
@@ -467,6 +489,7 @@ type pagedBoundedBase struct {
 	nodes                        map[shoal.ID]graph.Node
 	hiddenOnly                   bool
 	omittedOnly                  bool
+	knownZero                    bool
 	truncatedWithoutContinuation bool
 }
 
@@ -503,6 +526,14 @@ func (b *pagedBoundedBase) BoundedNeighborhood(
 	request explorer.BoundedNeighborhoodRequest,
 ) (explorer.BoundedNeighborhood, error) {
 	b.calls++
+	if b.knownZero {
+		return explorer.BoundedNeighborhood{
+			Neighborhood: explorer.Neighborhood{
+				Nodes: []graph.Node{b.nodes["node-seed"]},
+			},
+			ScannedEdgesKnown: true,
+		}, nil
+	}
 	if b.truncatedWithoutContinuation {
 		return explorer.BoundedNeighborhood{
 			Neighborhood: explorer.Neighborhood{
