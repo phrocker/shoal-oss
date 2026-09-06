@@ -315,6 +315,13 @@ func TestHTTPWorkspaceSettingsRejectsBoundsAndUnknownFields(t *testing.T) {
 	}
 	path := "/api/v1/workspaces/" +
 		base64.RawURLEncoding.EncodeToString([]byte("bounded")) + "/settings"
+	noncanonicalPath := settingsRequest(
+		t, handler, http.MethodGet,
+		"/api/v1/workspaces/YR/settings", nil, "owner", "")
+	if noncanonicalPath.Code != http.StatusBadRequest {
+		t.Fatalf("noncanonical workspace status = %d, body = %s",
+			noncanonicalPath.Code, noncanonicalPath.Body.String())
+	}
 	for _, test := range []struct {
 		name string
 		body map[string]any
@@ -337,6 +344,14 @@ func TestHTTPWorkspaceSettingsRejectsBoundsAndUnknownFields(t *testing.T) {
 				"expected_revision": 0,
 				"mutation_id":       base64.RawURLEncoding.EncodeToString([]byte("unknown")),
 				"settings":          map[string]any{"ambient_lens": "forbidden"},
+			},
+		},
+		{
+			name: "noncanonical mutation ID",
+			body: map[string]any{
+				"expected_revision": 0,
+				"mutation_id":       "YR",
+				"settings":          map[string]any{},
 			},
 		},
 		{
