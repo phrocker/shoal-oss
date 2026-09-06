@@ -67,3 +67,22 @@ func TestCanonicalResponseIdentityRejectsMalformedEvidence(t *testing.T) {
 		t.Fatalf("response ID error = %v", err)
 	}
 }
+
+func TestInteractionEvidenceEqualityPreservesGraphOrder(t *testing.T) {
+	base := interaction.EvidenceReference{
+		AnchorID: "anchor",
+		Kind:     interaction.EvidenceGraph,
+		NodeIDs:  []shoal.ID{"node-a", "node-b", "node-c"},
+		EdgeIDs:  []shoal.ID{"edge-a", "edge-b"},
+	}
+	reorderedNodes := base
+	reorderedNodes.NodeIDs = []shoal.ID{"node-c", "node-b", "node-a"}
+	if interactionEvidenceEqual(base, reorderedNodes) {
+		t.Fatal("reordered graph nodes compared equal")
+	}
+	reorderedEdges := base
+	reorderedEdges.EdgeIDs = []shoal.ID{"edge-b", "edge-a"}
+	if interactionEvidenceEqual(base, reorderedEdges) {
+		t.Fatal("reordered graph edges compared equal")
+	}
+}

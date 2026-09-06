@@ -1549,8 +1549,8 @@ func interactionEvidenceEqual(
 ) bool {
 	if left.AnchorID != right.AnchorID || left.Kind != right.Kind ||
 		left.Citation != right.Citation ||
-		!equalIDs(left.NodeIDs, right.NodeIDs) ||
-		!equalIDs(left.EdgeIDs, right.EdgeIDs) ||
+		!reflect.DeepEqual(left.NodeIDs, right.NodeIDs) ||
+		!reflect.DeepEqual(left.EdgeIDs, right.EdgeIDs) ||
 		len(left.Assertions) != len(right.Assertions) {
 		return false
 	}
