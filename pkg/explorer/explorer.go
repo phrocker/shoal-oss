@@ -30,6 +30,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/phrocker/shoal-oss/internal/dirlock"
 	"github.com/phrocker/shoal-oss/internal/engine"
 	"github.com/phrocker/shoal-oss/pkg/document"
 	"github.com/phrocker/shoal-oss/pkg/graph"
@@ -44,6 +45,7 @@ import (
 type Explorer struct {
 	mu                      sync.RWMutex
 	engine                  *engine.Engine
+	lock                    *dirlock.Lock
 	documents               map[shoal.ID]map[shoal.ID]*persistedDocument
 	edges                   map[shoal.ID]persistedEdge
 	interactions            map[shoal.ID]*persistedInteraction
@@ -161,16 +163,23 @@ func OpenWithOptions(dir string, options Options) (*Explorer, error) {
 	if strings.TrimSpace(dir) == "" {
 		return nil, shoal.NewError(shoal.ErrorInvalidArgument, "data directory is required")
 	}
+	lock, err := dirlock.Acquire(dir, ".shoal-explorer-runtime.lock")
+	if err != nil {
+		return nil, shoal.WrapError(shoal.ErrorUnavailable, "acquire explorer storage", err)
+	}
 	eng, err := engine.Open(dir, engine.Options{})
 	if err != nil {
+		_ = lock.Close()
 		return nil, shoal.WrapError(shoal.ErrorUnavailable, "open explorer storage", err)
 	}
 	explorer, err := openWithEngine(eng, options, nil)
 	if err != nil {
 		_ = eng.Close()
+		_ = lock.Close()
 		return nil, err
 	}
 	explorer.ownsEngine = true
+	explorer.lock = lock
 	return explorer, nil
 }
 
@@ -288,10 +297,13 @@ func (e *Explorer) Close() error {
 		return nil
 	}
 	e.closed = true
+	var engineErr error
 	if e.ownsEngine {
-		if err := e.engine.Close(); err != nil {
-			return shoal.WrapError(shoal.ErrorInternal, "close explorer storage", err)
-		}
+		engineErr = e.engine.Close()
+	}
+	lockErr := e.lock.Close()
+	if err := errors.Join(engineErr, lockErr); err != nil {
+		return shoal.WrapError(shoal.ErrorInternal, "close explorer storage", err)
 	}
 	return nil
 }
@@ -379,10 +391,6 @@ func (e *Explorer) ingest(
 			)
 		}
 	} else {
-		publicationHead, err = e.documentRecordHead(ctx, []byte(parsed.document.ID))
-		if err != nil {
-			return IngestResult{}, err
-		}
 		embeddings, err := e.embedParsedSpans(ctx, parsed.spans)
 		if err != nil {
 			return IngestResult{}, err
@@ -407,6 +415,22 @@ func (e *Explorer) ingest(
 	if revisions := e.documents[record.Document.ID]; revisions != nil {
 		if existing := revisions[record.Revision.ID]; existing != nil {
 			return ingestResult(existing, IngestUnchanged), nil
+		}
+	}
+	if !attempted {
+		pending, err := e.publicationPending(ctx)
+		if err != nil {
+			return IngestResult{}, err
+		}
+		if pending {
+			return IngestResult{}, shoal.NewError(
+				shoal.ErrorUnavailable,
+				"a previous transactional publication requires recovery",
+			)
+		}
+		publicationHead, err = e.documentRecordHead(ctx, []byte(parsed.document.ID))
+		if err != nil {
+			return IngestResult{}, err
 		}
 	}
 	if record.Embeddings != nil {

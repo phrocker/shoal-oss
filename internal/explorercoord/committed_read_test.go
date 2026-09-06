@@ -155,6 +155,7 @@ func TestScanCommittedPagesBoundsAndDetectsPhysicalMutation(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+
 	first, err := runtime.ScanCommitted(context.Background(), CommittedScanRequest{
 		Table: "records", RowPrefix: []byte("event/"), Family: []byte("event"),
 		Qualifier: []byte("record"), Limit: 1,
@@ -239,6 +240,41 @@ func TestScanCommittedPagesBoundsAndDetectsPhysicalMutation(t *testing.T) {
 		Qualifier: []byte("record"), Frontier: first.Frontier, Limit: 1,
 	}); !errors.Is(err, transaction.ErrInternal) {
 		t.Fatalf("divergent physical mutation scan = %v", err)
+	}
+}
+
+func TestScanCommittedFinalizesMatchingRowBeforeNonmatchingWork(t *testing.T) {
+	config := testRuntimeConfig(t, testDirectory(t))
+	runtime, err := Open(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.Close()
+	intent := committedReadIntent(
+		t, config.Domain, "matching", []byte("event/a"), []byte("value"),
+		guard.ModeAbsentOrIdentical, 0, coordination.Digest{},
+	)
+	if _, err := runtime.Publish(
+		context.Background(), Request{Intent: intent},
+	); err != nil {
+		t.Fatal(err)
+	}
+	noise, err := cclient.NewMutation([]byte("event/b"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	noise.Put([]byte("event"), []byte("other"), nil, 1, []byte("noise"))
+	if err := runtime.engine.Write("records", []*cclient.Mutation{noise}); err != nil {
+		t.Fatal(err)
+	}
+	page, err := runtime.ScanCommitted(context.Background(), CommittedScanRequest{
+		Table: "records", RowPrefix: []byte("event/"),
+		Family: []byte("event"), Qualifier: []byte("record"),
+		Limit: 1, MaxScanned: 1,
+	})
+	if err != nil || len(page.Cells) != 1 ||
+		!bytes.Equal(page.Cells[0].Cell.Coordinate.Row, []byte("event/a")) {
+		t.Fatalf("page before nonmatching work = %#v, %v", page, err)
 	}
 }
 

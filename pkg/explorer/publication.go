@@ -82,9 +82,23 @@ type RecordPublicationAdapter interface {
 	RecordCommitted(context.Context, RecordPublication) (bool, error)
 	RecordHead(context.Context, byte, []byte) (*RecordPublicationHead, error)
 	RecordAttempt(context.Context, RecordPublication) (*RecordPublicationAttempt, error)
+	PendingPublications(context.Context) (bool, error)
 }
 
 var embeddedDefaultPolicy = []byte("embedded/default")
+
+func (e *Explorer) publicationPending(ctx context.Context) (bool, error) {
+	if e.publication == nil {
+		return false, nil
+	}
+	pending, err := e.publication.PendingPublications(ctx)
+	if err != nil {
+		return false, shoal.WrapError(
+			shoal.ErrorUnavailable, "inspect transactional publications", err,
+		)
+	}
+	return pending, nil
+}
 
 func documentStableKey(row []byte) []byte {
 	key := sha256.Sum256(append([]byte("explorer-document-record-v1\x00"), row...))

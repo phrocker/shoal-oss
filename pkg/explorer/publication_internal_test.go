@@ -63,6 +63,12 @@ func (*rejectingPublicationAdapter) RecordAttempt(
 	return nil, nil
 }
 
+func (*rejectingPublicationAdapter) PendingPublications(
+	context.Context,
+) (bool, error) {
+	return false, nil
+}
+
 func TestConfiguredPublicationRejectsOversizedDocumentWithoutDirectWrite(t *testing.T) {
 	source := Source{
 		URI: "file:///oversized.txt", MediaType: MediaTypeText,

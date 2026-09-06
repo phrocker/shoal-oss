@@ -657,6 +657,21 @@ func (r *Runtime) RecordAttempt(
 	}, nil
 }
 
+func (r *Runtime) PendingPublications(
+	ctx context.Context,
+) (bool, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if r.closed {
+		return false, transaction.ErrUnavailable
+	}
+	candidates, _, err := r.intents.Candidates(ctx, nil, 1)
+	if err != nil {
+		return false, err
+	}
+	return len(candidates) != 0, nil
+}
+
 func (r *Runtime) bindRecordAttempt(
 	ctx context.Context,
 	key []byte,

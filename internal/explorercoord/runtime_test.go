@@ -38,6 +38,7 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/explorer/coordination/allocator"
 	"github.com/phrocker/shoal-oss/pkg/explorer/coordination/guard"
 	"github.com/phrocker/shoal-oss/pkg/explorer/coordination/transaction"
+	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
 func TestRuntimePublishesRetriesAndRejectsConcurrentDivergence(t *testing.T) {
@@ -652,6 +653,81 @@ func TestExplorerRetryReusesDurableAttemptAcrossPublicationFaults(t *testing.T) 
 				t.Fatalf("retry documents at stage %d = %#v, %v", stage, documents, err)
 			}
 		})
+	}
+}
+
+func TestPendingPublicationBlocksLaterChangeFeedAdvance(t *testing.T) {
+	config := testRuntimeConfig(t, testDirectory(t))
+	fired := false
+	config.testStageHook = func(stage recoveryStage) error {
+		if stage == recoveryStageIntent && !fired {
+			fired = true
+			return context.Canceled
+		}
+		return nil
+	}
+	embedded, err := OpenExplorer(config, explorer.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer embedded.Close()
+	first := explorer.Source{
+		URI: "file:///first.md", Title: "First",
+		MediaType: explorer.MediaTypeMarkdown, Content: "# First\n",
+	}
+	second := explorer.Source{
+		URI: "file:///second.md", Title: "Second",
+		MediaType: explorer.MediaTypeMarkdown, Content: "# Second\n",
+	}
+	if _, err := embedded.Explorer.Ingest(
+		context.Background(), first,
+	); err == nil || !explorer.IsIndeterminateCommit(err) {
+		t.Fatalf("first indeterminate ingest = %v", err)
+	}
+	pending, err := embedded.Runtime.PendingPublications(context.Background())
+	if err != nil || !pending {
+		t.Fatalf("pending publication after failure = %v, %v", pending, err)
+	}
+	if _, err := embedded.Explorer.Ingest(
+		context.Background(), second,
+	); !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
+		t.Fatalf("later ingest while pending = %v", err)
+	}
+	if _, err := embedded.Explorer.Ingest(
+		context.Background(), first,
+	); err != nil {
+		t.Fatalf("retry first ingest = %v", err)
+	}
+	if _, err := embedded.Explorer.Ingest(
+		context.Background(), second,
+	); err != nil {
+		t.Fatalf("second ingest after recovery = %v", err)
+	}
+	feed, err := embedded.Explorer.Changes(
+		context.Background(), explorer.ChangeRequest{Limit: 10},
+	)
+	if err != nil || len(feed.Changes) != 2 ||
+		feed.Changes[0].Sequence != 1 ||
+		feed.Changes[1].Sequence != 2 ||
+		feed.Head != 2 {
+		t.Fatalf("change feed after retry = %#v, %v", feed, err)
+	}
+}
+
+func TestTransactionalRuntimeRejectsLegacyExplorerOpen(t *testing.T) {
+	config := testRuntimeConfig(t, testDirectory(t))
+	embedded, err := OpenExplorer(config, explorer.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer embedded.Close()
+	legacy, err := explorer.Open(config.Directory)
+	if err == nil {
+		_ = legacy.Close()
+		t.Fatal("legacy Explorer opened a transaction-owned directory")
+	}
+	if !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
+		t.Fatalf("legacy open error = %v", err)
 	}
 }
 

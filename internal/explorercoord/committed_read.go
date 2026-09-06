@@ -263,6 +263,7 @@ func (r *Runtime) ScanCommitted(
 	}
 	proofs := make(map[coordination.Epoch]publicationProof)
 	var row []byte
+	var scanRow []byte
 	var versions []physicalVersion
 	finishRow := func() (bool, error) {
 		if len(versions) == 0 {
@@ -287,6 +288,21 @@ func (r *Runtime) ScanCommitted(
 		if err := ctx.Err(); err != nil {
 			return CommittedPage{}, err
 		}
+		key := scanner.Key()
+		if scanRow != nil && !bytes.Equal(scanRow, key.Row) {
+			done, finishErr := finishRow()
+			if finishErr != nil {
+				return CommittedPage{}, finishErr
+			}
+			if done {
+				return page, nil
+			}
+			versions = versions[:0]
+			row = nil
+		}
+		if scanRow == nil || !bytes.Equal(scanRow, key.Row) {
+			scanRow = append(scanRow[:0], key.Row...)
+		}
 		page.Scanned++
 		if page.Scanned > request.MaxScanned {
 			return CommittedPage{}, errors.Join(
@@ -294,20 +310,9 @@ func (r *Runtime) ScanCommitted(
 				errors.New("committed scan exhausted its work limit"),
 			)
 		}
-		key := scanner.Key()
 		if bytes.Equal(key.ColumnFamily, request.Family) &&
 			bytes.Equal(key.ColumnQualifier, request.Qualifier) &&
 			bytes.Equal(key.ColumnVisibility, request.Visibility) {
-			if row != nil && !bytes.Equal(row, key.Row) {
-				done, finishErr := finishRow()
-				if finishErr != nil {
-					return CommittedPage{}, finishErr
-				}
-				if done {
-					return page, nil
-				}
-				versions = versions[:0]
-			}
 			if row == nil || !bytes.Equal(row, key.Row) {
 				row = append(row[:0], key.Row...)
 			}
