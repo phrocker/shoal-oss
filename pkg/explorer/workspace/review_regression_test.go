@@ -24,6 +24,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -34,6 +35,27 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/ontology"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
+
+func TestReviewSettingsRejectOutputPolicyConjunctionOverflow(t *testing.T) {
+	policies := make([]auth.Policy, 0, 32)
+	for index := 0; index < 32; index++ {
+		policy, err := auth.NewPolicy(auth.PolicyConfig{
+			AuthorizationDomain: []byte("domain"),
+			SourceID:            []byte(fmt.Sprintf("source-%02d", index)),
+			GrantPolicyID:       []byte(fmt.Sprintf("policy-%02d", index)),
+			Epoch:               1,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		policies = append(policies, policy)
+	}
+	if _, err := normalizePolicies(policies); !shoal.IsErrorCode(
+		err, shoal.ErrorInvalidArgument,
+	) {
+		t.Fatalf("output policy conjunction error = %v", err)
+	}
+}
 
 type reviewBlockingStore struct {
 	Store
