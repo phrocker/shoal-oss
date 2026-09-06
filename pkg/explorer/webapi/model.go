@@ -285,7 +285,6 @@ type PathRequest struct {
 	To        shoal.ID `json:"to"`
 	MaxDepth  uint32   `json:"max_depth,omitempty"`
 	Fanout    uint32   `json:"fanout,omitempty"`
-	MaxNodes  uint32   `json:"max_nodes,omitempty"`
 	EdgeTypes []string `json:"edge_types,omitempty"`
 }
 

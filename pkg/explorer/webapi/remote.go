@@ -374,12 +374,14 @@ func (s *RemoteService) Path(ctx context.Context, request PathRequest) (PathResp
 	if err := shoal.ValidateRequiredID("path target node ID", request.To); err != nil {
 		return PathResponse{}, err
 	}
-	maxNodes := request.MaxNodes
-	if maxNodes == 0 {
-		maxNodes = effectiveGraphNodeLimit(ctx, MaxNodes)
+	if effectiveGraphNodeLimit(ctx, MaxNodes) < MaxNodes {
+		return PathResponse{}, shoal.NewError(
+			shoal.ErrorUnavailable,
+			"remote path cannot enforce the workspace graph node budget",
+		)
 	}
-	depth, fanout, maxNodes, err := normalizeGraphBounds(
-		request.MaxDepth, request.Fanout, maxNodes)
+	depth, fanout, _, err := normalizeGraphBounds(
+		request.MaxDepth, request.Fanout, MaxNodes)
 	if err != nil {
 		return PathResponse{}, err
 	}
@@ -395,7 +397,6 @@ func (s *RemoteService) Path(ctx context.Context, request PathRequest) (PathResp
 	request.EdgeTypes = normalized.EdgeTypes
 	request.MaxDepth = depth
 	request.Fanout = fanout
-	request.MaxNodes = maxNodes
 	var response PathResponse
 	if err := s.post(
 		ctx, CapabilityPath, "path", request, &response,

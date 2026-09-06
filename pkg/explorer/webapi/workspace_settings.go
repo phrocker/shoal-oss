@@ -137,9 +137,16 @@ func (h *Handler) applyWorkspaceSettings(
 	if err != nil || ctx == nil {
 		return nil, authenticationDenied()
 	}
-	ctx = context.WithValue(
-		ctx, effectiveWorkspaceSettingsContextKey{}, effective)
+	ctx = withEffectiveWorkspaceSettings(ctx, effective)
 	return withIdentity(ctx, decision), nil
+}
+
+func withEffectiveWorkspaceSettings(
+	ctx context.Context,
+	effective workspace.EffectiveDecision,
+) context.Context {
+	return context.WithValue(
+		ctx, effectiveWorkspaceSettingsContextKey{}, effective)
 }
 
 func applyWorkspaceRequestLimits(ctx context.Context, request any) {
@@ -164,8 +171,6 @@ func applyWorkspaceRequestLimits(ctx context.Context, request any) {
 			value.MaxDepth, DefaultDepth, limits.GraphDepth)
 		value.Fanout = lowerRequestLimit(
 			value.Fanout, DefaultFanout, limits.GraphFanout)
-		value.MaxNodes = lowerRequestLimit(
-			value.MaxNodes, MaxNodes, limits.GraphNodes)
 	}
 }
 
