@@ -66,5 +66,7 @@ actor/delegation/reason metadata. Its visibility is the conjunction of the
 current workspace policies for every recorded node and edge. A failure after
 the durable write is returned with indeterminate-commit semantics.
 
-Recording reauthorizes the evidence with `analytics_read`; an analytics-only
-identity is not required to hold the unrelated `retrieve` operation.
+The interaction admission is authorized and recorded with `analytics_read`.
+The underlying graph evidence is independently reauthorized with `retrieve`,
+so evidence-bearing analytics identities require both operations. The
+analytics service role permits this bounded pair.

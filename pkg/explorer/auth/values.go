@@ -187,7 +187,9 @@ func (r ServiceRole) Allows(operation Operation) bool {
 	case ServiceRoleEventPublication:
 		return operation == OperationEventPublish || operation == OperationValidate
 	case ServiceRoleAnalytics:
-		return operation == OperationAnalyticsRead || operation == OperationValidate
+		return operation == OperationAnalyticsRead ||
+			operation == OperationRetrieve ||
+			operation == OperationValidate
 	case ServiceRoleWorkspaceSettingsRead:
 		return operation == OperationWorkspaceSettingsRead ||
 			operation == OperationValidate
