@@ -142,6 +142,8 @@ type OntologyMorphism struct {
 	safety        MorphismSafety
 	source        OntologyIdentity
 	target        OntologyIdentity
+	sourceVersion OntologyVersion
+	targetVersion OntologyVersion
 	sources       []shoal.ID
 	targets       []shoal.ID
 	discriminator MorphismDiscriminator
@@ -162,7 +164,9 @@ func NewOntologyMorphism(config MorphismConfig) (OntologyMorphism, error) {
 	m := OntologyMorphism{
 		kind: config.Kind, safety: safetyForMorphism(config.Kind),
 		source: source, target: target,
-		sources: canonicalizeIDs(config.Sources), targets: canonicalizeIDs(config.Targets),
+		sourceVersion: config.SourceVersion.clone(),
+		targetVersion: config.TargetVersion.clone(),
+		sources:       canonicalizeIDs(config.Sources), targets: canonicalizeIDs(config.Targets),
 		discriminator: config.Discriminator, evidence: cloneEvidence(config.Evidence),
 		rationale: config.Rationale, metadata: cloneMetadata(config.Metadata),
 	}
@@ -210,6 +214,17 @@ func (m OntologyMorphism) Validate() error {
 	}
 	if err := m.target.Validate(); err != nil {
 		return err
+	}
+	if err := m.sourceVersion.Validate(); err != nil {
+		return err
+	}
+	if err := m.targetVersion.Validate(); err != nil {
+		return err
+	}
+	source, _ := NewOntologyIdentity(m.sourceVersion)
+	target, _ := NewOntologyIdentity(m.targetVersion)
+	if source != m.source || target != m.target {
+		return invalid("morphism version material does not match its identities")
 	}
 	if m.source.SchemaID() != m.target.SchemaID() ||
 		m.source.VersionID() == m.target.VersionID() {
@@ -418,6 +433,8 @@ func (m OntologyMorphism) Kind() MorphismKind                   { return m.kind 
 func (m OntologyMorphism) Safety() MorphismSafety               { return m.safety }
 func (m OntologyMorphism) Source() OntologyIdentity             { return m.source }
 func (m OntologyMorphism) Target() OntologyIdentity             { return m.target }
+func (m OntologyMorphism) SourceVersion() OntologyVersion       { return m.sourceVersion.clone() }
+func (m OntologyMorphism) TargetVersion() OntologyVersion       { return m.targetVersion.clone() }
 func (m OntologyMorphism) Sources() []shoal.ID                  { return cloneIDs(m.sources) }
 func (m OntologyMorphism) Targets() []shoal.ID                  { return cloneIDs(m.targets) }
 func (m OntologyMorphism) Discriminator() MorphismDiscriminator { return m.discriminator }
@@ -425,6 +442,8 @@ func (m OntologyMorphism) Evidence() []EvidenceRef              { return cloneEv
 func (m OntologyMorphism) Rationale() string                    { return m.rationale }
 func (m OntologyMorphism) Metadata() shoal.Metadata             { return cloneMetadata(m.metadata) }
 func (m OntologyMorphism) clone() OntologyMorphism {
+	m.sourceVersion = m.sourceVersion.clone()
+	m.targetVersion = m.targetVersion.clone()
 	m.sources = cloneIDs(m.sources)
 	m.targets = cloneIDs(m.targets)
 	m.evidence = cloneEvidence(m.evidence)
@@ -517,8 +536,10 @@ type OntologyLens struct {
 // versions. It exists independently of morphisms so additive releases remain
 // traversable even when no definition mapping is required.
 type OntologyTransition struct {
-	source OntologyIdentity
-	target OntologyIdentity
+	source        OntologyIdentity
+	target        OntologyIdentity
+	sourceVersion OntologyVersion
+	targetVersion OntologyVersion
 }
 
 func NewOntologyTransition(
@@ -547,7 +568,11 @@ func NewOntologyTransition(
 	); err != nil {
 		return OntologyTransition{}, err
 	}
-	transition := OntologyTransition{source: source, target: target}
+	transition := OntologyTransition{
+		source: source, target: target,
+		sourceVersion: sourceVersion.clone(),
+		targetVersion: targetVersion.clone(),
+	}
 	if err := transition.Validate(); err != nil {
 		return OntologyTransition{}, err
 	}
@@ -561,6 +586,17 @@ func (t OntologyTransition) Validate() error {
 	if err := t.target.Validate(); err != nil {
 		return err
 	}
+	if err := t.sourceVersion.Validate(); err != nil {
+		return err
+	}
+	if err := t.targetVersion.Validate(); err != nil {
+		return err
+	}
+	source, _ := NewOntologyIdentity(t.sourceVersion)
+	target, _ := NewOntologyIdentity(t.targetVersion)
+	if source != t.source || target != t.target {
+		return invalid("ontology transition material does not match its identities")
+	}
 	if t.source.SchemaID() != t.target.SchemaID() ||
 		t.source.VersionID() == t.target.VersionID() {
 		return invalid("ontology transition must connect distinct versions of one schema")
@@ -570,11 +606,19 @@ func (t OntologyTransition) Validate() error {
 
 func (t OntologyTransition) Source() OntologyIdentity { return t.source }
 func (t OntologyTransition) Target() OntologyIdentity { return t.target }
+func (t OntologyTransition) SourceVersion() OntologyVersion {
+	return t.sourceVersion.clone()
+}
+func (t OntologyTransition) TargetVersion() OntologyVersion {
+	return t.targetVersion.clone()
+}
 
 type ontologyLensTransition struct {
-	source    OntologyIdentity
-	target    OntologyIdentity
-	morphisms []OntologyMorphism
+	source        OntologyIdentity
+	target        OntologyIdentity
+	sourceVersion OntologyVersion
+	targetVersion OntologyVersion
+	morphisms     []OntologyMorphism
 }
 
 func NewOntologyLens(
@@ -595,10 +639,18 @@ func NewOntologyLensWithTransitions(
 	lens := OntologyLens{target: target.clone(), identity: identity}
 	inferTransitions := transitions == nil
 	grouped := make(map[string]*ontologyLensTransition)
-	addTransition := func(source, target OntologyIdentity) *ontologyLensTransition {
+	addTransition := func(
+		sourceVersion, targetVersion OntologyVersion,
+	) *ontologyLensTransition {
+		source, _ := NewOntologyIdentity(sourceVersion)
+		target, _ := NewOntologyIdentity(targetVersion)
 		key := source.String() + "->" + target.String()
 		if grouped[key] == nil {
-			grouped[key] = &ontologyLensTransition{source: source, target: target}
+			grouped[key] = &ontologyLensTransition{
+				source: source, target: target,
+				sourceVersion: sourceVersion.clone(),
+				targetVersion: targetVersion.clone(),
+			}
 		}
 		return grouped[key]
 	}
@@ -609,7 +661,7 @@ func NewOntologyLensWithTransitions(
 		if transition.Source().SchemaID() != identity.SchemaID() {
 			continue
 		}
-		addTransition(transition.Source(), transition.Target())
+		addTransition(transition.SourceVersion(), transition.TargetVersion())
 	}
 	for _, morphism := range morphisms {
 		if err := morphism.Validate(); err != nil {
@@ -624,7 +676,8 @@ func NewOntologyLensWithTransitions(
 			if !inferTransitions {
 				continue
 			}
-			edge = addTransition(morphism.Source(), morphism.Target())
+			edge = addTransition(
+				morphism.SourceVersion(), morphism.TargetVersion())
 		}
 		edge.morphisms = append(edge.morphisms, morphism.clone())
 	}
@@ -654,7 +707,11 @@ func (l OntologyLens) Read(assertion Assertion) AssertionInterpretation {
 		return UnresolvedInterpretation(assertion, l.identity, string(reading))
 	}
 	if reading == OntologySameVersion {
-		return ReadAssertionUnder(assertion, l.identity)
+		result := ReadAssertionUnder(assertion, l.identity)
+		if err := validateInterpretationAgainst(l.target, assertion, result); err != nil {
+			return UnresolvedInterpretation(assertion, l.identity, err.Error())
+		}
+		return result
 	}
 	subjectType, _ := assertion.SubjectType()
 	objectType, _ := assertion.ObjectType()
@@ -669,6 +726,11 @@ func (l OntologyLens) Read(assertion Assertion) AssertionInterpretation {
 	}
 	applied := make(map[shoal.ID]struct{})
 	for _, step := range path {
+		if err := validateInterpretationAgainst(
+			step.sourceVersion, assertion, result,
+		); err != nil {
+			return UnresolvedInterpretation(assertion, l.identity, err.Error())
+		}
 		var reason string
 		var matched []shoal.ID
 		result.subjectType, matched, reason = mapDefinition(
@@ -689,8 +751,13 @@ func (l OntologyLens) Read(assertion Assertion) AssertionInterpretation {
 			return UnresolvedInterpretation(assertion, l.identity, reason)
 		}
 		appendAppliedMorphisms(&result.applied, applied, matched)
+		if err := validateInterpretationAgainst(
+			step.targetVersion, assertion, result,
+		); err != nil {
+			return UnresolvedInterpretation(assertion, l.identity, err.Error())
+		}
 	}
-	if err := l.validateInterpretation(assertion, result); err != nil {
+	if err := validateInterpretationAgainst(l.target, assertion, result); err != nil {
 		return UnresolvedInterpretation(assertion, l.identity, err.Error())
 	}
 	return result
@@ -796,12 +863,13 @@ func appendAppliedMorphisms(
 	}
 }
 
-func (l OntologyLens) validateInterpretation(
+func validateInterpretationAgainst(
+	version OntologyVersion,
 	assertion Assertion, interpretation AssertionInterpretation,
 ) error {
 	switch IDNamespace(interpretation.predicate) {
 	case "relationship":
-		relationship, ok := l.target.relationship(interpretation.predicate)
+		relationship, ok := version.relationship(interpretation.predicate)
 		if !ok || assertion.Object().Type() != ValueReference ||
 			interpretation.subjectType == "" || interpretation.objectType == "" {
 			return invalid("relationship is not resolvable in selected ontology")
@@ -815,7 +883,7 @@ func (l OntologyLens) validateInterpretation(
 			return invalid("relationship endpoints are incompatible with selected ontology")
 		}
 	case "property":
-		property, ok := l.target.property(interpretation.predicate)
+		property, ok := version.property(interpretation.predicate)
 		if !ok || validatePropertyValue(property, assertion.Object(), nil) != nil {
 			return invalid("property is incompatible with selected ontology")
 		}
@@ -823,16 +891,16 @@ func (l OntologyLens) validateInterpretation(
 		if namespace != "concept" && namespace != "relationship" {
 			return invalid("property subject type has an incompatible definition kind")
 		}
-		if !definitionExists(l.target, interpretation.subjectType) {
+		if !definitionExists(version, interpretation.subjectType) {
 			return invalid("property subject type is absent from selected ontology")
 		}
 		owners := make([]shoal.ID, 0)
-		for _, concept := range l.target.concepts {
+		for _, concept := range version.concepts {
 			if containsID(concept.Properties(), interpretation.predicate) {
 				owners = append(owners, concept.ID())
 			}
 		}
-		for _, relationship := range l.target.relationships {
+		for _, relationship := range version.relationships {
 			if containsID(relationship.Properties(), interpretation.predicate) {
 				owners = append(owners, relationship.ID())
 			}

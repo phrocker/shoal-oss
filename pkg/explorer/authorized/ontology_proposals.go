@@ -257,6 +257,9 @@ func (c *Client) ontologyEvidenceAllows(
 		return false, inconsistentBase()
 	}
 	citation := evidence.Citation()
+	if citation.SectionID == "" && citation.SpanID == "" {
+		return false, nil
+	}
 	registration, ok, err := c.policyStore.Revision(
 		ctx, citation.DocumentID, citation.RevisionID)
 	if err != nil {

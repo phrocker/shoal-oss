@@ -166,6 +166,73 @@ func TestReadAssertionUnderResolvesOnlyExactRecordedVersion(t *testing.T) {
 	}
 }
 
+func TestOntologyLensRejectsAbsentDefinitionInExactVersion(t *testing.T) {
+	f := newMorphismFixture(t)
+	future, err := NewPropertyDefinition(
+		"future", "Future", "", ValueString, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertion := mustPropertyAssertion(
+		t, f.person.ID(), future.ID(), f.v1, nil, f.evidence, f.provenance)
+	lens, err := NewOntologyLensWithTransitions(f.v1, []OntologyTransition{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := lens.Read(assertion); got.Resolved() {
+		t.Fatalf("exact-version read resolved absent predicate: %#v", got)
+	}
+}
+
+func TestOntologyLensRejectsFutureDefinitionStampedWithSourceVersion(t *testing.T) {
+	f := newMorphismFixture(t)
+	future, err := NewPropertyDefinition(
+		"future", "Future", "", ValueString, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	basePerson, err := NewConceptDefinition(
+		"person", "Person", "", nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetPerson, err := NewConceptDefinition(
+		"person", "Person", "", []shoal.ID{future.ID()}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	schema, err := NewOntologySchema("future", "Future", "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	at := time.Date(2026, time.September, 6, 0, 0, 0, 0, time.UTC)
+	base, err := NewOntologyVersion(
+		schema, "1", at, []ConceptDefinition{basePerson}, nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target, err := NewOntologyVersion(
+		schema, "2", at.Add(time.Second), []ConceptDefinition{targetPerson},
+		nil, []PropertyDefinition{future}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	transition, err := NewOntologyTransition(base, target, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lens, err := NewOntologyLensWithTransitions(
+		target, []OntologyTransition{transition}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertion := mustPropertyAssertion(
+		t, basePerson.ID(), future.ID(), base, nil, f.evidence, f.provenance)
+	if got := lens.Read(assertion); got.Resolved() {
+		t.Fatalf("future definition retroactively resolved: %#v", got)
+	}
+}
+
 func mustIdentity(t *testing.T, version OntologyVersion) OntologyIdentity {
 	t.Helper()
 	identity, err := NewOntologyIdentity(version)
