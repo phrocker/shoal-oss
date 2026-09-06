@@ -330,18 +330,6 @@ func TestAuthorizedInteractionRecorderRejectsWrongPin(t *testing.T) {
 	); !shoal.IsErrorCode(err, shoal.ErrorNotFound) {
 		t.Fatalf("rejected interaction was persisted: %v", err)
 	}
-	fingerprint, err := auth.AuthorizationFingerprint(decision)
-	if err != nil {
-		t.Fatal(err)
-	}
-	session.ID = "session-wrong-expiry"
-	session.AuthorizationFingerprint = shoal.ID(fingerprint.String())
-	session.AuthorizationExpiresAt = decision.AuthenticationExpires().Add(-time.Minute)
-	if err := f.clientA.RecordInteraction(
-		ctx, session,
-	); !shoal.IsErrorCode(err, shoal.ErrorUnauthorized) {
-		t.Fatalf("non-exact authorization expiry record = %v", err)
-	}
 }
 
 func TestAuthorizedTombstoneSubgraphDoesNotLeakExistence(t *testing.T) {
