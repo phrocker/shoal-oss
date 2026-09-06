@@ -263,6 +263,11 @@ func (e *Explorer) CommitExtraction(
 		return ExtractionResult{}, shoal.NewError(
 			shoal.ErrorConflict, "document changed before extraction publication")
 	}
+	if err := e.requireSourceGraphIDsAvailableLocked(
+		published.Nodes, published.Edges,
+	); err != nil {
+		return ExtractionResult{}, err
+	}
 	// This stable row overwrite is load-bearing; TestExtractDocumentRerunReusesSkillEntities pins idempotent re-publication.
 	if err := e.writeRecord(
 		extractionRecordRow(published.ID), embeddedRecordExtraction, published,

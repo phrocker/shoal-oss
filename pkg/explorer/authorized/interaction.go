@@ -21,6 +21,7 @@ package authorized
 
 import (
 	"context"
+	"reflect"
 	"sort"
 	"strconv"
 	"time"
@@ -149,8 +150,23 @@ func (c *Client) recordInteractionForOperation(
 	if err != nil {
 		return interaction.Session{}, err
 	}
-	if !interactionPinMatchesDecision(canonical, decision) {
+	if !interactionPinMatchesDecision(canonical, decision, now) {
 		return interaction.Session{}, authorizationDenied()
+	}
+	bounded, err := c.boundedBase()
+	if err != nil {
+		return interaction.Session{}, err
+	}
+	snapshot, err := bounded.Snapshot(ctx)
+	if err != nil {
+		return interaction.Session{}, directBaseError(err)
+	}
+	if canonical.SnapshotID != shoal.ID(snapshot.ID) ||
+		!canonical.SnapshotAsOf.UTC().Equal(snapshot.AsOf.UTC()) {
+		return interaction.Session{}, shoal.NewError(
+			shoal.ErrorConflict,
+			"interaction observed snapshot is no longer current",
+		)
 	}
 	canonical.Actor = interaction.ActorContext{
 		SubjectID:  decision.Subject(),
@@ -214,7 +230,18 @@ func (c *Client) recordInteractionForOperation(
 		}
 		return interaction.Session{}, explorer.MarkCommittedInteraction(err)
 	}
-	return persisted, nil
+	if _, ok := writer.(interaction.ResultSink); ok {
+		returned, canonicalErr := persisted.Canonical()
+		if canonicalErr != nil || !reflect.DeepEqual(returned, canonical) {
+			return interaction.Session{}, explorer.MarkCommittedInteraction(
+				shoal.NewError(
+					shoal.ErrorInternal,
+					"durable interaction sink returned a different record",
+				),
+			)
+		}
+	}
+	return canonical, nil
 }
 
 // Interactions lists only derived records whose complete current source set
@@ -1040,13 +1067,16 @@ func interactionSourcesAllow(
 }
 
 func interactionPinMatchesDecision(
-	session interaction.Session, decision auth.Decision,
+	session interaction.Session, decision auth.Decision, now time.Time,
 ) bool {
 	fingerprint, err := auth.AuthorizationFingerprint(decision)
 	if err != nil {
 		return false
 	}
+	// A runtime pin may deliberately be shorter than its enclosing credential,
+	// but it must still be live now and may never outlive that credential.
 	return session.AuthorizationFingerprint == shoal.ID(fingerprint.String()) &&
+		now.Before(session.AuthorizationExpiresAt) &&
 		!decision.AuthenticationExpires().Before(session.AuthorizationExpiresAt)
 }
 
@@ -1072,14 +1102,13 @@ func (c *Client) interactionWriter() (explorer.InteractionWriter, error) {
 }
 
 func (c *Client) interactionReader() (explorer.InteractionReader, error) {
-	reader, ok := c.base.(explorer.InteractionReader)
-	if !ok || isNilDependency(reader) {
+	if isNilDependency(c.interactionSource) {
 		return nil, shoal.NewError(
 			shoal.ErrorUnavailable,
-			"underlying Explorer has no interaction reader",
+			"trusted interaction reader is unavailable",
 		)
 	}
-	return reader, nil
+	return c.interactionSource, nil
 }
 
 var (

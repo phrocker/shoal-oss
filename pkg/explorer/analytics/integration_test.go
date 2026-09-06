@@ -553,7 +553,7 @@ func TestAnalyticsInteractionSinkReauthorizesExactEdgeEvidence(t *testing.T) {
 		ID:                       "analytics-edge-session",
 		RecordedAt:               fixture.now.Add(time.Minute),
 		Operation:                interaction.OperationToolCall,
-		SnapshotID:               "analytics-edge-snapshot",
+		SnapshotID:               shoal.ID(materialized.Snapshot.ID),
 		SnapshotAsOf:             materialized.Snapshot.AsOf,
 		AuthorizationFingerprint: shoal.ID(fingerprint.String()),
 		AuthorizationExpiresAt:   decision.AuthenticationExpires(),

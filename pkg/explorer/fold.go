@@ -162,6 +162,11 @@ func (e *Explorer) FoldInteractions(
 	if err != nil {
 		return FoldResult{}, err
 	}
+	if _, exists := e.folds[subgraph.ID]; !exists {
+		if err := e.reconcilePersistedFoldLocked(subgraph.ID); err != nil {
+			return FoldResult{}, err
+		}
+	}
 	if existing, ok := e.folds[subgraph.ID]; ok {
 		return foldIdempotentResult(*existing, subgraph)
 	}
@@ -200,6 +205,8 @@ func (e *Explorer) FoldInteractions(
 	); err != nil {
 		return FoldResult{}, err
 	}
+	e.reserveInteractionRecordGraphIDsLocked(
+		record.FoldID, record.Nodes, record.Edges)
 	e.folds[record.FoldID] = &record
 	if err := e.rebuildCurrentGraphLocked(); err != nil {
 		return FoldResult{}, MarkCommittedInteraction(err)
@@ -377,6 +384,9 @@ func (e *Explorer) DeleteFold(
 	if err := e.requireWritableLocked(); err != nil {
 		return interaction.Tombstone{}, err
 	}
+	if err := e.reconcilePersistedFoldLocked(foldID); err != nil {
+		return interaction.Tombstone{}, err
+	}
 	existing, ok := e.folds[foldID]
 	if !ok {
 		return interaction.Tombstone{}, shoal.NewError(
@@ -401,10 +411,12 @@ func (e *Explorer) DeleteFold(
 	if err != nil {
 		return interaction.Tombstone{}, err
 	}
-	if err := e.requireInteractionGraphIDsAvailableLocked(
-		[]graph.Node{node}, nil,
-	); err != nil {
-		return interaction.Tombstone{}, err
+	if existingNode, exists := e.graphNodes[node.ID]; exists {
+		return interaction.Tombstone{}, shoal.NewError(
+			shoal.ErrorConflict,
+			"fold tombstone ID collides with existing graph node "+
+				string(existingNode.ID),
+		)
 	}
 	// The members are dropped, not retained beside the tombstone: a deleted
 	// fold must not keep a rehydratable copy of what it folded.
@@ -424,6 +436,8 @@ func (e *Explorer) DeleteFold(
 	); err != nil {
 		return interaction.Tombstone{}, err
 	}
+	e.reserveInteractionRecordGraphIDsLocked(
+		record.FoldID, record.Nodes, record.Edges)
 	e.folds[foldID] = &record
 	if err := e.rebuildCurrentGraphLocked(); err != nil {
 		return interaction.Tombstone{}, MarkCommittedInteraction(err)

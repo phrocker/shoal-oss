@@ -86,6 +86,7 @@ func (r *InteractionRecorder) RecordAnalytics(
 			record.Materialization.PolicyGeneration ||
 		record.Materialization.RequestID == "" ||
 		record.Materialization.AuthorizationExpiresAt.IsZero() ||
+		record.Materialization.Snapshot.ID == "" ||
 		record.Materialization.Snapshot.AsOf.IsZero() {
 		return RecordingReceipt{}, shoal.NewError(
 			shoal.ErrorInternal, "analytics recording pins are inconsistent")
@@ -144,7 +145,7 @@ func (r *InteractionRecorder) RecordAnalytics(
 		ID:           sessionID,
 		RecordedAt:   recordedAt,
 		Operation:    interaction.OperationToolCall,
-		SnapshotID:   shoal.ID(record.Result.Scope.SnapshotID),
+		SnapshotID:   shoal.ID(record.Materialization.Snapshot.ID),
 		SnapshotAsOf: record.Materialization.Snapshot.AsOf,
 		AuthorizationFingerprint: shoal.ID(
 			record.Materialization.AuthorizationFingerprint.String()),
@@ -179,6 +180,8 @@ func (r *InteractionRecorder) RecordAnalytics(
 		return RecordingReceipt{}, err
 	}
 	if persisted.ID != sessionID ||
+		persisted.SnapshotID != session.SnapshotID ||
+		!persisted.SnapshotAsOf.UTC().Equal(session.SnapshotAsOf.UTC()) ||
 		persisted.AuthorizationFingerprint != session.AuthorizationFingerprint ||
 		persisted.AuthorizationExpiresAt != session.AuthorizationExpiresAt ||
 		persisted.RequestID != session.RequestID ||
