@@ -37,11 +37,26 @@ type countingDocumentsAnalyticsBase struct {
 	calls int
 }
 
+type omittingAssertionsAnalyticsBase struct {
+	*explorer.Explorer
+}
+
 func (b *countingDocumentsAnalyticsBase) Documents(
 	ctx context.Context,
 ) ([]explorer.DocumentSummary, error) {
 	b.calls++
 	return b.Explorer.Documents(ctx)
+}
+
+func (b *omittingAssertionsAnalyticsBase) BoundedNeighborhood(
+	ctx context.Context,
+	request explorer.BoundedNeighborhoodRequest,
+) (explorer.BoundedNeighborhood, error) {
+	result, err := b.Explorer.BoundedNeighborhood(ctx, request)
+	if err == nil {
+		result.Neighborhood.Assertions = nil
+	}
+	return result, err
 }
 
 func TestAnalyticsRecorderReauthorizesExtractedRelationshipEvidence(t *testing.T) {
@@ -77,6 +92,34 @@ func TestAnalyticsRecorderReauthorizesExtractedRelationshipEvidence(t *testing.T
 	}
 	if relationship.ID == "" {
 		t.Fatal("extraction relationship edge was not materialized")
+	}
+	omitting := &omittingAssertionsAnalyticsBase{Explorer: f.base}
+	omittingClient := f.newClient(
+		t, omitting, f.store, f.sourceA, f.policyA, nil)
+	omittingService, err := analytics.NewService(analytics.Config{
+		Source: omittingClient, Limits: analytics.DefaultLimits(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	omittingContext := f.context(t, f.decision(
+		t,
+		"analytics-reader",
+		[][]byte{f.sourceA},
+		[][]byte{f.policyA},
+		[]auth.Operation{auth.OperationAnalyticsRead},
+	))
+	_, err = omittingService.Run(omittingContext, analytics.Request{
+		Scope: analytics.Scope{
+			NodeIDs: []shoal.ID{relationship.From},
+			Depth:   1, Direction: explorer.GraphDirectionBoth,
+			Fanout: 10, MaxNodes: 50, MaxEdges: 50,
+			MaxScannedEdgesPerNode: 1024,
+			EdgeTypes:              []string{relationship.Type},
+		},
+	})
+	if !shoal.IsErrorCode(err, shoal.ErrorInternal) {
+		t.Fatalf("omitted relationship assertion error = %v", err)
 	}
 	counted := &countingDocumentsAnalyticsBase{Explorer: f.base}
 	client := f.newClient(
