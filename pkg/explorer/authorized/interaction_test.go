@@ -956,9 +956,9 @@ func TestAuthorizedInteractionRecorderRejectsWrongPin(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	session.ID = "session-wrong-expiry"
+	session.ID = "session-shorter-expiry"
 	session.AuthorizationFingerprint = shoal.ID(fingerprint.String())
-	session.AuthorizationExpiresAt = decision.AuthenticationExpires().Add(-time.Minute)
+	session.AuthorizationExpiresAt = f.clock.Now().Add(time.Minute)
 	if err := f.clientA.RecordInteraction(ctx, session); err != nil {
 		t.Fatalf("shorter live authorization expiry record = %v", err)
 	}

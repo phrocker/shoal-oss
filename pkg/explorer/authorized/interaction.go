@@ -84,6 +84,9 @@ func (c *Client) recordInteraction(
 		return interaction.Session{}, authorizationDenied()
 	}
 	session.RecordedAt = now.UTC()
+	if !now.Before(session.AuthorizationExpiresAt) {
+		return interaction.Session{}, authorizationDenied()
+	}
 	canonical, err := session.Canonical()
 	if err != nil {
 		return interaction.Session{}, err

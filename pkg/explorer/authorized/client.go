@@ -91,6 +91,7 @@ type Config struct {
 type Client struct {
 	base                explorer.Client
 	vectorScorer        VectorScorer
+	vectorSpaceResolver VectorEmbeddingSpaceResolver
 	interactionSink     explorer.InteractionWriter
 	interactionSource   explorer.InteractionReader
 	ontologyInterpreter explorer.OntologyInterpreter
@@ -136,6 +137,16 @@ func NewClient(config Config) (*Client, error) {
 	if config.Clock == nil {
 		return nil, dependencyRequired("clock")
 	}
+	var vectorSpaceResolver VectorEmbeddingSpaceResolver
+	if !isNilDependency(config.VectorScorer) {
+		var ok bool
+		vectorSpaceResolver, ok =
+			config.VectorScorer.(VectorEmbeddingSpaceResolver)
+		if !ok || isNilDependency(vectorSpaceResolver) {
+			return nil, dependencyRequired(
+				"trusted vector embedding provenance")
+		}
+	}
 	hasInteractionWriter := !isNilDependency(config.InteractionWriter)
 	hasInteractionReader := !isNilDependency(config.InteractionReader)
 	hasSnapshotValidator := !isNilDependency(config.SnapshotValidator)
@@ -170,6 +181,7 @@ func NewClient(config Config) (*Client, error) {
 	return &Client{
 		base:                config.Base,
 		vectorScorer:        config.VectorScorer,
+		vectorSpaceResolver: vectorSpaceResolver,
 		interactionSink:     config.InteractionWriter,
 		interactionSource:   config.InteractionReader,
 		ontologyInterpreter: config.OntologyInterpreter,
