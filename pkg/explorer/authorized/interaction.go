@@ -246,6 +246,15 @@ func (c *Client) recordInteraction(
 	return persisted, nil
 }
 
+func postCommitInteractionError(
+	operation auth.Operation, err error,
+) error {
+	if operation == auth.OperationAnalyticsRead {
+		return explorer.MarkIndeterminateCommit(err)
+	}
+	return explorer.MarkCommittedInteraction(err)
+}
+
 // Interactions lists only derived records whose complete current source set
 // the caller may read. Tombstones have intentionally discarded their source
 // edges, so they are visible only to the exact authorization projection that

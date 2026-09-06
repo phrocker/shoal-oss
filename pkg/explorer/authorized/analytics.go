@@ -83,6 +83,14 @@ func (c *Client) MaterializeAnalytics(
 	if err != nil {
 		return exploreranalytics.Materialization{}, err
 	}
+	before, err := bounded.Snapshot(ctx)
+	if err != nil {
+		return exploreranalytics.Materialization{}, directBaseError(err)
+	}
+	ctx, err = c.withCanonicalDocumentIndex(ctx)
+	if err != nil {
+		return exploreranalytics.Materialization{}, err
+	}
 	for _, nodeID := range normalized.NodeIDs {
 		if possibleProvenanceNodeID(nodeID) {
 			continue
@@ -92,10 +100,6 @@ func (c *Client) MaterializeAnalytics(
 		); err != nil {
 			return exploreranalytics.Materialization{}, err
 		}
-	}
-	before, err := bounded.Snapshot(ctx)
-	if err != nil {
-		return exploreranalytics.Materialization{}, directBaseError(err)
 	}
 	neighborhood, err := c.materializeAnalyticsNeighborhood(
 		ctx, bounded, request, maxEdges, maxEvidenceBytes, decision, guard, now)
@@ -143,6 +147,10 @@ func (c *Client) materializeAnalyticsNeighborhood(
 	guard auth.GenerationGuard,
 	now time.Time,
 ) (explorer.Neighborhood, error) {
+	ctx, err := c.withCanonicalDocumentIndex(ctx)
+	if err != nil {
+		return explorer.Neighborhood{}, err
+	}
 	nodes := make(map[shoal.ID]graph.Node, len(request.NodeIDs))
 	edges := make(map[shoal.ID]graph.Edge)
 	assertions := make(map[shoal.ID]ontology.Assertion)

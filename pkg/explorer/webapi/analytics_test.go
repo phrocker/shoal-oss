@@ -343,6 +343,17 @@ func TestRemoteMetadataRequiresValidRecordedAnalyticsLimits(t *testing.T) {
 			MaxNodes: webapi.MaxNodes, AnalyticsLimits: &valid,
 			Capabilities: webapi.Capabilities{Analytics: true},
 		},
+		{
+			MaxPageSize: webapi.MaxPageSize, MaxTopK: webapi.MaxTopK,
+			MaxDepth: webapi.MaxDepth, MaxFanout: webapi.MaxFanout,
+			MaxNodes: webapi.MaxNodes, AnalyticsLimits: &valid,
+		},
+		{
+			MaxPageSize: webapi.MaxPageSize, MaxTopK: webapi.MaxTopK,
+			MaxDepth: webapi.MaxDepth, MaxFanout: webapi.MaxFanout,
+			MaxNodes:                   webapi.MaxNodes,
+			AnalyticsRecordingRequired: true,
+		},
 	}
 	for index, metadata := range tests {
 		t.Run(string(rune('a'+index)), func(t *testing.T) {

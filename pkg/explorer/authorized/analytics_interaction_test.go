@@ -32,6 +32,18 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
+type countingDocumentsAnalyticsBase struct {
+	*explorer.Explorer
+	calls int
+}
+
+func (b *countingDocumentsAnalyticsBase) Documents(
+	ctx context.Context,
+) ([]explorer.DocumentSummary, error) {
+	b.calls++
+	return b.Explorer.Documents(ctx)
+}
+
 func TestAnalyticsRecorderReauthorizesExtractedRelationshipEvidence(t *testing.T) {
 	f := newFixture(t)
 	version := authorizedSkillsOntologyVersion(t)
@@ -66,6 +78,9 @@ func TestAnalyticsRecorderReauthorizesExtractedRelationshipEvidence(t *testing.T
 	if relationship.ID == "" {
 		t.Fatal("extraction relationship edge was not materialized")
 	}
+	counted := &countingDocumentsAnalyticsBase{Explorer: f.base}
+	client := f.newClient(
+		t, counted, f.store, f.sourceA, f.policyA, nil)
 	snapshot, err := f.base.Snapshot(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -79,7 +94,7 @@ func TestAnalyticsRecorderReauthorizesExtractedRelationshipEvidence(t *testing.T
 		[]auth.Operation{auth.OperationAnalyticsRead},
 	)
 	ctx := f.context(t, decision)
-	sink := f.clientA.AnalyticsInteractionSink()
+	sink := client.AnalyticsInteractionSink()
 	if sink == nil {
 		t.Fatal("analytics interaction sink is unavailable")
 	}
@@ -92,7 +107,7 @@ func TestAnalyticsRecorderReauthorizesExtractedRelationshipEvidence(t *testing.T
 		t.Fatal(err)
 	}
 	service, err := analytics.NewService(analytics.Config{
-		Source: f.clientA, Limits: analytics.DefaultLimits(),
+		Source: client, Limits: analytics.DefaultLimits(),
 		Recorder: recorder, RequireRecording: true,
 	})
 	if err != nil {
@@ -126,6 +141,63 @@ func TestAnalyticsRecorderReauthorizesExtractedRelationshipEvidence(t *testing.T
 	assertionCount := len(recorded.Turns[0].ToolCall.RetrievedAssertions)
 	if assertionCount == 0 {
 		t.Fatal("recorded analytics evidence omitted extracted assertions")
+	}
+	if counted.calls != 2 {
+		t.Fatalf("analytics documents scans = %d, want 2", counted.calls)
+	}
+}
+
+func TestAnalyticsForgedSinkResultIsIndeterminate(t *testing.T) {
+	f := newFixture(t)
+	document := ingestAuthorizedSkill(
+		t, f.clientA, f.admin(t), "analytics-indeterminate", "bounded")
+	view, err := f.clientA.Document(
+		f.alice(t), document.Document.ID, document.Revision.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := f.base.Snapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.clock.Set(snapshot.AsOf.Add(time.Second))
+	wrapped := &forgedResultInteractionBase{Explorer: f.base}
+	client := f.newClient(
+		t, wrapped, f.store, f.sourceA, f.policyA, nil)
+	decision := f.decision(
+		t,
+		"analytics-indeterminate",
+		[][]byte{f.sourceA},
+		[][]byte{f.policyA},
+		[]auth.Operation{auth.OperationAnalyticsRead},
+	)
+	ctx := f.context(t, decision)
+	shared, err := interaction.NewRecorder(
+		context.Background(), client.AnalyticsInteractionSink())
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder, err := analytics.NewInteractionRecorder(shared, f.clock.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service, err := analytics.NewService(analytics.Config{
+		Source: client, Limits: analytics.DefaultLimits(),
+		Recorder: recorder, RequireRecording: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = service.Run(ctx, analytics.Request{
+		Scope: analytics.Scope{
+			NodeIDs: []shoal.ID{firstSpanID(t, view)},
+			Depth:   1, Direction: explorer.GraphDirectionBoth,
+			Fanout: 4, MaxNodes: 8, MaxEdges: 8,
+			MaxScannedEdgesPerNode: 16,
+		},
+	})
+	if !explorer.IsIndeterminateCommit(err) {
+		t.Fatalf("forged analytics result error = %v", err)
 	}
 }
 
