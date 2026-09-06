@@ -388,6 +388,13 @@ func (c *Client) boundedAuthorizedNeighborhoodPage(
 		if raw.Truncated && !raw.Continuation {
 			incompleteWithoutCursor = true
 		}
+		cursorAdvanced := raw.NextAfterEdgeID != "" &&
+			raw.NextAfterEdgeID != scan.AfterEdgeID
+		if (!raw.Continuation && cursorAdvanced) ||
+			(raw.ScannedEdgesKnown && raw.ScannedEdges == 0 &&
+				(raw.Continuation || cursorAdvanced)) {
+			return explorer.BoundedNeighborhood{}, inconsistentBase()
+		}
 		consumed := raw.ScannedEdges
 		if !raw.ScannedEdgesKnown {
 			// Older or remote bounded implementations cannot prove how many

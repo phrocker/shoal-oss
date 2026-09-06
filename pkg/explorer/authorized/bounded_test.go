@@ -306,7 +306,8 @@ func TestBoundedNeighborhoodPreservesKnownZeroScanCount(t *testing.T) {
 		explorer.BoundedNeighborhoodRequest{
 			NodeIDs: []shoal.ID{"node-seed"}, Depth: 1,
 			Fanout: 1, MaxNodes: 2, MaxScannedEdges: 1,
-			Direction: explorer.GraphDirectionOutgoing,
+			Direction:   explorer.GraphDirectionOutgoing,
+			AfterEdgeID: "edge-prior",
 		},
 	)
 	if err != nil {
@@ -314,6 +315,45 @@ func TestBoundedNeighborhoodPreservesKnownZeroScanCount(t *testing.T) {
 	}
 	if !result.ScannedEdgesKnown || result.ScannedEdges != 0 {
 		t.Fatalf("known zero scan count = %#v", result)
+	}
+}
+
+func TestBoundedNeighborhoodRejectsKnownZeroAdvancingContinuation(t *testing.T) {
+	client, base := authorizedPaginationClient(t, false)
+	base.knownZeroContinuation = true
+	_, err := client.BoundedNeighborhood(
+		context.Background(),
+		explorer.BoundedNeighborhoodRequest{
+			NodeIDs: []shoal.ID{"node-seed"}, Depth: 1,
+			Fanout: 1, MaxNodes: 2, MaxScannedEdges: 1,
+			Direction: explorer.GraphDirectionOutgoing,
+		},
+	)
+	if !shoal.IsErrorCode(err, shoal.ErrorInternal) {
+		t.Fatalf("known-zero advancing continuation error = %v", err)
+	}
+	if base.calls != 1 {
+		t.Fatalf("malformed provider calls = %d, want 1", base.calls)
+	}
+}
+
+func TestBoundedNeighborhoodRejectsAdvanceWithoutContinuation(t *testing.T) {
+	client, base := authorizedPaginationClient(t, false)
+	base.advanceWithoutContinuation = true
+	_, err := client.BoundedNeighborhood(
+		context.Background(),
+		explorer.BoundedNeighborhoodRequest{
+			NodeIDs: []shoal.ID{"node-seed"}, Depth: 1,
+			Fanout: 1, MaxNodes: 2, MaxScannedEdges: 1,
+			Direction:   explorer.GraphDirectionOutgoing,
+			AfterEdgeID: "edge-prior",
+		},
+	)
+	if !shoal.IsErrorCode(err, shoal.ErrorInternal) {
+		t.Fatalf("cursor advance without continuation error = %v", err)
+	}
+	if base.calls != 1 {
+		t.Fatalf("malformed provider calls = %d, want 1", base.calls)
 	}
 }
 
@@ -490,6 +530,8 @@ type pagedBoundedBase struct {
 	hiddenOnly                   bool
 	omittedOnly                  bool
 	knownZero                    bool
+	knownZeroContinuation        bool
+	advanceWithoutContinuation   bool
 	truncatedWithoutContinuation bool
 }
 
@@ -526,11 +568,30 @@ func (b *pagedBoundedBase) BoundedNeighborhood(
 	request explorer.BoundedNeighborhoodRequest,
 ) (explorer.BoundedNeighborhood, error) {
 	b.calls++
+	if b.knownZeroContinuation {
+		return explorer.BoundedNeighborhood{
+			Neighborhood: explorer.Neighborhood{
+				Nodes: []graph.Node{b.nodes["node-seed"]},
+			},
+			Truncated: true, NextAfterEdgeID: "edge-progress",
+			Continuation: true, ScannedEdgesKnown: true,
+		}, nil
+	}
+	if b.advanceWithoutContinuation {
+		return explorer.BoundedNeighborhood{
+			Neighborhood: explorer.Neighborhood{
+				Nodes: []graph.Node{b.nodes["node-seed"]},
+			},
+			NextAfterEdgeID: "edge-progress",
+			ScannedEdges:    1, ScannedEdgesKnown: true,
+		}, nil
+	}
 	if b.knownZero {
 		return explorer.BoundedNeighborhood{
 			Neighborhood: explorer.Neighborhood{
 				Nodes: []graph.Node{b.nodes["node-seed"]},
 			},
+			NextAfterEdgeID:   request.AfterEdgeID,
 			ScannedEdgesKnown: true,
 		}, nil
 	}
