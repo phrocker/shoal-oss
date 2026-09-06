@@ -239,8 +239,8 @@ func metadataFor(ctx context.Context, service Service) (MetadataResponse, error)
 		if _, ok := service.(ChangeProvider); !ok {
 			metadata.Capabilities.Changes = false
 		}
-		if _, limits, ok := analyticsProvider(service); ok {
-			metadata.Capabilities.Analytics = true
+		if _, limits, ok := analyticsProvider(service); ok &&
+			metadata.Capabilities.Analytics {
 			metadata.AnalyticsLimits = &limits
 			metadata.AnalyticsRecordingRequired = true
 		} else {
@@ -261,7 +261,8 @@ func metadataFor(ctx context.Context, service Service) (MetadataResponse, error)
 		MaxUploadFileBytes: MaxUploadFileBytes, MaxUploadTotalBytes: MaxUploadTotalBytes,
 		Capabilities: capabilities,
 	}
-	if _, limits, ok := analyticsProvider(service); ok {
+	if _, limits, ok := analyticsProvider(service); ok &&
+		capabilities.Analytics {
 		metadata.AnalyticsLimits = &limits
 		metadata.AnalyticsRecordingRequired = true
 	}
@@ -297,7 +298,9 @@ func capabilitiesFor(ctx context.Context, service Service) (Capabilities, error)
 	if _, ok := service.(ChangeProvider); !ok {
 		capabilities.Changes = false
 	}
-	_, _, capabilities.Analytics = analyticsProvider(service)
+	if capabilities.Analytics {
+		_, _, capabilities.Analytics = analyticsProvider(service)
+	}
 	return capabilities, nil
 }
 

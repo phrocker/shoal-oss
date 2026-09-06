@@ -801,7 +801,7 @@ func (e *Explorer) BoundedNeighborhood(
 	return BoundedNeighborhood{
 		Neighborhood: result, Truncated: truncated,
 		NextAfterEdgeID: nextAfter, Continuation: continuation,
-		ScannedEdges: scannedEdges,
+		ScannedEdges: scannedEdges, ScannedEdgesKnown: true,
 	}, nil
 }
 

@@ -257,6 +257,8 @@ type NeighborhoodResponse struct {
 	OntologyInterpretations []OntologyInterpretationReport `json:"ontology_interpretations,omitempty"`
 	Truncated               bool                           `json:"truncated"`
 	NextCursor              string                         `json:"next_cursor,omitempty"`
+	// ScannedEdges is present only when the backend supplied an exact count.
+	ScannedEdges *uint32 `json:"scanned_edges,omitempty"`
 }
 
 type OntologyInterpretationReport struct {
