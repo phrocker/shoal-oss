@@ -292,6 +292,7 @@ func (e *Explorer) TransitionOntologyProposal(
 			otherBase, otherHasBase := other.BaseVersionID()
 			currentBase, currentHasBase := current.BaseVersionID()
 			if other.State() == ontology.ProposalPublished &&
+				other.Schema().ID() == current.Schema().ID() &&
 				otherHasBase == currentHasBase &&
 				otherBase == currentBase {
 				return ontology.GovernedProposal{}, shoal.NewError(

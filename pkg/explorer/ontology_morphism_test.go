@@ -326,6 +326,7 @@ func TestPublishedSemanticChangeWithoutMorphismRemainsUnresolved(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+
 	evidence, _ := ontology.NewEvidenceRef(document.Citation{
 		DocumentID: "doc", RevisionID: "rev", SectionID: "section", SpanID: "span",
 		Range: document.SourceRange{
@@ -352,4 +353,157 @@ func TestPublishedSemanticChangeWithoutMorphismRemainsUnresolved(t *testing.T) {
 		read[0].Reason() != "no unique published morphism path" {
 		t.Fatalf("unsafe implicit transition read = %#v, err = %v", read, err)
 	}
+}
+
+func TestGenesisPublicationsForDifferentSchemasDoNotConflict(t *testing.T) {
+	corpus, err := Open(filepath.Join(t.TempDir(), "corpus"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer corpus.Close()
+	at := time.Date(2026, 9, 6, 3, 0, 0, 0, time.UTC)
+	for index, key := range []string{"schema-a", "schema-b"} {
+		schema, _ := ontology.NewOntologySchema(key, key, "", nil)
+		version, _ := ontology.NewOntologyVersion(
+			schema, "1", at.Add(time.Duration(index)*time.Second),
+			nil, nil, nil, nil)
+		proposal, err := ontology.NewGovernedProposal(
+			schema, ontology.OntologyVersion{}, version,
+			"author", "genesis", at.Add(time.Duration(index+2)*time.Second), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := corpus.CreateOntologyProposal(
+			context.Background(), proposal, ontology.OntologyVersion{}); err != nil {
+			t.Fatal(err)
+		}
+		for step, state := range []ontology.ProposalState{
+			ontology.ProposalSubmitted,
+			ontology.ProposalApproved,
+			ontology.ProposalPublished,
+		} {
+			proposal, err = corpus.TransitionOntologyProposal(
+				context.Background(), proposal.ID(), state,
+				"governor", "approved",
+				at.Add(time.Duration(index*10+step+4)*time.Second))
+			if err != nil {
+				t.Fatalf("publish %s genesis: %v", key, err)
+			}
+		}
+	}
+}
+
+func TestUnrelatedSchemaForkDoesNotPoisonSelectedOntology(t *testing.T) {
+	corpus, err := Open(filepath.Join(t.TempDir(), "corpus"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer corpus.Close()
+	at := time.Date(2026, 9, 6, 4, 0, 0, 0, time.UTC)
+
+	schemaA, _ := ontology.NewOntologySchema("selected", "Selected", "", nil)
+	property, _ := ontology.NewPropertyDefinition(
+		"name", "Name", "", ontology.ValueString, nil, nil)
+	concept, _ := ontology.NewConceptDefinition(
+		"person", "Person", "", []shoal.ID{property.ID()}, nil)
+	versionA, _ := ontology.NewOntologyVersion(
+		schemaA, "1", at, []ontology.ConceptDefinition{concept},
+		nil, []ontology.PropertyDefinition{property}, nil)
+	proposalA := mustPublishedProposal(
+		t, schemaA, ontology.OntologyVersion{}, versionA, at.Add(time.Second))
+
+	schemaB, _ := ontology.NewOntologySchema("forked", "Forked", "", nil)
+	baseB, _ := ontology.NewOntologyVersion(
+		schemaB, "1", at.Add(10*time.Second), nil, nil, nil, nil)
+	leftB, _ := ontology.NewOntologyVersion(
+		schemaB, "2-left", at.Add(11*time.Second), nil, nil, nil, nil)
+	rightB, _ := ontology.NewOntologyVersion(
+		schemaB, "2-right", at.Add(12*time.Second), nil, nil, nil, nil)
+	left := mustPublishedProposal(t, schemaB, baseB, leftB, at.Add(13*time.Second))
+	right := mustPublishedProposal(t, schemaB, baseB, rightB, at.Add(17*time.Second))
+
+	records := []struct {
+		proposal ontology.GovernedProposal
+		base     ontology.OntologyVersion
+	}{
+		{proposalA, ontology.OntologyVersion{}},
+		{left, baseB},
+		{right, baseB},
+	}
+	corpus.mu.Lock()
+	for _, item := range records {
+		record := mustPersistedPublishedProposal(t, item.proposal, item.base)
+		copy := record
+		corpus.ontologyProposals[item.proposal.ID()] = &copy
+	}
+	corpus.mu.Unlock()
+
+	evidence, _ := ontology.NewEvidenceRef(document.Citation{
+		DocumentID: "doc", RevisionID: "rev", SectionID: "section", SpanID: "span",
+		Range: document.SourceRange{
+			Start: document.SourcePosition{Offset: 0, Page: 1},
+			End:   document.SourcePosition{Offset: 4, Page: 1},
+		},
+	}, "name", nil)
+	provenance, _ := ontology.NewExtractionProvenance(
+		"provider", "model", "1", "prompt", "1", "extractor", "1", nil)
+	value, _ := ontology.NewStringValue("Ada")
+	identity, _ := ontology.NewOntologyIdentity(versionA)
+	assertion, err := ontology.NewAssertion(
+		"person-1", property.ID(), value, ontology.AssertionExplicit, 1,
+		[]ontology.EvidenceRef{evidence}, provenance, nil,
+		ontology.WithAssertionSubjectType(concept.ID()),
+		ontology.WithAssertionOntology(identity))
+	if err != nil {
+		t.Fatal(err)
+	}
+	read, err := corpus.InterpretAssertions(
+		context.Background(), []ontology.Assertion{assertion}, identity)
+	if err != nil || len(read) != 1 || !read[0].Resolved() {
+		t.Fatalf("unrelated fork poisoned selected schema: %#v, err=%v", read, err)
+	}
+}
+
+func mustPublishedProposal(
+	t *testing.T,
+	schema ontology.OntologySchema,
+	base, target ontology.OntologyVersion,
+	at time.Time,
+) ontology.GovernedProposal {
+	t.Helper()
+	proposal, err := ontology.NewGovernedProposal(
+		schema, base, target, "author", "publish", at, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for index, state := range []ontology.ProposalState{
+		ontology.ProposalSubmitted,
+		ontology.ProposalApproved,
+		ontology.ProposalPublished,
+	} {
+		proposal, err = proposal.Transition(
+			state, "governor", "approved",
+			at.Add(time.Duration(index+1)*time.Second))
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	return proposal
+}
+
+func mustPersistedPublishedProposal(
+	t *testing.T,
+	proposal ontology.GovernedProposal,
+	base ontology.OntologyVersion,
+) persistedOntologyProposal {
+	t.Helper()
+	record, err := persistOntologyProposal(proposal, base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for index, transition := range proposal.Transitions() {
+		record.transitions = append(record.transitions, persistProposalTransition(
+			proposal.ID(), uint32(index+1), transition))
+	}
+	return record
 }

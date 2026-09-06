@@ -62,6 +62,9 @@ func (e *Explorer) InterpretAssertions(
 		if proposal.State() != ontology.ProposalPublished {
 			continue
 		}
+		if proposal.Schema().ID() != selected.SchemaID() {
+			continue
+		}
 		baseID, hasBase := proposal.BaseVersionID()
 		if hasBase {
 			key := string(baseID)
