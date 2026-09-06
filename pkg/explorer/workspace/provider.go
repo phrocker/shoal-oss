@@ -627,12 +627,7 @@ func (p *Provider) normalizeUpdate(
 			GrantPolicyID:       append([]byte(nil), spec.GrantPolicyID...),
 			Epoch:               spec.Epoch,
 		}
-		var policy auth.Policy
-		if decision.TrustedService() {
-			policy, err = auth.NewServicePolicy(config, decision)
-		} else {
-			policy, err = auth.NewPolicy(config)
-		}
+		policy, err := auth.NewPolicy(config)
 		if err != nil {
 			return Narrowing{}, err
 		}
@@ -648,9 +643,13 @@ func (p *Provider) normalizeUpdate(
 			return Narrowing{}, err
 		}
 		if ceiling != nil {
+			servicePolicy, err := auth.NewServicePolicy(config, decision)
+			if err != nil {
+				return Narrowing{}, authDenied()
+			}
 			if _, err := auth.DeriveScannerAuthorizations(
 				decision, auth.OperationWorkspaceSettingsWrite,
-				policy, *ceiling, now,
+				servicePolicy, *ceiling, now,
 			); err != nil {
 				return Narrowing{}, authDenied()
 			}
@@ -794,15 +793,22 @@ func DeriveEffectiveDecision(
 		selected = narrowing.SelectedOntology.Identity
 		selectedSet = true
 	}
-	for _, policy := range narrowing.OutputPolicies {
+	settingsOutputPolicies := make(
+		[]auth.Policy, 0, len(narrowing.OutputPolicies))
+	for _, stored := range narrowing.OutputPolicies {
+		policy, err := neutralOutputPolicy(stored)
+		if err != nil {
+			return EffectiveDecision{}, err
+		}
 		if err := authorizeOutputPolicy(
 			base, policy, options.ServiceCeiling, options.Now); err != nil {
 			return EffectiveDecision{}, authDenied()
 		}
+		settingsOutputPolicies = append(settingsOutputPolicies, policy)
 	}
 	outputPolicies := append(
 		append([]auth.Policy(nil), options.BaseOutputPolicies...),
-		narrowing.OutputPolicies...,
+		settingsOutputPolicies...,
 	)
 	outputPolicies, err = normalizePolicies(outputPolicies)
 	if err != nil {
@@ -899,14 +905,33 @@ func authorizeOutputPolicy(
 		if ceiling == nil {
 			return authDenied()
 		}
-		_, err := auth.DeriveScannerAuthorizations(
-			decision, auth.OperationWorkspaceSettingsRead, policy, *ceiling, now)
+		servicePolicy, err := auth.NewServicePolicy(auth.PolicyConfig{
+			AuthorizationDomain: policy.AuthorizationDomain(),
+			SourceID:            policy.SourceID(),
+			GrantPolicyID:       policy.GrantPolicyID(),
+			Epoch:               policy.Epoch(),
+		}, decision)
+		if err != nil {
+			return authDenied()
+		}
+		_, err = auth.DeriveScannerAuthorizations(
+			decision, auth.OperationWorkspaceSettingsRead,
+			servicePolicy, *ceiling, now)
 		return err
 	}
 	if policy.ServiceRole() != "" {
 		return authDenied()
 	}
 	return nil
+}
+
+func neutralOutputPolicy(policy auth.Policy) (auth.Policy, error) {
+	return auth.NewPolicy(auth.PolicyConfig{
+		AuthorizationDomain: policy.AuthorizationDomain(),
+		SourceID:            policy.SourceID(),
+		GrantPolicyID:       policy.GrantPolicyID(),
+		Epoch:               policy.Epoch(),
+	})
 }
 
 func validateDecisionSelections(
