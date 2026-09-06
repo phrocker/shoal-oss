@@ -42,6 +42,34 @@ type ResultSink interface {
 	RecordInteractionResult(context.Context, Session) (Session, error)
 }
 
+// ValidateRecordedSession checks a successful trusted sink receipt. The sink
+// may supply trusted admission time, actor and reason metadata, and a default
+// authorization operation, but cannot replace the recorded work or its pins.
+// Callers must mark a validation failure as committed, since writing succeeded.
+func ValidateRecordedSession(requested, persisted Session) error {
+	expected, err := requested.Canonical()
+	if err != nil {
+		return err
+	}
+	actual, err := persisted.Canonical()
+	if err != nil {
+		return err
+	}
+	expected.RecordedAt = actual.RecordedAt
+	expected.Actor = actual.Actor
+	expected.Reason = actual.Reason
+	if expected.AuthorizationOperation == "" {
+		expected.AuthorizationOperation = actual.AuthorizationOperation
+	}
+	if !reflect.DeepEqual(actual, expected) {
+		return shoal.NewError(
+			shoal.ErrorInternal,
+			"durable interaction sink returned a mismatched session",
+		)
+	}
+	return nil
+}
+
 // Recorder is the product-level fail-closed recorder for retrieval, chat, MCP,
 // and other non-harness adapters. It canonicalizes a typed Session, supplies a
 // UTC timestamp when one is absent, and returns only after the sink accepts the
@@ -119,6 +147,9 @@ func (r *Recorder) Record(
 				err,
 			),
 		)
+	}
+	if err := ValidateRecordedSession(canonical, persisted); err != nil {
+		return Session{}, MarkCommittedRecord(err)
 	}
 	deliveredAt := r.now().UTC()
 	if deliveredAt.IsZero() {

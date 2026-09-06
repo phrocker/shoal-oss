@@ -48,6 +48,7 @@ type stubSink struct {
 	ensured    int
 	recorded   int
 	lastRecord interaction.Session
+	mutate     func(*interaction.Session)
 }
 
 func (s *stubSink) EnsureInteractionSink(context.Context) error {
@@ -71,7 +72,39 @@ func (s *stubSink) RecordInteractionResult(
 	if s.recordErr != nil {
 		return interaction.Session{}, s.recordErr
 	}
+	if s.mutate != nil {
+		s.mutate(&session)
+	}
 	return session, nil
+}
+
+func TestGraphRecorderRejectsMismatchedPersistedResult(t *testing.T) {
+	sink := &stubSink{mutate: func(session *interaction.Session) {
+		session.ResultID = "different-result"
+	}}
+	recorder, err := NewGraphRecorder(context.Background(), sink)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := recorder.SetClock(func() time.Time { return fixedTime }); err != nil {
+		t.Fatal(err)
+	}
+	model, prompt := provenanceParts(t)
+	provenance, err := NewProvenance(
+		"fake-harness", model, prompt, "grounded-tools-v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	record := EvaluationRecord{
+		Provenance: provenance, TranscriptID: "mismatched-result",
+		SnapshotID: "snapshot", SnapshotAsOf: fixedTime.Add(-time.Minute),
+		AuthorizationFingerprint: "auth-sha256:mismatched-result",
+		AuthorizationExpiresAt:   fixedTime.Add(time.Hour),
+	}
+	if err := recorder.Record(context.Background(), record); !errors.Is(err, ErrInvalid) ||
+		!interaction.IsCommittedRecord(err) {
+		t.Fatalf("mismatched persisted result error = %v", err)
+	}
 }
 
 // TestGeneratorRequiresRecorder pins binding decision 4 structurally: there is

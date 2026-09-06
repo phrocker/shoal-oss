@@ -102,6 +102,7 @@ func TestProductRecorderIsFailClosedAndCanonical(t *testing.T) {
 	sink.result.ID = enrichedID
 	sink.result.RecordedAt = fixed
 	sink.result.Operation = interaction.OperationToolCall
+	sink.result.SeedNodeIDs = nil
 	sink.result.Actor = interaction.ActorContext{
 		SubjectID: "trusted-subject",
 		ActorID:   "trusted-actor",
@@ -144,6 +145,38 @@ func TestProductRecorderIsFailClosedAndCanonical(t *testing.T) {
 		ctx, typedNil,
 	); !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
 		t.Fatalf("typed-nil sink error = %v", err)
+	}
+}
+
+func TestProductRecorderRejectsChangedWorkAsCommitted(t *testing.T) {
+	now := time.Date(2026, time.September, 6, 10, 0, 0, 0, time.UTC)
+	for name, mutate := range map[string]func(*interaction.Session){
+		"result":    func(s *interaction.Session) { s.ResultID = "different-result" },
+		"operation": func(s *interaction.Session) { s.AuthorizationOperation = "dispatch" },
+		"evidence":  func(s *interaction.Session) { s.SeedNodeIDs = []shoal.ID{"different-node"} },
+		"expiry":    func(s *interaction.Session) { s.AuthorizationExpiresAt = now.Add(2 * time.Hour) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			request := interaction.Session{
+				ID: interaction.DerivedID("session", name), RecordedAt: now,
+				Operation: interaction.OperationToolCall, AuthorizationOperation: "invoke",
+				SnapshotID: "snapshot", SnapshotAsOf: now.Add(-time.Minute),
+				AuthorizationFingerprint: "auth-sha256:test",
+				AuthorizationExpiresAt:   now.Add(time.Hour),
+			}
+			sink := &recorderSink{result: request}
+			mutate(&sink.result)
+			recorder, err := interaction.NewRecorder(context.Background(), sink)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := recorder.SetClock(func() time.Time { return now }); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := recorder.Record(context.Background(), request); !interaction.IsCommittedRecord(err) {
+				t.Fatalf("changed %s must fail as committed: %v", name, err)
+			}
+		})
 	}
 }
 
