@@ -94,6 +94,14 @@ func TestProducerDerivationEdgeRequiresCanonicalReconstruction(t *testing.T) {
 		t.Fatal("forged producer node was accepted")
 	}
 	raw[producer.ID] = producer
+	forgedAssertion := assertionNode
+	forgedAssertion.Properties = cloneMetadata(forgedAssertion.Properties)
+	forgedAssertion.Properties["forged"] = "true"
+	raw[assertionNode.ID] = forgedAssertion
+	if producerDerivationEdgeMatches(edge, raw, assertion) {
+		t.Fatal("forged derived assertion node was accepted")
+	}
+	raw[assertionNode.ID] = assertionNode
 	forgedEdge := edge
 	forgedEdge.Properties = cloneMetadata(forgedEdge.Properties)
 	forgedEdge.Properties["forged"] = "true"
