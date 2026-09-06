@@ -242,9 +242,11 @@ func metadataFor(ctx context.Context, service Service) (MetadataResponse, error)
 		if _, limits, ok := analyticsProvider(service); ok {
 			metadata.Capabilities.Analytics = true
 			metadata.AnalyticsLimits = &limits
+			metadata.AnalyticsRecordingRequired = true
 		} else {
 			metadata.Capabilities.Analytics = false
 			metadata.AnalyticsLimits = nil
+			metadata.AnalyticsRecordingRequired = false
 		}
 		return metadata, nil
 	}
@@ -261,6 +263,7 @@ func metadataFor(ctx context.Context, service Service) (MetadataResponse, error)
 	}
 	if _, limits, ok := analyticsProvider(service); ok {
 		metadata.AnalyticsLimits = &limits
+		metadata.AnalyticsRecordingRequired = true
 	}
 	return metadata, nil
 }
@@ -278,9 +281,7 @@ func capabilitiesFor(ctx context.Context, service Service) (Capabilities, error)
 		if _, ok := service.(ChangeProvider); !ok {
 			capabilities.Changes = false
 		}
-		if _, _, ok := analyticsProvider(service); !ok {
-			capabilities.Analytics = false
-		}
+		_, _, capabilities.Analytics = analyticsProvider(service)
 		return capabilities, nil
 	}
 	capabilities, err := provider.Capabilities(ctx)
@@ -296,9 +297,7 @@ func capabilitiesFor(ctx context.Context, service Service) (Capabilities, error)
 	if _, ok := service.(ChangeProvider); !ok {
 		capabilities.Changes = false
 	}
-	if _, _, ok := analyticsProvider(service); !ok {
-		capabilities.Analytics = false
-	}
+	_, _, capabilities.Analytics = analyticsProvider(service)
 	return capabilities, nil
 }
 
