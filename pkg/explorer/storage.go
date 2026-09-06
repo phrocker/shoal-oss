@@ -21,6 +21,7 @@ package explorer
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/gob"
@@ -44,7 +45,7 @@ import (
 // kind, big-endian payload length, SHA-256 payload checksum, and gob payload.
 // It is intentionally separate from the future cross-adapter canonical codec.
 const (
-	explorerTable  = "_shoal_explorer"
+	explorerTable  = EmbeddedTableName
 	recordCF       = "record"
 	recordCQV1     = "v1"
 	recordCQV2     = "v2"
@@ -299,6 +300,18 @@ func (e *Explorer) loadDocumentRecord(
 		record persistedDocument
 		format byte
 	)
+	if bytes.Equal(qualifier, []byte(recordCQV1)) ||
+		bytes.Equal(qualifier, []byte(recordCQV2)) {
+		committed, err := e.documentRecordCommitted(
+			context.Background(), row, qualifier, encoded,
+		)
+		if err != nil {
+			return err
+		}
+		if !committed {
+			return nil
+		}
+	}
 	switch {
 	case bytes.Equal(qualifier, []byte(recordCQV1)):
 		if err := json.Unmarshal(encoded, &record); err != nil {
@@ -469,6 +482,10 @@ func (e *Explorer) writeRecord(row []byte, kind byte, value any) error {
 	if err != nil {
 		return shoal.WrapError(shoal.ErrorInternal, "encode explorer record", err)
 	}
+	return e.writeEncodedRecord(row, encoded)
+}
+
+func (e *Explorer) writeEncodedRecord(row, encoded []byte) error {
 	mutation, err := cclient.NewMutation(row)
 	if err != nil {
 		return shoal.WrapError(shoal.ErrorInternal, "create explorer mutation", err)

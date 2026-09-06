@@ -115,10 +115,16 @@ type ConditionKind int
 const (
 	ConditionAbsent ConditionKind = iota + 1
 	ConditionValueEquals
+	// ConditionLatestValueAndTimestampEquals compares both the value and
+	// timestamp of the newest live version. It is the generation-fenced CAS
+	// predicate used by the embedded Explorer transaction store.
+	ConditionLatestValueAndTimestampEquals
 )
 
 // Condition targets one cell coordinate in the mutation's row. Timestamp nil
-// selects the newest version; a non-nil timestamp selects that exact version.
+// selects the newest version; a non-nil timestamp selects that exact version
+// except for ConditionLatestValueAndTimestampEquals, which checks that the
+// newest live version has the supplied timestamp and value.
 type Condition struct {
 	ColumnFamily     []byte
 	ColumnQualifier  []byte
@@ -347,7 +353,7 @@ func (t *Tablet) conditionsMatchLocked(row []byte, conditions []Condition) (bool
 			Timestamp:        math.MaxInt64,
 			Deleted:          true,
 		}
-		if condition.Timestamp != nil {
+		if condition.Timestamp != nil && condition.Kind != ConditionLatestValueAndTimestampEquals {
 			start.Timestamp = *condition.Timestamp
 		}
 		if err := source.Seek(iterrt.Range{
@@ -378,6 +384,12 @@ func (t *Tablet) conditionsMatchLocked(row []byte, conditions []Condition) (bool
 			}
 		case ConditionValueEquals:
 			if !exists || !bytes.Equal(value, condition.Value) {
+				return false, nil
+			}
+		case ConditionLatestValueAndTimestampEquals:
+			if condition.Timestamp == nil || !exists ||
+				source.GetTopKey().Timestamp != *condition.Timestamp ||
+				!bytes.Equal(value, condition.Value) {
 				return false, nil
 			}
 		default:
@@ -657,12 +669,7 @@ func (t *Tablet) SourceContext(
 	ctx context.Context,
 	env iterrt.IteratorEnvironment,
 ) (iterrt.SortedKeyValueIterator, func(), error) {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	t.mu.RLock()
-	defer t.mu.RUnlock()
-	return t.sourceLockedContext(ctx, env)
+	return t.SnapshotSourceContext(ctx, env)
 }
 
 // SnapshotSourceContext returns a source whose memtable component is copied

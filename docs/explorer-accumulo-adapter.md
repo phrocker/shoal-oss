@@ -111,7 +111,7 @@ without pretending that Accumulo offers cross-row transactions.
 | Authorization core | `pkg/explorer/auth` provides immutable decisions, capability-bound context resolution, canonical policy/visibility encoding, service-role ceilings, scanner-authorization derivation, generation guards, partitioned cache keys, and redacted audit values. | Durable authority/policy-copy catalogs, authenticated gRPC interceptor wiring, and Accumulo service-account deployment remain later work. |
 | Embedded storage | `proto/embed.proto:ConditionalWrite` defines row-local conditional mutation semantics; `ScanRequest.as_of` defines lower-level timestamp filtering. | These are storage primitives, not a public Explorer snapshot, document, graph, citation, or authorization contract. |
 | Accumulo reads | `accumulo/scanner.go` exposes scanner authorizations, columns, and iterator settings. `batch_scanner.go` documents input-range/tablet order unless multi-scan is used. `scan_stream.go` bounds memory to a scanner batch. | Accumulo scans are not a multi-row/multi-table snapshot. Batch and stream results may be accompanied by errors. |
-| Accumulo writes | `accumulo/mutation.go` provides one-row puts/deletes. `batch_writer.go` provides bounded buffering, durability, safe retries, and explicit ambiguous-partial-commit failure. `conditional_writer.go` exposes exact-row absence/value conditions, optional exact timestamps, and Accepted/Rejected/Unknown results over the native Accumulo conditional-update protocol. `pkg/explorer/coordination` provides bounded deterministic M3 record/key vocabulary, including transaction leases and physical `PartitionCommitCopyV1` fences. The allocator, guard, catalog, and control packages provide their documented row-CAS lifecycles. `pkg/explorer/coordination/transaction` adds absent-or-identical claims, immutable manifest chunks, sorted guard acquisition, owner-fenced allocation/takeover, injected physical write/verification, row-atomic root-plus-LPART publication, terminal outcome/checkpoint/finalization, deterministic stored results, corruption quarantine, an in-memory durable fault backend, and trusted Accumulo mutation mapping. `pkg/explorer/coordination/recovery` adds bounded band scanning, authoritative recheck, lease takeover, concurrency caps, cancellation, and bounded backoff. | BatchWriter is not atomic across mutations. The live Accumulo physical sink, concrete document/graph materializer binding, deployment schema/bootstrap, and live-cluster fault suite are deferred. Policy relabel and index-rebuild packages have independent recovery primitives; a single end-to-end live fault campaign spanning those operations is not yet present. |
+| Transactional writes | `accumulo/mutation.go` provides one-row puts/deletes. `batch_writer.go` provides bounded buffering, durability, safe retries, and explicit ambiguous-partial-commit failure. `conditional_writer.go` exposes exact-row absence/value conditions, optional exact timestamps, and Accepted/Rejected/Unknown results over the native Accumulo conditional-update protocol. `pkg/explorer/coordination` provides bounded deterministic M3 record/key vocabulary, including transaction leases and physical `PartitionCommitCopyV1` fences. The allocator, guard, catalog, and control packages provide their documented row-CAS lifecycles. `pkg/explorer/coordination/transaction` adds absent-or-identical claims, immutable manifest chunks, sorted guard acquisition, owner-fenced allocation/takeover, injected physical write/verification, row-atomic root-plus-LPART publication, terminal outcome/checkpoint/finalization, deterministic stored results, corruption quarantine, and trusted physical mapping. `pkg/explorer/coordination/recovery` adds bounded band scanning, authoritative recheck, lease takeover, concurrency caps, cancellation, and bounded backoff. `internal/explorercoord` supplies the production embedded-engine Store, deterministic physical writer/verifier, durable canonical intent materializer, process-exclusive runtime, committed-record gate, and restart recovery composition. `cmd/shoal-explore-web` opens that composition for its embedded backend. | BatchWriter is not atomic across mutations. The live Accumulo physical sink, full document/graph row materialization, deployment schema/bootstrap, and live-cluster fault suite remain deferred. The embedded command transactionally publishes the existing immutable Explorer document-record family. A configured record exceeding the 1 MiB manifest-cell bound is rejected before any write; the unconfigured legacy `explorer.Open` path retains its historical compatibility behavior. Other Explorer record families retain their established embedded persistence path. Policy relabel and index-rebuild packages have independent recovery primitives; a single end-to-end live fault campaign spanning those operations is not yet present. |
 | Accumulo ordering/history | `accumulo/key.go:Key.Compare` defines row/CF/CQ/visibility ascending, timestamp descending, tombstone-first ordering. | Scanner order is not public Explorer order, and versioning/compaction can remove cell history. |
 | Accumulo security | `accumulo/authorizations.go`, `column_visibility.go`, `scanner.go`, and `security.go` expose byte-exact authorizations, boolean visibility expressions, per-scan authorizations, and user/table/namespace permissions. | They do not derive labels from a Shoal principal, prevent blank visibility, or define Explorer non-disclosure. |
 | Table administration | `accumulo/table_admin.go`, `table_properties.go`, `table_add_splits.go`, and `table_bulk_import.go` expose table creation, properties, binary splits, and manager-authoritative bulk import. | Explorer-specific locality groups, iterator stacks, split plans, retention, and compaction policy do not exist today. |
@@ -1777,6 +1777,85 @@ integration paths pass.
 - Aggressive deletion of citation-bearing history.
 - Decommissioning embedded storage before a verified rollback window.
 
+### 13.1 Embedded transaction runtime
+
+`internal/explorercoord.Open` is the production in-process composition for the
+embedded engine. Callers provide a domain, a recovery owner, a current
+embedded-primary authority generation/fence, and the physical tables that the
+intent may address. `Runtime.Publish` accepts a bounded logical intent
+containing cells, expected entity states, and result identities. It:
+
+1. canonicalizes and stores the intent absent-or-identical;
+2. derives the TXN from domain, operation, and token;
+3. invokes the existing allocator/guard/transaction protocol;
+4. writes physical cells in deterministic table/row order;
+5. independently reads exact physical versions before publication;
+6. marks completion only after outcome, checkpoint, and guard finalization.
+
+Recovery first enumerates durable intent rows and then transaction-root bands.
+Both scans use bounded row cursors, not `Snapshot.Frontier`; repeated recovery
+is idempotent. An unavailable or canceled call after intent persistence is an
+indeterminate publication, never an implicit rollback.
+
+The embedded implementation maintains a row-atomic pending marker beside each
+new durable intent and a canonical, generation-fenced index containing only
+live pending transaction IDs. Index registration precedes intent persistence,
+so a crash can create only a safe false positive that recovery removes; it
+cannot hide a durable pending intent. Completion or a non-committed terminal
+state removes the transaction from the index. Startup and steady-state pending
+checks therefore inspect only outstanding work; completed corpus history does
+not consume the recovery page budget or make each ingest scan old tombstones.
+A record publication also stores its stable record-key binding in the canonical
+intent, allowing recovery to restore or verify an ambiguous alias before any
+physical publication. A non-committed terminal attempt is released and its TXN
+is folded into the next deterministic retry token before the record key is
+rebound. A retry of an active or committed Explorer document publication
+reloads the exact encoded attempted record, including its original publication
+time, sequence, and expected entity head, instead of regenerating transient
+values under the same TXN. Before the first transactional Explorer open, the
+runtime records bounded, per-row grandfather markers for existing legacy
+document rows and then seals migration with a domain-bound marker in the
+Explorer table. Once sealed, a physical document without a transaction binding
+is readable only when its exact legacy marker exists; recreating coordination
+metadata cannot reclassify later transactional residue as legacy data.
+
+The transaction runtime accepts only `localwal.SyncFull`. `SyncNormal` and
+`SyncOff` are rejected before the engine is opened because coordination and
+physical tables have independent WALs; allowing a commit/checkpoint WAL to
+survive while a physical WAL is lost would violate the publication fence.
+
+`Runtime.ScanCommitted` is the read-only physical event/registry seam. It pins
+one allocator frontier, scans only a configured table and exact
+family/qualifier/visibility under a bounded row prefix, and returns the newest
+committed epoch-stamped version per row. Admission requires the immutable epoch
+outcome, durable intent completion, committed root, frontier inclusion, and an
+exact matching cell in the reconstructed manifest. A newer nonterminal,
+aborted, or poisoned version cannot hide an older committed version.
+`Runtime.Committed` exposes the same completion proof for a known TXN and
+logical digest. Raw engine scans and a second engine open remain unsupported.
+
+`internal/explorercoord.OpenExplorer` shares the same engine handle with
+`pkg/explorer`, and `cmd/shoal-explore-web` uses it for the embedded backend.
+Immutable document-revision records are published with a stable document-level
+guard and optimistic expected epoch/digest. Concurrent divergent revisions
+that start from one head cannot both commit. Explorer load consults durable
+intent completion and the committed transaction root before decoding a
+transactional record, so physical-stage residue from a nonterminal, aborted,
+or poisoned transaction is not observable. A configured document envelope
+larger than the 1 MiB manifest-cell limit fails closed before physical write;
+only the unconfigured legacy open path preserves direct-write compatibility.
+Snapshot-anchor, change-cursor, edge, interaction, fold, extraction, and
+ontology-proposal records still use the established embedded path. Fleet
+registry/dispatch code may use `Runtime.Publish` for bounded multi-row bundles,
+but those domain routes are not implemented by this adapter change.
+
+The v1 embedded runtime supports many concurrent agents in one process. It
+holds a nonblocking operating-system file lock for the data directory and
+rejects a second runtime open. Authority is injected and must exactly match the
+durable allocator head. This is not a claim that multiple processes can share
+one embedded engine directory; cross-process authority rotation and routing
+remain separate work.
+
 ## 14. Risks, open questions, and decision points
 
 These items affect feasibility, performance, or public adoption. They do not
@@ -1784,7 +1863,7 @@ relax the normative behavior above.
 
 | Item | Why it matters / required decision |
 |---|---|
-| Native Accumulo conditional writer | The M3 slices expose a public exact-row API over Accumulo's native conditional-update RPC, the bounded coordination vocabulary, a production allocator client with allocator-head fencing, row-atomic reservations/checkpoints/retirement, immutable outcomes, and a production entity-guard client with canonical acquisition ordering, APPEND/ABSENT_OR_IDENTICAL decisions inside row CAS, renewal/takeover fencing, publication-authority-gated finalization, retention checks, and authoritative ambiguous-response readback. Both use trusted Scanner/ConditionalWriter mapping. High-level TXN/revision claims and ingestion/materialization orchestration, LPART commit-copy writing, durable catalogs/mirrors, snapshot-lease lifecycle, routing, authority lifecycle, and recovery/reconciliation workers remain incomplete. These slices do not make full M3 complete. |
+| Native Accumulo conditional writer | The M3 slices expose a public exact-row API over Accumulo's native conditional-update RPC, the bounded coordination vocabulary, a production allocator client with allocator-head fencing, row-atomic reservations/checkpoints/retirement, immutable outcomes, and a production entity-guard client with canonical acquisition ordering, APPEND/ABSENT_OR_IDENTICAL decisions inside row CAS, renewal/takeover fencing, publication-authority-gated finalization, retention checks, and authoritative ambiguous-response readback. The embedded Shoal-engine runtime now composes those pieces with durable intents and recovery. A live Accumulo physical sink, full product materializers, durable catalogs/mirrors, deployment routing, and a live-cluster fault campaign remain incomplete. These slices do not make full M3 complete. |
 | Pre-GA allocator wire compatibility | `AllocatorHeadV1` and `ReservationV1` currently include explicit monotonic record generations. This branch has not shipped, so their V1 fixtures were updated in place and no migration from the earlier branch-only bytes is provided. |
 | Public contract adoption | M0 adopts byte-offset, normalization, scope, error, and traversal rules in `docs/explorer-public-contract.md`. Winner/tombstone persistence, publication frontiers, authorization, and mutation shapes remain later additive work and must not be inferred from the value helpers. |
 | Embedded historical export | Migration requires exact publication order/time and canonical source bytes. If embedded storage cannot export them, promotion is blocked rather than approximated. |

@@ -59,7 +59,7 @@ func TestAskRejectsReadOnlyCorpusAtSetup(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer corpus.Close()
+	t.Cleanup(func() { _ = corpus.Close() })
 	sessions, err := corpus.Interactions(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -126,6 +126,9 @@ func TestAskRecordsInteractionInTheGraph(t *testing.T) {
 	}
 	if retrieved == 0 || cited == 0 {
 		t.Fatalf("retrieved edges = %d, cited edges = %d", retrieved, cited)
+	}
+	if err := corpus.Close(); err != nil {
+		t.Fatal(err)
 	}
 
 	// The recorded interaction must not resurface as source evidence.
