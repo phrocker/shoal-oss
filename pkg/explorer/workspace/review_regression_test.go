@@ -22,6 +22,7 @@ package workspace
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"testing"
 	"time"
@@ -482,6 +483,21 @@ func TestReviewSettingsConditionalWriteErrorReadback(t *testing.T) {
 			t.Fatalf("unknown result = %#v, error = %v", result, err)
 		}
 	})
+}
+
+func TestReviewSettingsReadbackConcealsForeignWinner(t *testing.T) {
+	record := persistedSettings{
+		Owner:               "other-owner",
+		AuthorizationDomain: []byte("domain"),
+		LastMutationID:      "other-mutation",
+	}
+	replayed, _, err := replayResult(
+		record, true, "owner", []byte("domain"),
+		0, "mutation", [sha256.Size]byte{},
+	)
+	if !replayed || !shoal.IsErrorCode(err, shoal.ErrorNotFound) {
+		t.Fatalf("foreign readback replayed=%v, error=%v", replayed, err)
+	}
 }
 
 func TestReviewSettingsRejectConcurrentDirectoryOpen(t *testing.T) {

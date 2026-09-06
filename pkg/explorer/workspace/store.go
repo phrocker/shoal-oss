@@ -410,7 +410,7 @@ func replayResult(
 	mutationID shoal.ID,
 	digest [sha256.Size]byte,
 ) (bool, Settings, error) {
-	if !found || record.LastMutationID != string(mutationID) {
+	if !found {
 		return false, Settings{}, nil
 	}
 	if record.Owner != string(owner) {
@@ -418,6 +418,9 @@ func replayResult(
 	}
 	if !bytes.Equal(record.AuthorizationDomain, authorizationDomain) {
 		return true, Settings{}, auth.ObjectNotFound()
+	}
+	if record.LastMutationID != string(mutationID) {
+		return false, Settings{}, nil
 	}
 	if record.Revision != expectedRevision+1 ||
 		record.LastMutationDigest != digest {

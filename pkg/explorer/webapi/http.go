@@ -446,15 +446,20 @@ func writeResponse(writer http.ResponseWriter, status int, value any) {
 	var body limitedResponseBuffer
 	body.limit = int64(responseLimitFor(writer))
 	if err := json.NewEncoder(&body).Encode(value); err != nil {
-		writer.Header().Set("Content-Type", "application/json; charset=utf-8")
-		writer.WriteHeader(http.StatusInternalServerError)
-		_ = json.NewEncoder(writer).Encode(struct {
+		var fallback limitedResponseBuffer
+		fallback.limit = body.limit
+		fallbackErr := json.NewEncoder(&fallback).Encode(struct {
 			Code    shoal.ErrorCode `json:"code"`
 			Message string          `json:"message"`
 		}{
 			Code:    shoal.ErrorInternal,
-			Message: shoal.NewError(shoal.ErrorInternal, "response exceeds max_response_bytes").Error(),
+			Message: "response exceeds output byte limit",
 		})
+		writer.Header().Set("Content-Type", "application/json; charset=utf-8")
+		writer.WriteHeader(http.StatusInternalServerError)
+		if fallbackErr == nil && fallback.Len() <= int(body.limit) {
+			_, _ = writer.Write(fallback.Bytes())
+		}
 		return
 	}
 	writer.Header().Set("Content-Type", "application/json; charset=utf-8")

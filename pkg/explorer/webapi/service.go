@@ -804,9 +804,12 @@ func (s *EmbeddedService) Path(
 	if err := shoal.ValidateRequiredID("path target node ID", request.To); err != nil {
 		return PathResponse{}, err
 	}
+	maxNodes := request.MaxNodes
+	if maxNodes == 0 {
+		maxNodes = effectiveGraphNodeLimit(ctx, MaxNodes)
+	}
 	depth, fanout, maxNodes, err := normalizeGraphBounds(
-		request.MaxDepth, request.Fanout,
-		effectiveGraphNodeLimit(ctx, MaxNodes))
+		request.MaxDepth, request.Fanout, maxNodes)
 	if err != nil {
 		return PathResponse{}, err
 	}
@@ -817,6 +820,7 @@ func (s *EmbeddedService) Path(
 		return PathResponse{}, err
 	}
 	request.EdgeTypes = normalized.EdgeTypes
+	request.MaxNodes = maxNodes
 	if err := validateEdgeTypes(request.EdgeTypes); err != nil {
 		return PathResponse{}, err
 	}

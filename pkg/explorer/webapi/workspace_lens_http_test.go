@@ -366,11 +366,13 @@ func TestHTTPSelectableLensIsPerCallerAndPreservesSettings(t *testing.T) {
 		t, handler, http.MethodPost, "/api/v1/path",
 		webapi.PathRequest{
 			From: "from", To: "to", MaxDepth: 4, Fanout: 50,
+			MaxNodes: 250,
 		},
 		"owner", workspacePath)
 	if pathResponse.Code != http.StatusOK ||
 		service.path.MaxDepth != depth ||
-		service.path.Fanout != fanout {
+		service.path.Fanout != fanout ||
+		service.path.MaxNodes != graphNodes {
 		t.Fatalf("path budget = %#v, status = %d, body = %s",
 			service.path, pathResponse.Code, pathResponse.Body.String())
 	}
@@ -416,6 +418,10 @@ func TestHTTPSelectableLensIsPerCallerAndPreservesSettings(t *testing.T) {
 	if limited.Code != http.StatusInternalServerError {
 		t.Fatalf("limited output status = %d, body = %s",
 			limited.Code, limited.Body.String())
+	}
+	if uint64(limited.Body.Len()) > outputBytes {
+		t.Fatalf("limited output body = %d bytes, want <= %d",
+			limited.Body.Len(), outputBytes)
 	}
 }
 
