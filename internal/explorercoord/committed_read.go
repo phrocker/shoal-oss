@@ -480,8 +480,14 @@ func (r *Runtime) selectCommittedVersion(
 				for duplicate := index + 1; duplicate < end; duplicate++ {
 					if versions[duplicate].key.Deleted != deleted {
 						return CommittedCell{}, false, fmt.Errorf(
-							"%w: physical deletion state disagrees at one timestamp",
+							"%w: physical deletion state disagrees at table %q row %x family %x qualifier %x visibility %x timestamp %d",
 							transaction.ErrInternal,
+							table,
+							versions[index].key.Row,
+							versions[index].key.ColumnFamily,
+							versions[index].key.ColumnQualifier,
+							versions[index].key.ColumnVisibility,
+							timestamp,
 						)
 					}
 					if !versions[duplicate].key.Deleted &&

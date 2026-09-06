@@ -198,9 +198,9 @@ func (p Plan) Validate() (coordination.ManifestSummary, error) {
 		)
 		if valueErr != nil {
 			return summary, fmt.Errorf(
-				"%w: physical cell %d commitment is invalid",
-				ErrInvalid,
+				"physical cell %d commitment is invalid: %w",
 				i,
+				valueErr,
 			)
 		}
 		if coordination.CompareManifestEntries(entries[i], cell.Entry) != 0 ||
