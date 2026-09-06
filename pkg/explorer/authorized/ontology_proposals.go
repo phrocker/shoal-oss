@@ -335,6 +335,24 @@ func (c *Client) ontologyEvidenceAllows(
 			return false, nil
 		}
 	}
+	resolver, ok := c.base.(explorer.OntologyEvidenceCitationResolver)
+	if !ok {
+		return false, shoal.NewError(
+			shoal.ErrorUnavailable,
+			"workspace capability \"ontology evidence citation\" is unavailable",
+		)
+	}
+	quote, err := resolver.ResolveOntologyEvidenceCitation(ctx, citation)
+	if err != nil {
+		if shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) ||
+			shoal.IsErrorCode(err, shoal.ErrorNotFound) {
+			return false, nil
+		}
+		return false, directBaseError(err)
+	}
+	if quote != evidence.Quote() {
+		return false, nil
+	}
 	path, hasPath := evidence.Path()
 	if !hasPath {
 		return true, nil

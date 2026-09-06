@@ -287,8 +287,13 @@ func TestOntologyProposalEvidenceRequiresObjectAuthorization(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	forgedQuote, err := ontology.NewEvidenceRef(
+		allowedEvidence.Citation(), "fabricated quote", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 	for index, evidence := range []ontology.EvidenceRef{
-		deniedCitation, deniedPath, outsideRange,
+		deniedCitation, deniedPath, outsideRange, forgedQuote,
 	} {
 		rejected, _ := ontologyEvidenceProposal(
 			t, schema, baseVersion, index+6, evidence, at)
@@ -381,6 +386,23 @@ func (b *ontologyEvidenceBase) Document(
 			shoal.ErrorNotFound, "document revision not found")
 	}
 	return view, nil
+}
+
+func (b *ontologyEvidenceBase) ResolveOntologyEvidenceCitation(
+	_ context.Context,
+	citation document.Citation,
+) (string, error) {
+	view, ok := b.views[citation.DocumentID]
+	if !ok || view.Revision.ID != citation.RevisionID {
+		return "", shoal.NewError(
+			shoal.ErrorNotFound, "document revision not found")
+	}
+	if citation.SectionID != view.Root.Section.ID ||
+		citation.Range != view.Root.Section.Range {
+		return "", shoal.NewError(
+			shoal.ErrorInvalidArgument, "citation is outside the section")
+	}
+	return "", nil
 }
 
 func registerOntologyEvidenceDocument(

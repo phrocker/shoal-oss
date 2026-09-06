@@ -26,6 +26,7 @@ import (
 	"sort"
 	"time"
 
+	"github.com/phrocker/shoal-oss/pkg/document"
 	"github.com/phrocker/shoal-oss/pkg/ontology"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
@@ -74,6 +75,14 @@ type OntologyProposalEvidenceProvider interface {
 	OntologyProposalEvidence(
 		context.Context, shoal.ID,
 	) ([]ontology.EvidenceRef, bool, error)
+}
+
+// OntologyEvidenceCitationResolver resolves exact immutable source bytes for
+// evidence validation without exposing a complete document revision.
+type OntologyEvidenceCitationResolver interface {
+	ResolveOntologyEvidenceCitation(
+		context.Context, document.Citation,
+	) (string, error)
 }
 
 // OntologyProposalMutationState is the narrow preflight view needed by
@@ -337,6 +346,38 @@ func (e *Explorer) OntologyProposalEvidence(
 		evidence = append(evidence, morphism.Evidence()...)
 	}
 	return evidence, true, nil
+}
+
+// ResolveOntologyEvidenceCitation validates and resolves an exact citation
+// against the immutable stored source revision.
+func (e *Explorer) ResolveOntologyEvidenceCitation(
+	ctx context.Context,
+	citation document.Citation,
+) (string, error) {
+	if err := contextError(ctx); err != nil {
+		return "", err
+	}
+	if err := citation.Validate(); err != nil {
+		return "", err
+	}
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	if err := e.requireOpen(); err != nil {
+		return "", err
+	}
+	record := e.documents[citation.DocumentID][citation.RevisionID]
+	if record == nil {
+		return "", shoal.NewError(
+			shoal.ErrorNotFound, "cited document revision not found")
+	}
+	return document.ResolveCitationQuote(
+		record.Source.Content,
+		record.Document,
+		record.Revision,
+		record.Sections,
+		record.Spans,
+		citation,
+	)
 }
 
 // CreateOntologyProposal durably records a new draft proposal. The lifecycle is
