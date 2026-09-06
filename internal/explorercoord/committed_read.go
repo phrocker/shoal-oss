@@ -406,9 +406,14 @@ func (r *Runtime) proofForEpoch(
 	}
 	outcome, err := r.allocator.Outcome(ctx, epoch)
 	if err != nil {
-		return publicationProof{}, fmt.Errorf(
-			"%w: read epoch outcome: %v", transaction.ErrInternal, err,
-		)
+		if errors.Is(err, allocator.ErrNotFound) ||
+			errors.Is(err, allocator.ErrCorruption) {
+			return publicationProof{}, errors.Join(
+				transaction.ErrInternal,
+				fmt.Errorf("read epoch outcome: %w", err),
+			)
+		}
+		return publicationProof{}, fmt.Errorf("read epoch outcome: %w", err)
 	}
 	proof := publicationProof{}
 	if outcome.State != coordination.StateCommitted {
@@ -417,9 +422,13 @@ func (r *Runtime) proofForEpoch(
 	}
 	record, err := r.intents.Load(ctx, outcome.TXN)
 	if err != nil {
-		return publicationProof{}, fmt.Errorf(
-			"%w: load committed intent: %v", transaction.ErrInternal, err,
-		)
+		if errors.Is(err, transaction.ErrNotFound) {
+			return publicationProof{}, errors.Join(
+				transaction.ErrInternal,
+				fmt.Errorf("load committed intent: %w", err),
+			)
+		}
+		return publicationProof{}, fmt.Errorf("load committed intent: %w", err)
 	}
 	result, committed, err := r.committedLocked(
 		ctx, outcome.TXN, record.LogicalDigest,

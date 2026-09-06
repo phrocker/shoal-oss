@@ -20,9 +20,12 @@
 package explorercoord
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"sort"
 	"testing"
+	"time"
 
 	"github.com/phrocker/shoal-oss/pkg/explorer/coordination"
 	"github.com/phrocker/shoal-oss/pkg/explorer/coordination/allocator"
@@ -281,6 +284,236 @@ func TestRecordBindingFailuresDoNotLeaveRecoverableOrphans(t *testing.T) {
 	})
 }
 
+func TestPendingCandidateIndexIgnoresTombstonedHistory(t *testing.T) {
+	eng, store := openTestEngineStore(t, "coord")
+	defer eng.Close()
+	domain := coordination.DomainID("domain")
+	intents, err := NewIntentStore(domain, nil, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	records := make([]storedIntent, 0, 2)
+	for _, token := range []string{"first", "second"} {
+		record, _, err := intents.Put(
+			context.Background(),
+			testIntent(
+				t,
+				domain,
+				"pending-page",
+				token,
+				token,
+				guard.ModeAbsentOrIdentical,
+				0,
+				coordination.Digest{},
+			),
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		records = append(records, record)
+	}
+	sort.Slice(records, func(i, j int) bool {
+		return bytes.Compare(
+			intents.intentRow(records[i].TXN),
+			intents.intentRow(records[j].TXN),
+		) < 0
+	})
+	if err := intents.Settle(
+		context.Background(),
+		records[0].TXN,
+		records[0].LogicalDigest,
+	); err != nil {
+		t.Fatal(err)
+	}
+	intents.store = &scanFailIntentStore{EngineStore: store}
+	candidates, next, err := intents.Candidates(context.Background(), nil, 1)
+	if err != nil || len(candidates) != 1 ||
+		!bytes.Equal(candidates[0], records[1].TXN) ||
+		len(next) != 0 {
+		t.Fatalf("live pending index = %#v, %x, %v", candidates, next, err)
+	}
+}
+
+func TestPendingPublicationsUsesLoadedLiveIndex(t *testing.T) {
+	config := testRuntimeConfig(t, testDirectory(t))
+	runtime, err := Open(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.Close()
+	intent := testIntent(
+		t,
+		config.Domain,
+		"completed-history",
+		"token",
+		"value",
+		guard.ModeAbsentOrIdentical,
+		0,
+		coordination.Digest{},
+	)
+	if _, err := runtime.Publish(
+		context.Background(),
+		Request{Intent: intent},
+	); err != nil {
+		t.Fatal(err)
+	}
+	runtime.intents.store = &scanFailIntentStore{EngineStore: runtime.store}
+	if pending, err := runtime.PendingPublications(
+		context.Background(),
+	); err != nil || pending {
+		t.Fatalf("indexed pending check = %v, %v", pending, err)
+	}
+}
+
+func TestRecoveryAndPublicationUseSameLockOrder(t *testing.T) {
+	config := testRuntimeConfig(t, testDirectory(t))
+	runtime, err := Open(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	runtime.recoveryMu.Lock()
+	recoverDone := make(chan error, 1)
+	go func() {
+		_, err := runtime.RecoverPage(context.Background())
+		recoverDone <- err
+	}()
+	time.Sleep(20 * time.Millisecond)
+
+	publishDone := make(chan error, 1)
+	go func() {
+		_, err := runtime.PublishRecord(
+			context.Background(),
+			testRecordPublication("document", "revision", "value", nil),
+		)
+		publishDone <- err
+	}()
+	deadline := time.Now().Add(2 * time.Second)
+	for runtime.mu.TryLock() {
+		runtime.mu.Unlock()
+		if time.Now().After(deadline) {
+			runtime.recoveryMu.Unlock()
+			t.Fatal("publication did not acquire the runtime read lock")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	closeDone := make(chan error, 1)
+	go func() {
+		closeDone <- runtime.Close()
+	}()
+	time.Sleep(20 * time.Millisecond)
+	runtime.recoveryMu.Unlock()
+
+	for name, done := range map[string]<-chan error{
+		"recovery": recoverDone,
+		"publish":  publishDone,
+		"close":    closeDone,
+	} {
+		select {
+		case <-done:
+		case <-time.After(3 * time.Second):
+			t.Fatalf("%s deadlocked", name)
+		}
+	}
+}
+
+func TestRecoveryRejectsPendingIntentOutsideCurrentTableAllowlist(t *testing.T) {
+	config := testRuntimeConfig(t, testDirectory(t))
+	config.PhysicalTables = []string{"legacy"}
+	fired := false
+	config.testStageHook = func(stage recoveryStage) error {
+		if stage == recoveryStageIntent && !fired {
+			fired = true
+			return context.Canceled
+		}
+		return nil
+	}
+	runtime, err := Open(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	intent := testIntent(
+		t,
+		config.Domain,
+		"legacy-table",
+		"token",
+		"value",
+		guard.ModeAbsentOrIdentical,
+		0,
+		coordination.Digest{},
+	)
+	intent.Cells[0].Table = "legacy"
+	if _, err := runtime.Publish(
+		context.Background(),
+		Request{Intent: intent},
+	); !errors.Is(err, ErrIndeterminatePublication) {
+		t.Fatalf("stage pending legacy intent = %v", err)
+	}
+	if err := runtime.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	config.PhysicalTables = []string{"records"}
+	config.testStageHook = nil
+	if reopened, err := Open(config); !errors.Is(err, transaction.ErrInvalid) {
+		if reopened != nil {
+			_ = reopened.Close()
+		}
+		t.Fatalf("recover intent outside current allowlist = %v", err)
+	}
+}
+
+func TestCommittedProofPreservesOperationalReadErrors(t *testing.T) {
+	config := testRuntimeConfig(t, testDirectory(t))
+	runtime, err := Open(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.Close()
+	intent := testIntent(
+		t,
+		config.Domain,
+		"committed-proof",
+		"token",
+		"value",
+		guard.ModeAbsentOrIdentical,
+		0,
+		coordination.Digest{},
+	)
+	result, err := runtime.Publish(
+		context.Background(),
+		Request{Intent: intent},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := runtime.proofForEpoch(
+		canceled,
+		result.Epoch,
+		make(map[coordination.Epoch]publicationProof),
+	); !errors.Is(err, context.Canceled) ||
+		errors.Is(err, transaction.ErrInternal) {
+		t.Fatalf("canceled outcome read = %v", err)
+	}
+
+	runtime.intents.store = &readFailIntentStore{
+		EngineStore: runtime.store,
+		err:         context.Canceled,
+	}
+	if _, err := runtime.proofForEpoch(
+		context.Background(),
+		result.Epoch,
+		make(map[coordination.Epoch]publicationProof),
+	); !errors.Is(err, context.Canceled) ||
+		errors.Is(err, transaction.ErrInternal) {
+		t.Fatalf("canceled committed intent read = %v", err)
+	}
+}
+
 type ambiguousIntentStore struct {
 	*EngineStore
 	ambiguous    bool
@@ -292,7 +525,7 @@ func (s *ambiguousIntentStore) CompareAndMutate(
 	mutation allocator.Mutation,
 ) (allocator.Status, error) {
 	status, err := s.EngineStore.CompareAndMutate(ctx, mutation)
-	if !s.ambiguous {
+	if !s.ambiguous || !bytes.HasPrefix(mutation.Row, intentRowMagic) {
 		return status, err
 	}
 	s.ambiguous = false
@@ -312,4 +545,32 @@ func (s *ambiguousIntentStore) ReadExact(
 		return nil, errors.New("injected intent readback failure")
 	}
 	return s.EngineStore.ReadExact(ctx, coordinates)
+}
+
+type scanFailIntentStore struct {
+	*EngineStore
+}
+
+func (s *scanFailIntentStore) ScanPrefixFrom(
+	context.Context,
+	[]byte,
+	[]byte,
+	[]byte,
+	[]byte,
+	[]byte,
+	int,
+) ([]allocator.Cell, error) {
+	return nil, errors.New("unexpected historical pending scan")
+}
+
+type readFailIntentStore struct {
+	*EngineStore
+	err error
+}
+
+func (s *readFailIntentStore) ReadExact(
+	context.Context,
+	[]allocator.Coordinate,
+) ([]allocator.Cell, error) {
+	return nil, s.err
 }

@@ -1798,9 +1798,13 @@ is idempotent. An unavailable or canceled call after intent persistence is an
 indeterminate publication, never an implicit rollback.
 
 The embedded implementation maintains a row-atomic pending marker beside each
-new durable intent and removes it when the transaction commits or reaches a
-non-committed terminal state. Startup therefore scans only outstanding work;
-completed corpus history does not consume the recovery page budget. A retry of
+new durable intent and a canonical, generation-fenced index containing only
+live pending transaction IDs. Index registration precedes intent persistence,
+so a crash can create only a safe false positive that recovery removes; it
+cannot hide a durable pending intent. Completion or a non-committed terminal
+state removes the transaction from the index. Startup and steady-state pending
+checks therefore inspect only outstanding work; completed corpus history does
+not consume the recovery page budget or make each ingest scan old tombstones. A retry of
 an Explorer document publication reloads the exact encoded attempted record,
 including its original publication time, sequence, and expected entity head,
 instead of regenerating transient values under the same TXN.

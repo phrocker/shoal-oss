@@ -30,6 +30,7 @@ import (
 	"io"
 	"math"
 	"sort"
+	"sync"
 
 	"github.com/phrocker/shoal-oss/pkg/explorer/coordination"
 	"github.com/phrocker/shoal-oss/pkg/explorer/coordination/allocator"
@@ -38,9 +39,10 @@ import (
 )
 
 const (
-	intentVersion  = 1
-	maxIntentBytes = 128 << 20
-	maxIntentCells = 65_536
+	intentVersion       = 1
+	pendingIndexVersion = 1
+	maxIntentBytes      = 128 << 20
+	maxIntentCells      = 65_536
 )
 
 var (
@@ -53,6 +55,8 @@ var (
 	intentRowMagic    = []byte{2, 'I'}
 	attemptRowMagic   = []byte{2, 'A'}
 	attemptQualifier  = []byte("txn")
+	pendingIndexRow   = []byte{2, 'P'}
+	pendingIndexCQ    = []byte("active")
 )
 
 // Cell is one immutable physical cell in a logical publication intent.
@@ -123,23 +127,18 @@ type intentCompletion struct {
 	Epoch  coordination.Epoch
 }
 
-type intentStoreBackend interface {
-	allocator.Store
-	ScanPrefixFrom(
-		context.Context,
-		[]byte,
-		[]byte,
-		[]byte,
-		[]byte,
-		[]byte,
-		int,
-	) ([]allocator.Cell, error)
+type pendingIntentIndex struct {
+	Version    uint8              `json:"version"`
+	Generation int64              `json:"generation"`
+	TXNs       []coordination.TXN `json:"txns"`
 }
 
 type IntentStore struct {
 	domain     coordination.DomainID
 	visibility []byte
-	store      intentStoreBackend
+	store      allocator.Store
+	pendingMu  sync.RWMutex
+	pending    map[string]struct{}
 }
 
 func NewIntentStore(
@@ -157,6 +156,7 @@ func NewIntentStore(
 		domain:     append(coordination.DomainID(nil), domain...),
 		visibility: append([]byte(nil), visibility...),
 		store:      store,
+		pending:    make(map[string]struct{}),
 	}, nil
 }
 
@@ -211,6 +211,9 @@ func (s *IntentStore) Put(
 	if err != nil {
 		return storedIntent{}, false, err
 	}
+	if err := s.addPending(ctx, txn); err != nil {
+		return storedIntent{}, false, err
+	}
 	record := storedIntent{
 		Version: intentVersion, Domain: append(coordination.DomainID(nil), s.domain...),
 		TXN: append(coordination.TXN(nil), txn...), LogicalDigest: digest, Intent: normalized,
@@ -247,8 +250,19 @@ func (s *IntentStore) Put(
 				return storedIntent{}, false, encodeErr
 			}
 			if bytes.Equal(existingBytes, encoded) {
-				if err := s.ensurePending(ctx, existing); err != nil {
+				active, err := s.ensurePending(ctx, existing)
+				if err != nil {
+					if errors.Is(err, allocator.ErrConditionalUnknown) {
+						s.markPending(txn)
+					}
 					return storedIntent{}, false, err
+				}
+				if active {
+					s.markPending(txn)
+				} else {
+					if err := s.removePending(ctx, txn); err != nil {
+						return storedIntent{}, false, err
+					}
 				}
 				return existing, true, nil
 			}
@@ -256,6 +270,7 @@ func (s *IntentStore) Put(
 		}
 		if !errors.Is(readErr, transaction.ErrNotFound) {
 			if errors.Is(writeErr, allocator.ErrConditionalUnknown) {
+				s.markPending(txn)
 				return storedIntent{}, false, errors.Join(
 					transaction.ErrUnavailable,
 					allocator.ErrConditionalUnknown,
@@ -272,6 +287,7 @@ func (s *IntentStore) Put(
 			return storedIntent{}, false, errors.Join(transaction.ErrUnavailable, writeErr)
 		}
 		if attempt == 3 {
+			s.markPending(txn)
 			return storedIntent{}, false, errors.Join(transaction.ErrUnavailable, allocator.ErrConditionalUnknown)
 		}
 	}
@@ -340,14 +356,14 @@ func (s *IntentStore) Complete(
 	}
 	status, writeErr := s.store.CompareAndMutate(ctx, mutation)
 	if status == allocator.StatusAccepted {
-		return nil
+		return s.removePending(ctx, txn)
 	}
 	cells, readErr := s.store.ReadExact(ctx, []allocator.Coordinate{coordinate})
 	if readErr != nil {
 		return errors.Join(transaction.ErrUnavailable, writeErr, readErr)
 	}
 	if len(cells) == 1 && cells[0].Timestamp == int64(epoch) && bytes.Equal(cells[0].Value, value) {
-		return nil
+		return s.removePending(ctx, txn)
 	}
 	if status == allocator.StatusRejected {
 		return transaction.ErrConflict
@@ -387,34 +403,286 @@ func (s *IntentStore) Candidates(
 		return nil, nil, errors.New("explorer coordination: intent scan limit is outside its bound")
 	}
 	prefix := s.intentPrefix()
-	start := prefix
 	if len(after) != 0 {
 		if !bytes.HasPrefix(after, prefix) || bytes.Compare(after, prefix) < 0 {
 			return nil, nil, errors.New("explorer coordination: invalid intent recovery cursor")
 		}
-		start = after
 	}
-	cells, err := s.store.ScanPrefixFrom(
-		ctx, prefix, start, intentFamily, pendingQualifier, s.visibility, limit,
-	)
+	index, _, _, err := s.readPendingIndex(ctx)
 	if err != nil {
 		return nil, nil, err
 	}
-	result := make([]coordination.TXN, 0, len(cells))
-	for _, cell := range cells {
-		if cell.Timestamp != intentVersion || len(cell.Value) != len(coordination.Digest{}) {
-			return nil, nil, errors.New("explorer coordination: invalid pending intent marker")
-		}
-		txn, parseErr := s.parseIntentRow(cell.Coordinate.Row)
-		if parseErr != nil {
-			return nil, nil, parseErr
-		}
-		result = append(result, txn)
+	start := 0
+	if len(after) != 0 {
+		start = sort.Search(len(index.TXNs), func(i int) bool {
+			return bytes.Compare(s.intentRow(index.TXNs[i]), after) >= 0
+		})
 	}
-	if len(cells) == limit {
-		return result, append(append([]byte(nil), cells[len(cells)-1].Coordinate.Row...), 0), nil
+	end := min(start+limit, len(index.TXNs))
+	result := make([]coordination.TXN, 0, end-start)
+	for _, txn := range index.TXNs[start:end] {
+		result = append(result, append(coordination.TXN(nil), txn...))
+		s.markPending(txn)
 	}
-	return result, nil, nil
+	var next []byte
+	if end < len(index.TXNs) {
+		next = append(s.intentRow(index.TXNs[end-1]), 0)
+	}
+	return result, next, nil
+}
+
+func (s *IntentStore) IndexPending(
+	ctx context.Context,
+	limit, maxPages int,
+) error {
+	if limit < 1 || maxPages < 1 {
+		return errors.Join(
+			transaction.ErrInvalid,
+			errors.New("pending intent index bounds are invalid"),
+		)
+	}
+	index, _, _, err := s.readPendingIndex(ctx)
+	if err != nil {
+		return err
+	}
+	s.pendingMu.Lock()
+	s.pending = make(map[string]struct{})
+	for _, txn := range index.TXNs {
+		s.pending[string(txn)] = struct{}{}
+	}
+	s.pendingMu.Unlock()
+	return nil
+}
+
+func (s *IntentStore) HasPending() bool {
+	s.pendingMu.RLock()
+	defer s.pendingMu.RUnlock()
+	return len(s.pending) != 0
+}
+
+func (s *IntentStore) markPending(txn coordination.TXN) {
+	s.pendingMu.Lock()
+	defer s.pendingMu.Unlock()
+	s.pending[string(txn)] = struct{}{}
+}
+
+func (s *IntentStore) clearPending(txn coordination.TXN) {
+	s.pendingMu.Lock()
+	defer s.pendingMu.Unlock()
+	delete(s.pending, string(txn))
+}
+
+func (s *IntentStore) addPending(
+	ctx context.Context,
+	txn coordination.TXN,
+) error {
+	if err := s.updatePendingIndex(ctx, txn, true); err != nil {
+		if errors.Is(err, allocator.ErrConditionalUnknown) {
+			s.markPending(txn)
+		}
+		return err
+	}
+	s.markPending(txn)
+	return nil
+}
+
+func (s *IntentStore) removePending(
+	ctx context.Context,
+	txn coordination.TXN,
+) error {
+	if err := s.updatePendingIndex(ctx, txn, false); err != nil {
+		return err
+	}
+	s.clearPending(txn)
+	return nil
+}
+
+func (s *IntentStore) updatePendingIndex(
+	ctx context.Context,
+	txn coordination.TXN,
+	add bool,
+) error {
+	if err := txn.Validate(); err != nil {
+		return errors.Join(transaction.ErrInvalid, err)
+	}
+	for attempt := 0; attempt <= 7; attempt++ {
+		index, encoded, found, err := s.readPendingIndex(ctx)
+		if err != nil {
+			return err
+		}
+		position, present := s.pendingIndexPosition(index.TXNs, txn)
+		if present == add {
+			return nil
+		}
+		next := pendingIntentIndex{
+			Version:    pendingIndexVersion,
+			Generation: 1,
+			TXNs:       cloneTXNs(index.TXNs),
+		}
+		if found {
+			if index.Generation == math.MaxInt64 {
+				return errors.Join(
+					transaction.ErrInvalid,
+					errors.New("pending intent index generation is exhausted"),
+				)
+			}
+			next.Generation = index.Generation + 1
+		}
+		if add {
+			if len(next.TXNs) >= coordination.MaxActiveReservations {
+				return allocator.ErrWindowFull
+			}
+			next.TXNs = append(next.TXNs, nil)
+			copy(next.TXNs[position+1:], next.TXNs[position:])
+			next.TXNs[position] = append(coordination.TXN(nil), txn...)
+		} else {
+			next.TXNs = append(next.TXNs[:position], next.TXNs[position+1:]...)
+		}
+		nextEncoded, err := json.Marshal(next)
+		if err != nil {
+			return errors.Join(transaction.ErrInternal, err)
+		}
+		coordinate := s.pendingIndexCoordinate()
+		condition := allocator.Condition{Coordinate: coordinate, Absent: true}
+		if found {
+			condition = allocator.Condition{
+				Coordinate:   coordinate,
+				Value:        encoded,
+				Timestamp:    index.Generation,
+				TimestampSet: true,
+			}
+		}
+		status, writeErr := s.store.CompareAndMutate(ctx, allocator.Mutation{
+			Row:        coordinate.Row,
+			Conditions: []allocator.Condition{condition},
+			Updates: []allocator.Update{{
+				Coordinate: coordinate,
+				Value:      nextEncoded,
+				Timestamp:  next.Generation,
+			}},
+		})
+		if status == allocator.StatusAccepted {
+			return nil
+		}
+		observed, _, observedFound, readErr := s.readPendingIndex(ctx)
+		if readErr != nil {
+			if errors.Is(writeErr, allocator.ErrConditionalUnknown) {
+				return errors.Join(
+					transaction.ErrUnavailable,
+					allocator.ErrConditionalUnknown,
+					writeErr,
+					readErr,
+				)
+			}
+			return errors.Join(transaction.ErrUnavailable, writeErr, readErr)
+		}
+		_, observedPresent := s.pendingIndexPosition(observed.TXNs, txn)
+		if observedFound &&
+			observed.Generation == next.Generation &&
+			observedPresent == add {
+			return nil
+		}
+		if status == allocator.StatusUnknown {
+			return errors.Join(
+				transaction.ErrUnavailable,
+				allocator.ErrConditionalUnknown,
+				writeErr,
+			)
+		}
+	}
+	return transaction.ErrConflict
+}
+
+func (s *IntentStore) readPendingIndex(
+	ctx context.Context,
+) (pendingIntentIndex, []byte, bool, error) {
+	coordinate := s.pendingIndexCoordinate()
+	cells, err := s.store.ReadExact(ctx, []allocator.Coordinate{coordinate})
+	if err != nil {
+		return pendingIntentIndex{}, nil, false, errors.Join(transaction.ErrUnavailable, err)
+	}
+	if len(cells) == 0 {
+		return pendingIntentIndex{Version: pendingIndexVersion}, nil, false, nil
+	}
+	if len(cells) != 1 || cells[0].Timestamp < pendingIndexVersion {
+		return pendingIntentIndex{}, nil, false, fmt.Errorf(
+			"%w: pending intent index cell is invalid",
+			transaction.ErrInternal,
+		)
+	}
+	var index pendingIntentIndex
+	if err := json.Unmarshal(cells[0].Value, &index); err != nil {
+		return pendingIntentIndex{}, nil, false, fmt.Errorf(
+			"%w: decode pending intent index: %v",
+			transaction.ErrInternal,
+			err,
+		)
+	}
+	if index.Version != pendingIndexVersion ||
+		index.Generation != cells[0].Timestamp ||
+		index.Generation < 1 ||
+		len(index.TXNs) > coordination.MaxActiveReservations {
+		return pendingIntentIndex{}, nil, false, fmt.Errorf(
+			"%w: pending intent index metadata is invalid",
+			transaction.ErrInternal,
+		)
+	}
+	for position, txn := range index.TXNs {
+		if err := txn.Validate(); err != nil {
+			return pendingIntentIndex{}, nil, false, fmt.Errorf(
+				"%w: pending intent index transaction is invalid",
+				transaction.ErrInternal,
+			)
+		}
+		if position > 0 &&
+			bytes.Compare(
+				s.intentRow(index.TXNs[position-1]),
+				s.intentRow(txn),
+			) >= 0 {
+			return pendingIntentIndex{}, nil, false, fmt.Errorf(
+				"%w: pending intent index is not canonical",
+				transaction.ErrInternal,
+			)
+		}
+	}
+	again, err := json.Marshal(index)
+	if err != nil || !bytes.Equal(again, cells[0].Value) {
+		return pendingIntentIndex{}, nil, false, fmt.Errorf(
+			"%w: pending intent index encoding is not canonical",
+			transaction.ErrInternal,
+		)
+	}
+	return index, append([]byte(nil), cells[0].Value...), true, nil
+}
+
+func (s *IntentStore) pendingIndexPosition(
+	txns []coordination.TXN,
+	txn coordination.TXN,
+) (int, bool) {
+	row := s.intentRow(txn)
+	position := sort.Search(len(txns), func(i int) bool {
+		return bytes.Compare(s.intentRow(txns[i]), row) >= 0
+	})
+	return position, position < len(txns) && bytes.Equal(txns[position], txn)
+}
+
+func (s *IntentStore) pendingIndexCoordinate() allocator.Coordinate {
+	row := append([]byte(nil), pendingIndexRow...)
+	row = append(row, coordination.E(s.domain)...)
+	return allocator.Coordinate{
+		Row:        row,
+		Family:     append([]byte(nil), intentFamily...),
+		Qualifier:  append([]byte(nil), pendingIndexCQ...),
+		Visibility: append([]byte(nil), s.visibility...),
+	}
+}
+
+func cloneTXNs(txns []coordination.TXN) []coordination.TXN {
+	result := make([]coordination.TXN, len(txns))
+	for index, txn := range txns {
+		result[index] = append(coordination.TXN(nil), txn...)
+	}
+	return result
 }
 
 func (s *IntentStore) Materialize(
@@ -607,13 +875,13 @@ func (s *IntentStore) attemptCoordinate(key []byte) (allocator.Coordinate, error
 func (s *IntentStore) ensurePending(
 	ctx context.Context,
 	record storedIntent,
-) error {
+) (bool, error) {
 	if _, complete, err := s.Completed(
 		ctx, record.TXN, record.LogicalDigest,
 	); err != nil {
-		return err
+		return false, err
 	} else if complete {
-		return nil
+		return false, nil
 	}
 	coordinate := s.pendingCoordinate(record.TXN)
 	mutation := allocator.Mutation{
@@ -626,20 +894,20 @@ func (s *IntentStore) ensurePending(
 	}
 	status, writeErr := s.store.CompareAndMutate(ctx, mutation)
 	if status == allocator.StatusAccepted {
-		return nil
+		return true, nil
 	}
 	cells, readErr := s.store.ReadExact(ctx, []allocator.Coordinate{coordinate})
 	if readErr != nil {
-		return errors.Join(transaction.ErrUnavailable, writeErr, readErr)
+		return false, errors.Join(transaction.ErrUnavailable, writeErr, readErr)
 	}
 	if len(cells) == 1 && cells[0].Timestamp == intentVersion &&
 		bytes.Equal(cells[0].Value, record.LogicalDigest[:]) {
-		return nil
+		return true, nil
 	}
 	if status == allocator.StatusRejected {
-		return transaction.ErrConflict
+		return false, transaction.ErrConflict
 	}
-	return errors.Join(transaction.ErrUnavailable, allocator.ErrConditionalUnknown, writeErr)
+	return false, errors.Join(transaction.ErrUnavailable, allocator.ErrConditionalUnknown, writeErr)
 }
 
 func (s *IntentStore) Settle(
@@ -653,11 +921,14 @@ func (s *IntentStore) Settle(
 		return errors.Join(transaction.ErrUnavailable, err)
 	}
 	if len(cells) == 0 {
-		return nil
+		return s.removePending(ctx, txn)
 	}
 	if len(cells) != 1 || cells[0].Timestamp != intentVersion ||
 		!bytes.Equal(cells[0].Value, logicalDigest[:]) {
 		return fmt.Errorf("%w: pending intent marker is invalid", transaction.ErrInternal)
+	}
+	if err := s.removePending(ctx, txn); err != nil {
+		return err
 	}
 	mutation := allocator.Mutation{
 		Row: coordinate.Row,

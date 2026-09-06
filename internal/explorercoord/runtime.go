@@ -292,7 +292,15 @@ func Open(config Config) (*Runtime, error) {
 	if err := runtime.compose(config, physicalWriter); err != nil {
 		return closeOnError(err)
 	}
-	if !config.DisableRecoveryOnOpen {
+	if config.DisableRecoveryOnOpen {
+		if err := runtime.intents.IndexPending(
+			context.Background(),
+			config.RecoveryLimit,
+			config.RecoveryMaxPages,
+		); err != nil {
+			return closeOnError(err)
+		}
+	} else {
 		if err := runtime.Recover(context.Background()); err != nil {
 			return closeOnError(err)
 		}
@@ -738,11 +746,10 @@ func (r *Runtime) PendingPublications(
 	if r.closed {
 		return false, transaction.ErrUnavailable
 	}
-	candidates, _, err := r.intents.Candidates(ctx, nil, 1)
-	if err != nil {
+	if err := ctx.Err(); err != nil {
 		return false, err
 	}
-	return len(candidates) != 0, nil
+	return r.intents.HasPending(), nil
 }
 
 func (r *Runtime) bindRecordAttempt(
@@ -823,13 +830,13 @@ func intentContainsRecordCell(
 // RecoverPage processes one bounded page of durable intents and transaction
 // roots. Callers may resume by invoking it again while more is true.
 func (r *Runtime) RecoverPage(ctx context.Context) (more bool, err error) {
-	r.recoveryMu.Lock()
-	defer r.recoveryMu.Unlock()
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	if r.closed {
 		return false, transaction.ErrUnavailable
 	}
+	r.recoveryMu.Lock()
+	defer r.recoveryMu.Unlock()
 	candidates, next, err := r.intents.Candidates(
 		ctx, r.intentCursor, r.recoveryLimit,
 	)
@@ -892,7 +899,13 @@ func (r *Runtime) Recover(ctx context.Context) error {
 
 func (r *Runtime) recoverIntent(ctx context.Context, txn coordination.TXN) error {
 	record, err := r.intents.Load(ctx, txn)
+	if errors.Is(err, transaction.ErrNotFound) {
+		return r.intents.removePending(ctx, txn)
+	}
 	if err != nil {
+		return err
+	}
+	if err := r.validateIntentTables(record.Intent); err != nil {
 		return err
 	}
 	if _, complete, err := r.intents.Completed(ctx, txn, record.LogicalDigest); err != nil {

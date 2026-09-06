@@ -1163,6 +1163,7 @@ func TestExplorerLoadHidesUncommittedAndPoisonedPhysicalRevision(t *testing.T) {
 
 	config.testStageHook = nil
 	config.DisableRecoveryOnOpen = true
+	config.PhysicalTables = append(config.PhysicalTables, explorer.EmbeddedTableName)
 	runtime, err := Open(config)
 	if err != nil {
 		t.Fatal(err)
