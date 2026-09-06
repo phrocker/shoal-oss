@@ -28,21 +28,7 @@ import (
 )
 
 type mutableGovernedOntologySource struct {
-	active        ontology.OntologyVersion
-	configured    bool
-	proposals     []ontology.GovernedProposal
-	activeCalls   int
-	changeOnCheck *ontology.OntologyVersion
-}
-
-func (s *mutableGovernedOntologySource) ActiveOntology(
-	context.Context,
-) (ontology.OntologyVersion, bool, error) {
-	s.activeCalls++
-	if s.activeCalls > 1 && s.changeOnCheck != nil {
-		return *s.changeOnCheck, true, nil
-	}
-	return s.active, s.configured, nil
+	proposals []ontology.GovernedProposal
 }
 
 func (s *mutableGovernedOntologySource) OntologyProposals(
@@ -54,10 +40,9 @@ func (s *mutableGovernedOntologySource) OntologyProposals(
 func TestGovernedOntologyChoicesUsesLivePublishedAncestry(t *testing.T) {
 	first, second, third, published := governedOntologyFixture(t)
 	source := &mutableGovernedOntologySource{
-		active: second, configured: true,
 		proposals: []ontology.GovernedProposal{published},
 	}
-	choices, err := NewGovernedOntologyChoices(source)
+	choices, err := NewGovernedOntologyChoices(&first, source)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -84,9 +69,7 @@ func TestGovernedOntologyChoicesUsesLivePublishedAncestry(t *testing.T) {
 		t.Fatalf("unpublished choice error = %v", err)
 	}
 
-	source.active = first
 	source.proposals = nil
-	source.activeCalls = 0
 	listed, err = choices.ListOntologyChoices(
 		context.Background(), auth.Decision{})
 	if err != nil {
@@ -98,20 +81,19 @@ func TestGovernedOntologyChoicesUsesLivePublishedAncestry(t *testing.T) {
 	}
 }
 
-func TestGovernedOntologyChoicesRejectsMovingActiveSnapshot(t *testing.T) {
-	first, second, _, _ := governedOntologyFixture(t)
-	source := &mutableGovernedOntologySource{
-		active: first, configured: true,
-		changeOnCheck: &second,
-	}
-	choices, err := NewGovernedOntologyChoices(source)
+func TestGovernedOntologyChoicesWithoutConfiguredRootIsEmpty(t *testing.T) {
+	source := &mutableGovernedOntologySource{}
+	choices, err := NewGovernedOntologyChoices(nil, source)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := choices.ListOntologyChoices(
-		context.Background(), auth.Decision{},
-	); !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
-		t.Fatalf("moving active snapshot error = %v", err)
+	listed, err := choices.ListOntologyChoices(
+		context.Background(), auth.Decision{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(listed) != 0 {
+		t.Fatalf("unconfigured choices = %#v", listed)
 	}
 }
 
