@@ -158,8 +158,11 @@ func (b *reportingVectorBackend) eventForDocuments(
 		return event, documents
 	}
 	for _, identity := range identities {
+		event.Attempted = append(event.Attempted, identity)
 		if b.unavailable[identity] {
 			event.Unavailable = append(event.Unavailable, identity)
+		} else {
+			event.Completed = append(event.Completed, identity)
 		}
 	}
 	if cacheHit {
@@ -409,6 +412,35 @@ func TestAuthorizedUnavailableAndFanoutReportsAreHonest(t *testing.T) {
 		}
 		if !reflect.DeepEqual(callback, *report.Embedding) {
 			t.Fatalf("unavailable callback = %+v, report = %+v", callback, report.Embedding)
+		}
+	})
+
+	t.Run("partial completion", func(t *testing.T) {
+		f := newEmbeddingReportFixture(t)
+		f.ingest(
+			t, f.clientA, f.admin(t),
+			"file:///available-vector.txt", "available vector evidence",
+			publicSpaceIdentity,
+		)
+		f.ingest(
+			t, f.clientB, f.admin(t),
+			"file:///later-unavailable-vector.txt", "later unavailable vector evidence",
+			hiddenSpaceIdentity,
+		)
+		f.backend.unavailable[hiddenSpaceIdentity] = true
+		_, report, err := f.clientA.RetrieveWithReport(
+			f.admin(t), vectorQuery("partial vector"))
+		if !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
+			t.Fatalf("partial completion error = %v", err)
+		}
+		statuses := map[authorized.EmbeddingSpaceStatus]int{}
+		for _, space := range report.Embedding.Spaces {
+			statuses[space.Status]++
+		}
+		if statuses[authorized.EmbeddingSpaceAvailable] != 1 ||
+			statuses[authorized.EmbeddingSpaceUnavailable] != 1 ||
+			len(statuses) != 2 {
+			t.Fatalf("partial completion statuses = %+v", report.Embedding)
 		}
 	})
 

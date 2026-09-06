@@ -122,6 +122,8 @@ type persistedEdge struct {
 // vector bytes, provider credentials, or source content.
 type EmbeddingQueryEvent struct {
 	SpaceIdentities []string
+	Attempted       []string
+	Completed       []string
 	FanoutLimit     int
 	CacheHits       int
 	ProviderCalls   int
@@ -167,6 +169,8 @@ func ReportEmbeddingQueryEvent(ctx context.Context, event EmbeddingQueryEvent) {
 
 func cloneEmbeddingQueryEvent(event EmbeddingQueryEvent) EmbeddingQueryEvent {
 	event.SpaceIdentities = append([]string(nil), event.SpaceIdentities...)
+	event.Attempted = append([]string(nil), event.Attempted...)
+	event.Completed = append([]string(nil), event.Completed...)
 	event.Unavailable = append([]string(nil), event.Unavailable...)
 	return event
 }

@@ -555,10 +555,18 @@ func (e *Explorer) embedQueriesForSpaces(
 	}
 
 	if len(keys) == 0 {
+		identity, identityErr := e.embeddingIdentity()
+		if identityErr == nil {
+			event.SpaceIdentities = []string{identity}
+			event.Attempted = append(event.Attempted, identity)
+		}
 		provenance, _, cacheHit, providerCalled, err :=
 			e.cachedEmbedQuery(ctx, text)
 		if provenance.Identity != "" {
 			event.SpaceIdentities = []string{provenance.Identity}
+			if len(event.Attempted) == 0 {
+				event.Attempted = append(event.Attempted, provenance.Identity)
+			}
 		}
 		if cacheHit {
 			event.CacheHits++
@@ -567,13 +575,16 @@ func (e *Explorer) embedQueriesForSpaces(
 			event.ProviderCalls++
 		}
 		if err != nil {
-			if identity, identityErr := e.embeddingIdentity(); identityErr == nil {
+			if identityErr == nil {
 				event.SpaceIdentities = []string{identity}
 				if shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
 					event.Unavailable = []string{identity}
 				}
 			}
 			return nil, nil, event, err
+		}
+		if provenance.Identity != "" {
+			event.Completed = append(event.Completed, provenance.Identity)
 		}
 		return map[string][]float32{}, nil, event, nil
 	}
@@ -582,6 +593,7 @@ func (e *Explorer) embedQueriesForSpaces(
 	participating := make([]persistedEmbeddingProvenance, 0, len(keys))
 	for _, identity := range keys {
 		space := spaces[identity]
+		event.Attempted = append(event.Attempted, identity)
 		_, vector, cacheHit, providerCalled, err :=
 			e.cachedEmbedQueryInSpace(ctx, text, space)
 		if cacheHit {
@@ -596,6 +608,7 @@ func (e *Explorer) embedQueriesForSpaces(
 			}
 			return nil, nil, event, err
 		}
+		event.Completed = append(event.Completed, identity)
 		vectors[identity] = vector
 		participating = append(participating, space)
 	}

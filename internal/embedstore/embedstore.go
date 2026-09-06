@@ -265,6 +265,9 @@ func (s *EngineStore) Scan(ctx context.Context, table string, req *embedpb.ScanR
 	if table == "" {
 		return nil, errors.New("embedstore: table is required")
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	sc, err := s.ScannerContext(ctx, table, req)
 	if err != nil {
 		return nil, err

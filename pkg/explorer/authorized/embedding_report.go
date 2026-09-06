@@ -117,6 +117,8 @@ func cloneEmbeddingQueryReport(report EmbeddingQueryReport) EmbeddingQueryReport
 type embeddingQueryCollector struct {
 	mu             sync.Mutex
 	spaces         map[string]struct{}
+	attempted      map[string]struct{}
+	completed      map[string]struct{}
 	unavailable    map[string]struct{}
 	fanoutLimit    uint64
 	cacheHits      uint64
@@ -129,6 +131,8 @@ type embeddingQueryCollector struct {
 func newEmbeddingQueryCollector() *embeddingQueryCollector {
 	return &embeddingQueryCollector{
 		spaces:      make(map[string]struct{}),
+		attempted:   make(map[string]struct{}),
+		completed:   make(map[string]struct{}),
 		unavailable: make(map[string]struct{}),
 	}
 }
@@ -164,6 +168,26 @@ func (c *embeddingQueryCollector) observe(event explorer.EmbeddingQueryEvent) {
 		}
 		c.spaces[identity] = struct{}{}
 		c.unavailable[identity] = struct{}{}
+	}
+	for _, identity := range event.Attempted {
+		if identity == "" {
+			c.invalid = true
+			continue
+		}
+		c.spaces[identity] = struct{}{}
+		c.attempted[identity] = struct{}{}
+	}
+	for _, identity := range event.Completed {
+		if identity == "" {
+			c.invalid = true
+			continue
+		}
+		c.spaces[identity] = struct{}{}
+		c.attempted[identity] = struct{}{}
+		c.completed[identity] = struct{}{}
+		if _, unavailable := c.unavailable[identity]; unavailable {
+			c.invalid = true
+		}
 	}
 	if c.cacheHits > math.MaxUint32 ||
 		c.providerCalls > math.MaxUint32 ||
@@ -225,6 +249,14 @@ func (c *embeddingQueryCollector) report(
 		status := EmbeddingSpaceAvailable
 		if _, unavailable := c.unavailable[identity]; unavailable {
 			status = EmbeddingSpaceUnavailable
+		} else if _, completed := c.completed[identity]; completed {
+			status = EmbeddingSpaceAvailable
+		} else if len(c.attempted) > 0 {
+			if _, attempted := c.attempted[identity]; attempted {
+				status = EmbeddingSpaceNotCompleted
+			} else {
+				status = EmbeddingSpaceNotAttempted
+			}
 		} else if c.fanoutExceeded {
 			status = EmbeddingSpaceNotAttempted
 		} else if requestErr != nil {

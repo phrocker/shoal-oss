@@ -604,7 +604,9 @@ func TestUnavailableEmbeddingSpaceIsNamedAndObservable(t *testing.T) {
 		t.Fatalf("unavailable space error = %v", err)
 	}
 	if len(events) != 1 || events[0].ProviderCalls != 2 ||
-		fmt.Sprint(events[0].Unavailable) != "[space-b]" {
+		fmt.Sprint(events[0].Unavailable) != "[space-b]" ||
+		fmt.Sprint(events[0].Attempted) != "[space-a space-b]" ||
+		fmt.Sprint(events[0].Completed) != "[space-a]" {
 		t.Fatalf("unavailable events = %+v", events)
 	}
 }

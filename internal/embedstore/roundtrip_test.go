@@ -79,6 +79,34 @@ func TestScannerContextCancelsEmbeddingMetadataRead(t *testing.T) {
 	}
 }
 
+func TestScanAcceptsNilContext(t *testing.T) {
+	eng, err := engine.Open(t.TempDir(), engine.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close()
+	store := embedstore.New(eng)
+	if err := store.CreateTable(context.Background(), "rows", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Write(context.Background(), "rows", []*embedpb.Mutation{{
+		Row: []byte("row"),
+		Entries: []*embedpb.Entry{{
+			ColumnFamily: []byte("cf"),
+			Value:        []byte("value"),
+		}},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	cells, err := store.Scan(nil, "rows", &embedpb.ScanRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cells) != 1 {
+		t.Fatalf("cells = %d, want 1", len(cells))
+	}
+}
+
 func TestAgentmemRoundTripExportImport(t *testing.T) {
 	ctx := context.Background()
 	srcDir := filepath.Join(t.TempDir(), "src")
