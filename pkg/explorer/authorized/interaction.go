@@ -69,6 +69,9 @@ func (c *Client) AnalyticsInteractionSink() interaction.ResultSink {
 	if isNilDependency(c.snapshotValidator) {
 		return nil
 	}
+	if _, ok := c.snapshotValidator.(EvidenceSnapshotValidator); !ok {
+		return nil
+	}
 	return operationInteractionSink{
 		client: c, operation: auth.OperationAnalyticsRead,
 	}
@@ -556,6 +559,7 @@ func (c *Client) InteractionRecord(
 			shoal.IsErrorCode(err, shoal.ErrorNotFound) {
 			return explorer.InteractionRecord{}, auth.ObjectNotFound()
 		}
+		return explorer.InteractionRecord{}, err
 	}
 	if err := guard.Check(ctx); err != nil {
 		return explorer.InteractionRecord{}, err

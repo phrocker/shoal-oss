@@ -683,6 +683,12 @@ func (e *Explorer) Connect(ctx context.Context, edge graph.Edge) error {
 	if err := validatePersistedEdge(edge); err != nil {
 		return err
 	}
+	if interaction.IsInteractionID(edge.ID) {
+		return shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			"applications cannot use the reserved interaction edge ID namespace",
+		)
+	}
 	if interaction.IsInteractionEdgeType(edge.Type) {
 		return shoal.NewError(
 			shoal.ErrorInvalidArgument,
