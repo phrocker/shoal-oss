@@ -145,6 +145,30 @@ func TestAnalyticsRecorderReauthorizesExtractedRelationshipEvidence(t *testing.T
 	if counted.calls != 2 {
 		t.Fatalf("analytics documents scans = %d, want 2", counted.calls)
 	}
+	readDecision := f.decision(
+		t,
+		"analytics-reader",
+		[][]byte{f.sourceA},
+		[][]byte{f.policyA},
+		[]auth.Operation{auth.OperationRead},
+	)
+	readContext := f.context(t, readDecision)
+	counted.calls = 0
+	if _, err := client.InteractionRecords(readContext); err != nil {
+		t.Fatal(err)
+	}
+	if counted.calls != 1 {
+		t.Fatalf("analytics list documents scans = %d, want 1", counted.calls)
+	}
+	counted.calls = 0
+	if _, err := client.Interaction(
+		readContext, result.Recording.InteractionID,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if counted.calls != 1 {
+		t.Fatalf("analytics point documents scans = %d, want 1", counted.calls)
+	}
 }
 
 func TestAnalyticsForgedSinkResultIsIndeterminate(t *testing.T) {
@@ -198,6 +222,60 @@ func TestAnalyticsForgedSinkResultIsIndeterminate(t *testing.T) {
 	})
 	if !explorer.IsIndeterminateCommit(err) {
 		t.Fatalf("forged analytics result error = %v", err)
+	}
+}
+
+func TestAnalyticsCommittedSinkFailureIsIndeterminate(t *testing.T) {
+	f := newFixture(t)
+	document := ingestAuthorizedSkill(
+		t, f.clientA, f.admin(t), "analytics-committed", "bounded")
+	view, err := f.clientA.Document(
+		f.alice(t), document.Document.ID, document.Revision.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := f.base.Snapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.clock.Set(snapshot.AsOf.Add(time.Second))
+	wrapped := &committedFailureInteractionBase{Explorer: f.base}
+	client := f.newClient(
+		t, wrapped, f.store, f.sourceA, f.policyA, nil)
+	decision := f.decision(
+		t,
+		"analytics-committed",
+		[][]byte{f.sourceA},
+		[][]byte{f.policyA},
+		[]auth.Operation{auth.OperationAnalyticsRead},
+	)
+	ctx := f.context(t, decision)
+	shared, err := interaction.NewRecorder(
+		context.Background(), client.AnalyticsInteractionSink())
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder, err := analytics.NewInteractionRecorder(shared, f.clock.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service, err := analytics.NewService(analytics.Config{
+		Source: client, Limits: analytics.DefaultLimits(),
+		Recorder: recorder, RequireRecording: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = service.Run(ctx, analytics.Request{
+		Scope: analytics.Scope{
+			NodeIDs: []shoal.ID{firstSpanID(t, view)},
+			Depth:   1, Direction: explorer.GraphDirectionBoth,
+			Fanout: 4, MaxNodes: 8, MaxEdges: 8,
+			MaxScannedEdgesPerNode: 16,
+		},
+	})
+	if !explorer.IsIndeterminateCommit(err) {
+		t.Fatalf("committed analytics sink error = %v", err)
 	}
 }
 

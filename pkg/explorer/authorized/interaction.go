@@ -219,7 +219,12 @@ func (c *Client) recordInteractionForOperation(
 		err = writer.RecordInteraction(ctx, canonical)
 	}
 	if err != nil {
-		return interaction.Session{}, directBaseError(err)
+		mapped := directBaseError(err)
+		if explorer.IsCommittedInteraction(err) {
+			return interaction.Session{},
+				postCommitInteractionError(operation, mapped)
+		}
+		return interaction.Session{}, mapped
 	}
 	if err := guard.Check(ctx); err != nil {
 		return interaction.Session{}, postCommitInteractionError(
@@ -301,6 +306,8 @@ func (c *Client) InteractionRecords(
 		return nil, err
 	}
 	visible := make([]explorer.InteractionRecord, 0, len(records))
+	evidenceContext := ctx
+	evidenceContextIndexed := false
 	for _, record := range records {
 		if record.Summary.Deleted {
 			if summaryFingerprintMatchesDecision(record.Summary, decision) {
@@ -325,8 +332,16 @@ func (c *Client) InteractionRecords(
 			}
 		}
 		if evidenceErr == nil && (analytics || hasExactEvidence) {
+			if !evidenceContextIndexed {
+				evidenceContext, evidenceErr =
+					c.withCanonicalDocumentIndex(ctx)
+				evidenceContextIndexed = evidenceErr == nil
+			}
+		}
+		if evidenceErr == nil && (analytics || hasExactEvidence) {
 			_, evidenceErr = c.authorizeInteractionEvidence(
-				ctx, record.Session, decision, auth.OperationRead, now)
+				evidenceContext, record.Session,
+				decision, auth.OperationRead, now)
 		} else if evidenceErr == nil {
 			var allowed bool
 			allowed, evidenceErr = interactionSourcesAllow(
@@ -380,14 +395,19 @@ func (c *Client) InteractionRecord(
 		if !summaryFingerprintMatchesDecision(record.Summary, decision) {
 			return explorer.InteractionRecord{}, auth.ObjectNotFound()
 		}
-	} else if _, err := c.authorizeInteractionEvidence(
-		ctx, record.Session, decision, auth.OperationRead, now,
-	); err != nil {
-		if shoal.IsErrorCode(err, shoal.ErrorUnauthorized) ||
-			shoal.IsErrorCode(err, shoal.ErrorNotFound) {
-			return explorer.InteractionRecord{}, auth.ObjectNotFound()
+	} else {
+		ctx, err = c.withCanonicalDocumentIndex(ctx)
+		if err == nil {
+			_, err = c.authorizeInteractionEvidence(
+				ctx, record.Session, decision, auth.OperationRead, now)
 		}
-		return explorer.InteractionRecord{}, err
+		if err != nil {
+			if shoal.IsErrorCode(err, shoal.ErrorUnauthorized) ||
+				shoal.IsErrorCode(err, shoal.ErrorNotFound) {
+				return explorer.InteractionRecord{}, auth.ObjectNotFound()
+			}
+			return explorer.InteractionRecord{}, err
+		}
 	}
 	if err := guard.Check(ctx); err != nil {
 		return explorer.InteractionRecord{}, err
@@ -447,6 +467,10 @@ func (c *Client) InteractionSubgraph(
 	if len(record.TouchedNodeIDs) == 0 &&
 		!summaryFingerprintMatchesDecision(record.Summary, decision) {
 		return explorer.Neighborhood{}, auth.ObjectNotFound()
+	}
+	ctx, err = c.withCanonicalDocumentIndex(ctx)
+	if err != nil {
+		return explorer.Neighborhood{}, err
 	}
 	if _, err := c.authorizeInteractionEvidence(
 		ctx, record.Session, decision, auth.OperationRead, now,
