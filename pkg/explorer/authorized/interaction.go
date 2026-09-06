@@ -38,11 +38,11 @@ import (
 // privileged action recorders. It still requires a live credential that grants
 // something, because the base sink probe is a durable write.
 func (c *Client) EnsureInteractionSink(ctx context.Context) error {
-	writer, err := c.interactionWriter()
+	guard, err := c.beginAny(ctx)
 	if err != nil {
 		return err
 	}
-	guard, err := c.beginAny(ctx)
+	writer, err := c.interactionWriter()
 	if err != nil {
 		return err
 	}
