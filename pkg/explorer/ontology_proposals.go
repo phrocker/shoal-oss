@@ -406,6 +406,30 @@ func (e *Explorer) TransitionOntologyProposal(
 	actor, note string,
 	at time.Time,
 ) (ontology.GovernedProposal, error) {
+	return e.transitionOntologyProposal(ctx, proposalID, next, actor, note, at, nil)
+}
+
+// TransitionOntologyProposalWithLimits validates the prospective response
+// under the same lock as the transition, without narrowing the domain API.
+func (e *Explorer) TransitionOntologyProposalWithLimits(
+	ctx context.Context,
+	proposalID shoal.ID,
+	next ontology.ProposalState,
+	actor, note string,
+	at time.Time,
+	limits OntologyProjectionLimits,
+) (ontology.GovernedProposal, error) {
+	return e.transitionOntologyProposal(ctx, proposalID, next, actor, note, at, &limits)
+}
+
+func (e *Explorer) transitionOntologyProposal(
+	ctx context.Context,
+	proposalID shoal.ID,
+	next ontology.ProposalState,
+	actor, note string,
+	at time.Time,
+	limits *OntologyProjectionLimits,
+) (ontology.GovernedProposal, error) {
 	if err := contextError(ctx); err != nil {
 		return ontology.GovernedProposal{}, err
 	}
@@ -479,6 +503,11 @@ func (e *Explorer) TransitionOntologyProposal(
 	updated, err := current.Transition(next, actor, note, at)
 	if err != nil {
 		return ontology.GovernedProposal{}, err
+	}
+	if limits != nil {
+		if err := limits.ValidateProposal(updated); err != nil {
+			return ontology.GovernedProposal{}, err
+		}
 	}
 	if len(record.transitions) == math.MaxUint32 {
 		return ontology.GovernedProposal{}, shoal.NewError(

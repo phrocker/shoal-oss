@@ -614,8 +614,16 @@ func (s *EmbeddedService) TransitionOntologyProposal(
 			)
 		}
 	}
-	proposal, err := store.TransitionOntologyProposal(
-		ctx, proposalID, next, ontologyActor(ctx), request.Note, s.now())
+	bounded, ok := store.(explorer.OntologyProposalBoundedTransitionStore)
+	if !ok {
+		return ontology.GovernedProposal{}, shoal.NewError(
+			shoal.ErrorUnavailable,
+			"workspace capability \"bounded ontology proposal transitions\" is unavailable",
+		)
+	}
+	proposal, err := bounded.TransitionOntologyProposalWithLimits(
+		ctx, proposalID, next, ontologyActor(ctx), request.Note, s.now(),
+		ontologyProjectionLimits())
 	if err != nil {
 		return ontology.GovernedProposal{}, err
 	}
@@ -704,7 +712,7 @@ func createOntologyProposalFor(
 	}
 	projected, err := projectOntologyProposalForMutation(proposal)
 	if err != nil {
-		return OntologyProposalResponse{}, err
+		return OntologyProposalResponse{}, explorer.MarkIndeterminateCommit(err)
 	}
 	return OntologyProposalResponse{Proposal: projected}, nil
 }
@@ -726,7 +734,7 @@ func transitionOntologyProposalFor(
 	}
 	projected, err := projectOntologyProposalForMutation(proposal)
 	if err != nil {
-		return OntologyProposalResponse{}, err
+		return OntologyProposalResponse{}, explorer.MarkIndeterminateCommit(err)
 	}
 	return OntologyProposalResponse{Proposal: projected}, nil
 }
@@ -781,14 +789,10 @@ func projectOntologyProposalWithEvidence(
 	if err := proposal.Validate(); err != nil {
 		return OntologyProposalProjection{}, err
 	}
-	if err := enforceOntologyBounds(proposal.ProposedVersion()); err != nil {
+	if err := ontologyProjectionLimits().ValidateProposal(proposal); err != nil {
 		return OntologyProposalProjection{}, err
 	}
 	transitions := proposal.Transitions()
-	if uint32(len(transitions)) > MaxOntologyProposalTransitions {
-		return OntologyProposalProjection{}, ontologyBoundError(
-			"proposal transition", len(transitions), MaxOntologyProposalTransitions)
-	}
 	proposed, err := projectOntology(proposal.ProposedVersion())
 	if err != nil {
 		return OntologyProposalProjection{}, err
@@ -817,10 +821,6 @@ func projectOntologyProposalWithEvidence(
 	}
 	for _, morphism := range proposal.Morphisms() {
 		evidence := morphism.Evidence()
-		if uint32(len(evidence)) > MaxEvidencePerResult {
-			return OntologyProposalProjection{}, ontologyBoundError(
-				"morphism evidence", len(evidence), MaxEvidencePerResult)
-		}
 		evidenceIDs := make([]string, len(evidence))
 		evidenceProjected := make([]OntologyMorphismEvidenceProjection, 0)
 		for index, item := range evidence {
@@ -844,13 +844,6 @@ func projectOntologyProposalWithEvidence(
 		if morphism.Kind() == ontology.MorphismSplit {
 			value := morphism.Discriminator()
 			choices := value.Choices()
-			if uint32(len(choices)) > MaxOntologyConcepts {
-				return OntologyProposalProjection{}, ontologyBoundError(
-					"morphism discriminator choice",
-					len(choices),
-					MaxOntologyConcepts,
-				)
-			}
 			projectedChoices := make(map[string]string, len(choices))
 			for choice, id := range choices {
 				projectedChoices[choice] = encodeID(id)

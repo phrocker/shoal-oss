@@ -89,6 +89,12 @@ selection are intentionally tracked separately and are not claimed here.
   authorized for every cited revision and path object. Proposal reads expose
   full evidence only when every referenced object is authorized; mutation
   responses retain opaque evidence IDs without returning evidence contents.
+- HTTP transitions enforce their complete response projection bounds under the
+  store's write lock before appending the transition. A domain-valid proposal
+  that exceeds the HTTP evidence, discriminator, or ontology size limits is
+  rejected without changing its state or the active ontology. The lower-level
+  transition API retains its domain bounds. Unexpected projection failures
+  after a provider reports success carry indeterminate-commit semantics.
 - A corpus admits at most 256 durable proposals across all schemas and lifecycle
   states. Admission is checked under the store's write lock before persistence,
   including concurrent requests through different service instances. Identical

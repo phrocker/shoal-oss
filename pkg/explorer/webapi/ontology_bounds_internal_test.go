@@ -211,6 +211,18 @@ func TestOntologyProposalBoundIsAtomicAcrossServices(t *testing.T) {
 }
 
 func TestOntologyProposalProjectionRejectsOversizedDiscriminator(t *testing.T) {
+	proposal, _ := ontologyDiscriminatorBoundProposal(t, MaxOntologyConcepts+1)
+	if _, err := projectOntologyProposal(proposal); !shoal.IsErrorCode(
+		err, shoal.ErrorUnavailable,
+	) {
+		t.Fatalf("oversized discriminator projection = %v", err)
+	}
+}
+
+func ontologyDiscriminatorBoundProposal(
+	t *testing.T, count uint32,
+) (ontology.GovernedProposal, ontology.OntologyVersion) {
+	t.Helper()
 	schema, err := ontology.NewOntologySchema("split", "Split", "", nil)
 	if err != nil {
 		t.Fatal(err)
@@ -227,10 +239,10 @@ func TestOntologyProposalProjectionRejectsOversizedDiscriminator(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	targets := make([]ontology.PropertyDefinition, 0, MaxOntologyConcepts+1)
-	targetIDs := make([]shoal.ID, 0, MaxOntologyConcepts+1)
-	choices := make(map[string]shoal.ID, MaxOntologyConcepts+1)
-	for index := uint32(0); index <= MaxOntologyConcepts; index++ {
+	targets := make([]ontology.PropertyDefinition, 0, count)
+	targetIDs := make([]shoal.ID, 0, count)
+	choices := make(map[string]shoal.ID, count)
+	for index := uint32(0); index < count; index++ {
 		property, err := ontology.NewPropertyDefinition(
 			fmt.Sprintf("target-%03d", index),
 			fmt.Sprintf("Target %03d", index),
@@ -274,14 +286,22 @@ func TestOntologyProposalProjectionRejectsOversizedDiscriminator(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := projectOntologyProposal(proposal); !shoal.IsErrorCode(
-		err, shoal.ErrorUnavailable,
-	) {
-		t.Fatalf("oversized discriminator projection = %v", err)
-	}
+	return proposal, base
 }
 
 func TestOntologyProposalProjectionRejectsOversizedEvidence(t *testing.T) {
+	proposal, _ := ontologyEvidenceBoundProposal(t, MaxEvidencePerResult+1)
+	if _, err := projectOntologyProposal(proposal); !shoal.IsErrorCode(
+		err, shoal.ErrorUnavailable,
+	) {
+		t.Fatalf("oversized evidence projection = %v", err)
+	}
+}
+
+func ontologyEvidenceBoundProposal(
+	t *testing.T, count uint32,
+) (ontology.GovernedProposal, ontology.OntologyVersion) {
+	t.Helper()
 	schema, err := ontology.NewOntologySchema("evidence", "Evidence", "", nil)
 	if err != nil {
 		t.Fatal(err)
@@ -309,8 +329,8 @@ func TestOntologyProposalProjectionRejectsOversizedEvidence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	evidence := make([]ontology.EvidenceRef, 0, MaxEvidencePerResult+1)
-	for index := uint32(0); index <= MaxEvidencePerResult; index++ {
+	evidence := make([]ontology.EvidenceRef, 0, count)
+	for index := uint32(0); index < count; index++ {
 		item, err := ontology.NewEvidenceRef(document.Citation{
 			DocumentID: shoal.ID(fmt.Sprintf("doc-%03d", index)),
 			RevisionID: "rev", SectionID: "section",
@@ -335,11 +355,7 @@ func TestOntologyProposalProjectionRejectsOversizedEvidence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := projectOntologyProposal(proposal); !shoal.IsErrorCode(
-		err, shoal.ErrorUnavailable,
-	) {
-		t.Fatalf("oversized evidence projection = %v", err)
-	}
+	return proposal, base
 }
 
 func TestActiveOntologyDoesNotDependOnProposalBodyReads(t *testing.T) {
