@@ -198,6 +198,9 @@ func (r *Runtime) ScanCommitted(
 		if request.MaxScanned < 1024 {
 			request.MaxScanned = 1024
 		}
+		if request.MaxScanned > MaxCommittedScanCells {
+			request.MaxScanned = MaxCommittedScanCells
+		}
 	}
 	if request.MaxScanned < request.Limit ||
 		request.MaxScanned > MaxCommittedScanCells {

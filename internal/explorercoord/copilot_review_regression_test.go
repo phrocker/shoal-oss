@@ -701,6 +701,28 @@ func TestSuccessfulRecoveryRefreshesPendingCache(t *testing.T) {
 	}
 }
 
+func TestCommittedScanDefaultWorkBoundSupportsMaximumLimit(t *testing.T) {
+	config := testRuntimeConfig(t, testDirectory(t))
+	runtime, err := Open(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.Close()
+	page, err := runtime.ScanCommitted(
+		context.Background(),
+		CommittedScanRequest{
+			Table:     "records",
+			RowPrefix: []byte("missing/"),
+			Family:    []byte("record"),
+			Qualifier: []byte("v1"),
+			Limit:     MaxCommittedScanLimit,
+		},
+	)
+	if err != nil || len(page.Cells) != 0 {
+		t.Fatalf("maximum default committed scan = %#v, %v", page, err)
+	}
+}
+
 type ambiguousIntentStore struct {
 	*EngineStore
 	ambiguous    bool
