@@ -243,6 +243,7 @@ type Materializer interface {
 		context.Context,
 		explorer.BoundedNeighborhoodRequest,
 		uint32,
+		uint64,
 	) (Materialization, error)
 	RevalidateAnalytics(context.Context, Materialization) error
 }
@@ -522,7 +523,7 @@ func (s *Service) Run(ctx context.Context, request Request) (Result, error) {
 			EdgeTypes:       append([]string(nil), normalized.Scope.EdgeTypes...),
 			Direction:       normalized.Scope.Direction,
 		},
-		normalized.Scope.MaxEdges,
+		normalized.Scope.MaxEdges, s.limits.MaxEvidenceBytes,
 	)
 	if err != nil {
 		return Result{}, err

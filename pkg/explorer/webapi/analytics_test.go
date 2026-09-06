@@ -510,6 +510,7 @@ func (s *remoteAnalyticsMaterializer) MaterializeAnalytics(
 	context.Context,
 	explorer.BoundedNeighborhoodRequest,
 	uint32,
+	uint64,
 ) (analytics.Materialization, error) {
 	return s.materialization, nil
 }
@@ -529,6 +530,7 @@ func (*recordlessAnalyticsClient) MaterializeAnalytics(
 	context.Context,
 	explorer.BoundedNeighborhoodRequest,
 	uint32,
+	uint64,
 ) (analytics.Materialization, error) {
 	return analytics.Materialization{}, nil
 }

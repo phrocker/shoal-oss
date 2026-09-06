@@ -532,6 +532,7 @@ func TestAnalyticsInteractionSinkReauthorizesExactEdgeEvidence(t *testing.T) {
 			Direction: explorer.GraphDirectionOutgoing,
 		},
 		4,
+		analytics.HardMaxEvidenceBytes,
 	)
 	if err != nil {
 		t.Fatal(err)
