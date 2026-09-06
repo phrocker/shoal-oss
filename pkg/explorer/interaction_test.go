@@ -21,6 +21,7 @@ package explorer_test
 
 import (
 	"context"
+	"fmt"
 	"strconv"
 	"strings"
 	"testing"
@@ -424,6 +425,76 @@ func TestGeneratedInteractionNodeIDsCannotCollide(t *testing.T) {
 		ctx, collidingID,
 	); err != nil {
 		t.Fatalf("existing interaction was damaged by collision: %v", err)
+	}
+}
+
+func TestOversizedVisibilityPersistsAcrossRestart(t *testing.T) {
+	ctx := context.Background()
+	dataDir := t.TempDir()
+	corpus, err := explorer.Open(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const count = 70
+	var spans []shoal.ID
+	labels := make([]string, count)
+	for index := 0; index < count; index++ {
+		label := fmt.Sprintf(
+			"label-%03d-%s", index, strings.Repeat("x", 56))
+		labels[index] = label
+		visible := ingestVisible(
+			t,
+			corpus,
+			fmt.Sprintf("file:///visibility-%03d.md", index),
+			fmt.Sprintf("# Source %d\n\nvalue %d\n", index, index),
+			label,
+		)
+		spans = append(spans, visible[0])
+	}
+	expected := strings.Join(labels, "&")
+	if len(expected) <= shoal.MaxMetadataValueBytes {
+		t.Fatal("fixture did not exceed the graph metadata value bound")
+	}
+	recordedSession(
+		t, corpus, "session-oversized-visibility", spans, spans[len(spans)-1:])
+	subgraph, err := corpus.InteractionSubgraph(
+		ctx, "session-oversized-visibility")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sessionNode graph.Node
+	for _, node := range subgraph.Nodes {
+		if node.Kind == interaction.KindSession {
+			sessionNode = node
+			break
+		}
+	}
+	if sessionNode.Properties[interaction.PropertyVisibility] != "" ||
+		sessionNode.Properties[interaction.PropertyVisibilityDigest] !=
+			interaction.Digest(expected) ||
+		sessionNode.Properties[interaction.PropertyVisibilityCount] !=
+			strconv.Itoa(count) {
+		t.Fatalf("oversized visibility markers = %+v", sessionNode.Properties)
+	}
+	if err := corpus.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := explorer.Open(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	summaries, err := reopened.Interactions(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(summaries) != 1 {
+		t.Fatalf("reopened summaries = %+v", summaries)
+	}
+	if summaries[0].Visibility != expected {
+		t.Fatalf("reopened visibility length=%d, want %d",
+			len(summaries[0].Visibility), len(expected))
 	}
 }
 

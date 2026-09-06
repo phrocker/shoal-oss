@@ -284,6 +284,28 @@ func TestResponseRejectsDuplicateEvidenceOrderingKey(t *testing.T) {
 	}); !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
 		t.Fatalf("duplicate evidence ordering key error = %v", err)
 	}
+
+}
+
+func TestEmbeddingSpaceSetIDIsCanonicalAndOpaque(t *testing.T) {
+	first, err := retrieval.EmbeddingSpaceSetID("space-b", "space-a", "space-b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := retrieval.EmbeddingSpaceSetID("space-a", "space-b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first == "" || first != second {
+		t.Fatalf("embedding space IDs = %q and %q", first, second)
+	}
+	if strings.Contains(string(first), "space-a") ||
+		strings.Contains(string(first), "space-b") {
+		t.Fatalf("embedding space ID exposes provider identity: %q", first)
+	}
+	if empty, err := retrieval.EmbeddingSpaceSetID(); err != nil || empty != "" {
+		t.Fatalf("empty embedding space set = %q, %v", empty, err)
+	}
 }
 
 func testEvidence(documentID, spanID shoal.ID, score shoal.Score) retrieval.Evidence {

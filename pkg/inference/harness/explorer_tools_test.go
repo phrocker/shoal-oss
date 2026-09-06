@@ -169,7 +169,9 @@ func TestExplorerToolHostAllowsFanoutOneMultiHopPath(t *testing.T) {
 
 func TestExplorerToolHostAllowsEmptyRetrieveResult(t *testing.T) {
 	pack, _, _ := fixture(t)
-	client := &boundedClientStub{}
+	client := &boundedClientStub{retrieveResponse: retrieval.Response{
+		EmbeddingSpaceID: "embedding-space-v3",
+	}}
 	host := &ExplorerToolHost{Client: client}
 	request, err := NewRetrieveRequest("no hits", 1)
 	if err != nil {
@@ -188,6 +190,9 @@ func TestExplorerToolHostAllowsEmptyRetrieveResult(t *testing.T) {
 	}
 	if len(result.Anchors()) != 0 || !client.retrieve.AsOf.Equal(pack.Snapshot().AsOf()) {
 		t.Fatalf("empty retrieve was not pinned and empty: %#v", result)
+	}
+	if result.EmbeddingSpaceID() != "embedding-space-v3" {
+		t.Fatalf("tool result embedding space = %q", result.EmbeddingSpaceID())
 	}
 }
 

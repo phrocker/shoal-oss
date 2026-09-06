@@ -371,6 +371,28 @@ type VisibilityResolver func(shoal.ID) ([]string, error)
 // NodeVisibility reads the declared visibility labels of a graph node. A node
 // with no declared labels is public.
 func NodeVisibility(node graph.Node) ([]string, error) {
+	if node.Properties[PropertyVisibility] == "" &&
+		node.Properties[PropertyVisibilityDigest] != "" {
+		if err := validateDigest(
+			"interaction visibility digest",
+			node.Properties[PropertyVisibilityDigest],
+			false,
+		); err != nil {
+			return nil, err
+		}
+		count, err := strconv.Atoi(node.Properties[PropertyVisibilityCount])
+		if err != nil || count <= 0 {
+			return nil, shoal.NewError(
+				shoal.ErrorInvalidArgument,
+				"interaction visibility count is invalid",
+			)
+		}
+		return nil, shoal.NewError(
+			shoal.ErrorUnavailable,
+			"interaction visibility is digest-only and requires the explicit "+
+				"derived record view",
+		)
+	}
 	return ParseVisibility(node.Properties[PropertyVisibility])
 }
 
@@ -495,6 +517,18 @@ func (s Session) Validate() error {
 			return shoal.NewError(
 				shoal.ErrorInvalidArgument,
 				"interaction authorization expires before its observed snapshot",
+			)
+		}
+		if s.SnapshotAsOf.After(s.RecordedAt) {
+			return shoal.NewError(
+				shoal.ErrorInvalidArgument,
+				"interaction snapshot time is after the recording time",
+			)
+		}
+		if !s.RecordedAt.Before(s.AuthorizationExpiresAt) {
+			return shoal.NewError(
+				shoal.ErrorInvalidArgument,
+				"interaction was recorded after authorization expired",
 			)
 		}
 	}

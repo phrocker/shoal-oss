@@ -22,6 +22,9 @@ package retrieval
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/binary"
+	"encoding/hex"
 	"sort"
 	"strings"
 	"time"
@@ -240,8 +243,9 @@ type Result struct {
 
 // Response is the complete, all-or-error result of one retrieval request.
 type Response struct {
-	RequestID shoal.ID
-	Results   []Result
+	RequestID        shoal.ID
+	EmbeddingSpaceID shoal.ID
+	Results          []Result
 }
 
 // ValidateFor checks result bounds, uniqueness, finite scores, and normative
@@ -254,10 +258,16 @@ func (r Response) ValidateFor(request Request) error {
 	if err := shoal.ValidateOptionalID("retrieval request ID", r.RequestID); err != nil {
 		return err
 	}
+	if err := shoal.ValidateOptionalID(
+		"retrieval embedding space ID", r.EmbeddingSpaceID,
+	); err != nil {
+		return err
+	}
 	if uint32(len(r.Results)) > normalized.TopK {
 		return shoal.NewError(
 			shoal.ErrorInvalidArgument, "retrieval response exceeds normalized top_k")
 	}
+
 	seen := make(map[shoal.ID]struct{}, len(r.Results))
 	for index, result := range r.Results {
 		if err := shoal.ValidateRequiredID("retrieval result ID", result.ID); err != nil {
@@ -302,6 +312,48 @@ func (r Response) ValidateFor(request Request) error {
 		}
 	}
 	return nil
+}
+
+// EmbeddingSpaceSetID returns a stable opaque identity for the exact set of
+// embedding spaces that participated in retrieval. Input order and duplicate
+// identities do not affect the result. An empty set means no vector space
+// participated and returns the empty ID.
+func EmbeddingSpaceSetID(identities ...string) (shoal.ID, error) {
+	normalized := append([]string(nil), identities...)
+	for _, identity := range normalized {
+		if !utf8.ValidString(identity) || strings.TrimSpace(identity) == "" ||
+			len(identity) > shoal.MaxSemanticStringBytes {
+			return "", shoal.NewError(
+				shoal.ErrorInvalidArgument,
+				"embedding space identity is invalid",
+			)
+		}
+	}
+	sort.Strings(normalized)
+	unique := normalized[:0]
+	for _, identity := range normalized {
+		if len(unique) > 0 && unique[len(unique)-1] == identity {
+			continue
+		}
+		unique = append(unique, identity)
+	}
+	if len(unique) == 0 {
+		return "", nil
+	}
+	hash := sha256.New()
+	var length [8]byte
+	write := func(value string) {
+		binary.BigEndian.PutUint64(length[:], uint64(len(value)))
+		_, _ = hash.Write(length[:])
+		_, _ = hash.Write([]byte(value))
+	}
+	write("shoal-retrieval-embedding-space-set-v1")
+	for _, identity := range unique {
+		write(identity)
+	}
+	return shoal.ID(
+		"embedding-space_" + hex.EncodeToString(hash.Sum(nil)[:16]),
+	), nil
 }
 
 // CompareResult returns a negative value when left sorts before right under

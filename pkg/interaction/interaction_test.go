@@ -22,10 +22,12 @@ package interaction_test
 import (
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/phrocker/shoal-oss/pkg/graph"
 	"github.com/phrocker/shoal-oss/pkg/interaction"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
@@ -209,12 +211,58 @@ func TestVisibilityAndProvenanceHaveNoSemanticCountCap(t *testing.T) {
 			cited++
 		}
 	}
+
 	if retrieved != count || cited != 1 {
 		t.Fatalf("retrieved=%d cited=%d, want %d and 1",
 			retrieved, cited, count)
 	}
 	if subgraph.TouchedNodeIDs[len(subgraph.TouchedNodeIDs)-1] != ids[count-1] {
 		t.Fatal("late source was dropped from the provenance union")
+	}
+}
+
+func TestOversizedVisibilityIsDigestMarkedAndFailsClosed(t *testing.T) {
+	const count = 80
+	ids := make([]shoal.ID, count)
+	labels := make(map[shoal.ID]string, count)
+	for index := range ids {
+		id := shoal.ID(fmt.Sprintf("span-large-%03d", index))
+		ids[index] = id
+		labels[id] = fmt.Sprintf(
+			"label-%03d-%s", index, strings.Repeat("x", 56))
+	}
+	session := interaction.Session{
+		ID:          "session-large-visibility",
+		RecordedAt:  time.Unix(1700000000, 0).UTC(),
+		SeedNodeIDs: ids,
+	}
+	subgraph, err := session.Subgraph(func(id shoal.ID) ([]string, error) {
+		return []string{labels[id]}, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(interaction.Expression(subgraph.Visibility)) <=
+		shoal.MaxMetadataValueBytes {
+		t.Fatal("fixture did not exceed the graph metadata value bound")
+	}
+	var sessionNode graph.Node
+	for _, node := range subgraph.Nodes {
+		if node.Kind == interaction.KindSession {
+			sessionNode = node
+			break
+		}
+	}
+	if sessionNode.Properties[interaction.PropertyVisibility] != "" ||
+		sessionNode.Properties[interaction.PropertyVisibilityDigest] == "" ||
+		sessionNode.Properties[interaction.PropertyVisibilityCount] !=
+			strconv.Itoa(count) {
+		t.Fatalf("oversized visibility markers = %+v", sessionNode.Properties)
+	}
+	if _, err := interaction.NodeVisibility(
+		sessionNode,
+	); !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
+		t.Fatalf("digest-only visibility was treated as public: %v", err)
 	}
 }
 
@@ -263,6 +311,24 @@ func TestSessionValidateRejectsMalformedSessions(t *testing.T) {
 	tooMany.Turns = make([]interaction.Turn, interaction.MaxTurns+1)
 	if err := tooMany.Validate(); err == nil {
 		t.Fatal("unbounded turn list accepted")
+	}
+	pinned := valid
+	pinned.SnapshotID = "snapshot"
+	pinned.SnapshotAsOf = valid.RecordedAt.Add(-time.Minute)
+	pinned.AuthorizationFingerprint = "auth"
+	pinned.AuthorizationExpiresAt = valid.RecordedAt.Add(time.Hour)
+	if err := pinned.Validate(); err != nil {
+		t.Fatalf("valid execution pins rejected: %v", err)
+	}
+	futureSnapshot := pinned
+	futureSnapshot.SnapshotAsOf = futureSnapshot.RecordedAt.Add(time.Second)
+	if err := futureSnapshot.Validate(); err == nil {
+		t.Fatal("future observed snapshot accepted")
+	}
+	expired := pinned
+	expired.AuthorizationExpiresAt = expired.RecordedAt
+	if err := expired.Validate(); err == nil {
+		t.Fatal("expired authorization accepted at record time")
 	}
 }
 

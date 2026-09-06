@@ -64,7 +64,8 @@ func TestInProcessAndLoopbackParity(t *testing.T) {
 		Explain: true,
 	}
 	want := retrieval.Response{
-		RequestID: "request-1",
+		RequestID:        "request-1",
+		EmbeddingSpaceID: "embedding-space-v3",
 		Results: []retrieval.Result{{
 			ID:    "result-1",
 			Score: 0.91,

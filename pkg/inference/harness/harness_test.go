@@ -28,6 +28,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/phrocker/shoal-oss/pkg/contextpack"
 	"github.com/phrocker/shoal-oss/pkg/document"
 	"github.com/phrocker/shoal-oss/pkg/graph"
 	"github.com/phrocker/shoal-oss/pkg/inference"
@@ -37,6 +38,21 @@ import (
 
 var fixedTime = time.Date(2026, 8, 28, 12, 0, 0, 0, time.UTC)
 
+func TestAddAnchorsCarriesEmbeddingSpaceIntoTranscriptContext(t *testing.T) {
+	pack, _, _ := fixture(t)
+	next, err := addAnchors(pack, nil, "embedding-space-v3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity, ok, err := contextpack.EmbeddingSpaceID(next)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || identity != "embedding-space-v3" {
+		t.Fatalf("merged embedding space = %q, %t", identity, ok)
+	}
+}
+
 func TestSuccessfulTraceAndCanonicalTranscript(t *testing.T) {
 	pack, initial, additions := fixture(t)
 	retrieve := mustRetrieve(t, "r1", "more evidence", 2)
@@ -44,7 +60,7 @@ func TestSuccessfulTraceAndCanonicalTranscript(t *testing.T) {
 	neighbors := mustNeighbors(t, "r3", "node-a", 1, 2)
 	host := &fakeTools{pack: pack, results: map[shoal.ID][]inference.EvidenceAnchor{
 		"r1": {additions[0]}, "r2": {additions[1]}, "r3": {additions[2]},
-	}}
+	}, embeddingSpaceID: "embedding-space-v3"}
 	runner := NewFakeRunner(
 		ScriptAction(retrieve), ScriptAction(open), ScriptAction(neighbors),
 		func(_ context.Context, transcript Transcript) (Action, error) {
@@ -76,6 +92,13 @@ func TestSuccessfulTraceAndCanonicalTranscript(t *testing.T) {
 	}
 	if record.Transcript.ID() == "" || record.Request.ID() == "" {
 		t.Fatal("missing canonical identity")
+	}
+	evaluation, err := evaluationRecord(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if evaluation.EmbeddingSpaceID != "embedding-space-v3" {
+		t.Fatalf("evaluation embedding space = %q", evaluation.EmbeddingSpaceID)
 	}
 
 	g2 := newGenerator(t, runner, host)
@@ -611,10 +634,11 @@ func TestConcurrentGeneration(t *testing.T) {
 }
 
 type fakeTools struct {
-	pack     inference.ContextPack
-	results  map[shoal.ID][]inference.EvidenceAnchor
-	mismatch bool
-	stale    bool
+	pack             inference.ContextPack
+	results          map[shoal.ID][]inference.EvidenceAnchor
+	embeddingSpaceID shoal.ID
+	mismatch         bool
+	stale            bool
 }
 
 // captureRecorder is shared across goroutines by TestConcurrentGeneration,
@@ -685,7 +709,10 @@ func (f *fakeTools) make(id shoal.ID, kind ActionKind) (ToolResult, error) {
 	if f.stale {
 		snapshot, _ = inference.NewSnapshotPin("stale", snapshot.AsOf())
 	}
-	return NewToolResult(correlation, kind, f.results[id], snapshot, auth)
+	return NewToolResultWithEmbeddingSpace(
+		correlation, kind, f.results[id], snapshot, auth,
+		f.embeddingSpaceID,
+	)
 }
 
 func budgets() Budgets {

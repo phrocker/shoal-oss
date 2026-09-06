@@ -31,6 +31,21 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
+type generationChangingInteractionBase struct {
+	*explorer.Explorer
+	after func()
+}
+
+func (b *generationChangingInteractionBase) RecordInteractionResult(
+	ctx context.Context, session interaction.Session,
+) (interaction.Session, error) {
+	recorded, err := b.Explorer.RecordInteractionResult(ctx, session)
+	if err == nil && b.after != nil {
+		b.after()
+	}
+	return recorded, err
+}
+
 func TestAuthorizedInteractionRecorderAndViews(t *testing.T) {
 	f := newFixture(t)
 	receipt, err := f.clientA.Ingest(f.admin(t), explorer.Source{
@@ -315,6 +330,18 @@ func TestAuthorizedInteractionRecorderRejectsWrongPin(t *testing.T) {
 	); !shoal.IsErrorCode(err, shoal.ErrorNotFound) {
 		t.Fatalf("rejected interaction was persisted: %v", err)
 	}
+	fingerprint, err := auth.AuthorizationFingerprint(decision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session.ID = "session-wrong-expiry"
+	session.AuthorizationFingerprint = shoal.ID(fingerprint.String())
+	session.AuthorizationExpiresAt = decision.AuthenticationExpires().Add(-time.Minute)
+	if err := f.clientA.RecordInteraction(
+		ctx, session,
+	); !shoal.IsErrorCode(err, shoal.ErrorUnauthorized) {
+		t.Fatalf("non-exact authorization expiry record = %v", err)
+	}
 }
 
 func TestAuthorizedTombstoneSubgraphDoesNotLeakExistence(t *testing.T) {
@@ -327,6 +354,7 @@ func TestAuthorizedTombstoneSubgraphDoesNotLeakExistence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	snapshot, err := f.base.Snapshot(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -376,6 +404,27 @@ func TestAuthorizedTombstoneSubgraphDoesNotLeakExistence(t *testing.T) {
 		subgraph.Nodes[0].Kind != interaction.KindTombstone {
 		t.Fatalf("authorized tombstone subgraph = %+v", subgraph)
 	}
+	renewed, err := auth.NewDecision(auth.DecisionConfig{
+		Subject:               decision.Subject(),
+		Actor:                 decision.Actor(),
+		ClientID:              decision.ClientID(),
+		OnBehalfOf:            decision.OnBehalfOf(),
+		AuthorizationDomain:   decision.AuthorizationDomain(),
+		AllowedOperations:     decision.AllowedOperations(),
+		PermittedSourceIDs:    decision.PermittedSourceIDs(),
+		PermittedPolicyIDs:    decision.PermittedPolicyIDs(),
+		PolicyGeneration:      decision.PolicyGeneration(),
+		AuthenticationExpires: f.clock.Now().Add(30 * time.Minute),
+		RequestID:             "renewed-deletion-request",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.clientA.InteractionSubgraph(
+		f.context(t, renewed), session.ID,
+	); err != nil {
+		t.Fatalf("renewed shorter credential cannot read tombstone: %v", err)
+	}
 	if _, err := f.clientA.Interaction(
 		ctx, session.ID,
 	); !shoal.IsErrorCode(err, shoal.ErrorNotFound) {
@@ -397,5 +446,74 @@ func TestAuthorizedTombstoneSubgraphDoesNotLeakExistence(t *testing.T) {
 		f.context(t, bobDecision), session.ID,
 	); !shoal.IsErrorCode(err, shoal.ErrorNotFound) {
 		t.Fatalf("unauthorized tombstone read leaked existence: %v", err)
+	}
+}
+
+func TestAuthorizedInteractionMarksPostCommitGenerationFailure(t *testing.T) {
+	f := newFixture(t)
+	receipt, err := f.clientA.Ingest(f.admin(t), explorer.Source{
+		URI:       "file:///post-commit-generation.txt",
+		MediaType: explorer.MediaTypeText,
+		Content:   "post commit generation evidence",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := f.base.Snapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.clock.Set(snapshot.AsOf.Add(time.Second))
+	decision := f.decision(
+		t,
+		"generation-recorder",
+		[][]byte{f.sourceA},
+		[][]byte{f.policyA},
+		[]auth.Operation{
+			auth.OperationRead,
+			auth.OperationRetrieve,
+			auth.OperationValidate,
+		},
+	)
+	ctx := f.context(t, decision)
+	view, err := f.clientA.Document(
+		ctx, receipt.Document.ID, receipt.Revision.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fingerprint, err := auth.AuthorizationFingerprint(decision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := &generationChangingInteractionBase{
+		Explorer: f.base,
+		after: func() {
+			f.reader.Set(f.domain, 2)
+		},
+	}
+	client := f.newClient(
+		t, base, f.store, f.sourceA, f.policyA, nil)
+	recorder, err := interaction.NewRecorder(ctx, client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := interaction.Session{
+		ID:                       "session-post-commit-generation",
+		RecordedAt:               f.clock.Now(),
+		SnapshotID:               shoal.ID(snapshot.ID),
+		SnapshotAsOf:             snapshot.AsOf,
+		AuthorizationFingerprint: shoal.ID(fingerprint.String()),
+		AuthorizationExpiresAt:   decision.AuthenticationExpires(),
+		SeedNodeIDs:              []shoal.ID{firstSpanID(t, view)},
+	}
+	if _, err := recorder.Record(
+		ctx, session,
+	); !explorer.IsCommittedInteraction(err) {
+		t.Fatalf("post-commit generation error = %v", err)
+	}
+	if _, err := f.base.Interaction(
+		context.Background(), session.ID,
+	); err != nil {
+		t.Fatalf("committed interaction was not durable: %v", err)
 	}
 }

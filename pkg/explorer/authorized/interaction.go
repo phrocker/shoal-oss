@@ -121,7 +121,7 @@ func (c *Client) recordInteraction(
 		return interaction.Session{}, directBaseError(err)
 	}
 	if err := guard.Check(ctx); err != nil {
-		return interaction.Session{}, err
+		return interaction.Session{}, explorer.MarkCommittedInteraction(err)
 	}
 	return persisted, nil
 }
@@ -314,7 +314,7 @@ func interactionPinMatchesDecision(
 		return false
 	}
 	return session.AuthorizationFingerprint == shoal.ID(fingerprint.String()) &&
-		!decision.AuthenticationExpires().Before(session.AuthorizationExpiresAt)
+		decision.AuthenticationExpires().Equal(session.AuthorizationExpiresAt)
 }
 
 func summaryFingerprintMatchesDecision(
@@ -324,8 +324,7 @@ func summaryFingerprintMatchesDecision(
 	if err != nil {
 		return false
 	}
-	return summary.AuthorizationFingerprint == shoal.ID(fingerprint.String()) &&
-		!decision.AuthenticationExpires().Before(summary.AuthorizationExpiresAt)
+	return summary.AuthorizationFingerprint == shoal.ID(fingerprint.String())
 }
 
 func (c *Client) interactionWriter() (explorer.InteractionWriter, error) {

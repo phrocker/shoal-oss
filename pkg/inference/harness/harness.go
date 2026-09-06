@@ -400,18 +400,38 @@ func (a Action) validate() error {
 }
 
 type ToolResult struct {
-	correlation shoal.ID
-	kind        ActionKind
-	anchors     []inference.EvidenceAnchor
-	snapshot    inference.SnapshotPin
-	auth        inference.AuthPin
+	correlation      shoal.ID
+	kind             ActionKind
+	anchors          []inference.EvidenceAnchor
+	snapshot         inference.SnapshotPin
+	auth             inference.AuthPin
+	embeddingSpaceID shoal.ID
 }
 
 func NewToolResult(correlation shoal.ID, kind ActionKind, anchors []inference.EvidenceAnchor, snapshot inference.SnapshotPin, auth inference.AuthPin) (ToolResult, error) {
+	return NewToolResultWithEmbeddingSpace(
+		correlation, kind, anchors, snapshot, auth, "")
+}
+
+// NewToolResultWithEmbeddingSpace records the opaque identity of the vector
+// space/set used by a retrieval tool call.
+func NewToolResultWithEmbeddingSpace(
+	correlation shoal.ID,
+	kind ActionKind,
+	anchors []inference.EvidenceAnchor,
+	snapshot inference.SnapshotPin,
+	auth inference.AuthPin,
+	embeddingSpaceID shoal.ID,
+) (ToolResult, error) {
 	if len(anchors) > inference.MaxEvidenceAnchors {
 		return ToolResult{}, invalid("tool result anchor count is outside the supported range")
 	}
-	r := ToolResult{correlation: correlation, kind: kind, anchors: append([]inference.EvidenceAnchor(nil), anchors...), snapshot: snapshot, auth: auth}
+	r := ToolResult{
+		correlation: correlation, kind: kind,
+		anchors:  append([]inference.EvidenceAnchor(nil), anchors...),
+		snapshot: snapshot, auth: auth,
+		embeddingSpaceID: embeddingSpaceID,
+	}
 	sort.Slice(r.anchors, func(i, j int) bool { return shoal.CompareID(r.anchors[i].ID(), r.anchors[j].ID()) < 0 })
 	if err := r.validate(); err != nil {
 		return ToolResult{}, err
@@ -425,6 +445,7 @@ func (r ToolResult) Anchors() []inference.EvidenceAnchor {
 }
 func (r ToolResult) Snapshot() inference.SnapshotPin  { return r.snapshot }
 func (r ToolResult) Authorization() inference.AuthPin { return r.auth }
+func (r ToolResult) EmbeddingSpaceID() shoal.ID       { return r.embeddingSpaceID }
 func (r ToolResult) validate() error {
 	if err := validateLogicalID("tool result correlation ID", r.correlation); err != nil {
 		return err
@@ -438,6 +459,11 @@ func (r ToolResult) validate() error {
 		return err
 	}
 	if err := r.auth.Validate(); err != nil {
+		return err
+	}
+	if err := shoal.ValidateOptionalID(
+		"tool result embedding space ID", r.embeddingSpaceID,
+	); err != nil {
 		return err
 	}
 	if len(r.anchors) > inference.MaxEvidenceAnchors {
@@ -1046,7 +1072,11 @@ func (g *Generator) Run(ctx context.Context, pack inference.ContextPack) (Record
 			return finish(StopReasonBudgetExhausted, step, "budget", inference.InferenceResult{}, err)
 		}
 		addGraphNodes(graphNodes, toolResult.anchors)
-		nextPack, err := addAnchors(transcript.context, toolResult.anchors)
+		nextPack, err := addAnchors(
+			transcript.context,
+			toolResult.anchors,
+			toolResult.embeddingSpaceID,
+		)
 		if err != nil {
 			return finish(StopReasonInvalid, step, "context pack", inference.InferenceResult{}, err)
 		}
@@ -1148,7 +1178,7 @@ func cloneRunTrace(trace RunTrace) RunTrace {
 
 func evaluationRecord(record Record) (EvaluationRecord, error) {
 	embeddingSpaceID, _, err := contextpack.EmbeddingSpaceID(
-		record.Request.context)
+		record.Transcript.context)
 	if err != nil {
 		return EvaluationRecord{}, err
 	}
@@ -1306,7 +1336,11 @@ func validateToolResult(action Action, result ToolResult, original inference.Con
 	return nil
 }
 
-func addAnchors(pack inference.ContextPack, additions []inference.EvidenceAnchor) (inference.ContextPack, error) {
+func addAnchors(
+	pack inference.ContextPack,
+	additions []inference.EvidenceAnchor,
+	embeddingSpaceID shoal.ID,
+) (inference.ContextPack, error) {
 	anchors := pack.Evidence()
 	seen := make(map[shoal.ID]struct{}, len(anchors)+len(additions))
 	for _, a := range anchors {
@@ -1324,7 +1358,14 @@ func addAnchors(pack inference.ContextPack, additions []inference.EvidenceAnchor
 	if ok {
 		ontologyPtr = &ontology
 	}
-	return inference.NewContextPack(pack.Query(), anchors, ontologyPtr, pack.Snapshot(), pack.Authorization(), pack.Metadata())
+	metadata, err := contextpack.MergeEmbeddingSpaceMetadata(
+		pack.Metadata(), embeddingSpaceID)
+	if err != nil {
+		return inference.ContextPack{}, err
+	}
+	return inference.NewContextPack(
+		pack.Query(), anchors, ontologyPtr,
+		pack.Snapshot(), pack.Authorization(), metadata)
 }
 
 func actionKey(a Action) string {

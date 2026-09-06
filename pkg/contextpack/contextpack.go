@@ -223,9 +223,19 @@ func (b Builder) Build(ctx context.Context, input InitialRequest) (inference.Con
 	if err != nil {
 		return inference.ContextPack{}, err
 	}
+	embeddingSpaceID := input.Pins.EmbeddingSpaceID
+	if response.EmbeddingSpaceID != "" {
+		if embeddingSpaceID != "" &&
+			embeddingSpaceID != response.EmbeddingSpaceID {
+			return inference.ContextPack{}, invalid(
+				"retrieval embedding space does not match the trusted pin")
+		}
+		embeddingSpaceID = response.EmbeddingSpaceID
+	}
+	input.Pins.EmbeddingSpaceID = embeddingSpaceID
 	metadata, err := provenanceMetadata(
 		input.Metadata, request, response, input.Pins.PolicyID,
-		input.Pins.EmbeddingSpaceID, limits)
+		embeddingSpaceID, limits)
 	if err != nil {
 		return inference.ContextPack{}, err
 	}
@@ -974,7 +984,13 @@ func provenanceMetadata(
 // Builder when the context was assembled. The boolean is false for non-vector
 // contexts. Malformed reserved metadata fails closed.
 func EmbeddingSpaceID(pack inference.ContextPack) (shoal.ID, bool, error) {
-	value := pack.Metadata()[metadataEmbeddingSpaceKey]
+	return embeddingSpaceIDFromMetadata(pack.Metadata())
+}
+
+func embeddingSpaceIDFromMetadata(
+	metadata shoal.Metadata,
+) (shoal.ID, bool, error) {
+	value := metadata[metadataEmbeddingSpaceKey]
 	if value == "" {
 		return "", false, nil
 	}
@@ -991,6 +1007,44 @@ func EmbeddingSpaceID(pack inference.ContextPack) (shoal.ID, bool, error) {
 		return "", false, err
 	}
 	return id, true, nil
+}
+
+// MergeEmbeddingSpaceMetadata returns independently owned context metadata
+// whose embedding-space pin covers both the existing context and one new tool
+// result. Repeated identities are idempotent; distinct identities produce a
+// stable opaque set identity.
+func MergeEmbeddingSpaceMetadata(
+	metadata shoal.Metadata, next shoal.ID,
+) (shoal.Metadata, error) {
+	if err := shoal.ValidateOptionalID("embedding space ID", next); err != nil {
+		return nil, err
+	}
+	merged := cloneMetadata(metadata)
+	if next == "" {
+		return merged, nil
+	}
+	current, found, err := embeddingSpaceIDFromMetadata(merged)
+	if err != nil {
+		return nil, err
+	}
+	identity := next
+	if found && current != next {
+		identity, err = retrieval.EmbeddingSpaceSetID(
+			string(current), string(next))
+		if err != nil {
+			return nil, err
+		}
+	} else if found {
+		identity = current
+	}
+	if merged == nil {
+		merged = make(shoal.Metadata)
+	}
+	merged[metadataEmbeddingSpaceKey] = encodeID(identity)
+	if err := shoal.ValidateMetadata("context metadata", merged); err != nil {
+		return nil, err
+	}
+	return merged, nil
 }
 
 func preflightResponse(
@@ -1127,6 +1181,7 @@ func retrievalIdentity(request retrieval.Request, response retrieval.Response) (
 	}
 	writeBool(digest, request.Explain)
 	writePart(digest, []byte(response.RequestID))
+	writePart(digest, []byte(response.EmbeddingSpaceID))
 	writeUint64(digest, uint64(len(response.Results)))
 	for _, result := range response.Results {
 		writePart(digest, []byte(result.ID))
@@ -1448,7 +1503,10 @@ func validateUniqueIDs(name string, ids []shoal.ID) error {
 }
 
 func cloneResponse(response retrieval.Response) retrieval.Response {
-	cloned := retrieval.Response{RequestID: response.RequestID}
+	cloned := retrieval.Response{
+		RequestID:        response.RequestID,
+		EmbeddingSpaceID: response.EmbeddingSpaceID,
+	}
 	cloned.Results = make([]retrieval.Result, len(response.Results))
 	for i, result := range response.Results {
 		cloned.Results[i] = retrieval.Result{

@@ -406,11 +406,24 @@ func TestVectorRetrievalUsesEmbeddingSpaceIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := reopened.Retrieve(ctx, retrieval.Request{
+	response, err := reopened.Retrieve(ctx, retrieval.Request{
 		Text:  "lexical embedding space",
 		Modes: []retrieval.Mode{retrieval.ModeVector},
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatalf("cache-only configuration change was treated as incompatible: %v", err)
+	}
+	identity, err := sameSpace.EmbeddingSpaceIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	expectedSpaceID, err := retrieval.EmbeddingSpaceSetID(identity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.EmbeddingSpaceID != expectedSpaceID {
+		t.Fatalf("retrieval embedding space = %q, want %q",
+			response.EmbeddingSpaceID, expectedSpaceID)
 	}
 	if err := reopened.Close(); err != nil {
 		t.Fatal(err)

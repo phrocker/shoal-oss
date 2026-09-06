@@ -123,7 +123,7 @@ func TestBuildFromEmbeddedExplorerExactEvidenceAndDeterminism(t *testing.T) {
 
 func TestBuildPinsEmbeddingSpaceIdentity(t *testing.T) {
 	client, request, response, pins := embeddedFixture(t)
-	pins.EmbeddingSpaceID = "embedding-space-v3"
+	response.EmbeddingSpaceID = "embedding-space-v3"
 	pack, err := (Builder{Reader: client}).Build(
 		context.Background(),
 		InitialRequest{Request: request, Response: response, Pins: pins},
@@ -135,8 +135,15 @@ func TestBuildPinsEmbeddingSpaceIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !ok || identity != pins.EmbeddingSpaceID {
+	if !ok || identity != response.EmbeddingSpaceID {
 		t.Fatalf("embedding space = %q, %t", identity, ok)
+	}
+	pins.EmbeddingSpaceID = "different-space"
+	if _, err := (Builder{Reader: client}).Build(
+		context.Background(),
+		InitialRequest{Request: request, Response: response, Pins: pins},
+	); err == nil {
+		t.Fatal("mismatched trusted embedding-space pin was accepted")
 	}
 }
 

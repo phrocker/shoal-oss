@@ -1122,7 +1122,9 @@ func TestRemoteServiceAllowsScopedVectorWhenGlobalCapabilityIsUnavailable(t *tes
 				Snapshot: webapi.Snapshot{
 					ID: "snapshot", AsOf: now, Frontier: 1,
 				},
-				Retrieval: retrieval.Response{},
+				Retrieval: retrieval.Response{
+					EmbeddingSpaceID: "embedding-space-v3",
+				},
 			})
 		default:
 			http.NotFound(writer, request)
@@ -1133,7 +1135,7 @@ func TestRemoteServiceAllowsScopedVectorWhenGlobalCapabilityIsUnavailable(t *tes
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = service.Retrieve(context.Background(), webapi.RetrievalRequest{
+	response, err := service.Retrieve(context.Background(), webapi.RetrievalRequest{
 		Query: retrieval.Request{
 			Text:  "query",
 			Modes: []retrieval.Mode{retrieval.ModeVector},
@@ -1144,6 +1146,10 @@ func TestRemoteServiceAllowsScopedVectorWhenGlobalCapabilityIsUnavailable(t *tes
 	})
 	if err != nil {
 		t.Fatalf("scoped vector retrieve: %v", err)
+	}
+	if response.Retrieval.EmbeddingSpaceID != "embedding-space-v3" {
+		t.Fatalf("remote embedding space = %q",
+			response.Retrieval.EmbeddingSpaceID)
 	}
 	if !retrieveCalled {
 		t.Fatal("scoped vector request did not reach remote endpoint")
