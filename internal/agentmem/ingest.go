@@ -2,6 +2,7 @@ package agentmem
 
 import (
 	"context"
+	"fmt"
 	"sort"
 	"strconv"
 	"strings"
@@ -40,7 +41,9 @@ func (c *Client) EnsureTable(ctx context.Context) error {
 			embeddingspace.Has(c.cfg.EmbeddingSpace).String(),
 		)
 	}
-	return c.cfg.Store.CreateTable(ctx, c.cfg.Table, []string{graphschema.EventRowPrefix, graphschema.EntityRowPrefix, graphschema.TermRowPrefix})
+	return fmt.Errorf(
+		"%w: agent-memory store does not support embedding-aware table creation",
+		embeddingspace.ErrQueryMetadataMissing)
 }
 
 func (c *Client) Ingest(ctx context.Context, req IngestRequest) (IngestResult, error) {

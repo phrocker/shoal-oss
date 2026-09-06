@@ -62,6 +62,19 @@ func TestAdaptedEmbedderAcceptsExplicitIdentityFallback(t *testing.T) {
 	}
 }
 
+func TestEnsureTableRequiresEmbeddingAwareStore(t *testing.T) {
+	legacy := struct{ EmbedStore }{EmbedStore: NewFakeStore()}
+	client, err := New(Config{Store: legacy})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := client.EnsureTable(
+		context.Background(),
+	); !errors.Is(err, embeddingspace.ErrQueryMetadataMissing) {
+		t.Fatalf("EnsureTable legacy store error = %v", err)
+	}
+}
+
 func TestPackVectorRoundTrip(t *testing.T) {
 	want := []float32{1.25, -2.5, 0.125}
 	got, err := UnpackVector(PackVector(want))
