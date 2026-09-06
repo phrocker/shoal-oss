@@ -143,6 +143,17 @@ func TestCitationEnvelopeOpaqueIDRoundTrip(t *testing.T) {
 			decoded.EmbeddingSpaces, embeddingSpaces,
 		)
 	}
+	forgedEmbeddingDigest := bytes.Replace(
+		encoded,
+		[]byte(embeddingSpaces.Digest),
+		[]byte(strings.Repeat("0", len(embeddingSpaces.Digest))),
+		1,
+	)
+	if err := json.Unmarshal(
+		forgedEmbeddingDigest, &CitationEnvelope{},
+	); err == nil {
+		t.Fatal("forged embedding-space digest was accepted")
+	}
 	encodedQuote, err := json.Marshal(original.Evidence[0].Quote)
 	if err != nil {
 		t.Fatal(err)
