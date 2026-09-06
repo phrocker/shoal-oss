@@ -83,6 +83,51 @@ func TestRetrievalResponseEmbeddingReportUsesOpaqueIDCodec(t *testing.T) {
 	}
 }
 
+func TestRetrievalResponseEmbeddingReportBoundsOpaqueIDs(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		size    int
+		wantErr bool
+	}{
+		{name: "empty", wantErr: true},
+		{name: "one opaque byte", size: 1},
+		{name: "maximum opaque ID", size: shoal.MaxIDBytes},
+		{name: "oversized opaque ID", size: shoal.MaxIDBytes + 1, wantErr: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			report := testEmbeddingReport()
+			report.Spaces[0].ID = shoal.ID(bytes.Repeat([]byte{0xff}, test.size))
+			response := RetrievalResponse{
+				Snapshot: Snapshot{
+					ID: "snapshot", AsOf: time.Date(2026, 9, 5, 12, 0, 0, 0, time.UTC),
+					Frontier: 1,
+				},
+				Retrieval: retrieval.Response{},
+				Embedding: &report,
+			}
+			payload, err := json.Marshal(response)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var decoded RetrievalResponse
+			err = json.Unmarshal(payload, &decoded)
+			if test.wantErr {
+				if err == nil {
+					t.Fatalf("accepted embedding space ID with %d bytes", test.size)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if decoded.Embedding == nil || len(decoded.Embedding.Spaces) != 1 ||
+				decoded.Embedding.Spaces[0].ID != report.Spaces[0].ID {
+				t.Fatal("valid opaque embedding space ID was not preserved")
+			}
+		})
+	}
+}
+
 func TestEmbeddingQueryErrorWireAndRemoteRoundTrip(t *testing.T) {
 	report := testEmbeddingReport()
 	recorder := httptest.NewRecorder()

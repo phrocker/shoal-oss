@@ -692,6 +692,9 @@ func embeddingQueryReportValue(
 		if err != nil {
 			return nil, fmt.Errorf("spaces.id: %w", err)
 		}
+		if err := shoal.ValidateRequiredID("spaces.id", id); err != nil {
+			return nil, err
+		}
 		switch item.Status {
 		case authorized.EmbeddingSpaceAvailable,
 			authorized.EmbeddingSpaceUnavailable,
