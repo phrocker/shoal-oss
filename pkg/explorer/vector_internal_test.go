@@ -183,6 +183,34 @@ func TestEmbeddingSpaceMismatchStopsAfterFirstProviderCall(t *testing.T) {
 	}
 }
 
+func TestQueryProviderCountRequiresActualEmbedInvocation(t *testing.T) {
+	embedder := &countingEmbedder{
+		model: "actual", dimensions: 2, identity: "space-actual",
+	}
+	corpus := &Explorer{
+		embedders: map[string]model.Embedder{
+			"space-expected": embedder,
+		},
+		queryEmbeddingCache: make(map[embeddingQueryCacheKey]cachedQueryEmbedding),
+	}
+	_, _, cacheHit, providerCalled, err := corpus.cachedEmbedQueryInSpace(
+		context.Background(),
+		"query",
+		persistedEmbeddingProvenance{
+			Provider: "counting", Model: "expected",
+			Identity: "space-expected", Dimensions: 2,
+		},
+	)
+	if !shoal.IsErrorCode(err, shoal.ErrorConflict) {
+		t.Fatalf("identity mismatch error = %v", err)
+	}
+	if cacheHit || providerCalled || embedder.calls != 0 {
+		t.Fatalf(
+			"cache/provider/calls = %v/%v/%d, want false/false/0",
+			cacheHit, providerCalled, embedder.calls)
+	}
+}
+
 func TestVectorAvailabilityIncludesHistoricalEmbeddingSpace(t *testing.T) {
 	ctx := context.Background()
 	dataDir := t.TempDir()

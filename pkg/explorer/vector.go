@@ -148,7 +148,7 @@ func (e *Explorer) VectorAvailable(ctx context.Context) (bool, error) {
 		available = false
 	} else {
 		for _, space := range spaces {
-			_, _, err := e.embedQueryInSpace(ctx, vectorCapabilityProbeText, space)
+			_, _, _, err := e.embedQueryInSpace(ctx, vectorCapabilityProbeText, space)
 			if err != nil {
 				if shoal.IsErrorCode(err, shoal.ErrorCanceled) ||
 					shoal.IsErrorCode(err, shoal.ErrorDeadline) {
@@ -474,36 +474,36 @@ func (e *Explorer) embedQueryInSpace(
 	ctx context.Context,
 	text string,
 	space persistedEmbeddingProvenance,
-) (persistedEmbeddingProvenance, []float32, error) {
+) (persistedEmbeddingProvenance, []float32, bool, error) {
 	if err := validateEmbeddingProvenance(space); err != nil {
-		return persistedEmbeddingProvenance{}, nil, err
+		return persistedEmbeddingProvenance{}, nil, false, err
 	}
 	embedder := e.embedders[space.Identity]
 	if embedder == nil {
 		if e.embedder != nil {
 			currentIdentity, err := e.embeddingIdentity()
 			if err != nil {
-				return persistedEmbeddingProvenance{}, nil, err
+				return persistedEmbeddingProvenance{}, nil, false, err
 			}
 			if currentIdentity != space.Identity {
-				return persistedEmbeddingProvenance{}, nil,
+				return persistedEmbeddingProvenance{}, nil, false,
 					incompatibleEmbeddingSpaceError(
 						space,
 						persistedEmbeddingProvenance{Identity: currentIdentity},
 					)
 			}
 		}
-		return persistedEmbeddingProvenance{}, nil, shoal.NewError(
+		return persistedEmbeddingProvenance{}, nil, false, shoal.NewError(
 			shoal.ErrorUnavailable,
 			fmt.Sprintf("embedding provider for stored space %q is unavailable", space.Identity),
 		)
 	}
 	identity, err := embeddingIdentityFor(embedder)
 	if err != nil {
-		return persistedEmbeddingProvenance{}, nil, err
+		return persistedEmbeddingProvenance{}, nil, false, err
 	}
 	if identity != space.Identity {
-		return persistedEmbeddingProvenance{}, nil,
+		return persistedEmbeddingProvenance{}, nil, false,
 			incompatibleEmbeddingSpaceError(space, persistedEmbeddingProvenance{
 				Provider: space.Provider, Model: space.Model,
 				Identity: identity, Dimensions: space.Dimensions,
@@ -511,18 +511,19 @@ func (e *Explorer) embedQueryInSpace(
 	}
 	result, err := embedder.Embed(ctx, model.EmbedRequest{Text: text})
 	if err != nil {
-		return persistedEmbeddingProvenance{}, nil,
+		return persistedEmbeddingProvenance{}, nil, true,
 			embeddingProviderError(
 				fmt.Sprintf("embed retrieval query for space %q", space.Identity), err)
 	}
 	provenance, vector, err := normalizedEmbeddingResult(result, identity)
 	if err != nil {
-		return persistedEmbeddingProvenance{}, nil, err
+		return persistedEmbeddingProvenance{}, nil, true, err
 	}
 	if provenance != space {
-		return persistedEmbeddingProvenance{}, nil, incompatibleEmbeddingSpaceError(space, provenance)
+		return persistedEmbeddingProvenance{}, nil, true,
+			incompatibleEmbeddingSpaceError(space, provenance)
 	}
-	return provenance, vector, nil
+	return provenance, vector, true, nil
 }
 
 func (e *Explorer) embedQueriesForSpaces(
@@ -656,8 +657,8 @@ func (e *Explorer) cachedEmbedQueryInSpace(
 		}
 		return cached.provenance, cached.vector, true, false, nil
 	}
-	providerCalled := e.embedders[space.Identity] != nil
-	provenance, vector, err := e.embedQueryInSpace(ctx, query, space)
+	provenance, vector, providerCalled, err :=
+		e.embedQueryInSpace(ctx, query, space)
 	if err != nil {
 		return persistedEmbeddingProvenance{}, nil, false, providerCalled, err
 	}
