@@ -24,6 +24,10 @@ type Embedder interface {
 	Embed(ctx context.Context, text string) ([]float32, error)
 }
 
+type embeddingSpaceIdentityProvider interface {
+	EmbeddingSpaceIdentity() (string, error)
+}
+
 // PlanOptions carries runtime inputs needed to finish lowering.
 type PlanOptions struct {
 	// Params supplies values for `:name` bind parameters (vector params).
@@ -47,8 +51,9 @@ type VectorOptions struct {
 	Mode  VectorMode
 	Index string
 	// EmbeddingSpace is the stable identity of the model space that produced
-	// a supplied query vector. It is mandatory for exact and approximate
-	// execution; dimensionality alone is never treated as identity.
+	// a supplied literal or parameter vector. Text-query identity is derived
+	// from its identity-reporting Embedder and, when this value is also set,
+	// verified against it. Dimensionality alone is never treated as identity.
 	EmbeddingSpace string
 	NProbe         int
 	Freshness      vectorindex.Freshness
@@ -346,13 +351,13 @@ func planDocument(ctx context.Context, stmt *SelectStmt, dm documentModel, opts 
 		if opts.Vector.Mode != VectorApproximate {
 			return nil, fmt.Errorf("shoalql: document semantic search requires explicit approximate vector mode")
 		}
-		vec, err := resolveVector(ctx, stmt.Order.Target, opts)
+		embeddingSpace, err := resolveVectorEmbeddingSpace(
+			stmt.Order.Target, opts, "plan approximate vector query")
 		if err != nil {
 			return nil, err
 		}
-		embeddingSpace := strings.TrimSpace(opts.Vector.EmbeddingSpace)
-		if err := embeddingspace.ValidateQueryStates(
-			"plan approximate vector query", embeddingSpace); err != nil {
+		vec, err := resolveVector(ctx, stmt.Order.Target, opts)
+		if err != nil {
 			return nil, err
 		}
 		topK := 10
@@ -433,13 +438,13 @@ func planVectorKNN(ctx context.Context, stmt *SelectStmt, binding TableBinding, 
 	if !ok || col.Role != RoleVector {
 		return nil, fmt.Errorf("shoalql: ORDER BY <-> requires a vector column, got %q", stmt.Order.Column)
 	}
-	vec, err := resolveVector(ctx, stmt.Order.Target, opts)
+	embeddingSpace, err := resolveVectorEmbeddingSpace(
+		stmt.Order.Target, opts, "plan exact vector query")
 	if err != nil {
 		return nil, err
 	}
-	embeddingSpace := strings.TrimSpace(opts.Vector.EmbeddingSpace)
-	if err := embeddingspace.ValidateQueryStates(
-		"plan exact vector query", embeddingSpace); err != nil {
+	vec, err := resolveVector(ctx, stmt.Order.Target, opts)
+	if err != nil {
 		return nil, err
 	}
 	topK := 10
@@ -508,6 +513,49 @@ func resolveVector(ctx context.Context, v VectorExpr, opts PlanOptions) ([]float
 	default:
 		return nil, fmt.Errorf("shoalql: unknown vector expression")
 	}
+}
+
+func resolveVectorEmbeddingSpace(
+	target VectorExpr,
+	opts PlanOptions,
+	operation string,
+) (string, error) {
+	configured := strings.TrimSpace(opts.Vector.EmbeddingSpace)
+	if target.Kind != VecText {
+		if err := embeddingspace.ValidateQueryStates(
+			operation, configured); err != nil {
+			return "", err
+		}
+		return configured, nil
+	}
+	if opts.Embedder == nil {
+		return "", fmt.Errorf("shoalql: ORDER BY <-> 'text' needs an embedder")
+	}
+	provider, ok := opts.Embedder.(embeddingSpaceIdentityProvider)
+	if !ok {
+		return "", fmt.Errorf(
+			"%w: text embedder does not report its embedding space",
+			embeddingspace.ErrQueryIdentityRequired)
+	}
+	identity, err := provider.EmbeddingSpaceIdentity()
+	if err != nil {
+		return "", fmt.Errorf("shoalql: resolve text embedding identity: %w", err)
+	}
+	identity = strings.TrimSpace(identity)
+	if err := embeddingspace.ValidateQueryStates(operation, identity); err != nil {
+		return "", err
+	}
+	if configured != "" {
+		if err := embeddingspace.ValidateQueryStates(
+			operation, configured); err != nil {
+			return "", err
+		}
+		if err := embeddingspace.EnsureSameIdentity(
+			operation, identity, configured); err != nil {
+			return "", err
+		}
+	}
+	return identity, nil
 }
 
 // projection lowers the SELECT list. Star projects id + content by convention.
