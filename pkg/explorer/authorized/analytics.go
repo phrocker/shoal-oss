@@ -202,6 +202,7 @@ func (c *Client) materializeAnalyticsNeighborhood(
 				now,
 				request.Direction,
 				auth.OperationAnalyticsRead,
+				false,
 			)
 			if err != nil {
 				return explorer.Neighborhood{}, err

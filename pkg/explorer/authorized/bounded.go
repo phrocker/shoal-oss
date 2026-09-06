@@ -304,7 +304,7 @@ func (c *Client) BoundedNeighborhood(
 	if authorizedCursorEligible(normalized) {
 		return c.boundedAuthorizedNeighborhoodPage(
 			ctx, bounded, request, normalized, decision, guard, now, direction,
-			auth.OperationNeighborhood)
+			auth.OperationNeighborhood, true)
 	}
 	raw, err := bounded.BoundedNeighborhood(ctx, request)
 	if err != nil {
@@ -354,6 +354,7 @@ func (c *Client) boundedAuthorizedNeighborhoodPage(
 	now time.Time,
 	direction explorer.GraphDirection,
 	operation auth.Operation,
+	applyLens bool,
 ) (explorer.BoundedNeighborhood, error) {
 	scan := request
 	scan.Depth = 1
@@ -472,11 +473,14 @@ func (c *Client) boundedAuthorizedNeighborhoodPage(
 	result.Truncated = result.Truncated || incompleteWithoutCursor
 	result.ScannedEdges = scannedEdges
 	result.ScannedEdgesKnown = scannedEdgesKnown
-	interpreted, interpretErr := c.applyOntologyLens(ctx, result.Neighborhood, decision)
-	if interpretErr != nil {
-		return explorer.BoundedNeighborhood{}, interpretErr
+	if applyLens {
+		interpreted, interpretErr := c.applyOntologyLens(
+			ctx, result.Neighborhood, decision)
+		if interpretErr != nil {
+			return explorer.BoundedNeighborhood{}, interpretErr
+		}
+		result.Neighborhood = interpreted
 	}
-	result.Neighborhood = interpreted
 	if err := guard.Check(ctx); err != nil {
 		return explorer.BoundedNeighborhood{}, err
 	}
