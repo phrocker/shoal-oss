@@ -572,8 +572,9 @@ func TestWideLazyCompactionOutagePreservesIdentityAndCanRetry(t *testing.T) {
 		Target:   "model-new",
 		Governor: g,
 		Rewriter: RewriterFunc(func(
-			_ context.Context, _ string, _ *iterrt.Key, _ []byte,
+			_ context.Context, _ string, _ *iterrt.Key, value []byte,
 		) ([]byte, error) {
+			value[0] = 'X'
 			return nil, outage
 		}),
 	})
@@ -594,6 +595,21 @@ func TestWideLazyCompactionOutagePreservesIdentityAndCanRetry(t *testing.T) {
 	if result.Converged || result.EmbeddingSpace != embeddingspace.Has("model-old") {
 		t.Fatalf("result = (converged=%v, space=%s), want preserved model-old",
 			result.Converged, result.EmbeddingSpace)
+	}
+	values := 0
+	if err := compaction.StreamCells(compaction.Spec{
+		Inputs: []compaction.Input{{Name: "output.rf", Bytes: result.Output}},
+	}, func(_ *wire.Key, value []byte) error {
+		values++
+		if string(value) != "value" {
+			t.Fatalf("provider outage mutated fallback bytes: %q", value)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if values != len(inputs) {
+		t.Fatalf("fallback cells = %d, want %d", values, len(inputs))
 	}
 	if got := g.Stats().SpentFiles; got != 0 {
 		t.Fatalf("SpentFiles = %d, want the failed reservation refunded", got)

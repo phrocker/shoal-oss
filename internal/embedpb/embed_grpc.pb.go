@@ -40,6 +40,7 @@ const (
 	ShoalEmbed_Write_FullMethodName            = "/shoal.embed.v1.ShoalEmbed/Write"
 	ShoalEmbed_ConditionalWrite_FullMethodName = "/shoal.embed.v1.ShoalEmbed/ConditionalWrite"
 	ShoalEmbed_Scan_FullMethodName             = "/shoal.embed.v1.ShoalEmbed/Scan"
+	ShoalEmbed_ScanV2_FullMethodName           = "/shoal.embed.v1.ShoalEmbed/ScanV2"
 	ShoalEmbed_Flush_FullMethodName            = "/shoal.embed.v1.ShoalEmbed/Flush"
 	ShoalEmbed_Compact_FullMethodName          = "/shoal.embed.v1.ShoalEmbed/Compact"
 	ShoalEmbed_Status_FullMethodName           = "/shoal.embed.v1.ShoalEmbed/Status"
@@ -63,6 +64,10 @@ type ShoalEmbedClient interface {
 	ConditionalWrite(ctx context.Context, in *WriteRequest, opts ...grpc.CallOption) (*WriteResponse, error)
 	// Scan reads cells from a table. Results are streamed back.
 	Scan(ctx context.Context, in *ScanRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[ScanResponse], error)
+	// ScanV2 enforces safety-critical vector embedding-space identity. Clients
+	// issuing vector_search must use this RPC so pre-V2 servers fail closed with
+	// UNIMPLEMENTED rather than ignoring the embedding_space field.
+	ScanV2(ctx context.Context, in *ScanRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[ScanResponse], error)
 	// Flush forces memtables to RFiles for a table.
 	Flush(ctx context.Context, in *FlushRequest, opts ...grpc.CallOption) (*FlushResponse, error)
 	// Compact runs major compaction on a table.
@@ -128,6 +133,25 @@ func (c *shoalEmbedClient) Scan(ctx context.Context, in *ScanRequest, opts ...gr
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type ShoalEmbed_ScanClient = grpc.ServerStreamingClient[ScanResponse]
 
+func (c *shoalEmbedClient) ScanV2(ctx context.Context, in *ScanRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[ScanResponse], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &ShoalEmbed_ServiceDesc.Streams[1], ShoalEmbed_ScanV2_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[ScanRequest, ScanResponse]{ClientStream: stream}
+	if err := x.ClientStream.SendMsg(in); err != nil {
+		return nil, err
+	}
+	if err := x.ClientStream.CloseSend(); err != nil {
+		return nil, err
+	}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type ShoalEmbed_ScanV2Client = grpc.ServerStreamingClient[ScanResponse]
+
 func (c *shoalEmbedClient) Flush(ctx context.Context, in *FlushRequest, opts ...grpc.CallOption) (*FlushResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(FlushResponse)
@@ -176,6 +200,10 @@ type ShoalEmbedServer interface {
 	ConditionalWrite(context.Context, *WriteRequest) (*WriteResponse, error)
 	// Scan reads cells from a table. Results are streamed back.
 	Scan(*ScanRequest, grpc.ServerStreamingServer[ScanResponse]) error
+	// ScanV2 enforces safety-critical vector embedding-space identity. Clients
+	// issuing vector_search must use this RPC so pre-V2 servers fail closed with
+	// UNIMPLEMENTED rather than ignoring the embedding_space field.
+	ScanV2(*ScanRequest, grpc.ServerStreamingServer[ScanResponse]) error
 	// Flush forces memtables to RFiles for a table.
 	Flush(context.Context, *FlushRequest) (*FlushResponse, error)
 	// Compact runs major compaction on a table.
@@ -203,6 +231,9 @@ func (UnimplementedShoalEmbedServer) ConditionalWrite(context.Context, *WriteReq
 }
 func (UnimplementedShoalEmbedServer) Scan(*ScanRequest, grpc.ServerStreamingServer[ScanResponse]) error {
 	return status.Error(codes.Unimplemented, "method Scan not implemented")
+}
+func (UnimplementedShoalEmbedServer) ScanV2(*ScanRequest, grpc.ServerStreamingServer[ScanResponse]) error {
+	return status.Error(codes.Unimplemented, "method ScanV2 not implemented")
 }
 func (UnimplementedShoalEmbedServer) Flush(context.Context, *FlushRequest) (*FlushResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Flush not implemented")
@@ -299,6 +330,17 @@ func _ShoalEmbed_Scan_Handler(srv interface{}, stream grpc.ServerStream) error {
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type ShoalEmbed_ScanServer = grpc.ServerStreamingServer[ScanResponse]
 
+func _ShoalEmbed_ScanV2_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(ScanRequest)
+	if err := stream.RecvMsg(m); err != nil {
+		return err
+	}
+	return srv.(ShoalEmbedServer).ScanV2(m, &grpc.GenericServerStream[ScanRequest, ScanResponse]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type ShoalEmbed_ScanV2Server = grpc.ServerStreamingServer[ScanResponse]
+
 func _ShoalEmbed_Flush_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(FlushRequest)
 	if err := dec(in); err != nil {
@@ -389,6 +431,11 @@ var ShoalEmbed_ServiceDesc = grpc.ServiceDesc{
 		{
 			StreamName:    "Scan",
 			Handler:       _ShoalEmbed_Scan_Handler,
+			ServerStreams: true,
+		},
+		{
+			StreamName:    "ScanV2",
+			Handler:       _ShoalEmbed_ScanV2_Handler,
 			ServerStreams: true,
 		},
 	},

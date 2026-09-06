@@ -2243,13 +2243,14 @@ const file_proto_embed_proto_rawDesc = "" +
 	"\x0eMutationStatus\x12\x1f\n" +
 	"\x1bMUTATION_STATUS_UNSPECIFIED\x10\x00\x12\x1c\n" +
 	"\x18MUTATION_STATUS_ACCEPTED\x10\x01\x12\x1c\n" +
-	"\x18MUTATION_STATUS_REJECTED\x10\x022\x9b\x04\n" +
+	"\x18MUTATION_STATUS_REJECTED\x10\x022\xe2\x04\n" +
 	"\n" +
 	"ShoalEmbed\x12V\n" +
 	"\vCreateTable\x12\".shoal.embed.v1.CreateTableRequest\x1a#.shoal.embed.v1.CreateTableResponse\x12D\n" +
 	"\x05Write\x12\x1c.shoal.embed.v1.WriteRequest\x1a\x1d.shoal.embed.v1.WriteResponse\x12O\n" +
 	"\x10ConditionalWrite\x12\x1c.shoal.embed.v1.WriteRequest\x1a\x1d.shoal.embed.v1.WriteResponse\x12C\n" +
-	"\x04Scan\x12\x1b.shoal.embed.v1.ScanRequest\x1a\x1c.shoal.embed.v1.ScanResponse0\x01\x12D\n" +
+	"\x04Scan\x12\x1b.shoal.embed.v1.ScanRequest\x1a\x1c.shoal.embed.v1.ScanResponse0\x01\x12E\n" +
+	"\x06ScanV2\x12\x1b.shoal.embed.v1.ScanRequest\x1a\x1c.shoal.embed.v1.ScanResponse0\x01\x12D\n" +
 	"\x05Flush\x12\x1c.shoal.embed.v1.FlushRequest\x1a\x1d.shoal.embed.v1.FlushResponse\x12J\n" +
 	"\aCompact\x12\x1e.shoal.embed.v1.CompactRequest\x1a\x1f.shoal.embed.v1.CompactResponse\x12G\n" +
 	"\x06Status\x12\x1d.shoal.embed.v1.StatusRequest\x1a\x1e.shoal.embed.v1.StatusResponseB0Z.github.com/phrocker/shoal-oss/internal/embedpbb\x06proto3"
@@ -2325,18 +2326,20 @@ var file_proto_embed_proto_depIdxs = []int32{
 	8,  // 24: shoal.embed.v1.ShoalEmbed.Write:input_type -> shoal.embed.v1.WriteRequest
 	8,  // 25: shoal.embed.v1.ShoalEmbed.ConditionalWrite:input_type -> shoal.embed.v1.WriteRequest
 	11, // 26: shoal.embed.v1.ShoalEmbed.Scan:input_type -> shoal.embed.v1.ScanRequest
-	20, // 27: shoal.embed.v1.ShoalEmbed.Flush:input_type -> shoal.embed.v1.FlushRequest
-	22, // 28: shoal.embed.v1.ShoalEmbed.Compact:input_type -> shoal.embed.v1.CompactRequest
-	24, // 29: shoal.embed.v1.ShoalEmbed.Status:input_type -> shoal.embed.v1.StatusRequest
-	4,  // 30: shoal.embed.v1.ShoalEmbed.CreateTable:output_type -> shoal.embed.v1.CreateTableResponse
-	10, // 31: shoal.embed.v1.ShoalEmbed.Write:output_type -> shoal.embed.v1.WriteResponse
-	10, // 32: shoal.embed.v1.ShoalEmbed.ConditionalWrite:output_type -> shoal.embed.v1.WriteResponse
-	19, // 33: shoal.embed.v1.ShoalEmbed.Scan:output_type -> shoal.embed.v1.ScanResponse
-	21, // 34: shoal.embed.v1.ShoalEmbed.Flush:output_type -> shoal.embed.v1.FlushResponse
-	23, // 35: shoal.embed.v1.ShoalEmbed.Compact:output_type -> shoal.embed.v1.CompactResponse
-	26, // 36: shoal.embed.v1.ShoalEmbed.Status:output_type -> shoal.embed.v1.StatusResponse
-	30, // [30:37] is the sub-list for method output_type
-	23, // [23:30] is the sub-list for method input_type
+	11, // 27: shoal.embed.v1.ShoalEmbed.ScanV2:input_type -> shoal.embed.v1.ScanRequest
+	20, // 28: shoal.embed.v1.ShoalEmbed.Flush:input_type -> shoal.embed.v1.FlushRequest
+	22, // 29: shoal.embed.v1.ShoalEmbed.Compact:input_type -> shoal.embed.v1.CompactRequest
+	24, // 30: shoal.embed.v1.ShoalEmbed.Status:input_type -> shoal.embed.v1.StatusRequest
+	4,  // 31: shoal.embed.v1.ShoalEmbed.CreateTable:output_type -> shoal.embed.v1.CreateTableResponse
+	10, // 32: shoal.embed.v1.ShoalEmbed.Write:output_type -> shoal.embed.v1.WriteResponse
+	10, // 33: shoal.embed.v1.ShoalEmbed.ConditionalWrite:output_type -> shoal.embed.v1.WriteResponse
+	19, // 34: shoal.embed.v1.ShoalEmbed.Scan:output_type -> shoal.embed.v1.ScanResponse
+	19, // 35: shoal.embed.v1.ShoalEmbed.ScanV2:output_type -> shoal.embed.v1.ScanResponse
+	21, // 36: shoal.embed.v1.ShoalEmbed.Flush:output_type -> shoal.embed.v1.FlushResponse
+	23, // 37: shoal.embed.v1.ShoalEmbed.Compact:output_type -> shoal.embed.v1.CompactResponse
+	26, // 38: shoal.embed.v1.ShoalEmbed.Status:output_type -> shoal.embed.v1.StatusResponse
+	31, // [31:39] is the sub-list for method output_type
+	23, // [23:31] is the sub-list for method input_type
 	23, // [23:23] is the sub-list for extension type_name
 	23, // [23:23] is the sub-list for extension extendee
 	0,  // [0:23] is the sub-list for field type_name

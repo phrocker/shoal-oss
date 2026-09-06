@@ -252,7 +252,13 @@ func (s GRPCStore) Flush(ctx context.Context, table string) error {
 func (s GRPCStore) Scan(ctx context.Context, table string, req *embedpb.ScanRequest) ([]*embedpb.Cell, error) {
 	clone := proto.Clone(req).(*embedpb.ScanRequest)
 	clone.Table = table
-	stream, err := s.Client.Scan(ctx, clone)
+	var stream grpc.ServerStreamingClient[embedpb.ScanResponse]
+	var err error
+	if clone.VectorSearch != nil {
+		stream, err = s.Client.ScanV2(ctx, clone)
+	} else {
+		stream, err = s.Client.Scan(ctx, clone)
+	}
 	if err != nil {
 		return nil, err
 	}

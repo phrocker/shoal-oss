@@ -34,8 +34,11 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 
+	"github.com/phrocker/shoal-oss/internal/agentmem"
 	"github.com/phrocker/shoal-oss/internal/embedpb"
 )
 
@@ -359,6 +362,65 @@ func startStuckStreamingScan(t *testing.T, h *serveHandle) {
 	// Deliberately never call Recv again: give the still-running handler
 	// goroutine time to fill the pinned window and block in Send.
 	time.Sleep(200 * time.Millisecond)
+}
+
+func TestVectorScanRequiresVersionedRPC(t *testing.T) {
+	h := startTestServe(t)
+	conn, err := grpc.NewClient(
+		h.GRPCAddr,
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	client := embedpb.NewShoalEmbedClient(conn)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	const identity = "test:model:v1:1:normalized"
+	if _, err := client.CreateTable(ctx, &embedpb.CreateTableRequest{
+		Table: "vectors", DefaultEmbedding: "has_embeddings:" + identity,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.Write(ctx, &embedpb.WriteRequest{
+		Table: "vectors",
+		Mutations: []*embedpb.Mutation{{
+			Row: []byte("row"),
+			Entries: []*embedpb.Entry{{
+				ColumnFamily: []byte("vec"),
+				Value:        agentmem.PackVector([]float32{1}),
+			}},
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	request := &embedpb.ScanRequest{
+		Table: "vectors",
+		VectorSearch: &embedpb.VectorSearch{
+			Query:          agentmem.PackVector([]float32{1}),
+			EmbeddingCf:    []byte("vec"),
+			EmbeddingSpace: identity,
+		},
+	}
+	legacy, err := client.Scan(ctx, request)
+	if err == nil {
+		_, err = legacy.Recv()
+	}
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("legacy vector Scan error = %v", err)
+	}
+	safe, err := client.ScanV2(ctx, request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := safe.Recv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(response.Cells) != 1 {
+		t.Fatalf("ScanV2 cells = %d, want 1", len(response.Cells))
+	}
 }
 
 // TestServeHandleStopIsBoundedByDrainTimeout guards a real bug found while

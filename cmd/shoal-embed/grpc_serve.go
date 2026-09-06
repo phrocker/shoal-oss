@@ -307,7 +307,32 @@ func scanStatusError(err error) error {
 	}
 }
 
-func (s *embedServer) Scan(req *embedpb.ScanRequest, stream embedpb.ShoalEmbed_ScanServer) error {
+type scanServer interface {
+	Context() context.Context
+	Send(*embedpb.ScanResponse) error
+}
+
+func (s *embedServer) Scan(
+	req *embedpb.ScanRequest,
+	stream embedpb.ShoalEmbed_ScanServer,
+) error {
+	if req.VectorSearch != nil {
+		return status.Error(
+			codes.FailedPrecondition,
+			"vector_search requires ScanV2 identity enforcement",
+		)
+	}
+	return s.scan(req, stream)
+}
+
+func (s *embedServer) ScanV2(
+	req *embedpb.ScanRequest,
+	stream embedpb.ShoalEmbed_ScanV2Server,
+) error {
+	return s.scan(req, stream)
+}
+
+func (s *embedServer) scan(req *embedpb.ScanRequest, stream scanServer) error {
 	if req.Table == "" {
 		return status.Error(codes.InvalidArgument, "table is required")
 	}

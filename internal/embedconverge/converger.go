@@ -255,8 +255,9 @@ func (a *convergeAttempt) Convert(
 	if key != nil {
 		rewriteKey = key.Clone()
 	}
+	rewriteValue := append([]byte(nil), value...)
 	return a.converger.rewriter.Rewrite(
-		ctx, a.converger.target, rewriteKey, value)
+		ctx, a.converger.target, rewriteKey, rewriteValue)
 }
 
 // End settles the attempt against the Governor's reservation and reports

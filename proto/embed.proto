@@ -39,6 +39,11 @@ service ShoalEmbed {
   // Scan reads cells from a table. Results are streamed back.
   rpc Scan(ScanRequest) returns (stream ScanResponse);
 
+  // ScanV2 enforces safety-critical vector embedding-space identity. Clients
+  // issuing vector_search must use this RPC so pre-V2 servers fail closed with
+  // UNIMPLEMENTED rather than ignoring the embedding_space field.
+  rpc ScanV2(ScanRequest) returns (stream ScanResponse);
+
   // Flush forces memtables to RFiles for a table.
   rpc Flush(FlushRequest) returns (FlushResponse);
 
