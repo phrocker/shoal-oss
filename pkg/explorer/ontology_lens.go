@@ -51,6 +51,7 @@ func (e *Explorer) InterpretAssertions(
 	}
 	var target ontology.OntologyVersion
 	var morphisms []ontology.OntologyMorphism
+	var transitions []ontology.OntologyTransition
 	publishedTransitions := make(map[string]struct{})
 	ambiguousPublication := false
 	for _, record := range e.ontologyProposals {
@@ -63,11 +64,27 @@ func (e *Explorer) InterpretAssertions(
 		}
 		baseID, hasBase := proposal.BaseVersionID()
 		if hasBase {
-			key := string(baseID) + "->" + string(proposal.ProposedVersion().ID())
+			key := string(baseID)
 			if _, duplicate := publishedTransitions[key]; duplicate {
 				ambiguousPublication = true
 			}
 			publishedTransitions[key] = struct{}{}
+			source, identityErr := ontology.NewOntologyIdentityFromIDs(
+				proposal.Schema().ID(), baseID)
+			if identityErr != nil {
+				return nil, identityErr
+			}
+			targetIdentity, identityErr := ontology.NewOntologyIdentity(
+				proposal.ProposedVersion())
+			if identityErr != nil {
+				return nil, identityErr
+			}
+			transition, transitionErr := ontology.NewOntologyTransition(
+				source, targetIdentity)
+			if transitionErr != nil {
+				return nil, transitionErr
+			}
+			transitions = append(transitions, transition)
 		}
 		if identity, _ := ontology.NewOntologyIdentity(proposal.ProposedVersion()); identity == selected {
 			target = proposal.ProposedVersion()
@@ -97,7 +114,8 @@ func (e *Explorer) InterpretAssertions(
 		}
 		return out, nil
 	}
-	lens, err := ontology.NewOntologyLens(target, morphisms)
+	lens, err := ontology.NewOntologyLensWithTransitions(
+		target, transitions, morphisms)
 	if err != nil {
 		return nil, err
 	}
