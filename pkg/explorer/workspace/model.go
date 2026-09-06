@@ -313,6 +313,11 @@ func normalizePolicies(policies []auth.Policy) ([]auth.Policy, error) {
 		previous = item.encoded
 		result = append(result, item.policy)
 	}
+	if len(result) > 0 {
+		if _, err := auth.ConjoinPolicies(result...); err != nil {
+			return nil, err
+		}
+	}
 	return result, nil
 }
 
