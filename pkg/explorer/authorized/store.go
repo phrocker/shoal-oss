@@ -1492,7 +1492,8 @@ func graphEdgesEqual(left, right graph.Edge) bool {
 		return false
 	}
 	for key, value := range left.Properties {
-		if right.Properties[key] != value {
+		other, ok := right.Properties[key]
+		if !ok || other != value {
 			return false
 		}
 	}

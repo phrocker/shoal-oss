@@ -108,10 +108,10 @@ func TestNonAnalyticsInteractionRejectsUnverifiedExactEvidence(t *testing.T) {
 
 	first := graph.Edge{
 		ID: "edge", From: "from", To: "to", Type: "related",
-		Properties: shoal.Metadata{"source": "first"},
+		Properties: shoal.Metadata{"first": ""},
 	}
 	second := first
-	second.Properties = shoal.Metadata{"source": "second"}
+	second.Properties = shoal.Metadata{"second": ""}
 	withConflict := base
 	withConflict.ID = "session-conflicting-edge"
 	withConflict.CitedEdges = []graph.Edge{first}
