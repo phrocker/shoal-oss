@@ -22,6 +22,7 @@ package explorer_test
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -443,6 +444,13 @@ func TestExactEdgeEvidenceSurvivesRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	embeddingSpaces, err := interaction.NewEmbeddingSpaceSet([]string{
+		"18:embedding-space-v15:alpha",
+		"18:embedding-space-v14:beta",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	session := interaction.Session{
 		ID:                       interaction.DerivedID("session", "edge-restart"),
 		RecordedAt:               snapshot.AsOf.Add(time.Second),
@@ -451,6 +459,7 @@ func TestExactEdgeEvidenceSurvivesRestart(t *testing.T) {
 		SnapshotAsOf:             snapshot.AsOf,
 		AuthorizationFingerprint: "auth-sha256:edge-restart",
 		AuthorizationExpiresAt:   snapshot.AsOf.Add(time.Hour),
+		EmbeddingSpaces:          embeddingSpaces,
 		SeedNodeIDs:              []shoal.ID{edge.From, edge.To},
 		SeedEvidence: []interaction.EvidenceReference{{
 			AnchorID: "edge-anchor",
@@ -494,6 +503,12 @@ func TestExactEdgeEvidenceSurvivesRestart(t *testing.T) {
 		len(record.Session.SeedEvidence) != 1 ||
 		record.Session.SeedEvidence[0].EdgeIDs[0] != edge.ID {
 		t.Fatalf("hydrated exact evidence = %+v", record)
+	}
+	if !reflect.DeepEqual(
+		record.Session.EmbeddingSpaces, embeddingSpaces,
+	) || record.Summary.EmbeddingSpaceDigest != embeddingSpaces.Digest ||
+		record.Summary.EmbeddingSpaceCount != 2 {
+		t.Fatalf("hydrated embedding spaces = %+v", record)
 	}
 	if record.Summary.Visibility != "edge-secret&ops" {
 		t.Fatalf("edge-aware visibility = %q", record.Summary.Visibility)

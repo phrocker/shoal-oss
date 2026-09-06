@@ -23,6 +23,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -237,6 +238,37 @@ func TestInteractionSessionPreservesExecutionPins(t *testing.T) {
 		!session.AuthorizationExpiresAt.Equal(expiresAt) ||
 		session.EmbeddingSpaceID != "embedding-space-v3" {
 		t.Fatalf("session pins = %+v", session)
+	}
+}
+
+func TestInteractionSessionPreservesCanonicalEmbeddingSpaces(t *testing.T) {
+	model, prompt := provenanceParts(t)
+	provenance, err := NewProvenance(
+		"fake-harness", model, prompt, "grounded-tools-v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	spaces, err := interaction.NewEmbeddingSpaceSet([]string{
+		"18:embedding-space-v15:alpha",
+		"18:embedding-space-v14:beta",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := InteractionSession(EvaluationRecord{
+		Provenance:               provenance,
+		TranscriptID:             "transcript-spaces",
+		SnapshotID:               "snapshot-spaces",
+		SnapshotAsOf:             fixedTime.Add(-time.Minute),
+		AuthorizationFingerprint: "auth-sha256:spaces",
+		AuthorizationExpiresAt:   fixedTime.Add(time.Hour),
+		EmbeddingSpaces:          spaces,
+	}, fixedTime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(session.EmbeddingSpaces, spaces) {
+		t.Fatalf("session embedding spaces = %+v", session.EmbeddingSpaces)
 	}
 }
 

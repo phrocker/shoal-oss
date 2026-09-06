@@ -128,6 +128,8 @@ const (
 	PropertyAuthFingerprint = "interaction.authorization_fingerprint"
 	PropertyAuthExpiresAt   = "interaction.authorization_expires_at"
 	PropertyEmbeddingSpace  = "interaction.embedding_space"
+	PropertyEmbeddingSpaces = "interaction.embedding_space_set_digest"
+	PropertyEmbeddingCount  = "interaction.embedding_space_count"
 	PropertyOperation       = "interaction.operation"
 	PropertySubjectID       = "interaction.subject_id"
 	PropertyActorID         = "interaction.actor_id"
@@ -357,13 +359,17 @@ type Session struct {
 	SnapshotAsOf             time.Time
 	AuthorizationFingerprint shoal.ID
 	AuthorizationExpiresAt   time.Time
-	EmbeddingSpaceID         shoal.ID
-	Provenance               Provenance
-	QueryDigest              string
-	RequestID                shoal.ID
-	ContextPackID            shoal.ID
-	ResultID                 shoal.ID
-	StopReason               string
+	// EmbeddingSpaceID is retained for legacy single/set-ID records.
+	EmbeddingSpaceID shoal.ID
+	// EmbeddingSpaces carries canonical stable full identities from the core
+	// request-local embedding query observer.
+	EmbeddingSpaces EmbeddingSpaceSet
+	Provenance      Provenance
+	QueryDigest     string
+	RequestID       shoal.ID
+	ContextPackID   shoal.ID
+	ResultID        shoal.ID
+	StopReason      string
 
 	// SeedNodeIDs are source nodes the session was shown before its first
 	// turn. They count as retrieved.
@@ -667,6 +673,16 @@ func (s Session) Validate() error {
 	); err != nil {
 		return err
 	}
+	if err := s.EmbeddingSpaces.Validate(); err != nil {
+		return err
+	}
+	if s.EmbeddingSpaceID != "" &&
+		len(s.EmbeddingSpaces.Identities) > 0 {
+		return shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			"interaction cannot mix legacy and canonical embedding space pins",
+		)
+	}
 	for _, id := range s.SeedNodeIDs {
 		if err := shoal.ValidateRequiredID("interaction seed node ID", id); err != nil {
 			return err
@@ -773,6 +789,10 @@ func (s Session) Canonical() (Session, error) {
 	canonical.RecordedAt = s.RecordedAt.UTC()
 	canonical.SnapshotAsOf = s.SnapshotAsOf.UTC()
 	canonical.AuthorizationExpiresAt = s.AuthorizationExpiresAt.UTC()
+	canonical.EmbeddingSpaces, err = s.EmbeddingSpaces.Canonical()
+	if err != nil {
+		return Session{}, err
+	}
 	canonical.Actor.OnBehalfOf = append(
 		[]shoal.ID(nil), s.Actor.OnBehalfOf...)
 	canonical.SeedNodeIDs = dedupeIDs(s.SeedNodeIDs)
@@ -956,6 +976,14 @@ func (s Session) SubgraphWithEvidence(
 		string(s.EmbeddingSpaceID),
 	)
 	setIfPresent(
+		sessionNode.Properties, PropertyEmbeddingSpaces,
+		s.EmbeddingSpaces.Digest,
+	)
+	if len(s.EmbeddingSpaces.Identities) > 0 {
+		sessionNode.Properties[PropertyEmbeddingCount] =
+			strconv.Itoa(len(s.EmbeddingSpaces.Identities))
+	}
+	setIfPresent(
 		sessionNode.Properties, PropertySubjectID, string(s.Actor.SubjectID))
 	setIfPresent(
 		sessionNode.Properties, PropertyActorID, string(s.Actor.ActorID))
@@ -1046,6 +1074,15 @@ func (s Session) SubgraphWithEvidence(
 			PropertyEmbeddingSpace,
 			string(s.EmbeddingSpaceID),
 		)
+		setIfPresent(
+			inferenceNode.Properties,
+			PropertyEmbeddingSpaces,
+			s.EmbeddingSpaces.Digest,
+		)
+		if len(s.EmbeddingSpaces.Identities) > 0 {
+			inferenceNode.Properties[PropertyEmbeddingCount] =
+				strconv.Itoa(len(s.EmbeddingSpaces.Identities))
+		}
 		nodes = append(nodes, inferenceNode)
 		edges = append(
 			edges, provenanceEdge(EdgeHasInference, s.ID, inferenceID))

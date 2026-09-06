@@ -151,6 +151,7 @@ func InteractionSession(
 		AuthorizationFingerprint: record.AuthorizationFingerprint,
 		AuthorizationExpiresAt:   record.AuthorizationExpiresAt,
 		EmbeddingSpaceID:         record.EmbeddingSpaceID,
+		EmbeddingSpaces:          record.EmbeddingSpaces,
 		Provenance: interaction.Provenance{
 			Harness:      interactionIdentifier(record.Provenance.Harness()),
 			Provider:     interactionIdentifier(record.Provenance.Provider()),

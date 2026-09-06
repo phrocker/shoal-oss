@@ -691,6 +691,7 @@ type EvaluationRecord struct {
 	AuthorizationFingerprint shoal.ID
 	AuthorizationExpiresAt   time.Time
 	EmbeddingSpaceID         shoal.ID
+	EmbeddingSpaces          interaction.EmbeddingSpaceSet
 
 	// SeedNodeIDs are source graph nodes the session was shown before its
 	// first turn. CitedNodeIDs are the source graph nodes the final answer

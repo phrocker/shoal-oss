@@ -41,6 +41,8 @@ type InteractionSummary struct {
 	AuthorizationFingerprint shoal.ID
 	AuthorizationExpiresAt   time.Time
 	EmbeddingSpaceID         shoal.ID
+	EmbeddingSpaceDigest     string
+	EmbeddingSpaceCount      int
 	Operation                interaction.Operation
 	Actor                    interaction.ActorContext
 	Reason                   interaction.Reason
@@ -1143,6 +1145,8 @@ func validatePersistedInteraction(record persistedInteraction) error {
 func cloneInteractionSession(session interaction.Session) interaction.Session {
 	cloned := session
 	cloned.Actor = cloneActorContext(session.Actor)
+	cloned.EmbeddingSpaces.Identities = append(
+		[]string(nil), session.EmbeddingSpaces.Identities...)
 	cloned.SeedNodeIDs = append([]shoal.ID(nil), session.SeedNodeIDs...)
 	cloned.SeedEvidence = cloneEvidenceReferences(session.SeedEvidence)
 	cloned.CitedNodeIDs = append([]shoal.ID(nil), session.CitedNodeIDs...)
@@ -1190,6 +1194,8 @@ func interactionSummary(record persistedInteraction) InteractionSummary {
 		AuthorizationFingerprint: record.AuthorizationFingerprint,
 		AuthorizationExpiresAt:   record.AuthorizationExpiresAt,
 		EmbeddingSpaceID:         record.EmbeddingSpaceID,
+		EmbeddingSpaceDigest:     record.Session.EmbeddingSpaces.Digest,
+		EmbeddingSpaceCount:      len(record.Session.EmbeddingSpaces.Identities),
 		Operation:                record.Operation,
 		Actor:                    cloneActorContext(record.Actor),
 		Reason:                   record.Reason,
