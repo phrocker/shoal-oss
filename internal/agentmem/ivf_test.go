@@ -151,6 +151,32 @@ func TestIvfIndex_LoadAndSearch(t *testing.T) {
 	); !errors.Is(err, embeddingspace.ErrMismatch) {
 		t.Fatalf("foreign LoadIvfIndexInSpace error = %v", err)
 	}
+	if err := store.Write(ctx, ivfpq.IvfTableName(table), []*embedpb.Mutation{{
+		Row: []byte(ivfpq.RowKey(0, "evt:stale-only")),
+		Entries: []*embedpb.Entry{
+			{
+				ColumnFamily:    []byte(ivfpq.ColFam),
+				ColumnQualifier: []byte(ivfpq.QualPQCode),
+				Value:           []byte{0, 0},
+			},
+			{
+				ColumnFamily:    []byte(ivfpq.ColFam),
+				ColumnQualifier: []byte(ivfpq.QualCodebookVersion),
+				Value:           []byte("0"),
+			},
+		},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	hits, err := ix.SearchInSpace(ctx, vecs[0], space, 100, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, hit := range hits {
+		if hit.Row == "evt:stale-only" {
+			t.Fatal("stale codebook posting was scored")
+		}
+	}
 
 	// Probe all clusters (full recall) and confirm each vector retrieves
 	// itself as the top hit.
