@@ -92,8 +92,33 @@ func (r *Runtime) ReadCommittedCell(
 	row, family, qualifier, visibility []byte,
 	epoch coordination.Epoch,
 ) (CommittedCell, bool, error) {
+	return r.readCommittedCell(
+		ctx,
+		table,
+		row,
+		family,
+		qualifier,
+		visibility,
+		epoch,
+		MaxCommittedScanCells,
+	)
+}
+
+func (r *Runtime) readCommittedCell(
+	ctx context.Context,
+	table string,
+	row, family, qualifier, visibility []byte,
+	epoch coordination.Epoch,
+	maxScanned int,
+) (CommittedCell, bool, error) {
 	if err := epoch.Validate(); err != nil {
 		return CommittedCell{}, false, errors.Join(transaction.ErrInvalid, err)
+	}
+	if maxScanned < 1 || maxScanned > MaxCommittedScanCells {
+		return CommittedCell{}, false, errors.Join(
+			transaction.ErrInvalid,
+			errors.New("committed exact read work limit is outside its bound"),
+		)
 	}
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -145,18 +170,18 @@ func (r *Runtime) ReadCommittedCell(
 		if err := ctx.Err(); err != nil {
 			return CommittedCell{}, false, err
 		}
-		scanned++
-		if scanned > MaxCommittedScanCells {
-			return CommittedCell{}, false, errors.Join(
-				transaction.ErrUnavailable,
-				errors.New("committed exact read work limit exhausted"),
-			)
-		}
 		key := scanner.Key()
 		if bytes.Equal(key.Row, row) &&
 			bytes.Equal(key.ColumnFamily, family) &&
 			bytes.Equal(key.ColumnQualifier, qualifier) &&
 			bytes.Equal(key.ColumnVisibility, visibility) {
+			scanned++
+			if scanned > maxScanned {
+				return CommittedCell{}, false, errors.Join(
+					transaction.ErrUnavailable,
+					errors.New("committed exact read work limit exhausted"),
+				)
+			}
 			versions = append(versions, physicalVersion{
 				key:   *key.Clone(),
 				value: append([]byte(nil), scanner.Value()...),
@@ -279,6 +304,11 @@ func (r *Runtime) ScanCommitted(
 			transaction.ErrInvalid,
 			errors.New("committed scan work limit is outside its bound"),
 		)
+	}
+	if request.Frontier != 0 {
+		if err := request.Frontier.Validate(); err != nil {
+			return CommittedPage{}, errors.Join(transaction.ErrInvalid, err)
+		}
 	}
 	head, err := r.allocator.CurrentHead(ctx)
 	if err != nil {

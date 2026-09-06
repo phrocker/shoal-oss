@@ -786,22 +786,24 @@ func (r *Runtime) RecordAttempt(
 		)
 	}
 	var value []byte
+	foundValue := false
 	for _, cell := range record.Intent.Cells {
 		if cell.Table == request.Table &&
 			bytes.Equal(cell.Row, request.Row) &&
 			bytes.Equal(cell.Family, request.Family) &&
 			bytes.Equal(cell.Qualifier, request.Qualifier) &&
 			bytes.Equal(cell.Visibility, request.Visibility) {
-			if value != nil {
+			if foundValue {
 				return nil, fmt.Errorf(
 					"%w: record attempt has duplicate physical cells",
 					transaction.ErrInternal,
 				)
 			}
+			foundValue = true
 			value = append([]byte(nil), cell.Value...)
 		}
 	}
-	if value == nil {
+	if !foundValue {
 		return nil, transaction.ErrConflict
 	}
 	expected := record.Intent.Guards[0]
