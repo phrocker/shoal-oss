@@ -448,6 +448,123 @@ func TestPrunePlanAndVerifierBindTombstoneSemantics(t *testing.T) {
 	}
 }
 
+func TestPruneCommittedRetiresOnlyOwningGuardsAcrossSharedPartition(t *testing.T) {
+	config := testRuntimeConfig(t, testDirectory(t))
+	runtime, err := Open(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.Close()
+	stream := guard.Entity{
+		Kind: 'E',
+		ID:   coordination.EntityID("shared-event-stream"),
+	}
+	lpart, err := Partition(config.Domain, stream.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var streamHead *guard.Head
+	targets := make([]PruneTarget, 0, 2)
+	for index := 1; index <= 2; index++ {
+		row := []byte(fmt.Sprintf("shared/%04d", index))
+		eventEntity := guard.Entity{
+			Kind: 'e',
+			ID:   coordination.EntityID(fmt.Sprintf("event-%04d", index)),
+		}
+		streamMode := guard.ModeAbsentOrIdentical
+		var expectedEpoch coordination.Epoch
+		var expectedDigest coordination.Digest
+		if streamHead != nil {
+			streamMode = guard.ModeMutate
+			expectedEpoch = streamHead.Epoch
+			expectedDigest = streamHead.LogicalDigest
+		}
+		intent := Intent{
+			Operation: []byte("shared-event-publish"),
+			Token:     []byte(fmt.Sprintf("shared-event-%04d", index)),
+			Cells: []Cell{{
+				Table: "records", Row: row,
+				Family: []byte("event"), Qualifier: []byte("record"),
+				Value:          []byte(fmt.Sprintf("value-%04d", index)),
+				EpochTimestamp: true, LPART: lpart, CopyGeneration: 1,
+			}},
+			Guards: []GuardIntent{
+				{
+					Entity: stream, Mode: streamMode,
+					ExpectedEpoch: expectedEpoch, ExpectedDigest: expectedDigest,
+					DesiredState:    guard.StateLive,
+					DesiredWinnerID: []byte(fmt.Sprintf("%04d", index)),
+					LPART:           lpart, LogicalPolicyID: []byte("events/shared"),
+					RetirementGeneration: 1,
+				},
+				{
+					Entity: eventEntity, Mode: guard.ModeAbsentOrIdentical,
+					DesiredState:    guard.StateLive,
+					DesiredWinnerID: []byte(fmt.Sprintf("%04d", index)),
+					LPART:           lpart, LogicalPolicyID: []byte("events/shared"),
+					RetirementGeneration: 1,
+				},
+			},
+		}
+		result, err := runtime.Publish(
+			context.Background(),
+			Request{Intent: intent},
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		streamHead, _, err = runtime.ReadEntity(context.Background(), stream)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cell, found, err := runtime.ReadCommittedCell(
+			context.Background(),
+			"records",
+			row,
+			[]byte("event"),
+			[]byte("record"),
+			nil,
+			result.Epoch,
+		)
+		if err != nil || !found {
+			t.Fatalf("shared event cell = %#v, %v, %v", cell, found, err)
+		}
+		targets = append(targets, PruneTarget{
+			Table: "records", Cell: cell, Entity: eventEntity,
+		})
+	}
+	result, err := runtime.PruneCommitted(
+		context.Background(),
+		pruneTestRequest(
+			t,
+			config.Domain,
+			"shared-prune",
+			3,
+			nil,
+			targets,
+		),
+	)
+	if err != nil || result.Pruned != 2 {
+		t.Fatalf("shared-partition prune = %#v, %v", result, err)
+	}
+	currentStream, pending, err := runtime.ReadEntity(context.Background(), stream)
+	if err != nil || currentStream == nil ||
+		currentStream.State != guard.StateLive ||
+		currentStream.Epoch != streamHead.Epoch ||
+		pending != nil && pending.Active {
+		t.Fatalf("shared stream after prune = %#v, %#v, %v", currentStream, pending, err)
+	}
+	for _, target := range targets {
+		head, pending, err := runtime.ReadEntity(context.Background(), target.Entity)
+		if err != nil || head == nil ||
+			head.State != guard.StateTombstone ||
+			head.Epoch != result.Epoch ||
+			pending != nil && pending.Active {
+			t.Fatalf("retired shared event = %#v, %#v, %v", head, pending, err)
+		}
+	}
+}
+
 func publishPruneTarget(
 	t *testing.T,
 	runtime *Runtime,
