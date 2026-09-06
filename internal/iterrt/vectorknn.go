@@ -27,7 +27,6 @@ import (
 	"math"
 	"sort"
 	"strconv"
-	"strings"
 
 	"github.com/phrocker/shoal-oss/internal/embeddingspace"
 )
@@ -142,7 +141,7 @@ func (v *VectorKNNIterator) Init(source SortedKeyValueIterator, options map[stri
 		return fmt.Errorf("iterrt: VectorKNNIterator %s is empty", VectorKNNQuery)
 	}
 	v.queryNorm = knnNorm(v.query)
-	v.querySpace = strings.TrimSpace(options[VectorKNNEmbeddingSpace])
+	v.querySpace = options[VectorKNNEmbeddingSpace]
 	if err := embeddingspace.ValidateQueryStates(
 		"initialize exact vector iterator", v.querySpace); err != nil {
 		return fmt.Errorf("iterrt: VectorKNNIterator: %w", err)

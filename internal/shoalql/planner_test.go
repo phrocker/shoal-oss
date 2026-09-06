@@ -332,6 +332,16 @@ func TestPlan_VectorKNNRequiresEmbeddingIdentity(t *testing.T) {
 	}
 }
 
+func TestPlan_VectorKNNRejectsNonCanonicalEmbeddingIdentity(t *testing.T) {
+	st, _ := Parse("SELECT id FROM events ORDER BY embedding <-> [1,0] LIMIT 3")
+	b, _ := NewGraphCatalog("graph").Binding("events")
+	if _, err := PlanQuery(context.Background(), st, b, PlanOptions{
+		Vector: VectorOptions{EmbeddingSpace: " space-a "},
+	}); !errors.Is(err, embeddingspace.ErrInvalidState) {
+		t.Fatalf("non-canonical identity error = %v", err)
+	}
+}
+
 func TestPlan_OrderByNonVectorColumnErrors(t *testing.T) {
 	st, _ := Parse("SELECT id FROM events ORDER BY content <-> [1,2] LIMIT 3")
 	b, _ := NewGraphCatalog("graph").Binding("events")

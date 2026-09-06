@@ -520,7 +520,7 @@ func resolveVectorEmbeddingSpace(
 	opts PlanOptions,
 	operation string,
 ) (string, error) {
-	configured := strings.TrimSpace(opts.Vector.EmbeddingSpace)
+	configured := opts.Vector.EmbeddingSpace
 	if target.Kind != VecText {
 		if err := embeddingspace.ValidateQueryStates(
 			operation, configured); err != nil {
@@ -541,7 +541,6 @@ func resolveVectorEmbeddingSpace(
 	if err != nil {
 		return "", fmt.Errorf("shoalql: resolve text embedding identity: %w", err)
 	}
-	identity = strings.TrimSpace(identity)
 	if err := embeddingspace.ValidateQueryStates(operation, identity); err != nil {
 		return "", err
 	}
