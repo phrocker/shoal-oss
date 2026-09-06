@@ -665,6 +665,44 @@ func (t *Tablet) SourceContext(
 	return t.sourceLockedContext(ctx, env)
 }
 
+// SnapshotSourceContext returns a source whose memtable component is copied
+// while holding the tablet lock. Later writes cannot join the returned scan.
+func (t *Tablet) SnapshotSourceContext(
+	ctx context.Context,
+	env iterrt.IteratorEnvironment,
+) (iterrt.SortedKeyValueIterator, func(), error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	mem := t.active.Iterator()
+	if err := mem.Init(nil, nil, env); err != nil {
+		return nil, nil, err
+	}
+	if err := mem.Seek(iterrt.InfiniteRange(), nil, false); err != nil {
+		return nil, nil, err
+	}
+	var cells []iterrt.Cell
+	for mem.HasTop() {
+		if err := ctx.Err(); err != nil {
+			return nil, nil, err
+		}
+		cells = append(cells, iterrt.Cell{
+			Key:   mem.GetTopKey().Clone(),
+			Value: append([]byte(nil), mem.GetTopValue()...),
+		})
+		if err := mem.Next(); err != nil {
+			return nil, nil, err
+		}
+	}
+	memSnapshot := iterrt.NewSliceSource(cells)
+	if err := memSnapshot.Init(nil, nil, env); err != nil {
+		return nil, nil, err
+	}
+	return t.sourceWithMemLockedContext(ctx, env, memSnapshot)
+}
+
 func (t *Tablet) sourceLocked(env iterrt.IteratorEnvironment) (iterrt.SortedKeyValueIterator, func(), error) {
 	return t.sourceLockedContext(context.Background(), env)
 }
@@ -674,6 +712,14 @@ func (t *Tablet) sourceLockedContext(
 	env iterrt.IteratorEnvironment,
 ) (iterrt.SortedKeyValueIterator, func(), error) {
 	memIter := t.active.Iterator()
+	return t.sourceWithMemLockedContext(ctx, env, memIter)
+}
+
+func (t *Tablet) sourceWithMemLockedContext(
+	ctx context.Context,
+	env iterrt.IteratorEnvironment,
+	memIter iterrt.SortedKeyValueIterator,
+) (iterrt.SortedKeyValueIterator, func(), error) {
 	filesCopy := append([]string(nil), t.files...)
 
 	// Build leaf iterators: one from memtable + one per RFile

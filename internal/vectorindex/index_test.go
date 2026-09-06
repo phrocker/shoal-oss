@@ -117,8 +117,13 @@ func TestApproximateRecallContractRequiresBenchmark(t *testing.T) {
 		result.Recall.CodebookVersion == "" {
 		t.Fatalf("benchmark identity binding missing: %+v", result.Recall)
 	}
-	if _, err := manager.SetRecallContract(ctx, "docs_ivf", result.Recall); err != nil {
+	manifest, err := manager.SetRecallContract(ctx, "docs_ivf", result.Recall)
+	if err != nil {
 		t.Fatal(err)
+	}
+	if manifest.Recall.Generation != manifest.Generation {
+		t.Fatalf("recall evidence generation=%d, manifest=%d",
+			manifest.Recall.Generation, manifest.Generation)
 	}
 	_, evidence, err := manager.Search(ctx, "docs_ivf", Query{
 		Vector: records[7].Vector, EmbeddingSpace: testEmbeddingSpace,

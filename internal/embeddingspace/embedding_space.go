@@ -292,11 +292,12 @@ func VerifyMetadataMatchesFooter(metadataState, footerState FileState) error {
 // no_embeddings therefore fail closed rather than silently producing partial
 // recall, and a different known identity returns the ordinary typed mismatch.
 func ValidateQueryStates(operation, queryIdentity string, states ...FileState) error {
-	queryIdentity = strings.TrimSpace(queryIdentity)
 	if queryIdentity == "" {
 		return fmt.Errorf("%w: %s", ErrQueryIdentityRequired, operation)
 	}
-	if err := Has(queryIdentity).Validate(); err != nil {
+	if err := (FileState{
+		State: StateHasEmbeddings, Identity: queryIdentity,
+	}).Validate(); err != nil {
 		return err
 	}
 	for _, state := range states {

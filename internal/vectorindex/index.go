@@ -432,8 +432,10 @@ func (m *Manager) SetRecallContract(ctx context.Context, index string, recall Re
 	manifest := active.Manifest
 	manifest.ParentGeneration = manifest.Generation
 	manifest.Generation++
-	manifest.Lineage = append(append([]uint64(nil), manifest.Lineage...), manifest.ParentGeneration)
+	manifest.Lineage = append(
+		append([]uint64(nil), manifest.Lineage...), manifest.ParentGeneration)
 	manifest.CreatedAtUnixMS = m.now().UTC().UnixMilli()
+	recall.Generation = manifest.Generation
 	manifest.Recall = recall
 	active.Manifest = manifest
 	if err := m.store.Commit(ctx, active); err != nil {

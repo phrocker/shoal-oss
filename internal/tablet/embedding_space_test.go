@@ -5,6 +5,7 @@
 package tablet
 
 import (
+	"context"
 	"encoding/base64"
 	"errors"
 	"testing"
@@ -77,5 +78,43 @@ func TestUniqueCompactionBaseAvoidsExistingOutputNames(t *testing.T) {
 	}
 	if got := uniqueCompactionBase(100, 2, extension, existing); got != 102 {
 		t.Fatalf("unique base = %d, want 102", got)
+	}
+}
+
+func TestSnapshotSourceExcludesLaterWrites(t *testing.T) {
+	tablet, err := Open(t.TempDir(), Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tablet.Close()
+	write := func(row string) {
+		mutation, _ := cclient.NewMutation([]byte(row))
+		mutation.PutLatest([]byte("cf"), nil, nil, []byte(row))
+		if err := tablet.Write([]*cclient.Mutation{mutation}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("a")
+	source, closeSource, err := tablet.SnapshotSourceContext(
+		context.Background(),
+		iterrt.IteratorEnvironment{Scope: iterrt.ScopeScan},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeSource()
+	write("b")
+	if err := source.Seek(iterrt.InfiniteRange(), nil, false); err != nil {
+		t.Fatal(err)
+	}
+	var rows []string
+	for source.HasTop() {
+		rows = append(rows, string(source.GetTopKey().Row))
+		if err := source.Next(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(rows) != 1 || rows[0] != "a" {
+		t.Fatalf("snapshot rows = %v, want [a]", rows)
 	}
 }

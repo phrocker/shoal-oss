@@ -838,20 +838,19 @@ func (t *table) scanHosted(
 	if err != nil {
 		return nil, err
 	}
-	if exact {
-		t.formatMu.Lock()
-		defer t.formatMu.Unlock()
-		if err := t.validateExactVectorEmbeddingSpaceLocked(ctx, identity); err != nil {
-			return nil, err
-		}
-	} else {
-		t.formatMu.RLock()
-		defer t.formatMu.RUnlock()
-	}
 	env := iterrt.IteratorEnvironment{
 		Context:        ctx,
 		Scope:          iterrt.ScopeScan,
 		Authorizations: opts.Authorizations,
+	}
+	if exact {
+		t.formatMu.Lock()
+		if err := t.validateExactVectorEmbeddingSpaceLocked(ctx, identity); err != nil {
+			t.formatMu.Unlock()
+			return nil, err
+		}
+	} else {
+		t.formatMu.RLock()
 	}
 
 	leaves := make([]iterrt.SortedKeyValueIterator, 0, len(t.tablets))
@@ -865,15 +864,38 @@ func (t *table) scanHosted(
 	for _, tb := range t.tablets {
 		if err := ctx.Err(); err != nil {
 			cleanup()
+			if exact {
+				t.formatMu.Unlock()
+			} else {
+				t.formatMu.RUnlock()
+			}
 			return nil, err
 		}
-		src, closer, err := tb.SourceContext(ctx, env)
+		var (
+			src    iterrt.SortedKeyValueIterator
+			closer func()
+		)
+		if exact {
+			src, closer, err = tb.SnapshotSourceContext(ctx, env)
+		} else {
+			src, closer, err = tb.SourceContext(ctx, env)
+		}
 		if err != nil {
 			cleanup()
+			if exact {
+				t.formatMu.Unlock()
+			} else {
+				t.formatMu.RUnlock()
+			}
 			return nil, err
 		}
 		leaves = append(leaves, src)
 		closers = append(closers, closer)
+	}
+	if exact {
+		t.formatMu.Unlock()
+	} else {
+		t.formatMu.RUnlock()
 	}
 
 	merge := iterrt.NewMergingIterator(leaves...)

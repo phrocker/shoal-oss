@@ -107,6 +107,7 @@ func TestValidateQueryStatesFailsClosed(t *testing.T) {
 		in       []FileState
 	}{
 		{"missing identity", "", ErrQueryIdentityRequired, []FileState{Has(query)}},
+		{"non-canonical query identity", " " + query, ErrInvalidState, []FileState{Has(query)}},
 		{"unknown", query, ErrQuerySpaceUnknown, []FileState{Unknown()}},
 		{"zero is unknown", query, ErrQuerySpaceUnknown, []FileState{{}}},
 		{"partial state", query, ErrInvalidState, []FileState{{Identity: query}}},
