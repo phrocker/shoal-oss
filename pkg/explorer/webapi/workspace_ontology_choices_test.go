@@ -19,6 +19,7 @@ package webapi
 
 import (
 	"context"
+	"strconv"
 	"testing"
 	"time"
 
@@ -97,6 +98,39 @@ func TestGovernedOntologyChoicesWithoutConfiguredRootIsEmpty(t *testing.T) {
 	}
 }
 
+func TestPublishedOntologyHistoryAcceptsExactBound(t *testing.T) {
+	configured, expected, proposals := governedOntologyChain(
+		t, int(MaxOntologyProposals))
+	active, err := replayPublishedOntology(configured, proposals)
+	if err != nil {
+		t.Fatalf("exact-bound active ontology: %v", err)
+	}
+	if active.ID() != expected.ID() {
+		t.Fatalf("active = %s, want %s", active.ID(), expected.ID())
+	}
+	source := &mutableGovernedOntologySource{proposals: proposals}
+	choices, err := NewGovernedOntologyChoices(&configured, source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	listed, err := choices.ListOntologyChoices(
+		context.Background(), auth.Decision{})
+	if err != nil {
+		t.Fatalf("exact-bound choices: %v", err)
+	}
+	if len(listed) != int(MaxOntologyProposals)+1 {
+		t.Fatalf("choice count = %d", len(listed))
+	}
+
+	configured, _, proposals = governedOntologyChain(
+		t, int(MaxOntologyProposals)+1)
+	if _, err := replayPublishedOntology(
+		configured, proposals,
+	); !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
+		t.Fatalf("over-bound active ontology error = %v", err)
+	}
+}
+
 func governedOntologyFixture(
 	t *testing.T,
 ) (
@@ -148,4 +182,64 @@ func governedOntologyFixture(
 		t.Fatal(err)
 	}
 	return first, second, third, proposal
+}
+
+func governedOntologyChain(
+	t *testing.T,
+	count int,
+) (
+	ontology.OntologyVersion,
+	ontology.OntologyVersion,
+	[]ontology.GovernedProposal,
+) {
+	t.Helper()
+	now := time.Date(2026, 9, 6, 2, 0, 0, 0, time.UTC)
+	schema, err := ontology.NewOntologySchema(
+		"bounded", "Bounded", "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	configured, err := ontology.NewOntologyVersion(
+		schema, "0", now, nil, nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	current := configured
+	proposals := make([]ontology.GovernedProposal, 0, count)
+	for index := 0; index < count; index++ {
+		next, err := ontology.NewOntologyVersion(
+			schema, strconv.Itoa(index+1),
+			now.Add(time.Duration(index+1)*time.Second),
+			nil, nil, nil, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		proposal, err := ontology.NewGovernedProposal(
+			schema, current, next, "author", "advance",
+			now.Add(time.Duration(count+index+1)*time.Second), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		proposal, err = proposal.Transition(
+			ontology.ProposalSubmitted, "author", "submit",
+			now.Add(time.Duration(3*count+index+1)*time.Second))
+		if err != nil {
+			t.Fatal(err)
+		}
+		proposal, err = proposal.Transition(
+			ontology.ProposalApproved, "reviewer", "approve",
+			now.Add(time.Duration(5*count+index+1)*time.Second))
+		if err != nil {
+			t.Fatal(err)
+		}
+		proposal, err = proposal.Transition(
+			ontology.ProposalPublished, "publisher", "publish",
+			now.Add(time.Duration(7*count+index+1)*time.Second))
+		if err != nil {
+			t.Fatal(err)
+		}
+		proposals = append(proposals, proposal)
+		current = next
+	}
+	return configured, current, proposals
 }

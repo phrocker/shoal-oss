@@ -111,10 +111,16 @@ func (c *GovernedOntologyChoices) ListOntologyChoices(
 	}}
 	current := activeIdentity.VersionID()
 	visited := map[shoal.ID]struct{}{current: {}}
-	for range MaxOntologyProposals {
+	for traversed := uint32(0); ; traversed++ {
 		proposal, ok := byTarget[current]
 		if !ok {
 			return choices, nil
+		}
+		if traversed >= MaxOntologyProposals {
+			return nil, shoal.NewError(
+				shoal.ErrorUnavailable,
+				"published ontology history exceeds the service bound",
+			)
 		}
 		baseID, ok := proposal.BaseVersionID()
 		if !ok {
@@ -135,10 +141,6 @@ func (c *GovernedOntologyChoices) ListOntologyChoices(
 		choices = append(choices, workspace.OntologyChoice{Identity: base})
 		current = baseID
 	}
-	return nil, shoal.NewError(
-		shoal.ErrorUnavailable,
-		"published ontology history exceeds the service bound",
-	)
 }
 
 // AuthorizeOntology permits only identities returned by the current live
