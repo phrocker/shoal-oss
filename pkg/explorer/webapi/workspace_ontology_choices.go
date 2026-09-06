@@ -23,6 +23,7 @@ import (
 	"context"
 	"reflect"
 
+	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/explorer/workspace"
 	"github.com/phrocker/shoal-oss/pkg/ontology"
@@ -35,7 +36,15 @@ type GovernedOntologyChoices struct {
 	source OntologyCatalogProvider
 }
 
+type explorerOntologyCatalog struct {
+	configured    ontology.OntologyVersion
+	configuredSet bool
+	source        *explorer.Explorer
+}
+
 // NewGovernedOntologyChoices constructs a live, read-only choice adapter.
+// source must expose a trusted caller-independent catalog; request-scoped
+// authorization is applied separately to each workspace operation.
 func NewGovernedOntologyChoices(
 	source OntologyCatalogProvider,
 ) (*GovernedOntologyChoices, error) {
@@ -46,6 +55,54 @@ func NewGovernedOntologyChoices(
 		)
 	}
 	return &GovernedOntologyChoices{source: source}, nil
+}
+
+// NewGovernedOntologyChoicesFromExplorer constructs the production settings
+// adapter over the trusted base corpus. Catalog construction bypasses
+// request-scoped proposal-read authorization so applying a selected lens does
+// not require an unrelated read grant; selection eligibility is still checked
+// against the caller's Decision by GovernedOntologyChoices.
+func NewGovernedOntologyChoicesFromExplorer(
+	configured *ontology.OntologyVersion,
+	source *explorer.Explorer,
+) (*GovernedOntologyChoices, error) {
+	if source == nil {
+		return nil, shoal.NewError(
+			shoal.ErrorInvalidArgument, "trusted Explorer source is required")
+	}
+	catalog := &explorerOntologyCatalog{source: source}
+	if configured != nil {
+		if err := configured.Validate(); err != nil {
+			return nil, err
+		}
+		catalog.configured = *configured
+		catalog.configuredSet = true
+	}
+	return NewGovernedOntologyChoices(catalog)
+}
+
+func (c *explorerOntologyCatalog) OntologyCatalog(
+	ctx context.Context,
+) (ontology.PublishedCatalog, bool, error) {
+	if ctx == nil {
+		return ontology.PublishedCatalog{}, false, shoal.NewError(
+			shoal.ErrorInvalidArgument, "context is required")
+	}
+	if err := ctx.Err(); err != nil {
+		return ontology.PublishedCatalog{}, false, err
+	}
+	if !c.configuredSet {
+		return ontology.PublishedCatalog{}, false, nil
+	}
+	proposals, err := c.source.OntologyProposals(ctx)
+	if err != nil {
+		return ontology.PublishedCatalog{}, false, err
+	}
+	catalog, err := boundedOntologyCatalog(c.configured, proposals)
+	if err != nil {
+		return ontology.PublishedCatalog{}, false, err
+	}
+	return catalog, true, nil
 }
 
 // ListOntologyChoices returns only the active ontology and its retained
