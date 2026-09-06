@@ -45,6 +45,11 @@ func BenchmarkRecall(ctx context.Context, manager *Manager, index string, corpus
 		if record.Tombstone {
 			continue
 		}
+		if len(record.Vector) != manifest.Dimension {
+			return BenchmarkResult{}, fmt.Errorf(
+				"vectorindex: benchmark record %q dimension %d, want %d",
+				record.ID, len(record.Vector), manifest.Dimension)
+		}
 		if err := embeddingspace.EnsureSameIdentity(
 			"benchmark vector index", manifest.EmbeddingSpace,
 			record.EmbeddingSpace); err != nil {

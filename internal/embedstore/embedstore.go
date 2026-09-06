@@ -261,11 +261,11 @@ func (s *EngineStore) Compact(_ context.Context, table string) error {
 // Scan runs req against table and returns the matching cells, honoring
 // req.Limit (0 = no limit). It is the buffered counterpart of Scanner used by
 // in-process callers such as agentmem.
-func (s *EngineStore) Scan(_ context.Context, table string, req *embedpb.ScanRequest) ([]*embedpb.Cell, error) {
+func (s *EngineStore) Scan(ctx context.Context, table string, req *embedpb.ScanRequest) ([]*embedpb.Cell, error) {
 	if table == "" {
 		return nil, errors.New("embedstore: table is required")
 	}
-	sc, err := s.Scanner(table, req)
+	sc, err := s.ScannerContext(ctx, table, req)
 	if err != nil {
 		return nil, err
 	}
@@ -274,6 +274,9 @@ func (s *EngineStore) Scan(_ context.Context, table string, req *embedpb.ScanReq
 	limit := int(req.Limit)
 	var cells []*embedpb.Cell
 	for sc.Next() {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		k := sc.Key()
 		cells = append(cells, &embedpb.Cell{
 			Row:              k.Row,
@@ -361,8 +364,21 @@ func appendZero(row []byte) []byte {
 // cells may span tablets, and at most one may be set. With none set it runs an
 // ordinary version-capped scan. The caller owns Close on the returned scanner.
 func (s *EngineStore) Scanner(table string, req *embedpb.ScanRequest) (*engine.Scanner, error) {
+	return s.ScannerContext(context.Background(), table, req)
+}
+
+// ScannerContext is Scanner with cancellation for hosted source construction
+// and embedding metadata reads.
+func (s *EngineStore) ScannerContext(
+	ctx context.Context,
+	table string,
+	req *embedpb.ScanRequest,
+) (*engine.Scanner, error) {
 	if table == "" {
 		return nil, errors.New("embedstore: table is required")
+	}
+	if ctx == nil {
+		ctx = context.Background()
 	}
 	scanRange := ScanRange(req)
 
@@ -418,7 +434,7 @@ func (s *EngineStore) Scanner(table string, req *embedpb.ScanRequest) (*engine.S
 				}
 			}
 		}
-		return s.eng.ScanHosted(table, scanRange, engine.ScanOptions{},
+		return s.eng.ScanHostedContext(ctx, table, scanRange, engine.ScanOptions{},
 			[]iterrt.IterSpec{{Name: iterrt.IterTermIndex, Options: opts}})
 	}
 
@@ -446,7 +462,7 @@ func (s *EngineStore) Scanner(table string, req *embedpb.ScanRequest) (*engine.S
 		if vs.MinScoreSet {
 			opts[iterrt.VectorKNNMinScore] = strconv.FormatFloat(float64(vs.MinScore), 'g', -1, 32)
 		}
-		return s.eng.ScanHosted(table, scanRange, engine.ScanOptions{},
+		return s.eng.ScanHostedContext(ctx, table, scanRange, engine.ScanOptions{},
 			[]iterrt.IterSpec{{Name: iterrt.IterVectorKNN, Options: opts}})
 	}
 
@@ -498,7 +514,7 @@ func (s *EngineStore) Scanner(table string, req *embedpb.ScanRequest) (*engine.S
 					strconv.FormatFloat(float64(ew.Weight), 'g', -1, 32)
 			}
 		}
-		return s.eng.ScanHosted(table, scanRange, engine.ScanOptions{},
+		return s.eng.ScanHostedContext(ctx, table, scanRange, engine.ScanOptions{},
 			[]iterrt.IterSpec{{Name: iterrt.IterEdgeExpand, Options: opts}})
 	}
 
@@ -529,7 +545,7 @@ func (s *EngineStore) Scanner(table string, req *embedpb.ScanRequest) (*engine.S
 		if sf.HalfLifeMs != 0 {
 			opts[iterrt.ScoreFilterHalfLifeMs] = strconv.FormatInt(sf.HalfLifeMs, 10)
 		}
-		return s.eng.ScanHosted(table, scanRange, engine.ScanOptions{},
+		return s.eng.ScanHostedContext(ctx, table, scanRange, engine.ScanOptions{},
 			[]iterrt.IterSpec{{Name: iterrt.IterScoreFilter, Options: opts}})
 	}
 

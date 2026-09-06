@@ -123,9 +123,11 @@ func New(cfg Config) (*Client, error) {
 	if provider, ok := cfg.Embedder.(embeddingSpaceIdentityProvider); ok {
 		identity, err := provider.EmbeddingSpaceIdentity()
 		if err != nil {
-			return nil, err
-		}
-		if cfg.EmbeddingSpace == "" {
+			if cfg.EmbeddingSpace == "" ||
+				!errors.Is(err, embeddingspace.ErrQueryIdentityRequired) {
+				return nil, err
+			}
+		} else if cfg.EmbeddingSpace == "" {
 			cfg.EmbeddingSpace = identity
 		} else if err := embeddingspace.EnsureSameIdentity(
 			"configure agent memory embedding",

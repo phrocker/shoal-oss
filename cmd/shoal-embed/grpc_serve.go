@@ -289,8 +289,19 @@ func scanStatusError(err error) error {
 	switch {
 	case errors.Is(err, embedstore.ErrMultiplePushdowns),
 		errors.Is(err, embedstore.ErrVectorQueryRequired),
+		errors.Is(err, embedstore.ErrVectorEmbeddingSpaceRequired),
 		errors.Is(err, embedstore.ErrNegativeMaxHops):
 		return status.Error(codes.InvalidArgument, err.Error())
+	case errors.Is(err, embeddingspace.ErrMismatch),
+		errors.Is(err, embeddingspace.ErrIntegrity),
+		errors.Is(err, embeddingspace.ErrQuerySpaceUnknown),
+		errors.Is(err, embeddingspace.ErrQueryNoEmbeddings),
+		errors.Is(err, embeddingspace.ErrQueryMetadataMissing):
+		return status.Error(codes.FailedPrecondition, err.Error())
+	case errors.Is(err, context.Canceled):
+		return status.Error(codes.Canceled, err.Error())
+	case errors.Is(err, context.DeadlineExceeded):
+		return status.Error(codes.DeadlineExceeded, err.Error())
 	default:
 		return status.Errorf(codes.Internal, "scan: %v", err)
 	}
@@ -301,7 +312,7 @@ func (s *embedServer) Scan(req *embedpb.ScanRequest, stream embedpb.ShoalEmbed_S
 		return status.Error(codes.InvalidArgument, "table is required")
 	}
 
-	sc, err := s.store.Scanner(req.Table, req)
+	sc, err := s.store.ScannerContext(stream.Context(), req.Table, req)
 	if err != nil {
 		return scanStatusError(err)
 	}
@@ -317,6 +328,9 @@ func (s *embedServer) Scan(req *embedpb.ScanRequest, stream embedpb.ShoalEmbed_S
 	total := 0
 
 	for sc.Next() {
+		if err := stream.Context().Err(); err != nil {
+			return scanStatusError(err)
+		}
 		k := sc.Key()
 		batch = append(batch, &embedpb.Cell{
 			Row:              k.Row,

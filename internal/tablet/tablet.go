@@ -388,6 +388,13 @@ func (t *Tablet) conditionsMatchLocked(row []byte, conditions []Condition) (bool
 // columnFamilies + inclusive follow the SKVI Seek contract: pass nil
 // with inclusive=false for a full scan.
 func (t *Tablet) Scan(r iterrt.Range, columnFamilies [][]byte, inclusive bool, stack []iterrt.IterSpec, env iterrt.IteratorEnvironment) (*Scanner, error) {
+	for _, spec := range stack {
+		if spec.Name == iterrt.IterVectorKNN {
+			return nil, fmt.Errorf(
+				"%w: vectorKNN requires engine-hosted metadata validation",
+				embeddingspace.ErrQueryMetadataMissing)
+		}
+	}
 	merge, closeAll, err := t.Source(env)
 	if err != nil {
 		return nil, err

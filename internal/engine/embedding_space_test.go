@@ -9,6 +9,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/phrocker/shoal-oss/internal/cclient"
 	"github.com/phrocker/shoal-oss/internal/embeddingspace"
@@ -162,5 +163,54 @@ func TestValidateExactVectorSpaceFailsClosed(t *testing.T) {
 		context.Background(), "graph", "space-b",
 	); !errors.Is(err, embeddingspace.ErrMismatch) {
 		t.Fatalf("mismatch error = %v, want ErrMismatch", err)
+	}
+	if _, err := eng.Scan(
+		"graph", iterrt.InfiniteRange(), ScanOptions{
+			Stack: []iterrt.IterSpec{{
+				Name: iterrt.IterVectorKNN,
+				Options: map[string]string{
+					iterrt.VectorKNNQuery: base64.StdEncoding.EncodeToString(
+						[]byte{0, 0, 0, 0}),
+					iterrt.VectorKNNEmbeddingSpace: "space-b",
+				},
+			}},
+		},
+	); !errors.Is(err, embeddingspace.ErrQueryMetadataMissing) {
+		t.Fatalf(
+			"direct scan error = %v, want ErrQueryMetadataMissing",
+			err)
+	}
+}
+
+func TestOrdinaryWritesShareEmbeddingStateGate(t *testing.T) {
+	eng, err := Open(t.TempDir(), Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close()
+	if err := eng.CreateTable("graph", TableOptions{
+		DefaultEmbedding: embeddingspace.Has("space-a"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	eng.mu.RLock()
+	tbl := eng.tables["graph"]
+	eng.mu.RUnlock()
+	tbl.formatMu.RLock()
+	mutation, _ := cclient.NewMutation([]byte("a"))
+	mutation.PutLatest([]byte("vec"), nil, nil, []byte("value"))
+	done := make(chan error, 1)
+	go func() {
+		done <- eng.Write("graph", []*cclient.Mutation{mutation})
+	}()
+	select {
+	case err := <-done:
+		tbl.formatMu.RUnlock()
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		tbl.formatMu.RUnlock()
+		t.Fatal("ordinary write waited for a peer read lock")
 	}
 }

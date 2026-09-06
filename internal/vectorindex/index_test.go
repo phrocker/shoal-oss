@@ -7,6 +7,7 @@ import (
 	"math"
 	"reflect"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -123,6 +124,36 @@ func TestApproximateRecallContractRequiresBenchmark(t *testing.T) {
 	}
 	if !evidence.RecallClaimed || evidence.Recall.BenchmarkRef != "test-corpus-v1" {
 		t.Fatalf("benchmark evidence missing: %+v", evidence)
+	}
+}
+
+func TestBenchmarkRecallRejectsMalformedCorpusDimension(t *testing.T) {
+	ctx := context.Background()
+	records := corpus(32)
+	manager := New(NewMemoryStore(), testConfig())
+	if _, err := manager.Build(ctx, "docs_ivf", records, 1000); err != nil {
+		t.Fatal(err)
+	}
+	malformed := append([]VectorRecord(nil), records...)
+	malformed[7] = records[7]
+	malformed[7].Vector = append([]float32(nil), records[7].Vector[:len(records[7].Vector)-1]...)
+	_, err := BenchmarkRecall(
+		ctx,
+		manager,
+		"docs_ivf",
+		malformed,
+		[]BenchmarkQuery{{
+			Name:           records[0].ID,
+			Vector:         records[0].Vector,
+			EmbeddingSpace: testEmbeddingSpace,
+		}},
+		10,
+		8,
+		0.80,
+		"test-corpus-v1",
+	)
+	if err == nil || !strings.Contains(err.Error(), "dimension 7, want 8") {
+		t.Fatalf("BenchmarkRecall malformed dimension error = %v", err)
 	}
 }
 

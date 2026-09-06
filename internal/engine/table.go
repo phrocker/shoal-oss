@@ -539,8 +539,8 @@ func (t *table) routeTablet(row []byte) int {
 // write routes each mutation to its tablet and applies them.
 // Mutations to different tablets are batched and written in parallel.
 func (t *table) write(mutations []*cclient.Mutation) error {
-	t.formatMu.Lock()
-	defer t.formatMu.Unlock()
+	t.formatMu.RLock()
+	defer t.formatMu.RUnlock()
 	if len(t.tablets) == 1 {
 		return t.tablets[0].Write(mutations)
 	}
@@ -576,8 +576,8 @@ func (t *table) write(mutations []*cclient.Mutation) error {
 }
 
 func (t *table) conditionalWrite(mutations []ConditionalMutation) ([]bool, error) {
-	t.formatMu.Lock()
-	defer t.formatMu.Unlock()
+	t.formatMu.RLock()
+	defer t.formatMu.RUnlock()
 	results := make([]bool, len(mutations))
 	buckets := make([][]ConditionalMutation, len(t.tablets))
 	indices := make([][]int, len(t.tablets))
@@ -722,6 +722,15 @@ func (t *table) neighborsOne(row, edgeCF []byte, env iterrt.IteratorEnvironment)
 // scan builds a merged scanner across all tablets whose range overlaps
 // the requested scan range. Each tablet is scanned in its own goroutine.
 func (t *table) scan(r iterrt.Range, opts ScanOptions) (*Scanner, error) {
+	_, exact, err := exactVectorEmbeddingSpace(opts.Stack)
+	if err != nil {
+		return nil, err
+	}
+	if exact {
+		return nil, fmt.Errorf(
+			"%w: vectorKNN requires ScanHosted",
+			embeddingspace.ErrQueryMetadataMissing)
+	}
 	env := iterrt.IteratorEnvironment{
 		Scope:          iterrt.ScopeScan,
 		Authorizations: opts.Authorizations,
@@ -825,31 +834,19 @@ func (t *table) scanHosted(
 	opts ScanOptions,
 	topStack []iterrt.IterSpec,
 ) (*Scanner, error) {
-	t.formatMu.RLock()
-	defer t.formatMu.RUnlock()
-	if identity, ok, err := exactVectorEmbeddingSpace(topStack); err != nil {
+	identity, exact, err := exactVectorEmbeddingSpace(topStack)
+	if err != nil {
 		return nil, err
-	} else if ok {
-		files, unflushed, defaultEmbedding, err :=
-			t.embeddingStateSnapshotLocked(ctx)
-		if err != nil {
+	}
+	if exact {
+		t.formatMu.Lock()
+		defer t.formatMu.Unlock()
+		if err := t.validateExactVectorEmbeddingSpaceLocked(ctx, identity); err != nil {
 			return nil, err
 		}
-		if unflushed > 0 {
-			if err := embeddingspace.ValidateQueryStates(
-				"exact vector query over unflushed cells",
-				identity,
-				defaultEmbedding,
-			); err != nil {
-				return nil, err
-			}
-		}
-		for _, file := range files {
-			if err := embeddingspace.ValidateQueryStates(
-				"exact vector query", identity, file.State); err != nil {
-				return nil, fmt.Errorf("%w: file %q", err, file.Path)
-			}
-		}
+	} else {
+		t.formatMu.RLock()
+		defer t.formatMu.RUnlock()
 	}
 	env := iterrt.IteratorEnvironment{
 		Scope:          iterrt.ScopeScan,
@@ -909,6 +906,33 @@ func (t *table) scanHosted(
 	}
 
 	return &Scanner{merge: top, closers: closers}, nil
+}
+
+func (t *table) validateExactVectorEmbeddingSpaceLocked(
+	ctx context.Context,
+	identity string,
+) error {
+	files, unflushed, defaultEmbedding, err :=
+		t.embeddingStateSnapshotLocked(ctx)
+	if err != nil {
+		return err
+	}
+	if unflushed > 0 {
+		if err := embeddingspace.ValidateQueryStates(
+			"exact vector query over unflushed cells",
+			identity,
+			defaultEmbedding,
+		); err != nil {
+			return err
+		}
+	}
+	for _, file := range files {
+		if err := embeddingspace.ValidateQueryStates(
+			"exact vector query", identity, file.State); err != nil {
+			return fmt.Errorf("%w: file %q", err, file.Path)
+		}
+	}
+	return nil
 }
 
 func exactVectorEmbeddingSpace(
