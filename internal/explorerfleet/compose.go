@@ -25,14 +25,20 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/explorer/fleet"
 )
 
-// ConfigureRuntime adds the fleet physical table before explorercoord.Open.
+// ConfigureRuntime adds the fleet physical tables before explorercoord.Open.
 func ConfigureRuntime(config explorercoord.Config) explorercoord.Config {
-	for _, table := range config.PhysicalTables {
-		if table == Table {
-			return config
+	for _, wanted := range []string{Table, DispatchTable} {
+		found := false
+		for _, table := range config.PhysicalTables {
+			if table == wanted {
+				found = true
+				break
+			}
+		}
+		if !found {
+			config.PhysicalTables = append(config.PhysicalTables, wanted)
 		}
 	}
-	config.PhysicalTables = append(append([]string(nil), config.PhysicalTables...), Table)
 	return config
 }
 

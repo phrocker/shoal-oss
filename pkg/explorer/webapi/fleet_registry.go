@@ -38,9 +38,21 @@ type FleetRegistryProvider interface {
 	List(context.Context, fleet.ListRequest) (fleet.ListPage, error)
 }
 
-// MountFleetRegistry installs authenticated registry routes on the real
-// workspace handler. It rejects anonymous handlers so these privileged routes
-// cannot accidentally be mounted without the standard per-request decision.
+// NewFleetRegistryHandler returns the fleet registry HTTP surface without
+// adding another authentication boundary. Mount it through
+// Handler.MountAuthenticated at /api/v1/fleet/.
+func NewFleetRegistryHandler(provider FleetRegistryProvider) (http.Handler, error) {
+	if provider == nil {
+		return nil, shoal.NewError(shoal.ErrorInvalidArgument, "fleet registry provider is required")
+	}
+	mux := http.NewServeMux()
+	mountFleetRegistry(mux, provider)
+	return mux, nil
+}
+
+// MountFleetRegistry is retained for registry-only tests and compatibility.
+// Hosted startup must instead mount NewFleetHandler once at FleetRoutePrefix
+// so registry and dispatch share one authenticated route subtree.
 func (h *Handler) MountFleetRegistry(provider FleetRegistryProvider) error {
 	if h == nil || isAbsentInterface(provider) {
 		return shoal.NewError(shoal.ErrorInvalidArgument, "fleet registry provider is required")
@@ -48,7 +60,12 @@ func (h *Handler) MountFleetRegistry(provider FleetRegistryProvider) error {
 	if isAbsentInterface(h.authenticator) || isAbsentInterface(h.binder) {
 		return shoal.NewError(shoal.ErrorInvalidArgument, "fleet registry requires authenticated transport")
 	}
-	h.mux.HandleFunc("POST /api/v1/fleet/agents", func(writer http.ResponseWriter, request *http.Request) {
+	mountFleetRegistry(h.mux, provider)
+	return nil
+}
+
+func mountFleetRegistry(mux *http.ServeMux, provider FleetRegistryProvider) {
+	mux.HandleFunc("POST /api/v1/fleet/agents", func(writer http.ResponseWriter, request *http.Request) {
 		var input fleetRegisterWire
 		if err := decodeRequest(writer, request, &input); err != nil {
 			writeError(writer, shoal.NewError(shoal.ErrorInvalidArgument, err.Error()))
@@ -66,7 +83,7 @@ func (h *Handler) MountFleetRegistry(provider FleetRegistryProvider) error {
 		}
 		writeResponse(writer, http.StatusCreated, encodeFleetDescriptor(descriptor))
 	})
-	h.mux.HandleFunc("POST /api/v1/fleet/agents/{agent}/heartbeat", func(writer http.ResponseWriter, request *http.Request) {
+	mux.HandleFunc("POST /api/v1/fleet/agents/{agent}/heartbeat", func(writer http.ResponseWriter, request *http.Request) {
 		id, err := decodeID(request.PathValue("agent"))
 		if err != nil {
 			writeError(writer, shoal.NewError(shoal.ErrorInvalidArgument, "agent ID "+err.Error()))
@@ -89,7 +106,7 @@ func (h *Handler) MountFleetRegistry(provider FleetRegistryProvider) error {
 		}
 		writeResponse(writer, http.StatusOK, encodeFleetDescriptor(descriptor))
 	})
-	h.mux.HandleFunc("POST /api/v1/fleet/agents/{agent}/revoke", func(writer http.ResponseWriter, request *http.Request) {
+	mux.HandleFunc("POST /api/v1/fleet/agents/{agent}/revoke", func(writer http.ResponseWriter, request *http.Request) {
 		id, err := decodeID(request.PathValue("agent"))
 		if err != nil {
 			writeError(writer, shoal.NewError(shoal.ErrorInvalidArgument, "agent ID "+err.Error()))
@@ -112,7 +129,7 @@ func (h *Handler) MountFleetRegistry(provider FleetRegistryProvider) error {
 		}
 		writeResponse(writer, http.StatusOK, encodeFleetDescriptor(descriptor))
 	})
-	h.mux.HandleFunc("POST /api/v1/fleet/agents/{agent}/resolve", func(writer http.ResponseWriter, request *http.Request) {
+	mux.HandleFunc("POST /api/v1/fleet/agents/{agent}/resolve", func(writer http.ResponseWriter, request *http.Request) {
 		id, err := decodeID(request.PathValue("agent"))
 		if err != nil {
 			writeError(writer, shoal.NewError(shoal.ErrorInvalidArgument, "agent ID "+err.Error()))
@@ -137,7 +154,7 @@ func (h *Handler) MountFleetRegistry(provider FleetRegistryProvider) error {
 		}
 		writeResponse(writer, http.StatusOK, encodeFleetDescriptor(resolved.Descriptor))
 	})
-	h.mux.HandleFunc("POST /api/v1/fleet/agents/resolve", func(writer http.ResponseWriter, request *http.Request) {
+	mux.HandleFunc("POST /api/v1/fleet/agents/resolve", func(writer http.ResponseWriter, request *http.Request) {
 		var input fleetListWire
 		if err := decodeRequest(writer, request, &input); err != nil {
 			writeError(writer, shoal.NewError(shoal.ErrorInvalidArgument, err.Error()))
@@ -168,7 +185,6 @@ func (h *Handler) MountFleetRegistry(provider FleetRegistryProvider) error {
 			Next   []byte                `json:"next,omitempty"`
 		}{Agents: response, Next: page.Next})
 	})
-	return nil
 }
 
 type fleetRequestContextWire struct {
