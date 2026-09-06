@@ -23,6 +23,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/ontology"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
@@ -43,6 +44,13 @@ const (
 // failing or inventing an empty schema.
 type ActiveOntologyProvider interface {
 	ActiveOntology(context.Context) (ontology.OntologyVersion, bool, error)
+}
+
+// OntologyCatalogProvider exposes the canonical governed choice set and its
+// durable active tip. Callers must still apply their own authorization policy;
+// the catalog prevents them from duplicating publication-chain/CAS semantics.
+type OntologyCatalogProvider interface {
+	OntologyCatalog(context.Context) (ontology.PublishedCatalog, bool, error)
 }
 
 // OntologyResponse is the stable browser contract for the currently active
@@ -68,6 +76,48 @@ type OntologyIdentityProjection struct {
 	SchemaID  string `json:"schema_id,omitempty"`
 	VersionID string `json:"version_id,omitempty"`
 	Reading   string `json:"reading"`
+}
+
+// ProjectOntologyIdentity applies the public opaque-ID wire encoding to one
+// validated ontology identity.
+func ProjectOntologyIdentity(
+	identity ontology.OntologyIdentity,
+) (OntologyIdentityProjection, error) {
+	if err := identity.Validate(); err != nil {
+		return OntologyIdentityProjection{}, err
+	}
+	return OntologyIdentityProjection{
+		Known: true, SchemaID: encodeID(identity.SchemaID()),
+		VersionID: encodeID(identity.VersionID()),
+		Reading:   string(ontology.OntologySameVersion),
+	}, nil
+}
+
+// ParseOntologyIdentityProjection decodes one public identity projection
+// without interpreting an unknown selection as the active version.
+func ParseOntologyIdentityProjection(
+	projection OntologyIdentityProjection,
+) (ontology.OntologyIdentity, error) {
+	if !projection.Known {
+		if projection.SchemaID != "" || projection.VersionID != "" {
+			return ontology.OntologyIdentity{}, shoal.NewError(
+				shoal.ErrorInvalidArgument,
+				"unknown ontology identity cannot carry IDs",
+			)
+		}
+		return ontology.UnknownOntology(), nil
+	}
+	schemaID, err := decodeID(projection.SchemaID)
+	if err != nil {
+		return ontology.OntologyIdentity{}, shoal.WrapError(
+			shoal.ErrorInvalidArgument, "decode ontology schema ID", err)
+	}
+	versionID, err := decodeID(projection.VersionID)
+	if err != nil {
+		return ontology.OntologyIdentity{}, shoal.WrapError(
+			shoal.ErrorInvalidArgument, "decode ontology version ID", err)
+	}
+	return ontology.NewOntologyIdentityFromIDs(schemaID, versionID)
 }
 
 type OntologySchemaProjection struct {
@@ -144,6 +194,8 @@ func (s *EmbeddedService) SetOntologyVersion(version ontology.OntologyVersion) e
 		return err
 	}
 	cloned := version
+	s.ontologyPublishMu.Lock()
+	defer s.ontologyPublishMu.Unlock()
 	s.ontologyMu.Lock()
 	defer s.ontologyMu.Unlock()
 	s.ontologyVersion = &cloned
@@ -161,11 +213,78 @@ func (s *EmbeddedService) ActiveOntology(
 		return ontology.OntologyVersion{}, false, err
 	}
 	s.ontologyMu.RLock()
-	defer s.ontologyMu.RUnlock()
 	if s.ontologyVersion == nil {
+		s.ontologyMu.RUnlock()
 		return ontology.OntologyVersion{}, false, nil
 	}
-	return *s.ontologyVersion, true, nil
+	configured := *s.ontologyVersion
+	s.ontologyMu.RUnlock()
+	if provider, ok := s.client.(explorer.OntologyActiveStateProvider); ok {
+		active, err := provider.OntologyActiveState(ctx, configured)
+		return active, true, err
+	}
+	catalog, _, err := s.OntologyCatalog(ctx)
+	if err != nil {
+		return ontology.OntologyVersion{}, false, err
+	}
+	return catalog.Active(), true, nil
+}
+
+func (s *EmbeddedService) OntologyCatalog(
+	ctx context.Context,
+) (ontology.PublishedCatalog, bool, error) {
+	if ctx == nil {
+		return ontology.PublishedCatalog{}, false, shoal.NewError(
+			shoal.ErrorInvalidArgument, "context is required")
+	}
+	if err := ctx.Err(); err != nil {
+		return ontology.PublishedCatalog{}, false, err
+	}
+	s.ontologyMu.RLock()
+	if s.ontologyVersion == nil {
+		s.ontologyMu.RUnlock()
+		return ontology.PublishedCatalog{}, false, nil
+	}
+	configured := *s.ontologyVersion
+	s.ontologyMu.RUnlock()
+	store, ok := s.client.(interface {
+		OntologyProposals(context.Context) ([]ontology.GovernedProposal, error)
+	})
+	if !ok {
+		catalog, err := boundedOntologyCatalog(configured, nil)
+		return catalog, true, err
+	}
+	proposals, err := store.OntologyProposals(ctx)
+	if err != nil {
+		return ontology.PublishedCatalog{}, false, err
+	}
+	catalog, err := boundedOntologyCatalog(configured, proposals)
+	if err != nil {
+		return ontology.PublishedCatalog{}, false, err
+	}
+	return catalog, true, nil
+}
+
+func boundedOntologyCatalog(
+	configured ontology.OntologyVersion,
+	proposals []ontology.GovernedProposal,
+) (ontology.PublishedCatalog, error) {
+	if len(proposals) > int(MaxOntologyProposals) {
+		return ontology.PublishedCatalog{}, ontologyBoundError(
+			"proposal", len(proposals), MaxOntologyProposals)
+	}
+	return ontology.NewPublishedCatalog(configured, proposals)
+}
+
+func replayPublishedOntology(
+	configured ontology.OntologyVersion,
+	proposals []ontology.GovernedProposal,
+) (ontology.OntologyVersion, error) {
+	catalog, err := boundedOntologyCatalog(configured, proposals)
+	if err != nil {
+		return ontology.OntologyVersion{}, err
+	}
+	return catalog.Active(), nil
 }
 
 func ontologyFor(ctx context.Context, service Service) (OntologyResponse, error) {
@@ -215,65 +334,19 @@ func ontologyLimits() OntologyDescriptionLimits {
 	}
 }
 
+func ontologyProjectionLimits() explorer.OntologyProjectionLimits {
+	return explorer.OntologyProjectionLimits{
+		MaxConcepts: MaxOntologyConcepts, MaxRelationships: MaxOntologyRelationships,
+		MaxProperties: MaxOntologyProperties, MaxDefinitionProperties: MaxOntologyDefinitionProperties,
+		MaxRelationshipEndpointSets: MaxOntologyRelationshipEndpointSets,
+		MaxConstraintsPerProperty:   MaxOntologyConstraintsPerProperty,
+		MaxAllowedValues:            MaxOntologyAllowedValues, MaxTransitions: MaxOntologyProposalTransitions,
+		MaxMorphismEvidence: MaxEvidencePerResult, MaxDiscriminatorChoices: MaxOntologyConcepts,
+	}
+}
+
 func enforceOntologyBounds(version ontology.OntologyVersion) error {
-	concepts := version.Concepts()
-	if uint32(len(concepts)) > MaxOntologyConcepts {
-		return ontologyBoundError("concept", len(concepts), MaxOntologyConcepts)
-	}
-	relationships := version.Relationships()
-	if uint32(len(relationships)) > MaxOntologyRelationships {
-		return ontologyBoundError(
-			"relationship", len(relationships), MaxOntologyRelationships)
-	}
-	properties := version.Properties()
-	if uint32(len(properties)) > MaxOntologyProperties {
-		return ontologyBoundError("property", len(properties), MaxOntologyProperties)
-	}
-	for _, concept := range concepts {
-		if uint32(len(concept.Properties())) > MaxOntologyDefinitionProperties {
-			return ontologyBoundError(
-				"concept property reference", len(concept.Properties()),
-				MaxOntologyDefinitionProperties,
-			)
-		}
-	}
-	for _, relationship := range relationships {
-		if uint32(len(relationship.FromConcepts())) > MaxOntologyRelationshipEndpointSets {
-			return ontologyBoundError(
-				"relationship source concept reference",
-				len(relationship.FromConcepts()), MaxOntologyRelationshipEndpointSets,
-			)
-		}
-		if uint32(len(relationship.ToConcepts())) > MaxOntologyRelationshipEndpointSets {
-			return ontologyBoundError(
-				"relationship target concept reference",
-				len(relationship.ToConcepts()), MaxOntologyRelationshipEndpointSets,
-			)
-		}
-		if uint32(len(relationship.Properties())) > MaxOntologyDefinitionProperties {
-			return ontologyBoundError(
-				"relationship property reference", len(relationship.Properties()),
-				MaxOntologyDefinitionProperties,
-			)
-		}
-	}
-	for _, property := range properties {
-		constraints := property.Constraints()
-		if uint32(len(constraints)) > MaxOntologyConstraintsPerProperty {
-			return ontologyBoundError(
-				"property constraint", len(constraints),
-				MaxOntologyConstraintsPerProperty,
-			)
-		}
-		for _, constraint := range constraints {
-			allowed := constraint.AllowedValues()
-			if uint32(len(allowed)) > MaxOntologyAllowedValues {
-				return ontologyBoundError(
-					"allowed value", len(allowed), MaxOntologyAllowedValues)
-			}
-		}
-	}
-	return nil
+	return ontologyProjectionLimits().ValidateVersion(version)
 }
 
 func ontologyBoundError(name string, count int, limit uint32) error {

@@ -26,12 +26,18 @@ import (
 	"sort"
 	"time"
 
+	"github.com/phrocker/shoal-oss/pkg/document"
 	"github.com/phrocker/shoal-oss/pkg/ontology"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
+// MaxOntologyProposals bounds the total durable proposals in one corpus,
+// including proposals that have reached a terminal state.
+const MaxOntologyProposals uint32 = 256
+
 // OntologyProposalStore is the optional durable proposal lifecycle held by a
-// Shoal Explorer corpus.
+// Shoal Explorer corpus. New proposals must be admitted atomically against
+// MaxOntologyProposals; identical retries do not consume another slot.
 type OntologyProposalStore interface {
 	OntologyProposals(context.Context) ([]ontology.GovernedProposal, error)
 	CreateOntologyProposal(
@@ -47,6 +53,64 @@ type OntologyProposalStore interface {
 	) (ontology.GovernedProposal, error)
 }
 
+// OntologyProposalMutationStateProvider supplies the narrow preflight view
+// needed by proposal mutations without exposing governed proposal bodies.
+type OntologyProposalMutationStateProvider interface {
+	OntologyProposalMutationState(
+		context.Context, ontology.OntologyVersion, shoal.ID,
+	) (OntologyProposalMutationState, error)
+}
+
+// OntologyActiveStateProvider returns the global durable active tip without
+// exposing proposal bodies or evidence.
+type OntologyActiveStateProvider interface {
+	OntologyActiveState(
+		context.Context, ontology.OntologyVersion,
+	) (ontology.OntologyVersion, error)
+}
+
+// OntologyProposalEvidenceProvider returns only the immutable evidence needed
+// to authorize a requested proposal mutation.
+type OntologyProposalEvidenceProvider interface {
+	OntologyProposalEvidence(
+		context.Context, shoal.ID,
+	) ([]ontology.EvidenceRef, bool, error)
+}
+
+// OntologyEvidenceCitationResolver resolves exact immutable source bytes for
+// evidence validation without exposing a complete document revision.
+type OntologyEvidenceCitationResolver interface {
+	ResolveOntologyEvidenceCitation(
+		context.Context, document.Citation,
+	) (string, error)
+}
+
+// OntologyProposalMutationState is the narrow preflight view needed by
+// proposal mutations. It intentionally excludes proposal authors, rationale,
+// metadata, evidence, and unrelated proposal bodies.
+type OntologyProposalMutationState struct {
+	active                ontology.OntologyVersion
+	proposalBaseVersionID shoal.ID
+	proposalFound         bool
+	proposalHasBase       bool
+}
+
+// Active returns the currently published tip rooted at the configured
+// ontology version supplied to OntologyProposalMutationState.
+func (s OntologyProposalMutationState) Active() ontology.OntologyVersion {
+	return s.active
+}
+
+// ProposalFound reports whether the requested proposal ID exists.
+func (s OntologyProposalMutationState) ProposalFound() bool {
+	return s.proposalFound
+}
+
+// ProposalBaseVersionID returns the requested proposal's immutable base.
+func (s OntologyProposalMutationState) ProposalBaseVersionID() (shoal.ID, bool) {
+	return s.proposalBaseVersionID, s.proposalHasBase
+}
+
 type persistedOntologyProposal struct {
 	ProposalID      shoal.ID
 	Schema          persistedOntologySchema
@@ -56,7 +120,19 @@ type persistedOntologyProposal struct {
 	Rationale       string
 	CreatedAt       time.Time
 	Metadata        shoal.Metadata
+	Morphisms       []persistedOntologyMorphism
 	transitions     []persistedProposalTransition
+}
+
+type persistedOntologyMorphism struct {
+	Kind             ontology.MorphismKind
+	Sources          []shoal.ID
+	Targets          []shoal.ID
+	DiscriminatorKey string
+	Discriminator    map[string]shoal.ID
+	Evidence         []persistedEvidenceRef
+	Rationale        string
+	Metadata         shoal.Metadata
 }
 
 type persistedOntologySchema struct {
@@ -147,6 +223,9 @@ func (e *Explorer) OntologyProposals(
 	if err := e.requireOpen(); err != nil {
 		return nil, err
 	}
+	if err := e.requireCertainOntologyMutationLocked(); err != nil {
+		return nil, err
+	}
 	proposals := make([]ontology.GovernedProposal, 0, len(e.ontologyProposals))
 	for _, record := range e.ontologyProposals {
 		proposal, err := record.proposal()
@@ -166,6 +245,139 @@ func (e *Explorer) OntologyProposals(
 		return proposals[left].UpdatedAt().After(proposals[right].UpdatedAt())
 	})
 	return proposals, nil
+}
+
+// OntologyProposalMutationState returns only the active ontology and the
+// requested proposal's base identity. It supports least-privilege mutation
+// preflight without exposing the governed proposal corpus.
+func (e *Explorer) OntologyProposalMutationState(
+	ctx context.Context,
+	configured ontology.OntologyVersion,
+	proposalID shoal.ID,
+) (OntologyProposalMutationState, error) {
+	if err := contextError(ctx); err != nil {
+		return OntologyProposalMutationState{}, err
+	}
+	if err := configured.Validate(); err != nil {
+		return OntologyProposalMutationState{}, err
+	}
+	if err := shoal.ValidateOptionalID("ontology proposal ID", proposalID); err != nil {
+		return OntologyProposalMutationState{}, err
+	}
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	if err := e.requireOpen(); err != nil {
+		return OntologyProposalMutationState{}, err
+	}
+	if err := e.requireCertainOntologyMutationLocked(); err != nil {
+		return OntologyProposalMutationState{}, err
+	}
+	if len(e.ontologyProposals) > int(MaxOntologyProposals) {
+		return OntologyProposalMutationState{}, shoal.NewError(
+			shoal.ErrorUnavailable, "ontology proposals exceed the corpus bound")
+	}
+	proposals := make([]ontology.GovernedProposal, 0, len(e.ontologyProposals))
+	state := OntologyProposalMutationState{}
+	for id, record := range e.ontologyProposals {
+		proposal, err := record.proposal()
+		if err != nil {
+			return OntologyProposalMutationState{}, shoal.WrapError(
+				shoal.ErrorInternal, "stored ontology proposal is invalid", err)
+		}
+		proposals = append(proposals, proposal)
+		if proposalID != "" && id == proposalID {
+			state.proposalFound = true
+			state.proposalBaseVersionID, state.proposalHasBase =
+				proposal.BaseVersionID()
+		}
+	}
+	catalog, err := ontology.NewPublishedCatalog(configured, proposals)
+	if err != nil {
+		return OntologyProposalMutationState{}, err
+	}
+	state.active = catalog.Active()
+	return state, nil
+}
+
+// OntologyActiveState returns the active tip rooted at configured without
+// exposing the proposal corpus used to derive it.
+func (e *Explorer) OntologyActiveState(
+	ctx context.Context,
+	configured ontology.OntologyVersion,
+) (ontology.OntologyVersion, error) {
+	state, err := e.OntologyProposalMutationState(ctx, configured, "")
+	if err != nil {
+		return ontology.OntologyVersion{}, err
+	}
+	return state.Active(), nil
+}
+
+// OntologyProposalEvidence returns independent evidence values for one
+// proposal without exposing unrelated governed proposal bodies.
+func (e *Explorer) OntologyProposalEvidence(
+	ctx context.Context,
+	proposalID shoal.ID,
+) ([]ontology.EvidenceRef, bool, error) {
+	if err := contextError(ctx); err != nil {
+		return nil, false, err
+	}
+	if err := shoal.ValidateRequiredID("ontology proposal ID", proposalID); err != nil {
+		return nil, false, err
+	}
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	if err := e.requireOpen(); err != nil {
+		return nil, false, err
+	}
+	if err := e.requireCertainOntologyMutationLocked(); err != nil {
+		return nil, false, err
+	}
+	record := e.ontologyProposals[proposalID]
+	if record == nil {
+		return nil, false, nil
+	}
+	proposal, err := record.proposal()
+	if err != nil {
+		return nil, false, shoal.WrapError(
+			shoal.ErrorInternal, "stored ontology proposal is invalid", err)
+	}
+	var evidence []ontology.EvidenceRef
+	for _, morphism := range proposal.Morphisms() {
+		evidence = append(evidence, morphism.Evidence()...)
+	}
+	return evidence, true, nil
+}
+
+// ResolveOntologyEvidenceCitation validates and resolves an exact citation
+// against the immutable stored source revision.
+func (e *Explorer) ResolveOntologyEvidenceCitation(
+	ctx context.Context,
+	citation document.Citation,
+) (string, error) {
+	if err := contextError(ctx); err != nil {
+		return "", err
+	}
+	if err := citation.Validate(); err != nil {
+		return "", err
+	}
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	if err := e.requireOpen(); err != nil {
+		return "", err
+	}
+	record := e.documents[citation.DocumentID][citation.RevisionID]
+	if record == nil {
+		return "", shoal.NewError(
+			shoal.ErrorNotFound, "cited document revision not found")
+	}
+	return document.ResolveCitationQuote(
+		record.Source.Content,
+		record.Document,
+		record.Revision,
+		record.Sections,
+		record.Spans,
+		citation,
+	)
 }
 
 // CreateOntologyProposal durably records a new draft proposal. The lifecycle is
@@ -197,6 +409,9 @@ func (e *Explorer) CreateOntologyProposal(
 	if err := e.requireWritableLocked(); err != nil {
 		return err
 	}
+	if err := e.requireCertainOntologyMutationLocked(); err != nil {
+		return err
+	}
 	if existing := e.ontologyProposals[proposal.ID()]; existing != nil {
 		if existing.sameBase(record) {
 			return nil
@@ -204,11 +419,18 @@ func (e *Explorer) CreateOntologyProposal(
 		return shoal.NewError(
 			shoal.ErrorUnavailable, "ontology proposal ID collision")
 	}
+	if len(e.ontologyProposals) >= int(MaxOntologyProposals) {
+		return shoal.NewError(
+			shoal.ErrorUnavailable, "ontology proposals exceed the corpus bound")
+	}
 	if err := e.writeRecord(
 		ontologyProposalRecordRow(record.ProposalID),
 		embeddedRecordOntologyProposal,
 		record,
 	); err != nil {
+		if IsIndeterminateCommit(err) {
+			e.ontologyMutationIndeterminate = true
+		}
 		return err
 	}
 	copy := record
@@ -225,6 +447,30 @@ func (e *Explorer) TransitionOntologyProposal(
 	actor, note string,
 	at time.Time,
 ) (ontology.GovernedProposal, error) {
+	return e.transitionOntologyProposal(ctx, proposalID, next, actor, note, at, nil)
+}
+
+// TransitionOntologyProposalWithLimits validates the prospective response
+// under the same lock as the transition, without narrowing the domain API.
+func (e *Explorer) TransitionOntologyProposalWithLimits(
+	ctx context.Context,
+	proposalID shoal.ID,
+	next ontology.ProposalState,
+	actor, note string,
+	at time.Time,
+	limits OntologyProjectionLimits,
+) (ontology.GovernedProposal, error) {
+	return e.transitionOntologyProposal(ctx, proposalID, next, actor, note, at, &limits)
+}
+
+func (e *Explorer) transitionOntologyProposal(
+	ctx context.Context,
+	proposalID shoal.ID,
+	next ontology.ProposalState,
+	actor, note string,
+	at time.Time,
+	limits *OntologyProjectionLimits,
+) (ontology.GovernedProposal, error) {
 	if err := contextError(ctx); err != nil {
 		return ontology.GovernedProposal{}, err
 	}
@@ -239,6 +485,9 @@ func (e *Explorer) TransitionOntologyProposal(
 	if err := e.requireWritableLocked(); err != nil {
 		return ontology.GovernedProposal{}, err
 	}
+	if err := e.requireCertainOntologyMutationLocked(); err != nil {
+		return ontology.GovernedProposal{}, err
+	}
 	record := e.ontologyProposals[proposalID]
 	if record == nil {
 		return ontology.GovernedProposal{}, shoal.NewError(
@@ -248,6 +497,42 @@ func (e *Explorer) TransitionOntologyProposal(
 	if err != nil {
 		return ontology.GovernedProposal{}, shoal.WrapError(
 			shoal.ErrorInternal, "stored ontology proposal is invalid", err)
+	}
+	if next == ontology.ProposalPublished {
+		publishedVersions := make(map[shoal.ID]struct{})
+		for otherID, otherRecord := range e.ontologyProposals {
+			if otherID == proposalID {
+				continue
+			}
+			other, restoreErr := otherRecord.proposal()
+			if restoreErr != nil {
+				return ontology.GovernedProposal{}, shoal.WrapError(
+					shoal.ErrorInternal, "stored ontology proposal is invalid", restoreErr)
+			}
+			otherBase, otherHasBase := other.BaseVersionID()
+			currentBase, currentHasBase := current.BaseVersionID()
+			if other.State() != ontology.ProposalPublished ||
+				other.Schema().ID() != current.Schema().ID() {
+				continue
+			}
+			publishedVersions[other.ProposedVersion().ID()] = struct{}{}
+			if otherHasBase {
+				publishedVersions[otherBase] = struct{}{}
+			}
+			if otherHasBase == currentHasBase &&
+				otherBase == currentBase {
+				return ontology.GovernedProposal{}, shoal.NewError(
+					shoal.ErrorConflict,
+					"another proposal already advanced this ontology base version",
+				)
+			}
+		}
+		if _, cycle := publishedVersions[current.ProposedVersion().ID()]; cycle {
+			return ontology.GovernedProposal{}, shoal.NewError(
+				shoal.ErrorConflict,
+				"ontology publication target already exists in published history",
+			)
+		}
 	}
 	// This advance is load-bearing; TestOntologyProposalTransitionsSurviveCoarseClockGranularity
 	// pins that back-to-back transitions still record strictly increasing times
@@ -259,6 +544,11 @@ func (e *Explorer) TransitionOntologyProposal(
 	updated, err := current.Transition(next, actor, note, at)
 	if err != nil {
 		return ontology.GovernedProposal{}, err
+	}
+	if limits != nil {
+		if err := limits.ValidateProposal(updated); err != nil {
+			return ontology.GovernedProposal{}, err
+		}
 	}
 	if len(record.transitions) == math.MaxUint32 {
 		return ontology.GovernedProposal{}, shoal.NewError(
@@ -279,10 +569,23 @@ func (e *Explorer) TransitionOntologyProposal(
 		embeddedRecordProposalTransition,
 		persisted,
 	); err != nil {
+		if IsIndeterminateCommit(err) {
+			e.ontologyMutationIndeterminate = true
+		}
 		return ontology.GovernedProposal{}, err
 	}
 	record.transitions = nextTransitions
 	return updated, nil
+}
+
+func (e *Explorer) requireCertainOntologyMutationLocked() error {
+	if !e.ontologyMutationIndeterminate {
+		return nil
+	}
+	return shoal.NewError(
+		shoal.ErrorUnavailable,
+		"ontology mutation outcome is indeterminate; reopen the corpus before retrying",
+	)
 }
 
 // advanceProposalTransitionTime returns the earliest time that keeps a
@@ -423,8 +726,17 @@ func (p *persistedOntologyProposal) proposalBase() (ontology.GovernedProposal, e
 	if err != nil {
 		return ontology.GovernedProposal{}, err
 	}
-	proposal, err := ontology.NewGovernedProposal(
-		schema, base, proposed, p.ProposedBy, p.Rationale, p.CreatedAt, p.Metadata)
+	morphisms := make([]ontology.OntologyMorphism, 0, len(p.Morphisms))
+	for _, item := range p.Morphisms {
+		morphism, err := restoreOntologyMorphism(item, base, proposed)
+		if err != nil {
+			return ontology.GovernedProposal{}, err
+		}
+		morphisms = append(morphisms, morphism)
+	}
+	proposal, err := ontology.NewGovernedProposalWithMorphisms(
+		schema, base, proposed, morphisms,
+		p.ProposedBy, p.Rationale, p.CreatedAt, p.Metadata)
 	if err != nil {
 		return ontology.GovernedProposal{}, err
 	}
@@ -470,7 +782,73 @@ func persistOntologyProposal(
 		CreatedAt:       proposal.CreatedAt(),
 		Metadata:        proposal.Metadata(),
 	}
+	for _, morphism := range proposal.Morphisms() {
+		persisted, err := persistOntologyMorphism(morphism)
+		if err != nil {
+			return persistedOntologyProposal{}, err
+		}
+		record.Morphisms = append(record.Morphisms, persisted)
+	}
 	return record, nil
+}
+
+func persistOntologyMorphism(
+	morphism ontology.OntologyMorphism,
+) (persistedOntologyMorphism, error) {
+	record := persistedOntologyMorphism{
+		Kind: morphism.Kind(), Sources: morphism.Sources(), Targets: morphism.Targets(),
+		DiscriminatorKey: morphism.Discriminator().MetadataKey(),
+		Discriminator:    morphism.Discriminator().Choices(),
+		Rationale:        morphism.Rationale(), Metadata: morphism.Metadata(),
+	}
+	for _, evidence := range morphism.Evidence() {
+		if _, derived := evidence.Derivation(); derived {
+			return persistedOntologyMorphism{}, shoal.NewError(
+				shoal.ErrorInvalidArgument,
+				"ontology morphism persistence requires citation evidence",
+			)
+		}
+		path, hasPath := evidence.Path()
+		record.Evidence = append(record.Evidence, persistedEvidenceRef{
+			Citation: evidence.Citation(), Quote: evidence.Quote(),
+			Path: path, HasPath: hasPath, Metadata: evidence.Metadata(),
+		})
+	}
+	return record, nil
+}
+
+func restoreOntologyMorphism(
+	record persistedOntologyMorphism,
+	source, target ontology.OntologyVersion,
+) (ontology.OntologyMorphism, error) {
+	evidence := make([]ontology.EvidenceRef, 0, len(record.Evidence))
+	for _, item := range record.Evidence {
+		var options []ontology.EvidenceOption
+		if item.HasPath {
+			options = append(options, ontology.WithEvidencePath(item.Path))
+		}
+		ref, err := ontology.NewEvidenceRef(
+			item.Citation, item.Quote, item.Metadata, options...)
+		if err != nil {
+			return ontology.OntologyMorphism{}, err
+		}
+		evidence = append(evidence, ref)
+	}
+	var discriminator ontology.MorphismDiscriminator
+	var err error
+	if record.Kind == ontology.MorphismSplit {
+		discriminator, err = ontology.NewMorphismDiscriminator(
+			record.DiscriminatorKey, record.Discriminator)
+		if err != nil {
+			return ontology.OntologyMorphism{}, err
+		}
+	}
+	return ontology.NewOntologyMorphism(ontology.MorphismConfig{
+		Kind: record.Kind, SourceVersion: source, TargetVersion: target,
+		Sources: record.Sources, Targets: record.Targets,
+		Discriminator: discriminator, Evidence: evidence,
+		Rationale: record.Rationale, Metadata: record.Metadata,
+	})
 }
 
 func persistOntologySchema(schema ontology.OntologySchema) persistedOntologySchema {

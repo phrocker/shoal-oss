@@ -41,13 +41,21 @@ type Config struct {
 	// VectorScorer is an optional explicitly trusted scorer for authorized
 	// vector retrieval validation. It is intentionally separate from Base:
 	// Base responses are treated as untrusted and validated canonically.
-	VectorScorer       VectorScorer
-	Resolver           auth.Resolver
-	PolicySelector     PolicySelector
-	EdgePolicySelector EdgePolicySelector
-	PolicyStore        PolicyStore
-	GenerationReader   auth.GenerationReader
-	Clock              func() time.Time
+	VectorScorer VectorScorer
+	// OntologyInterpreter is an optional explicitly trusted read-time
+	// interpreter. It is separate from Base because Base graph responses are
+	// untrusted and must never be allowed to inject interpretations.
+	OntologyInterpreter explorer.OntologyInterpreter
+	// OntologyProposalStore is the optional explicitly trusted governance
+	// store. It is separate from Base because proposal state, evidence, and
+	// citation bytes participate in authorization decisions.
+	OntologyProposalStore explorer.OntologyProposalStore
+	Resolver              auth.Resolver
+	PolicySelector        PolicySelector
+	EdgePolicySelector    EdgePolicySelector
+	PolicyStore           PolicyStore
+	GenerationReader      auth.GenerationReader
+	Clock                 func() time.Time
 	// Mosaic optionally enables the sensitivity-domain co-occurrence budget
 	// that defends against the mosaic effect. A zero MaxDomains disables it; a
 	// nonzero MaxDomains requires PolicyStore to implement CoOccurrenceLedger
@@ -58,20 +66,22 @@ type Config struct {
 
 // Client enforces trusted-context authorization around an Explorer client.
 type Client struct {
-	base               explorer.Client
-	vectorScorer       VectorScorer
-	resolver           auth.Resolver
-	policySelector     PolicySelector
-	edgePolicySelector EdgePolicySelector
-	policyStore        PolicyStore
-	generationReader   auth.GenerationReader
-	clock              func() time.Time
-	mosaic             MosaicBudget
-	ledger             CoOccurrenceLedger
-	mutationMu         sync.Mutex
-	vectorMu           sync.Mutex
-	budgetMu           sync.Mutex
-	vectorAvailability authorizedVectorAvailabilityCache
+	base                explorer.Client
+	vectorScorer        VectorScorer
+	ontologyInterpreter explorer.OntologyInterpreter
+	ontologyProposals   explorer.OntologyProposalStore
+	resolver            auth.Resolver
+	policySelector      PolicySelector
+	edgePolicySelector  EdgePolicySelector
+	policyStore         PolicyStore
+	generationReader    auth.GenerationReader
+	clock               func() time.Time
+	mosaic              MosaicBudget
+	ledger              CoOccurrenceLedger
+	mutationMu          sync.Mutex
+	vectorMu            sync.Mutex
+	budgetMu            sync.Mutex
+	vectorAvailability  authorizedVectorAvailabilityCache
 }
 
 type authorizedVectorAvailabilityCache struct {
@@ -121,16 +131,18 @@ func NewClient(config Config) (*Client, error) {
 		}
 	}
 	return &Client{
-		base:               config.Base,
-		vectorScorer:       config.VectorScorer,
-		resolver:           config.Resolver,
-		policySelector:     config.PolicySelector,
-		edgePolicySelector: edgeSelector,
-		policyStore:        config.PolicyStore,
-		generationReader:   config.GenerationReader,
-		clock:              config.Clock,
-		mosaic:             config.Mosaic,
-		ledger:             ledger,
+		base:                config.Base,
+		vectorScorer:        config.VectorScorer,
+		ontologyInterpreter: config.OntologyInterpreter,
+		ontologyProposals:   config.OntologyProposalStore,
+		resolver:            config.Resolver,
+		policySelector:      config.PolicySelector,
+		edgePolicySelector:  edgeSelector,
+		policyStore:         config.PolicyStore,
+		generationReader:    config.GenerationReader,
+		clock:               config.Clock,
+		mosaic:              config.Mosaic,
+		ledger:              ledger,
 	}, nil
 }
 

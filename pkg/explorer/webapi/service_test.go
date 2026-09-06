@@ -308,6 +308,7 @@ func TestHTTPIDsAreBinarySafeAndReversible(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	if bytes.Contains(encoded, []byte("\ufffd")) {
 		t.Fatalf("JSON replaced opaque ID bytes: %s", encoded)
 	}
@@ -336,6 +337,30 @@ func TestHTTPIDsAreBinarySafeAndReversible(t *testing.T) {
 	}
 	if len(request.NodeIDs) != 1 || request.NodeIDs[0] != rawID {
 		t.Fatalf("ID round trip = %q", request.NodeIDs)
+	}
+}
+
+func TestPathResponseRoundTripsOntologyInterpretationReports(t *testing.T) {
+	response := webapi.PathResponse{
+		OntologyInterpretations: []webapi.OntologyInterpretationReport{{
+			AssertionID: "assertion-1", SchemaID: "schema-1", VersionID: "version-2",
+			Reading: ontology.OntologyOtherVersion, Status: ontology.InterpretationResolved,
+			OriginalPredicate: "relationship-old", Predicate: "relationship-new",
+			AppliedMorphisms: []string{"morphism-1"},
+		}},
+	}
+	encoded, err := json.Marshal(response)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded webapi.PathResponse
+	if err := json.Unmarshal(encoded, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if len(decoded.OntologyInterpretations) != 1 ||
+		decoded.OntologyInterpretations[0].Predicate != "relationship-new" ||
+		decoded.OntologyInterpretations[0].Status != ontology.InterpretationResolved {
+		t.Fatalf("interpretation round trip = %#v", decoded.OntologyInterpretations)
 	}
 }
 

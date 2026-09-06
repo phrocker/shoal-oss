@@ -87,6 +87,11 @@ func AuthorizationFingerprint(decision Decision) (Fingerprint, error) {
 	}
 	encoder.text(string(cloned.serviceRole))
 	encoder.text(string(cloned.serviceCeilingIdentity))
+	if cloned.selectedOntology.Known() {
+		encoder.boolean(true)
+		encoder.text(string(cloned.selectedOntology.SchemaID()))
+		encoder.text(string(cloned.selectedOntology.VersionID()))
+	}
 	return Fingerprint(encoder.sum()), nil
 }
 

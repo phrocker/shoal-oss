@@ -134,9 +134,40 @@ func (c *Client) Neighborhood(
 	if err != nil {
 		return explorer.Neighborhood{}, err
 	}
+	result, err = c.applyOntologyLens(ctx, result, decision)
+	if err != nil {
+		return explorer.Neighborhood{}, err
+	}
 	if err := guard.Check(ctx); err != nil {
 		return explorer.Neighborhood{}, err
 	}
+	return result, nil
+}
+
+func (c *Client) applyOntologyLens(
+	ctx context.Context,
+	result explorer.Neighborhood,
+	decision auth.Decision,
+) (explorer.Neighborhood, error) {
+	selected, ok := decision.SelectedOntology()
+	if !ok {
+		return result, nil
+	}
+	interpreter := c.ontologyInterpreter
+	if isNilDependency(interpreter) {
+		for _, assertion := range result.Assertions {
+			result.Interpretations = append(result.Interpretations,
+				ontology.UnresolvedInterpretation(
+					assertion, selected, "ontology interpretation is unavailable"))
+		}
+		return result, nil
+	}
+	interpretations, err := interpreter.InterpretAssertions(
+		ctx, result.Assertions, selected)
+	if err != nil {
+		return explorer.Neighborhood{}, directBaseError(err)
+	}
+	result.Interpretations = interpretations
 	return result, nil
 }
 
