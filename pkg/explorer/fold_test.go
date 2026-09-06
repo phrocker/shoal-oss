@@ -246,7 +246,7 @@ func TestRehydrateFoldPreservesRetrievedAndCitedDistinction(t *testing.T) {
 
 	wide, ok := byID["interaction.session_wide"]
 	if !ok {
-		t.Fatal("rehydration lost session-wide")
+		t.Fatal("rehydration lost interaction.session_wide")
 	}
 	if !containsNodeID(wide.RetrievedNodeIDs, restricted[0]) {
 		t.Fatal("rehydration lost a retrieved-only node")
@@ -549,7 +549,7 @@ func TestInteractionsTouchingWalksAcrossSessions(t *testing.T) {
 		}
 	}
 	if !sawCites {
-		t.Fatalf("cross-session walk missed session-cites: %+v", overlaps)
+		t.Fatalf("cross-session walk missed interaction.session_cites: %+v", overlaps)
 	}
 }
 

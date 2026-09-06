@@ -293,7 +293,8 @@ func (c *Client) authorizeInteractionRecords(
 				record.Summary, decision)
 			continue
 		}
-		count := len(record.TouchedNodeIDs) + len(record.TouchedEdgeIDs)
+		count := interactionAuthorizationCost(
+			len(record.TouchedNodeIDs), len(record.TouchedEdgeIDs))
 		if batchIDs > 0 && batchIDs+count > maxInteractionAuthorizationIDs {
 			if err := flush(); err != nil {
 				return nil, err
@@ -330,7 +331,9 @@ func (c *Client) authorizeInteractionBatch(
 		batchNodeIDs = append(batchNodeIDs, records[index].TouchedNodeIDs...)
 		batchEdgeIDs = append(batchEdgeIDs, records[index].TouchedEdgeIDs...)
 	}
-	if len(batchNodeIDs)+len(batchEdgeIDs) > maxInteractionAuthorizationIDs {
+	if interactionAuthorizationCost(
+		len(batchNodeIDs), len(batchEdgeIDs),
+	) > maxInteractionAuthorizationIDs {
 		for _, index := range batch {
 			decided, err := c.interactionEvidenceAllowsBounded(
 				ctx,
@@ -539,7 +542,7 @@ func (c *Client) interactionEvidenceAllowsBounded(
 	now time.Time,
 ) (bool, error) {
 	for start := 0; start < len(edgeIDs); {
-		end := chunkEnd(start, len(edgeIDs))
+		end := chunkEnd(start, len(edgeIDs), maxInteractionAuthorizationIDs/2)
 		chunk := edgeIDs[start:end]
 		start = end
 		edges, err := c.resolveEdges(ctx, chunk)
@@ -562,7 +565,7 @@ func (c *Client) interactionEvidenceAllowsBounded(
 		}
 	}
 	for start := 0; start < len(nodeIDs); {
-		end := chunkEnd(start, len(nodeIDs))
+		end := chunkEnd(start, len(nodeIDs), maxInteractionAuthorizationIDs)
 		chunk := nodeIDs[start:end]
 		start = end
 		registrations, err := c.resolveNodes(ctx, chunk)
@@ -578,13 +581,22 @@ func (c *Client) interactionEvidenceAllowsBounded(
 	return true, nil
 }
 
-// chunkEnd is the exclusive end of the bounded chunk that starts at start.
-func chunkEnd(start, length int) int {
-	end := start + maxInteractionAuthorizationIDs
+// chunkEnd is the exclusive end of the chunk of at most size elements that
+// starts at start.
+func chunkEnd(start, length, size int) int {
+	end := start + size
 	if end > length {
 		return length
 	}
 	return end
+}
+
+// interactionAuthorizationCost is the number of identifiers a batch submits to
+// the policy store. Every edge costs its own identifier plus the two endpoint
+// node identifiers its registration expands into, so the bound holds for the
+// node lookup as well as the edge lookup.
+func interactionAuthorizationCost(nodes, edges int) int {
+	return nodes + 3*edges
 }
 
 func interactionEvidenceAllows(
