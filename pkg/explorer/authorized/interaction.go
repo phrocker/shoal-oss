@@ -561,7 +561,7 @@ func analyticsInteractionEvidence(
 			"analytics interaction has multiple analytics tool calls",
 		)
 	}
-	if len(session.CitedEdges) != 0 {
+	if len(session.CitedNodeIDs) != 0 || len(session.CitedEdges) != 0 {
 		return analyticsInteractionGraph{}, false, shoal.NewError(
 			shoal.ErrorInvalidArgument,
 			"analytics interaction has evidence outside its analytics tool call",
@@ -608,6 +608,24 @@ func analyticsInteractionEvidence(
 				shoal.ErrorInvalidArgument,
 				"analytics interaction node evidence is inconsistent",
 			)
+		}
+		if len(session.SeedNodeIDs) == 0 {
+			return analyticsInteractionGraph{}, false, shoal.NewError(
+				shoal.ErrorInvalidArgument,
+				"analytics interaction requires at least one seed node",
+			)
+		}
+		retrieved := make(map[shoal.ID]struct{}, len(nodeIDs))
+		for _, nodeID := range nodeIDs {
+			retrieved[nodeID] = struct{}{}
+		}
+		for _, seedNodeID := range session.SeedNodeIDs {
+			if _, ok := retrieved[seedNodeID]; !ok {
+				return analyticsInteractionGraph{}, false, shoal.NewError(
+					shoal.ErrorInvalidArgument,
+					"analytics interaction seed is absent from exact node evidence",
+				)
+			}
 		}
 	}
 	return evidence, true, nil
