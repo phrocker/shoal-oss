@@ -834,12 +834,13 @@ func (r *Runtime) recoverIntent(ctx context.Context, txn coordination.TXN) error
 		return inspectErr
 	}
 	if err != nil {
-		if errors.Is(err, transaction.ErrConflict) {
-			snapshot, inspectErr := r.coordinator.Inspect(ctx, txn)
-			if inspectErr == nil && snapshot.Root.State.Terminal() &&
-				snapshot.Root.State != coordination.StateCommitted {
-				return r.intents.Settle(ctx, txn, record.LogicalDigest)
-			}
+		snapshot, inspectErr := r.coordinator.Inspect(ctx, txn)
+		if inspectErr == nil && snapshot.Root.State.Terminal() &&
+			snapshot.Root.State != coordination.StateCommitted {
+			return r.intents.Settle(ctx, txn, record.LogicalDigest)
+		}
+		if inspectErr != nil && !errors.Is(inspectErr, transaction.ErrNotFound) {
+			return errors.Join(err, inspectErr)
 		}
 		return err
 	}

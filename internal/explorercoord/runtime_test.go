@@ -666,12 +666,17 @@ func TestExplorerLoadHidesUncommittedAndPoisonedPhysicalRevision(t *testing.T) {
 	if err := runtime.engine.Write(explorer.EmbeddedTableName, []*cclient.Mutation{corrupt}); err != nil {
 		t.Fatal(err)
 	}
-	if err := runtime.Recover(context.Background()); !errors.Is(err, transaction.ErrQuarantined) {
-		t.Fatalf("poison staged transaction = %v", err)
+	if err := runtime.Recover(context.Background()); err != nil {
+		t.Fatalf("settle poisoned staged transaction = %v", err)
 	}
 	snapshot, err = runtime.Inspect(context.Background(), txn)
 	if err != nil || snapshot.Root.State != coordination.StatePoisoned {
 		t.Fatalf("poisoned transaction = %#v, %v", snapshot, err)
+	}
+	if candidates, _, err := runtime.intents.Candidates(
+		context.Background(), nil, 1,
+	); err != nil || len(candidates) != 0 {
+		t.Fatalf("poisoned pending candidates = %#v, %v", candidates, err)
 	}
 	if err := runtime.Close(); err != nil {
 		t.Fatal(err)
