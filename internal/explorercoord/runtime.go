@@ -861,6 +861,19 @@ func (r *Runtime) recoverPending(
 		if err == nil || !errors.Is(err, transaction.ErrUnavailable) {
 			return err
 		}
+		record, loadErr := r.intents.Load(ctx, txn)
+		if loadErr != nil {
+			return errors.Join(err, loadErr)
+		}
+		advanced, available, waitErr := r.waitForExpectedResolution(
+			ctx, txn, record.Intent,
+		)
+		if waitErr != nil {
+			return errors.Join(err, waitErr)
+		}
+		if advanced || available {
+			continue
+		}
 		timer := time.NewTimer(r.recoveryBackoff << min(round, 8))
 		select {
 		case <-ctx.Done():

@@ -293,6 +293,125 @@ func TestRuntimeCrashRecoveryAtEveryDurableStage(t *testing.T) {
 	}
 }
 
+func TestOpenSettlesConflictingPendingIntentsInOnePass(t *testing.T) {
+	config := testRuntimeConfig(t, testDirectory(t))
+	config.RecoveryLimit = 2
+	config.RecoveryConcurrency = 2
+	runtime, err := Open(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := testIntent(
+		t, config.Domain, "create", "base", "v1",
+		guard.ModeAbsentOrIdentical, 0, coordination.Digest{},
+	)
+	baseResult, err := runtime.Publish(context.Background(), Request{Intent: base})
+	if err != nil {
+		t.Fatal(err)
+	}
+	left := testIntent(
+		t, config.Domain, "update", "pending-left", "left",
+		guard.ModeMutate, baseResult.Epoch, baseResult.LogicalDigest,
+	)
+	right := testIntent(
+		t, config.Domain, "update", "pending-right", "right",
+		guard.ModeMutate, baseResult.Epoch, baseResult.LogicalDigest,
+	)
+	leftRecord, _, err := runtime.intents.Put(context.Background(), left)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rightRecord, _, err := runtime.intents.Put(context.Background(), right)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := Open(config)
+	if err != nil {
+		t.Fatalf("single-pass conflict recovery open = %v", err)
+	}
+	defer reopened.Close()
+	candidates, _, err := reopened.intents.Candidates(context.Background(), nil, 2)
+	if err != nil || len(candidates) != 0 {
+		t.Fatalf("conflicted pending candidates = %#v, %v", candidates, err)
+	}
+	committed, conflicted := 0, 0
+	for _, txn := range []coordination.TXN{leftRecord.TXN, rightRecord.TXN} {
+		snapshot, err := reopened.Inspect(context.Background(), txn)
+		if err != nil {
+			t.Fatal(err)
+		}
+		switch snapshot.Root.State {
+		case coordination.StateCommitted:
+			committed++
+		case coordination.StateConflicted:
+			conflicted++
+		}
+	}
+	if committed != 1 || conflicted != 1 {
+		t.Fatalf("recovery outcomes committed=%d conflicted=%d", committed, conflicted)
+	}
+}
+
+func TestOpenSettlesNewlyPoisonedIntentInOnePass(t *testing.T) {
+	directory := testDirectory(t)
+	config := testRuntimeConfig(t, directory)
+	fired := false
+	config.testStageHook = func(stage recoveryStage) error {
+		if stage == recoveryStagePhysical && !fired {
+			fired = true
+			return context.Canceled
+		}
+		return nil
+	}
+	runtime, err := Open(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	intent := testIntent(
+		t, config.Domain, "poison-on-open", "poison", "expected",
+		guard.ModeAbsentOrIdentical, 0, coordination.Digest{},
+	)
+	if _, err := runtime.Publish(
+		context.Background(), Request{Intent: intent},
+	); err == nil {
+		t.Fatal("physical-stage failure did not occur")
+	}
+	txn, _ := DeriveTXN(config.Domain, intent.Operation, intent.Token)
+	snapshot, err := runtime.Inspect(context.Background(), txn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	corrupt, _ := cclient.NewMutation([]byte("record/one"))
+	corrupt.Put(
+		[]byte("record"), []byte("v1"), nil,
+		int64(snapshot.Root.Epoch), []byte("corrupt"),
+	)
+	if err := runtime.engine.Write("records", []*cclient.Mutation{corrupt}); err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.Close(); err != nil {
+		t.Fatal(err)
+	}
+	config.testStageHook = nil
+	reopened, err := Open(config)
+	if err != nil {
+		t.Fatalf("single-pass poison recovery open = %v", err)
+	}
+	defer reopened.Close()
+	snapshot, err = reopened.Inspect(context.Background(), txn)
+	if err != nil || snapshot.Root.State != coordination.StatePoisoned {
+		t.Fatalf("poisoned recovery root = %#v, %v", snapshot, err)
+	}
+	candidates, _, err := reopened.intents.Candidates(context.Background(), nil, 1)
+	if err != nil || len(candidates) != 0 {
+		t.Fatalf("poisoned pending candidates = %#v, %v", candidates, err)
+	}
+}
+
 func TestExplorerRetryReusesDurableAttemptAcrossPublicationFaults(t *testing.T) {
 	for _, stage := range []recoveryStage{
 		recoveryStageIntent,
