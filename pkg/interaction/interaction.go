@@ -45,6 +45,7 @@ import (
 	"time"
 
 	"github.com/phrocker/shoal-oss/pkg/graph"
+	"github.com/phrocker/shoal-oss/pkg/ontology"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
@@ -128,6 +129,8 @@ const (
 	PropertyAuthFingerprint = "interaction.authorization_fingerprint"
 	PropertyAuthExpiresAt   = "interaction.authorization_expires_at"
 	PropertyAuthOperation   = "interaction.authorization_operation"
+	PropertyOntologySchema  = "interaction.ontology_schema_id"
+	PropertyOntologyVersion = "interaction.ontology_version_id"
 	PropertyEmbeddingSpace  = "interaction.embedding_space"
 	PropertyEmbeddingSpaces = "interaction.embedding_space_set_digest"
 	PropertyEmbeddingCount  = "interaction.embedding_space_count"
@@ -363,6 +366,9 @@ type Session struct {
 	// AuthorizationOperation is the exact trusted operation authorized for
 	// this interaction. Empty retains the legacy retrieval authorization.
 	AuthorizationOperation string
+	// OntologySchemaID and OntologyVersionID pin the exact read-time lens.
+	OntologySchemaID  shoal.ID
+	OntologyVersionID shoal.ID
 	// EmbeddingSpaceID is retained for legacy single/set-ID records.
 	EmbeddingSpaceID shoal.ID
 	// EmbeddingSpaces carries canonical stable full identities from the core
@@ -683,6 +689,13 @@ func (s Session) Validate() error {
 		true,
 	); err != nil {
 		return err
+	}
+	if s.OntologySchemaID != "" || s.OntologyVersionID != "" {
+		if _, err := ontology.NewOntologyIdentityFromIDs(
+			s.OntologySchemaID, s.OntologyVersionID,
+		); err != nil {
+			return err
+		}
 	}
 	if err := s.EmbeddingSpaces.Validate(); err != nil {
 		return err
@@ -1005,6 +1018,14 @@ func (s Session) SubgraphWithEvidence(
 		sessionNode.Properties,
 		PropertyAuthOperation,
 		s.AuthorizationOperation,
+	)
+	setIfPresent(
+		sessionNode.Properties, PropertyOntologySchema,
+		string(s.OntologySchemaID),
+	)
+	setIfPresent(
+		sessionNode.Properties, PropertyOntologyVersion,
+		string(s.OntologyVersionID),
 	)
 	if !s.AuthorizationExpiresAt.IsZero() {
 		setIfPresent(

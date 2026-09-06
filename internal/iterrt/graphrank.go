@@ -18,13 +18,14 @@
 package iterrt
 
 import (
+	"context"
 	"errors"
 	"fmt"
-	"math"
 	"sort"
 	"strconv"
 	"strings"
 
+	"github.com/phrocker/shoal-oss/internal/graphrank"
 	"github.com/phrocker/shoal-oss/internal/rfile/wire"
 )
 
@@ -198,7 +199,6 @@ func (g *GraphRankIterator) Seek(r Range, columnFamilies [][]byte, inclusive boo
 
 	vertices := map[string]*graphRankVertex{}
 	outgoing := map[string][]string{}
-	incoming := map[string]map[string]struct{}{}
 	var maxTS int64
 	haveSource := false
 
@@ -230,13 +230,6 @@ func (g *GraphRankIterator) Seek(r Range, columnFamilies [][]byte, inclusive boo
 			if g.edgeType == "" || cf == g.edgeCFPrefix+g.edgeType {
 				// Load-bearing Java parity: TestGraphRank_DuplicateEdgesCountForOutDegree pins outgoing List vs incoming Set asymmetry.
 				outgoing[row] = append(outgoing[row], cq)
-				sources := incoming[cq]
-				if sources == nil {
-					sources = map[string]struct{}{}
-					incoming[cq] = sources
-				}
-				// Load-bearing Java parity: TestGraphRank_DuplicateEdgesCountForOutDegree pins outgoing List vs incoming Set asymmetry.
-				sources[row] = struct{}{}
 			}
 		}
 
@@ -260,47 +253,26 @@ func (g *GraphRankIterator) Seek(r Range, columnFamilies [][]byte, inclusive boo
 
 	vertexIDs := graphRankKeys(vertices)
 	sort.Strings(vertexIDs)
-	n := len(vertexIDs)
-	initialRank := 1.0 / float64(n)
-	ranks := make(map[string]float64, n)
-	for _, vertexID := range vertexIDs {
-		ranks[vertexID] = initialRank
+	rankEdges := make([]graphrank.Edge, 0)
+	for from, targets := range outgoing {
+		for _, to := range targets {
+			rankEdges = append(rankEdges, graphrank.Edge{From: from, To: to})
+		}
 	}
-
-	for iter := 0; iter < g.maxIterations; iter++ {
-		newRanks := make(map[string]float64, n)
-		maxDelta := 0.0
-
-		for _, vertexID := range vertexIDs {
-			rankSum := 0.0
-			if sources := incoming[vertexID]; len(sources) > 0 {
-				neighbors := graphRankKeys(sources)
-				sort.Strings(neighbors) // Load-bearing determinism: TestGraphRankParity_DeterministicIncomingOrder pins contribution order.
-				for _, neighbor := range neighbors {
-					neighborRank, ok := ranks[neighbor]
-					if !ok {
-						continue
-					}
-					outDegree := len(outgoing[neighbor])
-					if outDegree == 0 {
-						outDegree = 1
-					}
-					rankSum += neighborRank / float64(outDegree)
-				}
-			}
-
-			newRank := (1.0-g.dampingFactor)/float64(n) + g.dampingFactor*rankSum
-			newRanks[vertexID] = newRank
-			delta := math.Abs(newRank - ranks[vertexID])
-			if delta > maxDelta {
-				maxDelta = delta
-			}
-		}
-
-		ranks = newRanks
-		if maxDelta < g.convergenceThreshold {
-			break
-		}
+	ranked, err := graphrank.Compute(
+		context.Background(),
+		vertexIDs,
+		rankEdges,
+		graphrank.Options{
+			DampingFactor:              g.dampingFactor,
+			MaxIterations:              g.maxIterations,
+			ConvergenceThreshold:       g.convergenceThreshold,
+			DeduplicateIncomingSources: true,
+		},
+	)
+	if err != nil {
+		g.err = err
+		return err
 	}
 
 	rankTS := maxTS + 1 // Load-bearing determinism: TestGraphRank_DerivedTimestamps pins source-derived timestamps.
@@ -314,7 +286,7 @@ func (g *GraphRankIterator) Seek(r Range, columnFamilies [][]byte, inclusive boo
 				ColumnVisibility: append([]byte(nil), vertex.visibility...),
 				Timestamp:        rankTS,
 			},
-			Value: []byte(strconv.FormatFloat(ranks[vertexID], 'g', -1, 64)),
+			Value: []byte(strconv.FormatFloat(ranked.Ranks[vertexID], 'g', -1, 64)),
 		})
 	}
 

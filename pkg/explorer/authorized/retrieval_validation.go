@@ -465,11 +465,10 @@ func (c *Client) authorizedVectorScores(
 			})
 		}
 	}
-	scoreRequest := explorer.VectorScoreRequest{
+	scores, err := c.vectorScorer.VectorScores(ctx, explorer.VectorScoreRequest{
 		Text:      request.Text,
 		Citations: citations,
-	}
-	scores, err := c.vectorScorer.VectorScores(ctx, scoreRequest)
+	})
 	if err != nil {
 		return nil, authorizedVectorError(err)
 	}

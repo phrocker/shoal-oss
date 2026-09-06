@@ -30,8 +30,10 @@ import (
 	"time"
 
 	"github.com/phrocker/shoal-oss/pkg/explorer"
+	exploreranalytics "github.com/phrocker/shoal-oss/pkg/explorer/analytics"
 	"github.com/phrocker/shoal-oss/pkg/explorer/authorized"
 	"github.com/phrocker/shoal-oss/pkg/graph"
+	"github.com/phrocker/shoal-oss/pkg/interaction"
 	"github.com/phrocker/shoal-oss/pkg/ontology"
 	"github.com/phrocker/shoal-oss/pkg/retrieval"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
@@ -166,6 +168,7 @@ type changeFeedBackend interface {
 // EmbeddedService adapts the public Explorer client to the workspace service.
 type EmbeddedService struct {
 	client            explorer.BoundedClient
+	analytics         *exploreranalytics.Service
 	ontologyMu        sync.RWMutex
 	ontologyPublishMu sync.Mutex
 	ontologyVersion   *ontology.OntologyVersion
@@ -178,7 +181,40 @@ func NewEmbeddedService(client explorer.BoundedClient) (*EmbeddedService, error)
 	if client == nil {
 		return nil, shoal.NewError(shoal.ErrorInvalidArgument, "explorer client is required")
 	}
-	return &EmbeddedService{client: client, clock: time.Now}, nil
+	service := &EmbeddedService{client: client, clock: time.Now}
+	if materializer, ok := client.(exploreranalytics.Materializer); ok {
+		sinkProvider, ok := client.(interface {
+			AnalyticsInteractionSink() interaction.ResultSink
+		})
+		if !ok {
+			return service, nil
+		}
+		sink := sinkProvider.AnalyticsInteractionSink()
+		if sink == nil {
+			return service, nil
+		}
+		sharedRecorder, err := interaction.NewRecorder(
+			context.Background(), sink)
+		if err != nil {
+			return nil, err
+		}
+		recorder, err := exploreranalytics.NewInteractionRecorder(
+			sharedRecorder, service.clock)
+		if err != nil {
+			return nil, err
+		}
+		analyticsService, err := exploreranalytics.NewService(
+			exploreranalytics.Config{
+				Source: materializer, Limits: exploreranalytics.DefaultLimits(),
+				Recorder: recorder, RequireRecording: true,
+			},
+		)
+		if err != nil {
+			return nil, err
+		}
+		service.analytics = analyticsService
+	}
+	return service, nil
 }
 
 func (s *EmbeddedService) Capabilities(ctx context.Context) (Capabilities, error) {
@@ -190,6 +226,7 @@ func (s *EmbeddedService) Capabilities(ctx context.Context) (Capabilities, error
 	if !s.ChangesAvailable() {
 		capabilities.Changes = false
 	}
+	capabilities.Analytics = s.AnalyticsAvailable()
 	provider, ok := s.client.(vectorAvailabilityProvider)
 	if !ok {
 		return capabilities, nil

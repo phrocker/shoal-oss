@@ -41,6 +41,8 @@ type InteractionSummary struct {
 	AuthorizationFingerprint shoal.ID
 	AuthorizationExpiresAt   time.Time
 	AuthorizationOperation   string
+	OntologySchemaID         shoal.ID
+	OntologyVersionID        shoal.ID
 	EmbeddingSpaceID         shoal.ID
 	EmbeddingSpaceDigest     string
 	EmbeddingSpaceCount      int
@@ -72,6 +74,8 @@ type persistedInteraction struct {
 	AuthorizationFingerprint shoal.ID
 	AuthorizationExpiresAt   time.Time
 	AuthorizationOperation   string
+	OntologySchemaID         shoal.ID
+	OntologyVersionID        shoal.ID
 	EmbeddingSpaceID         shoal.ID
 	Operation                interaction.Operation
 	Actor                    interaction.ActorContext
@@ -258,6 +262,8 @@ func (e *Explorer) recordInteractionResult(
 		AuthorizationFingerprint: session.AuthorizationFingerprint,
 		AuthorizationExpiresAt:   session.AuthorizationExpiresAt,
 		AuthorizationOperation:   session.AuthorizationOperation,
+		OntologySchemaID:         session.OntologySchemaID,
+		OntologyVersionID:        session.OntologyVersionID,
 		EmbeddingSpaceID:         session.EmbeddingSpaceID,
 		Operation:                session.Operation,
 		Actor:                    session.Actor,
@@ -607,6 +613,9 @@ func (e *Explorer) DeleteInteraction(
 		SnapshotAsOf:             existing.SnapshotAsOf,
 		AuthorizationFingerprint: existing.AuthorizationFingerprint,
 		AuthorizationExpiresAt:   existing.AuthorizationExpiresAt,
+		AuthorizationOperation:   existing.AuthorizationOperation,
+		OntologySchemaID:         existing.OntologySchemaID,
+		OntologyVersionID:        existing.OntologyVersionID,
 		EmbeddingSpaceID:         existing.EmbeddingSpaceID,
 		Operation:                existing.Operation,
 		Actor:                    existing.Actor,
@@ -1124,6 +1133,8 @@ func validatePersistedInteraction(record persistedInteraction) error {
 				record.AuthorizationExpiresAt.UTC()) ||
 			record.Session.AuthorizationOperation !=
 				record.AuthorizationOperation ||
+			record.Session.OntologySchemaID != record.OntologySchemaID ||
+			record.Session.OntologyVersionID != record.OntologyVersionID ||
 			record.Session.EmbeddingSpaceID != record.EmbeddingSpaceID {
 			return shoal.NewError(
 				shoal.ErrorInternal,
@@ -1224,6 +1235,8 @@ func interactionSummary(record persistedInteraction) InteractionSummary {
 		AuthorizationFingerprint: record.AuthorizationFingerprint,
 		AuthorizationExpiresAt:   record.AuthorizationExpiresAt,
 		AuthorizationOperation:   record.AuthorizationOperation,
+		OntologySchemaID:         record.OntologySchemaID,
+		OntologyVersionID:        record.OntologyVersionID,
 		EmbeddingSpaceID:         record.EmbeddingSpaceID,
 		EmbeddingSpaceDigest:     record.Session.EmbeddingSpaces.Digest,
 		EmbeddingSpaceCount:      len(record.Session.EmbeddingSpaces.Identities),

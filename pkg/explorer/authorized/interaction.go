@@ -52,6 +52,68 @@ func (c *Client) EnsureInteractionSink(ctx context.Context) error {
 	return guard.Check(ctx)
 }
 
+type operationInteractionSink struct {
+	client    *Client
+	operation auth.Operation
+}
+
+// AnalyticsInteractionSink returns the durable interaction sink bound to the
+// analytics authorization operation.
+func (c *Client) AnalyticsInteractionSink() interaction.ResultSink {
+	if c == nil {
+		return nil
+	}
+	if _, err := c.interactionWriter(); err != nil {
+		return nil
+	}
+	if isNilDependency(c.snapshotValidator) {
+		return nil
+	}
+	if _, ok := c.snapshotValidator.(EvidenceSnapshotValidator); !ok {
+		return nil
+	}
+	return operationInteractionSink{
+		client: c, operation: auth.OperationAnalyticsRead,
+	}
+}
+
+func (s operationInteractionSink) EnsureInteractionSink(
+	ctx context.Context,
+) error {
+	if s.client == nil {
+		return shoal.NewError(
+			shoal.ErrorUnavailable, "authorized interaction sink is unavailable")
+	}
+	writer, err := s.client.interactionWriter()
+	if err != nil {
+		return err
+	}
+	if err := writer.EnsureInteractionSink(ctx); err != nil {
+		return directBaseError(err)
+	}
+	return nil
+}
+
+func (s operationInteractionSink) RecordInteraction(
+	ctx context.Context,
+	session interaction.Session,
+) error {
+	_, err := s.RecordInteractionResult(ctx, session)
+	return err
+}
+
+func (s operationInteractionSink) RecordInteractionResult(
+	ctx context.Context,
+	session interaction.Session,
+) (interaction.Session, error) {
+	if s.client == nil {
+		return interaction.Session{}, shoal.NewError(
+			shoal.ErrorUnavailable, "authorized interaction sink is unavailable")
+	}
+	session.AuthorizationOperation = string(s.operation)
+	return s.client.recordInteraction(ctx, session)
+}
+
 // RecordInteraction appends one redacted interaction after verifying that its
 // pinned authorization is the exact current decision and that every source
 // node it retrieved or cited is still authorized. A revoked or missing source
@@ -113,14 +175,16 @@ func (c *Client) recordInteraction(
 	if err != nil {
 		return interaction.Session{}, err
 	}
+	evidenceOperation := auth.OperationRetrieve
+	if authorizationOperation == auth.OperationAnalyticsRead {
+		evidenceOperation = authorizationOperation
+	}
 	if err := c.authorizeInteractionEvidence(
 		ctx,
 		canonical.TouchedNodeIDs(),
 		canonical.TouchedEdgeIDs(),
 		decision,
-		// Evidence access remains retrieval authorization even when the
-		// enclosing privileged action has a different exact operation.
-		auth.OperationRetrieve,
+		evidenceOperation,
 		now,
 	); err != nil {
 		return interaction.Session{}, err
@@ -251,15 +315,31 @@ func (c *Client) recordInteraction(
 		persisted = returned
 	}
 	if err := guard.Check(ctx); err != nil {
+		if authorizationOperation == auth.OperationAnalyticsRead {
+			return persisted, explorer.MarkIndeterminateCommit(err)
+		}
 		return persisted, explorer.MarkCommittedInteraction(err)
 	}
 	deliveredAt := c.clock().UTC()
 	if deliveredAt.IsZero() ||
 		!interactionPinMatchesDecision(persisted, decision, deliveredAt) {
+		if authorizationOperation == auth.OperationAnalyticsRead {
+			return persisted, explorer.MarkIndeterminateCommit(
+				authorizationDenied())
+		}
 		return persisted, explorer.MarkCommittedInteraction(
 			authorizationDenied())
 	}
 	return persisted, nil
+}
+
+func postCommitInteractionError(
+	operation auth.Operation, err error,
+) error {
+	if operation == auth.OperationAnalyticsRead {
+		return explorer.MarkIndeterminateCommit(err)
+	}
+	return explorer.MarkCommittedInteraction(err)
 }
 
 // Interactions lists only derived records whose complete current source set

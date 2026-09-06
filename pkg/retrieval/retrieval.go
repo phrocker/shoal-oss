@@ -22,6 +22,9 @@ package retrieval
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/binary"
+	"encoding/hex"
 	"sort"
 	"strings"
 	"time"
@@ -31,6 +34,64 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/graph"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
+
+// EmbeddingSpaceIdentityID returns a stable opaque identifier for internal
+// provenance metadata without adding provenance to retrieval responses.
+func EmbeddingSpaceIdentityID(identity string) (shoal.ID, error) {
+	if !utf8.ValidString(identity) || strings.TrimSpace(identity) == "" ||
+		len(identity) > shoal.MaxSemanticStringBytes {
+		return "", shoal.NewError(
+			shoal.ErrorInvalidArgument, "embedding space identity is invalid")
+	}
+	hash := sha256.New()
+	var length [8]byte
+	write := func(value string) {
+		binary.BigEndian.PutUint64(length[:], uint64(len(value)))
+		_, _ = hash.Write(length[:])
+		_, _ = hash.Write([]byte(value))
+	}
+	write("shoal-retrieval-embedding-space-v1")
+	write(identity)
+	return shoal.ID(
+		"embedding-space_" + hex.EncodeToString(hash.Sum(nil)[:16])), nil
+}
+
+// EmbeddingSpaceSetID returns a stable opaque identifier for an internal set
+// of embedding-space identifiers.
+func EmbeddingSpaceSetID(identities ...shoal.ID) (shoal.ID, error) {
+	normalized := append([]shoal.ID(nil), identities...)
+	for _, identity := range normalized {
+		if err := shoal.ValidateRequiredID(
+			"embedding space constituent ID", identity); err != nil {
+			return "", err
+		}
+	}
+	sort.Slice(normalized, func(i, j int) bool {
+		return shoal.CompareID(normalized[i], normalized[j]) < 0
+	})
+	unique := normalized[:0]
+	for _, identity := range normalized {
+		if len(unique) == 0 || unique[len(unique)-1] != identity {
+			unique = append(unique, identity)
+		}
+	}
+	if len(unique) == 0 {
+		return "", nil
+	}
+	hash := sha256.New()
+	var length [8]byte
+	write := func(value string) {
+		binary.BigEndian.PutUint64(length[:], uint64(len(value)))
+		_, _ = hash.Write(length[:])
+		_, _ = hash.Write([]byte(value))
+	}
+	write("shoal-retrieval-embedding-space-set-v1")
+	for _, identity := range unique {
+		write(string(identity))
+	}
+	return shoal.ID(
+		"embedding-space_" + hex.EncodeToString(hash.Sum(nil)[:16])), nil
+}
 
 const (
 	DefaultTopK         uint32 = 20
@@ -258,7 +319,6 @@ func (r Response) ValidateFor(request Request) error {
 		return shoal.NewError(
 			shoal.ErrorInvalidArgument, "retrieval response exceeds normalized top_k")
 	}
-
 	seen := make(map[shoal.ID]struct{}, len(r.Results))
 	for index, result := range r.Results {
 		if err := shoal.ValidateRequiredID("retrieval result ID", result.ID); err != nil {

@@ -37,6 +37,7 @@ import (
 
 const vectorCapabilityProbeText = "shoal vector capability probe"
 const graphAssertionEdgeIDMetadata = "shoal.graph.edge_id"
+const extractionRelationshipIDProperty = "ontology_relationship_id"
 
 func (c *Client) Snapshot(ctx context.Context) (explorer.Snapshot, error) {
 	bounded, err := c.boundedBase()
@@ -282,14 +283,16 @@ func (c *Client) BoundedNeighborhood(
 	}
 	if authorizedCursorEligible(normalized) {
 		return c.boundedAuthorizedNeighborhoodPage(
-			ctx, bounded, request, normalized, decision, guard, now, direction)
+			ctx, bounded, request, normalized, decision, guard, now, direction,
+			auth.OperationNeighborhood, true)
 	}
 	raw, err := bounded.BoundedNeighborhood(ctx, request)
 	if err != nil {
 		return explorer.BoundedNeighborhood{}, directBaseError(err)
 	}
 	filtered, err := c.filterNeighborhood(
-		ctx, raw.Neighborhood, normalized, direction, decision, now, false)
+		ctx, raw.Neighborhood, normalized, direction, decision, now, false,
+		auth.OperationNeighborhood)
 	if err != nil {
 		return explorer.BoundedNeighborhood{}, err
 	}
@@ -312,8 +315,9 @@ func (c *Client) BoundedNeighborhood(
 const maxAuthorizedBoundedScanPages = 1024
 
 const (
-	derivedAssertionPropertyAssertionID  = "ontology.assertion.id"
-	derivedAssertionPropertyDerivationID = "ontology.assertion.derivation.id"
+	derivedAssertionPropertyAssertionID     = "ontology.assertion.id"
+	derivedAssertionPropertyDerivationID    = "ontology.assertion.derivation.id"
+	derivedAssertionPropertyDerivationScore = "ontology.assertion.derivation.score"
 )
 
 func authorizedCursorEligible(normalized explorer.NeighborhoodRequest) bool {
@@ -329,6 +333,8 @@ func (c *Client) boundedAuthorizedNeighborhoodPage(
 	guard auth.GenerationGuard,
 	now time.Time,
 	direction explorer.GraphDirection,
+	operation auth.Operation,
+	applyLens bool,
 ) (explorer.BoundedNeighborhood, error) {
 	scan := request
 	scan.Depth = 1
@@ -342,7 +348,9 @@ func (c *Client) boundedAuthorizedNeighborhoodPage(
 	assertions := make(map[shoal.ID]ontology.Assertion)
 	after := request.AfterEdgeID
 	exhaustedScanLimit := true
+	incompleteWithoutCursor := false
 	scannedEdges := uint32(0)
+	scannedEdgesKnown := true
 	scanLimit := authorizedScanEdgeLimit(request)
 	for page := 0; page < maxAuthorizedBoundedScanPages && scannedEdges < scanLimit; page++ {
 		if err := ctx.Err(); err != nil {
@@ -362,9 +370,34 @@ func (c *Client) boundedAuthorizedNeighborhoodPage(
 		if err != nil {
 			return explorer.BoundedNeighborhood{}, directBaseError(err)
 		}
-		scannedEdges += uint32(len(raw.Neighborhood.Edges))
+		if raw.Truncated && !raw.Continuation {
+			incompleteWithoutCursor = true
+		}
+		cursorAdvanced := raw.NextAfterEdgeID != "" &&
+			raw.NextAfterEdgeID != scan.AfterEdgeID
+		if (!raw.Continuation && cursorAdvanced) ||
+			(raw.ScannedEdgesKnown && raw.ScannedEdges == 0 &&
+				(raw.Continuation || cursorAdvanced)) {
+			return explorer.BoundedNeighborhood{}, inconsistentBase()
+		}
+		if raw.ScannedEdgesKnown &&
+			(raw.ScannedEdges < uint32(len(raw.Neighborhood.Edges)) ||
+				raw.ScannedEdges > scan.Fanout) {
+			return explorer.BoundedNeighborhood{}, inconsistentBase()
+		}
+		// The base is not trusted to report how much suppressed adjacency it
+		// inspected. Preserve terminal exact zero, but conservatively charge
+		// every non-empty or unknown page at its requested scan allowance.
+		consumed := scan.Fanout
+		if raw.ScannedEdgesKnown && raw.ScannedEdges == 0 {
+			consumed = 0
+		} else {
+			scannedEdgesKnown = false
+		}
+		scannedEdges += consumed
 		filtered, err := c.filterNeighborhood(
-			ctx, raw.Neighborhood, normalized, direction, decision, now, true)
+			ctx, raw.Neighborhood, normalized, direction, decision, now, true,
+			operation)
 		if err != nil {
 			return explorer.BoundedNeighborhood{}, err
 		}
@@ -379,8 +412,12 @@ func (c *Client) boundedAuthorizedNeighborhoodPage(
 			}
 		}
 		for _, assertion := range filtered.Assertions {
-			if _, ok := assertions[assertion.ID()]; !ok {
-				assertions[assertion.ID()] = assertion
+			key := assertion.ID()
+			if edgeID := assertion.Metadata()[graphAssertionEdgeIDMetadata]; edgeID != "" {
+				key = shoal.ID(edgeID)
+			}
+			if _, ok := assertions[key]; !ok {
+				assertions[key] = assertion
 			}
 		}
 		if len(edges) > int(request.Fanout) {
@@ -413,11 +450,17 @@ func (c *Client) boundedAuthorizedNeighborhoodPage(
 	}
 	result := authorizedBoundedPage(
 		nodes, edges, assertions, request, len(normalized.NodeIDs))
-	interpreted, interpretErr := c.applyOntologyLens(ctx, result.Neighborhood, decision)
-	if interpretErr != nil {
-		return explorer.BoundedNeighborhood{}, interpretErr
+	result.Truncated = result.Truncated || incompleteWithoutCursor
+	result.ScannedEdges = scannedEdges
+	result.ScannedEdgesKnown = scannedEdgesKnown
+	if applyLens {
+		interpreted, interpretErr := c.applyOntologyLens(
+			ctx, result.Neighborhood, decision)
+		if interpretErr != nil {
+			return explorer.BoundedNeighborhood{}, interpretErr
+		}
+		result.Neighborhood = interpreted
 	}
-	result.Neighborhood = interpreted
 	if err := guard.Check(ctx); err != nil {
 		return explorer.BoundedNeighborhood{}, err
 	}
@@ -551,6 +594,7 @@ func (c *Client) filterNeighborhood(
 	decision auth.Decision,
 	now time.Time,
 	allowMissingProvenanceSeeds bool,
+	operation auth.Operation,
 ) (explorer.Neighborhood, error) {
 	candidates := make(map[shoal.ID]graph.Node, len(raw.Nodes))
 	registrations := make(map[shoal.ID]NodeRegistration, len(raw.Nodes))
@@ -576,7 +620,7 @@ func (c *Client) filterNeighborhood(
 			continue
 		}
 		allowed, err := ruleAllows(
-			registration.Rule, decision, auth.OperationNeighborhood, now)
+			registration.Rule, decision, operation, now)
 		if err != nil {
 			return explorer.Neighborhood{}, err
 		}
@@ -627,7 +671,7 @@ func (c *Client) filterNeighborhood(
 		if hasAssertion && assertion.Origin() == ontology.AssertionDerived {
 			allowed, err := c.derivedAssertionEndpointsAllow(
 				ctx, rawNodes, visibleNodes, resolved, assertion, decision,
-				auth.OperationNeighborhood, now)
+				operation, now)
 			if err != nil {
 				return explorer.Neighborhood{}, err
 			}
@@ -644,7 +688,7 @@ func (c *Client) filterNeighborhood(
 				return explorer.Neighborhood{}, inconsistentBase()
 			}
 			allowed, err := c.derivedAssertionAllows(
-				ctx, assertion, decision, auth.OperationNeighborhood, now)
+				ctx, assertion, decision, operation, now)
 			if err != nil {
 				return explorer.Neighborhood{}, err
 			}
@@ -679,7 +723,7 @@ func (c *Client) filterNeighborhood(
 			continue
 		}
 		allowed, err := edgeAllowsResolved(
-			resolved, registration, decision, auth.OperationNeighborhood, now)
+			resolved, registration, decision, operation, now)
 		if err != nil {
 			return explorer.Neighborhood{}, err
 		}
@@ -691,6 +735,11 @@ func (c *Client) filterNeighborhood(
 		}
 		admittedEdges[edge.ID] = cloneGraphEdge(edge)
 		assertion, hasAssertion := derivedAssertions[edge.ID]
+		if operation == auth.OperationAnalyticsRead &&
+			edge.Properties[extractionRelationshipIDProperty] != "" &&
+			(!hasAssertion || !extractionAssertionMatchesEdge(assertion, edge)) {
+			return explorer.Neighborhood{}, inconsistentBase()
+		}
 		if hasAssertion {
 			admittedAssertions[edge.ID] = assertion
 		}
@@ -844,6 +893,21 @@ func derivedAssertionMatchesEdge(assertion ontology.Assertion, edge graph.Edge) 
 		edge.From == assertion.Subject() &&
 		edge.To == target &&
 		edge.Type == string(assertion.Predicate()) &&
+		scoresEqual(edge.Weight, assertion.Confidence())
+}
+
+func extractionAssertionMatchesEdge(
+	assertion ontology.Assertion,
+	edge graph.Edge,
+) bool {
+	target, ok := assertion.Object().ReferenceValue()
+	if !ok {
+		return false
+	}
+	return edge.From == assertion.Subject() &&
+		edge.To == target &&
+		edge.Properties[extractionRelationshipIDProperty] ==
+			string(assertion.Predicate()) &&
 		scoresEqual(edge.Weight, assertion.Confidence())
 }
 

@@ -56,7 +56,7 @@ const (
 	defaultAskMaxRepeatedAction = 1
 	askPromptTemplateID         = "shoal-explore-ask"
 	askPromptVersion            = "v1"
-	askHarnessID                = "shoal-explore ask/v1"
+	askHarnessID                = "shoal-explore-ask-v1"
 	askToolPolicyID             = "explorer-bounded-tools/v1"
 	localAskPolicyID            = shoal.ID("policy:shoal-explore-local")
 	localAskAuthFingerprint     = shoal.ID("auth:shoal-explore-local")

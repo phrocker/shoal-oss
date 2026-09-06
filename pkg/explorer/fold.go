@@ -166,6 +166,9 @@ func (e *Explorer) FoldInteractions(
 		}
 	}
 	if existing, ok := e.folds[foldID]; ok {
+		if err := e.validateFoldReuseLocked(*existing); err != nil {
+			return FoldResult{}, err
+		}
 		return foldIdempotentResult(*existing, canonical)
 	}
 	for _, sessionID := range sessionIDs {
@@ -232,6 +235,9 @@ func (e *Explorer) FoldInteractions(
 				"fold create was rejected without a durable winner",
 			)
 		}
+		if err := e.validateFoldReuseLocked(*existing); err != nil {
+			return FoldResult{}, err
+		}
 		return foldIdempotentResult(*existing, canonical)
 	}
 	e.reserveInteractionRecordGraphIDsLocked(
@@ -249,6 +255,20 @@ func (e *Explorer) FoldInteractions(
 		RetrievedCount: len(subgraph.RetrievedNodeIDs),
 		CitedCount:     len(subgraph.CitedNodeIDs),
 	}, nil
+}
+
+func (e *Explorer) validateFoldReuseLocked(record persistedFold) error {
+	if err := e.requireLiveFoldMembersLocked(record); err != nil {
+		return err
+	}
+	current, err := e.currentSubgraphVisibilityLocked(record.Nodes, record.Edges)
+	if err != nil {
+		return err
+	}
+	if !visibilityCovered(record.Visibility, current) {
+		return staleDerivedVisibilityError()
+	}
+	return nil
 }
 
 // requireLiveFoldMembersLocked refuses to expose a fold's provenance once any

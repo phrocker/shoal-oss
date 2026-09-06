@@ -31,6 +31,31 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
+type canonicalDocumentIndexKey struct{}
+
+func (c *Client) withCanonicalDocumentIndex(
+	ctx context.Context,
+) (context.Context, error) {
+	if _, ok := ctx.Value(canonicalDocumentIndexKey{}).(map[shoal.ID]shoal.ID); ok {
+		return ctx, nil
+	}
+	summaries, err := c.base.Documents(ctx)
+	if err != nil {
+		return nil, err
+	}
+	currentBase := make(map[shoal.ID]shoal.ID, len(summaries))
+	for _, summary := range summaries {
+		if err := validateSummary(summary); err != nil {
+			return nil, inconsistentBase()
+		}
+		if _, duplicate := currentBase[summary.Document.ID]; duplicate {
+			return nil, inconsistentBase()
+		}
+		currentBase[summary.Document.ID] = summary.Revision.ID
+	}
+	return context.WithValue(ctx, canonicalDocumentIndexKey{}, currentBase), nil
+}
+
 // Connect authorizes both current endpoints and stores only the trusted
 // edge-local policy. Endpoint rules are re-evaluated dynamically on every use.
 func (c *Client) Connect(ctx context.Context, edge graph.Edge) error {
@@ -130,7 +155,8 @@ func (c *Client) Neighborhood(
 		return explorer.Neighborhood{}, directBaseError(err)
 	}
 	result, err := c.filterNeighborhood(
-		ctx, raw, normalized, explorer.GraphDirectionBoth, decision, now, false)
+		ctx, raw, normalized, explorer.GraphDirectionBoth, decision, now, false,
+		auth.OperationNeighborhood)
 	if err != nil {
 		return explorer.Neighborhood{}, err
 	}
@@ -367,19 +393,15 @@ func (c *Client) canonicalRegisteredNodes(
 	ctx context.Context,
 	registrations map[shoal.ID]NodeRegistration,
 ) (map[shoal.ID]graph.Node, error) {
-	summaries, err := c.base.Documents(ctx)
-	if err != nil {
-		return nil, err
-	}
-	currentBase := make(map[shoal.ID]shoal.ID, len(summaries))
-	for _, summary := range summaries {
-		if err := validateSummary(summary); err != nil {
-			return nil, inconsistentBase()
+	currentBase, ok := ctx.Value(
+		canonicalDocumentIndexKey{}).(map[shoal.ID]shoal.ID)
+	if !ok {
+		indexed, err := c.withCanonicalDocumentIndex(ctx)
+		if err != nil {
+			return nil, err
 		}
-		if _, duplicate := currentBase[summary.Document.ID]; duplicate {
-			return nil, inconsistentBase()
-		}
-		currentBase[summary.Document.ID] = summary.Revision.ID
+		currentBase = indexed.Value(
+			canonicalDocumentIndexKey{}).(map[shoal.ID]shoal.ID)
 	}
 	required := make(map[shoal.ID]shoal.ID)
 	for _, registration := range registrations {

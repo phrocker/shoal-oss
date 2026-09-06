@@ -37,21 +37,15 @@ import (
 
 // SnapshotValidator verifies corpus frontiers pinned into interaction records.
 type SnapshotValidator interface {
-	ValidateSnapshot(
-		context.Context, shoal.ID, time.Time, []shoal.ID,
-	) error
+	ValidateSnapshot(context.Context, shoal.ID, time.Time, []shoal.ID) error
 }
 
-// EvidenceSnapshotValidator additionally binds exact source edges to the
+// EvidenceSnapshotValidator additionally binds exact source evidence to the
 // pinned corpus frontier.
 type EvidenceSnapshotValidator interface {
 	SnapshotValidator
 	ValidateEvidenceSnapshot(
-		context.Context,
-		shoal.ID,
-		time.Time,
-		[]shoal.ID,
-		[]shoal.ID,
+		context.Context, shoal.ID, time.Time, []shoal.ID, []shoal.ID,
 		[]interaction.EvidenceReference,
 	) error
 }
@@ -100,11 +94,11 @@ type Config struct {
 
 // Client enforces trusted-context authorization around an Explorer client.
 type Client struct {
+	base                explorer.Client
+	vectorScorer        VectorScorer
 	interactionSink     explorer.InteractionWriter
 	interactionSource   explorer.InteractionReader
 	snapshotValidator   SnapshotValidator
-	base                explorer.Client
-	vectorScorer        VectorScorer
 	ontologyInterpreter explorer.OntologyInterpreter
 	ontologyProposals   explorer.OntologyProposalStore
 	resolver            auth.Resolver
@@ -151,8 +145,7 @@ func NewClient(config Config) (*Client, error) {
 	hasInteractionWriter := !isNilDependency(config.InteractionWriter)
 	hasInteractionReader := !isNilDependency(config.InteractionReader)
 	hasSnapshotValidator := !isNilDependency(config.SnapshotValidator)
-	if hasInteractionWriter &&
-		(!hasInteractionReader || !hasSnapshotValidator) {
+	if hasInteractionWriter && (!hasInteractionReader || !hasSnapshotValidator) {
 		return nil, dependencyRequired(
 			"trusted interaction writer, reader, and snapshot validator")
 	}
@@ -179,11 +172,11 @@ func NewClient(config Config) (*Client, error) {
 		}
 	}
 	return &Client{
+		base:                config.Base,
+		vectorScorer:        config.VectorScorer,
 		interactionSink:     config.InteractionWriter,
 		interactionSource:   config.InteractionReader,
 		snapshotValidator:   config.SnapshotValidator,
-		base:                config.Base,
-		vectorScorer:        config.VectorScorer,
 		ontologyInterpreter: config.OntologyInterpreter,
 		ontologyProposals:   config.OntologyProposalStore,
 		resolver:            config.Resolver,

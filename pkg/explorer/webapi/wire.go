@@ -754,6 +754,7 @@ func (r *NeighborhoodResponse) UnmarshalJSON(data []byte) error {
 		OntologyInterpretations []OntologyInterpretationReport `json:"ontology_interpretations,omitempty"`
 		Truncated               bool                           `json:"truncated"`
 		NextCursor              string                         `json:"next_cursor,omitempty"`
+		ScannedEdges            *uint32                        `json:"scanned_edges,omitempty"`
 	}
 	if err := strictUnmarshal(data, &wire); err != nil {
 		return err
@@ -766,6 +767,7 @@ func (r *NeighborhoodResponse) UnmarshalJSON(data []byte) error {
 		Snapshot: wire.Snapshot, Neighborhood: neighborhood,
 		OntologyInterpretations: wire.OntologyInterpretations,
 		Truncated:               wire.Truncated, NextCursor: wire.NextCursor,
+		ScannedEdges: cloneUint32(wire.ScannedEdges),
 	}
 	return nil
 }
@@ -1990,6 +1992,14 @@ func decodeIDs(values []string) ([]shoal.ID, error) {
 		result = append(result, id)
 	}
 	return result, nil
+}
+
+func cloneUint32(value *uint32) *uint32 {
+	if value == nil {
+		return nil
+	}
+	cloned := *value
+	return &cloned
 }
 
 func strictUnmarshal(data []byte, value any) error {

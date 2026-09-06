@@ -146,6 +146,32 @@ func TestParseCommandConfigFailsClosedAndSupportsEnvironment(t *testing.T) {
 	}
 }
 
+func TestAnalyticsToolRequiresExplicitProcessOperation(t *testing.T) {
+	defaults, err := configureIdentity(identityOptions{
+		subject: "subject", actor: "actor", domain: "domain",
+		sourceID: "source", policyID: "policy",
+		policyGeneration: 1, lifetime: time.Hour,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if identityAllows(defaults, auth.OperationAnalyticsRead) {
+		t.Fatal("default stdio read identity unexpectedly allows analytics")
+	}
+	explicit, err := configureIdentity(identityOptions{
+		subject: "subject", actor: "actor", domain: "domain",
+		sourceID: "source", policyID: "policy",
+		operations:       string(auth.OperationAnalyticsRead),
+		policyGeneration: 1, lifetime: time.Hour,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !identityAllows(explicit, auth.OperationAnalyticsRead) {
+		t.Fatal("explicit analytics operation was not retained")
+	}
+}
+
 func TestResolveStatePathsRejectsSymlinkAliases(t *testing.T) {
 	root := t.TempDir()
 	realRoot := filepath.Join(root, "real")

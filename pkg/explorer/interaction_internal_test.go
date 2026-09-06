@@ -439,7 +439,7 @@ func TestFoldRetryAdoptsCommittedRecord(t *testing.T) {
 	}
 }
 
-func TestFoldRetryAdoptsCommittedRecordAfterSourceChange(t *testing.T) {
+func TestFoldRetryRejectsCommittedRecordAfterSourceChange(t *testing.T) {
 	for _, test := range []struct {
 		name   string
 		change func(*testing.T, *Explorer, Source, shoal.ID)
@@ -537,18 +537,15 @@ func TestFoldRetryAdoptsCommittedRecordAfterSourceChange(t *testing.T) {
 					accepted, foldWrites)
 			}
 			test.change(t, corpus, source, session.ID)
-			result, err := corpus.FoldInteractions(ctx, FoldRequest{
+			_, err = corpus.FoldInteractions(ctx, FoldRequest{
 				SessionIDs:    []shoal.ID{session.ID},
 				SummaryDigest: summaryDigest,
 			})
-			if err != nil {
-				t.Fatalf("committed fold retry was not adopted: %v", err)
+			if err == nil {
+				t.Fatal("committed fold retry reused stale member evidence")
 			}
-			if result.Created ||
-				!result.FoldedAt.Equal(accepted.FoldedAt) ||
-				result.Visibility != accepted.Visibility ||
-				foldWrites != 1 {
-				t.Fatalf("reconciled fold result = %+v", result)
+			if foldWrites != 1 {
+				t.Fatalf("fold writes = %d", foldWrites)
 			}
 		})
 	}
@@ -855,10 +852,12 @@ func TestDeletedFoldMemberProvenanceIsNotRehydratable(t *testing.T) {
 		SummaryDigest: interaction.Digest("deleted fold member"),
 	}
 	write := corpus.writeRecord
+	var accepted persistedFold
 	corpus.interactionRecordWriter = func(
 		row []byte, kind byte, value any,
 	) error {
 		if fold, ok := value.(persistedFold); ok && !fold.Deleted {
+			accepted = fold
 			if err := write(row, kind, value); err != nil {
 				return err
 			}
@@ -872,14 +871,13 @@ func TestDeletedFoldMemberProvenanceIsNotRehydratable(t *testing.T) {
 	if _, err := corpus.DeleteInteraction(ctx, session.ID); err != nil {
 		t.Fatal(err)
 	}
-	result, err := corpus.FoldInteractions(ctx, request)
-	if err != nil {
-		t.Fatalf("committed fold retry was not adopted: %v", err)
+	if _, err := corpus.FoldInteractions(ctx, request); err == nil {
+		t.Fatal("committed fold retry reused a deleted member")
 	}
-	if _, err := corpus.RehydrateFold(ctx, result.FoldID); err == nil {
+	if _, err := corpus.RehydrateFold(ctx, accepted.FoldID); err == nil {
 		t.Fatal("rehydrated the provenance of a deleted session")
 	}
-	if _, err := corpus.FoldSubgraph(ctx, result.FoldID); err == nil {
+	if _, err := corpus.FoldSubgraph(ctx, accepted.FoldID); err == nil {
 		t.Fatal("served the subgraph of a deleted session's provenance")
 	}
 }
