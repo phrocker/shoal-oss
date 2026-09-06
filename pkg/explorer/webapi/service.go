@@ -805,7 +805,8 @@ func (s *EmbeddedService) Path(
 		return PathResponse{}, err
 	}
 	depth, fanout, maxNodes, err := normalizeGraphBounds(
-		request.MaxDepth, request.Fanout, MaxNodes)
+		request.MaxDepth, request.Fanout,
+		effectiveGraphNodeLimit(ctx, MaxNodes))
 	if err != nil {
 		return PathResponse{}, err
 	}

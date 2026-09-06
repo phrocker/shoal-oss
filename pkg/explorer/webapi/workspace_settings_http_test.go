@@ -28,6 +28,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/explorer/webapi"
 	"github.com/phrocker/shoal-oss/pkg/explorer/workspace"
@@ -35,6 +36,23 @@ import (
 )
 
 type settingsStubService struct{}
+
+type indeterminateSettingsProvider struct {
+	webapi.WorkspaceSettingsProvider
+}
+
+func (indeterminateSettingsProvider) Update(
+	context.Context,
+	shoal.ID,
+	workspace.UpdateRequest,
+) (workspace.Settings, error) {
+	return workspace.Settings{Revision: 2}, explorer.MarkIndeterminateCommit(
+		shoal.NewError(
+			shoal.ErrorUnauthorized,
+			"authorization changed after workspace settings commit",
+		),
+	)
+}
 
 type settingsGenerationReader int64
 
@@ -328,6 +346,57 @@ func TestHTTPWorkspaceSettingsRejectsBoundsAndUnknownFields(t *testing.T) {
 	}
 }
 
+func TestHTTPWorkspaceSettingsReportsIndeterminateCommit(t *testing.T) {
+	now := time.Date(2026, 9, 5, 18, 0, 0, 0, time.UTC)
+	authority, _ := auth.NewAuthorityWithClock(func() time.Time { return now })
+	handler, err := webapi.NewAuthenticatedHandler(
+		settingsStubService{},
+		webapi.AuthenticatorFunc(func(*http.Request) (auth.Decision, error) {
+			return settingsHTTPDecision(t, now, "owner"), nil
+		}),
+		authority.Binder(),
+		"example.test",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := handler.SetWorkspaceSettingsProvider(
+		indeterminateSettingsProvider{},
+	); err != nil {
+		t.Fatal(err)
+	}
+	response := settingsRequest(
+		t, handler, http.MethodPut,
+		"/api/v1/workspaces/"+
+			base64.RawURLEncoding.EncodeToString([]byte("indeterminate"))+
+			"/settings",
+		map[string]any{
+			"expected_revision": 1,
+			"mutation_id": base64.RawURLEncoding.EncodeToString(
+				[]byte("retry-same-mutation")),
+			"settings": map[string]any{},
+		},
+		"owner", "http://example.test")
+	if response.Code != http.StatusServiceUnavailable ||
+		response.Header().Get(webapi.CommitOutcomeHeader) !=
+			webapi.CommitOutcomeIndeterminate {
+		t.Fatalf("indeterminate status = %d, header = %q, body = %s",
+			response.Code,
+			response.Header().Get(webapi.CommitOutcomeHeader),
+			response.Body.String())
+	}
+	var envelope struct {
+		Code          shoal.ErrorCode `json:"code"`
+		Indeterminate bool            `json:"indeterminate"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &envelope); err != nil {
+		t.Fatal(err)
+	}
+	if envelope.Code != shoal.ErrorUnavailable || !envelope.Indeterminate {
+		t.Fatalf("indeterminate envelope = %#v", envelope)
+	}
+}
+
 func settingsHTTPDecision(
 	t *testing.T,
 	now time.Time,
@@ -358,7 +427,7 @@ func settingsRequest(
 	t *testing.T,
 	handler http.Handler,
 	method, path string,
-	body map[string]any,
+	body any,
 	subject, origin string,
 ) *httptest.ResponseRecorder {
 	t.Helper()

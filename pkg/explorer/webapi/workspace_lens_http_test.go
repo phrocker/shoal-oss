@@ -31,6 +31,7 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/explorer/webapi"
 	"github.com/phrocker/shoal-oss/pkg/explorer/workspace"
 	"github.com/phrocker/shoal-oss/pkg/ontology"
+	"github.com/phrocker/shoal-oss/pkg/retrieval"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
@@ -40,8 +41,11 @@ type httpCallerOntologyChoices struct {
 
 type lensObservingService struct {
 	settingsStubService
-	effective workspace.EffectiveDecision
-	found     bool
+	effective    workspace.EffectiveDecision
+	retrieval    webapi.RetrievalRequest
+	neighborhood webapi.NeighborhoodRequest
+	path         webapi.PathRequest
+	found        bool
 }
 
 func (s *lensObservingService) Documents(
@@ -50,6 +54,30 @@ func (s *lensObservingService) Documents(
 ) (webapi.DocumentsResponse, error) {
 	s.effective, s.found = webapi.EffectiveWorkspaceSettings(ctx)
 	return webapi.DocumentsResponse{}, nil
+}
+
+func (s *lensObservingService) Retrieve(
+	_ context.Context,
+	request webapi.RetrievalRequest,
+) (webapi.RetrievalResponse, error) {
+	s.retrieval = request
+	return webapi.RetrievalResponse{}, nil
+}
+
+func (s *lensObservingService) Neighborhood(
+	_ context.Context,
+	request webapi.NeighborhoodRequest,
+) (webapi.NeighborhoodResponse, error) {
+	s.neighborhood = request
+	return webapi.NeighborhoodResponse{}, nil
+}
+
+func (s *lensObservingService) Path(
+	_ context.Context,
+	request webapi.PathRequest,
+) (webapi.PathResponse, error) {
+	s.path = request
+	return webapi.PathResponse{}, nil
 }
 
 func (c httpCallerOntologyChoices) ListOntologyChoices(
@@ -122,7 +150,9 @@ func TestHTTPSelectableLensIsPerCallerAndPreservesSettings(t *testing.T) {
 	}
 	workspacePath := base64.RawURLEncoding.EncodeToString([]byte("lens-http"))
 	settingsPath := "/api/v1/workspaces/" + workspacePath + "/settings"
-	topK := uint32(6)
+	topK, depth, fanout, graphNodes := uint32(6), uint32(2), uint32(3), uint32(4)
+	sourceID := mustComponent(t, []byte("source-a"))
+	policyID := mustComponent(t, []byte("policy-a"))
 	response := settingsRequest(
 		t, handler, http.MethodPut, settingsPath,
 		map[string]any{
@@ -130,11 +160,19 @@ func TestHTTPSelectableLensIsPerCallerAndPreservesSettings(t *testing.T) {
 			"mutation_id": base64.RawURLEncoding.EncodeToString(
 				[]byte("lens-settings-create")),
 			"settings": map[string]any{
-				"allowed_operations": []string{"read"},
-				"permitted_source_ids": []string{
-					mustComponent(t, []byte("source-a")),
+				"allowed_operations":   []string{"read"},
+				"permitted_source_ids": []string{sourceID},
+				"budgets": map[string]any{
+					"retrieval_top_k": topK,
+					"graph_depth":     depth,
+					"graph_fanout":    fanout,
+					"graph_nodes":     graphNodes,
 				},
-				"budgets": map[string]any{"retrieval_top_k": topK},
+				"output_policies": []map[string]any{{
+					"source_id":       sourceID,
+					"grant_policy_id": policyID,
+					"epoch":           int64(1),
+				}},
 			},
 		},
 		"owner", "http://example.test")
@@ -291,9 +329,93 @@ func TestHTTPSelectableLensIsPerCallerAndPreservesSettings(t *testing.T) {
 	if !service.found ||
 		service.effective.Revision() != selected.Revision ||
 		service.effective.Limits().RetrievalTopK != topK ||
+		service.effective.Limits().GraphDepth != depth ||
+		service.effective.Limits().GraphFanout != fanout ||
+		service.effective.Limits().GraphNodes != graphNodes ||
+		len(service.effective.OutputPolicies()) != 1 ||
 		service.effective.SettingsID() == "" {
 		t.Fatalf("mounted transport effective settings = found %v, %#v",
 			service.found, service.effective)
+	}
+
+	retrieve := settingsWorkspaceRequest(
+		t, handler, http.MethodPost, "/api/v1/retrieve",
+		webapi.RetrievalRequest{
+			Query: retrieval.Request{Text: "bounded", TopK: 50},
+		},
+		"owner", workspacePath)
+	if retrieve.Code != http.StatusOK || service.retrieval.Query.TopK != topK {
+		t.Fatalf("retrieval budget = %d, status = %d, body = %s",
+			service.retrieval.Query.TopK, retrieve.Code, retrieve.Body.String())
+	}
+	neighborhood := settingsWorkspaceRequest(
+		t, handler, http.MethodPost, "/api/v1/neighborhood",
+		webapi.NeighborhoodRequest{
+			NodeIDs: []shoal.ID{"node"}, Depth: 4,
+			Fanout: 50, MaxNodes: 250,
+		},
+		"owner", workspacePath)
+	if neighborhood.Code != http.StatusOK ||
+		service.neighborhood.Depth != depth ||
+		service.neighborhood.Fanout != fanout ||
+		service.neighborhood.MaxNodes != graphNodes {
+		t.Fatalf("neighborhood budget = %#v, status = %d, body = %s",
+			service.neighborhood, neighborhood.Code, neighborhood.Body.String())
+	}
+	pathResponse := settingsWorkspaceRequest(
+		t, handler, http.MethodPost, "/api/v1/path",
+		webapi.PathRequest{
+			From: "from", To: "to", MaxDepth: 4, Fanout: 50,
+		},
+		"owner", workspacePath)
+	if pathResponse.Code != http.StatusOK ||
+		service.path.MaxDepth != depth ||
+		service.path.Fanout != fanout {
+		t.Fatalf("path budget = %#v, status = %d, body = %s",
+			service.path, pathResponse.Code, pathResponse.Body.String())
+	}
+	metadataResponse := settingsWorkspaceRequest(
+		t, handler, http.MethodGet, "/api/v1/meta",
+		nil, "owner", workspacePath)
+	if metadataResponse.Code != http.StatusOK {
+		t.Fatalf("metadata status = %d, body = %s",
+			metadataResponse.Code, metadataResponse.Body.String())
+	}
+	var metadata webapi.MetadataResponse
+	if err := json.Unmarshal(metadataResponse.Body.Bytes(), &metadata); err != nil {
+		t.Fatal(err)
+	}
+	if metadata.MaxTopK != topK || metadata.MaxDepth != depth ||
+		metadata.MaxFanout != fanout || metadata.MaxNodes != graphNodes {
+		t.Fatalf("effective metadata limits = %#v", metadata)
+	}
+
+	limitedWorkspace := base64.RawURLEncoding.EncodeToString(
+		[]byte("limited-output"))
+	limitedSettingsPath := "/api/v1/workspaces/" +
+		limitedWorkspace + "/settings"
+	outputBytes := uint64(64)
+	response = settingsRequest(
+		t, handler, http.MethodPut, limitedSettingsPath,
+		map[string]any{
+			"expected_revision": 0,
+			"mutation_id": base64.RawURLEncoding.EncodeToString(
+				[]byte("limited-output-create")),
+			"settings": map[string]any{
+				"budgets": map[string]any{"output_bytes": outputBytes},
+			},
+		},
+		"owner", "http://example.test")
+	if response.Code != http.StatusCreated {
+		t.Fatalf("limited output create status = %d, body = %s",
+			response.Code, response.Body.String())
+	}
+	limited := settingsWorkspaceRequest(
+		t, handler, http.MethodGet, "/api/v1/identity",
+		nil, "owner", limitedWorkspace)
+	if limited.Code != http.StatusInternalServerError {
+		t.Fatalf("limited output status = %d, body = %s",
+			limited.Code, limited.Body.String())
 	}
 }
 
@@ -344,7 +466,7 @@ func settingsWorkspaceRequest(
 	t *testing.T,
 	handler http.Handler,
 	method, path string,
-	body map[string]any,
+	body any,
 	subject, workspaceID string,
 ) *httptest.ResponseRecorder {
 	t.Helper()
