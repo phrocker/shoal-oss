@@ -226,8 +226,9 @@ type ConditionKind = tablet.ConditionKind
 type ConditionalMutation = tablet.ConditionalMutation
 
 const (
-	ConditionAbsent      = tablet.ConditionAbsent
-	ConditionValueEquals = tablet.ConditionValueEquals
+	ConditionAbsent                        = tablet.ConditionAbsent
+	ConditionValueEquals                   = tablet.ConditionValueEquals
+	ConditionLatestValueAndTimestampEquals = tablet.ConditionLatestValueAndTimestampEquals
 )
 
 // ConditionalWrite evaluates and applies each mutation atomically at its
@@ -238,7 +239,9 @@ func (e *Engine) ConditionalWrite(table string, mutations []ConditionalMutation)
 			return nil, fmt.Errorf("engine: conditional mutation %d is nil", mutationIndex)
 		}
 		for conditionIndex, condition := range mutation.Conditions {
-			if condition.Kind != ConditionAbsent && condition.Kind != ConditionValueEquals {
+			if condition.Kind != ConditionAbsent &&
+				condition.Kind != ConditionValueEquals &&
+				condition.Kind != ConditionLatestValueAndTimestampEquals {
 				return nil, fmt.Errorf("engine: conditional mutation %d condition %d has unsupported kind %d", mutationIndex, conditionIndex, condition.Kind)
 			}
 		}

@@ -22,6 +22,7 @@ package recovery
 import (
 	"bytes"
 	"context"
+	"errors"
 	"sort"
 	"sync"
 	"testing"
@@ -76,6 +77,25 @@ type fakeCoordinator struct {
 	active     int
 	maxActive  int
 	recoverLag time.Duration
+}
+
+type failOnceCoordinator struct {
+	fakeCoordinator
+	failed bool
+}
+
+func (f *failOnceCoordinator) Recover(
+	ctx context.Context,
+	txn coordination.TXN,
+	owner coordination.OwnerID,
+	lease time.Time,
+	authority transaction.Authority,
+) (transaction.Result, error) {
+	if !f.failed {
+		f.failed = true
+		return transaction.Result{}, transaction.ErrUnavailable
+	}
+	return f.fakeCoordinator.Recover(ctx, txn, owner, lease, authority)
 }
 
 func (f *fakeCoordinator) Inspect(context.Context, coordination.TXN) (transaction.Snapshot, error) {
@@ -159,6 +179,44 @@ func TestWorkerPoolHonorsConcurrencyCap(t *testing.T) {
 	if coordinator.recovered != len(candidates) || coordinator.maxActive > 3 ||
 		coordinator.maxActive < 2 {
 		t.Fatalf("pool recovered=%d maxActive=%d", coordinator.recovered, coordinator.maxActive)
+	}
+}
+
+func TestWorkerRunPageRetainsCursorOnFailure(t *testing.T) {
+	now := time.Date(2026, 9, 5, 18, 0, 0, 0, time.UTC)
+	coordinator := &failOnceCoordinator{fakeCoordinator: fakeCoordinator{
+		snapshot: transaction.Snapshot{
+			Root: coordination.TxnRootV3{State: coordination.StateClaimed},
+			Lease: coordination.TxnLeaseV1{
+				Generation: 1, Owner: coordination.OwnerID("old"), Fence: 1,
+				LeaseUntil: now.Add(-time.Minute),
+			},
+		},
+	}}
+	worker, err := New(Config{
+		Domain: coordination.DomainID("domain"), Owner: coordination.OwnerID("recovery"),
+		Source: fixedSource{
+			coordination.TXN("a"), coordination.TXN("b"), coordination.TXN("c"),
+		},
+		Coordinator: coordinator, Clock: func() time.Time { return now },
+		Authority: transaction.Authority{}, Limit: 2, Concurrency: 1,
+		MaxRounds: 1, Backoff: time.Nanosecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if more, err := worker.RunPage(context.Background()); !more ||
+		!errors.Is(err, transaction.ErrUnavailable) {
+		t.Fatalf("failed page = more %v, %v", more, err)
+	}
+	if more, err := worker.RunPage(context.Background()); !more || err != nil {
+		t.Fatalf("retried page = more %v, %v", more, err)
+	}
+	coordinator.mu.Lock()
+	recovered := coordinator.recovered
+	coordinator.mu.Unlock()
+	if recovered != 3 {
+		t.Fatalf("successful recoveries = %d, want 3 including replayed page", recovered)
 	}
 }
 
