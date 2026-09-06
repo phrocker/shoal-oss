@@ -29,30 +29,42 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
-// GovernedOntologySource exposes the corrected RDO active pointer and durable
-// proposal history without giving settings any publication authority.
-type GovernedOntologySource interface {
-	ActiveOntology(context.Context) (ontology.OntologyVersion, bool, error)
+// GovernedOntologyProposalSource exposes durable proposal history without
+// routing through the generic graph-read authorization path.
+type GovernedOntologyProposalSource interface {
 	OntologyProposals(context.Context) ([]ontology.GovernedProposal, error)
 }
 
 // GovernedOntologyChoices adapts the live RDO publication state to the
 // workspace settings eligibility contract.
 type GovernedOntologyChoices struct {
-	source GovernedOntologySource
+	configured *ontology.OntologyVersion
+	source     GovernedOntologyProposalSource
 }
 
 // NewGovernedOntologyChoices constructs a live, read-only choice adapter.
 func NewGovernedOntologyChoices(
-	source GovernedOntologySource,
+	configured *ontology.OntologyVersion,
+	source GovernedOntologyProposalSource,
 ) (*GovernedOntologyChoices, error) {
-	if absentGovernedOntologySource(source) {
+	if absentGovernedOntologyProposalSource(source) {
 		return nil, shoal.NewError(
 			shoal.ErrorInvalidArgument,
 			"governed ontology source is required",
 		)
 	}
-	return &GovernedOntologyChoices{source: source}, nil
+	var cloned *ontology.OntologyVersion
+	if configured != nil {
+		if err := configured.Validate(); err != nil {
+			return nil, err
+		}
+		value := *configured
+		cloned = &value
+	}
+	return &GovernedOntologyChoices{
+		configured: cloned,
+		source:     source,
+	}, nil
 }
 
 // ListOntologyChoices returns only the active ontology and its retained
@@ -62,40 +74,20 @@ func (c *GovernedOntologyChoices) ListOntologyChoices(
 	ctx context.Context,
 	_ auth.Decision,
 ) ([]workspace.OntologyChoice, error) {
-	active, configured, err := c.source.ActiveOntology(ctx)
-	if err != nil {
-		return nil, err
-	}
-	if !configured {
+	if c.configured == nil {
 		return []workspace.OntologyChoice{}, nil
-	}
-	activeIdentity, err := ontology.NewOntologyIdentity(active)
-	if err != nil {
-		return nil, err
 	}
 	proposals, err := c.source.OntologyProposals(ctx)
 	if err != nil {
 		return nil, err
 	}
-	confirmed, stillConfigured, err := c.source.ActiveOntology(ctx)
+	active, err := replayPublishedOntology(*c.configured, proposals)
 	if err != nil {
 		return nil, err
 	}
-	if !stillConfigured {
-		return nil, shoal.NewError(
-			shoal.ErrorUnavailable,
-			"active ontology changed while listing workspace choices",
-		)
-	}
-	confirmedIdentity, err := ontology.NewOntologyIdentity(confirmed)
+	activeIdentity, err := ontology.NewOntologyIdentity(active)
 	if err != nil {
 		return nil, err
-	}
-	if confirmedIdentity != activeIdentity {
-		return nil, shoal.NewError(
-			shoal.ErrorUnavailable,
-			"active ontology changed while listing workspace choices",
-		)
 	}
 
 	byTarget := make(map[shoal.ID]ontology.GovernedProposal)
@@ -171,7 +163,9 @@ func (c *GovernedOntologyChoices) AuthorizeOntology(
 	return shoal.NewError(shoal.ErrorUnauthorized, "authorization denied")
 }
 
-func absentGovernedOntologySource(value GovernedOntologySource) bool {
+func absentGovernedOntologyProposalSource(
+	value GovernedOntologyProposalSource,
+) bool {
 	if value == nil {
 		return true
 	}
