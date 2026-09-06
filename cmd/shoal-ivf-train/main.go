@@ -120,6 +120,17 @@ func main() {
 	if n == 0 {
 		fatal("no vectors found in table %q with column family %q", *table, *vecCF)
 	}
+	if _, err := store.Scan(ctx, *table, &embedpb.ScanRequest{
+		Limit: 1,
+		VectorSearch: &embedpb.VectorSearch{
+			Query:          agentmem.PackVector(records[0].vec),
+			TopK:           1,
+			EmbeddingCf:    []byte(*vecCF),
+			EmbeddingSpace: strings.TrimSpace(*embeddingSpace),
+		},
+	}); err != nil {
+		fatal("verify source embedding space: %v", err)
+	}
 	fmt.Printf("found %d vectors (dim=%d)\n", n, dim)
 
 	// ── 2. Deterministic training sample ────────────────────────────────────

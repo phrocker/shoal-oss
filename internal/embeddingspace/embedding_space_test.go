@@ -109,6 +109,7 @@ func TestValidateQueryStatesFailsClosed(t *testing.T) {
 		{"missing identity", "", ErrQueryIdentityRequired, []FileState{Has(query)}},
 		{"unknown", query, ErrQuerySpaceUnknown, []FileState{Unknown()}},
 		{"zero is unknown", query, ErrQuerySpaceUnknown, []FileState{{}}},
+		{"partial state", query, ErrInvalidState, []FileState{{Identity: query}}},
 		{"no embeddings", query, ErrQueryNoEmbeddings, []FileState{NoEmbeddings()}},
 		{"same dimensions different model", query, ErrMismatch, []FileState{
 			Has(query), Has("provider:model-b:2:l2"),

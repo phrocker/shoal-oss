@@ -300,7 +300,7 @@ func ValidateQueryStates(operation, queryIdentity string, states ...FileState) e
 		return err
 	}
 	for _, state := range states {
-		if state.State == "" {
+		if state == (FileState{}) {
 			state = Unknown()
 		}
 		if err := state.Validate(); err != nil {
