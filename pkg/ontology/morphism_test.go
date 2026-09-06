@@ -140,10 +140,37 @@ func TestOntologyMorphismDefensivelyOwnsSafetyInputs(t *testing.T) {
 	if err := morphism.Validate(); err != nil {
 		t.Fatalf("caller mutation changed morphism: %v", err)
 	}
+
 	if morphism.Sources()[0] != f.oldRel.ID() ||
 		morphism.Metadata()["review"] != "approved" {
 		t.Fatal("morphism retained caller-owned mutable data")
 	}
+}
+
+func TestReadAssertionUnderResolvesOnlyExactRecordedVersion(t *testing.T) {
+	f := newMorphismFixture(t)
+	first := ReadAssertionUnder(f.personAssertion, mustIdentity(t, f.v1))
+	if !first.Resolved() || first.Reading() != OntologySameVersion ||
+		first.Predicate() != f.v1rel.ID() {
+		t.Fatalf("same-version identity-only read = %#v", first)
+	}
+	other := ReadAssertionUnder(f.personAssertion, mustIdentity(t, f.v2))
+	if other.Resolved() || other.Reading() != OntologyOtherVersion {
+		t.Fatal("identity-only read silently reinterpreted another version")
+	}
+	unknown := ReadAssertionUnder(f.personAssertion, UnknownOntology())
+	if unknown.Resolved() || unknown.Reading() != OntologyUnresolved {
+		t.Fatal("identity-only read upgraded an unknown reader")
+	}
+}
+
+func mustIdentity(t *testing.T, version OntologyVersion) OntologyIdentity {
+	t.Helper()
+	identity, err := NewOntologyIdentity(version)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return identity
 }
 
 type morphismFixture struct {

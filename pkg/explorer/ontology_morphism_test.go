@@ -56,6 +56,7 @@ func TestPublishedMorphismAndHistoricAssertionSurviveRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	proposal, err := ontology.NewGovernedProposalWithMorphisms(
 		schema, base, target, []ontology.OntologyMorphism{morphism},
 		"author", "rename", at.Add(2*time.Second), nil)
@@ -80,6 +81,7 @@ func TestPublishedMorphismAndHistoricAssertionSurviveRestart(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+
 	if err := corpus.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -113,5 +115,47 @@ func TestPublishedMorphismAndHistoricAssertionSurviveRestart(t *testing.T) {
 		read[0].Predicate() != newRel.ID() ||
 		read[0].Original().Predicate() != oldRel.ID() {
 		t.Fatalf("restart interpretation = %#v, err = %v", read, err)
+	}
+}
+
+func TestInterpretAssertionsResolvesSameVersionWithoutProposalCatalog(t *testing.T) {
+	corpus, err := Open(filepath.Join(t.TempDir(), "corpus"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer corpus.Close()
+	schema, _ := ontology.NewOntologySchema("direct", "Direct", "", nil)
+	property, _ := ontology.NewPropertyDefinition(
+		"name", "Name", "", ontology.ValueString, nil, nil)
+	concept, _ := ontology.NewConceptDefinition(
+		"person", "Person", "", []shoal.ID{property.ID()}, nil)
+	version, _ := ontology.NewOntologyVersion(
+		schema, "1", time.Date(2026, 9, 5, 12, 0, 0, 0, time.UTC),
+		[]ontology.ConceptDefinition{concept}, nil,
+		[]ontology.PropertyDefinition{property}, nil)
+	evidence, _ := ontology.NewEvidenceRef(document.Citation{
+		DocumentID: "doc", RevisionID: "rev", SectionID: "section", SpanID: "span",
+		Range: document.SourceRange{
+			Start: document.SourcePosition{Offset: 0, Page: 1},
+			End:   document.SourcePosition{Offset: 4, Page: 1},
+		},
+	}, "name", nil)
+	provenance, _ := ontology.NewExtractionProvenance(
+		"provider", "model", "1", "prompt", "1", "extractor", "1", nil)
+	value, _ := ontology.NewStringValue("Ada")
+	identity, _ := ontology.NewOntologyIdentity(version)
+	assertion, err := ontology.NewAssertion(
+		"person-1", property.ID(), value, ontology.AssertionExplicit, 1,
+		[]ontology.EvidenceRef{evidence}, provenance, nil,
+		ontology.WithAssertionSubjectType(concept.ID()),
+		ontology.WithAssertionOntology(identity))
+	if err != nil {
+		t.Fatal(err)
+	}
+	read, err := corpus.InterpretAssertions(
+		context.Background(), []ontology.Assertion{assertion}, identity)
+	if err != nil || len(read) != 1 || !read[0].Resolved() ||
+		read[0].Predicate() != property.ID() {
+		t.Fatalf("same-version interpretation = %#v, err = %v", read, err)
 	}
 }

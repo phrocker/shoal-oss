@@ -466,6 +466,31 @@ func UnresolvedInterpretation(
 	}
 }
 
+// ReadAssertionUnder resolves the identity-only case without requiring schema
+// material. Exact same-version assertions retain their original effective
+// identifiers; every other comparison remains explicitly unresolved.
+func ReadAssertionUnder(
+	assertion Assertion, reader OntologyIdentity,
+) AssertionInterpretation {
+	if err := assertion.Validate(); err != nil {
+		return UnresolvedInterpretation(assertion, reader, "assertion is malformed")
+	}
+	if !reader.Known() || reader.Validate() != nil {
+		return UnresolvedInterpretation(assertion, reader, "selected ontology is unresolved")
+	}
+	if assertion.ReadUnder(reader) != OntologySameVersion {
+		return UnresolvedInterpretation(
+			assertion, reader, "ontology schema material is unavailable for reinterpretation")
+	}
+	subjectType, _ := assertion.SubjectType()
+	objectType, _ := assertion.ObjectType()
+	return AssertionInterpretation{
+		original: assertion.clone(), reader: reader,
+		reading: OntologySameVersion, status: InterpretationResolved,
+		subjectType: subjectType, predicate: assertion.Predicate(), objectType: objectType,
+	}
+}
+
 type OntologyLens struct {
 	target    OntologyVersion
 	identity  OntologyIdentity
@@ -506,6 +531,9 @@ func (l OntologyLens) Read(assertion Assertion) AssertionInterpretation {
 		reading == OntologyOtherSchema {
 		return UnresolvedInterpretation(assertion, l.identity, string(reading))
 	}
+	if reading == OntologySameVersion {
+		return ReadAssertionUnder(assertion, l.identity)
+	}
 	subjectType, _ := assertion.SubjectType()
 	objectType, _ := assertion.ObjectType()
 	result := AssertionInterpretation{
@@ -513,28 +541,26 @@ func (l OntologyLens) Read(assertion Assertion) AssertionInterpretation {
 		status: InterpretationResolved, subjectType: subjectType,
 		predicate: assertion.Predicate(), objectType: objectType,
 	}
-	if reading == OntologyOtherVersion {
-		path, ok := l.uniquePath(assertion.ontologyIdentity)
-		if !ok {
-			return UnresolvedInterpretation(assertion, l.identity, "no unique published morphism path")
+	path, ok := l.uniquePath(assertion.ontologyIdentity)
+	if !ok {
+		return UnresolvedInterpretation(assertion, l.identity, "no unique published morphism path")
+	}
+	for _, step := range path {
+		var reason string
+		result.subjectType, reason = mapDefinition(result.subjectType, assertion.metadata, step)
+		if reason != "" {
+			return UnresolvedInterpretation(assertion, l.identity, reason)
 		}
-		for _, step := range path {
-			var reason string
-			result.subjectType, reason = mapDefinition(result.subjectType, assertion.metadata, step)
-			if reason != "" {
-				return UnresolvedInterpretation(assertion, l.identity, reason)
-			}
-			result.predicate, reason = mapDefinition(result.predicate, assertion.metadata, step)
-			if reason != "" {
-				return UnresolvedInterpretation(assertion, l.identity, reason)
-			}
-			result.objectType, reason = mapDefinition(result.objectType, assertion.metadata, step)
-			if reason != "" {
-				return UnresolvedInterpretation(assertion, l.identity, reason)
-			}
-			for _, morphism := range step {
-				result.applied = append(result.applied, morphism.ID())
-			}
+		result.predicate, reason = mapDefinition(result.predicate, assertion.metadata, step)
+		if reason != "" {
+			return UnresolvedInterpretation(assertion, l.identity, reason)
+		}
+		result.objectType, reason = mapDefinition(result.objectType, assertion.metadata, step)
+		if reason != "" {
+			return UnresolvedInterpretation(assertion, l.identity, reason)
+		}
+		for _, morphism := range step {
+			result.applied = append(result.applied, morphism.ID())
 		}
 	}
 	if err := l.validateInterpretation(assertion, result); err != nil {

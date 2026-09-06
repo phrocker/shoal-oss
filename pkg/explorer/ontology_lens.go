@@ -93,8 +93,7 @@ func (e *Explorer) InterpretAssertions(
 	}
 	if target.ID() == "" {
 		for _, assertion := range assertions {
-			out = append(out, ontology.UnresolvedInterpretation(
-				assertion, selected, "selected ontology is not published or retained"))
+			out = append(out, ontology.ReadAssertionUnder(assertion, selected))
 		}
 		return out, nil
 	}
