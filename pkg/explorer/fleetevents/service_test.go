@@ -415,6 +415,7 @@ func TestPublishLifecycleKeepsStableTokenAndRejectsBroadOperation(t *testing.T) 
 		}(),
 		AuthorizationExpiresAt: decision.AuthenticationExpires(),
 	}
+	request.Event.Kind = "action.enqueued"
 	if _, err := service.PublishLifecycle(
 		context.Background(), auth.OperationDispatch, request, receipt,
 	); err != nil {
