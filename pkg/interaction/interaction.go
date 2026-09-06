@@ -385,6 +385,11 @@ type Subgraph struct {
 	// TouchedNodeIDs is the sorted union of every source node the session was
 	// shown or cited. Visibility is the conjunction over exactly this set.
 	TouchedNodeIDs []shoal.ID
+	// TouchedEdgeIDs is the sorted union of every exact source edge present in
+	// retrieved or cited evidence. These edges are not copied into the derived
+	// interaction graph, but their current existence and policy remain
+	// required to serve it.
+	TouchedEdgeIDs []shoal.ID
 }
 
 // VisibilityResolver reports the visibility labels a source node requires. It
@@ -395,16 +400,26 @@ type VisibilityResolver func(shoal.ID) ([]string, error)
 // NodeVisibility reads the declared visibility labels of a graph node. A node
 // with no declared labels is public.
 func NodeVisibility(node graph.Node) ([]string, error) {
-	if node.Properties[PropertyVisibility] == "" &&
-		node.Properties[PropertyVisibilityDigest] != "" {
+	return metadataVisibility(node.Properties)
+}
+
+// EdgeVisibility reads the declared visibility labels of a graph edge. A
+// source edge with no declared labels is public.
+func EdgeVisibility(edge graph.Edge) ([]string, error) {
+	return metadataVisibility(edge.Properties)
+}
+
+func metadataVisibility(properties shoal.Metadata) ([]string, error) {
+	if properties[PropertyVisibility] == "" &&
+		properties[PropertyVisibilityDigest] != "" {
 		if err := validateDigest(
 			"interaction visibility digest",
-			node.Properties[PropertyVisibilityDigest],
+			properties[PropertyVisibilityDigest],
 			false,
 		); err != nil {
 			return nil, err
 		}
-		count, err := strconv.Atoi(node.Properties[PropertyVisibilityCount])
+		count, err := strconv.Atoi(properties[PropertyVisibilityCount])
 		if err != nil || count <= 0 {
 			return nil, shoal.NewError(
 				shoal.ErrorInvalidArgument,
@@ -417,7 +432,7 @@ func NodeVisibility(node graph.Node) ([]string, error) {
 				"derived record view",
 		)
 	}
-	return ParseVisibility(node.Properties[PropertyVisibility])
+	return ParseVisibility(properties[PropertyVisibility])
 }
 
 // ParseVisibility parses a canonical conjunction expression into sorted unique
@@ -811,29 +826,55 @@ func (s Session) TouchedEdgeIDs() []shoal.ID {
 	return dedupeIDs(ids)
 }
 
+// TouchedAssertions returns every authoritative assertion identity and origin
+// carried by retrieved or cited evidence.
+func (s Session) TouchedAssertions() []AssertionReference {
+	references := evidenceAssertions(s.SeedEvidence)
+	references = append(references, evidenceAssertions(s.CitedEvidence)...)
+	for _, turn := range s.Turns {
+		if turn.ToolCall != nil {
+			references = append(
+				references,
+				evidenceAssertions(turn.ToolCall.RetrievedEvidence)...,
+			)
+		}
+	}
+	return evidenceAssertions([]EvidenceReference{{Assertions: references}})
+}
+
 // Subgraph materializes the session, turn, and tool-call nodes with their
 // retrieved and cited edges. resolve supplies the visibility labels of every
 // touched source node; if it fails for any node, the whole record fails rather
 // than being written with an understated visibility.
 func (s Session) Subgraph(resolve VisibilityResolver) (Subgraph, error) {
+	return s.SubgraphWithEvidence(resolve, nil)
+}
+
+// SubgraphWithEvidence materializes the interaction while resolving both
+// source-node and exact source-edge visibility. An edge resolver is mandatory
+// whenever the session contains edge-backed evidence.
+func (s Session) SubgraphWithEvidence(
+	resolveNode VisibilityResolver,
+	resolveEdge VisibilityResolver,
+) (Subgraph, error) {
 	canonical, err := s.Canonical()
 	if err != nil {
 		return Subgraph{}, err
 	}
 	s = canonical
-	if resolve == nil {
+	if resolveNode == nil {
 		return Subgraph{}, shoal.NewError(
 			shoal.ErrorInvalidArgument, "interaction visibility resolver is required")
 	}
-	cache := make(map[shoal.ID][]string)
-	labelsFor := func(ids []shoal.ID) ([]string, error) {
+	nodeCache := make(map[shoal.ID][]string)
+	labelsForNodes := func(ids []shoal.ID) ([]string, error) {
 		sets := make([][]string, 0, len(ids))
 		for _, id := range ids {
-			if cached, ok := cache[id]; ok {
+			if cached, ok := nodeCache[id]; ok {
 				sets = append(sets, cached)
 				continue
 			}
-			labels, err := resolve(id)
+			labels, err := resolveNode(id)
 			if err != nil {
 				return nil, err
 			}
@@ -841,7 +882,34 @@ func (s Session) Subgraph(resolve VisibilityResolver) (Subgraph, error) {
 			if err != nil {
 				return nil, err
 			}
-			cache[id] = normalized
+			nodeCache[id] = normalized
+			sets = append(sets, normalized)
+		}
+		return Conjoin(sets...)
+	}
+	edgeCache := make(map[shoal.ID][]string)
+	labelsForEdges := func(ids []shoal.ID) ([]string, error) {
+		if len(ids) > 0 && resolveEdge == nil {
+			return nil, shoal.NewError(
+				shoal.ErrorInvalidArgument,
+				"interaction edge visibility resolver is required",
+			)
+		}
+		sets := make([][]string, 0, len(ids))
+		for _, id := range ids {
+			if cached, ok := edgeCache[id]; ok {
+				sets = append(sets, cached)
+				continue
+			}
+			labels, err := resolveEdge(id)
+			if err != nil {
+				return nil, err
+			}
+			normalized, err := Conjoin(labels)
+			if err != nil {
+				return nil, err
+			}
+			edgeCache[id] = normalized
 			sets = append(sets, normalized)
 		}
 		return Conjoin(sets...)
@@ -1022,6 +1090,8 @@ func (s Session) Subgraph(resolve VisibilityResolver) (Subgraph, error) {
 		if turn.ToolCall != nil {
 			retrieved := dedupeIDs(turn.ToolCall.RetrievedNodeIDs)
 			addTouched(retrieved)
+			retrievedEdges := evidenceEdgeIDs(
+				turn.ToolCall.RetrievedEvidence)
 			callID := DerivedID("tool_call", string(turnID))
 			callNode := graph.Node{
 				ID:     callID,
@@ -1035,7 +1105,16 @@ func (s Session) Subgraph(resolve VisibilityResolver) (Subgraph, error) {
 				},
 			}
 			setIfPresent(callNode.Properties, PropertyToolKind, turn.ToolCall.Kind)
-			callVisibility, err := labelsFor(retrieved)
+			nodeVisibility, err := labelsForNodes(retrieved)
+			if err != nil {
+				return Subgraph{}, err
+			}
+			edgeVisibility, err := labelsForEdges(retrievedEdges)
+			if err != nil {
+				return Subgraph{}, err
+			}
+			callVisibility, err := Conjoin(
+				nodeVisibility, edgeVisibility)
 			if err != nil {
 				return Subgraph{}, err
 			}
@@ -1058,7 +1137,16 @@ func (s Session) Subgraph(resolve VisibilityResolver) (Subgraph, error) {
 	sort.Slice(touchedIDs, func(i, j int) bool {
 		return shoal.CompareID(touchedIDs[i], touchedIDs[j]) < 0
 	})
-	visibility, err := labelsFor(touchedIDs)
+	nodeVisibility, err := labelsForNodes(touchedIDs)
+	if err != nil {
+		return Subgraph{}, err
+	}
+	touchedEdgeIDs := s.TouchedEdgeIDs()
+	edgeVisibility, err := labelsForEdges(touchedEdgeIDs)
+	if err != nil {
+		return Subgraph{}, err
+	}
+	visibility, err := Conjoin(nodeVisibility, edgeVisibility)
 	if err != nil {
 		return Subgraph{}, err
 	}
@@ -1084,6 +1172,7 @@ func (s Session) Subgraph(resolve VisibilityResolver) (Subgraph, error) {
 		Edges:          edges,
 		Visibility:     visibility,
 		TouchedNodeIDs: touchedIDs,
+		TouchedEdgeIDs: touchedEdgeIDs,
 	}, nil
 }
 

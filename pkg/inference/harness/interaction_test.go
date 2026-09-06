@@ -62,6 +62,17 @@ func (s *stubSink) RecordInteraction(
 	return s.recordErr
 }
 
+func (s *stubSink) RecordInteractionResult(
+	_ context.Context, session interaction.Session,
+) (interaction.Session, error) {
+	s.recorded++
+	s.lastRecord = session
+	if s.recordErr != nil {
+		return interaction.Session{}, s.recordErr
+	}
+	return session, nil
+}
+
 // TestGeneratorRequiresRecorder pins binding decision 4 structurally: there is
 // no configuration in which an inference is served without a recorder.
 func TestGeneratorRequiresRecorder(t *testing.T) {
@@ -289,6 +300,18 @@ func TestGraphRecorderRecordsThroughTheSink(t *testing.T) {
 	}
 	if len(session.CitedNodeIDs) == 0 {
 		t.Fatal("session recorded no cited source node IDs")
+	}
+	if len(session.SeedEvidence) != 1 ||
+		session.SeedEvidence[0].AnchorID != initial.ID() {
+		t.Fatalf("session seed evidence = %+v", session.SeedEvidence)
+	}
+	if len(session.CitedEvidence) != 1 ||
+		session.CitedEvidence[0].AnchorID != initial.ID() {
+		t.Fatalf("session cited evidence = %+v", session.CitedEvidence)
+	}
+	if session.SeedEvidence[0].Citation.Range !=
+		session.CitedEvidence[0].Citation.Range {
+		t.Fatal("recorded evidence lost its exact source range")
 	}
 
 	sink.recordErr = errors.New("write refused")

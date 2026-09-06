@@ -104,8 +104,13 @@ func (c *Client) recordInteraction(
 	if err != nil {
 		return interaction.Session{}, err
 	}
-	if err := c.authorizeInteractionSources(
-		ctx, canonical.TouchedNodeIDs(), decision, auth.OperationRetrieve, now,
+	if err := c.authorizeInteractionEvidence(
+		ctx,
+		canonical.TouchedNodeIDs(),
+		canonical.TouchedEdgeIDs(),
+		decision,
+		auth.OperationRetrieve,
+		now,
 	); err != nil {
 		return interaction.Session{}, err
 	}
@@ -143,10 +148,27 @@ func (c *Client) recordInteraction(
 			"trusted interaction snapshot validator is unavailable",
 		)
 	}
-	if err := c.snapshotValidator.ValidateSnapshot(
-		ctx, canonical.SnapshotID, canonical.SnapshotAsOf,
-		canonical.TouchedNodeIDs(),
-	); err != nil {
+	edgeIDs := canonical.TouchedEdgeIDs()
+	if len(edgeIDs) > 0 {
+		validator, ok := c.snapshotValidator.(EvidenceSnapshotValidator)
+		if !ok {
+			return interaction.Session{}, shoal.NewError(
+				shoal.ErrorUnavailable,
+				"trusted interaction edge snapshot validator is unavailable",
+			)
+		}
+		err = validator.ValidateEvidenceSnapshot(
+			ctx, canonical.SnapshotID, canonical.SnapshotAsOf,
+			canonical.TouchedNodeIDs(), edgeIDs,
+			canonical.TouchedAssertions(),
+		)
+	} else {
+		err = c.snapshotValidator.ValidateSnapshot(
+			ctx, canonical.SnapshotID, canonical.SnapshotAsOf,
+			canonical.TouchedNodeIDs(),
+		)
+	}
+	if err != nil {
 		return interaction.Session{}, directBaseError(err)
 	}
 	if err := guard.Check(ctx); err != nil {
@@ -214,10 +236,23 @@ func (c *Client) InteractionRecords(
 		return nil, directBaseError(err)
 	}
 	allNodeIDs := make([]shoal.ID, 0)
+	allEdgeIDs := make([]shoal.ID, 0)
 	for _, record := range records {
 		if !record.Summary.Deleted {
 			allNodeIDs = append(allNodeIDs, record.TouchedNodeIDs...)
+			allEdgeIDs = append(allEdgeIDs, record.TouchedEdgeIDs...)
 		}
+	}
+	edges, err := c.resolveEdges(ctx, allEdgeIDs)
+	if err != nil {
+		return nil, err
+	}
+	for _, registration := range edges {
+		allNodeIDs = append(
+			allNodeIDs,
+			registration.Edge.From,
+			registration.Edge.To,
+		)
 	}
 	registrations, err := c.resolveNodes(ctx, allNodeIDs)
 	if err != nil {
@@ -237,8 +272,9 @@ func (c *Client) InteractionRecords(
 			}
 			continue
 		}
-		allowed, err := interactionSourcesAllow(
-			registrations, record.TouchedNodeIDs,
+		allowed, err := interactionEvidenceAllows(
+			registrations, edges,
+			record.TouchedNodeIDs, record.TouchedEdgeIDs,
 			decision, auth.OperationRead, now,
 		)
 		if err != nil {
@@ -283,8 +319,13 @@ func (c *Client) InteractionRecord(
 		if !summaryFingerprintMatchesDecision(record.Summary, decision) {
 			return explorer.InteractionRecord{}, auth.ObjectNotFound()
 		}
-	} else if err := c.authorizeInteractionSources(
-		ctx, record.TouchedNodeIDs, decision, auth.OperationRead, now,
+	} else if err := c.authorizeInteractionEvidence(
+		ctx,
+		record.TouchedNodeIDs,
+		record.TouchedEdgeIDs,
+		decision,
+		auth.OperationRead,
+		now,
 	); err != nil {
 		if shoal.IsErrorCode(err, shoal.ErrorUnauthorized) ||
 			shoal.IsErrorCode(err, shoal.ErrorNotFound) {
@@ -351,8 +392,13 @@ func (c *Client) InteractionSubgraph(
 		!summaryFingerprintMatchesDecision(record.Summary, decision) {
 		return explorer.Neighborhood{}, auth.ObjectNotFound()
 	}
-	if err := c.authorizeInteractionSources(
-		ctx, record.TouchedNodeIDs, decision, auth.OperationRead, now,
+	if err := c.authorizeInteractionEvidence(
+		ctx,
+		record.TouchedNodeIDs,
+		record.TouchedEdgeIDs,
+		decision,
+		auth.OperationRead,
+		now,
 	); err != nil {
 		if shoal.IsErrorCode(err, shoal.ErrorUnauthorized) {
 			return explorer.Neighborhood{}, auth.ObjectNotFound()
@@ -378,19 +424,31 @@ func interactionSubgraphIsTombstone(subgraph explorer.Neighborhood) bool {
 		subgraph.Nodes[0].Kind == interaction.KindTombstone
 }
 
-func (c *Client) authorizeInteractionSources(
+func (c *Client) authorizeInteractionEvidence(
 	ctx context.Context,
 	nodeIDs []shoal.ID,
+	edgeIDs []shoal.ID,
 	decision auth.Decision,
 	operation auth.Operation,
 	now time.Time,
 ) error {
+	edges, err := c.resolveEdges(ctx, edgeIDs)
+	if err != nil {
+		return err
+	}
+	for _, registration := range edges {
+		nodeIDs = append(
+			nodeIDs,
+			registration.Edge.From,
+			registration.Edge.To,
+		)
+	}
 	registrations, err := c.resolveNodes(ctx, nodeIDs)
 	if err != nil {
 		return err
 	}
-	allowed, err := interactionSourcesAllow(
-		registrations, nodeIDs, decision, operation, now)
+	allowed, err := interactionEvidenceAllows(
+		registrations, edges, nodeIDs, edgeIDs, decision, operation, now)
 	if err != nil {
 		return err
 	}
@@ -400,9 +458,11 @@ func (c *Client) authorizeInteractionSources(
 	return nil
 }
 
-func interactionSourcesAllow(
+func interactionEvidenceAllows(
 	registrations registeredNodes,
+	edges registeredEdges,
 	nodeIDs []shoal.ID,
+	edgeIDs []shoal.ID,
 	decision auth.Decision,
 	operation auth.Operation,
 	now time.Time,
@@ -414,6 +474,20 @@ func interactionSourcesAllow(
 		}
 		allowed, err := ruleAllows(
 			registration.Rule, decision, operation, now)
+		if err != nil {
+			return false, err
+		}
+		if !allowed {
+			return false, nil
+		}
+	}
+	for _, edgeID := range edgeIDs {
+		registration, ok := edges[edgeID]
+		if !ok || registration.Edge.ID != edgeID {
+			return false, nil
+		}
+		allowed, err := edgeAllowsResolved(
+			registrations, registration, decision, operation, now)
 		if err != nil {
 			return false, err
 		}

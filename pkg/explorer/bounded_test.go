@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/phrocker/shoal-oss/pkg/graph"
+	"github.com/phrocker/shoal-oss/pkg/interaction"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
@@ -62,6 +63,7 @@ func TestHistoricalSnapshotValidationSurvivesRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	firstReceipt, err := corpus.Ingest(ctx, Source{
 		URI: "file:///snapshot-one.txt", MediaType: MediaTypeText,
 		Content: "snapshot one",
@@ -117,6 +119,95 @@ func TestHistoricalSnapshotValidationSurvivesRestart(t *testing.T) {
 		[]shoal.ID{secondView.Root.Spans[0].ID},
 	); !shoal.IsErrorCode(err, shoal.ErrorConflict) {
 		t.Fatalf("post-snapshot source validation error = %v", err)
+	}
+}
+
+func TestHistoricalSnapshotRejectsReusedIDsWithChangedSourceState(t *testing.T) {
+	ctx := context.Background()
+	dataDir := t.TempDir()
+	corpus, err := Open(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := Source{
+		URI: "file:///snapshot-reclassified.txt", MediaType: MediaTypeText,
+		Content: "stable content",
+		Metadata: shoal.Metadata{
+			interaction.PropertyVisibility: "restricted",
+		},
+	}
+	firstReceipt, err := corpus.Ingest(ctx, source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstView, err := corpus.Document(
+		ctx, firstReceipt.Document.ID, firstReceipt.Revision.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	neighborhood, err := corpus.Neighborhood(
+		ctx, NeighborhoodRequest{
+			NodeIDs: []shoal.ID{firstReceipt.Document.ID}, Depth: 2,
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(neighborhood.Edges) == 0 {
+		t.Fatal("fixture produced no source edge")
+	}
+	snapshot, err := corpus.Snapshot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	source.Metadata[interaction.PropertyVisibility] = "public"
+	secondReceipt, err := corpus.Ingest(ctx, source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondView, err := corpus.Document(
+		ctx, secondReceipt.Document.ID, secondReceipt.Revision.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstSpan := firstView.Root.Spans[0].ID
+	if secondView.Root.Spans[0].ID != firstSpan {
+		t.Fatal("fixture did not preserve the source span ID")
+	}
+	if err := corpus.ValidateSnapshot(
+		ctx, shoal.ID(snapshot.ID), snapshot.AsOf, []shoal.ID{firstSpan},
+	); !shoal.IsErrorCode(err, shoal.ErrorConflict) {
+		t.Fatalf("changed source state validation error = %v", err)
+	}
+	if err := corpus.ValidateEvidenceSnapshot(
+		ctx, shoal.ID(snapshot.ID), snapshot.AsOf, nil,
+		[]shoal.ID{neighborhood.Edges[0].ID}, nil,
+	); err != nil {
+		t.Fatalf("unchanged source edge validation error = %v", err)
+	}
+	corpus.mu.Lock()
+	changedEdge := corpus.graphEdges[neighborhood.Edges[0].ID]
+	changedEdge.Properties = shoal.Metadata{"changed": "true"}
+	corpus.graphEdges[changedEdge.ID] = changedEdge
+	corpus.mu.Unlock()
+	if err := corpus.ValidateEvidenceSnapshot(
+		ctx, shoal.ID(snapshot.ID), snapshot.AsOf, nil,
+		[]shoal.ID{neighborhood.Edges[0].ID}, nil,
+	); !shoal.IsErrorCode(err, shoal.ErrorConflict) {
+		t.Fatalf("changed source edge validation error = %v", err)
+	}
+	if err := corpus.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	if err := reopened.ValidateSnapshot(
+		ctx, shoal.ID(snapshot.ID), snapshot.AsOf, []shoal.ID{firstSpan},
+	); !shoal.IsErrorCode(err, shoal.ErrorConflict) {
+		t.Fatalf("reopened changed source state validation error = %v", err)
 	}
 }
 

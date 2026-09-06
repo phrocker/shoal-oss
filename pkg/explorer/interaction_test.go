@@ -30,6 +30,7 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/graph"
 	"github.com/phrocker/shoal-oss/pkg/interaction"
+	"github.com/phrocker/shoal-oss/pkg/ontology"
 	"github.com/phrocker/shoal-oss/pkg/retrieval"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
@@ -397,6 +398,178 @@ func TestGenericRecorderSurvivesRestartAndStaysSourceOnly(t *testing.T) {
 		}
 	}
 
+}
+
+func TestExactEdgeEvidenceSurvivesRestart(t *testing.T) {
+	ctx := context.Background()
+	dataDir := t.TempDir()
+	corpus, err := explorer.Open(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := explorer.Source{
+		URI: "file:///edge-evidence.txt", MediaType: explorer.MediaTypeText,
+		Content: "exact edge evidence",
+		Metadata: shoal.Metadata{
+			interaction.PropertyVisibility: "ops",
+		},
+	}
+	receipt, err := corpus.Ingest(ctx, source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	view, err := corpus.Document(
+		ctx, receipt.Document.ID, receipt.Revision.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(view.Root.Spans) == 0 {
+		t.Fatal("fixture produced no span")
+	}
+	edge := graph.Edge{
+		ID:     "source-evidence-edge",
+		From:   receipt.Document.ID,
+		To:     view.Root.Spans[0].ID,
+		Type:   "supports",
+		Weight: 1,
+		Properties: shoal.Metadata{
+			interaction.PropertyVisibility: "edge-secret",
+		},
+	}
+	if err := corpus.Connect(ctx, edge); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := corpus.Snapshot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := interaction.Session{
+		ID:                       interaction.DerivedID("session", "edge-restart"),
+		RecordedAt:               snapshot.AsOf.Add(time.Second),
+		Operation:                interaction.OperationRetrieval,
+		SnapshotID:               shoal.ID(snapshot.ID),
+		SnapshotAsOf:             snapshot.AsOf,
+		AuthorizationFingerprint: "auth-sha256:edge-restart",
+		AuthorizationExpiresAt:   snapshot.AsOf.Add(time.Hour),
+		SeedNodeIDs:              []shoal.ID{edge.From, edge.To},
+		SeedEvidence: []interaction.EvidenceReference{{
+			AnchorID: "edge-anchor",
+			Kind:     interaction.EvidenceGraph,
+			NodeIDs:  []shoal.ID{edge.From, edge.To},
+			EdgeIDs:  []shoal.ID{edge.ID},
+		}},
+	}
+	forged := session
+	forged.ID = interaction.DerivedID("session", "forged-assertion")
+	forged.SeedEvidence = cloneTestEvidence(session.SeedEvidence)
+	forged.SeedEvidence[0].Assertions =
+		[]interaction.AssertionReference{{
+			AssertionID: "forged-assertion",
+			EdgeID:      edge.ID,
+			Origin:      ontology.AssertionExplicit,
+		}}
+	if err := corpus.RecordInteraction(
+		ctx, forged,
+	); !shoal.IsErrorCode(err, shoal.ErrorConflict) {
+		t.Fatalf("forged assertion recording error = %v", err)
+	}
+	if err := corpus.RecordInteraction(ctx, session); err != nil {
+		t.Fatal(err)
+	}
+	if err := corpus.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := explorer.Open(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	record, err := reopened.InteractionRecord(ctx, session.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(record.TouchedEdgeIDs) != 1 ||
+		record.TouchedEdgeIDs[0] != edge.ID ||
+		len(record.Session.SeedEvidence) != 1 ||
+		record.Session.SeedEvidence[0].EdgeIDs[0] != edge.ID {
+		t.Fatalf("hydrated exact evidence = %+v", record)
+	}
+	if record.Summary.Visibility != "edge-secret&ops" {
+		t.Fatalf("edge-aware visibility = %q", record.Summary.Visibility)
+	}
+}
+
+func cloneTestEvidence(
+	references []interaction.EvidenceReference,
+) []interaction.EvidenceReference {
+	cloned := make([]interaction.EvidenceReference, len(references))
+	for index, reference := range references {
+		cloned[index] = reference
+		cloned[index].NodeIDs = append(
+			[]shoal.ID(nil), reference.NodeIDs...)
+		cloned[index].EdgeIDs = append(
+			[]shoal.ID(nil), reference.EdgeIDs...)
+		cloned[index].Assertions = append(
+			[]interaction.AssertionReference(nil), reference.Assertions...)
+	}
+	return cloned
+}
+
+func TestRecordInteractionRejectsReclassifiedPinnedSource(t *testing.T) {
+	ctx := context.Background()
+	corpus, err := explorer.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer corpus.Close()
+	source := explorer.Source{
+		URI: "file:///reclassified-pin.txt", MediaType: explorer.MediaTypeText,
+		Content: "stable evidence",
+		Metadata: shoal.Metadata{
+			interaction.PropertyVisibility: "restricted",
+		},
+	}
+	first, err := corpus.Ingest(ctx, source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	view, err := corpus.Document(
+		ctx, first.Document.ID, first.Revision.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(view.Root.Spans) == 0 {
+		t.Fatal("fixture produced no span")
+	}
+	snapshot, err := corpus.Snapshot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	source.Metadata[interaction.PropertyVisibility] = "public"
+	if _, err := corpus.Ingest(ctx, source); err != nil {
+		t.Fatal(err)
+	}
+	session := interaction.Session{
+		ID:                       interaction.DerivedID("session", "reclassified-pin"),
+		RecordedAt:               snapshot.AsOf.Add(time.Second),
+		Operation:                interaction.OperationRetrieval,
+		SnapshotID:               shoal.ID(snapshot.ID),
+		SnapshotAsOf:             snapshot.AsOf,
+		AuthorizationFingerprint: "auth-sha256:reclassified-pin",
+		AuthorizationExpiresAt:   snapshot.AsOf.Add(time.Hour),
+		SeedNodeIDs:              []shoal.ID{view.Root.Spans[0].ID},
+	}
+	if err := corpus.RecordInteraction(
+		ctx, session,
+	); !shoal.IsErrorCode(err, shoal.ErrorConflict) {
+		t.Fatalf("reclassified pinned source recording error = %v", err)
+	}
+	if _, err := corpus.InteractionRecord(
+		ctx, session.ID,
+	); !shoal.IsErrorCode(err, shoal.ErrorNotFound) {
+		t.Fatalf("reclassified source persisted interaction: %v", err)
+	}
 }
 
 func TestGeneratedInteractionNodeIDsCannotCollide(t *testing.T) {

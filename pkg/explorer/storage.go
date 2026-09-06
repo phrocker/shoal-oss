@@ -24,6 +24,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/gob"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -104,6 +105,14 @@ type persistedSnapshot struct {
 	ParentID       shoal.ID
 	AddedNodeIDs   []shoal.ID
 	RemovedNodeIDs []shoal.ID
+	NodeStates     []persistedSnapshotObject
+	RemovedEdgeIDs []shoal.ID
+	EdgeStates     []persistedSnapshotObject
+}
+
+type persistedSnapshotObject struct {
+	ID     shoal.ID
+	Digest string
 }
 
 // persistedCursorKey holds the durable, per-corpus secret that seals change-feed
@@ -345,15 +354,38 @@ func validateSnapshotDelta(record persistedSnapshot) error {
 		"snapshot parent ID", record.ParentID); err != nil {
 		return err
 	}
-	for _, ids := range [][]shoal.ID{
-		record.AddedNodeIDs, record.RemovedNodeIDs,
+	for groupIndex, ids := range [][]shoal.ID{
+		record.AddedNodeIDs, record.RemovedNodeIDs, record.RemovedEdgeIDs,
 	} {
+		name := "snapshot node ID"
+		if groupIndex == 2 {
+			name = "snapshot edge ID"
+		}
 		for index, id := range ids {
-			if err := shoal.ValidateRequiredID("snapshot node ID", id); err != nil {
+			if err := shoal.ValidateRequiredID(name, id); err != nil {
 				return err
 			}
 			if index > 0 && shoal.CompareID(ids[index-1], id) >= 0 {
-				return fmt.Errorf("snapshot node IDs are not canonical")
+				return fmt.Errorf("snapshot object IDs are not canonical")
+			}
+		}
+	}
+	for _, states := range [][]persistedSnapshotObject{
+		record.NodeStates, record.EdgeStates,
+	} {
+		for index, state := range states {
+			if err := shoal.ValidateRequiredID(
+				"snapshot object ID", state.ID); err != nil {
+				return err
+			}
+			decoded, err := hex.DecodeString(state.Digest)
+			if err != nil || len(decoded) != sha256.Size ||
+				hex.EncodeToString(decoded) != state.Digest {
+				return fmt.Errorf("snapshot object digest is invalid")
+			}
+			if index > 0 &&
+				shoal.CompareID(states[index-1].ID, state.ID) >= 0 {
+				return fmt.Errorf("snapshot object states are not canonical")
 			}
 		}
 	}
@@ -364,6 +396,29 @@ func validateSnapshotDelta(record persistedSnapshot) error {
 		if index < len(record.RemovedNodeIDs) &&
 			record.RemovedNodeIDs[index] == id {
 			return fmt.Errorf("snapshot node cannot be both added and removed")
+		}
+	}
+	if len(record.NodeStates) > 0 {
+		if len(record.NodeStates) != len(record.AddedNodeIDs) {
+			return fmt.Errorf("snapshot node states do not match node additions")
+		}
+		for index, state := range record.NodeStates {
+			if state.ID != record.AddedNodeIDs[index] {
+				return fmt.Errorf(
+					"snapshot node states do not match node additions")
+			}
+		}
+	}
+	for _, state := range record.EdgeStates {
+		index := sort.Search(
+			len(record.RemovedEdgeIDs), func(index int) bool {
+				return shoal.CompareID(
+					record.RemovedEdgeIDs[index], state.ID) >= 0
+			})
+		if index < len(record.RemovedEdgeIDs) &&
+			record.RemovedEdgeIDs[index] == state.ID {
+			return fmt.Errorf(
+				"snapshot edge cannot be both updated and removed")
 		}
 	}
 	return nil
@@ -933,7 +988,10 @@ func persistedSnapshotsEqual(left, right persistedSnapshot) bool {
 		left.AsOf.UTC().Equal(right.AsOf.UTC()) &&
 		left.ParentID == right.ParentID &&
 		reflect.DeepEqual(left.AddedNodeIDs, right.AddedNodeIDs) &&
-		reflect.DeepEqual(left.RemovedNodeIDs, right.RemovedNodeIDs)
+		reflect.DeepEqual(left.RemovedNodeIDs, right.RemovedNodeIDs) &&
+		reflect.DeepEqual(left.NodeStates, right.NodeStates) &&
+		reflect.DeepEqual(left.RemovedEdgeIDs, right.RemovedEdgeIDs) &&
+		reflect.DeepEqual(left.EdgeStates, right.EdgeStates)
 }
 
 func encodeEmbeddedRecord(kind byte, value any) ([]byte, error) {

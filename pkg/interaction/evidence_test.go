@@ -44,3 +44,43 @@ func TestSessionCanonicalPreservesExactEvidence(t *testing.T) {
 		t.Fatal("assertion detached from its authoritative edge was accepted")
 	}
 }
+
+func TestSessionSubgraphRequiresAndConjoinsExactEdgeVisibility(t *testing.T) {
+	session := interaction.Session{
+		ID:          interaction.DerivedID("session", "edge-visibility"),
+		RecordedAt:  time.Unix(1700000000, 0).UTC(),
+		Operation:   interaction.OperationRetrieval,
+		SeedNodeIDs: []shoal.ID{"node-a", "node-b"},
+		SeedEvidence: []interaction.EvidenceReference{{
+			AnchorID: "anchor-1", Kind: interaction.EvidenceGraph,
+			NodeIDs: []shoal.ID{"node-a", "node-b"},
+			EdgeIDs: []shoal.ID{"edge-1"},
+		}},
+	}
+	nodeResolver := func(shoal.ID) ([]string, error) {
+		return []string{"node-label"}, nil
+	}
+	if _, err := session.Subgraph(nodeResolver); err == nil {
+		t.Fatal("edge-backed evidence was accepted without an edge resolver")
+	}
+	subgraph, err := session.SubgraphWithEvidence(
+		nodeResolver,
+		func(id shoal.ID) ([]string, error) {
+			if id != "edge-1" {
+				t.Fatalf("resolved unexpected edge %q", id)
+			}
+			return []string{"edge-label"}, nil
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := interaction.Expression(subgraph.Visibility); got !=
+		"edge-label&node-label" {
+		t.Fatalf("visibility = %q", got)
+	}
+	if len(subgraph.TouchedEdgeIDs) != 1 ||
+		subgraph.TouchedEdgeIDs[0] != "edge-1" {
+		t.Fatalf("touched edges = %v", subgraph.TouchedEdgeIDs)
+	}
+}

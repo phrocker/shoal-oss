@@ -31,6 +31,7 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/graph"
+	"github.com/phrocker/shoal-oss/pkg/interaction"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
@@ -38,6 +39,20 @@ import (
 type SnapshotValidator interface {
 	ValidateSnapshot(
 		context.Context, shoal.ID, time.Time, []shoal.ID,
+	) error
+}
+
+// EvidenceSnapshotValidator additionally binds exact source edges to the
+// pinned corpus frontier.
+type EvidenceSnapshotValidator interface {
+	SnapshotValidator
+	ValidateEvidenceSnapshot(
+		context.Context,
+		shoal.ID,
+		time.Time,
+		[]shoal.ID,
+		[]shoal.ID,
+		[]interaction.AssertionReference,
 	) error
 }
 

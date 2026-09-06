@@ -95,6 +95,17 @@ func (r *GraphRecorder) Record(ctx context.Context, record EvaluationRecord) err
 	if err != nil {
 		return err
 	}
+	if sink, ok := r.sink.(interaction.ResultSink); ok {
+		persisted, err := sink.RecordInteractionResult(ctx, session)
+		if err != nil {
+			return err
+		}
+		if _, err := persisted.Canonical(); err != nil {
+			return invalid(
+				"interaction sink returned an invalid persisted session")
+		}
+		return nil
+	}
 	return r.sink.RecordInteraction(ctx, session)
 }
 
@@ -156,7 +167,9 @@ func InteractionSession(
 		ResultID:      record.ResultID,
 		StopReason:    string(record.StopReason),
 		SeedNodeIDs:   record.SeedNodeIDs,
+		SeedEvidence:  record.SeedEvidence,
 		CitedNodeIDs:  record.CitedNodeIDs,
+		CitedEvidence: record.CitedEvidence,
 	}
 	for _, turn := range record.Turns {
 		mapped := interaction.Turn{
@@ -168,8 +181,9 @@ func InteractionSession(
 		}
 		if turn.ToolKind != "" {
 			mapped.ToolCall = &interaction.ToolCall{
-				Kind:             string(turn.ToolKind),
-				RetrievedNodeIDs: turn.RetrievedNodeIDs,
+				Kind:              string(turn.ToolKind),
+				RetrievedNodeIDs:  turn.RetrievedNodeIDs,
+				RetrievedEvidence: turn.RetrievedEvidence,
 			}
 		}
 		session.Turns = append(session.Turns, mapped)

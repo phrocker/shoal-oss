@@ -58,6 +58,7 @@ type InteractionRecord struct {
 	Summary        InteractionSummary
 	Session        interaction.Session
 	TouchedNodeIDs []shoal.ID
+	TouchedEdgeIDs []shoal.ID
 }
 
 type persistedInteraction struct {
@@ -193,7 +194,26 @@ func (e *Explorer) RecordInteraction(
 			"interaction session ID is already used by a fold",
 		)
 	}
-	subgraph, err := session.Subgraph(e.visibilityResolverLocked())
+	// The authorized boundary validates the pin before entering the durable
+	// writer. Repeat the exact-state check while holding the graph/write lock
+	// so a concurrent source mutation cannot race between validation,
+	// visibility materialization, and persistence. Legacy direct callers with
+	// an unregistered descriptive pin retain their existing behavior.
+	if _, trusted := e.snapshotHistory[string(session.SnapshotID)]; trusted {
+		if err := e.validateEvidenceSnapshotLocked(
+			session.SnapshotID,
+			session.SnapshotAsOf,
+			session.TouchedNodeIDs(),
+			session.TouchedEdgeIDs(),
+			session.TouchedAssertions(),
+		); err != nil {
+			return err
+		}
+	}
+	subgraph, err := session.SubgraphWithEvidence(
+		e.visibilityResolverLocked(),
+		e.edgeVisibilityResolverLocked(),
+	)
 	if err != nil {
 		return err
 	}
@@ -604,8 +624,7 @@ func (e *Explorer) Interactions(ctx context.Context) ([]InteractionSummary, erro
 	summaries := make([]InteractionSummary, 0, len(e.interactions))
 	for _, record := range e.interactions {
 		if !record.Deleted {
-			current, err := e.currentSubgraphVisibilityLocked(
-				record.Nodes, record.Edges)
+			current, err := e.currentInteractionVisibilityLocked(*record)
 			if err != nil || !visibilityCovered(record.Visibility, current) {
 				// Fail closed at read time: a live session whose evidence was
 				// reclassified to a stricter label after it was recorded is
@@ -639,8 +658,7 @@ func (e *Explorer) InteractionRecords(
 	records := make([]InteractionRecord, 0, len(e.interactions))
 	for _, stored := range e.interactions {
 		if !stored.Deleted {
-			current, err := e.currentSubgraphVisibilityLocked(
-				stored.Nodes, stored.Edges)
+			current, err := e.currentInteractionVisibilityLocked(*stored)
 			if err != nil || !visibilityCovered(stored.Visibility, current) {
 				continue
 			}
@@ -679,8 +697,7 @@ func (e *Explorer) InteractionRecord(
 			shoal.ErrorNotFound, "interaction session not found")
 	}
 	if !stored.Deleted {
-		current, err := e.currentSubgraphVisibilityLocked(
-			stored.Nodes, stored.Edges)
+		current, err := e.currentInteractionVisibilityLocked(*stored)
 		if err != nil {
 			return InteractionRecord{}, err
 		}
@@ -738,8 +755,7 @@ func (e *Explorer) InteractionSubgraph(
 			shoal.ErrorNotFound, "interaction session not found")
 	}
 	if !record.Deleted {
-		current, err := e.currentSubgraphVisibilityLocked(
-			record.Nodes, record.Edges)
+		current, err := e.currentInteractionVisibilityLocked(*record)
 		if err != nil {
 			return Neighborhood{}, err
 		}
@@ -787,6 +803,71 @@ func (e *Explorer) visibilityResolverLocked() interaction.VisibilityResolver {
 		}
 		return interaction.NodeVisibility(node)
 	}
+}
+
+// edgeVisibilityResolverLocked resolves an exact source edge to the
+// conjunction of the current declared visibility of both endpoints. Missing
+// or interaction-owned edges fail closed. Authorization wrappers additionally
+// re-evaluate the edge-local policy rule.
+func (e *Explorer) edgeVisibilityResolverLocked() interaction.VisibilityResolver {
+	resolveNode := e.visibilityResolverLocked()
+	return func(id shoal.ID) ([]string, error) {
+		edge, ok := e.graphEdges[id]
+		if !ok {
+			return nil, shoal.NewError(
+				shoal.ErrorUnavailable,
+				"interaction touched edge "+string(id)+
+					", which is no longer in the corpus graph",
+			)
+		}
+		if interaction.IsInteractionID(edge.ID) {
+			return nil, shoal.NewError(
+				shoal.ErrorUnavailable,
+				"interaction cannot treat another interaction edge as source evidence",
+			)
+		}
+		from, err := resolveNode(edge.From)
+		if err != nil {
+			return nil, err
+		}
+		to, err := resolveNode(edge.To)
+		if err != nil {
+			return nil, err
+		}
+		local, err := interaction.EdgeVisibility(edge)
+		if err != nil {
+			return nil, err
+		}
+		return interaction.Conjoin(from, to, local)
+	}
+}
+
+func (e *Explorer) currentInteractionVisibilityLocked(
+	record persistedInteraction,
+) (string, error) {
+	touched := interaction.TouchedNodes(record.Nodes, record.Edges)
+	nodeIDs := append(
+		append([]shoal.ID(nil), touched.RetrievedNodeIDs...),
+		touched.CitedNodeIDs...,
+	)
+	nodeVisibility, err := e.conjoinNodeVisibilityLocked(nodeIDs)
+	if err != nil {
+		return "", err
+	}
+	resolveEdge := e.edgeVisibilityResolverLocked()
+	sets := [][]string{nodeVisibility}
+	for _, edgeID := range record.Session.TouchedEdgeIDs() {
+		labels, err := resolveEdge(edgeID)
+		if err != nil {
+			return "", err
+		}
+		sets = append(sets, labels)
+	}
+	visibility, err := interaction.Conjoin(sets...)
+	if err != nil {
+		return "", err
+	}
+	return interaction.Expression(visibility), nil
 }
 
 // currentSubgraphVisibilityLocked re-derives, from the current corpus graph,
@@ -1050,7 +1131,9 @@ func cloneInteractionSession(session interaction.Session) interaction.Session {
 	cloned := session
 	cloned.Actor = cloneActorContext(session.Actor)
 	cloned.SeedNodeIDs = append([]shoal.ID(nil), session.SeedNodeIDs...)
+	cloned.SeedEvidence = cloneEvidenceReferences(session.SeedEvidence)
 	cloned.CitedNodeIDs = append([]shoal.ID(nil), session.CitedNodeIDs...)
+	cloned.CitedEvidence = cloneEvidenceReferences(session.CitedEvidence)
 	cloned.Turns = make([]interaction.Turn, len(session.Turns))
 	for index, turn := range session.Turns {
 		cloned.Turns[index] = turn
@@ -1058,8 +1141,29 @@ func cloneInteractionSession(session interaction.Session) interaction.Session {
 			call := *turn.ToolCall
 			call.RetrievedNodeIDs = append(
 				[]shoal.ID(nil), turn.ToolCall.RetrievedNodeIDs...)
+			call.RetrievedEvidence = cloneEvidenceReferences(
+				turn.ToolCall.RetrievedEvidence)
 			cloned.Turns[index].ToolCall = &call
 		}
+	}
+	return cloned
+}
+
+func cloneEvidenceReferences(
+	references []interaction.EvidenceReference,
+) []interaction.EvidenceReference {
+	if len(references) == 0 {
+		return nil
+	}
+	cloned := make([]interaction.EvidenceReference, len(references))
+	for index, reference := range references {
+		cloned[index] = reference
+		cloned[index].NodeIDs = append(
+			[]shoal.ID(nil), reference.NodeIDs...)
+		cloned[index].EdgeIDs = append(
+			[]shoal.ID(nil), reference.EdgeIDs...)
+		cloned[index].Assertions = append(
+			[]interaction.AssertionReference(nil), reference.Assertions...)
 	}
 	return cloned
 }
@@ -1098,6 +1202,7 @@ func interactionRecord(record persistedInteraction) InteractionRecord {
 		Summary:        interactionSummary(record),
 		Session:        cloneInteractionSession(record.Session),
 		TouchedNodeIDs: dedupeExplorerIDs(ids),
+		TouchedEdgeIDs: record.Session.TouchedEdgeIDs(),
 	}
 }
 

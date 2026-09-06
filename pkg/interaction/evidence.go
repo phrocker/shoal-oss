@@ -154,7 +154,8 @@ func (r EvidenceReference) Canonical() (EvidenceReference, error) {
 	})
 	for index := 1; index < len(r.Assertions); index++ {
 		if r.Assertions[index-1].AssertionID ==
-			r.Assertions[index].AssertionID {
+			r.Assertions[index].AssertionID &&
+			r.Assertions[index-1].EdgeID == r.Assertions[index].EdgeID {
 			return EvidenceReference{}, shoal.NewError(
 				shoal.ErrorInvalidArgument,
 				"interaction evidence contains duplicate assertion references")
@@ -206,6 +207,36 @@ func evidenceEdgeIDs(values []EvidenceReference) []shoal.ID {
 		ids = append(ids, value.EdgeIDs...)
 	}
 	return dedupeIDs(ids)
+}
+
+func evidenceAssertions(
+	values []EvidenceReference,
+) []AssertionReference {
+	var references []AssertionReference
+	for _, value := range values {
+		references = append(references, value.Assertions...)
+	}
+	sort.Slice(references, func(i, j int) bool {
+		if compared := shoal.CompareID(
+			references[i].EdgeID, references[j].EdgeID); compared != 0 {
+			return compared < 0
+		}
+		if compared := shoal.CompareID(
+			references[i].AssertionID,
+			references[j].AssertionID,
+		); compared != 0 {
+			return compared < 0
+		}
+		return references[i].Origin < references[j].Origin
+	})
+	result := references[:0]
+	for _, reference := range references {
+		if len(result) > 0 && result[len(result)-1] == reference {
+			continue
+		}
+		result = append(result, reference)
+	}
+	return result
 }
 
 func evidenceReferencesEqual(left, right EvidenceReference) bool {

@@ -29,6 +29,7 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/explorer/authorized"
+	"github.com/phrocker/shoal-oss/pkg/graph"
 	"github.com/phrocker/shoal-oss/pkg/interaction"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
@@ -65,6 +66,23 @@ func (b *forgedResultInteractionBase) RecordInteractionResult(
 type countingInteractionStore struct {
 	authorized.PolicyStore
 	nodesCalls int
+}
+
+type edgeHidingInteractionStore struct {
+	authorized.PolicyStore
+	hidden shoal.ID
+}
+
+func (s edgeHidingInteractionStore) Edges(
+	ctx context.Context,
+	ids []shoal.ID,
+) (map[shoal.ID]authorized.EdgeRegistration, error) {
+	result, err := s.PolicyStore.Edges(ctx, ids)
+	if err != nil {
+		return nil, err
+	}
+	delete(result, s.hidden)
+	return result, nil
 }
 
 func (s *countingInteractionStore) Nodes(
@@ -116,6 +134,7 @@ func TestAuthorizedInteractionRecorderAndViews(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	snapshot, err := f.base.Snapshot(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -211,6 +230,104 @@ func TestAuthorizedInteractionRecorderAndViews(t *testing.T) {
 		ctx, session.ID,
 	); !shoal.IsErrorCode(err, shoal.ErrorNotFound) {
 		t.Fatalf("revoked source left interaction readable: %v", err)
+	}
+}
+
+func TestAuthorizedInteractionReauthorizesExactSourceEdge(t *testing.T) {
+	f := newFixture(t)
+	receipt, err := f.clientA.Ingest(f.admin(t), explorer.Source{
+		URI:       "file:///authorized-edge-interaction.txt",
+		MediaType: explorer.MediaTypeText,
+		Content:   "authorized edge interaction evidence",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	view, err := f.clientA.Document(
+		f.admin(t), receipt.Document.ID, receipt.Revision.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	edge := graph.Edge{
+		ID:     "application-evidence-edge",
+		From:   receipt.Document.ID,
+		To:     firstSpanID(t, view),
+		Type:   "supports",
+		Weight: 1,
+	}
+	if err := f.clientA.Connect(f.admin(t), edge); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := f.base.Snapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.clock.Set(snapshot.AsOf.Add(time.Second))
+	decision := f.decision(
+		t, "edge-recorder", [][]byte{f.sourceA}, [][]byte{f.policyA},
+		[]auth.Operation{
+			auth.OperationRead,
+			auth.OperationRetrieve,
+			auth.OperationValidate,
+		},
+	)
+	ctx := f.context(t, decision)
+	fingerprint, err := auth.AuthorizationFingerprint(decision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := interaction.Session{
+		ID:                       interaction.DerivedID("session", "authorized-edge"),
+		RecordedAt:               f.clock.Now(),
+		Operation:                interaction.OperationRetrieval,
+		SnapshotID:               shoal.ID(snapshot.ID),
+		SnapshotAsOf:             snapshot.AsOf,
+		AuthorizationFingerprint: shoal.ID(fingerprint.String()),
+		AuthorizationExpiresAt:   decision.AuthenticationExpires(),
+		SeedNodeIDs:              []shoal.ID{edge.From, edge.To},
+		SeedEvidence: []interaction.EvidenceReference{{
+			AnchorID: "edge-anchor",
+			Kind:     interaction.EvidenceGraph,
+			NodeIDs:  []shoal.ID{edge.From, edge.To},
+			EdgeIDs:  []shoal.ID{edge.ID},
+		}},
+	}
+	if err := f.clientA.RecordInteraction(ctx, session); err != nil {
+		t.Fatal(err)
+	}
+	record, err := f.clientA.InteractionRecord(ctx, session.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(record.TouchedEdgeIDs) != 1 ||
+		record.TouchedEdgeIDs[0] != edge.ID {
+		t.Fatalf("touched edges = %v", record.TouchedEdgeIDs)
+	}
+
+	revoked := f.newClient(
+		t, f.base,
+		edgeHidingInteractionStore{
+			PolicyStore: f.store,
+			hidden:      edge.ID,
+		},
+		f.sourceA, f.policyA, nil,
+	)
+	if _, err := revoked.Interaction(
+		ctx, session.ID,
+	); !shoal.IsErrorCode(err, shoal.ErrorNotFound) {
+		t.Fatalf("revoked edge left interaction readable: %v", err)
+	}
+	rejected := session
+	rejected.ID = interaction.DerivedID("session", "revoked-edge-write")
+	if err := revoked.RecordInteraction(ctx, rejected); !shoal.IsErrorCode(
+		err, shoal.ErrorNotFound,
+	) {
+		t.Fatalf("revoked edge recording error = %v", err)
+	}
+	if _, err := f.base.InteractionRecord(
+		context.Background(), rejected.ID,
+	); !shoal.IsErrorCode(err, shoal.ErrorNotFound) {
+		t.Fatalf("revoked edge recording persisted a record: %v", err)
 	}
 }
 
