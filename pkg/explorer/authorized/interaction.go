@@ -75,16 +75,17 @@ func (c *Client) recordInteraction(
 	if err != nil {
 		return interaction.Session{}, err
 	}
-	canonical, err := session.Canonical()
-	if err != nil {
-		return interaction.Session{}, err
-	}
 	decision, guard, now, err := c.begin(ctx, auth.OperationRetrieve)
 	if err != nil {
 		return interaction.Session{}, err
 	}
-	if !interactionPinMatchesDecision(canonical, decision, now) {
+	session.RecordedAt = now.UTC()
+	if !interactionPinMatchesDecision(session, decision, now) {
 		return interaction.Session{}, authorizationDenied()
+	}
+	canonical, err := session.Canonical()
+	if err != nil {
+		return interaction.Session{}, err
 	}
 	canonical.Actor = interaction.ActorContext{
 		SubjectID:  decision.Subject(),
@@ -128,8 +129,10 @@ func (c *Client) recordInteraction(
 			)
 		}
 		existingCanonical, canonicalErr := existing.Session.Canonical()
+		retryCanonical := canonical
+		retryCanonical.RecordedAt = existingCanonical.RecordedAt
 		if canonicalErr != nil ||
-			!reflect.DeepEqual(existingCanonical, canonical) {
+			!reflect.DeepEqual(existingCanonical, retryCanonical) {
 			return interaction.Session{}, shoal.NewError(
 				shoal.ErrorConflict,
 				"interaction session ID already exists with different content",

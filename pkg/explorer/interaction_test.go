@@ -692,6 +692,58 @@ func TestRecordInteractionExactRetryIsIdempotent(t *testing.T) {
 	}
 }
 
+func TestRecorderExactRetryReplaysAcceptedTimestamp(t *testing.T) {
+	ctx := context.Background()
+	corpus, err := explorer.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer corpus.Close()
+	recorder, err := interaction.NewRecorder(ctx, corpus)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstTime := time.Unix(1700000000, 0).UTC()
+	current := firstTime
+	if err := recorder.SetClock(func() time.Time { return current }); err != nil {
+		t.Fatal(err)
+	}
+	session := interaction.Session{
+		ID:         interaction.DerivedID("session", "trusted-time-retry"),
+		RecordedAt: firstTime.Add(-24 * time.Hour),
+		Operation:  interaction.OperationToolCall,
+		Turns: []interaction.Turn{{
+			Index: 0, Decision: "tool_call",
+			ToolCall: &interaction.ToolCall{Kind: "registry_create"},
+		}},
+	}
+	first, err := recorder.Record(ctx, session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !first.RecordedAt.Equal(firstTime) {
+		t.Fatalf("first accepted time = %v", first.RecordedAt)
+	}
+	current = firstTime.Add(time.Minute)
+	session.RecordedAt = firstTime.Add(24 * time.Hour)
+	retried, err := recorder.Record(ctx, session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !retried.RecordedAt.Equal(firstTime) {
+		t.Fatalf("retry minted time %v, want %v",
+			retried.RecordedAt, firstTime)
+	}
+	records, err := corpus.InteractionRecords(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 1 ||
+		!records[0].Session.RecordedAt.Equal(firstTime) {
+		t.Fatalf("durable retry records = %+v", records)
+	}
+}
+
 func TestOversizedVisibilityPersistsAcrossRestart(t *testing.T) {
 	ctx := context.Background()
 	dataDir := t.TempDir()

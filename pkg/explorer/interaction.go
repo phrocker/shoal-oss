@@ -448,7 +448,9 @@ func interactionRetryResult(
 		)
 	}
 	existingCanonical, err := existing.Session.Canonical()
-	if err == nil && reflect.DeepEqual(existingCanonical, session) {
+	retryCanonical := session
+	retryCanonical.RecordedAt = existingCanonical.RecordedAt
+	if err == nil && reflect.DeepEqual(existingCanonical, retryCanonical) {
 		return nil
 	}
 	return shoal.NewError(
@@ -498,7 +500,18 @@ func (e *Explorer) RecordInteractionResult(
 	if err := e.RecordInteraction(ctx, canonical); err != nil {
 		return interaction.Session{}, err
 	}
-	return cloneInteractionSession(canonical), nil
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	record, ok := e.interactions[canonical.ID]
+	if !ok || record.Deleted || record.Session.ID == "" {
+		return interaction.Session{}, MarkCommittedInteraction(
+			shoal.NewError(
+				shoal.ErrorUnavailable,
+				"persisted interaction result is unavailable",
+			),
+		)
+	}
+	return cloneInteractionSession(record.Session), nil
 }
 
 // DeleteInteraction removes one interaction session's nodes and edges and

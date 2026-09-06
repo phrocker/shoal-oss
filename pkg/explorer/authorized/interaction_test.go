@@ -608,7 +608,8 @@ func TestAuthorizedExactRetryUsesTrustedDurableRecord(t *testing.T) {
 	}
 	session := interaction.Session{
 		ID:         interaction.DerivedID("session", "authorized-retry"),
-		RecordedAt: f.clock.Now(), Operation: interaction.OperationRetrieval,
+		RecordedAt: snapshot.AsOf.Add(-time.Hour),
+		Operation:  interaction.OperationRetrieval,
 		SnapshotID: shoal.ID(snapshot.ID), SnapshotAsOf: snapshot.AsOf,
 		AuthorizationFingerprint: shoal.ID(fingerprint.String()),
 		AuthorizationExpiresAt:   decision.AuthenticationExpires(),
@@ -617,6 +618,9 @@ func TestAuthorizedExactRetryUsesTrustedDurableRecord(t *testing.T) {
 	first, err := f.clientA.RecordInteractionResult(ctx, session)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if !first.RecordedAt.Equal(f.clock.Now()) {
+		t.Fatalf("accepted caller timestamp %v", first.RecordedAt)
 	}
 	selector, err := authorized.NewStaticPolicySelector(f.sourceA, f.policyA)
 	if err != nil {
@@ -633,6 +637,8 @@ func TestAuthorizedExactRetryUsesTrustedDurableRecord(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	f.clock.Set(f.clock.Now().Add(time.Second))
+	session.RecordedAt = snapshot.AsOf.Add(24 * time.Hour)
 	retried, err := retryClient.RecordInteractionResult(ctx, session)
 	if err != nil {
 		t.Fatalf("exact durable retry was rejected: %v", err)
