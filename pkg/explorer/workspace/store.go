@@ -47,7 +47,7 @@ const (
 	settingsTable    = "_shoal_workspace_settings"
 	settingsCF       = "settings"
 	settingsCQ       = "v1"
-	settingsLockFile = ".shoal-workspace-settings.lock"
+	settingsLockFile = ".shoal-explorer-runtime.lock"
 
 	settingsRecordMagic     = "SHOALWS1"
 	settingsEnvelopeVersion = byte(1)

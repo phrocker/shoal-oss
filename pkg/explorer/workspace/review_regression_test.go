@@ -747,6 +747,29 @@ func TestReviewSettingsRejectConcurrentDirectoryOpen(t *testing.T) {
 	}
 }
 
+func TestReviewSettingsRejectExplorerRuntimeDirectory(t *testing.T) {
+	directory := t.TempDir()
+	runtime, err := explorer.Open(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := OpenDurableStore(directory); !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
+		t.Fatalf("expected unavailable while explorer runtime owns directory, got %v", err)
+	}
+	if err := runtime.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err := OpenDurableStore(directory)
+	if err != nil {
+		t.Fatalf("open settings store after explorer runtime close: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestReviewSettingsStoreRejectsPathAliasAndReopensAfterClose(t *testing.T) {
 	root := t.TempDir()
 	directory := filepath.Join(root, "settings")
