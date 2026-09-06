@@ -66,6 +66,12 @@ func (c *Client) AnalyticsInteractionSink() interaction.ResultSink {
 	if _, err := c.interactionWriter(); err != nil {
 		return nil
 	}
+	bounded, boundedOK := c.base.(explorer.BoundedClient)
+	verifier, verifierOK := c.base.(explorer.InteractionEvidenceVerifier)
+	if !boundedOK || isNilDependency(bounded) ||
+		!verifierOK || isNilDependency(verifier) {
+		return nil
+	}
 	return operationInteractionSink{
 		client: c, operation: auth.OperationAnalyticsRead,
 	}
