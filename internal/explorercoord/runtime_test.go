@@ -131,7 +131,7 @@ func TestIntentStoreCanonicalReplayPagingAndDigestMutation(t *testing.T) {
 		t.Fatal(err)
 	}
 	var txns []coordination.TXN
-	for index := 0; index < 5; index++ {
+	for index := 0; index < 24; index++ {
 		intent := testIntent(
 			t, domain, "create", fmt.Sprintf("token-%d", index),
 			fmt.Sprintf("value-%d", index), guard.ModeAbsentOrIdentical, 0, coordination.Digest{},
@@ -421,7 +421,7 @@ func TestRecoveryPageBoundIgnoresCompletedHistory(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for index := 0; index < 5; index++ {
+	for index := 0; index < 24; index++ {
 		row := []byte(fmt.Sprintf("history/%d", index))
 		intent := committedReadIntent(
 			t, config.Domain, fmt.Sprintf("history-%d", index),
@@ -448,7 +448,7 @@ func TestRecoveryPageBoundIgnoresCompletedHistory(t *testing.T) {
 	}
 	defer reopened.Close()
 	head, err := reopened.CurrentHead(context.Background())
-	if err != nil || head.Frontier != 5 {
+	if err != nil || head.Frontier != 24 {
 		t.Fatalf("reopened completed frontier = %#v, %v", head, err)
 	}
 }
