@@ -887,6 +887,71 @@ func (e *Explorer) lookupPersistedInteraction(
 	return record, true, nil
 }
 
+func (e *Explorer) lookupPersistedLiveInteraction(
+	sessionID shoal.ID,
+) (persistedInteraction, bool, error) {
+	var live persistedInteraction
+	found := false
+	var decodeErr error
+	row := interactionRecordRow(sessionID)
+	err := e.engine.LookupRows(
+		explorerTable,
+		[][]byte{append([]byte(nil), row...)},
+		engine.ScanOptions{
+			ColumnFamilies:          [][]byte{[]byte(recordCF)},
+			ColumnFamiliesInclusive: true,
+		},
+		func(_ int, key *iterrt.Key, value []byte) {
+			if decodeErr != nil ||
+				!bytes.Equal(key.ColumnQualifier, []byte(recordCQV2)) {
+				return
+			}
+			var candidate persistedInteraction
+			if err := decodeEmbeddedRecord(
+				value, embeddedRecordInteraction, &candidate,
+			); err != nil {
+				decodeErr = err
+				return
+			}
+			if err := validatePersistedInteraction(candidate); err != nil {
+				decodeErr = err
+				return
+			}
+			if candidate.SessionID != sessionID ||
+				!bytes.Equal(row, interactionRecordRow(candidate.SessionID)) {
+				decodeErr = errors.New(
+					"stored explorer interaction row is invalid")
+				return
+			}
+			if candidate.Deleted {
+				return
+			}
+			if found && !persistedInteractionsEqual(live, candidate) {
+				decodeErr = errors.New(
+					"stored interaction session has conflicting live versions")
+				return
+			}
+			live = candidate
+			found = true
+		},
+	)
+	if err != nil {
+		return persistedInteraction{}, false, shoal.WrapError(
+			shoal.ErrorUnavailable,
+			"read historical interaction record",
+			err,
+		)
+	}
+	if decodeErr != nil {
+		return persistedInteraction{}, false, shoal.WrapError(
+			shoal.ErrorInternal,
+			"stored historical interaction is invalid",
+			decodeErr,
+		)
+	}
+	return live, found, nil
+}
+
 func (e *Explorer) lookupPersistedFold(
 	foldID shoal.ID,
 ) (persistedFold, bool, error) {

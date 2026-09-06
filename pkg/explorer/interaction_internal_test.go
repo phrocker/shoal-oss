@@ -439,6 +439,124 @@ func TestFoldRetryAdoptsCommittedRecord(t *testing.T) {
 	}
 }
 
+func TestFoldRetryAdoptsCommittedRecordAfterSourceChange(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		change func(*testing.T, *Explorer, Source, shoal.ID)
+	}{
+		{
+			name: "visibility reclassification",
+			change: func(
+				t *testing.T, corpus *Explorer, source Source, _ shoal.ID,
+			) {
+				source.Metadata = shoal.Metadata{
+					interaction.PropertyVisibility: "restricted",
+				}
+				if _, err := corpus.Ingest(
+					context.Background(), source); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "member deletion",
+			change: func(
+				t *testing.T, corpus *Explorer, _ Source, sessionID shoal.ID,
+			) {
+				if _, err := corpus.DeleteInteraction(
+					context.Background(), sessionID); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			corpus, err := Open(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer corpus.Close()
+			source := Source{
+				URI:       "file:///fold-retry-source.txt",
+				MediaType: MediaTypeText,
+				Content:   "stable fold source",
+				Metadata: shoal.Metadata{
+					interaction.PropertyVisibility: "open",
+				},
+			}
+			receipt, err := corpus.Ingest(ctx, source)
+			if err != nil {
+				t.Fatal(err)
+			}
+			view, err := corpus.Document(
+				ctx, receipt.Document.ID, receipt.Revision.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			session := interaction.Session{
+				ID: interaction.DerivedID(
+					"session", "fold-source-change", test.name),
+				RecordedAt:  time.Unix(1700000000, 0).UTC(),
+				Operation:   interaction.OperationRetrieval,
+				SeedNodeIDs: []shoal.ID{view.Root.Spans[0].ID},
+			}
+			if err := corpus.RecordInteraction(ctx, session); err != nil {
+				t.Fatal(err)
+			}
+			summaryDigest := interaction.Digest(
+				"fold source change " + test.name)
+			fold := interaction.Fold{
+				Members: []interaction.FoldMember{{
+					SessionID: session.ID,
+					RetrievedNodeIDs: []shoal.ID{
+						view.Root.Spans[0].ID,
+					},
+					Visibility: []string{"open"},
+				}},
+				SummaryDigest: summaryDigest,
+				FoldedAt:      time.Unix(1700000100, 0).UTC(),
+			}
+			subgraph, err := fold.Subgraph(
+				corpus.visibilityResolverLocked())
+			if err != nil {
+				t.Fatal(err)
+			}
+			canonical, err := fold.Canonical()
+			if err != nil {
+				t.Fatal(err)
+			}
+			record := persistedFold{
+				FoldID: subgraph.ID, Members: canonical.Members,
+				SummaryDigest: canonical.SummaryDigest,
+				Nodes:         subgraph.Nodes, Edges: subgraph.Edges,
+				Visibility: interaction.Expression(subgraph.Visibility),
+				FoldedAt:   fold.FoldedAt,
+			}
+			if err := corpus.writeRecord(
+				foldRecordRow(record.FoldID),
+				embeddedRecordFold,
+				record,
+			); err != nil {
+				t.Fatal(err)
+			}
+			test.change(t, corpus, source, session.ID)
+			result, err := corpus.FoldInteractions(ctx, FoldRequest{
+				SessionIDs:    []shoal.ID{session.ID},
+				SummaryDigest: summaryDigest,
+			})
+			if err != nil {
+				t.Fatalf("committed fold retry was not adopted: %v", err)
+			}
+			if result.Created ||
+				!result.FoldedAt.Equal(record.FoldedAt) ||
+				result.Visibility != record.Visibility {
+				t.Fatalf("reconciled fold result = %+v", result)
+			}
+		})
+	}
+}
+
 func TestDeleteRetryAdoptsCommittedTombstone(t *testing.T) {
 	ctx := context.Background()
 	corpus, err := Open(t.TempDir())
