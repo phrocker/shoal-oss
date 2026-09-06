@@ -228,11 +228,18 @@ func (c *Client) recordInteraction(
 		persisted = returned
 	}
 	if err := guard.Check(ctx); err != nil {
+		if operation == auth.OperationAnalyticsRead {
+			return persisted, explorer.MarkIndeterminateCommit(err)
+		}
 		return persisted, explorer.MarkCommittedInteraction(err)
 	}
 	deliveredAt := c.clock().UTC()
 	if deliveredAt.IsZero() ||
 		!interactionPinMatchesDecision(persisted, decision, deliveredAt) {
+		if operation == auth.OperationAnalyticsRead {
+			return persisted, explorer.MarkIndeterminateCommit(
+				authorizationDenied())
+		}
 		return persisted, explorer.MarkCommittedInteraction(
 			authorizationDenied())
 	}

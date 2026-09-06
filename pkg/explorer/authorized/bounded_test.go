@@ -671,6 +671,8 @@ func (b *pagedBoundedBase) InterpretAssertions(
 		result = append(result, ontology.ReadAssertionUnder(assertion, selected))
 	}
 	return result, nil
+}
+
 func (b *pagedBoundedBase) Retrieve(context.Context, retrieval.Request) (retrieval.Response, error) {
 	return retrieval.Response{}, nil
 }
