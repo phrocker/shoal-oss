@@ -31,8 +31,30 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/graph"
+	"github.com/phrocker/shoal-oss/pkg/interaction"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
+
+// SnapshotValidator verifies corpus frontiers pinned into interaction records.
+type SnapshotValidator interface {
+	ValidateSnapshot(
+		context.Context, shoal.ID, time.Time, []shoal.ID,
+	) error
+}
+
+// EvidenceSnapshotValidator additionally binds exact source edges to the
+// pinned corpus frontier.
+type EvidenceSnapshotValidator interface {
+	SnapshotValidator
+	ValidateEvidenceSnapshot(
+		context.Context,
+		shoal.ID,
+		time.Time,
+		[]shoal.ID,
+		[]shoal.ID,
+		[]interaction.AssertionReference,
+	) error
+}
 
 // Config supplies the trusted dependencies for an authorization-enforcing
 // Explorer client.
@@ -42,11 +64,18 @@ type Config struct {
 	// vector retrieval validation. It is intentionally separate from Base:
 	// Base responses are treated as untrusted and validated canonically.
 	VectorScorer VectorScorer
+	// InteractionWriter is the explicitly trusted durable sink for
+	// interaction records. It is separate from Base because Base responses
+	// and mutation acknowledgements are not authorization evidence.
+	InteractionWriter explorer.InteractionWriter
 	// InteractionReader is the explicitly trusted source for durable
 	// interaction envelopes. It is intentionally separate from Base because
 	// authorization decisions for derived views depend on the stored source
 	// set and authorization fingerprint.
 	InteractionReader explorer.InteractionReader
+	// SnapshotValidator is the explicitly trusted verifier for historical
+	// corpus frontiers pinned into interaction records.
+	SnapshotValidator SnapshotValidator
 	// OntologyInterpreter is an optional explicitly trusted read-time
 	// interpreter. It is separate from Base because Base graph responses are
 	// untrusted and must never be allowed to inject interpretations.
@@ -69,8 +98,9 @@ type Config struct {
 type Client struct {
 	base                explorer.Client
 	vectorScorer        VectorScorer
-	vectorSpaceResolver VectorEmbeddingSpaceResolver
+	interactionSink     explorer.InteractionWriter
 	interactionSource   explorer.InteractionReader
+	snapshotValidator   SnapshotValidator
 	ontologyInterpreter explorer.OntologyInterpreter
 	resolver            auth.Resolver
 	policySelector      PolicySelector
@@ -113,15 +143,16 @@ func NewClient(config Config) (*Client, error) {
 	if config.Clock == nil {
 		return nil, dependencyRequired("clock")
 	}
-	var vectorSpaceResolver VectorEmbeddingSpaceResolver
-	if !isNilDependency(config.VectorScorer) {
-		var ok bool
-		vectorSpaceResolver, ok =
-			config.VectorScorer.(VectorEmbeddingSpaceResolver)
-		if !ok || isNilDependency(vectorSpaceResolver) {
-			return nil, dependencyRequired(
-				"trusted vector embedding provenance")
-		}
+	hasInteractionWriter := !isNilDependency(config.InteractionWriter)
+	hasInteractionReader := !isNilDependency(config.InteractionReader)
+	hasSnapshotValidator := !isNilDependency(config.SnapshotValidator)
+	if hasInteractionWriter &&
+		(!hasInteractionReader || !hasSnapshotValidator) {
+		return nil, dependencyRequired(
+			"trusted interaction writer, reader, and snapshot validator")
+	}
+	if hasSnapshotValidator && !hasInteractionWriter {
+		return nil, dependencyRequired("trusted interaction writer")
 	}
 	edgeSelector := config.EdgePolicySelector
 	if isNilDependency(edgeSelector) {
@@ -145,8 +176,9 @@ func NewClient(config Config) (*Client, error) {
 	return &Client{
 		base:                config.Base,
 		vectorScorer:        config.VectorScorer,
-		vectorSpaceResolver: vectorSpaceResolver,
+		interactionSink:     config.InteractionWriter,
 		interactionSource:   config.InteractionReader,
+		snapshotValidator:   config.SnapshotValidator,
 		ontologyInterpreter: config.OntologyInterpreter,
 		resolver:            config.Resolver,
 		policySelector:      config.PolicySelector,

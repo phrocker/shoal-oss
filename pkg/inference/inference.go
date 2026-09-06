@@ -32,6 +32,7 @@ import (
 
 	"github.com/phrocker/shoal-oss/pkg/document"
 	"github.com/phrocker/shoal-oss/pkg/graph"
+	"github.com/phrocker/shoal-oss/pkg/interaction"
 	"github.com/phrocker/shoal-oss/pkg/ontology"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
@@ -66,11 +67,12 @@ const (
 // EvidenceAnchor is one immutable, exact evidence location. Exactly one of a
 // document citation or graph path is present.
 type EvidenceAnchor struct {
-	id       shoal.ID
-	kind     AnchorKind
-	citation document.Citation
-	quote    string
-	path     graph.Path
+	id         shoal.ID
+	kind       AnchorKind
+	citation   document.Citation
+	quote      string
+	path       graph.Path
+	assertions []interaction.AssertionReference
 }
 
 // NewDocumentAnchor creates an exact citation-backed anchor. Quote bytes must
@@ -92,6 +94,15 @@ func NewDocumentAnchor(citation document.Citation, quote string) (EvidenceAnchor
 // NewGraphAnchor creates a graph-native anchor without a placeholder
 // document citation.
 func NewGraphAnchor(path graph.Path) (EvidenceAnchor, error) {
+	return NewGraphAnchorWithAssertions(path, nil)
+}
+
+// NewGraphAnchorWithAssertions creates a graph-native anchor carrying the
+// authoritative ontology assertions that materialize edges in the path.
+func NewGraphAnchorWithAssertions(
+	path graph.Path,
+	assertions []interaction.AssertionReference,
+) (EvidenceAnchor, error) {
 	if len(path.Nodes) > MaxPathNodes || len(path.Edges) > MaxPathEdges {
 		return EvidenceAnchor{}, invalid(
 			"graph evidence path exceeds the public count bound")
@@ -99,9 +110,14 @@ func NewGraphAnchor(path graph.Path) (EvidenceAnchor, error) {
 	if err := path.Validate(); err != nil {
 		return EvidenceAnchor{}, err
 	}
+	canonicalAssertions, err := canonicalAnchorAssertions(path, assertions)
+	if err != nil {
+		return EvidenceAnchor{}, err
+	}
 	anchor := EvidenceAnchor{
-		kind: AnchorGraph,
-		path: canonicalizePath(path),
+		kind:       AnchorGraph,
+		path:       canonicalizePath(path),
+		assertions: canonicalAssertions,
 	}
 	id, err := anchorID(anchor)
 	if err != nil {
@@ -141,8 +157,41 @@ func (a EvidenceAnchor) Path() (graph.Path, bool) {
 	return clonePath(a.path), a.kind == AnchorGraph
 }
 
+// EvidenceReference returns the redacted exact identity recorded for this
+// anchor. It never includes a document quote.
+func (a EvidenceAnchor) EvidenceReference() (interaction.EvidenceReference, error) {
+	if err := a.Validate(); err != nil {
+		return interaction.EvidenceReference{}, err
+	}
+	reference := interaction.EvidenceReference{
+		AnchorID: a.id,
+	}
+	switch a.kind {
+	case AnchorDocument:
+		reference.Kind = interaction.EvidenceDocument
+		reference.Citation = a.citation
+		reference.NodeIDs = evidenceCitationNodeIDs(a.citation)
+	case AnchorGraph:
+		reference.Kind = interaction.EvidenceGraph
+		reference.Assertions = append(
+			[]interaction.AssertionReference(nil), a.assertions...)
+		for _, node := range a.path.Nodes {
+			reference.NodeIDs = append(reference.NodeIDs, node.ID)
+		}
+		for _, edge := range a.path.Edges {
+			reference.EdgeIDs = append(reference.EdgeIDs, edge.ID)
+		}
+	default:
+		return interaction.EvidenceReference{}, invalid(
+			"evidence anchor requires exactly one variant")
+	}
+	return reference.Canonical()
+}
+
 func (a EvidenceAnchor) clone() EvidenceAnchor {
 	a.path = clonePath(a.path)
+	a.assertions = append(
+		[]interaction.AssertionReference(nil), a.assertions...)
 	return a
 }
 
@@ -181,14 +230,108 @@ func anchorID(anchor EvidenceAnchor) (shoal.ID, error) {
 		if err := validatePath(anchor.path); err != nil {
 			return "", err
 		}
-		return deriveID(
-			"evidence-anchor",
+		assertions, err := canonicalAnchorAssertions(
+			anchor.path, anchor.assertions)
+		if err != nil {
+			return "", err
+		}
+		parts := []string{
 			string(AnchorGraph),
 			canonicalPath(anchor.path),
-		), nil
+		}
+		if len(assertions) > 0 {
+			parts = append(
+				parts, canonicalAnchorAssertionReferences(assertions))
+		}
+		return deriveID("evidence-anchor", parts...), nil
 	default:
 		return "", invalid("evidence anchor requires exactly one variant")
 	}
+}
+
+func canonicalAnchorAssertions(
+	path graph.Path,
+	assertions []interaction.AssertionReference,
+) ([]interaction.AssertionReference, error) {
+	edgeIDs := make(map[shoal.ID]struct{}, len(path.Edges))
+	for _, edge := range path.Edges {
+		edgeIDs[edge.ID] = struct{}{}
+	}
+	result := append([]interaction.AssertionReference(nil), assertions...)
+	sort.Slice(result, func(i, j int) bool {
+		if compared := shoal.CompareID(
+			result[i].EdgeID, result[j].EdgeID); compared != 0 {
+			return compared < 0
+		}
+		if compared := shoal.CompareID(
+			result[i].AssertionID, result[j].AssertionID); compared != 0 {
+			return compared < 0
+		}
+		return result[i].Origin < result[j].Origin
+	})
+	for index, reference := range result {
+		if err := shoal.ValidateRequiredID(
+			"evidence assertion ID", reference.AssertionID); err != nil {
+			return nil, err
+		}
+		if err := shoal.ValidateRequiredID(
+			"evidence assertion edge ID", reference.EdgeID); err != nil {
+			return nil, err
+		}
+		if _, ok := edgeIDs[reference.EdgeID]; !ok {
+			return nil, invalid(
+				"evidence assertion does not name an edge in the graph path")
+		}
+		switch reference.Origin {
+		case ontology.AssertionExplicit,
+			ontology.AssertionInferred,
+			ontology.AssertionDerived:
+		default:
+			return nil, invalid("evidence assertion origin is invalid")
+		}
+		if index > 0 &&
+			result[index-1].AssertionID == reference.AssertionID &&
+			result[index-1].EdgeID == reference.EdgeID {
+			return nil, invalid(
+				"graph evidence contains duplicate assertion references")
+		}
+	}
+	return result, nil
+}
+
+func canonicalAnchorAssertionReferences(
+	assertions []interaction.AssertionReference,
+) string {
+	parts := make([]string, len(assertions))
+	for index, assertion := range assertions {
+		parts[index] = canonicalParts(
+			string(assertion.AssertionID),
+			string(assertion.EdgeID),
+			string(assertion.Origin),
+		)
+	}
+	return canonicalParts(parts...)
+}
+
+func evidenceCitationNodeIDs(citation document.Citation) []shoal.ID {
+	seen := make(map[shoal.ID]struct{}, 3)
+	var result []shoal.ID
+	for _, id := range []shoal.ID{
+		citation.DocumentID, citation.SectionID, citation.SpanID,
+	} {
+		if id == "" {
+			continue
+		}
+		if _, duplicate := seen[id]; duplicate {
+			continue
+		}
+		seen[id] = struct{}{}
+		result = append(result, id)
+	}
+	sort.Slice(result, func(i, j int) bool {
+		return shoal.CompareID(result[i], result[j]) < 0
+	})
+	return result
 }
 
 // OntologyIdentity identifies an immutable ontology schema snapshot without

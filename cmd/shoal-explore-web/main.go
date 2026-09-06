@@ -859,6 +859,9 @@ func authorizedClient(
 	return authorized.NewClient(authorized.Config{
 		Base:                corpus,
 		VectorScorer:        scorer,
+		InteractionWriter:   corpus,
+		InteractionReader:   corpus,
+		SnapshotValidator:   corpus,
 		OntologyInterpreter: corpus,
 		Resolver:            resolver,
 		PolicySelector:      selector,

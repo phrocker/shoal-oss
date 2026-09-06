@@ -51,7 +51,7 @@ func TestInteractionWriteResolvesCommittedIndeterminateOutcome(t *testing.T) {
 	}
 	spanID := view.Root.Spans[0].ID
 	session := interaction.Session{
-		ID:                       "session-indeterminate-committed",
+		ID:                       "interaction.session_indeterminate-committed",
 		RecordedAt:               time.Unix(1700000000, 0).UTC(),
 		SnapshotID:               "snapshot",
 		SnapshotAsOf:             time.Unix(1699999990, 0).UTC(),
@@ -59,7 +59,7 @@ func TestInteractionWriteResolvesCommittedIndeterminateOutcome(t *testing.T) {
 		AuthorizationExpiresAt:   time.Unix(1700003600, 0).UTC(),
 		SeedNodeIDs:              []shoal.ID{spanID},
 	}
-	write := corpus.interactionRecordWriter
+	write := corpus.writeRecord
 	corpus.interactionRecordWriter = func(
 		row []byte, kind byte, value any,
 	) error {
@@ -73,25 +73,6 @@ func TestInteractionWriteResolvesCommittedIndeterminateOutcome(t *testing.T) {
 	}
 	if _, err := corpus.Interaction(ctx, session.ID); err != nil {
 		t.Fatalf("reconciled interaction is not hydrated: %v", err)
-	}
-}
-
-func TestVerifyInteractionEvidenceRejectsMissingZeroValues(t *testing.T) {
-	corpus, err := Open(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer corpus.Close()
-	ctx := context.Background()
-	if err := corpus.VerifyInteractionEvidence(
-		ctx, []graph.Node{{}}, nil, nil,
-	); !shoal.IsErrorCode(err, shoal.ErrorNotFound) {
-		t.Fatalf("missing zero node evidence = %v", err)
-	}
-	if err := corpus.VerifyInteractionEvidence(
-		ctx, nil, []graph.Edge{{}}, nil,
-	); !shoal.IsErrorCode(err, shoal.ErrorNotFound) {
-		t.Fatalf("missing zero edge evidence = %v", err)
 	}
 }
 
@@ -116,7 +97,7 @@ func TestInteractionWritePreservesUnresolvedIndeterminateOutcome(t *testing.T) {
 		t.Fatal(err)
 	}
 	session := interaction.Session{
-		ID:                       "session-indeterminate-absent",
+		ID:                       "interaction.session_indeterminate-absent",
 		RecordedAt:               time.Unix(1700000000, 0).UTC(),
 		SnapshotID:               "snapshot",
 		SnapshotAsOf:             time.Unix(1699999990, 0).UTC(),
@@ -278,5 +259,136 @@ func TestDeleteRetryAdoptsCommittedTombstone(t *testing.T) {
 	if got := corpus.interactions[session.ID]; !got.Deleted ||
 		!got.DeletedAt.Equal(deletedAt) {
 		t.Fatalf("committed tombstone was not adopted: %+v", got)
+	}
+}
+
+func TestFoldLoadRejectsConflictingLiveVersions(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	corpus, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := interaction.Session{
+		ID:         interaction.DerivedID("session", "fold-live-conflict"),
+		RecordedAt: time.Unix(1700000000, 0).UTC(),
+		Operation:  interaction.OperationRetrieval,
+	}
+	if err := corpus.RecordInteraction(ctx, session); err != nil {
+		t.Fatal(err)
+	}
+	result, err := corpus.FoldInteractions(ctx, FoldRequest{
+		SessionIDs:    []shoal.ID{session.ID},
+		SummaryDigest: interaction.Digest("conflicting fold"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	conflicting := *corpus.folds[result.FoldID]
+	conflicting.FoldedAt = conflicting.FoldedAt.Add(time.Second)
+	if err := validatePersistedFold(conflicting); err != nil {
+		t.Fatal(err)
+	}
+	if err := corpus.writeRecord(
+		foldRecordRow(result.FoldID), embeddedRecordFold, conflicting,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := corpus.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if reopened, err := Open(dir); err == nil {
+		_ = reopened.Close()
+		t.Fatal("conflicting durable live fold versions were accepted")
+	}
+}
+
+func TestExactReadbackChecksOnlyCurrentVersion(t *testing.T) {
+	corpus, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer corpus.Close()
+	older := persistedInteractionSink{
+		CheckedAt: time.Unix(1700000000, 0).UTC(),
+	}
+	expected, err := encodeEmbeddedRecord(
+		embeddedRecordInteractionSink, older)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := corpus.writeRecord(
+		interactionSinkRow, embeddedRecordInteractionSink, older,
+	); err != nil {
+		t.Fatal(err)
+	}
+	newer := persistedInteractionSink{
+		CheckedAt: older.CheckedAt.Add(time.Second),
+	}
+	if err := corpus.writeRecord(
+		interactionSinkRow, embeddedRecordInteractionSink, newer,
+	); err != nil {
+		t.Fatal(err)
+	}
+	committed, err := corpus.hasExactRecord(interactionSinkRow, expected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if committed {
+		t.Fatal("historical matching value masked the current durable value")
+	}
+}
+
+func TestConditionalInteractionCreateKeepsOneWinner(t *testing.T) {
+	corpus, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer corpus.Close()
+	recordedAt := time.Unix(1700000000, 0).UTC()
+	build := func(stopReason string) persistedInteraction {
+		session := interaction.Session{
+			ID:         interaction.DerivedID("session", "cas-winner"),
+			RecordedAt: recordedAt, Operation: interaction.OperationRetrieval,
+			StopReason: stopReason,
+		}
+		subgraph, err := session.Subgraph(
+			func(shoal.ID) ([]string, error) { return nil, nil })
+		if err != nil {
+			t.Fatal(err)
+		}
+		return persistedInteraction{
+			SessionID: session.ID, Session: session,
+			Operation: session.Operation, Nodes: subgraph.Nodes,
+			Edges: subgraph.Edges, RecordedAt: recordedAt,
+		}
+	}
+	first := build("first")
+	accepted, err := corpus.createInteractionRecord(
+		interactionRecordRow(first.SessionID),
+		embeddedRecordInteraction,
+		first,
+	)
+	if err != nil || !accepted {
+		t.Fatalf("first conditional create = %t, %v", accepted, err)
+	}
+	second := build("second")
+	accepted, err = corpus.createInteractionRecord(
+		interactionRecordRow(second.SessionID),
+		embeddedRecordInteraction,
+		second,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if accepted {
+		t.Fatal("conflicting conditional create was accepted")
+	}
+	stored, found, err := corpus.lookupPersistedInteraction(first.SessionID)
+	if err != nil || !found {
+		t.Fatalf("lookup winner = %t, %v", found, err)
+	}
+	if stored.Session.StopReason != first.Session.StopReason {
+		t.Fatalf("durable winner = %+v", stored.Session)
 	}
 }

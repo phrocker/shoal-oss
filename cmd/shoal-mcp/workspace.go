@@ -147,6 +147,9 @@ func openWorkspace(
 	client, err := authorized.NewClient(authorized.Config{
 		Base:                corpus,
 		VectorScorer:        scorer,
+		InteractionWriter:   corpus,
+		InteractionReader:   corpus,
+		SnapshotValidator:   corpus,
 		OntologyInterpreter: corpus,
 		Resolver:            authority.Resolver(),
 		PolicySelector:      selector,

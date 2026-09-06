@@ -31,7 +31,6 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/graph"
-	"github.com/phrocker/shoal-oss/pkg/interaction"
 	"github.com/phrocker/shoal-oss/pkg/ontology"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
@@ -165,18 +164,6 @@ func TestValidateResultRejectsOversizedInteractionID(t *testing.T) {
 		err, shoal.ErrorInternal,
 	) {
 		t.Fatalf("oversized interaction ID error = %v", err)
-	}
-}
-
-func TestEqualAssertionEvidenceDistinguishesSignedZero(t *testing.T) {
-	base := interaction.AssertionEvidence{ID: "assertion:one"}
-	changed := base
-	changed.Confidence = shoal.Score(math.Copysign(0, -1))
-	if equalAssertionEvidence(
-		[]interaction.AssertionEvidence{base},
-		[]interaction.AssertionEvidence{changed},
-	) {
-		t.Fatal("receipt evidence accepted a signed-zero confidence change")
 	}
 }
 

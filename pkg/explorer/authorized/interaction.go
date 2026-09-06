@@ -22,15 +22,11 @@ package authorized
 import (
 	"context"
 	"reflect"
-	"sort"
-	"strconv"
 	"time"
 
 	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
-	"github.com/phrocker/shoal-oss/pkg/graph"
 	"github.com/phrocker/shoal-oss/pkg/interaction"
-	"github.com/phrocker/shoal-oss/pkg/ontology"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
@@ -57,9 +53,8 @@ type operationInteractionSink struct {
 	operation auth.Operation
 }
 
-// AnalyticsInteractionSink returns the shared durable interaction sink bound
-// to the exact analytics_read operation. Nil means the underlying Explorer has
-// no durable interaction writer, so analytics must not be advertised.
+// AnalyticsInteractionSink returns the durable interaction sink bound to the
+// analytics authorization operation.
 func (c *Client) AnalyticsInteractionSink() interaction.ResultSink {
 	if c == nil {
 		return nil
@@ -67,10 +62,7 @@ func (c *Client) AnalyticsInteractionSink() interaction.ResultSink {
 	if _, err := c.interactionWriter(); err != nil {
 		return nil
 	}
-	bounded, boundedOK := c.base.(explorer.BoundedClient)
-	verifier, verifierOK := c.base.(explorer.InteractionEvidenceVerifier)
-	if !boundedOK || isNilDependency(bounded) ||
-		!verifierOK || isNilDependency(verifier) {
+	if isNilDependency(c.snapshotValidator) {
 		return nil
 	}
 	return operationInteractionSink{
@@ -142,33 +134,15 @@ func (c *Client) recordInteractionForOperation(
 	if err != nil {
 		return interaction.Session{}, err
 	}
-	canonical, err := session.Canonical()
-	if err != nil {
-		return interaction.Session{}, err
-	}
 	decision, guard, now, err := c.begin(ctx, operation)
 	if err != nil {
 		return interaction.Session{}, err
 	}
-	if !interactionPinMatchesDecision(canonical, decision, now) {
+	session.RecordedAt = now.UTC()
+	if !interactionPinMatchesDecision(session, decision, now) {
 		return interaction.Session{}, authorizationDenied()
 	}
-	bounded, err := c.boundedBase()
-	if err != nil {
-		return interaction.Session{}, err
-	}
-	snapshot, err := bounded.Snapshot(ctx)
-	if err != nil {
-		return interaction.Session{}, directBaseError(err)
-	}
-	if canonical.SnapshotID != shoal.ID(snapshot.ID) ||
-		!canonical.SnapshotAsOf.UTC().Equal(snapshot.AsOf.UTC()) {
-		return interaction.Session{}, shoal.NewError(
-			shoal.ErrorConflict,
-			"interaction observed snapshot is no longer current",
-		)
-	}
-	ctx, err = c.withCanonicalDocumentIndex(ctx)
+	canonical, err := session.Canonical()
 	if err != nil {
 		return interaction.Session{}, err
 	}
@@ -204,16 +178,78 @@ func (c *Client) recordInteractionForOperation(
 			return interaction.Session{}, authorizationDenied()
 		}
 	}
-	canonical.RequiredVisibility = nil
-	visibility, err := c.authorizeInteractionEvidence(
-		ctx, canonical, decision, operation, now)
-	if err != nil {
-		return interaction.Session{}, err
-	}
-	canonical.RequiredVisibility = visibility
 	canonical, err = canonical.Canonical()
 	if err != nil {
 		return interaction.Session{}, err
+	}
+	if err := c.authorizeInteractionEvidence(
+		ctx,
+		canonical.TouchedNodeIDs(),
+		canonical.TouchedEdgeIDs(),
+		decision,
+		operation,
+		now,
+	); err != nil {
+		return interaction.Session{}, err
+	}
+	reader, err := c.interactionReader()
+	if err != nil {
+		return interaction.Session{}, err
+	}
+	existing, readErr := reader.InteractionRecord(ctx, canonical.ID)
+	switch {
+	case readErr == nil:
+		if existing.Summary.Deleted || existing.Session.ID == "" {
+			return interaction.Session{}, shoal.NewError(
+				shoal.ErrorConflict,
+				"interaction session ID is not available for an exact retry",
+			)
+		}
+		existingCanonical, canonicalErr := existing.Session.Canonical()
+		retryCanonical := canonical
+		retryCanonical.RecordedAt = existingCanonical.RecordedAt
+		if canonicalErr != nil ||
+			!reflect.DeepEqual(existingCanonical, retryCanonical) {
+			return interaction.Session{}, shoal.NewError(
+				shoal.ErrorConflict,
+				"interaction session ID already exists with different content",
+			)
+		}
+		if err := guard.Check(ctx); err != nil {
+			return interaction.Session{}, err
+		}
+		return existingCanonical, nil
+	case !shoal.IsErrorCode(readErr, shoal.ErrorNotFound):
+		return interaction.Session{}, directBaseError(readErr)
+	}
+	if isNilDependency(c.snapshotValidator) {
+		return interaction.Session{}, shoal.NewError(
+			shoal.ErrorUnavailable,
+			"trusted interaction snapshot validator is unavailable",
+		)
+	}
+	edgeIDs := canonical.TouchedEdgeIDs()
+	if len(edgeIDs) > 0 {
+		validator, ok := c.snapshotValidator.(EvidenceSnapshotValidator)
+		if !ok {
+			return interaction.Session{}, shoal.NewError(
+				shoal.ErrorUnavailable,
+				"trusted interaction edge snapshot validator is unavailable",
+			)
+		}
+		err = validator.ValidateEvidenceSnapshot(
+			ctx, canonical.SnapshotID, canonical.SnapshotAsOf,
+			canonical.TouchedNodeIDs(), edgeIDs,
+			canonical.TouchedAssertions(),
+		)
+	} else {
+		err = c.snapshotValidator.ValidateSnapshot(
+			ctx, canonical.SnapshotID, canonical.SnapshotAsOf,
+			canonical.TouchedNodeIDs(),
+		)
+	}
+	if err != nil {
+		return interaction.Session{}, directBaseError(err)
 	}
 	if err := guard.Check(ctx); err != nil {
 		return interaction.Session{}, err
@@ -233,14 +269,7 @@ func (c *Client) recordInteractionForOperation(
 		return interaction.Session{}, mapped
 	}
 	if err := guard.Check(ctx); err != nil {
-		return interaction.Session{}, postCommitInteractionError(
-			operation,
-			shoal.WrapError(
-				shoal.ErrorUnavailable,
-				"interaction was recorded but authorization generation revalidation failed",
-				err,
-			),
-		)
+		return interaction.Session{}, postCommitInteractionError(operation, err)
 	}
 	if _, ok := writer.(interaction.ResultSink); ok {
 		returned, canonicalErr := persisted.Canonical()
@@ -285,7 +314,7 @@ func (c *Client) Interactions(
 }
 
 // InteractionRecords returns authorized interaction summaries and provenance
-// in one base read and one batched policy lookup.
+// in one base read and bounded batched policy lookups.
 func (c *Client) InteractionRecords(
 	ctx context.Context,
 ) ([]explorer.InteractionRecord, error) {
@@ -301,75 +330,145 @@ func (c *Client) InteractionRecords(
 	if err != nil {
 		return nil, directBaseError(err)
 	}
-	allNodeIDs := make([]shoal.ID, 0)
-	for _, record := range records {
-		if !record.Summary.Deleted {
-			allNodeIDs = append(allNodeIDs, record.TouchedNodeIDs...)
-		}
-	}
-	registrations, err := c.resolveNodes(ctx, allNodeIDs)
+	allowed, err := c.authorizeInteractionRecords(ctx, records, decision, now)
 	if err != nil {
 		return nil, err
 	}
 	visible := make([]explorer.InteractionRecord, 0, len(records))
-	evidenceContext := ctx
-	evidenceContextIndexed := false
-	for _, record := range records {
-		if record.Summary.Deleted {
-			if summaryFingerprintMatchesDecision(record.Summary, decision) {
-				visible = append(visible, record)
-			}
-			continue
+	for index, record := range records {
+		if allowed[index] {
+			visible = append(visible, record)
 		}
-		if len(record.TouchedNodeIDs) == 0 {
-			if summaryFingerprintMatchesDecision(record.Summary, decision) {
-				visible = append(visible, record)
-			}
-			continue
-		}
-		_, analytics, evidenceErr := analyticsInteractionEvidence(record.Session)
-		hasExactEvidence := len(interactionSourceEdges(record.Session)) != 0
-		for _, turn := range record.Session.Turns {
-			if turn.ToolCall != nil &&
-				(len(turn.ToolCall.RetrievedNodes) != 0 ||
-					len(turn.ToolCall.RetrievedAssertions) != 0) {
-				hasExactEvidence = true
-				break
-			}
-		}
-		if evidenceErr == nil && (analytics || hasExactEvidence) {
-			if !evidenceContextIndexed {
-				evidenceContext, evidenceErr =
-					c.withCanonicalDocumentIndex(ctx)
-				evidenceContextIndexed = evidenceErr == nil
-			}
-		}
-		if evidenceErr == nil && (analytics || hasExactEvidence) {
-			_, evidenceErr = c.authorizeInteractionEvidence(
-				evidenceContext, record.Session,
-				decision, auth.OperationRead, now)
-		} else if evidenceErr == nil {
-			var allowed bool
-			allowed, evidenceErr = interactionSourcesAllow(
-				registrations, record.TouchedNodeIDs,
-				decision, auth.OperationRead, now)
-			if evidenceErr == nil && !allowed {
-				evidenceErr = auth.ObjectNotFound()
-			}
-		}
-		if evidenceErr != nil {
-			if shoal.IsErrorCode(evidenceErr, shoal.ErrorNotFound) ||
-				shoal.IsErrorCode(evidenceErr, shoal.ErrorUnauthorized) {
-				continue
-			}
-			return nil, evidenceErr
-		}
-		visible = append(visible, record)
 	}
 	if err := guard.Check(ctx); err != nil {
 		return nil, err
 	}
 	return visible, nil
+}
+
+// maxInteractionAuthorizationIDs bounds how many provenance identifiers one
+// policy-store lookup may carry while authorizing a list of interaction
+// records. Interaction provenance is intentionally uncapped per record, so
+// without this bound a single list call would submit the union of the whole
+// durable corpus in one request. Records are grouped into batches under this
+// bound instead, and one record whose own provenance exceeds it is authorized
+// in bounded chunks of its own.
+const maxInteractionAuthorizationIDs = 1024
+
+// authorizeInteractionRecords decides visibility for every record in list
+// order without ever holding more than one bounded batch of registrations.
+func (c *Client) authorizeInteractionRecords(
+	ctx context.Context,
+	records []explorer.InteractionRecord,
+	decision auth.Decision,
+	now time.Time,
+) ([]bool, error) {
+	allowed := make([]bool, len(records))
+	batch := make([]int, 0, len(records))
+	batchIDs := 0
+	flush := func() error {
+		if len(batch) == 0 {
+			return nil
+		}
+		if err := c.authorizeInteractionBatch(
+			ctx, records, batch, allowed, decision, now,
+		); err != nil {
+			return err
+		}
+		batch = batch[:0]
+		batchIDs = 0
+		return nil
+	}
+	for index, record := range records {
+		if record.Summary.Deleted || len(record.TouchedNodeIDs) == 0 {
+			// Tombstones discarded their source edges, and a zero-hit record
+			// never had any, so both are visible only to the exact
+			// authorization projection that created them.
+			allowed[index] = summaryFingerprintMatchesDecision(
+				record.Summary, decision)
+			continue
+		}
+		count := interactionAuthorizationCost(
+			len(record.TouchedNodeIDs), len(record.TouchedEdgeIDs))
+		if batchIDs > 0 && batchIDs+count > maxInteractionAuthorizationIDs {
+			if err := flush(); err != nil {
+				return nil, err
+			}
+		}
+		batch = append(batch, index)
+		batchIDs += count
+		if batchIDs >= maxInteractionAuthorizationIDs {
+			if err := flush(); err != nil {
+				return nil, err
+			}
+		}
+	}
+	if err := flush(); err != nil {
+		return nil, err
+	}
+	return allowed, nil
+}
+
+// authorizeInteractionBatch resolves one bounded batch of records in a single
+// edge and node lookup pair. A record whose own provenance is larger than the
+// batch bound is the only member of its batch and is resolved in chunks.
+func (c *Client) authorizeInteractionBatch(
+	ctx context.Context,
+	records []explorer.InteractionRecord,
+	batch []int,
+	allowed []bool,
+	decision auth.Decision,
+	now time.Time,
+) error {
+	batchNodeIDs := make([]shoal.ID, 0, maxInteractionAuthorizationIDs)
+	batchEdgeIDs := make([]shoal.ID, 0, maxInteractionAuthorizationIDs)
+	for _, index := range batch {
+		batchNodeIDs = append(batchNodeIDs, records[index].TouchedNodeIDs...)
+		batchEdgeIDs = append(batchEdgeIDs, records[index].TouchedEdgeIDs...)
+	}
+	if interactionAuthorizationCost(
+		len(batchNodeIDs), len(batchEdgeIDs),
+	) > maxInteractionAuthorizationIDs {
+		for _, index := range batch {
+			decided, err := c.interactionEvidenceAllowsBounded(
+				ctx,
+				records[index].TouchedNodeIDs,
+				records[index].TouchedEdgeIDs,
+				decision,
+				auth.OperationRead,
+				now,
+			)
+			if err != nil {
+				return err
+			}
+			allowed[index] = decided
+		}
+		return nil
+	}
+	edges, err := c.resolveEdges(ctx, batchEdgeIDs)
+	if err != nil {
+		return err
+	}
+	for _, registration := range edges {
+		batchNodeIDs = append(
+			batchNodeIDs, registration.Edge.From, registration.Edge.To)
+	}
+	registrations, err := c.resolveNodes(ctx, batchNodeIDs)
+	if err != nil {
+		return err
+	}
+	for _, index := range batch {
+		decided, err := interactionEvidenceAllows(
+			registrations, edges,
+			records[index].TouchedNodeIDs, records[index].TouchedEdgeIDs,
+			decision, auth.OperationRead, now,
+		)
+		if err != nil {
+			return err
+		}
+		allowed[index] = decided
+	}
+	return nil
 }
 
 // InteractionRecord returns one authorized point record without scanning the
@@ -401,19 +500,19 @@ func (c *Client) InteractionRecord(
 		if !summaryFingerprintMatchesDecision(record.Summary, decision) {
 			return explorer.InteractionRecord{}, auth.ObjectNotFound()
 		}
-	} else {
-		ctx, err = c.withCanonicalDocumentIndex(ctx)
-		if err == nil {
-			_, err = c.authorizeInteractionEvidence(
-				ctx, record.Session, decision, auth.OperationRead, now)
+	} else if err := c.authorizeInteractionEvidence(
+		ctx,
+		record.TouchedNodeIDs,
+		record.TouchedEdgeIDs,
+		decision,
+		auth.OperationRead,
+		now,
+	); err != nil {
+		if shoal.IsErrorCode(err, shoal.ErrorUnauthorized) ||
+			shoal.IsErrorCode(err, shoal.ErrorNotFound) {
+			return explorer.InteractionRecord{}, auth.ObjectNotFound()
 		}
-		if err != nil {
-			if shoal.IsErrorCode(err, shoal.ErrorUnauthorized) ||
-				shoal.IsErrorCode(err, shoal.ErrorNotFound) {
-				return explorer.InteractionRecord{}, auth.ObjectNotFound()
-			}
-			return explorer.InteractionRecord{}, err
-		}
+		return explorer.InteractionRecord{}, err
 	}
 	if err := guard.Check(ctx); err != nil {
 		return explorer.InteractionRecord{}, err
@@ -474,12 +573,13 @@ func (c *Client) InteractionSubgraph(
 		!summaryFingerprintMatchesDecision(record.Summary, decision) {
 		return explorer.Neighborhood{}, auth.ObjectNotFound()
 	}
-	ctx, err = c.withCanonicalDocumentIndex(ctx)
-	if err != nil {
-		return explorer.Neighborhood{}, err
-	}
-	if _, err := c.authorizeInteractionEvidence(
-		ctx, record.Session, decision, auth.OperationRead, now,
+	if err := c.authorizeInteractionEvidence(
+		ctx,
+		record.TouchedNodeIDs,
+		record.TouchedEdgeIDs,
+		decision,
+		auth.OperationRead,
+		now,
 	); err != nil {
 		if shoal.IsErrorCode(err, shoal.ErrorUnauthorized) {
 			return explorer.Neighborhood{}, auth.ObjectNotFound()
@@ -507,589 +607,98 @@ func interactionSubgraphIsTombstone(subgraph explorer.Neighborhood) bool {
 
 func (c *Client) authorizeInteractionEvidence(
 	ctx context.Context,
-	session interaction.Session,
+	nodeIDs []shoal.ID,
+	edgeIDs []shoal.ID,
 	decision auth.Decision,
 	operation auth.Operation,
 	now time.Time,
-) ([]string, error) {
-	evidence, analytics, err := analyticsInteractionEvidence(session)
+) error {
+	allowed, err := c.interactionEvidenceAllowsBounded(
+		ctx, nodeIDs, edgeIDs, decision, operation, now)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	if analytics {
-		if operation != auth.OperationAnalyticsRead &&
-			operation != auth.OperationRead {
-			return nil, authorizationDenied()
-		}
-		return c.authorizeAnalyticsInteractionEvidence(
-			ctx, evidence, decision, operation, now)
-	}
-	if operation == auth.OperationAnalyticsRead {
-		return nil, shoal.NewError(
-			shoal.ErrorInvalidArgument,
-			"analytics interaction requires complete graph evidence",
-		)
-	}
-	for _, turn := range session.Turns {
-		if turn.ToolCall != nil &&
-			(len(turn.ToolCall.RetrievedNodes) != 0 ||
-				len(turn.ToolCall.RetrievedAssertions) != 0) {
-			return nil, shoal.NewError(
-				shoal.ErrorInvalidArgument,
-				"exact node and assertion evidence requires an analytics interaction",
-			)
-		}
-	}
-	if err := validateInteractionSourceEdges(session); err != nil {
-		return nil, err
-	}
-	nodeIDs := session.TouchedNodeIDs()
-	registrations, err := c.resolveNodes(ctx, nodeIDs)
-	if err != nil {
-		return nil, err
-	}
-	visibilitySets := make(
-		[][]string, 0, len(nodeIDs)+len(session.TouchedEdgeIDs()))
-	for _, nodeID := range nodeIDs {
-		registration, ok := registrations[nodeID]
-		if !ok {
-			return nil, auth.ObjectNotFound()
-		}
-		allowed, err := ruleAllows(
-			registration.Rule, decision, operation, now)
-		if err != nil {
-			return nil, err
-		}
-		if !allowed {
-			return nil, auth.ObjectNotFound()
-		}
-		labels, err := accessRuleVisibility(registration.Rule)
-		if err != nil {
-			return nil, err
-		}
-		visibilitySets = append(visibilitySets, labels)
-	}
-	edges := interactionSourceEdges(session)
-	edgeIDs := make([]shoal.ID, len(edges))
-	for index, edge := range edges {
-		edgeIDs[index] = edge.ID
-	}
-	resolvedEdges, err := c.resolveEdges(ctx, edgeIDs)
-	if err != nil {
-		return nil, err
-	}
-	touchedNodes := make(map[shoal.ID]struct{}, len(nodeIDs))
-	for _, nodeID := range nodeIDs {
-		touchedNodes[nodeID] = struct{}{}
-	}
-	for _, edge := range edges {
-		if _, ok := touchedNodes[edge.From]; !ok {
-			return nil, auth.ObjectNotFound()
-		}
-		if _, ok := touchedNodes[edge.To]; !ok {
-			return nil, auth.ObjectNotFound()
-		}
-		registration, ok := resolvedEdges[edge.ID]
-		if !ok || !graphEdgesEqual(registration.Edge, edge) {
-			return nil, auth.ObjectNotFound()
-		}
-		allowed, err := edgeAllowsResolved(
-			registrations, registration, decision, operation, now)
-		if err != nil {
-			return nil, err
-		}
-		if !allowed {
-			return nil, auth.ObjectNotFound()
-		}
-		labels, err := accessRuleVisibility(registration.Rule)
-		if err != nil {
-			return nil, err
-		}
-		visibilitySets = append(visibilitySets, labels)
-	}
-	return interaction.Conjoin(visibilitySets...)
-}
-
-type analyticsInteractionGraph struct {
-	Nodes      []graph.Node
-	Edges      []graph.Edge
-	Assertions []interaction.AssertionEvidence
-}
-
-func analyticsInteractionEvidence(
-	session interaction.Session,
-) (analyticsInteractionGraph, bool, error) {
-	var evidence analyticsInteractionGraph
-	if session.Provenance.ToolPolicy != string(auth.OperationAnalyticsRead) {
-		return evidence, false, nil
-	}
-	analyticsCalls := 0
-	for _, turn := range session.Turns {
-		if turn.ToolCall != nil && turn.ToolCall.Kind == "analytics" {
-			analyticsCalls++
-		}
-	}
-	if analyticsCalls == 0 {
-		return evidence, false, nil
-	}
-	if analyticsCalls != 1 {
-		return analyticsInteractionGraph{}, false, shoal.NewError(
-			shoal.ErrorInvalidArgument,
-			"analytics interaction has multiple analytics tool calls",
-		)
-	}
-	if len(session.CitedNodeIDs) != 0 || len(session.CitedEdges) != 0 {
-		return analyticsInteractionGraph{}, false, shoal.NewError(
-			shoal.ErrorInvalidArgument,
-			"analytics interaction has evidence outside its analytics tool call",
-		)
-	}
-	for _, turn := range session.Turns {
-		if turn.ToolCall == nil {
-			continue
-		}
-		if turn.ToolCall.Kind != "analytics" {
-			if len(turn.ToolCall.RetrievedNodeIDs) != 0 ||
-				len(turn.ToolCall.RetrievedNodes) != 0 ||
-				len(turn.ToolCall.RetrievedEdges) != 0 ||
-				len(turn.ToolCall.RetrievedAssertions) != 0 {
-				return analyticsInteractionGraph{}, false, shoal.NewError(
-					shoal.ErrorInvalidArgument,
-					"analytics interaction has evidence outside its analytics tool call",
-				)
-			}
-			continue
-		}
-		evidence.Nodes = append(
-			[]graph.Node(nil), turn.ToolCall.RetrievedNodes...)
-		evidence.Edges = append(
-			[]graph.Edge(nil), turn.ToolCall.RetrievedEdges...)
-		evidence.Assertions = append(
-			[]interaction.AssertionEvidence(nil),
-			turn.ToolCall.RetrievedAssertions...,
-		)
-		nodeIDs := make([]shoal.ID, len(evidence.Nodes))
-		for index, node := range evidence.Nodes {
-			nodeIDs[index] = node.ID
-		}
-		sort.Slice(nodeIDs, func(i, j int) bool {
-			return shoal.CompareID(nodeIDs[i], nodeIDs[j]) < 0
-		})
-		expected := append(
-			[]shoal.ID(nil), turn.ToolCall.RetrievedNodeIDs...)
-		sort.Slice(expected, func(i, j int) bool {
-			return shoal.CompareID(expected[i], expected[j]) < 0
-		})
-		if !equalInteractionIDs(nodeIDs, expected) {
-			return analyticsInteractionGraph{}, false, shoal.NewError(
-				shoal.ErrorInvalidArgument,
-				"analytics interaction node evidence is inconsistent",
-			)
-		}
-		if len(session.SeedNodeIDs) == 0 {
-			return analyticsInteractionGraph{}, false, shoal.NewError(
-				shoal.ErrorInvalidArgument,
-				"analytics interaction requires at least one seed node",
-			)
-		}
-		retrieved := make(map[shoal.ID]struct{}, len(nodeIDs))
-		for _, nodeID := range nodeIDs {
-			retrieved[nodeID] = struct{}{}
-		}
-		for _, seedNodeID := range session.SeedNodeIDs {
-			if _, ok := retrieved[seedNodeID]; !ok {
-				return analyticsInteractionGraph{}, false, shoal.NewError(
-					shoal.ErrorInvalidArgument,
-					"analytics interaction seed is absent from exact node evidence",
-				)
-			}
-		}
-	}
-	return evidence, true, nil
-}
-
-func equalInteractionIDs(left, right []shoal.ID) bool {
-	if len(left) != len(right) {
-		return false
-	}
-	for index := range left {
-		if left[index] != right[index] {
-			return false
-		}
-	}
-	return true
-}
-
-func (c *Client) authorizeAnalyticsInteractionEvidence(
-	ctx context.Context,
-	raw analyticsInteractionGraph,
-	decision auth.Decision,
-	operation auth.Operation,
-	now time.Time,
-) ([]string, error) {
-	rawNodes := make(map[shoal.ID]graph.Node, len(raw.Nodes))
-	nodeIDs := make([]shoal.ID, 0, len(raw.Nodes))
-	for _, node := range raw.Nodes {
-		if err := node.Validate(); err != nil {
-			return nil, inconsistentBase()
-		}
-		if _, duplicate := rawNodes[node.ID]; duplicate {
-			return nil, inconsistentBase()
-		}
-		rawNodes[node.ID] = cloneGraphNode(node)
-		nodeIDs = append(nodeIDs, node.ID)
-	}
-	resolved, err := c.resolveNodes(ctx, nodeIDs)
-	if err != nil {
-		return nil, err
-	}
-	visibleNodes := make(map[shoal.ID]graph.Node, len(raw.Nodes))
-	registrations := make(map[shoal.ID]NodeRegistration, len(resolved))
-	visibilitySets := make([][]string, 0, len(raw.Nodes)+len(raw.Edges))
-	for _, node := range raw.Nodes {
-		registration, ok := resolved[node.ID]
-		if !ok {
-			if graph.IsProvenanceKind(node.Kind) {
-				continue
-			}
-			return nil, auth.ObjectNotFound()
-		}
-		allowed, err := ruleAllows(
-			registration.Rule, decision, operation, now)
-		if err != nil {
-			return nil, err
-		}
-		if !allowed {
-			return nil, auth.ObjectNotFound()
-		}
-		visibleNodes[node.ID] = cloneGraphNode(node)
-		registrations[node.ID] = registration
-		labels, err := accessRuleVisibility(registration.Rule)
-		if err != nil {
-			return nil, err
-		}
-		visibilitySets = append(visibilitySets, labels)
-	}
-	canonical, err := c.canonicalRegisteredNodes(ctx, registrations)
-	if err != nil {
-		return nil, err
-	}
-	for nodeID, node := range visibleNodes {
-		if !graphNodesEqual(canonical[nodeID], node) {
-			return nil, inconsistentBase()
-		}
-	}
-	assertionsByEdge, err := interactionAssertionsByEdge(raw.Assertions)
-	if err != nil {
-		return nil, err
-	}
-	verifier, ok := c.base.(explorer.InteractionEvidenceVerifier)
-	if !ok || isNilDependency(verifier) {
-		return nil, shoal.NewError(
-			shoal.ErrorUnavailable,
-			"underlying Explorer cannot verify exact interaction evidence")
-	}
-	if err := verifier.VerifyInteractionEvidence(
-		ctx, raw.Nodes, raw.Edges, raw.Assertions,
-	); err != nil {
-		return nil, directBaseError(err)
-	}
-	candidateEdgeIDs := make([]shoal.ID, 0, len(raw.Edges))
-	for _, edge := range raw.Edges {
-		if assertion, derived := assertionsByEdge[edge.ID]; (derived &&
-			assertion.Origin == string(ontology.AssertionDerived)) ||
-			edge.Type == graph.EdgeTypeProduced {
-			continue
-		}
-		candidateEdgeIDs = append(candidateEdgeIDs, edge.ID)
-	}
-	resolvedEdges, err := c.resolveEdges(ctx, candidateEdgeIDs)
-	if err != nil {
-		return nil, err
-	}
-	admittedEdges := make(map[shoal.ID]struct{}, len(raw.Edges))
-	admittedAssertions := make(map[shoal.ID]struct{}, len(raw.Assertions))
-	assertionEndpoints := make(registeredNodes)
-	for _, edge := range raw.Edges {
-		if err := edge.Validate(); err != nil {
-			return nil, inconsistentBase()
-		}
-		if assertion, ok := assertionsByEdge[edge.ID]; ok &&
-			assertion.Origin == string(ontology.AssertionDerived) {
-			endpoints, allowed, err := c.interactionAssertionAllows(
-				ctx, assertion, decision, operation, now)
-			if err != nil {
-				return nil, err
-			}
-			if !allowed || !interactionAssertionMatchesEdge(assertion, edge) {
-				return nil, auth.ObjectNotFound()
-			}
-			for nodeID, registration := range endpoints {
-				node, ok := rawNodes[nodeID]
-				if !ok || !graphNodesEqual(registration.Node, node) {
-					return nil, inconsistentBase()
-				}
-				visibleNodes[nodeID] = cloneGraphNode(node)
-				assertionEndpoints[nodeID] = registration
-			}
-			admittedEdges[edge.ID] = struct{}{}
-			admittedAssertions[assertion.ID] = struct{}{}
-			continue
-		}
-		if edge.Type == graph.EdgeTypeProduced {
-			assertion, ok := assertionsByEdge[edge.To]
-			if !ok {
-				return nil, inconsistentBase()
-			}
-			endpoints, allowed, err := c.interactionAssertionAllows(
-				ctx, assertion, decision, operation, now)
-			if err != nil {
-				return nil, err
-			}
-			if !allowed ||
-				!interactionProducerEdgeMatches(edge, rawNodes, assertion) {
-				return nil, auth.ObjectNotFound()
-			}
-			for _, registration := range endpoints {
-				labels, err := accessRuleVisibility(registration.Rule)
-				if err != nil {
-					return nil, err
-				}
-				visibilitySets = append(visibilitySets, labels)
-			}
-			for nodeID, registration := range endpoints {
-				assertionEndpoints[nodeID] = registration
-			}
-			visibleNodes[edge.From] = cloneGraphNode(rawNodes[edge.From])
-			visibleNodes[edge.To] = cloneGraphNode(rawNodes[edge.To])
-			admittedEdges[edge.ID] = struct{}{}
-			admittedAssertions[assertion.ID] = struct{}{}
-			continue
-		}
-		registration, ok := resolvedEdges[edge.ID]
-		if !ok || !graphEdgesEqual(registration.Edge, edge) {
-			return nil, auth.ObjectNotFound()
-		}
-		allowed, err := edgeAllowsResolved(
-			resolved, registration, decision, operation, now)
-		if err != nil {
-			return nil, err
-		}
-		if !allowed {
-			return nil, auth.ObjectNotFound()
-		}
-		labels, err := accessRuleVisibility(registration.Rule)
-		if err != nil {
-			return nil, err
-		}
-		visibilitySets = append(visibilitySets, labels)
-		admittedEdges[edge.ID] = struct{}{}
-		if assertion, ok := assertionsByEdge[edge.ID]; ok {
-			admittedAssertions[assertion.ID] = struct{}{}
-		}
-	}
-	if len(admittedEdges) != len(raw.Edges) ||
-		len(visibleNodes) != len(raw.Nodes) {
-		return nil, auth.ObjectNotFound()
-	}
-	for _, assertion := range raw.Assertions {
-		if _, ok := admittedAssertions[assertion.ID]; !ok {
-			return nil, auth.ObjectNotFound()
-		}
-		if assertion.ObjectReference == "" {
-			continue
-		}
-		for _, nodeID := range []shoal.ID{
-			assertion.Subject, assertion.ObjectReference,
-		} {
-			registration, ok := resolved[nodeID]
-			if !ok {
-				registration, ok = assertionEndpoints[nodeID]
-				if !ok {
-					return nil, auth.ObjectNotFound()
-				}
-			}
-			labels, err := accessRuleVisibility(registration.Rule)
-			if err != nil {
-				return nil, err
-			}
-			visibilitySets = append(visibilitySets, labels)
-		}
-	}
-	return interaction.Conjoin(visibilitySets...)
-}
-
-func interactionAssertionsByEdge(
-	assertions []interaction.AssertionEvidence,
-) (map[shoal.ID]interaction.AssertionEvidence, error) {
-	result := make(
-		map[shoal.ID]interaction.AssertionEvidence, len(assertions))
-	for _, assertion := range assertions {
-		if err := assertion.Validate(); err != nil {
-			return nil, inconsistentBase()
-		}
-
-		edgeID := assertion.GraphEdgeID
-		if assertion.Origin == string(ontology.AssertionDerived) {
-			edgeID = assertion.ID
-		}
-		if edgeID == "" {
-			continue
-		}
-		if _, duplicate := result[edgeID]; duplicate {
-			return nil, inconsistentBase()
-		}
-		result[edgeID] = assertion
-	}
-	return result, nil
-}
-
-func (c *Client) interactionAssertionAllows(
-	ctx context.Context,
-	assertion interaction.AssertionEvidence,
-	decision auth.Decision,
-	operation auth.Operation,
-	now time.Time,
-) (registeredNodes, bool, error) {
-	if assertion.ObjectReference == "" {
-		return nil, false, nil
-	}
-	resolved, err := c.resolveNodes(ctx, []shoal.ID{
-		assertion.Subject, assertion.ObjectReference,
-	})
-	if err != nil {
-		return nil, false, err
-	}
-	allowed, err := edgeEndpointsAllow(
-		resolved,
-		EdgeRegistration{Edge: graph.Edge{
-			ID: assertion.ID, From: assertion.Subject,
-			To: assertion.ObjectReference, Type: string(assertion.Predicate),
-			Weight: assertion.Confidence,
-		}},
-		decision,
-		operation,
-		now,
-	)
-	if err != nil || !allowed {
-		return resolved, allowed, err
-	}
-	if _, err := c.canonicalRegisteredNodes(ctx, resolved); err != nil {
-		return nil, false, err
-	}
-	return resolved, true, nil
-}
-
-func interactionAssertionMatchesEdge(
-	assertion interaction.AssertionEvidence,
-	edge graph.Edge,
-) bool {
-	expectedProperties := shoal.Metadata{
-		"ontology.assertion.origin":          assertion.Origin,
-		derivedAssertionPropertyAssertionID:  string(assertion.ID),
-		derivedAssertionPropertyDerivationID: string(assertion.DerivationID),
-		derivedAssertionPropertyDerivationScore: strconv.FormatFloat(
-			float64(assertion.DerivationScore), 'g', -1, 64),
-	}
-	return edge.ID == assertion.ID &&
-		edge.From == assertion.Subject &&
-		edge.To == assertion.ObjectReference &&
-		edge.Type == string(assertion.Predicate) &&
-		scoresEqual(edge.Weight, assertion.Confidence) &&
-		metadataEqual(edge.Properties, expectedProperties)
-}
-
-func interactionProducerEdgeMatches(
-	edge graph.Edge,
-	rawNodes map[shoal.ID]graph.Node,
-	assertion interaction.AssertionEvidence,
-) bool {
-	producer, ok := rawNodes[edge.From]
-	if !ok || producer.Kind != graph.NodeKindProducer {
-		return false
-	}
-	assertionNode, ok := rawNodes[edge.To]
-	if !ok || assertionNode.Kind != graph.NodeKindDerivedAssertion ||
-		assertionNode.ID != assertion.ID {
-		return false
-	}
-	return edge.Weight == 1 && len(edge.Properties) == 2 &&
-		edge.Properties[derivedAssertionPropertyAssertionID] ==
-			string(assertion.ID) &&
-		edge.Properties[derivedAssertionPropertyDerivationID] ==
-			string(assertion.DerivationID)
-}
-
-func metadataEqual(left, right shoal.Metadata) bool {
-	if len(left) != len(right) {
-		return false
-	}
-	for key, value := range left {
-		other, ok := right[key]
-		if !ok || other != value {
-			return false
-		}
-	}
-	return true
-}
-
-func interactionSourceEdges(session interaction.Session) []graph.Edge {
-	edges := append([]graph.Edge(nil), session.CitedEdges...)
-	for _, turn := range session.Turns {
-		if turn.ToolCall != nil {
-			edges = append(edges, turn.ToolCall.RetrievedEdges...)
-		}
-	}
-	sort.Slice(edges, func(i, j int) bool {
-		return shoal.CompareID(edges[i].ID, edges[j].ID) < 0
-	})
-	result := edges[:0]
-	for _, edge := range edges {
-		if len(result) > 0 && result[len(result)-1].ID == edge.ID {
-			continue
-		}
-		result = append(result, edge)
-	}
-	return result
-}
-
-func validateInteractionSourceEdges(session interaction.Session) error {
-	edges := append([]graph.Edge(nil), session.CitedEdges...)
-	for _, turn := range session.Turns {
-		if turn.ToolCall != nil {
-			edges = append(edges, turn.ToolCall.RetrievedEdges...)
-		}
-	}
-	sort.Slice(edges, func(i, j int) bool {
-		return shoal.CompareID(edges[i].ID, edges[j].ID) < 0
-	})
-	for index := 1; index < len(edges); index++ {
-		if edges[index-1].ID == edges[index].ID &&
-			!graphEdgesEqual(edges[index-1], edges[index]) {
-			return shoal.NewError(
-				shoal.ErrorInvalidArgument,
-				"interaction source edge ID has conflicting values",
-			)
-		}
+	if !allowed {
+		return auth.ObjectNotFound()
 	}
 	return nil
 }
 
-func accessRuleVisibility(rule AccessRule) ([]string, error) {
-	expression, err := auth.ConjoinPolicies(rule.components()...)
-	if err != nil {
-		return nil, inconsistentBase()
+// interactionEvidenceAllowsBounded authorizes one record's uncapped provenance
+// without ever submitting more than maxInteractionAuthorizationIDs identifiers
+// in a single policy-store lookup. Authorization is a conjunction, so chunking
+// preserves the fail-closed result exactly.
+func (c *Client) interactionEvidenceAllowsBounded(
+	ctx context.Context,
+	nodeIDs []shoal.ID,
+	edgeIDs []shoal.ID,
+	decision auth.Decision,
+	operation auth.Operation,
+	now time.Time,
+) (bool, error) {
+	for start := 0; start < len(edgeIDs); {
+		end := chunkEnd(start, len(edgeIDs), maxInteractionAuthorizationIDs/2)
+		chunk := edgeIDs[start:end]
+		start = end
+		edges, err := c.resolveEdges(ctx, chunk)
+		if err != nil {
+			return false, err
+		}
+		endpoints := make([]shoal.ID, 0, 2*len(edges))
+		for _, registration := range edges {
+			endpoints = append(
+				endpoints, registration.Edge.From, registration.Edge.To)
+		}
+		registrations, err := c.resolveNodes(ctx, endpoints)
+		if err != nil {
+			return false, err
+		}
+		allowed, err := interactionEvidenceAllows(
+			registrations, edges, endpoints, chunk, decision, operation, now)
+		if err != nil || !allowed {
+			return false, err
+		}
 	}
-	labels, err := interaction.ParseVisibility(string(expression))
-	if err != nil {
-		return nil, inconsistentBase()
+	for start := 0; start < len(nodeIDs); {
+		end := chunkEnd(start, len(nodeIDs), maxInteractionAuthorizationIDs)
+		chunk := nodeIDs[start:end]
+		start = end
+		registrations, err := c.resolveNodes(ctx, chunk)
+		if err != nil {
+			return false, err
+		}
+		allowed, err := interactionEvidenceAllows(
+			registrations, nil, chunk, nil, decision, operation, now)
+		if err != nil || !allowed {
+			return false, err
+		}
 	}
-	return labels, nil
+	return true, nil
 }
 
-func interactionSourcesAllow(
+// chunkEnd is the exclusive end of the chunk of at most size elements that
+// starts at start.
+func chunkEnd(start, length, size int) int {
+	end := start + size
+	if end > length {
+		return length
+	}
+	return end
+}
+
+// interactionAuthorizationCost is the number of identifiers a batch submits to
+// the policy store. Every edge costs its own identifier plus the two endpoint
+// node identifiers its registration expands into, so the bound holds for the
+// node lookup as well as the edge lookup.
+func interactionAuthorizationCost(nodes, edges int) int {
+	return nodes + 3*edges
+}
+
+func interactionEvidenceAllows(
 	registrations registeredNodes,
+	edges registeredEdges,
 	nodeIDs []shoal.ID,
+	edgeIDs []shoal.ID,
 	decision auth.Decision,
 	operation auth.Operation,
 	now time.Time,
@@ -1101,6 +710,20 @@ func interactionSourcesAllow(
 		}
 		allowed, err := ruleAllows(
 			registration.Rule, decision, operation, now)
+		if err != nil {
+			return false, err
+		}
+		if !allowed {
+			return false, nil
+		}
+	}
+	for _, edgeID := range edgeIDs {
+		registration, ok := edges[edgeID]
+		if !ok || registration.Edge.ID != edgeID {
+			return false, nil
+		}
+		allowed, err := edgeAllowsResolved(
+			registrations, registration, decision, operation, now)
 		if err != nil {
 			return false, err
 		}
@@ -1136,14 +759,13 @@ func summaryFingerprintMatchesDecision(
 }
 
 func (c *Client) interactionWriter() (explorer.InteractionWriter, error) {
-	writer, ok := c.base.(explorer.InteractionWriter)
-	if !ok || isNilDependency(writer) {
+	if isNilDependency(c.interactionSink) {
 		return nil, shoal.NewError(
 			shoal.ErrorUnavailable,
-			"underlying Explorer has no durable interaction writer",
+			"trusted interaction writer is unavailable",
 		)
 	}
-	return writer, nil
+	return c.interactionSink, nil
 }
 
 func (c *Client) interactionReader() (explorer.InteractionReader, error) {
@@ -1160,5 +782,4 @@ var (
 	_ explorer.InteractionWriter       = (*Client)(nil)
 	_ explorer.InteractionResultWriter = (*Client)(nil)
 	_ explorer.InteractionReader       = (*Client)(nil)
-	_ interaction.ResultSink           = operationInteractionSink{}
 )

@@ -306,6 +306,7 @@ func TestEmbeddedAnalyticsDurablyRecordsCompleteAuthorizedEvidence(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	httpRequest := httptest.NewRequest(
 		http.MethodPost,
 		"http://workspace.test/api/v1/analytics",
@@ -319,6 +320,7 @@ func TestEmbeddedAnalyticsDurablyRecordsCompleteAuthorizedEvidence(t *testing.T)
 		t.Fatalf("analytics HTTP status = %d: %s",
 			httpResponse.Code, httpResponse.Body.String())
 	}
+
 	var response webapi.AnalyticsResponse
 	if err := json.Unmarshal(httpResponse.Body.Bytes(), &response); err != nil {
 		t.Fatal(err)
@@ -347,49 +349,10 @@ func TestEmbeddedAnalyticsDurablyRecordsCompleteAuthorizedEvidence(t *testing.T)
 	}
 	if len(recorded.Turns) != 1 || recorded.Turns[0].ToolCall == nil ||
 		len(recorded.Turns[0].ToolCall.RetrievedNodeIDs) != 3 ||
-		len(recorded.Turns[0].ToolCall.RetrievedEdges) != 2 ||
+		len(recorded.Turns[0].ToolCall.RetrievedEvidence) != 1 ||
+		len(recorded.Turns[0].ToolCall.RetrievedEvidence[0].EdgeIDs) != 2 ||
 		len(recorded.TouchedEdgeIDs()) != 2 {
 		t.Fatalf("recorded evidence = %+v", recorded)
-	}
-	nodePolicy, err := auth.NewPolicy(auth.PolicyConfig{
-		AuthorizationDomain: fixture.domain,
-		SourceID:            fixture.sourceA, GrantPolicyID: fixture.policyA, Epoch: 1,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	edgePolicy, err := auth.NewPolicy(auth.PolicyConfig{
-		AuthorizationDomain: fixture.domain,
-		SourceID:            fixture.sourceB, GrantPolicyID: fixture.policyB, Epoch: 1,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	expectedVisibility, err := auth.ConjoinPolicies(nodePolicy, edgePolicy)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if interaction.Expression(recorded.RequiredVisibility) !=
-		string(expectedVisibility) {
-		t.Fatalf("record visibility = %q, want %q",
-			interaction.Expression(recorded.RequiredVisibility),
-			expectedVisibility)
-	}
-	subgraph, err := fixture.base.InteractionSubgraph(
-		context.Background(), recorded.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var sessionVisibility string
-	for _, node := range subgraph.Nodes {
-		if node.Kind == interaction.KindSession {
-			sessionVisibility = node.Properties[interaction.PropertyVisibility]
-			break
-		}
-	}
-	if sessionVisibility != string(expectedVisibility) {
-		t.Fatalf("persisted visibility = %q, want %q",
-			sessionVisibility, expectedVisibility)
 	}
 	if err := fixture.base.Close(); err != nil {
 		t.Fatal(err)
@@ -404,12 +367,9 @@ func TestEmbeddedAnalyticsDurablyRecordsCompleteAuthorizedEvidence(t *testing.T)
 		t.Fatal(err)
 	}
 	if !reflect.DeepEqual(
-		recovered.Turns[0].ToolCall.RetrievedEdges,
-		recorded.Turns[0].ToolCall.RetrievedEdges,
+		recovered.Turns[0].ToolCall.RetrievedEvidence,
+		recorded.Turns[0].ToolCall.RetrievedEvidence,
 	) ||
-		!reflect.DeepEqual(
-			recovered.RequiredVisibility, recorded.RequiredVisibility,
-		) ||
 		recovered.OntologySchemaID != recorded.OntologySchemaID ||
 		recovered.OntologyVersionID != recorded.OntologyVersionID {
 		t.Fatalf("recovered interaction evidence = %+v", recovered)
@@ -549,24 +509,32 @@ func TestAnalyticsInteractionSinkReauthorizesExactEdgeEvidence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	recordedAt := fixture.now.Add(time.Minute)
+	sessionID, err := interaction.OperationSessionID(
+		interaction.OperationToolCall, decision.RequestID(), recordedAt)
+	if err != nil {
+		t.Fatal(err)
+	}
 	session := interaction.Session{
-		ID:                       "analytics-edge-session",
-		RecordedAt:               fixture.now.Add(time.Minute),
+		ID:                       sessionID,
+		RecordedAt:               recordedAt,
 		Operation:                interaction.OperationToolCall,
 		SnapshotID:               shoal.ID(materialized.Snapshot.ID),
 		SnapshotAsOf:             materialized.Snapshot.AsOf,
 		AuthorizationFingerprint: shoal.ID(fingerprint.String()),
 		AuthorizationExpiresAt:   decision.AuthenticationExpires(),
+		RequestID:                decision.RequestID(),
 		SeedNodeIDs:              []shoal.ID{from},
 		Turns: []interaction.Turn{{
 			Index: 0,
 			ToolCall: &interaction.ToolCall{
 				Kind:             "analytics",
 				RetrievedNodeIDs: []shoal.ID{from, to},
-				RetrievedNodes:   materialized.Neighborhood.Nodes,
-				RetrievedEdges: []graph.Edge{{
-					ID: exact.ID, From: exact.From, To: exact.To,
-					Type: "altered", Weight: exact.Weight,
+				RetrievedEvidence: []interaction.EvidenceReference{{
+					AnchorID: "analytics-evidence",
+					Kind:     interaction.EvidenceGraph,
+					NodeIDs:  []shoal.ID{from, to},
+					EdgeIDs:  []shoal.ID{"missing-edge"},
 				}},
 			},
 		}},
@@ -576,7 +544,8 @@ func TestAnalyticsInteractionSinkReauthorizesExactEdgeEvidence(t *testing.T) {
 	) {
 		t.Fatalf("altered edge evidence error = %v", err)
 	}
-	session.Turns[0].ToolCall.RetrievedEdges = []graph.Edge{exact}
+	session.Turns[0].ToolCall.RetrievedEvidence[0].EdgeIDs =
+		[]shoal.ID{exact.ID}
 	recorded, err := recorder.Record(ctx, session)
 	if err != nil {
 		t.Fatal(err)
@@ -623,13 +592,17 @@ func TestAuthorizedInteractionSinkMarksPostWriteRevocationIndeterminate(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
+	recordBase := &generationChangingRecordBase{
+		Explorer: fixture.base, generations: fixture.generations,
+		domain: fixture.domain,
+	}
 	client, err := authorized.NewClient(authorized.Config{
-		Base: &generationChangingRecordBase{
-			Explorer: fixture.base, generations: fixture.generations,
-			domain: fixture.domain,
-		},
-		Resolver:       fixture.authority.Resolver(),
-		PolicySelector: selector, PolicyStore: fixture.store,
+		Base:              recordBase,
+		InteractionWriter: recordBase,
+		InteractionReader: fixture.base,
+		SnapshotValidator: fixture.base,
+		Resolver:          fixture.authority.Resolver(),
+		PolicySelector:    selector, PolicyStore: fixture.store,
 		GenerationReader: fixture.generations,
 		Clock:            func() time.Time { return fixture.now },
 	})
@@ -810,7 +783,7 @@ func (r *analyticsRecorder) RecordAnalytics(
 
 func newAnalyticsFixture(t *testing.T) *analyticsFixture {
 	t.Helper()
-	now := time.Now().UTC().Truncate(time.Second)
+	now := time.Now().UTC().Add(time.Minute).Truncate(time.Second)
 	authority, err := auth.NewAuthorityWithClock(func() time.Time { return now })
 	if err != nil {
 		t.Fatal(err)
@@ -849,8 +822,12 @@ func (f *analyticsFixture) client(
 		t.Fatal(err)
 	}
 	client, err := authorized.NewClient(authorized.Config{
-		Base: f.base, Resolver: f.authority.Resolver(),
-		PolicySelector: selector, PolicyStore: f.store,
+		Base:              f.base,
+		InteractionWriter: f.base,
+		InteractionReader: f.base,
+		SnapshotValidator: f.base,
+		Resolver:          f.authority.Resolver(),
+		PolicySelector:    selector, PolicyStore: f.store,
 		GenerationReader: f.generations, Clock: func() time.Time { return f.now },
 	})
 	if err != nil {

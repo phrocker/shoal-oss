@@ -254,9 +254,7 @@ func (c *Client) materializeAnalyticsNeighborhood(
 			}
 			for _, assertion := range page.Neighborhood.Assertions {
 				if _, exists := assertions[assertion.ID()]; !exists {
-					if err := charge(
-						exploreranalytics.InteractionAssertionEvidence(assertion),
-					); err != nil {
+					if err := charge(assertion); err != nil {
 						return explorer.Neighborhood{}, err
 					}
 					assertions[assertion.ID()] = assertion

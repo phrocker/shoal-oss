@@ -108,6 +108,12 @@ node-kind and edge-type namespace. Phase 1 of issue #266 defines:
 - Node kinds `interaction.session`, `interaction.turn`, `interaction.tool_call`,
   and `interaction.tombstone`. Content MUST NOT use the `interaction.` kind
   prefix; ingest and `Connect` reject it.
+- Session identities are minted by `interaction.SessionID` or
+  `interaction.OperationSessionID` and always live under the
+  `interaction.session_` prefix. Because every source publication path rejects
+  the reserved prefix, interaction identities and source identities are
+  disjoint by construction, so independent writers can never durably commit a
+  source node and an interaction node under one graph identity.
 - Edge types `interaction.has_turn`, `interaction.has_tool_call`,
   `interaction.retrieved`, and `interaction.cited`. Retrieved and cited are
   distinct: retrieval records everything the model was shown, citation records

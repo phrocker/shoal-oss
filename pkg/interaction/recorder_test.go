@@ -81,8 +81,9 @@ func TestProductRecorderIsFailClosedAndCanonical(t *testing.T) {
 		t.Fatal(err)
 	}
 	recorded, err := recorder.Record(ctx, interaction.Session{
-		ID:        id,
-		Operation: interaction.OperationRetrieval,
+		ID:         id,
+		RecordedAt: fixed.Add(24 * time.Hour),
+		Operation:  interaction.OperationRetrieval,
 		SeedNodeIDs: []shoal.ID{
 			"span-b", "span-a", "span-b",
 		},

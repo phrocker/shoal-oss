@@ -41,6 +41,8 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/graph"
 	"github.com/phrocker/shoal-oss/pkg/inference"
+	"github.com/phrocker/shoal-oss/pkg/interaction"
+	"github.com/phrocker/shoal-oss/pkg/ontology"
 	"github.com/phrocker/shoal-oss/pkg/retrieval"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
@@ -454,15 +456,16 @@ func (b Builder) ExpandNeighbors(
 }
 
 type verifier struct {
-	ctx       context.Context
-	reader    Reader
-	limits    Limits
-	documents map[documentKey]*documentIndex
-	nodes     map[shoal.ID]graph.Node
-	edges     map[shoal.ID]graph.Edge
-	sections  int
-	spans     int
-	bytes     int
+	ctx        context.Context
+	reader     Reader
+	limits     Limits
+	documents  map[documentKey]*documentIndex
+	nodes      map[shoal.ID]graph.Node
+	edges      map[shoal.ID]graph.Edge
+	assertions map[shoal.ID][]interaction.AssertionReference
+	sections   int
+	spans      int
+	bytes      int
 }
 
 type documentKey struct {
@@ -488,9 +491,10 @@ func newVerifier(
 ) (*verifier, error) {
 	v := &verifier{
 		ctx: ctx, reader: reader, limits: limits,
-		documents: make(map[documentKey]*documentIndex),
-		nodes:     make(map[shoal.ID]graph.Node),
-		edges:     make(map[shoal.ID]graph.Edge),
+		documents:  make(map[documentKey]*documentIndex),
+		nodes:      make(map[shoal.ID]graph.Node),
+		edges:      make(map[shoal.ID]graph.Edge),
+		assertions: make(map[shoal.ID][]interaction.AssertionReference),
 	}
 	if len(views) > limits.MaxDocuments {
 		return nil, invalid("hydrated documents exceed the document bound")
@@ -604,7 +608,22 @@ func (v *verifier) graphAnchor(path graph.Path) (inference.EvidenceAnchor, error
 				"graph path edge does not match hydrated Explorer data")
 		}
 	}
-	return inference.NewGraphAnchor(path)
+	var assertions []interaction.AssertionReference
+	for _, edge := range path.Edges {
+		for _, assertion := range v.assertions[edge.ID] {
+			switch assertion.Origin {
+			case ontology.AssertionExplicit:
+				assertions = append(assertions, assertion)
+			case ontology.AssertionInferred, ontology.AssertionDerived:
+				return inference.EvidenceAnchor{}, invalid(
+					"graph path contains non-source ontology assertion")
+			default:
+				return inference.EvidenceAnchor{}, invalid(
+					"graph path contains assertion with unknown origin")
+			}
+		}
+	}
+	return inference.NewGraphAnchorWithAssertions(path, assertions)
 }
 
 func (v *verifier) verifyExisting(anchors []inference.EvidenceAnchor) error {
@@ -615,16 +634,25 @@ func (v *verifier) verifyExisting(anchors []inference.EvidenceAnchor) error {
 			if !ok {
 				return invalid("document anchor variant is unavailable")
 			}
-			if _, err := v.documentAnchor(citation, quote); err != nil {
+			verified, err := v.documentAnchor(citation, quote)
+			if err != nil {
 				return fmt.Errorf("existing document anchor %q: %w", anchor.ID(), err)
+			}
+			if verified.ID() != anchor.ID() {
+				return invalid("existing document anchor identity is not authoritative")
 			}
 		case inference.AnchorGraph:
 			path, ok := anchor.Path()
 			if !ok {
 				return invalid("graph anchor variant is unavailable")
 			}
-			if _, err := v.graphAnchor(path); err != nil {
+			verified, err := v.graphAnchor(path)
+			if err != nil {
 				return fmt.Errorf("existing graph anchor %q: %w", anchor.ID(), err)
+			}
+			if verified.ID() != anchor.ID() {
+				return invalid(
+					"existing graph anchor omits authoritative assertion identity")
 			}
 		default:
 			return invalid("unknown evidence anchor kind")
@@ -708,6 +736,11 @@ func (v *verifier) addNeighborhood(neighborhood explorer.Neighborhood) error {
 		}
 		localEdges[edge.ID] = edge
 	}
+	localAssertions, err := assertionsByNeighborhoodEdge(
+		neighborhood.Assertions, localEdges)
+	if err != nil {
+		return err
+	}
 	additionalBytes := 0
 	additionalNodes := 0
 	for id, node := range localNodes {
@@ -734,6 +767,13 @@ func (v *verifier) addNeighborhood(neighborhood explorer.Neighborhood) error {
 			if !canonicalEqual(existing, edge) {
 				return invalid("hydrated graph edge conflicts with prior content")
 			}
+			for edgeID, assertions := range localAssertions {
+				existing := v.assertions[edgeID]
+				if len(existing) != 0 &&
+					!reflect.DeepEqual(existing, assertions) {
+					return invalid("hydrated graph assertion conflicts with prior content")
+				}
+			}
 			continue
 		}
 		additionalEdges++
@@ -757,8 +797,96 @@ func (v *verifier) addNeighborhood(neighborhood explorer.Neighborhood) error {
 			v.edges[id] = cloneEdge(edge)
 		}
 	}
+	for edgeID, assertions := range localAssertions {
+		if _, exists := v.assertions[edgeID]; !exists {
+			v.assertions[edgeID] = append(
+				[]interaction.AssertionReference(nil), assertions...)
+		}
+	}
 	v.bytes += additionalBytes
 	return nil
+}
+
+func assertionsByNeighborhoodEdge(
+	assertions []ontology.Assertion,
+	edges map[shoal.ID]graph.Edge,
+) (map[shoal.ID][]interaction.AssertionReference, error) {
+	const (
+		assertionEdgeIDProperty = "shoal.graph.edge_id"
+		assertionIDProperty     = "ontology.assertion.id"
+	)
+	result := make(map[shoal.ID][]interaction.AssertionReference)
+	for _, assertion := range assertions {
+		if err := assertion.Validate(); err != nil {
+			return nil, err
+		}
+		matched := make(map[shoal.ID]struct{})
+		if edgeID := shoal.ID(
+			assertion.Metadata()[assertionEdgeIDProperty]); edgeID != "" {
+			if edge, ok := edges[edgeID]; ok {
+				if !assertionMatchesEvidenceEdge(assertion, edge) {
+					return nil, invalid(
+						"hydrated assertion does not match its graph edge")
+				}
+				matched[edgeID] = struct{}{}
+			}
+		}
+		if edge, ok := edges[assertion.ID()]; ok {
+			if !assertionMatchesEvidenceEdge(assertion, edge) {
+				return nil, invalid(
+					"hydrated assertion does not match its graph edge")
+			}
+			matched[assertion.ID()] = struct{}{}
+		}
+		for edgeID, edge := range edges {
+			if shoal.ID(edge.Properties[assertionIDProperty]) == assertion.ID() {
+				if assertion.Origin() != ontology.AssertionDerived {
+					return nil, invalid(
+						"non-derived assertion has a derivation edge")
+				}
+				matched[edgeID] = struct{}{}
+			}
+		}
+		if len(matched) == 0 {
+			return nil, invalid(
+				"hydrated graph assertion has no authoritative edge")
+		}
+		for edgeID := range matched {
+			result[edgeID] = append(
+				result[edgeID],
+				interaction.AssertionReference{
+					AssertionID: assertion.ID(),
+					EdgeID:      edgeID,
+					Origin:      assertion.Origin(),
+				},
+			)
+		}
+	}
+	for edgeID := range result {
+		sort.Slice(result[edgeID], func(i, j int) bool {
+			if compared := shoal.CompareID(
+				result[edgeID][i].AssertionID,
+				result[edgeID][j].AssertionID,
+			); compared != 0 {
+				return compared < 0
+			}
+			return result[edgeID][i].Origin < result[edgeID][j].Origin
+		})
+	}
+	return result, nil
+}
+
+func assertionMatchesEvidenceEdge(
+	assertion ontology.Assertion,
+	edge graph.Edge,
+) bool {
+	target, ok := assertion.Object().ReferenceValue()
+	return ok &&
+		edge.From == assertion.Subject() &&
+		edge.To == target &&
+		edge.Type == string(assertion.Predicate()) &&
+		math.Float64bits(float64(edge.Weight)) ==
+			math.Float64bits(float64(assertion.Confidence()))
 }
 
 func indexDocument(

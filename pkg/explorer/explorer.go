@@ -49,6 +49,7 @@ type Explorer struct {
 	interactions                  map[shoal.ID]*persistedInteraction
 	interactionLiveRecords        map[shoal.ID]*persistedInteraction
 	folds                         map[shoal.ID]*persistedFold
+	foldLiveRecords               map[shoal.ID]*persistedFold
 	interactionNodeIDs            map[shoal.ID]struct{}
 	interactionEdgeIDs            map[shoal.ID]struct{}
 	extractions                   map[shoal.ID]*persistedExtraction
@@ -71,6 +72,10 @@ type Explorer struct {
 	vectorProbeMu                 sync.Mutex
 	vectorAvailability            vectorAvailabilityCache
 	snapshot                      Snapshot
+	snapshotHistory               map[string]persistedSnapshot
+	latestSnapshotID              shoal.ID
+	latestSnapshotNodeDigests     map[shoal.ID]string
+	latestSnapshotEdgeDigests     map[shoal.ID]string
 	snapshotAnchor                time.Time
 	lastPublicationSequence       uint64
 	changeHistoryFloor            uint64
@@ -199,30 +204,34 @@ func OpenWithOptions(dir string, options Options) (*Explorer, error) {
 		}
 	}
 	explorer := &Explorer{
-		engine:                  eng,
-		documents:               make(map[shoal.ID]map[shoal.ID]*persistedDocument),
-		edges:                   make(map[shoal.ID]persistedEdge),
-		interactions:            make(map[shoal.ID]*persistedInteraction),
-		interactionLiveRecords:  make(map[shoal.ID]*persistedInteraction),
-		folds:                   make(map[shoal.ID]*persistedFold),
-		interactionNodeIDs:      make(map[shoal.ID]struct{}),
-		interactionEdgeIDs:      make(map[shoal.ID]struct{}),
-		extractions:             make(map[shoal.ID]*persistedExtraction),
-		ontologyProposals:       make(map[shoal.ID]*persistedOntologyProposal),
-		embedder:                options.Embedder,
-		embedders:               embedders,
-		maxEmbeddingSpaceFanout: maxFanout,
-		recallEvidence:          cloneStringMap(options.RecallEvidence),
-		latentLinkProjection:    latentProjection,
-		maxLatentAssertions:     maxLatentAssertions,
-		readOnly:                options.ReadOnly,
+		engine:                    eng,
+		documents:                 make(map[shoal.ID]map[shoal.ID]*persistedDocument),
+		edges:                     make(map[shoal.ID]persistedEdge),
+		interactions:              make(map[shoal.ID]*persistedInteraction),
+		interactionLiveRecords:    make(map[shoal.ID]*persistedInteraction),
+		folds:                     make(map[shoal.ID]*persistedFold),
+		foldLiveRecords:           make(map[shoal.ID]*persistedFold),
+		interactionNodeIDs:        make(map[shoal.ID]struct{}),
+		interactionEdgeIDs:        make(map[shoal.ID]struct{}),
+		extractions:               make(map[shoal.ID]*persistedExtraction),
+		ontologyProposals:         make(map[shoal.ID]*persistedOntologyProposal),
+		embedder:                  options.Embedder,
+		embedders:                 embedders,
+		maxEmbeddingSpaceFanout:   maxFanout,
+		recallEvidence:            cloneStringMap(options.RecallEvidence),
+		latentLinkProjection:      latentProjection,
+		maxLatentAssertions:       maxLatentAssertions,
+		snapshotHistory:           make(map[string]persistedSnapshot),
+		latestSnapshotNodeDigests: make(map[shoal.ID]string),
+		latestSnapshotEdgeDigests: make(map[shoal.ID]string),
+		readOnly:                  options.ReadOnly,
 	}
-	explorer.interactionRecordWriter = explorer.writeRecord
 	if err := explorer.load(); err != nil {
 		_ = eng.Close()
 		return nil, err
 	}
 	explorer.interactionLiveRecords = nil
+	explorer.foldLiveRecords = nil
 	if explorer.snapshotAnchor.IsZero() {
 		explorer.snapshotAnchor = time.Now().UTC()
 		if !explorer.readOnly {

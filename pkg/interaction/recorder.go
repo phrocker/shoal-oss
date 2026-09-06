@@ -82,9 +82,10 @@ func (r *Recorder) SetClock(now func() time.Time) error {
 	return nil
 }
 
-// Record durably stores a typed interaction. A missing RecordedAt is filled
-// from the recorder clock; IDs and all other security-relevant pins remain
-// caller-supplied and validated rather than guessed.
+// Record durably stores a typed interaction. RecordedAt is always overwritten
+// from the recorder's trusted clock; a caller cannot backdate or future-date
+// authorization chronology. On an exact retry, the ResultSink returns the
+// original accepted session and timestamp.
 func (r *Recorder) Record(
 	ctx context.Context, session Session,
 ) (Session, error) {
@@ -92,9 +93,7 @@ func (r *Recorder) Record(
 		return Session{}, shoal.NewError(
 			shoal.ErrorInvalidArgument, "interaction recorder is required")
 	}
-	if session.RecordedAt.IsZero() {
-		session.RecordedAt = r.now().UTC()
-	}
+	session.RecordedAt = r.now().UTC()
 	canonical, err := session.Canonical()
 	if err != nil {
 		return Session{}, err

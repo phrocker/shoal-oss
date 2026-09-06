@@ -174,19 +174,23 @@ func TestAnalyticsRecorderReauthorizesExtractedRelationshipEvidence(t *testing.T
 		t.Fatal(err)
 	}
 	if len(recorded.Turns) != 1 || recorded.Turns[0].ToolCall == nil ||
-		len(recorded.Turns[0].ToolCall.RetrievedEdges) == 0 {
+		len(recorded.Turns[0].ToolCall.RetrievedEvidence) == 0 ||
+		len(recorded.Turns[0].ToolCall.RetrievedEvidence[0].EdgeIDs) == 0 {
 		t.Fatalf("recorded extracted evidence = %+v", recorded)
 	}
 	if len(recorded.TouchedEdgeIDs()) != int(result.Scope.EdgeCount) {
 		t.Fatalf("recorded edge IDs = %d, result edge count = %d",
 			len(recorded.TouchedEdgeIDs()), result.Scope.EdgeCount)
 	}
-	assertionCount := len(recorded.Turns[0].ToolCall.RetrievedAssertions)
+	assertionCount := 0
+	for _, evidence := range recorded.Turns[0].ToolCall.RetrievedEvidence {
+		assertionCount += len(evidence.Assertions)
+	}
 	if assertionCount == 0 {
 		t.Fatal("recorded analytics evidence omitted extracted assertions")
 	}
-	if counted.calls != 2 {
-		t.Fatalf("analytics documents scans = %d, want 2", counted.calls)
+	if counted.calls != 1 {
+		t.Fatalf("analytics documents scans = %d, want 1", counted.calls)
 	}
 	readDecision := f.decision(
 		t,
@@ -200,8 +204,8 @@ func TestAnalyticsRecorderReauthorizesExtractedRelationshipEvidence(t *testing.T
 	if _, err := client.InteractionRecords(readContext); err != nil {
 		t.Fatal(err)
 	}
-	if counted.calls != 1 {
-		t.Fatalf("analytics list documents scans = %d, want 1", counted.calls)
+	if counted.calls != 0 {
+		t.Fatalf("analytics list documents scans = %d, want 0", counted.calls)
 	}
 	counted.calls = 0
 	if _, err := client.Interaction(
@@ -209,8 +213,8 @@ func TestAnalyticsRecorderReauthorizesExtractedRelationshipEvidence(t *testing.T
 	); err != nil {
 		t.Fatal(err)
 	}
-	if counted.calls != 1 {
-		t.Fatalf("analytics point documents scans = %d, want 1", counted.calls)
+	if counted.calls != 0 {
+		t.Fatalf("analytics point documents scans = %d, want 0", counted.calls)
 	}
 }
 
@@ -320,6 +324,21 @@ func TestAnalyticsCommittedSinkFailureIsIndeterminate(t *testing.T) {
 	if !explorer.IsIndeterminateCommit(err) {
 		t.Fatalf("committed analytics sink error = %v", err)
 	}
+}
+
+type committedFailureInteractionBase struct {
+	*explorer.Explorer
+}
+
+func (b *committedFailureInteractionBase) RecordInteractionResult(
+	ctx context.Context, session interaction.Session,
+) (interaction.Session, error) {
+	recorded, err := b.Explorer.RecordInteractionResult(ctx, session)
+	if err != nil {
+		return recorded, err
+	}
+	return recorded, explorer.MarkCommittedInteraction(
+		shoal.NewError(shoal.ErrorUnavailable, "post-commit failure"))
 }
 
 func interactionErrorChain(err error) string {

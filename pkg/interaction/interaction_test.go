@@ -22,7 +22,6 @@ package interaction_test
 import (
 	"errors"
 	"fmt"
-	"math"
 	"strconv"
 	"strings"
 	"testing"
@@ -30,62 +29,8 @@ import (
 
 	"github.com/phrocker/shoal-oss/pkg/graph"
 	"github.com/phrocker/shoal-oss/pkg/interaction"
-	"github.com/phrocker/shoal-oss/pkg/ontology"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
-
-func TestAssertionEvidenceEqualDistinguishesSignedZeroScores(t *testing.T) {
-	base := interaction.AssertionEvidence{
-		ID: "assertion:one", Subject: "subject", Predicate: "property:name",
-		ObjectReference: "object", Origin: "explicit", GraphEdgeID: "edge",
-		DerivationID: "derivation:one",
-	}
-	for _, mutate := range []func(*interaction.AssertionEvidence){
-		func(value *interaction.AssertionEvidence) {
-			value.Confidence = shoal.Score(math.Copysign(0, -1))
-		},
-		func(value *interaction.AssertionEvidence) {
-			value.DerivationScore = shoal.Score(math.Copysign(0, -1))
-		},
-	} {
-		changed := base
-		mutate(&changed)
-		if interaction.AssertionEvidenceEqual(base, changed) {
-			t.Fatalf("signed-zero mutation considered equal: %#v", changed)
-		}
-	}
-}
-
-func TestAssertionEvidenceRejectsImpossibleProjection(t *testing.T) {
-	valid := interaction.AssertionEvidence{
-		ID: "assertion:one", Subject: "subject", Predicate: "property:name",
-		Origin: string(ontology.AssertionExplicit), Confidence: 0.5,
-	}
-	for name, mutate := range map[string]func(*interaction.AssertionEvidence){
-		"confidence below zero": func(value *interaction.AssertionEvidence) {
-			value.Confidence = -0.1
-		},
-		"confidence above one": func(value *interaction.AssertionEvidence) {
-			value.Confidence = 1.1
-		},
-		"non-derived derivation ID": func(value *interaction.AssertionEvidence) {
-			value.DerivationID = "derivation:one"
-		},
-		"non-derived derivation score": func(value *interaction.AssertionEvidence) {
-			value.DerivationScore = 0.5
-		},
-	} {
-		t.Run(name, func(t *testing.T) {
-			evidence := valid
-			mutate(&evidence)
-			if err := evidence.Validate(); !shoal.IsErrorCode(
-				err, shoal.ErrorInvalidArgument,
-			) {
-				t.Fatalf("error = %v", err)
-			}
-		})
-	}
-}
 
 func TestConjoinIsSortedUniqueUnion(t *testing.T) {
 	labels, err := interaction.Conjoin(
@@ -102,131 +47,6 @@ func TestConjoinIsSortedUniqueUnion(t *testing.T) {
 	}
 	if len(empty) != 0 {
 		t.Fatalf("empty conjunction = %v", empty)
-	}
-}
-
-func TestSessionRetainsExactEdgeEvidenceAndRequiredVisibility(t *testing.T) {
-	sourceEdge := graph.Edge{
-		ID: "edge-a-b", From: "node-a", To: "node-b",
-		Type: "related", Weight: 1,
-		Properties: shoal.Metadata{"source": "exact"},
-	}
-
-	session := interaction.Session{
-		ID: "session-edge-evidence",
-		RecordedAt: time.Date(
-			2026, time.September, 6, 12, 0, 0, 0, time.UTC),
-		Operation:          interaction.OperationToolCall,
-		RequiredVisibility: []string{"policy-b", "policy-a", "policy-b"},
-		Turns: []interaction.Turn{{
-			Index: 0,
-			ToolCall: &interaction.ToolCall{
-				Kind:             "analytics",
-				RetrievedNodeIDs: []shoal.ID{"node-b", "node-a"},
-				RetrievedEdges:   []graph.Edge{sourceEdge, sourceEdge},
-			},
-		}},
-	}
-	canonical, err := session.Canonical()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(canonical.Turns[0].ToolCall.RetrievedEdges) != 1 ||
-		canonical.Turns[0].ToolCall.RetrievedEdges[0].Properties["source"] !=
-			"exact" ||
-		interaction.Expression(canonical.RequiredVisibility) !=
-			"policy-a&policy-b" {
-		t.Fatalf("canonical session = %+v", canonical)
-	}
-	if got := canonical.TouchedEdgeIDs(); len(got) != 1 ||
-		got[0] != sourceEdge.ID {
-		t.Fatalf("touched edges = %v", got)
-	}
-	if got := canonical.TouchedNodeIDs(); len(got) != 2 ||
-		got[0] != "node-a" || got[1] != "node-b" {
-		t.Fatalf("touched nodes = %v", got)
-	}
-	subgraph, err := canonical.Subgraph(func(shoal.ID) ([]string, error) {
-		return []string{"node-policy"}, nil
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if interaction.Expression(subgraph.Visibility) !=
-		"node-policy&policy-a&policy-b" ||
-		len(subgraph.TouchedEdgeIDs) != 1 ||
-		subgraph.TouchedEdgeIDs[0] != sourceEdge.ID {
-		t.Fatalf("subgraph evidence = %+v", subgraph)
-	}
-	var callProperties shoal.Metadata
-	for _, node := range subgraph.Nodes {
-		if node.Kind == interaction.KindToolCall {
-			callProperties = node.Properties
-			break
-		}
-	}
-	if callProperties[interaction.PropertyRetrievedEdges] != "1" ||
-		callProperties[interaction.PropertyEdgeEvidence] == "" {
-		t.Fatalf("tool-call edge evidence = %+v", callProperties)
-	}
-	for _, value := range callProperties {
-		if strings.Contains(value, string(sourceEdge.ID)) {
-			t.Fatal("raw source edge ID leaked into graph metadata")
-		}
-	}
-}
-
-func TestCanonicalEvidenceDistinguishesMissingEmptyProperties(t *testing.T) {
-	session := interaction.Session{
-		ID: "session-conflicting-empty-properties",
-		RecordedAt: time.Date(
-			2026, time.September, 6, 12, 0, 0, 0, time.UTC),
-		Turns: []interaction.Turn{{
-			Index: 0,
-			ToolCall: &interaction.ToolCall{
-				Kind: "analytics",
-				RetrievedNodes: []graph.Node{
-					{ID: "node", Kind: "document", Properties: shoal.Metadata{"a": ""}},
-					{ID: "node", Kind: "document", Properties: shoal.Metadata{"b": ""}},
-				},
-			},
-		}},
-	}
-	if _, err := session.Canonical(); !shoal.IsErrorCode(
-		err, shoal.ErrorInvalidArgument,
-	) {
-		t.Fatalf("conflicting node properties = %v", err)
-	}
-
-	session.Turns[0].ToolCall.RetrievedNodes = nil
-	session.Turns[0].ToolCall.RetrievedEdges = []graph.Edge{
-		{
-			ID: "edge", From: "from", To: "to", Type: "related",
-			Properties: shoal.Metadata{"a": ""},
-		},
-		{
-			ID: "edge", From: "from", To: "to", Type: "related",
-			Properties: shoal.Metadata{"b": ""},
-		},
-	}
-	if _, err := session.Canonical(); !shoal.IsErrorCode(
-		err, shoal.ErrorInvalidArgument,
-	) {
-		t.Fatalf("conflicting edge properties = %v", err)
-	}
-
-	session.CitedEdges = []graph.Edge{{
-		ID: "edge", From: "from", To: "to", Type: "related",
-		Properties: shoal.Metadata{"a": ""},
-	}}
-	session.Turns[0].ToolCall.RetrievedEdges = []graph.Edge{{
-		ID: "edge", From: "from", To: "to", Type: "related",
-		Properties: shoal.Metadata{"b": ""},
-	}}
-	if _, err := session.Canonical(); !shoal.IsErrorCode(
-		err, shoal.ErrorInvalidArgument,
-	) {
-		t.Fatalf("cross-slice conflicting edge properties = %v", err)
 	}
 }
 
@@ -566,7 +386,7 @@ func TestKindAndEdgeNamespaceDetection(t *testing.T) {
 
 func TestTombstoneNodeCarriesAuditFields(t *testing.T) {
 	tombstone := interaction.Tombstone{
-		SessionID:  "session-4",
+		SessionID:  "interaction.session_4",
 		DeletedAt:  time.Unix(1700000123, 0).UTC(),
 		NodeCount:  3,
 		EdgeCount:  4,
@@ -579,10 +399,10 @@ func TestTombstoneNodeCarriesAuditFields(t *testing.T) {
 	if node.Kind != interaction.KindTombstone {
 		t.Fatalf("kind = %q", node.Kind)
 	}
-	if node.ID != interaction.TombstoneID("session-4") {
+	if node.ID != interaction.TombstoneID("interaction.session_4") {
 		t.Fatalf("id = %q", node.ID)
 	}
-	if node.Properties[interaction.PropertySessionID] != "session-4" ||
+	if node.Properties[interaction.PropertySessionID] != "interaction.session_4" ||
 		node.Properties[interaction.PropertyNodeCount] != "3" ||
 		node.Properties[interaction.PropertyEdgeCount] != "4" ||
 		node.Properties[interaction.PropertyVisibility] != "ops&secret" ||

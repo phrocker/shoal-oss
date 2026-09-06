@@ -22,8 +22,10 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
+	"encoding/json"
 	"math"
 	"sort"
+	"time"
 
 	"github.com/phrocker/shoal-oss/pkg/graph"
 	"github.com/phrocker/shoal-oss/pkg/interaction"
@@ -44,7 +46,432 @@ func (e *Explorer) Snapshot(ctx context.Context) (Snapshot, error) {
 	if err := e.ensureGraphLocked(); err != nil {
 		return Snapshot{}, err
 	}
+	if err := e.registerSnapshotLocked(e.snapshot); err != nil {
+		return Snapshot{}, err
+	}
 	return e.snapshot, nil
+}
+
+// ValidateSnapshot verifies that a snapshot pin names a genuine corpus
+// frontier observed from this Explorer instance. Historical frontiers remain
+// valid after unrelated content publications during the process lifetime.
+func (e *Explorer) ValidateSnapshot(
+	ctx context.Context, id shoal.ID, asOf time.Time, nodeIDs []shoal.ID,
+) error {
+	return e.ValidateEvidenceSnapshot(ctx, id, asOf, nodeIDs, nil, nil)
+}
+
+// ValidateEvidenceSnapshot verifies exact source nodes and edges against the
+// canonical state captured by a trusted snapshot. Reusing an ID after changing
+// content, revision, labels, endpoints, or edge properties fails closed.
+func (e *Explorer) ValidateEvidenceSnapshot(
+	ctx context.Context,
+	id shoal.ID,
+	asOf time.Time,
+	nodeIDs []shoal.ID,
+	edgeIDs []shoal.ID,
+	assertions []interaction.AssertionReference,
+) error {
+	if err := contextError(ctx); err != nil {
+		return err
+	}
+	if err := shoal.ValidateRequiredID("snapshot ID", id); err != nil {
+		return err
+	}
+	if asOf.IsZero() {
+		return shoal.NewError(
+			shoal.ErrorInvalidArgument, "snapshot time is required")
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if err := e.requireOpen(); err != nil {
+		return err
+	}
+	if err := e.ensureGraphLocked(); err != nil {
+		return err
+	}
+	return e.validateEvidenceSnapshotLocked(
+		id, asOf, nodeIDs, edgeIDs, assertions)
+}
+
+func (e *Explorer) validateEvidenceSnapshotLocked(
+	id shoal.ID,
+	asOf time.Time,
+	nodeIDs []shoal.ID,
+	edgeIDs []shoal.ID,
+	assertions []interaction.AssertionReference,
+) error {
+	record, ok := e.snapshotHistory[string(id)]
+	if !ok || !record.AsOf.Equal(asOf.UTC()) {
+		return shoal.NewError(
+			shoal.ErrorConflict, "snapshot pin is not a trusted corpus frontier")
+	}
+	nodeState, edgeState, err := e.snapshotStateLocked(id)
+	if err != nil {
+		return err
+	}
+	for _, nodeID := range nodeIDs {
+		node, current := e.graphNodes[nodeID]
+		expected, present := nodeState[nodeID]
+		actual, digestErr := snapshotObjectDigest(node)
+		if !current || interaction.IsInteractionKind(node.Kind) || !present ||
+			expected == "" || digestErr != nil || actual != expected {
+			return shoal.NewError(
+				shoal.ErrorConflict,
+				"interaction source does not match the pinned snapshot",
+			)
+		}
+	}
+	for _, edgeID := range edgeIDs {
+		edge, current := e.graphEdges[edgeID]
+		expected, present := edgeState[edgeID]
+		actual, digestErr := snapshotObjectDigest(edge)
+		if !current || interaction.IsInteractionID(edge.ID) || !present ||
+			expected == "" || digestErr != nil || actual != expected {
+			return shoal.NewError(
+				shoal.ErrorConflict,
+				"interaction source edge does not match the pinned snapshot",
+			)
+		}
+	}
+	for _, reference := range assertions {
+		if err := e.validateAssertionReferenceLocked(reference); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (e *Explorer) validateAssertionReferenceLocked(
+	reference interaction.AssertionReference,
+) error {
+	if err := shoal.ValidateRequiredID(
+		"interaction assertion ID", reference.AssertionID); err != nil {
+		return err
+	}
+	if err := shoal.ValidateRequiredID(
+		"interaction assertion edge ID", reference.EdgeID); err != nil {
+		return err
+	}
+	var assertion ontology.Assertion
+	found := false
+	for _, candidate := range e.graphAssertions {
+		if candidate.ID() == reference.AssertionID {
+			assertion = candidate
+			found = true
+			break
+		}
+	}
+	if !found || assertion.Origin() != reference.Origin {
+		return shoal.NewError(
+			shoal.ErrorConflict,
+			"interaction assertion does not match current authoritative data",
+		)
+	}
+	edge, ok := e.graphEdges[reference.EdgeID]
+	if !ok {
+		return shoal.NewError(
+			shoal.ErrorConflict,
+			"interaction assertion edge is no longer present",
+		)
+	}
+	const (
+		assertionEdgeIDProperty = "shoal.graph.edge_id"
+		assertionIDProperty     = "ontology.assertion.id"
+	)
+	target, hasTarget := assertion.Object().ReferenceValue()
+	matches := shoal.ID(
+		assertion.Metadata()[assertionEdgeIDProperty],
+	) == reference.EdgeID ||
+		(hasTarget && assertion.ID() == reference.EdgeID &&
+			edge.From == assertion.Subject() &&
+			edge.To == target &&
+			edge.Type == string(assertion.Predicate()) &&
+			math.Float64bits(float64(edge.Weight)) ==
+				math.Float64bits(float64(assertion.Confidence()))) ||
+		shoal.ID(edge.Properties[assertionIDProperty]) == assertion.ID()
+	if !matches {
+		return shoal.NewError(
+			shoal.ErrorConflict,
+			"interaction assertion is not authoritative for its source edge",
+		)
+	}
+	return nil
+}
+
+func (e *Explorer) registerSnapshotLocked(snapshot Snapshot) error {
+	id := shoal.ID(snapshot.ID)
+	currentNodes, currentEdges, err := e.currentSourceStateLocked()
+	if err != nil {
+		return err
+	}
+	nodeStates, removedNodes := snapshotObjectDelta(
+		e.latestSnapshotNodeDigests, currentNodes)
+	edgeStates, removedEdges := snapshotObjectDelta(
+		e.latestSnapshotEdgeDigests, currentEdges)
+	record := persistedSnapshot{
+		ID: id, AsOf: snapshot.AsOf.UTC(), ParentID: e.latestSnapshotID,
+		AddedNodeIDs:   snapshotStateIDs(nodeStates),
+		RemovedNodeIDs: removedNodes,
+		NodeStates:     nodeStates,
+		RemovedEdgeIDs: removedEdges,
+		EdgeStates:     edgeStates,
+	}
+	if existing, ok := e.snapshotHistory[snapshot.ID]; ok {
+		nodes, edges, err := e.snapshotStateLocked(id)
+		if err == nil && existing.AsOf.Equal(record.AsOf) &&
+			snapshotObjectMapsEqual(nodes, currentNodes) &&
+			snapshotObjectMapsEqual(edges, currentEdges) {
+			e.latestSnapshotID = id
+			e.setLatestSnapshotState(currentNodes, currentEdges)
+			return nil
+		}
+		return shoal.NewError(
+			shoal.ErrorInternal,
+			"snapshot ID has conflicting observation times",
+		)
+	}
+	if e.readOnly {
+		e.snapshotHistory[snapshot.ID] = record
+		e.latestSnapshotID = id
+		e.setLatestSnapshotState(currentNodes, currentEdges)
+		return nil
+	}
+	accepted, err := e.conditionalInteractionRecord(
+		snapshotRecordRow(id),
+		embeddedRecordSnapshot,
+		record,
+		recordCQV2,
+		false,
+	)
+	if err != nil {
+		return err
+	}
+	if !accepted {
+		var winner persistedSnapshot
+		found, err := e.lookupEmbeddedRecord(
+			snapshotRecordRow(id), embeddedRecordSnapshot, &winner)
+		if err != nil {
+			return err
+		}
+		winner.AsOf = winner.AsOf.UTC()
+		if !found || winner.ID != id || !winner.AsOf.Equal(record.AsOf) {
+			return shoal.NewError(
+				shoal.ErrorConflict,
+				"snapshot ID is already registered with different content",
+			)
+		}
+		e.snapshotHistory[snapshot.ID] = winner
+		nodes, edges, err := e.snapshotStateLocked(id)
+		if err != nil ||
+			!snapshotObjectMapsEqual(nodes, currentNodes) ||
+			!snapshotObjectMapsEqual(edges, currentEdges) {
+			return shoal.NewError(
+				shoal.ErrorConflict,
+				"snapshot ID is already registered with different membership",
+			)
+		}
+		record = winner
+	}
+	e.snapshotHistory[snapshot.ID] = record
+	e.latestSnapshotID = id
+	e.setLatestSnapshotState(currentNodes, currentEdges)
+	return nil
+}
+
+func snapshotObjectMapsEqual(
+	left, right map[shoal.ID]string,
+) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for id, digest := range left {
+		if right[id] != digest {
+			return false
+		}
+	}
+	return true
+}
+
+func (e *Explorer) restoreLatestSnapshotLocked() error {
+	var latest persistedSnapshot
+	found := false
+	for _, record := range e.snapshotHistory {
+		if !found || record.AsOf.After(latest.AsOf) ||
+			(record.AsOf.Equal(latest.AsOf) &&
+				shoal.CompareID(record.ID, latest.ID) > 0) {
+			latest = record
+			found = true
+		}
+	}
+	if !found {
+		return nil
+	}
+	nodes, edges, err := e.snapshotStateLocked(latest.ID)
+	if err != nil {
+		return err
+	}
+	e.latestSnapshotID = latest.ID
+	e.setLatestSnapshotState(nodes, edges)
+	return nil
+}
+
+func (e *Explorer) currentSourceStateLocked() (
+	map[shoal.ID]string,
+	map[shoal.ID]string,
+	error,
+) {
+	nodes := make(map[shoal.ID]string, len(e.graphNodes))
+	for id, node := range e.graphNodes {
+		if !interaction.IsInteractionKind(node.Kind) {
+			digest, err := snapshotObjectDigest(node)
+			if err != nil {
+				return nil, nil, err
+			}
+			nodes[id] = digest
+		}
+	}
+	edges := make(map[shoal.ID]string, len(e.graphEdges))
+	for id, edge := range e.graphEdges {
+		from, fromOK := e.graphNodes[edge.From]
+		to, toOK := e.graphNodes[edge.To]
+		if interaction.IsInteractionID(id) || !fromOK || !toOK ||
+			interaction.IsInteractionKind(from.Kind) ||
+			interaction.IsInteractionKind(to.Kind) {
+			continue
+		}
+		digest, err := snapshotObjectDigest(edge)
+		if err != nil {
+			return nil, nil, err
+		}
+		edges[id] = digest
+	}
+	return nodes, edges, nil
+}
+
+func snapshotObjectDelta(
+	previous, current map[shoal.ID]string,
+) ([]persistedSnapshotObject, []shoal.ID) {
+	var states []persistedSnapshotObject
+	var removed []shoal.ID
+	for id, digest := range current {
+		if previous[id] != digest {
+			states = append(states, persistedSnapshotObject{
+				ID: id, Digest: digest,
+			})
+		}
+	}
+	for id := range previous {
+		if _, ok := current[id]; !ok {
+			removed = append(removed, id)
+		}
+	}
+	sort.Slice(states, func(i, j int) bool {
+		return shoal.CompareID(states[i].ID, states[j].ID) < 0
+	})
+	sort.Slice(removed, func(i, j int) bool {
+		return shoal.CompareID(removed[i], removed[j]) < 0
+	})
+	return states, removed
+}
+
+func snapshotStateIDs(states []persistedSnapshotObject) []shoal.ID {
+	ids := make([]shoal.ID, len(states))
+	for index, state := range states {
+		ids[index] = state.ID
+	}
+	return ids
+}
+
+func (e *Explorer) snapshotMembershipLocked(
+	id shoal.ID,
+) (map[shoal.ID]struct{}, error) {
+	nodes, _, err := e.snapshotStateLocked(id)
+	if err != nil {
+		return nil, err
+	}
+	membership := make(map[shoal.ID]struct{}, len(nodes))
+	for nodeID := range nodes {
+		membership[nodeID] = struct{}{}
+	}
+	return membership, nil
+}
+
+func (e *Explorer) snapshotStateLocked(
+	id shoal.ID,
+) (map[shoal.ID]string, map[shoal.ID]string, error) {
+	var chain []persistedSnapshot
+	seen := make(map[shoal.ID]struct{})
+	for id != "" {
+		if _, duplicate := seen[id]; duplicate {
+			return nil, nil, shoal.NewError(
+				shoal.ErrorInternal, "snapshot history contains a cycle")
+		}
+		seen[id] = struct{}{}
+		record, ok := e.snapshotHistory[string(id)]
+		if !ok {
+			return nil, nil, shoal.NewError(
+				shoal.ErrorInternal, "snapshot history is incomplete")
+		}
+		chain = append(chain, record)
+		id = record.ParentID
+	}
+	nodes := make(map[shoal.ID]string)
+	edges := make(map[shoal.ID]string)
+	for index := len(chain) - 1; index >= 0; index-- {
+		for _, nodeID := range chain[index].RemovedNodeIDs {
+			delete(nodes, nodeID)
+		}
+		if len(chain[index].NodeStates) == 0 {
+			for _, nodeID := range chain[index].AddedNodeIDs {
+				nodes[nodeID] = ""
+			}
+		} else {
+			for _, state := range chain[index].NodeStates {
+				nodes[state.ID] = state.Digest
+			}
+		}
+		for _, edgeID := range chain[index].RemovedEdgeIDs {
+			delete(edges, edgeID)
+		}
+		for _, state := range chain[index].EdgeStates {
+			edges[state.ID] = state.Digest
+		}
+	}
+	return nodes, edges, nil
+}
+
+func (e *Explorer) setLatestSnapshotState(
+	nodes, edges map[shoal.ID]string,
+) {
+	e.latestSnapshotNodeDigests = nodes
+	e.latestSnapshotEdgeDigests = edges
+}
+
+func snapshotObjectDigest(value any) (string, error) {
+	switch object := value.(type) {
+	case graph.Node:
+		object.Labels = append([]string(nil), object.Labels...)
+		sort.Strings(object.Labels)
+		if len(object.Labels) == 0 {
+			object.Labels = nil
+		}
+		if len(object.Properties) == 0 {
+			object.Properties = nil
+		}
+		value = object
+	case graph.Edge:
+		if len(object.Properties) == 0 {
+			object.Properties = nil
+		}
+		value = object
+	}
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(encoded)
+	return hex.EncodeToString(sum[:]), nil
 }
 
 // BoundedNeighborhood expands the cached adjacency index without scanning or

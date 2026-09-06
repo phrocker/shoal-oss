@@ -36,6 +36,7 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/contextpack"
 	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/inference"
+	"github.com/phrocker/shoal-oss/pkg/interaction"
 	"github.com/phrocker/shoal-oss/pkg/retrieval"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
@@ -656,12 +657,13 @@ type RunTrace struct {
 // exposure — and therefore the visibility an interaction record requires — is
 // determined by everything it saw.
 type InteractionTurn struct {
-	Index            int
-	Decision         ActionKind
-	Usage            Usage
-	Failed           bool
-	ToolKind         ActionKind
-	RetrievedNodeIDs []shoal.ID
+	Index             int
+	Decision          ActionKind
+	Usage             Usage
+	Failed            bool
+	ToolKind          ActionKind
+	RetrievedNodeIDs  []shoal.ID
+	RetrievedEvidence []interaction.EvidenceReference
 }
 
 // EvaluationRecord is a redacted deterministic execution record. It contains
@@ -693,9 +695,11 @@ type EvaluationRecord struct {
 	// SeedNodeIDs are source graph nodes the session was shown before its
 	// first turn. CitedNodeIDs are the source graph nodes the final answer
 	// actually cited. Both are sorted and deduplicated.
-	SeedNodeIDs  []shoal.ID
-	Turns        []InteractionTurn
-	CitedNodeIDs []shoal.ID
+	SeedNodeIDs   []shoal.ID
+	SeedEvidence  []interaction.EvidenceReference
+	Turns         []InteractionTurn
+	CitedNodeIDs  []shoal.ID
+	CitedEvidence []interaction.EvidenceReference
 }
 
 // Recorder durably captures an execution record. Recording is part of serving
@@ -1281,6 +1285,11 @@ func evaluationRecord(record Record) (EvaluationRecord, error) {
 			failedIterations[failure.Iteration] = struct{}{}
 		}
 	}
+	evaluation.SeedEvidence, err = evidenceReferences(
+		record.Request.context.Evidence())
+	if err != nil {
+		return EvaluationRecord{}, err
+	}
 	evaluation.SeedNodeIDs = sourceNodeIDs(record.Request.context.Evidence())
 	for index, exchange := range record.Transcript.exchanges {
 		add(exchange.action)
@@ -1290,6 +1299,11 @@ func evaluationRecord(record Record) (EvaluationRecord, error) {
 			Usage:            exchange.action.usage,
 			ToolKind:         exchange.result.kind,
 			RetrievedNodeIDs: sourceNodeIDs(exchange.result.anchors),
+		}
+		turn.RetrievedEvidence, err = evidenceReferences(
+			exchange.result.anchors)
+		if err != nil {
+			return EvaluationRecord{}, err
 		}
 		if _, failed := failedIterations[index]; failed {
 			turn.Failed = true
@@ -1311,7 +1325,59 @@ func evaluationRecord(record Record) (EvaluationRecord, error) {
 	}
 	evaluation.CitedNodeIDs = citedSourceNodeIDs(
 		record.Result, record.Transcript.context.Evidence())
+	evaluation.CitedEvidence, err = citedEvidenceReferences(
+		record.Result, record.Transcript.context.Evidence())
+	if err != nil {
+		return EvaluationRecord{}, err
+	}
 	return evaluation, nil
+}
+
+func evidenceReferences(
+	anchors []inference.EvidenceAnchor,
+) ([]interaction.EvidenceReference, error) {
+	if len(anchors) == 0 {
+		return nil, nil
+	}
+	result := make([]interaction.EvidenceReference, 0, len(anchors))
+	for _, anchor := range anchors {
+		reference, err := anchor.EvidenceReference()
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, reference)
+	}
+	sort.Slice(result, func(i, j int) bool {
+		return shoal.CompareID(
+			result[i].AnchorID, result[j].AnchorID) < 0
+	})
+	return result, nil
+}
+
+func citedEvidenceReferences(
+	result inference.InferenceResult,
+	available []inference.EvidenceAnchor,
+) ([]interaction.EvidenceReference, error) {
+	cited := make(map[shoal.ID]struct{})
+	for _, claim := range result.Claims() {
+		for _, id := range claim.EvidenceIDs() {
+			cited[id] = struct{}{}
+		}
+	}
+	for _, issue := range append(result.Unresolved(), result.Unsupported()...) {
+		for _, id := range issue.EvidenceIDs() {
+			cited[id] = struct{}{}
+		}
+	}
+	anchors := append(append([]inference.EvidenceAnchor(nil), available...),
+		result.EvidenceAdditions()...)
+	selected := make([]inference.EvidenceAnchor, 0, len(cited))
+	for _, anchor := range anchors {
+		if _, ok := cited[anchor.ID()]; ok {
+			selected = append(selected, anchor)
+		}
+	}
+	return evidenceReferences(selected)
 }
 
 // sourceNodeIDs projects evidence anchors onto the source graph nodes they

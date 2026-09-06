@@ -39,7 +39,6 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
-	"math"
 	"sort"
 	"strconv"
 	"strings"
@@ -140,11 +139,6 @@ const (
 	PropertyDelegationID    = "interaction.delegation_id"
 	PropertyReasonCode      = "interaction.reason_code"
 	PropertyReasonDigest    = "interaction.reason_digest"
-	PropertyRetrievedNodes  = "interaction.retrieved_node_count"
-	PropertyRetrievedEdges  = "interaction.retrieved_edge_count"
-	PropertyRetrievedFacts  = "interaction.retrieved_assertion_count"
-	PropertyCitedEdges      = "interaction.cited_edge_count"
-	PropertyEdgeEvidence    = "interaction.edge_evidence_digest"
 
 	// PropertySummaryDigest carries the SHA-256 digest of a fold's
 	// out-of-band summary text. The digest is stored so a fold can be
@@ -190,132 +184,9 @@ func IsInteractionEdgeType(edgeType string) bool {
 // source graph nodes the call put in front of the model, not only the ones it
 // went on to cite.
 type ToolCall struct {
-	Kind                string
-	RetrievedNodeIDs    []shoal.ID
-	RetrievedNodes      []graph.Node
-	RetrievedEdges      []graph.Edge
-	RetrievedAssertions []AssertionEvidence
-}
-
-// AssertionEvidence is the immutable identity and graph projection of an
-// ontology assertion used by a tool. The source assertion remains in the
-// corpus; this record retains enough exact structure to reauthorize and verify
-// every derived graph edge without duplicating private assertion internals.
-type AssertionEvidence struct {
-	ID              shoal.ID
-	Subject         shoal.ID
-	Predicate       shoal.ID
-	ObjectReference shoal.ID
-	Origin          string
-	Confidence      shoal.Score
-	GraphEdgeID     shoal.ID
-	DerivationID    shoal.ID
-	DerivationScore shoal.Score
-}
-
-// AssertionEvidenceEqual compares a durable assertion projection exactly,
-// including the IEEE-754 representation of both scores.
-func AssertionEvidenceEqual(left, right AssertionEvidence) bool {
-	return left.ID == right.ID &&
-		left.Subject == right.Subject &&
-		left.Predicate == right.Predicate &&
-		left.ObjectReference == right.ObjectReference &&
-		left.Origin == right.Origin &&
-		math.Float64bits(float64(left.Confidence)) ==
-			math.Float64bits(float64(right.Confidence)) &&
-		left.GraphEdgeID == right.GraphEdgeID &&
-		left.DerivationID == right.DerivationID &&
-		math.Float64bits(float64(left.DerivationScore)) ==
-			math.Float64bits(float64(right.DerivationScore))
-}
-
-// Validate checks the recorded assertion projection.
-func (e AssertionEvidence) Validate() error {
-	if err := ontology.ValidateID(e.ID); err != nil ||
-		ontology.IDNamespace(e.ID) != "assertion" {
-		return shoal.NewError(
-			shoal.ErrorInvalidArgument, "assertion evidence ID is invalid")
-	}
-	if err := shoal.ValidateRequiredID(
-		"assertion evidence subject", e.Subject,
-	); err != nil {
-		return err
-	}
-	if err := ontology.ValidateID(e.Predicate); err != nil {
-		return shoal.NewError(
-			shoal.ErrorInvalidArgument,
-			"assertion evidence predicate is invalid",
-		)
-	}
-	predicateNamespace := ontology.IDNamespace(e.Predicate)
-	if predicateNamespace != "property" &&
-		predicateNamespace != "relationship" {
-		return shoal.NewError(
-			shoal.ErrorInvalidArgument,
-			"assertion evidence predicate has an unexpected namespace",
-		)
-	}
-	if err := shoal.ValidateOptionalID(
-		"assertion evidence object reference", e.ObjectReference,
-	); err != nil {
-		return err
-	}
-	if err := shoal.ValidateOptionalID(
-		"assertion evidence graph edge ID", e.GraphEdgeID,
-	); err != nil {
-		return err
-	}
-	if err := shoal.ValidateOptionalID(
-		"assertion evidence derivation ID", e.DerivationID,
-	); err != nil {
-		return err
-	}
-	if e.DerivationID != "" {
-		if err := ontology.ValidateID(e.DerivationID); err != nil ||
-			ontology.IDNamespace(e.DerivationID) != "derivation" {
-			return shoal.NewError(
-				shoal.ErrorInvalidArgument,
-				"assertion evidence derivation ID is invalid",
-			)
-		}
-	}
-	origin := ontology.AssertionOrigin(e.Origin)
-	switch origin {
-	case ontology.AssertionExplicit,
-		ontology.AssertionInferred,
-		ontology.AssertionDerived:
-	default:
-		return shoal.NewError(
-			shoal.ErrorInvalidArgument, "assertion evidence origin is invalid")
-	}
-	if origin == ontology.AssertionDerived &&
-		(e.ObjectReference == "" || e.DerivationID == "") {
-		return shoal.NewError(
-			shoal.ErrorInvalidArgument,
-			"derived assertion evidence is incomplete",
-		)
-	}
-	if origin != ontology.AssertionDerived &&
-		(e.DerivationID != "" ||
-			math.Float64bits(float64(e.DerivationScore)) != 0) {
-		return shoal.NewError(
-			shoal.ErrorInvalidArgument,
-			"non-derived assertion evidence has derivation fields",
-		)
-	}
-	if err := shoal.ValidateFiniteScore(
-		"assertion evidence confidence", e.Confidence,
-	); err != nil {
-		return err
-	}
-	if e.Confidence < 0 || e.Confidence > 1 {
-		return shoal.NewError(
-			shoal.ErrorInvalidArgument,
-			"assertion evidence confidence must be between zero and one",
-		)
-	}
-	return shoal.ValidateFiniteScore(
-		"assertion evidence derivation score", e.DerivationScore)
+	Kind              string
+	RetrievedNodeIDs  []shoal.ID
+	RetrievedEvidence []EvidenceReference
 }
 
 // Operation identifies the product interaction represented by a session.
@@ -501,15 +372,12 @@ type Session struct {
 
 	// SeedNodeIDs are source nodes the session was shown before its first
 	// turn. They count as retrieved.
-	SeedNodeIDs []shoal.ID
-	Turns       []Turn
+	SeedNodeIDs  []shoal.ID
+	SeedEvidence []EvidenceReference
+	Turns        []Turn
 	// CitedNodeIDs are source nodes the final answer actually cited.
-	CitedNodeIDs []shoal.ID
-	// CitedEdges are source graph edges directly cited by the result.
-	CitedEdges []graph.Edge
-	// RequiredVisibility is trusted policy-derived visibility added by an
-	// authorization-enforcing sink. It is never derived from caller grants.
-	RequiredVisibility []string
+	CitedNodeIDs  []shoal.ID
+	CitedEvidence []EvidenceReference
 }
 
 // Subgraph is the materialized interaction record: its own nodes, its edges to
@@ -522,8 +390,10 @@ type Subgraph struct {
 	// TouchedNodeIDs is the sorted union of every source node the session was
 	// shown or cited. Visibility is the conjunction over exactly this set.
 	TouchedNodeIDs []shoal.ID
-	// TouchedEdgeIDs is the sorted union of every exact source graph edge the
-	// session retrieved or cited.
+	// TouchedEdgeIDs is the sorted union of every exact source edge present in
+	// retrieved or cited evidence. These edges are not copied into the derived
+	// interaction graph, but their current existence and policy remain
+	// required to serve it.
 	TouchedEdgeIDs []shoal.ID
 }
 
@@ -535,16 +405,26 @@ type VisibilityResolver func(shoal.ID) ([]string, error)
 // NodeVisibility reads the declared visibility labels of a graph node. A node
 // with no declared labels is public.
 func NodeVisibility(node graph.Node) ([]string, error) {
-	if node.Properties[PropertyVisibility] == "" &&
-		node.Properties[PropertyVisibilityDigest] != "" {
+	return metadataVisibility(node.Properties)
+}
+
+// EdgeVisibility reads the declared visibility labels of a graph edge. A
+// source edge with no declared labels is public.
+func EdgeVisibility(edge graph.Edge) ([]string, error) {
+	return metadataVisibility(edge.Properties)
+}
+
+func metadataVisibility(properties shoal.Metadata) ([]string, error) {
+	if properties[PropertyVisibility] == "" &&
+		properties[PropertyVisibilityDigest] != "" {
 		if err := validateDigest(
 			"interaction visibility digest",
-			node.Properties[PropertyVisibilityDigest],
+			properties[PropertyVisibilityDigest],
 			false,
 		); err != nil {
 			return nil, err
 		}
-		count, err := strconv.Atoi(node.Properties[PropertyVisibilityCount])
+		count, err := strconv.Atoi(properties[PropertyVisibilityCount])
 		if err != nil || count <= 0 {
 			return nil, shoal.NewError(
 				shoal.ErrorInvalidArgument,
@@ -557,7 +437,7 @@ func NodeVisibility(node graph.Node) ([]string, error) {
 				"derived record view",
 		)
 	}
-	return ParseVisibility(node.Properties[PropertyVisibility])
+	return ParseVisibility(properties[PropertyVisibility])
 }
 
 // ParseVisibility parses a canonical conjunction expression into sorted unique
@@ -673,10 +553,17 @@ func (s Session) Validate() error {
 	if err := shoal.ValidateRequiredID("interaction session ID", s.ID); err != nil {
 		return err
 	}
-	if IsInteractionID(s.ID) && !IsSessionID(s.ID) {
+	// Session identities must live in the session-owned part of the reserved
+	// interaction namespace, which every source publication path rejects. That
+	// disjointness is what makes the graph-ID reservation safe across writers:
+	// two processes with independent local state can never durably commit a
+	// source node and a session (or a session and another kind of derived
+	// interaction node) under one graph identity.
+	if !IsSessionID(s.ID) {
 		return shoal.NewError(
 			shoal.ErrorInvalidArgument,
-			"interaction session ID uses a reserved derived-node namespace",
+			"interaction session ID must be minted by SessionID or "+
+				"OperationSessionID in the reserved session namespace",
 		)
 	}
 	if s.RecordedAt.IsZero() {
@@ -776,14 +663,6 @@ func (s Session) Validate() error {
 			)
 		}
 	}
-	hasOntology := s.OntologySchemaID != "" || s.OntologyVersionID != ""
-	if hasOntology {
-		if _, err := ontology.NewOntologyIdentityFromIDs(
-			s.OntologySchemaID, s.OntologyVersionID,
-		); err != nil {
-			return err
-		}
-	}
 	if len(s.Turns) > MaxTurns {
 		return shoal.NewError(
 			shoal.ErrorInvalidArgument, "interaction session exceeds the public turn bound")
@@ -793,25 +672,44 @@ func (s Session) Validate() error {
 	); err != nil {
 		return err
 	}
+	if s.OntologySchemaID != "" || s.OntologyVersionID != "" {
+		if _, err := ontology.NewOntologyIdentityFromIDs(
+			s.OntologySchemaID, s.OntologyVersionID,
+		); err != nil {
+			return err
+		}
+	}
 	for _, id := range s.SeedNodeIDs {
 		if err := shoal.ValidateRequiredID("interaction seed node ID", id); err != nil {
 			return err
+		}
+		for _, evidence := range s.SeedEvidence {
+			if err := evidence.Validate(); err != nil {
+				return err
+			}
+		}
+		if len(s.SeedEvidence) > 0 &&
+			!equalIDs(dedupeIDs(s.SeedNodeIDs), evidenceNodeIDs(s.SeedEvidence)) {
+			return shoal.NewError(
+				shoal.ErrorInvalidArgument,
+				"interaction seed nodes do not match seed evidence")
 		}
 	}
 	for _, id := range s.CitedNodeIDs {
 		if err := shoal.ValidateRequiredID("interaction cited node ID", id); err != nil {
 			return err
 		}
-	}
-	for _, edge := range s.CitedEdges {
-		if err := edge.Validate(); err != nil {
-			return shoal.WrapError(
-				shoal.ErrorInvalidArgument, "interaction cited edge", err)
+		for _, evidence := range s.CitedEvidence {
+			if err := evidence.Validate(); err != nil {
+				return err
+			}
 		}
-	}
-	if _, err := Conjoin(s.RequiredVisibility); err != nil {
-		return shoal.WrapError(
-			shoal.ErrorInvalidArgument, "interaction required visibility", err)
+		if len(s.CitedEvidence) > 0 &&
+			!equalIDs(dedupeIDs(s.CitedNodeIDs), evidenceNodeIDs(s.CitedEvidence)) {
+			return shoal.NewError(
+				shoal.ErrorInvalidArgument,
+				"interaction cited nodes do not match cited evidence")
+		}
 	}
 	turnIndexes := make(map[int]struct{}, len(s.Turns))
 	for _, turn := range s.Turns {
@@ -854,26 +752,19 @@ func (s Session) Validate() error {
 				return err
 			}
 		}
-		for _, edge := range turn.ToolCall.RetrievedEdges {
-			if err := edge.Validate(); err != nil {
-				return shoal.WrapError(
-					shoal.ErrorInvalidArgument, "interaction retrieved edge", err)
+		for _, evidence := range turn.ToolCall.RetrievedEvidence {
+			if err := evidence.Validate(); err != nil {
+				return err
 			}
 		}
-		for _, node := range turn.ToolCall.RetrievedNodes {
-			if err := node.Validate(); err != nil {
-				return shoal.WrapError(
-					shoal.ErrorInvalidArgument, "interaction retrieved node", err)
-			}
-		}
-		for _, assertion := range turn.ToolCall.RetrievedAssertions {
-			if err := assertion.Validate(); err != nil {
-				return shoal.WrapError(
-					shoal.ErrorInvalidArgument,
-					"interaction retrieved assertion",
-					err,
-				)
-			}
+		if len(turn.ToolCall.RetrievedEvidence) > 0 &&
+			!equalIDs(
+				dedupeIDs(turn.ToolCall.RetrievedNodeIDs),
+				evidenceNodeIDs(turn.ToolCall.RetrievedEvidence),
+			) {
+			return shoal.NewError(
+				shoal.ErrorInvalidArgument,
+				"interaction tool nodes do not match retrieved evidence")
 		}
 	}
 	return nil
@@ -897,12 +788,12 @@ func (s Session) Canonical() (Session, error) {
 	canonical.Actor.OnBehalfOf = append(
 		[]shoal.ID(nil), s.Actor.OnBehalfOf...)
 	canonical.SeedNodeIDs = dedupeIDs(s.SeedNodeIDs)
-	canonical.CitedNodeIDs = dedupeIDs(s.CitedNodeIDs)
-	canonical.CitedEdges, err = canonicalSourceEdges(s.CitedEdges)
+	canonical.SeedEvidence, err = canonicalEvidenceReferences(s.SeedEvidence)
 	if err != nil {
 		return Session{}, err
 	}
-	canonical.RequiredVisibility, err = Conjoin(s.RequiredVisibility)
+	canonical.CitedNodeIDs = dedupeIDs(s.CitedNodeIDs)
+	canonical.CitedEvidence, err = canonicalEvidenceReferences(s.CitedEvidence)
 	if err != nil {
 		return Session{}, err
 	}
@@ -912,18 +803,8 @@ func (s Session) Canonical() (Session, error) {
 		if turn.ToolCall != nil {
 			call := *turn.ToolCall
 			call.RetrievedNodeIDs = dedupeIDs(turn.ToolCall.RetrievedNodeIDs)
-			call.RetrievedEdges, err = canonicalSourceEdges(
-				turn.ToolCall.RetrievedEdges)
-			if err != nil {
-				return Session{}, err
-			}
-			call.RetrievedNodes, err = canonicalSourceNodes(
-				turn.ToolCall.RetrievedNodes)
-			if err != nil {
-				return Session{}, err
-			}
-			call.RetrievedAssertions, err = canonicalAssertions(
-				turn.ToolCall.RetrievedAssertions)
+			call.RetrievedEvidence, err = canonicalEvidenceReferences(
+				turn.ToolCall.RetrievedEvidence)
 			if err != nil {
 				return Session{}, err
 			}
@@ -933,32 +814,6 @@ func (s Session) Canonical() (Session, error) {
 	sort.Slice(canonical.Turns, func(i, j int) bool {
 		return canonical.Turns[i].Index < canonical.Turns[j].Index
 	})
-	sessionEdges := make(map[shoal.ID]graph.Edge)
-	checkEdges := func(edges []graph.Edge) error {
-		for _, edge := range edges {
-			if existing, ok := sessionEdges[edge.ID]; ok {
-				if !sourceEdgesEqual(existing, edge) {
-					return shoal.NewError(
-						shoal.ErrorInvalidArgument,
-						"interaction source edge ID has conflicting values",
-					)
-				}
-				continue
-			}
-			sessionEdges[edge.ID] = edge
-		}
-		return nil
-	}
-	if err := checkEdges(canonical.CitedEdges); err != nil {
-		return Session{}, err
-	}
-	for _, turn := range canonical.Turns {
-		if turn.ToolCall != nil {
-			if err := checkEdges(turn.ToolCall.RetrievedEdges); err != nil {
-				return Session{}, err
-			}
-		}
-	}
 	return canonical, nil
 }
 
@@ -968,39 +823,42 @@ func (s Session) Canonical() (Session, error) {
 func (s Session) TouchedNodeIDs() []shoal.ID {
 	ids := append([]shoal.ID(nil), s.SeedNodeIDs...)
 	ids = append(ids, s.CitedNodeIDs...)
-	for _, edge := range s.CitedEdges {
-		ids = append(ids, edge.From, edge.To)
-	}
 	for _, turn := range s.Turns {
 		if turn.ToolCall != nil {
 			ids = append(ids, turn.ToolCall.RetrievedNodeIDs...)
-			for _, node := range turn.ToolCall.RetrievedNodes {
-				ids = append(ids, node.ID)
-			}
-			for _, edge := range turn.ToolCall.RetrievedEdges {
-				ids = append(ids, edge.From, edge.To)
-			}
 		}
 	}
 	return dedupeIDs(ids)
 }
 
-// TouchedEdgeIDs returns the sorted, deduplicated source graph edge IDs
-// retrieved or cited by the session.
+// TouchedEdgeIDs returns every exact source graph edge referenced by retrieved
+// or cited evidence.
 func (s Session) TouchedEdgeIDs() []shoal.ID {
-	ids := make([]shoal.ID, 0, len(s.CitedEdges))
-	for _, edge := range s.CitedEdges {
-		ids = append(ids, edge.ID)
-	}
+	ids := evidenceEdgeIDs(s.SeedEvidence)
+	ids = append(ids, evidenceEdgeIDs(s.CitedEvidence)...)
 	for _, turn := range s.Turns {
-		if turn.ToolCall == nil {
-			continue
-		}
-		for _, edge := range turn.ToolCall.RetrievedEdges {
-			ids = append(ids, edge.ID)
+		if turn.ToolCall != nil {
+			ids = append(ids,
+				evidenceEdgeIDs(turn.ToolCall.RetrievedEvidence)...)
 		}
 	}
 	return dedupeIDs(ids)
+}
+
+// TouchedAssertions returns every authoritative assertion identity and origin
+// carried by retrieved or cited evidence.
+func (s Session) TouchedAssertions() []AssertionReference {
+	references := evidenceAssertions(s.SeedEvidence)
+	references = append(references, evidenceAssertions(s.CitedEvidence)...)
+	for _, turn := range s.Turns {
+		if turn.ToolCall != nil {
+			references = append(
+				references,
+				evidenceAssertions(turn.ToolCall.RetrievedEvidence)...,
+			)
+		}
+	}
+	return evidenceAssertions([]EvidenceReference{{Assertions: references}})
 }
 
 // Subgraph materializes the session, turn, and tool-call nodes with their
@@ -1008,24 +866,34 @@ func (s Session) TouchedEdgeIDs() []shoal.ID {
 // touched source node; if it fails for any node, the whole record fails rather
 // than being written with an understated visibility.
 func (s Session) Subgraph(resolve VisibilityResolver) (Subgraph, error) {
+	return s.SubgraphWithEvidence(resolve, nil)
+}
+
+// SubgraphWithEvidence materializes the interaction while resolving both
+// source-node and exact source-edge visibility. An edge resolver is mandatory
+// whenever the session contains edge-backed evidence.
+func (s Session) SubgraphWithEvidence(
+	resolveNode VisibilityResolver,
+	resolveEdge VisibilityResolver,
+) (Subgraph, error) {
 	canonical, err := s.Canonical()
 	if err != nil {
 		return Subgraph{}, err
 	}
 	s = canonical
-	if resolve == nil {
+	if resolveNode == nil {
 		return Subgraph{}, shoal.NewError(
 			shoal.ErrorInvalidArgument, "interaction visibility resolver is required")
 	}
-	cache := make(map[shoal.ID][]string)
-	labelsFor := func(ids []shoal.ID) ([]string, error) {
+	nodeCache := make(map[shoal.ID][]string)
+	labelsForNodes := func(ids []shoal.ID) ([]string, error) {
 		sets := make([][]string, 0, len(ids))
 		for _, id := range ids {
-			if cached, ok := cache[id]; ok {
+			if cached, ok := nodeCache[id]; ok {
 				sets = append(sets, cached)
 				continue
 			}
-			labels, err := resolve(id)
+			labels, err := resolveNode(id)
 			if err != nil {
 				return nil, err
 			}
@@ -1033,7 +901,34 @@ func (s Session) Subgraph(resolve VisibilityResolver) (Subgraph, error) {
 			if err != nil {
 				return nil, err
 			}
-			cache[id] = normalized
+			nodeCache[id] = normalized
+			sets = append(sets, normalized)
+		}
+		return Conjoin(sets...)
+	}
+	edgeCache := make(map[shoal.ID][]string)
+	labelsForEdges := func(ids []shoal.ID) ([]string, error) {
+		if len(ids) > 0 && resolveEdge == nil {
+			return nil, shoal.NewError(
+				shoal.ErrorInvalidArgument,
+				"interaction edge visibility resolver is required",
+			)
+		}
+		sets := make([][]string, 0, len(ids))
+		for _, id := range ids {
+			if cached, ok := edgeCache[id]; ok {
+				sets = append(sets, cached)
+				continue
+			}
+			labels, err := resolveEdge(id)
+			if err != nil {
+				return nil, err
+			}
+			normalized, err := Conjoin(labels)
+			if err != nil {
+				return nil, err
+			}
+			edgeCache[id] = normalized
 			sets = append(sets, normalized)
 		}
 		return Conjoin(sets...)
@@ -1189,19 +1084,9 @@ func (s Session) Subgraph(resolve VisibilityResolver) (Subgraph, error) {
 		edges = append(edges, provenanceEdge(EdgeRetrieved, rootID, id))
 	}
 	cited := dedupeIDs(s.CitedNodeIDs)
-	for _, edge := range s.CitedEdges {
-		cited = append(cited, edge.From, edge.To)
-	}
-	cited = dedupeIDs(cited)
 	addTouched(cited)
 	for _, id := range cited {
 		edges = append(edges, provenanceEdge(EdgeCited, rootID, id))
-	}
-	if len(s.CitedEdges) > 0 {
-		sessionNode.Properties[PropertyCitedEdges] =
-			strconv.Itoa(len(s.CitedEdges))
-		sessionNode.Properties[PropertyEdgeEvidence] =
-			sourceEdgesDigest(s.CitedEdges)
 	}
 
 	for _, turn := range s.Turns {
@@ -1231,14 +1116,9 @@ func (s Session) Subgraph(resolve VisibilityResolver) (Subgraph, error) {
 		turnVisibility := []string(nil)
 		if turn.ToolCall != nil {
 			retrieved := dedupeIDs(turn.ToolCall.RetrievedNodeIDs)
-			for _, node := range turn.ToolCall.RetrievedNodes {
-				retrieved = append(retrieved, node.ID)
-			}
-			for _, edge := range turn.ToolCall.RetrievedEdges {
-				retrieved = append(retrieved, edge.From, edge.To)
-			}
-			retrieved = dedupeIDs(retrieved)
 			addTouched(retrieved)
+			retrievedEdges := evidenceEdgeIDs(
+				turn.ToolCall.RetrievedEvidence)
 			callID := DerivedID("tool_call", string(turnID))
 			callNode := graph.Node{
 				ID:     callID,
@@ -1252,25 +1132,16 @@ func (s Session) Subgraph(resolve VisibilityResolver) (Subgraph, error) {
 				},
 			}
 			setIfPresent(callNode.Properties, PropertyToolKind, turn.ToolCall.Kind)
-			if len(turn.ToolCall.RetrievedNodes) > 0 {
-				callNode.Properties[PropertyRetrievedNodes] =
-					strconv.Itoa(len(turn.ToolCall.RetrievedNodes))
-			}
-			if len(turn.ToolCall.RetrievedEdges) > 0 {
-				callNode.Properties[PropertyRetrievedEdges] =
-					strconv.Itoa(len(turn.ToolCall.RetrievedEdges))
-				callNode.Properties[PropertyEdgeEvidence] =
-					sourceEdgesDigest(turn.ToolCall.RetrievedEdges)
-			}
-			if len(turn.ToolCall.RetrievedAssertions) > 0 {
-				callNode.Properties[PropertyRetrievedFacts] =
-					strconv.Itoa(len(turn.ToolCall.RetrievedAssertions))
-			}
-			callVisibility, err := labelsFor(retrieved)
+			nodeVisibility, err := labelsForNodes(retrieved)
 			if err != nil {
 				return Subgraph{}, err
 			}
-			callVisibility, err = Conjoin(callVisibility, s.RequiredVisibility)
+			edgeVisibility, err := labelsForEdges(retrievedEdges)
+			if err != nil {
+				return Subgraph{}, err
+			}
+			callVisibility, err := Conjoin(
+				nodeVisibility, edgeVisibility)
 			if err != nil {
 				return Subgraph{}, err
 			}
@@ -1293,11 +1164,16 @@ func (s Session) Subgraph(resolve VisibilityResolver) (Subgraph, error) {
 	sort.Slice(touchedIDs, func(i, j int) bool {
 		return shoal.CompareID(touchedIDs[i], touchedIDs[j]) < 0
 	})
-	visibility, err := labelsFor(touchedIDs)
+	nodeVisibility, err := labelsForNodes(touchedIDs)
 	if err != nil {
 		return Subgraph{}, err
 	}
-	visibility, err = Conjoin(visibility, s.RequiredVisibility)
+	touchedEdgeIDs := s.TouchedEdgeIDs()
+	edgeVisibility, err := labelsForEdges(touchedEdgeIDs)
+	if err != nil {
+		return Subgraph{}, err
+	}
+	visibility, err := Conjoin(nodeVisibility, edgeVisibility)
 	if err != nil {
 		return Subgraph{}, err
 	}
@@ -1323,7 +1199,7 @@ func (s Session) Subgraph(resolve VisibilityResolver) (Subgraph, error) {
 		Edges:          edges,
 		Visibility:     visibility,
 		TouchedNodeIDs: touchedIDs,
-		TouchedEdgeIDs: s.TouchedEdgeIDs(),
+		TouchedEdgeIDs: touchedEdgeIDs,
 	}, nil
 }
 
@@ -1534,186 +1410,6 @@ func dedupeIDs(ids []shoal.ID) []shoal.ID {
 		return shoal.CompareID(result[i], result[j]) < 0
 	})
 	return result
-}
-
-func canonicalSourceEdges(edges []graph.Edge) ([]graph.Edge, error) {
-	if len(edges) == 0 {
-		return nil, nil
-	}
-	canonical := make([]graph.Edge, len(edges))
-	for index, edge := range edges {
-		if err := edge.Validate(); err != nil {
-			return nil, err
-		}
-		canonical[index] = cloneSourceEdge(edge)
-	}
-	sortEdges(canonical)
-	result := canonical[:0]
-	for _, edge := range canonical {
-		if len(result) > 0 && result[len(result)-1].ID == edge.ID {
-			if !sourceEdgesEqual(result[len(result)-1], edge) {
-				return nil, shoal.NewError(
-					shoal.ErrorInvalidArgument,
-					"interaction source edge ID has conflicting values",
-				)
-			}
-			continue
-		}
-		result = append(result, edge)
-	}
-	return result, nil
-}
-
-func canonicalSourceNodes(nodes []graph.Node) ([]graph.Node, error) {
-	if len(nodes) == 0 {
-		return nil, nil
-	}
-	canonical := make([]graph.Node, len(nodes))
-	for index, node := range nodes {
-		if err := node.Validate(); err != nil {
-			return nil, err
-		}
-		canonical[index] = cloneSourceNode(node)
-	}
-	sortNodes(canonical)
-	result := canonical[:0]
-	for _, node := range canonical {
-		if len(result) > 0 && result[len(result)-1].ID == node.ID {
-			if !sourceNodesEqual(result[len(result)-1], node) {
-				return nil, shoal.NewError(
-					shoal.ErrorInvalidArgument,
-					"interaction source node ID has conflicting values",
-				)
-			}
-			continue
-		}
-		result = append(result, node)
-	}
-	return result, nil
-}
-
-func canonicalAssertions(
-	assertions []AssertionEvidence,
-) ([]AssertionEvidence, error) {
-	if len(assertions) == 0 {
-		return nil, nil
-	}
-	canonical := append([]AssertionEvidence(nil), assertions...)
-	for _, assertion := range canonical {
-		if err := assertion.Validate(); err != nil {
-			return nil, err
-		}
-	}
-	sort.Slice(canonical, func(i, j int) bool {
-		return shoal.CompareID(canonical[i].ID, canonical[j].ID) < 0
-	})
-	result := canonical[:0]
-	for _, assertion := range canonical {
-		if len(result) > 0 &&
-			result[len(result)-1].ID == assertion.ID {
-			if !AssertionEvidenceEqual(result[len(result)-1], assertion) {
-				return nil, shoal.NewError(
-					shoal.ErrorInvalidArgument,
-					"interaction assertion evidence ID has conflicting values",
-				)
-			}
-			continue
-		}
-		result = append(result, assertion)
-	}
-	return result, nil
-}
-
-func cloneSourceNode(node graph.Node) graph.Node {
-	cloned := node
-	cloned.Labels = append([]string(nil), node.Labels...)
-	if node.Properties != nil {
-		cloned.Properties = make(shoal.Metadata, len(node.Properties))
-		for key, value := range node.Properties {
-			cloned.Properties[key] = value
-		}
-	}
-	return cloned
-}
-
-func sourceNodesEqual(left, right graph.Node) bool {
-	if left.ID != right.ID || left.Kind != right.Kind ||
-		len(left.Labels) != len(right.Labels) ||
-		len(left.Properties) != len(right.Properties) {
-		return false
-	}
-	for index := range left.Labels {
-		if left.Labels[index] != right.Labels[index] {
-			return false
-		}
-	}
-	for key, value := range left.Properties {
-		other, ok := right.Properties[key]
-		if !ok || other != value {
-			return false
-		}
-	}
-	return true
-}
-
-func cloneSourceEdge(edge graph.Edge) graph.Edge {
-	cloned := edge
-	if edge.Properties != nil {
-		cloned.Properties = make(shoal.Metadata, len(edge.Properties))
-		for key, value := range edge.Properties {
-			cloned.Properties[key] = value
-		}
-	}
-	return cloned
-}
-
-func sourceEdgesEqual(left, right graph.Edge) bool {
-	if left.ID != right.ID || left.From != right.From || left.To != right.To ||
-		left.Type != right.Type ||
-		math.Float64bits(float64(left.Weight)) !=
-			math.Float64bits(float64(right.Weight)) ||
-		len(left.Properties) != len(right.Properties) {
-		return false
-	}
-	for key, value := range left.Properties {
-		other, ok := right.Properties[key]
-		if !ok || other != value {
-			return false
-		}
-	}
-	return true
-}
-
-func sourceEdgesDigest(edges []graph.Edge) string {
-	hash := sha256.New()
-	var length [8]byte
-	write := func(value []byte) {
-		binary.BigEndian.PutUint64(length[:], uint64(len(value)))
-		_, _ = hash.Write(length[:])
-		_, _ = hash.Write(value)
-	}
-	binary.BigEndian.PutUint64(length[:], uint64(len(edges)))
-	_, _ = hash.Write(length[:])
-	for _, edge := range edges {
-		write([]byte(edge.ID))
-		write([]byte(edge.From))
-		write([]byte(edge.To))
-		write([]byte(edge.Type))
-		binary.BigEndian.PutUint64(length[:], math.Float64bits(float64(edge.Weight)))
-		_, _ = hash.Write(length[:])
-		keys := make([]string, 0, len(edge.Properties))
-		for key := range edge.Properties {
-			keys = append(keys, key)
-		}
-		sort.Strings(keys)
-		binary.BigEndian.PutUint64(length[:], uint64(len(keys)))
-		_, _ = hash.Write(length[:])
-		for _, key := range keys {
-			write([]byte(key))
-			write([]byte(edge.Properties[key]))
-		}
-	}
-	return hex.EncodeToString(hash.Sum(nil))
 }
 
 func sortNodes(nodes []graph.Node) {
