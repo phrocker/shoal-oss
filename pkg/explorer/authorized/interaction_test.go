@@ -531,6 +531,55 @@ func TestAuthorizedRecorderSetupSupportsEvidenceEmptyActionOnlyGrant(t *testing.
 	}
 }
 
+func TestAuthorizedInteractionPreservesNarrowerExpiry(t *testing.T) {
+	f := newFixture(t)
+	snapshot, err := f.base.Snapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.clock.Set(snapshot.AsOf.Add(time.Second))
+	decision := f.decision(
+		t, "narrow-expiry",
+		[][]byte{f.sourceA}, [][]byte{f.policyA},
+		[]auth.Operation{auth.OperationRetrieve},
+	)
+	fingerprint, err := auth.AuthorizationFingerprint(decision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	narrowExpiry := f.clock.Now().Add(5 * time.Minute)
+	session := interaction.Session{
+		ID:                       interaction.DerivedID("session", "narrow-expiry"),
+		Operation:                interaction.OperationRetrieval,
+		SnapshotID:               shoal.ID(snapshot.ID),
+		SnapshotAsOf:             snapshot.AsOf,
+		AuthorizationFingerprint: shoal.ID(fingerprint.String()),
+		AuthorizationExpiresAt:   narrowExpiry,
+	}
+	persisted, err := f.clientA.RecordInteractionResult(
+		f.context(t, decision), session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !persisted.AuthorizationExpiresAt.Equal(narrowExpiry) {
+		t.Fatalf("persisted expiry = %v, want %v",
+			persisted.AuthorizationExpiresAt, narrowExpiry)
+	}
+	record, err := f.base.InteractionRecord(
+		context.Background(), session.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !record.Session.AuthorizationExpiresAt.Equal(narrowExpiry) ||
+		!record.Summary.AuthorizationExpiresAt.Equal(narrowExpiry) {
+		t.Fatalf("durable expiry = session %v summary %v, want %v",
+			record.Session.AuthorizationExpiresAt,
+			record.Summary.AuthorizationExpiresAt,
+			narrowExpiry,
+		)
+	}
+}
+
 func TestAuthorizedInteractionEnrichesTrustedActorDelegationAndReason(t *testing.T) {
 	f := newFixture(t)
 	receipt, err := f.clientA.Ingest(f.admin(t), explorer.Source{
