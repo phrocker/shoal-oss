@@ -9,6 +9,7 @@ import (
 	"strings"
 	"unicode"
 
+	"github.com/phrocker/shoal-oss/internal/embeddingspace"
 	"github.com/phrocker/shoal-oss/internal/iterrt"
 	"github.com/phrocker/shoal-oss/internal/vectorindex"
 )
@@ -274,7 +275,16 @@ func addVectorExplain(be Backend, p *Plan, d *ExplainDetails) {
 		manifest, err := provider.DescribeVector(context.Background(), p.VectorIndex)
 		if err == nil {
 			d.VectorIndex = &manifest
-			d.RecallClaimed = manifest.Recall.Benchmarked()
+			spaceCompatible := embeddingspace.EnsureSameIdentity(
+				"explain approximate vector query",
+				manifest.EmbeddingSpace,
+				p.VectorEmbeddingSpace,
+			) == nil
+			d.RecallClaimed = spaceCompatible && manifest.Recall.Benchmarked()
+			if !spaceCompatible {
+				d.FallbackReasons = append(d.FallbackReasons,
+					"query embedding space is incompatible with the vector index; recall is not claimed")
+			}
 			if !d.RecallClaimed {
 				d.FallbackReasons = append(d.FallbackReasons,
 					"index has no reproducible corpus benchmark; EXPLAIN makes no recall claim")

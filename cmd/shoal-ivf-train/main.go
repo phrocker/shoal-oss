@@ -151,7 +151,36 @@ func main() {
 		trainVecs[i] = r.vec
 	}
 
+	if *version <= 0 || int64(*version) > int64(^uint32(0)>>1) {
+		fatal("version must be in [1, %d]", uint32(^uint32(0)>>1))
+	}
 	cbVersion := int32(*version)
+
+	ivfTable := ivfpq.IvfTableName(*table)
+	cfgTable := ivfpq.ConfigTableName(*table)
+	_ = store.CreateTable(ctx, ivfTable, nil)
+	_ = store.CreateTable(ctx, cfgTable, nil)
+	reservation, err := store.WriteWithResults(ctx, cfgTable, []*embedpb.Mutation{{
+		Row: []byte(ivfpq.PQRow(cbVersion)),
+		Entries: []*embedpb.Entry{{
+			ColumnFamily:    []byte(ivfpq.ConfigColFam),
+			ColumnQualifier: []byte(ivfpq.ConfigQual),
+			Timestamp:       *ts,
+			Value:           []byte("reserved"),
+		}},
+		Conditions: []*embedpb.Condition{{
+			ColumnFamily:    []byte(ivfpq.ConfigColFam),
+			ColumnQualifier: []byte(ivfpq.ConfigQual),
+			Predicate:       &embedpb.Condition_Absent{Absent: true},
+		}},
+	}})
+	if err != nil {
+		fatal("reserve codebook version %d: %v", cbVersion, err)
+	}
+	if len(reservation) != 1 ||
+		reservation[0].Status != embedpb.MutationStatus_MUTATION_STATUS_ACCEPTED {
+		fatal("codebook version %d already exists; choose a new version", cbVersion)
+	}
 
 	// Clamp nlist so we never ask for more clusters than samples.
 	k := *nlist
@@ -172,13 +201,6 @@ func main() {
 	}
 
 	// ── 3. Create IVF + config tables ────────────────────────────────────────
-
-	ivfTable := ivfpq.IvfTableName(*table)
-	cfgTable := ivfpq.ConfigTableName(*table)
-
-	// Ignore "already exists" — CreateTable is idempotent in intent.
-	_ = store.CreateTable(ctx, ivfTable, nil)
-	_ = store.CreateTable(ctx, cfgTable, nil)
 
 	// ── 4. Write coded vectors ───────────────────────────────────────────────
 

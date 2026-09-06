@@ -12,6 +12,7 @@ import (
 	"github.com/phrocker/shoal-oss/internal/documentschema"
 	"github.com/phrocker/shoal-oss/internal/graphschema"
 	"github.com/phrocker/shoal-oss/internal/iterrt"
+	"github.com/phrocker/shoal-oss/internal/vectorindex"
 )
 
 // --- fake backend ---
@@ -54,6 +55,41 @@ func (b *declaredBackend) BackendInfo() BackendInfo {
 		Capabilities:          []Capability{CapabilityRangeScan, CapabilityExactVectorKNN},
 		StorageFormats:        []string{"fixture"},
 		SelectedStorageFormat: "fixture",
+	}
+}
+
+type vectorExplainFixture struct {
+	*declaredBackend
+	manifest vectorindex.Manifest
+}
+
+func (b *vectorExplainFixture) DescribeVector(
+	context.Context,
+	string,
+) (vectorindex.Manifest, error) {
+	return b.manifest, nil
+}
+
+func TestExplainDoesNotClaimRecallAcrossEmbeddingSpaces(t *testing.T) {
+	backend := &vectorExplainFixture{
+		declaredBackend: &declaredBackend{fakeBackend: &fakeBackend{}},
+		manifest: vectorindex.Manifest{
+			EmbeddingSpace:  "space-a",
+			Generation:      1,
+			CodebookVersion: "codebook-a",
+			Recall: vectorindex.RecallContract{
+				Corpus: "corpus", Queries: 1, BenchmarkRef: "benchmark",
+				EmbeddingSpace: "space-a", Generation: 1,
+				CodebookVersion: "codebook-a",
+			},
+		},
+	}
+	details := buildExplainDetails(backend, &Plan{
+		Shape: ShapeVectorKNN, VectorMode: VectorApproximate,
+		VectorIndex: "idx", VectorEmbeddingSpace: "space-b",
+	})
+	if details.RecallClaimed {
+		t.Fatal("EXPLAIN claimed recall across incompatible embedding spaces")
 	}
 }
 

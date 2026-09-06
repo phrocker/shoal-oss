@@ -290,6 +290,7 @@ func TestFileRefSurvivesNonUTF8ExtentBytes(t *testing.T) {
 				i, decoded.Files[i].Ref.Extent, epoch.Files[i].Ref.Extent)
 		}
 	}
+
 	if decoded.Files[0].Ref.Key() == decoded.Files[1].Ref.Key() {
 		t.Fatal("the extents collided after a persistence round trip")
 	}
@@ -306,5 +307,29 @@ func TestFileRefSurvivesNonUTF8ExtentBytes(t *testing.T) {
 	progress := migration.Progress()
 	if progress.Converged != 1 || progress.Pending != 1 {
 		t.Fatalf("progress = %+v, want exactly one of the two converged", progress)
+	}
+}
+
+func TestDecodeRejectsLegacyEpochWithoutSpanSchema(t *testing.T) {
+	epoch := testEpoch(t)
+	raw, err := json.Marshal(epoch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var legacy map[string]any
+	if err := json.Unmarshal(raw, &legacy); err != nil {
+		t.Fatal(err)
+	}
+	delete(legacy, "version")
+	files := legacy["files"].([]any)
+	for _, item := range files {
+		delete(item.(map[string]any), "spans")
+	}
+	raw, err = json.Marshal(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Decode(raw); !errors.Is(err, ErrInvalidEpoch) {
+		t.Fatalf("legacy epoch error = %v", err)
 	}
 }

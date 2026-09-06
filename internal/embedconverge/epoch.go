@@ -55,6 +55,8 @@ const (
 // ErrInvalidEpoch reports a snapshot that cannot describe a migration.
 var ErrInvalidEpoch = errors.New("embedconverge: invalid epoch")
 
+const epochSchemaVersion = 2
+
 // FileRef identifies one immutable file inside a table.
 //
 // The metadata file entry is part of the identity rather than just the
@@ -136,6 +138,7 @@ type EpochFile struct {
 // they are written by the current embedder, in the target space,
 // already converged by construction.
 type Epoch struct {
+	Version   int         `json:"version"`
 	ID        string      `json:"id"`
 	Table     string      `json:"table"`
 	Target    string      `json:"target"`
@@ -175,6 +178,7 @@ func Snapshot(
 	}
 
 	epoch := Epoch{
+		Version:   epochSchemaVersion,
 		ID:        id,
 		Table:     table,
 		Target:    normalized,
@@ -226,6 +230,11 @@ func Snapshot(
 // Validate checks a decoded epoch, which may have come off disk written
 // by another process or another version.
 func (e Epoch) Validate() error {
+	if e.Version != epochSchemaVersion {
+		return fmt.Errorf(
+			"%w: unsupported epoch schema version %d",
+			ErrInvalidEpoch, e.Version)
+	}
 	if strings.TrimSpace(e.ID) == "" {
 		return fmt.Errorf("%w: epoch id is required", ErrInvalidEpoch)
 	}
