@@ -47,6 +47,20 @@ func (b *generationChangingInteractionBase) RecordInteractionResult(
 	return recorded, err
 }
 
+type forgedResultInteractionBase struct {
+	*explorer.Explorer
+}
+
+func (b *forgedResultInteractionBase) RecordInteractionResult(
+	ctx context.Context, session interaction.Session,
+) (interaction.Session, error) {
+	recorded, err := b.Explorer.RecordInteractionResult(ctx, session)
+	if err == nil {
+		recorded.Actor.SubjectID = "forged-return"
+	}
+	return recorded, err
+}
+
 type countingInteractionStore struct {
 	authorized.PolicyStore
 	nodesCalls int
@@ -363,6 +377,28 @@ func TestAuthorizedInteractionRecorderRejectsWrongPin(t *testing.T) {
 	); !shoal.IsErrorCode(err, shoal.ErrorNotFound) {
 		t.Fatalf("rejected interaction was persisted: %v", err)
 	}
+	fingerprint, err := auth.AuthorizationFingerprint(decision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session.ID = "session-wrong-snapshot"
+	session.AuthorizationFingerprint = shoal.ID(fingerprint.String())
+	session.SnapshotID = "forged-snapshot"
+	if err := f.clientA.RecordInteraction(
+		ctx, session,
+	); !shoal.IsErrorCode(err, shoal.ErrorConflict) {
+		t.Fatalf("forged snapshot record = %v", err)
+	}
+	session.ID = "session-expired-pin"
+	session.SnapshotID = shoal.ID(snapshot.ID)
+	session.SnapshotAsOf = snapshot.AsOf
+	session.RecordedAt = snapshot.AsOf
+	session.AuthorizationExpiresAt = snapshot.AsOf.Add(500 * time.Millisecond)
+	if err := f.clientA.RecordInteraction(
+		ctx, session,
+	); !shoal.IsErrorCode(err, shoal.ErrorUnauthorized) {
+		t.Fatalf("expired authorization pin record = %v", err)
+	}
 }
 
 func TestAuthorizedTombstoneSubgraphDoesNotLeakExistence(t *testing.T) {
@@ -540,6 +576,51 @@ func TestAuthorizedInteractionMarksPostCommitGenerationFailure(t *testing.T) {
 	}
 }
 
+func TestAuthorizedInteractionRejectsForgedSinkResult(t *testing.T) {
+	f := newFixture(t)
+	wrapped := &forgedResultInteractionBase{Explorer: f.base}
+	client := f.newClient(
+		t, wrapped, f.store, f.sourceA, f.policyA, nil)
+	snapshot, err := f.base.Snapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.clock.Set(snapshot.AsOf.Add(time.Second))
+	decision := f.decision(
+		t,
+		"trusted-result",
+		[][]byte{f.sourceA},
+		[][]byte{f.policyA},
+		[]auth.Operation{auth.OperationRetrieve},
+	)
+	fingerprint, err := auth.AuthorizationFingerprint(decision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := interaction.Session{
+		ID:                       "session-forged-result",
+		RecordedAt:               f.clock.Now(),
+		Operation:                interaction.OperationRetrieval,
+		SnapshotID:               shoal.ID(snapshot.ID),
+		SnapshotAsOf:             snapshot.AsOf,
+		AuthorizationFingerprint: shoal.ID(fingerprint.String()),
+		AuthorizationExpiresAt:   decision.AuthenticationExpires(),
+	}
+	ctx := f.context(t, decision)
+	if _, err := client.RecordInteractionResult(
+		ctx, session,
+	); !explorer.IsCommittedInteraction(err) {
+		t.Fatalf("forged sink result error = %v", err)
+	}
+	stored, err := f.base.Interaction(ctx, session.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.Actor.SubjectID != decision.Subject() {
+		t.Fatalf("stored actor was forged: %+v", stored.Actor)
+	}
+}
+
 func TestAuthorizedInteractionReadsUseBulkAndPointPaths(t *testing.T) {
 	f := newFixture(t)
 	receipt, err := f.clientA.Ingest(f.admin(t), explorer.Source{
@@ -682,5 +763,37 @@ func TestSourceLessInteractionRequiresOriginalAuthorizationProjection(t *testing
 	}
 	if len(summaries) != 0 {
 		t.Fatalf("source-less list leaked across projections: %+v", summaries)
+	}
+}
+
+func TestInteractionReadsRequireExplicitTrustedReader(t *testing.T) {
+	f := newFixture(t)
+	selector, err := authorized.NewStaticPolicySelector(f.sourceA, f.policyA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, err := authorized.NewClient(authorized.Config{
+		Base:             f.base,
+		VectorScorer:     f.base,
+		Resolver:         f.authority.Resolver(),
+		PolicySelector:   selector,
+		PolicyStore:      f.store,
+		GenerationReader: f.reader,
+		Clock:            f.clock.Now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	decision := f.decision(
+		t,
+		"interaction-reader",
+		[][]byte{f.sourceA},
+		[][]byte{f.policyA},
+		[]auth.Operation{auth.OperationRead},
+	)
+	if _, err := client.InteractionRecords(
+		f.context(t, decision),
+	); !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
+		t.Fatalf("implicit base interaction reader error = %v", err)
 	}
 }

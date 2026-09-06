@@ -97,7 +97,8 @@ func TestProductRecorderIsFailClosedAndCanonical(t *testing.T) {
 	}
 
 	sink.result = recorded
-	sink.result.ID = "session-enriched"
+	enrichedID := interaction.DerivedID("session", "enriched")
+	sink.result.ID = enrichedID
 	sink.result.RecordedAt = fixed.Add(time.Second)
 	sink.result.Operation = interaction.OperationToolCall
 	sink.result.Actor = interaction.ActorContext{
@@ -105,7 +106,7 @@ func TestProductRecorderIsFailClosedAndCanonical(t *testing.T) {
 		ActorID:   "trusted-actor",
 	}
 	returned, err := recorder.Record(ctx, interaction.Session{
-		ID:         "session-enriched",
+		ID:         enrichedID,
 		RecordedAt: fixed.Add(time.Second),
 		Operation:  interaction.OperationToolCall,
 		Actor: interaction.ActorContext{
@@ -124,7 +125,7 @@ func TestProductRecorderIsFailClosedAndCanonical(t *testing.T) {
 
 	sink.recordErr = errors.New("durable sink unavailable")
 	if _, err := recorder.Record(ctx, interaction.Session{
-		ID:        "session-failing",
+		ID:        interaction.DerivedID("session", "failing"),
 		Operation: interaction.OperationToolCall,
 	}); !errors.Is(err, sink.recordErr) {
 		t.Fatalf("record error = %v", err)
@@ -147,7 +148,7 @@ func TestProductRecorderIsFailClosedAndCanonical(t *testing.T) {
 
 func TestGenericRetrievalHasNoInferenceNode(t *testing.T) {
 	session := interaction.Session{
-		ID:         "retrieval-session",
+		ID:         interaction.DerivedID("session", "retrieval"),
 		RecordedAt: time.Unix(1700000000, 0).UTC(),
 		Operation:  interaction.OperationRetrieval,
 		Actor: interaction.ActorContext{

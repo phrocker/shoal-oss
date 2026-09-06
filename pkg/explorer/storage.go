@@ -419,6 +419,21 @@ func (e *Explorer) loadInteractionRecord(row, qualifier, encoded []byte) error {
 		return shoal.NewError(
 			shoal.ErrorInternal, "stored explorer interaction row is invalid")
 	}
+	e.reserveInteractionRecordGraphIDsLocked(
+		record.SessionID, record.Nodes, record.Edges)
+	if !record.Deleted {
+		if live, ok := e.interactionLiveRecords[record.SessionID]; ok {
+			if !reflect.DeepEqual(*live, record) {
+				return shoal.NewError(
+					shoal.ErrorInternal,
+					"stored interaction session has conflicting live versions",
+				)
+			}
+		} else {
+			live := record
+			e.interactionLiveRecords[record.SessionID] = &live
+		}
+	}
 	// A session row is written at most twice: once when the interaction is
 	// recorded and once when it is explicitly deleted. The scan returns raw
 	// cells, so both versions arrive here. Resolve without depending on scan
@@ -452,6 +467,8 @@ func (e *Explorer) loadFoldRecord(row, qualifier, encoded []byte) error {
 		return shoal.NewError(
 			shoal.ErrorInternal, "stored explorer fold row is invalid")
 	}
+	e.reserveInteractionRecordGraphIDsLocked(
+		record.FoldID, record.Nodes, record.Edges)
 	// A fold row is written at most twice: once when it is folded and once
 	// when it is explicitly deleted. The scan returns raw cells, so both
 	// versions arrive here. A tombstone is terminal because a deleted fold ID
@@ -539,6 +556,100 @@ func (e *Explorer) hasExactRecord(row, expected []byte) (bool, error) {
 		)
 	}
 	return committed, nil
+}
+
+func (e *Explorer) lookupPersistedInteraction(
+	sessionID shoal.ID,
+) (persistedInteraction, bool, error) {
+	var record persistedInteraction
+	found, err := e.lookupEmbeddedRecord(
+		interactionRecordRow(sessionID),
+		embeddedRecordInteraction,
+		&record,
+	)
+	if err != nil || !found {
+		return persistedInteraction{}, found, err
+	}
+	if err := validatePersistedInteraction(record); err != nil {
+		return persistedInteraction{}, false, shoal.WrapError(
+			shoal.ErrorInternal,
+			"stored explorer interaction is invalid",
+			err,
+		)
+	}
+	if record.SessionID != sessionID {
+		return persistedInteraction{}, false, shoal.NewError(
+			shoal.ErrorInternal,
+			"stored explorer interaction row is invalid",
+		)
+	}
+	return record, true, nil
+}
+
+func (e *Explorer) lookupPersistedFold(
+	foldID shoal.ID,
+) (persistedFold, bool, error) {
+	var record persistedFold
+	found, err := e.lookupEmbeddedRecord(
+		foldRecordRow(foldID),
+		embeddedRecordFold,
+		&record,
+	)
+	if err != nil || !found {
+		return persistedFold{}, found, err
+	}
+	if err := validatePersistedFold(record); err != nil {
+		return persistedFold{}, false, shoal.WrapError(
+			shoal.ErrorInternal,
+			"stored explorer fold is invalid",
+			err,
+		)
+	}
+	if record.FoldID != foldID {
+		return persistedFold{}, false, shoal.NewError(
+			shoal.ErrorInternal,
+			"stored explorer fold row is invalid",
+		)
+	}
+	return record, true, nil
+}
+
+func (e *Explorer) lookupEmbeddedRecord(
+	row []byte, kind byte, target any,
+) (bool, error) {
+	found := false
+	var decodeErr error
+	err := e.engine.LookupRows(
+		explorerTable,
+		[][]byte{append([]byte(nil), row...)},
+		engine.ScanOptions{
+			ColumnFamilies:          [][]byte{[]byte(recordCF)},
+			ColumnFamiliesInclusive: true,
+		},
+		func(_ int, key *iterrt.Key, value []byte) {
+			if found || decodeErr != nil ||
+				!bytes.Equal(key.ColumnQualifier, []byte(recordCQV2)) {
+				return
+			}
+			decodeErr = decodeEmbeddedRecord(value, kind, target)
+			found = decodeErr == nil
+		},
+	)
+	if err != nil {
+		return false, shoal.WrapError(
+			shoal.ErrorUnavailable,
+			"read committed interaction record",
+			err,
+		)
+	}
+	if decodeErr != nil {
+		return false, shoal.WrapError(
+			shoal.ErrorInternal,
+			"decode committed interaction record",
+			decodeErr,
+		)
+	}
+	return found, nil
 }
 
 func equivalentEmbeddedRecord(row, stored, expected []byte) bool {
@@ -710,6 +821,10 @@ func validatePersistedDocument(record persistedDocument) error {
 		if !utf8.ValidString(node.Kind) {
 			return fmt.Errorf("graph node kind is invalid")
 		}
+		if interaction.IsInteractionID(node.ID) {
+			return fmt.Errorf(
+				"content cannot use the reserved interaction node ID namespace")
+		}
 		if interaction.IsInteractionKind(node.Kind) {
 			return fmt.Errorf("content cannot use the reserved interaction node kind namespace")
 		}
@@ -722,6 +837,10 @@ func validatePersistedDocument(record persistedDocument) error {
 	for _, edge := range record.Edges {
 		if err := validatePersistedEdge(edge); err != nil {
 			return err
+		}
+		if interaction.IsInteractionID(edge.ID) {
+			return fmt.Errorf(
+				"content cannot use the reserved interaction edge ID namespace")
 		}
 		if interaction.IsInteractionEdgeType(edge.Type) {
 			return fmt.Errorf("content cannot use the reserved interaction edge type namespace")

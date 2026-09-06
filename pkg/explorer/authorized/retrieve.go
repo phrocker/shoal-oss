@@ -182,17 +182,20 @@ func (c *Client) retrieve(
 			}
 		}
 		if len(documentIDs) == 0 {
-			if err := c.probeAuthorizedVector(ctx, normalized); err != nil {
+			embeddingSpaceIDs, err := c.probeAuthorizedVector(ctx, normalized)
+			if err != nil {
 				return retrieval.Response{}, err
 			}
-			return c.emptyRetrieval(ctx, guard, normalized)
+			return c.emptyRetrieval(
+				ctx, guard, normalized, embeddingSpaceIDs)
 		}
 	}
 	if len(documentIDs) == 0 {
-		if err := c.probeAuthorizedVector(ctx, normalized); err != nil {
+		embeddingSpaceIDs, err := c.probeAuthorizedVector(ctx, normalized)
+		if err != nil {
 			return retrieval.Response{}, err
 		}
-		return c.emptyRetrieval(ctx, guard, normalized)
+		return c.emptyRetrieval(ctx, guard, normalized, embeddingSpaceIDs)
 	}
 	selected := make(map[shoal.ID]RevisionRegistration, len(documentIDs))
 	selectedNodes := make(map[shoal.ID]NodeRegistration)
@@ -217,10 +220,12 @@ func (c *Client) retrieve(
 			}
 		}
 		if len(nodeIDs) == 0 {
-			if err := c.probeAuthorizedVector(ctx, normalized); err != nil {
+			embeddingSpaceIDs, err := c.probeAuthorizedVector(ctx, normalized)
+			if err != nil {
 				return retrieval.Response{}, err
 			}
-			return c.emptyRetrieval(ctx, guard, normalized)
+			return c.emptyRetrieval(
+				ctx, guard, normalized, embeddingSpaceIDs)
 		}
 	}
 	if len(documentIDs)+len(nodeIDs) > retrieval.MaxScopeIDs {
@@ -263,6 +268,7 @@ func (c *Client) emptyRetrieval(
 	ctx context.Context,
 	guard auth.GenerationGuard,
 	request retrieval.Request,
+	embeddingSpaceIDs []shoal.ID,
 ) (retrieval.Response, error) {
 	response := retrieval.Response{}
 	if request.HasMode(retrieval.ModeVector) {
@@ -279,9 +285,13 @@ func (c *Client) emptyRetrieval(
 		if len(probed.Results) != 0 {
 			return retrieval.Response{}, inconsistentRetrieval()
 		}
-		response.EmbeddingSpaceID = probed.EmbeddingSpaceID
+		response.EmbeddingSpaceID, err = retrieval.EmbeddingSpaceSetID(
+			embeddingSpaceIDs...)
+		if err != nil {
+			return retrieval.Response{}, inconsistentRetrieval()
+		}
 		response.EmbeddingSpaceIDs = append(
-			[]shoal.ID(nil), probed.EmbeddingSpaceIDs...)
+			[]shoal.ID(nil), embeddingSpaceIDs...)
 	}
 	if err := response.ValidateFor(request); err != nil {
 		return retrieval.Response{}, inconsistentRetrieval()

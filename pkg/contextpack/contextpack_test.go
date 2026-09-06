@@ -147,6 +147,18 @@ func TestBuildPinsEmbeddingSpaceIdentity(t *testing.T) {
 	if !ok || identity != response.EmbeddingSpaceID {
 		t.Fatalf("embedding space = %q, %t", identity, ok)
 	}
+	malformedMetadata := pack.Metadata()
+	delete(malformedMetadata, metadataEmbeddingSpacesKey)
+	malformed, err := inference.NewContextPack(
+		pack.Query(), pack.Evidence(), nil, pack.Snapshot(),
+		pack.Authorization(), malformedMetadata,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := EmbeddingSpaceID(malformed); err == nil {
+		t.Fatal("aggregate-only context metadata was accepted")
+	}
 	constituents, err := EmbeddingSpaceIDs(pack)
 	if err != nil {
 		t.Fatal(err)
@@ -160,6 +172,27 @@ func TestBuildPinsEmbeddingSpaceIdentity(t *testing.T) {
 		InitialRequest{Request: request, Response: response, Pins: pins},
 	); err == nil {
 		t.Fatal("mismatched trusted embedding-space pin was accepted")
+	}
+
+	pins.EmbeddingSpaceID = response.EmbeddingSpaceID
+	pins.EmbeddingSpaceIDs = nil
+	if _, err := (Builder{Reader: client}).Build(
+		context.Background(),
+		InitialRequest{Request: request, Response: response, Pins: pins},
+	); err == nil {
+		t.Fatal("aggregate-only trusted embedding-space pin was accepted")
+	}
+
+	_, lexical, lexicalResponse, lexicalPins := embeddedFixture(t)
+	lexicalPins.EmbeddingSpaceID = response.EmbeddingSpaceID
+	lexicalPins.EmbeddingSpaceIDs = []shoal.ID{constituent}
+	if _, err := (Builder{Reader: client}).Build(
+		context.Background(),
+		InitialRequest{
+			Request: lexical, Response: lexicalResponse, Pins: lexicalPins,
+		},
+	); err == nil {
+		t.Fatal("non-vector retrieval accepted embedding-space pins")
 	}
 }
 
@@ -220,6 +253,9 @@ func TestMergeEmbeddingSpaceMetadataIsASetUnion(t *testing.T) {
 		legacy, []shoal.ID{spaceA},
 	); err == nil {
 		t.Fatal("aggregate-only provenance was merged without constituents")
+	}
+	if _, err := MergeEmbeddingSpaceMetadata(legacy, nil); err == nil {
+		t.Fatal("aggregate-only provenance survived an empty merge")
 	}
 }
 

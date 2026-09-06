@@ -25,6 +25,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/phrocker/shoal-oss/pkg/graph"
 	"github.com/phrocker/shoal-oss/pkg/interaction"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
@@ -81,6 +82,7 @@ func TestInteractionWritePreservesUnresolvedIndeterminateOutcome(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	defer corpus.Close()
 	receipt, err := corpus.Ingest(ctx, Source{
 		URI:       "file:///source.txt",
@@ -116,5 +118,146 @@ func TestInteractionWritePreservesUnresolvedIndeterminateOutcome(t *testing.T) {
 		err, shoal.ErrorNotFound,
 	) {
 		t.Fatalf("uncommitted interaction became visible: %v", err)
+	}
+}
+
+func TestInteractionLoadRejectsConflictingLiveVersions(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	corpus, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := interaction.Session{
+		ID:         interaction.DerivedID("session", "conflicting-live"),
+		RecordedAt: time.Unix(1700000000, 0).UTC(),
+		Operation:  interaction.OperationRetrieval,
+	}
+	if err := corpus.RecordInteraction(ctx, session); err != nil {
+		t.Fatal(err)
+	}
+	conflicting := *corpus.interactions[session.ID]
+	conflicting.Session.StopReason = "different"
+	if err := validatePersistedInteraction(conflicting); err != nil {
+		t.Fatal(err)
+	}
+	if err := corpus.writeRecord(
+		interactionRecordRow(session.ID),
+		embeddedRecordInteraction,
+		conflicting,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := corpus.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if reopened, err := Open(dir); err == nil {
+		_ = reopened.Close()
+		t.Fatal("conflicting durable live interaction versions were accepted")
+	}
+}
+
+func TestFoldRetryAdoptsCommittedRecord(t *testing.T) {
+	ctx := context.Background()
+	corpus, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer corpus.Close()
+	session := interaction.Session{
+		ID:         interaction.DerivedID("session", "fold-retry"),
+		RecordedAt: time.Unix(1700000000, 0).UTC(),
+		Operation:  interaction.OperationRetrieval,
+	}
+	if err := corpus.RecordInteraction(ctx, session); err != nil {
+		t.Fatal(err)
+	}
+	summaryDigest := interaction.Digest("fold retry")
+	fold := interaction.Fold{
+		Members:       []interaction.FoldMember{{SessionID: session.ID}},
+		SummaryDigest: summaryDigest,
+		FoldedAt:      time.Unix(1700000100, 0).UTC(),
+	}
+	subgraph, err := fold.Subgraph(func(shoal.ID) ([]string, error) {
+		return nil, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	canonical, err := fold.Canonical()
+	if err != nil {
+		t.Fatal(err)
+	}
+	record := persistedFold{
+		FoldID: subgraph.ID, Members: canonical.Members,
+		SummaryDigest: canonical.SummaryDigest,
+		Nodes:         subgraph.Nodes, Edges: subgraph.Edges,
+		Visibility: interaction.Expression(subgraph.Visibility),
+		FoldedAt:   fold.FoldedAt,
+	}
+	if err := corpus.writeRecord(
+		foldRecordRow(record.FoldID), embeddedRecordFold, record,
+	); err != nil {
+		t.Fatal(err)
+	}
+	result, err := corpus.FoldInteractions(ctx, FoldRequest{
+		SessionIDs: []shoal.ID{session.ID}, SummaryDigest: summaryDigest,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Created || !result.FoldedAt.Equal(record.FoldedAt) {
+		t.Fatalf("reconciled fold result = %+v", result)
+	}
+}
+
+func TestDeleteRetryAdoptsCommittedTombstone(t *testing.T) {
+	ctx := context.Background()
+	corpus, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer corpus.Close()
+	session := interaction.Session{
+		ID:         interaction.DerivedID("session", "delete-retry"),
+		RecordedAt: time.Unix(1700000000, 0).UTC(),
+		Operation:  interaction.OperationRetrieval,
+	}
+	if err := corpus.RecordInteraction(ctx, session); err != nil {
+		t.Fatal(err)
+	}
+	existing := corpus.interactions[session.ID]
+	deletedAt := time.Unix(1700000200, 0).UTC()
+	tombstone := interaction.Tombstone{
+		SessionID: session.ID, DeletedAt: deletedAt,
+		NodeCount: len(existing.Nodes), EdgeCount: len(existing.Edges),
+	}
+	node, err := tombstone.Node()
+	if err != nil {
+		t.Fatal(err)
+	}
+	record := persistedInteraction{
+		SessionID: session.ID, Operation: existing.Operation,
+		Nodes: []graph.Node{node}, RecordedAt: existing.RecordedAt,
+		Deleted: true, DeletedAt: deletedAt,
+	}
+	if err := validatePersistedInteraction(record); err != nil {
+		t.Fatal(err)
+	}
+	if err := corpus.writeRecord(
+		interactionRecordRow(session.ID),
+		embeddedRecordInteraction,
+		record,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := corpus.DeleteInteraction(
+		ctx, session.ID,
+	); !shoal.IsErrorCode(err, shoal.ErrorConflict) {
+		t.Fatalf("reconciled delete error = %v", err)
+	}
+	if got := corpus.interactions[session.ID]; !got.Deleted ||
+		!got.DeletedAt.Equal(deletedAt) {
+		t.Fatalf("committed tombstone was not adopted: %+v", got)
 	}
 }
