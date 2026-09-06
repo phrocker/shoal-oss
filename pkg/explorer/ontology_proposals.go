@@ -164,6 +164,9 @@ func (e *Explorer) OntologyProposals(
 	if err := e.requireOpen(); err != nil {
 		return nil, err
 	}
+	if err := e.requireCertainOntologyMutationLocked(); err != nil {
+		return nil, err
+	}
 	proposals := make([]ontology.GovernedProposal, 0, len(e.ontologyProposals))
 	for _, record := range e.ontologyProposals {
 		proposal, err := record.proposal()
@@ -280,6 +283,7 @@ func (e *Explorer) TransitionOntologyProposal(
 			shoal.ErrorInternal, "stored ontology proposal is invalid", err)
 	}
 	if next == ontology.ProposalPublished {
+		publishedVersions := make(map[shoal.ID]struct{})
 		for otherID, otherRecord := range e.ontologyProposals {
 			if otherID == proposalID {
 				continue
@@ -291,15 +295,27 @@ func (e *Explorer) TransitionOntologyProposal(
 			}
 			otherBase, otherHasBase := other.BaseVersionID()
 			currentBase, currentHasBase := current.BaseVersionID()
-			if other.State() == ontology.ProposalPublished &&
-				other.Schema().ID() == current.Schema().ID() &&
-				otherHasBase == currentHasBase &&
+			if other.State() != ontology.ProposalPublished ||
+				other.Schema().ID() != current.Schema().ID() {
+				continue
+			}
+			publishedVersions[other.ProposedVersion().ID()] = struct{}{}
+			if otherHasBase {
+				publishedVersions[otherBase] = struct{}{}
+			}
+			if otherHasBase == currentHasBase &&
 				otherBase == currentBase {
 				return ontology.GovernedProposal{}, shoal.NewError(
 					shoal.ErrorConflict,
 					"another proposal already advanced this ontology base version",
 				)
 			}
+		}
+		if _, cycle := publishedVersions[current.ProposedVersion().ID()]; cycle {
+			return ontology.GovernedProposal{}, shoal.NewError(
+				shoal.ErrorConflict,
+				"ontology publication target already exists in published history",
+			)
 		}
 	}
 	// This advance is load-bearing; TestOntologyProposalTransitionsSurviveCoarseClockGranularity

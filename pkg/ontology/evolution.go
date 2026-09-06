@@ -41,7 +41,21 @@ func validateProposalEvolution(
 	}
 	for _, property := range base.properties {
 		target, retained := targetProperties[property.ID()]
-		if retained && property.canonical() != target.canonical() {
+		mapped, explicit, err := mappedDefinitionTargets(
+			property.ID(), "property", morphisms)
+		if err != nil {
+			return err
+		}
+		if explicit && !identityOnlyMapping(property.ID(), mapped) {
+			if !allDefinitionsExist(proposed, mapped) {
+				return invalid("property morphism targets are absent from proposed version")
+			}
+			continue
+		}
+		if !retained {
+			return invalid("removed property requires an explicit morphism")
+		}
+		if property.canonical() != target.canonical() {
 			return invalid(
 				"retained property changed meaning without a supported morphism")
 		}
@@ -53,13 +67,30 @@ func validateProposalEvolution(
 	}
 	for _, concept := range base.concepts {
 		target, retained := targetConcepts[concept.ID()]
-		if !retained {
+		mapped, explicit, err := mappedDefinitionTargets(
+			concept.ID(), "concept", morphisms)
+		if err != nil {
+			return err
+		}
+		if explicit && !identityOnlyMapping(concept.ID(), mapped) {
+			if !allDefinitionsExist(proposed, mapped) {
+				return invalid("concept morphism targets are absent from proposed version")
+			}
 			continue
+		}
+		if !retained {
+			return invalid("removed concept requires an explicit morphism")
+		}
+		mappedProperties, err := mappedDefinitionSet(
+			concept.properties, "property", morphisms)
+		if err != nil {
+			return err
 		}
 		if concept.key != target.key || concept.name != target.name ||
 			concept.description != target.description ||
 			canonicalMetadata(concept.metadata) != canonicalMetadata(target.metadata) ||
-			!safePropertyAddition(concept.properties, target.properties, targetProperties) {
+			!safePropertyAddition(
+				mappedProperties, target.properties, targetProperties) {
 			return invalid(
 				"retained concept changed meaning without a supported morphism")
 		}
@@ -72,8 +103,35 @@ func validateProposalEvolution(
 	}
 	for _, relationship := range base.relationships {
 		target, retained := targetRelationships[relationship.ID()]
-		if !retained {
+		mapped, explicit, err := mappedDefinitionTargets(
+			relationship.ID(), "relationship", morphisms)
+		if err != nil {
+			return err
+		}
+		if explicit && !identityOnlyMapping(relationship.ID(), mapped) {
+			if !allDefinitionsExist(proposed, mapped) {
+				return invalid(
+					"relationship morphism targets are absent from proposed version")
+			}
 			continue
+		}
+		if !retained {
+			return invalid("removed relationship requires an explicit morphism")
+		}
+		mappedProperties, err := mappedDefinitionSet(
+			relationship.properties, "property", morphisms)
+		if err != nil {
+			return err
+		}
+		mappedFrom, err := mappedDefinitionSet(
+			relationship.fromConcepts, "concept", morphisms)
+		if err != nil {
+			return err
+		}
+		mappedTo, err := mappedDefinitionSet(
+			relationship.toConcepts, "concept", morphisms)
+		if err != nil {
+			return err
 		}
 		if relationship.key != target.key ||
 			relationship.name != target.name ||
@@ -81,32 +139,109 @@ func validateProposalEvolution(
 			relationship.directed != target.directed ||
 			canonicalMetadata(relationship.metadata) != canonicalMetadata(target.metadata) ||
 			!safePropertyAddition(
-				relationship.properties, target.properties, targetProperties) {
+				mappedProperties, target.properties, targetProperties) {
 			return invalid(
 				"retained relationship changed unsupported semantics")
 		}
-		if equalIDs(relationship.fromConcepts, target.fromConcepts) &&
-			equalIDs(relationship.toConcepts, target.toConcepts) {
+		if equalIDs(mappedFrom, target.fromConcepts) &&
+			equalIDs(mappedTo, target.toConcepts) {
 			continue
 		}
 		required := MorphismKind("")
 		switch {
-		case idSubset(relationship.fromConcepts, target.fromConcepts) &&
-			idSubset(relationship.toConcepts, target.toConcepts):
+		case idSubset(mappedFrom, target.fromConcepts) &&
+			idSubset(mappedTo, target.toConcepts):
 			required = MorphismWiden
-		case idSubset(target.fromConcepts, relationship.fromConcepts) &&
-			idSubset(target.toConcepts, relationship.toConcepts):
+		case idSubset(target.fromConcepts, mappedFrom) &&
+			idSubset(target.toConcepts, mappedTo):
 			required = MorphismNarrow
 		default:
 			return invalid(
 				"relationship endpoint change requires separate supported morphisms")
 		}
+
 		if !hasRelationshipMorphism(morphisms, relationship.ID(), required) {
 			return invalid(
 				"relationship endpoint change requires an explicit morphism")
 		}
 	}
 	return nil
+}
+
+func mappedDefinitionSet(
+	values []shoal.ID,
+	namespace string,
+	morphisms []OntologyMorphism,
+) ([]shoal.ID, error) {
+	var mapped []shoal.ID
+	for _, id := range values {
+		targets, _, err := mappedDefinitionTargets(id, namespace, morphisms)
+		if err != nil {
+			return nil, err
+		}
+		mapped = append(mapped, targets...)
+	}
+	return canonicalUniqueIDs(mapped), nil
+}
+
+func mappedDefinitionTargets(
+	id shoal.ID,
+	namespace string,
+	morphisms []OntologyMorphism,
+) ([]shoal.ID, bool, error) {
+	if IDNamespace(id) != namespace {
+		return nil, false, invalid("definition has an unexpected namespace")
+	}
+	var matched *OntologyMorphism
+	for index := range morphisms {
+		morphism := &morphisms[index]
+		if !containsID(morphism.sources, id) {
+			continue
+		}
+		if matched != nil {
+			return nil, false, invalid(
+				"multiple morphisms map the same source definition")
+		}
+		matched = morphism
+	}
+	if matched == nil {
+		return []shoal.ID{id}, false, nil
+	}
+	targets := canonicalizeIDs(matched.targets)
+	for _, target := range targets {
+		if IDNamespace(target) != namespace {
+			return nil, false, invalid("morphism changes definition kind")
+		}
+	}
+	return targets, true, nil
+}
+
+func identityOnlyMapping(source shoal.ID, targets []shoal.ID) bool {
+	return len(targets) == 1 && targets[0] == source
+}
+
+func allDefinitionsExist(version OntologyVersion, ids []shoal.ID) bool {
+	for _, id := range ids {
+		if !definitionExists(version, id) {
+			return false
+		}
+	}
+	return true
+}
+
+func canonicalUniqueIDs(values []shoal.ID) []shoal.ID {
+	ordered := canonicalizeIDs(values)
+	if len(ordered) < 2 {
+		return ordered
+	}
+	result := ordered[:0]
+	for _, id := range ordered {
+		if len(result) > 0 && result[len(result)-1] == id {
+			continue
+		}
+		result = append(result, id)
+	}
+	return result
 }
 
 func safePropertyAddition(

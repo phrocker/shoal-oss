@@ -254,13 +254,18 @@ func TestIndeterminateOntologyMutationBlocksFurtherWritesUntilReopen(t *testing.
 		); !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
 			t.Fatalf("create after indeterminate mutation = %v", err)
 		}
+		if _, err := corpus.OntologyProposals(
+			context.Background(),
+		); !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
+			t.Fatalf("read after indeterminate mutation = %v", err)
+		}
 	})
 	t.Run("transition", func(t *testing.T) {
-		corpus, err := Open(filepath.Join(t.TempDir(), "corpus"))
+		data := filepath.Join(t.TempDir(), "corpus")
+		corpus, err := Open(data)
 		if err != nil {
 			t.Fatal(err)
 		}
-		defer corpus.Close()
 		if err := corpus.CreateOntologyProposal(
 			context.Background(), proposal, base,
 		); err != nil {
@@ -275,6 +280,19 @@ func TestIndeterminateOntologyMutationBlocksFurtherWritesUntilReopen(t *testing.
 		); !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
 			t.Fatalf("transition after indeterminate mutation = %v", err)
 		}
+		if _, err := corpus.OntologyProposals(
+			context.Background(),
+		); !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
+			t.Fatalf("read after indeterminate transition = %v", err)
+		}
+		if err := corpus.Close(); err != nil {
+			t.Fatal(err)
+		}
+		corpus, err = Open(data)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer corpus.Close()
 		stored, err := corpus.OntologyProposals(context.Background())
 		if err != nil {
 			t.Fatal(err)
@@ -461,6 +479,59 @@ func TestUnrelatedSchemaForkDoesNotPoisonSelectedOntology(t *testing.T) {
 		context.Background(), []ontology.Assertion{assertion}, identity)
 	if err != nil || len(read) != 1 || !read[0].Resolved() {
 		t.Fatalf("unrelated fork poisoned selected schema: %#v, err=%v", read, err)
+	}
+}
+
+func TestOntologyPublicationRejectsCycleToPublishedAncestor(t *testing.T) {
+	corpus, err := Open(filepath.Join(t.TempDir(), "corpus"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer corpus.Close()
+	schema, _ := ontology.NewOntologySchema("cycle", "Cycle", "", nil)
+	at := time.Date(2026, 9, 6, 5, 0, 0, 0, time.UTC)
+	v1, _ := ontology.NewOntologyVersion(schema, "1", at, nil, nil, nil, nil)
+	v2, _ := ontology.NewOntologyVersion(
+		schema, "2", at.Add(time.Second), nil, nil, nil, nil)
+	first, _ := ontology.NewGovernedProposal(
+		schema, v1, v2, "author", "forward", at.Add(2*time.Second), nil)
+	ctx := context.Background()
+	if err := corpus.CreateOntologyProposal(ctx, first, v1); err != nil {
+		t.Fatal(err)
+	}
+	for index, state := range []ontology.ProposalState{
+		ontology.ProposalSubmitted,
+		ontology.ProposalApproved,
+		ontology.ProposalPublished,
+	} {
+		first, err = corpus.TransitionOntologyProposal(
+			ctx, first.ID(), state, "governor", "approved",
+			at.Add(time.Duration(index+3)*time.Second))
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	cycle, _ := ontology.NewGovernedProposal(
+		schema, v2, v1, "author", "cycle", at.Add(10*time.Second), nil)
+	if err := corpus.CreateOntologyProposal(ctx, cycle, v2); err != nil {
+		t.Fatal(err)
+	}
+	for index, state := range []ontology.ProposalState{
+		ontology.ProposalSubmitted,
+		ontology.ProposalApproved,
+	} {
+		cycle, err = corpus.TransitionOntologyProposal(
+			ctx, cycle.ID(), state, "governor", "approved",
+			at.Add(time.Duration(index+11)*time.Second))
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := corpus.TransitionOntologyProposal(
+		ctx, cycle.ID(), ontology.ProposalPublished,
+		"governor", "reject cycle", at.Add(13*time.Second),
+	); !shoal.IsErrorCode(err, shoal.ErrorConflict) {
+		t.Fatalf("cycle publication error = %v, want conflict", err)
 	}
 }
 
