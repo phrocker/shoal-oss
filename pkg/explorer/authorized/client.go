@@ -528,6 +528,64 @@ func (c *Client) begin(
 	return decision, guard, now, nil
 }
 
+func (c *Client) beginOneOf(
+	ctx context.Context,
+	operations ...auth.Operation,
+) (
+	auth.Decision,
+	auth.GenerationGuard,
+	time.Time,
+	auth.Operation,
+	error,
+) {
+	if err := contextFailure(ctx); err != nil {
+		return auth.Decision{}, auth.GenerationGuard{}, time.Time{}, "", err
+	}
+	if len(operations) == 0 {
+		return auth.Decision{}, auth.GenerationGuard{}, time.Time{}, "",
+			authorizationDenied()
+	}
+	decision, err := c.resolver.Resolve(ctx)
+	if err != nil {
+		return auth.Decision{}, auth.GenerationGuard{}, time.Time{}, "",
+			resolverFailure(ctx, err)
+	}
+	now := c.clock()
+	if now.IsZero() {
+		return auth.Decision{}, auth.GenerationGuard{}, time.Time{}, "",
+			authorizationDenied()
+	}
+	request := auth.ResourceRequest{
+		AuthorizationDomain: decision.AuthorizationDomain(),
+	}
+	var selected auth.Operation
+	for _, operation := range operations {
+		if err := operation.Validate(); err != nil {
+			return auth.Decision{}, auth.GenerationGuard{}, time.Time{}, "", err
+		}
+		if err := decision.Authorize(operation, request, now); err == nil {
+			selected = operation
+			break
+		}
+	}
+	if selected == "" {
+		if contextErr := contextFailure(ctx); contextErr != nil {
+			return auth.Decision{}, auth.GenerationGuard{}, time.Time{}, "", contextErr
+		}
+		return auth.Decision{}, auth.GenerationGuard{}, time.Time{}, "",
+			authorizationDenied()
+	}
+	guard, err := auth.NewGenerationGuard(decision, c.generationReader)
+	if err != nil {
+		return auth.Decision{}, auth.GenerationGuard{}, time.Time{}, "",
+			authorizationDenied()
+	}
+	if err := guard.Check(ctx); err != nil {
+		return auth.Decision{}, auth.GenerationGuard{}, time.Time{}, "", err
+	}
+	return decision, guard, now, selected, nil
+}
+
 // beginAny authorizes a setup-time operation that is not tied to one specific
 // operation. It still requires a live, in-domain credential and a policy
 // generation guard, but accepts any operation the decision itself grants, so
