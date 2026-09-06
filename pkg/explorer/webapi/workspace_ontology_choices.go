@@ -109,6 +109,27 @@ func (c *GovernedOntologyChoices) AuthorizeOntology(
 	return shoal.NewError(shoal.ErrorUnauthorized, "authorization denied")
 }
 
+// AuthorizeOntologyForOperation checks one identity through the service's
+// non-disclosing membership seam when available. Catalog listing remains
+// reserved for explicit settings management reads and writes.
+func (c *GovernedOntologyChoices) AuthorizeOntologyForOperation(
+	ctx context.Context,
+	decision auth.Decision,
+	identity ontology.OntologyIdentity,
+	operation auth.Operation,
+) error {
+	if err := identity.Validate(); err != nil {
+		return err
+	}
+	if selected, ok := decision.SelectedOntology(); ok && selected != identity {
+		return shoal.NewError(shoal.ErrorUnauthorized, "authorization denied")
+	}
+	if authorizer, ok := c.source.(OntologySelectionAuthorizer); ok {
+		return authorizer.AuthorizeOntologySelection(ctx, identity, operation)
+	}
+	return c.AuthorizeOntology(ctx, decision, identity)
+}
+
 func (c *GovernedOntologyChoices) catalog(
 	ctx context.Context,
 ) (ontology.PublishedCatalog, bool, error) {

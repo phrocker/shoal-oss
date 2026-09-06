@@ -190,15 +190,55 @@ func (c *Client) PublishedOntologyCatalog(
 	ctx context.Context,
 	configured ontology.OntologyVersion,
 ) (ontology.PublishedCatalog, error) {
-	store, err := c.ontologyProposalStore()
-	if err != nil {
-		return ontology.PublishedCatalog{}, err
-	}
 	decision, guard, now, operation, err := c.beginOneOf(
 		ctx,
 		auth.OperationWorkspaceSettingsRead,
 		auth.OperationWorkspaceSettingsWrite,
 	)
+	if err != nil {
+		return ontology.PublishedCatalog{}, err
+	}
+	return c.publishedOntologyCatalog(
+		ctx, configured, decision, guard, now, operation, nil)
+}
+
+// AuthorizePublishedOntology checks one selected published identity under the
+// exact operation whose decision is being narrowed, without exposing the
+// catalog or requiring workspace-settings management authority.
+func (c *Client) AuthorizePublishedOntology(
+	ctx context.Context,
+	configured ontology.OntologyVersion,
+	identity ontology.OntologyIdentity,
+	operation auth.Operation,
+) error {
+	if err := identity.Validate(); err != nil {
+		return err
+	}
+	decision, guard, now, err := c.begin(ctx, operation)
+	if err != nil {
+		return err
+	}
+	catalog, err := c.publishedOntologyCatalog(
+		ctx, configured, decision, guard, now, operation, &identity)
+	if err != nil {
+		return err
+	}
+	if !catalog.Contains(identity) {
+		return auth.ObjectNotFound()
+	}
+	return nil
+}
+
+func (c *Client) publishedOntologyCatalog(
+	ctx context.Context,
+	configured ontology.OntologyVersion,
+	decision auth.Decision,
+	guard auth.GenerationGuard,
+	now time.Time,
+	operation auth.Operation,
+	through *ontology.OntologyIdentity,
+) (ontology.PublishedCatalog, error) {
+	store, err := c.ontologyProposalStore()
 	if err != nil {
 		return ontology.PublishedCatalog{}, err
 	}
@@ -215,6 +255,21 @@ func (c *Client) PublishedOntologyCatalog(
 		return ontology.PublishedCatalog{}, err
 	}
 	versions := catalog.Versions()
+	if through != nil {
+		if !catalog.Contains(*through) {
+			return ontology.PublishedCatalog{}, auth.ObjectNotFound()
+		}
+		for index, version := range versions {
+			identity, err := ontology.NewOntologyIdentity(version)
+			if err != nil {
+				return ontology.PublishedCatalog{}, err
+			}
+			if identity == *through {
+				versions = versions[:index+1]
+				break
+			}
+		}
+	}
 	reachable := make(map[shoal.ID]shoal.ID, len(versions)-1)
 	for index := 1; index < len(versions); index++ {
 		reachable[versions[index-1].ID()] = versions[index].ID()
