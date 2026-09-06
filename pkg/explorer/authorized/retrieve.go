@@ -22,6 +22,7 @@ package authorized
 import (
 	"context"
 
+	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/retrieval"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
@@ -33,8 +34,8 @@ func (c *Client) Retrieve(
 	ctx context.Context,
 	request retrieval.Request,
 ) (retrieval.Response, error) {
-	var disclosure Disclosure
-	return c.retrieve(ctx, request, &disclosure)
+	var report RetrievalReport
+	return c.retrieve(ctx, request, &report)
 }
 
 // RetrieveWithSuppressed performs the identical authorized retrieval as
@@ -47,12 +48,12 @@ func (c *Client) RetrieveWithSuppressed(
 	ctx context.Context,
 	request retrieval.Request,
 ) (retrieval.Response, uint32, error) {
-	var disclosure Disclosure
-	response, err := c.retrieve(ctx, request, &disclosure)
+	var report RetrievalReport
+	response, err := c.retrieve(ctx, request, &report)
 	if err != nil {
 		return retrieval.Response{}, 0, err
 	}
-	return response, disclosure.Suppressed, nil
+	return response, report.Disclosure.Suppressed, nil
 }
 
 // RetrieveWithDisclosure performs the identical authorized retrieval as
@@ -65,19 +66,32 @@ func (c *Client) RetrieveWithDisclosure(
 	ctx context.Context,
 	request retrieval.Request,
 ) (retrieval.Response, Disclosure, error) {
-	var disclosure Disclosure
-	response, err := c.retrieve(ctx, request, &disclosure)
+	var report RetrievalReport
+	response, err := c.retrieve(ctx, request, &report)
 	if err != nil {
 		return retrieval.Response{}, Disclosure{}, err
 	}
-	return response, disclosure, nil
+	return response, report.Disclosure, nil
+}
+
+// RetrieveWithReport performs authorized retrieval and returns request-local
+// embedding-space observability alongside the existing disclosure counts.
+// Unlike the older helpers, report is retained when retrieval fails so an
+// unavailable authorized provider or fan-out refusal is not silently lost.
+func (c *Client) RetrieveWithReport(
+	ctx context.Context,
+	request retrieval.Request,
+) (retrieval.Response, RetrievalReport, error) {
+	var report RetrievalReport
+	response, err := c.retrieve(ctx, request, &report)
+	return response, report, err
 }
 
 func (c *Client) retrieve(
 	ctx context.Context,
 	request retrieval.Request,
-	disclosure *Disclosure,
-) (retrieval.Response, error) {
+	report *RetrievalReport,
+) (response retrieval.Response, err error) {
 	normalized, err := request.Normalize()
 	if err != nil {
 		return retrieval.Response{}, err
@@ -85,7 +99,23 @@ func (c *Client) retrieve(
 	if err := normalized.ValidateSeedPlan(true); err != nil {
 		return retrieval.Response{}, err
 	}
+	vectorRequest := normalized.HasMode(retrieval.ModeVector)
+	collector := newEmbeddingQueryCollector()
+	observedCtx := ctx
+	if vectorRequest {
+		observedCtx = explorer.WithEmbeddingQueryObserver(ctx, collector.observe)
+	}
 	if normalized.HasMode(retrieval.ModeVector) && !c.authorizedVectorScoringAvailable() {
+		embedding := collector.report(
+			report.Disclosure, false,
+			shoal.NewError(
+				shoal.ErrorUnavailable,
+				"authorized vector retrieval requires trusted vector validation",
+			),
+			true,
+		)
+		report.Embedding = &embedding
+		notifyEmbeddingQueryObserver(ctx, embedding)
 		return retrieval.Response{}, shoal.NewError(
 			shoal.ErrorUnavailable,
 			"authorized vector retrieval requires trusted vector validation",
@@ -95,6 +125,29 @@ func (c *Client) retrieve(
 	if err != nil {
 		return retrieval.Response{}, err
 	}
+	authorizedCandidates := false
+	defer func() {
+		discloseIdentities := true
+		if guardErr := guard.Check(ctx); guardErr != nil {
+			discloseIdentities = false
+			report.Disclosure = Disclosure{}
+			if err == nil {
+				response = retrieval.Response{}
+				err = guardErr
+			}
+		}
+		if !vectorRequest {
+			return
+		}
+		embedding := collector.report(
+			report.Disclosure,
+			authorizedCandidates,
+			err,
+			discloseIdentities,
+		)
+		report.Embedding = &embedding
+		notifyEmbeddingQueryObserver(ctx, embedding)
+	}()
 	summaries, err := c.base.Documents(ctx)
 	if err != nil {
 		return retrieval.Response{}, err
@@ -120,7 +173,7 @@ func (c *Client) retrieve(
 			// catalog, where the corpus is intact but every document falls
 			// through here; without it a fully withheld corpus would read as
 			// "nothing withheld". The record is still dropped exactly as before.
-			disclosure.Suppressed++
+			report.Disclosure.Suppressed++
 			continue
 		}
 		if registration.RevisionID != summary.Revision.ID {
@@ -136,7 +189,7 @@ func (c *Client) retrieve(
 			// record is still dropped exactly as before. Counting a document
 			// the identity's rule denies is unambiguous authorization
 			// suppression, alongside the missing-grant case counted above.
-			disclosure.Suppressed++
+			report.Disclosure.Suppressed++
 			continue
 		}
 		if _, duplicate := visible[summary.Document.ID]; duplicate {
@@ -153,7 +206,7 @@ func (c *Client) retrieve(
 	if err != nil {
 		return retrieval.Response{}, err
 	}
-	disclosure.Restricted += restricted.restricted
+	report.Disclosure.Restricted += restricted.restricted
 	if len(restricted.allowed) != len(visibleOrder) {
 		// Load-bearing: documents whose sensitivity domain exceeds the
 		// co-occurrence budget are dropped from the projection so the base
@@ -182,17 +235,11 @@ func (c *Client) retrieve(
 			}
 		}
 		if len(documentIDs) == 0 {
-			if err := c.probeAuthorizedVector(ctx, normalized); err != nil {
-				return retrieval.Response{}, err
-			}
-			return c.emptyRetrieval(ctx, guard, normalized)
+			return c.emptyRetrieval(normalized)
 		}
 	}
 	if len(documentIDs) == 0 {
-		if err := c.probeAuthorizedVector(ctx, normalized); err != nil {
-			return retrieval.Response{}, err
-		}
-		return c.emptyRetrieval(ctx, guard, normalized)
+		return c.emptyRetrieval(normalized)
 	}
 	selected := make(map[shoal.ID]RevisionRegistration, len(documentIDs))
 	selectedNodes := make(map[shoal.ID]NodeRegistration)
@@ -217,10 +264,7 @@ func (c *Client) retrieve(
 			}
 		}
 		if len(nodeIDs) == 0 {
-			if err := c.probeAuthorizedVector(ctx, normalized); err != nil {
-				return retrieval.Response{}, err
-			}
-			return c.emptyRetrieval(ctx, guard, normalized)
+			return c.emptyRetrieval(normalized)
 		}
 	}
 	if len(documentIDs)+len(nodeIDs) > retrieval.MaxScopeIDs {
@@ -234,42 +278,56 @@ func (c *Client) retrieve(
 		DocumentIDs: append([]shoal.ID(nil), documentIDs...),
 		NodeIDs:     append([]shoal.ID(nil), nodeIDs...),
 	}
+	authorizedCandidates = vectorRequest
 	corpus, err := c.hydrateRetrievalCorpus(
 		ctx, documentIDs, selected, decision, now)
 	if err != nil {
 		return retrieval.Response{}, err
 	}
-	response, err := c.base.Retrieve(ctx, projected)
+	var vectorScores map[shoal.ID]shoal.Score
+	if vectorRequest {
+		nodeScope := make(map[shoal.ID]struct{}, len(projected.Scope.NodeIDs))
+		for _, nodeID := range projected.Scope.NodeIDs {
+			nodeScope[nodeID] = struct{}{}
+		}
+		vectorScores, err = c.authorizedVectorScores(
+			observedCtx, projected, corpus, nodeScope)
+		if err != nil {
+			return retrieval.Response{}, err
+		}
+		if err := collector.err(); err != nil {
+			return retrieval.Response{}, err
+		}
+	}
+	response, err = c.base.Retrieve(
+		explorer.WithEmbeddingQueryObserver(ctx, nil),
+		projected,
+	)
 	if err != nil {
+		if vectorRequest {
+			return retrieval.Response{}, authorizedVectorError(err)
+		}
 		return retrieval.Response{}, err
 	}
 	if err := response.ValidateFor(projected); err != nil {
 		return retrieval.Response{}, inconsistentRetrieval()
 	}
-	if err := c.validateRetrievedResponse(
-		ctx, response, projected, corpus, decision, now,
+	if err := c.validateRetrievedResponseWithVectorScores(
+		ctx, response, projected, corpus, decision, now, vectorScores,
 	); err != nil {
 		return retrieval.Response{}, err
 	}
 	cloned := cloneRetrievalResponse(response)
 	cloned.RequestID = ""
-	if err := guard.Check(ctx); err != nil {
-		return retrieval.Response{}, err
-	}
 	return cloned, nil
 }
 
 func (c *Client) emptyRetrieval(
-	ctx context.Context,
-	guard auth.GenerationGuard,
 	request retrieval.Request,
 ) (retrieval.Response, error) {
 	response := retrieval.Response{}
 	if err := response.ValidateFor(request); err != nil {
 		return retrieval.Response{}, inconsistentRetrieval()
-	}
-	if err := guard.Check(ctx); err != nil {
-		return retrieval.Response{}, err
 	}
 	return response, nil
 }

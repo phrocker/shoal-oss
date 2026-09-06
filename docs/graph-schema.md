@@ -54,9 +54,15 @@ entity traversals in one large edge namespace.
 
 ## Mapping to pushdown requests
 
+- Exact ShoalQL vector search: set `VectorOptions.EmbeddingSpace` to the full
+  stable identity that produced the supplied raw vector. The planner carries
+  it as the `vectorKNN` iterator's `embeddingSpace` option. The embedded engine
+  validates every participating immutable file before scoring and rejects
+  unknown, `no_embeddings`, or incompatible spaces.
 - `VectorSearch`: set `embedding_cf` to `graphschema.VectorCF()`. Query vectors
   and embedding values use packed big-endian `float32`, matching
-  `proto/embed.proto`.
+  `proto/embed.proto`. The lower-level gRPC request does not currently expose
+  the per-file identity snapshot needed for the ShoalQL exact contract.
 - `EdgeExpand`: set `edge_cf` to `graphschema.EdgeCF(kind)`. This schema stores
   the neighbor id in the column qualifier, so use the default `edge_field`
   (`"qualifier"`), no field separator, and set `primary_prefix` to the target

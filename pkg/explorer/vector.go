@@ -45,6 +45,16 @@ const (
 	vectorCapabilityProbeText      = "shoal vector capability probe"
 )
 
+type embeddingQueryCacheKey struct {
+	identity string
+	query    string
+}
+
+type cachedQueryEmbedding struct {
+	provenance persistedEmbeddingProvenance
+	vector     []float32
+}
+
 type vectorAvailabilityCache struct {
 	checkedAt time.Time
 	available bool
@@ -168,7 +178,13 @@ func (e *Explorer) vectorAvailabilitySnapshotLocked() (
 			if err := validateEmbeddingSet(record); err != nil {
 				return nil, false, err
 			}
-			spacesByIdentity[record.Embeddings.Provenance.Identity] = record.Embeddings.Provenance
+			current := record.Embeddings.Provenance
+			if existing, ok := spacesByIdentity[current.Identity]; ok &&
+				existing != current {
+				return nil, false, conflictingEmbeddingProvenanceError(
+					existing, current)
+			}
+			spacesByIdentity[current.Identity] = current
 		}
 		record, err := latestRevision(revisions)
 		if err != nil {
@@ -214,12 +230,20 @@ func (e *Explorer) VectorScores(
 	}
 	if len(request.Citations) == 0 {
 		e.mu.RUnlock()
-		_, _, err := e.embedQuery(ctx, request.Text)
+		_, _, event, err := e.embedQueriesForSpaces(ctx, request.Text, nil)
+		e.observeEmbeddingQuery(ctx, event)
 		if err != nil {
 			return nil, err
 		}
 		return map[shoal.ID]shoal.Score{}, nil
 	}
+	var queryEvent EmbeddingQueryEvent
+	var observeQuery bool
+	defer func() {
+		if observeQuery {
+			e.observeEmbeddingQuery(ctx, queryEvent)
+		}
+	}()
 	defer e.mu.RUnlock()
 	type scoreTarget struct {
 		span      document.Span
@@ -277,29 +301,22 @@ func (e *Explorer) VectorScores(
 				"stored span embeddings are stale or incomplete",
 			)
 		}
-		spacesByIdentity[record.Embeddings.Provenance.Identity] = record.Embeddings.Provenance
+		current := record.Embeddings.Provenance
+		if existing, ok := spacesByIdentity[current.Identity]; ok &&
+			existing != current {
+			return nil, conflictingEmbeddingProvenanceError(existing, current)
+		}
+		spacesByIdentity[current.Identity] = current
 		targets = append(targets, scoreTarget{
 			span: span, embedding: embedding, space: record.Embeddings.Provenance,
 		})
 	}
-	if len(spacesByIdentity) > e.maxEmbeddingSpaceFanout {
-		return nil, shoal.NewError(
-			shoal.ErrorUnavailable,
-			"vector scoring spans too many embedding spaces",
-		)
-	}
-	spaceKeys := make([]string, 0, len(spacesByIdentity))
-	for identity := range spacesByIdentity {
-		spaceKeys = append(spaceKeys, identity)
-	}
-	sort.Strings(spaceKeys)
-	queryVectors := make(map[string][]float32, len(spaceKeys))
-	for _, identity := range spaceKeys {
-		_, vector, err := e.embedQueryInSpace(ctx, request.Text, spacesByIdentity[identity])
-		if err != nil {
-			return nil, err
-		}
-		queryVectors[identity] = vector
+	queryVectors, _, event, err := e.embedQueriesForSpaces(
+		ctx, request.Text, spacesByIdentity)
+	queryEvent = event
+	observeQuery = true
+	if err != nil {
+		return nil, err
 	}
 	scores := make(map[shoal.ID]shoal.Score, len(targets))
 	rawBySpace := make(map[string][]rankedSpan)
@@ -464,18 +481,21 @@ func (e *Explorer) embedQueryInSpace(
 	embedder := e.embedders[space.Identity]
 	if embedder == nil {
 		if e.embedder != nil {
-			current, _, err := e.embedQuery(ctx, text)
+			currentIdentity, err := e.embeddingIdentity()
 			if err != nil {
 				return persistedEmbeddingProvenance{}, nil, err
 			}
-			if current != space {
+			if currentIdentity != space.Identity {
 				return persistedEmbeddingProvenance{}, nil,
-					incompatibleEmbeddingSpaceError(space, current)
+					incompatibleEmbeddingSpaceError(
+						space,
+						persistedEmbeddingProvenance{Identity: currentIdentity},
+					)
 			}
 		}
 		return persistedEmbeddingProvenance{}, nil, shoal.NewError(
 			shoal.ErrorUnavailable,
-			"embedding provider for stored space is unavailable",
+			fmt.Sprintf("embedding provider for stored space %q is unavailable", space.Identity),
 		)
 	}
 	identity, err := embeddingIdentityFor(embedder)
@@ -492,7 +512,8 @@ func (e *Explorer) embedQueryInSpace(
 	result, err := embedder.Embed(ctx, model.EmbedRequest{Text: text})
 	if err != nil {
 		return persistedEmbeddingProvenance{}, nil,
-			embeddingProviderError("embed retrieval query", err)
+			embeddingProviderError(
+				fmt.Sprintf("embed retrieval query for space %q", space.Identity), err)
 	}
 	provenance, vector, err := normalizedEmbeddingResult(result, identity)
 	if err != nil {
@@ -502,6 +523,218 @@ func (e *Explorer) embedQueryInSpace(
 		return persistedEmbeddingProvenance{}, nil, incompatibleEmbeddingSpaceError(space, provenance)
 	}
 	return provenance, vector, nil
+}
+
+func (e *Explorer) embedQueriesForSpaces(
+	ctx context.Context,
+	text string,
+	spaces map[string]persistedEmbeddingProvenance,
+) (
+	map[string][]float32,
+	[]persistedEmbeddingProvenance,
+	EmbeddingQueryEvent,
+	error,
+) {
+	keys := make([]string, 0, len(spaces))
+	for identity := range spaces {
+		keys = append(keys, identity)
+	}
+	sort.Strings(keys)
+	event := EmbeddingQueryEvent{
+		SpaceIdentities: append([]string(nil), keys...),
+		FanoutLimit:     e.maxEmbeddingSpaceFanout,
+	}
+	if len(keys) > e.maxEmbeddingSpaceFanout {
+		event.FanoutExceeded = true
+		return nil, nil, event, shoal.NewError(
+			shoal.ErrorUnavailable,
+			fmt.Sprintf(
+				"vector retrieval spans %d embedding spaces, exceeding fan-out limit %d",
+				len(keys), e.maxEmbeddingSpaceFanout),
+		)
+	}
+
+	if len(keys) == 0 {
+		identity, identityErr := e.embeddingIdentity()
+		if identityErr == nil {
+			event.SpaceIdentities = []string{identity}
+			event.Attempted = append(event.Attempted, identity)
+		}
+		provenance, _, cacheHit, providerCalled, err :=
+			e.cachedEmbedQuery(ctx, text)
+		if provenance.Identity != "" {
+			event.SpaceIdentities = []string{provenance.Identity}
+			if len(event.Attempted) == 0 {
+				event.Attempted = append(event.Attempted, provenance.Identity)
+			}
+		}
+		if cacheHit {
+			event.CacheHits++
+		}
+		if providerCalled {
+			event.ProviderCalls++
+		}
+		if err != nil {
+			if identityErr == nil {
+				event.SpaceIdentities = []string{identity}
+				if shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
+					event.Unavailable = []string{identity}
+				}
+			}
+			return nil, nil, event, err
+		}
+		if provenance.Identity != "" {
+			event.Completed = append(event.Completed, provenance.Identity)
+		}
+		return map[string][]float32{}, nil, event, nil
+	}
+
+	vectors := make(map[string][]float32, len(keys))
+	participating := make([]persistedEmbeddingProvenance, 0, len(keys))
+	for _, identity := range keys {
+		space := spaces[identity]
+		event.Attempted = append(event.Attempted, identity)
+		_, vector, cacheHit, providerCalled, err :=
+			e.cachedEmbedQueryInSpace(ctx, text, space)
+		if cacheHit {
+			event.CacheHits++
+		}
+		if providerCalled {
+			event.ProviderCalls++
+		}
+		if err != nil {
+			if shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
+				event.Unavailable = append(event.Unavailable, identity)
+			}
+			return nil, nil, event, err
+		}
+		event.Completed = append(event.Completed, identity)
+		vectors[identity] = vector
+		participating = append(participating, space)
+	}
+	return vectors, participating, event, nil
+}
+
+func (e *Explorer) cachedEmbedQuery(
+	ctx context.Context,
+	text string,
+) (persistedEmbeddingProvenance, []float32, bool, bool, error) {
+	if e.embedder == nil {
+		provenance, vector, err := e.embedQuery(ctx, normalizeEmbeddingQueryText(text))
+		return provenance, vector, false, false, err
+	}
+	identity, err := e.embeddingIdentity()
+	if err != nil {
+		return persistedEmbeddingProvenance{}, nil, false, false, err
+	}
+	query := normalizeEmbeddingQueryText(text)
+	if cached, ok := e.queryEmbedding(identity, query); ok {
+		return cached.provenance, cached.vector, true, false, nil
+	}
+	provenance, vector, err := e.embedQuery(ctx, query)
+	if err != nil {
+		return persistedEmbeddingProvenance{}, nil, false, true, err
+	}
+	e.cacheQueryEmbedding(identity, query, provenance, vector)
+	return provenance, vector, false, true, nil
+}
+
+func (e *Explorer) cachedEmbedQueryInSpace(
+	ctx context.Context,
+	text string,
+	space persistedEmbeddingProvenance,
+) (persistedEmbeddingProvenance, []float32, bool, bool, error) {
+	if err := validateEmbeddingProvenance(space); err != nil {
+		return persistedEmbeddingProvenance{}, nil, false, false, err
+	}
+	query := normalizeEmbeddingQueryText(text)
+	if cached, ok := e.queryEmbedding(space.Identity, query); ok {
+		if cached.provenance != space {
+			return persistedEmbeddingProvenance{}, nil, true, false,
+				conflictingEmbeddingProvenanceError(
+					cached.provenance, space)
+		}
+		return cached.provenance, cached.vector, true, false, nil
+	}
+	providerCalled := e.embedders[space.Identity] != nil
+	provenance, vector, err := e.embedQueryInSpace(ctx, query, space)
+	if err != nil {
+		return persistedEmbeddingProvenance{}, nil, false, providerCalled, err
+	}
+	e.cacheQueryEmbedding(space.Identity, query, provenance, vector)
+	return provenance, vector, false, providerCalled, nil
+}
+
+func normalizeEmbeddingQueryText(text string) string {
+	return strings.TrimSpace(text)
+}
+
+func (e *Explorer) queryEmbedding(
+	identity, query string,
+) (cachedQueryEmbedding, bool) {
+	e.queryEmbeddingMu.Lock()
+	defer e.queryEmbeddingMu.Unlock()
+	cached, ok := e.queryEmbeddingCache[embeddingQueryCacheKey{
+		identity: identity,
+		query:    query,
+	}]
+	if !ok {
+		return cachedQueryEmbedding{}, false
+	}
+	cached.vector = append([]float32(nil), cached.vector...)
+	return cached, true
+}
+
+func (e *Explorer) cacheQueryEmbedding(
+	identity, query string,
+	provenance persistedEmbeddingProvenance,
+	vector []float32,
+) {
+	key := embeddingQueryCacheKey{identity: identity, query: query}
+	e.queryEmbeddingMu.Lock()
+	defer e.queryEmbeddingMu.Unlock()
+	if _, exists := e.queryEmbeddingCache[key]; exists {
+		return
+	}
+	for len(e.queryEmbeddingOrder) >= e.maxQueryEmbeddingCache {
+		evicted := e.queryEmbeddingOrder[0]
+		e.queryEmbeddingOrder = e.queryEmbeddingOrder[1:]
+		delete(e.queryEmbeddingCache, evicted)
+	}
+	e.queryEmbeddingCache[key] = cachedQueryEmbedding{
+		provenance: provenance,
+		vector:     append([]float32(nil), vector...),
+	}
+	e.queryEmbeddingOrder = append(e.queryEmbeddingOrder, key)
+}
+
+func (e *Explorer) observeEmbeddingQuery(
+	ctx context.Context,
+	event EmbeddingQueryEvent,
+) {
+	ReportEmbeddingQueryEvent(ctx, event)
+	if e.embeddingQueryObserver != nil {
+		e.embeddingQueryObserver(cloneEmbeddingQueryEvent(event))
+	}
+}
+
+func conflictingEmbeddingProvenanceError(
+	existing, incoming persistedEmbeddingProvenance,
+) error {
+	return shoal.WrapError(
+		shoal.ErrorInternal,
+		fmt.Sprintf(
+			"embedding identity %q has conflicting persisted provenance",
+			existing.Identity,
+		),
+		fmt.Errorf(
+			"%w: identity %q maps to %s/%s/%d and %s/%s/%d",
+			embeddingspace.ErrIntegrity,
+			existing.Identity,
+			existing.Provider, existing.Model, existing.Dimensions,
+			incoming.Provider, incoming.Model, incoming.Dimensions,
+		),
+	)
 }
 
 func embeddingProviderMap(options Options) (map[string]model.Embedder, error) {

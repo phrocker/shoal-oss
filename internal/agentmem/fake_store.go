@@ -6,6 +6,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/phrocker/shoal-oss/internal/embeddingspace"
 	"github.com/phrocker/shoal-oss/internal/embedpb"
 )
 
@@ -23,6 +24,23 @@ func (s *FakeStore) CreateTable(_ context.Context, table string, _ []string) err
 	}
 	return nil
 }
+
+func (s *FakeStore) CreateTableWithEmbedding(
+	ctx context.Context,
+	table string,
+	splits []string,
+	defaultEmbedding string,
+) error {
+	state, err := embeddingspace.Parse(defaultEmbedding)
+	if err != nil {
+		return err
+	}
+	if state == (embeddingspace.FileState{}) {
+		return embeddingspace.ErrQueryMetadataMissing
+	}
+	return s.CreateTable(ctx, table, splits)
+}
+
 func (s *FakeStore) Flush(context.Context, string) error { return nil }
 func (s *FakeStore) Write(_ context.Context, table string, muts []*embedpb.Mutation) error {
 	s.mu.Lock()

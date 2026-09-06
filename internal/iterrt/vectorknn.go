@@ -19,6 +19,7 @@ package iterrt
 
 import (
 	"container/heap"
+	"context"
 	"encoding/base64"
 	"encoding/binary"
 	"errors"
@@ -26,6 +27,8 @@ import (
 	"math"
 	"sort"
 	"strconv"
+
+	"github.com/phrocker/shoal-oss/internal/embeddingspace"
 )
 
 // VectorKNNIterator is the brute-force vector k-NN pushdown iterator described
@@ -45,6 +48,7 @@ import (
 // embedding schema is the consumer's, supplied via options:
 //
 //	query.b64    base64 of the query vector, packed big-endian float32
+//	embeddingSpace stable identity of the model space that produced the query
 //	topK         number of nearest cells to return (k); default 10
 //	embeddingCF  optional column family holding embedding cells; empty means
 //	             every cell in range is treated as an embedding
@@ -63,9 +67,11 @@ import (
 // sees every embedding cell regardless of which tablet holds it.
 type VectorKNNIterator struct {
 	source SortedKeyValueIterator
+	ctx    context.Context
 
 	query       []float32
 	queryNorm   float32 // precomputed |query| for cosine
+	querySpace  string
 	topK        int
 	embeddingCF []byte // nil/empty = any cf
 	metric      string
@@ -81,6 +87,10 @@ const (
 	// VectorKNNQuery is the base64-encoded query vector (packed big-endian
 	// float32, length dim*4).
 	VectorKNNQuery = "query.b64"
+	// VectorKNNEmbeddingSpace is the stable identity of the model space that
+	// produced query. Identity-aware planners supply it even when dimensions
+	// happen to match; storage backends use it to validate per-file metadata.
+	VectorKNNEmbeddingSpace = "embeddingSpace"
 	// VectorKNNTopK is the number of nearest cells to return (k); default 10.
 	VectorKNNTopK = "topK"
 	// VectorKNNEmbeddingCF optionally restricts which column family is treated
@@ -110,6 +120,10 @@ func (v *VectorKNNIterator) Init(source SortedKeyValueIterator, options map[stri
 		return errors.New("iterrt: VectorKNNIterator requires a non-nil source")
 	}
 	v.source = source
+	v.ctx = env.Context
+	if v.ctx == nil {
+		v.ctx = context.Background()
+	}
 
 	qB64, ok := options[VectorKNNQuery]
 	if !ok || qB64 == "" {
@@ -127,6 +141,11 @@ func (v *VectorKNNIterator) Init(source SortedKeyValueIterator, options map[stri
 		return fmt.Errorf("iterrt: VectorKNNIterator %s is empty", VectorKNNQuery)
 	}
 	v.queryNorm = knnNorm(v.query)
+	v.querySpace = options[VectorKNNEmbeddingSpace]
+	if err := embeddingspace.ValidateQueryStates(
+		"initialize exact vector iterator", v.querySpace); err != nil {
+		return fmt.Errorf("iterrt: VectorKNNIterator: %w", err)
+	}
 
 	v.topK = 10
 	if s, ok := options[VectorKNNTopK]; ok && s != "" {
@@ -174,6 +193,10 @@ func (v *VectorKNNIterator) Seek(r Range, columnFamilies [][]byte, inclusive boo
 	v.outIndex = 0
 	v.err = nil
 
+	if err := v.ctx.Err(); err != nil {
+		v.err = err
+		return err
+	}
 	if err := v.source.Seek(r, columnFamilies, inclusive); err != nil {
 		v.err = err
 		return err
@@ -181,6 +204,10 @@ func (v *VectorKNNIterator) Seek(r Range, columnFamilies [][]byte, inclusive boo
 
 	h := &knnHeap{cap: v.topK}
 	for v.source.HasTop() {
+		if err := v.ctx.Err(); err != nil {
+			v.err = err
+			return err
+		}
 		k := v.source.GetTopKey()
 		if len(v.embeddingCF) == 0 || bytesEqual(k.ColumnFamily, v.embeddingCF) {
 			if vec, err := unpackFloat32BE(v.source.GetTopValue()); err == nil && len(vec) == len(v.query) {
@@ -267,12 +294,17 @@ func (v *VectorKNNIterator) Next() error {
 func (v *VectorKNNIterator) DeepCopy(env IteratorEnvironment) SortedKeyValueIterator {
 	cp := &VectorKNNIterator{
 		source:      v.source.DeepCopy(env),
+		ctx:         env.Context,
 		query:       v.query,
 		queryNorm:   v.queryNorm,
+		querySpace:  v.querySpace,
 		topK:        v.topK,
 		embeddingCF: v.embeddingCF,
 		metric:      v.metric,
 		minScore:    v.minScore,
+	}
+	if cp.ctx == nil {
+		cp.ctx = context.Background()
 	}
 	return cp
 }

@@ -50,6 +50,16 @@ func mustConverger(t *testing.T, opts ConvergerOptions) *Converger {
 func convergenceInput(
 	t *testing.T, name string, state embeddingspace.FileState,
 ) compaction.Input {
+	return convergenceInputWithVisibility(t, name, state, nil, []byte("value"))
+}
+
+func convergenceInputWithVisibility(
+	t *testing.T,
+	name string,
+	state embeddingspace.FileState,
+	visibility []byte,
+	value []byte,
+) compaction.Input {
 	t.Helper()
 	var buf bytes.Buffer
 	w, err := rfile.NewWriter(&buf, rfile.WriterOptions{EmbeddingSpace: state})
@@ -57,14 +67,40 @@ func convergenceInput(
 		t.Fatalf("NewWriter(%s): %v", name, err)
 	}
 	if err := w.Append(&wire.Key{
-		Row: []byte(name), ColumnFamily: []byte("cf"), Timestamp: 1,
-	}, []byte("value")); err != nil {
+		Row: []byte(name), ColumnFamily: []byte("cf"),
+		ColumnVisibility: append([]byte(nil), visibility...), Timestamp: 1,
+	}, append([]byte(nil), value...)); err != nil {
 		t.Fatalf("Append(%s): %v", name, err)
 	}
 	if err := w.Close(); err != nil {
 		t.Fatalf("Close(%s): %v", name, err)
 	}
 	return compaction.Input{Name: name, Bytes: buf.Bytes()}
+}
+
+func readSingleCompactionCell(
+	t *testing.T, image []byte,
+) (*wire.Key, []byte) {
+	t.Helper()
+	var gotKey *wire.Key
+	var gotValue []byte
+	err := compaction.StreamCells(compaction.Spec{
+		Inputs: []compaction.Input{{Name: "output.rf", Bytes: image}},
+	}, func(key *wire.Key, value []byte) error {
+		if gotKey != nil {
+			t.Fatal("output contained more than one cell")
+		}
+		gotKey = key.Clone()
+		gotValue = append([]byte(nil), value...)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotKey == nil {
+		t.Fatal("output contained no cells")
+	}
+	return gotKey, gotValue
 }
 
 func TestNewConvergerRequiresATargetAndItsCollaborators(t *testing.T) {
@@ -113,6 +149,95 @@ func TestConvergerRefusesATargetItCannotProduce(t *testing.T) {
 	}
 	if attempt == nil {
 		t.Fatal("an admitted Begin must return an attempt")
+	}
+}
+
+func TestEgressDenialPreservesIdentityVisibilityAndSourceBytes(t *testing.T) {
+	input := convergenceInputWithVisibility(
+		t, "classified", embeddingspace.Has("model-old"),
+		[]byte("secret&legal"), []byte("source-bytes"),
+	)
+	var rewrites int
+	var outcomes []Outcome
+	converger := mustConverger(t, ConvergerOptions{
+		Target:   "model-hosted",
+		Governor: NewGovernor(GovernorOptions{Now: time.Now}),
+		EgressGuard: EgressGuardFunc(func(
+			_ context.Context, target string, visibility []byte,
+		) error {
+			if target != "model-hosted" ||
+				string(visibility) != "secret&legal" {
+				t.Fatalf("egress check = target %q visibility %q", target, visibility)
+			}
+			return errors.New("classification requires local embedding")
+		}),
+		Rewriter: RewriterFunc(func(
+			_ context.Context, _ string, _ *iterrt.Key, _ []byte,
+		) ([]byte, error) {
+			rewrites++
+			return []byte("rewritten"), nil
+		}),
+		Observer: func(outcome Outcome) {
+			outcomes = append(outcomes, outcome)
+		},
+	})
+	result, err := compaction.Compact(compaction.Spec{
+		Inputs: []compaction.Input{input}, Scope: iterrt.ScopeMajc,
+		TargetEmbeddingSpace: "model-hosted", Converger: converger,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Converged || result.EmbeddingSpace != embeddingspace.Has("model-old") {
+		t.Fatalf("result = converged %t space %s", result.Converged, result.EmbeddingSpace)
+	}
+	if rewrites != 0 {
+		t.Fatalf("rewriter calls = %d, want 0", rewrites)
+	}
+	stats := converger.governor.Stats()
+	if stats.SpentFiles != 0 || stats.SpentCells != 0 {
+		t.Fatalf("governor spent denied work: %+v", stats)
+	}
+	if len(outcomes) != 1 || !errors.Is(outcomes[0].Err, ErrEgressDenied) {
+		t.Fatalf("outcomes = %+v, want typed egress denial", outcomes)
+	}
+	key, value := readSingleCompactionCell(t, result.Output)
+	if string(key.ColumnVisibility) != "secret&legal" ||
+		string(value) != "source-bytes" {
+		t.Fatalf("fallback changed visibility/value: %q %q", key.ColumnVisibility, value)
+	}
+}
+
+func TestRewriterCannotWidenVisibility(t *testing.T) {
+	input := convergenceInputWithVisibility(
+		t, "classified", embeddingspace.Has("model-old"),
+		[]byte("secret"), []byte("source"),
+	)
+	converger := mustConverger(t, ConvergerOptions{
+		Target:   "model-new",
+		Governor: NewGovernor(GovernorOptions{Now: time.Now}),
+		Rewriter: RewriterFunc(func(
+			_ context.Context, _ string, key *iterrt.Key, _ []byte,
+		) ([]byte, error) {
+			key.ColumnVisibility = []byte("public")
+			return []byte("rewritten"), nil
+		}),
+	})
+	result, err := compaction.Compact(compaction.Spec{
+		Inputs: []compaction.Input{input}, Scope: iterrt.ScopeMajc,
+		TargetEmbeddingSpace: "model-new", Converger: converger,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Converged ||
+		result.EmbeddingSpace != embeddingspace.Has("model-new") {
+		t.Fatalf("result = converged %t space %s", result.Converged, result.EmbeddingSpace)
+	}
+	key, value := readSingleCompactionCell(t, result.Output)
+	if string(key.ColumnVisibility) != "secret" ||
+		string(value) != "rewritten" {
+		t.Fatalf("rewrite changed key visibility or lost value: %q %q", key.ColumnVisibility, value)
 	}
 }
 
@@ -447,8 +572,9 @@ func TestWideLazyCompactionOutagePreservesIdentityAndCanRetry(t *testing.T) {
 		Target:   "model-new",
 		Governor: g,
 		Rewriter: RewriterFunc(func(
-			_ context.Context, _ string, _ *iterrt.Key, _ []byte,
+			_ context.Context, _ string, _ *iterrt.Key, value []byte,
 		) ([]byte, error) {
+			value[0] = 'X'
 			return nil, outage
 		}),
 	})
@@ -469,6 +595,21 @@ func TestWideLazyCompactionOutagePreservesIdentityAndCanRetry(t *testing.T) {
 	if result.Converged || result.EmbeddingSpace != embeddingspace.Has("model-old") {
 		t.Fatalf("result = (converged=%v, space=%s), want preserved model-old",
 			result.Converged, result.EmbeddingSpace)
+	}
+	values := 0
+	if err := compaction.StreamCells(compaction.Spec{
+		Inputs: []compaction.Input{{Name: "output.rf", Bytes: result.Output}},
+	}, func(_ *wire.Key, value []byte) error {
+		values++
+		if string(value) != "value" {
+			t.Fatalf("provider outage mutated fallback bytes: %q", value)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if values != len(inputs) {
+		t.Fatalf("fallback cells = %d, want %d", values, len(inputs))
 	}
 	if got := g.Stats().SpentFiles; got != 0 {
 		t.Fatalf("SpentFiles = %d, want the failed reservation refunded", got)

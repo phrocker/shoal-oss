@@ -149,28 +149,32 @@ func (c *Client) anchors(ctx context.Context, a analysis) ([]string, error) {
 // unchanged.
 func (c *Client) semanticAnchors(ctx context.Context, a analysis) ([]string, error) {
 	if c.cfg.UseIVF {
-		if ix := c.ivfIndex(ctx); ix != nil {
+		if index := c.ivfIndex(ctx); index != nil {
 			nprobe := c.cfg.IvfNprobe
 			if nprobe <= 0 {
 				nprobe = 8
 			}
-			hits, err := ix.Search(ctx, a.vector, c.cfg.MaxAnchors, nprobe)
+			hits, err := index.SearchInSpace(
+				ctx,
+				a.vector,
+				c.cfg.EmbeddingSpace,
+				c.cfg.MaxAnchors,
+				nprobe,
+			)
 			if err == nil {
-				rows := make([]string, 0, len(hits))
-				seen := map[string]bool{}
-				for _, h := range hits {
-					if seen[h.Row] {
-						continue
-					}
-					seen[h.Row] = true
-					rows = append(rows, h.Row)
+				rows := make([]string, len(hits))
+				for i, hit := range hits {
+					rows[i] = hit.Row
 				}
 				return rows, nil
 			}
-			// fall through to brute force on search error
 		}
 	}
-	cells, err := c.cfg.Store.Scan(ctx, c.cfg.Table, &embedpb.ScanRequest{RowPrefix: graphschema.EventRowPrefix, VectorSearch: &embedpb.VectorSearch{Query: PackVector(a.vector), TopK: int32(c.cfg.MaxAnchors), EmbeddingCf: graphschema.VectorCF(), Metric: "cosine"}})
+	cells, err := c.cfg.Store.Scan(ctx, c.cfg.Table, &embedpb.ScanRequest{RowPrefix: graphschema.EventRowPrefix, VectorSearch: &embedpb.VectorSearch{
+		Query: PackVector(a.vector), TopK: int32(c.cfg.MaxAnchors),
+		EmbeddingCf: graphschema.VectorCF(), Metric: "cosine",
+		EmbeddingSpace: c.cfg.EmbeddingSpace,
+	}})
 	return uniqueRows(cells), err
 }
 
@@ -179,7 +183,8 @@ func (c *Client) semanticAnchors(ctx context.Context, a analysis) ([]string, err
 // to fall back to the brute-force path.
 func (c *Client) ivfIndex(ctx context.Context) *IvfIndex {
 	c.ivfOnce.Do(func() {
-		c.ivf, c.ivfErr = LoadIvfIndex(ctx, c.cfg.Store, c.cfg.Table)
+		c.ivf, c.ivfErr = LoadIvfIndexInSpace(
+			ctx, c.cfg.Store, c.cfg.Table, c.cfg.EmbeddingSpace)
 	})
 	return c.ivf
 }

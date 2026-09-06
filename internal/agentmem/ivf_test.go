@@ -19,9 +19,11 @@ package agentmem
 
 import (
 	"context"
+	"errors"
 	"strconv"
 	"testing"
 
+	"github.com/phrocker/shoal-oss/internal/embeddingspace"
 	"github.com/phrocker/shoal-oss/internal/embedpb"
 	"github.com/phrocker/shoal-oss/internal/ivfpq"
 )
@@ -91,6 +93,8 @@ func seedIvfIndex(t *testing.T, store EmbedStore, table string, vecs [][]float32
 	cfgMuts := []*embedpb.Mutation{
 		cfgMut(ivfpq.PQRow(version), pqBlob),
 		cfgMut(ivfpq.CentroidsRow(version), centBlob),
+		cfgMut(ivfpq.EmbeddingSpaceRow(version), []byte(
+			testIvfEmbeddingSpace(t, len(vecs[0])))),
 		cfgMut(ivfpq.ConfigRowActiveVersion, []byte(strconv.Itoa(int(version)))),
 		cfgMut(ivfpq.ConfigRowLastTrainedRows, []byte(strconv.Itoa(len(vecs)))),
 	}
@@ -98,6 +102,15 @@ func seedIvfIndex(t *testing.T, store EmbedStore, table string, vecs [][]float32
 		t.Fatalf("write config: %v", err)
 	}
 	return rows
+}
+
+func testIvfEmbeddingSpace(t *testing.T, dimensions int) string {
+	t.Helper()
+	identity, err := (FakeEmbedder{Dim: dimensions}).EmbeddingSpaceIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return identity
 }
 
 func TestIvfIndex_LoadAndSearch(t *testing.T) {
@@ -117,18 +130,63 @@ func TestIvfIndex_LoadAndSearch(t *testing.T) {
 	}
 	rows := seedIvfIndex(t, store, table, vecs, 2, 6, 2, 1)
 
-	ix, err := LoadIvfIndex(ctx, store, table)
+	space := testIvfEmbeddingSpace(t, len(vecs[0]))
+	ix, err := LoadIvfIndexInSpace(ctx, store, table, space)
 	if err != nil {
 		t.Fatalf("LoadIvfIndex: %v", err)
 	}
 	if ix.Version() != 1 {
 		t.Fatalf("version = %d, want 1", ix.Version())
 	}
+	if ix.EmbeddingSpace() != space {
+		t.Fatalf("embedding space = %q, want %q", ix.EmbeddingSpace(), space)
+	}
+	if _, err := ix.Search(
+		ctx, vecs[0], 3, 2,
+	); !errors.Is(err, embeddingspace.ErrQueryIdentityRequired) {
+		t.Fatalf("legacy Search error = %v", err)
+	}
+	if _, err := ix.SearchInSpace(
+		ctx, vecs[0], " "+space+" ", 3, 2,
+	); !errors.Is(err, embeddingspace.ErrInvalidState) {
+		t.Fatalf("non-canonical SearchInSpace error = %v", err)
+	}
+	if _, err := LoadIvfIndexInSpace(
+		ctx, store, table, "foreign-space",
+	); !errors.Is(err, embeddingspace.ErrMismatch) {
+		t.Fatalf("foreign LoadIvfIndexInSpace error = %v", err)
+	}
+	if err := store.Write(ctx, ivfpq.IvfTableName(table), []*embedpb.Mutation{{
+		Row: []byte(ivfpq.RowKey(0, "evt:stale-only")),
+		Entries: []*embedpb.Entry{
+			{
+				ColumnFamily:    []byte(ivfpq.ColFam),
+				ColumnQualifier: []byte(ivfpq.QualPQCode),
+				Value:           []byte{0, 0},
+			},
+			{
+				ColumnFamily:    []byte(ivfpq.ColFam),
+				ColumnQualifier: []byte(ivfpq.QualCodebookVersion),
+				Value:           []byte("0"),
+			},
+		},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	hits, err := ix.SearchInSpace(ctx, vecs[0], space, 100, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, hit := range hits {
+		if hit.Row == "evt:stale-only" {
+			t.Fatal("stale codebook posting was scored")
+		}
+	}
 
 	// Probe all clusters (full recall) and confirm each vector retrieves
 	// itself as the top hit.
 	for i, q := range vecs {
-		got, err := ix.Search(ctx, q, 3, 2)
+		got, err := ix.SearchInSpace(ctx, q, space, 3, 2)
 		if err != nil {
 			t.Fatalf("Search[%d]: %v", i, err)
 		}
@@ -146,4 +204,62 @@ func TestLoadIvfIndex_Untrained(t *testing.T) {
 	if _, err := LoadIvfIndex(context.Background(), store, "graph"); err == nil {
 		t.Fatal("LoadIvfIndex on an untrained table: want error, got nil")
 	}
+}
+
+func TestLoadIvfIndexRejectsLegacyIdentitylessArtifact(t *testing.T) {
+	store := NewFakeStore()
+	const table = "graph"
+	vecs := [][]float32{
+		{1, 0, 0, 0}, {0, 1, 0, 0}, {0, 0, 1, 0},
+		{0, 0, 0, 1}, {1, 1, 0, 0}, {0, 0, 1, 1},
+	}
+	seedIvfIndex(t, store, table, vecs, 2, 6, 2, 1)
+	store.mu.Lock()
+	delete(
+		store.tables[ivfpq.ConfigTableName(table)],
+		ivfpq.EmbeddingSpaceRow(1),
+	)
+	store.mu.Unlock()
+	if _, err := LoadIvfIndex(
+		context.Background(), store, table,
+	); !errors.Is(err, embeddingspace.ErrQueryMetadataMissing) {
+		t.Fatalf("legacy load error = %v", err)
+	}
+}
+
+func TestLoadIvfIndexRejectsInvalidVersionAndNonCanonicalIdentity(t *testing.T) {
+	makeStore := func(t *testing.T) *FakeStore {
+		t.Helper()
+		store := NewFakeStore()
+		vecs := [][]float32{
+			{1, 0, 0, 0}, {0, 1, 0, 0}, {0, 0, 1, 0},
+			{0, 0, 0, 1}, {1, 1, 0, 0}, {0, 0, 1, 1},
+		}
+		seedIvfIndex(t, store, "graph", vecs, 2, 6, 2, 1)
+		return store
+	}
+	t.Run("overflow version", func(t *testing.T) {
+		store := makeStore(t)
+		store.mu.Lock()
+		cells := store.tables[ivfpq.ConfigTableName("graph")][ivfpq.ConfigRowActiveVersion]
+		cells[0].Value = []byte("4294967297")
+		store.mu.Unlock()
+		if _, err := LoadIvfIndex(
+			context.Background(), store, "graph"); err == nil {
+			t.Fatal("overflowed active version was accepted")
+		}
+	})
+	t.Run("non-canonical identity", func(t *testing.T) {
+		store := makeStore(t)
+		store.mu.Lock()
+		row := ivfpq.EmbeddingSpaceRow(1)
+		cells := store.tables[ivfpq.ConfigTableName("graph")][row]
+		cells[0].Value = append([]byte(" "), append(cells[0].Value, ' ')...)
+		store.mu.Unlock()
+		if _, err := LoadIvfIndex(
+			context.Background(), store, "graph",
+		); !errors.Is(err, embeddingspace.ErrInvalidState) {
+			t.Fatalf("non-canonical identity error = %v", err)
+		}
+	})
 }

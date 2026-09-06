@@ -19,6 +19,7 @@ package embedstore_test
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -40,6 +41,72 @@ import (
 // second agentmem client querying the imported engine recovers the same graph —
 // with no re-ingest and no re-embed. This is the local-memory-graph-is-platform
 // -data guarantee gated in CI.
+func TestScannerContextCancelsEmbeddingMetadataRead(t *testing.T) {
+	ctx := context.Background()
+	eng, err := engine.Open(t.TempDir(), engine.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close()
+	store := embedstore.New(eng)
+	const identity = "test:model:v1:1:normalized"
+	if err := store.CreateTableWithEmbedding(
+		ctx, "vectors", nil, "has_embeddings:"+identity); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Write(ctx, "vectors", []*embedpb.Mutation{{
+		Row: []byte("row"),
+		Entries: []*embedpb.Entry{{
+			ColumnFamily: []byte("vec"),
+			Value:        []byte{0, 0, 0, 0},
+		}},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Flush(ctx, "vectors"); err != nil {
+		t.Fatal(err)
+	}
+	canceled, cancel := context.WithCancel(ctx)
+	cancel()
+	_, err = store.ScannerContext(canceled, "vectors", &embedpb.ScanRequest{
+		VectorSearch: &embedpb.VectorSearch{
+			Query:          []byte{0, 0, 0, 0},
+			EmbeddingSpace: identity,
+		},
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("ScannerContext error = %v, want context.Canceled", err)
+	}
+}
+
+func TestScanAcceptsNilContext(t *testing.T) {
+	eng, err := engine.Open(t.TempDir(), engine.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close()
+	store := embedstore.New(eng)
+	if err := store.CreateTable(context.Background(), "rows", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Write(context.Background(), "rows", []*embedpb.Mutation{{
+		Row: []byte("row"),
+		Entries: []*embedpb.Entry{{
+			ColumnFamily: []byte("cf"),
+			Value:        []byte("value"),
+		}},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	cells, err := store.Scan(nil, "rows", &embedpb.ScanRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cells) != 1 {
+		t.Fatalf("cells = %d, want 1", len(cells))
+	}
+}
+
 func TestAgentmemRoundTripExportImport(t *testing.T) {
 	ctx := context.Background()
 	srcDir := filepath.Join(t.TempDir(), "src")

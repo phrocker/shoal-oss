@@ -9,6 +9,7 @@ import (
 	"strings"
 	"unicode"
 
+	"github.com/phrocker/shoal-oss/internal/embeddingspace"
 	"github.com/phrocker/shoal-oss/internal/iterrt"
 	"github.com/phrocker/shoal-oss/internal/vectorindex"
 )
@@ -81,6 +82,7 @@ type ExplainDetails struct {
 	UnsupportedCapabilities []Capability           `json:"unsupported_capabilities"`
 	OrderingAssumptions     []string               `json:"ordering_top_k_assumptions"`
 	VectorIndex             *vectorindex.Manifest  `json:"vector_index,omitempty"`
+	VectorEmbeddingSpace    string                 `json:"vector_embedding_space,omitempty"`
 	VectorFreshness         *vectorindex.Freshness `json:"vector_freshness,omitempty"`
 	RecallClaimed           bool                   `json:"recall_claimed"`
 }
@@ -113,9 +115,14 @@ func (e *Executor) explain(p *Plan) (*Result, error) {
 		{strVal("fallback_reasons"), strVal(strings.Join(d.FallbackReasons, "; "))},
 		{strVal("ordering_top_k_assumptions"), strVal(strings.Join(d.OrderingAssumptions, "; "))},
 	}
+	if d.VectorEmbeddingSpace != "" {
+		rows = append(rows,
+			Row{strVal("vector_embedding_space"), strVal(d.VectorEmbeddingSpace)})
+	}
 	if d.VectorIndex != nil {
 		rows = append(rows,
 			Row{strVal("vector_generation"), strVal(strconv.FormatUint(d.VectorIndex.Generation, 10))},
+			Row{strVal("vector_index_embedding_space"), strVal(d.VectorIndex.EmbeddingSpace)},
 			Row{strVal("vector_codebook_version"), strVal(d.VectorIndex.CodebookVersion)},
 			Row{strVal("vector_lineage"), strVal(fmt.Sprint(d.VectorIndex.Lineage))},
 			Row{strVal("vector_indexed_watermark"), strVal(strconv.FormatInt(d.VectorIndex.IndexedWatermark, 10))},
@@ -167,6 +174,10 @@ func buildExplainDetails(be Backend, p *Plan) ExplainDetails {
 			}
 			continue
 		}
+		if spec.Name == iterrt.IterVectorKNN &&
+			!hasCapability(d.Backend.Capabilities, CapabilityExactVectorKNN) {
+			continue
+		}
 		if stringListed(d.Backend.FallbackIterators, spec.Name) {
 			d.LocalMaterialization = append(d.LocalMaterialization,
 				"local iterator fallback: "+explainIterator(spec))
@@ -177,8 +188,13 @@ func buildExplainDetails(be Backend, p *Plan) ExplainDetails {
 
 	switch p.Shape {
 	case ShapeVectorKNN:
+		d.VectorEmbeddingSpace = p.VectorEmbeddingSpace
 		addVectorExplain(be, p, &d)
-		if hasCapability(d.Backend.Capabilities, CapabilityDistributedScan) {
+		if !hasCapability(d.Backend.Capabilities, CapabilityExactVectorKNN) &&
+			p.VectorMode != VectorApproximate {
+			d.FallbackReasons = append(d.FallbackReasons,
+				"exact vector execution is refused because the backend cannot prove per-file embedding identity")
+		} else if hasCapability(d.Backend.Capabilities, CapabilityDistributedScan) {
 			d.OrderingAssumptions = append(d.OrderingAssumptions,
 				"distributed scan candidates are merged into one exact score-descending top-k with ascending-key tie-break")
 		} else {
@@ -195,6 +211,7 @@ func buildExplainDetails(be Backend, p *Plan) ExplainDetails {
 			"aggregation groups are emitted in backend iterator order")
 	case ShapeDocument:
 		if p.VectorMode == VectorApproximate {
+			d.VectorEmbeddingSpace = p.VectorEmbeddingSpace
 			addVectorExplain(be, p, &d)
 		}
 		for _, term := range p.DocTerms {
@@ -258,7 +275,16 @@ func addVectorExplain(be Backend, p *Plan, d *ExplainDetails) {
 		manifest, err := provider.DescribeVector(context.Background(), p.VectorIndex)
 		if err == nil {
 			d.VectorIndex = &manifest
-			d.RecallClaimed = manifest.Recall.Benchmarked()
+			spaceCompatible := embeddingspace.EnsureSameIdentity(
+				"explain approximate vector query",
+				manifest.EmbeddingSpace,
+				p.VectorEmbeddingSpace,
+			) == nil
+			d.RecallClaimed = spaceCompatible && manifest.Recall.Benchmarked()
+			if !spaceCompatible {
+				d.FallbackReasons = append(d.FallbackReasons,
+					"query embedding space is incompatible with the vector index; recall is not claimed")
+			}
 			if !d.RecallClaimed {
 				d.FallbackReasons = append(d.FallbackReasons,
 					"index has no reproducible corpus benchmark; EXPLAIN makes no recall claim")
@@ -339,7 +365,8 @@ func explainIterator(spec iterrt.IterSpec) string {
 		return fmt.Sprintf("aggregate %s group by %s",
 			spec.Options[iterrt.GraphAggregationOp], spec.Options[iterrt.GraphAggregationGroupBy])
 	case iterrt.IterVectorKNN:
-		return fmt.Sprintf("exact vector KNN metric=%s top_k=%s embedding_cf=%q",
+		return fmt.Sprintf("exact vector KNN space=%q metric=%s top_k=%s embedding_cf=%q",
+			spec.Options[iterrt.VectorKNNEmbeddingSpace],
 			spec.Options[iterrt.VectorKNNMetric], spec.Options[iterrt.VectorKNNTopK],
 			spec.Options[iterrt.VectorKNNEmbeddingCF])
 	default:

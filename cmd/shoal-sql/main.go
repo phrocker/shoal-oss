@@ -30,6 +30,10 @@ func main() {
 	table := flag.String("table", "graph", "physical engine table backing the graph tables")
 	query := flag.String("query", "", "run a single query and exit; omit for an interactive REPL")
 	explain := flag.Bool("explain", false, "print the physical plan and storage policy without executing")
+	embeddingSpace := flag.String(
+		"embedding-space", "",
+		"required embedding-space identity for vector queries",
+	)
 	flag.Parse()
 
 	if *dir == "" {
@@ -48,7 +52,10 @@ func main() {
 	exec := shoalql.NewExecutor(enginebackend.New(eng))
 
 	run := func(sql string) {
-		if err := runQuery(context.Background(), eng, cat, exec, sql, *explain); err != nil {
+		if err := runQuery(
+			context.Background(), eng, cat, exec, sql, *explain,
+			*embeddingSpace,
+		); err != nil {
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		}
 	}
@@ -73,7 +80,15 @@ func main() {
 	}
 }
 
-func runQuery(ctx context.Context, eng *engine.Engine, cat shoalql.Catalog, exec *shoalql.Executor, sql string, explain bool) error {
+func runQuery(
+	ctx context.Context,
+	eng *engine.Engine,
+	cat shoalql.Catalog,
+	exec *shoalql.Executor,
+	sql string,
+	explain bool,
+	embeddingSpace string,
+) error {
 	stmt, err := shoalql.Parse(sql)
 	if err != nil {
 		return err
@@ -82,7 +97,9 @@ func runQuery(ctx context.Context, eng *engine.Engine, cat shoalql.Catalog, exec
 	if !ok {
 		return fmt.Errorf("unknown table %q", stmt.Table)
 	}
-	plan, err := shoalql.PlanQuery(ctx, stmt, binding, shoalql.PlanOptions{})
+	plan, err := shoalql.PlanQuery(ctx, stmt, binding, shoalql.PlanOptions{
+		Vector: shoalql.VectorOptions{EmbeddingSpace: embeddingSpace},
+	})
 	if err != nil {
 		return err
 	}

@@ -19,6 +19,7 @@ package engine
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -26,10 +27,12 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/phrocker/shoal-oss/internal/cclient"
+	"github.com/phrocker/shoal-oss/internal/embeddingspace"
 	"github.com/phrocker/shoal-oss/internal/iterrt"
 	"github.com/phrocker/shoal-oss/internal/localwal"
 	"github.com/phrocker/shoal-oss/internal/storage"
@@ -63,6 +66,11 @@ type TableOptions struct {
 	// TargetEmbeddingSpace is the desired per-table convergence target. Actual
 	// embedding state remains per immutable file metadata.
 	TargetEmbeddingSpace string
+
+	// DefaultEmbedding is the actual state stamped on future immutable files.
+	// It is distinct from TargetEmbeddingSpace: desired convergence state must
+	// never be mistaken for evidence about what produced existing vectors.
+	DefaultEmbedding embeddingspace.FileState
 }
 
 type WorkloadProfile string
@@ -125,16 +133,18 @@ type table struct {
 	logger               *slog.Logger
 	format               tablet.FileFormat
 	targetEmbeddingSpace string
+	defaultEmbedding     embeddingspace.FileState
 	formatMu             sync.RWMutex
 }
 
 const tableManifestVersion = 1
 
 type tableManifest struct {
-	Version              int               `json:"version"`
-	Splits               [][]byte          `json:"splits,omitempty"`
-	FileFormat           tablet.FileFormat `json:"file_format"`
-	TargetEmbeddingSpace string            `json:"target_embedding_space,omitempty"`
+	Version              int                      `json:"version"`
+	Splits               [][]byte                 `json:"splits,omitempty"`
+	FileFormat           tablet.FileFormat        `json:"file_format"`
+	TargetEmbeddingSpace string                   `json:"target_embedding_space,omitempty"`
+	DefaultEmbedding     embeddingspace.FileState `json:"default_embedding,omitempty"`
 }
 
 // createTable creates a new table on disk with the configured splits. notify,
@@ -166,6 +176,20 @@ func createTable(dir, name string, opts TableOptions, logger *slog.Logger, rfCac
 		return nil, err
 	}
 	opts.TabletOptions.FileFormat = format
+	if opts.DefaultEmbedding == (embeddingspace.FileState{}) {
+		opts.DefaultEmbedding = opts.TabletOptions.DefaultEmbedding
+	} else if opts.TabletOptions.DefaultEmbedding != (embeddingspace.FileState{}) &&
+		opts.TabletOptions.DefaultEmbedding != opts.DefaultEmbedding {
+		return nil, fmt.Errorf(
+			"table: conflicting default embedding states %s and %s",
+			opts.DefaultEmbedding, opts.TabletOptions.DefaultEmbedding)
+	}
+	if opts.DefaultEmbedding != (embeddingspace.FileState{}) {
+		if err := opts.DefaultEmbedding.Validate(); err != nil {
+			return nil, fmt.Errorf("table: invalid default embedding state: %w", err)
+		}
+	}
+	opts.TabletOptions.DefaultEmbedding = opts.DefaultEmbedding
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("table: mkdir %s: %w", dir, err)
 	}
@@ -183,6 +207,7 @@ func createTable(dir, name string, opts TableOptions, logger *slog.Logger, rfCac
 		Splits:               splits,
 		FileFormat:           format,
 		TargetEmbeddingSpace: opts.TargetEmbeddingSpace,
+		DefaultEmbedding:     opts.DefaultEmbedding,
 	}); err != nil {
 		return nil, err
 	}
@@ -221,6 +246,7 @@ func createTable(dir, name string, opts TableOptions, logger *slog.Logger, rfCac
 		logger:               logger,
 		format:               format,
 		targetEmbeddingSpace: opts.TargetEmbeddingSpace,
+		defaultEmbedding:     opts.DefaultEmbedding,
 	}, nil
 }
 
@@ -263,6 +289,7 @@ func (t *table) setTargetEmbedding(identity string) error {
 		Splits:               t.splits,
 		FileFormat:           t.format,
 		TargetEmbeddingSpace: identity,
+		DefaultEmbedding:     t.defaultEmbedding,
 	}
 	if err := writeTableManifest(t.dir, manifest); err != nil {
 		return err
@@ -305,13 +332,14 @@ func openTable(dir, name string, logger *slog.Logger, rfCache *tablet.Cache, wal
 	tablets := make([]*tablet.Tablet, len(tabletDirs))
 	for i, td := range tabletDirs {
 		t, err := tablet.Open(td, tablet.Options{
-			Logger:          logger,
-			Cache:           rfCache,
-			WALSyncMode:     walSyncMode,
-			WALSyncInterval: walSyncInterval,
-			Backend:         backend,
-			FileFormat:      manifest.FileFormat,
-			OnRFile:         tabletNotify(name, notify),
+			Logger:           logger,
+			Cache:            rfCache,
+			WALSyncMode:      walSyncMode,
+			WALSyncInterval:  walSyncInterval,
+			Backend:          backend,
+			FileFormat:       manifest.FileFormat,
+			DefaultEmbedding: manifest.DefaultEmbedding,
+			OnRFile:          tabletNotify(name, notify),
 		})
 		if err != nil {
 			for j := 0; j < i; j++ {
@@ -334,6 +362,7 @@ func openTable(dir, name string, logger *slog.Logger, rfCache *tablet.Cache, wal
 		logger:               logger,
 		format:               manifest.FileFormat,
 		targetEmbeddingSpace: manifest.TargetEmbeddingSpace,
+		defaultEmbedding:     manifest.DefaultEmbedding,
 	}, nil
 }
 
@@ -358,6 +387,12 @@ func readTableManifest(dir string) (tableManifest, error) {
 		return tableManifest{}, err
 	}
 	manifest.FileFormat = format
+	if manifest.DefaultEmbedding != (embeddingspace.FileState{}) {
+		if err := manifest.DefaultEmbedding.Validate(); err != nil {
+			return tableManifest{}, fmt.Errorf(
+				"table: invalid default embedding state: %w", err)
+		}
+	}
 	return manifest, nil
 }
 
@@ -417,6 +452,7 @@ func (t *table) setFileFormatLocked(format tablet.FileFormat) error {
 		Splits:               t.splits,
 		FileFormat:           parsed,
 		TargetEmbeddingSpace: t.targetEmbeddingSpace,
+		DefaultEmbedding:     t.defaultEmbedding,
 	}); err != nil {
 		return err
 	}
@@ -427,6 +463,64 @@ func (t *table) setFileFormatLocked(format tablet.FileFormat) error {
 	}
 	t.format = parsed
 	return nil
+}
+
+func (t *table) setDefaultEmbedding(state embeddingspace.FileState) error {
+	if state != (embeddingspace.FileState{}) {
+		if err := state.Validate(); err != nil {
+			return err
+		}
+	}
+	t.formatMu.Lock()
+	defer t.formatMu.Unlock()
+	for _, tb := range t.tablets {
+		if cells := tb.MemtableSize(); cells > 0 {
+			return fmt.Errorf(
+				"%w: table %q has %d unflushed cells",
+				ErrEmbeddingStateChangeWithUnflushedData, t.name, cells)
+		}
+	}
+	if err := writeTableManifest(t.dir, tableManifest{
+		Version:              tableManifestVersion,
+		Splits:               t.splits,
+		FileFormat:           t.format,
+		TargetEmbeddingSpace: t.targetEmbeddingSpace,
+		DefaultEmbedding:     state,
+	}); err != nil {
+		return err
+	}
+	for _, tb := range t.tablets {
+		if err := tb.SetDefaultEmbedding(state); err != nil {
+			return err
+		}
+	}
+	t.defaultEmbedding = state
+	return nil
+}
+
+func (t *table) embeddingStateSnapshot(
+	ctx context.Context,
+) ([]tablet.EmbeddingFileState, int, embeddingspace.FileState, error) {
+	t.formatMu.Lock()
+	defer t.formatMu.Unlock()
+	return t.embeddingStateSnapshotLocked(ctx)
+}
+
+func (t *table) embeddingStateSnapshotLocked(
+	ctx context.Context,
+) ([]tablet.EmbeddingFileState, int, embeddingspace.FileState, error) {
+	var files []tablet.EmbeddingFileState
+	unflushed := 0
+	for _, tb := range t.tablets {
+		states, cells, err := tb.EmbeddingStateSnapshot(ctx)
+		if err != nil {
+			return nil, 0, embeddingspace.FileState{}, err
+		}
+		files = append(files, states...)
+		unflushed += cells
+	}
+	sort.Slice(files, func(i, j int) bool { return files[i].Path < files[j].Path })
+	return files, unflushed, t.defaultEmbedding, nil
 }
 
 // routeTablet returns the tablet index for a given row key based on
@@ -445,6 +539,8 @@ func (t *table) routeTablet(row []byte) int {
 // write routes each mutation to its tablet and applies them.
 // Mutations to different tablets are batched and written in parallel.
 func (t *table) write(mutations []*cclient.Mutation) error {
+	t.formatMu.RLock()
+	defer t.formatMu.RUnlock()
 	if len(t.tablets) == 1 {
 		return t.tablets[0].Write(mutations)
 	}
@@ -480,6 +576,8 @@ func (t *table) write(mutations []*cclient.Mutation) error {
 }
 
 func (t *table) conditionalWrite(mutations []ConditionalMutation) ([]bool, error) {
+	t.formatMu.RLock()
+	defer t.formatMu.RUnlock()
 	results := make([]bool, len(mutations))
 	buckets := make([][]ConditionalMutation, len(t.tablets))
 	indices := make([][]int, len(t.tablets))
@@ -624,6 +722,15 @@ func (t *table) neighborsOne(row, edgeCF []byte, env iterrt.IteratorEnvironment)
 // scan builds a merged scanner across all tablets whose range overlaps
 // the requested scan range. Each tablet is scanned in its own goroutine.
 func (t *table) scan(r iterrt.Range, opts ScanOptions) (*Scanner, error) {
+	_, exact, err := exactVectorEmbeddingSpace(opts.Stack)
+	if err != nil {
+		return nil, err
+	}
+	if exact {
+		return nil, fmt.Errorf(
+			"%w: vectorKNN requires ScanHosted",
+			embeddingspace.ErrQueryMetadataMissing)
+	}
 	env := iterrt.IteratorEnvironment{
 		Scope:          iterrt.ScopeScan,
 		Authorizations: opts.Authorizations,
@@ -721,10 +828,29 @@ func (t *table) scan(r iterrt.Range, opts ScanOptions) (*Scanner, error) {
 // merge is correct because tablets partition the row space — every cell
 // coordinate lives in exactly one tablet, so all versions of a coordinate are
 // adjacent in the merged stream.
-func (t *table) scanHosted(r iterrt.Range, opts ScanOptions, topStack []iterrt.IterSpec) (*Scanner, error) {
+func (t *table) scanHosted(
+	ctx context.Context,
+	r iterrt.Range,
+	opts ScanOptions,
+	topStack []iterrt.IterSpec,
+) (*Scanner, error) {
+	identity, exact, err := exactVectorEmbeddingSpace(topStack)
+	if err != nil {
+		return nil, err
+	}
 	env := iterrt.IteratorEnvironment{
+		Context:        ctx,
 		Scope:          iterrt.ScopeScan,
 		Authorizations: opts.Authorizations,
+	}
+	if exact {
+		t.formatMu.Lock()
+		if err := t.validateExactVectorEmbeddingSpaceLocked(ctx, identity); err != nil {
+			t.formatMu.Unlock()
+			return nil, err
+		}
+	} else {
+		t.formatMu.RLock()
 	}
 
 	leaves := make([]iterrt.SortedKeyValueIterator, 0, len(t.tablets))
@@ -736,13 +862,40 @@ func (t *table) scanHosted(r iterrt.Range, opts ScanOptions, topStack []iterrt.I
 	}
 
 	for _, tb := range t.tablets {
-		src, closer, err := tb.Source(env)
+		if err := ctx.Err(); err != nil {
+			cleanup()
+			if exact {
+				t.formatMu.Unlock()
+			} else {
+				t.formatMu.RUnlock()
+			}
+			return nil, err
+		}
+		var (
+			src    iterrt.SortedKeyValueIterator
+			closer func()
+		)
+		if exact {
+			src, closer, err = tb.SnapshotSourceContext(ctx, env)
+		} else {
+			src, closer, err = tb.SourceContext(ctx, env)
+		}
 		if err != nil {
 			cleanup()
+			if exact {
+				t.formatMu.Unlock()
+			} else {
+				t.formatMu.RUnlock()
+			}
 			return nil, err
 		}
 		leaves = append(leaves, src)
 		closers = append(closers, closer)
+	}
+	if exact {
+		t.formatMu.Unlock()
+	} else {
+		t.formatMu.RUnlock()
 	}
 
 	merge := iterrt.NewMergingIterator(leaves...)
@@ -780,6 +933,61 @@ func (t *table) scanHosted(r iterrt.Range, opts ScanOptions, topStack []iterrt.I
 	}
 
 	return &Scanner{merge: top, closers: closers}, nil
+}
+
+func (t *table) validateExactVectorEmbeddingSpaceLocked(
+	ctx context.Context,
+	identity string,
+) error {
+	files, unflushed, defaultEmbedding, err :=
+		t.embeddingStateSnapshotLocked(ctx)
+	if err != nil {
+		return err
+	}
+	if unflushed > 0 {
+		if err := embeddingspace.ValidateQueryStates(
+			"exact vector query over unflushed cells",
+			identity,
+			defaultEmbedding,
+		); err != nil {
+			return err
+		}
+	}
+	for _, file := range files {
+		if err := embeddingspace.ValidateQueryStates(
+			"exact vector query", identity, file.State); err != nil {
+			return fmt.Errorf("%w: file %q", err, file.Path)
+		}
+	}
+	return nil
+}
+
+func exactVectorEmbeddingSpace(
+	stack []iterrt.IterSpec,
+) (string, bool, error) {
+	var identity string
+	found := false
+	for _, spec := range stack {
+		if spec.Name != iterrt.IterVectorKNN {
+			continue
+		}
+		current := strings.TrimSpace(
+			spec.Options[iterrt.VectorKNNEmbeddingSpace])
+		if err := embeddingspace.ValidateQueryStates(
+			"execute exact vector query", current); err != nil {
+			return "", true, err
+		}
+		if found {
+			if err := embeddingspace.EnsureSameIdentity(
+				"compose exact vector iterators", identity, current); err != nil {
+				return "", true, err
+			}
+			continue
+		}
+		identity = current
+		found = true
+	}
+	return identity, found, nil
 }
 
 // flush forces all tablets to flush their memtables.

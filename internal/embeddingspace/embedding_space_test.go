@@ -93,3 +93,34 @@ func TestCompatibleRejectsInvalidState(t *testing.T) {
 		t.Fatalf("identity on embedding-free state must be rejected, got %v", err)
 	}
 }
+
+func TestValidateQueryStatesFailsClosed(t *testing.T) {
+	const query = "provider:model-a:2:l2"
+	if err := ValidateQueryStates("exact query", query,
+		Has(query), Has(query)); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name     string
+		identity string
+		err      error
+		in       []FileState
+	}{
+		{"missing identity", "", ErrQueryIdentityRequired, []FileState{Has(query)}},
+		{"non-canonical query identity", " " + query, ErrInvalidState, []FileState{Has(query)}},
+		{"unknown", query, ErrQuerySpaceUnknown, []FileState{Unknown()}},
+		{"zero is unknown", query, ErrQuerySpaceUnknown, []FileState{{}}},
+		{"partial state", query, ErrInvalidState, []FileState{{Identity: query}}},
+		{"no embeddings", query, ErrQueryNoEmbeddings, []FileState{NoEmbeddings()}},
+		{"same dimensions different model", query, ErrMismatch, []FileState{
+			Has(query), Has("provider:model-b:2:l2"),
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := ValidateQueryStates(
+				"exact query", tc.identity, tc.in...); !errors.Is(err, tc.err) {
+				t.Fatalf("error = %v, want %v", err, tc.err)
+			}
+		})
+	}
+}

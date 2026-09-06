@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/phrocker/shoal-oss/internal/embeddingspace"
 	modelio "github.com/phrocker/shoal-oss/pkg/model"
 )
 
@@ -19,8 +20,9 @@ const (
 type OllamaOption func(*modelio.OllamaConfig)
 
 type OllamaEmbedder struct {
-	embedder modelio.Embedder
-	err      error
+	embedder   modelio.Embedder
+	dimensions int
+	err        error
 }
 
 type ollamaLLM struct {
@@ -40,6 +42,10 @@ func WithOllamaTimeout(timeout time.Duration) OllamaOption {
 	return func(c *modelio.OllamaConfig) { c.Timeout = timeout }
 }
 
+func WithOllamaDimensions(dimensions int) OllamaOption {
+	return func(c *modelio.OllamaConfig) { c.Dimensions = dimensions }
+}
+
 func WithOllamaHTTPClient(client *http.Client) OllamaOption {
 	return func(c *modelio.OllamaConfig) { c.HTTPClient = client }
 }
@@ -56,7 +62,9 @@ func NewOllamaEmbedder(opts ...OllamaOption) *OllamaEmbedder {
 		cfg.Model = DefaultOllamaEmbedModel
 	}
 	embedder, err := modelio.NewOllamaEmbedder(cfg)
-	return &OllamaEmbedder{embedder: embedder, err: err}
+	return &OllamaEmbedder{
+		embedder: embedder, dimensions: cfg.Dimensions, err: err,
+	}
 }
 
 func NewOllamaLLM(opts ...OllamaOption) LLM {
@@ -80,6 +88,20 @@ func (o *OllamaEmbedder) Embed(ctx context.Context, text string) ([]float32, err
 	}
 	result, err := o.embedder.Embed(ctx, modelio.EmbedRequest{Text: text})
 	return append([]float32(nil), result.Vector...), err
+}
+
+func (o *OllamaEmbedder) EmbeddingSpaceIdentity() (string, error) {
+	if o.err != nil {
+		return "", o.err
+	}
+	if o.dimensions <= 0 {
+		return "", embeddingspace.ErrQueryIdentityRequired
+	}
+	provider, ok := o.embedder.(modelio.EmbeddingSpaceIdentityProvider)
+	if !ok {
+		return "", modelio.ErrInvalidConfig
+	}
+	return provider.EmbeddingSpaceIdentity()
 }
 
 func (o *ollamaLLM) Infer(ctx context.Context, prompt string) (string, error) {
