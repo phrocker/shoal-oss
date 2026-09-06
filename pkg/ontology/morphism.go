@@ -95,6 +95,9 @@ func (d MorphismDiscriminator) Validate() error {
 }
 
 func (d MorphismDiscriminator) MetadataKey() string { return d.metadataKey }
+func (d MorphismDiscriminator) Known() bool {
+	return d.metadataKey != "" || len(d.choices) != 0
+}
 func (d MorphismDiscriminator) Choices() map[string]shoal.ID {
 	out := make(map[string]shoal.ID, len(d.choices))
 	for _, choice := range d.choices {
@@ -164,15 +167,15 @@ func NewOntologyMorphism(config MorphismConfig) (OntologyMorphism, error) {
 		rationale: config.Rationale, metadata: cloneMetadata(config.Metadata),
 	}
 	sort.Slice(m.evidence, func(i, j int) bool { return m.evidence[i].ID() < m.evidence[j].ID() })
-	if err := validateMorphismSemantics(m, config.SourceVersion, config.TargetVersion); err != nil {
-		return OntologyMorphism{}, err
-	}
 	id, err := morphismID(m)
 	if err != nil {
 		return OntologyMorphism{}, err
 	}
 	m.id = id
 	if err := m.Validate(); err != nil {
+		return OntologyMorphism{}, err
+	}
+	if err := validateMorphismSemantics(m, config.SourceVersion, config.TargetVersion); err != nil {
 		return OntologyMorphism{}, err
 	}
 	return m, nil
@@ -234,6 +237,9 @@ func (m OntologyMorphism) Validate() error {
 	}
 	if err := validateMorphismIDs(m.targets, "morphism targets"); err != nil {
 		return err
+	}
+	if m.kind != MorphismSplit && m.discriminator.Known() {
+		return invalid("only split morphisms may carry a discriminator")
 	}
 
 	switch m.kind {
@@ -502,19 +508,85 @@ func ReadAssertionUnder(
 }
 
 type OntologyLens struct {
-	target    OntologyVersion
-	identity  OntologyIdentity
+	target      OntologyVersion
+	identity    OntologyIdentity
+	transitions []ontologyLensTransition
+}
+
+// OntologyTransition is one published, governed edge between immutable
+// versions. It exists independently of morphisms so additive releases remain
+// traversable even when no definition mapping is required.
+type OntologyTransition struct {
+	source OntologyIdentity
+	target OntologyIdentity
+}
+
+func NewOntologyTransition(
+	source, target OntologyIdentity,
+) (OntologyTransition, error) {
+	transition := OntologyTransition{source: source, target: target}
+	if err := transition.Validate(); err != nil {
+		return OntologyTransition{}, err
+	}
+	return transition, nil
+}
+
+func (t OntologyTransition) Validate() error {
+	if err := t.source.Validate(); err != nil {
+		return err
+	}
+	if err := t.target.Validate(); err != nil {
+		return err
+	}
+	if t.source.SchemaID() != t.target.SchemaID() ||
+		t.source.VersionID() == t.target.VersionID() {
+		return invalid("ontology transition must connect distinct versions of one schema")
+	}
+	return nil
+}
+
+func (t OntologyTransition) Source() OntologyIdentity { return t.source }
+func (t OntologyTransition) Target() OntologyIdentity { return t.target }
+
+type ontologyLensTransition struct {
+	source    OntologyIdentity
+	target    OntologyIdentity
 	morphisms []OntologyMorphism
 }
 
 func NewOntologyLens(
 	target OntologyVersion, morphisms []OntologyMorphism,
 ) (OntologyLens, error) {
+	return NewOntologyLensWithTransitions(target, nil, morphisms)
+}
+
+func NewOntologyLensWithTransitions(
+	target OntologyVersion,
+	transitions []OntologyTransition,
+	morphisms []OntologyMorphism,
+) (OntologyLens, error) {
 	if err := target.Validate(); err != nil {
 		return OntologyLens{}, err
 	}
 	identity, _ := NewOntologyIdentity(target)
 	lens := OntologyLens{target: target.clone(), identity: identity}
+	grouped := make(map[string]*ontologyLensTransition)
+	addTransition := func(source, target OntologyIdentity) *ontologyLensTransition {
+		key := source.String() + "->" + target.String()
+		if grouped[key] == nil {
+			grouped[key] = &ontologyLensTransition{source: source, target: target}
+		}
+		return grouped[key]
+	}
+	for _, transition := range transitions {
+		if err := transition.Validate(); err != nil {
+			return OntologyLens{}, err
+		}
+		if transition.Source().SchemaID() != identity.SchemaID() {
+			continue
+		}
+		addTransition(transition.Source(), transition.Target())
+	}
 	for _, morphism := range morphisms {
 		if err := morphism.Validate(); err != nil {
 			return OntologyLens{}, err
@@ -522,10 +594,19 @@ func NewOntologyLens(
 		if morphism.Source().SchemaID() != identity.SchemaID() {
 			continue
 		}
-		lens.morphisms = append(lens.morphisms, morphism.clone())
+		edge := addTransition(morphism.Source(), morphism.Target())
+		edge.morphisms = append(edge.morphisms, morphism.clone())
 	}
-	sort.Slice(lens.morphisms, func(i, j int) bool {
-		return lens.morphisms[i].ID() < lens.morphisms[j].ID()
+	for _, transition := range grouped {
+		sort.Slice(transition.morphisms, func(i, j int) bool {
+			return transition.morphisms[i].ID() < transition.morphisms[j].ID()
+		})
+		lens.transitions = append(lens.transitions, *transition)
+	}
+	sort.Slice(lens.transitions, func(i, j int) bool {
+		left := lens.transitions[i].source.String() + "->" + lens.transitions[i].target.String()
+		right := lens.transitions[j].source.String() + "->" + lens.transitions[j].target.String()
+		return left < right
 	})
 	return lens, nil
 }
@@ -557,19 +638,22 @@ func (l OntologyLens) Read(assertion Assertion) AssertionInterpretation {
 	}
 	for _, step := range path {
 		var reason string
-		result.subjectType, reason = mapDefinition(result.subjectType, assertion.metadata, step)
+		result.subjectType, reason = mapDefinition(
+			result.subjectType, assertion.metadata, step.morphisms)
 		if reason != "" {
 			return UnresolvedInterpretation(assertion, l.identity, reason)
 		}
-		result.predicate, reason = mapDefinition(result.predicate, assertion.metadata, step)
+		result.predicate, reason = mapDefinition(
+			result.predicate, assertion.metadata, step.morphisms)
 		if reason != "" {
 			return UnresolvedInterpretation(assertion, l.identity, reason)
 		}
-		result.objectType, reason = mapDefinition(result.objectType, assertion.metadata, step)
+		result.objectType, reason = mapDefinition(
+			result.objectType, assertion.metadata, step.morphisms)
 		if reason != "" {
 			return UnresolvedInterpretation(assertion, l.identity, reason)
 		}
-		for _, morphism := range step {
+		for _, morphism := range step.morphisms {
 			result.applied = append(result.applied, morphism.ID())
 		}
 	}
@@ -579,42 +663,23 @@ func (l OntologyLens) Read(assertion Assertion) AssertionInterpretation {
 	return result
 }
 
-func (l OntologyLens) uniquePath(from OntologyIdentity) ([][]OntologyMorphism, bool) {
-	type edge struct {
-		to OntologyIdentity
-		ms []OntologyMorphism
-	}
-	grouped := map[string]*edge{}
-	for _, m := range l.morphisms {
-		key := m.Source().String() + "->" + m.Target().String()
-		if grouped[key] == nil {
-			grouped[key] = &edge{to: m.Target()}
-		}
-		grouped[key].ms = append(grouped[key].ms, m)
-	}
-	adj := map[string][]edge{}
-	for _, m := range l.morphisms {
-		key := m.Source().String() + "->" + m.Target().String()
-		e := grouped[key]
-		if len(adj[m.Source().String()]) > 0 {
-			found := false
-			for _, existing := range adj[m.Source().String()] {
-				if existing.to == e.to {
-					found = true
-				}
-			}
-			if found {
-				continue
-			}
-		}
-		adj[m.Source().String()] = append(adj[m.Source().String()], *e)
+func (l OntologyLens) uniquePath(
+	from OntologyIdentity,
+) ([]ontologyLensTransition, bool) {
+	adj := map[string][]ontologyLensTransition{}
+	for _, transition := range l.transitions {
+		adj[transition.source.String()] = append(
+			adj[transition.source.String()], transition)
 	}
 	type state struct {
-		at   OntologyIdentity
-		path [][]OntologyMorphism
+		at      OntologyIdentity
+		path    []ontologyLensTransition
+		visited map[string]struct{}
 	}
-	queue := []state{{at: from}}
-	var found [][][]OntologyMorphism
+	queue := []state{{
+		at: from, visited: map[string]struct{}{from.String(): {}},
+	}}
+	var found [][]ontologyLensTransition
 	for len(queue) > 0 {
 		current := queue[0]
 		queue = queue[1:]
@@ -629,17 +694,17 @@ func (l OntologyLens) uniquePath(from OntologyIdentity) ([][]OntologyMorphism, b
 			continue
 		}
 		for _, next := range adj[current.at.String()] {
-			seen := false
-			for _, step := range current.path {
-				if len(step) > 0 && step[0].Source() == next.to {
-					seen = true
-				}
-			}
-			if seen {
+			if _, seen := current.visited[next.target.String()]; seen {
 				continue
 			}
-			path := append(append([][]OntologyMorphism(nil), current.path...), next.ms)
-			queue = append(queue, state{at: next.to, path: path})
+			path := append(
+				append([]ontologyLensTransition(nil), current.path...), next)
+			visited := make(map[string]struct{}, len(current.visited)+1)
+			for key := range current.visited {
+				visited[key] = struct{}{}
+			}
+			visited[next.target.String()] = struct{}{}
+			queue = append(queue, state{at: next.target, path: path, visited: visited})
 		}
 	}
 	if len(found) != 1 {
@@ -704,6 +769,10 @@ func (l OntologyLens) validateInterpretation(
 		property, ok := l.target.property(interpretation.predicate)
 		if !ok || validatePropertyValue(property, assertion.Object(), nil) != nil {
 			return invalid("property is incompatible with selected ontology")
+		}
+		namespace := IDNamespace(interpretation.subjectType)
+		if namespace != "concept" && namespace != "relationship" {
+			return invalid("property subject type has an incompatible definition kind")
 		}
 		if !definitionExists(l.target, interpretation.subjectType) {
 			return invalid("property subject type is absent from selected ontology")

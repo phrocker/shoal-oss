@@ -144,6 +144,8 @@ func (s *EmbeddedService) SetOntologyVersion(version ontology.OntologyVersion) e
 		return err
 	}
 	cloned := version
+	s.ontologyPublishMu.Lock()
+	defer s.ontologyPublishMu.Unlock()
 	s.ontologyMu.Lock()
 	defer s.ontologyMu.Unlock()
 	s.ontologyVersion = &cloned
@@ -161,11 +163,65 @@ func (s *EmbeddedService) ActiveOntology(
 		return ontology.OntologyVersion{}, false, err
 	}
 	s.ontologyMu.RLock()
-	defer s.ontologyMu.RUnlock()
 	if s.ontologyVersion == nil {
+		s.ontologyMu.RUnlock()
 		return ontology.OntologyVersion{}, false, nil
 	}
-	return *s.ontologyVersion, true, nil
+	configured := *s.ontologyVersion
+	s.ontologyMu.RUnlock()
+	store, ok := s.client.(interface {
+		OntologyProposals(context.Context) ([]ontology.GovernedProposal, error)
+	})
+	if !ok {
+		return configured, true, nil
+	}
+	proposals, err := store.OntologyProposals(ctx)
+	if err != nil {
+		return ontology.OntologyVersion{}, false, err
+	}
+	active, err := replayPublishedOntology(configured, proposals)
+	if err != nil {
+		return ontology.OntologyVersion{}, false, err
+	}
+	return active, true, nil
+}
+
+func replayPublishedOntology(
+	configured ontology.OntologyVersion,
+	proposals []ontology.GovernedProposal,
+) (ontology.OntologyVersion, error) {
+	outgoing := make(map[shoal.ID]ontology.GovernedProposal)
+	for _, proposal := range proposals {
+		if proposal.State() != ontology.ProposalPublished ||
+			proposal.Schema().ID() != configured.Schema().ID() {
+			continue
+		}
+		baseID, ok := proposal.BaseVersionID()
+		if !ok {
+			continue
+		}
+		if _, duplicate := outgoing[baseID]; duplicate {
+			return ontology.OntologyVersion{}, shoal.NewError(
+				shoal.ErrorConflict, "published ontology history is ambiguous")
+		}
+		outgoing[baseID] = proposal
+	}
+	active := configured
+	visited := map[shoal.ID]struct{}{active.ID(): {}}
+	for range MaxOntologyProposals {
+		next, ok := outgoing[active.ID()]
+		if !ok {
+			return active, nil
+		}
+		active = next.ProposedVersion()
+		if _, cycle := visited[active.ID()]; cycle {
+			return ontology.OntologyVersion{}, shoal.NewError(
+				shoal.ErrorConflict, "published ontology history contains a cycle")
+		}
+		visited[active.ID()] = struct{}{}
+	}
+	return ontology.OntologyVersion{}, shoal.NewError(
+		shoal.ErrorUnavailable, "published ontology history exceeds the service bound")
 }
 
 func ontologyFor(ctx context.Context, service Service) (OntologyResponse, error) {

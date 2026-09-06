@@ -28,6 +28,8 @@ selection are intentionally tracked separately and are not claimed here.
 - Assertions and graph observations remain immutable; interpretations are
   separate result values.
 - Only morphisms on published proposals participate in a lens.
+- Published version transitions remain traversable even when an additive
+  release needs no definition mappings.
 - Widening is safe and monotonic. Narrowing is unsafe and resolves only when
   the assertion remains valid.
 - Rename requires an explicit mapping. Split requires an explicit metadata
@@ -40,6 +42,8 @@ selection are intentionally tracked separately and are not claimed here.
 ## Integration API
 
 - `ontology.NewOntologyMorphism` creates validated evidence-bearing morphisms.
+- `ontology.NewOntologyLensWithTransitions` and `ontology.NewOntologyTransition`
+  model governed version edges independently from definition mappings.
 - `ontology.NewGovernedProposalWithMorphisms` binds them to the existing
   lifecycle.
 - `auth.DecisionConfig.SelectedOntology` selects a schema+version and is part
@@ -49,3 +53,8 @@ selection are intentionally tracked separately and are not claimed here.
 - `webapi.NeighborhoodResponse.OntologyInterpretations` and
   `webapi.PathResponse.OntologyInterpretations` expose effective and original
   identities, safety-path IDs, and unresolved reasons.
+- Proposal morphism drafts reference definitions by `namespace` plus `key`;
+  evidence uses the same opaque-ID citation/path codecs as other Explorer APIs.
+- Published proposal transitions form the durable active-version chain.
+  Publication rejects stale bases, and `ActiveOntology` replays the chain after
+  restart.
