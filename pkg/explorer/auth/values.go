@@ -125,6 +125,7 @@ const (
 	ServiceRoleSubscription           ServiceRole = "subscription"
 	ServiceRoleEventPublication       ServiceRole = "event_publication"
 	ServiceRoleAnalytics              ServiceRole = "analytics"
+	ServiceRoleWorkspaceReader        ServiceRole = "workspace_reader"
 	ServiceRoleWorkspaceSettingsRead  ServiceRole = "workspace_settings_read"
 	ServiceRoleWorkspaceSettingsWrite ServiceRole = "workspace_settings_write"
 )
@@ -138,7 +139,8 @@ func (r ServiceRole) Validate() error {
 		ServiceRoleDelegation, ServiceRoleAgentRegistration,
 		ServiceRoleAgentRevocation, ServiceRoleAgentResolution,
 		ServiceRoleSubscription, ServiceRoleEventPublication,
-		ServiceRoleAnalytics, ServiceRoleWorkspaceSettingsRead,
+		ServiceRoleAnalytics, ServiceRoleWorkspaceReader,
+		ServiceRoleWorkspaceSettingsRead,
 		ServiceRoleWorkspaceSettingsWrite:
 		return nil
 	default:
@@ -189,6 +191,11 @@ func (r ServiceRole) Allows(operation Operation) bool {
 	case ServiceRoleAnalytics:
 		return operation == OperationAnalyticsRead ||
 			operation == OperationRetrieve ||
+			operation == OperationValidate
+	case ServiceRoleWorkspaceReader:
+		return operation == OperationList || operation == OperationRead ||
+			operation == OperationNeighborhood || operation == OperationRetrieve ||
+			operation == OperationWorkspaceSettingsRead ||
 			operation == OperationValidate
 	case ServiceRoleWorkspaceSettingsRead:
 		return operation == OperationWorkspaceSettingsRead ||
