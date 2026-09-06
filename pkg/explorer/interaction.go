@@ -27,7 +27,6 @@ import (
 
 	"github.com/phrocker/shoal-oss/pkg/graph"
 	"github.com/phrocker/shoal-oss/pkg/interaction"
-	"github.com/phrocker/shoal-oss/pkg/ontology"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
@@ -107,14 +106,6 @@ type InteractionResultWriter interface {
 	) (interaction.Session, error)
 }
 
-// InteractionEvidenceVerifier validates exact graph evidence without scanning
-// unrelated adjacency entries.
-type InteractionEvidenceVerifier interface {
-	VerifyInteractionEvidence(
-		context.Context, []graph.Node, []graph.Edge, []interaction.AssertionEvidence,
-	) error
-}
-
 // InteractionReader is the explicit opt-in surface for derived interaction
 // data. These methods are intentionally absent from Client, so source
 // retrieval cannot begin returning derived nodes by interface expansion.
@@ -134,7 +125,6 @@ func (e *Explorer) EnsureInteractionSink(ctx context.Context) error {
 	if err := contextError(ctx); err != nil {
 		return err
 	}
-
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if err := e.requireOpen(); err != nil {
@@ -160,106 +150,6 @@ func (e *Explorer) EnsureInteractionSink(ctx context.Context) error {
 		)
 	}
 	return nil
-}
-
-// VerifyInteractionEvidence compares supplied evidence with the current exact
-// graph indexes. Lookup work is linear only in the supplied evidence.
-func (e *Explorer) VerifyInteractionEvidence(
-	ctx context.Context,
-	nodes []graph.Node,
-	edges []graph.Edge,
-	assertions []interaction.AssertionEvidence,
-) error {
-	if err := contextError(ctx); err != nil {
-		return err
-	}
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	if err := e.requireOpen(); err != nil {
-		return err
-	}
-	if err := e.ensureGraphLocked(); err != nil {
-		return err
-	}
-	for _, node := range nodes {
-		actual, ok := e.graphNodes[node.ID]
-		if !ok || !exactInteractionNodeEqual(actual, node) {
-			return shoal.NewError(shoal.ErrorNotFound, "interaction evidence node not found")
-		}
-	}
-	for _, edge := range edges {
-		actual, ok := e.graphEdges[edge.ID]
-		if !ok || !exactInteractionEdgeEqual(actual, edge) {
-			return shoal.NewError(shoal.ErrorNotFound, "interaction evidence edge not found")
-		}
-	}
-	for _, evidence := range assertions {
-		key := evidence.ID
-		if evidence.GraphEdgeID != "" {
-			key = evidence.GraphEdgeID
-		}
-		assertion, ok := e.graphAssertions[key]
-		if !ok || !interaction.AssertionEvidenceEqual(
-			assertionInteractionEvidence(assertion), evidence,
-		) {
-			return shoal.NewError(
-				shoal.ErrorNotFound, "interaction evidence assertion not found")
-		}
-	}
-	return nil
-}
-
-func exactInteractionNodeEqual(left, right graph.Node) bool {
-	if left.ID != right.ID || left.Kind != right.Kind ||
-		len(left.Labels) != len(right.Labels) ||
-		len(left.Properties) != len(right.Properties) {
-		return false
-	}
-	for index := range left.Labels {
-		if left.Labels[index] != right.Labels[index] {
-			return false
-		}
-	}
-	for key, value := range left.Properties {
-		rightValue, ok := right.Properties[key]
-		if !ok || rightValue != value {
-			return false
-		}
-	}
-	return true
-}
-
-func exactInteractionEdgeEqual(left, right graph.Edge) bool {
-	if left.ID != right.ID || left.From != right.From || left.To != right.To ||
-		left.Type != right.Type || left.Weight != right.Weight ||
-		len(left.Properties) != len(right.Properties) {
-		return false
-	}
-	for key, value := range left.Properties {
-		rightValue, ok := right.Properties[key]
-		if !ok || rightValue != value {
-			return false
-		}
-	}
-	return true
-}
-
-func assertionInteractionEvidence(assertion ontology.Assertion) interaction.AssertionEvidence {
-	target, _ := assertion.Object().ReferenceValue()
-	evidence := interaction.AssertionEvidence{
-		ID: assertion.ID(), Subject: assertion.Subject(),
-		Predicate: assertion.Predicate(), ObjectReference: target,
-		Origin: string(assertion.Origin()), Confidence: assertion.Confidence(),
-		GraphEdgeID: shoal.ID(assertion.Metadata()[graphAssertionEdgeIDMetadata]),
-	}
-	for _, item := range assertion.Evidence() {
-		if derivation, ok := item.Derivation(); ok {
-			evidence.DerivationID = derivation.ID()
-			evidence.DerivationScore = derivation.Score()
-			break
-		}
-	}
-	return evidence
 }
 
 // RecordInteraction durably stores one interaction session as reserved

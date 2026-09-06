@@ -95,25 +95,6 @@ func TestInteractionWriteResolvesCommittedIndeterminateOutcome(t *testing.T) {
 	}
 }
 
-func TestVerifyInteractionEvidenceRejectsMissingZeroValues(t *testing.T) {
-	corpus, err := Open(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer corpus.Close()
-	ctx := context.Background()
-	if err := corpus.VerifyInteractionEvidence(
-		ctx, []graph.Node{{}}, nil, nil,
-	); !shoal.IsErrorCode(err, shoal.ErrorNotFound) {
-		t.Fatalf("missing zero node evidence = %v", err)
-	}
-	if err := corpus.VerifyInteractionEvidence(
-		ctx, nil, []graph.Edge{{}}, nil,
-	); !shoal.IsErrorCode(err, shoal.ErrorNotFound) {
-		t.Fatalf("missing zero edge evidence = %v", err)
-	}
-}
-
 func TestInteractionWritePreservesUnresolvedIndeterminateOutcome(t *testing.T) {
 	ctx := context.Background()
 	corpus, err := Open(t.TempDir())
