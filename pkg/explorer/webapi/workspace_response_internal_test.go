@@ -55,3 +55,20 @@ func TestMutationResponseOverflowIsExplicitlyIndeterminate(t *testing.T) {
 			response.Body.Len())
 	}
 }
+
+func TestErrorResponseOverflowPreservesDeterministicStatus(t *testing.T) {
+	response := httptest.NewRecorder()
+	writer := workspaceResponseWriter{
+		ResponseWriter:          response,
+		maxResponseBytes:        8,
+		indeterminateOnOverflow: true,
+	}
+	writeResponse(writer, http.StatusBadRequest, strings.Repeat("x", 1024))
+	if response.Code != http.StatusBadRequest ||
+		response.Header().Get(CommitOutcomeHeader) != "" ||
+		response.Body.Len() != 0 {
+		t.Fatalf("overflow status = %d, header = %q, bytes = %d",
+			response.Code, response.Header().Get(CommitOutcomeHeader),
+			response.Body.Len())
+	}
+}

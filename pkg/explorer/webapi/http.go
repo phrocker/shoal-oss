@@ -448,6 +448,12 @@ func writeResponse(writer http.ResponseWriter, status int, value any) {
 	var body limitedResponseBuffer
 	body.limit = int64(responseLimitFor(writer))
 	if err := json.NewEncoder(&body).Encode(value); err != nil {
+		success := status >= http.StatusOK && status < http.StatusMultipleChoices
+		if !success {
+			writer.Header().Set("Content-Type", "application/json; charset=utf-8")
+			writer.WriteHeader(status)
+			return
+		}
 		indeterminate := responseOverflowIsIndeterminate(writer)
 		status := http.StatusInternalServerError
 		code := shoal.ErrorInternal
