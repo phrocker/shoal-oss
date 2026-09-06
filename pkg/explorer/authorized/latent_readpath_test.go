@@ -20,6 +20,8 @@
 package authorized_test
 
 import (
+	"context"
+	"strings"
 	"testing"
 
 	"github.com/phrocker/shoal-oss/pkg/explorer"
@@ -27,6 +29,90 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/ontology"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
+
+type countingCanonicalBase struct {
+	*explorer.Explorer
+	documentsCalls int
+	documentCalls  int
+}
+
+func (b *countingCanonicalBase) Documents(
+	ctx context.Context,
+) ([]explorer.DocumentSummary, error) {
+	b.documentsCalls++
+	return b.Explorer.Documents(ctx)
+}
+
+func (b *countingCanonicalBase) Document(
+	ctx context.Context, documentID, revisionID shoal.ID,
+) (explorer.DocumentView, error) {
+	b.documentCalls++
+	return b.Explorer.Document(ctx, documentID, revisionID)
+}
+
+func TestAuthorizedDerivedAssertionsShareCanonicalNodeHydration(t *testing.T) {
+	f := newFixture(t)
+	admin := f.admin(t)
+	source, err := f.clientA.Ingest(admin, explorer.Source{
+		URI: "file:///batched-assertion-source.txt", MediaType: explorer.MediaTypeText,
+		Content: "batched assertion source",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	target, err := f.clientA.Ingest(admin, explorer.Source{
+		URI: "file:///batched-assertion-target.txt", MediaType: explorer.MediaTypeText,
+		Content: strings.Repeat("batched assertion target\n\n", 16),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetView, err := f.base.Document(
+		admin, target.Document.ID, target.Revision.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetIDs := []shoal.ID{
+		target.Document.ID, targetView.Root.Section.ID,
+	}
+	for _, span := range targetView.Root.Spans {
+		targetIDs = append(targetIDs, span.ID)
+	}
+	cells := make([]explorer.LatentLinkCell, 0, len(targetIDs))
+	for _, targetID := range targetIDs {
+		cells = append(cells, authorizedLatentCell(
+			source.Document.ID, targetID, int64(len(cells)+1)))
+	}
+	if err := f.base.PutLatentLinkCells(admin, cells); err != nil {
+		t.Fatal(err)
+	}
+	base := &countingCanonicalBase{Explorer: f.base}
+	client := f.newClient(t, base, f.store, f.sourceA, f.policyA, nil)
+	result, err := client.BoundedNeighborhood(
+		f.alice(t),
+		explorer.BoundedNeighborhoodRequest{
+			NodeIDs: []shoal.ID{source.Document.ID},
+			Depth:   1, Fanout: 64, MaxNodes: 64,
+			EdgeTypes: []string{authorizedLatentEdgeType(t)},
+			Direction: explorer.GraphDirectionOutgoing,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Neighborhood.Assertions) != len(cells) {
+		t.Fatalf(
+			"authorized assertions = %d, want %d",
+			len(result.Neighborhood.Assertions), len(cells),
+		)
+	}
+	if base.documentsCalls != 2 || base.documentCalls != 3 {
+		t.Fatalf(
+			"canonical hydration calls = Documents:%d Document:%d, want 2 and 3",
+			base.documentsCalls, base.documentCalls,
+		)
+	}
+}
 
 func TestAuthorizedLatentAssertionWithholdsUnauthorizedTarget(t *testing.T) {
 	f := newFixture(t)

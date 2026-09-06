@@ -616,6 +616,39 @@ func (c *Client) filterNeighborhood(
 		rawNodes[node.ID] = cloneGraphNode(node)
 		rawNodeIDs = append(rawNodeIDs, node.ID)
 	}
+	derivedAssertions, err := derivedAssertionsByEdge(raw.Assertions)
+	if err != nil {
+		return explorer.Neighborhood{}, err
+	}
+	typeFilter := make(map[string]struct{}, len(normalized.EdgeTypes))
+	for _, edgeType := range normalized.EdgeTypes {
+		typeFilter[edgeType] = struct{}{}
+	}
+	requiredDerivedAssertions := make(
+		map[shoal.ID]ontology.Assertion, len(derivedAssertions))
+	for _, edge := range raw.Edges {
+		if len(typeFilter) > 0 {
+			if _, ok := typeFilter[edge.Type]; !ok {
+				continue
+			}
+		}
+		if assertion, ok := derivedAssertions[edge.ID]; ok &&
+			assertion.Origin() == ontology.AssertionDerived {
+			requiredDerivedAssertions[assertion.ID()] = assertion
+		}
+		if edge.Type == graph.EdgeTypeProduced {
+			if assertion, ok := derivedAssertions[edge.To]; ok {
+				requiredDerivedAssertions[assertion.ID()] = assertion
+			}
+		}
+	}
+	for _, assertion := range requiredDerivedAssertions {
+		target, ok := assertion.Object().ReferenceValue()
+		if !ok {
+			continue
+		}
+		rawNodeIDs = append(rawNodeIDs, assertion.Subject(), target)
+	}
 	resolved, err := c.resolveNodes(ctx, rawNodeIDs)
 	if err != nil {
 		return explorer.Neighborhood{}, err
@@ -639,6 +672,29 @@ func (c *Client) filterNeighborhood(
 		candidates[node.ID] = cloneGraphNode(node)
 		registrations[node.ID] = registration
 	}
+	derivedAllowed := make(map[shoal.ID]bool, len(requiredDerivedAssertions))
+	for _, assertion := range requiredDerivedAssertions {
+		target, ok := assertion.Object().ReferenceValue()
+		if !ok {
+			continue
+		}
+		allowed, err := edgeEndpointsAllow(
+			resolved,
+			EdgeRegistration{Edge: graph.Edge{
+				ID: assertion.ID(), From: assertion.Subject(), To: target,
+				Type: string(assertion.Predicate()), Weight: assertion.Confidence(),
+			}},
+			decision, operation, now,
+		)
+		if err != nil {
+			return explorer.Neighborhood{}, err
+		}
+		derivedAllowed[assertion.ID()] = allowed
+		if allowed {
+			registrations[assertion.Subject()] = resolved[assertion.Subject()]
+			registrations[target] = resolved[target]
+		}
+	}
 	canonicalNodes, err := c.canonicalRegisteredNodes(ctx, registrations)
 	if err != nil {
 		return explorer.Neighborhood{}, err
@@ -652,14 +708,6 @@ func (c *Client) filterNeighborhood(
 		visibleNodes[nodeID] = node
 	}
 
-	typeFilter := make(map[string]struct{}, len(normalized.EdgeTypes))
-	for _, edgeType := range normalized.EdgeTypes {
-		typeFilter[edgeType] = struct{}{}
-	}
-	derivedAssertions, err := derivedAssertionsByEdge(raw.Assertions)
-	if err != nil {
-		return explorer.Neighborhood{}, err
-	}
 	admittedEdges := make(map[shoal.ID]graph.Edge, len(raw.Edges))
 	admittedAssertions := make(map[shoal.ID]ontology.Assertion, len(raw.Assertions))
 	candidateEdges := make([]graph.Edge, 0, len(raw.Edges))
@@ -675,9 +723,9 @@ func (c *Client) filterNeighborhood(
 		}
 		assertion, hasAssertion := derivedAssertions[edge.ID]
 		if hasAssertion && assertion.Origin() == ontology.AssertionDerived {
-			allowed, err := c.derivedAssertionEndpointsAllow(
-				ctx, rawNodes, visibleNodes, resolved, assertion, decision,
-				operation, now)
+			allowed, err := derivedAssertionEndpointsAllow(
+				rawNodes, visibleNodes, canonicalNodes, assertion,
+				derivedAllowed[assertion.ID()])
 			if err != nil {
 				return explorer.Neighborhood{}, err
 			}
@@ -693,11 +741,7 @@ func (c *Client) filterNeighborhood(
 			if !ok {
 				return explorer.Neighborhood{}, inconsistentBase()
 			}
-			allowed, err := c.derivedAssertionAllows(
-				ctx, assertion, decision, operation, now)
-			if err != nil {
-				return explorer.Neighborhood{}, err
-			}
+			allowed := derivedAllowed[assertion.ID()]
 			if !allowed || !producerDerivationEdgeMatches(edge, rawNodes, assertion) {
 				continue
 			}
@@ -945,40 +989,16 @@ func producerDerivationEdgeMatches(
 		string(derivation.ID())
 }
 
-func (c *Client) derivedAssertionEndpointsAllow(
-	ctx context.Context,
+func derivedAssertionEndpointsAllow(
 	rawNodes map[shoal.ID]graph.Node,
 	visibleNodes map[shoal.ID]graph.Node,
-	resolved registeredNodes,
+	canonical map[shoal.ID]graph.Node,
 	assertion ontology.Assertion,
-	decision auth.Decision,
-	operation auth.Operation,
-	now time.Time,
+	allowed bool,
 ) (bool, error) {
 	target, ok := assertion.Object().ReferenceValue()
-	if !ok {
+	if !ok || !allowed {
 		return false, nil
-	}
-	allowed, err := edgeEndpointsAllow(
-		resolved,
-		EdgeRegistration{Edge: graph.Edge{
-			ID: assertion.ID(), From: assertion.Subject(), To: target,
-			Type: string(assertion.Predicate()), Weight: assertion.Confidence(),
-		}},
-		decision,
-		operation,
-		now,
-	)
-	if err != nil || !allowed {
-		return allowed, err
-	}
-	registrations := map[shoal.ID]NodeRegistration{
-		assertion.Subject(): resolved[assertion.Subject()],
-		target:              resolved[target],
-	}
-	canonical, err := c.canonicalRegisteredNodes(ctx, registrations)
-	if err != nil {
-		return false, err
 	}
 	for _, nodeID := range []shoal.ID{assertion.Subject(), target} {
 		node, ok := rawNodes[nodeID]
@@ -986,45 +1006,6 @@ func (c *Client) derivedAssertionEndpointsAllow(
 			return false, inconsistentBase()
 		}
 		visibleNodes[nodeID] = cloneGraphNode(node)
-	}
-	return true, nil
-}
-
-func (c *Client) derivedAssertionAllows(
-	ctx context.Context,
-	assertion ontology.Assertion,
-	decision auth.Decision,
-	operation auth.Operation,
-	now time.Time,
-) (bool, error) {
-	target, ok := assertion.Object().ReferenceValue()
-	if !ok {
-		return false, nil
-	}
-	resolved, err := c.resolveNodes(ctx, []shoal.ID{assertion.Subject(), target})
-	if err != nil {
-		return false, err
-	}
-	allowed, err := edgeEndpointsAllow(
-		resolved,
-		EdgeRegistration{Edge: graph.Edge{
-			ID: assertion.ID(), From: assertion.Subject(), To: target,
-			Type: string(assertion.Predicate()), Weight: assertion.Confidence(),
-		}},
-		decision,
-		operation,
-		now,
-	)
-	if err != nil || !allowed {
-		return allowed, err
-	}
-	registrations := map[shoal.ID]NodeRegistration{
-		assertion.Subject(): resolved[assertion.Subject()],
-		target:              resolved[target],
-	}
-	_, err = c.canonicalRegisteredNodes(ctx, registrations)
-	if err != nil {
-		return false, err
 	}
 	return true, nil
 }
