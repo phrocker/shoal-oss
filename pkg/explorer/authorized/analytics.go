@@ -151,6 +151,7 @@ func (c *Client) materializeAnalyticsNeighborhood(
 	if err != nil {
 		return explorer.Neighborhood{}, err
 	}
+	ctx = withNeighborhoodAuthorizationCache(ctx)
 	nodes := make(map[shoal.ID]graph.Node, len(request.NodeIDs))
 	edges := make(map[shoal.ID]graph.Edge)
 	assertions := make(map[shoal.ID]ontology.Assertion)
@@ -202,6 +203,7 @@ func (c *Client) materializeAnalyticsNeighborhood(
 				now,
 				request.Direction,
 				auth.OperationAnalyticsRead,
+				false,
 				false,
 			)
 			if err != nil {

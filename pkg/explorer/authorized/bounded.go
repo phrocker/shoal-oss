@@ -290,7 +290,7 @@ func (c *Client) BoundedNeighborhood(
 	if authorizedCursorEligible(normalized) {
 		return c.boundedAuthorizedNeighborhoodPage(
 			ctx, bounded, request, normalized, decision, guard, now, direction,
-			auth.OperationNeighborhood, true)
+			auth.OperationNeighborhood, true, true)
 	}
 	raw, err := bounded.BoundedNeighborhood(ctx, request)
 	if err != nil {
@@ -326,6 +326,67 @@ const (
 	derivedAssertionPropertyDerivationScore = "ontology.assertion.derivation.score"
 )
 
+type neighborhoodAuthorizationCacheKey struct{}
+
+type neighborhoodAuthorizationCache struct {
+	resolved           registeredNodes
+	resolvedIDs        map[shoal.ID]struct{}
+	canonicalDocuments map[shoal.ID]*canonicalRetrievalDocument
+}
+
+func withNeighborhoodAuthorizationCache(ctx context.Context) context.Context {
+	if _, ok := ctx.Value(
+		neighborhoodAuthorizationCacheKey{}).(*neighborhoodAuthorizationCache); ok {
+		return ctx
+	}
+	return context.WithValue(ctx, neighborhoodAuthorizationCacheKey{},
+		&neighborhoodAuthorizationCache{
+			resolved:           make(registeredNodes),
+			resolvedIDs:        make(map[shoal.ID]struct{}),
+			canonicalDocuments: make(map[shoal.ID]*canonicalRetrievalDocument),
+		})
+}
+
+func neighborhoodCache(ctx context.Context) *neighborhoodAuthorizationCache {
+	if cached, ok := ctx.Value(
+		neighborhoodAuthorizationCacheKey{}).(*neighborhoodAuthorizationCache); ok {
+		return cached
+	}
+	return &neighborhoodAuthorizationCache{
+		resolved:           make(registeredNodes),
+		resolvedIDs:        make(map[shoal.ID]struct{}),
+		canonicalDocuments: make(map[shoal.ID]*canonicalRetrievalDocument),
+	}
+}
+
+func (c *Client) resolveNeighborhoodNodes(
+	ctx context.Context,
+	nodeIDs []shoal.ID,
+	cache *neighborhoodAuthorizationCache,
+) (registeredNodes, error) {
+	missing := make([]shoal.ID, 0, len(nodeIDs))
+	for _, nodeID := range nodeIDs {
+		if _, seen := cache.resolvedIDs[nodeID]; seen {
+			continue
+		}
+		cache.resolvedIDs[nodeID] = struct{}{}
+		missing = append(missing, nodeID)
+	}
+	if len(missing) > 0 {
+		resolved, err := c.resolveNodes(ctx, missing)
+		if err != nil {
+			for _, nodeID := range missing {
+				delete(cache.resolvedIDs, nodeID)
+			}
+			return nil, err
+		}
+		for nodeID, registration := range resolved {
+			cache.resolved[nodeID] = registration
+		}
+	}
+	return cache.resolved, nil
+}
+
 func authorizedCursorEligible(normalized explorer.NeighborhoodRequest) bool {
 	return len(normalized.NodeIDs) == 1 && normalized.Depth == 1
 }
@@ -341,7 +402,21 @@ func (c *Client) boundedAuthorizedNeighborhoodPage(
 	direction explorer.GraphDirection,
 	operation auth.Operation,
 	applyLens bool,
+	validateSnapshot bool,
 ) (explorer.BoundedNeighborhood, error) {
+	var before explorer.Snapshot
+	var err error
+	if validateSnapshot {
+		before, err = bounded.Snapshot(ctx)
+		if err != nil {
+			return explorer.BoundedNeighborhood{}, directBaseError(err)
+		}
+	}
+	ctx = withNeighborhoodAuthorizationCache(ctx)
+	ctx, err = c.withCanonicalDocumentIndex(ctx)
+	if err != nil {
+		return explorer.BoundedNeighborhood{}, err
+	}
 	scan := request
 	scan.Depth = 1
 	scan.NodeIDs = normalized.NodeIDs
@@ -453,6 +528,16 @@ func (c *Client) boundedAuthorizedNeighborhoodPage(
 	}
 	if err := guard.Check(ctx); err != nil {
 		return explorer.BoundedNeighborhood{}, err
+	}
+	if validateSnapshot {
+		afterSnapshot, snapshotErr := bounded.Snapshot(ctx)
+		if snapshotErr != nil {
+			return explorer.BoundedNeighborhood{}, directBaseError(snapshotErr)
+		}
+		if before != afterSnapshot {
+			return explorer.BoundedNeighborhood{}, shoal.NewError(
+				shoal.ErrorConflict, "corpus changed while scanning bounded graph")
+		}
 	}
 	result := authorizedBoundedPage(
 		nodes, edges, assertions, request, len(normalized.NodeIDs))
@@ -602,6 +687,7 @@ func (c *Client) filterNeighborhood(
 	allowMissingProvenanceSeeds bool,
 	operation auth.Operation,
 ) (explorer.Neighborhood, error) {
+	cache := neighborhoodCache(ctx)
 	candidates := make(map[shoal.ID]graph.Node, len(raw.Nodes))
 	registrations := make(map[shoal.ID]NodeRegistration, len(raw.Nodes))
 	rawNodes := make(map[shoal.ID]graph.Node, len(raw.Nodes))
@@ -616,7 +702,40 @@ func (c *Client) filterNeighborhood(
 		rawNodes[node.ID] = cloneGraphNode(node)
 		rawNodeIDs = append(rawNodeIDs, node.ID)
 	}
-	resolved, err := c.resolveNodes(ctx, rawNodeIDs)
+	derivedAssertions, err := derivedAssertionsByEdge(raw.Assertions)
+	if err != nil {
+		return explorer.Neighborhood{}, err
+	}
+	typeFilter := make(map[string]struct{}, len(normalized.EdgeTypes))
+	for _, edgeType := range normalized.EdgeTypes {
+		typeFilter[edgeType] = struct{}{}
+	}
+	requiredDerivedAssertions := make(
+		map[shoal.ID]ontology.Assertion, len(derivedAssertions))
+	for _, edge := range raw.Edges {
+		if len(typeFilter) > 0 {
+			if _, ok := typeFilter[edge.Type]; !ok {
+				continue
+			}
+		}
+		if assertion, ok := derivedAssertions[edge.ID]; ok &&
+			assertion.Origin() == ontology.AssertionDerived {
+			requiredDerivedAssertions[assertion.ID()] = assertion
+		}
+		if edge.Type == graph.EdgeTypeProduced {
+			if assertion, ok := derivedAssertions[edge.To]; ok {
+				requiredDerivedAssertions[assertion.ID()] = assertion
+			}
+		}
+	}
+	for _, assertion := range requiredDerivedAssertions {
+		target, ok := assertion.Object().ReferenceValue()
+		if !ok {
+			continue
+		}
+		rawNodeIDs = append(rawNodeIDs, assertion.Subject(), target)
+	}
+	resolved, err := c.resolveNeighborhoodNodes(ctx, rawNodeIDs, cache)
 	if err != nil {
 		return explorer.Neighborhood{}, err
 	}
@@ -639,7 +758,31 @@ func (c *Client) filterNeighborhood(
 		candidates[node.ID] = cloneGraphNode(node)
 		registrations[node.ID] = registration
 	}
-	canonicalNodes, err := c.canonicalRegisteredNodes(ctx, registrations)
+	derivedAllowed := make(map[shoal.ID]bool, len(requiredDerivedAssertions))
+	for _, assertion := range requiredDerivedAssertions {
+		target, ok := assertion.Object().ReferenceValue()
+		if !ok {
+			continue
+		}
+		allowed, err := edgeEndpointsAllow(
+			resolved,
+			EdgeRegistration{Edge: graph.Edge{
+				ID: assertion.ID(), From: assertion.Subject(), To: target,
+				Type: string(assertion.Predicate()), Weight: assertion.Confidence(),
+			}},
+			decision, operation, now,
+		)
+		if err != nil {
+			return explorer.Neighborhood{}, err
+		}
+		derivedAllowed[assertion.ID()] = allowed
+		if allowed {
+			registrations[assertion.Subject()] = resolved[assertion.Subject()]
+			registrations[target] = resolved[target]
+		}
+	}
+	canonicalNodes, err := c.canonicalRegisteredNodesCached(
+		ctx, registrations, cache.canonicalDocuments)
 	if err != nil {
 		return explorer.Neighborhood{}, err
 	}
@@ -652,14 +795,6 @@ func (c *Client) filterNeighborhood(
 		visibleNodes[nodeID] = node
 	}
 
-	typeFilter := make(map[string]struct{}, len(normalized.EdgeTypes))
-	for _, edgeType := range normalized.EdgeTypes {
-		typeFilter[edgeType] = struct{}{}
-	}
-	derivedAssertions, err := derivedAssertionsByEdge(raw.Assertions)
-	if err != nil {
-		return explorer.Neighborhood{}, err
-	}
 	admittedEdges := make(map[shoal.ID]graph.Edge, len(raw.Edges))
 	admittedAssertions := make(map[shoal.ID]ontology.Assertion, len(raw.Assertions))
 	candidateEdges := make([]graph.Edge, 0, len(raw.Edges))
@@ -675,9 +810,9 @@ func (c *Client) filterNeighborhood(
 		}
 		assertion, hasAssertion := derivedAssertions[edge.ID]
 		if hasAssertion && assertion.Origin() == ontology.AssertionDerived {
-			allowed, err := c.derivedAssertionEndpointsAllow(
-				ctx, rawNodes, visibleNodes, resolved, assertion, decision,
-				operation, now)
+			allowed, err := derivedAssertionEndpointsAllow(
+				rawNodes, visibleNodes, canonicalNodes, assertion,
+				derivedAllowed[assertion.ID()])
 			if err != nil {
 				return explorer.Neighborhood{}, err
 			}
@@ -693,11 +828,7 @@ func (c *Client) filterNeighborhood(
 			if !ok {
 				return explorer.Neighborhood{}, inconsistentBase()
 			}
-			allowed, err := c.derivedAssertionAllows(
-				ctx, assertion, decision, operation, now)
-			if err != nil {
-				return explorer.Neighborhood{}, err
-			}
+			allowed := derivedAllowed[assertion.ID()]
 			if !allowed || !producerDerivationEdgeMatches(edge, rawNodes, assertion) {
 				continue
 			}
@@ -922,63 +1053,32 @@ func producerDerivationEdgeMatches(
 	rawNodes map[shoal.ID]graph.Node,
 	assertion ontology.Assertion,
 ) bool {
-	producer, ok := rawNodes[edge.From]
-	if !ok || producer.Kind != graph.NodeKindProducer {
+	producer, assertionNode, producedEdge, ok, err :=
+		explorer.ProducerGraphElementsForAssertion(assertion)
+	if err != nil || !ok || !graphEdgesEqual(producedEdge, edge) {
 		return false
 	}
-	assertionNode, ok := rawNodes[edge.To]
-	if !ok || assertionNode.Kind != graph.NodeKindDerivedAssertion {
+	rawProducer, ok := rawNodes[producer.ID]
+	if !ok || !graphNodesEqual(rawProducer, producer) {
 		return false
 	}
-	if assertionNode.ID != assertion.ID() {
+	rawAssertion, ok := rawNodes[assertionNode.ID]
+	if !ok || !graphNodesEqual(rawAssertion, assertionNode) {
 		return false
 	}
-	assertionID, ok := edge.Properties[derivedAssertionPropertyAssertionID]
-	if !ok || shoal.ID(assertionID) != assertion.ID() {
-		return false
-	}
-	derivation, ok := assertion.Evidence()[0].Derivation()
-	if !ok {
-		return false
-	}
-	return edge.Properties[derivedAssertionPropertyDerivationID] ==
-		string(derivation.ID())
+	return true
 }
 
-func (c *Client) derivedAssertionEndpointsAllow(
-	ctx context.Context,
+func derivedAssertionEndpointsAllow(
 	rawNodes map[shoal.ID]graph.Node,
 	visibleNodes map[shoal.ID]graph.Node,
-	resolved registeredNodes,
+	canonical map[shoal.ID]graph.Node,
 	assertion ontology.Assertion,
-	decision auth.Decision,
-	operation auth.Operation,
-	now time.Time,
+	allowed bool,
 ) (bool, error) {
 	target, ok := assertion.Object().ReferenceValue()
-	if !ok {
+	if !ok || !allowed {
 		return false, nil
-	}
-	allowed, err := edgeEndpointsAllow(
-		resolved,
-		EdgeRegistration{Edge: graph.Edge{
-			ID: assertion.ID(), From: assertion.Subject(), To: target,
-			Type: string(assertion.Predicate()), Weight: assertion.Confidence(),
-		}},
-		decision,
-		operation,
-		now,
-	)
-	if err != nil || !allowed {
-		return allowed, err
-	}
-	registrations := map[shoal.ID]NodeRegistration{
-		assertion.Subject(): resolved[assertion.Subject()],
-		target:              resolved[target],
-	}
-	canonical, err := c.canonicalRegisteredNodes(ctx, registrations)
-	if err != nil {
-		return false, err
 	}
 	for _, nodeID := range []shoal.ID{assertion.Subject(), target} {
 		node, ok := rawNodes[nodeID]
@@ -986,45 +1086,6 @@ func (c *Client) derivedAssertionEndpointsAllow(
 			return false, inconsistentBase()
 		}
 		visibleNodes[nodeID] = cloneGraphNode(node)
-	}
-	return true, nil
-}
-
-func (c *Client) derivedAssertionAllows(
-	ctx context.Context,
-	assertion ontology.Assertion,
-	decision auth.Decision,
-	operation auth.Operation,
-	now time.Time,
-) (bool, error) {
-	target, ok := assertion.Object().ReferenceValue()
-	if !ok {
-		return false, nil
-	}
-	resolved, err := c.resolveNodes(ctx, []shoal.ID{assertion.Subject(), target})
-	if err != nil {
-		return false, err
-	}
-	allowed, err := edgeEndpointsAllow(
-		resolved,
-		EdgeRegistration{Edge: graph.Edge{
-			ID: assertion.ID(), From: assertion.Subject(), To: target,
-			Type: string(assertion.Predicate()), Weight: assertion.Confidence(),
-		}},
-		decision,
-		operation,
-		now,
-	)
-	if err != nil || !allowed {
-		return allowed, err
-	}
-	registrations := map[shoal.ID]NodeRegistration{
-		assertion.Subject(): resolved[assertion.Subject()],
-		target:              resolved[target],
-	}
-	_, err = c.canonicalRegisteredNodes(ctx, registrations)
-	if err != nil {
-		return false, err
 	}
 	return true, nil
 }

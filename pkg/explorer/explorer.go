@@ -1004,7 +1004,7 @@ func (e *Explorer) computeCurrentGraph() (
 		edges[edge.ID] = edge
 		assertions[edge.ID] = assertion
 		producer, assertionNode, derivationEdge, ok, err :=
-			producerGraphElementsForAssertion(assertion)
+			ProducerGraphElementsForAssertion(assertion)
 		if err != nil {
 			return nil, nil, nil, err
 		}

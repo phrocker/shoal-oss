@@ -34,7 +34,8 @@ import (
 
 type countingDocumentsAnalyticsBase struct {
 	*explorer.Explorer
-	calls int
+	calls         int
+	snapshotCalls int
 }
 
 type omittingAssertionsAnalyticsBase struct {
@@ -46,6 +47,13 @@ func (b *countingDocumentsAnalyticsBase) Documents(
 ) ([]explorer.DocumentSummary, error) {
 	b.calls++
 	return b.Explorer.Documents(ctx)
+}
+
+func (b *countingDocumentsAnalyticsBase) Snapshot(
+	ctx context.Context,
+) (explorer.Snapshot, error) {
+	b.snapshotCalls++
+	return b.Explorer.Snapshot(ctx)
 }
 
 func (b *omittingAssertionsAnalyticsBase) BoundedNeighborhood(
@@ -191,6 +199,12 @@ func TestAnalyticsRecorderReauthorizesExtractedRelationshipEvidence(t *testing.T
 	}
 	if counted.calls != 1 {
 		t.Fatalf("analytics documents scans = %d, want 1", counted.calls)
+	}
+	if counted.snapshotCalls != 4 {
+		t.Fatalf(
+			"analytics and recording snapshot calls = %d, want 4",
+			counted.snapshotCalls,
+		)
 	}
 	readDecision := f.decision(
 		t,
