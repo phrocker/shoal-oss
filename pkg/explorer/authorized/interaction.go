@@ -30,22 +30,23 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
-// EnsureInteractionSink verifies both the caller's current authorization pin
-// and the base corpus's durable write path. This makes *Client directly usable
-// with harness.NewGraphRecorder without bypassing the authorization wrapper.
+// EnsureInteractionSink verifies only the configured durable write path.
+// Authorization is operation-specific and is therefore enforced by
+// RecordInteractionResult after the Session declares AuthorizationOperation;
+// requiring Retrieve here would incorrectly reject evidence-empty privileged
+// action recorders during setup.
 func (c *Client) EnsureInteractionSink(ctx context.Context) error {
-	writer, err := c.interactionWriter()
-	if err != nil {
+	if err := contextFailure(ctx); err != nil {
 		return err
 	}
-	_, guard, _, err := c.begin(ctx, auth.OperationRetrieve)
+	writer, err := c.interactionWriter()
 	if err != nil {
 		return err
 	}
 	if err := writer.EnsureInteractionSink(ctx); err != nil {
 		return directBaseError(err)
 	}
-	return guard.Check(ctx)
+	return contextFailure(ctx)
 }
 
 // RecordInteraction appends one redacted interaction after verifying that its
