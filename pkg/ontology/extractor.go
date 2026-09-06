@@ -778,6 +778,15 @@ func (r ExtractionResult) ValidateFor(request ExtractionRequest) error {
 		if !present || baseVersionID != request.version.ID() {
 			return invalid("extracted proposal does not use the request ontology version")
 		}
+		for _, morphism := range proposal.Morphisms() {
+			for _, evidence := range morphism.Evidence() {
+				metadata, exists := requestEvidence[evidence.ID()]
+				if !exists || metadata != canonicalMetadata(evidence.metadata) {
+					return invalid(
+						"proposal morphism cites evidence outside the extraction request")
+				}
+			}
+		}
 	}
 	return nil
 }

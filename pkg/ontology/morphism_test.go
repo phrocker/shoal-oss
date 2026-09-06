@@ -787,6 +787,47 @@ func TestExtractionResultBoundsMorphismEvidenceDetails(t *testing.T) {
 	}
 }
 
+func TestExtractionResultRejectsProposalEvidenceOutsideRequest(t *testing.T) {
+	f := newMorphismFixture(t)
+	request, err := NewExtractionRequest(
+		f.renameFrom, []EvidenceRef{f.evidence},
+		"extract", f.provenance, DefaultExtractionLimits(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unrequested, err := NewEvidenceRef(
+		document.Citation{
+			DocumentID: "other-doc", RevisionID: "other-rev",
+			SectionID: "other-section",
+			Range:     document.SourceRange{},
+		},
+		"", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	morphism := mustMorphism(t, MorphismConfig{
+		Kind:          MorphismRename,
+		SourceVersion: f.renameFrom, TargetVersion: f.renameTo,
+		Sources:   []shoal.ID{f.oldRel.ID()},
+		Targets:   []shoal.ID{f.newRel.ID()},
+		Evidence:  []EvidenceRef{unrequested},
+		Rationale: "unrequested evidence",
+	})
+	proposal, err := NewGovernedProposalWithMorphisms(
+		f.renameFrom.Schema(), f.renameFrom, f.renameTo,
+		[]OntologyMorphism{morphism}, "extractor", "proposal",
+		f.renameTo.CreatedAt().Add(time.Second), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewExtractionResult(
+		request, nil, []GovernedProposal{proposal},
+		f.renameTo.CreatedAt().Add(2*time.Second), nil,
+	); err == nil {
+		t.Fatal("proposal morphism accepted evidence outside the extraction request")
+	}
+}
+
 func TestOntologyTransitionRejectsMorphismFromDifferentVersions(t *testing.T) {
 	f := newMorphismFixture(t)
 	widen := mustMorphism(t, MorphismConfig{

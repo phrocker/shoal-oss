@@ -35,6 +35,7 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/document"
 	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/graph"
+	"github.com/phrocker/shoal-oss/pkg/ontology"
 	"github.com/phrocker/shoal-oss/pkg/retrieval"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
@@ -344,6 +345,12 @@ func (s *RemoteService) Neighborhood(
 	); err != nil {
 		return NeighborhoodResponse{}, err
 	}
+	if err := validateRemoteOntologyInterpretations(
+		response.Neighborhood.Assertions,
+		response.OntologyInterpretations,
+	); err != nil {
+		return NeighborhoodResponse{}, err
+	}
 	if response.NextCursor != "" {
 		if !response.Truncated {
 			return NeighborhoodResponse{}, remoteContractError(
@@ -411,6 +418,12 @@ func (s *RemoteService) Path(ctx context.Context, request PathRequest) (PathResp
 		return PathResponse{}, remoteContractError(
 			"remote identity path must contain only the requested node", nil)
 	}
+	if err := validateRemoteOntologyInterpretations(
+		response.Assertions,
+		response.OntologyInterpretations,
+	); err != nil {
+		return PathResponse{}, err
+	}
 	seenEdges := make(map[shoal.ID]struct{}, len(response.Path.Edges))
 	for _, edge := range response.Path.Edges {
 		if _, duplicate := seenEdges[edge.ID]; duplicate {
@@ -424,6 +437,191 @@ func (s *RemoteService) Path(ctx context.Context, request PathRequest) (PathResp
 		}
 	}
 	return response, nil
+}
+
+func validateRemoteOntologyInterpretations(
+	assertions []ontology.Assertion,
+	reports []OntologyInterpretationReport,
+) error {
+	if len(reports) == 0 {
+		return nil
+	}
+	if len(reports) != len(assertions) {
+		return remoteContractError(
+			"remote ontology interpretations do not match returned assertions", nil)
+	}
+	expected := make(map[shoal.ID]ontology.Assertion, len(assertions))
+	for _, assertion := range assertions {
+		if err := assertion.Validate(); err != nil {
+			return remoteContractError("remote assertion is invalid", err)
+		}
+		if _, duplicate := expected[assertion.ID()]; duplicate {
+			return remoteContractError(
+				"remote assertions contain duplicate IDs", nil)
+		}
+		expected[assertion.ID()] = assertion
+	}
+	var reader ontology.OntologyIdentity
+	for index, report := range reports {
+		assertionID, err := decodeID(report.AssertionID)
+		if err != nil {
+			return remoteContractError(
+				"remote ontology interpretation assertion ID is invalid", err)
+		}
+		assertion, ok := expected[assertionID]
+		if !ok {
+			return remoteContractError(
+				"remote ontology interpretation references an absent assertion", nil)
+		}
+		delete(expected, assertionID)
+		schemaID, err := decodeID(report.SchemaID)
+		if err != nil {
+			return remoteContractError(
+				"remote ontology interpretation schema ID is invalid", err)
+		}
+		versionID, err := decodeID(report.VersionID)
+		if err != nil {
+			return remoteContractError(
+				"remote ontology interpretation version ID is invalid", err)
+		}
+		currentReader, err := ontology.NewOntologyIdentityFromIDs(
+			schemaID, versionID)
+		if err != nil {
+			return remoteContractError(
+				"remote ontology interpretation reader is invalid", err)
+		}
+		if index == 0 {
+			reader = currentReader
+		} else if currentReader != reader {
+			return remoteContractError(
+				"remote ontology interpretations use inconsistent readers", nil)
+		}
+		originalSubject, hasOriginalSubject := assertion.SubjectType()
+		originalObject, hasOriginalObject := assertion.ObjectType()
+		if !encodedOptionalIDMatches(report.OriginalSubjectType, originalSubject, hasOriginalSubject) ||
+			!encodedIDMatches(report.OriginalPredicate, assertion.Predicate()) ||
+			!encodedOptionalIDMatches(report.OriginalObjectType, originalObject, hasOriginalObject) {
+			return remoteContractError(
+				"remote ontology interpretation does not match its original assertion", nil)
+		}
+		if !validOntologyInterpretationStatus(report.Status) ||
+			!validOntologyReading(report.Reading) {
+			return remoteContractError(
+				"remote ontology interpretation status is invalid", nil)
+		}
+		recorded, recordedPresent := assertion.Ontology()
+		if !recordedPresent || report.Reading != ontology.ReadOntologyUnder(
+			recorded, currentReader,
+		) {
+			return remoteContractError(
+				"remote ontology interpretation reading is inconsistent", nil)
+		}
+		if report.Status == ontology.InterpretationResolved {
+			if report.Reading != ontology.OntologySameVersion &&
+				report.Reading != ontology.OntologyOtherVersion ||
+				report.Reason != "" {
+				return remoteContractError(
+					"remote resolved ontology interpretation is inconsistent", nil)
+			}
+		} else if strings.TrimSpace(report.Reason) == "" ||
+			len(report.AppliedMorphisms) != 0 {
+			return remoteContractError(
+				"remote unresolved ontology interpretation is inconsistent", nil)
+		}
+		if (report.SubjectType == "") != (report.OriginalSubjectType == "") ||
+			(report.ObjectType == "") != (report.OriginalObjectType == "") ||
+			report.Predicate == "" {
+			return remoteContractError(
+				"remote ontology interpretation effective shape is invalid", nil)
+		}
+		for _, encoded := range []string{
+			report.SubjectType, report.Predicate, report.ObjectType,
+		} {
+			if encoded == "" {
+				continue
+			}
+			if _, err := decodeID(encoded); err != nil {
+				return remoteContractError(
+					"remote ontology interpretation effective ID is invalid", err)
+			}
+		}
+		if report.SubjectType != "" {
+			subject, _ := decodeID(report.SubjectType)
+			original, _ := decodeID(report.OriginalSubjectType)
+			if ontology.IDNamespace(subject) != ontology.IDNamespace(original) {
+				return remoteContractError(
+					"remote ontology interpretation subject kind changed", nil)
+			}
+		}
+		predicate, _ := decodeID(report.Predicate)
+		originalPredicate, _ := decodeID(report.OriginalPredicate)
+		if ontology.IDNamespace(predicate) != ontology.IDNamespace(originalPredicate) {
+			return remoteContractError(
+				"remote ontology interpretation predicate kind changed", nil)
+		}
+		if report.ObjectType != "" {
+			object, _ := decodeID(report.ObjectType)
+			original, _ := decodeID(report.OriginalObjectType)
+			if ontology.IDNamespace(object) != ontology.IDNamespace(original) {
+				return remoteContractError(
+					"remote ontology interpretation object kind changed", nil)
+			}
+		}
+		seenMorphisms := make(map[shoal.ID]struct{}, len(report.AppliedMorphisms))
+		for _, encoded := range report.AppliedMorphisms {
+			id, err := decodeID(encoded)
+			if err != nil || ontology.IDNamespace(id) != "morphism" {
+				return remoteContractError(
+					"remote ontology interpretation morphism ID is invalid", err)
+			}
+			if _, duplicate := seenMorphisms[id]; duplicate {
+				return remoteContractError(
+					"remote ontology interpretation repeats a morphism", nil)
+			}
+			seenMorphisms[id] = struct{}{}
+		}
+	}
+	if len(expected) != 0 {
+		return remoteContractError(
+			"remote ontology interpretations omit returned assertions", nil)
+	}
+	return nil
+}
+
+func encodedIDMatches(encoded string, expected shoal.ID) bool {
+	decoded, err := decodeID(encoded)
+	return err == nil && decoded == expected
+}
+
+func encodedOptionalIDMatches(
+	encoded string,
+	expected shoal.ID,
+	present bool,
+) bool {
+	if !present {
+		return encoded == ""
+	}
+	return encodedIDMatches(encoded, expected)
+}
+
+func validOntologyInterpretationStatus(
+	status ontology.InterpretationStatus,
+) bool {
+	return status == ontology.InterpretationResolved ||
+		status == ontology.InterpretationUnresolved
+}
+
+func validOntologyReading(reading ontology.OntologyReading) bool {
+	switch reading {
+	case ontology.OntologyUnresolved,
+		ontology.OntologyMalformed,
+		ontology.OntologySameVersion,
+		ontology.OntologyOtherVersion,
+		ontology.OntologyOtherSchema:
+		return true
+	default:
+		return false
+	}
 }
 
 func (s *RemoteService) post(
