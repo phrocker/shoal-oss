@@ -34,6 +34,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/phrocker/shoal-oss/pkg/contextpack"
+	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/inference"
 	"github.com/phrocker/shoal-oss/pkg/retrieval"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
@@ -828,18 +829,26 @@ func (g *Generator) Run(ctx context.Context, pack inference.ContextPack) (Record
 						return earlyFinish(stopReasonFor(err), "recorder", err)
 					}
 					if err := runCtx.Err(); err != nil {
-						return earlyFinish(stopReasonFor(err), "recorder", err)
+						return earlyFinish(
+							stopReasonFor(err), "recorder",
+							explorer.MarkCommittedInteraction(err))
 					}
 					if !g.now().Before(pack.Authorization().ExpiresAt()) {
 						err := invalid("authorization pin expired during cache recording")
-						return earlyFinish(StopReasonInvalid, "authorization", err)
+						return earlyFinish(
+							StopReasonInvalid, "authorization",
+							explorer.MarkCommittedInteraction(err))
 					}
 					if err := runCtx.Err(); err != nil {
-						return earlyFinish(stopReasonFor(err), "cache", err)
+						return earlyFinish(
+							stopReasonFor(err), "cache",
+							explorer.MarkCommittedInteraction(err))
 					}
 					if !g.now().Before(pack.Authorization().ExpiresAt()) {
 						err := invalid("authorization pin expired before cache return")
-						return earlyFinish(StopReasonInvalid, "authorization", err)
+						return earlyFinish(
+							StopReasonInvalid, "authorization",
+							explorer.MarkCommittedInteraction(err))
 					}
 					return cloneRecord(cached), nil
 				}
@@ -969,7 +978,11 @@ func (g *Generator) Run(ctx context.Context, pack inference.ContextPack) (Record
 		outputTokens += action.usage.OutputTokens
 		trace.Iterations[len(trace.Iterations)-1].Budget = currentUsage()
 		if err := runCtx.Err(); err != nil {
-			return finish(stopReasonFor(err), step, "model", inference.InferenceResult{}, err)
+			return finish(
+				stopReasonFor(err), step, "model",
+				inference.InferenceResult{},
+				explorer.MarkCommittedInteraction(err),
+			)
 		}
 		if !g.now().Before(pack.Authorization().ExpiresAt()) {
 			err := invalid("authorization pin expired during execution")
