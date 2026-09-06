@@ -451,6 +451,39 @@ func TestWorkspaceSettingsHTTPHandlerIsIndependentlyMountable(t *testing.T) {
 	}
 }
 
+func TestClampWorkspaceRequestLimits(t *testing.T) {
+	got := webapi.ClampWorkspaceRequestLimits(
+		workspace.Limits{
+			GraphDepth:  2,
+			GraphFanout: 10,
+		},
+		workspace.Limits{
+			RetrievalTopK: 8,
+			GraphDepth:    4,
+			GraphFanout:   6,
+			GraphNodes:    100,
+			OutputBytes:   4096,
+		},
+		workspace.Limits{
+			RetrievalTopK: 5,
+			GraphDepth:    3,
+			GraphFanout:   4,
+			GraphNodes:    25,
+			OutputBytes:   1024,
+		},
+	)
+	want := workspace.Limits{
+		RetrievalTopK: 5,
+		GraphDepth:    2,
+		GraphFanout:   4,
+		GraphNodes:    25,
+		OutputBytes:   1024,
+	}
+	if got != want {
+		t.Fatalf("limits = %#v, want %#v", got, want)
+	}
+}
+
 func settingsHTTPDecision(
 	t *testing.T,
 	now time.Time,
