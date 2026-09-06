@@ -36,6 +36,29 @@ import (
 
 type settingsStubService struct{}
 
+type settingsGenerationReader int64
+
+func (r settingsGenerationReader) CurrentPolicyGeneration(
+	ctx context.Context,
+	_ []byte,
+) (int64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	return int64(r), nil
+}
+
+func settingsProviderOptions(
+	resolver auth.Resolver,
+	now time.Time,
+) workspace.ProviderOptions {
+	return workspace.ProviderOptions{
+		Resolver:         resolver,
+		GenerationReader: settingsGenerationReader(1),
+		Clock:            func() time.Time { return now },
+	}
+}
+
 func (settingsStubService) Documents(
 	context.Context,
 	webapi.DocumentsRequest,
@@ -82,10 +105,8 @@ func TestHTTPWorkspaceSettingsRoundTripAuthorizationAndRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	provider, err := workspace.NewProvider(store, workspace.ProviderOptions{
-		Resolver: authority.Resolver(),
-		Clock:    func() time.Time { return now },
-	})
+	provider, err := workspace.NewProvider(
+		store, settingsProviderOptions(authority.Resolver(), now))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -162,14 +183,14 @@ func TestHTTPWorkspaceSettingsRoundTripAuthorizationAndRestart(t *testing.T) {
 	response = settingsRequest(
 		t, handler, http.MethodGet,
 		"/api/v1/workspaces/"+workspacePath+"/settings", nil, "other", "")
-	if response.Code != http.StatusUnauthorized {
+	if response.Code != http.StatusNotFound {
 		t.Fatalf("cross-owner GET status = %d, body = %s",
 			response.Code, response.Body.String())
 	}
 	response = settingsRequest(
 		t, handler, http.MethodPut,
 		"/api/v1/workspaces/"+workspacePath+"/settings", body, "other", "http://example.test")
-	if response.Code != http.StatusUnauthorized {
+	if response.Code != http.StatusNotFound {
 		t.Fatalf("cross-owner PUT status = %d, body = %s",
 			response.Code, response.Body.String())
 	}
@@ -202,12 +223,7 @@ func TestHTTPWorkspaceSettingsRoundTripAuthorizationAndRestart(t *testing.T) {
 	}
 	defer reopened.Close()
 	restartedProvider, err := workspace.NewProvider(
-		reopened,
-		workspace.ProviderOptions{
-			Resolver: authority.Resolver(),
-			Clock:    func() time.Time { return now },
-		},
-	)
+		reopened, settingsProviderOptions(authority.Resolver(), now))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -245,9 +261,8 @@ func TestHTTPWorkspaceSettingsRejectsBoundsAndUnknownFields(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer store.Close()
-	provider, err := workspace.NewProvider(store, workspace.ProviderOptions{
-		Resolver: authority.Resolver(), Clock: func() time.Time { return now },
-	})
+	provider, err := workspace.NewProvider(
+		store, settingsProviderOptions(authority.Resolver(), now))
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -28,6 +28,7 @@ import (
 	"sort"
 	"time"
 
+	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/ontology"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
@@ -138,19 +139,21 @@ func (c StaticOntologyChoices) AuthorizeOntology(
 // ProviderOptions configures trusted decision, ceiling, ontology, and clock
 // dependencies.
 type ProviderOptions struct {
-	Resolver        auth.Resolver
-	CeilingResolver CeilingResolver
-	OntologyChoices OntologyChoices
-	Clock           func() time.Time
+	Resolver         auth.Resolver
+	GenerationReader auth.GenerationReader
+	CeilingResolver  CeilingResolver
+	OntologyChoices  OntologyChoices
+	Clock            func() time.Time
 }
 
 // Provider adds ownership and authorization enforcement to a settings Store.
 type Provider struct {
-	store           Store
-	resolver        auth.Resolver
-	ceilingResolver CeilingResolver
-	ontologyChoices OntologyChoices
-	clock           func() time.Time
+	store            Store
+	resolver         auth.Resolver
+	generationReader auth.GenerationReader
+	ceilingResolver  CeilingResolver
+	ontologyChoices  OntologyChoices
+	clock            func() time.Time
 }
 
 // NewProvider constructs a usable authorized settings provider.
@@ -161,14 +164,18 @@ func NewProvider(store Store, options ProviderOptions) (*Provider, error) {
 	if absent(options.Resolver) {
 		return nil, invalid("workspace settings decision resolver is required")
 	}
+	if absent(options.GenerationReader) {
+		return nil, invalid("workspace settings generation reader is required")
+	}
 	if options.Clock == nil {
 		options.Clock = time.Now
 	}
 	return &Provider{
 		store: store, resolver: options.Resolver,
-		ceilingResolver: options.CeilingResolver,
-		ontologyChoices: options.OntologyChoices,
-		clock:           options.Clock,
+		generationReader: options.GenerationReader,
+		ceilingResolver:  options.CeilingResolver,
+		ontologyChoices:  options.OntologyChoices,
+		clock:            options.Clock,
 	}, nil
 }
 
@@ -177,7 +184,7 @@ func (p *Provider) Get(
 	ctx context.Context,
 	workspaceID shoal.ID,
 ) (Settings, error) {
-	decision, _, err := p.authorize(
+	check, err := p.authorize(
 		ctx, auth.OperationWorkspaceSettingsRead, workspaceID)
 	if err != nil {
 		return Settings{}, err
@@ -186,12 +193,15 @@ func (p *Provider) Get(
 	if err != nil {
 		return Settings{}, err
 	}
-	if settings.Owner != decision.Subject() {
-		return Settings{}, authDenied()
+	if settings.Owner != check.decision.Subject() {
+		return Settings{}, auth.ObjectNotFound()
 	}
 	if !bytes.Equal(
-		settings.AuthorizationDomain, decision.AuthorizationDomain()) {
-		return Settings{}, authDenied()
+		settings.AuthorizationDomain, check.decision.AuthorizationDomain()) {
+		return Settings{}, auth.ObjectNotFound()
+	}
+	if err := p.recheck(ctx, check); err != nil {
+		return Settings{}, err
 	}
 	return settings.clone(), nil
 }
@@ -202,7 +212,7 @@ func (p *Provider) Update(
 	workspaceID shoal.ID,
 	request UpdateRequest,
 ) (Settings, error) {
-	decision, now, err := p.authorize(
+	check, err := p.authorize(
 		ctx, auth.OperationWorkspaceSettingsWrite, workspaceID)
 	if err != nil {
 		return Settings{}, err
@@ -211,19 +221,20 @@ func (p *Provider) Update(
 		"settings mutation ID", request.MutationID); err != nil {
 		return Settings{}, err
 	}
-	candidate, err := p.normalizeUpdate(ctx, decision, now, request.Narrowing)
+	candidate, err := p.normalizeUpdate(
+		ctx, check.decision, check.now, request.Narrowing)
 	if err != nil {
 		return Settings{}, err
 	}
 	current, loadErr := p.store.Load(ctx, workspaceID)
 	switch {
 	case loadErr == nil:
-		if current.Owner != decision.Subject() {
-			return Settings{}, authDenied()
+		if current.Owner != check.decision.Subject() {
+			return Settings{}, auth.ObjectNotFound()
 		}
 		if !bytes.Equal(
-			current.AuthorizationDomain, decision.AuthorizationDomain()) {
-			return Settings{}, authDenied()
+			current.AuthorizationDomain, check.decision.AuthorizationDomain()) {
+			return Settings{}, auth.ObjectNotFound()
 		}
 		if current.Revision == request.ExpectedRevision {
 			if err := ensureMonotonic(current.Narrowing, candidate); err != nil {
@@ -237,9 +248,20 @@ func (p *Provider) Update(
 	default:
 		return Settings{}, loadErr
 	}
-	return p.store.CompareAndSwap(
-		ctx, workspaceID, decision.Subject(), decision.AuthorizationDomain(),
+	if err := p.recheck(ctx, check); err != nil {
+		return Settings{}, err
+	}
+	result, err := p.store.CompareAndSwap(
+		ctx, workspaceID, check.decision.Subject(),
+		check.decision.AuthorizationDomain(),
 		request.ExpectedRevision, request.MutationID, candidate)
+	if err != nil {
+		return Settings{}, err
+	}
+	if err := p.recheck(ctx, check); err != nil {
+		return result, explorer.MarkIndeterminateCommit(err)
+	}
+	return result, nil
 }
 
 // OntologyChoice is one caller-eligible immutable lens. Active is projected
@@ -265,7 +287,7 @@ func (p *Provider) ListOntologyChoices(
 	ctx context.Context,
 	workspaceID shoal.ID,
 ) (OntologyChoiceSet, error) {
-	decision, _, err := p.authorize(
+	check, err := p.authorize(
 		ctx, auth.OperationWorkspaceSettingsRead, workspaceID)
 	if err != nil {
 		return OntologyChoiceSet{}, err
@@ -278,10 +300,10 @@ func (p *Provider) ListOntologyChoices(
 	settings, loadErr := p.store.Load(ctx, workspaceID)
 	switch {
 	case loadErr == nil:
-		if settings.Owner != decision.Subject() ||
+		if settings.Owner != check.decision.Subject() ||
 			!bytes.Equal(
-				settings.AuthorizationDomain, decision.AuthorizationDomain()) {
-			return OntologyChoiceSet{}, authDenied()
+				settings.AuthorizationDomain, check.decision.AuthorizationDomain()) {
+			return OntologyChoiceSet{}, auth.ObjectNotFound()
 		}
 		result.SettingsID = settings.SettingsID
 		result.SettingsRevision = settings.Revision
@@ -290,7 +312,7 @@ func (p *Provider) ListOntologyChoices(
 	default:
 		return OntologyChoiceSet{}, loadErr
 	}
-	choices, err := p.ontologyChoices.ListOntologyChoices(ctx, decision)
+	choices, err := p.ontologyChoices.ListOntologyChoices(ctx, check.decision)
 	if err != nil {
 		return OntologyChoiceSet{}, err
 	}
@@ -300,13 +322,13 @@ func (p *Provider) ListOntologyChoices(
 	}
 	for _, choice := range choices {
 		if err := p.ontologyChoices.AuthorizeOntology(
-			ctx, decision, choice.Identity); err != nil {
+			ctx, check.decision, choice.Identity); err != nil {
 			return OntologyChoiceSet{}, authDenied()
 		}
 	}
 	if result.SelectedOntology.Present {
 		if err := p.ontologyChoices.AuthorizeOntology(
-			ctx, decision, result.SelectedOntology.Identity); err != nil {
+			ctx, check.decision, result.SelectedOntology.Identity); err != nil {
 			return OntologyChoiceSet{}, authDenied()
 		}
 		found := false
@@ -319,6 +341,9 @@ func (p *Provider) ListOntologyChoices(
 		if !found {
 			return OntologyChoiceSet{}, authDenied()
 		}
+	}
+	if err := p.recheck(ctx, check); err != nil {
+		return OntologyChoiceSet{}, err
 	}
 	result.Choices = choices
 	return result, nil
@@ -333,7 +358,7 @@ func (p *Provider) SelectOntology(
 	mutationID shoal.ID,
 	identity ontology.OntologyIdentity,
 ) (Settings, error) {
-	decision, now, err := p.authorize(
+	check, err := p.authorize(
 		ctx, auth.OperationWorkspaceSettingsWrite, workspaceID)
 	if err != nil {
 		return Settings{}, err
@@ -342,17 +367,18 @@ func (p *Provider) SelectOntology(
 		return Settings{}, err
 	}
 	if absent(p.ontologyChoices) ||
-		p.ontologyChoices.AuthorizeOntology(ctx, decision, identity) != nil {
+		p.ontologyChoices.AuthorizeOntology(
+			ctx, check.decision, identity) != nil {
 		return Settings{}, authDenied()
 	}
 	var current Settings
 	current, loadErr := p.store.Load(ctx, workspaceID)
 	switch {
 	case loadErr == nil:
-		if current.Owner != decision.Subject() ||
+		if current.Owner != check.decision.Subject() ||
 			!bytes.Equal(
-				current.AuthorizationDomain, decision.AuthorizationDomain()) {
-			return Settings{}, authDenied()
+				current.AuthorizationDomain, check.decision.AuthorizationDomain()) {
+			return Settings{}, auth.ObjectNotFound()
 		}
 	case shoal.IsErrorCode(loadErr, shoal.ErrorNotFound):
 		if expectedRevision != 0 {
@@ -365,7 +391,8 @@ func (p *Provider) SelectOntology(
 	update.SelectedOntology = OntologySelection{
 		Present: true, Identity: identity,
 	}
-	candidate, err := p.normalizeUpdate(ctx, decision, now, update)
+	candidate, err := p.normalizeUpdate(
+		ctx, check.decision, check.now, update)
 	if err != nil {
 		return Settings{}, err
 	}
@@ -374,9 +401,20 @@ func (p *Provider) SelectOntology(
 			return Settings{}, err
 		}
 	}
-	return p.store.CompareAndSwap(
-		ctx, workspaceID, decision.Subject(), decision.AuthorizationDomain(),
+	if err := p.recheck(ctx, check); err != nil {
+		return Settings{}, err
+	}
+	result, err := p.store.CompareAndSwap(
+		ctx, workspaceID, check.decision.Subject(),
+		check.decision.AuthorizationDomain(),
 		expectedRevision, mutationID, candidate)
+	if err != nil {
+		return Settings{}, err
+	}
+	if err := p.recheck(ctx, check); err != nil {
+		return result, explorer.MarkIndeterminateCommit(err)
+	}
+	return result, nil
 }
 
 // Effective returns a currently revalidated decision plus budget, output label,
@@ -398,7 +436,7 @@ func (p *Provider) Apply(
 	baseLimits Limits,
 	baseOutputPolicies []auth.Policy,
 ) (EffectiveDecision, error) {
-	decision, now, err := p.authorize(
+	check, err := p.authorize(
 		ctx, auth.OperationWorkspaceSettingsRead, workspaceID)
 	if err != nil {
 		return EffectiveDecision{}, err
@@ -407,29 +445,41 @@ func (p *Provider) Apply(
 	if err != nil {
 		return EffectiveDecision{}, err
 	}
-	if settings.Owner != decision.Subject() {
-		return EffectiveDecision{}, authDenied()
+	if settings.Owner != check.decision.Subject() {
+		return EffectiveDecision{}, auth.ObjectNotFound()
 	}
 	if !bytes.Equal(
-		settings.AuthorizationDomain, decision.AuthorizationDomain()) {
-		return EffectiveDecision{}, authDenied()
+		settings.AuthorizationDomain, check.decision.AuthorizationDomain()) {
+		return EffectiveDecision{}, auth.ObjectNotFound()
+	}
+	if err := p.recheck(ctx, check); err != nil {
+		return EffectiveDecision{}, err
 	}
 	options := ApplyOptions{
-		Now: now, BaseLimits: baseLimits,
+		Now: p.clock(), BaseLimits: baseLimits,
 		BaseOutputPolicies: baseOutputPolicies,
 		OntologyChoices:    p.ontologyChoices,
 	}
-	if decision.TrustedService() {
+	if check.decision.TrustedService() {
 		if absent(p.ceilingResolver) {
 			return EffectiveDecision{}, authDenied()
 		}
-		ceiling, err := p.ceilingResolver.ResolveServiceCeiling(ctx, decision)
+		ceiling, err := p.ceilingResolver.ResolveServiceCeiling(
+			ctx, check.decision)
 		if err != nil {
 			return EffectiveDecision{}, authDenied()
 		}
 		options.ServiceCeiling = &ceiling
 	}
-	return DeriveEffectiveDecision(ctx, decision, settings, options)
+	effective, err := DeriveEffectiveDecision(
+		ctx, check.decision, settings, options)
+	if err != nil {
+		return EffectiveDecision{}, err
+	}
+	if err := p.recheck(ctx, check); err != nil {
+		return EffectiveDecision{}, err
+	}
+	return effective, nil
 }
 
 // ApplyDecision returns the current caller decision with only the selected
@@ -445,29 +495,71 @@ func (p *Provider) ApplyDecision(
 	return effective.Decision(), nil
 }
 
+type authorizationCheck struct {
+	decision    auth.Decision
+	guard       auth.GenerationGuard
+	operation   auth.Operation
+	workspaceID shoal.ID
+	now         time.Time
+}
+
 func (p *Provider) authorize(
 	ctx context.Context,
 	operation auth.Operation,
 	workspaceID shoal.ID,
-) (auth.Decision, time.Time, error) {
+) (authorizationCheck, error) {
 	if err := shoal.ValidateRequiredID("workspace ID", workspaceID); err != nil {
-		return auth.Decision{}, time.Time{}, err
+		return authorizationCheck{}, err
 	}
 	decision, err := p.resolver.Resolve(ctx)
 	if err != nil {
-		return auth.Decision{}, time.Time{}, err
+		return authorizationCheck{}, err
+	}
+	guard, err := auth.NewGenerationGuard(decision, p.generationReader)
+	if err != nil {
+		return authorizationCheck{}, authDenied()
+	}
+	if err := guard.Check(ctx); err != nil {
+		return authorizationCheck{}, err
 	}
 	now := p.clock()
 	if now.IsZero() {
-		return auth.Decision{}, time.Time{}, authDenied()
+		return authorizationCheck{}, authDenied()
 	}
 	if err := decision.Authorize(operation, auth.ResourceRequest{
 		AuthorizationDomain: decision.AuthorizationDomain(),
 		ObjectID:            workspaceID,
 	}, now); err != nil {
-		return auth.Decision{}, time.Time{}, err
+		return authorizationCheck{}, err
 	}
-	return decision, now, nil
+	return authorizationCheck{
+		decision: decision, guard: guard, operation: operation,
+		workspaceID: workspaceID, now: now,
+	}, nil
+}
+
+func (p *Provider) recheck(
+	ctx context.Context,
+	check authorizationCheck,
+) error {
+	if err := check.guard.Check(ctx); err != nil {
+		return err
+	}
+	now := p.clock()
+	if now.IsZero() {
+		return authDenied()
+	}
+	if err := check.decision.Authorize(
+		check.operation,
+		auth.ResourceRequest{
+			AuthorizationDomain: check.decision.AuthorizationDomain(),
+			ObjectID:            check.workspaceID,
+		},
+		now,
+	); err != nil {
+		return authDenied()
+	}
+	return nil
 }
 
 func (p *Provider) normalizeUpdate(

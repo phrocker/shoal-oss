@@ -694,8 +694,13 @@ func openService(
 				return closed, err
 			}
 		}
+		generationReader := fixedGenerationReader{
+			domain:     workspaceAuthorizationDomain,
+			generation: workspacePolicyGeneration,
+		}
 		client, err := authorizedClient(
-			corpus, store, config.resolver, config.clock, config.mosaic)
+			corpus, store, config.resolver, generationReader,
+			config.clock, config.mosaic)
 		if err != nil {
 			store.Close()
 			embedded.Close()
@@ -756,9 +761,10 @@ func openService(
 		settingsProvider, err := workspace.NewProvider(
 			settingsStore,
 			workspace.ProviderOptions{
-				Resolver:        config.resolver,
-				OntologyChoices: choices,
-				Clock:           config.clock,
+				Resolver:         config.resolver,
+				GenerationReader: generationReader,
+				OntologyChoices:  choices,
+				Clock:            config.clock,
 			},
 		)
 		if err != nil {
@@ -927,6 +933,7 @@ func authorizedClient(
 	corpus *explorer.Explorer,
 	store authorized.PolicyStore,
 	resolver auth.Resolver,
+	generationReader auth.GenerationReader,
 	clock func() time.Time,
 	mosaic authorized.MosaicBudget,
 ) (*authorized.Client, error) {
@@ -947,11 +954,8 @@ func authorizedClient(
 		Resolver:              resolver,
 		PolicySelector:        selector,
 		PolicyStore:           store,
-		GenerationReader: fixedGenerationReader{
-			domain:     workspaceAuthorizationDomain,
-			generation: workspacePolicyGeneration,
-		},
-		Clock:  clock,
-		Mosaic: mosaic,
+		GenerationReader:      generationReader,
+		Clock:                 clock,
+		Mosaic:                mosaic,
 	})
 }
