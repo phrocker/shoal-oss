@@ -123,10 +123,23 @@ type intentCompletion struct {
 	Epoch  coordination.Epoch
 }
 
+type intentStoreBackend interface {
+	allocator.Store
+	ScanPrefixFrom(
+		context.Context,
+		[]byte,
+		[]byte,
+		[]byte,
+		[]byte,
+		[]byte,
+		int,
+	) ([]allocator.Cell, error)
+}
+
 type IntentStore struct {
 	domain     coordination.DomainID
 	visibility []byte
-	store      *EngineStore
+	store      intentStoreBackend
 }
 
 func NewIntentStore(
@@ -242,6 +255,14 @@ func (s *IntentStore) Put(
 			return storedIntent{}, false, transaction.ErrConflict
 		}
 		if !errors.Is(readErr, transaction.ErrNotFound) {
+			if errors.Is(writeErr, allocator.ErrConditionalUnknown) {
+				return storedIntent{}, false, errors.Join(
+					transaction.ErrUnavailable,
+					allocator.ErrConditionalUnknown,
+					writeErr,
+					readErr,
+				)
+			}
 			return storedIntent{}, false, readErr
 		}
 		if status == allocator.StatusRejected {
@@ -282,10 +303,11 @@ func (s *IntentStore) Load(
 	if !bytes.Equal(record.Domain, s.domain) || !bytes.Equal(record.TXN, txn) {
 		return storedIntent{}, fmt.Errorf("%w: durable intent identity mismatch", transaction.ErrInternal)
 	}
-	_, canonical, digest, err := canonicalIntent(record.Intent)
+	normalized, canonical, digest, err := canonicalIntent(record.Intent)
 	if err != nil || digest != record.LogicalDigest {
 		return storedIntent{}, fmt.Errorf("%w: durable intent digest mismatch", transaction.ErrInternal)
 	}
+	record.Intent = normalized
 	again, err := encodeStoredIntent(record)
 	if err != nil || !bytes.Equal(again, cells[0].Value) || len(canonical) == 0 {
 		return storedIntent{}, fmt.Errorf("%w: durable intent is not canonical", transaction.ErrInternal)

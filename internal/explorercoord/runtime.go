@@ -197,6 +197,19 @@ func Open(config Config) (*Runtime, error) {
 	if config.ContentionWait < 0 || config.ContentionWait > time.Minute {
 		return nil, errors.Join(transaction.ErrInvalid, errors.New("contention wait is outside its bound"))
 	}
+	physicalTables := make(map[string]struct{}, len(config.PhysicalTables))
+	for _, table := range config.PhysicalTables {
+		if !validTableName(table) {
+			return nil, errors.Join(transaction.ErrInvalid, errors.New("physical table name is invalid"))
+		}
+		if table == config.CoordinationTable {
+			return nil, errors.Join(
+				transaction.ErrInvalid,
+				errors.New("coordination table cannot be a physical target"),
+			)
+		}
+		physicalTables[table] = struct{}{}
+	}
 	lock, err := dirlock.Acquire(config.Directory, ".shoal-explorer-runtime.lock")
 	if err != nil {
 		return nil, fmt.Errorf("explorer coordination: acquire runtime directory: %w", err)
@@ -213,14 +226,7 @@ func Open(config Config) (*Runtime, error) {
 	}
 	tables := append([]string{config.CoordinationTable}, config.PhysicalTables...)
 	sort.Strings(tables)
-	physicalTables := make(map[string]struct{}, len(config.PhysicalTables))
-	for _, table := range config.PhysicalTables {
-		physicalTables[table] = struct{}{}
-	}
 	for index, table := range tables {
-		if !validTableName(table) {
-			return closeOnError(errors.Join(transaction.ErrInvalid, errors.New("physical table name is invalid")))
-		}
 		if index > 0 && table == tables[index-1] {
 			continue
 		}
@@ -357,9 +363,12 @@ func (r *Runtime) publishLocked(
 	if leaseUntil.Location() != time.UTC || !leaseUntil.After(r.clock().UTC()) {
 		return Result{}, errors.Join(transaction.ErrInvalid, errors.New("publication lease must be a future UTC time"))
 	}
+	if err := r.validateIntentTables(request.Intent); err != nil {
+		return Result{}, err
+	}
 	record, _, err := r.intents.Put(ctx, request.Intent)
 	if err != nil {
-		return Result{}, err
+		return Result{}, classifyIntentPersistenceFailure(err)
 	}
 	if hook := runtimeStageHook(r.protocolStore); hook != nil {
 		if err := hook(recoveryStageIntent); err != nil {
@@ -421,6 +430,9 @@ func (r *Runtime) PublishRecord(
 	if r.closed {
 		return explorer.RecordPublicationResult{}, transaction.PublicError(transaction.ErrUnavailable)
 	}
+	if err := r.validatePhysicalTable(request.Table); err != nil {
+		return explorer.RecordPublicationResult{}, transaction.PublicError(err)
+	}
 	lpart, err := Partition(r.domain, request.Partition)
 	if err != nil {
 		return explorer.RecordPublicationResult{}, transaction.PublicError(err)
@@ -429,26 +441,87 @@ func (r *Runtime) PublishRecord(
 	if err != nil {
 		return explorer.RecordPublicationResult{}, transaction.PublicError(err)
 	}
-	stored, _, err := r.intents.Put(ctx, intent)
-	if err != nil {
-		return explorer.RecordPublicationResult{}, transaction.PublicError(err)
-	}
 	recordKey := request.RecordKey
 	if len(recordKey) == 0 {
 		recordKey = request.Token
 	}
-	if err := r.bindRecordAttempt(ctx, recordKey, stored.TXN); err != nil {
+	if _, err := r.intents.attemptCoordinate(recordKey); err != nil {
 		return explorer.RecordPublicationResult{}, transaction.PublicError(err)
+	}
+	if err := r.persistRecordAttempt(ctx, intent, recordKey); err != nil {
+		return explorer.RecordPublicationResult{}, recordPublicationError(err)
 	}
 	result, err := r.publishLocked(ctx, Request{Intent: intent})
 	if err != nil {
-		public := transaction.PublicError(err)
-		if errors.Is(err, ErrIndeterminatePublication) {
-			public = explorer.MarkIndeterminateCommit(public)
-		}
-		return explorer.RecordPublicationResult{}, public
+		return explorer.RecordPublicationResult{}, recordPublicationError(err)
 	}
 	return explorer.RecordPublicationResult{Epoch: result.Epoch, Unchanged: result.Unchanged}, nil
+}
+
+func (r *Runtime) persistRecordAttempt(
+	ctx context.Context,
+	intent Intent,
+	recordKey []byte,
+) error {
+	r.recoveryMu.Lock()
+	defer r.recoveryMu.Unlock()
+
+	stored, replayed, err := r.intents.Put(ctx, intent)
+	if err != nil {
+		return classifyIntentPersistenceFailure(err)
+	}
+	if err := r.bindRecordAttempt(ctx, recordKey, stored.TXN); err != nil {
+		classified := classifyIntentPersistenceFailure(err)
+		if !replayed && !errors.Is(classified, ErrIndeterminatePublication) {
+			if settleErr := r.intents.Settle(
+				ctx,
+				stored.TXN,
+				stored.LogicalDigest,
+			); settleErr != nil {
+				classified = errors.Join(
+					ErrIndeterminatePublication,
+					classified,
+					settleErr,
+				)
+			}
+		}
+		return classified
+	}
+	return nil
+}
+
+func (r *Runtime) validateIntentTables(intent Intent) error {
+	for index, cell := range intent.Cells {
+		if err := r.validatePhysicalTable(cell.Table); err != nil {
+			return fmt.Errorf("intent cell %d: %w", index, err)
+		}
+	}
+	return nil
+}
+
+func (r *Runtime) validatePhysicalTable(table string) error {
+	if _, allowed := r.physicalTables[table]; !allowed {
+		return errors.Join(
+			transaction.ErrInvalid,
+			errors.New("physical table was not configured for the runtime"),
+		)
+	}
+	return nil
+}
+
+func classifyIntentPersistenceFailure(err error) error {
+	if errors.Is(err, allocator.ErrConditionalUnknown) {
+		return errors.Join(ErrIndeterminatePublication, err)
+	}
+	return err
+}
+
+func recordPublicationError(err error) error {
+	public := transaction.PublicError(err)
+	if errors.Is(err, ErrIndeterminatePublication) {
+		public = explorer.MarkIndeterminateCommit(public)
+	}
+	return public
 }
 
 func (r *Runtime) RecordCommitted(
