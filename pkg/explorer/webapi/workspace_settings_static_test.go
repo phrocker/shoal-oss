@@ -31,6 +31,7 @@ func TestStaticWorkspaceSettingsLensControls(t *testing.T) {
 
 	for _, marker := range []string{
 		`id="workspace-settings-id"`,
+		`id="workspace-settings-new"`,
 		`id="workspace-settings-lens"`,
 		`id="workspace-settings-refresh"`,
 		`id="workspace-settings-apply"`,

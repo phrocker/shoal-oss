@@ -280,6 +280,7 @@
     elements = {
       form: document.getElementById("workspace-settings-form"),
       input: document.getElementById("workspace-settings-id"),
+      fresh: document.getElementById("workspace-settings-new"),
       clear: document.getElementById("workspace-settings-clear"),
       lens: document.getElementById("workspace-settings-lens"),
       refresh: document.getElementById("workspace-settings-refresh"),
@@ -306,6 +307,10 @@
         return;
       }
       persistWorkspaceID(selected);
+      window.location.reload();
+    });
+    elements.fresh.addEventListener("click", () => {
+      persistWorkspaceID(mutationID());
       window.location.reload();
     });
     elements.clear.addEventListener("click", () => {
