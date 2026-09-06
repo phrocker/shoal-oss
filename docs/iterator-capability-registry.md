@@ -6,7 +6,7 @@ stack construction, table-configuration resolution, compaction admission,
 and compatibility reporting.
 
 The current machine-readable inventory is
-[`iterator-capabilities-v2.json`](iterator-capabilities-v2.json). Consumers
+[`iterator-capabilities-v3.json`](iterator-capabilities-v3.json). Consumers
 can also JSON-encode `iterrt.RegistrySnapshot()` and
 `iterrt.CompatibilityReport` directly.
 

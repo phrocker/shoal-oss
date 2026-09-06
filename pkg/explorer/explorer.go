@@ -124,11 +124,14 @@ type EmbeddingQueryEvent struct {
 	SpaceIdentities []string
 	Attempted       []string
 	Completed       []string
-	FanoutLimit     int
-	CacheHits       int
-	ProviderCalls   int
-	Unavailable     []string
-	FanoutExceeded  bool
+	// Participating contains the stable spaces represented by successful
+	// scored outputs. It is empty when vector scoring produced no result.
+	Participating  []string
+	FanoutLimit    int
+	CacheHits      int
+	ProviderCalls  int
+	Unavailable    []string
+	FanoutExceeded bool
 }
 
 // EmbeddingQueryObserver receives one query event. Events contain no query
@@ -171,6 +174,7 @@ func cloneEmbeddingQueryEvent(event EmbeddingQueryEvent) EmbeddingQueryEvent {
 	event.SpaceIdentities = append([]string(nil), event.SpaceIdentities...)
 	event.Attempted = append([]string(nil), event.Attempted...)
 	event.Completed = append([]string(nil), event.Completed...)
+	event.Participating = append([]string(nil), event.Participating...)
 	event.Unavailable = append([]string(nil), event.Unavailable...)
 	return event
 }
