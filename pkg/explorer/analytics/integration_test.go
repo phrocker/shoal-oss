@@ -694,15 +694,18 @@ func TestAuthorizedAnalyticsRechecksGenerationAfterOntologyLens(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	interpreter := &generationChangingLensBase{
+		Explorer: fixture.base, generations: fixture.generations,
+		domain: fixture.domain,
+	}
 	client, err := authorized.NewClient(authorized.Config{
-		Base: &generationChangingLensBase{
-			Explorer: fixture.base, generations: fixture.generations,
-			domain: fixture.domain,
-		},
-		Resolver:       fixture.authority.Resolver(),
-		PolicySelector: selector, PolicyStore: fixture.store,
-		GenerationReader: fixture.generations,
-		Clock:            func() time.Time { return fixture.now },
+		Base:                interpreter,
+		OntologyInterpreter: interpreter,
+		Resolver:            fixture.authority.Resolver(),
+		PolicySelector:      selector,
+		PolicyStore:         fixture.store,
+		GenerationReader:    fixture.generations,
+		Clock:               func() time.Time { return fixture.now },
 	})
 	if err != nil {
 		t.Fatal(err)

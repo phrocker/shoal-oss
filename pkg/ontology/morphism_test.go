@@ -232,12 +232,16 @@ func TestOntologyLensTraversesPublishedTransitionsWithoutMorphisms(t *testing.T)
 		t.Fatal(err)
 	}
 	first, err := NewOntologyTransition(
-		mustIdentity(t, f.v1), mustIdentity(t, f.v2))
+		f.v1, f.v2, []OntologyMorphism{mustMorphism(t, MorphismConfig{
+			Kind: MorphismWiden, SourceVersion: f.v1, TargetVersion: f.v2,
+			Sources: []shoal.ID{f.v1rel.ID()}, Targets: []shoal.ID{f.v2rel.ID()},
+			Evidence: []EvidenceRef{f.evidence}, Rationale: "widen endpoints",
+		})})
 	if err != nil {
 		t.Fatal(err)
 	}
 	second, err := NewOntologyTransition(
-		mustIdentity(t, f.v2), mustIdentity(t, v3))
+		f.v2, v3, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -303,27 +307,39 @@ func TestOntologyLensRejectsRemovedPropertyOwnership(t *testing.T) {
 	targetPerson, _ := NewConceptDefinition("person", "Person", "", nil, nil)
 	source, err := NewOntologyVersion(
 		f.v1.Schema(), "ownership-1", f.v1.CreatedAt().Add(10*time.Second),
-		[]ConceptDefinition{f.person, f.org}, nil, []PropertyDefinition{f.name}, nil)
+		[]ConceptDefinition{f.person, f.org},
+		[]RelationshipDefinition{f.oldRel},
+		[]PropertyDefinition{f.name}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	target, err := NewOntologyVersion(
 		f.v1.Schema(), "ownership-2", f.v1.CreatedAt().Add(11*time.Second),
-		[]ConceptDefinition{targetPerson, f.org}, nil, []PropertyDefinition{f.name}, nil)
+		[]ConceptDefinition{targetPerson, f.org},
+		[]RelationshipDefinition{f.newRel},
+		[]PropertyDefinition{f.name}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	transition, _ := NewOntologyTransition(
-		mustIdentity(t, source), mustIdentity(t, target))
+	unrelated := mustMorphism(t, MorphismConfig{
+		Kind: MorphismRename, SourceVersion: source, TargetVersion: target,
+		Sources: []shoal.ID{f.oldRel.ID()}, Targets: []shoal.ID{f.newRel.ID()},
+		Evidence: []EvidenceRef{f.evidence}, Rationale: "unrelated rename",
+	})
+	if _, err := NewOntologyTransition(
+		source, target, []OntologyMorphism{unrelated},
+	); err == nil {
+		t.Fatal("ownership-removing identity-only transition was accepted")
+	}
 	lens, err := NewOntologyLensWithTransitions(
-		target, []OntologyTransition{transition}, nil)
+		target, []OntologyTransition{}, []OntologyMorphism{unrelated})
 	if err != nil {
 		t.Fatal(err)
 	}
 	assertion := mustPropertyAssertion(
 		t, f.person.ID(), f.name.ID(), source, nil, f.evidence, f.provenance)
 	if read := lens.Read(assertion); read.Resolved() ||
-		!strings.Contains(read.Reason(), "does not apply") {
+		!strings.Contains(read.Reason(), "no unique published morphism path") {
 		t.Fatalf("removed property ownership read = %#v", read)
 	}
 }
@@ -337,6 +353,229 @@ func TestOntologyMorphismRejectsCrossKindMerge(t *testing.T) {
 		Evidence: []EvidenceRef{f.evidence}, Rationale: "invalid cross-kind merge",
 	}); err == nil || !strings.Contains(err.Error(), "same definition kind") {
 		t.Fatalf("cross-kind merge error = %v", err)
+	}
+}
+
+func TestProposalRequiresMorphismForRetainedRelationshipMeaningChange(t *testing.T) {
+	f := newMorphismFixture(t)
+	at := time.Date(2026, 9, 6, 2, 0, 0, 0, time.UTC)
+	if _, err := NewGovernedProposal(
+		f.v1.Schema(), f.v1, f.v2, "author",
+		"silent endpoint widening", at, nil,
+	); err != nil {
+		t.Fatalf("governance draft should remain reviewable: %v", err)
+	}
+	if _, err := NewOntologyTransition(f.v1, f.v2, nil); err == nil ||
+		!strings.Contains(err.Error(), "explicit morphism") {
+		t.Fatalf("silent relationship transition error = %v", err)
+	}
+	widen := mustMorphism(t, MorphismConfig{
+		Kind: MorphismWiden, SourceVersion: f.v1, TargetVersion: f.v2,
+		Sources: []shoal.ID{f.v1rel.ID()}, Targets: []shoal.ID{f.v2rel.ID()},
+		Evidence: []EvidenceRef{f.evidence}, Rationale: "widen endpoints",
+	})
+	if _, err := NewGovernedProposalWithMorphisms(
+		f.v1.Schema(), f.v1, f.v2, []OntologyMorphism{widen},
+		"author", "governed endpoint widening", at, nil,
+	); err != nil {
+		t.Fatalf("governed relationship change rejected: %v", err)
+	}
+	if _, err := NewOntologyTransition(
+		f.v1, f.v2, []OntologyMorphism{widen},
+	); err != nil {
+		t.Fatalf("governed relationship transition rejected: %v", err)
+	}
+}
+
+func TestProposalAllowsOnlyOptionalAdditiveConceptProperties(t *testing.T) {
+	f := newMorphismFixture(t)
+	nickname, _ := NewPropertyDefinition(
+		"nickname", "Nickname", "", ValueString, nil, nil)
+	person, _ := NewConceptDefinition(
+		"person", "Person", "", []shoal.ID{f.name.ID(), nickname.ID()}, nil)
+	target, err := NewOntologyVersion(
+		f.splitFrom.Schema(), "optional-addition",
+		f.splitFrom.CreatedAt().Add(time.Second),
+		[]ConceptDefinition{person}, nil,
+		[]PropertyDefinition{f.name, nickname}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sourcePerson, _ := NewConceptDefinition(
+		"person", "Person", "", []shoal.ID{f.name.ID()}, nil)
+	source, err := NewOntologyVersion(
+		f.splitFrom.Schema(), "optional-base",
+		f.splitFrom.CreatedAt(),
+		[]ConceptDefinition{sourcePerson}, nil,
+		[]PropertyDefinition{f.name}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewOntologyTransition(source, target, nil); err != nil {
+		t.Fatalf("optional additive property transition rejected: %v", err)
+	}
+	required, _ := NewFlagConstraint(ConstraintRequired)
+	requiredNickname, _ := NewPropertyDefinition(
+		"nickname", "Nickname", "", ValueString, []Constraint{required}, nil)
+	requiredPerson, _ := NewConceptDefinition(
+		"person", "Person", "",
+		[]shoal.ID{f.name.ID(), requiredNickname.ID()}, nil)
+	requiredTarget, err := NewOntologyVersion(
+		source.Schema(), "required-addition", target.CreatedAt().Add(time.Second),
+		[]ConceptDefinition{requiredPerson}, nil,
+		[]PropertyDefinition{f.name, requiredNickname}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewOntologyTransition(source, requiredTarget, nil); err == nil ||
+		!strings.Contains(err.Error(), "retained concept") {
+		t.Fatalf("required additive property error = %v", err)
+	}
+}
+
+func TestOntologyLensReportsOnlyMorphismsAppliedToAssertion(t *testing.T) {
+	f := newMorphismFixture(t)
+	otherOld, _ := NewRelationshipDefinition(
+		"assigned-to", "Assigned To", "", []shoal.ID{f.person.ID()},
+		[]shoal.ID{f.org.ID()}, nil, true, nil)
+	otherNew, _ := NewRelationshipDefinition(
+		"allocated-to", "Allocated To", "", []shoal.ID{f.person.ID()},
+		[]shoal.ID{f.org.ID()}, nil, true, nil)
+	source, err := NewOntologyVersion(
+		f.renameFrom.Schema(), "multi-rename-1",
+		f.renameFrom.CreatedAt().Add(20*time.Second),
+		[]ConceptDefinition{f.person, f.org},
+		[]RelationshipDefinition{f.oldRel, otherOld},
+		[]PropertyDefinition{f.name}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target, err := NewOntologyVersion(
+		f.renameFrom.Schema(), "multi-rename-2",
+		f.renameFrom.CreatedAt().Add(21*time.Second),
+		[]ConceptDefinition{f.person, f.org},
+		[]RelationshipDefinition{f.newRel, otherNew},
+		[]PropertyDefinition{f.name}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	used := mustMorphism(t, MorphismConfig{
+		Kind: MorphismRename, SourceVersion: source, TargetVersion: target,
+		Sources: []shoal.ID{f.oldRel.ID()}, Targets: []shoal.ID{f.newRel.ID()},
+		Evidence: []EvidenceRef{f.evidence}, Rationale: "rename used relationship",
+	})
+	unrelated := mustMorphism(t, MorphismConfig{
+		Kind: MorphismRename, SourceVersion: source, TargetVersion: target,
+		Sources: []shoal.ID{otherOld.ID()}, Targets: []shoal.ID{otherNew.ID()},
+		Evidence: []EvidenceRef{f.evidence}, Rationale: "rename unrelated relationship",
+	})
+	transition, err := NewOntologyTransition(
+		source, target, []OntologyMorphism{used, unrelated})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lens, err := NewOntologyLensWithTransitions(
+		target, []OntologyTransition{transition},
+		[]OntologyMorphism{used, unrelated})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertion := mustRelationshipAssertion(
+		t, f.person.ID(), f.oldRel.ID(), f.org.ID(),
+		source, f.evidence, f.provenance)
+	read := lens.Read(assertion)
+	applied := read.AppliedMorphisms()
+	if !read.Resolved() || len(applied) != 1 || applied[0] != used.ID() {
+		t.Fatalf("applied morphisms = %v, want only %s", applied, used.ID())
+	}
+}
+
+func TestOntologyTransitionRejectsMorphismFromDifferentVersions(t *testing.T) {
+	f := newMorphismFixture(t)
+	widen := mustMorphism(t, MorphismConfig{
+		Kind: MorphismWiden, SourceVersion: f.v1, TargetVersion: f.v2,
+		Sources: []shoal.ID{f.v1rel.ID()}, Targets: []shoal.ID{f.v2rel.ID()},
+		Evidence: []EvidenceRef{f.evidence}, Rationale: "widen original schema",
+	})
+	foreignSchema, _ := NewOntologySchema("foreign", "Foreign", "", nil)
+	source, err := NewOntologyVersion(
+		foreignSchema, "1", f.v1.CreatedAt(),
+		f.v1.Concepts(), f.v1.Relationships(), f.v1.Properties(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target, err := NewOntologyVersion(
+		foreignSchema, "2", f.v2.CreatedAt(),
+		f.v2.Concepts(), f.v2.Relationships(), f.v2.Properties(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewOntologyTransition(
+		source, target, []OntologyMorphism{widen},
+	); err == nil || !strings.Contains(err.Error(), "does not connect") {
+		t.Fatalf("foreign-version morphism error = %v", err)
+	}
+}
+
+func TestOntologyTransitionMapsRenamedOwnedProperty(t *testing.T) {
+	f := newMorphismFixture(t)
+	oldProperty, _ := NewPropertyDefinition(
+		"display-name", "Display Name", "", ValueString, nil, nil)
+	newProperty, _ := NewPropertyDefinition(
+		"preferred-name", "Preferred Name", "", ValueString, nil, nil)
+	sourcePerson, _ := NewConceptDefinition(
+		"person", "Person", "", []shoal.ID{oldProperty.ID()}, nil)
+	targetPerson, _ := NewConceptDefinition(
+		"person", "Person", "", []shoal.ID{newProperty.ID()}, nil)
+	source, _ := NewOntologyVersion(
+		f.v1.Schema(), "property-rename-1", f.v1.CreatedAt().Add(30*time.Second),
+		[]ConceptDefinition{sourcePerson}, nil,
+		[]PropertyDefinition{oldProperty}, nil)
+	target, _ := NewOntologyVersion(
+		f.v1.Schema(), "property-rename-2", f.v1.CreatedAt().Add(31*time.Second),
+		[]ConceptDefinition{targetPerson}, nil,
+		[]PropertyDefinition{newProperty}, nil)
+	rename := mustMorphism(t, MorphismConfig{
+		Kind: MorphismRename, SourceVersion: source, TargetVersion: target,
+		Sources: []shoal.ID{oldProperty.ID()}, Targets: []shoal.ID{newProperty.ID()},
+		Evidence: []EvidenceRef{f.evidence}, Rationale: "rename owned property",
+	})
+	transition, err := NewOntologyTransition(
+		source, target, []OntologyMorphism{rename})
+	if err != nil {
+		t.Fatalf("property rename transition rejected: %v", err)
+	}
+	lens, err := NewOntologyLensWithTransitions(
+		target, []OntologyTransition{transition}, []OntologyMorphism{rename})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertion := mustPropertyAssertion(
+		t, sourcePerson.ID(), oldProperty.ID(), source,
+		nil, f.evidence, f.provenance)
+	read := lens.Read(assertion)
+	if !read.Resolved() || read.Predicate() != newProperty.ID() {
+		t.Fatalf("property rename interpretation = %#v", read)
+	}
+}
+
+func TestOntologyTransitionRejectsUnmappedRemovalBeforeReintroduction(t *testing.T) {
+	schema, _ := NewOntologySchema("revival", "Revival", "", nil)
+	person, _ := NewConceptDefinition("person", "Person", "", nil, nil)
+	at := time.Date(2026, 9, 6, 3, 0, 0, 0, time.UTC)
+	v1, _ := NewOntologyVersion(
+		schema, "1", at, []ConceptDefinition{person}, nil, nil, nil)
+	v2, _ := NewOntologyVersion(
+		schema, "2", at.Add(time.Second), nil, nil, nil, nil)
+	v3, _ := NewOntologyVersion(
+		schema, "3", at.Add(2*time.Second),
+		[]ConceptDefinition{person}, nil, nil, nil)
+	if _, err := NewOntologyTransition(v1, v2, nil); err == nil ||
+		!strings.Contains(err.Error(), "removed concept") {
+		t.Fatalf("unmapped removal error = %v", err)
+	}
+	if _, err := NewOntologyTransition(v2, v3, nil); err != nil {
+		t.Fatalf("additive reintroduction transition rejected: %v", err)
 	}
 }
 
