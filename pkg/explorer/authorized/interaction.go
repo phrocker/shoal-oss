@@ -196,6 +196,15 @@ func (c *Client) recordInteractionForOperation(
 		return interaction.Session{}, directBaseError(err)
 	}
 	if err := guard.Check(ctx); err != nil {
+		if operation == auth.OperationAnalyticsRead {
+			return interaction.Session{}, explorer.MarkIndeterminateCommit(
+				shoal.WrapError(
+					shoal.ErrorUnavailable,
+					"interaction was recorded but authorization generation revalidation failed",
+					err,
+				),
+			)
+		}
 		return interaction.Session{}, explorer.MarkCommittedInteraction(err)
 	}
 	return persisted, nil
@@ -320,8 +329,8 @@ func (c *Client) InteractionRecord(
 		if !summaryFingerprintMatchesDecision(record.Summary, decision) {
 			return explorer.InteractionRecord{}, auth.ObjectNotFound()
 		}
-	} else if err := c.authorizeInteractionSources(
-		ctx, record.TouchedNodeIDs, decision, auth.OperationRead, now,
+	} else if _, err := c.authorizeInteractionEvidence(
+		ctx, record.Session, decision, auth.OperationRead, now,
 	); err != nil {
 		if shoal.IsErrorCode(err, shoal.ErrorUnauthorized) ||
 			shoal.IsErrorCode(err, shoal.ErrorNotFound) {
