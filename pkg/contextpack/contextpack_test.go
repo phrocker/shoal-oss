@@ -651,6 +651,15 @@ func TestGraphAnchorRejectsAuthoritativeDerivedAssertion(t *testing.T) {
 }
 
 func TestGraphAnchorCarriesAuthoritativeExplicitAssertion(t *testing.T) {
+	testGraphAnchorCarriesAuthoritativeAssertion(t, ontology.AssertionExplicit)
+}
+
+func TestGraphAnchorCarriesAuthoritativeInferredAssertion(t *testing.T) {
+	testGraphAnchorCarriesAuthoritativeAssertion(t, ontology.AssertionInferred)
+}
+
+func testGraphAnchorCarriesAuthoritativeAssertion(t *testing.T, origin ontology.AssertionOrigin) {
+	t.Helper()
 	_, _, response, _ := embeddedFixture(t)
 	citation := response.Results[0].Evidence[0].Citation
 	quote := response.Results[0].Evidence[0].Quote
@@ -682,7 +691,7 @@ func TestGraphAnchorCarriesAuthoritativeExplicitAssertion(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertion, err := ontology.NewAssertion(
-		"source", relationship.ID(), value, ontology.AssertionExplicit, 1,
+		"source", relationship.ID(), value, origin, 1,
 		[]ontology.EvidenceRef{evidence}, provenance,
 		shoal.Metadata{"shoal.graph.edge_id": "edge-1"},
 	)
@@ -717,7 +726,7 @@ func TestGraphAnchorCarriesAuthoritativeExplicitAssertion(t *testing.T) {
 	if len(reference.Assertions) != 1 ||
 		reference.Assertions[0].AssertionID != assertion.ID() ||
 		reference.Assertions[0].EdgeID != "edge-1" ||
-		reference.Assertions[0].Origin != ontology.AssertionExplicit {
+		reference.Assertions[0].Origin != origin {
 		t.Fatalf("authoritative assertion reference = %+v", reference.Assertions)
 	}
 }

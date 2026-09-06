@@ -130,6 +130,11 @@ returned session. This verification does not require an additional read grant.
 A failed post-write verification cannot produce success or imply rollback;
 an unavailable durable read preserves both committed and indeterminate markers.
 
+Both the product recorder and harness compare successful result-sink receipts
+with the requested canonical session. Only trusted time, actor, reason, and a
+previously unspecified authorization operation may be enriched. Changed work,
+evidence, or pins fail with a committed marker rather than reporting success.
+
 No Copilot, SDK-process, or other hosted execution backend is bundled. Future
 backends can implement `Runner` without changing inference contracts; the
 package deliberately includes no arbitrary subprocess runner.

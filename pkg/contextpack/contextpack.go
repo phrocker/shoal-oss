@@ -559,9 +559,9 @@ func (v *verifier) graphAnchor(path graph.Path) (inference.EvidenceAnchor, error
 	for _, edge := range path.Edges {
 		for _, assertion := range v.assertions[edge.ID] {
 			switch assertion.Origin {
-			case ontology.AssertionExplicit:
+			case ontology.AssertionExplicit, ontology.AssertionInferred:
 				assertions = append(assertions, assertion)
-			case ontology.AssertionInferred, ontology.AssertionDerived:
+			case ontology.AssertionDerived:
 				return inference.EvidenceAnchor{}, invalid(
 					"graph path contains non-source ontology assertion")
 			default:
