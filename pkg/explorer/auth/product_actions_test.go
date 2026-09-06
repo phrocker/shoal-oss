@@ -75,6 +75,7 @@ var authorizationServiceRoles = []auth.ServiceRole{
 	auth.ServiceRoleSubscription,
 	auth.ServiceRoleEventPublication,
 	auth.ServiceRoleAnalytics,
+	auth.ServiceRoleWorkspaceReader,
 	auth.ServiceRoleWorkspaceSettingsRead,
 	auth.ServiceRoleWorkspaceSettingsWrite,
 }
@@ -149,6 +150,14 @@ var roleOperationCeilings = map[auth.ServiceRole]map[auth.Operation]bool{
 	auth.ServiceRoleAnalytics: operationSet(
 		auth.OperationAnalyticsRead,
 		auth.OperationRetrieve,
+		auth.OperationValidate,
+	),
+	auth.ServiceRoleWorkspaceReader: operationSet(
+		auth.OperationList,
+		auth.OperationRead,
+		auth.OperationNeighborhood,
+		auth.OperationRetrieve,
+		auth.OperationWorkspaceSettingsRead,
 		auth.OperationValidate,
 	),
 	auth.ServiceRoleWorkspaceSettingsRead: operationSet(
@@ -240,6 +249,7 @@ func TestProductActionServiceRoleValuesAreStable(t *testing.T) {
 		auth.ServiceRoleSubscription:           "subscription",
 		auth.ServiceRoleEventPublication:       "event_publication",
 		auth.ServiceRoleAnalytics:              "analytics",
+		auth.ServiceRoleWorkspaceReader:        "workspace_reader",
 		auth.ServiceRoleWorkspaceSettingsRead:  "workspace_settings_read",
 		auth.ServiceRoleWorkspaceSettingsWrite: "workspace_settings_write",
 	}
@@ -404,6 +414,7 @@ func TestProductActionServiceRolesRoundTripThroughPolicy(t *testing.T) {
 		auth.ServiceRoleSubscription:           auth.OperationSubscriptionCreate,
 		auth.ServiceRoleEventPublication:       auth.OperationEventPublish,
 		auth.ServiceRoleAnalytics:              auth.OperationAnalyticsRead,
+		auth.ServiceRoleWorkspaceReader:        auth.OperationWorkspaceSettingsRead,
 		auth.ServiceRoleWorkspaceSettingsRead:  auth.OperationWorkspaceSettingsRead,
 		auth.ServiceRoleWorkspaceSettingsWrite: auth.OperationWorkspaceSettingsWrite,
 	}

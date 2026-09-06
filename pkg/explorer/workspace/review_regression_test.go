@@ -438,10 +438,12 @@ func TestReviewServiceWriterOutputPolicyIsConsumerNeutral(t *testing.T) {
 		},
 	})
 	reader := testDecision(t, decisionOptions{
-		serviceRole: auth.ServiceRoleWorkspaceSettingsRead,
-		ceilingID:   "reader-ceiling",
+		serviceRole: auth.ServiceRoleWorkspaceReader,
+		ceilingID:   "data-reader-ceiling",
 		operations: []auth.Operation{
 			auth.OperationWorkspaceSettingsRead,
+			auth.OperationRead,
+			auth.OperationRetrieve,
 		},
 	})
 	writerCeiling := serviceCeilingForDecision(
@@ -459,7 +461,7 @@ func TestReviewServiceWriterOutputPolicyIsConsumerNeutral(t *testing.T) {
 		GenerationReader: testGenerationReader{generation: 7},
 		CeilingResolver: roleCeilingResolver{
 			auth.ServiceRoleWorkspaceSettingsWrite: writerCeiling,
-			auth.ServiceRoleWorkspaceSettingsRead:  readerCeiling,
+			auth.ServiceRoleWorkspaceReader:        readerCeiling,
 		},
 		Clock: func() time.Time { return testNow },
 	})
@@ -496,6 +498,15 @@ func TestReviewServiceWriterOutputPolicyIsConsumerNeutral(t *testing.T) {
 	if len(effective.OutputPolicies()) != 1 ||
 		effective.OutputPolicies()[0].ServiceRole() != "" {
 		t.Fatalf("effective output policies = %#v", effective.OutputPolicies())
+	}
+	if err := effective.Decision().Authorize(
+		auth.OperationRetrieve,
+		auth.ResourceRequest{
+			AuthorizationDomain: effective.Decision().AuthorizationDomain(),
+		},
+		testNow,
+	); err != nil {
+		t.Fatalf("effective data-read decision cannot retrieve: %v", err)
 	}
 }
 
