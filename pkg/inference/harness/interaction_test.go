@@ -187,27 +187,51 @@ func TestNewGraphRecorderChecksSinkAtSetup(t *testing.T) {
 
 func TestInteractionSessionHashesOversizedIdentifiers(t *testing.T) {
 	model, prompt := provenanceParts(t)
-	provenance, err := NewProvenance(
-		strings.Repeat("a", interaction.MaxIdentifierBytes+1),
-		model, prompt, "grounded-tools-v1",
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	session, err := InteractionSession(EvaluationRecord{
-		Provenance:               provenance,
-		TranscriptID:             "transcript-long-identifier",
-		SnapshotID:               "snapshot-long-identifier",
-		SnapshotAsOf:             fixedTime.Add(-time.Minute),
-		AuthorizationFingerprint: "auth-sha256:long-identifier",
-		AuthorizationExpiresAt:   fixedTime.Add(time.Hour),
-	}, fixedTime)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.HasPrefix(session.Provenance.Harness, "sha256:") {
-		t.Fatalf("oversized harness identity was not hashed: %q",
-			session.Provenance.Harness)
+	for _, size := range []int{
+		interaction.MaxIdentifierBytes,
+		interaction.MaxIdentifierBytes + 1,
+		shoal.MaxSemanticStringBytes,
+	} {
+		t.Run(fmt.Sprintf("bytes-%d", size), func(t *testing.T) {
+			provenance, err := NewProvenance(
+				strings.Repeat("a", size),
+				model, prompt, "grounded-tools-v1",
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			sink := &stubSink{}
+			recorder, err := NewGraphRecorder(context.Background(), sink)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := recorder.SetClock(
+				func() time.Time { return fixedTime }); err != nil {
+				t.Fatal(err)
+			}
+			if err := recorder.Record(
+				context.Background(),
+				EvaluationRecord{
+					Provenance: provenance,
+					TranscriptID: shoal.ID(
+						fmt.Sprintf("transcript-identifier-%d", size)),
+					SnapshotID:               "snapshot-long-identifier",
+					SnapshotAsOf:             fixedTime.Add(-time.Minute),
+					AuthorizationFingerprint: "auth-sha256:long-identifier",
+					AuthorizationExpiresAt:   fixedTime.Add(time.Hour),
+				},
+			); err != nil {
+				t.Fatal(err)
+			}
+			got := sink.lastRecord.Provenance.Harness
+			if size <= interaction.MaxIdentifierBytes {
+				if got != strings.Repeat("a", size) {
+					t.Fatalf("boundary identifier = %q", got)
+				}
+			} else if !strings.HasPrefix(got, "sha256:") {
+				t.Fatalf("oversized harness identity was not hashed: %q", got)
+			}
+		})
 	}
 }
 

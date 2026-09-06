@@ -155,6 +155,29 @@ func (b *hiddenFirstInteractionRecordBase) InteractionRecord(
 	return b.Explorer.InteractionRecord(ctx, id)
 }
 
+type mutatingInteractionSnapshotBase struct {
+	*explorer.Explorer
+	mutate func() error
+}
+
+func (b *mutatingInteractionSnapshotBase) ValidateSnapshot(
+	ctx context.Context,
+	id shoal.ID,
+	asOf time.Time,
+	nodeIDs []shoal.ID,
+) error {
+	if err := b.Explorer.ValidateSnapshot(
+		ctx, id, asOf, nodeIDs); err != nil {
+		return err
+	}
+	if b.mutate == nil {
+		return nil
+	}
+	mutate := b.mutate
+	b.mutate = nil
+	return mutate()
+}
+
 type rejectingSnapshotValidator struct {
 	calls int
 }
@@ -689,6 +712,71 @@ func TestAuthorizedInteractionAcceptsTrustedHistoricalSnapshot(t *testing.T) {
 		f.context(t, decision), session,
 	); err != nil {
 		t.Fatalf("trusted historical snapshot was rejected: %v", err)
+	}
+}
+
+func TestAuthorizedNewWriteRechecksSnapshotAfterConcurrentIngest(t *testing.T) {
+	f := newFixture(t)
+	source := explorer.Source{
+		URI:       "file:///snapshot-race.txt",
+		MediaType: explorer.MediaTypeText,
+		Content:   "original evidence",
+	}
+	receipt, err := f.clientA.Ingest(f.admin(t), source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := f.base.Snapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.clock.Set(snapshot.AsOf.Add(time.Second))
+	decision := f.decision(
+		t, "snapshot-race",
+		[][]byte{f.sourceA}, [][]byte{f.policyA},
+		[]auth.Operation{auth.OperationRead, auth.OperationRetrieve},
+	)
+	view, err := f.clientA.Document(
+		f.context(t, decision), receipt.Document.ID, receipt.Revision.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fingerprint, err := auth.AuthorizationFingerprint(decision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := &mutatingInteractionSnapshotBase{Explorer: f.base}
+	base.mutate = func() error {
+		_, mutateErr := f.base.Ingest(context.Background(), explorer.Source{
+			URI:       source.URI,
+			MediaType: source.MediaType,
+			Content:   source.Content,
+			Metadata: shoal.Metadata{
+				interaction.PropertyVisibility: "restricted",
+			},
+		})
+		return mutateErr
+	}
+	client := f.newClient(
+		t, base, f.store, f.sourceA, f.policyA, nil)
+	session := interaction.Session{
+		ID:                       interaction.DerivedID("session", "snapshot-race"),
+		Operation:                interaction.OperationRetrieval,
+		SnapshotID:               shoal.ID(snapshot.ID),
+		SnapshotAsOf:             snapshot.AsOf,
+		AuthorizationFingerprint: shoal.ID(fingerprint.String()),
+		AuthorizationExpiresAt:   decision.AuthenticationExpires(),
+		SeedNodeIDs:              []shoal.ID{firstSpanID(t, view)},
+	}
+	if _, err := client.RecordInteractionResult(
+		f.context(t, decision), session,
+	); !shoal.IsErrorCode(err, shoal.ErrorConflict) {
+		t.Fatalf("stale snapshot write error = %v", err)
+	}
+	if _, err := f.base.InteractionRecord(
+		context.Background(), session.ID,
+	); !shoal.IsErrorCode(err, shoal.ErrorNotFound) {
+		t.Fatalf("stale snapshot write persisted a record: %v", err)
 	}
 }
 
