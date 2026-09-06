@@ -80,7 +80,8 @@ func EffectiveWorkspaceSettings(
 
 type workspaceResponseWriter struct {
 	http.ResponseWriter
-	maxResponseBytes uint64
+	maxResponseBytes        uint64
+	indeterminateOnOverflow bool
 }
 
 func (w workspaceResponseWriter) Unwrap() http.ResponseWriter {
@@ -217,6 +218,11 @@ func responseLimitFor(writer http.ResponseWriter) uint64 {
 	return MaxResponseBytes
 }
 
+func responseOverflowIsIndeterminate(writer http.ResponseWriter) bool {
+	limited, ok := writer.(workspaceResponseWriter)
+	return ok && limited.indeterminateOnOverflow
+}
+
 func responseLimitForContext(ctx context.Context) uint64 {
 	effective, ok := EffectiveWorkspaceSettings(ctx)
 	if !ok {
@@ -229,4 +235,20 @@ func isWorkspaceSettingsManagementPath(path string) bool {
 	return strings.HasPrefix(path, "/api/v1/workspaces/") &&
 		(strings.HasSuffix(path, "/settings") ||
 			strings.HasSuffix(path, "/settings/lens"))
+}
+
+func requestMayCommit(method, path string) bool {
+	if method != http.MethodPost {
+		return false
+	}
+	switch path {
+	case "/api/v1/ingest",
+		"/api/v1/extract",
+		"/api/v1/derivation/recompute",
+		"/api/v1/ontology/proposals":
+		return true
+	default:
+		return strings.HasPrefix(path, "/api/v1/ontology/proposals/") &&
+			strings.HasSuffix(path, "/transition")
+	}
 }

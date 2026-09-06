@@ -131,6 +131,8 @@ func (h *Handler) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 			writer = workspaceResponseWriter{
 				ResponseWriter:   writer,
 				maxResponseBytes: responseLimitForContext(ctx),
+				indeterminateOnOverflow: requestMayCommit(
+					request.Method, request.URL.Path),
 			}
 		}
 	}
@@ -446,17 +448,27 @@ func writeResponse(writer http.ResponseWriter, status int, value any) {
 	var body limitedResponseBuffer
 	body.limit = int64(responseLimitFor(writer))
 	if err := json.NewEncoder(&body).Encode(value); err != nil {
+		indeterminate := responseOverflowIsIndeterminate(writer)
+		status := http.StatusInternalServerError
+		code := shoal.ErrorInternal
+		if indeterminate {
+			writer.Header().Set(
+				CommitOutcomeHeader, CommitOutcomeIndeterminate)
+			status, code = http.StatusServiceUnavailable, shoal.ErrorUnavailable
+		}
 		var fallback limitedResponseBuffer
 		fallback.limit = body.limit
 		fallbackErr := json.NewEncoder(&fallback).Encode(struct {
-			Code    shoal.ErrorCode `json:"code"`
-			Message string          `json:"message"`
+			Code          shoal.ErrorCode `json:"code"`
+			Message       string          `json:"message"`
+			Indeterminate bool            `json:"indeterminate,omitempty"`
 		}{
-			Code:    shoal.ErrorInternal,
-			Message: "response exceeds output byte limit",
+			Code:          code,
+			Message:       "response exceeds output byte limit",
+			Indeterminate: indeterminate,
 		})
 		writer.Header().Set("Content-Type", "application/json; charset=utf-8")
-		writer.WriteHeader(http.StatusInternalServerError)
+		writer.WriteHeader(status)
 		if fallbackErr == nil && fallback.Len() <= int(body.limit) {
 			_, _ = writer.Write(fallback.Bytes())
 		}
