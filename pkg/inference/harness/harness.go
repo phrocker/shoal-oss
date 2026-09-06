@@ -882,6 +882,7 @@ func (g *Generator) Run(ctx context.Context, pack inference.ContextPack) (Record
 			GraphNodes:   len(graphNodes),
 		}
 	}
+	recordCommitted := false
 	finish := func(
 		reason StopReason,
 		iteration int,
@@ -918,6 +919,9 @@ func (g *Generator) Run(ctx context.Context, pack inference.ContextPack) (Record
 					Error:     postErr.Error(),
 				})
 				record.Trace = cloneRunTrace(trace)
+				if recordCommitted {
+					postErr = explorer.MarkCommittedInteraction(postErr)
+				}
 				return record, postErr
 			}
 			if !g.now().Before(pack.Authorization().ExpiresAt()) {
@@ -929,6 +933,9 @@ func (g *Generator) Run(ctx context.Context, pack inference.ContextPack) (Record
 					Error:     postErr.Error(),
 				})
 				record.Trace = cloneRunTrace(trace)
+				if recordCommitted {
+					postErr = explorer.MarkCommittedInteraction(postErr)
+				}
 				return record, postErr
 			}
 		}
@@ -980,8 +987,7 @@ func (g *Generator) Run(ctx context.Context, pack inference.ContextPack) (Record
 		if err := runCtx.Err(); err != nil {
 			return finish(
 				stopReasonFor(err), step, "model",
-				inference.InferenceResult{},
-				explorer.MarkCommittedInteraction(err),
+				inference.InferenceResult{}, err,
 			)
 		}
 		if !g.now().Before(pack.Authorization().ExpiresAt()) {
@@ -1039,8 +1045,13 @@ func (g *Generator) Run(ctx context.Context, pack inference.ContextPack) (Record
 			if err := g.recorder.Record(runCtx, evaluation); err != nil {
 				return finish(stopReasonFor(err), step, "recorder", inference.InferenceResult{}, err)
 			}
+			recordCommitted = true
 			if err := runCtx.Err(); err != nil {
-				return finish(stopReasonFor(err), step, "model", inference.InferenceResult{}, err)
+				return finish(
+					stopReasonFor(err), step, "model",
+					inference.InferenceResult{},
+					explorer.MarkCommittedInteraction(err),
+				)
 			}
 			return finish(StopReasonStop, step, "stop", result, nil)
 		}
