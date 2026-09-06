@@ -59,9 +59,23 @@ func TestOpenServiceWiresDurableWorkspaceSettings(t *testing.T) {
 		backend: "embedded", data: corpus, policyDir: policy,
 		resolver: resolver, clock: func() time.Time { return now },
 	}
-	opened, err := openService(context.Background(), config)
+	blocker, err := workspace.OpenDurableStore(
+		workspaceSettingsStoreDir(corpus))
 	if err != nil {
 		t.Fatal(err)
+	}
+	if failed, err := openService(
+		context.Background(), config,
+	); err == nil {
+		failed.close()
+		t.Fatal("startup succeeded while the settings directory was owned")
+	}
+	if err := blocker.Close(); err != nil {
+		t.Fatal(err)
+	}
+	opened, err := openService(context.Background(), config)
+	if err != nil {
+		t.Fatalf("startup failure retained the runtime lock: %v", err)
 	}
 	if opened.settings == nil {
 		t.Fatal("embedded startup did not expose workspace settings")

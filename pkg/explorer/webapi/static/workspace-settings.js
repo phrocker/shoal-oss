@@ -111,7 +111,8 @@
         })
       : await nativeFetch(input, init);
     if (url.origin === window.location.origin &&
-        url.pathname === "/api/v1/identity" && response.ok) {
+        url.pathname === "/api/v1/identity" &&
+        (response.ok || response.status === 404)) {
       identityReady = true;
       queueLensLoad();
     }

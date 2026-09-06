@@ -310,6 +310,45 @@ func TestEffectiveDecisionCannotReplaceIssuerSelectedOntology(t *testing.T) {
 	}
 }
 
+func TestSelectedOntologyCannotChangeAcrossSettingsRevisions(t *testing.T) {
+	firstOntology, secondOntology := testOntologies(t)
+	store, err := OpenDurableStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	created, err := store.CompareAndSwap(
+		context.Background(), "workspace", "owner", []byte("domain"),
+		0, "first", Narrowing{
+			SelectedOntology: OntologySelection{
+				Present: true, Identity: firstOntology,
+			},
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CompareAndSwap(
+		context.Background(), "workspace", "owner", []byte("domain"),
+		created.Revision, "replace", Narrowing{
+			SelectedOntology: OntologySelection{
+				Present: true, Identity: secondOntology,
+			},
+		},
+	); !shoal.IsErrorCode(err, shoal.ErrorUnauthorized) {
+		t.Fatalf("ontology replacement error = %v, want unauthorized", err)
+	}
+	current, err := store.Load(context.Background(), "workspace")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !current.Narrowing.SelectedOntology.Present ||
+		current.Narrowing.SelectedOntology.Identity != firstOntology ||
+		current.Revision != created.Revision {
+		t.Fatalf("ontology replacement changed settings: %#v", current)
+	}
+}
+
 func TestExplicitEmptyScopeDiffersFromOmission(t *testing.T) {
 	store, err := OpenDurableStore(t.TempDir())
 	if err != nil {

@@ -55,6 +55,7 @@ func TestStaticWorkspaceSettingsLensControls(t *testing.T) {
 		`selected_ontology`,
 		`crypto.getRandomValues`,
 		`window.ShoalWorkspaceSettings`,
+		`response.status === 404`,
 	} {
 		if !strings.Contains(script, marker) {
 			t.Fatalf("workspace settings script missing %q", marker)
@@ -165,5 +166,116 @@ vm.runInContext(fs.readFileSync("static/workspace-settings.js", "utf8"), context
 	output, err := command.CombinedOutput()
 	if err != nil {
 		t.Fatalf("node workspace settings check failed: %v\n%s", err, output)
+	}
+}
+
+func TestStaticWorkspaceSettingsLoadsLensAfterNewWorkspaceNotFound(t *testing.T) {
+	if _, err := exec.LookPath("node"); err != nil {
+		if os.Getenv("CI") != "" {
+			t.Fatal("node is required for executable static UI checks in CI")
+		}
+		t.Skip("node is not available for executable static UI checks")
+	}
+	script := `
+const assert = require("assert");
+const fs = require("fs");
+const vm = require("vm");
+const calls = [];
+let ready;
+function element() {
+  return {
+    value: "",
+    disabled: false,
+    className: "",
+    textContent: "",
+    options: [],
+    addEventListener() {},
+    replaceChildren() { this.options = []; },
+    append(value) { this.options.push(value); },
+  };
+}
+const elements = new Map([
+  "workspace-settings-form",
+  "workspace-settings-id",
+  "workspace-settings-new",
+  "workspace-settings-clear",
+  "workspace-settings-lens",
+  "workspace-settings-refresh",
+  "workspace-settings-apply",
+  "workspace-settings-status",
+].map((id) => [id, element()]));
+const window = {
+  location: {
+    href: "https://example.test/",
+    origin: "https://example.test",
+    reload() {},
+  },
+  crypto: {getRandomValues(bytes) { bytes.fill(7); return bytes; }},
+  fetch: async (input, init) => {
+    const url = new URL(String(input), "https://example.test/");
+    calls.push(url.pathname);
+    if (url.pathname === "/api/v1/identity") {
+      return {ok: false, status: 404, statusText: "Not Found"};
+    }
+    if (url.pathname.endsWith("/settings/lens")) {
+      return {
+        ok: true,
+        status: 200,
+        statusText: "OK",
+        async json() {
+          return {
+            workspace_id: "d29ya3NwYWNl",
+            settings_revision: 0,
+            active: {known: false, reading: "unresolved"},
+            choices: [],
+          };
+        },
+      };
+    }
+    return {ok: true, status: 200, statusText: "OK"};
+  },
+  addEventListener(name, callback) {
+    if (name === "DOMContentLoaded") ready = callback;
+  },
+  setTimeout(callback) { callback(); },
+};
+const context = {
+  window,
+  sessionStorage: {
+    getItem() { return "d29ya3NwYWNl"; },
+    setItem() {},
+    removeItem() {},
+  },
+  document: {
+    getElementById(id) { return elements.get(id); },
+    createElement() { return element(); },
+  },
+  Headers,
+  Request,
+  URL,
+  Uint8Array,
+  atob,
+  Object,
+  console,
+};
+vm.createContext(context);
+vm.runInContext(fs.readFileSync("static/workspace-settings.js", "utf8"), context);
+ready();
+(async () => {
+  await window.fetch("/api/v1/identity");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepStrictEqual(calls, [
+    "/api/v1/identity",
+    "/api/v1/workspaces/d29ya3NwYWNl/settings/lens",
+  ]);
+})().catch((error) => {
+  console.error(error);
+  process.exitCode = 1;
+});
+`
+	command := exec.Command("node", "-e", script)
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("node new-workspace lens check failed: %v\n%s", err, output)
 	}
 }

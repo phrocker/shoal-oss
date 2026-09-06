@@ -549,7 +549,12 @@ func requireSameOrigin(request *http.Request) error {
 		return shoal.NewError(
 			shoal.ErrorUnauthorized, "cross-origin settings mutation denied")
 	}
-	if !sameAuthority(parsed.Host, request.Host) {
+	requestScheme := "http"
+	if request.TLS != nil {
+		requestScheme = "https"
+	}
+	if !strings.EqualFold(parsed.Scheme, requestScheme) ||
+		!sameAuthority(parsed.Host, request.Host) {
 		return shoal.NewError(
 			shoal.ErrorUnauthorized, "cross-origin settings mutation denied")
 	}
