@@ -782,6 +782,13 @@ func (s Session) Validate() error {
 				"interaction tool nodes do not match retrieved evidence")
 		}
 	}
+	// One anchor identity must describe one evidence reference across seed,
+	// cited, and tool-call evidence, or the session-wide union is ambiguous.
+	if _, err := canonicalEvidenceReferences(
+		s.evidenceReferenceValues(),
+	); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -881,8 +888,14 @@ func (s Session) TouchedAssertions() []AssertionReference {
 }
 
 // EvidenceReferences returns the canonical union of every retrieved and cited
-// evidence anchor in the session.
-func (s Session) EvidenceReferences() []EvidenceReference {
+// evidence anchor in the session. It fails rather than silently omitting
+// evidence, because callers use the result to bind evidence to a pinned
+// frontier and an empty result selects a weaker validation path.
+func (s Session) EvidenceReferences() ([]EvidenceReference, error) {
+	return canonicalEvidenceReferences(s.evidenceReferenceValues())
+}
+
+func (s Session) evidenceReferenceValues() []EvidenceReference {
 	values := append([]EvidenceReference(nil), s.SeedEvidence...)
 	values = append(values, s.CitedEvidence...)
 	for _, turn := range s.Turns {
@@ -890,11 +903,7 @@ func (s Session) EvidenceReferences() []EvidenceReference {
 			values = append(values, turn.ToolCall.RetrievedEvidence...)
 		}
 	}
-	canonical, err := canonicalEvidenceReferences(values)
-	if err != nil {
-		return nil
-	}
-	return canonical
+	return values
 }
 
 // Subgraph materializes the session, turn, and tool-call nodes with their

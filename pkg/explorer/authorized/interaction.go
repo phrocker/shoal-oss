@@ -165,8 +165,11 @@ func (c *Client) recordInteraction(
 		)
 	}
 	edgeIDs := canonical.TouchedEdgeIDs()
-	references := canonical.EvidenceReferences()
-	if len(references) > 0 {
+	references, err := canonical.EvidenceReferences()
+	if err != nil {
+		return interaction.Session{}, err
+	}
+	if len(references) > 0 || len(edgeIDs) > 0 {
 		validator, ok := c.snapshotValidator.(EvidenceSnapshotValidator)
 		if !ok {
 			return interaction.Session{}, shoal.NewError(

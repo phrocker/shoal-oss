@@ -220,12 +220,16 @@ func (e *Explorer) recordInteractionResult(
 	// visibility materialization, and persistence. Legacy direct callers with
 	// an unregistered descriptive pin retain their existing behavior.
 	if _, trusted := e.snapshotHistory[string(session.SnapshotID)]; trusted {
+		references, err := session.EvidenceReferences()
+		if err != nil {
+			return interaction.Session{}, err
+		}
 		if err := e.validateEvidenceSnapshotLocked(
 			session.SnapshotID,
 			session.SnapshotAsOf,
 			session.TouchedNodeIDs(),
 			session.TouchedEdgeIDs(),
-			session.EvidenceReferences(),
+			references,
 		); err != nil {
 			return interaction.Session{}, err
 		}
@@ -875,7 +879,11 @@ func (e *Explorer) edgeVisibilityResolverLocked() interaction.VisibilityResolver
 func (e *Explorer) currentInteractionVisibilityLocked(
 	record persistedInteraction,
 ) (string, error) {
-	for _, reference := range record.Session.EvidenceReferences() {
+	references, err := record.Session.EvidenceReferences()
+	if err != nil {
+		return "", err
+	}
+	for _, reference := range references {
 		if err := e.validateEvidenceReferenceLocked(reference); err != nil {
 			return "", err
 		}

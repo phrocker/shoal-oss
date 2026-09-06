@@ -123,3 +123,27 @@ func TestSessionRejectsEvidenceWithoutDeclaredSourceNodes(t *testing.T) {
 		t.Fatal("unvalidated seed evidence was accepted")
 	}
 }
+
+func TestSessionRejectsConflictingEvidenceAnchorAcrossGroups(t *testing.T) {
+	session := interaction.Session{
+		ID:          interaction.DerivedID("session", "anchor-conflict"),
+		RecordedAt:  time.Unix(1700000000, 0).UTC(),
+		Operation:   interaction.OperationRetrieval,
+		SeedNodeIDs: []shoal.ID{"node-a"},
+		SeedEvidence: []interaction.EvidenceReference{{
+			AnchorID: "anchor-x", Kind: interaction.EvidenceGraph,
+			NodeIDs: []shoal.ID{"node-a"},
+		}},
+		CitedNodeIDs: []shoal.ID{"node-b"},
+		CitedEvidence: []interaction.EvidenceReference{{
+			AnchorID: "anchor-x", Kind: interaction.EvidenceGraph,
+			NodeIDs: []shoal.ID{"node-b"},
+		}},
+	}
+	if err := session.Validate(); err == nil {
+		t.Fatal("conflicting evidence anchor across groups was accepted")
+	}
+	if _, err := session.EvidenceReferences(); err == nil {
+		t.Fatal("ambiguous evidence union was reported as absent evidence")
+	}
+}
