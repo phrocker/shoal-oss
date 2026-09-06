@@ -557,6 +557,59 @@ func TestOntologyLensReportsOnlyMorphismsAppliedToAssertion(t *testing.T) {
 	}
 }
 
+func TestProposalRejectsRestrictingPreviouslyUnownedProperty(t *testing.T) {
+	schema, _ := NewOntologySchema("owners", "Owners", "", nil)
+	property, _ := NewPropertyDefinition(
+		"name", "Name", "", ValueString, nil, nil)
+	first, _ := NewConceptDefinition("first", "First", "", nil, nil)
+	second, _ := NewConceptDefinition("second", "Second", "", nil, nil)
+	restricted, _ := NewConceptDefinition(
+		"first", "First", "", []shoal.ID{property.ID()}, nil)
+	at := time.Date(2026, time.September, 6, 1, 0, 0, 0, time.UTC)
+	base, _ := NewOntologyVersion(
+		schema, "1", at, []ConceptDefinition{first, second}, nil,
+		[]PropertyDefinition{property}, nil)
+	target, _ := NewOntologyVersion(
+		schema, "2", at.Add(time.Second),
+		[]ConceptDefinition{restricted, second}, nil,
+		[]PropertyDefinition{property}, nil)
+	if _, err := NewOntologyTransition(base, target, nil); err == nil {
+		t.Fatal("unowned property became owner-restricted without an explicit transformation")
+	}
+}
+
+func TestInferredLensValidatesCompleteEvolution(t *testing.T) {
+	f := newMorphismFixture(t)
+	concepts := f.v2.Concepts()
+	for index, concept := range concepts {
+		if concept.ID() != f.person.ID() {
+			continue
+		}
+		changed, err := NewConceptDefinition(
+			concept.Key(), concept.Name(), "changed without a morphism",
+			concept.Properties(), concept.Metadata())
+		if err != nil {
+			t.Fatal(err)
+		}
+		concepts[index] = changed
+	}
+	target, err := NewOntologyVersion(
+		f.v2.Schema(), "inferred-invalid",
+		f.v2.CreatedAt().Add(time.Second), concepts,
+		f.v2.Relationships(), f.v2.Properties(), f.v2.Metadata())
+	if err != nil {
+		t.Fatal(err)
+	}
+	widen := mustMorphism(t, MorphismConfig{
+		Kind: MorphismWiden, SourceVersion: f.v1, TargetVersion: target,
+		Sources: []shoal.ID{f.v1rel.ID()}, Targets: []shoal.ID{f.v2rel.ID()},
+		Evidence: []EvidenceRef{f.evidence}, Rationale: "valid endpoint widening",
+	})
+	if _, err := NewOntologyLens(target, []OntologyMorphism{widen}); err == nil {
+		t.Fatal("inferred lens accepted unrelated semantic changes")
+	}
+}
+
 func TestOntologyTransitionRejectsMorphismFromDifferentVersions(t *testing.T) {
 	f := newMorphismFixture(t)
 	widen := mustMorphism(t, MorphismConfig{

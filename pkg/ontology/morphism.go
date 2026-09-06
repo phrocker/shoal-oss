@@ -685,6 +685,15 @@ func NewOntologyLensWithTransitions(
 		sort.Slice(transition.morphisms, func(i, j int) bool {
 			return transition.morphisms[i].ID() < transition.morphisms[j].ID()
 		})
+		if inferTransitions {
+			if _, err := NewOntologyTransition(
+				transition.sourceVersion,
+				transition.targetVersion,
+				transition.morphisms,
+			); err != nil {
+				return OntologyLens{}, err
+			}
+		}
 		lens.transitions = append(lens.transitions, *transition)
 	}
 	sort.Slice(lens.transitions, func(i, j int) bool {
