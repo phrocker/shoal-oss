@@ -146,6 +146,11 @@ func TestIvfIndex_LoadAndSearch(t *testing.T) {
 	); !errors.Is(err, embeddingspace.ErrQueryIdentityRequired) {
 		t.Fatalf("legacy Search error = %v", err)
 	}
+	if _, err := ix.SearchInSpace(
+		ctx, vecs[0], " "+space+" ", 3, 2,
+	); !errors.Is(err, embeddingspace.ErrInvalidState) {
+		t.Fatalf("non-canonical SearchInSpace error = %v", err)
+	}
 	if _, err := LoadIvfIndexInSpace(
 		ctx, store, table, "foreign-space",
 	); !errors.Is(err, embeddingspace.ErrMismatch) {

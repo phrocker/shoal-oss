@@ -72,6 +72,11 @@ func TestIvfIndex_Add(t *testing.T) {
 	); !errors.Is(err, embeddingspace.ErrMismatch) {
 		t.Fatalf("foreign AddInSpace error = %v", err)
 	}
+	if err := ix.AddInSpace(
+		ctx, "evt:padded", []float32{1, 0, 0, 0}, " "+space+" ",
+	); !errors.Is(err, embeddingspace.ErrInvalidState) {
+		t.Fatalf("non-canonical AddInSpace error = %v", err)
+	}
 	if found := searchHasRow(t, ctx, ix, []float32{1, 0, 0, 0}, newID); !found {
 		t.Fatalf("row %q not searchable after Add", newID)
 	}

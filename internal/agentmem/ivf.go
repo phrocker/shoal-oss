@@ -172,6 +172,10 @@ func (ix *IvfIndex) SearchInSpace(
 	embeddingSpace string,
 	topK, nprobe int,
 ) ([]IvfResult, error) {
+	if err := embeddingspace.ValidateQueryStates(
+		"search agent-memory IVF index", embeddingSpace); err != nil {
+		return nil, err
+	}
 	if err := embeddingspace.EnsureSameIdentity(
 		"search agent-memory IVF index", ix.space, embeddingSpace); err != nil {
 		return nil, err
@@ -291,6 +295,10 @@ func (ix *IvfIndex) AddInSpace(
 	vec []float32,
 	embeddingSpace string,
 ) error {
+	if err := embeddingspace.ValidateQueryStates(
+		"update agent-memory IVF index", embeddingSpace); err != nil {
+		return err
+	}
 	if err := embeddingspace.EnsureSameIdentity(
 		"update agent-memory IVF index", ix.space, embeddingSpace); err != nil {
 		return err
