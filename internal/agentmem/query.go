@@ -150,12 +150,16 @@ func (c *Client) anchors(ctx context.Context, a analysis) ([]string, error) {
 func (c *Client) semanticAnchors(ctx context.Context, a analysis) ([]string, error) {
 	if c.cfg.UseIVF {
 		if index := c.ivfIndex(ctx); index != nil {
+			nprobe := c.cfg.IvfNprobe
+			if nprobe <= 0 {
+				nprobe = 8
+			}
 			hits, err := index.SearchInSpace(
 				ctx,
 				a.vector,
 				c.cfg.EmbeddingSpace,
 				c.cfg.MaxAnchors,
-				c.cfg.IvfNprobe,
+				nprobe,
 			)
 			if err == nil {
 				rows := make([]string, len(hits))

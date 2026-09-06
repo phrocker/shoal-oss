@@ -80,7 +80,7 @@ func TestSemanticAnchors_IVFEnabled(t *testing.T) {
 
 	c, err := New(Config{
 		Store: store, Table: table, Embedder: FakeEmbedder{Dim: 4},
-		UseIVF: true, IvfNprobe: 2,
+		UseIVF: true,
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -97,6 +97,9 @@ func TestSemanticAnchors_IVFEnabled(t *testing.T) {
 	if c.ivf == nil || c.ivfErr != nil {
 		t.Fatalf("UseIVF did not load identity-checked index: index=%v err=%v",
 			c.ivf, c.ivfErr)
+	}
+	if c.cfg.IvfNprobe != 8 {
+		t.Fatalf("default IvfNprobe = %d, want 8", c.cfg.IvfNprobe)
 	}
 }
 
