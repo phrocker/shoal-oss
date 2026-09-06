@@ -100,7 +100,7 @@ func TestGovernedOntologyChoicesWithoutConfiguredRootIsEmpty(t *testing.T) {
 
 func TestPublishedOntologyHistoryAcceptsExactBound(t *testing.T) {
 	configured, expected, proposals := governedOntologyChain(
-		t, int(MaxOntologyProposals))
+		t, ontology.MaxPublishedOntologyVersions-1)
 	active, err := replayPublishedOntology(configured, proposals)
 	if err != nil {
 		t.Fatalf("exact-bound active ontology: %v", err)
@@ -118,12 +118,12 @@ func TestPublishedOntologyHistoryAcceptsExactBound(t *testing.T) {
 	if err != nil {
 		t.Fatalf("exact-bound choices: %v", err)
 	}
-	if len(listed) != int(MaxOntologyProposals)+1 {
+	if len(listed) != ontology.MaxPublishedOntologyVersions {
 		t.Fatalf("choice count = %d", len(listed))
 	}
 
 	configured, _, proposals = governedOntologyChain(
-		t, int(MaxOntologyProposals)+1)
+		t, ontology.MaxPublishedOntologyVersions)
 	if _, err := replayPublishedOntology(
 		configured, proposals,
 	); !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
