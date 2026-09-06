@@ -22,6 +22,7 @@ package explorer
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -29,6 +30,23 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/interaction"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
+
+type stagedCancellationContext struct {
+	context.Context
+	mu          sync.Mutex
+	calls       int
+	cancelAfter int
+}
+
+func (c *stagedCancellationContext) Err() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.calls++
+	if c.calls >= c.cancelAfter {
+		return context.Canceled
+	}
+	return nil
+}
 
 func TestInteractionWriteResolvesCommittedIndeterminateOutcome(t *testing.T) {
 	ctx := context.Background()
@@ -118,6 +136,215 @@ func TestInteractionWritePreservesUnresolvedIndeterminateOutcome(t *testing.T) {
 		err, shoal.ErrorNotFound,
 	) {
 		t.Fatalf("uncommitted interaction became visible: %v", err)
+	}
+}
+
+func TestInteractionResultMarksCancellationAfterDurableCommit(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	corpus, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	defer corpus.Close()
+	write := corpus.writeRecord
+	corpus.interactionRecordWriter = func(
+		row []byte, kind byte, value any,
+	) error {
+		if err := write(row, kind, value); err != nil {
+			return err
+		}
+		cancel()
+		return nil
+	}
+	session := interaction.Session{
+		ID:         interaction.DerivedID("session", "cancel-after-commit"),
+		RecordedAt: time.Unix(1700000000, 0).UTC(),
+		Operation:  interaction.OperationToolCall,
+	}
+	accepted, err := corpus.RecordInteractionResult(ctx, session)
+	if !IsCommittedInteraction(err) ||
+		!shoal.IsErrorCode(err, shoal.ErrorCanceled) {
+		t.Fatalf("post-commit cancellation error = %v", err)
+	}
+	if accepted.ID != session.ID {
+		t.Fatalf("accepted session = %+v", accepted)
+	}
+	if _, err := corpus.Interaction(
+		context.Background(), session.ID); err != nil {
+		t.Fatalf("committed session is unavailable: %v", err)
+	}
+}
+
+func TestInteractionResultDoesNotPerformPostCommitPublicRead(t *testing.T) {
+	corpus, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer corpus.Close()
+	ctx := &stagedCancellationContext{
+		Context: context.Background(), cancelAfter: 3,
+	}
+	session := interaction.Session{
+		ID:         interaction.DerivedID("session", "single-lock-result"),
+		RecordedAt: time.Unix(1700000000, 0).UTC(),
+		Operation:  interaction.OperationToolCall,
+	}
+	accepted, err := corpus.RecordInteractionResult(ctx, session)
+	if err != nil {
+		t.Fatalf("atomic result performed a post-commit read: %v", err)
+	}
+	if accepted.ID != session.ID {
+		t.Fatalf("accepted session = %+v", accepted)
+	}
+	ctx.mu.Lock()
+	calls := ctx.calls
+	ctx.mu.Unlock()
+	if calls != 2 {
+		t.Fatalf("context checks = %d, want admission and post-commit only", calls)
+	}
+}
+
+func TestInteractionResultIsAtomicAgainstConcurrentDeletion(t *testing.T) {
+	ctx := context.Background()
+	corpus, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer corpus.Close()
+	session := interaction.Session{
+		ID:         interaction.DerivedID("session", "delete-race"),
+		RecordedAt: time.Unix(1700000000, 0).UTC(),
+		Operation:  interaction.OperationToolCall,
+	}
+	written := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	write := corpus.writeRecord
+	corpus.interactionRecordWriter = func(
+		row []byte, kind byte, value any,
+	) error {
+		if err := write(row, kind, value); err != nil {
+			return err
+		}
+		if record, ok := value.(persistedInteraction); ok &&
+			!record.Deleted {
+			once.Do(func() {
+				close(written)
+				<-release
+			})
+		}
+		return nil
+	}
+	type result struct {
+		session interaction.Session
+		err     error
+	}
+	recorded := make(chan result, 1)
+	go func() {
+		accepted, recordErr := corpus.RecordInteractionResult(ctx, session)
+		recorded <- result{session: accepted, err: recordErr}
+	}()
+	<-written
+	deleteStarted := make(chan struct{})
+	deleted := make(chan error, 1)
+	go func() {
+		close(deleteStarted)
+		_, deleteErr := corpus.DeleteInteraction(ctx, session.ID)
+		deleted <- deleteErr
+	}()
+	<-deleteStarted
+	time.Sleep(20 * time.Millisecond)
+	close(release)
+	recordResult := <-recorded
+	if recordResult.err != nil || recordResult.session.ID != session.ID {
+		t.Fatalf("atomic record result = %+v, %v",
+			recordResult.session, recordResult.err)
+	}
+	if err := <-deleted; err != nil {
+		t.Fatalf("concurrent deletion failed: %v", err)
+	}
+}
+
+func TestInteractionResultDoesNotRereadAfterVisibilityTightening(t *testing.T) {
+	ctx := context.Background()
+	corpus, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer corpus.Close()
+	source := Source{
+		URI: "file:///visibility-race.txt", MediaType: MediaTypeText,
+		Content: "stable source",
+	}
+	receipt, err := corpus.Ingest(ctx, source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	view, err := corpus.Document(
+		ctx, receipt.Document.ID, receipt.Revision.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := interaction.Session{
+		ID:          interaction.DerivedID("session", "visibility-race"),
+		RecordedAt:  time.Unix(1700000000, 0).UTC(),
+		Operation:   interaction.OperationRetrieval,
+		SeedNodeIDs: []shoal.ID{view.Root.Spans[0].ID},
+	}
+	written := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	write := corpus.writeRecord
+	corpus.interactionRecordWriter = func(
+		row []byte, kind byte, value any,
+	) error {
+		if err := write(row, kind, value); err != nil {
+			return err
+		}
+		if record, ok := value.(persistedInteraction); ok &&
+			!record.Deleted {
+			once.Do(func() {
+				close(written)
+				<-release
+			})
+		}
+		return nil
+	}
+	type result struct {
+		session interaction.Session
+		err     error
+	}
+	recorded := make(chan result, 1)
+	go func() {
+		accepted, recordErr := corpus.RecordInteractionResult(ctx, session)
+		recorded <- result{session: accepted, err: recordErr}
+	}()
+	<-written
+	ingestStarted := make(chan struct{})
+	ingested := make(chan error, 1)
+	go func() {
+		close(ingestStarted)
+		source.Metadata = shoal.Metadata{
+			interaction.PropertyVisibility: "restricted",
+		}
+		_, ingestErr := corpus.Ingest(ctx, source)
+		ingested <- ingestErr
+	}()
+	<-ingestStarted
+	time.Sleep(20 * time.Millisecond)
+	close(release)
+	recordResult := <-recorded
+	if recordResult.err != nil || recordResult.session.ID != session.ID {
+		t.Fatalf("atomic record result = %+v, %v",
+			recordResult.session, recordResult.err)
+	}
+	if err := <-ingested; err != nil {
+		t.Fatalf("visibility tightening failed: %v", err)
+	}
+	if _, err := corpus.InteractionRecord(
+		ctx, session.ID); err == nil {
+		t.Fatal("tightened source left the interaction readable")
 	}
 }
 
