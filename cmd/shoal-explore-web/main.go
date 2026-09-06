@@ -740,23 +740,12 @@ func openService(
 			corpus.Close()
 			return closed, err
 		}
-		var choices workspace.OntologyChoices
-		if config.ontology != nil {
-			identity, err := ontology.NewOntologyIdentity(*config.ontology)
-			if err != nil {
-				settingsStore.Close()
-				store.Close()
-				corpus.Close()
-				return closed, err
-			}
-			configured, err := workspace.NewStaticOntologyChoicesWithActive(identity)
-			if err != nil {
-				settingsStore.Close()
-				store.Close()
-				corpus.Close()
-				return closed, err
-			}
-			choices = configured
+		choices, err := webapi.NewGovernedOntologyChoices(service)
+		if err != nil {
+			settingsStore.Close()
+			store.Close()
+			corpus.Close()
+			return closed, err
 		}
 		settingsProvider, err := workspace.NewProvider(
 			settingsStore,
