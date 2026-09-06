@@ -230,6 +230,7 @@
       ],
       "optionKeys": [
         "query.b64",
+        "embeddingSpace",
         "topK",
         "embeddingCF",
         "metric",

@@ -55,6 +55,9 @@ func unpackScore(t *testing.T, v []byte) float32 {
 // runKNN wires a SliceSource → VectorKNNIterator over the full range and drains.
 func runKNN(t *testing.T, cells []Cell, opts map[string]string) []Cell {
 	t.Helper()
+	if _, ok := opts[VectorKNNEmbeddingSpace]; !ok {
+		opts[VectorKNNEmbeddingSpace] = "test-provider:test-model-v1:2:l2"
+	}
 	leaf := NewSliceSource(sortedSlice(cells))
 	if err := leaf.Init(nil, nil, IteratorEnvironment{Scope: ScopeScan}); err != nil {
 		t.Fatalf("leaf init: %v", err)
@@ -199,10 +202,10 @@ func TestVectorKNNInitErrors(t *testing.T) {
 		name string
 		opts map[string]string
 	}{
-		{"missing query", map[string]string{}},
-		{"bad base64", map[string]string{VectorKNNQuery: "!!!"}},
-		{"bad topK", map[string]string{VectorKNNQuery: b64(1, 0), VectorKNNTopK: "0"}},
-		{"bad metric", map[string]string{VectorKNNQuery: b64(1, 0), VectorKNNMetric: "manhattan"}},
+		{"missing query", map[string]string{VectorKNNEmbeddingSpace: "space-a"}},
+		{"bad base64", map[string]string{VectorKNNQuery: "!!!", VectorKNNEmbeddingSpace: "space-a"}},
+		{"bad topK", map[string]string{VectorKNNQuery: b64(1, 0), VectorKNNEmbeddingSpace: "space-a", VectorKNNTopK: "0"}},
+		{"bad metric", map[string]string{VectorKNNQuery: b64(1, 0), VectorKNNEmbeddingSpace: "space-a", VectorKNNMetric: "manhattan"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

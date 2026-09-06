@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/phrocker/shoal-oss/accumulo"
+	"github.com/phrocker/shoal-oss/internal/embeddingspace"
 	"github.com/phrocker/shoal-oss/internal/iterrt"
 	"github.com/phrocker/shoal-oss/internal/shoalql"
 	"github.com/phrocker/shoal-oss/internal/vectorindex"
@@ -114,7 +115,6 @@ func (b *Backend) BackendInfo() shoalql.BackendInfo {
 	capabilities := []shoalql.Capability{
 		shoalql.CapabilityRangeScan,
 		shoalql.CapabilityColumnFamilyFilter,
-		shoalql.CapabilityExactVectorKNN,
 		shoalql.CapabilityRowLookup,
 		shoalql.CapabilityGraphNeighbors,
 		shoalql.CapabilityDocumentIndex,
@@ -134,15 +134,13 @@ func (b *Backend) BackendInfo() shoalql.BackendInfo {
 		},
 		FallbackReasons: []string{
 			"distributed IVF-PQ build, freshness, and routing lifecycle is unavailable; approximate vector search is unsupported",
-			"exact vector search materializes all visible candidates before global top-k selection",
+			"exact vector search is refused until metadata-table per-file embedding states are supplied to planning",
 		},
 		OrderingAssumptions: []string{
 			"tablet results are globally key-sorted before fallback execution",
-			"exact top-k is score-descending with full-key ascending tie-break",
 		},
 		FallbackIterators: []string{
 			iterrt.IterGraphAggregation,
-			iterrt.IterVectorKNN,
 			iterrt.IterDocumentIndex,
 		},
 	}
@@ -209,6 +207,12 @@ func (b *Backend) Scan(
 ) (shoalql.RowStream, error) {
 	if hasIterator(req.Stack, iterrt.IterAsOf) && !b.opts.HistoricalVersions {
 		return nil, ErrHistoricalVersionsUnavailable
+	}
+	if hasIterator(req.Stack, iterrt.IterVectorKNN) {
+		return nil, fmt.Errorf(
+			"%w: Accumulo exact vector scans require the metadata-table file-state snapshot",
+			embeddingspace.ErrQueryMetadataMissing,
+		)
 	}
 	ctx, cancel := b.withTimeout(ctx)
 	defer cancel()

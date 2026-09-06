@@ -26,6 +26,9 @@ import (
 	"math"
 	"sort"
 	"strconv"
+	"strings"
+
+	"github.com/phrocker/shoal-oss/internal/embeddingspace"
 )
 
 // VectorKNNIterator is the brute-force vector k-NN pushdown iterator described
@@ -45,6 +48,7 @@ import (
 // embedding schema is the consumer's, supplied via options:
 //
 //	query.b64    base64 of the query vector, packed big-endian float32
+//	embeddingSpace stable identity of the model space that produced the query
 //	topK         number of nearest cells to return (k); default 10
 //	embeddingCF  optional column family holding embedding cells; empty means
 //	             every cell in range is treated as an embedding
@@ -66,6 +70,7 @@ type VectorKNNIterator struct {
 
 	query       []float32
 	queryNorm   float32 // precomputed |query| for cosine
+	querySpace  string
 	topK        int
 	embeddingCF []byte // nil/empty = any cf
 	metric      string
@@ -81,6 +86,10 @@ const (
 	// VectorKNNQuery is the base64-encoded query vector (packed big-endian
 	// float32, length dim*4).
 	VectorKNNQuery = "query.b64"
+	// VectorKNNEmbeddingSpace is the stable identity of the model space that
+	// produced query. Identity-aware planners supply it even when dimensions
+	// happen to match; storage backends use it to validate per-file metadata.
+	VectorKNNEmbeddingSpace = "embeddingSpace"
 	// VectorKNNTopK is the number of nearest cells to return (k); default 10.
 	VectorKNNTopK = "topK"
 	// VectorKNNEmbeddingCF optionally restricts which column family is treated
@@ -127,6 +136,13 @@ func (v *VectorKNNIterator) Init(source SortedKeyValueIterator, options map[stri
 		return fmt.Errorf("iterrt: VectorKNNIterator %s is empty", VectorKNNQuery)
 	}
 	v.queryNorm = knnNorm(v.query)
+	v.querySpace = strings.TrimSpace(options[VectorKNNEmbeddingSpace])
+	if v.querySpace != "" {
+		if err := embeddingspace.ValidateQueryStates(
+			"initialize exact vector iterator", v.querySpace); err != nil {
+			return fmt.Errorf("iterrt: VectorKNNIterator: %w", err)
+		}
+	}
 
 	v.topK = 10
 	if s, ok := options[VectorKNNTopK]; ok && s != "" {
@@ -269,6 +285,7 @@ func (v *VectorKNNIterator) DeepCopy(env IteratorEnvironment) SortedKeyValueIter
 		source:      v.source.DeepCopy(env),
 		query:       v.query,
 		queryNorm:   v.queryNorm,
+		querySpace:  v.querySpace,
 		topK:        v.topK,
 		embeddingCF: v.embeddingCF,
 		metric:      v.metric,

@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/binary"
+	"errors"
 	"math"
 	"testing"
 
+	"github.com/phrocker/shoal-oss/internal/embeddingspace"
 	"github.com/phrocker/shoal-oss/internal/graphschema"
 	"github.com/phrocker/shoal-oss/internal/iterrt"
 )
@@ -166,7 +168,9 @@ func TestPlan_GroupByUnsupportedColumn(t *testing.T) {
 }
 
 func TestPlan_VectorKNNLiteral(t *testing.T) {
-	p := planFor(t, "SELECT id, content FROM events ORDER BY embedding <-> [1, 0, -1] LIMIT 5", PlanOptions{})
+	p := planFor(t, "SELECT id, content FROM events ORDER BY embedding <-> [1, 0, -1] LIMIT 5", PlanOptions{
+		Vector: VectorOptions{EmbeddingSpace: "space-a"},
+	})
 	if p.Shape != ShapeVectorKNN {
 		t.Fatalf("shape = %v", p.Shape)
 	}
@@ -188,6 +192,9 @@ func TestPlan_VectorKNNLiteral(t *testing.T) {
 	if knn.Options[iterrt.VectorKNNEmbeddingCF] != string(graphschema.VectorCF()) {
 		t.Errorf("embeddingCF = %q", knn.Options[iterrt.VectorKNNEmbeddingCF])
 	}
+	if knn.Options[iterrt.VectorKNNEmbeddingSpace] != "space-a" {
+		t.Errorf("embeddingSpace = %q", knn.Options[iterrt.VectorKNNEmbeddingSpace])
+	}
 	// verify packed query vector round-trips
 	raw, err := base64.StdEncoding.DecodeString(knn.Options[iterrt.VectorKNNQuery])
 	if err != nil {
@@ -206,7 +213,10 @@ func TestPlan_VectorKNNLiteral(t *testing.T) {
 }
 
 func TestPlan_VectorKNNParam(t *testing.T) {
-	opts := PlanOptions{Params: map[string][]float32{"q": {0.5, 0.5}}}
+	opts := PlanOptions{
+		Params: map[string][]float32{"q": {0.5, 0.5}},
+		Vector: VectorOptions{EmbeddingSpace: "space-a"},
+	}
 	p := planFor(t, "SELECT id FROM events ORDER BY vec <-> :q LIMIT 3", opts)
 	if p.Shape != ShapeVectorKNN {
 		t.Fatalf("shape = %v", p.Shape)
@@ -229,10 +239,23 @@ type fakeEmbedder struct{ v []float32 }
 func (f fakeEmbedder) Embed(_ context.Context, _ string) ([]float32, error) { return f.v, nil }
 
 func TestPlan_VectorKNNTextWithEmbedder(t *testing.T) {
-	opts := PlanOptions{Embedder: fakeEmbedder{v: []float32{1, 2, 3}}}
+	opts := PlanOptions{
+		Embedder: fakeEmbedder{v: []float32{1, 2, 3}},
+		Vector:   VectorOptions{EmbeddingSpace: "space-a"},
+	}
 	p := planFor(t, "SELECT id FROM events ORDER BY embedding <-> 'hello' LIMIT 3", opts)
 	if p.Shape != ShapeVectorKNN {
 		t.Fatalf("shape = %v", p.Shape)
+	}
+}
+
+func TestPlan_VectorKNNRequiresEmbeddingIdentity(t *testing.T) {
+	st, _ := Parse("SELECT id FROM events ORDER BY embedding <-> [1,0] LIMIT 3")
+	b, _ := NewGraphCatalog("graph").Binding("events")
+	if _, err := PlanQuery(
+		context.Background(), st, b, PlanOptions{},
+	); !errors.Is(err, embeddingspace.ErrQueryIdentityRequired) {
+		t.Fatalf("error = %v, want ErrQueryIdentityRequired", err)
 	}
 }
 

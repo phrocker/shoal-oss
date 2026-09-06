@@ -298,7 +298,7 @@ var (
 				Name:           IterVectorKNN,
 				Contexts:       []CapabilityContext{ContextScan},
 				ActiveContexts: []CapabilityContext{ContextScan},
-				OptionKeys:     []string{VectorKNNQuery, VectorKNNTopK, VectorKNNEmbeddingCF, VectorKNNMetric, VectorKNNMinScore},
+				OptionKeys:     []string{VectorKNNQuery, VectorKNNEmbeddingSpace, VectorKNNTopK, VectorKNNEmbeddingCF, VectorKNNMetric, VectorKNNMinScore},
 			},
 			new: func() SortedKeyValueIterator { return NewVectorKNNIterator() },
 		},

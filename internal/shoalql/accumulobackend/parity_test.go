@@ -16,6 +16,7 @@ import (
 	"github.com/phrocker/shoal-oss/accumulo"
 	"github.com/phrocker/shoal-oss/internal/cclient"
 	"github.com/phrocker/shoal-oss/internal/documentschema"
+	"github.com/phrocker/shoal-oss/internal/embeddingspace"
 	"github.com/phrocker/shoal-oss/internal/engine"
 	"github.com/phrocker/shoal-oss/internal/graphschema"
 	"github.com/phrocker/shoal-oss/internal/iterrt"
@@ -283,7 +284,11 @@ func runQuery(
 	if !ok {
 		t.Fatalf("missing binding for %s", stmt.Table)
 	}
-	plan, err := shoalql.PlanQuery(context.Background(), stmt, binding, shoalql.PlanOptions{})
+	plan, err := shoalql.PlanQuery(
+		context.Background(), stmt, binding,
+		shoalql.PlanOptions{Vector: shoalql.VectorOptions{
+			EmbeddingSpace: "test-provider:test-model-v1:2:l2",
+		}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -300,10 +305,8 @@ func TestCrossBackendCorpusParity(t *testing.T) {
 		"SELECT id, content FROM events",
 		"SELECT id FROM events WHERE id >= '0002'",
 		"SELECT id FROM events WHERE MATCH(content, 'timeout retry')",
-		"SELECT id, content FROM events ORDER BY embedding <-> [1,0] LIMIT 2",
 		"SELECT expand(id, 'semantic') FROM events WHERE id = '0001'",
 		"SELECT id, content FROM events AS OF 150 WHERE id = '0004'",
-		"SELECT id, content FROM events AS OF 150 WHERE id = '0004' ORDER BY embedding <-> [1,0] LIMIT 1",
 		"SELECT expand(id, 'semantic') FROM events AS OF 150 WHERE id = '0001'",
 	}
 	documentQueries := []string{
@@ -350,49 +353,42 @@ func TestCrossBackendCorpusParity(t *testing.T) {
 	if fmt.Sprint(distributed) != fmt.Sprint(baseline) {
 		t.Fatalf("Accumulo replay differs\nlocal=%v\naccumulo=%v", baseline, distributed)
 	}
-	if !strings.Contains(distributed[4], "0002") || !strings.Contains(distributed[4], "0003") {
-		t.Fatalf("graph traversal corpus did not exercise neighbors: %s", distributed[4])
+	if !strings.Contains(distributed[3], "0002") || !strings.Contains(distributed[3], "0003") {
+		t.Fatalf("graph traversal corpus did not exercise neighbors: %s", distributed[3])
 	}
 	if len(replay.scans) == 0 || replay.scans[0].BatchSize != 2 {
 		t.Fatalf("scanner pagination options not propagated: %+v", replay.scans)
 	}
 }
 
-func TestVisibilityDeleteAndDeterministicTopK(t *testing.T) {
+func TestAccumuloExactVectorFailsWithoutPerFileMetadata(t *testing.T) {
 	cells := buildCorpus()
-	public := func(id string, score float32, visibility string) {
-		row := graphschema.EventRowPrefix + id
-		cells = append(cells,
-			corpusCell{"graph", accumulo.NewKeyWithColumns([]byte(row), graphschema.ContentCF(), nil, []byte(visibility), 300), []byte(id)},
-			corpusCell{"graph", accumulo.NewKeyWithColumns([]byte(row), graphschema.VectorCF(), nil, []byte(visibility), 300), packedVector(score, 0)},
-		)
-	}
-	public("tie-a", 1, "A")
-	public("tie-b", 1, "B")
-	deleted := accumulo.NewKeyWithColumns([]byte(graphschema.EventRowPrefix+"0002"),
-		graphschema.ContentCF(), nil, nil, 400)
-	deleted.Deleted = true
-	cells = append(cells, corpusCell{"graph", deleted, nil})
-	sort.SliceStable(cells, func(i, j int) bool {
-		if cells[i].table != cells[j].table {
-			return cells[i].table < cells[j].table
-		}
-		return cells[i].key.Compare(cells[j].key) < 0
-	})
 	replay := &replayClient{cells: cells}
 	executor := shoalql.NewExecutor(accumulobackend.New(replay, accumulobackend.Options{
 		Authorizations: [][]byte{[]byte("A")},
 		BatchSize:      1,
 	}))
-	got := runQuery(t, executor, shoalql.NewGraphCatalog("graph"),
+	stmt, err := shoalql.Parse(
 		"SELECT id FROM events ORDER BY embedding <-> [1,0] LIMIT 2")
-	if !strings.Contains(got, "tie-a") || strings.Contains(got, "tie-b") {
-		t.Fatalf("visibility/top-k result = %s", got)
+	if err != nil {
+		t.Fatal(err)
 	}
-	deletedResult := runQuery(t, executor, shoalql.NewGraphCatalog("graph"),
-		"SELECT id, content FROM events WHERE id = '0002'")
-	if strings.Contains(deletedResult, "everything was fine") {
-		t.Fatalf("delete marker did not suppress older value: %s", deletedResult)
+	binding, _ := shoalql.NewGraphCatalog("graph").Binding("events")
+	plan, err := shoalql.PlanQuery(
+		context.Background(), stmt, binding,
+		shoalql.PlanOptions{Vector: shoalql.VectorOptions{
+			EmbeddingSpace: "test-provider:test-model-v1:2:l2",
+		}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := executor.Run(
+		context.Background(), plan,
+	); !errors.Is(err, embeddingspace.ErrQueryMetadataMissing) {
+		t.Fatalf("error = %v, want ErrQueryMetadataMissing", err)
+	}
+	if len(replay.scans) != 0 {
+		t.Fatalf("unsafe exact vector query reached scanner: %+v", replay.scans)
 	}
 }
 
@@ -454,7 +450,11 @@ func TestExplainDeclaresExactFallbackAndApproximateUnsupported(t *testing.T) {
 	}
 
 	binding, _ := shoalql.NewGraphCatalog("graph").Binding("events")
-	plan, err := shoalql.PlanQuery(context.Background(), stmt, binding, shoalql.PlanOptions{})
+	plan, err := shoalql.PlanQuery(
+		context.Background(), stmt, binding,
+		shoalql.PlanOptions{Vector: shoalql.VectorOptions{
+			EmbeddingSpace: "test-provider:test-model-v1:2:l2",
+		}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -468,9 +468,10 @@ func TestExplainDeclaresExactFallbackAndApproximateUnsupported(t *testing.T) {
 		`"mode":"distributed"`,
 		`"approximate_vector_index"`,
 		`distributed IVF-PQ build, freshness, and routing lifecycle is unavailable`,
-		`exact vector search materializes all visible candidates`,
+		`exact vector search is refused until metadata-table per-file embedding states are supplied`,
 		`globally key-sorted`,
-		`local iterator fallback: exact vector KNN`,
+		`exact vector execution is refused because the backend cannot prove per-file embedding identity`,
+		`"vector_embedding_space":"test-provider:test-model-v1:2:l2"`,
 	} {
 		if !strings.Contains(explain, want) {
 			t.Fatalf("EXPLAIN missing %q: %s", want, explain)

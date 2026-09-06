@@ -8,6 +8,7 @@ import (
 	"math"
 	"strings"
 
+	"github.com/phrocker/shoal-oss/internal/embeddingspace"
 	"github.com/phrocker/shoal-oss/internal/iterrt"
 	"github.com/phrocker/shoal-oss/internal/vectorindex"
 )
@@ -43,8 +44,11 @@ const (
 )
 
 type VectorOptions struct {
-	Mode           VectorMode
-	Index          string
+	Mode  VectorMode
+	Index string
+	// EmbeddingSpace is the stable identity of the model space that produced
+	// a supplied query vector. It is mandatory for exact and approximate
+	// execution; dimensionality alone is never treated as identity.
 	EmbeddingSpace string
 	NProbe         int
 	Freshness      vectorindex.Freshness
@@ -346,6 +350,11 @@ func planDocument(ctx context.Context, stmt *SelectStmt, dm documentModel, opts 
 		if err != nil {
 			return nil, err
 		}
+		embeddingSpace := strings.TrimSpace(opts.Vector.EmbeddingSpace)
+		if err := embeddingspace.ValidateQueryStates(
+			"plan approximate vector query", embeddingSpace); err != nil {
+			return nil, err
+		}
 		topK := 10
 		if p.Limit != nil && *p.Limit > 0 {
 			topK = *p.Limit
@@ -356,7 +365,7 @@ func planDocument(ctx context.Context, stmt *SelectStmt, dm documentModel, opts 
 			p.VectorIndex = opts.Vector.Index
 		}
 		p.VectorQuery = append([]float32(nil), vec...)
-		p.VectorEmbeddingSpace = opts.Vector.EmbeddingSpace
+		p.VectorEmbeddingSpace = embeddingSpace
 		p.VectorTopK = topK
 		p.VectorNProbe = opts.Vector.NProbe
 		p.VectorFreshness = opts.Vector.Freshness
@@ -428,14 +437,20 @@ func planVectorKNN(ctx context.Context, stmt *SelectStmt, binding TableBinding, 
 	if err != nil {
 		return nil, err
 	}
+	embeddingSpace := strings.TrimSpace(opts.Vector.EmbeddingSpace)
+	if err := embeddingspace.ValidateQueryStates(
+		"plan exact vector query", embeddingSpace); err != nil {
+		return nil, err
+	}
 	topK := 10
 	if p.Limit != nil && *p.Limit > 0 {
 		topK = *p.Limit
 	}
 	opt := map[string]string{
-		iterrt.VectorKNNQuery:  packVecBE(vec),
-		iterrt.VectorKNNTopK:   fmt.Sprintf("%d", topK),
-		iterrt.VectorKNNMetric: "cosine",
+		iterrt.VectorKNNQuery:          packVecBE(vec),
+		iterrt.VectorKNNEmbeddingSpace: embeddingSpace,
+		iterrt.VectorKNNTopK:           fmt.Sprintf("%d", topK),
+		iterrt.VectorKNNMetric:         "cosine",
 	}
 	if len(col.CF) > 0 {
 		opt[iterrt.VectorKNNEmbeddingCF] = string(col.CF)
@@ -453,7 +468,7 @@ func planVectorKNN(ctx context.Context, stmt *SelectStmt, binding TableBinding, 
 		p.VectorIndex = p.Table + "_ivf"
 	}
 	p.VectorQuery = append([]float32(nil), vec...)
-	p.VectorEmbeddingSpace = opts.Vector.EmbeddingSpace
+	p.VectorEmbeddingSpace = embeddingSpace
 	p.VectorTopK = topK
 	p.VectorNProbe = opts.Vector.NProbe
 	p.VectorFreshness = opts.Vector.Freshness

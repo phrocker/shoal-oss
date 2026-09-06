@@ -49,6 +49,24 @@ when two models have the same dimensions. A legacy manifest without an identity
 fails closed rather than treating dimension as identity. Recall evidence is
 therefore evidence for the manifest's one recorded space, not a global claim.
 
+Exact ShoalQL vectors require `PlanOptions.Vector.EmbeddingSpace`; the
+`shoal-sql` CLI exposes the same value as `-embedding-space`. The planner
+threads it into the `vectorKNN` iterator as `embeddingSpace`, and the embedded
+engine checks every participating RFile/Parquet footer before scanning.
+`unknown`, `no_embeddings`, unflushed cells, and same-dimension files from a
+different model all fail with typed embedding-space errors. Because one raw
+vector has only one identity, mixed-space exact scans are rejected rather than
+rank-fused or compared by raw score. Callers that need mixed-space retrieval
+must supply text to the multi-provider Explorer path so it can embed once per
+space.
+
+Embedded-engine writers declare the actual state for future files through
+`engine.TableOptions.DefaultEmbedding` or
+`Engine.SetTableDefaultEmbedding`. Changing it is refused while any tablet has
+unflushed cells, preventing a new setting from relabelling writes accepted
+under the old setting. This actual-state setting is deliberately separate from
+the table's desired convergence target.
+
 If any requirement fails, search returns `ErrStale`, or
 `ErrExactFallback` only when exact fallback was explicitly enabled. ShoalQL
 then runs its existing exhaustive vector iterator for graph rows. Document

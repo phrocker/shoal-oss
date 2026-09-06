@@ -38,6 +38,7 @@ package engine
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -49,6 +50,7 @@ import (
 	"time"
 
 	"github.com/phrocker/shoal-oss/internal/cclient"
+	"github.com/phrocker/shoal-oss/internal/embeddingspace"
 	"github.com/phrocker/shoal-oss/internal/iterrt"
 	"github.com/phrocker/shoal-oss/internal/localwal"
 	"github.com/phrocker/shoal-oss/internal/rfile/wire"
@@ -339,6 +341,81 @@ func (e *Engine) TableTargetEmbeddingSpace(tableName string) (string, error) {
 		return "", fmt.Errorf("engine: table %q not found", tableName)
 	}
 	return tbl.targetEmbedding(), nil
+}
+
+// SetTableDefaultEmbedding changes the actual embedding state stamped on
+// future immutable files. It does not relabel existing files.
+func (e *Engine) SetTableDefaultEmbedding(
+	tableName string, state embeddingspace.FileState,
+) error {
+	e.mu.RLock()
+	tbl, ok := e.tables[tableName]
+	e.mu.RUnlock()
+	if !ok {
+		return fmt.Errorf("engine: table %q not found", tableName)
+	}
+	return tbl.setDefaultEmbedding(state)
+}
+
+// EmbeddingStateSnapshot reports the immutable file states that an exact
+// vector scan would span, plus cells still resident in unlabelled memtables.
+type EmbeddingStateSnapshot struct {
+	Files            []tablet.EmbeddingFileState
+	UnflushedCells   int
+	DefaultEmbedding embeddingspace.FileState
+}
+
+// TableEmbeddingStateSnapshot obtains a deterministic per-file snapshot
+// without scanning file bodies.
+func (e *Engine) TableEmbeddingStateSnapshot(
+	ctx context.Context, tableName string,
+) (EmbeddingStateSnapshot, error) {
+	e.mu.RLock()
+	tbl, ok := e.tables[tableName]
+	e.mu.RUnlock()
+	if !ok {
+		return EmbeddingStateSnapshot{}, fmt.Errorf(
+			"engine: table %q not found", tableName)
+	}
+	files, unflushed, defaultEmbedding, err := tbl.embeddingStateSnapshot(ctx)
+	if err != nil {
+		return EmbeddingStateSnapshot{}, err
+	}
+	return EmbeddingStateSnapshot{
+		Files: files, UnflushedCells: unflushed,
+		DefaultEmbedding: defaultEmbedding,
+	}, nil
+}
+
+// ValidateExactVectorSpace fails closed unless one raw query vector can be
+// compared with every immutable file in the scan snapshot.
+func (e *Engine) ValidateExactVectorSpace(
+	ctx context.Context, tableName, queryIdentity string,
+) error {
+	snapshot, err := e.TableEmbeddingStateSnapshot(ctx, tableName)
+	if err != nil {
+		return err
+	}
+	if err := embeddingspace.ValidateQueryStates(
+		"exact vector query", queryIdentity); err != nil {
+		return err
+	}
+	if snapshot.UnflushedCells > 0 {
+		if err := embeddingspace.ValidateQueryStates(
+			"exact vector query over unflushed cells",
+			queryIdentity,
+			snapshot.DefaultEmbedding,
+		); err != nil {
+			return err
+		}
+	}
+	for _, file := range snapshot.Files {
+		if err := embeddingspace.ValidateQueryStates(
+			"exact vector query", queryIdentity, file.State); err != nil {
+			return fmt.Errorf("%w: file %q", err, file.Path)
+		}
+	}
+	return nil
 }
 
 // MigrateTableStorageFormat atomically selects the write format, flushes, and
@@ -632,3 +709,9 @@ var (
 	_ = wire.Key{}
 	_ = bytes.Compare
 )
+
+// ErrEmbeddingStateChangeWithUnflushedData prevents relabelling cells that
+// were accepted under one producer state but have not yet acquired per-file
+// metadata.
+var ErrEmbeddingStateChangeWithUnflushedData = errors.New(
+	"engine: cannot change default embedding state with unflushed data")

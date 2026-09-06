@@ -4,7 +4,15 @@
 // The ASF licenses this file to you under the Apache License, Version 2.0.
 package engine
 
-import "testing"
+import (
+	"context"
+	"errors"
+	"testing"
+
+	"github.com/phrocker/shoal-oss/internal/cclient"
+	"github.com/phrocker/shoal-oss/internal/embeddingspace"
+	"github.com/phrocker/shoal-oss/internal/tablet"
+)
 
 func TestTableTargetEmbeddingSpacePersists(t *testing.T) {
 	dir := t.TempDir()
@@ -39,5 +47,106 @@ func TestTableTargetEmbeddingSpacePersists(t *testing.T) {
 	}
 	if got != "space-b" {
 		t.Fatalf("reopened target = %q", got)
+	}
+}
+
+func TestTableDefaultEmbeddingPersistsPerFile(t *testing.T) {
+	for _, format := range []tablet.FileFormat{
+		tablet.FormatRFile,
+		tablet.FormatParquet,
+	} {
+		t.Run(string(format), func(t *testing.T) {
+			dir := t.TempDir()
+			eng, err := Open(dir, Options{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := eng.CreateTable("graph", TableOptions{
+				TabletOptions:    tablet.Options{FileFormat: format},
+				DefaultEmbedding: embeddingspace.Has("space-a"),
+			}); err != nil {
+				t.Fatal(err)
+			}
+			write := func(row string) {
+				mutation, _ := cclient.NewMutation([]byte(row))
+				mutation.PutLatest([]byte("vec"), nil, nil, []byte("value"))
+				if err := eng.Write("graph", []*cclient.Mutation{mutation}); err != nil {
+					t.Fatal(err)
+				}
+				if err := eng.Flush("graph"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			write("a")
+			if err := eng.SetTableDefaultEmbedding(
+				"graph", embeddingspace.Has("space-b")); err != nil {
+				t.Fatal(err)
+			}
+			write("b")
+			if err := eng.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			reopened, err := Open(dir, Options{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer reopened.Close()
+			snapshot, err := reopened.TableEmbeddingStateSnapshot(
+				context.Background(), "graph")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if snapshot.UnflushedCells != 0 || len(snapshot.Files) != 2 {
+				t.Fatalf("snapshot = %+v", snapshot)
+			}
+			got := map[string]int{}
+			for _, file := range snapshot.Files {
+				got[file.State.String()]++
+			}
+			if got[embeddingspace.Has("space-a").String()] != 1 ||
+				got[embeddingspace.Has("space-b").String()] != 1 ||
+				len(got) != 2 {
+				t.Fatalf("states = %v", got)
+			}
+		})
+	}
+}
+
+func TestValidateExactVectorSpaceFailsClosed(t *testing.T) {
+	eng, err := Open(t.TempDir(), Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close()
+	if err := eng.CreateTable("graph", TableOptions{
+		DefaultEmbedding: embeddingspace.Has("space-a"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	mutation, _ := cclient.NewMutation([]byte("a"))
+	mutation.PutLatest([]byte("vec"), nil, nil, []byte("value"))
+	if err := eng.Write("graph", []*cclient.Mutation{mutation}); err != nil {
+		t.Fatal(err)
+	}
+	if err := eng.SetTableDefaultEmbedding(
+		"graph", embeddingspace.Has("space-b"),
+	); !errors.Is(err, ErrEmbeddingStateChangeWithUnflushedData) {
+		t.Fatalf(
+			"default change error = %v, want ErrEmbeddingStateChangeWithUnflushedData",
+			err)
+	}
+	if err := eng.ValidateExactVectorSpace(
+		context.Background(), "graph", "space-a",
+	); err != nil {
+		t.Fatalf("known unflushed state rejected: %v", err)
+	}
+	if err := eng.Flush("graph"); err != nil {
+		t.Fatal(err)
+	}
+	if err := eng.ValidateExactVectorSpace(
+		context.Background(), "graph", "space-b",
+	); !errors.Is(err, embeddingspace.ErrMismatch) {
+		t.Fatalf("mismatch error = %v, want ErrMismatch", err)
 	}
 }

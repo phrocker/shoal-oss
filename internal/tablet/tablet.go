@@ -52,11 +52,13 @@ import (
 
 	"github.com/phrocker/shoal-oss/internal/cclient"
 	"github.com/phrocker/shoal-oss/internal/compaction"
+	"github.com/phrocker/shoal-oss/internal/embeddingspace"
 	"github.com/phrocker/shoal-oss/internal/iterrt"
 	"github.com/phrocker/shoal-oss/internal/localwal"
 	"github.com/phrocker/shoal-oss/internal/parquetfile"
 	"github.com/phrocker/shoal-oss/internal/rfile"
 	"github.com/phrocker/shoal-oss/internal/rfile/adjacency"
+	"github.com/phrocker/shoal-oss/internal/rfile/bcfile"
 	"github.com/phrocker/shoal-oss/internal/rfile/bcfile/block"
 	"github.com/phrocker/shoal-oss/internal/rfile/wire"
 	"github.com/phrocker/shoal-oss/internal/storage"
@@ -173,6 +175,10 @@ type Options struct {
 	// The zero value preserves the historical RFile behavior.
 	FileFormat FileFormat
 
+	// DefaultEmbedding is the actual embedding state written into each new
+	// immutable file. The zero value writes no claim and reads as unknown.
+	DefaultEmbedding embeddingspace.FileState
+
 	// OnRFile, when set, is invoked after a flush or compaction writes a new
 	// immutable RFile, with the event kind ("flush" | "compact") and the new
 	// RFile's base name. It enables event-driven shipping (sync as soon as an
@@ -198,6 +204,11 @@ func Open(dir string, opts Options) (*Tablet, error) {
 		return nil, err
 	}
 	opts.FileFormat = format
+	if opts.DefaultEmbedding.State != "" {
+		if err := opts.DefaultEmbedding.Validate(); err != nil {
+			return nil, fmt.Errorf("tablet: invalid default embedding state: %w", err)
+		}
+	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("tablet: mkdir %s: %w", dir, err)
 	}
@@ -873,10 +884,17 @@ func (t *Tablet) flushLocked() error {
 
 func (t *Tablet) encode(iter iterrt.SortedKeyValueIterator) ([]byte, int64, error) {
 	if t.opts.FileFormat == FormatParquet {
-		return parquetfile.Encode(iter)
+		return parquetfile.EncodeWithOptions(
+			iter,
+			parquetfile.EncodeOptions{EmbeddingSpace: t.opts.DefaultEmbedding},
+		)
 	}
 	var buf bytes.Buffer
-	w, err := rfile.NewWriter(&buf, rfile.WriterOptions{Codec: block.CodecSnappy, AdjacencyEdgeCF: t.opts.AdjacencyEdgeCF})
+	w, err := rfile.NewWriter(&buf, rfile.WriterOptions{
+		Codec:           block.CodecSnappy,
+		AdjacencyEdgeCF: t.opts.AdjacencyEdgeCF,
+		EmbeddingSpace:  t.opts.DefaultEmbedding,
+	})
 	if err != nil {
 		return nil, 0, fmt.Errorf("new rfile writer: %w", err)
 	}
@@ -921,6 +939,69 @@ func (t *Tablet) SetFileFormat(format FileFormat) error {
 	t.opts.FileFormat = parsed
 	t.mu.Unlock()
 	return nil
+}
+
+// SetDefaultEmbedding changes the actual embedding state stamped on future
+// flushes. Existing immutable files keep their own self-describing state.
+func (t *Tablet) SetDefaultEmbedding(state embeddingspace.FileState) error {
+	if state.State != "" {
+		if err := state.Validate(); err != nil {
+			return err
+		}
+	}
+	t.mu.Lock()
+	t.opts.DefaultEmbedding = state
+	t.mu.Unlock()
+	return nil
+}
+
+// EmbeddingFileState is one immutable file's footer-level embedding state.
+type EmbeddingFileState struct {
+	Path  string
+	State embeddingspace.FileState
+}
+
+// EmbeddingStateSnapshot reads every immutable file's footer while holding a
+// consistent tablet file-set snapshot. UnflushedCells are reported separately
+// because a memtable has no immutable file metadata and must fail exact vector
+// queries closed.
+func (t *Tablet) EmbeddingStateSnapshot(
+	ctx context.Context,
+) ([]EmbeddingFileState, int, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	out := make([]EmbeddingFileState, 0, len(t.files))
+	for _, path := range t.files {
+		if err := ctx.Err(); err != nil {
+			return nil, 0, err
+		}
+		file, err := t.backend.Open(ctx, path)
+		if err != nil {
+			return nil, 0, fmt.Errorf("tablet: open embedding metadata %s: %w", path, err)
+		}
+		var state embeddingspace.FileState
+		if fileFormat(path) == FormatParquet {
+			state, err = parquetfile.ReadEmbeddingSpaceMetadata(file, file.Size())
+		} else {
+			var bc *bcfile.Reader
+			bc, err = bcfile.NewReader(file, file.Size())
+			if err == nil {
+				state, err = rfile.ReadEmbeddingSpaceMetadata(bc, block.Default())
+			}
+		}
+		closeErr := file.Close()
+		if err != nil {
+			return nil, 0, fmt.Errorf("tablet: read embedding metadata %s: %w", path, err)
+		}
+		if closeErr != nil {
+			return nil, 0, fmt.Errorf("tablet: close embedding metadata %s: %w", path, closeErr)
+		}
+		out = append(out, EmbeddingFileState{Path: path, State: state})
+	}
+	return out, t.active.Len(), nil
 }
 
 // ingestMutation inserts a mutation's cells into the active memtable.
