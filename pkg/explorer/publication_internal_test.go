@@ -20,7 +20,9 @@
 package explorer
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"os"
 	"strings"
 	"testing"
@@ -30,7 +32,8 @@ import (
 )
 
 type rejectingPublicationAdapter struct {
-	published bool
+	published         bool
+	committedRequests []RecordPublication
 }
 
 func (a *rejectingPublicationAdapter) PublishRecord(
@@ -41,10 +44,11 @@ func (a *rejectingPublicationAdapter) PublishRecord(
 	return RecordPublicationResult{}, nil
 }
 
-func (*rejectingPublicationAdapter) RecordCommitted(
-	context.Context,
-	RecordPublication,
+func (a *rejectingPublicationAdapter) RecordCommitted(
+	_ context.Context,
+	request RecordPublication,
 ) (bool, error) {
+	a.committedRequests = append(a.committedRequests, request)
 	return false, nil
 }
 
@@ -106,6 +110,55 @@ func TestConfiguredPublicationRejectsOversizedDocumentWithoutDirectWrite(t *test
 	defer unconfigured.Close()
 	if _, err := unconfigured.Ingest(context.Background(), source); err != nil {
 		t.Fatalf("legacy unconfigured oversized ingest = %v", err)
+	}
+}
+
+func TestLegacyDocumentRecordRequiresPublicationProof(t *testing.T) {
+	source := Source{
+		URI:       "file:///legacy.txt",
+		MediaType: MediaTypeText,
+		Content:   "legacy",
+	}
+	parsed, err := parseSource(source, time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	record := persistedDocument{
+		Document:    parsed.document,
+		Revision:    parsed.revision,
+		Source:      parsed.source,
+		Sections:    parsed.sections,
+		Spans:       parsed.spans,
+		Nodes:       parsed.nodes,
+		Edges:       parsed.edges,
+		PublishedAt: time.Now().UTC(),
+	}
+	encoded, err := json.Marshal(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	adapter := &rejectingPublicationAdapter{}
+	corpus := &Explorer{
+		publication: adapter,
+		documents:   make(map[shoal.ID]map[shoal.ID]*persistedDocument),
+	}
+	row := documentRecordRow(record.Document.ID, record.Revision.ID)
+	if err := corpus.loadDocumentRecord(
+		row,
+		[]byte(recordCQV1),
+		encoded,
+		make(map[documentRevisionKey]byte),
+		make(map[uint64]documentRevisionKey),
+	); err != nil {
+		t.Fatal(err)
+	}
+	if len(adapter.committedRequests) != 1 ||
+		!bytes.Equal(adapter.committedRequests[0].Qualifier, []byte(recordCQV1)) ||
+		!bytes.Equal(adapter.committedRequests[0].Value, encoded) {
+		t.Fatalf("legacy commit probes = %#v", adapter.committedRequests)
+	}
+	if len(corpus.documents) != 0 {
+		t.Fatal("uncommitted legacy document was loaded")
 	}
 }
 

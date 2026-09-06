@@ -44,6 +44,12 @@ var (
 	legacyMarkerQualifier = []byte("legacy")
 )
 
+type legacyDocumentRecord struct {
+	row       []byte
+	qualifier []byte
+	value     []byte
+}
+
 func (r *Runtime) enableExplorerLegacyCompatibility(ctx context.Context) error {
 	store, err := NewEngineStore(r.engine, explorer.EmbeddedTableName)
 	if err != nil {
@@ -72,7 +78,7 @@ func (r *Runtime) enableExplorerLegacyCompatibility(ctx context.Context) error {
 
 	var cursor []byte
 	for page := 0; page < r.recoveryPages; page++ {
-		rows, next, err := r.scanLegacyDocumentRows(
+		records, next, err := r.scanLegacyDocumentRows(
 			ctx,
 			cursor,
 			legacyMigrationPageSize,
@@ -80,12 +86,16 @@ func (r *Runtime) enableExplorerLegacyCompatibility(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		for _, row := range rows {
+		for _, record := range records {
 			if err := putAbsentOrIdenticalMarker(
 				ctx,
 				store,
-				legacyRecordCoordinate(row),
-				row,
+				legacyRecordCoordinate(record.row, record.qualifier),
+				legacyRecordMarkerValue(
+					record.row,
+					record.qualifier,
+					record.value,
+				),
 			); err != nil {
 				return err
 			}
@@ -116,14 +126,20 @@ func (r *Runtime) legacyRecordAllowed(
 ) (bool, error) {
 	if r.legacyRecords == nil ||
 		request.Table != explorer.EmbeddedTableName ||
-		len(request.Row) == 0 {
+		len(request.Row) == 0 ||
+		(!bytes.Equal(request.Qualifier, []byte("v1")) &&
+			!bytes.Equal(request.Qualifier, []byte("v2"))) {
 		return false, nil
 	}
 	return exactMarker(
 		ctx,
 		r.legacyRecords,
-		legacyRecordCoordinate(request.Row),
-		request.Row,
+		legacyRecordCoordinate(request.Row, request.Qualifier),
+		legacyRecordMarkerValue(
+			request.Row,
+			request.Qualifier,
+			request.Value,
+		),
 	)
 }
 
@@ -131,7 +147,7 @@ func (r *Runtime) scanLegacyDocumentRows(
 	ctx context.Context,
 	start []byte,
 	limit int,
-) ([][]byte, []byte, error) {
+) ([]legacyDocumentRecord, []byte, error) {
 	prefix := []byte("document/")
 	if len(start) == 0 {
 		start = prefix
@@ -168,15 +184,14 @@ func (r *Runtime) scanLegacyDocumentRows(
 	}
 	defer scanner.Close()
 
-	rows := make([][]byte, 0, limit)
+	records := make([]legacyDocumentRecord, 0, limit)
 	var current []byte
-	liveV2 := false
+	var currentRecords []legacyDocumentRecord
+	seenV1 := false
 	seenV2 := false
 	rowsInspected := 0
 	finish := func() {
-		if liveV2 {
-			rows = append(rows, append([]byte(nil), current...))
-		}
+		records = append(records, currentRecords...)
 	}
 	for scanner.Next() {
 		if err := ctx.Err(); err != nil {
@@ -188,18 +203,31 @@ func (r *Runtime) scanLegacyDocumentRows(
 				finish()
 			}
 			if rowsInspected == limit {
-				return rows, append(append([]byte(nil), current...), 0), nil
+				return records, append(append([]byte(nil), current...), 0), nil
 			}
 			current = append(current[:0], key.Row...)
 			rowsInspected++
-			liveV2 = false
+			currentRecords = currentRecords[:0]
+			seenV1 = false
 			seenV2 = false
 		}
-		if !seenV2 &&
-			bytes.Equal(key.ColumnQualifier, []byte("v2")) &&
-			len(key.ColumnVisibility) == 0 {
-			seenV2 = true
-			liveV2 = !key.Deleted
+		if len(key.ColumnVisibility) == 0 {
+			qualifier := string(key.ColumnQualifier)
+			first := (qualifier == "v1" && !seenV1) ||
+				(qualifier == "v2" && !seenV2)
+			if qualifier == "v1" {
+				seenV1 = true
+			}
+			if qualifier == "v2" {
+				seenV2 = true
+			}
+			if first && !key.Deleted {
+				currentRecords = append(currentRecords, legacyDocumentRecord{
+					row:       append([]byte(nil), key.Row...),
+					qualifier: append([]byte(nil), key.ColumnQualifier...),
+					value:     append([]byte(nil), scanner.Value()...),
+				})
+			}
 		}
 		if err := scanner.Advance(); err != nil {
 			return nil, nil, err
@@ -208,7 +236,7 @@ func (r *Runtime) scanLegacyDocumentRows(
 	if len(current) != 0 {
 		finish()
 	}
-	return rows, nil, nil
+	return records, nil, nil
 }
 
 func (r *Runtime) legacyMigrationCoordinate() allocator.Coordinate {
@@ -225,16 +253,27 @@ func (r *Runtime) legacyMigrationValue() []byte {
 	return value
 }
 
-func legacyRecordCoordinate(row []byte) allocator.Coordinate {
-	digest := sha256.Sum256(row)
+func legacyRecordCoordinate(row, qualifier []byte) allocator.Coordinate {
+	hash := sha256.New()
+	writeDigestPart(hash, row)
+	writeDigestPart(hash, qualifier)
 	markerRow := append([]byte(nil), legacyMarkerRowPrefix...)
-	markerRow = append(markerRow, digest[:]...)
+	markerRow = append(markerRow, hash.Sum(nil)...)
 	return allocator.Coordinate{
 		Row:        markerRow,
 		Family:     append([]byte(nil), legacyMarkerFamily...),
 		Qualifier:  append([]byte(nil), legacyMarkerQualifier...),
 		Visibility: nil,
 	}
+}
+
+func legacyRecordMarkerValue(row, qualifier, value []byte) []byte {
+	hash := sha256.New()
+	writeDigestPart(hash, []byte("shoal-explorer-legacy-record-v1"))
+	writeDigestPart(hash, row)
+	writeDigestPart(hash, qualifier)
+	writeDigestPart(hash, value)
+	return hash.Sum(nil)
 }
 
 func exactMarker(

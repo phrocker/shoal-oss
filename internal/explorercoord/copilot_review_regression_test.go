@@ -888,6 +888,88 @@ func TestExplorerLegacyMigrationDoesNotGrandfatherTransactionalResidue(t *testin
 	}
 }
 
+func TestExplorerLegacyMigrationMarksV1RecordsExactly(t *testing.T) {
+	config := testRuntimeConfig(t, testDirectory(t))
+	config.PhysicalTables = append(config.PhysicalTables, explorer.EmbeddedTableName)
+	runtime, err := Open(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.Close()
+	legacyRow := []byte("document/legacy/revision")
+	legacyValue := []byte(`{"legacy":true}`)
+	legacyMutation, err := cclient.NewMutation(legacyRow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyMutation.PutLatest(
+		[]byte("record"),
+		[]byte("v1"),
+		nil,
+		legacyValue,
+	)
+	if err := runtime.engine.Write(
+		explorer.EmbeddedTableName,
+		[]*cclient.Mutation{legacyMutation},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.enableExplorerLegacyCompatibility(
+		context.Background(),
+	); err != nil {
+		t.Fatal(err)
+	}
+	allowed, err := runtime.RecordCommitted(
+		context.Background(),
+		explorer.RecordPublication{
+			Operation: []byte("explorer-document-record-v1"),
+			RecordKey: documentTestRecordKey(legacyRow),
+			Table:     explorer.EmbeddedTableName,
+			Row:       legacyRow,
+			Family:    []byte("record"),
+			Qualifier: []byte("v1"),
+			Value:     legacyValue,
+		},
+	)
+	if err != nil || !allowed {
+		t.Fatalf("grandfathered v1 record = %v, %v", allowed, err)
+	}
+
+	residueRow := []byte("document/residue/revision")
+	residueValue := []byte(`{"residue":true}`)
+	residueMutation, err := cclient.NewMutation(residueRow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	residueMutation.PutLatest(
+		[]byte("record"),
+		[]byte("v1"),
+		nil,
+		residueValue,
+	)
+	if err := runtime.engine.Write(
+		explorer.EmbeddedTableName,
+		[]*cclient.Mutation{residueMutation},
+	); err != nil {
+		t.Fatal(err)
+	}
+	allowed, err = runtime.RecordCommitted(
+		context.Background(),
+		explorer.RecordPublication{
+			Operation: []byte("explorer-document-record-v1"),
+			RecordKey: documentTestRecordKey(residueRow),
+			Table:     explorer.EmbeddedTableName,
+			Row:       residueRow,
+			Family:    []byte("record"),
+			Qualifier: []byte("v1"),
+			Value:     residueValue,
+		},
+	)
+	if err != nil || allowed {
+		t.Fatalf("post-migration v1 residue = %v, %v", allowed, err)
+	}
+}
+
 func TestGenericPublishSerializesPendingRegistrationWithRecovery(t *testing.T) {
 	config := testRuntimeConfig(t, testDirectory(t))
 	fired := false

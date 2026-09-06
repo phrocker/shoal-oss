@@ -300,6 +300,18 @@ func (e *Explorer) loadDocumentRecord(
 		record persistedDocument
 		format byte
 	)
+	if bytes.Equal(qualifier, []byte(recordCQV1)) ||
+		bytes.Equal(qualifier, []byte(recordCQV2)) {
+		committed, err := e.documentRecordCommitted(
+			context.Background(), row, qualifier, encoded,
+		)
+		if err != nil {
+			return err
+		}
+		if !committed {
+			return nil
+		}
+	}
 	switch {
 	case bytes.Equal(qualifier, []byte(recordCQV1)):
 		if err := json.Unmarshal(encoded, &record); err != nil {
@@ -312,15 +324,6 @@ func (e *Explorer) loadDocumentRecord(
 		}
 		format = 1
 	case bytes.Equal(qualifier, []byte(recordCQV2)):
-		committed, err := e.documentRecordCommitted(
-			context.Background(), row, encoded,
-		)
-		if err != nil {
-			return err
-		}
-		if !committed {
-			return nil
-		}
 		if err := decodeEmbeddedRecord(
 			encoded, embeddedRecordDocument, &record,
 		); err != nil {

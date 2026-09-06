@@ -147,14 +147,14 @@ func documentRecordPublication(
 	return request
 }
 
-func documentRecordCommitProbe(row, encoded []byte) RecordPublication {
+func documentRecordCommitProbe(row, qualifier, encoded []byte) RecordPublication {
 	return RecordPublication{
 		Operation: []byte("explorer-document-record-v1"),
 		RecordKey: documentStableKey(row),
 		Table:     EmbeddedTableName,
 		Row:       append([]byte(nil), row...),
 		Family:    []byte(recordCF),
-		Qualifier: []byte(recordCQV2),
+		Qualifier: append([]byte(nil), qualifier...),
 		Value:     append([]byte(nil), encoded...),
 	}
 }
@@ -259,13 +259,13 @@ func (e *Explorer) writeDocumentRecord(
 
 func (e *Explorer) documentRecordCommitted(
 	ctx context.Context,
-	row, encoded []byte,
+	row, qualifier, encoded []byte,
 ) (bool, error) {
 	if e.publication == nil {
 		return true, nil
 	}
 	committed, err := e.publication.RecordCommitted(
-		ctx, documentRecordCommitProbe(row, encoded),
+		ctx, documentRecordCommitProbe(row, qualifier, encoded),
 	)
 	if err != nil {
 		return false, shoal.WrapError(

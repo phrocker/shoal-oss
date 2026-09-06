@@ -669,22 +669,7 @@ func (t *Tablet) SourceContext(
 	ctx context.Context,
 	env iterrt.IteratorEnvironment,
 ) (iterrt.SortedKeyValueIterator, func(), error) {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	t.mu.RLock()
-	source, closeSource, err := t.sourceLockedContext(ctx, env)
-	if err != nil {
-		t.mu.RUnlock()
-		return nil, nil, err
-	}
-	var once sync.Once
-	return source, func() {
-		once.Do(func() {
-			closeSource()
-			t.mu.RUnlock()
-		})
-	}, nil
+	return t.SnapshotSourceContext(ctx, env)
 }
 
 // SnapshotSourceContext returns a source whose memtable component is copied
