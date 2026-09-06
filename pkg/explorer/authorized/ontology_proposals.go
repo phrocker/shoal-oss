@@ -57,6 +57,7 @@ func (c *Client) CreateOntologyProposal(
 	if err != nil {
 		return err
 	}
+
 	// This operation check is load-bearing; TestOntologyProposalEndpointDistinguishesAuthorizationDenial
 	// pins that proposal mutations require write authority and surface a
 	// governance 401 without a bearer challenge when the caller lacks it.
@@ -73,6 +74,27 @@ func (c *Client) CreateOntologyProposal(
 		return directBaseError(err)
 	}
 	return guard.Check(ctx)
+}
+
+func (c *Client) OntologyProposalsForMutation(
+	ctx context.Context,
+) ([]ontology.GovernedProposal, error) {
+	store, err := c.ontologyProposalStore()
+	if err != nil {
+		return nil, err
+	}
+	_, guard, _, err := c.begin(ctx, auth.OperationIngest)
+	if err != nil {
+		return nil, err
+	}
+	proposals, err := store.OntologyProposalsForMutation(ctx)
+	if err != nil {
+		return nil, directBaseError(err)
+	}
+	if err := guard.Check(ctx); err != nil {
+		return nil, err
+	}
+	return proposals, nil
 }
 
 func (c *Client) TransitionOntologyProposal(

@@ -157,10 +157,11 @@ type changeFeedBackend interface {
 
 // EmbeddedService adapts the public Explorer client to the workspace service.
 type EmbeddedService struct {
-	client          explorer.BoundedClient
-	ontologyMu      sync.RWMutex
-	ontologyVersion *ontology.OntologyVersion
-	clock           func() time.Time
+	client            explorer.BoundedClient
+	ontologyMu        sync.RWMutex
+	ontologyPublishMu sync.Mutex
+	ontologyVersion   *ontology.OntologyVersion
+	clock             func() time.Time
 }
 
 // NewEmbeddedService creates a local service without exposing the embedded
@@ -717,17 +718,20 @@ func ontologyInterpretationReports(
 		applied := value.AppliedMorphisms()
 		appliedStrings := make([]string, len(applied))
 		for i, id := range applied {
-			appliedStrings[i] = string(id)
+			appliedStrings[i] = encodeID(id)
 		}
 		reader := value.Reader()
 		out = append(out, OntologyInterpretationReport{
-			AssertionID: string(original.ID()),
-			SchemaID:    string(reader.SchemaID()), VersionID: string(reader.VersionID()),
+			AssertionID: encodeID(original.ID()),
+			SchemaID:    encodeID(reader.SchemaID()), VersionID: encodeID(reader.VersionID()),
 			Reading: value.Reading(), Status: value.Status(),
-			OriginalSubjectType: string(originalSubject), SubjectType: string(subject),
-			OriginalPredicate: string(original.Predicate()), Predicate: string(value.Predicate()),
-			OriginalObjectType: string(originalObject), ObjectType: string(object),
-			AppliedMorphisms: appliedStrings, Reason: value.Reason(),
+			OriginalSubjectType: encodeOptionalID(originalSubject),
+			SubjectType:         encodeOptionalID(subject),
+			OriginalPredicate:   encodeID(original.Predicate()),
+			Predicate:           encodeID(value.Predicate()),
+			OriginalObjectType:  encodeOptionalID(originalObject),
+			ObjectType:          encodeOptionalID(object),
+			AppliedMorphisms:    appliedStrings, Reason: value.Reason(),
 		})
 	}
 	return out

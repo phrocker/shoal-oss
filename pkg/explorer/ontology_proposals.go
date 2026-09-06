@@ -34,6 +34,7 @@ import (
 // Shoal Explorer corpus.
 type OntologyProposalStore interface {
 	OntologyProposals(context.Context) ([]ontology.GovernedProposal, error)
+	OntologyProposalsForMutation(context.Context) ([]ontology.GovernedProposal, error)
 	CreateOntologyProposal(
 		context.Context, ontology.GovernedProposal, ontology.OntologyVersion,
 	) error
@@ -45,6 +46,15 @@ type OntologyProposalStore interface {
 		string,
 		time.Time,
 	) (ontology.GovernedProposal, error)
+}
+
+// OntologyProposalsForMutation returns the same immutable snapshot as
+// OntologyProposals. Authorization wrappers expose it under mutation authority
+// so publication CAS does not require a separate read grant.
+func (e *Explorer) OntologyProposalsForMutation(
+	ctx context.Context,
+) ([]ontology.GovernedProposal, error) {
+	return e.OntologyProposals(ctx)
 }
 
 type persistedOntologyProposal struct {
@@ -275,11 +285,10 @@ func (e *Explorer) TransitionOntologyProposal(
 			currentBase, currentHasBase := current.BaseVersionID()
 			if other.State() == ontology.ProposalPublished &&
 				otherHasBase == currentHasBase &&
-				otherBase == currentBase &&
-				other.ProposedVersion().ID() == current.ProposedVersion().ID() {
+				otherBase == currentBase {
 				return ontology.GovernedProposal{}, shoal.NewError(
 					shoal.ErrorConflict,
-					"another proposal already published this ontology transition",
+					"another proposal already advanced this ontology base version",
 				)
 			}
 		}

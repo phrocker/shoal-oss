@@ -322,6 +322,9 @@ func (c *Client) BoundedNeighborhood(
 	if err != nil {
 		return explorer.BoundedNeighborhood{}, err
 	}
+	if err := guard.Check(ctx); err != nil {
+		return explorer.BoundedNeighborhood{}, err
+	}
 	raw.NextAfterEdgeID = ""
 	raw.Continuation = false
 	return raw, nil
@@ -436,6 +439,9 @@ func (c *Client) boundedAuthorizedNeighborhoodPage(
 		return explorer.BoundedNeighborhood{}, interpretErr
 	}
 	result.Neighborhood = interpreted
+	if err := guard.Check(ctx); err != nil {
+		return explorer.BoundedNeighborhood{}, err
+	}
 	return result, nil
 }
 

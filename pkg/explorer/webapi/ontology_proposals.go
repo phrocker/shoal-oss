@@ -48,6 +48,7 @@ type OntologyProposalProvider interface {
 
 type ontologyProposalStoreClient interface {
 	OntologyProposals(context.Context) ([]ontology.GovernedProposal, error)
+	OntologyProposalsForMutation(context.Context) ([]ontology.GovernedProposal, error)
 	CreateOntologyProposal(
 		context.Context, ontology.GovernedProposal, ontology.OntologyVersion,
 	) error
@@ -112,18 +113,23 @@ type CreateOntologyProposalRequest struct {
 }
 
 type OntologyMorphismDraft struct {
-	Kind          ontology.MorphismKind           `json:"kind"`
-	Sources       []shoal.ID                      `json:"sources"`
-	Targets       []shoal.ID                      `json:"targets"`
-	Discriminator *OntologyDiscriminatorDraft     `json:"discriminator,omitempty"`
-	Evidence      []OntologyMorphismEvidenceDraft `json:"evidence"`
-	Rationale     string                          `json:"rationale"`
-	Metadata      shoal.Metadata                  `json:"metadata,omitempty"`
+	Kind          ontology.MorphismKind              `json:"kind"`
+	Sources       []OntologyDefinitionReferenceDraft `json:"sources"`
+	Targets       []OntologyDefinitionReferenceDraft `json:"targets"`
+	Discriminator *OntologyDiscriminatorDraft        `json:"discriminator,omitempty"`
+	Evidence      []OntologyMorphismEvidenceDraft    `json:"evidence"`
+	Rationale     string                             `json:"rationale"`
+	Metadata      shoal.Metadata                     `json:"metadata,omitempty"`
+}
+
+type OntologyDefinitionReferenceDraft struct {
+	Namespace string `json:"namespace"`
+	Key       string `json:"key"`
 }
 
 type OntologyDiscriminatorDraft struct {
-	MetadataKey string              `json:"metadata_key"`
-	Choices     map[string]shoal.ID `json:"choices"`
+	MetadataKey string                                      `json:"metadata_key"`
+	Choices     map[string]OntologyDefinitionReferenceDraft `json:"choices"`
 }
 
 type OntologyMorphismEvidenceDraft struct {
@@ -134,19 +140,73 @@ type OntologyMorphismEvidenceDraft struct {
 }
 
 type OntologyMorphismProjection struct {
-	ID            string                      `json:"id"`
-	Kind          ontology.MorphismKind       `json:"kind"`
-	Safety        ontology.MorphismSafety     `json:"safety"`
-	SourceSchema  string                      `json:"source_schema_id"`
-	SourceVersion string                      `json:"source_version_id"`
-	TargetSchema  string                      `json:"target_schema_id"`
-	TargetVersion string                      `json:"target_version_id"`
-	Sources       []shoal.ID                  `json:"sources"`
-	Targets       []shoal.ID                  `json:"targets"`
-	Discriminator *OntologyDiscriminatorDraft `json:"discriminator,omitempty"`
-	EvidenceIDs   []string                    `json:"evidence_ids"`
-	Rationale     string                      `json:"rationale"`
-	Metadata      shoal.Metadata              `json:"metadata,omitempty"`
+	ID            string                           `json:"id"`
+	Kind          ontology.MorphismKind            `json:"kind"`
+	Safety        ontology.MorphismSafety          `json:"safety"`
+	SourceSchema  string                           `json:"source_schema_id"`
+	SourceVersion string                           `json:"source_version_id"`
+	TargetSchema  string                           `json:"target_schema_id"`
+	TargetVersion string                           `json:"target_version_id"`
+	Sources       []string                         `json:"sources"`
+	Targets       []string                         `json:"targets"`
+	Discriminator *OntologyDiscriminatorProjection `json:"discriminator,omitempty"`
+	EvidenceIDs   []string                         `json:"evidence_ids"`
+	Rationale     string                           `json:"rationale"`
+	Metadata      shoal.Metadata                   `json:"metadata,omitempty"`
+}
+
+type OntologyDiscriminatorProjection struct {
+	MetadataKey string            `json:"metadata_key"`
+	Choices     map[string]string `json:"choices"`
+}
+
+func (d OntologyMorphismEvidenceDraft) MarshalJSON() ([]byte, error) {
+	var path *wirePath
+	if d.Path != nil {
+		value := wirePathValue(*d.Path)
+		path = &value
+	}
+	return json.Marshal(struct {
+		Citation wireCitation `json:"citation"`
+		Quote    string       `json:"quote,omitempty"`
+		Path     *wirePath    `json:"path,omitempty"`
+		Metadata wireMetadata `json:"metadata,omitempty"`
+	}{
+		Citation: wireCitationValue(d.Citation), Quote: d.Quote,
+		Path: path, Metadata: wireMetadataValue(d.Metadata),
+	})
+}
+
+func (d *OntologyMorphismEvidenceDraft) UnmarshalJSON(data []byte) error {
+	var wire struct {
+		Citation wireCitation `json:"citation"`
+		Quote    string       `json:"quote,omitempty"`
+		Path     *wirePath    `json:"path,omitempty"`
+		Metadata wireMetadata `json:"metadata,omitempty"`
+	}
+	if err := strictUnmarshal(data, &wire); err != nil {
+		return err
+	}
+	citation, err := citationValue(wire.Citation)
+	if err != nil {
+		return fmt.Errorf("citation: %w", err)
+	}
+	metadata, err := metadataValue(wire.Metadata)
+	if err != nil {
+		return fmt.Errorf("metadata: %w", err)
+	}
+	var path *graph.Path
+	if wire.Path != nil {
+		value, err := pathValue(*wire.Path)
+		if err != nil {
+			return fmt.Errorf("path: %w", err)
+		}
+		path = &value
+	}
+	*d = OntologyMorphismEvidenceDraft{
+		Citation: citation, Quote: wire.Quote, Path: path, Metadata: metadata,
+	}
+	return nil
 }
 
 type TransitionOntologyProposalRequest struct {
@@ -219,7 +279,7 @@ func (s *EmbeddedService) CreateOntologyProposal(
 		return ontology.GovernedProposal{}, shoal.NewError(
 			shoal.ErrorUnavailable, "workspace capability \"ontology proposals\" is unavailable")
 	}
-	base, configured, err := s.ActiveOntology(ctx)
+	base, configured, _, err := s.ontologyMutationSnapshot(ctx, store)
 	if err != nil {
 		return ontology.GovernedProposal{}, err
 	}
@@ -291,18 +351,34 @@ func ontologyMorphismsFromDraft(
 			}
 			evidence = append(evidence, ref)
 		}
+		sources, err := resolveOntologyDefinitionReferences(base, draft.Sources)
+		if err != nil {
+			return nil, fmt.Errorf("morphism sources: %w", err)
+		}
+		targets, err := resolveOntologyDefinitionReferences(proposed, draft.Targets)
+		if err != nil {
+			return nil, fmt.Errorf("morphism targets: %w", err)
+		}
 		var discriminator ontology.MorphismDiscriminator
-		var err error
 		if draft.Discriminator != nil {
+			choices := make(map[string]shoal.ID, len(draft.Discriminator.Choices))
+			for value, reference := range draft.Discriminator.Choices {
+				resolved, resolveErr := resolveOntologyDefinitionReference(
+					proposed, reference)
+				if resolveErr != nil {
+					return nil, fmt.Errorf("morphism discriminator: %w", resolveErr)
+				}
+				choices[value] = resolved
+			}
 			discriminator, err = ontology.NewMorphismDiscriminator(
-				draft.Discriminator.MetadataKey, draft.Discriminator.Choices)
+				draft.Discriminator.MetadataKey, choices)
 			if err != nil {
 				return nil, err
 			}
 		}
 		morphism, err := ontology.NewOntologyMorphism(ontology.MorphismConfig{
 			Kind: draft.Kind, SourceVersion: base, TargetVersion: proposed,
-			Sources: draft.Sources, Targets: draft.Targets,
+			Sources: sources, Targets: targets,
 			Discriminator: discriminator, Evidence: evidence,
 			Rationale: draft.Rationale, Metadata: draft.Metadata,
 		})
@@ -312,6 +388,61 @@ func ontologyMorphismsFromDraft(
 		out = append(out, morphism)
 	}
 	return out, nil
+}
+
+func resolveOntologyDefinitionReferences(
+	version ontology.OntologyVersion,
+	references []OntologyDefinitionReferenceDraft,
+) ([]shoal.ID, error) {
+	ids := make([]shoal.ID, 0, len(references))
+	for _, reference := range references {
+		id, err := resolveOntologyDefinitionReference(version, reference)
+		if err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, nil
+}
+
+func resolveOntologyDefinitionReference(
+	version ontology.OntologyVersion,
+	reference OntologyDefinitionReferenceDraft,
+) (shoal.ID, error) {
+	namespace := strings.TrimSpace(reference.Namespace)
+	key := strings.TrimSpace(reference.Key)
+	if namespace == "" || key == "" ||
+		namespace != reference.Namespace || key != reference.Key {
+		return "", shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			"ontology definition reference requires canonical namespace and key",
+		)
+	}
+	switch namespace {
+	case "concept":
+		for _, definition := range version.Concepts() {
+			if definition.Key() == key {
+				return definition.ID(), nil
+			}
+		}
+	case "relationship":
+		for _, definition := range version.Relationships() {
+			if definition.Key() == key {
+				return definition.ID(), nil
+			}
+		}
+	case "property":
+		for _, definition := range version.Properties() {
+			if definition.Key() == key {
+				return definition.ID(), nil
+			}
+		}
+	default:
+		return "", shoal.NewError(
+			shoal.ErrorInvalidArgument, "unknown ontology definition namespace")
+	}
+	return "", shoal.NewError(
+		shoal.ErrorInvalidArgument, "ontology definition reference was not found")
 }
 
 func (s *EmbeddedService) TransitionOntologyProposal(
@@ -325,20 +456,68 @@ func (s *EmbeddedService) TransitionOntologyProposal(
 			shoal.ErrorUnavailable, "workspace capability \"ontology proposals\" is unavailable")
 	}
 	next := ontology.ProposalState(strings.TrimSpace(request.State))
+	if next == ontology.ProposalPublished {
+		s.ontologyPublishMu.Lock()
+		defer s.ontologyPublishMu.Unlock()
+		active, configured, proposals, snapshotErr := s.ontologyMutationSnapshot(ctx, store)
+		if snapshotErr != nil {
+			return ontology.GovernedProposal{}, snapshotErr
+		}
+		var current ontology.GovernedProposal
+		for _, candidate := range proposals {
+			if candidate.ID() == proposalID {
+				current = candidate
+				break
+			}
+		}
+		if current.ID() == "" {
+			return ontology.GovernedProposal{}, shoal.NewError(
+				shoal.ErrorNotFound, "ontology proposal not found")
+		}
+		baseID, hasBase := current.BaseVersionID()
+		if !configured || !hasBase || active.ID() != baseID {
+			return ontology.GovernedProposal{}, shoal.NewError(
+				shoal.ErrorConflict,
+				"ontology proposal base is not the active version",
+			)
+		}
+	}
 	proposal, err := store.TransitionOntologyProposal(
 		ctx, proposalID, next, ontologyActor(ctx), request.Note, s.now())
 	if err != nil {
 		return ontology.GovernedProposal{}, err
 	}
-	if next == ontology.ProposalPublished {
-		// This assignment is load-bearing; TestOntologyProposalPublishUpdatesActiveOntology
-		// pins that a published proposal becomes the active ontology read by the
-		// existing /api/v1/ontology surface.
-		if err := s.SetOntologyVersion(proposal.ProposedVersion()); err != nil {
-			return ontology.GovernedProposal{}, err
-		}
-	}
 	return proposal, nil
+}
+
+func (s *EmbeddedService) ontologyMutationSnapshot(
+	ctx context.Context,
+	store ontologyProposalStoreClient,
+) (
+	ontology.OntologyVersion,
+	bool,
+	[]ontology.GovernedProposal,
+	error,
+) {
+	s.ontologyMu.RLock()
+	var configured ontology.OntologyVersion
+	present := s.ontologyVersion != nil
+	if present {
+		configured = *s.ontologyVersion
+	}
+	s.ontologyMu.RUnlock()
+	if !present {
+		return ontology.OntologyVersion{}, false, nil, nil
+	}
+	proposals, err := store.OntologyProposalsForMutation(ctx)
+	if err != nil {
+		return ontology.OntologyVersion{}, false, nil, err
+	}
+	active, err := replayPublishedOntology(configured, proposals)
+	if err != nil {
+		return ontology.OntologyVersion{}, false, nil, err
+	}
+	return active, true, proposals, nil
 }
 
 func ontologyProposalsFor(
@@ -479,11 +658,16 @@ func projectOntologyProposal(
 		for index, item := range evidence {
 			evidenceIDs[index] = encodeID(item.ID())
 		}
-		var discriminator *OntologyDiscriminatorDraft
+		var discriminator *OntologyDiscriminatorProjection
 		if morphism.Kind() == ontology.MorphismSplit {
 			value := morphism.Discriminator()
-			discriminator = &OntologyDiscriminatorDraft{
-				MetadataKey: value.MetadataKey(), Choices: value.Choices(),
+			choices := value.Choices()
+			projectedChoices := make(map[string]string, len(choices))
+			for choice, id := range choices {
+				projectedChoices[choice] = encodeID(id)
+			}
+			discriminator = &OntologyDiscriminatorProjection{
+				MetadataKey: value.MetadataKey(), Choices: projectedChoices,
 			}
 		}
 		projected.Morphisms = append(projected.Morphisms, OntologyMorphismProjection{
@@ -492,7 +676,8 @@ func projectOntologyProposal(
 			SourceVersion: encodeID(morphism.Source().VersionID()),
 			TargetSchema:  encodeID(morphism.Target().SchemaID()),
 			TargetVersion: encodeID(morphism.Target().VersionID()),
-			Sources:       morphism.Sources(), Targets: morphism.Targets(),
+			Sources:       encodeOntologyIDs(morphism.Sources()),
+			Targets:       encodeOntologyIDs(morphism.Targets()),
 			Discriminator: discriminator, EvidenceIDs: evidenceIDs,
 			Rationale: morphism.Rationale(), Metadata: morphism.Metadata(),
 		})

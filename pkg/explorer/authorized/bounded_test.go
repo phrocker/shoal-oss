@@ -29,6 +29,7 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/graph"
+	"github.com/phrocker/shoal-oss/pkg/ontology"
 	"github.com/phrocker/shoal-oss/pkg/retrieval"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
@@ -326,6 +327,50 @@ func TestAuthorizedVectorAvailabilityKeyLengthPrefixesIDs(t *testing.T) {
 	}
 }
 
+func TestBoundedNeighborhoodRechecksGenerationAfterOntologyLens(t *testing.T) {
+	for _, depth := range []uint32{1, 2} {
+		t.Run(fmt.Sprintf("depth-%d", depth), func(t *testing.T) {
+			client, base := authorizedPaginationClient(t, false)
+			schema, _ := ontology.NewOntologySchema("guard", "Guard", "", nil)
+			version, _ := ontology.NewOntologyVersion(
+				schema, "1", time.Date(2026, time.September, 6, 0, 0, 0, 0, time.UTC),
+				nil, nil, nil, nil)
+			selected, _ := ontology.NewOntologyIdentity(version)
+			now := time.Date(2026, time.September, 6, 0, 0, 0, 0, time.UTC)
+			decision, err := auth.NewDecision(auth.DecisionConfig{
+				Subject: "subject", Actor: "actor",
+				AuthorizationDomain: []byte("domain"),
+				AllowedOperations:   []auth.Operation{auth.OperationNeighborhood},
+				PermittedSourceIDs:  [][]byte{[]byte("source")},
+				PermittedPolicyIDs:  [][]byte{[]byte("policy")},
+				PolicyGeneration:    1, AuthenticationExpires: now.Add(time.Hour),
+				RequestID: "request", SelectedOntology: selected,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			generation := int64(1)
+			client.resolver = resolverFunc(func(context.Context) (auth.Decision, error) {
+				return decision, nil
+			})
+			client.generationReader = generationReaderFunc(
+				func(context.Context, []byte) (int64, error) {
+					return generation, nil
+				})
+			client.clock = func() time.Time { return now }
+			base.interpret = func() { generation = 2 }
+			_, err = client.BoundedNeighborhood(
+				context.Background(), explorer.BoundedNeighborhoodRequest{
+					NodeIDs: []shoal.ID{"node-seed"}, Depth: depth,
+					Fanout: 1, MaxNodes: 2, MaxScannedEdges: 2,
+				})
+			if !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
+				t.Fatalf("generation change after lens = %v, want unavailable", err)
+			}
+		})
+	}
+}
+
 func authorizedPaginationClient(t *testing.T, hiddenOnly bool) (*Client, *pagedBoundedBase) {
 	t.Helper()
 	ctx := context.Background()
@@ -425,6 +470,22 @@ type pagedBoundedBase struct {
 	view       explorer.DocumentView
 	nodes      map[shoal.ID]graph.Node
 	hiddenOnly bool
+	interpret  func()
+}
+
+func (b *pagedBoundedBase) InterpretAssertions(
+	_ context.Context,
+	assertions []ontology.Assertion,
+	selected ontology.OntologyIdentity,
+) ([]ontology.AssertionInterpretation, error) {
+	if b.interpret != nil {
+		b.interpret()
+	}
+	result := make([]ontology.AssertionInterpretation, 0, len(assertions))
+	for _, assertion := range assertions {
+		result = append(result, ontology.ReadAssertionUnder(assertion, selected))
+	}
+	return result, nil
 }
 
 func (b *pagedBoundedBase) Retrieve(context.Context, retrieval.Request) (retrieval.Response, error) {

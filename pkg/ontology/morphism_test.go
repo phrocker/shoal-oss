@@ -182,6 +182,7 @@ func TestMorphismBoundsAndProposalPayloadAccounting(t *testing.T) {
 	for i := range evidence {
 		evidence[i] = f.evidence
 	}
+
 	_, err := NewOntologyMorphism(MorphismConfig{
 		Kind: MorphismRename, SourceVersion: f.renameFrom, TargetVersion: f.renameTo,
 		Sources: []shoal.ID{f.oldRel.ID()}, Targets: []shoal.ID{f.newRel.ID()},
@@ -219,6 +220,103 @@ func TestMorphismBoundsAndProposalPayloadAccounting(t *testing.T) {
 	}
 	if proposalPayloadBytes(with) <= proposalPayloadBytes(without) {
 		t.Fatal("morphism payload was omitted from proposal accounting")
+	}
+}
+
+func TestOntologyLensTraversesPublishedTransitionsWithoutMorphisms(t *testing.T) {
+	f := newMorphismFixture(t)
+	v3, err := NewOntologyVersion(
+		f.v2.Schema(), "3", f.v2.CreatedAt().Add(time.Second),
+		f.v2.Concepts(), f.v2.Relationships(), f.v2.Properties(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := NewOntologyTransition(
+		mustIdentity(t, f.v1), mustIdentity(t, f.v2))
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := NewOntologyTransition(
+		mustIdentity(t, f.v2), mustIdentity(t, v3))
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertion := mustPropertyAssertion(
+		t, f.person.ID(), f.name.ID(), f.v1, nil, f.evidence, f.provenance)
+	lens, err := NewOntologyLensWithTransitions(
+		v3, []OntologyTransition{first, second}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	read := lens.Read(assertion)
+	if !read.Resolved() || read.Predicate() != f.name.ID() ||
+		len(read.AppliedMorphisms()) != 0 {
+		t.Fatalf("empty-transition read = %#v", read)
+	}
+}
+
+func TestOntologyMorphismRejectsInvalidShapeBeforeSemanticLookup(t *testing.T) {
+	f := newMorphismFixture(t)
+	if _, err := NewOntologyMorphism(MorphismConfig{
+		Kind: MorphismWiden, SourceVersion: f.v1, TargetVersion: f.v2,
+		Evidence: []EvidenceRef{f.evidence}, Rationale: "missing relationship",
+	}); err == nil {
+		t.Fatal("empty widening did not return an error")
+	}
+	discriminator, err := NewMorphismDiscriminator(
+		"kind", map[string]shoal.ID{"person": f.newRel.ID()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewOntologyMorphism(MorphismConfig{
+		Kind: MorphismRename, SourceVersion: f.renameFrom, TargetVersion: f.renameTo,
+		Sources: []shoal.ID{f.oldRel.ID()}, Targets: []shoal.ID{f.newRel.ID()},
+		Discriminator: discriminator,
+		Evidence:      []EvidenceRef{f.evidence}, Rationale: "invalid discriminator",
+	}); err == nil || !strings.Contains(err.Error(), "only split") {
+		t.Fatalf("rename discriminator error = %v", err)
+	}
+}
+
+func TestOntologyLensRejectsRemovedPropertyOwnership(t *testing.T) {
+	f := newMorphismFixture(t)
+	targetPerson, _ := NewConceptDefinition("person", "Person", "", nil, nil)
+	source, err := NewOntologyVersion(
+		f.v1.Schema(), "ownership-1", f.v1.CreatedAt().Add(10*time.Second),
+		[]ConceptDefinition{f.person, f.org}, nil, []PropertyDefinition{f.name}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target, err := NewOntologyVersion(
+		f.v1.Schema(), "ownership-2", f.v1.CreatedAt().Add(11*time.Second),
+		[]ConceptDefinition{targetPerson, f.org}, nil, []PropertyDefinition{f.name}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	transition, _ := NewOntologyTransition(
+		mustIdentity(t, source), mustIdentity(t, target))
+	lens, err := NewOntologyLensWithTransitions(
+		target, []OntologyTransition{transition}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertion := mustPropertyAssertion(
+		t, f.person.ID(), f.name.ID(), source, nil, f.evidence, f.provenance)
+	if read := lens.Read(assertion); read.Resolved() ||
+		!strings.Contains(read.Reason(), "does not apply") {
+		t.Fatalf("removed property ownership read = %#v", read)
+	}
+}
+
+func TestOntologyMorphismRejectsCrossKindMerge(t *testing.T) {
+	f := newMorphismFixture(t)
+	if _, err := NewOntologyMorphism(MorphismConfig{
+		Kind: MorphismMerge, SourceVersion: f.splitTo, TargetVersion: f.splitFrom,
+		Sources:  []shoal.ID{f.person.ID(), f.org.ID()},
+		Targets:  []shoal.ID{f.name.ID()},
+		Evidence: []EvidenceRef{f.evidence}, Rationale: "invalid cross-kind merge",
+	}); err == nil || !strings.Contains(err.Error(), "same definition kind") {
+		t.Fatalf("cross-kind merge error = %v", err)
 	}
 }
 

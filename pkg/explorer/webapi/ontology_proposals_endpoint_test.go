@@ -20,6 +20,7 @@ package webapi_test
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -34,6 +35,7 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/explorer/authorized"
 	"github.com/phrocker/shoal-oss/pkg/explorer/webapi"
+	"github.com/phrocker/shoal-oss/pkg/graph"
 	"github.com/phrocker/shoal-oss/pkg/ontology"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
@@ -108,12 +110,21 @@ func TestOntologyProposalEndpointUsesEmbeddedServiceLifecycleAndPersistence(t *t
 		t.Fatal(err)
 	}
 	defer reopened.Close()
-	_, reopenedServer := ontologyProposalServer(t, reopened, richOntologyVersion(t))
+	reopenedService, reopenedServer := ontologyProposalServer(
+		t, reopened, richOntologyVersion(t))
 	persisted := getOntologyProposals(t, reopenedServer)
 	if len(persisted.Proposals) != 1 ||
 		persisted.Proposals[0].State != string(ontology.ProposalPublished) ||
 		len(persisted.Proposals[0].Transitions) != 3 {
 		t.Fatalf("persisted proposal after reopen = %+v", persisted)
+	}
+	replayed, configured, err := reopenedService.ActiveOntology(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !configured || replayed.Version() != "v2" {
+		t.Fatalf("active ontology after reopen = configured %v version %q",
+			configured, replayed.Version())
 	}
 }
 
@@ -302,6 +313,55 @@ func TestOntologyProposalEndpointDistinguishesAuthorizationDenial(t *testing.T) 
 	if envelope.Code != shoal.ErrorUnauthorized {
 		t.Fatalf("proposal denial code = %q, want unauthorized", envelope.Code)
 	}
+
+	create, err := http.NewRequest(
+		http.MethodPost, server.URL+"/api/v1/ontology/proposals",
+		bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	create.Header.Set("Content-Type", "application/json")
+	create.Header.Set(authnPrincipalHeader, "ingest-only")
+	createdResponse, err := server.Client().Do(create)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer createdResponse.Body.Close()
+	if createdResponse.StatusCode != http.StatusCreated {
+		data, _ := io.ReadAll(createdResponse.Body)
+		t.Fatalf("ingest-only create status = %d, want 201: %s",
+			createdResponse.StatusCode, data)
+	}
+	var created webapi.OntologyProposalResponse
+	if err := json.NewDecoder(createdResponse.Body).Decode(&created); err != nil {
+		t.Fatal(err)
+	}
+	for _, state := range []ontology.ProposalState{
+		ontology.ProposalSubmitted, ontology.ProposalApproved, ontology.ProposalPublished,
+	} {
+		transitionBody := bytes.NewBufferString(
+			`{"state":` + strconvQuote(string(state)) + `,"note":"ingest-only"}`)
+		transition, err := http.NewRequest(
+			http.MethodPost,
+			server.URL+"/api/v1/ontology/proposals/"+created.Proposal.ID+"/transition",
+			transitionBody)
+		if err != nil {
+			t.Fatal(err)
+		}
+		transition.Header.Set("Content-Type", "application/json")
+		transition.Header.Set(authnPrincipalHeader, "ingest-only")
+		transitionResponse, err := server.Client().Do(transition)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if transitionResponse.StatusCode != http.StatusOK {
+			data, _ := io.ReadAll(transitionResponse.Body)
+			transitionResponse.Body.Close()
+			t.Fatalf("ingest-only transition %s status = %d, want 200: %s",
+				state, transitionResponse.StatusCode, data)
+		}
+		transitionResponse.Body.Close()
+	}
 }
 
 func TestOntologyProposalEndpointReturnsStableOrdering(t *testing.T) {
@@ -347,6 +407,164 @@ func TestOntologyProposalPublishUpdatesActiveOntology(t *testing.T) {
 	}
 	if !configured || active.Version() != "v2" {
 		t.Fatalf("published ontology was not activated: configured=%v version=%q",
+			configured, active.Version())
+	}
+}
+
+func TestOntologyProposalPublishRejectsStaleBase(t *testing.T) {
+	corpus, err := explorer.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer corpus.Close()
+	service, server := ontologyProposalServer(t, corpus, richOntologyVersion(t))
+
+	first := createOntologyProposal(t, server, "v2")
+	second := createOntologyProposal(t, server, "v3")
+	for _, proposal := range []webapi.OntologyProposalProjection{first, second} {
+		_ = transitionOntologyProposal(
+			t, server, proposal.ID, string(ontology.ProposalSubmitted))
+		_ = transitionOntologyProposal(
+			t, server, proposal.ID, string(ontology.ProposalApproved))
+	}
+	_ = transitionOntologyProposal(
+		t, server, first.ID, string(ontology.ProposalPublished))
+
+	body := bytes.NewBufferString(`{"state":"published","note":"stale publish"}`)
+	response, err := server.Client().Post(
+		server.URL+"/api/v1/ontology/proposals/"+second.ID+"/transition",
+		"application/json", body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusConflict {
+		data, _ := io.ReadAll(response.Body)
+		t.Fatalf("stale publish status = %d, want 409: %s",
+			response.StatusCode, data)
+	}
+	active, configured, err := service.ActiveOntology(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !configured || active.Version() != "v2" {
+		t.Fatalf("stale proposal changed active ontology: configured=%v version=%q",
+			configured, active.Version())
+	}
+}
+
+func TestOntologyProposalMorphismUsesKeyReferencesAndWireCodecs(t *testing.T) {
+	corpus, err := explorer.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer corpus.Close()
+	active := richOntologyVersion(t)
+	_, server := ontologyProposalServer(t, corpus, active)
+	request := ontologyProposalRequest("v2")
+	request.ProposedVersion.Relationships[0].Key = "belongs_to"
+	request.ProposedVersion.Relationships[0].Name = "Belongs to"
+	request.Morphisms = []webapi.OntologyMorphismDraft{{
+		Kind: ontology.MorphismRename,
+		Sources: []webapi.OntologyDefinitionReferenceDraft{{
+			Namespace: "relationship", Key: "member_of",
+		}},
+		Targets: []webapi.OntologyDefinitionReferenceDraft{{
+			Namespace: "relationship", Key: "belongs_to",
+		}},
+		Evidence: []webapi.OntologyMorphismEvidenceDraft{{
+			Citation: document.Citation{
+				DocumentID: "doc", RevisionID: "rev",
+				SectionID: "section", SpanID: "span",
+				Range: document.SourceRange{
+					Start: document.SourcePosition{Offset: 0, Page: 1},
+					End:   document.SourcePosition{Offset: 4, Page: 1},
+				},
+			},
+			Quote: "rename evidence",
+			Path: &graph.Path{Nodes: []graph.Node{{
+				ID: "node", Kind: "evidence",
+			}}},
+			Metadata: shoal.Metadata{"source": "test"},
+		}},
+		Rationale: "rename the relationship",
+	}}
+	encoded := mustJSON(t, request)
+	if bytes.Contains(encoded, []byte(`"document_id":"doc"`)) ||
+		bytes.Contains(encoded, []byte(`"id":"node"`)) ||
+		bytes.Contains(encoded, []byte(`"metadata":{"source"`)) {
+		t.Fatalf("morphism evidence bypassed wire codecs: %s", encoded)
+	}
+	created := createOntologyProposalWithRequest(t, server, request)
+	if len(created.Morphisms) != 1 {
+		t.Fatalf("morphism count = %d, want 1", len(created.Morphisms))
+	}
+	var sourceID shoal.ID
+	for _, relationship := range active.Relationships() {
+		if relationship.Key() == "member_of" {
+			sourceID = relationship.ID()
+		}
+	}
+	var targetID string
+	for _, relationship := range created.ProposedOntology.Relationships {
+		if relationship.Key == "belongs_to" {
+			targetID = relationship.ID
+		}
+	}
+	projected := created.Morphisms[0]
+	wantSource := base64.RawURLEncoding.EncodeToString([]byte(sourceID))
+	if len(projected.Sources) != 1 || projected.Sources[0] != wantSource ||
+		len(projected.Targets) != 1 || projected.Targets[0] != targetID {
+		t.Fatalf("projected morphism IDs = %+v", projected)
+	}
+}
+
+func TestActiveOntologyReplaysPublishedChainAcrossRestart(t *testing.T) {
+	data := t.TempDir()
+	corpus, err := explorer.Open(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service, server := ontologyProposalServer(t, corpus, richOntologyVersion(t))
+	first := createOntologyProposal(t, server, "v2")
+	for _, state := range []ontology.ProposalState{
+		ontology.ProposalSubmitted, ontology.ProposalApproved, ontology.ProposalPublished,
+	} {
+		_ = transitionOntologyProposal(t, server, first.ID, string(state))
+	}
+	second := createOntologyProposal(t, server, "v3")
+	for _, state := range []ontology.ProposalState{
+		ontology.ProposalSubmitted, ontology.ProposalApproved, ontology.ProposalPublished,
+	} {
+		_ = transitionOntologyProposal(t, server, second.ID, string(state))
+	}
+	active, configured, err := service.ActiveOntology(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !configured || active.Version() != "v3" {
+		t.Fatalf("active chain before restart = configured %v version %q",
+			configured, active.Version())
+	}
+	server.Close()
+	if err := corpus.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := explorer.Open(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	reopenedService, reopenedServer := ontologyProposalServer(
+		t, reopened, richOntologyVersion(t))
+	defer reopenedServer.Close()
+	active, configured, err = reopenedService.ActiveOntology(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !configured || active.Version() != "v3" {
+		t.Fatalf("active chain after restart = configured %v version %q",
 			configured, active.Version())
 	}
 }
