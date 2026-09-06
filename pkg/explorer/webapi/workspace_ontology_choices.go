@@ -81,7 +81,7 @@ func (c *GovernedOntologyChoices) ListOntologyChoices(
 	if err != nil {
 		return nil, err
 	}
-	catalog, err := ontology.NewPublishedCatalog(*c.configured, proposals)
+	catalog, err := boundedOntologyCatalog(*c.configured, proposals)
 	if err != nil {
 		return nil, err
 	}
