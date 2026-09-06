@@ -75,11 +75,12 @@ func (c *Client) recordInteraction(
 	if err != nil {
 		return interaction.Session{}, err
 	}
-	canonical, err := session.Canonical()
+	decision, guard, now, err := c.begin(ctx, auth.OperationRetrieve)
 	if err != nil {
 		return interaction.Session{}, err
 	}
-	decision, guard, now, err := c.begin(ctx, auth.OperationRetrieve)
+	session.RecordedAt = now.UTC()
+	canonical, err := session.Canonical()
 	if err != nil {
 		return interaction.Session{}, err
 	}
@@ -109,6 +110,11 @@ func (c *Client) recordInteraction(
 	); err != nil {
 		return interaction.Session{}, err
 	}
+	if err := c.authorizeInteractionEdges(
+		ctx, canonical.TouchedEdgeIDs(), decision, auth.OperationRetrieve, now,
+	); err != nil {
+		return interaction.Session{}, err
+	}
 	if err := guard.Check(ctx); err != nil {
 		return interaction.Session{}, err
 	}
@@ -135,7 +141,18 @@ func (c *Client) recordInteraction(
 			)
 		}
 	}
-	return canonical, nil
+	completedAt := c.clock()
+	if completedAt.IsZero() || decision.Authorize(
+		auth.OperationRetrieve,
+		auth.ResourceRequest{
+			AuthorizationDomain: decision.AuthorizationDomain(),
+		},
+		completedAt,
+	) != nil {
+		return interaction.Session{}, explorer.MarkCommittedInteraction(
+			authorizationDenied())
+	}
+	return persisted, nil
 }
 
 // Interactions lists only derived records whose complete current source set
@@ -204,9 +221,20 @@ func (c *Client) InteractionRecords(
 		if err != nil {
 			return nil, err
 		}
-		if allowed {
-			visible = append(visible, record)
+		if !allowed {
+			continue
 		}
+		if err := c.authorizeInteractionEdges(
+			ctx, record.Session.TouchedEdgeIDs(),
+			decision, auth.OperationRead, now,
+		); err != nil {
+			if shoal.IsErrorCode(err, shoal.ErrorNotFound) ||
+				shoal.IsErrorCode(err, shoal.ErrorUnauthorized) {
+				continue
+			}
+			return nil, err
+		}
+		visible = append(visible, record)
 	}
 	if err := guard.Check(ctx); err != nil {
 		return nil, err
@@ -251,6 +279,18 @@ func (c *Client) InteractionRecord(
 			return explorer.InteractionRecord{}, auth.ObjectNotFound()
 		}
 		return explorer.InteractionRecord{}, err
+	}
+	if !record.Summary.Deleted {
+		if err := c.authorizeInteractionEdges(
+			ctx, record.Session.TouchedEdgeIDs(),
+			decision, auth.OperationRead, now,
+		); err != nil {
+			if shoal.IsErrorCode(err, shoal.ErrorUnauthorized) ||
+				shoal.IsErrorCode(err, shoal.ErrorNotFound) {
+				return explorer.InteractionRecord{}, auth.ObjectNotFound()
+			}
+			return explorer.InteractionRecord{}, err
+		}
 	}
 	if err := guard.Check(ctx); err != nil {
 		return explorer.InteractionRecord{}, err
@@ -313,6 +353,14 @@ func (c *Client) InteractionSubgraph(
 	}
 	if err := c.authorizeInteractionSources(
 		ctx, record.TouchedNodeIDs, decision, auth.OperationRead, now,
+	); err != nil {
+		if shoal.IsErrorCode(err, shoal.ErrorUnauthorized) {
+			return explorer.Neighborhood{}, auth.ObjectNotFound()
+		}
+		return explorer.Neighborhood{}, err
+	}
+	if err := c.authorizeInteractionEdges(
+		ctx, record.Session.TouchedEdgeIDs(), decision, auth.OperationRead, now,
 	); err != nil {
 		if shoal.IsErrorCode(err, shoal.ErrorUnauthorized) {
 			return explorer.Neighborhood{}, auth.ObjectNotFound()
@@ -382,6 +430,34 @@ func interactionSourcesAllow(
 		}
 	}
 	return true, nil
+}
+
+func (c *Client) authorizeInteractionEdges(
+	ctx context.Context,
+	edgeIDs []shoal.ID,
+	decision auth.Decision,
+	operation auth.Operation,
+	now time.Time,
+) error {
+	registrations, err := c.resolveEdges(ctx, edgeIDs)
+	if err != nil {
+		return err
+	}
+	for _, edgeID := range edgeIDs {
+		registration, ok := registrations[edgeID]
+		if !ok {
+			return auth.ObjectNotFound()
+		}
+		allowed, err := c.edgeAllows(
+			ctx, registration, decision, operation, now)
+		if err != nil {
+			return err
+		}
+		if !allowed {
+			return auth.ObjectNotFound()
+		}
+	}
+	return nil
 }
 
 func interactionPinMatchesDecision(

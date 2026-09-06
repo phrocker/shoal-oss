@@ -43,8 +43,8 @@ type ResultSink interface {
 }
 
 // Recorder is the product-level fail-closed recorder for retrieval, chat, MCP,
-// and other non-harness adapters. It canonicalizes a typed Session, supplies a
-// UTC timestamp when one is absent, and returns only after the sink accepts the
+// and other non-harness adapters. It replaces caller time with its trusted UTC
+// clock, canonicalizes the Session, and returns only after the sink accepts the
 // durable record.
 type Recorder struct {
 	sink ResultSink
@@ -82,9 +82,10 @@ func (r *Recorder) SetClock(now func() time.Time) error {
 	return nil
 }
 
-// Record durably stores a typed interaction. A missing RecordedAt is filled
-// from the recorder clock; IDs and all other security-relevant pins remain
-// caller-supplied and validated rather than guessed.
+// Record durably stores a typed interaction. RecordedAt is always replaced by
+// the recorder clock so a caller cannot backdate or future-date authorization.
+// IDs and all other security-relevant pins remain caller-supplied and validated
+// rather than guessed.
 func (r *Recorder) Record(
 	ctx context.Context, session Session,
 ) (Session, error) {
@@ -92,9 +93,13 @@ func (r *Recorder) Record(
 		return Session{}, shoal.NewError(
 			shoal.ErrorInvalidArgument, "interaction recorder is required")
 	}
-	if session.RecordedAt.IsZero() {
-		session.RecordedAt = r.now().UTC()
+	recordedAt := r.now()
+	if recordedAt.IsZero() {
+		return Session{}, shoal.NewError(
+			shoal.ErrorUnavailable,
+			"interaction recorder clock is unavailable")
 	}
+	session.RecordedAt = recordedAt.UTC()
 	canonical, err := session.Canonical()
 	if err != nil {
 		return Session{}, err

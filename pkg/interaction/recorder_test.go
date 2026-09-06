@@ -22,6 +22,7 @@ package interaction_test
 import (
 	"context"
 	"errors"
+	"reflect"
 	"testing"
 	"time"
 
@@ -81,8 +82,9 @@ func TestProductRecorderIsFailClosedAndCanonical(t *testing.T) {
 		t.Fatal(err)
 	}
 	recorded, err := recorder.Record(ctx, interaction.Session{
-		ID:        id,
-		Operation: interaction.OperationRetrieval,
+		ID:         id,
+		RecordedAt: fixed.Add(24 * time.Hour),
+		Operation:  interaction.OperationRetrieval,
 		SeedNodeIDs: []shoal.ID{
 			"span-b", "span-a", "span-b",
 		},
@@ -94,6 +96,21 @@ func TestProductRecorderIsFailClosedAndCanonical(t *testing.T) {
 		len(recorded.SeedNodeIDs) != 2 ||
 		recorded.SeedNodeIDs[0] != "span-a" {
 		t.Fatalf("canonical recorded session = %+v", recorded)
+	}
+	retried, err := recorder.Record(ctx, interaction.Session{
+		ID:         id,
+		RecordedAt: fixed.Add(-24 * time.Hour),
+		Operation:  interaction.OperationRetrieval,
+		SeedNodeIDs: []shoal.ID{
+			"span-b", "span-a", "span-b",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(recorded, retried) {
+		t.Fatalf("identical retry changed canonical result: %+v != %+v",
+			recorded, retried)
 	}
 
 	sink.result = recorded

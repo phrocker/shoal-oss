@@ -41,6 +41,7 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/graph"
 	"github.com/phrocker/shoal-oss/pkg/inference"
+	"github.com/phrocker/shoal-oss/pkg/ontology"
 	"github.com/phrocker/shoal-oss/pkg/retrieval"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
@@ -454,15 +455,16 @@ func (b Builder) ExpandNeighbors(
 }
 
 type verifier struct {
-	ctx       context.Context
-	reader    Reader
-	limits    Limits
-	documents map[documentKey]*documentIndex
-	nodes     map[shoal.ID]graph.Node
-	edges     map[shoal.ID]graph.Edge
-	sections  int
-	spans     int
-	bytes     int
+	ctx        context.Context
+	reader     Reader
+	limits     Limits
+	documents  map[documentKey]*documentIndex
+	nodes      map[shoal.ID]graph.Node
+	edges      map[shoal.ID]graph.Edge
+	assertions map[shoal.ID]ontology.Assertion
+	sections   int
+	spans      int
+	bytes      int
 }
 
 type documentKey struct {
@@ -488,9 +490,10 @@ func newVerifier(
 ) (*verifier, error) {
 	v := &verifier{
 		ctx: ctx, reader: reader, limits: limits,
-		documents: make(map[documentKey]*documentIndex),
-		nodes:     make(map[shoal.ID]graph.Node),
-		edges:     make(map[shoal.ID]graph.Edge),
+		documents:  make(map[documentKey]*documentIndex),
+		nodes:      make(map[shoal.ID]graph.Node),
+		edges:      make(map[shoal.ID]graph.Edge),
+		assertions: make(map[shoal.ID]ontology.Assertion),
 	}
 	if len(views) > limits.MaxDocuments {
 		return nil, invalid("hydrated documents exceed the document bound")
@@ -604,6 +607,9 @@ func (v *verifier) graphAnchor(path graph.Path) (inference.EvidenceAnchor, error
 				"graph path edge does not match hydrated Explorer data")
 		}
 	}
+	if _, err := v.assertionsForPath(path); err != nil {
+		return inference.EvidenceAnchor{}, err
+	}
 	return inference.NewGraphAnchor(path)
 }
 
@@ -673,6 +679,9 @@ func (v *verifier) addNeighborhood(neighborhood explorer.Neighborhood) error {
 	if len(neighborhood.Edges) > v.limits.MaxGraphEdges {
 		return invalid("hydrated graph exceeds the edge bound")
 	}
+	if len(neighborhood.Assertions) > v.limits.MaxGraphEdges {
+		return invalid("hydrated graph exceeds the assertion bound")
+	}
 	payloadBytes, err := neighborhoodPayloadBytes(neighborhood)
 	if err != nil {
 		return err
@@ -708,6 +717,28 @@ func (v *verifier) addNeighborhood(neighborhood explorer.Neighborhood) error {
 		}
 		localEdges[edge.ID] = edge
 	}
+	localAssertions := make(map[shoal.ID]ontology.Assertion, len(neighborhood.Assertions))
+	for _, assertion := range neighborhood.Assertions {
+		if err := assertion.Validate(); err != nil {
+			return err
+		}
+		edgeID := assertion.ID()
+		if mapped := assertion.Metadata()["shoal.graph.edge_id"]; mapped != "" {
+			edgeID = shoal.ID(mapped)
+		}
+		if err := shoal.ValidateRequiredID(
+			"hydrated assertion edge ID", edgeID); err != nil {
+			return err
+		}
+		if existing, duplicate := localAssertions[edgeID]; duplicate {
+			if existing.ID() != assertion.ID() {
+				return invalid(
+					"graph edge has multiple authoritative assertions")
+			}
+			continue
+		}
+		localAssertions[edgeID] = assertion
+	}
 	additionalBytes := 0
 	additionalNodes := 0
 	for id, node := range localNodes {
@@ -734,6 +765,13 @@ func (v *verifier) addNeighborhood(neighborhood explorer.Neighborhood) error {
 			if !canonicalEqual(existing, edge) {
 				return invalid("hydrated graph edge conflicts with prior content")
 			}
+			for id, assertion := range localAssertions {
+				if existing, ok := v.assertions[id]; ok &&
+					existing.ID() != assertion.ID() {
+					return invalid(
+						"hydrated assertion conflicts with prior content")
+				}
+			}
 			continue
 		}
 		additionalEdges++
@@ -755,6 +793,11 @@ func (v *verifier) addNeighborhood(neighborhood explorer.Neighborhood) error {
 	for id, edge := range localEdges {
 		if _, exists := v.edges[id]; !exists {
 			v.edges[id] = cloneEdge(edge)
+		}
+		for id, assertion := range localAssertions {
+			if _, exists := v.assertions[id]; !exists {
+				v.assertions[id] = assertion
+			}
 		}
 	}
 	v.bytes += additionalBytes
