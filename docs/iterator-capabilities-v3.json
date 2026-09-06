@@ -1,5 +1,5 @@
 {
-  "version": 2,
+  "version": 3,
   "accumuloVersion": "4.0",
   "mandatoryStacks": [
     {
@@ -230,6 +230,7 @@
       ],
       "optionKeys": [
         "query.b64",
+        "embeddingSpace",
         "topK",
         "embeddingCF",
         "metric",

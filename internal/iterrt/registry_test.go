@@ -62,7 +62,7 @@ func TestRegistrySnapshot(t *testing.T) {
 }
 
 func TestRegistryInventoryJSONIsCurrent(t *testing.T) {
-	data, err := os.ReadFile(filepath.Join("..", "..", "docs", "iterator-capabilities-v2.json"))
+	data, err := os.ReadFile(filepath.Join("..", "..", "docs", "iterator-capabilities-v3.json"))
 	if err != nil {
 		t.Fatalf("ReadFile: %v", err)
 	}
