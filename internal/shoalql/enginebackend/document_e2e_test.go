@@ -162,6 +162,7 @@ func TestDocE2E_ParquetParity(t *testing.T) {
 }
 
 func TestDocE2E_SemanticIndexHydratesDocumentIdentity(t *testing.T) {
+	const embeddingSpace = "test-provider:test-model-v1:4:l2"
 	eng, _, cat := newEngineWithDocs(t)
 	defer eng.Close()
 	store := vectorindex.NewMemoryStore()
@@ -170,11 +171,11 @@ func TestDocE2E_SemanticIndexHydratesDocumentIdentity(t *testing.T) {
 		Seed: 7, ShardCount: 2,
 	})
 	records := []vectorindex.VectorRecord{
-		{ID: "email/u1", Vector: []float32{1, 0, 0, 0}, Timestamp: 100,
+		{ID: "email/u1", Vector: []float32{1, 0, 0, 0}, EmbeddingSpace: embeddingSpace, Timestamp: 100,
 			Document: vectorindex.DocumentRef{Shard: "20240101_1", Datatype: "email", UID: "u1"}},
-		{ID: "email/u2", Vector: []float32{0, 1, 0, 0}, Timestamp: 100,
+		{ID: "email/u2", Vector: []float32{0, 1, 0, 0}, EmbeddingSpace: embeddingSpace, Timestamp: 100,
 			Document: vectorindex.DocumentRef{Shard: "20240101_2", Datatype: "email", UID: "u2"}},
-		{ID: "email/u3", Vector: []float32{0.9, 0.1, 0, 0}, Timestamp: 100,
+		{ID: "email/u3", Vector: []float32{0.9, 0.1, 0, 0}, EmbeddingSpace: embeddingSpace, Timestamp: 100,
 			Document: vectorindex.DocumentRef{Shard: "20240102_1", Datatype: "email", UID: "u3"}},
 	}
 	if _, err := manager.Build(context.Background(), "docs_ivf", records, 100); err != nil {
@@ -184,7 +185,8 @@ func TestDocE2E_SemanticIndexHydratesDocumentIdentity(t *testing.T) {
 	res := runE2E(t, cat, exec,
 		"SELECT id, SUBJECT FROM emails ORDER BY embedding <-> [1,0,0,0] LIMIT 2",
 		shoalql.PlanOptions{Vector: shoalql.VectorOptions{
-			Mode: shoalql.VectorApproximate, Index: "docs_ivf", NProbe: 2,
+			Mode: shoalql.VectorApproximate, Index: "docs_ivf",
+			EmbeddingSpace: embeddingSpace, NProbe: 2,
 		}})
 	ids := idsOf(t, res)
 	if fmt.Sprint(ids) != "[u1 u3]" {
@@ -193,7 +195,8 @@ func TestDocE2E_SemanticIndexHydratesDocumentIdentity(t *testing.T) {
 	filtered := runE2E(t, cat, exec,
 		"SELECT id FROM emails WHERE SENDER = 'alice' ORDER BY embedding <-> [0,1,0,0] LIMIT 2",
 		shoalql.PlanOptions{Vector: shoalql.VectorOptions{
-			Mode: shoalql.VectorApproximate, Index: "docs_ivf", NProbe: 2,
+			Mode: shoalql.VectorApproximate, Index: "docs_ivf",
+			EmbeddingSpace: embeddingSpace, NProbe: 2,
 		}})
 	if got := idsOf(t, filtered); fmt.Sprint(got) != "[u1 u3]" {
 		t.Fatalf("semantic predicate must filter before top-k: %v", got)
@@ -201,7 +204,8 @@ func TestDocE2E_SemanticIndexHydratesDocumentIdentity(t *testing.T) {
 	explain := runE2E(t, cat, exec,
 		"EXPLAIN FORMAT JSON SELECT id FROM emails ORDER BY embedding <-> [1,0,0,0] LIMIT 2",
 		shoalql.PlanOptions{Vector: shoalql.VectorOptions{
-			Mode: shoalql.VectorApproximate, Index: "docs_ivf", NProbe: 2,
+			Mode: shoalql.VectorApproximate, Index: "docs_ivf",
+			EmbeddingSpace: embeddingSpace, NProbe: 2,
 			Freshness:     vectorindex.Freshness{RequiredGeneration: 1, MinimumWatermark: 100},
 			ExactFallback: true,
 		}}).Rows[0][0].Str

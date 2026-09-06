@@ -5,6 +5,7 @@
 package embedconverge
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"sync"
@@ -14,6 +15,8 @@ import (
 	"github.com/phrocker/shoal-oss/internal/compaction"
 	"github.com/phrocker/shoal-oss/internal/embeddingspace"
 	"github.com/phrocker/shoal-oss/internal/iterrt"
+	"github.com/phrocker/shoal-oss/internal/rfile"
+	"github.com/phrocker/shoal-oss/internal/rfile/wire"
 )
 
 func passthrough() Rewriter {
@@ -42,6 +45,62 @@ func mustConverger(t *testing.T, opts ConvergerOptions) *Converger {
 		t.Fatalf("NewConverger: %v", err)
 	}
 	return c
+}
+
+func convergenceInput(
+	t *testing.T, name string, state embeddingspace.FileState,
+) compaction.Input {
+	return convergenceInputWithVisibility(t, name, state, nil, []byte("value"))
+}
+
+func convergenceInputWithVisibility(
+	t *testing.T,
+	name string,
+	state embeddingspace.FileState,
+	visibility []byte,
+	value []byte,
+) compaction.Input {
+	t.Helper()
+	var buf bytes.Buffer
+	w, err := rfile.NewWriter(&buf, rfile.WriterOptions{EmbeddingSpace: state})
+	if err != nil {
+		t.Fatalf("NewWriter(%s): %v", name, err)
+	}
+	if err := w.Append(&wire.Key{
+		Row: []byte(name), ColumnFamily: []byte("cf"),
+		ColumnVisibility: append([]byte(nil), visibility...), Timestamp: 1,
+	}, append([]byte(nil), value...)); err != nil {
+		t.Fatalf("Append(%s): %v", name, err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close(%s): %v", name, err)
+	}
+	return compaction.Input{Name: name, Bytes: buf.Bytes()}
+}
+
+func readSingleCompactionCell(
+	t *testing.T, image []byte,
+) (*wire.Key, []byte) {
+	t.Helper()
+	var gotKey *wire.Key
+	var gotValue []byte
+	err := compaction.StreamCells(compaction.Spec{
+		Inputs: []compaction.Input{{Name: "output.rf", Bytes: image}},
+	}, func(key *wire.Key, value []byte) error {
+		if gotKey != nil {
+			t.Fatal("output contained more than one cell")
+		}
+		gotKey = key.Clone()
+		gotValue = append([]byte(nil), value...)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotKey == nil {
+		t.Fatal("output contained no cells")
+	}
+	return gotKey, gotValue
 }
 
 func TestNewConvergerRequiresATargetAndItsCollaborators(t *testing.T) {
@@ -90,6 +149,95 @@ func TestConvergerRefusesATargetItCannotProduce(t *testing.T) {
 	}
 	if attempt == nil {
 		t.Fatal("an admitted Begin must return an attempt")
+	}
+}
+
+func TestEgressDenialPreservesIdentityVisibilityAndSourceBytes(t *testing.T) {
+	input := convergenceInputWithVisibility(
+		t, "classified", embeddingspace.Has("model-old"),
+		[]byte("secret&legal"), []byte("source-bytes"),
+	)
+	var rewrites int
+	var outcomes []Outcome
+	converger := mustConverger(t, ConvergerOptions{
+		Target:   "model-hosted",
+		Governor: NewGovernor(GovernorOptions{Now: time.Now}),
+		EgressGuard: EgressGuardFunc(func(
+			_ context.Context, target string, visibility []byte,
+		) error {
+			if target != "model-hosted" ||
+				string(visibility) != "secret&legal" {
+				t.Fatalf("egress check = target %q visibility %q", target, visibility)
+			}
+			return errors.New("classification requires local embedding")
+		}),
+		Rewriter: RewriterFunc(func(
+			_ context.Context, _ string, _ *iterrt.Key, _ []byte,
+		) ([]byte, error) {
+			rewrites++
+			return []byte("rewritten"), nil
+		}),
+		Observer: func(outcome Outcome) {
+			outcomes = append(outcomes, outcome)
+		},
+	})
+	result, err := compaction.Compact(compaction.Spec{
+		Inputs: []compaction.Input{input}, Scope: iterrt.ScopeMajc,
+		TargetEmbeddingSpace: "model-hosted", Converger: converger,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Converged || result.EmbeddingSpace != embeddingspace.Has("model-old") {
+		t.Fatalf("result = converged %t space %s", result.Converged, result.EmbeddingSpace)
+	}
+	if rewrites != 0 {
+		t.Fatalf("rewriter calls = %d, want 0", rewrites)
+	}
+	stats := converger.governor.Stats()
+	if stats.SpentFiles != 0 || stats.SpentCells != 0 {
+		t.Fatalf("governor spent denied work: %+v", stats)
+	}
+	if len(outcomes) != 1 || !errors.Is(outcomes[0].Err, ErrEgressDenied) {
+		t.Fatalf("outcomes = %+v, want typed egress denial", outcomes)
+	}
+	key, value := readSingleCompactionCell(t, result.Output)
+	if string(key.ColumnVisibility) != "secret&legal" ||
+		string(value) != "source-bytes" {
+		t.Fatalf("fallback changed visibility/value: %q %q", key.ColumnVisibility, value)
+	}
+}
+
+func TestRewriterCannotWidenVisibility(t *testing.T) {
+	input := convergenceInputWithVisibility(
+		t, "classified", embeddingspace.Has("model-old"),
+		[]byte("secret"), []byte("source"),
+	)
+	converger := mustConverger(t, ConvergerOptions{
+		Target:   "model-new",
+		Governor: NewGovernor(GovernorOptions{Now: time.Now}),
+		Rewriter: RewriterFunc(func(
+			_ context.Context, _ string, key *iterrt.Key, _ []byte,
+		) ([]byte, error) {
+			key.ColumnVisibility = []byte("public")
+			return []byte("rewritten"), nil
+		}),
+	})
+	result, err := compaction.Compact(compaction.Spec{
+		Inputs: []compaction.Input{input}, Scope: iterrt.ScopeMajc,
+		TargetEmbeddingSpace: "model-new", Converger: converger,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Converged ||
+		result.EmbeddingSpace != embeddingspace.Has("model-new") {
+		t.Fatalf("result = converged %t space %s", result.Converged, result.EmbeddingSpace)
+	}
+	key, value := readSingleCompactionCell(t, result.Output)
+	if string(key.ColumnVisibility) != "secret" ||
+		string(value) != "rewritten" {
+		t.Fatalf("rewrite changed key visibility or lost value: %q %q", key.ColumnVisibility, value)
 	}
 }
 
@@ -327,6 +475,196 @@ func TestConvergerBeginRespectsTheRateLimitAndContext(t *testing.T) {
 		Target: "model-a", Inputs: states(1),
 	}); !errors.Is(err, context.Canceled) {
 		t.Fatalf("err = %v, want context.Canceled", err)
+	}
+}
+
+func TestLazyCompactionConvergesWhenBurstIsSmallerThanMergeWidth(t *testing.T) {
+	t.Parallel()
+
+	clock := newFakeClock()
+	g := NewGovernor(GovernorOptions{
+		FilesPerSecond: 1,
+		Burst:          1,
+		Budget:         Budget{MaxFiles: 4},
+		Now:            clock.Now,
+	})
+	c := mustConverger(t, ConvergerOptions{
+		Target:   "model-new",
+		Governor: g,
+	})
+	inputs := []compaction.Input{
+		convergenceInput(t, "a.rf", embeddingspace.Has("model-old")),
+		convergenceInput(t, "b.rf", embeddingspace.Has("model-old")),
+		convergenceInput(t, "c.rf", embeddingspace.Has("model-old")),
+		convergenceInput(t, "d.rf", embeddingspace.Has("model-old")),
+	}
+
+	result, err := compaction.Compact(compaction.Spec{
+		Inputs:               inputs,
+		Scope:                iterrt.ScopeMajc,
+		TargetEmbeddingSpace: "model-new",
+		Converger:            c,
+	})
+	if err != nil {
+		t.Fatalf("Compact: %v", err)
+	}
+	if !result.Converged || result.EmbeddingSpace != embeddingspace.Has("model-new") {
+		t.Fatalf("result = (converged=%v, space=%s), want model-new",
+			result.Converged, result.EmbeddingSpace)
+	}
+	stats := g.Stats()
+	if stats.Admitted != 4 || stats.SpentFiles != 4 || stats.SpentCells != 4 {
+		t.Fatalf("stats = %+v, want four files and four cells charged", stats)
+	}
+}
+
+func TestWideLazyCompactionCancellationTakesNothing(t *testing.T) {
+	t.Parallel()
+
+	g := NewGovernor(GovernorOptions{
+		FilesPerSecond: 1,
+		Burst:          1,
+		Budget:         Budget{MaxFiles: 4},
+		Now:            newFakeClock().Now,
+	})
+	c := mustConverger(t, ConvergerOptions{
+		Target:   "model-new",
+		Governor: g,
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	result, err := compaction.CompactContext(ctx, compaction.Spec{
+		Inputs: []compaction.Input{
+			convergenceInput(t, "a.rf", embeddingspace.Has("model-old")),
+			convergenceInput(t, "b.rf", embeddingspace.Has("model-old")),
+			convergenceInput(t, "c.rf", embeddingspace.Has("model-old")),
+			convergenceInput(t, "d.rf", embeddingspace.Has("model-old")),
+		},
+		Scope:                iterrt.ScopeMajc,
+		TargetEmbeddingSpace: "model-new",
+		Converger:            c,
+	}, nil)
+	if result != nil {
+		t.Fatal("a cancelled compaction must not publish an output")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("CompactContext error = %v, want context.Canceled", err)
+	}
+	stats := g.Stats()
+	if stats.Admitted != 0 || stats.Refused != 0 || stats.SpentFiles != 0 || stats.SpentCells != 0 {
+		t.Fatalf("cancelled compaction changed governor accounting: %+v", stats)
+	}
+}
+
+func TestWideLazyCompactionOutagePreservesIdentityAndCanRetry(t *testing.T) {
+	t.Parallel()
+
+	clock := newFakeClock()
+	g := NewGovernor(GovernorOptions{
+		FilesPerSecond: 1,
+		Burst:          1,
+		Budget:         Budget{MaxFiles: 2},
+		Now:            clock.Now,
+	})
+	outage := errors.New("provider unavailable")
+	c := mustConverger(t, ConvergerOptions{
+		Target:   "model-new",
+		Governor: g,
+		Rewriter: RewriterFunc(func(
+			_ context.Context, _ string, _ *iterrt.Key, value []byte,
+		) ([]byte, error) {
+			value[0] = 'X'
+			return nil, outage
+		}),
+	})
+	inputs := []compaction.Input{
+		convergenceInput(t, "a.rf", embeddingspace.Has("model-old")),
+		convergenceInput(t, "b.rf", embeddingspace.Has("model-old")),
+	}
+
+	result, err := compaction.Compact(compaction.Spec{
+		Inputs:               inputs,
+		Scope:                iterrt.ScopeMajc,
+		TargetEmbeddingSpace: "model-new",
+		Converger:            c,
+	})
+	if err != nil {
+		t.Fatalf("provider outage must not fail a same-space compaction: %v", err)
+	}
+	if result.Converged || result.EmbeddingSpace != embeddingspace.Has("model-old") {
+		t.Fatalf("result = (converged=%v, space=%s), want preserved model-old",
+			result.Converged, result.EmbeddingSpace)
+	}
+	values := 0
+	if err := compaction.StreamCells(compaction.Spec{
+		Inputs: []compaction.Input{{Name: "output.rf", Bytes: result.Output}},
+	}, func(_ *wire.Key, value []byte) error {
+		values++
+		if string(value) != "value" {
+			t.Fatalf("provider outage mutated fallback bytes: %q", value)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if values != len(inputs) {
+		t.Fatalf("fallback cells = %d, want %d", values, len(inputs))
+	}
+	if got := g.Stats().SpentFiles; got != 0 {
+		t.Fatalf("SpentFiles = %d, want the failed reservation refunded", got)
+	}
+
+	if _, err := c.Begin(context.Background(), compaction.ConvergeRequest{
+		Target: "model-new", Inputs: states(2),
+	}); !errors.Is(err, ErrThrottled) {
+		t.Fatalf("immediate retry error = %v, want ErrThrottled", err)
+	}
+	clock.Advance(time.Second)
+	if _, err := c.Begin(context.Background(), compaction.ConvergeRequest{
+		Target: "model-new", Inputs: states(2),
+	}); err != nil {
+		t.Fatalf("retry after refill: %v", err)
+	}
+}
+
+func TestWideLazyCompactionNeverMergesDifferentIdentitiesOnOutage(t *testing.T) {
+	t.Parallel()
+
+	g := NewGovernor(GovernorOptions{
+		FilesPerSecond: 1,
+		Burst:          1,
+		Budget:         Budget{MaxFiles: 2},
+		Now:            newFakeClock().Now,
+	})
+	c := mustConverger(t, ConvergerOptions{
+		Target:   "model-new",
+		Governor: g,
+		Rewriter: RewriterFunc(func(
+			_ context.Context, _ string, _ *iterrt.Key, _ []byte,
+		) ([]byte, error) {
+			return nil, errors.New("provider unavailable")
+		}),
+	})
+
+	result, err := compaction.Compact(compaction.Spec{
+		Inputs: []compaction.Input{
+			convergenceInput(t, "a.rf", embeddingspace.Has("model-a")),
+			convergenceInput(t, "b.rf", embeddingspace.Has("model-b")),
+		},
+		Scope:                iterrt.ScopeMajc,
+		TargetEmbeddingSpace: "model-new",
+		Converger:            c,
+	})
+	if result != nil {
+		t.Fatal("a failed mixed-space convergence must not publish an output")
+	}
+	if !errors.Is(err, compaction.ErrConvergenceRequired) ||
+		!errors.Is(err, embeddingspace.ErrMismatch) {
+		t.Fatalf("Compact error = %v, want ErrConvergenceRequired and ErrMismatch", err)
+	}
+	if got := g.Stats().SpentFiles; got != 0 {
+		t.Fatalf("SpentFiles = %d, want the failed reservation refunded", got)
 	}
 }
 

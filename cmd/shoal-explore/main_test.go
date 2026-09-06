@@ -244,9 +244,105 @@ func TestAskMarkdownAndNoEvidenceOutput(t *testing.T) {
 }
 
 func TestAskMarkdownCodePadsBacktickBoundaries(t *testing.T) {
+	if rendered := markdownCode(""); rendered != "" {
+		t.Fatalf("empty markdown code span = %q", rendered)
+	}
 	rendered := markdownCode("`model`")
 	if rendered != "`` `model` ``" {
 		t.Fatalf("markdown code span = %q", rendered)
+	}
+	rendered = markdownCode("line one\r\n\r<script>alert(1)</script>")
+	if rendered != "`line one  <script>alert(1)</script>`" {
+		t.Fatalf("multiline markdown code span = %q", rendered)
+	}
+}
+
+func TestAskMarkdownEscapesOnceAndUsesCodeSpans(t *testing.T) {
+	const (
+		answer = "Résumé_budget -> <script>alert(\"x\")</script> & [link](javascript:alert(1)) *bold*\n" +
+			"# heading\n- item\n1. item\n> quote\nsafe + plus!\nordinary text\n===\nanother line\n--\n" +
+			"#hashtag\n---version\n-- -\n###### heading\n####### heading\n" +
+			"    *space* <script>alert(2)</script>\n\t# tabbed & [link](javascript:alert(2))"
+		errorText = "budget_exhausted ->\n\n<img src=x onerror=alert(1)>"
+	)
+	response := askOutput{
+		Answer: answer,
+		Execution: askExecution{
+			Authorization: "role_admin -> tenant_日本",
+		},
+		Claims: []askClaim{{
+			Subject:    askID("subject"),
+			Predicate:  askID("predicate"),
+			Object:     askValue{Value: "budget_exhausted -> <b>unsafe</b>"},
+			Confidence: 0.5,
+			EvidenceIDs: []askID{
+				"evidence_α",
+				"evidence_[β]",
+			},
+		}},
+		Issues: []askIssue{{
+			Kind:   inference.IssueUnresolved,
+			Input:  "input_*_[x]",
+			Reason: "<script>alert(1)</script> budget_exhausted ->",
+		}},
+		Evidence: []askEvidence{{
+			ID:   askID("evidence_α"),
+			Kind: inference.AnchorGraph,
+			Path: &askPath{
+				Nodes: []askNode{{ID: askID("node_α")}, {ID: askID("node_[β]")}},
+				Edges: []askEdge{{ID: askID("edge_一")}, {ID: askID("edge_*_二")}},
+			},
+		}},
+		DetailedTrace: &askDetailedTrace{
+			Iterations: []askIterationTrace{{
+				Index:       1,
+				Failure:     errorText,
+				EvidenceIDs: []askID{"evidence_α", "evidence_[β]"},
+			}},
+			Failures: []harness.FailureTrace{{
+				Iteration: 1,
+				Operation: "tool_call",
+				Error:     errorText,
+			}},
+		},
+	}
+
+	var output bytes.Buffer
+	if err := writeAskMarkdown(&output, response); err != nil {
+		t.Fatal(err)
+	}
+	rendered := output.String()
+	indent := strings.Repeat("\u00a0", 4)
+	for _, want := range []string{
+		"Résumé\\_budget -> \\<script>alert(\"x\")\\</script> \\& \\[link\\](javascript:alert(1)) \\*bold\\*",
+		"\\# heading\n\\- item\n1\\. item\n\\> quote\nsafe + plus!\nordinary text\n\\===\nanother line\n\\--\n" +
+			"#hashtag\n---version\n\\-- -\n\\###### heading\n####### heading\n" +
+			indent + "\\*space\\* \\<script>alert(2)\\</script>\n" +
+			indent + "\\# tabbed \\& \\[link\\](javascript:alert(2))",
+		"- authorization: `role_admin -> tenant_日本`",
+		"- `subject` `predicate` `budget_exhausted -> <b>unsafe</b>` (confidence 0.5; evidence `evidence_α, evidence_[β]`)",
+		"- `unresolved`: `input_*_[x]` (`<script>alert(1)</script> budget_exhausted ->`)",
+		"- graph path nodes: `node_α -> node_[β]`",
+		"- graph path edges: `edge_一 -> edge_*_二`",
+		"evidence `evidence_α, evidence_[β]`, failure `budget_exhausted ->  <img src=x onerror=alert(1)>`",
+		"- iteration 1 `tool_call`: `budget_exhausted ->  <img src=x onerror=alert(1)>`",
+	} {
+		if !strings.Contains(rendered, want) {
+			t.Errorf("markdown missing %q:\n%s", want, rendered)
+		}
+	}
+	for _, unwanted := range []string{
+		"&lt;",
+		"&gt;",
+		"&amp;",
+		"budget\\_exhausted",
+		"\\-&gt;",
+		"\n<script>",
+		"\n\n<img src=x onerror=alert(1)>",
+	} {
+		if strings.Contains(rendered, unwanted) {
+			t.Errorf("markdown contains unsafe or double-escaped %q:\n%s", unwanted, rendered)
+		}
 	}
 }
 

@@ -2,12 +2,14 @@ package agentmem
 
 import (
 	"context"
+	"fmt"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/phrocker/shoal-oss/internal/embeddingspace"
 	"github.com/phrocker/shoal-oss/internal/embedpb"
 	"github.com/phrocker/shoal-oss/internal/graphschema"
 	"github.com/phrocker/shoal-oss/pkg/extraction"
@@ -25,7 +27,23 @@ type IngestResult struct {
 }
 
 func (c *Client) EnsureTable(ctx context.Context) error {
-	return c.cfg.Store.CreateTable(ctx, c.cfg.Table, []string{graphschema.EventRowPrefix, graphschema.EntityRowPrefix, graphschema.TermRowPrefix})
+	if store, ok := c.cfg.Store.(interface {
+		CreateTableWithEmbedding(context.Context, string, []string, string) error
+	}); ok {
+		return store.CreateTableWithEmbedding(
+			ctx,
+			c.cfg.Table,
+			[]string{
+				graphschema.EventRowPrefix,
+				graphschema.EntityRowPrefix,
+				graphschema.TermRowPrefix,
+			},
+			embeddingspace.Has(c.cfg.EmbeddingSpace).String(),
+		)
+	}
+	return fmt.Errorf(
+		"%w: agent-memory store does not support embedding-aware table creation",
+		embeddingspace.ErrQueryMetadataMissing)
 }
 
 func (c *Client) Ingest(ctx context.Context, req IngestRequest) (IngestResult, error) {
@@ -89,7 +107,7 @@ func (c *Client) indexVectorForFreshness(ctx context.Context, vertexID string, v
 	if ix == nil {
 		return
 	}
-	_ = ix.Add(ctx, vertexID, vec)
+	_ = ix.AddInSpace(ctx, vertexID, vec, c.cfg.EmbeddingSpace)
 }
 
 func (c *Client) previousEvent(ctx context.Context, current []byte) string {

@@ -446,10 +446,17 @@ func writeError(writer http.ResponseWriter, err error) {
 	case shoal.ErrorDeadline:
 		status, code = http.StatusGatewayTimeout, shoal.ErrorDeadline
 	}
+	var embedding *wireEmbeddingQueryReport
+	var embeddingErr *EmbeddingQueryError
+	if errors.As(err, &embeddingErr) {
+		report := embeddingErr.EmbeddingQueryReport()
+		embedding = wireEmbeddingQueryReportValue(&report)
+	}
 	writeResponse(writer, status, struct {
-		Code    shoal.ErrorCode `json:"code"`
-		Message string          `json:"message"`
-	}{Code: code, Message: err.Error()})
+		Code      shoal.ErrorCode           `json:"code"`
+		Message   string                    `json:"message"`
+		Embedding *wireEmbeddingQueryReport `json:"embedding,omitempty"`
+	}{Code: code, Message: err.Error(), Embedding: embedding})
 }
 
 func primaryErrorCode(err error) shoal.ErrorCode {

@@ -93,7 +93,8 @@ func (e *Executor) runSemanticDocument(ctx context.Context, p *Plan) (*Result, e
 	}
 	hits, _, err := backend.SearchVector(ctx, VectorSearchRequest{
 		Index: p.VectorIndex, Query: append([]float32(nil), p.VectorQuery...),
-		TopK: p.VectorTopK, NProbe: p.VectorNProbe, AsOf: p.AsOf,
+		EmbeddingSpace: p.VectorEmbeddingSpace,
+		TopK:           p.VectorTopK, NProbe: p.VectorNProbe, AsOf: p.AsOf,
 		Freshness: p.VectorFreshness, ExactFallback: p.VectorExactFallback,
 		AllowedDocuments: allowedDocuments,
 	})

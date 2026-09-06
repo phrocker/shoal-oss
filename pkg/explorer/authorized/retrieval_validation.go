@@ -21,6 +21,7 @@ package authorized
 
 import (
 	"context"
+	"errors"
 	"math"
 	"sort"
 	"strings"
@@ -65,27 +66,6 @@ type VectorScorer interface {
 
 func (c *Client) authorizedVectorScoringAvailable() bool {
 	return !isNilDependency(c.vectorScorer)
-}
-
-func (c *Client) probeAuthorizedVector(
-	ctx context.Context, request retrieval.Request,
-) error {
-	if !request.HasMode(retrieval.ModeVector) {
-		return nil
-	}
-	if isNilDependency(c.vectorScorer) {
-		return shoal.NewError(
-			shoal.ErrorUnavailable,
-			"authorized vector retrieval requires trusted vector validation",
-		)
-	}
-	_, err := c.vectorScorer.VectorScores(ctx, explorer.VectorScoreRequest{
-		Text: request.Text,
-	})
-	if err != nil {
-		return directBaseError(err)
-	}
-	return nil
 }
 
 func (c *Client) hydrateRetrievalCorpus(
@@ -284,6 +264,33 @@ func (c *Client) validateRetrievedResponse(
 	decision auth.Decision,
 	now time.Time,
 ) error {
+	return c.validateRetrievedResponseInternal(
+		ctx, response, request, corpus, decision, now, nil, false)
+}
+
+func (c *Client) validateRetrievedResponseWithVectorScores(
+	ctx context.Context,
+	response retrieval.Response,
+	request retrieval.Request,
+	corpus *canonicalRetrievalCorpus,
+	decision auth.Decision,
+	now time.Time,
+	vectorScores map[shoal.ID]shoal.Score,
+) error {
+	return c.validateRetrievedResponseInternal(
+		ctx, response, request, corpus, decision, now, vectorScores, true)
+}
+
+func (c *Client) validateRetrievedResponseInternal(
+	ctx context.Context,
+	response retrieval.Response,
+	request retrieval.Request,
+	corpus *canonicalRetrievalCorpus,
+	decision auth.Decision,
+	now time.Time,
+	vectorScores map[shoal.ID]shoal.Score,
+	vectorScoresProvided bool,
+) error {
 	analyzer := retrieval.UnicodeTermAnalyzer{}
 	scorer := retrieval.CoverageFusionScorer{}
 	queryTerms := analyzer.Analyze(request.Text)
@@ -291,9 +298,13 @@ func (c *Client) validateRetrievedResponse(
 	for _, nodeID := range request.Scope.NodeIDs {
 		nodeScope[nodeID] = struct{}{}
 	}
-	vectorScores, err := c.authorizedVectorScores(ctx, request, corpus, nodeScope)
-	if err != nil {
-		return err
+	if !vectorScoresProvided {
+		var err error
+		vectorScores, err = c.authorizedVectorScores(
+			ctx, request, corpus, nodeScope)
+		if err != nil {
+			return err
+		}
 	}
 	expectedIDs := make([]shoal.ID, 0)
 	expectedResults := make([]retrieval.Result, 0)
@@ -459,12 +470,47 @@ func (c *Client) authorizedVectorScores(
 		Citations: citations,
 	})
 	if err != nil {
-		return nil, directBaseError(err)
+		return nil, authorizedVectorError(err)
 	}
 	if len(scores) != len(citations) {
 		return nil, inconsistentRetrieval()
 	}
 	return scores, nil
+}
+
+func authorizedVectorError(err error) error {
+	switch {
+	case errors.Is(err, context.Canceled),
+		shoal.IsErrorCode(err, shoal.ErrorCanceled):
+		return shoal.WrapError(shoal.ErrorCanceled, "authorized vector retrieval canceled", context.Canceled)
+	case errors.Is(err, context.DeadlineExceeded),
+		shoal.IsErrorCode(err, shoal.ErrorDeadline):
+		return shoal.WrapError(
+			shoal.ErrorDeadline,
+			"authorized vector retrieval deadline exceeded",
+			context.DeadlineExceeded,
+		)
+	case shoal.IsErrorCode(err, shoal.ErrorInvalidArgument):
+		return shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			"authorized vector retrieval request is invalid",
+		)
+	case shoal.IsErrorCode(err, shoal.ErrorConflict):
+		return shoal.NewError(
+			shoal.ErrorConflict,
+			"authorized vector retrieval has incompatible embedding metadata",
+		)
+	case shoal.IsErrorCode(err, shoal.ErrorUnavailable):
+		return shoal.NewError(
+			shoal.ErrorUnavailable,
+			"an authorized embedding provider is unavailable",
+		)
+	default:
+		return shoal.NewError(
+			shoal.ErrorInternal,
+			"authorized vector retrieval failed",
+		)
+	}
 }
 
 func applyCanonicalVectorScore(

@@ -24,6 +24,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/phrocker/shoal-oss/internal/embeddingspace"
 	"github.com/phrocker/shoal-oss/internal/embedpb"
 	"github.com/phrocker/shoal-oss/internal/ivfpq"
 )
@@ -41,6 +42,7 @@ type IvfIndex struct {
 	pq        *ivfpq.VectorPQ
 	centroids *ivfpq.Centroids
 	version   int32
+	space     string
 }
 
 // IvfResult is one approximate-nearest-neighbor hit. Row is the original source
@@ -53,6 +55,9 @@ type IvfResult struct {
 
 // Version reports the codebook version the index was loaded against.
 func (ix *IvfIndex) Version() int32 { return ix.version }
+
+// EmbeddingSpace reports the identity persisted with this codebook.
+func (ix *IvfIndex) EmbeddingSpace() string { return ix.space }
 
 // LoadIvfIndex reads the active codebook and centroids for graphTable's IVF-PQ
 // index from the <graphTable>_ann_config table. It returns an error if no index
@@ -71,34 +76,52 @@ func LoadIvfIndex(ctx context.Context, store EmbedStore, graphTable string) (*Iv
 		return nil, fmt.Errorf("agentmem: no trained IVF-PQ index for %q (missing %s in %s)",
 			graphTable, ivfpq.ConfigRowActiveVersion, cfgTable)
 	}
-	v, err := strconv.Atoi(strings.TrimSpace(string(versionBlob)))
+	parsedVersion, err := strconv.ParseInt(
+		strings.TrimSpace(string(versionBlob)), 10, 32)
 	if err != nil {
 		return nil, fmt.Errorf("agentmem: bad active version %q: %w", versionBlob, err)
 	}
-	version := int32(v)
+	version := int32(parsedVersion)
+	spaceBlob, err := readConfigCell(
+		ctx, store, cfgTable, ivfpq.EmbeddingSpaceRow(version))
+	if err != nil {
+		return nil, fmt.Errorf(
+			"agentmem: read embedding space v%d: %w", parsedVersion, err)
+	}
+	if spaceBlob == nil {
+		return nil, fmt.Errorf(
+			"%w: legacy IVF-PQ codebook v%d has no embedding-space identity",
+			embeddingspace.ErrQueryMetadataMissing, parsedVersion)
+	}
+	space := string(spaceBlob)
+	if err := (embeddingspace.FileState{
+		State: embeddingspace.StateHasEmbeddings, Identity: space,
+	}).Validate(); err != nil {
+		return nil, err
+	}
 
 	pqBlob, err := readConfigCell(ctx, store, cfgTable, ivfpq.PQRow(version))
 	if err != nil {
-		return nil, fmt.Errorf("agentmem: read PQ codebook v%d: %w", v, err)
+		return nil, fmt.Errorf("agentmem: read PQ codebook v%d: %w", parsedVersion, err)
 	}
 	if pqBlob == nil {
 		return nil, fmt.Errorf("agentmem: missing PQ codebook %s in %s", ivfpq.PQRow(version), cfgTable)
 	}
 	pq, err := ivfpq.FromBytes(pqBlob)
 	if err != nil {
-		return nil, fmt.Errorf("agentmem: parse PQ codebook v%d: %w", v, err)
+		return nil, fmt.Errorf("agentmem: parse PQ codebook v%d: %w", parsedVersion, err)
 	}
 
 	centBlob, err := readConfigCell(ctx, store, cfgTable, ivfpq.CentroidsRow(version))
 	if err != nil {
-		return nil, fmt.Errorf("agentmem: read centroids v%d: %w", v, err)
+		return nil, fmt.Errorf("agentmem: read centroids v%d: %w", parsedVersion, err)
 	}
 	if centBlob == nil {
 		return nil, fmt.Errorf("agentmem: missing centroids %s in %s", ivfpq.CentroidsRow(version), cfgTable)
 	}
 	cent, err := ivfpq.CentroidsFromBytes(centBlob)
 	if err != nil {
-		return nil, fmt.Errorf("agentmem: parse centroids v%d: %w", v, err)
+		return nil, fmt.Errorf("agentmem: parse centroids v%d: %w", parsedVersion, err)
 	}
 
 	return &IvfIndex{
@@ -107,7 +130,30 @@ func LoadIvfIndex(ctx context.Context, store EmbedStore, graphTable string) (*Iv
 		pq:        pq,
 		centroids: cent,
 		version:   version,
+		space:     space,
 	}, nil
+}
+
+// LoadIvfIndexInSpace loads an index and verifies it was trained in expected.
+func LoadIvfIndexInSpace(
+	ctx context.Context,
+	store EmbedStore,
+	graphTable string,
+	expected string,
+) (*IvfIndex, error) {
+	if err := embeddingspace.ValidateQueryStates(
+		"load agent-memory IVF index", expected); err != nil {
+		return nil, err
+	}
+	index, err := LoadIvfIndex(ctx, store, graphTable)
+	if err != nil {
+		return nil, err
+	}
+	if err := embeddingspace.EnsureSameIdentity(
+		"load agent-memory IVF index", index.space, expected); err != nil {
+		return nil, err
+	}
+	return index, nil
 }
 
 // Search returns the approximate topK nearest source rows to query. It probes
@@ -116,6 +162,24 @@ func LoadIvfIndex(ctx context.Context, store EmbedStore, graphTable string) (*Iv
 // returns the best topK by descending score with ties broken by ascending row
 // for determinism. topK<=0 defaults to 10; nprobe<=0 defaults to 1.
 func (ix *IvfIndex) Search(ctx context.Context, query []float32, topK, nprobe int) ([]IvfResult, error) {
+	return nil, embeddingspace.ErrQueryIdentityRequired
+}
+
+// SearchInSpace searches only after verifying the supplied raw vector's space.
+func (ix *IvfIndex) SearchInSpace(
+	ctx context.Context,
+	query []float32,
+	embeddingSpace string,
+	topK, nprobe int,
+) ([]IvfResult, error) {
+	if err := embeddingspace.ValidateQueryStates(
+		"search agent-memory IVF index", embeddingSpace); err != nil {
+		return nil, err
+	}
+	if err := embeddingspace.EnsureSameIdentity(
+		"search agent-memory IVF index", ix.space, embeddingSpace); err != nil {
+		return nil, err
+	}
 	if topK <= 0 {
 		topK = 10
 	}
@@ -142,16 +206,55 @@ func (ix *IvfIndex) Search(ctx context.Context, query []float32, topK, nprobe in
 		if err != nil {
 			return nil, fmt.Errorf("agentmem: scan IVF cluster %d: %w", c, err)
 		}
+		type posting struct {
+			code       []byte
+			version    int32
+			hasVersion bool
+		}
+		postings := make(map[string]*posting)
 		for _, cell := range cells {
-			if string(cell.ColumnFamily) != ivfpq.ColFam || string(cell.ColumnQualifier) != ivfpq.QualPQCode {
+			if string(cell.ColumnFamily) != ivfpq.ColFam {
 				continue
 			}
-			vid := ivfpq.ExtractVertexID(string(cell.Row))
+			row := string(cell.Row)
+			entry := postings[row]
+			if entry == nil {
+				entry = &posting{}
+				postings[row] = entry
+			}
+			switch string(cell.ColumnQualifier) {
+			case ivfpq.QualPQCode:
+				entry.code = append([]byte(nil), cell.Value...)
+			case ivfpq.QualCodebookVersion:
+				value, err := strconv.ParseInt(
+					strings.TrimSpace(string(cell.Value)), 10, 32)
+				if err != nil {
+					continue
+				}
+				entry.version = int32(value)
+				entry.hasVersion = true
+			}
+		}
+		rows := make([]string, 0, len(postings))
+		for row := range postings {
+			rows = append(rows, row)
+		}
+		sort.Strings(rows)
+		for _, row := range rows {
+			entry := postings[row]
+			if !entry.hasVersion ||
+				entry.version != ix.version ||
+				len(entry.code) == 0 {
+				continue
+			}
+			vid := ivfpq.ExtractVertexID(row)
 			if seen[vid] {
 				continue
 			}
 			seen[vid] = true
-			hits = append(hits, scored{row: vid, score: ix.pq.Dot(cell.Value, ipTable)})
+			hits = append(hits, scored{
+				row: vid, score: ix.pq.Dot(entry.code, ipTable),
+			})
 		}
 	}
 
@@ -182,6 +285,24 @@ func (ix *IvfIndex) Search(ctx context.Context, query []float32, topK, nprobe in
 // added between trainings therefore stay consistent with this index's own
 // query path. The next full training re-encodes every vector authoritatively.
 func (ix *IvfIndex) Add(ctx context.Context, vertexID string, vec []float32) error {
+	return embeddingspace.ErrQueryIdentityRequired
+}
+
+// AddInSpace incrementally indexes a vector only in the codebook's space.
+func (ix *IvfIndex) AddInSpace(
+	ctx context.Context,
+	vertexID string,
+	vec []float32,
+	embeddingSpace string,
+) error {
+	if err := embeddingspace.ValidateQueryStates(
+		"update agent-memory IVF index", embeddingSpace); err != nil {
+		return err
+	}
+	if err := embeddingspace.EnsureSameIdentity(
+		"update agent-memory IVF index", ix.space, embeddingSpace); err != nil {
+		return err
+	}
 	if vertexID == "" {
 		return fmt.Errorf("agentmem: IvfIndex.Add: empty vertexID")
 	}

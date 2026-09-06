@@ -20,10 +20,10 @@ func ref(entry string) FileRef {
 
 func observations() []Observation {
 	return []Observation{
-		{Ref: ref("f-old.rf"), State: embeddingspace.Has("model-b")},
-		{Ref: ref("f-target.rf"), State: embeddingspace.Has("model-a")},
-		{Ref: ref("f-none.rf"), State: embeddingspace.NoEmbeddings()},
-		{Ref: ref("f-unknown.rf"), State: embeddingspace.Unknown()},
+		{Ref: ref("f-old.rf"), State: embeddingspace.Has("model-b"), Spans: 10},
+		{Ref: ref("f-target.rf"), State: embeddingspace.Has("model-a"), Spans: 20},
+		{Ref: ref("f-none.rf"), State: embeddingspace.NoEmbeddings(), Spans: 30},
+		{Ref: ref("f-unknown.rf"), State: embeddingspace.Unknown(), Spans: 40},
 	}
 }
 
@@ -105,6 +105,11 @@ func TestSnapshotRefusesUnusableInput(t *testing.T) {
 		{"invalid state", func() (Epoch, error) {
 			return Snapshot("e", "t", "model-a", ModeLazy, 0, []Observation{
 				{Ref: ref("f.rf"), State: embeddingspace.FileState{State: "bogus"}},
+			})
+		}},
+		{"negative spans", func() (Epoch, error) {
+			return Snapshot("e", "t", "model-a", ModeLazy, 0, []Observation{
+				{Ref: ref("f.rf"), State: embeddingspace.NoEmbeddings(), Spans: -1},
 			})
 		}},
 		{"no entry", func() (Epoch, error) {
@@ -207,8 +212,10 @@ func TestEncodeRefusesAnInvalidEpoch(t *testing.T) {
 }
 
 func equalEpochFile(a, b EpochFile) bool {
-	return a.Ref.Equal(b.Ref) && a.Status == b.Status && a.Current == b.Current &&
-		a.Attempts == b.Attempts && a.LastError == b.LastError
+	return a.Ref.Equal(b.Ref) && a.Status == b.Status &&
+		a.Observed == b.Observed && a.Current == b.Current &&
+		a.Attempts == b.Attempts && a.Spans == b.Spans &&
+		a.LastError == b.LastError
 }
 
 // TestFileRefSurvivesNonUTF8ExtentBytes covers finding 7. A tablet
@@ -283,6 +290,7 @@ func TestFileRefSurvivesNonUTF8ExtentBytes(t *testing.T) {
 				i, decoded.Files[i].Ref.Extent, epoch.Files[i].Ref.Extent)
 		}
 	}
+
 	if decoded.Files[0].Ref.Key() == decoded.Files[1].Ref.Key() {
 		t.Fatal("the extents collided after a persistence round trip")
 	}
@@ -299,5 +307,29 @@ func TestFileRefSurvivesNonUTF8ExtentBytes(t *testing.T) {
 	progress := migration.Progress()
 	if progress.Converged != 1 || progress.Pending != 1 {
 		t.Fatalf("progress = %+v, want exactly one of the two converged", progress)
+	}
+}
+
+func TestDecodeRejectsLegacyEpochWithoutSpanSchema(t *testing.T) {
+	epoch := testEpoch(t)
+	raw, err := json.Marshal(epoch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var legacy map[string]any
+	if err := json.Unmarshal(raw, &legacy); err != nil {
+		t.Fatal(err)
+	}
+	delete(legacy, "version")
+	files := legacy["files"].([]any)
+	for _, item := range files {
+		delete(item.(map[string]any), "spans")
+	}
+	raw, err = json.Marshal(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Decode(raw); !errors.Is(err, ErrInvalidEpoch) {
+		t.Fatalf("legacy epoch error = %v", err)
 	}
 }

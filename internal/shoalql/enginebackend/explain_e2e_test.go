@@ -10,7 +10,11 @@ import (
 
 func explainDetails(t *testing.T, cat shoalql.Catalog, exec *shoalql.Executor, sql string) shoalql.ExplainDetails {
 	t.Helper()
-	res := runE2E(t, cat, exec, "EXPLAIN FORMAT JSON "+sql, shoalql.PlanOptions{})
+	opts := shoalql.PlanOptions{}
+	if strings.Contains(sql, "<->") {
+		opts.Vector.EmbeddingSpace = exactTestSpace
+	}
+	res := runE2E(t, cat, exec, "EXPLAIN FORMAT JSON "+sql, opts)
 	if len(res.Rows) != 1 {
 		t.Fatalf("explain rows = %d", len(res.Rows))
 	}

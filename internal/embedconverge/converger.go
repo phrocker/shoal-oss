@@ -6,6 +6,7 @@ package embedconverge
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -46,6 +47,31 @@ func (f RewriterFunc) Rewrite(
 	return f(ctx, target, key, value)
 }
 
+// EgressGuard decides whether a cell's exact visibility may be sent to the
+// provider that produces target. It receives no cell value or source text.
+//
+// A hosted-provider deployment uses this hook to deny classifications that
+// may only be embedded in place. A local provider can allow every visibility.
+// Denial is best effort: the compaction completes unconverged with the input
+// identity and bytes preserved.
+type EgressGuard interface {
+	CheckEmbeddingEgress(ctx context.Context, target string, visibility []byte) error
+}
+
+// EgressGuardFunc adapts a function to EgressGuard.
+type EgressGuardFunc func(ctx context.Context, target string, visibility []byte) error
+
+// CheckEmbeddingEgress implements EgressGuard.
+func (f EgressGuardFunc) CheckEmbeddingEgress(
+	ctx context.Context, target string, visibility []byte,
+) error {
+	return f(ctx, target, visibility)
+}
+
+// ErrEgressDenied reports a classification policy that prohibited sending a
+// cell to the target provider.
+var ErrEgressDenied = errors.New("embedconverge: embedding egress denied")
+
 // Converger implements compaction.Converger on top of a Governor and a
 // Rewriter. One Converger is meant to be shared by every compaction on a
 // node: the Governor it holds is what makes the rate limit and budget
@@ -60,6 +86,7 @@ type Converger struct {
 	epoch    string
 	governor *Governor
 	rewriter Rewriter
+	egress   EgressGuard
 	observer func(Outcome)
 }
 
@@ -103,6 +130,10 @@ type ConvergerOptions struct {
 	// Rewriter re-embeds cell values.
 	Rewriter Rewriter
 
+	// EgressGuard enforces classification-specific provider selection before
+	// source text can reach a hosted provider.
+	EgressGuard EgressGuard
+
 	// Observer, when non-nil, is called once per settled attempt. It
 	// must be safe for concurrent use.
 	Observer func(Outcome)
@@ -129,6 +160,7 @@ func NewConverger(opts ConvergerOptions) (*Converger, error) {
 		epoch:    strings.TrimSpace(opts.Epoch),
 		governor: opts.Governor,
 		rewriter: opts.Rewriter,
+		egress:   opts.EgressGuard,
 		observer: opts.Observer,
 	}, nil
 }
@@ -199,12 +231,33 @@ func (a *convergeAttempt) Convert(
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	if a.converger.egress != nil {
+		var visibility []byte
+		if key != nil {
+			visibility = append([]byte(nil), key.ColumnVisibility...)
+		}
+		if err := a.converger.egress.CheckEmbeddingEgress(
+			ctx, a.converger.target, visibility); err != nil {
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return nil, err
+			}
+			return nil, fmt.Errorf(
+				"%w: %w: %v",
+				embeddingspace.ErrConvergenceUnavailable, ErrEgressDenied, err)
+		}
+	}
 	// Charged before the provider is called, so a refusal costs nothing
 	// and a charge is never recorded for work that did not happen.
 	if err := a.converger.governor.ChargeCell(); err != nil {
 		return nil, err
 	}
-	return a.converger.rewriter.Rewrite(ctx, a.converger.target, key, value)
+	var rewriteKey *iterrt.Key
+	if key != nil {
+		rewriteKey = key.Clone()
+	}
+	rewriteValue := append([]byte(nil), value...)
+	return a.converger.rewriter.Rewrite(
+		ctx, a.converger.target, rewriteKey, rewriteValue)
 }
 
 // End settles the attempt against the Governor's reservation and reports

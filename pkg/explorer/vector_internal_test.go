@@ -21,6 +21,7 @@ package explorer
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -411,8 +412,202 @@ func TestMixedSpaceVectorRetrievalUsesDeterministicRankFusion(t *testing.T) {
 		}
 		previous = current
 	}
-	if embedA.calls != 5 || embedB.calls != 3 {
-		t.Fatalf("provider calls: a=%d b=%d, want a=5 b=3", embedA.calls, embedB.calls)
+	if embedA.calls != 3 || embedB.calls != 1 {
+		t.Fatalf("provider calls: a=%d b=%d, want cached a=3 b=1", embedA.calls, embedB.calls)
+	}
+}
+
+func TestEmbeddingQueryCacheUsesSpaceAndNormalizedQuery(t *testing.T) {
+	ctx := context.Background()
+	embedder := &countingEmbedder{
+		model: "cache", dimensions: 2, identity: "space-cache",
+	}
+	var events []EmbeddingQueryEvent
+	corpus, err := OpenWithOptions(t.TempDir(), Options{
+		Embedder: embedder,
+		EmbeddingQueryObserver: func(event EmbeddingQueryEvent) {
+			events = append(events, event)
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer corpus.Close()
+	if _, err := corpus.Ingest(ctx, Source{
+		URI: "file:///cache.txt", MediaType: MediaTypeText, Content: "cache",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, query := range []string{"  cache query  ", "cache query"} {
+		if _, err := corpus.Retrieve(ctx, retrieval.Request{
+			Text: query, Modes: []retrieval.Mode{retrieval.ModeVector},
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if embedder.calls != 2 {
+		t.Fatalf("embedder calls = %d, want ingest plus one normalized query", embedder.calls)
+	}
+	if len(events) != 2 ||
+		events[0].ProviderCalls != 1 || events[0].CacheHits != 0 ||
+		events[1].ProviderCalls != 0 || events[1].CacheHits != 1 {
+		t.Fatalf("query events = %+v", events)
+	}
+	if fmt.Sprint(events[1].SpaceIdentities) != "[space-cache]" {
+		t.Fatalf("cached event spaces = %v", events[1].SpaceIdentities)
+	}
+}
+
+func TestEmbeddingQueryCacheIsBounded(t *testing.T) {
+	ctx := context.Background()
+	embedder := &countingEmbedder{
+		model: "cache", dimensions: 2, identity: "space-cache",
+	}
+	corpus, err := OpenWithOptions(t.TempDir(), Options{
+		Embedder: embedder, MaxEmbeddingQueryCacheEntries: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer corpus.Close()
+	if _, err := corpus.Ingest(ctx, Source{
+		URI: "file:///cache.txt", MediaType: MediaTypeText, Content: "cache",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for _, query := range []string{"first", "second", "first"} {
+		if _, err := corpus.Retrieve(ctx, retrieval.Request{
+			Text: query, Modes: []retrieval.Mode{retrieval.ModeVector},
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if embedder.calls != 4 {
+		t.Fatalf("embedder calls = %d, want ingest plus three cache misses", embedder.calls)
+	}
+	corpus.queryEmbeddingMu.Lock()
+	defer corpus.queryEmbeddingMu.Unlock()
+	if len(corpus.queryEmbeddingCache) != 1 ||
+		len(corpus.queryEmbeddingOrder) != 1 {
+		t.Fatalf(
+			"bounded cache = %d entries / %d order",
+			len(corpus.queryEmbeddingCache), len(corpus.queryEmbeddingOrder))
+	}
+}
+
+func TestEmbeddingQueryFanoutExceededIsObservableAndCallsNoProvider(t *testing.T) {
+	ctx := context.Background()
+	embedA := &countingEmbedder{model: "a", dimensions: 2, identity: "space-a"}
+	embedB := &countingEmbedder{model: "b", dimensions: 2, identity: "space-b"}
+	var events []EmbeddingQueryEvent
+	corpus, err := OpenWithOptions(t.TempDir(), Options{
+		Embedder: embedA, EmbeddingProviders: []model.Embedder{embedB},
+		MaxEmbeddingSpaceFanout: 1,
+		EmbeddingQueryObserver: func(event EmbeddingQueryEvent) {
+			events = append(events, event)
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer corpus.Close()
+	first, err := corpus.Ingest(ctx, Source{
+		URI: "file:///a.txt", MediaType: MediaTypeText, Content: "alpha",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := corpus.Ingest(ctx, Source{
+		URI: "file:///b.txt", MediaType: MediaTypeText, Content: "bravo",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	corpus.mu.Lock()
+	corpus.documents[first.Document.ID][first.Revision.ID].Embeddings.Provenance =
+		persistedEmbeddingProvenance{
+			Provider: "counting", Model: "a", Identity: "space-a", Dimensions: 2,
+		}
+	corpus.documents[second.Document.ID][second.Revision.ID].Embeddings.Provenance =
+		persistedEmbeddingProvenance{
+			Provider: "counting", Model: "b", Identity: "space-b", Dimensions: 2,
+		}
+	corpus.embeddingSpace = embeddingSpaceCache{}
+	corpus.mu.Unlock()
+
+	beforeA, beforeB := embedA.calls, embedB.calls
+	_, err = corpus.Retrieve(ctx, retrieval.Request{
+		Text: "query", Modes: []retrieval.Mode{retrieval.ModeVector},
+	})
+	if !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
+		t.Fatalf("fan-out error = %v", err)
+	}
+	if embedA.calls != beforeA || embedB.calls != beforeB {
+		t.Fatalf("providers called after fan-out refusal: a=%d b=%d", embedA.calls-beforeA, embedB.calls-beforeB)
+	}
+	if len(events) != 1 || !events[0].FanoutExceeded ||
+		events[0].FanoutLimit != 1 || events[0].ProviderCalls != 0 ||
+		fmt.Sprint(events[0].SpaceIdentities) != "[space-a space-b]" {
+		t.Fatalf("fan-out events = %+v", events)
+	}
+}
+
+func TestUnavailableEmbeddingSpaceIsNamedAndObservable(t *testing.T) {
+	ctx := context.Background()
+	embedA := &countingEmbedder{model: "a", dimensions: 2, identity: "space-a"}
+	embedB := &countingEmbedder{
+		model: "b", dimensions: 2, identity: "space-b",
+		err: model.ErrUnavailable,
+	}
+	var events []EmbeddingQueryEvent
+	corpus, err := OpenWithOptions(t.TempDir(), Options{
+		Embedder: embedA, EmbeddingProviders: []model.Embedder{embedB},
+		MaxEmbeddingSpaceFanout: 4,
+		EmbeddingQueryObserver: func(event EmbeddingQueryEvent) {
+			events = append(events, event)
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer corpus.Close()
+	first, err := corpus.Ingest(ctx, Source{
+		URI: "file:///a.txt", MediaType: MediaTypeText, Content: "alpha",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := corpus.Ingest(ctx, Source{
+		URI: "file:///b.txt", MediaType: MediaTypeText, Content: "bravo",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	corpus.mu.Lock()
+	corpus.documents[first.Document.ID][first.Revision.ID].Embeddings.Provenance =
+		persistedEmbeddingProvenance{
+			Provider: "counting", Model: "a", Identity: "space-a", Dimensions: 2,
+		}
+	corpus.documents[second.Document.ID][second.Revision.ID].Embeddings.Provenance =
+		persistedEmbeddingProvenance{
+			Provider: "counting", Model: "b", Identity: "space-b", Dimensions: 2,
+		}
+	corpus.embeddingSpace = embeddingSpaceCache{}
+	corpus.mu.Unlock()
+
+	_, err = corpus.Retrieve(ctx, retrieval.Request{
+		Text: "query", Modes: []retrieval.Mode{retrieval.ModeVector},
+	})
+	if !shoal.IsErrorCode(err, shoal.ErrorUnavailable) ||
+		!strings.Contains(err.Error(), `"space-b"`) {
+		t.Fatalf("unavailable space error = %v", err)
+	}
+	if len(events) != 1 || events[0].ProviderCalls != 2 ||
+		fmt.Sprint(events[0].Unavailable) != "[space-b]" ||
+		fmt.Sprint(events[0].Attempted) != "[space-a space-b]" ||
+		fmt.Sprint(events[0].Completed) != "[space-a]" {
+		t.Fatalf("unavailable events = %+v", events)
 	}
 }
 
@@ -463,6 +658,7 @@ type countingEmbedder struct {
 	dimensions int
 	identity   string
 	delay      time.Duration
+	err        error
 }
 
 func (e *countingEmbedder) CacheIdentity() (string, error) {
@@ -495,6 +691,9 @@ func (e *countingEmbedder) Embed(
 		}
 	}
 	e.calls++
+	if e.err != nil {
+		return model.EmbedResult{}, e.err
+	}
 	dimensions := e.dimensions
 	if dimensions == 0 {
 		dimensions = 2

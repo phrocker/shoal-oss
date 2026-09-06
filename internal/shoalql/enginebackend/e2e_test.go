@@ -3,16 +3,21 @@ package enginebackend
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"math"
+	"strings"
 	"testing"
 
 	"github.com/phrocker/shoal-oss/internal/cclient"
+	"github.com/phrocker/shoal-oss/internal/embeddingspace"
 	"github.com/phrocker/shoal-oss/internal/engine"
 	"github.com/phrocker/shoal-oss/internal/graphschema"
 	"github.com/phrocker/shoal-oss/internal/shoalql"
 	"github.com/phrocker/shoal-oss/internal/tablet"
 )
+
+const exactTestSpace = "test-provider:test-model-v1:2:l2"
 
 func packVec(v ...float32) []byte {
 	b := make([]byte, 4*len(v))
@@ -44,7 +49,8 @@ func newEngineWithEventsFormat(t *testing.T, format tablet.FileFormat) (*engine.
 		t.Fatal(err)
 	}
 	if err := eng.CreateTable("graph", engine.TableOptions{
-		TabletOptions: tablet.Options{FileFormat: format},
+		TabletOptions:    tablet.Options{FileFormat: format},
+		DefaultEmbedding: embeddingspace.Has(exactTestSpace),
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -71,7 +77,11 @@ func TestE2E_RFileParquetQueryParity(t *testing.T) {
 		defer eng.Close()
 		results := make([]string, len(queries))
 		for i, query := range queries {
-			result := runE2E(t, cat, exec, query, shoalql.PlanOptions{})
+			opts := shoalql.PlanOptions{}
+			if strings.Contains(query, "<->") {
+				opts.Vector.EmbeddingSpace = exactTestSpace
+			}
+			result := runE2E(t, cat, exec, query, opts)
 			results[i] = fmt.Sprint(result.Columns, result.Rows)
 		}
 		return results
@@ -87,7 +97,9 @@ func TestE2E_RFileParquetQueryParity(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer mixedEngine.Close()
-	if err := mixedEngine.CreateTable("graph", engine.TableOptions{}); err != nil {
+	if err := mixedEngine.CreateTable("graph", engine.TableOptions{
+		DefaultEmbedding: embeddingspace.Has(exactTestSpace),
+	}); err != nil {
 		t.Fatal(err)
 	}
 	writeEvent(t, mixedEngine, "0001", "retry hit a timeout", []float32{1, 0})
@@ -106,7 +118,11 @@ func TestE2E_RFileParquetQueryParity(t *testing.T) {
 	mixedCatalog := shoalql.NewGraphCatalog("graph")
 	mixedResults := make([]string, len(queries))
 	for i, query := range queries {
-		result := runE2E(t, mixedCatalog, mixedExec, query, shoalql.PlanOptions{})
+		opts := shoalql.PlanOptions{}
+		if strings.Contains(query, "<->") {
+			opts.Vector.EmbeddingSpace = exactTestSpace
+		}
+		result := runE2E(t, mixedCatalog, mixedExec, query, opts)
 		mixedResults[i] = fmt.Sprint(result.Columns, result.Rows)
 	}
 	if fmt.Sprint(mixedResults) != fmt.Sprint(rfileResults) {
@@ -176,7 +192,11 @@ func TestE2E_VectorKNN(t *testing.T) {
 	defer eng.Close()
 
 	// Query near [1,0]; events 0001 and 0003 are closest by cosine.
-	res := runE2E(t, cat, exec, "SELECT id, content FROM events ORDER BY embedding <-> [1, 0] LIMIT 2", shoalql.PlanOptions{})
+	res := runE2E(t, cat, exec,
+		"SELECT id, content FROM events ORDER BY embedding <-> [1, 0] LIMIT 2",
+		shoalql.PlanOptions{Vector: shoalql.VectorOptions{
+			EmbeddingSpace: exactTestSpace,
+		}})
 	if len(res.Rows) != 2 {
 		t.Fatalf("rows = %d: %+v", len(res.Rows), res.Rows)
 	}
@@ -189,6 +209,93 @@ func TestE2E_VectorKNN(t *testing.T) {
 		if r[1].Str == "" {
 			t.Errorf("content not hydrated: %+v", r)
 		}
+	}
+}
+
+func TestE2E_ExactVectorRejectsSameDimensionDifferentModels(t *testing.T) {
+	eng, err := engine.Open(t.TempDir(), engine.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close()
+	if err := eng.CreateTable("graph", engine.TableOptions{
+		DefaultEmbedding: embeddingspace.Has(exactTestSpace),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	writeEvent(t, eng, "0001", "space a", []float32{1, 0})
+	if err := eng.Flush("graph"); err != nil {
+		t.Fatal(err)
+	}
+	const other = "test-provider:different-model-v1:2:l2"
+	if err := eng.SetTableDefaultEmbedding(
+		"graph", embeddingspace.Has(other)); err != nil {
+		t.Fatal(err)
+	}
+	writeEvent(t, eng, "0002", "space b", []float32{1, 0})
+	if err := eng.Flush("graph"); err != nil {
+		t.Fatal(err)
+	}
+
+	stmt, _ := shoalql.Parse(
+		"SELECT id FROM events ORDER BY embedding <-> [1,0] LIMIT 2")
+	binding, _ := shoalql.NewGraphCatalog("graph").Binding("events")
+	plan, err := shoalql.PlanQuery(
+		context.Background(), stmt, binding,
+		shoalql.PlanOptions{Vector: shoalql.VectorOptions{
+			EmbeddingSpace: exactTestSpace,
+		}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := shoalql.NewExecutor(New(eng)).Run(
+		context.Background(), plan,
+	); !errors.Is(err, embeddingspace.ErrMismatch) {
+		t.Fatalf("exact mixed-space error = %v, want ErrMismatch", err)
+	}
+}
+
+func TestE2E_ExactVectorFailsClosedOnUnknownAndNoEmbeddings(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		state embeddingspace.FileState
+		want  error
+	}{
+		{"unknown", embeddingspace.FileState{}, embeddingspace.ErrQuerySpaceUnknown},
+		{"no embeddings", embeddingspace.NoEmbeddings(), embeddingspace.ErrQueryNoEmbeddings},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			eng, err := engine.Open(t.TempDir(), engine.Options{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer eng.Close()
+			if err := eng.CreateTable("graph", engine.TableOptions{
+				DefaultEmbedding: tc.state,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			writeEvent(t, eng, "0001", tc.name, []float32{1, 0})
+			if err := eng.Flush("graph"); err != nil {
+				t.Fatal(err)
+			}
+			stmt, _ := shoalql.Parse(
+				"SELECT id FROM events ORDER BY embedding <-> [1,0] LIMIT 1")
+			binding, _ := shoalql.NewGraphCatalog("graph").Binding("events")
+			plan, err := shoalql.PlanQuery(
+				context.Background(), stmt, binding,
+				shoalql.PlanOptions{Vector: shoalql.VectorOptions{
+					EmbeddingSpace: exactTestSpace,
+				}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := shoalql.NewExecutor(New(eng)).Run(
+				context.Background(), plan,
+			); !errors.Is(err, tc.want) {
+				t.Fatalf("error = %v, want %v", err, tc.want)
+			}
+		})
 	}
 }
 

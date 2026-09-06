@@ -86,12 +86,12 @@ func (b *Backend) DescribeVector(ctx context.Context, index string) (vectorindex
 // whole-table merge (ScanHosted) so re-seeking iterators such as VectorKNN
 // and TermIndex see every cell regardless of tablet boundaries. *engine.Scanner
 // already satisfies shoalql.RowStream because iterrt.Key aliases wire.Key.
-func (b *Backend) Scan(_ context.Context, table string, r iterrt.Range, req shoalql.ScanRequest) (shoalql.RowStream, error) {
+func (b *Backend) Scan(ctx context.Context, table string, r iterrt.Range, req shoalql.ScanRequest) (shoalql.RowStream, error) {
 	opts := engine.ScanOptions{
 		ColumnFamilies:          req.ColumnFamilies,
 		ColumnFamiliesInclusive: req.CFInclusive,
 	}
-	return b.eng.ScanHosted(table, r, opts, req.Stack)
+	return b.eng.ScanHostedContext(ctx, table, r, opts, req.Stack)
 }
 
 // LookupRows implements shoalql.Backend, buffering the engine's visitor

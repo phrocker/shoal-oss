@@ -12,6 +12,7 @@ import (
 	"github.com/phrocker/shoal-oss/internal/documentschema"
 	"github.com/phrocker/shoal-oss/internal/graphschema"
 	"github.com/phrocker/shoal-oss/internal/iterrt"
+	"github.com/phrocker/shoal-oss/internal/vectorindex"
 )
 
 // --- fake backend ---
@@ -54,6 +55,41 @@ func (b *declaredBackend) BackendInfo() BackendInfo {
 		Capabilities:          []Capability{CapabilityRangeScan, CapabilityExactVectorKNN},
 		StorageFormats:        []string{"fixture"},
 		SelectedStorageFormat: "fixture",
+	}
+}
+
+type vectorExplainFixture struct {
+	*declaredBackend
+	manifest vectorindex.Manifest
+}
+
+func (b *vectorExplainFixture) DescribeVector(
+	context.Context,
+	string,
+) (vectorindex.Manifest, error) {
+	return b.manifest, nil
+}
+
+func TestExplainDoesNotClaimRecallAcrossEmbeddingSpaces(t *testing.T) {
+	backend := &vectorExplainFixture{
+		declaredBackend: &declaredBackend{fakeBackend: &fakeBackend{}},
+		manifest: vectorindex.Manifest{
+			EmbeddingSpace:  "space-a",
+			Generation:      1,
+			CodebookVersion: "codebook-a",
+			Recall: vectorindex.RecallContract{
+				Corpus: "corpus", Queries: 1, BenchmarkRef: "benchmark",
+				EmbeddingSpace: "space-a", Generation: 1,
+				CodebookVersion: "codebook-a",
+			},
+		},
+	}
+	details := buildExplainDetails(backend, &Plan{
+		Shape: ShapeVectorKNN, VectorMode: VectorApproximate,
+		VectorIndex: "idx", VectorEmbeddingSpace: "space-b",
+	})
+	if details.RecallClaimed {
+		t.Fatal("EXPLAIN claimed recall across incompatible embedding spaces")
 	}
 }
 
@@ -195,7 +231,7 @@ func TestExec_ExplainJSONVectorContract(t *testing.T) {
 	be := &declaredBackend{fakeBackend: &fakeBackend{}}
 	res := runSQL(t, be,
 		"EXPLAIN FORMAT JSON SELECT id, content FROM events ORDER BY embedding <-> [1,0] LIMIT 2",
-		PlanOptions{})
+		PlanOptions{Vector: VectorOptions{EmbeddingSpace: "space-a"}})
 	if be.scans != 0 || len(res.Rows) != 1 {
 		t.Fatalf("scans=%d result=%+v", be.scans, res)
 	}
@@ -205,6 +241,9 @@ func TestExec_ExplainJSONVectorContract(t *testing.T) {
 	}
 	if details.Version != 1 || details.Format != "json" || details.Shape != "vector_knn" {
 		t.Fatalf("details = %+v", details)
+	}
+	if details.VectorEmbeddingSpace != "space-a" {
+		t.Fatalf("vector embedding space = %q", details.VectorEmbeddingSpace)
 	}
 	if !strings.Contains(strings.Join(details.Pushdowns, " "), "top_k=2") {
 		t.Fatalf("pushdowns = %v", details.Pushdowns)
@@ -298,7 +337,9 @@ func TestExec_VectorKNNHydratesInScoreOrder(t *testing.T) {
 	// order by giving rows that already sort best-first is not guaranteed, so
 	// verify the executor preserves the stream order it receives. Our fake
 	// sorts ascending by key: evt:4 < evt:9, so stream order is evt:4, evt:9.
-	res := runSQL(t, be, "SELECT id, content FROM events ORDER BY embedding <-> [1,0] LIMIT 5", PlanOptions{})
+	res := runSQL(t, be,
+		"SELECT id, content FROM events ORDER BY embedding <-> [1,0] LIMIT 5",
+		PlanOptions{Vector: VectorOptions{EmbeddingSpace: "space-a"}})
 	if len(res.Rows) != 2 {
 		t.Fatalf("rows = %d", len(res.Rows))
 	}
@@ -320,7 +361,9 @@ func TestExec_VectorKNNIdOnlyNoHydration(t *testing.T) {
 	be := &fakeBackend{scanCells: []Cell{
 		cell("evt:1", vc, "", scoreVal(0.5)),
 	}}
-	res := runSQL(t, be, "SELECT id FROM events ORDER BY vec <-> [1,2,3] LIMIT 3", PlanOptions{})
+	res := runSQL(t, be,
+		"SELECT id FROM events ORDER BY vec <-> [1,2,3] LIMIT 3",
+		PlanOptions{Vector: VectorOptions{EmbeddingSpace: "space-a"}})
 	if len(res.Rows) != 1 || res.Rows[0][0].Str != "1" {
 		t.Fatalf("rows = %+v", res.Rows)
 	}
