@@ -40,10 +40,19 @@ type generationChangingInteractionBase struct {
 
 func TestNonAnalyticsInteractionRejectsUnverifiedExactEvidence(t *testing.T) {
 	f := newFixture(t)
+	receipt, err := f.clientA.Ingest(f.admin(t), explorer.Source{
+		URI:       "file:///ordinary-interaction.txt",
+		MediaType: explorer.MediaTypeText,
+		Content:   "ordinary retrieval evidence",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	snapshot, err := f.base.Snapshot(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
+	f.clock.Set(snapshot.AsOf.Add(time.Second))
 	decision := f.decision(
 		t, "recorder", [][]byte{f.sourceA}, [][]byte{f.policyA},
 		[]auth.Operation{auth.OperationRead, auth.OperationRetrieve},
@@ -60,6 +69,25 @@ func TestNonAnalyticsInteractionRejectsUnverifiedExactEvidence(t *testing.T) {
 		AuthorizationExpiresAt:   decision.AuthenticationExpires(),
 	}
 	ctx := f.context(t, decision)
+	view, err := f.clientA.Document(
+		ctx, receipt.Document.ID, receipt.Revision.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nodeID := firstSpanID(t, view)
+
+	ordinary := base
+	ordinary.ID = "session-ordinary-retrieval"
+	ordinary.SeedNodeIDs = []shoal.ID{nodeID}
+	ordinary.Turns = []interaction.Turn{{
+		Index: 0,
+		ToolCall: &interaction.ToolCall{
+			Kind: "retrieve", RetrievedNodeIDs: []shoal.ID{nodeID},
+		},
+	}}
+	if err := f.clientA.RecordInteraction(ctx, ordinary); err != nil {
+		t.Fatalf("ordinary retrieval record = %v", err)
+	}
 
 	withNode := base
 	withNode.ID = "session-exact-node"

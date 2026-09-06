@@ -546,7 +546,21 @@ func analyticsInteractionEvidence(
 	session interaction.Session,
 ) (analyticsInteractionGraph, bool, error) {
 	var evidence analyticsInteractionGraph
-	found := false
+	analyticsCalls := 0
+	for _, turn := range session.Turns {
+		if turn.ToolCall != nil && turn.ToolCall.Kind == "analytics" {
+			analyticsCalls++
+		}
+	}
+	if analyticsCalls == 0 {
+		return evidence, false, nil
+	}
+	if analyticsCalls != 1 {
+		return analyticsInteractionGraph{}, false, shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			"analytics interaction has multiple analytics tool calls",
+		)
+	}
 	if len(session.CitedEdges) != 0 {
 		return analyticsInteractionGraph{}, false, shoal.NewError(
 			shoal.ErrorInvalidArgument,
@@ -569,13 +583,6 @@ func analyticsInteractionEvidence(
 			}
 			continue
 		}
-		if found {
-			return analyticsInteractionGraph{}, false, shoal.NewError(
-				shoal.ErrorInvalidArgument,
-				"analytics interaction has multiple analytics tool calls",
-			)
-		}
-		found = true
 		evidence.Nodes = append(
 			[]graph.Node(nil), turn.ToolCall.RetrievedNodes...)
 		evidence.Edges = append(
@@ -603,7 +610,7 @@ func analyticsInteractionEvidence(
 			)
 		}
 	}
-	return evidence, found, nil
+	return evidence, true, nil
 }
 
 func equalInteractionIDs(left, right []shoal.ID) bool {
