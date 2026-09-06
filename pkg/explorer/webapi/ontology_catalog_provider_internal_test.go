@@ -119,22 +119,3 @@ func (c *rawOnlyOntologyCatalogClient) OntologyProposals(
 	c.rawCalls++
 	return []ontology.GovernedProposal{}, nil
 }
-
-func (*rawOnlyOntologyCatalogClient) CreateOntologyProposal(
-	context.Context,
-	ontology.GovernedProposal,
-	ontology.OntologyVersion,
-) error {
-	return nil
-}
-
-func (*rawOnlyOntologyCatalogClient) TransitionOntologyProposal(
-	context.Context,
-	shoal.ID,
-	ontology.ProposalState,
-	string,
-	string,
-	time.Time,
-) (ontology.GovernedProposal, error) {
-	return ontology.GovernedProposal{}, nil
-}

@@ -253,7 +253,7 @@ func (s *EmbeddedService) OntologyCatalog(
 		catalog, err := provider.PublishedOntologyCatalog(ctx, configured)
 		return catalog, true, err
 	}
-	if _, exposesRawProposals := s.client.(explorer.OntologyProposalStore); exposesRawProposals {
+	if _, exposesRawProposals := s.client.(ontologyProposalReadClient); exposesRawProposals {
 		return ontology.PublishedCatalog{}, false, shoal.NewError(
 			shoal.ErrorUnavailable,
 			"workspace capability \"published ontology catalog\" is unavailable",
