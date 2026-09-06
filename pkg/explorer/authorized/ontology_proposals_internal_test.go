@@ -248,6 +248,11 @@ func TestOntologyProposalEvidenceRequiresObjectAuthorization(t *testing.T) {
 		visible[0].Morphisms()[0].Evidence()[0].ID() != allowedEvidence.ID() {
 		t.Fatalf("visible proposals = %#v, want only source-a evidence", visible)
 	}
+	hiddenState, err := client.OntologyProposalMutationState(
+		ctx, baseVersion, deniedProposals[0].ID())
+	if err != nil || hiddenState.ProposalFound() {
+		t.Fatalf("hidden proposal mutation state = %#v, %v", hiddenState, err)
+	}
 	published := deniedProposals[0]
 	for index, state := range []ontology.ProposalState{
 		ontology.ProposalSubmitted,
@@ -383,6 +388,13 @@ func (*untrustedOntologyEvidenceBase) ResolveOntologyEvidenceCitation(
 	document.Citation,
 ) (string, error) {
 	return "forged untrusted quote", nil
+}
+
+func (*untrustedOntologyEvidenceBase) OntologyActiveState(
+	context.Context,
+	ontology.OntologyVersion,
+) (ontology.OntologyVersion, error) {
+	return ontology.OntologyVersion{}, nil
 }
 
 func (b *ontologyEvidenceBase) Documents(

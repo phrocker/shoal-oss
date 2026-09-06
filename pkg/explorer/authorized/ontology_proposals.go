@@ -110,7 +110,7 @@ func (c *Client) OntologyProposalMutationState(
 			"workspace capability \"ontology proposal mutation state\" is unavailable",
 		)
 	}
-	_, guard, _, err := c.begin(ctx, auth.OperationIngest)
+	decision, guard, now, err := c.begin(ctx, auth.OperationIngest)
 	if err != nil {
 		return explorer.OntologyProposalMutationState{}, err
 	}
@@ -118,6 +118,35 @@ func (c *Client) OntologyProposalMutationState(
 	defer c.mutationMu.Unlock()
 	if err := guard.Check(ctx); err != nil {
 		return explorer.OntologyProposalMutationState{}, err
+	}
+	if proposalID != "" {
+		evidenceStore, ok := c.ontologyProposals.(explorer.OntologyProposalEvidenceProvider)
+		if !ok {
+			return explorer.OntologyProposalMutationState{}, shoal.NewError(
+				shoal.ErrorUnavailable,
+				"workspace capability \"ontology proposal evidence\" is unavailable",
+			)
+		}
+		evidence, found, err := evidenceStore.OntologyProposalEvidence(ctx, proposalID)
+		if err != nil {
+			return explorer.OntologyProposalMutationState{}, directBaseError(err)
+		}
+		if !found {
+			return explorer.OntologyProposalMutationState{}, nil
+		}
+		for _, item := range evidence {
+			allowed, evidenceErr := c.ontologyEvidenceAllows(
+				ctx, item, decision, auth.OperationIngest, now)
+			if evidenceErr != nil {
+				return explorer.OntologyProposalMutationState{}, evidenceErr
+			}
+			if !allowed {
+				return explorer.OntologyProposalMutationState{}, nil
+			}
+		}
+		if err := guard.Check(ctx); err != nil {
+			return explorer.OntologyProposalMutationState{}, err
+		}
 	}
 	state, err := store.OntologyProposalMutationState(ctx, configured, proposalID)
 	if err != nil {
@@ -133,7 +162,7 @@ func (c *Client) OntologyActiveState(
 	ctx context.Context,
 	configured ontology.OntologyVersion,
 ) (ontology.OntologyVersion, error) {
-	provider, ok := c.base.(explorer.OntologyActiveStateProvider)
+	provider, ok := c.ontologyProposals.(explorer.OntologyActiveStateProvider)
 	if !ok {
 		return ontology.OntologyVersion{}, shoal.NewError(
 			shoal.ErrorUnavailable,

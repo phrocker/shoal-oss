@@ -27,7 +27,7 @@ import (
 )
 
 const (
-	MaxLensTransitions              = 32
+	MaxLensTransitions              = MaxPublishedOntologyVersions
 	MaxMorphismEvidence             = 256
 	MaxMorphismDiscriminatorChoices = 4096
 )
@@ -540,6 +540,7 @@ type OntologyTransition struct {
 	target        OntologyIdentity
 	sourceVersion OntologyVersion
 	targetVersion OntologyVersion
+	morphisms     []OntologyMorphism
 }
 
 func NewOntologyTransition(
@@ -572,6 +573,7 @@ func NewOntologyTransition(
 		source: source, target: target,
 		sourceVersion: sourceVersion.clone(),
 		targetVersion: targetVersion.clone(),
+		morphisms:     cloneMorphisms(morphisms),
 	}
 	if err := transition.Validate(); err != nil {
 		return OntologyTransition{}, err
@@ -597,11 +599,21 @@ func (t OntologyTransition) Validate() error {
 	if source != t.source || target != t.target {
 		return invalid("ontology transition material does not match its identities")
 	}
+	for _, morphism := range t.morphisms {
+		if err := morphism.Validate(); err != nil {
+			return err
+		}
+		if morphism.Source() != t.source || morphism.Target() != t.target {
+			return invalid(
+				"transition morphism does not connect its source and target versions")
+		}
+	}
 	if t.source.SchemaID() != t.target.SchemaID() ||
 		t.source.VersionID() == t.target.VersionID() {
 		return invalid("ontology transition must connect distinct versions of one schema")
 	}
-	return nil
+	return validateProposalEvolution(
+		t.sourceVersion, t.targetVersion, t.morphisms)
 }
 
 func (t OntologyTransition) Source() OntologyIdentity { return t.source }
@@ -611,6 +623,9 @@ func (t OntologyTransition) SourceVersion() OntologyVersion {
 }
 func (t OntologyTransition) TargetVersion() OntologyVersion {
 	return t.targetVersion.clone()
+}
+func (t OntologyTransition) Morphisms() []OntologyMorphism {
+	return cloneMorphisms(t.morphisms)
 }
 
 type ontologyLensTransition struct {
@@ -661,7 +676,9 @@ func NewOntologyLensWithTransitions(
 		if transition.Source().SchemaID() != identity.SchemaID() {
 			continue
 		}
-		addTransition(transition.SourceVersion(), transition.TargetVersion())
+		edge := addTransition(
+			transition.SourceVersion(), transition.TargetVersion())
+		edge.morphisms = append(edge.morphisms, transition.Morphisms()...)
 	}
 	for _, morphism := range morphisms {
 		if err := morphism.Validate(); err != nil {
@@ -672,10 +689,10 @@ func NewOntologyLensWithTransitions(
 		}
 		key := morphism.Source().String() + "->" + morphism.Target().String()
 		edge := grouped[key]
+		if !inferTransitions {
+			continue
+		}
 		if edge == nil {
-			if !inferTransitions {
-				continue
-			}
 			edge = addTransition(
 				morphism.SourceVersion(), morphism.TargetVersion())
 		}

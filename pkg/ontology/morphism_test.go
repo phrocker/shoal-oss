@@ -610,6 +610,99 @@ func TestInferredLensValidatesCompleteEvolution(t *testing.T) {
 	}
 }
 
+func TestExplicitTransitionUsesItsGovernedMorphisms(t *testing.T) {
+	f := newMorphismFixture(t)
+	schema, _ := NewOntologySchema("bound", "Bound", "", nil)
+	sourceProperty, _ := NewPropertyDefinition(
+		"old", "Old", "", ValueString, nil, nil)
+	governedProperty, _ := NewPropertyDefinition(
+		"governed", "Governed", "", ValueString, nil, nil)
+	otherProperty, _ := NewPropertyDefinition(
+		"other", "Other", "", ValueString, nil, nil)
+	sourceConcept, _ := NewConceptDefinition(
+		"person", "Person", "", []shoal.ID{sourceProperty.ID()}, nil)
+	targetConcept, _ := NewConceptDefinition(
+		"person", "Person", "",
+		[]shoal.ID{governedProperty.ID(), otherProperty.ID()}, nil)
+	at := time.Date(2026, time.September, 6, 2, 0, 0, 0, time.UTC)
+	source, _ := NewOntologyVersion(
+		schema, "1", at, []ConceptDefinition{sourceConcept}, nil,
+		[]PropertyDefinition{sourceProperty}, nil)
+	target, _ := NewOntologyVersion(
+		schema, "2", at.Add(time.Second), []ConceptDefinition{targetConcept}, nil,
+		[]PropertyDefinition{governedProperty, otherProperty}, nil)
+	governed := mustMorphism(t, MorphismConfig{
+		Kind: MorphismRename, SourceVersion: source, TargetVersion: target,
+		Sources:  []shoal.ID{sourceProperty.ID()},
+		Targets:  []shoal.ID{governedProperty.ID()},
+		Evidence: []EvidenceRef{f.evidence}, Rationale: "governed rename",
+	})
+	other := mustMorphism(t, MorphismConfig{
+		Kind: MorphismRename, SourceVersion: source, TargetVersion: target,
+		Sources:  []shoal.ID{sourceProperty.ID()},
+		Targets:  []shoal.ID{otherProperty.ID()},
+		Evidence: []EvidenceRef{f.evidence}, Rationale: "ungoverned rename",
+	})
+	transition, err := NewOntologyTransition(
+		source, target, []OntologyMorphism{governed})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lens, err := NewOntologyLensWithTransitions(
+		target, []OntologyTransition{transition}, []OntologyMorphism{other})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertion := mustPropertyAssertion(
+		t, sourceConcept.ID(), sourceProperty.ID(), source, nil,
+		f.evidence, f.provenance)
+	read := lens.Read(assertion)
+	if !read.Resolved() || read.Predicate() != governedProperty.ID() {
+		t.Fatalf("explicit transition used ungoverned morphism: %#v", read)
+	}
+}
+
+func TestOntologyLensTraversesBeyondLegacyDepth(t *testing.T) {
+	f := newMorphismFixture(t)
+	schema, _ := NewOntologySchema("long", "Long", "", nil)
+	property, _ := NewPropertyDefinition(
+		"name", "Name", "", ValueString, nil, nil)
+	person, _ := NewConceptDefinition(
+		"person", "Person", "", []shoal.ID{property.ID()}, nil)
+	at := time.Date(2026, time.September, 6, 3, 0, 0, 0, time.UTC)
+	versions := make([]OntologyVersion, 41)
+	for index := range versions {
+		version, err := NewOntologyVersion(
+			schema, strconv.Itoa(index), at.Add(time.Duration(index)*time.Second),
+			[]ConceptDefinition{person}, nil,
+			[]PropertyDefinition{property}, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		versions[index] = version
+	}
+	transitions := make([]OntologyTransition, 0, len(versions)-1)
+	for index := 1; index < len(versions); index++ {
+		transition, err := NewOntologyTransition(
+			versions[index-1], versions[index], nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		transitions = append(transitions, transition)
+	}
+	lens, err := NewOntologyLensWithTransitions(
+		versions[len(versions)-1], transitions, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertion := mustPropertyAssertion(
+		t, person.ID(), property.ID(), versions[0], nil,
+		f.evidence, f.provenance)
+	if read := lens.Read(assertion); !read.Resolved() {
+		t.Fatalf("governed 40-hop lens read = %#v", read)
+	}
+}
+
 func TestOntologyTransitionRejectsMorphismFromDifferentVersions(t *testing.T) {
 	f := newMorphismFixture(t)
 	widen := mustMorphism(t, MorphismConfig{
