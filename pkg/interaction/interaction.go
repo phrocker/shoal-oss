@@ -933,6 +933,32 @@ func (s Session) Canonical() (Session, error) {
 	sort.Slice(canonical.Turns, func(i, j int) bool {
 		return canonical.Turns[i].Index < canonical.Turns[j].Index
 	})
+	sessionEdges := make(map[shoal.ID]graph.Edge)
+	checkEdges := func(edges []graph.Edge) error {
+		for _, edge := range edges {
+			if existing, ok := sessionEdges[edge.ID]; ok {
+				if !sourceEdgesEqual(existing, edge) {
+					return shoal.NewError(
+						shoal.ErrorInvalidArgument,
+						"interaction source edge ID has conflicting values",
+					)
+				}
+				continue
+			}
+			sessionEdges[edge.ID] = edge
+		}
+		return nil
+	}
+	if err := checkEdges(canonical.CitedEdges); err != nil {
+		return Session{}, err
+	}
+	for _, turn := range canonical.Turns {
+		if turn.ToolCall != nil {
+			if err := checkEdges(turn.ToolCall.RetrievedEdges); err != nil {
+				return Session{}, err
+			}
+		}
+	}
 	return canonical, nil
 }
 

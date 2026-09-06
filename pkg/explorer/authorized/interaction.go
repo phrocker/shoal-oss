@@ -1016,7 +1016,8 @@ func metadataEqual(left, right shoal.Metadata) bool {
 		return false
 	}
 	for key, value := range left {
-		if right[key] != value {
+		other, ok := right[key]
+		if !ok || other != value {
 			return false
 		}
 	}

@@ -182,12 +182,14 @@ func (e *Explorer) VerifyInteractionEvidence(
 		return err
 	}
 	for _, node := range nodes {
-		if !exactInteractionNodeEqual(e.graphNodes[node.ID], node) {
+		actual, ok := e.graphNodes[node.ID]
+		if !ok || !exactInteractionNodeEqual(actual, node) {
 			return shoal.NewError(shoal.ErrorNotFound, "interaction evidence node not found")
 		}
 	}
 	for _, edge := range edges {
-		if !exactInteractionEdgeEqual(e.graphEdges[edge.ID], edge) {
+		actual, ok := e.graphEdges[edge.ID]
+		if !ok || !exactInteractionEdgeEqual(actual, edge) {
 			return shoal.NewError(shoal.ErrorNotFound, "interaction evidence edge not found")
 		}
 	}

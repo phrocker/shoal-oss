@@ -214,6 +214,20 @@ func TestCanonicalEvidenceDistinguishesMissingEmptyProperties(t *testing.T) {
 	) {
 		t.Fatalf("conflicting edge properties = %v", err)
 	}
+
+	session.CitedEdges = []graph.Edge{{
+		ID: "edge", From: "from", To: "to", Type: "related",
+		Properties: shoal.Metadata{"a": ""},
+	}}
+	session.Turns[0].ToolCall.RetrievedEdges = []graph.Edge{{
+		ID: "edge", From: "from", To: "to", Type: "related",
+		Properties: shoal.Metadata{"b": ""},
+	}}
+	if _, err := session.Canonical(); !shoal.IsErrorCode(
+		err, shoal.ErrorInvalidArgument,
+	) {
+		t.Fatalf("cross-slice conflicting edge properties = %v", err)
+	}
 }
 
 func TestParseVisibilityRoundTripsAndRejectsBadLabels(t *testing.T) {
