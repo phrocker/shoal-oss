@@ -183,7 +183,8 @@ func (e *Explorer) RecordInteraction(
 				"interaction session ID was explicitly deleted and cannot be reused",
 			)
 		}
-		if reflect.DeepEqual(existing.Session, session) {
+		existingCanonical, canonicalErr := existing.Session.Canonical()
+		if canonicalErr == nil && reflect.DeepEqual(existingCanonical, session) {
 			return nil
 		}
 		return shoal.NewError(

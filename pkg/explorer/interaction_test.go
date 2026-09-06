@@ -482,11 +482,11 @@ func TestFutureSourceCannotCollideWithRecordedSessionID(t *testing.T) {
 
 func TestRecordInteractionExactRetryIsIdempotent(t *testing.T) {
 	ctx := context.Background()
-	corpus, err := explorer.Open(t.TempDir())
+	dir := t.TempDir()
+	corpus, err := explorer.Open(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer corpus.Close()
 	session := interaction.Session{
 		ID:         interaction.DerivedID("session", "idempotent"),
 		RecordedAt: time.Unix(1700000000, 0).UTC(),
@@ -497,6 +497,17 @@ func TestRecordInteractionExactRetryIsIdempotent(t *testing.T) {
 	}
 	if err := corpus.RecordInteraction(ctx, session); err != nil {
 		t.Fatalf("exact retry failed: %v", err)
+	}
+	if err := corpus.Close(); err != nil {
+		t.Fatal(err)
+	}
+	corpus, err = explorer.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer corpus.Close()
+	if err := corpus.RecordInteraction(ctx, session); err != nil {
+		t.Fatalf("exact retry after restart failed: %v", err)
 	}
 	different := session
 	different.StopReason = "different"

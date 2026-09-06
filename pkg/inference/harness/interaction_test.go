@@ -138,6 +138,7 @@ func TestNewGraphRecorderChecksSinkAtSetup(t *testing.T) {
 	if _, err := NewGraphRecorder(context.Background(), sink); err == nil {
 		t.Fatal("recorder accepted an unwritable sink")
 	}
+
 	if sink.ensured != 1 {
 		t.Fatalf("sink checks = %d", sink.ensured)
 	}
@@ -169,6 +170,32 @@ func TestNewGraphRecorderChecksSinkAtSetup(t *testing.T) {
 	}
 	if err := recorder.SetClock(nil); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("nil clock error = %v", err)
+	}
+}
+
+func TestInteractionSessionHashesOversizedIdentifiers(t *testing.T) {
+	model, prompt := provenanceParts(t)
+	provenance, err := NewProvenance(
+		strings.Repeat("a", interaction.MaxIdentifierBytes+1),
+		model, prompt, "grounded-tools-v1",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := InteractionSession(EvaluationRecord{
+		Provenance:               provenance,
+		TranscriptID:             "transcript-long-identifier",
+		SnapshotID:               "snapshot-long-identifier",
+		SnapshotAsOf:             fixedTime.Add(-time.Minute),
+		AuthorizationFingerprint: "auth-sha256:long-identifier",
+		AuthorizationExpiresAt:   fixedTime.Add(time.Hour),
+	}, fixedTime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(session.Provenance.Harness, "sha256:") {
+		t.Fatalf("oversized harness identity was not hashed: %q",
+			session.Provenance.Harness)
 	}
 }
 

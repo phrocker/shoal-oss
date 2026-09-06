@@ -181,6 +181,9 @@ func InteractionSession(
 }
 
 func interactionIdentifier(value string) string {
+	if len(value) > interaction.MaxIdentifierBytes {
+		return "sha256:" + interaction.Digest(value)
+	}
 	for index := 0; index < len(value); index++ {
 		c := value[index]
 		switch {
