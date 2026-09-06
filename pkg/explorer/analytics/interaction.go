@@ -192,8 +192,12 @@ func (r *InteractionRecorder) RecordAnalytics(
 		!equalGraphEdges(recordedSourceEdges(persisted), edges) ||
 		!equalAssertionEvidence(
 			recordedAssertionEvidence(persisted), assertions) {
-		return RecordingReceipt{}, shoal.NewError(
-			shoal.ErrorInternal, "analytics recorder returned inconsistent evidence")
+		return RecordingReceipt{}, explorer.MarkIndeterminateCommit(
+			shoal.NewError(
+				shoal.ErrorInternal,
+				"analytics recorder returned inconsistent evidence",
+			),
+		)
 	}
 	return RecordingReceipt{InteractionID: persisted.ID}, nil
 }

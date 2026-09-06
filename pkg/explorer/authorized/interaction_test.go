@@ -65,6 +65,21 @@ func (b *forgedResultInteractionBase) RecordInteractionResult(
 	return recorded, err
 }
 
+type committedFailureInteractionBase struct {
+	*explorer.Explorer
+}
+
+func (b *committedFailureInteractionBase) RecordInteractionResult(
+	ctx context.Context, session interaction.Session,
+) (interaction.Session, error) {
+	recorded, err := b.Explorer.RecordInteractionResult(ctx, session)
+	if err != nil {
+		return recorded, err
+	}
+	return recorded, explorer.MarkCommittedInteraction(
+		shoal.NewError(shoal.ErrorUnavailable, "post-commit failure"))
+}
+
 type countingInteractionStore struct {
 	authorized.PolicyStore
 	nodesCalls int
