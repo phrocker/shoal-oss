@@ -116,7 +116,10 @@ func NewAnalyticsTool(
 			"bounded, authorization-filtered, ontology-lensed subgraph. " +
 			"Incomplete materialization, nonconvergence, or durable interaction " +
 			"recording failure fails the call.",
-		InputSchema: schema, Annotations: readOnlyAnnotations(),
+		InputSchema: schema, Annotations: &ToolAnnotations{
+			ReadOnlyHint: boolHint(false), DestructiveHint: boolHint(false),
+			IdempotentHint: boolHint(false), OpenWorldHint: boolHint(false),
+		},
 		Execution: &ToolExecution{TaskSupport: "forbidden"},
 	}
 	if _, err := validateTool(tool); err != nil {

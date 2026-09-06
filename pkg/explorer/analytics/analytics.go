@@ -372,6 +372,14 @@ func ValidateResult(request Request, result Result, limits Limits) error {
 			return shoal.NewError(
 				shoal.ErrorInternal, "analytics response assertion status is invalid")
 		}
+		switch ontology.OntologyReading(unresolved.Reading) {
+		case ontology.OntologyUnresolved, ontology.OntologyMalformed,
+			ontology.OntologySameVersion, ontology.OntologyOtherVersion,
+			ontology.OntologyOtherSchema:
+		default:
+			return shoal.NewError(
+				shoal.ErrorInternal, "analytics response assertion reading is invalid")
+		}
 		if _, duplicate := seenUnresolved[unresolved.AssertionID]; duplicate ||
 			(index > 0 && shoal.CompareID(
 				scope.UnresolvedAssertions[index-1].AssertionID,
