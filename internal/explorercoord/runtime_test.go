@@ -457,6 +457,61 @@ func TestOpenSettlesConflictingPendingIntentsInOnePass(t *testing.T) {
 	}
 }
 
+func TestOpenSettlesCompetingFirstCreateIntentsInOnePass(t *testing.T) {
+	config := testRuntimeConfig(t, testDirectory(t))
+	config.RecoveryLimit = 2
+	config.RecoveryConcurrency = 2
+	runtime, err := Open(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	left := testIntent(
+		t, config.Domain, "create", "first-left", "left",
+		guard.ModeAbsentOrIdentical, 0, coordination.Digest{},
+	)
+	right := testIntent(
+		t, config.Domain, "create", "first-right", "right",
+		guard.ModeAbsentOrIdentical, 0, coordination.Digest{},
+	)
+	leftRecord, _, err := runtime.intents.Put(context.Background(), left)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rightRecord, _, err := runtime.intents.Put(context.Background(), right)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := Open(config)
+	if err != nil {
+		t.Fatalf("single-pass first-create recovery open = %v", err)
+	}
+	defer reopened.Close()
+	candidates, _, err := reopened.intents.Candidates(context.Background(), nil, 2)
+	if err != nil || len(candidates) != 0 {
+		t.Fatalf("first-create pending candidates = %#v, %v", candidates, err)
+	}
+	committed, conflicted := 0, 0
+	for _, txn := range []coordination.TXN{leftRecord.TXN, rightRecord.TXN} {
+		snapshot, err := reopened.Inspect(context.Background(), txn)
+		if err != nil {
+			t.Fatal(err)
+		}
+		switch snapshot.Root.State {
+		case coordination.StateCommitted:
+			committed++
+		case coordination.StateConflicted:
+			conflicted++
+		}
+	}
+	if committed != 1 || conflicted != 1 {
+		t.Fatalf("first-create outcomes committed=%d conflicted=%d", committed, conflicted)
+	}
+}
+
 func TestOpenSettlesNewlyPoisonedIntentInOnePass(t *testing.T) {
 	directory := testDirectory(t)
 	config := testRuntimeConfig(t, directory)
