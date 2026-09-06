@@ -24,13 +24,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
-	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/phrocker/shoal-oss/internal/dirlock"
 	"github.com/phrocker/shoal-oss/internal/engine"
 	"github.com/phrocker/shoal-oss/internal/localwal"
 	"github.com/phrocker/shoal-oss/pkg/explorer"
@@ -93,7 +92,7 @@ type Runtime struct {
 	recoveryMu          sync.Mutex
 	closed              bool
 	engine              *engine.Engine
-	lock                *os.File
+	lock                *dirlock.Lock
 	store               *EngineStore
 	protocolStore       coordinationStore
 	intents             *IntentStore
@@ -198,30 +197,17 @@ func Open(config Config) (*Runtime, error) {
 	if config.ContentionWait < 0 || config.ContentionWait > time.Minute {
 		return nil, errors.Join(transaction.ErrInvalid, errors.New("contention wait is outside its bound"))
 	}
-	if err := os.MkdirAll(config.Directory, 0o755); err != nil {
-		return nil, fmt.Errorf("explorer coordination: create runtime directory: %w", err)
-	}
-	lock, err := os.OpenFile(
-		filepath.Join(config.Directory, ".shoal-explorer-runtime.lock"),
-		os.O_CREATE|os.O_RDWR,
-		0o600,
-	)
+	lock, err := dirlock.Acquire(config.Directory, ".shoal-explorer-runtime.lock")
 	if err != nil {
-		return nil, fmt.Errorf("explorer coordination: open runtime lock: %w", err)
-	}
-	if err := tryLockRuntimeFile(lock); err != nil {
-		_ = lock.Close()
-		return nil, fmt.Errorf("explorer coordination: runtime directory is already open: %w", err)
+		return nil, fmt.Errorf("explorer coordination: acquire runtime directory: %w", err)
 	}
 	eng, err := engine.Open(config.Directory, config.EngineOptions)
 	if err != nil {
-		_ = unlockRuntimeFile(lock)
 		_ = lock.Close()
 		return nil, err
 	}
 	closeOnError := func(openErr error) (*Runtime, error) {
 		_ = eng.Close()
-		_ = unlockRuntimeFile(lock)
 		_ = lock.Close()
 		return nil, openErr
 	}
@@ -1010,9 +996,8 @@ func (r *Runtime) Close() error {
 	}
 	r.closed = true
 	engineErr := r.engine.Close()
-	unlockErr := unlockRuntimeFile(r.lock)
-	closeErr := r.lock.Close()
-	return errors.Join(engineErr, unlockErr, closeErr)
+	lockErr := r.lock.Close()
+	return errors.Join(engineErr, lockErr)
 }
 
 type EmbeddedExplorer struct {
