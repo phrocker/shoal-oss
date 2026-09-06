@@ -52,7 +52,7 @@ type EvidenceSnapshotValidator interface {
 		time.Time,
 		[]shoal.ID,
 		[]shoal.ID,
-		[]interaction.AssertionReference,
+		[]interaction.EvidenceReference,
 	) error
 }
 

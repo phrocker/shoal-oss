@@ -165,18 +165,19 @@ func (c *Client) recordInteraction(
 		)
 	}
 	edgeIDs := canonical.TouchedEdgeIDs()
-	if len(edgeIDs) > 0 {
+	references := canonical.EvidenceReferences()
+	if len(references) > 0 {
 		validator, ok := c.snapshotValidator.(EvidenceSnapshotValidator)
 		if !ok {
 			return interaction.Session{}, shoal.NewError(
 				shoal.ErrorUnavailable,
-				"trusted interaction edge snapshot validator is unavailable",
+				"trusted interaction evidence validator is unavailable",
 			)
 		}
 		err = validator.ValidateEvidenceSnapshot(
 			ctx, canonical.SnapshotID, canonical.SnapshotAsOf,
 			canonical.TouchedNodeIDs(), edgeIDs,
-			canonical.TouchedAssertions(),
+			references,
 		)
 	} else {
 		err = c.snapshotValidator.ValidateSnapshot(

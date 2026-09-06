@@ -86,20 +86,31 @@ func (r EvidenceReference) Validate() error {
 				shoal.ErrorInvalidArgument,
 				"document evidence cannot contain graph edge references")
 		}
+		var required []shoal.ID
 		for _, id := range []shoal.ID{
 			r.Citation.DocumentID, r.Citation.SectionID, r.Citation.SpanID,
 		} {
-			if id != "" && !containsEvidenceID(r.NodeIDs, id) {
-				return shoal.NewError(
-					shoal.ErrorInvalidArgument,
-					"document evidence omits a cited source node")
+			if id != "" {
+				required = append(required, id)
 			}
+		}
+		required = dedupeIDs(required)
+		actual := dedupeIDs(r.NodeIDs)
+		if !equalIDs(actual, required) {
+			return shoal.NewError(
+				shoal.ErrorInvalidArgument,
+				"document evidence nodes do not exactly match its citation")
 		}
 	case EvidenceGraph:
 		if r.Citation != (document.Citation{}) || len(r.NodeIDs) == 0 {
 			return shoal.NewError(
 				shoal.ErrorInvalidArgument,
 				"graph evidence has an invalid variant")
+		}
+		if len(r.EdgeIDs) != len(r.NodeIDs)-1 {
+			return shoal.NewError(
+				shoal.ErrorInvalidArgument,
+				"graph evidence path has inconsistent edges")
 		}
 	default:
 		return shoal.NewError(
@@ -136,8 +147,12 @@ func (r EvidenceReference) Canonical() (EvidenceReference, error) {
 	if err := r.Validate(); err != nil {
 		return EvidenceReference{}, err
 	}
-	r.NodeIDs = dedupeIDs(r.NodeIDs)
-	r.EdgeIDs = dedupeIDs(r.EdgeIDs)
+	if r.Kind == EvidenceDocument {
+		r.NodeIDs = dedupeIDs(r.NodeIDs)
+	} else {
+		r.NodeIDs = append([]shoal.ID(nil), r.NodeIDs...)
+		r.EdgeIDs = append([]shoal.ID(nil), r.EdgeIDs...)
+	}
 	r.Assertions = append([]AssertionReference(nil), r.Assertions...)
 	sort.Slice(r.Assertions, func(i, j int) bool {
 		if compared := shoal.CompareID(

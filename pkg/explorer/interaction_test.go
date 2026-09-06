@@ -28,8 +28,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/phrocker/shoal-oss/pkg/document"
 	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/graph"
+	"github.com/phrocker/shoal-oss/pkg/inference"
 	"github.com/phrocker/shoal-oss/pkg/interaction"
 	"github.com/phrocker/shoal-oss/pkg/ontology"
 	"github.com/phrocker/shoal-oss/pkg/retrieval"
@@ -84,6 +86,45 @@ func ingestVisible(
 		t.Fatalf("ingest of %q produced no span nodes", uri)
 	}
 	return spans
+}
+
+func exactGraphEvidence(
+	t testing.TB, corpus *explorer.Explorer, edge graph.Edge,
+) interaction.EvidenceReference {
+	t.Helper()
+	neighborhood, err := corpus.Neighborhood(
+		context.Background(), explorer.NeighborhoodRequest{
+			NodeIDs: []shoal.ID{edge.From}, Depth: 1,
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	nodes := make(map[shoal.ID]graph.Node, len(neighborhood.Nodes))
+	for _, node := range neighborhood.Nodes {
+		nodes[node.ID] = node
+	}
+	var exact graph.Edge
+	for _, candidate := range neighborhood.Edges {
+		if candidate.ID == edge.ID {
+			exact = candidate
+			break
+		}
+	}
+	if exact.ID == "" || nodes[edge.From].ID == "" || nodes[edge.To].ID == "" {
+		t.Fatal("exact graph evidence is unavailable")
+	}
+	anchor, err := inference.NewGraphAnchor(graph.Path{
+		Nodes: []graph.Node{nodes[edge.From], nodes[edge.To]},
+		Edges: []graph.Edge{exact},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reference, err := anchor.EvidenceReference()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return reference
 }
 
 func recordedSession(
@@ -451,6 +492,7 @@ func TestExactEdgeEvidenceSurvivesRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	evidence := exactGraphEvidence(t, corpus, edge)
 	session := interaction.Session{
 		ID:                       interaction.DerivedID("session", "edge-restart"),
 		RecordedAt:               snapshot.AsOf.Add(time.Second),
@@ -461,12 +503,17 @@ func TestExactEdgeEvidenceSurvivesRestart(t *testing.T) {
 		AuthorizationExpiresAt:   snapshot.AsOf.Add(time.Hour),
 		EmbeddingSpaces:          embeddingSpaces,
 		SeedNodeIDs:              []shoal.ID{edge.From, edge.To},
-		SeedEvidence: []interaction.EvidenceReference{{
-			AnchorID: "edge-anchor",
-			Kind:     interaction.EvidenceGraph,
-			NodeIDs:  []shoal.ID{edge.From, edge.To},
-			EdgeIDs:  []shoal.ID{edge.ID},
-		}},
+		SeedEvidence:             []interaction.EvidenceReference{evidence},
+	}
+	forgedAnchor := session
+	forgedAnchor.ID = interaction.DerivedID(
+		"session", "forged-graph-anchor")
+	forgedAnchor.SeedEvidence = cloneTestEvidence(session.SeedEvidence)
+	forgedAnchor.SeedEvidence[0].AnchorID = "forged-anchor"
+	if err := corpus.RecordInteraction(
+		ctx, forgedAnchor,
+	); !shoal.IsErrorCode(err, shoal.ErrorConflict) {
+		t.Fatalf("forged graph anchor recording error = %v", err)
 	}
 	forged := session
 	forged.ID = interaction.DerivedID("session", "forged-assertion")
@@ -512,6 +559,74 @@ func TestExactEdgeEvidenceSurvivesRestart(t *testing.T) {
 	}
 	if record.Summary.Visibility != "edge-secret&ops" {
 		t.Fatalf("edge-aware visibility = %q", record.Summary.Visibility)
+	}
+}
+
+func TestRecordInteractionRejectsForgedCitationAnchor(t *testing.T) {
+	ctx := context.Background()
+	corpus, err := explorer.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer corpus.Close()
+	receipt, err := corpus.Ingest(ctx, explorer.Source{
+		URI:       "file:///citation-evidence.txt",
+		MediaType: explorer.MediaTypeText,
+		Content:   "trusted citation bytes",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	view, err := corpus.Document(
+		ctx, receipt.Document.ID, receipt.Revision.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(view.Root.Spans) == 0 {
+		t.Fatal("fixture produced no span")
+	}
+	span := view.Root.Spans[0]
+	citation := document.Citation{
+		DocumentID: receipt.Document.ID,
+		RevisionID: receipt.Revision.ID,
+		SectionID:  span.SectionID,
+		SpanID:     span.ID,
+		Range:      span.Range,
+	}
+	anchor, err := inference.NewDocumentAnchor(citation, span.Text)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reference, err := anchor.EvidenceReference()
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := corpus.Snapshot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := interaction.Session{
+		ID:                       interaction.DerivedID("session", "citation-anchor"),
+		RecordedAt:               snapshot.AsOf.Add(time.Second),
+		Operation:                interaction.OperationRetrieval,
+		SnapshotID:               shoal.ID(snapshot.ID),
+		SnapshotAsOf:             snapshot.AsOf,
+		AuthorizationFingerprint: "auth-sha256:citation-anchor",
+		AuthorizationExpiresAt:   snapshot.AsOf.Add(time.Hour),
+		SeedNodeIDs:              reference.NodeIDs,
+		SeedEvidence:             []interaction.EvidenceReference{reference},
+	}
+	forged := session
+	forged.ID = interaction.DerivedID("session", "forged-citation-anchor")
+	forged.SeedEvidence = cloneTestEvidence(session.SeedEvidence)
+	forged.SeedEvidence[0].Citation.Range.Start.Offset++
+	if err := corpus.RecordInteraction(
+		ctx, forged,
+	); !shoal.IsErrorCode(err, shoal.ErrorConflict) {
+		t.Fatalf("forged citation anchor recording error = %v", err)
+	}
+	if err := corpus.RecordInteraction(ctx, session); err != nil {
+		t.Fatalf("authoritative citation was rejected: %v", err)
 	}
 }
 

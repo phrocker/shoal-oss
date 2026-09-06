@@ -27,7 +27,9 @@ import (
 	"sort"
 	"time"
 
+	"github.com/phrocker/shoal-oss/pkg/document"
 	"github.com/phrocker/shoal-oss/pkg/graph"
+	"github.com/phrocker/shoal-oss/pkg/inference"
 	"github.com/phrocker/shoal-oss/pkg/interaction"
 	"github.com/phrocker/shoal-oss/pkg/ontology"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
@@ -70,7 +72,7 @@ func (e *Explorer) ValidateEvidenceSnapshot(
 	asOf time.Time,
 	nodeIDs []shoal.ID,
 	edgeIDs []shoal.ID,
-	assertions []interaction.AssertionReference,
+	references []interaction.EvidenceReference,
 ) error {
 	if err := contextError(ctx); err != nil {
 		return err
@@ -91,7 +93,7 @@ func (e *Explorer) ValidateEvidenceSnapshot(
 		return err
 	}
 	return e.validateEvidenceSnapshotLocked(
-		id, asOf, nodeIDs, edgeIDs, assertions)
+		id, asOf, nodeIDs, edgeIDs, references)
 }
 
 func (e *Explorer) validateEvidenceSnapshotLocked(
@@ -99,7 +101,7 @@ func (e *Explorer) validateEvidenceSnapshotLocked(
 	asOf time.Time,
 	nodeIDs []shoal.ID,
 	edgeIDs []shoal.ID,
-	assertions []interaction.AssertionReference,
+	references []interaction.EvidenceReference,
 ) error {
 	record, ok := e.snapshotHistory[string(id)]
 	if !ok || !record.AsOf.Equal(asOf.UTC()) {
@@ -134,10 +136,98 @@ func (e *Explorer) validateEvidenceSnapshotLocked(
 			)
 		}
 	}
-	for _, reference := range assertions {
-		if err := e.validateAssertionReferenceLocked(reference); err != nil {
+	for _, reference := range references {
+		if err := e.validateEvidenceReferenceLocked(reference); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+func (e *Explorer) validateEvidenceReferenceLocked(
+	reference interaction.EvidenceReference,
+) error {
+	canonical, err := reference.Canonical()
+	if err != nil {
+		return err
+	}
+	switch canonical.Kind {
+	case interaction.EvidenceDocument:
+		revisions := e.documents[canonical.Citation.DocumentID]
+		record := revisions[canonical.Citation.RevisionID]
+		if record == nil {
+			return shoal.NewError(
+				shoal.ErrorConflict,
+				"interaction citation revision is unavailable",
+			)
+		}
+		quote, err := document.ResolveCitationQuote(
+			record.Source.Content,
+			record.Document,
+			record.Revision,
+			record.Sections,
+			record.Spans,
+			canonical.Citation,
+		)
+		if err != nil {
+			return shoal.WrapError(
+				shoal.ErrorConflict,
+				"interaction citation is not authoritative",
+				err,
+			)
+		}
+		anchor, err := inference.NewDocumentAnchor(
+			canonical.Citation, quote)
+		if err != nil || anchor.ID() != canonical.AnchorID {
+			return shoal.NewError(
+				shoal.ErrorConflict,
+				"interaction citation anchor identity is not authoritative",
+			)
+		}
+	case interaction.EvidenceGraph:
+		path := graph.Path{
+			Nodes: make([]graph.Node, len(canonical.NodeIDs)),
+			Edges: make([]graph.Edge, len(canonical.EdgeIDs)),
+		}
+		for index, nodeID := range canonical.NodeIDs {
+			node, ok := e.graphNodes[nodeID]
+			if !ok || interaction.IsInteractionKind(node.Kind) {
+				return shoal.NewError(
+					shoal.ErrorConflict,
+					"interaction graph evidence node is unavailable",
+				)
+			}
+			path.Nodes[index] = cloneNode(node)
+		}
+		for index, edgeID := range canonical.EdgeIDs {
+			edge, ok := e.graphEdges[edgeID]
+			if !ok || interaction.IsInteractionID(edge.ID) {
+				return shoal.NewError(
+					shoal.ErrorConflict,
+					"interaction graph evidence edge is unavailable",
+				)
+			}
+			path.Edges[index] = cloneEdge(edge)
+		}
+		for _, assertion := range canonical.Assertions {
+			if err := e.validateAssertionReferenceLocked(
+				assertion); err != nil {
+				return err
+			}
+		}
+		anchor, err := inference.NewGraphAnchorWithAssertions(
+			path, canonical.Assertions)
+		if err != nil || anchor.ID() != canonical.AnchorID {
+			return shoal.NewError(
+				shoal.ErrorConflict,
+				"interaction graph anchor identity is not authoritative",
+			)
+		}
+	default:
+		return shoal.NewError(
+			shoal.ErrorConflict,
+			"interaction evidence kind is not authoritative",
+		)
 	}
 	return nil
 }

@@ -225,7 +225,7 @@ func (e *Explorer) recordInteractionResult(
 			session.SnapshotAsOf,
 			session.TouchedNodeIDs(),
 			session.TouchedEdgeIDs(),
-			session.TouchedAssertions(),
+			session.EvidenceReferences(),
 		); err != nil {
 			return interaction.Session{}, err
 		}
@@ -875,6 +875,11 @@ func (e *Explorer) edgeVisibilityResolverLocked() interaction.VisibilityResolver
 func (e *Explorer) currentInteractionVisibilityLocked(
 	record persistedInteraction,
 ) (string, error) {
+	for _, reference := range record.Session.EvidenceReferences() {
+		if err := e.validateEvidenceReferenceLocked(reference); err != nil {
+			return "", err
+		}
+	}
 	touched := interaction.TouchedNodes(record.Nodes, record.Edges)
 	nodeIDs := append(
 		append([]shoal.ID(nil), touched.RetrievedNodeIDs...),

@@ -31,6 +31,7 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/explorer/authorized"
 	"github.com/phrocker/shoal-oss/pkg/graph"
+	"github.com/phrocker/shoal-oss/pkg/inference"
 	"github.com/phrocker/shoal-oss/pkg/interaction"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
@@ -72,6 +73,45 @@ type countingInteractionStore struct {
 type edgeHidingInteractionStore struct {
 	authorized.PolicyStore
 	hidden shoal.ID
+}
+
+func exactAuthorizedGraphEvidence(
+	t testing.TB, corpus *explorer.Explorer, edge graph.Edge,
+) interaction.EvidenceReference {
+	t.Helper()
+	neighborhood, err := corpus.Neighborhood(
+		context.Background(), explorer.NeighborhoodRequest{
+			NodeIDs: []shoal.ID{edge.From}, Depth: 1,
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	nodes := make(map[shoal.ID]graph.Node, len(neighborhood.Nodes))
+	for _, node := range neighborhood.Nodes {
+		nodes[node.ID] = node
+	}
+	var exact graph.Edge
+	for _, candidate := range neighborhood.Edges {
+		if candidate.ID == edge.ID {
+			exact = candidate
+			break
+		}
+	}
+	if exact.ID == "" || nodes[edge.From].ID == "" || nodes[edge.To].ID == "" {
+		t.Fatal("exact graph evidence is unavailable")
+	}
+	anchor, err := inference.NewGraphAnchor(graph.Path{
+		Nodes: []graph.Node{nodes[edge.From], nodes[edge.To]},
+		Edges: []graph.Edge{exact},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reference, err := anchor.EvidenceReference()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return reference
 }
 
 func (s edgeHidingInteractionStore) Edges(
@@ -278,6 +318,7 @@ func TestAuthorizedInteractionReauthorizesExactSourceEdge(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	evidence := exactAuthorizedGraphEvidence(t, f.base, edge)
 	session := interaction.Session{
 		ID:                       interaction.DerivedID("session", "authorized-edge"),
 		RecordedAt:               f.clock.Now(),
@@ -288,12 +329,7 @@ func TestAuthorizedInteractionReauthorizesExactSourceEdge(t *testing.T) {
 		AuthorizationFingerprint: shoal.ID(fingerprint.String()),
 		AuthorizationExpiresAt:   decision.AuthenticationExpires(),
 		SeedNodeIDs:              []shoal.ID{edge.From, edge.To},
-		SeedEvidence: []interaction.EvidenceReference{{
-			AnchorID: "edge-anchor",
-			Kind:     interaction.EvidenceGraph,
-			NodeIDs:  []shoal.ID{edge.From, edge.To},
-			EdgeIDs:  []shoal.ID{edge.ID},
-		}},
+		SeedEvidence:             []interaction.EvidenceReference{evidence},
 	}
 	if err := f.clientA.RecordInteraction(ctx, session); err != nil {
 		t.Fatal(err)

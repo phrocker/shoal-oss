@@ -880,6 +880,23 @@ func (s Session) TouchedAssertions() []AssertionReference {
 	return evidenceAssertions([]EvidenceReference{{Assertions: references}})
 }
 
+// EvidenceReferences returns the canonical union of every retrieved and cited
+// evidence anchor in the session.
+func (s Session) EvidenceReferences() []EvidenceReference {
+	values := append([]EvidenceReference(nil), s.SeedEvidence...)
+	values = append(values, s.CitedEvidence...)
+	for _, turn := range s.Turns {
+		if turn.ToolCall != nil {
+			values = append(values, turn.ToolCall.RetrievedEvidence...)
+		}
+	}
+	canonical, err := canonicalEvidenceReferences(values)
+	if err != nil {
+		return nil
+	}
+	return canonical
+}
+
 // Subgraph materializes the session, turn, and tool-call nodes with their
 // retrieved and cited edges. resolve supplies the visibility labels of every
 // touched source node; if it fails for any node, the whole record fails rather
