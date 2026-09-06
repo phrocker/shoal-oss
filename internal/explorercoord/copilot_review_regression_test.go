@@ -1176,6 +1176,92 @@ func TestCommittedScanRejectsOversizedCursors(t *testing.T) {
 	}
 }
 
+func TestCommittedScanRejectsNegativeFrontier(t *testing.T) {
+	config := testRuntimeConfig(t, testDirectory(t))
+	runtime, err := Open(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.Close()
+	if _, err := runtime.ScanCommitted(
+		context.Background(),
+		CommittedScanRequest{
+			Table:     "records",
+			RowPrefix: []byte("row/"),
+			Family:    []byte("record"),
+			Qualifier: []byte("v1"),
+			Frontier:  coordination.Epoch(-1),
+			Limit:     1,
+		},
+	); !errors.Is(err, transaction.ErrInvalid) {
+		t.Fatalf("negative committed frontier = %v", err)
+	}
+}
+
+func TestExactCommittedReadIgnoresSiblingCoordinateWork(t *testing.T) {
+	config := testRuntimeConfig(t, testDirectory(t))
+	runtime, err := Open(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.Close()
+	row := []byte("shared-row")
+	intent := committedReadIntent(
+		t,
+		config.Domain,
+		"exact-coordinate",
+		row,
+		[]byte("target"),
+		guard.ModeAbsentOrIdentical,
+		0,
+		coordination.Digest{},
+	)
+	result, err := runtime.Publish(
+		context.Background(),
+		Request{Intent: intent},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	siblings, err := cclient.NewMutation(row)
+	if err != nil {
+		t.Fatal(err)
+	}
+	siblings.Put(
+		[]byte("event"),
+		[]byte("a"),
+		nil,
+		int64(result.Epoch),
+		[]byte("a"),
+	)
+	siblings.Put(
+		[]byte("event"),
+		[]byte("b"),
+		nil,
+		int64(result.Epoch),
+		[]byte("b"),
+	)
+	if err := runtime.engine.Write(
+		"records",
+		[]*cclient.Mutation{siblings},
+	); err != nil {
+		t.Fatal(err)
+	}
+	cell, found, err := runtime.readCommittedCell(
+		context.Background(),
+		"records",
+		row,
+		[]byte("event"),
+		[]byte("record"),
+		nil,
+		result.Epoch,
+		1,
+	)
+	if err != nil || !found || !bytes.Equal(cell.Cell.Value, []byte("target")) {
+		t.Fatalf("exact read with sibling cells = %#v, %v, %v", cell, found, err)
+	}
+}
+
 func TestRecoveryRestoresAmbiguousRecordAttemptBinding(t *testing.T) {
 	for _, applied := range []bool{false, true} {
 		t.Run(map[bool]string{false: "not applied", true: "applied"}[applied], func(t *testing.T) {
@@ -1232,6 +1318,24 @@ func TestRecoveryRestoresAmbiguousRecordAttemptBinding(t *testing.T) {
 				t.Fatalf("retry duplicated recovered publication = %#v, %v", after, err)
 			}
 		})
+	}
+}
+
+func TestRecordAttemptPreservesEmptyValue(t *testing.T) {
+	config := testRuntimeConfig(t, testDirectory(t))
+	runtime, err := Open(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.Close()
+	request := testRecordPublication("document", "revision", "value", nil)
+	request.Value = nil
+	if _, err := runtime.PublishRecord(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	attempt, err := runtime.RecordAttempt(context.Background(), request)
+	if err != nil || attempt == nil || len(attempt.Value) != 0 {
+		t.Fatalf("empty record attempt = %#v, %v", attempt, err)
 	}
 }
 
