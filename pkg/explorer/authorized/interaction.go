@@ -533,8 +533,26 @@ func analyticsInteractionEvidence(
 ) (analyticsInteractionGraph, bool, error) {
 	var evidence analyticsInteractionGraph
 	found := false
+	if len(session.CitedEdges) != 0 {
+		return analyticsInteractionGraph{}, false, shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			"analytics interaction has evidence outside its analytics tool call",
+		)
+	}
 	for _, turn := range session.Turns {
-		if turn.ToolCall == nil || turn.ToolCall.Kind != "analytics" {
+		if turn.ToolCall == nil {
+			continue
+		}
+		if turn.ToolCall.Kind != "analytics" {
+			if len(turn.ToolCall.RetrievedNodeIDs) != 0 ||
+				len(turn.ToolCall.RetrievedNodes) != 0 ||
+				len(turn.ToolCall.RetrievedEdges) != 0 ||
+				len(turn.ToolCall.RetrievedAssertions) != 0 {
+				return analyticsInteractionGraph{}, false, shoal.NewError(
+					shoal.ErrorInvalidArgument,
+					"analytics interaction has evidence outside its analytics tool call",
+				)
+			}
 			continue
 		}
 		if found {

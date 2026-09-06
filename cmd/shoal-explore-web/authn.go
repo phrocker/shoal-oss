@@ -69,6 +69,7 @@ var workspaceOperations = []auth.Operation{
 	auth.OperationConnect,
 	auth.OperationNeighborhood,
 	auth.OperationRetrieve,
+	auth.OperationAnalyticsRead,
 }
 
 // developmentAuthenticator mints one short-lived decision per request for a
