@@ -148,28 +148,9 @@ func (c *Client) anchors(ctx context.Context, a analysis) ([]string, error) {
 // degrades gracefully and the default (UseIVF=false) path is byte-for-byte
 // unchanged.
 func (c *Client) semanticAnchors(ctx context.Context, a analysis) ([]string, error) {
-	if c.cfg.UseIVF {
-		if ix := c.ivfIndex(ctx); ix != nil {
-			nprobe := c.cfg.IvfNprobe
-			if nprobe <= 0 {
-				nprobe = 8
-			}
-			hits, err := ix.Search(ctx, a.vector, c.cfg.MaxAnchors, nprobe)
-			if err == nil {
-				rows := make([]string, 0, len(hits))
-				seen := map[string]bool{}
-				for _, h := range hits {
-					if seen[h.Row] {
-						continue
-					}
-					seen[h.Row] = true
-					rows = append(rows, h.Row)
-				}
-				return rows, nil
-			}
-			// fall through to brute force on search error
-		}
-	}
+	// Legacy agent-memory IVF artifacts do not persist embedding-space
+	// identity. Until that format is upgraded, fail closed to the
+	// identity-checked brute-force path instead of trusting dimensions.
 	cells, err := c.cfg.Store.Scan(ctx, c.cfg.Table, &embedpb.ScanRequest{RowPrefix: graphschema.EventRowPrefix, VectorSearch: &embedpb.VectorSearch{
 		Query: PackVector(a.vector), TopK: int32(c.cfg.MaxAnchors),
 		EmbeddingCf: graphschema.VectorCF(), Metric: "cosine",

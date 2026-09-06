@@ -539,8 +539,8 @@ func (t *table) routeTablet(row []byte) int {
 // write routes each mutation to its tablet and applies them.
 // Mutations to different tablets are batched and written in parallel.
 func (t *table) write(mutations []*cclient.Mutation) error {
-	t.formatMu.RLock()
-	defer t.formatMu.RUnlock()
+	t.formatMu.Lock()
+	defer t.formatMu.Unlock()
 	if len(t.tablets) == 1 {
 		return t.tablets[0].Write(mutations)
 	}
@@ -576,8 +576,8 @@ func (t *table) write(mutations []*cclient.Mutation) error {
 }
 
 func (t *table) conditionalWrite(mutations []ConditionalMutation) ([]bool, error) {
-	t.formatMu.RLock()
-	defer t.formatMu.RUnlock()
+	t.formatMu.Lock()
+	defer t.formatMu.Unlock()
 	results := make([]bool, len(mutations))
 	buckets := make([][]ConditionalMutation, len(t.tablets))
 	indices := make([][]int, len(t.tablets))
@@ -819,14 +819,19 @@ func (t *table) scan(r iterrt.Range, opts ScanOptions) (*Scanner, error) {
 // merge is correct because tablets partition the row space — every cell
 // coordinate lives in exactly one tablet, so all versions of a coordinate are
 // adjacent in the merged stream.
-func (t *table) scanHosted(r iterrt.Range, opts ScanOptions, topStack []iterrt.IterSpec) (*Scanner, error) {
+func (t *table) scanHosted(
+	ctx context.Context,
+	r iterrt.Range,
+	opts ScanOptions,
+	topStack []iterrt.IterSpec,
+) (*Scanner, error) {
 	t.formatMu.RLock()
 	defer t.formatMu.RUnlock()
 	if identity, ok, err := exactVectorEmbeddingSpace(topStack); err != nil {
 		return nil, err
 	} else if ok {
 		files, unflushed, defaultEmbedding, err :=
-			t.embeddingStateSnapshotLocked(context.Background())
+			t.embeddingStateSnapshotLocked(ctx)
 		if err != nil {
 			return nil, err
 		}

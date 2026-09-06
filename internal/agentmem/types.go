@@ -120,16 +120,22 @@ func New(cfg Config) (*Client, error) {
 	if cfg.Embedder == nil {
 		cfg.Embedder = FakeEmbedder{Dim: DefaultDim}
 	}
-	if cfg.EmbeddingSpace == "" {
-		provider, ok := cfg.Embedder.(embeddingSpaceIdentityProvider)
-		if !ok {
-			return nil, embeddingspace.ErrQueryIdentityRequired
-		}
+	if provider, ok := cfg.Embedder.(embeddingSpaceIdentityProvider); ok {
 		identity, err := provider.EmbeddingSpaceIdentity()
 		if err != nil {
 			return nil, err
 		}
-		cfg.EmbeddingSpace = identity
+		if cfg.EmbeddingSpace == "" {
+			cfg.EmbeddingSpace = identity
+		} else if err := embeddingspace.EnsureSameIdentity(
+			"configure agent memory embedding",
+			identity,
+			cfg.EmbeddingSpace,
+		); err != nil {
+			return nil, err
+		}
+	} else if cfg.EmbeddingSpace == "" {
+		return nil, embeddingspace.ErrQueryIdentityRequired
 	}
 	if err := embeddingspace.ValidateQueryStates(
 		"configure agent memory embedding", cfg.EmbeddingSpace); err != nil {

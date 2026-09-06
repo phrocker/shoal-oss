@@ -91,7 +91,7 @@ func (b *Backend) Scan(ctx context.Context, table string, r iterrt.Range, req sh
 		ColumnFamilies:          req.ColumnFamilies,
 		ColumnFamiliesInclusive: req.CFInclusive,
 	}
-	return b.eng.ScanHosted(table, r, opts, req.Stack)
+	return b.eng.ScanHostedContext(ctx, table, r, opts, req.Stack)
 }
 
 // LookupRows implements shoalql.Backend, buffering the engine's visitor

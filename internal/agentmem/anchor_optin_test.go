@@ -70,13 +70,14 @@ var optinVecs = [][]float32{
 	{0, 0, 1, 1},
 }
 
-// With UseIVF and a trained index, semanticAnchors sources from the IVF-PQ
-// index: each query vector retrieves its own row as the first anchor.
+// Legacy IVF artifacts have no embedding identity, so UseIVF safely falls
+// back to the identity-checked brute-force path.
 func TestSemanticAnchors_IVFEnabled(t *testing.T) {
 	ctx := context.Background()
 	store := NewFakeStore()
 	const table = "graph"
-	rows := seedIvfIndex(t, store, table, optinVecs, 2, 6, 2, 1)
+	_ = seedIvfIndex(t, store, table, optinVecs, 2, 6, 2, 1)
+	seedBruteForceVectors(t, store, table, optinVecs)
 
 	c, err := New(Config{Store: store, Table: table, UseIVF: true, IvfNprobe: 2})
 	if err != nil {
@@ -87,8 +88,8 @@ func TestSemanticAnchors_IVFEnabled(t *testing.T) {
 		if err != nil {
 			t.Fatalf("semanticAnchors[%d]: %v", i, err)
 		}
-		if len(got) == 0 || got[0] != rows[i] {
-			t.Errorf("semanticAnchors[%d] = %v, want first=%q", i, got, rows[i])
+		if len(got) == 0 {
+			t.Errorf("semanticAnchors[%d] = %v, want a safe fallback result", i, got)
 		}
 	}
 }

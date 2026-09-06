@@ -486,6 +486,19 @@ func (e *Engine) TableStoragePolicy(tableName string) (StoragePolicy, error) {
 // primary rows it references may live in different tablets. A VersioningIterator
 // is always applied beneath topStack; topStack is composed above it.
 func (e *Engine) ScanHosted(tableName string, r iterrt.Range, opts ScanOptions, topStack []iterrt.IterSpec) (*Scanner, error) {
+	return e.ScanHostedContext(
+		context.Background(), tableName, r, opts, topStack)
+}
+
+// ScanHostedContext is ScanHosted with cancellation for metadata reads and
+// source construction.
+func (e *Engine) ScanHostedContext(
+	ctx context.Context,
+	tableName string,
+	r iterrt.Range,
+	opts ScanOptions,
+	topStack []iterrt.IterSpec,
+) (*Scanner, error) {
 	e.mu.RLock()
 	tbl, ok := e.tables[tableName]
 	e.mu.RUnlock()
@@ -493,7 +506,7 @@ func (e *Engine) ScanHosted(tableName string, r iterrt.Range, opts ScanOptions, 
 		return nil, fmt.Errorf("engine: table %q not found", tableName)
 	}
 	e.metrics.scans.Add(1)
-	return tbl.scanHosted(r, opts, topStack)
+	return tbl.scanHosted(ctx, r, opts, topStack)
 }
 
 // RowVisitor receives each cell of each looked-up row. idx is the row's
