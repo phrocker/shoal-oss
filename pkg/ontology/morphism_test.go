@@ -517,6 +517,68 @@ func TestOntologyTransitionRejectsMorphismFromDifferentVersions(t *testing.T) {
 	}
 }
 
+func TestOntologyTransitionMapsRenamedOwnedProperty(t *testing.T) {
+	f := newMorphismFixture(t)
+	oldProperty, _ := NewPropertyDefinition(
+		"display-name", "Display Name", "", ValueString, nil, nil)
+	newProperty, _ := NewPropertyDefinition(
+		"preferred-name", "Preferred Name", "", ValueString, nil, nil)
+	sourcePerson, _ := NewConceptDefinition(
+		"person", "Person", "", []shoal.ID{oldProperty.ID()}, nil)
+	targetPerson, _ := NewConceptDefinition(
+		"person", "Person", "", []shoal.ID{newProperty.ID()}, nil)
+	source, _ := NewOntologyVersion(
+		f.v1.Schema(), "property-rename-1", f.v1.CreatedAt().Add(30*time.Second),
+		[]ConceptDefinition{sourcePerson}, nil,
+		[]PropertyDefinition{oldProperty}, nil)
+	target, _ := NewOntologyVersion(
+		f.v1.Schema(), "property-rename-2", f.v1.CreatedAt().Add(31*time.Second),
+		[]ConceptDefinition{targetPerson}, nil,
+		[]PropertyDefinition{newProperty}, nil)
+	rename := mustMorphism(t, MorphismConfig{
+		Kind: MorphismRename, SourceVersion: source, TargetVersion: target,
+		Sources: []shoal.ID{oldProperty.ID()}, Targets: []shoal.ID{newProperty.ID()},
+		Evidence: []EvidenceRef{f.evidence}, Rationale: "rename owned property",
+	})
+	transition, err := NewOntologyTransition(
+		source, target, []OntologyMorphism{rename})
+	if err != nil {
+		t.Fatalf("property rename transition rejected: %v", err)
+	}
+	lens, err := NewOntologyLensWithTransitions(
+		target, []OntologyTransition{transition}, []OntologyMorphism{rename})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertion := mustPropertyAssertion(
+		t, sourcePerson.ID(), oldProperty.ID(), source,
+		nil, f.evidence, f.provenance)
+	read := lens.Read(assertion)
+	if !read.Resolved() || read.Predicate() != newProperty.ID() {
+		t.Fatalf("property rename interpretation = %#v", read)
+	}
+}
+
+func TestOntologyTransitionRejectsUnmappedRemovalBeforeReintroduction(t *testing.T) {
+	schema, _ := NewOntologySchema("revival", "Revival", "", nil)
+	person, _ := NewConceptDefinition("person", "Person", "", nil, nil)
+	at := time.Date(2026, 9, 6, 3, 0, 0, 0, time.UTC)
+	v1, _ := NewOntologyVersion(
+		schema, "1", at, []ConceptDefinition{person}, nil, nil, nil)
+	v2, _ := NewOntologyVersion(
+		schema, "2", at.Add(time.Second), nil, nil, nil, nil)
+	v3, _ := NewOntologyVersion(
+		schema, "3", at.Add(2*time.Second),
+		[]ConceptDefinition{person}, nil, nil, nil)
+	if _, err := NewOntologyTransition(v1, v2, nil); err == nil ||
+		!strings.Contains(err.Error(), "removed concept") {
+		t.Fatalf("unmapped removal error = %v", err)
+	}
+	if _, err := NewOntologyTransition(v2, v3, nil); err != nil {
+		t.Fatalf("additive reintroduction transition rejected: %v", err)
+	}
+}
+
 type morphismFixture struct {
 	v1, v2, renameFrom, renameTo, splitFrom, splitTo                      OntologyVersion
 	v1rel, v2rel, oldRel, newRel                                          RelationshipDefinition
