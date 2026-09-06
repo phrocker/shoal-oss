@@ -439,6 +439,121 @@ func TestFoldRetryAdoptsCommittedRecord(t *testing.T) {
 	}
 }
 
+func TestFoldRetryAdoptsCommittedRecordAfterSourceChange(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		change func(*testing.T, *Explorer, Source, shoal.ID)
+	}{
+		{
+			name: "visibility reclassification",
+			change: func(
+				t *testing.T, corpus *Explorer, source Source, _ shoal.ID,
+			) {
+				source.Metadata = shoal.Metadata{
+					interaction.PropertyVisibility: "restricted",
+				}
+				if _, err := corpus.Ingest(
+					context.Background(), source); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "member deletion",
+			change: func(
+				t *testing.T, corpus *Explorer, _ Source, sessionID shoal.ID,
+			) {
+				if _, err := corpus.DeleteInteraction(
+					context.Background(), sessionID); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			corpus, err := Open(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer corpus.Close()
+			source := Source{
+				URI:       "file:///fold-retry-source.txt",
+				MediaType: MediaTypeText,
+				Content:   "stable fold source",
+				Metadata: shoal.Metadata{
+					interaction.PropertyVisibility: "open",
+				},
+			}
+			receipt, err := corpus.Ingest(ctx, source)
+			if err != nil {
+				t.Fatal(err)
+			}
+			view, err := corpus.Document(
+				ctx, receipt.Document.ID, receipt.Revision.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			session := interaction.Session{
+				ID: interaction.DerivedID(
+					"session", "fold-source-change", test.name),
+				RecordedAt:  time.Unix(1700000000, 0).UTC(),
+				Operation:   interaction.OperationRetrieval,
+				SeedNodeIDs: []shoal.ID{view.Root.Spans[0].ID},
+			}
+			if err := corpus.RecordInteraction(ctx, session); err != nil {
+				t.Fatal(err)
+			}
+			summaryDigest := interaction.Digest(
+				"fold source change " + test.name)
+			write := corpus.writeRecord
+			foldWrites := 0
+			var accepted persistedFold
+			corpus.interactionRecordWriter = func(
+				row []byte, kind byte, value any,
+			) error {
+				if fold, ok := value.(persistedFold); ok &&
+					!fold.Deleted {
+					foldWrites++
+					if foldWrites > 1 {
+						return errors.New("unexpected second fold write")
+					}
+					accepted = fold
+					if err := write(row, kind, value); err != nil {
+						return err
+					}
+					return errors.New("simulated committed fold error")
+				}
+				return write(row, kind, value)
+			}
+			if _, err := corpus.FoldInteractions(ctx, FoldRequest{
+				SessionIDs:    []shoal.ID{session.ID},
+				SummaryDigest: summaryDigest,
+			}); err == nil {
+				t.Fatalf("initial fold error = %v", err)
+			}
+			if accepted.FoldID == "" || foldWrites != 1 {
+				t.Fatalf("accepted fold = %+v, writes = %d",
+					accepted, foldWrites)
+			}
+			test.change(t, corpus, source, session.ID)
+			result, err := corpus.FoldInteractions(ctx, FoldRequest{
+				SessionIDs:    []shoal.ID{session.ID},
+				SummaryDigest: summaryDigest,
+			})
+			if err != nil {
+				t.Fatalf("committed fold retry was not adopted: %v", err)
+			}
+			if result.Created ||
+				!result.FoldedAt.Equal(accepted.FoldedAt) ||
+				result.Visibility != accepted.Visibility ||
+				foldWrites != 1 {
+				t.Fatalf("reconciled fold result = %+v", result)
+			}
+		})
+	}
+}
+
 func TestDeleteRetryAdoptsCommittedTombstone(t *testing.T) {
 	ctx := context.Background()
 	corpus, err := Open(t.TempDir())
@@ -696,5 +811,75 @@ func TestSnapshotObjectDigestSeparatesOpaqueBytes(t *testing.T) {
 	}
 	if _, err := snapshotObjectDigest("unsupported"); err == nil {
 		t.Fatal("expected an error for an unknown snapshot object")
+	}
+}
+
+// TestDeletedFoldMemberProvenanceIsNotRehydratable pins that a fold whose
+// create returned an indeterminate commit cannot be used to recover the
+// provenance of a member session that was deleted before the fold was
+// reconciled. The in-memory guard in DeleteInteraction cannot see that fold,
+// so the retention contract has to hold at the exposure points too.
+func TestDeletedFoldMemberProvenanceIsNotRehydratable(t *testing.T) {
+	ctx := context.Background()
+	corpus, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer corpus.Close()
+	receipt, err := corpus.Ingest(ctx, Source{
+		URI:       "file:///deleted-fold-member.txt",
+		MediaType: MediaTypeText,
+		Content:   "folded member source",
+		Metadata: shoal.Metadata{
+			interaction.PropertyVisibility: "open",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	view, err := corpus.Document(ctx, receipt.Document.ID, receipt.Revision.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := interaction.Session{
+		ID:          interaction.DerivedID("session", "deleted-fold-member"),
+		RecordedAt:  time.Unix(1700000000, 0).UTC(),
+		Operation:   interaction.OperationRetrieval,
+		SeedNodeIDs: []shoal.ID{view.Root.Spans[0].ID},
+	}
+	if err := corpus.RecordInteraction(ctx, session); err != nil {
+		t.Fatal(err)
+	}
+	request := FoldRequest{
+		SessionIDs:    []shoal.ID{session.ID},
+		SummaryDigest: interaction.Digest("deleted fold member"),
+	}
+	write := corpus.writeRecord
+	corpus.interactionRecordWriter = func(
+		row []byte, kind byte, value any,
+	) error {
+		if fold, ok := value.(persistedFold); ok && !fold.Deleted {
+			if err := write(row, kind, value); err != nil {
+				return err
+			}
+			return errors.New("simulated committed fold error")
+		}
+		return write(row, kind, value)
+	}
+	if _, err := corpus.FoldInteractions(ctx, request); err == nil {
+		t.Fatal("expected the simulated committed fold error")
+	}
+	if _, err := corpus.DeleteInteraction(ctx, session.ID); err != nil {
+		t.Fatal(err)
+	}
+	result, err := corpus.FoldInteractions(ctx, request)
+	if err != nil {
+		t.Fatalf("committed fold retry was not adopted: %v", err)
+	}
+	if _, err := corpus.RehydrateFold(ctx, result.FoldID); err == nil {
+		t.Fatal("rehydrated the provenance of a deleted session")
+	}
+	if _, err := corpus.FoldSubgraph(ctx, result.FoldID); err == nil {
+		t.Fatal("served the subgraph of a deleted session's provenance")
 	}
 }

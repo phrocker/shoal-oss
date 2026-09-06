@@ -533,6 +533,49 @@ func (c *Client) begin(
 	return decision, guard, now, nil
 }
 
+// beginAny authorizes a setup-time operation that is not tied to one specific
+// operation. It still requires a live, in-domain credential and a policy
+// generation guard, but accepts any operation the decision itself grants, so
+// an action-only grant is not rejected the way pinning setup to Retrieve
+// would reject it. A decision that grants nothing is denied.
+func (c *Client) beginAny(ctx context.Context) (auth.GenerationGuard, error) {
+	if err := contextFailure(ctx); err != nil {
+		return auth.GenerationGuard{}, err
+	}
+	decision, err := c.resolver.Resolve(ctx)
+	if err != nil {
+		return auth.GenerationGuard{}, resolverFailure(ctx, err)
+	}
+	now := c.clock()
+	if now.IsZero() {
+		return auth.GenerationGuard{}, authorizationDenied()
+	}
+	request := auth.ResourceRequest{
+		AuthorizationDomain: decision.AuthorizationDomain(),
+	}
+	granted := false
+	for _, operation := range decision.AllowedOperations() {
+		if err := decision.Authorize(operation, request, now); err == nil {
+			granted = true
+			break
+		}
+	}
+	if !granted {
+		if contextErr := contextFailure(ctx); contextErr != nil {
+			return auth.GenerationGuard{}, contextErr
+		}
+		return auth.GenerationGuard{}, authorizationDenied()
+	}
+	guard, err := auth.NewGenerationGuard(decision, c.generationReader)
+	if err != nil {
+		return auth.GenerationGuard{}, authorizationDenied()
+	}
+	if err := guard.Check(ctx); err != nil {
+		return auth.GenerationGuard{}, err
+	}
+	return guard, nil
+}
+
 func (c *Client) selectIngestRule(
 	ctx context.Context,
 	decision auth.Decision,
