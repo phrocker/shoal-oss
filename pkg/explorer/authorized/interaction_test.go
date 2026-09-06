@@ -27,6 +27,7 @@ import (
 
 	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
+	"github.com/phrocker/shoal-oss/pkg/explorer/authorized"
 	"github.com/phrocker/shoal-oss/pkg/interaction"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
@@ -44,6 +45,38 @@ func (b *generationChangingInteractionBase) RecordInteractionResult(
 		b.after()
 	}
 	return recorded, err
+}
+
+type countingInteractionStore struct {
+	authorized.PolicyStore
+	nodesCalls int
+}
+
+func (s *countingInteractionStore) Nodes(
+	ctx context.Context, ids []shoal.ID,
+) (map[shoal.ID]authorized.NodeRegistration, error) {
+	s.nodesCalls++
+	return s.PolicyStore.Nodes(ctx, ids)
+}
+
+type countingInteractionBase struct {
+	*explorer.Explorer
+	recordCalls  int
+	recordsCalls int
+}
+
+func (b *countingInteractionBase) InteractionRecord(
+	ctx context.Context, id shoal.ID,
+) (explorer.InteractionRecord, error) {
+	b.recordCalls++
+	return b.Explorer.InteractionRecord(ctx, id)
+}
+
+func (b *countingInteractionBase) InteractionRecords(
+	ctx context.Context,
+) ([]explorer.InteractionRecord, error) {
+	b.recordsCalls++
+	return b.Explorer.InteractionRecords(ctx)
 }
 
 func TestAuthorizedInteractionRecorderAndViews(t *testing.T) {
@@ -447,6 +480,7 @@ func TestAuthorizedInteractionMarksPostCommitGenerationFailure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	snapshot, err := f.base.Snapshot(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -503,5 +537,79 @@ func TestAuthorizedInteractionMarksPostCommitGenerationFailure(t *testing.T) {
 		context.Background(), session.ID,
 	); err != nil {
 		t.Fatalf("committed interaction was not durable: %v", err)
+	}
+}
+
+func TestAuthorizedInteractionReadsUseBulkAndPointPaths(t *testing.T) {
+	f := newFixture(t)
+	receipt, err := f.clientA.Ingest(f.admin(t), explorer.Source{
+		URI:       "file:///bulk-interactions.txt",
+		MediaType: explorer.MediaTypeText,
+		Content:   "bulk interaction evidence",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := f.base.Snapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.clock.Set(snapshot.AsOf.Add(time.Second))
+	decision := f.decision(
+		t,
+		"bulk-reader",
+		[][]byte{f.sourceA},
+		[][]byte{f.policyA},
+		[]auth.Operation{
+			auth.OperationRead,
+			auth.OperationRetrieve,
+			auth.OperationValidate,
+		},
+	)
+	ctx := f.context(t, decision)
+	view, err := f.clientA.Document(
+		ctx, receipt.Document.ID, receipt.Revision.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fingerprint, err := auth.AuthorizationFingerprint(decision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []shoal.ID{"session-bulk-a", "session-bulk-b"} {
+		if err := f.clientA.RecordInteraction(ctx, interaction.Session{
+			ID:                       id,
+			RecordedAt:               f.clock.Now(),
+			SnapshotID:               shoal.ID(snapshot.ID),
+			SnapshotAsOf:             snapshot.AsOf,
+			AuthorizationFingerprint: shoal.ID(fingerprint.String()),
+			AuthorizationExpiresAt:   decision.AuthenticationExpires(),
+			SeedNodeIDs:              []shoal.ID{firstSpanID(t, view)},
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	store := &countingInteractionStore{PolicyStore: f.store}
+	base := &countingInteractionBase{Explorer: f.base}
+	client := f.newClient(t, base, store, f.sourceA, f.policyA, nil)
+	records, err := client.InteractionRecords(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 2 || store.nodesCalls != 1 ||
+		base.recordsCalls != 1 {
+		t.Fatalf(
+			"records=%d node_batches=%d bulk_reads=%d",
+			len(records), store.nodesCalls, base.recordsCalls,
+		)
+	}
+	if _, err := client.InteractionSubgraph(
+		ctx, "session-bulk-a",
+	); err != nil {
+		t.Fatal(err)
+	}
+	if base.recordCalls != 1 || base.recordsCalls != 1 {
+		t.Fatalf("point_reads=%d bulk_reads=%d",
+			base.recordCalls, base.recordsCalls)
 	}
 }

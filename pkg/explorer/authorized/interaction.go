@@ -133,6 +133,22 @@ func (c *Client) recordInteraction(
 func (c *Client) Interactions(
 	ctx context.Context,
 ) ([]explorer.InteractionSummary, error) {
+	records, err := c.InteractionRecords(ctx)
+	if err != nil {
+		return nil, err
+	}
+	summaries := make([]explorer.InteractionSummary, len(records))
+	for index, record := range records {
+		summaries[index] = record.Summary
+	}
+	return summaries, nil
+}
+
+// InteractionRecords returns authorized interaction summaries and provenance
+// in one base read and one batched policy lookup.
+func (c *Client) InteractionRecords(
+	ctx context.Context,
+) ([]explorer.InteractionRecord, error) {
 	reader, err := c.interactionReader()
 	if err != nil {
 		return nil, err
@@ -141,37 +157,38 @@ func (c *Client) Interactions(
 	if err != nil {
 		return nil, err
 	}
-	summaries, err := reader.Interactions(ctx)
+	records, err := reader.InteractionRecords(ctx)
 	if err != nil {
 		return nil, directBaseError(err)
 	}
-	visible := make([]explorer.InteractionSummary, 0, len(summaries))
-	for _, summary := range summaries {
-		if summary.Deleted {
-			if summaryFingerprintMatchesDecision(summary, decision) {
-				visible = append(visible, summary)
+	allNodeIDs := make([]shoal.ID, 0)
+	for _, record := range records {
+		if !record.Summary.Deleted {
+			allNodeIDs = append(allNodeIDs, record.TouchedNodeIDs...)
+		}
+	}
+	registrations, err := c.resolveNodes(ctx, allNodeIDs)
+	if err != nil {
+		return nil, err
+	}
+	visible := make([]explorer.InteractionRecord, 0, len(records))
+	for _, record := range records {
+		if record.Summary.Deleted {
+			if summaryFingerprintMatchesDecision(record.Summary, decision) {
+				visible = append(visible, record)
 			}
 			continue
 		}
-		session, readErr := reader.Interaction(ctx, summary.SessionID)
-		if readErr != nil {
-			if shoal.IsErrorCode(readErr, shoal.ErrorNotFound) ||
-				shoal.IsErrorCode(readErr, shoal.ErrorUnavailable) ||
-				shoal.IsErrorCode(readErr, shoal.ErrorConflict) {
-				continue
-			}
-			return nil, directBaseError(readErr)
-		}
-		if err := c.authorizeInteractionSources(
-			ctx, session.TouchedNodeIDs(), decision, auth.OperationRead, now,
-		); err != nil {
-			if shoal.IsErrorCode(err, shoal.ErrorNotFound) ||
-				shoal.IsErrorCode(err, shoal.ErrorUnauthorized) {
-				continue
-			}
+		allowed, err := interactionSourcesAllow(
+			registrations, record.TouchedNodeIDs,
+			decision, auth.OperationRead, now,
+		)
+		if err != nil {
 			return nil, err
 		}
-		visible = append(visible, summary)
+		if allowed {
+			visible = append(visible, record)
+		}
 	}
 	if err := guard.Check(ctx); err != nil {
 		return nil, err
@@ -179,39 +196,59 @@ func (c *Client) Interactions(
 	return visible, nil
 }
 
+// InteractionRecord returns one authorized point record without scanning the
+// complete interaction history.
+func (c *Client) InteractionRecord(
+	ctx context.Context, sessionID shoal.ID,
+) (explorer.InteractionRecord, error) {
+	reader, err := c.interactionReader()
+	if err != nil {
+		return explorer.InteractionRecord{}, err
+	}
+	decision, guard, now, err := c.begin(ctx, auth.OperationRead)
+	if err != nil {
+		return explorer.InteractionRecord{}, err
+	}
+	record, err := reader.InteractionRecord(ctx, sessionID)
+	if err != nil {
+		if shoal.IsErrorCode(err, shoal.ErrorUnavailable) ||
+			shoal.IsErrorCode(err, shoal.ErrorConflict) {
+			return explorer.InteractionRecord{}, auth.ObjectNotFound()
+		}
+		return explorer.InteractionRecord{}, directBaseError(err)
+	}
+	if record.Summary.Deleted {
+		if !summaryFingerprintMatchesDecision(record.Summary, decision) {
+			return explorer.InteractionRecord{}, auth.ObjectNotFound()
+		}
+	} else if err := c.authorizeInteractionSources(
+		ctx, record.TouchedNodeIDs, decision, auth.OperationRead, now,
+	); err != nil {
+		if shoal.IsErrorCode(err, shoal.ErrorUnauthorized) ||
+			shoal.IsErrorCode(err, shoal.ErrorNotFound) {
+			return explorer.InteractionRecord{}, auth.ObjectNotFound()
+		}
+		return explorer.InteractionRecord{}, err
+	}
+	if err := guard.Check(ctx); err != nil {
+		return explorer.InteractionRecord{}, err
+	}
+	return record, nil
+}
+
 // Interaction returns one authorized typed interaction. It is an explicit
 // derived view and therefore cannot affect the source-only retrieval surface.
 func (c *Client) Interaction(
 	ctx context.Context, sessionID shoal.ID,
 ) (interaction.Session, error) {
-	reader, err := c.interactionReader()
+	record, err := c.InteractionRecord(ctx, sessionID)
 	if err != nil {
 		return interaction.Session{}, err
 	}
-	decision, guard, now, err := c.begin(ctx, auth.OperationRead)
-	if err != nil {
-		return interaction.Session{}, err
+	if record.Summary.Deleted || record.Session.ID == "" {
+		return interaction.Session{}, auth.ObjectNotFound()
 	}
-	session, err := reader.Interaction(ctx, sessionID)
-	if err != nil {
-		if shoal.IsErrorCode(err, shoal.ErrorUnavailable) ||
-			shoal.IsErrorCode(err, shoal.ErrorConflict) {
-			return interaction.Session{}, auth.ObjectNotFound()
-		}
-		return interaction.Session{}, directBaseError(err)
-	}
-	if err := c.authorizeInteractionSources(
-		ctx, session.TouchedNodeIDs(), decision, auth.OperationRead, now,
-	); err != nil {
-		if shoal.IsErrorCode(err, shoal.ErrorUnauthorized) {
-			return interaction.Session{}, auth.ObjectNotFound()
-		}
-		return interaction.Session{}, err
-	}
-	if err := guard.Check(ctx); err != nil {
-		return interaction.Session{}, err
-	}
-	return session, nil
+	return record.Session, nil
 }
 
 // InteractionSubgraph returns an authorized explicit graph view. Every
@@ -227,22 +264,16 @@ func (c *Client) InteractionSubgraph(
 	if err != nil {
 		return explorer.Neighborhood{}, err
 	}
-	summaries, err := reader.Interactions(ctx)
+	record, err := reader.InteractionRecord(ctx, sessionID)
 	if err != nil {
+		if shoal.IsErrorCode(err, shoal.ErrorUnavailable) ||
+			shoal.IsErrorCode(err, shoal.ErrorConflict) {
+			return explorer.Neighborhood{}, auth.ObjectNotFound()
+		}
 		return explorer.Neighborhood{}, directBaseError(err)
 	}
-	var summary *explorer.InteractionSummary
-	for index := range summaries {
-		if summaries[index].SessionID == sessionID {
-			summary = &summaries[index]
-			break
-		}
-	}
-	if summary == nil {
-		return explorer.Neighborhood{}, auth.ObjectNotFound()
-	}
-	if summary.Deleted {
-		if !summaryFingerprintMatchesDecision(*summary, decision) {
+	if record.Summary.Deleted {
+		if !summaryFingerprintMatchesDecision(record.Summary, decision) {
 			return explorer.Neighborhood{}, auth.ObjectNotFound()
 		}
 		subgraph, readErr := reader.InteractionSubgraph(ctx, sessionID)
@@ -254,15 +285,8 @@ func (c *Client) InteractionSubgraph(
 		}
 		return subgraph, nil
 	}
-	session, err := reader.Interaction(ctx, sessionID)
-	if err != nil {
-		if shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
-			return explorer.Neighborhood{}, auth.ObjectNotFound()
-		}
-		return explorer.Neighborhood{}, directBaseError(err)
-	}
 	if err := c.authorizeInteractionSources(
-		ctx, session.TouchedNodeIDs(), decision, auth.OperationRead, now,
+		ctx, record.TouchedNodeIDs, decision, auth.OperationRead, now,
 	); err != nil {
 		if shoal.IsErrorCode(err, shoal.ErrorUnauthorized) {
 			return explorer.Neighborhood{}, auth.ObjectNotFound()
@@ -274,7 +298,7 @@ func (c *Client) InteractionSubgraph(
 		return explorer.Neighborhood{}, directBaseError(err)
 	}
 	if interactionSubgraphIsTombstone(subgraph) &&
-		!summaryFingerprintMatchesDecision(*summary, decision) {
+		!summaryFingerprintMatchesDecision(record.Summary, decision) {
 		return explorer.Neighborhood{}, auth.ObjectNotFound()
 	}
 	if err := guard.Check(ctx); err != nil {
@@ -299,21 +323,39 @@ func (c *Client) authorizeInteractionSources(
 	if err != nil {
 		return err
 	}
+	allowed, err := interactionSourcesAllow(
+		registrations, nodeIDs, decision, operation, now)
+	if err != nil {
+		return err
+	}
+	if !allowed {
+		return auth.ObjectNotFound()
+	}
+	return nil
+}
+
+func interactionSourcesAllow(
+	registrations registeredNodes,
+	nodeIDs []shoal.ID,
+	decision auth.Decision,
+	operation auth.Operation,
+	now time.Time,
+) (bool, error) {
 	for _, nodeID := range nodeIDs {
 		registration, ok := registrations[nodeID]
 		if !ok {
-			return auth.ObjectNotFound()
+			return false, nil
 		}
 		allowed, err := ruleAllows(
 			registration.Rule, decision, operation, now)
 		if err != nil {
-			return err
+			return false, err
 		}
 		if !allowed {
-			return auth.ObjectNotFound()
+			return false, nil
 		}
 	}
-	return nil
+	return true, nil
 }
 
 func interactionPinMatchesDecision(

@@ -50,6 +50,15 @@ type InteractionSummary struct {
 	DeletedAt                time.Time
 }
 
+// InteractionRecord is the bulk/point authorization view of one durable
+// interaction. TouchedNodeIDs is available even for legacy records whose typed
+// Session payload predates hydration support.
+type InteractionRecord struct {
+	Summary        InteractionSummary
+	Session        interaction.Session
+	TouchedNodeIDs []shoal.ID
+}
+
 type persistedInteraction struct {
 	SessionID                shoal.ID
 	Session                  interaction.Session
@@ -96,6 +105,8 @@ type InteractionResultWriter interface {
 // retrieval cannot begin returning derived nodes by interface expansion.
 type InteractionReader interface {
 	Interactions(context.Context) ([]InteractionSummary, error)
+	InteractionRecords(context.Context) ([]InteractionRecord, error)
+	InteractionRecord(context.Context, shoal.ID) (InteractionRecord, error)
 	Interaction(context.Context, shoal.ID) (interaction.Session, error)
 	InteractionSubgraph(context.Context, shoal.ID) (Neighborhood, error)
 }
@@ -380,32 +391,80 @@ func (e *Explorer) Interactions(ctx context.Context) ([]InteractionSummary, erro
 				continue
 			}
 		}
-		summary := InteractionSummary{
-			SessionID:                record.SessionID,
-			RecordedAt:               record.RecordedAt,
-			SnapshotID:               record.SnapshotID,
-			SnapshotAsOf:             record.SnapshotAsOf,
-			AuthorizationFingerprint: record.AuthorizationFingerprint,
-			AuthorizationExpiresAt:   record.AuthorizationExpiresAt,
-			EmbeddingSpaceID:         record.EmbeddingSpaceID,
-			Operation:                record.Operation,
-			Actor:                    cloneActorContext(record.Actor),
-			Reason:                   record.Reason,
-			Visibility:               record.Visibility,
-			NodeCount:                len(record.Nodes),
-			EdgeCount:                len(record.Edges),
-			Deleted:                  record.Deleted,
-			DeletedAt:                record.DeletedAt,
-		}
-		if record.Operation.HasInference() {
-			summary.InferenceID = interaction.InferenceID(record.SessionID)
-		}
-		summaries = append(summaries, summary)
+		summaries = append(summaries, interactionSummary(*record))
 	}
 	sort.Slice(summaries, func(i, j int) bool {
 		return shoal.CompareID(summaries[i].SessionID, summaries[j].SessionID) < 0
 	})
 	return summaries, nil
+}
+
+// InteractionRecords returns the explicit derived records in one read pass so
+// authorization wrappers can batch source-policy resolution instead of
+// performing one storage read and one policy round trip per interaction.
+func (e *Explorer) InteractionRecords(
+	ctx context.Context,
+) ([]InteractionRecord, error) {
+	if err := contextError(ctx); err != nil {
+		return nil, err
+	}
+	if err := e.acquireReadWithGraph(); err != nil {
+		return nil, err
+	}
+	defer e.mu.RUnlock()
+	records := make([]InteractionRecord, 0, len(e.interactions))
+	for _, stored := range e.interactions {
+		if !stored.Deleted {
+			current, err := e.currentSubgraphVisibilityLocked(
+				stored.Nodes, stored.Edges)
+			if err != nil || !visibilityCovered(stored.Visibility, current) {
+				continue
+			}
+		}
+		records = append(records, interactionRecord(*stored))
+	}
+	sort.Slice(records, func(i, j int) bool {
+		return shoal.CompareID(
+			records[i].Summary.SessionID,
+			records[j].Summary.SessionID,
+		) < 0
+	})
+	return records, nil
+}
+
+// InteractionRecord returns one explicit derived record without scanning the
+// durable interaction history.
+func (e *Explorer) InteractionRecord(
+	ctx context.Context, sessionID shoal.ID,
+) (InteractionRecord, error) {
+	if err := contextError(ctx); err != nil {
+		return InteractionRecord{}, err
+	}
+	if err := shoal.ValidateRequiredID(
+		"interaction session ID", sessionID,
+	); err != nil {
+		return InteractionRecord{}, err
+	}
+	if err := e.acquireReadWithGraph(); err != nil {
+		return InteractionRecord{}, err
+	}
+	defer e.mu.RUnlock()
+	stored, ok := e.interactions[sessionID]
+	if !ok {
+		return InteractionRecord{}, shoal.NewError(
+			shoal.ErrorNotFound, "interaction session not found")
+	}
+	if !stored.Deleted {
+		current, err := e.currentSubgraphVisibilityLocked(
+			stored.Nodes, stored.Edges)
+		if err != nil {
+			return InteractionRecord{}, err
+		}
+		if !visibilityCovered(stored.Visibility, current) {
+			return InteractionRecord{}, staleDerivedVisibilityError()
+		}
+	}
+	return interactionRecord(*stored), nil
 }
 
 // Interaction returns the typed, redacted session record. This is an explicit
@@ -415,34 +474,13 @@ func (e *Explorer) Interactions(ctx context.Context) ([]InteractionSummary, erro
 func (e *Explorer) Interaction(
 	ctx context.Context, sessionID shoal.ID,
 ) (interaction.Session, error) {
-	if err := contextError(ctx); err != nil {
-		return interaction.Session{}, err
-	}
-	if err := shoal.ValidateRequiredID(
-		"interaction session ID", sessionID,
-	); err != nil {
-		return interaction.Session{}, err
-	}
-	if err := e.acquireReadWithGraph(); err != nil {
-		return interaction.Session{}, err
-	}
-	defer e.mu.RUnlock()
-	record, ok := e.interactions[sessionID]
-	if !ok {
-		return interaction.Session{}, shoal.NewError(
-			shoal.ErrorNotFound, "interaction session not found")
-	}
-	if record.Deleted {
-		return interaction.Session{}, shoal.NewError(
-			shoal.ErrorConflict, "interaction session was explicitly deleted")
-	}
-	current, err := e.currentSubgraphVisibilityLocked(
-		record.Nodes, record.Edges)
+	record, err := e.InteractionRecord(ctx, sessionID)
 	if err != nil {
 		return interaction.Session{}, err
 	}
-	if !visibilityCovered(record.Visibility, current) {
-		return interaction.Session{}, staleDerivedVisibilityError()
+	if record.Summary.Deleted {
+		return interaction.Session{}, shoal.NewError(
+			shoal.ErrorConflict, "interaction session was explicitly deleted")
 	}
 	if record.Session.ID == "" {
 		return interaction.Session{}, shoal.NewError(
@@ -450,7 +488,7 @@ func (e *Explorer) Interaction(
 			"legacy interaction record has no typed session payload",
 		)
 	}
-	return cloneInteractionSession(record.Session), nil
+	return record.Session, nil
 }
 
 // InteractionSubgraph returns one recorded session's nodes and edges. This is
@@ -800,6 +838,62 @@ func cloneInteractionSession(session interaction.Session) interaction.Session {
 		}
 	}
 	return cloned
+}
+
+func interactionSummary(record persistedInteraction) InteractionSummary {
+	summary := InteractionSummary{
+		SessionID:                record.SessionID,
+		RecordedAt:               record.RecordedAt,
+		SnapshotID:               record.SnapshotID,
+		SnapshotAsOf:             record.SnapshotAsOf,
+		AuthorizationFingerprint: record.AuthorizationFingerprint,
+		AuthorizationExpiresAt:   record.AuthorizationExpiresAt,
+		EmbeddingSpaceID:         record.EmbeddingSpaceID,
+		Operation:                record.Operation,
+		Actor:                    cloneActorContext(record.Actor),
+		Reason:                   record.Reason,
+		Visibility:               record.Visibility,
+		NodeCount:                len(record.Nodes),
+		EdgeCount:                len(record.Edges),
+		Deleted:                  record.Deleted,
+		DeletedAt:                record.DeletedAt,
+	}
+	if record.Operation.HasInference() {
+		summary.InferenceID = interaction.InferenceID(record.SessionID)
+	}
+	return summary
+}
+
+func interactionRecord(record persistedInteraction) InteractionRecord {
+	touched := interaction.TouchedNodes(record.Nodes, record.Edges)
+	ids := append(
+		append([]shoal.ID(nil), touched.RetrievedNodeIDs...),
+		touched.CitedNodeIDs...,
+	)
+	return InteractionRecord{
+		Summary:        interactionSummary(record),
+		Session:        cloneInteractionSession(record.Session),
+		TouchedNodeIDs: dedupeExplorerIDs(ids),
+	}
+}
+
+func dedupeExplorerIDs(ids []shoal.ID) []shoal.ID {
+	if len(ids) == 0 {
+		return nil
+	}
+	seen := make(map[shoal.ID]struct{}, len(ids))
+	result := make([]shoal.ID, 0, len(ids))
+	for _, id := range ids {
+		if _, duplicate := seen[id]; duplicate {
+			continue
+		}
+		seen[id] = struct{}{}
+		result = append(result, id)
+	}
+	sort.Slice(result, func(i, j int) bool {
+		return shoal.CompareID(result[i], result[j]) < 0
+	})
+	return result
 }
 
 func cloneActorContext(actor interaction.ActorContext) interaction.ActorContext {
