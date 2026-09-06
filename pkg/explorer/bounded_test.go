@@ -33,6 +33,7 @@ func TestSnapshotStableAcrossRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	before, err := corpus.Snapshot(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -51,6 +52,52 @@ func TestSnapshotStableAcrossRestart(t *testing.T) {
 	}
 	if before != after {
 		t.Fatalf("snapshot changed across restart: before=%+v after=%+v", before, after)
+	}
+}
+
+func TestHistoricalSnapshotValidationSurvivesRestart(t *testing.T) {
+	ctx := context.Background()
+	dataDir := t.TempDir()
+	corpus, err := Open(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := corpus.Ingest(ctx, Source{
+		URI: "file:///snapshot-one.txt", MediaType: MediaTypeText,
+		Content: "snapshot one",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	first, err := corpus.Snapshot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := corpus.Ingest(ctx, Source{
+		URI: "file:///snapshot-two.txt", MediaType: MediaTypeText,
+		Content: "snapshot two",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := corpus.Snapshot(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := corpus.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	if err := reopened.ValidateSnapshot(
+		ctx, shoal.ID(first.ID), first.AsOf,
+	); err != nil {
+		t.Fatalf("historical snapshot was not durable: %v", err)
+	}
+	if err := reopened.ValidateSnapshot(
+		ctx, "forged-snapshot", first.AsOf,
+	); !shoal.IsErrorCode(err, shoal.ErrorConflict) {
+		t.Fatalf("forged snapshot validation error = %v", err)
 	}
 }
 

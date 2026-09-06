@@ -182,19 +182,7 @@ func (e *Explorer) RecordInteraction(
 		}
 	}
 	if existing, ok := e.interactions[session.ID]; ok {
-		if existing.Deleted {
-			return shoal.NewError(
-				shoal.ErrorConflict,
-				"interaction session ID was explicitly deleted and cannot be reused",
-			)
-		}
-		existingCanonical, canonicalErr := existing.Session.Canonical()
-		if canonicalErr == nil && reflect.DeepEqual(existingCanonical, session) {
-			return nil
-		}
-		return shoal.NewError(
-			shoal.ErrorConflict,
-			"interaction session ID already exists with different content")
+		return interactionRetryResult(*existing, session)
 	}
 	// Sessions and folds are distinct maps but share one node namespace in the
 	// corpus graph, so an ID taken by either would silently overwrite the other
@@ -238,10 +226,24 @@ func (e *Explorer) RecordInteraction(
 	if err := validatePersistedInteraction(record); err != nil {
 		return err
 	}
-	if err := e.writeInteractionRecord(
+	accepted, err := e.createInteractionRecord(
 		interactionRecordRow(session.ID), embeddedRecordInteraction, record,
-	); err != nil {
+	)
+	if err != nil {
 		return err
+	}
+	if !accepted {
+		if err := e.reconcilePersistedInteractionLocked(session.ID); err != nil {
+			return err
+		}
+		existing, ok := e.interactions[session.ID]
+		if !ok {
+			return shoal.NewError(
+				shoal.ErrorUnavailable,
+				"interaction create was rejected without a durable winner",
+			)
+		}
+		return interactionRetryResult(*existing, session)
 	}
 	e.reserveInteractionRecordGraphIDsLocked(
 		record.SessionID, record.Nodes, record.Edges)
@@ -416,6 +418,25 @@ func persistedInteractionsEqual(
 	return reflect.DeepEqual(left, right)
 }
 
+func interactionRetryResult(
+	existing persistedInteraction, session interaction.Session,
+) error {
+	if existing.Deleted {
+		return shoal.NewError(
+			shoal.ErrorConflict,
+			"interaction session ID was explicitly deleted and cannot be reused",
+		)
+	}
+	existingCanonical, err := existing.Session.Canonical()
+	if err == nil && reflect.DeepEqual(existingCanonical, session) {
+		return nil
+	}
+	return shoal.NewError(
+		shoal.ErrorConflict,
+		"interaction session ID already exists with different content",
+	)
+}
+
 func persistedFoldsEqual(left, right persistedFold) bool {
 	leftFold, leftErr := (interaction.Fold{
 		Members: left.Members, SummaryDigest: left.SummaryDigest,
@@ -545,10 +566,20 @@ func (e *Explorer) DeleteInteraction(
 	if err := validatePersistedInteraction(record); err != nil {
 		return interaction.Tombstone{}, err
 	}
-	if err := e.writeInteractionRecord(
+	accepted, err := e.deleteInteractionRecord(
 		interactionRecordRow(sessionID), embeddedRecordInteraction, record,
-	); err != nil {
+	)
+	if err != nil {
 		return interaction.Tombstone{}, err
+	}
+	if !accepted {
+		if err := e.reconcilePersistedInteractionLocked(sessionID); err != nil {
+			return interaction.Tombstone{}, err
+		}
+		return interaction.Tombstone{}, shoal.NewError(
+			shoal.ErrorConflict,
+			"interaction deletion lost a concurrent durable race",
+		)
 	}
 	e.reserveInteractionRecordGraphIDsLocked(
 		record.SessionID, record.Nodes, record.Edges)

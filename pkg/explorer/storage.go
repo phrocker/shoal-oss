@@ -50,11 +50,13 @@ const (
 	recordCF       = "record"
 	recordCQV1     = "v1"
 	recordCQV2     = "v2"
+	recordDeleteCQ = "deleted"
 	documentRow    = "document/"
 	edgeRow        = "edge/"
 	interactionRow = "interaction/"
 	foldRow        = "interaction-fold/"
 	extractionRow  = "extraction/"
+	snapshotRow    = "snapshot/"
 	proposalRow    = "ontology-proposal/"
 	transitionRow  = "ontology-proposal-transition/"
 
@@ -70,6 +72,7 @@ const (
 	embeddedRecordOntologyProposal     = byte(8)
 	embeddedRecordProposalTransition   = byte(9)
 	embeddedRecordExtraction           = byte(10)
+	embeddedRecordSnapshot             = byte(11)
 	embeddedEnvelopeHeader             = 8 + 1 + 1 + 8 + sha256.Size
 	maxEmbeddedDocumentBytes           = uint64(document.MaxRevisionSourceBytes) * 8
 	maxEmbeddedEdgeBytes               = uint64(2 * 1024 * 1024)
@@ -81,6 +84,7 @@ const (
 	maxEmbeddedOntologyProposalBytes   = uint64(16 * 1024 * 1024)
 	maxEmbeddedProposalTransitionBytes = uint64(64 * 1024)
 	maxEmbeddedExtractionBytes         = uint64(16 * 1024 * 1024)
+	maxEmbeddedSnapshotBytes           = uint64(1024)
 )
 
 var snapshotAnchorRow = []byte("meta/snapshot-anchor")
@@ -91,6 +95,11 @@ var interactionSinkRow = []byte("meta/interaction-sink")
 
 type persistedSnapshotAnchor struct {
 	CreatedAt time.Time
+}
+
+type persistedSnapshot struct {
+	ID   shoal.ID
+	AsOf time.Time
 }
 
 // persistedCursorKey holds the durable, per-corpus secret that seals change-feed
@@ -134,6 +143,13 @@ func foldRecordRow(foldID shoal.ID) []byte {
 	row := make([]byte, 0, len(foldRow)+len(foldID))
 	row = append(row, foldRow...)
 	row = append(row, []byte(foldID)...)
+	return row
+}
+
+func snapshotRecordRow(snapshotID shoal.ID) []byte {
+	row := make([]byte, 0, len(snapshotRow)+len(snapshotID))
+	row = append(row, snapshotRow...)
+	row = append(row, snapshotID...)
 	return row
 }
 
@@ -221,6 +237,12 @@ func (e *Explorer) load() error {
 			); err != nil {
 				return err
 			}
+		case bytes.HasPrefix(key.Row, []byte(snapshotRow)):
+			if err := e.loadSnapshotRecord(
+				key.Row, qualifier, scanner.Value(),
+			); err != nil {
+				return err
+			}
 		case bytes.HasPrefix(key.Row, []byte(proposalRow)):
 			if err := e.loadOntologyProposalRecord(
 				key.Row, qualifier, scanner.Value(),
@@ -272,6 +294,39 @@ func (e *Explorer) loadSnapshotAnchor(qualifier, encoded []byte) error {
 		return shoal.NewError(shoal.ErrorInternal, "snapshot anchor time is missing")
 	}
 	e.snapshotAnchor = record.CreatedAt.UTC()
+	return nil
+}
+
+func (e *Explorer) loadSnapshotRecord(
+	row, qualifier, encoded []byte,
+) error {
+	if !bytes.Equal(qualifier, []byte(recordCQV2)) {
+		return nil
+	}
+	var record persistedSnapshot
+	if err := decodeEmbeddedRecord(
+		encoded, embeddedRecordSnapshot, &record,
+	); err != nil {
+		return shoal.WrapError(
+			shoal.ErrorInternal, "decode explorer snapshot", err)
+	}
+	if err := shoal.ValidateRequiredID("snapshot ID", record.ID); err != nil {
+		return shoal.WrapError(
+			shoal.ErrorInternal, "stored snapshot is invalid", err)
+	}
+	if record.AsOf.IsZero() ||
+		!bytes.Equal(row, snapshotRecordRow(record.ID)) {
+		return shoal.NewError(
+			shoal.ErrorInternal, "stored snapshot record is invalid")
+	}
+	if existing, ok := e.snapshotHistory[string(record.ID)]; ok &&
+		!existing.Equal(record.AsOf.UTC()) {
+		return shoal.NewError(
+			shoal.ErrorInternal,
+			"stored snapshot ID has conflicting observation times",
+		)
+	}
+	e.snapshotHistory[string(record.ID)] = record.AsOf.UTC()
 	return nil
 }
 
@@ -543,6 +598,95 @@ func (e *Explorer) writeInteractionRecord(
 	return err
 }
 
+func (e *Explorer) createInteractionRecord(
+	row []byte, kind byte, value any,
+) (bool, error) {
+	if e.interactionRecordWriter != nil {
+		err := e.writeInteractionRecord(row, kind, value)
+		return err == nil, err
+	}
+	return e.conditionalInteractionRecord(
+		row, kind, value, recordCQV2, false)
+}
+
+func (e *Explorer) deleteInteractionRecord(
+	row []byte, kind byte, value any,
+) (bool, error) {
+	if e.interactionRecordWriter != nil {
+		err := e.writeInteractionRecord(row, kind, value)
+		return err == nil, err
+	}
+	return e.conditionalInteractionRecord(
+		row, kind, value, recordDeleteCQ, true)
+}
+
+func (e *Explorer) conditionalInteractionRecord(
+	row []byte,
+	kind byte,
+	value any,
+	conditionQualifier string,
+	writeDeleteMarker bool,
+) (bool, error) {
+	encoded, err := encodeEmbeddedRecord(kind, value)
+	if err != nil {
+		return false, shoal.WrapError(
+			shoal.ErrorInternal, "encode interaction record", err)
+	}
+	mutation, err := cclient.NewMutation(row)
+	if err != nil {
+		return false, shoal.WrapError(
+			shoal.ErrorInternal, "create interaction mutation", err)
+	}
+	mutation.PutLatest(
+		[]byte(recordCF), []byte(recordCQV2), nil, encoded)
+	if writeDeleteMarker {
+		mutation.PutLatest(
+			[]byte(recordCF), []byte(recordDeleteCQ), nil, []byte{1})
+	}
+	accepted, err := e.engine.ConditionalWrite(
+		explorerTable,
+		[]engine.ConditionalMutation{{
+			Mutation: mutation,
+			Conditions: []engine.Condition{{
+				ColumnFamily:    []byte(recordCF),
+				ColumnQualifier: []byte(conditionQualifier),
+				Kind:            engine.ConditionAbsent,
+			}},
+		}},
+	)
+	if err == nil {
+		if len(accepted) != 1 {
+			return false, shoal.NewError(
+				shoal.ErrorInternal,
+				"interaction conditional write returned an invalid result",
+			)
+		}
+		return accepted[0], nil
+	}
+	indeterminate := MarkIndeterminateCommit(
+		shoal.WrapError(
+			shoal.ErrorUnavailable,
+			"conditionally write interaction record",
+			err,
+		),
+	)
+	committed, readErr := e.hasExactRecord(row, encoded)
+	if readErr != nil {
+		return false, errors.Join(indeterminate, readErr)
+	}
+	if committed {
+		return true, nil
+	}
+	found, readErr := e.hasCurrentRecord(row)
+	if readErr != nil {
+		return false, errors.Join(indeterminate, readErr)
+	}
+	if found {
+		return false, nil
+	}
+	return false, indeterminate
+}
+
 func (e *Explorer) hasExactRecord(row, expected []byte) (bool, error) {
 	committed := false
 	examined := false
@@ -571,6 +715,32 @@ func (e *Explorer) hasExactRecord(row, expected []byte) (bool, error) {
 		)
 	}
 	return committed, nil
+}
+
+func (e *Explorer) hasCurrentRecord(row []byte) (bool, error) {
+	found := false
+	err := e.engine.LookupRows(
+		explorerTable,
+		[][]byte{append([]byte(nil), row...)},
+		engine.ScanOptions{
+			ColumnFamilies:          [][]byte{[]byte(recordCF)},
+			ColumnFamiliesInclusive: true,
+		},
+		func(_ int, key *iterrt.Key, _ []byte) {
+			if !found &&
+				bytes.Equal(key.ColumnQualifier, []byte(recordCQV2)) {
+				found = true
+			}
+		},
+	)
+	if err != nil {
+		return false, shoal.WrapError(
+			shoal.ErrorUnavailable,
+			"read current interaction record",
+			err,
+		)
+	}
+	return found, nil
 }
 
 func (e *Explorer) lookupPersistedInteraction(
@@ -699,6 +869,16 @@ func equivalentEmbeddedRecord(row, stored, expected []byte) bool {
 				expected, embeddedRecordFold, &right,
 			) == nil &&
 			reflect.DeepEqual(left, right)
+	case bytes.HasPrefix(row, []byte(snapshotRow)):
+		var left, right persistedSnapshot
+		return decodeEmbeddedRecord(
+			stored, embeddedRecordSnapshot, &left,
+		) == nil &&
+			decodeEmbeddedRecord(
+				expected, embeddedRecordSnapshot, &right,
+			) == nil &&
+			left.ID == right.ID &&
+			left.AsOf.UTC().Equal(right.AsOf.UTC())
 	default:
 		return false
 	}
@@ -789,6 +969,8 @@ func embeddedRecordMaximum(kind byte) (uint64, error) {
 		return maxEmbeddedProposalTransitionBytes, nil
 	case embeddedRecordExtraction:
 		return maxEmbeddedExtractionBytes, nil
+	case embeddedRecordSnapshot:
+		return maxEmbeddedSnapshotBytes, nil
 	default:
 		return 0, fmt.Errorf("embedded record kind %d is unsupported", kind)
 	}

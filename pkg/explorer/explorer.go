@@ -220,7 +220,6 @@ func OpenWithOptions(dir string, options Options) (*Explorer, error) {
 		snapshotHistory:         make(map[string]time.Time),
 		readOnly:                options.ReadOnly,
 	}
-	explorer.interactionRecordWriter = explorer.writeRecord
 	if err := explorer.load(); err != nil {
 		_ = eng.Close()
 		return nil, err
@@ -594,7 +593,7 @@ func (e *Explorer) Connect(ctx context.Context, edge graph.Edge) error {
 	sort.Slice(e.incoming[edge.To], func(i, j int) bool {
 		return shoal.CompareID(e.incoming[edge.To][i], e.incoming[edge.To][j]) < 0
 	})
-	e.refreshTrustedSnapshotLocked()
+	e.refreshSnapshotLocked()
 	return nil
 }
 
@@ -958,7 +957,7 @@ func (e *Explorer) rebuildCurrentGraphLocked() error {
 	e.outgoing, e.incoming = outgoing, incoming
 	e.graphErr = nil
 	e.graphInitialized = true
-	e.refreshTrustedSnapshotLocked()
+	e.refreshSnapshotLocked()
 	return nil
 }
 

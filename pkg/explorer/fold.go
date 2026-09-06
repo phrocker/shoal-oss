@@ -200,10 +200,24 @@ func (e *Explorer) FoldInteractions(
 	if err := validatePersistedFold(record); err != nil {
 		return FoldResult{}, err
 	}
-	if err := e.writeInteractionRecord(
+	accepted, err := e.createInteractionRecord(
 		foldRecordRow(record.FoldID), embeddedRecordFold, record,
-	); err != nil {
+	)
+	if err != nil {
 		return FoldResult{}, err
+	}
+	if !accepted {
+		if err := e.reconcilePersistedFoldLocked(record.FoldID); err != nil {
+			return FoldResult{}, err
+		}
+		existing, ok := e.folds[record.FoldID]
+		if !ok {
+			return FoldResult{}, shoal.NewError(
+				shoal.ErrorUnavailable,
+				"fold create was rejected without a durable winner",
+			)
+		}
+		return foldIdempotentResult(*existing, subgraph)
 	}
 	e.reserveInteractionRecordGraphIDsLocked(
 		record.FoldID, record.Nodes, record.Edges)
@@ -431,10 +445,20 @@ func (e *Explorer) DeleteFold(
 	if err := validatePersistedFold(record); err != nil {
 		return interaction.Tombstone{}, err
 	}
-	if err := e.writeInteractionRecord(
+	accepted, err := e.deleteInteractionRecord(
 		foldRecordRow(foldID), embeddedRecordFold, record,
-	); err != nil {
+	)
+	if err != nil {
 		return interaction.Tombstone{}, err
+	}
+	if !accepted {
+		if err := e.reconcilePersistedFoldLocked(foldID); err != nil {
+			return interaction.Tombstone{}, err
+		}
+		return interaction.Tombstone{}, shoal.NewError(
+			shoal.ErrorConflict,
+			"fold deletion lost a concurrent durable race",
+		)
 	}
 	e.reserveInteractionRecordGraphIDsLocked(
 		record.FoldID, record.Nodes, record.Edges)

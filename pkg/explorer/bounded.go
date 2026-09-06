@@ -45,6 +45,9 @@ func (e *Explorer) Snapshot(ctx context.Context) (Snapshot, error) {
 	if err := e.ensureGraphLocked(); err != nil {
 		return Snapshot{}, err
 	}
+	if err := e.registerSnapshotLocked(e.snapshot); err != nil {
+		return Snapshot{}, err
+	}
 	return e.snapshot, nil
 }
 
@@ -77,6 +80,51 @@ func (e *Explorer) ValidateSnapshot(
 		return shoal.NewError(
 			shoal.ErrorConflict, "snapshot pin is not a trusted corpus frontier")
 	}
+	return nil
+}
+
+func (e *Explorer) registerSnapshotLocked(snapshot Snapshot) error {
+	id := shoal.ID(snapshot.ID)
+	if observedAt, ok := e.snapshotHistory[snapshot.ID]; ok {
+		if observedAt.Equal(snapshot.AsOf.UTC()) {
+			return nil
+		}
+		return shoal.NewError(
+			shoal.ErrorInternal,
+			"snapshot ID has conflicting observation times",
+		)
+	}
+	if e.readOnly {
+		e.snapshotHistory[snapshot.ID] = snapshot.AsOf.UTC()
+		return nil
+	}
+	record := persistedSnapshot{ID: id, AsOf: snapshot.AsOf.UTC()}
+	accepted, err := e.conditionalInteractionRecord(
+		snapshotRecordRow(id),
+		embeddedRecordSnapshot,
+		record,
+		recordCQV2,
+		false,
+	)
+	if err != nil {
+		return err
+	}
+	if !accepted {
+		var current persistedSnapshot
+		found, err := e.lookupEmbeddedRecord(
+			snapshotRecordRow(id), embeddedRecordSnapshot, &current)
+		if err != nil {
+			return err
+		}
+		if !found || current.ID != id ||
+			!current.AsOf.UTC().Equal(record.AsOf) {
+			return shoal.NewError(
+				shoal.ErrorConflict,
+				"snapshot ID is already registered with different content",
+			)
+		}
+	}
+	e.snapshotHistory[snapshot.ID] = snapshot.AsOf.UTC()
 	return nil
 }
 
@@ -378,13 +426,6 @@ func (e *Explorer) refreshSnapshotLocked() {
 	e.snapshot = Snapshot{
 		ID: hex.EncodeToString(sum), AsOf: asOf.UTC(),
 		Frontier: binary.BigEndian.Uint64(sum[:8]),
-	}
-}
-
-func (e *Explorer) refreshTrustedSnapshotLocked() {
-	e.refreshSnapshotLocked()
-	if e.snapshotHistory != nil {
-		e.snapshotHistory[e.snapshot.ID] = e.snapshot.AsOf
 	}
 }
 
