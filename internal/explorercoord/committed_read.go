@@ -42,15 +42,18 @@ const (
 )
 
 type CommittedScanRequest struct {
-	Table      string
-	RowPrefix  []byte
-	StartRow   []byte
-	Family     []byte
-	Qualifier  []byte
-	Visibility []byte
-	Frontier   coordination.Epoch
-	Limit      int
-	MaxScanned int
+	Table     string
+	RowPrefix []byte
+	StartRow  []byte
+	// StartAfterRow is an exclusive row cursor. It is mutually exclusive with
+	// StartRow and is the preferred paging input for domain adapters.
+	StartAfterRow []byte
+	Family        []byte
+	Qualifier     []byte
+	Visibility    []byte
+	Frontier      coordination.Epoch
+	Limit         int
+	MaxScanned    int
 }
 
 type CommittedCell struct {
@@ -61,10 +64,11 @@ type CommittedCell struct {
 }
 
 type CommittedPage struct {
-	Cells    []CommittedCell
-	Frontier coordination.Epoch
-	NextRow  []byte
-	Scanned  int
+	Cells        []CommittedCell
+	Frontier     coordination.Epoch
+	HistoryFloor coordination.Epoch
+	NextRow      []byte
+	Scanned      int
 }
 
 type physicalVersion struct {
@@ -155,6 +159,21 @@ func (r *Runtime) ScanCommitted(
 			errors.New("committed scan coordinate is outside its bound"),
 		)
 	}
+	if len(request.StartRow) != 0 && len(request.StartAfterRow) != 0 {
+		return CommittedPage{}, errors.Join(
+			transaction.ErrInvalid,
+			errors.New("committed scan start cursors are mutually exclusive"),
+		)
+	}
+	if len(request.StartAfterRow) != 0 {
+		if !bytes.HasPrefix(request.StartAfterRow, request.RowPrefix) {
+			return CommittedPage{}, errors.Join(
+				transaction.ErrInvalid,
+				errors.New("committed scan exclusive cursor is outside its prefix"),
+			)
+		}
+		request.StartRow = append(append([]byte(nil), request.StartAfterRow...), 0)
+	}
 	if len(request.StartRow) == 0 {
 		request.StartRow = request.RowPrefix
 	}
@@ -196,7 +215,7 @@ func (r *Runtime) ScanCommitted(
 		frontier = head.Frontier
 	}
 	if frontier == 0 {
-		return CommittedPage{Frontier: 0}, nil
+		return CommittedPage{Frontier: 0, HistoryFloor: head.HistoryFloor}, nil
 	}
 	if frontier > head.Frontier {
 		return CommittedPage{}, errors.Join(
@@ -240,7 +259,7 @@ func (r *Runtime) ScanCommitted(
 
 	page := CommittedPage{
 		Cells:    make([]CommittedCell, 0, request.Limit),
-		Frontier: frontier,
+		Frontier: frontier, HistoryFloor: head.HistoryFloor,
 	}
 	proofs := make(map[coordination.Epoch]publicationProof)
 	var row []byte
@@ -258,7 +277,7 @@ func (r *Runtime) ScanCommitted(
 		if found {
 			page.Cells = append(page.Cells, cell)
 			if len(page.Cells) == request.Limit {
-				page.NextRow = append(append([]byte(nil), row...), 0)
+				page.NextRow = append([]byte(nil), row...)
 				return true, nil
 			}
 		}
