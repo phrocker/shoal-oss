@@ -345,8 +345,7 @@ func (v *verifier) verifyAnchor(
 			visibilitySets = append(visibilitySets, labels)
 		}
 		for _, edge := range path.Edges {
-			labels, err := interaction.ParseVisibility(
-				edge.Properties[interaction.PropertyVisibility])
+			labels, err := interaction.EdgeVisibility(edge)
 			if err != nil {
 				return VerifiedAnchor{}, err
 			}
