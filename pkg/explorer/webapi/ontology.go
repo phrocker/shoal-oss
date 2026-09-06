@@ -190,38 +190,11 @@ func replayPublishedOntology(
 	configured ontology.OntologyVersion,
 	proposals []ontology.GovernedProposal,
 ) (ontology.OntologyVersion, error) {
-	outgoing := make(map[shoal.ID]ontology.GovernedProposal)
-	for _, proposal := range proposals {
-		if proposal.State() != ontology.ProposalPublished ||
-			proposal.Schema().ID() != configured.Schema().ID() {
-			continue
-		}
-		baseID, ok := proposal.BaseVersionID()
-		if !ok {
-			continue
-		}
-		if _, duplicate := outgoing[baseID]; duplicate {
-			return ontology.OntologyVersion{}, shoal.NewError(
-				shoal.ErrorConflict, "published ontology history is ambiguous")
-		}
-		outgoing[baseID] = proposal
+	catalog, err := ontology.NewPublishedCatalog(configured, proposals)
+	if err != nil {
+		return ontology.OntologyVersion{}, err
 	}
-	active := configured
-	visited := map[shoal.ID]struct{}{active.ID(): {}}
-	for range MaxOntologyProposals {
-		next, ok := outgoing[active.ID()]
-		if !ok {
-			return active, nil
-		}
-		active = next.ProposedVersion()
-		if _, cycle := visited[active.ID()]; cycle {
-			return ontology.OntologyVersion{}, shoal.NewError(
-				shoal.ErrorConflict, "published ontology history contains a cycle")
-		}
-		visited[active.ID()] = struct{}{}
-	}
-	return ontology.OntologyVersion{}, shoal.NewError(
-		shoal.ErrorUnavailable, "published ontology history exceeds the service bound")
+	return catalog.Active(), nil
 }
 
 func ontologyFor(ctx context.Context, service Service) (OntologyResponse, error) {
