@@ -1274,12 +1274,46 @@ func (c *payloadCounter) addProposal(proposal GovernedProposal) {
 }
 
 func proposalPayloadBytes(proposal GovernedProposal) uint64 {
-	counter := payloadCounter{limit: ^uint64(0)}
-	counter.addProposal(proposal)
-	if counter.exceeded {
-		return ^uint64(0)
+	size := uint64(len(proposal.schema.key)+len(proposal.schema.name)+
+		len(proposal.schema.description)+len(proposal.baseSchemaID)+
+		len(proposal.baseVersionID)+
+		len(proposal.proposedBy)+len(proposal.rationale)+
+		len(canonicalMetadata(proposal.schema.metadata))+
+		len(canonicalMetadata(proposal.metadata))) +
+		ontologyVersionPayloadBytes(proposal.proposedVersion)
+	for _, transition := range proposal.transitions {
+		size += uint64(len(transition.actor) + len(transition.note))
 	}
-	return counter.size
+	for _, morphism := range proposal.morphisms {
+		counter := payloadCounter{limit: ^uint64(0)}
+		counter.addString(string(morphism.kind))
+		counter.addString(string(morphism.safety))
+		counter.addString(string(morphism.source.schemaID))
+		counter.addString(string(morphism.source.versionID))
+		counter.addString(string(morphism.target.schemaID))
+		counter.addString(string(morphism.target.versionID))
+		for _, id := range morphism.sources {
+			counter.addString(string(id))
+		}
+		for _, id := range morphism.targets {
+			counter.addString(string(id))
+		}
+		counter.addString(morphism.discriminator.metadataKey)
+		for _, choice := range morphism.discriminator.choices {
+			counter.addString(choice.value)
+			counter.addString(string(choice.target))
+		}
+		for _, evidence := range morphism.evidence {
+			counter.addEvidence(evidence)
+		}
+		counter.addString(morphism.rationale)
+		counter.addMetadata(morphism.metadata)
+		if counter.exceeded || counter.size > ^uint64(0)-size {
+			return ^uint64(0)
+		}
+		size += counter.size
+	}
+	return size
 }
 
 func validateBoundedMetadata(metadata shoal.Metadata, limits ExtractionLimits) error {
