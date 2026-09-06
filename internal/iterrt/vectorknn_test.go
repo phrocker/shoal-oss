@@ -18,13 +18,35 @@
 package iterrt
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/binary"
+	"errors"
 	"math"
 	"testing"
 
 	"github.com/phrocker/shoal-oss/internal/rfile/wire"
 )
+
+type cancelingVectorSource struct {
+	SortedKeyValueIterator
+	cancel context.CancelFunc
+}
+
+func (s *cancelingVectorSource) Next() error {
+	err := s.SortedKeyValueIterator.Next()
+	s.cancel()
+	return err
+}
+
+func (s *cancelingVectorSource) DeepCopy(
+	env IteratorEnvironment,
+) SortedKeyValueIterator {
+	return &cancelingVectorSource{
+		SortedKeyValueIterator: s.SortedKeyValueIterator.DeepCopy(env),
+		cancel:                 s.cancel,
+	}
+}
 
 // packBE packs a float32 vector big-endian, matching the iterator's wire form.
 func packBE(vec ...float32) []byte {
@@ -84,6 +106,33 @@ func runKNN(t *testing.T, cells []Cell, opts map[string]string) []Cell {
 
 func b64(vec ...float32) string {
 	return base64.StdEncoding.EncodeToString(packBE(vec...))
+}
+
+func TestVectorKNNSeekHonorsCancellationWhileScoring(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	leaf := NewSliceSource(sortedSlice([]Cell{
+		embCell("a", "V", 1, 0),
+		embCell("b", "V", 0, 1),
+	}))
+	if err := leaf.Init(nil, nil, IteratorEnvironment{Scope: ScopeScan}); err != nil {
+		t.Fatal(err)
+	}
+	source := &cancelingVectorSource{
+		SortedKeyValueIterator: leaf,
+		cancel:                 cancel,
+	}
+	it := NewVectorKNNIterator()
+	if err := it.Init(source, map[string]string{
+		VectorKNNQuery:          b64(1, 0),
+		VectorKNNEmbeddingSpace: "test-space",
+	}, IteratorEnvironment{Context: ctx, Scope: ScopeScan}); err != nil {
+		t.Fatal(err)
+	}
+	if err := it.Seek(
+		InfiniteRange(), nil, false,
+	); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Seek cancellation error = %v", err)
+	}
 }
 
 // TestVectorKNNCosineRanking verifies cosine top-k ordering: the query is the

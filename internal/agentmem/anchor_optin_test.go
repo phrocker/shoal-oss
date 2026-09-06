@@ -70,8 +70,7 @@ var optinVecs = [][]float32{
 	{0, 0, 1, 1},
 }
 
-// Legacy IVF artifacts have no embedding identity, so UseIVF safely falls
-// back to the identity-checked brute-force path.
+// Identity-bearing IVF artifacts serve the explicit UseIVF path.
 func TestSemanticAnchors_IVFEnabled(t *testing.T) {
 	ctx := context.Background()
 	store := NewFakeStore()
@@ -79,7 +78,10 @@ func TestSemanticAnchors_IVFEnabled(t *testing.T) {
 	_ = seedIvfIndex(t, store, table, optinVecs, 2, 6, 2, 1)
 	seedBruteForceVectors(t, store, table, optinVecs)
 
-	c, err := New(Config{Store: store, Table: table, UseIVF: true, IvfNprobe: 2})
+	c, err := New(Config{
+		Store: store, Table: table, Embedder: FakeEmbedder{Dim: 4},
+		UseIVF: true, IvfNprobe: 2,
+	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -89,8 +91,12 @@ func TestSemanticAnchors_IVFEnabled(t *testing.T) {
 			t.Fatalf("semanticAnchors[%d]: %v", i, err)
 		}
 		if len(got) == 0 {
-			t.Errorf("semanticAnchors[%d] = %v, want a safe fallback result", i, got)
+			t.Errorf("semanticAnchors[%d] = %v, want IVF result", i, got)
 		}
+	}
+	if c.ivf == nil || c.ivfErr != nil {
+		t.Fatalf("UseIVF did not load identity-checked index: index=%v err=%v",
+			c.ivf, c.ivfErr)
 	}
 }
 
@@ -102,7 +108,10 @@ func TestSemanticAnchors_IVFFallsBackWhenUntrained(t *testing.T) {
 	const table = "graph"
 	seedBruteForceVectors(t, store, table, optinVecs)
 
-	c, err := New(Config{Store: store, Table: table, UseIVF: true})
+	c, err := New(Config{
+		Store: store, Table: table, Embedder: FakeEmbedder{Dim: 4},
+		UseIVF: true,
+	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -124,7 +133,9 @@ func TestSemanticAnchors_DefaultIgnoresIVF(t *testing.T) {
 	seedIvfIndex(t, store, table, optinVecs, 2, 6, 2, 1)
 	seedBruteForceVectors(t, store, table, optinVecs)
 
-	c, err := New(Config{Store: store, Table: table})
+	c, err := New(Config{
+		Store: store, Table: table, Embedder: FakeEmbedder{Dim: 4},
+	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}

@@ -849,6 +849,7 @@ func (t *table) scanHosted(
 		defer t.formatMu.RUnlock()
 	}
 	env := iterrt.IteratorEnvironment{
+		Context:        ctx,
 		Scope:          iterrt.ScopeScan,
 		Authorizations: opts.Authorizations,
 	}

@@ -19,6 +19,7 @@ package iterrt
 
 import (
 	"container/heap"
+	"context"
 	"encoding/base64"
 	"encoding/binary"
 	"errors"
@@ -67,6 +68,7 @@ import (
 // sees every embedding cell regardless of which tablet holds it.
 type VectorKNNIterator struct {
 	source SortedKeyValueIterator
+	ctx    context.Context
 
 	query       []float32
 	queryNorm   float32 // precomputed |query| for cosine
@@ -119,6 +121,10 @@ func (v *VectorKNNIterator) Init(source SortedKeyValueIterator, options map[stri
 		return errors.New("iterrt: VectorKNNIterator requires a non-nil source")
 	}
 	v.source = source
+	v.ctx = env.Context
+	if v.ctx == nil {
+		v.ctx = context.Background()
+	}
 
 	qB64, ok := options[VectorKNNQuery]
 	if !ok || qB64 == "" {
@@ -188,6 +194,10 @@ func (v *VectorKNNIterator) Seek(r Range, columnFamilies [][]byte, inclusive boo
 	v.outIndex = 0
 	v.err = nil
 
+	if err := v.ctx.Err(); err != nil {
+		v.err = err
+		return err
+	}
 	if err := v.source.Seek(r, columnFamilies, inclusive); err != nil {
 		v.err = err
 		return err
@@ -195,6 +205,10 @@ func (v *VectorKNNIterator) Seek(r Range, columnFamilies [][]byte, inclusive boo
 
 	h := &knnHeap{cap: v.topK}
 	for v.source.HasTop() {
+		if err := v.ctx.Err(); err != nil {
+			v.err = err
+			return err
+		}
 		k := v.source.GetTopKey()
 		if len(v.embeddingCF) == 0 || bytesEqual(k.ColumnFamily, v.embeddingCF) {
 			if vec, err := unpackFloat32BE(v.source.GetTopValue()); err == nil && len(vec) == len(v.query) {
@@ -281,6 +295,7 @@ func (v *VectorKNNIterator) Next() error {
 func (v *VectorKNNIterator) DeepCopy(env IteratorEnvironment) SortedKeyValueIterator {
 	cp := &VectorKNNIterator{
 		source:      v.source.DeepCopy(env),
+		ctx:         env.Context,
 		query:       v.query,
 		queryNorm:   v.queryNorm,
 		querySpace:  v.querySpace,
@@ -288,6 +303,9 @@ func (v *VectorKNNIterator) DeepCopy(env IteratorEnvironment) SortedKeyValueIter
 		embeddingCF: v.embeddingCF,
 		metric:      v.metric,
 		minScore:    v.minScore,
+	}
+	if cp.ctx == nil {
+		cp.ctx = context.Background()
 	}
 	return cp
 }
