@@ -101,13 +101,20 @@ func New(config Config) (*Worker, error) {
 }
 
 func (w *Worker) RunOnce(ctx context.Context) error {
+	_, err := w.RunPage(ctx)
+	return err
+}
+
+// RunPage processes one bounded candidate page. More is true when the source
+// returned a continuation cursor. The cursor is the candidate row position;
+// it is never derived from a publication frontier.
+func (w *Worker) RunPage(ctx context.Context) (more bool, err error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	candidates, next, err := w.config.Source.Candidates(ctx, w.config.Domain, w.cursor, w.config.Limit)
 	if err != nil {
-		return errors.Join(transaction.ErrUnavailable, err)
+		return false, errors.Join(transaction.ErrUnavailable, err)
 	}
-	w.cursor = append(w.cursor[:0], next...)
 	sort.Slice(candidates, func(i, j int) bool { return bytes.Compare(candidates[i], candidates[j]) < 0 })
 	workerCount := min(w.config.Concurrency, len(candidates))
 	jobs := make(chan coordination.TXN)
@@ -140,7 +147,18 @@ send:
 	for err := range errs {
 		combined = errors.Join(combined, err)
 	}
-	return combined
+	if combined != nil {
+		return len(next) != 0, combined
+	}
+	w.cursor = append(w.cursor[:0], next...)
+	return len(next) != 0, combined
+}
+
+// Reset restarts candidate enumeration from the first recovery band.
+func (w *Worker) Reset() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.cursor = nil
 }
 
 func (w *Worker) recoverOne(ctx context.Context, txn coordination.TXN) error {

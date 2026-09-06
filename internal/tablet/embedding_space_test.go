@@ -9,6 +9,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/phrocker/shoal-oss/internal/cclient"
 	"github.com/phrocker/shoal-oss/internal/embeddingspace"
@@ -116,5 +117,55 @@ func TestSnapshotSourceExcludesLaterWrites(t *testing.T) {
 	}
 	if len(rows) != 1 || rows[0] != "a" {
 		t.Fatalf("snapshot rows = %v, want [a]", rows)
+	}
+}
+
+func TestSourceContextSnapshotsWithoutBlockingWrites(t *testing.T) {
+	tablet, err := Open(t.TempDir(), Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tablet.Close()
+	write := func(row string) error {
+		mutation, _ := cclient.NewMutation([]byte(row))
+		mutation.PutLatest([]byte("cf"), nil, nil, []byte(row))
+		return tablet.Write([]*cclient.Mutation{mutation})
+	}
+	if err := write("a"); err != nil {
+		t.Fatal(err)
+	}
+	source, closeSource, err := tablet.SourceContext(
+		context.Background(),
+		iterrt.IteratorEnvironment{Scope: iterrt.ScopeScan},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeSource()
+	writeDone := make(chan error, 1)
+	go func() {
+		writeDone <- write("b")
+	}()
+	select {
+	case err := <-writeDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(3 * time.Second):
+		closeSource()
+		t.Fatal("ordinary source blocked a concurrent tablet write")
+	}
+	if err := source.Seek(iterrt.InfiniteRange(), nil, false); err != nil {
+		t.Fatal(err)
+	}
+	var rows []string
+	for source.HasTop() {
+		rows = append(rows, string(source.GetTopKey().Row))
+		if err := source.Next(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(rows) != 1 || rows[0] != "a" {
+		t.Fatalf("ordinary source rows = %v, want [a]", rows)
 	}
 }

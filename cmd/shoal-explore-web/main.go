@@ -33,9 +33,12 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/phrocker/shoal-oss/internal/explorercoord"
 	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/explorer/authorized"
+	"github.com/phrocker/shoal-oss/pkg/explorer/coordination"
+	"github.com/phrocker/shoal-oss/pkg/explorer/coordination/transaction"
 	"github.com/phrocker/shoal-oss/pkg/explorer/webapi"
 	"github.com/phrocker/shoal-oss/pkg/model"
 	"github.com/phrocker/shoal-oss/pkg/ontology"
@@ -623,6 +626,11 @@ type openedService struct {
 	close      func()
 }
 
+var (
+	workspacePublicationDomain = coordination.DomainID("shoal-explore-web/publication")
+	workspaceRuntimeOwner      = coordination.OwnerID("shoal-explore-web/runtime")
+)
+
 func openService(
 	ctx context.Context,
 	config serviceConfig,
@@ -630,12 +638,24 @@ func openService(
 	closed := openedService{close: func() {}}
 	switch config.backend {
 	case "embedded":
-		corpus, err := explorer.OpenWithOptions(config.data, explorer.Options{
-			Embedder: config.embedder,
-		})
+		embedded, err := explorercoord.OpenExplorer(explorercoord.Config{
+			Directory: config.data,
+			Domain:    workspacePublicationDomain,
+			Owner:     workspaceRuntimeOwner,
+			Authority: transaction.Authority{
+				Generation:          1,
+				Fence:               1,
+				Holder:              workspaceRuntimeOwner,
+				Mode:                coordination.WriterModeEmbeddedPrimary,
+				RetentionGeneration: 1,
+				HistoryFloor:        1,
+			},
+			Clock: config.clock,
+		}, explorer.Options{Embedder: config.embedder})
 		if err != nil {
 			return closed, err
 		}
+		corpus := embedded.Explorer
 		// The policy catalog is durable and lives in its own directory, not a
 		// subdirectory of the corpus: the corpus engine treats every
 		// subdirectory as a table, so nesting the store there would corrupt
@@ -647,7 +667,7 @@ func openService(
 		}
 		store, err := authorized.OpenDurablePolicyStore(policyDir)
 		if err != nil {
-			corpus.Close()
+			embedded.Close()
 			return closed, err
 		}
 		// A non-empty corpus paired with an empty policy catalog is the
@@ -661,7 +681,7 @@ func openService(
 			if err := refuseSplitBrainStateDirectory(
 				ctx, corpus, store, config.data, policyDir); err != nil {
 				store.Close()
-				corpus.Close()
+				embedded.Close()
 				return closed, err
 			}
 		}
@@ -669,7 +689,7 @@ func openService(
 			corpus, store, config.resolver, config.clock, config.mosaic)
 		if err != nil {
 			store.Close()
-			corpus.Close()
+			embedded.Close()
 			return closed, err
 		}
 		// The development-only backfill migrates a corpus whose documents were
@@ -680,13 +700,13 @@ func openService(
 		backfilled, err := config.backfill.run(ctx, client)
 		if err != nil {
 			store.Close()
-			corpus.Close()
+			embedded.Close()
 			return closed, err
 		}
 		service, err := webapi.NewEmbeddedService(client)
 		if err != nil {
 			store.Close()
-			corpus.Close()
+			embedded.Close()
 			return closed, err
 		}
 		if config.ontology != nil {
@@ -695,7 +715,7 @@ func openService(
 			// path used by proposal creation, not only into an injected test double.
 			if err := service.SetOntologyVersion(*config.ontology); err != nil {
 				store.Close()
-				corpus.Close()
+				embedded.Close()
 				return closed, err
 			}
 		}
@@ -704,7 +724,7 @@ func openService(
 			backfilled: backfilled,
 			close: func() {
 				store.Close()
-				corpus.Close()
+				embedded.Close()
 			},
 		}, nil
 	case "remote":
