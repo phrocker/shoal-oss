@@ -80,11 +80,17 @@ func (c *Client) VectorAvailable(ctx context.Context) (bool, error) {
 		if err := validateSummary(summary); err != nil {
 			return false, inconsistentBase()
 		}
-		registration, ok, err := c.policyStore.CurrentRevision(
-			ctx, summary.Document.ID)
-		if err != nil {
-			return false, policyCatalogReadError(ctx, err)
-		}
+	}
+	documentIDs := make([]shoal.ID, 0, len(summaries))
+	for _, summary := range summaries {
+		documentIDs = append(documentIDs, summary.Document.ID)
+	}
+	currentRevisions, err := c.resolveCurrentRevisions(ctx, documentIDs)
+	if err != nil {
+		return false, err
+	}
+	for _, summary := range summaries {
+		registration, ok := currentRevisions[summary.Document.ID]
 		if !ok || registration.RevisionID != summary.Revision.ID {
 			continue
 		}

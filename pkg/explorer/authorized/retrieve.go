@@ -158,11 +158,17 @@ func (c *Client) retrieve(
 		if err := validateSummary(summary); err != nil {
 			return retrieval.Response{}, inconsistentBase()
 		}
-		registration, ok, err := c.policyStore.CurrentRevision(
-			ctx, summary.Document.ID)
-		if err != nil {
-			return retrieval.Response{}, policyCatalogReadError(ctx, err)
-		}
+	}
+	candidateDocumentIDs := make([]shoal.ID, 0, len(summaries))
+	for _, summary := range summaries {
+		candidateDocumentIDs = append(candidateDocumentIDs, summary.Document.ID)
+	}
+	currentRevisions, err := c.resolveCurrentRevisions(ctx, candidateDocumentIDs)
+	if err != nil {
+		return retrieval.Response{}, err
+	}
+	for _, summary := range summaries {
+		registration, ok := currentRevisions[summary.Document.ID]
 		if !ok {
 			// A document present in the corpus but covered by no policy grant
 			// is withheld from every caller: that is an authorization outcome,

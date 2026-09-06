@@ -472,10 +472,12 @@ func (c *Client) authorizeLegacySource(
 	if !found {
 		return nil
 	}
-	registration, ok, err := c.policyStore.CurrentRevision(ctx, documentID)
+	currentRevisions, err := c.resolveCurrentRevisions(
+		ctx, []shoal.ID{documentID})
 	if err != nil {
-		return policyCatalogReadError(ctx, err)
+		return err
 	}
+	registration, ok := currentRevisions[documentID]
 	if !ok {
 		return catalogUnavailable()
 	}
