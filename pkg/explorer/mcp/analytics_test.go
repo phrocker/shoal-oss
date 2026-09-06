@@ -42,6 +42,23 @@ func TestAnalyticsOptionalToolAdvertisesAndInvokesOnlyWithLimits(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	tool := provider.Tool()
+	schema, err := parseOptionalToolInputSchema(tool.InputSchema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"damping_factor", "convergence_tolerance"} {
+		bound := schema.Properties["page_rank"].Properties[name]
+		if bound.Maximum != nil || bound.ExclusiveMaximum == nil {
+			t.Fatalf("%s upper bound = %#v", name, bound)
+		}
+		if err := validateOptionalToolValue(json.Number("1"), bound); err == nil {
+			t.Fatalf("%s accepted exclusive upper bound", name)
+		}
+		if err := validateOptionalToolValue(json.Number("0.5"), bound); err != nil {
+			t.Fatalf("%s rejected valid value: %v", name, err)
+		}
+	}
 	now := time.Now()
 	authority := auth.NewAuthority()
 	decision, err := auth.NewDecision(auth.DecisionConfig{
