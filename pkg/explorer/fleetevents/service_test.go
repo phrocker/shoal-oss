@@ -159,7 +159,7 @@ func TestPullDropsEventDeniedOnlyByFinalAuthorizationCheck(t *testing.T) {
 	allowed, err := auth.NewDecision(auth.DecisionConfig{
 		Subject: "alice", Actor: "alice", RequestID: "request",
 		AuthorizationDomain: []byte("domain"),
-		AllowedOperations:   []auth.Operation{auth.OperationSubscriptionDeliver},
+		AllowedOperations:   []auth.Operation{auth.OperationSubscriptionCreate},
 		PermittedSourceIDs:  [][]byte{[]byte("source")},
 		PermittedPolicyIDs:  [][]byte{[]byte("policy")},
 		PolicyGeneration:    7, AuthenticationExpires: now.Add(time.Hour),
@@ -555,13 +555,10 @@ func TestSubscriptionRoleOnlyCanDeliverWithoutGenericRead(t *testing.T) {
 	decision, err := auth.NewDecision(auth.DecisionConfig{
 		Subject: "subscriber", Actor: "subscriber", RequestID: "request",
 		AuthorizationDomain: []byte("domain"),
-		AllowedOperations: []auth.Operation{
-			auth.OperationSubscriptionCreate,
-			auth.OperationSubscriptionDeliver,
-		},
-		PermittedSourceIDs: [][]byte{[]byte("source")},
-		PermittedPolicyIDs: [][]byte{[]byte("policy")},
-		PolicyGeneration:   7, AuthenticationExpires: now.Add(time.Hour),
+		AllowedOperations:   []auth.Operation{auth.OperationSubscriptionCreate},
+		PermittedSourceIDs:  [][]byte{[]byte("source")},
+		PermittedPolicyIDs:  [][]byte{[]byte("policy")},
+		PolicyGeneration:    7, AuthenticationExpires: now.Add(time.Hour),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -641,7 +638,7 @@ func testService(
 		AuthorizationDomain: []byte("domain"),
 		AllowedOperations: []auth.Operation{
 			auth.OperationSubscriptionCreate, auth.OperationSubscriptionDelete,
-			auth.OperationEventPublish, auth.OperationSubscriptionDeliver,
+			auth.OperationEventPublish,
 		},
 		PermittedSourceIDs: [][]byte{[]byte("source")},
 		PermittedPolicyIDs: [][]byte{[]byte("policy")},

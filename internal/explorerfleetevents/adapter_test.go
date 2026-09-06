@@ -32,6 +32,7 @@ import (
 	"github.com/phrocker/shoal-oss/internal/explorercoord"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/explorer/coordination"
+	"github.com/phrocker/shoal-oss/pkg/explorer/coordination/guard"
 	"github.com/phrocker/shoal-oss/pkg/explorer/coordination/transaction"
 	"github.com/phrocker/shoal-oss/pkg/explorer/fleetevents"
 	"github.com/phrocker/shoal-oss/pkg/interaction"
@@ -148,6 +149,8 @@ func TestAdapterRetentionFloorAndIdempotencyExpirySurviveRestart(t *testing.T) {
 	}
 	start := time.Date(2026, 9, 6, 6, 0, 0, 0, time.UTC)
 	var firstEventID []byte
+	var historicalFrontier coordination.Epoch
+	var historyFloor coordination.Epoch
 	for index := 0; index < 5; index++ {
 		event := testEvent(index)
 		event.OccurredAt = start.Add(time.Duration(index) * time.Minute)
@@ -163,6 +166,17 @@ func TestAdapterRetentionFloorAndIdempotencyExpirySurviveRestart(t *testing.T) {
 		}
 		if index == 0 {
 			firstEventID = append([]byte(nil), result.EventID...)
+		}
+		if index == 2 {
+			page, scanErr := runtime.ScanCommitted(
+				ctx, explorercoord.CommittedScanRequest{
+					Table: Table, RowPrefix: eventPrefix,
+					Family: recordFamily, Qualifier: recordQualifier, Limit: 10,
+				})
+			if scanErr != nil || len(page.Cells) != 3 {
+				t.Fatalf("pre-prune event rows = %d, %v", len(page.Cells), scanErr)
+			}
+			historicalFrontier, historyFloor = page.Frontier, page.HistoryFloor
 		}
 	}
 	if _, _, err := adapter.Scan(ctx, 1, 0, 3); !errors.Is(
@@ -181,6 +195,33 @@ func TestAdapterRetentionFloorAndIdempotencyExpirySurviveRestart(t *testing.T) {
 	})
 	if err != nil || len(page.Cells) != 3 {
 		t.Fatalf("bounded event rows = %d, %v", len(page.Cells), err)
+	}
+	if page.HistoryFloor != historyFloor {
+		t.Fatalf(
+			"prune changed shared history floor from %d to %d",
+			historyFloor, page.HistoryFloor,
+		)
+	}
+	historical, err := runtime.ScanCommitted(ctx, explorercoord.CommittedScanRequest{
+		Table: Table, RowPrefix: eventPrefix, Family: recordFamily,
+		Qualifier: recordQualifier, Frontier: historicalFrontier, Limit: 10,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	historicalEvents, err := decodeSortedEvents(historical.Cells, 1, 10)
+	if err != nil || len(historicalEvents) != 3 ||
+		historicalEvents[0].Sequence != 1 ||
+		historicalEvents[2].Sequence != 3 {
+		t.Fatalf("historical event rows = %#v, %v", historicalEvents, err)
+	}
+	retired, _, err := runtime.ReadEntity(ctx, adapter.eventSlotEntity(1))
+	if err != nil || retired == nil || retired.State != guard.StateTombstone {
+		t.Fatalf("retired event guard = %#v, %v", retired, err)
+	}
+	replacement, _, err := runtime.ReadEntity(ctx, adapter.eventSlotEntity(4))
+	if err != nil || replacement == nil || replacement.State != guard.StateLive {
+		t.Fatalf("replacement event guard = %#v, %v", replacement, err)
 	}
 	if err := runtime.Close(); err != nil {
 		t.Fatal(err)
@@ -598,7 +639,6 @@ func restartService(
 		AuthorizationDomain: []byte("domain"),
 		AllowedOperations: []auth.Operation{
 			auth.OperationSubscriptionCreate, auth.OperationEventPublish,
-			auth.OperationSubscriptionDeliver,
 		},
 		PermittedSourceIDs: [][]byte{[]byte("source")},
 		PermittedPolicyIDs: [][]byte{[]byte("policy")},
@@ -639,7 +679,6 @@ func durableRetryService(
 		CorrelationID: "correlation", AuthorizationDomain: []byte("domain"),
 		AllowedOperations: []auth.Operation{
 			auth.OperationSubscriptionCreate, auth.OperationSubscriptionDelete,
-			auth.OperationSubscriptionDeliver,
 		},
 		PermittedSourceIDs: [][]byte{[]byte("source")},
 		PermittedPolicyIDs: [][]byte{[]byte("policy")},

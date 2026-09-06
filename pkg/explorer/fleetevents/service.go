@@ -443,7 +443,7 @@ func validateRetryUntil(
 func (s *Service) deliveryState(
 	ctx context.Context, request PullRequest, now time.Time,
 ) (Subscription, auth.Decision, auth.Fingerprint, uint64, uint64, error) {
-	decision, guard, err := s.authorize(ctx, auth.OperationSubscriptionDeliver, nil, now)
+	decision, guard, err := s.authorize(ctx, auth.OperationSubscriptionCreate, nil, now)
 	if err != nil {
 		return Subscription{}, auth.Decision{}, auth.Fingerprint{}, 0, 0, err
 	}
@@ -492,7 +492,7 @@ func (s *Service) authorizeDelivery(
 ) (bool, error) {
 	now := s.now().UTC()
 	fresh, guard, err := s.authorize(
-		ctx, auth.OperationSubscriptionDeliver, event.Evidence, now)
+		ctx, auth.OperationSubscriptionCreate, event.Evidence, now)
 	if err != nil {
 		if shoal.IsErrorCode(err, shoal.ErrorUnauthorized) || shoal.IsErrorCode(err, shoal.ErrorNotFound) {
 			return false, nil

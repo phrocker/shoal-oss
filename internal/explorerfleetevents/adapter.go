@@ -63,6 +63,10 @@ const (
 
 type Runtime interface {
 	Publish(context.Context, explorercoord.Request) (explorercoord.Result, error)
+	PruneCommitted(
+		context.Context,
+		explorercoord.PruneCommittedRequest,
+	) (explorercoord.PruneCommittedResult, error)
 	ReadEntity(context.Context, guard.Entity) (*guard.Head, *guard.Pending, error)
 	ScanCommitted(context.Context, explorercoord.CommittedScanRequest) (explorercoord.CommittedPage, error)
 }
@@ -577,7 +581,7 @@ func (a *Adapter) publishEvent(
 		floor = sequence - a.retained + 1
 	}
 	if sequence > a.retained {
-		if retired, found, readErr := a.readSlotEvent(ctx, row); readErr != nil {
+		if retired, committed, found, readErr := a.readSlotEvent(ctx, row); readErr != nil {
 			return explorercoord.Result{}, readErr
 		} else if found {
 			if retired.RetryUntil.IsZero() ||
@@ -588,46 +592,105 @@ func (a *Adapter) publishEvent(
 			if now.Before(retired.RetryUntil) {
 				return explorercoord.Result{}, fleetevents.ErrRetentionCapacity
 			}
+			if retired.Event.Sequence != sequence-a.retained {
+				return explorercoord.Result{}, errors.New(
+					"fleet events: corrupt retained event sequence")
+			}
+			if err := a.pruneEvent(
+				ctx, retired, committed, floor, lpart,
+			); err != nil {
+				return explorercoord.Result{}, err
+			}
 		}
-	}
-	floorValue, err := json.Marshal(floorRecord{Sequence: floor})
-	if err != nil {
-		return explorercoord.Result{}, err
 	}
 	slotEntity := a.eventSlotEntity(sequence)
 	slotGuard, err := a.mutationGuard(ctx, slotEntity, eventID, lpart)
 	if err != nil {
 		return explorercoord.Result{}, err
 	}
-	floorGuard, err := a.mutationGuard(ctx, floorEntity, encodeUint64(floor), lpart)
-	if err != nil {
-		return explorercoord.Result{}, err
+	cells := []explorercoord.Cell{{
+		Table: Table, Row: append([]byte(nil), row...), Family: recordFamily,
+		Qualifier: recordQualifier, Value: append([]byte(nil), value...),
+		EpochTimestamp: true, LPART: lpart, CopyGeneration: 1,
+	}}
+	guards := []explorercoord.GuardIntent{
+		{
+			Entity: streamEntity, Mode: streamMode, ExpectedEpoch: expectedEpoch,
+			ExpectedDigest: expectedDigest, DesiredState: guard.StateLive,
+			DesiredWinnerID: sequenceID, LPART: lpart,
+			LogicalPolicyID: logicalPolicy, RetirementGeneration: 1,
+		},
+		slotGuard,
 	}
-	return a.runtime.Publish(ctx, explorercoord.Request{Intent: explorercoord.Intent{
-		Operation: []byte("fleet-event-publish-v1"), Token: append([]byte(nil), token...),
-		Cells: []explorercoord.Cell{{
-			Table: Table, Row: append([]byte(nil), row...), Family: recordFamily,
-			Qualifier: recordQualifier, Value: append([]byte(nil), value...),
-			EpochTimestamp: true, LPART: lpart, CopyGeneration: 1,
-		}, {
+	if sequence <= a.retained {
+		floorValue, marshalErr := json.Marshal(floorRecord{Sequence: floor})
+		if marshalErr != nil {
+			return explorercoord.Result{}, marshalErr
+		}
+		floorGuard, guardErr := a.mutationGuard(
+			ctx, floorEntity, encodeUint64(floor), lpart)
+		if guardErr != nil {
+			return explorercoord.Result{}, guardErr
+		}
+		cells = append(cells, explorercoord.Cell{
 			Table: Table, Row: append([]byte(nil), floorRow...), Family: recordFamily,
 			Qualifier: recordQualifier, Value: floorValue,
 			EpochTimestamp: true, LPART: lpart, CopyGeneration: 1,
-		}},
-		Guards: []explorercoord.GuardIntent{
-			{
-				Entity: streamEntity, Mode: streamMode, ExpectedEpoch: expectedEpoch,
-				ExpectedDigest: expectedDigest, DesiredState: guard.StateLive,
-				DesiredWinnerID: sequenceID, LPART: lpart,
-				LogicalPolicyID: logicalPolicy, RetirementGeneration: 1,
-			},
-			slotGuard,
-			floorGuard,
-		},
+		})
+		guards = append(guards, floorGuard)
+	}
+	return a.runtime.Publish(ctx, explorercoord.Request{Intent: explorercoord.Intent{
+		Operation: []byte("fleet-event-publish-v1"), Token: append([]byte(nil), token...),
+		Cells:  cells,
+		Guards: guards,
 		Results: []explorercoord.ResultIdentity{{
 			Kind: []byte("fleet-event-publish-v1"), ID: append([]byte(nil), eventID...),
 		}},
 	}})
+}
+
+func (a *Adapter) pruneEvent(
+	ctx context.Context, retired eventRecord,
+	committed explorercoord.CommittedCell, floor uint64,
+	lpart coordination.LPART,
+) error {
+	floorValue, err := json.Marshal(floorRecord{Sequence: floor})
+	if err != nil {
+		return err
+	}
+	floorGuard, err := a.mutationGuard(
+		ctx, floorEntity, encodeUint64(floor), lpart)
+	if err != nil {
+		return err
+	}
+	_, err = a.runtime.PruneCommitted(ctx, explorercoord.PruneCommittedRequest{
+		Operation: []byte("fleet-event-prune-v1"),
+		Token: digest(
+			"fleet-event-prune-token-v1",
+			encodeUint64(retired.Event.Sequence),
+			retired.Event.EventID,
+			encodeUint64(floor),
+		),
+		Targets: []explorercoord.PruneTarget{{
+			Table:  Table,
+			Cell:   committed,
+			Entity: a.eventSlotEntity(retired.Event.Sequence),
+		}},
+		Checkpoint: explorercoord.PruneCheckpoint{
+			Cell: explorercoord.Cell{
+				Table: Table, Row: append([]byte(nil), floorRow...),
+				Family: recordFamily, Qualifier: recordQualifier,
+				Value: floorValue, EpochTimestamp: true,
+				LPART: lpart, CopyGeneration: 1,
+			},
+			Guard: floorGuard,
+		},
+		Results: []explorercoord.ResultIdentity{{
+			Kind: []byte("fleet-event-prune-v1"),
+			ID:   encodeUint64(floor),
+		}},
+	})
+	return translate(err)
 }
 
 func (a *Adapter) Scan(
@@ -732,23 +795,23 @@ func (a *Adapter) readFloor(ctx context.Context) (uint64, time.Time, error) {
 
 func (a *Adapter) readSlotEvent(
 	ctx context.Context, row []byte,
-) (eventRecord, bool, error) {
+) (eventRecord, explorercoord.CommittedCell, bool, error) {
 	page, err := a.runtime.ScanCommitted(ctx, explorercoord.CommittedScanRequest{
 		Table: Table, RowPrefix: row, Family: recordFamily,
 		Qualifier: recordQualifier, Limit: 1,
 	})
 	if err != nil {
-		return eventRecord{}, false, translate(err)
+		return eventRecord{}, explorercoord.CommittedCell{}, false, translate(err)
 	}
 	if len(page.Cells) == 0 ||
 		!bytes.Equal(page.Cells[0].Cell.Coordinate.Row, row) {
-		return eventRecord{}, false, nil
+		return eventRecord{}, explorercoord.CommittedCell{}, false, nil
 	}
 	var record eventRecord
 	if err := json.Unmarshal(page.Cells[0].Cell.Value, &record); err != nil {
-		return eventRecord{}, false, err
+		return eventRecord{}, explorercoord.CommittedCell{}, false, err
 	}
-	return record, true, nil
+	return record, page.Cells[0], true, nil
 }
 
 func (a *Adapter) mutationGuard(
@@ -870,7 +933,7 @@ func (a *Adapter) eventSlotEntity(sequence uint64) guard.Entity {
 	return guard.Entity{
 		Kind: 'e',
 		ID: coordination.EntityID(digest(
-			"fleet-event-slot-v1", encodeUint64((sequence-1)%a.retained+1))),
+			"fleet-event-slot-v2", encodeUint64(sequence))),
 	}
 }
 

@@ -48,7 +48,6 @@ var productActionOperations = []auth.Operation{
 	auth.OperationAgentResolve,
 	auth.OperationSubscriptionCreate,
 	auth.OperationSubscriptionDelete,
-	auth.OperationSubscriptionDeliver,
 	auth.OperationEventPublish,
 	auth.OperationAnalyticsRead,
 	auth.OperationWorkspaceSettingsRead,
@@ -141,7 +140,6 @@ var roleOperationCeilings = map[auth.ServiceRole]map[auth.Operation]bool{
 	auth.ServiceRoleSubscription: operationSet(
 		auth.OperationSubscriptionCreate,
 		auth.OperationSubscriptionDelete,
-		auth.OperationSubscriptionDeliver,
 		auth.OperationValidate,
 	),
 	auth.ServiceRoleEventPublication: operationSet(
@@ -189,7 +187,6 @@ func TestProductActionOperationValuesAndParsingAreStable(t *testing.T) {
 		auth.OperationAgentResolve:           "agent_resolve",
 		auth.OperationSubscriptionCreate:     "subscription_create",
 		auth.OperationSubscriptionDelete:     "subscription_delete",
-		auth.OperationSubscriptionDeliver:    "subscription_deliver",
 		auth.OperationEventPublish:           "event_publish",
 		auth.OperationAnalyticsRead:          "analytics_read",
 		auth.OperationWorkspaceSettingsRead:  "workspace_settings_read",

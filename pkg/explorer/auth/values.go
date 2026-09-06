@@ -73,7 +73,6 @@ const (
 	OperationAgentResolve           Operation = "agent_resolve"
 	OperationSubscriptionCreate     Operation = "subscription_create"
 	OperationSubscriptionDelete     Operation = "subscription_delete"
-	OperationSubscriptionDeliver    Operation = "subscription_deliver"
 	OperationEventPublish           Operation = "event_publish"
 	OperationAnalyticsRead          Operation = "analytics_read"
 	OperationWorkspaceSettingsRead  Operation = "workspace_settings_read"
@@ -97,8 +96,7 @@ func (o Operation) Validate() error {
 		OperationInvoke, OperationDispatch, OperationDelegate,
 		OperationAgentRegister, OperationAgentHeartbeat, OperationAgentRevoke,
 		OperationAgentResolve, OperationSubscriptionCreate,
-		OperationSubscriptionDelete, OperationSubscriptionDeliver,
-		OperationEventPublish,
+		OperationSubscriptionDelete, OperationEventPublish,
 		OperationAnalyticsRead, OperationWorkspaceSettingsRead,
 		OperationWorkspaceSettingsWrite:
 		return nil
@@ -185,7 +183,6 @@ func (r ServiceRole) Allows(operation Operation) bool {
 	case ServiceRoleSubscription:
 		return operation == OperationSubscriptionCreate ||
 			operation == OperationSubscriptionDelete ||
-			operation == OperationSubscriptionDeliver ||
 			operation == OperationValidate
 	case ServiceRoleEventPublication:
 		return operation == OperationEventPublish || operation == OperationValidate
