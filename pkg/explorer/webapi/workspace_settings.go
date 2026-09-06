@@ -175,14 +175,12 @@ func (h *Handler) applyWorkspaceSettings(
 		isWorkspaceSettingsManagementPath(request.URL.Path) {
 		return request.Context(), nil
 	}
-	encoded := request.Header.Get(WorkspaceIDHeader)
-	if encoded == "" {
-		return request.Context(), nil
-	}
-	workspaceID, err := decodeID(encoded)
+	workspaceID, present, err := workspaceIDFromHeader(request.Header)
 	if err != nil {
-		return nil, shoal.NewError(
-			shoal.ErrorInvalidArgument, "workspace settings header "+err.Error())
+		return nil, err
+	}
+	if !present {
+		return request.Context(), nil
 	}
 	effective, err := h.workspaceSettings.Apply(
 		request.Context(), workspaceID, workspace.MaximumLimits(), nil)
@@ -191,11 +189,38 @@ func (h *Handler) applyWorkspaceSettings(
 	}
 	decision := effective.Decision()
 	ctx, err := h.binder.Bind(request.Context(), decision)
-	if err != nil || ctx == nil {
+	if err != nil {
+		return nil, authenticationDenied()
+	}
+	if ctx == nil {
 		return nil, authenticationDenied()
 	}
 	ctx = withEffectiveWorkspaceSettings(ctx, effective)
 	return withIdentity(ctx, decision), nil
+}
+
+func workspaceIDFromHeader(
+	header http.Header,
+) (shoal.ID, bool, error) {
+	values := header.Values(WorkspaceIDHeader)
+	if len(values) == 0 {
+		return "", false, nil
+	}
+	if len(values) != 1 || values[0] == "" ||
+		strings.TrimSpace(values[0]) != values[0] {
+		return "", false, shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			"workspace settings header must contain one canonical opaque ID",
+		)
+	}
+	workspaceID, err := decodeID(values[0])
+	if err != nil || encodeID(workspaceID) != values[0] {
+		return "", false, shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			"workspace settings header must contain one canonical opaque ID",
+		)
+	}
+	return workspaceID, true, nil
 }
 
 func withEffectiveWorkspaceSettings(

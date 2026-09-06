@@ -32,6 +32,40 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
+func TestWorkspaceIDFromHeaderRequiresCanonicalSingleton(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		values  []string
+		want    shoal.ID
+		present bool
+		wantErr bool
+	}{
+		{name: "absent"},
+		{name: "canonical", values: []string{"YQ"}, want: "a", present: true},
+		{name: "noncanonical trailing bits", values: []string{"YR"}, wantErr: true},
+		{name: "padded", values: []string{"YQ=="}, wantErr: true},
+		{name: "whitespace", values: []string{" YQ"}, wantErr: true},
+		{name: "duplicate", values: []string{"YQ", "YQ"}, wantErr: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			header := make(http.Header)
+			for _, value := range test.values {
+				header.Add(WorkspaceIDHeader, value)
+			}
+			got, present, err := workspaceIDFromHeader(header)
+			if (err != nil) != test.wantErr {
+				t.Fatalf("error = %v, wantErr %v", err, test.wantErr)
+			}
+			if got != test.want || present != test.present {
+				t.Fatalf(
+					"workspace = %q, present = %v; want %q, %v",
+					got, present, test.want, test.present,
+				)
+			}
+		})
+	}
+}
+
 func TestPublicIngestErrorPreservesIndeterminateCommit(t *testing.T) {
 	original := explorer.MarkIndeterminateCommit(
 		shoal.NewError(shoal.ErrorUnavailable, "private storage detail"))
