@@ -506,39 +506,35 @@ func TestFoldRetryAdoptsCommittedRecordAfterSourceChange(t *testing.T) {
 			}
 			summaryDigest := interaction.Digest(
 				"fold source change " + test.name)
-			fold := interaction.Fold{
-				Members: []interaction.FoldMember{{
-					SessionID: session.ID,
-					RetrievedNodeIDs: []shoal.ID{
-						view.Root.Spans[0].ID,
-					},
-					Visibility: []string{"open"},
-				}},
+			write := corpus.writeRecord
+			foldWrites := 0
+			var accepted persistedFold
+			corpus.interactionRecordWriter = func(
+				row []byte, kind byte, value any,
+			) error {
+				if fold, ok := value.(persistedFold); ok &&
+					!fold.Deleted {
+					foldWrites++
+					if foldWrites > 1 {
+						return errors.New("unexpected second fold write")
+					}
+					accepted = fold
+					if err := write(row, kind, value); err != nil {
+						return err
+					}
+					return errors.New("simulated committed fold error")
+				}
+				return write(row, kind, value)
+			}
+			if _, err := corpus.FoldInteractions(ctx, FoldRequest{
+				SessionIDs:    []shoal.ID{session.ID},
 				SummaryDigest: summaryDigest,
-				FoldedAt:      time.Unix(1700000100, 0).UTC(),
+			}); err == nil {
+				t.Fatalf("initial fold error = %v", err)
 			}
-			subgraph, err := fold.Subgraph(
-				corpus.visibilityResolverLocked())
-			if err != nil {
-				t.Fatal(err)
-			}
-			canonical, err := fold.Canonical()
-			if err != nil {
-				t.Fatal(err)
-			}
-			record := persistedFold{
-				FoldID: subgraph.ID, Members: canonical.Members,
-				SummaryDigest: canonical.SummaryDigest,
-				Nodes:         subgraph.Nodes, Edges: subgraph.Edges,
-				Visibility: interaction.Expression(subgraph.Visibility),
-				FoldedAt:   fold.FoldedAt,
-			}
-			if err := corpus.writeRecord(
-				foldRecordRow(record.FoldID),
-				embeddedRecordFold,
-				record,
-			); err != nil {
-				t.Fatal(err)
+			if accepted.FoldID == "" || foldWrites != 1 {
+				t.Fatalf("accepted fold = %+v, writes = %d",
+					accepted, foldWrites)
 			}
 			test.change(t, corpus, source, session.ID)
 			result, err := corpus.FoldInteractions(ctx, FoldRequest{
@@ -549,8 +545,9 @@ func TestFoldRetryAdoptsCommittedRecordAfterSourceChange(t *testing.T) {
 				t.Fatalf("committed fold retry was not adopted: %v", err)
 			}
 			if result.Created ||
-				!result.FoldedAt.Equal(record.FoldedAt) ||
-				result.Visibility != record.Visibility {
+				!result.FoldedAt.Equal(accepted.FoldedAt) ||
+				result.Visibility != accepted.Visibility ||
+				foldWrites != 1 {
 				t.Fatalf("reconciled fold result = %+v", result)
 			}
 		})
