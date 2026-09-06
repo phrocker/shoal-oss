@@ -30,6 +30,7 @@ import (
 	"math"
 	"reflect"
 	"sort"
+	"time"
 
 	rankkernel "github.com/phrocker/shoal-oss/internal/graphrank"
 	"github.com/phrocker/shoal-oss/pkg/explorer"
@@ -202,8 +203,9 @@ type PageRankSummary struct {
 
 // RecordingStatus is the integration seam for the shared interaction recorder.
 type RecordingStatus struct {
-	Recorded bool `json:"recorded"`
-	Required bool `json:"required"`
+	Recorded      bool     `json:"recorded"`
+	Required      bool     `json:"required"`
+	InteractionID shoal.ID `json:"-"`
 }
 
 // Result contains deterministic analytics over one complete authorized scope.
@@ -224,6 +226,8 @@ type Materialization struct {
 	AuthorizationFingerprint auth.Fingerprint          `json:"-"`
 	PolicyGeneration         int64                     `json:"-"`
 	SelectedOntology         ontology.OntologyIdentity `json:"-"`
+	RequestID                shoal.ID                  `json:"-"`
+	AuthorizationExpiresAt   time.Time                 `json:"-"`
 	Complete                 bool                      `json:"-"`
 }
 
@@ -238,9 +242,24 @@ type Materializer interface {
 	RevalidateAnalytics(context.Context, Materialization) error
 }
 
-// Recorder is the future shared interaction-recording integration point.
+// Recorder durably captures the complete authorized analytics evidence before
+// a required-recording service may return success.
 type Recorder interface {
-	RecordAnalytics(context.Context, Request, Result) error
+	RecordAnalytics(context.Context, Record) (RecordingReceipt, error)
+}
+
+// Record carries the complete authorized materialization to the recorder.
+// Transports never serialize this value.
+type Record struct {
+	Request         Request
+	Result          Result
+	Materialization Materialization
+}
+
+// RecordingReceipt identifies the exact durable interaction accepted by the
+// shared recorder.
+type RecordingReceipt struct {
+	InteractionID shoal.ID
 }
 
 // Config constructs a bounded analytics service.
@@ -445,7 +464,8 @@ func ValidateResult(request Request, result Result, limits Limits) error {
 	}
 	if len(covered) != len(result.Nodes) ||
 		componentEdges != uint64(scope.EdgeCount) ||
-		(result.Recording.Required && !result.Recording.Recorded) {
+		(result.Recording.Required && !result.Recording.Recorded) ||
+		result.Recording.Recorded != (result.Recording.InteractionID != "") {
 		return shoal.NewError(
 			shoal.ErrorInternal, "analytics response is incomplete")
 	}
@@ -507,15 +527,34 @@ func (s *Service) Run(ctx context.Context, request Request) (Result, error) {
 		return Result{}, err
 	}
 	if !isNil(s.recorder) {
-		recorded := result
-		recorded.Recording.Recorded = true
-		if err := s.recorder.RecordAnalytics(ctx, normalized, recorded); err != nil {
+		receipt, err := s.recorder.RecordAnalytics(ctx, Record{
+			Request: normalized, Result: result,
+			Materialization: materialization,
+		})
+		if err != nil {
 			return Result{}, shoal.WrapError(
 				shoal.ErrorUnavailable, "record analytics result", err)
 		}
+		if err := shoal.ValidateRequiredID(
+			"analytics interaction ID", receipt.InteractionID,
+		); err != nil {
+			return Result{}, explorer.MarkIndeterminateCommit(
+				shoal.NewError(
+					shoal.ErrorUnavailable,
+					"analytics recorder returned no durable interaction identity",
+				),
+			)
+		}
 		result.Recording.Recorded = true
+		result.Recording.InteractionID = receipt.InteractionID
 		if err := s.source.RevalidateAnalytics(ctx, materialization); err != nil {
-			return Result{}, err
+			return Result{}, explorer.MarkIndeterminateCommit(
+				shoal.WrapError(
+					shoal.ErrorUnavailable,
+					"analytics result was recorded but authorization revalidation failed",
+					err,
+				),
+			)
 		}
 	}
 	return result, nil

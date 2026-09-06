@@ -78,7 +78,8 @@ func buildApplication(
 			"RequestID are bound for each tools/call, but stdio cannot " +
 			"independently authenticate remote callers; a future HTTP transport " +
 			"is required for independently authenticated per-call remote callers. " +
-			"Tool-call recording is not implemented.",
+			"shoal.analytics requires durable interaction recording before success; " +
+			"other stdio tool-call recording is not implemented.",
 		ContextBudgetBytes: config.contextBudgetBytes,
 		ToolCallsPerMinute: config.toolCallsPerMinute,
 	})

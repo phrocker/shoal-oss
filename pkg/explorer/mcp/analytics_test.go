@@ -35,7 +35,8 @@ import (
 func TestAnalyticsOptionalToolAdvertisesAndInvokesOnlyWithLimits(t *testing.T) {
 	limits := analytics.DefaultLimits()
 	service := &analyticsMCPService{
-		stubService: &stubService{}, limits: limits, available: true,
+		stubService: &stubService{}, limits: limits,
+		available: true, recording: true,
 	}
 	provider, err := NewAnalyticsTool(service, limits)
 	if err != nil {
@@ -111,7 +112,8 @@ func TestAnalyticsOptionalToolRejectsUnavailableOrMismatchedLimits(t *testing.T)
 		t.Fatalf("unavailable limits error = %v", err)
 	}
 	available := &analyticsMCPService{
-		stubService: &stubService{}, limits: limits, available: true,
+		stubService: &stubService{}, limits: limits,
+		available: true, recording: true,
 	}
 	mismatch := limits
 	mismatch.MaxEdges--
@@ -120,6 +122,14 @@ func TestAnalyticsOptionalToolRejectsUnavailableOrMismatchedLimits(t *testing.T)
 	) {
 		t.Fatalf("mismatched limits error = %v", err)
 	}
+	unrecorded := &analyticsMCPService{
+		stubService: &stubService{}, limits: limits, available: true,
+	}
+	if _, err := NewAnalyticsTool(unrecorded, limits); !shoal.IsErrorCode(
+		err, shoal.ErrorInvalidArgument,
+	) {
+		t.Fatalf("unrecorded provider error = %v", err)
+	}
 }
 
 type analyticsMCPService struct {
@@ -127,11 +137,16 @@ type analyticsMCPService struct {
 	resolver  auth.Resolver
 	limits    analytics.Limits
 	available bool
+	recording bool
 	calls     int
 }
 
 func (s *analyticsMCPService) AnalyticsLimits() (analytics.Limits, bool) {
 	return s.limits, s.available
+}
+
+func (s *analyticsMCPService) AnalyticsRecordingRequired() bool {
+	return s.recording
 }
 
 func (s *analyticsMCPService) Analytics(
@@ -167,6 +182,10 @@ func (s *analyticsMCPService) Analytics(
 				DampingFactor:        analytics.DefaultDampingFactor,
 				ConvergenceTolerance: analytics.DefaultConvergenceTolerance,
 				MaxIterations:        analytics.DefaultMaxIterations, Converged: true,
+			},
+			Recording: analytics.RecordingStatus{
+				Recorded: true, Required: true,
+				InteractionID: "interaction-mcp",
 			},
 		},
 	}, nil

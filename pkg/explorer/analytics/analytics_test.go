@@ -19,6 +19,7 @@ package analytics
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"reflect"
@@ -313,6 +314,40 @@ func TestServiceReportsUnresolvedOntologySemantics(t *testing.T) {
 	}
 }
 
+func TestServicePreservesIndeterminateRecordingFailure(t *testing.T) {
+	var fingerprint auth.Fingerprint
+	fingerprint[0] = 1
+	source := &staticMaterializer{materialization: Materialization{
+		Neighborhood: explorer.Neighborhood{
+			Nodes: []graph.Node{{ID: "node"}},
+		},
+		AuthorizationFingerprint: fingerprint,
+		PolicyGeneration:         1,
+		Complete:                 true,
+	}}
+	failure := errors.New("unknown durable outcome")
+	service, err := NewService(Config{
+		Source: source, Limits: DefaultLimits(),
+		Recorder: recorderStub(func(
+			context.Context,
+			Record,
+		) (RecordingReceipt, error) {
+			return RecordingReceipt{},
+				explorer.MarkIndeterminateCommit(failure)
+		}),
+		RequireRecording: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = service.Run(context.Background(), boundedRequest("node"))
+	if !explorer.IsIndeterminateCommit(err) ||
+		!shoal.IsErrorCode(err, shoal.ErrorUnavailable) ||
+		!errors.Is(err, failure) {
+		t.Fatalf("recording failure = %v", err)
+	}
+}
+
 func boundedRequest(nodeID shoal.ID) Request {
 	return Request{Scope: Scope{
 		NodeIDs: []shoal.ID{nodeID}, Depth: 1,
@@ -325,6 +360,18 @@ func boundedRequest(nodeID shoal.ID) Request {
 type staticMaterializer struct {
 	materialization Materialization
 	revalidations   int
+}
+
+type recorderStub func(
+	context.Context,
+	Record,
+) (RecordingReceipt, error)
+
+func (f recorderStub) RecordAnalytics(
+	ctx context.Context,
+	record Record,
+) (RecordingReceipt, error) {
+	return f(ctx, record)
 }
 
 func (s *staticMaterializer) MaterializeAnalytics(

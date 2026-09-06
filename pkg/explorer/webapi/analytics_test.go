@@ -90,7 +90,8 @@ func TestAnalyticsRouteUsesHostAndAuthenticationGuards(t *testing.T) {
 		t.Fatalf("analytics response = %d %s, calls=%d",
 			response.Code, response.Body.String(), service.calls)
 	}
-	if !strings.Contains(response.Body.String(), `"recorded":false`) ||
+	if !strings.Contains(response.Body.String(), `"recorded":true`) ||
+		!strings.Contains(response.Body.String(), `"interaction_id"`) ||
 		strings.Contains(response.Body.String(), `"Recorded"`) {
 		t.Fatalf("analytics response schema = %s", response.Body.String())
 	}
@@ -184,7 +185,9 @@ func TestAnalyticsResponseWireRoundTripsOpaqueIDs(t *testing.T) {
 				MaxIterations:        analytics.DefaultMaxIterations,
 				Iterations:           1, Converged: true,
 			},
-			Recording: analytics.RecordingStatus{Recorded: false, Required: false},
+			Recording: analytics.RecordingStatus{
+				Recorded: true, Required: true, InteractionID: opaque,
+			},
 		},
 	}
 	encoded, err := json.Marshal(response)
@@ -203,14 +206,61 @@ func TestAnalyticsResponseWireRoundTripsOpaqueIDs(t *testing.T) {
 	}
 }
 
+func TestEmbeddedAnalyticsIsUnavailableWithoutRequiredRecorderSink(t *testing.T) {
+	base, err := explorer.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = base.Close() })
+	service, err := webapi.NewEmbeddedService(&recordlessAnalyticsClient{
+		BoundedClient: base,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if service.AnalyticsAvailable() {
+		t.Fatal("analytics advertised without a durable interaction sink")
+	}
+	metadata, err := service.Capabilities(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if metadata.Analytics {
+		t.Fatal("analytics capability was true without a durable recorder")
+	}
+}
+
 type analyticsRouteService struct {
 	gateStubService
 	resolver auth.Resolver
 	calls    int
 }
 
+type recordlessAnalyticsClient struct {
+	explorer.BoundedClient
+}
+
+func (*recordlessAnalyticsClient) MaterializeAnalytics(
+	context.Context,
+	explorer.BoundedNeighborhoodRequest,
+	uint32,
+) (analytics.Materialization, error) {
+	return analytics.Materialization{}, nil
+}
+
+func (*recordlessAnalyticsClient) RevalidateAnalytics(
+	context.Context,
+	analytics.Materialization,
+) error {
+	return nil
+}
+
 func (s *analyticsRouteService) AnalyticsLimits() (analytics.Limits, bool) {
 	return analytics.DefaultLimits(), true
+}
+
+func (*analyticsRouteService) AnalyticsRecordingRequired() bool {
+	return true
 }
 
 func (s *analyticsRouteService) Analytics(
@@ -247,6 +297,10 @@ func (s *analyticsRouteService) Analytics(
 				DampingFactor:        analytics.DefaultDampingFactor,
 				ConvergenceTolerance: analytics.DefaultConvergenceTolerance,
 				MaxIterations:        analytics.DefaultMaxIterations, Converged: true,
+			},
+			Recording: analytics.RecordingStatus{
+				Recorded: true, Required: true,
+				InteractionID: "interaction-route",
 			},
 		},
 	}, nil

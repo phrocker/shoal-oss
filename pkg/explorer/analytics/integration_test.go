@@ -20,7 +20,11 @@ package analytics_test
 import (
 	"bytes"
 	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -29,7 +33,10 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/explorer/analytics"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/explorer/authorized"
+	"github.com/phrocker/shoal-oss/pkg/explorer/mcp"
+	"github.com/phrocker/shoal-oss/pkg/explorer/webapi"
 	"github.com/phrocker/shoal-oss/pkg/graph"
+	"github.com/phrocker/shoal-oss/pkg/interaction"
 	"github.com/phrocker/shoal-oss/pkg/ontology"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
@@ -232,8 +239,349 @@ func TestAuthorizedAnalyticsRecordingSeamIsExplicit(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !result.Recording.Recorded || !result.Recording.Required ||
-		recorder.calls != 1 || !recorder.recorded.Recording.Recorded {
+		result.Recording.InteractionID != "interaction-test" ||
+		recorder.calls != 1 ||
+		len(recorder.recorded.Materialization.Neighborhood.Nodes) == 0 {
 		t.Fatalf("recording status = %#v, recorder = %#v", result.Recording, recorder)
+	}
+}
+
+func TestEmbeddedAnalyticsDurablyRecordsCompleteAuthorizedEvidence(t *testing.T) {
+	fixture := newAnalyticsFixture(t)
+	a1 := fixture.ingest(t, fixture.clientA, "memory://a1", "alpha")
+	a2 := fixture.ingest(t, fixture.clientA, "memory://a2", "bravo")
+	a3 := fixture.ingest(t, fixture.clientA, "memory://a3", "charlie")
+	fixture.connect(t, fixture.clientA, "edge-a1-a2", a1, a2)
+	fixture.connect(t, fixture.clientB, "edge-a2-a3", a2, a3)
+	schema, err := ontology.NewOntologySchema("analytics", "Analytics", "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, err := ontology.NewOntologyVersion(
+		schema, "1", fixture.now, nil, nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lens, _ := ontology.NewOntologyIdentity(version)
+	decision, err := auth.NewDecision(auth.DecisionConfig{
+		Subject: "analytics-subject", Actor: "analytics-actor",
+		ClientID:              "analytics-client",
+		OnBehalfOf:            []shoal.ID{"fleet"},
+		AuthorizationDomain:   fixture.domain,
+		AllowedOperations:     []auth.Operation{auth.OperationAnalyticsRead},
+		PermittedSourceIDs:    [][]byte{fixture.sourceA, fixture.sourceB},
+		PermittedPolicyIDs:    [][]byte{fixture.policyA, fixture.policyB},
+		PolicyGeneration:      1,
+		AuthenticationExpires: fixture.now.Add(time.Hour),
+		RequestID:             "analytics-request",
+		AuditPurpose:          "rank authorized incident evidence",
+		SelectedOntology:      lens,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	service, err := webapi.NewEmbeddedService(fixture.clientA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !service.AnalyticsAvailable() {
+		t.Fatal("embedded analytics was advertised without its required recorder")
+	}
+	request := analyticsRequest(a1)
+	wireRequest := webapi.AnalyticsRequest{
+		Scope: request.Scope, PageRank: request.PageRank,
+	}
+	body, err := json.Marshal(wireRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler, err := webapi.NewAuthenticatedHandler(
+		service,
+		webapi.AuthenticatorFunc(func(*http.Request) (auth.Decision, error) {
+			return decision, nil
+		}),
+		fixture.authority.Binder(),
+		"workspace.test",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	httpRequest := httptest.NewRequest(
+		http.MethodPost,
+		"http://workspace.test/api/v1/analytics",
+		bytes.NewReader(body),
+	)
+	httpRequest.Host = "workspace.test"
+	httpRequest.Header.Set("Content-Type", "application/json")
+	httpResponse := httptest.NewRecorder()
+	handler.ServeHTTP(httpResponse, httpRequest)
+	if httpResponse.Code != http.StatusOK {
+		t.Fatalf("analytics HTTP status = %d: %s",
+			httpResponse.Code, httpResponse.Body.String())
+	}
+	var response webapi.AnalyticsResponse
+	if err := json.Unmarshal(httpResponse.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if !response.Analytics.Recording.Recorded ||
+		!response.Analytics.Recording.Required ||
+		response.Analytics.Recording.InteractionID == "" {
+		t.Fatalf("recording status = %#v", response.Analytics.Recording)
+	}
+	recorded, err := fixture.base.Interaction(
+		context.Background(), response.Analytics.Recording.InteractionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recorded.Operation != interaction.OperationToolCall ||
+		recorded.Actor.SubjectID != decision.Subject() ||
+		recorded.Actor.ActorID != decision.Actor() ||
+		recorded.Actor.ClientID != decision.ClientID() ||
+		!reflect.DeepEqual(recorded.Actor.OnBehalfOf, decision.OnBehalfOf()) ||
+		recorded.Reason.Code != "audit_purpose" ||
+		recorded.Reason.Digest != interaction.Digest(decision.AuditPurpose()) ||
+		recorded.AuthorizationExpiresAt != decision.AuthenticationExpires() ||
+		recorded.OntologySchemaID != lens.SchemaID() ||
+		recorded.OntologyVersionID != lens.VersionID() {
+		t.Fatalf("trusted interaction metadata = %+v", recorded)
+	}
+	if len(recorded.Turns) != 1 || recorded.Turns[0].ToolCall == nil ||
+		len(recorded.Turns[0].ToolCall.RetrievedNodeIDs) != 3 ||
+		len(recorded.Turns[0].ToolCall.RetrievedEdges) != 2 ||
+		len(recorded.TouchedEdgeIDs()) != 2 {
+		t.Fatalf("recorded evidence = %+v", recorded)
+	}
+	nodePolicy, err := auth.NewPolicy(auth.PolicyConfig{
+		AuthorizationDomain: fixture.domain,
+		SourceID:            fixture.sourceA, GrantPolicyID: fixture.policyA, Epoch: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	edgePolicy, err := auth.NewPolicy(auth.PolicyConfig{
+		AuthorizationDomain: fixture.domain,
+		SourceID:            fixture.sourceB, GrantPolicyID: fixture.policyB, Epoch: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	expectedVisibility, err := auth.ConjoinPolicies(nodePolicy, edgePolicy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if interaction.Expression(recorded.RequiredVisibility) !=
+		string(expectedVisibility) {
+		t.Fatalf("record visibility = %q, want %q",
+			interaction.Expression(recorded.RequiredVisibility),
+			expectedVisibility)
+	}
+	subgraph, err := fixture.base.InteractionSubgraph(
+		context.Background(), recorded.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sessionVisibility string
+	for _, node := range subgraph.Nodes {
+		if node.Kind == interaction.KindSession {
+			sessionVisibility = node.Properties[interaction.PropertyVisibility]
+			break
+		}
+	}
+	if sessionVisibility != string(expectedVisibility) {
+		t.Fatalf("persisted visibility = %q, want %q",
+			sessionVisibility, expectedVisibility)
+	}
+	if err := fixture.base.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := explorer.Open(fixture.corpusDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = reopened.Close() })
+	recovered, err := reopened.Interaction(context.Background(), recorded.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(
+		recovered.Turns[0].ToolCall.RetrievedEdges,
+		recorded.Turns[0].ToolCall.RetrievedEdges,
+	) ||
+		!reflect.DeepEqual(
+			recovered.RequiredVisibility, recorded.RequiredVisibility,
+		) ||
+		recovered.OntologySchemaID != recorded.OntologySchemaID ||
+		recovered.OntologyVersionID != recorded.OntologyVersionID {
+		t.Fatalf("recovered interaction evidence = %+v", recovered)
+	}
+}
+
+func TestMCPAnalyticsDurablyRecordsBeforeSuccess(t *testing.T) {
+	fixture := newAnalyticsFixture(t)
+	seed := fixture.ingest(t, fixture.clientA, "memory://a1", "alpha")
+	service, err := webapi.NewEmbeddedService(fixture.clientA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	limits, available := service.AnalyticsLimits()
+	if !available {
+		t.Fatal("embedded analytics recorder is unavailable")
+	}
+	tool, err := mcp.NewAnalyticsTool(service, limits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decision, err := auth.NewDecision(auth.DecisionConfig{
+		Subject: "mcp-subject", Actor: "mcp-actor",
+		AuthorizationDomain:   fixture.domain,
+		AllowedOperations:     []auth.Operation{auth.OperationAnalyticsRead},
+		PermittedSourceIDs:    [][]byte{fixture.sourceA},
+		PermittedPolicyIDs:    [][]byte{fixture.policyA},
+		PolicyGeneration:      1,
+		AuthenticationExpires: fixture.now.Add(time.Hour),
+		RequestID:             "mcp-template-request",
+		AuditPurpose:          "analyze authorized workspace",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server, err := mcp.NewServer(mcp.Config{
+		Service: service, Authority: fixture.authority,
+		Decisions: mcp.DecisionProviderFunc(func(
+			context.Context,
+		) (auth.Decision, error) {
+			return decision, nil
+		}),
+		OptionalTools: []mcp.OptionalToolProvider{tool},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	arguments, err := json.Marshal(webapi.AnalyticsRequest{
+		Scope: analyticsRequest(seed).Scope,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	call, err := json.Marshal(mcp.CallToolParams{
+		Name: mcp.ToolAnalytics, Arguments: arguments,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	input := strings.Join([]string{
+		`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"` +
+			mcp.ProtocolVersion +
+			`","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}`,
+		`{"jsonrpc":"2.0","method":"notifications/initialized"}`,
+		`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":` +
+			string(call) + `}`,
+	}, "\n") + "\n"
+	var output bytes.Buffer
+	if err := server.Serve(
+		context.Background(), strings.NewReader(input), &output,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(output.String(), `"recorded":true`) ||
+		!strings.Contains(output.String(), `"interaction_id"`) {
+		t.Fatalf("MCP analytics did not return a durable receipt: %s", output.String())
+	}
+	summaries, err := fixture.base.Interactions(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(summaries) != 1 {
+		t.Fatalf("recorded MCP interactions = %+v", summaries)
+	}
+}
+
+func TestAnalyticsInteractionSinkReauthorizesExactEdgeEvidence(t *testing.T) {
+	fixture := newAnalyticsFixture(t)
+	from := fixture.ingest(t, fixture.clientA, "memory://a1", "alpha")
+	to := fixture.ingest(t, fixture.clientA, "memory://a2", "bravo")
+	exact := graph.Edge{
+		ID: "edge-a1-a2", From: from, To: to, Type: "related", Weight: 1,
+	}
+	if err := fixture.clientA.Connect(fixture.adminContext(t), exact); err != nil {
+		t.Fatal(err)
+	}
+	decision, err := auth.NewDecision(auth.DecisionConfig{
+		Subject: "analytics-subject", Actor: "analytics-actor",
+		AuthorizationDomain:   fixture.domain,
+		AllowedOperations:     []auth.Operation{auth.OperationAnalyticsRead},
+		PermittedSourceIDs:    [][]byte{fixture.sourceA},
+		PermittedPolicyIDs:    [][]byte{fixture.policyA},
+		PolicyGeneration:      1,
+		AuthenticationExpires: fixture.now.Add(time.Hour),
+		RequestID:             "analytics-edge-request",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, err := fixture.authority.Binder().Bind(context.Background(), decision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	materialized, err := fixture.clientA.MaterializeAnalytics(
+		ctx,
+		explorer.BoundedNeighborhoodRequest{
+			NodeIDs: []shoal.ID{from}, Depth: 1, Fanout: 4,
+			MaxNodes: 4, MaxScannedEdges: 16,
+			EdgeTypes: []string{"related"},
+			Direction: explorer.GraphDirectionOutgoing,
+		},
+		4,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fingerprint, err := auth.AuthorizationFingerprint(decision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sink := fixture.clientA.AnalyticsInteractionSink()
+	if sink == nil {
+		t.Fatal("analytics interaction sink is unavailable")
+	}
+	recorder, err := interaction.NewRecorder(context.Background(), sink)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := interaction.Session{
+		ID:                       "analytics-edge-session",
+		RecordedAt:               fixture.now.Add(time.Minute),
+		Operation:                interaction.OperationToolCall,
+		SnapshotID:               "analytics-edge-snapshot",
+		SnapshotAsOf:             materialized.Snapshot.AsOf,
+		AuthorizationFingerprint: shoal.ID(fingerprint.String()),
+		AuthorizationExpiresAt:   decision.AuthenticationExpires(),
+		Turns: []interaction.Turn{{
+			Index: 0,
+			ToolCall: &interaction.ToolCall{
+				Kind:             "analytics",
+				RetrievedNodeIDs: []shoal.ID{from, to},
+				RetrievedNodes:   materialized.Neighborhood.Nodes,
+				RetrievedEdges: []graph.Edge{{
+					ID: exact.ID, From: exact.From, To: exact.To,
+					Type: "altered", Weight: exact.Weight,
+				}},
+			},
+		}},
+	}
+	if _, err := recorder.Record(ctx, session); !shoal.IsErrorCode(
+		err, shoal.ErrorNotFound,
+	) {
+		t.Fatalf("altered edge evidence error = %v", err)
+	}
+	session.Turns[0].ToolCall.RetrievedEdges = []graph.Edge{exact}
+	recorded, err := recorder.Record(ctx, session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(recorded.TouchedEdgeIDs()) != 1 ||
+		recorded.TouchedEdgeIDs()[0] != exact.ID {
+		t.Fatalf("recorded exact edges = %v", recorded.TouchedEdgeIDs())
 	}
 }
 
@@ -242,11 +590,10 @@ func TestAuthorizedAnalyticsRevalidatesGenerationAfterRecording(t *testing.T) {
 	seed := fixture.ingest(t, fixture.clientA, "memory://a1", "alpha")
 	recorder := recorderFunc(func(
 		context.Context,
-		analytics.Request,
-		analytics.Result,
-	) error {
+		analytics.Record,
+	) (analytics.RecordingReceipt, error) {
 		fixture.generations.Set(fixture.domain, 2)
-		return nil
+		return analytics.RecordingReceipt{InteractionID: "interaction-test"}, nil
 	})
 	service, err := analytics.NewService(analytics.Config{
 		Source: fixture.clientA, Limits: analytics.DefaultLimits(),
@@ -260,8 +607,70 @@ func TestAuthorizedAnalyticsRevalidatesGenerationAfterRecording(t *testing.T) {
 			t, "alice", fixture.sourceA, fixture.policyA, ontology.OntologyIdentity{}),
 		analyticsRequest(seed),
 	)
-	if !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
+	if !shoal.IsErrorCode(err, shoal.ErrorUnavailable) ||
+		!explorer.IsIndeterminateCommit(err) {
 		t.Fatalf("generation change after recording error = %v", err)
+	}
+}
+
+func TestAuthorizedInteractionSinkMarksPostWriteRevocationIndeterminate(t *testing.T) {
+	fixture := newAnalyticsFixture(t)
+	seed := fixture.ingest(t, fixture.clientA, "memory://a1", "alpha")
+	selector, err := authorized.NewStaticPolicySelector(
+		fixture.sourceA, fixture.policyA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, err := authorized.NewClient(authorized.Config{
+		Base: &generationChangingRecordBase{
+			Explorer: fixture.base, generations: fixture.generations,
+			domain: fixture.domain,
+		},
+		Resolver:       fixture.authority.Resolver(),
+		PolicySelector: selector, PolicyStore: fixture.store,
+		GenerationReader: fixture.generations,
+		Clock:            func() time.Time { return fixture.now },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sink := client.AnalyticsInteractionSink()
+	if sink == nil {
+		t.Fatal("analytics interaction sink is unavailable")
+	}
+	shared, err := interaction.NewRecorder(context.Background(), sink)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder, err := analytics.NewInteractionRecorder(
+		shared, func() time.Time { return fixture.now.Add(time.Minute) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	service, err := analytics.NewService(analytics.Config{
+		Source: client, Limits: analytics.DefaultLimits(),
+		Recorder: recorder, RequireRecording: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = service.Run(
+		fixture.readContext(
+			t, "alice", fixture.sourceA, fixture.policyA,
+			ontology.OntologyIdentity{},
+		),
+		analyticsRequest(seed),
+	)
+	if !explorer.IsIndeterminateCommit(err) ||
+		!shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
+		t.Fatalf("post-write generation error = %v", err)
+	}
+	summaries, readErr := fixture.base.Interactions(context.Background())
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if len(summaries) != 1 {
+		t.Fatalf("durably recorded interactions = %+v", summaries)
 	}
 }
 
@@ -314,6 +723,7 @@ func TestAuthorizedAnalyticsRechecksGenerationAfterOntologyLens(t *testing.T) {
 
 type analyticsFixture struct {
 	now         time.Time
+	corpusDir   string
 	base        *explorer.Explorer
 	store       *authorized.MemoryPolicyStore
 	authority   *auth.Authority
@@ -329,23 +739,42 @@ type analyticsFixture struct {
 
 type analyticsRecorder struct {
 	calls    int
-	recorded analytics.Result
+	recorded analytics.Record
 }
 
-type recorderFunc func(context.Context, analytics.Request, analytics.Result) error
+type recorderFunc func(
+	context.Context,
+	analytics.Record,
+) (analytics.RecordingReceipt, error)
 
 func (f recorderFunc) RecordAnalytics(
 	ctx context.Context,
-	request analytics.Request,
-	result analytics.Result,
-) error {
-	return f(ctx, request, result)
+	record analytics.Record,
+) (analytics.RecordingReceipt, error) {
+	return f(ctx, record)
 }
 
 type generationChangingLensBase struct {
 	*explorer.Explorer
 	generations *analyticsGenerationReader
 	domain      []byte
+}
+
+type generationChangingRecordBase struct {
+	*explorer.Explorer
+	generations *analyticsGenerationReader
+	domain      []byte
+}
+
+func (b *generationChangingRecordBase) RecordInteractionResult(
+	ctx context.Context,
+	session interaction.Session,
+) (interaction.Session, error) {
+	recorded, err := b.Explorer.RecordInteractionResult(ctx, session)
+	if err == nil {
+		b.generations.Set(b.domain, 2)
+	}
+	return recorded, err
 }
 
 func (b *generationChangingLensBase) InterpretAssertions(
@@ -359,31 +788,32 @@ func (b *generationChangingLensBase) InterpretAssertions(
 
 func (r *analyticsRecorder) RecordAnalytics(
 	ctx context.Context,
-	_ analytics.Request,
-	result analytics.Result,
-) error {
+	record analytics.Record,
+) (analytics.RecordingReceipt, error) {
 	if err := ctx.Err(); err != nil {
-		return err
+		return analytics.RecordingReceipt{}, err
 	}
 	r.calls++
-	r.recorded = result
-	return nil
+	r.recorded = record
+	return analytics.RecordingReceipt{InteractionID: "interaction-test"}, nil
 }
 
 func newAnalyticsFixture(t *testing.T) *analyticsFixture {
 	t.Helper()
-	now := time.Date(2026, time.September, 5, 18, 0, 0, 0, time.UTC)
+	now := time.Now().UTC().Truncate(time.Second)
 	authority, err := auth.NewAuthorityWithClock(func() time.Time { return now })
 	if err != nil {
 		t.Fatal(err)
 	}
-	base, err := explorer.Open(t.TempDir())
+	corpusDir := t.TempDir()
+	base, err := explorer.Open(corpusDir)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = base.Close() })
 	fixture := &analyticsFixture{
-		now: now, base: base, store: authorized.NewMemoryPolicyStore(),
+		now: now, corpusDir: corpusDir, base: base,
+		store:     authorized.NewMemoryPolicyStore(),
 		authority: authority,
 		generations: &analyticsGenerationReader{
 			values: make(map[string]int64),

@@ -57,6 +57,14 @@ fingerprint and analytics snapshot. Unresolved assertion interpretations remain
 explicit in scope metadata with their reading and reason; they are never
 silently presented as resolved.
 
-Analytics results are not currently claimed as interaction records.
-`analytics.Recorder` is the integration seam, and callers may construct the
-service with required recording so a recording failure fails the request.
+The shipped embedded HTTP and stdio MCP providers require the shared durable
+`interaction.ResultSink`. They are unavailable when no sink is installed and
+never return a successful analytics result until the interaction is durably
+captured. The record retains every materialized node and exact source edge,
+the selected ontology, authorization fingerprint and expiry, and trusted
+actor/delegation/reason metadata. Its visibility is the conjunction of the
+current workspace policies for every recorded node and edge. A failure after
+the durable write is returned with indeterminate-commit semantics.
+
+Recording reauthorizes the evidence with `analytics_read`; an analytics-only
+identity is not required to hold the unrelated `retrieve` operation.
