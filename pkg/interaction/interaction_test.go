@@ -56,6 +56,7 @@ func TestSessionRetainsExactEdgeEvidenceAndRequiredVisibility(t *testing.T) {
 		Type: "related", Weight: 1,
 		Properties: shoal.Metadata{"source": "exact"},
 	}
+
 	session := interaction.Session{
 		ID: "session-edge-evidence",
 		RecordedAt: time.Date(
@@ -117,6 +118,46 @@ func TestSessionRetainsExactEdgeEvidenceAndRequiredVisibility(t *testing.T) {
 		if strings.Contains(value, string(sourceEdge.ID)) {
 			t.Fatal("raw source edge ID leaked into graph metadata")
 		}
+	}
+}
+
+func TestCanonicalEvidenceDistinguishesMissingEmptyProperties(t *testing.T) {
+	session := interaction.Session{
+		ID: "session-conflicting-empty-properties",
+		RecordedAt: time.Date(
+			2026, time.September, 6, 12, 0, 0, 0, time.UTC),
+		Turns: []interaction.Turn{{
+			Index: 0,
+			ToolCall: &interaction.ToolCall{
+				Kind: "analytics",
+				RetrievedNodes: []graph.Node{
+					{ID: "node", Kind: "document", Properties: shoal.Metadata{"a": ""}},
+					{ID: "node", Kind: "document", Properties: shoal.Metadata{"b": ""}},
+				},
+			},
+		}},
+	}
+	if _, err := session.Canonical(); !shoal.IsErrorCode(
+		err, shoal.ErrorInvalidArgument,
+	) {
+		t.Fatalf("conflicting node properties = %v", err)
+	}
+
+	session.Turns[0].ToolCall.RetrievedNodes = nil
+	session.Turns[0].ToolCall.RetrievedEdges = []graph.Edge{
+		{
+			ID: "edge", From: "from", To: "to", Type: "related",
+			Properties: shoal.Metadata{"a": ""},
+		},
+		{
+			ID: "edge", From: "from", To: "to", Type: "related",
+			Properties: shoal.Metadata{"b": ""},
+		},
+	}
+	if _, err := session.Canonical(); !shoal.IsErrorCode(
+		err, shoal.ErrorInvalidArgument,
+	) {
+		t.Fatalf("conflicting edge properties = %v", err)
 	}
 }
 

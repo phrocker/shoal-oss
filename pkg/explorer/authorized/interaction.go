@@ -274,7 +274,8 @@ func (c *Client) InteractionRecords(
 		hasExactEvidence := len(interactionSourceEdges(record.Session)) != 0
 		for _, turn := range record.Session.Turns {
 			if turn.ToolCall != nil &&
-				len(turn.ToolCall.RetrievedAssertions) != 0 {
+				(len(turn.ToolCall.RetrievedNodes) != 0 ||
+					len(turn.ToolCall.RetrievedAssertions) != 0) {
 				hasExactEvidence = true
 				break
 			}
@@ -454,6 +455,19 @@ func (c *Client) authorizeInteractionEvidence(
 			shoal.ErrorInvalidArgument,
 			"analytics interaction requires complete graph evidence",
 		)
+	}
+	for _, turn := range session.Turns {
+		if turn.ToolCall != nil &&
+			(len(turn.ToolCall.RetrievedNodes) != 0 ||
+				len(turn.ToolCall.RetrievedAssertions) != 0) {
+			return nil, shoal.NewError(
+				shoal.ErrorInvalidArgument,
+				"exact node and assertion evidence requires an analytics interaction",
+			)
+		}
+	}
+	if err := validateInteractionSourceEdges(session); err != nil {
+		return nil, err
 	}
 	nodeIDs := session.TouchedNodeIDs()
 	registrations, err := c.resolveNodes(ctx, nodeIDs)
@@ -934,6 +948,28 @@ func interactionSourceEdges(session interaction.Session) []graph.Edge {
 		result = append(result, edge)
 	}
 	return result
+}
+
+func validateInteractionSourceEdges(session interaction.Session) error {
+	edges := append([]graph.Edge(nil), session.CitedEdges...)
+	for _, turn := range session.Turns {
+		if turn.ToolCall != nil {
+			edges = append(edges, turn.ToolCall.RetrievedEdges...)
+		}
+	}
+	sort.Slice(edges, func(i, j int) bool {
+		return shoal.CompareID(edges[i].ID, edges[j].ID) < 0
+	})
+	for index := 1; index < len(edges); index++ {
+		if edges[index-1].ID == edges[index].ID &&
+			!graphEdgesEqual(edges[index-1], edges[index]) {
+			return shoal.NewError(
+				shoal.ErrorInvalidArgument,
+				"interaction source edge ID has conflicting values",
+			)
+		}
+	}
+	return nil
 }
 
 func accessRuleVisibility(rule AccessRule) ([]string, error) {

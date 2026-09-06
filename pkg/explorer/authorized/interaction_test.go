@@ -28,6 +28,7 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/explorer/authorized"
+	"github.com/phrocker/shoal-oss/pkg/graph"
 	"github.com/phrocker/shoal-oss/pkg/interaction"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
@@ -35,6 +36,68 @@ import (
 type generationChangingInteractionBase struct {
 	*explorer.Explorer
 	after func()
+}
+
+func TestNonAnalyticsInteractionRejectsUnverifiedExactEvidence(t *testing.T) {
+	f := newFixture(t)
+	snapshot, err := f.base.Snapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	decision := f.decision(
+		t, "recorder", [][]byte{f.sourceA}, [][]byte{f.policyA},
+		[]auth.Operation{auth.OperationRead, auth.OperationRetrieve},
+	)
+	fingerprint, err := auth.AuthorizationFingerprint(decision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := interaction.Session{
+		RecordedAt:               f.clock.Now(),
+		SnapshotID:               shoal.ID(snapshot.ID),
+		SnapshotAsOf:             snapshot.AsOf,
+		AuthorizationFingerprint: shoal.ID(fingerprint.String()),
+		AuthorizationExpiresAt:   decision.AuthenticationExpires(),
+	}
+	ctx := f.context(t, decision)
+
+	withNode := base
+	withNode.ID = "session-exact-node"
+	withNode.Turns = []interaction.Turn{{
+		Index: 0,
+		ToolCall: &interaction.ToolCall{
+			Kind: "retrieve",
+			RetrievedNodes: []graph.Node{{
+				ID: "fabricated", Kind: "document",
+			}},
+		},
+	}}
+	if err := f.clientA.RecordInteraction(
+		ctx, withNode,
+	); !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
+		t.Fatalf("non-analytics exact node record = %v", err)
+	}
+
+	first := graph.Edge{
+		ID: "edge", From: "from", To: "to", Type: "related",
+		Properties: shoal.Metadata{"source": "first"},
+	}
+	second := first
+	second.Properties = shoal.Metadata{"source": "second"}
+	withConflict := base
+	withConflict.ID = "session-conflicting-edge"
+	withConflict.CitedEdges = []graph.Edge{first}
+	withConflict.Turns = []interaction.Turn{{
+		Index: 0,
+		ToolCall: &interaction.ToolCall{
+			Kind: "retrieve", RetrievedEdges: []graph.Edge{second},
+		},
+	}}
+	if err := f.clientA.RecordInteraction(
+		ctx, withConflict,
+	); !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
+		t.Fatalf("conflicting exact edge record = %v", err)
+	}
 }
 
 func (b *generationChangingInteractionBase) RecordInteractionResult(
