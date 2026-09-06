@@ -264,6 +264,11 @@ func TestIndeterminateOntologyMutationBlocksFurtherWritesUntilReopen(t *testing.
 		); !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
 			t.Fatalf("mutation state after indeterminate mutation = %v", err)
 		}
+		if _, err := corpus.PublishedOntologyCatalog(
+			context.Background(), base,
+		); !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
+			t.Fatalf("catalog after indeterminate mutation = %v", err)
+		}
 		selected, _ := ontology.NewOntologyIdentity(target)
 		if _, err := corpus.InterpretAssertions(
 			context.Background(), nil, selected,
@@ -301,6 +306,11 @@ func TestIndeterminateOntologyMutationBlocksFurtherWritesUntilReopen(t *testing.
 		); !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
 			t.Fatalf("mutation state after indeterminate transition = %v", err)
 		}
+		if _, err := corpus.PublishedOntologyCatalog(
+			context.Background(), base,
+		); !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
+			t.Fatalf("catalog after indeterminate transition = %v", err)
+		}
 		selected, _ := ontology.NewOntologyIdentity(target)
 		if _, err := corpus.InterpretAssertions(
 			context.Background(), nil, selected,
@@ -331,6 +341,11 @@ func TestIndeterminateOntologyMutationBlocksFurtherWritesUntilReopen(t *testing.
 			context.Background(), base, proposal.ID())
 		if err != nil || !state.ProposalFound() {
 			t.Fatalf("mutation state after reopen = %#v, %v", state, err)
+		}
+		if _, err := corpus.PublishedOntologyCatalog(
+			context.Background(), base,
+		); err != nil {
+			t.Fatalf("catalog after reopen = %v", err)
 		}
 	})
 }

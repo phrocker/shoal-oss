@@ -183,6 +183,66 @@ func (c *Client) OntologyActiveState(
 	return active, nil
 }
 
+// PublishedOntologyCatalog exposes only the caller-authorized published
+// version chain needed by workspace settings. Proposal bodies remain protected
+// by OntologyProposals and its generic read permission.
+func (c *Client) PublishedOntologyCatalog(
+	ctx context.Context,
+	configured ontology.OntologyVersion,
+) (ontology.PublishedCatalog, error) {
+	store, err := c.ontologyProposalStore()
+	if err != nil {
+		return ontology.PublishedCatalog{}, err
+	}
+	decision, guard, now, operation, err := c.beginOneOf(
+		ctx,
+		auth.OperationWorkspaceSettingsRead,
+		auth.OperationWorkspaceSettingsWrite,
+	)
+	if err != nil {
+		return ontology.PublishedCatalog{}, err
+	}
+	proposals, err := store.OntologyProposals(ctx)
+	if err != nil {
+		return ontology.PublishedCatalog{}, directBaseError(err)
+	}
+	if len(proposals) > int(explorer.MaxOntologyProposals) {
+		return ontology.PublishedCatalog{}, shoal.NewError(
+			shoal.ErrorUnavailable, "ontology proposals exceed the corpus bound")
+	}
+	catalog, err := explorer.NewPublishedOntologyCatalog(configured, proposals)
+	if err != nil {
+		return ontology.PublishedCatalog{}, err
+	}
+	versions := catalog.Versions()
+	reachable := make(map[shoal.ID]shoal.ID, len(versions)-1)
+	for index := 1; index < len(versions); index++ {
+		reachable[versions[index-1].ID()] = versions[index].ID()
+	}
+	for _, proposal := range proposals {
+		if proposal.State() != ontology.ProposalPublished ||
+			proposal.Schema().ID() != configured.Schema().ID() {
+			continue
+		}
+		baseID, hasBase := proposal.BaseVersionID()
+		if !hasBase || reachable[baseID] != proposal.ProposedVersion().ID() {
+			continue
+		}
+		allowed, err := c.ontologyProposalEvidenceAllows(
+			ctx, proposal, decision, operation, now)
+		if err != nil {
+			return ontology.PublishedCatalog{}, err
+		}
+		if !allowed {
+			return ontology.PublishedCatalog{}, auth.ObjectNotFound()
+		}
+	}
+	if err := guard.Check(ctx); err != nil {
+		return ontology.PublishedCatalog{}, err
+	}
+	return catalog, nil
+}
+
 func (c *Client) TransitionOntologyProposal(
 	ctx context.Context,
 	proposalID shoal.ID,

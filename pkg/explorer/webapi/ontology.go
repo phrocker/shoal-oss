@@ -47,8 +47,10 @@ type ActiveOntologyProvider interface {
 }
 
 // OntologyCatalogProvider exposes the canonical governed choice set and its
-// durable active tip. Callers must still apply their own authorization policy;
-// the catalog prevents them from duplicating publication-chain/CAS semantics.
+// durable active tip. Authorized backends enforce catalog access before this
+// method returns; callers still enforce issuer-selected-lens constraints. The
+// catalog prevents either layer from duplicating publication-chain/CAS
+// semantics.
 type OntologyCatalogProvider interface {
 	OntologyCatalog(context.Context) (ontology.PublishedCatalog, bool, error)
 }
@@ -247,33 +249,25 @@ func (s *EmbeddedService) OntologyCatalog(
 	}
 	configured := *s.ontologyVersion
 	s.ontologyMu.RUnlock()
-	store, ok := s.client.(interface {
-		OntologyProposals(context.Context) ([]ontology.GovernedProposal, error)
-	})
-	if !ok {
-		catalog, err := boundedOntologyCatalog(configured, nil)
+	if provider, ok := s.client.(explorer.PublishedOntologyCatalogProvider); ok {
+		catalog, err := provider.PublishedOntologyCatalog(ctx, configured)
 		return catalog, true, err
 	}
-	proposals, err := store.OntologyProposals(ctx)
-	if err != nil {
-		return ontology.PublishedCatalog{}, false, err
+	if _, exposesRawProposals := s.client.(ontologyProposalReadClient); exposesRawProposals {
+		return ontology.PublishedCatalog{}, false, shoal.NewError(
+			shoal.ErrorUnavailable,
+			"workspace capability \"published ontology catalog\" is unavailable",
+		)
 	}
-	catalog, err := boundedOntologyCatalog(configured, proposals)
-	if err != nil {
-		return ontology.PublishedCatalog{}, false, err
-	}
-	return catalog, true, nil
+	catalog, err := boundedOntologyCatalog(configured, nil)
+	return catalog, true, err
 }
 
 func boundedOntologyCatalog(
 	configured ontology.OntologyVersion,
 	proposals []ontology.GovernedProposal,
 ) (ontology.PublishedCatalog, error) {
-	if len(proposals) > int(MaxOntologyProposals) {
-		return ontology.PublishedCatalog{}, ontologyBoundError(
-			"proposal", len(proposals), MaxOntologyProposals)
-	}
-	return ontology.NewPublishedCatalog(configured, proposals)
+	return explorer.NewPublishedOntologyCatalog(configured, proposals)
 }
 
 func replayPublishedOntology(

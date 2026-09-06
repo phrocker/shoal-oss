@@ -69,6 +69,14 @@ type OntologyActiveStateProvider interface {
 	) (ontology.OntologyVersion, error)
 }
 
+// PublishedOntologyCatalogProvider returns the bounded published ontology
+// history rooted at a configured version without exposing proposal bodies.
+type PublishedOntologyCatalogProvider interface {
+	PublishedOntologyCatalog(
+		context.Context, ontology.OntologyVersion,
+	) (ontology.PublishedCatalog, error)
+}
+
 // OntologyProposalEvidenceProvider returns only the immutable evidence needed
 // to authorize a requested proposal mutation.
 type OntologyProposalEvidenceProvider interface {
@@ -291,7 +299,7 @@ func (e *Explorer) OntologyProposalMutationState(
 				proposal.BaseVersionID()
 		}
 	}
-	catalog, err := ontology.NewPublishedCatalog(configured, proposals)
+	catalog, err := NewPublishedOntologyCatalog(configured, proposals)
 	if err != nil {
 		return OntologyProposalMutationState{}, err
 	}
@@ -310,6 +318,51 @@ func (e *Explorer) OntologyActiveState(
 		return ontology.OntologyVersion{}, err
 	}
 	return state.Active(), nil
+}
+
+// PublishedOntologyCatalog returns the bounded durable published history
+// without exposing proposal authors, rationale, metadata, or evidence.
+func (e *Explorer) PublishedOntologyCatalog(
+	ctx context.Context,
+	configured ontology.OntologyVersion,
+) (ontology.PublishedCatalog, error) {
+	if err := contextError(ctx); err != nil {
+		return ontology.PublishedCatalog{}, err
+	}
+	if err := configured.Validate(); err != nil {
+		return ontology.PublishedCatalog{}, err
+	}
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	if err := e.requireOpen(); err != nil {
+		return ontology.PublishedCatalog{}, err
+	}
+	if err := e.requireCertainOntologyMutationLocked(); err != nil {
+		return ontology.PublishedCatalog{}, err
+	}
+	proposals := make([]ontology.GovernedProposal, 0, len(e.ontologyProposals))
+	for _, record := range e.ontologyProposals {
+		proposal, err := record.proposal()
+		if err != nil {
+			return ontology.PublishedCatalog{}, shoal.WrapError(
+				shoal.ErrorInternal, "stored ontology proposal is invalid", err)
+		}
+		proposals = append(proposals, proposal)
+	}
+	return NewPublishedOntologyCatalog(configured, proposals)
+}
+
+// NewPublishedOntologyCatalog applies the corpus proposal bound before
+// delegating all publication-chain semantics to ontology.NewPublishedCatalog.
+func NewPublishedOntologyCatalog(
+	configured ontology.OntologyVersion,
+	proposals []ontology.GovernedProposal,
+) (ontology.PublishedCatalog, error) {
+	if len(proposals) > int(MaxOntologyProposals) {
+		return ontology.PublishedCatalog{}, shoal.NewError(
+			shoal.ErrorUnavailable, "ontology proposals exceed the corpus bound")
+	}
+	return ontology.NewPublishedCatalog(configured, proposals)
 }
 
 // OntologyProposalEvidence returns independent evidence values for one

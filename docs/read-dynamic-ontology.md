@@ -76,6 +76,12 @@ selection are intentionally tracked separately and are not claimed here.
   without proposal bodies. Extraction uses the ingest-authorized mutation
   state, while selectable proposal/catalog views apply read and evidence
   authorization independently.
+- `explorer.PublishedOntologyCatalogProvider` exposes the bounded canonical
+  published chain without proposal bodies. The authorized implementation
+  accepts only workspace-settings read or write authority, checks current
+  evidence object policies for every reachable transition, and rechecks the
+  policy generation before returning. Raw proposal reads remain protected by
+  `OperationRead`.
 - `webapi.NeighborhoodResponse.OntologyInterpretations` and
   `webapi.PathResponse.OntologyInterpretations` expose effective and original
   identities, safety-path IDs, and unresolved reasons.
