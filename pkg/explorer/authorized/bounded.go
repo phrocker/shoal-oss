@@ -335,8 +335,9 @@ func (c *Client) BoundedNeighborhood(
 const maxAuthorizedBoundedScanPages = 1024
 
 const (
-	derivedAssertionPropertyAssertionID  = "ontology.assertion.id"
-	derivedAssertionPropertyDerivationID = "ontology.assertion.derivation.id"
+	derivedAssertionPropertyAssertionID     = "ontology.assertion.id"
+	derivedAssertionPropertyDerivationID    = "ontology.assertion.derivation.id"
+	derivedAssertionPropertyDerivationScore = "ontology.assertion.derivation.score"
 )
 
 func authorizedCursorEligible(normalized explorer.NeighborhoodRequest) bool {

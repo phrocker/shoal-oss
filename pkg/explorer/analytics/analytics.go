@@ -354,6 +354,12 @@ func ValidateResult(request Request, result Result, limits Limits) error {
 			return shoal.NewError(
 				shoal.ErrorInternal, "analytics response ontology is invalid")
 		}
+	} else if scope.ResolvedAssertionCount != 0 ||
+		len(scope.UnresolvedAssertions) != 0 {
+		return shoal.NewError(
+			shoal.ErrorInternal,
+			"analytics response assertion metadata requires an ontology",
+		)
 	}
 	seenUnresolved := make(map[shoal.ID]struct{}, len(scope.UnresolvedAssertions))
 	for index, unresolved := range scope.UnresolvedAssertions {
