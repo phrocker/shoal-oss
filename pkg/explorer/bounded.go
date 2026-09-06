@@ -22,7 +22,6 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
-	"encoding/json"
 	"math"
 	"sort"
 	"time"
@@ -538,30 +537,41 @@ func (e *Explorer) setLatestSnapshotState(
 	e.latestSnapshotEdgeDigests = edges
 }
 
+// snapshotObjectDigest binds a graph object to the frontier that observed it.
+// IDs and metadata are opaque byte strings, so the digest hashes raw
+// length-prefixed bytes: a JSON encoding would silently fold every distinct
+// invalid UTF-8 byte onto U+FFFD and let a mutated node or edge endpoint keep
+// the digest it had in the pinned snapshot.
 func snapshotObjectDigest(value any) (string, error) {
+	hash := sha256.New()
 	switch object := value.(type) {
 	case graph.Node:
-		object.Labels = append([]string(nil), object.Labels...)
-		sort.Strings(object.Labels)
-		if len(object.Labels) == 0 {
-			object.Labels = nil
+		writeSnapshotString(hash, "node")
+		writeSnapshotString(hash, string(object.ID))
+		writeSnapshotString(hash, object.Kind)
+		labels := append([]string(nil), object.Labels...)
+		sort.Strings(labels)
+		writeSnapshotCount(hash, len(labels))
+		for _, label := range labels {
+			writeSnapshotString(hash, label)
 		}
-		if len(object.Properties) == 0 {
-			object.Properties = nil
-		}
-		value = object
+		writeSnapshotMetadata(hash, object.Properties)
 	case graph.Edge:
-		if len(object.Properties) == 0 {
-			object.Properties = nil
-		}
-		value = object
+		writeSnapshotString(hash, "edge")
+		writeSnapshotString(hash, string(object.ID))
+		writeSnapshotString(hash, string(object.From))
+		writeSnapshotString(hash, string(object.To))
+		writeSnapshotString(hash, object.Type)
+		var weight [8]byte
+		binary.BigEndian.PutUint64(
+			weight[:], math.Float64bits(float64(object.Weight)))
+		_, _ = hash.Write(weight[:])
+		writeSnapshotMetadata(hash, object.Properties)
+	default:
+		return "", shoal.NewError(
+			shoal.ErrorInternal, "unknown snapshot object")
 	}
-	encoded, err := json.Marshal(value)
-	if err != nil {
-		return "", err
-	}
-	sum := sha256.Sum256(encoded)
-	return hex.EncodeToString(sum[:]), nil
+	return hex.EncodeToString(hash.Sum(nil)), nil
 }
 
 // BoundedNeighborhood expands the cached adjacency index without scanning or

@@ -652,3 +652,49 @@ func TestInteractionRetryCancellationRemainsCommitted(t *testing.T) {
 		t.Fatalf("reconciled session = %+v, want %+v", retried, first)
 	}
 }
+
+// TestSnapshotObjectDigestSeparatesOpaqueBytes pins that the snapshot binding
+// digest distinguishes graph objects whose opaque IDs, endpoints, or metadata
+// differ only in bytes that a JSON encoding would fold onto U+FFFD.
+func TestSnapshotObjectDigestSeparatesOpaqueBytes(t *testing.T) {
+	pinnedEdge := graph.Edge{
+		ID: "edge", From: "from", To: shoal.ID([]byte{0xFF}), Type: "cites",
+	}
+	mutatedEdge := pinnedEdge
+	mutatedEdge.To = shoal.ID([]byte{0xFE})
+	pinned, err := snapshotObjectDigest(pinnedEdge)
+	if err != nil {
+		t.Fatalf("digest pinned edge: %v", err)
+	}
+	mutated, err := snapshotObjectDigest(mutatedEdge)
+	if err != nil {
+		t.Fatalf("digest mutated edge: %v", err)
+	}
+	if pinned == mutated {
+		t.Fatal("mutated edge endpoint kept its pinned snapshot digest")
+	}
+	pinnedNode := graph.Node{
+		ID:         "node",
+		Kind:       "entity",
+		Properties: shoal.Metadata{"p": string([]byte{0xFF, 'A'})},
+	}
+	mutatedNode := graph.Node{
+		ID:         "node",
+		Kind:       "entity",
+		Properties: shoal.Metadata{"p": string([]byte{0x80, 'A'})},
+	}
+	pinned, err = snapshotObjectDigest(pinnedNode)
+	if err != nil {
+		t.Fatalf("digest pinned node: %v", err)
+	}
+	mutated, err = snapshotObjectDigest(mutatedNode)
+	if err != nil {
+		t.Fatalf("digest mutated node: %v", err)
+	}
+	if pinned == mutated {
+		t.Fatal("mutated node metadata kept its pinned snapshot digest")
+	}
+	if _, err := snapshotObjectDigest("unsupported"); err == nil {
+		t.Fatal("expected an error for an unknown snapshot object")
+	}
+}
