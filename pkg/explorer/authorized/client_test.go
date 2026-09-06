@@ -100,6 +100,7 @@ func (r *generationReader) SetError(err error) {
 }
 
 type fixture struct {
+	dataDir   string
 	base      *explorer.Explorer
 	store     *authorized.MemoryPolicyStore
 	clock     *fakeClock
@@ -122,12 +123,14 @@ func newFixture(t *testing.T) *fixture {
 	if err != nil {
 		t.Fatal(err)
 	}
-	base, err := explorer.Open(t.TempDir())
+	dataDir := t.TempDir()
+	base, err := explorer.Open(dataDir)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = base.Close() })
 	f := &fixture{
+		dataDir:   dataDir,
 		base:      base,
 		store:     authorized.NewMemoryPolicyStore(),
 		clock:     clock,
@@ -160,6 +163,9 @@ func (f *fixture) newClient(
 	client, err := authorized.NewClient(authorized.Config{
 		Base:               base,
 		VectorScorer:       trustedVectorScorer(base),
+		InteractionWriter:  trustedInteractionWriter(base),
+		InteractionReader:  trustedInteractionReader(base),
+		SnapshotValidator:  trustedSnapshotValidator(base),
 		Resolver:           f.authority.Resolver(),
 		PolicySelector:     selector,
 		EdgePolicySelector: edgeSelector,
@@ -176,6 +182,21 @@ func (f *fixture) newClient(
 func trustedVectorScorer(base explorer.Client) authorized.VectorScorer {
 	scorer, _ := base.(authorized.VectorScorer)
 	return scorer
+}
+
+func trustedInteractionReader(base explorer.Client) explorer.InteractionReader {
+	reader, _ := base.(explorer.InteractionReader)
+	return reader
+}
+
+func trustedInteractionWriter(base explorer.Client) explorer.InteractionWriter {
+	writer, _ := base.(explorer.InteractionWriter)
+	return writer
+}
+
+func trustedSnapshotValidator(base explorer.Client) authorized.SnapshotValidator {
+	validator, _ := base.(authorized.SnapshotValidator)
+	return validator
 }
 
 func (f *fixture) decision(
@@ -445,6 +466,66 @@ func TestAuthorizedVectorRetrievalProjection(t *testing.T) {
 		response.Results[0].Evidence[0].Citation.DocumentID != visible.Document.ID ||
 		response.RequestID != "" {
 		t.Fatalf("authorized vector retrieval = %#v", response)
+	}
+}
+
+func TestAuthorizedEmptyVectorRetrievalDoesNotProbeProvider(t *testing.T) {
+	f := newFixture(t)
+	base, err := explorer.OpenWithOptions(t.TempDir(), explorer.Options{
+		Embedder: model.FakeEmbedder{Model: "authorized-empty", Dimensions: 8},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = base.Close() })
+	clientB := f.newClient(t, base, f.store, f.sourceB, f.policyB, nil)
+	if _, err := clientB.Ingest(f.admin(t), explorer.Source{
+		URI:       "file:///hidden-vector-only.txt",
+		MediaType: explorer.MediaTypeText,
+		Content:   "hidden vector evidence",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	retrieveCalls := 0
+	untrusted := &hookClient{
+		Client: base,
+		retrieve: func(
+			context.Context, retrieval.Request,
+		) (retrieval.Response, error) {
+			retrieveCalls++
+			return retrieval.Response{}, errors.New(
+				"empty authorized retrieval reached the untrusted base")
+		},
+	}
+	selector, err := authorized.NewStaticPolicySelector(f.sourceA, f.policyA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scorer := &countingVectorScorer{VectorScorer: base}
+	clientA, err := authorized.NewClient(authorized.Config{
+		Base: untrusted, VectorScorer: scorer,
+		Resolver: f.authority.Resolver(), PolicySelector: selector,
+		PolicyStore: f.store, GenerationReader: f.reader, Clock: f.clock.Now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := clientA.Retrieve(f.alice(t), retrieval.Request{
+		Text:  "hidden vector evidence",
+		TopK:  1,
+		Modes: []retrieval.Mode{retrieval.ModeVector},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(response.Results) != 0 {
+		t.Fatalf("authorized empty vector response = %+v", response)
+	}
+	if scorer.calls != 0 {
+		t.Fatalf("trusted vector scorer calls = %d, want 0", scorer.calls)
+	}
+	if retrieveCalls != 0 {
+		t.Fatalf("untrusted base retrieval calls = %d", retrieveCalls)
 	}
 }
 

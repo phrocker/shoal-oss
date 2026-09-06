@@ -77,7 +77,7 @@ func seedProvenanceCorpus(t *testing.T) (string, shoal.ID) {
 	if span == "" {
 		t.Fatal("ingest produced no span node")
 	}
-	for index, id := range []shoal.ID{"session-cli-one", "session-cli-two"} {
+	for index, id := range []shoal.ID{"interaction.session_cli-one", "interaction.session_cli-two"} {
 		if err := corpus.RecordInteraction(
 			context.Background(), interaction.Session{
 				ID:           id,
@@ -100,7 +100,7 @@ func TestFoldAndProvenanceCommands(t *testing.T) {
 	var output bytes.Buffer
 	if err := run(ctx, []string{
 		"fold", "-data", data,
-		"-session", "session-cli-one", "-session", "session-cli-two",
+		"-session", "interaction.session_cli-one", "-session", "interaction.session_cli-two",
 		"-summary-digest", interaction.Digest("a summary held out of band"),
 	}, &output); err != nil {
 		t.Fatal(err)
@@ -153,7 +153,7 @@ func TestFoldAndProvenanceCommands(t *testing.T) {
 
 	output.Reset()
 	if err := run(ctx, []string{
-		"provenance", "-data", data, "-interaction", "session-cli-one",
+		"provenance", "-data", data, "-interaction", "interaction.session_cli-one",
 	}, &output); err != nil {
 		t.Fatal(err)
 	}
@@ -175,7 +175,7 @@ func TestProvenanceRefusesDerivedNode(t *testing.T) {
 
 	var output bytes.Buffer
 	if err := run(ctx, []string{
-		"fold", "-data", data, "-session", "session-cli-one",
+		"fold", "-data", data, "-session", "interaction.session_cli-one",
 	}, &output); err != nil {
 		t.Fatal(err)
 	}
@@ -191,7 +191,7 @@ func TestProvenanceRefusesDerivedNode(t *testing.T) {
 	}
 	if err := run(ctx, []string{
 		"provenance", "-data", data,
-		"-node", "span-x", "-interaction", "session-cli-one",
+		"-node", "span-x", "-interaction", "interaction.session_cli-one",
 	}, &output); err == nil {
 		t.Fatal("expected -node with -interaction to be refused")
 	}

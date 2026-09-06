@@ -31,8 +31,30 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/graph"
+	"github.com/phrocker/shoal-oss/pkg/interaction"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
+
+// SnapshotValidator verifies corpus frontiers pinned into interaction records.
+type SnapshotValidator interface {
+	ValidateSnapshot(
+		context.Context, shoal.ID, time.Time, []shoal.ID,
+	) error
+}
+
+// EvidenceSnapshotValidator additionally binds exact source edges to the
+// pinned corpus frontier.
+type EvidenceSnapshotValidator interface {
+	SnapshotValidator
+	ValidateEvidenceSnapshot(
+		context.Context,
+		shoal.ID,
+		time.Time,
+		[]shoal.ID,
+		[]shoal.ID,
+		[]interaction.EvidenceReference,
+	) error
+}
 
 // Config supplies the trusted dependencies for an authorization-enforcing
 // Explorer client.
@@ -42,6 +64,18 @@ type Config struct {
 	// vector retrieval validation. It is intentionally separate from Base:
 	// Base responses are treated as untrusted and validated canonically.
 	VectorScorer VectorScorer
+	// InteractionWriter is the explicitly trusted durable sink for
+	// interaction records. It is separate from Base because Base responses
+	// and mutation acknowledgements are not authorization evidence.
+	InteractionWriter explorer.InteractionWriter
+	// InteractionReader is the explicitly trusted source for durable
+	// interaction envelopes. It is intentionally separate from Base because
+	// authorization decisions for derived views depend on the stored source
+	// set and authorization fingerprint.
+	InteractionReader explorer.InteractionReader
+	// SnapshotValidator is the explicitly trusted verifier for historical
+	// corpus frontiers pinned into interaction records.
+	SnapshotValidator SnapshotValidator
 	// OntologyInterpreter is an optional explicitly trusted read-time
 	// interpreter. It is separate from Base because Base graph responses are
 	// untrusted and must never be allowed to inject interpretations.
@@ -66,6 +100,9 @@ type Config struct {
 
 // Client enforces trusted-context authorization around an Explorer client.
 type Client struct {
+	interactionSink     explorer.InteractionWriter
+	interactionSource   explorer.InteractionReader
+	snapshotValidator   SnapshotValidator
 	base                explorer.Client
 	vectorScorer        VectorScorer
 	ontologyInterpreter explorer.OntologyInterpreter
@@ -111,6 +148,17 @@ func NewClient(config Config) (*Client, error) {
 	if config.Clock == nil {
 		return nil, dependencyRequired("clock")
 	}
+	hasInteractionWriter := !isNilDependency(config.InteractionWriter)
+	hasInteractionReader := !isNilDependency(config.InteractionReader)
+	hasSnapshotValidator := !isNilDependency(config.SnapshotValidator)
+	if hasInteractionWriter &&
+		(!hasInteractionReader || !hasSnapshotValidator) {
+		return nil, dependencyRequired(
+			"trusted interaction writer, reader, and snapshot validator")
+	}
+	if hasSnapshotValidator && !hasInteractionWriter {
+		return nil, dependencyRequired("trusted interaction writer")
+	}
 	edgeSelector := config.EdgePolicySelector
 	if isNilDependency(edgeSelector) {
 		var ok bool
@@ -131,6 +179,9 @@ func NewClient(config Config) (*Client, error) {
 		}
 	}
 	return &Client{
+		interactionSink:     config.InteractionWriter,
+		interactionSource:   config.InteractionReader,
+		snapshotValidator:   config.SnapshotValidator,
 		base:                config.Base,
 		vectorScorer:        config.VectorScorer,
 		ontologyInterpreter: config.OntologyInterpreter,
@@ -480,6 +531,49 @@ func (c *Client) begin(
 		return auth.Decision{}, auth.GenerationGuard{}, time.Time{}, err
 	}
 	return decision, guard, now, nil
+}
+
+// beginAny authorizes a setup-time operation that is not tied to one specific
+// operation. It still requires a live, in-domain credential and a policy
+// generation guard, but accepts any operation the decision itself grants, so
+// an action-only grant is not rejected the way pinning setup to Retrieve
+// would reject it. A decision that grants nothing is denied.
+func (c *Client) beginAny(ctx context.Context) (auth.GenerationGuard, error) {
+	if err := contextFailure(ctx); err != nil {
+		return auth.GenerationGuard{}, err
+	}
+	decision, err := c.resolver.Resolve(ctx)
+	if err != nil {
+		return auth.GenerationGuard{}, resolverFailure(ctx, err)
+	}
+	now := c.clock()
+	if now.IsZero() {
+		return auth.GenerationGuard{}, authorizationDenied()
+	}
+	request := auth.ResourceRequest{
+		AuthorizationDomain: decision.AuthorizationDomain(),
+	}
+	granted := false
+	for _, operation := range decision.AllowedOperations() {
+		if err := decision.Authorize(operation, request, now); err == nil {
+			granted = true
+			break
+		}
+	}
+	if !granted {
+		if contextErr := contextFailure(ctx); contextErr != nil {
+			return auth.GenerationGuard{}, contextErr
+		}
+		return auth.GenerationGuard{}, authorizationDenied()
+	}
+	guard, err := auth.NewGenerationGuard(decision, c.generationReader)
+	if err != nil {
+		return auth.GenerationGuard{}, authorizationDenied()
+	}
+	if err := guard.Check(ctx); err != nil {
+		return auth.GenerationGuard{}, err
+	}
+	return guard, nil
 }
 
 func (c *Client) selectIngestRule(

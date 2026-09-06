@@ -19,7 +19,11 @@
 
 package explorer
 
-import "errors"
+import (
+	"errors"
+
+	"github.com/phrocker/shoal-oss/pkg/interaction"
+)
 
 type indeterminateCommitError struct {
 	cause error
@@ -48,4 +52,34 @@ func MarkIndeterminateCommit(err error) error {
 func IsIndeterminateCommit(err error) bool {
 	var marked *indeterminateCommitError
 	return errors.As(err, &marked)
+}
+
+type committedInteractionError struct {
+	cause error
+}
+
+func (e *committedInteractionError) Error() string {
+	return e.cause.Error()
+}
+
+func (e *committedInteractionError) Unwrap() error {
+	return e.cause
+}
+
+// MarkCommittedInteraction marks a post-commit failure: the interaction is
+// durable even though a later authorization/generation check prevented the
+// caller from receiving success. Callers must not retry the same stable ID as
+// though the write rolled back.
+func MarkCommittedInteraction(err error) error {
+	if err == nil || IsCommittedInteraction(err) {
+		return err
+	}
+	return interaction.MarkCommittedRecord(err)
+}
+
+// IsCommittedInteraction reports whether an error occurred after the durable
+// interaction write completed.
+func IsCommittedInteraction(err error) bool {
+	var marked *committedInteractionError
+	return errors.As(err, &marked) || interaction.IsCommittedRecord(err)
 }

@@ -31,20 +31,64 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/document"
 	"github.com/phrocker/shoal-oss/pkg/graph"
 	"github.com/phrocker/shoal-oss/pkg/inference"
+	"github.com/phrocker/shoal-oss/pkg/interaction"
 	"github.com/phrocker/shoal-oss/pkg/ontology"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
 var fixedTime = time.Date(2026, 8, 28, 12, 0, 0, 0, time.UTC)
 
+func TestMergeEmbeddingSpacesIsCanonical(t *testing.T) {
+	pack, _, _ := fixture(t)
+	left, err := interaction.NewEmbeddingSpaceSet([]string{"space-b"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	right, err := interaction.NewEmbeddingSpaceSet(
+		[]string{"space-a", "space-b"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	merged, err := mergeEmbeddingSpaces(left, right)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(merged.Identities) != 2 ||
+		merged.Identities[0] != "space-a" ||
+		merged.Identities[1] != "space-b" ||
+		merged.Digest == "" {
+		t.Fatalf("merged embedding spaces = %+v", merged)
+	}
+	_ = pack
+}
+
+func TestToolResultRejectsNoncanonicalEmbeddingSpaces(t *testing.T) {
+	pack, _, _ := fixture(t)
+	if _, err := NewToolResultWithEmbeddingSpaces(
+		"retrieve", ActionRetrieve, nil,
+		pack.Snapshot(), pack.Authorization(),
+		interaction.EmbeddingSpaceSet{
+			Identities: []string{"space-a"},
+			Digest:     "not-canonical",
+		},
+	); err == nil {
+		t.Fatal("noncanonical embedding space set was accepted")
+	}
+}
+
 func TestSuccessfulTraceAndCanonicalTranscript(t *testing.T) {
 	pack, initial, additions := fixture(t)
+	embeddingSpaces, err := interaction.NewEmbeddingSpaceSet(
+		[]string{"space-v3"})
+	if err != nil {
+		t.Fatal(err)
+	}
 	retrieve := mustRetrieve(t, "r1", "more evidence", 2)
 	open := mustOpen(t, "r2", "document", "section-initial")
 	neighbors := mustNeighbors(t, "r3", "node-a", 1, 2)
 	host := &fakeTools{pack: pack, results: map[shoal.ID][]inference.EvidenceAnchor{
 		"r1": {additions[0]}, "r2": {additions[1]}, "r3": {additions[2]},
-	}}
+	}, embeddingSpaces: embeddingSpaces}
 	runner := NewFakeRunner(
 		ScriptAction(retrieve), ScriptAction(open), ScriptAction(neighbors),
 		func(_ context.Context, transcript Transcript) (Action, error) {
@@ -76,6 +120,15 @@ func TestSuccessfulTraceAndCanonicalTranscript(t *testing.T) {
 	}
 	if record.Transcript.ID() == "" || record.Request.ID() == "" {
 		t.Fatal("missing canonical identity")
+	}
+	evaluation, err := evaluationRecord(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if evaluation.EmbeddingSpaces.Digest != embeddingSpaces.Digest ||
+		len(evaluation.EmbeddingSpaces.Identities) != 1 ||
+		evaluation.EmbeddingSpaces.Identities[0] != "space-v3" {
+		t.Fatalf("evaluation embedding spaces = %+v", evaluation.EmbeddingSpaces)
 	}
 
 	g2 := newGenerator(t, runner, host)
@@ -611,10 +664,11 @@ func TestConcurrentGeneration(t *testing.T) {
 }
 
 type fakeTools struct {
-	pack     inference.ContextPack
-	results  map[shoal.ID][]inference.EvidenceAnchor
-	mismatch bool
-	stale    bool
+	pack            inference.ContextPack
+	results         map[shoal.ID][]inference.EvidenceAnchor
+	embeddingSpaces interaction.EmbeddingSpaceSet
+	mismatch        bool
+	stale           bool
 }
 
 // captureRecorder is shared across goroutines by TestConcurrentGeneration,
@@ -685,7 +739,10 @@ func (f *fakeTools) make(id shoal.ID, kind ActionKind) (ToolResult, error) {
 	if f.stale {
 		snapshot, _ = inference.NewSnapshotPin("stale", snapshot.AsOf())
 	}
-	return NewToolResult(correlation, kind, f.results[id], snapshot, auth)
+	return NewToolResultWithEmbeddingSpaces(
+		correlation, kind, f.results[id], snapshot, auth,
+		f.embeddingSpaces,
+	)
 }
 
 func budgets() Budgets {

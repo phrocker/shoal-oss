@@ -258,6 +258,7 @@ func (r Response) ValidateFor(request Request) error {
 		return shoal.NewError(
 			shoal.ErrorInvalidArgument, "retrieval response exceeds normalized top_k")
 	}
+
 	seen := make(map[shoal.ID]struct{}, len(r.Results))
 	for index, result := range r.Results {
 		if err := shoal.ValidateRequiredID("retrieval result ID", result.ID); err != nil {

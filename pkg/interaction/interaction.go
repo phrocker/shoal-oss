@@ -55,6 +55,7 @@ const KindPrefix = "interaction."
 // Reserved interaction node kinds.
 const (
 	KindSession   = KindPrefix + "session"
+	KindInference = KindPrefix + "inference"
 	KindTurn      = KindPrefix + "turn"
 	KindToolCall  = KindPrefix + "tool_call"
 	KindTombstone = KindPrefix + "tombstone"
@@ -68,10 +69,11 @@ const EdgeTypePrefix = "interaction."
 // distinct: what the model was shown is a larger set than what it cited, and
 // visibility must be derived from everything it was shown.
 const (
-	EdgeHasTurn     = EdgeTypePrefix + "has_turn"
-	EdgeHasToolCall = EdgeTypePrefix + "has_tool_call"
-	EdgeRetrieved   = EdgeTypePrefix + "retrieved"
-	EdgeCited       = EdgeTypePrefix + "cited"
+	EdgeHasTurn      = EdgeTypePrefix + "has_turn"
+	EdgeHasInference = EdgeTypePrefix + "has_inference"
+	EdgeHasToolCall  = EdgeTypePrefix + "has_tool_call"
+	EdgeRetrieved    = EdgeTypePrefix + "retrieved"
+	EdgeCited        = EdgeTypePrefix + "cited"
 	// EdgeFolds points from a fold summary to a session it folds. It is what
 	// makes a fold rehydratable and what makes cross-session traversal
 	// possible without widening anything.
@@ -85,35 +87,58 @@ const (
 	// PropertyVisibility carries the canonical conjunction expression. It is
 	// also the key content ingestion uses to declare a source's visibility.
 	PropertyVisibility = "shoal.visibility"
+	// Derived nodes whose complete conjunction exceeds one graph metadata
+	// value carry its digest and term count in the graph. The full uncapped
+	// conjunction remains in the durable interaction envelope and explicit
+	// typed view.
+	PropertyVisibilityDigest = "interaction.visibility_digest"
+	PropertyVisibilityCount  = "interaction.visibility_count"
 
-	PropertySessionID     = "interaction.session_id"
-	PropertyTurnID        = "interaction.turn_id"
-	PropertyIndex         = "interaction.index"
-	PropertyDecision      = "interaction.decision"
-	PropertyToolKind      = "interaction.tool_kind"
-	PropertyRetrieved     = "interaction.retrieved_count"
-	PropertyCited         = "interaction.cited_count"
-	PropertyTurnCount     = "interaction.turn_count"
-	PropertyStopReason    = "interaction.stop_reason"
-	PropertyRecordedAt    = "interaction.recorded_at"
-	PropertyDeletedAt     = "interaction.deleted_at"
-	PropertyNodeCount     = "interaction.node_count"
-	PropertyEdgeCount     = "interaction.edge_count"
-	PropertyQueryDigest   = "interaction.query_digest"
-	PropertyRequestID     = "interaction.request_id"
-	PropertyContextPackID = "interaction.context_pack_id"
-	PropertyResultID      = "interaction.result_id"
-	PropertyInputTokens   = "interaction.input_tokens"
-	PropertyOutputTokens  = "interaction.output_tokens"
-	PropertyFailed        = "interaction.failed"
-	PropertyHarness       = "interaction.harness"
-	PropertyProvider      = "interaction.provider"
-	PropertyModel         = "interaction.model"
-	PropertyModelVersion  = "interaction.model_version"
-	PropertyPromptID      = "interaction.prompt_template_id"
-	PropertyPromptVersion = "interaction.prompt_version"
-	PropertyPromptHash    = "interaction.prompt_hash"
-	PropertyToolPolicy    = "interaction.tool_policy"
+	PropertySessionID       = "interaction.session_id"
+	PropertyInferenceID     = "interaction.inference_id"
+	PropertyTurnID          = "interaction.turn_id"
+	PropertyIndex           = "interaction.index"
+	PropertyDecision        = "interaction.decision"
+	PropertyToolKind        = "interaction.tool_kind"
+	PropertyRetrieved       = "interaction.retrieved_count"
+	PropertyCited           = "interaction.cited_count"
+	PropertyTurnCount       = "interaction.turn_count"
+	PropertyStopReason      = "interaction.stop_reason"
+	PropertyRecordedAt      = "interaction.recorded_at"
+	PropertyDeletedAt       = "interaction.deleted_at"
+	PropertyNodeCount       = "interaction.node_count"
+	PropertyEdgeCount       = "interaction.edge_count"
+	PropertyQueryDigest     = "interaction.query_digest"
+	PropertyRequestID       = "interaction.request_id"
+	PropertyContextPackID   = "interaction.context_pack_id"
+	PropertyResultID        = "interaction.result_id"
+	PropertyInputTokens     = "interaction.input_tokens"
+	PropertyOutputTokens    = "interaction.output_tokens"
+	PropertyFailed          = "interaction.failed"
+	PropertyHarness         = "interaction.harness"
+	PropertyProvider        = "interaction.provider"
+	PropertyModel           = "interaction.model"
+	PropertyModelVersion    = "interaction.model_version"
+	PropertyPromptID        = "interaction.prompt_template_id"
+	PropertyPromptVersion   = "interaction.prompt_version"
+	PropertyPromptHash      = "interaction.prompt_hash"
+	PropertyToolPolicy      = "interaction.tool_policy"
+	PropertySnapshotID      = "interaction.snapshot_id"
+	PropertySnapshotAsOf    = "interaction.snapshot_as_of"
+	PropertyAuthFingerprint = "interaction.authorization_fingerprint"
+	PropertyAuthExpiresAt   = "interaction.authorization_expires_at"
+	PropertyAuthOperation   = "interaction.authorization_operation"
+	PropertyEmbeddingSpace  = "interaction.embedding_space"
+	PropertyEmbeddingSpaces = "interaction.embedding_space_set_digest"
+	PropertyEmbeddingCount  = "interaction.embedding_space_count"
+	PropertyOperation       = "interaction.operation"
+	PropertySubjectID       = "interaction.subject_id"
+	PropertyActorID         = "interaction.actor_id"
+	PropertyClientID        = "interaction.client_id"
+	PropertyDelegationCount = "interaction.delegation_count"
+	PropertyDelegationID    = "interaction.delegation_id"
+	PropertyReasonCode      = "interaction.reason_code"
+	PropertyReasonDigest    = "interaction.reason_digest"
 
 	// PropertySummaryDigest carries the SHA-256 digest of a fold's
 	// out-of-band summary text. The digest is stored so a fold can be
@@ -132,11 +157,16 @@ const LabelInteraction = "interaction"
 // Public static bounds. They exist so a single recorded session can never
 // become an unbounded write.
 const (
-	MaxTurns             = 4096
+	MaxTurns = 4096
+	// MaxTouchedNodes and MaxVisibilityLabels are retained as compatibility
+	// sizing constants only. They are not semantic truncation or rejection
+	// limits: provenance and visibility unions must include every source.
 	MaxTouchedNodes      = 65536
 	MaxVisibilityLabels  = 64
 	MaxVisibilityLabelSz = 256
+	MaxIdentifierBytes   = 256
 	MaxFoldMembers       = 4096
+	MaxDelegationEntries = 64
 )
 
 // IsInteractionKind reports whether a node kind is in the reserved namespace.
@@ -154,8 +184,142 @@ func IsInteractionEdgeType(edgeType string) bool {
 // source graph nodes the call put in front of the model, not only the ones it
 // went on to cite.
 type ToolCall struct {
-	Kind             string
-	RetrievedNodeIDs []shoal.ID
+	Kind              string
+	RetrievedNodeIDs  []shoal.ID
+	RetrievedEvidence []EvidenceReference
+}
+
+// Operation identifies the product interaction represented by a session.
+// Inference and chat operations materialize an addressable inference node;
+// retrieval and tool-call operations remain session/turn/tool-call records.
+type Operation string
+
+const (
+	OperationInference Operation = "inference"
+	OperationRetrieval Operation = "retrieval"
+	OperationToolCall  Operation = "tool_call"
+	OperationChat      Operation = "chat"
+)
+
+// Validate rejects unknown interaction operations.
+func (o Operation) Validate() error {
+	switch o {
+	case OperationInference, OperationRetrieval, OperationToolCall, OperationChat:
+		return nil
+	default:
+		return shoal.NewError(
+			shoal.ErrorInvalidArgument, "unknown interaction operation")
+	}
+}
+
+// HasInference reports whether this operation produces an addressable
+// inference node in addition to its session, turns, and tool calls.
+func (o Operation) HasInference() bool {
+	return o == OperationInference || o == OperationChat
+}
+
+// ActorContext is the trusted, non-credential identity context under which an
+// interaction ran. The complete delegation chain is retained in the typed
+// durable record; graph metadata carries only its count and stable opaque ID.
+type ActorContext struct {
+	SubjectID  shoal.ID
+	ActorID    shoal.ID
+	ClientID   shoal.ID
+	OnBehalfOf []shoal.ID
+}
+
+// Validate checks actor and delegation identities without interpreting them.
+func (a ActorContext) Validate() error {
+	present := a.SubjectID != "" || a.ActorID != "" || a.ClientID != "" ||
+		len(a.OnBehalfOf) > 0
+	if !present {
+		return nil
+	}
+	if err := shoal.ValidateRequiredID(
+		"interaction subject ID", a.SubjectID,
+	); err != nil {
+		return err
+	}
+	if err := shoal.ValidateRequiredID(
+		"interaction actor ID", a.ActorID,
+	); err != nil {
+		return err
+	}
+	if err := shoal.ValidateOptionalID(
+		"interaction client ID", a.ClientID,
+	); err != nil {
+		return err
+	}
+	if len(a.OnBehalfOf) > MaxDelegationEntries {
+		return shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			"interaction delegation chain exceeds the public bound",
+		)
+	}
+	for _, id := range a.OnBehalfOf {
+		if err := shoal.ValidateRequiredID(
+			"interaction delegation identity", id,
+		); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// Reason is redacted action rationale. Code is a bounded machine-readable
+// category; Digest is SHA-256 of any free-form explanation. Raw reason text is
+// never persisted.
+type Reason struct {
+	Code   string
+	Digest string
+}
+
+// NewReason creates a safe reason from a category and optional free-form
+// detail. The detail is hashed immediately and is never retained.
+func NewReason(code, detail string) (Reason, error) {
+	reason := Reason{Code: code}
+	if detail != "" {
+		reason.Digest = Digest(detail)
+	}
+	if err := reason.Validate(); err != nil {
+		return Reason{}, err
+	}
+	return reason, nil
+}
+
+// Validate checks the redacted reason shape.
+func (r Reason) Validate() error {
+	if r.Code == "" && r.Digest == "" {
+		return nil
+	}
+	if r.Code == "" {
+		return shoal.NewError(
+			shoal.ErrorInvalidArgument, "interaction reason code is required")
+	}
+	if len(r.Code) > MaxVisibilityLabelSz {
+		return shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			"interaction reason code exceeds the public byte bound",
+		)
+	}
+	for index := 0; index < len(r.Code); index++ {
+		value := r.Code[index]
+		switch {
+		case value >= 'a' && value <= 'z',
+			value >= 'A' && value <= 'Z',
+			value >= '0' && value <= '9':
+		case value == '_', value == '-', value == '.', value == ':':
+		default:
+			return shoal.NewError(
+				shoal.ErrorInvalidArgument,
+				"interaction reason code contains an unsupported character",
+			)
+		}
+	}
+	if r.Digest == "" {
+		return nil
+	}
+	return validateDigest("interaction reason digest", r.Digest, false)
 }
 
 // Turn is one model decision. A turn that stopped rather than calling a tool
@@ -187,21 +351,38 @@ type Provenance struct {
 // prompt, the answer text, evidence quotes, authorization grants, or
 // model-chosen correlation strings.
 type Session struct {
-	ID            shoal.ID
-	RecordedAt    time.Time
-	Provenance    Provenance
-	QueryDigest   string
-	RequestID     shoal.ID
-	ContextPackID shoal.ID
-	ResultID      shoal.ID
-	StopReason    string
+	ID                       shoal.ID
+	RecordedAt               time.Time
+	Operation                Operation
+	Actor                    ActorContext
+	Reason                   Reason
+	SnapshotID               shoal.ID
+	SnapshotAsOf             time.Time
+	AuthorizationFingerprint shoal.ID
+	AuthorizationExpiresAt   time.Time
+	// AuthorizationOperation is the exact trusted operation authorized for
+	// this interaction. Empty retains the legacy retrieval authorization.
+	AuthorizationOperation string
+	// EmbeddingSpaceID is retained for legacy single/set-ID records.
+	EmbeddingSpaceID shoal.ID
+	// EmbeddingSpaces carries canonical stable full identities from the core
+	// request-local embedding query observer.
+	EmbeddingSpaces EmbeddingSpaceSet
+	Provenance      Provenance
+	QueryDigest     string
+	RequestID       shoal.ID
+	ContextPackID   shoal.ID
+	ResultID        shoal.ID
+	StopReason      string
 
 	// SeedNodeIDs are source nodes the session was shown before its first
 	// turn. They count as retrieved.
-	SeedNodeIDs []shoal.ID
-	Turns       []Turn
+	SeedNodeIDs  []shoal.ID
+	SeedEvidence []EvidenceReference
+	Turns        []Turn
 	// CitedNodeIDs are source nodes the final answer actually cited.
-	CitedNodeIDs []shoal.ID
+	CitedNodeIDs  []shoal.ID
+	CitedEvidence []EvidenceReference
 }
 
 // Subgraph is the materialized interaction record: its own nodes, its edges to
@@ -214,6 +395,11 @@ type Subgraph struct {
 	// TouchedNodeIDs is the sorted union of every source node the session was
 	// shown or cited. Visibility is the conjunction over exactly this set.
 	TouchedNodeIDs []shoal.ID
+	// TouchedEdgeIDs is the sorted union of every exact source edge present in
+	// retrieved or cited evidence. These edges are not copied into the derived
+	// interaction graph, but their current existence and policy remain
+	// required to serve it.
+	TouchedEdgeIDs []shoal.ID
 }
 
 // VisibilityResolver reports the visibility labels a source node requires. It
@@ -224,7 +410,39 @@ type VisibilityResolver func(shoal.ID) ([]string, error)
 // NodeVisibility reads the declared visibility labels of a graph node. A node
 // with no declared labels is public.
 func NodeVisibility(node graph.Node) ([]string, error) {
-	return ParseVisibility(node.Properties[PropertyVisibility])
+	return metadataVisibility(node.Properties)
+}
+
+// EdgeVisibility reads the declared visibility labels of a graph edge. A
+// source edge with no declared labels is public.
+func EdgeVisibility(edge graph.Edge) ([]string, error) {
+	return metadataVisibility(edge.Properties)
+}
+
+func metadataVisibility(properties shoal.Metadata) ([]string, error) {
+	if properties[PropertyVisibility] == "" &&
+		properties[PropertyVisibilityDigest] != "" {
+		if err := validateDigest(
+			"interaction visibility digest",
+			properties[PropertyVisibilityDigest],
+			false,
+		); err != nil {
+			return nil, err
+		}
+		count, err := strconv.Atoi(properties[PropertyVisibilityCount])
+		if err != nil || count <= 0 {
+			return nil, shoal.NewError(
+				shoal.ErrorInvalidArgument,
+				"interaction visibility count is invalid",
+			)
+		}
+		return nil, shoal.NewError(
+			shoal.ErrorUnavailable,
+			"interaction visibility is digest-only and requires the explicit "+
+				"derived record view",
+		)
+	}
+	return ParseVisibility(properties[PropertyVisibility])
 }
 
 // ParseVisibility parses a canonical conjunction expression into sorted unique
@@ -260,12 +478,6 @@ func Conjoin(sets ...[]string) ([]string, error) {
 	if len(seen) == 0 {
 		return nil, nil
 	}
-	if len(seen) > MaxVisibilityLabels {
-		return nil, shoal.NewError(
-			shoal.ErrorInvalidArgument,
-			"interaction visibility exceeds the public label bound",
-		)
-	}
 	labels := make([]string, 0, len(seen))
 	for label := range seen {
 		labels = append(labels, label)
@@ -278,6 +490,41 @@ func Conjoin(sets ...[]string) ([]string, error) {
 // visibility renders as the empty string.
 func Expression(labels []string) string {
 	return strings.Join(labels, "&")
+}
+
+func validatePrefixedDigest(name, digest string, optional bool) error {
+	if strings.HasPrefix(digest, "sha256:") {
+		digest = strings.TrimPrefix(digest, "sha256:")
+	}
+	return validateDigest(name, digest, optional)
+}
+
+func validateIdentifier(name, value string, optional bool) error {
+	if value == "" {
+		if optional {
+			return nil
+		}
+		return shoal.NewError(shoal.ErrorInvalidArgument, name+" is required")
+	}
+	if len(value) > MaxIdentifierBytes {
+		return shoal.NewError(
+			shoal.ErrorInvalidArgument, name+" exceeds the public byte bound")
+	}
+	for index := 0; index < len(value); index++ {
+		c := value[index]
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z',
+			c >= '0' && c <= '9':
+		case c == '_', c == '-', c == '.', c == ':', c == '/', c == '@',
+			c == '+':
+		default:
+			return shoal.NewError(
+				shoal.ErrorInvalidArgument,
+				name+" contains an unsupported character",
+			)
+		}
+	}
+	return nil
 }
 
 func validateLabel(label string) error {
@@ -311,24 +558,140 @@ func (s Session) Validate() error {
 	if err := shoal.ValidateRequiredID("interaction session ID", s.ID); err != nil {
 		return err
 	}
+	// Session identities must live in the session-owned part of the reserved
+	// interaction namespace, which every source publication path rejects. That
+	// disjointness is what makes the graph-ID reservation safe across writers:
+	// two processes with independent local state can never durably commit a
+	// source node and a session (or a session and another kind of derived
+	// interaction node) under one graph identity.
+	if !IsSessionID(s.ID) {
+		return shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			"interaction session ID must be minted by SessionID or "+
+				"OperationSessionID in the reserved session namespace",
+		)
+	}
 	if s.RecordedAt.IsZero() {
 		return shoal.NewError(
 			shoal.ErrorInvalidArgument, "interaction session time is required")
+	}
+	if s.Operation != "" {
+		if err := s.Operation.Validate(); err != nil {
+			return err
+		}
+	}
+	if err := s.Actor.Validate(); err != nil {
+		return err
+	}
+	if err := s.Reason.Validate(); err != nil {
+		return err
+	}
+	if err := validateDigest(
+		"interaction query digest", s.QueryDigest, true,
+	); err != nil {
+		return err
+	}
+	if err := validatePrefixedDigest(
+		"interaction prompt hash", s.Provenance.PromptHash, true,
+	); err != nil {
+		return err
+	}
+	for _, field := range []struct {
+		name  string
+		value string
+	}{
+		{"interaction harness", s.Provenance.Harness},
+		{"interaction provider", s.Provenance.Provider},
+		{"interaction model", s.Provenance.Model},
+		{"interaction model version", s.Provenance.ModelVersion},
+		{"interaction prompt ID", s.Provenance.PromptID},
+		{"interaction prompt version", s.Provenance.PromptVer},
+		{"interaction tool policy", s.Provenance.ToolPolicy},
+		{"interaction stop reason", s.StopReason},
+	} {
+		if err := validateIdentifier(field.name, field.value, true); err != nil {
+			return err
+		}
+	}
+	for _, field := range []struct {
+		name string
+		id   shoal.ID
+	}{
+		{"interaction request ID", s.RequestID},
+		{"interaction context pack ID", s.ContextPackID},
+		{"interaction result ID", s.ResultID},
+	} {
+		if err := shoal.ValidateOptionalID(field.name, field.id); err != nil {
+			return err
+		}
+	}
+	hasExecutionPin := s.SnapshotID != "" || !s.SnapshotAsOf.IsZero() ||
+		s.AuthorizationFingerprint != "" || !s.AuthorizationExpiresAt.IsZero()
+	if hasExecutionPin {
+		if err := shoal.ValidateRequiredID(
+			"interaction snapshot ID", s.SnapshotID,
+		); err != nil {
+			return err
+		}
+		if s.SnapshotAsOf.IsZero() {
+			return shoal.NewError(
+				shoal.ErrorInvalidArgument, "interaction snapshot time is required")
+		}
+		if err := shoal.ValidateRequiredID(
+			"interaction authorization fingerprint",
+			s.AuthorizationFingerprint,
+		); err != nil {
+			return err
+		}
+		if s.AuthorizationExpiresAt.IsZero() {
+			return shoal.NewError(
+				shoal.ErrorInvalidArgument,
+				"interaction authorization expiry is required",
+			)
+		}
+		if s.AuthorizationExpiresAt.Before(s.SnapshotAsOf) {
+			return shoal.NewError(
+				shoal.ErrorInvalidArgument,
+				"interaction authorization expires before its observed snapshot",
+			)
+		}
+		if s.SnapshotAsOf.After(s.RecordedAt) {
+			return shoal.NewError(
+				shoal.ErrorInvalidArgument,
+				"interaction snapshot time is after the recording time",
+			)
+		}
+		if !s.RecordedAt.Before(s.AuthorizationExpiresAt) {
+			return shoal.NewError(
+				shoal.ErrorInvalidArgument,
+				"interaction was recorded after authorization expired",
+			)
+		}
 	}
 	if len(s.Turns) > MaxTurns {
 		return shoal.NewError(
 			shoal.ErrorInvalidArgument, "interaction session exceeds the public turn bound")
 	}
-	touched := len(s.SeedNodeIDs) + len(s.CitedNodeIDs)
-	for _, turn := range s.Turns {
-		if turn.ToolCall != nil {
-			touched += len(turn.ToolCall.RetrievedNodeIDs)
-		}
+	if err := shoal.ValidateOptionalID(
+		"interaction embedding space ID", s.EmbeddingSpaceID,
+	); err != nil {
+		return err
 	}
-	if touched > MaxTouchedNodes {
+	if err := validateIdentifier(
+		"interaction authorization operation",
+		s.AuthorizationOperation,
+		true,
+	); err != nil {
+		return err
+	}
+	if err := s.EmbeddingSpaces.Validate(); err != nil {
+		return err
+	}
+	if s.EmbeddingSpaceID != "" &&
+		len(s.EmbeddingSpaces.Identities) > 0 {
 		return shoal.NewError(
 			shoal.ErrorInvalidArgument,
-			"interaction session exceeds the public touched-node bound",
+			"interaction cannot mix legacy and canonical embedding space pins",
 		)
 	}
 	for _, id := range s.SeedNodeIDs {
@@ -336,14 +699,66 @@ func (s Session) Validate() error {
 			return err
 		}
 	}
+	for _, evidence := range s.SeedEvidence {
+		if err := evidence.Validate(); err != nil {
+			return err
+		}
+	}
+	if len(s.SeedEvidence) > 0 &&
+		!equalIDs(dedupeIDs(s.SeedNodeIDs), evidenceNodeIDs(s.SeedEvidence)) {
+		return shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			"interaction seed nodes do not match seed evidence")
+	}
 	for _, id := range s.CitedNodeIDs {
 		if err := shoal.ValidateRequiredID("interaction cited node ID", id); err != nil {
 			return err
 		}
 	}
+	for _, evidence := range s.CitedEvidence {
+		if err := evidence.Validate(); err != nil {
+			return err
+		}
+	}
+	if len(s.CitedEvidence) > 0 &&
+		!equalIDs(dedupeIDs(s.CitedNodeIDs), evidenceNodeIDs(s.CitedEvidence)) {
+		return shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			"interaction cited nodes do not match cited evidence")
+	}
+	turnIndexes := make(map[int]struct{}, len(s.Turns))
 	for _, turn := range s.Turns {
+		if turn.Index < 0 {
+			return shoal.NewError(
+				shoal.ErrorInvalidArgument,
+				"interaction turn index cannot be negative",
+			)
+		}
+		if _, duplicate := turnIndexes[turn.Index]; duplicate {
+			return shoal.NewError(
+				shoal.ErrorInvalidArgument,
+				"interaction turn indexes must be unique",
+			)
+		}
+		turnIndexes[turn.Index] = struct{}{}
+		if turn.InputTokens < 0 || turn.OutputTokens < 0 {
+			return shoal.NewError(
+				shoal.ErrorInvalidArgument,
+				"interaction turn token counts cannot be negative",
+			)
+		}
+		if err := validateIdentifier(
+			"interaction turn decision", turn.Decision, true,
+		); err != nil {
+			return err
+		}
 		if turn.ToolCall == nil {
 			continue
+		}
+		if err := validateIdentifier(
+			"interaction tool kind", turn.ToolCall.Kind, false,
+		); err != nil {
+			return err
 		}
 		for _, id := range turn.ToolCall.RetrievedNodeIDs {
 			if err := shoal.ValidateRequiredID(
@@ -352,8 +767,143 @@ func (s Session) Validate() error {
 				return err
 			}
 		}
+		for _, evidence := range turn.ToolCall.RetrievedEvidence {
+			if err := evidence.Validate(); err != nil {
+				return err
+			}
+		}
+		if len(turn.ToolCall.RetrievedEvidence) > 0 &&
+			!equalIDs(
+				dedupeIDs(turn.ToolCall.RetrievedNodeIDs),
+				evidenceNodeIDs(turn.ToolCall.RetrievedEvidence),
+			) {
+			return shoal.NewError(
+				shoal.ErrorInvalidArgument,
+				"interaction tool nodes do not match retrieved evidence")
+		}
+	}
+	// One anchor identity must describe one evidence reference across seed,
+	// cited, and tool-call evidence, or the session-wide union is ambiguous.
+	if _, err := canonicalEvidenceReferences(
+		s.evidenceReferenceValues(),
+	); err != nil {
+		return err
 	}
 	return nil
+}
+
+// Canonical returns an independently owned session with UTC timestamps and
+// sorted, deduplicated opaque identity sets. Provenance edges are materialized
+// from this form so retries and durable hydration retain one stable shape.
+func (s Session) Canonical() (Session, error) {
+	if err := s.Validate(); err != nil {
+		return Session{}, err
+	}
+	canonical := s
+	var err error
+	if canonical.Operation == "" {
+		canonical.Operation = OperationInference
+	}
+	canonical.RecordedAt = s.RecordedAt.UTC()
+	canonical.SnapshotAsOf = s.SnapshotAsOf.UTC()
+	canonical.AuthorizationExpiresAt = s.AuthorizationExpiresAt.UTC()
+	canonical.EmbeddingSpaces, err = s.EmbeddingSpaces.Canonical()
+	if err != nil {
+		return Session{}, err
+	}
+	canonical.Actor.OnBehalfOf = append(
+		[]shoal.ID(nil), s.Actor.OnBehalfOf...)
+	canonical.SeedNodeIDs = dedupeIDs(s.SeedNodeIDs)
+	canonical.SeedEvidence, err = canonicalEvidenceReferences(s.SeedEvidence)
+	if err != nil {
+		return Session{}, err
+	}
+	canonical.CitedNodeIDs = dedupeIDs(s.CitedNodeIDs)
+	canonical.CitedEvidence, err = canonicalEvidenceReferences(s.CitedEvidence)
+	if err != nil {
+		return Session{}, err
+	}
+	canonical.Turns = make([]Turn, len(s.Turns))
+	for index, turn := range s.Turns {
+		canonical.Turns[index] = turn
+		if turn.ToolCall != nil {
+			call := *turn.ToolCall
+			call.RetrievedNodeIDs = dedupeIDs(turn.ToolCall.RetrievedNodeIDs)
+			call.RetrievedEvidence, err = canonicalEvidenceReferences(
+				turn.ToolCall.RetrievedEvidence)
+			if err != nil {
+				return Session{}, err
+			}
+			canonical.Turns[index].ToolCall = &call
+		}
+	}
+	sort.Slice(canonical.Turns, func(i, j int) bool {
+		return canonical.Turns[i].Index < canonical.Turns[j].Index
+	})
+	return canonical, nil
+}
+
+// TouchedNodeIDs returns the sorted, deduplicated union of every source node
+// the session retrieved or cited. It has no policy cap: dropping a late source
+// would understate exposure and therefore widen the derived record.
+func (s Session) TouchedNodeIDs() []shoal.ID {
+	ids := append([]shoal.ID(nil), s.SeedNodeIDs...)
+	ids = append(ids, s.CitedNodeIDs...)
+	for _, turn := range s.Turns {
+		if turn.ToolCall != nil {
+			ids = append(ids, turn.ToolCall.RetrievedNodeIDs...)
+		}
+	}
+	return dedupeIDs(ids)
+}
+
+// TouchedEdgeIDs returns every exact source graph edge referenced by retrieved
+// or cited evidence.
+func (s Session) TouchedEdgeIDs() []shoal.ID {
+	ids := evidenceEdgeIDs(s.SeedEvidence)
+	ids = append(ids, evidenceEdgeIDs(s.CitedEvidence)...)
+	for _, turn := range s.Turns {
+		if turn.ToolCall != nil {
+			ids = append(ids,
+				evidenceEdgeIDs(turn.ToolCall.RetrievedEvidence)...)
+		}
+	}
+	return dedupeIDs(ids)
+}
+
+// TouchedAssertions returns every authoritative assertion identity and origin
+// carried by retrieved or cited evidence.
+func (s Session) TouchedAssertions() []AssertionReference {
+	references := evidenceAssertions(s.SeedEvidence)
+	references = append(references, evidenceAssertions(s.CitedEvidence)...)
+	for _, turn := range s.Turns {
+		if turn.ToolCall != nil {
+			references = append(
+				references,
+				evidenceAssertions(turn.ToolCall.RetrievedEvidence)...,
+			)
+		}
+	}
+	return evidenceAssertions([]EvidenceReference{{Assertions: references}})
+}
+
+// EvidenceReferences returns the canonical union of every retrieved and cited
+// evidence anchor in the session. It fails rather than silently omitting
+// evidence, because callers use the result to bind evidence to a pinned
+// frontier and an empty result selects a weaker validation path.
+func (s Session) EvidenceReferences() ([]EvidenceReference, error) {
+	return canonicalEvidenceReferences(s.evidenceReferenceValues())
+}
+
+func (s Session) evidenceReferenceValues() []EvidenceReference {
+	values := append([]EvidenceReference(nil), s.SeedEvidence...)
+	values = append(values, s.CitedEvidence...)
+	for _, turn := range s.Turns {
+		if turn.ToolCall != nil {
+			values = append(values, turn.ToolCall.RetrievedEvidence...)
+		}
+	}
+	return values
 }
 
 // Subgraph materializes the session, turn, and tool-call nodes with their
@@ -361,22 +911,34 @@ func (s Session) Validate() error {
 // touched source node; if it fails for any node, the whole record fails rather
 // than being written with an understated visibility.
 func (s Session) Subgraph(resolve VisibilityResolver) (Subgraph, error) {
-	if err := s.Validate(); err != nil {
+	return s.SubgraphWithEvidence(resolve, nil)
+}
+
+// SubgraphWithEvidence materializes the interaction while resolving both
+// source-node and exact source-edge visibility. An edge resolver is mandatory
+// whenever the session contains edge-backed evidence.
+func (s Session) SubgraphWithEvidence(
+	resolveNode VisibilityResolver,
+	resolveEdge VisibilityResolver,
+) (Subgraph, error) {
+	canonical, err := s.Canonical()
+	if err != nil {
 		return Subgraph{}, err
 	}
-	if resolve == nil {
+	s = canonical
+	if resolveNode == nil {
 		return Subgraph{}, shoal.NewError(
 			shoal.ErrorInvalidArgument, "interaction visibility resolver is required")
 	}
-	cache := make(map[shoal.ID][]string)
-	labelsFor := func(ids []shoal.ID) ([]string, error) {
+	nodeCache := make(map[shoal.ID][]string)
+	labelsForNodes := func(ids []shoal.ID) ([]string, error) {
 		sets := make([][]string, 0, len(ids))
 		for _, id := range ids {
-			if cached, ok := cache[id]; ok {
+			if cached, ok := nodeCache[id]; ok {
 				sets = append(sets, cached)
 				continue
 			}
-			labels, err := resolve(id)
+			labels, err := resolveNode(id)
 			if err != nil {
 				return nil, err
 			}
@@ -384,7 +946,34 @@ func (s Session) Subgraph(resolve VisibilityResolver) (Subgraph, error) {
 			if err != nil {
 				return nil, err
 			}
-			cache[id] = normalized
+			nodeCache[id] = normalized
+			sets = append(sets, normalized)
+		}
+		return Conjoin(sets...)
+	}
+	edgeCache := make(map[shoal.ID][]string)
+	labelsForEdges := func(ids []shoal.ID) ([]string, error) {
+		if len(ids) > 0 && resolveEdge == nil {
+			return nil, shoal.NewError(
+				shoal.ErrorInvalidArgument,
+				"interaction edge visibility resolver is required",
+			)
+		}
+		sets := make([][]string, 0, len(ids))
+		for _, id := range ids {
+			if cached, ok := edgeCache[id]; ok {
+				sets = append(sets, cached)
+				continue
+			}
+			labels, err := resolveEdge(id)
+			if err != nil {
+				return nil, err
+			}
+			normalized, err := Conjoin(labels)
+			if err != nil {
+				return nil, err
+			}
+			edgeCache[id] = normalized
 			sets = append(sets, normalized)
 		}
 		return Conjoin(sets...)
@@ -397,25 +986,155 @@ func (s Session) Subgraph(resolve VisibilityResolver) (Subgraph, error) {
 		Properties: shoal.Metadata{
 			PropertyRecordedAt: s.RecordedAt.UTC().Format(time.RFC3339Nano),
 			PropertyTurnCount:  strconv.Itoa(len(s.Turns)),
-			PropertyCited:      strconv.Itoa(len(s.CitedNodeIDs)),
+			PropertyOperation:  string(s.Operation),
 		},
 	}
-	setIfPresent(sessionNode.Properties, PropertyStopReason, s.StopReason)
-	setIfPresent(sessionNode.Properties, PropertyQueryDigest, s.QueryDigest)
-	setIfPresent(sessionNode.Properties, PropertyRequestID, string(s.RequestID))
-	setIfPresent(sessionNode.Properties, PropertyContextPackID, string(s.ContextPackID))
-	setIfPresent(sessionNode.Properties, PropertyResultID, string(s.ResultID))
-	setIfPresent(sessionNode.Properties, PropertyHarness, s.Provenance.Harness)
-	setIfPresent(sessionNode.Properties, PropertyProvider, s.Provenance.Provider)
-	setIfPresent(sessionNode.Properties, PropertyModel, s.Provenance.Model)
-	setIfPresent(sessionNode.Properties, PropertyModelVersion, s.Provenance.ModelVersion)
-	setIfPresent(sessionNode.Properties, PropertyPromptID, s.Provenance.PromptID)
-	setIfPresent(sessionNode.Properties, PropertyPromptVersion, s.Provenance.PromptVer)
-	setIfPresent(sessionNode.Properties, PropertyPromptHash, s.Provenance.PromptHash)
-	setIfPresent(sessionNode.Properties, PropertyToolPolicy, s.Provenance.ToolPolicy)
+	setIfPresent(sessionNode.Properties, PropertySnapshotID, string(s.SnapshotID))
+	if !s.SnapshotAsOf.IsZero() {
+		setIfPresent(
+			sessionNode.Properties,
+			PropertySnapshotAsOf,
+			s.SnapshotAsOf.UTC().Format(time.RFC3339Nano),
+		)
+	}
+	setIfPresent(
+		sessionNode.Properties, PropertyAuthFingerprint,
+		string(s.AuthorizationFingerprint),
+	)
+	setIfPresent(
+		sessionNode.Properties,
+		PropertyAuthOperation,
+		s.AuthorizationOperation,
+	)
+	if !s.AuthorizationExpiresAt.IsZero() {
+		setIfPresent(
+			sessionNode.Properties,
+			PropertyAuthExpiresAt,
+			s.AuthorizationExpiresAt.UTC().Format(time.RFC3339Nano),
+		)
+	}
+	setIfPresent(
+		sessionNode.Properties, PropertyEmbeddingSpace,
+		string(s.EmbeddingSpaceID),
+	)
+	setIfPresent(
+		sessionNode.Properties, PropertyEmbeddingSpaces,
+		s.EmbeddingSpaces.Digest,
+	)
+	if len(s.EmbeddingSpaces.Identities) > 0 {
+		sessionNode.Properties[PropertyEmbeddingCount] =
+			strconv.Itoa(len(s.EmbeddingSpaces.Identities))
+	}
+	setIfPresent(
+		sessionNode.Properties, PropertySubjectID, string(s.Actor.SubjectID))
+	setIfPresent(
+		sessionNode.Properties, PropertyActorID, string(s.Actor.ActorID))
+	setIfPresent(
+		sessionNode.Properties, PropertyClientID, string(s.Actor.ClientID))
+	if len(s.Actor.OnBehalfOf) > 0 {
+		sessionNode.Properties[PropertyDelegationCount] =
+			strconv.Itoa(len(s.Actor.OnBehalfOf))
+		sessionNode.Properties[PropertyDelegationID] =
+			string(delegationID(s.Actor.OnBehalfOf))
+	}
+	setIfPresent(sessionNode.Properties, PropertyReasonCode, s.Reason.Code)
+	setIfPresent(sessionNode.Properties, PropertyReasonDigest, s.Reason.Digest)
 
 	nodes := []graph.Node{sessionNode}
 	var edges []graph.Edge
+	rootID := s.ID
+	var inferenceNode graph.Node
+	if s.Operation.HasInference() {
+		inferenceID := InferenceID(s.ID)
+		inferenceNode = graph.Node{
+			ID:     inferenceID,
+			Kind:   KindInference,
+			Labels: []string{LabelInteraction},
+			Properties: shoal.Metadata{
+				PropertySessionID:   string(s.ID),
+				PropertyInferenceID: string(inferenceID),
+				PropertyTurnCount:   strconv.Itoa(len(s.Turns)),
+				PropertyCited:       strconv.Itoa(len(s.CitedNodeIDs)),
+			},
+		}
+		setIfPresent(
+			inferenceNode.Properties, PropertySnapshotID, string(s.SnapshotID))
+		if !s.SnapshotAsOf.IsZero() {
+			setIfPresent(
+				inferenceNode.Properties,
+				PropertySnapshotAsOf,
+				s.SnapshotAsOf.UTC().Format(time.RFC3339Nano),
+			)
+		}
+		setIfPresent(
+			inferenceNode.Properties,
+			PropertyAuthFingerprint,
+			string(s.AuthorizationFingerprint),
+		)
+		setIfPresent(
+			inferenceNode.Properties,
+			PropertyAuthOperation,
+			s.AuthorizationOperation,
+		)
+		if !s.AuthorizationExpiresAt.IsZero() {
+			setIfPresent(
+				inferenceNode.Properties,
+				PropertyAuthExpiresAt,
+				s.AuthorizationExpiresAt.UTC().Format(time.RFC3339Nano),
+			)
+		}
+		setIfPresent(inferenceNode.Properties, PropertyStopReason, s.StopReason)
+		setIfPresent(inferenceNode.Properties, PropertyQueryDigest, s.QueryDigest)
+		setIfPresent(inferenceNode.Properties, PropertyRequestID, string(s.RequestID))
+		setIfPresent(
+			inferenceNode.Properties,
+			PropertyContextPackID,
+			string(s.ContextPackID),
+		)
+		setIfPresent(inferenceNode.Properties, PropertyResultID, string(s.ResultID))
+		setIfPresent(inferenceNode.Properties, PropertyHarness, s.Provenance.Harness)
+		setIfPresent(inferenceNode.Properties, PropertyProvider, s.Provenance.Provider)
+		setIfPresent(inferenceNode.Properties, PropertyModel, s.Provenance.Model)
+		setIfPresent(
+			inferenceNode.Properties,
+			PropertyModelVersion,
+			s.Provenance.ModelVersion,
+		)
+		setIfPresent(inferenceNode.Properties, PropertyPromptID, s.Provenance.PromptID)
+		setIfPresent(
+			inferenceNode.Properties,
+			PropertyPromptVersion,
+			s.Provenance.PromptVer,
+		)
+		setIfPresent(
+			inferenceNode.Properties,
+			PropertyPromptHash,
+			s.Provenance.PromptHash,
+		)
+		setIfPresent(
+			inferenceNode.Properties,
+			PropertyToolPolicy,
+			s.Provenance.ToolPolicy,
+		)
+		setIfPresent(
+			inferenceNode.Properties,
+			PropertyEmbeddingSpace,
+			string(s.EmbeddingSpaceID),
+		)
+		setIfPresent(
+			inferenceNode.Properties,
+			PropertyEmbeddingSpaces,
+			s.EmbeddingSpaces.Digest,
+		)
+		if len(s.EmbeddingSpaces.Identities) > 0 {
+			inferenceNode.Properties[PropertyEmbeddingCount] =
+				strconv.Itoa(len(s.EmbeddingSpaces.Identities))
+		}
+		nodes = append(nodes, inferenceNode)
+		edges = append(
+			edges, provenanceEdge(EdgeHasInference, s.ID, inferenceID))
+		rootID = inferenceID
+	}
 	touched := make(map[shoal.ID]struct{})
 	addTouched := func(ids []shoal.ID) {
 		for _, id := range ids {
@@ -426,16 +1145,16 @@ func (s Session) Subgraph(resolve VisibilityResolver) (Subgraph, error) {
 	seed := dedupeIDs(s.SeedNodeIDs)
 	addTouched(seed)
 	for _, id := range seed {
-		edges = append(edges, provenanceEdge(EdgeRetrieved, s.ID, id))
+		edges = append(edges, provenanceEdge(EdgeRetrieved, rootID, id))
 	}
 	cited := dedupeIDs(s.CitedNodeIDs)
 	addTouched(cited)
 	for _, id := range cited {
-		edges = append(edges, provenanceEdge(EdgeCited, s.ID, id))
+		edges = append(edges, provenanceEdge(EdgeCited, rootID, id))
 	}
 
 	for _, turn := range s.Turns {
-		turnID := DerivedID("turn", string(s.ID), strconv.Itoa(turn.Index))
+		turnID := DerivedID("turn", string(rootID), strconv.Itoa(turn.Index))
 		turnNode := graph.Node{
 			ID:     turnID,
 			Kind:   KindTurn,
@@ -448,13 +1167,22 @@ func (s Session) Subgraph(resolve VisibilityResolver) (Subgraph, error) {
 				PropertyFailed:       strconv.FormatBool(turn.Failed),
 			},
 		}
+		if s.Operation.HasInference() {
+			setIfPresent(
+				turnNode.Properties,
+				PropertyInferenceID,
+				string(InferenceID(s.ID)),
+			)
+		}
 		setIfPresent(turnNode.Properties, PropertyDecision, turn.Decision)
-		edges = append(edges, provenanceEdge(EdgeHasTurn, s.ID, turnID))
+		edges = append(edges, provenanceEdge(EdgeHasTurn, rootID, turnID))
 
 		turnVisibility := []string(nil)
 		if turn.ToolCall != nil {
 			retrieved := dedupeIDs(turn.ToolCall.RetrievedNodeIDs)
 			addTouched(retrieved)
+			retrievedEdges := evidenceEdgeIDs(
+				turn.ToolCall.RetrievedEvidence)
 			callID := DerivedID("tool_call", string(turnID))
 			callNode := graph.Node{
 				ID:     callID,
@@ -468,11 +1196,20 @@ func (s Session) Subgraph(resolve VisibilityResolver) (Subgraph, error) {
 				},
 			}
 			setIfPresent(callNode.Properties, PropertyToolKind, turn.ToolCall.Kind)
-			callVisibility, err := labelsFor(retrieved)
+			nodeVisibility, err := labelsForNodes(retrieved)
 			if err != nil {
 				return Subgraph{}, err
 			}
-			setIfPresent(callNode.Properties, PropertyVisibility, Expression(callVisibility))
+			edgeVisibility, err := labelsForEdges(retrievedEdges)
+			if err != nil {
+				return Subgraph{}, err
+			}
+			callVisibility, err := Conjoin(
+				nodeVisibility, edgeVisibility)
+			if err != nil {
+				return Subgraph{}, err
+			}
+			setVisibility(callNode.Properties, callVisibility)
 			turnVisibility = callVisibility
 			nodes = append(nodes, callNode)
 			edges = append(edges, provenanceEdge(EdgeHasToolCall, turnID, callID))
@@ -480,7 +1217,7 @@ func (s Session) Subgraph(resolve VisibilityResolver) (Subgraph, error) {
 				edges = append(edges, provenanceEdge(EdgeRetrieved, callID, id))
 			}
 		}
-		setIfPresent(turnNode.Properties, PropertyVisibility, Expression(turnVisibility))
+		setVisibility(turnNode.Properties, turnVisibility)
 		nodes = append(nodes, turnNode)
 	}
 
@@ -491,11 +1228,23 @@ func (s Session) Subgraph(resolve VisibilityResolver) (Subgraph, error) {
 	sort.Slice(touchedIDs, func(i, j int) bool {
 		return shoal.CompareID(touchedIDs[i], touchedIDs[j]) < 0
 	})
-	visibility, err := labelsFor(touchedIDs)
+	nodeVisibility, err := labelsForNodes(touchedIDs)
 	if err != nil {
 		return Subgraph{}, err
 	}
-	setIfPresent(sessionNode.Properties, PropertyVisibility, Expression(visibility))
+	touchedEdgeIDs := s.TouchedEdgeIDs()
+	edgeVisibility, err := labelsForEdges(touchedEdgeIDs)
+	if err != nil {
+		return Subgraph{}, err
+	}
+	visibility, err := Conjoin(nodeVisibility, edgeVisibility)
+	if err != nil {
+		return Subgraph{}, err
+	}
+	setVisibility(sessionNode.Properties, visibility)
+	if s.Operation.HasInference() {
+		setVisibility(inferenceNode.Properties, visibility)
+	}
 
 	sortNodes(nodes)
 	sortEdges(edges)
@@ -514,6 +1263,7 @@ func (s Session) Subgraph(resolve VisibilityResolver) (Subgraph, error) {
 		Edges:          edges,
 		Visibility:     visibility,
 		TouchedNodeIDs: touchedIDs,
+		TouchedEdgeIDs: touchedEdgeIDs,
 	}, nil
 }
 
@@ -553,7 +1303,7 @@ func (t Tombstone) Node() (graph.Node, error) {
 			PropertyEdgeCount: strconv.Itoa(t.EdgeCount),
 		},
 	}
-	setIfPresent(node.Properties, PropertyVisibility, Expression(visibility))
+	setVisibility(node.Properties, visibility)
 	if err := node.Validate(); err != nil {
 		return graph.Node{}, err
 	}
@@ -575,6 +1325,45 @@ func SessionID(transcriptID shoal.ID, recordedAt time.Time) shoal.ID {
 		string(transcriptID),
 		recordedAt.UTC().Format(time.RFC3339Nano),
 	)
+}
+
+// IsSessionID reports whether an opaque ID is in the session-owned part of
+// the reserved interaction namespace.
+func IsSessionID(id shoal.ID) bool {
+	return strings.HasPrefix(string(id), KindSession+"_")
+}
+
+// OperationSessionID derives a stable opaque session identity for retrieval,
+// tool-call, chat, and other product interaction adapters. The caller-provided
+// correlation identity is hashed into the result and is never exposed.
+func OperationSessionID(
+	operation Operation, correlationID shoal.ID, recordedAt time.Time,
+) (shoal.ID, error) {
+	if err := operation.Validate(); err != nil {
+		return "", err
+	}
+	if err := shoal.ValidateRequiredID(
+		"interaction correlation ID", correlationID,
+	); err != nil {
+		return "", err
+	}
+	if recordedAt.IsZero() {
+		return "", shoal.NewError(
+			shoal.ErrorInvalidArgument, "interaction session time is required")
+	}
+	return DerivedID(
+		"session",
+		string(operation),
+		string(correlationID),
+		recordedAt.UTC().Format(time.RFC3339Nano),
+	), nil
+}
+
+// InferenceID is the stable address of the single inference represented by a
+// session. It is intentionally derived from the session rather than the result
+// so failed and empty-result inferences remain addressable.
+func InferenceID(sessionID shoal.ID) shoal.ID {
+	return DerivedID("inference", string(sessionID))
 }
 
 // DerivedID mints a collision-resistant identity inside the interaction
@@ -602,6 +1391,34 @@ func Digest(value string) string {
 	return hex.EncodeToString(sum[:])
 }
 
+func validateDigest(name, digest string, optional bool) error {
+	if digest == "" {
+		if optional {
+			return nil
+		}
+		return shoal.NewError(
+			shoal.ErrorInvalidArgument, name+" is required")
+	}
+	if len(digest) != sha256.Size*2 {
+		return shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			name+" must be a SHA-256 digest in lowercase hex",
+		)
+	}
+	for index := 0; index < len(digest); index++ {
+		value := digest[index]
+		if (value >= '0' && value <= '9') ||
+			(value >= 'a' && value <= 'f') {
+			continue
+		}
+		return shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			name+" must be a SHA-256 digest in lowercase hex",
+		)
+	}
+	return nil
+}
+
 func provenanceEdge(edgeType string, from, to shoal.ID) graph.Edge {
 	return graph.Edge{
 		ID:     DerivedID("edge", edgeType, string(from), string(to)),
@@ -617,6 +1434,27 @@ func setIfPresent(metadata shoal.Metadata, key, value string) {
 		return
 	}
 	metadata[key] = value
+}
+
+func setVisibility(metadata shoal.Metadata, labels []string) {
+	expression := Expression(labels)
+	if expression == "" {
+		return
+	}
+	if len(expression) <= shoal.MaxMetadataValueBytes {
+		metadata[PropertyVisibility] = expression
+		return
+	}
+	metadata[PropertyVisibilityDigest] = Digest(expression)
+	metadata[PropertyVisibilityCount] = strconv.Itoa(len(labels))
+}
+
+func delegationID(chain []shoal.ID) shoal.ID {
+	parts := make([]string, len(chain))
+	for index, id := range chain {
+		parts[index] = string(id)
+	}
+	return DerivedID("delegation", parts...)
 }
 
 func dedupeIDs(ids []shoal.ID) []shoal.ID {
