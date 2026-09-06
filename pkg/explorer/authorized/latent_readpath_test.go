@@ -21,6 +21,7 @@ package authorized_test
 
 import (
 	"context"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -36,6 +37,12 @@ type countingCanonicalBase struct {
 	documentCalls  int
 }
 
+type pagedCountingCanonicalBase struct {
+	*countingCanonicalBase
+	pages     int
+	pageCalls int
+}
+
 func (b *countingCanonicalBase) Documents(
 	ctx context.Context,
 ) ([]explorer.DocumentSummary, error) {
@@ -48,6 +55,29 @@ func (b *countingCanonicalBase) Document(
 ) (explorer.DocumentView, error) {
 	b.documentCalls++
 	return b.Explorer.Document(ctx, documentID, revisionID)
+}
+
+func (b *pagedCountingCanonicalBase) BoundedNeighborhood(
+	ctx context.Context,
+	request explorer.BoundedNeighborhoodRequest,
+) (explorer.BoundedNeighborhood, error) {
+	sourceRequest := request
+	sourceRequest.AfterEdgeID = ""
+	result, err := b.Explorer.BoundedNeighborhood(ctx, sourceRequest)
+	if err != nil {
+		return explorer.BoundedNeighborhood{}, err
+	}
+	b.pageCalls++
+	result.ScannedEdges = uint32(len(result.Neighborhood.Edges))
+	result.ScannedEdgesKnown = true
+	result.Continuation = b.pageCalls < b.pages
+	result.Truncated = result.Continuation
+	result.NextAfterEdgeID = ""
+	if result.Continuation {
+		result.NextAfterEdgeID = shoal.ID(
+			"forced-canonical-page-" + strconv.Itoa(b.pageCalls))
+	}
+	return result, nil
 }
 
 func TestAuthorizedDerivedAssertionsShareCanonicalNodeHydration(t *testing.T) {
@@ -86,15 +116,20 @@ func TestAuthorizedDerivedAssertionsShareCanonicalNodeHydration(t *testing.T) {
 	if err := f.base.PutLatentLinkCells(admin, cells); err != nil {
 		t.Fatal(err)
 	}
-	base := &countingCanonicalBase{Explorer: f.base}
+	counted := &countingCanonicalBase{Explorer: f.base}
+	base := &pagedCountingCanonicalBase{
+		countingCanonicalBase: counted,
+		pages:                 3,
+	}
 	client := f.newClient(t, base, f.store, f.sourceA, f.policyA, nil)
 	result, err := client.BoundedNeighborhood(
 		f.alice(t),
 		explorer.BoundedNeighborhoodRequest{
 			NodeIDs: []shoal.ID{source.Document.ID},
 			Depth:   1, Fanout: 64, MaxNodes: 64,
-			EdgeTypes: []string{authorizedLatentEdgeType(t)},
-			Direction: explorer.GraphDirectionOutgoing,
+			MaxScannedEdges: 256,
+			EdgeTypes:       []string{authorizedLatentEdgeType(t)},
+			Direction:       explorer.GraphDirectionOutgoing,
 		},
 	)
 	if err != nil {
@@ -106,10 +141,13 @@ func TestAuthorizedDerivedAssertionsShareCanonicalNodeHydration(t *testing.T) {
 			len(result.Neighborhood.Assertions), len(cells),
 		)
 	}
-	if base.documentsCalls != 2 || base.documentCalls != 3 {
+	if base.pageCalls != base.pages {
+		t.Fatalf("bounded page calls = %d, want %d", base.pageCalls, base.pages)
+	}
+	if counted.documentsCalls != 2 || counted.documentCalls != 3 {
 		t.Fatalf(
 			"canonical hydration calls = Documents:%d Document:%d, want 2 and 3",
-			base.documentsCalls, base.documentCalls,
+			counted.documentsCalls, counted.documentCalls,
 		)
 	}
 }

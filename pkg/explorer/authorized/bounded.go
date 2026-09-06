@@ -326,6 +326,67 @@ const (
 	derivedAssertionPropertyDerivationScore = "ontology.assertion.derivation.score"
 )
 
+type neighborhoodAuthorizationCacheKey struct{}
+
+type neighborhoodAuthorizationCache struct {
+	resolved           registeredNodes
+	resolvedIDs        map[shoal.ID]struct{}
+	canonicalDocuments map[shoal.ID]*canonicalRetrievalDocument
+}
+
+func withNeighborhoodAuthorizationCache(ctx context.Context) context.Context {
+	if _, ok := ctx.Value(
+		neighborhoodAuthorizationCacheKey{}).(*neighborhoodAuthorizationCache); ok {
+		return ctx
+	}
+	return context.WithValue(ctx, neighborhoodAuthorizationCacheKey{},
+		&neighborhoodAuthorizationCache{
+			resolved:           make(registeredNodes),
+			resolvedIDs:        make(map[shoal.ID]struct{}),
+			canonicalDocuments: make(map[shoal.ID]*canonicalRetrievalDocument),
+		})
+}
+
+func neighborhoodCache(ctx context.Context) *neighborhoodAuthorizationCache {
+	if cached, ok := ctx.Value(
+		neighborhoodAuthorizationCacheKey{}).(*neighborhoodAuthorizationCache); ok {
+		return cached
+	}
+	return &neighborhoodAuthorizationCache{
+		resolved:           make(registeredNodes),
+		resolvedIDs:        make(map[shoal.ID]struct{}),
+		canonicalDocuments: make(map[shoal.ID]*canonicalRetrievalDocument),
+	}
+}
+
+func (c *Client) resolveNeighborhoodNodes(
+	ctx context.Context,
+	nodeIDs []shoal.ID,
+	cache *neighborhoodAuthorizationCache,
+) (registeredNodes, error) {
+	missing := make([]shoal.ID, 0, len(nodeIDs))
+	for _, nodeID := range nodeIDs {
+		if _, seen := cache.resolvedIDs[nodeID]; seen {
+			continue
+		}
+		cache.resolvedIDs[nodeID] = struct{}{}
+		missing = append(missing, nodeID)
+	}
+	if len(missing) > 0 {
+		resolved, err := c.resolveNodes(ctx, missing)
+		if err != nil {
+			for _, nodeID := range missing {
+				delete(cache.resolvedIDs, nodeID)
+			}
+			return nil, err
+		}
+		for nodeID, registration := range resolved {
+			cache.resolved[nodeID] = registration
+		}
+	}
+	return cache.resolved, nil
+}
+
 func authorizedCursorEligible(normalized explorer.NeighborhoodRequest) bool {
 	return len(normalized.NodeIDs) == 1 && normalized.Depth == 1
 }
@@ -342,6 +403,16 @@ func (c *Client) boundedAuthorizedNeighborhoodPage(
 	operation auth.Operation,
 	applyLens bool,
 ) (explorer.BoundedNeighborhood, error) {
+	ctx = withNeighborhoodAuthorizationCache(ctx)
+	var err error
+	ctx, err = c.withCanonicalDocumentIndex(ctx)
+	if err != nil {
+		return explorer.BoundedNeighborhood{}, err
+	}
+	before, err := bounded.Snapshot(ctx)
+	if err != nil {
+		return explorer.BoundedNeighborhood{}, directBaseError(err)
+	}
 	scan := request
 	scan.Depth = 1
 	scan.NodeIDs = normalized.NodeIDs
@@ -453,6 +524,14 @@ func (c *Client) boundedAuthorizedNeighborhoodPage(
 	}
 	if err := guard.Check(ctx); err != nil {
 		return explorer.BoundedNeighborhood{}, err
+	}
+	afterSnapshot, err := bounded.Snapshot(ctx)
+	if err != nil {
+		return explorer.BoundedNeighborhood{}, directBaseError(err)
+	}
+	if before != afterSnapshot {
+		return explorer.BoundedNeighborhood{}, shoal.NewError(
+			shoal.ErrorConflict, "corpus changed while scanning bounded graph")
 	}
 	result := authorizedBoundedPage(
 		nodes, edges, assertions, request, len(normalized.NodeIDs))
@@ -602,6 +681,7 @@ func (c *Client) filterNeighborhood(
 	allowMissingProvenanceSeeds bool,
 	operation auth.Operation,
 ) (explorer.Neighborhood, error) {
+	cache := neighborhoodCache(ctx)
 	candidates := make(map[shoal.ID]graph.Node, len(raw.Nodes))
 	registrations := make(map[shoal.ID]NodeRegistration, len(raw.Nodes))
 	rawNodes := make(map[shoal.ID]graph.Node, len(raw.Nodes))
@@ -649,7 +729,7 @@ func (c *Client) filterNeighborhood(
 		}
 		rawNodeIDs = append(rawNodeIDs, assertion.Subject(), target)
 	}
-	resolved, err := c.resolveNodes(ctx, rawNodeIDs)
+	resolved, err := c.resolveNeighborhoodNodes(ctx, rawNodeIDs, cache)
 	if err != nil {
 		return explorer.Neighborhood{}, err
 	}
@@ -695,7 +775,8 @@ func (c *Client) filterNeighborhood(
 			registrations[target] = resolved[target]
 		}
 	}
-	canonicalNodes, err := c.canonicalRegisteredNodes(ctx, registrations)
+	canonicalNodes, err := c.canonicalRegisteredNodesCached(
+		ctx, registrations, cache.canonicalDocuments)
 	if err != nil {
 		return explorer.Neighborhood{}, err
 	}

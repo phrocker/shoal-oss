@@ -429,6 +429,14 @@ func (c *Client) canonicalRegisteredNodes(
 	ctx context.Context,
 	registrations map[shoal.ID]NodeRegistration,
 ) (map[shoal.ID]graph.Node, error) {
+	return c.canonicalRegisteredNodesCached(ctx, registrations, nil)
+}
+
+func (c *Client) canonicalRegisteredNodesCached(
+	ctx context.Context,
+	registrations map[shoal.ID]NodeRegistration,
+	canonicalDocuments map[shoal.ID]*canonicalRetrievalDocument,
+) (map[shoal.ID]graph.Node, error) {
 	currentBase, ok := ctx.Value(
 		canonicalDocumentIndexKey{}).(map[shoal.ID]shoal.ID)
 	if !ok {
@@ -439,16 +447,26 @@ func (c *Client) canonicalRegisteredNodes(
 		currentBase = indexed.Value(
 			canonicalDocumentIndexKey{}).(map[shoal.ID]shoal.ID)
 	}
+	if canonicalDocuments == nil {
+		canonicalDocuments = make(map[shoal.ID]*canonicalRetrievalDocument)
+	}
 	required := make(map[shoal.ID]shoal.ID)
 	for _, registration := range registrations {
+		if registration.Node.ID != "" {
+			continue
+		}
+		if cached, ok := canonicalDocuments[registration.DocumentID]; ok {
+			if cached.registration.RevisionID != registration.RevisionID {
+				return nil, inconsistentBase()
+			}
+			continue
+		}
 		if revisionID, ok := required[registration.DocumentID]; ok &&
 			revisionID != registration.RevisionID {
 			return nil, inconsistentBase()
 		}
 		required[registration.DocumentID] = registration.RevisionID
 	}
-	canonicalDocuments := make(
-		map[shoal.ID]*canonicalRetrievalDocument, len(required))
 	documentIDs := make([]shoal.ID, 0, len(required))
 	for documentID, revisionID := range required {
 		if currentBase[documentID] != revisionID {
