@@ -42,13 +42,13 @@ func foldFixture() interaction.Fold {
 	return interaction.Fold{
 		Members: []interaction.FoldMember{
 			{
-				SessionID:        "session-b",
+				SessionID:        "interaction.session_b",
 				RetrievedNodeIDs: []shoal.ID{"span-2", "span-3"},
 				CitedNodeIDs:     []shoal.ID{"span-3"},
 				Visibility:       []string{"ops"},
 			},
 			{
-				SessionID:        "session-a",
+				SessionID:        "interaction.session_a",
 				RetrievedNodeIDs: []shoal.ID{"span-1", "span-2"},
 				CitedNodeIDs:     []shoal.ID{"span-1"},
 				Visibility:       []string{"secret"},
@@ -74,13 +74,13 @@ func TestFoldIdentityIsContentAddressed(t *testing.T) {
 	shuffled := interaction.Fold{
 		Members: []interaction.FoldMember{
 			{
-				SessionID:        "session-a",
+				SessionID:        "interaction.session_a",
 				RetrievedNodeIDs: []shoal.ID{"span-2", "span-1", "span-1"},
 				CitedNodeIDs:     []shoal.ID{"span-1"},
 				Visibility:       []string{"secret"},
 			},
 			{
-				SessionID:        "session-b",
+				SessionID:        "interaction.session_b",
 				RetrievedNodeIDs: []shoal.ID{"span-3", "span-2"},
 				CitedNodeIDs:     []shoal.ID{"span-3"},
 				Visibility:       []string{"ops"},
@@ -209,7 +209,7 @@ func TestFoldSubgraphKeepsRetrievedAndCitedDistinct(t *testing.T) {
 // inside an interaction record are never mistaken for source provenance.
 func TestTouchedNodesIgnoresSubgraphInternalEdges(t *testing.T) {
 	session := interaction.Session{
-		ID:          "session-internal",
+		ID:          interaction.DerivedID("session", "internal"),
 		RecordedAt:  time.Unix(1700000000, 0).UTC(),
 		SeedNodeIDs: []shoal.ID{"span-1"},
 		Turns: []interaction.Turn{{
@@ -312,7 +312,7 @@ func TestFoldRequiresAtLeastOneMember(t *testing.T) {
 	}
 	duplicated := interaction.Fold{
 		Members: []interaction.FoldMember{
-			{SessionID: "session-a"}, {SessionID: "session-a"},
+			{SessionID: "interaction.session_a"}, {SessionID: "interaction.session_a"},
 		},
 		FoldedAt: time.Now(),
 	}

@@ -33,7 +33,11 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/phrocker/shoal-oss/pkg/contextpack"
+	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/inference"
+	"github.com/phrocker/shoal-oss/pkg/interaction"
+	"github.com/phrocker/shoal-oss/pkg/retrieval"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
@@ -399,18 +403,48 @@ func (a Action) validate() error {
 }
 
 type ToolResult struct {
-	correlation shoal.ID
-	kind        ActionKind
-	anchors     []inference.EvidenceAnchor
-	snapshot    inference.SnapshotPin
-	auth        inference.AuthPin
+	correlation       shoal.ID
+	kind              ActionKind
+	anchors           []inference.EvidenceAnchor
+	snapshot          inference.SnapshotPin
+	auth              inference.AuthPin
+	embeddingSpaceID  shoal.ID
+	embeddingSpaceIDs []shoal.ID
 }
 
 func NewToolResult(correlation shoal.ID, kind ActionKind, anchors []inference.EvidenceAnchor, snapshot inference.SnapshotPin, auth inference.AuthPin) (ToolResult, error) {
+	return NewToolResultWithEmbeddingSpaces(
+		correlation, kind, anchors, snapshot, auth,
+		"", nil,
+	)
+}
+
+// NewToolResultWithEmbeddingSpaces records both the aggregate vector-space
+// identity and its canonical constituent identities.
+func NewToolResultWithEmbeddingSpaces(
+	correlation shoal.ID,
+	kind ActionKind,
+	anchors []inference.EvidenceAnchor,
+	snapshot inference.SnapshotPin,
+	auth inference.AuthPin,
+	embeddingSpaceID shoal.ID,
+	embeddingSpaceIDs []shoal.ID,
+) (ToolResult, error) {
 	if len(anchors) > inference.MaxEvidenceAnchors {
 		return ToolResult{}, invalid("tool result anchor count is outside the supported range")
 	}
-	r := ToolResult{correlation: correlation, kind: kind, anchors: append([]inference.EvidenceAnchor(nil), anchors...), snapshot: snapshot, auth: auth}
+	r := ToolResult{
+		correlation: correlation, kind: kind,
+		anchors:  append([]inference.EvidenceAnchor(nil), anchors...),
+		snapshot: snapshot, auth: auth,
+		embeddingSpaceID: embeddingSpaceID,
+		embeddingSpaceIDs: append(
+			[]shoal.ID(nil), embeddingSpaceIDs...),
+	}
+	sort.Slice(r.embeddingSpaceIDs, func(i, j int) bool {
+		return shoal.CompareID(
+			r.embeddingSpaceIDs[i], r.embeddingSpaceIDs[j]) < 0
+	})
 	sort.Slice(r.anchors, func(i, j int) bool { return shoal.CompareID(r.anchors[i].ID(), r.anchors[j].ID()) < 0 })
 	if err := r.validate(); err != nil {
 		return ToolResult{}, err
@@ -424,6 +458,10 @@ func (r ToolResult) Anchors() []inference.EvidenceAnchor {
 }
 func (r ToolResult) Snapshot() inference.SnapshotPin  { return r.snapshot }
 func (r ToolResult) Authorization() inference.AuthPin { return r.auth }
+func (r ToolResult) EmbeddingSpaceID() shoal.ID       { return r.embeddingSpaceID }
+func (r ToolResult) EmbeddingSpaceIDs() []shoal.ID {
+	return append([]shoal.ID(nil), r.embeddingSpaceIDs...)
+}
 func (r ToolResult) validate() error {
 	if err := validateLogicalID("tool result correlation ID", r.correlation); err != nil {
 		return err
@@ -438,6 +476,41 @@ func (r ToolResult) validate() error {
 	}
 	if err := r.auth.Validate(); err != nil {
 		return err
+	}
+	if err := shoal.ValidateOptionalID(
+		"tool result embedding space ID", r.embeddingSpaceID,
+	); err != nil {
+		return err
+	}
+	if r.embeddingSpaceID != "" && len(r.embeddingSpaceIDs) == 0 {
+		return invalid(
+			"tool result embedding space requires canonical constituents")
+	}
+	if r.embeddingSpaceID == "" && len(r.embeddingSpaceIDs) > 0 {
+		return invalid(
+			"tool result embedding space constituents require an aggregate ID")
+	}
+	for index, id := range r.embeddingSpaceIDs {
+		if err := shoal.ValidateRequiredID(
+			"tool result embedding space constituent ID", id,
+		); err != nil {
+			return err
+		}
+		if index > 0 &&
+			shoal.CompareID(r.embeddingSpaceIDs[index-1], id) >= 0 {
+			return invalid(
+				"tool result embedding space constituent IDs must be unique")
+		}
+	}
+	if len(r.embeddingSpaceIDs) > 0 {
+		expected, err := retrieval.EmbeddingSpaceSetID(
+			r.embeddingSpaceIDs...)
+		if err != nil {
+			return err
+		}
+		if expected != r.embeddingSpaceID {
+			return invalid("tool result embedding space ID is not canonical")
+		}
 	}
 	if len(r.anchors) > inference.MaxEvidenceAnchors {
 		return invalid("tool result anchor count is outside the supported range")
@@ -584,12 +657,13 @@ type RunTrace struct {
 // exposure — and therefore the visibility an interaction record requires — is
 // determined by everything it saw.
 type InteractionTurn struct {
-	Index            int
-	Decision         ActionKind
-	Usage            Usage
-	Failed           bool
-	ToolKind         ActionKind
-	RetrievedNodeIDs []shoal.ID
+	Index             int
+	Decision          ActionKind
+	Usage             Usage
+	Failed            bool
+	ToolKind          ActionKind
+	RetrievedNodeIDs  []shoal.ID
+	RetrievedEvidence []interaction.EvidenceReference
 }
 
 // EvaluationRecord is a redacted deterministic execution record. It contains
@@ -602,22 +676,32 @@ type EvaluationRecord struct {
 	ActionKinds []ActionKind
 	ActionUsage []Usage
 
-	// TranscriptID, RequestID, ContextPackID, and ResultID are derived
-	// identities. QueryDigest is a one-way digest of the question, present so
-	// records can be correlated without persisting the question itself.
-	TranscriptID  shoal.ID
-	RequestID     shoal.ID
-	ContextPackID shoal.ID
-	ResultID      shoal.ID
-	QueryDigest   string
-	StopReason    StopReason
+	// TranscriptID, RequestID, ContextPackID, ResultID, SnapshotID,
+	// AuthorizationFingerprint, and EmbeddingSpaceID are opaque identities.
+	// QueryDigest is a one-way digest of the question, present so records can
+	// be correlated without persisting the question itself.
+	TranscriptID             shoal.ID
+	RequestID                shoal.ID
+	ContextPackID            shoal.ID
+	ResultID                 shoal.ID
+	QueryDigest              string
+	StopReason               StopReason
+	SnapshotID               shoal.ID
+	SnapshotAsOf             time.Time
+	AuthorizationFingerprint shoal.ID
+	AuthorizationExpiresAt   time.Time
+	AuthorizationOperation   string
+	EmbeddingSpaceID         shoal.ID
+	EmbeddingSpaces          interaction.EmbeddingSpaceSet
 
 	// SeedNodeIDs are source graph nodes the session was shown before its
 	// first turn. CitedNodeIDs are the source graph nodes the final answer
 	// actually cited. Both are sorted and deduplicated.
-	SeedNodeIDs  []shoal.ID
-	Turns        []InteractionTurn
-	CitedNodeIDs []shoal.ID
+	SeedNodeIDs   []shoal.ID
+	SeedEvidence  []interaction.EvidenceReference
+	Turns         []InteractionTurn
+	CitedNodeIDs  []shoal.ID
+	CitedEvidence []interaction.EvidenceReference
 }
 
 // Recorder durably captures an execution record. Recording is part of serving
@@ -742,22 +826,35 @@ func (g *Generator) Run(ctx context.Context, pack inference.ContextPack) (Record
 					return earlyFinish(StopReasonInvalid, "authorization", err)
 				}
 				if err := validateCachedRecord(cached, request, pack); err == nil {
-					if err := g.recorder.Record(runCtx, evaluationRecord(cached)); err != nil {
+					evaluation, recordErr := evaluationRecord(cached)
+					if recordErr != nil {
+						return earlyFinish(
+							stopReasonFor(recordErr), "recorder", recordErr)
+					}
+					if err := g.recorder.Record(runCtx, evaluation); err != nil {
 						return earlyFinish(stopReasonFor(err), "recorder", err)
 					}
 					if err := runCtx.Err(); err != nil {
-						return earlyFinish(stopReasonFor(err), "recorder", err)
+						return earlyFinish(
+							stopReasonFor(err), "recorder",
+							explorer.MarkCommittedInteraction(err))
 					}
 					if !g.now().Before(pack.Authorization().ExpiresAt()) {
 						err := invalid("authorization pin expired during cache recording")
-						return earlyFinish(StopReasonInvalid, "authorization", err)
+						return earlyFinish(
+							StopReasonInvalid, "authorization",
+							explorer.MarkCommittedInteraction(err))
 					}
 					if err := runCtx.Err(); err != nil {
-						return earlyFinish(stopReasonFor(err), "cache", err)
+						return earlyFinish(
+							stopReasonFor(err), "cache",
+							explorer.MarkCommittedInteraction(err))
 					}
 					if !g.now().Before(pack.Authorization().ExpiresAt()) {
 						err := invalid("authorization pin expired before cache return")
-						return earlyFinish(StopReasonInvalid, "authorization", err)
+						return earlyFinish(
+							StopReasonInvalid, "authorization",
+							explorer.MarkCommittedInteraction(err))
 					}
 					return cloneRecord(cached), nil
 				}
@@ -791,6 +888,7 @@ func (g *Generator) Run(ctx context.Context, pack inference.ContextPack) (Record
 			GraphNodes:   len(graphNodes),
 		}
 	}
+	recordCommitted := false
 	finish := func(
 		reason StopReason,
 		iteration int,
@@ -827,6 +925,9 @@ func (g *Generator) Run(ctx context.Context, pack inference.ContextPack) (Record
 					Error:     postErr.Error(),
 				})
 				record.Trace = cloneRunTrace(trace)
+				if recordCommitted {
+					postErr = explorer.MarkCommittedInteraction(postErr)
+				}
 				return record, postErr
 			}
 			if !g.now().Before(pack.Authorization().ExpiresAt()) {
@@ -838,6 +939,9 @@ func (g *Generator) Run(ctx context.Context, pack inference.ContextPack) (Record
 					Error:     postErr.Error(),
 				})
 				record.Trace = cloneRunTrace(trace)
+				if recordCommitted {
+					postErr = explorer.MarkCommittedInteraction(postErr)
+				}
 				return record, postErr
 			}
 		}
@@ -887,7 +991,10 @@ func (g *Generator) Run(ctx context.Context, pack inference.ContextPack) (Record
 		outputTokens += action.usage.OutputTokens
 		trace.Iterations[len(trace.Iterations)-1].Budget = currentUsage()
 		if err := runCtx.Err(); err != nil {
-			return finish(stopReasonFor(err), step, "model", inference.InferenceResult{}, err)
+			return finish(
+				stopReasonFor(err), step, "model",
+				inference.InferenceResult{}, err,
+			)
 		}
 		if !g.now().Before(pack.Authorization().ExpiresAt()) {
 			err := invalid("authorization pin expired during execution")
@@ -934,11 +1041,26 @@ func (g *Generator) Run(ctx context.Context, pack inference.ContextPack) (Record
 				Request: request, Transcript: cloneTranscript(transcript),
 				Result: result, Trace: cloneRunTrace(trace),
 			}
-			if err := g.recorder.Record(runCtx, evaluationRecord(record)); err != nil {
+			evaluation, recordErr := evaluationRecord(record)
+			if recordErr != nil {
+				return finish(
+					stopReasonFor(recordErr), step, "recorder",
+					inference.InferenceResult{}, recordErr,
+				)
+			}
+			if err := g.recorder.Record(runCtx, evaluation); err != nil {
+				if explorer.IsCommittedInteraction(err) {
+					recordCommitted = true
+				}
 				return finish(stopReasonFor(err), step, "recorder", inference.InferenceResult{}, err)
 			}
+			recordCommitted = true
 			if err := runCtx.Err(); err != nil {
-				return finish(stopReasonFor(err), step, "model", inference.InferenceResult{}, err)
+				return finish(
+					stopReasonFor(err), step, "model",
+					inference.InferenceResult{},
+					explorer.MarkCommittedInteraction(err),
+				)
 			}
 			return finish(StopReasonStop, step, "stop", result, nil)
 		}
@@ -1027,7 +1149,11 @@ func (g *Generator) Run(ctx context.Context, pack inference.ContextPack) (Record
 			return finish(StopReasonBudgetExhausted, step, "budget", inference.InferenceResult{}, err)
 		}
 		addGraphNodes(graphNodes, toolResult.anchors)
-		nextPack, err := addAnchors(transcript.context, toolResult.anchors)
+		nextPack, err := addAnchors(
+			transcript.context,
+			toolResult.anchors,
+			toolResult.embeddingSpaceIDs,
+		)
 		if err != nil {
 			return finish(StopReasonInvalid, step, "context pack", inference.InferenceResult{}, err)
 		}
@@ -1127,19 +1253,29 @@ func cloneRunTrace(trace RunTrace) RunTrace {
 	return trace
 }
 
-func evaluationRecord(record Record) EvaluationRecord {
+func evaluationRecord(record Record) (EvaluationRecord, error) {
+	embeddingSpaceID, _, err := contextpack.EmbeddingSpaceID(
+		record.Transcript.context)
+	if err != nil {
+		return EvaluationRecord{}, err
+	}
 	evaluation := EvaluationRecord{
 		Provenance:  record.Request.provenance,
 		Budgets:     record.Request.budgets,
 		ActionKinds: make([]ActionKind, 0, len(record.Transcript.exchanges)+1),
 		ActionUsage: make([]Usage, 0, len(record.Transcript.exchanges)+1),
 
-		TranscriptID:  record.Transcript.id,
-		RequestID:     record.Request.id,
-		ContextPackID: record.Request.context.ID(),
-		ResultID:      record.Result.ID(),
-		QueryDigest:   digestString(record.Request.context.Query()),
-		StopReason:    record.Trace.StopReason,
+		TranscriptID:             record.Transcript.id,
+		RequestID:                record.Request.id,
+		ContextPackID:            record.Request.context.ID(),
+		ResultID:                 record.Result.ID(),
+		QueryDigest:              digestString(record.Request.context.Query()),
+		StopReason:               record.Trace.StopReason,
+		SnapshotID:               record.Request.context.Snapshot().ID(),
+		SnapshotAsOf:             record.Request.context.Snapshot().AsOf(),
+		AuthorizationFingerprint: record.Request.context.Authorization().Fingerprint(),
+		AuthorizationExpiresAt:   record.Request.context.Authorization().ExpiresAt(),
+		EmbeddingSpaceID:         embeddingSpaceID,
 	}
 	if evaluation.StopReason == "" && record.Transcript.final != nil {
 		evaluation.StopReason = StopReasonStop
@@ -1154,6 +1290,11 @@ func evaluationRecord(record Record) EvaluationRecord {
 			failedIterations[failure.Iteration] = struct{}{}
 		}
 	}
+	evaluation.SeedEvidence, err = evidenceReferences(
+		record.Request.context.Evidence())
+	if err != nil {
+		return EvaluationRecord{}, err
+	}
 	evaluation.SeedNodeIDs = sourceNodeIDs(record.Request.context.Evidence())
 	for index, exchange := range record.Transcript.exchanges {
 		add(exchange.action)
@@ -1163,6 +1304,11 @@ func evaluationRecord(record Record) EvaluationRecord {
 			Usage:            exchange.action.usage,
 			ToolKind:         exchange.result.kind,
 			RetrievedNodeIDs: sourceNodeIDs(exchange.result.anchors),
+		}
+		turn.RetrievedEvidence, err = evidenceReferences(
+			exchange.result.anchors)
+		if err != nil {
+			return EvaluationRecord{}, err
 		}
 		if _, failed := failedIterations[index]; failed {
 			turn.Failed = true
@@ -1184,7 +1330,59 @@ func evaluationRecord(record Record) EvaluationRecord {
 	}
 	evaluation.CitedNodeIDs = citedSourceNodeIDs(
 		record.Result, record.Transcript.context.Evidence())
-	return evaluation
+	evaluation.CitedEvidence, err = citedEvidenceReferences(
+		record.Result, record.Transcript.context.Evidence())
+	if err != nil {
+		return EvaluationRecord{}, err
+	}
+	return evaluation, nil
+}
+
+func evidenceReferences(
+	anchors []inference.EvidenceAnchor,
+) ([]interaction.EvidenceReference, error) {
+	if len(anchors) == 0 {
+		return nil, nil
+	}
+	result := make([]interaction.EvidenceReference, 0, len(anchors))
+	for _, anchor := range anchors {
+		reference, err := anchor.EvidenceReference()
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, reference)
+	}
+	sort.Slice(result, func(i, j int) bool {
+		return shoal.CompareID(
+			result[i].AnchorID, result[j].AnchorID) < 0
+	})
+	return result, nil
+}
+
+func citedEvidenceReferences(
+	result inference.InferenceResult,
+	available []inference.EvidenceAnchor,
+) ([]interaction.EvidenceReference, error) {
+	cited := make(map[shoal.ID]struct{})
+	for _, claim := range result.Claims() {
+		for _, id := range claim.EvidenceIDs() {
+			cited[id] = struct{}{}
+		}
+	}
+	for _, issue := range append(result.Unresolved(), result.Unsupported()...) {
+		for _, id := range issue.EvidenceIDs() {
+			cited[id] = struct{}{}
+		}
+	}
+	anchors := append(append([]inference.EvidenceAnchor(nil), available...),
+		result.EvidenceAdditions()...)
+	selected := make([]inference.EvidenceAnchor, 0, len(cited))
+	for _, anchor := range anchors {
+		if _, ok := cited[anchor.ID()]; ok {
+			selected = append(selected, anchor)
+		}
+	}
+	return evidenceReferences(selected)
 }
 
 // sourceNodeIDs projects evidence anchors onto the source graph nodes they
@@ -1277,7 +1475,11 @@ func validateToolResult(action Action, result ToolResult, original inference.Con
 	return nil
 }
 
-func addAnchors(pack inference.ContextPack, additions []inference.EvidenceAnchor) (inference.ContextPack, error) {
+func addAnchors(
+	pack inference.ContextPack,
+	additions []inference.EvidenceAnchor,
+	embeddingSpaceIDs []shoal.ID,
+) (inference.ContextPack, error) {
 	anchors := pack.Evidence()
 	seen := make(map[shoal.ID]struct{}, len(anchors)+len(additions))
 	for _, a := range anchors {
@@ -1295,7 +1497,14 @@ func addAnchors(pack inference.ContextPack, additions []inference.EvidenceAnchor
 	if ok {
 		ontologyPtr = &ontology
 	}
-	return inference.NewContextPack(pack.Query(), anchors, ontologyPtr, pack.Snapshot(), pack.Authorization(), pack.Metadata())
+	metadata, err := contextpack.MergeEmbeddingSpaceMetadata(
+		pack.Metadata(), embeddingSpaceIDs)
+	if err != nil {
+		return inference.ContextPack{}, err
+	}
+	return inference.NewContextPack(
+		pack.Query(), anchors, ontologyPtr,
+		pack.Snapshot(), pack.Authorization(), metadata)
 }
 
 func actionKey(a Action) string {

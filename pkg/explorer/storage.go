@@ -25,9 +25,13 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/gob"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"reflect"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -49,11 +53,13 @@ const (
 	recordCF       = "record"
 	recordCQV1     = "v1"
 	recordCQV2     = "v2"
+	recordDeleteCQ = "deleted"
 	documentRow    = "document/"
 	edgeRow        = "edge/"
 	interactionRow = "interaction/"
 	foldRow        = "interaction-fold/"
 	extractionRow  = "extraction/"
+	snapshotRow    = "snapshot/"
 	proposalRow    = "ontology-proposal/"
 	transitionRow  = "ontology-proposal-transition/"
 
@@ -69,6 +75,7 @@ const (
 	embeddedRecordOntologyProposal     = byte(8)
 	embeddedRecordProposalTransition   = byte(9)
 	embeddedRecordExtraction           = byte(10)
+	embeddedRecordSnapshot             = byte(11)
 	embeddedEnvelopeHeader             = 8 + 1 + 1 + 8 + sha256.Size
 	maxEmbeddedDocumentBytes           = uint64(document.MaxRevisionSourceBytes) * 8
 	maxEmbeddedEdgeBytes               = uint64(2 * 1024 * 1024)
@@ -80,6 +87,7 @@ const (
 	maxEmbeddedOntologyProposalBytes   = uint64(16 * 1024 * 1024)
 	maxEmbeddedProposalTransitionBytes = uint64(64 * 1024)
 	maxEmbeddedExtractionBytes         = uint64(16 * 1024 * 1024)
+	maxEmbeddedSnapshotBytes           = uint64(64 * 1024 * 1024)
 )
 
 var snapshotAnchorRow = []byte("meta/snapshot-anchor")
@@ -90,6 +98,25 @@ var interactionSinkRow = []byte("meta/interaction-sink")
 
 type persistedSnapshotAnchor struct {
 	CreatedAt time.Time
+}
+
+type persistedSnapshot struct {
+	ID             shoal.ID
+	AsOf           time.Time
+	ParentID       shoal.ID
+	AddedNodeIDs   []shoal.ID
+	RemovedNodeIDs []shoal.ID
+	NodeStates     []persistedSnapshotObject
+	RemovedEdgeIDs []shoal.ID
+	EdgeStates     []persistedSnapshotObject
+	// Assertion states are keyed by their mapped source edge, like graphAssertions.
+	AssertionStates         []persistedSnapshotObject
+	RemovedAssertionEdgeIDs []shoal.ID
+}
+
+type persistedSnapshotObject struct {
+	ID     shoal.ID
+	Digest string
 }
 
 // persistedCursorKey holds the durable, per-corpus secret that seals change-feed
@@ -133,6 +160,13 @@ func foldRecordRow(foldID shoal.ID) []byte {
 	row := make([]byte, 0, len(foldRow)+len(foldID))
 	row = append(row, foldRow...)
 	row = append(row, []byte(foldID)...)
+	return row
+}
+
+func snapshotRecordRow(snapshotID shoal.ID) []byte {
+	row := make([]byte, 0, len(snapshotRow)+len(snapshotID))
+	row = append(row, snapshotRow...)
+	row = append(row, snapshotID...)
 	return row
 }
 
@@ -220,6 +254,12 @@ func (e *Explorer) load() error {
 			); err != nil {
 				return err
 			}
+		case bytes.HasPrefix(key.Row, []byte(snapshotRow)):
+			if err := e.loadSnapshotRecord(
+				key.Row, qualifier, scanner.Value(),
+			); err != nil {
+				return err
+			}
 		case bytes.HasPrefix(key.Row, []byte(proposalRow)):
 			if err := e.loadOntologyProposalRecord(
 				key.Row, qualifier, scanner.Value(),
@@ -254,6 +294,9 @@ func (e *Explorer) load() error {
 		return err
 	}
 	e.embeddingSpace = embeddingSpaceCache{provenance: space, found: found}
+	if err := e.restoreLatestSnapshotLocked(); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -271,6 +314,130 @@ func (e *Explorer) loadSnapshotAnchor(qualifier, encoded []byte) error {
 		return shoal.NewError(shoal.ErrorInternal, "snapshot anchor time is missing")
 	}
 	e.snapshotAnchor = record.CreatedAt.UTC()
+	return nil
+}
+
+func (e *Explorer) loadSnapshotRecord(
+	row, qualifier, encoded []byte,
+) error {
+	if !bytes.Equal(qualifier, []byte(recordCQV2)) {
+		return nil
+	}
+	var record persistedSnapshot
+	if err := decodeEmbeddedRecord(
+		encoded, embeddedRecordSnapshot, &record,
+	); err != nil {
+		return shoal.WrapError(
+			shoal.ErrorInternal, "decode explorer snapshot", err)
+	}
+	if err := shoal.ValidateRequiredID("snapshot ID", record.ID); err != nil {
+		return shoal.WrapError(
+			shoal.ErrorInternal, "stored snapshot is invalid", err)
+	}
+	if record.AsOf.IsZero() ||
+		!bytes.Equal(row, snapshotRecordRow(record.ID)) {
+		return shoal.NewError(
+			shoal.ErrorInternal, "stored snapshot record is invalid")
+	}
+	if err := validateSnapshotDelta(record); err != nil {
+		return shoal.WrapError(
+			shoal.ErrorInternal, "stored snapshot is invalid", err)
+	}
+	record.AsOf = record.AsOf.UTC()
+	if existing, ok := e.snapshotHistory[string(record.ID)]; ok &&
+		!persistedSnapshotsEqual(existing, record) {
+		return shoal.NewError(
+			shoal.ErrorInternal, "stored snapshot ID has conflicting content")
+	}
+	e.snapshotHistory[string(record.ID)] = record
+	return nil
+}
+
+func validateSnapshotDelta(record persistedSnapshot) error {
+	if err := shoal.ValidateOptionalID(
+		"snapshot parent ID", record.ParentID); err != nil {
+		return err
+	}
+	for groupIndex, ids := range [][]shoal.ID{
+		record.AddedNodeIDs, record.RemovedNodeIDs, record.RemovedEdgeIDs,
+		record.RemovedAssertionEdgeIDs,
+	} {
+		name := "snapshot node ID"
+		if groupIndex >= 2 {
+			name = "snapshot edge ID"
+		}
+		for index, id := range ids {
+			if err := shoal.ValidateRequiredID(name, id); err != nil {
+				return err
+			}
+			if index > 0 && shoal.CompareID(ids[index-1], id) >= 0 {
+				return fmt.Errorf("snapshot object IDs are not canonical")
+			}
+		}
+	}
+	for _, states := range [][]persistedSnapshotObject{
+		record.NodeStates, record.EdgeStates, record.AssertionStates,
+	} {
+		for index, state := range states {
+			if err := shoal.ValidateRequiredID(
+				"snapshot object ID", state.ID); err != nil {
+				return err
+			}
+			decoded, err := hex.DecodeString(state.Digest)
+			if err != nil || len(decoded) != sha256.Size ||
+				hex.EncodeToString(decoded) != state.Digest {
+				return fmt.Errorf("snapshot object digest is invalid")
+			}
+			if index > 0 &&
+				shoal.CompareID(states[index-1].ID, state.ID) >= 0 {
+				return fmt.Errorf("snapshot object states are not canonical")
+			}
+		}
+	}
+	for _, id := range record.AddedNodeIDs {
+		index := sort.Search(len(record.RemovedNodeIDs), func(index int) bool {
+			return shoal.CompareID(record.RemovedNodeIDs[index], id) >= 0
+		})
+		if index < len(record.RemovedNodeIDs) &&
+			record.RemovedNodeIDs[index] == id {
+			return fmt.Errorf("snapshot node cannot be both added and removed")
+		}
+	}
+	if len(record.NodeStates) > 0 {
+		if len(record.NodeStates) != len(record.AddedNodeIDs) {
+			return fmt.Errorf("snapshot node states do not match node additions")
+		}
+		for index, state := range record.NodeStates {
+			if state.ID != record.AddedNodeIDs[index] {
+				return fmt.Errorf(
+					"snapshot node states do not match node additions")
+			}
+		}
+	}
+	for _, state := range record.EdgeStates {
+		index := sort.Search(
+			len(record.RemovedEdgeIDs), func(index int) bool {
+				return shoal.CompareID(
+					record.RemovedEdgeIDs[index], state.ID) >= 0
+			})
+		if index < len(record.RemovedEdgeIDs) &&
+			record.RemovedEdgeIDs[index] == state.ID {
+			return fmt.Errorf(
+				"snapshot edge cannot be both updated and removed")
+		}
+	}
+	for _, state := range record.AssertionStates {
+		index := sort.Search(
+			len(record.RemovedAssertionEdgeIDs), func(index int) bool {
+				return shoal.CompareID(
+					record.RemovedAssertionEdgeIDs[index], state.ID) >= 0
+			})
+		if index < len(record.RemovedAssertionEdgeIDs) &&
+			record.RemovedAssertionEdgeIDs[index] == state.ID {
+			return fmt.Errorf(
+				"snapshot assertion cannot be both updated and removed")
+		}
+	}
 	return nil
 }
 
@@ -430,6 +597,21 @@ func (e *Explorer) loadInteractionRecord(row, qualifier, encoded []byte) error {
 		return shoal.NewError(
 			shoal.ErrorInternal, "stored explorer interaction row is invalid")
 	}
+	e.reserveInteractionRecordGraphIDsLocked(
+		record.SessionID, record.Nodes, record.Edges)
+	if !record.Deleted {
+		if live, ok := e.interactionLiveRecords[record.SessionID]; ok {
+			if !reflect.DeepEqual(*live, record) {
+				return shoal.NewError(
+					shoal.ErrorInternal,
+					"stored interaction session has conflicting live versions",
+				)
+			}
+		} else {
+			live := record
+			e.interactionLiveRecords[record.SessionID] = &live
+		}
+	}
 	// A session row is written at most twice: once when the interaction is
 	// recorded and once when it is explicitly deleted. The scan returns raw
 	// cells, so both versions arrive here. Resolve without depending on scan
@@ -462,6 +644,21 @@ func (e *Explorer) loadFoldRecord(row, qualifier, encoded []byte) error {
 	if !bytes.Equal(row, foldRecordRow(record.FoldID)) {
 		return shoal.NewError(
 			shoal.ErrorInternal, "stored explorer fold row is invalid")
+	}
+	e.reserveInteractionRecordGraphIDsLocked(
+		record.FoldID, record.Nodes, record.Edges)
+	if !record.Deleted {
+		if live, ok := e.foldLiveRecords[record.FoldID]; ok {
+			if !persistedFoldsEqual(*live, record) {
+				return shoal.NewError(
+					shoal.ErrorInternal,
+					"stored fold has conflicting live versions",
+				)
+			}
+		} else {
+			live := record
+			e.foldLiveRecords[record.FoldID] = &live
+		}
 	}
 	// A fold row is written at most twice: once when it is folded and once
 	// when it is explicitly deleted. The scan returns raw cells, so both
@@ -497,6 +694,404 @@ func (e *Explorer) writeEncodedRecord(row, encoded []byte) error {
 		)
 	}
 	return nil
+}
+
+// writeInteractionRecord appends an interaction-family record and resolves a
+// storage error whose commit outcome is indeterminate by reading the exact
+// cell back. A byte-identical durable value is success; absence or a different
+// value preserves the indeterminate error so inference still fails closed.
+func (e *Explorer) writeInteractionRecord(
+	row []byte, kind byte, value any,
+) error {
+	writer := e.interactionRecordWriter
+	if writer == nil {
+		writer = e.writeRecord
+	}
+	err := writer(row, kind, value)
+	if err == nil || !IsIndeterminateCommit(err) {
+		return err
+	}
+	expected, encodeErr := encodeEmbeddedRecord(kind, value)
+	if encodeErr != nil {
+		return errors.Join(err, encodeErr)
+	}
+	committed, readErr := e.hasExactRecord(row, expected)
+	if readErr != nil {
+		return errors.Join(err, readErr)
+	}
+	if committed {
+		return nil
+	}
+	return err
+}
+
+func (e *Explorer) createInteractionRecord(
+	row []byte, kind byte, value any,
+) (bool, error) {
+	if e.interactionRecordWriter != nil {
+		err := e.writeInteractionRecord(row, kind, value)
+		return err == nil, err
+	}
+	return e.conditionalInteractionRecord(
+		row, kind, value, recordCQV2, false)
+}
+
+func (e *Explorer) deleteInteractionRecord(
+	row []byte, kind byte, value any,
+) (bool, error) {
+	if e.interactionRecordWriter != nil {
+		err := e.writeInteractionRecord(row, kind, value)
+		return err == nil, err
+	}
+	return e.conditionalInteractionRecord(
+		row, kind, value, recordDeleteCQ, true)
+}
+
+func (e *Explorer) conditionalInteractionRecord(
+	row []byte,
+	kind byte,
+	value any,
+	conditionQualifier string,
+	writeDeleteMarker bool,
+) (bool, error) {
+	encoded, err := encodeEmbeddedRecord(kind, value)
+	if err != nil {
+		return false, shoal.WrapError(
+			shoal.ErrorInternal, "encode interaction record", err)
+	}
+	mutation, err := cclient.NewMutation(row)
+	if err != nil {
+		return false, shoal.WrapError(
+			shoal.ErrorInternal, "create interaction mutation", err)
+	}
+	mutation.PutLatest(
+		[]byte(recordCF), []byte(recordCQV2), nil, encoded)
+	if writeDeleteMarker {
+		mutation.PutLatest(
+			[]byte(recordCF), []byte(recordDeleteCQ), nil, []byte{1})
+	}
+	accepted, err := e.engine.ConditionalWrite(
+		explorerTable,
+		[]engine.ConditionalMutation{{
+			Mutation: mutation,
+			Conditions: []engine.Condition{{
+				ColumnFamily:    []byte(recordCF),
+				ColumnQualifier: []byte(conditionQualifier),
+				Kind:            engine.ConditionAbsent,
+			}},
+		}},
+	)
+	if err == nil {
+		if len(accepted) != 1 {
+			return false, shoal.NewError(
+				shoal.ErrorInternal,
+				"interaction conditional write returned an invalid result",
+			)
+		}
+		return accepted[0], nil
+	}
+	indeterminate := MarkIndeterminateCommit(
+		shoal.WrapError(
+			shoal.ErrorUnavailable,
+			"conditionally write interaction record",
+			err,
+		),
+	)
+	committed, readErr := e.hasExactRecord(row, encoded)
+	if readErr != nil {
+		return false, errors.Join(indeterminate, readErr)
+	}
+	if committed {
+		return true, nil
+	}
+	winnerQualifier := recordCQV2
+	if writeDeleteMarker {
+		winnerQualifier = recordDeleteCQ
+	}
+	found, readErr := e.hasCurrentQualifier(row, winnerQualifier)
+	if readErr != nil {
+		return false, errors.Join(indeterminate, readErr)
+	}
+	if found {
+		return false, nil
+	}
+	return false, indeterminate
+}
+
+func (e *Explorer) hasExactRecord(row, expected []byte) (bool, error) {
+	committed := false
+	examined := false
+	err := e.engine.LookupRows(
+		explorerTable,
+		[][]byte{append([]byte(nil), row...)},
+		engine.ScanOptions{
+			ColumnFamilies:          [][]byte{[]byte(recordCF)},
+			ColumnFamiliesInclusive: true,
+		},
+		func(_ int, key *iterrt.Key, value []byte) {
+			if examined ||
+				!bytes.Equal(key.ColumnQualifier, []byte(recordCQV2)) {
+				return
+			}
+			examined = true
+			committed = equivalentEmbeddedRecord(
+				key.Row, value, expected)
+		},
+	)
+	if err != nil {
+		return false, shoal.WrapError(
+			shoal.ErrorUnavailable,
+			"verify indeterminate interaction write",
+			err,
+		)
+	}
+	return committed, nil
+}
+
+func (e *Explorer) hasCurrentQualifier(
+	row []byte, qualifier string,
+) (bool, error) {
+	found := false
+	err := e.engine.LookupRows(
+		explorerTable,
+		[][]byte{append([]byte(nil), row...)},
+		engine.ScanOptions{
+			ColumnFamilies:          [][]byte{[]byte(recordCF)},
+			ColumnFamiliesInclusive: true,
+		},
+		func(_ int, key *iterrt.Key, _ []byte) {
+			if !found &&
+				bytes.Equal(key.ColumnQualifier, []byte(qualifier)) {
+				found = true
+			}
+		},
+	)
+	if err != nil {
+		return false, shoal.WrapError(
+			shoal.ErrorUnavailable,
+			"read current interaction record",
+			err,
+		)
+	}
+	return found, nil
+}
+
+func (e *Explorer) lookupPersistedInteraction(
+	sessionID shoal.ID,
+) (persistedInteraction, bool, error) {
+	var record persistedInteraction
+	found, err := e.lookupEmbeddedRecord(
+		interactionRecordRow(sessionID),
+		embeddedRecordInteraction,
+		&record,
+	)
+	if err != nil || !found {
+		return persistedInteraction{}, found, err
+	}
+	if err := validatePersistedInteraction(record); err != nil {
+		return persistedInteraction{}, false, shoal.WrapError(
+			shoal.ErrorInternal,
+			"stored explorer interaction is invalid",
+			err,
+		)
+	}
+	if record.SessionID != sessionID {
+		return persistedInteraction{}, false, shoal.NewError(
+			shoal.ErrorInternal,
+			"stored explorer interaction row is invalid",
+		)
+	}
+	return record, true, nil
+}
+
+func (e *Explorer) lookupPersistedLiveInteraction(
+	sessionID shoal.ID,
+) (persistedInteraction, bool, error) {
+	var live persistedInteraction
+	found := false
+	var decodeErr error
+	row := interactionRecordRow(sessionID)
+	err := e.engine.LookupRows(
+		explorerTable,
+		[][]byte{append([]byte(nil), row...)},
+		engine.ScanOptions{
+			ColumnFamilies:          [][]byte{[]byte(recordCF)},
+			ColumnFamiliesInclusive: true,
+		},
+		func(_ int, key *iterrt.Key, value []byte) {
+			if decodeErr != nil ||
+				!bytes.Equal(key.ColumnQualifier, []byte(recordCQV2)) {
+				return
+			}
+			var candidate persistedInteraction
+			if err := decodeEmbeddedRecord(
+				value, embeddedRecordInteraction, &candidate,
+			); err != nil {
+				decodeErr = err
+				return
+			}
+			if err := validatePersistedInteraction(candidate); err != nil {
+				decodeErr = err
+				return
+			}
+			if candidate.SessionID != sessionID ||
+				!bytes.Equal(row, interactionRecordRow(candidate.SessionID)) {
+				decodeErr = errors.New(
+					"stored explorer interaction row is invalid")
+				return
+			}
+			if candidate.Deleted {
+				return
+			}
+			if found && !persistedInteractionsEqual(live, candidate) {
+				decodeErr = errors.New(
+					"stored interaction session has conflicting live versions")
+				return
+			}
+			live = candidate
+			found = true
+		},
+	)
+	if err != nil {
+		return persistedInteraction{}, false, shoal.WrapError(
+			shoal.ErrorUnavailable,
+			"read historical interaction record",
+			err,
+		)
+	}
+	if decodeErr != nil {
+		return persistedInteraction{}, false, shoal.WrapError(
+			shoal.ErrorInternal,
+			"stored historical interaction is invalid",
+			decodeErr,
+		)
+	}
+	return live, found, nil
+}
+
+func (e *Explorer) lookupPersistedFold(
+	foldID shoal.ID,
+) (persistedFold, bool, error) {
+	var record persistedFold
+	found, err := e.lookupEmbeddedRecord(
+		foldRecordRow(foldID),
+		embeddedRecordFold,
+		&record,
+	)
+	if err != nil || !found {
+		return persistedFold{}, found, err
+	}
+	if err := validatePersistedFold(record); err != nil {
+		return persistedFold{}, false, shoal.WrapError(
+			shoal.ErrorInternal,
+			"stored explorer fold is invalid",
+			err,
+		)
+	}
+	if record.FoldID != foldID {
+		return persistedFold{}, false, shoal.NewError(
+			shoal.ErrorInternal,
+			"stored explorer fold row is invalid",
+		)
+	}
+	return record, true, nil
+}
+
+func (e *Explorer) lookupEmbeddedRecord(
+	row []byte, kind byte, target any,
+) (bool, error) {
+	found := false
+	var decodeErr error
+	err := e.engine.LookupRows(
+		explorerTable,
+		[][]byte{append([]byte(nil), row...)},
+		engine.ScanOptions{
+			ColumnFamilies:          [][]byte{[]byte(recordCF)},
+			ColumnFamiliesInclusive: true,
+		},
+		func(_ int, key *iterrt.Key, value []byte) {
+			if found || decodeErr != nil ||
+				!bytes.Equal(key.ColumnQualifier, []byte(recordCQV2)) {
+				return
+			}
+			decodeErr = decodeEmbeddedRecord(value, kind, target)
+			found = decodeErr == nil
+		},
+	)
+	if err != nil {
+		return false, shoal.WrapError(
+			shoal.ErrorUnavailable,
+			"read committed interaction record",
+			err,
+		)
+	}
+	if decodeErr != nil {
+		return false, shoal.WrapError(
+			shoal.ErrorInternal,
+			"decode committed interaction record",
+			decodeErr,
+		)
+	}
+	return found, nil
+}
+
+func equivalentEmbeddedRecord(row, stored, expected []byte) bool {
+	if bytes.Equal(stored, expected) {
+		return true
+	}
+	switch {
+	case bytes.Equal(row, interactionSinkRow):
+		var left, right persistedInteractionSink
+		return decodeEmbeddedRecord(
+			stored, embeddedRecordInteractionSink, &left,
+		) == nil &&
+			decodeEmbeddedRecord(
+				expected, embeddedRecordInteractionSink, &right,
+			) == nil &&
+			reflect.DeepEqual(left, right)
+	case bytes.HasPrefix(row, []byte(interactionRow)):
+		var left, right persistedInteraction
+		return decodeEmbeddedRecord(
+			stored, embeddedRecordInteraction, &left,
+		) == nil &&
+			decodeEmbeddedRecord(
+				expected, embeddedRecordInteraction, &right,
+			) == nil &&
+			reflect.DeepEqual(left, right)
+	case bytes.HasPrefix(row, []byte(foldRow)):
+		var left, right persistedFold
+		return decodeEmbeddedRecord(
+			stored, embeddedRecordFold, &left,
+		) == nil &&
+			decodeEmbeddedRecord(
+				expected, embeddedRecordFold, &right,
+			) == nil &&
+			reflect.DeepEqual(left, right)
+	case bytes.HasPrefix(row, []byte(snapshotRow)):
+		var left, right persistedSnapshot
+		return decodeEmbeddedRecord(
+			stored, embeddedRecordSnapshot, &left,
+		) == nil &&
+			decodeEmbeddedRecord(
+				expected, embeddedRecordSnapshot, &right,
+			) == nil &&
+			persistedSnapshotsEqual(left, right)
+	default:
+		return false
+	}
+}
+
+func persistedSnapshotsEqual(left, right persistedSnapshot) bool {
+	return left.ID == right.ID &&
+		left.AsOf.UTC().Equal(right.AsOf.UTC()) &&
+		left.ParentID == right.ParentID &&
+		reflect.DeepEqual(left.AddedNodeIDs, right.AddedNodeIDs) &&
+		reflect.DeepEqual(left.RemovedNodeIDs, right.RemovedNodeIDs) &&
+		reflect.DeepEqual(left.NodeStates, right.NodeStates) &&
+		reflect.DeepEqual(left.RemovedEdgeIDs, right.RemovedEdgeIDs) &&
+		reflect.DeepEqual(left.EdgeStates, right.EdgeStates) &&
+		reflect.DeepEqual(left.AssertionStates, right.AssertionStates) &&
+		reflect.DeepEqual(left.RemovedAssertionEdgeIDs, right.RemovedAssertionEdgeIDs)
 }
 
 func encodeEmbeddedRecord(kind byte, value any) ([]byte, error) {
@@ -584,6 +1179,8 @@ func embeddedRecordMaximum(kind byte) (uint64, error) {
 		return maxEmbeddedProposalTransitionBytes, nil
 	case embeddedRecordExtraction:
 		return maxEmbeddedExtractionBytes, nil
+	case embeddedRecordSnapshot:
+		return maxEmbeddedSnapshotBytes, nil
 	default:
 		return 0, fmt.Errorf("embedded record kind %d is unsupported", kind)
 	}
@@ -631,6 +1228,10 @@ func validatePersistedDocument(record persistedDocument) error {
 		if !utf8.ValidString(node.Kind) {
 			return fmt.Errorf("graph node kind is invalid")
 		}
+		if interaction.IsInteractionID(node.ID) {
+			return fmt.Errorf(
+				"content cannot use the reserved interaction node ID namespace")
+		}
 		if interaction.IsInteractionKind(node.Kind) {
 			return fmt.Errorf("content cannot use the reserved interaction node kind namespace")
 		}
@@ -643,6 +1244,10 @@ func validatePersistedDocument(record persistedDocument) error {
 	for _, edge := range record.Edges {
 		if err := validatePersistedEdge(edge); err != nil {
 			return err
+		}
+		if interaction.IsInteractionID(edge.ID) {
+			return fmt.Errorf(
+				"content cannot use the reserved interaction edge ID namespace")
 		}
 		if interaction.IsInteractionEdgeType(edge.Type) {
 			return fmt.Errorf("content cannot use the reserved interaction edge type namespace")

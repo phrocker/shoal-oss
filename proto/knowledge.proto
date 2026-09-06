@@ -112,4 +112,6 @@ message RetrievalResult {
 message RetrieveResponse {
   string request_id = 1;
   repeated RetrievalResult results = 2;
+  string embedding_space_id = 3;
+  repeated string embedding_space_ids = 4;
 }
