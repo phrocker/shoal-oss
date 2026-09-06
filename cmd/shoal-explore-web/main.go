@@ -741,8 +741,7 @@ func openService(
 			embedded.Close()
 			return closed, err
 		}
-		choices, err := webapi.NewGovernedOntologyChoicesFromExplorer(
-			config.ontology, corpus)
+		choices, err := webapi.NewGovernedOntologyChoices(service)
 		if err != nil {
 			settingsStore.Close()
 			store.Close()

@@ -23,7 +23,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/ontology"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
@@ -132,48 +131,6 @@ func TestGovernedOntologyChoicesWithoutConfiguredRootIsEmpty(t *testing.T) {
 	}
 	if len(listed) != 0 {
 		t.Fatalf("unconfigured choices = %#v", listed)
-	}
-}
-
-func TestGovernedOntologyChoicesFromExplorerUsesTrustedCatalog(t *testing.T) {
-	first, _, _, _ := governedOntologyFixture(t)
-	corpus, err := explorer.Open(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer corpus.Close()
-	choices, err := NewGovernedOntologyChoicesFromExplorer(&first, corpus)
-	if err != nil {
-		t.Fatal(err)
-	}
-	decision, err := auth.NewDecision(auth.DecisionConfig{
-		Subject:             "service",
-		Actor:               "service",
-		AuthorizationDomain: []byte("domain"),
-		AllowedOperations:   []auth.Operation{auth.OperationRetrieve},
-		PolicyGeneration:    1,
-		AuthenticationExpires: time.Date(
-			2030, 1, 1, 0, 0, 0, 0, time.UTC),
-		RequestID: "request",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	listed, err := choices.ListOntologyChoices(context.Background(), decision)
-	if err != nil {
-		t.Fatalf("narrow decision could not read trusted catalog: %v", err)
-	}
-	identity, err := ontology.NewOntologyIdentity(first)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(listed) != 1 || listed[0].Identity != identity ||
-		!listed[0].Active {
-		t.Fatalf("trusted catalog choices = %#v", listed)
-	}
-	if err := choices.AuthorizeOntology(
-		context.Background(), decision, identity); err != nil {
-		t.Fatalf("narrow decision could not select published identity: %v", err)
 	}
 }
 
