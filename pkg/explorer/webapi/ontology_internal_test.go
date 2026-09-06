@@ -19,8 +19,10 @@ package webapi
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"testing"
 	"time"
 
@@ -28,6 +30,61 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/ontology"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
+
+func TestOntologyMorphismWireMetadataPreservesOpaqueBytes(t *testing.T) {
+	metadata := shoal.Metadata{"\xff": "value\xfe", "\xfe": "value\xff", "nul": "\x00"}
+	draft := OntologyMorphismDraft{Rationale: "opaque draft", Metadata: metadata}
+	projection := OntologyMorphismProjection{ID: "opaque projection", Metadata: metadata}
+	for _, original := range []any{draft, projection} {
+		data, err := json.Marshal(original)
+		if err != nil {
+			t.Fatal(err)
+		}
+		switch value := original.(type) {
+		case OntologyMorphismDraft:
+			var decoded OntologyMorphismDraft
+			if err := json.Unmarshal(data, &decoded); err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(decoded, value) {
+				t.Fatalf("draft byte roundtrip changed: %#v", decoded)
+			}
+		case OntologyMorphismProjection:
+			var decoded OntologyMorphismProjection
+			if err := json.Unmarshal(data, &decoded); err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(decoded, value) {
+				t.Fatalf("projection byte roundtrip changed: %#v", decoded)
+			}
+		}
+	}
+}
+
+func TestOntologyMorphismMetadataDecodersRejectInvalidWireValues(t *testing.T) {
+	for name, data := range map[string]string{
+		"object":        `{"metadata":{"plain":"text"}}`,
+		"invalid-key":   `{"metadata":[{"key":"!","value":"dg"}]}`,
+		"invalid-value": `{"metadata":[{"key":"aw","value":"!"}]}`,
+		"duplicate-key": `{"metadata":[{"key":"_w","value":"dg"},{"key":"_w","value":"dw"}]}`,
+		"unknown-field": `{"unknown":true}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			draft := OntologyMorphismDraft{Rationale: "unchanged", Metadata: shoal.Metadata{"before": "\xff"}}
+			projection := OntologyMorphismProjection{ID: "unchanged", Metadata: shoal.Metadata{"before": "\xff"}}
+			for _, target := range []any{&draft, &projection} {
+				if err := json.Unmarshal([]byte(data), target); err == nil {
+					t.Fatalf("%T accepted %s", target, data)
+				}
+			}
+			if draft.Rationale != "unchanged" || projection.ID != "unchanged" ||
+				!reflect.DeepEqual(draft.Metadata, shoal.Metadata{"before": "\xff"}) ||
+				!reflect.DeepEqual(projection.Metadata, shoal.Metadata{"before": "\xff"}) {
+				t.Fatal("failed decode mutated the destination")
+			}
+		})
+	}
+}
 
 func TestOntologyEndpointIsNotPubliclyReachable(t *testing.T) {
 	handler, err := NewHandler(allowlistStubService{}, "127.0.0.1:8080")

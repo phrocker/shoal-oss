@@ -55,6 +55,16 @@ selection are intentionally tracked separately and are not claimed here.
   identities, safety-path IDs, and unresolved reasons.
 - Proposal morphism drafts reference definitions by `namespace` plus `key`;
   evidence uses the same opaque-ID citation/path codecs as other Explorer APIs.
+  Morphism-level metadata in drafts and projections uses the same base64url
+  key/value entry codec as evidence metadata, preserving opaque bytes and
+  canonical morphism identities. The ontology model still requires canonical
+  UTF-8 metadata: invalid byte sequences are rejected, not silently replaced
+  by the JSON transport before validation.
 - Published proposal transitions form the durable active-version chain.
   Publication rejects stale bases, and `ActiveOntology` replays the chain after
-  restart.
+  restart, including a terminal chain of exactly 256 transitions.
+- A corpus admits at most 256 durable proposals across all schemas and lifecycle
+  states. Admission is checked under the store's write lock before persistence,
+  including concurrent requests through different service instances. Identical
+  retries remain valid at capacity; new proposals are rejected without changing
+  the stored history.
