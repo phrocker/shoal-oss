@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"math"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -30,6 +31,7 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/graph"
+	"github.com/phrocker/shoal-oss/pkg/interaction"
 	"github.com/phrocker/shoal-oss/pkg/ontology"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
@@ -141,6 +143,59 @@ func TestAnalyzeFailsOnNonconvergence(t *testing.T) {
 	})
 	if !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
 		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestValidateResultRejectsPerComponentEdgeMismatch(t *testing.T) {
+	request, result := validResultForValidation(t)
+	result.WeaklyConnectedComponents[0].EdgeCount = 2
+	result.WeaklyConnectedComponents[1].EdgeCount = 0
+	if err := ValidateResult(request, result, DefaultLimits()); !shoal.IsErrorCode(
+		err, shoal.ErrorInternal,
+	) {
+		t.Fatalf("component edge mismatch error = %v", err)
+	}
+}
+
+func TestValidateResultRejectsOversizedInteractionID(t *testing.T) {
+	request, result := validResultForValidation(t)
+	result.Recording.Recorded = true
+	result.Recording.InteractionID = shoal.ID(strings.Repeat("x", shoal.MaxIDBytes+1))
+	if err := ValidateResult(request, result, DefaultLimits()); !shoal.IsErrorCode(
+		err, shoal.ErrorInternal,
+	) {
+		t.Fatalf("oversized interaction ID error = %v", err)
+	}
+}
+
+func TestEqualAssertionEvidenceDistinguishesSignedZero(t *testing.T) {
+	base := interaction.AssertionEvidence{ID: "assertion:one"}
+	changed := base
+	changed.Confidence = shoal.Score(math.Copysign(0, -1))
+	if equalAssertionEvidence(
+		[]interaction.AssertionEvidence{base},
+		[]interaction.AssertionEvidence{changed},
+	) {
+		t.Fatal("receipt evidence accepted a signed-zero confidence change")
+	}
+}
+
+func TestAuthorizedScopeSnapshotIncludesAssertionEvidence(t *testing.T) {
+	left := snapshotAssertion(t, ontology.AssertionExplicit)
+	right := snapshotAssertion(t, ontology.AssertionInferred)
+	request := boundedRequest("node").Scope
+	var fingerprint auth.Fingerprint
+	fingerprint[0] = 1
+	leftID := authorizedScopeSnapshotID(
+		request, fingerprint, 1, ontology.OntologyIdentity{}, false,
+		explorer.Neighborhood{Assertions: []ontology.Assertion{left}},
+	)
+	rightID := authorizedScopeSnapshotID(
+		request, fingerprint, 1, ontology.OntologyIdentity{}, false,
+		explorer.Neighborhood{Assertions: []ontology.Assertion{right}},
+	)
+	if leftID == rightID {
+		t.Fatal("different durable assertion evidence produced the same snapshot")
 	}
 }
 
@@ -355,6 +410,78 @@ func boundedRequest(nodeID shoal.ID) Request {
 		Fanout:    4, MaxNodes: 8, MaxEdges: 16,
 		MaxScannedEdgesPerNode: 32,
 	}}
+}
+
+func validResultForValidation(t *testing.T) (Request, Result) {
+	t.Helper()
+	neighborhood := explorer.Neighborhood{
+		Nodes: []graph.Node{{ID: "A"}, {ID: "B"}, {ID: "C"}, {ID: "D"}},
+		Edges: []graph.Edge{
+			{ID: "A-B", From: "A", To: "B", Type: "link", Weight: 1},
+			{ID: "C-D", From: "C", To: "D", Type: "link", Weight: 1},
+		},
+	}
+	analysis, err := Analyze(context.Background(), neighborhood, PageRankOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := boundedRequest("A")
+	result := Result{
+		Scope: ScopeMetadata{
+			SnapshotID: "snapshot", AuthorizationFingerprint: "fingerprint",
+			PolicyGeneration: 1, SeedNodeIDs: append(
+				[]shoal.ID(nil), request.Scope.NodeIDs...),
+			Depth: request.Scope.Depth, Direction: request.Scope.Direction,
+			Fanout: request.Scope.Fanout, MaxNodes: request.Scope.MaxNodes,
+			MaxEdges:               request.Scope.MaxEdges,
+			MaxScannedEdgesPerNode: request.Scope.MaxScannedEdgesPerNode,
+			NodeCount:              uint32(len(neighborhood.Nodes)),
+			EdgeCount:              uint32(len(neighborhood.Edges)), Complete: true,
+		},
+		Nodes:                     analysis.Nodes,
+		WeaklyConnectedComponents: analysis.WeaklyConnectedComponents,
+		PageRank:                  analysis.PageRank,
+	}
+	return request, result
+}
+
+func snapshotAssertion(
+	t *testing.T,
+	origin ontology.AssertionOrigin,
+) ontology.Assertion {
+	t.Helper()
+	property, err := ontology.NewPropertyDefinition(
+		"name", "Name", "", ontology.ValueString, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	value, err := ontology.NewStringValue("alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	evidence, err := ontology.NewEvidenceRef(document.Citation{
+		DocumentID: "document", RevisionID: "revision",
+		SectionID: "section", SpanID: "span",
+		Range: document.SourceRange{
+			Start: document.SourcePosition{Offset: 0, Page: 1},
+			End:   document.SourcePosition{Offset: 5, Page: 1},
+		},
+	}, "alpha", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	provenance, err := ontology.NewExtractionProvenance(
+		"provider", "model", "1", "prompt", "1", "extractor", "1", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertion, err := ontology.NewAssertion(
+		"entity", property.ID(), value, origin, 1,
+		[]ontology.EvidenceRef{evidence}, provenance, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return assertion
 }
 
 type staticMaterializer struct {

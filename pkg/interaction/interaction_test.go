@@ -22,6 +22,7 @@ package interaction_test
 import (
 	"errors"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"testing"
@@ -31,6 +32,28 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/interaction"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
+
+func TestAssertionEvidenceEqualDistinguishesSignedZeroScores(t *testing.T) {
+	base := interaction.AssertionEvidence{
+		ID: "assertion:one", Subject: "subject", Predicate: "property:name",
+		ObjectReference: "object", Origin: "explicit", GraphEdgeID: "edge",
+		DerivationID: "derivation:one",
+	}
+	for _, mutate := range []func(*interaction.AssertionEvidence){
+		func(value *interaction.AssertionEvidence) {
+			value.Confidence = shoal.Score(math.Copysign(0, -1))
+		},
+		func(value *interaction.AssertionEvidence) {
+			value.DerivationScore = shoal.Score(math.Copysign(0, -1))
+		},
+	} {
+		changed := base
+		mutate(&changed)
+		if interaction.AssertionEvidenceEqual(base, changed) {
+			t.Fatalf("signed-zero mutation considered equal: %#v", changed)
+		}
+	}
+}
 
 func TestConjoinIsSortedUniqueUnion(t *testing.T) {
 	labels, err := interaction.Conjoin(

@@ -196,7 +196,9 @@ func (e *Explorer) VerifyInteractionEvidence(
 			key = evidence.GraphEdgeID
 		}
 		assertion, ok := e.graphAssertions[key]
-		if !ok || assertionInteractionEvidence(assertion) != evidence {
+		if !ok || !interaction.AssertionEvidenceEqual(
+			assertionInteractionEvidence(assertion), evidence,
+		) {
 			return shoal.NewError(
 				shoal.ErrorNotFound, "interaction evidence assertion not found")
 		}

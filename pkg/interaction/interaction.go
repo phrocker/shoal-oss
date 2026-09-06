@@ -212,6 +212,22 @@ type AssertionEvidence struct {
 	DerivationScore shoal.Score
 }
 
+// AssertionEvidenceEqual compares a durable assertion projection exactly,
+// including the IEEE-754 representation of both scores.
+func AssertionEvidenceEqual(left, right AssertionEvidence) bool {
+	return left.ID == right.ID &&
+		left.Subject == right.Subject &&
+		left.Predicate == right.Predicate &&
+		left.ObjectReference == right.ObjectReference &&
+		left.Origin == right.Origin &&
+		math.Float64bits(float64(left.Confidence)) ==
+			math.Float64bits(float64(right.Confidence)) &&
+		left.GraphEdgeID == right.GraphEdgeID &&
+		left.DerivationID == right.DerivationID &&
+		math.Float64bits(float64(left.DerivationScore)) ==
+			math.Float64bits(float64(right.DerivationScore))
+}
+
 // Validate checks the recorded assertion projection.
 func (e AssertionEvidence) Validate() error {
 	if err := ontology.ValidateID(e.ID); err != nil ||
@@ -1460,7 +1476,7 @@ func canonicalAssertions(
 	for _, assertion := range canonical {
 		if len(result) > 0 &&
 			result[len(result)-1].ID == assertion.ID {
-			if result[len(result)-1] != assertion {
+			if !AssertionEvidenceEqual(result[len(result)-1], assertion) {
 				return nil, shoal.NewError(
 					shoal.ErrorInvalidArgument,
 					"interaction assertion evidence ID has conflicting values",
