@@ -641,6 +641,11 @@ func decodeRemoteMetadata(reader io.Reader) (MetadataResponse, error) {
 		return MetadataResponse{}, errors.New(
 			"remote workspace analytics metadata is incomplete")
 	}
+	if !capabilities.Analytics &&
+		(wire.AnalyticsLimits != nil || wire.AnalyticsRecordingRequired) {
+		return MetadataResponse{}, errors.New(
+			"remote workspace advertises analytics metadata without capability")
+	}
 	return MetadataResponse{
 		MaxPageSize: MaxPageSize, MaxTopK: MaxTopK,
 		MaxDepth: MaxDepth, MaxFanout: MaxFanout,

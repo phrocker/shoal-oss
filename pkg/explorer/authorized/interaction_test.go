@@ -490,6 +490,20 @@ func TestAuthorizedInteractionRecorderRejectsWrongPin(t *testing.T) {
 	); !shoal.IsErrorCode(err, shoal.ErrorUnauthorized) {
 		t.Fatalf("expired authorization pin record = %v", err)
 	}
+	session.ID = "session-narrower-live-pin"
+	session.RecordedAt = f.clock.Now()
+	session.AuthorizationExpiresAt = f.clock.Now().Add(time.Minute)
+	if err := f.clientA.RecordInteraction(ctx, session); err != nil {
+		t.Fatalf("narrower authorization pin record = %v", err)
+	}
+	stored, err := f.base.Interaction(context.Background(), session.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !stored.AuthorizationExpiresAt.Equal(session.AuthorizationExpiresAt) {
+		t.Fatalf("stored expiry = %v, want %v",
+			stored.AuthorizationExpiresAt, session.AuthorizationExpiresAt)
+	}
 }
 
 func TestAuthorizedTombstoneSubgraphDoesNotLeakExistence(t *testing.T) {

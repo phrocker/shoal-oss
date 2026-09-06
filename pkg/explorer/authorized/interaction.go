@@ -168,6 +168,10 @@ func (c *Client) recordInteractionForOperation(
 			"interaction observed snapshot is no longer current",
 		)
 	}
+	ctx, err = c.withCanonicalDocumentIndex(ctx)
+	if err != nil {
+		return interaction.Session{}, err
+	}
 	canonical.Actor = interaction.ActorContext{
 		SubjectID:  decision.Subject(),
 		ActorID:    decision.Actor(),
@@ -180,7 +184,6 @@ func (c *Client) recordInteractionForOperation(
 		return interaction.Session{}, authorizationDenied()
 	}
 	canonical.AuthorizationFingerprint = shoal.ID(fingerprint.String())
-	canonical.AuthorizationExpiresAt = decision.AuthenticationExpires()
 	canonical.OntologySchemaID = ""
 	canonical.OntologyVersionID = ""
 	if selected, ok := decision.SelectedOntology(); ok {
@@ -219,21 +222,20 @@ func (c *Client) recordInteractionForOperation(
 		return interaction.Session{}, directBaseError(err)
 	}
 	if err := guard.Check(ctx); err != nil {
-		if operation == auth.OperationAnalyticsRead {
-			return interaction.Session{}, explorer.MarkIndeterminateCommit(
-				shoal.WrapError(
-					shoal.ErrorUnavailable,
-					"interaction was recorded but authorization generation revalidation failed",
-					err,
-				),
-			)
-		}
-		return interaction.Session{}, explorer.MarkCommittedInteraction(err)
+		return interaction.Session{}, postCommitInteractionError(
+			operation,
+			shoal.WrapError(
+				shoal.ErrorUnavailable,
+				"interaction was recorded but authorization generation revalidation failed",
+				err,
+			),
+		)
 	}
 	if _, ok := writer.(interaction.ResultSink); ok {
 		returned, canonicalErr := persisted.Canonical()
 		if canonicalErr != nil || !reflect.DeepEqual(returned, canonical) {
-			return interaction.Session{}, explorer.MarkCommittedInteraction(
+			return interaction.Session{}, postCommitInteractionError(
+				operation,
 				shoal.NewError(
 					shoal.ErrorInternal,
 					"durable interaction sink returned a different record",
@@ -242,6 +244,15 @@ func (c *Client) recordInteractionForOperation(
 		}
 	}
 	return canonical, nil
+}
+
+func postCommitInteractionError(
+	operation auth.Operation, err error,
+) error {
+	if operation == auth.OperationAnalyticsRead {
+		return explorer.MarkIndeterminateCommit(err)
+	}
+	return explorer.MarkCommittedInteraction(err)
 }
 
 // Interactions lists only derived records whose complete current source set
