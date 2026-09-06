@@ -104,7 +104,7 @@ func (c *Client) indexVectorForFreshness(ctx context.Context, vertexID string, v
 	if ix == nil {
 		return
 	}
-	_ = ix.Add(ctx, vertexID, vec)
+	_ = ix.AddInSpace(ctx, vertexID, vec, c.cfg.EmbeddingSpace)
 }
 
 func (c *Client) previousEvent(ctx context.Context, current []byte) string {

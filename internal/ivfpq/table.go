@@ -54,6 +54,12 @@ func CentroidsRow(v int32) string { return fmt.Sprintf("centroids_v%d", v) }
 // e.g. "pq_v1".
 func PQRow(v int32) string { return fmt.Sprintf("pq_v%d", v) }
 
+// EmbeddingSpaceRow returns the config-table row carrying the stable identity
+// of the vector space used to train codebook version v.
+func EmbeddingSpaceRow(v int32) string {
+	return fmt.Sprintf("embedding_space_v%d", v)
+}
+
 // FormatClusterID formats a cluster identifier as a zero-padded 8-digit
 // lowercase hex string, matching veculo's fixed-width cluster key convention.
 func FormatClusterID(id int) string { return fmt.Sprintf("%08x", id) }

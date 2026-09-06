@@ -37,6 +37,7 @@ import (
 	"strings"
 
 	"github.com/phrocker/shoal-oss/internal/agentmem"
+	"github.com/phrocker/shoal-oss/internal/embeddingspace"
 	"github.com/phrocker/shoal-oss/internal/embedpb"
 	"github.com/phrocker/shoal-oss/internal/graphschema"
 	"github.com/phrocker/shoal-oss/internal/ivfpq"
@@ -55,8 +56,16 @@ func main() {
 	seed := flag.Int64("seed", 42, "RNG seed for deterministic training")
 	sample := flag.Int("sample", 0, "max training vectors (0=all)")
 	version := flag.Int("version", 1, "codebook version tag")
+	embeddingSpace := flag.String(
+		"embedding-space", "",
+		"required stable identity of the source vector space",
+	)
 	ts := flag.Int64("ts", 0, "timestamp for all written cells (0 = let server assign)")
 	flag.Parse()
+	if err := embeddingspace.ValidateQueryStates(
+		"train agent-memory IVF index", strings.TrimSpace(*embeddingSpace)); err != nil {
+		fatal("embedding-space: %v", err)
+	}
 
 	ctx := context.Background()
 
@@ -223,6 +232,7 @@ func main() {
 	cfgMuts := []*embedpb.Mutation{
 		cfgMut(ivfpq.PQRow(cbVersion), ivfpq.ConfigColFam, ivfpq.ConfigQual, pqBlob, *ts),
 		cfgMut(ivfpq.CentroidsRow(cbVersion), ivfpq.ConfigColFam, ivfpq.ConfigQual, centroidsBlob, *ts),
+		cfgMut(ivfpq.EmbeddingSpaceRow(cbVersion), ivfpq.ConfigColFam, ivfpq.ConfigQual, []byte(strings.TrimSpace(*embeddingSpace)), *ts),
 		cfgMut(ivfpq.ConfigRowActiveVersion, ivfpq.ConfigColFam, ivfpq.ConfigQual, []byte(strconv.Itoa(*version)), *ts),
 		cfgMut(ivfpq.ConfigRowLastTrainedRows, ivfpq.ConfigColFam, ivfpq.ConfigQual, []byte(strconv.Itoa(n)), *ts),
 	}

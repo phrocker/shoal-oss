@@ -164,7 +164,8 @@ func (c *Client) semanticAnchors(ctx context.Context, a analysis) ([]string, err
 // to fall back to the brute-force path.
 func (c *Client) ivfIndex(ctx context.Context) *IvfIndex {
 	c.ivfOnce.Do(func() {
-		c.ivf, c.ivfErr = LoadIvfIndex(ctx, c.cfg.Store, c.cfg.Table)
+		c.ivf, c.ivfErr = LoadIvfIndexInSpace(
+			ctx, c.cfg.Store, c.cfg.Table, c.cfg.EmbeddingSpace)
 	})
 	return c.ivf
 }
