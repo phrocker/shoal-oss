@@ -46,6 +46,7 @@ const (
 	HardMaxFanout              uint32  = 50
 	HardMaxNodes               uint32  = 250
 	HardMaxEdges               uint32  = 12_500
+	HardMaxEvidenceBytes       uint64  = 16 << 20
 	HardMaxScannedEdgesPerNode uint32  = 1_024
 	HardMaxEdgeTypes           uint32  = 64
 	HardMaxPageRankIterations  uint32  = 1_000
@@ -63,6 +64,7 @@ type Limits struct {
 	MaxFanout              uint32  `json:"max_fanout"`
 	MaxNodes               uint32  `json:"max_nodes"`
 	MaxEdges               uint32  `json:"max_edges"`
+	MaxEvidenceBytes       uint64  `json:"max_evidence_bytes"`
 	MaxScannedEdgesPerNode uint32  `json:"max_scanned_edges_per_node"`
 	MaxEdgeTypes           uint32  `json:"max_edge_types"`
 	MaxPageRankIterations  uint32  `json:"max_page_rank_iterations"`
@@ -75,6 +77,7 @@ func DefaultLimits() Limits {
 		MaxSeeds: HardMaxSeeds, MaxDepth: HardMaxDepth,
 		MaxFanout: HardMaxFanout, MaxNodes: HardMaxNodes,
 		MaxEdges:               HardMaxEdges,
+		MaxEvidenceBytes:       HardMaxEvidenceBytes,
 		MaxScannedEdgesPerNode: HardMaxScannedEdgesPerNode,
 		MaxEdgeTypes:           HardMaxEdgeTypes,
 		MaxPageRankIterations:  HardMaxPageRankIterations,
@@ -89,6 +92,8 @@ func (l Limits) Validate() error {
 		l.MaxFanout == 0 || l.MaxFanout > HardMaxFanout ||
 		l.MaxNodes == 0 || l.MaxNodes > HardMaxNodes ||
 		l.MaxEdges == 0 || l.MaxEdges > HardMaxEdges ||
+		l.MaxEvidenceBytes == 0 ||
+		l.MaxEvidenceBytes > HardMaxEvidenceBytes ||
 		l.MaxScannedEdgesPerNode == 0 ||
 		l.MaxScannedEdgesPerNode > HardMaxScannedEdgesPerNode ||
 		l.MaxEdgeTypes == 0 || l.MaxEdgeTypes > HardMaxEdgeTypes ||
@@ -254,6 +259,7 @@ type Record struct {
 	Request         Request
 	Result          Result
 	Materialization Materialization
+	Limits          Limits
 }
 
 // RecordingReceipt identifies the exact durable interaction accepted by the
@@ -552,6 +558,7 @@ func (s *Service) Run(ctx context.Context, request Request) (Result, error) {
 		receipt, err := s.recorder.RecordAnalytics(ctx, Record{
 			Request: normalized, Result: result,
 			Materialization: materialization,
+			Limits:          s.limits,
 		})
 		if err != nil {
 			return Result{}, shoal.WrapError(

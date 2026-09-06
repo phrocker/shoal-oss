@@ -556,6 +556,7 @@ func TestAnalyticsInteractionSinkReauthorizesExactEdgeEvidence(t *testing.T) {
 		SnapshotAsOf:             materialized.Snapshot.AsOf,
 		AuthorizationFingerprint: shoal.ID(fingerprint.String()),
 		AuthorizationExpiresAt:   decision.AuthenticationExpires(),
+		SeedNodeIDs:              []shoal.ID{from},
 		Turns: []interaction.Turn{{
 			Index: 0,
 			ToolCall: &interaction.ToolCall{

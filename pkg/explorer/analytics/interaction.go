@@ -20,10 +20,12 @@ package analytics
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"math"
 	"sort"
 	"time"
 
+	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/graph"
 	"github.com/phrocker/shoal-oss/pkg/interaction"
 	"github.com/phrocker/shoal-oss/pkg/ontology"
@@ -93,11 +95,23 @@ func (r *InteractionRecorder) RecordAnalytics(
 		return RecordingReceipt{}, shoal.NewError(
 			shoal.ErrorInternal, "analytics recording ontology is inconsistent")
 	}
+	limits := record.Limits
+	if limits == (Limits{}) {
+		limits = DefaultLimits()
+	}
+	if err := limits.Validate(); err != nil {
+		return RecordingReceipt{}, err
+	}
+	if err := validateAnalyticsEvidenceBytes(
+		record.Materialization.Neighborhood, limits.MaxEvidenceBytes); err != nil {
+		return RecordingReceipt{}, err
+	}
 	neighborhood := cloneNeighborhood(record.Materialization.Neighborhood)
 	nodeIDs := make([]shoal.ID, len(neighborhood.Nodes))
 	for index, node := range neighborhood.Nodes {
 		nodeIDs[index] = node.ID
 	}
+
 	sort.Slice(nodeIDs, func(i, j int) bool {
 		return shoal.CompareID(nodeIDs[i], nodeIDs[j]) < 0
 	})
@@ -182,6 +196,50 @@ func (r *InteractionRecorder) RecordAnalytics(
 			shoal.ErrorInternal, "analytics recorder returned inconsistent evidence")
 	}
 	return RecordingReceipt{InteractionID: persisted.ID}, nil
+}
+
+func validateAnalyticsEvidenceBytes(
+	neighborhood explorer.Neighborhood,
+	limit uint64,
+) error {
+	total := uint64(2)
+	add := func(value any) error {
+		encoded, err := json.Marshal(value)
+		if err != nil {
+			return shoal.WrapError(
+				shoal.ErrorInternal, "encode analytics interaction evidence", err)
+		}
+		size := uint64(len(encoded)) + 1
+		if size > limit || total > limit-size {
+			return shoal.NewError(
+				shoal.ErrorUnavailable,
+				"analytics interaction evidence exceeds the configured byte limit",
+			)
+		}
+		total += size
+		return nil
+	}
+	for _, node := range neighborhood.Nodes {
+		if err := add(node); err != nil {
+			return err
+		}
+	}
+	for _, edge := range neighborhood.Edges {
+		if err := add(edge); err != nil {
+			return err
+		}
+	}
+	for _, assertion := range neighborhood.Assertions {
+		evidence := analyticsAssertionEvidence([]ontology.Assertion{assertion})
+		if len(evidence) != 1 {
+			return shoal.NewError(
+				shoal.ErrorInternal, "analytics assertion evidence is inconsistent")
+		}
+		if err := add(evidence[0]); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func analyticsAssertionEvidence(
