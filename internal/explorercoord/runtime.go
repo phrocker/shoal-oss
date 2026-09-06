@@ -99,6 +99,7 @@ type Runtime struct {
 	intents             *IntentStore
 	physical            *Physical
 	physicalTables      map[string]struct{}
+	legacyRecords       *EngineStore
 	allocator           *allocator.Client
 	guards              *guard.Client
 	coordinator         *transaction.Coordinator
@@ -564,7 +565,7 @@ func (r *Runtime) RecordCommitted(
 		return false, err
 	}
 	if !found {
-		return true, nil
+		return r.legacyRecordAllowed(ctx, request)
 	}
 	record, err := r.intents.Load(ctx, txn)
 	if errors.Is(err, transaction.ErrNotFound) {
@@ -576,17 +577,15 @@ func (r *Runtime) RecordCommitted(
 	if err != nil {
 		return false, err
 	}
-	epoch, complete, err := r.intents.Completed(ctx, txn, record.LogicalDigest)
-	if err != nil || !complete {
-		return false, err
-	}
-	snapshot, err := r.coordinator.Inspect(ctx, txn)
+	_, committed, err := r.committedLocked(
+		ctx,
+		txn,
+		record.LogicalDigest,
+	)
 	if err != nil {
 		return false, err
 	}
-	if snapshot.Root.State != coordination.StateCommitted ||
-		snapshot.Root.Epoch != epoch ||
-		snapshot.Root.LogicalDigest != record.LogicalDigest {
+	if !committed {
 		return false, nil
 	}
 	if !intentContainsRecordCell(record.Intent, request) {
@@ -1286,6 +1285,12 @@ func OpenExplorer(
 	)
 	runtime, err := Open(config)
 	if err != nil {
+		return nil, err
+	}
+	if err := runtime.enableExplorerLegacyCompatibility(
+		context.Background(),
+	); err != nil {
+		_ = runtime.Close()
 		return nil, err
 	}
 	corpus, err := explorer.OpenWithEmbeddedEngine(runtime.engine, options, runtime)

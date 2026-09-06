@@ -1812,7 +1812,12 @@ is folded into the next deterministic retry token before the record key is
 rebound. A retry of an active or committed Explorer document publication
 reloads the exact encoded attempted record, including its original publication
 time, sequence, and expected entity head, instead of regenerating transient
-values under the same TXN.
+values under the same TXN. Before the first transactional Explorer open, the
+runtime records bounded, per-row grandfather markers for existing legacy
+document rows and then seals migration with a domain-bound marker in the
+Explorer table. Once sealed, a physical document without a transaction binding
+is readable only when its exact legacy marker exists; recreating coordination
+metadata cannot reclassify later transactional residue as legacy data.
 
 The transaction runtime accepts only `localwal.SyncFull`. `SyncNormal` and
 `SyncOff` are rejected before the engine is opened because coordination and

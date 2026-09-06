@@ -30,6 +30,7 @@ import (
 	"time"
 
 	"github.com/phrocker/shoal-oss/internal/cclient"
+	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/explorer/coordination"
 	"github.com/phrocker/shoal-oss/pkg/explorer/coordination/allocator"
 	"github.com/phrocker/shoal-oss/pkg/explorer/coordination/guard"
@@ -594,6 +595,143 @@ func TestCommittedRequiresImmutableEpochOutcome(t *testing.T) {
 	}
 }
 
+func TestRecordCommittedUsesFullPublicationProof(t *testing.T) {
+	config := testRuntimeConfig(t, testDirectory(t))
+	runtime, err := Open(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.Close()
+	request := testRecordPublication("document", "revision", "value", nil)
+	result, err := runtime.PublishRecord(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if committed, err := runtime.RecordCommitted(
+		context.Background(),
+		request,
+	); err != nil || !committed {
+		t.Fatalf("initial record committed proof = %v, %v", committed, err)
+	}
+	if err := deleteEpochOutcome(
+		context.Background(),
+		runtime,
+		config.Domain,
+		result.Epoch,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if committed, err := runtime.RecordCommitted(
+		context.Background(),
+		request,
+	); committed || !errors.Is(err, transaction.ErrInternal) {
+		t.Fatalf("record proof without outcome = %v, %v", committed, err)
+	}
+}
+
+func TestExplorerLegacyMigrationDoesNotGrandfatherTransactionalResidue(t *testing.T) {
+	directory := testDirectory(t)
+	legacy, err := explorer.Open(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacySource := explorer.Source{
+		URI:       "file:///legacy.md",
+		Title:     "Legacy",
+		MediaType: explorer.MediaTypeMarkdown,
+		Content:   "# Legacy\n\nGrandfathered.\n",
+	}
+	legacyResult, err := legacy.Ingest(context.Background(), legacySource)
+	if err != nil {
+		_ = legacy.Close()
+		t.Fatal(err)
+	}
+	if err := legacy.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	config := testRuntimeConfig(t, directory)
+	embedded, err := OpenExplorer(config, explorer.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	documents, err := embedded.Explorer.Documents(context.Background())
+	if err != nil || len(documents) != 1 ||
+		documents[0].Document.ID != legacyResult.Document.ID {
+		_ = embedded.Close()
+		t.Fatalf("migrated legacy documents = %#v, %v", documents, err)
+	}
+	transactionalSource := explorer.Source{
+		URI:       "file:///transactional.md",
+		Title:     "Transactional",
+		MediaType: explorer.MediaTypeMarkdown,
+		Content:   "# Transactional\n\nMust remain fenced.\n",
+	}
+	transactional, err := embedded.Explorer.Ingest(
+		context.Background(),
+		transactionalSource,
+	)
+	if err != nil {
+		_ = embedded.Close()
+		t.Fatal(err)
+	}
+	row := []byte(
+		"document/" +
+			string(transactional.Document.ID) +
+			"/" +
+			string(transactional.Revision.ID),
+	)
+	recordKey := documentTestRecordKey(row)
+	coordinate, err := embedded.Runtime.intents.attemptCoordinate(recordKey)
+	if err != nil {
+		_ = embedded.Close()
+		t.Fatal(err)
+	}
+	cells, err := embedded.Runtime.store.ReadExact(
+		context.Background(),
+		[]allocator.Coordinate{coordinate},
+	)
+	if err != nil || len(cells) != 1 {
+		_ = embedded.Close()
+		t.Fatalf("read transactional binding = %#v, %v", cells, err)
+	}
+	status, err := embedded.Runtime.store.CompareAndMutate(
+		context.Background(),
+		allocator.Mutation{
+			Row: coordinate.Row,
+			Conditions: []allocator.Condition{{
+				Coordinate:   coordinate,
+				Value:        cells[0].Value,
+				Timestamp:    cells[0].Timestamp,
+				TimestampSet: true,
+			}},
+			Updates: []allocator.Update{{
+				Coordinate: coordinate,
+				Delete:     true,
+				Timestamp:  cells[0].Timestamp + 1,
+			}},
+		},
+	)
+	if err != nil || status != allocator.StatusAccepted {
+		_ = embedded.Close()
+		t.Fatalf("delete transactional binding = %v, %v", status, err)
+	}
+	if err := embedded.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := OpenExplorer(config, explorer.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	documents, err = reopened.Explorer.Documents(context.Background())
+	if err != nil || len(documents) != 1 ||
+		documents[0].Document.ID != legacyResult.Document.ID {
+		t.Fatalf("documents after binding loss = %#v, %v", documents, err)
+	}
+}
+
 func TestGenericPublishSerializesPendingRegistrationWithRecovery(t *testing.T) {
 	config := testRuntimeConfig(t, testDirectory(t))
 	fired := false
@@ -1135,4 +1273,52 @@ func (s *ambiguousAttemptStore) ReadExact(
 		return nil, errors.New("injected attempt binding readback failure")
 	}
 	return s.EngineStore.ReadExact(ctx, coordinates)
+}
+
+func deleteEpochOutcome(
+	ctx context.Context,
+	runtime *Runtime,
+	domain coordination.DomainID,
+	epoch coordination.Epoch,
+) error {
+	row, err := coordination.OutcomeRow(domain, epoch)
+	if err != nil {
+		return err
+	}
+	coordinate := allocator.Coordinate{
+		Row:       row,
+		Family:    []byte("o"),
+		Qualifier: []byte("terminal"),
+	}
+	cells, err := runtime.store.ReadExact(
+		ctx,
+		[]allocator.Coordinate{coordinate},
+	)
+	if err != nil {
+		return err
+	}
+	if len(cells) != 1 {
+		return errors.New("epoch outcome is missing")
+	}
+	status, err := runtime.store.CompareAndMutate(ctx, allocator.Mutation{
+		Row: row,
+		Conditions: []allocator.Condition{{
+			Coordinate:   coordinate,
+			Value:        cells[0].Value,
+			Timestamp:    cells[0].Timestamp,
+			TimestampSet: true,
+		}},
+		Updates: []allocator.Update{{
+			Coordinate: coordinate,
+			Delete:     true,
+			Timestamp:  cells[0].Timestamp + 1,
+		}},
+	})
+	if err != nil {
+		return err
+	}
+	if status != allocator.StatusAccepted {
+		return fmt.Errorf("delete epoch outcome status %d", status)
+	}
+	return nil
 }
