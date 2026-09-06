@@ -259,7 +259,10 @@ func (e *Explorer) FoldInteractions(
 // A deleted session must not keep a rehydratable copy of what it recorded.
 func (e *Explorer) requireLiveFoldMembersLocked(record persistedFold) error {
 	for _, member := range record.Members {
-		if existing, ok := e.interactions[member.SessionID]; ok &&
+		// Absence is treated like deletion: every recorded session, including
+		// its tombstone, is loaded at open, so a member that is not indexed
+		// cannot be shown to still exist.
+		if existing, ok := e.interactions[member.SessionID]; !ok ||
 			existing.Deleted {
 			return shoal.NewError(
 				shoal.ErrorConflict,
