@@ -287,9 +287,29 @@ func (r Reason) Validate() error {
 	if r.Code == "" && r.Digest == "" {
 		return nil
 	}
-	if err := validateLabel(r.Code); err != nil {
-		return shoal.WrapError(
-			shoal.ErrorInvalidArgument, "interaction reason code", err)
+	if r.Code == "" {
+		return shoal.NewError(
+			shoal.ErrorInvalidArgument, "interaction reason code is required")
+	}
+	if len(r.Code) > MaxVisibilityLabelSz {
+		return shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			"interaction reason code exceeds the public byte bound",
+		)
+	}
+	for index := 0; index < len(r.Code); index++ {
+		value := r.Code[index]
+		switch {
+		case value >= 'a' && value <= 'z',
+			value >= 'A' && value <= 'Z',
+			value >= '0' && value <= '9':
+		case value == '_', value == '-', value == '.', value == ':':
+		default:
+			return shoal.NewError(
+				shoal.ErrorInvalidArgument,
+				"interaction reason code contains an unsupported character",
+			)
+		}
 	}
 	if r.Digest == "" {
 		return nil
@@ -473,6 +493,12 @@ func validateLabel(label string) error {
 func (s Session) Validate() error {
 	if err := shoal.ValidateRequiredID("interaction session ID", s.ID); err != nil {
 		return err
+	}
+	if IsInteractionID(s.ID) && !IsSessionID(s.ID) {
+		return shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			"interaction session ID uses a reserved derived-node namespace",
+		)
 	}
 	if s.RecordedAt.IsZero() {
 		return shoal.NewError(
@@ -958,6 +984,12 @@ func SessionID(transcriptID shoal.ID, recordedAt time.Time) shoal.ID {
 		string(transcriptID),
 		recordedAt.UTC().Format(time.RFC3339Nano),
 	)
+}
+
+// IsSessionID reports whether an opaque ID is in the session-owned part of
+// the reserved interaction namespace.
+func IsSessionID(id shoal.ID) bool {
+	return strings.HasPrefix(string(id), KindSession+"_")
 }
 
 // OperationSessionID derives a stable opaque session identity for retrieval,

@@ -589,6 +589,7 @@ func TestAuthorizedInteractionReadsUseBulkAndPointPaths(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+
 	store := &countingInteractionStore{PolicyStore: f.store}
 	base := &countingInteractionBase{Explorer: f.base}
 	client := f.newClient(t, base, store, f.sourceA, f.policyA, nil)
@@ -611,5 +612,75 @@ func TestAuthorizedInteractionReadsUseBulkAndPointPaths(t *testing.T) {
 	if base.recordCalls != 1 || base.recordsCalls != 1 {
 		t.Fatalf("point_reads=%d bulk_reads=%d",
 			base.recordCalls, base.recordsCalls)
+	}
+}
+
+func TestSourceLessInteractionRequiresOriginalAuthorizationProjection(t *testing.T) {
+	f := newFixture(t)
+	snapshot, err := f.base.Snapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.clock.Set(snapshot.AsOf.Add(time.Second))
+	ownerDecision := f.decision(
+		t,
+		"source-less-owner",
+		[][]byte{f.sourceA},
+		[][]byte{f.policyA},
+		[]auth.Operation{
+			auth.OperationRead,
+			auth.OperationRetrieve,
+			auth.OperationValidate,
+		},
+	)
+	owner := f.context(t, ownerDecision)
+	fingerprint, err := auth.AuthorizationFingerprint(ownerDecision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := interaction.Session{
+		ID:                       "session-source-less",
+		RecordedAt:               f.clock.Now(),
+		Operation:                interaction.OperationRetrieval,
+		SnapshotID:               shoal.ID(snapshot.ID),
+		SnapshotAsOf:             snapshot.AsOf,
+		AuthorizationFingerprint: shoal.ID(fingerprint.String()),
+		AuthorizationExpiresAt:   ownerDecision.AuthenticationExpires(),
+	}
+	if err := f.clientA.RecordInteraction(owner, session); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.clientA.Interaction(owner, session.ID); err != nil {
+		t.Fatalf("owner cannot read source-less interaction: %v", err)
+	}
+
+	otherDecision := f.decision(
+		t,
+		"source-less-other",
+		[][]byte{f.sourceA},
+		[][]byte{f.policyA},
+		[]auth.Operation{
+			auth.OperationRead,
+			auth.OperationRetrieve,
+			auth.OperationValidate,
+		},
+	)
+	other := f.context(t, otherDecision)
+	if _, err := f.clientA.Interaction(
+		other, session.ID,
+	); !shoal.IsErrorCode(err, shoal.ErrorNotFound) {
+		t.Fatalf("source-less point read leaked across projections: %v", err)
+	}
+	if _, err := f.clientA.InteractionSubgraph(
+		other, session.ID,
+	); !shoal.IsErrorCode(err, shoal.ErrorNotFound) {
+		t.Fatalf("source-less subgraph leaked across projections: %v", err)
+	}
+	summaries, err := f.clientA.Interactions(other)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(summaries) != 0 {
+		t.Fatalf("source-less list leaked across projections: %+v", summaries)
 	}
 }

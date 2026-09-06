@@ -179,6 +179,12 @@ func (c *Client) InteractionRecords(
 			}
 			continue
 		}
+		if len(record.TouchedNodeIDs) == 0 {
+			if summaryFingerprintMatchesDecision(record.Summary, decision) {
+				visible = append(visible, record)
+			}
+			continue
+		}
 		allowed, err := interactionSourcesAllow(
 			registrations, record.TouchedNodeIDs,
 			decision, auth.OperationRead, now,
@@ -218,6 +224,10 @@ func (c *Client) InteractionRecord(
 		return explorer.InteractionRecord{}, directBaseError(err)
 	}
 	if record.Summary.Deleted {
+		if !summaryFingerprintMatchesDecision(record.Summary, decision) {
+			return explorer.InteractionRecord{}, auth.ObjectNotFound()
+		}
+	} else if len(record.TouchedNodeIDs) == 0 {
 		if !summaryFingerprintMatchesDecision(record.Summary, decision) {
 			return explorer.InteractionRecord{}, auth.ObjectNotFound()
 		}
@@ -284,6 +294,10 @@ func (c *Client) InteractionSubgraph(
 			return explorer.Neighborhood{}, err
 		}
 		return subgraph, nil
+	}
+	if len(record.TouchedNodeIDs) == 0 &&
+		!summaryFingerprintMatchesDecision(record.Summary, decision) {
+		return explorer.Neighborhood{}, auth.ObjectNotFound()
 	}
 	if err := c.authorizeInteractionSources(
 		ctx, record.TouchedNodeIDs, decision, auth.OperationRead, now,

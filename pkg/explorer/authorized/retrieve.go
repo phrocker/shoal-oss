@@ -265,6 +265,24 @@ func (c *Client) emptyRetrieval(
 	request retrieval.Request,
 ) (retrieval.Response, error) {
 	response := retrieval.Response{}
+	if request.HasMode(retrieval.ModeVector) {
+		probe := request
+		probe.Scope = retrieval.Scope{
+			DocumentIDs: []shoal.ID{
+				"interaction.vector_probe_authorized_empty",
+			},
+		}
+		probed, err := c.base.Retrieve(ctx, probe)
+		if err != nil {
+			return retrieval.Response{}, directBaseError(err)
+		}
+		if len(probed.Results) != 0 {
+			return retrieval.Response{}, inconsistentRetrieval()
+		}
+		response.EmbeddingSpaceID = probed.EmbeddingSpaceID
+		response.EmbeddingSpaceIDs = append(
+			[]shoal.ID(nil), probed.EmbeddingSpaceIDs...)
+	}
 	if err := response.ValidateFor(request); err != nil {
 		return retrieval.Response{}, inconsistentRetrieval()
 	}

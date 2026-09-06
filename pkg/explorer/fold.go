@@ -174,8 +174,12 @@ func (e *Explorer) FoldInteractions(
 			"fold identity is already used by an interaction session",
 		)
 	}
+	reservedNodes := append([]graph.Node(nil), subgraph.Nodes...)
+	reservedNodes = append(reservedNodes, graph.Node{
+		ID: interaction.TombstoneID(subgraph.ID),
+	})
 	if err := e.requireInteractionGraphIDsAvailableLocked(
-		subgraph.Nodes, subgraph.Edges,
+		reservedNodes, subgraph.Edges,
 	); err != nil {
 		return FoldResult{}, err
 	}

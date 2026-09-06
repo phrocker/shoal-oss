@@ -411,31 +411,26 @@ func TestGeneratedInteractionNodeIDsCannotCollide(t *testing.T) {
 
 	const futureSessionID shoal.ID = "future-session"
 	collidingID := interaction.InferenceID(futureSessionID)
-	recordedSession(
-		t, corpus, collidingID, spans[:1], spans[:1])
 	session := recordedSession(
 		t, corpus, "template-session", spans[:1], spans[:1])
-	session.ID = futureSessionID
+	session.ID = collidingID
 	if err := corpus.RecordInteraction(
 		ctx, session,
-	); !shoal.IsErrorCode(err, shoal.ErrorConflict) {
-		t.Fatalf("generated inference-node collision = %v", err)
-	}
-	if _, err := corpus.Interaction(
-		ctx, collidingID,
-	); err != nil {
-		t.Fatalf("existing interaction was damaged by collision: %v", err)
+	); !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
+		t.Fatalf("reserved inference-node ID accepted as a session: %v", err)
 	}
 
 	recordedSession(
 		t, corpus, "delete-target", spans[:1], spans[:1])
 	tombstoneCollisionID := interaction.TombstoneID("delete-target")
-	recordedSession(
-		t, corpus, tombstoneCollisionID, spans[:1], spans[:1])
-	if _, err := corpus.DeleteInteraction(
-		ctx, "delete-target",
-	); !shoal.IsErrorCode(err, shoal.ErrorConflict) {
-		t.Fatalf("generated tombstone-node collision = %v", err)
+	session.ID = tombstoneCollisionID
+	if err := corpus.RecordInteraction(
+		ctx, session,
+	); !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
+		t.Fatalf("reserved tombstone-node ID accepted as a session: %v", err)
+	}
+	if _, err := corpus.DeleteInteraction(ctx, "delete-target"); err != nil {
+		t.Fatalf("reserved ID prevented deletion: %v", err)
 	}
 }
 

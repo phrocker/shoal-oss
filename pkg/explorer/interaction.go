@@ -198,8 +198,12 @@ func (e *Explorer) RecordInteraction(
 	if err != nil {
 		return err
 	}
+	reservedNodes := append([]graph.Node(nil), subgraph.Nodes...)
+	reservedNodes = append(reservedNodes, graph.Node{
+		ID: interaction.TombstoneID(session.ID),
+	})
 	if err := e.requireInteractionGraphIDsAvailableLocked(
-		subgraph.Nodes, subgraph.Edges,
+		reservedNodes, subgraph.Edges,
 	); err != nil {
 		return err
 	}

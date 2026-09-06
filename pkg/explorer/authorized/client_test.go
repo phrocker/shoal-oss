@@ -448,6 +448,39 @@ func TestAuthorizedVectorRetrievalProjection(t *testing.T) {
 	}
 }
 
+func TestAuthorizedEmptyVectorRetrievalCarriesProvenance(t *testing.T) {
+	f := newFixture(t)
+	base, err := explorer.OpenWithOptions(t.TempDir(), explorer.Options{
+		Embedder: model.FakeEmbedder{Model: "authorized-empty", Dimensions: 8},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = base.Close() })
+	clientB := f.newClient(t, base, f.store, f.sourceB, f.policyB, nil)
+	if _, err := clientB.Ingest(f.admin(t), explorer.Source{
+		URI:       "file:///hidden-vector-only.txt",
+		MediaType: explorer.MediaTypeText,
+		Content:   "hidden vector evidence",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	clientA := f.newClient(t, base, f.store, f.sourceA, f.policyA, nil)
+	response, err := clientA.Retrieve(f.alice(t), retrieval.Request{
+		Text:  "hidden vector evidence",
+		TopK:  1,
+		Modes: []retrieval.Mode{retrieval.ModeVector},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(response.Results) != 0 ||
+		response.EmbeddingSpaceID == "" ||
+		len(response.EmbeddingSpaceIDs) == 0 {
+		t.Fatalf("authorized empty vector response = %+v", response)
+	}
+}
+
 func TestAuthorizedVectorRetrievalUsesTrustedScorer(t *testing.T) {
 	f := newFixture(t)
 	base, err := explorer.OpenWithOptions(t.TempDir(), explorer.Options{
