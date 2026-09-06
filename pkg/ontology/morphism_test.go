@@ -490,6 +490,33 @@ func TestOntologyLensReportsOnlyMorphismsAppliedToAssertion(t *testing.T) {
 	}
 }
 
+func TestOntologyTransitionRejectsMorphismFromDifferentVersions(t *testing.T) {
+	f := newMorphismFixture(t)
+	widen := mustMorphism(t, MorphismConfig{
+		Kind: MorphismWiden, SourceVersion: f.v1, TargetVersion: f.v2,
+		Sources: []shoal.ID{f.v1rel.ID()}, Targets: []shoal.ID{f.v2rel.ID()},
+		Evidence: []EvidenceRef{f.evidence}, Rationale: "widen original schema",
+	})
+	foreignSchema, _ := NewOntologySchema("foreign", "Foreign", "", nil)
+	source, err := NewOntologyVersion(
+		foreignSchema, "1", f.v1.CreatedAt(),
+		f.v1.Concepts(), f.v1.Relationships(), f.v1.Properties(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target, err := NewOntologyVersion(
+		foreignSchema, "2", f.v2.CreatedAt(),
+		f.v2.Concepts(), f.v2.Relationships(), f.v2.Properties(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewOntologyTransition(
+		source, target, []OntologyMorphism{widen},
+	); err == nil || !strings.Contains(err.Error(), "does not connect") {
+		t.Fatalf("foreign-version morphism error = %v", err)
+	}
+}
+
 type morphismFixture struct {
 	v1, v2, renameFrom, renameTo, splitFrom, splitTo                      OntologyVersion
 	v1rel, v2rel, oldRel, newRel                                          RelationshipDefinition

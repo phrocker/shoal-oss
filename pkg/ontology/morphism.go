@@ -525,13 +525,28 @@ func NewOntologyTransition(
 	sourceVersion, targetVersion OntologyVersion,
 	morphisms []OntologyMorphism,
 ) (OntologyTransition, error) {
+	if err := sourceVersion.Validate(); err != nil {
+		return OntologyTransition{}, err
+	}
+	if err := targetVersion.Validate(); err != nil {
+		return OntologyTransition{}, err
+	}
+	source, _ := NewOntologyIdentity(sourceVersion)
+	target, _ := NewOntologyIdentity(targetVersion)
+	for _, morphism := range morphisms {
+		if err := morphism.Validate(); err != nil {
+			return OntologyTransition{}, err
+		}
+		if morphism.Source() != source || morphism.Target() != target {
+			return OntologyTransition{}, invalid(
+				"transition morphism does not connect its source and target versions")
+		}
+	}
 	if err := validateProposalEvolution(
 		sourceVersion, targetVersion, morphisms,
 	); err != nil {
 		return OntologyTransition{}, err
 	}
-	source, _ := NewOntologyIdentity(sourceVersion)
-	target, _ := NewOntologyIdentity(targetVersion)
 	transition := OntologyTransition{source: source, target: target}
 	if err := transition.Validate(); err != nil {
 		return OntologyTransition{}, err
