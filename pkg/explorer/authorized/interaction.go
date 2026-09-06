@@ -215,7 +215,9 @@ func (c *Client) recordInteraction(
 	}
 	if _, ok := writer.(interaction.ResultSink); ok {
 		returned, canonicalErr := persisted.Canonical()
-		if canonicalErr != nil || !reflect.DeepEqual(returned, canonical) {
+		expected := canonical
+		expected.RecordedAt = returned.RecordedAt
+		if canonicalErr != nil || !reflect.DeepEqual(returned, expected) {
 			return persisted, explorer.MarkCommittedInteraction(
 				shoal.NewError(
 					shoal.ErrorInternal,

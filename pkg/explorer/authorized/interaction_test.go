@@ -139,6 +139,22 @@ type countingInteractionBase struct {
 	recordsCalls int
 }
 
+type hiddenFirstInteractionRecordBase struct {
+	*explorer.Explorer
+	hidden bool
+}
+
+func (b *hiddenFirstInteractionRecordBase) InteractionRecord(
+	ctx context.Context, id shoal.ID,
+) (explorer.InteractionRecord, error) {
+	if !b.hidden {
+		b.hidden = true
+		return explorer.InteractionRecord{}, shoal.NewError(
+			shoal.ErrorNotFound, "simulated concurrent retry winner")
+	}
+	return b.Explorer.InteractionRecord(ctx, id)
+}
+
 type rejectingSnapshotValidator struct {
 	calls int
 }
@@ -811,6 +827,49 @@ func TestAuthorizedResultSinkExactRetryAfterReopen(t *testing.T) {
 	}
 	if len(records) != 1 {
 		t.Fatalf("durable record count = %d", len(records))
+	}
+}
+
+func TestAuthorizedResultSinkAdoptsConcurrentRetryWinner(t *testing.T) {
+	f := newFixture(t)
+	snapshot, err := f.base.Snapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstTime := snapshot.AsOf.Add(time.Second)
+	f.clock.Set(firstTime)
+	decision := f.decision(
+		t, "concurrent-retry",
+		[][]byte{f.sourceA}, [][]byte{f.policyA},
+		[]auth.Operation{auth.OperationRetrieve},
+	)
+	fingerprint, err := auth.AuthorizationFingerprint(decision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := interaction.Session{
+		ID:                       interaction.DerivedID("session", "concurrent-retry"),
+		Operation:                interaction.OperationRetrieval,
+		SnapshotID:               shoal.ID(snapshot.ID),
+		SnapshotAsOf:             snapshot.AsOf,
+		AuthorizationFingerprint: shoal.ID(fingerprint.String()),
+		AuthorizationExpiresAt:   decision.AuthenticationExpires(),
+	}
+	ctx := f.context(t, decision)
+	first, err := f.clientA.RecordInteractionResult(ctx, session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.clock.Set(firstTime.Add(time.Minute))
+	base := &hiddenFirstInteractionRecordBase{Explorer: f.base}
+	retryClient := f.newClient(
+		t, base, f.store, f.sourceA, f.policyA, nil)
+	retried, err := retryClient.RecordInteractionResult(ctx, session)
+	if err != nil {
+		t.Fatalf("concurrent durable winner was rejected: %v", err)
+	}
+	if !reflect.DeepEqual(retried, first) {
+		t.Fatalf("concurrent retry = %+v, want %+v", retried, first)
 	}
 }
 
