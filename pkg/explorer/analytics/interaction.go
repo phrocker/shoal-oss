@@ -391,7 +391,8 @@ func equalGraphNodes(left, right []graph.Node) bool {
 			}
 		}
 		for key, value := range left[index].Properties {
-			if right[index].Properties[key] != value {
+			other, ok := right[index].Properties[key]
+			if !ok || other != value {
 				return false
 			}
 		}
@@ -408,12 +409,14 @@ func equalGraphEdges(left, right []graph.Edge) bool {
 			left[index].From != right[index].From ||
 			left[index].To != right[index].To ||
 			left[index].Type != right[index].Type ||
-			left[index].Weight != right[index].Weight ||
+			math.Float64bits(float64(left[index].Weight)) !=
+				math.Float64bits(float64(right[index].Weight)) ||
 			len(left[index].Properties) != len(right[index].Properties) {
 			return false
 		}
 		for key, value := range left[index].Properties {
-			if right[index].Properties[key] != value {
+			other, ok := right[index].Properties[key]
+			if !ok || other != value {
 				return false
 			}
 		}
