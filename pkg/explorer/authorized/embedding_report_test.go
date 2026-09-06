@@ -471,12 +471,12 @@ func TestAuthorizedEmbeddingReportFailsClosedForUnknownObservation(t *testing.T)
 func TestAuthorizedEmbeddingReportScrubsAfterCancellationAndRevocation(t *testing.T) {
 	for _, test := range []struct {
 		name string
-		run  func(*testing.T, *embeddingReportFixture, context.Context) error
+		run  func(*testing.T, *embeddingReportFixture, context.Context) (authorized.RetrievalReport, error)
 		code shoal.ErrorCode
 	}{
 		{
 			name: "cancellation",
-			run: func(t *testing.T, f *embeddingReportFixture, ctx context.Context) error {
+			run: func(t *testing.T, f *embeddingReportFixture, ctx context.Context) (authorized.RetrievalReport, error) {
 				entered := make(chan struct{})
 				f.backend.beforeRetrieve = func(ctx context.Context) error {
 					close(entered)
@@ -484,21 +484,26 @@ func TestAuthorizedEmbeddingReportScrubsAfterCancellationAndRevocation(t *testin
 					return ctx.Err()
 				}
 				cancelCtx, cancel := context.WithCancel(ctx)
-				done := make(chan error, 1)
+				type result struct {
+					report authorized.RetrievalReport
+					err    error
+				}
+				done := make(chan result, 1)
 				go func() {
-					_, _, err := f.clientA.RetrieveWithReport(
+					_, report, err := f.clientA.RetrieveWithReport(
 						cancelCtx, vectorQuery("cancel vector"))
-					done <- err
+					done <- result{report: report, err: err}
 				}()
 				<-entered
 				cancel()
-				return <-done
+				got := <-done
+				return got.report, got.err
 			},
 			code: shoal.ErrorCanceled,
 		},
 		{
 			name: "revocation",
-			run: func(t *testing.T, f *embeddingReportFixture, ctx context.Context) error {
+			run: func(t *testing.T, f *embeddingReportFixture, ctx context.Context) (authorized.RetrievalReport, error) {
 				entered := make(chan struct{})
 				release := make(chan struct{})
 				f.backend.beforeRetrieve = func(context.Context) error {
@@ -506,16 +511,21 @@ func TestAuthorizedEmbeddingReportScrubsAfterCancellationAndRevocation(t *testin
 					<-release
 					return nil
 				}
-				done := make(chan error, 1)
+				type result struct {
+					report authorized.RetrievalReport
+					err    error
+				}
+				done := make(chan result, 1)
 				go func() {
-					_, _, err := f.clientA.RetrieveWithReport(
+					_, report, err := f.clientA.RetrieveWithReport(
 						ctx, vectorQuery("revoke vector"))
-					done <- err
+					done <- result{report: report, err: err}
 				}()
 				<-entered
 				f.reader.Set(f.domain, 2)
 				close(release)
-				return <-done
+				got := <-done
+				return got.report, got.err
 			},
 			code: shoal.ErrorUnavailable,
 		},
@@ -532,9 +542,15 @@ func TestAuthorizedEmbeddingReportScrubsAfterCancellationAndRevocation(t *testin
 				f.alice(t),
 				func(report authorized.EmbeddingQueryReport) { callback = report },
 			)
-			err := test.run(t, f, ctx)
+			report, err := test.run(t, f, ctx)
 			if !shoal.IsErrorCode(err, test.code) {
 				t.Fatalf("guarded error = %v, want %s", err, test.code)
+			}
+			if report.Disclosure != (authorized.Disclosure{}) ||
+				report.Embedding == nil ||
+				report.Embedding.Suppressed ||
+				report.Embedding.Restricted {
+				t.Fatalf("guarded return report leaked disclosure: %+v", report)
 			}
 			if !callback.Degraded ||
 				callback.Observed ||

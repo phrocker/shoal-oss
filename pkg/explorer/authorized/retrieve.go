@@ -130,6 +130,7 @@ func (c *Client) retrieve(
 		discloseIdentities := true
 		if guardErr := guard.Check(ctx); guardErr != nil {
 			discloseIdentities = false
+			report.Disclosure = Disclosure{}
 			if err == nil {
 				response = retrieval.Response{}
 				err = guardErr
