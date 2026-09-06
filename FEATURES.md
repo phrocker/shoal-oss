@@ -55,15 +55,15 @@ the configured Explorer storage compactor.
 `internal/explorerfleetevents.NewActionEventPublisher` maps durable dispatch
 lifecycle transitions into this log. Each envelope carries the immutable
 producer generation and an opaque SHA-256 transition ID derived from the event
-kind, action ID, and exact dispatch transition discriminator. The publication
-token binds only the kind, action ID, and durable action version. Immutable
-producer identity, producer generation, and transition identity remain in the
-canonical persisted envelope, so a same-version divergent retry conflicts
-rather than appending another event. Every hashed component is uint64
-length-framed; raw enqueue, claim, execution, and cancellation keys are never
-exposed, and exact retries remain idempotent. Trusted lifecycle publication is separate
+kind, action ID, agent ID and generation, and a separately hashed exact
+dispatch transition discriminator. Every component is uint64 length-framed;
+raw enqueue, claim, execution, and cancellation keys are never exposed. The publication
+token is keyed only by kind, action ID, and durable action version, so changing
+the transition ID, producer identity, or generation for the same transition
+conflicts against canonical event content instead of appending a second event.
+Exact retries remain idempotent. Trusted lifecycle publication is separate
 from public `event_publish`, preserves its canonical token across authorization
-refreshes, and accepts only the original narrow
+refreshes, and requires the original narrow
 `dispatch` or `invoke` authorization, not `event_publish`, and reauthorizes the
 durable action identity on every attempt. The five `action.*` lifecycle kinds
 are reserved from public publication, and each trusted kind is bound to its
