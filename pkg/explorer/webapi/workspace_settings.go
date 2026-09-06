@@ -164,6 +164,8 @@ func applyWorkspaceRequestLimits(ctx context.Context, request any) {
 			value.MaxDepth, DefaultDepth, limits.GraphDepth)
 		value.Fanout = lowerRequestLimit(
 			value.Fanout, DefaultFanout, limits.GraphFanout)
+		value.MaxNodes = lowerRequestLimit(
+			value.MaxNodes, MaxNodes, limits.GraphNodes)
 	}
 }
 
