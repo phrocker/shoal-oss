@@ -143,7 +143,7 @@ func (c *Client) TransitionOntologyProposal(
 	// This operation check is load-bearing; TestOntologyProposalEndpointDistinguishesAuthorizationDenial
 	// pins that proposal mutations require write authority and surface a
 	// governance 401 without a bearer challenge when the caller lacks it.
-	_, guard, _, err := c.begin(ctx, auth.OperationIngest)
+	decision, guard, now, err := c.begin(ctx, auth.OperationIngest)
 	if err != nil {
 		return ontology.GovernedProposal{}, err
 	}
@@ -151,6 +151,30 @@ func (c *Client) TransitionOntologyProposal(
 	defer c.mutationMu.Unlock()
 	if err := guard.Check(ctx); err != nil {
 		return ontology.GovernedProposal{}, err
+	}
+	evidenceStore, ok := c.base.(explorer.OntologyProposalEvidenceProvider)
+	if !ok {
+		return ontology.GovernedProposal{}, shoal.NewError(
+			shoal.ErrorUnavailable,
+			"workspace capability \"ontology proposal evidence\" is unavailable",
+		)
+	}
+	evidence, found, err := evidenceStore.OntologyProposalEvidence(ctx, proposalID)
+	if err != nil {
+		return ontology.GovernedProposal{}, directBaseError(err)
+	}
+	if !found {
+		return ontology.GovernedProposal{}, auth.ObjectNotFound()
+	}
+	for _, item := range evidence {
+		allowed, evidenceErr := c.ontologyEvidenceAllows(
+			ctx, item, decision, auth.OperationIngest, now)
+		if evidenceErr != nil {
+			return ontology.GovernedProposal{}, evidenceErr
+		}
+		if !allowed {
+			return ontology.GovernedProposal{}, auth.ObjectNotFound()
+		}
 	}
 	proposal, err := store.TransitionOntologyProposal(
 		ctx, proposalID, next, actor, note, at)
@@ -229,14 +253,18 @@ func (c *Client) ontologyEvidenceAllows(
 		return false, inconsistentBase()
 	}
 	if citation.SectionID != "" {
-		if _, ok := canonical.sections[citation.SectionID]; !ok {
-			return false, inconsistentBase()
+		section, ok := canonical.sections[citation.SectionID]
+		if !ok || section.Range.Start.Offset > citation.Range.Start.Offset ||
+			citation.Range.End.Offset > section.Range.End.Offset {
+			return false, nil
 		}
 	}
 	if citation.SpanID != "" {
 		span, ok := canonical.spans[citation.SpanID]
-		if !ok || citation.SectionID != "" && span.SectionID != citation.SectionID {
-			return false, inconsistentBase()
+		if !ok || citation.SectionID != "" && span.SectionID != citation.SectionID ||
+			span.Range.Start.Offset > citation.Range.Start.Offset ||
+			citation.Range.End.Offset > span.Range.End.Offset {
+			return false, nil
 		}
 	}
 	path, hasPath := evidence.Path()

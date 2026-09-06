@@ -64,6 +64,31 @@ func TestPublishedCatalogRejectsForkedActiveHistory(t *testing.T) {
 	}
 }
 
+func TestPublishedCatalogIgnoresDisconnectedFork(t *testing.T) {
+	schema, _ := NewOntologySchema("disconnected", "Disconnected", "", nil)
+	at := time.Date(2026, time.September, 6, 2, 0, 0, 0, time.UTC)
+	configured, _ := NewOntologyVersion(schema, "1", at, nil, nil, nil, nil)
+	active, _ := NewOntologyVersion(
+		schema, "2", at.Add(time.Second), nil, nil, nil, nil)
+	disconnected, _ := NewOntologyVersion(
+		schema, "other", at.Add(2*time.Second), nil, nil, nil, nil)
+	left, _ := NewOntologyVersion(
+		schema, "other-left", at.Add(3*time.Second), nil, nil, nil, nil)
+	right, _ := NewOntologyVersion(
+		schema, "other-right", at.Add(4*time.Second), nil, nil, nil, nil)
+	catalog, err := NewPublishedCatalog(configured, []GovernedProposal{
+		publishedProposal(t, configured, active, at.Add(5*time.Second)),
+		publishedProposal(t, disconnected, left, at.Add(9*time.Second)),
+		publishedProposal(t, disconnected, right, at.Add(13*time.Second)),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if catalog.Active().ID() != active.ID() || len(catalog.Versions()) != 2 {
+		t.Fatalf("disconnected fork changed catalog = %#v", catalog.Versions())
+	}
+}
+
 func publishedProposal(
 	t *testing.T,
 	base, target OntologyVersion,

@@ -514,6 +514,60 @@ func TestUnrelatedSchemaForkDoesNotPoisonSelectedOntology(t *testing.T) {
 	}
 }
 
+func TestDisconnectedSameSchemaForkDoesNotPoisonExactRead(t *testing.T) {
+	corpus, err := Open(filepath.Join(t.TempDir(), "corpus"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer corpus.Close()
+	at := time.Date(2026, 9, 6, 4, 30, 0, 0, time.UTC)
+	schema, _ := ontology.NewOntologySchema("selected", "Selected", "", nil)
+	property, _ := ontology.NewPropertyDefinition(
+		"name", "Name", "", ontology.ValueString, nil, nil)
+	concept, _ := ontology.NewConceptDefinition(
+		"person", "Person", "", []shoal.ID{property.ID()}, nil)
+	selected, _ := ontology.NewOntologyVersion(
+		schema, "1", at, []ontology.ConceptDefinition{concept},
+		nil, []ontology.PropertyDefinition{property}, nil)
+	disconnected, _ := ontology.NewOntologyVersion(
+		schema, "other", at.Add(time.Second), nil, nil, nil, nil)
+	left, _ := ontology.NewOntologyVersion(
+		schema, "other-left", at.Add(2*time.Second), nil, nil, nil, nil)
+	right, _ := ontology.NewOntologyVersion(
+		schema, "other-right", at.Add(3*time.Second), nil, nil, nil, nil)
+	corpus.mu.Lock()
+	for _, proposal := range []ontology.GovernedProposal{
+		mustPublishedProposal(t, schema, disconnected, left, at.Add(4*time.Second)),
+		mustPublishedProposal(t, schema, disconnected, right, at.Add(8*time.Second)),
+	} {
+		record := mustPersistedPublishedProposal(t, proposal, disconnected)
+		copy := record
+		corpus.ontologyProposals[proposal.ID()] = &copy
+	}
+	corpus.mu.Unlock()
+	evidence, _ := ontology.NewEvidenceRef(document.Citation{
+		DocumentID: "doc", RevisionID: "rev", SectionID: "section",
+		Range: document.SourceRange{},
+	}, "", nil)
+	provenance, _ := ontology.NewExtractionProvenance(
+		"provider", "model", "1", "prompt", "1", "extractor", "1", nil)
+	value, _ := ontology.NewStringValue("Ada")
+	identity, _ := ontology.NewOntologyIdentity(selected)
+	assertion, err := ontology.NewAssertion(
+		"person-1", property.ID(), value, ontology.AssertionExplicit, 1,
+		[]ontology.EvidenceRef{evidence}, provenance, nil,
+		ontology.WithAssertionSubjectType(concept.ID()),
+		ontology.WithAssertionOntology(identity))
+	if err != nil {
+		t.Fatal(err)
+	}
+	read, err := corpus.InterpretAssertions(
+		context.Background(), []ontology.Assertion{assertion}, identity)
+	if err != nil || len(read) != 1 || !read[0].Resolved() {
+		t.Fatalf("disconnected same-schema fork poisoned exact read: %#v, %v", read, err)
+	}
+}
+
 func TestOntologyPublicationRejectsCycleToPublishedAncestor(t *testing.T) {
 	corpus, err := Open(filepath.Join(t.TempDir(), "corpus"))
 	if err != nil {

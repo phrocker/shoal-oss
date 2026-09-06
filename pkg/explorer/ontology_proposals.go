@@ -60,6 +60,14 @@ type OntologyProposalMutationStateProvider interface {
 	) (OntologyProposalMutationState, error)
 }
 
+// OntologyProposalEvidenceProvider returns only the immutable evidence needed
+// to authorize a requested proposal mutation.
+type OntologyProposalEvidenceProvider interface {
+	OntologyProposalEvidence(
+		context.Context, shoal.ID,
+	) ([]ontology.EvidenceRef, bool, error)
+}
+
 // OntologyProposalMutationState is the narrow preflight view needed by
 // proposal mutations. It intentionally excludes proposal authors, rationale,
 // metadata, evidence, and unrelated proposal bodies.
@@ -272,6 +280,42 @@ func (e *Explorer) OntologyProposalMutationState(
 	}
 	state.active = catalog.Active()
 	return state, nil
+}
+
+// OntologyProposalEvidence returns independent evidence values for one
+// proposal without exposing unrelated governed proposal bodies.
+func (e *Explorer) OntologyProposalEvidence(
+	ctx context.Context,
+	proposalID shoal.ID,
+) ([]ontology.EvidenceRef, bool, error) {
+	if err := contextError(ctx); err != nil {
+		return nil, false, err
+	}
+	if err := shoal.ValidateRequiredID("ontology proposal ID", proposalID); err != nil {
+		return nil, false, err
+	}
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	if err := e.requireOpen(); err != nil {
+		return nil, false, err
+	}
+	if err := e.requireCertainOntologyMutationLocked(); err != nil {
+		return nil, false, err
+	}
+	record := e.ontologyProposals[proposalID]
+	if record == nil {
+		return nil, false, nil
+	}
+	proposal, err := record.proposal()
+	if err != nil {
+		return nil, false, shoal.WrapError(
+			shoal.ErrorInternal, "stored ontology proposal is invalid", err)
+	}
+	var evidence []ontology.EvidenceRef
+	for _, morphism := range proposal.Morphisms() {
+		evidence = append(evidence, morphism.Evidence()...)
+	}
+	return evidence, true, nil
 }
 
 // CreateOntologyProposal durably records a new draft proposal. The lifecycle is

@@ -200,6 +200,7 @@ func TestOntologyProposalEvidenceRequiresObjectAuthorization(t *testing.T) {
 		t, viewB, nil)
 	deniedPath := ontologyEvidenceRef(
 		t, viewA, &pathB)
+	var deniedProposals []ontology.GovernedProposal
 	for index, evidence := range []ontology.EvidenceRef{
 		allowedEvidence, deniedCitation, deniedPath,
 	} {
@@ -211,6 +212,9 @@ func TestOntologyProposalEvidenceRequiresObjectAuthorization(t *testing.T) {
 		if target.ID() == "" {
 			t.Fatal("target ontology version is empty")
 		}
+		if index > 0 {
+			deniedProposals = append(deniedProposals, proposal)
+		}
 	}
 
 	visible, err := client.OntologyProposals(ctx)
@@ -221,14 +225,31 @@ func TestOntologyProposalEvidenceRequiresObjectAuthorization(t *testing.T) {
 		visible[0].Morphisms()[0].Evidence()[0].ID() != allowedEvidence.ID() {
 		t.Fatalf("visible proposals = %#v, want only source-a evidence", visible)
 	}
+	if _, err := client.TransitionOntologyProposal(
+		ctx, deniedProposals[0].ID(), ontology.ProposalSubmitted,
+		"governor", "unauthorized evidence", at.Add(time.Minute),
+	); !shoal.IsErrorCode(err, shoal.ErrorNotFound) {
+		t.Fatalf("unauthorized evidence transition = %v, want non-disclosing not found", err)
+	}
 
 	allowed, _ := ontologyEvidenceProposal(
 		t, schema, baseVersion, 5, allowedEvidence, at)
 	if err := client.CreateOntologyProposal(ctx, allowed, baseVersion); err != nil {
 		t.Fatalf("authorized evidence create = %v", err)
 	}
+	outsideRange, err := ontology.NewEvidenceRef(document.Citation{
+		DocumentID: viewA.Document.ID, RevisionID: viewA.Revision.ID,
+		SectionID: viewA.Root.Section.ID,
+		Range: document.SourceRange{
+			Start: document.SourcePosition{Offset: 0},
+			End:   document.SourcePosition{Offset: 1},
+		},
+	}, "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 	for index, evidence := range []ontology.EvidenceRef{
-		deniedCitation, deniedPath,
+		deniedCitation, deniedPath, outsideRange,
 	} {
 		rejected, _ := ontologyEvidenceProposal(
 			t, schema, baseVersion, index+6, evidence, at)
@@ -245,6 +266,11 @@ func TestOntologyProposalEvidenceRequiresObjectAuthorization(t *testing.T) {
 	}
 	if len(stored) != 4 {
 		t.Fatalf("unauthorized evidence proposal persisted: %d proposals", len(stored))
+	}
+	for _, proposal := range stored {
+		if proposal.State() != ontology.ProposalDraft {
+			t.Fatalf("unauthorized evidence transition changed proposal: %#v", proposal)
+		}
 	}
 
 	if len(pathA.Nodes) != 2 || len(pathA.Edges) != 1 {
