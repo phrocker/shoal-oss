@@ -110,6 +110,12 @@ func TestAnalyticsOptionalToolAdvertisesAndInvokesOnlyWithLimits(t *testing.T) {
 		string(result.StructuredContent), "analytics-sha256:test") {
 		t.Fatalf("structured result = %s", result.StructuredContent)
 	}
+	service.invalid = true
+	invalid := decodeToolResult(
+		t, callToolRequest(t, server, ToolAnalytics, string(arguments)))
+	if !invalid.IsError || service.calls != 2 {
+		t.Fatalf("invalid analytics result = %#v, calls=%d", invalid, service.calls)
+	}
 
 	without, _ := newTestServer(t, &stubService{}, nil)
 	makeReady(t, without)
@@ -156,6 +162,7 @@ type analyticsMCPService struct {
 	available bool
 	recording bool
 	calls     int
+	invalid   bool
 }
 
 func (s *analyticsMCPService) AnalyticsLimits() (analytics.Limits, bool) {
@@ -193,15 +200,26 @@ func (s *analyticsMCPService) Analytics(
 				Fanout: request.Scope.Fanout, MaxNodes: request.Scope.MaxNodes,
 				MaxEdges:               request.Scope.MaxEdges,
 				MaxScannedEdgesPerNode: request.Scope.MaxScannedEdgesPerNode,
+				NodeCount:              1,
 				Complete:               true,
 			},
+			Nodes: []analytics.NodeSummary{{
+				NodeID: "node", PageRank: 1,
+				WeakComponentID: "component-sha256:1fd9520a06abfed7821c68b3626a8ff3dcca5d4da5d663da612324802ebc821f",
+			}},
+			WeaklyConnectedComponents: []analytics.ComponentSummary{{
+				ID:        "component-sha256:1fd9520a06abfed7821c68b3626a8ff3dcca5d4da5d663da612324802ebc821f",
+				NodeIDs:   []shoal.ID{"node"},
+				NodeCount: 1,
+			}},
 			PageRank: analytics.PageRankSummary{
 				DampingFactor:        analytics.DefaultDampingFactor,
 				ConvergenceTolerance: analytics.DefaultConvergenceTolerance,
-				MaxIterations:        analytics.DefaultMaxIterations, Converged: true,
+				MaxIterations:        analytics.DefaultMaxIterations,
+				Iterations:           1, Converged: true,
 			},
 			Recording: analytics.RecordingStatus{
-				Recorded: true, Required: true,
+				Recorded: !s.invalid, Required: true,
 				InteractionID: "interaction-mcp",
 			},
 		},

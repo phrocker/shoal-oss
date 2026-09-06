@@ -96,6 +96,20 @@ func TestAnalyticsRouteUsesHostAndAuthenticationGuards(t *testing.T) {
 		strings.Contains(response.Body.String(), `"Recorded"`) {
 		t.Fatalf("analytics response schema = %s", response.Body.String())
 	}
+	service.invalid = true
+	invalidRequest := httptest.NewRequest(
+		http.MethodPost, "http://workspace.test/api/v1/analytics",
+		bytes.NewReader(body),
+	)
+	invalidRequest.Host = "workspace.test"
+	invalidRequest.Header.Set("Content-Type", "application/json")
+	invalidResponse := httptest.NewRecorder()
+	handler.ServeHTTP(invalidResponse, invalidRequest)
+	if invalidResponse.Code != http.StatusInternalServerError {
+		t.Fatalf("invalid provider response = %d %s",
+			invalidResponse.Code, invalidResponse.Body.String())
+	}
+	service.invalid = false
 
 	badHost := httptest.NewRequest(
 		http.MethodPost, "http://evil.test/api/v1/analytics",
@@ -105,7 +119,7 @@ func TestAnalyticsRouteUsesHostAndAuthenticationGuards(t *testing.T) {
 	badHost.Header.Set("Content-Type", "application/json")
 	badHostResponse := httptest.NewRecorder()
 	handler.ServeHTTP(badHostResponse, badHost)
-	if badHostResponse.Code != http.StatusMisdirectedRequest || service.calls != 1 {
+	if badHostResponse.Code != http.StatusMisdirectedRequest || service.calls != 2 {
 		t.Fatalf("host guard response = %d, calls=%d",
 			badHostResponse.Code, service.calls)
 	}
@@ -508,6 +522,7 @@ type analyticsRouteService struct {
 	gateStubService
 	resolver auth.Resolver
 	calls    int
+	invalid  bool
 }
 
 type disabledAnalyticsService struct {
@@ -617,7 +632,7 @@ func (s *analyticsRouteService) Analytics(
 				Iterations:           1, Converged: true,
 			},
 			Recording: analytics.RecordingStatus{
-				Recorded: true, Required: true,
+				Recorded: !s.invalid, Required: true,
 				InteractionID: "interaction-route",
 			},
 		},

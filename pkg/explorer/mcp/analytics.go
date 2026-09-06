@@ -158,7 +158,15 @@ func (p *analyticsToolProvider) Call(
 	); err != nil {
 		return nil, invalidToolArguments(ToolAnalytics)
 	}
-	return p.provider.Analytics(ctx, request)
+	response, err := p.provider.Analytics(ctx, request)
+	if err != nil {
+		return nil, err
+	}
+	if err := webapi.ValidateAnalyticsResponse(
+		request, response, p.limits); err != nil {
+		return nil, err
+	}
+	return response, nil
 }
 
 var _ OptionalToolProvider = (*analyticsToolProvider)(nil)

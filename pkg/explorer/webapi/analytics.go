@@ -150,8 +150,45 @@ func analyticsEndpoint(service Service) http.HandlerFunc {
 			writeError(writer, err)
 			return
 		}
+		if err := ValidateAnalyticsResponse(input, response, limits); err != nil {
+			writeError(writer, err)
+			return
+		}
 		writeResponse(writer, http.StatusOK, response)
 	}
+}
+
+// ValidateAnalyticsResponse verifies an extension provider result against the
+// exact request, advertised limits, snapshot, and durable-recording contract.
+func ValidateAnalyticsResponse(
+	request AnalyticsRequest,
+	response AnalyticsResponse,
+	limits exploreranalytics.Limits,
+) error {
+	if response.Snapshot.ID == "" ||
+		response.Snapshot.ID != response.Analytics.Scope.SnapshotID {
+		return shoal.NewError(
+			shoal.ErrorInternal, "analytics provider returned an inconsistent snapshot")
+	}
+	if err := exploreranalytics.ValidateResult(
+		exploreranalytics.Request{
+			SnapshotID: request.Snapshot.ID,
+			Scope:      request.Scope,
+			PageRank:   request.PageRank,
+		},
+		response.Analytics,
+		limits,
+	); err != nil {
+		return err
+	}
+	if !response.Analytics.Recording.Required ||
+		!response.Analytics.Recording.Recorded {
+		return shoal.NewError(
+			shoal.ErrorInternal,
+			"analytics provider did not durably record the result",
+		)
+	}
+	return nil
 }
 
 func analyticsProvider(
