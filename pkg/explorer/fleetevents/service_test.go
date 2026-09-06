@@ -240,6 +240,37 @@ func TestRecorderFailureReportsAmbiguousCommittedAction(t *testing.T) {
 	}
 }
 
+func TestAuditErrorClassificationPreservesCommittedOutcome(t *testing.T) {
+	cause := errors.New("record accepted before failure")
+	committed := interaction.MarkCommittedRecord(cause)
+	if got := classifyAuditError(committed); !errors.Is(got, cause) ||
+		!interaction.IsCommittedRecord(got) ||
+		errors.Is(got, ErrAuditOutcomeUnknown) {
+		t.Fatalf("committed audit error = %v", got)
+	}
+	unclassified := classifyAuditError(cause)
+	if !errors.Is(unclassified, cause) ||
+		!errors.Is(unclassified, ErrAuditOutcomeUnknown) {
+		t.Fatalf("unclassified audit error = %v", unclassified)
+	}
+}
+
+func TestPublishPreservesKnownCommittedAuditOutcome(t *testing.T) {
+	now := time.Date(2026, 9, 5, 20, 0, 0, 0, time.UTC)
+	backend := &memoryBackend{}
+	cause := errors.New("record accepted before cancellation")
+	audit := &auditor{err: interaction.MarkCommittedRecord(cause)}
+	service := testService(t, "alice", now, backend, &generationReader{generation: 7},
+		&leaseValidator{}, audit)
+	_, err := service.Publish(context.Background(), PublishRequest{
+		Token: []byte("publish"), RetryUntil: now.Add(time.Hour), Event: eventAt(0),
+	})
+	if !errors.Is(err, cause) || !interaction.IsCommittedRecord(err) ||
+		errors.Is(err, ErrAuditOutcomeUnknown) || len(backend.events) != 1 {
+		t.Fatalf("publish error/events = %v/%d", err, len(backend.events))
+	}
+}
+
 func TestRetryDeadlineBoundsFailBeforeMutation(t *testing.T) {
 	now := time.Date(2026, 9, 6, 20, 0, 0, 0, time.UTC)
 	backend := &memoryBackend{}

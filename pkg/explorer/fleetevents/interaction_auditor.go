@@ -22,6 +22,7 @@ package fleetevents
 import (
 	"context"
 	"encoding/hex"
+	"errors"
 	"reflect"
 	"time"
 
@@ -81,13 +82,20 @@ func (a *InteractionAuditor) RecordFleetAction(ctx context.Context, record Audit
 		}},
 	}
 	persisted, err := a.recorder.Record(ctx, session)
-	if err != nil {
+	if err != nil && !interaction.IsCommittedRecord(err) {
 		return err
 	}
 	if !sameFleetReceipt(session, persisted) {
-		return explorer.MarkCommittedInteraction(shoal.NewError(
+		mismatch := explorer.MarkCommittedInteraction(shoal.NewError(
 			shoal.ErrorInternal,
 			"persisted fleet interaction receipt does not match request"))
+		if err != nil {
+			return errors.Join(err, mismatch)
+		}
+		return mismatch
+	}
+	if err != nil {
+		return err
 	}
 	return nil
 }

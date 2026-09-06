@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
+	"github.com/phrocker/shoal-oss/pkg/interaction"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
@@ -156,7 +157,7 @@ func (s *Service) Create(ctx context.Context, request CreateRequest) (Subscripti
 		ctx, decision, auth.OperationSubscriptionCreate, request.Token,
 		subscription.ID, nil, subscription.CreatedAt,
 	); err != nil {
-		return Subscription{}, errors.Join(ErrAuditOutcomeUnknown, err)
+		return Subscription{}, classifyAuditError(err)
 	}
 	if err := guard.Check(ctx); err != nil {
 		return Subscription{}, errors.Join(ErrActionCommitted, err)
@@ -194,7 +195,7 @@ func (s *Service) Delete(ctx context.Context, request DeleteRequest) error {
 		ctx, decision, auth.OperationSubscriptionDelete, request.SubscriptionID,
 		subscription.ID, nil, subscription.RevokedAt,
 	); err != nil {
-		return errors.Join(ErrAuditOutcomeUnknown, err)
+		return classifyAuditError(err)
 	}
 	if err := guard.Check(ctx); err != nil {
 		return errors.Join(ErrActionCommitted, err)
@@ -308,7 +309,7 @@ func (s *Service) publish(
 		})
 	}
 	if recordErr != nil {
-		return PublishResult{}, errors.Join(ErrAuditOutcomeUnknown, recordErr)
+		return PublishResult{}, classifyAuditError(recordErr)
 	}
 	if err := guard.Check(ctx); err != nil {
 		return PublishResult{}, errors.Join(ErrActionCommitted, err)
@@ -413,6 +414,13 @@ func (s *Service) Pull(ctx context.Context, request PullRequest) (Page, error) {
 		subscription, decision, fingerprint =
 			freshSubscription, freshDecision, freshFingerprint
 	}
+}
+
+func classifyAuditError(err error) error {
+	if err == nil || interaction.IsCommittedRecord(err) {
+		return err
+	}
+	return errors.Join(ErrAuditOutcomeUnknown, err)
 }
 
 func validateRetryUntil(

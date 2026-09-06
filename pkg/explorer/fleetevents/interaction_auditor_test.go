@@ -21,11 +21,13 @@ package fleetevents
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/interaction"
+	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
 func TestInteractionAuditorRecordsRedactedAction(t *testing.T) {
@@ -99,8 +101,8 @@ func TestInteractionAuditorRejectsMismatchedPersistedReceipt(t *testing.T) {
 		ObjectID: []byte("event"), AuthorizationFingerprint: auth.Fingerprint{1},
 		AuthorizationExpiresAt: time.Now().Add(time.Hour), OccurredAt: time.Now(),
 	})
-	if err == nil {
-		t.Fatal("expected mismatched receipt to fail")
+	if !interaction.IsCommittedRecord(err) {
+		t.Fatalf("mismatched accepted receipt must fail as committed: %v", err)
 	}
 }
 
@@ -110,9 +112,124 @@ func TestInteractionAuditorRejectsNilRecorder(t *testing.T) {
 	}
 }
 
+func TestInteractionAuditorAcceptsOriginalRetryTimestamp(t *testing.T) {
+	original := time.Date(2026, 9, 6, 10, 0, 0, 0, time.UTC)
+	retry := original.Add(time.Minute)
+	sink := &auditSink{mutateResult: func(session interaction.Session) interaction.Session {
+		session.RecordedAt = original
+		return session
+	}}
+	recorder, err := interaction.NewRecorder(context.Background(), sink)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := recorder.SetClock(func() time.Time { return retry }); err != nil {
+		t.Fatal(err)
+	}
+	auditor, err := NewInteractionAuditor(recorder)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := auditor.RecordFleetAction(context.Background(), AuditRecord{
+		Operation: auth.OperationEventPublish, ActionID: []byte("retry"),
+		ObjectID: []byte("event"), AuthorizationFingerprint: auth.Fingerprint{1},
+		AuthorizationExpiresAt: retry.Add(time.Hour), OccurredAt: original,
+	}); err != nil {
+		t.Fatalf("original timestamp retry = %v", err)
+	}
+}
+
+func TestInteractionAuditorRejectsPreSinkExpiryWithoutWrite(t *testing.T) {
+	now := time.Date(2026, 9, 6, 10, 0, 0, 0, time.UTC)
+	sink := &auditSink{}
+	recorder, err := interaction.NewRecorder(context.Background(), sink)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := recorder.SetClock(func() time.Time { return now }); err != nil {
+		t.Fatal(err)
+	}
+	auditor, err := NewInteractionAuditor(recorder)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = auditor.RecordFleetAction(context.Background(), AuditRecord{
+		Operation: auth.OperationEventPublish, ActionID: []byte("expired"),
+		ObjectID: []byte("event"), AuthorizationFingerprint: auth.Fingerprint{1},
+		AuthorizationExpiresAt: now, OccurredAt: now.Add(-time.Second),
+	})
+	if !shoal.IsErrorCode(err, shoal.ErrorUnauthorized) ||
+		interaction.IsCommittedRecord(err) || len(sink.sessions) != 0 {
+		t.Fatalf("pre-sink expiry = %v, writes = %d", err, len(sink.sessions))
+	}
+}
+
+func TestInteractionAuditorPreservesCommittedPostSinkFailures(t *testing.T) {
+	started := time.Date(2026, 9, 6, 10, 0, 0, 0, time.UTC)
+	t.Run("expiry", func(t *testing.T) {
+		calls := 0
+		sink := &auditSink{}
+		recorder, err := interaction.NewRecorder(context.Background(), sink)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := recorder.SetClock(func() time.Time {
+			calls++
+			if calls == 1 {
+				return started
+			}
+			return started.Add(time.Second)
+		}); err != nil {
+			t.Fatal(err)
+		}
+		auditor, err := NewInteractionAuditor(recorder)
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = auditor.RecordFleetAction(context.Background(), AuditRecord{
+			Operation: auth.OperationEventPublish, ActionID: []byte("expiry"),
+			ObjectID: []byte("event"), AuthorizationFingerprint: auth.Fingerprint{1},
+			AuthorizationExpiresAt: started.Add(time.Second),
+			OccurredAt:             started.Add(-time.Second),
+		})
+		if !interaction.IsCommittedRecord(err) ||
+			!shoal.IsErrorCode(err, shoal.ErrorUnauthorized) ||
+			len(sink.sessions) != 1 {
+			t.Fatalf("post-sink expiry = %v, writes = %d", err, len(sink.sessions))
+		}
+	})
+
+	t.Run("cancellation", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		sink := &auditSink{afterRecord: cancel}
+		recorder, err := interaction.NewRecorder(context.Background(), sink)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := recorder.SetClock(func() time.Time { return started }); err != nil {
+			t.Fatal(err)
+		}
+		auditor, err := NewInteractionAuditor(recorder)
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = auditor.RecordFleetAction(ctx, AuditRecord{
+			Operation: auth.OperationEventPublish, ActionID: []byte("canceled"),
+			ObjectID: []byte("event"), AuthorizationFingerprint: auth.Fingerprint{1},
+			AuthorizationExpiresAt: started.Add(time.Hour),
+			OccurredAt:             started.Add(-time.Second),
+		})
+		if !interaction.IsCommittedRecord(err) ||
+			!errors.Is(err, context.Canceled) || len(sink.sessions) != 1 {
+			t.Fatalf("post-sink cancellation = %v, writes = %d", err, len(sink.sessions))
+		}
+	})
+}
+
 type auditSink struct {
 	sessions     []interaction.Session
 	mutateResult func(interaction.Session) interaction.Session
+	afterRecord  func()
 }
 
 func (*auditSink) EnsureInteractionSink(context.Context) error { return nil }
@@ -135,6 +252,9 @@ func (s *auditSink) RecordInteractionResult(
 	result.Reason = interaction.Reason{Code: "audit_purpose"}
 	if s.mutateResult != nil {
 		result = s.mutateResult(result)
+	}
+	if s.afterRecord != nil {
+		s.afterRecord()
 	}
 	return result, nil
 }
