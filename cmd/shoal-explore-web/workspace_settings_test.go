@@ -26,6 +26,7 @@ import (
 
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/explorer/workspace"
+	"github.com/phrocker/shoal-oss/pkg/ontology"
 )
 
 func TestOpenServiceWiresDurableWorkspaceSettings(t *testing.T) {
@@ -50,14 +51,28 @@ func TestOpenServiceWiresDurableWorkspaceSettings(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resolver, err := auth.NewStaticResolverWithClock(
-		decision, func() time.Time { return now })
+	authority, err := auth.NewAuthorityWithClock(func() time.Time { return now })
+	if err != nil {
+		t.Fatal(err)
+	}
+	adminContext, err := authority.Binder().Bind(context.Background(), decision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	schema, err := ontology.NewOntologySchema(
+		"workspace", "Workspace", "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, err := ontology.NewOntologyVersion(
+		schema, "1", now, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	config := serviceConfig{
 		backend: "embedded", data: corpus, policyDir: policy,
-		resolver: resolver, clock: func() time.Time { return now },
+		resolver: authority.Resolver(), clock: func() time.Time { return now },
+		ontology: &version,
 	}
 	opened, err := openService(context.Background(), config)
 	if err != nil {
@@ -68,7 +83,7 @@ func TestOpenServiceWiresDurableWorkspaceSettings(t *testing.T) {
 	}
 	topK := uint32(5)
 	created, err := opened.settings.Update(
-		context.Background(), "started-workspace", workspace.UpdateRequest{
+		adminContext, "started-workspace", workspace.UpdateRequest{
 			MutationID: "started-mutation",
 			Narrowing: workspace.UpdateNarrowing{
 				Budgets: workspace.Budgets{RetrievalTopK: &topK},
@@ -77,6 +92,44 @@ func TestOpenServiceWiresDurableWorkspaceSettings(t *testing.T) {
 	)
 	if err != nil {
 		t.Fatal(err)
+	}
+	identity, err := ontology.NewOntologyIdentity(version)
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err = opened.settings.SelectOntology(
+		adminContext, created.WorkspaceID, created.Revision,
+		"select-ontology", identity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	narrowDecision, err := auth.NewDecision(auth.DecisionConfig{
+		Subject:               "owner",
+		Actor:                 "actor",
+		AuthorizationDomain:   workspaceAuthorizationDomain,
+		AllowedOperations:     []auth.Operation{auth.OperationRetrieve},
+		PermittedSourceIDs:    [][]byte{workspaceSourceID},
+		PermittedPolicyIDs:    [][]byte{workspaceGrantPolicyID},
+		PolicyGeneration:      workspacePolicyGeneration,
+		AuthenticationExpires: now.Add(time.Hour),
+		RequestID:             "narrow-request",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	narrowContext, err := authority.Binder().Bind(
+		context.Background(), narrowDecision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	effective, err := opened.settings.Apply(
+		narrowContext, created.WorkspaceID, workspace.MaximumLimits(), nil)
+	if err != nil {
+		t.Fatalf("apply selected lens for narrow service operation: %v", err)
+	}
+	selected, selectedSet := effective.Decision().SelectedOntology()
+	if !selectedSet || selected != identity {
+		t.Fatalf("effective selected ontology = %#v, %v", selected, selectedSet)
 	}
 	opened.close()
 	if _, err := os.Stat(filepath.Join(root, "settings")); !os.IsNotExist(err) {
@@ -89,14 +142,16 @@ func TestOpenServiceWiresDurableWorkspaceSettings(t *testing.T) {
 	}
 	defer reopened.close()
 	loaded, err := reopened.settings.Get(
-		context.Background(), "started-workspace")
+		adminContext, "started-workspace")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if loaded.Revision != created.Revision ||
 		loaded.SettingsID != created.SettingsID ||
 		loaded.Narrowing.Budgets.RetrievalTopK == nil ||
-		*loaded.Narrowing.Budgets.RetrievalTopK != topK {
+		*loaded.Narrowing.Budgets.RetrievalTopK != topK ||
+		!loaded.Narrowing.SelectedOntology.Present ||
+		loaded.Narrowing.SelectedOntology.Identity != identity {
 		t.Fatalf("restarted settings = %#v", loaded)
 	}
 }
