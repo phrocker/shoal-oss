@@ -390,6 +390,28 @@ func TestLegacySnapshotCannotProveAssertionState(t *testing.T) {
 	f.validate(t, pin, false)
 }
 
+func TestSnapshotReusesIdenticalHistoricalAssertionState(t *testing.T) {
+	f := newSnapshotAssertionFixture(t)
+	f.publish(t)
+	first := f.snapshot(t)
+	original := f.assertion
+	f.annotate(t)
+	f.publish(t)
+	changed := f.snapshot(t)
+	f.assertion = original
+	f.publish(t)
+	if got := f.snapshot(t); got != first {
+		t.Fatalf("identical logical assertion state changed frontier: %+v != %+v", got, first)
+	}
+	f.validate(t, first, false)
+	f.validate(t, changed, true)
+	f.reopen(t)
+	if got := f.snapshot(t); got != first {
+		t.Fatalf("reopened repeated frontier changed: %+v != %+v", got, first)
+	}
+	f.validate(t, first, false)
+}
+
 func TestSnapshotAssertionDeltaValidationAndEquality(t *testing.T) {
 	state := persistedSnapshotObject{ID: "edge", Digest: strings.Repeat("a", 64)}
 	for _, test := range []struct {

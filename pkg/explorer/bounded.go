@@ -928,8 +928,14 @@ func (e *Explorer) refreshSnapshotLocked() {
 		}
 	}
 	sum := hash.Sum(nil)
+	id := hex.EncodeToString(sum)
+	// An equality frontier can recur after intervening changes. Reuse its
+	// registered observation time rather than invalidating its historical pin.
+	if registered, ok := e.snapshotHistory[id]; ok {
+		asOf = registered.AsOf
+	}
 	e.snapshot = Snapshot{
-		ID: hex.EncodeToString(sum), AsOf: asOf.UTC(),
+		ID: id, AsOf: asOf.UTC(),
 		Frontier: binary.BigEndian.Uint64(sum[:8]),
 	}
 }

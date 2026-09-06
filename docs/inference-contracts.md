@@ -44,6 +44,9 @@ Legacy snapshot records without assertion state can still prove their recorded
 node and edge state, but cannot authorize new assertion-backed evidence; callers
 must obtain a new snapshot for that evidence. Current authorization checks remain
 required independently of historical proof.
+Snapshot identities are equality frontiers, not ordered change cursors. When
+identical logical state reappears, its registered snapshot identity and `AsOf`
+are reused rather than assigning a conflicting observation time.
 
 ## Tool-using agent harness
 
