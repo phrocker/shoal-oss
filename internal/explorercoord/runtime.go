@@ -88,28 +88,29 @@ type Result struct {
 // Publish concurrently through one Runtime. Multiple processes may not open
 // the same directory.
 type Runtime struct {
-	mu            sync.RWMutex
-	recoveryMu    sync.Mutex
-	closed        bool
-	engine        *engine.Engine
-	lock          *os.File
-	store         *EngineStore
-	protocolStore coordinationStore
-	intents       *IntentStore
-	physical      *Physical
-	allocator     *allocator.Client
-	guards        *guard.Client
-	coordinator   *transaction.Coordinator
-	recovery      *recovery.Worker
-	domain        coordination.DomainID
-	owner         coordination.OwnerID
-	authority     transaction.Authority
-	lease         time.Duration
-	clock         func() time.Time
-	recoveryLimit int
-	recoveryPages int
-	intentCursor  []byte
-	intentDone    bool
+	mu             sync.RWMutex
+	recoveryMu     sync.Mutex
+	closed         bool
+	engine         *engine.Engine
+	lock           *os.File
+	store          *EngineStore
+	protocolStore  coordinationStore
+	intents        *IntentStore
+	physical       *Physical
+	physicalTables map[string]struct{}
+	allocator      *allocator.Client
+	guards         *guard.Client
+	coordinator    *transaction.Coordinator
+	recovery       *recovery.Worker
+	domain         coordination.DomainID
+	owner          coordination.OwnerID
+	authority      transaction.Authority
+	lease          time.Duration
+	clock          func() time.Time
+	recoveryLimit  int
+	recoveryPages  int
+	intentCursor   []byte
+	intentDone     bool
 }
 
 func Open(config Config) (*Runtime, error) {
@@ -190,6 +191,10 @@ func Open(config Config) (*Runtime, error) {
 	}
 	tables := append([]string{config.CoordinationTable}, config.PhysicalTables...)
 	sort.Strings(tables)
+	physicalTables := make(map[string]struct{}, len(config.PhysicalTables))
+	for _, table := range config.PhysicalTables {
+		physicalTables[table] = struct{}{}
+	}
 	for index, table := range tables {
 		if !validTableName(table) {
 			return closeOnError(errors.Join(transaction.ErrInvalid, errors.New("physical table name is invalid")))
@@ -248,8 +253,9 @@ func Open(config Config) (*Runtime, error) {
 	runtime := &Runtime{
 		engine: eng, lock: lock, store: store, intents: intents, physical: physical,
 		protocolStore: protocolStore, allocator: allocatorClient,
-		domain: append(coordination.DomainID(nil), config.Domain...),
-		owner:  append(coordination.OwnerID(nil), config.Owner...), authority: cloneAuthority(config.Authority),
+		physicalTables: physicalTables,
+		domain:         append(coordination.DomainID(nil), config.Domain...),
+		owner:          append(coordination.OwnerID(nil), config.Owner...), authority: cloneAuthority(config.Authority),
 		lease: config.Lease, clock: config.Clock, recoveryLimit: config.RecoveryLimit,
 		recoveryPages: config.RecoveryMaxPages,
 	}

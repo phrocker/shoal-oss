@@ -1797,6 +1797,16 @@ Both scans use bounded row cursors, not `Snapshot.Frontier`; repeated recovery
 is idempotent. An unavailable or canceled call after intent persistence is an
 indeterminate publication, never an implicit rollback.
 
+`Runtime.ScanCommitted` is the read-only physical event/registry seam. It pins
+one allocator frontier, scans only a configured table and exact
+family/qualifier/visibility under a bounded row prefix, and returns the newest
+committed epoch-stamped version per row. Admission requires the immutable epoch
+outcome, durable intent completion, committed root, frontier inclusion, and an
+exact matching cell in the reconstructed manifest. A newer nonterminal,
+aborted, or poisoned version cannot hide an older committed version.
+`Runtime.Committed` exposes the same completion proof for a known TXN and
+logical digest. Raw engine scans and a second engine open remain unsupported.
+
 `internal/explorercoord.OpenExplorer` shares the same engine handle with
 `pkg/explorer`, and `cmd/shoal-explore-web` uses it for the embedded backend.
 Immutable document-revision records are published with a stable document-level
