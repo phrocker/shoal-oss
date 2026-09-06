@@ -57,7 +57,9 @@ func TestGovernedOntologyChoicesUsesLivePublishedAncestry(t *testing.T) {
 	thirdIdentity, _ := ontology.NewOntologyIdentity(third)
 	if len(listed) != 2 ||
 		listed[0].Identity != secondIdentity || !listed[0].Active ||
-		listed[1].Identity != firstIdentity || listed[1].Active {
+		listed[0].Version != "2" ||
+		listed[1].Identity != firstIdentity || listed[1].Active ||
+		listed[1].Version != "1" {
 		t.Fatalf("published choices = %#v", listed)
 	}
 	if err := choices.AuthorizeOntology(
@@ -77,7 +79,7 @@ func TestGovernedOntologyChoicesUsesLivePublishedAncestry(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(listed) != 1 || listed[0].Identity != firstIdentity ||
-		!listed[0].Active {
+		!listed[0].Active || listed[0].Version != "1" {
 		t.Fatalf("live active choice = %#v", listed)
 	}
 }

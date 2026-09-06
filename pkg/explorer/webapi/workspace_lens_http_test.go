@@ -123,10 +123,10 @@ func TestHTTPSelectableLensIsPerCallerAndPreservesSettings(t *testing.T) {
 	options.OntologyChoices = httpCallerOntologyChoices{
 		bySubject: map[shoal.ID][]workspace.OntologyChoice{
 			"owner": {
-				{Identity: first, Active: true},
-				{Identity: second},
+				{Identity: first, Version: "1", Active: true},
+				{Identity: second, Version: "2"},
 			},
-			"other": {{Identity: second, Active: true}},
+			"other": {{Identity: second, Version: "2", Active: true}},
 		},
 	}
 	provider, err := workspace.NewProvider(store, options)
@@ -193,6 +193,9 @@ func TestHTTPSelectableLensIsPerCallerAndPreservesSettings(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(choices.Choices) != 2 || !choices.Choices[0].Active ||
+		!choices.Choices[0].Identity.Known ||
+		choices.Choices[0].Version != "1" ||
+		choices.Active != choices.Choices[0].Identity ||
 		choices.SettingsRevision != 1 {
 		t.Fatalf("owner lens choices = %#v", choices)
 	}
@@ -217,8 +220,11 @@ func TestHTTPSelectableLensIsPerCallerAndPreservesSettings(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(otherChoices.Choices) != 1 ||
-		otherChoices.Choices[0].SchemaID != encodeTestID(second.SchemaID()) ||
-		otherChoices.Choices[0].VersionID != encodeTestID(second.VersionID()) {
+		otherChoices.Choices[0].Identity.SchemaID !=
+			encodeTestID(second.SchemaID()) ||
+		otherChoices.Choices[0].Identity.VersionID !=
+			encodeTestID(second.VersionID()) ||
+		otherChoices.Choices[0].Version != "2" {
 		t.Fatalf("other caller choices leaked owner eligibility: %#v", otherChoices)
 	}
 
@@ -228,10 +234,7 @@ func TestHTTPSelectableLensIsPerCallerAndPreservesSettings(t *testing.T) {
 			"expected_revision": 1,
 			"mutation_id": base64.RawURLEncoding.EncodeToString(
 				[]byte("lens-select")),
-			"selected_ontology": map[string]any{
-				"schema_id":  encodeTestID(second.SchemaID()),
-				"version_id": encodeTestID(second.VersionID()),
-			},
+			"selected_ontology": workspaceOntologyProjection(second),
 		},
 		"owner", "http://example.test")
 	if response.Code != http.StatusOK {
@@ -244,10 +247,7 @@ func TestHTTPSelectableLensIsPerCallerAndPreservesSettings(t *testing.T) {
 			"expected_revision": 1,
 			"mutation_id": base64.RawURLEncoding.EncodeToString(
 				[]byte("lens-select-stale")),
-			"selected_ontology": map[string]any{
-				"schema_id":  encodeTestID(first.SchemaID()),
-				"version_id": encodeTestID(first.VersionID()),
-			},
+			"selected_ontology": workspaceOntologyProjection(first),
 		},
 		"owner", "http://example.test")
 	if stale.Code != http.StatusConflict {
@@ -273,6 +273,9 @@ func TestHTTPSelectableLensIsPerCallerAndPreservesSettings(t *testing.T) {
 		selected.Settings.Budgets.RetrievalTopK == nil ||
 		*selected.Settings.Budgets.RetrievalTopK != topK ||
 		selected.Settings.SelectedOntology == nil ||
+		!selected.Settings.SelectedOntology.Known ||
+		selected.Settings.SelectedOntology.Reading !=
+			string(ontology.OntologySameVersion) ||
 		selected.Settings.SelectedOntology.VersionID !=
 			encodeTestID(second.VersionID()) {
 		t.Fatalf("selected lens did not preserve settings: %#v", selected)
@@ -464,6 +467,17 @@ func mustComponent(t *testing.T, value []byte) string {
 
 func encodeTestID(value shoal.ID) string {
 	return base64.RawURLEncoding.EncodeToString([]byte(value))
+}
+
+func workspaceOntologyProjection(
+	identity ontology.OntologyIdentity,
+) map[string]any {
+	return map[string]any{
+		"known":      true,
+		"schema_id":  encodeTestID(identity.SchemaID()),
+		"version_id": encodeTestID(identity.VersionID()),
+		"reading":    string(ontology.OntologySameVersion),
+	}
 }
 
 func settingsWorkspaceRequest(

@@ -70,20 +70,19 @@ type WorkspaceOutputPolicy struct {
 	Epoch         int64  `json:"epoch"`
 }
 
-type WorkspaceOntologyIdentity struct {
-	SchemaID  string `json:"schema_id"`
-	VersionID string `json:"version_id"`
-}
+type WorkspaceOntologyIdentity = OntologyIdentityProjection
 
 type WorkspaceOntologyChoice struct {
-	WorkspaceOntologyIdentity
-	Active bool `json:"active"`
+	Identity OntologyIdentityProjection `json:"identity"`
+	Version  string                     `json:"version"`
+	Active   bool                       `json:"active"`
 }
 
 type WorkspaceOntologyChoicesResponse struct {
 	WorkspaceID      string                     `json:"workspace_id"`
 	SettingsID       string                     `json:"settings_id,omitempty"`
 	SettingsRevision uint64                     `json:"settings_revision"`
+	Active           OntologyIdentityProjection `json:"active"`
 	SelectedOntology *WorkspaceOntologyIdentity `json:"selected_ontology,omitempty"`
 	Choices          []WorkspaceOntologyChoice  `json:"choices"`
 }
@@ -209,7 +208,12 @@ func (h *Handler) getWorkspaceLens(
 		writeError(writer, err)
 		return
 	}
-	writeResponse(writer, http.StatusOK, workspaceOntologyChoicesResponse(choices))
+	response, err := workspaceOntologyChoicesResponse(choices)
+	if err != nil {
+		writeError(writer, err)
+		return
+	}
+	writeResponse(writer, http.StatusOK, response)
 }
 
 func (h *Handler) putWorkspaceLens(
@@ -352,45 +356,63 @@ func workspaceSettingsUpdate(
 
 func workspaceOntologyChoicesResponse(
 	value workspace.OntologyChoiceSet,
-) WorkspaceOntologyChoicesResponse {
+) (WorkspaceOntologyChoicesResponse, error) {
 	response := WorkspaceOntologyChoicesResponse{
 		WorkspaceID:      encodeID(value.WorkspaceID),
 		SettingsRevision: value.SettingsRevision,
 		Choices:          make([]WorkspaceOntologyChoice, 0, len(value.Choices)),
+		Active: OntologyIdentityProjection{
+			Known: false, Reading: string(ontology.OntologyUnresolved),
+		},
 	}
 	if value.SettingsID != "" {
 		response.SettingsID = encodeID(value.SettingsID)
 	}
 	if value.SelectedOntology.Present {
-		response.SelectedOntology = &WorkspaceOntologyIdentity{
-			SchemaID:  encodeID(value.SelectedOntology.Identity.SchemaID()),
-			VersionID: encodeID(value.SelectedOntology.Identity.VersionID()),
+		projected, err := ProjectOntologyIdentity(
+			value.SelectedOntology.Identity)
+		if err != nil {
+			return WorkspaceOntologyChoicesResponse{}, err
 		}
+		response.SelectedOntology = &projected
 	}
 	for _, choice := range value.Choices {
+		projected, err := ProjectOntologyIdentity(choice.Identity)
+		if err != nil {
+			return WorkspaceOntologyChoicesResponse{}, err
+		}
+		if choice.Active {
+			response.Active = projected
+		}
 		response.Choices = append(response.Choices, WorkspaceOntologyChoice{
-			WorkspaceOntologyIdentity: WorkspaceOntologyIdentity{
-				SchemaID:  encodeID(choice.Identity.SchemaID()),
-				VersionID: encodeID(choice.Identity.VersionID()),
-			},
-			Active: choice.Active,
+			Identity: projected,
+			Version:  choice.Version,
+			Active:   choice.Active,
 		})
 	}
-	return response
+	return response, nil
 }
 
 func workspaceOntologyIdentityValue(
 	value WorkspaceOntologyIdentity,
 ) (ontology.OntologyIdentity, error) {
-	schemaID, err := decodeID(value.SchemaID)
+	identity, err := ParseOntologyIdentityProjection(value)
 	if err != nil {
-		return ontology.OntologyIdentity{}, fmt.Errorf("schema_id: %w", err)
+		return ontology.OntologyIdentity{}, err
 	}
-	versionID, err := decodeID(value.VersionID)
+	if !identity.Known() {
+		return ontology.OntologyIdentity{}, fmt.Errorf(
+			"selected ontology must be known")
+	}
+	canonical, err := ProjectOntologyIdentity(identity)
 	if err != nil {
-		return ontology.OntologyIdentity{}, fmt.Errorf("version_id: %w", err)
+		return ontology.OntologyIdentity{}, err
 	}
-	return ontology.NewOntologyIdentityFromIDs(schemaID, versionID)
+	if canonical != value {
+		return ontology.OntologyIdentity{}, fmt.Errorf(
+			"selected ontology must use the canonical identity projection")
+	}
+	return identity, nil
 }
 
 func workspaceSettingsResponse(
@@ -441,12 +463,12 @@ func workspaceSettingsResponse(
 		)
 	}
 	if value.Narrowing.SelectedOntology.Present {
-		settings.SelectedOntology = &WorkspaceOntologyIdentity{
-			SchemaID: encodeID(
-				value.Narrowing.SelectedOntology.Identity.SchemaID()),
-			VersionID: encodeID(
-				value.Narrowing.SelectedOntology.Identity.VersionID()),
+		projected, err := ProjectOntologyIdentity(
+			value.Narrowing.SelectedOntology.Identity)
+		if err != nil {
+			return WorkspaceSettingsResponse{}, err
 		}
+		settings.SelectedOntology = &projected
 	}
 	return WorkspaceSettingsResponse{
 		WorkspaceID:    encodeID(value.WorkspaceID),
