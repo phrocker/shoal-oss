@@ -129,6 +129,11 @@ func TestTableDefaultEmbeddingPersistsPerFile(t *testing.T) {
 				got[embeddingspace.Has("space-b").String()] != 1 {
 				t.Fatalf("compacted mixed states = %+v", snapshot)
 			}
+			if err := reopened.Compact("graph", []iterrt.IterSpec{{
+				Name: iterrt.IterGraphRank,
+			}}); !errors.Is(err, tablet.ErrMixedEmbeddingCompactionStack) {
+				t.Fatalf("mixed-space global compaction error = %v", err)
+			}
 		})
 	}
 }

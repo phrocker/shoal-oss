@@ -74,6 +74,9 @@ const DefaultFlushThreshold = 256_000
 var ErrEmbeddingStateChangeWithUnflushedData = errors.New(
 	"tablet: cannot change default embedding state with unflushed data")
 
+var ErrMixedEmbeddingCompactionStack = errors.New(
+	"tablet: iterator stack requires a whole-table view across mixed embedding spaces")
+
 type FileFormat string
 
 const (
@@ -760,6 +763,9 @@ func (t *Tablet) Compact(stack []iterrt.IterSpec) error {
 		groupKeys = append(groupKeys, key)
 	}
 	sort.Strings(groupKeys)
+	if len(groupKeys) > 1 && len(stack) > 0 {
+		return ErrMixedEmbeddingCompactionStack
+	}
 
 	type compactedOutput struct {
 		name    string
