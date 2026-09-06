@@ -724,6 +724,9 @@ func TestAuthorizedAnalyticsRechecksGenerationAfterOntologyLens(t *testing.T) {
 	if !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
 		t.Fatalf("post-lens generation change error = %v", err)
 	}
+	if interpreter.calls != 1 {
+		t.Fatalf("ontology interpreter calls = %d, want 1", interpreter.calls)
+	}
 }
 
 type analyticsFixture struct {
@@ -763,6 +766,7 @@ type generationChangingLensBase struct {
 	*explorer.Explorer
 	generations *analyticsGenerationReader
 	domain      []byte
+	calls       int
 }
 
 type generationChangingRecordBase struct {
@@ -787,6 +791,7 @@ func (b *generationChangingLensBase) InterpretAssertions(
 	assertions []ontology.Assertion,
 	selected ontology.OntologyIdentity,
 ) ([]ontology.AssertionInterpretation, error) {
+	b.calls++
 	b.generations.Set(b.domain, 2)
 	return b.Explorer.InterpretAssertions(ctx, assertions, selected)
 }
