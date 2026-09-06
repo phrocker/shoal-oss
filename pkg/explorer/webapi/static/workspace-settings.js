@@ -9,6 +9,7 @@
   let elements = null;
   let lensState = null;
   let loadGeneration = 0;
+  let pendingLensMutation = null;
 
   function encodeOpaqueID(bytes) {
     const alphabet =
@@ -148,7 +149,12 @@
       // A structured server envelope is preferred but not assumed.
     }
     if (!response.ok) {
-      throw new Error(value.message || response.statusText || "request failed");
+      const error = new Error(
+        value.message || response.statusText || "request failed");
+      error.indeterminate = Boolean(value.indeterminate) ||
+        Boolean(response.headers &&
+          response.headers.get("Shoal-Commit-Outcome") === "indeterminate");
+      throw error;
     }
     return value;
   }
@@ -162,6 +168,7 @@
   }
 
   function renderChoices(value) {
+    pendingLensMutation = null;
     lensState = value;
     const selected = value.selected_ontology
       ? identityKey(value.selected_ontology)
@@ -183,8 +190,9 @@
     }
     if (defaultValue) elements.lens.value = defaultValue;
     const available = elements.lens.options.length > 0;
-    elements.lens.disabled = !available;
-    elements.apply.disabled = !available;
+    const mutable = available && !selected;
+    elements.lens.disabled = !mutable;
+    elements.apply.disabled = !mutable;
     if (!available) {
       setStatus("No governed ontology lens is currently selectable.");
       return;
@@ -240,6 +248,10 @@
 
   async function applyLens() {
     if (!lensState || !workspaceID) return;
+    if (lensState.selected_ontology) {
+      setStatus("The selected workspace lens is immutable.");
+      return;
+    }
     const selected = (lensState.choices || []).find(
       (choice) => choiceKey(choice) === elements.lens.value);
     if (!selected) {
@@ -250,30 +262,57 @@
     elements.refresh.disabled = true;
     setStatus("Applying the governed ontology lens…");
     try {
-      const response = await window.fetch(
-        `/api/v1/workspaces/${workspaceID}/settings/lens`,
-        {
-          method: "PUT",
-          headers: {
-            "content-type": "application/json",
-            "accept": "application/json",
-            ...issuerHeaders(),
+      const expectedRevision = Number(lensState.settings_revision || 0);
+      const selection = choiceKey(selected);
+      if (!pendingLensMutation ||
+          pendingLensMutation.expectedRevision !== expectedRevision ||
+          pendingLensMutation.selection !== selection) {
+        pendingLensMutation = {
+          expectedRevision,
+          mutationID: mutationID(),
+          selection,
+        };
+      }
+      let response;
+      try {
+        response = await window.fetch(
+          `/api/v1/workspaces/${workspaceID}/settings/lens`,
+          {
+            method: "PUT",
+            headers: {
+              "content-type": "application/json",
+              "accept": "application/json",
+              ...issuerHeaders(),
+            },
+            body: JSON.stringify({
+              expected_revision: pendingLensMutation.expectedRevision,
+              mutation_id: pendingLensMutation.mutationID,
+              selected_ontology: selected.identity,
+            }),
           },
-          body: JSON.stringify({
-            expected_revision: Number(lensState.settings_revision || 0),
-            mutation_id: mutationID(),
-            selected_ontology: selected.identity,
-          }),
-        },
-      );
+        );
+      } catch (error) {
+        const indeterminate = new Error(
+          error && error.message ? error.message : "request failed");
+        indeterminate.indeterminate = true;
+        throw indeterminate;
+      }
       const value = await responseValue(response);
+      pendingLensMutation = null;
       setStatus(
         `Lens saved at workspace revision ${Number(value.revision || 0)}; ` +
         "reloading under the narrowed decision.",
       );
       window.location.reload();
     } catch (error) {
-      setStatus(`Unable to apply workspace lens: ${error.message}`, "error");
+      if (!error.indeterminate) pendingLensMutation = null;
+      setStatus(
+        error.indeterminate
+          ? `Lens outcome is indeterminate; retry will reuse the same ` +
+            `mutation ID: ${error.message}`
+          : `Unable to apply workspace lens: ${error.message}`,
+        "error",
+      );
       elements.apply.disabled = false;
       elements.refresh.disabled = false;
     }

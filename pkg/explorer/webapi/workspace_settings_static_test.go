@@ -279,3 +279,158 @@ ready();
 		t.Fatalf("node new-workspace lens check failed: %v\n%s", err, output)
 	}
 }
+
+func TestStaticWorkspaceSettingsRetriesMutationAndLocksSelection(t *testing.T) {
+	if _, err := exec.LookPath("node"); err != nil {
+		if os.Getenv("CI") != "" {
+			t.Fatal("node is required for executable static UI checks in CI")
+		}
+		t.Skip("node is not available for executable static UI checks")
+	}
+	script := `
+const assert = require("assert");
+const fs = require("fs");
+const vm = require("vm");
+let ready;
+let reloads = 0;
+let putAttempts = 0;
+let selectedOntology = null;
+const putBodies = [];
+function element() {
+  return {
+    value: "",
+    disabled: false,
+    className: "",
+    textContent: "",
+    options: [],
+    listeners: {},
+    addEventListener(name, callback) { this.listeners[name] = callback; },
+    replaceChildren() { this.options = []; },
+    append(value) { this.options.push(value); },
+  };
+}
+const elements = new Map([
+  "workspace-settings-form",
+  "workspace-settings-id",
+  "workspace-settings-new",
+  "workspace-settings-clear",
+  "workspace-settings-lens",
+  "workspace-settings-refresh",
+  "workspace-settings-apply",
+  "workspace-settings-status",
+].map((id) => [id, element()]));
+const identity = {schema_id: "c2NoZW1h", version_id: "dmVyc2lvbg"};
+function response(value) {
+  return {
+    ok: true,
+    status: 200,
+    statusText: "OK",
+    headers: new Headers(),
+    async json() { return value; },
+  };
+}
+const window = {
+  location: {
+    href: "https://example.test/",
+    origin: "https://example.test",
+    reload() { reloads++; },
+  },
+  crypto: {getRandomValues(bytes) { bytes.fill(7); return bytes; }},
+  fetch: async (input, init) => {
+    const url = new URL(String(input), "https://example.test/");
+    if (url.pathname === "/api/v1/identity") return response({});
+    if (url.pathname.endsWith("/settings/lens") &&
+        (!init || init.method !== "PUT")) {
+      return response({
+        workspace_id: "d29ya3NwYWNl",
+        settings_revision: selectedOntology ? 1 : 0,
+        active: identity,
+        selected_ontology: selectedOntology,
+        choices: [{identity, version: "v1", active: true}],
+      });
+    }
+    if (url.pathname.endsWith("/settings/lens") && init.method === "PUT") {
+      putAttempts++;
+      putBodies.push(JSON.parse(init.body));
+      if (putAttempts === 1) throw new Error("connection lost");
+      if (putAttempts === 2) {
+        return {
+          ok: false,
+          status: 503,
+          statusText: "Service Unavailable",
+          headers: new Headers({
+            "Shoal-Commit-Outcome": "indeterminate",
+          }),
+          async json() {
+            return {message: "commit outcome unavailable", indeterminate: true};
+          },
+        };
+      }
+      selectedOntology = identity;
+      return response({revision: 1});
+    }
+    throw new Error("unexpected request");
+  },
+  addEventListener(name, callback) {
+    if (name === "DOMContentLoaded") ready = callback;
+  },
+  setTimeout(callback) { callback(); },
+};
+const context = {
+  window,
+  sessionStorage: {
+    getItem() { return "d29ya3NwYWNl"; },
+    setItem() {},
+    removeItem() {},
+  },
+  document: {
+    getElementById(id) { return elements.get(id); },
+    createElement() { return element(); },
+  },
+  Headers,
+  Request,
+  URL,
+  Uint8Array,
+  atob,
+  Object,
+  console,
+};
+vm.createContext(context);
+vm.runInContext(fs.readFileSync("static/workspace-settings.js", "utf8"), context);
+ready();
+(async () => {
+  await window.fetch("/api/v1/identity");
+  await new Promise((resolve) => setImmediate(resolve));
+  const apply = elements.get("workspace-settings-apply");
+  assert.strictEqual(apply.disabled, false);
+
+  await apply.listeners.click();
+  assert.match(
+    elements.get("workspace-settings-status").textContent,
+    /outcome is indeterminate/,
+  );
+  await apply.listeners.click();
+  assert.match(
+    elements.get("workspace-settings-status").textContent,
+    /outcome is indeterminate/,
+  );
+  await apply.listeners.click();
+  assert.strictEqual(putBodies.length, 3);
+  assert.strictEqual(putBodies[0].mutation_id, putBodies[1].mutation_id);
+  assert.strictEqual(putBodies[1].mutation_id, putBodies[2].mutation_id);
+  assert.strictEqual(reloads, 1);
+
+  await elements.get("workspace-settings-refresh").listeners.click();
+  assert.strictEqual(elements.get("workspace-settings-lens").disabled, true);
+  assert.strictEqual(apply.disabled, true);
+})().catch((error) => {
+  console.error(error);
+  process.exitCode = 1;
+});
+`
+	command := exec.Command("node", "-e", script)
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("node mutation retry check failed: %v\n%s", err, output)
+	}
+}
