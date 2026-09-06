@@ -1108,22 +1108,14 @@ func authorizedScopeSnapshotID(
 		writeText(&encoded, string(assertion.Origin()))
 		writeUint64(
 			&encoded, math.Float64bits(float64(assertion.Confidence())))
-		writeBytes(
-			&encoded,
-			[]byte(assertion.Metadata()[graphAssertionEdgeIDMetadata]),
-		)
-		var derivationID shoal.ID
-		var derivationScore shoal.Score
-		for _, item := range assertion.Evidence() {
-			if derivation, ok := item.Derivation(); ok {
-				derivationID = derivation.ID()
-				derivationScore = derivation.Score()
-				break
-			}
+		writeMetadata(&encoded, assertion.Metadata())
+		writeMetadata(&encoded, assertion.Provenance().Metadata())
+		evidence := assertion.Evidence()
+		writeUint64(&encoded, uint64(len(evidence)))
+		for _, item := range evidence {
+			writeBytes(&encoded, []byte(item.ID()))
+			writeMetadata(&encoded, item.Metadata())
 		}
-		writeBytes(&encoded, []byte(derivationID))
-		writeUint64(
-			&encoded, math.Float64bits(float64(derivationScore)))
 	}
 	interpretations := append(
 		[]ontology.AssertionInterpretation(nil), neighborhood.Interpretations...)

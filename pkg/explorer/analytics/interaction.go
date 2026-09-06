@@ -341,6 +341,9 @@ func InteractionAssertionEvidence(
 	assertion ontology.Assertion,
 ) (interaction.AssertionReference, error) {
 	edgeID := shoal.ID(assertion.Metadata()[graphAssertionEdgeIDMetadata])
+	if edgeID == "" && assertion.Origin() == ontology.AssertionDerived {
+		edgeID = assertion.ID()
+	}
 	if edgeID == "" {
 		return interaction.AssertionReference{}, shoal.NewError(
 			shoal.ErrorInternal,

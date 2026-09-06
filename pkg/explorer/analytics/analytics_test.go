@@ -84,6 +84,112 @@ func TestAnalyticsResultIDIncludesPageRankContract(t *testing.T) {
 	}
 }
 
+func TestAuthorizedScopeSnapshotBindsAssertionAnnotationMetadata(t *testing.T) {
+	value, err := ontology.NewStringValue("value")
+	if err != nil {
+		t.Fatal(err)
+	}
+	provenance, err := ontology.NewExtractionProvenance(
+		"provider", "model", "1", "prompt", "1", "extractor", "1", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	property, err := ontology.NewPropertyDefinition(
+		"value", "Value", "", ontology.ValueString, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	evidence, err := ontology.NewEvidenceRef(document.Citation{
+		DocumentID: "document", RevisionID: "revision",
+		SectionID: "section", SpanID: "span",
+		Range: document.SourceRange{
+			Start: document.SourcePosition{Offset: 0, Page: 1},
+			End:   document.SourcePosition{Offset: 5, Page: 1},
+		},
+	}, "value", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	makeAssertion := func(metadata shoal.Metadata) ontology.Assertion {
+		assertion, err := ontology.NewAssertion(
+			"subject", property.ID(), value, ontology.AssertionExplicit, 1,
+			[]ontology.EvidenceRef{evidence}, provenance, metadata)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return assertion
+	}
+	first := makeAssertion(shoal.Metadata{"annotation": "first"})
+	second := makeAssertion(shoal.Metadata{"annotation": "second"})
+	if first.ID() != second.ID() {
+		t.Fatal("test requires annotation metadata outside assertion identity")
+	}
+	var fingerprint [32]byte
+	scope := Scope{NodeIDs: []shoal.ID{"subject"}}
+	firstID := authorizedScopeSnapshotID(
+		scope, fingerprint, 1, ontology.OntologyIdentity{}, false,
+		explorer.Neighborhood{Assertions: []ontology.Assertion{first}})
+	secondID := authorizedScopeSnapshotID(
+		scope, fingerprint, 1, ontology.OntologyIdentity{}, false,
+		explorer.Neighborhood{Assertions: []ontology.Assertion{second}})
+	if firstID == secondID {
+		t.Fatal("snapshot ID did not bind assertion annotation metadata")
+	}
+}
+
+func TestDerivedAssertionEvidenceUsesAuthoritativeAssertionEdge(t *testing.T) {
+	value, err := ontology.NewReferenceValue("target")
+	if err != nil {
+		t.Fatal(err)
+	}
+	derivation, err := ontology.NewAssertionDerivation(
+		"model", "1", "cosine", 0.5, "cell", 0.9,
+		"subject", "target", "iterator", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	evidence, err := ontology.NewDerivationEvidenceRef(derivation, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	provenance, err := ontology.NewExtractionProvenance(
+		"provider", "model", "1", "prompt", "1", "extractor", "1", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sourceConcept, err := ontology.NewConceptDefinition(
+		"source", "Source", "", nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetConcept, err := ontology.NewConceptDefinition(
+		"target", "Target", "", nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	relationship, err := ontology.NewRelationshipDefinition(
+		"related", "Related", "",
+		[]shoal.ID{sourceConcept.ID()}, []shoal.ID{targetConcept.ID()},
+		nil, true, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertion, err := ontology.NewAssertion(
+		"subject", relationship.ID(), value, ontology.AssertionDerived, 0.9,
+		[]ontology.EvidenceRef{evidence}, provenance, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reference, err := InteractionAssertionEvidence(assertion)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reference.EdgeID != assertion.ID() {
+		t.Fatalf("derived assertion edge = %q, want %q",
+			reference.EdgeID, assertion.ID())
+	}
+}
+
 func TestAnalyzeDanglingGraphConvergesAndPreservesMass(t *testing.T) {
 	got, err := Analyze(context.Background(), explorer.Neighborhood{
 		Nodes: []graph.Node{{ID: "A"}, {ID: "B"}},
