@@ -254,6 +254,20 @@ func (e *Explorer) retrieve(
 	if uint64(topK) < uint64(len(ranked)) {
 		ranked = ranked[:int(topK)]
 	}
+	if hasVector {
+		spaces := make(map[string]struct{})
+		for _, match := range ranked {
+			if match.space != "" {
+				spaces[match.space] = struct{}{}
+			}
+		}
+		queryEvent.Participating = make([]string, 0, len(spaces))
+		for identity := range spaces {
+			queryEvent.Participating = append(
+				queryEvent.Participating, identity)
+		}
+		sort.Strings(queryEvent.Participating)
+	}
 
 	response := retrieval.Response{
 		RequestID: requestID(request),

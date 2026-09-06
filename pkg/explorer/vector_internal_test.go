@@ -374,11 +374,15 @@ func TestMixedSpaceVectorRetrievalUsesDeterministicRankFusion(t *testing.T) {
 	ctx := context.Background()
 	embedA := &countingEmbedder{model: "a", dimensions: 2, identity: "space-a"}
 	embedB := &countingEmbedder{model: "b", dimensions: 2, identity: "space-b"}
+	var events []EmbeddingQueryEvent
 	corpus, err := OpenWithOptions(t.TempDir(), Options{
 		Embedder:                embedA,
 		EmbeddingProviders:      []model.Embedder{embedB},
 		RecallEvidence:          map[string]string{"space-a": "benchmarked"},
 		MaxEmbeddingSpaceFanout: 4,
+		EmbeddingQueryObserver: func(event EmbeddingQueryEvent) {
+			events = append(events, event)
+		},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -442,6 +446,67 @@ func TestMixedSpaceVectorRetrievalUsesDeterministicRankFusion(t *testing.T) {
 	}
 	if embedA.calls != 3 || embedB.calls != 1 {
 		t.Fatalf("provider calls: a=%d b=%d, want cached a=3 b=1", embedA.calls, embedB.calls)
+	}
+	for _, event := range events {
+		if fmt.Sprint(event.Participating) != "[space-a space-b]" {
+			t.Fatalf("participating spaces = %v", event.Participating)
+		}
+	}
+}
+
+func TestEmbeddingQueryParticipatingSpacesAreEmptyWithoutScoredResults(t *testing.T) {
+	var events []EmbeddingQueryEvent
+	corpus, err := OpenWithOptions(t.TempDir(), Options{
+		Embedder: &countingEmbedder{
+			model: "empty", dimensions: 2, identity: "space-empty",
+		},
+		EmbeddingQueryObserver: func(event EmbeddingQueryEvent) {
+			events = append(events, event)
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer corpus.Close()
+	response, err := corpus.Retrieve(context.Background(), retrieval.Request{
+		Text: "empty", Modes: []retrieval.Mode{retrieval.ModeVector},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(response.Results) != 0 || len(events) != 1 ||
+		len(events[0].Participating) != 0 {
+		t.Fatalf("empty retrieval response/events = %+v / %+v", response, events)
+	}
+	if fmt.Sprint(events[0].Completed) != "[space-empty]" {
+		t.Fatalf("completed spaces = %v, want query-only space", events[0].Completed)
+	}
+}
+
+func TestNonVectorRetrievalEmitsNoEmbeddingParticipation(t *testing.T) {
+	var events []EmbeddingQueryEvent
+	corpus, err := OpenWithOptions(t.TempDir(), Options{
+		EmbeddingQueryObserver: func(event EmbeddingQueryEvent) {
+			events = append(events, event)
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer corpus.Close()
+	if _, err := corpus.Ingest(context.Background(), Source{
+		URI: "file:///lexical.txt", MediaType: MediaTypeText,
+		Content: "lexical evidence",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := corpus.Retrieve(context.Background(), retrieval.Request{
+		Text: "lexical", Modes: []retrieval.Mode{retrieval.ModeLexical},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 0 {
+		t.Fatalf("non-vector retrieval emitted embedding events: %+v", events)
 	}
 }
 

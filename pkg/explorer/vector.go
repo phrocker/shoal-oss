@@ -345,6 +345,16 @@ func (e *Explorer) VectorScores(
 			scores[item.span.ID] = item.score
 		}
 	}
+	participating := make(map[string]struct{})
+	for _, target := range targets {
+		participating[target.space.Identity] = struct{}{}
+	}
+	queryEvent.Participating = make([]string, 0, len(participating))
+	for identity := range participating {
+		queryEvent.Participating = append(
+			queryEvent.Participating, identity)
+	}
+	sort.Strings(queryEvent.Participating)
 	return scores, nil
 }
 
