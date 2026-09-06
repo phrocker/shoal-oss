@@ -71,6 +71,31 @@ func TestGovernedOntologyChoicesUsesLivePublishedAncestry(t *testing.T) {
 	); !shoal.IsErrorCode(err, shoal.ErrorUnauthorized) {
 		t.Fatalf("unpublished choice error = %v", err)
 	}
+	issuer, err := auth.NewDecision(auth.DecisionConfig{
+		Subject: "owner", Actor: "actor",
+		AuthorizationDomain: []byte("domain"),
+		AllowedOperations:   []auth.Operation{auth.OperationWorkspaceSettingsRead},
+		PolicyGeneration:    1,
+		AuthenticationExpires: time.Date(
+			2030, 1, 1, 0, 0, 0, 0, time.UTC),
+		RequestID:        "request",
+		SelectedOntology: firstIdentity,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	filtered, err := choices.ListOntologyChoices(context.Background(), issuer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(filtered) != 1 || filtered[0].Identity != firstIdentity {
+		t.Fatalf("issuer-selected choices = %#v", filtered)
+	}
+	if err := choices.AuthorizeOntology(
+		context.Background(), issuer, secondIdentity,
+	); !shoal.IsErrorCode(err, shoal.ErrorUnauthorized) {
+		t.Fatalf("issuer lens replacement error = %v", err)
+	}
 
 	source.proposals = nil
 	listed, err = choices.ListOntologyChoices(
