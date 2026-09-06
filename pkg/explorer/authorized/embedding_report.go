@@ -219,8 +219,6 @@ func (c *embeddingQueryCollector) report(
 
 	report := EmbeddingQueryReport{
 		FanoutLimit:    uint32(c.fanoutLimit),
-		CacheHits:      uint32(c.cacheHits),
-		ProviderCalls:  uint32(c.providerCalls),
 		Observed:       c.observed,
 		Suppressed:     disclosure.Suppressed > 0,
 		Restricted:     disclosure.Restricted > 0,

@@ -334,7 +334,9 @@ func TestAuthorizedEmbeddingReportDoesNotExposeHiddenSpace(t *testing.T) {
 	}
 	if adminReport.Disclosure.Suppressed != 0 ||
 		adminReport.Embedding == nil ||
-		len(adminReport.Embedding.Spaces) != 2 {
+		len(adminReport.Embedding.Spaces) != 2 ||
+		adminReport.Embedding.CacheHits != 0 ||
+		adminReport.Embedding.ProviderCalls != 0 {
 		t.Fatalf("admin mixed-space report = %+v", adminReport)
 	}
 	if adminReport.Embedding.Spaces[0].ID == adminReport.Embedding.Spaces[1].ID {

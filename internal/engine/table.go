@@ -501,8 +501,8 @@ func (t *table) setDefaultEmbedding(state embeddingspace.FileState) error {
 func (t *table) embeddingStateSnapshot(
 	ctx context.Context,
 ) ([]tablet.EmbeddingFileState, int, embeddingspace.FileState, error) {
-	t.formatMu.RLock()
-	defer t.formatMu.RUnlock()
+	t.formatMu.Lock()
+	defer t.formatMu.Unlock()
 	return t.embeddingStateSnapshotLocked(ctx)
 }
 

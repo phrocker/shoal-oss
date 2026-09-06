@@ -61,17 +61,25 @@ type Posting struct {
 }
 
 type RecallContract struct {
-	Corpus       string  `json:"corpus,omitempty"`
-	TopK         int     `json:"top_k,omitempty"`
-	NProbe       int     `json:"nprobe,omitempty"`
-	Minimum      float64 `json:"minimum,omitempty"`
-	Measured     float64 `json:"measured,omitempty"`
-	Queries      int     `json:"queries,omitempty"`
-	BenchmarkRef string  `json:"benchmark_ref,omitempty"`
+	Corpus          string  `json:"corpus,omitempty"`
+	TopK            int     `json:"top_k,omitempty"`
+	NProbe          int     `json:"nprobe,omitempty"`
+	Minimum         float64 `json:"minimum,omitempty"`
+	Measured        float64 `json:"measured,omitempty"`
+	Queries         int     `json:"queries,omitempty"`
+	BenchmarkRef    string  `json:"benchmark_ref,omitempty"`
+	EmbeddingSpace  string  `json:"embedding_space,omitempty"`
+	Generation      uint64  `json:"generation,omitempty"`
+	CodebookVersion string  `json:"codebook_version,omitempty"`
 }
 
 func (r RecallContract) Benchmarked() bool {
-	return r.Corpus != "" && r.Queries > 0 && r.BenchmarkRef != ""
+	return r.Corpus != "" &&
+		r.Queries > 0 &&
+		r.BenchmarkRef != "" &&
+		r.EmbeddingSpace != "" &&
+		r.Generation > 0 &&
+		r.CodebookVersion != ""
 }
 
 type Manifest struct {
@@ -338,6 +346,7 @@ func (m *Manager) Update(ctx context.Context, index string, changes []VectorReco
 	manifest.CreatedAtUnixMS = m.now().UTC().UnixMilli()
 	manifest.RecordCount = len(postings)
 	manifest.TombstoneCount = tombstones
+	manifest.Recall = RecallContract{}
 	active.Manifest = manifest
 	active.Postings = postings
 	if err := m.store.Commit(ctx, active); err != nil {
@@ -381,6 +390,7 @@ func (m *Manager) Compact(ctx context.Context, index string, beforeTimestamp int
 	manifest.CreatedAtUnixMS = m.now().UTC().UnixMilli()
 	manifest.RecordCount = len(keep)
 	manifest.TombstoneCount = countTombstones(keep)
+	manifest.Recall = RecallContract{}
 	active.Manifest, active.Postings = manifest, keep
 	if err := m.store.Commit(ctx, active); err != nil {
 		return Manifest{}, err
@@ -401,6 +411,23 @@ func (m *Manager) SetRecallContract(ctx context.Context, index string, recall Re
 	}
 	if err := validateManifestEmbeddingSpace(active.Manifest); err != nil {
 		return Manifest{}, err
+	}
+	if err := embeddingspace.EnsureSameIdentity(
+		"set vector recall contract",
+		active.Manifest.EmbeddingSpace,
+		recall.EmbeddingSpace,
+	); err != nil {
+		return Manifest{}, err
+	}
+	if recall.Generation != active.Manifest.Generation ||
+		recall.CodebookVersion != active.Manifest.CodebookVersion {
+		return Manifest{}, fmt.Errorf(
+			"vectorindex: recall contract targets generation/codebook %d/%q, active is %d/%q",
+			recall.Generation,
+			recall.CodebookVersion,
+			active.Manifest.Generation,
+			active.Manifest.CodebookVersion,
+		)
 	}
 	manifest := active.Manifest
 	manifest.ParentGeneration = manifest.Generation

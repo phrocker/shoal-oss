@@ -112,6 +112,23 @@ func TestTableDefaultEmbeddingPersistsPerFile(t *testing.T) {
 				len(got) != 2 {
 				t.Fatalf("states = %v", got)
 			}
+			if err := reopened.Compact("graph", nil); err != nil {
+				t.Fatalf("compact mixed embedding spaces: %v", err)
+			}
+			snapshot, err = reopened.TableEmbeddingStateSnapshot(
+				context.Background(), "graph")
+			if err != nil {
+				t.Fatal(err)
+			}
+			got = map[string]int{}
+			for _, file := range snapshot.Files {
+				got[file.State.String()]++
+			}
+			if len(snapshot.Files) != 2 ||
+				got[embeddingspace.Has("space-a").String()] != 1 ||
+				got[embeddingspace.Has("space-b").String()] != 1 {
+				t.Fatalf("compacted mixed states = %+v", snapshot)
+			}
 		})
 	}
 }
@@ -212,6 +229,39 @@ func TestOrdinaryWritesShareEmbeddingStateGate(t *testing.T) {
 	case <-time.After(time.Second):
 		tbl.formatMu.RUnlock()
 		t.Fatal("ordinary write waited for a peer read lock")
+	}
+}
+
+func TestEmbeddingStateSnapshotExcludesWrites(t *testing.T) {
+	eng, err := Open(t.TempDir(), Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close()
+	if err := eng.CreateTable("graph", TableOptions{
+		DefaultEmbedding: embeddingspace.Has("space-a"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	eng.mu.RLock()
+	tbl := eng.tables["graph"]
+	eng.mu.RUnlock()
+	tbl.formatMu.RLock()
+	done := make(chan error, 1)
+	go func() {
+		_, err := eng.TableEmbeddingStateSnapshot(
+			context.Background(), "graph")
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		tbl.formatMu.RUnlock()
+		t.Fatalf("snapshot did not exclude a writer: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	tbl.formatMu.RUnlock()
+	if err := <-done; err != nil {
+		t.Fatal(err)
 	}
 }
 

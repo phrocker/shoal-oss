@@ -731,32 +731,73 @@ func (t *Tablet) Compact(stack []iterrt.IterSpec) error {
 		return nil // nothing to compact
 	}
 
-	// Read all input RFiles (served from cache when warm)
-	inputs := make([]compaction.Input, 0, len(t.files))
+	type inputGroup struct {
+		state  embeddingspace.FileState
+		inputs []compaction.Input
+	}
+	groupsByState := make(map[string]*inputGroup)
 	for _, path := range t.files {
 		data, err := t.fileBytes(path)
 		if err != nil {
 			return fmt.Errorf("tablet: read %s for compaction: %w", path, err)
 		}
-		inputs = append(inputs, compaction.Input{Name: path, Bytes: data})
+		state, err := embeddingStateFromImage(path, data)
+		if err != nil {
+			return fmt.Errorf("tablet: read embedding state %s: %w", path, err)
+		}
+		key := state.String()
+		group := groupsByState[key]
+		if group == nil {
+			group = &inputGroup{state: state}
+			groupsByState[key] = group
+		}
+		group.inputs = append(group.inputs, compaction.Input{
+			Name: path, Bytes: data, MetadataEmbedding: state,
+		})
 	}
-
-	result, err := compaction.Compact(compaction.Spec{
-		Inputs:              inputs,
-		Stack:               stack,
-		Scope:               iterrt.ScopeMajc,
-		FullMajorCompaction: true,
-		AdjacencyEdgeCF:     t.opts.AdjacencyEdgeCF,
-		OutputFormat:        string(t.opts.FileFormat),
-	})
-	if err != nil {
-		return fmt.Errorf("tablet: compact: %w", err)
+	groupKeys := make([]string, 0, len(groupsByState))
+	for key := range groupsByState {
+		groupKeys = append(groupKeys, key)
 	}
+	sort.Strings(groupKeys)
 
-	outName := fmt.Sprintf("C%013d%s", time.Now().UnixMilli(), t.opts.FileFormat.extension())
-	outPath := filepath.Join(t.dir, outName)
-	if err := storage.WriteAll(context.Background(), t.backend, outPath, result.Output); err != nil {
-		return fmt.Errorf("tablet: write compacted: %w", err)
+	type compactedOutput struct {
+		name    string
+		path    string
+		entries int64
+	}
+	outputs := make([]compactedOutput, 0, len(groupKeys))
+	cleanupOutputs := func() {
+		for _, output := range outputs {
+			_ = removeObject(t.backend, output.path)
+		}
+	}
+	base := time.Now().UnixMilli()
+	for index, key := range groupKeys {
+		group := groupsByState[key]
+		result, err := compaction.Compact(compaction.Spec{
+			Inputs:              group.inputs,
+			Stack:               stack,
+			Scope:               iterrt.ScopeMajc,
+			FullMajorCompaction: len(groupKeys) == 1,
+			AdjacencyEdgeCF:     t.opts.AdjacencyEdgeCF,
+			OutputFormat:        string(t.opts.FileFormat),
+		})
+		if err != nil {
+			cleanupOutputs()
+			return fmt.Errorf("tablet: compact %s: %w", group.state, err)
+		}
+		outName := fmt.Sprintf(
+			"C%013d-%03d%s", base, index, t.opts.FileFormat.extension())
+		outPath := filepath.Join(t.dir, outName)
+		if err := storage.WriteAll(
+			context.Background(), t.backend, outPath, result.Output); err != nil {
+			cleanupOutputs()
+			return fmt.Errorf("tablet: write compacted: %w", err)
+		}
+		outputs = append(outputs, compactedOutput{
+			name: outName, path: outPath, entries: result.EntriesWritten,
+		})
 	}
 
 	oldFiles := t.files
@@ -764,16 +805,21 @@ func (t *Tablet) Compact(stack []iterrt.IterSpec) error {
 	for _, old := range oldFiles {
 		obsolete[filepath.Base(old)] = struct{}{}
 	}
-	if err := persistImmutableManifest(t.backend, t.dir, []string{outPath}, obsolete); err != nil {
+	outputPaths := make([]string, len(outputs))
+	for index, output := range outputs {
+		outputPaths[index] = output.path
+	}
+	if err := persistImmutableManifest(
+		t.backend, t.dir, outputPaths, obsolete); err != nil {
 		if storage.IsCommittedWriteError(err) {
-			t.files = []string{outPath}
+			t.files = outputPaths
 			t.obsolete = obsolete
 			return fmt.Errorf("tablet: publish compacted generation committed with cleanup error: %w", err)
 		}
-		_ = removeObject(t.backend, outPath)
+		cleanupOutputs()
 		return fmt.Errorf("tablet: publish compacted generation: %w", err)
 	}
-	t.files = []string{outPath}
+	t.files = outputPaths
 	t.obsolete = obsolete
 	for _, old := range oldFiles {
 		if t.opts.Cache != nil {
@@ -793,13 +839,29 @@ func (t *Tablet) Compact(stack []iterrt.IterSpec) error {
 
 	t.logger.Info("compaction complete",
 		slog.Int("inputs", len(oldFiles)),
-		slog.Int64("entries", result.EntriesWritten),
-		slog.String("output", outName))
+		slog.Int("outputs", len(outputs)))
 	if t.opts.OnRFile != nil {
-		t.opts.OnRFile("compact", outName)
+		for _, output := range outputs {
+			t.opts.OnRFile("compact", output.name)
+		}
 	}
 
 	return nil
+}
+
+func embeddingStateFromImage(
+	path string,
+	data []byte,
+) (embeddingspace.FileState, error) {
+	if fileFormat(path) == FormatParquet {
+		return parquetfile.ReadEmbeddingSpaceMetadata(
+			bytes.NewReader(data), int64(len(data)))
+	}
+	reader, err := bcfile.NewReader(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		return embeddingspace.FileState{}, err
+	}
+	return rfile.ReadEmbeddingSpaceMetadata(reader, block.Default())
 }
 
 // FileCount returns the number of immutable files.

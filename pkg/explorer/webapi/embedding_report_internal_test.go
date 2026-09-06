@@ -83,6 +83,23 @@ func TestRetrievalResponseEmbeddingReportUsesOpaqueIDCodec(t *testing.T) {
 	}
 }
 
+func TestRetrievalResponseOmitsNilEmbeddingReport(t *testing.T) {
+	payload, err := json.Marshal(RetrievalResponse{
+		Snapshot: Snapshot{
+			ID:       "snapshot",
+			AsOf:     time.Date(2026, 9, 6, 0, 0, 0, 0, time.UTC),
+			Frontier: 1,
+		},
+		Retrieval: retrieval.Response{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(payload, []byte(`"embedding"`)) {
+		t.Fatalf("nil embedding report was serialized: %s", payload)
+	}
+}
+
 func TestRetrievalResponseEmbeddingReportBoundsOpaqueIDs(t *testing.T) {
 	for _, test := range []struct {
 		name    string

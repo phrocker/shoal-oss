@@ -112,6 +112,11 @@ func TestApproximateRecallContractRequiresBenchmark(t *testing.T) {
 	if !result.Passed {
 		t.Fatalf("recall %.4f below threshold %.4f", result.Recall.Measured, result.Recall.Minimum)
 	}
+	if result.Recall.EmbeddingSpace != testEmbeddingSpace ||
+		result.Recall.Generation == 0 ||
+		result.Recall.CodebookVersion == "" {
+		t.Fatalf("benchmark identity binding missing: %+v", result.Recall)
+	}
 	if _, err := manager.SetRecallContract(ctx, "docs_ivf", result.Recall); err != nil {
 		t.Fatal(err)
 	}
@@ -124,6 +129,33 @@ func TestApproximateRecallContractRequiresBenchmark(t *testing.T) {
 	}
 	if !evidence.RecallClaimed || evidence.Recall.BenchmarkRef != "test-corpus-v1" {
 		t.Fatalf("benchmark evidence missing: %+v", evidence)
+	}
+	foreign := result.Recall
+	foreign.EmbeddingSpace = "test-provider:foreign-model:normalized"
+	if _, err := manager.SetRecallContract(
+		ctx, "docs_ivf", foreign,
+	); !errors.Is(err, embeddingspace.ErrMismatch) {
+		t.Fatalf("foreign recall contract error = %v", err)
+	}
+	if _, err := manager.Update(ctx, "docs_ivf", []VectorRecord{{
+		ID: "removed", Tombstone: true, Timestamp: 2000,
+	}}, 2000); err != nil {
+		t.Fatal(err)
+	}
+	_, evidence, err = manager.Search(ctx, "docs_ivf", Query{
+		Vector: records[7].Vector, EmbeddingSpace: testEmbeddingSpace,
+		TopK: 10, NProbe: 8,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if evidence.RecallClaimed {
+		t.Fatalf("updated corpus retained stale recall: %+v", evidence)
+	}
+	if _, err := manager.SetRecallContract(
+		ctx, "docs_ivf", result.Recall,
+	); err == nil || !strings.Contains(err.Error(), "generation/codebook") {
+		t.Fatalf("stale recall contract error = %v", err)
 	}
 }
 

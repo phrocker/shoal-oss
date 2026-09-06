@@ -544,11 +544,11 @@ func (r RetrievalResponse) MarshalJSON() ([]byte, error) {
 		})
 	}
 	return json.Marshal(struct {
-		Snapshot   Snapshot `json:"snapshot"`
-		Retrieval  any      `json:"retrieval"`
-		Suppressed uint32   `json:"suppressed,omitempty"`
-		Restricted uint32   `json:"restricted,omitempty"`
-		Embedding  any      `json:"embedding,omitempty"`
+		Snapshot   Snapshot                  `json:"snapshot"`
+		Retrieval  any                       `json:"retrieval"`
+		Suppressed uint32                    `json:"suppressed,omitempty"`
+		Restricted uint32                    `json:"restricted,omitempty"`
+		Embedding  *wireEmbeddingQueryReport `json:"embedding,omitempty"`
 	}{r.Snapshot, struct {
 		RequestID string `json:"request_id,omitempty"`
 		Results   []any  `json:"results"`

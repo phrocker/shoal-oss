@@ -97,6 +97,8 @@ func BenchmarkRecall(ctx context.Context, manager *Manager, index string, corpus
 	contract := RecallContract{
 		Corpus: "deterministic:" + index, TopK: topK, NProbe: nprobe,
 		Minimum: minimum, Measured: measured, Queries: len(queries), BenchmarkRef: benchmarkRef,
+		EmbeddingSpace: manifest.EmbeddingSpace,
+		Generation:     manifest.Generation, CodebookVersion: manifest.CodebookVersion,
 	}
 	return BenchmarkResult{Recall: contract, Passed: measured >= minimum}, nil
 }
