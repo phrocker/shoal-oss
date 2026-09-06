@@ -882,6 +882,13 @@ func validateOptionalToolSchemaNode(
 		return errors.New("schema exceeds structural limits")
 	}
 	switch schema.Type {
+	case "":
+		if len(schema.Properties) != 0 || len(schema.Required) != 0 ||
+			schema.AdditionalProperties != nil || schema.Items != nil ||
+			schema.Enum != nil || hasScalarSchemaBounds(schema) {
+			return errors.New("untyped schema has validation keywords")
+		}
+		return nil
 	case "object":
 		if schema.Items != nil || hasScalarSchemaBounds(schema) {
 			return errors.New("object schema has incompatible keywords")
@@ -1052,6 +1059,8 @@ func validateOptionalToolValue(value any, schema optionalToolInputSchema) error 
 		}
 	}
 	switch schema.Type {
+	case "":
+		return nil
 	case "object":
 		object, ok := value.(map[string]any)
 		if !ok {
