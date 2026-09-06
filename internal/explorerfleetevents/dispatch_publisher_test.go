@@ -461,8 +461,8 @@ func TestActionEventTokenUsesCanonicalTransitionIdentity(t *testing.T) {
 				t.Fatal(err)
 			}
 			if !bytes.Equal(generationToken, baseToken) ||
-				bytes.Equal(generationTransition, baseTransition) {
-				t.Fatal("agent generation did not alter only the transition ID")
+				!bytes.Equal(generationTransition, baseTransition) {
+				t.Fatal("agent generation altered token or transition ID")
 			}
 			record.AgentGeneration = 3
 			record.AgentID = "different"
@@ -471,8 +471,8 @@ func TestActionEventTokenUsesCanonicalTransitionIdentity(t *testing.T) {
 				t.Fatal(err)
 			}
 			if !bytes.Equal(agentToken, baseToken) ||
-				bytes.Equal(agentTransition, baseTransition) {
-				t.Fatal("agent identity did not alter only the transition ID")
+				!bytes.Equal(agentTransition, baseTransition) {
+				t.Fatal("agent identity altered token or transition ID")
 			}
 		})
 	}
