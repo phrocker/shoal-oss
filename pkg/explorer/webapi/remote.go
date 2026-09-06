@@ -462,20 +462,10 @@ func (s *RemoteService) Analytics(
 	); err != nil {
 		return AnalyticsResponse{}, err
 	}
-	if response.Snapshot.ID == "" ||
-		response.Snapshot.ID != response.Analytics.Scope.SnapshotID {
-		return AnalyticsResponse{}, remoteContractError(
-			"remote analytics snapshot is inconsistent", nil)
-	}
-	if err := exploreranalytics.ValidateResult(
-		analyticsRequest, response.Analytics, *metadata.AnalyticsLimits); err != nil {
+	if err := ValidateAnalyticsResponse(
+		request, response, *metadata.AnalyticsLimits); err != nil {
 		return AnalyticsResponse{}, remoteContractError(
 			"remote analytics response is invalid", err)
-	}
-	if !response.Analytics.Recording.Required ||
-		!response.Analytics.Recording.Recorded {
-		return AnalyticsResponse{}, remoteContractError(
-			"remote analytics response was not durably recorded", nil)
 	}
 	return response, nil
 }
