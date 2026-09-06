@@ -25,6 +25,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
+	"reflect"
 	"time"
 
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
@@ -89,12 +90,12 @@ func (p *ActionEventPublisher) PublishActionEvent(
 	}, now); err != nil {
 		return err
 	}
-	evidence := make([]fleetevents.Evidence, 1, len(record.Evidence)+1)
-	evidence[0] = fleetevents.Evidence{
+	evidence := make([]fleetevents.Evidence, 0, len(record.Evidence)+1)
+	evidence = appendUniqueEvidence(evidence, fleetevents.Evidence{
 		SourceID: append([]byte(nil), record.SourceID...),
 		PolicyID: append([]byte(nil), record.PolicyID...),
 		ObjectID: record.ObjectID,
-	}
+	})
 	for _, reference := range record.Evidence {
 		converted := fleetevents.Evidence{
 			SourceID: append([]byte(nil), record.SourceID...),
@@ -111,21 +112,25 @@ func (p *ActionEventPublisher) PublishActionEvent(
 		if len(reference.EdgeIDs) > 0 {
 			converted.EdgeID = reference.EdgeIDs[0]
 		}
-		evidence = append(evidence, converted)
-		for _, nodeID := range reference.NodeIDs[1:] {
-			entry := converted
-			entry.NodeID, entry.EdgeID = nodeID, ""
-			evidence = append(evidence, entry)
+		evidence = appendUniqueEvidence(evidence, converted)
+		if len(reference.NodeIDs) > 1 {
+			for _, nodeID := range reference.NodeIDs[1:] {
+				entry := converted
+				entry.NodeID, entry.EdgeID = nodeID, ""
+				evidence = appendUniqueEvidence(evidence, entry)
+			}
 		}
-		for _, edgeID := range reference.EdgeIDs[1:] {
-			entry := converted
-			entry.NodeID, entry.EdgeID = "", edgeID
-			evidence = append(evidence, entry)
+		if len(reference.EdgeIDs) > 1 {
+			for _, edgeID := range reference.EdgeIDs[1:] {
+				entry := converted
+				entry.NodeID, entry.EdgeID = "", edgeID
+				evidence = appendUniqueEvidence(evidence, entry)
+			}
 		}
 		for _, assertion := range reference.Assertions {
 			entry := converted
 			entry.NodeID, entry.EdgeID = assertion.AssertionID, assertion.EdgeID
-			evidence = append(evidence, entry)
+			evidence = appendUniqueEvidence(evidence, entry)
 		}
 	}
 	event := fleetevents.Event{
@@ -139,6 +144,7 @@ func (p *ActionEventPublisher) PublishActionEvent(
 		Evidence:           evidence,
 		OccurredAt:         record.UpdatedAt,
 	}
+
 	_, err = p.service.PublishLifecycle(ctx, operation, fleetevents.PublishRequest{
 		Token: token, RetryUntil: record.UpdatedAt.Add(fleetevents.MaxMutationRetryWindow),
 		Event: event,
@@ -148,6 +154,17 @@ func (p *ActionEventPublisher) PublishActionEvent(
 		AuthorizationExpiresAt:   expiresAt,
 	})
 	return err
+}
+
+func appendUniqueEvidence(
+	values []fleetevents.Evidence, candidate fleetevents.Evidence,
+) []fleetevents.Evidence {
+	for _, value := range values {
+		if reflect.DeepEqual(value, candidate) {
+			return values
+		}
+	}
+	return append(values, candidate)
 }
 
 func actionEventAuthorization(

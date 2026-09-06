@@ -30,6 +30,7 @@ import (
 	"net/http"
 	"path"
 	"reflect"
+	"strings"
 
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
@@ -42,13 +43,14 @@ var staticFiles embed.FS
 
 // Handler exposes only the logical Explorer API and static workspace assets.
 type Handler struct {
-	service       Service
-	mux           *http.ServeMux
-	authority     hostAuthority
-	authenticator Authenticator
-	binder        auth.Binder
-	browserAuth   *BrowserAuthConfig
-	preAuth       map[string]preAuthenticationValidator
+	service             Service
+	mux                 *http.ServeMux
+	authority           hostAuthority
+	authenticator       Authenticator
+	binder              auth.Binder
+	browserAuth         *BrowserAuthConfig
+	preAuth             map[string]preAuthenticationValidator
+	authenticatedMounts map[string]http.Handler
 }
 
 // NewHandler constructs the standard HTTP transport without caller identity.
@@ -79,8 +81,9 @@ func NewHandler(service Service, allowedAuthorities ...string) (*Handler, error)
 	}
 	handler := &Handler{
 		service: service, mux: http.NewServeMux(),
-		authority: authority,
-		preAuth:   make(map[string]preAuthenticationValidator),
+		authority:           authority,
+		preAuth:             make(map[string]preAuthenticationValidator),
+		authenticatedMounts: make(map[string]http.Handler),
 	}
 	handler.routes()
 	return handler, nil
@@ -102,7 +105,8 @@ func (h *Handler) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	if cleanedPath == "" {
 		cleanedPath = "/"
 	}
-	if validator := h.preAuth[path.Clean(cleanedPath)]; validator != nil {
+	cleanedPath = path.Clean(cleanedPath)
+	if validator := h.mountedValidator(cleanedPath); validator != nil {
 		if status := validator.ValidatePreAuthentication(request); status != 0 {
 			http.Error(writer, http.StatusText(status), status)
 			return
@@ -123,7 +127,47 @@ func (h *Handler) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 		}
 		request = request.WithContext(ctx)
 	}
+	if mounted := h.mountedHandler(cleanedPath); mounted != nil {
+		mounted.ServeHTTP(writer, request)
+		return
+	}
 	h.mux.ServeHTTP(writer, request)
+}
+
+func (h *Handler) mountedHandler(requestPath string) http.Handler {
+	var selected http.Handler
+	longest := 0
+	for prefix, handler := range h.authenticatedMounts {
+		cleanedPrefix := strings.TrimSuffix(prefix, "/")
+		if mountedPathMatches(prefix, cleanedPrefix, requestPath) &&
+			len(cleanedPrefix) > longest {
+			selected, longest = handler, len(cleanedPrefix)
+		}
+	}
+	return selected
+}
+
+func (h *Handler) mountedValidator(
+	requestPath string,
+) preAuthenticationValidator {
+	var selected preAuthenticationValidator
+	longest := 0
+	for prefix, validator := range h.preAuth {
+		cleanedPrefix := strings.TrimSuffix(prefix, "/")
+		if mountedPathMatches(prefix, cleanedPrefix, requestPath) &&
+			len(cleanedPrefix) > longest {
+			selected, longest = validator, len(cleanedPrefix)
+		}
+	}
+	return selected
+}
+
+func mountedPathMatches(pattern, cleanedPattern, requestPath string) bool {
+	if strings.HasSuffix(pattern, "/") {
+		return requestPath == cleanedPattern ||
+			strings.HasPrefix(requestPath, cleanedPattern+"/")
+	}
+	return requestPath == cleanedPattern
 }
 
 func (h *Handler) routes() {

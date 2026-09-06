@@ -19,6 +19,7 @@ package webapi
 
 import (
 	"net/http"
+	"path"
 	"strings"
 
 	"github.com/phrocker/shoal-oss/pkg/shoal"
@@ -42,25 +43,26 @@ func (h *Handler) MountAuthenticated(
 		return shoal.NewError(
 			shoal.ErrorInvalidArgument, "mounted handler is required")
 	}
+	if isAbsentInterface(h.authenticator) || isAbsentInterface(h.binder) {
+		return shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			"authenticated mount requires authentication dependencies")
+	}
+	cleaned := path.Clean(pattern)
 	if !strings.HasPrefix(pattern, "/") || pattern == "/" ||
-		pattern == "/api/v1/auth-config" ||
-		pattern == "/assets" || strings.HasPrefix(pattern, "/assets/") {
+		cleaned == "/api/v1/auth-config" ||
+		cleaned == "/assets" || strings.HasPrefix(cleaned, "/assets/") {
 		return shoal.NewError(
 			shoal.ErrorInvalidArgument, "authenticated mount pattern is invalid")
 	}
-	defer func() {
-		if recover() != nil {
-			err = shoal.NewError(
-				shoal.ErrorInvalidArgument,
-				"authenticated mount pattern conflicts with an existing route",
-			)
-		}
-	}()
+	if _, exists := h.authenticatedMounts[pattern]; exists {
+		return shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			"authenticated mount pattern conflicts with an existing route")
+	}
+	h.authenticatedMounts[pattern] = handler
 	if validator, ok := handler.(preAuthenticationValidator); ok {
 		h.preAuth[pattern] = validator
 	}
-	h.mux.Handle("POST "+pattern, handler)
-	h.mux.Handle("GET "+pattern, handler)
-	h.mux.Handle("DELETE "+pattern, handler)
 	return nil
 }

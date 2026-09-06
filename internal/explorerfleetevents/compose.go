@@ -25,6 +25,7 @@ import (
 	"github.com/phrocker/shoal-oss/internal/explorercoord"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/explorer/coordination"
+	"github.com/phrocker/shoal-oss/pkg/explorer/fleet"
 	"github.com/phrocker/shoal-oss/pkg/explorer/fleetevents"
 	"github.com/phrocker/shoal-oss/pkg/interaction"
 )
@@ -52,13 +53,14 @@ func Compose(
 	resolver auth.Resolver,
 	generations auth.GenerationReader,
 	interactionRecorder *interaction.Recorder,
+	snapshots fleet.InteractionSnapshotProvider,
 	leases fleetevents.LeaseValidator,
 	cursorKey []byte,
 	clock func() time.Time,
 ) (*fleetevents.Service, error) {
 	service, _, err := ComposeWithPublisher(
 		runtime, domain, resolver, generations, interactionRecorder,
-		leases, cursorKey, clock,
+		snapshots, leases, cursorKey, clock,
 	)
 	return service, err
 }
@@ -71,6 +73,7 @@ func ComposeWithPublisher(
 	resolver auth.Resolver,
 	generations auth.GenerationReader,
 	interactionRecorder *interaction.Recorder,
+	snapshots fleet.InteractionSnapshotProvider,
 	leases fleetevents.LeaseValidator,
 	cursorKey []byte,
 	clock func() time.Time,
@@ -79,7 +82,8 @@ func ComposeWithPublisher(
 	if err != nil {
 		return nil, nil, err
 	}
-	auditor, err := fleetevents.NewInteractionAuditor(interactionRecorder)
+	auditor, err := fleetevents.NewInteractionAuditor(
+		interactionRecorder, snapshots)
 	if err != nil {
 		return nil, nil, err
 	}

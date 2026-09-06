@@ -38,6 +38,7 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/explorer/coordination/guard"
 	"github.com/phrocker/shoal-oss/pkg/explorer/coordination/transaction"
 	"github.com/phrocker/shoal-oss/pkg/explorer/fleetevents"
+	"github.com/phrocker/shoal-oss/pkg/interaction"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
@@ -120,6 +121,164 @@ type subscriptionMutationReceipt struct {
 	RequestDigest []byte                   `json:"request_digest"`
 	RetryUntil    time.Time                `json:"retry_until"`
 	Subscription  fleetevents.Subscription `json:"subscription"`
+}
+
+type subscriptionWire struct {
+	ID                       []byte
+	SubscriberID             []byte
+	AgentID                  []byte
+	AgentGeneration          int64
+	AuthorizationFingerprint auth.Fingerprint
+	PolicyGeneration         int64
+	Filter                   fleetevents.Filter
+	Generation               uint64
+	CreatedAt                time.Time
+	ExpiresAt                time.Time
+	RevokedAt                time.Time
+}
+
+type evidenceWire struct {
+	SourceID, PolicyID       []byte
+	ObjectID, NodeID, EdgeID []byte
+	AnchorID, RevisionID     []byte
+	Start, End               int64
+	Visibility               []string
+}
+
+type eventWire struct {
+	Sequence                      uint64
+	EventID, ProducerID, ActionID []byte
+	TransitionID, CorrelationID   []byte
+	Kind                          string
+	ProducerGeneration            int64
+	Reason                        interaction.Reason
+	Evidence                      []evidenceWire
+	OccurredAt                    time.Time
+}
+
+func subscriptionToWire(value fleetevents.Subscription) subscriptionWire {
+	return subscriptionWire{
+		ID: value.ID, SubscriberID: []byte(value.SubscriberID),
+		AgentID: []byte(value.AgentID), AgentGeneration: value.AgentGeneration,
+		AuthorizationFingerprint: value.AuthorizationFingerprint,
+		PolicyGeneration:         value.PolicyGeneration, Filter: value.Filter,
+		Generation: value.Generation, CreatedAt: value.CreatedAt,
+		ExpiresAt: value.ExpiresAt, RevokedAt: value.RevokedAt,
+	}
+}
+
+func (value subscriptionWire) domain() fleetevents.Subscription {
+	return fleetevents.Subscription{
+		ID: value.ID, SubscriberID: shoal.ID(value.SubscriberID),
+		AgentID: shoal.ID(value.AgentID), AgentGeneration: value.AgentGeneration,
+		AuthorizationFingerprint: value.AuthorizationFingerprint,
+		PolicyGeneration:         value.PolicyGeneration, Filter: value.Filter,
+		Generation: value.Generation, CreatedAt: value.CreatedAt,
+		ExpiresAt: value.ExpiresAt, RevokedAt: value.RevokedAt,
+	}
+}
+
+func eventToWire(value fleetevents.Event) eventWire {
+	evidence := make([]evidenceWire, len(value.Evidence))
+	for i, item := range value.Evidence {
+		evidence[i] = evidenceWire{
+			SourceID: item.SourceID, PolicyID: item.PolicyID,
+			ObjectID: []byte(item.ObjectID), NodeID: []byte(item.NodeID),
+			EdgeID: []byte(item.EdgeID), AnchorID: []byte(item.AnchorID),
+			RevisionID: []byte(item.RevisionID), Start: item.Start, End: item.End,
+			Visibility: item.Visibility,
+		}
+	}
+	return eventWire{
+		Sequence: value.Sequence, EventID: value.EventID, Kind: value.Kind,
+		ProducerID: value.ProducerID, ProducerGeneration: value.ProducerGeneration,
+		ActionID: value.ActionID, TransitionID: value.TransitionID,
+		CorrelationID: value.CorrelationID, Reason: value.Reason,
+		Evidence: evidence, OccurredAt: value.OccurredAt,
+	}
+}
+
+func (value eventWire) domain() fleetevents.Event {
+	evidence := make([]fleetevents.Evidence, len(value.Evidence))
+	for i, item := range value.Evidence {
+		evidence[i] = fleetevents.Evidence{
+			SourceID: item.SourceID, PolicyID: item.PolicyID,
+			ObjectID: shoal.ID(item.ObjectID), NodeID: shoal.ID(item.NodeID),
+			EdgeID: shoal.ID(item.EdgeID), AnchorID: shoal.ID(item.AnchorID),
+			RevisionID: shoal.ID(item.RevisionID), Start: item.Start, End: item.End,
+			Visibility: item.Visibility,
+		}
+	}
+	return fleetevents.Event{
+		Sequence: value.Sequence, EventID: value.EventID, Kind: value.Kind,
+		ProducerID: value.ProducerID, ProducerGeneration: value.ProducerGeneration,
+		ActionID: value.ActionID, TransitionID: value.TransitionID,
+		CorrelationID: value.CorrelationID, Reason: value.Reason,
+		Evidence: evidence, OccurredAt: value.OccurredAt,
+	}
+}
+
+func (r subscriptionRecord) MarshalJSON() ([]byte, error) {
+	return json.Marshal(struct{ Subscription subscriptionWire }{
+		Subscription: subscriptionToWire(r.Subscription),
+	})
+}
+
+func (r *subscriptionRecord) UnmarshalJSON(value []byte) error {
+	var wire struct{ Subscription subscriptionWire }
+	if err := json.Unmarshal(value, &wire); err != nil {
+		return err
+	}
+	r.Subscription = wire.Subscription.domain()
+	return nil
+}
+
+func (r eventRecord) MarshalJSON() ([]byte, error) {
+	return json.Marshal(struct {
+		Event         eventWire
+		PublicationID []byte
+		RetryUntil    time.Time
+	}{eventToWire(r.Event), r.PublicationID, r.RetryUntil})
+}
+
+func (r *eventRecord) UnmarshalJSON(value []byte) error {
+	var wire struct {
+		Event         eventWire
+		PublicationID []byte
+		RetryUntil    time.Time
+	}
+	if err := json.Unmarshal(value, &wire); err != nil {
+		return err
+	}
+	r.Event, r.PublicationID, r.RetryUntil =
+		wire.Event.domain(), wire.PublicationID, wire.RetryUntil
+	return nil
+}
+
+func (r subscriptionMutationReceipt) MarshalJSON() ([]byte, error) {
+	return json.Marshal(struct {
+		MutationID, RequestDigest []byte
+		RetryUntil                time.Time
+		Subscription              subscriptionWire
+	}{
+		r.MutationID, r.RequestDigest, r.RetryUntil,
+		subscriptionToWire(r.Subscription),
+	})
+}
+
+func (r *subscriptionMutationReceipt) UnmarshalJSON(value []byte) error {
+	var wire struct {
+		MutationID, RequestDigest []byte
+		RetryUntil                time.Time
+		Subscription              subscriptionWire
+	}
+	if err := json.Unmarshal(value, &wire); err != nil {
+		return err
+	}
+	r.MutationID, r.RequestDigest, r.RetryUntil =
+		wire.MutationID, wire.RequestDigest, wire.RetryUntil
+	r.Subscription = wire.Subscription.domain()
+	return nil
 }
 
 func (a *Adapter) Create(
@@ -258,8 +417,8 @@ func createRequestDigest(
 	policyGeneration int64,
 ) ([]byte, error) {
 	value, err := json.Marshal(struct {
-		SubscriberID     string             `json:"subscriber_id"`
-		AgentID          string             `json:"agent_id"`
+		SubscriberID     []byte             `json:"subscriber_id"`
+		AgentID          []byte             `json:"agent_id"`
 		AgentGeneration  int64              `json:"agent_generation"`
 		Fingerprint      auth.Fingerprint   `json:"fingerprint"`
 		PolicyGeneration int64              `json:"policy_generation"`
@@ -267,8 +426,8 @@ func createRequestDigest(
 		TTL              int64              `json:"ttl"`
 		RetryUntil       time.Time          `json:"retry_until"`
 	}{
-		SubscriberID: string(request.SubscriberID),
-		AgentID:      string(request.AgentID), AgentGeneration: request.AgentGeneration,
+		SubscriberID: []byte(request.SubscriberID),
+		AgentID:      []byte(request.AgentID), AgentGeneration: request.AgentGeneration,
 		Fingerprint: fingerprint, PolicyGeneration: policyGeneration,
 		Filter: request.Filter, TTL: int64(request.TTL),
 		RetryUntil: request.RetryUntil,

@@ -128,8 +128,89 @@ func TestCombinedFleetAndEventMountsRemainIsolated(t *testing.T) {
 	}
 }
 
+func TestMountAuthenticatedRejectsUnsafeConfigurationAtomically(t *testing.T) {
+	unauthenticated, err := NewHandler(&stubWorkspaceService{}, "example.test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := unauthenticated.MountAuthenticated(
+		"/mounted/", http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}),
+	); !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
+		t.Fatalf("unauthenticated mount error = %v", err)
+	}
+
+	now := time.Date(2026, 9, 6, 2, 0, 0, 0, time.UTC)
+	authority, err := auth.NewAuthorityWithClock(func() time.Time { return now })
+	if err != nil {
+		t.Fatal(err)
+	}
+	decision, err := auth.NewDecision(auth.DecisionConfig{
+		Subject: "subject", Actor: "actor", AuthorizationDomain: []byte("domain"),
+		AllowedOperations: []auth.Operation{auth.OperationRetrieve},
+		PolicyGeneration:  1, AuthenticationExpires: now.Add(time.Hour),
+		RequestID: "request",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler, err := NewAuthenticatedHandler(
+		&stubWorkspaceService{},
+		AuthenticatorFunc(func(*http.Request) (auth.Decision, error) {
+			return decision, nil
+		}),
+		authority.Binder(), "example.test",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := handler.MountAuthenticated(
+		"/api/v1/auth-config/",
+		http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}),
+	); !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
+		t.Fatalf("normalized public mount error = %v", err)
+	}
+	first := http.HandlerFunc(func(http.ResponseWriter, *http.Request) {})
+	if err := handler.MountAuthenticated("/mounted/", first); err != nil {
+		t.Fatal(err)
+	}
+	if err := handler.MountAuthenticated(
+		"/mounted/", http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}),
+	); !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
+		t.Fatalf("duplicate mount error = %v", err)
+	}
+	if reflect.ValueOf(handler.mountedHandler("/mounted/path")).Pointer() !=
+		reflect.ValueOf(first).Pointer() {
+		t.Fatal("failed mount replaced the previously registered handler")
+	}
+}
+
 func TestFleetRoutesRoundTripReturnedOpaqueID(t *testing.T) {
-	handler, err := NewHandler(fleetBaseService{}, "example.test")
+	now := time.Date(2026, 9, 6, 1, 0, 0, 0, time.UTC)
+	authority, err := auth.NewAuthorityWithClock(func() time.Time { return now })
+	if err != nil {
+		t.Fatal(err)
+	}
+	decision, err := auth.NewDecision(auth.DecisionConfig{
+		Subject: "subject", Actor: "actor",
+		AuthorizationDomain: []byte("domain"),
+		AllowedOperations: []auth.Operation{
+			auth.OperationSubscriptionCreate,
+			auth.OperationSubscriptionDelete,
+			auth.OperationEventPublish,
+		},
+		PolicyGeneration: 1, AuthenticationExpires: now.Add(time.Hour),
+		RequestID: "request", CorrelationID: "correlation",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler, err := NewAuthenticatedHandler(
+		fleetBaseService{},
+		AuthenticatorFunc(func(*http.Request) (auth.Decision, error) {
+			return decision, nil
+		}),
+		authority.Binder(), "example.test",
+	)
 	if err != nil {
 		t.Fatal(err)
 	}

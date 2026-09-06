@@ -25,10 +25,22 @@ import (
 	"testing"
 	"time"
 
+	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/interaction"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
+
+type testAuditSnapshots struct{}
+
+func (testAuditSnapshots) InteractionSnapshot(
+	context.Context,
+) (explorer.Snapshot, error) {
+	return explorer.Snapshot{
+		ID:   "audit-snapshot",
+		AsOf: time.Date(2026, 9, 5, 19, 0, 0, 0, time.UTC),
+	}, nil
+}
 
 func TestInteractionAuditorRecordsRedactedAction(t *testing.T) {
 	now := time.Date(2026, 9, 5, 20, 0, 0, 0, time.UTC)
@@ -40,7 +52,7 @@ func TestInteractionAuditorRecordsRedactedAction(t *testing.T) {
 	if err := recorder.SetClock(func() time.Time { return now }); err != nil {
 		t.Fatal(err)
 	}
-	auditor, err := NewInteractionAuditor(recorder)
+	auditor, err := NewInteractionAuditor(recorder, testAuditSnapshots{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -92,7 +104,7 @@ func TestInteractionAuditorRejectsMismatchedPersistedReceipt(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	auditor, err := NewInteractionAuditor(recorder)
+	auditor, err := NewInteractionAuditor(recorder, testAuditSnapshots{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -107,7 +119,7 @@ func TestInteractionAuditorRejectsMismatchedPersistedReceipt(t *testing.T) {
 }
 
 func TestInteractionAuditorRejectsNilRecorder(t *testing.T) {
-	if _, err := NewInteractionAuditor(nil); err == nil {
+	if _, err := NewInteractionAuditor(nil, testAuditSnapshots{}); err == nil {
 		t.Fatal("nil recorder succeeded")
 	}
 }
@@ -126,7 +138,7 @@ func TestInteractionAuditorAcceptsOriginalRetryTimestamp(t *testing.T) {
 	if err := recorder.SetClock(func() time.Time { return retry }); err != nil {
 		t.Fatal(err)
 	}
-	auditor, err := NewInteractionAuditor(recorder)
+	auditor, err := NewInteractionAuditor(recorder, testAuditSnapshots{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -149,7 +161,7 @@ func TestInteractionAuditorRejectsPreSinkExpiryWithoutWrite(t *testing.T) {
 	if err := recorder.SetClock(func() time.Time { return now }); err != nil {
 		t.Fatal(err)
 	}
-	auditor, err := NewInteractionAuditor(recorder)
+	auditor, err := NewInteractionAuditor(recorder, testAuditSnapshots{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -182,7 +194,7 @@ func TestInteractionAuditorPreservesCommittedPostSinkFailures(t *testing.T) {
 		}); err != nil {
 			t.Fatal(err)
 		}
-		auditor, err := NewInteractionAuditor(recorder)
+		auditor, err := NewInteractionAuditor(recorder, testAuditSnapshots{})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -209,7 +221,7 @@ func TestInteractionAuditorPreservesCommittedPostSinkFailures(t *testing.T) {
 		if err := recorder.SetClock(func() time.Time { return started }); err != nil {
 			t.Fatal(err)
 		}
-		auditor, err := NewInteractionAuditor(recorder)
+		auditor, err := NewInteractionAuditor(recorder, testAuditSnapshots{})
 		if err != nil {
 			t.Fatal(err)
 		}

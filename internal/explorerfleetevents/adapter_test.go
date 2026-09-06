@@ -25,6 +25,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
@@ -133,6 +134,79 @@ func TestAdapterConcurrentAppendRestartResume(t *testing.T) {
 	resumed, resumedFrontier, err := adapter.Scan(context.Background(), 13, 0, count)
 	if err != nil || len(resumed) != 12 || resumed[0].Sequence != 13 || resumedFrontier == 0 {
 		t.Fatalf("resumed scan = %#v, frontier %d, %v", resumed, resumedFrontier, err)
+	}
+}
+
+func TestAdapterOpaqueIDsRemainByteSafeAcrossRestart(t *testing.T) {
+	ctx := context.Background()
+	config := runtimeConfig(t.TempDir())
+	runtime, err := explorercoord.Open(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	adapter, err := New(runtime, config.Domain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 9, 6, 22, 0, 0, 0, time.UTC)
+	request := fleetevents.CreateRequest{
+		Token: []byte("opaque-create"), SubscriberID: shoal.ID(string([]byte{0xff})),
+		AgentID: shoal.ID(string([]byte{'a', 0xfe})), AgentGeneration: 1,
+		TTL: time.Hour, RetryUntil: now.Add(time.Hour),
+	}
+	fingerprint := auth.Fingerprint{1}
+	created, repeated, err := adapter.Create(ctx, request, fingerprint, 1, now)
+	if err != nil || repeated {
+		t.Fatalf("create = %#v, repeated %v, %v", created, repeated, err)
+	}
+	divergent := request
+	divergent.SubscriberID = shoal.ID(string([]byte{0xfe}))
+	if _, _, err := adapter.Create(
+		ctx, divergent, fingerprint, 1, now,
+	); !errors.Is(err, transaction.ErrConflict) {
+		t.Fatalf("byte-distinct create retry error = %v, want conflict", err)
+	}
+
+	event := testEvent(0)
+	event.ProducerID = []byte{0xff, 0x00}
+	event.Evidence[0].ObjectID = shoal.ID(string([]byte{0xff}))
+	event.Evidence[0].NodeID = shoal.ID(string([]byte{0xfe}))
+	event.Evidence[0].EdgeID = shoal.ID(string([]byte{0xfd}))
+	event.Evidence[0].AnchorID = shoal.ID(string([]byte{0xfc}))
+	event.Evidence[0].RevisionID = shoal.ID(string([]byte{0xfb}))
+	if _, err := adapter.Append(ctx, fleetevents.PublishRequest{
+		Token: []byte("opaque-event"), RetryUntil: now.Add(time.Hour),
+		Event: event,
+	}, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.Close(); err != nil {
+		t.Fatal(err)
+	}
+	runtime, err = explorercoord.Open(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.Close()
+	adapter, err = New(runtime, config.Domain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reloaded, err := adapter.Subscription(ctx, created.ID)
+	if err != nil || reloaded.SubscriberID != request.SubscriberID ||
+		reloaded.AgentID != request.AgentID {
+		t.Fatalf("reloaded subscription = %#v, %v", reloaded, err)
+	}
+	events, _, err := adapter.Scan(ctx, 1, 0, 1)
+	if err != nil || len(events) != 1 ||
+		!reflect.DeepEqual(events[0], fleetevents.Event{
+			Sequence: 1, EventID: events[0].EventID, Kind: event.Kind,
+			ProducerID: event.ProducerID, ProducerGeneration: event.ProducerGeneration,
+			ActionID: event.ActionID, TransitionID: event.TransitionID,
+			CorrelationID: event.CorrelationID, Reason: event.Reason,
+			Evidence: event.Evidence, OccurredAt: event.OccurredAt,
+		}) {
+		t.Fatalf("reloaded event = %#v, %v", events, err)
 	}
 }
 

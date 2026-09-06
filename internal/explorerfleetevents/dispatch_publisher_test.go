@@ -277,7 +277,7 @@ func TestActionEventPublisherPreservesExecutorEvidence(t *testing.T) {
 		SourceID: []byte("source"), PolicyID: []byte("policy"), ObjectID: "object",
 		Reason: interaction.Reason{Code: "completed"}, UpdatedAt: now,
 		Evidence: []fleet.EvidenceRef{{
-			NodeIDs: []shoal.ID{"node"}, EdgeIDs: []shoal.ID{"edge"},
+			NodeIDs:    []shoal.ID{"node", "node"},
 			AnchorID:   "anchor",
 			Visibility: []string{"A", "B"},
 		}},
@@ -291,7 +291,7 @@ func TestActionEventPublisherPreservesExecutorEvidence(t *testing.T) {
 		t.Fatalf("preserved evidence = %#v", backend.request.Event.Evidence)
 	}
 	evidence := backend.request.Event.Evidence[1]
-	if evidence.NodeID != "node" || evidence.EdgeID != "edge" ||
+	if evidence.NodeID != "node" || evidence.EdgeID != "" ||
 		evidence.AnchorID != "anchor" ||
 		!reflect.DeepEqual(evidence.Visibility, []string{"A", "B"}) {
 		t.Fatalf("executor evidence = %#v", evidence)

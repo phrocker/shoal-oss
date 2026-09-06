@@ -106,7 +106,7 @@ func ComposeHosted(ctx context.Context, config HostConfig) (*HostedServices, err
 	}
 	events, actionEvents, err := ComposeWithPublisher(
 		config.Runtime, config.Domain, config.Resolver, config.Generations,
-		recorder, registry, cursorKey, config.Clock)
+		recorder, config.Snapshots, registry, cursorKey, config.Clock)
 	if err != nil {
 		return nil, err
 	}

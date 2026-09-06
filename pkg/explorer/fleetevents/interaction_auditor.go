@@ -24,7 +24,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"reflect"
-	"time"
 
 	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/interaction"
@@ -35,14 +34,23 @@ import (
 // durable interaction recorder without persisting event payloads or raw
 // opaque object identities.
 type InteractionAuditor struct {
-	recorder *interaction.Recorder
+	recorder  *interaction.Recorder
+	snapshots InteractionSnapshotProvider
 }
 
-func NewInteractionAuditor(recorder *interaction.Recorder) (*InteractionAuditor, error) {
-	if recorder == nil {
-		return nil, shoal.NewError(shoal.ErrorInvalidArgument, "interaction recorder is required")
+type InteractionSnapshotProvider interface {
+	InteractionSnapshot(context.Context) (explorer.Snapshot, error)
+}
+
+func NewInteractionAuditor(
+	recorder *interaction.Recorder, snapshots InteractionSnapshotProvider,
+) (*InteractionAuditor, error) {
+	if recorder == nil || snapshots == nil {
+		return nil, shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			"interaction recorder and snapshot provider are required")
 	}
-	return &InteractionAuditor{recorder: recorder}, nil
+	return &InteractionAuditor{recorder: recorder, snapshots: snapshots}, nil
 }
 
 func (a *InteractionAuditor) RecordFleetAction(ctx context.Context, record AuditRecord) error {
@@ -50,9 +58,10 @@ func (a *InteractionAuditor) RecordFleetAction(ctx context.Context, record Audit
 		"fleet-action-session-v1", []byte(record.Operation), record.ActionID,
 		record.ObjectID, record.CorrelationID,
 	)))
-	snapshotID := shoal.ID(hex.EncodeToString(deriveID(
-		"fleet-action-snapshot-v1", record.ObjectID, []byte(record.OccurredAt.Format(time.RFC3339Nano)),
-	)))
+	snapshot, err := a.snapshots.InteractionSnapshot(ctx)
+	if err != nil {
+		return err
+	}
 	evidenceIDs := make([]shoal.ID, 0, len(record.Evidence)*5)
 	for _, evidence := range record.Evidence {
 		evidenceIDs = append(evidenceIDs, evidence.ObjectID)
@@ -71,7 +80,7 @@ func (a *InteractionAuditor) RecordFleetAction(ctx context.Context, record Audit
 			record.AuthorizationFingerprint.String()),
 		AuthorizationExpiresAt: record.AuthorizationExpiresAt,
 		AuthorizationOperation: string(record.Operation),
-		SnapshotID:             snapshotID, SnapshotAsOf: record.OccurredAt,
+		SnapshotID:             shoal.ID(snapshot.ID), SnapshotAsOf: snapshot.AsOf,
 		RequestID: record.RequestID,
 		QueryDigest: interaction.Digest(
 			string(record.ActionID) + "\x00" + string(record.CorrelationID)),
