@@ -192,7 +192,11 @@ func (e *Explorer) VerifyInteractionEvidence(
 		}
 	}
 	for _, evidence := range assertions {
-		assertion, ok := e.graphAssertions[evidence.ID]
+		key := evidence.ID
+		if evidence.GraphEdgeID != "" {
+			key = evidence.GraphEdgeID
+		}
+		assertion, ok := e.graphAssertions[key]
 		if !ok || assertionInteractionEvidence(assertion) != evidence {
 			return shoal.NewError(
 				shoal.ErrorNotFound, "interaction evidence assertion not found")
@@ -213,7 +217,8 @@ func exactInteractionNodeEqual(left, right graph.Node) bool {
 		}
 	}
 	for key, value := range left.Properties {
-		if right.Properties[key] != value {
+		rightValue, ok := right.Properties[key]
+		if !ok || rightValue != value {
 			return false
 		}
 	}
@@ -227,7 +232,8 @@ func exactInteractionEdgeEqual(left, right graph.Edge) bool {
 		return false
 	}
 	for key, value := range left.Properties {
-		if right.Properties[key] != value {
+		rightValue, ok := right.Properties[key]
+		if !ok || rightValue != value {
 			return false
 		}
 	}
@@ -240,7 +246,7 @@ func assertionInteractionEvidence(assertion ontology.Assertion) interaction.Asse
 		ID: assertion.ID(), Subject: assertion.Subject(),
 		Predicate: assertion.Predicate(), ObjectReference: target,
 		Origin: string(assertion.Origin()), Confidence: assertion.Confidence(),
-		GraphEdgeID: shoal.ID(assertion.Metadata()["graph.edge.id"]),
+		GraphEdgeID: shoal.ID(assertion.Metadata()[graphAssertionEdgeIDMetadata]),
 	}
 	for _, item := range assertion.Evidence() {
 		if derivation, ok := item.Derivation(); ok {
