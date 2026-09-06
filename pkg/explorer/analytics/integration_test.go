@@ -269,7 +269,7 @@ func TestEmbeddedAnalyticsDurablyRecordsCompleteAuthorizedEvidence(t *testing.T)
 		ClientID:              "analytics-client",
 		OnBehalfOf:            []shoal.ID{"fleet"},
 		AuthorizationDomain:   fixture.domain,
-		AllowedOperations:     []auth.Operation{auth.OperationAnalyticsRead},
+		AllowedOperations:     []auth.Operation{auth.OperationAnalyticsRead, auth.OperationRetrieve},
 		PermittedSourceIDs:    [][]byte{fixture.sourceA, fixture.sourceB},
 		PermittedPolicyIDs:    [][]byte{fixture.policyA, fixture.policyB},
 		PolicyGeneration:      1,
@@ -397,7 +397,7 @@ func TestMCPAnalyticsDurablyRecordsBeforeSuccess(t *testing.T) {
 	decision, err := auth.NewDecision(auth.DecisionConfig{
 		Subject: "mcp-subject", Actor: "mcp-actor",
 		AuthorizationDomain:   fixture.domain,
-		AllowedOperations:     []auth.Operation{auth.OperationAnalyticsRead},
+		AllowedOperations:     []auth.Operation{auth.OperationAnalyticsRead, auth.OperationRetrieve},
 		PermittedSourceIDs:    [][]byte{fixture.sourceA},
 		PermittedPolicyIDs:    [][]byte{fixture.policyA},
 		PolicyGeneration:      1,
@@ -472,7 +472,7 @@ func TestAnalyticsInteractionSinkReauthorizesExactEdgeEvidence(t *testing.T) {
 	decision, err := auth.NewDecision(auth.DecisionConfig{
 		Subject: "analytics-subject", Actor: "analytics-actor",
 		AuthorizationDomain:   fixture.domain,
-		AllowedOperations:     []auth.Operation{auth.OperationAnalyticsRead},
+		AllowedOperations:     []auth.Operation{auth.OperationAnalyticsRead, auth.OperationRetrieve},
 		PermittedSourceIDs:    [][]byte{fixture.sourceA},
 		PermittedPolicyIDs:    [][]byte{fixture.policyA},
 		PolicyGeneration:      1,
@@ -937,7 +937,7 @@ func (f *analyticsFixture) readContextAtGeneration(
 	decision, err := auth.NewDecision(auth.DecisionConfig{
 		Subject: shoal.ID(subject), Actor: shoal.ID(subject + "-actor"),
 		AuthorizationDomain:   f.domain,
-		AllowedOperations:     []auth.Operation{auth.OperationAnalyticsRead},
+		AllowedOperations:     []auth.Operation{auth.OperationAnalyticsRead, auth.OperationRetrieve},
 		PermittedSourceIDs:    [][]byte{source},
 		PermittedPolicyIDs:    [][]byte{policy},
 		PolicyGeneration:      generation,

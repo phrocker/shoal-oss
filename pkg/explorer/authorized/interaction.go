@@ -175,16 +175,12 @@ func (c *Client) recordInteraction(
 	if err != nil {
 		return interaction.Session{}, err
 	}
-	evidenceOperation := auth.OperationRetrieve
-	if authorizationOperation == auth.OperationAnalyticsRead {
-		evidenceOperation = authorizationOperation
-	}
 	if err := c.authorizeInteractionEvidence(
 		ctx,
 		canonical.TouchedNodeIDs(),
 		canonical.TouchedEdgeIDs(),
 		decision,
-		evidenceOperation,
+		auth.OperationRetrieve,
 		now,
 	); err != nil {
 		return interaction.Session{}, err
