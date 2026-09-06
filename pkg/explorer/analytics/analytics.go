@@ -36,6 +36,7 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/graph"
+	"github.com/phrocker/shoal-oss/pkg/interaction"
 	"github.com/phrocker/shoal-oss/pkg/ontology"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
@@ -472,6 +473,7 @@ func ValidateResult(request Request, result Result, limits Limits) error {
 				shoal.ErrorInternal, "analytics response has duplicate components")
 		}
 		componentIDs[component.ID] = struct{}{}
+		var memberEdges uint64
 		if index > 0 && shoal.CompareID(
 			result.WeaklyConnectedComponents[index-1].NodeIDs[0],
 			component.NodeIDs[0],
@@ -495,8 +497,21 @@ func ValidateResult(request Request, result Result, limits Limits) error {
 					shoal.ErrorInternal, "analytics node occurs in multiple components")
 			}
 			covered[nodeID] = struct{}{}
+			memberEdges += uint64(node.OutDegree)
+		}
+		if memberEdges != uint64(component.EdgeCount) {
+			return shoal.NewError(
+				shoal.ErrorInternal, "analytics component edge count is inconsistent")
 		}
 		componentEdges += uint64(component.EdgeCount)
+	}
+	if result.Recording.Recorded {
+		if err := shoal.ValidateRequiredID(
+			"analytics recording interaction", result.Recording.InteractionID,
+		); err != nil {
+			return shoal.NewError(
+				shoal.ErrorInternal, "analytics recording interaction ID is invalid")
+		}
 	}
 	if len(covered) != len(result.Nodes) ||
 		componentEdges != uint64(scope.EdgeCount) ||
@@ -1018,7 +1033,7 @@ func authorizedScopeSnapshotID(
 	neighborhood explorer.Neighborhood,
 ) string {
 	var encoded bytes.Buffer
-	writeText(&encoded, "authorized-analytics-snapshot-v1")
+	writeText(&encoded, "authorized-analytics-snapshot-v2")
 	writeBytes(&encoded, fingerprint[:])
 	writeUint64(&encoded, uint64(generation))
 	if hasOntology {
@@ -1070,6 +1085,27 @@ func authorizedScopeSnapshotID(
 		writeText(&encoded, edge.Type)
 		writeUint64(&encoded, math.Float64bits(float64(edge.Weight)))
 		writeMetadata(&encoded, edge.Properties)
+	}
+	assertions := make(
+		[]interaction.AssertionEvidence, len(neighborhood.Assertions))
+	for index, assertion := range neighborhood.Assertions {
+		assertions[index] = InteractionAssertionEvidence(assertion)
+	}
+	sort.Slice(assertions, func(i, j int) bool {
+		return shoal.CompareID(assertions[i].ID, assertions[j].ID) < 0
+	})
+	writeUint64(&encoded, uint64(len(assertions)))
+	for _, assertion := range assertions {
+		writeText(&encoded, "assertion")
+		writeBytes(&encoded, []byte(assertion.ID))
+		writeBytes(&encoded, []byte(assertion.Subject))
+		writeBytes(&encoded, []byte(assertion.Predicate))
+		writeBytes(&encoded, []byte(assertion.ObjectReference))
+		writeText(&encoded, assertion.Origin)
+		writeUint64(&encoded, math.Float64bits(float64(assertion.Confidence)))
+		writeBytes(&encoded, []byte(assertion.GraphEdgeID))
+		writeBytes(&encoded, []byte(assertion.DerivationID))
+		writeUint64(&encoded, math.Float64bits(float64(assertion.DerivationScore)))
 	}
 	interpretations := append(
 		[]ontology.AssertionInterpretation(nil), neighborhood.Interpretations...)

@@ -304,7 +304,7 @@ func equalAssertionEvidence(
 		return shoal.CompareID(right[i].ID, right[j].ID) < 0
 	})
 	for index := range left {
-		if left[index] != right[index] {
+		if !interaction.AssertionEvidenceEqual(left[index], right[index]) {
 			return false
 		}
 	}
