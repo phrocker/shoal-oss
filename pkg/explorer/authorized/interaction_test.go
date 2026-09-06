@@ -377,6 +377,18 @@ func TestAuthorizedInteractionRecorderRejectsWrongPin(t *testing.T) {
 	); !shoal.IsErrorCode(err, shoal.ErrorNotFound) {
 		t.Fatalf("rejected interaction was persisted: %v", err)
 	}
+	fingerprint, err := auth.AuthorizationFingerprint(decision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session.ID = "session-wrong-snapshot"
+	session.AuthorizationFingerprint = shoal.ID(fingerprint.String())
+	session.SnapshotID = "forged-snapshot"
+	if err := f.clientA.RecordInteraction(
+		ctx, session,
+	); !shoal.IsErrorCode(err, shoal.ErrorConflict) {
+		t.Fatalf("forged snapshot record = %v", err)
+	}
 }
 
 func TestAuthorizedTombstoneSubgraphDoesNotLeakExistence(t *testing.T) {

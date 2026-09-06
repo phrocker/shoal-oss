@@ -86,6 +86,21 @@ func (c *Client) recordInteraction(
 	if !interactionPinMatchesDecision(canonical, decision) {
 		return interaction.Session{}, authorizationDenied()
 	}
+	bounded, err := c.boundedBase()
+	if err != nil {
+		return interaction.Session{}, err
+	}
+	snapshot, err := bounded.Snapshot(ctx)
+	if err != nil {
+		return interaction.Session{}, directBaseError(err)
+	}
+	if canonical.SnapshotID != shoal.ID(snapshot.ID) ||
+		!canonical.SnapshotAsOf.UTC().Equal(snapshot.AsOf.UTC()) {
+		return interaction.Session{}, shoal.NewError(
+			shoal.ErrorConflict,
+			"interaction observed snapshot is no longer current",
+		)
+	}
 	canonical.Actor = interaction.ActorContext{
 		SubjectID:  decision.Subject(),
 		ActorID:    decision.Actor(),

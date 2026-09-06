@@ -21,6 +21,7 @@ package explorer
 
 import (
 	"context"
+	"reflect"
 	"sort"
 	"time"
 
@@ -182,8 +183,12 @@ func (e *Explorer) RecordInteraction(
 				"interaction session ID was explicitly deleted and cannot be reused",
 			)
 		}
+		if reflect.DeepEqual(existing.Session, session) {
+			return nil
+		}
 		return shoal.NewError(
-			shoal.ErrorConflict, "interaction session ID already exists")
+			shoal.ErrorConflict,
+			"interaction session ID already exists with different content")
 	}
 	// Sessions and folds are distinct maps but share one node namespace in the
 	// corpus graph, so an ID taken by either would silently overwrite the other

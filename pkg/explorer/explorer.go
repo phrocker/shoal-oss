@@ -47,6 +47,7 @@ type Explorer struct {
 	documents               map[shoal.ID]map[shoal.ID]*persistedDocument
 	edges                   map[shoal.ID]persistedEdge
 	interactions            map[shoal.ID]*persistedInteraction
+	interactionLiveRecords  map[shoal.ID]*persistedInteraction
 	folds                   map[shoal.ID]*persistedFold
 	interactionNodeIDs      map[shoal.ID]struct{}
 	interactionEdgeIDs      map[shoal.ID]struct{}
@@ -201,6 +202,7 @@ func OpenWithOptions(dir string, options Options) (*Explorer, error) {
 		documents:               make(map[shoal.ID]map[shoal.ID]*persistedDocument),
 		edges:                   make(map[shoal.ID]persistedEdge),
 		interactions:            make(map[shoal.ID]*persistedInteraction),
+		interactionLiveRecords:  make(map[shoal.ID]*persistedInteraction),
 		folds:                   make(map[shoal.ID]*persistedFold),
 		interactionNodeIDs:      make(map[shoal.ID]struct{}),
 		interactionEdgeIDs:      make(map[shoal.ID]struct{}),
@@ -219,6 +221,7 @@ func OpenWithOptions(dir string, options Options) (*Explorer, error) {
 		_ = eng.Close()
 		return nil, err
 	}
+	explorer.interactionLiveRecords = nil
 	if explorer.snapshotAnchor.IsZero() {
 		explorer.snapshotAnchor = time.Now().UTC()
 		if !explorer.readOnly {

@@ -161,6 +161,7 @@ const (
 	MaxTouchedNodes      = 65536
 	MaxVisibilityLabels  = 64
 	MaxVisibilityLabelSz = 256
+	MaxIdentifierBytes   = 256
 	MaxFoldMembers       = 4096
 	MaxDelegationEntries = 64
 )
@@ -463,6 +464,41 @@ func Expression(labels []string) string {
 	return strings.Join(labels, "&")
 }
 
+func validatePrefixedDigest(name, digest string, optional bool) error {
+	if strings.HasPrefix(digest, "sha256:") {
+		digest = strings.TrimPrefix(digest, "sha256:")
+	}
+	return validateDigest(name, digest, optional)
+}
+
+func validateIdentifier(name, value string, optional bool) error {
+	if value == "" {
+		if optional {
+			return nil
+		}
+		return shoal.NewError(shoal.ErrorInvalidArgument, name+" is required")
+	}
+	if len(value) > MaxIdentifierBytes {
+		return shoal.NewError(
+			shoal.ErrorInvalidArgument, name+" exceeds the public byte bound")
+	}
+	for index := 0; index < len(value); index++ {
+		c := value[index]
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z',
+			c >= '0' && c <= '9':
+		case c == '_', c == '-', c == '.', c == ':', c == '/', c == '@',
+			c == '+':
+		default:
+			return shoal.NewError(
+				shoal.ErrorInvalidArgument,
+				name+" contains an unsupported character",
+			)
+		}
+	}
+	return nil
+}
+
 func validateLabel(label string) error {
 	if label == "" {
 		return shoal.NewError(
@@ -514,6 +550,45 @@ func (s Session) Validate() error {
 	}
 	if err := s.Reason.Validate(); err != nil {
 		return err
+	}
+	if err := validateDigest(
+		"interaction query digest", s.QueryDigest, true,
+	); err != nil {
+		return err
+	}
+	if err := validatePrefixedDigest(
+		"interaction prompt hash", s.Provenance.PromptHash, true,
+	); err != nil {
+		return err
+	}
+	for _, field := range []struct {
+		name  string
+		value string
+	}{
+		{"interaction harness", s.Provenance.Harness},
+		{"interaction provider", s.Provenance.Provider},
+		{"interaction model", s.Provenance.Model},
+		{"interaction model version", s.Provenance.ModelVersion},
+		{"interaction prompt ID", s.Provenance.PromptID},
+		{"interaction prompt version", s.Provenance.PromptVer},
+		{"interaction tool policy", s.Provenance.ToolPolicy},
+		{"interaction stop reason", s.StopReason},
+	} {
+		if err := validateIdentifier(field.name, field.value, true); err != nil {
+			return err
+		}
+	}
+	for _, field := range []struct {
+		name string
+		id   shoal.ID
+	}{
+		{"interaction request ID", s.RequestID},
+		{"interaction context pack ID", s.ContextPackID},
+		{"interaction result ID", s.ResultID},
+	} {
+		if err := shoal.ValidateOptionalID(field.name, field.id); err != nil {
+			return err
+		}
 	}
 	hasExecutionPin := s.SnapshotID != "" || !s.SnapshotAsOf.IsZero() ||
 		s.AuthorizationFingerprint != "" || !s.AuthorizationExpiresAt.IsZero()
@@ -592,8 +667,24 @@ func (s Session) Validate() error {
 			)
 		}
 		turnIndexes[turn.Index] = struct{}{}
+		if turn.InputTokens < 0 || turn.OutputTokens < 0 {
+			return shoal.NewError(
+				shoal.ErrorInvalidArgument,
+				"interaction turn token counts cannot be negative",
+			)
+		}
+		if err := validateIdentifier(
+			"interaction turn decision", turn.Decision, true,
+		); err != nil {
+			return err
+		}
 		if turn.ToolCall == nil {
 			continue
+		}
+		if err := validateIdentifier(
+			"interaction tool kind", turn.ToolCall.Kind, false,
+		); err != nil {
+			return err
 		}
 		for _, id := range turn.ToolCall.RetrievedNodeIDs {
 			if err := shoal.ValidateRequiredID(
@@ -633,6 +724,9 @@ func (s Session) Canonical() (Session, error) {
 			canonical.Turns[index].ToolCall = &call
 		}
 	}
+	sort.Slice(canonical.Turns, func(i, j int) bool {
+		return canonical.Turns[i].Index < canonical.Turns[j].Index
+	})
 	return canonical, nil
 }
 

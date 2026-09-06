@@ -149,6 +149,12 @@ func TestNewGraphRecorderChecksSinkAtSetup(t *testing.T) {
 	) {
 		t.Fatalf("nil sink error = %v", err)
 	}
+	var typedNil *stubSink
+	if _, err := NewGraphRecorder(
+		context.Background(), typedNil,
+	); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("typed-nil sink error = %v", err)
+	}
 
 	writable := &stubSink{}
 	recorder, err := NewGraphRecorder(context.Background(), writable)

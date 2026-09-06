@@ -480,6 +480,33 @@ func TestFutureSourceCannotCollideWithRecordedSessionID(t *testing.T) {
 	}
 }
 
+func TestRecordInteractionExactRetryIsIdempotent(t *testing.T) {
+	ctx := context.Background()
+	corpus, err := explorer.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer corpus.Close()
+	session := interaction.Session{
+		ID:         interaction.DerivedID("session", "idempotent"),
+		RecordedAt: time.Unix(1700000000, 0).UTC(),
+		Operation:  interaction.OperationRetrieval,
+	}
+	if err := corpus.RecordInteraction(ctx, session); err != nil {
+		t.Fatal(err)
+	}
+	if err := corpus.RecordInteraction(ctx, session); err != nil {
+		t.Fatalf("exact retry failed: %v", err)
+	}
+	different := session
+	different.StopReason = "different"
+	if err := corpus.RecordInteraction(
+		ctx, different,
+	); !shoal.IsErrorCode(err, shoal.ErrorConflict) {
+		t.Fatalf("conflicting retry error = %v", err)
+	}
+}
+
 func TestOversizedVisibilityPersistsAcrossRestart(t *testing.T) {
 	ctx := context.Background()
 	dataDir := t.TempDir()

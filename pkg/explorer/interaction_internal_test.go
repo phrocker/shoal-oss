@@ -81,6 +81,7 @@ func TestInteractionWritePreservesUnresolvedIndeterminateOutcome(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	defer corpus.Close()
 	receipt, err := corpus.Ingest(ctx, Source{
 		URI:       "file:///source.txt",
@@ -116,5 +117,41 @@ func TestInteractionWritePreservesUnresolvedIndeterminateOutcome(t *testing.T) {
 		err, shoal.ErrorNotFound,
 	) {
 		t.Fatalf("uncommitted interaction became visible: %v", err)
+	}
+}
+
+func TestInteractionLoadRejectsConflictingLiveVersions(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	corpus, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := interaction.Session{
+		ID:         interaction.DerivedID("session", "conflicting-live"),
+		RecordedAt: time.Unix(1700000000, 0).UTC(),
+		Operation:  interaction.OperationRetrieval,
+	}
+	if err := corpus.RecordInteraction(ctx, session); err != nil {
+		t.Fatal(err)
+	}
+	conflicting := *corpus.interactions[session.ID]
+	conflicting.Session.StopReason = "different"
+	if err := validatePersistedInteraction(conflicting); err != nil {
+		t.Fatal(err)
+	}
+	if err := corpus.writeRecord(
+		interactionRecordRow(session.ID),
+		embeddedRecordInteraction,
+		conflicting,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := corpus.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if reopened, err := Open(dir); err == nil {
+		_ = reopened.Close()
+		t.Fatal("conflicting durable live interaction versions were accepted")
 	}
 }

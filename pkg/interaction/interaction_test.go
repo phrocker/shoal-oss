@@ -289,6 +289,7 @@ func TestSessionValidateRejectsMalformedSessions(t *testing.T) {
 		ID:         interaction.DerivedID("session", "3"),
 		RecordedAt: time.Unix(1700000000, 0).UTC(),
 	}
+
 	if err := valid.Validate(); err != nil {
 		t.Fatal(err)
 	}
@@ -329,6 +330,34 @@ func TestSessionValidateRejectsMalformedSessions(t *testing.T) {
 	expired.AuthorizationExpiresAt = expired.RecordedAt
 	if err := expired.Validate(); err == nil {
 		t.Fatal("expired authorization accepted at record time")
+	}
+}
+
+func TestSessionCanonicalSortsTurnsAndRejectsRawTextFields(t *testing.T) {
+	session := interaction.Session{
+		ID:         interaction.DerivedID("session", "canonical-turns"),
+		RecordedAt: time.Unix(1700000000, 0).UTC(),
+		Operation:  interaction.OperationInference,
+		Turns: []interaction.Turn{
+			{Index: 2, Decision: "stop"},
+			{Index: 0, Decision: "retrieve"},
+		},
+	}
+	canonical, err := session.Canonical()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if canonical.Turns[0].Index != 0 || canonical.Turns[1].Index != 2 {
+		t.Fatalf("canonical turns = %+v", canonical.Turns)
+	}
+	session.QueryDigest = "raw query text"
+	if err := session.Validate(); err == nil {
+		t.Fatal("raw query text was accepted as a digest")
+	}
+	session.QueryDigest = ""
+	session.Turns[0].Decision = "raw model decision"
+	if err := session.Validate(); err == nil {
+		t.Fatal("raw decision text was accepted")
 	}
 }
 

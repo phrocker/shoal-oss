@@ -421,6 +421,19 @@ func (e *Explorer) loadInteractionRecord(row, qualifier, encoded []byte) error {
 	}
 	e.reserveInteractionRecordGraphIDsLocked(
 		record.SessionID, record.Nodes, record.Edges)
+	if !record.Deleted {
+		if live, ok := e.interactionLiveRecords[record.SessionID]; ok {
+			if !reflect.DeepEqual(*live, record) {
+				return shoal.NewError(
+					shoal.ErrorInternal,
+					"stored interaction session has conflicting live versions",
+				)
+			}
+		} else {
+			live := record
+			e.interactionLiveRecords[record.SessionID] = &live
+		}
+	}
 	// A session row is written at most twice: once when the interaction is
 	// recorded and once when it is explicitly deleted. The scan returns raw
 	// cells, so both versions arrive here. Resolve without depending on scan
