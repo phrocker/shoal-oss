@@ -281,6 +281,67 @@ func TestOntologyProposalProjectionRejectsOversizedDiscriminator(t *testing.T) {
 	}
 }
 
+func TestOntologyProposalProjectionRejectsOversizedEvidence(t *testing.T) {
+	schema, err := ontology.NewOntologySchema("evidence", "Evidence", "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	at := time.Date(2026, 9, 6, 2, 0, 0, 0, time.UTC)
+	source, err := ontology.NewPropertyDefinition(
+		"source", "Source", "", ontology.ValueString, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetDefinition, err := ontology.NewPropertyDefinition(
+		"target", "Target", "", ontology.ValueString, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base, err := ontology.NewOntologyVersion(
+		schema, "1", at, nil, nil,
+		[]ontology.PropertyDefinition{source}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target, err := ontology.NewOntologyVersion(
+		schema, "2", at.Add(time.Second), nil, nil,
+		[]ontology.PropertyDefinition{targetDefinition}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	evidence := make([]ontology.EvidenceRef, 0, MaxEvidencePerResult+1)
+	for index := uint32(0); index <= MaxEvidencePerResult; index++ {
+		item, err := ontology.NewEvidenceRef(document.Citation{
+			DocumentID: shoal.ID(fmt.Sprintf("doc-%03d", index)),
+			RevisionID: "rev", SectionID: "section",
+			Range: document.SourceRange{},
+		}, "", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		evidence = append(evidence, item)
+	}
+	morphism, err := ontology.NewOntologyMorphism(ontology.MorphismConfig{
+		Kind: ontology.MorphismRename, SourceVersion: base, TargetVersion: target,
+		Sources: []shoal.ID{source.ID()}, Targets: []shoal.ID{targetDefinition.ID()},
+		Evidence: evidence, Rationale: "oversized public evidence",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	proposal, err := ontology.NewGovernedProposalWithMorphisms(
+		schema, base, target, []ontology.OntologyMorphism{morphism},
+		"author", "proposal", at.Add(2*time.Second), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := projectOntologyProposal(proposal); !shoal.IsErrorCode(
+		err, shoal.ErrorUnavailable,
+	) {
+		t.Fatalf("oversized evidence projection = %v", err)
+	}
+}
+
 func ontologyBoundVersion(t *testing.T, index int) ontology.OntologyVersion {
 	t.Helper()
 	schema, err := ontology.NewOntologySchema("bounded", "Bounded", "", nil)

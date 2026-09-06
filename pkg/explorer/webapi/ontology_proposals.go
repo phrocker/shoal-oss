@@ -796,6 +796,10 @@ func projectOntologyProposalWithEvidence(
 	}
 	for _, morphism := range proposal.Morphisms() {
 		evidence := morphism.Evidence()
+		if uint32(len(evidence)) > MaxEvidencePerResult {
+			return OntologyProposalProjection{}, ontologyBoundError(
+				"morphism evidence", len(evidence), MaxEvidencePerResult)
+		}
 		evidenceIDs := make([]string, len(evidence))
 		evidenceProjected := make([]OntologyMorphismEvidenceProjection, 0)
 		for index, item := range evidence {
