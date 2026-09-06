@@ -210,6 +210,53 @@ func TestIntentStoreCanonicalReplayPagingAndDigestMutation(t *testing.T) {
 	}
 }
 
+func TestRecordAttemptAliasGenerationSurvivesSeparateRFiles(t *testing.T) {
+	directory := testDirectory(t)
+	eng, err := engine.Open(directory, engine.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := eng.CreateTable("coord", engine.TableOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	store, _ := NewEngineStore(eng, "coord")
+	intents, _ := NewIntentStore(coordination.DomainID("domain"), nil, store)
+	key := []byte("document/revision")
+	oldTxn := coordination.TXN("old")
+	newTxn := coordination.TXN("new")
+	if err := intents.SetAttempt(context.Background(), key, nil, oldTxn); err != nil {
+		t.Fatal(err)
+	}
+	if err := eng.Flush("coord"); err != nil {
+		t.Fatal(err)
+	}
+	if err := intents.SetAttempt(context.Background(), key, oldTxn, newTxn); err != nil {
+		t.Fatal(err)
+	}
+	if err := eng.Flush("coord"); err != nil {
+		t.Fatal(err)
+	}
+	if err := eng.Close(); err != nil {
+		t.Fatal(err)
+	}
+	eng, err = engine.Open(directory, engine.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close()
+	store, _ = NewEngineStore(eng, "coord")
+	intents, _ = NewIntentStore(coordination.DomainID("domain"), nil, store)
+	coordinate, _ := intents.attemptCoordinate(key)
+	cells, readErr := store.ReadExact(context.Background(), []allocator.Coordinate{coordinate})
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	got, found, err := intents.Attempt(context.Background(), key)
+	if err != nil || !found || !bytes.Equal(got, newTxn) {
+		t.Fatalf("reopened attempt alias = %q, %v, %v; cells=%#v", got, found, err, cells)
+	}
+}
+
 func TestRuntimeCrashRecoveryAtEveryDurableStage(t *testing.T) {
 	stages := []recoveryStage{
 		recoveryStageIntent,

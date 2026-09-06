@@ -28,6 +28,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"sort"
 
 	"github.com/phrocker/shoal-oss/pkg/explorer/coordination"
@@ -271,7 +272,7 @@ func (s *IntentStore) Load(
 	if len(cells) == 0 {
 		return storedIntent{}, transaction.ErrNotFound
 	}
-	if len(cells) != 1 || cells[0].Timestamp != intentVersion {
+	if len(cells) != 1 || cells[0].Timestamp < intentVersion {
 		return storedIntent{}, fmt.Errorf("%w: durable intent cell is invalid", transaction.ErrInternal)
 	}
 	record, err := decodeStoredIntent(cells[0].Value)
@@ -473,7 +474,7 @@ func (s *IntentStore) Attempt(
 	if len(cells) == 0 {
 		return nil, false, nil
 	}
-	if len(cells) != 1 || cells[0].Timestamp != intentVersion {
+	if len(cells) != 1 || cells[0].Timestamp < intentVersion {
 		return nil, false, fmt.Errorf("%w: record attempt binding is invalid", transaction.ErrInternal)
 	}
 	txn := coordination.TXN(append([]byte(nil), cells[0].Value...))
@@ -493,17 +494,29 @@ func (s *IntentStore) SetAttempt(
 		return err
 	}
 	condition := allocator.Condition{Coordinate: coordinate, Absent: true}
+	generation := int64(intentVersion)
 	if len(previous) != 0 {
-		condition = allocator.Condition{
-			Coordinate: coordinate, Value: previous,
-			Timestamp: intentVersion, TimestampSet: true,
+		cells, readErr := s.store.ReadExact(ctx, []allocator.Coordinate{coordinate})
+		if readErr != nil {
+			return errors.Join(transaction.ErrUnavailable, readErr)
 		}
+		if len(cells) != 1 || !bytes.Equal(cells[0].Value, previous) {
+			return transaction.ErrConflict
+		}
+		if cells[0].Timestamp == math.MaxInt64 {
+			return errors.Join(transaction.ErrInvalid, errors.New("record attempt generation is exhausted"))
+		}
+		condition = allocator.Condition{
+			Coordinate: coordinate, Value: cells[0].Value,
+			Timestamp: cells[0].Timestamp, TimestampSet: true,
+		}
+		generation = cells[0].Timestamp + 1
 	}
 	mutation := allocator.Mutation{
 		Row:        coordinate.Row,
 		Conditions: []allocator.Condition{condition},
 		Updates: []allocator.Update{{
-			Coordinate: coordinate, Value: next, Timestamp: intentVersion,
+			Coordinate: coordinate, Value: next, Timestamp: generation,
 		}},
 	}
 	status, writeErr := s.store.CompareAndMutate(ctx, mutation)
