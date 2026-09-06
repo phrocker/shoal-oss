@@ -161,6 +161,30 @@ func (c *Client) TransitionOntologyProposal(
 	actor, note string,
 	at time.Time,
 ) (ontology.GovernedProposal, error) {
+	return c.transitionOntologyProposal(ctx, proposalID, next, actor, note, at, nil)
+}
+
+// TransitionOntologyProposalWithLimits keeps bounded transitions under the
+// same mutation and evidence authority as the ordinary domain operation.
+func (c *Client) TransitionOntologyProposalWithLimits(
+	ctx context.Context,
+	proposalID shoal.ID,
+	next ontology.ProposalState,
+	actor, note string,
+	at time.Time,
+	limits explorer.OntologyProjectionLimits,
+) (ontology.GovernedProposal, error) {
+	return c.transitionOntologyProposal(ctx, proposalID, next, actor, note, at, &limits)
+}
+
+func (c *Client) transitionOntologyProposal(
+	ctx context.Context,
+	proposalID shoal.ID,
+	next ontology.ProposalState,
+	actor, note string,
+	at time.Time,
+	limits *explorer.OntologyProjectionLimits,
+) (ontology.GovernedProposal, error) {
 	store, err := c.ontologyProposalStore()
 	if err != nil {
 		return ontology.GovernedProposal{}, err
@@ -204,13 +228,26 @@ func (c *Client) TransitionOntologyProposal(
 	if err := guard.Check(ctx); err != nil {
 		return ontology.GovernedProposal{}, err
 	}
-	proposal, err := store.TransitionOntologyProposal(
-		ctx, proposalID, next, actor, note, at)
+	var proposal ontology.GovernedProposal
+	if limits == nil {
+		proposal, err = store.TransitionOntologyProposal(
+			ctx, proposalID, next, actor, note, at)
+	} else {
+		bounded, ok := store.(explorer.OntologyProposalBoundedTransitionStore)
+		if !ok {
+			return ontology.GovernedProposal{}, shoal.NewError(
+				shoal.ErrorUnavailable,
+				"workspace capability \"bounded ontology proposal transitions\" is unavailable",
+			)
+		}
+		proposal, err = bounded.TransitionOntologyProposalWithLimits(
+			ctx, proposalID, next, actor, note, at, *limits)
+	}
 	if err != nil {
 		return ontology.GovernedProposal{}, directBaseError(err)
 	}
 	if err := guard.Check(ctx); err != nil {
-		return ontology.GovernedProposal{}, err
+		return ontology.GovernedProposal{}, explorer.MarkIndeterminateCommit(err)
 	}
 	return proposal, nil
 }

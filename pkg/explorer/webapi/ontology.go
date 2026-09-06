@@ -334,65 +334,19 @@ func ontologyLimits() OntologyDescriptionLimits {
 	}
 }
 
+func ontologyProjectionLimits() explorer.OntologyProjectionLimits {
+	return explorer.OntologyProjectionLimits{
+		MaxConcepts: MaxOntologyConcepts, MaxRelationships: MaxOntologyRelationships,
+		MaxProperties: MaxOntologyProperties, MaxDefinitionProperties: MaxOntologyDefinitionProperties,
+		MaxRelationshipEndpointSets: MaxOntologyRelationshipEndpointSets,
+		MaxConstraintsPerProperty:   MaxOntologyConstraintsPerProperty,
+		MaxAllowedValues:            MaxOntologyAllowedValues, MaxTransitions: MaxOntologyProposalTransitions,
+		MaxMorphismEvidence: MaxEvidencePerResult, MaxDiscriminatorChoices: MaxOntologyConcepts,
+	}
+}
+
 func enforceOntologyBounds(version ontology.OntologyVersion) error {
-	concepts := version.Concepts()
-	if uint32(len(concepts)) > MaxOntologyConcepts {
-		return ontologyBoundError("concept", len(concepts), MaxOntologyConcepts)
-	}
-	relationships := version.Relationships()
-	if uint32(len(relationships)) > MaxOntologyRelationships {
-		return ontologyBoundError(
-			"relationship", len(relationships), MaxOntologyRelationships)
-	}
-	properties := version.Properties()
-	if uint32(len(properties)) > MaxOntologyProperties {
-		return ontologyBoundError("property", len(properties), MaxOntologyProperties)
-	}
-	for _, concept := range concepts {
-		if uint32(len(concept.Properties())) > MaxOntologyDefinitionProperties {
-			return ontologyBoundError(
-				"concept property reference", len(concept.Properties()),
-				MaxOntologyDefinitionProperties,
-			)
-		}
-	}
-	for _, relationship := range relationships {
-		if uint32(len(relationship.FromConcepts())) > MaxOntologyRelationshipEndpointSets {
-			return ontologyBoundError(
-				"relationship source concept reference",
-				len(relationship.FromConcepts()), MaxOntologyRelationshipEndpointSets,
-			)
-		}
-		if uint32(len(relationship.ToConcepts())) > MaxOntologyRelationshipEndpointSets {
-			return ontologyBoundError(
-				"relationship target concept reference",
-				len(relationship.ToConcepts()), MaxOntologyRelationshipEndpointSets,
-			)
-		}
-		if uint32(len(relationship.Properties())) > MaxOntologyDefinitionProperties {
-			return ontologyBoundError(
-				"relationship property reference", len(relationship.Properties()),
-				MaxOntologyDefinitionProperties,
-			)
-		}
-	}
-	for _, property := range properties {
-		constraints := property.Constraints()
-		if uint32(len(constraints)) > MaxOntologyConstraintsPerProperty {
-			return ontologyBoundError(
-				"property constraint", len(constraints),
-				MaxOntologyConstraintsPerProperty,
-			)
-		}
-		for _, constraint := range constraints {
-			allowed := constraint.AllowedValues()
-			if uint32(len(allowed)) > MaxOntologyAllowedValues {
-				return ontologyBoundError(
-					"allowed value", len(allowed), MaxOntologyAllowedValues)
-			}
-		}
-	}
-	return nil
+	return ontologyProjectionLimits().ValidateVersion(version)
 }
 
 func ontologyBoundError(name string, count int, limit uint32) error {
