@@ -237,6 +237,14 @@ func TestHTTPWorkspaceSettingsRoundTripAuthorizationAndRestart(t *testing.T) {
 		t.Fatalf("cross-origin PUT status = %d, body = %s",
 			response.Code, response.Body.String())
 	}
+	response = settingsRequest(
+		t, handler, http.MethodPut,
+		"/api/v1/workspaces/"+workspacePath+"/settings",
+		body, "owner", "https://example.test")
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("cross-scheme PUT status = %d, body = %s",
+			response.Code, response.Body.String())
+	}
 
 	if err := store.Close(); err != nil {
 		t.Fatal(err)

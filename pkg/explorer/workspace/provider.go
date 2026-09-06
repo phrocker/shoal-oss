@@ -1081,7 +1081,10 @@ func ensureMonotonic(previous, next Narrowing) error {
 		widenedIDSelection(previous.PermittedPolicyIDs, next.PermittedPolicyIDs) ||
 		widenedBudgets(previous.Budgets, next.Budgets) ||
 		!policySubset(previous.OutputPolicies, next.OutputPolicies) ||
-		(previous.SelectedOntology.Present && !next.SelectedOntology.Present) {
+		(previous.SelectedOntology.Present &&
+			(!next.SelectedOntology.Present ||
+				next.SelectedOntology.Identity !=
+					previous.SelectedOntology.Identity)) {
 		return authDenied()
 	}
 	return nil

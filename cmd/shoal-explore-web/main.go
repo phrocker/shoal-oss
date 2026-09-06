@@ -737,14 +737,14 @@ func openService(
 			workspaceSettingsStoreDir(config.data))
 		if err != nil {
 			store.Close()
-			corpus.Close()
+			embedded.Close()
 			return closed, err
 		}
 		choices, err := webapi.NewGovernedOntologyChoices(service)
 		if err != nil {
 			settingsStore.Close()
 			store.Close()
-			corpus.Close()
+			embedded.Close()
 			return closed, err
 		}
 		settingsProvider, err := workspace.NewProvider(
@@ -759,7 +759,7 @@ func openService(
 		if err != nil {
 			settingsStore.Close()
 			store.Close()
-			corpus.Close()
+			embedded.Close()
 			return closed, err
 		}
 		return openedService{
