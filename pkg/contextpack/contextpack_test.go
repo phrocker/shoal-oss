@@ -34,6 +34,7 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/graph"
 	"github.com/phrocker/shoal-oss/pkg/inference"
+	"github.com/phrocker/shoal-oss/pkg/interaction"
 	"github.com/phrocker/shoal-oss/pkg/retrieval"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
@@ -827,6 +828,33 @@ func TestHydratedDuplicatesRequireExactContentAndRequestedIdentity(t *testing.T)
 		Selection: EvidenceSelection{Documents: true}, Pins: pins,
 	})
 	assertCode(t, err, shoal.ErrorInvalidArgument)
+}
+
+func TestVerifyGraphRejectsDigestOnlyEdgeVisibility(t *testing.T) {
+	nodes := []graph.Node{{ID: "left"}, {ID: "right"}}
+	edge := graph.Edge{
+		ID: "edge", From: "left", To: "right", Type: "related", Weight: 1,
+		Properties: shoal.Metadata{
+			interaction.PropertyVisibilityDigest: interaction.Digest("secret"),
+			interaction.PropertyVisibilityCount:  "1",
+		},
+	}
+	path := graph.Path{Nodes: nodes, Edges: []graph.Edge{edge}}
+	anchor, err := inference.NewGraphAnchor(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	limits := mustLimits(t, Limits{})
+	verifier, err := newVerifier(
+		context.Background(), nil, limits, nil,
+		[]explorer.Neighborhood{{Nodes: nodes, Edges: []graph.Edge{edge}}},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := verifier.verifyAnchor(anchor, false); !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
+		t.Fatalf("digest-only edge visibility error = %v", err)
+	}
 }
 
 func TestOpenSectionSkipsValidEmptySpans(t *testing.T) {
