@@ -59,10 +59,8 @@ func TestPublishedOntologyRemainsDurableWhenFinalGenerationGuardFails(t *testing
 	generation := int64(1)
 	baseClient := &generationChangingProposalBase{
 		Explorer: corpus,
-		after: func(next ontology.ProposalState) {
-			if next == ontology.ProposalPublished {
-				generation = 2
-			}
+		afterEvidence: func() {
+			generation = 2
 		},
 	}
 	selector, err := NewStaticPolicySelector([]byte("source"), []byte("policy"))
@@ -100,9 +98,30 @@ func TestPublishedOntologyRemainsDurableWhenFinalGenerationGuardFails(t *testing
 		ctx, proposal.ID(), ontology.ProposalPublished,
 		"governor", "published", at.Add(5*time.Second))
 	if !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
-		t.Fatalf("post-commit generation change = %v, want unavailable", err)
+		t.Fatalf("pre-commit generation change = %v, want unavailable", err)
 	}
 	stored, err := corpus.OntologyProposals(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stored) != 1 || stored[0].State() != ontology.ProposalApproved {
+		t.Fatalf("proposal changed after pre-commit guard failure = %#v", stored)
+	}
+
+	generation = 1
+	baseClient.afterEvidence = nil
+	baseClient.after = func(next ontology.ProposalState) {
+		if next == ontology.ProposalPublished {
+			generation = 2
+		}
+	}
+	_, err = client.TransitionOntologyProposal(
+		ctx, proposal.ID(), ontology.ProposalPublished,
+		"governor", "published", at.Add(5*time.Second))
+	if !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
+		t.Fatalf("post-commit generation change = %v, want unavailable", err)
+	}
+	stored, err = corpus.OntologyProposals(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -280,7 +299,19 @@ func TestOntologyProposalEvidenceRequiresObjectAuthorization(t *testing.T) {
 
 type generationChangingProposalBase struct {
 	*explorer.Explorer
-	after func(ontology.ProposalState)
+	after         func(ontology.ProposalState)
+	afterEvidence func()
+}
+
+func (b *generationChangingProposalBase) OntologyProposalEvidence(
+	ctx context.Context,
+	proposalID shoal.ID,
+) ([]ontology.EvidenceRef, bool, error) {
+	evidence, found, err := b.Explorer.OntologyProposalEvidence(ctx, proposalID)
+	if err == nil && b.afterEvidence != nil {
+		b.afterEvidence()
+	}
+	return evidence, found, err
 }
 
 func (b *generationChangingProposalBase) TransitionOntologyProposal(

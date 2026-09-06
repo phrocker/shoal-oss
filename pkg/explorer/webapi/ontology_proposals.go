@@ -819,6 +819,13 @@ func projectOntologyProposalWithEvidence(
 		if morphism.Kind() == ontology.MorphismSplit {
 			value := morphism.Discriminator()
 			choices := value.Choices()
+			if uint32(len(choices)) > MaxOntologyConcepts {
+				return OntologyProposalProjection{}, ontologyBoundError(
+					"morphism discriminator choice",
+					len(choices),
+					MaxOntologyConcepts,
+				)
+			}
 			projectedChoices := make(map[string]string, len(choices))
 			for choice, id := range choices {
 				projectedChoices[choice] = encodeID(id)

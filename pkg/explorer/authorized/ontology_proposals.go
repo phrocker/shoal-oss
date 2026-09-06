@@ -176,6 +176,9 @@ func (c *Client) TransitionOntologyProposal(
 			return ontology.GovernedProposal{}, auth.ObjectNotFound()
 		}
 	}
+	if err := guard.Check(ctx); err != nil {
+		return ontology.GovernedProposal{}, err
+	}
 	proposal, err := store.TransitionOntologyProposal(
 		ctx, proposalID, next, actor, note, at)
 	if err != nil {

@@ -24,6 +24,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/phrocker/shoal-oss/pkg/document"
 	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/ontology"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
@@ -206,6 +207,77 @@ func TestOntologyProposalBoundIsAtomicAcrossServices(t *testing.T) {
 	proposals, err := corpus.OntologyProposals(ctx)
 	if err != nil || len(proposals) != int(MaxOntologyProposals) {
 		t.Fatalf("final proposal count = %d, %v", len(proposals), err)
+	}
+}
+
+func TestOntologyProposalProjectionRejectsOversizedDiscriminator(t *testing.T) {
+	schema, err := ontology.NewOntologySchema("split", "Split", "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	at := time.Date(2026, 9, 6, 1, 0, 0, 0, time.UTC)
+	source, err := ontology.NewPropertyDefinition(
+		"source", "Source", "", ontology.ValueString, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base, err := ontology.NewOntologyVersion(
+		schema, "1", at, nil, nil,
+		[]ontology.PropertyDefinition{source}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	targets := make([]ontology.PropertyDefinition, 0, MaxOntologyConcepts+1)
+	targetIDs := make([]shoal.ID, 0, MaxOntologyConcepts+1)
+	choices := make(map[string]shoal.ID, MaxOntologyConcepts+1)
+	for index := uint32(0); index <= MaxOntologyConcepts; index++ {
+		property, err := ontology.NewPropertyDefinition(
+			fmt.Sprintf("target-%03d", index),
+			fmt.Sprintf("Target %03d", index),
+			"", ontology.ValueString, nil, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		targets = append(targets, property)
+		targetIDs = append(targetIDs, property.ID())
+		choices[fmt.Sprintf("choice-%03d", index)] = property.ID()
+	}
+	target, err := ontology.NewOntologyVersion(
+		schema, "2", at.Add(time.Second), nil, nil, targets, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	discriminator, err := ontology.NewMorphismDiscriminator("kind", choices)
+	if err != nil {
+		t.Fatal(err)
+	}
+	evidence, err := ontology.NewEvidenceRef(document.Citation{
+		DocumentID: "doc", RevisionID: "rev", SectionID: "section",
+		Range: document.SourceRange{},
+	}, "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	morphism, err := ontology.NewOntologyMorphism(ontology.MorphismConfig{
+		Kind: ontology.MorphismSplit, SourceVersion: base, TargetVersion: target,
+		Sources: []shoal.ID{source.ID()}, Targets: targetIDs,
+		Discriminator: discriminator,
+		Evidence:      []ontology.EvidenceRef{evidence},
+		Rationale:     "oversized public discriminator",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	proposal, err := ontology.NewGovernedProposalWithMorphisms(
+		schema, base, target, []ontology.OntologyMorphism{morphism},
+		"author", "proposal", at.Add(2*time.Second), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := projectOntologyProposal(proposal); !shoal.IsErrorCode(
+		err, shoal.ErrorUnavailable,
+	) {
+		t.Fatalf("oversized discriminator projection = %v", err)
 	}
 }
 
