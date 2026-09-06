@@ -48,6 +48,8 @@ type Explorer struct {
 	edges                   map[shoal.ID]persistedEdge
 	interactions            map[shoal.ID]*persistedInteraction
 	folds                   map[shoal.ID]*persistedFold
+	interactionNodeIDs      map[shoal.ID]struct{}
+	interactionEdgeIDs      map[shoal.ID]struct{}
 	extractions             map[shoal.ID]*persistedExtraction
 	ontologyProposals       map[shoal.ID]*persistedOntologyProposal
 	graphNodes              map[shoal.ID]graph.Node
@@ -200,6 +202,8 @@ func OpenWithOptions(dir string, options Options) (*Explorer, error) {
 		edges:                   make(map[shoal.ID]persistedEdge),
 		interactions:            make(map[shoal.ID]*persistedInteraction),
 		folds:                   make(map[shoal.ID]*persistedFold),
+		interactionNodeIDs:      make(map[shoal.ID]struct{}),
+		interactionEdgeIDs:      make(map[shoal.ID]struct{}),
 		extractions:             make(map[shoal.ID]*persistedExtraction),
 		ontologyProposals:       make(map[shoal.ID]*persistedOntologyProposal),
 		embedder:                options.Embedder,
@@ -501,6 +505,12 @@ func (e *Explorer) Connect(ctx context.Context, edge graph.Edge) error {
 	}
 	if err := validatePersistedEdge(edge); err != nil {
 		return err
+	}
+	if interaction.IsInteractionID(edge.ID) {
+		return shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			"applications cannot use the reserved interaction edge ID namespace",
+		)
 	}
 	if interaction.IsInteractionEdgeType(edge.Type) {
 		return shoal.NewError(

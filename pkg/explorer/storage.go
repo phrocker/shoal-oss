@@ -419,6 +419,8 @@ func (e *Explorer) loadInteractionRecord(row, qualifier, encoded []byte) error {
 		return shoal.NewError(
 			shoal.ErrorInternal, "stored explorer interaction row is invalid")
 	}
+	e.reserveInteractionRecordGraphIDsLocked(
+		record.SessionID, record.Nodes, record.Edges)
 	// A session row is written at most twice: once when the interaction is
 	// recorded and once when it is explicitly deleted. The scan returns raw
 	// cells, so both versions arrive here. Resolve without depending on scan
@@ -452,6 +454,8 @@ func (e *Explorer) loadFoldRecord(row, qualifier, encoded []byte) error {
 		return shoal.NewError(
 			shoal.ErrorInternal, "stored explorer fold row is invalid")
 	}
+	e.reserveInteractionRecordGraphIDsLocked(
+		record.FoldID, record.Nodes, record.Edges)
 	// A fold row is written at most twice: once when it is folded and once
 	// when it is explicitly deleted. The scan returns raw cells, so both
 	// versions arrive here. A tombstone is terminal because a deleted fold ID

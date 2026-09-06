@@ -63,21 +63,22 @@ type Config struct {
 
 // Client enforces trusted-context authorization around an Explorer client.
 type Client struct {
-	base               explorer.Client
-	vectorScorer       VectorScorer
-	interactionSource  explorer.InteractionReader
-	resolver           auth.Resolver
-	policySelector     PolicySelector
-	edgePolicySelector EdgePolicySelector
-	policyStore        PolicyStore
-	generationReader   auth.GenerationReader
-	clock              func() time.Time
-	mosaic             MosaicBudget
-	ledger             CoOccurrenceLedger
-	mutationMu         sync.Mutex
-	vectorMu           sync.Mutex
-	budgetMu           sync.Mutex
-	vectorAvailability authorizedVectorAvailabilityCache
+	base                explorer.Client
+	vectorScorer        VectorScorer
+	vectorSpaceResolver VectorEmbeddingSpaceResolver
+	interactionSource   explorer.InteractionReader
+	resolver            auth.Resolver
+	policySelector      PolicySelector
+	edgePolicySelector  EdgePolicySelector
+	policyStore         PolicyStore
+	generationReader    auth.GenerationReader
+	clock               func() time.Time
+	mosaic              MosaicBudget
+	ledger              CoOccurrenceLedger
+	mutationMu          sync.Mutex
+	vectorMu            sync.Mutex
+	budgetMu            sync.Mutex
+	vectorAvailability  authorizedVectorAvailabilityCache
 }
 
 type authorizedVectorAvailabilityCache struct {
@@ -107,6 +108,16 @@ func NewClient(config Config) (*Client, error) {
 	if config.Clock == nil {
 		return nil, dependencyRequired("clock")
 	}
+	var vectorSpaceResolver VectorEmbeddingSpaceResolver
+	if !isNilDependency(config.VectorScorer) {
+		var ok bool
+		vectorSpaceResolver, ok =
+			config.VectorScorer.(VectorEmbeddingSpaceResolver)
+		if !ok || isNilDependency(vectorSpaceResolver) {
+			return nil, dependencyRequired(
+				"trusted vector embedding provenance")
+		}
+	}
 	edgeSelector := config.EdgePolicySelector
 	if isNilDependency(edgeSelector) {
 		var ok bool
@@ -127,17 +138,18 @@ func NewClient(config Config) (*Client, error) {
 		}
 	}
 	return &Client{
-		base:               config.Base,
-		vectorScorer:       config.VectorScorer,
-		interactionSource:  config.InteractionReader,
-		resolver:           config.Resolver,
-		policySelector:     config.PolicySelector,
-		edgePolicySelector: edgeSelector,
-		policyStore:        config.PolicyStore,
-		generationReader:   config.GenerationReader,
-		clock:              config.Clock,
-		mosaic:             config.Mosaic,
-		ledger:             ledger,
+		base:                config.Base,
+		vectorScorer:        config.VectorScorer,
+		vectorSpaceResolver: vectorSpaceResolver,
+		interactionSource:   config.InteractionReader,
+		resolver:            config.Resolver,
+		policySelector:      config.PolicySelector,
+		edgePolicySelector:  edgeSelector,
+		policyStore:         config.PolicyStore,
+		generationReader:    config.GenerationReader,
+		clock:               config.Clock,
+		mosaic:              config.Mosaic,
+		ledger:              ledger,
 	}, nil
 }
 

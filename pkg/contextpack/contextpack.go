@@ -1042,6 +1042,10 @@ func EmbeddingSpaceID(pack inference.ContextPack) (shoal.ID, bool, error) {
 	if err != nil {
 		return "", false, err
 	}
+	if found != (len(constituents) > 0) {
+		return "", false, invalid(
+			"context embedding space requires aggregate and constituents")
+	}
 	if len(constituents) > 0 {
 		expected, deriveErr := retrieval.EmbeddingSpaceSetID(constituents...)
 		if deriveErr != nil {
@@ -1183,7 +1187,7 @@ func MergeEmbeddingSpaceMetadata(
 			return nil, invalid(
 				"context embedding space set identity is not canonical")
 		}
-	} else if found && len(next) > 0 {
+	} else if found {
 		return nil, invalid(
 			"aggregate-only embedding space provenance cannot be merged")
 	}

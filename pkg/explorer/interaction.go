@@ -232,6 +232,8 @@ func (e *Explorer) RecordInteraction(
 	); err != nil {
 		return err
 	}
+	e.reserveInteractionRecordGraphIDsLocked(
+		record.SessionID, record.Nodes, record.Edges)
 	e.interactions[session.ID] = &record
 	if err := e.rebuildCurrentGraphLocked(); err != nil {
 		return MarkCommittedInteraction(err)
@@ -243,6 +245,12 @@ func (e *Explorer) requireInteractionGraphIDsAvailableLocked(
 	nodes []graph.Node, edges []graph.Edge,
 ) error {
 	for _, node := range nodes {
+		if _, exists := e.interactionNodeIDs[node.ID]; exists {
+			return shoal.NewError(
+				shoal.ErrorConflict,
+				"interaction node ID is already reserved "+string(node.ID),
+			)
+		}
 		if existing, ok := e.graphNodes[node.ID]; ok {
 			return shoal.NewError(
 				shoal.ErrorConflict,
@@ -252,6 +260,12 @@ func (e *Explorer) requireInteractionGraphIDsAvailableLocked(
 		}
 	}
 	for _, edge := range edges {
+		if _, exists := e.interactionEdgeIDs[edge.ID]; exists {
+			return shoal.NewError(
+				shoal.ErrorConflict,
+				"interaction edge ID is already reserved "+string(edge.ID),
+			)
+		}
 		if existing, ok := e.graphEdges[edge.ID]; ok {
 			return shoal.NewError(
 				shoal.ErrorConflict,
@@ -266,26 +280,8 @@ func (e *Explorer) requireInteractionGraphIDsAvailableLocked(
 func (e *Explorer) requireSourceGraphIDsAvailableLocked(
 	nodes []graph.Node, edges []graph.Edge,
 ) error {
-	nodeIDs := make(map[shoal.ID]struct{})
-	edgeIDs := make(map[shoal.ID]struct{})
-	for _, record := range e.interactions {
-		for _, node := range record.Nodes {
-			nodeIDs[node.ID] = struct{}{}
-		}
-		for _, edge := range record.Edges {
-			edgeIDs[edge.ID] = struct{}{}
-		}
-	}
-	for _, record := range e.folds {
-		for _, node := range record.Nodes {
-			nodeIDs[node.ID] = struct{}{}
-		}
-		for _, edge := range record.Edges {
-			edgeIDs[edge.ID] = struct{}{}
-		}
-	}
 	for _, node := range nodes {
-		if _, exists := nodeIDs[node.ID]; exists {
+		if _, exists := e.interactionNodeIDs[node.ID]; exists {
 			return shoal.NewError(
 				shoal.ErrorConflict,
 				"source node ID collides with an interaction node",
@@ -293,7 +289,7 @@ func (e *Explorer) requireSourceGraphIDsAvailableLocked(
 		}
 	}
 	for _, edge := range edges {
-		if _, exists := edgeIDs[edge.ID]; exists {
+		if _, exists := e.interactionEdgeIDs[edge.ID]; exists {
 			return shoal.NewError(
 				shoal.ErrorConflict,
 				"source edge ID collides with an interaction edge",
@@ -301,6 +297,25 @@ func (e *Explorer) requireSourceGraphIDsAvailableLocked(
 		}
 	}
 	return nil
+}
+
+func (e *Explorer) reserveInteractionGraphIDsLocked(
+	nodes []graph.Node, edges []graph.Edge,
+) {
+	for _, node := range nodes {
+		e.interactionNodeIDs[node.ID] = struct{}{}
+	}
+	for _, edge := range edges {
+		e.interactionEdgeIDs[edge.ID] = struct{}{}
+	}
+}
+
+func (e *Explorer) reserveInteractionRecordGraphIDsLocked(
+	recordID shoal.ID, nodes []graph.Node, edges []graph.Edge,
+) {
+	e.reserveInteractionGraphIDsLocked(nodes, edges)
+	e.interactionNodeIDs[recordID] = struct{}{}
+	e.interactionNodeIDs[interaction.TombstoneID(recordID)] = struct{}{}
 }
 
 // RecordInteractionResult records a session and returns the exact canonical
@@ -374,10 +389,12 @@ func (e *Explorer) DeleteInteraction(
 	if err != nil {
 		return interaction.Tombstone{}, err
 	}
-	if err := e.requireInteractionGraphIDsAvailableLocked(
-		[]graph.Node{node}, nil,
-	); err != nil {
-		return interaction.Tombstone{}, err
+	if existingNode, exists := e.graphNodes[node.ID]; exists {
+		return interaction.Tombstone{}, shoal.NewError(
+			shoal.ErrorConflict,
+			"interaction tombstone ID collides with existing graph node "+
+				string(existingNode.ID),
+		)
 	}
 	record := persistedInteraction{
 		SessionID:                sessionID,
@@ -403,6 +420,8 @@ func (e *Explorer) DeleteInteraction(
 	); err != nil {
 		return interaction.Tombstone{}, err
 	}
+	e.reserveInteractionRecordGraphIDsLocked(
+		record.SessionID, record.Nodes, record.Edges)
 	e.interactions[sessionID] = &record
 	if err := e.rebuildCurrentGraphLocked(); err != nil {
 		return interaction.Tombstone{}, MarkCommittedInteraction(err)

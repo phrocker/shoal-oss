@@ -63,18 +63,17 @@ type VectorScorer interface {
 	) (map[shoal.ID]shoal.Score, error)
 }
 
-type vectorEmbeddingSpaceResolver interface {
+// VectorEmbeddingSpaceResolver reports the canonical trusted vector-space
+// constituents used for the same request passed to VectorScorer.
+type VectorEmbeddingSpaceResolver interface {
 	VectorEmbeddingSpaceIDs(
 		context.Context, explorer.VectorScoreRequest,
 	) ([]shoal.ID, error)
 }
 
 func (c *Client) authorizedVectorScoringAvailable() bool {
-	if isNilDependency(c.vectorScorer) {
-		return false
-	}
-	resolver, ok := c.vectorScorer.(vectorEmbeddingSpaceResolver)
-	return ok && !isNilDependency(resolver)
+	return !isNilDependency(c.vectorScorer) &&
+		!isNilDependency(c.vectorSpaceResolver)
 }
 
 func (c *Client) probeAuthorizedVector(
@@ -96,14 +95,14 @@ func (c *Client) probeAuthorizedVector(
 	if err != nil {
 		return nil, directBaseError(err)
 	}
-	resolver, ok := c.vectorScorer.(vectorEmbeddingSpaceResolver)
-	if !ok || isNilDependency(resolver) {
+	if isNilDependency(c.vectorSpaceResolver) {
 		return nil, shoal.NewError(
 			shoal.ErrorUnavailable,
 			"authorized vector retrieval requires trusted embedding provenance",
 		)
 	}
-	ids, err := resolver.VectorEmbeddingSpaceIDs(ctx, scoreRequest)
+	ids, err := c.vectorSpaceResolver.VectorEmbeddingSpaceIDs(
+		ctx, scoreRequest)
 	if err != nil {
 		return nil, directBaseError(err)
 	}
@@ -502,14 +501,13 @@ func (c *Client) authorizedVectorScores(
 	if len(scores) != len(citations) {
 		return nil, nil, inconsistentRetrieval()
 	}
-	resolver, ok := c.vectorScorer.(vectorEmbeddingSpaceResolver)
-	if !ok || isNilDependency(resolver) {
+	if isNilDependency(c.vectorSpaceResolver) {
 		return nil, nil, shoal.NewError(
 			shoal.ErrorUnavailable,
 			"authorized vector retrieval requires trusted embedding provenance",
 		)
 	}
-	embeddingSpaceIDs, err := resolver.VectorEmbeddingSpaceIDs(
+	embeddingSpaceIDs, err := c.vectorSpaceResolver.VectorEmbeddingSpaceIDs(
 		ctx, scoreRequest)
 	if err != nil {
 		return nil, nil, directBaseError(err)

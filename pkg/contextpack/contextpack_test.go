@@ -147,6 +147,18 @@ func TestBuildPinsEmbeddingSpaceIdentity(t *testing.T) {
 	if !ok || identity != response.EmbeddingSpaceID {
 		t.Fatalf("embedding space = %q, %t", identity, ok)
 	}
+	malformedMetadata := pack.Metadata()
+	delete(malformedMetadata, metadataEmbeddingSpacesKey)
+	malformed, err := inference.NewContextPack(
+		pack.Query(), pack.Evidence(), nil, pack.Snapshot(),
+		pack.Authorization(), malformedMetadata,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := EmbeddingSpaceID(malformed); err == nil {
+		t.Fatal("aggregate-only context metadata was accepted")
+	}
 	constituents, err := EmbeddingSpaceIDs(pack)
 	if err != nil {
 		t.Fatal(err)
@@ -241,6 +253,9 @@ func TestMergeEmbeddingSpaceMetadataIsASetUnion(t *testing.T) {
 		legacy, []shoal.ID{spaceA},
 	); err == nil {
 		t.Fatal("aggregate-only provenance was merged without constituents")
+	}
+	if _, err := MergeEmbeddingSpaceMetadata(legacy, nil); err == nil {
+		t.Fatal("aggregate-only provenance survived an empty merge")
 	}
 }
 
