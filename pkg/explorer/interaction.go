@@ -21,12 +21,14 @@ package explorer
 
 import (
 	"context"
+	"math"
 	"reflect"
 	"sort"
 	"time"
 
 	"github.com/phrocker/shoal-oss/pkg/graph"
 	"github.com/phrocker/shoal-oss/pkg/interaction"
+	"github.com/phrocker/shoal-oss/pkg/ontology"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
@@ -40,6 +42,8 @@ type InteractionSummary struct {
 	SnapshotAsOf             time.Time
 	AuthorizationFingerprint shoal.ID
 	AuthorizationExpiresAt   time.Time
+	OntologySchemaID         shoal.ID
+	OntologyVersionID        shoal.ID
 	EmbeddingSpaceID         shoal.ID
 	Operation                interaction.Operation
 	Actor                    interaction.ActorContext
@@ -67,6 +71,8 @@ type persistedInteraction struct {
 	SnapshotAsOf             time.Time
 	AuthorizationFingerprint shoal.ID
 	AuthorizationExpiresAt   time.Time
+	OntologySchemaID         shoal.ID
+	OntologyVersionID        shoal.ID
 	EmbeddingSpaceID         shoal.ID
 	Operation                interaction.Operation
 	Actor                    interaction.ActorContext
@@ -101,6 +107,14 @@ type InteractionResultWriter interface {
 	) (interaction.Session, error)
 }
 
+// InteractionEvidenceVerifier validates exact graph evidence without scanning
+// unrelated adjacency entries.
+type InteractionEvidenceVerifier interface {
+	VerifyInteractionEvidence(
+		context.Context, []graph.Node, []graph.Edge, []interaction.AssertionEvidence,
+	) error
+}
+
 // InteractionReader is the explicit opt-in surface for derived interaction
 // data. These methods are intentionally absent from Client, so source
 // retrieval cannot begin returning derived nodes by interface expansion.
@@ -120,6 +134,7 @@ func (e *Explorer) EnsureInteractionSink(ctx context.Context) error {
 	if err := contextError(ctx); err != nil {
 		return err
 	}
+
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if err := e.requireOpen(); err != nil {
@@ -145,6 +160,108 @@ func (e *Explorer) EnsureInteractionSink(ctx context.Context) error {
 		)
 	}
 	return nil
+}
+
+// VerifyInteractionEvidence compares supplied evidence with the current exact
+// graph indexes. Lookup work is linear only in the supplied evidence.
+func (e *Explorer) VerifyInteractionEvidence(
+	ctx context.Context,
+	nodes []graph.Node,
+	edges []graph.Edge,
+	assertions []interaction.AssertionEvidence,
+) error {
+	if err := contextError(ctx); err != nil {
+		return err
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if err := e.requireOpen(); err != nil {
+		return err
+	}
+	if err := e.ensureGraphLocked(); err != nil {
+		return err
+	}
+	for _, node := range nodes {
+		actual, ok := e.graphNodes[node.ID]
+		if !ok || !exactInteractionNodeEqual(actual, node) {
+			return shoal.NewError(shoal.ErrorNotFound, "interaction evidence node not found")
+		}
+	}
+	for _, edge := range edges {
+		actual, ok := e.graphEdges[edge.ID]
+		if !ok || !exactInteractionEdgeEqual(actual, edge) {
+			return shoal.NewError(shoal.ErrorNotFound, "interaction evidence edge not found")
+		}
+	}
+	for _, evidence := range assertions {
+		key := evidence.ID
+		if evidence.GraphEdgeID != "" {
+			key = evidence.GraphEdgeID
+		}
+		assertion, ok := e.graphAssertions[key]
+		if !ok || !interaction.AssertionEvidenceEqual(
+			assertionInteractionEvidence(assertion), evidence,
+		) {
+			return shoal.NewError(
+				shoal.ErrorNotFound, "interaction evidence assertion not found")
+		}
+	}
+	return nil
+}
+
+func exactInteractionNodeEqual(left, right graph.Node) bool {
+	if left.ID != right.ID || left.Kind != right.Kind ||
+		len(left.Labels) != len(right.Labels) ||
+		len(left.Properties) != len(right.Properties) {
+		return false
+	}
+	for index := range left.Labels {
+		if left.Labels[index] != right.Labels[index] {
+			return false
+		}
+	}
+	for key, value := range left.Properties {
+		rightValue, ok := right.Properties[key]
+		if !ok || rightValue != value {
+			return false
+		}
+	}
+	return true
+}
+
+func exactInteractionEdgeEqual(left, right graph.Edge) bool {
+	if left.ID != right.ID || left.From != right.From || left.To != right.To ||
+		left.Type != right.Type ||
+		math.Float64bits(float64(left.Weight)) !=
+			math.Float64bits(float64(right.Weight)) ||
+		len(left.Properties) != len(right.Properties) {
+		return false
+	}
+	for key, value := range left.Properties {
+		rightValue, ok := right.Properties[key]
+		if !ok || rightValue != value {
+			return false
+		}
+	}
+	return true
+}
+
+func assertionInteractionEvidence(assertion ontology.Assertion) interaction.AssertionEvidence {
+	target, _ := assertion.Object().ReferenceValue()
+	evidence := interaction.AssertionEvidence{
+		ID: assertion.ID(), Subject: assertion.Subject(),
+		Predicate: assertion.Predicate(), ObjectReference: target,
+		Origin: string(assertion.Origin()), Confidence: assertion.Confidence(),
+		GraphEdgeID: shoal.ID(assertion.Metadata()[graphAssertionEdgeIDMetadata]),
+	}
+	for _, item := range assertion.Evidence() {
+		if derivation, ok := item.Derivation(); ok {
+			evidence.DerivationID = derivation.ID()
+			evidence.DerivationScore = derivation.Score()
+			break
+		}
+	}
+	return evidence
 }
 
 // RecordInteraction durably stores one interaction session as reserved
@@ -225,6 +342,8 @@ func (e *Explorer) RecordInteraction(
 		SnapshotAsOf:             session.SnapshotAsOf,
 		AuthorizationFingerprint: session.AuthorizationFingerprint,
 		AuthorizationExpiresAt:   session.AuthorizationExpiresAt,
+		OntologySchemaID:         session.OntologySchemaID,
+		OntologyVersionID:        session.OntologyVersionID,
 		EmbeddingSpaceID:         session.EmbeddingSpaceID,
 		Operation:                session.Operation,
 		Actor:                    session.Actor,
@@ -532,6 +651,8 @@ func (e *Explorer) DeleteInteraction(
 		SnapshotAsOf:             existing.SnapshotAsOf,
 		AuthorizationFingerprint: existing.AuthorizationFingerprint,
 		AuthorizationExpiresAt:   existing.AuthorizationExpiresAt,
+		OntologySchemaID:         existing.OntologySchemaID,
+		OntologyVersionID:        existing.OntologyVersionID,
 		EmbeddingSpaceID:         existing.EmbeddingSpaceID,
 		Operation:                existing.Operation,
 		Actor:                    existing.Actor,
@@ -967,6 +1088,8 @@ func validatePersistedInteraction(record persistedInteraction) error {
 				record.AuthorizationFingerprint ||
 			!record.Session.AuthorizationExpiresAt.UTC().Equal(
 				record.AuthorizationExpiresAt.UTC()) ||
+			record.Session.OntologySchemaID != record.OntologySchemaID ||
+			record.Session.OntologyVersionID != record.OntologyVersionID ||
 			record.Session.EmbeddingSpaceID != record.EmbeddingSpaceID {
 			return shoal.NewError(
 				shoal.ErrorInternal,
@@ -983,6 +1106,15 @@ func validatePersistedInteraction(record persistedInteraction) error {
 			return shoal.NewError(
 				shoal.ErrorInternal,
 				"stored interaction actor metadata does not match its envelope",
+			)
+		}
+		if !visibilityCovered(
+			record.Visibility,
+			interaction.Expression(record.Session.RequiredVisibility),
+		) {
+			return shoal.NewError(
+				shoal.ErrorInternal,
+				"stored interaction visibility omits required policy labels",
 			)
 		}
 	}
@@ -1020,6 +1152,9 @@ func cloneInteractionSession(session interaction.Session) interaction.Session {
 	cloned.Actor = cloneActorContext(session.Actor)
 	cloned.SeedNodeIDs = append([]shoal.ID(nil), session.SeedNodeIDs...)
 	cloned.CitedNodeIDs = append([]shoal.ID(nil), session.CitedNodeIDs...)
+	cloned.CitedEdges = cloneInteractionSourceEdges(session.CitedEdges)
+	cloned.RequiredVisibility = append(
+		[]string(nil), session.RequiredVisibility...)
 	cloned.Turns = make([]interaction.Turn, len(session.Turns))
 	for index, turn := range session.Turns {
 		cloned.Turns[index] = turn
@@ -1027,6 +1162,17 @@ func cloneInteractionSession(session interaction.Session) interaction.Session {
 			call := *turn.ToolCall
 			call.RetrievedNodeIDs = append(
 				[]shoal.ID(nil), turn.ToolCall.RetrievedNodeIDs...)
+			call.RetrievedNodes = make(
+				[]graph.Node, len(turn.ToolCall.RetrievedNodes))
+			for nodeIndex, node := range turn.ToolCall.RetrievedNodes {
+				call.RetrievedNodes[nodeIndex] = cloneNode(node)
+			}
+			call.RetrievedEdges = cloneInteractionSourceEdges(
+				turn.ToolCall.RetrievedEdges)
+			call.RetrievedAssertions = append(
+				[]interaction.AssertionEvidence(nil),
+				turn.ToolCall.RetrievedAssertions...,
+			)
 			cloned.Turns[index].ToolCall = &call
 		}
 	}
@@ -1041,6 +1187,8 @@ func interactionSummary(record persistedInteraction) InteractionSummary {
 		SnapshotAsOf:             record.SnapshotAsOf,
 		AuthorizationFingerprint: record.AuthorizationFingerprint,
 		AuthorizationExpiresAt:   record.AuthorizationExpiresAt,
+		OntologySchemaID:         record.OntologySchemaID,
+		OntologyVersionID:        record.OntologyVersionID,
 		EmbeddingSpaceID:         record.EmbeddingSpaceID,
 		Operation:                record.Operation,
 		Actor:                    cloneActorContext(record.Actor),
@@ -1087,6 +1235,14 @@ func dedupeExplorerIDs(ids []shoal.ID) []shoal.ID {
 		return shoal.CompareID(result[i], result[j]) < 0
 	})
 	return result
+}
+
+func cloneInteractionSourceEdges(edges []graph.Edge) []graph.Edge {
+	cloned := make([]graph.Edge, len(edges))
+	for index, edge := range edges {
+		cloned[index] = cloneEdge(edge)
+	}
+	return cloned
 }
 
 func cloneActorContext(actor interaction.ActorContext) interaction.ActorContext {

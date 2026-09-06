@@ -174,6 +174,62 @@ func TestSelfEdgeDoesNotCreateFalseContinuation(t *testing.T) {
 	}
 }
 
+func TestBoundedNeighborhoodReportsSuppressedAdjacencyScans(t *testing.T) {
+	corpus := &Explorer{
+		graphInitialized: true,
+		graphNodes: map[shoal.ID]graph.Node{
+			"source":  {ID: "source"},
+			"hidden":  {ID: "hidden", Kind: "interaction.session"},
+			"visible": {ID: "visible"},
+		},
+		graphEdges: map[shoal.ID]graph.Edge{
+			"a-hidden": {
+				ID: "a-hidden", From: "source", To: "hidden",
+				Type: "interaction.retrieved", Weight: 1,
+			},
+			"b-visible": {
+				ID: "b-visible", From: "source", To: "visible",
+				Type: "related", Weight: 1,
+			},
+		},
+		outgoing: map[shoal.ID][]shoal.ID{
+			"source": {"a-hidden", "b-visible"},
+		},
+		incoming: map[shoal.ID][]shoal.ID{},
+	}
+	first, err := corpus.BoundedNeighborhood(
+		context.Background(),
+		BoundedNeighborhoodRequest{
+			NodeIDs: []shoal.ID{"source"}, Depth: 1,
+			Fanout: 1, MaxNodes: 2, Direction: GraphDirectionOutgoing,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.ScannedEdges != 1 || len(first.Neighborhood.Edges) != 0 ||
+		!first.Truncated || !first.Continuation ||
+		first.NextAfterEdgeID != "a-hidden" {
+		t.Fatalf("suppressed first page = %#v", first)
+	}
+	second, err := corpus.BoundedNeighborhood(
+		context.Background(),
+		BoundedNeighborhoodRequest{
+			NodeIDs: []shoal.ID{"source"}, Depth: 1,
+			Fanout: 1, MaxNodes: 2, Direction: GraphDirectionOutgoing,
+			AfterEdgeID: first.NextAfterEdgeID,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.ScannedEdges != 1 ||
+		len(second.Neighborhood.Edges) != 1 ||
+		second.Neighborhood.Edges[0].ID != "b-visible" {
+		t.Fatalf("visible second page = %#v", second)
+	}
+}
+
 func TestConnectClonesRetainedEdgeProperties(t *testing.T) {
 	corpus, err := Open(t.TempDir())
 	if err != nil {

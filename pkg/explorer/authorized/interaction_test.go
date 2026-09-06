@@ -28,6 +28,7 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/explorer/authorized"
+	"github.com/phrocker/shoal-oss/pkg/graph"
 	"github.com/phrocker/shoal-oss/pkg/interaction"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
@@ -35,6 +36,121 @@ import (
 type generationChangingInteractionBase struct {
 	*explorer.Explorer
 	after func()
+}
+
+func TestNonAnalyticsInteractionRejectsUnverifiedExactEvidence(t *testing.T) {
+	f := newFixture(t)
+	receipt, err := f.clientA.Ingest(f.admin(t), explorer.Source{
+		URI:       "file:///ordinary-interaction.txt",
+		MediaType: explorer.MediaTypeText,
+		Content:   "ordinary retrieval evidence",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := f.base.Snapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.clock.Set(snapshot.AsOf.Add(time.Second))
+	decision := f.decision(
+		t, "recorder", [][]byte{f.sourceA}, [][]byte{f.policyA},
+		[]auth.Operation{auth.OperationRead, auth.OperationRetrieve},
+	)
+	fingerprint, err := auth.AuthorizationFingerprint(decision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := interaction.Session{
+		RecordedAt:               f.clock.Now(),
+		SnapshotID:               shoal.ID(snapshot.ID),
+		SnapshotAsOf:             snapshot.AsOf,
+		AuthorizationFingerprint: shoal.ID(fingerprint.String()),
+		AuthorizationExpiresAt:   decision.AuthenticationExpires(),
+	}
+	ctx := f.context(t, decision)
+	view, err := f.clientA.Document(
+		ctx, receipt.Document.ID, receipt.Revision.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nodeID := firstSpanID(t, view)
+
+	ordinary := base
+	ordinary.ID = "session-ordinary-retrieval"
+	ordinary.SeedNodeIDs = []shoal.ID{nodeID}
+	ordinary.Turns = []interaction.Turn{{
+		Index: 0,
+		ToolCall: &interaction.ToolCall{
+			Kind: "retrieve", RetrievedNodeIDs: []shoal.ID{nodeID},
+		},
+	}}
+	if err := f.clientA.RecordInteraction(ctx, ordinary); err != nil {
+		t.Fatalf("ordinary retrieval record = %v", err)
+	}
+
+	ordinaryAnalyticsTool := base
+	ordinaryAnalyticsTool.ID = "session-ordinary-analytics-tool"
+	ordinaryAnalyticsTool.Provenance.ToolPolicy =
+		string(auth.OperationAnalyticsRead)
+	ordinaryAnalyticsTool.Turns = []interaction.Turn{{
+		Index: 0,
+		ToolCall: &interaction.ToolCall{
+			Kind: "analytics", RetrievedNodeIDs: []shoal.ID{nodeID},
+		},
+	}}
+	if err := f.clientA.RecordInteraction(
+		ctx, ordinaryAnalyticsTool,
+	); err != nil {
+		t.Fatalf("ordinary analytics-named tool record = %v", err)
+	}
+	storedOrdinary, err := f.base.Interaction(
+		context.Background(), ordinaryAnalyticsTool.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if storedOrdinary.Provenance.ToolPolicy ==
+		string(auth.OperationAnalyticsRead) {
+		t.Fatal("ordinary interaction retained trusted analytics marker")
+	}
+
+	withNode := base
+	withNode.ID = "session-exact-node"
+	withNode.Turns = []interaction.Turn{{
+		Index: 0,
+		ToolCall: &interaction.ToolCall{
+			Kind: "retrieve",
+			RetrievedNodes: []graph.Node{{
+				ID: "fabricated", Kind: "document",
+			}},
+		},
+	}}
+	if err := f.clientA.RecordInteraction(
+		ctx, withNode,
+	); !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
+		t.Fatalf("non-analytics exact node record = %v", err)
+	}
+
+	first := graph.Edge{
+		ID: "edge", From: "from", To: "to", Type: "related",
+		Properties: shoal.Metadata{"first": ""},
+	}
+	second := first
+	second.Properties = shoal.Metadata{"second": ""}
+	withConflict := base
+	withConflict.ID = "session-conflicting-edge"
+	withConflict.CitedEdges = []graph.Edge{first}
+	withConflict.Turns = []interaction.Turn{{
+		Index: 0,
+		ToolCall: &interaction.ToolCall{
+			Kind: "retrieve", RetrievedEdges: []graph.Edge{second},
+		},
+	}}
+	if err := f.clientA.RecordInteraction(
+		ctx, withConflict,
+	); !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
+		t.Fatalf("conflicting exact edge record = %v", err)
+	}
 }
 
 func (b *generationChangingInteractionBase) RecordInteractionResult(
@@ -59,6 +175,21 @@ func (b *forgedResultInteractionBase) RecordInteractionResult(
 		recorded.Actor.SubjectID = "forged-return"
 	}
 	return recorded, err
+}
+
+type committedFailureInteractionBase struct {
+	*explorer.Explorer
+}
+
+func (b *committedFailureInteractionBase) RecordInteractionResult(
+	ctx context.Context, session interaction.Session,
+) (interaction.Session, error) {
+	recorded, err := b.Explorer.RecordInteractionResult(ctx, session)
+	if err != nil {
+		return recorded, err
+	}
+	return recorded, explorer.MarkCommittedInteraction(
+		shoal.NewError(shoal.ErrorUnavailable, "post-commit failure"))
 }
 
 type countingInteractionStore struct {
@@ -398,6 +529,20 @@ func TestAuthorizedInteractionRecorderRejectsWrongPin(t *testing.T) {
 		ctx, session,
 	); !shoal.IsErrorCode(err, shoal.ErrorUnauthorized) {
 		t.Fatalf("expired authorization pin record = %v", err)
+	}
+	session.ID = "session-narrower-live-pin"
+	session.RecordedAt = f.clock.Now()
+	session.AuthorizationExpiresAt = f.clock.Now().Add(time.Minute)
+	if err := f.clientA.RecordInteraction(ctx, session); err != nil {
+		t.Fatalf("narrower authorization pin record = %v", err)
+	}
+	stored, err := f.base.Interaction(context.Background(), session.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !stored.AuthorizationExpiresAt.Equal(session.AuthorizationExpiresAt) {
+		t.Fatalf("stored expiry = %v, want %v",
+			stored.AuthorizationExpiresAt, session.AuthorizationExpiresAt)
 	}
 }
 

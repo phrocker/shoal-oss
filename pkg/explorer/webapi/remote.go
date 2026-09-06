@@ -34,6 +34,7 @@ import (
 
 	"github.com/phrocker/shoal-oss/pkg/document"
 	"github.com/phrocker/shoal-oss/pkg/explorer"
+	exploreranalytics "github.com/phrocker/shoal-oss/pkg/explorer/analytics"
 	"github.com/phrocker/shoal-oss/pkg/graph"
 	"github.com/phrocker/shoal-oss/pkg/retrieval"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
@@ -344,6 +345,11 @@ func (s *RemoteService) Neighborhood(
 	); err != nil {
 		return NeighborhoodResponse{}, err
 	}
+	if response.ScannedEdges != nil &&
+		*response.ScannedEdges < uint32(len(response.Neighborhood.Edges)) {
+		return NeighborhoodResponse{}, remoteContractError(
+			"remote graph scan count is smaller than the returned edge count", nil)
+	}
 	if response.NextCursor != "" {
 		if !response.Truncated {
 			return NeighborhoodResponse{}, remoteContractError(
@@ -422,6 +428,44 @@ func (s *RemoteService) Path(ctx context.Context, request PathRequest) (PathResp
 			return PathResponse{}, remoteContractError(
 				"remote path contains an excluded edge type", nil)
 		}
+	}
+	return response, nil
+}
+
+// Analytics invokes the upstream authorized bounded analytics provider. The
+// upstream must advertise both the capability and its exact runtime limits.
+func (s *RemoteService) Analytics(
+	ctx context.Context,
+	request AnalyticsRequest,
+) (AnalyticsResponse, error) {
+	metadata, err := s.Metadata(ctx)
+	if err != nil {
+		return AnalyticsResponse{}, err
+	}
+	if !metadata.Capabilities.Analytics || metadata.AnalyticsLimits == nil ||
+		!metadata.AnalyticsRecordingRequired {
+		return AnalyticsResponse{}, shoal.NewError(
+			shoal.ErrorUnavailable, "workspace capability \"analytics\" is unavailable")
+	}
+	analyticsRequest := exploreranalytics.Request{
+		SnapshotID: request.Snapshot.ID,
+		Scope:      request.Scope, PageRank: request.PageRank,
+	}
+	if err := exploreranalytics.ValidateRequest(
+		analyticsRequest, *metadata.AnalyticsLimits); err != nil {
+		return AnalyticsResponse{}, err
+	}
+	var response AnalyticsResponse
+	if err := s.post(
+		ctx, CapabilityAnalytics, "analytics", request, &response,
+		maxRemoteResponseBytes,
+	); err != nil {
+		return AnalyticsResponse{}, err
+	}
+	if err := ValidateAnalyticsResponse(
+		request, response, *metadata.AnalyticsLimits); err != nil {
+		return AnalyticsResponse{}, explorer.MarkIndeterminateCommit(
+			remoteContractError("remote analytics response is invalid", err))
 	}
 	return response, nil
 }
@@ -537,17 +581,19 @@ func minInt64(left, right int64) int64 {
 
 func decodeRemoteMetadata(reader io.Reader) (MetadataResponse, error) {
 	var wire struct {
-		MaxPageSize         uint32        `json:"max_page_size"`
-		MaxTopK             uint32        `json:"max_top_k"`
-		MaxDepth            uint32        `json:"max_depth"`
-		MaxFanout           uint32        `json:"max_fanout"`
-		MaxNodes            uint32        `json:"max_nodes"`
-		MaxEdgeTypes        uint32        `json:"max_edge_types,omitempty"`
-		MaxResponseBytes    uint64        `json:"max_response_bytes,omitempty"`
-		MaxUploadFiles      uint32        `json:"max_upload_files,omitempty"`
-		MaxUploadFileBytes  uint64        `json:"max_upload_file_bytes,omitempty"`
-		MaxUploadTotalBytes uint64        `json:"max_upload_total_bytes,omitempty"`
-		Capabilities        *Capabilities `json:"capabilities,omitempty"`
+		MaxPageSize                uint32                    `json:"max_page_size"`
+		MaxTopK                    uint32                    `json:"max_top_k"`
+		MaxDepth                   uint32                    `json:"max_depth"`
+		MaxFanout                  uint32                    `json:"max_fanout"`
+		MaxNodes                   uint32                    `json:"max_nodes"`
+		MaxEdgeTypes               uint32                    `json:"max_edge_types,omitempty"`
+		MaxResponseBytes           uint64                    `json:"max_response_bytes,omitempty"`
+		MaxUploadFiles             uint32                    `json:"max_upload_files,omitempty"`
+		MaxUploadFileBytes         uint64                    `json:"max_upload_file_bytes,omitempty"`
+		MaxUploadTotalBytes        uint64                    `json:"max_upload_total_bytes,omitempty"`
+		AnalyticsLimits            *exploreranalytics.Limits `json:"analytics_limits,omitempty"`
+		AnalyticsRecordingRequired bool                      `json:"analytics_recording_required,omitempty"`
+		Capabilities               *Capabilities             `json:"capabilities,omitempty"`
 	}
 	if err := decodeOneJSON(reader, &wire, maxRemoteMetadataResponseBytes); err != nil {
 		return MetadataResponse{}, err
@@ -574,13 +620,32 @@ func decodeRemoteMetadata(reader io.Reader) (MetadataResponse, error) {
 			wire.MaxUploadTotalBytes == 0) {
 		return MetadataResponse{}, errors.New("remote workspace upload bounds are incomplete")
 	}
+	if wire.AnalyticsLimits != nil {
+		if err := wire.AnalyticsLimits.Validate(); err != nil {
+			return MetadataResponse{}, errors.New(
+				"remote workspace analytics limits are invalid")
+		}
+	}
+	if capabilities.Analytics &&
+		(wire.AnalyticsLimits == nil || !wire.AnalyticsRecordingRequired) {
+		return MetadataResponse{}, errors.New(
+			"remote workspace analytics metadata is incomplete")
+	}
+	if !capabilities.Analytics &&
+		(wire.AnalyticsLimits != nil || wire.AnalyticsRecordingRequired) {
+		return MetadataResponse{}, errors.New(
+			"remote workspace advertises analytics metadata without capability")
+	}
 	return MetadataResponse{
 		MaxPageSize: MaxPageSize, MaxTopK: MaxTopK,
 		MaxDepth: MaxDepth, MaxFanout: MaxFanout,
 		MaxNodes: MaxNodes, MaxEdgeTypes: MaxEdgeTypes,
 		MaxResponseBytes: MaxResponseBytes,
 		MaxUploadFiles:   MaxUploadFiles, MaxUploadFileBytes: MaxUploadFileBytes,
-		MaxUploadTotalBytes: MaxUploadTotalBytes, Capabilities: capabilities,
+		MaxUploadTotalBytes:        MaxUploadTotalBytes,
+		AnalyticsLimits:            wire.AnalyticsLimits,
+		AnalyticsRecordingRequired: wire.AnalyticsRecordingRequired,
+		Capabilities:               capabilities,
 	}, nil
 }
 
