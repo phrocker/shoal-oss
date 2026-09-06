@@ -75,16 +75,16 @@ func (e *Explorer) ValidateSnapshot(
 	if err := e.ensureGraphLocked(); err != nil {
 		return err
 	}
-	record, ok := e.snapshotHistory[string(id)]
-	if !ok || !record.AsOf.Equal(asOf.UTC()) {
+	observedAt, ok := e.snapshotHistory[string(id)]
+	if !ok || !observedAt.Equal(asOf.UTC()) {
 		return shoal.NewError(
 			shoal.ErrorConflict, "snapshot pin is not a trusted corpus frontier")
 	}
 	for _, nodeID := range nodeIDs {
-		index := sort.Search(len(record.NodeIDs), func(index int) bool {
-			return shoal.CompareID(record.NodeIDs[index], nodeID) >= 0
-		})
-		if index == len(record.NodeIDs) || record.NodeIDs[index] != nodeID {
+		node, current := e.graphNodes[nodeID]
+		bornAt, known := e.sourceNodeBirth[nodeID]
+		if !current || interaction.IsInteractionKind(node.Kind) ||
+			!known || bornAt.After(asOf.UTC()) {
 			return shoal.NewError(
 				shoal.ErrorConflict,
 				"interaction source was not present in the pinned snapshot",
@@ -96,12 +96,9 @@ func (e *Explorer) ValidateSnapshot(
 
 func (e *Explorer) registerSnapshotLocked(snapshot Snapshot) error {
 	id := shoal.ID(snapshot.ID)
-	record := persistedSnapshot{
-		ID: id, AsOf: snapshot.AsOf.UTC(),
-		NodeIDs: e.snapshotSourceNodeIDsLocked(),
-	}
+	record := persistedSnapshot{ID: id, AsOf: snapshot.AsOf.UTC()}
 	if existing, ok := e.snapshotHistory[snapshot.ID]; ok {
-		if persistedSnapshotsEqual(existing, record) {
+		if existing.Equal(record.AsOf) {
 			return nil
 		}
 		return shoal.NewError(
@@ -110,7 +107,7 @@ func (e *Explorer) registerSnapshotLocked(snapshot Snapshot) error {
 		)
 	}
 	if e.readOnly {
-		e.snapshotHistory[snapshot.ID] = record
+		e.snapshotHistory[snapshot.ID] = record.AsOf
 		return nil
 	}
 	accepted, err := e.conditionalInteractionRecord(
@@ -138,22 +135,8 @@ func (e *Explorer) registerSnapshotLocked(snapshot Snapshot) error {
 			)
 		}
 	}
-	record.NodeIDs = append([]shoal.ID(nil), record.NodeIDs...)
-	e.snapshotHistory[snapshot.ID] = record
+	e.snapshotHistory[snapshot.ID] = record.AsOf
 	return nil
-}
-
-func (e *Explorer) snapshotSourceNodeIDsLocked() []shoal.ID {
-	nodeIDs := make([]shoal.ID, 0, len(e.graphNodes))
-	for id, node := range e.graphNodes {
-		if !interaction.IsInteractionKind(node.Kind) {
-			nodeIDs = append(nodeIDs, id)
-		}
-	}
-	sort.Slice(nodeIDs, func(i, j int) bool {
-		return shoal.CompareID(nodeIDs[i], nodeIDs[j]) < 0
-	})
-	return nodeIDs
 }
 
 // BoundedNeighborhood expands the cached adjacency index without scanning or

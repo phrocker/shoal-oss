@@ -84,7 +84,7 @@ const (
 	maxEmbeddedOntologyProposalBytes   = uint64(16 * 1024 * 1024)
 	maxEmbeddedProposalTransitionBytes = uint64(64 * 1024)
 	maxEmbeddedExtractionBytes         = uint64(16 * 1024 * 1024)
-	maxEmbeddedSnapshotBytes           = uint64(64 * 1024 * 1024)
+	maxEmbeddedSnapshotBytes           = uint64(1024)
 )
 
 var snapshotAnchorRow = []byte("meta/snapshot-anchor")
@@ -98,9 +98,8 @@ type persistedSnapshotAnchor struct {
 }
 
 type persistedSnapshot struct {
-	ID      shoal.ID
-	AsOf    time.Time
-	NodeIDs []shoal.ID
+	ID   shoal.ID
+	AsOf time.Time
 }
 
 // persistedCursorKey holds the durable, per-corpus secret that seals change-feed
@@ -320,29 +319,13 @@ func (e *Explorer) loadSnapshotRecord(
 		return shoal.NewError(
 			shoal.ErrorInternal, "stored snapshot record is invalid")
 	}
-	for index, nodeID := range record.NodeIDs {
-		if err := shoal.ValidateRequiredID(
-			"snapshot source node ID", nodeID,
-		); err != nil {
-			return shoal.WrapError(
-				shoal.ErrorInternal, "stored snapshot is invalid", err)
-		}
-		if index > 0 &&
-			shoal.CompareID(record.NodeIDs[index-1], nodeID) >= 0 {
-			return shoal.NewError(
-				shoal.ErrorInternal,
-				"stored snapshot source node IDs are not canonical",
-			)
-		}
-	}
 	record.AsOf = record.AsOf.UTC()
 	if existing, ok := e.snapshotHistory[string(record.ID)]; ok &&
-		!persistedSnapshotsEqual(existing, record) {
+		!existing.Equal(record.AsOf) {
 		return shoal.NewError(
 			shoal.ErrorInternal, "stored snapshot ID has conflicting content")
 	}
-	record.NodeIDs = append([]shoal.ID(nil), record.NodeIDs...)
-	e.snapshotHistory[string(record.ID)] = record
+	e.snapshotHistory[string(record.ID)] = record.AsOf
 	return nil
 }
 
@@ -422,6 +405,7 @@ func (e *Explorer) loadDocumentRecord(
 		e.documents[record.Document.ID] = make(map[shoal.ID]*persistedDocument)
 	}
 	copy := record
+	e.registerSourceNodeBirthLocked(copy.Nodes, copy.PublishedAt)
 	e.documents[record.Document.ID][record.Revision.ID] = &copy
 	if record.PublicationSequence > e.lastPublicationSequence {
 		e.lastPublicationSequence = record.PublicationSequence
@@ -906,16 +890,8 @@ func equivalentEmbeddedRecord(row, stored, expected []byte) bool {
 }
 
 func persistedSnapshotsEqual(left, right persistedSnapshot) bool {
-	if left.ID != right.ID || !left.AsOf.UTC().Equal(right.AsOf.UTC()) ||
-		len(left.NodeIDs) != len(right.NodeIDs) {
-		return false
-	}
-	for index := range left.NodeIDs {
-		if left.NodeIDs[index] != right.NodeIDs[index] {
-			return false
-		}
-	}
-	return true
+	return left.ID == right.ID &&
+		left.AsOf.UTC().Equal(right.AsOf.UTC())
 }
 
 func encodeEmbeddedRecord(kind byte, value any) ([]byte, error) {
