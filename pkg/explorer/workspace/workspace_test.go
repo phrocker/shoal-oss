@@ -88,7 +88,9 @@ func (r staticCeilingResolver) ResolveServiceCeiling(
 }
 
 type callerOntologyChoices struct {
-	bySubject map[shoal.ID][]OntologyChoice
+	bySubject      map[shoal.ID][]OntologyChoice
+	listCalls      *int
+	authorizeCalls *int
 }
 
 func (c callerOntologyChoices) ListOntologyChoices(
@@ -98,6 +100,9 @@ func (c callerOntologyChoices) ListOntologyChoices(
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	if c.listCalls != nil {
+		(*c.listCalls)++
+	}
 	return append([]OntologyChoice(nil), c.bySubject[decision.Subject()]...), nil
 }
 
@@ -106,6 +111,9 @@ func (c callerOntologyChoices) AuthorizeOntology(
 	decision auth.Decision,
 	identity ontology.OntologyIdentity,
 ) error {
+	if c.authorizeCalls != nil {
+		(*c.authorizeCalls)++
+	}
 	choices, err := c.ListOntologyChoices(ctx, decision)
 	if err != nil {
 		return err
@@ -531,6 +539,7 @@ func TestSelectableLensPreservesSettingsAndDoesNotLeakAcrossCallers(t *testing.T
 	defer store.Close()
 	first, second := testOntologies(t)
 	resolver := &mutableResolver{decision: testDecision(t, decisionOptions{})}
+	listCalls, authorizeCalls := 0, 0
 	callerChoices := callerOntologyChoices{
 		bySubject: map[shoal.ID][]OntologyChoice{
 			"owner": {
@@ -541,6 +550,8 @@ func TestSelectableLensPreservesSettingsAndDoesNotLeakAcrossCallers(t *testing.T
 				{Identity: second, Active: true},
 			},
 		},
+		listCalls:      &listCalls,
+		authorizeCalls: &authorizeCalls,
 	}
 	options := testProviderOptions(resolver)
 	options.OntologyChoices = callerChoices
@@ -573,6 +584,10 @@ func TestSelectableLensPreservesSettingsAndDoesNotLeakAcrossCallers(t *testing.T
 	if len(choices.Choices) != 2 || !choices.Choices[0].Active ||
 		choices.SettingsRevision != created.Revision {
 		t.Fatalf("owner choices = %#v", choices)
+	}
+	if listCalls != 1 || authorizeCalls != 0 {
+		t.Fatalf("choice snapshot calls: list=%d authorize=%d",
+			listCalls, authorizeCalls)
 	}
 	selected, err := provider.SelectOntology(
 		context.Background(), "lens-workspace", created.Revision,
