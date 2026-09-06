@@ -1131,7 +1131,7 @@ func decodeRemoteErrorOutcome(response *http.Response) (error, bool) {
 		Code          shoal.ErrorCode           `json:"code"`
 		Message       string                    `json:"message"`
 		Embedding     *wireEmbeddingQueryReport `json:"embedding,omitempty"`
-		Indeterminate bool                       `json:"indeterminate,omitempty"`
+		Indeterminate bool                      `json:"indeterminate,omitempty"`
 	}
 	indeterminate := response.Header.Get(CommitOutcomeHeader) ==
 		CommitOutcomeIndeterminate
@@ -1161,7 +1161,7 @@ func decodeRemoteErrorOutcome(response *http.Response) (error, bool) {
 				remoteContractError(
 					"invalid remote embedding query report", reportErr),
 				indeterminate || payload.Indeterminate,
-			)
+			), indeterminate || payload.Indeterminate
 		}
 		if report != nil {
 			if !report.Degraded {
@@ -1171,7 +1171,7 @@ func decodeRemoteErrorOutcome(response *http.Response) (error, bool) {
 						nil,
 					),
 					indeterminate || payload.Indeterminate,
-				)
+				), indeterminate || payload.Indeterminate
 			}
 			decoded = newEmbeddingQueryError(decoded, *report)
 		}
