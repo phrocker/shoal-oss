@@ -321,6 +321,18 @@ func (p *Provider) ListOntologyChoices(
 	if err != nil {
 		return OntologyChoiceSet{}, err
 	}
+	if selected, ok := check.decision.SelectedOntology(); ok {
+		filtered := choices[:0]
+		for _, choice := range choices {
+			if choice.Identity == selected {
+				filtered = append(filtered, choice)
+			}
+		}
+		if len(filtered) == 0 {
+			return OntologyChoiceSet{}, authDenied()
+		}
+		choices = filtered
+	}
 	if result.SelectedOntology.Present {
 		found := false
 		for _, choice := range choices {
@@ -612,6 +624,10 @@ func (p *Provider) normalizeUpdate(
 		return Narrowing{}, err
 	}
 	if ontologySelection.Present {
+		if selected, ok := decision.SelectedOntology(); ok &&
+			selected != ontologySelection.Identity {
+			return Narrowing{}, authDenied()
+		}
 		if absent(p.ontologyChoices) {
 			return Narrowing{}, authDenied()
 		}
@@ -811,6 +827,9 @@ func DeriveEffectiveDecision(
 	}
 	selected, selectedSet := base.SelectedOntology()
 	if narrowing.SelectedOntology.Present {
+		if selectedSet && selected != narrowing.SelectedOntology.Identity {
+			return EffectiveDecision{}, authDenied()
+		}
 		if absent(options.OntologyChoices) {
 			return EffectiveDecision{}, authDenied()
 		}

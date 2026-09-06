@@ -139,7 +139,7 @@ func TestProviderAppliesOnlyNarrowingAndPreservesDecision(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	base := testDecision(t, decisionOptions{ontology: firstOntology})
+	base := testDecision(t, decisionOptions{})
 	resolver := &mutableResolver{decision: base}
 	options := testProviderOptions(resolver)
 	options.OntologyChoices = choices
@@ -244,6 +244,69 @@ func TestProviderAppliesOnlyNarrowingAndPreservesDecision(t *testing.T) {
 	if effective.CacheDimensions()["workspace_settings_revision"] != 1 ||
 		effective.CacheDimensions()["workspace_settings_identity_0"] == 0 {
 		t.Fatalf("cache dimensions = %#v", effective.CacheDimensions())
+	}
+}
+
+func TestEffectiveDecisionCannotReplaceIssuerSelectedOntology(t *testing.T) {
+	firstOntology, secondOntology := testOntologies(t)
+	base := testDecision(t, decisionOptions{ontology: firstOntology})
+	choices, err := NewStaticOntologyChoices(firstOntology, secondOntology)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := OpenDurableStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	options := testProviderOptions(&mutableResolver{decision: base})
+	options.OntologyChoices = choices
+	provider, err := NewProvider(store, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := provider.Update(
+		context.Background(), "workspace", UpdateRequest{
+			MutationID: "replace",
+			Narrowing: UpdateNarrowing{
+				SelectedOntology: OntologySelection{
+					Present: true, Identity: secondOntology,
+				},
+			},
+		},
+	); !shoal.IsErrorCode(err, shoal.ErrorUnauthorized) {
+		t.Fatalf("replacement update error = %v, want unauthorized", err)
+	}
+	settings, err := provider.Update(
+		context.Background(), "workspace", UpdateRequest{
+			MutationID: "preserve",
+			Narrowing: UpdateNarrowing{
+				SelectedOntology: OntologySelection{
+					Present: true, Identity: firstOntology,
+				},
+			},
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	effective, err := provider.Apply(
+		context.Background(), "workspace", testLimits(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	selected, ok := effective.Decision().SelectedOntology()
+	if !ok || selected != firstOntology {
+		t.Fatalf("selected ontology = %#v, %v", selected, ok)
+	}
+
+	settings.Narrowing.SelectedOntology.Identity = secondOntology
+	if _, err := DeriveEffectiveDecision(
+		context.Background(), base, settings, ApplyOptions{
+			Now: testNow, BaseLimits: testLimits(), OntologyChoices: choices,
+		},
+	); !shoal.IsErrorCode(err, shoal.ErrorUnauthorized) {
+		t.Fatalf("replacement derive error = %v, want unauthorized", err)
 	}
 }
 
@@ -831,7 +894,7 @@ func TestServiceCeilingConstrainsOutputPolicies(t *testing.T) {
 
 func TestSettingsRevisionAndOntologyPartitionCaches(t *testing.T) {
 	firstOntology, secondOntology := testOntologies(t)
-	base := testDecision(t, decisionOptions{ontology: firstOntology})
+	base := testDecision(t, decisionOptions{})
 	choices, _ := NewStaticOntologyChoices(firstOntology, secondOntology)
 	first := Settings{
 		WorkspaceID: "workspace", Owner: base.Subject(),

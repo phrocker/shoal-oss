@@ -72,7 +72,7 @@ func NewGovernedOntologyChoices(
 // selectable.
 func (c *GovernedOntologyChoices) ListOntologyChoices(
 	ctx context.Context,
-	_ auth.Decision,
+	decision auth.Decision,
 ) ([]workspace.OntologyChoice, error) {
 	catalog, configured, err := c.catalog(ctx)
 	if err != nil {
@@ -84,11 +84,15 @@ func (c *GovernedOntologyChoices) ListOntologyChoices(
 	active := catalog.ActiveIdentity()
 	versions := catalog.Versions()
 	choices := make([]workspace.OntologyChoice, 0, len(versions))
+	selected, selectedSet := decision.SelectedOntology()
 	for index := len(versions) - 1; index >= 0; index-- {
 		version := versions[index]
 		identity, err := ontology.NewOntologyIdentity(version)
 		if err != nil {
 			return nil, err
+		}
+		if selectedSet && identity != selected {
+			continue
 		}
 		choices = append(choices, workspace.OntologyChoice{
 			Identity: identity,
@@ -103,11 +107,14 @@ func (c *GovernedOntologyChoices) ListOntologyChoices(
 // eligibility snapshot.
 func (c *GovernedOntologyChoices) AuthorizeOntology(
 	ctx context.Context,
-	_ auth.Decision,
+	decision auth.Decision,
 	identity ontology.OntologyIdentity,
 ) error {
 	if err := identity.Validate(); err != nil {
 		return err
+	}
+	if selected, ok := decision.SelectedOntology(); ok && selected != identity {
+		return shoal.NewError(shoal.ErrorUnauthorized, "authorization denied")
 	}
 	catalog, configured, err := c.catalog(ctx)
 	if err != nil {
