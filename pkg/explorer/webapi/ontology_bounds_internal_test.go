@@ -110,6 +110,16 @@ func TestActiveOntologyExactBoundSurvivesRestart(t *testing.T) {
 				t.Fatalf("active at %d, reopen %v = %q, %v, %v",
 					index, reopen, active.ID(), configured, err)
 			}
+			catalog, configured, err := service.OntologyCatalog(ctx)
+			if err != nil || !configured || len(catalog.Versions()) != index+1 ||
+				catalog.Active().ID() != active.ID() {
+				t.Fatalf("catalog at %d, reopen %v = %d versions, %v, %v",
+					index, reopen, len(catalog.Versions()), configured, err)
+			}
+			identity, err := ontology.NewOntologyIdentity(active)
+			if err != nil || !catalog.Contains(identity) {
+				t.Fatalf("catalog does not contain active identity at %d: %v", index, err)
+			}
 		}
 	}
 	_, err = service.CreateOntologyProposal(ctx, CreateOntologyProposalRequest{

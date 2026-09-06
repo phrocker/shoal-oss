@@ -44,6 +44,11 @@ selection are intentionally tracked separately and are not claimed here.
 - `ontology.NewOntologyMorphism` creates validated evidence-bearing morphisms.
 - `ontology.NewOntologyLensWithTransitions` and `ontology.NewOntologyTransition`
   model governed version edges independently from definition mappings.
+- `ontology.NewPublishedCatalog` derives selectable versions from the unique
+  reachable published chain. `webapi.EmbeddedService.OntologyCatalog` applies
+  the corpus proposal bound before exposing that same catalog to host adapters;
+  discovery and active-version replay do not implement separate eligibility
+  rules.
 - `ontology.NewGovernedProposalWithMorphisms` binds them to the existing
   lifecycle.
 - `auth.DecisionConfig.SelectedOntology` selects a schema+version and is part

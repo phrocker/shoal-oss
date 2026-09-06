@@ -45,6 +45,13 @@ type ActiveOntologyProvider interface {
 	ActiveOntology(context.Context) (ontology.OntologyVersion, bool, error)
 }
 
+// OntologyCatalogProvider exposes the canonical governed choice set and its
+// durable active tip. Callers must still apply their own authorization policy;
+// the catalog prevents them from duplicating publication-chain/CAS semantics.
+type OntologyCatalogProvider interface {
+	OntologyCatalog(context.Context) (ontology.PublishedCatalog, bool, error)
+}
+
 // OntologyResponse is the stable browser contract for the currently active
 // ontology. Configured distinguishes "no ontology was configured" from a
 // configured ontology that legitimately contains no definitions.
@@ -68,6 +75,48 @@ type OntologyIdentityProjection struct {
 	SchemaID  string `json:"schema_id,omitempty"`
 	VersionID string `json:"version_id,omitempty"`
 	Reading   string `json:"reading"`
+}
+
+// ProjectOntologyIdentity applies the public opaque-ID wire encoding to one
+// validated ontology identity.
+func ProjectOntologyIdentity(
+	identity ontology.OntologyIdentity,
+) (OntologyIdentityProjection, error) {
+	if err := identity.Validate(); err != nil {
+		return OntologyIdentityProjection{}, err
+	}
+	return OntologyIdentityProjection{
+		Known: true, SchemaID: encodeID(identity.SchemaID()),
+		VersionID: encodeID(identity.VersionID()),
+		Reading:   string(ontology.OntologySameVersion),
+	}, nil
+}
+
+// ParseOntologyIdentityProjection decodes one public identity projection
+// without interpreting an unknown selection as the active version.
+func ParseOntologyIdentityProjection(
+	projection OntologyIdentityProjection,
+) (ontology.OntologyIdentity, error) {
+	if !projection.Known {
+		if projection.SchemaID != "" || projection.VersionID != "" {
+			return ontology.OntologyIdentity{}, shoal.NewError(
+				shoal.ErrorInvalidArgument,
+				"unknown ontology identity cannot carry IDs",
+			)
+		}
+		return ontology.UnknownOntology(), nil
+	}
+	schemaID, err := decodeID(projection.SchemaID)
+	if err != nil {
+		return ontology.OntologyIdentity{}, shoal.WrapError(
+			shoal.ErrorInvalidArgument, "decode ontology schema ID", err)
+	}
+	versionID, err := decodeID(projection.VersionID)
+	if err != nil {
+		return ontology.OntologyIdentity{}, shoal.WrapError(
+			shoal.ErrorInvalidArgument, "decode ontology version ID", err)
+	}
+	return ontology.NewOntologyIdentityFromIDs(schemaID, versionID)
 }
 
 type OntologySchemaProjection struct {
@@ -155,17 +204,27 @@ func (s *EmbeddedService) SetOntologyVersion(version ontology.OntologyVersion) e
 func (s *EmbeddedService) ActiveOntology(
 	ctx context.Context,
 ) (ontology.OntologyVersion, bool, error) {
+	catalog, configured, err := s.OntologyCatalog(ctx)
+	if err != nil || !configured {
+		return ontology.OntologyVersion{}, configured, err
+	}
+	return catalog.Active(), true, nil
+}
+
+func (s *EmbeddedService) OntologyCatalog(
+	ctx context.Context,
+) (ontology.PublishedCatalog, bool, error) {
 	if ctx == nil {
-		return ontology.OntologyVersion{}, false, shoal.NewError(
+		return ontology.PublishedCatalog{}, false, shoal.NewError(
 			shoal.ErrorInvalidArgument, "context is required")
 	}
 	if err := ctx.Err(); err != nil {
-		return ontology.OntologyVersion{}, false, err
+		return ontology.PublishedCatalog{}, false, err
 	}
 	s.ontologyMu.RLock()
 	if s.ontologyVersion == nil {
 		s.ontologyMu.RUnlock()
-		return ontology.OntologyVersion{}, false, nil
+		return ontology.PublishedCatalog{}, false, nil
 	}
 	configured := *s.ontologyVersion
 	s.ontologyMu.RUnlock()
@@ -173,58 +232,40 @@ func (s *EmbeddedService) ActiveOntology(
 		OntologyProposals(context.Context) ([]ontology.GovernedProposal, error)
 	})
 	if !ok {
-		return configured, true, nil
+		catalog, err := boundedOntologyCatalog(configured, nil)
+		return catalog, true, err
 	}
 	proposals, err := store.OntologyProposals(ctx)
 	if err != nil {
-		return ontology.OntologyVersion{}, false, err
+		return ontology.PublishedCatalog{}, false, err
 	}
-	active, err := replayPublishedOntology(configured, proposals)
+	catalog, err := boundedOntologyCatalog(configured, proposals)
 	if err != nil {
-		return ontology.OntologyVersion{}, false, err
+		return ontology.PublishedCatalog{}, false, err
 	}
-	return active, true, nil
+	return catalog, true, nil
+}
+
+func boundedOntologyCatalog(
+	configured ontology.OntologyVersion,
+	proposals []ontology.GovernedProposal,
+) (ontology.PublishedCatalog, error) {
+	if len(proposals) > int(MaxOntologyProposals) {
+		return ontology.PublishedCatalog{}, ontologyBoundError(
+			"proposal", len(proposals), MaxOntologyProposals)
+	}
+	return ontology.NewPublishedCatalog(configured, proposals)
 }
 
 func replayPublishedOntology(
 	configured ontology.OntologyVersion,
 	proposals []ontology.GovernedProposal,
 ) (ontology.OntologyVersion, error) {
-	outgoing := make(map[shoal.ID]ontology.GovernedProposal)
-	for _, proposal := range proposals {
-		if proposal.State() != ontology.ProposalPublished ||
-			proposal.Schema().ID() != configured.Schema().ID() {
-			continue
-		}
-		baseID, ok := proposal.BaseVersionID()
-		if !ok {
-			continue
-		}
-		if _, duplicate := outgoing[baseID]; duplicate {
-			return ontology.OntologyVersion{}, shoal.NewError(
-				shoal.ErrorConflict, "published ontology history is ambiguous")
-		}
-		outgoing[baseID] = proposal
+	catalog, err := boundedOntologyCatalog(configured, proposals)
+	if err != nil {
+		return ontology.OntologyVersion{}, err
 	}
-	active := configured
-	visited := map[shoal.ID]struct{}{active.ID(): {}}
-	for range MaxOntologyProposals {
-		next, ok := outgoing[active.ID()]
-		if !ok {
-			return active, nil
-		}
-		active = next.ProposedVersion()
-		if _, cycle := visited[active.ID()]; cycle {
-			return ontology.OntologyVersion{}, shoal.NewError(
-				shoal.ErrorConflict, "published ontology history contains a cycle")
-		}
-		visited[active.ID()] = struct{}{}
-	}
-	if _, more := outgoing[active.ID()]; !more {
-		return active, nil
-	}
-	return ontology.OntologyVersion{}, shoal.NewError(
-		shoal.ErrorUnavailable, "published ontology history exceeds the service bound")
+	return catalog.Active(), nil
 }
 
 func ontologyFor(ctx context.Context, service Service) (OntologyResponse, error) {
