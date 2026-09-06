@@ -81,66 +81,21 @@ func (c *GovernedOntologyChoices) ListOntologyChoices(
 	if err != nil {
 		return nil, err
 	}
-	active, err := replayPublishedOntology(*c.configured, proposals)
+	catalog, err := ontology.NewPublishedCatalog(*c.configured, proposals)
 	if err != nil {
 		return nil, err
 	}
-	activeIdentity, err := ontology.NewOntologyIdentity(active)
-	if err != nil {
-		return nil, err
+	active := catalog.ActiveIdentity()
+	identities := catalog.Identities()
+	choices := make([]workspace.OntologyChoice, 0, len(identities))
+	for index := len(identities) - 1; index >= 0; index-- {
+		identity := identities[index]
+		choices = append(choices, workspace.OntologyChoice{
+			Identity: identity,
+			Active:   identity == active,
+		})
 	}
-
-	byTarget := make(map[shoal.ID]ontology.GovernedProposal)
-	for _, proposal := range proposals {
-		if proposal.State() != ontology.ProposalPublished ||
-			proposal.Schema().ID() != activeIdentity.SchemaID() {
-			continue
-		}
-		target := proposal.ProposedVersion().ID()
-		if _, duplicate := byTarget[target]; duplicate {
-			return nil, shoal.NewError(
-				shoal.ErrorConflict,
-				"published ontology history has duplicate targets",
-			)
-		}
-		byTarget[target] = proposal
-	}
-	choices := []workspace.OntologyChoice{{
-		Identity: activeIdentity,
-		Active:   true,
-	}}
-	current := activeIdentity.VersionID()
-	visited := map[shoal.ID]struct{}{current: {}}
-	for traversed := uint32(0); ; traversed++ {
-		proposal, ok := byTarget[current]
-		if !ok {
-			return choices, nil
-		}
-		if traversed >= MaxOntologyProposals {
-			return nil, shoal.NewError(
-				shoal.ErrorUnavailable,
-				"published ontology history exceeds the service bound",
-			)
-		}
-		baseID, ok := proposal.BaseVersionID()
-		if !ok {
-			return choices, nil
-		}
-		if _, cycle := visited[baseID]; cycle {
-			return nil, shoal.NewError(
-				shoal.ErrorConflict,
-				"published ontology history contains a cycle",
-			)
-		}
-		visited[baseID] = struct{}{}
-		base, err := ontology.NewOntologyIdentityFromIDs(
-			activeIdentity.SchemaID(), baseID)
-		if err != nil {
-			return nil, err
-		}
-		choices = append(choices, workspace.OntologyChoice{Identity: base})
-		current = baseID
-	}
+	return choices, nil
 }
 
 // AuthorizeOntology permits only identities returned by the current live
