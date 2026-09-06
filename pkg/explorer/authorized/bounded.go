@@ -399,18 +399,19 @@ func (c *Client) boundedAuthorizedNeighborhoodPage(
 				(raw.Continuation || cursorAdvanced)) {
 			return explorer.BoundedNeighborhood{}, inconsistentBase()
 		}
-		consumed := raw.ScannedEdges
-		if !raw.ScannedEdgesKnown {
-			// Older or remote bounded implementations cannot prove how many
-			// adjacency entries were suppressed before materialization.
-			// Charge the full requested page rather than allowing hidden or
-			// reserved edges to bypass the authorization scan budget.
-			consumed = scan.Fanout
-			scannedEdgesKnown = false
-		}
-		if consumed < uint32(len(raw.Neighborhood.Edges)) ||
-			consumed > remainingScan {
+		if raw.ScannedEdgesKnown &&
+			(raw.ScannedEdges < uint32(len(raw.Neighborhood.Edges)) ||
+				raw.ScannedEdges > remainingScan) {
 			return explorer.BoundedNeighborhood{}, inconsistentBase()
+		}
+		// The base is not trusted to report how much suppressed adjacency it
+		// inspected. Preserve terminal exact zero, but conservatively charge
+		// every non-empty or unknown page at its requested scan allowance.
+		consumed := scan.Fanout
+		if raw.ScannedEdgesKnown && raw.ScannedEdges == 0 {
+			consumed = 0
+		} else {
+			scannedEdgesKnown = false
 		}
 		scannedEdges += consumed
 		filtered, err := c.filterNeighborhood(
