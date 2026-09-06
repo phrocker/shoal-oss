@@ -328,40 +328,10 @@ func TestOntologyProposalEndpointDistinguishesAuthorizationDenial(t *testing.T) 
 		t.Fatal(err)
 	}
 	defer createdResponse.Body.Close()
-	if createdResponse.StatusCode != http.StatusCreated {
+	if createdResponse.StatusCode != http.StatusUnauthorized {
 		data, _ := io.ReadAll(createdResponse.Body)
-		t.Fatalf("ingest-only create status = %d, want 201: %s",
+		t.Fatalf("ingest-only create status = %d, want 401: %s",
 			createdResponse.StatusCode, data)
-	}
-	var created webapi.OntologyProposalResponse
-	if err := json.NewDecoder(createdResponse.Body).Decode(&created); err != nil {
-		t.Fatal(err)
-	}
-	for _, state := range []ontology.ProposalState{
-		ontology.ProposalSubmitted, ontology.ProposalApproved, ontology.ProposalPublished,
-	} {
-		transitionBody := bytes.NewBufferString(
-			`{"state":` + strconvQuote(string(state)) + `,"note":"ingest-only"}`)
-		transition, err := http.NewRequest(
-			http.MethodPost,
-			server.URL+"/api/v1/ontology/proposals/"+created.Proposal.ID+"/transition",
-			transitionBody)
-		if err != nil {
-			t.Fatal(err)
-		}
-		transition.Header.Set("Content-Type", "application/json")
-		transition.Header.Set(authnPrincipalHeader, "ingest-only")
-		transitionResponse, err := server.Client().Do(transition)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if transitionResponse.StatusCode != http.StatusOK {
-			data, _ := io.ReadAll(transitionResponse.Body)
-			transitionResponse.Body.Close()
-			t.Fatalf("ingest-only transition %s status = %d, want 200: %s",
-				state, transitionResponse.StatusCode, data)
-		}
-		transitionResponse.Body.Close()
 	}
 }
 
@@ -606,7 +576,15 @@ func TestOntologyProposalMorphismUsesKeyReferencesAndWireCodecs(t *testing.T) {
 		len(projected.Targets) != 1 || projected.Targets[0] != targetID ||
 		len(projected.EvidenceIDs) != 1 ||
 		projected.EvidenceIDs[0] != base64.RawURLEncoding.EncodeToString(
-			[]byte(expectedEvidence.ID())) {
+			[]byte(expectedEvidence.ID())) ||
+		len(projected.Evidence) != 1 ||
+		projected.Evidence[0].ID != projected.EvidenceIDs[0] ||
+		projected.Evidence[0].Citation != evidenceDraft.Citation ||
+		projected.Evidence[0].Quote != evidenceDraft.Quote ||
+		projected.Evidence[0].Metadata["source"] != "test" ||
+		projected.Evidence[0].Path == nil ||
+		len(projected.Evidence[0].Path.Nodes) != 1 ||
+		projected.Evidence[0].Path.Nodes[0].ID != "node:opaque/value" {
 		t.Fatalf("projected morphism IDs = %+v", projected)
 	}
 	if !reflect.DeepEqual(projected.Metadata, metadata) {

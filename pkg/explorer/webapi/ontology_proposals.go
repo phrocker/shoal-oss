@@ -49,7 +49,6 @@ type OntologyProposalProvider interface {
 
 type ontologyProposalStoreClient interface {
 	OntologyProposals(context.Context) ([]ontology.GovernedProposal, error)
-	OntologyProposalsForMutation(context.Context) ([]ontology.GovernedProposal, error)
 	CreateOntologyProposal(
 		context.Context, ontology.GovernedProposal, ontology.OntologyVersion,
 	) error
@@ -140,20 +139,29 @@ type OntologyMorphismEvidenceDraft struct {
 	Metadata shoal.Metadata    `json:"metadata,omitempty"`
 }
 
+type OntologyMorphismEvidenceProjection struct {
+	ID       string            `json:"id"`
+	Citation document.Citation `json:"citation"`
+	Quote    string            `json:"quote,omitempty"`
+	Path     *graph.Path       `json:"path,omitempty"`
+	Metadata shoal.Metadata    `json:"metadata,omitempty"`
+}
+
 type OntologyMorphismProjection struct {
-	ID            string                           `json:"id"`
-	Kind          ontology.MorphismKind            `json:"kind"`
-	Safety        ontology.MorphismSafety          `json:"safety"`
-	SourceSchema  string                           `json:"source_schema_id"`
-	SourceVersion string                           `json:"source_version_id"`
-	TargetSchema  string                           `json:"target_schema_id"`
-	TargetVersion string                           `json:"target_version_id"`
-	Sources       []string                         `json:"sources"`
-	Targets       []string                         `json:"targets"`
-	Discriminator *OntologyDiscriminatorProjection `json:"discriminator,omitempty"`
-	EvidenceIDs   []string                         `json:"evidence_ids"`
-	Rationale     string                           `json:"rationale"`
-	Metadata      shoal.Metadata                   `json:"metadata,omitempty"`
+	ID            string                               `json:"id"`
+	Kind          ontology.MorphismKind                `json:"kind"`
+	Safety        ontology.MorphismSafety              `json:"safety"`
+	SourceSchema  string                               `json:"source_schema_id"`
+	SourceVersion string                               `json:"source_version_id"`
+	TargetSchema  string                               `json:"target_schema_id"`
+	TargetVersion string                               `json:"target_version_id"`
+	Sources       []string                             `json:"sources"`
+	Targets       []string                             `json:"targets"`
+	Discriminator *OntologyDiscriminatorProjection     `json:"discriminator,omitempty"`
+	EvidenceIDs   []string                             `json:"evidence_ids"`
+	Evidence      []OntologyMorphismEvidenceProjection `json:"evidence"`
+	Rationale     string                               `json:"rationale"`
+	Metadata      shoal.Metadata                       `json:"metadata,omitempty"`
 }
 
 type OntologyDiscriminatorProjection struct {
@@ -260,6 +268,74 @@ func (d *OntologyMorphismEvidenceDraft) UnmarshalJSON(data []byte) error {
 	}
 	*d = OntologyMorphismEvidenceDraft{
 		Citation: citation, Quote: wire.Quote, Path: path, Metadata: metadata,
+	}
+	return nil
+}
+
+func (p OntologyMorphismEvidenceProjection) MarshalJSON() ([]byte, error) {
+	var path *wirePath
+	if p.Path != nil {
+		value := wirePathValue(*p.Path)
+		path = &value
+	}
+	return json.Marshal(struct {
+		ID       string       `json:"id"`
+		Citation wireCitation `json:"citation"`
+		Quote    string       `json:"quote,omitempty"`
+		Path     *wirePath    `json:"path,omitempty"`
+		Metadata wireMetadata `json:"metadata,omitempty"`
+	}{
+		ID: p.ID, Citation: wireCitationValue(p.Citation), Quote: p.Quote,
+		Path: path, Metadata: wireMetadataValue(p.Metadata),
+	})
+}
+
+func (p *OntologyMorphismEvidenceProjection) UnmarshalJSON(data []byte) error {
+	var wire struct {
+		ID       string       `json:"id"`
+		Citation wireCitation `json:"citation"`
+		Quote    string       `json:"quote,omitempty"`
+		Path     *wirePath    `json:"path,omitempty"`
+		Metadata wireMetadata `json:"metadata,omitempty"`
+	}
+	if err := strictUnmarshal(data, &wire); err != nil {
+		return err
+	}
+	id, err := decodeID(wire.ID)
+	if err != nil {
+		return fmt.Errorf("id: %w", err)
+	}
+	citation, err := citationValue(wire.Citation)
+	if err != nil {
+		return fmt.Errorf("citation: %w", err)
+	}
+	metadata, err := metadataValue(wire.Metadata)
+	if err != nil {
+		return fmt.Errorf("metadata: %w", err)
+	}
+	var (
+		path    *graph.Path
+		options []ontology.EvidenceOption
+	)
+	if wire.Path != nil {
+		value, pathErr := pathValue(*wire.Path)
+		if pathErr != nil {
+			return fmt.Errorf("path: %w", pathErr)
+		}
+		path = &value
+		options = append(options, ontology.WithEvidencePath(value))
+	}
+	evidence, err := ontology.NewEvidenceRef(
+		citation, wire.Quote, metadata, options...)
+	if err != nil {
+		return err
+	}
+	if evidence.ID() != id {
+		return fmt.Errorf("id does not match evidence content")
+	}
+	*p = OntologyMorphismEvidenceProjection{
+		ID: wire.ID, Citation: citation, Quote: wire.Quote,
+		Path: path, Metadata: metadata,
 	}
 	return nil
 }
@@ -574,7 +650,7 @@ func (s *EmbeddedService) ontologyMutationSnapshot(
 		configured = *s.ontologyVersion
 	}
 	s.ontologyMu.RUnlock()
-	proposals, err := store.OntologyProposalsForMutation(ctx)
+	proposals, err := store.OntologyProposals(ctx)
 	if err != nil {
 		return ontology.OntologyVersion{}, false, nil, err
 	}
@@ -723,8 +799,21 @@ func projectOntologyProposal(
 	for _, morphism := range proposal.Morphisms() {
 		evidence := morphism.Evidence()
 		evidenceIDs := make([]string, len(evidence))
+		evidenceProjected := make(
+			[]OntologyMorphismEvidenceProjection, 0, len(evidence))
 		for index, item := range evidence {
 			evidenceIDs[index] = encodeID(item.ID())
+			path, hasPath := item.Path()
+			var projectedPath *graph.Path
+			if hasPath {
+				projectedPath = &path
+			}
+			evidenceProjected = append(
+				evidenceProjected, OntologyMorphismEvidenceProjection{
+					ID: encodeID(item.ID()), Citation: item.Citation(),
+					Quote: item.Quote(), Path: projectedPath,
+					Metadata: item.Metadata(),
+				})
 		}
 		var discriminator *OntologyDiscriminatorProjection
 		if morphism.Kind() == ontology.MorphismSplit {
@@ -747,6 +836,7 @@ func projectOntologyProposal(
 			Sources:       encodeOntologyIDs(morphism.Sources()),
 			Targets:       encodeOntologyIDs(morphism.Targets()),
 			Discriminator: discriminator, EvidenceIDs: evidenceIDs,
+			Evidence:  evidenceProjected,
 			Rationale: morphism.Rationale(), Metadata: morphism.Metadata(),
 		})
 	}

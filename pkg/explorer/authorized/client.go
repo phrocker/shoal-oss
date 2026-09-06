@@ -46,13 +46,17 @@ type Config struct {
 	// interaction envelopes. It is intentionally separate from Base because
 	// authorization decisions for derived views depend on the stored source
 	// set and authorization fingerprint.
-	InteractionReader  explorer.InteractionReader
-	Resolver           auth.Resolver
-	PolicySelector     PolicySelector
-	EdgePolicySelector EdgePolicySelector
-	PolicyStore        PolicyStore
-	GenerationReader   auth.GenerationReader
-	Clock              func() time.Time
+	InteractionReader explorer.InteractionReader
+	// OntologyInterpreter is an optional explicitly trusted read-time
+	// interpreter. It is separate from Base because Base graph responses are
+	// untrusted and must never be allowed to inject interpretations.
+	OntologyInterpreter explorer.OntologyInterpreter
+	Resolver            auth.Resolver
+	PolicySelector      PolicySelector
+	EdgePolicySelector  EdgePolicySelector
+	PolicyStore         PolicyStore
+	GenerationReader    auth.GenerationReader
+	Clock               func() time.Time
 	// Mosaic optionally enables the sensitivity-domain co-occurrence budget
 	// that defends against the mosaic effect. A zero MaxDomains disables it; a
 	// nonzero MaxDomains requires PolicyStore to implement CoOccurrenceLedger
@@ -67,6 +71,7 @@ type Client struct {
 	vectorScorer        VectorScorer
 	vectorSpaceResolver VectorEmbeddingSpaceResolver
 	interactionSource   explorer.InteractionReader
+	ontologyInterpreter explorer.OntologyInterpreter
 	resolver            auth.Resolver
 	policySelector      PolicySelector
 	edgePolicySelector  EdgePolicySelector
@@ -142,6 +147,7 @@ func NewClient(config Config) (*Client, error) {
 		vectorScorer:        config.VectorScorer,
 		vectorSpaceResolver: vectorSpaceResolver,
 		interactionSource:   config.InteractionReader,
+		ontologyInterpreter: config.OntologyInterpreter,
 		resolver:            config.Resolver,
 		policySelector:      config.PolicySelector,
 		edgePolicySelector:  edgeSelector,

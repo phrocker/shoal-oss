@@ -153,8 +153,8 @@ func (c *Client) applyOntologyLens(
 	if !ok {
 		return result, nil
 	}
-	interpreter, ok := c.base.(explorer.OntologyInterpreter)
-	if !ok {
+	interpreter := c.ontologyInterpreter
+	if isNilDependency(interpreter) {
 		for _, assertion := range result.Assertions {
 			result.Interpretations = append(result.Interpretations,
 				ontology.UnresolvedInterpretation(
