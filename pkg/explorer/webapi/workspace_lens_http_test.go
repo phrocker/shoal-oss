@@ -91,19 +91,17 @@ func TestHTTPSelectableLensIsPerCallerAndPreservesSettings(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer store.Close()
-	provider, err := workspace.NewProvider(store, workspace.ProviderOptions{
-		Resolver: authority.Resolver(),
-		OntologyChoices: httpCallerOntologyChoices{
-			bySubject: map[shoal.ID][]workspace.OntologyChoice{
-				"owner": {
-					{Identity: first, Active: true},
-					{Identity: second},
-				},
-				"other": {{Identity: second, Active: true}},
+	options := settingsProviderOptions(authority.Resolver(), now)
+	options.OntologyChoices = httpCallerOntologyChoices{
+		bySubject: map[shoal.ID][]workspace.OntologyChoice{
+			"owner": {
+				{Identity: first, Active: true},
+				{Identity: second},
 			},
+			"other": {{Identity: second, Active: true}},
 		},
-		Clock: func() time.Time { return now },
-	})
+	}
+	provider, err := workspace.NewProvider(store, options)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -163,7 +161,7 @@ func TestHTTPSelectableLensIsPerCallerAndPreservesSettings(t *testing.T) {
 
 	response = settingsRequest(
 		t, handler, http.MethodGet, lensPath, nil, "other", "")
-	if response.Code != http.StatusUnauthorized {
+	if response.Code != http.StatusNotFound {
 		t.Fatalf("cross-caller lens status = %d, body = %s",
 			response.Code, response.Body.String())
 	}
@@ -277,7 +275,7 @@ func TestHTTPSelectableLensIsPerCallerAndPreservesSettings(t *testing.T) {
 	crossCaller := settingsWorkspaceRequest(
 		t, handler, http.MethodGet, "/api/v1/identity",
 		nil, "other", workspacePath)
-	if crossCaller.Code != http.StatusUnauthorized ||
+	if crossCaller.Code != http.StatusNotFound ||
 		crossCaller.Header().Get("WWW-Authenticate") != "" {
 		t.Fatalf("cross-caller effective status = %d, challenge = %q, body = %s",
 			crossCaller.Code, crossCaller.Header().Get("WWW-Authenticate"),

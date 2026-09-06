@@ -34,8 +34,10 @@ import (
 	"sync"
 
 	"github.com/phrocker/shoal-oss/internal/cclient"
+	"github.com/phrocker/shoal-oss/internal/dirlock"
 	"github.com/phrocker/shoal-oss/internal/engine"
 	"github.com/phrocker/shoal-oss/internal/iterrt"
+	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/ontology"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
@@ -73,8 +75,12 @@ type DurableStore struct {
 	// The engine's point-read path is not concurrent with writes. Serialize the
 	// one settings row operation honestly while retaining engine CAS as the
 	// durable expected-version guard.
-	mu     sync.Mutex
-	engine *engine.Engine
+	mu               sync.Mutex
+	engine           *engine.Engine
+	lock             *dirlock.Lock
+	conditionalWrite func(
+		string, []engine.ConditionalMutation,
+	) ([]bool, error)
 	closed bool
 }
 
@@ -108,8 +114,21 @@ func OpenDurableStore(dir string) (*DurableStore, error) {
 	if strings.TrimSpace(dir) == "" {
 		return nil, invalid("settings directory is required")
 	}
+	lock, err := dirlock.Acquire(dir, ".shoal-workspace-settings.lock")
+	if err != nil {
+		message := "acquire workspace settings directory ownership"
+		if errors.Is(err, dirlock.ErrHeld) {
+			message = "workspace settings directory is already open"
+		}
+		return nil, shoal.WrapError(
+			shoal.ErrorUnavailable,
+			message,
+			err,
+		)
+	}
 	eng, err := engine.Open(dir, engine.Options{})
 	if err != nil {
+		_ = lock.Close()
 		return nil, shoal.WrapError(
 			shoal.ErrorUnavailable, "open workspace settings storage", err)
 	}
@@ -123,11 +142,16 @@ func OpenDurableStore(dir string) (*DurableStore, error) {
 	if !found {
 		if err := eng.CreateTable(settingsTable, engine.TableOptions{}); err != nil {
 			_ = eng.Close()
+			_ = lock.Close()
 			return nil, shoal.WrapError(
 				shoal.ErrorInternal, "create workspace settings table", err)
 		}
 	}
-	return &DurableStore{engine: eng}, nil
+	return &DurableStore{
+		engine:           eng,
+		lock:             lock,
+		conditionalWrite: eng.ConditionalWrite,
+	}, nil
 }
 
 // Close flushes and closes the settings engine.
@@ -141,9 +165,14 @@ func (s *DurableStore) Close() error {
 		return nil
 	}
 	s.closed = true
-	if err := s.engine.Close(); err != nil {
+	engineErr := s.engine.Close()
+	lockErr := s.lock.Close()
+	if engineErr != nil || lockErr != nil {
 		return shoal.WrapError(
-			shoal.ErrorInternal, "close workspace settings storage", err)
+			shoal.ErrorInternal,
+			"close workspace settings storage",
+			errors.Join(engineErr, lockErr),
+		)
 	}
 	return nil
 }
@@ -238,10 +267,10 @@ func (s *DurableStore) CompareAndSwap(
 	}
 	if found {
 		if current.Owner != string(owner) {
-			return Settings{}, authDenied()
+			return Settings{}, auth.ObjectNotFound()
 		}
 		if !bytes.Equal(current.AuthorizationDomain, authorizationDomain) {
-			return Settings{}, authDenied()
+			return Settings{}, auth.ObjectNotFound()
 		}
 		if current.Revision != expectedRevision {
 			return Settings{}, versionConflict()
@@ -286,12 +315,25 @@ func (s *DurableStore) CompareAndSwap(
 	} else {
 		condition.Kind = engine.ConditionAbsent
 	}
-	accepted, err := s.engine.ConditionalWrite(settingsTable, []engine.ConditionalMutation{{
+	accepted, err := s.conditionalWrite(settingsTable, []engine.ConditionalMutation{{
 		Mutation: mutation, Conditions: []engine.Condition{condition},
 	}})
 	if err != nil {
-		return Settings{}, shoal.WrapError(
+		var writeErr error = shoal.WrapError(
 			shoal.ErrorUnavailable, "write workspace settings", err)
+		winner, _, winnerFound, loadErr := s.loadLocked(workspaceID)
+		if loadErr == nil {
+			if replayed, result, replayErr := replayResult(
+				winner, winnerFound, owner, authorizationDomain,
+				expectedRevision, mutationID, digest,
+			); replayed {
+				return result, replayErr
+			}
+		}
+		if loadErr != nil {
+			writeErr = errors.Join(writeErr, loadErr)
+		}
+		return Settings{}, explorer.MarkIndeterminateCommit(writeErr)
 	}
 	if len(accepted) != 1 {
 		return Settings{}, shoal.NewError(
@@ -372,10 +414,10 @@ func replayResult(
 		return false, Settings{}, nil
 	}
 	if record.Owner != string(owner) {
-		return true, Settings{}, authDenied()
+		return true, Settings{}, auth.ObjectNotFound()
 	}
 	if !bytes.Equal(record.AuthorizationDomain, authorizationDomain) {
-		return true, Settings{}, authDenied()
+		return true, Settings{}, auth.ObjectNotFound()
 	}
 	if record.Revision != expectedRevision+1 ||
 		record.LastMutationDigest != digest {

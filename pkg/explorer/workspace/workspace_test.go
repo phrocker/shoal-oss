@@ -39,6 +39,28 @@ type mutableResolver struct {
 	decision auth.Decision
 }
 
+type testGenerationReader struct {
+	generation int64
+}
+
+func (r testGenerationReader) CurrentPolicyGeneration(
+	ctx context.Context,
+	_ []byte,
+) (int64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	return r.generation, nil
+}
+
+func testProviderOptions(resolver auth.Resolver) ProviderOptions {
+	return ProviderOptions{
+		Resolver:         resolver,
+		GenerationReader: testGenerationReader{generation: 7},
+		Clock:            func() time.Time { return testNow },
+	}
+}
+
 func (r *mutableResolver) Resolve(ctx context.Context) (auth.Decision, error) {
 	if err := ctx.Err(); err != nil {
 		return auth.Decision{}, err
@@ -111,10 +133,9 @@ func TestProviderAppliesOnlyNarrowingAndPreservesDecision(t *testing.T) {
 	}
 	base := testDecision(t, decisionOptions{ontology: firstOntology})
 	resolver := &mutableResolver{decision: base}
-	provider, err := NewProvider(store, ProviderOptions{
-		Resolver: resolver, OntologyChoices: choices,
-		Clock: func() time.Time { return testNow },
-	})
+	options := testProviderOptions(resolver)
+	options.OntologyChoices = choices
+	provider, err := NewProvider(store, options)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -225,10 +246,8 @@ func TestExplicitEmptyScopeDiffersFromOmission(t *testing.T) {
 	}
 	defer store.Close()
 	base := testDecision(t, decisionOptions{})
-	provider, err := NewProvider(store, ProviderOptions{
-		Resolver: &mutableResolver{decision: base},
-		Clock:    func() time.Time { return testNow },
-	})
+	provider, err := NewProvider(
+		store, testProviderOptions(&mutableResolver{decision: base}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -280,10 +299,8 @@ func TestProviderRejectsEscalationAndWideningMutations(t *testing.T) {
 	}
 	defer store.Close()
 	base := testDecision(t, decisionOptions{})
-	provider, err := NewProvider(store, ProviderOptions{
-		Resolver: &mutableResolver{decision: base},
-		Clock:    func() time.Time { return testNow },
-	})
+	provider, err := NewProvider(
+		store, testProviderOptions(&mutableResolver{decision: base}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -416,9 +433,7 @@ func TestProviderRevalidatesRevokedDecisionAndOwnership(t *testing.T) {
 	}
 	defer store.Close()
 	resolver := &mutableResolver{decision: testDecision(t, decisionOptions{})}
-	provider, err := NewProvider(store, ProviderOptions{
-		Resolver: resolver, Clock: func() time.Time { return testNow },
-	})
+	provider, err := NewProvider(store, testProviderOptions(resolver))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -442,20 +457,20 @@ func TestProviderRevalidatesRevokedDecisionAndOwnership(t *testing.T) {
 	}
 	resolver.set(testDecision(t, decisionOptions{subject: "other-owner"}))
 	if _, err := provider.Get(context.Background(), "owned"); !shoal.IsErrorCode(
-		err, shoal.ErrorUnauthorized,
+		err, shoal.ErrorNotFound,
 	) {
 		t.Fatalf("cross-owner read error = %v", err)
 	}
 	if _, err := provider.Update(context.Background(), "owned", UpdateRequest{
 		ExpectedRevision: 1, MutationID: "cross-owner",
-	}); !shoal.IsErrorCode(err, shoal.ErrorUnauthorized) {
+	}); !shoal.IsErrorCode(err, shoal.ErrorNotFound) {
 		t.Fatalf("cross-owner write error = %v", err)
 	}
 	resolver.set(testDecision(t, decisionOptions{
 		subject: "owner", domain: []byte("other-domain"),
 	}))
 	if _, err := provider.Get(context.Background(), "owned"); !shoal.IsErrorCode(
-		err, shoal.ErrorUnauthorized,
+		err, shoal.ErrorNotFound,
 	) {
 		t.Fatalf("cross-domain read error = %v", err)
 	}
@@ -489,11 +504,10 @@ func TestProviderRequiresGovernedOntologyChoice(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	provider, err := NewProvider(store, ProviderOptions{
-		Resolver:        &mutableResolver{decision: testDecision(t, decisionOptions{})},
-		OntologyChoices: choices,
-		Clock:           func() time.Time { return testNow },
-	})
+	options := testProviderOptions(
+		&mutableResolver{decision: testDecision(t, decisionOptions{})})
+	options.OntologyChoices = choices
+	provider, err := NewProvider(store, options)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -528,11 +542,9 @@ func TestSelectableLensPreservesSettingsAndDoesNotLeakAcrossCallers(t *testing.T
 			},
 		},
 	}
-	provider, err := NewProvider(store, ProviderOptions{
-		Resolver:        resolver,
-		OntologyChoices: callerChoices,
-		Clock:           func() time.Time { return testNow },
-	})
+	options := testProviderOptions(resolver)
+	options.OntologyChoices = callerChoices
+	provider, err := NewProvider(store, options)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -596,7 +608,7 @@ func TestSelectableLensPreservesSettingsAndDoesNotLeakAcrossCallers(t *testing.T
 	resolver.set(testDecision(t, decisionOptions{subject: "other-owner"}))
 	if _, err := provider.ListOntologyChoices(
 		context.Background(), "lens-workspace",
-	); !shoal.IsErrorCode(err, shoal.ErrorUnauthorized) {
+	); !shoal.IsErrorCode(err, shoal.ErrorNotFound) {
 		t.Fatalf("cross-caller lens listing error = %v", err)
 	}
 	otherChoices, err := provider.ListOntologyChoices(
@@ -630,10 +642,8 @@ func TestUpdateMayAddButNotRemoveOutputPolicies(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer store.Close()
-	provider, err := NewProvider(store, ProviderOptions{
-		Resolver: &mutableResolver{decision: testDecision(t, decisionOptions{})},
-		Clock:    func() time.Time { return testNow },
-	})
+	provider, err := NewProvider(store, testProviderOptions(
+		&mutableResolver{decision: testDecision(t, decisionOptions{})}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -774,11 +784,9 @@ func TestServiceCeilingConstrainsOutputPolicies(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer store.Close()
-	provider, err := NewProvider(store, ProviderOptions{
-		Resolver:        &mutableResolver{decision: decision},
-		CeilingResolver: staticCeilingResolver{ceiling: ceiling},
-		Clock:           func() time.Time { return testNow },
-	})
+	options := testProviderOptions(&mutableResolver{decision: decision})
+	options.CeilingResolver = staticCeilingResolver{ceiling: ceiling}
+	provider, err := NewProvider(store, options)
 	if err != nil {
 		t.Fatal(err)
 	}
