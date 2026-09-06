@@ -698,6 +698,26 @@ func TestActiveOntologyReplaysPublishedChainAcrossRestart(t *testing.T) {
 		t.Fatalf("active chain after restart = configured %v version %q",
 			configured, active.Version())
 	}
+	catalog, configured, err := reopenedService.OntologyCatalog(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !configured || len(catalog.Identities()) != 3 ||
+		catalog.ActiveIdentity() != mustOntologyIdentity(t, active) {
+		t.Fatalf("governed choice catalog after restart = %#v", catalog.Identities())
+	}
+}
+
+func mustOntologyIdentity(
+	t *testing.T,
+	version ontology.OntologyVersion,
+) ontology.OntologyIdentity {
+	t.Helper()
+	identity, err := ontology.NewOntologyIdentity(version)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return identity
 }
 
 func TestOntologyProposalBlastRadiusReportsStructuralDiffWithoutDecorativeCounts(t *testing.T) {
