@@ -20,6 +20,7 @@
 package explorer
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 
@@ -64,6 +65,12 @@ type RecordPublicationHead struct {
 	WinnerID      []byte
 }
 
+type RecordPublicationAttempt struct {
+	Value          []byte
+	ExpectedEpoch  coordination.Epoch
+	ExpectedDigest coordination.Digest
+}
+
 // RecordPublicationAdapter durably publishes one immutable Explorer record.
 // Implementations must persist their canonical logical intent before making
 // any physical write and must resolve ambiguous commits by authoritative
@@ -72,6 +79,7 @@ type RecordPublicationAdapter interface {
 	PublishRecord(context.Context, RecordPublication) (RecordPublicationResult, error)
 	RecordCommitted(context.Context, RecordPublication) (bool, error)
 	RecordHead(context.Context, byte, []byte) (*RecordPublicationHead, error)
+	RecordAttempt(context.Context, RecordPublication) (*RecordPublicationAttempt, error)
 }
 
 var embeddedDefaultPolicy = []byte("embedded/default")
@@ -122,6 +130,58 @@ func documentRecordCommitProbe(row, encoded []byte) RecordPublication {
 	}
 }
 
+func documentRecordAttemptProbe(row []byte) RecordPublication {
+	return RecordPublication{
+		Operation: []byte("explorer-document-record-v1"),
+		Token:     documentRecordKey(row),
+		Table:     EmbeddedTableName,
+		Row:       append([]byte(nil), row...),
+		Family:    []byte(recordCF),
+		Qualifier: []byte(recordCQV2),
+	}
+}
+
+func (e *Explorer) documentRecordAttempt(
+	ctx context.Context,
+	row []byte,
+) (*persistedDocument, *RecordPublicationHead, []byte, bool, error) {
+	if e.publication == nil {
+		return nil, nil, nil, false, nil
+	}
+	attempt, err := e.publication.RecordAttempt(
+		ctx, documentRecordAttemptProbe(row),
+	)
+	if err != nil {
+		return nil, nil, nil, false, shoal.WrapError(
+			shoal.ErrorUnavailable, "read transactional document attempt", err,
+		)
+	}
+	if attempt == nil {
+		return nil, nil, nil, false, nil
+	}
+	var record persistedDocument
+	if err := decodeEmbeddedRecord(
+		attempt.Value, embeddedRecordDocument, &record,
+	); err != nil {
+		return nil, nil, nil, false, shoal.WrapError(
+			shoal.ErrorInternal, "decode transactional document attempt", err,
+		)
+	}
+	if err := validatePersistedDocument(record); err != nil ||
+		!bytes.Equal(row, documentRecordRow(record.Document.ID, record.Revision.ID)) {
+		return nil, nil, nil, false, shoal.NewError(
+			shoal.ErrorInternal, "transactional document attempt is invalid",
+		)
+	}
+	var head *RecordPublicationHead
+	if attempt.ExpectedEpoch != 0 {
+		head = &RecordPublicationHead{
+			Epoch: attempt.ExpectedEpoch, LogicalDigest: attempt.ExpectedDigest,
+		}
+	}
+	return &record, head, append([]byte(nil), attempt.Value...), true, nil
+}
+
 func (e *Explorer) documentRecordHead(
 	ctx context.Context,
 	documentID []byte,
@@ -143,10 +203,15 @@ func (e *Explorer) writeDocumentRecord(
 	row []byte,
 	record *persistedDocument,
 	head *RecordPublicationHead,
+	attemptedValue []byte,
 ) error {
-	encoded, err := encodeEmbeddedRecord(embeddedRecordDocument, record)
-	if err != nil {
-		return shoal.WrapError(shoal.ErrorInternal, "encode explorer record", err)
+	encoded := append([]byte(nil), attemptedValue...)
+	if len(encoded) == 0 {
+		var err error
+		encoded, err = encodeEmbeddedRecord(embeddedRecordDocument, record)
+		if err != nil {
+			return shoal.WrapError(shoal.ErrorInternal, "encode explorer record", err)
+		}
 	}
 	if e.publication == nil {
 		return e.writeEncodedRecord(row, encoded)
@@ -157,7 +222,7 @@ func (e *Explorer) writeDocumentRecord(
 			"transactional document record exceeds the embedded publication bound",
 		)
 	}
-	_, err = e.publication.PublishRecord(
+	_, err := e.publication.PublishRecord(
 		ctx, documentRecordPublication(row, encoded, record, head),
 	)
 	return err

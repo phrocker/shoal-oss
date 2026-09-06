@@ -361,23 +361,42 @@ func (e *Explorer) ingest(
 		}
 	}
 	e.mu.RUnlock()
-	publicationHead, err := e.documentRecordHead(ctx, []byte(parsed.document.ID))
+	row := documentRecordRow(parsed.document.ID, parsed.revision.ID)
+	record, publicationHead, attemptedValue, attempted, err :=
+		e.documentRecordAttempt(ctx, row)
 	if err != nil {
 		return IngestResult{}, err
 	}
-	embeddings, err := e.embedParsedSpans(ctx, parsed.spans)
-	if err != nil {
-		return IngestResult{}, err
-	}
-	record := &persistedDocument{
-		Document:   parsed.document,
-		Revision:   parsed.revision,
-		Source:     parsed.source,
-		Sections:   parsed.sections,
-		Spans:      parsed.spans,
-		Nodes:      parsed.nodes,
-		Edges:      parsed.edges,
-		Embeddings: embeddings,
+	if attempted {
+		if record.Document.ID != parsed.document.ID ||
+			record.Revision.ID != parsed.revision.ID ||
+			record.Source.URI != parsed.source.URI ||
+			record.Source.MediaType != parsed.source.MediaType ||
+			record.Source.Content != parsed.source.Content {
+			return IngestResult{}, shoal.NewError(
+				shoal.ErrorInternal,
+				"transactional document attempt disagrees with the source",
+			)
+		}
+	} else {
+		publicationHead, err = e.documentRecordHead(ctx, []byte(parsed.document.ID))
+		if err != nil {
+			return IngestResult{}, err
+		}
+		embeddings, err := e.embedParsedSpans(ctx, parsed.spans)
+		if err != nil {
+			return IngestResult{}, err
+		}
+		record = &persistedDocument{
+			Document:   parsed.document,
+			Revision:   parsed.revision,
+			Source:     parsed.source,
+			Sections:   parsed.sections,
+			Spans:      parsed.spans,
+			Nodes:      parsed.nodes,
+			Edges:      parsed.edges,
+			Embeddings: embeddings,
+		}
 	}
 
 	e.mu.Lock()
@@ -390,10 +409,6 @@ func (e *Explorer) ingest(
 			return ingestResult(existing, IngestUnchanged), nil
 		}
 	}
-	if e.lastPublicationSequence == math.MaxUint64 {
-		return IngestResult{}, shoal.NewError(
-			shoal.ErrorUnavailable, "embedded publication sequence is exhausted")
-	}
 	if record.Embeddings != nil {
 		if err := e.ensureEmbeddingSpaceCompatibleLocked(
 			record.Embeddings.Provenance,
@@ -405,14 +420,29 @@ func (e *Explorer) ingest(
 			found:      true,
 		}
 	}
-	record.PublishedAt = time.Now().UTC()
-	// A write error can occur after the WAL append committed, so attempted
-	// publication sequences must never be reused.
-	e.lastPublicationSequence++
-	record.PublicationSequence = e.lastPublicationSequence
+	if attempted {
+		if record.PublicationSequence == 0 || record.PublishedAt.IsZero() {
+			return IngestResult{}, shoal.NewError(
+				shoal.ErrorInternal,
+				"transactional document attempt has no publication coordinate",
+			)
+		}
+		if record.PublicationSequence > e.lastPublicationSequence {
+			e.lastPublicationSequence = record.PublicationSequence
+		}
+	} else {
+		if e.lastPublicationSequence == math.MaxUint64 {
+			return IngestResult{}, shoal.NewError(
+				shoal.ErrorUnavailable, "embedded publication sequence is exhausted")
+		}
+		record.PublishedAt = time.Now().UTC()
+		// A write error can occur after the WAL append committed, so attempted
+		// publication sequences must never be reused.
+		e.lastPublicationSequence++
+		record.PublicationSequence = e.lastPublicationSequence
+	}
 	if err := e.writeDocumentRecord(
-		ctx, documentRecordRow(record.Document.ID, record.Revision.ID), record,
-		publicationHead,
+		ctx, row, record, publicationHead, attemptedValue,
 	); err != nil {
 		return IngestResult{}, err
 	}

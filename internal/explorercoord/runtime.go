@@ -32,11 +32,11 @@ import (
 	"time"
 
 	"github.com/phrocker/shoal-oss/internal/engine"
+	"github.com/phrocker/shoal-oss/internal/localwal"
 	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/explorer/coordination"
 	"github.com/phrocker/shoal-oss/pkg/explorer/coordination/allocator"
 	"github.com/phrocker/shoal-oss/pkg/explorer/coordination/guard"
-	"github.com/phrocker/shoal-oss/pkg/explorer/coordination/recovery"
 	"github.com/phrocker/shoal-oss/pkg/explorer/coordination/transaction"
 )
 
@@ -88,29 +88,30 @@ type Result struct {
 // Publish concurrently through one Runtime. Multiple processes may not open
 // the same directory.
 type Runtime struct {
-	mu             sync.RWMutex
-	recoveryMu     sync.Mutex
-	closed         bool
-	engine         *engine.Engine
-	lock           *os.File
-	store          *EngineStore
-	protocolStore  coordinationStore
-	intents        *IntentStore
-	physical       *Physical
-	physicalTables map[string]struct{}
-	allocator      *allocator.Client
-	guards         *guard.Client
-	coordinator    *transaction.Coordinator
-	recovery       *recovery.Worker
-	domain         coordination.DomainID
-	owner          coordination.OwnerID
-	authority      transaction.Authority
-	lease          time.Duration
-	clock          func() time.Time
-	recoveryLimit  int
-	recoveryPages  int
-	intentCursor   []byte
-	intentDone     bool
+	mu                  sync.RWMutex
+	recoveryMu          sync.Mutex
+	closed              bool
+	engine              *engine.Engine
+	lock                *os.File
+	store               *EngineStore
+	protocolStore       coordinationStore
+	intents             *IntentStore
+	physical            *Physical
+	physicalTables      map[string]struct{}
+	allocator           *allocator.Client
+	guards              *guard.Client
+	coordinator         *transaction.Coordinator
+	domain              coordination.DomainID
+	owner               coordination.OwnerID
+	authority           transaction.Authority
+	lease               time.Duration
+	clock               func() time.Time
+	recoveryLimit       int
+	recoveryPages       int
+	recoveryConcurrency int
+	recoveryRounds      int
+	recoveryBackoff     time.Duration
+	intentCursor        []byte
 }
 
 func Open(config Config) (*Runtime, error) {
@@ -138,6 +139,12 @@ func Open(config Config) (*Runtime, error) {
 	if len(config.ControlVisibility) > coordination.MaxCoordinateBytes {
 		return nil, errors.Join(transaction.ErrInvalid, errors.New("control visibility exceeds its bound"))
 	}
+	if config.EngineOptions.WALSyncMode != localwal.SyncFull {
+		return nil, errors.Join(
+			transaction.ErrInvalid,
+			errors.New("transaction runtime requires full per-write WAL sync"),
+		)
+	}
 	if config.Clock == nil {
 		config.Clock = time.Now
 	}
@@ -155,6 +162,27 @@ func Open(config Config) (*Runtime, error) {
 	}
 	if config.RecoveryLimit == 0 {
 		config.RecoveryLimit = 256
+	}
+	if config.RecoveryLimit < 1 || config.RecoveryLimit > 10_000 {
+		return nil, errors.Join(transaction.ErrInvalid, errors.New("recovery limit is outside its bound"))
+	}
+	if config.RecoveryConcurrency == 0 {
+		config.RecoveryConcurrency = 4
+	}
+	if config.RecoveryConcurrency < 1 || config.RecoveryConcurrency > 256 {
+		return nil, errors.Join(transaction.ErrInvalid, errors.New("recovery concurrency is outside its bound"))
+	}
+	if config.RecoveryRounds == 0 {
+		config.RecoveryRounds = 3
+	}
+	if config.RecoveryRounds < 1 || config.RecoveryRounds > 100 {
+		return nil, errors.Join(transaction.ErrInvalid, errors.New("recovery rounds are outside their bound"))
+	}
+	if config.RecoveryBackoff == 0 {
+		config.RecoveryBackoff = 25 * time.Millisecond
+	}
+	if config.RecoveryBackoff < 0 || config.RecoveryBackoff > time.Minute {
+		return nil, errors.Join(transaction.ErrInvalid, errors.New("recovery backoff is outside its bound"))
 	}
 	if config.RecoveryMaxPages == 0 {
 		config.RecoveryMaxPages = 4096
@@ -257,7 +285,8 @@ func Open(config Config) (*Runtime, error) {
 		domain:         append(coordination.DomainID(nil), config.Domain...),
 		owner:          append(coordination.OwnerID(nil), config.Owner...), authority: cloneAuthority(config.Authority),
 		lease: config.Lease, clock: config.Clock, recoveryLimit: config.RecoveryLimit,
-		recoveryPages: config.RecoveryMaxPages,
+		recoveryPages: config.RecoveryMaxPages, recoveryConcurrency: config.RecoveryConcurrency,
+		recoveryRounds: config.RecoveryRounds, recoveryBackoff: config.RecoveryBackoff,
 	}
 	if err := runtime.compose(config, physicalWriter); err != nil {
 		return closeOnError(err)
@@ -292,19 +321,7 @@ func (r *Runtime) compose(config Config, physicalWriter transaction.PhysicalWrit
 		return err
 	}
 	proxy.coordinator = coordinator
-	worker, err := recovery.New(recovery.Config{
-		Domain: r.domain, Owner: r.owner, Authority: cloneAuthority(r.authority),
-		Source: recovery.BandedSource{
-			Scanner: r.protocolStore, ControlVisibility: append([]byte(nil), config.ControlVisibility...),
-		},
-		Coordinator: coordinator, Clock: r.clock, Lease: r.lease,
-		Limit: config.RecoveryLimit, Concurrency: config.RecoveryConcurrency,
-		MaxRounds: config.RecoveryRounds, Backoff: config.RecoveryBackoff,
-	})
-	if err != nil {
-		return err
-	}
-	r.guards, r.coordinator, r.recovery = guards, coordinator, worker
+	r.guards, r.coordinator = guards, coordinator
 	return nil
 }
 
@@ -359,10 +376,26 @@ func (r *Runtime) publishLocked(
 		Owner: owner, LeaseUntil: leaseUntil, Authority: cloneAuthority(r.authority),
 	})
 	if err != nil {
-		return Result{}, r.classifyPublishFailure(ctx, record.TXN, err)
+		classified := r.classifyPublishFailure(ctx, record.TXN, err)
+		if !errors.Is(classified, ErrIndeterminatePublication) {
+			if settleErr := r.intents.Settle(
+				ctx, record.TXN, record.LogicalDigest,
+			); settleErr != nil {
+				classified = errors.Join(classified, settleErr)
+			}
+		}
+		return Result{}, classified
 	}
 	if err := r.intents.Complete(ctx, record.TXN, record.LogicalDigest, result.Epoch); err != nil {
 		return Result{}, errors.Join(ErrIndeterminatePublication, err)
+	}
+	if err := r.intents.Settle(ctx, record.TXN, record.LogicalDigest); err != nil {
+		return Result{}, errors.Join(ErrIndeterminatePublication, err)
+	}
+	if hook := runtimeStageHook(r.protocolStore); hook != nil {
+		if err := hook(recoveryStageComplete); err != nil {
+			return Result{}, errors.Join(ErrIndeterminatePublication, err)
+		}
 	}
 	return Result{
 		TXN: append(coordination.TXN(nil), record.TXN...), LogicalDigest: record.LogicalDigest,
@@ -532,6 +565,57 @@ func (r *Runtime) RecordHead(
 	}, nil
 }
 
+func (r *Runtime) RecordAttempt(
+	ctx context.Context,
+	request explorer.RecordPublication,
+) (*explorer.RecordPublicationAttempt, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if r.closed {
+		return nil, transaction.ErrUnavailable
+	}
+	txn, err := DeriveTXN(r.domain, request.Operation, request.Token)
+	if err != nil {
+		return nil, err
+	}
+	record, err := r.intents.Load(ctx, txn)
+	if errors.Is(err, transaction.ErrNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if len(record.Intent.Guards) != 1 {
+		return nil, fmt.Errorf(
+			"%w: record attempt guard count is invalid", transaction.ErrInternal,
+		)
+	}
+	var value []byte
+	for _, cell := range record.Intent.Cells {
+		if cell.Table == request.Table &&
+			bytes.Equal(cell.Row, request.Row) &&
+			bytes.Equal(cell.Family, request.Family) &&
+			bytes.Equal(cell.Qualifier, request.Qualifier) &&
+			bytes.Equal(cell.Visibility, request.Visibility) {
+			if value != nil {
+				return nil, fmt.Errorf(
+					"%w: record attempt has duplicate physical cells",
+					transaction.ErrInternal,
+				)
+			}
+			value = append([]byte(nil), cell.Value...)
+		}
+	}
+	if value == nil {
+		return nil, transaction.ErrConflict
+	}
+	expected := record.Intent.Guards[0]
+	return &explorer.RecordPublicationAttempt{
+		Value: value, ExpectedEpoch: expected.ExpectedEpoch,
+		ExpectedDigest: expected.ExpectedDigest,
+	}, nil
+}
+
 func (r *Runtime) intentMatchesRecord(
 	intent Intent,
 	request explorer.RecordPublication,
@@ -591,32 +675,51 @@ func (r *Runtime) RecoverPage(ctx context.Context) (more bool, err error) {
 	if r.closed {
 		return false, transaction.ErrUnavailable
 	}
-	if !r.intentDone {
-		candidates, next, err := r.intents.Candidates(ctx, r.intentCursor, r.recoveryLimit)
-		if err != nil {
-			return false, errors.Join(transaction.ErrUnavailable, err)
-		}
-		for _, txn := range candidates {
-			if err := r.recoverIntent(ctx, txn); err != nil {
-				return false, err
-			}
-		}
-		r.intentCursor = append(r.intentCursor[:0], next...)
-		if len(next) != 0 {
-			return true, nil
-		}
-		r.intentDone = true
-	}
-	more, err = r.recovery.RunPage(ctx)
+	candidates, next, err := r.intents.Candidates(
+		ctx, r.intentCursor, r.recoveryLimit,
+	)
 	if err != nil {
-		return more, err
+		return false, errors.Join(transaction.ErrUnavailable, err)
 	}
-	if !more {
+	workerCount := min(r.recoveryConcurrency, len(candidates))
+	jobs := make(chan coordination.TXN)
+	errs := make(chan error, len(candidates))
+	var workers sync.WaitGroup
+	for range workerCount {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			for txn := range jobs {
+				if recoverErr := r.recoverPending(ctx, txn); recoverErr != nil {
+					errs <- recoverErr
+				}
+			}
+		}()
+	}
+send:
+	for _, txn := range candidates {
+		select {
+		case jobs <- append(coordination.TXN(nil), txn...):
+		case <-ctx.Done():
+			errs <- ctx.Err()
+			break send
+		}
+	}
+	close(jobs)
+	workers.Wait()
+	close(errs)
+	var combined error
+	for recoverErr := range errs {
+		combined = errors.Join(combined, recoverErr)
+	}
+	if combined != nil {
+		return len(next) != 0, combined
+	}
+	r.intentCursor = append(r.intentCursor[:0], next...)
+	if len(next) == 0 {
 		r.intentCursor = nil
-		r.intentDone = false
-		r.recovery.Reset()
 	}
-	return more, nil
+	return len(next) != 0, nil
 }
 
 func (r *Runtime) Recover(ctx context.Context) error {
@@ -640,7 +743,7 @@ func (r *Runtime) recoverIntent(ctx context.Context, txn coordination.TXN) error
 	if _, complete, err := r.intents.Completed(ctx, txn, record.LogicalDigest); err != nil {
 		return err
 	} else if complete {
-		return nil
+		return r.intents.Settle(ctx, txn, record.LogicalDigest)
 	}
 	leaseUntil := r.clock().UTC().Add(r.lease)
 	snapshot, inspectErr := r.coordinator.Inspect(ctx, txn)
@@ -648,7 +751,7 @@ func (r *Runtime) recoverIntent(ctx context.Context, txn coordination.TXN) error
 	switch {
 	case inspectErr == nil && snapshot.Root.State.Terminal() &&
 		snapshot.Root.State != coordination.StateCommitted:
-		return nil
+		return r.intents.Settle(ctx, txn, record.LogicalDigest)
 	case inspectErr == nil && snapshot.Root.State.Nonterminal() &&
 		snapshot.Lease.LeaseUntil.After(r.clock().UTC()) &&
 		!bytes.Equal(snapshot.Root.Owner, r.owner):
@@ -668,7 +771,32 @@ func (r *Runtime) recoverIntent(ctx context.Context, txn coordination.TXN) error
 	if err != nil {
 		return err
 	}
-	return r.intents.Complete(ctx, record.TXN, record.LogicalDigest, result.Epoch)
+	if err := r.intents.Complete(
+		ctx, record.TXN, record.LogicalDigest, result.Epoch,
+	); err != nil {
+		return err
+	}
+	return r.intents.Settle(ctx, record.TXN, record.LogicalDigest)
+}
+
+func (r *Runtime) recoverPending(
+	ctx context.Context,
+	txn coordination.TXN,
+) error {
+	for round := 0; round < r.recoveryRounds; round++ {
+		err := r.recoverIntent(ctx, txn)
+		if err == nil || !errors.Is(err, transaction.ErrUnavailable) {
+			return err
+		}
+		timer := time.NewTimer(r.recoveryBackoff << min(round, 8))
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+	return transaction.ErrUnavailable
 }
 
 func (r *Runtime) classifyPublishFailure(
@@ -908,6 +1036,7 @@ const (
 	recoveryStagePrepared
 	recoveryStageCommitted
 	recoveryStageCheckpoint
+	recoveryStageComplete
 )
 
 type stageStore struct {

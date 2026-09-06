@@ -56,6 +56,13 @@ func (*rejectingPublicationAdapter) RecordHead(
 	return nil, nil
 }
 
+func (*rejectingPublicationAdapter) RecordAttempt(
+	context.Context,
+	RecordPublication,
+) (*RecordPublicationAttempt, error) {
+	return nil, nil
+}
+
 func TestConfiguredPublicationRejectsOversizedDocumentWithoutDirectWrite(t *testing.T) {
 	source := Source{
 		URI: "file:///oversized.txt", MediaType: MediaTypeText,
@@ -76,6 +83,7 @@ func TestConfiguredPublicationRejectsOversizedDocumentWithoutDirectWrite(t *test
 		context.Background(),
 		documentRecordRow(record.Document.ID, record.Revision.ID),
 		record,
+		nil,
 		nil,
 	)
 	if !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {

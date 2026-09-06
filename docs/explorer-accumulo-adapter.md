@@ -1797,6 +1797,19 @@ Both scans use bounded row cursors, not `Snapshot.Frontier`; repeated recovery
 is idempotent. An unavailable or canceled call after intent persistence is an
 indeterminate publication, never an implicit rollback.
 
+The embedded implementation maintains a row-atomic pending marker beside each
+new durable intent and removes it when the transaction commits or reaches a
+non-committed terminal state. Startup therefore scans only outstanding work;
+completed corpus history does not consume the recovery page budget. A retry of
+an Explorer document publication reloads the exact encoded attempted record,
+including its original publication time, sequence, and expected entity head,
+instead of regenerating transient values under the same TXN.
+
+The transaction runtime accepts only `localwal.SyncFull`. `SyncNormal` and
+`SyncOff` are rejected before the engine is opened because coordination and
+physical tables have independent WALs; allowing a commit/checkpoint WAL to
+survive while a physical WAL is lost would violate the publication fence.
+
 `Runtime.ScanCommitted` is the read-only physical event/registry seam. It pins
 one allocator frontier, scans only a configured table and exact
 family/qualifier/visibility under a bounded row prefix, and returns the newest

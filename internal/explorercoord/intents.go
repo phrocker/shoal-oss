@@ -45,6 +45,7 @@ const (
 var (
 	intentFamily      = []byte("i")
 	intentQualifier   = []byte("intent")
+	pendingQualifier  = []byte("pending")
 	completeQualifier = []byte("complete")
 	quarantineFamily  = []byte("q")
 	quarantineCQ      = []byte("reason")
@@ -204,9 +205,19 @@ func (s *IntentStore) Put(
 	}
 	coordinate := s.intentCoordinate(txn)
 	mutation := allocator.Mutation{
-		Row:        coordinate.Row,
-		Conditions: []allocator.Condition{{Coordinate: coordinate, Absent: true}},
-		Updates:    []allocator.Update{{Coordinate: coordinate, Value: encoded, Timestamp: intentVersion}},
+		Row: coordinate.Row,
+		Conditions: []allocator.Condition{
+			{Coordinate: coordinate, Absent: true},
+			{Coordinate: s.pendingCoordinate(txn), Absent: true},
+		},
+		Updates: []allocator.Update{
+			{Coordinate: coordinate, Value: encoded, Timestamp: intentVersion},
+			{
+				Coordinate: s.pendingCoordinate(txn),
+				Value:      digest[:],
+				Timestamp:  intentVersion,
+			},
+		},
 	}
 	for attempt := 0; attempt <= 3; attempt++ {
 		status, writeErr := s.store.CompareAndMutate(ctx, mutation)
@@ -220,6 +231,9 @@ func (s *IntentStore) Put(
 				return storedIntent{}, false, encodeErr
 			}
 			if bytes.Equal(existingBytes, encoded) {
+				if err := s.ensurePending(ctx, existing); err != nil {
+					return storedIntent{}, false, err
+				}
 				return existing, true, nil
 			}
 			return storedIntent{}, false, transaction.ErrConflict
@@ -290,7 +304,14 @@ func (s *IntentStore) Complete(
 	mutation := allocator.Mutation{
 		Row:        coordinate.Row,
 		Conditions: []allocator.Condition{{Coordinate: coordinate, Absent: true}},
-		Updates:    []allocator.Update{{Coordinate: coordinate, Value: value, Timestamp: int64(epoch)}},
+		Updates: []allocator.Update{
+			{Coordinate: coordinate, Value: value, Timestamp: int64(epoch)},
+			{
+				Coordinate: s.pendingCoordinate(txn),
+				Delete:     true,
+				Timestamp:  intentVersion,
+			},
+		},
 	}
 	status, writeErr := s.store.CompareAndMutate(ctx, mutation)
 	if status == allocator.StatusAccepted {
@@ -349,13 +370,16 @@ func (s *IntentStore) Candidates(
 		start = after
 	}
 	cells, err := s.store.ScanPrefixFrom(
-		ctx, prefix, start, intentFamily, intentQualifier, s.visibility, limit,
+		ctx, prefix, start, intentFamily, pendingQualifier, s.visibility, limit,
 	)
 	if err != nil {
 		return nil, nil, err
 	}
 	result := make([]coordination.TXN, 0, len(cells))
 	for _, cell := range cells {
+		if cell.Timestamp != intentVersion || len(cell.Value) != len(coordination.Digest{}) {
+			return nil, nil, errors.New("explorer coordination: invalid pending intent marker")
+		}
 		txn, parseErr := s.parseIntentRow(cell.Coordinate.Row)
 		if parseErr != nil {
 			return nil, nil, parseErr
@@ -423,6 +447,95 @@ func (s *IntentStore) completionCoordinate(txn coordination.TXN) allocator.Coord
 		Row: s.intentRow(txn), Family: append([]byte(nil), intentFamily...),
 		Qualifier: append([]byte(nil), completeQualifier...), Visibility: append([]byte(nil), s.visibility...),
 	}
+}
+
+func (s *IntentStore) pendingCoordinate(txn coordination.TXN) allocator.Coordinate {
+	return allocator.Coordinate{
+		Row: s.intentRow(txn), Family: append([]byte(nil), intentFamily...),
+		Qualifier: append([]byte(nil), pendingQualifier...), Visibility: append([]byte(nil), s.visibility...),
+	}
+}
+
+func (s *IntentStore) ensurePending(
+	ctx context.Context,
+	record storedIntent,
+) error {
+	if _, complete, err := s.Completed(
+		ctx, record.TXN, record.LogicalDigest,
+	); err != nil {
+		return err
+	} else if complete {
+		return nil
+	}
+	coordinate := s.pendingCoordinate(record.TXN)
+	mutation := allocator.Mutation{
+		Row:        coordinate.Row,
+		Conditions: []allocator.Condition{{Coordinate: coordinate, Absent: true}},
+		Updates: []allocator.Update{{
+			Coordinate: coordinate, Value: record.LogicalDigest[:],
+			Timestamp: intentVersion,
+		}},
+	}
+	status, writeErr := s.store.CompareAndMutate(ctx, mutation)
+	if status == allocator.StatusAccepted {
+		return nil
+	}
+	cells, readErr := s.store.ReadExact(ctx, []allocator.Coordinate{coordinate})
+	if readErr != nil {
+		return errors.Join(transaction.ErrUnavailable, writeErr, readErr)
+	}
+	if len(cells) == 1 && cells[0].Timestamp == intentVersion &&
+		bytes.Equal(cells[0].Value, record.LogicalDigest[:]) {
+		return nil
+	}
+	if status == allocator.StatusRejected {
+		return transaction.ErrConflict
+	}
+	return errors.Join(transaction.ErrUnavailable, allocator.ErrConditionalUnknown, writeErr)
+}
+
+func (s *IntentStore) Settle(
+	ctx context.Context,
+	txn coordination.TXN,
+	logicalDigest coordination.Digest,
+) error {
+	coordinate := s.pendingCoordinate(txn)
+	cells, err := s.store.ReadExact(ctx, []allocator.Coordinate{coordinate})
+	if err != nil {
+		return errors.Join(transaction.ErrUnavailable, err)
+	}
+	if len(cells) == 0 {
+		return nil
+	}
+	if len(cells) != 1 || cells[0].Timestamp != intentVersion ||
+		!bytes.Equal(cells[0].Value, logicalDigest[:]) {
+		return fmt.Errorf("%w: pending intent marker is invalid", transaction.ErrInternal)
+	}
+	mutation := allocator.Mutation{
+		Row: coordinate.Row,
+		Conditions: []allocator.Condition{{
+			Coordinate: coordinate, Value: cells[0].Value,
+			Timestamp: cells[0].Timestamp, TimestampSet: true,
+		}},
+		Updates: []allocator.Update{{
+			Coordinate: coordinate, Delete: true, Timestamp: intentVersion,
+		}},
+	}
+	status, writeErr := s.store.CompareAndMutate(ctx, mutation)
+	if status == allocator.StatusAccepted {
+		return nil
+	}
+	after, readErr := s.store.ReadExact(ctx, []allocator.Coordinate{coordinate})
+	if readErr != nil {
+		return errors.Join(transaction.ErrUnavailable, writeErr, readErr)
+	}
+	if len(after) == 0 {
+		return nil
+	}
+	if status == allocator.StatusRejected {
+		return transaction.ErrConflict
+	}
+	return errors.Join(transaction.ErrUnavailable, allocator.ErrConditionalUnknown, writeErr)
 }
 
 func (s *IntentStore) intentPrefix() []byte {

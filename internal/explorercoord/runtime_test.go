@@ -30,6 +30,8 @@ import (
 	"time"
 
 	"github.com/phrocker/shoal-oss/internal/cclient"
+	"github.com/phrocker/shoal-oss/internal/engine"
+	"github.com/phrocker/shoal-oss/internal/localwal"
 	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/explorer/coordination"
 	"github.com/phrocker/shoal-oss/pkg/explorer/coordination/allocator"
@@ -201,6 +203,7 @@ func TestRuntimeCrashRecoveryAtEveryDurableStage(t *testing.T) {
 		recoveryStagePrepared,
 		recoveryStageCommitted,
 		recoveryStageCheckpoint,
+		recoveryStageComplete,
 	}
 	for _, stage := range stages {
 		t.Run(fmt.Sprintf("stage-%d", stage), func(t *testing.T) {
@@ -273,6 +276,167 @@ func TestRuntimeCrashRecoveryAtEveryDurableStage(t *testing.T) {
 				t.Fatalf("recovered frontier = %#v, %v", head, err)
 			}
 		})
+	}
+}
+
+func TestExplorerRetryReusesDurableAttemptAcrossPublicationFaults(t *testing.T) {
+	for _, stage := range []recoveryStage{
+		recoveryStageIntent,
+		recoveryStageCommitted,
+		recoveryStageComplete,
+	} {
+		t.Run(fmt.Sprintf("stage-%d", stage), func(t *testing.T) {
+			config := testRuntimeConfig(t, testDirectory(t))
+			fired := false
+			config.testStageHook = func(got recoveryStage) error {
+				if got == stage && !fired {
+					fired = true
+					return context.Canceled
+				}
+				return nil
+			}
+			embedded, err := OpenExplorer(config, explorer.Options{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer embedded.Close()
+			source := explorer.Source{
+				URI: "file:///retry.md", Title: "Retry",
+				MediaType: explorer.MediaTypeMarkdown,
+				Content:   "# Retry\n\nExactly once.\n",
+			}
+			analyzed, err := explorer.AnalyzeSource(source)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := embedded.Explorer.Ingest(
+				context.Background(), source,
+			); err == nil || !explorer.IsIndeterminateCommit(err) {
+				t.Fatalf("first ingest at stage %d = %v", stage, err)
+			}
+			row := []byte(
+				"document/" + string(analyzed.Document.ID) + "/" +
+					string(analyzed.Revision.ID),
+			)
+			attempt, err := embedded.Runtime.RecordAttempt(
+				context.Background(),
+				explorer.RecordPublication{
+					Operation: []byte("explorer-document-record-v1"),
+					Token:     documentTestRecordKey(row),
+					Table:     explorer.EmbeddedTableName, Row: row,
+					Family: []byte("record"), Qualifier: []byte("v2"),
+				},
+			)
+			if err != nil || attempt == nil || len(attempt.Value) == 0 {
+				t.Fatalf("durable attempt at stage %d = %#v, %v", stage, attempt, err)
+			}
+			retry, err := embedded.Explorer.Ingest(context.Background(), source)
+			if err != nil || retry.Revision.ID != analyzed.Revision.ID {
+				t.Fatalf("retry at stage %d = %#v, %v", stage, retry, err)
+			}
+			after, err := embedded.Runtime.RecordAttempt(
+				context.Background(),
+				explorer.RecordPublication{
+					Operation: []byte("explorer-document-record-v1"),
+					Token:     documentTestRecordKey(row),
+					Table:     explorer.EmbeddedTableName, Row: row,
+					Family: []byte("record"), Qualifier: []byte("v2"),
+				},
+			)
+			if err != nil || after == nil || !bytes.Equal(after.Value, attempt.Value) ||
+				after.ExpectedEpoch != attempt.ExpectedEpoch ||
+				after.ExpectedDigest != attempt.ExpectedDigest {
+				t.Fatalf("attempt changed at stage %d: before %#v after %#v err %v", stage, attempt, after, err)
+			}
+			documents, err := embedded.Explorer.Documents(context.Background())
+			if err != nil || len(documents) != 1 ||
+				documents[0].Revision.ID != analyzed.Revision.ID {
+				t.Fatalf("retry documents at stage %d = %#v, %v", stage, documents, err)
+			}
+		})
+	}
+}
+
+func TestRuntimeRequiresFullPerWriteWALSync(t *testing.T) {
+	tests := []struct {
+		name    string
+		options engine.Options
+	}{
+		{
+			name: "normal",
+			options: engine.Options{
+				WALSyncMode: localwal.SyncNormal,
+			},
+		},
+		{
+			name: "off",
+			options: engine.Options{
+				WALSyncMode: localwal.SyncOff,
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			config := testRuntimeConfig(t, testDirectory(t))
+			config.EngineOptions = test.options
+			if runtime, err := Open(config); err == nil ||
+				!errors.Is(err, transaction.ErrInvalid) {
+				if runtime != nil {
+					_ = runtime.Close()
+				}
+				t.Fatalf("unsafe WAL configuration = %v", err)
+			}
+		})
+	}
+	config := testRuntimeConfig(t, testDirectory(t))
+	config.EngineOptions = engine.Options{
+		WALSyncMode: localwal.SyncFull, WALSyncInterval: time.Millisecond,
+	}
+	runtime, err := Open(config)
+	if err != nil {
+		t.Fatalf("full sync with no-op interval = %v", err)
+	}
+	_ = runtime.Close()
+}
+
+func TestRecoveryPageBoundIgnoresCompletedHistory(t *testing.T) {
+	directory := testDirectory(t)
+	config := testRuntimeConfig(t, directory)
+	config.RecoveryLimit = 1
+	config.RecoveryMaxPages = 1
+	runtime, err := Open(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for index := 0; index < 5; index++ {
+		row := []byte(fmt.Sprintf("history/%d", index))
+		intent := committedReadIntent(
+			t, config.Domain, fmt.Sprintf("history-%d", index),
+			row, []byte("committed"), guard.ModeAbsentOrIdentical,
+			0, coordination.Digest{},
+		)
+		if _, err := runtime.Publish(
+			context.Background(), Request{Intent: intent},
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if candidates, _, err := runtime.intents.Candidates(
+		context.Background(), nil, 1,
+	); err != nil || len(candidates) != 0 {
+		t.Fatalf("completed pending candidates = %#v, %v", candidates, err)
+	}
+	if err := runtime.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(config)
+	if err != nil {
+		t.Fatalf("tiny-page reopen after completed history: %v", err)
+	}
+	defer reopened.Close()
+	head, err := reopened.CurrentHead(context.Background())
+	if err != nil || head.Frontier != 5 {
+		t.Fatalf("reopened completed frontier = %#v, %v", head, err)
 	}
 }
 
@@ -667,4 +831,9 @@ func testRecordPublication(
 		request.ExpectedDigest = head.LogicalDigest
 	}
 	return request
+}
+
+func documentTestRecordKey(row []byte) []byte {
+	key := sha256.Sum256(append([]byte("explorer-document-record-v1\x00"), row...))
+	return key[:]
 }
