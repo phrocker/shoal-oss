@@ -27,6 +27,7 @@ import (
 	"reflect"
 	"strings"
 
+	"github.com/phrocker/shoal-oss/internal/embeddingspace"
 	"github.com/phrocker/shoal-oss/internal/embedpb"
 	"github.com/phrocker/shoal-oss/internal/embedstore"
 	"github.com/phrocker/shoal-oss/internal/engine"
@@ -223,6 +224,13 @@ func (s *embedServer) CreateTable(_ context.Context, req *embedpb.CreateTableReq
 	}
 	if selection.fileFormatSet {
 		opts.TabletOptions.FileFormat = selection.fileFormat
+	}
+	if req.DefaultEmbedding != "" {
+		state, err := embeddingspace.Parse(req.DefaultEmbedding)
+		if err != nil {
+			return nil, status.Error(codes.InvalidArgument, err.Error())
+		}
+		opts.DefaultEmbedding = state
 	}
 	if err := s.eng.CreateTable(req.Table, opts); err != nil {
 		return nil, adminStatusError("create table", err)

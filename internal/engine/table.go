@@ -917,9 +917,6 @@ func exactVectorEmbeddingSpace(
 		}
 		current := strings.TrimSpace(
 			spec.Options[iterrt.VectorKNNEmbeddingSpace])
-		if current == "" {
-			return "", false, nil
-		}
 		if err := embeddingspace.ValidateQueryStates(
 			"execute exact vector query", current); err != nil {
 			return "", true, err

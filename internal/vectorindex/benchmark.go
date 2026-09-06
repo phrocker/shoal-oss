@@ -9,8 +9,9 @@ import (
 )
 
 type BenchmarkQuery struct {
-	Name   string
-	Vector []float32
+	Name           string
+	Vector         []float32
+	EmbeddingSpace string
 }
 
 type BenchmarkResult struct {
@@ -55,8 +56,17 @@ func BenchmarkRecall(ctx context.Context, manager *Manager, index string, corpus
 		if err := ctx.Err(); err != nil {
 			return BenchmarkResult{}, err
 		}
+		if err := requireEmbeddingSpace(
+			"benchmark query", query.EmbeddingSpace); err != nil {
+			return BenchmarkResult{}, err
+		}
+		if err := embeddingspace.EnsureSameIdentity(
+			"benchmark query", manifest.EmbeddingSpace,
+			query.EmbeddingSpace); err != nil {
+			return BenchmarkResult{}, err
+		}
 		approx, _, err := manager.Search(ctx, index, Query{
-			Vector: query.Vector, EmbeddingSpace: manifest.EmbeddingSpace,
+			Vector: query.Vector, EmbeddingSpace: query.EmbeddingSpace,
 			TopK: topK, NProbe: nprobe,
 		})
 		if err != nil {

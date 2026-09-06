@@ -41,6 +41,7 @@ import (
 	"time"
 
 	"github.com/phrocker/shoal-oss/internal/cclient"
+	"github.com/phrocker/shoal-oss/internal/embeddingspace"
 	"github.com/phrocker/shoal-oss/internal/embedpb"
 	"github.com/phrocker/shoal-oss/internal/engine"
 	"github.com/phrocker/shoal-oss/internal/iterrt"
@@ -59,6 +60,12 @@ var (
 	ErrMultiplePushdowns = errors.New("at most one of term_filter, vector_search, edge_expand and score_filter may be set")
 	// ErrVectorQueryRequired is returned when vector_search is set without a query.
 	ErrVectorQueryRequired = errors.New("vector_search.query is required")
+	// ErrVectorEmbeddingSpaceRequired is returned when a raw query vector has
+	// no stable embedding-space identity.
+	ErrVectorEmbeddingSpaceRequired = fmt.Errorf(
+		"vector_search.embedding_space is required: %w",
+		embeddingspace.ErrQueryIdentityRequired,
+	)
 	// ErrNegativeMaxHops is returned when edge_expand.max_hops is negative.
 	ErrNegativeMaxHops = errors.New("edge_expand.max_hops must be non-negative")
 	// ErrInvalidCondition is returned when a mutation condition has no predicate.
@@ -99,13 +106,31 @@ func (s *EngineStore) nextTimestamp() int64 {
 }
 
 // CreateTable creates table, optionally split on the given row prefixes.
-func (s *EngineStore) CreateTable(_ context.Context, table string, splits []string) error {
+func (s *EngineStore) CreateTable(ctx context.Context, table string, splits []string) error {
+	return s.CreateTableWithEmbedding(ctx, table, splits, "")
+}
+
+// CreateTableWithEmbedding creates a table whose future immutable files carry
+// defaultEmbedding's explicit state.
+func (s *EngineStore) CreateTableWithEmbedding(
+	_ context.Context,
+	table string,
+	splits []string,
+	defaultEmbedding string,
+) error {
 	if table == "" {
 		return errors.New("embedstore: table is required")
 	}
 	opts := engine.TableOptions{}
 	if len(splits) > 0 {
 		opts.Splits = engine.PrefixSplit(splits...)
+	}
+	if defaultEmbedding != "" {
+		state, err := embeddingspace.Parse(defaultEmbedding)
+		if err != nil {
+			return err
+		}
+		opts.DefaultEmbedding = state
 	}
 	return s.eng.CreateTable(table, opts)
 }
@@ -401,8 +426,13 @@ func (s *EngineStore) Scanner(table string, req *embedpb.ScanRequest) (*engine.S
 		if len(vs.Query) == 0 {
 			return nil, ErrVectorQueryRequired
 		}
+		if err := embeddingspace.ValidateQueryStates(
+			"embedded vector search", vs.EmbeddingSpace); err != nil {
+			return nil, errors.Join(ErrVectorEmbeddingSpaceRequired, err)
+		}
 		opts := map[string]string{
-			iterrt.VectorKNNQuery: base64.StdEncoding.EncodeToString(vs.Query),
+			iterrt.VectorKNNQuery:          base64.StdEncoding.EncodeToString(vs.Query),
+			iterrt.VectorKNNEmbeddingSpace: vs.EmbeddingSpace,
 		}
 		if vs.TopK > 0 {
 			opts[iterrt.VectorKNNTopK] = strconv.Itoa(int(vs.TopK))

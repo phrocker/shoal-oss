@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/phrocker/shoal-oss/internal/embeddingspace"
 	"github.com/phrocker/shoal-oss/internal/embedpb"
 	"github.com/phrocker/shoal-oss/internal/graphschema"
 	"github.com/phrocker/shoal-oss/pkg/extraction"
@@ -25,6 +26,20 @@ type IngestResult struct {
 }
 
 func (c *Client) EnsureTable(ctx context.Context) error {
+	if store, ok := c.cfg.Store.(interface {
+		CreateTableWithEmbedding(context.Context, string, []string, string) error
+	}); ok {
+		return store.CreateTableWithEmbedding(
+			ctx,
+			c.cfg.Table,
+			[]string{
+				graphschema.EventRowPrefix,
+				graphschema.EntityRowPrefix,
+				graphschema.TermRowPrefix,
+			},
+			embeddingspace.Has(c.cfg.EmbeddingSpace).String(),
+		)
+	}
 	return c.cfg.Store.CreateTable(ctx, c.cfg.Table, []string{graphschema.EventRowPrefix, graphschema.EntityRowPrefix, graphschema.TermRowPrefix})
 }
 

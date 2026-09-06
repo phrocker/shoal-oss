@@ -19,7 +19,7 @@
 // versions:
 // 	protoc-gen-go v1.36.11
 // 	protoc        v7.35.0
-// source: embed.proto
+// source: proto/embed.proto
 
 package embedpb
 
@@ -73,11 +73,11 @@ func (x TableWorkload) String() string {
 }
 
 func (TableWorkload) Descriptor() protoreflect.EnumDescriptor {
-	return file_embed_proto_enumTypes[0].Descriptor()
+	return file_proto_embed_proto_enumTypes[0].Descriptor()
 }
 
 func (TableWorkload) Type() protoreflect.EnumType {
-	return &file_embed_proto_enumTypes[0]
+	return &file_proto_embed_proto_enumTypes[0]
 }
 
 func (x TableWorkload) Number() protoreflect.EnumNumber {
@@ -86,7 +86,7 @@ func (x TableWorkload) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use TableWorkload.Descriptor instead.
 func (TableWorkload) EnumDescriptor() ([]byte, []int) {
-	return file_embed_proto_rawDescGZIP(), []int{0}
+	return file_proto_embed_proto_rawDescGZIP(), []int{0}
 }
 
 // TableFileFormat is the immutable persistence format written by flushes and
@@ -124,11 +124,11 @@ func (x TableFileFormat) String() string {
 }
 
 func (TableFileFormat) Descriptor() protoreflect.EnumDescriptor {
-	return file_embed_proto_enumTypes[1].Descriptor()
+	return file_proto_embed_proto_enumTypes[1].Descriptor()
 }
 
 func (TableFileFormat) Type() protoreflect.EnumType {
-	return &file_embed_proto_enumTypes[1]
+	return &file_proto_embed_proto_enumTypes[1]
 }
 
 func (x TableFileFormat) Number() protoreflect.EnumNumber {
@@ -137,7 +137,7 @@ func (x TableFileFormat) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use TableFileFormat.Descriptor instead.
 func (TableFileFormat) EnumDescriptor() ([]byte, []int) {
-	return file_embed_proto_rawDescGZIP(), []int{1}
+	return file_proto_embed_proto_rawDescGZIP(), []int{1}
 }
 
 type MutationStatus int32
@@ -173,11 +173,11 @@ func (x MutationStatus) String() string {
 }
 
 func (MutationStatus) Descriptor() protoreflect.EnumDescriptor {
-	return file_embed_proto_enumTypes[2].Descriptor()
+	return file_proto_embed_proto_enumTypes[2].Descriptor()
 }
 
 func (MutationStatus) Type() protoreflect.EnumType {
-	return &file_embed_proto_enumTypes[2]
+	return &file_proto_embed_proto_enumTypes[2]
 }
 
 func (x MutationStatus) Number() protoreflect.EnumNumber {
@@ -186,7 +186,7 @@ func (x MutationStatus) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use MutationStatus.Descriptor instead.
 func (MutationStatus) EnumDescriptor() ([]byte, []int) {
-	return file_embed_proto_rawDescGZIP(), []int{2}
+	return file_proto_embed_proto_rawDescGZIP(), []int{2}
 }
 
 type CreateTableRequest struct {
@@ -198,14 +198,18 @@ type CreateTableRequest struct {
 	Workload TableWorkload `protobuf:"varint,3,opt,name=workload,proto3,enum=shoal.embed.v1.TableWorkload" json:"workload,omitempty"`
 	// Optional immutable persistence format. Unspecified preserves the existing
 	// create-table behavior unless workload implies a specific format.
-	FileFormat    TableFileFormat `protobuf:"varint,4,opt,name=file_format,json=fileFormat,proto3,enum=shoal.embed.v1.TableFileFormat" json:"file_format,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	FileFormat TableFileFormat `protobuf:"varint,4,opt,name=file_format,json=fileFormat,proto3,enum=shoal.embed.v1.TableFileFormat" json:"file_format,omitempty"`
+	// Actual embedding state stamped into future immutable files. Uses the
+	// canonical FileState grammar: has_embeddings:<identity>, no_embeddings,
+	// or unknown. Empty records no claim and therefore reads as unknown.
+	DefaultEmbedding string `protobuf:"bytes,5,opt,name=default_embedding,json=defaultEmbedding,proto3" json:"default_embedding,omitempty"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
 }
 
 func (x *CreateTableRequest) Reset() {
 	*x = CreateTableRequest{}
-	mi := &file_embed_proto_msgTypes[0]
+	mi := &file_proto_embed_proto_msgTypes[0]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -217,7 +221,7 @@ func (x *CreateTableRequest) String() string {
 func (*CreateTableRequest) ProtoMessage() {}
 
 func (x *CreateTableRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_embed_proto_msgTypes[0]
+	mi := &file_proto_embed_proto_msgTypes[0]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -230,7 +234,7 @@ func (x *CreateTableRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CreateTableRequest.ProtoReflect.Descriptor instead.
 func (*CreateTableRequest) Descriptor() ([]byte, []int) {
-	return file_embed_proto_rawDescGZIP(), []int{0}
+	return file_proto_embed_proto_rawDescGZIP(), []int{0}
 }
 
 func (x *CreateTableRequest) GetTable() string {
@@ -261,6 +265,13 @@ func (x *CreateTableRequest) GetFileFormat() TableFileFormat {
 	return TableFileFormat_TABLE_FILE_FORMAT_UNSPECIFIED
 }
 
+func (x *CreateTableRequest) GetDefaultEmbedding() string {
+	if x != nil {
+		return x.DefaultEmbedding
+	}
+	return ""
+}
+
 type CreateTableResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Table         string                 `protobuf:"bytes,1,opt,name=table,proto3" json:"table,omitempty"`
@@ -273,7 +284,7 @@ type CreateTableResponse struct {
 
 func (x *CreateTableResponse) Reset() {
 	*x = CreateTableResponse{}
-	mi := &file_embed_proto_msgTypes[1]
+	mi := &file_proto_embed_proto_msgTypes[1]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -285,7 +296,7 @@ func (x *CreateTableResponse) String() string {
 func (*CreateTableResponse) ProtoMessage() {}
 
 func (x *CreateTableResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_embed_proto_msgTypes[1]
+	mi := &file_proto_embed_proto_msgTypes[1]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -298,7 +309,7 @@ func (x *CreateTableResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CreateTableResponse.ProtoReflect.Descriptor instead.
 func (*CreateTableResponse) Descriptor() ([]byte, []int) {
-	return file_embed_proto_rawDescGZIP(), []int{1}
+	return file_proto_embed_proto_rawDescGZIP(), []int{1}
 }
 
 func (x *CreateTableResponse) GetTable() string {
@@ -343,7 +354,7 @@ type Mutation struct {
 
 func (x *Mutation) Reset() {
 	*x = Mutation{}
-	mi := &file_embed_proto_msgTypes[2]
+	mi := &file_proto_embed_proto_msgTypes[2]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -355,7 +366,7 @@ func (x *Mutation) String() string {
 func (*Mutation) ProtoMessage() {}
 
 func (x *Mutation) ProtoReflect() protoreflect.Message {
-	mi := &file_embed_proto_msgTypes[2]
+	mi := &file_proto_embed_proto_msgTypes[2]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -368,7 +379,7 @@ func (x *Mutation) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Mutation.ProtoReflect.Descriptor instead.
 func (*Mutation) Descriptor() ([]byte, []int) {
-	return file_embed_proto_rawDescGZIP(), []int{2}
+	return file_proto_embed_proto_rawDescGZIP(), []int{2}
 }
 
 func (x *Mutation) GetRow() []byte {
@@ -406,7 +417,7 @@ type Entry struct {
 
 func (x *Entry) Reset() {
 	*x = Entry{}
-	mi := &file_embed_proto_msgTypes[3]
+	mi := &file_proto_embed_proto_msgTypes[3]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -418,7 +429,7 @@ func (x *Entry) String() string {
 func (*Entry) ProtoMessage() {}
 
 func (x *Entry) ProtoReflect() protoreflect.Message {
-	mi := &file_embed_proto_msgTypes[3]
+	mi := &file_proto_embed_proto_msgTypes[3]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -431,7 +442,7 @@ func (x *Entry) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Entry.ProtoReflect.Descriptor instead.
 func (*Entry) Descriptor() ([]byte, []int) {
-	return file_embed_proto_rawDescGZIP(), []int{3}
+	return file_proto_embed_proto_rawDescGZIP(), []int{3}
 }
 
 func (x *Entry) GetColumnFamily() []byte {
@@ -497,7 +508,7 @@ type Condition struct {
 
 func (x *Condition) Reset() {
 	*x = Condition{}
-	mi := &file_embed_proto_msgTypes[4]
+	mi := &file_proto_embed_proto_msgTypes[4]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -509,7 +520,7 @@ func (x *Condition) String() string {
 func (*Condition) ProtoMessage() {}
 
 func (x *Condition) ProtoReflect() protoreflect.Message {
-	mi := &file_embed_proto_msgTypes[4]
+	mi := &file_proto_embed_proto_msgTypes[4]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -522,7 +533,7 @@ func (x *Condition) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Condition.ProtoReflect.Descriptor instead.
 func (*Condition) Descriptor() ([]byte, []int) {
-	return file_embed_proto_rawDescGZIP(), []int{4}
+	return file_proto_embed_proto_rawDescGZIP(), []int{4}
 }
 
 func (x *Condition) GetColumnFamily() []byte {
@@ -607,7 +618,7 @@ type WriteRequest struct {
 
 func (x *WriteRequest) Reset() {
 	*x = WriteRequest{}
-	mi := &file_embed_proto_msgTypes[5]
+	mi := &file_proto_embed_proto_msgTypes[5]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -619,7 +630,7 @@ func (x *WriteRequest) String() string {
 func (*WriteRequest) ProtoMessage() {}
 
 func (x *WriteRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_embed_proto_msgTypes[5]
+	mi := &file_proto_embed_proto_msgTypes[5]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -632,7 +643,7 @@ func (x *WriteRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use WriteRequest.ProtoReflect.Descriptor instead.
 func (*WriteRequest) Descriptor() ([]byte, []int) {
-	return file_embed_proto_rawDescGZIP(), []int{5}
+	return file_proto_embed_proto_rawDescGZIP(), []int{5}
 }
 
 func (x *WriteRequest) GetTable() string {
@@ -658,7 +669,7 @@ type MutationResult struct {
 
 func (x *MutationResult) Reset() {
 	*x = MutationResult{}
-	mi := &file_embed_proto_msgTypes[6]
+	mi := &file_proto_embed_proto_msgTypes[6]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -670,7 +681,7 @@ func (x *MutationResult) String() string {
 func (*MutationResult) ProtoMessage() {}
 
 func (x *MutationResult) ProtoReflect() protoreflect.Message {
-	mi := &file_embed_proto_msgTypes[6]
+	mi := &file_proto_embed_proto_msgTypes[6]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -683,7 +694,7 @@ func (x *MutationResult) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use MutationResult.ProtoReflect.Descriptor instead.
 func (*MutationResult) Descriptor() ([]byte, []int) {
-	return file_embed_proto_rawDescGZIP(), []int{6}
+	return file_proto_embed_proto_rawDescGZIP(), []int{6}
 }
 
 func (x *MutationResult) GetStatus() MutationStatus {
@@ -706,7 +717,7 @@ type WriteResponse struct {
 
 func (x *WriteResponse) Reset() {
 	*x = WriteResponse{}
-	mi := &file_embed_proto_msgTypes[7]
+	mi := &file_proto_embed_proto_msgTypes[7]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -718,7 +729,7 @@ func (x *WriteResponse) String() string {
 func (*WriteResponse) ProtoMessage() {}
 
 func (x *WriteResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_embed_proto_msgTypes[7]
+	mi := &file_proto_embed_proto_msgTypes[7]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -731,7 +742,7 @@ func (x *WriteResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use WriteResponse.ProtoReflect.Descriptor instead.
 func (*WriteResponse) Descriptor() ([]byte, []int) {
-	return file_embed_proto_rawDescGZIP(), []int{7}
+	return file_proto_embed_proto_rawDescGZIP(), []int{7}
 }
 
 func (x *WriteResponse) GetWritten() int32 {
@@ -802,7 +813,7 @@ type ScanRequest struct {
 
 func (x *ScanRequest) Reset() {
 	*x = ScanRequest{}
-	mi := &file_embed_proto_msgTypes[8]
+	mi := &file_proto_embed_proto_msgTypes[8]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -814,7 +825,7 @@ func (x *ScanRequest) String() string {
 func (*ScanRequest) ProtoMessage() {}
 
 func (x *ScanRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_embed_proto_msgTypes[8]
+	mi := &file_proto_embed_proto_msgTypes[8]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -827,7 +838,7 @@ func (x *ScanRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ScanRequest.ProtoReflect.Descriptor instead.
 func (*ScanRequest) Descriptor() ([]byte, []int) {
-	return file_embed_proto_rawDescGZIP(), []int{8}
+	return file_proto_embed_proto_rawDescGZIP(), []int{8}
 }
 
 func (x *ScanRequest) GetTable() string {
@@ -959,7 +970,7 @@ type TermFilter struct {
 
 func (x *TermFilter) Reset() {
 	*x = TermFilter{}
-	mi := &file_embed_proto_msgTypes[9]
+	mi := &file_proto_embed_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -971,7 +982,7 @@ func (x *TermFilter) String() string {
 func (*TermFilter) ProtoMessage() {}
 
 func (x *TermFilter) ProtoReflect() protoreflect.Message {
-	mi := &file_embed_proto_msgTypes[9]
+	mi := &file_proto_embed_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -984,7 +995,7 @@ func (x *TermFilter) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TermFilter.ProtoReflect.Descriptor instead.
 func (*TermFilter) Descriptor() ([]byte, []int) {
-	return file_embed_proto_rawDescGZIP(), []int{9}
+	return file_proto_embed_proto_rawDescGZIP(), []int{9}
 }
 
 func (x *TermFilter) GetTermRows() [][]byte {
@@ -1049,7 +1060,7 @@ type NumericRange struct {
 
 func (x *NumericRange) Reset() {
 	*x = NumericRange{}
-	mi := &file_embed_proto_msgTypes[10]
+	mi := &file_proto_embed_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1061,7 +1072,7 @@ func (x *NumericRange) String() string {
 func (*NumericRange) ProtoMessage() {}
 
 func (x *NumericRange) ProtoReflect() protoreflect.Message {
-	mi := &file_embed_proto_msgTypes[10]
+	mi := &file_proto_embed_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1074,7 +1085,7 @@ func (x *NumericRange) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NumericRange.ProtoReflect.Descriptor instead.
 func (*NumericRange) Descriptor() ([]byte, []int) {
-	return file_embed_proto_rawDescGZIP(), []int{10}
+	return file_proto_embed_proto_rawDescGZIP(), []int{10}
 }
 
 func (x *NumericRange) GetLower() float64 {
@@ -1146,14 +1157,17 @@ type VectorSearch struct {
 	// applied unless min_score_set is true.
 	MinScore float32 `protobuf:"fixed32,5,opt,name=min_score,json=minScore,proto3" json:"min_score,omitempty"`
 	// Distinguishes "min_score deliberately 0" from "min_score unset".
-	MinScoreSet   bool `protobuf:"varint,6,opt,name=min_score_set,json=minScoreSet,proto3" json:"min_score_set,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	MinScoreSet bool `protobuf:"varint,6,opt,name=min_score_set,json=minScoreSet,proto3" json:"min_score_set,omitempty"`
+	// Stable provider/model/version/dimension/normalization identity of query.
+	// Required for identity-safe raw-vector comparison.
+	EmbeddingSpace string `protobuf:"bytes,7,opt,name=embedding_space,json=embeddingSpace,proto3" json:"embedding_space,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *VectorSearch) Reset() {
 	*x = VectorSearch{}
-	mi := &file_embed_proto_msgTypes[11]
+	mi := &file_proto_embed_proto_msgTypes[11]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1165,7 +1179,7 @@ func (x *VectorSearch) String() string {
 func (*VectorSearch) ProtoMessage() {}
 
 func (x *VectorSearch) ProtoReflect() protoreflect.Message {
-	mi := &file_embed_proto_msgTypes[11]
+	mi := &file_proto_embed_proto_msgTypes[11]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1178,7 +1192,7 @@ func (x *VectorSearch) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use VectorSearch.ProtoReflect.Descriptor instead.
 func (*VectorSearch) Descriptor() ([]byte, []int) {
-	return file_embed_proto_rawDescGZIP(), []int{11}
+	return file_proto_embed_proto_rawDescGZIP(), []int{11}
 }
 
 func (x *VectorSearch) GetQuery() []byte {
@@ -1223,6 +1237,13 @@ func (x *VectorSearch) GetMinScoreSet() bool {
 	return false
 }
 
+func (x *VectorSearch) GetEmbeddingSpace() string {
+	if x != nil {
+		return x.EmbeddingSpace
+	}
+	return ""
+}
+
 // ScoreFilter configures the read-time scoring pushdown iterator. A consumer
 // stores score inputs as ordinary cells: vectors, timestamps, or feature
 // values in a reserved column family. ScoreFilter moves the "stream cells,
@@ -1260,7 +1281,7 @@ type ScoreFilter struct {
 
 func (x *ScoreFilter) Reset() {
 	*x = ScoreFilter{}
-	mi := &file_embed_proto_msgTypes[12]
+	mi := &file_proto_embed_proto_msgTypes[12]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1272,7 +1293,7 @@ func (x *ScoreFilter) String() string {
 func (*ScoreFilter) ProtoMessage() {}
 
 func (x *ScoreFilter) ProtoReflect() protoreflect.Message {
-	mi := &file_embed_proto_msgTypes[12]
+	mi := &file_proto_embed_proto_msgTypes[12]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1285,7 +1306,7 @@ func (x *ScoreFilter) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ScoreFilter.ProtoReflect.Descriptor instead.
 func (*ScoreFilter) Descriptor() ([]byte, []int) {
-	return file_embed_proto_rawDescGZIP(), []int{12}
+	return file_proto_embed_proto_rawDescGZIP(), []int{12}
 }
 
 func (x *ScoreFilter) GetScoreCf() []byte {
@@ -1392,7 +1413,7 @@ type EdgeExpand struct {
 
 func (x *EdgeExpand) Reset() {
 	*x = EdgeExpand{}
-	mi := &file_embed_proto_msgTypes[13]
+	mi := &file_proto_embed_proto_msgTypes[13]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1404,7 +1425,7 @@ func (x *EdgeExpand) String() string {
 func (*EdgeExpand) ProtoMessage() {}
 
 func (x *EdgeExpand) ProtoReflect() protoreflect.Message {
-	mi := &file_embed_proto_msgTypes[13]
+	mi := &file_proto_embed_proto_msgTypes[13]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1417,7 +1438,7 @@ func (x *EdgeExpand) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use EdgeExpand.ProtoReflect.Descriptor instead.
 func (*EdgeExpand) Descriptor() ([]byte, []int) {
-	return file_embed_proto_rawDescGZIP(), []int{13}
+	return file_proto_embed_proto_rawDescGZIP(), []int{13}
 }
 
 func (x *EdgeExpand) GetAnchorRows() [][]byte {
@@ -1516,7 +1537,7 @@ type EdgeWeight struct {
 
 func (x *EdgeWeight) Reset() {
 	*x = EdgeWeight{}
-	mi := &file_embed_proto_msgTypes[14]
+	mi := &file_proto_embed_proto_msgTypes[14]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1528,7 +1549,7 @@ func (x *EdgeWeight) String() string {
 func (*EdgeWeight) ProtoMessage() {}
 
 func (x *EdgeWeight) ProtoReflect() protoreflect.Message {
-	mi := &file_embed_proto_msgTypes[14]
+	mi := &file_proto_embed_proto_msgTypes[14]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1541,7 +1562,7 @@ func (x *EdgeWeight) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use EdgeWeight.ProtoReflect.Descriptor instead.
 func (*EdgeWeight) Descriptor() ([]byte, []int) {
-	return file_embed_proto_rawDescGZIP(), []int{14}
+	return file_proto_embed_proto_rawDescGZIP(), []int{14}
 }
 
 func (x *EdgeWeight) GetRelationship() string {
@@ -1572,7 +1593,7 @@ type Cell struct {
 
 func (x *Cell) Reset() {
 	*x = Cell{}
-	mi := &file_embed_proto_msgTypes[15]
+	mi := &file_proto_embed_proto_msgTypes[15]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1584,7 +1605,7 @@ func (x *Cell) String() string {
 func (*Cell) ProtoMessage() {}
 
 func (x *Cell) ProtoReflect() protoreflect.Message {
-	mi := &file_embed_proto_msgTypes[15]
+	mi := &file_proto_embed_proto_msgTypes[15]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1597,7 +1618,7 @@ func (x *Cell) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Cell.ProtoReflect.Descriptor instead.
 func (*Cell) Descriptor() ([]byte, []int) {
-	return file_embed_proto_rawDescGZIP(), []int{15}
+	return file_proto_embed_proto_rawDescGZIP(), []int{15}
 }
 
 func (x *Cell) GetRow() []byte {
@@ -1651,7 +1672,7 @@ type ScanResponse struct {
 
 func (x *ScanResponse) Reset() {
 	*x = ScanResponse{}
-	mi := &file_embed_proto_msgTypes[16]
+	mi := &file_proto_embed_proto_msgTypes[16]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1663,7 +1684,7 @@ func (x *ScanResponse) String() string {
 func (*ScanResponse) ProtoMessage() {}
 
 func (x *ScanResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_embed_proto_msgTypes[16]
+	mi := &file_proto_embed_proto_msgTypes[16]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1676,7 +1697,7 @@ func (x *ScanResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ScanResponse.ProtoReflect.Descriptor instead.
 func (*ScanResponse) Descriptor() ([]byte, []int) {
-	return file_embed_proto_rawDescGZIP(), []int{16}
+	return file_proto_embed_proto_rawDescGZIP(), []int{16}
 }
 
 func (x *ScanResponse) GetCells() []*Cell {
@@ -1695,7 +1716,7 @@ type FlushRequest struct {
 
 func (x *FlushRequest) Reset() {
 	*x = FlushRequest{}
-	mi := &file_embed_proto_msgTypes[17]
+	mi := &file_proto_embed_proto_msgTypes[17]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1707,7 +1728,7 @@ func (x *FlushRequest) String() string {
 func (*FlushRequest) ProtoMessage() {}
 
 func (x *FlushRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_embed_proto_msgTypes[17]
+	mi := &file_proto_embed_proto_msgTypes[17]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1720,7 +1741,7 @@ func (x *FlushRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use FlushRequest.ProtoReflect.Descriptor instead.
 func (*FlushRequest) Descriptor() ([]byte, []int) {
-	return file_embed_proto_rawDescGZIP(), []int{17}
+	return file_proto_embed_proto_rawDescGZIP(), []int{17}
 }
 
 func (x *FlushRequest) GetTable() string {
@@ -1738,7 +1759,7 @@ type FlushResponse struct {
 
 func (x *FlushResponse) Reset() {
 	*x = FlushResponse{}
-	mi := &file_embed_proto_msgTypes[18]
+	mi := &file_proto_embed_proto_msgTypes[18]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1750,7 +1771,7 @@ func (x *FlushResponse) String() string {
 func (*FlushResponse) ProtoMessage() {}
 
 func (x *FlushResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_embed_proto_msgTypes[18]
+	mi := &file_proto_embed_proto_msgTypes[18]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1763,7 +1784,7 @@ func (x *FlushResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use FlushResponse.ProtoReflect.Descriptor instead.
 func (*FlushResponse) Descriptor() ([]byte, []int) {
-	return file_embed_proto_rawDescGZIP(), []int{18}
+	return file_proto_embed_proto_rawDescGZIP(), []int{18}
 }
 
 type CompactRequest struct {
@@ -1782,7 +1803,7 @@ type CompactRequest struct {
 
 func (x *CompactRequest) Reset() {
 	*x = CompactRequest{}
-	mi := &file_embed_proto_msgTypes[19]
+	mi := &file_proto_embed_proto_msgTypes[19]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1794,7 +1815,7 @@ func (x *CompactRequest) String() string {
 func (*CompactRequest) ProtoMessage() {}
 
 func (x *CompactRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_embed_proto_msgTypes[19]
+	mi := &file_proto_embed_proto_msgTypes[19]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1807,7 +1828,7 @@ func (x *CompactRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CompactRequest.ProtoReflect.Descriptor instead.
 func (*CompactRequest) Descriptor() ([]byte, []int) {
-	return file_embed_proto_rawDescGZIP(), []int{19}
+	return file_proto_embed_proto_rawDescGZIP(), []int{19}
 }
 
 func (x *CompactRequest) GetTable() string {
@@ -1842,7 +1863,7 @@ type CompactResponse struct {
 
 func (x *CompactResponse) Reset() {
 	*x = CompactResponse{}
-	mi := &file_embed_proto_msgTypes[20]
+	mi := &file_proto_embed_proto_msgTypes[20]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1854,7 +1875,7 @@ func (x *CompactResponse) String() string {
 func (*CompactResponse) ProtoMessage() {}
 
 func (x *CompactResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_embed_proto_msgTypes[20]
+	mi := &file_proto_embed_proto_msgTypes[20]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1867,7 +1888,7 @@ func (x *CompactResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CompactResponse.ProtoReflect.Descriptor instead.
 func (*CompactResponse) Descriptor() ([]byte, []int) {
-	return file_embed_proto_rawDescGZIP(), []int{20}
+	return file_proto_embed_proto_rawDescGZIP(), []int{20}
 }
 
 func (x *CompactResponse) GetTable() string {
@@ -1899,7 +1920,7 @@ type StatusRequest struct {
 
 func (x *StatusRequest) Reset() {
 	*x = StatusRequest{}
-	mi := &file_embed_proto_msgTypes[21]
+	mi := &file_proto_embed_proto_msgTypes[21]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1911,7 +1932,7 @@ func (x *StatusRequest) String() string {
 func (*StatusRequest) ProtoMessage() {}
 
 func (x *StatusRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_embed_proto_msgTypes[21]
+	mi := &file_proto_embed_proto_msgTypes[21]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1924,7 +1945,7 @@ func (x *StatusRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StatusRequest.ProtoReflect.Descriptor instead.
 func (*StatusRequest) Descriptor() ([]byte, []int) {
-	return file_embed_proto_rawDescGZIP(), []int{21}
+	return file_proto_embed_proto_rawDescGZIP(), []int{21}
 }
 
 type TableStatus struct {
@@ -1940,7 +1961,7 @@ type TableStatus struct {
 
 func (x *TableStatus) Reset() {
 	*x = TableStatus{}
-	mi := &file_embed_proto_msgTypes[22]
+	mi := &file_proto_embed_proto_msgTypes[22]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1952,7 +1973,7 @@ func (x *TableStatus) String() string {
 func (*TableStatus) ProtoMessage() {}
 
 func (x *TableStatus) ProtoReflect() protoreflect.Message {
-	mi := &file_embed_proto_msgTypes[22]
+	mi := &file_proto_embed_proto_msgTypes[22]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1965,7 +1986,7 @@ func (x *TableStatus) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TableStatus.ProtoReflect.Descriptor instead.
 func (*TableStatus) Descriptor() ([]byte, []int) {
-	return file_embed_proto_rawDescGZIP(), []int{22}
+	return file_proto_embed_proto_rawDescGZIP(), []int{22}
 }
 
 func (x *TableStatus) GetTable() string {
@@ -2013,7 +2034,7 @@ type StatusResponse struct {
 
 func (x *StatusResponse) Reset() {
 	*x = StatusResponse{}
-	mi := &file_embed_proto_msgTypes[23]
+	mi := &file_proto_embed_proto_msgTypes[23]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2025,7 +2046,7 @@ func (x *StatusResponse) String() string {
 func (*StatusResponse) ProtoMessage() {}
 
 func (x *StatusResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_embed_proto_msgTypes[23]
+	mi := &file_proto_embed_proto_msgTypes[23]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2038,7 +2059,7 @@ func (x *StatusResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StatusResponse.ProtoReflect.Descriptor instead.
 func (*StatusResponse) Descriptor() ([]byte, []int) {
-	return file_embed_proto_rawDescGZIP(), []int{23}
+	return file_proto_embed_proto_rawDescGZIP(), []int{23}
 }
 
 func (x *StatusResponse) GetTables() []string {
@@ -2055,17 +2076,18 @@ func (x *StatusResponse) GetTableStatuses() []*TableStatus {
 	return nil
 }
 
-var File_embed_proto protoreflect.FileDescriptor
+var File_proto_embed_proto protoreflect.FileDescriptor
 
-const file_embed_proto_rawDesc = "" +
+const file_proto_embed_proto_rawDesc = "" +
 	"\n" +
-	"\vembed.proto\x12\x0eshoal.embed.v1\"\xbf\x01\n" +
+	"\x11proto/embed.proto\x12\x0eshoal.embed.v1\"\xec\x01\n" +
 	"\x12CreateTableRequest\x12\x14\n" +
 	"\x05table\x18\x01 \x01(\tR\x05table\x12\x16\n" +
 	"\x06splits\x18\x02 \x03(\tR\x06splits\x129\n" +
 	"\bworkload\x18\x03 \x01(\x0e2\x1d.shoal.embed.v1.TableWorkloadR\bworkload\x12@\n" +
 	"\vfile_format\x18\x04 \x01(\x0e2\x1f.shoal.embed.v1.TableFileFormatR\n" +
-	"fileFormat\"\xc2\x01\n" +
+	"fileFormat\x12+\n" +
+	"\x11default_embedding\x18\x05 \x01(\tR\x10defaultEmbedding\"\xc2\x01\n" +
 	"\x13CreateTableResponse\x12\x14\n" +
 	"\x05table\x18\x01 \x01(\tR\x05table\x12\x18\n" +
 	"\atablets\x18\x02 \x01(\x05R\atablets\x129\n" +
@@ -2137,14 +2159,15 @@ const file_embed_proto_rawDesc = "" +
 	"\x05upper\x18\x03 \x01(\x01R\x05upper\x12\x1b\n" +
 	"\tupper_set\x18\x04 \x01(\bR\bupperSet\x12'\n" +
 	"\x0flower_inclusive\x18\x05 \x01(\bR\x0elowerInclusive\x12'\n" +
-	"\x0fupper_inclusive\x18\x06 \x01(\bR\x0eupperInclusive\"\xb5\x01\n" +
+	"\x0fupper_inclusive\x18\x06 \x01(\bR\x0eupperInclusive\"\xde\x01\n" +
 	"\fVectorSearch\x12\x14\n" +
 	"\x05query\x18\x01 \x01(\fR\x05query\x12\x13\n" +
 	"\x05top_k\x18\x02 \x01(\x05R\x04topK\x12!\n" +
 	"\fembedding_cf\x18\x03 \x01(\fR\vembeddingCf\x12\x16\n" +
 	"\x06metric\x18\x04 \x01(\tR\x06metric\x12\x1b\n" +
 	"\tmin_score\x18\x05 \x01(\x02R\bminScore\x12\"\n" +
-	"\rmin_score_set\x18\x06 \x01(\bR\vminScoreSet\"\xd5\x01\n" +
+	"\rmin_score_set\x18\x06 \x01(\bR\vminScoreSet\x12'\n" +
+	"\x0fembedding_space\x18\a \x01(\tR\x0eembeddingSpace\"\xd5\x01\n" +
 	"\vScoreFilter\x12\x19\n" +
 	"\bscore_cf\x18\x01 \x01(\fR\ascoreCf\x12\x16\n" +
 	"\x06method\x18\x02 \x01(\tR\x06method\x12\x14\n" +
@@ -2232,20 +2255,20 @@ const file_embed_proto_rawDesc = "" +
 	"\x06Status\x12\x1d.shoal.embed.v1.StatusRequest\x1a\x1e.shoal.embed.v1.StatusResponseB0Z.github.com/phrocker/shoal-oss/internal/embedpbb\x06proto3"
 
 var (
-	file_embed_proto_rawDescOnce sync.Once
-	file_embed_proto_rawDescData []byte
+	file_proto_embed_proto_rawDescOnce sync.Once
+	file_proto_embed_proto_rawDescData []byte
 )
 
-func file_embed_proto_rawDescGZIP() []byte {
-	file_embed_proto_rawDescOnce.Do(func() {
-		file_embed_proto_rawDescData = protoimpl.X.CompressGZIP(unsafe.Slice(unsafe.StringData(file_embed_proto_rawDesc), len(file_embed_proto_rawDesc)))
+func file_proto_embed_proto_rawDescGZIP() []byte {
+	file_proto_embed_proto_rawDescOnce.Do(func() {
+		file_proto_embed_proto_rawDescData = protoimpl.X.CompressGZIP(unsafe.Slice(unsafe.StringData(file_proto_embed_proto_rawDesc), len(file_proto_embed_proto_rawDesc)))
 	})
-	return file_embed_proto_rawDescData
+	return file_proto_embed_proto_rawDescData
 }
 
-var file_embed_proto_enumTypes = make([]protoimpl.EnumInfo, 3)
-var file_embed_proto_msgTypes = make([]protoimpl.MessageInfo, 24)
-var file_embed_proto_goTypes = []any{
+var file_proto_embed_proto_enumTypes = make([]protoimpl.EnumInfo, 3)
+var file_proto_embed_proto_msgTypes = make([]protoimpl.MessageInfo, 24)
+var file_proto_embed_proto_goTypes = []any{
 	(TableWorkload)(0),          // 0: shoal.embed.v1.TableWorkload
 	(TableFileFormat)(0),        // 1: shoal.embed.v1.TableFileFormat
 	(MutationStatus)(0),         // 2: shoal.embed.v1.MutationStatus
@@ -2274,7 +2297,7 @@ var file_embed_proto_goTypes = []any{
 	(*TableStatus)(nil),         // 25: shoal.embed.v1.TableStatus
 	(*StatusResponse)(nil),      // 26: shoal.embed.v1.StatusResponse
 }
-var file_embed_proto_depIdxs = []int32{
+var file_proto_embed_proto_depIdxs = []int32{
 	0,  // 0: shoal.embed.v1.CreateTableRequest.workload:type_name -> shoal.embed.v1.TableWorkload
 	1,  // 1: shoal.embed.v1.CreateTableRequest.file_format:type_name -> shoal.embed.v1.TableFileFormat
 	0,  // 2: shoal.embed.v1.CreateTableResponse.workload:type_name -> shoal.embed.v1.TableWorkload
@@ -2319,12 +2342,12 @@ var file_embed_proto_depIdxs = []int32{
 	0,  // [0:23] is the sub-list for field type_name
 }
 
-func init() { file_embed_proto_init() }
-func file_embed_proto_init() {
-	if File_embed_proto != nil {
+func init() { file_proto_embed_proto_init() }
+func file_proto_embed_proto_init() {
+	if File_proto_embed_proto != nil {
 		return
 	}
-	file_embed_proto_msgTypes[4].OneofWrappers = []any{
+	file_proto_embed_proto_msgTypes[4].OneofWrappers = []any{
 		(*Condition_Absent)(nil),
 		(*Condition_ValueEquals)(nil),
 	}
@@ -2332,18 +2355,18 @@ func file_embed_proto_init() {
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
-			RawDescriptor: unsafe.Slice(unsafe.StringData(file_embed_proto_rawDesc), len(file_embed_proto_rawDesc)),
+			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proto_embed_proto_rawDesc), len(file_proto_embed_proto_rawDesc)),
 			NumEnums:      3,
 			NumMessages:   24,
 			NumExtensions: 0,
 			NumServices:   1,
 		},
-		GoTypes:           file_embed_proto_goTypes,
-		DependencyIndexes: file_embed_proto_depIdxs,
-		EnumInfos:         file_embed_proto_enumTypes,
-		MessageInfos:      file_embed_proto_msgTypes,
+		GoTypes:           file_proto_embed_proto_goTypes,
+		DependencyIndexes: file_proto_embed_proto_depIdxs,
+		EnumInfos:         file_proto_embed_proto_enumTypes,
+		MessageInfos:      file_proto_embed_proto_msgTypes,
 	}.Build()
-	File_embed_proto = out.File
-	file_embed_proto_goTypes = nil
-	file_embed_proto_depIdxs = nil
+	File_proto_embed_proto = out.File
+	file_proto_embed_proto_goTypes = nil
+	file_proto_embed_proto_depIdxs = nil
 }

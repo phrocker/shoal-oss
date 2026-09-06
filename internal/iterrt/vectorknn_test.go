@@ -203,6 +203,7 @@ func TestVectorKNNInitErrors(t *testing.T) {
 		opts map[string]string
 	}{
 		{"missing query", map[string]string{VectorKNNEmbeddingSpace: "space-a"}},
+		{"missing identity", map[string]string{VectorKNNQuery: b64(1, 0)}},
 		{"bad base64", map[string]string{VectorKNNQuery: "!!!", VectorKNNEmbeddingSpace: "space-a"}},
 		{"bad topK", map[string]string{VectorKNNQuery: b64(1, 0), VectorKNNEmbeddingSpace: "space-a", VectorKNNTopK: "0"}},
 		{"bad metric", map[string]string{VectorKNNQuery: b64(1, 0), VectorKNNEmbeddingSpace: "space-a", VectorKNNMetric: "manhattan"}},

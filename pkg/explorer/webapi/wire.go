@@ -615,6 +615,16 @@ func (r *RetrievalResponse) UnmarshalJSON(data []byte) error {
 	if err != nil {
 		return fmt.Errorf("embedding: %w", err)
 	}
+	if embedding != nil {
+		if embedding.Suppressed != (wire.Suppressed > 0) {
+			return fmt.Errorf(
+				"embedding: suppressed flag does not match suppressed count")
+		}
+		if embedding.Restricted != (wire.Restricted > 0) {
+			return fmt.Errorf(
+				"embedding: restricted flag does not match restricted count")
+		}
+	}
 	*r = RetrievalResponse{
 		Snapshot:   wire.Snapshot,
 		Retrieval:  retrieval.Response{RequestID: requestID, Results: results},

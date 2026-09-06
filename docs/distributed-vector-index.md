@@ -53,8 +53,9 @@ Exact ShoalQL vectors require `PlanOptions.Vector.EmbeddingSpace`; the
 `shoal-sql` CLI exposes the same value as `-embedding-space`. The planner
 threads it into the `vectorKNN` iterator as `embeddingSpace`, and the embedded
 engine checks every participating RFile/Parquet footer before scanning.
-`unknown`, `no_embeddings`, unflushed cells, and same-dimension files from a
-different model all fail with typed embedding-space errors. Because one raw
+`unknown`, `no_embeddings`, unflushed cells with an unknown or incompatible
+declared default, and same-dimension files from a different model all fail
+with typed embedding-space errors. Because one raw
 vector has only one identity, mixed-space exact scans are rejected rather than
 rank-fused or compared by raw score. Callers that need mixed-space retrieval
 must supply text to the multi-provider Explorer path so it can embed once per

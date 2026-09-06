@@ -137,11 +137,9 @@ func (v *VectorKNNIterator) Init(source SortedKeyValueIterator, options map[stri
 	}
 	v.queryNorm = knnNorm(v.query)
 	v.querySpace = strings.TrimSpace(options[VectorKNNEmbeddingSpace])
-	if v.querySpace != "" {
-		if err := embeddingspace.ValidateQueryStates(
-			"initialize exact vector iterator", v.querySpace); err != nil {
-			return fmt.Errorf("iterrt: VectorKNNIterator: %w", err)
-		}
+	if err := embeddingspace.ValidateQueryStates(
+		"initialize exact vector iterator", v.querySpace); err != nil {
+		return fmt.Errorf("iterrt: VectorKNNIterator: %w", err)
 	}
 
 	v.topK = 10

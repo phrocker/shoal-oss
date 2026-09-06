@@ -170,7 +170,11 @@ func (c *Client) semanticAnchors(ctx context.Context, a analysis) ([]string, err
 			// fall through to brute force on search error
 		}
 	}
-	cells, err := c.cfg.Store.Scan(ctx, c.cfg.Table, &embedpb.ScanRequest{RowPrefix: graphschema.EventRowPrefix, VectorSearch: &embedpb.VectorSearch{Query: PackVector(a.vector), TopK: int32(c.cfg.MaxAnchors), EmbeddingCf: graphschema.VectorCF(), Metric: "cosine"}})
+	cells, err := c.cfg.Store.Scan(ctx, c.cfg.Table, &embedpb.ScanRequest{RowPrefix: graphschema.EventRowPrefix, VectorSearch: &embedpb.VectorSearch{
+		Query: PackVector(a.vector), TopK: int32(c.cfg.MaxAnchors),
+		EmbeddingCf: graphschema.VectorCF(), Metric: "cosine",
+		EmbeddingSpace: c.cfg.EmbeddingSpace,
+	}})
 	return uniqueRows(cells), err
 }
 

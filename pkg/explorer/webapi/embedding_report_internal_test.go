@@ -58,14 +58,17 @@ func TestRetrievalResponseEmbeddingReportUsesOpaqueIDCodec(t *testing.T) {
 		Retrieval: retrieval.Response{},
 		Embedding: &report,
 	}
+
 	payload, err := json.Marshal(response)
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	encodedID := base64.RawURLEncoding.EncodeToString([]byte(report.Spaces[0].ID))
 	if !bytes.Contains(payload, []byte(`"id":"`+encodedID+`"`)) {
 		t.Fatalf("wire report did not use opaque ID codec: %s", payload)
 	}
+
 	if bytes.Contains(payload, []byte{0x00, 0xff, 0x10}) {
 		t.Fatalf("wire report emitted raw opaque identifier bytes: %q", payload)
 	}

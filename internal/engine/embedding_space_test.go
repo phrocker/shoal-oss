@@ -6,11 +6,13 @@ package engine
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"testing"
 
 	"github.com/phrocker/shoal-oss/internal/cclient"
 	"github.com/phrocker/shoal-oss/internal/embeddingspace"
+	"github.com/phrocker/shoal-oss/internal/iterrt"
 	"github.com/phrocker/shoal-oss/internal/tablet"
 )
 
@@ -143,6 +145,18 @@ func TestValidateExactVectorSpaceFailsClosed(t *testing.T) {
 	}
 	if err := eng.Flush("graph"); err != nil {
 		t.Fatal(err)
+	}
+	if _, err := eng.ScanHosted(
+		"graph", iterrt.InfiniteRange(), ScanOptions{},
+		[]iterrt.IterSpec{{
+			Name: iterrt.IterVectorKNN,
+			Options: map[string]string{
+				iterrt.VectorKNNQuery: base64.StdEncoding.EncodeToString(
+					[]byte{0, 0, 0, 0}),
+			},
+		}},
+	); !errors.Is(err, embeddingspace.ErrQueryIdentityRequired) {
+		t.Fatalf("missing query identity error = %v", err)
 	}
 	if err := eng.ValidateExactVectorSpace(
 		context.Background(), "graph", "space-b",

@@ -76,6 +76,10 @@ message CreateTableRequest {
   // Optional immutable persistence format. Unspecified preserves the existing
   // create-table behavior unless workload implies a specific format.
   TableFileFormat file_format = 4;
+  // Actual embedding state stamped into future immutable files. Uses the
+  // canonical FileState grammar: has_embeddings:<identity>, no_embeddings,
+  // or unknown. Empty records no claim and therefore reads as unknown.
+  string default_embedding = 5;
 }
 
 message CreateTableResponse {
@@ -272,6 +276,9 @@ message VectorSearch {
   float min_score = 5;
   // Distinguishes "min_score deliberately 0" from "min_score unset".
   bool min_score_set = 6;
+  // Stable provider/model/version/dimension/normalization identity of query.
+  // Required for identity-safe raw-vector comparison.
+  string embedding_space = 7;
 }
 
 // ScoreFilter configures the read-time scoring pushdown iterator. A consumer

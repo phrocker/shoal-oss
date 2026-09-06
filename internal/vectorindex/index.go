@@ -762,8 +762,14 @@ func embeddingSpaceForRecords(operation string, records []VectorRecord) (string,
 }
 
 func requireEmbeddingSpace(operation, identity string) error {
-	if strings.TrimSpace(identity) == "" {
+	normalized := strings.TrimSpace(identity)
+	if normalized == "" {
 		return fmt.Errorf("%w: %s", ErrEmbeddingSpace, operation)
+	}
+	if normalized != identity {
+		return fmt.Errorf(
+			"%w: %s identity has surrounding whitespace",
+			ErrEmbeddingSpace, operation)
 	}
 	if err := embeddingspace.Has(identity).Validate(); err != nil {
 		return fmt.Errorf("%s: %w", operation, err)

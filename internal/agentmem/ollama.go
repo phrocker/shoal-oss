@@ -82,6 +82,17 @@ func (o *OllamaEmbedder) Embed(ctx context.Context, text string) ([]float32, err
 	return append([]float32(nil), result.Vector...), err
 }
 
+func (o *OllamaEmbedder) EmbeddingSpaceIdentity() (string, error) {
+	if o.err != nil {
+		return "", o.err
+	}
+	provider, ok := o.embedder.(modelio.EmbeddingSpaceIdentityProvider)
+	if !ok {
+		return "", modelio.ErrInvalidConfig
+	}
+	return provider.EmbeddingSpaceIdentity()
+}
+
 func (o *ollamaLLM) Infer(ctx context.Context, prompt string) (string, error) {
 	if o.err != nil {
 		return "", o.err

@@ -97,12 +97,17 @@ func TestApproximateRecallContractRequiresBenchmark(t *testing.T) {
 	}
 	queries := make([]BenchmarkQuery, 0, 24)
 	for i := 0; i < 24; i++ {
-		queries = append(queries, BenchmarkQuery{Name: records[i*3].ID, Vector: records[i*3].Vector})
+		queries = append(queries, BenchmarkQuery{
+			Name: records[i*3].ID, Vector: records[i*3].Vector,
+			EmbeddingSpace: testEmbeddingSpace,
+		})
 	}
+
 	result, err := BenchmarkRecall(ctx, manager, "docs_ivf", records, queries, 10, 8, 0.80, "test-corpus-v1")
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	if !result.Passed {
 		t.Fatalf("recall %.4f below threshold %.4f", result.Recall.Measured, result.Recall.Minimum)
 	}
@@ -351,11 +356,13 @@ func TestEmbeddingSpaceContractFailsClosedOnUnknown(t *testing.T) {
 	if _, err := manager.Build(ctx, "idx", records, 1); err != nil {
 		t.Fatal(err)
 	}
+
 	if _, _, err := manager.Search(ctx, "idx", Query{
 		Vector: records[0].Vector, TopK: 1,
 	}); !errors.Is(err, ErrEmbeddingSpace) {
 		t.Fatalf("Search error = %v, want ErrEmbeddingSpace", err)
 	}
+
 }
 
 func TestManifestRecordCarriesEmbeddingSpaceWithoutIndexBody(t *testing.T) {

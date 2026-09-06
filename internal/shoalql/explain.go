@@ -121,7 +121,7 @@ func (e *Executor) explain(p *Plan) (*Result, error) {
 	if d.VectorIndex != nil {
 		rows = append(rows,
 			Row{strVal("vector_generation"), strVal(strconv.FormatUint(d.VectorIndex.Generation, 10))},
-			Row{strVal("vector_embedding_space"), strVal(d.VectorIndex.EmbeddingSpace)},
+			Row{strVal("vector_index_embedding_space"), strVal(d.VectorIndex.EmbeddingSpace)},
 			Row{strVal("vector_codebook_version"), strVal(d.VectorIndex.CodebookVersion)},
 			Row{strVal("vector_lineage"), strVal(fmt.Sprint(d.VectorIndex.Lineage))},
 			Row{strVal("vector_indexed_watermark"), strVal(strconv.FormatInt(d.VectorIndex.IndexedWatermark, 10))},

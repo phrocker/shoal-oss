@@ -19,7 +19,7 @@
 // versions:
 // - protoc-gen-go-grpc v1.6.2
 // - protoc             v7.35.0
-// source: embed.proto
+// source: proto/embed.proto
 
 package embedpb
 
@@ -392,5 +392,5 @@ var ShoalEmbed_ServiceDesc = grpc.ServiceDesc{
 			ServerStreams: true,
 		},
 	},
-	Metadata: "embed.proto",
+	Metadata: "proto/embed.proto",
 }
