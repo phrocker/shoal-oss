@@ -506,12 +506,12 @@ func (s *EmbeddedService) ontologyMutationSnapshot(
 		configured = *s.ontologyVersion
 	}
 	s.ontologyMu.RUnlock()
-	if !present {
-		return ontology.OntologyVersion{}, false, nil, nil
-	}
 	proposals, err := store.OntologyProposalsForMutation(ctx)
 	if err != nil {
 		return ontology.OntologyVersion{}, false, nil, err
+	}
+	if !present {
+		return ontology.OntologyVersion{}, false, proposals, nil
 	}
 	active, err := replayPublishedOntology(configured, proposals)
 	if err != nil {
