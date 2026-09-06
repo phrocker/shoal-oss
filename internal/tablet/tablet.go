@@ -642,12 +642,31 @@ func cloneBytes(b []byte) []byte {
 // may fall in different tablets — by merging every tablet's Source and
 // stacking the iterator above that cross-tablet merge.
 func (t *Tablet) Source(env iterrt.IteratorEnvironment) (iterrt.SortedKeyValueIterator, func(), error) {
+	return t.SourceContext(context.Background(), env)
+}
+
+// SourceContext is Source with cancellation propagated to immutable-file
+// opens and reads during source construction.
+func (t *Tablet) SourceContext(
+	ctx context.Context,
+	env iterrt.IteratorEnvironment,
+) (iterrt.SortedKeyValueIterator, func(), error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	t.mu.RLock()
 	defer t.mu.RUnlock()
-	return t.sourceLocked(env)
+	return t.sourceLockedContext(ctx, env)
 }
 
 func (t *Tablet) sourceLocked(env iterrt.IteratorEnvironment) (iterrt.SortedKeyValueIterator, func(), error) {
+	return t.sourceLockedContext(context.Background(), env)
+}
+
+func (t *Tablet) sourceLockedContext(
+	ctx context.Context,
+	env iterrt.IteratorEnvironment,
+) (iterrt.SortedKeyValueIterator, func(), error) {
 	memIter := t.active.Iterator()
 	filesCopy := append([]string(nil), t.files...)
 
@@ -656,7 +675,13 @@ func (t *Tablet) sourceLocked(env iterrt.IteratorEnvironment) (iterrt.SortedKeyV
 	var closers []func()
 
 	for _, path := range filesCopy {
-		src, closer, err := t.openFileSource(path, env)
+		if err := ctx.Err(); err != nil {
+			for _, c := range closers {
+				c()
+			}
+			return nil, nil, err
+		}
+		src, closer, err := t.openFileSourceContext(ctx, path, env)
 		if err != nil {
 			// Clean up any already-opened readers
 			for _, c := range closers {
@@ -1049,9 +1074,20 @@ func (t *Tablet) sharedForPath(path string) (*rfile.SharedFile, error) {
 // path, so the shared bytes slice is safe to wrap in concurrent read-only
 // readers.
 func (t *Tablet) openFileSource(path string, env iterrt.IteratorEnvironment) (iterrt.SortedKeyValueIterator, func(), error) {
+	return t.openFileSourceContext(context.Background(), path, env)
+}
+
+func (t *Tablet) openFileSourceContext(
+	ctx context.Context,
+	path string,
+	env iterrt.IteratorEnvironment,
+) (iterrt.SortedKeyValueIterator, func(), error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if fileFormat(path) == FormatParquet {
 		open := func() (storage.File, error) {
-			return t.backend.Open(context.Background(), path)
+			return t.backend.Open(ctx, path)
 		}
 		file, err := open()
 		if err != nil {
@@ -1067,8 +1103,17 @@ func (t *Tablet) openFileSource(path string, env iterrt.IteratorEnvironment) (it
 		}
 		return src, func() { _ = src.Close() }, nil
 	}
-	data, err := t.fileBytes(path)
+	var data []byte
+	var err error
+	if t.opts.Cache != nil {
+		data, err = t.opts.Cache.fileBytesContext(ctx, path)
+	} else {
+		data, err = storage.ReadAll(ctx, t.backend, path)
+	}
 	if err != nil {
+		return nil, nil, err
+	}
+	if err := ctx.Err(); err != nil {
 		return nil, nil, err
 	}
 	c := t.opts.Cache

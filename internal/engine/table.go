@@ -862,7 +862,11 @@ func (t *table) scanHosted(
 	}
 
 	for _, tb := range t.tablets {
-		src, closer, err := tb.Source(env)
+		if err := ctx.Err(); err != nil {
+			cleanup()
+			return nil, err
+		}
+		src, closer, err := tb.SourceContext(ctx, env)
 		if err != nil {
 			cleanup()
 			return nil, err
