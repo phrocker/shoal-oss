@@ -62,7 +62,7 @@ func (e *Explorer) ValidateSnapshot(
 	return e.ValidateEvidenceSnapshot(ctx, id, asOf, nodeIDs, nil, nil)
 }
 
-// ValidateEvidenceSnapshot verifies exact source nodes and edges against the
+// ValidateEvidenceSnapshot verifies exact source nodes, edges, and assertions against the
 // canonical state captured by a trusted snapshot. Reusing an ID after changing
 // content, revision, labels, endpoints, or edge properties fails closed.
 func (e *Explorer) ValidateEvidenceSnapshot(
@@ -107,7 +107,7 @@ func (e *Explorer) validateEvidenceSnapshotLocked(
 		return shoal.NewError(
 			shoal.ErrorConflict, "snapshot pin is not a trusted corpus frontier")
 	}
-	nodeState, edgeState, err := e.snapshotStateLocked(id)
+	nodeState, edgeState, assertionState, err := e.snapshotStateLocked(id)
 	if err != nil {
 		return err
 	}
@@ -138,6 +138,18 @@ func (e *Explorer) validateEvidenceSnapshotLocked(
 	for _, reference := range references {
 		if err := e.validateEvidenceReferenceLocked(reference); err != nil {
 			return err
+		}
+		for _, assertion := range reference.Assertions {
+			expected, present := assertionState[assertion.EdgeID]
+			current, exists := e.graphAssertions[assertion.EdgeID]
+			actual, digestErr := snapshotObjectDigest(current)
+			if !present || !exists || expected == "" ||
+				digestErr != nil || actual != expected {
+				return shoal.NewError(
+					shoal.ErrorConflict,
+					"interaction assertion does not match the pinned snapshot",
+				)
+			}
 		}
 	}
 	return nil
@@ -242,16 +254,9 @@ func (e *Explorer) validateAssertionReferenceLocked(
 		"interaction assertion edge ID", reference.EdgeID); err != nil {
 		return err
 	}
-	var assertion ontology.Assertion
-	found := false
-	for _, candidate := range e.graphAssertions {
-		if candidate.ID() == reference.AssertionID {
-			assertion = candidate
-			found = true
-			break
-		}
-	}
-	if !found || assertion.Origin() != reference.Origin {
+	assertion, found := e.graphAssertions[reference.EdgeID]
+	if !found || assertion.ID() != reference.AssertionID ||
+		assertion.Origin() != reference.Origin {
 		return shoal.NewError(
 			shoal.ErrorConflict,
 			"interaction assertion does not match current authoritative data",
@@ -290,7 +295,7 @@ func (e *Explorer) validateAssertionReferenceLocked(
 
 func (e *Explorer) registerSnapshotLocked(snapshot Snapshot) error {
 	id := shoal.ID(snapshot.ID)
-	currentNodes, currentEdges, err := e.currentSourceStateLocked()
+	currentNodes, currentEdges, currentAssertions, err := e.currentSourceStateLocked()
 	if err != nil {
 		return err
 	}
@@ -298,21 +303,26 @@ func (e *Explorer) registerSnapshotLocked(snapshot Snapshot) error {
 		e.latestSnapshotNodeDigests, currentNodes)
 	edgeStates, removedEdges := snapshotObjectDelta(
 		e.latestSnapshotEdgeDigests, currentEdges)
+	assertionStates, removedAssertions := snapshotObjectDelta(
+		e.latestSnapshotAssertionDigests, currentAssertions)
 	record := persistedSnapshot{
 		ID: id, AsOf: snapshot.AsOf.UTC(), ParentID: e.latestSnapshotID,
-		AddedNodeIDs:   snapshotStateIDs(nodeStates),
-		RemovedNodeIDs: removedNodes,
-		NodeStates:     nodeStates,
-		RemovedEdgeIDs: removedEdges,
-		EdgeStates:     edgeStates,
+		AddedNodeIDs:            snapshotStateIDs(nodeStates),
+		RemovedNodeIDs:          removedNodes,
+		NodeStates:              nodeStates,
+		RemovedEdgeIDs:          removedEdges,
+		EdgeStates:              edgeStates,
+		AssertionStates:         assertionStates,
+		RemovedAssertionEdgeIDs: removedAssertions,
 	}
 	if existing, ok := e.snapshotHistory[snapshot.ID]; ok {
-		nodes, edges, err := e.snapshotStateLocked(id)
+		nodes, edges, assertions, err := e.snapshotStateLocked(id)
 		if err == nil && existing.AsOf.Equal(record.AsOf) &&
 			snapshotObjectMapsEqual(nodes, currentNodes) &&
-			snapshotObjectMapsEqual(edges, currentEdges) {
+			snapshotObjectMapsEqual(edges, currentEdges) &&
+			snapshotObjectMapsEqual(assertions, currentAssertions) {
 			e.latestSnapshotID = id
-			e.setLatestSnapshotState(currentNodes, currentEdges)
+			e.setLatestSnapshotState(currentNodes, currentEdges, currentAssertions)
 			return nil
 		}
 		return shoal.NewError(
@@ -323,7 +333,7 @@ func (e *Explorer) registerSnapshotLocked(snapshot Snapshot) error {
 	if e.readOnly {
 		e.snapshotHistory[snapshot.ID] = record
 		e.latestSnapshotID = id
-		e.setLatestSnapshotState(currentNodes, currentEdges)
+		e.setLatestSnapshotState(currentNodes, currentEdges, currentAssertions)
 		return nil
 	}
 	accepted, err := e.conditionalInteractionRecord(
@@ -351,10 +361,11 @@ func (e *Explorer) registerSnapshotLocked(snapshot Snapshot) error {
 			)
 		}
 		e.snapshotHistory[snapshot.ID] = winner
-		nodes, edges, err := e.snapshotStateLocked(id)
+		nodes, edges, assertions, err := e.snapshotStateLocked(id)
 		if err != nil ||
 			!snapshotObjectMapsEqual(nodes, currentNodes) ||
-			!snapshotObjectMapsEqual(edges, currentEdges) {
+			!snapshotObjectMapsEqual(edges, currentEdges) ||
+			!snapshotObjectMapsEqual(assertions, currentAssertions) {
 			return shoal.NewError(
 				shoal.ErrorConflict,
 				"snapshot ID is already registered with different membership",
@@ -364,7 +375,7 @@ func (e *Explorer) registerSnapshotLocked(snapshot Snapshot) error {
 	}
 	e.snapshotHistory[snapshot.ID] = record
 	e.latestSnapshotID = id
-	e.setLatestSnapshotState(currentNodes, currentEdges)
+	e.setLatestSnapshotState(currentNodes, currentEdges, currentAssertions)
 	return nil
 }
 
@@ -396,16 +407,17 @@ func (e *Explorer) restoreLatestSnapshotLocked() error {
 	if !found {
 		return nil
 	}
-	nodes, edges, err := e.snapshotStateLocked(latest.ID)
+	nodes, edges, assertions, err := e.snapshotStateLocked(latest.ID)
 	if err != nil {
 		return err
 	}
 	e.latestSnapshotID = latest.ID
-	e.setLatestSnapshotState(nodes, edges)
+	e.setLatestSnapshotState(nodes, edges, assertions)
 	return nil
 }
 
 func (e *Explorer) currentSourceStateLocked() (
+	map[shoal.ID]string,
 	map[shoal.ID]string,
 	map[shoal.ID]string,
 	error,
@@ -415,12 +427,13 @@ func (e *Explorer) currentSourceStateLocked() (
 		if !interaction.IsInteractionKind(node.Kind) {
 			digest, err := snapshotObjectDigest(node)
 			if err != nil {
-				return nil, nil, err
+				return nil, nil, nil, err
 			}
 			nodes[id] = digest
 		}
 	}
 	edges := make(map[shoal.ID]string, len(e.graphEdges))
+	assertions := make(map[shoal.ID]string, len(e.graphAssertions))
 	for id, edge := range e.graphEdges {
 		from, fromOK := e.graphNodes[edge.From]
 		to, toOK := e.graphNodes[edge.To]
@@ -431,11 +444,18 @@ func (e *Explorer) currentSourceStateLocked() (
 		}
 		digest, err := snapshotObjectDigest(edge)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 		edges[id] = digest
+		if assertion, ok := e.graphAssertions[id]; ok {
+			digest, err := snapshotObjectDigest(assertion)
+			if err != nil {
+				return nil, nil, nil, err
+			}
+			assertions[id] = digest
+		}
 	}
-	return nodes, edges, nil
+	return nodes, edges, assertions, nil
 }
 
 func snapshotObjectDelta(
@@ -475,7 +495,7 @@ func snapshotStateIDs(states []persistedSnapshotObject) []shoal.ID {
 func (e *Explorer) snapshotMembershipLocked(
 	id shoal.ID,
 ) (map[shoal.ID]struct{}, error) {
-	nodes, _, err := e.snapshotStateLocked(id)
+	nodes, _, _, err := e.snapshotStateLocked(id)
 	if err != nil {
 		return nil, err
 	}
@@ -488,18 +508,18 @@ func (e *Explorer) snapshotMembershipLocked(
 
 func (e *Explorer) snapshotStateLocked(
 	id shoal.ID,
-) (map[shoal.ID]string, map[shoal.ID]string, error) {
+) (map[shoal.ID]string, map[shoal.ID]string, map[shoal.ID]string, error) {
 	var chain []persistedSnapshot
 	seen := make(map[shoal.ID]struct{})
 	for id != "" {
 		if _, duplicate := seen[id]; duplicate {
-			return nil, nil, shoal.NewError(
+			return nil, nil, nil, shoal.NewError(
 				shoal.ErrorInternal, "snapshot history contains a cycle")
 		}
 		seen[id] = struct{}{}
 		record, ok := e.snapshotHistory[string(id)]
 		if !ok {
-			return nil, nil, shoal.NewError(
+			return nil, nil, nil, shoal.NewError(
 				shoal.ErrorInternal, "snapshot history is incomplete")
 		}
 		chain = append(chain, record)
@@ -507,6 +527,7 @@ func (e *Explorer) snapshotStateLocked(
 	}
 	nodes := make(map[shoal.ID]string)
 	edges := make(map[shoal.ID]string)
+	assertions := make(map[shoal.ID]string)
 	for index := len(chain) - 1; index >= 0; index-- {
 		for _, nodeID := range chain[index].RemovedNodeIDs {
 			delete(nodes, nodeID)
@@ -526,15 +547,22 @@ func (e *Explorer) snapshotStateLocked(
 		for _, state := range chain[index].EdgeStates {
 			edges[state.ID] = state.Digest
 		}
+		for _, edgeID := range chain[index].RemovedAssertionEdgeIDs {
+			delete(assertions, edgeID)
+		}
+		for _, state := range chain[index].AssertionStates {
+			assertions[state.ID] = state.Digest
+		}
 	}
-	return nodes, edges, nil
+	return nodes, edges, assertions, nil
 }
 
 func (e *Explorer) setLatestSnapshotState(
-	nodes, edges map[shoal.ID]string,
+	nodes, edges, assertions map[shoal.ID]string,
 ) {
 	e.latestSnapshotNodeDigests = nodes
 	e.latestSnapshotEdgeDigests = edges
+	e.latestSnapshotAssertionDigests = assertions
 }
 
 // snapshotObjectDigest binds a graph object to the frontier that observed it.
@@ -567,11 +595,30 @@ func snapshotObjectDigest(value any) (string, error) {
 			weight[:], math.Float64bits(float64(object.Weight)))
 		_, _ = hash.Write(weight[:])
 		writeSnapshotMetadata(hash, object.Properties)
+	case ontology.Assertion:
+		writeSnapshotAssertion(hash, object)
 	default:
 		return "", shoal.NewError(
 			shoal.ErrorInternal, "unknown snapshot object")
 	}
 	return hex.EncodeToString(hash.Sum(nil)), nil
+}
+
+func writeSnapshotAssertion(writer snapshotWriter, assertion ontology.Assertion) {
+	// The canonical ID binds typed values, origin, confidence, provenance,
+	// ontology, and evidence identities. Annotation metadata is not part of
+	// every identity, so bind it explicitly as well.
+	writeSnapshotString(writer, "assertion")
+	writeSnapshotString(writer, string(assertion.ID()))
+	writeSnapshotString(writer, string(assertion.Origin()))
+	writeSnapshotMetadata(writer, assertion.Metadata())
+	writeSnapshotMetadata(writer, assertion.Provenance().Metadata())
+	evidence := assertion.Evidence()
+	writeSnapshotCount(writer, len(evidence))
+	for _, item := range evidence {
+		writeSnapshotString(writer, string(item.ID()))
+		writeSnapshotMetadata(writer, item.Metadata())
+	}
 }
 
 // BoundedNeighborhood expands the cached adjacency index without scanning or
@@ -862,6 +909,18 @@ func (e *Explorer) refreshSnapshotLocked() {
 		if record, ok := e.edges[id]; ok && record.PublishedAt.After(asOf) {
 			asOf = record.PublishedAt
 		}
+	}
+	assertionEdges := make([]shoal.ID, 0, len(e.graphAssertions))
+	for _, edgeID := range edgeIDs {
+		if _, ok := e.graphAssertions[edgeID]; ok {
+			assertionEdges = append(assertionEdges, edgeID)
+		}
+	}
+	writeSnapshotString(hash, "assertions")
+	writeSnapshotCount(hash, len(assertionEdges))
+	for _, edgeID := range assertionEdges {
+		writeSnapshotString(hash, string(edgeID))
+		writeSnapshotAssertion(hash, e.graphAssertions[edgeID])
 	}
 	for _, record := range e.extractions {
 		if record != nil && record.PublishedAt.After(asOf) {

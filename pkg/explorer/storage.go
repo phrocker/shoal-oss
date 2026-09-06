@@ -108,6 +108,9 @@ type persistedSnapshot struct {
 	NodeStates     []persistedSnapshotObject
 	RemovedEdgeIDs []shoal.ID
 	EdgeStates     []persistedSnapshotObject
+	// Assertion states are keyed by their mapped source edge, like graphAssertions.
+	AssertionStates         []persistedSnapshotObject
+	RemovedAssertionEdgeIDs []shoal.ID
 }
 
 type persistedSnapshotObject struct {
@@ -356,9 +359,10 @@ func validateSnapshotDelta(record persistedSnapshot) error {
 	}
 	for groupIndex, ids := range [][]shoal.ID{
 		record.AddedNodeIDs, record.RemovedNodeIDs, record.RemovedEdgeIDs,
+		record.RemovedAssertionEdgeIDs,
 	} {
 		name := "snapshot node ID"
-		if groupIndex == 2 {
+		if groupIndex >= 2 {
 			name = "snapshot edge ID"
 		}
 		for index, id := range ids {
@@ -371,7 +375,7 @@ func validateSnapshotDelta(record persistedSnapshot) error {
 		}
 	}
 	for _, states := range [][]persistedSnapshotObject{
-		record.NodeStates, record.EdgeStates,
+		record.NodeStates, record.EdgeStates, record.AssertionStates,
 	} {
 		for index, state := range states {
 			if err := shoal.ValidateRequiredID(
@@ -419,6 +423,18 @@ func validateSnapshotDelta(record persistedSnapshot) error {
 			record.RemovedEdgeIDs[index] == state.ID {
 			return fmt.Errorf(
 				"snapshot edge cannot be both updated and removed")
+		}
+	}
+	for _, state := range record.AssertionStates {
+		index := sort.Search(
+			len(record.RemovedAssertionEdgeIDs), func(index int) bool {
+				return shoal.CompareID(
+					record.RemovedAssertionEdgeIDs[index], state.ID) >= 0
+			})
+		if index < len(record.RemovedAssertionEdgeIDs) &&
+			record.RemovedAssertionEdgeIDs[index] == state.ID {
+			return fmt.Errorf(
+				"snapshot assertion cannot be both updated and removed")
 		}
 	}
 	return nil
@@ -991,7 +1007,9 @@ func persistedSnapshotsEqual(left, right persistedSnapshot) bool {
 		reflect.DeepEqual(left.RemovedNodeIDs, right.RemovedNodeIDs) &&
 		reflect.DeepEqual(left.NodeStates, right.NodeStates) &&
 		reflect.DeepEqual(left.RemovedEdgeIDs, right.RemovedEdgeIDs) &&
-		reflect.DeepEqual(left.EdgeStates, right.EdgeStates)
+		reflect.DeepEqual(left.EdgeStates, right.EdgeStates) &&
+		reflect.DeepEqual(left.AssertionStates, right.AssertionStates) &&
+		reflect.DeepEqual(left.RemovedAssertionEdgeIDs, right.RemovedAssertionEdgeIDs)
 }
 
 func encodeEmbeddedRecord(kind byte, value any) ([]byte, error) {

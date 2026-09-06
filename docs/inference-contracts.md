@@ -35,6 +35,16 @@ its quote against retained canonical source with
 model, enforcing authorization at retrieval time, and implementing the
 `Generator` interface.
 
+Explorer's durable snapshot proof binds canonical source nodes, edges, and
+assertions, including each assertion's mapped edge, origin, and annotation
+metadata. A historical pin cannot justify an assertion added or changed after
+that snapshot merely because its source edge is unchanged. This proof is
+rechecked under the interaction write lock and survives reopening the corpus.
+Legacy snapshot records without assertion state can still prove their recorded
+node and edge state, but cannot authorize new assertion-backed evidence; callers
+must obtain a new snapshot for that evidence. Current authorization checks remain
+required independently of historical proof.
+
 ## Tool-using agent harness
 
 The harness exposes typed `retrieve`, `open_section`, `neighbors`, and `stop`
