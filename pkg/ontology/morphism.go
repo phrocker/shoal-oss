@@ -26,7 +26,11 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
-const MaxLensTransitions = 32
+const (
+	MaxLensTransitions              = 32
+	MaxMorphismEvidence             = 256
+	MaxMorphismDiscriminatorChoices = 4096
+)
 
 type MorphismKind string
 
@@ -75,6 +79,9 @@ func NewMorphismDiscriminator(
 func (d MorphismDiscriminator) Validate() error {
 	if !requiredWire(d.metadataKey) || len(d.choices) == 0 {
 		return invalid("split discriminator key and choices are required")
+	}
+	if len(d.choices) > MaxMorphismDiscriminatorChoices {
+		return invalid("split discriminator choices exceed the public bound")
 	}
 	for i, choice := range d.choices {
 		if !requiredWire(choice.value) || ValidateID(choice.target) != nil {
@@ -207,6 +214,9 @@ func (m OntologyMorphism) Validate() error {
 	}
 	if !requiredWire(m.rationale) || len(m.evidence) == 0 {
 		return invalid("morphism rationale and evidence are required")
+	}
+	if len(m.evidence) > MaxMorphismEvidence {
+		return invalid("morphism evidence exceeds the public bound")
 	}
 	for i, evidence := range m.evidence {
 		if err := evidence.Validate(); err != nil {

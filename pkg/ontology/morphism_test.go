@@ -13,6 +13,8 @@
 package ontology
 
 import (
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -170,7 +172,54 @@ func mustIdentity(t *testing.T, version OntologyVersion) OntologyIdentity {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	return identity
+}
+
+func TestMorphismBoundsAndProposalPayloadAccounting(t *testing.T) {
+	f := newMorphismFixture(t)
+	evidence := make([]EvidenceRef, MaxMorphismEvidence+1)
+	for i := range evidence {
+		evidence[i] = f.evidence
+	}
+	_, err := NewOntologyMorphism(MorphismConfig{
+		Kind: MorphismRename, SourceVersion: f.renameFrom, TargetVersion: f.renameTo,
+		Sources: []shoal.ID{f.oldRel.ID()}, Targets: []shoal.ID{f.newRel.ID()},
+		Evidence: evidence, Rationale: "bounded evidence",
+	})
+	if err == nil || !strings.Contains(err.Error(), "evidence exceeds") {
+		t.Fatalf("oversized evidence error = %v", err)
+	}
+	choices := make(map[string]shoal.ID, MaxMorphismDiscriminatorChoices+1)
+	for i := 0; i <= MaxMorphismDiscriminatorChoices; i++ {
+		choices[strconv.Itoa(i)] = f.person.ID()
+	}
+	if _, err := NewMorphismDiscriminator("kind", choices); err == nil ||
+		!strings.Contains(err.Error(), "choices exceed") {
+		t.Fatalf("oversized discriminator error = %v", err)
+	}
+
+	morphism := mustMorphism(t, MorphismConfig{
+		Kind: MorphismRename, SourceVersion: f.renameFrom, TargetVersion: f.renameTo,
+		Sources: []shoal.ID{f.oldRel.ID()}, Targets: []shoal.ID{f.newRel.ID()},
+		Evidence: []EvidenceRef{f.evidence}, Rationale: strings.Repeat("r", 1024),
+	})
+	at := time.Date(2026, 9, 5, 12, 30, 0, 0, time.UTC)
+	without, err := NewGovernedProposal(
+		f.renameFrom.Schema(), f.renameFrom, f.renameTo,
+		"author", "proposal", at, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	with, err := NewGovernedProposalWithMorphisms(
+		f.renameFrom.Schema(), f.renameFrom, f.renameTo,
+		[]OntologyMorphism{morphism}, "author", "proposal", at, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if proposalPayloadBytes(with) <= proposalPayloadBytes(without) {
+		t.Fatal("morphism payload was omitted from proposal accounting")
+	}
 }
 
 type morphismFixture struct {

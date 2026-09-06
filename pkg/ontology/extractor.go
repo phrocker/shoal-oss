@@ -472,6 +472,19 @@ func (r ExtractionResult) Validate() error {
 		if err := validateBoundedMetadata(proposal.Metadata(), r.limits); err != nil {
 			return err
 		}
+		for _, morphism := range proposal.Morphisms() {
+			if uint64(len(morphism.Evidence())) > uint64(r.limits.MaxEvidence) {
+				return invalid("morphism evidence exceeds result limit")
+			}
+			if err := validateBoundedMetadata(morphism.Metadata(), r.limits); err != nil {
+				return err
+			}
+			for _, evidence := range morphism.Evidence() {
+				if err := validateBoundedEvidenceMetadata(evidence, r.limits); err != nil {
+					return err
+				}
+			}
+		}
 		if proposalPayloadBytes(proposal) > uint64(r.limits.MaxPayloadBytes) {
 			return invalid("proposal payload exceeds result limit")
 		}
@@ -1234,20 +1247,39 @@ func (c *payloadCounter) addProposal(proposal GovernedProposal) {
 		c.addString(transition.actor)
 		c.addString(transition.note)
 	}
+	for _, morphism := range proposal.morphisms {
+		c.addString(string(morphism.kind))
+		c.addString(string(morphism.safety))
+		c.addString(string(morphism.source.schemaID))
+		c.addString(string(morphism.source.versionID))
+		c.addString(string(morphism.target.schemaID))
+		c.addString(string(morphism.target.versionID))
+		for _, id := range morphism.sources {
+			c.addString(string(id))
+		}
+		for _, id := range morphism.targets {
+			c.addString(string(id))
+		}
+		c.addString(morphism.discriminator.metadataKey)
+		for _, choice := range morphism.discriminator.choices {
+			c.addString(choice.value)
+			c.addString(string(choice.target))
+		}
+		for _, evidence := range morphism.evidence {
+			c.addEvidence(evidence)
+		}
+		c.addString(morphism.rationale)
+		c.addMetadata(morphism.metadata)
+	}
 }
 
 func proposalPayloadBytes(proposal GovernedProposal) uint64 {
-	size := uint64(len(proposal.schema.key)+len(proposal.schema.name)+
-		len(proposal.schema.description)+len(proposal.baseSchemaID)+
-		len(proposal.baseVersionID)+
-		len(proposal.proposedBy)+len(proposal.rationale)+
-		len(canonicalMetadata(proposal.schema.metadata))+
-		len(canonicalMetadata(proposal.metadata))) +
-		ontologyVersionPayloadBytes(proposal.proposedVersion)
-	for _, transition := range proposal.transitions {
-		size += uint64(len(transition.actor) + len(transition.note))
+	counter := payloadCounter{limit: ^uint64(0)}
+	counter.addProposal(proposal)
+	if counter.exceeded {
+		return ^uint64(0)
 	}
-	return size
+	return counter.size
 }
 
 func validateBoundedMetadata(metadata shoal.Metadata, limits ExtractionLimits) error {

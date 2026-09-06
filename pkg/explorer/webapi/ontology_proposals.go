@@ -95,6 +95,9 @@ type ProposalTransitionProjection struct {
 type OntologyProposalLimits struct {
 	MaxProposals              uint32 `json:"max_proposals"`
 	MaxTransitions            uint32 `json:"max_transitions"`
+	MaxMorphisms              uint32 `json:"max_morphisms"`
+	MaxMorphismEvidence       uint32 `json:"max_morphism_evidence"`
+	MaxDiscriminatorChoices   uint32 `json:"max_discriminator_choices"`
 	MaxConcepts               uint32 `json:"max_concepts"`
 	MaxRelationships          uint32 `json:"max_relationships"`
 	MaxProperties             uint32 `json:"max_properties"`
@@ -259,6 +262,22 @@ func ontologyMorphismsFromDraft(
 	}
 	out := make([]ontology.OntologyMorphism, 0, len(drafts))
 	for _, draft := range drafts {
+		if len(draft.Sources) > int(MaxOntologyProperties) ||
+			len(draft.Targets) > int(MaxOntologyProperties) {
+			return nil, shoal.NewError(
+				shoal.ErrorInvalidArgument, "morphism definitions exceed the service bound")
+		}
+		if len(draft.Evidence) > int(MaxEvidencePerResult) {
+			return nil, shoal.NewError(
+				shoal.ErrorInvalidArgument, "morphism evidence exceeds the service bound")
+		}
+		if draft.Discriminator != nil &&
+			len(draft.Discriminator.Choices) > int(MaxOntologyConcepts) {
+			return nil, shoal.NewError(
+				shoal.ErrorInvalidArgument,
+				"morphism discriminator choices exceed the service bound",
+			)
+		}
 		evidence := make([]ontology.EvidenceRef, 0, len(draft.Evidence))
 		for _, item := range draft.Evidence {
 			var options []ontology.EvidenceOption
@@ -485,6 +504,9 @@ func ontologyProposalLimits() OntologyProposalLimits {
 	return OntologyProposalLimits{
 		MaxProposals:              MaxOntologyProposals,
 		MaxTransitions:            MaxOntologyProposalTransitions,
+		MaxMorphisms:              ontology.MaxProposalMorphisms,
+		MaxMorphismEvidence:       MaxEvidencePerResult,
+		MaxDiscriminatorChoices:   MaxOntologyConcepts,
 		MaxConcepts:               MaxOntologyConcepts,
 		MaxRelationships:          MaxOntologyRelationships,
 		MaxProperties:             MaxOntologyProperties,
