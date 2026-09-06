@@ -259,6 +259,17 @@ func TestIndeterminateOntologyMutationBlocksFurtherWritesUntilReopen(t *testing.
 		); !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
 			t.Fatalf("read after indeterminate mutation = %v", err)
 		}
+		if _, err := corpus.OntologyProposalMutationState(
+			context.Background(), base, "",
+		); !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
+			t.Fatalf("mutation state after indeterminate mutation = %v", err)
+		}
+		selected, _ := ontology.NewOntologyIdentity(target)
+		if _, err := corpus.InterpretAssertions(
+			context.Background(), nil, selected,
+		); !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
+			t.Fatalf("lens read after indeterminate mutation = %v", err)
+		}
 	})
 	t.Run("transition", func(t *testing.T) {
 		data := filepath.Join(t.TempDir(), "corpus")
@@ -285,6 +296,17 @@ func TestIndeterminateOntologyMutationBlocksFurtherWritesUntilReopen(t *testing.
 		); !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
 			t.Fatalf("read after indeterminate transition = %v", err)
 		}
+		if _, err := corpus.OntologyProposalMutationState(
+			context.Background(), base, proposal.ID(),
+		); !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
+			t.Fatalf("mutation state after indeterminate transition = %v", err)
+		}
+		selected, _ := ontology.NewOntologyIdentity(target)
+		if _, err := corpus.InterpretAssertions(
+			context.Background(), nil, selected,
+		); !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
+			t.Fatalf("lens read after indeterminate transition = %v", err)
+		}
 		if err := corpus.Close(); err != nil {
 			t.Fatal(err)
 		}
@@ -299,6 +321,16 @@ func TestIndeterminateOntologyMutationBlocksFurtherWritesUntilReopen(t *testing.
 		}
 		if len(stored) != 1 || stored[0].State() != ontology.ProposalDraft {
 			t.Fatalf("blocked transition mutated proposal = %#v", stored)
+		}
+		if _, err := corpus.InterpretAssertions(
+			context.Background(), nil, selected,
+		); err != nil {
+			t.Fatalf("lens read after reopen = %v", err)
+		}
+		state, err := corpus.OntologyProposalMutationState(
+			context.Background(), base, proposal.ID())
+		if err != nil || !state.ProposalFound() {
+			t.Fatalf("mutation state after reopen = %#v, %v", state, err)
 		}
 	})
 }

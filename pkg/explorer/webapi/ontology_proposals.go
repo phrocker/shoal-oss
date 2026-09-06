@@ -47,8 +47,14 @@ type OntologyProposalProvider interface {
 	) (ontology.GovernedProposal, error)
 }
 
-type ontologyProposalStoreClient interface {
+type ontologyProposalReadClient interface {
 	OntologyProposals(context.Context) ([]ontology.GovernedProposal, error)
+}
+
+type ontologyProposalMutationClient interface {
+	OntologyProposalMutationState(
+		context.Context, ontology.OntologyVersion, shoal.ID,
+	) (explorer.OntologyProposalMutationState, error)
 	CreateOntologyProposal(
 		context.Context, ontology.GovernedProposal, ontology.OntologyVersion,
 	) error
@@ -393,7 +399,7 @@ type OntologyProposalValueDraft struct {
 func (s *EmbeddedService) OntologyProposals(
 	ctx context.Context,
 ) ([]ontology.GovernedProposal, error) {
-	store, ok := s.client.(ontologyProposalStoreClient)
+	store, ok := s.client.(ontologyProposalReadClient)
 	if !ok {
 		return nil, shoal.NewError(
 			shoal.ErrorUnavailable, "workspace capability \"ontology proposals\" is unavailable")
@@ -405,12 +411,12 @@ func (s *EmbeddedService) CreateOntologyProposal(
 	ctx context.Context,
 	request CreateOntologyProposalRequest,
 ) (ontology.GovernedProposal, error) {
-	store, ok := s.client.(ontologyProposalStoreClient)
+	store, ok := s.client.(ontologyProposalMutationClient)
 	if !ok {
 		return ontology.GovernedProposal{}, shoal.NewError(
 			shoal.ErrorUnavailable, "workspace capability \"ontology proposals\" is unavailable")
 	}
-	base, configured, proposals, err := s.ontologyMutationSnapshot(ctx, store)
+	state, configured, err := s.ontologyMutationSnapshot(ctx, store, "")
 	if err != nil {
 		return ontology.GovernedProposal{}, err
 	}
@@ -418,6 +424,7 @@ func (s *EmbeddedService) CreateOntologyProposal(
 		return ontology.GovernedProposal{}, shoal.NewError(
 			shoal.ErrorUnavailable, "an active ontology is required to propose a refinement")
 	}
+	base := state.Active()
 	now := s.now()
 	proposed, err := ontologyVersionFromProposalDraft(
 		base.Schema(), request.ProposedVersion, now)
@@ -436,19 +443,6 @@ func (s *EmbeddedService) CreateOntologyProposal(
 		ontologyActor(ctx), request.Rationale, now, nil)
 	if err != nil {
 		return ontology.GovernedProposal{}, err
-	}
-	if len(proposals) >= int(MaxOntologyProposals) {
-		existing := false
-		for _, candidate := range proposals {
-			if candidate.ID() == proposal.ID() {
-				existing = true
-				break
-			}
-		}
-		if !existing {
-			return ontology.GovernedProposal{}, ontologyBoundError(
-				"proposal", len(proposals)+1, MaxOntologyProposals)
-		}
 	}
 	if err := store.CreateOntologyProposal(ctx, proposal, base); err != nil {
 		return ontology.GovernedProposal{}, err
@@ -594,7 +588,7 @@ func (s *EmbeddedService) TransitionOntologyProposal(
 	proposalID shoal.ID,
 	request TransitionOntologyProposalRequest,
 ) (ontology.GovernedProposal, error) {
-	store, ok := s.client.(ontologyProposalStoreClient)
+	store, ok := s.client.(ontologyProposalMutationClient)
 	if !ok {
 		return ontology.GovernedProposal{}, shoal.NewError(
 			shoal.ErrorUnavailable, "workspace capability \"ontology proposals\" is unavailable")
@@ -603,23 +597,17 @@ func (s *EmbeddedService) TransitionOntologyProposal(
 	if next == ontology.ProposalPublished {
 		s.ontologyPublishMu.Lock()
 		defer s.ontologyPublishMu.Unlock()
-		active, configured, proposals, snapshotErr := s.ontologyMutationSnapshot(ctx, store)
+		state, configured, snapshotErr := s.ontologyMutationSnapshot(
+			ctx, store, proposalID)
 		if snapshotErr != nil {
 			return ontology.GovernedProposal{}, snapshotErr
 		}
-		var current ontology.GovernedProposal
-		for _, candidate := range proposals {
-			if candidate.ID() == proposalID {
-				current = candidate
-				break
-			}
-		}
-		if current.ID() == "" {
+		if !state.ProposalFound() {
 			return ontology.GovernedProposal{}, shoal.NewError(
 				shoal.ErrorNotFound, "ontology proposal not found")
 		}
-		baseID, hasBase := current.BaseVersionID()
-		if !configured || !hasBase || active.ID() != baseID {
+		baseID, hasBase := state.ProposalBaseVersionID()
+		if !configured || !hasBase || state.Active().ID() != baseID {
 			return ontology.GovernedProposal{}, shoal.NewError(
 				shoal.ErrorConflict,
 				"ontology proposal base is not the active version",
@@ -636,11 +624,11 @@ func (s *EmbeddedService) TransitionOntologyProposal(
 
 func (s *EmbeddedService) ontologyMutationSnapshot(
 	ctx context.Context,
-	store ontologyProposalStoreClient,
+	store ontologyProposalMutationClient,
+	proposalID shoal.ID,
 ) (
-	ontology.OntologyVersion,
+	explorer.OntologyProposalMutationState,
 	bool,
-	[]ontology.GovernedProposal,
 	error,
 ) {
 	s.ontologyMu.RLock()
@@ -650,18 +638,15 @@ func (s *EmbeddedService) ontologyMutationSnapshot(
 		configured = *s.ontologyVersion
 	}
 	s.ontologyMu.RUnlock()
-	proposals, err := store.OntologyProposals(ctx)
-	if err != nil {
-		return ontology.OntologyVersion{}, false, nil, err
-	}
 	if !present {
-		return ontology.OntologyVersion{}, false, proposals, nil
+		return explorer.OntologyProposalMutationState{}, false, nil
 	}
-	active, err := replayPublishedOntology(configured, proposals)
+	state, err := store.OntologyProposalMutationState(
+		ctx, configured, proposalID)
 	if err != nil {
-		return ontology.OntologyVersion{}, false, nil, err
+		return explorer.OntologyProposalMutationState{}, false, err
 	}
-	return active, true, proposals, nil
+	return state, true, nil
 }
 
 func ontologyProposalsFor(
@@ -696,7 +681,7 @@ func createOntologyProposalFor(
 	if err != nil {
 		return OntologyProposalResponse{}, err
 	}
-	projected, err := projectOntologyProposal(proposal)
+	projected, err := projectOntologyProposalForMutation(proposal)
 	if err != nil {
 		return OntologyProposalResponse{}, err
 	}
@@ -718,7 +703,7 @@ func transitionOntologyProposalFor(
 	if err != nil {
 		return OntologyProposalResponse{}, err
 	}
-	projected, err := projectOntologyProposal(proposal)
+	projected, err := projectOntologyProposalForMutation(proposal)
 	if err != nil {
 		return OntologyProposalResponse{}, err
 	}
@@ -758,6 +743,19 @@ func projectOntologyProposals(
 
 func projectOntologyProposal(
 	proposal ontology.GovernedProposal,
+) (OntologyProposalProjection, error) {
+	return projectOntologyProposalWithEvidence(proposal, true)
+}
+
+func projectOntologyProposalForMutation(
+	proposal ontology.GovernedProposal,
+) (OntologyProposalProjection, error) {
+	return projectOntologyProposalWithEvidence(proposal, false)
+}
+
+func projectOntologyProposalWithEvidence(
+	proposal ontology.GovernedProposal,
+	includeEvidence bool,
 ) (OntologyProposalProjection, error) {
 	if err := proposal.Validate(); err != nil {
 		return OntologyProposalProjection{}, err
@@ -799,10 +797,12 @@ func projectOntologyProposal(
 	for _, morphism := range proposal.Morphisms() {
 		evidence := morphism.Evidence()
 		evidenceIDs := make([]string, len(evidence))
-		evidenceProjected := make(
-			[]OntologyMorphismEvidenceProjection, 0, len(evidence))
+		evidenceProjected := make([]OntologyMorphismEvidenceProjection, 0)
 		for index, item := range evidence {
 			evidenceIDs[index] = encodeID(item.ID())
+			if !includeEvidence {
+				continue
+			}
 			path, hasPath := item.Path()
 			var projectedPath *graph.Path
 			if hasPath {

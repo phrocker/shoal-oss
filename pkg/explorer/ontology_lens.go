@@ -49,6 +49,9 @@ func (e *Explorer) InterpretAssertions(
 	if err := e.requireOpen(); err != nil {
 		return nil, err
 	}
+	if err := e.requireCertainOntologyMutationLocked(); err != nil {
+		return nil, err
+	}
 	var target ontology.OntologyVersion
 	var morphisms []ontology.OntologyMorphism
 	transitions := make([]ontology.OntologyTransition, 0)

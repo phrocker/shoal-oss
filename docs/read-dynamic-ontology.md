@@ -61,6 +61,10 @@ selection are intentionally tracked separately and are not claimed here.
 - `authorized.Config.OntologyInterpreter` is the explicit trusted
   interpretation dependency. The authorization wrapper never accepts
   interpretations from its untrusted graph `Base`.
+- `explorer.OntologyProposalMutationStateProvider` exposes only the active
+  ontology and a requested proposal's base identity to ingest-authorized
+  mutation preflight. Mutation callers do not receive the governed proposal
+  corpus and do not need unrelated read authority.
 - `webapi.NeighborhoodResponse.OntologyInterpretations` and
   `webapi.PathResponse.OntologyInterpretations` expose effective and original
   identities, safety-path IDs, and unresolved reasons.
@@ -75,7 +79,12 @@ selection are intentionally tracked separately and are not claimed here.
   Publication rejects stale bases, and `ActiveOntology` replays the chain after
   restart, including a terminal chain of exactly 256 transitions.
 - An indeterminate proposal or transition write fail-closes subsequent ontology
-  mutations until the corpus is reopened and durable state is replayed.
+  mutations, mutation preflight, proposal reads, and read-time interpretation
+  until the corpus is reopened and durable state is replayed.
+- Governed proposal evidence is accepted only when the mutation caller is
+  authorized for every cited revision and path object. Proposal reads expose
+  full evidence only when every referenced object is authorized; mutation
+  responses retain opaque evidence IDs without returning evidence contents.
 - A corpus admits at most 256 durable proposals across all schemas and lifecycle
   states. Admission is checked under the store's write lock before persistence,
   including concurrent requests through different service instances. Identical

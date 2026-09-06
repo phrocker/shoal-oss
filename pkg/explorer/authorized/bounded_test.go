@@ -413,6 +413,37 @@ func TestOntologyLensRequiresExplicitTrustedInterpreter(t *testing.T) {
 	}
 }
 
+func TestOntologyLensPropagatesTrustedInterpreterUnavailability(t *testing.T) {
+	client, base := authorizedPaginationClient(t, false)
+	schema, _ := ontology.NewOntologySchema("uncertain", "Uncertain", "", nil)
+	version, _ := ontology.NewOntologyVersion(
+		schema, "1", time.Date(2026, time.September, 6, 0, 0, 0, 0, time.UTC),
+		nil, nil, nil, nil)
+	selected, _ := ontology.NewOntologyIdentity(version)
+	decision, err := auth.NewDecision(auth.DecisionConfig{
+		Subject: "subject", Actor: "actor",
+		AuthorizationDomain: []byte("domain"),
+		AllowedOperations:   []auth.Operation{auth.OperationNeighborhood},
+		PermittedSourceIDs:  [][]byte{[]byte("source")},
+		PermittedPolicyIDs:  [][]byte{[]byte("policy")},
+		PolicyGeneration:    1,
+		AuthenticationExpires: time.Date(
+			2026, time.September, 6, 1, 0, 0, 0, time.UTC),
+		RequestID: "request", SelectedOntology: selected,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	base.interpretErr = shoal.NewError(
+		shoal.ErrorUnavailable, "ontology mutation outcome is indeterminate")
+	client.ontologyInterpreter = base
+	if _, err := client.applyOntologyLens(
+		context.Background(), explorer.Neighborhood{}, decision,
+	); !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
+		t.Fatalf("trusted interpreter unavailability = %v", err)
+	}
+}
+
 func authorizedPaginationClient(t *testing.T, hiddenOnly bool) (*Client, *pagedBoundedBase) {
 	t.Helper()
 	ctx := context.Background()
@@ -508,11 +539,12 @@ func authorizedPaginationClient(t *testing.T, hiddenOnly bool) (*Client, *pagedB
 }
 
 type pagedBoundedBase struct {
-	calls      int
-	view       explorer.DocumentView
-	nodes      map[shoal.ID]graph.Node
-	hiddenOnly bool
-	interpret  func()
+	calls        int
+	view         explorer.DocumentView
+	nodes        map[shoal.ID]graph.Node
+	hiddenOnly   bool
+	interpret    func()
+	interpretErr error
 }
 
 func (b *pagedBoundedBase) InterpretAssertions(
@@ -522,6 +554,9 @@ func (b *pagedBoundedBase) InterpretAssertions(
 ) ([]ontology.AssertionInterpretation, error) {
 	if b.interpret != nil {
 		b.interpret()
+	}
+	if b.interpretErr != nil {
+		return nil, b.interpretErr
 	}
 	result := make([]ontology.AssertionInterpretation, 0, len(assertions))
 	for _, assertion := range assertions {

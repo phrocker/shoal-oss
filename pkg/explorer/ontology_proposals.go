@@ -52,6 +52,40 @@ type OntologyProposalStore interface {
 	) (ontology.GovernedProposal, error)
 }
 
+// OntologyProposalMutationStateProvider supplies the narrow preflight view
+// needed by proposal mutations without exposing governed proposal bodies.
+type OntologyProposalMutationStateProvider interface {
+	OntologyProposalMutationState(
+		context.Context, ontology.OntologyVersion, shoal.ID,
+	) (OntologyProposalMutationState, error)
+}
+
+// OntologyProposalMutationState is the narrow preflight view needed by
+// proposal mutations. It intentionally excludes proposal authors, rationale,
+// metadata, evidence, and unrelated proposal bodies.
+type OntologyProposalMutationState struct {
+	active                ontology.OntologyVersion
+	proposalBaseVersionID shoal.ID
+	proposalFound         bool
+	proposalHasBase       bool
+}
+
+// Active returns the currently published tip rooted at the configured
+// ontology version supplied to OntologyProposalMutationState.
+func (s OntologyProposalMutationState) Active() ontology.OntologyVersion {
+	return s.active
+}
+
+// ProposalFound reports whether the requested proposal ID exists.
+func (s OntologyProposalMutationState) ProposalFound() bool {
+	return s.proposalFound
+}
+
+// ProposalBaseVersionID returns the requested proposal's immutable base.
+func (s OntologyProposalMutationState) ProposalBaseVersionID() (shoal.ID, bool) {
+	return s.proposalBaseVersionID, s.proposalHasBase
+}
+
 type persistedOntologyProposal struct {
 	ProposalID      shoal.ID
 	Schema          persistedOntologySchema
@@ -186,6 +220,58 @@ func (e *Explorer) OntologyProposals(
 		return proposals[left].UpdatedAt().After(proposals[right].UpdatedAt())
 	})
 	return proposals, nil
+}
+
+// OntologyProposalMutationState returns only the active ontology and the
+// requested proposal's base identity. It supports least-privilege mutation
+// preflight without exposing the governed proposal corpus.
+func (e *Explorer) OntologyProposalMutationState(
+	ctx context.Context,
+	configured ontology.OntologyVersion,
+	proposalID shoal.ID,
+) (OntologyProposalMutationState, error) {
+	if err := contextError(ctx); err != nil {
+		return OntologyProposalMutationState{}, err
+	}
+	if err := configured.Validate(); err != nil {
+		return OntologyProposalMutationState{}, err
+	}
+	if err := shoal.ValidateOptionalID("ontology proposal ID", proposalID); err != nil {
+		return OntologyProposalMutationState{}, err
+	}
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	if err := e.requireOpen(); err != nil {
+		return OntologyProposalMutationState{}, err
+	}
+	if err := e.requireCertainOntologyMutationLocked(); err != nil {
+		return OntologyProposalMutationState{}, err
+	}
+	if len(e.ontologyProposals) > int(MaxOntologyProposals) {
+		return OntologyProposalMutationState{}, shoal.NewError(
+			shoal.ErrorUnavailable, "ontology proposals exceed the corpus bound")
+	}
+	proposals := make([]ontology.GovernedProposal, 0, len(e.ontologyProposals))
+	state := OntologyProposalMutationState{}
+	for id, record := range e.ontologyProposals {
+		proposal, err := record.proposal()
+		if err != nil {
+			return OntologyProposalMutationState{}, shoal.WrapError(
+				shoal.ErrorInternal, "stored ontology proposal is invalid", err)
+		}
+		proposals = append(proposals, proposal)
+		if proposalID != "" && id == proposalID {
+			state.proposalFound = true
+			state.proposalBaseVersionID, state.proposalHasBase =
+				proposal.BaseVersionID()
+		}
+	}
+	catalog, err := ontology.NewPublishedCatalog(configured, proposals)
+	if err != nil {
+		return OntologyProposalMutationState{}, err
+	}
+	state.active = catalog.Active()
+	return state, nil
 }
 
 // CreateOntologyProposal durably records a new draft proposal. The lifecycle is

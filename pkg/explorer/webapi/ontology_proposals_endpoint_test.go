@@ -328,10 +328,60 @@ func TestOntologyProposalEndpointDistinguishesAuthorizationDenial(t *testing.T) 
 		t.Fatal(err)
 	}
 	defer createdResponse.Body.Close()
-	if createdResponse.StatusCode != http.StatusUnauthorized {
+	if createdResponse.StatusCode != http.StatusCreated {
 		data, _ := io.ReadAll(createdResponse.Body)
-		t.Fatalf("ingest-only create status = %d, want 401: %s",
+		t.Fatalf("ingest-only create status = %d, want 201: %s",
 			createdResponse.StatusCode, data)
+	}
+	var created webapi.OntologyProposalResponse
+	if err := json.NewDecoder(createdResponse.Body).Decode(&created); err != nil {
+		t.Fatal(err)
+	}
+	for _, state := range []ontology.ProposalState{
+		ontology.ProposalSubmitted,
+		ontology.ProposalApproved,
+		ontology.ProposalPublished,
+	} {
+		transition, err := http.NewRequest(
+			http.MethodPost,
+			server.URL+"/api/v1/ontology/proposals/"+created.Proposal.ID+"/transition",
+			bytes.NewReader(mustJSON(t, webapi.TransitionOntologyProposalRequest{
+				State: string(state), Note: "ingest-only governance",
+			})))
+		if err != nil {
+			t.Fatal(err)
+		}
+		transition.Header.Set("Content-Type", "application/json")
+		transition.Header.Set(authnPrincipalHeader, "ingest-only")
+		transitionResponse, err := server.Client().Do(transition)
+		if err != nil {
+			t.Fatal(err)
+		}
+		data, readErr := io.ReadAll(transitionResponse.Body)
+		transitionResponse.Body.Close()
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		if transitionResponse.StatusCode != http.StatusOK {
+			t.Fatalf("ingest-only %s status = %d, want 200: %s",
+				state, transitionResponse.StatusCode, data)
+		}
+	}
+	list, err := http.NewRequest(
+		http.MethodGet, server.URL+"/api/v1/ontology/proposals", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	list.Header.Set(authnPrincipalHeader, "ingest-only")
+	listResponse, err := server.Client().Do(list)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listResponse.Body.Close()
+	if listResponse.StatusCode != http.StatusUnauthorized {
+		data, _ := io.ReadAll(listResponse.Body)
+		t.Fatalf("ingest-only list status = %d, want 401: %s",
+			listResponse.StatusCode, data)
 	}
 }
 
@@ -577,14 +627,7 @@ func TestOntologyProposalMorphismUsesKeyReferencesAndWireCodecs(t *testing.T) {
 		len(projected.EvidenceIDs) != 1 ||
 		projected.EvidenceIDs[0] != base64.RawURLEncoding.EncodeToString(
 			[]byte(expectedEvidence.ID())) ||
-		len(projected.Evidence) != 1 ||
-		projected.Evidence[0].ID != projected.EvidenceIDs[0] ||
-		projected.Evidence[0].Citation != evidenceDraft.Citation ||
-		projected.Evidence[0].Quote != evidenceDraft.Quote ||
-		projected.Evidence[0].Metadata["source"] != "test" ||
-		projected.Evidence[0].Path == nil ||
-		len(projected.Evidence[0].Path.Nodes) != 1 ||
-		projected.Evidence[0].Path.Nodes[0].ID != "node:opaque/value" {
+		len(projected.Evidence) != 0 {
 		t.Fatalf("projected morphism IDs = %+v", projected)
 	}
 	if !reflect.DeepEqual(projected.Metadata, metadata) {
@@ -615,6 +658,17 @@ func TestOntologyProposalMorphismUsesKeyReferencesAndWireCodecs(t *testing.T) {
 		!reflect.DeepEqual(listed.Proposals[0].Morphisms[0].Metadata, metadata) ||
 		listed.Proposals[0].Morphisms[0].ID != projected.ID {
 		t.Fatalf("listed morphism metadata or identity changed: %#v", listed.Proposals)
+	}
+	listedEvidence := listed.Proposals[0].Morphisms[0].Evidence
+	if len(listedEvidence) != 1 ||
+		listedEvidence[0].ID != projected.EvidenceIDs[0] ||
+		listedEvidence[0].Citation != evidenceDraft.Citation ||
+		listedEvidence[0].Quote != evidenceDraft.Quote ||
+		listedEvidence[0].Metadata["source"] != "test" ||
+		listedEvidence[0].Path == nil ||
+		len(listedEvidence[0].Path.Nodes) != 1 ||
+		listedEvidence[0].Path.Nodes[0].ID != "node:opaque/value" {
+		t.Fatalf("listed morphism evidence = %+v", listedEvidence)
 	}
 	for _, invalidMetadata := range []shoal.Metadata{
 		{"\xff": "one", "\xfe": "two"},
