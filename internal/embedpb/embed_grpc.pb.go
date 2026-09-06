@@ -37,6 +37,7 @@ const _ = grpc.SupportPackageIsVersion9
 
 const (
 	ShoalEmbed_CreateTable_FullMethodName      = "/shoal.embed.v1.ShoalEmbed/CreateTable"
+	ShoalEmbed_CreateTableV2_FullMethodName    = "/shoal.embed.v1.ShoalEmbed/CreateTableV2"
 	ShoalEmbed_Write_FullMethodName            = "/shoal.embed.v1.ShoalEmbed/Write"
 	ShoalEmbed_ConditionalWrite_FullMethodName = "/shoal.embed.v1.ShoalEmbed/ConditionalWrite"
 	ShoalEmbed_Scan_FullMethodName             = "/shoal.embed.v1.ShoalEmbed/Scan"
@@ -55,6 +56,10 @@ const (
 type ShoalEmbedClient interface {
 	// CreateTable creates a new table with optional split points.
 	CreateTable(ctx context.Context, in *CreateTableRequest, opts ...grpc.CallOption) (*CreateTableResponse, error)
+	// CreateTableV2 enforces the safety-critical default_embedding field. New
+	// clients use this RPC for embedding-bearing tables so pre-V2 servers fail
+	// closed with UNIMPLEMENTED rather than ignoring the field.
+	CreateTableV2(ctx context.Context, in *CreateTableRequest, opts ...grpc.CallOption) (*CreateTableResponse, error)
 	// Write writes an unconditional batch of mutations to a table.
 	Write(ctx context.Context, in *WriteRequest, opts ...grpc.CallOption) (*WriteResponse, error)
 	// ConditionalWrite atomically evaluates optional per-mutation conditions
@@ -88,6 +93,16 @@ func (c *shoalEmbedClient) CreateTable(ctx context.Context, in *CreateTableReque
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(CreateTableResponse)
 	err := c.cc.Invoke(ctx, ShoalEmbed_CreateTable_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *shoalEmbedClient) CreateTableV2(ctx context.Context, in *CreateTableRequest, opts ...grpc.CallOption) (*CreateTableResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(CreateTableResponse)
+	err := c.cc.Invoke(ctx, ShoalEmbed_CreateTableV2_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -191,6 +206,10 @@ func (c *shoalEmbedClient) Status(ctx context.Context, in *StatusRequest, opts .
 type ShoalEmbedServer interface {
 	// CreateTable creates a new table with optional split points.
 	CreateTable(context.Context, *CreateTableRequest) (*CreateTableResponse, error)
+	// CreateTableV2 enforces the safety-critical default_embedding field. New
+	// clients use this RPC for embedding-bearing tables so pre-V2 servers fail
+	// closed with UNIMPLEMENTED rather than ignoring the field.
+	CreateTableV2(context.Context, *CreateTableRequest) (*CreateTableResponse, error)
 	// Write writes an unconditional batch of mutations to a table.
 	Write(context.Context, *WriteRequest) (*WriteResponse, error)
 	// ConditionalWrite atomically evaluates optional per-mutation conditions
@@ -222,6 +241,9 @@ type UnimplementedShoalEmbedServer struct{}
 
 func (UnimplementedShoalEmbedServer) CreateTable(context.Context, *CreateTableRequest) (*CreateTableResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method CreateTable not implemented")
+}
+func (UnimplementedShoalEmbedServer) CreateTableV2(context.Context, *CreateTableRequest) (*CreateTableResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method CreateTableV2 not implemented")
 }
 func (UnimplementedShoalEmbedServer) Write(context.Context, *WriteRequest) (*WriteResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Write not implemented")
@@ -279,6 +301,24 @@ func _ShoalEmbed_CreateTable_Handler(srv interface{}, ctx context.Context, dec f
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(ShoalEmbedServer).CreateTable(ctx, req.(*CreateTableRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _ShoalEmbed_CreateTableV2_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CreateTableRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ShoalEmbedServer).CreateTableV2(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ShoalEmbed_CreateTableV2_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ShoalEmbedServer).CreateTableV2(ctx, req.(*CreateTableRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -405,6 +445,10 @@ var ShoalEmbed_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "CreateTable",
 			Handler:    _ShoalEmbed_CreateTable_Handler,
+		},
+		{
+			MethodName: "CreateTableV2",
+			Handler:    _ShoalEmbed_CreateTableV2_Handler,
 		},
 		{
 			MethodName: "Write",

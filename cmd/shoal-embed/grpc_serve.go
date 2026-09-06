@@ -208,6 +208,25 @@ func (s *embedServer) readPersistedTableStatus(table string) (persistedTableStat
 }
 
 func (s *embedServer) CreateTable(_ context.Context, req *embedpb.CreateTableRequest) (*embedpb.CreateTableResponse, error) {
+	if req.DefaultEmbedding != "" {
+		return nil, status.Error(
+			codes.FailedPrecondition,
+			"default_embedding requires CreateTableV2",
+		)
+	}
+	return s.createTable(req)
+}
+
+func (s *embedServer) CreateTableV2(
+	_ context.Context,
+	req *embedpb.CreateTableRequest,
+) (*embedpb.CreateTableResponse, error) {
+	return s.createTable(req)
+}
+
+func (s *embedServer) createTable(
+	req *embedpb.CreateTableRequest,
+) (*embedpb.CreateTableResponse, error) {
 	if req.Table == "" {
 		return nil, status.Error(codes.InvalidArgument, "table is required")
 	}

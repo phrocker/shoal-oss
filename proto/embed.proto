@@ -27,6 +27,11 @@ service ShoalEmbed {
   // CreateTable creates a new table with optional split points.
   rpc CreateTable(CreateTableRequest) returns (CreateTableResponse);
 
+  // CreateTableV2 enforces the safety-critical default_embedding field. New
+  // clients use this RPC for embedding-bearing tables so pre-V2 servers fail
+  // closed with UNIMPLEMENTED rather than ignoring the field.
+  rpc CreateTableV2(CreateTableRequest) returns (CreateTableResponse);
+
   // Write writes an unconditional batch of mutations to a table.
   rpc Write(WriteRequest) returns (WriteResponse);
 

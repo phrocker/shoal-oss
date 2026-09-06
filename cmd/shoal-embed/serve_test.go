@@ -380,6 +380,11 @@ func TestVectorScanRequiresVersionedRPC(t *testing.T) {
 	const identity = "test:model:v1:1:normalized"
 	if _, err := client.CreateTable(ctx, &embedpb.CreateTableRequest{
 		Table: "vectors", DefaultEmbedding: "has_embeddings:" + identity,
+	}); status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("legacy embedding CreateTable error = %v", err)
+	}
+	if _, err := client.CreateTableV2(ctx, &embedpb.CreateTableRequest{
+		Table: "vectors", DefaultEmbedding: "has_embeddings:" + identity,
 	}); err != nil {
 		t.Fatal(err)
 	}

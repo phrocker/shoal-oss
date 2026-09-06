@@ -205,7 +205,7 @@ func (s GRPCStore) CreateTableWithEmbedding(
 	splits []string,
 	defaultEmbedding string,
 ) error {
-	_, err := s.Client.CreateTable(ctx, &embedpb.CreateTableRequest{
+	_, err := s.Client.CreateTableV2(ctx, &embedpb.CreateTableRequest{
 		Table: table, Splits: splits, DefaultEmbedding: defaultEmbedding,
 	})
 	return err
