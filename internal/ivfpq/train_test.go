@@ -408,6 +408,9 @@ func TestTableHelpers(t *testing.T) {
 	if got := EmbeddingSpaceRow(2); got != "embedding_space_v2" {
 		t.Errorf("EmbeddingSpaceRow(2) = %q; want embedding_space_v2", got)
 	}
+	if got := VersionReservationRow(2); got != "version_reserved_v2" {
+		t.Errorf("VersionReservationRow(2) = %q; want version_reserved_v2", got)
+	}
 	if got := FormatClusterID(0); got != "00000000" {
 		t.Errorf("FormatClusterID(0) = %q; want 00000000", got)
 	}

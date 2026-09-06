@@ -161,7 +161,7 @@ func main() {
 	_ = store.CreateTable(ctx, ivfTable, nil)
 	_ = store.CreateTable(ctx, cfgTable, nil)
 	reservation, err := store.WriteWithResults(ctx, cfgTable, []*embedpb.Mutation{{
-		Row: []byte(ivfpq.PQRow(cbVersion)),
+		Row: []byte(ivfpq.VersionReservationRow(cbVersion)),
 		Entries: []*embedpb.Entry{{
 			ColumnFamily:    []byte(ivfpq.ConfigColFam),
 			ColumnQualifier: []byte(ivfpq.ConfigQual),
