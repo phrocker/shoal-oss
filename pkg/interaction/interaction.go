@@ -209,6 +209,7 @@ type AssertionEvidence struct {
 	Confidence      shoal.Score
 	GraphEdgeID     shoal.ID
 	DerivationID    shoal.ID
+	DerivationScore shoal.Score
 }
 
 // Validate checks the recorded assertion projection.
@@ -276,8 +277,13 @@ func (e AssertionEvidence) Validate() error {
 			"derived assertion evidence is incomplete",
 		)
 	}
+	if err := shoal.ValidateFiniteScore(
+		"assertion evidence confidence", e.Confidence,
+	); err != nil {
+		return err
+	}
 	return shoal.ValidateFiniteScore(
-		"assertion evidence confidence", e.Confidence)
+		"assertion evidence derivation score", e.DerivationScore)
 }
 
 // Operation identifies the product interaction represented by a session.
@@ -1511,7 +1517,9 @@ func cloneSourceEdge(edge graph.Edge) graph.Edge {
 
 func sourceEdgesEqual(left, right graph.Edge) bool {
 	if left.ID != right.ID || left.From != right.From || left.To != right.To ||
-		left.Type != right.Type || left.Weight != right.Weight ||
+		left.Type != right.Type ||
+		math.Float64bits(float64(left.Weight)) !=
+			math.Float64bits(float64(right.Weight)) ||
 		len(left.Properties) != len(right.Properties) {
 		return false
 	}

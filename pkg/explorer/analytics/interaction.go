@@ -203,6 +203,7 @@ func analyticsAssertionEvidence(
 		for _, item := range assertion.Evidence() {
 			if derivation, ok := item.Derivation(); ok {
 				evidence.DerivationID = derivation.ID()
+				evidence.DerivationScore = derivation.Score()
 				break
 			}
 		}

@@ -22,6 +22,7 @@ package authorized
 import (
 	"context"
 	"sort"
+	"strconv"
 	"time"
 
 	"github.com/phrocker/shoal-oss/pkg/explorer"
@@ -431,19 +432,19 @@ func (c *Client) authorizeInteractionEvidence(
 	operation auth.Operation,
 	now time.Time,
 ) ([]string, error) {
-	if operation == auth.OperationAnalyticsRead {
-		evidence, ok, err := analyticsInteractionEvidence(session)
-		if err != nil {
-			return nil, err
-		}
-		if !ok {
-			return nil, shoal.NewError(
-				shoal.ErrorInvalidArgument,
-				"analytics interaction requires complete graph evidence",
-			)
-		}
+	evidence, analytics, err := analyticsInteractionEvidence(session)
+	if err != nil {
+		return nil, err
+	}
+	if analytics {
 		return c.authorizeAnalyticsInteractionEvidence(
 			ctx, evidence, decision, operation, now)
+	}
+	if operation == auth.OperationAnalyticsRead {
+		return nil, shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			"analytics interaction requires complete graph evidence",
+		)
 	}
 	nodeIDs := session.TouchedNodeIDs()
 	registrations, err := c.resolveNodes(ctx, nodeIDs)
@@ -653,6 +654,7 @@ func (c *Client) authorizeAnalyticsInteractionEvidence(
 	}
 	admittedEdges := make(map[shoal.ID]struct{}, len(raw.Edges))
 	admittedAssertions := make(map[shoal.ID]struct{}, len(raw.Assertions))
+	assertionEndpoints := make(registeredNodes)
 	for _, edge := range raw.Edges {
 		if err := edge.Validate(); err != nil {
 			return nil, inconsistentBase()
@@ -673,6 +675,7 @@ func (c *Client) authorizeAnalyticsInteractionEvidence(
 					return nil, inconsistentBase()
 				}
 				visibleNodes[nodeID] = cloneGraphNode(node)
+				assertionEndpoints[nodeID] = registration
 			}
 			admittedEdges[edge.ID] = struct{}{}
 			admittedAssertions[assertion.ID] = struct{}{}
@@ -698,6 +701,9 @@ func (c *Client) authorizeAnalyticsInteractionEvidence(
 					return nil, err
 				}
 				visibilitySets = append(visibilitySets, labels)
+			}
+			for nodeID, registration := range endpoints {
+				assertionEndpoints[nodeID] = registration
 			}
 			visibleNodes[edge.From] = cloneGraphNode(rawNodes[edge.From])
 			visibleNodes[edge.To] = cloneGraphNode(rawNodes[edge.To])
@@ -743,7 +749,10 @@ func (c *Client) authorizeAnalyticsInteractionEvidence(
 		} {
 			registration, ok := resolved[nodeID]
 			if !ok {
-				return nil, auth.ObjectNotFound()
+				registration, ok = assertionEndpoints[nodeID]
+				if !ok {
+					return nil, auth.ObjectNotFound()
+				}
 			}
 			labels, err := accessRuleVisibility(registration.Rule)
 			if err != nil {
@@ -819,11 +828,19 @@ func interactionAssertionMatchesEdge(
 	assertion interaction.AssertionEvidence,
 	edge graph.Edge,
 ) bool {
+	expectedProperties := shoal.Metadata{
+		"ontology.assertion.origin":          assertion.Origin,
+		derivedAssertionPropertyAssertionID:  string(assertion.ID),
+		derivedAssertionPropertyDerivationID: string(assertion.DerivationID),
+		derivedAssertionPropertyDerivationScore: strconv.FormatFloat(
+			float64(assertion.DerivationScore), 'g', -1, 64),
+	}
 	return edge.ID == assertion.ID &&
 		edge.From == assertion.Subject &&
 		edge.To == assertion.ObjectReference &&
 		edge.Type == string(assertion.Predicate) &&
-		scoresEqual(edge.Weight, assertion.Confidence)
+		scoresEqual(edge.Weight, assertion.Confidence) &&
+		metadataEqual(edge.Properties, expectedProperties)
 }
 
 func interactionProducerEdgeMatches(
@@ -840,10 +857,23 @@ func interactionProducerEdgeMatches(
 		assertionNode.ID != assertion.ID {
 		return false
 	}
-	return edge.Properties[derivedAssertionPropertyAssertionID] ==
-		string(assertion.ID) &&
+	return edge.Weight == 1 && len(edge.Properties) == 2 &&
+		edge.Properties[derivedAssertionPropertyAssertionID] ==
+			string(assertion.ID) &&
 		edge.Properties[derivedAssertionPropertyDerivationID] ==
 			string(assertion.DerivationID)
+}
+
+func metadataEqual(left, right shoal.Metadata) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for key, value := range left {
+		if right[key] != value {
+			return false
+		}
+	}
+	return true
 }
 
 func interactionSourceEdges(session interaction.Session) []graph.Edge {
