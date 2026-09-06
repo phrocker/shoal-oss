@@ -232,12 +232,16 @@ func TestOntologyLensTraversesPublishedTransitionsWithoutMorphisms(t *testing.T)
 		t.Fatal(err)
 	}
 	first, err := NewOntologyTransition(
-		mustIdentity(t, f.v1), mustIdentity(t, f.v2))
+		f.v1, f.v2, []OntologyMorphism{mustMorphism(t, MorphismConfig{
+			Kind: MorphismWiden, SourceVersion: f.v1, TargetVersion: f.v2,
+			Sources: []shoal.ID{f.v1rel.ID()}, Targets: []shoal.ID{f.v2rel.ID()},
+			Evidence: []EvidenceRef{f.evidence}, Rationale: "widen endpoints",
+		})})
 	if err != nil {
 		t.Fatal(err)
 	}
 	second, err := NewOntologyTransition(
-		mustIdentity(t, f.v2), mustIdentity(t, v3))
+		f.v2, v3, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -313,17 +317,17 @@ func TestOntologyLensRejectsRemovedPropertyOwnership(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	transition, _ := NewOntologyTransition(
-		mustIdentity(t, source), mustIdentity(t, target))
-	lens, err := NewOntologyLensWithTransitions(
-		target, []OntologyTransition{transition}, nil)
+	if _, err := NewOntologyTransition(source, target, nil); err == nil {
+		t.Fatal("ownership-removing identity-only transition was accepted")
+	}
+	lens, err := NewOntologyLensWithTransitions(target, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	assertion := mustPropertyAssertion(
 		t, f.person.ID(), f.name.ID(), source, nil, f.evidence, f.provenance)
 	if read := lens.Read(assertion); read.Resolved() ||
-		!strings.Contains(read.Reason(), "does not apply") {
+		!strings.Contains(read.Reason(), "no unique published morphism path") {
 		t.Fatalf("removed property ownership read = %#v", read)
 	}
 }
@@ -337,6 +341,83 @@ func TestOntologyMorphismRejectsCrossKindMerge(t *testing.T) {
 		Evidence: []EvidenceRef{f.evidence}, Rationale: "invalid cross-kind merge",
 	}); err == nil || !strings.Contains(err.Error(), "same definition kind") {
 		t.Fatalf("cross-kind merge error = %v", err)
+	}
+}
+
+func TestProposalRequiresMorphismForRetainedRelationshipMeaningChange(t *testing.T) {
+	f := newMorphismFixture(t)
+	at := time.Date(2026, 9, 6, 2, 0, 0, 0, time.UTC)
+	if _, err := NewGovernedProposal(
+		f.v1.Schema(), f.v1, f.v2, "author",
+		"silent endpoint widening", at, nil,
+	); err != nil {
+		t.Fatalf("governance draft should remain reviewable: %v", err)
+	}
+	if _, err := NewOntologyTransition(f.v1, f.v2, nil); err == nil ||
+		!strings.Contains(err.Error(), "explicit morphism") {
+		t.Fatalf("silent relationship transition error = %v", err)
+	}
+	widen := mustMorphism(t, MorphismConfig{
+		Kind: MorphismWiden, SourceVersion: f.v1, TargetVersion: f.v2,
+		Sources: []shoal.ID{f.v1rel.ID()}, Targets: []shoal.ID{f.v2rel.ID()},
+		Evidence: []EvidenceRef{f.evidence}, Rationale: "widen endpoints",
+	})
+	if _, err := NewGovernedProposalWithMorphisms(
+		f.v1.Schema(), f.v1, f.v2, []OntologyMorphism{widen},
+		"author", "governed endpoint widening", at, nil,
+	); err != nil {
+		t.Fatalf("governed relationship change rejected: %v", err)
+	}
+	if _, err := NewOntologyTransition(
+		f.v1, f.v2, []OntologyMorphism{widen},
+	); err != nil {
+		t.Fatalf("governed relationship transition rejected: %v", err)
+	}
+}
+
+func TestProposalAllowsOnlyOptionalAdditiveConceptProperties(t *testing.T) {
+	f := newMorphismFixture(t)
+	nickname, _ := NewPropertyDefinition(
+		"nickname", "Nickname", "", ValueString, nil, nil)
+	person, _ := NewConceptDefinition(
+		"person", "Person", "", []shoal.ID{f.name.ID(), nickname.ID()}, nil)
+	target, err := NewOntologyVersion(
+		f.splitFrom.Schema(), "optional-addition",
+		f.splitFrom.CreatedAt().Add(time.Second),
+		[]ConceptDefinition{person}, nil,
+		[]PropertyDefinition{f.name, nickname}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sourcePerson, _ := NewConceptDefinition(
+		"person", "Person", "", []shoal.ID{f.name.ID()}, nil)
+	source, err := NewOntologyVersion(
+		f.splitFrom.Schema(), "optional-base",
+		f.splitFrom.CreatedAt(),
+		[]ConceptDefinition{sourcePerson}, nil,
+		[]PropertyDefinition{f.name}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewOntologyTransition(source, target, nil); err != nil {
+		t.Fatalf("optional additive property transition rejected: %v", err)
+	}
+	required, _ := NewFlagConstraint(ConstraintRequired)
+	requiredNickname, _ := NewPropertyDefinition(
+		"nickname", "Nickname", "", ValueString, []Constraint{required}, nil)
+	requiredPerson, _ := NewConceptDefinition(
+		"person", "Person", "",
+		[]shoal.ID{f.name.ID(), requiredNickname.ID()}, nil)
+	requiredTarget, err := NewOntologyVersion(
+		source.Schema(), "required-addition", target.CreatedAt().Add(time.Second),
+		[]ConceptDefinition{requiredPerson}, nil,
+		[]PropertyDefinition{f.name, requiredNickname}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewOntologyTransition(source, requiredTarget, nil); err == nil ||
+		!strings.Contains(err.Error(), "retained concept") {
+		t.Fatalf("required additive property error = %v", err)
 	}
 }
 

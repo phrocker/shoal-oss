@@ -49,7 +49,6 @@ type OntologyProposalProvider interface {
 
 type ontologyProposalStoreClient interface {
 	OntologyProposals(context.Context) ([]ontology.GovernedProposal, error)
-	OntologyProposalsForMutation(context.Context) ([]ontology.GovernedProposal, error)
 	CreateOntologyProposal(
 		context.Context, ontology.GovernedProposal, ontology.OntologyVersion,
 	) error
@@ -574,7 +573,7 @@ func (s *EmbeddedService) ontologyMutationSnapshot(
 		configured = *s.ontologyVersion
 	}
 	s.ontologyMu.RUnlock()
-	proposals, err := store.OntologyProposalsForMutation(ctx)
+	proposals, err := store.OntologyProposals(ctx)
 	if err != nil {
 		return ontology.OntologyVersion{}, false, nil, err
 	}

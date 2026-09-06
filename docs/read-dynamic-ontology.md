@@ -37,6 +37,9 @@ selection are intentionally tracked separately and are not claimed here.
   assertion.
 - Missing versions, missing paths, ambiguous paths, and unmatched split
   discriminators return explicit `unresolved` interpretations.
+- A published transition whose retained definitions changed without supported
+  morphisms is excluded from the interpretation path, preserving unresolved
+  history instead of silently adopting the changed meaning.
 - A decision without `SelectedOntology` preserves the previous no-lens result.
 
 ## Integration API
@@ -55,6 +58,9 @@ selection are intentionally tracked separately and are not claimed here.
   of `AuthorizationFingerprint` and `CacheKey`.
 - `explorer.OntologyInterpreter.InterpretAssertions` applies published
   morphisms after authorization filtering.
+- `authorized.Config.OntologyInterpreter` is the explicit trusted
+  interpretation dependency. The authorization wrapper never accepts
+  interpretations from its untrusted graph `Base`.
 - `webapi.NeighborhoodResponse.OntologyInterpretations` and
   `webapi.PathResponse.OntologyInterpretations` expose effective and original
   identities, safety-path IDs, and unresolved reasons.
@@ -68,6 +74,8 @@ selection are intentionally tracked separately and are not claimed here.
 - Published proposal transitions form the durable active-version chain.
   Publication rejects stale bases, and `ActiveOntology` replays the chain after
   restart, including a terminal chain of exactly 256 transitions.
+- An indeterminate proposal or transition write fail-closes subsequent ontology
+  mutations until the corpus is reopened and durable state is replayed.
 - A corpus admits at most 256 durable proposals across all schemas and lifecycle
   states. Admission is checked under the store's write lock before persistence,
   including concurrent requests through different service instances. Identical

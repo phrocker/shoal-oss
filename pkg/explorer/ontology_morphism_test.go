@@ -165,6 +165,7 @@ func TestPublishedTransitionWithoutMorphismsRemainsReadable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	defer corpus.Close()
 	schema, _ := ontology.NewOntologySchema("additive", "Additive", "", nil)
 	property, _ := ontology.NewPropertyDefinition(
@@ -201,6 +202,7 @@ func TestPublishedTransitionWithoutMorphismsRemainsReadable(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+
 	evidence, _ := ontology.NewEvidenceRef(document.Citation{
 		DocumentID: "doc", RevisionID: "rev", SectionID: "section", SpanID: "span",
 		Range: document.SourceRange{
@@ -226,5 +228,128 @@ func TestPublishedTransitionWithoutMorphismsRemainsReadable(t *testing.T) {
 	if err != nil || len(read) != 1 || !read[0].Resolved() ||
 		len(read[0].AppliedMorphisms()) != 0 {
 		t.Fatalf("additive transition read = %#v, err = %v", read, err)
+	}
+}
+
+func TestIndeterminateOntologyMutationBlocksFurtherWritesUntilReopen(t *testing.T) {
+	schema, _ := ontology.NewOntologySchema("indeterminate", "Indeterminate", "", nil)
+	at := time.Date(2026, 9, 6, 0, 0, 0, 0, time.UTC)
+	base, _ := ontology.NewOntologyVersion(schema, "1", at, nil, nil, nil, nil)
+	target, _ := ontology.NewOntologyVersion(
+		schema, "2", at.Add(time.Second), nil, nil, nil, nil)
+	proposal, _ := ontology.NewGovernedProposal(
+		schema, base, target, "author", "proposal", at.Add(2*time.Second), nil)
+
+	t.Run("create", func(t *testing.T) {
+		corpus, err := Open(filepath.Join(t.TempDir(), "corpus"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer corpus.Close()
+		corpus.mu.Lock()
+		corpus.ontologyMutationIndeterminate = true
+		corpus.mu.Unlock()
+		if err := corpus.CreateOntologyProposal(
+			context.Background(), proposal, base,
+		); !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
+			t.Fatalf("create after indeterminate mutation = %v", err)
+		}
+	})
+	t.Run("transition", func(t *testing.T) {
+		corpus, err := Open(filepath.Join(t.TempDir(), "corpus"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer corpus.Close()
+		if err := corpus.CreateOntologyProposal(
+			context.Background(), proposal, base,
+		); err != nil {
+			t.Fatal(err)
+		}
+		corpus.mu.Lock()
+		corpus.ontologyMutationIndeterminate = true
+		corpus.mu.Unlock()
+		if _, err := corpus.TransitionOntologyProposal(
+			context.Background(), proposal.ID(), ontology.ProposalSubmitted,
+			"governor", "submit", at.Add(3*time.Second),
+		); !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
+			t.Fatalf("transition after indeterminate mutation = %v", err)
+		}
+		stored, err := corpus.OntologyProposals(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(stored) != 1 || stored[0].State() != ontology.ProposalDraft {
+			t.Fatalf("blocked transition mutated proposal = %#v", stored)
+		}
+	})
+}
+
+func TestPublishedSemanticChangeWithoutMorphismRemainsUnresolved(t *testing.T) {
+	corpus, err := Open(filepath.Join(t.TempDir(), "corpus"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer corpus.Close()
+	schema, _ := ontology.NewOntologySchema("semantic", "Semantic", "", nil)
+	property, _ := ontology.NewPropertyDefinition(
+		"name", "Name", "", ontology.ValueString, nil, nil)
+	basePerson, _ := ontology.NewConceptDefinition(
+		"person", "Person", "", []shoal.ID{property.ID()}, nil)
+	targetPerson, _ := ontology.NewConceptDefinition(
+		"person", "Person", "", nil, nil)
+	at := time.Date(2026, 9, 6, 0, 0, 0, 0, time.UTC)
+	base, _ := ontology.NewOntologyVersion(
+		schema, "1", at, []ontology.ConceptDefinition{basePerson}, nil,
+		[]ontology.PropertyDefinition{property}, nil)
+	target, _ := ontology.NewOntologyVersion(
+		schema, "2", at.Add(time.Second),
+		[]ontology.ConceptDefinition{targetPerson}, nil,
+		[]ontology.PropertyDefinition{property}, nil)
+	proposal, err := ontology.NewGovernedProposal(
+		schema, base, target, "author", "remove ownership",
+		at.Add(2*time.Second), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	if err := corpus.CreateOntologyProposal(ctx, proposal, base); err != nil {
+		t.Fatal(err)
+	}
+	for index, state := range []ontology.ProposalState{
+		ontology.ProposalSubmitted, ontology.ProposalApproved, ontology.ProposalPublished,
+	} {
+		proposal, err = corpus.TransitionOntologyProposal(
+			ctx, proposal.ID(), state, "governor", "approved",
+			at.Add(time.Duration(index+3)*time.Second))
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	evidence, _ := ontology.NewEvidenceRef(document.Citation{
+		DocumentID: "doc", RevisionID: "rev", SectionID: "section", SpanID: "span",
+		Range: document.SourceRange{
+			Start: document.SourcePosition{Offset: 0, Page: 1},
+			End:   document.SourcePosition{Offset: 4, Page: 1},
+		},
+	}, "name", nil)
+	provenance, _ := ontology.NewExtractionProvenance(
+		"provider", "model", "1", "prompt", "1", "extractor", "1", nil)
+	value, _ := ontology.NewStringValue("Ada")
+	baseIdentity, _ := ontology.NewOntologyIdentity(base)
+	assertion, err := ontology.NewAssertion(
+		"person-1", property.ID(), value, ontology.AssertionExplicit, 1,
+		[]ontology.EvidenceRef{evidence}, provenance, nil,
+		ontology.WithAssertionSubjectType(basePerson.ID()),
+		ontology.WithAssertionOntology(baseIdentity))
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetIdentity, _ := ontology.NewOntologyIdentity(target)
+	read, err := corpus.InterpretAssertions(
+		ctx, []ontology.Assertion{assertion}, targetIdentity)
+	if err != nil || len(read) != 1 || read[0].Resolved() ||
+		read[0].Reason() != "no unique published morphism path" {
+		t.Fatalf("unsafe implicit transition read = %#v, err = %v", read, err)
 	}
 }

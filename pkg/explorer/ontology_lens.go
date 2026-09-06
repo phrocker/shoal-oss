@@ -69,22 +69,6 @@ func (e *Explorer) InterpretAssertions(
 				ambiguousPublication = true
 			}
 			publishedTransitions[key] = struct{}{}
-			source, identityErr := ontology.NewOntologyIdentityFromIDs(
-				proposal.Schema().ID(), baseID)
-			if identityErr != nil {
-				return nil, identityErr
-			}
-			targetIdentity, identityErr := ontology.NewOntologyIdentity(
-				proposal.ProposedVersion())
-			if identityErr != nil {
-				return nil, identityErr
-			}
-			transition, transitionErr := ontology.NewOntologyTransition(
-				source, targetIdentity)
-			if transitionErr != nil {
-				return nil, transitionErr
-			}
-			transitions = append(transitions, transition)
 		}
 		if identity, _ := ontology.NewOntologyIdentity(proposal.ProposedVersion()); identity == selected {
 			target = proposal.ProposedVersion()
@@ -96,6 +80,11 @@ func (e *Explorer) InterpretAssertions(
 			}
 			if identity, _ := ontology.NewOntologyIdentity(base); identity == selected {
 				target = base
+			}
+			transition, transitionErr := ontology.NewOntologyTransition(
+				base, proposal.ProposedVersion(), proposal.Morphisms())
+			if transitionErr == nil {
+				transitions = append(transitions, transition)
 			}
 		}
 		morphisms = append(morphisms, proposal.Morphisms()...)

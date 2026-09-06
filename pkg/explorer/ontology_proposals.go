@@ -39,7 +39,6 @@ const MaxOntologyProposals uint32 = 256
 // MaxOntologyProposals; identical retries do not consume another slot.
 type OntologyProposalStore interface {
 	OntologyProposals(context.Context) ([]ontology.GovernedProposal, error)
-	OntologyProposalsForMutation(context.Context) ([]ontology.GovernedProposal, error)
 	CreateOntologyProposal(
 		context.Context, ontology.GovernedProposal, ontology.OntologyVersion,
 	) error
@@ -51,15 +50,6 @@ type OntologyProposalStore interface {
 		string,
 		time.Time,
 	) (ontology.GovernedProposal, error)
-}
-
-// OntologyProposalsForMutation returns the same immutable snapshot as
-// OntologyProposals. Authorization wrappers expose it under mutation authority
-// so publication CAS does not require a separate read grant.
-func (e *Explorer) OntologyProposalsForMutation(
-	ctx context.Context,
-) ([]ontology.GovernedProposal, error) {
-	return e.OntologyProposals(ctx)
 }
 
 type persistedOntologyProposal struct {
@@ -224,6 +214,9 @@ func (e *Explorer) CreateOntologyProposal(
 	if err := e.requireWritableLocked(); err != nil {
 		return err
 	}
+	if err := e.requireCertainOntologyMutationLocked(); err != nil {
+		return err
+	}
 	if existing := e.ontologyProposals[proposal.ID()]; existing != nil {
 		if existing.sameBase(record) {
 			return nil
@@ -240,6 +233,9 @@ func (e *Explorer) CreateOntologyProposal(
 		embeddedRecordOntologyProposal,
 		record,
 	); err != nil {
+		if IsIndeterminateCommit(err) {
+			e.ontologyMutationIndeterminate = true
+		}
 		return err
 	}
 	copy := record
@@ -268,6 +264,9 @@ func (e *Explorer) TransitionOntologyProposal(
 		return ontology.GovernedProposal{}, err
 	}
 	if err := e.requireWritableLocked(); err != nil {
+		return ontology.GovernedProposal{}, err
+	}
+	if err := e.requireCertainOntologyMutationLocked(); err != nil {
 		return ontology.GovernedProposal{}, err
 	}
 	record := e.ontologyProposals[proposalID]
@@ -332,10 +331,23 @@ func (e *Explorer) TransitionOntologyProposal(
 		embeddedRecordProposalTransition,
 		persisted,
 	); err != nil {
+		if IsIndeterminateCommit(err) {
+			e.ontologyMutationIndeterminate = true
+		}
 		return ontology.GovernedProposal{}, err
 	}
 	record.transitions = nextTransitions
 	return updated, nil
+}
+
+func (e *Explorer) requireCertainOntologyMutationLocked() error {
+	if !e.ontologyMutationIndeterminate {
+		return nil
+	}
+	return shoal.NewError(
+		shoal.ErrorUnavailable,
+		"ontology mutation outcome is indeterminate; reopen the corpus before retrying",
+	)
 }
 
 // advanceProposalTransitionTime returns the earliest time that keeps a
