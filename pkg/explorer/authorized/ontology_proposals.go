@@ -103,7 +103,7 @@ func (c *Client) OntologyProposalMutationState(
 	configured ontology.OntologyVersion,
 	proposalID shoal.ID,
 ) (explorer.OntologyProposalMutationState, error) {
-	store, ok := c.base.(explorer.OntologyProposalMutationStateProvider)
+	store, ok := c.ontologyProposals.(explorer.OntologyProposalMutationStateProvider)
 	if !ok {
 		return explorer.OntologyProposalMutationState{}, shoal.NewError(
 			shoal.ErrorUnavailable,
@@ -201,7 +201,7 @@ func (c *Client) transitionOntologyProposal(
 	if err := guard.Check(ctx); err != nil {
 		return ontology.GovernedProposal{}, err
 	}
-	evidenceStore, ok := c.base.(explorer.OntologyProposalEvidenceProvider)
+	evidenceStore, ok := c.ontologyProposals.(explorer.OntologyProposalEvidenceProvider)
 	if !ok {
 		return ontology.GovernedProposal{}, shoal.NewError(
 			shoal.ErrorUnavailable,
@@ -253,12 +253,11 @@ func (c *Client) transitionOntologyProposal(
 }
 
 func (c *Client) ontologyProposalStore() (explorer.OntologyProposalStore, error) {
-	store, ok := c.base.(explorer.OntologyProposalStore)
-	if !ok {
+	if isNilDependency(c.ontologyProposals) {
 		return nil, shoal.NewError(
 			shoal.ErrorUnavailable, "workspace capability \"ontology proposals\" is unavailable")
 	}
-	return store, nil
+	return c.ontologyProposals, nil
 }
 
 func (c *Client) ontologyProposalEvidenceAllows(
@@ -335,7 +334,7 @@ func (c *Client) ontologyEvidenceAllows(
 			return false, nil
 		}
 	}
-	resolver, ok := c.base.(explorer.OntologyEvidenceCitationResolver)
+	resolver, ok := c.ontologyProposals.(explorer.OntologyEvidenceCitationResolver)
 	if !ok {
 		return false, shoal.NewError(
 			shoal.ErrorUnavailable,

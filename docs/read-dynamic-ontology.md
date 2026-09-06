@@ -61,6 +61,10 @@ selection are intentionally tracked separately and are not claimed here.
 - `authorized.Config.OntologyInterpreter` is the explicit trusted
   interpretation dependency. The authorization wrapper never accepts
   interpretations from its untrusted graph `Base`.
+- `authorized.Config.OntologyProposalStore` is the explicit trusted governance
+  dependency. Proposal state, evidence references, and canonical citation
+  bytes used by authorization are never accepted from the untrusted graph
+  `Base`.
 - `explorer.OntologyProposalMutationStateProvider` exposes only the active
   ontology and a requested proposal's base identity to ingest-authorized
   mutation preflight. Mutation callers do not receive the governed proposal

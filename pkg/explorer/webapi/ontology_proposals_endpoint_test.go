@@ -256,12 +256,13 @@ func TestOntologyProposalEndpointDistinguishesAuthorizationDenial(t *testing.T) 
 		t.Fatal(err)
 	}
 	client, err := authorized.NewClient(authorized.Config{
-		Base:             corpus,
-		Resolver:         authority.Resolver(),
-		PolicySelector:   selector,
-		PolicyStore:      authorized.NewMemoryPolicyStore(),
-		GenerationReader: authnGenerationReader{},
-		Clock:            time.Now,
+		Base:                  corpus,
+		OntologyProposalStore: corpus,
+		Resolver:              authority.Resolver(),
+		PolicySelector:        selector,
+		PolicyStore:           authorized.NewMemoryPolicyStore(),
+		GenerationReader:      authnGenerationReader{},
+		Clock:                 time.Now,
 	})
 	if err != nil {
 		t.Fatal(err)

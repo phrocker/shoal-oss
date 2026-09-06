@@ -80,7 +80,8 @@ func TestPublishedOntologyRemainsDurableWhenFinalGenerationGuardFails(t *testing
 		t.Fatal(err)
 	}
 	client, err := NewClient(Config{
-		Base: baseClient,
+		Base:                  baseClient,
+		OntologyProposalStore: baseClient,
 		Resolver: resolverFunc(func(context.Context) (auth.Decision, error) {
 			return decision, nil
 		}),
@@ -199,7 +200,10 @@ func TestOntologyProposalEvidenceRequiresObjectAuthorization(t *testing.T) {
 		t.Fatal(err)
 	}
 	client, err := NewClient(Config{
-		Base: base,
+		Base: &untrustedOntologyEvidenceBase{
+			ontologyEvidenceBase: base,
+		},
+		OntologyProposalStore: base,
 		Resolver: resolverFunc(func(context.Context) (auth.Decision, error) {
 			return decision, nil
 		}),
@@ -361,6 +365,24 @@ func (b *generationChangingProposalBase) TransitionOntologyProposal(
 type ontologyEvidenceBase struct {
 	*explorer.Explorer
 	views map[shoal.ID]explorer.DocumentView
+}
+
+type untrustedOntologyEvidenceBase struct {
+	*ontologyEvidenceBase
+}
+
+func (*untrustedOntologyEvidenceBase) OntologyProposalEvidence(
+	context.Context,
+	shoal.ID,
+) ([]ontology.EvidenceRef, bool, error) {
+	return nil, true, nil
+}
+
+func (*untrustedOntologyEvidenceBase) ResolveOntologyEvidenceCitation(
+	context.Context,
+	document.Citation,
+) (string, error) {
+	return "forged untrusted quote", nil
 }
 
 func (b *ontologyEvidenceBase) Documents(

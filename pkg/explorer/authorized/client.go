@@ -46,12 +46,16 @@ type Config struct {
 	// interpreter. It is separate from Base because Base graph responses are
 	// untrusted and must never be allowed to inject interpretations.
 	OntologyInterpreter explorer.OntologyInterpreter
-	Resolver            auth.Resolver
-	PolicySelector      PolicySelector
-	EdgePolicySelector  EdgePolicySelector
-	PolicyStore         PolicyStore
-	GenerationReader    auth.GenerationReader
-	Clock               func() time.Time
+	// OntologyProposalStore is the optional explicitly trusted governance
+	// store. It is separate from Base because proposal state, evidence, and
+	// citation bytes participate in authorization decisions.
+	OntologyProposalStore explorer.OntologyProposalStore
+	Resolver              auth.Resolver
+	PolicySelector        PolicySelector
+	EdgePolicySelector    EdgePolicySelector
+	PolicyStore           PolicyStore
+	GenerationReader      auth.GenerationReader
+	Clock                 func() time.Time
 	// Mosaic optionally enables the sensitivity-domain co-occurrence budget
 	// that defends against the mosaic effect. A zero MaxDomains disables it; a
 	// nonzero MaxDomains requires PolicyStore to implement CoOccurrenceLedger
@@ -65,6 +69,7 @@ type Client struct {
 	base                explorer.Client
 	vectorScorer        VectorScorer
 	ontologyInterpreter explorer.OntologyInterpreter
+	ontologyProposals   explorer.OntologyProposalStore
 	resolver            auth.Resolver
 	policySelector      PolicySelector
 	edgePolicySelector  EdgePolicySelector
@@ -129,6 +134,7 @@ func NewClient(config Config) (*Client, error) {
 		base:                config.Base,
 		vectorScorer:        config.VectorScorer,
 		ontologyInterpreter: config.OntologyInterpreter,
+		ontologyProposals:   config.OntologyProposalStore,
 		resolver:            config.Resolver,
 		policySelector:      config.PolicySelector,
 		edgePolicySelector:  edgeSelector,
