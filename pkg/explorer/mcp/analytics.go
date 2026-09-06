@@ -22,6 +22,7 @@ import (
 	"encoding/json"
 	"fmt"
 
+	"github.com/phrocker/shoal-oss/pkg/explorer"
 	exploreranalytics "github.com/phrocker/shoal-oss/pkg/explorer/analytics"
 	"github.com/phrocker/shoal-oss/pkg/explorer/webapi"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
@@ -90,8 +91,8 @@ func NewAnalyticsTool(
 				"type":"object",
 				"properties":{
 					"damping_factor":{"type":"number","minimum":0,"exclusiveMaximum":1},
-					"convergence_tolerance":{"type":"number","minimum":%g,"exclusiveMaximum":1},
-					"max_iterations":{"type":"integer","minimum":1,"maximum":%d}
+					"convergence_tolerance":{"type":"number","minimum":0,"exclusiveMaximum":1},
+					"max_iterations":{"type":"integer","minimum":0,"maximum":%d}
 				},
 				"additionalProperties":false
 			}
@@ -106,7 +107,6 @@ func NewAnalyticsTool(
 		limits.MaxEdges,
 		limits.MaxScannedEdgesPerNode,
 		limits.MaxEdgeTypes,
-		limits.MinPageRankTolerance,
 		limits.MaxPageRankIterations,
 	))
 	tool := Tool{
@@ -164,7 +164,7 @@ func (p *analyticsToolProvider) Call(
 	}
 	if err := webapi.ValidateAnalyticsResponse(
 		request, response, p.limits); err != nil {
-		return nil, err
+		return nil, explorer.MarkIndeterminateCommit(err)
 	}
 	return response, nil
 }

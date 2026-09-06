@@ -59,6 +59,12 @@ func TestAnalyticsOptionalToolAdvertisesAndInvokesOnlyWithLimits(t *testing.T) {
 			t.Fatalf("%s rejected valid value: %v", name, err)
 		}
 	}
+	for _, name := range []string{"convergence_tolerance", "max_iterations"} {
+		bound := schema.Properties["page_rank"].Properties[name]
+		if err := validateOptionalToolValue(json.Number("0"), bound); err != nil {
+			t.Fatalf("%s rejected explicit default value: %v", name, err)
+		}
+	}
 	now := time.Now()
 	authority := auth.NewAuthority()
 	decision, err := auth.NewDecision(auth.DecisionConfig{

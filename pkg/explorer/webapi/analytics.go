@@ -151,7 +151,7 @@ func analyticsEndpoint(service Service) http.HandlerFunc {
 			return
 		}
 		if err := ValidateAnalyticsResponse(input, response, limits); err != nil {
-			writeError(writer, err)
+			writeError(writer, explorer.MarkIndeterminateCommit(err))
 			return
 		}
 		writeResponse(writer, http.StatusOK, response)

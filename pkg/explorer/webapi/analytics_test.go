@@ -330,6 +330,12 @@ func TestRemoteAnalyticsDecodesLimitsAndInvokesUpstream(t *testing.T) {
 	if !analyticsCalled || !reflect.DeepEqual(got, expected) {
 		t.Fatalf("remote analytics = %#v, called=%t", got, analyticsCalled)
 	}
+	expected.Analytics.Recording.Recorded = false
+	if _, err := remote.Analytics(
+		context.Background(), request,
+	); !explorer.IsIndeterminateCommit(err) {
+		t.Fatalf("invalid remote analytics commit state = %v", err)
+	}
 }
 
 func TestRemoteMetadataRequiresValidRecordedAnalyticsLimits(t *testing.T) {
