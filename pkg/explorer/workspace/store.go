@@ -114,10 +114,10 @@ func OpenDurableStore(dir string) (*DurableStore, error) {
 	if strings.TrimSpace(dir) == "" {
 		return nil, invalid("settings directory is required")
 	}
-	lock, err := dirlock.Acquire(dir, ".shoal-workspace-settings.lock")
+	lock, err := dirlock.Acquire(dir, ".shoal-workspace.lock")
 	if err != nil {
 		message := "acquire workspace settings directory ownership"
-		if errors.Is(err, dirlock.ErrHeld) {
+		if errors.Is(err, dirlock.ErrLocked) {
 			message = "workspace settings directory is already open"
 		}
 		return nil, shoal.WrapError(
