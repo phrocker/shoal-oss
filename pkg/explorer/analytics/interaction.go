@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"github.com/phrocker/shoal-oss/pkg/explorer"
+	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/graph"
 	"github.com/phrocker/shoal-oss/pkg/interaction"
 	"github.com/phrocker/shoal-oss/pkg/ontology"
@@ -155,6 +156,7 @@ func (r *InteractionRecorder) RecordAnalytics(
 		AuthorizationFingerprint: shoal.ID(
 			record.Materialization.AuthorizationFingerprint.String()),
 		AuthorizationExpiresAt: record.Materialization.AuthorizationExpiresAt,
+		AuthorizationOperation: string(auth.OperationAnalyticsRead),
 		RequestID:              record.Materialization.RequestID,
 		QueryDigest:            analyticsRequestDigest(record.Request),
 		ResultID:               resultID,
@@ -174,10 +176,6 @@ func (r *InteractionRecorder) RecordAnalytics(
 			ModelVersion: "1", ToolPolicy: "analytics_read",
 		},
 	}
-	if selected := record.Result.Scope.Ontology; selected != nil {
-		session.OntologySchemaID = selected.SchemaID
-		session.OntologyVersionID = selected.VersionID
-	}
 	persisted, err := r.recorder.Record(ctx, session)
 	if err != nil {
 		return RecordingReceipt{}, err
@@ -187,9 +185,8 @@ func (r *InteractionRecorder) RecordAnalytics(
 		!persisted.SnapshotAsOf.UTC().Equal(session.SnapshotAsOf.UTC()) ||
 		persisted.AuthorizationFingerprint != session.AuthorizationFingerprint ||
 		!persisted.AuthorizationExpiresAt.Equal(session.AuthorizationExpiresAt) ||
+		persisted.AuthorizationOperation != session.AuthorizationOperation ||
 		persisted.RequestID != session.RequestID ||
-		persisted.OntologySchemaID != session.OntologySchemaID ||
-		persisted.OntologyVersionID != session.OntologyVersionID ||
 		persisted.Actor.SubjectID == "" || persisted.Actor.ActorID == "" ||
 		!equalIDs(persisted.TouchedNodeIDs(), nodeIDs) ||
 		!equalIDs(persisted.TouchedEdgeIDs(), edgeIDs(edges)) ||

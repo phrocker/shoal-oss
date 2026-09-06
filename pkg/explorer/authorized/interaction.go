@@ -48,6 +48,69 @@ func (c *Client) EnsureInteractionSink(ctx context.Context) error {
 	return guard.Check(ctx)
 }
 
+type operationInteractionSink struct {
+	client    *Client
+	operation auth.Operation
+}
+
+// AnalyticsInteractionSink returns the durable interaction sink bound to the
+// analytics authorization operation.
+func (c *Client) AnalyticsInteractionSink() interaction.ResultSink {
+	if c == nil {
+		return nil
+	}
+	if _, err := c.interactionWriter(); err != nil {
+		return nil
+	}
+	if isNilDependency(c.snapshotValidator) {
+		return nil
+	}
+	return operationInteractionSink{
+		client: c, operation: auth.OperationAnalyticsRead,
+	}
+}
+
+func (s operationInteractionSink) EnsureInteractionSink(
+	ctx context.Context,
+) error {
+	if s.client == nil {
+		return shoal.NewError(
+			shoal.ErrorUnavailable, "authorized interaction sink is unavailable")
+	}
+	writer, err := s.client.interactionWriter()
+	if err != nil {
+		return err
+	}
+	_, guard, _, err := s.client.begin(ctx, s.operation)
+	if err != nil {
+		return err
+	}
+	if err := writer.EnsureInteractionSink(ctx); err != nil {
+		return directBaseError(err)
+	}
+	return guard.Check(ctx)
+}
+
+func (s operationInteractionSink) RecordInteraction(
+	ctx context.Context,
+	session interaction.Session,
+) error {
+	_, err := s.RecordInteractionResult(ctx, session)
+	return err
+}
+
+func (s operationInteractionSink) RecordInteractionResult(
+	ctx context.Context,
+	session interaction.Session,
+) (interaction.Session, error) {
+	if s.client == nil {
+		return interaction.Session{}, shoal.NewError(
+			shoal.ErrorUnavailable, "authorized interaction sink is unavailable")
+	}
+	session.AuthorizationOperation = string(s.operation)
+	return s.client.recordInteraction(ctx, session)
+}
+
 // RecordInteraction appends one redacted interaction after verifying that its
 // pinned authorization is the exact current decision and that every source
 // node it retrieved or cited is still authorized. A revoked or missing source
@@ -228,7 +291,7 @@ func (c *Client) recordInteraction(
 		persisted = returned
 	}
 	if err := guard.Check(ctx); err != nil {
-		if operation == auth.OperationAnalyticsRead {
+		if authorizationOperation == auth.OperationAnalyticsRead {
 			return persisted, explorer.MarkIndeterminateCommit(err)
 		}
 		return persisted, explorer.MarkCommittedInteraction(err)
@@ -236,7 +299,7 @@ func (c *Client) recordInteraction(
 	deliveredAt := c.clock().UTC()
 	if deliveredAt.IsZero() ||
 		!interactionPinMatchesDecision(persisted, decision, deliveredAt) {
-		if operation == auth.OperationAnalyticsRead {
+		if authorizationOperation == auth.OperationAnalyticsRead {
 			return persisted, explorer.MarkIndeterminateCommit(
 				authorizationDenied())
 		}
