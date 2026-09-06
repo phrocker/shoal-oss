@@ -219,7 +219,7 @@ func (c *Client) Interactions(
 }
 
 // InteractionRecords returns authorized interaction summaries and provenance
-// in one base read and one batched policy lookup.
+// in one base read and bounded batched policy lookups.
 func (c *Client) InteractionRecords(
 	ctx context.Context,
 ) ([]explorer.InteractionRecord, error) {
@@ -235,52 +235,13 @@ func (c *Client) InteractionRecords(
 	if err != nil {
 		return nil, directBaseError(err)
 	}
-	allNodeIDs := make([]shoal.ID, 0)
-	allEdgeIDs := make([]shoal.ID, 0)
-	for _, record := range records {
-		if !record.Summary.Deleted {
-			allNodeIDs = append(allNodeIDs, record.TouchedNodeIDs...)
-			allEdgeIDs = append(allEdgeIDs, record.TouchedEdgeIDs...)
-		}
-	}
-	edges, err := c.resolveEdges(ctx, allEdgeIDs)
-	if err != nil {
-		return nil, err
-	}
-	for _, registration := range edges {
-		allNodeIDs = append(
-			allNodeIDs,
-			registration.Edge.From,
-			registration.Edge.To,
-		)
-	}
-	registrations, err := c.resolveNodes(ctx, allNodeIDs)
+	allowed, err := c.authorizeInteractionRecords(ctx, records, decision, now)
 	if err != nil {
 		return nil, err
 	}
 	visible := make([]explorer.InteractionRecord, 0, len(records))
-	for _, record := range records {
-		if record.Summary.Deleted {
-			if summaryFingerprintMatchesDecision(record.Summary, decision) {
-				visible = append(visible, record)
-			}
-			continue
-		}
-		if len(record.TouchedNodeIDs) == 0 {
-			if summaryFingerprintMatchesDecision(record.Summary, decision) {
-				visible = append(visible, record)
-			}
-			continue
-		}
-		allowed, err := interactionEvidenceAllows(
-			registrations, edges,
-			record.TouchedNodeIDs, record.TouchedEdgeIDs,
-			decision, auth.OperationRead, now,
-		)
-		if err != nil {
-			return nil, err
-		}
-		if allowed {
+	for index, record := range records {
+		if allowed[index] {
 			visible = append(visible, record)
 		}
 	}
@@ -288,6 +249,128 @@ func (c *Client) InteractionRecords(
 		return nil, err
 	}
 	return visible, nil
+}
+
+// maxInteractionAuthorizationIDs bounds how many provenance identifiers one
+// policy-store lookup may carry while authorizing a list of interaction
+// records. Interaction provenance is intentionally uncapped per record, so
+// without this bound a single list call would submit the union of the whole
+// durable corpus in one request. Records are grouped into batches under this
+// bound instead, and one record whose own provenance exceeds it is authorized
+// in bounded chunks of its own.
+const maxInteractionAuthorizationIDs = 1024
+
+// authorizeInteractionRecords decides visibility for every record in list
+// order without ever holding more than one bounded batch of registrations.
+func (c *Client) authorizeInteractionRecords(
+	ctx context.Context,
+	records []explorer.InteractionRecord,
+	decision auth.Decision,
+	now time.Time,
+) ([]bool, error) {
+	allowed := make([]bool, len(records))
+	batch := make([]int, 0, len(records))
+	batchIDs := 0
+	flush := func() error {
+		if len(batch) == 0 {
+			return nil
+		}
+		if err := c.authorizeInteractionBatch(
+			ctx, records, batch, allowed, decision, now,
+		); err != nil {
+			return err
+		}
+		batch = batch[:0]
+		batchIDs = 0
+		return nil
+	}
+	for index, record := range records {
+		if record.Summary.Deleted || len(record.TouchedNodeIDs) == 0 {
+			// Tombstones discarded their source edges, and a zero-hit record
+			// never had any, so both are visible only to the exact
+			// authorization projection that created them.
+			allowed[index] = summaryFingerprintMatchesDecision(
+				record.Summary, decision)
+			continue
+		}
+		count := len(record.TouchedNodeIDs) + len(record.TouchedEdgeIDs)
+		if batchIDs > 0 && batchIDs+count > maxInteractionAuthorizationIDs {
+			if err := flush(); err != nil {
+				return nil, err
+			}
+		}
+		batch = append(batch, index)
+		batchIDs += count
+		if batchIDs >= maxInteractionAuthorizationIDs {
+			if err := flush(); err != nil {
+				return nil, err
+			}
+		}
+	}
+	if err := flush(); err != nil {
+		return nil, err
+	}
+	return allowed, nil
+}
+
+// authorizeInteractionBatch resolves one bounded batch of records in a single
+// edge and node lookup pair. A record whose own provenance is larger than the
+// batch bound is the only member of its batch and is resolved in chunks.
+func (c *Client) authorizeInteractionBatch(
+	ctx context.Context,
+	records []explorer.InteractionRecord,
+	batch []int,
+	allowed []bool,
+	decision auth.Decision,
+	now time.Time,
+) error {
+	batchNodeIDs := make([]shoal.ID, 0, maxInteractionAuthorizationIDs)
+	batchEdgeIDs := make([]shoal.ID, 0, maxInteractionAuthorizationIDs)
+	for _, index := range batch {
+		batchNodeIDs = append(batchNodeIDs, records[index].TouchedNodeIDs...)
+		batchEdgeIDs = append(batchEdgeIDs, records[index].TouchedEdgeIDs...)
+	}
+	if len(batchNodeIDs)+len(batchEdgeIDs) > maxInteractionAuthorizationIDs {
+		for _, index := range batch {
+			decided, err := c.interactionEvidenceAllowsBounded(
+				ctx,
+				records[index].TouchedNodeIDs,
+				records[index].TouchedEdgeIDs,
+				decision,
+				auth.OperationRead,
+				now,
+			)
+			if err != nil {
+				return err
+			}
+			allowed[index] = decided
+		}
+		return nil
+	}
+	edges, err := c.resolveEdges(ctx, batchEdgeIDs)
+	if err != nil {
+		return err
+	}
+	for _, registration := range edges {
+		batchNodeIDs = append(
+			batchNodeIDs, registration.Edge.From, registration.Edge.To)
+	}
+	registrations, err := c.resolveNodes(ctx, batchNodeIDs)
+	if err != nil {
+		return err
+	}
+	for _, index := range batch {
+		decided, err := interactionEvidenceAllows(
+			registrations, edges,
+			records[index].TouchedNodeIDs, records[index].TouchedEdgeIDs,
+			decision, auth.OperationRead, now,
+		)
+		if err != nil {
+			return err
+		}
+		allowed[index] = decided
+	}
+	return nil
 }
 
 // InteractionRecord returns one authorized point record without scanning the
@@ -432,23 +515,8 @@ func (c *Client) authorizeInteractionEvidence(
 	operation auth.Operation,
 	now time.Time,
 ) error {
-	edges, err := c.resolveEdges(ctx, edgeIDs)
-	if err != nil {
-		return err
-	}
-	for _, registration := range edges {
-		nodeIDs = append(
-			nodeIDs,
-			registration.Edge.From,
-			registration.Edge.To,
-		)
-	}
-	registrations, err := c.resolveNodes(ctx, nodeIDs)
-	if err != nil {
-		return err
-	}
-	allowed, err := interactionEvidenceAllows(
-		registrations, edges, nodeIDs, edgeIDs, decision, operation, now)
+	allowed, err := c.interactionEvidenceAllowsBounded(
+		ctx, nodeIDs, edgeIDs, decision, operation, now)
 	if err != nil {
 		return err
 	}
@@ -456,6 +524,67 @@ func (c *Client) authorizeInteractionEvidence(
 		return auth.ObjectNotFound()
 	}
 	return nil
+}
+
+// interactionEvidenceAllowsBounded authorizes one record's uncapped provenance
+// without ever submitting more than maxInteractionAuthorizationIDs identifiers
+// in a single policy-store lookup. Authorization is a conjunction, so chunking
+// preserves the fail-closed result exactly.
+func (c *Client) interactionEvidenceAllowsBounded(
+	ctx context.Context,
+	nodeIDs []shoal.ID,
+	edgeIDs []shoal.ID,
+	decision auth.Decision,
+	operation auth.Operation,
+	now time.Time,
+) (bool, error) {
+	for start := 0; start < len(edgeIDs); {
+		end := chunkEnd(start, len(edgeIDs))
+		chunk := edgeIDs[start:end]
+		start = end
+		edges, err := c.resolveEdges(ctx, chunk)
+		if err != nil {
+			return false, err
+		}
+		endpoints := make([]shoal.ID, 0, 2*len(edges))
+		for _, registration := range edges {
+			endpoints = append(
+				endpoints, registration.Edge.From, registration.Edge.To)
+		}
+		registrations, err := c.resolveNodes(ctx, endpoints)
+		if err != nil {
+			return false, err
+		}
+		allowed, err := interactionEvidenceAllows(
+			registrations, edges, endpoints, chunk, decision, operation, now)
+		if err != nil || !allowed {
+			return false, err
+		}
+	}
+	for start := 0; start < len(nodeIDs); {
+		end := chunkEnd(start, len(nodeIDs))
+		chunk := nodeIDs[start:end]
+		start = end
+		registrations, err := c.resolveNodes(ctx, chunk)
+		if err != nil {
+			return false, err
+		}
+		allowed, err := interactionEvidenceAllows(
+			registrations, nil, chunk, nil, decision, operation, now)
+		if err != nil || !allowed {
+			return false, err
+		}
+	}
+	return true, nil
+}
+
+// chunkEnd is the exclusive end of the bounded chunk that starts at start.
+func chunkEnd(start, length int) int {
+	end := start + maxInteractionAuthorizationIDs
+	if end > length {
+		return length
+	}
+	return end
 }
 
 func interactionEvidenceAllows(

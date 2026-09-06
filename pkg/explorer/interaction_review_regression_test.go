@@ -43,7 +43,7 @@ func reviewSession(t *testing.T, corpus *Explorer) (interaction.Session, shoal.I
 		t.Fatal(err)
 	}
 	return interaction.Session{
-		ID: "review-session", Operation: interaction.OperationRetrieval,
+		ID: "interaction.session_review", Operation: interaction.OperationRetrieval,
 		RecordedAt:  time.Unix(1700000000, 0).UTC(),
 		SeedNodeIDs: []shoal.ID{document.Root.Spans[0].ID},
 	}, receipt.Document.ID

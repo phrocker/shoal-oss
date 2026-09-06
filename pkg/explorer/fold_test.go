@@ -75,10 +75,10 @@ func TestFoldVisibilityIsConjunctionOfEverythingFolded(t *testing.T) {
 	// The restricted session is shown the restricted span but cites only the
 	// open one, so its own visibility already covers what it was shown.
 	recordedSession(
-		t, corpus, "session-restricted",
+		t, corpus, "interaction.session_restricted",
 		[]shoal.ID{restricted[0], open[0]}, []shoal.ID{open[0]})
 	recordedSession(
-		t, corpus, "session-open",
+		t, corpus, "interaction.session_open",
 		[]shoal.ID{open[0]}, []shoal.ID{open[0]})
 
 	sessions, err := corpus.Interactions(ctx)
@@ -90,13 +90,13 @@ func TestFoldVisibilityIsConjunctionOfEverythingFolded(t *testing.T) {
 		byID[summary.SessionID] = summary
 	}
 
-	result := foldOf(t, corpus, "session-restricted", "session-open")
+	result := foldOf(t, corpus, "interaction.session_restricted", "interaction.session_open")
 	if result.Visibility != "incident&ops&secret" {
 		t.Fatalf("fold visibility = %q, want %q",
 			result.Visibility, "incident&ops&secret")
 	}
 	// The fold is never readable by anyone who could not read a part.
-	for _, sessionID := range []shoal.ID{"session-restricted", "session-open"} {
+	for _, sessionID := range []shoal.ID{"interaction.session_restricted", "interaction.session_open"} {
 		for _, label := range strings.Split(byID[sessionID].Visibility, "&") {
 			if label == "" {
 				continue
@@ -118,9 +118,9 @@ func TestFoldIsExcludedFromDefaultRetrieval(t *testing.T) {
 	defer corpus.Close()
 
 	recordedSession(
-		t, corpus, "session-one",
+		t, corpus, "interaction.session_one",
 		[]shoal.ID{restricted[0], open[0]}, []shoal.ID{open[0]})
-	fold := foldOf(t, corpus, "session-one")
+	fold := foldOf(t, corpus, "interaction.session_one")
 
 	result, err := corpus.Retrieve(ctx, retrieval.Request{
 		Text:  "retry budget exhausted",
@@ -180,12 +180,12 @@ func TestFoldCannotBeCitedAsSourceEvidence(t *testing.T) {
 	defer corpus.Close()
 
 	recordedSession(
-		t, corpus, "session-one",
+		t, corpus, "interaction.session_one",
 		[]shoal.ID{restricted[0], open[0]}, []shoal.ID{open[0]})
-	fold := foldOf(t, corpus, "session-one")
+	fold := foldOf(t, corpus, "interaction.session_one")
 
 	later := interaction.Session{
-		ID:           "session-citing-a-fold",
+		ID:           "interaction.session_citing-a-fold",
 		RecordedAt:   time.Unix(1700000100, 0).UTC(),
 		SeedNodeIDs:  []shoal.ID{open[0]},
 		CitedNodeIDs: []shoal.ID{fold.FoldID},
@@ -199,7 +199,7 @@ func TestFoldCannotBeCitedAsSourceEvidence(t *testing.T) {
 	}
 
 	shown := interaction.Session{
-		ID:          "session-shown-a-fold",
+		ID:          "interaction.session_shown-a-fold",
 		RecordedAt:  time.Unix(1700000200, 0).UTC(),
 		SeedNodeIDs: []shoal.ID{fold.FoldID},
 	}
@@ -225,13 +225,13 @@ func TestRehydrateFoldPreservesRetrievedAndCitedDistinction(t *testing.T) {
 
 	// The session is shown the restricted span but cites only the open one.
 	recordedSession(
-		t, corpus, "session-wide",
+		t, corpus, "interaction.session_wide",
 		[]shoal.ID{restricted[0], open[0]}, []shoal.ID{open[0]})
 	recordedSession(
-		t, corpus, "session-narrow",
+		t, corpus, "interaction.session_narrow",
 		[]shoal.ID{open[0]}, []shoal.ID{open[0]})
 
-	fold := foldOf(t, corpus, "session-wide", "session-narrow")
+	fold := foldOf(t, corpus, "interaction.session_wide", "interaction.session_narrow")
 	rehydrated, err := corpus.RehydrateFold(ctx, fold.FoldID)
 	if err != nil {
 		t.Fatal(err)
@@ -244,7 +244,7 @@ func TestRehydrateFoldPreservesRetrievedAndCitedDistinction(t *testing.T) {
 		byID[member.SessionID] = member
 	}
 
-	wide, ok := byID["session-wide"]
+	wide, ok := byID["interaction.session_wide"]
 	if !ok {
 		t.Fatal("rehydration lost session-wide")
 	}
@@ -257,7 +257,7 @@ func TestRehydrateFoldPreservesRetrievedAndCitedDistinction(t *testing.T) {
 	if !containsNodeID(wide.CitedNodeIDs, open[0]) {
 		t.Fatal("rehydration lost a cited node")
 	}
-	narrow := byID["session-narrow"]
+	narrow := byID["interaction.session_narrow"]
 	if containsNodeID(narrow.RetrievedNodeIDs, restricted[0]) {
 		t.Fatal("rehydration leaked another session's retrieved node")
 	}
@@ -286,16 +286,16 @@ func TestFoldIsContentAddressedAndIdempotent(t *testing.T) {
 	defer corpus.Close()
 
 	recordedSession(
-		t, corpus, "session-a", []shoal.ID{restricted[0]}, []shoal.ID{restricted[0]})
+		t, corpus, "interaction.session_a", []shoal.ID{restricted[0]}, []shoal.ID{restricted[0]})
 	recordedSession(
-		t, corpus, "session-b", []shoal.ID{open[0]}, []shoal.ID{open[0]})
+		t, corpus, "interaction.session_b", []shoal.ID{open[0]}, []shoal.ID{open[0]})
 
-	first := foldOf(t, corpus, "session-a", "session-b")
+	first := foldOf(t, corpus, "interaction.session_a", "interaction.session_b")
 	if !first.Created {
 		t.Fatal("the first fold was not created")
 	}
 	// Reversed order, same input.
-	second := foldOf(t, corpus, "session-b", "session-a")
+	second := foldOf(t, corpus, "interaction.session_b", "interaction.session_a")
 	if second.FoldID != first.FoldID {
 		t.Fatalf("fold is not content addressed: %q != %q",
 			second.FoldID, first.FoldID)
@@ -303,7 +303,7 @@ func TestFoldIsContentAddressedAndIdempotent(t *testing.T) {
 	if second.Created {
 		t.Fatal("refolding the same input created a second vertex")
 	}
-	third := foldOf(t, corpus, "session-a")
+	third := foldOf(t, corpus, "interaction.session_a")
 	if third.FoldID == first.FoldID {
 		t.Fatal("a different member set produced the same fold")
 	}
@@ -324,9 +324,9 @@ func TestFoldSurvivesReopen(t *testing.T) {
 	dir := t.TempDir()
 	corpus, restricted, open := foldedCorpus(t, dir)
 	recordedSession(
-		t, corpus, "session-one",
+		t, corpus, "interaction.session_one",
 		[]shoal.ID{restricted[0], open[0]}, []shoal.ID{open[0]})
-	fold := foldOf(t, corpus, "session-one")
+	fold := foldOf(t, corpus, "interaction.session_one")
 	if err := corpus.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -352,7 +352,7 @@ func TestFoldSurvivesReopen(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(rehydrated.Members) != 1 ||
-		rehydrated.Members[0].SessionID != "session-one" {
+		rehydrated.Members[0].SessionID != "interaction.session_one" {
 		t.Fatalf("reopened fold lost its members: %+v", rehydrated.Members)
 	}
 }
@@ -366,11 +366,11 @@ func TestFoldRetentionIsExplicitAndTombstoned(t *testing.T) {
 	defer corpus.Close()
 
 	recordedSession(
-		t, corpus, "session-one",
+		t, corpus, "interaction.session_one",
 		[]shoal.ID{restricted[0], open[0]}, []shoal.ID{open[0]})
-	fold := foldOf(t, corpus, "session-one")
+	fold := foldOf(t, corpus, "interaction.session_one")
 
-	if _, err := corpus.DeleteInteraction(ctx, "session-one"); !shoal.IsErrorCode(
+	if _, err := corpus.DeleteInteraction(ctx, "interaction.session_one"); !shoal.IsErrorCode(
 		err, shoal.ErrorConflict,
 	) {
 		t.Fatalf("expected deleting a folded session to be refused, got %v", err)
@@ -401,7 +401,7 @@ func TestFoldRetentionIsExplicitAndTombstoned(t *testing.T) {
 		t.Fatalf("deleted fold did not leave a tombstone: %+v", subgraph.Nodes)
 	}
 	// With the fold gone the session may be deleted.
-	if _, err := corpus.DeleteInteraction(ctx, "session-one"); err != nil {
+	if _, err := corpus.DeleteInteraction(ctx, "interaction.session_one"); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -414,18 +414,18 @@ func TestFoldRefusesDeletedSession(t *testing.T) {
 	defer corpus.Close()
 
 	recordedSession(
-		t, corpus, "session-one",
+		t, corpus, "interaction.session_one",
 		[]shoal.ID{restricted[0], open[0]}, []shoal.ID{open[0]})
-	if _, err := corpus.DeleteInteraction(ctx, "session-one"); err != nil {
+	if _, err := corpus.DeleteInteraction(ctx, "interaction.session_one"); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := corpus.FoldInteractions(ctx, explorer.FoldRequest{
-		SessionIDs: []shoal.ID{"session-one"},
+		SessionIDs: []shoal.ID{"interaction.session_one"},
 	}); !shoal.IsErrorCode(err, shoal.ErrorConflict) {
 		t.Fatalf("expected folding a deleted session to be refused, got %v", err)
 	}
 	if _, err := corpus.FoldInteractions(ctx, explorer.FoldRequest{
-		SessionIDs: []shoal.ID{"session-missing"},
+		SessionIDs: []shoal.ID{"interaction.session_missing"},
 	}); !shoal.IsErrorCode(err, shoal.ErrorNotFound) {
 		t.Fatalf("expected folding an unknown session to be refused, got %v", err)
 	}
@@ -439,10 +439,10 @@ func TestFoldRefusesNonDigestSummary(t *testing.T) {
 	defer corpus.Close()
 
 	recordedSession(
-		t, corpus, "session-one",
+		t, corpus, "interaction.session_one",
 		[]shoal.ID{restricted[0], open[0]}, []shoal.ID{open[0]})
 	if _, err := corpus.FoldInteractions(ctx, explorer.FoldRequest{
-		SessionIDs:    []shoal.ID{"session-one"},
+		SessionIDs:    []shoal.ID{"interaction.session_one"},
 		SummaryDigest: "the retry budget was exhausted during the outage",
 	}); !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
 		t.Fatalf("expected free-text summary to be refused, got %v", err)
@@ -461,14 +461,14 @@ func TestSessionIDCannotCollideWithFoldID(t *testing.T) {
 	defer corpus.Close()
 
 	recordedSession(
-		t, corpus, "session-a", []shoal.ID{open[0]}, []shoal.ID{open[0]})
+		t, corpus, "interaction.session_a", []shoal.ID{open[0]}, []shoal.ID{open[0]})
 	recordedSession(
-		t, corpus, "session-b",
+		t, corpus, "interaction.session_b",
 		[]shoal.ID{restricted[0], open[0]}, []shoal.ID{open[0]})
-	fold := foldOf(t, corpus, "session-a", "session-b")
+	fold := foldOf(t, corpus, "interaction.session_a", "interaction.session_b")
 
 	template := recordedSession(
-		t, corpus, "session-c", []shoal.ID{open[0]}, []shoal.ID{open[0]})
+		t, corpus, "interaction.session_c", []shoal.ID{open[0]}, []shoal.ID{open[0]})
 	colliding := template
 	colliding.ID = fold.FoldID
 
@@ -492,12 +492,12 @@ func TestInteractionsTouchingWalksAcrossSessions(t *testing.T) {
 	defer corpus.Close()
 
 	recordedSession(
-		t, corpus, "session-cites",
+		t, corpus, "interaction.session_cites",
 		[]shoal.ID{restricted[0], open[0]}, []shoal.ID{open[0]})
 	recordedSession(
-		t, corpus, "session-shows",
+		t, corpus, "interaction.session_shows",
 		[]shoal.ID{restricted[0]}, []shoal.ID{})
-	fold := foldOf(t, corpus, "session-cites")
+	fold := foldOf(t, corpus, "interaction.session_cites")
 
 	touches, err := corpus.InteractionsTouching(ctx, restricted[0])
 	if err != nil {
@@ -510,8 +510,8 @@ func TestInteractionsTouchingWalksAcrossSessions(t *testing.T) {
 	if len(found) != 3 {
 		t.Fatalf("walked %d interactions, want 3: %+v", len(found), touches)
 	}
-	if !found["session-cites"].Retrieved || found["session-cites"].Cited {
-		t.Fatalf("session-cites touch = %+v", found["session-cites"])
+	if !found["interaction.session_cites"].Retrieved || found["interaction.session_cites"].Cited {
+		t.Fatalf("interaction.session_cites touch = %+v", found["interaction.session_cites"])
 	}
 	if found[fold.FoldID].Kind != interaction.KindFold {
 		t.Fatalf("fold touch = %+v", found[fold.FoldID])
@@ -522,22 +522,22 @@ func TestInteractionsTouchingWalksAcrossSessions(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, touch := range openTouches {
-		if touch.InteractionID == "session-cites" && !touch.Cited {
+		if touch.InteractionID == "interaction.session_cites" && !touch.Cited {
 			t.Fatal("a cited node was not reported as cited")
 		}
-		if touch.InteractionID == "session-shows" {
+		if touch.InteractionID == "interaction.session_shows" {
 			t.Fatal("a session that never saw the node was reported")
 		}
 	}
 
 	// Cross-session overlap.
-	overlaps, err := corpus.RelatedInteractions(ctx, "session-shows")
+	overlaps, err := corpus.RelatedInteractions(ctx, "interaction.session_shows")
 	if err != nil {
 		t.Fatal(err)
 	}
 	var sawCites bool
 	for _, overlap := range overlaps {
-		if overlap.InteractionID != "session-cites" {
+		if overlap.InteractionID != "interaction.session_cites" {
 			continue
 		}
 		sawCites = true
@@ -561,16 +561,16 @@ func TestInteractionsTouchingRefusesInteractionNode(t *testing.T) {
 	defer corpus.Close()
 
 	recordedSession(
-		t, corpus, "session-one",
+		t, corpus, "interaction.session_one",
 		[]shoal.ID{restricted[0], open[0]}, []shoal.ID{open[0]})
-	fold := foldOf(t, corpus, "session-one")
+	fold := foldOf(t, corpus, "interaction.session_one")
 
 	if _, err := corpus.InteractionsTouching(ctx, fold.FoldID); !shoal.IsErrorCode(
 		err, shoal.ErrorInvalidArgument,
 	) {
 		t.Fatalf("expected walking from a fold node to be refused, got %v", err)
 	}
-	if _, err := corpus.RelatedInteractions(ctx, "session-missing"); !shoal.IsErrorCode(
+	if _, err := corpus.RelatedInteractions(ctx, "interaction.session_missing"); !shoal.IsErrorCode(
 		err, shoal.ErrorNotFound,
 	) {
 		t.Fatalf("expected an unknown interaction to be refused, got %v", err)
@@ -586,10 +586,10 @@ func TestFoldIsSafeUnderConcurrentReads(t *testing.T) {
 	defer corpus.Close()
 
 	recordedSession(
-		t, corpus, "session-one",
+		t, corpus, "interaction.session_one",
 		[]shoal.ID{restricted[0], open[0]}, []shoal.ID{open[0]})
 	recordedSession(
-		t, corpus, "session-two",
+		t, corpus, "interaction.session_two",
 		[]shoal.ID{open[0]}, []shoal.ID{open[0]})
 
 	var group sync.WaitGroup
@@ -599,7 +599,7 @@ func TestFoldIsSafeUnderConcurrentReads(t *testing.T) {
 			defer group.Done()
 			if _, err := corpus.FoldInteractions(
 				ctx, explorer.FoldRequest{
-					SessionIDs: []shoal.ID{"session-one", "session-two"},
+					SessionIDs: []shoal.ID{"interaction.session_one", "interaction.session_two"},
 				}); err != nil {
 				t.Error(err)
 			}
@@ -610,7 +610,7 @@ func TestFoldIsSafeUnderConcurrentReads(t *testing.T) {
 			if _, err := corpus.InteractionsTouching(ctx, open[0]); err != nil {
 				t.Error(err)
 			}
-			if _, err := corpus.RelatedInteractions(ctx, "session-one"); err != nil {
+			if _, err := corpus.RelatedInteractions(ctx, "interaction.session_one"); err != nil {
 				t.Error(err)
 			}
 			if _, err := corpus.Folds(ctx); err != nil {

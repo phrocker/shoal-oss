@@ -145,7 +145,7 @@ func TestInteractionVisibilityIsConjunctionOfTouchedSpans(t *testing.T) {
 	// The session is shown the restricted span but only cites the open one.
 	// Visibility must still account for what the model was shown.
 	recordedSession(
-		t, corpus, "session-conjunction",
+		t, corpus, "interaction.session_conjunction",
 		[]shoal.ID{restricted[0], open[0]},
 		[]shoal.ID{open[0]},
 	)
@@ -162,7 +162,7 @@ func TestInteractionVisibilityIsConjunctionOfTouchedSpans(t *testing.T) {
 			summaries[0].Visibility, "incident&ops&secret")
 	}
 
-	sub, err := corpus.InteractionSubgraph(ctx, "session-conjunction")
+	sub, err := corpus.InteractionSubgraph(ctx, "interaction.session_conjunction")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -229,7 +229,7 @@ func TestInteractionHydratesAllProvenanceWithoutMovingSnapshot(t *testing.T) {
 		t.Fatal(err)
 	}
 	session := recordedSession(
-		t, corpus, "session-durable", spans, []shoal.ID{spans[len(spans)-1]})
+		t, corpus, "interaction.session_durable", spans, []shoal.ID{spans[len(spans)-1]})
 	after, err := corpus.Snapshot(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -585,7 +585,7 @@ func TestGeneratedInteractionNodeIDsCannotCollide(t *testing.T) {
 	const futureSessionID shoal.ID = "future-session"
 	collidingID := interaction.InferenceID(futureSessionID)
 	session := recordedSession(
-		t, corpus, "template-session", spans[:1], spans[:1])
+		t, corpus, "interaction.session_template", spans[:1], spans[:1])
 	session.ID = collidingID
 	if err := corpus.RecordInteraction(
 		ctx, session,
@@ -593,20 +593,26 @@ func TestGeneratedInteractionNodeIDsCannotCollide(t *testing.T) {
 		t.Fatalf("reserved inference-node ID accepted as a session: %v", err)
 	}
 
-	recordedSession(
-		t, corpus, "delete-target", spans[:1], spans[:1])
-	tombstoneCollisionID := interaction.TombstoneID("delete-target")
+	const deleteTargetID shoal.ID = "interaction.session_delete_target"
+	recordedSession(t, corpus, deleteTargetID, spans[:1], spans[:1])
+	tombstoneCollisionID := interaction.TombstoneID(deleteTargetID)
 	session.ID = tombstoneCollisionID
 	if err := corpus.RecordInteraction(
 		ctx, session,
 	); !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
 		t.Fatalf("reserved tombstone-node ID accepted as a session: %v", err)
 	}
-	if _, err := corpus.DeleteInteraction(ctx, "delete-target"); err != nil {
+	if _, err := corpus.DeleteInteraction(ctx, deleteTargetID); err != nil {
 		t.Fatalf("reserved ID prevented deletion: %v", err)
 	}
 }
 
+// TestFutureSourceCannotCollideWithRecordedSessionID pins the cross-writer
+// safety property: session identities are confined to the reserved
+// interaction.session_ namespace, which every source publication path rejects,
+// so no session can squat an identity a later source ingestion will mint --
+// even when the two writes happen in different processes that never observed
+// each other.
 func TestFutureSourceCannotCollideWithRecordedSessionID(t *testing.T) {
 	ctx := context.Background()
 	futureSource := explorer.Source{
@@ -640,16 +646,11 @@ func TestFutureSourceCannotCollideWithRecordedSessionID(t *testing.T) {
 		ID:         futureNodeID,
 		RecordedAt: time.Unix(1700000000, 0).UTC(),
 		Operation:  interaction.OperationRetrieval,
-	}); err != nil {
-		t.Fatal(err)
+	}); !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
+		t.Fatalf("source node ID accepted as a session ID: %v", err)
 	}
-	if _, err := corpus.Ingest(
-		ctx, futureSource,
-	); !shoal.IsErrorCode(err, shoal.ErrorConflict) {
-		t.Fatalf("future source collision error = %v", err)
-	}
-	if _, err := corpus.Interaction(ctx, futureNodeID); err != nil {
-		t.Fatalf("collision attempt damaged interaction: %v", err)
+	if _, err := corpus.Ingest(ctx, futureSource); err != nil {
+		t.Fatalf("rejected session damaged later ingestion: %v", err)
 	}
 }
 
@@ -719,9 +720,9 @@ func TestOversizedVisibilityPersistsAcrossRestart(t *testing.T) {
 		t.Fatal("fixture did not exceed the graph metadata value bound")
 	}
 	recordedSession(
-		t, corpus, "session-oversized-visibility", spans, spans[len(spans)-1:])
+		t, corpus, "interaction.session_oversized-visibility", spans, spans[len(spans)-1:])
 	subgraph, err := corpus.InteractionSubgraph(
-		ctx, "session-oversized-visibility")
+		ctx, "interaction.session_oversized-visibility")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -773,7 +774,7 @@ func TestInteractionVisibilityIgnoresAskerGrants(t *testing.T) {
 	spans := ingestVisible(
 		t, corpus, "file:///runbook.md", publicMarkdown, "ops")
 
-	recordedSession(t, corpus, "session-open", spans[:1], spans[:1])
+	recordedSession(t, corpus, "interaction.session_open", spans[:1], spans[:1])
 	summaries, err := corpus.Interactions(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -795,7 +796,7 @@ func TestInteractionVisibilityFailsClosedOnUnknownNode(t *testing.T) {
 	ingestVisible(t, corpus, "file:///runbook.md", publicMarkdown, "ops")
 
 	err = corpus.RecordInteraction(context.Background(), interaction.Session{
-		ID:          "session-unknown",
+		ID:          "interaction.session_unknown",
 		RecordedAt:  time.Unix(1700000000, 0).UTC(),
 		SeedNodeIDs: []shoal.ID{"no-such-node"},
 	})
@@ -818,7 +819,7 @@ func TestInteractionNodesExcludedFromRetrieval(t *testing.T) {
 	}
 	defer corpus.Close()
 	spans := ingestVisible(t, corpus, "file:///runbook.md", publicMarkdown, "")
-	recordedSession(t, corpus, "session-retrieval", spans[:1], spans[:1])
+	recordedSession(t, corpus, "interaction.session_retrieval", spans[:1], spans[:1])
 
 	response, err := corpus.Retrieve(ctx, retrieval.Request{
 		Text:  "exponential backoff",
@@ -853,7 +854,7 @@ func TestInteractionNodesExcludedFromExpansion(t *testing.T) {
 	}
 	defer corpus.Close()
 	spans := ingestVisible(t, corpus, "file:///runbook.md", publicMarkdown, "")
-	recordedSession(t, corpus, "session-expansion", spans[:1], spans[:1])
+	recordedSession(t, corpus, "interaction.session_expansion", spans[:1], spans[:1])
 
 	neighborhood, err := corpus.Neighborhood(ctx, explorer.NeighborhoodRequest{
 		NodeIDs: []shoal.ID{spans[0]},
@@ -879,7 +880,7 @@ func TestInteractionNodesExcludedFromExpansion(t *testing.T) {
 		bounded.Neighborhood.Nodes, bounded.Neighborhood.Edges)
 
 	// The subgraph is still reachable by explicit, kind-scoped traversal.
-	explicit, err := corpus.InteractionSubgraph(ctx, "session-expansion")
+	explicit, err := corpus.InteractionSubgraph(ctx, "interaction.session_expansion")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -916,9 +917,9 @@ func TestInteractionDeletionLeavesTombstone(t *testing.T) {
 	}
 	spans := ingestVisible(
 		t, corpus, "file:///incident.md", restrictedMarkdown, "secret")
-	recordedSession(t, corpus, "session-deleted", spans[:1], spans[:1])
+	recordedSession(t, corpus, "interaction.session_deleted", spans[:1], spans[:1])
 
-	tombstone, err := corpus.DeleteInteraction(ctx, "session-deleted")
+	tombstone, err := corpus.DeleteInteraction(ctx, "interaction.session_deleted")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -931,7 +932,7 @@ func TestInteractionDeletionLeavesTombstone(t *testing.T) {
 
 	assertTombstoneOnly := func(label string, c *explorer.Explorer) {
 		t.Helper()
-		sub, err := c.InteractionSubgraph(ctx, "session-deleted")
+		sub, err := c.InteractionSubgraph(ctx, "interaction.session_deleted")
 		if err != nil {
 			t.Fatalf("%s: %v", label, err)
 		}
@@ -950,11 +951,11 @@ func TestInteractionDeletionLeavesTombstone(t *testing.T) {
 	assertTombstoneOnly("live", corpus)
 
 	// Deleting twice is refused, and the ID cannot be reused.
-	if _, err := corpus.DeleteInteraction(ctx, "session-deleted"); err == nil {
+	if _, err := corpus.DeleteInteraction(ctx, "interaction.session_deleted"); err == nil {
 		t.Fatal("second deletion succeeded")
 	}
 	err = corpus.RecordInteraction(ctx, interaction.Session{
-		ID:          "session-deleted",
+		ID:          "interaction.session_deleted",
 		RecordedAt:  time.Unix(1700000001, 0).UTC(),
 		SeedNodeIDs: spans[:1],
 	})
@@ -1010,7 +1011,7 @@ func TestReadOnlyCorpusRejectsInteractionSink(t *testing.T) {
 	}
 
 	err = readOnly.RecordInteraction(ctx, interaction.Session{
-		ID:          "session-read-only",
+		ID:          "interaction.session_read-only",
 		RecordedAt:  time.Unix(1700000000, 0).UTC(),
 		SeedNodeIDs: spans[:1],
 	})
@@ -1018,7 +1019,7 @@ func TestReadOnlyCorpusRejectsInteractionSink(t *testing.T) {
 		t.Fatalf("read-only record = %v", err)
 	}
 	if _, err := readOnly.DeleteInteraction(
-		ctx, "session-read-only",
+		ctx, "interaction.session_read-only",
 	); !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
 		t.Fatalf("read-only delete = %v", err)
 	}
@@ -1041,7 +1042,7 @@ func TestIngestRejectsReservedInteractionKinds(t *testing.T) {
 	}
 	defer corpus.Close()
 	spans := ingestVisible(t, corpus, "file:///runbook.md", publicMarkdown, "")
-	recordedSession(t, corpus, "session-connect", spans[:1], spans[:1])
+	recordedSession(t, corpus, "interaction.session_connect", spans[:1], spans[:1])
 
 	err = corpus.Connect(ctx, graph.Edge{
 		ID:   "edge-reserved",
@@ -1055,7 +1056,7 @@ func TestIngestRejectsReservedInteractionKinds(t *testing.T) {
 	err = corpus.Connect(ctx, graph.Edge{
 		ID:   "edge-into-interaction",
 		From: spans[0],
-		To:   "session-connect",
+		To:   "interaction.session_connect",
 		Type: "mentions",
 	})
 	if !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {

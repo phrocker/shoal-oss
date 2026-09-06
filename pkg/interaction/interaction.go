@@ -548,10 +548,17 @@ func (s Session) Validate() error {
 	if err := shoal.ValidateRequiredID("interaction session ID", s.ID); err != nil {
 		return err
 	}
-	if IsInteractionID(s.ID) && !IsSessionID(s.ID) {
+	// Session identities must live in the session-owned part of the reserved
+	// interaction namespace, which every source publication path rejects. That
+	// disjointness is what makes the graph-ID reservation safe across writers:
+	// two processes with independent local state can never durably commit a
+	// source node and a session (or a session and another kind of derived
+	// interaction node) under one graph identity.
+	if !IsSessionID(s.ID) {
 		return shoal.NewError(
 			shoal.ErrorInvalidArgument,
-			"interaction session ID uses a reserved derived-node namespace",
+			"interaction session ID must be minted by SessionID or "+
+				"OperationSessionID in the reserved session namespace",
 		)
 	}
 	if s.RecordedAt.IsZero() {

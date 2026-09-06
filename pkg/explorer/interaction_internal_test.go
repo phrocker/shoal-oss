@@ -51,7 +51,7 @@ func TestInteractionWriteResolvesCommittedIndeterminateOutcome(t *testing.T) {
 	}
 	spanID := view.Root.Spans[0].ID
 	session := interaction.Session{
-		ID:                       "session-indeterminate-committed",
+		ID:                       "interaction.session_indeterminate-committed",
 		RecordedAt:               time.Unix(1700000000, 0).UTC(),
 		SnapshotID:               "snapshot",
 		SnapshotAsOf:             time.Unix(1699999990, 0).UTC(),
@@ -97,7 +97,7 @@ func TestInteractionWritePreservesUnresolvedIndeterminateOutcome(t *testing.T) {
 		t.Fatal(err)
 	}
 	session := interaction.Session{
-		ID:                       "session-indeterminate-absent",
+		ID:                       "interaction.session_indeterminate-absent",
 		RecordedAt:               time.Unix(1700000000, 0).UTC(),
 		SnapshotID:               "snapshot",
 		SnapshotAsOf:             time.Unix(1699999990, 0).UTC(),

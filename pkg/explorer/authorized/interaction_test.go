@@ -22,6 +22,7 @@ package authorized_test
 import (
 	"context"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -162,7 +163,7 @@ func TestAuthorizedInteractionRecorderAndViews(t *testing.T) {
 		t.Fatal(err)
 	}
 	session := interaction.Session{
-		ID:                       "session-authorized",
+		ID:                       "interaction.session_authorized",
 		RecordedAt:               f.clock.Now(),
 		SnapshotID:               shoal.ID(snapshot.ID),
 		SnapshotAsOf:             snapshot.AsOf,
@@ -382,7 +383,7 @@ func TestAuthorizedInteractionEnrichesTrustedActorDelegationAndReason(t *testing
 		t.Fatal(err)
 	}
 	session := interaction.Session{
-		ID:         "session-actor-context",
+		ID:         "interaction.session_actor-context",
 		RecordedAt: f.clock.Now(),
 		Operation:  interaction.OperationRetrieval,
 		Actor: interaction.ActorContext{
@@ -489,7 +490,7 @@ func TestAuthorizedInteractionRecorderRejectsWrongPin(t *testing.T) {
 		t.Fatal(err)
 	}
 	session := interaction.Session{
-		ID:                       "session-wrong-pin",
+		ID:                       "interaction.session_wrong-pin",
 		RecordedAt:               f.clock.Now(),
 		SnapshotID:               shoal.ID(snapshot.ID),
 		SnapshotAsOf:             snapshot.AsOf,
@@ -511,7 +512,7 @@ func TestAuthorizedInteractionRecorderRejectsWrongPin(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	session.ID = "session-wrong-snapshot"
+	session.ID = "interaction.session_wrong-snapshot"
 	session.AuthorizationFingerprint = shoal.ID(fingerprint.String())
 	session.SnapshotID = "forged-snapshot"
 	if err := f.clientA.RecordInteraction(
@@ -519,7 +520,7 @@ func TestAuthorizedInteractionRecorderRejectsWrongPin(t *testing.T) {
 	); !shoal.IsErrorCode(err, shoal.ErrorConflict) {
 		t.Fatalf("forged snapshot record = %v", err)
 	}
-	session.ID = "session-expired-pin"
+	session.ID = "interaction.session_expired-pin"
 	session.SnapshotID = shoal.ID(snapshot.ID)
 	session.SnapshotAsOf = snapshot.AsOf
 	session.RecordedAt = snapshot.AsOf
@@ -683,7 +684,7 @@ func TestAuthorizedTombstoneSubgraphDoesNotLeakExistence(t *testing.T) {
 		t.Fatal(err)
 	}
 	session := interaction.Session{
-		ID:                       "session-deleted-authorized",
+		ID:                       "interaction.session_deleted-authorized",
 		RecordedAt:               f.clock.Now(),
 		SnapshotID:               shoal.ID(snapshot.ID),
 		SnapshotAsOf:             snapshot.AsOf,
@@ -800,7 +801,7 @@ func TestAuthorizedInteractionMarksPostCommitGenerationFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	session := interaction.Session{
-		ID:                       "session-post-commit-generation",
+		ID:                       "interaction.session_post-commit-generation",
 		RecordedAt:               f.clock.Now(),
 		SnapshotID:               shoal.ID(snapshot.ID),
 		SnapshotAsOf:             snapshot.AsOf,
@@ -842,7 +843,7 @@ func TestAuthorizedInteractionRejectsForgedSinkResult(t *testing.T) {
 		t.Fatal(err)
 	}
 	session := interaction.Session{
-		ID:                       "session-forged-result",
+		ID:                       "interaction.session_forged-result",
 		RecordedAt:               f.clock.Now(),
 		Operation:                interaction.OperationRetrieval,
 		SnapshotID:               shoal.ID(snapshot.ID),
@@ -901,7 +902,7 @@ func TestAuthorizedInteractionReadsUseBulkAndPointPaths(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, id := range []shoal.ID{"session-bulk-a", "session-bulk-b"} {
+	for _, id := range []shoal.ID{"interaction.session_bulk-a", "interaction.session_bulk-b"} {
 		if err := f.clientA.RecordInteraction(ctx, interaction.Session{
 			ID:                       id,
 			RecordedAt:               f.clock.Now(),
@@ -930,7 +931,7 @@ func TestAuthorizedInteractionReadsUseBulkAndPointPaths(t *testing.T) {
 		)
 	}
 	if _, err := client.InteractionSubgraph(
-		ctx, "session-bulk-a",
+		ctx, "interaction.session_bulk-a",
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -964,7 +965,7 @@ func TestSourceLessInteractionRequiresOriginalAuthorizationProjection(t *testing
 		t.Fatal(err)
 	}
 	session := interaction.Session{
-		ID:                       "session-source-less",
+		ID:                       "interaction.session_source-less",
 		RecordedAt:               f.clock.Now(),
 		Operation:                interaction.OperationRetrieval,
 		SnapshotID:               shoal.ID(snapshot.ID),
@@ -1044,5 +1045,99 @@ func TestInteractionReadsRequireExplicitTrustedReader(t *testing.T) {
 		f.context(t, decision),
 	); !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
 		t.Fatalf("implicit base interaction writer error = %v", err)
+	}
+}
+
+type syntheticInteractionBase struct {
+	*explorer.Explorer
+	records []explorer.InteractionRecord
+}
+
+func (b *syntheticInteractionBase) InteractionRecords(
+	context.Context,
+) ([]explorer.InteractionRecord, error) {
+	return b.records, nil
+}
+
+type batchBoundedStore struct {
+	authorized.PolicyStore
+	nodeCalls    int
+	largestBatch int
+}
+
+func (s *batchBoundedStore) Nodes(
+	ctx context.Context, ids []shoal.ID,
+) (map[shoal.ID]authorized.NodeRegistration, error) {
+	s.nodeCalls++
+	if len(ids) > s.largestBatch {
+		s.largestBatch = len(ids)
+	}
+	return s.PolicyStore.Nodes(ctx, ids)
+}
+
+// TestAuthorizedInteractionListAuthorizesBoundedBatches pins the read-path
+// bound: interaction provenance is intentionally uncapped per record, so a
+// list must never submit the union of the whole durable history in one
+// policy-store lookup. Authorization is a conjunction, so batching cannot
+// change the fail-closed outcome.
+func TestAuthorizedInteractionListAuthorizesBoundedBatches(t *testing.T) {
+	f := newFixture(t)
+	const (
+		records       = 8
+		nodesPerBatch = 500
+		bound         = 1024
+	)
+	synthetic := make([]explorer.InteractionRecord, 0, records)
+	for record := 0; record < records; record++ {
+		nodeIDs := make([]shoal.ID, 0, nodesPerBatch)
+		for node := 0; node < nodesPerBatch; node++ {
+			nodeIDs = append(nodeIDs, shoal.ID(
+				"unregistered-"+strconv.Itoa(record)+"-"+strconv.Itoa(node)))
+		}
+		synthetic = append(synthetic, explorer.InteractionRecord{
+			Summary: explorer.InteractionSummary{
+				SessionID: shoal.ID(
+					"interaction.session_bounded-" + strconv.Itoa(record)),
+			},
+			TouchedNodeIDs: nodeIDs,
+		})
+	}
+	// One record whose own provenance exceeds the bound proves a single
+	// uncapped record is chunked rather than submitted whole.
+	oversized := make([]shoal.ID, 0, 2*bound)
+	for node := 0; node < 2*bound; node++ {
+		oversized = append(
+			oversized, shoal.ID("unregistered-large-"+strconv.Itoa(node)))
+	}
+	synthetic = append(synthetic, explorer.InteractionRecord{
+		Summary: explorer.InteractionSummary{
+			SessionID: "interaction.session_bounded-large",
+		},
+		TouchedNodeIDs: oversized,
+	})
+	base := &syntheticInteractionBase{Explorer: f.base, records: synthetic}
+	store := &batchBoundedStore{PolicyStore: f.store}
+	client := f.newClient(t, base, store, f.sourceA, f.policyA, nil)
+	decision := f.decision(
+		t,
+		"bounded-reader",
+		[][]byte{f.sourceA},
+		[][]byte{f.policyA},
+		[]auth.Operation{auth.OperationRead},
+	)
+	visible, err := client.InteractionRecords(f.context(t, decision))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(visible) != 0 {
+		t.Fatalf("unregistered provenance was authorized: %d", len(visible))
+	}
+	if store.largestBatch > bound {
+		t.Fatalf("policy lookup batch = %d, want at most %d",
+			store.largestBatch, bound)
+	}
+	if store.nodeCalls < records*nodesPerBatch/bound {
+		t.Fatalf("node lookups = %d, want the list split into batches",
+			store.nodeCalls)
 	}
 }

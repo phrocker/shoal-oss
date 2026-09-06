@@ -386,7 +386,7 @@ func TestKindAndEdgeNamespaceDetection(t *testing.T) {
 
 func TestTombstoneNodeCarriesAuditFields(t *testing.T) {
 	tombstone := interaction.Tombstone{
-		SessionID:  "session-4",
+		SessionID:  "interaction.session_4",
 		DeletedAt:  time.Unix(1700000123, 0).UTC(),
 		NodeCount:  3,
 		EdgeCount:  4,
@@ -399,10 +399,10 @@ func TestTombstoneNodeCarriesAuditFields(t *testing.T) {
 	if node.Kind != interaction.KindTombstone {
 		t.Fatalf("kind = %q", node.Kind)
 	}
-	if node.ID != interaction.TombstoneID("session-4") {
+	if node.ID != interaction.TombstoneID("interaction.session_4") {
 		t.Fatalf("id = %q", node.ID)
 	}
-	if node.Properties[interaction.PropertySessionID] != "session-4" ||
+	if node.Properties[interaction.PropertySessionID] != "interaction.session_4" ||
 		node.Properties[interaction.PropertyNodeCount] != "3" ||
 		node.Properties[interaction.PropertyEdgeCount] != "4" ||
 		node.Properties[interaction.PropertyVisibility] != "ops&secret" ||
