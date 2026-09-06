@@ -41,6 +41,7 @@ import (
 	"time"
 
 	"github.com/phrocker/shoal-oss/internal/cclient"
+	"github.com/phrocker/shoal-oss/internal/embeddingspace"
 	"github.com/phrocker/shoal-oss/internal/embedpb"
 	"github.com/phrocker/shoal-oss/internal/engine"
 	"github.com/phrocker/shoal-oss/internal/iterrt"
@@ -59,6 +60,12 @@ var (
 	ErrMultiplePushdowns = errors.New("at most one of term_filter, vector_search, edge_expand and score_filter may be set")
 	// ErrVectorQueryRequired is returned when vector_search is set without a query.
 	ErrVectorQueryRequired = errors.New("vector_search.query is required")
+	// ErrVectorEmbeddingSpaceRequired is returned when a raw query vector has
+	// no stable embedding-space identity.
+	ErrVectorEmbeddingSpaceRequired = fmt.Errorf(
+		"vector_search.embedding_space is required: %w",
+		embeddingspace.ErrQueryIdentityRequired,
+	)
 	// ErrNegativeMaxHops is returned when edge_expand.max_hops is negative.
 	ErrNegativeMaxHops = errors.New("edge_expand.max_hops must be non-negative")
 	// ErrInvalidCondition is returned when a mutation condition has no predicate.
@@ -99,13 +106,31 @@ func (s *EngineStore) nextTimestamp() int64 {
 }
 
 // CreateTable creates table, optionally split on the given row prefixes.
-func (s *EngineStore) CreateTable(_ context.Context, table string, splits []string) error {
+func (s *EngineStore) CreateTable(ctx context.Context, table string, splits []string) error {
+	return s.CreateTableWithEmbedding(ctx, table, splits, "")
+}
+
+// CreateTableWithEmbedding creates a table whose future immutable files carry
+// defaultEmbedding's explicit state.
+func (s *EngineStore) CreateTableWithEmbedding(
+	_ context.Context,
+	table string,
+	splits []string,
+	defaultEmbedding string,
+) error {
 	if table == "" {
 		return errors.New("embedstore: table is required")
 	}
 	opts := engine.TableOptions{}
 	if len(splits) > 0 {
 		opts.Splits = engine.PrefixSplit(splits...)
+	}
+	if defaultEmbedding != "" {
+		state, err := embeddingspace.Parse(defaultEmbedding)
+		if err != nil {
+			return err
+		}
+		opts.DefaultEmbedding = state
 	}
 	return s.eng.CreateTable(table, opts)
 }
@@ -236,11 +261,14 @@ func (s *EngineStore) Compact(_ context.Context, table string) error {
 // Scan runs req against table and returns the matching cells, honoring
 // req.Limit (0 = no limit). It is the buffered counterpart of Scanner used by
 // in-process callers such as agentmem.
-func (s *EngineStore) Scan(_ context.Context, table string, req *embedpb.ScanRequest) ([]*embedpb.Cell, error) {
+func (s *EngineStore) Scan(ctx context.Context, table string, req *embedpb.ScanRequest) ([]*embedpb.Cell, error) {
 	if table == "" {
 		return nil, errors.New("embedstore: table is required")
 	}
-	sc, err := s.Scanner(table, req)
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	sc, err := s.ScannerContext(ctx, table, req)
 	if err != nil {
 		return nil, err
 	}
@@ -249,6 +277,9 @@ func (s *EngineStore) Scan(_ context.Context, table string, req *embedpb.ScanReq
 	limit := int(req.Limit)
 	var cells []*embedpb.Cell
 	for sc.Next() {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		k := sc.Key()
 		cells = append(cells, &embedpb.Cell{
 			Row:              k.Row,
@@ -336,8 +367,21 @@ func appendZero(row []byte) []byte {
 // cells may span tablets, and at most one may be set. With none set it runs an
 // ordinary version-capped scan. The caller owns Close on the returned scanner.
 func (s *EngineStore) Scanner(table string, req *embedpb.ScanRequest) (*engine.Scanner, error) {
+	return s.ScannerContext(context.Background(), table, req)
+}
+
+// ScannerContext is Scanner with cancellation for hosted source construction
+// and embedding metadata reads.
+func (s *EngineStore) ScannerContext(
+	ctx context.Context,
+	table string,
+	req *embedpb.ScanRequest,
+) (*engine.Scanner, error) {
 	if table == "" {
 		return nil, errors.New("embedstore: table is required")
+	}
+	if ctx == nil {
+		ctx = context.Background()
 	}
 	scanRange := ScanRange(req)
 
@@ -393,7 +437,7 @@ func (s *EngineStore) Scanner(table string, req *embedpb.ScanRequest) (*engine.S
 				}
 			}
 		}
-		return s.eng.ScanHosted(table, scanRange, engine.ScanOptions{},
+		return s.eng.ScanHostedContext(ctx, table, scanRange, engine.ScanOptions{},
 			[]iterrt.IterSpec{{Name: iterrt.IterTermIndex, Options: opts}})
 	}
 
@@ -401,8 +445,13 @@ func (s *EngineStore) Scanner(table string, req *embedpb.ScanRequest) (*engine.S
 		if len(vs.Query) == 0 {
 			return nil, ErrVectorQueryRequired
 		}
+		if err := embeddingspace.ValidateQueryStates(
+			"embedded vector search", vs.EmbeddingSpace); err != nil {
+			return nil, errors.Join(ErrVectorEmbeddingSpaceRequired, err)
+		}
 		opts := map[string]string{
-			iterrt.VectorKNNQuery: base64.StdEncoding.EncodeToString(vs.Query),
+			iterrt.VectorKNNQuery:          base64.StdEncoding.EncodeToString(vs.Query),
+			iterrt.VectorKNNEmbeddingSpace: vs.EmbeddingSpace,
 		}
 		if vs.TopK > 0 {
 			opts[iterrt.VectorKNNTopK] = strconv.Itoa(int(vs.TopK))
@@ -416,7 +465,7 @@ func (s *EngineStore) Scanner(table string, req *embedpb.ScanRequest) (*engine.S
 		if vs.MinScoreSet {
 			opts[iterrt.VectorKNNMinScore] = strconv.FormatFloat(float64(vs.MinScore), 'g', -1, 32)
 		}
-		return s.eng.ScanHosted(table, scanRange, engine.ScanOptions{},
+		return s.eng.ScanHostedContext(ctx, table, scanRange, engine.ScanOptions{},
 			[]iterrt.IterSpec{{Name: iterrt.IterVectorKNN, Options: opts}})
 	}
 
@@ -468,7 +517,7 @@ func (s *EngineStore) Scanner(table string, req *embedpb.ScanRequest) (*engine.S
 					strconv.FormatFloat(float64(ew.Weight), 'g', -1, 32)
 			}
 		}
-		return s.eng.ScanHosted(table, scanRange, engine.ScanOptions{},
+		return s.eng.ScanHostedContext(ctx, table, scanRange, engine.ScanOptions{},
 			[]iterrt.IterSpec{{Name: iterrt.IterEdgeExpand, Options: opts}})
 	}
 
@@ -499,7 +548,7 @@ func (s *EngineStore) Scanner(table string, req *embedpb.ScanRequest) (*engine.S
 		if sf.HalfLifeMs != 0 {
 			opts[iterrt.ScoreFilterHalfLifeMs] = strconv.FormatInt(sf.HalfLifeMs, 10)
 		}
-		return s.eng.ScanHosted(table, scanRange, engine.ScanOptions{},
+		return s.eng.ScanHostedContext(ctx, table, scanRange, engine.ScanOptions{},
 			[]iterrt.IterSpec{{Name: iterrt.IterScoreFilter, Options: opts}})
 	}
 

@@ -13,7 +13,8 @@ type ManagedVectorSearcher struct {
 
 func (s ManagedVectorSearcher) SearchVector(ctx context.Context, request VectorSearchRequest) ([]VectorHit, vectorindex.Evidence, error) {
 	hits, evidence, err := s.Manager.Search(ctx, request.Index, vectorindex.Query{
-		Vector: request.Query, TopK: request.TopK, NProbe: request.NProbe,
+		Vector: request.Query, EmbeddingSpace: request.EmbeddingSpace,
+		TopK: request.TopK, NProbe: request.NProbe,
 		Authorizations: request.Authorizations, AsOf: request.AsOf,
 		Freshness: request.Freshness, ExactFallback: request.ExactFallback,
 		AllowedDocuments: request.AllowedDocuments,

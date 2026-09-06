@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/phrocker/shoal-oss/internal/embeddingspace"
 	"github.com/phrocker/shoal-oss/internal/embedpb"
 	"github.com/phrocker/shoal-oss/pkg/extraction"
 	modelio "github.com/phrocker/shoal-oss/pkg/model"
@@ -33,6 +34,10 @@ const (
 type Embedder interface {
 	Embed(context.Context, string) ([]float32, error)
 }
+
+type embeddingSpaceIdentityProvider interface {
+	EmbeddingSpaceIdentity() (string, error)
+}
 type LLM interface {
 	Infer(context.Context, string) (string, error)
 }
@@ -46,16 +51,19 @@ type EmbedStore interface {
 }
 
 type Config struct {
-	Table       string
-	Embedder    Embedder
-	LLM         LLM
-	Enricher    Enricher
-	Classifier  IntentClassifier
-	Store       EmbedStore
-	MaxAnchors  int
-	BeamWidth   int
-	MaxDepth    int
-	TokenBudget int
+	Table    string
+	Embedder Embedder
+	// EmbeddingSpace is the stable identity produced by Embedder. Empty is
+	// resolved from embeddingSpaceIdentityProvider during New.
+	EmbeddingSpace string
+	LLM            LLM
+	Enricher       Enricher
+	Classifier     IntentClassifier
+	Store          EmbedStore
+	MaxAnchors     int
+	BeamWidth      int
+	MaxDepth       int
+	TokenBudget    int
 
 	// OntologyExtractor and OntologyRequestFactory enable safe structured
 	// enrichment and consolidation planning without using the legacy entity
@@ -112,6 +120,29 @@ func New(cfg Config) (*Client, error) {
 	if cfg.Embedder == nil {
 		cfg.Embedder = FakeEmbedder{Dim: DefaultDim}
 	}
+	if provider, ok := cfg.Embedder.(embeddingSpaceIdentityProvider); ok {
+		identity, err := provider.EmbeddingSpaceIdentity()
+		if err != nil {
+			if cfg.EmbeddingSpace == "" ||
+				!errors.Is(err, embeddingspace.ErrQueryIdentityRequired) {
+				return nil, err
+			}
+		} else if cfg.EmbeddingSpace == "" {
+			cfg.EmbeddingSpace = identity
+		} else if err := embeddingspace.EnsureSameIdentity(
+			"configure agent memory embedding",
+			identity,
+			cfg.EmbeddingSpace,
+		); err != nil {
+			return nil, err
+		}
+	} else if cfg.EmbeddingSpace == "" {
+		return nil, embeddingspace.ErrQueryIdentityRequired
+	}
+	if err := embeddingspace.ValidateQueryStates(
+		"configure agent memory embedding", cfg.EmbeddingSpace); err != nil {
+		return nil, err
+	}
 	if cfg.LLM == nil {
 		cfg.LLM = FakeLLM{}
 	}
@@ -167,6 +198,18 @@ func (s GRPCStore) CreateTable(ctx context.Context, table string, splits []strin
 	_, err := s.Client.CreateTable(ctx, &embedpb.CreateTableRequest{Table: table, Splits: splits})
 	return err
 }
+
+func (s GRPCStore) CreateTableWithEmbedding(
+	ctx context.Context,
+	table string,
+	splits []string,
+	defaultEmbedding string,
+) error {
+	_, err := s.Client.CreateTableV2(ctx, &embedpb.CreateTableRequest{
+		Table: table, Splits: splits, DefaultEmbedding: defaultEmbedding,
+	})
+	return err
+}
 func (s GRPCStore) Write(ctx context.Context, table string, muts []*embedpb.Mutation) error {
 	results, err := s.WriteWithResults(ctx, table, muts)
 	if err != nil {
@@ -209,7 +252,13 @@ func (s GRPCStore) Flush(ctx context.Context, table string) error {
 func (s GRPCStore) Scan(ctx context.Context, table string, req *embedpb.ScanRequest) ([]*embedpb.Cell, error) {
 	clone := proto.Clone(req).(*embedpb.ScanRequest)
 	clone.Table = table
-	stream, err := s.Client.Scan(ctx, clone)
+	var stream grpc.ServerStreamingClient[embedpb.ScanResponse]
+	var err error
+	if clone.VectorSearch != nil {
+		stream, err = s.Client.ScanV2(ctx, clone)
+	} else {
+		stream, err = s.Client.Scan(ctx, clone)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -235,6 +284,14 @@ type modelEmbedderAdapter struct{ embedder modelio.Embedder }
 func (a modelEmbedderAdapter) Embed(ctx context.Context, text string) ([]float32, error) {
 	result, err := a.embedder.Embed(ctx, modelio.EmbedRequest{Text: text})
 	return append([]float32(nil), result.Vector...), err
+}
+
+func (a modelEmbedderAdapter) EmbeddingSpaceIdentity() (string, error) {
+	provider, ok := a.embedder.(modelio.EmbeddingSpaceIdentityProvider)
+	if !ok {
+		return "", embeddingspace.ErrQueryIdentityRequired
+	}
+	return provider.EmbeddingSpaceIdentity()
 }
 
 type modelGeneratorAdapter struct{ generator modelio.TextGenerator }

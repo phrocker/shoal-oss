@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/binary"
+	"errors"
 	"math"
 	"testing"
 
+	"github.com/phrocker/shoal-oss/internal/embeddingspace"
 	"github.com/phrocker/shoal-oss/internal/graphschema"
 	"github.com/phrocker/shoal-oss/internal/iterrt"
 )
@@ -166,7 +168,9 @@ func TestPlan_GroupByUnsupportedColumn(t *testing.T) {
 }
 
 func TestPlan_VectorKNNLiteral(t *testing.T) {
-	p := planFor(t, "SELECT id, content FROM events ORDER BY embedding <-> [1, 0, -1] LIMIT 5", PlanOptions{})
+	p := planFor(t, "SELECT id, content FROM events ORDER BY embedding <-> [1, 0, -1] LIMIT 5", PlanOptions{
+		Vector: VectorOptions{EmbeddingSpace: "space-a"},
+	})
 	if p.Shape != ShapeVectorKNN {
 		t.Fatalf("shape = %v", p.Shape)
 	}
@@ -188,6 +192,9 @@ func TestPlan_VectorKNNLiteral(t *testing.T) {
 	if knn.Options[iterrt.VectorKNNEmbeddingCF] != string(graphschema.VectorCF()) {
 		t.Errorf("embeddingCF = %q", knn.Options[iterrt.VectorKNNEmbeddingCF])
 	}
+	if knn.Options[iterrt.VectorKNNEmbeddingSpace] != "space-a" {
+		t.Errorf("embeddingSpace = %q", knn.Options[iterrt.VectorKNNEmbeddingSpace])
+	}
 	// verify packed query vector round-trips
 	raw, err := base64.StdEncoding.DecodeString(knn.Options[iterrt.VectorKNNQuery])
 	if err != nil {
@@ -206,7 +213,10 @@ func TestPlan_VectorKNNLiteral(t *testing.T) {
 }
 
 func TestPlan_VectorKNNParam(t *testing.T) {
-	opts := PlanOptions{Params: map[string][]float32{"q": {0.5, 0.5}}}
+	opts := PlanOptions{
+		Params: map[string][]float32{"q": {0.5, 0.5}},
+		Vector: VectorOptions{EmbeddingSpace: "space-a"},
+	}
 	p := planFor(t, "SELECT id FROM events ORDER BY vec <-> :q LIMIT 3", opts)
 	if p.Shape != ShapeVectorKNN {
 		t.Fatalf("shape = %v", p.Shape)
@@ -224,15 +234,111 @@ func TestPlan_VectorKNNTextNeedsEmbedder(t *testing.T) {
 	}
 }
 
-type fakeEmbedder struct{ v []float32 }
+type fakeEmbedder struct {
+	v        []float32
+	identity string
+	calls    *int
+}
 
-func (f fakeEmbedder) Embed(_ context.Context, _ string) ([]float32, error) { return f.v, nil }
+func (f fakeEmbedder) Embed(_ context.Context, _ string) ([]float32, error) {
+	if f.calls != nil {
+		(*f.calls)++
+	}
+	return f.v, nil
+}
+
+func (f fakeEmbedder) EmbeddingSpaceIdentity() (string, error) {
+	if f.identity == "" {
+		return "space-a", nil
+	}
+	return f.identity, nil
+}
 
 func TestPlan_VectorKNNTextWithEmbedder(t *testing.T) {
-	opts := PlanOptions{Embedder: fakeEmbedder{v: []float32{1, 2, 3}}}
+	opts := PlanOptions{
+		Embedder: fakeEmbedder{v: []float32{1, 2, 3}},
+		Vector:   VectorOptions{EmbeddingSpace: "space-a"},
+	}
 	p := planFor(t, "SELECT id FROM events ORDER BY embedding <-> 'hello' LIMIT 3", opts)
 	if p.Shape != ShapeVectorKNN {
 		t.Fatalf("shape = %v", p.Shape)
+	}
+}
+
+func TestPlan_VectorKNNTextDerivesAndVerifiesEmbedderIdentity(t *testing.T) {
+	var calls int
+	opts := PlanOptions{
+		Embedder: fakeEmbedder{
+			v: []float32{1, 2, 3}, identity: "space-b", calls: &calls,
+		},
+		Vector: VectorOptions{EmbeddingSpace: "space-a"},
+	}
+	st, _ := Parse("SELECT id FROM events ORDER BY embedding <-> 'hello' LIMIT 3")
+	b, _ := NewGraphCatalog("graph").Binding("events")
+	if _, err := PlanQuery(
+		context.Background(), st, b, opts,
+	); !errors.Is(err, embeddingspace.ErrMismatch) {
+		t.Fatalf("identity mismatch error = %v", err)
+	}
+	if calls != 0 {
+		t.Fatalf("embed calls = %d, want 0 before identity validation", calls)
+	}
+
+	opts.Vector.EmbeddingSpace = ""
+	p, err := PlanQuery(context.Background(), st, b, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.VectorEmbeddingSpace != "space-b" || calls != 1 {
+		t.Fatalf(
+			"derived identity/calls = %q/%d, want space-b/1",
+			p.VectorEmbeddingSpace, calls)
+	}
+}
+
+type identitylessFakeEmbedder struct{ calls *int }
+
+func (f identitylessFakeEmbedder) Embed(
+	_ context.Context,
+	_ string,
+) ([]float32, error) {
+	(*f.calls)++
+	return []float32{1, 2, 3}, nil
+}
+
+func TestPlan_VectorKNNTextRequiresIdentityReportingEmbedder(t *testing.T) {
+	var calls int
+	st, _ := Parse("SELECT id FROM events ORDER BY embedding <-> 'hello' LIMIT 3")
+	b, _ := NewGraphCatalog("graph").Binding("events")
+	_, err := PlanQuery(context.Background(), st, b, PlanOptions{
+		Embedder: identitylessFakeEmbedder{calls: &calls},
+		Vector:   VectorOptions{EmbeddingSpace: "space-a"},
+	})
+	if !errors.Is(err, embeddingspace.ErrQueryIdentityRequired) {
+		t.Fatalf("identityless embedder error = %v", err)
+	}
+	if calls != 0 {
+		t.Fatalf("embed calls = %d, want 0 before identity validation", calls)
+	}
+}
+
+func TestPlan_VectorKNNRequiresEmbeddingIdentity(t *testing.T) {
+	st, _ := Parse("SELECT id FROM events ORDER BY embedding <-> [1,0] LIMIT 3")
+	b, _ := NewGraphCatalog("graph").Binding("events")
+	if _, err := PlanQuery(
+		context.Background(), st, b, PlanOptions{},
+	); !errors.Is(err, embeddingspace.ErrQueryIdentityRequired) {
+		t.Fatalf("error = %v, want ErrQueryIdentityRequired", err)
+	}
+}
+
+func TestPlan_VectorKNNRejectsNonCanonicalEmbeddingIdentity(t *testing.T) {
+	st, _ := Parse("SELECT id FROM events ORDER BY embedding <-> [1,0] LIMIT 3")
+	b, _ := NewGraphCatalog("graph").Binding("events")
+	if _, err := PlanQuery(context.Background(), st, b, PlanOptions{
+		Vector: VectorOptions{EmbeddingSpace: " space-a "},
+	}); !errors.Is(err, embeddingspace.ErrInvalidState) {
+		t.Fatalf("non-canonical identity error = %v", err)
 	}
 }
 

@@ -2,13 +2,16 @@ package agentmem
 
 import (
 	"context"
+	"errors"
 	"math"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/phrocker/shoal-oss/internal/embeddingspace"
 	"github.com/phrocker/shoal-oss/internal/embedpb"
 	"github.com/phrocker/shoal-oss/internal/graphschema"
+	modelio "github.com/phrocker/shoal-oss/pkg/model"
 )
 
 func TestRRF(t *testing.T) {
@@ -24,6 +27,51 @@ func TestRuleClassifier(t *testing.T) {
 		if got := (RuleClassifier{}).Classify(q); got != want {
 			t.Fatalf("Classify(%q)=%s want %s", q, got, want)
 		}
+	}
+}
+
+type identitylessModelEmbedder struct{}
+
+func (identitylessModelEmbedder) Embed(
+	context.Context,
+	modelio.EmbedRequest,
+) (modelio.EmbedResult, error) {
+	return modelio.EmbedResult{Vector: []float32{1, 0}}, nil
+}
+
+func TestAdaptedEmbedderAcceptsExplicitIdentityFallback(t *testing.T) {
+	const identity = "custom:model:v1:2:normalized"
+	client, err := New(Config{
+		Store:          NewFakeStore(),
+		Embedder:       AdaptEmbedder(identitylessModelEmbedder{}),
+		EmbeddingSpace: identity,
+	})
+	if err != nil {
+		t.Fatalf("New with explicit identity: %v", err)
+	}
+	if client.cfg.EmbeddingSpace != identity {
+		t.Fatalf("embedding space = %q, want %q", client.cfg.EmbeddingSpace, identity)
+	}
+
+	_, err = New(Config{
+		Store:    NewFakeStore(),
+		Embedder: AdaptEmbedder(identitylessModelEmbedder{}),
+	})
+	if !errors.Is(err, embeddingspace.ErrQueryIdentityRequired) {
+		t.Fatalf("New without explicit identity error = %v", err)
+	}
+}
+
+func TestEnsureTableRequiresEmbeddingAwareStore(t *testing.T) {
+	legacy := struct{ EmbedStore }{EmbedStore: NewFakeStore()}
+	client, err := New(Config{Store: legacy})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := client.EnsureTable(
+		context.Background(),
+	); !errors.Is(err, embeddingspace.ErrQueryMetadataMissing) {
+		t.Fatalf("EnsureTable legacy store error = %v", err)
 	}
 }
 

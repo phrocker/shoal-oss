@@ -10,6 +10,10 @@ The current machine-readable inventory is
 can also JSON-encode `iterrt.RegistrySnapshot()` and
 `iterrt.CompatibilityReport` directly.
 
+`vectorKNN` accepts an `embeddingSpace` option. ShoalQL always supplies it for
+exact vector plans; storage backends must validate that identity against every
+participating immutable file before allowing the iterator to compare scores.
+
 Admission is fail closed:
 
 - the requested registry and Accumulo versions must match;

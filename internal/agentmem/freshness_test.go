@@ -19,8 +19,10 @@ package agentmem
 
 import (
 	"context"
+	"errors"
 	"testing"
 
+	"github.com/phrocker/shoal-oss/internal/embeddingspace"
 	"github.com/phrocker/shoal-oss/internal/embedpb"
 	"github.com/phrocker/shoal-oss/internal/ivfpq"
 )
@@ -42,7 +44,8 @@ func TestIvfIndex_Add(t *testing.T) {
 	}
 	seedIvfIndex(t, store, table, vecs, 2, 6, 2, 1)
 
-	ix, err := LoadIvfIndex(ctx, store, table)
+	space := testIvfEmbeddingSpace(t, len(vecs[0]))
+	ix, err := LoadIvfIndexInSpace(ctx, store, table, space)
 	if err != nil {
 		t.Fatalf("LoadIvfIndex: %v", err)
 	}
@@ -55,25 +58,43 @@ func TestIvfIndex_Add(t *testing.T) {
 
 	// Add a vector identical to vecs[0]; PQ encodes losslessly here (ks==n) so
 	// it must rank alongside the original.
-	if err := ix.Add(ctx, newID, []float32{1, 0, 0, 0}); err != nil {
+	if err := ix.AddInSpace(
+		ctx, newID, []float32{1, 0, 0, 0}, space); err != nil {
 		t.Fatalf("Add: %v", err)
+	}
+	if err := ix.Add(
+		ctx, "evt:legacy", []float32{1, 0, 0, 0},
+	); !errors.Is(err, embeddingspace.ErrQueryIdentityRequired) {
+		t.Fatalf("legacy Add error = %v", err)
+	}
+	if err := ix.AddInSpace(
+		ctx, "evt:foreign", []float32{1, 0, 0, 0}, "foreign-space",
+	); !errors.Is(err, embeddingspace.ErrMismatch) {
+		t.Fatalf("foreign AddInSpace error = %v", err)
+	}
+	if err := ix.AddInSpace(
+		ctx, "evt:padded", []float32{1, 0, 0, 0}, " "+space+" ",
+	); !errors.Is(err, embeddingspace.ErrInvalidState) {
+		t.Fatalf("non-canonical AddInSpace error = %v", err)
 	}
 	if found := searchHasRow(t, ctx, ix, []float32{1, 0, 0, 0}, newID); !found {
 		t.Fatalf("row %q not searchable after Add", newID)
 	}
 
 	// Dim mismatch is rejected.
-	if err := ix.Add(ctx, "evt:bad", []float32{1, 0, 0}); err == nil {
+	if err := ix.AddInSpace(
+		ctx, "evt:bad", []float32{1, 0, 0}, space); err == nil {
 		t.Error("Add with wrong dim: want error, got nil")
 	}
-	if err := ix.Add(ctx, "", []float32{1, 0, 0, 0}); err == nil {
+	if err := ix.AddInSpace(
+		ctx, "", []float32{1, 0, 0, 0}, space); err == nil {
 		t.Error("Add with empty vertexID: want error, got nil")
 	}
 }
 
 func searchHasRow(t *testing.T, ctx context.Context, ix *IvfIndex, q []float32, row string) bool {
 	t.Helper()
-	hits, err := ix.Search(ctx, q, 10, 2)
+	hits, err := ix.SearchInSpace(ctx, q, ix.EmbeddingSpace(), 10, 2)
 	if err != nil {
 		t.Fatalf("Search: %v", err)
 	}

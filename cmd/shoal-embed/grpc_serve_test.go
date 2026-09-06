@@ -19,12 +19,15 @@ package main
 
 import (
 	"context"
+	"errors"
 	"io/fs"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/phrocker/shoal-oss/internal/embeddingspace"
 	"github.com/phrocker/shoal-oss/internal/embedpb"
+	"github.com/phrocker/shoal-oss/internal/embedstore"
 	"github.com/phrocker/shoal-oss/internal/engine"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -153,6 +156,49 @@ func TestEmbedServer_CompactMigratesToRequestedFormat(t *testing.T) {
 	}
 	if got := st.TableStatuses[0]; got.Workload != embedpb.TableWorkload_TABLE_WORKLOAD_ANALYTICAL || got.FileFormat != embedpb.TableFileFormat_TABLE_FILE_FORMAT_PARQUET {
 		t.Fatalf("Status table_status = %+v", got)
+	}
+}
+
+func TestScanStatusErrorMapsEmbeddingContractFailures(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		code codes.Code
+	}{
+		{
+			name: "missing query identity",
+			err: errors.Join(
+				embedstore.ErrVectorEmbeddingSpaceRequired,
+				embeddingspace.ErrQueryIdentityRequired,
+			),
+			code: codes.InvalidArgument,
+		},
+		{
+			name: "incompatible stored identity",
+			err: &embeddingspace.MismatchError{
+				Operation: "scan",
+				Left:      embeddingspace.Has("space-a"),
+				Right:     embeddingspace.Has("space-b"),
+			},
+			code: codes.FailedPrecondition,
+		},
+		{
+			name: "unknown stored identity",
+			err:  embeddingspace.ErrQuerySpaceUnknown,
+			code: codes.FailedPrecondition,
+		},
+		{
+			name: "canceled metadata read",
+			err:  context.Canceled,
+			code: codes.Canceled,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := status.Code(scanStatusError(test.err)); got != test.code {
+				t.Fatalf("status code = %v, want %v", got, test.code)
+			}
+		})
 	}
 }
 

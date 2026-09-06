@@ -19,7 +19,7 @@
 // versions:
 // - protoc-gen-go-grpc v1.6.2
 // - protoc             v7.35.0
-// source: embed.proto
+// source: proto/embed.proto
 
 package embedpb
 
@@ -37,9 +37,11 @@ const _ = grpc.SupportPackageIsVersion9
 
 const (
 	ShoalEmbed_CreateTable_FullMethodName      = "/shoal.embed.v1.ShoalEmbed/CreateTable"
+	ShoalEmbed_CreateTableV2_FullMethodName    = "/shoal.embed.v1.ShoalEmbed/CreateTableV2"
 	ShoalEmbed_Write_FullMethodName            = "/shoal.embed.v1.ShoalEmbed/Write"
 	ShoalEmbed_ConditionalWrite_FullMethodName = "/shoal.embed.v1.ShoalEmbed/ConditionalWrite"
 	ShoalEmbed_Scan_FullMethodName             = "/shoal.embed.v1.ShoalEmbed/Scan"
+	ShoalEmbed_ScanV2_FullMethodName           = "/shoal.embed.v1.ShoalEmbed/ScanV2"
 	ShoalEmbed_Flush_FullMethodName            = "/shoal.embed.v1.ShoalEmbed/Flush"
 	ShoalEmbed_Compact_FullMethodName          = "/shoal.embed.v1.ShoalEmbed/Compact"
 	ShoalEmbed_Status_FullMethodName           = "/shoal.embed.v1.ShoalEmbed/Status"
@@ -54,6 +56,10 @@ const (
 type ShoalEmbedClient interface {
 	// CreateTable creates a new table with optional split points.
 	CreateTable(ctx context.Context, in *CreateTableRequest, opts ...grpc.CallOption) (*CreateTableResponse, error)
+	// CreateTableV2 enforces the safety-critical default_embedding field. New
+	// clients use this RPC for embedding-bearing tables so pre-V2 servers fail
+	// closed with UNIMPLEMENTED rather than ignoring the field.
+	CreateTableV2(ctx context.Context, in *CreateTableRequest, opts ...grpc.CallOption) (*CreateTableResponse, error)
 	// Write writes an unconditional batch of mutations to a table.
 	Write(ctx context.Context, in *WriteRequest, opts ...grpc.CallOption) (*WriteResponse, error)
 	// ConditionalWrite atomically evaluates optional per-mutation conditions
@@ -63,6 +69,10 @@ type ShoalEmbedClient interface {
 	ConditionalWrite(ctx context.Context, in *WriteRequest, opts ...grpc.CallOption) (*WriteResponse, error)
 	// Scan reads cells from a table. Results are streamed back.
 	Scan(ctx context.Context, in *ScanRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[ScanResponse], error)
+	// ScanV2 enforces safety-critical vector embedding-space identity. Clients
+	// issuing vector_search must use this RPC so pre-V2 servers fail closed with
+	// UNIMPLEMENTED rather than ignoring the embedding_space field.
+	ScanV2(ctx context.Context, in *ScanRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[ScanResponse], error)
 	// Flush forces memtables to RFiles for a table.
 	Flush(ctx context.Context, in *FlushRequest, opts ...grpc.CallOption) (*FlushResponse, error)
 	// Compact runs major compaction on a table.
@@ -83,6 +93,16 @@ func (c *shoalEmbedClient) CreateTable(ctx context.Context, in *CreateTableReque
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(CreateTableResponse)
 	err := c.cc.Invoke(ctx, ShoalEmbed_CreateTable_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *shoalEmbedClient) CreateTableV2(ctx context.Context, in *CreateTableRequest, opts ...grpc.CallOption) (*CreateTableResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(CreateTableResponse)
+	err := c.cc.Invoke(ctx, ShoalEmbed_CreateTableV2_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -128,6 +148,25 @@ func (c *shoalEmbedClient) Scan(ctx context.Context, in *ScanRequest, opts ...gr
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type ShoalEmbed_ScanClient = grpc.ServerStreamingClient[ScanResponse]
 
+func (c *shoalEmbedClient) ScanV2(ctx context.Context, in *ScanRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[ScanResponse], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &ShoalEmbed_ServiceDesc.Streams[1], ShoalEmbed_ScanV2_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[ScanRequest, ScanResponse]{ClientStream: stream}
+	if err := x.ClientStream.SendMsg(in); err != nil {
+		return nil, err
+	}
+	if err := x.ClientStream.CloseSend(); err != nil {
+		return nil, err
+	}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type ShoalEmbed_ScanV2Client = grpc.ServerStreamingClient[ScanResponse]
+
 func (c *shoalEmbedClient) Flush(ctx context.Context, in *FlushRequest, opts ...grpc.CallOption) (*FlushResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(FlushResponse)
@@ -167,6 +206,10 @@ func (c *shoalEmbedClient) Status(ctx context.Context, in *StatusRequest, opts .
 type ShoalEmbedServer interface {
 	// CreateTable creates a new table with optional split points.
 	CreateTable(context.Context, *CreateTableRequest) (*CreateTableResponse, error)
+	// CreateTableV2 enforces the safety-critical default_embedding field. New
+	// clients use this RPC for embedding-bearing tables so pre-V2 servers fail
+	// closed with UNIMPLEMENTED rather than ignoring the field.
+	CreateTableV2(context.Context, *CreateTableRequest) (*CreateTableResponse, error)
 	// Write writes an unconditional batch of mutations to a table.
 	Write(context.Context, *WriteRequest) (*WriteResponse, error)
 	// ConditionalWrite atomically evaluates optional per-mutation conditions
@@ -176,6 +219,10 @@ type ShoalEmbedServer interface {
 	ConditionalWrite(context.Context, *WriteRequest) (*WriteResponse, error)
 	// Scan reads cells from a table. Results are streamed back.
 	Scan(*ScanRequest, grpc.ServerStreamingServer[ScanResponse]) error
+	// ScanV2 enforces safety-critical vector embedding-space identity. Clients
+	// issuing vector_search must use this RPC so pre-V2 servers fail closed with
+	// UNIMPLEMENTED rather than ignoring the embedding_space field.
+	ScanV2(*ScanRequest, grpc.ServerStreamingServer[ScanResponse]) error
 	// Flush forces memtables to RFiles for a table.
 	Flush(context.Context, *FlushRequest) (*FlushResponse, error)
 	// Compact runs major compaction on a table.
@@ -195,6 +242,9 @@ type UnimplementedShoalEmbedServer struct{}
 func (UnimplementedShoalEmbedServer) CreateTable(context.Context, *CreateTableRequest) (*CreateTableResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method CreateTable not implemented")
 }
+func (UnimplementedShoalEmbedServer) CreateTableV2(context.Context, *CreateTableRequest) (*CreateTableResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method CreateTableV2 not implemented")
+}
 func (UnimplementedShoalEmbedServer) Write(context.Context, *WriteRequest) (*WriteResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Write not implemented")
 }
@@ -203,6 +253,9 @@ func (UnimplementedShoalEmbedServer) ConditionalWrite(context.Context, *WriteReq
 }
 func (UnimplementedShoalEmbedServer) Scan(*ScanRequest, grpc.ServerStreamingServer[ScanResponse]) error {
 	return status.Error(codes.Unimplemented, "method Scan not implemented")
+}
+func (UnimplementedShoalEmbedServer) ScanV2(*ScanRequest, grpc.ServerStreamingServer[ScanResponse]) error {
+	return status.Error(codes.Unimplemented, "method ScanV2 not implemented")
 }
 func (UnimplementedShoalEmbedServer) Flush(context.Context, *FlushRequest) (*FlushResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Flush not implemented")
@@ -248,6 +301,24 @@ func _ShoalEmbed_CreateTable_Handler(srv interface{}, ctx context.Context, dec f
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(ShoalEmbedServer).CreateTable(ctx, req.(*CreateTableRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _ShoalEmbed_CreateTableV2_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CreateTableRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ShoalEmbedServer).CreateTableV2(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ShoalEmbed_CreateTableV2_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ShoalEmbedServer).CreateTableV2(ctx, req.(*CreateTableRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -298,6 +369,17 @@ func _ShoalEmbed_Scan_Handler(srv interface{}, stream grpc.ServerStream) error {
 
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type ShoalEmbed_ScanServer = grpc.ServerStreamingServer[ScanResponse]
+
+func _ShoalEmbed_ScanV2_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(ScanRequest)
+	if err := stream.RecvMsg(m); err != nil {
+		return err
+	}
+	return srv.(ShoalEmbedServer).ScanV2(m, &grpc.GenericServerStream[ScanRequest, ScanResponse]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type ShoalEmbed_ScanV2Server = grpc.ServerStreamingServer[ScanResponse]
 
 func _ShoalEmbed_Flush_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(FlushRequest)
@@ -365,6 +447,10 @@ var ShoalEmbed_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _ShoalEmbed_CreateTable_Handler,
 		},
 		{
+			MethodName: "CreateTableV2",
+			Handler:    _ShoalEmbed_CreateTableV2_Handler,
+		},
+		{
 			MethodName: "Write",
 			Handler:    _ShoalEmbed_Write_Handler,
 		},
@@ -391,6 +477,11 @@ var ShoalEmbed_ServiceDesc = grpc.ServiceDesc{
 			Handler:       _ShoalEmbed_Scan_Handler,
 			ServerStreams: true,
 		},
+		{
+			StreamName:    "ScanV2",
+			Handler:       _ShoalEmbed_ScanV2_Handler,
+			ServerStreams: true,
+		},
 	},
-	Metadata: "embed.proto",
+	Metadata: "proto/embed.proto",
 }

@@ -11,10 +11,12 @@ originated in RFile or Parquet.
 Shoal iterator implementations do not have compatible distributed Java class
 lifecycle in this slice. Scanner pages are therefore materialized, globally
 key-sorted, and replayed through the local iterator runtime for document
-reconstruction, aggregation, `AS OF`, and exact vector ranking. This fallback
-is deterministic: exact top-k uses score descending and full-key ascending as
-the tie-break. Because a standard Accumulo scan may apply versioning before the
-client sees cells, `AS OF` is rejected unless `HistoricalVersions` explicitly
+reconstruction, aggregation, and `AS OF`. Exact raw-vector ranking is refused
+with `embeddingspace.ErrQueryMetadataMissing` until the Accumulo adapter can
+obtain the authoritative per-file `file.embedding` snapshot; replaying one raw
+vector across unverified files would silently mix model spaces. Because a
+standard Accumulo scan may apply versioning before the client sees cells,
+`AS OF` is rejected unless `HistoricalVersions` explicitly
 confirms that the configured scanner/replay retains historical versions.
 
 Approximate vector search is opt-in. Configure `Options.VectorSearcher` with a

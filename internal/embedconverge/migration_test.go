@@ -64,8 +64,9 @@ func TestMigrationCompleteConvergesAndIsIdempotent(t *testing.T) {
 	if progress.InFlight != 0 {
 		t.Fatalf("InFlight = %d, want 0", progress.InFlight)
 	}
-	if len(progress.Spaces) != 1 || progress.Spaces[0].Files != 4 {
-		t.Fatalf("spaces = %+v, want one space holding all four files", progress.Spaces)
+	if len(progress.Spaces) != 1 ||
+		progress.Spaces[0].Files != 4 || progress.Spaces[0].Spans != 100 {
+		t.Fatalf("spaces = %+v, want one space holding four files / 100 spans", progress.Spaces)
 	}
 
 	// Re-reporting an already converged file is a no-op, not an error,

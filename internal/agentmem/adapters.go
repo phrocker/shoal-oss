@@ -26,6 +26,14 @@ func (f FakeEmbedder) Embed(ctx context.Context, text string) ([]float32, error)
 	return result.Vector, err
 }
 
+func (f FakeEmbedder) EmbeddingSpaceIdentity() (string, error) {
+	dim := f.Dim
+	if dim <= 0 {
+		dim = DefaultDim
+	}
+	return (modelio.FakeEmbedder{Dimensions: dim}).EmbeddingSpaceIdentity()
+}
+
 type FakeLLM struct{}
 
 func (FakeLLM) Infer(ctx context.Context, prompt string) (string, error) {
