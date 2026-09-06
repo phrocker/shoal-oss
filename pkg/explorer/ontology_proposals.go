@@ -30,8 +30,13 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
+// MaxOntologyProposals bounds the total durable proposals in one corpus,
+// including proposals that have reached a terminal state.
+const MaxOntologyProposals uint32 = 256
+
 // OntologyProposalStore is the optional durable proposal lifecycle held by a
-// Shoal Explorer corpus.
+// Shoal Explorer corpus. New proposals must be admitted atomically against
+// MaxOntologyProposals; identical retries do not consume another slot.
 type OntologyProposalStore interface {
 	OntologyProposals(context.Context) ([]ontology.GovernedProposal, error)
 	OntologyProposalsForMutation(context.Context) ([]ontology.GovernedProposal, error)
@@ -225,6 +230,10 @@ func (e *Explorer) CreateOntologyProposal(
 		}
 		return shoal.NewError(
 			shoal.ErrorUnavailable, "ontology proposal ID collision")
+	}
+	if len(e.ontologyProposals) >= int(MaxOntologyProposals) {
+		return shoal.NewError(
+			shoal.ErrorUnavailable, "ontology proposals exceed the corpus bound")
 	}
 	if err := e.writeRecord(
 		ontologyProposalRecordRow(record.ProposalID),

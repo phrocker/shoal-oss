@@ -220,6 +220,9 @@ func replayPublishedOntology(
 		}
 		visited[active.ID()] = struct{}{}
 	}
+	if _, more := outgoing[active.ID()]; !more {
+		return active, nil
+	}
 	return ontology.OntologyVersion{}, shoal.NewError(
 		shoal.ErrorUnavailable, "published ontology history exceeds the service bound")
 }

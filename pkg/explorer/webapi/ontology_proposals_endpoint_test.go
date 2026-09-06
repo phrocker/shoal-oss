@@ -26,6 +26,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
@@ -531,6 +532,7 @@ func TestOntologyProposalMorphismUsesKeyReferencesAndWireCodecs(t *testing.T) {
 	request := ontologyProposalRequest("v2")
 	request.ProposedVersion.Relationships[0].Key = "belongs_to"
 	request.ProposedVersion.Relationships[0].Name = "Belongs to"
+	metadata := shoal.Metadata{"source": "test", "unicode": "caf\u00e9", "\ufffd": "literal", "nul": "\x00"}
 	evidenceDraft := webapi.OntologyMorphismEvidenceDraft{
 		Citation: document.Citation{
 			DocumentID: "document:opaque/value", RevisionID: "revision:opaque/value",
@@ -556,8 +558,16 @@ func TestOntologyProposalMorphismUsesKeyReferencesAndWireCodecs(t *testing.T) {
 		}},
 		Evidence:  []webapi.OntologyMorphismEvidenceDraft{evidenceDraft},
 		Rationale: "rename the relationship",
+		Metadata:  metadata,
 	}}
 	encoded := mustJSON(t, request)
+	var decoded webapi.CreateOntologyProposalRequest
+	if err := json.Unmarshal(encoded, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if len(decoded.Morphisms) != 1 || !reflect.DeepEqual(decoded.Morphisms[0].Metadata, metadata) {
+		t.Fatalf("draft metadata roundtrip = %#v", decoded.Morphisms)
+	}
 	if bytes.Contains(encoded, []byte(`"document_id":"document:opaque/value"`)) ||
 		bytes.Contains(encoded, []byte(`"id":"node:opaque/value"`)) ||
 		bytes.Contains(encoded, []byte(`"metadata":{"source"`)) {
@@ -598,6 +608,60 @@ func TestOntologyProposalMorphismUsesKeyReferencesAndWireCodecs(t *testing.T) {
 		projected.EvidenceIDs[0] != base64.RawURLEncoding.EncodeToString(
 			[]byte(expectedEvidence.ID())) {
 		t.Fatalf("projected morphism IDs = %+v", projected)
+	}
+	if !reflect.DeepEqual(projected.Metadata, metadata) {
+		t.Fatalf("projection metadata = %#v, want %#v", projected.Metadata, metadata)
+	}
+	persisted, err := corpus.OntologyProposals(context.Background())
+	if err != nil || len(persisted) != 1 || len(persisted[0].Morphisms()) != 1 {
+		t.Fatalf("persisted proposals = %#v, %v", persisted, err)
+	}
+	stored := persisted[0].Morphisms()[0]
+	expected, err := ontology.NewOntologyMorphism(ontology.MorphismConfig{
+		Kind: ontology.MorphismRename, SourceVersion: active,
+		TargetVersion: persisted[0].ProposedVersion(),
+		Sources:       []shoal.ID{sourceID}, Targets: stored.Targets(),
+		Evidence:  []ontology.EvidenceRef{expectedEvidence},
+		Rationale: request.Morphisms[0].Rationale, Metadata: metadata,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(stored.Metadata(), metadata) || stored.ID() != expected.ID() ||
+		projected.ID != base64.RawURLEncoding.EncodeToString([]byte(expected.ID())) {
+		t.Fatalf("morphism metadata or canonical identity changed: stored %q, projected %q, want %q",
+			stored.ID(), projected.ID, expected.ID())
+	}
+	listed := getOntologyProposals(t, server)
+	if len(listed.Proposals) != 1 || len(listed.Proposals[0].Morphisms) != 1 ||
+		!reflect.DeepEqual(listed.Proposals[0].Morphisms[0].Metadata, metadata) ||
+		listed.Proposals[0].Morphisms[0].ID != projected.ID {
+		t.Fatalf("listed morphism metadata or identity changed: %#v", listed.Proposals)
+	}
+	for _, invalidMetadata := range []shoal.Metadata{
+		{"\xff": "one", "\xfe": "two"},
+		{"valid": "\xff"},
+	} {
+		invalid := request
+		invalid.Morphisms = append([]webapi.OntologyMorphismDraft(nil), request.Morphisms...)
+		invalid.Morphisms[0].Metadata = invalidMetadata
+		response, err := server.Client().Post(
+			server.URL+"/api/v1/ontology/proposals", "application/json",
+			bytes.NewReader(mustJSON(t, invalid)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, readErr := io.ReadAll(response.Body)
+		response.Body.Close()
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		if response.StatusCode != http.StatusBadRequest {
+			t.Fatalf("invalid UTF-8 metadata status = %d, want 400: %s", response.StatusCode, body)
+		}
+	}
+	if after := getOntologyProposals(t, server); len(after.Proposals) != 1 {
+		t.Fatalf("invalid metadata persisted a proposal: %#v", after.Proposals)
 	}
 }
 

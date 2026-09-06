@@ -26,13 +26,14 @@ import (
 	"time"
 
 	"github.com/phrocker/shoal-oss/pkg/document"
+	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/graph"
 	"github.com/phrocker/shoal-oss/pkg/ontology"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
 const (
-	MaxOntologyProposals           uint32 = 256
+	MaxOntologyProposals           uint32 = explorer.MaxOntologyProposals
 	MaxOntologyProposalTransitions uint32 = 128
 )
 
@@ -160,6 +161,60 @@ type OntologyDiscriminatorProjection struct {
 	Choices     map[string]string `json:"choices"`
 }
 
+func (d OntologyMorphismDraft) MarshalJSON() ([]byte, error) {
+	type fields OntologyMorphismDraft
+	return json.Marshal(struct {
+		fields
+		Metadata wireMetadata `json:"metadata,omitempty"`
+	}{fields: fields(d), Metadata: wireMetadataValue(d.Metadata)})
+}
+
+func (d *OntologyMorphismDraft) UnmarshalJSON(data []byte) error {
+	type fields OntologyMorphismDraft
+	var wire struct {
+		fields
+		Metadata wireMetadata `json:"metadata,omitempty"`
+	}
+	if err := strictUnmarshal(data, &wire); err != nil {
+		return err
+	}
+	metadata, err := metadataValue(wire.Metadata)
+	if err != nil {
+		return fmt.Errorf("metadata: %w", err)
+	}
+	decoded := OntologyMorphismDraft(wire.fields)
+	decoded.Metadata = metadata
+	*d = decoded
+	return nil
+}
+
+func (p OntologyMorphismProjection) MarshalJSON() ([]byte, error) {
+	type fields OntologyMorphismProjection
+	return json.Marshal(struct {
+		fields
+		Metadata wireMetadata `json:"metadata,omitempty"`
+	}{fields: fields(p), Metadata: wireMetadataValue(p.Metadata)})
+}
+
+func (p *OntologyMorphismProjection) UnmarshalJSON(data []byte) error {
+	type fields OntologyMorphismProjection
+	var wire struct {
+		fields
+		Metadata wireMetadata `json:"metadata,omitempty"`
+	}
+	if err := strictUnmarshal(data, &wire); err != nil {
+		return err
+	}
+	metadata, err := metadataValue(wire.Metadata)
+	if err != nil {
+		return fmt.Errorf("metadata: %w", err)
+	}
+	decoded := OntologyMorphismProjection(wire.fields)
+	decoded.Metadata = metadata
+	*p = decoded
+	return nil
+}
+
 func (d OntologyMorphismEvidenceDraft) MarshalJSON() ([]byte, error) {
 	var path *wirePath
 	if d.Path != nil {
@@ -279,7 +334,7 @@ func (s *EmbeddedService) CreateOntologyProposal(
 		return ontology.GovernedProposal{}, shoal.NewError(
 			shoal.ErrorUnavailable, "workspace capability \"ontology proposals\" is unavailable")
 	}
-	base, configured, _, err := s.ontologyMutationSnapshot(ctx, store)
+	base, configured, proposals, err := s.ontologyMutationSnapshot(ctx, store)
 	if err != nil {
 		return ontology.GovernedProposal{}, err
 	}
@@ -305,6 +360,19 @@ func (s *EmbeddedService) CreateOntologyProposal(
 		ontologyActor(ctx), request.Rationale, now, nil)
 	if err != nil {
 		return ontology.GovernedProposal{}, err
+	}
+	if len(proposals) >= int(MaxOntologyProposals) {
+		existing := false
+		for _, candidate := range proposals {
+			if candidate.ID() == proposal.ID() {
+				existing = true
+				break
+			}
+		}
+		if !existing {
+			return ontology.GovernedProposal{}, ontologyBoundError(
+				"proposal", len(proposals)+1, MaxOntologyProposals)
+		}
 	}
 	if err := store.CreateOntologyProposal(ctx, proposal, base); err != nil {
 		return ontology.GovernedProposal{}, err
