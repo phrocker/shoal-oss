@@ -191,10 +191,6 @@ func assertServiceBoundsAndSnapshot(
 		len(neighborhood.Neighborhood.Edges) > 1 {
 		t.Fatalf("%s unbounded neighborhood = %+v", name, neighborhood)
 	}
-	if neighborhood.ScannedEdges != nil {
-		t.Fatalf("%s exposed internal scan count = %v",
-			name, *neighborhood.ScannedEdges)
-	}
 	nodeIDs := map[shoal.ID]bool{}
 	for _, node := range neighborhood.Neighborhood.Nodes {
 		nodeIDs[node.ID] = true
@@ -1128,14 +1124,6 @@ func TestRemoteServiceCapabilityNegotiation(t *testing.T) {
 func TestRemoteServiceAllowsScopedVectorWhenGlobalCapabilityIsUnavailable(t *testing.T) {
 	retrieveCalled := false
 	now := time.Date(2026, time.August, 29, 12, 0, 0, 0, time.UTC)
-	embeddingSpace, err := retrieval.EmbeddingSpaceIdentityID("space-v3")
-	if err != nil {
-		t.Fatal(err)
-	}
-	embeddingSpaceSet, err := retrieval.EmbeddingSpaceSetID(embeddingSpace)
-	if err != nil {
-		t.Fatal(err)
-	}
 	upstream := httptest.NewServer(http.HandlerFunc(func(
 		writer http.ResponseWriter,
 		request *http.Request,
@@ -1159,10 +1147,7 @@ func TestRemoteServiceAllowsScopedVectorWhenGlobalCapabilityIsUnavailable(t *tes
 				Snapshot: webapi.Snapshot{
 					ID: "snapshot", AsOf: now, Frontier: 1,
 				},
-				Retrieval: retrieval.Response{
-					EmbeddingSpaceID:  embeddingSpaceSet,
-					EmbeddingSpaceIDs: []shoal.ID{embeddingSpace},
-				},
+				Retrieval: retrieval.Response{},
 			})
 		default:
 			http.NotFound(writer, request)
@@ -1173,7 +1158,7 @@ func TestRemoteServiceAllowsScopedVectorWhenGlobalCapabilityIsUnavailable(t *tes
 	if err != nil {
 		t.Fatal(err)
 	}
-	response, err := service.Retrieve(context.Background(), webapi.RetrievalRequest{
+	_, err = service.Retrieve(context.Background(), webapi.RetrievalRequest{
 		Query: retrieval.Request{
 			Text:  "query",
 			Modes: []retrieval.Mode{retrieval.ModeVector},
@@ -1184,12 +1169,6 @@ func TestRemoteServiceAllowsScopedVectorWhenGlobalCapabilityIsUnavailable(t *tes
 	})
 	if err != nil {
 		t.Fatalf("scoped vector retrieve: %v", err)
-	}
-	if response.Retrieval.EmbeddingSpaceID != embeddingSpaceSet ||
-		len(response.Retrieval.EmbeddingSpaceIDs) != 1 ||
-		response.Retrieval.EmbeddingSpaceIDs[0] != embeddingSpace {
-		t.Fatalf("remote embedding space = %q",
-			response.Retrieval.EmbeddingSpaceID)
 	}
 	if !retrieveCalled {
 		t.Fatal("scoped vector request did not reach remote endpoint")

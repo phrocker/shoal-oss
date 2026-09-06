@@ -740,12 +740,8 @@ func (r NeighborhoodResponse) MarshalJSON() ([]byte, error) {
 		OntologyInterpretations []OntologyInterpretationReport `json:"ontology_interpretations,omitempty"`
 		Truncated               bool                           `json:"truncated"`
 		NextCursor              string                         `json:"next_cursor,omitempty"`
-	}{
-		Snapshot:                r.Snapshot,
-		Neighborhood:            wireNeighborhoodValue(r.Neighborhood),
-		OntologyInterpretations: r.OntologyInterpretations,
-		Truncated:               r.Truncated, NextCursor: r.NextCursor,
-	})
+	}{r.Snapshot, wireNeighborhoodValue(r.Neighborhood), r.OntologyInterpretations,
+		r.Truncated, r.NextCursor})
 }
 
 func (r *NeighborhoodResponse) UnmarshalJSON(data []byte) error {

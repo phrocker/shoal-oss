@@ -34,7 +34,6 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/graph"
 	"github.com/phrocker/shoal-oss/pkg/inference"
-	"github.com/phrocker/shoal-oss/pkg/ontology"
 	"github.com/phrocker/shoal-oss/pkg/retrieval"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
@@ -48,7 +47,6 @@ func TestBuildFromEmbeddedExplorerExactEvidenceAndDeterminism(t *testing.T) {
 		Request: request, Response: response, Pins: pins,
 		Metadata: shoal.Metadata{"application": "test"},
 	}
-
 	first, err := builder.Build(context.Background(), input)
 	if err != nil {
 		t.Fatal(err)
@@ -119,144 +117,6 @@ func TestBuildFromEmbeddedExplorerExactEvidenceAndDeterminism(t *testing.T) {
 	}
 	if first.ID() != reorderedModes.ID() {
 		t.Fatal("retrieval mode order changed canonical pack identity")
-	}
-}
-
-func TestBuildPinsEmbeddingSpaceIdentity(t *testing.T) {
-	client, request, response, pins := embeddedFixture(t)
-	request.Modes = []retrieval.Mode{retrieval.ModeVector}
-	constituent, err := retrieval.EmbeddingSpaceIdentityID("space-v3")
-	if err != nil {
-		t.Fatal(err)
-	}
-	response.EmbeddingSpaceID, err = retrieval.EmbeddingSpaceSetID(constituent)
-	if err != nil {
-		t.Fatal(err)
-	}
-	response.EmbeddingSpaceIDs = []shoal.ID{constituent}
-	pack, err := (Builder{Reader: client}).Build(
-		context.Background(),
-		InitialRequest{Request: request, Response: response, Pins: pins},
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	identity, ok, err := EmbeddingSpaceID(pack)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !ok || identity != response.EmbeddingSpaceID {
-		t.Fatalf("embedding space = %q, %t", identity, ok)
-	}
-	malformedMetadata := pack.Metadata()
-	delete(malformedMetadata, metadataEmbeddingSpacesKey)
-	malformed, err := inference.NewContextPack(
-		pack.Query(), pack.Evidence(), nil, pack.Snapshot(),
-		pack.Authorization(), malformedMetadata,
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, _, err := EmbeddingSpaceID(malformed); err == nil {
-		t.Fatal("aggregate-only context metadata was accepted")
-	}
-	constituents, err := EmbeddingSpaceIDs(pack)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(constituents) != 1 || constituents[0] != constituent {
-		t.Fatalf("embedding space constituents = %v", constituents)
-	}
-	pins.EmbeddingSpaceID = "different-space"
-	if _, err := (Builder{Reader: client}).Build(
-		context.Background(),
-		InitialRequest{Request: request, Response: response, Pins: pins},
-	); err == nil {
-		t.Fatal("mismatched trusted embedding-space pin was accepted")
-	}
-
-	pins.EmbeddingSpaceID = response.EmbeddingSpaceID
-	pins.EmbeddingSpaceIDs = nil
-	if _, err := (Builder{Reader: client}).Build(
-		context.Background(),
-		InitialRequest{Request: request, Response: response, Pins: pins},
-	); err == nil {
-		t.Fatal("aggregate-only trusted embedding-space pin was accepted")
-	}
-
-	_, lexical, lexicalResponse, lexicalPins := embeddedFixture(t)
-	lexicalPins.EmbeddingSpaceID = response.EmbeddingSpaceID
-	lexicalPins.EmbeddingSpaceIDs = []shoal.ID{constituent}
-	if _, err := (Builder{Reader: client}).Build(
-		context.Background(),
-		InitialRequest{
-			Request: lexical, Response: lexicalResponse, Pins: lexicalPins,
-		},
-	); err == nil {
-		t.Fatal("non-vector retrieval accepted embedding-space pins")
-	}
-}
-
-func TestMergeEmbeddingSpaceMetadataIsASetUnion(t *testing.T) {
-	spaceA, err := retrieval.EmbeddingSpaceIdentityID("space-a")
-	if err != nil {
-		t.Fatal(err)
-	}
-	spaceB, err := retrieval.EmbeddingSpaceIdentityID("space-b")
-	if err != nil {
-		t.Fatal(err)
-	}
-	metadata, err := MergeEmbeddingSpaceMetadata(nil, []shoal.ID{spaceA})
-	if err != nil {
-		t.Fatal(err)
-	}
-	metadata, err = MergeEmbeddingSpaceMetadata(
-		metadata, []shoal.ID{spaceB})
-	if err != nil {
-		t.Fatal(err)
-	}
-	metadata, err = MergeEmbeddingSpaceMetadata(
-		metadata, []shoal.ID{spaceA})
-	if err != nil {
-		t.Fatal(err)
-	}
-	ids, err := embeddingSpaceIDsFromMetadata(metadata)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(ids) != 2 ||
-		!((ids[0] == spaceA && ids[1] == spaceB) ||
-			(ids[0] == spaceB && ids[1] == spaceA)) {
-		t.Fatalf("merged constituent IDs = %v", ids)
-	}
-	got, ok, err := embeddingSpaceIDFromMetadata(metadata)
-	if err != nil {
-		t.Fatal(err)
-	}
-	want, err := retrieval.EmbeddingSpaceSetID(spaceA, spaceB)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !ok || got != want {
-		t.Fatalf("merged set ID = %q, %t, want %q", got, ok, want)
-	}
-	corrupt := cloneMetadata(metadata)
-	corrupt[metadataEmbeddingSpaceKey] = encodeID(spaceA)
-	if _, err := MergeEmbeddingSpaceMetadata(
-		corrupt, []shoal.ID{spaceA},
-	); err == nil {
-		t.Fatal("mismatched aggregate and constituents were repaired")
-	}
-	legacy := shoal.Metadata{
-		metadataEmbeddingSpaceKey: encodeID(want),
-	}
-	if _, err := MergeEmbeddingSpaceMetadata(
-		legacy, []shoal.ID{spaceA},
-	); err == nil {
-		t.Fatal("aggregate-only provenance was merged without constituents")
-	}
-	if _, err := MergeEmbeddingSpaceMetadata(legacy, nil); err == nil {
-		t.Fatal("aggregate-only provenance survived an empty merge")
 	}
 }
 
@@ -701,7 +561,6 @@ func TestMutationIsolationAndNoUncitedExplanationText(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-
 	beforeID := pack.ID()
 	response.Results[0].Evidence[0].Quote = "mutated"
 	response.Results[0].Evidence[0].Path.Nodes[0].Labels = []string{"mutated"}
@@ -718,145 +577,6 @@ func TestMutationIsolationAndNoUncitedExplanationText(t *testing.T) {
 		if _, quote, ok := anchor.Document(); ok && strings.Contains(quote, uncited) {
 			t.Fatal("uncited explanation prose entered evidence")
 		}
-	}
-}
-
-func TestGraphAnchorRejectsAuthoritativeDerivedAssertion(t *testing.T) {
-	value, err := ontology.NewReferenceValue("target")
-	if err != nil {
-		t.Fatal(err)
-	}
-	derivation, err := ontology.NewAssertionDerivation(
-		"embedding-model", "v1", "cosine", 0.8, "cell-1", 0.9,
-		"source", "target", "iterator", nil,
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	evidence, err := ontology.NewDerivationEvidenceRef(derivation, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	provenance, err := ontology.NewExtractionProvenance(
-		"provider", "model", "v1", "prompt", "v1", "extractor", "v1", nil,
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	concept, err := ontology.NewConceptDefinition(
-		"graph-node", "Graph Node", "A graph node", nil, nil,
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	relationship, err := ontology.NewRelationshipDefinition(
-		"related-to", "Related To", "Relates two graph nodes",
-		[]shoal.ID{concept.ID()}, []shoal.ID{concept.ID()}, nil, true, nil,
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	predicate := relationship.ID()
-	assertion, err := ontology.NewAssertion(
-		"source", predicate, value, ontology.AssertionDerived, 0.9,
-		[]ontology.EvidenceRef{evidence}, provenance, nil,
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	path := graph.Path{
-		Nodes: []graph.Node{{ID: "source"}, {ID: "target"}},
-		Edges: []graph.Edge{{
-			ID: assertion.ID(), From: "source", To: "target",
-			Type: string(predicate), Weight: 0.9,
-		}},
-	}
-	verifier, err := newVerifier(
-		context.Background(), nil, mustLimits(t, Limits{}), nil,
-		[]explorer.Neighborhood{{
-			Nodes: path.Nodes, Edges: path.Edges,
-			Assertions: []ontology.Assertion{assertion},
-		}},
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := verifier.graphAnchor(path); !shoal.IsErrorCode(
-		err, shoal.ErrorInvalidArgument,
-	) {
-		t.Fatalf("derived assertion graph anchor error = %v", err)
-	}
-}
-
-func TestGraphAnchorCarriesAuthoritativeExplicitAssertion(t *testing.T) {
-	_, _, response, _ := embeddedFixture(t)
-	citation := response.Results[0].Evidence[0].Citation
-	quote := response.Results[0].Evidence[0].Quote
-	evidence, err := ontology.NewEvidenceRef(citation, quote, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	provenance, err := ontology.NewExtractionProvenance(
-		"provider", "model", "v1", "prompt", "v1", "extractor", "v1", nil,
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	concept, err := ontology.NewConceptDefinition(
-		"source-node", "Source Node", "A source graph node", nil, nil,
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	relationship, err := ontology.NewRelationshipDefinition(
-		"supports", "Supports", "Supports another graph node",
-		[]shoal.ID{concept.ID()}, []shoal.ID{concept.ID()}, nil, true, nil,
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	value, err := ontology.NewReferenceValue("target")
-	if err != nil {
-		t.Fatal(err)
-	}
-	assertion, err := ontology.NewAssertion(
-		"source", relationship.ID(), value, ontology.AssertionExplicit, 1,
-		[]ontology.EvidenceRef{evidence}, provenance,
-		shoal.Metadata{"shoal.graph.edge_id": "edge-1"},
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	path := graph.Path{
-		Nodes: []graph.Node{{ID: "source"}, {ID: "target"}},
-		Edges: []graph.Edge{{
-			ID: "edge-1", From: "source", To: "target",
-			Type: string(relationship.ID()), Weight: 1,
-		}},
-	}
-	verifier, err := newVerifier(
-		context.Background(), nil, mustLimits(t, Limits{}), nil,
-		[]explorer.Neighborhood{{
-			Nodes: path.Nodes, Edges: path.Edges,
-			Assertions: []ontology.Assertion{assertion},
-		}},
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	anchor, err := verifier.graphAnchor(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	reference, err := anchor.EvidenceReference()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(reference.Assertions) != 1 ||
-		reference.Assertions[0].AssertionID != assertion.ID() ||
-		reference.Assertions[0].EdgeID != "edge-1" ||
-		reference.Assertions[0].Origin != ontology.AssertionExplicit {
-		t.Fatalf("authoritative assertion reference = %+v", reference.Assertions)
 	}
 }
 

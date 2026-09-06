@@ -175,7 +175,7 @@ func TestAnalyticsRecorderReauthorizesExtractedRelationshipEvidence(t *testing.T
 	}
 	if len(recorded.Turns) != 1 || recorded.Turns[0].ToolCall == nil ||
 		len(recorded.Turns[0].ToolCall.RetrievedEvidence) == 0 ||
-		len(recorded.Turns[0].ToolCall.RetrievedEvidence[0].EdgeIDs) == 0 {
+		len(recorded.TouchedEdgeIDs()) == 0 {
 		t.Fatalf("recorded extracted evidence = %+v", recorded)
 	}
 	if len(recorded.TouchedEdgeIDs()) != int(result.Scope.EdgeCount) {

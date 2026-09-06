@@ -96,8 +96,6 @@ func cloneGraphNode(node graph.Node) graph.Node {
 }
 
 func cloneRetrievalResponse(response retrieval.Response) retrieval.Response {
-	response.EmbeddingSpaceIDs = append(
-		[]shoal.ID(nil), response.EmbeddingSpaceIDs...)
 	response.Results = append([]retrieval.Result(nil), response.Results...)
 	for resultIndex := range response.Results {
 		result := &response.Results[resultIndex]

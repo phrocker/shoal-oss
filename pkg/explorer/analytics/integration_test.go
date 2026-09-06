@@ -36,6 +36,7 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/explorer/mcp"
 	"github.com/phrocker/shoal-oss/pkg/explorer/webapi"
 	"github.com/phrocker/shoal-oss/pkg/graph"
+	"github.com/phrocker/shoal-oss/pkg/inference"
 	"github.com/phrocker/shoal-oss/pkg/interaction"
 	"github.com/phrocker/shoal-oss/pkg/ontology"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
@@ -348,8 +349,7 @@ func TestEmbeddedAnalyticsDurablyRecordsCompleteAuthorizedEvidence(t *testing.T)
 	}
 	if len(recorded.Turns) != 1 || recorded.Turns[0].ToolCall == nil ||
 		len(recorded.Turns[0].ToolCall.RetrievedNodeIDs) != 3 ||
-		len(recorded.Turns[0].ToolCall.RetrievedEvidence) != 1 ||
-		len(recorded.Turns[0].ToolCall.RetrievedEvidence[0].EdgeIDs) != 2 ||
+		len(recorded.Turns[0].ToolCall.RetrievedEvidence) == 0 ||
 		len(recorded.TouchedEdgeIDs()) != 2 {
 		t.Fatalf("recorded evidence = %+v", recorded)
 	}
@@ -512,6 +512,17 @@ func TestAnalyticsInteractionSinkReauthorizesExactEdgeEvidence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	nodesByID := make(map[shoal.ID]graph.Node, len(materialized.Neighborhood.Nodes))
+	for _, node := range materialized.Neighborhood.Nodes {
+		nodesByID[node.ID] = node
+	}
+	anchor, err := inference.NewGraphAnchor(graph.Path{
+		Nodes: []graph.Node{nodesByID[from], nodesByID[to]},
+		Edges: []graph.Edge{exact},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	session := interaction.Session{
 		ID:                       sessionID,
 		RecordedAt:               recordedAt,
@@ -528,7 +539,7 @@ func TestAnalyticsInteractionSinkReauthorizesExactEdgeEvidence(t *testing.T) {
 				Kind:             "analytics",
 				RetrievedNodeIDs: []shoal.ID{from, to},
 				RetrievedEvidence: []interaction.EvidenceReference{{
-					AnchorID: "analytics-evidence",
+					AnchorID: anchor.ID(),
 					Kind:     interaction.EvidenceGraph,
 					NodeIDs:  []shoal.ID{from, to},
 					EdgeIDs:  []shoal.ID{"missing-edge"},

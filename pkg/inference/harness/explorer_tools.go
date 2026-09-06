@@ -188,12 +188,9 @@ func (h *ExplorerToolHost) Retrieve(
 		return ToolResult{}, err
 	}
 	if len(response.Results) == 0 {
-		return NewToolResultWithEmbeddingSpaces(
+		return NewToolResult(
 			call.CorrelationID(), ActionRetrieve, nil,
-			call.Snapshot(), call.Authorization(),
-			response.EmbeddingSpaceID,
-			response.EmbeddingSpaceIDs,
-		)
+			call.Snapshot(), call.Authorization())
 	}
 	neighborhoods, err := neighborhoodsFromRetrievalResponse(response)
 	if err != nil {
@@ -219,12 +216,9 @@ func (h *ExplorerToolHost) Retrieve(
 	if err := h.validateAuthorization(ctx, call); err != nil {
 		return ToolResult{}, err
 	}
-	return NewToolResultWithEmbeddingSpaces(
+	return NewToolResult(
 		call.CorrelationID(), ActionRetrieve, pack.Evidence(),
-		call.Snapshot(), call.Authorization(),
-		response.EmbeddingSpaceID,
-		response.EmbeddingSpaceIDs,
-	)
+		call.Snapshot(), call.Authorization())
 }
 
 func (h *ExplorerToolHost) OpenSection(

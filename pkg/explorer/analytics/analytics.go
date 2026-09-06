@@ -583,8 +583,13 @@ func (s *Service) Run(ctx context.Context, request Request) (Result, error) {
 			Limits:          s.limits,
 		})
 		if err != nil {
-			return Result{}, shoal.WrapError(
+			wrapped := shoal.WrapError(
 				shoal.ErrorUnavailable, "record analytics result", err)
+			if explorer.IsCommittedInteraction(err) ||
+				explorer.IsIndeterminateCommit(err) {
+				return Result{}, explorer.MarkIndeterminateCommit(wrapped)
+			}
+			return Result{}, wrapped
 		}
 		if err := shoal.ValidateRequiredID(
 			"analytics interaction ID", receipt.InteractionID,

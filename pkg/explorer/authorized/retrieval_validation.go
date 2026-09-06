@@ -710,8 +710,7 @@ func graphNodesEqual(left, right graph.Node) bool {
 		}
 	}
 	for key, value := range left.Properties {
-		other, ok := right.Properties[key]
-		if !ok || other != value {
+		if right.Properties[key] != value {
 			return false
 		}
 	}

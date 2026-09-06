@@ -81,14 +81,10 @@ func (s operationInteractionSink) EnsureInteractionSink(
 	if err != nil {
 		return err
 	}
-	_, guard, _, err := s.client.begin(ctx, s.operation)
-	if err != nil {
-		return err
-	}
 	if err := writer.EnsureInteractionSink(ctx); err != nil {
 		return directBaseError(err)
 	}
-	return guard.Check(ctx)
+	return nil
 }
 
 func (s operationInteractionSink) RecordInteraction(
@@ -172,14 +168,16 @@ func (c *Client) recordInteraction(
 	if err != nil {
 		return interaction.Session{}, err
 	}
+	evidenceOperation := auth.OperationRetrieve
+	if authorizationOperation == auth.OperationAnalyticsRead {
+		evidenceOperation = authorizationOperation
+	}
 	if err := c.authorizeInteractionEvidence(
 		ctx,
 		canonical.TouchedNodeIDs(),
 		canonical.TouchedEdgeIDs(),
 		decision,
-		// Evidence access remains retrieval authorization even when the
-		// enclosing privileged action has a different exact operation.
-		auth.OperationRetrieve,
+		evidenceOperation,
 		now,
 	); err != nil {
 		return interaction.Session{}, err

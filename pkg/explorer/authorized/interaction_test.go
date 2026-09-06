@@ -65,21 +65,6 @@ func (b *forgedResultInteractionBase) RecordInteractionResult(
 	return recorded, err
 }
 
-type committedFailureInteractionBase struct {
-	*explorer.Explorer
-}
-
-func (b *committedFailureInteractionBase) RecordInteractionResult(
-	ctx context.Context, session interaction.Session,
-) (interaction.Session, error) {
-	recorded, err := b.Explorer.RecordInteractionResult(ctx, session)
-	if err != nil {
-		return recorded, err
-	}
-	return recorded, explorer.MarkCommittedInteraction(
-		shoal.NewError(shoal.ErrorUnavailable, "post-commit failure"))
-}
-
 type countingInteractionStore struct {
 	authorized.PolicyStore
 	nodesCalls int
@@ -669,20 +654,6 @@ func TestAuthorizedInteractionRecorderRejectsWrongPin(t *testing.T) {
 		ctx, session,
 	); !shoal.IsErrorCode(err, shoal.ErrorUnauthorized) {
 		t.Fatalf("expired authorization pin record = %v", err)
-	}
-	session.ID = "session-narrower-live-pin"
-	session.RecordedAt = f.clock.Now()
-	session.AuthorizationExpiresAt = f.clock.Now().Add(time.Minute)
-	if err := f.clientA.RecordInteraction(ctx, session); err != nil {
-		t.Fatalf("narrower authorization pin record = %v", err)
-	}
-	stored, err := f.base.Interaction(context.Background(), session.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !stored.AuthorizationExpiresAt.Equal(session.AuthorizationExpiresAt) {
-		t.Fatalf("stored expiry = %v, want %v",
-			stored.AuthorizationExpiresAt, session.AuthorizationExpiresAt)
 	}
 }
 

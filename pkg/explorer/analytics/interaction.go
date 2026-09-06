@@ -28,6 +28,7 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/graph"
+	"github.com/phrocker/shoal-oss/pkg/inference"
 	"github.com/phrocker/shoal-oss/pkg/interaction"
 	"github.com/phrocker/shoal-oss/pkg/ontology"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
@@ -142,8 +143,8 @@ func (r *InteractionRecorder) RecordAnalytics(
 		return RecordingReceipt{}, err
 	}
 	resultID := analyticsResultID(record.Result)
-	evidence, err := analyticsEvidenceReference(
-		resultID, nodeIDs, edges, neighborhood.Assertions)
+	evidence, err := analyticsEvidenceReferences(
+		neighborhood.Nodes, edges, neighborhood.Assertions)
 	if err != nil {
 		return RecordingReceipt{}, err
 	}
@@ -167,7 +168,7 @@ func (r *InteractionRecorder) RecordAnalytics(
 			ToolCall: &interaction.ToolCall{
 				Kind:              analyticsToolKind,
 				RetrievedNodeIDs:  nodeIDs,
-				RetrievedEvidence: []interaction.EvidenceReference{evidence},
+				RetrievedEvidence: evidence,
 			},
 		}},
 		Provenance: interaction.Provenance{
@@ -191,10 +192,10 @@ func (r *InteractionRecorder) RecordAnalytics(
 		!equalIDs(persisted.TouchedNodeIDs(), nodeIDs) ||
 		!equalIDs(persisted.TouchedEdgeIDs(), edgeIDs(edges)) ||
 		!equalAssertionReferences(
-			persisted.TouchedAssertions(), evidence.Assertions) ||
+			persisted.TouchedAssertions(), evidenceAssertions(evidence)) ||
 		!equalEvidenceReferences(
 			recordedEvidenceReferences(persisted),
-			[]interaction.EvidenceReference{evidence}) {
+			evidence) {
 		return RecordingReceipt{}, explorer.MarkIndeterminateCommit(
 			shoal.NewError(
 				shoal.ErrorInternal,
@@ -244,27 +245,90 @@ func validateAnalyticsEvidenceBytes(
 	return nil
 }
 
-func analyticsEvidenceReference(
-	anchorID shoal.ID,
-	nodeIDs []shoal.ID,
+func analyticsEvidenceReferences(
+	nodes []graph.Node,
 	edges []graph.Edge,
 	assertions []ontology.Assertion,
-) (interaction.EvidenceReference, error) {
-	references := make([]interaction.AssertionReference, 0, len(assertions))
+) ([]interaction.EvidenceReference, error) {
+	nodesByID := make(map[shoal.ID]graph.Node, len(nodes))
+	for _, node := range nodes {
+		nodesByID[node.ID] = node
+	}
+	assertionsByEdge := make(
+		map[shoal.ID][]interaction.AssertionReference, len(assertions))
 	for _, assertion := range assertions {
 		reference, err := InteractionAssertionEvidence(assertion)
 		if err != nil {
-			return interaction.EvidenceReference{}, err
+			return nil, err
 		}
-		references = append(references, reference)
+		assertionsByEdge[reference.EdgeID] = append(
+			assertionsByEdge[reference.EdgeID], reference)
 	}
-	return (interaction.EvidenceReference{
-		AnchorID:   anchorID,
-		Kind:       interaction.EvidenceGraph,
-		NodeIDs:    append([]shoal.ID(nil), nodeIDs...),
-		EdgeIDs:    edgeIDs(edges),
-		Assertions: references,
-	}).Canonical()
+	references := make([]interaction.EvidenceReference, 0, len(nodes)+len(edges))
+	for _, node := range nodes {
+		anchor, err := inference.NewGraphAnchorWithAssertions(
+			graph.Path{Nodes: []graph.Node{node}}, nil)
+		if err != nil {
+			return nil, err
+		}
+		references = append(references, interaction.EvidenceReference{
+			AnchorID: anchor.ID(), Kind: interaction.EvidenceGraph,
+			NodeIDs: []shoal.ID{node.ID},
+		})
+	}
+	for _, edge := range edges {
+		from, fromOK := nodesByID[edge.From]
+		to, toOK := nodesByID[edge.To]
+		if !fromOK || !toOK {
+			return nil, shoal.NewError(
+				shoal.ErrorInternal,
+				"analytics edge endpoint is absent from exact node evidence")
+		}
+		edgeAssertions := assertionsByEdge[edge.ID]
+		anchor, err := inference.NewGraphAnchorWithAssertions(
+			graph.Path{
+				Nodes: []graph.Node{from, to},
+				Edges: []graph.Edge{edge},
+			},
+			edgeAssertions,
+		)
+		if err != nil {
+			return nil, err
+		}
+		references = append(references, interaction.EvidenceReference{
+			AnchorID: anchor.ID(), Kind: interaction.EvidenceGraph,
+			NodeIDs: []shoal.ID{edge.From, edge.To},
+			EdgeIDs: []shoal.ID{edge.ID}, Assertions: edgeAssertions,
+		})
+		delete(assertionsByEdge, edge.ID)
+	}
+	if len(assertionsByEdge) != 0 {
+		return nil, shoal.NewError(
+			shoal.ErrorInternal,
+			"analytics assertion is not bound to returned edge evidence")
+	}
+	sort.Slice(references, func(i, j int) bool {
+		return shoal.CompareID(references[i].AnchorID, references[j].AnchorID) < 0
+	})
+	return references, nil
+}
+
+func evidenceAssertions(
+	references []interaction.EvidenceReference,
+) []interaction.AssertionReference {
+	var assertions []interaction.AssertionReference
+	for _, reference := range references {
+		assertions = append(assertions, reference.Assertions...)
+	}
+	sort.Slice(assertions, func(i, j int) bool {
+		if compared := shoal.CompareID(
+			assertions[i].EdgeID, assertions[j].EdgeID); compared != 0 {
+			return compared < 0
+		}
+		return shoal.CompareID(
+			assertions[i].AssertionID, assertions[j].AssertionID) < 0
+	})
+	return assertions
 }
 
 // InteractionAssertionEvidence projects an ontology assertion into the exact
