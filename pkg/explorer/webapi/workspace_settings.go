@@ -64,6 +64,30 @@ type WorkspaceSettingsProvider interface {
 	) (workspace.EffectiveDecision, error)
 }
 
+// WorkspaceSettingsHTTPConfig configures the independently mountable settings
+// management handler.
+type WorkspaceSettingsHTTPConfig struct {
+	Provider WorkspaceSettingsProvider
+}
+
+// NewWorkspaceSettingsHTTPHandler constructs the settings management subtree.
+// The returned handler performs authorization through Provider but must be
+// mounted behind the host's existing authentication and host/origin gates.
+func NewWorkspaceSettingsHTTPHandler(
+	config WorkspaceSettingsHTTPConfig,
+) (http.Handler, error) {
+	if isAbsentInterface(config.Provider) {
+		return nil, shoal.NewError(
+			shoal.ErrorInvalidArgument, "workspace settings provider is required")
+	}
+	routes := &Handler{
+		mux:               http.NewServeMux(),
+		workspaceSettings: config.Provider,
+	}
+	routes.registerWorkspaceSettingsRoutes()
+	return routes.mux, nil
+}
+
 type effectiveWorkspaceSettingsContextKey struct{}
 
 // EffectiveWorkspaceSettings returns the authenticated workspace settings
@@ -88,10 +112,11 @@ func (w workspaceResponseWriter) Unwrap() http.ResponseWriter {
 	return w.ResponseWriter
 }
 
-// SetWorkspaceSettingsProvider enables the settings routes on a constructed
-// handler. Authentication and host-authority checks remain centralized in
-// ServeHTTP.
-func (h *Handler) SetWorkspaceSettingsProvider(
+// ConfigureWorkspaceSettings enables effective-decision application without
+// registering management routes. It is intended for hosts that mount the
+// handler returned by NewWorkspaceSettingsHTTPHandler through their existing
+// authenticated routing seam.
+func (h *Handler) ConfigureWorkspaceSettings(
 	provider WorkspaceSettingsProvider,
 ) error {
 	if h == nil {
@@ -108,8 +133,39 @@ func (h *Handler) SetWorkspaceSettingsProvider(
 			"workspace settings require an authenticated handler",
 		)
 	}
+	if h.workspaceSettingsMounted {
+		return shoal.NewError(
+			shoal.ErrorConflict, "workspace settings routes are already mounted")
+	}
 	h.workspaceSettings = provider
 	return nil
+}
+
+// MountWorkspaceSettings configures effective-decision application and mounts
+// the settings management subtree behind this Handler's existing gates.
+func (h *Handler) MountWorkspaceSettings(
+	config WorkspaceSettingsHTTPConfig,
+) error {
+	if err := h.ConfigureWorkspaceSettings(config.Provider); err != nil {
+		return err
+	}
+	settingsHandler, err := NewWorkspaceSettingsHTTPHandler(config)
+	if err != nil {
+		return err
+	}
+	h.mux.Handle("GET /api/v1/workspaces/", settingsHandler)
+	h.mux.Handle("PUT /api/v1/workspaces/", settingsHandler)
+	h.workspaceSettingsMounted = true
+	return nil
+}
+
+// SetWorkspaceSettingsProvider preserves the original one-call integration
+// surface and delegates to MountWorkspaceSettings.
+func (h *Handler) SetWorkspaceSettingsProvider(
+	provider WorkspaceSettingsProvider,
+) error {
+	return h.MountWorkspaceSettings(
+		WorkspaceSettingsHTTPConfig{Provider: provider})
 }
 
 func (h *Handler) applyWorkspaceSettings(

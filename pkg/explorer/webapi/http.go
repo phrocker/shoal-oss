@@ -51,13 +51,14 @@ var staticFiles embed.FS
 
 // Handler exposes only the logical Explorer API and static workspace assets.
 type Handler struct {
-	service           Service
-	mux               *http.ServeMux
-	authority         hostAuthority
-	authenticator     Authenticator
-	binder            auth.Binder
-	browserAuth       *BrowserAuthConfig
-	workspaceSettings WorkspaceSettingsProvider
+	service                  Service
+	mux                      *http.ServeMux
+	authority                hostAuthority
+	authenticator            Authenticator
+	binder                   auth.Binder
+	browserAuth              *BrowserAuthConfig
+	workspaceSettings        WorkspaceSettingsProvider
+	workspaceSettingsMounted bool
 }
 
 // NewHandler constructs the standard HTTP transport without caller identity.
@@ -237,7 +238,6 @@ func (h *Handler) routes() {
 	h.mux.HandleFunc("POST /api/v1/neighborhood", endpoint(h.service.Neighborhood))
 	h.mux.HandleFunc("POST /api/v1/path", endpoint(h.service.Path))
 	h.mux.HandleFunc("POST /api/v1/analytics", analyticsEndpoint(h.service))
-	h.registerWorkspaceSettingsRoutes()
 
 	content, _ := fs.Sub(staticFiles, "static")
 	h.mux.Handle("GET /assets/", http.StripPrefix("/assets/", http.FileServer(http.FS(content))))
@@ -533,7 +533,7 @@ func writeError(writer http.ResponseWriter, err error) {
 		Code          shoal.ErrorCode           `json:"code"`
 		Message       string                    `json:"message"`
 		Embedding     *wireEmbeddingQueryReport `json:"embedding,omitempty"`
-		Indeterminate bool                       `json:"indeterminate,omitempty"`
+		Indeterminate bool                      `json:"indeterminate,omitempty"`
 	}{
 		Code: code, Message: err.Error(),
 		Embedding: embedding, Indeterminate: indeterminate,
