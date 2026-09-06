@@ -46,5 +46,6 @@ selection are intentionally tracked separately and are not claimed here.
   of `AuthorizationFingerprint` and `CacheKey`.
 - `explorer.OntologyInterpreter.InterpretAssertions` applies published
   morphisms after authorization filtering.
-- `webapi.NeighborhoodResponse.OntologyInterpretations` exposes effective and
-  original identities, safety-path IDs, and unresolved reasons.
+- `webapi.NeighborhoodResponse.OntologyInterpretations` and
+  `webapi.PathResponse.OntologyInterpretations` expose effective and original
+  identities, safety-path IDs, and unresolved reasons.

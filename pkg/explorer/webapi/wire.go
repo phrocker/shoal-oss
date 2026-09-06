@@ -655,17 +655,19 @@ func (r PathResponse) MarshalJSON() ([]byte, error) {
 		assertions = append(assertions, wireAssertionValue(assertion))
 	}
 	return json.Marshal(struct {
-		Snapshot   Snapshot        `json:"snapshot"`
-		Path       wirePath        `json:"path"`
-		Assertions []wireAssertion `json:"assertions,omitempty"`
-	}{r.Snapshot, wirePathValue(r.Path), assertions})
+		Snapshot                Snapshot                       `json:"snapshot"`
+		Path                    wirePath                       `json:"path"`
+		Assertions              []wireAssertion                `json:"assertions,omitempty"`
+		OntologyInterpretations []OntologyInterpretationReport `json:"ontology_interpretations,omitempty"`
+	}{r.Snapshot, wirePathValue(r.Path), assertions, r.OntologyInterpretations})
 }
 
 func (r *PathResponse) UnmarshalJSON(data []byte) error {
 	var wire struct {
-		Snapshot   Snapshot        `json:"snapshot"`
-		Path       wirePath        `json:"path"`
-		Assertions []wireAssertion `json:"assertions,omitempty"`
+		Snapshot                Snapshot                       `json:"snapshot"`
+		Path                    wirePath                       `json:"path"`
+		Assertions              []wireAssertion                `json:"assertions,omitempty"`
+		OntologyInterpretations []OntologyInterpretationReport `json:"ontology_interpretations,omitempty"`
 	}
 	if err := strictUnmarshal(data, &wire); err != nil {
 		return err
@@ -684,6 +686,7 @@ func (r *PathResponse) UnmarshalJSON(data []byte) error {
 	}
 	*r = PathResponse{
 		Snapshot: wire.Snapshot, Path: path, Assertions: assertions,
+		OntologyInterpretations: wire.OntologyInterpretations,
 	}
 	return nil
 }

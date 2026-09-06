@@ -780,10 +780,34 @@ func (s *EmbeddedService) Path(
 	if err := s.confirmSnapshot(ctx, snapshot); err != nil {
 		return PathResponse{}, err
 	}
+	assertions := assertionsForPath(path, bounded.Neighborhood.Assertions)
 	return PathResponse{
 		Snapshot: snapshot, Path: path,
-		Assertions: assertionsForPath(path, bounded.Neighborhood.Assertions),
+		Assertions: assertions,
+		OntologyInterpretations: ontologyInterpretationReports(
+			interpretationsForAssertions(
+				assertions, bounded.Neighborhood.Interpretations)),
 	}, nil
+}
+
+func interpretationsForAssertions(
+	assertions []ontology.Assertion,
+	interpretations []ontology.AssertionInterpretation,
+) []ontology.AssertionInterpretation {
+	if len(assertions) == 0 || len(interpretations) == 0 {
+		return nil
+	}
+	selected := make(map[shoal.ID]struct{}, len(assertions))
+	for _, assertion := range assertions {
+		selected[assertion.ID()] = struct{}{}
+	}
+	out := make([]ontology.AssertionInterpretation, 0, len(assertions))
+	for _, interpretation := range interpretations {
+		if _, ok := selected[interpretation.Original().ID()]; ok {
+			out = append(out, interpretation)
+		}
+	}
+	return out
 }
 
 func (s *EmbeddedService) pin(

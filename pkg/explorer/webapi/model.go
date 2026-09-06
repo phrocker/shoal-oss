@@ -237,9 +237,10 @@ type PathRequest struct {
 
 // PathResponse contains the selected explanation path.
 type PathResponse struct {
-	Snapshot   Snapshot             `json:"snapshot"`
-	Path       graph.Path           `json:"path"`
-	Assertions []ontology.Assertion `json:"assertions,omitempty"`
+	Snapshot                Snapshot                       `json:"snapshot"`
+	Path                    graph.Path                     `json:"path"`
+	Assertions              []ontology.Assertion           `json:"assertions,omitempty"`
+	OntologyInterpretations []OntologyInterpretationReport `json:"ontology_interpretations,omitempty"`
 }
 
 // UploadFile carries one bounded, untrusted browser file after HTTP parsing.
