@@ -29,42 +29,23 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
-// GovernedOntologyProposalSource exposes durable proposal history without
-// routing through the generic graph-read authorization path.
-type GovernedOntologyProposalSource interface {
-	OntologyProposals(context.Context) ([]ontology.GovernedProposal, error)
-}
-
 // GovernedOntologyChoices adapts the live RDO publication state to the
 // workspace settings eligibility contract.
 type GovernedOntologyChoices struct {
-	configured *ontology.OntologyVersion
-	source     GovernedOntologyProposalSource
+	source OntologyCatalogProvider
 }
 
 // NewGovernedOntologyChoices constructs a live, read-only choice adapter.
 func NewGovernedOntologyChoices(
-	configured *ontology.OntologyVersion,
-	source GovernedOntologyProposalSource,
+	source OntologyCatalogProvider,
 ) (*GovernedOntologyChoices, error) {
-	if absentGovernedOntologyProposalSource(source) {
+	if absentOntologyCatalogProvider(source) {
 		return nil, shoal.NewError(
 			shoal.ErrorInvalidArgument,
 			"governed ontology source is required",
 		)
 	}
-	var cloned *ontology.OntologyVersion
-	if configured != nil {
-		if err := configured.Validate(); err != nil {
-			return nil, err
-		}
-		value := *configured
-		cloned = &value
-	}
-	return &GovernedOntologyChoices{
-		configured: cloned,
-		source:     source,
-	}, nil
+	return &GovernedOntologyChoices{source: source}, nil
 }
 
 // ListOntologyChoices returns only the active ontology and its retained
@@ -129,22 +110,11 @@ func (c *GovernedOntologyChoices) AuthorizeOntology(
 func (c *GovernedOntologyChoices) catalog(
 	ctx context.Context,
 ) (ontology.PublishedCatalog, bool, error) {
-	if c.configured == nil {
-		return ontology.PublishedCatalog{}, false, nil
-	}
-	proposals, err := c.source.OntologyProposals(ctx)
-	if err != nil {
-		return ontology.PublishedCatalog{}, false, err
-	}
-	catalog, err := boundedOntologyCatalog(*c.configured, proposals)
-	if err != nil {
-		return ontology.PublishedCatalog{}, false, err
-	}
-	return catalog, true, nil
+	return c.source.OntologyCatalog(ctx)
 }
 
-func absentGovernedOntologyProposalSource(
-	value GovernedOntologyProposalSource,
+func absentOntologyCatalogProvider(
+	value OntologyCatalogProvider,
 ) bool {
 	if value == nil {
 		return true
