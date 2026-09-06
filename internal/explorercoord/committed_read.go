@@ -111,6 +111,30 @@ func (r *Runtime) readCommittedCell(
 	epoch coordination.Epoch,
 	maxScanned int,
 ) (CommittedCell, bool, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if r.closed {
+		return CommittedCell{}, false, transaction.ErrUnavailable
+	}
+	return r.readCommittedCellLocked(
+		ctx,
+		table,
+		row,
+		family,
+		qualifier,
+		visibility,
+		epoch,
+		maxScanned,
+	)
+}
+
+func (r *Runtime) readCommittedCellLocked(
+	ctx context.Context,
+	table string,
+	row, family, qualifier, visibility []byte,
+	epoch coordination.Epoch,
+	maxScanned int,
+) (CommittedCell, bool, error) {
 	if err := epoch.Validate(); err != nil {
 		return CommittedCell{}, false, errors.Join(transaction.ErrInvalid, err)
 	}
@@ -119,11 +143,6 @@ func (r *Runtime) readCommittedCell(
 			transaction.ErrInvalid,
 			errors.New("committed exact read work limit is outside its bound"),
 		)
-	}
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	if r.closed {
-		return CommittedCell{}, false, transaction.ErrUnavailable
 	}
 	if _, allowed := r.physicalTables[table]; !allowed {
 		return CommittedCell{}, false, errors.Join(
@@ -459,7 +478,18 @@ func (r *Runtime) selectCommittedVersion(
 				deleted := versions[index].key.Deleted
 				value := versions[index].value
 				for duplicate := index + 1; duplicate < end; duplicate++ {
-					deleted = deleted || versions[duplicate].key.Deleted
+					if versions[duplicate].key.Deleted != deleted {
+						return CommittedCell{}, false, fmt.Errorf(
+							"%w: physical deletion state disagrees at table %q row %x family %x qualifier %x visibility %x timestamp %d",
+							transaction.ErrInternal,
+							table,
+							versions[index].key.Row,
+							versions[index].key.ColumnFamily,
+							versions[index].key.ColumnQualifier,
+							versions[index].key.ColumnVisibility,
+							timestamp,
+						)
+					}
 					if !versions[duplicate].key.Deleted &&
 						!bytes.Equal(value, versions[duplicate].value) {
 						return CommittedCell{}, false, fmt.Errorf(
@@ -468,18 +498,15 @@ func (r *Runtime) selectCommittedVersion(
 						)
 					}
 				}
-				if deleted {
-					return CommittedCell{}, false, fmt.Errorf(
-						"%w: committed physical cell is shadowed by an unauthenticated tombstone",
-						transaction.ErrInternal,
-					)
-				}
 				version := versions[index]
 				if !planContainsEpochCell(proof.plan, table, epoch, version) {
 					return CommittedCell{}, false, fmt.Errorf(
 						"%w: committed physical cell is absent from its durable intent",
 						transaction.ErrInternal,
 					)
+				}
+				if deleted {
+					return CommittedCell{}, false, nil
 				}
 				return CommittedCell{
 					Cell: allocator.Cell{
@@ -637,6 +664,7 @@ func planContainsEpochCell(
 ) bool {
 	for _, cell := range plan.Cells {
 		if cell.Entry.EpochSlot != coordination.EpochSlotContent ||
+			cell.Delete != version.key.Deleted ||
 			string(cell.Entry.Table) != table ||
 			!bytes.Equal(cell.Entry.Row, version.key.Row) ||
 			!bytes.Equal(cell.Entry.ColumnFamily, version.key.ColumnFamily) ||

@@ -48,7 +48,7 @@ func cloneTrustedCells(values []TrustedCell) []TrustedCell {
 			Table: append([]byte(nil), value.Table...), Row: append([]byte(nil), value.Row...),
 			Family: append([]byte(nil), value.Family...), Qualifier: append([]byte(nil), value.Qualifier...),
 			Visibility: append([]byte(nil), value.Visibility...), Timestamp: value.Timestamp,
-			Value: append([]byte(nil), value.Value...),
+			Value: append([]byte(nil), value.Value...), Delete: value.Delete,
 		}
 	}
 	return result
@@ -177,5 +177,68 @@ func TestMemoryPhysicalVerifyUsesSameSetSemantics(t *testing.T) {
 	store.DeletePhysical(9, cells[1])
 	if err := store.Verify(context.Background(), 9, cells); !errors.Is(err, ErrInternal) {
 		t.Fatalf("missing memory key = %v", err)
+	}
+}
+
+func TestPhysicalTombstoneCommitmentAndVerification(t *testing.T) {
+	emptyLength, emptyDigest, err := PhysicalValueCommitment(false, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deleteLength, deleteDigest, err := PhysicalValueCommitment(true, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if emptyLength != 0 || deleteLength != 0 || emptyDigest == deleteDigest {
+		t.Fatalf(
+			"empty/delete commitments = %d %x, %d %x",
+			emptyLength,
+			emptyDigest,
+			deleteLength,
+			deleteDigest,
+		)
+	}
+	if _, _, err := PhysicalValueCommitment(
+		true,
+		[]byte("forbidden"),
+	); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("valued tombstone = %v", err)
+	}
+
+	cell := verificationCells()[0]
+	cell.Value = nil
+	cell.Delete = true
+	cell.Entry.ValueLength = deleteLength
+	cell.Entry.ValueDigest = deleteDigest
+	trusted := mapTrusted(9, []PhysicalCell{cell})
+	if len(trusted) != 1 || !trusted[0].Delete {
+		t.Fatalf("trusted tombstone mapping = %#v", trusted)
+	}
+	adapter, err := NewAccumuloPhysicalAdapter(&verificationSink{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := adapter.Verify(
+		context.Background(),
+		9,
+		[]PhysicalCell{cell},
+	); err != nil {
+		t.Fatal(err)
+	}
+	adapter, err = NewAccumuloPhysicalAdapter(&verificationSink{
+		transform: func(values []TrustedCell) []TrustedCell {
+			values[0].Delete = false
+			return values
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := adapter.Verify(
+		context.Background(),
+		9,
+		[]PhysicalCell{cell},
+	); !errors.Is(err, ErrInternal) {
+		t.Fatalf("tombstone changed to empty value = %v", err)
 	}
 }

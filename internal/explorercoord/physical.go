@@ -45,6 +45,7 @@ type physicalCell struct {
 	visibility []byte
 	value      []byte
 	timestamp  int64
+	delete     bool
 }
 
 // Physical writes trusted manifest cells to the embedded engine in stable
@@ -104,7 +105,9 @@ func (p *Physical) Verify(
 		if !found {
 			return fmt.Errorf("%w: physical cell %d is missing", transaction.ErrInternal, index)
 		}
-		if !bytes.Equal(got.value, mapped[index].value) {
+		if got.delete != mapped[index].delete ||
+			!mapped[index].delete &&
+				!bytes.Equal(got.value, mapped[index].value) {
 			return fmt.Errorf("%w: physical cell %d value differs", transaction.ErrInternal, index)
 		}
 	}
@@ -119,7 +122,9 @@ func (p *Physical) writeRow(ctx context.Context, cells []physicalCell) error {
 			return err
 		}
 		if found {
-			if !bytes.Equal(got.value, cells[index].value) {
+			if got.delete != cells[index].delete ||
+				!cells[index].delete &&
+					!bytes.Equal(got.value, cells[index].value) {
 				return fmt.Errorf("%w: physical key already has a different value", transaction.ErrInternal)
 			}
 			continue
@@ -144,7 +149,11 @@ func (p *Physical) writeRow(ctx context.Context, cells []physicalCell) error {
 			Timestamp:        &timestamp,
 			Kind:             engine.ConditionAbsent,
 		}
-		mutation.Put(cell.family, cell.qualifier, cell.visibility, cell.timestamp, cell.value)
+		if cell.delete {
+			mutation.Delete(cell.family, cell.qualifier, cell.visibility, cell.timestamp)
+		} else {
+			mutation.Put(cell.family, cell.qualifier, cell.visibility, cell.timestamp, cell.value)
+		}
 	}
 	results, err := p.engine.ConditionalWrite(cells[0].table, []engine.ConditionalMutation{{
 		Mutation: mutation, Conditions: conditions,
@@ -166,7 +175,9 @@ func (p *Physical) writeRow(ctx context.Context, cells []physicalCell) error {
 		if !found {
 			return errors.Join(transaction.ErrUnavailable, allocator.ErrConditionalUnknown)
 		}
-		if !bytes.Equal(got.value, cells[index].value) {
+		if got.delete != cells[index].delete ||
+			!cells[index].delete &&
+				!bytes.Equal(got.value, cells[index].value) {
 			return fmt.Errorf("%w: physical CAS observed a divergent value", transaction.ErrInternal)
 		}
 	}
@@ -188,6 +199,8 @@ func (p *Physical) readExact(
 		return physicalCell{}, false, err
 	}
 	defer scanner.Close()
+	var result physicalCell
+	found := false
 	for scanner.Next() {
 		if err := ctx.Err(); err != nil {
 			return physicalCell{}, false, err
@@ -198,18 +211,26 @@ func (p *Physical) readExact(
 			bytes.Equal(key.ColumnQualifier, wanted.qualifier) &&
 			bytes.Equal(key.ColumnVisibility, wanted.visibility) &&
 			key.Timestamp == wanted.timestamp {
-			if key.Deleted {
-				return physicalCell{}, false, nil
+			current := wanted
+			current.delete = key.Deleted
+			current.value = append([]byte(nil), scanner.Value()...)
+			if found &&
+				(result.delete != current.delete ||
+					!current.delete &&
+						!bytes.Equal(result.value, current.value)) {
+				return physicalCell{}, false, fmt.Errorf(
+					"%w: physical key has divergent exact versions",
+					transaction.ErrInternal,
+				)
 			}
-			result := wanted
-			result.value = append([]byte(nil), scanner.Value()...)
-			return result, true, nil
+			result = current
+			found = true
 		}
 		if err := scanner.Advance(); err != nil {
 			return physicalCell{}, false, err
 		}
 	}
-	return physicalCell{}, false, nil
+	return result, found, nil
 }
 
 func mapPhysical(
@@ -225,8 +246,15 @@ func mapPhysical(
 		if err := cell.Entry.Validate(); err != nil {
 			return nil, errors.Join(transaction.ErrInvalid, err)
 		}
-		if uint32(len(cell.Value)) != cell.Entry.ValueLength ||
-			coordination.Sum(cell.Value) != cell.Entry.ValueDigest ||
+		valueLength, valueDigest, commitmentErr := transaction.PhysicalValueCommitment(
+			cell.Delete,
+			cell.Value,
+		)
+		if commitmentErr != nil {
+			return nil, commitmentErr
+		}
+		if valueLength != cell.Entry.ValueLength ||
+			valueDigest != cell.Entry.ValueDigest ||
 			coordination.Sum(cell.Visibility) != cell.Entry.VisibilityDigest {
 			return nil, fmt.Errorf("%w: physical cell %d disagrees with its manifest", transaction.ErrInternal, index)
 		}
@@ -244,6 +272,7 @@ func mapPhysical(
 			qualifier:  append([]byte(nil), cell.Entry.ColumnQualifier...),
 			visibility: append([]byte(nil), cell.Visibility...),
 			value:      append([]byte(nil), cell.Value...), timestamp: timestamp,
+			delete: cell.Delete,
 		}
 		key := physicalIdentity(result[index])
 		if previous, ok := seen[key]; ok {
