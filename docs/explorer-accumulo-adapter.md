@@ -1836,6 +1836,19 @@ aborted, or poisoned version cannot hide an older committed version.
 `Runtime.Committed` exposes the same completion proof for a known TXN and
 logical digest. Raw engine scans and a second engine open remain unsupported.
 
+`Runtime.PruneCommitted` is the bounded retention seam for product-local
+streams such as fleet events. Callers page at most 256 exact
+`CommittedCell` values, identify each owning live entity guard, and provide one
+domain-local readable-floor checkpoint. The runtime independently rehydrates
+every committed proof, commits domain-separated physical tombstones, retires
+the owning guards, and advances the checkpoint in one normal transaction.
+Tombstones remain visible at older pinned frontiers and hide the value only at
+and after the prune epoch. The checkpoint is an ordinary committed cell and
+guard chosen by the product adapter; pruning never advances the shared
+allocator `HistoryFloor`. Replays with the same operation/token are
+idempotent, divergent targets conflict, and unavailable outcomes remain
+indeterminate and recoverable through the existing pending-intent worker.
+
 `internal/explorercoord.OpenExplorer` shares the same engine handle with
 `pkg/explorer`, and `cmd/shoal-explore-web` uses it for the embedded backend.
 Immutable document-revision records are published with a stable document-level

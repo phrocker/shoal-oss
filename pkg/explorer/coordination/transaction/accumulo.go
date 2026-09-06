@@ -47,6 +47,7 @@ type TrustedCell struct {
 	Visibility []byte
 	Timestamp  int64
 	Value      []byte
+	Delete     bool
 }
 
 type TrustedPhysicalSink interface {
@@ -77,7 +78,7 @@ func mapTrusted(epoch coordination.Epoch, cells []PhysicalCell) []TrustedCell {
 			Family:     append([]byte(nil), cell.Entry.ColumnFamily...),
 			Qualifier:  append([]byte(nil), cell.Entry.ColumnQualifier...),
 			Visibility: append([]byte(nil), cell.Visibility...), Timestamp: timestamp,
-			Value: append([]byte(nil), cell.Value...),
+			Value: append([]byte(nil), cell.Value...), Delete: cell.Delete,
 		}
 	}
 	return result
@@ -111,7 +112,8 @@ func verifyTrustedCells(wanted, got []TrustedCell, valueDigests []coordination.D
 		if _, exists := expected[key]; exists {
 			return fmt.Errorf("%w: expected physical key duplicate at ordinal %d", ErrInternal, ordinal)
 		}
-		if coordination.Sum(cell.Value) != valueDigests[ordinal] {
+		_, digest, err := PhysicalValueCommitment(cell.Delete, cell.Value)
+		if err != nil || digest != valueDigests[ordinal] {
 			return fmt.Errorf("%w: expected physical value digest mismatch at ordinal %d", ErrInternal, ordinal)
 		}
 		expected[key] = expectedTrustedCell{cell: cell, valueDigest: valueDigests[ordinal]}
@@ -127,8 +129,11 @@ func verifyTrustedCells(wanted, got []TrustedCell, valueDigests []coordination.D
 		if !exists {
 			return fmt.Errorf("%w: unexpected physical key at ordinal %d", ErrInternal, ordinal)
 		}
-		if !bytes.Equal(wantedCell.cell.Value, cell.Value) ||
-			coordination.Sum(cell.Value) != wantedCell.valueDigest {
+		_, digest, err := PhysicalValueCommitment(cell.Delete, cell.Value)
+		if err != nil ||
+			wantedCell.cell.Delete != cell.Delete ||
+			!bytes.Equal(wantedCell.cell.Value, cell.Value) ||
+			digest != wantedCell.valueDigest {
 			return fmt.Errorf("%w: physical value digest mismatch at ordinal %d", ErrInternal, ordinal)
 		}
 	}

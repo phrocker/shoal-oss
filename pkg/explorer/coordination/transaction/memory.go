@@ -54,6 +54,7 @@ type PhysicalValue struct {
 	Visibility []byte
 	Timestamp  int64
 	Value      []byte
+	Delete     bool
 }
 
 func NewMemoryStore() *MemoryStore {
@@ -252,7 +253,7 @@ func expandCell(epoch coordination.Epoch, cell PhysicalCell) PhysicalValue {
 		Family:     append([]byte(nil), cell.Entry.ColumnFamily...),
 		Qualifier:  append([]byte(nil), cell.Entry.ColumnQualifier...),
 		Visibility: append([]byte(nil), cell.Visibility...), Timestamp: timestamp,
-		Value: append([]byte(nil), cell.Value...),
+		Value: append([]byte(nil), cell.Value...), Delete: cell.Delete,
 	}
 }
 
@@ -266,7 +267,9 @@ func (s *MemoryStore) Write(_ context.Context, epoch coordination.Epoch, cells [
 	for _, cell := range cells {
 		value := expandCell(epoch, cell)
 		key := physicalKey(value)
-		if existing, found := s.physical[key]; found && !bytes.Equal(existing.Value, value.Value) {
+		if existing, found := s.physical[key]; found &&
+			(existing.Delete != value.Delete ||
+				!value.Delete && !bytes.Equal(existing.Value, value.Value)) {
 			return ErrInternal
 		}
 		s.physical[key] = value
@@ -293,7 +296,7 @@ func (s *MemoryStore) Verify(_ context.Context, epoch coordination.Epoch, cells 
 			got = append(got, TrustedCell{
 				Table: value.Table, Row: value.Row, Family: value.Family,
 				Qualifier: value.Qualifier, Visibility: value.Visibility,
-				Timestamp: value.Timestamp, Value: value.Value,
+				Timestamp: value.Timestamp, Value: value.Value, Delete: value.Delete,
 			})
 		}
 	}
