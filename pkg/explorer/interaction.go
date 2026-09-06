@@ -197,10 +197,13 @@ func (e *Explorer) recordInteractionResult(
 		if err := interactionRetryResult(*existing, session); err != nil {
 			return interaction.Session{}, err
 		}
+		// The exact record is already durable, so a cancellation observed
+		// here must never be reported as a rollback.
+		reconciled := cloneInteractionSession(existing.Session)
 		if err := contextError(ctx); err != nil {
-			return interaction.Session{}, err
+			return reconciled, MarkCommittedInteraction(err)
 		}
-		return cloneInteractionSession(existing.Session), nil
+		return reconciled, nil
 	}
 	// Sessions and folds are distinct maps but share one node namespace in the
 	// corpus graph, so an ID taken by either would silently overwrite the other
@@ -284,10 +287,13 @@ func (e *Explorer) recordInteractionResult(
 		if err := interactionRetryResult(*existing, session); err != nil {
 			return interaction.Session{}, err
 		}
+		// The durable winner already holds this exact record, so a
+		// cancellation observed here is a post-commit failure.
+		reconciled := cloneInteractionSession(existing.Session)
 		if err := contextError(ctx); err != nil {
-			return interaction.Session{}, err
+			return reconciled, MarkCommittedInteraction(err)
 		}
-		return cloneInteractionSession(existing.Session), nil
+		return reconciled, nil
 	}
 	e.reserveInteractionRecordGraphIDsLocked(
 		record.SessionID, record.Nodes, record.Edges)

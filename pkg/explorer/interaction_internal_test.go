@@ -22,6 +22,7 @@ package explorer
 import (
 	"context"
 	"errors"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
@@ -617,5 +618,37 @@ func TestConditionalInteractionCreateKeepsOneWinner(t *testing.T) {
 	}
 	if stored.Session.StopReason != first.Session.StopReason {
 		t.Fatalf("durable winner = %+v", stored.Session)
+	}
+}
+
+func TestInteractionRetryCancellationRemainsCommitted(t *testing.T) {
+	corpus, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer corpus.Close()
+	session := interaction.Session{
+		ID:         interaction.DerivedID("session", "retry-cancellation"),
+		RecordedAt: time.Unix(1700000000, 0).UTC(),
+		Operation:  interaction.OperationToolCall,
+	}
+	first, err := corpus.RecordInteractionResult(context.Background(), session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The exact record is already durable, so the retry observes it and only
+	// then sees the cancellation.
+	ctx := &stagedCancellationContext{
+		Context: context.Background(), cancelAfter: 2,
+	}
+	retried, err := corpus.RecordInteractionResult(ctx, session)
+	if err == nil {
+		t.Fatal("cancellation after durable reconciliation was not reported")
+	}
+	if !IsCommittedInteraction(err) {
+		t.Fatalf("durable retry cancellation reported as rollback: %v", err)
+	}
+	if !reflect.DeepEqual(retried, first) {
+		t.Fatalf("reconciled session = %+v, want %+v", retried, first)
 	}
 }
