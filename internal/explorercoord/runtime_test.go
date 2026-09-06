@@ -23,6 +23,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"sync"
@@ -587,6 +588,12 @@ func TestRecordPublicationUsesStableDocumentExpectedHead(t *testing.T) {
 			!bytes.Equal(head.WinnerID, []byte("revision-2b"))) {
 		t.Fatalf("winning document head = %#v, %v", head, err)
 	}
+	refreshed := testRecordPublication(
+		"document", string(loser.WinnerID), string(loser.Value), head,
+	)
+	if _, err := runtime.PublishRecord(context.Background(), refreshed); err != nil {
+		t.Fatalf("refreshed expected-head retry = %v", err)
+	}
 }
 
 func TestExplorerLoadHidesUncommittedAndPoisonedPhysicalRevision(t *testing.T) {
@@ -640,11 +647,9 @@ func TestExplorerLoadHidesUncommittedAndPoisonedPhysicalRevision(t *testing.T) {
 
 	row := []byte("document/" + string(analyzed.Document.ID) + "/" + string(analyzed.Revision.ID))
 	key := sha256.Sum256(append([]byte("explorer-document-record-v1\x00"), row...))
-	txn, err := DeriveTXN(
-		config.Domain, []byte("explorer-document-record-v1"), key[:],
-	)
-	if err != nil {
-		t.Fatal(err)
+	txn, found, err := runtime.intents.Attempt(context.Background(), key[:])
+	if err != nil || !found {
+		t.Fatalf("document attempt binding = %x, %v, %v", txn, found, err)
 	}
 	snapshot, err := runtime.Inspect(context.Background(), txn)
 	if err != nil || snapshot.Root.Epoch == 0 {
@@ -825,7 +830,6 @@ func testRecordPublication(
 ) explorer.RecordPublication {
 	request := explorer.RecordPublication{
 		Operation:       []byte("document-test-v1"),
-		Token:           []byte(revision),
 		Table:           "records",
 		Row:             []byte("document/" + document + "/" + revision),
 		Family:          []byte("record"),
@@ -839,10 +843,19 @@ func testRecordPublication(
 		ResultKind:      []byte("document-revision"),
 		ResultID:        []byte(revision),
 	}
+	stable := sha256.Sum256(request.Row)
+	request.RecordKey = stable[:]
+	hash := sha256.New()
+	_, _ = hash.Write(stable[:])
 	if head != nil {
 		request.ExpectedEpoch = head.Epoch
 		request.ExpectedDigest = head.LogicalDigest
+		var epoch [8]byte
+		binary.BigEndian.PutUint64(epoch[:], uint64(head.Epoch))
+		_, _ = hash.Write(epoch[:])
+		_, _ = hash.Write(head.LogicalDigest[:])
 	}
+	request.Token = hash.Sum(nil)
 	return request
 }
 

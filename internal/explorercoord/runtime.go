@@ -441,6 +441,17 @@ func (r *Runtime) PublishRecord(
 	if err != nil {
 		return explorer.RecordPublicationResult{}, transaction.PublicError(err)
 	}
+	stored, _, err := r.intents.Put(ctx, intent)
+	if err != nil {
+		return explorer.RecordPublicationResult{}, transaction.PublicError(err)
+	}
+	recordKey := request.RecordKey
+	if len(recordKey) == 0 {
+		recordKey = request.Token
+	}
+	if err := r.bindRecordAttempt(ctx, recordKey, stored.TXN); err != nil {
+		return explorer.RecordPublicationResult{}, transaction.PublicError(err)
+	}
 	result, err := r.publishLocked(ctx, Request{Intent: intent})
 	if err != nil {
 		public := transaction.PublicError(err)
@@ -461,16 +472,23 @@ func (r *Runtime) RecordCommitted(
 	if r.closed {
 		return false, transaction.ErrUnavailable
 	}
-	txn, err := DeriveTXN(r.domain, request.Operation, request.Token)
+	recordKey := request.RecordKey
+	if len(recordKey) == 0 {
+		recordKey = request.Token
+	}
+	txn, found, err := r.intents.Attempt(ctx, recordKey)
 	if err != nil {
 		return false, err
 	}
+	if !found {
+		return true, nil
+	}
 	record, err := r.intents.Load(ctx, txn)
 	if errors.Is(err, transaction.ErrNotFound) {
-		// A record without a durable intent predates transactional publication.
-		// New configured writes always persist intent first, so this cannot
-		// silently admit a staged record produced by this runtime.
-		return true, nil
+		return false, fmt.Errorf(
+			"%w: record attempt binding has no durable intent",
+			transaction.ErrInternal,
+		)
 	}
 	if err != nil {
 		return false, err
@@ -594,9 +612,24 @@ func (r *Runtime) RecordAttempt(
 	if r.closed {
 		return nil, transaction.ErrUnavailable
 	}
-	txn, err := DeriveTXN(r.domain, request.Operation, request.Token)
+	recordKey := request.RecordKey
+	if len(recordKey) == 0 {
+		recordKey = request.Token
+	}
+	txn, found, err := r.intents.Attempt(ctx, recordKey)
 	if err != nil {
 		return nil, err
+	}
+	if !found {
+		return nil, nil
+	}
+	snapshot, inspectErr := r.coordinator.Inspect(ctx, txn)
+	if inspectErr == nil && snapshot.Root.State.Terminal() &&
+		snapshot.Root.State != coordination.StateCommitted {
+		return nil, nil
+	}
+	if inspectErr != nil && !errors.Is(inspectErr, transaction.ErrNotFound) {
+		return nil, inspectErr
 	}
 	record, err := r.intents.Load(ctx, txn)
 	if errors.Is(err, transaction.ErrNotFound) {
@@ -634,6 +667,32 @@ func (r *Runtime) RecordAttempt(
 		Value: value, ExpectedEpoch: expected.ExpectedEpoch,
 		ExpectedDigest: expected.ExpectedDigest,
 	}, nil
+}
+
+func (r *Runtime) bindRecordAttempt(
+	ctx context.Context,
+	key []byte,
+	txn coordination.TXN,
+) error {
+	current, found, err := r.intents.Attempt(ctx, key)
+	if err != nil {
+		return err
+	}
+	if !found {
+		return r.intents.SetAttempt(ctx, key, nil, txn)
+	}
+	if bytes.Equal(current, txn) {
+		return nil
+	}
+	snapshot, err := r.coordinator.Inspect(ctx, current)
+	if err != nil {
+		return err
+	}
+	if !snapshot.Root.State.Terminal() ||
+		snapshot.Root.State == coordination.StateCommitted {
+		return transaction.ErrConflict
+	}
+	return r.intents.SetAttempt(ctx, key, current, txn)
 }
 
 func (r *Runtime) intentMatchesRecord(

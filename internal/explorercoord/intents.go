@@ -50,6 +50,8 @@ var (
 	quarantineFamily  = []byte("q")
 	quarantineCQ      = []byte("reason")
 	intentRowMagic    = []byte{2, 'I'}
+	attemptRowMagic   = []byte{2, 'A'}
+	attemptQualifier  = []byte("txn")
 )
 
 // Cell is one immutable physical cell in a logical publication intent.
@@ -454,6 +456,88 @@ func (s *IntentStore) pendingCoordinate(txn coordination.TXN) allocator.Coordina
 		Row: s.intentRow(txn), Family: append([]byte(nil), intentFamily...),
 		Qualifier: append([]byte(nil), pendingQualifier...), Visibility: append([]byte(nil), s.visibility...),
 	}
+}
+
+func (s *IntentStore) Attempt(
+	ctx context.Context,
+	key []byte,
+) (coordination.TXN, bool, error) {
+	coordinate, err := s.attemptCoordinate(key)
+	if err != nil {
+		return nil, false, err
+	}
+	cells, err := s.store.ReadExact(ctx, []allocator.Coordinate{coordinate})
+	if err != nil {
+		return nil, false, errors.Join(transaction.ErrUnavailable, err)
+	}
+	if len(cells) == 0 {
+		return nil, false, nil
+	}
+	if len(cells) != 1 || cells[0].Timestamp != intentVersion {
+		return nil, false, fmt.Errorf("%w: record attempt binding is invalid", transaction.ErrInternal)
+	}
+	txn := coordination.TXN(append([]byte(nil), cells[0].Value...))
+	if err := txn.Validate(); err != nil {
+		return nil, false, fmt.Errorf("%w: record attempt transaction is invalid", transaction.ErrInternal)
+	}
+	return txn, true, nil
+}
+
+func (s *IntentStore) SetAttempt(
+	ctx context.Context,
+	key []byte,
+	previous, next coordination.TXN,
+) error {
+	coordinate, err := s.attemptCoordinate(key)
+	if err != nil {
+		return err
+	}
+	condition := allocator.Condition{Coordinate: coordinate, Absent: true}
+	if len(previous) != 0 {
+		condition = allocator.Condition{
+			Coordinate: coordinate, Value: previous,
+			Timestamp: intentVersion, TimestampSet: true,
+		}
+	}
+	mutation := allocator.Mutation{
+		Row:        coordinate.Row,
+		Conditions: []allocator.Condition{condition},
+		Updates: []allocator.Update{{
+			Coordinate: coordinate, Value: next, Timestamp: intentVersion,
+		}},
+	}
+	status, writeErr := s.store.CompareAndMutate(ctx, mutation)
+	if status == allocator.StatusAccepted {
+		return nil
+	}
+	current, found, readErr := s.Attempt(ctx, key)
+	if readErr != nil {
+		return errors.Join(transaction.ErrUnavailable, writeErr, readErr)
+	}
+	if found && bytes.Equal(current, next) {
+		return nil
+	}
+	if status == allocator.StatusRejected {
+		return transaction.ErrConflict
+	}
+	return errors.Join(transaction.ErrUnavailable, allocator.ErrConditionalUnknown, writeErr)
+}
+
+func (s *IntentStore) attemptCoordinate(key []byte) (allocator.Coordinate, error) {
+	if len(key) == 0 || len(key) > coordination.MaxOpaqueIDBytes {
+		return allocator.Coordinate{}, errors.Join(
+			transaction.ErrInvalid,
+			errors.New("record attempt key is outside its bound"),
+		)
+	}
+	row := append([]byte(nil), attemptRowMagic...)
+	row = append(row, coordination.E(s.domain)...)
+	row = append(row, coordination.E(key)...)
+	return allocator.Coordinate{
+		Row: row, Family: append([]byte(nil), intentFamily...),
+		Qualifier:  append([]byte(nil), attemptQualifier...),
+		Visibility: append([]byte(nil), s.visibility...),
+	}, nil
 }
 
 func (s *IntentStore) ensurePending(

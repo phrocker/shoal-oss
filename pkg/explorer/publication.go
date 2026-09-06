@@ -23,6 +23,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 
 	"github.com/phrocker/shoal-oss/pkg/explorer/coordination"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
@@ -36,6 +37,7 @@ const EmbeddedTableName = "_shoal_explorer"
 // Explorer continues to own its existing record envelope and row layout.
 type RecordPublication struct {
 	Operation       []byte
+	RecordKey       []byte
 	Token           []byte
 	Table           string
 	Row             []byte
@@ -84,9 +86,21 @@ type RecordPublicationAdapter interface {
 
 var embeddedDefaultPolicy = []byte("embedded/default")
 
-func documentRecordKey(row []byte) []byte {
+func documentStableKey(row []byte) []byte {
 	key := sha256.Sum256(append([]byte("explorer-document-record-v1\x00"), row...))
 	return append([]byte(nil), key[:]...)
+}
+
+func documentRecordKey(row []byte, head *RecordPublicationHead) []byte {
+	hash := sha256.New()
+	_, _ = hash.Write(documentStableKey(row))
+	if head != nil {
+		var epoch [8]byte
+		binary.BigEndian.PutUint64(epoch[:], uint64(head.Epoch))
+		_, _ = hash.Write(epoch[:])
+		_, _ = hash.Write(head.LogicalDigest[:])
+	}
+	return hash.Sum(nil)
 }
 
 func documentRecordPublication(
@@ -94,10 +108,11 @@ func documentRecordPublication(
 	record *persistedDocument,
 	head *RecordPublicationHead,
 ) RecordPublication {
-	recordKey := documentRecordKey(row)
+	recordKey := documentStableKey(row)
 	request := RecordPublication{
 		Operation:       []byte("explorer-document-record-v1"),
-		Token:           recordKey,
+		RecordKey:       recordKey,
+		Token:           documentRecordKey(row, head),
 		Table:           EmbeddedTableName,
 		Row:             append([]byte(nil), row...),
 		Family:          []byte(recordCF),
@@ -121,7 +136,7 @@ func documentRecordPublication(
 func documentRecordCommitProbe(row, encoded []byte) RecordPublication {
 	return RecordPublication{
 		Operation: []byte("explorer-document-record-v1"),
-		Token:     documentRecordKey(row),
+		RecordKey: documentStableKey(row),
 		Table:     EmbeddedTableName,
 		Row:       append([]byte(nil), row...),
 		Family:    []byte(recordCF),
@@ -133,7 +148,7 @@ func documentRecordCommitProbe(row, encoded []byte) RecordPublication {
 func documentRecordAttemptProbe(row []byte) RecordPublication {
 	return RecordPublication{
 		Operation: []byte("explorer-document-record-v1"),
-		Token:     documentRecordKey(row),
+		RecordKey: documentStableKey(row),
 		Table:     EmbeddedTableName,
 		Row:       append([]byte(nil), row...),
 		Family:    []byte(recordCF),
