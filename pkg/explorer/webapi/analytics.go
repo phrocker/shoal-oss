@@ -60,6 +60,12 @@ type AnalyticsLimitsProvider interface {
 	AnalyticsLimits() (exploreranalytics.Limits, bool)
 }
 
+// AnalyticsRecordingProvider confirms that successful calls require durable
+// interaction capture. Providers without this guarantee are not advertised.
+type AnalyticsRecordingProvider interface {
+	AnalyticsRecordingRequired() bool
+}
+
 // AnalyticsAvailable reports whether the embedded service has an authorized
 // materializer and valid server-owned limits.
 func (s *EmbeddedService) AnalyticsAvailable() bool {
@@ -75,6 +81,12 @@ func (s *EmbeddedService) AnalyticsLimits() (exploreranalytics.Limits, bool) {
 		return exploreranalytics.Limits{}, false
 	}
 	return s.analytics.Limits(), true
+}
+
+// AnalyticsRecordingRequired reports the shipped fail-closed recording
+// contract.
+func (s *EmbeddedService) AnalyticsRecordingRequired() bool {
+	return s.AnalyticsAvailable()
 }
 
 // Analytics runs the authorized materializer and deterministic pure kernel.
@@ -145,6 +157,11 @@ func analyticsProvider(
 	}
 	limits, available := limitsProvider.AnalyticsLimits()
 	if !available || limits.Validate() != nil {
+		return nil, exploreranalytics.Limits{}, false
+	}
+	recording, ok := service.(AnalyticsRecordingProvider)
+	if !ok || isAbsentInterface(recording) ||
+		!recording.AnalyticsRecordingRequired() {
 		return nil, exploreranalytics.Limits{}, false
 	}
 	return provider, limits, true
@@ -281,7 +298,13 @@ type wireAnalyticsResult struct {
 	Nodes                     []wireAnalyticsNode               `json:"nodes"`
 	WeaklyConnectedComponents []wireAnalyticsComponent          `json:"weakly_connected_components"`
 	PageRank                  exploreranalytics.PageRankSummary `json:"page_rank"`
-	Recording                 exploreranalytics.RecordingStatus `json:"recording"`
+	Recording                 wireAnalyticsRecording            `json:"recording"`
+}
+
+type wireAnalyticsRecording struct {
+	Recorded      bool   `json:"recorded"`
+	Required      bool   `json:"required"`
+	InteractionID string `json:"interaction_id,omitempty"`
 }
 
 func (r AnalyticsResponse) MarshalJSON() ([]byte, error) {
@@ -343,7 +366,13 @@ func (r AnalyticsResponse) MarshalJSON() ([]byte, error) {
 				UnresolvedAssertions:   unresolved, Complete: scope.Complete,
 			},
 			Nodes: nodes, WeaklyConnectedComponents: components,
-			PageRank: r.Analytics.PageRank, Recording: r.Analytics.Recording,
+			PageRank: r.Analytics.PageRank,
+			Recording: wireAnalyticsRecording{
+				Recorded: r.Analytics.Recording.Recorded,
+				Required: r.Analytics.Recording.Required,
+				InteractionID: encodeOptionalID(
+					r.Analytics.Recording.InteractionID),
+			},
 		},
 	})
 }
@@ -416,6 +445,11 @@ func (r *AnalyticsResponse) UnmarshalJSON(data []byte) error {
 		}
 	}
 	scope := wire.Analytics.Scope
+	recordingID, err := decodeOptionalID(
+		wire.Analytics.Recording.InteractionID)
+	if err != nil {
+		return err
+	}
 	*r = AnalyticsResponse{
 		Snapshot: wire.Snapshot,
 		Analytics: exploreranalytics.Result{
@@ -434,8 +468,12 @@ func (r *AnalyticsResponse) UnmarshalJSON(data []byte) error {
 				UnresolvedAssertions:   unresolved, Complete: scope.Complete,
 			},
 			Nodes: nodes, WeaklyConnectedComponents: components,
-			PageRank:  wire.Analytics.PageRank,
-			Recording: wire.Analytics.Recording,
+			PageRank: wire.Analytics.PageRank,
+			Recording: exploreranalytics.RecordingStatus{
+				Recorded:      wire.Analytics.Recording.Recorded,
+				Required:      wire.Analytics.Recording.Required,
+				InteractionID: recordingID,
+			},
 		},
 	}
 	return nil

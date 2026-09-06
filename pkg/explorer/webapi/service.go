@@ -33,6 +33,7 @@ import (
 	exploreranalytics "github.com/phrocker/shoal-oss/pkg/explorer/analytics"
 	"github.com/phrocker/shoal-oss/pkg/explorer/authorized"
 	"github.com/phrocker/shoal-oss/pkg/graph"
+	"github.com/phrocker/shoal-oss/pkg/interaction"
 	"github.com/phrocker/shoal-oss/pkg/ontology"
 	"github.com/phrocker/shoal-oss/pkg/retrieval"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
@@ -173,9 +174,30 @@ func NewEmbeddedService(client explorer.BoundedClient) (*EmbeddedService, error)
 	}
 	service := &EmbeddedService{client: client, clock: time.Now}
 	if materializer, ok := client.(exploreranalytics.Materializer); ok {
+		sinkProvider, ok := client.(interface {
+			AnalyticsInteractionSink() interaction.ResultSink
+		})
+		if !ok {
+			return service, nil
+		}
+		sink := sinkProvider.AnalyticsInteractionSink()
+		if sink == nil {
+			return service, nil
+		}
+		sharedRecorder, err := interaction.NewRecorder(
+			context.Background(), sink)
+		if err != nil {
+			return nil, err
+		}
+		recorder, err := exploreranalytics.NewInteractionRecorder(
+			sharedRecorder, service.clock)
+		if err != nil {
+			return nil, err
+		}
 		analyticsService, err := exploreranalytics.NewService(
 			exploreranalytics.Config{
 				Source: materializer, Limits: exploreranalytics.DefaultLimits(),
+				Recorder: recorder, RequireRecording: true,
 			},
 		)
 		if err != nil {

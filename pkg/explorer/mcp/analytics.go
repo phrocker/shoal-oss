@@ -56,6 +56,13 @@ func NewAnalyticsTool(
 		return nil, shoal.NewError(
 			shoal.ErrorInvalidArgument, "analytics provider limits are unavailable")
 	}
+	recording, ok := provider.(webapi.AnalyticsRecordingProvider)
+	if !ok || isAbsent(recording) || !recording.AnalyticsRecordingRequired() {
+		return nil, shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			"analytics provider does not require durable recording",
+		)
+	}
 	schema := json.RawMessage(fmt.Sprintf(`{
 		"type":"object",
 		"properties":{
@@ -107,7 +114,8 @@ func NewAnalyticsTool(
 		Description: "Compute converged PageRank, directed degree, and weakly " +
 			"connected component summaries only within a complete, explicitly " +
 			"bounded, authorization-filtered, ontology-lensed subgraph. " +
-			"Incomplete materialization and nonconvergence fail.",
+			"Incomplete materialization, nonconvergence, or durable interaction " +
+			"recording failure fails the call.",
 		InputSchema: schema, Annotations: readOnlyAnnotations(),
 		Execution: &ToolExecution{TaskSupport: "forbidden"},
 	}

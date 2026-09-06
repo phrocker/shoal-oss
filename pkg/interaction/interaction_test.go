@@ -50,6 +50,76 @@ func TestConjoinIsSortedUniqueUnion(t *testing.T) {
 	}
 }
 
+func TestSessionRetainsExactEdgeEvidenceAndRequiredVisibility(t *testing.T) {
+	sourceEdge := graph.Edge{
+		ID: "edge-a-b", From: "node-a", To: "node-b",
+		Type: "related", Weight: 1,
+		Properties: shoal.Metadata{"source": "exact"},
+	}
+	session := interaction.Session{
+		ID: "session-edge-evidence",
+		RecordedAt: time.Date(
+			2026, time.September, 6, 12, 0, 0, 0, time.UTC),
+		Operation:          interaction.OperationToolCall,
+		RequiredVisibility: []string{"policy-b", "policy-a", "policy-b"},
+		Turns: []interaction.Turn{{
+			Index: 0,
+			ToolCall: &interaction.ToolCall{
+				Kind:             "analytics",
+				RetrievedNodeIDs: []shoal.ID{"node-b", "node-a"},
+				RetrievedEdges:   []graph.Edge{sourceEdge, sourceEdge},
+			},
+		}},
+	}
+	canonical, err := session.Canonical()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(canonical.Turns[0].ToolCall.RetrievedEdges) != 1 ||
+		canonical.Turns[0].ToolCall.RetrievedEdges[0].Properties["source"] !=
+			"exact" ||
+		interaction.Expression(canonical.RequiredVisibility) !=
+			"policy-a&policy-b" {
+		t.Fatalf("canonical session = %+v", canonical)
+	}
+	if got := canonical.TouchedEdgeIDs(); len(got) != 1 ||
+		got[0] != sourceEdge.ID {
+		t.Fatalf("touched edges = %v", got)
+	}
+	if got := canonical.TouchedNodeIDs(); len(got) != 2 ||
+		got[0] != "node-a" || got[1] != "node-b" {
+		t.Fatalf("touched nodes = %v", got)
+	}
+	subgraph, err := canonical.Subgraph(func(shoal.ID) ([]string, error) {
+		return []string{"node-policy"}, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if interaction.Expression(subgraph.Visibility) !=
+		"node-policy&policy-a&policy-b" ||
+		len(subgraph.TouchedEdgeIDs) != 1 ||
+		subgraph.TouchedEdgeIDs[0] != sourceEdge.ID {
+		t.Fatalf("subgraph evidence = %+v", subgraph)
+	}
+	var callProperties shoal.Metadata
+	for _, node := range subgraph.Nodes {
+		if node.Kind == interaction.KindToolCall {
+			callProperties = node.Properties
+			break
+		}
+	}
+	if callProperties[interaction.PropertyRetrievedEdges] != "1" ||
+		callProperties[interaction.PropertyEdgeEvidence] == "" {
+		t.Fatalf("tool-call edge evidence = %+v", callProperties)
+	}
+	for _, value := range callProperties {
+		if strings.Contains(value, string(sourceEdge.ID)) {
+			t.Fatal("raw source edge ID leaked into graph metadata")
+		}
+	}
+}
+
 func TestParseVisibilityRoundTripsAndRejectsBadLabels(t *testing.T) {
 	labels, err := interaction.ParseVisibility(" secret & ops ")
 	if err != nil {

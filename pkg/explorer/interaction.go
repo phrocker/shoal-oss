@@ -39,6 +39,8 @@ type InteractionSummary struct {
 	SnapshotAsOf             time.Time
 	AuthorizationFingerprint shoal.ID
 	AuthorizationExpiresAt   time.Time
+	OntologySchemaID         shoal.ID
+	OntologyVersionID        shoal.ID
 	EmbeddingSpaceID         shoal.ID
 	Operation                interaction.Operation
 	Actor                    interaction.ActorContext
@@ -66,6 +68,8 @@ type persistedInteraction struct {
 	SnapshotAsOf             time.Time
 	AuthorizationFingerprint shoal.ID
 	AuthorizationExpiresAt   time.Time
+	OntologySchemaID         shoal.ID
+	OntologyVersionID        shoal.ID
 	EmbeddingSpaceID         shoal.ID
 	Operation                interaction.Operation
 	Actor                    interaction.ActorContext
@@ -214,6 +218,8 @@ func (e *Explorer) RecordInteraction(
 		SnapshotAsOf:             session.SnapshotAsOf,
 		AuthorizationFingerprint: session.AuthorizationFingerprint,
 		AuthorizationExpiresAt:   session.AuthorizationExpiresAt,
+		OntologySchemaID:         session.OntologySchemaID,
+		OntologyVersionID:        session.OntologyVersionID,
 		EmbeddingSpaceID:         session.EmbeddingSpaceID,
 		Operation:                session.Operation,
 		Actor:                    session.Actor,
@@ -345,6 +351,8 @@ func (e *Explorer) DeleteInteraction(
 		SnapshotAsOf:             existing.SnapshotAsOf,
 		AuthorizationFingerprint: existing.AuthorizationFingerprint,
 		AuthorizationExpiresAt:   existing.AuthorizationExpiresAt,
+		OntologySchemaID:         existing.OntologySchemaID,
+		OntologyVersionID:        existing.OntologyVersionID,
 		EmbeddingSpaceID:         existing.EmbeddingSpaceID,
 		Operation:                existing.Operation,
 		Actor:                    existing.Actor,
@@ -778,6 +786,8 @@ func validatePersistedInteraction(record persistedInteraction) error {
 				record.AuthorizationFingerprint ||
 			!record.Session.AuthorizationExpiresAt.UTC().Equal(
 				record.AuthorizationExpiresAt.UTC()) ||
+			record.Session.OntologySchemaID != record.OntologySchemaID ||
+			record.Session.OntologyVersionID != record.OntologyVersionID ||
 			record.Session.EmbeddingSpaceID != record.EmbeddingSpaceID {
 			return shoal.NewError(
 				shoal.ErrorInternal,
@@ -794,6 +804,15 @@ func validatePersistedInteraction(record persistedInteraction) error {
 			return shoal.NewError(
 				shoal.ErrorInternal,
 				"stored interaction actor metadata does not match its envelope",
+			)
+		}
+		if !visibilityCovered(
+			record.Visibility,
+			interaction.Expression(record.Session.RequiredVisibility),
+		) {
+			return shoal.NewError(
+				shoal.ErrorInternal,
+				"stored interaction visibility omits required policy labels",
 			)
 		}
 	}
@@ -831,6 +850,9 @@ func cloneInteractionSession(session interaction.Session) interaction.Session {
 	cloned.Actor = cloneActorContext(session.Actor)
 	cloned.SeedNodeIDs = append([]shoal.ID(nil), session.SeedNodeIDs...)
 	cloned.CitedNodeIDs = append([]shoal.ID(nil), session.CitedNodeIDs...)
+	cloned.CitedEdges = cloneInteractionSourceEdges(session.CitedEdges)
+	cloned.RequiredVisibility = append(
+		[]string(nil), session.RequiredVisibility...)
 	cloned.Turns = make([]interaction.Turn, len(session.Turns))
 	for index, turn := range session.Turns {
 		cloned.Turns[index] = turn
@@ -838,6 +860,17 @@ func cloneInteractionSession(session interaction.Session) interaction.Session {
 			call := *turn.ToolCall
 			call.RetrievedNodeIDs = append(
 				[]shoal.ID(nil), turn.ToolCall.RetrievedNodeIDs...)
+			call.RetrievedNodes = make(
+				[]graph.Node, len(turn.ToolCall.RetrievedNodes))
+			for nodeIndex, node := range turn.ToolCall.RetrievedNodes {
+				call.RetrievedNodes[nodeIndex] = cloneNode(node)
+			}
+			call.RetrievedEdges = cloneInteractionSourceEdges(
+				turn.ToolCall.RetrievedEdges)
+			call.RetrievedAssertions = append(
+				[]interaction.AssertionEvidence(nil),
+				turn.ToolCall.RetrievedAssertions...,
+			)
 			cloned.Turns[index].ToolCall = &call
 		}
 	}
@@ -852,6 +885,8 @@ func interactionSummary(record persistedInteraction) InteractionSummary {
 		SnapshotAsOf:             record.SnapshotAsOf,
 		AuthorizationFingerprint: record.AuthorizationFingerprint,
 		AuthorizationExpiresAt:   record.AuthorizationExpiresAt,
+		OntologySchemaID:         record.OntologySchemaID,
+		OntologyVersionID:        record.OntologyVersionID,
 		EmbeddingSpaceID:         record.EmbeddingSpaceID,
 		Operation:                record.Operation,
 		Actor:                    cloneActorContext(record.Actor),
@@ -898,6 +933,14 @@ func dedupeExplorerIDs(ids []shoal.ID) []shoal.ID {
 		return shoal.CompareID(result[i], result[j]) < 0
 	})
 	return result
+}
+
+func cloneInteractionSourceEdges(edges []graph.Edge) []graph.Edge {
+	cloned := make([]graph.Edge, len(edges))
+	for index, edge := range edges {
+		cloned[index] = cloneEdge(edge)
+	}
+	return cloned
 }
 
 func cloneActorContext(actor interaction.ActorContext) interaction.ActorContext {

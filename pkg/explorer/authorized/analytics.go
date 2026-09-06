@@ -124,7 +124,10 @@ func (c *Client) MaterializeAnalytics(
 		Snapshot: before, Neighborhood: cloneAnalyticsNeighborhood(neighborhood),
 		AuthorizationFingerprint: fingerprint,
 		PolicyGeneration:         decision.PolicyGeneration(),
-		SelectedOntology:         selected, Complete: true,
+		SelectedOntology:         selected,
+		RequestID:                decision.RequestID(),
+		AuthorizationExpiresAt:   decision.AuthenticationExpires(),
+		Complete:                 true,
 	}, nil
 }
 
