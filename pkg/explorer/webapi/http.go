@@ -127,6 +127,10 @@ func (h *Handler) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 			return
 		}
 		request = request.WithContext(ctx)
+		if visibility := workspaceOutputVisibility(ctx); visibility != "" {
+			writer.Header().Set(
+				WorkspaceOutputVisibilityHeader, visibility)
+		}
 		if _, ok := EffectiveWorkspaceSettings(ctx); ok &&
 			strings.HasPrefix(request.URL.Path, "/api/v1/") {
 			writer = workspaceResponseWriter{

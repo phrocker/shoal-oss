@@ -26,6 +26,7 @@ import (
 
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/explorer/workspace"
+	"github.com/phrocker/shoal-oss/pkg/interaction"
 	"github.com/phrocker/shoal-oss/pkg/ontology"
 	"github.com/phrocker/shoal-oss/pkg/retrieval"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
@@ -34,6 +35,10 @@ import (
 // WorkspaceIDHeader selects the owned durable workspace settings applied to a
 // non-settings API request. Its value is one canonical opaque wire ID.
 const WorkspaceIDHeader = "Shoal-Workspace-ID"
+
+// WorkspaceOutputVisibilityHeader carries the canonical conjunction every
+// response or derived interaction produced under effective settings requires.
+const WorkspaceOutputVisibilityHeader = "Shoal-Output-Visibility"
 
 // WorkspaceSettingsProvider is the transport-neutral settings extension used
 // by the HTTP endpoint and future chat/MCP adapters.
@@ -195,6 +200,18 @@ func (h *Handler) applyWorkspaceSettings(
 	if ctx == nil {
 		return nil, authenticationDenied()
 	}
+	visibility, err := effective.OutputVisibility()
+	if err != nil {
+		return nil, err
+	}
+	labels, err := interaction.ParseVisibility(string(visibility))
+	if err != nil {
+		return nil, err
+	}
+	ctx, err = interaction.WithRequiredVisibility(ctx, labels)
+	if err != nil {
+		return nil, err
+	}
 	ctx = withEffectiveWorkspaceSettings(ctx, effective)
 	return withIdentity(ctx, decision), nil
 }
@@ -227,6 +244,10 @@ func withEffectiveWorkspaceSettings(
 ) context.Context {
 	return context.WithValue(
 		ctx, effectiveWorkspaceSettingsContextKey{}, effective)
+}
+
+func workspaceOutputVisibility(ctx context.Context) string {
+	return interaction.Expression(interaction.RequiredVisibility(ctx))
 }
 
 func applyWorkspaceRequestLimits(ctx context.Context, request any) {
@@ -274,7 +295,30 @@ func applyWorkspaceRequestLimits(ctx context.Context, request any) {
 		)
 		value.MaxDepth = narrowed.GraphDepth
 		value.Fanout = narrowed.GraphFanout
+	case *AnalyticsRequest:
+		applyAnalyticsWorkspaceLimits(value, limits)
 	}
+}
+
+func applyAnalyticsWorkspaceLimits(
+	request *AnalyticsRequest,
+	limits workspace.Limits,
+) {
+	if request == nil {
+		return
+	}
+	narrowed := ClampWorkspaceRequestLimits(
+		workspace.Limits{
+			GraphDepth:  request.Scope.Depth,
+			GraphFanout: request.Scope.Fanout,
+			GraphNodes:  request.Scope.MaxNodes,
+		},
+		workspace.Limits{},
+		limits,
+	)
+	request.Scope.Depth = narrowed.GraphDepth
+	request.Scope.Fanout = narrowed.GraphFanout
+	request.Scope.MaxNodes = narrowed.GraphNodes
 }
 
 // ClampWorkspaceRequestLimits replaces zero request values with their defaults
@@ -393,7 +437,8 @@ func requestMayCommit(method, path string) bool {
 	case "/api/v1/ingest",
 		"/api/v1/extract",
 		"/api/v1/derivation/recompute",
-		"/api/v1/ontology/proposals":
+		"/api/v1/ontology/proposals",
+		"/api/v1/analytics":
 		return true
 	default:
 		return strings.HasPrefix(path, "/api/v1/ontology/proposals/") &&

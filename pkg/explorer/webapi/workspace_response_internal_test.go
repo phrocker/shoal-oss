@@ -29,8 +29,29 @@ import (
 	"testing"
 
 	"github.com/phrocker/shoal-oss/pkg/explorer"
+	exploreranalytics "github.com/phrocker/shoal-oss/pkg/explorer/analytics"
+	"github.com/phrocker/shoal-oss/pkg/explorer/workspace"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
+
+func TestWorkspaceSettingsClampAnalyticsAndMarkResponseLoss(t *testing.T) {
+	request := AnalyticsRequest{
+		Scope: exploreranalytics.Scope{
+			Depth: 9, Fanout: 10, MaxNodes: 100,
+		},
+	}
+	applyAnalyticsWorkspaceLimits(&request, workspace.Limits{
+		GraphDepth: 3, GraphFanout: 4, GraphNodes: 25,
+	})
+	if request.Scope.Depth != 3 ||
+		request.Scope.Fanout != 4 ||
+		request.Scope.MaxNodes != 25 {
+		t.Fatalf("analytics workspace limits = %#v", request.Scope)
+	}
+	if !requestMayCommit(http.MethodPost, "/api/v1/analytics") {
+		t.Fatal("analytics response loss must be indeterminate after recording")
+	}
+}
 
 func TestWorkspaceIDFromHeaderRequiresCanonicalSingleton(t *testing.T) {
 	for _, test := range []struct {

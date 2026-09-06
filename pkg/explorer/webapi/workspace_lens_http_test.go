@@ -340,6 +340,16 @@ func TestHTTPSelectableLensIsPerCallerAndPreservesSettings(t *testing.T) {
 		t.Fatalf("mounted transport effective settings = found %v, %#v",
 			service.found, service.effective)
 	}
+	visibility, err := service.effective.OutputVisibility()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if documents.Header().Get(webapi.WorkspaceOutputVisibilityHeader) !=
+		string(visibility) {
+		t.Fatalf("workspace output visibility header = %q, want %q",
+			documents.Header().Get(webapi.WorkspaceOutputVisibilityHeader),
+			visibility)
+	}
 
 	retrieve := settingsWorkspaceRequest(
 		t, handler, http.MethodPost, "/api/v1/retrieve",
