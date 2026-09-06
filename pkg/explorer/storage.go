@@ -29,6 +29,7 @@ import (
 	"fmt"
 	"io"
 	"reflect"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -84,7 +85,7 @@ const (
 	maxEmbeddedOntologyProposalBytes   = uint64(16 * 1024 * 1024)
 	maxEmbeddedProposalTransitionBytes = uint64(64 * 1024)
 	maxEmbeddedExtractionBytes         = uint64(16 * 1024 * 1024)
-	maxEmbeddedSnapshotBytes           = uint64(1024)
+	maxEmbeddedSnapshotBytes           = uint64(64 * 1024 * 1024)
 )
 
 var snapshotAnchorRow = []byte("meta/snapshot-anchor")
@@ -98,8 +99,11 @@ type persistedSnapshotAnchor struct {
 }
 
 type persistedSnapshot struct {
-	ID   shoal.ID
-	AsOf time.Time
+	ID             shoal.ID
+	AsOf           time.Time
+	ParentID       shoal.ID
+	AddedNodeIDs   []shoal.ID
+	RemovedNodeIDs []shoal.ID
 }
 
 // persistedCursorKey holds the durable, per-corpus secret that seals change-feed
@@ -277,6 +281,9 @@ func (e *Explorer) load() error {
 		return err
 	}
 	e.embeddingSpace = embeddingSpaceCache{provenance: space, found: found}
+	if err := e.restoreLatestSnapshotLocked(); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -319,13 +326,46 @@ func (e *Explorer) loadSnapshotRecord(
 		return shoal.NewError(
 			shoal.ErrorInternal, "stored snapshot record is invalid")
 	}
+	if err := validateSnapshotDelta(record); err != nil {
+		return shoal.WrapError(
+			shoal.ErrorInternal, "stored snapshot is invalid", err)
+	}
 	record.AsOf = record.AsOf.UTC()
 	if existing, ok := e.snapshotHistory[string(record.ID)]; ok &&
-		!existing.Equal(record.AsOf) {
+		!persistedSnapshotsEqual(existing, record) {
 		return shoal.NewError(
 			shoal.ErrorInternal, "stored snapshot ID has conflicting content")
 	}
-	e.snapshotHistory[string(record.ID)] = record.AsOf
+	e.snapshotHistory[string(record.ID)] = record
+	return nil
+}
+
+func validateSnapshotDelta(record persistedSnapshot) error {
+	if err := shoal.ValidateOptionalID(
+		"snapshot parent ID", record.ParentID); err != nil {
+		return err
+	}
+	for _, ids := range [][]shoal.ID{
+		record.AddedNodeIDs, record.RemovedNodeIDs,
+	} {
+		for index, id := range ids {
+			if err := shoal.ValidateRequiredID("snapshot node ID", id); err != nil {
+				return err
+			}
+			if index > 0 && shoal.CompareID(ids[index-1], id) >= 0 {
+				return fmt.Errorf("snapshot node IDs are not canonical")
+			}
+		}
+	}
+	for _, id := range record.AddedNodeIDs {
+		index := sort.Search(len(record.RemovedNodeIDs), func(index int) bool {
+			return shoal.CompareID(record.RemovedNodeIDs[index], id) >= 0
+		})
+		if index < len(record.RemovedNodeIDs) &&
+			record.RemovedNodeIDs[index] == id {
+			return fmt.Errorf("snapshot node cannot be both added and removed")
+		}
+	}
 	return nil
 }
 
@@ -405,7 +445,6 @@ func (e *Explorer) loadDocumentRecord(
 		e.documents[record.Document.ID] = make(map[shoal.ID]*persistedDocument)
 	}
 	copy := record
-	e.registerSourceNodeBirthLocked(copy.Nodes, copy.PublishedAt)
 	e.documents[record.Document.ID][record.Revision.ID] = &copy
 	if record.PublicationSequence > e.lastPublicationSequence {
 		e.lastPublicationSequence = record.PublicationSequence
@@ -891,7 +930,10 @@ func equivalentEmbeddedRecord(row, stored, expected []byte) bool {
 
 func persistedSnapshotsEqual(left, right persistedSnapshot) bool {
 	return left.ID == right.ID &&
-		left.AsOf.UTC().Equal(right.AsOf.UTC())
+		left.AsOf.UTC().Equal(right.AsOf.UTC()) &&
+		left.ParentID == right.ParentID &&
+		reflect.DeepEqual(left.AddedNodeIDs, right.AddedNodeIDs) &&
+		reflect.DeepEqual(left.RemovedNodeIDs, right.RemovedNodeIDs)
 }
 
 func encodeEmbeddedRecord(kind byte, value any) ([]byte, error) {

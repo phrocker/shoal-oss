@@ -71,8 +71,9 @@ type Explorer struct {
 	vectorProbeMu           sync.Mutex
 	vectorAvailability      vectorAvailabilityCache
 	snapshot                Snapshot
-	snapshotHistory         map[string]time.Time
-	sourceNodeBirth         map[shoal.ID]time.Time
+	snapshotHistory         map[string]persistedSnapshot
+	latestSnapshotID        shoal.ID
+	latestSnapshotNodes     map[shoal.ID]struct{}
 	snapshotAnchor          time.Time
 	lastPublicationSequence uint64
 	changeHistoryFloor      uint64
@@ -218,8 +219,8 @@ func OpenWithOptions(dir string, options Options) (*Explorer, error) {
 		recallEvidence:          cloneStringMap(options.RecallEvidence),
 		latentLinkProjection:    latentProjection,
 		maxLatentAssertions:     maxLatentAssertions,
-		snapshotHistory:         make(map[string]time.Time),
-		sourceNodeBirth:         make(map[shoal.ID]time.Time),
+		snapshotHistory:         make(map[string]persistedSnapshot),
+		latestSnapshotNodes:     make(map[shoal.ID]struct{}),
 		readOnly:                options.ReadOnly,
 	}
 	if err := explorer.load(); err != nil {
@@ -408,7 +409,6 @@ func (e *Explorer) ingest(
 	if e.documents[record.Document.ID] == nil {
 		e.documents[record.Document.ID] = make(map[shoal.ID]*persistedDocument)
 	}
-	e.registerSourceNodeBirthLocked(record.Nodes, record.PublishedAt)
 	e.documents[record.Document.ID][record.Revision.ID] = record
 	e.invalidateVectorAvailabilityLocked()
 	if e.graphInitialized {
@@ -417,24 +417,6 @@ func (e *Explorer) ingest(
 		}
 	}
 	return ingestResult(record, IngestApplied), nil
-}
-
-func (e *Explorer) registerSourceNodeBirthLocked(
-	nodes []graph.Node, publishedAt time.Time,
-) {
-	if publishedAt.IsZero() {
-		return
-	}
-	publishedAt = publishedAt.UTC()
-	for _, node := range nodes {
-		if interaction.IsInteractionKind(node.Kind) {
-			continue
-		}
-		if existing, ok := e.sourceNodeBirth[node.ID]; !ok ||
-			publishedAt.Before(existing) {
-			e.sourceNodeBirth[node.ID] = publishedAt
-		}
-	}
 }
 
 // Documents lists the newest revision of every document.

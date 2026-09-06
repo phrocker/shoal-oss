@@ -75,16 +75,19 @@ func (e *Explorer) ValidateSnapshot(
 	if err := e.ensureGraphLocked(); err != nil {
 		return err
 	}
-	observedAt, ok := e.snapshotHistory[string(id)]
-	if !ok || !observedAt.Equal(asOf.UTC()) {
+	record, ok := e.snapshotHistory[string(id)]
+	if !ok || !record.AsOf.Equal(asOf.UTC()) {
 		return shoal.NewError(
 			shoal.ErrorConflict, "snapshot pin is not a trusted corpus frontier")
 	}
+	membership, err := e.snapshotMembershipLocked(id)
+	if err != nil {
+		return err
+	}
 	for _, nodeID := range nodeIDs {
 		node, current := e.graphNodes[nodeID]
-		bornAt, known := e.sourceNodeBirth[nodeID]
-		if !current || interaction.IsInteractionKind(node.Kind) ||
-			!known || bornAt.After(asOf.UTC()) {
+		_, present := membership[nodeID]
+		if !current || interaction.IsInteractionKind(node.Kind) || !present {
 			return shoal.NewError(
 				shoal.ErrorConflict,
 				"interaction source was not present in the pinned snapshot",
@@ -96,9 +99,18 @@ func (e *Explorer) ValidateSnapshot(
 
 func (e *Explorer) registerSnapshotLocked(snapshot Snapshot) error {
 	id := shoal.ID(snapshot.ID)
-	record := persistedSnapshot{ID: id, AsOf: snapshot.AsOf.UTC()}
+	currentNodes := e.currentSourceNodeSetLocked()
+	added, removed := snapshotDelta(e.latestSnapshotNodes, currentNodes)
+	record := persistedSnapshot{
+		ID: id, AsOf: snapshot.AsOf.UTC(), ParentID: e.latestSnapshotID,
+		AddedNodeIDs: added, RemovedNodeIDs: removed,
+	}
 	if existing, ok := e.snapshotHistory[snapshot.ID]; ok {
-		if existing.Equal(record.AsOf) {
+		membership, err := e.snapshotMembershipLocked(id)
+		if err == nil && existing.AsOf.Equal(record.AsOf) &&
+			snapshotNodeSetsEqual(membership, currentNodes) {
+			e.latestSnapshotID = id
+			e.latestSnapshotNodes = currentNodes
 			return nil
 		}
 		return shoal.NewError(
@@ -107,7 +119,9 @@ func (e *Explorer) registerSnapshotLocked(snapshot Snapshot) error {
 		)
 	}
 	if e.readOnly {
-		e.snapshotHistory[snapshot.ID] = record.AsOf
+		e.snapshotHistory[snapshot.ID] = record
+		e.latestSnapshotID = id
+		e.latestSnapshotNodes = currentNodes
 		return nil
 	}
 	accepted, err := e.conditionalInteractionRecord(
@@ -121,22 +135,134 @@ func (e *Explorer) registerSnapshotLocked(snapshot Snapshot) error {
 		return err
 	}
 	if !accepted {
-		var current persistedSnapshot
+		var winner persistedSnapshot
 		found, err := e.lookupEmbeddedRecord(
-			snapshotRecordRow(id), embeddedRecordSnapshot, &current)
+			snapshotRecordRow(id), embeddedRecordSnapshot, &winner)
 		if err != nil {
 			return err
 		}
-		current.AsOf = current.AsOf.UTC()
-		if !found || !persistedSnapshotsEqual(current, record) {
+		winner.AsOf = winner.AsOf.UTC()
+		if !found || winner.ID != id || !winner.AsOf.Equal(record.AsOf) {
 			return shoal.NewError(
 				shoal.ErrorConflict,
 				"snapshot ID is already registered with different content",
 			)
 		}
+		e.snapshotHistory[snapshot.ID] = winner
+		membership, err := e.snapshotMembershipLocked(id)
+		if err != nil || !snapshotNodeSetsEqual(membership, currentNodes) {
+			return shoal.NewError(
+				shoal.ErrorConflict,
+				"snapshot ID is already registered with different membership",
+			)
+		}
+		record = winner
 	}
-	e.snapshotHistory[snapshot.ID] = record.AsOf
+	e.snapshotHistory[snapshot.ID] = record
+	e.latestSnapshotID = id
+	e.latestSnapshotNodes = currentNodes
 	return nil
+}
+
+func snapshotNodeSetsEqual(
+	left, right map[shoal.ID]struct{},
+) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for id := range left {
+		if _, ok := right[id]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func (e *Explorer) restoreLatestSnapshotLocked() error {
+	var latest persistedSnapshot
+	found := false
+	for _, record := range e.snapshotHistory {
+		if !found || record.AsOf.After(latest.AsOf) ||
+			(record.AsOf.Equal(latest.AsOf) &&
+				shoal.CompareID(record.ID, latest.ID) > 0) {
+			latest = record
+			found = true
+		}
+	}
+	if !found {
+		return nil
+	}
+	membership, err := e.snapshotMembershipLocked(latest.ID)
+	if err != nil {
+		return err
+	}
+	e.latestSnapshotID = latest.ID
+	e.latestSnapshotNodes = membership
+	return nil
+}
+
+func (e *Explorer) currentSourceNodeSetLocked() map[shoal.ID]struct{} {
+	result := make(map[shoal.ID]struct{}, len(e.graphNodes))
+	for id, node := range e.graphNodes {
+		if !interaction.IsInteractionKind(node.Kind) {
+			result[id] = struct{}{}
+		}
+	}
+	return result
+}
+
+func snapshotDelta(
+	previous, current map[shoal.ID]struct{},
+) ([]shoal.ID, []shoal.ID) {
+	var added, removed []shoal.ID
+	for id := range current {
+		if _, ok := previous[id]; !ok {
+			added = append(added, id)
+		}
+	}
+	for id := range previous {
+		if _, ok := current[id]; !ok {
+			removed = append(removed, id)
+		}
+	}
+	sort.Slice(added, func(i, j int) bool {
+		return shoal.CompareID(added[i], added[j]) < 0
+	})
+	sort.Slice(removed, func(i, j int) bool {
+		return shoal.CompareID(removed[i], removed[j]) < 0
+	})
+	return added, removed
+}
+
+func (e *Explorer) snapshotMembershipLocked(
+	id shoal.ID,
+) (map[shoal.ID]struct{}, error) {
+	var chain []persistedSnapshot
+	seen := make(map[shoal.ID]struct{})
+	for id != "" {
+		if _, duplicate := seen[id]; duplicate {
+			return nil, shoal.NewError(
+				shoal.ErrorInternal, "snapshot history contains a cycle")
+		}
+		seen[id] = struct{}{}
+		record, ok := e.snapshotHistory[string(id)]
+		if !ok {
+			return nil, shoal.NewError(
+				shoal.ErrorInternal, "snapshot history is incomplete")
+		}
+		chain = append(chain, record)
+		id = record.ParentID
+	}
+	membership := make(map[shoal.ID]struct{})
+	for index := len(chain) - 1; index >= 0; index-- {
+		for _, nodeID := range chain[index].RemovedNodeIDs {
+			delete(membership, nodeID)
+		}
+		for _, nodeID := range chain[index].AddedNodeIDs {
+			membership[nodeID] = struct{}{}
+		}
+	}
+	return membership, nil
 }
 
 // BoundedNeighborhood expands the cached adjacency index without scanning or
