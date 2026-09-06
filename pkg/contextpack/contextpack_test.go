@@ -123,7 +123,16 @@ func TestBuildFromEmbeddedExplorerExactEvidenceAndDeterminism(t *testing.T) {
 
 func TestBuildPinsEmbeddingSpaceIdentity(t *testing.T) {
 	client, request, response, pins := embeddedFixture(t)
-	response.EmbeddingSpaceID = "embedding-space-v3"
+	request.Modes = []retrieval.Mode{retrieval.ModeVector}
+	constituent, err := retrieval.EmbeddingSpaceIdentityID("space-v3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.EmbeddingSpaceID, err = retrieval.EmbeddingSpaceSetID(constituent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.EmbeddingSpaceIDs = []shoal.ID{constituent}
 	pack, err := (Builder{Reader: client}).Build(
 		context.Background(),
 		InitialRequest{Request: request, Response: response, Pins: pins},
@@ -138,12 +147,64 @@ func TestBuildPinsEmbeddingSpaceIdentity(t *testing.T) {
 	if !ok || identity != response.EmbeddingSpaceID {
 		t.Fatalf("embedding space = %q, %t", identity, ok)
 	}
+	constituents, err := EmbeddingSpaceIDs(pack)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(constituents) != 1 || constituents[0] != constituent {
+		t.Fatalf("embedding space constituents = %v", constituents)
+	}
 	pins.EmbeddingSpaceID = "different-space"
 	if _, err := (Builder{Reader: client}).Build(
 		context.Background(),
 		InitialRequest{Request: request, Response: response, Pins: pins},
 	); err == nil {
 		t.Fatal("mismatched trusted embedding-space pin was accepted")
+	}
+}
+
+func TestMergeEmbeddingSpaceMetadataIsASetUnion(t *testing.T) {
+	spaceA, err := retrieval.EmbeddingSpaceIdentityID("space-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	spaceB, err := retrieval.EmbeddingSpaceIdentityID("space-b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	metadata, err := MergeEmbeddingSpaceMetadata(nil, []shoal.ID{spaceA})
+	if err != nil {
+		t.Fatal(err)
+	}
+	metadata, err = MergeEmbeddingSpaceMetadata(
+		metadata, []shoal.ID{spaceB})
+	if err != nil {
+		t.Fatal(err)
+	}
+	metadata, err = MergeEmbeddingSpaceMetadata(
+		metadata, []shoal.ID{spaceA})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids, err := embeddingSpaceIDsFromMetadata(metadata)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ids) != 2 ||
+		!((ids[0] == spaceA && ids[1] == spaceB) ||
+			(ids[0] == spaceB && ids[1] == spaceA)) {
+		t.Fatalf("merged constituent IDs = %v", ids)
+	}
+	got, ok, err := embeddingSpaceIDFromMetadata(metadata)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := retrieval.EmbeddingSpaceSetID(spaceA, spaceB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || got != want {
+		t.Fatalf("merged set ID = %q, %t, want %q", got, ok, want)
 	}
 }
 

@@ -187,7 +187,9 @@ func (e *Explorer) RecordInteraction(
 	if err != nil {
 		return err
 	}
-	if err := e.requireInteractionIDsAvailableLocked(subgraph); err != nil {
+	if err := e.requireInteractionGraphIDsAvailableLocked(
+		subgraph.Nodes, subgraph.Edges,
+	); err != nil {
 		return err
 	}
 	record := persistedInteraction{
@@ -216,13 +218,16 @@ func (e *Explorer) RecordInteraction(
 		return err
 	}
 	e.interactions[session.ID] = &record
-	return e.rebuildCurrentGraphLocked()
+	if err := e.rebuildCurrentGraphLocked(); err != nil {
+		return MarkCommittedInteraction(err)
+	}
+	return nil
 }
 
-func (e *Explorer) requireInteractionIDsAvailableLocked(
-	subgraph interaction.Subgraph,
+func (e *Explorer) requireInteractionGraphIDsAvailableLocked(
+	nodes []graph.Node, edges []graph.Edge,
 ) error {
-	for _, node := range subgraph.Nodes {
+	for _, node := range nodes {
 		if existing, ok := e.graphNodes[node.ID]; ok {
 			return shoal.NewError(
 				shoal.ErrorConflict,
@@ -231,7 +236,7 @@ func (e *Explorer) requireInteractionIDsAvailableLocked(
 			)
 		}
 	}
-	for _, edge := range subgraph.Edges {
+	for _, edge := range edges {
 		if existing, ok := e.graphEdges[edge.ID]; ok {
 			return shoal.NewError(
 				shoal.ErrorConflict,
@@ -314,6 +319,11 @@ func (e *Explorer) DeleteInteraction(
 	if err != nil {
 		return interaction.Tombstone{}, err
 	}
+	if err := e.requireInteractionGraphIDsAvailableLocked(
+		[]graph.Node{node}, nil,
+	); err != nil {
+		return interaction.Tombstone{}, err
+	}
 	record := persistedInteraction{
 		SessionID:                sessionID,
 		SnapshotID:               existing.SnapshotID,
@@ -340,7 +350,7 @@ func (e *Explorer) DeleteInteraction(
 	}
 	e.interactions[sessionID] = &record
 	if err := e.rebuildCurrentGraphLocked(); err != nil {
-		return interaction.Tombstone{}, err
+		return interaction.Tombstone{}, MarkCommittedInteraction(err)
 	}
 	return tombstone, nil
 }

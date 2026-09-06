@@ -288,11 +288,19 @@ func TestResponseRejectsDuplicateEvidenceOrderingKey(t *testing.T) {
 }
 
 func TestEmbeddingSpaceSetIDIsCanonicalAndOpaque(t *testing.T) {
-	first, err := retrieval.EmbeddingSpaceSetID("space-b", "space-a", "space-b")
+	spaceA, err := retrieval.EmbeddingSpaceIdentityID("space-a")
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := retrieval.EmbeddingSpaceSetID("space-a", "space-b")
+	spaceB, err := retrieval.EmbeddingSpaceIdentityID("space-b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := retrieval.EmbeddingSpaceSetID(spaceB, spaceA, spaceB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := retrieval.EmbeddingSpaceSetID(spaceA, spaceB)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -303,8 +311,19 @@ func TestEmbeddingSpaceSetIDIsCanonicalAndOpaque(t *testing.T) {
 		strings.Contains(string(first), "space-b") {
 		t.Fatalf("embedding space ID exposes provider identity: %q", first)
 	}
+	if strings.Contains(string(spaceA), "space-a") {
+		t.Fatalf("constituent ID exposes provider identity: %q", spaceA)
+	}
 	if empty, err := retrieval.EmbeddingSpaceSetID(); err != nil || empty != "" {
 		t.Fatalf("empty embedding space set = %q, %v", empty, err)
+	}
+}
+
+func TestVectorResponseRequiresEmbeddingSpaceID(t *testing.T) {
+	if err := (retrieval.Response{}).ValidateFor(retrieval.Request{
+		Text: "query", Modes: []retrieval.Mode{retrieval.ModeVector},
+	}); !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
+		t.Fatalf("missing vector embedding space error = %v", err)
 	}
 }
 

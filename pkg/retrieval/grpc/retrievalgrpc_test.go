@@ -63,9 +63,18 @@ func TestInProcessAndLoopbackParity(t *testing.T) {
 		AsOf:    time.Date(2026, time.August, 22, 8, 0, 0, 0, time.UTC),
 		Explain: true,
 	}
+	embeddingSpace, err := retrieval.EmbeddingSpaceIdentityID("space-v3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	embeddingSpaceSet, err := retrieval.EmbeddingSpaceSetID(embeddingSpace)
+	if err != nil {
+		t.Fatal(err)
+	}
 	want := retrieval.Response{
-		RequestID:        "request-1",
-		EmbeddingSpaceID: "embedding-space-v3",
+		RequestID:         "request-1",
+		EmbeddingSpaceID:  embeddingSpaceSet,
+		EmbeddingSpaceIDs: []shoal.ID{embeddingSpace},
 		Results: []retrieval.Result{{
 			ID:    "result-1",
 			Score: 0.91,
@@ -396,6 +405,21 @@ func TestServerRejectsInvalidUTF8OutgoingResponse(t *testing.T) {
 			name: "request ID",
 			mutate: func(response *retrieval.Response) {
 				response.RequestID = shoal.ID(invalid)
+			},
+		},
+		{
+			name: "embedding space ID",
+			mutate: func(response *retrieval.Response) {
+				response.EmbeddingSpaceID = shoal.ID(invalid)
+			},
+		},
+		{
+			name: "embedding space constituent ID",
+			mutate: func(response *retrieval.Response) {
+				constituent := shoal.ID(invalid)
+				response.EmbeddingSpaceIDs = []shoal.ID{constituent}
+				response.EmbeddingSpaceID, _ =
+					retrieval.EmbeddingSpaceSetID(constituent)
 			},
 		},
 		{

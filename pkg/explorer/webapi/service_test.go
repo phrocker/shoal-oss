@@ -1099,6 +1099,14 @@ func TestRemoteServiceCapabilityNegotiation(t *testing.T) {
 func TestRemoteServiceAllowsScopedVectorWhenGlobalCapabilityIsUnavailable(t *testing.T) {
 	retrieveCalled := false
 	now := time.Date(2026, time.August, 29, 12, 0, 0, 0, time.UTC)
+	embeddingSpace, err := retrieval.EmbeddingSpaceIdentityID("space-v3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	embeddingSpaceSet, err := retrieval.EmbeddingSpaceSetID(embeddingSpace)
+	if err != nil {
+		t.Fatal(err)
+	}
 	upstream := httptest.NewServer(http.HandlerFunc(func(
 		writer http.ResponseWriter,
 		request *http.Request,
@@ -1123,7 +1131,8 @@ func TestRemoteServiceAllowsScopedVectorWhenGlobalCapabilityIsUnavailable(t *tes
 					ID: "snapshot", AsOf: now, Frontier: 1,
 				},
 				Retrieval: retrieval.Response{
-					EmbeddingSpaceID: "embedding-space-v3",
+					EmbeddingSpaceID:  embeddingSpaceSet,
+					EmbeddingSpaceIDs: []shoal.ID{embeddingSpace},
 				},
 			})
 		default:
@@ -1147,7 +1156,9 @@ func TestRemoteServiceAllowsScopedVectorWhenGlobalCapabilityIsUnavailable(t *tes
 	if err != nil {
 		t.Fatalf("scoped vector retrieve: %v", err)
 	}
-	if response.Retrieval.EmbeddingSpaceID != "embedding-space-v3" {
+	if response.Retrieval.EmbeddingSpaceID != embeddingSpaceSet ||
+		len(response.Retrieval.EmbeddingSpaceIDs) != 1 ||
+		response.Retrieval.EmbeddingSpaceIDs[0] != embeddingSpace {
 		t.Fatalf("remote embedding space = %q",
 			response.Retrieval.EmbeddingSpaceID)
 	}

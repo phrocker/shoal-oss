@@ -156,7 +156,8 @@ func (c *Client) Interactions(
 		session, readErr := reader.Interaction(ctx, summary.SessionID)
 		if readErr != nil {
 			if shoal.IsErrorCode(readErr, shoal.ErrorNotFound) ||
-				shoal.IsErrorCode(readErr, shoal.ErrorUnavailable) {
+				shoal.IsErrorCode(readErr, shoal.ErrorUnavailable) ||
+				shoal.IsErrorCode(readErr, shoal.ErrorConflict) {
 				continue
 			}
 			return nil, directBaseError(readErr)
@@ -272,10 +273,19 @@ func (c *Client) InteractionSubgraph(
 	if err != nil {
 		return explorer.Neighborhood{}, directBaseError(err)
 	}
+	if interactionSubgraphIsTombstone(subgraph) &&
+		!summaryFingerprintMatchesDecision(*summary, decision) {
+		return explorer.Neighborhood{}, auth.ObjectNotFound()
+	}
 	if err := guard.Check(ctx); err != nil {
 		return explorer.Neighborhood{}, err
 	}
 	return subgraph, nil
+}
+
+func interactionSubgraphIsTombstone(subgraph explorer.Neighborhood) bool {
+	return len(subgraph.Nodes) == 1 &&
+		subgraph.Nodes[0].Kind == interaction.KindTombstone
 }
 
 func (c *Client) authorizeInteractionSources(
@@ -314,7 +324,7 @@ func interactionPinMatchesDecision(
 		return false
 	}
 	return session.AuthorizationFingerprint == shoal.ID(fingerprint.String()) &&
-		decision.AuthenticationExpires().Equal(session.AuthorizationExpiresAt)
+		!decision.AuthenticationExpires().Before(session.AuthorizationExpiresAt)
 }
 
 func summaryFingerprintMatchesDecision(

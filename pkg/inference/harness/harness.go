@@ -35,6 +35,7 @@ import (
 
 	"github.com/phrocker/shoal-oss/pkg/contextpack"
 	"github.com/phrocker/shoal-oss/pkg/inference"
+	"github.com/phrocker/shoal-oss/pkg/retrieval"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
@@ -400,28 +401,32 @@ func (a Action) validate() error {
 }
 
 type ToolResult struct {
-	correlation      shoal.ID
-	kind             ActionKind
-	anchors          []inference.EvidenceAnchor
-	snapshot         inference.SnapshotPin
-	auth             inference.AuthPin
-	embeddingSpaceID shoal.ID
+	correlation       shoal.ID
+	kind              ActionKind
+	anchors           []inference.EvidenceAnchor
+	snapshot          inference.SnapshotPin
+	auth              inference.AuthPin
+	embeddingSpaceID  shoal.ID
+	embeddingSpaceIDs []shoal.ID
 }
 
 func NewToolResult(correlation shoal.ID, kind ActionKind, anchors []inference.EvidenceAnchor, snapshot inference.SnapshotPin, auth inference.AuthPin) (ToolResult, error) {
-	return NewToolResultWithEmbeddingSpace(
-		correlation, kind, anchors, snapshot, auth, "")
+	return NewToolResultWithEmbeddingSpaces(
+		correlation, kind, anchors, snapshot, auth,
+		"", nil,
+	)
 }
 
-// NewToolResultWithEmbeddingSpace records the opaque identity of the vector
-// space/set used by a retrieval tool call.
-func NewToolResultWithEmbeddingSpace(
+// NewToolResultWithEmbeddingSpaces records both the aggregate vector-space
+// identity and its canonical constituent identities.
+func NewToolResultWithEmbeddingSpaces(
 	correlation shoal.ID,
 	kind ActionKind,
 	anchors []inference.EvidenceAnchor,
 	snapshot inference.SnapshotPin,
 	auth inference.AuthPin,
 	embeddingSpaceID shoal.ID,
+	embeddingSpaceIDs []shoal.ID,
 ) (ToolResult, error) {
 	if len(anchors) > inference.MaxEvidenceAnchors {
 		return ToolResult{}, invalid("tool result anchor count is outside the supported range")
@@ -431,7 +436,13 @@ func NewToolResultWithEmbeddingSpace(
 		anchors:  append([]inference.EvidenceAnchor(nil), anchors...),
 		snapshot: snapshot, auth: auth,
 		embeddingSpaceID: embeddingSpaceID,
+		embeddingSpaceIDs: append(
+			[]shoal.ID(nil), embeddingSpaceIDs...),
 	}
+	sort.Slice(r.embeddingSpaceIDs, func(i, j int) bool {
+		return shoal.CompareID(
+			r.embeddingSpaceIDs[i], r.embeddingSpaceIDs[j]) < 0
+	})
 	sort.Slice(r.anchors, func(i, j int) bool { return shoal.CompareID(r.anchors[i].ID(), r.anchors[j].ID()) < 0 })
 	if err := r.validate(); err != nil {
 		return ToolResult{}, err
@@ -446,6 +457,9 @@ func (r ToolResult) Anchors() []inference.EvidenceAnchor {
 func (r ToolResult) Snapshot() inference.SnapshotPin  { return r.snapshot }
 func (r ToolResult) Authorization() inference.AuthPin { return r.auth }
 func (r ToolResult) EmbeddingSpaceID() shoal.ID       { return r.embeddingSpaceID }
+func (r ToolResult) EmbeddingSpaceIDs() []shoal.ID {
+	return append([]shoal.ID(nil), r.embeddingSpaceIDs...)
+}
 func (r ToolResult) validate() error {
 	if err := validateLogicalID("tool result correlation ID", r.correlation); err != nil {
 		return err
@@ -465,6 +479,28 @@ func (r ToolResult) validate() error {
 		"tool result embedding space ID", r.embeddingSpaceID,
 	); err != nil {
 		return err
+	}
+	for index, id := range r.embeddingSpaceIDs {
+		if err := shoal.ValidateRequiredID(
+			"tool result embedding space constituent ID", id,
+		); err != nil {
+			return err
+		}
+		if index > 0 &&
+			shoal.CompareID(r.embeddingSpaceIDs[index-1], id) >= 0 {
+			return invalid(
+				"tool result embedding space constituent IDs must be unique")
+		}
+	}
+	if len(r.embeddingSpaceIDs) > 0 {
+		expected, err := retrieval.EmbeddingSpaceSetID(
+			r.embeddingSpaceIDs...)
+		if err != nil {
+			return err
+		}
+		if expected != r.embeddingSpaceID {
+			return invalid("tool result embedding space ID is not canonical")
+		}
 	}
 	if len(r.anchors) > inference.MaxEvidenceAnchors {
 		return invalid("tool result anchor count is outside the supported range")
@@ -1075,7 +1111,7 @@ func (g *Generator) Run(ctx context.Context, pack inference.ContextPack) (Record
 		nextPack, err := addAnchors(
 			transcript.context,
 			toolResult.anchors,
-			toolResult.embeddingSpaceID,
+			toolResult.embeddingSpaceIDs,
 		)
 		if err != nil {
 			return finish(StopReasonInvalid, step, "context pack", inference.InferenceResult{}, err)
@@ -1339,7 +1375,7 @@ func validateToolResult(action Action, result ToolResult, original inference.Con
 func addAnchors(
 	pack inference.ContextPack,
 	additions []inference.EvidenceAnchor,
-	embeddingSpaceID shoal.ID,
+	embeddingSpaceIDs []shoal.ID,
 ) (inference.ContextPack, error) {
 	anchors := pack.Evidence()
 	seen := make(map[shoal.ID]struct{}, len(anchors)+len(additions))
@@ -1359,7 +1395,7 @@ func addAnchors(
 		ontologyPtr = &ontology
 	}
 	metadata, err := contextpack.MergeEmbeddingSpaceMetadata(
-		pack.Metadata(), embeddingSpaceID)
+		pack.Metadata(), embeddingSpaceIDs)
 	if err != nil {
 		return inference.ContextPack{}, err
 	}

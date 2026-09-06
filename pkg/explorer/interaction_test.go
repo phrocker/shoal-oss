@@ -426,6 +426,17 @@ func TestGeneratedInteractionNodeIDsCannotCollide(t *testing.T) {
 	); err != nil {
 		t.Fatalf("existing interaction was damaged by collision: %v", err)
 	}
+
+	recordedSession(
+		t, corpus, "delete-target", spans[:1], spans[:1])
+	tombstoneCollisionID := interaction.TombstoneID("delete-target")
+	recordedSession(
+		t, corpus, tombstoneCollisionID, spans[:1], spans[:1])
+	if _, err := corpus.DeleteInteraction(
+		ctx, "delete-target",
+	); !shoal.IsErrorCode(err, shoal.ErrorConflict) {
+		t.Fatalf("generated tombstone-node collision = %v", err)
+	}
 }
 
 func TestOversizedVisibilityPersistsAcrossRestart(t *testing.T) {

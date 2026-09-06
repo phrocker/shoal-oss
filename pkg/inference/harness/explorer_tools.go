@@ -188,10 +188,11 @@ func (h *ExplorerToolHost) Retrieve(
 		return ToolResult{}, err
 	}
 	if len(response.Results) == 0 {
-		return NewToolResultWithEmbeddingSpace(
+		return NewToolResultWithEmbeddingSpaces(
 			call.CorrelationID(), ActionRetrieve, nil,
 			call.Snapshot(), call.Authorization(),
 			response.EmbeddingSpaceID,
+			response.EmbeddingSpaceIDs,
 		)
 	}
 	neighborhoods, err := neighborhoodsFromRetrievalResponse(response)
@@ -218,10 +219,11 @@ func (h *ExplorerToolHost) Retrieve(
 	if err := h.validateAuthorization(ctx, call); err != nil {
 		return ToolResult{}, err
 	}
-	return NewToolResultWithEmbeddingSpace(
+	return NewToolResultWithEmbeddingSpaces(
 		call.CorrelationID(), ActionRetrieve, pack.Evidence(),
 		call.Snapshot(), call.Authorization(),
 		response.EmbeddingSpaceID,
+		response.EmbeddingSpaceIDs,
 	)
 }
 

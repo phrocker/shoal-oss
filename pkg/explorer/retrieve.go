@@ -270,20 +270,31 @@ func (e *Explorer) retrieve(
 	}
 
 	var embeddingSpaceID shoal.ID
+	var embeddingSpaceIDs []shoal.ID
 	if hasVector {
-		identities := make([]string, len(participatingSpaces))
+		embeddingSpaceIDs = make([]shoal.ID, len(participatingSpaces))
 		for index, space := range participatingSpaces {
-			identities[index] = space.Identity
+			embeddingSpaceIDs[index], err =
+				retrieval.EmbeddingSpaceIdentityID(space.Identity)
+			if err != nil {
+				return retrieval.Response{}, err
+			}
 		}
-		embeddingSpaceID, err = retrieval.EmbeddingSpaceSetID(identities...)
+		sort.Slice(embeddingSpaceIDs, func(i, j int) bool {
+			return shoal.CompareID(
+				embeddingSpaceIDs[i], embeddingSpaceIDs[j]) < 0
+		})
+		embeddingSpaceID, err = retrieval.EmbeddingSpaceSetID(
+			embeddingSpaceIDs...)
 		if err != nil {
 			return retrieval.Response{}, err
 		}
 	}
 	response := retrieval.Response{
-		RequestID:        requestID(request),
-		EmbeddingSpaceID: embeddingSpaceID,
-		Results:          make([]retrieval.Result, 0, len(ranked)),
+		RequestID:         requestID(request),
+		EmbeddingSpaceID:  embeddingSpaceID,
+		EmbeddingSpaceIDs: embeddingSpaceIDs,
+		Results:           make([]retrieval.Result, 0, len(ranked)),
 	}
 	for _, match := range ranked {
 		result := retrieval.Result{

@@ -60,12 +60,13 @@ const (
 	DefaultMaxProvenanceBytes = 64 * 1024
 	DefaultMaxHierarchyDepth  = 16
 
-	metadataBuilderKey        = "shoal.context.builder"
-	metadataRequestKey        = "shoal.context.retrieval_request_id"
-	metadataRetrievalKey      = "shoal.context.retrieval_identity"
-	metadataPolicyKey         = "shoal.context.policy_id"
-	metadataEmbeddingSpaceKey = "shoal.context.embedding_space_id"
-	builderVersion            = "explorer-context/v1"
+	metadataBuilderKey         = "shoal.context.builder"
+	metadataRequestKey         = "shoal.context.retrieval_request_id"
+	metadataRetrievalKey       = "shoal.context.retrieval_identity"
+	metadataPolicyKey          = "shoal.context.policy_id"
+	metadataEmbeddingSpaceKey  = "shoal.context.embedding_space_id"
+	metadataEmbeddingSpacesKey = "shoal.context.embedding_space_ids"
+	builderVersion             = "explorer-context/v1"
 )
 
 // Reader is the stable, authorization-enforcing Explorer seam needed for
@@ -106,7 +107,11 @@ type Pins struct {
 	// stable identity for that exact set. Empty means no vector space
 	// participated.
 	EmbeddingSpaceID shoal.ID
-	Ontology         *inference.OntologyIdentity
+	// EmbeddingSpaceIDs are the canonical opaque constituent identities used
+	// to derive EmbeddingSpaceID. They allow later tool calls to union spaces
+	// without re-hashing already-aggregated set IDs.
+	EmbeddingSpaceIDs []shoal.ID
+	Ontology          *inference.OntologyIdentity
 }
 
 // InitialRequest contains one retrieval operation and optional pre-hydrated
@@ -224,6 +229,8 @@ func (b Builder) Build(ctx context.Context, input InitialRequest) (inference.Con
 		return inference.ContextPack{}, err
 	}
 	embeddingSpaceID := input.Pins.EmbeddingSpaceID
+	embeddingSpaceIDs := append(
+		[]shoal.ID(nil), input.Pins.EmbeddingSpaceIDs...)
 	if response.EmbeddingSpaceID != "" {
 		if embeddingSpaceID != "" &&
 			embeddingSpaceID != response.EmbeddingSpaceID {
@@ -231,11 +238,30 @@ func (b Builder) Build(ctx context.Context, input InitialRequest) (inference.Con
 				"retrieval embedding space does not match the trusted pin")
 		}
 		embeddingSpaceID = response.EmbeddingSpaceID
+		embeddingSpaceIDs = append(
+			[]shoal.ID(nil), response.EmbeddingSpaceIDs...)
+	}
+	embeddingSpaceIDs, err = normalizeEmbeddingSpaceIDs(embeddingSpaceIDs)
+	if err != nil {
+		return inference.ContextPack{}, err
+	}
+	if len(embeddingSpaceIDs) > 0 {
+		expected, deriveErr := retrieval.EmbeddingSpaceSetID(
+			embeddingSpaceIDs...)
+		if deriveErr != nil {
+			return inference.ContextPack{}, deriveErr
+		}
+		if embeddingSpaceID != "" && embeddingSpaceID != expected {
+			return inference.ContextPack{}, invalid(
+				"embedding space set identity is not canonical")
+		}
+		embeddingSpaceID = expected
 	}
 	input.Pins.EmbeddingSpaceID = embeddingSpaceID
+	input.Pins.EmbeddingSpaceIDs = embeddingSpaceIDs
 	metadata, err := provenanceMetadata(
 		input.Metadata, request, response, input.Pins.PolicyID,
-		embeddingSpaceID, limits)
+		embeddingSpaceID, embeddingSpaceIDs, limits)
 	if err != nil {
 		return inference.ContextPack{}, err
 	}
@@ -938,6 +964,7 @@ func provenanceMetadata(
 	response retrieval.Response,
 	policyID shoal.ID,
 	embeddingSpaceID shoal.ID,
+	embeddingSpaceIDs []shoal.ID,
 	limits Limits,
 ) (shoal.Metadata, error) {
 	if err := shoal.ValidateRequiredID("policy ID", policyID); err != nil {
@@ -948,6 +975,13 @@ func provenanceMetadata(
 	); err != nil {
 		return nil, err
 	}
+	for _, id := range embeddingSpaceIDs {
+		if err := shoal.ValidateRequiredID(
+			"embedding space constituent ID", id,
+		); err != nil {
+			return nil, err
+		}
+	}
 	metadata := cloneMetadata(input)
 	if metadata == nil {
 		metadata = make(shoal.Metadata)
@@ -955,6 +989,7 @@ func provenanceMetadata(
 	for _, key := range []string{
 		metadataBuilderKey, metadataRequestKey, metadataRetrievalKey,
 		metadataPolicyKey, metadataEmbeddingSpaceKey,
+		metadataEmbeddingSpacesKey,
 	} {
 		if _, exists := metadata[key]; exists {
 			return nil, invalid("context metadata uses a reserved builder key")
@@ -971,6 +1006,10 @@ func provenanceMetadata(
 	if embeddingSpaceID != "" {
 		metadata[metadataEmbeddingSpaceKey] = encodeID(embeddingSpaceID)
 	}
+	if len(embeddingSpaceIDs) > 0 {
+		metadata[metadataEmbeddingSpacesKey] =
+			encodeIDs(embeddingSpaceIDs)
+	}
 	if metadataBytes(metadata) > limits.MaxProvenanceBytes {
 		return nil, invalid("context metadata and provenance exceed the byte bound")
 	}
@@ -984,7 +1023,32 @@ func provenanceMetadata(
 // Builder when the context was assembled. The boolean is false for non-vector
 // contexts. Malformed reserved metadata fails closed.
 func EmbeddingSpaceID(pack inference.ContextPack) (shoal.ID, bool, error) {
-	return embeddingSpaceIDFromMetadata(pack.Metadata())
+	metadata := pack.Metadata()
+	identity, found, err := embeddingSpaceIDFromMetadata(metadata)
+	if err != nil {
+		return "", false, err
+	}
+	constituents, err := embeddingSpaceIDsFromMetadata(metadata)
+	if err != nil {
+		return "", false, err
+	}
+	if len(constituents) > 0 {
+		expected, deriveErr := retrieval.EmbeddingSpaceSetID(constituents...)
+		if deriveErr != nil {
+			return "", false, deriveErr
+		}
+		if !found || identity != expected {
+			return "", false, invalid(
+				"context embedding space set identity is not canonical")
+		}
+	}
+	return identity, found, nil
+}
+
+// EmbeddingSpaceIDs returns the canonical constituent space identities pinned
+// by Builder. The values are opaque digests, never provider credentials.
+func EmbeddingSpaceIDs(pack inference.ContextPack) ([]shoal.ID, error) {
+	return embeddingSpaceIDsFromMetadata(pack.Metadata())
 }
 
 func embeddingSpaceIDFromMetadata(
@@ -1009,38 +1073,111 @@ func embeddingSpaceIDFromMetadata(
 	return id, true, nil
 }
 
+func embeddingSpaceIDsFromMetadata(
+	metadata shoal.Metadata,
+) ([]shoal.ID, error) {
+	value := metadata[metadataEmbeddingSpacesKey]
+	if value == "" {
+		return nil, nil
+	}
+	parts := strings.Split(value, ",")
+	ids := make([]shoal.ID, len(parts))
+	for index, part := range parts {
+		const prefix = "hex:"
+		if !strings.HasPrefix(part, prefix) {
+			return nil, invalid(
+				"context embedding space constituents are invalid")
+		}
+		decoded, err := hex.DecodeString(strings.TrimPrefix(part, prefix))
+		if err != nil {
+			return nil, invalid(
+				"context embedding space constituents are invalid")
+		}
+		ids[index] = shoal.ID(decoded)
+		if err := shoal.ValidateRequiredID(
+			"embedding space constituent ID", ids[index],
+		); err != nil {
+			return nil, err
+		}
+		if index > 0 && shoal.CompareID(ids[index-1], ids[index]) >= 0 {
+			return nil, invalid(
+				"context embedding space constituents are not canonical")
+		}
+	}
+	return ids, nil
+}
+
+func normalizeEmbeddingSpaceIDs(ids []shoal.ID) ([]shoal.ID, error) {
+	normalized := append([]shoal.ID(nil), ids...)
+	for _, id := range normalized {
+		if err := shoal.ValidateRequiredID(
+			"embedding space constituent ID", id,
+		); err != nil {
+			return nil, err
+		}
+	}
+	sort.Slice(normalized, func(i, j int) bool {
+		return shoal.CompareID(normalized[i], normalized[j]) < 0
+	})
+	unique := normalized[:0]
+	for _, id := range normalized {
+		if len(unique) > 0 && unique[len(unique)-1] == id {
+			continue
+		}
+		unique = append(unique, id)
+	}
+	return unique, nil
+}
+
 // MergeEmbeddingSpaceMetadata returns independently owned context metadata
 // whose embedding-space pin covers both the existing context and one new tool
 // result. Repeated identities are idempotent; distinct identities produce a
 // stable opaque set identity.
 func MergeEmbeddingSpaceMetadata(
-	metadata shoal.Metadata, next shoal.ID,
+	metadata shoal.Metadata, next []shoal.ID,
 ) (shoal.Metadata, error) {
-	if err := shoal.ValidateOptionalID("embedding space ID", next); err != nil {
-		return nil, err
+	for _, id := range next {
+		if err := shoal.ValidateRequiredID(
+			"embedding space constituent ID", id,
+		); err != nil {
+			return nil, err
+		}
 	}
 	merged := cloneMetadata(metadata)
-	if next == "" {
+	if len(next) == 0 {
 		return merged, nil
 	}
-	current, found, err := embeddingSpaceIDFromMetadata(merged)
+	current, err := embeddingSpaceIDsFromMetadata(merged)
 	if err != nil {
 		return nil, err
 	}
-	identity := next
-	if found && current != next {
-		identity, err = retrieval.EmbeddingSpaceSetID(
-			string(current), string(next))
-		if err != nil {
-			return nil, err
+	if len(current) == 0 {
+		if legacy, found, readErr := embeddingSpaceIDFromMetadata(merged); readErr != nil {
+			return nil, readErr
+		} else if found {
+			current = []shoal.ID{legacy}
 		}
-	} else if found {
-		identity = current
+	}
+	constituents := append(current, next...)
+	sort.Slice(constituents, func(i, j int) bool {
+		return shoal.CompareID(constituents[i], constituents[j]) < 0
+	})
+	unique := constituents[:0]
+	for _, id := range constituents {
+		if len(unique) > 0 && unique[len(unique)-1] == id {
+			continue
+		}
+		unique = append(unique, id)
+	}
+	identity, err := retrieval.EmbeddingSpaceSetID(unique...)
+	if err != nil {
+		return nil, err
 	}
 	if merged == nil {
 		merged = make(shoal.Metadata)
 	}
 	merged[metadataEmbeddingSpaceKey] = encodeID(identity)
+	merged[metadataEmbeddingSpacesKey] = encodeIDs(unique)
 	if err := shoal.ValidateMetadata("context metadata", merged); err != nil {
 		return nil, err
 	}
@@ -1182,6 +1319,7 @@ func retrievalIdentity(request retrieval.Request, response retrieval.Response) (
 	writeBool(digest, request.Explain)
 	writePart(digest, []byte(response.RequestID))
 	writePart(digest, []byte(response.EmbeddingSpaceID))
+	writeIDs(digest, response.EmbeddingSpaceIDs)
 	writeUint64(digest, uint64(len(response.Results)))
 	for _, result := range response.Results {
 		writePart(digest, []byte(result.ID))
@@ -1506,6 +1644,8 @@ func cloneResponse(response retrieval.Response) retrieval.Response {
 	cloned := retrieval.Response{
 		RequestID:        response.RequestID,
 		EmbeddingSpaceID: response.EmbeddingSpaceID,
+		EmbeddingSpaceIDs: append(
+			[]shoal.ID(nil), response.EmbeddingSpaceIDs...),
 	}
 	cloned.Results = make([]retrieval.Result, len(response.Results))
 	for i, result := range response.Results {
@@ -1817,6 +1957,14 @@ func writeMetadata(writer hash.Hash, metadata shoal.Metadata) {
 
 func encodeID(id shoal.ID) string {
 	return "hex:" + hex.EncodeToString([]byte(id))
+}
+
+func encodeIDs(ids []shoal.ID) string {
+	encoded := make([]string, len(ids))
+	for index, id := range ids {
+		encoded[index] = encodeID(id)
+	}
+	return strings.Join(encoded, ",")
 }
 
 func rangeContains(outer, inner document.SourceRange) bool {

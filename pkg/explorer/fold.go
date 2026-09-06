@@ -174,6 +174,11 @@ func (e *Explorer) FoldInteractions(
 			"fold identity is already used by an interaction session",
 		)
 	}
+	if err := e.requireInteractionGraphIDsAvailableLocked(
+		subgraph.Nodes, subgraph.Edges,
+	); err != nil {
+		return FoldResult{}, err
+	}
 	record := persistedFold{
 		FoldID:        subgraph.ID,
 		Members:       canonical.Members,
@@ -193,7 +198,7 @@ func (e *Explorer) FoldInteractions(
 	}
 	e.folds[record.FoldID] = &record
 	if err := e.rebuildCurrentGraphLocked(); err != nil {
-		return FoldResult{}, err
+		return FoldResult{}, MarkCommittedInteraction(err)
 	}
 	return FoldResult{
 		FoldID:         record.FoldID,
@@ -392,6 +397,11 @@ func (e *Explorer) DeleteFold(
 	if err != nil {
 		return interaction.Tombstone{}, err
 	}
+	if err := e.requireInteractionGraphIDsAvailableLocked(
+		[]graph.Node{node}, nil,
+	); err != nil {
+		return interaction.Tombstone{}, err
+	}
 	// The members are dropped, not retained beside the tombstone: a deleted
 	// fold must not keep a rehydratable copy of what it folded.
 	record := persistedFold{
@@ -412,7 +422,7 @@ func (e *Explorer) DeleteFold(
 	}
 	e.folds[foldID] = &record
 	if err := e.rebuildCurrentGraphLocked(); err != nil {
-		return interaction.Tombstone{}, err
+		return interaction.Tombstone{}, MarkCommittedInteraction(err)
 	}
 	return tombstone, nil
 }

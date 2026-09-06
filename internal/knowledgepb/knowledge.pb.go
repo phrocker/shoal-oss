@@ -811,12 +811,13 @@ func (x *RetrievalResult) GetExplanation() *Explanation {
 }
 
 type RetrieveResponse struct {
-	state            protoimpl.MessageState `protogen:"open.v1"`
-	RequestId        string                 `protobuf:"bytes,1,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
-	Results          []*RetrievalResult     `protobuf:"bytes,2,rep,name=results,proto3" json:"results,omitempty"`
-	EmbeddingSpaceId string                 `protobuf:"bytes,3,opt,name=embedding_space_id,json=embeddingSpaceId,proto3" json:"embedding_space_id,omitempty"`
-	unknownFields    protoimpl.UnknownFields
-	sizeCache        protoimpl.SizeCache
+	state             protoimpl.MessageState `protogen:"open.v1"`
+	RequestId         string                 `protobuf:"bytes,1,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
+	Results           []*RetrievalResult     `protobuf:"bytes,2,rep,name=results,proto3" json:"results,omitempty"`
+	EmbeddingSpaceId  string                 `protobuf:"bytes,3,opt,name=embedding_space_id,json=embeddingSpaceId,proto3" json:"embedding_space_id,omitempty"`
+	EmbeddingSpaceIds []string               `protobuf:"bytes,4,rep,name=embedding_space_ids,json=embeddingSpaceIds,proto3" json:"embedding_space_ids,omitempty"`
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
 }
 
 func (x *RetrieveResponse) Reset() {
@@ -868,6 +869,13 @@ func (x *RetrieveResponse) GetEmbeddingSpaceId() string {
 		return x.EmbeddingSpaceId
 	}
 	return ""
+}
+
+func (x *RetrieveResponse) GetEmbeddingSpaceIds() []string {
+	if x != nil {
+		return x.EmbeddingSpaceIds
+	}
+	return nil
 }
 
 var File_proto_knowledge_proto protoreflect.FileDescriptor
@@ -941,12 +949,13 @@ const file_proto_knowledge_proto_rawDesc = "" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x14\n" +
 	"\x05score\x18\x02 \x01(\x01R\x05score\x128\n" +
 	"\bevidence\x18\x03 \x03(\v2\x1c.shoal.knowledge.v1.EvidenceR\bevidence\x12A\n" +
-	"\vexplanation\x18\x04 \x01(\v2\x1f.shoal.knowledge.v1.ExplanationR\vexplanation\"\x9e\x01\n" +
+	"\vexplanation\x18\x04 \x01(\v2\x1f.shoal.knowledge.v1.ExplanationR\vexplanation\"\xce\x01\n" +
 	"\x10RetrieveResponse\x12\x1d\n" +
 	"\n" +
 	"request_id\x18\x01 \x01(\tR\trequestId\x12=\n" +
 	"\aresults\x18\x02 \x03(\v2#.shoal.knowledge.v1.RetrievalResultR\aresults\x12,\n" +
-	"\x12embedding_space_id\x18\x03 \x01(\tR\x10embeddingSpaceId*\x99\x01\n" +
+	"\x12embedding_space_id\x18\x03 \x01(\tR\x10embeddingSpaceId\x12.\n" +
+	"\x13embedding_space_ids\x18\x04 \x03(\tR\x11embeddingSpaceIds*\x99\x01\n" +
 	"\rRetrievalMode\x12\x1e\n" +
 	"\x1aRETRIEVAL_MODE_UNSPECIFIED\x10\x00\x12\x1a\n" +
 	"\x16RETRIEVAL_MODE_LEXICAL\x10\x01\x12\x19\n" +
