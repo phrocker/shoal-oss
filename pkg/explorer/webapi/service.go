@@ -137,6 +137,14 @@ type disclosureCountingRetriever interface {
 	) (retrieval.Response, authorized.Disclosure, error)
 }
 
+// reportingRetriever is the authorized retrieval extension that preserves
+// request-local embedding-space observability, including on provider failure.
+type reportingRetriever interface {
+	RetrieveWithReport(
+		context.Context, retrieval.Request,
+	) (retrieval.Response, authorized.RetrievalReport, error)
+}
+
 // disclosureCountingLister is the Documents-listing counterpart to
 // disclosureCountingRetriever under the same preference rule.
 type disclosureCountingLister interface {
@@ -157,10 +165,11 @@ type changeFeedBackend interface {
 
 // EmbeddedService adapts the public Explorer client to the workspace service.
 type EmbeddedService struct {
-	client          explorer.BoundedClient
-	ontologyMu      sync.RWMutex
-	ontologyVersion *ontology.OntologyVersion
-	clock           func() time.Time
+	client            explorer.BoundedClient
+	ontologyMu        sync.RWMutex
+	ontologyPublishMu sync.Mutex
+	ontologyVersion   *ontology.OntologyVersion
+	clock             func() time.Time
 }
 
 // NewEmbeddedService creates a local service without exposing the embedded
@@ -234,7 +243,7 @@ func (s *EmbeddedService) Extract(
 	if _, err := s.pin(ctx, request.Snapshot); err != nil {
 		return ExtractResponse{}, err
 	}
-	version, configured, err := s.ActiveOntology(ctx)
+	version, configured, err := s.activeOntologyForMutation(ctx)
 	if err != nil {
 		return ExtractResponse{}, err
 	}
@@ -480,7 +489,7 @@ func (s *EmbeddedService) Documents(
 // documentsCountingDisclosure lists the authorized documents and, when the
 // backing client can report it, the corpus-wide counts of current documents
 // withheld from this identity, split by reason class: plain authorization
-// denials and mosaic co-occurrence restrictions. See retrieveCountingDisclosure
+// denials and mosaic co-occurrence restrictions. See retrieveReporting
 // for the amplification risk of disclosing these counts; the same caveat applies
 // to the document listing. A client that reports only the older suppression
 // count still contributes the denial count with a zero restriction count, and a
@@ -584,8 +593,11 @@ func (s *EmbeddedService) Retrieve(
 	// The embedded backend is already pinned by the snapshot identity and does
 	// not implement historical publication-frontier reads.
 	query.AsOf = time.Time{}
-	response, disclosure, err := s.retrieveCountingDisclosure(ctx, query)
+	response, report, err := s.retrieveReporting(ctx, query)
 	if err != nil {
+		if report.Embedding != nil {
+			return RetrievalResponse{}, newEmbeddingQueryError(err, *report.Embedding)
+		}
 		return RetrievalResponse{}, err
 	}
 	if err := validateRetrievalResponse(response, query); err != nil {
@@ -597,15 +609,15 @@ func (s *EmbeddedService) Retrieve(
 	}
 	return RetrievalResponse{
 		Snapshot: snapshot, Retrieval: response,
-		Suppressed: disclosure.Suppressed, Restricted: disclosure.Restricted,
+		Suppressed: report.Disclosure.Suppressed,
+		Restricted: report.Disclosure.Restricted,
+		Embedding:  report.Embedding,
 	}, nil
 }
 
-// retrieveCountingDisclosure runs the authorized retrieval and, when the backing
-// client can report it, the counts of current documents withheld from this
-// identity and therefore never searched, split by reason class: plain
-// authorization denials (Suppressed) and mosaic co-occurrence restrictions
-// (Restricted).
+// retrieveReporting runs the authorized retrieval and, when the backing client
+// can report it, preserves both document withholding counts and request-local
+// authorized embedding-space outcomes.
 //
 // Amplification risk. The Suppressed count is a real disclosure. Because a
 // caller can re-run retrieval as the corpus changes, and vary the request, and
@@ -622,18 +634,24 @@ func (s *EmbeddedService) Retrieve(
 // content the way a caller-distinguishable denial signal could. It names no
 // domain and no document. See docs and app.js for how the two counts are
 // surfaced as distinct reason classes.
-func (s *EmbeddedService) retrieveCountingDisclosure(
+func (s *EmbeddedService) retrieveReporting(
 	ctx context.Context, query retrieval.Request,
-) (retrieval.Response, authorized.Disclosure, error) {
+) (retrieval.Response, authorized.RetrievalReport, error) {
+	if reporter, ok := s.client.(reportingRetriever); ok {
+		return reporter.RetrieveWithReport(ctx, query)
+	}
 	if counter, ok := s.client.(disclosureCountingRetriever); ok {
-		return counter.RetrieveWithDisclosure(ctx, query)
+		response, disclosure, err := counter.RetrieveWithDisclosure(ctx, query)
+		return response, authorized.RetrievalReport{Disclosure: disclosure}, err
 	}
 	if counter, ok := s.client.(suppressionCountingRetriever); ok {
 		response, suppressed, err := counter.RetrieveWithSuppressed(ctx, query)
-		return response, authorized.Disclosure{Suppressed: suppressed}, err
+		return response, authorized.RetrievalReport{
+			Disclosure: authorized.Disclosure{Suppressed: suppressed},
+		}, err
 	}
 	response, err := s.client.Retrieve(ctx, query)
-	return response, authorized.Disclosure{}, err
+	return response, authorized.RetrievalReport{}, err
 }
 
 func (s *EmbeddedService) Neighborhood(
@@ -690,6 +708,8 @@ func (s *EmbeddedService) Neighborhood(
 	}
 	response := NeighborhoodResponse{
 		Snapshot: snapshot, Neighborhood: result.Neighborhood,
+		OntologyInterpretations: ontologyInterpretationReports(
+			result.Neighborhood.Interpretations),
 		Truncated: result.Truncated,
 	}
 	if result.Continuation {
@@ -697,6 +717,41 @@ func (s *EmbeddedService) Neighborhood(
 			snapshot.ID, normalizedRequest, result.NextAfterEdgeID)
 	}
 	return response, nil
+}
+
+func ontologyInterpretationReports(
+	values []ontology.AssertionInterpretation,
+) []OntologyInterpretationReport {
+	if len(values) == 0 {
+		return nil
+	}
+	out := make([]OntologyInterpretationReport, 0, len(values))
+	for _, value := range values {
+		original := value.Original()
+		originalSubject, _ := original.SubjectType()
+		originalObject, _ := original.ObjectType()
+		subject, _ := value.SubjectType()
+		object, _ := value.ObjectType()
+		applied := value.AppliedMorphisms()
+		appliedStrings := make([]string, len(applied))
+		for i, id := range applied {
+			appliedStrings[i] = encodeID(id)
+		}
+		reader := value.Reader()
+		out = append(out, OntologyInterpretationReport{
+			AssertionID: encodeID(original.ID()),
+			SchemaID:    encodeID(reader.SchemaID()), VersionID: encodeID(reader.VersionID()),
+			Reading: value.Reading(), Status: value.Status(),
+			OriginalSubjectType: encodeOptionalID(originalSubject),
+			SubjectType:         encodeOptionalID(subject),
+			OriginalPredicate:   encodeID(original.Predicate()),
+			Predicate:           encodeID(value.Predicate()),
+			OriginalObjectType:  encodeOptionalID(originalObject),
+			ObjectType:          encodeOptionalID(object),
+			AppliedMorphisms:    appliedStrings, Reason: value.Reason(),
+		})
+	}
+	return out
 }
 
 func (s *EmbeddedService) Path(
@@ -746,10 +801,34 @@ func (s *EmbeddedService) Path(
 	if err := s.confirmSnapshot(ctx, snapshot); err != nil {
 		return PathResponse{}, err
 	}
+	assertions := assertionsForPath(path, bounded.Neighborhood.Assertions)
 	return PathResponse{
 		Snapshot: snapshot, Path: path,
-		Assertions: assertionsForPath(path, bounded.Neighborhood.Assertions),
+		Assertions: assertions,
+		OntologyInterpretations: ontologyInterpretationReports(
+			interpretationsForAssertions(
+				assertions, bounded.Neighborhood.Interpretations)),
 	}, nil
+}
+
+func interpretationsForAssertions(
+	assertions []ontology.Assertion,
+	interpretations []ontology.AssertionInterpretation,
+) []ontology.AssertionInterpretation {
+	if len(assertions) == 0 || len(interpretations) == 0 {
+		return nil
+	}
+	selected := make(map[shoal.ID]struct{}, len(assertions))
+	for _, assertion := range assertions {
+		selected[assertion.ID()] = struct{}{}
+	}
+	out := make([]ontology.AssertionInterpretation, 0, len(assertions))
+	for _, interpretation := range interpretations {
+		if _, ok := selected[interpretation.Original().ID()]; ok {
+			out = append(out, interpretation)
+		}
+	}
+	return out
 }
 
 func (s *EmbeddedService) pin(

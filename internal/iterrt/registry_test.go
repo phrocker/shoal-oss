@@ -45,7 +45,7 @@ func TestRegistrySnapshot(t *testing.T) {
 			{Name: IterGraphRank, JavaClasses: []string{"org.apache.accumulo.core.graph.GraphRankIterator"}, Contexts: []CapabilityContext{ContextMajc, ContextOffline}, ActiveContexts: []CapabilityContext{ContextMajc, ContextOffline}, OptionKeys: []string{GraphRankDampingFactor, GraphRankMaxIterations, GraphRankEdgeType, GraphRankMaxVertices, GraphRankConvergenceThreshold, GraphRankVertexCF, GraphRankEdgeCFPrefix, GraphRankLabelCQ, GraphRankRankCQ}},
 			{Name: IterCausalInference, JavaClasses: []string{"org.apache.accumulo.core.graph.CausalInferenceEngine"}, Contexts: []CapabilityContext{ContextScan}, ActiveContexts: []CapabilityContext{ContextScan}, OptionKeys: []string{CausalInferenceQuery, CausalInferenceStartVertex, CausalInferenceDirection, CausalInferenceMaxDepth, CausalInferenceThreshold, CausalInferenceEdgeType, CausalInferenceMaxVertices, CausalInferenceVertexCF, CausalInferenceEmbeddingCQ, CausalInferenceEdgeCFPrefix, CausalInferenceInverseEdgeCFPrefix, CausalInferenceResultCF, CausalInferenceResultCQ}},
 			{Name: IterTermIndex, Contexts: []CapabilityContext{ContextScan}, ActiveContexts: []CapabilityContext{ContextScan}, OptionKeys: []string{TermIndexCount, TermIndexPrimaryPrefix, TermIndexIDSource, TermIndexPostingCF, TermIndexPhrase, TermIndexNumericLower, TermIndexNumericLowerSet, TermIndexNumericUpper, TermIndexNumericUpperSet, TermIndexNumericLowerInclusive, TermIndexNumericUpperInclusive}, OptionPatterns: []string{"term.<n>"}},
-			{Name: IterVectorKNN, Contexts: []CapabilityContext{ContextScan}, ActiveContexts: []CapabilityContext{ContextScan}, OptionKeys: []string{VectorKNNQuery, VectorKNNTopK, VectorKNNEmbeddingCF, VectorKNNMetric, VectorKNNMinScore}},
+			{Name: IterVectorKNN, Contexts: []CapabilityContext{ContextScan}, ActiveContexts: []CapabilityContext{ContextScan}, OptionKeys: []string{VectorKNNQuery, VectorKNNEmbeddingSpace, VectorKNNTopK, VectorKNNEmbeddingCF, VectorKNNMetric, VectorKNNMinScore}},
 			{Name: IterEdgeExpand, Contexts: []CapabilityContext{ContextScan}, ActiveContexts: []CapabilityContext{ContextScan}, OptionKeys: []string{EdgeExpandAnchorCount, EdgeExpandEdgeCF, EdgeExpandEdgeField, EdgeExpandFieldSep, EdgeExpandIDIndex, EdgeExpandRelIndex, EdgeExpandRelCount, EdgeExpandPrimaryPrefix, EdgeExpandIncludeAnchors, EdgeExpandMaxHops, EdgeExpandWeightCount}, OptionPatterns: []string{"anchor.<n>", "rel.<n>", "edgeWeight.rel.<n>", "edgeWeight.weight.<n>"}},
 			{Name: IterScoreFilter, Contexts: []CapabilityContext{ContextScan}, ActiveContexts: []CapabilityContext{ContextScan}, OptionKeys: []string{ScoreFilterScoreCF, ScoreFilterMethod, ScoreFilterQuery, ScoreFilterTopK, ScoreFilterParamCount, ScoreFilterTimestampAnchorMs, ScoreFilterHalfLifeMs}, OptionPatterns: []string{"param.<n>"}},
 			{Name: IterGraphAggregation, Contexts: []CapabilityContext{ContextScan}, ActiveContexts: []CapabilityContext{ContextScan}, OptionKeys: []string{GraphAggregationOp, GraphAggregationGroupBy, GraphAggregationRowPrefixSep, GraphAggregationValueCF, GraphAggregationValueCQ, GraphAggregationResultRow, GraphAggregationResultCF}},
@@ -62,7 +62,7 @@ func TestRegistrySnapshot(t *testing.T) {
 }
 
 func TestRegistryInventoryJSONIsCurrent(t *testing.T) {
-	data, err := os.ReadFile(filepath.Join("..", "..", "docs", "iterator-capabilities-v2.json"))
+	data, err := os.ReadFile(filepath.Join("..", "..", "docs", "iterator-capabilities-v3.json"))
 	if err != nil {
 		t.Fatalf("ReadFile: %v", err)
 	}

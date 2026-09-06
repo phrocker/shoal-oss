@@ -1047,8 +1047,9 @@ func (e responseReadError) Unwrap() error {
 
 func decodeRemoteError(response *http.Response) error {
 	var payload struct {
-		Code    shoal.ErrorCode `json:"code"`
-		Message string          `json:"message"`
+		Code      shoal.ErrorCode           `json:"code"`
+		Message   string                    `json:"message"`
+		Embedding *wireEmbeddingQueryReport `json:"embedding,omitempty"`
 	}
 	err := decodeOneJSON(response.Body, &payload, maxRemoteMetadataResponseBytes)
 	if err == nil && isKnownErrorCode(payload.Code) {
@@ -1057,14 +1058,29 @@ func decodeRemoteError(response *http.Response) error {
 				response.StatusCode, "remote workspace error code does not match status")
 		}
 		message := trimErrorCode(payload.Code, payload.Message)
+		var decoded error
 		switch payload.Code {
 		case shoal.ErrorCanceled:
-			return shoal.WrapError(payload.Code, message, context.Canceled)
+			decoded = shoal.WrapError(payload.Code, message, context.Canceled)
 		case shoal.ErrorDeadline:
-			return shoal.WrapError(payload.Code, message, context.DeadlineExceeded)
+			decoded = shoal.WrapError(payload.Code, message, context.DeadlineExceeded)
 		default:
-			return shoal.NewError(payload.Code, message)
+			decoded = shoal.NewError(payload.Code, message)
 		}
+		report, reportErr := embeddingQueryReportValue(payload.Embedding)
+		if reportErr != nil {
+			return remoteContractError("invalid remote embedding query report", reportErr)
+		}
+		if report != nil {
+			if !report.Degraded {
+				return remoteContractError(
+					"remote error carried a non-degraded embedding query report",
+					nil,
+				)
+			}
+			return newEmbeddingQueryError(decoded, *report)
+		}
+		return decoded
 	}
 	if err != nil && isRemoteTransportDecodeError(err) {
 		return shoal.WrapError(

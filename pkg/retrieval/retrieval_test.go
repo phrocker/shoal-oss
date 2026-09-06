@@ -287,60 +287,6 @@ func TestResponseRejectsDuplicateEvidenceOrderingKey(t *testing.T) {
 
 }
 
-func TestEmbeddingSpaceSetIDIsCanonicalAndOpaque(t *testing.T) {
-	spaceA, err := retrieval.EmbeddingSpaceIdentityID("space-a")
-	if err != nil {
-		t.Fatal(err)
-	}
-	spaceB, err := retrieval.EmbeddingSpaceIdentityID("space-b")
-	if err != nil {
-		t.Fatal(err)
-	}
-	first, err := retrieval.EmbeddingSpaceSetID(spaceB, spaceA, spaceB)
-	if err != nil {
-		t.Fatal(err)
-	}
-	second, err := retrieval.EmbeddingSpaceSetID(spaceA, spaceB)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if first == "" || first != second {
-		t.Fatalf("embedding space IDs = %q and %q", first, second)
-	}
-	if strings.Contains(string(first), "space-a") ||
-		strings.Contains(string(first), "space-b") {
-		t.Fatalf("embedding space ID exposes provider identity: %q", first)
-	}
-	if strings.Contains(string(spaceA), "space-a") {
-		t.Fatalf("constituent ID exposes provider identity: %q", spaceA)
-	}
-	if empty, err := retrieval.EmbeddingSpaceSetID(); err != nil || empty != "" {
-		t.Fatalf("empty embedding space set = %q, %v", empty, err)
-	}
-}
-
-func TestVectorResponseRequiresEmbeddingSpaceID(t *testing.T) {
-	if err := (retrieval.Response{}).ValidateFor(retrieval.Request{
-		Text: "query", Modes: []retrieval.Mode{retrieval.ModeVector},
-	}); !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
-		t.Fatalf("missing vector embedding space error = %v", err)
-	}
-	if err := (retrieval.Response{
-		EmbeddingSpaceID: "aggregate-only",
-	}).ValidateFor(retrieval.Request{
-		Text: "query", Modes: []retrieval.Mode{retrieval.ModeVector},
-	}); !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
-		t.Fatalf("aggregate-only vector embedding space error = %v", err)
-	}
-	if err := (retrieval.Response{
-		EmbeddingSpaceID: "lexical-space",
-	}).ValidateFor(retrieval.Request{
-		Text: "query", Modes: []retrieval.Mode{retrieval.ModeLexical},
-	}); !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
-		t.Fatalf("non-vector embedding space error = %v", err)
-	}
-}
-
 func testEvidence(documentID, spanID shoal.ID, score shoal.Score) retrieval.Evidence {
 	return retrieval.Evidence{
 		Citation: document.Citation{

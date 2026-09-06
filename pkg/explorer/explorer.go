@@ -30,6 +30,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/phrocker/shoal-oss/internal/dirlock"
 	"github.com/phrocker/shoal-oss/internal/engine"
 	"github.com/phrocker/shoal-oss/pkg/document"
 	"github.com/phrocker/shoal-oss/pkg/graph"
@@ -44,6 +45,7 @@ import (
 type Explorer struct {
 	mu                             sync.RWMutex
 	engine                         *engine.Engine
+	lock                           *dirlock.Lock
 	documents                      map[shoal.ID]map[shoal.ID]*persistedDocument
 	edges                          map[shoal.ID]persistedEdge
 	interactions                   map[shoal.ID]*persistedInteraction
@@ -54,6 +56,7 @@ type Explorer struct {
 	interactionEdgeIDs             map[shoal.ID]struct{}
 	extractions                    map[shoal.ID]*persistedExtraction
 	ontologyProposals              map[shoal.ID]*persistedOntologyProposal
+	ontologyMutationIndeterminate  bool
 	graphNodes                     map[shoal.ID]graph.Node
 	graphEdges                     map[shoal.ID]graph.Edge
 	graphAssertions                map[shoal.ID]ontology.Assertion
@@ -64,6 +67,11 @@ type Explorer struct {
 	embedder                       model.Embedder
 	embedders                      map[string]model.Embedder
 	maxEmbeddingSpaceFanout        int
+	queryEmbeddingMu               sync.Mutex
+	queryEmbeddingCache            map[embeddingQueryCacheKey]cachedQueryEmbedding
+	queryEmbeddingOrder            []embeddingQueryCacheKey
+	maxQueryEmbeddingCache         int
+	embeddingQueryObserver         EmbeddingQueryObserver
 	recallEvidence                 map[string]string
 	embeddingSpace                 embeddingSpaceCache
 	latentLinkProjection           LatentLinkAssertionProjection
@@ -82,6 +90,8 @@ type Explorer struct {
 	changeCursorKey                []byte
 	interactionRecordWriter        func([]byte, byte, any) error
 	readOnly                       bool
+	publication                    RecordPublicationAdapter
+	ownsEngine                     bool
 	closed                         bool
 }
 
@@ -122,6 +132,68 @@ type persistedEdge struct {
 	PublishedAt time.Time
 }
 
+// EmbeddingQueryEvent is one operator-visible multi-space query outcome.
+// It contains stable space identities and counters only, never query text,
+// vector bytes, provider credentials, or source content.
+type EmbeddingQueryEvent struct {
+	SpaceIdentities []string
+	Attempted       []string
+	Completed       []string
+	// Participating contains the stable spaces represented by successful
+	// scored outputs. It is empty when vector scoring produced no result.
+	Participating  []string
+	FanoutLimit    int
+	CacheHits      int
+	ProviderCalls  int
+	Unavailable    []string
+	FanoutExceeded bool
+}
+
+// EmbeddingQueryObserver receives one query event. Events contain no query
+// text, vector bytes, provider credentials, or source content.
+type EmbeddingQueryObserver func(EmbeddingQueryEvent)
+
+type embeddingQueryObservation struct {
+	observer EmbeddingQueryObserver
+}
+
+type embeddingQueryObservationKey struct{}
+
+// WithEmbeddingQueryObserver binds one observer to ctx. The binding replaces
+// any earlier request observer and is inherited only by calls using the
+// returned context. Authorization wrappers use this seam after projecting
+// source scope so raw space identities never cross the authorization boundary.
+func WithEmbeddingQueryObserver(
+	ctx context.Context,
+	observer EmbeddingQueryObserver,
+) context.Context {
+	return context.WithValue(
+		ctx,
+		embeddingQueryObservationKey{},
+		embeddingQueryObservation{observer: observer},
+	)
+}
+
+// ReportEmbeddingQueryEvent delivers an event to the observer bound to ctx.
+// Trusted vector implementations may use this to participate in request-local
+// reporting without installing process-global state.
+func ReportEmbeddingQueryEvent(ctx context.Context, event EmbeddingQueryEvent) {
+	observation, ok := ctx.Value(embeddingQueryObservationKey{}).(embeddingQueryObservation)
+	if !ok || observation.observer == nil {
+		return
+	}
+	observation.observer(cloneEmbeddingQueryEvent(event))
+}
+
+func cloneEmbeddingQueryEvent(event EmbeddingQueryEvent) EmbeddingQueryEvent {
+	event.SpaceIdentities = append([]string(nil), event.SpaceIdentities...)
+	event.Attempted = append([]string(nil), event.Attempted...)
+	event.Completed = append([]string(nil), event.Completed...)
+	event.Participating = append([]string(nil), event.Participating...)
+	event.Unavailable = append([]string(nil), event.Unavailable...)
+	return event
+}
+
 // Options configures optional embedded Explorer features.
 type Options struct {
 	// Embedder enables vector indexing and retrieval. It must also implement
@@ -138,6 +210,14 @@ type Options struct {
 	// MaxEmbeddingSpaceFanout bounds provider calls for one vector query. Zero
 	// defaults to eight distinct spaces.
 	MaxEmbeddingSpaceFanout int
+
+	// MaxEmbeddingQueryCacheEntries bounds cached query vectors across every
+	// embedding space. Zero defaults to 256 entries.
+	MaxEmbeddingQueryCacheEntries int
+
+	// EmbeddingQueryObserver receives one bounded fan-out summary per vector
+	// retrieval or vector-score request. It must be safe for concurrent use.
+	EmbeddingQueryObserver EmbeddingQueryObserver
 
 	// RecallEvidence records benchmark evidence per embedding-space identity.
 	RecallEvidence map[string]string
@@ -169,6 +249,45 @@ func OpenWithOptions(dir string, options Options) (*Explorer, error) {
 	if strings.TrimSpace(dir) == "" {
 		return nil, shoal.NewError(shoal.ErrorInvalidArgument, "data directory is required")
 	}
+	lock, err := dirlock.Acquire(dir, ".shoal-explorer-runtime.lock")
+	if err != nil {
+		return nil, shoal.WrapError(shoal.ErrorUnavailable, "acquire explorer storage", err)
+	}
+	eng, err := engine.Open(dir, engine.Options{})
+	if err != nil {
+		_ = lock.Close()
+		return nil, shoal.WrapError(shoal.ErrorUnavailable, "open explorer storage", err)
+	}
+	explorer, err := openWithEngine(eng, options, nil)
+	if err != nil {
+		_ = eng.Close()
+		_ = lock.Close()
+		return nil, err
+	}
+	explorer.ownsEngine = true
+	explorer.lock = lock
+	return explorer, nil
+}
+
+// OpenWithEmbeddedEngine opens Explorer on an engine whose lifetime is owned
+// by the caller. It is intended for the in-process transaction runtime, which
+// must share one engine handle with both coordination and physical writes.
+func OpenWithEmbeddedEngine(
+	eng *engine.Engine,
+	options Options,
+	publication RecordPublicationAdapter,
+) (*Explorer, error) {
+	if eng == nil {
+		return nil, shoal.NewError(shoal.ErrorInvalidArgument, "embedded engine is required")
+	}
+	return openWithEngine(eng, options, publication)
+}
+
+func openWithEngine(
+	eng *engine.Engine,
+	options Options,
+	publication RecordPublicationAdapter,
+) (*Explorer, error) {
 	embedders, err := embeddingProviderMap(options)
 	if err != nil {
 		return nil, err
@@ -176,6 +295,10 @@ func OpenWithOptions(dir string, options Options) (*Explorer, error) {
 	maxFanout := options.MaxEmbeddingSpaceFanout
 	if maxFanout <= 0 {
 		maxFanout = 8
+	}
+	maxQueryCache := options.MaxEmbeddingQueryCacheEntries
+	if maxQueryCache <= 0 {
+		maxQueryCache = 256
 	}
 	latentProjection, err := latentLinkProjectionForOptions(
 		options.LatentLinkProjection)
@@ -186,10 +309,6 @@ func OpenWithOptions(dir string, options Options) (*Explorer, error) {
 	if maxLatentAssertions == 0 {
 		maxLatentAssertions = DefaultMaxLatentDerivedAssertionsPerGraphRead
 	}
-	eng, err := engine.Open(dir, engine.Options{})
-	if err != nil {
-		return nil, shoal.WrapError(shoal.ErrorUnavailable, "open explorer storage", err)
-	}
 	found := false
 	for _, table := range eng.TableNames() {
 		if table == explorerTable {
@@ -199,7 +318,6 @@ func OpenWithOptions(dir string, options Options) (*Explorer, error) {
 	}
 	if !found {
 		if err := eng.CreateTable(explorerTable, engine.TableOptions{}); err != nil {
-			_ = eng.Close()
 			return nil, shoal.WrapError(shoal.ErrorInternal, "create explorer table", err)
 		}
 	}
@@ -218,6 +336,9 @@ func OpenWithOptions(dir string, options Options) (*Explorer, error) {
 		embedder:                       options.Embedder,
 		embedders:                      embedders,
 		maxEmbeddingSpaceFanout:        maxFanout,
+		queryEmbeddingCache:            make(map[embeddingQueryCacheKey]cachedQueryEmbedding),
+		maxQueryEmbeddingCache:         maxQueryCache,
+		embeddingQueryObserver:         options.EmbeddingQueryObserver,
 		recallEvidence:                 cloneStringMap(options.RecallEvidence),
 		latentLinkProjection:           latentProjection,
 		maxLatentAssertions:            maxLatentAssertions,
@@ -226,9 +347,9 @@ func OpenWithOptions(dir string, options Options) (*Explorer, error) {
 		latestSnapshotEdgeDigests:      make(map[shoal.ID]string),
 		latestSnapshotAssertionDigests: make(map[shoal.ID]string),
 		readOnly:                       options.ReadOnly,
+		publication:                    publication,
 	}
 	if err := explorer.load(); err != nil {
-		_ = eng.Close()
 		return nil, err
 	}
 	explorer.interactionLiveRecords = nil
@@ -240,7 +361,6 @@ func OpenWithOptions(dir string, options Options) (*Explorer, error) {
 				snapshotAnchorRow, embeddedRecordSnapshotAnchor,
 				persistedSnapshotAnchor{CreatedAt: explorer.snapshotAnchor},
 			); err != nil {
-				_ = eng.Close()
 				return nil, err
 			}
 		}
@@ -256,7 +376,6 @@ func OpenWithOptions(dir string, options Options) (*Explorer, error) {
 		// cursors then fail authentication and the client is told to resynchronise.
 		key := make([]byte, changeCursorKeyBytes)
 		if _, err := rand.Read(key); err != nil {
-			_ = eng.Close()
 			return nil, shoal.WrapError(
 				shoal.ErrorInternal, "generate change cursor key", err)
 		}
@@ -266,7 +385,6 @@ func OpenWithOptions(dir string, options Options) (*Explorer, error) {
 				cursorKeyRow, embeddedRecordCursorKey,
 				persistedCursorKey{Key: key},
 			); err != nil {
-				_ = eng.Close()
 				return nil, err
 			}
 		}
@@ -282,7 +400,12 @@ func (e *Explorer) Close() error {
 		return nil
 	}
 	e.closed = true
-	if err := e.engine.Close(); err != nil {
+	var engineErr error
+	if e.ownsEngine {
+		engineErr = e.engine.Close()
+	}
+	lockErr := e.lock.Close()
+	if err := errors.Join(engineErr, lockErr); err != nil {
 		return shoal.WrapError(shoal.ErrorInternal, "close explorer storage", err)
 	}
 	return nil
@@ -353,19 +476,38 @@ func (e *Explorer) ingest(
 		}
 	}
 	e.mu.RUnlock()
-	embeddings, err := e.embedParsedSpans(ctx, parsed.spans)
+	row := documentRecordRow(parsed.document.ID, parsed.revision.ID)
+	record, publicationHead, attemptedValue, attempted, err :=
+		e.documentRecordAttempt(ctx, row)
 	if err != nil {
 		return IngestResult{}, err
 	}
-	record := &persistedDocument{
-		Document:   parsed.document,
-		Revision:   parsed.revision,
-		Source:     parsed.source,
-		Sections:   parsed.sections,
-		Spans:      parsed.spans,
-		Nodes:      parsed.nodes,
-		Edges:      parsed.edges,
-		Embeddings: embeddings,
+	if attempted {
+		if record.Document.ID != parsed.document.ID ||
+			record.Revision.ID != parsed.revision.ID ||
+			record.Source.URI != parsed.source.URI ||
+			record.Source.MediaType != parsed.source.MediaType ||
+			record.Source.Content != parsed.source.Content {
+			return IngestResult{}, shoal.NewError(
+				shoal.ErrorInternal,
+				"transactional document attempt disagrees with the source",
+			)
+		}
+	} else {
+		embeddings, err := e.embedParsedSpans(ctx, parsed.spans)
+		if err != nil {
+			return IngestResult{}, err
+		}
+		record = &persistedDocument{
+			Document:   parsed.document,
+			Revision:   parsed.revision,
+			Source:     parsed.source,
+			Sections:   parsed.sections,
+			Spans:      parsed.spans,
+			Nodes:      parsed.nodes,
+			Edges:      parsed.edges,
+			Embeddings: embeddings,
+		}
 	}
 
 	e.mu.Lock()
@@ -378,9 +520,21 @@ func (e *Explorer) ingest(
 			return ingestResult(existing, IngestUnchanged), nil
 		}
 	}
-	if e.lastPublicationSequence == math.MaxUint64 {
-		return IngestResult{}, shoal.NewError(
-			shoal.ErrorUnavailable, "embedded publication sequence is exhausted")
+	if !attempted {
+		pending, err := e.publicationPending(ctx)
+		if err != nil {
+			return IngestResult{}, err
+		}
+		if pending {
+			return IngestResult{}, shoal.NewError(
+				shoal.ErrorUnavailable,
+				"a previous transactional publication requires recovery",
+			)
+		}
+		publicationHead, err = e.documentRecordHead(ctx, []byte(parsed.document.ID))
+		if err != nil {
+			return IngestResult{}, err
+		}
 	}
 	if err := e.requireSourceGraphIDsAvailableLocked(
 		record.Nodes, record.Edges,
@@ -398,15 +552,29 @@ func (e *Explorer) ingest(
 			found:      true,
 		}
 	}
-	record.PublishedAt = time.Now().UTC()
-	// A write error can occur after the WAL append committed, so attempted
-	// publication sequences must never be reused.
-	e.lastPublicationSequence++
-	record.PublicationSequence = e.lastPublicationSequence
-	if err := e.writeRecord(
-		documentRecordRow(record.Document.ID, record.Revision.ID),
-		embeddedRecordDocument,
-		record,
+	if attempted {
+		if record.PublicationSequence == 0 || record.PublishedAt.IsZero() {
+			return IngestResult{}, shoal.NewError(
+				shoal.ErrorInternal,
+				"transactional document attempt has no publication coordinate",
+			)
+		}
+		if record.PublicationSequence > e.lastPublicationSequence {
+			e.lastPublicationSequence = record.PublicationSequence
+		}
+	} else {
+		if e.lastPublicationSequence == math.MaxUint64 {
+			return IngestResult{}, shoal.NewError(
+				shoal.ErrorUnavailable, "embedded publication sequence is exhausted")
+		}
+		record.PublishedAt = time.Now().UTC()
+		// A write error can occur after the WAL append committed, so attempted
+		// publication sequences must never be reused.
+		e.lastPublicationSequence++
+		record.PublicationSequence = e.lastPublicationSequence
+	}
+	if err := e.writeDocumentRecord(
+		ctx, row, record, publicationHead, attemptedValue,
 	); err != nil {
 		return IngestResult{}, err
 	}

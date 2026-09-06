@@ -40,7 +40,11 @@
 //     run multiple concurrent seeks (e.g. source-of-a-source fan-out).
 package iterrt
 
-import "github.com/phrocker/shoal-oss/internal/rfile/wire"
+import (
+	"context"
+
+	"github.com/phrocker/shoal-oss/internal/rfile/wire"
+)
 
 // Key is the cell coordinate type threaded through the runtime. Aliased to
 // wire.Key so RFile readers, the WAL merger, and iterators all speak one
@@ -82,6 +86,9 @@ func (s IteratorScope) String() string {
 // the subset of Java's IteratorEnvironment that shoal's iterators actually
 // consult. It is read-only from an iterator's point of view.
 type IteratorEnvironment struct {
+	// Context cancels request-scoped iterator work. Nil means Background.
+	Context context.Context
+
 	// Scope is the compaction/scan context (see IteratorScope).
 	Scope IteratorScope
 

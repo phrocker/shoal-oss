@@ -34,6 +34,7 @@ var reservedIDNamespaces = map[string]struct{}{
 	"concept":          {},
 	"evidence":         {},
 	"extraction":       {},
+	"morphism":         {},
 	"ontology-version": {},
 	"property":         {},
 	"proposal":         {},

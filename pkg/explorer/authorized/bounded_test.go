@@ -29,6 +29,7 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/graph"
+	"github.com/phrocker/shoal-oss/pkg/ontology"
 	"github.com/phrocker/shoal-oss/pkg/retrieval"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
@@ -326,6 +327,123 @@ func TestAuthorizedVectorAvailabilityKeyLengthPrefixesIDs(t *testing.T) {
 	}
 }
 
+func TestBoundedNeighborhoodRechecksGenerationAfterOntologyLens(t *testing.T) {
+	for _, depth := range []uint32{1, 2} {
+		t.Run(fmt.Sprintf("depth-%d", depth), func(t *testing.T) {
+			client, base := authorizedPaginationClient(t, false)
+			schema, _ := ontology.NewOntologySchema("guard", "Guard", "", nil)
+			version, _ := ontology.NewOntologyVersion(
+				schema, "1", time.Date(2026, time.September, 6, 0, 0, 0, 0, time.UTC),
+				nil, nil, nil, nil)
+			selected, _ := ontology.NewOntologyIdentity(version)
+			now := time.Date(2026, time.September, 6, 0, 0, 0, 0, time.UTC)
+			decision, err := auth.NewDecision(auth.DecisionConfig{
+				Subject: "subject", Actor: "actor",
+				AuthorizationDomain: []byte("domain"),
+				AllowedOperations:   []auth.Operation{auth.OperationNeighborhood},
+				PermittedSourceIDs:  [][]byte{[]byte("source")},
+				PermittedPolicyIDs:  [][]byte{[]byte("policy")},
+				PolicyGeneration:    1, AuthenticationExpires: now.Add(time.Hour),
+				RequestID: "request", SelectedOntology: selected,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			generation := int64(1)
+			client.resolver = resolverFunc(func(context.Context) (auth.Decision, error) {
+				return decision, nil
+			})
+			client.generationReader = generationReaderFunc(
+				func(context.Context, []byte) (int64, error) {
+					return generation, nil
+				})
+			client.clock = func() time.Time { return now }
+			client.ontologyInterpreter = base
+			base.interpret = func() { generation = 2 }
+			_, err = client.BoundedNeighborhood(
+				context.Background(), explorer.BoundedNeighborhoodRequest{
+					NodeIDs: []shoal.ID{"node-seed"}, Depth: depth,
+					Fanout: 1, MaxNodes: 2, MaxScannedEdges: 2,
+				})
+			if !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
+				t.Fatalf("generation change after lens = %v, want unavailable", err)
+			}
+		})
+	}
+}
+
+func TestOntologyLensRequiresExplicitTrustedInterpreter(t *testing.T) {
+	client, base := authorizedPaginationClient(t, false)
+	schema, _ := ontology.NewOntologySchema("trusted", "Trusted", "", nil)
+	version, _ := ontology.NewOntologyVersion(
+		schema, "1", time.Date(2026, time.September, 6, 0, 0, 0, 0, time.UTC),
+		nil, nil, nil, nil)
+	selected, _ := ontology.NewOntologyIdentity(version)
+	decision, err := auth.NewDecision(auth.DecisionConfig{
+		Subject: "subject", Actor: "actor",
+		AuthorizationDomain: []byte("domain"),
+		AllowedOperations:   []auth.Operation{auth.OperationNeighborhood},
+		PermittedSourceIDs:  [][]byte{[]byte("source")},
+		PermittedPolicyIDs:  [][]byte{[]byte("policy")},
+		PolicyGeneration:    1,
+		AuthenticationExpires: time.Date(
+			2026, time.September, 6, 1, 0, 0, 0, time.UTC),
+		RequestID: "request", SelectedOntology: selected,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	called := false
+	base.interpret = func() { called = true }
+	result, err := client.applyOntologyLens(
+		context.Background(), explorer.Neighborhood{}, decision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if called || len(result.Interpretations) != 0 {
+		t.Fatal("untrusted base interpreter supplied ontology results")
+	}
+	client.ontologyInterpreter = base
+	if _, err := client.applyOntologyLens(
+		context.Background(), explorer.Neighborhood{}, decision); err != nil {
+		t.Fatal(err)
+	}
+	if !called {
+		t.Fatal("explicit trusted interpreter was not invoked")
+	}
+}
+
+func TestOntologyLensPropagatesTrustedInterpreterUnavailability(t *testing.T) {
+	client, base := authorizedPaginationClient(t, false)
+	schema, _ := ontology.NewOntologySchema("uncertain", "Uncertain", "", nil)
+	version, _ := ontology.NewOntologyVersion(
+		schema, "1", time.Date(2026, time.September, 6, 0, 0, 0, 0, time.UTC),
+		nil, nil, nil, nil)
+	selected, _ := ontology.NewOntologyIdentity(version)
+	decision, err := auth.NewDecision(auth.DecisionConfig{
+		Subject: "subject", Actor: "actor",
+		AuthorizationDomain: []byte("domain"),
+		AllowedOperations:   []auth.Operation{auth.OperationNeighborhood},
+		PermittedSourceIDs:  [][]byte{[]byte("source")},
+		PermittedPolicyIDs:  [][]byte{[]byte("policy")},
+		PolicyGeneration:    1,
+		AuthenticationExpires: time.Date(
+			2026, time.September, 6, 1, 0, 0, 0, time.UTC),
+		RequestID: "request", SelectedOntology: selected,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	base.interpretErr = shoal.NewError(
+		shoal.ErrorUnavailable, "ontology mutation outcome is indeterminate")
+	client.ontologyInterpreter = base
+	if _, err := client.applyOntologyLens(
+		context.Background(), explorer.Neighborhood{}, decision,
+	); !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
+		t.Fatalf("trusted interpreter unavailability = %v", err)
+	}
+}
+
 func authorizedPaginationClient(t *testing.T, hiddenOnly bool) (*Client, *pagedBoundedBase) {
 	t.Helper()
 	ctx := context.Background()
@@ -421,10 +539,30 @@ func authorizedPaginationClient(t *testing.T, hiddenOnly bool) (*Client, *pagedB
 }
 
 type pagedBoundedBase struct {
-	calls      int
-	view       explorer.DocumentView
-	nodes      map[shoal.ID]graph.Node
-	hiddenOnly bool
+	calls        int
+	view         explorer.DocumentView
+	nodes        map[shoal.ID]graph.Node
+	hiddenOnly   bool
+	interpret    func()
+	interpretErr error
+}
+
+func (b *pagedBoundedBase) InterpretAssertions(
+	_ context.Context,
+	assertions []ontology.Assertion,
+	selected ontology.OntologyIdentity,
+) ([]ontology.AssertionInterpretation, error) {
+	if b.interpret != nil {
+		b.interpret()
+	}
+	if b.interpretErr != nil {
+		return nil, b.interpretErr
+	}
+	result := make([]ontology.AssertionInterpretation, 0, len(assertions))
+	for _, assertion := range assertions {
+		result = append(result, ontology.ReadAssertionUnder(assertion, selected))
+	}
+	return result, nil
 }
 
 func (b *pagedBoundedBase) Retrieve(context.Context, retrieval.Request) (retrieval.Response, error) {

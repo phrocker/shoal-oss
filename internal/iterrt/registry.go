@@ -27,7 +27,7 @@ import (
 // inventory. Bump it whenever the registered iterator set, Java-class aliases,
 // supported execution contexts, activation semantics, or accepted option
 // keys/patterns changes.
-const CapabilityRegistryVersion = 2
+const CapabilityRegistryVersion = 3
 
 // AccumuloCompatibilityVersion is the Accumulo release line whose iterator
 // contracts are described by this registry.
@@ -298,7 +298,7 @@ var (
 				Name:           IterVectorKNN,
 				Contexts:       []CapabilityContext{ContextScan},
 				ActiveContexts: []CapabilityContext{ContextScan},
-				OptionKeys:     []string{VectorKNNQuery, VectorKNNTopK, VectorKNNEmbeddingCF, VectorKNNMetric, VectorKNNMinScore},
+				OptionKeys:     []string{VectorKNNQuery, VectorKNNEmbeddingSpace, VectorKNNTopK, VectorKNNEmbeddingCF, VectorKNNMetric, VectorKNNMinScore},
 			},
 			new: func() SortedKeyValueIterator { return NewVectorKNNIterator() },
 		},

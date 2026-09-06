@@ -63,13 +63,42 @@ const (
 	OperationNeighborhood Operation = "neighborhood"
 	OperationRetrieve     Operation = "retrieve"
 	OperationValidate     Operation = "validation"
+
+	OperationInvoke                 Operation = "invoke"
+	OperationDispatch               Operation = "dispatch"
+	OperationDelegate               Operation = "delegate"
+	OperationAgentRegister          Operation = "agent_register"
+	OperationAgentHeartbeat         Operation = "agent_heartbeat"
+	OperationAgentRevoke            Operation = "agent_revoke"
+	OperationAgentResolve           Operation = "agent_resolve"
+	OperationSubscriptionCreate     Operation = "subscription_create"
+	OperationSubscriptionDelete     Operation = "subscription_delete"
+	OperationEventPublish           Operation = "event_publish"
+	OperationAnalyticsRead          Operation = "analytics_read"
+	OperationWorkspaceSettingsRead  Operation = "workspace_settings_read"
+	OperationWorkspaceSettingsWrite Operation = "workspace_settings_write"
 )
+
+// ParseOperation accepts one exact canonical serialized operation.
+func ParseOperation(value string) (Operation, error) {
+	operation := Operation(value)
+	if err := operation.Validate(); err != nil {
+		return "", err
+	}
+	return operation, nil
+}
 
 // Validate rejects unknown operations.
 func (o Operation) Validate() error {
 	switch o {
 	case OperationIngest, OperationList, OperationRead, OperationConnect,
-		OperationNeighborhood, OperationRetrieve, OperationValidate:
+		OperationNeighborhood, OperationRetrieve, OperationValidate,
+		OperationInvoke, OperationDispatch, OperationDelegate,
+		OperationAgentRegister, OperationAgentHeartbeat, OperationAgentRevoke,
+		OperationAgentResolve, OperationSubscriptionCreate,
+		OperationSubscriptionDelete, OperationEventPublish,
+		OperationAnalyticsRead, OperationWorkspaceSettingsRead,
+		OperationWorkspaceSettingsWrite:
 		return nil
 	default:
 		return shoal.NewError(shoal.ErrorInvalidArgument, "unknown authorization operation")
@@ -86,13 +115,31 @@ const (
 	ServiceRoleDerivation    ServiceRole = "derivation"
 	ServiceRoleMigration     ServiceRole = "migration"
 	ServiceRoleSecurityAdmin ServiceRole = "security_admin"
+
+	ServiceRoleActionInvocation       ServiceRole = "action_invocation"
+	ServiceRoleActionDispatch         ServiceRole = "action_dispatch"
+	ServiceRoleDelegation             ServiceRole = "delegation"
+	ServiceRoleAgentRegistration      ServiceRole = "agent_registration"
+	ServiceRoleAgentRevocation        ServiceRole = "agent_revocation"
+	ServiceRoleAgentResolution        ServiceRole = "agent_resolution"
+	ServiceRoleSubscription           ServiceRole = "subscription"
+	ServiceRoleEventPublication       ServiceRole = "event_publication"
+	ServiceRoleAnalytics              ServiceRole = "analytics"
+	ServiceRoleWorkspaceSettingsRead  ServiceRole = "workspace_settings_read"
+	ServiceRoleWorkspaceSettingsWrite ServiceRole = "workspace_settings_write"
 )
 
 // Validate rejects an empty or unknown service role.
 func (r ServiceRole) Validate() error {
 	switch r {
 	case ServiceRoleDataRead, ServiceRoleDataWrite, ServiceRoleCoordination,
-		ServiceRoleDerivation, ServiceRoleMigration, ServiceRoleSecurityAdmin:
+		ServiceRoleDerivation, ServiceRoleMigration, ServiceRoleSecurityAdmin,
+		ServiceRoleActionInvocation, ServiceRoleActionDispatch,
+		ServiceRoleDelegation, ServiceRoleAgentRegistration,
+		ServiceRoleAgentRevocation, ServiceRoleAgentResolution,
+		ServiceRoleSubscription, ServiceRoleEventPublication,
+		ServiceRoleAnalytics, ServiceRoleWorkspaceSettingsRead,
+		ServiceRoleWorkspaceSettingsWrite:
 		return nil
 	default:
 		return shoal.NewError(shoal.ErrorInvalidArgument, "unknown service role")
@@ -118,6 +165,44 @@ func (r ServiceRole) Allows(operation Operation) bool {
 		return operation == OperationRead || operation == OperationConnect ||
 			operation == OperationValidate
 	case ServiceRoleMigration:
+		return isLegacyMigrationOperation(operation)
+	case ServiceRoleActionInvocation:
+		return operation == OperationInvoke || operation == OperationValidate
+	case ServiceRoleActionDispatch:
+		return operation == OperationDispatch || operation == OperationValidate
+	case ServiceRoleDelegation:
+		return operation == OperationDelegate || operation == OperationValidate
+	case ServiceRoleAgentRegistration:
+		return operation == OperationAgentRegister ||
+			operation == OperationAgentHeartbeat ||
+			operation == OperationValidate
+	case ServiceRoleAgentRevocation:
+		return operation == OperationAgentRevoke || operation == OperationValidate
+	case ServiceRoleAgentResolution:
+		return operation == OperationAgentResolve || operation == OperationValidate
+	case ServiceRoleSubscription:
+		return operation == OperationSubscriptionCreate ||
+			operation == OperationSubscriptionDelete ||
+			operation == OperationValidate
+	case ServiceRoleEventPublication:
+		return operation == OperationEventPublish || operation == OperationValidate
+	case ServiceRoleAnalytics:
+		return operation == OperationAnalyticsRead || operation == OperationValidate
+	case ServiceRoleWorkspaceSettingsRead:
+		return operation == OperationWorkspaceSettingsRead ||
+			operation == OperationValidate
+	case ServiceRoleWorkspaceSettingsWrite:
+		return operation == OperationWorkspaceSettingsWrite ||
+			operation == OperationValidate
+	default:
+		return false
+	}
+}
+
+func isLegacyMigrationOperation(operation Operation) bool {
+	switch operation {
+	case OperationIngest, OperationList, OperationRead, OperationConnect,
+		OperationNeighborhood, OperationRetrieve, OperationValidate:
 		return true
 	default:
 		return false

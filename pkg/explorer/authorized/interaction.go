@@ -225,6 +225,25 @@ func (c *Client) recordInteraction(
 				),
 			)
 		}
+		if !returned.RecordedAt.Equal(canonical.RecordedAt) {
+			// Only a durable retry winner may replace the admitted timestamp.
+			stored, readErr := reader.InteractionRecord(ctx, canonical.ID)
+			if readErr != nil {
+				return persisted, explorer.MarkCommittedInteraction(
+					explorer.MarkIndeterminateCommit(directBaseError(readErr)),
+				)
+			}
+			durable, durableErr := stored.Session.Canonical()
+			if stored.Summary.Deleted || durableErr != nil ||
+				!reflect.DeepEqual(durable, returned) {
+				return persisted, explorer.MarkCommittedInteraction(
+					shoal.NewError(
+						shoal.ErrorInternal,
+						"durable interaction sink returned an unverified timestamp",
+					),
+				)
+			}
+		}
 		persisted = returned
 	}
 	if err := guard.Check(ctx); err != nil {

@@ -171,8 +171,15 @@ func (c *Cache) sharedForPath(path string) (*rfile.SharedFile, error) {
 // (local filesystem by default). A nil Cache reads straight from the
 // backend with no memoization.
 func (c *Cache) fileBytes(path string) ([]byte, error) {
+	return c.fileBytesContext(context.Background(), path)
+}
+
+func (c *Cache) fileBytesContext(ctx context.Context, path string) ([]byte, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if c == nil {
-		return storage.ReadAll(context.Background(), local.New(), path)
+		return storage.ReadAll(ctx, local.New(), path)
 	}
 	c.mu.Lock()
 	if b, ok := c.files[path]; ok {
@@ -183,7 +190,7 @@ func (c *Cache) fileBytes(path string) ([]byte, error) {
 
 	// Read outside the lock; concurrent readers of the same fresh path
 	// may both read from the backend, but they converge on one cached copy.
-	b, err := storage.ReadAll(context.Background(), c.backend, path)
+	b, err := storage.ReadAll(ctx, c.backend, path)
 	if err != nil {
 		return nil, err
 	}

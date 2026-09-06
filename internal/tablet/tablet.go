@@ -52,11 +52,13 @@ import (
 
 	"github.com/phrocker/shoal-oss/internal/cclient"
 	"github.com/phrocker/shoal-oss/internal/compaction"
+	"github.com/phrocker/shoal-oss/internal/embeddingspace"
 	"github.com/phrocker/shoal-oss/internal/iterrt"
 	"github.com/phrocker/shoal-oss/internal/localwal"
 	"github.com/phrocker/shoal-oss/internal/parquetfile"
 	"github.com/phrocker/shoal-oss/internal/rfile"
 	"github.com/phrocker/shoal-oss/internal/rfile/adjacency"
+	"github.com/phrocker/shoal-oss/internal/rfile/bcfile"
 	"github.com/phrocker/shoal-oss/internal/rfile/bcfile/block"
 	"github.com/phrocker/shoal-oss/internal/rfile/wire"
 	"github.com/phrocker/shoal-oss/internal/storage"
@@ -68,6 +70,12 @@ import (
 // automatically flushed to an RFile. 256K cells balances memory use
 // against write amplification for bulk ingest workloads.
 const DefaultFlushThreshold = 256_000
+
+var ErrEmbeddingStateChangeWithUnflushedData = errors.New(
+	"tablet: cannot change default embedding state with unflushed data")
+
+var ErrMixedEmbeddingCompactionStack = errors.New(
+	"tablet: iterator stack requires a whole-table view across mixed embedding spaces")
 
 type FileFormat string
 
@@ -107,10 +115,16 @@ type ConditionKind int
 const (
 	ConditionAbsent ConditionKind = iota + 1
 	ConditionValueEquals
+	// ConditionLatestValueAndTimestampEquals compares both the value and
+	// timestamp of the newest live version. It is the generation-fenced CAS
+	// predicate used by the embedded Explorer transaction store.
+	ConditionLatestValueAndTimestampEquals
 )
 
 // Condition targets one cell coordinate in the mutation's row. Timestamp nil
-// selects the newest version; a non-nil timestamp selects that exact version.
+// selects the newest version; a non-nil timestamp selects that exact version
+// except for ConditionLatestValueAndTimestampEquals, which checks that the
+// newest live version has the supplied timestamp and value.
 type Condition struct {
 	ColumnFamily     []byte
 	ColumnQualifier  []byte
@@ -173,6 +187,10 @@ type Options struct {
 	// The zero value preserves the historical RFile behavior.
 	FileFormat FileFormat
 
+	// DefaultEmbedding is the actual embedding state written into each new
+	// immutable file. The zero value writes no claim and reads as unknown.
+	DefaultEmbedding embeddingspace.FileState
+
 	// OnRFile, when set, is invoked after a flush or compaction writes a new
 	// immutable RFile, with the event kind ("flush" | "compact") and the new
 	// RFile's base name. It enables event-driven shipping (sync as soon as an
@@ -198,6 +216,11 @@ func Open(dir string, opts Options) (*Tablet, error) {
 		return nil, err
 	}
 	opts.FileFormat = format
+	if opts.DefaultEmbedding != (embeddingspace.FileState{}) {
+		if err := opts.DefaultEmbedding.Validate(); err != nil {
+			return nil, fmt.Errorf("tablet: invalid default embedding state: %w", err)
+		}
+	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("tablet: mkdir %s: %w", dir, err)
 	}
@@ -330,7 +353,7 @@ func (t *Tablet) conditionsMatchLocked(row []byte, conditions []Condition) (bool
 			Timestamp:        math.MaxInt64,
 			Deleted:          true,
 		}
-		if condition.Timestamp != nil {
+		if condition.Timestamp != nil && condition.Kind != ConditionLatestValueAndTimestampEquals {
 			start.Timestamp = *condition.Timestamp
 		}
 		if err := source.Seek(iterrt.Range{
@@ -363,6 +386,12 @@ func (t *Tablet) conditionsMatchLocked(row []byte, conditions []Condition) (bool
 			if !exists || !bytes.Equal(value, condition.Value) {
 				return false, nil
 			}
+		case ConditionLatestValueAndTimestampEquals:
+			if condition.Timestamp == nil || !exists ||
+				source.GetTopKey().Timestamp != *condition.Timestamp ||
+				!bytes.Equal(value, condition.Value) {
+				return false, nil
+			}
 		default:
 			return false, fmt.Errorf("tablet: unsupported condition kind %d", condition.Kind)
 		}
@@ -377,6 +406,13 @@ func (t *Tablet) conditionsMatchLocked(row []byte, conditions []Condition) (bool
 // columnFamilies + inclusive follow the SKVI Seek contract: pass nil
 // with inclusive=false for a full scan.
 func (t *Tablet) Scan(r iterrt.Range, columnFamilies [][]byte, inclusive bool, stack []iterrt.IterSpec, env iterrt.IteratorEnvironment) (*Scanner, error) {
+	for _, spec := range stack {
+		if spec.Name == iterrt.IterVectorKNN {
+			return nil, fmt.Errorf(
+				"%w: vectorKNN requires engine-hosted metadata validation",
+				embeddingspace.ErrQueryMetadataMissing)
+		}
+	}
 	merge, closeAll, err := t.Source(env)
 	if err != nil {
 		return nil, err
@@ -624,13 +660,73 @@ func cloneBytes(b []byte) []byte {
 // may fall in different tablets — by merging every tablet's Source and
 // stacking the iterator above that cross-tablet merge.
 func (t *Tablet) Source(env iterrt.IteratorEnvironment) (iterrt.SortedKeyValueIterator, func(), error) {
+	return t.SourceContext(context.Background(), env)
+}
+
+// SourceContext is Source with cancellation propagated to immutable-file
+// opens and reads during source construction.
+func (t *Tablet) SourceContext(
+	ctx context.Context,
+	env iterrt.IteratorEnvironment,
+) (iterrt.SortedKeyValueIterator, func(), error) {
+	return t.SnapshotSourceContext(ctx, env)
+}
+
+// SnapshotSourceContext returns a source whose memtable component is copied
+// while holding the tablet lock. Later writes cannot join the returned scan.
+func (t *Tablet) SnapshotSourceContext(
+	ctx context.Context,
+	env iterrt.IteratorEnvironment,
+) (iterrt.SortedKeyValueIterator, func(), error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	t.mu.RLock()
 	defer t.mu.RUnlock()
-	return t.sourceLocked(env)
+	mem := t.active.Iterator()
+	if err := mem.Init(nil, nil, env); err != nil {
+		return nil, nil, err
+	}
+	if err := mem.Seek(iterrt.InfiniteRange(), nil, false); err != nil {
+		return nil, nil, err
+	}
+	var cells []iterrt.Cell
+	for mem.HasTop() {
+		if err := ctx.Err(); err != nil {
+			return nil, nil, err
+		}
+		cells = append(cells, iterrt.Cell{
+			Key:   mem.GetTopKey().Clone(),
+			Value: append([]byte(nil), mem.GetTopValue()...),
+		})
+		if err := mem.Next(); err != nil {
+			return nil, nil, err
+		}
+	}
+	memSnapshot := iterrt.NewSliceSource(cells)
+	if err := memSnapshot.Init(nil, nil, env); err != nil {
+		return nil, nil, err
+	}
+	return t.sourceWithMemLockedContext(ctx, env, memSnapshot)
 }
 
 func (t *Tablet) sourceLocked(env iterrt.IteratorEnvironment) (iterrt.SortedKeyValueIterator, func(), error) {
+	return t.sourceLockedContext(context.Background(), env)
+}
+
+func (t *Tablet) sourceLockedContext(
+	ctx context.Context,
+	env iterrt.IteratorEnvironment,
+) (iterrt.SortedKeyValueIterator, func(), error) {
 	memIter := t.active.Iterator()
+	return t.sourceWithMemLockedContext(ctx, env, memIter)
+}
+
+func (t *Tablet) sourceWithMemLockedContext(
+	ctx context.Context,
+	env iterrt.IteratorEnvironment,
+	memIter iterrt.SortedKeyValueIterator,
+) (iterrt.SortedKeyValueIterator, func(), error) {
 	filesCopy := append([]string(nil), t.files...)
 
 	// Build leaf iterators: one from memtable + one per RFile
@@ -638,7 +734,13 @@ func (t *Tablet) sourceLocked(env iterrt.IteratorEnvironment) (iterrt.SortedKeyV
 	var closers []func()
 
 	for _, path := range filesCopy {
-		src, closer, err := t.openFileSource(path, env)
+		if err := ctx.Err(); err != nil {
+			for _, c := range closers {
+				c()
+			}
+			return nil, nil, err
+		}
+		src, closer, err := t.openFileSourceContext(ctx, path, env)
 		if err != nil {
 			// Clean up any already-opened readers
 			for _, c := range closers {
@@ -685,32 +787,85 @@ func (t *Tablet) Compact(stack []iterrt.IterSpec) error {
 		return nil // nothing to compact
 	}
 
-	// Read all input RFiles (served from cache when warm)
-	inputs := make([]compaction.Input, 0, len(t.files))
+	type inputGroup struct {
+		state  embeddingspace.FileState
+		inputs []compaction.Input
+	}
+	groupsByState := make(map[string]*inputGroup)
 	for _, path := range t.files {
 		data, err := t.fileBytes(path)
 		if err != nil {
 			return fmt.Errorf("tablet: read %s for compaction: %w", path, err)
 		}
-		inputs = append(inputs, compaction.Input{Name: path, Bytes: data})
+		state, err := embeddingStateFromImage(path, data)
+		if err != nil {
+			return fmt.Errorf("tablet: read embedding state %s: %w", path, err)
+		}
+		key := state.String()
+		group := groupsByState[key]
+		if group == nil {
+			group = &inputGroup{state: state}
+			groupsByState[key] = group
+		}
+		group.inputs = append(group.inputs, compaction.Input{
+			Name: path, Bytes: data, MetadataEmbedding: state,
+		})
+	}
+	groupKeys := make([]string, 0, len(groupsByState))
+	for key := range groupsByState {
+		groupKeys = append(groupKeys, key)
+	}
+	sort.Strings(groupKeys)
+	if len(groupKeys) > 1 && len(stack) > 0 {
+		return ErrMixedEmbeddingCompactionStack
 	}
 
-	result, err := compaction.Compact(compaction.Spec{
-		Inputs:              inputs,
-		Stack:               stack,
-		Scope:               iterrt.ScopeMajc,
-		FullMajorCompaction: true,
-		AdjacencyEdgeCF:     t.opts.AdjacencyEdgeCF,
-		OutputFormat:        string(t.opts.FileFormat),
-	})
-	if err != nil {
-		return fmt.Errorf("tablet: compact: %w", err)
+	type compactedOutput struct {
+		name    string
+		path    string
+		entries int64
 	}
-
-	outName := fmt.Sprintf("C%013d%s", time.Now().UnixMilli(), t.opts.FileFormat.extension())
-	outPath := filepath.Join(t.dir, outName)
-	if err := storage.WriteAll(context.Background(), t.backend, outPath, result.Output); err != nil {
-		return fmt.Errorf("tablet: write compacted: %w", err)
+	outputs := make([]compactedOutput, 0, len(groupKeys))
+	cleanupOutputs := func() {
+		for _, output := range outputs {
+			_ = removeObject(t.backend, output.path)
+		}
+	}
+	existingNames := cloneObsolete(t.obsolete)
+	for _, path := range t.files {
+		existingNames[filepath.Base(path)] = struct{}{}
+	}
+	base := uniqueCompactionBase(
+		time.Now().UnixMilli(),
+		len(groupKeys),
+		t.opts.FileFormat.extension(),
+		existingNames,
+	)
+	for index, key := range groupKeys {
+		group := groupsByState[key]
+		result, err := compaction.Compact(compaction.Spec{
+			Inputs:              group.inputs,
+			Stack:               stack,
+			Scope:               iterrt.ScopeMajc,
+			FullMajorCompaction: len(groupKeys) == 1,
+			AdjacencyEdgeCF:     t.opts.AdjacencyEdgeCF,
+			OutputFormat:        string(t.opts.FileFormat),
+		})
+		if err != nil {
+			cleanupOutputs()
+			return fmt.Errorf("tablet: compact %s: %w", group.state, err)
+		}
+		outName := fmt.Sprintf(
+			"C%013d-%03d%s", base, index, t.opts.FileFormat.extension())
+		outPath := filepath.Join(t.dir, outName)
+		if err := storage.WriteAll(
+			context.Background(), t.backend, outPath, result.Output); err != nil {
+			cleanupOutputs()
+			return fmt.Errorf("tablet: write compacted: %w", err)
+		}
+		outputs = append(outputs, compactedOutput{
+			name: outName, path: outPath, entries: result.EntriesWritten,
+		})
 	}
 
 	oldFiles := t.files
@@ -718,16 +873,21 @@ func (t *Tablet) Compact(stack []iterrt.IterSpec) error {
 	for _, old := range oldFiles {
 		obsolete[filepath.Base(old)] = struct{}{}
 	}
-	if err := persistImmutableManifest(t.backend, t.dir, []string{outPath}, obsolete); err != nil {
+	outputPaths := make([]string, len(outputs))
+	for index, output := range outputs {
+		outputPaths[index] = output.path
+	}
+	if err := persistImmutableManifest(
+		t.backend, t.dir, outputPaths, obsolete); err != nil {
 		if storage.IsCommittedWriteError(err) {
-			t.files = []string{outPath}
+			t.files = outputPaths
 			t.obsolete = obsolete
 			return fmt.Errorf("tablet: publish compacted generation committed with cleanup error: %w", err)
 		}
-		_ = removeObject(t.backend, outPath)
+		cleanupOutputs()
 		return fmt.Errorf("tablet: publish compacted generation: %w", err)
 	}
-	t.files = []string{outPath}
+	t.files = outputPaths
 	t.obsolete = obsolete
 	for _, old := range oldFiles {
 		if t.opts.Cache != nil {
@@ -747,13 +907,51 @@ func (t *Tablet) Compact(stack []iterrt.IterSpec) error {
 
 	t.logger.Info("compaction complete",
 		slog.Int("inputs", len(oldFiles)),
-		slog.Int64("entries", result.EntriesWritten),
-		slog.String("output", outName))
+		slog.Int("outputs", len(outputs)))
 	if t.opts.OnRFile != nil {
-		t.opts.OnRFile("compact", outName)
+		for _, output := range outputs {
+			t.opts.OnRFile("compact", output.name)
+		}
 	}
 
 	return nil
+}
+
+func uniqueCompactionBase(
+	base int64,
+	outputs int,
+	extension string,
+	existing map[string]struct{},
+) int64 {
+	for {
+		collision := false
+		for index := 0; index < outputs; index++ {
+			name := fmt.Sprintf("C%013d-%03d%s", base, index, extension)
+			if _, found := existing[name]; found {
+				collision = true
+				break
+			}
+		}
+		if !collision {
+			return base
+		}
+		base++
+	}
+}
+
+func embeddingStateFromImage(
+	path string,
+	data []byte,
+) (embeddingspace.FileState, error) {
+	if fileFormat(path) == FormatParquet {
+		return parquetfile.ReadEmbeddingSpaceMetadata(
+			bytes.NewReader(data), int64(len(data)))
+	}
+	reader, err := bcfile.NewReader(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		return embeddingspace.FileState{}, err
+	}
+	return rfile.ReadEmbeddingSpaceMetadata(reader, block.Default())
 }
 
 // FileCount returns the number of immutable files.
@@ -873,10 +1071,17 @@ func (t *Tablet) flushLocked() error {
 
 func (t *Tablet) encode(iter iterrt.SortedKeyValueIterator) ([]byte, int64, error) {
 	if t.opts.FileFormat == FormatParquet {
-		return parquetfile.Encode(iter)
+		return parquetfile.EncodeWithOptions(
+			iter,
+			parquetfile.EncodeOptions{EmbeddingSpace: t.opts.DefaultEmbedding},
+		)
 	}
 	var buf bytes.Buffer
-	w, err := rfile.NewWriter(&buf, rfile.WriterOptions{Codec: block.CodecSnappy, AdjacencyEdgeCF: t.opts.AdjacencyEdgeCF})
+	w, err := rfile.NewWriter(&buf, rfile.WriterOptions{
+		Codec:           block.CodecSnappy,
+		AdjacencyEdgeCF: t.opts.AdjacencyEdgeCF,
+		EmbeddingSpace:  t.opts.DefaultEmbedding,
+	})
 	if err != nil {
 		return nil, 0, fmt.Errorf("new rfile writer: %w", err)
 	}
@@ -923,6 +1128,74 @@ func (t *Tablet) SetFileFormat(format FileFormat) error {
 	return nil
 }
 
+// SetDefaultEmbedding changes the actual embedding state stamped on future
+// flushes. Existing immutable files keep their own self-describing state.
+func (t *Tablet) SetDefaultEmbedding(state embeddingspace.FileState) error {
+	if state != (embeddingspace.FileState{}) {
+		if err := state.Validate(); err != nil {
+			return err
+		}
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if cells := t.active.Len(); cells > 0 {
+		return fmt.Errorf(
+			"%w: tablet has %d unflushed cells",
+			ErrEmbeddingStateChangeWithUnflushedData, cells)
+	}
+	t.opts.DefaultEmbedding = state
+	return nil
+}
+
+// EmbeddingFileState is one immutable file's footer-level embedding state.
+type EmbeddingFileState struct {
+	Path  string
+	State embeddingspace.FileState
+}
+
+// EmbeddingStateSnapshot reads every immutable file's footer while holding a
+// consistent tablet file-set snapshot. UnflushedCells are reported separately
+// because a memtable has no immutable file metadata and must fail exact vector
+// queries closed.
+func (t *Tablet) EmbeddingStateSnapshot(
+	ctx context.Context,
+) ([]EmbeddingFileState, int, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	out := make([]EmbeddingFileState, 0, len(t.files))
+	for _, path := range t.files {
+		if err := ctx.Err(); err != nil {
+			return nil, 0, err
+		}
+		file, err := t.backend.Open(ctx, path)
+		if err != nil {
+			return nil, 0, fmt.Errorf("tablet: open embedding metadata %s: %w", path, err)
+		}
+		var state embeddingspace.FileState
+		if fileFormat(path) == FormatParquet {
+			state, err = parquetfile.ReadEmbeddingSpaceMetadata(file, file.Size())
+		} else {
+			var bc *bcfile.Reader
+			bc, err = bcfile.NewReader(file, file.Size())
+			if err == nil {
+				state, err = rfile.ReadEmbeddingSpaceMetadata(bc, block.Default())
+			}
+		}
+		closeErr := file.Close()
+		if err != nil {
+			return nil, 0, fmt.Errorf("tablet: read embedding metadata %s: %w", path, err)
+		}
+		if closeErr != nil {
+			return nil, 0, fmt.Errorf("tablet: close embedding metadata %s: %w", path, closeErr)
+		}
+		out = append(out, EmbeddingFileState{Path: path, State: state})
+	}
+	return out, t.active.Len(), nil
+}
+
 // ingestMutation inserts a mutation's cells into the active memtable.
 func (t *Tablet) ingestMutation(m *cclient.Mutation) {
 	for _, c := range m.Cells() {
@@ -961,9 +1234,20 @@ func (t *Tablet) sharedForPath(path string) (*rfile.SharedFile, error) {
 // path, so the shared bytes slice is safe to wrap in concurrent read-only
 // readers.
 func (t *Tablet) openFileSource(path string, env iterrt.IteratorEnvironment) (iterrt.SortedKeyValueIterator, func(), error) {
+	return t.openFileSourceContext(context.Background(), path, env)
+}
+
+func (t *Tablet) openFileSourceContext(
+	ctx context.Context,
+	path string,
+	env iterrt.IteratorEnvironment,
+) (iterrt.SortedKeyValueIterator, func(), error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if fileFormat(path) == FormatParquet {
 		open := func() (storage.File, error) {
-			return t.backend.Open(context.Background(), path)
+			return t.backend.Open(ctx, path)
 		}
 		file, err := open()
 		if err != nil {
@@ -979,8 +1263,17 @@ func (t *Tablet) openFileSource(path string, env iterrt.IteratorEnvironment) (it
 		}
 		return src, func() { _ = src.Close() }, nil
 	}
-	data, err := t.fileBytes(path)
+	var data []byte
+	var err error
+	if t.opts.Cache != nil {
+		data, err = t.opts.Cache.fileBytesContext(ctx, path)
+	} else {
+		data, err = storage.ReadAll(ctx, t.backend, path)
+	}
 	if err != nil {
+		return nil, nil, err
+	}
+	if err := ctx.Err(); err != nil {
 		return nil, nil, err
 	}
 	c := t.opts.Cache

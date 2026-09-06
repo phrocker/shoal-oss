@@ -332,6 +332,25 @@ document/graph relationships that a later storage adapter must persist.
   authorized current-document/node projection before ranking, so hidden
   candidates cannot displace results or influence scores, explanations, or
   limits.
+- Vector-space observability is projected at that same boundary.
+  `authorized.Client.RetrieveWithReport` and the request-local
+  `authorized.WithEmbeddingQueryObserver` callback report only distinct spaces
+  reached after current policy and mosaic filtering. An authorized space is
+  represented by a process-keyed opaque ID and one of `available`,
+  `unavailable`, `not_attempted`, or `not_completed`; raw provider/model
+  identity and metadata are never returned. A hidden-only projection performs
+  no provider call and exposes no space ID. The existing `Suppressed` and
+  `Restricted` document counts remain the complete permitted disclosure about
+  withheld content; the embedding report adds only corresponding booleans, not
+  hidden-space identities or counts. Generation is rechecked before release,
+  and cancellation, expiry, revocation, or a failed generation read scrubs
+  observed IDs and activity counters.
+- `webapi.RetrievalResponse.embedding` carries the same report on success.
+  Failed vector retrieval returns an `EmbeddingQueryError`; HTTP places its
+  report beside the stable error code, and `RemoteService` reconstructs it.
+  The wire encodes opaque space IDs with the standard unpadded base64url ID
+  codec. Error text is generic and never substitutes raw space identity for
+  the opaque report.
 - Ingesting a source URI that already identifies a registered document
   requires ingest authorization under that document's current rule. A caller
   who cannot see the document is refused with the same `not_found` shape as an

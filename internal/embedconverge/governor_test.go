@@ -6,6 +6,7 @@ package embedconverge
 
 import (
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -94,24 +95,116 @@ func TestGovernorAdmitFilesIsAllOrNothing(t *testing.T) {
 	clock := newFakeClock()
 	g := NewGovernor(GovernorOptions{FilesPerSecond: 1, Burst: 3, Now: clock.Now})
 
-	if _, err := g.AdmitFiles(4); !errors.Is(err, ErrThrottled) {
-		t.Fatalf("err = %v, want ErrThrottled: 4 files need 4 tokens", err)
-	}
-	if got := g.Stats().SpentFiles; got != 0 {
-		t.Fatalf("SpentFiles = %d, want a refused reservation to take nothing", got)
-	}
-	permit, err := g.AdmitFiles(3)
+	first, err := g.AdmitFile()
 	if err != nil {
-		t.Fatalf("AdmitFiles(3): %v", err)
+		t.Fatalf("AdmitFile: %v", err)
 	}
-	if permit.Files() != 3 {
-		t.Fatalf("permit.Files() = %d, want 3", permit.Files())
+	first.Settle(1)
+	if _, err := g.AdmitFiles(3); !errors.Is(err, ErrThrottled) {
+		t.Fatalf("err = %v, want ErrThrottled: only two of three tokens are available", err)
+	}
+	if got := g.Stats().SpentFiles; got != 1 {
+		t.Fatalf("SpentFiles = %d, want the refused reservation to take nothing", got)
+	}
+	permit, err := g.AdmitFiles(2)
+	if err != nil {
+		t.Fatalf("AdmitFiles(2): %v", err)
+	}
+	if permit.Files() != 2 {
+		t.Fatalf("permit.Files() = %d, want 2", permit.Files())
 	}
 	if got := g.Stats().SpentFiles; got != 3 {
 		t.Fatalf("SpentFiles = %d, want 3", got)
 	}
 	if _, err := g.AdmitFiles(0); err == nil {
 		t.Fatal("a zero-file reservation is a caller bug and must be refused")
+	}
+}
+
+func TestGovernorWideAtomicReservationBorrowsAndRepaysRateCapacity(t *testing.T) {
+	t.Parallel()
+
+	clock := newFakeClock()
+	g := NewGovernor(GovernorOptions{
+		FilesPerSecond: 1,
+		Burst:          1,
+		Budget:         Budget{MaxFiles: 4},
+		Now:            clock.Now,
+	})
+
+	permit, err := g.AdmitFiles(4)
+	if err != nil {
+		t.Fatalf("AdmitFiles(4) with Burst 1: %v", err)
+	}
+	if permit.Files() != 4 {
+		t.Fatalf("permit.Files() = %d, want 4", permit.Files())
+	}
+	if got := g.Stats().SpentFiles; got != 4 {
+		t.Fatalf("SpentFiles = %d, want the complete atomic reservation", got)
+	}
+
+	// A failed provider attempt refunds the file budget, but it does not
+	// refund rate capacity: the next attempt must wait out the four files
+	// admitted by the first one.
+	permit.Settle(0)
+	if got := g.Stats().SpentFiles; got != 0 {
+		t.Fatalf("SpentFiles = %d, want the failed reservation refunded", got)
+	}
+	if _, err := g.AdmitFiles(4); !errors.Is(err, ErrThrottled) {
+		t.Fatalf("immediate retry error = %v, want ErrThrottled", err)
+	} else if !strings.Contains(err.Error(), "atomic 4-file reservation exceeds burst 1.000") ||
+		!strings.Contains(err.Error(), "rate debt outstanding") ||
+		!strings.Contains(err.Error(), "retry after at least 3.000s") {
+		t.Fatalf("wide-refusal error is not actionable: %v", err)
+	}
+	g.Pause()
+	g.Resume()
+	if _, err := g.AdmitFiles(4); !errors.Is(err, ErrThrottled) {
+		t.Fatalf("pause/resume retry error = %v, want rate debt to remain", err)
+	}
+
+	clock.Advance(2 * time.Second)
+	if _, err := g.AdmitFiles(4); !errors.Is(err, ErrThrottled) {
+		t.Fatalf("partial-refill retry error = %v, want ErrThrottled", err)
+	}
+	if got := g.Stats().SpentFiles; got != 0 {
+		t.Fatalf("SpentFiles = %d, want refused retries to reserve nothing", got)
+	}
+
+	clock.Advance(time.Second)
+	if _, err := g.AdmitFiles(4); err != nil {
+		t.Fatalf("retry after repaying rate capacity: %v", err)
+	}
+}
+
+func TestGovernorSmallAdmissionsCannotStarveAWideReservation(t *testing.T) {
+	t.Parallel()
+
+	g := NewGovernor(GovernorOptions{
+		FilesPerSecond: 1,
+		Burst:          3,
+		Budget:         Budget{MaxFiles: 8},
+		Now:            newFakeClock().Now,
+	})
+	for i := 0; i < 3; i++ {
+		permit, err := g.AdmitFile()
+		if err != nil {
+			t.Fatalf("small admission %d: %v", i, err)
+		}
+		permit.Settle(1)
+	}
+
+	permit, err := g.AdmitFiles(4)
+	if err != nil {
+		t.Fatalf("wide admission after the regular burst was consumed: %v", err)
+	}
+	permit.Settle(4)
+	stats := g.Stats()
+	if stats.Admitted != 7 || stats.SpentFiles != 7 {
+		t.Fatalf("stats = %+v, want all three small files and the four-file merge admitted", stats)
+	}
+	if _, err := g.AdmitFile(); !errors.Is(err, ErrThrottled) {
+		t.Fatalf("admission during wide-request rate debt = %v, want ErrThrottled", err)
 	}
 }
 
@@ -358,5 +451,53 @@ func TestGovernorIsSafeUnderConcurrentUse(t *testing.T) {
 	g.Stop()
 	if err := admit(g); !errors.Is(err, ErrStopped) {
 		t.Fatalf("err = %v, want ErrStopped", err)
+	}
+}
+
+func TestGovernorConcurrentWideReservationsAdmitOnlyOneBurst(t *testing.T) {
+	t.Parallel()
+
+	g := NewGovernor(GovernorOptions{
+		FilesPerSecond: 1,
+		Burst:          1,
+		Budget:         Budget{MaxFiles: 64},
+		Now:            newFakeClock().Now,
+	})
+	const (
+		workers = 16
+		width   = 4
+	)
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	admitted := 0
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			permit, err := g.AdmitFiles(width)
+			if err != nil {
+				if !errors.Is(err, ErrThrottled) {
+					t.Errorf("AdmitFiles(%d): %v", width, err)
+				}
+				return
+			}
+			mu.Lock()
+			admitted++
+			mu.Unlock()
+			permit.Settle(width)
+		}()
+	}
+	wg.Wait()
+
+	mu.Lock()
+	gotAdmitted := admitted
+	mu.Unlock()
+	if gotAdmitted != 1 {
+		t.Fatalf("admitted reservations = %d, want exactly one", gotAdmitted)
+	}
+	stats := g.Stats()
+	if stats.Admitted != width || stats.Refused != workers-1 || stats.SpentFiles != width {
+		t.Fatalf("stats = %+v, want admitted=%d refused=%d spent=%d",
+			stats, width, workers-1, width)
 	}
 }

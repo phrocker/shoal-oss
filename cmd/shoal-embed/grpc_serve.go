@@ -27,6 +27,7 @@ import (
 	"reflect"
 	"strings"
 
+	"github.com/phrocker/shoal-oss/internal/embeddingspace"
 	"github.com/phrocker/shoal-oss/internal/embedpb"
 	"github.com/phrocker/shoal-oss/internal/embedstore"
 	"github.com/phrocker/shoal-oss/internal/engine"
@@ -207,6 +208,25 @@ func (s *embedServer) readPersistedTableStatus(table string) (persistedTableStat
 }
 
 func (s *embedServer) CreateTable(_ context.Context, req *embedpb.CreateTableRequest) (*embedpb.CreateTableResponse, error) {
+	if req.DefaultEmbedding != "" {
+		return nil, status.Error(
+			codes.FailedPrecondition,
+			"default_embedding requires CreateTableV2",
+		)
+	}
+	return s.createTable(req)
+}
+
+func (s *embedServer) CreateTableV2(
+	_ context.Context,
+	req *embedpb.CreateTableRequest,
+) (*embedpb.CreateTableResponse, error) {
+	return s.createTable(req)
+}
+
+func (s *embedServer) createTable(
+	req *embedpb.CreateTableRequest,
+) (*embedpb.CreateTableResponse, error) {
 	if req.Table == "" {
 		return nil, status.Error(codes.InvalidArgument, "table is required")
 	}
@@ -223,6 +243,13 @@ func (s *embedServer) CreateTable(_ context.Context, req *embedpb.CreateTableReq
 	}
 	if selection.fileFormatSet {
 		opts.TabletOptions.FileFormat = selection.fileFormat
+	}
+	if req.DefaultEmbedding != "" {
+		state, err := embeddingspace.Parse(req.DefaultEmbedding)
+		if err != nil {
+			return nil, status.Error(codes.InvalidArgument, err.Error())
+		}
+		opts.DefaultEmbedding = state
 	}
 	if err := s.eng.CreateTable(req.Table, opts); err != nil {
 		return nil, adminStatusError("create table", err)
@@ -281,19 +308,55 @@ func scanStatusError(err error) error {
 	switch {
 	case errors.Is(err, embedstore.ErrMultiplePushdowns),
 		errors.Is(err, embedstore.ErrVectorQueryRequired),
+		errors.Is(err, embedstore.ErrVectorEmbeddingSpaceRequired),
 		errors.Is(err, embedstore.ErrNegativeMaxHops):
 		return status.Error(codes.InvalidArgument, err.Error())
+	case errors.Is(err, embeddingspace.ErrMismatch),
+		errors.Is(err, embeddingspace.ErrIntegrity),
+		errors.Is(err, embeddingspace.ErrQuerySpaceUnknown),
+		errors.Is(err, embeddingspace.ErrQueryNoEmbeddings),
+		errors.Is(err, embeddingspace.ErrQueryMetadataMissing):
+		return status.Error(codes.FailedPrecondition, err.Error())
+	case errors.Is(err, context.Canceled):
+		return status.Error(codes.Canceled, err.Error())
+	case errors.Is(err, context.DeadlineExceeded):
+		return status.Error(codes.DeadlineExceeded, err.Error())
 	default:
 		return status.Errorf(codes.Internal, "scan: %v", err)
 	}
 }
 
-func (s *embedServer) Scan(req *embedpb.ScanRequest, stream embedpb.ShoalEmbed_ScanServer) error {
+type scanServer interface {
+	Context() context.Context
+	Send(*embedpb.ScanResponse) error
+}
+
+func (s *embedServer) Scan(
+	req *embedpb.ScanRequest,
+	stream embedpb.ShoalEmbed_ScanServer,
+) error {
+	if req.VectorSearch != nil {
+		return status.Error(
+			codes.FailedPrecondition,
+			"vector_search requires ScanV2 identity enforcement",
+		)
+	}
+	return s.scan(req, stream)
+}
+
+func (s *embedServer) ScanV2(
+	req *embedpb.ScanRequest,
+	stream embedpb.ShoalEmbed_ScanV2Server,
+) error {
+	return s.scan(req, stream)
+}
+
+func (s *embedServer) scan(req *embedpb.ScanRequest, stream scanServer) error {
 	if req.Table == "" {
 		return status.Error(codes.InvalidArgument, "table is required")
 	}
 
-	sc, err := s.store.Scanner(req.Table, req)
+	sc, err := s.store.ScannerContext(stream.Context(), req.Table, req)
 	if err != nil {
 		return scanStatusError(err)
 	}
@@ -309,6 +372,9 @@ func (s *embedServer) Scan(req *embedpb.ScanRequest, stream embedpb.ShoalEmbed_S
 	total := 0
 
 	for sc.Next() {
+		if err := stream.Context().Err(); err != nil {
+			return scanStatusError(err)
+		}
 		k := sc.Key()
 		batch = append(batch, &embedpb.Cell{
 			Row:              k.Row,

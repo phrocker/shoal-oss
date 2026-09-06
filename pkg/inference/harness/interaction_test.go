@@ -251,7 +251,6 @@ func TestInteractionSessionPreservesExecutionPins(t *testing.T) {
 		SnapshotAsOf:             snapshotAt,
 		AuthorizationFingerprint: "auth-sha256:pinned",
 		AuthorizationExpiresAt:   expiresAt,
-		EmbeddingSpaceID:         "embedding-space-v3",
 	}, fixedTime)
 	if err != nil {
 		t.Fatal(err)
@@ -259,8 +258,7 @@ func TestInteractionSessionPreservesExecutionPins(t *testing.T) {
 	if session.SnapshotID != "snapshot-pinned" ||
 		!session.SnapshotAsOf.Equal(snapshotAt) ||
 		session.AuthorizationFingerprint != "auth-sha256:pinned" ||
-		!session.AuthorizationExpiresAt.Equal(expiresAt) ||
-		session.EmbeddingSpaceID != "embedding-space-v3" {
+		!session.AuthorizationExpiresAt.Equal(expiresAt) {
 		t.Fatalf("session pins = %+v", session)
 	}
 }

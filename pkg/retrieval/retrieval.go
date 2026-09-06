@@ -22,9 +22,6 @@ package retrieval
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/binary"
-	"encoding/hex"
 	"sort"
 	"strings"
 	"time"
@@ -243,10 +240,8 @@ type Result struct {
 
 // Response is the complete, all-or-error result of one retrieval request.
 type Response struct {
-	RequestID         shoal.ID
-	EmbeddingSpaceID  shoal.ID
-	EmbeddingSpaceIDs []shoal.ID
-	Results           []Result
+	RequestID shoal.ID
+	Results   []Result
 }
 
 // ValidateFor checks result bounds, uniqueness, finite scores, and normative
@@ -258,58 +253,6 @@ func (r Response) ValidateFor(request Request) error {
 	}
 	if err := shoal.ValidateOptionalID("retrieval request ID", r.RequestID); err != nil {
 		return err
-	}
-	if err := shoal.ValidateOptionalID(
-		"retrieval embedding space ID", r.EmbeddingSpaceID,
-	); err != nil {
-		return err
-	}
-	if normalized.HasMode(ModeVector) {
-		if r.EmbeddingSpaceID == "" || len(r.EmbeddingSpaceIDs) == 0 {
-			return shoal.NewError(
-				shoal.ErrorInvalidArgument,
-				"vector retrieval response requires canonical embedding "+
-					"space constituents",
-			)
-		}
-	} else if r.EmbeddingSpaceID != "" || len(r.EmbeddingSpaceIDs) > 0 {
-		return shoal.NewError(
-			shoal.ErrorInvalidArgument,
-			"non-vector retrieval response cannot carry embedding space provenance",
-		)
-	}
-	if len(r.EmbeddingSpaceIDs) > MaxScopeIDs {
-		return shoal.NewError(
-			shoal.ErrorInvalidArgument,
-			"retrieval embedding space constituents exceed the public bound",
-		)
-	}
-	for index, id := range r.EmbeddingSpaceIDs {
-		if err := shoal.ValidateRequiredID(
-			"retrieval embedding space constituent ID", id,
-		); err != nil {
-			return err
-		}
-		if index > 0 &&
-			shoal.CompareID(r.EmbeddingSpaceIDs[index-1], id) >= 0 {
-			return shoal.NewError(
-				shoal.ErrorInvalidArgument,
-				"retrieval embedding space constituent IDs must be unique "+
-					"and canonically ordered",
-			)
-		}
-	}
-	if len(r.EmbeddingSpaceIDs) > 0 {
-		expected, err := EmbeddingSpaceSetID(r.EmbeddingSpaceIDs...)
-		if err != nil {
-			return err
-		}
-		if expected != r.EmbeddingSpaceID {
-			return shoal.NewError(
-				shoal.ErrorInvalidArgument,
-				"retrieval embedding space set identity is not canonical",
-			)
-		}
 	}
 	if uint32(len(r.Results)) > normalized.TopK {
 		return shoal.NewError(
@@ -360,70 +303,6 @@ func (r Response) ValidateFor(request Request) error {
 		}
 	}
 	return nil
-}
-
-// EmbeddingSpaceIdentityID hashes one provider-defined embedding-space
-// identity into a stable opaque constituent ID.
-func EmbeddingSpaceIdentityID(identity string) (shoal.ID, error) {
-	if !utf8.ValidString(identity) || strings.TrimSpace(identity) == "" ||
-		len(identity) > shoal.MaxSemanticStringBytes {
-		return "", shoal.NewError(
-			shoal.ErrorInvalidArgument,
-			"embedding space identity is invalid",
-		)
-	}
-	hash := sha256.New()
-	var length [8]byte
-	write := func(value string) {
-		binary.BigEndian.PutUint64(length[:], uint64(len(value)))
-		_, _ = hash.Write(length[:])
-		_, _ = hash.Write([]byte(value))
-	}
-	write("shoal-retrieval-embedding-space-v1")
-	write(identity)
-	return shoal.ID(
-		"embedding-space_" + hex.EncodeToString(hash.Sum(nil)[:16]),
-	), nil
-}
-
-// EmbeddingSpaceSetID returns a stable opaque identity for an exact set of
-// canonical constituent embedding-space IDs.
-func EmbeddingSpaceSetID(identities ...shoal.ID) (shoal.ID, error) {
-	normalized := append([]shoal.ID(nil), identities...)
-	for _, identity := range normalized {
-		if err := shoal.ValidateRequiredID(
-			"embedding space constituent ID", identity,
-		); err != nil {
-			return "", err
-		}
-	}
-	sort.Slice(normalized, func(i, j int) bool {
-		return shoal.CompareID(normalized[i], normalized[j]) < 0
-	})
-	unique := normalized[:0]
-	for _, identity := range normalized {
-		if len(unique) > 0 && unique[len(unique)-1] == identity {
-			continue
-		}
-		unique = append(unique, identity)
-	}
-	if len(unique) == 0 {
-		return "", nil
-	}
-	hash := sha256.New()
-	var length [8]byte
-	write := func(value string) {
-		binary.BigEndian.PutUint64(length[:], uint64(len(value)))
-		_, _ = hash.Write(length[:])
-		_, _ = hash.Write([]byte(value))
-	}
-	write("shoal-retrieval-embedding-space-set-v1")
-	for _, identity := range unique {
-		write(string(identity))
-	}
-	return shoal.ID(
-		"embedding-space_" + hex.EncodeToString(hash.Sum(nil)[:16]),
-	), nil
 }
 
 // CompareResult returns a negative value when left sorts before right under

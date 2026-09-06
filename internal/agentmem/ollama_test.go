@@ -3,11 +3,14 @@ package agentmem
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/phrocker/shoal-oss/internal/embeddingspace"
 )
 
 func TestOllamaEmbedder(t *testing.T) {
@@ -47,6 +50,20 @@ func TestOllamaEmbedder(t *testing.T) {
 		if got[i] != want[i] {
 			t.Fatalf("got[%d] = %v, want %v", i, got[i], want[i])
 		}
+	}
+	if _, err := embedder.EmbeddingSpaceIdentity(); !errors.Is(
+		err, embeddingspace.ErrQueryIdentityRequired) {
+		t.Fatalf("unknown-dimension identity error = %v", err)
+	}
+	identified := NewOllamaEmbedder(
+		WithOllamaHost(server.URL),
+		WithOllamaModel("embed-test"),
+		WithOllamaDimensions(3),
+		WithOllamaHTTPClient(server.Client()),
+	)
+	if identity, err := identified.EmbeddingSpaceIdentity(); err != nil ||
+		identity == "" {
+		t.Fatalf("configured identity = %q, %v", identity, err)
 	}
 }
 

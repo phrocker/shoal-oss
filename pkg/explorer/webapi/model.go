@@ -24,6 +24,7 @@ import (
 
 	"github.com/phrocker/shoal-oss/pkg/document"
 	"github.com/phrocker/shoal-oss/pkg/explorer"
+	"github.com/phrocker/shoal-oss/pkg/explorer/authorized"
 	"github.com/phrocker/shoal-oss/pkg/graph"
 	"github.com/phrocker/shoal-oss/pkg/ontology"
 	"github.com/phrocker/shoal-oss/pkg/retrieval"
@@ -187,6 +188,50 @@ type RetrievalResponse struct {
 	// withheld to keep it within its distinct sensitivity-domain budget. It is a
 	// count only and never names what was withheld, nor which domains.
 	Restricted uint32 `json:"restricted,omitempty"`
+	// Embedding reports only spaces in the caller-authorized candidate
+	// projection. Space IDs are process-keyed opaque pseudonyms; provider/model
+	// metadata and identities of suppressed spaces are never exposed.
+	Embedding *authorized.EmbeddingQueryReport `json:"embedding,omitempty"`
+}
+
+// EmbeddingQueryError preserves an authorized embedding report on a failed
+// retrieval. HTTP serializes the report beside the stable error code, and the
+// remote service reconstructs this error so programmatic callers can inspect
+// the same non-disclosing degradation signal.
+type EmbeddingQueryError struct {
+	err    error
+	report authorized.EmbeddingQueryReport
+}
+
+func newEmbeddingQueryError(
+	err error,
+	report authorized.EmbeddingQueryReport,
+) *EmbeddingQueryError {
+	return &EmbeddingQueryError{err: err, report: report}
+}
+
+func (e *EmbeddingQueryError) Error() string {
+	if e == nil || e.err == nil {
+		return ""
+	}
+	return e.err.Error()
+}
+
+func (e *EmbeddingQueryError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.err
+}
+
+// EmbeddingQueryReport returns an independent report copy.
+func (e *EmbeddingQueryError) EmbeddingQueryReport() authorized.EmbeddingQueryReport {
+	if e == nil {
+		return authorized.EmbeddingQueryReport{}
+	}
+	report := e.report
+	report.Spaces = append([]authorized.EmbeddingSpaceReport(nil), report.Spaces...)
+	return report
 }
 
 // NeighborhoodRequest asks for a bounded graph expansion.
@@ -202,10 +247,27 @@ type NeighborhoodRequest struct {
 
 // NeighborhoodResponse returns only the bounded subgraph requested.
 type NeighborhoodResponse struct {
-	Snapshot     Snapshot              `json:"snapshot"`
-	Neighborhood explorer.Neighborhood `json:"neighborhood"`
-	Truncated    bool                  `json:"truncated"`
-	NextCursor   string                `json:"next_cursor,omitempty"`
+	Snapshot                Snapshot                       `json:"snapshot"`
+	Neighborhood            explorer.Neighborhood          `json:"neighborhood"`
+	OntologyInterpretations []OntologyInterpretationReport `json:"ontology_interpretations,omitempty"`
+	Truncated               bool                           `json:"truncated"`
+	NextCursor              string                         `json:"next_cursor,omitempty"`
+}
+
+type OntologyInterpretationReport struct {
+	AssertionID         string                        `json:"assertion_id"`
+	SchemaID            string                        `json:"schema_id"`
+	VersionID           string                        `json:"version_id"`
+	Reading             ontology.OntologyReading      `json:"reading"`
+	Status              ontology.InterpretationStatus `json:"status"`
+	OriginalSubjectType string                        `json:"original_subject_type,omitempty"`
+	SubjectType         string                        `json:"subject_type,omitempty"`
+	OriginalPredicate   string                        `json:"original_predicate"`
+	Predicate           string                        `json:"predicate"`
+	OriginalObjectType  string                        `json:"original_object_type,omitempty"`
+	ObjectType          string                        `json:"object_type,omitempty"`
+	AppliedMorphisms    []string                      `json:"applied_morphisms,omitempty"`
+	Reason              string                        `json:"reason,omitempty"`
 }
 
 // PathRequest asks for one bounded directed path.
@@ -220,9 +282,10 @@ type PathRequest struct {
 
 // PathResponse contains the selected explanation path.
 type PathResponse struct {
-	Snapshot   Snapshot             `json:"snapshot"`
-	Path       graph.Path           `json:"path"`
-	Assertions []ontology.Assertion `json:"assertions,omitempty"`
+	Snapshot                Snapshot                       `json:"snapshot"`
+	Path                    graph.Path                     `json:"path"`
+	Assertions              []ontology.Assertion           `json:"assertions,omitempty"`
+	OntologyInterpretations []OntologyInterpretationReport `json:"ontology_interpretations,omitempty"`
 }
 
 // UploadFile carries one bounded, untrusted browser file after HTTP parsing.

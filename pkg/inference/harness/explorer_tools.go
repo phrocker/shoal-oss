@@ -25,6 +25,7 @@ import (
 	"reflect"
 	"sort"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/phrocker/shoal-oss/pkg/contextpack"
@@ -32,6 +33,7 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/graph"
 	"github.com/phrocker/shoal-oss/pkg/inference"
+	"github.com/phrocker/shoal-oss/pkg/interaction"
 	"github.com/phrocker/shoal-oss/pkg/retrieval"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
@@ -49,6 +51,49 @@ type ExplorerToolHost struct {
 	BoundedClientIdentity  string
 	BuilderReaderIdentity  string
 	TokenEstimatorIdentity string
+}
+
+type embeddingParticipationCollector struct {
+	mu            sync.Mutex
+	observed      bool
+	participating []string
+	err           error
+}
+
+func (c *embeddingParticipationCollector) observe(
+	event explorer.EmbeddingQueryEvent,
+) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.observed = true
+	if c.err != nil {
+		return
+	}
+	identities := append(
+		append([]string(nil), c.participating...),
+		event.Participating...,
+	)
+	set, err := interaction.NewEmbeddingSpaceSet(identities)
+	if err != nil {
+		c.err = err
+		return
+	}
+	c.participating = set.Identities
+}
+
+func (c *embeddingParticipationCollector) result(
+	requireParticipation bool,
+) (interaction.EmbeddingSpaceSet, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.err != nil {
+		return interaction.EmbeddingSpaceSet{}, c.err
+	}
+	if requireParticipation && (!c.observed || len(c.participating) == 0) {
+		return interaction.EmbeddingSpaceSet{}, invalid(
+			"vector retrieval result lacks embedding participation provenance")
+	}
+	return interaction.NewEmbeddingSpaceSet(c.participating)
 }
 
 func NewExplorerToolHost(client explorer.Client, builder contextpack.Builder) (*ExplorerToolHost, error) {
@@ -168,7 +213,14 @@ func (h *ExplorerToolHost) Retrieve(
 	if h.BoundedClient != nil {
 		clientRequest.AsOf = time.Time{}
 	}
-	response, err := h.Client.Retrieve(ctx, clientRequest)
+	vectorRequest := clientRequest.HasMode(retrieval.ModeVector)
+	participation := &embeddingParticipationCollector{}
+	retrieveCtx := ctx
+	if vectorRequest {
+		retrieveCtx = explorer.WithEmbeddingQueryObserver(
+			ctx, participation.observe)
+	}
+	response, err := h.Client.Retrieve(retrieveCtx, clientRequest)
 	if err != nil {
 		return ToolResult{}, err
 	}
@@ -187,12 +239,20 @@ func (h *ExplorerToolHost) Retrieve(
 	if err := h.verifyRetrievalPaths(ctx, response, call.Budgets()); err != nil {
 		return ToolResult{}, err
 	}
+	embeddingSpaces, err := participation.result(
+		vectorRequest && len(response.Results) > 0)
+	if err != nil {
+		return ToolResult{}, err
+	}
+	if len(response.Results) == 0 &&
+		len(embeddingSpaces.Identities) > 0 {
+		return ToolResult{}, invalid(
+			"empty vector retrieval reported participating embedding spaces")
+	}
 	if len(response.Results) == 0 {
 		return NewToolResultWithEmbeddingSpaces(
 			call.CorrelationID(), ActionRetrieve, nil,
-			call.Snapshot(), call.Authorization(),
-			response.EmbeddingSpaceID,
-			response.EmbeddingSpaceIDs,
+			call.Snapshot(), call.Authorization(), embeddingSpaces,
 		)
 	}
 	neighborhoods, err := neighborhoodsFromRetrievalResponse(response)
@@ -221,9 +281,7 @@ func (h *ExplorerToolHost) Retrieve(
 	}
 	return NewToolResultWithEmbeddingSpaces(
 		call.CorrelationID(), ActionRetrieve, pack.Evidence(),
-		call.Snapshot(), call.Authorization(),
-		response.EmbeddingSpaceID,
-		response.EmbeddingSpaceIDs,
+		call.Snapshot(), call.Authorization(), embeddingSpaces,
 	)
 }
 

@@ -66,9 +66,13 @@ const (
 )
 
 var (
-	ErrInvalidState = errors.New("embedding space: invalid state")
-	ErrMismatch     = errors.New("embedding space: identity mismatch")
-	ErrIntegrity    = errors.New("embedding space: metadata integrity error")
+	ErrInvalidState          = errors.New("embedding space: invalid state")
+	ErrMismatch              = errors.New("embedding space: identity mismatch")
+	ErrIntegrity             = errors.New("embedding space: metadata integrity error")
+	ErrQueryIdentityRequired = errors.New("embedding space: query identity required")
+	ErrQuerySpaceUnknown     = errors.New("embedding space: query source space unknown")
+	ErrQueryNoEmbeddings     = errors.New("embedding space: query source has no embeddings")
+	ErrQueryMetadataMissing  = errors.New("embedding space: query source metadata unavailable")
 )
 
 type State string
@@ -278,6 +282,41 @@ func VerifyMetadataMatchesFooter(metadataState, footerState FileState) error {
 	}
 	if metadataState != footerState {
 		return &IntegrityError{Metadata: metadataState, Footer: footerState}
+	}
+	return nil
+}
+
+// ValidateQueryStates verifies that one raw query vector may be compared with
+// every supplied file. A raw vector belongs to exactly one space: unlike a
+// text query, it cannot be re-embedded once per file group. Unknown and
+// no_embeddings therefore fail closed rather than silently producing partial
+// recall, and a different known identity returns the ordinary typed mismatch.
+func ValidateQueryStates(operation, queryIdentity string, states ...FileState) error {
+	if queryIdentity == "" {
+		return fmt.Errorf("%w: %s", ErrQueryIdentityRequired, operation)
+	}
+	if err := (FileState{
+		State: StateHasEmbeddings, Identity: queryIdentity,
+	}).Validate(); err != nil {
+		return err
+	}
+	for _, state := range states {
+		if state == (FileState{}) {
+			state = Unknown()
+		}
+		if err := state.Validate(); err != nil {
+			return err
+		}
+		switch state.State {
+		case StateUnknown:
+			return fmt.Errorf("%w: %s", ErrQuerySpaceUnknown, operation)
+		case StateNoEmbeddings:
+			return fmt.Errorf("%w: %s", ErrQueryNoEmbeddings, operation)
+		case StateHasEmbeddings:
+			if err := EnsureSameIdentity(operation, queryIdentity, state.Identity); err != nil {
+				return err
+			}
+		}
 	}
 	return nil
 }

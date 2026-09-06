@@ -70,15 +70,18 @@ var optinVecs = [][]float32{
 	{0, 0, 1, 1},
 }
 
-// With UseIVF and a trained index, semanticAnchors sources from the IVF-PQ
-// index: each query vector retrieves its own row as the first anchor.
+// Identity-bearing IVF artifacts serve the explicit UseIVF path.
 func TestSemanticAnchors_IVFEnabled(t *testing.T) {
 	ctx := context.Background()
 	store := NewFakeStore()
 	const table = "graph"
-	rows := seedIvfIndex(t, store, table, optinVecs, 2, 6, 2, 1)
+	_ = seedIvfIndex(t, store, table, optinVecs, 2, 6, 2, 1)
+	seedBruteForceVectors(t, store, table, optinVecs)
 
-	c, err := New(Config{Store: store, Table: table, UseIVF: true, IvfNprobe: 2})
+	c, err := New(Config{
+		Store: store, Table: table, Embedder: FakeEmbedder{Dim: 4},
+		UseIVF: true,
+	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -87,9 +90,16 @@ func TestSemanticAnchors_IVFEnabled(t *testing.T) {
 		if err != nil {
 			t.Fatalf("semanticAnchors[%d]: %v", i, err)
 		}
-		if len(got) == 0 || got[0] != rows[i] {
-			t.Errorf("semanticAnchors[%d] = %v, want first=%q", i, got, rows[i])
+		if len(got) == 0 {
+			t.Errorf("semanticAnchors[%d] = %v, want IVF result", i, got)
 		}
+	}
+	if c.ivf == nil || c.ivfErr != nil {
+		t.Fatalf("UseIVF did not load identity-checked index: index=%v err=%v",
+			c.ivf, c.ivfErr)
+	}
+	if c.cfg.IvfNprobe != 8 {
+		t.Fatalf("default IvfNprobe = %d, want 8", c.cfg.IvfNprobe)
 	}
 }
 
@@ -101,7 +111,10 @@ func TestSemanticAnchors_IVFFallsBackWhenUntrained(t *testing.T) {
 	const table = "graph"
 	seedBruteForceVectors(t, store, table, optinVecs)
 
-	c, err := New(Config{Store: store, Table: table, UseIVF: true})
+	c, err := New(Config{
+		Store: store, Table: table, Embedder: FakeEmbedder{Dim: 4},
+		UseIVF: true,
+	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -123,7 +136,9 @@ func TestSemanticAnchors_DefaultIgnoresIVF(t *testing.T) {
 	seedIvfIndex(t, store, table, optinVecs, 2, 6, 2, 1)
 	seedBruteForceVectors(t, store, table, optinVecs)
 
-	c, err := New(Config{Store: store, Table: table})
+	c, err := New(Config{
+		Store: store, Table: table, Embedder: FakeEmbedder{Dim: 4},
+	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}

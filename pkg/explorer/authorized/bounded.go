@@ -122,28 +122,7 @@ func (c *Client) VectorAvailable(ctx context.Context) (bool, error) {
 	}
 	available := true
 	if len(visibleOrder) == 0 {
-		_, _, err = c.authorizedVectorScores(
-			ctx,
-			retrieval.Request{
-				Text:  vectorCapabilityProbeText,
-				Modes: []retrieval.Mode{retrieval.ModeVector},
-			},
-			corpus,
-			nil,
-		)
-		if err != nil {
-			switch {
-			case shoal.IsErrorCode(err, shoal.ErrorCanceled),
-				shoal.IsErrorCode(err, shoal.ErrorDeadline):
-				return false, err
-			case shoal.IsErrorCode(err, shoal.ErrorUnavailable),
-				shoal.IsErrorCode(err, shoal.ErrorConflict),
-				shoal.IsErrorCode(err, shoal.ErrorInvalidArgument):
-				available = false
-			default:
-				return false, err
-			}
-		}
+		available = false
 	} else {
 		probe := retrieval.Request{
 			Text:  vectorCapabilityProbeText,
@@ -318,6 +297,13 @@ func (c *Client) BoundedNeighborhood(
 		return explorer.BoundedNeighborhood{}, err
 	}
 	raw.Neighborhood = filtered
+	raw.Neighborhood, err = c.applyOntologyLens(ctx, raw.Neighborhood, decision)
+	if err != nil {
+		return explorer.BoundedNeighborhood{}, err
+	}
+	if err := guard.Check(ctx); err != nil {
+		return explorer.BoundedNeighborhood{}, err
+	}
 	raw.NextAfterEdgeID = ""
 	raw.Continuation = false
 	return raw, nil
@@ -425,8 +411,17 @@ func (c *Client) boundedAuthorizedNeighborhoodPage(
 	if err := guard.Check(ctx); err != nil {
 		return explorer.BoundedNeighborhood{}, err
 	}
-	return authorizedBoundedPage(
-		nodes, edges, assertions, request, len(normalized.NodeIDs)), nil
+	result := authorizedBoundedPage(
+		nodes, edges, assertions, request, len(normalized.NodeIDs))
+	interpreted, interpretErr := c.applyOntologyLens(ctx, result.Neighborhood, decision)
+	if interpretErr != nil {
+		return explorer.BoundedNeighborhood{}, interpretErr
+	}
+	result.Neighborhood = interpreted
+	if err := guard.Check(ctx); err != nil {
+		return explorer.BoundedNeighborhood{}, err
+	}
+	return result, nil
 }
 
 func authorizedScanEdgeLimit(request explorer.BoundedNeighborhoodRequest) uint32 {

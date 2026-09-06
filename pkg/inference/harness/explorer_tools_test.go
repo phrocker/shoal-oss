@@ -169,18 +169,13 @@ func TestExplorerToolHostAllowsFanoutOneMultiHopPath(t *testing.T) {
 
 func TestExplorerToolHostAllowsEmptyRetrieveResult(t *testing.T) {
 	pack, _, _ := fixture(t)
-	constituent, err := retrieval.EmbeddingSpaceIdentityID("space-v3")
-	if err != nil {
-		t.Fatal(err)
+	client := &boundedClientStub{
+		retrieveResponse: retrieval.Response{},
+		embeddingEvent: explorer.EmbeddingQueryEvent{
+			SpaceIdentities: []string{"candidate-space"},
+			Completed:       []string{"candidate-space"},
+		},
 	}
-	spaceID, err := retrieval.EmbeddingSpaceSetID(constituent)
-	if err != nil {
-		t.Fatal(err)
-	}
-	client := &boundedClientStub{retrieveResponse: retrieval.Response{
-		EmbeddingSpaceID:  spaceID,
-		EmbeddingSpaceIDs: []shoal.ID{constituent},
-	}}
 	host := &ExplorerToolHost{
 		Client: client, RetrievalModes: []retrieval.Mode{retrieval.ModeVector}}
 	request, err := NewRetrieveRequest("no hits", 1)
@@ -201,12 +196,37 @@ func TestExplorerToolHostAllowsEmptyRetrieveResult(t *testing.T) {
 	if len(result.Anchors()) != 0 || !client.retrieve.AsOf.Equal(pack.Snapshot().AsOf()) {
 		t.Fatalf("empty retrieve was not pinned and empty: %#v", result)
 	}
-	if result.EmbeddingSpaceID() != spaceID {
-		t.Fatalf("tool result embedding space = %q", result.EmbeddingSpaceID())
+	if got := result.EmbeddingSpaces(); len(got.Identities) != 0 ||
+		got.Digest != "" {
+		t.Fatalf("empty result embedding spaces = %+v", got)
 	}
-	if got := result.EmbeddingSpaceIDs(); len(got) != 1 ||
-		got[0] != constituent {
-		t.Fatalf("tool result embedding constituents = %v", got)
+}
+
+func TestEmbeddingParticipationCollectorUsesOnlyParticipatingSpaces(t *testing.T) {
+	collector := &embeddingParticipationCollector{}
+	collector.observe(explorer.EmbeddingQueryEvent{
+		SpaceIdentities: []string{"candidate-only", "space-b", "space-a"},
+		Completed:       []string{"candidate-only", "space-b", "space-a"},
+		Participating:   []string{"space-b", "space-a"},
+	})
+	got, err := collector.result(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Identities) != 2 ||
+		got.Identities[0] != "space-a" ||
+		got.Identities[1] != "space-b" ||
+		got.Digest == "" {
+		t.Fatalf("participating embedding spaces = %+v", got)
+	}
+
+	empty := &embeddingParticipationCollector{}
+	empty.observe(explorer.EmbeddingQueryEvent{
+		SpaceIdentities: []string{"candidate-only"},
+		Completed:       []string{"candidate-only"},
+	})
+	if _, err := empty.result(true); err == nil {
+		t.Fatal("scored vector result without participation was accepted")
 	}
 }
 
@@ -541,6 +561,7 @@ type boundedClientStub struct {
 	last              explorer.BoundedNeighborhoodRequest
 	retrieve          retrieval.Request
 	retrieveResponse  retrieval.Response
+	embeddingEvent    explorer.EmbeddingQueryEvent
 	snapshot          explorer.Snapshot
 	boundedResponse   explorer.BoundedNeighborhood
 	neighborhoodCalls int
@@ -552,8 +573,9 @@ type unavailableBoundedClient struct {
 
 func (*unavailableBoundedClient) BoundedAvailable() bool { return false }
 
-func (b *boundedClientStub) Retrieve(_ context.Context, request retrieval.Request) (retrieval.Response, error) {
+func (b *boundedClientStub) Retrieve(ctx context.Context, request retrieval.Request) (retrieval.Response, error) {
 	b.retrieve = request
+	explorer.ReportEmbeddingQueryEvent(ctx, b.embeddingEvent)
 	return b.retrieveResponse, nil
 }
 

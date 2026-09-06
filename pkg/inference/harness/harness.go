@@ -33,11 +33,9 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/phrocker/shoal-oss/pkg/contextpack"
 	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/inference"
 	"github.com/phrocker/shoal-oss/pkg/interaction"
-	"github.com/phrocker/shoal-oss/pkg/retrieval"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
@@ -403,32 +401,30 @@ func (a Action) validate() error {
 }
 
 type ToolResult struct {
-	correlation       shoal.ID
-	kind              ActionKind
-	anchors           []inference.EvidenceAnchor
-	snapshot          inference.SnapshotPin
-	auth              inference.AuthPin
-	embeddingSpaceID  shoal.ID
-	embeddingSpaceIDs []shoal.ID
+	correlation     shoal.ID
+	kind            ActionKind
+	anchors         []inference.EvidenceAnchor
+	snapshot        inference.SnapshotPin
+	auth            inference.AuthPin
+	embeddingSpaces interaction.EmbeddingSpaceSet
 }
 
 func NewToolResult(correlation shoal.ID, kind ActionKind, anchors []inference.EvidenceAnchor, snapshot inference.SnapshotPin, auth inference.AuthPin) (ToolResult, error) {
 	return NewToolResultWithEmbeddingSpaces(
 		correlation, kind, anchors, snapshot, auth,
-		"", nil,
+		interaction.EmbeddingSpaceSet{},
 	)
 }
 
-// NewToolResultWithEmbeddingSpaces records both the aggregate vector-space
-// identity and its canonical constituent identities.
+// NewToolResultWithEmbeddingSpaces records the stable spaces that participated
+// in successful vector-scored output.
 func NewToolResultWithEmbeddingSpaces(
 	correlation shoal.ID,
 	kind ActionKind,
 	anchors []inference.EvidenceAnchor,
 	snapshot inference.SnapshotPin,
 	auth inference.AuthPin,
-	embeddingSpaceID shoal.ID,
-	embeddingSpaceIDs []shoal.ID,
+	embeddingSpaces interaction.EmbeddingSpaceSet,
 ) (ToolResult, error) {
 	if len(anchors) > inference.MaxEvidenceAnchors {
 		return ToolResult{}, invalid("tool result anchor count is outside the supported range")
@@ -437,14 +433,10 @@ func NewToolResultWithEmbeddingSpaces(
 		correlation: correlation, kind: kind,
 		anchors:  append([]inference.EvidenceAnchor(nil), anchors...),
 		snapshot: snapshot, auth: auth,
-		embeddingSpaceID: embeddingSpaceID,
-		embeddingSpaceIDs: append(
-			[]shoal.ID(nil), embeddingSpaceIDs...),
+		embeddingSpaces: embeddingSpaces,
 	}
-	sort.Slice(r.embeddingSpaceIDs, func(i, j int) bool {
-		return shoal.CompareID(
-			r.embeddingSpaceIDs[i], r.embeddingSpaceIDs[j]) < 0
-	})
+	r.embeddingSpaces.Identities = append(
+		[]string(nil), embeddingSpaces.Identities...)
 	sort.Slice(r.anchors, func(i, j int) bool { return shoal.CompareID(r.anchors[i].ID(), r.anchors[j].ID()) < 0 })
 	if err := r.validate(); err != nil {
 		return ToolResult{}, err
@@ -458,9 +450,10 @@ func (r ToolResult) Anchors() []inference.EvidenceAnchor {
 }
 func (r ToolResult) Snapshot() inference.SnapshotPin  { return r.snapshot }
 func (r ToolResult) Authorization() inference.AuthPin { return r.auth }
-func (r ToolResult) EmbeddingSpaceID() shoal.ID       { return r.embeddingSpaceID }
-func (r ToolResult) EmbeddingSpaceIDs() []shoal.ID {
-	return append([]shoal.ID(nil), r.embeddingSpaceIDs...)
+func (r ToolResult) EmbeddingSpaces() interaction.EmbeddingSpaceSet {
+	cloned := r.embeddingSpaces
+	cloned.Identities = append([]string(nil), r.embeddingSpaces.Identities...)
+	return cloned
 }
 func (r ToolResult) validate() error {
 	if err := validateLogicalID("tool result correlation ID", r.correlation); err != nil {
@@ -477,40 +470,8 @@ func (r ToolResult) validate() error {
 	if err := r.auth.Validate(); err != nil {
 		return err
 	}
-	if err := shoal.ValidateOptionalID(
-		"tool result embedding space ID", r.embeddingSpaceID,
-	); err != nil {
+	if err := r.embeddingSpaces.Validate(); err != nil {
 		return err
-	}
-	if r.embeddingSpaceID != "" && len(r.embeddingSpaceIDs) == 0 {
-		return invalid(
-			"tool result embedding space requires canonical constituents")
-	}
-	if r.embeddingSpaceID == "" && len(r.embeddingSpaceIDs) > 0 {
-		return invalid(
-			"tool result embedding space constituents require an aggregate ID")
-	}
-	for index, id := range r.embeddingSpaceIDs {
-		if err := shoal.ValidateRequiredID(
-			"tool result embedding space constituent ID", id,
-		); err != nil {
-			return err
-		}
-		if index > 0 &&
-			shoal.CompareID(r.embeddingSpaceIDs[index-1], id) >= 0 {
-			return invalid(
-				"tool result embedding space constituent IDs must be unique")
-		}
-	}
-	if len(r.embeddingSpaceIDs) > 0 {
-		expected, err := retrieval.EmbeddingSpaceSetID(
-			r.embeddingSpaceIDs...)
-		if err != nil {
-			return err
-		}
-		if expected != r.embeddingSpaceID {
-			return invalid("tool result embedding space ID is not canonical")
-		}
 	}
 	if len(r.anchors) > inference.MaxEvidenceAnchors {
 		return invalid("tool result anchor count is outside the supported range")
@@ -535,11 +496,12 @@ func (e Exchange) Action() Action     { return e.action }
 func (e Exchange) Result() ToolResult { return cloneToolResult(e.result) }
 
 type Transcript struct {
-	id        shoal.ID
-	requestID shoal.ID
-	context   inference.ContextPack
-	exchanges []Exchange
-	final     *Action
+	id              shoal.ID
+	requestID       shoal.ID
+	context         inference.ContextPack
+	embeddingSpaces interaction.EmbeddingSpaceSet
+	exchanges       []Exchange
+	final           *Action
 }
 
 func newTranscript(request SessionRequest) Transcript {
@@ -676,8 +638,8 @@ type EvaluationRecord struct {
 	ActionKinds []ActionKind
 	ActionUsage []Usage
 
-	// TranscriptID, RequestID, ContextPackID, ResultID, SnapshotID,
-	// AuthorizationFingerprint, and EmbeddingSpaceID are opaque identities.
+	// TranscriptID, RequestID, ContextPackID, ResultID, SnapshotID, and
+	// AuthorizationFingerprint are opaque identities.
 	// QueryDigest is a one-way digest of the question, present so records can
 	// be correlated without persisting the question itself.
 	TranscriptID             shoal.ID
@@ -691,7 +653,6 @@ type EvaluationRecord struct {
 	AuthorizationFingerprint shoal.ID
 	AuthorizationExpiresAt   time.Time
 	AuthorizationOperation   string
-	EmbeddingSpaceID         shoal.ID
 	EmbeddingSpaces          interaction.EmbeddingSpaceSet
 
 	// SeedNodeIDs are source graph nodes the session was shown before its
@@ -1152,12 +1113,18 @@ func (g *Generator) Run(ctx context.Context, pack inference.ContextPack) (Record
 		nextPack, err := addAnchors(
 			transcript.context,
 			toolResult.anchors,
-			toolResult.embeddingSpaceIDs,
 		)
 		if err != nil {
 			return finish(StopReasonInvalid, step, "context pack", inference.InferenceResult{}, err)
 		}
 		transcript.context = nextPack
+		transcript.embeddingSpaces, err = mergeEmbeddingSpaces(
+			transcript.embeddingSpaces, toolResult.embeddingSpaces)
+		if err != nil {
+			return finish(
+				StopReasonInvalid, step, "embedding provenance",
+				inference.InferenceResult{}, err)
+		}
 		transcript.exchanges = append(transcript.exchanges, Exchange{action: action, result: cloneToolResult(toolResult)})
 		transcript.id = transcriptID(transcript)
 		trace.Iterations[len(trace.Iterations)-1].Budget = currentUsage()
@@ -1254,11 +1221,7 @@ func cloneRunTrace(trace RunTrace) RunTrace {
 }
 
 func evaluationRecord(record Record) (EvaluationRecord, error) {
-	embeddingSpaceID, _, err := contextpack.EmbeddingSpaceID(
-		record.Transcript.context)
-	if err != nil {
-		return EvaluationRecord{}, err
-	}
+	var err error
 	evaluation := EvaluationRecord{
 		Provenance:  record.Request.provenance,
 		Budgets:     record.Request.budgets,
@@ -1275,7 +1238,7 @@ func evaluationRecord(record Record) (EvaluationRecord, error) {
 		SnapshotAsOf:             record.Request.context.Snapshot().AsOf(),
 		AuthorizationFingerprint: record.Request.context.Authorization().Fingerprint(),
 		AuthorizationExpiresAt:   record.Request.context.Authorization().ExpiresAt(),
-		EmbeddingSpaceID:         embeddingSpaceID,
+		EmbeddingSpaces:          record.Transcript.embeddingSpaces,
 	}
 	if evaluation.StopReason == "" && record.Transcript.final != nil {
 		evaluation.StopReason = StopReasonStop
@@ -1478,7 +1441,6 @@ func validateToolResult(action Action, result ToolResult, original inference.Con
 func addAnchors(
 	pack inference.ContextPack,
 	additions []inference.EvidenceAnchor,
-	embeddingSpaceIDs []shoal.ID,
 ) (inference.ContextPack, error) {
 	anchors := pack.Evidence()
 	seen := make(map[shoal.ID]struct{}, len(anchors)+len(additions))
@@ -1497,14 +1459,25 @@ func addAnchors(
 	if ok {
 		ontologyPtr = &ontology
 	}
-	metadata, err := contextpack.MergeEmbeddingSpaceMetadata(
-		pack.Metadata(), embeddingSpaceIDs)
-	if err != nil {
-		return inference.ContextPack{}, err
-	}
 	return inference.NewContextPack(
 		pack.Query(), anchors, ontologyPtr,
-		pack.Snapshot(), pack.Authorization(), metadata)
+		pack.Snapshot(), pack.Authorization(), pack.Metadata())
+}
+
+func mergeEmbeddingSpaces(
+	left, right interaction.EmbeddingSpaceSet,
+) (interaction.EmbeddingSpaceSet, error) {
+	if err := left.Validate(); err != nil {
+		return interaction.EmbeddingSpaceSet{}, err
+	}
+	if err := right.Validate(); err != nil {
+		return interaction.EmbeddingSpaceSet{}, err
+	}
+	identities := append(
+		append([]string(nil), left.Identities...),
+		right.Identities...,
+	)
+	return interaction.NewEmbeddingSpaceSet(identities)
 }
 
 func actionKey(a Action) string {
@@ -1563,7 +1536,8 @@ func transcriptID(t Transcript) shoal.ID {
 	parts := []string{string(t.requestID), string(t.context.ID())}
 	for _, e := range t.exchanges {
 		parts = append(parts, string(e.action.kind), string(e.action.correlation), actionKey(e.action),
-			strconv.Itoa(e.action.usage.InputTokens), strconv.Itoa(e.action.usage.OutputTokens))
+			strconv.Itoa(e.action.usage.InputTokens), strconv.Itoa(e.action.usage.OutputTokens),
+			e.result.embeddingSpaces.Digest)
 		for _, a := range e.result.anchors {
 			parts = append(parts, string(a.ID()))
 		}
@@ -1619,10 +1593,14 @@ func clonePack(pack inference.ContextPack) inference.ContextPack {
 func cloneResult(result inference.InferenceResult) inference.InferenceResult { return result }
 func cloneToolResult(r ToolResult) ToolResult {
 	r.anchors = append([]inference.EvidenceAnchor(nil), r.anchors...)
+	r.embeddingSpaces.Identities = append(
+		[]string(nil), r.embeddingSpaces.Identities...)
 	return r
 }
 func cloneTranscript(t Transcript) Transcript {
 	t.context = clonePack(t.context)
+	t.embeddingSpaces.Identities = append(
+		[]string(nil), t.embeddingSpaces.Identities...)
 	t.exchanges = append([]Exchange(nil), t.exchanges...)
 	for i := range t.exchanges {
 		t.exchanges[i].result = cloneToolResult(t.exchanges[i].result)

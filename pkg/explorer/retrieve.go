@@ -91,6 +91,13 @@ func (e *Explorer) retrieve(
 		return retrieval.Response{}, shoal.NewError(
 			shoal.ErrorInvalidArgument, "retrieval text has no searchable terms")
 	}
+	var queryEvent EmbeddingQueryEvent
+	var observeQuery bool
+	defer func() {
+		if observeQuery {
+			e.observeEmbeddingQuery(ctx, queryEvent)
+		}
+	}()
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 	if err := e.requireOpen(); err != nil {
@@ -105,32 +112,11 @@ func (e *Explorer) retrieve(
 		if err != nil {
 			return retrieval.Response{}, err
 		}
-		if len(spacesByIdentity) > e.maxEmbeddingSpaceFanout {
-			return retrieval.Response{}, shoal.NewError(
-				shoal.ErrorUnavailable,
-				"vector retrieval spans too many embedding spaces",
-			)
-		}
-		spaceKeys := make([]string, 0, len(spacesByIdentity))
-		for identity := range spacesByIdentity {
-			spaceKeys = append(spaceKeys, identity)
-		}
-		sort.Strings(spaceKeys)
-		for _, identity := range spaceKeys {
-			space := spacesByIdentity[identity]
-			_, vector, err := e.embedQueryInSpace(ctx, request.Text, space)
-			if err != nil {
-				return retrieval.Response{}, err
-			}
-			queryVectors[identity] = vector
-			participatingSpaces = append(participatingSpaces, space)
-		}
-		if len(participatingSpaces) == 0 {
-			space, _, err := e.embedQuery(ctx, request.Text)
-			if err != nil {
-				return retrieval.Response{}, err
-			}
-			participatingSpaces = append(participatingSpaces, space)
+		queryVectors, participatingSpaces, queryEvent, err =
+			e.embedQueriesForSpaces(ctx, request.Text, spacesByIdentity)
+		observeQuery = true
+		if err != nil {
+			return retrieval.Response{}, err
 		}
 	}
 	mixedVectorSpaces := hasVector && len(participatingSpaces) > 1
@@ -268,33 +254,24 @@ func (e *Explorer) retrieve(
 	if uint64(topK) < uint64(len(ranked)) {
 		ranked = ranked[:int(topK)]
 	}
-
-	var embeddingSpaceID shoal.ID
-	var embeddingSpaceIDs []shoal.ID
 	if hasVector {
-		embeddingSpaceIDs = make([]shoal.ID, len(participatingSpaces))
-		for index, space := range participatingSpaces {
-			embeddingSpaceIDs[index], err =
-				retrieval.EmbeddingSpaceIdentityID(space.Identity)
-			if err != nil {
-				return retrieval.Response{}, err
+		spaces := make(map[string]struct{})
+		for _, match := range ranked {
+			if match.space != "" {
+				spaces[match.space] = struct{}{}
 			}
 		}
-		sort.Slice(embeddingSpaceIDs, func(i, j int) bool {
-			return shoal.CompareID(
-				embeddingSpaceIDs[i], embeddingSpaceIDs[j]) < 0
-		})
-		embeddingSpaceID, err = retrieval.EmbeddingSpaceSetID(
-			embeddingSpaceIDs...)
-		if err != nil {
-			return retrieval.Response{}, err
+		queryEvent.Participating = make([]string, 0, len(spaces))
+		for identity := range spaces {
+			queryEvent.Participating = append(
+				queryEvent.Participating, identity)
 		}
+		sort.Strings(queryEvent.Participating)
 	}
+
 	response := retrieval.Response{
-		RequestID:         requestID(request),
-		EmbeddingSpaceID:  embeddingSpaceID,
-		EmbeddingSpaceIDs: embeddingSpaceIDs,
-		Results:           make([]retrieval.Result, 0, len(ranked)),
+		RequestID: requestID(request),
+		Results:   make([]retrieval.Result, 0, len(ranked)),
 	}
 	for _, match := range ranked {
 		result := retrieval.Result{
@@ -502,7 +479,12 @@ func (e *Explorer) embeddingSpacesForScanLocked(
 		if _, err := recordEmbeddingMap(record); err != nil {
 			return nil, err
 		}
-		spaces[record.Embeddings.Provenance.Identity] = record.Embeddings.Provenance
+		current := record.Embeddings.Provenance
+		if existing, ok := spaces[current.Identity]; ok &&
+			existing != current {
+			return nil, conflictingEmbeddingProvenanceError(existing, current)
+		}
+		spaces[current.Identity] = current
 	}
 	return spaces, nil
 }
