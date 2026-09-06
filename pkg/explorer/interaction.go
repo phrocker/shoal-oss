@@ -40,6 +40,7 @@ type InteractionSummary struct {
 	SnapshotAsOf             time.Time
 	AuthorizationFingerprint shoal.ID
 	AuthorizationExpiresAt   time.Time
+	AuthorizationOperation   string
 	EmbeddingSpaceID         shoal.ID
 	EmbeddingSpaceDigest     string
 	EmbeddingSpaceCount      int
@@ -70,6 +71,7 @@ type persistedInteraction struct {
 	SnapshotAsOf             time.Time
 	AuthorizationFingerprint shoal.ID
 	AuthorizationExpiresAt   time.Time
+	AuthorizationOperation   string
 	EmbeddingSpaceID         shoal.ID
 	Operation                interaction.Operation
 	Actor                    interaction.ActorContext
@@ -235,6 +237,7 @@ func (e *Explorer) RecordInteraction(
 		SnapshotAsOf:             session.SnapshotAsOf,
 		AuthorizationFingerprint: session.AuthorizationFingerprint,
 		AuthorizationExpiresAt:   session.AuthorizationExpiresAt,
+		AuthorizationOperation:   session.AuthorizationOperation,
 		EmbeddingSpaceID:         session.EmbeddingSpaceID,
 		Operation:                session.Operation,
 		Actor:                    session.Actor,
@@ -1094,6 +1097,8 @@ func validatePersistedInteraction(record persistedInteraction) error {
 				record.AuthorizationFingerprint ||
 			!record.Session.AuthorizationExpiresAt.UTC().Equal(
 				record.AuthorizationExpiresAt.UTC()) ||
+			record.Session.AuthorizationOperation !=
+				record.AuthorizationOperation ||
 			record.Session.EmbeddingSpaceID != record.EmbeddingSpaceID {
 			return shoal.NewError(
 				shoal.ErrorInternal,
@@ -1193,6 +1198,7 @@ func interactionSummary(record persistedInteraction) InteractionSummary {
 		SnapshotAsOf:             record.SnapshotAsOf,
 		AuthorizationFingerprint: record.AuthorizationFingerprint,
 		AuthorizationExpiresAt:   record.AuthorizationExpiresAt,
+		AuthorizationOperation:   record.AuthorizationOperation,
 		EmbeddingSpaceID:         record.EmbeddingSpaceID,
 		EmbeddingSpaceDigest:     record.Session.EmbeddingSpaces.Digest,
 		EmbeddingSpaceCount:      len(record.Session.EmbeddingSpaces.Identities),

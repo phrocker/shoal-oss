@@ -690,6 +690,7 @@ type EvaluationRecord struct {
 	SnapshotAsOf             time.Time
 	AuthorizationFingerprint shoal.ID
 	AuthorizationExpiresAt   time.Time
+	AuthorizationOperation   string
 	EmbeddingSpaceID         shoal.ID
 	EmbeddingSpaces          interaction.EmbeddingSpaceSet
 

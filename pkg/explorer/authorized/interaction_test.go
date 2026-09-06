@@ -267,6 +267,7 @@ func TestAuthorizedInteractionReauthorizesExactSourceEdge(t *testing.T) {
 	decision := f.decision(
 		t, "edge-recorder", [][]byte{f.sourceA}, [][]byte{f.policyA},
 		[]auth.Operation{
+			auth.OperationConnect,
 			auth.OperationRead,
 			auth.OperationRetrieve,
 			auth.OperationValidate,
@@ -280,7 +281,8 @@ func TestAuthorizedInteractionReauthorizesExactSourceEdge(t *testing.T) {
 	session := interaction.Session{
 		ID:                       interaction.DerivedID("session", "authorized-edge"),
 		RecordedAt:               f.clock.Now(),
-		Operation:                interaction.OperationRetrieval,
+		Operation:                interaction.OperationToolCall,
+		AuthorizationOperation:   string(auth.OperationConnect),
 		SnapshotID:               shoal.ID(snapshot.ID),
 		SnapshotAsOf:             snapshot.AsOf,
 		AuthorizationFingerprint: shoal.ID(fingerprint.String()),
@@ -303,6 +305,54 @@ func TestAuthorizedInteractionReauthorizesExactSourceEdge(t *testing.T) {
 	if len(record.TouchedEdgeIDs) != 1 ||
 		record.TouchedEdgeIDs[0] != edge.ID {
 		t.Fatalf("touched edges = %v", record.TouchedEdgeIDs)
+	}
+	if record.Summary.AuthorizationOperation !=
+		string(auth.OperationConnect) {
+		t.Fatalf("authorization operation = %q",
+			record.Summary.AuthorizationOperation)
+	}
+
+	retrieveOnly := f.decision(
+		t, "edge-retrieve-only",
+		[][]byte{f.sourceA}, [][]byte{f.policyA},
+		[]auth.Operation{auth.OperationRetrieve},
+	)
+	retrieveFingerprint, err := auth.AuthorizationFingerprint(retrieveOnly)
+	if err != nil {
+		t.Fatal(err)
+	}
+	denied := session
+	denied.ID = interaction.DerivedID(
+		"session", "unauthorized-edge-operation")
+	denied.AuthorizationFingerprint =
+		shoal.ID(retrieveFingerprint.String())
+	denied.AuthorizationExpiresAt =
+		retrieveOnly.AuthenticationExpires()
+	if err := f.clientA.RecordInteraction(
+		f.context(t, retrieveOnly), denied,
+	); !shoal.IsErrorCode(err, shoal.ErrorUnauthorized) {
+		t.Fatalf("unauthorized exact operation error = %v", err)
+	}
+	connectOnly := f.decision(
+		t, "edge-connect-only",
+		[][]byte{f.sourceA}, [][]byte{f.policyA},
+		[]auth.Operation{auth.OperationConnect},
+	)
+	connectFingerprint, err := auth.AuthorizationFingerprint(connectOnly)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deniedEvidence := session
+	deniedEvidence.ID = interaction.DerivedID(
+		"session", "unauthorized-edge-evidence")
+	deniedEvidence.AuthorizationFingerprint =
+		shoal.ID(connectFingerprint.String())
+	deniedEvidence.AuthorizationExpiresAt =
+		connectOnly.AuthenticationExpires()
+	if err := f.clientA.RecordInteraction(
+		f.context(t, connectOnly), deniedEvidence,
+	); !shoal.IsErrorCode(err, shoal.ErrorNotFound) {
+		t.Fatalf("missing retrieve authorization error = %v", err)
 	}
 
 	revoked := f.newClient(

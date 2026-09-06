@@ -150,6 +150,7 @@ func InteractionSession(
 		SnapshotAsOf:             record.SnapshotAsOf,
 		AuthorizationFingerprint: record.AuthorizationFingerprint,
 		AuthorizationExpiresAt:   record.AuthorizationExpiresAt,
+		AuthorizationOperation:   record.AuthorizationOperation,
 		EmbeddingSpaceID:         record.EmbeddingSpaceID,
 		EmbeddingSpaces:          record.EmbeddingSpaces,
 		Provenance: interaction.Provenance{

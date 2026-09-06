@@ -75,7 +75,11 @@ func (c *Client) recordInteraction(
 	if err != nil {
 		return interaction.Session{}, err
 	}
-	decision, guard, now, err := c.begin(ctx, auth.OperationRetrieve)
+	authorizationOperation := auth.OperationRetrieve
+	if session.AuthorizationOperation != "" {
+		authorizationOperation = auth.Operation(session.AuthorizationOperation)
+	}
+	decision, guard, now, err := c.begin(ctx, authorizationOperation)
 	if err != nil {
 		return interaction.Session{}, err
 	}
@@ -110,6 +114,8 @@ func (c *Client) recordInteraction(
 		canonical.TouchedNodeIDs(),
 		canonical.TouchedEdgeIDs(),
 		decision,
+		// Evidence access remains retrieval authorization even when the
+		// enclosing privileged action has a different exact operation.
 		auth.OperationRetrieve,
 		now,
 	); err != nil {

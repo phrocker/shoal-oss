@@ -127,6 +127,7 @@ const (
 	PropertySnapshotAsOf    = "interaction.snapshot_as_of"
 	PropertyAuthFingerprint = "interaction.authorization_fingerprint"
 	PropertyAuthExpiresAt   = "interaction.authorization_expires_at"
+	PropertyAuthOperation   = "interaction.authorization_operation"
 	PropertyEmbeddingSpace  = "interaction.embedding_space"
 	PropertyEmbeddingSpaces = "interaction.embedding_space_set_digest"
 	PropertyEmbeddingCount  = "interaction.embedding_space_count"
@@ -359,6 +360,9 @@ type Session struct {
 	SnapshotAsOf             time.Time
 	AuthorizationFingerprint shoal.ID
 	AuthorizationExpiresAt   time.Time
+	// AuthorizationOperation is the exact trusted operation authorized for
+	// this interaction. Empty retains the legacy retrieval authorization.
+	AuthorizationOperation string
 	// EmbeddingSpaceID is retained for legacy single/set-ID records.
 	EmbeddingSpaceID shoal.ID
 	// EmbeddingSpaces carries canonical stable full identities from the core
@@ -673,6 +677,13 @@ func (s Session) Validate() error {
 	); err != nil {
 		return err
 	}
+	if err := validateIdentifier(
+		"interaction authorization operation",
+		s.AuthorizationOperation,
+		true,
+	); err != nil {
+		return err
+	}
 	if err := s.EmbeddingSpaces.Validate(); err != nil {
 		return err
 	}
@@ -964,6 +975,11 @@ func (s Session) SubgraphWithEvidence(
 		sessionNode.Properties, PropertyAuthFingerprint,
 		string(s.AuthorizationFingerprint),
 	)
+	setIfPresent(
+		sessionNode.Properties,
+		PropertyAuthOperation,
+		s.AuthorizationOperation,
+	)
 	if !s.AuthorizationExpiresAt.IsZero() {
 		setIfPresent(
 			sessionNode.Properties,
@@ -1028,6 +1044,11 @@ func (s Session) SubgraphWithEvidence(
 			inferenceNode.Properties,
 			PropertyAuthFingerprint,
 			string(s.AuthorizationFingerprint),
+		)
+		setIfPresent(
+			inferenceNode.Properties,
+			PropertyAuthOperation,
+			s.AuthorizationOperation,
 		)
 		if !s.AuthorizationExpiresAt.IsZero() {
 			setIfPresent(
