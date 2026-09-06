@@ -180,7 +180,7 @@ func (r *InteractionRecorder) RecordAnalytics(
 	}
 	if persisted.ID != sessionID ||
 		persisted.AuthorizationFingerprint != session.AuthorizationFingerprint ||
-		persisted.AuthorizationExpiresAt != session.AuthorizationExpiresAt ||
+		!persisted.AuthorizationExpiresAt.Equal(session.AuthorizationExpiresAt) ||
 		persisted.RequestID != session.RequestID ||
 		persisted.OntologySchemaID != session.OntologySchemaID ||
 		persisted.OntologyVersionID != session.OntologyVersionID ||
