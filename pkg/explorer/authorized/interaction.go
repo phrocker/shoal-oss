@@ -338,6 +338,57 @@ func postCommitInteractionError(
 	return explorer.MarkCommittedInteraction(err)
 }
 
+func (c *Client) beginInteraction(
+	ctx context.Context,
+) (auth.Decision, auth.GenerationGuard, time.Time, error) {
+	if err := contextFailure(ctx); err != nil {
+		return auth.Decision{}, auth.GenerationGuard{}, time.Time{}, err
+	}
+	decision, err := c.resolver.Resolve(ctx)
+	if err != nil {
+		return auth.Decision{}, auth.GenerationGuard{}, time.Time{},
+			resolverFailure(ctx, err)
+	}
+	now := c.clock()
+	if now.IsZero() || !now.Before(decision.AuthenticationExpires()) {
+		return auth.Decision{}, auth.GenerationGuard{}, time.Time{},
+			authorizationDenied()
+	}
+	guard, err := auth.NewGenerationGuard(decision, c.generationReader)
+	if err != nil {
+		return auth.Decision{}, auth.GenerationGuard{}, time.Time{},
+			authorizationDenied()
+	}
+	if err := guard.Check(ctx); err != nil {
+		return auth.Decision{}, auth.GenerationGuard{}, time.Time{}, err
+	}
+	return decision, guard, now, nil
+}
+
+// InteractionSnapshot returns a fresh trusted content snapshot for one
+// lifecycle receipt, with the request's authorization generation guarded
+// across the read.
+func (c *Client) InteractionSnapshot(
+	ctx context.Context,
+) (explorer.Snapshot, error) {
+	bounded, err := c.boundedBase()
+	if err != nil {
+		return explorer.Snapshot{}, err
+	}
+	_, guard, _, err := c.beginInteraction(ctx)
+	if err != nil {
+		return explorer.Snapshot{}, err
+	}
+	snapshot, err := bounded.Snapshot(ctx)
+	if err != nil {
+		return explorer.Snapshot{}, directBaseError(err)
+	}
+	if err := guard.Check(ctx); err != nil {
+		return explorer.Snapshot{}, err
+	}
+	return snapshot, nil
+}
+
 // Interactions lists only derived records whose complete current source set
 // the caller may read. Tombstones have intentionally discarded their source
 // edges, so they are visible only to the exact authorization projection that

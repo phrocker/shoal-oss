@@ -52,7 +52,15 @@ func TestFleetLifecycleReceiptsNeedNoRetrievePermission(t *testing.T) {
 	); err == nil {
 		t.Fatal("action-only principal unexpectedly has retrieve permission")
 	}
-	recorder, err := explorerfleet.NewLifecycleRecorder(f.clientA)
+	snapshot, err := f.clientA.InteractionSnapshot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	interactionRecorder, err := interaction.NewRecorder(ctx, f.clientA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder, err := explorerfleet.NewLifecycleRecorder(interactionRecorder)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -74,8 +82,8 @@ func TestFleetLifecycleReceiptsNeedNoRetrievePermission(t *testing.T) {
 			AuthorizationFingerprint: fingerprint,
 			AuthorizationExpiresAt:   decision.AuthenticationExpires(),
 			AuditPurpose:             decision.AuditPurpose(),
-			SnapshotID:               shoal.ID(baseSnapshot.ID),
-			SnapshotAsOf:             baseSnapshot.AsOf,
+			SnapshotID:               shoal.ID(snapshot.ID),
+			SnapshotAsOf:             snapshot.AsOf,
 		}
 		if err := recorder.RecordLifecycle(ctx, lifecycle); err != nil {
 			t.Fatalf("%s receipt = %v", operation, err)

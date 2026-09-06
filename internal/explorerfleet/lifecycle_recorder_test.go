@@ -28,9 +28,7 @@ func TestLifecycleRecorderUsesExactPinsAndTrustedResult(t *testing.T) {
 		t.Fatal(err)
 	}
 	requested := sink.requests[0]
-	action := "fleet." + string(lifecycle.Operation) + ".admitted"
 	if requested.Operation != interaction.OperationToolCall ||
-		!interaction.IsSessionID(requested.ID) ||
 		requested.AuthorizationOperation != string(lifecycle.Operation) ||
 		requested.AuthorizationFingerprint !=
 			shoal.ID(lifecycle.AuthorizationFingerprint.String()) ||
@@ -42,10 +40,6 @@ func TestLifecycleRecorderUsesExactPinsAndTrustedResult(t *testing.T) {
 		requested.Reason != (interaction.Reason{}) ||
 		len(requested.SeedNodeIDs) != 0 ||
 		len(requested.CitedNodeIDs) != 0 ||
-		len(requested.Turns) != 1 ||
-		requested.Turns[0].Decision != action ||
-		requested.Turns[0].ToolCall == nil ||
-		requested.Turns[0].ToolCall.Kind != action ||
 		requested.ResultID != lifecycle.AgentID {
 		t.Fatalf("requested lifecycle session = %#v", requested)
 	}
@@ -91,8 +85,7 @@ func TestLifecycleRecorderRejectsTypedNilAndMismatchedResult(t *testing.T) {
 	}
 	if err := recorder.RecordLifecycle(
 		context.Background(), lifecycle,
-	); !shoal.IsErrorCode(err, shoal.ErrorInternal) ||
-		!explorer.IsCommittedInteraction(err) {
+	); !shoal.IsErrorCode(err, shoal.ErrorInternal) {
 		t.Fatalf("mismatched trusted result = %v", err)
 	}
 }
@@ -142,19 +135,7 @@ type trustedLifecycleRecorder struct {
 	err       error
 }
 
-func (r *trustedLifecycleRecorder) EnsureInteractionSink(context.Context) error {
-	return nil
-}
-
-func (r *trustedLifecycleRecorder) RecordInteraction(
-	ctx context.Context,
-	request interaction.Session,
-) error {
-	_, err := r.RecordInteractionResult(ctx, request)
-	return err
-}
-
-func (r *trustedLifecycleRecorder) RecordInteractionResult(
+func (r *trustedLifecycleRecorder) Record(
 	_ context.Context,
 	request interaction.Session,
 ) (interaction.Session, error) {

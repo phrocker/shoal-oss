@@ -1,0 +1,140 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements. See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership. The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License. You may obtain a copy of the License at
+ *
+ *     https://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied. See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+package fleetevents
+
+import (
+	"context"
+	"testing"
+	"time"
+
+	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
+	"github.com/phrocker/shoal-oss/pkg/interaction"
+)
+
+func TestInteractionAuditorRecordsRedactedAction(t *testing.T) {
+	now := time.Date(2026, 9, 5, 20, 0, 0, 0, time.UTC)
+	sink := &auditSink{}
+	recorder, err := interaction.NewRecorder(context.Background(), sink)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := recorder.SetClock(func() time.Time { return now }); err != nil {
+		t.Fatal(err)
+	}
+	auditor, err := NewInteractionAuditor(recorder)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = auditor.RecordFleetAction(context.Background(), AuditRecord{
+		Operation: auth.OperationEventPublish, ActionID: []byte{0, 0xff},
+		RequestID: "request",
+		ObjectID:  []byte("event"),
+		Evidence: []Evidence{
+			{
+				SourceID: []byte("source-a"), PolicyID: []byte("policy-a"),
+				ObjectID: "object-a", NodeID: "node-a", EdgeID: "edge-a",
+				AnchorID: "anchor-a", RevisionID: "revision-a",
+			},
+			{SourceID: []byte("source-b"), PolicyID: []byte("policy-b"), ObjectID: "object-b"},
+		},
+		AuthorizationFingerprint: auth.Fingerprint{1},
+		AuthorizationExpiresAt:   now.Add(time.Hour), OccurredAt: now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sink.sessions) != 1 || sink.sessions[0].Operation != interaction.OperationToolCall ||
+		sink.sessions[0].AuthorizationOperation != string(auth.OperationEventPublish) ||
+		sink.sessions[0].Turns[0].ToolCall.Kind != "fleet.event_publish" ||
+		sink.sessions[0].RequestID != "request" ||
+		sink.sessions[0].AuthorizationFingerprint != "auth-sha256:0100000000000000000000000000000000000000000000000000000000000000" ||
+		sink.sessions[0].Actor.SubjectID != "" ||
+		sink.sessions[0].Actor.ActorID != "" ||
+		sink.sessions[0].Actor.ClientID != "" ||
+		len(sink.sessions[0].Actor.OnBehalfOf) != 0 ||
+		sink.sessions[0].Reason != (interaction.Reason{}) ||
+		len(sink.sessions[0].TouchedNodeIDs()) != 6 {
+		t.Fatalf("session = %#v", sink.sessions)
+	}
+	if got := sink.sessions[0].TouchedNodeIDs(); got[0] != "anchor-a" ||
+		got[1] != "edge-a" || got[2] != "node-a" ||
+		got[3] != "object-a" || got[4] != "object-b" ||
+		got[5] != "revision-a" {
+		t.Fatalf("evidence = %#v", sink.sessions[0].TouchedNodeIDs())
+	}
+}
+
+func TestInteractionAuditorRejectsMismatchedPersistedReceipt(t *testing.T) {
+	sink := &auditSink{mutateResult: func(session interaction.Session) interaction.Session {
+		session.AuthorizationOperation = string(auth.OperationSubscriptionCreate)
+		return session
+	}}
+	recorder, err := interaction.NewRecorder(context.Background(), sink)
+	if err != nil {
+		t.Fatal(err)
+	}
+	auditor, err := NewInteractionAuditor(recorder)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = auditor.RecordFleetAction(context.Background(), AuditRecord{
+		Operation: auth.OperationEventPublish, ActionID: []byte("action"),
+		ObjectID: []byte("event"), AuthorizationFingerprint: auth.Fingerprint{1},
+		AuthorizationExpiresAt: time.Now().Add(time.Hour), OccurredAt: time.Now(),
+	})
+	if err == nil {
+		t.Fatal("expected mismatched receipt to fail")
+	}
+}
+
+func TestInteractionAuditorRejectsNilRecorder(t *testing.T) {
+	if _, err := NewInteractionAuditor(nil); err == nil {
+		t.Fatal("nil recorder succeeded")
+	}
+}
+
+type auditSink struct {
+	sessions     []interaction.Session
+	mutateResult func(interaction.Session) interaction.Session
+}
+
+func (*auditSink) EnsureInteractionSink(context.Context) error { return nil }
+
+func (s *auditSink) RecordInteraction(_ context.Context, session interaction.Session) error {
+	s.sessions = append(s.sessions, session)
+	return nil
+}
+
+func (s *auditSink) RecordInteractionResult(
+	ctx context.Context, session interaction.Session,
+) (interaction.Session, error) {
+	if err := s.RecordInteraction(ctx, session); err != nil {
+		return interaction.Session{}, err
+	}
+	result := session
+	result.Actor = interaction.ActorContext{
+		SubjectID: "trusted-subject", ActorID: "trusted-actor",
+	}
+	result.Reason = interaction.Reason{Code: "audit_purpose"}
+	if s.mutateResult != nil {
+		result = s.mutateResult(result)
+	}
+	return result, nil
+}

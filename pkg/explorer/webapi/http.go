@@ -28,6 +28,7 @@ import (
 	"io/fs"
 	"mime"
 	"net/http"
+	"path"
 	"reflect"
 
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
@@ -47,6 +48,7 @@ type Handler struct {
 	authenticator Authenticator
 	binder        auth.Binder
 	browserAuth   *BrowserAuthConfig
+	preAuth       map[string]preAuthenticationValidator
 }
 
 // NewHandler constructs the standard HTTP transport without caller identity.
@@ -78,6 +80,7 @@ func NewHandler(service Service, allowedAuthorities ...string) (*Handler, error)
 	handler := &Handler{
 		service: service, mux: http.NewServeMux(),
 		authority: authority,
+		preAuth:   make(map[string]preAuthenticationValidator),
 	}
 	handler.routes()
 	return handler, nil
@@ -94,6 +97,16 @@ func (h *Handler) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	if !h.authority.permits(request.Host) {
 		http.Error(writer, "misdirected request", http.StatusMisdirectedRequest)
 		return
+	}
+	cleanedPath := request.URL.Path
+	if cleanedPath == "" {
+		cleanedPath = "/"
+	}
+	if validator := h.preAuth[path.Clean(cleanedPath)]; validator != nil {
+		if status := validator.ValidatePreAuthentication(request); status != 0 {
+			http.Error(writer, http.StatusText(status), status)
+			return
+		}
 	}
 	if h.authenticator != nil && !h.publiclyReachable(request) {
 		ctx, err := h.authenticate(request)
