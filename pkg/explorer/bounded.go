@@ -200,6 +200,7 @@ func (e *Explorer) validateEvidenceReferenceLocked(
 			Nodes: make([]graph.Node, len(canonical.NodeIDs)),
 			Edges: make([]graph.Edge, len(canonical.EdgeIDs)),
 		}
+		authoritativeAssertions := make(map[interaction.AssertionReference]struct{})
 		for index, nodeID := range canonical.NodeIDs {
 			node, ok := e.graphNodes[nodeID]
 			if !ok || interaction.IsInteractionKind(node.Kind) {
@@ -219,12 +220,31 @@ func (e *Explorer) validateEvidenceReferenceLocked(
 				)
 			}
 			path.Edges[index] = cloneEdge(edge)
+			if assertion, ok := e.graphAssertions[edgeID]; ok {
+				authoritativeAssertions[interaction.AssertionReference{
+					AssertionID: assertion.ID(), EdgeID: edgeID,
+					Origin: assertion.Origin(),
+				}] = struct{}{}
+			}
 		}
 		for _, assertion := range canonical.Assertions {
+			if _, ok := authoritativeAssertions[assertion]; !ok {
+				return shoal.NewError(
+					shoal.ErrorConflict,
+					"interaction graph assertion is not authoritative",
+				)
+			}
 			if err := e.validateAssertionReferenceLocked(
 				assertion); err != nil {
 				return err
 			}
+			delete(authoritativeAssertions, assertion)
+		}
+		if len(authoritativeAssertions) != 0 {
+			return shoal.NewError(
+				shoal.ErrorConflict,
+				"interaction graph evidence omits authoritative assertions",
+			)
 		}
 		anchor, err := inference.NewGraphAnchorWithAssertions(
 			path, canonical.Assertions)

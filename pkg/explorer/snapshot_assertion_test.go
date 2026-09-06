@@ -412,6 +412,31 @@ func TestSnapshotReusesIdenticalHistoricalAssertionState(t *testing.T) {
 	f.validate(t, first, false)
 }
 
+func TestGraphSnapshotEvidenceCannotOmitAuthoritativeAssertions(t *testing.T) {
+	f := newSnapshotAssertionFixture(t)
+	f.publish(t)
+	pin := f.snapshot(t)
+	f.validate(t, pin, false)
+	full := f.reference(t)
+	plain, err := inference.NewGraphAnchor(f.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, anchorID := range []shoal.ID{full.AnchorID, plain.ID()} {
+		reference := full
+		reference.AnchorID = anchorID
+		reference.Assertions = nil
+		err := f.corpus.ValidateEvidenceSnapshot(
+			context.Background(), shoal.ID(pin.ID), pin.AsOf,
+			reference.NodeIDs, reference.EdgeIDs,
+			[]interaction.EvidenceReference{reference},
+		)
+		if !shoal.IsErrorCode(err, shoal.ErrorConflict) {
+			t.Fatalf("omitted assertion with anchor %q = %v, want conflict", anchorID, err)
+		}
+	}
+}
+
 func TestSnapshotAssertionDeltaValidationAndEquality(t *testing.T) {
 	state := persistedSnapshotObject{ID: "edge", Digest: strings.Repeat("a", 64)}
 	for _, test := range []struct {
