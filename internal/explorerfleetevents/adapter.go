@@ -762,8 +762,8 @@ func (a *Adapter) publishEvent(
 			}
 		}
 	}
-	slotEntity := a.eventSlotEntity(sequence)
-	slotGuard, err := a.mutationGuard(ctx, slotEntity, eventID, lpart)
+	eventEntity := a.eventEntity(sequence)
+	eventGuard, err := a.mutationGuard(ctx, eventEntity, eventID, lpart)
 	if err != nil {
 		return explorercoord.Result{}, err
 	}
@@ -779,7 +779,7 @@ func (a *Adapter) publishEvent(
 			DesiredWinnerID: sequenceID, LPART: lpart,
 			LogicalPolicyID: logicalPolicy, RetirementGeneration: 1,
 		},
-		slotGuard,
+		eventGuard,
 	}
 	if sequence <= a.retained {
 		floorValue, marshalErr := json.Marshal(floorRecord{Sequence: floor})
@@ -833,7 +833,7 @@ func (a *Adapter) pruneEvent(
 		Targets: []explorercoord.PruneTarget{{
 			Table:  Table,
 			Cell:   committed,
-			Entity: a.eventSlotEntity(retired.Event.Sequence),
+			Entity: a.eventEntity(retired.Event.Sequence),
 		}},
 		Checkpoint: explorercoord.PruneCheckpoint{
 			Cell: explorercoord.Cell{
@@ -1088,11 +1088,12 @@ func (a *Adapter) eventRow(sequence uint64) []byte {
 	return eventRow((sequence-1)%a.retained + 1)
 }
 
-func (a *Adapter) eventSlotEntity(sequence uint64) guard.Entity {
+func (a *Adapter) eventEntity(sequence uint64) guard.Entity {
 	return guard.Entity{
 		Kind: 'e',
 		ID: coordination.EntityID(digest(
-			"fleet-event-slot-v2", encodeUint64(sequence))),
+			"fleet-event-entity-v3", []byte(streamEntity.ID),
+			encodeUint64(sequence))),
 	}
 }
 

@@ -100,7 +100,7 @@ func TestAdapterConcurrentAppendRestartResume(t *testing.T) {
 	}
 	for index := 0; index < count; index++ {
 		head, _, readErr := runtime.ReadEntity(
-			context.Background(), adapter.eventSlotEntity(uint64(index+1)))
+			context.Background(), adapter.eventEntity(uint64(index+1)))
 		if readErr != nil || head == nil {
 			t.Fatalf("event slot %d = %#v, %v", index, head, readErr)
 		}
@@ -289,11 +289,11 @@ func TestAdapterRetentionFloorAndIdempotencyExpirySurviveRestart(t *testing.T) {
 		historicalEvents[2].Sequence != 3 {
 		t.Fatalf("historical event rows = %#v, %v", historicalEvents, err)
 	}
-	retired, _, err := runtime.ReadEntity(ctx, adapter.eventSlotEntity(1))
+	retired, _, err := runtime.ReadEntity(ctx, adapter.eventEntity(1))
 	if err != nil || retired == nil || retired.State != guard.StateTombstone {
 		t.Fatalf("retired event guard = %#v, %v", retired, err)
 	}
-	replacement, _, err := runtime.ReadEntity(ctx, adapter.eventSlotEntity(4))
+	replacement, _, err := runtime.ReadEntity(ctx, adapter.eventEntity(4))
 	if err != nil || replacement == nil || replacement.State != guard.StateLive {
 		t.Fatalf("replacement event guard = %#v, %v", replacement, err)
 	}
