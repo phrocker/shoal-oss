@@ -86,6 +86,9 @@ func TestDispatchStoreCASReplayFenceAndRestart(t *testing.T) {
 	right.ClaimLeaseUntil = record.UpdatedAt.Add(time.Minute)
 	left.ExecutionPolicyGeneration, right.ExecutionPolicyGeneration = 1, 1
 	left.ExecutionExpiresAt, right.ExecutionExpiresAt = record.Deadline, record.Deadline
+	left.TransitionRequestID, right.TransitionRequestID = "left-request", "right-request"
+	left.TransitionCorrelationID = "left-correlation"
+	right.TransitionCorrelationID = "right-correlation"
 	var wait sync.WaitGroup
 	results := make(chan error, 2)
 	for _, item := range []struct {
@@ -140,7 +143,11 @@ func TestDispatchStoreCASReplayFenceAndRestart(t *testing.T) {
 	restarted, err := store.GetAction(context.Background(), record.ID)
 	if err != nil || restarted.Version != 2 ||
 		string(restarted.ExecutorKey) != string(record.ExecutorKey) ||
-		string(restarted.ClaimID) != string(current.ClaimID) {
+		string(restarted.ClaimID) != string(current.ClaimID) ||
+		restarted.EventProvenance().RequestID !=
+			current.EventProvenance().RequestID ||
+		restarted.EventProvenance().CorrelationID !=
+			current.EventProvenance().CorrelationID {
 		t.Fatalf("restart = %#v, %v", restarted, err)
 	}
 }
