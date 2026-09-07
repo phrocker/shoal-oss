@@ -58,9 +58,10 @@ type HostConfig struct {
 
 // HostedServices is the compact production construction and mounting seam.
 type HostedServices struct {
-	registry     *fleet.Service
-	events       *fleetevents.Service
-	actionEvents *ActionEventPublisher
+	registry       *fleet.Service
+	events         *fleetevents.Service
+	actionRecorder fleet.ActionRecorder
+	actionEvents   *ActionEventPublisher
 }
 
 // ConfigureHostedRuntime registers every physical table required by the
@@ -93,6 +94,10 @@ func ComposeHosted(ctx context.Context, config HostConfig) (*HostedServices, err
 	if err != nil {
 		return nil, err
 	}
+	actionRecorder, err := explorerfleet.NewActionRecorder(recorder)
+	if err != nil {
+		return nil, err
+	}
 	cursorKey, err := LoadOrCreateCursorKey(ctx, config.CursorKeys)
 	if err != nil {
 		return nil, err
@@ -111,20 +116,22 @@ func ComposeHosted(ctx context.Context, config HostConfig) (*HostedServices, err
 		return nil, err
 	}
 	return &HostedServices{
-		registry: registry, events: events, actionEvents: actionEvents,
+		registry: registry, events: events,
+		actionRecorder: actionRecorder, actionEvents: actionEvents,
 	}, nil
 }
 
 // DispatchDependencies returns the durable registry and event publisher
 // required by explorerfleet.ComposeDispatch.
 func (s *HostedServices) DispatchDependencies() (
-	*fleet.Service, fleet.ActionEventPublisher, error,
+	*fleet.Service, fleet.ActionRecorder, fleet.ActionEventPublisher, error,
 ) {
-	if s == nil || s.registry == nil || s.actionEvents == nil {
-		return nil, nil, shoal.NewError(
+	if s == nil || s.registry == nil || s.actionRecorder == nil ||
+		s.actionEvents == nil {
+		return nil, nil, nil, shoal.NewError(
 			shoal.ErrorInvalidArgument, "hosted fleet services are required")
 	}
-	return s.registry, s.actionEvents, nil
+	return s.registry, s.actionRecorder, s.actionEvents, nil
 }
 
 // Mount adds only the more-specific event subtree to the authenticated

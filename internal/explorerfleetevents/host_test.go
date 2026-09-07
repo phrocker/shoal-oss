@@ -24,21 +24,27 @@ import (
 	"context"
 	"testing"
 
+	"github.com/phrocker/shoal-oss/internal/explorerfleet"
 	"github.com/phrocker/shoal-oss/pkg/explorer/fleet"
 )
 
 func TestHostedServicesDispatchDependencies(t *testing.T) {
 	registry := new(fleet.Service)
+	recorder := new(explorerfleet.ActionRecorder)
 	publisher := new(ActionEventPublisher)
-	services := &HostedServices{registry: registry, actionEvents: publisher}
-	gotRegistry, gotPublisher, err := services.DispatchDependencies()
+	services := &HostedServices{
+		registry: registry, actionRecorder: recorder, actionEvents: publisher,
+	}
+	gotRegistry, gotRecorder, gotPublisher, err := services.DispatchDependencies()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if gotRegistry != registry || gotPublisher != publisher {
-		t.Fatalf("dispatch dependencies = %p, %T", gotRegistry, gotPublisher)
+	if gotRegistry != registry || gotRecorder != recorder ||
+		gotPublisher != publisher {
+		t.Fatalf("dispatch dependencies = %p, %T, %T",
+			gotRegistry, gotRecorder, gotPublisher)
 	}
-	if _, _, err := (*HostedServices)(nil).DispatchDependencies(); err == nil {
+	if _, _, _, err := (*HostedServices)(nil).DispatchDependencies(); err == nil {
 		t.Fatal("nil hosted services returned dispatch dependencies")
 	}
 }
