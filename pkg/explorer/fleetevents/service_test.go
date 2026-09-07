@@ -634,6 +634,47 @@ func testService(
 	return service
 }
 
+func TestNewRejectsTypedNilDependencies(t *testing.T) {
+	base := Config{
+		Backend: &memoryBackend{}, Resolver: &sequenceResolver{},
+		GenerationReader: &generationReader{}, LeaseValidator: &leaseValidator{},
+		Auditor: &auditor{}, CursorKey: make([]byte, 32),
+	}
+	tests := map[string]func(*Config){
+		"backend": func(config *Config) {
+			var value *memoryBackend
+			config.Backend = value
+		},
+		"resolver": func(config *Config) {
+			var value *sequenceResolver
+			config.Resolver = value
+		},
+		"generation reader": func(config *Config) {
+			var value *generationReader
+			config.GenerationReader = value
+		},
+		"lease validator": func(config *Config) {
+			var value *leaseValidator
+			config.LeaseValidator = value
+		},
+		"auditor": func(config *Config) {
+			var value *auditor
+			config.Auditor = value
+		},
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			config := base
+			mutate(&config)
+			if _, err := New(config); !shoal.IsErrorCode(
+				err, shoal.ErrorInvalidArgument,
+			) {
+				t.Fatalf("typed-nil dependency error = %v", err)
+			}
+		})
+	}
+}
+
 type generationReader struct {
 	mu         sync.Mutex
 	generation int64

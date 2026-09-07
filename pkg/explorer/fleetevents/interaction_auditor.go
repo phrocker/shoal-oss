@@ -22,7 +22,9 @@ package fleetevents
 import (
 	"context"
 	"encoding/hex"
+	"reflect"
 
+	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/explorer/fleet"
 	"github.com/phrocker/shoal-oss/pkg/interaction"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
@@ -32,7 +34,8 @@ import (
 // durable interaction recorder without persisting event payloads or raw
 // opaque object identities.
 type InteractionAuditor struct {
-	sink      interaction.ResultSink
+	recorder  *interaction.Recorder
+	trusted   interaction.ResultSink
 	snapshots fleet.InteractionSnapshotProvider
 }
 
@@ -44,18 +47,40 @@ const (
 )
 
 func NewInteractionAuditor(
-	sink interaction.ResultSink,
+	recorder *interaction.Recorder,
+	trusted interaction.ResultSink,
 	snapshots fleet.InteractionSnapshotProvider,
 ) (*InteractionAuditor, error) {
-	if interaction.IsNilResultSink(sink) {
+	if recorder == nil {
 		return nil, shoal.NewError(
-			shoal.ErrorInvalidArgument, "interaction result sink is required")
+			shoal.ErrorInvalidArgument, "interaction recorder is required")
 	}
-	if snapshots == nil {
+	if interaction.IsNilResultSink(trusted) {
+		return nil, shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			"trusted interaction result sink is required")
+	}
+	if isNilSnapshotProvider(snapshots) {
 		return nil, shoal.NewError(
 			shoal.ErrorInvalidArgument, "interaction snapshot provider is required")
 	}
-	return &InteractionAuditor{sink: sink, snapshots: snapshots}, nil
+	return &InteractionAuditor{
+		recorder: recorder, trusted: trusted, snapshots: snapshots,
+	}, nil
+}
+
+func isNilSnapshotProvider(value fleet.InteractionSnapshotProvider) bool {
+	if value == nil {
+		return true
+	}
+	reflected := reflect.ValueOf(value)
+	switch reflected.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map,
+		reflect.Pointer, reflect.Slice:
+		return reflected.IsNil()
+	default:
+		return false
+	}
 }
 
 func (a *InteractionAuditor) RecordFleetAction(ctx context.Context, record AuditRecord) error {
@@ -109,7 +134,13 @@ func (a *InteractionAuditor) RecordFleetAction(ctx context.Context, record Audit
 	if err != nil {
 		return err
 	}
-	persisted, err := a.sink.RecordInteractionResult(ctx, session)
+	var persisted interaction.Session
+	switch record.Operation {
+	case auth.OperationDispatch, auth.OperationInvoke:
+		persisted, err = a.trusted.RecordInteractionResult(ctx, session)
+	default:
+		persisted, err = a.recorder.Record(ctx, session)
+	}
 	if err != nil {
 		return err
 	}
@@ -159,6 +190,8 @@ func sameFleetReceipt(expected, persisted interaction.Session) bool {
 	}
 	if persisted.ID != expected.ID ||
 		persisted.Operation != interaction.OperationToolCall ||
+		persisted.SnapshotID != expected.SnapshotID ||
+		!persisted.SnapshotAsOf.Equal(expected.SnapshotAsOf) ||
 		persisted.AuthorizationOperation != expected.AuthorizationOperation ||
 		persisted.AuthorizationFingerprint != expected.AuthorizationFingerprint ||
 		!persisted.AuthorizationExpiresAt.Equal(expected.AuthorizationExpiresAt) ||

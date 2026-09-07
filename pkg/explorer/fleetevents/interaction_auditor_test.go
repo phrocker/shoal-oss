@@ -42,8 +42,15 @@ func (s fixedAuditSnapshot) InteractionSnapshot(
 func TestInteractionAuditorRecordsRedactedAction(t *testing.T) {
 	sink := &auditSink{}
 	now := time.Date(2026, 9, 5, 20, 0, 0, 0, time.UTC)
+	recorder, err := interaction.NewRecorder(context.Background(), sink)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := recorder.SetClock(func() time.Time { return now }); err != nil {
+		t.Fatal(err)
+	}
 	auditor, err := NewInteractionAuditor(
-		sink, fixedAuditSnapshot{at: now})
+		recorder, sink, fixedAuditSnapshot{at: now})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -97,8 +104,15 @@ func TestInteractionAuditorRejectsMismatchedPersistedReceipt(t *testing.T) {
 		session.AuthorizationOperation = string(auth.OperationSubscriptionCreate)
 		return session
 	}}
+	recorder, err := interaction.NewRecorder(context.Background(), sink)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := recorder.SetClock(func() time.Time { return now }); err != nil {
+		t.Fatal(err)
+	}
 	auditor, err := NewInteractionAuditor(
-		sink, fixedAuditSnapshot{at: now})
+		recorder, sink, fixedAuditSnapshot{at: now})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -112,13 +126,87 @@ func TestInteractionAuditorRejectsMismatchedPersistedReceipt(t *testing.T) {
 	}
 }
 
+func TestInteractionAuditorSeparatesPublicAndLifecycleSinks(t *testing.T) {
+	now := time.Now().UTC()
+	publicSink := &auditSink{}
+	trustedSink := &auditSink{}
+	recorder, err := interaction.NewRecorder(
+		context.Background(), publicSink)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := recorder.SetClock(func() time.Time { return now }); err != nil {
+		t.Fatal(err)
+	}
+	auditor, err := NewInteractionAuditor(
+		recorder, trustedSink, fixedAuditSnapshot{at: now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	record := AuditRecord{
+		Operation: auth.OperationEventPublish, ActionID: []byte("public"),
+		RequestID: "public-request", ObjectID: []byte("event"),
+		AuthorizationFingerprint: auth.Fingerprint{1},
+		AuthorizationExpiresAt:   now.Add(time.Hour), OccurredAt: now,
+	}
+	if err := auditor.RecordFleetAction(context.Background(), record); err != nil {
+		t.Fatal(err)
+	}
+	if len(publicSink.sessions) != 1 || len(trustedSink.sessions) != 0 {
+		t.Fatalf(
+			"public/trusted records = %d/%d",
+			len(publicSink.sessions), len(trustedSink.sessions),
+		)
+	}
+	record.Operation = auth.OperationDispatch
+	record.ActionID = []byte("lifecycle")
+	record.RequestID = "lifecycle-request"
+	if err := auditor.RecordFleetAction(context.Background(), record); err != nil {
+		t.Fatal(err)
+	}
+	if len(publicSink.sessions) != 1 || len(trustedSink.sessions) != 1 {
+		t.Fatalf(
+			"public/trusted records = %d/%d",
+			len(publicSink.sessions), len(trustedSink.sessions),
+		)
+	}
+}
+
 func TestInteractionAuditorRejectsNilRecorder(t *testing.T) {
-	if _, err := NewInteractionAuditor(nil, fixedAuditSnapshot{}); err == nil {
+	if _, err := NewInteractionAuditor(
+		nil, &auditSink{}, fixedAuditSnapshot{},
+	); err == nil {
 		t.Fatal("nil recorder succeeded")
 	}
-	if _, err := NewInteractionAuditor(&auditSink{}, nil); err == nil {
+	recorder, err := interaction.NewRecorder(
+		context.Background(), &auditSink{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewInteractionAuditor(
+		recorder, nil, fixedAuditSnapshot{},
+	); err == nil {
+		t.Fatal("nil trusted sink succeeded")
+	}
+	if _, err := NewInteractionAuditor(
+		recorder, &auditSink{}, nil,
+	); err == nil {
 		t.Fatal("nil snapshot provider succeeded")
 	}
+	var snapshots *nilAuditSnapshot
+	if _, err := NewInteractionAuditor(
+		recorder, &auditSink{}, snapshots,
+	); err == nil {
+		t.Fatal("typed-nil snapshot provider succeeded")
+	}
+}
+
+type nilAuditSnapshot struct{}
+
+func (*nilAuditSnapshot) InteractionSnapshot(
+	context.Context,
+) (explorer.Snapshot, error) {
+	panic("typed-nil snapshot provider must be rejected")
 }
 
 type auditSink struct {

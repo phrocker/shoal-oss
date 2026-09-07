@@ -89,14 +89,14 @@ func ComposeWithPublisher(
 		return nil, nil, err
 	}
 	snapshots, ok := leases.(fleet.InteractionSnapshotProvider)
-	if !ok || snapshots == nil {
+	if !ok {
 		return nil, nil, shoal.NewError(
 			shoal.ErrorInvalidArgument,
 			"fleet event snapshot provider is required",
 		)
 	}
 	auditor, err := fleetevents.NewInteractionAuditor(
-		trustedInteractions, snapshots)
+		interactionRecorder, trustedInteractions, snapshots)
 	if err != nil {
 		return nil, nil, err
 	}

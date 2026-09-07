@@ -24,6 +24,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
+	"reflect"
 	"time"
 
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
@@ -56,8 +57,11 @@ type Service struct {
 }
 
 func New(config Config) (*Service, error) {
-	if config.Backend == nil || config.Resolver == nil || config.GenerationReader == nil ||
-		config.LeaseValidator == nil || config.Auditor == nil {
+	if isNilEventDependency(config.Backend) ||
+		isNilEventDependency(config.Resolver) ||
+		isNilEventDependency(config.GenerationReader) ||
+		isNilEventDependency(config.LeaseValidator) ||
+		isNilEventDependency(config.Auditor) {
 		return nil, shoal.NewError(shoal.ErrorInvalidArgument, "fleet event dependencies are required")
 	}
 	if config.Clock == nil {
@@ -85,6 +89,20 @@ func New(config Config) (*Service, error) {
 		leases: config.LeaseValidator, auditor: config.Auditor, cursors: codec,
 		now: config.Clock, poll: config.PollInterval, maxWait: config.MaxWait,
 	}, nil
+}
+
+func isNilEventDependency(value any) bool {
+	if value == nil {
+		return true
+	}
+	reflected := reflect.ValueOf(value)
+	switch reflected.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map,
+		reflect.Pointer, reflect.Slice:
+		return reflected.IsNil()
+	default:
+		return false
+	}
 }
 
 func (s *Service) Create(ctx context.Context, request CreateRequest) (Subscription, error) {

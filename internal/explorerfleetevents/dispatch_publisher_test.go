@@ -532,6 +532,12 @@ func TestNewActionEventPublisherRejectsMissingDependencies(t *testing.T) {
 	); err == nil {
 		t.Fatal("missing dependencies succeeded")
 	}
+	var resolver *mutableDispatchResolver
+	if _, err := NewActionEventPublisher(
+		&fleetevents.Service{}, resolver, time.Now,
+	); err == nil {
+		t.Fatal("typed-nil resolver succeeded")
+	}
 }
 
 func mustActionEventToken(

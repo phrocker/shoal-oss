@@ -25,6 +25,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
+	"reflect"
 	"time"
 
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
@@ -48,12 +49,26 @@ func NewActionEventPublisher(
 	resolver auth.Resolver,
 	clock func() time.Time,
 ) (*ActionEventPublisher, error) {
-	if service == nil || resolver == nil || clock == nil {
+	if service == nil || isNilPublisherDependency(resolver) || clock == nil {
 		return nil, errors.New("fleet events: action publisher dependencies are required")
 	}
 	return &ActionEventPublisher{
 		service: service, resolver: resolver, now: clock,
 	}, nil
+}
+
+func isNilPublisherDependency(value any) bool {
+	if value == nil {
+		return true
+	}
+	reflected := reflect.ValueOf(value)
+	switch reflected.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map,
+		reflect.Pointer, reflect.Slice:
+		return reflected.IsNil()
+	default:
+		return false
+	}
 }
 
 func (p *ActionEventPublisher) PublishActionEvent(
