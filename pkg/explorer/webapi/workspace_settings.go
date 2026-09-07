@@ -298,6 +298,10 @@ func workspaceOperationForRequest(
 	case method == http.MethodPost &&
 		path == "/api/v1/fleet/events/subscriptions":
 		return auth.OperationSubscriptionCreate, true
+	case method == http.MethodPost &&
+		strings.HasPrefix(path, "/api/v1/fleet/events/subscriptions/") &&
+		strings.HasSuffix(path, "/pull"):
+		return auth.OperationSubscriptionCreate, true
 	case method == http.MethodDelete &&
 		strings.HasPrefix(path, "/api/v1/fleet/events/subscriptions/"):
 		return auth.OperationSubscriptionDelete, true

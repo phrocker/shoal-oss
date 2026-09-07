@@ -4,6 +4,97 @@ This document is the feature and validation index for Shoal. The
 [`README.md`](README.md) is the task-oriented entry point; detailed design and
 operational contracts remain in the linked runbooks and ADRs.
 
+## Durable fleet events
+
+`pkg/explorer/fleetevents` defines bounded event publication and subscription
+lifecycle operations for the agent-fleet control plane. Event envelopes carry
+stable identity, correlation, reason, and authorization-evidence fields only;
+they cannot contain arbitrary payloads, callbacks, credentials, or egress
+destinations.
+
+The embedded `internal/explorerfleetevents` writer uses Explorer transactions
+and entity guards as its source of truth and allocates a dense stream sequence
+under durable compare-and-swap. Delivery uses the runtime-owned
+`Runtime.ScanCommitted` proof boundary: raw physical presence is not proof
+that an event committed, and prepared, quarantined, and aborted cells are
+excluded. Pull cursors are authenticated,
+expiring, opaque, and scoped to the subscription, subscriber, subscription
+generation, and exact authorization fingerprint. Version 3 cursors encrypt and
+authenticate their complete contents with AES-GCM; earlier and other legacy
+formats are rejected. Their 32-byte encryption root is domain-separated from a
+durable per-corpus load-or-create key, so cursors survive process restart but
+not corpus replacement. Delivery reuses the narrow
+`subscription_create` authorization operation rather than generic data read
+or event publication. It rechecks
+authorization generation and the target agent's exact positive registry
+generation, lease, revocation, parent delegation, and narrowing before and
+after page computation.
+
+The event log retains 10,000 logical event slots by default and durably records
+its event-local readable floor without advancing the shared runtime history
+floor. Expired cells are physically tombstoned with their owning guards while
+the floor advances atomically; sequence-specific guards prevent a retired
+ownership claim from being revived when a physical slot is reused. Publication
+receipts are keyed independently by a digest of the caller token and retained
+for their declared UTC retry window of at most 24 hours. Event slots therefore
+rotate at the configured log bound without waiting for receipt expiry, while
+an exact retry still returns the original receipt after its event leaves the
+readable log. Reusing an active token with changed content or deadline fails
+closed; expired receipts are incrementally pruned and the token may then begin
+a new window with a distinct event identity. Exact retries after their
+deadline return `fleetevents.ErrPublicationExpired`.
+A cursor below the floor returns `fleetevents.ErrResyncRequired`.
+Subscription records likewise use bounded deterministic slots: active
+collisions fail closed, while expired or revoked occupants can be replaced.
+Separate bounded, token-qualified create and delete receipts preserve the
+original immutable result through live-slot deletion/reuse and WAL restart,
+allowing an ambiguous interaction receipt to be repaired during the declared
+retry window. Expired mutation retries return
+`fleetevents.ErrMutationExpired`; unexpired receipt-slot collisions return
+`fleetevents.ErrRetentionCapacity` rather than repurposing a receipt.
+Older values remain readable only from valid pre-prune frontiers; current
+committed scans hide them.
+
+`internal/explorerfleetevents.NewActionEventPublisher` maps durable dispatch
+lifecycle transitions into this log. Each envelope carries the immutable
+producer generation and an opaque SHA-256 transition ID derived from the event
+kind, action ID, and exact dispatch transition discriminator. The publication
+token binds only the kind, action ID, and durable action version. Immutable
+producer identity, producer generation, and transition identity remain in the
+canonical persisted envelope, so a same-version divergent retry conflicts
+rather than appending another event. Every hashed component is uint64
+length-framed; raw enqueue, claim, execution, and cancellation keys are never
+exposed, and exact retries remain idempotent. Trusted lifecycle publication is separate
+from public `event_publish`, preserves its canonical token across authorization
+refreshes, and accepts only the original narrow
+`dispatch` or `invoke` authorization, not `event_publish`, and reauthorizes the
+durable action identity on every attempt. The five `action.*` lifecycle kinds
+are reserved from public publication, and each trusted kind is bound to its
+exact `dispatch` or `invoke` operation. Event evidence includes the base
+authorization target plus canonical executor node, edge, anchor, revision,
+range, and assertion references. Visibility remains trusted interaction-sink
+state and is re-derived from current labels rather than persisted from callers.
+Lifecycle receipts retain the durable transition's original authorization
+fingerprint, expiry, request, and correlation pins across an ambiguous retry,
+while the current decision is still reauthorized before each attempt.
+Dispatch mutations atomically persist an immutable transition outbox/history
+entry with the action state. Publication acknowledges that entry only after
+both event append and lifecycle audit succeed. `DispatchService` can explicitly
+reconcile pending transitions for an action with a fresh authorized context,
+independent of the original request deadline and after runtime restart; later
+action states cannot overwrite an earlier unpublished transition. Lifecycle
+interaction sinks authorize exact evidence with the transition's `dispatch` or
+`invoke` operation, rather than requiring unrelated `retrieve` permission.
+
+`webapi.NewFleetEventsHandler` serves the `/api/v1/fleet/events/` subtree and
+`webapi.Handler.MountFleetEvents` mounts it once through the existing
+authenticated handler. Routes cover subscription create/delete, event publish,
+and bounded long-poll delivery. Long polls are capped at 25 seconds, below the
+production server's 30-second write timeout; requests have an event-specific 512 KiB limit
+and inherit the host-authority, authentication, cancellation, and response
+controls. Raw wait and TTL integers are range-checked before duration
+conversion. Opaque byte IDs use unpadded base64url at the HTTP boundary.
+
 ## Status legend
 
 - **Shipped**: implemented, tested, and available on `main`.

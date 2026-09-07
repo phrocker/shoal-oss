@@ -27,6 +27,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/phrocker/shoal-oss/internal/explorerfleetcap"
+
 	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/explorer/authorized"
@@ -529,6 +531,199 @@ func TestAuthorizedInteractionReauthorizesExactSourceEdge(t *testing.T) {
 		context.Background(), rejected.ID,
 	); !shoal.IsErrorCode(err, shoal.ErrorNotFound) {
 		t.Fatalf("revoked edge recording persisted a record: %v", err)
+	}
+}
+
+func TestFleetActionInteractionSinkUsesLifecycleOperationForEvidence(t *testing.T) {
+	f := newFixture(t)
+	receipt, err := f.clientA.Ingest(f.admin(t), explorer.Source{
+		URI: "file:///dispatch-evidence.txt", MediaType: explorer.MediaTypeText,
+		Content: "dispatch evidence",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	view, err := f.clientA.Document(
+		f.admin(t), receipt.Document.ID, receipt.Revision.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	edge := graph.Edge{
+		ID: "dispatch-evidence-edge", From: receipt.Document.ID,
+		To: firstSpanID(t, view), Type: "supports", Weight: 1,
+	}
+	if err := f.clientA.Connect(f.admin(t), edge); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := f.base.Snapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.clock.Set(snapshot.AsOf.Add(time.Second))
+	decision := f.decision(
+		t, "dispatch-only", [][]byte{f.sourceA}, [][]byte{f.policyA},
+		[]auth.Operation{auth.OperationDispatch},
+	)
+	fingerprint, err := auth.AuthorizationFingerprint(decision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := interaction.Session{
+		ID:         interaction.DerivedID("session", "dispatch-evidence"),
+		Operation:  interaction.OperationToolCall,
+		SnapshotID: shoal.ID(snapshot.ID), SnapshotAsOf: snapshot.AsOf,
+		AuthorizationFingerprint: shoal.ID(fingerprint.String()),
+		AuthorizationExpiresAt:   decision.AuthenticationExpires(),
+		SeedNodeIDs:              []shoal.ID{edge.From, edge.To},
+		SeedEvidence: []interaction.EvidenceReference{
+			exactAuthorizedGraphEvidence(t, f.base, edge),
+		},
+	}
+	sink := f.clientA.FleetActionInteractionSink(auth.OperationDispatch)
+	if sink == nil {
+		t.Fatal("dispatch interaction sink is unavailable")
+	}
+	stored, err := sink.RecordInteractionResult(f.context(t, decision), session)
+	if err != nil {
+		t.Fatalf("dispatch-only lifecycle evidence = %v", err)
+	}
+	if stored.AuthorizationOperation != string(auth.OperationDispatch) {
+		t.Fatalf("authorization operation = %q", stored.AuthorizationOperation)
+	}
+	invokeDecision := f.decision(
+		t, "invoke-only", [][]byte{f.sourceA}, [][]byte{f.policyA},
+		[]auth.Operation{auth.OperationInvoke},
+	)
+	invokeFingerprint, err := auth.AuthorizationFingerprint(invokeDecision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	invokeSession := session
+	invokeSession.ID = interaction.DerivedID("session", "invoke-evidence")
+	invokeSession.AuthorizationFingerprint =
+		shoal.ID(invokeFingerprint.String())
+	invokeSession.AuthorizationExpiresAt =
+		invokeDecision.AuthenticationExpires()
+	invokeSink := f.clientA.FleetActionInteractionSink(auth.OperationInvoke)
+	if invokeSink == nil {
+		t.Fatal("invoke interaction sink is unavailable")
+	}
+	if _, err := invokeSink.RecordInteractionResult(
+		f.context(t, invokeDecision), invokeSession,
+	); err != nil {
+		t.Fatalf("invoke-only lifecycle evidence = %v", err)
+	}
+
+	hidden := f.newClient(
+		t, f.base,
+		edgeHidingInteractionStore{
+			PolicyStore: f.store,
+			hidden:      edge.ID,
+		},
+		f.sourceA, f.policyA, nil,
+	)
+	hiddenSink := hidden.FleetActionInteractionSink(auth.OperationDispatch)
+	session.ID = interaction.DerivedID("session", "hidden-dispatch-evidence")
+	if _, err := hiddenSink.RecordInteractionResult(
+		f.context(t, decision), session,
+	); !shoal.IsErrorCode(err, shoal.ErrorNotFound) {
+		t.Fatalf("hidden exact evidence = %v", err)
+	}
+}
+
+func TestFleetActionReconciliationPreservesChangedDurablePin(t *testing.T) {
+	f := newFixture(t)
+	snapshot, err := f.base.Snapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.clock.Set(snapshot.AsOf.Add(time.Second))
+	original := f.decision(
+		t, "fleet-reconcile", [][]byte{f.sourceA}, [][]byte{f.policyA},
+		[]auth.Operation{auth.OperationDispatch},
+	)
+	originalFingerprint, err := auth.AuthorizationFingerprint(original)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := interaction.Session{
+		ID:         interaction.DerivedID("session", "fleet-reconcile"),
+		RecordedAt: f.clock.Now(), Operation: interaction.OperationToolCall,
+		AuthorizationOperation: string(auth.OperationDispatch),
+		SnapshotID:             shoal.ID(snapshot.ID), SnapshotAsOf: snapshot.AsOf,
+		AuthorizationFingerprint: shoal.ID(originalFingerprint.String()),
+		AuthorizationExpiresAt:   original.AuthenticationExpires(),
+		RequestID:                original.RequestID(),
+	}
+	f.clock.Set(original.AuthenticationExpires().Add(time.Second))
+	refreshed := f.decision(
+		t, "fleet-reconcile", [][]byte{f.sourceA}, [][]byte{f.policyA},
+		[]auth.Operation{auth.OperationDispatch, auth.OperationInvoke},
+	)
+	refreshedFingerprint, err := auth.AuthorizationFingerprint(refreshed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if refreshedFingerprint == originalFingerprint {
+		t.Fatal("refreshed authorization fingerprint did not change")
+	}
+	sink := f.clientA.FleetActionInteractionSink(auth.OperationDispatch)
+	if _, exposed := sink.(interface {
+		RecordReconciledInteractionResult(
+			context.Context, interaction.Session,
+		) (interaction.Session, error)
+	}); exposed {
+		t.Fatal("ordinary fleet action sink exposes reconciliation without capability")
+	}
+	reconciler, ok := sink.(interface {
+		RecordReconciledInteractionResult(
+			context.Context, explorerfleetcap.Capability, interaction.Session,
+		) (interaction.Session, error)
+	})
+	if !ok {
+		t.Fatal("fleet sink does not support durable reconciliation")
+	}
+	if _, err := reconciler.RecordReconciledInteractionResult(
+		f.context(t, refreshed), explorerfleetcap.Capability{}, session,
+	); !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
+		t.Fatalf("zero reconciliation capability = %v", err)
+	}
+	stored, err := reconciler.RecordReconciledInteractionResult(
+		f.context(t, refreshed), explorerfleetcap.New(), session)
+	if err != nil {
+		t.Fatalf("first-write reconciliation = %v", err)
+	}
+	if stored.AuthorizationFingerprint !=
+		shoal.ID(originalFingerprint.String()) ||
+		!stored.AuthorizationExpiresAt.Equal(original.AuthenticationExpires()) ||
+		stored.RequestID != original.RequestID() {
+		t.Fatalf("durable authorization receipt changed: %#v", stored)
+	}
+
+	if _, err := f.clientA.Ingest(f.admin(t), explorer.Source{
+		URI:       "file:///fleet-reconciliation-retry.txt",
+		MediaType: explorer.MediaTypeText,
+		Content:   "advance the interaction snapshot after receipt commit",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	current, err := f.base.Snapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if shoal.ID(current.ID) == session.SnapshotID {
+		t.Fatal("interaction snapshot did not advance")
+	}
+	retry := session
+	retry.SnapshotID = shoal.ID(current.ID)
+	retry.SnapshotAsOf = current.AsOf
+	retried, err := reconciler.RecordReconciledInteractionResult(
+		f.context(t, refreshed), explorerfleetcap.New(), retry)
+	if err != nil {
+		t.Fatalf("authoritative receipt retry = %v", err)
+	}
+	if !reflect.DeepEqual(retried, stored) {
+		t.Fatalf("retry receipt changed: got %#v, want %#v", retried, stored)
 	}
 }
 
