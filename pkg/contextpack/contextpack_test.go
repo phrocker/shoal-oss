@@ -721,6 +721,90 @@ func TestAssertionHydrationEnforcesCumulativeCount(t *testing.T) {
 	}
 }
 
+func TestAssertionHydrationChargesStringObjectPayload(t *testing.T) {
+	derivation, err := ontology.NewAssertionDerivation(
+		"embedding-model", "v1", "cosine", 0.8, "cell-1", 0.9,
+		"source", "target", "iterator", nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	evidence, err := ontology.NewDerivationEvidenceRef(derivation, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	provenance, err := ontology.NewExtractionProvenance(
+		"provider", "model", "v1", "prompt", "v1", "extractor", "v1", nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	value, err := ontology.NewStringValue(strings.Repeat("x", 1024))
+	if err != nil {
+		t.Fatal(err)
+	}
+	property, err := ontology.NewPropertyDefinition(
+		"string-property", "String Property", "A string assertion property",
+		ontology.ValueString, nil, nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertion, err := ontology.NewAssertion(
+		"source", property.ID(), value, ontology.AssertionDerived, 0.9,
+		[]ontology.EvidenceRef{evidence}, provenance, nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	emptyValue, err := ontology.NewStringValue("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	emptyAssertion, err := ontology.NewAssertion(
+		"source", property.ID(), emptyValue, ontology.AssertionDerived, 0.9,
+		[]ontology.EvidenceRef{evidence}, provenance, nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := assertionPayloadBytes(assertion) -
+		assertionPayloadBytes(emptyAssertion); got != 1024 {
+		t.Fatalf("string object payload bytes = %d, want 1024", got)
+	}
+	nodes := []graph.Node{{ID: "producer"}, {ID: assertion.ID()}}
+	edge := graph.Edge{
+		ID: "produced-string", From: "producer", To: assertion.ID(),
+		Type: graph.EdgeTypeProduced, Weight: 1,
+		Properties: shoal.Metadata{
+			"ontology.assertion.id": string(assertion.ID()),
+		},
+	}
+	neighborhood := explorer.Neighborhood{
+		Nodes: nodes, Edges: []graph.Edge{edge},
+		Assertions: []ontology.Assertion{assertion},
+	}
+	requiredBytes := nodePayloadBytes(nodes[0]) + nodePayloadBytes(nodes[1]) +
+		edgePayloadBytes(edge) +
+		assertionHydrationPayloadBytes(assertionHydration{
+			assertion: assertion, edgeIDs: []shoal.ID{edge.ID},
+		})
+	if _, err := newVerifier(
+		context.Background(), nil,
+		mustLimits(t, Limits{MaxHydrationBytes: requiredBytes - 1}),
+		nil, []explorer.Neighborhood{neighborhood},
+	); !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
+		t.Fatalf("under-budget string assertion error = %v", err)
+	}
+	if _, err := newVerifier(
+		context.Background(), nil,
+		mustLimits(t, Limits{MaxHydrationBytes: requiredBytes}),
+		nil, []explorer.Neighborhood{neighborhood},
+	); err != nil {
+		t.Fatalf("exact-budget string assertion error = %v", err)
+	}
+}
+
 func TestMutationIsolationAndNoUncitedExplanationText(t *testing.T) {
 	client, request, response, pins := embeddedFixture(t)
 	const uncited = "this explanation is not evidence"

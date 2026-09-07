@@ -1924,10 +1924,10 @@ const float64PayloadBytes = 8
 
 func assertionPayloadBytes(assertion ontology.Assertion) int {
 	object := assertion.Object()
-	target, _ := object.ReferenceValue()
 	total := len(assertion.ID()) + len(assertion.Subject()) +
 		len(assertion.Predicate()) + len(assertion.Origin()) +
-		len(object.Type()) + len(target) + float64PayloadBytes +
+		len(object.Type()) + ontologyValuePayloadBytes(object) +
+		float64PayloadBytes +
 		metadataBytes(assertion.Metadata())
 	if subjectType, ok := assertion.SubjectType(); ok {
 		total += len(subjectType)
@@ -1947,6 +1947,23 @@ func assertionPayloadBytes(assertion ontology.Assertion) int {
 		total += evidenceRefPayloadBytes(evidence)
 	}
 	return total
+}
+
+func ontologyValuePayloadBytes(value ontology.Value) int {
+	switch value.Type() {
+	case ontology.ValueString:
+		text, _ := value.StringValue()
+		return len(text)
+	case ontology.ValueReference:
+		reference, _ := value.ReferenceValue()
+		return len(reference)
+	case ontology.ValueInteger, ontology.ValueNumber, ontology.ValueTimestamp:
+		return 8
+	case ontology.ValueBoolean:
+		return 1
+	default:
+		return 0
+	}
 }
 
 func evidenceRefPayloadBytes(evidence ontology.EvidenceRef) int {
