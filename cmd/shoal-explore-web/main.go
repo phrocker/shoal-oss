@@ -43,6 +43,7 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/explorer/coordination/transaction"
 	"github.com/phrocker/shoal-oss/pkg/explorer/fleet"
 	"github.com/phrocker/shoal-oss/pkg/explorer/mcp"
+	"github.com/phrocker/shoal-oss/pkg/explorer/teamoverview"
 	"github.com/phrocker/shoal-oss/pkg/explorer/webapi"
 	"github.com/phrocker/shoal-oss/pkg/explorer/workspace"
 	"github.com/phrocker/shoal-oss/pkg/interaction"
@@ -610,6 +611,19 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 			return err
 		}
 	}
+	if opened.teamOverview != nil {
+		teamHandler, err := webapi.NewTeamOverviewHandler(opened.teamOverview)
+		if err != nil {
+			listener.Close()
+			return err
+		}
+		if err := handler.MountAuthenticated(
+			webapi.TeamOverviewRoute, teamHandler,
+		); err != nil {
+			listener.Close()
+			return err
+		}
+	}
 	// Browser login is optional and publishes only non-secret OIDC parameters.
 	// With -dev-auth, or an API-only OIDC configuration, auth-config reports
 	// unconfigured and the UI renders no login flow.
@@ -799,6 +813,7 @@ type openedService struct {
 	fleetRegistry webapi.FleetRegistryProvider
 	fleetDispatch webapi.FleetDispatchProvider
 	fleetEvents   webapi.FleetEventService
+	teamOverview  webapi.TeamOverviewProvider
 	client        *authorized.Client
 	backfilled    int
 	close         func()
@@ -960,6 +975,15 @@ func openService(
 			embedded.Close()
 			return closed, err
 		}
+		teamOverview, err := teamoverview.NewService(teamoverview.Config{
+			Graph: client, Agents: fleetRegistry, Actions: fleetDispatch,
+			Interactions: client, Resolver: config.resolver, Clock: config.clock,
+		})
+		if err != nil {
+			store.Close()
+			embedded.Close()
+			return closed, err
+		}
 		boundFleetDispatch, err := newBoundFleetDispatch(
 			fleetDispatch, config.resolver)
 		if err != nil {
@@ -1036,6 +1060,7 @@ func openService(
 			fleetRegistry: boundFleetRegistry,
 			fleetDispatch: boundFleetDispatch,
 			fleetEvents:   fleetEvents,
+			teamOverview:  teamOverview,
 			client:        client,
 			backfilled:    backfilled,
 			close: func() {

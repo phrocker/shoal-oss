@@ -51,6 +51,7 @@ var productActionOperations = []auth.Operation{
 	auth.OperationSubscriptionDeliver,
 	auth.OperationEventPublish,
 	auth.OperationAnalyticsRead,
+	auth.OperationTeamOverviewRead,
 	auth.OperationWorkspaceSettingsRead,
 	auth.OperationWorkspaceSettingsWrite,
 }
@@ -76,6 +77,7 @@ var authorizationServiceRoles = []auth.ServiceRole{
 	auth.ServiceRoleSubscription,
 	auth.ServiceRoleEventPublication,
 	auth.ServiceRoleAnalytics,
+	auth.ServiceRoleTeamOverview,
 	auth.ServiceRoleWorkspaceSettingsRead,
 	auth.ServiceRoleWorkspaceSettingsWrite,
 }
@@ -153,6 +155,10 @@ var roleOperationCeilings = map[auth.ServiceRole]map[auth.Operation]bool{
 		auth.OperationRetrieve,
 		auth.OperationValidate,
 	),
+	auth.ServiceRoleTeamOverview: operationSet(
+		auth.OperationTeamOverviewRead,
+		auth.OperationValidate,
+	),
 	auth.ServiceRoleWorkspaceSettingsRead: operationSet(
 		auth.OperationWorkspaceSettingsRead,
 		auth.OperationValidate,
@@ -192,6 +198,7 @@ func TestProductActionOperationValuesAndParsingAreStable(t *testing.T) {
 		auth.OperationSubscriptionDeliver:    "subscription_deliver",
 		auth.OperationEventPublish:           "event_publish",
 		auth.OperationAnalyticsRead:          "analytics_read",
+		auth.OperationTeamOverviewRead:       "team_overview_read",
 		auth.OperationWorkspaceSettingsRead:  "workspace_settings_read",
 		auth.OperationWorkspaceSettingsWrite: "workspace_settings_write",
 	}
@@ -243,6 +250,7 @@ func TestProductActionServiceRoleValuesAreStable(t *testing.T) {
 		auth.ServiceRoleSubscription:           "subscription",
 		auth.ServiceRoleEventPublication:       "event_publication",
 		auth.ServiceRoleAnalytics:              "analytics",
+		auth.ServiceRoleTeamOverview:           "team_overview",
 		auth.ServiceRoleWorkspaceSettingsRead:  "workspace_settings_read",
 		auth.ServiceRoleWorkspaceSettingsWrite: "workspace_settings_write",
 	}
@@ -407,6 +415,7 @@ func TestProductActionServiceRolesRoundTripThroughPolicy(t *testing.T) {
 		auth.ServiceRoleSubscription:           auth.OperationSubscriptionCreate,
 		auth.ServiceRoleEventPublication:       auth.OperationEventPublish,
 		auth.ServiceRoleAnalytics:              auth.OperationAnalyticsRead,
+		auth.ServiceRoleTeamOverview:           auth.OperationTeamOverviewRead,
 		auth.ServiceRoleWorkspaceSettingsRead:  auth.OperationWorkspaceSettingsRead,
 		auth.ServiceRoleWorkspaceSettingsWrite: auth.OperationWorkspaceSettingsWrite,
 	}

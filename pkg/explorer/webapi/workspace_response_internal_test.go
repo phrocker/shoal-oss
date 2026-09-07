@@ -94,6 +94,7 @@ func TestWorkspaceOperationForRequestUsesRouteOperation(t *testing.T) {
 	}{
 		{http.MethodPost, "/api/v1/retrieve", auth.OperationRetrieve, true},
 		{http.MethodPost, "/api/v1/analytics", auth.OperationAnalyticsRead, true},
+		{http.MethodPost, TeamOverviewRoute, auth.OperationTeamOverviewRead, true},
 		{http.MethodPost, "/api/v1/neighborhood", auth.OperationNeighborhood, true},
 		{http.MethodPost, "/api/v1/ingest", auth.OperationIngest, true},
 		{http.MethodPost, "/api/v1/documents", auth.OperationList, true},

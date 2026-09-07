@@ -70,6 +70,7 @@ var workspaceOperations = []auth.Operation{
 	auth.OperationNeighborhood,
 	auth.OperationRetrieve,
 	auth.OperationAnalyticsRead,
+	auth.OperationTeamOverviewRead,
 	auth.OperationWorkspaceSettingsRead,
 	auth.OperationWorkspaceSettingsWrite,
 	auth.OperationAgentRegister,
