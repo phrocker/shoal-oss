@@ -536,6 +536,18 @@ func (p *Provider) apply(
 	if err != nil {
 		return EffectiveDecision{}, err
 	}
+	effectiveNow := p.clock()
+	if effectiveNow.IsZero() ||
+		effective.Decision().Authorize(
+			check.operation,
+			auth.ResourceRequest{
+				AuthorizationDomain: effective.Decision().AuthorizationDomain(),
+				ObjectID:            workspaceID,
+			},
+			effectiveNow,
+		) != nil {
+		return EffectiveDecision{}, authDenied()
+	}
 	if err := p.recheck(ctx, check); err != nil {
 		return EffectiveDecision{}, err
 	}

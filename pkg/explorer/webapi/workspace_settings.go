@@ -197,7 +197,10 @@ func (h *Handler) applyWorkspaceSettings(
 	operation, apply := workspaceOperationForRequest(
 		request.Method, request.URL.Path)
 	if !apply {
-		return request.Context(), nil
+		return nil, shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			"workspace settings are not registered for this route",
+		)
 	}
 	effective, err := h.workspaceSettings.ApplyForOperation(
 		request.Context(), workspaceID, operation,
@@ -232,6 +235,9 @@ func (h *Handler) applyWorkspaceSettings(
 func workspaceOperationForRequest(
 	method, path string,
 ) (auth.Operation, bool) {
+	if method == http.MethodHead {
+		method = http.MethodGet
+	}
 	switch {
 	case method == http.MethodGet && path == "/api/v1/meta":
 		return auth.OperationRead, true
