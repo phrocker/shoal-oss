@@ -127,9 +127,10 @@ func (a VerifiedAnchor) EvidenceReference() (
 			return interaction.EvidenceReference{}, invalid(
 				"verified document evidence is unavailable")
 		}
-		if citation.SectionID == "" || citation.SpanID == "" {
+		if len(a.sources) != 3 ||
+			a.sources[0].ID() != citation.DocumentID {
 			return interaction.EvidenceReference{}, invalid(
-				"interaction evidence projection requires explicit section and span identities")
+				"verified document evidence has incomplete resolved source roles")
 		}
 		reference.Kind = interaction.EvidenceDocument
 		reference.Citation = citation

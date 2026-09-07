@@ -314,12 +314,21 @@ func TestCitationEnvelopeOpaqueIDRoundTrip(t *testing.T) {
 			citation := *candidate.Evidence[0].Citation
 			omit(&citation)
 			candidate.Evidence[0].Citation = &citation
-			if err := candidate.Validate(); err == nil ||
-				!strings.Contains(
-					err.Error(),
-					"requires explicit section and span identities",
-				) {
+			reanchorCitationDocumentEnvelope(t, &candidate)
+			payload, err := json.Marshal(candidate)
+			if err != nil {
 				t.Fatalf("omitted %s identity error = %v", name, err)
+			}
+			var roundTrip CitationEnvelope
+			if err := json.Unmarshal(payload, &roundTrip); err != nil {
+				t.Fatal(err)
+			}
+			if roundTrip.Evidence[0].SectionID == "" ||
+				roundTrip.Evidence[0].SpanID == "" {
+				t.Fatalf(
+					"omitted %s identity lost resolved roles: %+v",
+					name, roundTrip.Evidence[0],
+				)
 			}
 		})
 	}
@@ -1033,6 +1042,52 @@ func reanchorCitationGraphEnvelope(
 		citationResponseIdentity(*envelope),
 	)
 	return err
+}
+
+func reanchorCitationDocumentEnvelope(
+	t *testing.T,
+	envelope *CitationEnvelope,
+) {
+	t.Helper()
+	oldAnchorID := envelope.Evidence[0].AnchorID
+	anchor, err := inference.NewDocumentAnchor(
+		*envelope.Evidence[0].Citation,
+		envelope.Evidence[0].Quote,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newAnchorID := anchor.ID()
+	envelope.Evidence[0].AnchorID = newAnchorID
+	for sourceIndex := range envelope.Sources {
+		for anchorIndex, anchorID := range envelope.Sources[sourceIndex].AnchorIDs {
+			if anchorID == oldAnchorID {
+				envelope.Sources[sourceIndex].AnchorIDs[anchorIndex] = newAnchorID
+			}
+		}
+	}
+	for claimIndex := range envelope.Claims {
+		for anchorIndex, anchorID := range envelope.Claims[claimIndex].CitationAnchorIDs {
+			if anchorID == oldAnchorID {
+				envelope.Claims[claimIndex].CitationAnchorIDs[anchorIndex] =
+					newAnchorID
+			}
+		}
+		canonicalID, err := citationClaimCanonicalID(
+			envelope.Claims[claimIndex])
+		if err != nil {
+			t.Fatal(err)
+		}
+		envelope.Claims[claimIndex].ID = canonicalID
+	}
+	envelope.ID, err = reasoning.CanonicalResponseID(
+		envelope.SessionID,
+		envelope.RecordedAt,
+		citationResponseIdentity(*envelope),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
 }
 
 func citationClaimCanonicalID(claim CitationClaim) (shoal.ID, error) {

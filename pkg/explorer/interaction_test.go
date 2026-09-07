@@ -702,6 +702,121 @@ func TestRecordInteractionRejectsReclassifiedPinnedSource(t *testing.T) {
 	}
 }
 
+func TestRecordInteractionVerifiesResolvedCitationRoles(t *testing.T) {
+	ctx := context.Background()
+	corpus, err := explorer.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer corpus.Close()
+
+	first, err := corpus.Ingest(ctx, explorer.Source{
+		URI: "file:///resolved-role-a.txt", MediaType: explorer.MediaTypeText,
+		Content: "first source evidence",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := corpus.Ingest(ctx, explorer.Source{
+		URI: "file:///resolved-role-b.txt", MediaType: explorer.MediaTypeText,
+		Content: "second source evidence",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstView, err := corpus.Document(
+		ctx, first.Document.ID, first.Revision.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondView, err := corpus.Document(
+		ctx, second.Document.ID, second.Revision.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(firstView.Root.Spans) == 0 ||
+		len(secondView.Root.Spans) == 0 {
+		t.Fatal("fixture produced no source spans")
+	}
+	firstSpan := firstView.Root.Spans[0]
+	secondSpan := secondView.Root.Spans[0]
+	citation := document.Citation{
+		DocumentID: firstSpan.DocumentID,
+		RevisionID: firstSpan.RevisionID,
+		SpanID:     firstSpan.ID,
+		Range:      firstSpan.Range,
+	}
+	anchor, err := inference.NewDocumentAnchor(citation, firstSpan.Text)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := corpus.Snapshot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reference := interaction.EvidenceReference{
+		AnchorID: anchor.ID(),
+		Kind:     interaction.EvidenceDocument,
+		Citation: citation,
+		NodeIDs: []shoal.ID{
+			firstSpan.DocumentID, firstSpan.SectionID, firstSpan.ID,
+		},
+	}
+	sessionFor := func(
+		id shoal.ID,
+		evidence interaction.EvidenceReference,
+	) interaction.Session {
+		return interaction.Session{
+			ID:                       id,
+			RecordedAt:               snapshot.AsOf.Add(time.Second),
+			Operation:                interaction.OperationRetrieval,
+			SnapshotID:               shoal.ID(snapshot.ID),
+			SnapshotAsOf:             snapshot.AsOf,
+			AuthorizationFingerprint: "auth-sha256:resolved-role",
+			AuthorizationExpiresAt:   snapshot.AsOf.Add(time.Hour),
+			SeedNodeIDs:              append([]shoal.ID(nil), evidence.NodeIDs...),
+			SeedEvidence: []interaction.EvidenceReference{
+				evidence,
+			},
+		}
+	}
+	accepted, err := corpus.RecordInteractionResult(
+		ctx,
+		sessionFor(
+			interaction.DerivedID("session", "resolved-role-valid"),
+			reference,
+		),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if accepted.SeedEvidence[0].Citation.SectionID != "" ||
+		!reflect.DeepEqual(
+			accepted.SeedEvidence[0].NodeIDs,
+			[]shoal.ID{
+				firstSpan.DocumentID, firstSpan.SectionID, firstSpan.ID,
+			},
+		) {
+		t.Fatalf("accepted citation roles = %+v", accepted.SeedEvidence[0])
+	}
+
+	forged := reference
+	forged.NodeIDs = []shoal.ID{
+		firstSpan.DocumentID, secondSpan.SectionID, firstSpan.ID,
+	}
+	forgedID := interaction.DerivedID("session", "resolved-role-forged")
+	if _, err := corpus.RecordInteractionResult(
+		ctx, sessionFor(forgedID, forged),
+	); !shoal.IsErrorCode(err, shoal.ErrorConflict) {
+		t.Fatalf("forged resolved source role error = %v", err)
+	}
+	if _, err := corpus.InteractionRecord(
+		ctx, forgedID,
+	); !shoal.IsErrorCode(err, shoal.ErrorNotFound) {
+		t.Fatalf("forged resolved source role persisted: %v", err)
+	}
+}
+
 func TestGeneratedInteractionNodeIDsCannotCollide(t *testing.T) {
 	ctx := context.Background()
 	corpus, err := explorer.Open(t.TempDir())
