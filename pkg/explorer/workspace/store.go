@@ -44,15 +44,17 @@ import (
 )
 
 const (
-	settingsTable = "_shoal_workspace_settings"
-	settingsCF    = "settings"
-	settingsCQ    = "v1"
+	settingsTable    = "_shoal_workspace_settings"
+	settingsCF       = "settings"
+	settingsCQ       = "v1"
+	settingsLockFile = ".shoal-explorer-runtime.lock"
 
 	settingsRecordMagic     = "SHOALWS1"
 	settingsEnvelopeVersion = byte(1)
 	settingsRecordKind      = byte(1)
 	settingsEnvelopeHeader  = 8 + 1 + 1 + 8 + sha256.Size
 	maxSettingsRecordBytes  = uint64(8 << 20)
+	settingsCompactInterval = uint64(16)
 )
 
 // Store is the durable settings persistence contract used by Provider.
@@ -78,11 +80,29 @@ type DurableStore struct {
 	mu               sync.Mutex
 	engine           *engine.Engine
 	lock             *dirlock.Lock
+	ownsEngine       bool
+	sharedEngine     bool
 	conditionalWrite func(
 		string, []engine.ConditionalMutation,
 	) ([]bool, error)
-	ownsEngine bool
-	closed     bool
+	flush        func(string) error
+	compact      func(string, []iterrt.IterSpec) error
+	closeEngine  func() error
+	engineClosed bool
+	closed       bool
+
+	maintenanceMu  sync.Mutex
+	maintenanceWG  sync.WaitGroup
+	uncompacted    uint64
+	compacting     bool
+	maintenanceErr error
+}
+
+var sharedEngineStores = struct {
+	sync.Mutex
+	active map[*engine.Engine]struct{}
+}{
+	active: make(map[*engine.Engine]struct{}),
 }
 
 type persistedSettings struct {
@@ -115,7 +135,7 @@ func OpenDurableStore(dir string) (*DurableStore, error) {
 	if strings.TrimSpace(dir) == "" {
 		return nil, invalid("settings directory is required")
 	}
-	lock, err := dirlock.Acquire(dir, ".shoal-workspace-settings.lock")
+	lock, err := dirlock.Acquire(dir, settingsLockFile)
 	if err != nil {
 		message := "acquire workspace settings directory ownership"
 		if errors.Is(err, dirlock.ErrLocked) {
@@ -133,6 +153,57 @@ func OpenDurableStore(dir string) (*DurableStore, error) {
 		return nil, shoal.WrapError(
 			shoal.ErrorUnavailable, "open workspace settings storage", err)
 	}
+	store, err := newDurableStore(eng, lock, true, false)
+	if err != nil {
+		_ = eng.Close()
+		_ = lock.Close()
+		return nil, err
+	}
+	return store, nil
+}
+
+// NewDurableStoreWithEngine attaches a settings store to an existing embedded
+// engine without taking ownership of the engine or its directory lock. The
+// caller must close the store before closing the engine. Only one live settings
+// store may be attached to an engine in this process.
+func NewDurableStoreWithEngine(
+	eng *engine.Engine,
+) (*DurableStore, error) {
+	if eng == nil {
+		return nil, invalid("settings engine is required")
+	}
+	sharedEngineStores.Lock()
+	if _, exists := sharedEngineStores.active[eng]; exists {
+		sharedEngineStores.Unlock()
+		return nil, shoal.NewError(
+			shoal.ErrorUnavailable,
+			"workspace settings store is already attached to the engine",
+		)
+	}
+	sharedEngineStores.active[eng] = struct{}{}
+	sharedEngineStores.Unlock()
+	store, err := newDurableStore(eng, nil, false, true)
+	if err != nil {
+		releaseSharedEngine(eng)
+		return nil, err
+	}
+	return store, nil
+}
+
+// NewDurableStoreFromEngine is retained for compatibility with host branches
+// predating the canonical NewDurableStoreWithEngine name.
+func NewDurableStoreFromEngine(
+	eng *engine.Engine,
+) (*DurableStore, error) {
+	return NewDurableStoreWithEngine(eng)
+}
+
+func newDurableStore(
+	eng *engine.Engine,
+	lock *dirlock.Lock,
+	ownsEngine bool,
+	sharedEngine bool,
+) (*DurableStore, error) {
 	found := false
 	for _, table := range eng.TableNames() {
 		if table == settingsTable {
@@ -142,8 +213,6 @@ func OpenDurableStore(dir string) (*DurableStore, error) {
 	}
 	if !found {
 		if err := eng.CreateTable(settingsTable, engine.TableOptions{}); err != nil {
-			_ = eng.Close()
-			_ = lock.Close()
 			return nil, shoal.WrapError(
 				shoal.ErrorInternal, "create workspace settings table", err)
 		}
@@ -151,37 +220,16 @@ func OpenDurableStore(dir string) (*DurableStore, error) {
 	return &DurableStore{
 		engine:           eng,
 		lock:             lock,
+		ownsEngine:       ownsEngine,
+		sharedEngine:     sharedEngine,
 		conditionalWrite: eng.ConditionalWrite,
-		ownsEngine:       true,
+		flush:            eng.Flush,
+		compact:          eng.Compact,
+		closeEngine:      eng.Close,
 	}, nil
 }
 
-// NewDurableStoreFromEngine creates a non-owning settings store backed by an
-// already-open shared engine. Closing the store never closes the engine.
-func NewDurableStoreFromEngine(eng *engine.Engine) (*DurableStore, error) {
-	if eng == nil {
-		return nil, invalid("shared settings engine is required")
-	}
-	found := false
-	for _, table := range eng.TableNames() {
-		if table == settingsTable {
-			found = true
-			break
-		}
-	}
-	if !found {
-		if err := eng.CreateTable(settingsTable, engine.TableOptions{}); err != nil {
-			return nil, shoal.WrapError(
-				shoal.ErrorInternal, "create workspace settings table", err)
-		}
-	}
-	return &DurableStore{
-		engine: eng, conditionalWrite: eng.ConditionalWrite,
-	}, nil
-}
-
-// Close releases resources owned by the store. A store created from a shared
-// engine becomes unusable without closing that engine.
+// Close flushes and closes the settings engine.
 func (s *DurableStore) Close() error {
 	if s == nil {
 		return nil
@@ -191,22 +239,44 @@ func (s *DurableStore) Close() error {
 	if s.closed {
 		return nil
 	}
-	s.closed = true
-	var engineErr, lockErr error
+	if err := s.finishMaintenanceLocked(); err != nil {
+		return err
+	}
+	if s.sharedEngine {
+		s.closed = true
+		releaseSharedEngine(s.engine)
+		return nil
+	}
 	if s.ownsEngine {
-		engineErr = s.engine.Close()
+		if !s.engineClosed {
+			if err := s.closeEngine(); err != nil {
+				return shoal.WrapError(
+					shoal.ErrorInternal,
+					"close workspace settings engine",
+					err,
+				)
+			}
+			s.engineClosed = true
+		}
 		if s.lock != nil {
-			lockErr = s.lock.Close()
+			if err := s.lock.Close(); err != nil {
+				return shoal.WrapError(
+					shoal.ErrorInternal,
+					"release workspace settings directory ownership",
+					err,
+				)
+			}
+			s.lock = nil
 		}
 	}
-	if engineErr != nil || lockErr != nil {
-		return shoal.WrapError(
-			shoal.ErrorInternal,
-			"close workspace settings storage",
-			errors.Join(engineErr, lockErr),
-		)
-	}
+	s.closed = true
 	return nil
+}
+
+func releaseSharedEngine(eng *engine.Engine) {
+	sharedEngineStores.Lock()
+	delete(sharedEngineStores.active, eng)
+	sharedEngineStores.Unlock()
 }
 
 // Load returns the current workspace settings revision.
@@ -222,6 +292,9 @@ func (s *DurableStore) Load(
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := validateContext(ctx); err != nil {
+		return Settings{}, err
+	}
 	if s.closed {
 		return Settings{}, shoal.NewError(
 			shoal.ErrorUnavailable, "workspace settings store is closed")
@@ -283,6 +356,9 @@ func (s *DurableStore) CompareAndSwap(
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := validateContext(ctx); err != nil {
+		return Settings{}, err
+	}
 	if s.closed {
 		return Settings{}, shoal.NewError(
 			shoal.ErrorUnavailable, "workspace settings store is closed")
@@ -306,6 +382,14 @@ func (s *DurableStore) CompareAndSwap(
 		}
 		if current.Revision != expectedRevision {
 			return Settings{}, versionConflict()
+		}
+		currentSettings, err := settingsFromPersisted(current)
+		if err != nil {
+			return Settings{}, corruptSettings(err)
+		}
+		if err := ensureMonotonic(
+			currentSettings.Narrowing, normalized); err != nil {
+			return Settings{}, err
 		}
 	} else if expectedRevision != 0 {
 		return Settings{}, versionConflict()
@@ -347,6 +431,9 @@ func (s *DurableStore) CompareAndSwap(
 	} else {
 		condition.Kind = engine.ConditionAbsent
 	}
+	if err := validateContext(ctx); err != nil {
+		return Settings{}, err
+	}
 	accepted, err := s.conditionalWrite(settingsTable, []engine.ConditionalMutation{{
 		Mutation: mutation, Conditions: []engine.Condition{condition},
 	}})
@@ -359,6 +446,11 @@ func (s *DurableStore) CompareAndSwap(
 				winner, winnerFound, owner, authorizationDomain,
 				expectedRevision, mutationID, digest,
 			); replayed {
+				if replayErr == nil {
+					if retentionErr := s.retainCurrentLocked(found); retentionErr != nil {
+						return result, retentionErr
+					}
+				}
 				return result, replayErr
 			}
 		}
@@ -368,10 +460,33 @@ func (s *DurableStore) CompareAndSwap(
 		return Settings{}, explorer.MarkIndeterminateCommit(writeErr)
 	}
 	if len(accepted) != 1 {
-		return Settings{}, shoal.NewError(
-			shoal.ErrorInternal, "workspace settings CAS returned an invalid result")
+		var resultErr error = shoal.NewError(
+			shoal.ErrorInternal,
+			"workspace settings CAS returned an invalid result",
+		)
+		winner, _, winnerFound, loadErr := s.loadLocked(workspaceID)
+		if loadErr == nil {
+			if replayed, result, replayErr := replayResult(
+				winner, winnerFound, owner, authorizationDomain,
+				expectedRevision, mutationID, digest,
+			); replayed {
+				if replayErr == nil {
+					if retentionErr := s.retainCurrentLocked(found); retentionErr != nil {
+						return result, retentionErr
+					}
+				}
+				return result, replayErr
+			}
+		}
+		if loadErr != nil {
+			resultErr = errors.Join(resultErr, loadErr)
+		}
+		return Settings{}, explorer.MarkIndeterminateCommit(resultErr)
 	}
 	if accepted[0] {
+		if err := s.retainCurrentLocked(found); err != nil {
+			return candidate.clone(), err
+		}
 		return candidate.clone(), nil
 	}
 	winner, _, winnerFound, loadErr := s.loadLocked(workspaceID)
@@ -385,6 +500,84 @@ func (s *DurableStore) CompareAndSwap(
 		return result, replayErr
 	}
 	return Settings{}, versionConflict()
+}
+
+func (s *DurableStore) retainCurrentLocked(hadPrevious bool) error {
+	if err := s.flush(settingsTable); err != nil {
+		return explorer.MarkIndeterminateCommit(shoal.WrapError(
+			shoal.ErrorUnavailable,
+			"flush committed workspace settings",
+			err,
+		))
+	}
+	if !hadPrevious {
+		return nil
+	}
+	s.scheduleCompaction()
+	return nil
+}
+
+func settingsCompactionStack() []iterrt.IterSpec {
+	return []iterrt.IterSpec{{
+		Name: iterrt.IterVersioning,
+		Options: map[string]string{
+			iterrt.VersioningOption: "1",
+		},
+	}}
+}
+
+func (s *DurableStore) scheduleCompaction() {
+	s.maintenanceMu.Lock()
+	defer s.maintenanceMu.Unlock()
+	s.uncompacted++
+	if s.compacting || s.uncompacted < settingsCompactInterval {
+		return
+	}
+	s.compacting = true
+	s.uncompacted = 0
+	s.maintenanceWG.Add(1)
+	go s.runCompaction()
+}
+
+func (s *DurableStore) runCompaction() {
+	err := s.compact(settingsTable, settingsCompactionStack())
+	s.maintenanceMu.Lock()
+	s.compacting = false
+	s.maintenanceErr = err
+	retry := err == nil && s.uncompacted >= settingsCompactInterval
+	if retry {
+		s.compacting = true
+		s.uncompacted = 0
+		s.maintenanceWG.Add(1)
+	}
+	s.maintenanceMu.Unlock()
+	s.maintenanceWG.Done()
+	if retry {
+		go s.runCompaction()
+	}
+}
+
+func (s *DurableStore) finishMaintenanceLocked() error {
+	s.maintenanceWG.Wait()
+	s.maintenanceMu.Lock()
+	pending := s.uncompacted
+	maintenanceErr := s.maintenanceErr
+	s.maintenanceMu.Unlock()
+	if pending == 0 && maintenanceErr == nil {
+		return nil
+	}
+	if err := s.compact(settingsTable, settingsCompactionStack()); err != nil {
+		return shoal.WrapError(
+			shoal.ErrorInternal,
+			"compact workspace settings before close",
+			err,
+		)
+	}
+	s.maintenanceMu.Lock()
+	s.uncompacted = 0
+	s.maintenanceErr = nil
+	s.maintenanceMu.Unlock()
+	return nil
 }
 
 func (s *DurableStore) loadLocked(
@@ -403,6 +596,12 @@ func (s *DurableStore) loadRow(
 		engine.ScanOptions{
 			ColumnFamilies:          [][]byte{[]byte(settingsCF)},
 			ColumnFamiliesInclusive: true,
+			Stack: []iterrt.IterSpec{{
+				Name: iterrt.IterVersioning,
+				Options: map[string]string{
+					iterrt.VersioningOption: "1",
+				},
+			}},
 		},
 		func(_ int, key *iterrt.Key, value []byte) {
 			if encoded == nil &&

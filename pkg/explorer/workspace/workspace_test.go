@@ -27,56 +27,12 @@ import (
 	"time"
 
 	"github.com/phrocker/shoal-oss/accumulo"
-	"github.com/phrocker/shoal-oss/internal/engine"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/ontology"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
 var testNow = time.Date(2026, 9, 5, 18, 0, 0, 0, time.UTC)
-
-func TestSharedEngineStoreIsNonOwning(t *testing.T) {
-	eng, err := engine.Open(t.TempDir(), engine.Options{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer eng.Close()
-	store, err := NewDurableStoreFromEngine(eng)
-	if err != nil {
-		t.Fatal(err)
-	}
-	created, err := store.CompareAndSwap(
-		context.Background(), "shared-workspace", "owner", []byte("domain"),
-		0, "create", Narrowing{},
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	peer, err := NewDurableStoreFromEngine(eng)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := peer.CompareAndSwap(
-		context.Background(), "shared-workspace", "owner", []byte("domain"),
-		0, "conflicting-create", Narrowing{},
-	); !shoal.IsErrorCode(err, shoal.ErrorConflict) {
-		t.Fatalf("peer stale revision error = %v", err)
-	}
-	if err := store.Close(); err != nil {
-		t.Fatal(err)
-	}
-	loaded, err := peer.Load(context.Background(), "shared-workspace")
-	if err != nil {
-		t.Fatalf("shared engine was closed by peer store: %v", err)
-	}
-	if loaded.Revision != created.Revision ||
-		loaded.SettingsID != created.SettingsID {
-		t.Fatalf("peer loaded settings = %#v, want %#v", loaded, created)
-	}
-	if err := peer.Close(); err != nil {
-		t.Fatal(err)
-	}
-}
 
 type mutableResolver struct {
 	mu       sync.RWMutex
@@ -183,7 +139,7 @@ func TestProviderAppliesOnlyNarrowingAndPreservesDecision(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	base := testDecision(t, decisionOptions{ontology: firstOntology})
+	base := testDecision(t, decisionOptions{})
 	resolver := &mutableResolver{decision: base}
 	options := testProviderOptions(resolver)
 	options.OntologyChoices = choices
@@ -230,10 +186,11 @@ func TestProviderAppliesOnlyNarrowingAndPreservesDecision(t *testing.T) {
 		t.Fatalf("created settings = %#v", created)
 	}
 	baseOutput := testPolicy(t, base, "source-a", "policy-a", 3)
-	effective, err := provider.Effective(ctx, "workspace-one", Limits{
-		RetrievalTopK: 20, GraphDepth: 4, GraphFanout: 30,
-		GraphNodes: 200, OutputBytes: 1 << 20,
-	}, []auth.Policy{baseOutput})
+	effective, err := provider.ApplyForOperation(
+		ctx, "workspace-one", auth.OperationRead, Limits{
+			RetrievalTopK: 20, GraphDepth: 4, GraphFanout: 30,
+			GraphNodes: 200, OutputBytes: 1 << 20,
+		}, []auth.Policy{baseOutput})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -291,6 +248,109 @@ func TestProviderAppliesOnlyNarrowingAndPreservesDecision(t *testing.T) {
 	}
 }
 
+func TestEffectiveDecisionCannotReplaceIssuerSelectedOntology(t *testing.T) {
+	firstOntology, secondOntology := testOntologies(t)
+	base := testDecision(t, decisionOptions{ontology: firstOntology})
+	choices, err := NewStaticOntologyChoices(firstOntology, secondOntology)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := OpenDurableStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	options := testProviderOptions(&mutableResolver{decision: base})
+	options.OntologyChoices = choices
+	provider, err := NewProvider(store, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := provider.Update(
+		context.Background(), "workspace", UpdateRequest{
+			MutationID: "replace",
+			Narrowing: UpdateNarrowing{
+				SelectedOntology: OntologySelection{
+					Present: true, Identity: secondOntology,
+				},
+			},
+		},
+	); !shoal.IsErrorCode(err, shoal.ErrorUnauthorized) {
+		t.Fatalf("replacement update error = %v, want unauthorized", err)
+	}
+	settings, err := provider.Update(
+		context.Background(), "workspace", UpdateRequest{
+			MutationID: "preserve",
+			Narrowing: UpdateNarrowing{
+				SelectedOntology: OntologySelection{
+					Present: true, Identity: firstOntology,
+				},
+			},
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	effective, err := provider.ApplyForOperation(
+		context.Background(), "workspace", auth.OperationRead,
+		testLimits(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	selected, ok := effective.Decision().SelectedOntology()
+	if !ok || selected != firstOntology {
+		t.Fatalf("selected ontology = %#v, %v", selected, ok)
+	}
+
+	settings.Narrowing.SelectedOntology.Identity = secondOntology
+	if _, err := DeriveEffectiveDecision(
+		context.Background(), base, settings, ApplyOptions{
+			Now: testNow, BaseLimits: testLimits(), OntologyChoices: choices,
+		},
+	); !shoal.IsErrorCode(err, shoal.ErrorUnauthorized) {
+		t.Fatalf("replacement derive error = %v, want unauthorized", err)
+	}
+}
+
+func TestSelectedOntologyCannotChangeAcrossSettingsRevisions(t *testing.T) {
+	firstOntology, secondOntology := testOntologies(t)
+	store, err := OpenDurableStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	created, err := store.CompareAndSwap(
+		context.Background(), "workspace", "owner", []byte("domain"),
+		0, "first", Narrowing{
+			SelectedOntology: OntologySelection{
+				Present: true, Identity: firstOntology,
+			},
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CompareAndSwap(
+		context.Background(), "workspace", "owner", []byte("domain"),
+		created.Revision, "replace", Narrowing{
+			SelectedOntology: OntologySelection{
+				Present: true, Identity: secondOntology,
+			},
+		},
+	); !shoal.IsErrorCode(err, shoal.ErrorUnauthorized) {
+		t.Fatalf("ontology replacement error = %v, want unauthorized", err)
+	}
+	current, err := store.Load(context.Background(), "workspace")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !current.Narrowing.SelectedOntology.Present ||
+		current.Narrowing.SelectedOntology.Identity != firstOntology ||
+		current.Revision != created.Revision {
+		t.Fatalf("ontology replacement changed settings: %#v", current)
+	}
+}
+
 func TestExplicitEmptyScopeDiffersFromOmission(t *testing.T) {
 	store, err := OpenDurableStore(t.TempDir())
 	if err != nil {
@@ -324,8 +384,9 @@ func TestExplicitEmptyScopeDiffersFromOmission(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		effective, err := provider.Effective(
-			context.Background(), test.id, testLimits(), nil)
+		effective, err := provider.ApplyForOperation(
+			context.Background(), test.id, auth.OperationRead,
+			testLimits(), nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -503,7 +564,9 @@ func TestProviderRevalidatesRevokedDecisionAndOwnership(t *testing.T) {
 	resolver.set(testDecision(t, decisionOptions{
 		sources: [][]byte{[]byte("source-a")},
 	}))
-	_, err = provider.Effective(context.Background(), "owned", testLimits(), nil)
+	_, err = provider.ApplyForOperation(
+		context.Background(), "owned", auth.OperationRead,
+		testLimits(), nil)
 	if !shoal.IsErrorCode(err, shoal.ErrorUnauthorized) {
 		t.Fatalf("revoked source application error = %v", err)
 	}
@@ -650,8 +713,9 @@ func TestSelectableLensPreservesSettingsAndDoesNotLeakAcrossCallers(t *testing.T
 		len(selected.Narrowing.OutputPolicies) != 1 {
 		t.Fatalf("lens selection did not preserve settings: %#v", selected)
 	}
-	effective, err := provider.Apply(
-		context.Background(), "lens-workspace", testLimits(), nil)
+	effective, err := provider.ApplyForOperation(
+		context.Background(), "lens-workspace", auth.OperationRead,
+		testLimits(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -683,8 +747,9 @@ func TestSelectableLensPreservesSettingsAndDoesNotLeakAcrossCallers(t *testing.T
 	callerChoices.bySubject["owner"] = []OntologyChoice{
 		{Identity: first, Active: true},
 	}
-	if _, err := provider.Apply(
-		context.Background(), "lens-workspace", testLimits(), nil,
+	if _, err := provider.ApplyForOperation(
+		context.Background(), "lens-workspace", auth.OperationRead,
+		testLimits(), nil,
 	); !shoal.IsErrorCode(err, shoal.ErrorUnauthorized) {
 		t.Fatalf("revoked selected lens apply error = %v", err)
 	}
@@ -875,7 +940,7 @@ func TestServiceCeilingConstrainsOutputPolicies(t *testing.T) {
 
 func TestSettingsRevisionAndOntologyPartitionCaches(t *testing.T) {
 	firstOntology, secondOntology := testOntologies(t)
-	base := testDecision(t, decisionOptions{ontology: firstOntology})
+	base := testDecision(t, decisionOptions{})
 	choices, _ := NewStaticOntologyChoices(firstOntology, secondOntology)
 	first := Settings{
 		WorkspaceID: "workspace", Owner: base.Subject(),
