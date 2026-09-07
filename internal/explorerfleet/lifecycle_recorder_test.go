@@ -106,7 +106,7 @@ func TestLifecycleRecorderRetryIsByteStable(t *testing.T) {
 		t.Fatalf("record attempts = %d", len(store.requests))
 	}
 	expectedID := interaction.DerivedID(
-		"session", "fleet.lifecycle.v1", string(lifecycle.Operation),
+		"session", "fleet.lifecycle.v2", string(lifecycle.Operation),
 		string(lifecycle.RequestID), string(lifecycle.AgentID),
 	)
 	if lifecycleSessionID(lifecycle) != expectedID {
@@ -114,6 +114,39 @@ func TestLifecycleRecorderRetryIsByteStable(t *testing.T) {
 			"lifecycle session ID = %q, want %q",
 			lifecycleSessionID(lifecycle), expectedID,
 		)
+	}
+}
+
+func TestLifecycleRecorderReconcilesLegacyReceiptBeforeWritingV2(t *testing.T) {
+	lifecycle := testLifecycle()
+	accepted := lifecycleSession(lifecycle)
+	accepted.ID = legacyLifecycleSessionID(lifecycle)
+	accepted.RecordedAt = lifecycle.SnapshotAsOf.Add(time.Second)
+	accepted.Actor = interaction.ActorContext{
+		SubjectID: lifecycle.Subject, ActorID: lifecycle.Actor,
+		ClientID:   lifecycle.ClientID,
+		OnBehalfOf: append([]shoal.ID(nil), lifecycle.OnBehalfOf...),
+	}
+	accepted.Reason, _ = interaction.NewReason(
+		"audit_purpose", lifecycle.AuditPurpose,
+	)
+	store := &reconcilingLifecycleStore{
+		trustedLifecycleRecorder: trustedLifecycleRecorder{
+			lifecycle: lifecycle,
+		},
+		stored: accepted,
+	}
+	recorder, err := NewLifecycleRecorderWithReader(store, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := recorder.RecordLifecycle(
+		context.Background(), lifecycle,
+	); err != nil {
+		t.Fatalf("legacy receipt reconciliation = %v", err)
+	}
+	if len(store.requests) != 0 {
+		t.Fatalf("v2 receipt was written despite legacy match: %d", len(store.requests))
 	}
 }
 
@@ -403,10 +436,10 @@ func (r *reconcilingLifecycleStore) RecordInteractionResult(
 }
 
 func (r *reconcilingLifecycleStore) InteractionRecord(
-	context.Context,
-	shoal.ID,
+	_ context.Context,
+	id shoal.ID,
 ) (explorer.InteractionRecord, error) {
-	if r.stored.ID == "" {
+	if r.stored.ID == "" || r.stored.ID != id {
 		return explorer.InteractionRecord{}, shoal.NewError(
 			shoal.ErrorNotFound, "interaction receipt not found",
 		)

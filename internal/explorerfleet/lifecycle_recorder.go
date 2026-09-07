@@ -5,9 +5,13 @@ package explorerfleet
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
+	"hash"
 	"reflect"
+	"strconv"
 
 	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/explorer/fleet"
@@ -85,6 +89,21 @@ func (r *LifecycleRecorder) RecordLifecycle(
 		return err
 	}
 	requested := lifecycleSession(lifecycle)
+	if r.read != nil {
+		legacyRequested := requested
+		legacyRequested.ID = legacyLifecycleSessionID(lifecycle)
+		record, readErr := r.read(
+			context.WithoutCancel(ctx), legacyRequested.ID,
+		)
+		if readErr == nil {
+			if err := validateLifecycleReplay(
+				record.Session, legacyRequested, lifecycle,
+			); err != nil {
+				return err
+			}
+			return nil
+		}
+	}
 	persisted, recordErr := r.record(ctx, requested)
 	if recordErr != nil {
 		if r.read != nil {
@@ -224,11 +243,52 @@ func lifecycleSession(lifecycle fleet.Lifecycle) interaction.Session {
 func lifecycleSessionID(lifecycle fleet.Lifecycle) shoal.ID {
 	return interaction.DerivedID(
 		"session",
-		"fleet.lifecycle.v1",
+		"fleet.lifecycle.v2",
 		string(lifecycle.Operation),
 		string(lifecycle.RequestID),
 		string(lifecycle.AgentID),
 	)
+}
+
+func legacyLifecycleSessionID(lifecycle fleet.Lifecycle) shoal.ID {
+	digest := sha256.New()
+	writeLifecycleField(digest, []byte("shoal.fleet.lifecycle.v1"))
+	writeLifecycleField(digest, []byte(lifecycle.Operation))
+	writeLifecycleField(digest, []byte(lifecycle.RequestID))
+	writeLifecycleField(digest, []byte(lifecycle.CorrelationID))
+	writeLifecycleField(digest, []byte(lifecycle.Subject))
+	writeLifecycleField(digest, []byte(lifecycle.Actor))
+	writeLifecycleField(digest, []byte(lifecycle.ClientID))
+	for _, id := range lifecycle.OnBehalfOf {
+		writeLifecycleField(digest, []byte(id))
+	}
+	writeLifecycleField(digest, []byte(lifecycle.AgentID))
+	writeLifecycleField(digest, lifecycle.MutationDigest[:])
+	writeLifecycleField(
+		digest, []byte(strconv.FormatInt(lifecycle.Deadline, 10)))
+	writeLifecycleField(
+		digest, []byte(lifecycle.AuthorizationFingerprint.String()))
+	writeLifecycleField(
+		digest,
+		[]byte(lifecycle.AuthorizationExpiresAt.UTC().Format(
+			"2006-01-02T15:04:05.999999999Z07:00")),
+	)
+	writeLifecycleField(digest, []byte(lifecycle.AuditPurpose))
+	writeLifecycleField(digest, []byte(lifecycle.SnapshotID))
+	writeLifecycleField(
+		digest,
+		[]byte(lifecycle.SnapshotAsOf.UTC().Format(
+			"2006-01-02T15:04:05.999999999Z07:00")),
+	)
+	return interaction.DerivedID(
+		"session", hex.EncodeToString(digest.Sum(nil)))
+}
+
+func writeLifecycleField(digest hash.Hash, value []byte) {
+	var length [8]byte
+	binary.BigEndian.PutUint64(length[:], uint64(len(value)))
+	_, _ = digest.Write(length[:])
+	_, _ = digest.Write(value)
 }
 
 func committedLifecycleError(recordErr, validationErr error) error {

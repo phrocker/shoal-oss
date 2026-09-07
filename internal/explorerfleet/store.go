@@ -25,6 +25,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"reflect"
 	"time"
 
@@ -180,6 +181,7 @@ func (s *Store) Apply(ctx context.Context, mutation fleet.Mutation) (fleet.Store
 		return fleet.Stored{}, err
 	}
 	if mutation.ExpectedGeneration < 0 ||
+		mutation.ExpectedGeneration == math.MaxInt64 ||
 		mutation.Descriptor.Generation != mutation.ExpectedGeneration+1 {
 		return fleet.Stored{}, shoal.NewError(shoal.ErrorInvalidArgument, "fleet generation transition is invalid")
 	}
