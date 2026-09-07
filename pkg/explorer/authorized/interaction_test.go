@@ -532,6 +532,103 @@ func TestAuthorizedInteractionReauthorizesExactSourceEdge(t *testing.T) {
 	}
 }
 
+func TestFleetActionInteractionSinkUsesLifecycleOperationForEvidence(t *testing.T) {
+	f := newFixture(t)
+	receipt, err := f.clientA.Ingest(f.admin(t), explorer.Source{
+		URI: "file:///dispatch-evidence.txt", MediaType: explorer.MediaTypeText,
+		Content: "dispatch evidence",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	view, err := f.clientA.Document(
+		f.admin(t), receipt.Document.ID, receipt.Revision.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	edge := graph.Edge{
+		ID: "dispatch-evidence-edge", From: receipt.Document.ID,
+		To: firstSpanID(t, view), Type: "supports", Weight: 1,
+	}
+	if err := f.clientA.Connect(f.admin(t), edge); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := f.base.Snapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.clock.Set(snapshot.AsOf.Add(time.Second))
+	decision := f.decision(
+		t, "dispatch-only", [][]byte{f.sourceA}, [][]byte{f.policyA},
+		[]auth.Operation{auth.OperationDispatch},
+	)
+	fingerprint, err := auth.AuthorizationFingerprint(decision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := interaction.Session{
+		ID:         interaction.DerivedID("session", "dispatch-evidence"),
+		Operation:  interaction.OperationToolCall,
+		SnapshotID: shoal.ID(snapshot.ID), SnapshotAsOf: snapshot.AsOf,
+		AuthorizationFingerprint: shoal.ID(fingerprint.String()),
+		AuthorizationExpiresAt:   decision.AuthenticationExpires(),
+		SeedNodeIDs:              []shoal.ID{edge.From, edge.To},
+		SeedEvidence: []interaction.EvidenceReference{
+			exactAuthorizedGraphEvidence(t, f.base, edge),
+		},
+	}
+	sink := f.clientA.FleetActionInteractionSink(auth.OperationDispatch)
+	if sink == nil {
+		t.Fatal("dispatch interaction sink is unavailable")
+	}
+	stored, err := sink.RecordInteractionResult(f.context(t, decision), session)
+	if err != nil {
+		t.Fatalf("dispatch-only lifecycle evidence = %v", err)
+	}
+	if stored.AuthorizationOperation != string(auth.OperationDispatch) {
+		t.Fatalf("authorization operation = %q", stored.AuthorizationOperation)
+	}
+	invokeDecision := f.decision(
+		t, "invoke-only", [][]byte{f.sourceA}, [][]byte{f.policyA},
+		[]auth.Operation{auth.OperationInvoke},
+	)
+	invokeFingerprint, err := auth.AuthorizationFingerprint(invokeDecision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	invokeSession := session
+	invokeSession.ID = interaction.DerivedID("session", "invoke-evidence")
+	invokeSession.AuthorizationFingerprint =
+		shoal.ID(invokeFingerprint.String())
+	invokeSession.AuthorizationExpiresAt =
+		invokeDecision.AuthenticationExpires()
+	invokeSink := f.clientA.FleetActionInteractionSink(auth.OperationInvoke)
+	if invokeSink == nil {
+		t.Fatal("invoke interaction sink is unavailable")
+	}
+	if _, err := invokeSink.RecordInteractionResult(
+		f.context(t, invokeDecision), invokeSession,
+	); err != nil {
+		t.Fatalf("invoke-only lifecycle evidence = %v", err)
+	}
+
+	hidden := f.newClient(
+		t, f.base,
+		edgeHidingInteractionStore{
+			PolicyStore: f.store,
+			hidden:      edge.ID,
+		},
+		f.sourceA, f.policyA, nil,
+	)
+	hiddenSink := hidden.FleetActionInteractionSink(auth.OperationDispatch)
+	session.ID = interaction.DerivedID("session", "hidden-dispatch-evidence")
+	if _, err := hiddenSink.RecordInteractionResult(
+		f.context(t, decision), session,
+	); !shoal.IsErrorCode(err, shoal.ErrorNotFound) {
+		t.Fatalf("hidden exact evidence = %v", err)
+	}
+}
+
 func TestAuthorizedRecorderSetupRequiresLiveCredential(t *testing.T) {
 	f := newFixture(t)
 	if err := f.clientA.EnsureInteractionSink(

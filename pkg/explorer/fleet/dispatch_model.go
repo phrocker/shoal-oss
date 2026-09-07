@@ -236,6 +236,58 @@ type ExecutionResult struct {
 	Evidence             []EvidenceRef
 }
 
+// ActionTransition is the immutable, durable event outbox entry created in the
+// same transaction as an action-state mutation.
+type ActionTransition struct {
+	ID     []byte
+	Kind   string
+	Record ActionRecord
+}
+
+// NewActionTransition snapshots the exact event-producing state of one
+// committed dispatch transition.
+func NewActionTransition(
+	id []byte, kind string, record ActionRecord,
+) (ActionTransition, error) {
+	switch kind {
+	case "action.enqueued":
+	case "action.claimed":
+	case "action.completed":
+	case "action.failed":
+	case "action.canceled":
+	default:
+		return ActionTransition{}, shoal.NewError(
+			shoal.ErrorInvalidArgument, "fleet action transition kind is invalid")
+	}
+	if actionEventKind(record) != kind {
+		return ActionTransition{}, shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			"fleet action transition kind does not match action state")
+	}
+	result := ActionTransition{
+		ID: append([]byte(nil), id...), Kind: kind, Record: cloneActionRecord(record),
+	}
+	if err := result.Validate(); err != nil {
+		return ActionTransition{}, err
+	}
+	return result, nil
+}
+
+func (t ActionTransition) Validate() error {
+	if err := validateOpaque("transition ID", t.ID, false); err != nil {
+		return err
+	}
+	if err := t.Record.Validate(); err != nil {
+		return err
+	}
+	if actionEventKind(t.Record) != t.Kind {
+		return shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			"fleet action transition kind does not match action state")
+	}
+	return nil
+}
+
 type ActionExecutor interface {
 	Execute(context.Context, Invocation) (ExecutionResult, error)
 }
@@ -244,6 +296,7 @@ type DispatchMutation struct {
 	Token           []byte
 	ExpectedVersion uint64
 	ExpectedFence   uint64
+	TransitionKind  string
 	Record          ActionRecord
 }
 
@@ -251,6 +304,14 @@ type DispatchStore interface {
 	GetAction(context.Context, []byte) (ActionRecord, error)
 	ApplyAction(context.Context, DispatchMutation) (ActionRecord, error)
 	ScanActions(context.Context, []byte, int) (ActionPage, error)
+}
+
+type ActionTransitionStore interface {
+	DispatchStore
+	PendingActionTransitions(
+		context.Context, []byte, []byte, int,
+	) (ActionTransitionPage, error)
+	CompleteActionTransition(context.Context, ActionTransition) error
 }
 
 type ActionAudit struct {
@@ -266,8 +327,12 @@ type ActionRecorder interface {
 }
 
 type ActionEventPublisher interface {
-	// PublishActionEvent must be idempotent for kind, action ID, and version.
 	PublishActionEvent(context.Context, string, ActionRecord) error
+}
+
+type ActionTransitionPage struct {
+	Transitions []ActionTransition
+	Next        []byte
 }
 
 type DispatchConfig struct {
@@ -750,16 +815,21 @@ func cloneActionRecord(input ActionRecord) ActionRecord {
 	result.ClaimID = append([]byte(nil), input.ClaimID...)
 	result.CancelKey = append([]byte(nil), input.CancelKey...)
 	result.ExecutorKey = append([]byte(nil), input.ExecutorKey...)
-	result.Evidence = make([]EvidenceRef, len(input.Evidence))
-	for i, evidence := range input.Evidence {
-		result.Evidence[i] = evidence
-		result.Evidence[i].NodeIDs = append(
+	result.Evidence = cloneActionEvidence(input.Evidence)
+	return result
+}
+
+func cloneActionEvidence(input []EvidenceRef) []EvidenceRef {
+	result := make([]EvidenceRef, len(input))
+	for i, evidence := range input {
+		result[i] = evidence
+		result[i].NodeIDs = append(
 			[]shoal.ID(nil), evidence.NodeIDs...)
-		result.Evidence[i].EdgeIDs = append(
+		result[i].EdgeIDs = append(
 			[]shoal.ID(nil), evidence.EdgeIDs...)
-		result.Evidence[i].Assertions = append(
+		result[i].Assertions = append(
 			[]interaction.AssertionReference(nil), evidence.Assertions...)
-		result.Evidence[i].Visibility = append([]string(nil), evidence.Visibility...)
+		result[i].Visibility = append([]string(nil), evidence.Visibility...)
 	}
 	return result
 }

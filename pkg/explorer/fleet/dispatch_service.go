@@ -20,6 +20,7 @@ import (
 
 type DispatchService struct {
 	store    DispatchStore
+	outbox   ActionTransitionStore
 	registry *Service
 	resolver auth.Resolver
 	recorder ActionRecorder
@@ -32,10 +33,18 @@ func NewDispatchService(config DispatchConfig) (*DispatchService, error) {
 		config.Recorder == nil || config.Events == nil || config.Clock == nil {
 		return nil, shoal.NewError(shoal.ErrorInvalidArgument, "fleet dispatch dependencies are required")
 	}
-	return &DispatchService{
+	outbox, ok := config.Store.(ActionTransitionStore)
+	if !ok {
+		return nil, shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			"durable fleet action transition store is required")
+	}
+	service := &DispatchService{
 		store: config.Store, registry: config.Registry, resolver: config.Resolver,
 		recorder: config.Recorder, events: config.Events, clock: config.Clock,
-	}, nil
+		outbox: outbox,
+	}
+	return service, nil
 }
 
 func (s *DispatchService) Enqueue(ctx context.Context, request EnqueueRequest) (ActionRecord, error) {
@@ -108,7 +117,9 @@ func (s *DispatchService) enqueue(
 	}
 	if current, readErr := s.store.GetAction(ctx, request.ID); readErr == nil {
 		if equivalentEnqueue(current, record) {
-			if err := s.events.PublishActionEvent(ctx, actionEventKind(current), current); err != nil {
+			if err := s.publishTransition(
+				context.WithoutCancel(ctx), actionEventKind(current), current,
+			); err != nil {
 				return ActionRecord{}, errors.Join(ErrActionCommitted, err)
 			}
 			return cloneActionRecord(current), nil
@@ -123,12 +134,14 @@ func (s *DispatchService) enqueue(
 	stored, err := s.store.ApplyAction(ctx, DispatchMutation{
 		Token: transitionToken(
 			"enqueue", request.ID, request.IdempotencyKey, record.Version),
-		ExpectedVersion: 0, Record: record,
+		ExpectedVersion: 0, TransitionKind: "action.enqueued", Record: record,
 	})
 	if err != nil {
 		return ActionRecord{}, err
 	}
-	if err := s.events.PublishActionEvent(ctx, "action.enqueued", stored); err != nil {
+	if err := s.publishTransition(
+		context.WithoutCancel(ctx), "action.enqueued", stored,
+	); err != nil {
 		return ActionRecord{}, errors.Join(ErrActionCommitted, err)
 	}
 	return cloneActionRecord(stored), nil
@@ -150,7 +163,9 @@ func (s *DispatchService) Invoke(ctx context.Context, request InvokeRequest) (Ac
 		if currentErr != nil {
 			return ActionRecord{}, currentErr
 		}
-		if err := s.events.PublishActionEvent(ctx, actionEventKind(current), current); err != nil {
+		if err := s.publishTransition(
+			context.WithoutCancel(ctx), actionEventKind(current), current,
+		); err != nil {
 			return ActionRecord{}, errors.Join(ErrActionCommitted, err)
 		}
 		return current, nil
@@ -195,7 +210,9 @@ func (s *DispatchService) Claim(ctx context.Context, request ClaimRequest) (Acti
 			current.Version == request.ExpectedVersion+1 &&
 			bytes.Equal(current.ClaimID, request.ClaimID) &&
 			current.ClaimLease == request.Lease {
-			if err := s.events.PublishActionEvent(ctx, "action.claimed", current); err != nil {
+			if err := s.publishTransition(
+				context.WithoutCancel(ctx), "action.claimed", current,
+			); err != nil {
 				return ActionRecord{}, errors.Join(ErrActionCommitted, err)
 			}
 			return cloneActionRecord(current), nil
@@ -238,12 +255,15 @@ func (s *DispatchService) Claim(ctx context.Context, request ClaimRequest) (Acti
 	}
 	stored, err := s.store.ApplyAction(ctx, DispatchMutation{
 		Token:           transitionToken("claim", request.ID, request.ClaimID, next.Version),
-		ExpectedVersion: current.Version, ExpectedFence: current.ClaimFence, Record: next,
+		ExpectedVersion: current.Version, ExpectedFence: current.ClaimFence,
+		TransitionKind: "action.claimed", Record: next,
 	})
 	if err != nil {
 		return ActionRecord{}, err
 	}
-	if err := s.events.PublishActionEvent(ctx, "action.claimed", stored); err != nil {
+	if err := s.publishTransition(
+		context.WithoutCancel(ctx), "action.claimed", stored,
+	); err != nil {
 		return ActionRecord{}, errors.Join(ErrActionCommitted, err)
 	}
 	return cloneActionRecord(stored), nil
@@ -277,7 +297,9 @@ func (s *DispatchService) ExecuteClaim(ctx context.Context, claimed ActionRecord
 	if current.State.terminal() && current.Version == claimed.Version+1 &&
 		current.ClaimFence == claimed.ClaimFence &&
 		bytes.Equal(current.ClaimID, claimed.ClaimID) {
-		if err := s.events.PublishActionEvent(ctx, actionEventKind(current), current); err != nil {
+		if err := s.publishTransition(
+			context.WithoutCancel(ctx), actionEventKind(current), current,
+		); err != nil {
 			return ActionRecord{}, errors.Join(ErrActionCommitted, err)
 		}
 		return cloneActionRecord(current), nil
@@ -426,12 +448,15 @@ func (s *DispatchService) ExecuteClaim(ctx context.Context, claimed ActionRecord
 	}
 	stored, err := s.store.ApplyAction(ctx, DispatchMutation{
 		Token:           transitionToken("complete", current.ID, current.ExecutorKey, next.Version),
-		ExpectedVersion: current.Version, ExpectedFence: current.ClaimFence, Record: next,
+		ExpectedVersion: current.Version, ExpectedFence: current.ClaimFence,
+		TransitionKind: actionEventKind(next), Record: next,
 	})
 	if err != nil {
 		return ActionRecord{}, errors.Join(ErrExecutionAmbiguous, err)
 	}
-	if err := s.events.PublishActionEvent(ctx, actionEventKind(stored), stored); err != nil {
+	if err := s.publishTransition(
+		context.WithoutCancel(ctx), actionEventKind(stored), stored,
+	); err != nil {
 		return ActionRecord{}, errors.Join(ErrActionCommitted, err)
 	}
 	if executionErr != nil {
@@ -491,7 +516,9 @@ func (s *DispatchService) Cancel(ctx context.Context, request CancelRequest) (Ac
 		if current.State == DispatchCanceled &&
 			current.Version == request.ExpectedVersion+1 &&
 			bytes.Equal(current.CancelKey, request.MutationKey) {
-			if err := s.events.PublishActionEvent(ctx, "action.canceled", current); err != nil {
+			if err := s.publishTransition(
+				context.WithoutCancel(ctx), "action.canceled", current,
+			); err != nil {
 				return ActionRecord{}, errors.Join(ErrActionCommitted, err)
 			}
 			return cloneActionRecord(current), nil
@@ -527,12 +554,15 @@ func (s *DispatchService) Cancel(ctx context.Context, request CancelRequest) (Ac
 	stored, err := s.store.ApplyAction(ctx, DispatchMutation{
 		Token: transitionToken(
 			"cancel", request.ID, request.MutationKey, next.Version),
-		ExpectedVersion: current.Version, ExpectedFence: current.ClaimFence, Record: next,
+		ExpectedVersion: current.Version, ExpectedFence: current.ClaimFence,
+		TransitionKind: "action.canceled", Record: next,
 	})
 	if err != nil {
 		return ActionRecord{}, err
 	}
-	if err := s.events.PublishActionEvent(ctx, "action.canceled", stored); err != nil {
+	if err := s.publishTransition(
+		context.WithoutCancel(ctx), "action.canceled", stored,
+	); err != nil {
 		return ActionRecord{}, errors.Join(ErrActionCommitted, err)
 	}
 	return cloneActionRecord(stored), nil
@@ -588,6 +618,50 @@ func (s *DispatchService) Pull(ctx context.Context, request PullActionsRequest) 
 		result.Actions = append(result.Actions, cloneActionRecord(record))
 	}
 	return result, nil
+}
+
+// ReconcileActionTransitions publishes and acknowledges every durable pending
+// transition for one action. Callers may use a fresh authorized context after
+// the original dispatch request has expired or after process restart.
+func (s *DispatchService) ReconcileActionTransitions(
+	ctx context.Context, actionID []byte,
+) error {
+	if err := validateOpaque("action ID", actionID, false); err != nil {
+		return err
+	}
+	var after []byte
+	for {
+		page, err := s.outbox.PendingActionTransitions(
+			ctx, actionID, after, MaxDispatchListResults)
+		if err != nil {
+			return err
+		}
+		for _, transition := range page.Transitions {
+			if err := s.events.PublishActionEvent(
+				ctx, transition.Kind, transition.Record); err != nil {
+				return err
+			}
+			if err := s.outbox.CompleteActionTransition(
+				ctx, transition); err != nil {
+				return err
+			}
+		}
+		if len(page.Next) == 0 {
+			return nil
+		}
+		after = append(after[:0], page.Next...)
+	}
+}
+
+func (s *DispatchService) publishTransition(
+	ctx context.Context, kind string, record ActionRecord,
+) error {
+	if actionEventKind(record) != kind {
+		return shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			"fleet action transition kind does not match action state")
+	}
+	return s.ReconcileActionTransitions(ctx, record.ID)
 }
 
 func (s *DispatchService) begin(ctx context.Context, operation auth.Operation, request RequestContext) (auth.Decision, time.Time, error) {

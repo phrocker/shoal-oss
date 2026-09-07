@@ -59,8 +59,9 @@ func (c *Client) EnsureInteractionSink(ctx context.Context) error {
 }
 
 type operationInteractionSink struct {
-	client    *Client
-	operation auth.Operation
+	client            *Client
+	operation         auth.Operation
+	evidenceOperation auth.Operation
 }
 
 // AnalyticsInteractionSink returns the durable interaction sink bound to the
@@ -84,6 +85,36 @@ func (c *Client) AnalyticsInteractionSink() interaction.ResultSink {
 	}
 	return operationInteractionSink{
 		client: c, operation: auth.OperationAnalyticsRead,
+		evidenceOperation: auth.OperationRetrieve,
+	}
+}
+
+// FleetActionInteractionSink returns a durable interaction sink whose session
+// and exact evidence are both authorized with the supplied fleet action
+// operation. Dispatch lifecycle evidence has already been admitted under that
+// operation and must not require the unrelated retrieve permission.
+func (c *Client) FleetActionInteractionSink(
+	operation auth.Operation,
+) interaction.ResultSink {
+	if c == nil ||
+		(operation != auth.OperationDispatch && operation != auth.OperationInvoke) {
+		return nil
+	}
+	writer, err := c.interactionWriter()
+	if err != nil {
+		return nil
+	}
+	if _, ok := writer.(interaction.ResultSink); !ok {
+		return nil
+	}
+	if isNilDependency(c.snapshotValidator) {
+		return nil
+	}
+	if _, ok := c.snapshotValidator.(EvidenceSnapshotValidator); !ok {
+		return nil
+	}
+	return operationInteractionSink{
+		client: c, operation: operation, evidenceOperation: operation,
 	}
 }
 
@@ -127,7 +158,8 @@ func (s operationInteractionSink) RecordInteractionResult(
 			shoal.ErrorUnavailable, "authorized interaction sink is unavailable")
 	}
 	session.AuthorizationOperation = string(s.operation)
-	return s.client.recordInteraction(ctx, session, true)
+	return s.client.recordInteractionWithEvidenceOperation(
+		ctx, session, true, s.evidenceOperation)
 }
 
 // RecordInteraction appends one redacted interaction after verifying that its
@@ -152,6 +184,14 @@ func (c *Client) RecordInteractionResult(
 
 func (c *Client) recordInteraction(
 	ctx context.Context, session interaction.Session, requireResult bool,
+) (interaction.Session, error) {
+	return c.recordInteractionWithEvidenceOperation(
+		ctx, session, requireResult, auth.OperationRetrieve)
+}
+
+func (c *Client) recordInteractionWithEvidenceOperation(
+	ctx context.Context, session interaction.Session, requireResult bool,
+	evidenceOperation auth.Operation,
 ) (interaction.Session, error) {
 	writer, err := c.interactionWriter()
 	if err != nil {
@@ -203,7 +243,7 @@ func (c *Client) recordInteraction(
 		canonical.TouchedNodeIDs(),
 		canonical.TouchedEdgeIDs(),
 		decision,
-		auth.OperationRetrieve,
+		evidenceOperation,
 		now,
 	); err != nil {
 		return interaction.Session{}, err

@@ -55,10 +55,12 @@ var (
 	createReceiptPrefix = []byte{1, 'C'}
 	deleteReceiptPrefix = []byte{1, 'D'}
 	floorRow            = []byte{1, 'F'}
+	publicationGCRow    = []byte{1, 'G'}
 	recordFamily        = []byte("r")
 	recordQualifier     = []byte("v1")
 	streamEntity        = guard.Entity{Kind: 'E', ID: coordination.EntityID("fleet-event-stream-v1")}
 	floorEntity         = guard.Entity{Kind: 'F', ID: coordination.EntityID("fleet-event-floor-v1")}
+	publicationGCEntity = guard.Entity{Kind: 'G', ID: coordination.EntityID("fleet-event-publication-gc-v1")}
 	logicalPolicy       = []byte("fleet-events/default")
 )
 
@@ -78,11 +80,12 @@ type Runtime interface {
 }
 
 type Adapter struct {
-	appendMu sync.Mutex
-	runtime  Runtime
-	domain   coordination.DomainID
-	now      func() time.Time
-	retained uint64
+	appendMu      sync.Mutex
+	runtime       Runtime
+	domain        coordination.DomainID
+	now           func() time.Time
+	retained      uint64
+	publicationGC []byte
 }
 
 type mutationAuditContextKey struct{}
@@ -150,6 +153,10 @@ func (value lifecycleReceiptWire) domain() fleetevents.LifecycleReceipt {
 
 type floorRecord struct {
 	Sequence uint64 `json:"sequence"`
+}
+
+type publicationGCRecord struct {
+	SweptAt time.Time `json:"swept_at"`
 }
 
 type subscriptionMutationReceipt struct {
@@ -828,9 +835,13 @@ func (a *Adapter) Append(
 	publicationID := digest("fleet-event-publication-id-v2", request.Token)
 	eventID := digest(
 		"fleet-event-id-v2", publicationID, encodeTime(request.RetryUntil))
+	if err := a.pruneExpiredPublications(ctx, now); err != nil &&
+		!errors.Is(err, transaction.ErrConflict) {
+		return fleetevents.PublishResult{}, translate(err)
+	}
 	for attempt := 0; attempt < 32; attempt++ {
 		if repeated, found, err := a.repeatedPublication(
-			ctx, publicationID, eventID, request,
+			ctx, publicationID, eventID, request, now,
 		); err != nil {
 			return fleetevents.PublishResult{}, translate(err)
 		} else if found {
@@ -917,9 +928,9 @@ func validateRetryWindow(
 
 func (a *Adapter) repeatedPublication(
 	ctx context.Context, publicationID, eventID []byte,
-	request fleetevents.PublishRequest,
+	request fleetevents.PublishRequest, now time.Time,
 ) (fleetevents.PublishResult, bool, error) {
-	existing, _, found, err := a.readPublicationEvent(ctx, eventID)
+	existing, _, found, err := a.readPublicationEvent(ctx, publicationID)
 	if err != nil {
 		return fleetevents.PublishResult{}, false, err
 	}
@@ -930,6 +941,9 @@ func (a *Adapter) repeatedPublication(
 		existing.RetryUntil.Location() != time.UTC {
 		return fleetevents.PublishResult{}, false, errors.New(
 			"fleet events: corrupt publication receipt")
+	}
+	if !now.Before(existing.RetryUntil) {
+		return fleetevents.PublishResult{}, false, nil
 	}
 	if !bytes.Equal(existing.Event.EventID, eventID) ||
 		!existing.RetryUntil.Equal(request.RetryUntil) {
@@ -984,9 +998,6 @@ func (a *Adapter) publishEvent(
 				return explorercoord.Result{}, errors.New(
 					"fleet events: corrupt retained publication receipt")
 			}
-			if now.Before(retired.RetryUntil) {
-				return explorercoord.Result{}, fleetevents.ErrRetentionCapacity
-			}
 			if retired.Event.Sequence != sequence-a.retained {
 				return explorercoord.Result{}, errors.New(
 					"fleet events: corrupt retained event sequence")
@@ -1009,6 +1020,7 @@ func (a *Adapter) publishEvent(
 	if err != nil {
 		return explorercoord.Result{}, err
 	}
+
 	cells := []explorercoord.Cell{
 		{
 			Table: Table, Row: append([]byte(nil), row...), Family: recordFamily,
@@ -1016,7 +1028,7 @@ func (a *Adapter) publishEvent(
 			EpochTimestamp: true, LPART: lpart, CopyGeneration: 1,
 		},
 		{
-			Table: Table, Row: publicationRow(eventID), Family: recordFamily,
+			Table: Table, Row: publicationRow(publicationID), Family: recordFamily,
 			Qualifier: recordQualifier, Value: append([]byte(nil), value...),
 			EpochTimestamp: true, LPART: lpart, CopyGeneration: 1,
 		},
@@ -1057,19 +1069,85 @@ func (a *Adapter) publishEvent(
 	}})
 }
 
+func (a *Adapter) pruneExpiredPublications(
+	ctx context.Context, now time.Time,
+) error {
+	page, err := a.runtime.ScanCommitted(ctx, explorercoord.CommittedScanRequest{
+		Table: Table, RowPrefix: publicationPrefix, Family: recordFamily,
+		Qualifier: recordQualifier, Limit: explorercoord.MaxPruneTargets,
+		StartAfterRow: a.publicationGC,
+		MaxScanned:    explorercoord.MaxCommittedScanCells,
+	})
+	if err != nil {
+		return err
+	}
+	if len(page.NextRow) == 0 {
+		a.publicationGC = nil
+	} else {
+		a.publicationGC = append(a.publicationGC[:0], page.NextRow...)
+	}
+	targets := make([]explorercoord.PruneTarget, 0, len(page.Cells))
+	tokenParts := make([][]byte, 0, len(page.Cells)+1)
+	tokenParts = append(tokenParts, encodeTime(now))
+	for _, cell := range page.Cells {
+		var record eventRecord
+		if err := json.Unmarshal(cell.Cell.Value, &record); err != nil {
+			return err
+		}
+		if record.RetryUntil.IsZero() ||
+			record.RetryUntil.Location() != time.UTC {
+			return errors.New("fleet events: corrupt publication receipt")
+		}
+		if now.Before(record.RetryUntil) {
+			continue
+		}
+		targets = append(targets, explorercoord.PruneTarget{
+			Table: Table, Cell: cell,
+			Entity: publicationEntity(record.Event.EventID),
+		})
+		tokenParts = append(tokenParts, record.Event.EventID)
+	}
+	if len(targets) == 0 {
+		return nil
+	}
+	lpart, err := explorercoord.Partition(a.domain, streamEntity.ID)
+	if err != nil {
+		return err
+	}
+	checkpointValue, err := json.Marshal(publicationGCRecord{SweptAt: now})
+	if err != nil {
+		return err
+	}
+	checkpointGuard, err := a.mutationGuard(
+		ctx, publicationGCEntity, encodeTime(now), lpart)
+	if err != nil {
+		return err
+	}
+	_, err = a.runtime.PruneCommitted(ctx, explorercoord.PruneCommittedRequest{
+		Operation: []byte("fleet-event-publication-gc-v1"),
+		Token:     digest("fleet-event-publication-gc-token-v1", tokenParts...),
+		Targets:   targets,
+		Checkpoint: explorercoord.PruneCheckpoint{
+			Cell: explorercoord.Cell{
+				Table: Table, Row: publicationGCRow, Family: recordFamily,
+				Qualifier: recordQualifier, Value: checkpointValue,
+				EpochTimestamp: true, LPART: lpart, CopyGeneration: 1,
+			},
+			Guard: checkpointGuard,
+		},
+		Results: []explorercoord.ResultIdentity{{
+			Kind: []byte("fleet-event-publication-gc-v1"),
+			ID:   encodeTime(now),
+		}},
+	})
+	return err
+}
+
 func (a *Adapter) pruneEvent(
 	ctx context.Context, retired eventRecord,
 	committed explorercoord.CommittedCell, floor uint64,
 	lpart coordination.LPART,
 ) error {
-	indexed, publicationCell, found, err := a.readPublicationEvent(
-		ctx, retired.Event.EventID)
-	if err != nil {
-		return err
-	}
-	if !found || !reflect.DeepEqual(indexed, retired) {
-		return errors.New("fleet events: corrupt publication index")
-	}
 	floorValue, err := json.Marshal(floorRecord{Sequence: floor})
 	if err != nil {
 		return err
@@ -1092,11 +1170,6 @@ func (a *Adapter) pruneEvent(
 				Table:  Table,
 				Cell:   committed,
 				Entity: a.eventSlotEntity(retired.Event.Sequence),
-			},
-			{
-				Table:  Table,
-				Cell:   publicationCell,
-				Entity: publicationEntity(retired.Event.EventID),
 			},
 		},
 		Checkpoint: explorercoord.PruneCheckpoint{
@@ -1256,9 +1329,9 @@ func (a *Adapter) readSlotEvent(
 }
 
 func (a *Adapter) readPublicationEvent(
-	ctx context.Context, eventID []byte,
+	ctx context.Context, publicationID []byte,
 ) (eventRecord, explorercoord.CommittedCell, bool, error) {
-	return a.readSlotEvent(ctx, publicationRow(eventID))
+	return a.readSlotEvent(ctx, publicationRow(publicationID))
 }
 
 func (a *Adapter) mutationGuard(
@@ -1372,20 +1445,20 @@ func eventRow(sequence uint64) []byte {
 	return row
 }
 
-func publicationRow(eventID []byte) []byte {
-	row := make([]byte, 0, len(publicationPrefix)+len(eventID))
+func publicationRow(publicationID []byte) []byte {
+	row := make([]byte, 0, len(publicationPrefix)+len(publicationID))
 	row = append(row, publicationPrefix...)
-	return append(row, eventID...)
+	return append(row, publicationID...)
 }
 
 func (a *Adapter) eventRow(sequence uint64) []byte {
 	return eventRow((sequence-1)%a.retained + 1)
 }
 
-func publicationEntity(eventID []byte) guard.Entity {
+func publicationEntity(publicationID []byte) guard.Entity {
 	return guard.Entity{
 		Kind: 'P',
-		ID:   coordination.EntityID(hex.EncodeToString(eventID)),
+		ID:   coordination.EntityID(hex.EncodeToString(publicationID)),
 	}
 }
 
