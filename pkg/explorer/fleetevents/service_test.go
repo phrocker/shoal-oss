@@ -36,6 +36,40 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
+func TestNewRejectsTypedNilDependencies(t *testing.T) {
+	var nilBackend *memoryBackend
+	var nilResolver *countingResolver
+	var nilGeneration *generationReader
+	var nilLease *leaseValidator
+	var nilAuditor *auditor
+	valid := Config{
+		Backend: &memoryBackend{}, Resolver: &countingResolver{},
+		GenerationReader: &generationReader{}, LeaseValidator: &leaseValidator{},
+		Auditor: &auditor{}, CursorKey: make([]byte, 32),
+	}
+	tests := []struct {
+		name   string
+		mutate func(*Config)
+	}{
+		{"backend", func(c *Config) { c.Backend = nilBackend }},
+		{"resolver", func(c *Config) { c.Resolver = nilResolver }},
+		{"generation reader", func(c *Config) { c.GenerationReader = nilGeneration }},
+		{"lease validator", func(c *Config) { c.LeaseValidator = nilLease }},
+		{"auditor", func(c *Config) { c.Auditor = nilAuditor }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			config := valid
+			test.mutate(&config)
+			if _, err := New(config); !shoal.IsErrorCode(
+				err, shoal.ErrorInvalidArgument,
+			) {
+				t.Fatalf("typed nil dependency = %v", err)
+			}
+		})
+	}
+}
+
 func TestDeriveIDLengthFramesOpaqueParts(t *testing.T) {
 	left := deriveID("opaque", []byte{'a', 0, 'b'}, []byte("c"))
 	right := deriveID("opaque", []byte("a"), []byte{'b', 0, 'c'})
@@ -125,8 +159,9 @@ func TestServiceRejectsTransportRacingLongPollBound(t *testing.T) {
 	_, err = New(Config{
 		Backend: &memoryBackend{}, Resolver: resolver,
 		GenerationReader: &generationReader{generation: 7},
-		LeaseValidator:   &leaseValidator{}, Auditor: &auditor{},
-		CursorKey: make([]byte, 32), Clock: func() time.Time { return now },
+		LeaseValidator:   &leaseValidator{},
+		Auditor:          &auditor{},
+		CursorKey:        make([]byte, 32), Clock: func() time.Time { return now },
 		PollInterval: time.Millisecond, MaxWait: 30 * time.Second,
 	})
 	if err == nil {
@@ -187,15 +222,16 @@ func TestPullResyncAndMidPageGenerationChange(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := service.Pull(context.Background(), PullRequest{
+	page, err := service.Pull(context.Background(), PullRequest{
 		SubscriptionID: subscription.ID, Limit: 2,
-	}); !errors.Is(err, ErrResyncRequired) ||
-		!shoal.IsErrorCode(err, shoal.ErrorConflict) {
-		t.Fatalf("overrun error = %v", err)
+	})
+	if err != nil || len(page.Events) != 2 {
+		t.Fatalf("current-floor initial pull = %#v, %v", page, err)
 	}
 	backend.floor = 1
+	changeAt := lease.calls + 3
 	lease.onCall = func(count int) {
-		if count == 4 {
+		if count == changeAt {
 			generation.generation = 8
 		}
 	}
@@ -574,10 +610,11 @@ func TestPublishLifecycleKeepsStableTokenAndRejectsBroadOperation(t *testing.T) 
 		t.Fatal(err)
 	}
 	backend := &memoryBackend{}
+	audit := &auditor{}
 	service, err := New(Config{
 		Backend: backend, Resolver: resolver,
 		GenerationReader: &generationReader{generation: 7},
-		LeaseValidator:   &leaseValidator{}, Auditor: &auditor{},
+		LeaseValidator:   &leaseValidator{}, Auditor: audit,
 		CursorKey: make([]byte, 32), Clock: func() time.Time { return now },
 	})
 	if err != nil {
@@ -607,6 +644,20 @@ func TestPublishLifecycleKeepsStableTokenAndRejectsBroadOperation(t *testing.T) 
 	if len(backend.tokens) != 1 ||
 		!bytes.Equal(backend.tokens[0], request.Token) {
 		t.Fatalf("lifecycle token = %x", backend.tokens)
+	}
+	if audit.reconciliations != 1 {
+		t.Fatalf("first lifecycle audit reconciliations = %d", audit.reconciliations)
+	}
+	if _, err := service.PublishLifecycle(
+		context.Background(), auth.OperationDispatch, request, receipt,
+	); err != nil {
+		t.Fatalf("exact lifecycle retry = %v", err)
+	}
+	if audit.reconciliations != 2 || len(backend.events) != 1 {
+		t.Fatalf(
+			"lifecycle retry reconciliations = %d, events = %d",
+			audit.reconciliations, len(backend.events),
+		)
 	}
 	if _, err := service.PublishLifecycle(
 		context.Background(), auth.OperationEventPublish, request, receipt,
@@ -903,9 +954,10 @@ func (v *leaseValidator) ValidateDelivery(
 }
 
 type auditor struct {
-	err     error
-	calls   int
-	records []AuditRecord
+	err             error
+	calls           int
+	reconciliations int
+	records         []AuditRecord
 }
 
 func (a *auditor) RecordFleetAction(_ context.Context, record AuditRecord) error {
@@ -916,6 +968,13 @@ func (a *auditor) RecordFleetAction(_ context.Context, record AuditRecord) error
 	record.Evidence = cloneEvidence(record.Evidence)
 	a.records = append(a.records, record)
 	return a.err
+}
+
+func (a *auditor) RecordFleetActionReconciliation(
+	ctx context.Context, record AuditRecord,
+) error {
+	a.reconciliations++
+	return a.RecordFleetAction(ctx, record)
 }
 
 type memoryBackend struct {
@@ -977,6 +1036,15 @@ func (b *memoryBackend) Delete(
 func (b *memoryBackend) Append(_ context.Context, request PublishRequest, _ time.Time) (PublishResult, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	for index, token := range b.tokens {
+		if bytes.Equal(token, request.Token) {
+			event := b.events[index]
+			return PublishResult{
+				EventID: event.EventID, Sequence: event.Sequence,
+				Repeated: true, Audit: request.Audit,
+			}, nil
+		}
+	}
 	event := request.Event
 	event.Sequence = uint64(len(b.events) + 1)
 	event.EventID = deriveID("test-event", request.Token)
@@ -990,6 +1058,15 @@ func (b *memoryBackend) Append(_ context.Context, request PublishRequest, _ time
 	}, nil
 }
 
+func (b *memoryBackend) CurrentStart(context.Context) (uint64, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.floor == 0 {
+		return 1, nil
+	}
+	return b.floor, nil
+}
+
 func (b *memoryBackend) Scan(
 	_ context.Context, next, frontier uint64, limit int,
 ) ([]Event, uint64, error) {
@@ -999,7 +1076,9 @@ func (b *memoryBackend) Scan(
 		return nil, 0, ErrResyncRequired
 	}
 	if frontier == 0 {
-		frontier = uint64(len(b.events))
+		if len(b.events) > 0 {
+			frontier = b.events[len(b.events)-1].Sequence
+		}
 	}
 	result := make([]Event, 0, limit)
 	for _, event := range b.events {
@@ -1007,8 +1086,12 @@ func (b *memoryBackend) Scan(
 			result = append(result, cloneEvent(event))
 		}
 	}
-	if len(result) == 0 && frontier < uint64(len(b.events)) {
-		frontier = uint64(len(b.events))
+	highWater := uint64(0)
+	if len(b.events) > 0 {
+		highWater = b.events[len(b.events)-1].Sequence
+	}
+	if len(result) == 0 && frontier < highWater {
+		frontier = highWater
 		for _, event := range b.events {
 			if event.Sequence >= next && event.Sequence <= frontier && len(result) < limit {
 				result = append(result, cloneEvent(event))

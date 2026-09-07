@@ -629,6 +629,64 @@ func TestFleetActionInteractionSinkUsesLifecycleOperationForEvidence(t *testing.
 	}
 }
 
+func TestFleetActionReconciliationPreservesChangedDurablePin(t *testing.T) {
+	f := newFixture(t)
+	snapshot, err := f.base.Snapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.clock.Set(snapshot.AsOf.Add(time.Second))
+	original := f.decision(
+		t, "fleet-reconcile", [][]byte{f.sourceA}, [][]byte{f.policyA},
+		[]auth.Operation{auth.OperationDispatch},
+	)
+	originalFingerprint, err := auth.AuthorizationFingerprint(original)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := interaction.Session{
+		ID:         interaction.DerivedID("session", "fleet-reconcile"),
+		RecordedAt: f.clock.Now(), Operation: interaction.OperationToolCall,
+		AuthorizationOperation: string(auth.OperationDispatch),
+		SnapshotID:             shoal.ID(snapshot.ID), SnapshotAsOf: snapshot.AsOf,
+		AuthorizationFingerprint: shoal.ID(originalFingerprint.String()),
+		AuthorizationExpiresAt:   original.AuthenticationExpires(),
+		RequestID:                original.RequestID(),
+	}
+	f.clock.Set(original.AuthenticationExpires().Add(time.Second))
+	refreshed := f.decision(
+		t, "fleet-reconcile", [][]byte{f.sourceA}, [][]byte{f.policyA},
+		[]auth.Operation{auth.OperationDispatch, auth.OperationInvoke},
+	)
+	refreshedFingerprint, err := auth.AuthorizationFingerprint(refreshed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if refreshedFingerprint == originalFingerprint {
+		t.Fatal("refreshed authorization fingerprint did not change")
+	}
+	sink := f.clientA.FleetActionInteractionSink(auth.OperationDispatch)
+	reconciler, ok := sink.(interface {
+		RecordReconciledInteractionResult(
+			context.Context, interaction.Session,
+		) (interaction.Session, error)
+	})
+	if !ok {
+		t.Fatal("fleet sink does not support durable reconciliation")
+	}
+	stored, err := reconciler.RecordReconciledInteractionResult(
+		f.context(t, refreshed), session)
+	if err != nil {
+		t.Fatalf("first-write reconciliation = %v", err)
+	}
+	if stored.AuthorizationFingerprint !=
+		shoal.ID(originalFingerprint.String()) ||
+		!stored.AuthorizationExpiresAt.Equal(original.AuthenticationExpires()) ||
+		stored.RequestID != original.RequestID() {
+		t.Fatalf("durable authorization receipt changed: %#v", stored)
+	}
+}
+
 func TestAuthorizedRecorderSetupRequiresLiveCredential(t *testing.T) {
 	f := newFixture(t)
 	if err := f.clientA.EnsureInteractionSink(

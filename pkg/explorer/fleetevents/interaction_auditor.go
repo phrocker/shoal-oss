@@ -53,6 +53,12 @@ type InteractionSnapshotProvider interface {
 	InteractionSnapshot(context.Context) (explorer.Snapshot, error)
 }
 
+type reconciliationResultSink interface {
+	RecordReconciledInteractionResult(
+		context.Context, interaction.Session,
+	) (interaction.Session, error)
+}
+
 func NewInteractionAuditor(
 	recorder *interaction.Recorder, snapshots InteractionSnapshotProvider,
 ) (*InteractionAuditor, error) {
@@ -146,6 +152,32 @@ func (a *InteractionAuditor) RecordFleetActionRetry(
 			"persisted fleet interaction receipt does not match request"))
 	}
 	return a.RecordFleetAction(ctx, record)
+}
+
+func (a *InteractionAuditor) RecordFleetActionReconciliation(
+	ctx context.Context, record AuditRecord,
+) error {
+	session, err := a.fleetActionSession(ctx, record)
+	if err != nil {
+		return err
+	}
+	result := a.result
+	if a.resultFor != nil {
+		result = a.resultFor(record.Operation)
+		if result == nil {
+			return shoal.NewError(
+				shoal.ErrorUnavailable,
+				"operation-bound interaction sink is unavailable")
+		}
+	}
+	reconciler, ok := result.(reconciliationResultSink)
+	if !ok {
+		return shoal.NewError(
+			shoal.ErrorUnavailable,
+			"trusted interaction reconciliation sink is unavailable")
+	}
+	persisted, err := reconciler.RecordReconciledInteractionResult(ctx, session)
+	return validateFleetReceipt(session, persisted, err)
 }
 
 func (a *InteractionAuditor) fleetActionSession(

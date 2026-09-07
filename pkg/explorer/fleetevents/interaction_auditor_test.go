@@ -385,6 +385,37 @@ func TestOperationInteractionAuditorSelectsBoundSink(t *testing.T) {
 	}
 }
 
+func TestOperationInteractionAuditorUsesTrustedReconciliationSink(t *testing.T) {
+	now := time.Date(2026, 9, 7, 10, 0, 0, 0, time.UTC)
+	sink := &auditSink{}
+	auditor, err := NewOperationInteractionAuditorWithReader(
+		func(auth.Operation) interaction.ResultSink { return sink },
+		sink, testAuditSnapshots{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record := AuditRecord{
+		Operation: auth.OperationDispatch, ActionID: []byte("action"),
+		RequestID: "original-request", ObjectID: []byte("event"),
+		AuthorizationFingerprint: auth.Fingerprint{1},
+		AuthorizationExpiresAt:   now.Add(time.Hour), OccurredAt: now,
+	}
+	if err := auditor.RecordFleetActionReconciliation(
+		context.Background(), record,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if sink.reconciliations != 1 || len(sink.sessions) != 1 ||
+		sink.sessions[0].RequestID != record.RequestID ||
+		!sink.sessions[0].RecordedAt.Equal(record.OccurredAt) {
+		t.Fatalf(
+			"reconciliation calls = %d, sessions = %#v",
+			sink.reconciliations, sink.sessions,
+		)
+	}
+}
+
 func TestInteractionAuditorRetryDoesNotCreateMissingReceipt(t *testing.T) {
 	now := time.Date(2026, 9, 6, 10, 0, 0, 0, time.UTC)
 	sink := &auditSink{readErr: shoal.NewError(shoal.ErrorNotFound, "missing")}
@@ -414,12 +445,13 @@ func (s *changingAuditSnapshots) InteractionSnapshot(
 }
 
 type auditSink struct {
-	sessions     []interaction.Session
-	mutateResult func(interaction.Session) interaction.Session
-	afterRecord  func()
-	receipt      interaction.Session
-	readErr      error
-	deleted      bool
+	sessions        []interaction.Session
+	reconciliations int
+	mutateResult    func(interaction.Session) interaction.Session
+	afterRecord     func()
+	receipt         interaction.Session
+	readErr         error
+	deleted         bool
 }
 
 func (*auditSink) EnsureInteractionSink(context.Context) error { return nil }
@@ -448,6 +480,13 @@ func (s *auditSink) RecordInteractionResult(
 	}
 	s.receipt = result
 	return result, nil
+}
+
+func (s *auditSink) RecordReconciledInteractionResult(
+	ctx context.Context, session interaction.Session,
+) (interaction.Session, error) {
+	s.reconciliations++
+	return s.RecordInteractionResult(ctx, session)
 }
 
 func (s *auditSink) InteractionRecord(

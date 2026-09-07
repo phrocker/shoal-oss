@@ -812,6 +812,9 @@ func (b *recordingBackend) Append(
 	b.request = request
 	return fleetevents.PublishResult{Audit: request.Audit}, nil
 }
+func (*recordingBackend) CurrentStart(context.Context) (uint64, error) {
+	return 1, nil
+}
 func (*recordingBackend) Scan(
 	context.Context, uint64, uint64, int,
 ) ([]fleetevents.Event, uint64, error) {

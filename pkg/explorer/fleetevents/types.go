@@ -203,6 +203,13 @@ type RetryAuditor interface {
 	RecordFleetActionRetry(context.Context, AuditRecord) error
 }
 
+// ReconciliationAuditor records the first audit receipt for a durable
+// lifecycle transition under fresh authorization while preserving the
+// transition's original authorization pins.
+type ReconciliationAuditor interface {
+	RecordFleetActionReconciliation(context.Context, AuditRecord) error
+}
+
 // LeaseValidator rechecks the target agent's durable lease and delegation
 // immediately before delivery. Implementations must not cache a success.
 type LeaseValidator interface {
@@ -216,6 +223,7 @@ type Backend interface {
 	Subscription(context.Context, []byte) (Subscription, error)
 	Delete(context.Context, []byte, shoal.ID, uint64, time.Time, time.Time) (Subscription, bool, error)
 	Append(context.Context, PublishRequest, time.Time) (PublishResult, error)
+	CurrentStart(context.Context) (uint64, error)
 	Scan(context.Context, uint64, uint64, int) ([]Event, uint64, error)
 }
 
