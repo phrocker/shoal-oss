@@ -90,10 +90,8 @@ func TestOpenServiceComposesFleetWithActionOnlyRecording(t *testing.T) {
 	}
 	decision, err := auth.NewDecision(auth.DecisionConfig{
 		Subject: "owner", Actor: "operator",
-		AuthorizationDomain: workspaceAuthorizationDomain,
-		AllowedOperations: []auth.Operation{
-			auth.OperationAgentRegister, auth.OperationAgentResolve,
-		},
+		AuthorizationDomain:   workspaceAuthorizationDomain,
+		AllowedOperations:     []auth.Operation{auth.OperationAgentRegister},
 		PermittedSourceIDs:    [][]byte{workspaceSourceID},
 		PermittedPolicyIDs:    [][]byte{workspaceGrantPolicyID},
 		PolicyGeneration:      workspacePolicyGeneration,
@@ -221,14 +219,35 @@ func TestOpenServiceComposesFleetWithActionOnlyRecording(t *testing.T) {
 	if recorded.ID == "" ||
 		recorded.Operation != interaction.OperationToolCall ||
 		recorded.AuthorizationOperation != string(auth.OperationAgentRegister) ||
-		recorded.AuthorizationFingerprint == "" ||
+		recorded.AuthorizationFingerprint !=
+			shoal.ID(mustAuthorizationFingerprint(t, decision).String()) ||
+		!recorded.AuthorizationExpiresAt.Equal(
+			decision.AuthenticationExpires()) ||
 		recorded.SnapshotID == "" ||
+		recorded.SnapshotAsOf.IsZero() ||
 		recorded.RequestID != decision.RequestID() ||
+		recorded.ResultID != descriptor.ID ||
 		recorded.Actor.SubjectID != decision.Subject() ||
 		recorded.Actor.ActorID != decision.Actor() ||
-		recorded.Reason != (interaction.Reason{}) {
+		recorded.Reason != (interaction.Reason{}) ||
+		len(recorded.Turns) != 1 ||
+		recorded.Turns[0].ToolCall == nil ||
+		recorded.Turns[0].ToolCall.Kind !=
+			"fleet.registry."+string(auth.OperationAgentRegister) {
 		t.Fatalf("fleet lifecycle interaction = %#v", recorded)
 	}
+}
+
+func mustAuthorizationFingerprint(
+	t *testing.T,
+	decision auth.Decision,
+) auth.Fingerprint {
+	t.Helper()
+	fingerprint, err := auth.AuthorizationFingerprint(decision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return fingerprint
 }
 
 func TestOpenServiceLongPollObservesPolicyOnlyRevocation(t *testing.T) {
