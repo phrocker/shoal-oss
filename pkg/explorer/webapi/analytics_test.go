@@ -105,7 +105,9 @@ func TestAnalyticsRouteUsesHostAndAuthenticationGuards(t *testing.T) {
 	invalidRequest.Header.Set("Content-Type", "application/json")
 	invalidResponse := httptest.NewRecorder()
 	handler.ServeHTTP(invalidResponse, invalidRequest)
-	if invalidResponse.Code != http.StatusInternalServerError {
+	if invalidResponse.Code != http.StatusServiceUnavailable ||
+		invalidResponse.Header().Get(webapi.CommitOutcomeHeader) !=
+			webapi.CommitOutcomeIndeterminate {
 		t.Fatalf("invalid provider response = %d %s",
 			invalidResponse.Code, invalidResponse.Body.String())
 	}

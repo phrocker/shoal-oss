@@ -208,6 +208,19 @@ func (c *Client) recordInteraction(
 				"interaction session ID already exists with different content",
 			)
 		}
+		storedVisibility, visibilityErr := interaction.ParseVisibility(
+			existing.Summary.Visibility)
+		requiredVisibility := interaction.RequiredVisibility(ctx)
+		combinedVisibility, combinedErr := interaction.Conjoin(
+			storedVisibility, requiredVisibility)
+		if visibilityErr != nil || combinedErr != nil ||
+			interaction.Expression(combinedVisibility) !=
+				interaction.Expression(storedVisibility) {
+			return interaction.Session{}, shoal.NewError(
+				shoal.ErrorConflict,
+				"interaction retry requires stricter output visibility",
+			)
+		}
 		if err := guard.Check(ctx); err != nil {
 			return interaction.Session{}, err
 		}

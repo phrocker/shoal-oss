@@ -216,7 +216,12 @@ func TestAuthorizedClientUsesRuntimeInteractionDependencies(t *testing.T) {
 	t.Cleanup(func() { _ = store.Close() })
 	authority := auth.NewAuthority()
 	client, err := authorizedClient(
-		embedded.Explorer, store, authority.Resolver(), time.Now,
+		embedded.Explorer, store, authority.Resolver(),
+		fixedGenerationReader{
+			domain:     workspaceAuthorizationDomain,
+			generation: workspacePolicyGeneration,
+		},
+		time.Now,
 		authorized.MosaicBudget{},
 	)
 	if err != nil {

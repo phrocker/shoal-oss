@@ -40,6 +40,7 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/explorer/coordination"
 	"github.com/phrocker/shoal-oss/pkg/explorer/coordination/transaction"
 	"github.com/phrocker/shoal-oss/pkg/explorer/webapi"
+	"github.com/phrocker/shoal-oss/pkg/explorer/workspace"
 	"github.com/phrocker/shoal-oss/pkg/model"
 	"github.com/phrocker/shoal-oss/pkg/ontology"
 )
@@ -65,15 +66,17 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 	stateDir := flags.String(
 		"state-dir", "",
 		"Recommended workspace state root. The corpus and durable policy "+
-			"catalog are created as corpus/ and policy/ inside it, so mounting "+
+			"catalog are created as corpus/ and policy/ inside it; workspace "+
+			"settings are stored in corpus/, so mounting "+
 			"this one directory as a volume persists everything a restart "+
 			"needs. Overrides -data when set",
 	)
 	data := flags.String(
 		"data", ".shoal/explorer",
 		"Legacy Explorer corpus directory (used when -state-dir is unset). The "+
-			"durable policy catalog is placed in a sibling directory; both must "+
-			"be persisted for the workspace to survive a restart",
+			"durable policy catalog is placed in a sibling directory; workspace "+
+			"settings are stored in the corpus, and both directories must be "+
+			"persisted for the workspace to survive a restart",
 	)
 	policyDirFlag := flags.String(
 		"policy-dir", "",
@@ -444,6 +447,12 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 		listener.Close()
 		return err
 	}
+	if opened.settings != nil {
+		if err := handler.SetWorkspaceSettingsProvider(opened.settings); err != nil {
+			listener.Close()
+			return err
+		}
+	}
 	// Browser login is optional and publishes only non-secret OIDC parameters.
 	// With -dev-auth, or an API-only OIDC configuration, auth-config reports
 	// unconfigured and the UI renders no login flow.
@@ -622,6 +631,7 @@ type serviceConfig struct {
 // development principal was granted.
 type openedService struct {
 	service    webapi.Service
+	settings   webapi.WorkspaceSettingsProvider
 	backfilled int
 	close      func()
 }
@@ -685,8 +695,13 @@ func openService(
 				return closed, err
 			}
 		}
+		generationReader := fixedGenerationReader{
+			domain:     workspaceAuthorizationDomain,
+			generation: workspacePolicyGeneration,
+		}
 		client, err := authorizedClient(
-			corpus, store, config.resolver, config.clock, config.mosaic)
+			corpus, store, config.resolver, generationReader,
+			config.clock, config.mosaic)
 		if err != nil {
 			store.Close()
 			embedded.Close()
@@ -719,10 +734,41 @@ func openService(
 				return closed, err
 			}
 		}
+		settingsStore, err := workspace.NewDurableStoreWithEngine(
+			embedded.Runtime.EmbeddedEngine())
+		if err != nil {
+			store.Close()
+			embedded.Close()
+			return closed, err
+		}
+		choices, err := webapi.NewGovernedOntologyChoices(service)
+		if err != nil {
+			settingsStore.Close()
+			store.Close()
+			embedded.Close()
+			return closed, err
+		}
+		settingsProvider, err := workspace.NewProvider(
+			settingsStore,
+			workspace.ProviderOptions{
+				Resolver:         config.resolver,
+				GenerationReader: generationReader,
+				OntologyChoices:  choices,
+				Clock:            config.clock,
+			},
+		)
+		if err != nil {
+			settingsStore.Close()
+			store.Close()
+			embedded.Close()
+			return closed, err
+		}
 		return openedService{
 			service:    service,
+			settings:   settingsProvider,
 			backfilled: backfilled,
 			close: func() {
+				settingsStore.Close()
 				store.Close()
 				embedded.Close()
 			},
@@ -867,6 +913,7 @@ func authorizedClient(
 	corpus *explorer.Explorer,
 	store authorized.PolicyStore,
 	resolver auth.Resolver,
+	generationReader auth.GenerationReader,
 	clock func() time.Time,
 	mosaic authorized.MosaicBudget,
 ) (*authorized.Client, error) {
@@ -887,11 +934,8 @@ func authorizedClient(
 		Resolver:              resolver,
 		PolicySelector:        selector,
 		PolicyStore:           store,
-		GenerationReader: fixedGenerationReader{
-			domain:     workspaceAuthorizationDomain,
-			generation: workspacePolicyGeneration,
-		},
-		Clock:  clock,
-		Mosaic: mosaic,
+		GenerationReader:      generationReader,
+		Clock:                 clock,
+		Mosaic:                mosaic,
 	})
 }

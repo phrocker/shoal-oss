@@ -78,6 +78,26 @@
       </div>
     </section>
     <aside class="right">
+      <section id="workspace-settings-panel" aria-labelledby="workspace-settings-heading">
+        <h2 id="workspace-settings-heading">Workspace settings</h2>
+        <form id="workspace-settings-form" class="workspace-settings-form">
+          <label for="workspace-settings-id">Workspace ID (opaque base64url)</label>
+          <input id="workspace-settings-id" autocomplete="off" spellcheck="false" aria-describedby="workspace-settings-help">
+          <div class="workspace-settings-actions">
+            <button id="workspace-settings-use" type="submit">Use workspace</button>
+            <button id="workspace-settings-new" type="button">New</button>
+            <button id="workspace-settings-clear" type="button">Clear</button>
+          </div>
+        </form>
+        <p id="workspace-settings-help" class="muted">The selected workspace narrows every Explorer request in this browser tab.</p>
+        <label for="workspace-settings-lens">Governed ontology lens</label>
+        <select id="workspace-settings-lens" disabled></select>
+        <div class="workspace-settings-actions">
+          <button id="workspace-settings-refresh" type="button" disabled>Refresh lenses</button>
+          <button id="workspace-settings-apply" type="button" disabled>Apply lens</button>
+        </div>
+        <p id="workspace-settings-status" class="muted" role="status" aria-live="polite">No workspace selected.</p>
+      </section>
       <section id="identity-panel" aria-labelledby="identity-heading">
         <h2 id="identity-heading">Identity</h2>
         <div id="identity" role="status" aria-live="polite">Identifying…</div>
@@ -88,6 +108,7 @@
       </section>
     </aside>
   </main>
+  <script src="/assets/workspace-settings.js"></script>
   <script src="/assets/app.js"></script>
 </body>
 </html>

@@ -965,6 +965,64 @@ func TestAuthorizedExactRetryUsesTrustedDurableRecord(t *testing.T) {
 	}
 }
 
+func TestAuthorizedExactRetryRejectsStricterRequiredVisibility(t *testing.T) {
+	f := newFixture(t)
+	snapshot, err := f.base.Snapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.clock.Set(snapshot.AsOf.Add(time.Second))
+	decision := f.decision(
+		t, "retry-visibility",
+		[][]byte{f.sourceA}, [][]byte{f.policyA},
+		[]auth.Operation{auth.OperationRetrieve},
+	)
+	fingerprint, err := auth.AuthorizationFingerprint(decision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := interaction.Session{
+		ID: interaction.DerivedID(
+			"session", "authorized-retry-visibility"),
+		Operation:                interaction.OperationRetrieval,
+		SnapshotID:               shoal.ID(snapshot.ID),
+		SnapshotAsOf:             snapshot.AsOf,
+		AuthorizationFingerprint: shoal.ID(fingerprint.String()),
+		AuthorizationExpiresAt:   decision.AuthenticationExpires(),
+	}
+	firstContext, err := interaction.WithRequiredVisibility(
+		f.context(t, decision), []string{"restricted"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := f.clientA.RecordInteractionResult(firstContext, session)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	f.clock.Set(f.clock.Now().Add(time.Second))
+	retryContext, err := interaction.WithRequiredVisibility(
+		f.context(t, decision), []string{"restricted", "sensitive"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.clientA.RecordInteractionResult(
+		retryContext, session,
+	); !shoal.IsErrorCode(err, shoal.ErrorConflict) {
+		t.Fatalf("stricter visibility retry error = %v", err)
+	}
+
+	record, err := f.base.InteractionRecord(context.Background(), session.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.Summary.Visibility != "restricted" ||
+		record.Session.ID != first.ID ||
+		!record.Session.RecordedAt.Equal(first.RecordedAt) {
+		t.Fatalf("stricter retry changed durable record: %+v", record)
+	}
+}
+
 func TestAuthorizedResultSinkExactRetryAfterReopen(t *testing.T) {
 	f := newFixture(t)
 	snapshot, err := f.base.Snapshot(context.Background())

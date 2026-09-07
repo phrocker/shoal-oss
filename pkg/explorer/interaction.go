@@ -181,6 +181,7 @@ func (e *Explorer) recordInteractionResult(
 		return interaction.Session{}, err
 	}
 	session = canonical
+	requiredVisibility := interaction.RequiredVisibility(ctx)
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if err := e.requireOpen(); err != nil {
@@ -198,6 +199,15 @@ func (e *Explorer) recordInteractionResult(
 		}
 	}
 	if existing, ok := e.interactions[session.ID]; ok {
+		if !visibilityCovered(
+			existing.Visibility,
+			interaction.Expression(requiredVisibility),
+		) {
+			return interaction.Session{}, shoal.NewError(
+				shoal.ErrorConflict,
+				"interaction retry requires stricter output visibility",
+			)
+		}
 		if err := interactionRetryResult(*existing, session); err != nil {
 			return interaction.Session{}, err
 		}
@@ -242,6 +252,11 @@ func (e *Explorer) recordInteractionResult(
 		e.visibilityResolverLocked(),
 		e.edgeVisibilityResolverLocked(),
 	)
+	if err != nil {
+		return interaction.Session{}, err
+	}
+	subgraph, err = interaction.ConjoinSubgraphVisibility(
+		subgraph, requiredVisibility)
 	if err != nil {
 		return interaction.Session{}, err
 	}

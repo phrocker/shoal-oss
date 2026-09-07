@@ -60,19 +60,33 @@ func TestPublishedOntologyCatalogUsesSettingsAuthorityWithoutProposalRead(
 		})
 	}
 
-	client := newOntologyCatalogClient(
-		t, corpus, corpus,
-		ontologyCatalogDecision(t, auth.OperationAnalyticsRead, []byte("source"), at),
-		func(context.Context, []byte) (int64, error) { return 1, nil },
-		nil, at,
-	)
-	if _, err := client.PublishedOntologyCatalog(
-		ctx, base,
-	); !shoal.IsErrorCode(err, shoal.ErrorUnauthorized) {
-		t.Fatalf("non-settings catalog read = %v", err)
+	targetIdentity := mustOntologyCatalogIdentity(t, target)
+	for _, operation := range []auth.Operation{
+		auth.OperationRetrieve,
+		auth.OperationAnalyticsRead,
+		auth.OperationInvoke,
+	} {
+		t.Run(string(operation)+"_membership", func(t *testing.T) {
+			client := newOntologyCatalogClient(
+				t, corpus, corpus,
+				ontologyCatalogDecision(t, operation, []byte("source"), at),
+				func(context.Context, []byte) (int64, error) { return 1, nil },
+				nil, at,
+			)
+			if _, err := client.PublishedOntologyCatalog(
+				ctx, base,
+			); !shoal.IsErrorCode(err, shoal.ErrorUnauthorized) {
+				t.Fatalf("non-settings catalog read = %v", err)
+			}
+			if err := client.AuthorizePublishedOntology(
+				ctx, base, targetIdentity, operation,
+			); err != nil {
+				t.Fatalf("published identity membership = %v", err)
+			}
+		})
 	}
 
-	client = newOntologyCatalogClient(
+	client := newOntologyCatalogClient(
 		t, corpus, nil,
 		ontologyCatalogDecision(
 			t, auth.OperationWorkspaceSettingsRead, []byte("source"), at),
