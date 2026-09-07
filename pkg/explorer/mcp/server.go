@@ -850,6 +850,51 @@ func withBoundHTTPDecision(
 	return context.WithValue(ctx, boundHTTPDecisionKey{}, decision)
 }
 
+func (s *Server) bindHTTPSessionDecision(
+	ctx context.Context,
+	decision auth.Decision,
+	correlationID shoal.ID,
+) (context.Context, error) {
+	if s == nil || isAbsent(s.binder) {
+		return nil, shoal.NewError(
+			shoal.ErrorUnauthorized, "authorization denied")
+	}
+	if err := shoal.ValidateRequiredID(
+		"MCP session correlation ID", correlationID); err != nil {
+		return nil, shoal.NewError(
+			shoal.ErrorUnauthorized, "authorization denied")
+	}
+	selectedOntology, _ := decision.SelectedOntology()
+	correlated, err := auth.NewDecision(auth.DecisionConfig{
+		Subject:                decision.Subject(),
+		Actor:                  decision.Actor(),
+		ClientID:               decision.ClientID(),
+		OnBehalfOf:             decision.OnBehalfOf(),
+		AuthorizationDomain:    decision.AuthorizationDomain(),
+		AllowedOperations:      decision.AllowedOperations(),
+		PermittedSourceIDs:     decision.PermittedSourceIDs(),
+		PermittedPolicyIDs:     decision.PermittedPolicyIDs(),
+		PolicyGeneration:       decision.PolicyGeneration(),
+		AuthenticationExpires:  decision.AuthenticationExpires(),
+		RequestID:              decision.RequestID(),
+		CorrelationID:          correlationID,
+		AuditPurpose:           decision.AuditPurpose(),
+		ServiceRole:            decision.ServiceRole(),
+		ServiceCeilingIdentity: decision.ServiceCeilingIdentity(),
+		SelectedOntology:       selectedOntology,
+	})
+	if err != nil {
+		return nil, shoal.NewError(
+			shoal.ErrorUnauthorized, "authorization denied")
+	}
+	bound, err := s.binder.Bind(ctx, correlated)
+	if err != nil || bound == nil {
+		return nil, shoal.NewError(
+			shoal.ErrorUnauthorized, "authorization denied")
+	}
+	return withBoundHTTPDecision(bound, correlated), nil
+}
+
 func (s *Server) authorizedContext(
 	ctx context.Context,
 ) (context.Context, auth.Decision, error) {

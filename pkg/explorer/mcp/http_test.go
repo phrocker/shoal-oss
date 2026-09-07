@@ -37,12 +37,195 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/explorer/authorized"
+	"github.com/phrocker/shoal-oss/pkg/explorer/fleet"
 	"github.com/phrocker/shoal-oss/pkg/explorer/webapi"
 	"github.com/phrocker/shoal-oss/pkg/explorer/workspace"
 	"github.com/phrocker/shoal-oss/pkg/interaction"
 	"github.com/phrocker/shoal-oss/pkg/retrieval"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
+
+func TestStreamableHTTPFleetCallsUseTrustedSessionCorrelation(t *testing.T) {
+	now := time.Date(2026, 9, 7, 12, 0, 0, 0, time.UTC)
+	authority := auth.NewAuthority()
+	fleetService := &httpFleetToolService{}
+	tools, err := NewFleetDispatchTools(
+		fleetService, authority.Resolver())
+	if err != nil {
+		t.Fatal(err)
+	}
+	sink := &testInteractionSink{}
+	server, err := NewServer(Config{
+		Service: &stubService{}, Authority: authority,
+		Decisions: DecisionProviderFunc(func(context.Context) (auth.Decision, error) {
+			return httpFleetDecision(
+				t, "stdio", "template-request", "template-correlation",
+				now.Add(time.Hour),
+			), nil
+		}),
+		InteractionSink: sink,
+		Snapshots: testSnapshotProvider{snapshot: explorer.Snapshot{
+			ID: "snapshot", AsOf: now,
+		}},
+		OptionalTools:    tools,
+		toolCallClock:    func() time.Time { return now },
+		interactionClock: func() time.Time { return now },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var requestNumber atomic.Uint64
+	authenticator := webapi.AuthenticatorFunc(func(
+		request *http.Request,
+	) (auth.Decision, error) {
+		token := strings.TrimPrefix(
+			request.Header.Get("Authorization"), "Bearer ")
+		subject := shoal.ID(token)
+		expires := now.Add(24 * time.Hour)
+		switch token {
+		case "alice", "alice-refresh":
+			subject = "alice"
+			if token == "alice-refresh" {
+				expires = now.Add(48 * time.Hour)
+			}
+		case "bob":
+		default:
+			return auth.Decision{}, shoal.NewError(
+				shoal.ErrorUnauthorized, "bad token")
+		}
+		requestID := shoal.ID(
+			token + "-request-" +
+				strconv.FormatUint(requestNumber.Add(1), 10))
+		return httpFleetDecision(
+			t, subject, requestID,
+			shoal.ID("caller-forged-"+token), expires,
+		), nil
+	})
+
+	httpServer := httptest.NewUnstartedServer(nil)
+	mcpHandler, err := NewHTTPHandler(HTTPConfig{
+		Server: server,
+		AllowedOrigins: []string{
+			"http://" + httpServer.Listener.Addr().String(),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	outer, err := webapi.NewAuthenticatedHandler(
+		&stubService{}, authenticator, authority.Binder(),
+		httpServer.Listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := outer.MountAuthenticated("/mcp", mcpHandler); err != nil {
+		t.Fatal(err)
+	}
+	httpServer.Config.Handler = outer
+	httpServer.Start()
+	t.Cleanup(httpServer.Close)
+
+	aliceSession, _ := initializeHTTP(
+		t, httpServer.Client(), httpServer.URL+"/mcp", "alice", `1`)
+	assertEmptyBody(t, postHTTPMCP(
+		t, httpServer.Client(), httpServer.URL+"/mcp", "alice",
+		aliceSession, ProtocolVersion,
+		`{"jsonrpc":"2.0","method":"notifications/initialized"}`))
+
+	callHTTPFleetTool(
+		t, httpServer.Client(), httpServer.URL+"/mcp", "alice",
+		aliceSession, 2, FleetDispatchToolName,
+		fleetToolArguments(now, false))
+	callHTTPFleetTool(
+		t, httpServer.Client(), httpServer.URL+"/mcp", "alice-refresh",
+		aliceSession, 3, FleetInvokeToolName,
+		fleetToolArguments(now, true))
+
+	if len(fleetService.enqueued) != 1 || len(fleetService.invoked) != 1 {
+		t.Fatalf(
+			"fleet calls = %d dispatch, %d invoke",
+			len(fleetService.enqueued), len(fleetService.invoked))
+	}
+	dispatchContext := fleetService.enqueued[0].Context
+	invokeContext := fleetService.invoked[0].Enqueue.Context
+	if dispatchContext.RequestID == invokeContext.RequestID {
+		t.Fatalf("tool request IDs were reused: %q", dispatchContext.RequestID)
+	}
+	if dispatchContext.CorrelationID == "" ||
+		dispatchContext.CorrelationID != invokeContext.CorrelationID {
+		t.Fatalf(
+			"session correlations = %q, %q",
+			dispatchContext.CorrelationID, invokeContext.CorrelationID)
+	}
+	if strings.HasPrefix(
+		string(dispatchContext.CorrelationID), "caller-forged-") {
+		t.Fatalf(
+			"caller correlation was trusted: %q",
+			dispatchContext.CorrelationID)
+	}
+
+	crossCaller := postHTTPMCP(
+		t, httpServer.Client(), httpServer.URL+"/mcp", "bob",
+		aliceSession, ProtocolVersion,
+		`{"jsonrpc":"2.0","id":4,"method":"tools/list"}`)
+	if crossCaller.StatusCode != http.StatusNotFound {
+		t.Fatalf("cross-caller status = %d, want 404", crossCaller.StatusCode)
+	}
+	crossCaller.Body.Close()
+
+	bobSession, _ := initializeHTTP(
+		t, httpServer.Client(), httpServer.URL+"/mcp", "bob", `5`)
+	assertEmptyBody(t, postHTTPMCP(
+		t, httpServer.Client(), httpServer.URL+"/mcp", "bob",
+		bobSession, ProtocolVersion,
+		`{"jsonrpc":"2.0","method":"notifications/initialized"}`))
+	callHTTPFleetTool(
+		t, httpServer.Client(), httpServer.URL+"/mcp", "bob",
+		bobSession, 6, FleetDispatchToolName,
+		fleetToolArguments(now, false))
+	if len(fleetService.enqueued) != 2 {
+		t.Fatalf("dispatch calls = %d, want 2", len(fleetService.enqueued))
+	}
+	bobContext := fleetService.enqueued[1].Context
+	if bobContext.CorrelationID == "" ||
+		bobContext.CorrelationID == dispatchContext.CorrelationID {
+		t.Fatalf(
+			"Alice/Bob correlations = %q, %q",
+			dispatchContext.CorrelationID, bobContext.CorrelationID)
+	}
+
+	if len(sink.sessions) != 6 {
+		t.Fatalf("recorded interactions = %d, want 6", len(sink.sessions))
+	}
+	expectedCalls := []fleet.RequestContext{
+		dispatchContext, invokeContext, bobContext,
+	}
+	for index, expected := range expectedCalls {
+		for offset, reason := range []string{
+			"mcp_tool_admission", "mcp_tool_outcome",
+		} {
+			recorded := sink.sessions[index*2+offset]
+			if recorded.RequestID != expected.RequestID {
+				t.Fatalf(
+					"interaction %d request ID = %q, want %q",
+					index*2+offset, recorded.RequestID, expected.RequestID)
+			}
+			correlation := shoal.ID(interaction.Digest(
+				string(expected.CorrelationID) + "\x00" + reason))
+			wantSession, err := interaction.OperationSessionID(
+				interaction.OperationToolCall, correlation, now)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if recorded.ID != wantSession {
+				t.Fatalf(
+					"interaction %d session ID = %q, want %q",
+					index*2+offset, recorded.ID, wantSession)
+			}
+		}
+	}
+}
 
 func TestStreamableHTTPAuthenticatesEveryRequestAndIsolatesSessions(t *testing.T) {
 	service := &stubService{}
@@ -1534,6 +1717,112 @@ func assertEmptyBody(t *testing.T, response *http.Response) {
 	if len(body) != 0 {
 		t.Fatalf("body = %q, want empty", body)
 	}
+}
+
+func callHTTPFleetTool(
+	t *testing.T,
+	client *http.Client,
+	endpoint string,
+	token string,
+	session string,
+	id int,
+	name string,
+	arguments json.RawMessage,
+) {
+	t.Helper()
+	params, err := json.Marshal(CallToolParams{
+		Name: name, Arguments: arguments,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := decodeHTTPResponse(t, postHTTPMCP(
+		t, client, endpoint, token, session, ProtocolVersion,
+		`{"jsonrpc":"2.0","id":`+strconv.Itoa(id)+
+			`,"method":"tools/call","params":`+string(params)+`}`))
+	if response.Error != nil {
+		t.Fatalf("%s protocol error = %+v", name, response.Error)
+	}
+	var result ToolResult
+	if err := json.Unmarshal(response.Result, &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.IsError {
+		t.Fatalf("%s failed: %s", name, result.StructuredContent)
+	}
+}
+
+func httpFleetDecision(
+	t *testing.T,
+	subject shoal.ID,
+	requestID shoal.ID,
+	correlationID shoal.ID,
+	expires time.Time,
+) auth.Decision {
+	t.Helper()
+	decision, err := auth.NewDecision(auth.DecisionConfig{
+		Subject: subject, Actor: "http-client",
+		AuthorizationDomain: []byte("domain"),
+		AllowedOperations: []auth.Operation{
+			auth.OperationDispatch,
+			auth.OperationInvoke,
+			auth.OperationValidate,
+		},
+		PermittedSourceIDs:    [][]byte{[]byte("source")},
+		PermittedPolicyIDs:    [][]byte{[]byte("policy")},
+		PolicyGeneration:      1,
+		AuthenticationExpires: expires,
+		RequestID:             requestID,
+		CorrelationID:         correlationID,
+		AuditPurpose:          "test HTTP MCP fleet request",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return decision
+}
+
+type httpFleetToolService struct {
+	enqueued []fleet.EnqueueRequest
+	invoked  []fleet.InvokeRequest
+}
+
+func (s *httpFleetToolService) Enqueue(
+	_ context.Context, request fleet.EnqueueRequest,
+) (fleet.ActionRecord, error) {
+	s.enqueued = append(s.enqueued, request)
+	return fleet.ActionRecord{ID: request.ID}, nil
+}
+
+func (s *httpFleetToolService) Invoke(
+	_ context.Context, request fleet.InvokeRequest,
+) (fleet.ActionRecord, error) {
+	s.invoked = append(s.invoked, request)
+	return fleet.ActionRecord{ID: request.Enqueue.ID}, nil
+}
+
+func (*httpFleetToolService) Claim(
+	context.Context, fleet.ClaimRequest,
+) (fleet.ActionRecord, error) {
+	return fleet.ActionRecord{}, nil
+}
+
+func (*httpFleetToolService) Cancel(
+	context.Context, fleet.CancelRequest,
+) (fleet.ActionRecord, error) {
+	return fleet.ActionRecord{}, nil
+}
+
+func (*httpFleetToolService) Status(
+	context.Context, fleet.StatusRequest,
+) (fleet.ActionRecord, error) {
+	return fleet.ActionRecord{}, nil
+}
+
+func (*httpFleetToolService) Pull(
+	context.Context, fleet.PullActionsRequest,
+) (fleet.ActionPage, error) {
+	return fleet.ActionPage{}, nil
 }
 
 func httpTestDecision(
