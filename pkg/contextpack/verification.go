@@ -311,7 +311,8 @@ func (v *verifier) verifyAnchor(
 			return VerifiedAnchor{}, invalid(
 				"graph evidence variant is unavailable")
 		}
-		if _, err := v.graphAnchor(path); err != nil {
+		verified, err := v.graphAnchor(path)
+		if err != nil {
 			return VerifiedAnchor{}, err
 		}
 		sources := make([]VerifiedSource, 0, len(path.Nodes))
@@ -342,7 +343,7 @@ func (v *verifier) verifyAnchor(
 			return VerifiedAnchor{}, err
 		}
 		return VerifiedAnchor{
-			anchor:     anchor,
+			anchor:     verified,
 			sources:    sources,
 			assertions: assertions,
 			visibility: visibility,

@@ -1207,17 +1207,19 @@ func authorizedClient(
 	}
 	scorer, _ := any(corpus).(authorized.VectorScorer)
 	return authorized.NewClient(authorized.Config{
-		Base:                corpus,
-		VectorScorer:        scorer,
-		InteractionWriter:   corpus,
-		InteractionReader:   corpus,
-		OntologyInterpreter: corpus,
-		SnapshotValidator:   corpus,
-		Resolver:            resolver,
-		PolicySelector:      selector,
-		PolicyStore:         store,
-		GenerationReader:    generationReader,
-		Clock:               clock,
-		Mosaic:              mosaic,
+		Base:                   corpus,
+		VectorScorer:           scorer,
+		InteractionWriter:      corpus,
+		InteractionReader:      corpus,
+		OntologyInterpreter:    corpus,
+		OntologyProposalStore:  corpus,
+		SnapshotValidator:      corpus,
+		DerivedAssertionReader: corpus,
+		Resolver:               resolver,
+		PolicySelector:         selector,
+		PolicyStore:            store,
+		GenerationReader:       generationReader,
+		Clock:                  clock,
+		Mosaic:                 mosaic,
 	})
 }

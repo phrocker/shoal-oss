@@ -1638,6 +1638,10 @@ func citationInteractionReference(
 	}
 	if evidence.Path != nil {
 		reference.Kind = interaction.EvidenceGraph
+		reference.NodeIDs = reference.NodeIDs[:0]
+		for _, node := range evidence.Path.Nodes {
+			reference.NodeIDs = append(reference.NodeIDs, node.ID)
+		}
 		for _, edge := range evidence.Path.Edges {
 			reference.EdgeIDs = append(reference.EdgeIDs, edge.ID)
 		}

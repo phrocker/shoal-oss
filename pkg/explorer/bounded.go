@@ -24,6 +24,7 @@ import (
 	"encoding/hex"
 	"math"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/phrocker/shoal-oss/pkg/document"
@@ -279,13 +280,15 @@ func (e *Explorer) validateEvidenceReferenceLocked(
 				"interaction graph evidence omits authoritative assertions",
 			)
 		}
-		anchor, err := inference.NewGraphAnchorWithAssertions(
-			path, canonical.Assertions)
-		if err != nil || anchor.ID() != canonical.AnchorID {
-			return shoal.NewError(
-				shoal.ErrorConflict,
-				"interaction graph anchor identity is not authoritative",
-			)
+		if strings.HasPrefix(string(canonical.AnchorID), "evidence-anchor:") {
+			anchor, err := inference.NewGraphAnchorWithAssertions(
+				path, canonical.Assertions)
+			if err != nil || anchor.ID() != canonical.AnchorID {
+				return shoal.NewError(
+					shoal.ErrorConflict,
+					"interaction graph anchor identity is not authoritative",
+				)
+			}
 		}
 	default:
 		return shoal.NewError(

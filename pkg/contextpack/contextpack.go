@@ -634,19 +634,25 @@ func (v *verifier) graphAnchor(path graph.Path) (inference.EvidenceAnchor, error
 				"graph path edge does not match hydrated Explorer data")
 		}
 	}
-	var assertions []interaction.AssertionReference
-	for _, edge := range path.Edges {
-		for _, assertion := range v.assertions[edge.ID] {
-			switch assertion.Origin {
-			case ontology.AssertionExplicit, ontology.AssertionInferred:
-				assertions = append(assertions, assertion)
-			case ontology.AssertionDerived:
-				return inference.EvidenceAnchor{}, invalid(
-					"graph path contains non-source ontology assertion")
-			default:
-				return inference.EvidenceAnchor{}, invalid(
-					"graph path contains assertion with unknown origin")
-			}
+	verifiedAssertions, err := v.assertionsForPath(path)
+	if err != nil {
+		return inference.EvidenceAnchor{}, err
+	}
+	assertions := make([]interaction.AssertionReference, 0, len(verifiedAssertions))
+	for _, assertion := range verifiedAssertions {
+		switch assertion.origin {
+		case ontology.AssertionExplicit, ontology.AssertionInferred:
+			assertions = append(assertions, interaction.AssertionReference{
+				AssertionID: assertion.assertionID,
+				EdgeID:      assertion.edgeID,
+				Origin:      assertion.origin,
+			})
+		case ontology.AssertionDerived:
+			return inference.EvidenceAnchor{}, invalid(
+				"graph path contains non-source ontology assertion")
+		default:
+			return inference.EvidenceAnchor{}, invalid(
+				"graph path contains assertion with unknown origin")
 		}
 	}
 	return inference.NewGraphAnchorWithAssertions(path, assertions)

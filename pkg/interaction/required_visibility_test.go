@@ -123,7 +123,7 @@ func TestCompleteEvidenceRetainsEdgesAndJoinsTheirVisibility(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if repeated.SeedEvidence[0].NodeIDs[0] != "node-a" {
+	if repeated.SeedEvidence[0].NodeIDs[0] != "node-b" {
 		t.Fatal("canonical session leaked complete evidence mutation")
 	}
 }

@@ -213,7 +213,14 @@ func (e *Explorer) recordInteraction(
 				"interaction retry requires stricter output visibility",
 			)
 		}
-		return interactionRetryResult(*existing, session)
+		reconciled, err := interactionRetryResult(*existing, session)
+		if err != nil {
+			return interaction.Session{}, err
+		}
+		if err := contextError(ctx); err != nil {
+			return reconciled, MarkCommittedInteraction(err)
+		}
+		return reconciled, nil
 	}
 	// Sessions and folds are distinct maps but share one node namespace in the
 	// corpus graph, so an ID taken by either would silently overwrite the other
@@ -223,6 +230,23 @@ func (e *Explorer) recordInteraction(
 			shoal.ErrorConflict,
 			"interaction session ID is already used by a fold",
 		)
+	}
+	// Revalidate the exact pinned state while holding the graph/write lock so
+	// source mutation cannot race with visibility materialization and commit.
+	if _, trusted := e.snapshotHistory[string(session.SnapshotID)]; trusted {
+		references, err := session.EvidenceReferences()
+		if err != nil {
+			return interaction.Session{}, err
+		}
+		if err := e.validateEvidenceSnapshotLocked(
+			session.SnapshotID,
+			session.SnapshotAsOf,
+			session.TouchedNodeIDs(),
+			session.TouchedEdgeIDs(),
+			references,
+		); err != nil {
+			return interaction.Session{}, err
+		}
 	}
 	subgraph, err := session.SubgraphWithEvidence(
 		e.visibilityResolverLocked(), e.edgeVisibilityResolverLocked())

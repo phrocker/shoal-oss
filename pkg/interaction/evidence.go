@@ -7,7 +7,7 @@
  * "License"); you may not use this file except in compliance
  * with the License. You may obtain a copy of the License at
  *
- *     https://www.apache.org/licenses/LICENSE-2.0
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing,
  * software distributed under the License is distributed on an
@@ -21,6 +21,7 @@ package interaction
 
 import (
 	"sort"
+	"strings"
 
 	"github.com/phrocker/shoal-oss/pkg/document"
 	"github.com/phrocker/shoal-oss/pkg/ontology"
@@ -43,10 +44,8 @@ type AssertionReference struct {
 	Origin      ontology.AssertionOrigin
 }
 
-// EvidenceReference is the complete redacted identity of one verified
-// inference anchor. Quotes and model output are deliberately absent; AnchorID
-// binds those bytes in the inference contract while Citation retains the exact
-// immutable revision/range and graph references retain every node and edge.
+// EvidenceReference is the complete redacted identity of one verified anchor.
+// Quotes and generated text are deliberately absent.
 type EvidenceReference struct {
 	AnchorID   shoal.ID
 	Kind       EvidenceKind
@@ -56,7 +55,6 @@ type EvidenceReference struct {
 	Assertions []AssertionReference
 }
 
-// Validate checks the reference shape without requiring caller ordering.
 func (r EvidenceReference) Validate() error {
 	if err := shoal.ValidateRequiredID(
 		"interaction evidence anchor ID", r.AnchorID); err != nil {
@@ -89,31 +87,43 @@ func (r EvidenceReference) Validate() error {
 				shoal.ErrorInvalidArgument,
 				"document evidence cannot contain graph edge references")
 		}
-		required := []shoal.ID{
-			r.Citation.DocumentID, r.Citation.SectionID, r.Citation.SpanID,
+		required := []shoal.ID{r.Citation.DocumentID}
+		if r.Citation.SectionID != "" {
+			required = append(required, r.Citation.SectionID)
+		}
+		if r.Citation.SpanID != "" {
+			required = append(required, r.Citation.SpanID)
+		}
+		required = dedupeIDs(required)
+		actual := dedupeIDs(r.NodeIDs)
+		if len(actual) > 3 ||
+			(len(actual) != len(required) && len(actual) != 3) {
+			return shoal.NewError(
+				shoal.ErrorInvalidArgument,
+				"document evidence nodes do not match its citation source roles")
 		}
 		for _, id := range required {
-			if id != "" && !containsEvidenceID(r.NodeIDs, id) {
+			if !containsEvidenceID(actual, id) {
 				return shoal.NewError(
 					shoal.ErrorInvalidArgument,
-					"document evidence omits a cited source node")
+					"document evidence nodes do not match its citation source roles")
 			}
 		}
 	case EvidenceGraph:
-		if r.Citation != (document.Citation{}) {
+		if r.Citation != (document.Citation{}) || len(r.NodeIDs) == 0 {
 			return shoal.NewError(
 				shoal.ErrorInvalidArgument,
-				"graph evidence cannot contain a document citation")
+				"graph evidence has an invalid variant")
 		}
-		if len(r.NodeIDs) == 0 {
+		if strings.HasPrefix(string(r.AnchorID), "evidence-anchor:") &&
+			len(r.EdgeIDs) != len(r.NodeIDs)-1 {
 			return shoal.NewError(
 				shoal.ErrorInvalidArgument,
-				"graph evidence requires source node references")
+				"graph evidence path has inconsistent edges")
 		}
 	default:
 		return shoal.NewError(
-			shoal.ErrorInvalidArgument,
-			"interaction evidence kind is invalid")
+			shoal.ErrorInvalidArgument, "interaction evidence kind is invalid")
 	}
 	for _, assertion := range r.Assertions {
 		if err := shoal.ValidateRequiredID(
@@ -142,14 +152,16 @@ func (r EvidenceReference) Validate() error {
 	return nil
 }
 
-// Canonical returns an independently owned, deterministically ordered
-// reference.
 func (r EvidenceReference) Canonical() (EvidenceReference, error) {
 	if err := r.Validate(); err != nil {
 		return EvidenceReference{}, err
 	}
-	r.NodeIDs = dedupeIDs(r.NodeIDs)
-	r.EdgeIDs = dedupeIDs(r.EdgeIDs)
+	if r.Kind == EvidenceDocument {
+		r.NodeIDs = dedupeIDs(r.NodeIDs)
+	} else {
+		r.NodeIDs = append([]shoal.ID(nil), r.NodeIDs...)
+		r.EdgeIDs = append([]shoal.ID(nil), r.EdgeIDs...)
+	}
 	r.Assertions = append([]AssertionReference(nil), r.Assertions...)
 	sort.Slice(r.Assertions, func(i, j int) bool {
 		if compared := shoal.CompareID(
@@ -166,7 +178,8 @@ func (r EvidenceReference) Canonical() (EvidenceReference, error) {
 	})
 	for index := 1; index < len(r.Assertions); index++ {
 		if r.Assertions[index-1].AssertionID ==
-			r.Assertions[index].AssertionID {
+			r.Assertions[index].AssertionID &&
+			r.Assertions[index-1].EdgeID == r.Assertions[index].EdgeID {
 			return EvidenceReference{}, shoal.NewError(
 				shoal.ErrorInvalidArgument,
 				"interaction evidence contains duplicate assertion references")
@@ -199,8 +212,7 @@ func canonicalEvidenceReferences(
 		result = append(result, value)
 	}
 	sort.Slice(result, func(i, j int) bool {
-		return shoal.CompareID(
-			result[i].AnchorID, result[j].AnchorID) < 0
+		return shoal.CompareID(result[i].AnchorID, result[j].AnchorID) < 0
 	})
 	return result, nil
 }
@@ -219,6 +231,36 @@ func evidenceEdgeIDs(values []EvidenceReference) []shoal.ID {
 		ids = append(ids, value.EdgeIDs...)
 	}
 	return dedupeIDs(ids)
+}
+
+func evidenceAssertions(
+	values []EvidenceReference,
+) []AssertionReference {
+	var references []AssertionReference
+	for _, value := range values {
+		references = append(references, value.Assertions...)
+	}
+	sort.Slice(references, func(i, j int) bool {
+		if compared := shoal.CompareID(
+			references[i].EdgeID, references[j].EdgeID); compared != 0 {
+			return compared < 0
+		}
+		if compared := shoal.CompareID(
+			references[i].AssertionID,
+			references[j].AssertionID,
+		); compared != 0 {
+			return compared < 0
+		}
+		return references[i].Origin < references[j].Origin
+	})
+	result := references[:0]
+	for _, reference := range references {
+		if len(result) > 0 && result[len(result)-1] == reference {
+			continue
+		}
+		result = append(result, reference)
+	}
+	return result
 }
 
 func evidenceReferencesEqual(left, right EvidenceReference) bool {

@@ -856,6 +856,13 @@ func (s Session) Validate() error {
 				"interaction tool nodes do not match retrieved evidence")
 		}
 	}
+	// One anchor identity must describe one evidence reference across seed,
+	// cited, and tool-call evidence, or the session-wide union is ambiguous.
+	if _, err := canonicalEvidenceReferences(
+		s.evidenceReferenceValues(),
+	); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -944,6 +951,10 @@ func (s Session) RetrievedEvidence() []EvidenceReference {
 // EvidenceReferences returns the complete canonical evidence set attached to
 // the session across seeds, citations, and tool turns.
 func (s Session) EvidenceReferences() ([]EvidenceReference, error) {
+	return canonicalEvidenceReferences(s.evidenceReferenceValues())
+}
+
+func (s Session) evidenceReferenceValues() []EvidenceReference {
 	values := append([]EvidenceReference(nil), s.SeedEvidence...)
 	values = append(values, s.CitedEvidence...)
 	for _, turn := range s.Turns {
@@ -951,7 +962,7 @@ func (s Session) EvidenceReferences() ([]EvidenceReference, error) {
 			values = append(values, turn.ToolCall.RetrievedEvidence...)
 		}
 	}
-	return canonicalEvidenceReferences(values)
+	return values
 }
 
 // TouchedEdgeIDs returns the complete canonical set of source graph edges

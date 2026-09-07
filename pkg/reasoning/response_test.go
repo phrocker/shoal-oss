@@ -253,7 +253,7 @@ func TestSourceOnlyRejectsAuthoritativeInferredGraphMaterial(t *testing.T) {
 	}
 	edge := graph.Edge{
 		ID: edgeID, From: firstCitation.SpanID, To: secondCitation.SpanID,
-		Type: "related", Weight: 0.9,
+		Type: string(relationship.ID()), Weight: 0.9,
 		Properties: shoal.Metadata{
 			"ontology_relationship_id": string(relationship.ID()),
 		},

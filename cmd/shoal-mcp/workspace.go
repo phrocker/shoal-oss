@@ -137,15 +137,17 @@ func openWorkspace(
 	}
 	scorer, _ := any(corpus).(authorized.VectorScorer)
 	client, err := authorized.NewClient(authorized.Config{
-		Base:                corpus,
-		VectorScorer:        scorer,
-		InteractionWriter:   corpus,
-		InteractionReader:   corpus,
-		OntologyInterpreter: corpus,
-		SnapshotValidator:   corpus,
-		Resolver:            authority.Resolver(),
-		PolicySelector:      selector,
-		PolicyStore:         store,
+		Base:                   corpus,
+		VectorScorer:           scorer,
+		InteractionWriter:      corpus,
+		InteractionReader:      corpus,
+		OntologyInterpreter:    corpus,
+		OntologyProposalStore:  corpus,
+		SnapshotValidator:      corpus,
+		DerivedAssertionReader: corpus,
+		Resolver:               authority.Resolver(),
+		PolicySelector:         selector,
+		PolicyStore:            store,
 		GenerationReader: configuredGenerationReader{
 			domain:     append([]byte(nil), config.identity.domain...),
 			generation: config.identity.policyGeneration,
