@@ -262,10 +262,164 @@ func TestInteractionAuditorPreservesCommittedPostSinkFailures(t *testing.T) {
 	})
 }
 
+func TestInteractionAuditorRetryUsesAuthoritativeReceipt(t *testing.T) {
+	original := time.Date(2026, 9, 6, 10, 0, 0, 0, time.UTC)
+	snapshots := &changingAuditSnapshots{snapshot: explorer.Snapshot{
+		ID: "original-snapshot", AsOf: original.Add(-time.Minute),
+	}}
+	sink := &auditSink{}
+	auditor, err := NewInteractionAuditorWithReader(sink, sink, snapshots)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record := AuditRecord{
+		Operation: auth.OperationEventPublish, ActionID: []byte("retry"),
+		ObjectID: []byte("event"), AuthorizationFingerprint: auth.Fingerprint{1},
+		AuthorizationExpiresAt: original.Add(time.Second), OccurredAt: original,
+	}
+	if err := auditor.RecordFleetAction(context.Background(), record); err != nil {
+		t.Fatal(err)
+	}
+	snapshots.snapshot = explorer.Snapshot{
+		ID: "changed-snapshot", AsOf: original.Add(time.Hour),
+	}
+	if err := auditor.RecordFleetActionRetry(context.Background(), record); err != nil {
+		t.Fatalf("authoritative retry after snapshot and expiry changes = %v", err)
+	}
+	if len(sink.sessions) != 1 {
+		t.Fatalf("retry wrote another interaction: %d", len(sink.sessions))
+	}
+}
+
+func TestInteractionAuditorRetryRejectsMismatchedReceipt(t *testing.T) {
+	now := time.Date(2026, 9, 6, 10, 0, 0, 0, time.UTC)
+	sink := &auditSink{}
+	auditor, err := NewInteractionAuditorWithReader(sink, sink, testAuditSnapshots{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	record := AuditRecord{
+		Operation: auth.OperationEventPublish, ActionID: []byte("retry"),
+		ObjectID: []byte("event"), AuthorizationFingerprint: auth.Fingerprint{1},
+		AuthorizationExpiresAt: now.Add(time.Hour), OccurredAt: now,
+	}
+	if err := auditor.RecordFleetAction(context.Background(), record); err != nil {
+		t.Fatal(err)
+	}
+	sink.receipt.AuthorizationOperation = string(auth.OperationSubscriptionDelete)
+	err = auditor.RecordFleetActionRetry(context.Background(), record)
+	if !interaction.IsCommittedRecord(err) {
+		t.Fatalf("mismatched authoritative receipt = %v", err)
+	}
+}
+
+func TestInteractionAuditorRetryRejectsChangedAuthorizationPins(t *testing.T) {
+	now := time.Date(2026, 9, 7, 10, 0, 0, 0, time.UTC)
+	sink := &auditSink{}
+	auditor, err := NewInteractionAuditorWithReader(sink, sink, testAuditSnapshots{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	record := AuditRecord{
+		Operation: auth.OperationEventPublish, ActionID: []byte("retry"),
+		RequestID: "original", CorrelationID: []byte("correlation"),
+		ObjectID: []byte("event"), AuthorizationFingerprint: auth.Fingerprint{1},
+		AuthorizationExpiresAt: now.Add(time.Hour), OccurredAt: now,
+	}
+	if err := auditor.RecordFleetAction(context.Background(), record); err != nil {
+		t.Fatal(err)
+	}
+	record.RequestID = "changed"
+	err = auditor.RecordFleetActionRetry(context.Background(), record)
+	if !interaction.IsCommittedRecord(err) {
+		t.Fatalf("changed authorization pins = %v", err)
+	}
+}
+
+func TestInteractionAuditorRetryRejectsDeletedReceipt(t *testing.T) {
+	now := time.Date(2026, 9, 7, 10, 0, 0, 0, time.UTC)
+	sink := &auditSink{}
+	auditor, err := NewInteractionAuditorWithReader(sink, sink, testAuditSnapshots{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	record := AuditRecord{
+		Operation: auth.OperationEventPublish, ActionID: []byte("retry"),
+		ObjectID: []byte("event"), AuthorizationFingerprint: auth.Fingerprint{1},
+		AuthorizationExpiresAt: now.Add(time.Hour), OccurredAt: now,
+	}
+	if err := auditor.RecordFleetAction(context.Background(), record); err != nil {
+		t.Fatal(err)
+	}
+	sink.deleted = true
+	err = auditor.RecordFleetActionRetry(context.Background(), record)
+	if !interaction.IsCommittedRecord(err) ||
+		!shoal.IsErrorCode(err, shoal.ErrorNotFound) {
+		t.Fatalf("deleted authoritative receipt = %v", err)
+	}
+}
+
+func TestOperationInteractionAuditorSelectsBoundSink(t *testing.T) {
+	now := time.Date(2026, 9, 7, 10, 0, 0, 0, time.UTC)
+	sink := &auditSink{}
+	var selected auth.Operation
+	auditor, err := NewOperationInteractionAuditorWithReader(
+		func(operation auth.Operation) interaction.ResultSink {
+			selected = operation
+			return sink
+		},
+		sink, testAuditSnapshots{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := auditor.RecordFleetAction(context.Background(), AuditRecord{
+		Operation: auth.OperationInvoke, ActionID: []byte("action"),
+		ObjectID: []byte("event"), AuthorizationFingerprint: auth.Fingerprint{1},
+		AuthorizationExpiresAt: now.Add(time.Hour), OccurredAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if selected != auth.OperationInvoke {
+		t.Fatalf("selected operation = %q", selected)
+	}
+}
+
+func TestInteractionAuditorRetryDoesNotCreateMissingReceipt(t *testing.T) {
+	now := time.Date(2026, 9, 6, 10, 0, 0, 0, time.UTC)
+	sink := &auditSink{readErr: shoal.NewError(shoal.ErrorNotFound, "missing")}
+	auditor, err := NewInteractionAuditorWithReader(sink, sink, testAuditSnapshots{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = auditor.RecordFleetActionRetry(context.Background(), AuditRecord{
+		Operation: auth.OperationEventPublish, ActionID: []byte("retry"),
+		ObjectID: []byte("event"), AuthorizationFingerprint: auth.Fingerprint{1},
+		AuthorizationExpiresAt: now.Add(time.Hour), OccurredAt: now,
+	})
+	if !shoal.IsErrorCode(err, shoal.ErrorNotFound) ||
+		interaction.IsCommittedRecord(err) || len(sink.sessions) != 0 {
+		t.Fatalf("missing retry receipt = %v, writes = %d", err, len(sink.sessions))
+	}
+}
+
+type changingAuditSnapshots struct {
+	snapshot explorer.Snapshot
+}
+
+func (s *changingAuditSnapshots) InteractionSnapshot(
+	context.Context,
+) (explorer.Snapshot, error) {
+	return s.snapshot, nil
+}
+
 type auditSink struct {
 	sessions     []interaction.Session
 	mutateResult func(interaction.Session) interaction.Session
 	afterRecord  func()
+	receipt      interaction.Session
+	readErr      error
+	deleted      bool
 }
 
 func (*auditSink) EnsureInteractionSink(context.Context) error { return nil }
@@ -292,5 +446,18 @@ func (s *auditSink) RecordInteractionResult(
 	if s.afterRecord != nil {
 		s.afterRecord()
 	}
+	s.receipt = result
 	return result, nil
+}
+
+func (s *auditSink) InteractionRecord(
+	context.Context, shoal.ID,
+) (explorer.InteractionRecord, error) {
+	if s.readErr != nil {
+		return explorer.InteractionRecord{}, s.readErr
+	}
+	return explorer.InteractionRecord{
+		Summary: explorer.InteractionSummary{Deleted: s.deleted},
+		Session: s.receipt,
+	}, nil
 }

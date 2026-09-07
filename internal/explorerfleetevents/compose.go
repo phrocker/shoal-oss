@@ -87,6 +87,46 @@ func ComposeWithPublisher(
 	if err != nil {
 		return nil, nil, err
 	}
+	return composeWithPublisher(
+		backend, resolver, generations, auditor, leases, cursorKey, clock)
+}
+
+// ComposeWithPublisherAndReader constructs the production event service with
+// authoritative interaction-receipt reconciliation for exact retries.
+func ComposeWithPublisherAndReader(
+	runtime *explorercoord.Runtime,
+	domain coordination.DomainID,
+	resolver auth.Resolver,
+	generations auth.GenerationReader,
+	interactionSinkFor func(auth.Operation) interaction.ResultSink,
+	interactionReader fleetevents.InteractionReceiptReader,
+	snapshots fleet.InteractionSnapshotProvider,
+	leases fleetevents.LeaseValidator,
+	cursorKey []byte,
+	clock func() time.Time,
+) (*fleetevents.Service, *ActionEventPublisher, error) {
+	backend, err := New(runtime, domain)
+	if err != nil {
+		return nil, nil, err
+	}
+	auditor, err := fleetevents.NewOperationInteractionAuditorWithReader(
+		interactionSinkFor, interactionReader, snapshots)
+	if err != nil {
+		return nil, nil, err
+	}
+	return composeWithPublisher(
+		backend, resolver, generations, auditor, leases, cursorKey, clock)
+}
+
+func composeWithPublisher(
+	backend fleetevents.Backend,
+	resolver auth.Resolver,
+	generations auth.GenerationReader,
+	auditor fleetevents.Auditor,
+	leases fleetevents.LeaseValidator,
+	cursorKey []byte,
+	clock func() time.Time,
+) (*fleetevents.Service, *ActionEventPublisher, error) {
 	service, err := fleetevents.New(fleetevents.Config{
 		Backend: backend, Resolver: resolver, GenerationReader: generations,
 		LeaseValidator: leases, Auditor: auditor, CursorKey: cursorKey,

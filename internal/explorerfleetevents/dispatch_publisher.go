@@ -68,6 +68,7 @@ func (p *ActionEventPublisher) PublishActionEvent(
 	if err != nil {
 		return err
 	}
+	provenance := record.EventProvenance()
 	now := p.now().UTC()
 	decision, err := p.resolver.Resolve(ctx)
 	if err != nil {
@@ -75,8 +76,6 @@ func (p *ActionEventPublisher) PublishActionEvent(
 	}
 	if decision.Subject() != record.Subject || decision.Actor() != record.Actor ||
 		decision.ClientID() != record.ClientID ||
-		decision.RequestID() != record.RequestID ||
-		decision.CorrelationID() != record.CorrelationID ||
 		!sameIDs(decision.OnBehalfOf(), record.OnBehalfOf) {
 		return shoal.NewError(
 			shoal.ErrorUnauthorized,
@@ -98,7 +97,7 @@ func (p *ActionEventPublisher) PublishActionEvent(
 		ProducerGeneration: record.AgentGeneration,
 		ActionID:           append([]byte(nil), record.ID...),
 		TransitionID:       transitionID,
-		CorrelationID:      []byte(record.CorrelationID),
+		CorrelationID:      []byte(provenance.CorrelationID),
 		Reason:             record.Reason,
 		Evidence:           evidence,
 		ConsumedEvidence:   references,
@@ -109,7 +108,8 @@ func (p *ActionEventPublisher) PublishActionEvent(
 		Token: token, RetryUntil: record.UpdatedAt.Add(fleetevents.MaxMutationRetryWindow),
 		Event: event,
 	}, fleetevents.LifecycleReceipt{
-		RequestID: record.RequestID, CorrelationID: []byte(record.CorrelationID),
+		RequestID:                provenance.RequestID,
+		CorrelationID:            []byte(provenance.CorrelationID),
 		AuthorizationFingerprint: fingerprint,
 		AuthorizationExpiresAt:   expiresAt,
 	})
@@ -190,30 +190,33 @@ func actionEventAuthorization(
 	kind string, record fleet.ActionRecord,
 ) (auth.Operation, auth.Fingerprint, time.Time, error) {
 	var operation auth.Operation
-	var fingerprint auth.Fingerprint
-	var expiresAt time.Time
+	provenance := record.EventProvenance()
 	switch kind {
-	case "action.enqueued", "action.canceled":
+	case "action.enqueued":
+		if containsOperation(record.AuthorizedOperations, auth.OperationDispatch) {
+			operation = auth.OperationDispatch
+		} else {
+			operation = auth.OperationInvoke
+		}
+	case "action.canceled":
 		operation = auth.OperationDispatch
-		fingerprint = record.AuthorizationFingerprint
-		expiresAt = record.AuthorizationExpiresAt
 	case "action.claimed", "action.completed", "action.failed":
 		operation = auth.OperationInvoke
-		fingerprint = record.ExecutionFingerprint
-		expiresAt = record.ExecutionExpiresAt
 	default:
 		return "", auth.Fingerprint{}, time.Time{}, shoal.NewError(
 			shoal.ErrorInvalidArgument, "fleet action event kind is invalid")
 	}
-	if fingerprint == (auth.Fingerprint{}) || expiresAt.IsZero() ||
-		expiresAt.Location() != time.UTC ||
+	if provenance.AuthorizationFingerprint == (auth.Fingerprint{}) ||
+		provenance.AuthorizationExpiresAt.IsZero() ||
+		provenance.AuthorizationExpiresAt.Location() != time.UTC ||
 		!containsOperation(record.AuthorizedOperations, operation) {
 		return "", auth.Fingerprint{}, time.Time{}, shoal.NewError(
 			shoal.ErrorInvalidArgument,
 			"fleet action event authorization provenance is incomplete",
 		)
 	}
-	return operation, fingerprint, expiresAt, nil
+	return operation, provenance.AuthorizationFingerprint,
+		provenance.AuthorizationExpiresAt, nil
 }
 
 func containsOperation(values []auth.Operation, wanted auth.Operation) bool {

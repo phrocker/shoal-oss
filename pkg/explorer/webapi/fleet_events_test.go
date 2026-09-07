@@ -181,6 +181,7 @@ func TestMountAuthenticatedRejectsUnsafeConfigurationAtomically(t *testing.T) {
 	}
 	for _, pattern := range []string{
 		"/api/v1/foo/../bar/", "/api/v1/meta", "/api/v1/ontology/custom/",
+		"/api/v1/workspaces/", "/api/v1/workspaces/custom/",
 	} {
 		if err := handler.MountAuthenticated(
 			pattern, http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}),

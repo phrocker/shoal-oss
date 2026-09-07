@@ -29,6 +29,7 @@ import (
 	"time"
 
 	"github.com/phrocker/shoal-oss/pkg/explorer"
+	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/interaction"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
@@ -38,7 +39,14 @@ import (
 // opaque object identities.
 type InteractionAuditor struct {
 	recorder  *interaction.Recorder
+	result    interaction.ResultSink
+	resultFor func(auth.Operation) interaction.ResultSink
+	reader    InteractionReceiptReader
 	snapshots InteractionSnapshotProvider
+}
+
+type InteractionReceiptReader interface {
+	InteractionRecord(context.Context, shoal.ID) (explorer.InteractionRecord, error)
 }
 
 type InteractionSnapshotProvider interface {
@@ -56,21 +64,102 @@ func NewInteractionAuditor(
 	return &InteractionAuditor{recorder: recorder, snapshots: snapshots}, nil
 }
 
+func NewInteractionAuditorWithReader(
+	result interaction.ResultSink,
+	reader InteractionReceiptReader,
+	snapshots InteractionSnapshotProvider,
+) (*InteractionAuditor, error) {
+	if result == nil || reader == nil || snapshots == nil {
+		return nil, shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			"interaction result sink, reader, and snapshot provider are required")
+	}
+	return &InteractionAuditor{
+		result: result, reader: reader, snapshots: snapshots,
+	}, nil
+}
+
+func NewOperationInteractionAuditorWithReader(
+	resultFor func(auth.Operation) interaction.ResultSink,
+	reader InteractionReceiptReader,
+	snapshots InteractionSnapshotProvider,
+) (*InteractionAuditor, error) {
+	if resultFor == nil || reader == nil || snapshots == nil {
+		return nil, shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			"operation interaction sink, reader, and snapshot provider are required")
+	}
+	return &InteractionAuditor{
+		resultFor: resultFor, reader: reader, snapshots: snapshots,
+	}, nil
+}
+
 func (a *InteractionAuditor) RecordFleetAction(ctx context.Context, record AuditRecord) error {
-	correlationID := shoal.ID(hex.EncodeToString(deriveID(
-		"fleet-action-session-v1", []byte(record.Operation), record.ActionID,
-		record.ObjectID, record.CorrelationID,
-	)))
-	sessionID, err := interaction.OperationSessionID(
-		interaction.OperationToolCall, correlationID, record.OccurredAt)
+	session, err := a.fleetActionSession(ctx, record)
 	if err != nil {
 		return err
+	}
+	var persisted interaction.Session
+	result := a.result
+	if a.resultFor != nil {
+		result = a.resultFor(record.Operation)
+		if result == nil {
+			return shoal.NewError(
+				shoal.ErrorUnavailable,
+				"operation-bound interaction sink is unavailable")
+		}
+	}
+	if result != nil {
+		persisted, err = result.RecordInteractionResult(ctx, session)
+	} else {
+		persisted, err = a.recorder.Record(ctx, session)
+	}
+	return validateFleetReceipt(session, persisted, err)
+}
+
+func (a *InteractionAuditor) RecordFleetActionRetry(
+	ctx context.Context, record AuditRecord,
+) error {
+	sessionID, err := fleetActionSessionID(record)
+	if err != nil {
+		return err
+	}
+	if a.reader != nil {
+		stored, readErr := a.reader.InteractionRecord(
+			context.WithoutCancel(ctx), sessionID)
+		if readErr != nil {
+			return readErr
+		}
+		if stored.Summary.Deleted {
+			return explorer.MarkCommittedInteraction(shoal.NewError(
+				shoal.ErrorNotFound, "fleet interaction receipt was deleted"))
+		}
+		requested, buildErr := a.fleetActionSession(ctx, record)
+		if buildErr != nil {
+			return buildErr
+		}
+		if sameFleetReceipt(requested, stored.Session) {
+			return nil
+		}
+		return explorer.MarkCommittedInteraction(shoal.NewError(
+			shoal.ErrorInternal,
+			"persisted fleet interaction receipt does not match request"))
+	}
+	return a.RecordFleetAction(ctx, record)
+}
+
+func (a *InteractionAuditor) fleetActionSession(
+	ctx context.Context, record AuditRecord,
+) (interaction.Session, error) {
+	sessionID, err := fleetActionSessionID(record)
+	if err != nil {
+		return interaction.Session{}, err
 	}
 	snapshot, err := a.snapshots.InteractionSnapshot(ctx)
 	if err != nil {
-		return err
+		return interaction.Session{}, err
 	}
-	session := interaction.Session{
+	return interaction.Session{
 		ID: sessionID, RecordedAt: record.OccurredAt, Operation: interaction.OperationToolCall,
 		AuthorizationFingerprint: shoal.ID(
 			record.AuthorizationFingerprint.String()),
@@ -89,8 +178,21 @@ func (a *InteractionAuditor) RecordFleetAction(ctx context.Context, record Audit
 				RetrievedEvidence: cloneEvidenceReferences(record.ConsumedEvidence),
 			},
 		}},
-	}
-	persisted, err := a.recorder.Record(ctx, session)
+	}, nil
+}
+
+func fleetActionSessionID(record AuditRecord) (shoal.ID, error) {
+	correlationID := shoal.ID(hex.EncodeToString(deriveID(
+		"fleet-action-session-v1", []byte(record.Operation), record.ActionID,
+		record.ObjectID,
+	)))
+	return interaction.OperationSessionID(
+		interaction.OperationToolCall, correlationID, record.OccurredAt)
+}
+
+func validateFleetReceipt(
+	session, persisted interaction.Session, err error,
+) error {
 	if err != nil && !interaction.IsCommittedRecord(err) {
 		return err
 	}

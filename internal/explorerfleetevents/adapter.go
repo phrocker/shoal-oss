@@ -24,9 +24,11 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash"
 	"reflect"
 	"sort"
 	"sync"
@@ -48,6 +50,7 @@ const Table = "_shoal_explorer_fleet_events"
 
 var (
 	eventPrefix         = []byte{1, 'E'}
+	publicationPrefix   = []byte{1, 'P'}
 	subPrefix           = []byte{1, 'S'}
 	createReceiptPrefix = []byte{1, 'C'}
 	deleteReceiptPrefix = []byte{1, 'D'}
@@ -82,6 +85,13 @@ type Adapter struct {
 	retained uint64
 }
 
+type mutationAuditContextKey struct{}
+
+func mutationAudit(ctx context.Context) fleetevents.LifecycleReceipt {
+	value, _ := ctx.Value(mutationAuditContextKey{}).(fleetevents.LifecycleReceipt)
+	return value
+}
+
 func New(runtime Runtime, domain coordination.DomainID) (*Adapter, error) {
 	return NewWithRetention(runtime, domain, DefaultRetainedEvents)
 }
@@ -109,9 +119,33 @@ type subscriptionRecord struct {
 }
 
 type eventRecord struct {
-	Event         fleetevents.Event `json:"event"`
-	PublicationID []byte            `json:"publication_id"`
-	RetryUntil    time.Time         `json:"retry_until"`
+	Event         fleetevents.Event            `json:"event"`
+	PublicationID []byte                       `json:"publication_id"`
+	RetryUntil    time.Time                    `json:"retry_until"`
+	Audit         fleetevents.LifecycleReceipt `json:"audit"`
+}
+
+type lifecycleReceiptWire struct {
+	RequestID                []byte
+	CorrelationID            []byte
+	AuthorizationFingerprint auth.Fingerprint
+	AuthorizationExpiresAt   time.Time
+}
+
+func receiptToWire(value fleetevents.LifecycleReceipt) lifecycleReceiptWire {
+	return lifecycleReceiptWire{
+		RequestID: []byte(value.RequestID), CorrelationID: value.CorrelationID,
+		AuthorizationFingerprint: value.AuthorizationFingerprint,
+		AuthorizationExpiresAt:   value.AuthorizationExpiresAt,
+	}
+}
+
+func (value lifecycleReceiptWire) domain() fleetevents.LifecycleReceipt {
+	return fleetevents.LifecycleReceipt{
+		RequestID: shoal.ID(value.RequestID), CorrelationID: value.CorrelationID,
+		AuthorizationFingerprint: value.AuthorizationFingerprint,
+		AuthorizationExpiresAt:   value.AuthorizationExpiresAt,
+	}
 }
 
 type floorRecord struct {
@@ -119,10 +153,11 @@ type floorRecord struct {
 }
 
 type subscriptionMutationReceipt struct {
-	MutationID    []byte                   `json:"mutation_id"`
-	RequestDigest []byte                   `json:"request_digest"`
-	RetryUntil    time.Time                `json:"retry_until"`
-	Subscription  fleetevents.Subscription `json:"subscription"`
+	MutationID    []byte                       `json:"mutation_id"`
+	RequestDigest []byte                       `json:"request_digest"`
+	RetryUntil    time.Time                    `json:"retry_until"`
+	Subscription  fleetevents.Subscription     `json:"subscription"`
+	Audit         fleetevents.LifecycleReceipt `json:"audit"`
 }
 
 type subscriptionWire struct {
@@ -376,7 +411,8 @@ func (r eventRecord) MarshalJSON() ([]byte, error) {
 		Event         eventWire
 		PublicationID []byte
 		RetryUntil    time.Time
-	}{eventToWire(r.Event), r.PublicationID, r.RetryUntil})
+		Audit         lifecycleReceiptWire
+	}{eventToWire(r.Event), r.PublicationID, r.RetryUntil, receiptToWire(r.Audit)})
 }
 
 func (r *eventRecord) UnmarshalJSON(value []byte) error {
@@ -384,12 +420,14 @@ func (r *eventRecord) UnmarshalJSON(value []byte) error {
 		Event         eventWire
 		PublicationID []byte
 		RetryUntil    time.Time
+		Audit         lifecycleReceiptWire
 	}
 	if err := json.Unmarshal(value, &wire); err != nil {
 		return err
 	}
 	r.Event, r.PublicationID, r.RetryUntil =
 		wire.Event.domain(), wire.PublicationID, wire.RetryUntil
+	r.Audit = wire.Audit.domain()
 	return nil
 }
 
@@ -398,9 +436,10 @@ func (r subscriptionMutationReceipt) MarshalJSON() ([]byte, error) {
 		MutationID, RequestDigest []byte
 		RetryUntil                time.Time
 		Subscription              subscriptionWire
+		Audit                     lifecycleReceiptWire
 	}{
 		r.MutationID, r.RequestDigest, r.RetryUntil,
-		subscriptionToWire(r.Subscription),
+		subscriptionToWire(r.Subscription), receiptToWire(r.Audit),
 	})
 }
 
@@ -409,6 +448,7 @@ func (r *subscriptionMutationReceipt) UnmarshalJSON(value []byte) error {
 		MutationID, RequestDigest []byte
 		RetryUntil                time.Time
 		Subscription              subscriptionWire
+		Audit                     lifecycleReceiptWire
 	}
 	if err := json.Unmarshal(value, &wire); err != nil {
 		return err
@@ -416,6 +456,7 @@ func (r *subscriptionMutationReceipt) UnmarshalJSON(value []byte) error {
 	r.MutationID, r.RequestDigest, r.RetryUntil =
 		wire.MutationID, wire.RequestDigest, wire.RetryUntil
 	r.Subscription = wire.Subscription.domain()
+	r.Audit = wire.Audit.domain()
 	return nil
 }
 
@@ -460,11 +501,11 @@ func (a *Adapter) Create(
 			subscription.PolicyGeneration == policyGeneration &&
 			reflect.DeepEqual(subscription.Filter, request.Filter) &&
 			subscription.ExpiresAt.Sub(subscription.CreatedAt) == request.TTL {
-			return fleetevents.Subscription{}, false, transaction.ErrConflict
+			return fleetevents.Subscription{}, false, translate(transaction.ErrConflict)
 		}
 		if bytes.Equal(subscription.ID, id) ||
 			(subscription.RevokedAt.IsZero() && now.Before(subscription.ExpiresAt)) {
-			return fleetevents.Subscription{}, false, transaction.ErrConflict
+			return fleetevents.Subscription{}, false, translate(transaction.ErrConflict)
 		}
 		head, _, readErr := a.runtime.ReadEntity(ctx, entity)
 		if readErr != nil || head == nil {
@@ -489,6 +530,7 @@ func (a *Adapter) Create(
 	receiptValue, err := json.Marshal(subscriptionMutationReceipt{
 		MutationID: mutationID, RequestDigest: requestDigest,
 		RetryUntil: request.RetryUntil, Subscription: subscription,
+		Audit: mutationAudit(ctx),
 	})
 	if err != nil {
 		return fleetevents.Subscription{}, false, err
@@ -505,6 +547,28 @@ func (a *Adapter) Create(
 		return fleetevents.Subscription{}, false, translate(err)
 	}
 	return subscription, result.Unchanged, nil
+}
+
+func (a *Adapter) CreateWithAudit(
+	ctx context.Context, request fleetevents.CreateRequest, fingerprint auth.Fingerprint,
+	policyGeneration int64, audit fleetevents.LifecycleReceipt, now time.Time,
+) (fleetevents.Subscription, fleetevents.LifecycleReceipt, bool, error) {
+	ctx = context.WithValue(ctx, mutationAuditContextKey{}, audit)
+	subscription, repeated, err := a.Create(
+		ctx, request, fingerprint, policyGeneration, now)
+	if err != nil {
+		return fleetevents.Subscription{}, fleetevents.LifecycleReceipt{}, false, err
+	}
+	mutationID := digest(
+		"fleet-subscription-create-mutation-v1",
+		[]byte(request.SubscriberID), request.Token,
+	)
+	persisted, err := a.subscriptionMutationReceipt(
+		ctx, a.subscriptionReceiptRow(createReceiptPrefix, mutationID))
+	if err != nil {
+		return fleetevents.Subscription{}, fleetevents.LifecycleReceipt{}, false, err
+	}
+	return subscription, persisted.Audit, repeated, nil
 }
 
 func (a *Adapter) Subscription(ctx context.Context, id []byte) (fleetevents.Subscription, error) {
@@ -614,7 +678,7 @@ func (a *Adapter) prepareSubscriptionReceipt(
 				return 0, 0, coordination.Digest{}, nil, fleetevents.ErrMutationExpired
 			}
 			if !bytes.Equal(receipt.RequestDigest, requestDigest) {
-				return 0, 0, coordination.Digest{}, nil, transaction.ErrConflict
+				return 0, 0, coordination.Digest{}, nil, translate(transaction.ErrConflict)
 			}
 			return 0, 0, coordination.Digest{}, &receipt, nil
 		}
@@ -634,7 +698,7 @@ func (a *Adapter) prepareSubscriptionReceipt(
 func (a *Adapter) Delete(
 	ctx context.Context, id []byte, subscriberID shoal.ID, expected uint64,
 	retryUntil, now time.Time,
-) (fleetevents.Subscription, error) {
+) (fleetevents.Subscription, bool, error) {
 	deletionToken := digest(
 		"fleet-subscription-delete-token-v2",
 		[]byte(subscriberID), id, encodeUint64(expected))
@@ -650,47 +714,48 @@ func (a *Adapter) Delete(
 			retryUntil, now,
 		)
 	if receiptErr != nil {
-		return fleetevents.Subscription{}, receiptErr
+		return fleetevents.Subscription{}, false, receiptErr
 	}
 	if replay != nil {
 		if replay.Subscription.SubscriberID != subscriberID {
-			return fleetevents.Subscription{}, fleetevents.ErrSubscriptionNotFound
+			return fleetevents.Subscription{}, false, fleetevents.ErrSubscriptionNotFound
 		}
-		return replay.Subscription, nil
+		return replay.Subscription, true, nil
 	}
 	record, err := a.subscriptionRecord(ctx, id)
 	if err != nil {
-		return fleetevents.Subscription{}, err
+		return fleetevents.Subscription{}, false, err
 	}
 	subscription := record.Subscription
 	if subscription.SubscriberID != subscriberID {
-		return fleetevents.Subscription{}, fleetevents.ErrSubscriptionNotFound
+		return fleetevents.Subscription{}, false, fleetevents.ErrSubscriptionNotFound
 	}
 	if !subscription.RevokedAt.IsZero() {
-		return fleetevents.Subscription{}, fleetevents.ErrGenerationConflict
+		return fleetevents.Subscription{}, false, fleetevents.ErrGenerationConflict
 	}
 	if subscription.Generation != expected {
-		return fleetevents.Subscription{}, fleetevents.ErrGenerationConflict
+		return fleetevents.Subscription{}, false, fleetevents.ErrGenerationConflict
 	}
 	head, _, err := a.runtime.ReadEntity(ctx, a.subscriptionEntity(id))
 	if err != nil {
-		return fleetevents.Subscription{}, translate(err)
+		return fleetevents.Subscription{}, false, translate(err)
 	}
 	if head == nil {
-		return fleetevents.Subscription{}, fleetevents.ErrGenerationConflict
+		return fleetevents.Subscription{}, false, fleetevents.ErrGenerationConflict
 	}
 	subscription.Generation++
 	subscription.RevokedAt = now
 	value, err := json.Marshal(subscriptionRecord{Subscription: subscription})
 	if err != nil {
-		return fleetevents.Subscription{}, err
+		return fleetevents.Subscription{}, false, err
 	}
 	receiptValue, err := json.Marshal(subscriptionMutationReceipt{
 		MutationID: deletionToken, RequestDigest: requestDigest,
 		RetryUntil: retryUntil, Subscription: subscription,
+		Audit: mutationAudit(ctx),
 	})
 	if err != nil {
-		return fleetevents.Subscription{}, err
+		return fleetevents.Subscription{}, false, err
 	}
 	row := a.subscriptionRow(id)
 	_, err = a.publishSubscriptionMutation(
@@ -702,9 +767,52 @@ func (a *Adapter) Delete(
 		receiptEpoch, receiptDigest, deletionToken,
 	)
 	if err != nil {
-		return fleetevents.Subscription{}, translate(err)
+		return fleetevents.Subscription{}, false, translate(err)
 	}
-	return subscription, nil
+	return subscription, false, nil
+}
+
+func (a *Adapter) DeleteWithAudit(
+	ctx context.Context, id []byte, subscriberID shoal.ID, expected uint64,
+	retryUntil time.Time, audit fleetevents.LifecycleReceipt, now time.Time,
+) (fleetevents.Subscription, fleetevents.LifecycleReceipt, bool, error) {
+	ctx = context.WithValue(ctx, mutationAuditContextKey{}, audit)
+	subscription, repeated, err := a.Delete(
+		ctx, id, subscriberID, expected, retryUntil, now)
+	if err != nil {
+		return fleetevents.Subscription{}, fleetevents.LifecycleReceipt{}, false, err
+	}
+	deletionToken := digest(
+		"fleet-subscription-delete-token-v2",
+		[]byte(subscriberID), id, encodeUint64(expected))
+	persisted, err := a.subscriptionMutationReceipt(
+		ctx, a.subscriptionReceiptRow(deleteReceiptPrefix, deletionToken))
+	if err != nil {
+		return fleetevents.Subscription{}, fleetevents.LifecycleReceipt{}, false, err
+	}
+	return subscription, persisted.Audit, repeated, nil
+}
+
+func (a *Adapter) subscriptionMutationReceipt(
+	ctx context.Context, row []byte,
+) (subscriptionMutationReceipt, error) {
+	page, err := a.runtime.ScanCommitted(ctx, explorercoord.CommittedScanRequest{
+		Table: Table, RowPrefix: row, Family: recordFamily,
+		Qualifier: recordQualifier, Limit: 1,
+	})
+	if err != nil {
+		return subscriptionMutationReceipt{}, translate(err)
+	}
+	if len(page.Cells) != 1 ||
+		!bytes.Equal(page.Cells[0].Cell.Coordinate.Row, row) {
+		return subscriptionMutationReceipt{}, errors.New(
+			"fleet events: committed subscription receipt is missing")
+	}
+	var receipt subscriptionMutationReceipt
+	if err := json.Unmarshal(page.Cells[0].Cell.Value, &receipt); err != nil {
+		return subscriptionMutationReceipt{}, err
+	}
+	return receipt, nil
 }
 
 func (a *Adapter) Append(
@@ -724,7 +832,7 @@ func (a *Adapter) Append(
 		if repeated, found, err := a.repeatedPublication(
 			ctx, publicationID, eventID, request,
 		); err != nil {
-			return fleetevents.PublishResult{}, err
+			return fleetevents.PublishResult{}, translate(err)
 		} else if found {
 			return repeated, nil
 		}
@@ -746,7 +854,7 @@ func (a *Adapter) Append(
 		event.Sequence, event.EventID = sequence, eventID
 		value, marshalErr := json.Marshal(eventRecord{
 			Event: event, PublicationID: publicationID,
-			RetryUntil: request.RetryUntil,
+			RetryUntil: request.RetryUntil, Audit: request.Audit,
 		})
 		if marshalErr != nil {
 			return fleetevents.PublishResult{}, marshalErr
@@ -760,7 +868,7 @@ func (a *Adapter) Append(
 					"fleet-event-runtime-token-v2",
 					request.Token, encodeTime(request.RetryUntil),
 				),
-				row, value, eventID, sequence, now,
+				publicationID, row, value, eventID, sequence, now,
 				mode, expectedEpoch, expectedDigest,
 			)
 			if publishErr == nil || !errors.Is(publishErr, explorercoord.ErrIndeterminatePublication) {
@@ -779,7 +887,10 @@ func (a *Adapter) Append(
 			}
 		}
 		if publishErr == nil {
-			return fleetevents.PublishResult{EventID: eventID, Sequence: sequence, Repeated: result.Unchanged}, nil
+			return fleetevents.PublishResult{
+				EventID: eventID, Sequence: sequence,
+				Repeated: result.Unchanged, Audit: request.Audit,
+			}, nil
 		}
 		if !errors.Is(publishErr, transaction.ErrConflict) {
 			return fleetevents.PublishResult{}, translate(publishErr)
@@ -808,44 +919,28 @@ func (a *Adapter) repeatedPublication(
 	ctx context.Context, publicationID, eventID []byte,
 	request fleetevents.PublishRequest,
 ) (fleetevents.PublishResult, bool, error) {
-	page, err := a.runtime.ScanCommitted(ctx, explorercoord.CommittedScanRequest{
-		Table: Table, RowPrefix: eventPrefix,
-		Family: recordFamily, Qualifier: recordQualifier, Limit: int(a.retained),
-		MaxScanned: explorercoord.MaxCommittedScanCells,
-	})
+	existing, _, found, err := a.readPublicationEvent(ctx, eventID)
 	if err != nil {
-		return fleetevents.PublishResult{}, false, translate(err)
-	}
-	var existing eventRecord
-	var found bool
-	for _, cell := range page.Cells {
-		var record eventRecord
-		if err := json.Unmarshal(cell.Cell.Value, &record); err != nil {
-			return fleetevents.PublishResult{}, false, err
-		}
-		if bytes.Equal(record.PublicationID, publicationID) {
-			if record.RetryUntil.IsZero() ||
-				record.RetryUntil.Location() != time.UTC {
-				return fleetevents.PublishResult{}, false, errors.New(
-					"fleet events: corrupt publication receipt")
-			}
-			if !bytes.Equal(record.Event.EventID, eventID) ||
-				!record.RetryUntil.Equal(request.RetryUntil) {
-				return fleetevents.PublishResult{}, false, transaction.ErrConflict
-			}
-			existing, found = record, true
-			break
-		}
+		return fleetevents.PublishResult{}, false, err
 	}
 	if !found {
 		return fleetevents.PublishResult{}, false, nil
+	}
+	if existing.RetryUntil.IsZero() ||
+		existing.RetryUntil.Location() != time.UTC {
+		return fleetevents.PublishResult{}, false, errors.New(
+			"fleet events: corrupt publication receipt")
+	}
+	if !bytes.Equal(existing.Event.EventID, eventID) ||
+		!existing.RetryUntil.Equal(request.RetryUntil) {
+		return fleetevents.PublishResult{}, false, transaction.ErrConflict
 	}
 	requested := request.Event
 	requested.Sequence = existing.Event.Sequence
 	requested.EventID = append([]byte(nil), eventID...)
 	expected, err := json.Marshal(eventRecord{
 		Event: requested, PublicationID: publicationID,
-		RetryUntil: request.RetryUntil,
+		RetryUntil: request.RetryUntil, Audit: existing.Audit,
 	})
 	if err != nil {
 		return fleetevents.PublishResult{}, false, err
@@ -858,12 +953,15 @@ func (a *Adapter) repeatedPublication(
 		return fleetevents.PublishResult{}, false, transaction.ErrConflict
 	}
 	return fleetevents.PublishResult{
-		EventID: append([]byte(nil), eventID...), Sequence: existing.Event.Sequence, Repeated: true,
+		EventID: append([]byte(nil), eventID...), Sequence: existing.Event.Sequence,
+		Repeated: true, Audit: existing.Audit,
 	}, true, nil
 }
 
 func (a *Adapter) publishEvent(
-	ctx context.Context, token, row, value, eventID []byte, sequence uint64,
+	ctx context.Context,
+	token, publicationID, row, value, eventID []byte,
+	sequence uint64,
 	now time.Time,
 	streamMode guard.Mode, expectedEpoch coordination.Epoch,
 	expectedDigest coordination.Digest,
@@ -905,11 +1003,24 @@ func (a *Adapter) publishEvent(
 	if err != nil {
 		return explorercoord.Result{}, err
 	}
-	cells := []explorercoord.Cell{{
-		Table: Table, Row: append([]byte(nil), row...), Family: recordFamily,
-		Qualifier: recordQualifier, Value: append([]byte(nil), value...),
-		EpochTimestamp: true, LPART: lpart, CopyGeneration: 1,
-	}}
+	publicationEntity := publicationEntity(eventID)
+	publicationGuard, err := a.mutationGuard(
+		ctx, publicationEntity, eventID, lpart)
+	if err != nil {
+		return explorercoord.Result{}, err
+	}
+	cells := []explorercoord.Cell{
+		{
+			Table: Table, Row: append([]byte(nil), row...), Family: recordFamily,
+			Qualifier: recordQualifier, Value: append([]byte(nil), value...),
+			EpochTimestamp: true, LPART: lpart, CopyGeneration: 1,
+		},
+		{
+			Table: Table, Row: publicationRow(eventID), Family: recordFamily,
+			Qualifier: recordQualifier, Value: append([]byte(nil), value...),
+			EpochTimestamp: true, LPART: lpart, CopyGeneration: 1,
+		},
+	}
 	guards := []explorercoord.GuardIntent{
 		{
 			Entity: streamEntity, Mode: streamMode, ExpectedEpoch: expectedEpoch,
@@ -917,7 +1028,7 @@ func (a *Adapter) publishEvent(
 			DesiredWinnerID: sequenceID, LPART: lpart,
 			LogicalPolicyID: logicalPolicy, RetirementGeneration: 1,
 		},
-		slotGuard,
+		slotGuard, publicationGuard,
 	}
 	if sequence <= a.retained {
 		floorValue, marshalErr := json.Marshal(floorRecord{Sequence: floor})
@@ -951,6 +1062,14 @@ func (a *Adapter) pruneEvent(
 	committed explorercoord.CommittedCell, floor uint64,
 	lpart coordination.LPART,
 ) error {
+	indexed, publicationCell, found, err := a.readPublicationEvent(
+		ctx, retired.Event.EventID)
+	if err != nil {
+		return err
+	}
+	if !found || !reflect.DeepEqual(indexed, retired) {
+		return errors.New("fleet events: corrupt publication index")
+	}
 	floorValue, err := json.Marshal(floorRecord{Sequence: floor})
 	if err != nil {
 		return err
@@ -968,11 +1087,18 @@ func (a *Adapter) pruneEvent(
 			retired.Event.EventID,
 			encodeUint64(floor),
 		),
-		Targets: []explorercoord.PruneTarget{{
-			Table:  Table,
-			Cell:   committed,
-			Entity: a.eventSlotEntity(retired.Event.Sequence),
-		}},
+		Targets: []explorercoord.PruneTarget{
+			{
+				Table:  Table,
+				Cell:   committed,
+				Entity: a.eventSlotEntity(retired.Event.Sequence),
+			},
+			{
+				Table:  Table,
+				Cell:   publicationCell,
+				Entity: publicationEntity(retired.Event.EventID),
+			},
+		},
 		Checkpoint: explorercoord.PruneCheckpoint{
 			Cell: explorercoord.Cell{
 				Table: Table, Row: append([]byte(nil), floorRow...),
@@ -1003,27 +1129,40 @@ func (a *Adapter) Scan(
 	if next < floor {
 		return nil, 0, fleetevents.ErrResyncRequired
 	}
-	page, err := a.runtime.ScanCommitted(ctx, explorercoord.CommittedScanRequest{
-		Table: Table, RowPrefix: eventPrefix,
-		Family: recordFamily, Qualifier: recordQualifier,
-		Frontier: coordination.Epoch(frontier), Limit: int(a.retained),
-		MaxScanned: explorercoord.MaxCommittedScanCells,
-	})
-	if err != nil {
-		if errors.Is(err, transaction.ErrConflict) {
-			return nil, 0, fleetevents.ErrResyncRequired
-		}
-		return nil, 0, translate(err)
+	var highWater uint64
+	head, _, headErr := a.runtime.ReadEntity(ctx, streamEntity)
+	if headErr == nil && head != nil && len(head.WinnerID) == 8 {
+		highWater = binary.BigEndian.Uint64(head.WinnerID)
 	}
-	events, err := decodeSortedEvents(page.Cells, next, limit)
+	events, usedFrontier, err := a.scanEventsAt(
+		ctx, next, coordination.Epoch(frontier), limit)
 	if err != nil {
 		return nil, 0, err
 	}
 	if len(events) == 0 && frontier != 0 {
-		page, err = a.runtime.ScanCommitted(ctx, explorercoord.CommittedScanRequest{
-			Table: Table, RowPrefix: eventPrefix,
-			Family: recordFamily, Qualifier: recordQualifier, Limit: int(a.retained),
-			MaxScanned: explorercoord.MaxCommittedScanCells,
+		events, usedFrontier, err = a.scanEventsAt(ctx, next, 0, limit)
+		if err != nil {
+			return nil, 0, err
+		}
+	}
+	if len(events) > 0 && events[0].Sequence > next {
+		return nil, 0, fleetevents.ErrResyncRequired
+	} else if len(events) == 0 && next <= highWater {
+		return nil, 0, fleetevents.ErrResyncRequired
+	}
+	return events, uint64(usedFrontier), nil
+}
+
+func (a *Adapter) scanEventsAt(
+	ctx context.Context, next uint64, frontier coordination.Epoch, limit int,
+) ([]fleetevents.Event, coordination.Epoch, error) {
+	events := make([]fleetevents.Event, 0, limit)
+	for sequence := next; len(events) < limit; sequence++ {
+		row := a.eventRow(sequence)
+		page, err := a.runtime.ScanCommitted(ctx, explorercoord.CommittedScanRequest{
+			Table: Table, RowPrefix: eventPrefix, StartRow: row,
+			Family: recordFamily, Qualifier: recordQualifier,
+			Frontier: frontier, Limit: 1, MaxScanned: 4096,
 		})
 		if err != nil {
 			if errors.Is(err, transaction.ErrConflict) {
@@ -1031,22 +1170,27 @@ func (a *Adapter) Scan(
 			}
 			return nil, 0, translate(err)
 		}
-		events, err = decodeSortedEvents(page.Cells, next, limit)
-		if err != nil {
-			return nil, 0, err
+		if frontier == 0 {
+			frontier = page.Frontier
 		}
+		if len(page.Cells) == 0 ||
+			!bytes.Equal(page.Cells[0].Cell.Coordinate.Row, row) {
+			break
+		}
+		cell := page.Cells[0]
+		var record eventRecord
+		if err := json.Unmarshal(cell.Cell.Value, &record); err != nil {
+			return nil, 0, fmt.Errorf("fleet events: decode event: %w", err)
+		}
+		if record.Event.Sequence < sequence {
+			break
+		}
+		if record.Event.Sequence > sequence {
+			return nil, 0, fleetevents.ErrResyncRequired
+		}
+		events = append(events, record.Event)
 	}
-	var highWater uint64
-	head, _, headErr := a.runtime.ReadEntity(ctx, streamEntity)
-	if headErr == nil && head != nil && len(head.WinnerID) == 8 {
-		highWater = binary.BigEndian.Uint64(head.WinnerID)
-	}
-	if len(events) > 0 && events[0].Sequence > next {
-		return nil, 0, fleetevents.ErrResyncRequired
-	} else if len(events) == 0 && next <= highWater {
-		return nil, 0, fleetevents.ErrResyncRequired
-	}
-	return events, uint64(page.Frontier), nil
+	return events, frontier, nil
 }
 
 func decodeSortedEvents(
@@ -1109,6 +1253,12 @@ func (a *Adapter) readSlotEvent(
 		return eventRecord{}, explorercoord.CommittedCell{}, false, err
 	}
 	return record, page.Cells[0], true, nil
+}
+
+func (a *Adapter) readPublicationEvent(
+	ctx context.Context, eventID []byte,
+) (eventRecord, explorercoord.CommittedCell, bool, error) {
+	return a.readSlotEvent(ctx, publicationRow(eventID))
 }
 
 func (a *Adapter) mutationGuard(
@@ -1222,8 +1372,21 @@ func eventRow(sequence uint64) []byte {
 	return row
 }
 
+func publicationRow(eventID []byte) []byte {
+	row := make([]byte, 0, len(publicationPrefix)+len(eventID))
+	row = append(row, publicationPrefix...)
+	return append(row, eventID...)
+}
+
 func (a *Adapter) eventRow(sequence uint64) []byte {
 	return eventRow((sequence-1)%a.retained + 1)
+}
+
+func publicationEntity(eventID []byte) guard.Entity {
+	return guard.Entity{
+		Kind: 'P',
+		ID:   coordination.EntityID(hex.EncodeToString(eventID)),
+	}
 }
 
 func (a *Adapter) eventSlotEntity(sequence uint64) guard.Entity {
@@ -1283,12 +1446,18 @@ func encodeTime(value time.Time) []byte {
 
 func digest(tag string, parts ...[]byte) []byte {
 	hash := sha256.New()
-	hash.Write([]byte(tag))
+	writeDigestField(hash, []byte(tag))
 	for _, part := range parts {
-		hash.Write([]byte{0})
-		hash.Write(part)
+		writeDigestField(hash, part)
 	}
 	return hash.Sum(nil)
+}
+
+func writeDigestField(hash hash.Hash, value []byte) {
+	var size [8]byte
+	binary.BigEndian.PutUint64(size[:], uint64(len(value)))
+	_, _ = hash.Write(size[:])
+	_, _ = hash.Write(value)
 }
 
 func translate(err error) error {
@@ -1297,6 +1466,12 @@ func translate(err error) error {
 	}
 	if errors.Is(err, explorercoord.ErrIndeterminatePublication) {
 		return errors.Join(fleetevents.ErrPublicationUnknown, err)
+	}
+	if errors.Is(err, transaction.ErrConflict) {
+		return errors.Join(
+			shoal.NewError(shoal.ErrorConflict, "fleet event transaction conflict"),
+			err,
+		)
 	}
 	return err
 }

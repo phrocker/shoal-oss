@@ -151,13 +151,22 @@ func (s *Service) Create(ctx context.Context, request CreateRequest) (Subscripti
 	if err := guard.Check(ctx); err != nil {
 		return Subscription{}, err
 	}
-	subscription, _, err := s.backend.Create(ctx, request, fingerprint, decision.PolicyGeneration(), now)
+	audit := lifecycleReceiptForDecision(decision, fingerprint)
+	var subscription Subscription
+	var repeated bool
+	if backend, ok := s.backend.(MutationReceiptBackend); ok {
+		subscription, audit, repeated, err = backend.CreateWithAudit(
+			ctx, request, fingerprint, decision.PolicyGeneration(), audit, now)
+	} else {
+		subscription, repeated, err = s.backend.Create(
+			ctx, request, fingerprint, decision.PolicyGeneration(), now)
+	}
 	if err != nil {
 		return Subscription{}, mapContextError(err)
 	}
-	if err := s.record(
-		ctx, decision, auth.OperationSubscriptionCreate, request.Token,
-		subscription.ID, nil, nil, nil, subscription.CreatedAt,
+	if err := s.recordWithReceipt(
+		ctx, audit, auth.OperationSubscriptionCreate, request.Token,
+		subscription.ID, nil, nil, nil, subscription.CreatedAt, repeated,
 	); err != nil {
 		return Subscription{}, classifyAuditError(err)
 	}
@@ -186,16 +195,28 @@ func (s *Service) Delete(ctx context.Context, request DeleteRequest) error {
 	if err := guard.Check(ctx); err != nil {
 		return err
 	}
-	subscription, err := s.backend.Delete(
-		ctx, request.SubscriptionID, decision.Subject(), request.ExpectedGeneration,
-		request.RetryUntil, now,
-	)
+	fingerprint, err := auth.AuthorizationFingerprint(decision)
+	if err != nil {
+		return err
+	}
+	audit := lifecycleReceiptForDecision(decision, fingerprint)
+	var subscription Subscription
+	var repeated bool
+	if backend, ok := s.backend.(MutationReceiptBackend); ok {
+		subscription, audit, repeated, err = backend.DeleteWithAudit(
+			ctx, request.SubscriptionID, decision.Subject(),
+			request.ExpectedGeneration, request.RetryUntil, audit, now)
+	} else {
+		subscription, repeated, err = s.backend.Delete(
+			ctx, request.SubscriptionID, decision.Subject(),
+			request.ExpectedGeneration, request.RetryUntil, now)
+	}
 	if err != nil {
 		return nonDisclosingSubscriptionError(err)
 	}
-	if err := s.record(
-		ctx, decision, auth.OperationSubscriptionDelete, request.SubscriptionID,
-		subscription.ID, nil, nil, nil, subscription.RevokedAt,
+	if err := s.recordWithReceipt(
+		ctx, audit, auth.OperationSubscriptionDelete, request.SubscriptionID,
+		subscription.ID, nil, nil, nil, subscription.RevokedAt, repeated,
 	); err != nil {
 		return classifyAuditError(err)
 	}
@@ -223,7 +244,9 @@ func (s *Service) PublishLifecycle(
 	receipt LifecycleReceipt,
 ) (PublishResult, error) {
 	expected, trusted := lifecycleOperation(request.Event.Kind)
-	if !trusted || operation != expected {
+	enqueueInvoke := request.Event.Kind == "action.enqueued" &&
+		operation == auth.OperationInvoke
+	if !trusted || operation != expected && !enqueueInvoke {
 		return PublishResult{}, shoal.NewError(
 			shoal.ErrorInvalidArgument, "fleet lifecycle publication operation is invalid")
 	}
@@ -259,15 +282,16 @@ func (s *Service) publish(
 	); err != nil {
 		return PublishResult{}, err
 	}
-	decision, guard, err := s.authorize(ctx, operation, request.Event.Evidence, now)
-	if err != nil {
-		return PublishResult{}, err
-	}
 	if err := validateID("event publication token", request.Token, false); err != nil {
 		return PublishResult{}, err
 	}
 	request.Event.OccurredAt = request.Event.OccurredAt.UTC()
+	var err error
 	request.Event, err = normalizeEvent(request.Event, false)
+	if err != nil {
+		return PublishResult{}, err
+	}
+	decision, guard, err := s.authorize(ctx, operation, request.Event.Evidence, now)
 	if err != nil {
 		return PublishResult{}, err
 	}
@@ -284,31 +308,45 @@ func (s *Service) publish(
 			[]byte(decision.Subject()), fingerprint.Bytes(), request.Token,
 		)
 	}
+	if lifecycleReceipt != nil {
+		request.Audit = *lifecycleReceipt
+	} else {
+		request.Audit = LifecycleReceipt{
+			RequestID:                decision.RequestID(),
+			CorrelationID:            []byte(decision.CorrelationID()),
+			AuthorizationFingerprint: fingerprint,
+			AuthorizationExpiresAt:   decision.AuthenticationExpires(),
+		}
+	}
 	result, err := s.backend.Append(ctx, request, now)
 	if err != nil {
 		return PublishResult{}, mapContextError(err)
 	}
+	if result.Audit.AuthorizationFingerprint == (auth.Fingerprint{}) {
+		result.Audit = request.Audit
+	}
 	auditTime := request.Event.OccurredAt
+	record := AuditRecord{
+		Operation: operation, ActionID: cloneBytes(request.Event.ActionID),
+		ObjectID:         cloneBytes(result.EventID),
+		Evidence:         cloneEvidence(request.Event.Evidence),
+		ConsumedEvidence: cloneEvidenceReferences(request.Event.ConsumedEvidence),
+		CitedEvidence:    cloneEvidenceReferences(request.Event.CitedEvidence),
+		OccurredAt:       auditTime,
+	}
+	record.RequestID = result.Audit.RequestID
+	record.CorrelationID = cloneBytes(result.Audit.CorrelationID)
+	record.AuthorizationFingerprint = result.Audit.AuthorizationFingerprint
+	record.AuthorizationExpiresAt = result.Audit.AuthorizationExpiresAt
 	var recordErr error
-	if lifecycleReceipt == nil {
-		recordErr = s.record(
-			ctx, decision, operation, request.Event.ActionID,
-			result.EventID, request.Event.Evidence,
-			request.Event.ConsumedEvidence, request.Event.CitedEvidence, auditTime,
-		)
+	if result.Repeated {
+		if retryAuditor, ok := s.auditor.(RetryAuditor); ok {
+			recordErr = retryAuditor.RecordFleetActionRetry(ctx, record)
+		} else {
+			recordErr = s.auditor.RecordFleetAction(ctx, record)
+		}
 	} else {
-		recordErr = s.auditor.RecordFleetAction(ctx, AuditRecord{
-			Operation: operation, ActionID: cloneBytes(request.Event.ActionID),
-			RequestID:                lifecycleReceipt.RequestID,
-			CorrelationID:            cloneBytes(lifecycleReceipt.CorrelationID),
-			AuthorizationFingerprint: lifecycleReceipt.AuthorizationFingerprint,
-			AuthorizationExpiresAt:   lifecycleReceipt.AuthorizationExpiresAt,
-			ObjectID:                 cloneBytes(result.EventID),
-			Evidence:                 cloneEvidence(request.Event.Evidence),
-			ConsumedEvidence:         cloneEvidenceReferences(request.Event.ConsumedEvidence),
-			CitedEvidence:            cloneEvidenceReferences(request.Event.CitedEvidence),
-			OccurredAt:               auditTime,
-		})
+		recordErr = s.auditor.RecordFleetAction(ctx, record)
 	}
 	if recordErr != nil {
 		return PublishResult{}, classifyAuditError(recordErr)
@@ -580,7 +618,18 @@ func (s *Service) record(
 	actionID, objectID []byte, evidence []Evidence,
 	consumed, cited []interaction.EvidenceReference, now time.Time,
 ) error {
-	return s.auditor.RecordFleetAction(ctx, AuditRecord{
+	return s.recordWithRetry(
+		ctx, decision, operation, actionID, objectID, evidence,
+		consumed, cited, now, false)
+}
+
+func (s *Service) recordWithRetry(
+	ctx context.Context, decision auth.Decision, operation auth.Operation,
+	actionID, objectID []byte, evidence []Evidence,
+	consumed, cited []interaction.EvidenceReference, now time.Time,
+	repeated bool,
+) error {
+	record := AuditRecord{
 		Operation: operation, ActionID: cloneBytes(actionID),
 		RequestID: decision.RequestID(), CorrelationID: []byte(decision.CorrelationID()),
 		AuthorizationFingerprint: func() auth.Fingerprint {
@@ -593,7 +642,47 @@ func (s *Service) record(
 		ConsumedEvidence:       cloneEvidenceReferences(consumed),
 		CitedEvidence:          cloneEvidenceReferences(cited),
 		OccurredAt:             now,
-	})
+	}
+	if repeated {
+		if retryAuditor, ok := s.auditor.(RetryAuditor); ok {
+			return retryAuditor.RecordFleetActionRetry(ctx, record)
+		}
+	}
+	return s.auditor.RecordFleetAction(ctx, record)
+}
+
+func (s *Service) recordWithReceipt(
+	ctx context.Context, receipt LifecycleReceipt, operation auth.Operation,
+	actionID, objectID []byte, evidence []Evidence,
+	consumed, cited []interaction.EvidenceReference, now time.Time,
+	repeated bool,
+) error {
+	record := AuditRecord{
+		Operation: operation, ActionID: cloneBytes(actionID),
+		RequestID: receipt.RequestID, CorrelationID: cloneBytes(receipt.CorrelationID),
+		AuthorizationFingerprint: receipt.AuthorizationFingerprint,
+		AuthorizationExpiresAt:   receipt.AuthorizationExpiresAt,
+		ObjectID:                 cloneBytes(objectID), Evidence: cloneEvidence(evidence),
+		ConsumedEvidence: cloneEvidenceReferences(consumed),
+		CitedEvidence:    cloneEvidenceReferences(cited), OccurredAt: now,
+	}
+	if repeated {
+		if retryAuditor, ok := s.auditor.(RetryAuditor); ok {
+			return retryAuditor.RecordFleetActionRetry(ctx, record)
+		}
+	}
+	return s.auditor.RecordFleetAction(ctx, record)
+}
+
+func lifecycleReceiptForDecision(
+	decision auth.Decision, fingerprint auth.Fingerprint,
+) LifecycleReceipt {
+	return LifecycleReceipt{
+		RequestID:                decision.RequestID(),
+		CorrelationID:            []byte(decision.CorrelationID()),
+		AuthorizationFingerprint: fingerprint,
+		AuthorizationExpiresAt:   decision.AuthenticationExpires(),
+	}
 }
 
 func matchesFilter(filter Filter, event Event) bool {

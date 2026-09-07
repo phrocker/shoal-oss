@@ -30,6 +30,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/interaction"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
@@ -130,6 +131,47 @@ func TestServiceRejectsTransportRacingLongPollBound(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("accepted long poll equal to the production write timeout")
+	}
+}
+
+func TestPublishBoundsEvidenceBeforeAuthorization(t *testing.T) {
+	now := time.Date(2026, 9, 7, 10, 0, 0, 0, time.UTC)
+	resolver := &countingResolver{
+		err: errors.New("authorization should not run"),
+	}
+	service, err := New(Config{
+		Backend: &memoryBackend{}, Resolver: resolver,
+		GenerationReader: &generationReader{generation: 7},
+		LeaseValidator:   &leaseValidator{}, Auditor: &auditor{},
+		CursorKey: make([]byte, 32), Clock: func() time.Time { return now },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	evidence := make([]Evidence, MaxEvidence+1)
+	for index := range evidence {
+		evidence[index] = Evidence{
+			SourceID: []byte("source"), PolicyID: []byte("policy"),
+			ObjectID: shoal.ID(fmt.Sprintf("object-%d", index)),
+		}
+	}
+	_, err = service.Publish(context.Background(), PublishRequest{
+		Token: []byte("token"), RetryUntil: now.Add(time.Hour),
+		Event: Event{
+			Kind: "product.updated", ProducerID: []byte("producer"),
+			ActionID: []byte("action"), OccurredAt: now, Evidence: evidence,
+		},
+	})
+	if err == nil || resolver.calls != 0 {
+		t.Fatalf("oversized evidence error = %v, resolver calls = %d", err, resolver.calls)
+	}
+}
+
+func TestPublicationUnknownMapsToIndeterminateUnavailable(t *testing.T) {
+	err := mapContextError(ErrPublicationUnknown)
+	if !explorer.IsIndeterminateCommit(err) ||
+		!shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
+		t.Fatalf("publication unknown mapping = %v", err)
 	}
 }
 
@@ -811,6 +853,16 @@ type sequenceResolver struct {
 	calls, denyAt   int
 }
 
+type countingResolver struct {
+	calls int
+	err   error
+}
+
+func (r *countingResolver) Resolve(context.Context) (auth.Decision, error) {
+	r.calls++
+	return auth.Decision{}, r.err
+}
+
 func (r *sequenceResolver) Resolve(context.Context) (auth.Decision, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -908,18 +960,18 @@ func (b *memoryBackend) Subscription(context.Context, []byte) (Subscription, err
 func (b *memoryBackend) Delete(
 	_ context.Context, _ []byte, subscriberID shoal.ID, expected uint64,
 	_ time.Time, now time.Time,
-) (Subscription, error) {
+) (Subscription, bool, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if b.subscription.SubscriberID != subscriberID {
-		return Subscription{}, ErrSubscriptionNotFound
+		return Subscription{}, false, ErrSubscriptionNotFound
 	}
 	if b.subscription.Generation != expected {
-		return Subscription{}, ErrGenerationConflict
+		return Subscription{}, false, ErrGenerationConflict
 	}
 	b.subscription.Generation++
 	b.subscription.RevokedAt = now
-	return cloneSubscription(b.subscription), nil
+	return cloneSubscription(b.subscription), false, nil
 }
 
 func (b *memoryBackend) Append(_ context.Context, request PublishRequest, _ time.Time) (PublishResult, error) {
@@ -933,7 +985,9 @@ func (b *memoryBackend) Append(_ context.Context, request PublishRequest, _ time
 	if b.onAppend != nil {
 		b.onAppend()
 	}
-	return PublishResult{EventID: event.EventID, Sequence: event.Sequence}, nil
+	return PublishResult{
+		EventID: event.EventID, Sequence: event.Sequence, Audit: request.Audit,
+	}, nil
 }
 
 func (b *memoryBackend) Scan(

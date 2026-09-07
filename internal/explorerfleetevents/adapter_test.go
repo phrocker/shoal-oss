@@ -97,7 +97,8 @@ func TestAdapterConcurrentAppendRestartResume(t *testing.T) {
 	divergent.Kind = "different"
 	if _, err := adapter.Append(context.Background(), fleetevents.PublishRequest{
 		Token: []byte("token-00"), RetryUntil: retryUntil, Event: divergent,
-	}, appendNow); !errors.Is(err, transaction.ErrConflict) {
+	}, appendNow); !errors.Is(err, transaction.ErrConflict) ||
+		!shoal.IsErrorCode(err, shoal.ErrorConflict) {
 		t.Fatalf("divergent retry error = %v, want conflict", err)
 	}
 	for index := 0; index < count; index++ {
@@ -165,7 +166,8 @@ func TestAdapterOpaqueIDsRemainByteSafeAcrossRestart(t *testing.T) {
 	divergent.SubscriberID = shoal.ID(string([]byte{0xfe}))
 	if _, _, err := adapter.Create(
 		ctx, divergent, fingerprint, 1, now,
-	); !errors.Is(err, transaction.ErrConflict) {
+	); !errors.Is(err, transaction.ErrConflict) ||
+		!shoal.IsErrorCode(err, shoal.ErrorConflict) {
 		t.Fatalf("byte-distinct create retry error = %v, want conflict", err)
 	}
 
@@ -207,9 +209,15 @@ func TestAdapterOpaqueIDsRemainByteSafeAcrossRestart(t *testing.T) {
 	}}
 	reference := event.ConsumedEvidence[0]
 	event.Evidence[0].Reference = &reference
+	audit := fleetevents.LifecycleReceipt{
+		RequestID:                shoal.ID(string([]byte{0xff, 0x00, 'r'})),
+		CorrelationID:            []byte{0xfe, 0x00, 'c'},
+		AuthorizationFingerprint: auth.Fingerprint{9},
+		AuthorizationExpiresAt:   now.Add(time.Hour),
+	}
 	if _, err := adapter.Append(ctx, fleetevents.PublishRequest{
 		Token: []byte("opaque-event"), RetryUntil: now.Add(time.Hour),
-		Event: event,
+		Event: event, Audit: audit,
 	}, now); err != nil {
 		t.Fatal(err)
 	}
@@ -242,6 +250,24 @@ func TestAdapterOpaqueIDsRemainByteSafeAcrossRestart(t *testing.T) {
 			OccurredAt:    event.OccurredAt,
 		}) {
 		t.Fatalf("reloaded event = %#v, %v", events, err)
+	}
+	repeatedEvent, err := adapter.Append(ctx, fleetevents.PublishRequest{
+		Token: []byte("opaque-event"), RetryUntil: now.Add(time.Hour),
+		Event: event, Audit: fleetevents.LifecycleReceipt{
+			RequestID: "fresh-attempt",
+		},
+	}, now)
+	if err != nil || !repeatedEvent.Repeated ||
+		!reflect.DeepEqual(repeatedEvent.Audit, audit) {
+		t.Fatalf("reloaded audit receipt = %#v, %v", repeatedEvent, err)
+	}
+}
+
+func TestDigestLengthFramesOpaqueParts(t *testing.T) {
+	left := digest("opaque", []byte{'a', 0, 'b'}, []byte("c"))
+	right := digest("opaque", []byte("a"), []byte{'b', 0, 'c'})
+	if bytes.Equal(left, right) {
+		t.Fatal("length-distinct opaque identity parts collided")
 	}
 }
 
@@ -331,6 +357,10 @@ func TestAdapterRetentionFloorAndIdempotencyExpirySurviveRestart(t *testing.T) {
 	replacement, _, err := runtime.ReadEntity(ctx, adapter.eventSlotEntity(4))
 	if err != nil || replacement == nil || replacement.State != guard.StateLive {
 		t.Fatalf("replacement event guard = %#v, %v", replacement, err)
+	}
+	if _, _, found, err := adapter.readPublicationEvent(
+		ctx, firstEventID); err != nil || found {
+		t.Fatalf("retired publication index found = %v, %v", found, err)
 	}
 	if err := runtime.Close(); err != nil {
 		t.Fatal(err)
@@ -525,7 +555,7 @@ func TestAdapterSubscriptionGenerationCAS(t *testing.T) {
 		t.Fatalf("loaded subscription = %#v, %v", loaded, err)
 	}
 	deleteRetryUntil := now.Add(30 * time.Minute)
-	deleted, err := adapter.Delete(
+	deleted, _, err := adapter.Delete(
 		context.Background(), subscription.ID, "subscriber", 1,
 		deleteRetryUntil, now.Add(time.Minute))
 	if err != nil {
@@ -534,13 +564,13 @@ func TestAdapterSubscriptionGenerationCAS(t *testing.T) {
 	if deleted.Generation != 2 || deleted.RevokedAt.IsZero() {
 		t.Fatalf("deleted subscription = %#v", deleted)
 	}
-	replayed, err := adapter.Delete(
+	replayed, _, err := adapter.Delete(
 		context.Background(), subscription.ID, "subscriber", 1,
 		deleteRetryUntil, now.Add(2*time.Minute))
 	if err != nil || !replayed.RevokedAt.Equal(deleted.RevokedAt) {
 		t.Fatalf("exact deletion replay = %#v, %v", replayed, err)
 	}
-	if _, err := adapter.Delete(
+	if _, _, err := adapter.Delete(
 		context.Background(), subscription.ID, "subscriber", 2,
 		deleteRetryUntil, now.Add(2*time.Minute),
 	); !errors.Is(err, fleetevents.ErrGenerationConflict) {

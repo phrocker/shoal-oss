@@ -31,6 +31,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/interaction"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
@@ -105,12 +106,14 @@ type PublishRequest struct {
 	Token      []byte
 	RetryUntil time.Time
 	Event      Event
+	Audit      LifecycleReceipt
 }
 
 type PublishResult struct {
 	EventID  []byte
 	Sequence uint64
 	Repeated bool
+	Audit    LifecycleReceipt
 }
 
 // Filter can only narrow delivery. Empty sets mean no additional narrowing.
@@ -194,6 +197,12 @@ type Auditor interface {
 	RecordFleetAction(context.Context, AuditRecord) error
 }
 
+// RetryAuditor can reconcile an exact publication retry against an
+// authoritative interaction receipt before attempting another write.
+type RetryAuditor interface {
+	RecordFleetActionRetry(context.Context, AuditRecord) error
+}
+
 // LeaseValidator rechecks the target agent's durable lease and delegation
 // immediately before delivery. Implementations must not cache a success.
 type LeaseValidator interface {
@@ -205,9 +214,23 @@ type LeaseValidator interface {
 type Backend interface {
 	Create(context.Context, CreateRequest, auth.Fingerprint, int64, time.Time) (Subscription, bool, error)
 	Subscription(context.Context, []byte) (Subscription, error)
-	Delete(context.Context, []byte, shoal.ID, uint64, time.Time, time.Time) (Subscription, error)
+	Delete(context.Context, []byte, shoal.ID, uint64, time.Time, time.Time) (Subscription, bool, error)
 	Append(context.Context, PublishRequest, time.Time) (PublishResult, error)
 	Scan(context.Context, uint64, uint64, int) ([]Event, uint64, error)
+}
+
+// MutationReceiptBackend preserves the authorization receipt that accompanied
+// the first committed subscription mutation so later exact retries can repair
+// the interaction audit without adopting fresh request credentials.
+type MutationReceiptBackend interface {
+	CreateWithAudit(
+		context.Context, CreateRequest, auth.Fingerprint, int64,
+		LifecycleReceipt, time.Time,
+	) (Subscription, LifecycleReceipt, bool, error)
+	DeleteWithAudit(
+		context.Context, []byte, shoal.ID, uint64, time.Time,
+		LifecycleReceipt, time.Time,
+	) (Subscription, LifecycleReceipt, bool, error)
 }
 
 func cloneEvent(event Event) Event {
@@ -629,6 +652,15 @@ func mapContextError(err error) error {
 				"fleet event retry retention is temporarily at capacity",
 			),
 		)
+	}
+	if errors.Is(err, ErrPublicationUnknown) {
+		return explorer.MarkIndeterminateCommit(errors.Join(
+			ErrPublicationUnknown,
+			shoal.NewError(
+				shoal.ErrorUnavailable,
+				"fleet event publication outcome is unknown",
+			),
+		))
 	}
 	if errors.Is(err, context.Canceled) {
 		return shoal.WrapError(shoal.ErrorCanceled, "event operation canceled", err)

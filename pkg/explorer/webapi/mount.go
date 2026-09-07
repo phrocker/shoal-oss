@@ -82,6 +82,7 @@ func conflictsWithWorkspaceRoute(mount string) bool {
 		"/api/v1/derivation/recompute", "/api/v1/changes",
 		"/api/v1/documents", "/api/v1/document", "/api/v1/retrieve",
 		"/api/v1/neighborhood", "/api/v1/path", "/api/v1/analytics",
+		"/api/v1/workspaces",
 	}
 	for _, route := range protected {
 		if mount == route || strings.HasPrefix(route, mount+"/") ||
