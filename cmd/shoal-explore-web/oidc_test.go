@@ -525,6 +525,17 @@ func TestOIDCFleetMappingIsSeparateFromContributor(t *testing.T) {
 	if operationsContain(decision.AllowedOperations(), auth.OperationIngest) {
 		t.Fatal("fleet mapping granted contributor ingest")
 	}
+
+	claims["access"] = []string{"fleet", "writer"}
+	decision, err = authenticator.Authenticate(
+		bearerRequest(issuer.signRS256(t, testKID, claims)))
+	if err != nil {
+		t.Fatalf("combined token rejected: %v", err)
+	}
+	if !operationsContain(decision.AllowedOperations(), auth.OperationDelegate) ||
+		!operationsContain(decision.AllowedOperations(), auth.OperationIngest) {
+		t.Fatalf("combined mapping operations = %v", decision.AllowedOperations())
+	}
 }
 
 func TestOIDCRejectsMalformedConfiguredIdentityClaims(t *testing.T) {

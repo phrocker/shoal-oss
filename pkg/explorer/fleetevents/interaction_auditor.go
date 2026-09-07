@@ -41,8 +41,13 @@ func NewInteractionAuditor(
 	sink interaction.ResultSink,
 	snapshots fleet.InteractionSnapshotProvider,
 ) (*InteractionAuditor, error) {
-	if isNilInteractionResultSink(sink) || snapshots == nil {
-		return nil, shoal.NewError(shoal.ErrorInvalidArgument, "interaction recorder is required")
+	if isNilInteractionResultSink(sink) {
+		return nil, shoal.NewError(
+			shoal.ErrorInvalidArgument, "interaction result sink is required")
+	}
+	if snapshots == nil {
+		return nil, shoal.NewError(
+			shoal.ErrorInvalidArgument, "interaction snapshot provider is required")
 	}
 	return &InteractionAuditor{sink: sink, snapshots: snapshots}, nil
 }
@@ -63,6 +68,9 @@ func (a *InteractionAuditor) RecordFleetAction(ctx context.Context, record Audit
 	}
 	recordedAt := record.OccurredAt.UTC()
 	if recordedAt.IsZero() || recordedAt.Before(snapshot.AsOf) {
+		// Interaction receipts must not predate the snapshot whose source
+		// membership they pin; older lifecycle event times are audit inputs, not
+		// proof that this snapshot already existed.
 		recordedAt = snapshot.AsOf.UTC()
 	}
 	session := interaction.Session{
@@ -99,6 +107,10 @@ func (a *InteractionAuditor) RecordFleetAction(ctx context.Context, record Audit
 func fleetInteractionEvidence(record AuditRecord) []interaction.EvidenceReference {
 	evidence := make([]interaction.EvidenceReference, 0, len(record.Evidence))
 	for _, item := range record.Evidence {
+		// Only actual source graph nodes can be validated as touched interaction
+		// nodes. Object, edge-only, anchor, and revision IDs stay out of
+		// SeedNodeIDs so the interaction sink never tries to authorize them as
+		// source nodes.
 		if item.NodeID == "" {
 			continue
 		}

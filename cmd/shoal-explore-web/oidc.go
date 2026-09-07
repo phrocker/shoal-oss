@@ -878,20 +878,18 @@ func (a *oidcAuthenticator) authority(
 		}
 		values = trimmed
 	}
+	var operations []auth.Operation
 	if hasMappedValue(values, a.fleetValues) {
-		return oidcFleetOperations,
-			[][]byte{workspaceSourceID},
-			[][]byte{workspaceGrantPolicyID},
-			true
+		operations = appendUniqueOperations(operations, oidcFleetOperations)
 	}
 	if hasMappedValue(values, a.contributorValues) {
-		return oidcContributorOperations,
-			[][]byte{workspaceSourceID},
-			[][]byte{workspaceGrantPolicyID},
-			true
+		operations = appendUniqueOperations(operations, oidcContributorOperations)
 	}
 	if hasMappedValue(values, a.readerClaimValues) {
-		return oidcReaderOperations,
+		operations = appendUniqueOperations(operations, oidcReaderOperations)
+	}
+	if len(operations) > 0 {
+		return operations,
 			[][]byte{workspaceSourceID},
 			[][]byte{workspaceGrantPolicyID},
 			true
@@ -900,6 +898,24 @@ func (a *oidcAuthenticator) authority(
 		return []auth.Operation{auth.OperationList}, nil, nil, true
 	}
 	return nil, nil, nil, false
+}
+
+func appendUniqueOperations(
+	operations []auth.Operation,
+	values []auth.Operation,
+) []auth.Operation {
+	seen := make(map[auth.Operation]struct{}, len(operations)+len(values))
+	for _, operation := range operations {
+		seen[operation] = struct{}{}
+	}
+	for _, operation := range values {
+		if _, ok := seen[operation]; ok {
+			continue
+		}
+		seen[operation] = struct{}{}
+		operations = append(operations, operation)
+	}
+	return operations
 }
 
 // hasMappedValue reports whether any token claim value is explicitly mapped.
