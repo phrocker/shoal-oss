@@ -34,14 +34,15 @@ The event log retains 10,000 logical event slots by default and durably records
 its event-local readable floor without advancing the shared runtime history
 floor. Expired cells are physically tombstoned with their owning guards while
 the floor advances atomically; sequence-specific guards prevent a retired
-ownership claim from being revived when a physical slot is reused. Every
-publication declares a UTC retry deadline no more than 24 hours ahead; a slot
-cannot be retired before that backend-enforced deadline, regardless of the
-caller-controlled event occurrence time. Capacity fails closed while an
-unexpired receipt occupies the required slot. Exact retries after their
-deadline return `fleetevents.ErrPublicationExpired`. Reusing an expired token
-with a new deadline creates a distinct event identity only after its old
-receipt has left the bounded log, so an evicted event ID cannot be resurrected.
+ownership claim from being revived when a physical slot is reused. Publication
+receipts are keyed independently by a digest of the caller token and retained
+for their declared UTC retry window of at most 24 hours. Event slots therefore
+rotate at the configured log bound without waiting for receipt expiry, while
+an exact retry still returns the original receipt after its event leaves the
+readable log. Reusing an active token with changed content or deadline fails
+closed; expired receipts are incrementally pruned and the token may then begin
+a new window with a distinct event identity. Exact retries after their
+deadline return `fleetevents.ErrPublicationExpired`.
 A cursor below the floor returns `fleetevents.ErrResyncRequired`.
 Subscription records likewise use bounded deterministic slots: active
 collisions fail closed, while expired or revoked occupants can be replaced.
@@ -76,6 +77,14 @@ state and is re-derived from current labels rather than persisted from callers.
 Lifecycle receipts retain the durable transition's original authorization
 fingerprint, expiry, request, and correlation pins across an ambiguous retry,
 while the current decision is still reauthorized before each attempt.
+Dispatch mutations atomically persist an immutable transition outbox/history
+entry with the action state. Publication acknowledges that entry only after
+both event append and lifecycle audit succeed. `DispatchService` can explicitly
+reconcile pending transitions for an action with a fresh authorized context,
+independent of the original request deadline and after runtime restart; later
+action states cannot overwrite an earlier unpublished transition. Lifecycle
+interaction sinks authorize exact evidence with the transition's `dispatch` or
+`invoke` operation, rather than requiring unrelated `retrieve` permission.
 
 `webapi.NewFleetEventsHandler` serves the `/api/v1/fleet/events/` subtree and
 `webapi.Handler.MountFleetEvents` mounts it once through the existing

@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"reflect"
+	"sort"
 	"sync"
 	"testing"
 	"time"
@@ -590,8 +591,115 @@ func TestDispatchTerminalEventReconcilesOnInvokeRetry(t *testing.T) {
 	completed, err := service.Invoke(ctx, InvokeRequest{
 		Enqueue: request, ClaimID: []byte("claim"), Lease: time.Minute,
 	})
-	if err != nil || completed.State != DispatchSucceeded || events.calls != 3 {
+	if err != nil || completed.State != DispatchSucceeded || events.calls != 2 {
 		t.Fatalf("terminal event retry = %#v, calls=%d, err=%v", completed, events.calls, err)
+	}
+}
+
+func TestDispatchOutboxPreservesTransitionsAndReconcilesAfterDeadline(t *testing.T) {
+	now := time.Date(2026, 9, 6, 12, 0, 0, 0, time.UTC)
+	clock := now
+	authority, _ := auth.NewAuthorityWithClock(func() time.Time { return clock })
+	registryStore := newMemoryStore()
+	registry, _ := NewService(Config{
+		Store: registryStore, Resolver: authority.Resolver(),
+		Recorder: &memoryRecorder{}, Snapshots: fixedSnapshot{now},
+		Executors: executorMap{"exec": &dispatchExecutor{
+			result: ExecutionResult{Output: json.RawMessage(`{"ok":true}`)},
+		}},
+		Clock: func() time.Time { return clock },
+	})
+	registryStore.records["agent"] = Stored{Descriptor: dispatchDescriptor(now)}
+	store := newMemoryDispatchStore()
+	events := &controlledDispatchEvents{err: errors.New("event unavailable")}
+	service, _ := NewDispatchService(DispatchConfig{
+		Store: store, Registry: registry, Resolver: authority.Resolver(),
+		Recorder: &dispatchRecorder{}, Events: events,
+		Clock: func() time.Time { return clock },
+	})
+	decision := dispatchDecisionWithProvenance(
+		t, now, "request", "correlation", 1, now.Add(2*time.Hour))
+	ctx := bindDecision(t, authority, decision)
+	request := dispatchEnqueue(now, "request")
+	request.Context.Deadline = now.Add(time.Minute)
+	if _, err := service.Enqueue(ctx, request); !errors.Is(err, ErrActionCommitted) {
+		t.Fatalf("enqueue event failure = %v", err)
+	}
+	events.err = nil
+	clock = request.Context.Deadline.Add(time.Minute)
+	if err := service.ReconcileActionTransitions(ctx, request.ID); err != nil {
+		t.Fatalf("deadline-independent reconciliation = %v", err)
+	}
+	if !reflect.DeepEqual(events.kinds, []string{
+		"action.enqueued", "action.enqueued",
+	}) {
+		t.Fatalf("published kinds = %v", events.kinds)
+	}
+	page, err := store.PendingActionTransitions(
+		context.Background(), request.ID, nil, MaxDispatchListResults)
+	if err != nil || len(page.Transitions) != 0 {
+		t.Fatalf("pending transitions = %#v, %v", page, err)
+	}
+}
+
+func TestDispatchOutboxRetainsEarlierTransitionAfterStateAdvances(t *testing.T) {
+	now := time.Date(2026, 9, 6, 13, 0, 0, 0, time.UTC)
+	authority, _ := auth.NewAuthorityWithClock(func() time.Time { return now })
+	registryStore := newMemoryStore()
+	registry, _ := NewService(Config{
+		Store: registryStore, Resolver: authority.Resolver(),
+		Recorder: &memoryRecorder{}, Snapshots: fixedSnapshot{now},
+		Executors: executorMap{"exec": &dispatchExecutor{
+			result: ExecutionResult{Output: json.RawMessage(`{"ok":true}`)},
+		}},
+		Clock: func() time.Time { return now },
+	})
+	registryStore.records["agent"] = Stored{Descriptor: dispatchDescriptor(now)}
+	store := newMemoryDispatchStore()
+	events := &controlledDispatchEvents{}
+	service, _ := NewDispatchService(DispatchConfig{
+		Store: store, Registry: registry, Resolver: authority.Resolver(),
+		Recorder: &dispatchRecorder{}, Events: events,
+		Clock: func() time.Time { return now },
+	})
+	decision := dispatchDecision(
+		t, "owner", "actor", "request",
+		auth.OperationDispatch, auth.OperationInvoke)
+	ctx := bindDecision(t, authority, decision)
+	request := dispatchEnqueue(now, "request")
+	queued, err := service.Enqueue(ctx, request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	events.err = errors.New("event unavailable")
+	if _, err := service.Claim(ctx, ClaimRequest{
+		ID: queued.ID, ExpectedVersion: queued.Version, ClaimID: []byte("claim"),
+		Lease: time.Minute, Context: request.Context,
+	}); !errors.Is(err, ErrActionCommitted) {
+		t.Fatalf("claim publication failure = %v", err)
+	}
+	claimed, err := store.GetAction(ctx, queued.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.ExecuteClaim(ctx, claimed); !errors.Is(
+		err, ErrActionCommitted,
+	) {
+		t.Fatalf("completion with earlier pending transition = %v", err)
+	}
+	current, err := store.GetAction(ctx, queued.ID)
+	if err != nil || current.State != DispatchSucceeded {
+		t.Fatalf("advanced state = %#v, %v", current, err)
+	}
+	events.err = nil
+	if err := service.ReconcileActionTransitions(ctx, queued.ID); err != nil {
+		t.Fatal(err)
+	}
+	got := events.kinds[len(events.kinds)-2:]
+	if !reflect.DeepEqual(got, []string{
+		"action.claimed", "action.completed",
+	}) {
+		t.Fatalf("reconciled transition order = %v (all %v)", got, events.kinds)
 	}
 }
 
@@ -711,8 +819,10 @@ func TestDispatchSchemaInfersObjectFromObjectKeywords(t *testing.T) {
 }
 
 type memoryDispatchStore struct {
-	mu      sync.Mutex
-	records map[string]ActionRecord
+	mu          sync.Mutex
+	records     map[string]ActionRecord
+	transitions map[string]ActionTransition
+	completed   map[string]bool
 }
 
 type uniqueTokenDispatchStore struct {
@@ -733,7 +843,11 @@ func (s *uniqueTokenDispatchStore) ApplyAction(
 }
 
 func newMemoryDispatchStore() *memoryDispatchStore {
-	return &memoryDispatchStore{records: make(map[string]ActionRecord)}
+	return &memoryDispatchStore{
+		records:     make(map[string]ActionRecord),
+		transitions: make(map[string]ActionTransition),
+		completed:   make(map[string]bool),
+	}
 }
 
 func (s *memoryDispatchStore) GetAction(_ context.Context, id []byte) (ActionRecord, error) {
@@ -762,7 +876,66 @@ func (s *memoryDispatchStore) ApplyAction(_ context.Context, mutation DispatchMu
 		return ActionRecord{}, ErrActionConflict
 	}
 	s.records[string(mutation.Record.ID)] = cloneActionRecord(mutation.Record)
+	if mutation.TransitionKind != "" {
+		transition, err := NewActionTransition(
+			mutation.Token, mutation.TransitionKind, mutation.Record)
+		if err != nil {
+			return ActionRecord{}, err
+		}
+		key := string(transition.ID)
+		if current, ok := s.transitions[key]; ok &&
+			!reflect.DeepEqual(current, transition) {
+			return ActionRecord{}, ErrActionConflict
+		}
+		s.transitions[key] = transition
+	}
 	return cloneActionRecord(mutation.Record), nil
+}
+
+func (s *memoryDispatchStore) PendingActionTransitions(
+	_ context.Context, actionID, after []byte, limit int,
+) (ActionTransitionPage, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var keys []string
+	for key, transition := range s.transitions {
+		if bytes.Equal(transition.Record.ID, actionID) &&
+			key > string(after) && !s.completed[key] {
+			keys = append(keys, key)
+		}
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		left, right := s.transitions[keys[i]], s.transitions[keys[j]]
+		if left.Record.Version != right.Record.Version {
+			return left.Record.Version < right.Record.Version
+		}
+		return keys[i] < keys[j]
+	})
+	result := ActionTransitionPage{}
+	for _, key := range keys {
+		if len(result.Transitions) == limit {
+			result.Next = append([]byte(nil), []byte(key)...)
+			break
+		}
+		transition := s.transitions[key]
+		transition.Record = cloneActionRecord(transition.Record)
+		result.Transitions = append(result.Transitions, transition)
+	}
+	return result, nil
+}
+
+func (s *memoryDispatchStore) CompleteActionTransition(
+	_ context.Context, transition ActionTransition,
+) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	key := string(transition.ID)
+	current, ok := s.transitions[key]
+	if !ok || !reflect.DeepEqual(current, transition) {
+		return ErrActionConflict
+	}
+	s.completed[key] = true
+	return nil
 }
 
 func (s *memoryDispatchStore) ScanActions(_ context.Context, after []byte, limit int) (ActionPage, error) {
@@ -1077,6 +1250,7 @@ func (dispatchEvents) PublishActionEvent(context.Context, string, ActionRecord) 
 type controlledDispatchEvents struct {
 	calls int
 	err   error
+	kinds []string
 }
 
 type terminalFailEvents struct {
@@ -1092,8 +1266,11 @@ func (e *terminalFailEvents) PublishActionEvent(_ context.Context, kind string, 
 	return nil
 }
 
-func (e *controlledDispatchEvents) PublishActionEvent(context.Context, string, ActionRecord) error {
+func (e *controlledDispatchEvents) PublishActionEvent(
+	_ context.Context, kind string, _ ActionRecord,
+) error {
 	e.calls++
+	e.kinds = append(e.kinds, kind)
 	return e.err
 }
 

@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
@@ -598,6 +599,57 @@ type integratedEvents struct{}
 
 func (integratedEvents) PublishActionEvent(context.Context, string, fleet.ActionRecord) error {
 	return nil
+}
+
+func TestDispatchStorePersistsImmutableTransitionOutboxAcrossRestart(t *testing.T) {
+	directory := t.TempDir()
+	runtime := openDispatchRuntime(t, directory)
+	store, err := NewDispatchStore(runtime, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record := testActionRecord()
+	token := []byte("enqueue-transition")
+	if _, err := store.ApplyAction(context.Background(), fleet.DispatchMutation{
+		Token: token, TransitionKind: "action.enqueued", Record: record,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.Close(); err != nil {
+		t.Fatal(err)
+	}
+	runtime = openDispatchRuntime(t, directory)
+	defer runtime.Close()
+	store, err = NewDispatchStore(runtime, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	page, err := store.PendingActionTransitions(
+		context.Background(), record.ID, nil, 10)
+	if err != nil || len(page.Transitions) != 1 {
+		t.Fatalf("pending after restart = %#v, %v", page, err)
+	}
+	transition := page.Transitions[0]
+	if transition.Kind != "action.enqueued" ||
+		!bytes.Equal(transition.ID, token) ||
+		!reflect.DeepEqual(transition.Record, record) {
+		t.Fatalf("transition = %#v", transition)
+	}
+	if err := store.CompleteActionTransition(
+		context.Background(), transition); err != nil {
+		t.Fatal(err)
+	}
+	page, err = store.PendingActionTransitions(
+		context.Background(), record.ID, nil, 10)
+	if err != nil || len(page.Transitions) != 0 {
+		t.Fatalf("pending after completion = %#v, %v", page, err)
+	}
+	history, _, err := store.readTransition(
+		context.Background(), record.ID, record.Version, token)
+	if err != nil || history.CompletedAt.IsZero() ||
+		!reflect.DeepEqual(history.Transition, transition) {
+		t.Fatalf("durable transition history = %#v, %v", history, err)
+	}
 }
 
 type integratedExecutors map[string]fleet.Executor

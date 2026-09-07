@@ -898,8 +898,8 @@ func openService(
 			embedded.Close()
 			return closed, err
 		}
-		fleetLifecycleRecorder, err := explorerfleet.NewLifecycleRecorder(
-			fleetInteractionSink{durable: corpus, authorized: client})
+		fleetLifecycleRecorder, err := explorerfleet.NewLifecycleRecorderWithReader(
+			fleetInteractionSink{durable: corpus, authorized: client}, corpus)
 		if err != nil {
 			store.Close()
 			embedded.Close()
@@ -930,10 +930,14 @@ func openService(
 			return closed, err
 		}
 		fleetEvents, actionEvents, err :=
-			explorerfleetevents.ComposeWithPublisher(
+			explorerfleetevents.ComposeWithPublisherAndReader(
 				embedded.Runtime, workspacePublicationDomain, config.resolver,
-				generationReader, interactionRecorder, snapshots, fleetRegistry,
-				cursorKey, config.clock,
+				generationReader, func(operation auth.Operation) interaction.ResultSink {
+					if sink := client.FleetActionInteractionSink(operation); sink != nil {
+						return sink
+					}
+					return client
+				}, corpus, snapshots, fleetRegistry, cursorKey, config.clock,
 			)
 		if err != nil {
 			store.Close()

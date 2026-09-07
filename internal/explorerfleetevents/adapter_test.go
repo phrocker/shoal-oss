@@ -422,6 +422,76 @@ func TestAdapterRetentionFloorAndIdempotencyExpirySurviveRestart(t *testing.T) {
 	}
 }
 
+func TestAdapterActivePublicationIdentitySurvivesSlotRotation(t *testing.T) {
+	ctx := context.Background()
+	config := runtimeConfig(t.TempDir())
+	runtime, err := explorercoord.Open(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.Close()
+	adapter, err := NewWithRetention(runtime, config.Domain, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 9, 7, 12, 0, 0, 0, time.UTC)
+	first := fleetevents.PublishRequest{
+		Token: []byte("stable-publication"), RetryUntil: now.Add(time.Hour),
+		Event: testEvent(1),
+	}
+	first.Event.OccurredAt = now
+	published, err := adapter.Append(ctx, first, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for index := 0; index < 20; index++ {
+		event := testEvent(index + 10)
+		event.OccurredAt = now.Add(time.Duration(index+1) * time.Second)
+		if _, err := adapter.Append(ctx, fleetevents.PublishRequest{
+			Token:      []byte(fmt.Sprintf("rotation-%d", index)),
+			RetryUntil: now.Add(time.Hour), Event: event,
+		}, now.Add(time.Duration(index+1)*time.Second)); err != nil {
+			t.Fatalf("rotation %d: %v", index, err)
+		}
+	}
+	replayed, err := adapter.Append(ctx, first, now.Add(30*time.Second))
+	if err != nil || !replayed.Repeated ||
+		!bytes.Equal(replayed.EventID, published.EventID) {
+		t.Fatalf("rotated exact retry = %#v, %v", replayed, err)
+	}
+	changedDeadline := first
+	changedDeadline.RetryUntil = first.RetryUntil.Add(time.Minute)
+	if _, err := adapter.Append(
+		ctx, changedDeadline, now.Add(30*time.Second),
+	); !errors.Is(err, transaction.ErrConflict) {
+		t.Fatalf("changed active deadline = %v", err)
+	}
+	changedContent := first
+	changedContent.Event.Kind = "agent.failed"
+	if _, err := adapter.Append(
+		ctx, changedContent, now.Add(30*time.Second),
+	); !errors.Is(err, transaction.ErrConflict) {
+		t.Fatalf("changed active content = %v", err)
+	}
+	later := now.Add(2 * time.Hour)
+	expirySweep := testEvent(100)
+	expirySweep.OccurredAt = later
+	if _, err := adapter.Append(ctx, fleetevents.PublishRequest{
+		Token: []byte("after-expiry-sweep"), RetryUntil: later.Add(time.Hour),
+		Event: expirySweep,
+	}, later); err != nil {
+		t.Fatalf("post-expiry publication = %v", err)
+	}
+	receipts, err := runtime.ScanCommitted(
+		ctx, explorercoord.CommittedScanRequest{
+			Table: Table, RowPrefix: publicationPrefix,
+			Family: recordFamily, Qualifier: recordQualifier, Limit: 100,
+		})
+	if err != nil || len(receipts.Cells) != 1 {
+		t.Fatalf("retained publication receipts = %d, %v", len(receipts.Cells), err)
+	}
+}
+
 func TestAdapterRejectsOversizedRetryWindows(t *testing.T) {
 	ctx := context.Background()
 	config := runtimeConfig(t.TempDir())
