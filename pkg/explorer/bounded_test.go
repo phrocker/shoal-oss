@@ -33,6 +33,7 @@ func TestSnapshotStableAcrossRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	before, err := corpus.Snapshot(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -51,6 +52,92 @@ func TestSnapshotStableAcrossRestart(t *testing.T) {
 	}
 	if before != after {
 		t.Fatalf("snapshot changed across restart: before=%+v after=%+v", before, after)
+	}
+}
+
+func TestHistoricalSnapshotValidationSurvivesRestart(t *testing.T) {
+	ctx := context.Background()
+	dataDir := t.TempDir()
+	corpus, err := Open(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstReceipt, err := corpus.Ingest(ctx, Source{
+		URI: "file:///snapshot-one.txt", MediaType: MediaTypeText,
+		Content: "snapshot one",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstView, err := corpus.Document(
+		ctx, firstReceipt.Document.ID, firstReceipt.Revision.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := corpus.Snapshot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const postSnapshotEdgeID = shoal.ID("post-snapshot-edge")
+	if err := corpus.Connect(ctx, graph.Edge{
+		ID:   postSnapshotEdgeID,
+		From: firstReceipt.Document.ID, To: firstView.Root.Spans[0].ID,
+		Type: "post_snapshot", Weight: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	secondReceipt, err := corpus.Ingest(ctx, Source{
+		URI: "file:///snapshot-two.txt", MediaType: MediaTypeText,
+		Content: "snapshot two",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondView, err := corpus.Document(
+		ctx, secondReceipt.Document.ID, secondReceipt.Revision.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := corpus.Snapshot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := corpus.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	if err := reopened.ValidateSnapshot(
+		ctx, shoal.ID(first.ID), first.AsOf,
+		[]shoal.ID{firstView.Root.Spans[0].ID},
+	); err != nil {
+		t.Fatalf("historical snapshot was not durable: %v", err)
+	}
+	if err := reopened.ValidateSnapshot(
+		ctx, "forged-snapshot", first.AsOf, nil,
+	); !shoal.IsErrorCode(err, shoal.ErrorConflict) {
+		t.Fatalf("forged snapshot validation error = %v", err)
+	}
+	if err := reopened.ValidateSnapshot(
+		ctx, shoal.ID(first.ID), first.AsOf,
+		[]shoal.ID{secondView.Root.Spans[0].ID},
+	); !shoal.IsErrorCode(err, shoal.ErrorConflict) {
+		t.Fatalf("post-snapshot source validation error = %v", err)
+	}
+	if err := reopened.ValidateSnapshotEvidence(
+		ctx, shoal.ID(first.ID), first.AsOf,
+		nil, []shoal.ID{postSnapshotEdgeID},
+	); !shoal.IsErrorCode(err, shoal.ErrorConflict) {
+		t.Fatalf("post-snapshot edge validation error = %v", err)
+	}
+	if err := reopened.ValidateSnapshotEvidence(
+		ctx, shoal.ID(second.ID), second.AsOf,
+		nil, []shoal.ID{postSnapshotEdgeID},
+	); err != nil {
+		t.Fatalf("current snapshot edge was not durable: %v", err)
 	}
 }
 
@@ -171,6 +258,63 @@ func TestSelfEdgeDoesNotCreateFalseContinuation(t *testing.T) {
 	}
 	if result.Truncated || result.NextAfterEdgeID != "" {
 		t.Fatalf("self edge produced continuation: %+v", result)
+	}
+}
+
+func TestBoundedNeighborhoodReportsSuppressedAdjacencyScans(t *testing.T) {
+	corpus := &Explorer{
+		graphInitialized: true,
+		graphNodes: map[shoal.ID]graph.Node{
+			"source":  {ID: "source"},
+			"hidden":  {ID: "hidden", Kind: "interaction.session"},
+			"visible": {ID: "visible"},
+		},
+		graphEdges: map[shoal.ID]graph.Edge{
+			"a-hidden": {
+				ID: "a-hidden", From: "source", To: "hidden",
+				Type: "interaction.retrieved", Weight: 1,
+			},
+			"b-visible": {
+				ID: "b-visible", From: "source", To: "visible",
+				Type: "related", Weight: 1,
+			},
+		},
+		outgoing: map[shoal.ID][]shoal.ID{
+			"source": {"a-hidden", "b-visible"},
+		},
+		incoming: map[shoal.ID][]shoal.ID{},
+	}
+	first, err := corpus.BoundedNeighborhood(
+		context.Background(),
+		BoundedNeighborhoodRequest{
+			NodeIDs: []shoal.ID{"source"}, Depth: 1,
+			Fanout: 1, MaxNodes: 2, Direction: GraphDirectionOutgoing,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.ScannedEdges != 1 || !first.ScannedEdgesKnown ||
+		len(first.Neighborhood.Edges) != 0 ||
+		!first.Truncated || !first.Continuation ||
+		first.NextAfterEdgeID != "a-hidden" {
+		t.Fatalf("suppressed first page = %#v", first)
+	}
+	second, err := corpus.BoundedNeighborhood(
+		context.Background(),
+		BoundedNeighborhoodRequest{
+			NodeIDs: []shoal.ID{"source"}, Depth: 1,
+			Fanout: 1, MaxNodes: 2, Direction: GraphDirectionOutgoing,
+			AfterEdgeID: first.NextAfterEdgeID,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.ScannedEdges != 1 || !second.ScannedEdgesKnown ||
+		len(second.Neighborhood.Edges) != 1 ||
+		second.Neighborhood.Edges[0].ID != "b-visible" {
+		t.Fatalf("visible second page = %#v", second)
 	}
 }
 

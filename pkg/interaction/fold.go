@@ -182,14 +182,12 @@ func (f Fold) Validate() error {
 	if err := validateSummaryDigest(f.SummaryDigest); err != nil {
 		return err
 	}
-	touched := 0
 	for _, member := range f.Members {
 		if err := shoal.ValidateRequiredID(
 			"fold session ID", member.SessionID,
 		); err != nil {
 			return err
 		}
-		touched += len(member.RetrievedNodeIDs) + len(member.CitedNodeIDs)
 		for _, id := range member.RetrievedNodeIDs {
 			if err := shoal.ValidateRequiredID(
 				"fold retrieved node ID", id,
@@ -208,12 +206,6 @@ func (f Fold) Validate() error {
 				return err
 			}
 		}
-	}
-	if touched > MaxTouchedNodes {
-		return shoal.NewError(
-			shoal.ErrorInvalidArgument,
-			"fold exceeds the public touched-node bound",
-		)
 	}
 	return nil
 }
@@ -315,7 +307,7 @@ func (f Fold) Subgraph(resolve VisibilityResolver) (FoldSubgraph, error) {
 		},
 	}
 	setIfPresent(node.Properties, PropertySummaryDigest, canonical.SummaryDigest)
-	setIfPresent(node.Properties, PropertyVisibility, Expression(visibility))
+	setVisibility(node.Properties, visibility)
 
 	edges := make([]graph.Edge, 0, len(canonical.Members)+len(touched))
 	for _, member := range canonical.Members {
@@ -385,24 +377,5 @@ func requireSourceNodeID(id shoal.ID) error {
 // a caller cannot use the field to smuggle prompt or answer text, or a
 // model-chosen correlation string, into a node payload.
 func validateSummaryDigest(digest string) error {
-	if digest == "" {
-		return nil
-	}
-	if len(digest) != 64 {
-		return shoal.NewError(
-			shoal.ErrorInvalidArgument,
-			"fold summary digest must be a SHA-256 digest in lowercase hex",
-		)
-	}
-	for i := 0; i < len(digest); i++ {
-		c := digest[i]
-		if (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') {
-			continue
-		}
-		return shoal.NewError(
-			shoal.ErrorInvalidArgument,
-			"fold summary digest must be a SHA-256 digest in lowercase hex",
-		)
-	}
-	return nil
+	return validateDigest("fold summary digest", digest, true)
 }

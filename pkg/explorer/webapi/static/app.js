@@ -17,6 +17,9 @@ const state = {
   auth: {configured: false},
   ontology: null,
   ontologyProposals: null,
+  workspaceID: "",
+  workspaceSettings: null,
+  lensChoices: null,
   reauthRequired: false,
   capabilities: {
     documents: false,
@@ -84,7 +87,9 @@ function isDenied(error) {
 // acquired in memory. With -dev-auth no token exists, so the header is absent
 // and the request is byte-identical to the local development path.
 function authHeaders() {
-  return state.accessToken ? {authorization: `Bearer ${state.accessToken}`} : {};
+  const headers = state.accessToken ? {authorization: `Bearer ${state.accessToken}`} : {};
+  if (state.workspaceID) headers["Shoal-Workspace-ID"] = state.workspaceID;
+  return headers;
 }
 
 // challengedForBearer reports whether the transport answered with the standard
@@ -3245,6 +3250,429 @@ new ResizeObserver(() => {
 }).observe(canvas);
 renderGraphList();
 applyCapabilities();
+
+function wirePath(workspaceID, suffix) {
+  return `/api/v1/workspaces/${encodeURIComponent(workspaceID)}/settings${suffix || ""}`;
+}
+
+async function jsonRequest(path, options = {}) {
+  const headers = {"accept": "application/json", ...authHeaders(), ...(options.headers || {})};
+  const response = await fetch(path, {...options, headers});
+  const value = await response.json();
+  if (!response.ok) throw apiError(value, response);
+  return value;
+}
+
+function currentWorkspaceID() {
+  const input = document.getElementById("workspace-id");
+  return String(input && input.value || "").trim();
+}
+
+function setWorkspaceID(value) {
+  state.workspaceID = String(value || "").trim();
+}
+
+function resetIdentityBoundUI() {
+  state.workspaceID = "";
+  state.workspaceSettings = null;
+  state.lensChoices = null;
+  const workspace = document.getElementById("workspace-id");
+  if (workspace) workspace.value = "";
+  for (const id of ["chat-results", "provenance-results"]) {
+    const element = document.getElementById(id);
+    if (element) element.replaceChildren();
+  }
+  const settings = document.getElementById("settings-json");
+  if (settings) settings.value = "{}";
+  const lens = document.getElementById("lens-select");
+  if (lens) lens.replaceChildren();
+}
+
+function logout() {
+  state.accessToken = null;
+  state.identity = null;
+  state.reauthRequired = false;
+  clearLoginFlow();
+  resetIdentityBoundUI();
+  configureLoginUI(state.auth);
+  loadIdentity();
+}
+
+function appendText(parent, tag, text, className) {
+  const element = document.createElement(tag);
+  if (className) element.className = className;
+  element.textContent = String(text === undefined || text === null ? "" : text);
+  parent.append(element);
+  return element;
+}
+
+function displayOpaqueID(value) {
+  const encoded = String(value || "");
+  if (!encoded) return "(none)";
+  try {
+    return `${encoded} (${base64UrlDecode(encoded)})`;
+  } catch (_) {
+    return encoded;
+  }
+}
+
+function claimText(claim) {
+  const value = claim && claim.object;
+  if (!value) return "(structured claim)";
+  if (Object.prototype.hasOwnProperty.call(value, "string")) return value.string;
+  if (Object.prototype.hasOwnProperty.call(value, "id")) return displayOpaqueID(value.id);
+  return JSON.stringify(value);
+}
+
+function safeSourceHref(value) {
+  const source = String(value || "");
+  try {
+    const parsed = new URL(source, window.location.href);
+    return parsed.protocol === "http:" || parsed.protocol === "https:" ? parsed.href : "";
+  } catch (_) {
+    return "";
+  }
+}
+
+function renderCitation(parent, evidence) {
+  const item = document.createElement("li");
+  const verified = evidence && evidence.verification_status === "verified";
+  item.className = `citation-item ${verified ? "verified" : "unverified"}`;
+  appendText(item, "strong", `${verified ? "Verified" : "Unverified"} ${evidence.use || "evidence"}`);
+  appendText(item, "div", `Anchor: ${displayOpaqueID(evidence.anchor_id)}`, "provenance-meta");
+  const citation = evidence.citation;
+  if (citation) {
+    appendText(item, "div", `Document: ${displayOpaqueID(citation.document_id)}`, "provenance-meta");
+    appendText(item, "div", `Revision: ${displayOpaqueID(citation.revision_id)}`, "provenance-meta");
+    if (citation.section_id) appendText(item, "div", `Section: ${displayOpaqueID(citation.section_id)}`, "provenance-meta");
+    if (citation.span_id) appendText(item, "div", `Span: ${displayOpaqueID(citation.span_id)}`, "provenance-meta");
+  }
+  if (evidence.source_uri) {
+    const href = safeSourceHref(evidence.source_uri);
+    if (href) {
+      const link = document.createElement("a");
+      link.textContent = evidence.source_uri;
+      link.href = href;
+      link.rel = "noreferrer";
+      item.append(link);
+    } else {
+      appendText(item, "div", `Source: ${evidence.source_uri}`, "provenance-meta");
+    }
+  }
+  appendText(item, "div", `Sources: ${(evidence.source_ids || []).map(displayOpaqueID).join(", ")}`, "provenance-meta");
+  appendText(item, "div", `Visibility: ${(evidence.visibility || []).join(" & ") || "public"}`, "provenance-meta");
+  if (evidence.quote) appendText(item, "q", evidence.quote, "citation-quote");
+  parent.append(item);
+}
+
+function renderChatResponse(value) {
+  const results = document.getElementById("chat-results");
+  results.replaceChildren();
+  const verified = value && value.finalized === true &&
+    value.durably_recorded === true && value.verification === "verified";
+  const card = document.createElement("article");
+  card.className = `chat-response ${verified ? "verified" : "unverified"}`;
+  appendText(card, "h3", verified
+    ? "Verified and durably recorded response"
+    : "Response not verified");
+  appendText(card, "p", `Output label: ${value.output_visibility || "public"}`);
+  const interpretation = value.ontology_interpretation || {status: "unresolved"};
+  appendText(card, "p", interpretation.status === "selected"
+    ? `Ontology interpretation: selected ${displayOpaqueID(interpretation.schema_id)} / ${displayOpaqueID(interpretation.version_id)}`
+    : "Ontology interpretation: unresolved; no trusted lens was applied.");
+  appendText(card, "p", `Session: ${displayOpaqueID(value.session_id)}`, "provenance-meta");
+  for (const claim of value.claims || []) {
+    const claimCard = document.createElement("section");
+    appendText(claimCard, "h4", claimText(claim), "chat-answer");
+    appendText(claimCard, "p", `Status: ${claim.status}; confidence: ${claim.confidence}`);
+    const citations = document.createElement("ol");
+    citations.className = "citation-list";
+    for (const evidence of claim.citations || []) renderCitation(citations, evidence);
+    for (const evidence of claim.derived_evidence || []) renderCitation(citations, evidence);
+    claimCard.append(citations);
+    card.append(claimCard);
+  }
+  for (const issue of value.issues || []) {
+    appendText(card, "p", `${issue.kind}: ${issue.reason || issue.input}`, "unverified");
+  }
+  const sources = document.createElement("details");
+  const sourceSummary = document.createElement("summary");
+  sourceSummary.textContent = `Complete touched source set (${(value.sources || []).length})`;
+  const sourceList = document.createElement("ul");
+  sourceList.className = "source-list";
+  for (const source of value.sources || []) {
+    appendText(sourceList, "li",
+      `${displayOpaqueID(source.id)} · anchors ${(source.anchor_ids || []).map(displayOpaqueID).join(", ")} · visibility ${(source.visibility || []).join(" & ") || "public"}`);
+  }
+  sources.append(sourceSummary, sourceList);
+  card.append(sources);
+  results.append(card);
+}
+
+async function submitChat() {
+  const status = document.getElementById("chat-status");
+  const question = String(document.getElementById("chat-question").value || "").trim();
+  if (!question) {
+    setStatus(status, "Enter a question.", "empty-state");
+    return;
+  }
+  setWorkspaceID(currentWorkspaceID());
+  setStatus(status, "Retrieving authorized evidence, reasoning, verifying, and recording…");
+  document.getElementById("chat-send").disabled = true;
+  try {
+    const topK = Number(document.getElementById("chat-top-k").value) || 0;
+    const value = await jsonRequest("/api/v1/ask", {
+      method: "POST",
+      headers: {"content-type": "application/json"},
+      body: JSON.stringify({question, top_k: topK}),
+    });
+    renderChatResponse(value);
+    setStatus(status, "Final response received after durable provenance capture.");
+    await loadProvenance();
+  } catch (error) {
+    showActionError(status, error, "ask the workspace");
+  } finally {
+    document.getElementById("chat-send").disabled = false;
+  }
+}
+
+async function loadWorkspaceSettings() {
+  const status = document.getElementById("settings-status");
+  const workspaceID = currentWorkspaceID();
+  if (!workspaceID) {
+    setStatus(status, "Enter a workspace wire ID.", "empty-state");
+    return;
+  }
+  setWorkspaceID(workspaceID);
+  try {
+    const settings = await jsonRequest(wirePath(workspaceID));
+    const lenses = await jsonRequest(wirePath(workspaceID, "/lens"));
+    state.workspaceSettings = settings;
+    state.lensChoices = lenses;
+    document.getElementById("settings-json").value =
+      JSON.stringify(settings.settings || {}, null, 2);
+    renderLensChoices(lenses);
+    setStatus(status, `Loaded revision ${settings.revision}.`);
+  } catch (error) {
+    showActionError(status, error, "read workspace settings");
+  }
+}
+
+function renderLensChoices(value) {
+  const select = document.getElementById("lens-select");
+  select.replaceChildren();
+  for (const choice of value.choices || []) {
+    const option = document.createElement("option");
+    option.value = JSON.stringify({
+      schema_id: choice.schema_id,
+      version_id: choice.version_id,
+    });
+    option.textContent = `${displayOpaqueID(choice.schema_id)} / ${displayOpaqueID(choice.version_id)}${choice.active ? " (active)" : ""}`;
+    const selected = value.selected_ontology;
+    option.selected = Boolean(selected &&
+      selected.schema_id === choice.schema_id &&
+      selected.version_id === choice.version_id);
+    select.append(option);
+  }
+}
+
+async function saveWorkspaceSettings() {
+  const status = document.getElementById("settings-status");
+  if (!state.workspaceSettings) {
+    setStatus(status, "Load settings before saving.", "empty-state");
+    return;
+  }
+  try {
+    const narrowing = JSON.parse(document.getElementById("settings-json").value || "{}");
+    const value = await jsonRequest(wirePath(state.workspaceID), {
+      method: "PUT",
+      headers: {"content-type": "application/json"},
+      body: JSON.stringify({
+        expected_revision: state.workspaceSettings.revision,
+        mutation_id: randomUrlToken(24),
+        settings: narrowing,
+      }),
+    });
+    state.workspaceSettings = value;
+    setStatus(status, `Saved revision ${value.revision}.`);
+    await loadWorkspaceSettings();
+  } catch (error) {
+    showActionError(status, error, "update workspace settings");
+  }
+}
+
+async function saveLens() {
+  const status = document.getElementById("settings-status");
+  const select = document.getElementById("lens-select");
+  if (!state.workspaceSettings || !select.value) {
+    setStatus(status, "Load settings and choose a trusted lens first.", "empty-state");
+    return;
+  }
+  try {
+    const value = await jsonRequest(wirePath(state.workspaceID, "/lens"), {
+      method: "PUT",
+      headers: {"content-type": "application/json"},
+      body: JSON.stringify({
+        expected_revision: state.workspaceSettings.revision,
+        mutation_id: randomUrlToken(24),
+        selected_ontology: JSON.parse(select.value),
+      }),
+    });
+    state.workspaceSettings = value;
+    setStatus(status, `Selected lens at revision ${value.revision}.`);
+    await loadWorkspaceSettings();
+  } catch (error) {
+    showActionError(status, error, "select the ontology lens");
+  }
+}
+
+async function inspectProvenance(sessionID, target) {
+  try {
+    const value = await jsonRequest(`/api/v1/provenance/${encodeURIComponent(sessionID)}`);
+    appendText(target, "p", `Model: ${value.model.provider || "unknown"} / ${value.model.model || "unknown"}`);
+    appendText(target, "p", `Retrieved: ${(value.retrieved_source_ids || []).map(displayOpaqueID).join(", ") || "none"}`, "provenance-meta");
+    appendText(target, "p", `Cited: ${(value.cited_source_ids || []).map(displayOpaqueID).join(", ") || "none"}`, "provenance-meta");
+    appendText(target, "p", `Turns: ${(value.turns || []).length}; stop: ${value.stop_reason || "unknown"}`);
+  } catch (error) {
+    appendText(target, "p", error.message || String(error), "error");
+  }
+}
+
+async function foldSelectedProvenance(container) {
+  const selected = [...container.querySelectorAll("input")]
+    .filter((input) => input.checked)
+    .map((input) => input.value);
+  if (!selected.length) throw new Error("Select at least one interaction to fold.");
+  const value = await jsonRequest("/api/v1/provenance/fold", {
+    method: "POST",
+    headers: {"content-type": "application/json"},
+    body: JSON.stringify({session_ids: selected}),
+  });
+  return value;
+}
+
+function appendProvenanceCards(results, value, before = null) {
+  const append = (card) => before ? results.insertBefore(card, before) : results.append(card);
+  for (const item of value.interactions || []) {
+    const card = document.createElement("article");
+    card.className = "provenance-card";
+    const label = document.createElement("label");
+    const checkbox = document.createElement("input");
+    checkbox.type = "checkbox";
+    checkbox.value = item.session_id;
+    label.append(checkbox);
+    appendText(label, "span", ` ${item.operation} · ${new Date(item.recorded_at).toLocaleString()}`);
+    card.append(label);
+    appendText(card, "p", `Session: ${displayOpaqueID(item.session_id)}`, "provenance-meta");
+    appendText(card, "p", `Actor: ${displayOpaqueID(item.actor && item.actor.actor_id)}; output: ${item.output_visibility || "public"}`, "provenance-meta");
+    const inspect = document.createElement("button");
+    inspect.type = "button";
+    inspect.textContent = "Inspect exact provenance";
+    inspect.onclick = () => inspectProvenance(item.session_id, card);
+    card.append(inspect);
+    append(card);
+  }
+  for (const item of value.folds || []) {
+    const card = document.createElement("article");
+    card.className = "provenance-card";
+    appendText(card, "strong", `Native provenance fold (${item.member_count} sessions)`);
+    appendText(card, "p", `Fold: ${displayOpaqueID(item.fold_id)}; output: ${item.output_visibility || "public"}`, "provenance-meta");
+    const unfold = document.createElement("button");
+    unfold.type = "button";
+    unfold.textContent = "Unfold exact members";
+    unfold.onclick = async () => {
+      try {
+        const hydrated = await jsonRequest("/api/v1/provenance/unfold", {
+          method: "POST",
+          headers: {"content-type": "application/json"},
+          body: JSON.stringify({fold_id: item.fold_id}),
+        });
+        appendText(card, "p", (hydrated.members || [])
+          .map((member) => displayOpaqueID(member.session_id)).join(", "), "provenance-meta");
+      } catch (error) {
+        appendText(card, "p", error.message || String(error), "error");
+      }
+    };
+    card.append(unfold);
+    append(card);
+  }
+}
+
+async function loadProvenance() {
+  const status = document.getElementById("provenance-status");
+  const results = document.getElementById("provenance-results");
+  if (!status || !results) return;
+  setWorkspaceID(currentWorkspaceID());
+  try {
+    const value = await jsonRequest("/api/v1/provenance");
+    results.replaceChildren();
+    const controls = document.createElement("div");
+    controls.className = "button-row";
+    const fold = document.createElement("button");
+    fold.type = "button";
+    fold.textContent = "Fold selected provenance";
+    fold.onclick = async () => {
+      try {
+        const created = await foldSelectedProvenance(results);
+        setStatus(status, `Fold ${displayOpaqueID(created.fold_id)} ${created.created ? "created" : "already existed"}.`);
+        await loadProvenance();
+      } catch (error) {
+        showActionError(status, error, "fold provenance");
+      }
+    };
+    controls.append(fold);
+    results.append(controls);
+    appendProvenanceCards(results, value);
+    let interactions = (value.interactions || []).length;
+    let folds = (value.folds || []).length;
+    if (value.next_cursor) {
+      const more = document.createElement("button");
+      more.type = "button";
+      more.textContent = "More provenance";
+      let cursor = value.next_cursor;
+      more.onclick = async () => {
+        more.disabled = true;
+        try {
+          const next = await jsonRequest(`/api/v1/provenance?cursor=${encodeURIComponent(cursor)}`);
+          appendProvenanceCards(results, next, more);
+          interactions += (next.interactions || []).length;
+          folds += (next.folds || []).length;
+          cursor = next.next_cursor || "";
+          more.hidden = !cursor;
+          setStatus(status, `Loaded ${interactions} interaction(s) and ${folds} fold(s).`);
+        } catch (error) {
+          showActionError(status, error, "load more provenance");
+        } finally {
+          more.disabled = false;
+        }
+      };
+      results.append(more);
+    }
+    setStatus(status, `Loaded ${interactions} interaction(s) and ${folds} fold(s).`);
+  } catch (error) {
+    results.replaceChildren();
+    showActionError(status, error, "inspect provenance");
+  }
+}
+
+function installProductChatUI() {
+  const chatForm = document.getElementById("chat-form");
+  if (chatForm) chatForm.onsubmit = async (event) => {
+    event.preventDefault();
+    await submitChat();
+  };
+  const load = document.getElementById("settings-load");
+  if (load) load.onclick = loadWorkspaceSettings;
+  const save = document.getElementById("settings-save");
+  if (save) save.onclick = saveWorkspaceSettings;
+  const lens = document.getElementById("lens-save");
+  if (lens) lens.onclick = saveLens;
+  const refresh = document.getElementById("provenance-refresh");
+  if (refresh) refresh.onclick = loadProvenance;
+  const logoutButton = document.getElementById("logout");
+  if (logoutButton) logoutButton.onclick = logout;
+}
+installProductChatUI();
 
 // bootstrap resolves any login before the first identity/data calls so those
 // calls carry a bearer token when one is configured. With -dev-auth the config

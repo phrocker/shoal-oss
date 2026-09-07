@@ -158,14 +158,18 @@ func (f *fixture) newClient(
 		t.Fatal(err)
 	}
 	client, err := authorized.NewClient(authorized.Config{
-		Base:               base,
-		VectorScorer:       trustedVectorScorer(base),
-		Resolver:           f.authority.Resolver(),
-		PolicySelector:     selector,
-		EdgePolicySelector: edgeSelector,
-		PolicyStore:        store,
-		GenerationReader:   f.reader,
-		Clock:              f.clock.Now,
+		Base:                base,
+		VectorScorer:        trustedVectorScorer(base),
+		InteractionWriter:   trustedInteractionWriter(base),
+		InteractionReader:   trustedInteractionReader(base),
+		OntologyInterpreter: trustedOntologyInterpreter(base),
+		SnapshotValidator:   trustedSnapshotValidator(base),
+		Resolver:            f.authority.Resolver(),
+		PolicySelector:      selector,
+		EdgePolicySelector:  edgeSelector,
+		PolicyStore:         store,
+		GenerationReader:    f.reader,
+		Clock:               f.clock.Now,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -176,6 +180,28 @@ func (f *fixture) newClient(
 func trustedVectorScorer(base explorer.Client) authorized.VectorScorer {
 	scorer, _ := base.(authorized.VectorScorer)
 	return scorer
+}
+
+func trustedInteractionReader(base explorer.Client) explorer.InteractionReader {
+	reader, _ := base.(explorer.InteractionReader)
+	return reader
+}
+
+func trustedInteractionWriter(base explorer.Client) explorer.InteractionWriter {
+	writer, _ := base.(explorer.InteractionWriter)
+	return writer
+}
+
+func trustedOntologyInterpreter(
+	base explorer.Client,
+) explorer.OntologyInterpreter {
+	interpreter, _ := base.(explorer.OntologyInterpreter)
+	return interpreter
+}
+
+func trustedSnapshotValidator(base explorer.Client) authorized.SnapshotValidator {
+	validator, _ := base.(authorized.SnapshotValidator)
+	return validator
 }
 
 func (f *fixture) decision(
@@ -512,6 +538,75 @@ func TestAuthorizedVectorRetrievalUsesTrustedScorer(t *testing.T) {
 	}
 	if malicious.scoreCalls != 0 {
 		t.Fatalf("untrusted vector scorer was called %d times", malicious.scoreCalls)
+	}
+}
+
+func TestAuthorizedVectorRetrievalRejectsUntrustedEmbeddingProvenance(
+	t *testing.T,
+) {
+	f := newFixture(t)
+	base, err := explorer.OpenWithOptions(t.TempDir(), explorer.Options{
+		Embedder: model.FakeEmbedder{Model: "trusted-space", Dimensions: 8},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = base.Close() })
+	clientA := f.newClient(t, base, f.store, f.sourceA, f.policyA, nil)
+	if _, err := clientA.Ingest(f.admin(t), explorer.Source{
+		URI:       "file:///trusted-space.txt",
+		MediaType: explorer.MediaTypeText,
+		Content:   "trusted embedding provenance",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	request := retrieval.Request{
+		Text:  "trusted embedding provenance",
+		TopK:  1,
+		Modes: []retrieval.Mode{retrieval.ModeVector},
+	}
+	forged, err := clientA.Retrieve(f.alice(t), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	constituent, err := retrieval.EmbeddingSpaceIdentityID("forged-space")
+	if err != nil {
+		t.Fatal(err)
+	}
+	forged.EmbeddingSpaceIDs = []shoal.ID{constituent}
+	forged.EmbeddingSpaceID, err = retrieval.EmbeddingSpaceSetID(constituent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hooked := &hookClient{
+		Client: base,
+		retrieve: func(
+			context.Context,
+			retrieval.Request,
+		) (retrieval.Response, error) {
+			return forged, nil
+		},
+	}
+	selector, err := authorized.NewStaticPolicySelector(f.sourceA, f.policyA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, err := authorized.NewClient(authorized.Config{
+		Base:             hooked,
+		VectorScorer:     base,
+		Resolver:         f.authority.Resolver(),
+		PolicySelector:   selector,
+		PolicyStore:      f.store,
+		GenerationReader: f.reader,
+		Clock:            f.clock.Now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.Retrieve(
+		f.alice(t), request,
+	); !shoal.IsErrorCode(err, shoal.ErrorInternal) {
+		t.Fatalf("forged embedding provenance error = %v", err)
 	}
 }
 
@@ -2515,6 +2610,13 @@ func (c *maliciousVectorClient) VectorScores(
 	return map[shoal.ID]shoal.Score{}, nil
 }
 
+func (c *maliciousVectorClient) VectorEmbeddingSpaceIDs(
+	context.Context,
+	explorer.VectorScoreRequest,
+) ([]shoal.ID, error) {
+	return []shoal.ID{"malicious-space"}, nil
+}
+
 type countingVectorScorer struct {
 	authorized.VectorScorer
 	calls int
@@ -2526,6 +2628,21 @@ func (c *countingVectorScorer) VectorScores(
 ) (map[shoal.ID]shoal.Score, error) {
 	c.calls++
 	return c.VectorScorer.VectorScores(ctx, request)
+}
+
+func (c *countingVectorScorer) VectorEmbeddingSpaceIDs(
+	ctx context.Context,
+	request explorer.VectorScoreRequest,
+) ([]shoal.ID, error) {
+	resolver, ok := c.VectorScorer.(interface {
+		VectorEmbeddingSpaceIDs(
+			context.Context, explorer.VectorScoreRequest,
+		) ([]shoal.ID, error)
+	})
+	if !ok {
+		return nil, errors.New("vector scorer has no embedding provenance")
+	}
+	return resolver.VectorEmbeddingSpaceIDs(ctx, request)
 }
 
 func (c *hookClient) Connect(ctx context.Context, edge graph.Edge) error {

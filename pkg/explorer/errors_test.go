@@ -35,6 +35,7 @@ func TestIndeterminateCommitMarkerPreservesErrorChain(t *testing.T) {
 	if !explorer.IsIndeterminateCommit(marked) {
 		t.Fatal("marked error was not detected")
 	}
+
 	if !shoal.IsErrorCode(marked, shoal.ErrorUnavailable) {
 		t.Fatalf("marked error lost public code: %v", marked)
 	}
@@ -46,5 +47,24 @@ func TestIndeterminateCommitMarkerPreservesErrorChain(t *testing.T) {
 	}
 	if explorer.IsIndeterminateCommit(errors.New("ordinary failure")) {
 		t.Fatal("ordinary error reported indeterminate")
+	}
+}
+
+func TestCommittedInteractionMarkerPreservesErrorChain(t *testing.T) {
+	cause := errors.New("authorization generation changed after commit")
+	public := shoal.WrapError(
+		shoal.ErrorUnauthorized, "authorization changed", cause)
+	marked := explorer.MarkCommittedInteraction(public)
+	if !explorer.IsCommittedInteraction(marked) {
+		t.Fatal("committed interaction error was not detected")
+	}
+	if !shoal.IsErrorCode(marked, shoal.ErrorUnauthorized) {
+		t.Fatalf("committed interaction error lost public code: %v", marked)
+	}
+	if !errors.Is(marked, cause) {
+		t.Fatalf("committed interaction error lost cause: %v", marked)
+	}
+	if explorer.MarkCommittedInteraction(nil) != nil {
+		t.Fatal("nil error acquired a committed marker")
 	}
 }

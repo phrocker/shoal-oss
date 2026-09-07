@@ -21,13 +21,55 @@ package interaction_test
 
 import (
 	"errors"
+	"fmt"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/phrocker/shoal-oss/pkg/graph"
 	"github.com/phrocker/shoal-oss/pkg/interaction"
+	"github.com/phrocker/shoal-oss/pkg/retrieval"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
+
+func TestSessionPreservesCanonicalEmbeddingConstituents(t *testing.T) {
+	first, err := retrieval.EmbeddingSpaceIdentityID("first-space")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := retrieval.EmbeddingSpaceIdentityID("second-space")
+	if err != nil {
+		t.Fatal(err)
+	}
+	constituents := []shoal.ID{first, second}
+	if shoal.CompareID(constituents[0], constituents[1]) > 0 {
+		constituents[0], constituents[1] = constituents[1], constituents[0]
+	}
+	aggregate, err := retrieval.EmbeddingSpaceSetID(constituents...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recordedAt := time.Date(2026, 9, 6, 12, 0, 0, 0, time.UTC)
+	session := interaction.Session{
+		ID: "session", RecordedAt: recordedAt,
+		Operation:        interaction.OperationRetrieval,
+		EmbeddingSpaceID: aggregate, EmbeddingSpaceIDs: constituents,
+	}
+	canonical, err := session.Canonical()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(canonical.EmbeddingSpaceIDs) != 2 ||
+		canonical.EmbeddingSpaceIDs[0] != constituents[0] ||
+		canonical.EmbeddingSpaceIDs[1] != constituents[1] {
+		t.Fatalf("embedding constituents = %v", canonical.EmbeddingSpaceIDs)
+	}
+	canonical.EmbeddingSpaceIDs[0] = "mutated"
+	if session.EmbeddingSpaceIDs[0] == "mutated" {
+		t.Fatal("canonical session aliases embedding constituents")
+	}
+}
 
 func TestConjoinIsSortedUniqueUnion(t *testing.T) {
 	labels, err := interaction.Conjoin(
@@ -72,7 +114,7 @@ func TestParseVisibilityRoundTripsAndRejectsBadLabels(t *testing.T) {
 
 func TestSubgraphDistinguishesRetrievedFromCited(t *testing.T) {
 	session := interaction.Session{
-		ID:         "session-1",
+		ID:         interaction.DerivedID("session", "1"),
 		RecordedAt: time.Unix(1700000000, 0).UTC(),
 		Turns: []interaction.Turn{{
 			Index:    0,
@@ -104,10 +146,12 @@ func TestSubgraphDistinguishesRetrievedFromCited(t *testing.T) {
 		kinds[node.Kind]++
 	}
 	if kinds[interaction.KindSession] != 1 ||
+		kinds[interaction.KindInference] != 1 ||
 		kinds[interaction.KindTurn] != 1 ||
 		kinds[interaction.KindToolCall] != 1 {
 		t.Fatalf("node kinds = %v", kinds)
 	}
+
 	retrieved, cited := map[shoal.ID]bool{}, map[shoal.ID]bool{}
 	for _, edge := range sub.Edges {
 		switch edge.Type {
@@ -125,11 +169,147 @@ func TestSubgraphDistinguishesRetrievedFromCited(t *testing.T) {
 	}
 }
 
+func TestSubgraphPersistsExecutionPinsOnAddressableInference(t *testing.T) {
+	recordedAt := time.Date(2026, time.September, 5, 20, 1, 2, 345, time.UTC)
+	snapshotAt := recordedAt.Add(-time.Minute)
+	expiresAt := recordedAt.Add(time.Hour)
+	session := interaction.Session{
+		ID:                       interaction.DerivedID("session", "pinned"),
+		RecordedAt:               recordedAt,
+		SnapshotID:               "snapshot-17",
+		SnapshotAsOf:             snapshotAt,
+		AuthorizationFingerprint: "auth-sha256:0123456789abcdef",
+		AuthorizationExpiresAt:   expiresAt,
+		EmbeddingSpaceID:         "embedding-space-v3",
+		SeedNodeIDs:              []shoal.ID{"span-a"},
+	}
+	subgraph, err := session.Subgraph(func(shoal.ID) ([]string, error) {
+		return []string{"restricted"}, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	inferenceID := interaction.InferenceID(session.ID)
+	var inferenceNodeFound, inferenceEdgeFound bool
+	for _, node := range subgraph.Nodes {
+		if node.ID != inferenceID {
+			continue
+		}
+		inferenceNodeFound = node.Kind == interaction.KindInference &&
+			node.Properties[interaction.PropertySnapshotID] == "snapshot-17" &&
+			node.Properties[interaction.PropertySnapshotAsOf] ==
+				snapshotAt.Format(time.RFC3339Nano) &&
+			node.Properties[interaction.PropertyAuthFingerprint] ==
+				"auth-sha256:0123456789abcdef" &&
+			node.Properties[interaction.PropertyAuthExpiresAt] ==
+				expiresAt.Format(time.RFC3339Nano) &&
+			node.Properties[interaction.PropertyEmbeddingSpace] ==
+				"embedding-space-v3"
+	}
+	for _, edge := range subgraph.Edges {
+		if edge.Type == interaction.EdgeHasInference &&
+			edge.From == session.ID && edge.To == inferenceID {
+			inferenceEdgeFound = true
+		}
+	}
+	if !inferenceNodeFound || !inferenceEdgeFound {
+		t.Fatalf("inference node=%t edge=%t subgraph=%+v",
+			inferenceNodeFound, inferenceEdgeFound, subgraph)
+	}
+}
+
+func TestVisibilityAndProvenanceHaveNoSemanticCountCap(t *testing.T) {
+	const count = 80
+	ids := make([]shoal.ID, count)
+	for index := range ids {
+		ids[index] = shoal.ID(fmt.Sprintf("span-%03d", index))
+	}
+	session := interaction.Session{
+		ID:           interaction.DerivedID("session", "uncapped"),
+		RecordedAt:   time.Unix(1700000000, 0).UTC(),
+		SeedNodeIDs:  ids,
+		CitedNodeIDs: []shoal.ID{ids[len(ids)-1]},
+	}
+	subgraph, err := session.Subgraph(func(id shoal.ID) ([]string, error) {
+		return []string{"label-" + strings.TrimPrefix(string(id), "span-")}, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(subgraph.TouchedNodeIDs) != count ||
+		len(subgraph.Visibility) != count {
+		t.Fatalf("touched=%d visibility=%d, want %d",
+			len(subgraph.TouchedNodeIDs), len(subgraph.Visibility), count)
+	}
+	retrieved, cited := 0, 0
+	for _, edge := range subgraph.Edges {
+		switch edge.Type {
+		case interaction.EdgeRetrieved:
+			retrieved++
+		case interaction.EdgeCited:
+			cited++
+		}
+	}
+
+	if retrieved != count || cited != 1 {
+		t.Fatalf("retrieved=%d cited=%d, want %d and 1",
+			retrieved, cited, count)
+	}
+	if subgraph.TouchedNodeIDs[len(subgraph.TouchedNodeIDs)-1] != ids[count-1] {
+		t.Fatal("late source was dropped from the provenance union")
+	}
+}
+
+func TestOversizedVisibilityIsDigestMarkedAndFailsClosed(t *testing.T) {
+	const count = 80
+	ids := make([]shoal.ID, count)
+	labels := make(map[shoal.ID]string, count)
+	for index := range ids {
+		id := shoal.ID(fmt.Sprintf("span-large-%03d", index))
+		ids[index] = id
+		labels[id] = fmt.Sprintf(
+			"label-%03d-%s", index, strings.Repeat("x", 56))
+	}
+	session := interaction.Session{
+		ID:          interaction.DerivedID("session", "large-visibility"),
+		RecordedAt:  time.Unix(1700000000, 0).UTC(),
+		SeedNodeIDs: ids,
+	}
+	subgraph, err := session.Subgraph(func(id shoal.ID) ([]string, error) {
+		return []string{labels[id]}, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(interaction.Expression(subgraph.Visibility)) <=
+		shoal.MaxMetadataValueBytes {
+		t.Fatal("fixture did not exceed the graph metadata value bound")
+	}
+	var sessionNode graph.Node
+	for _, node := range subgraph.Nodes {
+		if node.Kind == interaction.KindSession {
+			sessionNode = node
+			break
+		}
+	}
+	if sessionNode.Properties[interaction.PropertyVisibility] != "" ||
+		sessionNode.Properties[interaction.PropertyVisibilityDigest] == "" ||
+		sessionNode.Properties[interaction.PropertyVisibilityCount] !=
+			strconv.Itoa(count) {
+		t.Fatalf("oversized visibility markers = %+v", sessionNode.Properties)
+	}
+	if _, err := interaction.NodeVisibility(
+		sessionNode,
+	); !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
+		t.Fatalf("digest-only visibility was treated as public: %v", err)
+	}
+}
+
 // TestSubgraphFailsClosedWhenVisibilityCannotBeResolved pins that an
 // unresolvable node produces an error, never a silently public node.
 func TestSubgraphFailsClosedWhenVisibilityCannotBeResolved(t *testing.T) {
 	session := interaction.Session{
-		ID:           "session-2",
+		ID:           interaction.DerivedID("session", "2"),
 		RecordedAt:   time.Unix(1700000000, 0).UTC(),
 		CitedNodeIDs: []shoal.ID{"span-missing"},
 	}
@@ -145,9 +325,10 @@ func TestSubgraphFailsClosedWhenVisibilityCannotBeResolved(t *testing.T) {
 
 func TestSessionValidateRejectsMalformedSessions(t *testing.T) {
 	valid := interaction.Session{
-		ID:         "session-3",
+		ID:         interaction.DerivedID("session", "3"),
 		RecordedAt: time.Unix(1700000000, 0).UTC(),
 	}
+
 	if err := valid.Validate(); err != nil {
 		t.Fatal(err)
 	}
@@ -171,11 +352,57 @@ func TestSessionValidateRejectsMalformedSessions(t *testing.T) {
 	if err := tooMany.Validate(); err == nil {
 		t.Fatal("unbounded turn list accepted")
 	}
+	pinned := valid
+	pinned.SnapshotID = "snapshot"
+	pinned.SnapshotAsOf = valid.RecordedAt.Add(-time.Minute)
+	pinned.AuthorizationFingerprint = "auth"
+	pinned.AuthorizationExpiresAt = valid.RecordedAt.Add(time.Hour)
+	if err := pinned.Validate(); err != nil {
+		t.Fatalf("valid execution pins rejected: %v", err)
+	}
+	futureSnapshot := pinned
+	futureSnapshot.SnapshotAsOf = futureSnapshot.RecordedAt.Add(time.Second)
+	if err := futureSnapshot.Validate(); err == nil {
+		t.Fatal("future observed snapshot accepted")
+	}
+	expired := pinned
+	expired.AuthorizationExpiresAt = expired.RecordedAt
+	if err := expired.Validate(); err == nil {
+		t.Fatal("expired authorization accepted at record time")
+	}
+}
+
+func TestSessionCanonicalSortsTurnsAndRejectsRawTextFields(t *testing.T) {
+	session := interaction.Session{
+		ID:         interaction.DerivedID("session", "canonical-turns"),
+		RecordedAt: time.Unix(1700000000, 0).UTC(),
+		Operation:  interaction.OperationInference,
+		Turns: []interaction.Turn{
+			{Index: 2, Decision: "stop"},
+			{Index: 0, Decision: "retrieve"},
+		},
+	}
+	canonical, err := session.Canonical()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if canonical.Turns[0].Index != 0 || canonical.Turns[1].Index != 2 {
+		t.Fatalf("canonical turns = %+v", canonical.Turns)
+	}
+	session.QueryDigest = "raw query text"
+	if err := session.Validate(); err == nil {
+		t.Fatal("raw query text was accepted as a digest")
+	}
+	session.QueryDigest = ""
+	session.Turns[0].Decision = "raw model decision"
+	if err := session.Validate(); err == nil {
+		t.Fatal("raw decision text was accepted")
+	}
 }
 
 func TestKindAndEdgeNamespaceDetection(t *testing.T) {
 	for _, kind := range []string{
-		interaction.KindSession, interaction.KindTurn,
+		interaction.KindSession, interaction.KindInference, interaction.KindTurn,
 		interaction.KindToolCall, interaction.KindTombstone,
 	} {
 		if !interaction.IsInteractionKind(kind) {

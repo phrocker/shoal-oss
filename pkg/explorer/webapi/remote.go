@@ -146,8 +146,9 @@ func (s *RemoteService) Ingest(
 	httpRequest.Header.Set("X-Shoal-Workspace-Request", "1")
 	httpResponse, err := s.client.Do(httpRequest)
 	if err != nil {
-		return IngestResponse{}, shoal.WrapError(
-			remoteTransportCode(err), "remote workspace unavailable", err)
+		return IngestResponse{}, explorer.MarkIndeterminateCommit(
+			shoal.WrapError(
+				remoteTransportCode(err), "remote workspace unavailable", err))
 	}
 	defer httpResponse.Body.Close()
 	if httpResponse.StatusCode < 200 || httpResponse.StatusCode >= 300 {
@@ -155,11 +156,12 @@ func (s *RemoteService) Ingest(
 	}
 	var response IngestResponse
 	if err := decodeOneJSON(httpResponse.Body, &response, maxRemoteResponseBytes); err != nil {
-		return IngestResponse{}, shoal.WrapError(
-			remoteDecodeCode(err), "decode remote workspace response", err)
+		return IngestResponse{}, explorer.MarkIndeterminateCommit(
+			shoal.WrapError(
+				remoteDecodeCode(err), "decode remote workspace response", err))
 	}
 	if err := validateRemoteIngestResponse(prepared, response); err != nil {
-		return IngestResponse{}, err
+		return IngestResponse{}, explorer.MarkIndeterminateCommit(err)
 	}
 	return response, nil
 }
@@ -368,9 +370,14 @@ func (s *RemoteService) Path(ctx context.Context, request PathRequest) (PathResp
 	if err := shoal.ValidateRequiredID("path target node ID", request.To); err != nil {
 		return PathResponse{}, err
 	}
+	if effectiveGraphNodeLimit(ctx, MaxNodes) < MaxNodes {
+		return PathResponse{}, shoal.NewError(
+			shoal.ErrorUnavailable,
+			"remote path cannot enforce the workspace graph node budget",
+		)
+	}
 	depth, fanout, _, err := normalizeGraphBounds(
-		request.MaxDepth, request.Fanout, MaxNodes,
-	)
+		request.MaxDepth, request.Fanout, MaxNodes)
 	if err != nil {
 		return PathResponse{}, err
 	}
@@ -1047,15 +1054,22 @@ func (e responseReadError) Unwrap() error {
 
 func decodeRemoteError(response *http.Response) error {
 	var payload struct {
-		Code      shoal.ErrorCode           `json:"code"`
-		Message   string                    `json:"message"`
-		Embedding *wireEmbeddingQueryReport `json:"embedding,omitempty"`
+		Code          shoal.ErrorCode           `json:"code"`
+		Message       string                    `json:"message"`
+		Indeterminate bool                      `json:"indeterminate,omitempty"`
+		Embedding     *wireEmbeddingQueryReport `json:"embedding,omitempty"`
 	}
+	indeterminate := response.Header.Get(CommitOutcomeHeader) ==
+		CommitOutcomeIndeterminate
 	err := decodeOneJSON(response.Body, &payload, maxRemoteMetadataResponseBytes)
 	if err == nil && isKnownErrorCode(payload.Code) {
 		if payload.Code != errorCodeFromHTTPStatus(response.StatusCode) {
-			return errorFromHTTPStatus(
-				response.StatusCode, "remote workspace error code does not match status")
+			mismatch := errorFromHTTPStatus(
+				response.StatusCode,
+				"remote workspace error code does not match status",
+			)
+			return markRemoteIndeterminate(
+				mismatch, indeterminate || payload.Indeterminate)
 		}
 		message := trimErrorCode(payload.Code, payload.Message)
 		var decoded error
@@ -1069,25 +1083,42 @@ func decodeRemoteError(response *http.Response) error {
 		}
 		report, reportErr := embeddingQueryReportValue(payload.Embedding)
 		if reportErr != nil {
-			return remoteContractError("invalid remote embedding query report", reportErr)
+			return markRemoteIndeterminate(
+				remoteContractError(
+					"invalid remote embedding query report", reportErr),
+				indeterminate || payload.Indeterminate,
+			)
 		}
 		if report != nil {
 			if !report.Degraded {
-				return remoteContractError(
-					"remote error carried a non-degraded embedding query report",
-					nil,
+				return markRemoteIndeterminate(
+					remoteContractError(
+						"remote error carried a non-degraded embedding query report",
+						nil,
+					),
+					indeterminate || payload.Indeterminate,
 				)
 			}
-			return newEmbeddingQueryError(decoded, *report)
+			decoded = newEmbeddingQueryError(decoded, *report)
 		}
-		return decoded
+		return markRemoteIndeterminate(
+			decoded, indeterminate || payload.Indeterminate)
 	}
 	if err != nil && isRemoteTransportDecodeError(err) {
-		return shoal.WrapError(
-			remoteDecodeCode(err), "read remote workspace error response", err)
+		return markRemoteIndeterminate(shoal.WrapError(
+			remoteDecodeCode(err), "read remote workspace error response", err),
+			indeterminate)
 	}
-	return errorFromHTTPStatus(
-		response.StatusCode, "remote workspace request failed")
+	return markRemoteIndeterminate(errorFromHTTPStatus(
+		response.StatusCode, "remote workspace request failed"),
+		indeterminate || payload.Indeterminate)
+}
+
+func markRemoteIndeterminate(err error, indeterminate bool) error {
+	if !indeterminate {
+		return err
+	}
+	return explorer.MarkIndeterminateCommit(err)
 }
 
 func trimErrorCode(code shoal.ErrorCode, message string) string {

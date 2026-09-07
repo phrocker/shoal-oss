@@ -57,6 +57,7 @@ func (c *Client) CreateOntologyProposal(
 	if err != nil {
 		return err
 	}
+
 	// This operation check is load-bearing; TestOntologyProposalEndpointDistinguishesAuthorizationDenial
 	// pins that proposal mutations require write authority and surface a
 	// governance 401 without a bearer challenge when the caller lacks it.
@@ -72,7 +73,31 @@ func (c *Client) CreateOntologyProposal(
 	if err := store.CreateOntologyProposal(ctx, proposal, baseVersion); err != nil {
 		return directBaseError(err)
 	}
-	return guard.Check(ctx)
+	if err := guard.Check(ctx); err != nil {
+		return explorer.MarkIndeterminateCommit(err)
+	}
+	return nil
+}
+
+func (c *Client) OntologyProposalsForMutation(
+	ctx context.Context,
+) ([]ontology.GovernedProposal, error) {
+	store, err := c.ontologyProposalStore()
+	if err != nil {
+		return nil, err
+	}
+	_, guard, _, err := c.begin(ctx, auth.OperationIngest)
+	if err != nil {
+		return nil, err
+	}
+	proposals, err := store.OntologyProposalsForMutation(ctx)
+	if err != nil {
+		return nil, directBaseError(err)
+	}
+	if err := guard.Check(ctx); err != nil {
+		return nil, err
+	}
+	return proposals, nil
 }
 
 func (c *Client) TransitionOntologyProposal(
@@ -104,7 +129,8 @@ func (c *Client) TransitionOntologyProposal(
 		return ontology.GovernedProposal{}, directBaseError(err)
 	}
 	if err := guard.Check(ctx); err != nil {
-		return ontology.GovernedProposal{}, err
+		return ontology.GovernedProposal{},
+			explorer.MarkIndeterminateCommit(err)
 	}
 	return proposal, nil
 }

@@ -34,14 +34,21 @@ import (
 	"time"
 
 	"github.com/phrocker/shoal-oss/internal/explorercoord"
+	"github.com/phrocker/shoal-oss/internal/explorerfleet"
+	"github.com/phrocker/shoal-oss/internal/explorerfleetevents"
 	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/explorer/authorized"
 	"github.com/phrocker/shoal-oss/pkg/explorer/coordination"
 	"github.com/phrocker/shoal-oss/pkg/explorer/coordination/transaction"
+	"github.com/phrocker/shoal-oss/pkg/explorer/fleet"
+	"github.com/phrocker/shoal-oss/pkg/explorer/mcp"
 	"github.com/phrocker/shoal-oss/pkg/explorer/webapi"
+	"github.com/phrocker/shoal-oss/pkg/explorer/workspace"
+	"github.com/phrocker/shoal-oss/pkg/interaction"
 	"github.com/phrocker/shoal-oss/pkg/model"
 	"github.com/phrocker/shoal-oss/pkg/ontology"
+	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
 func main() {
@@ -65,15 +72,16 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 	stateDir := flags.String(
 		"state-dir", "",
 		"Recommended workspace state root. The corpus and durable policy "+
-			"catalog are created as corpus/ and policy/ inside it, so mounting "+
+			"catalog and settings are created as corpus/, policy/, and settings/ "+
+			"inside it, so mounting "+
 			"this one directory as a volume persists everything a restart "+
 			"needs. Overrides -data when set",
 	)
 	data := flags.String(
 		"data", ".shoal/explorer",
 		"Legacy Explorer corpus directory (used when -state-dir is unset). The "+
-			"durable policy catalog is placed in a sibling directory; both must "+
-			"be persisted for the workspace to survive a restart",
+			"durable policy catalog and workspace settings are placed in sibling "+
+			"directories; all must be persisted for the workspace to survive a restart",
 	)
 	policyDirFlag := flags.String(
 		"policy-dir", "",
@@ -114,6 +122,36 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 	embeddingDimensions := flags.Int(
 		"embedding-dimensions", 0,
 		"Embedding dimensions; required for ollama/openai, zero uses fake default",
+	)
+	chatProvider := flags.String(
+		"chat-provider", firstNonEmpty(os.Getenv("SHOAL_CHAT_PROVIDER"), "ollama"),
+		"Grounded chat model provider: ollama or openai-compatible",
+	)
+	chatModel := flags.String(
+		"chat-model", os.Getenv("SHOAL_CHAT_MODEL"),
+		"Grounded chat model name",
+	)
+	chatBaseURL := flags.String(
+		"chat-base-url",
+		firstNonEmpty(os.Getenv("SHOAL_CHAT_BASE_URL"), model.DefaultOllamaBaseURL),
+		"Grounded chat provider base URL",
+	)
+	chatAPIKeyEnv := flags.String(
+		"chat-api-key-env", "SHOAL_OPENAI_API_KEY",
+		"Environment variable containing the OpenAI-compatible chat credential",
+	)
+	chatOrganization := flags.String(
+		"chat-organization", os.Getenv("SHOAL_OPENAI_ORGANIZATION"),
+		"Optional OpenAI-compatible organization header",
+	)
+	chatProject := flags.String(
+		"chat-project", os.Getenv("SHOAL_OPENAI_PROJECT"),
+		"Optional OpenAI-compatible project header",
+	)
+	fleetExecutorRefs := flags.String(
+		"fleet-executor-refs", os.Getenv("SHOAL_FLEET_EXECUTOR_REFS"),
+		"Comma-separated opaque executor references accepted by the durable "+
+			"agent registry; empty keeps registration fail-closed",
 	)
 	developmentAuth := flags.Bool(
 		"dev-auth", false,
@@ -275,6 +313,11 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
+	executors, err := newConfiguredFleetExecutors(
+		splitCommaList(*fleetExecutorRefs))
+	if err != nil {
+		return err
+	}
 
 	oidc := applyLegacyEntraCompatibility(oidcConfig{
 		issuer: firstNonEmpty(
@@ -403,6 +446,7 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 		clock:     time.Now,
 		backfill:  backfill,
 		ontology:  activeOntology,
+		executors: executors,
 		mosaic: authorized.MosaicBudget{
 			MaxDomains: uint32(*mosaicBudget),
 			Window:     *mosaicWindow,
@@ -443,6 +487,120 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 	if err != nil {
 		listener.Close()
 		return err
+	}
+	var chat webapi.AskProvider
+	var provenance webapi.InteractionProvider
+	if opened.settings != nil {
+		if err := handler.SetWorkspaceSettingsProvider(opened.settings); err != nil {
+			listener.Close()
+			return err
+		}
+		if opened.client != nil {
+			chat, provenance, err = newChatProviders(
+				ctx, opened.client, authority.Resolver(), chatModelConfig{
+					provider: *chatProvider, model: *chatModel, baseURL: *chatBaseURL,
+					apiKeyEnv: *chatAPIKeyEnv, organization: *chatOrganization,
+					project: *chatProject, retrievalModes: chatRetrievalModes(embedding),
+				})
+			if err != nil {
+				listener.Close()
+				return err
+			}
+			if err := handler.SetChatProvider(chat); err != nil {
+				listener.Close()
+				return err
+			}
+			if err := handler.SetInteractionProvider(provenance); err != nil {
+				listener.Close()
+				return err
+			}
+		}
+	}
+	var mcpTools []mcp.OptionalToolProvider
+	if chat != nil {
+		askTool, err := mcp.NewAskTool(chat)
+		if err != nil {
+			listener.Close()
+			return err
+		}
+		mcpTools = append(mcpTools, askTool)
+	}
+	if provenance != nil {
+		provenanceTools, err := mcp.NewInteractionTools(provenance)
+		if err != nil {
+			listener.Close()
+			return err
+		}
+		mcpTools = append(mcpTools, provenanceTools...)
+	}
+	if opened.fleetDispatch != nil {
+		fleetTools, err := mcp.NewFleetDispatchTools(
+			opened.fleetDispatch, authority.Resolver())
+		if err != nil {
+			listener.Close()
+			return err
+		}
+		mcpTools = append(mcpTools, fleetTools...)
+	}
+	mcpServer, err := mcp.NewServer(mcp.Config{
+		Service:         service,
+		Authority:       authority,
+		Decisions:       mcp.DecisionProviderFunc(authority.Resolver().Resolve),
+		InteractionSink: opened.client,
+		Snapshots:       opened.client,
+		OptionalTools:   mcpTools,
+		ServerInfo: mcp.Implementation{
+			Name:        "shoal-explore-web",
+			Title:       "Shoal Explorer MCP",
+			Version:     "1",
+			Description: "Authenticated Shoal Explorer over Streamable HTTP",
+		},
+		Instructions: "Every HTTP request is independently authenticated. " +
+			"Session IDs retain protocol state only and never carry authority.",
+	})
+	if err != nil {
+		listener.Close()
+		return err
+	}
+	mcpHTTP, err := mcp.NewHTTPHandler(mcp.HTTPConfig{
+		Server:                   mcpServer,
+		AllowedOrigins:           mcp.OriginsForAuthorities(allowedAuthorities),
+		RequireWorkspaceSettings: opened.settings != nil,
+	})
+	if err != nil {
+		listener.Close()
+		return err
+	}
+	if err := handler.MountAuthenticated("/mcp", mcpHTTP); err != nil {
+		listener.Close()
+		return err
+	}
+	if opened.fleetRegistry != nil || opened.fleetDispatch != nil ||
+		opened.fleetEvents != nil {
+		if opened.fleetRegistry == nil || opened.fleetDispatch == nil ||
+			opened.fleetEvents == nil {
+			listener.Close()
+			return shoal.NewError(
+				shoal.ErrorUnavailable,
+				"fleet HTTP dependencies are incomplete",
+			)
+		}
+		fleetHandler, err := webapi.NewFleetHandler(
+			opened.fleetRegistry, opened.fleetDispatch)
+		if err != nil {
+			listener.Close()
+			return err
+		}
+		if err := handler.MountAuthenticated(
+			webapi.FleetRoutePrefix, fleetHandler,
+		); err != nil {
+			listener.Close()
+			return err
+		}
+		if err := handler.MountFleetEvents(opened.fleetEvents); err != nil {
+			listener.Close()
+			return err
+		}
 	}
 	// Browser login is optional and publishes only non-secret OIDC parameters.
 	// With -dev-auth, or an API-only OIDC configuration, auth-config reports
@@ -612,6 +770,13 @@ type serviceConfig struct {
 	// ontology is an optional immutable snapshot configured at startup for the
 	// read-only ontology description endpoint.
 	ontology *ontology.OntologyVersion
+	// executors is the host-owned allowlist of opaque fleet executor
+	// references. A non-nil empty registry keeps agent registration disabled.
+	executors fleet.ExecutorRegistry
+	// generationReader is the shared current-policy authority used by
+	// authorized reads, settings, dispatch, and event delivery. Tests and
+	// deployments with a mutable policy lifecycle inject its durable reader.
+	generationReader auth.GenerationReader
 	// mosaic configures the sensitivity-domain co-occurrence budget. A zero
 	// MaxDomains disables the control.
 	mosaic authorized.MosaicBudget
@@ -621,9 +786,14 @@ type serviceConfig struct {
 // startup backfill registered, so the operator can be told exactly what the
 // development principal was granted.
 type openedService struct {
-	service    webapi.Service
-	backfilled int
-	close      func()
+	service       webapi.Service
+	settings      webapi.WorkspaceSettingsProvider
+	fleetRegistry webapi.FleetRegistryProvider
+	fleetDispatch webapi.FleetDispatchProvider
+	fleetEvents   webapi.FleetEventService
+	client        *authorized.Client
+	backfilled    int
+	close         func()
 }
 
 var (
@@ -638,7 +808,7 @@ func openService(
 	closed := openedService{close: func() {}}
 	switch config.backend {
 	case "embedded":
-		embedded, err := explorercoord.OpenExplorer(explorercoord.Config{
+		runtimeConfig := explorercoord.Config{
 			Directory: config.data,
 			Domain:    workspacePublicationDomain,
 			Owner:     workspaceRuntimeOwner,
@@ -651,7 +821,10 @@ func openService(
 				HistoryFloor:        1,
 			},
 			Clock: config.clock,
-		}, explorer.Options{Embedder: config.embedder})
+		}
+		explorerfleetevents.ConfigureHostedRuntime(&runtimeConfig)
+		embedded, err := explorercoord.OpenExplorer(
+			runtimeConfig, explorer.Options{Embedder: config.embedder})
 		if err != nil {
 			return closed, err
 		}
@@ -685,8 +858,105 @@ func openService(
 				return closed, err
 			}
 		}
+		generationReader := config.generationReader
+		if isNilFleetDependency(generationReader) {
+			generationReader = fixedGenerationReader{
+				domain:     workspaceAuthorizationDomain,
+				generation: workspacePolicyGeneration,
+			}
+		}
 		client, err := authorizedClient(
-			corpus, store, config.resolver, config.clock, config.mosaic)
+			corpus, store, config.resolver, generationReader,
+			config.clock, config.mosaic)
+		if err != nil {
+			store.Close()
+			embedded.Close()
+			return closed, err
+		}
+		if err := corpus.EnsureInteractionSink(ctx); err != nil {
+			store.Close()
+			embedded.Close()
+			return closed, err
+		}
+		interactionRecorder, err := interaction.NewRecorder(
+			ctx, fleetInteractionSink{durable: corpus, authorized: client})
+		if err != nil {
+			store.Close()
+			embedded.Close()
+			return closed, err
+		}
+		if err := interactionRecorder.SetClock(config.clock); err != nil {
+			store.Close()
+			embedded.Close()
+			return closed, err
+		}
+		fleetLifecycleRecorder, err := explorerfleet.NewLifecycleRecorder(
+			fleetInteractionSink{durable: corpus, authorized: client})
+		if err != nil {
+			store.Close()
+			embedded.Close()
+			return closed, err
+		}
+		executors := config.executors
+		if executors == nil {
+			executors = configuredFleetExecutors{}
+		}
+		snapshots, err := explorerfleet.NewInteractionSnapshotProvider(corpus)
+		if err != nil {
+			store.Close()
+			embedded.Close()
+			return closed, err
+		}
+		fleetRegistry, err := explorerfleet.Compose(
+			embedded.Runtime, config.resolver, fleetLifecycleRecorder, snapshots,
+			executors, nil, config.clock)
+		if err != nil {
+			store.Close()
+			embedded.Close()
+			return closed, err
+		}
+		cursorKey, err := explorerfleetevents.LoadOrCreateCursorKey(ctx, corpus)
+		if err != nil {
+			store.Close()
+			embedded.Close()
+			return closed, err
+		}
+		fleetEvents, actionEvents, err :=
+			explorerfleetevents.ComposeWithPublisher(
+				embedded.Runtime, workspacePublicationDomain, config.resolver,
+				generationReader, interactionRecorder, fleetRegistry,
+				cursorKey, config.clock,
+			)
+		if err != nil {
+			store.Close()
+			embedded.Close()
+			return closed, err
+		}
+		actionRecorder, err := explorerfleet.NewActionRecorder(
+			interactionRecorder)
+		if err != nil {
+			store.Close()
+			embedded.Close()
+			return closed, err
+		}
+		fleetDispatch, err := explorerfleet.ComposeDispatch(
+			embedded.Runtime, fleetRegistry, config.resolver, actionRecorder,
+			actionEvents, nil, config.clock,
+		)
+		if err != nil {
+			store.Close()
+			embedded.Close()
+			return closed, err
+		}
+		boundFleetDispatch, err := newBoundFleetDispatch(
+			fleetDispatch, config.resolver)
+		if err != nil {
+			store.Close()
+			embedded.Close()
+			return closed, err
+		}
+		boundFleetRegistry, err := newBoundFleetRegistry(
+			fleetRegistry, config.resolver)
 		if err != nil {
 			store.Close()
 			embedded.Close()
@@ -719,10 +989,46 @@ func openService(
 				return closed, err
 			}
 		}
+		settingsStore, err := workspace.OpenDurableStore(
+			workspaceSettingsStoreDir(config.data))
+		if err != nil {
+			store.Close()
+			embedded.Close()
+			return closed, err
+		}
+		choices, err := webapi.NewGovernedOntologyChoices(
+			config.ontology, corpus)
+		if err != nil {
+			settingsStore.Close()
+			store.Close()
+			embedded.Close()
+			return closed, err
+		}
+		settingsProvider, err := workspace.NewProvider(
+			settingsStore,
+			workspace.ProviderOptions{
+				Resolver:         config.resolver,
+				GenerationReader: generationReader,
+				OntologyChoices:  choices,
+				Clock:            config.clock,
+			},
+		)
+		if err != nil {
+			settingsStore.Close()
+			store.Close()
+			embedded.Close()
+			return closed, err
+		}
 		return openedService{
-			service:    service,
-			backfilled: backfilled,
+			service:       service,
+			settings:      settingsProvider,
+			fleetRegistry: boundFleetRegistry,
+			fleetDispatch: boundFleetDispatch,
+			fleetEvents:   fleetEvents,
+			client:        client,
+			backfilled:    backfilled,
 			close: func() {
+				settingsStore.Close()
 				store.Close()
 				embedded.Close()
 			},
@@ -750,6 +1056,16 @@ func openService(
 // treats every subdirectory of the data directory as a table.
 func policyStoreDir(data string) string {
 	return filepath.Clean(data) + "-policy"
+}
+
+// workspaceSettingsStoreDir keeps settings outside the corpus engine while
+// placing them under the same recommended state root.
+func workspaceSettingsStoreDir(data string) string {
+	clean := filepath.Clean(data)
+	if filepath.Base(clean) == "corpus" {
+		return filepath.Join(filepath.Dir(clean), "settings")
+	}
+	return clean + "-settings"
 }
 
 // firstNonEmpty returns the first argument whose trimmed value is non-empty.
@@ -867,6 +1183,7 @@ func authorizedClient(
 	corpus *explorer.Explorer,
 	store authorized.PolicyStore,
 	resolver auth.Resolver,
+	generationReader auth.GenerationReader,
 	clock func() time.Time,
 	mosaic authorized.MosaicBudget,
 ) (*authorized.Client, error) {
@@ -877,16 +1194,17 @@ func authorizedClient(
 	}
 	scorer, _ := any(corpus).(authorized.VectorScorer)
 	return authorized.NewClient(authorized.Config{
-		Base:           corpus,
-		VectorScorer:   scorer,
-		Resolver:       resolver,
-		PolicySelector: selector,
-		PolicyStore:    store,
-		GenerationReader: fixedGenerationReader{
-			domain:     workspaceAuthorizationDomain,
-			generation: workspacePolicyGeneration,
-		},
-		Clock:  clock,
-		Mosaic: mosaic,
+		Base:                corpus,
+		VectorScorer:        scorer,
+		InteractionWriter:   corpus,
+		InteractionReader:   corpus,
+		OntologyInterpreter: corpus,
+		SnapshotValidator:   corpus,
+		Resolver:            resolver,
+		PolicySelector:      selector,
+		PolicyStore:         store,
+		GenerationReader:    generationReader,
+		Clock:               clock,
+		Mosaic:              mosaic,
 	})
 }

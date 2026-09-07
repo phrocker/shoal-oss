@@ -142,8 +142,10 @@ func responseToProto(
 		}
 	}
 	return &knowledgepb.RetrieveResponse{
-		RequestId: string(response.RequestID),
-		Results:   results,
+		RequestId:         string(response.RequestID),
+		Results:           results,
+		EmbeddingSpaceId:  string(response.EmbeddingSpaceID),
+		EmbeddingSpaceIds: idsToStrings(response.EmbeddingSpaceIDs),
 	}, nil
 }
 
@@ -165,8 +167,10 @@ func responseFromProto(
 		}
 	}
 	publicResponse := retrieval.Response{
-		RequestID: shoal.ID(response.GetRequestId()),
-		Results:   results,
+		RequestID:         shoal.ID(response.GetRequestId()),
+		EmbeddingSpaceID:  shoal.ID(response.GetEmbeddingSpaceId()),
+		EmbeddingSpaceIDs: stringsToIDs(response.GetEmbeddingSpaceIds()),
+		Results:           results,
 	}
 	if err := validateResponse(request, publicResponse); err != nil {
 		return retrieval.Response{}, err

@@ -34,6 +34,21 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
+// SnapshotValidator verifies a genuine corpus frontier pin and complete
+// touched source-node membership.
+type SnapshotValidator interface {
+	ValidateSnapshot(
+		context.Context, shoal.ID, time.Time, []shoal.ID,
+	) error
+}
+
+// SnapshotEvidenceValidator additionally verifies touched source membership.
+type SnapshotEvidenceValidator interface {
+	ValidateSnapshotEvidence(
+		context.Context, shoal.ID, time.Time, []shoal.ID, []shoal.ID,
+	) error
+}
+
 // Config supplies the trusted dependencies for an authorization-enforcing
 // Explorer client.
 type Config struct {
@@ -41,7 +56,23 @@ type Config struct {
 	// VectorScorer is an optional explicitly trusted scorer for authorized
 	// vector retrieval validation. It is intentionally separate from Base:
 	// Base responses are treated as untrusted and validated canonically.
-	VectorScorer       VectorScorer
+	VectorScorer VectorScorer
+	// InteractionWriter is the explicitly trusted durable sink for
+	// interaction records. It is separate from Base because Base responses
+	// and mutation acknowledgements are not authorization evidence.
+	InteractionWriter explorer.InteractionWriter
+	// InteractionReader is the explicitly trusted source for durable
+	// interaction envelopes. It is intentionally separate from Base because
+	// authorization decisions for derived views depend on the stored source
+	// set and authorization fingerprint.
+	InteractionReader explorer.InteractionReader
+	// OntologyInterpreter is an optional explicitly trusted read-time
+	// interpreter. It is separate from Base because Base responses are
+	// untrusted and cannot establish authorized interpretation provenance.
+	OntologyInterpreter explorer.OntologyInterpreter
+	// SnapshotValidator is the explicitly trusted verifier for historical
+	// corpus frontiers pinned into interaction records.
+	SnapshotValidator  SnapshotValidator
 	Resolver           auth.Resolver
 	PolicySelector     PolicySelector
 	EdgePolicySelector EdgePolicySelector
@@ -58,20 +89,24 @@ type Config struct {
 
 // Client enforces trusted-context authorization around an Explorer client.
 type Client struct {
-	base               explorer.Client
-	vectorScorer       VectorScorer
-	resolver           auth.Resolver
-	policySelector     PolicySelector
-	edgePolicySelector EdgePolicySelector
-	policyStore        PolicyStore
-	generationReader   auth.GenerationReader
-	clock              func() time.Time
-	mosaic             MosaicBudget
-	ledger             CoOccurrenceLedger
-	mutationMu         sync.Mutex
-	vectorMu           sync.Mutex
-	budgetMu           sync.Mutex
-	vectorAvailability authorizedVectorAvailabilityCache
+	base                explorer.Client
+	vectorScorer        VectorScorer
+	interactionSink     explorer.InteractionWriter
+	interactionSource   explorer.InteractionReader
+	ontologyInterpreter explorer.OntologyInterpreter
+	snapshotValidator   SnapshotValidator
+	resolver            auth.Resolver
+	policySelector      PolicySelector
+	edgePolicySelector  EdgePolicySelector
+	policyStore         PolicyStore
+	generationReader    auth.GenerationReader
+	clock               func() time.Time
+	mosaic              MosaicBudget
+	ledger              CoOccurrenceLedger
+	mutationMu          sync.Mutex
+	vectorMu            sync.Mutex
+	budgetMu            sync.Mutex
+	vectorAvailability  authorizedVectorAvailabilityCache
 }
 
 type authorizedVectorAvailabilityCache struct {
@@ -101,6 +136,18 @@ func NewClient(config Config) (*Client, error) {
 	if config.Clock == nil {
 		return nil, dependencyRequired("clock")
 	}
+	hasInteractionWriter := !isNilDependency(config.InteractionWriter)
+	hasInteractionReader := !isNilDependency(config.InteractionReader)
+	hasSnapshotValidator := !isNilDependency(config.SnapshotValidator)
+	if hasInteractionWriter &&
+		(!hasInteractionReader || !hasSnapshotValidator) {
+		return nil, dependencyRequired(
+			"trusted interaction writer, reader, and snapshot validator")
+	}
+	if (hasInteractionReader || hasSnapshotValidator) &&
+		!hasInteractionWriter {
+		return nil, dependencyRequired("trusted interaction writer")
+	}
 	edgeSelector := config.EdgePolicySelector
 	if isNilDependency(edgeSelector) {
 		var ok bool
@@ -121,16 +168,20 @@ func NewClient(config Config) (*Client, error) {
 		}
 	}
 	return &Client{
-		base:               config.Base,
-		vectorScorer:       config.VectorScorer,
-		resolver:           config.Resolver,
-		policySelector:     config.PolicySelector,
-		edgePolicySelector: edgeSelector,
-		policyStore:        config.PolicyStore,
-		generationReader:   config.GenerationReader,
-		clock:              config.Clock,
-		mosaic:             config.Mosaic,
-		ledger:             ledger,
+		base:                config.Base,
+		vectorScorer:        config.VectorScorer,
+		interactionSink:     config.InteractionWriter,
+		interactionSource:   config.InteractionReader,
+		ontologyInterpreter: config.OntologyInterpreter,
+		snapshotValidator:   config.SnapshotValidator,
+		resolver:            config.Resolver,
+		policySelector:      config.PolicySelector,
+		edgePolicySelector:  edgeSelector,
+		policyStore:         config.PolicyStore,
+		generationReader:    config.GenerationReader,
+		clock:               config.Clock,
+		mosaic:              config.Mosaic,
+		ledger:              ledger,
 	}, nil
 }
 
