@@ -96,7 +96,7 @@ func (c *Client) probeAuthorizedVector(
 	if err != nil {
 		return nil, directBaseError(err)
 	}
-	ids, err := c.vectorScorer.VectorEmbeddingSpaceIDs(
+	ids, err := c.vectorSpaceResolver.VectorEmbeddingSpaceIDs(
 		ctx, scoreRequest)
 	if err != nil {
 		return nil, directBaseError(err)
@@ -532,7 +532,7 @@ func (c *Client) authorizedVectorScores(
 	if len(scores) != len(citations) {
 		return nil, nil, inconsistentRetrieval()
 	}
-	embeddingSpaceIDs, err := c.vectorScorer.VectorEmbeddingSpaceIDs(
+	embeddingSpaceIDs, err := c.vectorSpaceResolver.VectorEmbeddingSpaceIDs(
 		ctx, scoreRequest)
 	if err != nil {
 		return nil, nil, directBaseError(err)
