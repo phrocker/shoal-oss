@@ -45,8 +45,57 @@ var allOperations = []auth.Operation{
 	auth.OperationList,
 	auth.OperationRead,
 	auth.OperationConnect,
+	auth.OperationGraphMaterialize,
 	auth.OperationNeighborhood,
 	auth.OperationRetrieve,
+}
+
+func TestGraphMaterializationAuthorizationAndUnauthorizedAbsence(t *testing.T) {
+	f := newFixture(t)
+	snapshot, err := f.base.Snapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := explorer.GraphMaterializationRequest{
+		Namespace: []byte{0, 'd'}, MutationID: "graph-mutation",
+		SourceID: f.sourceA, PolicyID: f.policyA,
+		ExpectedSnapshot: snapshot,
+		Nodes: []explorer.GraphNodeSpec{{
+			Key: []byte{0xff, 't'}, Kind: "team",
+			Properties: shoal.Metadata{"name": "Demo"},
+		}},
+	}
+	denied := f.context(t, f.decision(
+		t, "reader", [][]byte{f.sourceA}, [][]byte{f.policyA},
+		[]auth.Operation{auth.OperationRead},
+	))
+	if _, err := f.clientA.MaterializeGraph(denied, request); !shoal.IsErrorCode(
+		err, shoal.ErrorUnauthorized,
+	) {
+		t.Fatalf("unauthorized materialization error = %v", err)
+	}
+	allowed := f.context(t, f.decision(
+		t, "writer", [][]byte{f.sourceA}, [][]byte{f.policyA},
+		[]auth.Operation{auth.OperationGraphMaterialize, auth.OperationNeighborhood},
+	))
+	result, err := f.clientA.MaterializeGraph(allowed, request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Disposition != explorer.IngestApplied {
+		t.Fatalf("disposition = %q", result.Disposition)
+	}
+	neighborhood, err := f.clientA.Neighborhood(
+		allowed, explorer.NeighborhoodRequest{
+			NodeIDs: []shoal.ID{result.Nodes[0].ID}, Depth: 0,
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(neighborhood.Nodes) != 1 ||
+		neighborhood.Nodes[0].Kind != "team" {
+		t.Fatalf("neighborhood = %#v", neighborhood)
+	}
 }
 
 type fakeClock struct {

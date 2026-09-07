@@ -281,6 +281,7 @@ func (h *Handler) routes() {
 	})
 	h.mux.HandleFunc("GET /api/v1/auth-config", h.authConfigEndpoint)
 	h.mux.HandleFunc("POST /api/v1/ingest", ingestEndpoint(h.service))
+	h.mux.HandleFunc("POST /api/v1/graph/materialize", graphMaterializeEndpoint(h.service))
 	// This route registration is load-bearing; TestHTTPExtractPublishesUploadedSkillGraph pins extraction as an explicit user-triggered action.
 	h.mux.HandleFunc("POST /api/v1/extract", extractEndpoint(h.service))
 	// This route registration is load-bearing; TestHTTPRecomputeReDerivesLatentAssertion
@@ -301,9 +302,33 @@ func (h *Handler) routes() {
 			http.NotFound(writer, request)
 			return
 		}
+
 		writer.Header().Set("Content-Type", "text/html; charset=utf-8")
 		http.ServeFileFS(writer, request, content, "index.html")
 	})
+}
+
+func graphMaterializeEndpoint(service Service) http.HandlerFunc {
+	return func(writer http.ResponseWriter, request *http.Request) {
+		provider, ok := service.(GraphMaterializationProvider)
+		if !ok {
+			writeError(writer, shoal.NewError(
+				shoal.ErrorUnavailable, "graph materialization is unavailable"))
+			return
+		}
+		var input GraphMaterializeRequest
+		if err := decodeRequest(writer, request, &input); err != nil {
+			writeError(writer, shoal.NewError(
+				shoal.ErrorInvalidArgument, err.Error()))
+			return
+		}
+		result, err := provider.MaterializeGraph(request.Context(), input)
+		if err != nil {
+			writeError(writer, err)
+			return
+		}
+		writeResponse(writer, http.StatusOK, result)
+	}
 }
 
 func metadataFor(ctx context.Context, service Service) (MetadataResponse, error) {

@@ -166,6 +166,7 @@ var oidcReaderOperations = []auth.Operation{
 // ceiling the workspace UI needs.
 var oidcContributorOperations = []auth.Operation{
 	auth.OperationIngest,
+	auth.OperationGraphMaterialize,
 	auth.OperationList,
 	auth.OperationRead,
 	auth.OperationConnect,

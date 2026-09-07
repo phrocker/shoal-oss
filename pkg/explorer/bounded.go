@@ -1018,6 +1018,11 @@ func (e *Explorer) refreshSnapshotLocked() {
 			asOf = record.PublishedAt
 		}
 	}
+	for _, record := range e.graphMaterializations {
+		if record != nil && record.PublishedAt.After(asOf) {
+			asOf = record.PublishedAt
+		}
+	}
 	sum := hash.Sum(nil)
 	id := hex.EncodeToString(sum)
 	// An equality frontier can recur after intervening changes. Reuse its

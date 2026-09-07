@@ -59,6 +59,7 @@ type config struct {
 	OIDCIssuer    string          `json:"oidc_issuer"`
 	ScenarioStart string          `json:"scenario_start"`
 	Team          teamConfig      `json:"team"`
+	Graph         graphConfig     `json:"graph"`
 	Workspace     workspaceConfig `json:"workspace"`
 	Users         []userConfig    `json:"users"`
 }
@@ -66,6 +67,13 @@ type config struct {
 type teamConfig struct {
 	ID   string `json:"id"`
 	Name string `json:"name"`
+}
+
+type graphConfig struct {
+	Namespace           string `json:"namespace"`
+	AuthorizationDomain string `json:"authorization_domain"`
+	SourceID            string `json:"source_id"`
+	PolicyID            string `json:"policy_id"`
 }
 
 type workspaceConfig struct {
@@ -89,10 +97,12 @@ type userConfig struct {
 }
 
 type agentConfig struct {
-	ID         string   `json:"id"`
-	Name       string   `json:"name"`
-	Capability string   `json:"capability"`
-	Skills     []string `json:"skills"`
+	ID                 string   `json:"id"`
+	Name               string   `json:"name"`
+	Capability         string   `json:"capability"`
+	Skills             []string `json:"skills"`
+	ExecutorRef        string   `json:"executor_ref"`
+	RegistrationKeyEnv string   `json:"registration_key_env"`
 }
 
 type fixtureFile struct {
@@ -106,7 +116,9 @@ type userPlan struct {
 }
 
 type scenario struct {
-	Plans []userPlan
+	Plans     []userPlan
+	Nodes     []webapi.GraphMaterializeNode
+	Relations []webapi.GraphMaterializeRelation
 }
 
 type provisioner struct {
@@ -115,10 +127,15 @@ type provisioner struct {
 }
 
 type provisionSummary struct {
-	TeamID        string        `json:"team_id"`
-	WorkItems     int           `json:"work_items"`
-	ActivityDays  int           `json:"activity_days"`
-	UserSummaries []userSummary `json:"users"`
+	TeamID            string        `json:"team_id"`
+	WorkItems         int           `json:"work_items"`
+	ActivityDays      int           `json:"activity_days"`
+	UserSummaries     []userSummary `json:"users"`
+	GraphDisposition  string        `json:"graph_disposition"`
+	TeamNodeID        string        `json:"team_node_id"`
+	OverviewPeople    int           `json:"overview_people"`
+	OverviewAgents    int           `json:"overview_agents"`
+	OverviewWorkItems int           `json:"overview_work_items"`
 }
 
 type userSummary struct {
@@ -135,10 +152,17 @@ type identityResponse struct {
 }
 
 type ingestResponse struct {
-	Files []struct {
+	Snapshot webapi.Snapshot `json:"snapshot"`
+	Files    []struct {
 		Name        string `json:"name"`
 		Disposition string `json:"disposition"`
 	} `json:"files"`
+}
+
+type fleetDescriptorResponse struct {
+	ID         string    `json:"id"`
+	Generation int64     `json:"generation"`
+	Lease      time.Time `json:"lease_expires_at"`
 }
 
 func main() {
@@ -248,6 +272,16 @@ func (c *config) validate() error {
 	if strings.TrimSpace(c.Team.Name) == "" {
 		return errors.New("team.name is required")
 	}
+	for name, value := range map[string]string{
+		"graph.namespace":            c.Graph.Namespace,
+		"graph.authorization_domain": c.Graph.AuthorizationDomain,
+		"graph.source_id":            c.Graph.SourceID,
+		"graph.policy_id":            c.Graph.PolicyID,
+	} {
+		if err := validateID(name, value); err != nil {
+			return err
+		}
+	}
 	if err := c.Workspace.validate(); err != nil {
 		return err
 	}
@@ -308,11 +342,17 @@ func (c *config) validate() error {
 		seenAgents[user.Agent.ID] = struct{}{}
 		if strings.TrimSpace(user.Agent.Name) == "" ||
 			strings.TrimSpace(user.Agent.Capability) == "" ||
-			len(user.Agent.Skills) == 0 {
+			len(user.Agent.Skills) == 0 ||
+			strings.TrimSpace(user.Agent.ExecutorRef) == "" {
 			return fmt.Errorf(
 				"%s.agent requires name, capability, and at least one skill",
 				prefix,
 			)
+		}
+		if !tokenEnvironmentName.MatchString(user.Agent.RegistrationKeyEnv) {
+			return fmt.Errorf(
+				"%s.agent.registration_key_env must be an uppercase environment variable name",
+				prefix)
 		}
 		for skillIndex, skill := range user.Agent.Skills {
 			if strings.TrimSpace(skill) == "" {
@@ -470,7 +510,80 @@ func buildScenario(c config) (scenario, error) {
 		files = append(files, itemFile, activityFile)
 		plans[index].Files = files
 	}
-	return scenario{Plans: plans}, nil
+	nodes, relations := makeGraph(c, workItems, activities)
+	return scenario{Plans: plans, Nodes: nodes, Relations: relations}, nil
+}
+
+func graphKey(value string) string {
+	return base64.RawURLEncoding.EncodeToString([]byte(value))
+}
+
+func makeGraph(
+	c config, workItems, activities []map[string]any,
+) ([]webapi.GraphMaterializeNode, []webapi.GraphMaterializeRelation) {
+	nodes := []webapi.GraphMaterializeNode{{
+		Key: graphKey(c.Team.ID), Kind: "team",
+		Properties: shoal.Metadata{"name": c.Team.Name},
+	}}
+	var relations []webapi.GraphMaterializeRelation
+	addMember := func(key, member string) {
+		relations = append(relations, webapi.GraphMaterializeRelation{
+			Key: graphKey("member-of:" + key), From: graphKey(member),
+			To: graphKey(c.Team.ID), Type: "member_of",
+		})
+	}
+	for _, user := range c.Users {
+		nodes = append(nodes,
+			webapi.GraphMaterializeNode{
+				Key: graphKey(user.PersonID), Kind: "person",
+				Properties: shoal.Metadata{
+					"name": user.DisplayName, "subject_id": user.trustedID,
+				},
+			},
+			webapi.GraphMaterializeNode{
+				Key: graphKey(user.Agent.ID), Kind: "agent",
+				Properties: shoal.Metadata{
+					"name": user.Agent.Name, "agent_id": user.Agent.ID,
+				},
+			},
+		)
+		addMember(user.PersonID, user.PersonID)
+		addMember(user.Agent.ID, user.Agent.ID)
+	}
+	for index, item := range workItems {
+		id := item["id"].(string)
+		nodes = append(nodes, webapi.GraphMaterializeNode{
+			Key: graphKey(id), Kind: "work_item",
+			Properties: shoal.Metadata{
+				"title": item["title"].(string), "status": item["state"].(string),
+			},
+		})
+		addMember(id, id)
+		relations = append(relations, webapi.GraphMaterializeRelation{
+			Key: graphKey("assigned-to:" + id), From: graphKey(id),
+			To: graphKey(item["assignee_person_id"].(string)), Type: "assigned_to",
+		})
+		if index == 4 {
+			relations = append(relations, webapi.GraphMaterializeRelation{
+				Key: graphKey("blocked-by:" + id), From: graphKey(id),
+				To: graphKey(workItems[2]["id"].(string)), Type: "blocked_by",
+			})
+		}
+	}
+	for _, activity := range activities {
+		id := activity["id"].(string)
+		nodes = append(nodes, webapi.GraphMaterializeNode{
+			Key: graphKey(id), Kind: "activity",
+			Properties: shoal.Metadata{
+				"recorded_at": activity["occurred_at"].(string),
+				"actor_id":    activity["actor_id"].(string),
+				"operation":   activity["event"].(string),
+				"status":      activity["outcome"].(string), "manual": "true",
+			},
+		})
+		addMember(id, id)
+	}
+	return nodes, relations
 }
 
 func makeWorkItems(c config, start time.Time) []map[string]any {
@@ -599,6 +712,40 @@ func (p *provisioner) provision(
 			WorkspaceHeader: plan.User.workspaceKey, Files: dispositions,
 		})
 	}
+	owner := generated.Plans[0].User
+	token := strings.TrimSpace(p.getenv(owner.TokenEnv))
+	snapshot, err := p.currentSnapshot(
+		ctx, c.BaseURL, token, owner.workspaceKey)
+	if err != nil {
+		return provisionSummary{}, err
+	}
+	graphResult, err := p.materializeGraph(
+		ctx, c, token, owner.workspaceKey, snapshot, generated)
+	if err != nil {
+		return provisionSummary{}, err
+	}
+	summary.GraphDisposition = string(graphResult.Disposition)
+	for _, node := range graphResult.Nodes {
+		if node.Key == graphKey(c.Team.ID) {
+			summary.TeamNodeID = node.ID
+			break
+		}
+	}
+	if summary.TeamNodeID == "" {
+		return provisionSummary{}, errors.New("graph response omitted team identity")
+	}
+	for _, user := range c.Users {
+		if err := p.registerAgent(ctx, c, user); err != nil {
+			return provisionSummary{}, err
+		}
+	}
+	people, agents, items, err := p.verifyOverview(
+		ctx, c, token, owner.workspaceKey, summary.TeamNodeID)
+	if err != nil {
+		return provisionSummary{}, err
+	}
+	summary.OverviewPeople, summary.OverviewAgents, summary.OverviewWorkItems =
+		people, agents, items
 	return summary, nil
 }
 
@@ -634,8 +781,13 @@ func (p *provisioner) verifyIdentity(
 	}
 	for _, operation := range []auth.Operation{
 		auth.OperationIngest,
+		auth.OperationGraphMaterialize,
 		auth.OperationWorkspaceSettingsRead,
 		auth.OperationWorkspaceSettingsWrite,
+		auth.OperationAgentRegister,
+		auth.OperationAgentHeartbeat,
+		auth.OperationAgentResolve,
+		auth.OperationTeamOverviewRead,
 	} {
 		if !slices.Contains(identity.Operations, string(operation)) {
 			return fmt.Errorf(
@@ -645,6 +797,201 @@ func (p *provisioner) verifyIdentity(
 		}
 	}
 	return nil
+}
+
+func (p *provisioner) currentSnapshot(
+	ctx context.Context, baseURL, token, workspaceID string,
+) (webapi.Snapshot, error) {
+	var response struct {
+		Snapshot webapi.Snapshot `json:"snapshot"`
+	}
+	err := p.doJSON(ctx, http.MethodPost, baseURL+"/api/v1/documents",
+		token, workspaceID, map[string]any{
+			"page": map[string]any{"limit": 1},
+		}, &response, http.StatusOK)
+	return response.Snapshot, err
+}
+
+func (p *provisioner) materializeGraph(
+	ctx context.Context, c config, token, workspaceID string,
+	snapshot webapi.Snapshot, generated scenario,
+) (webapi.GraphMaterializeResponse, error) {
+	request := webapi.GraphMaterializeRequest{
+		Namespace:  graphKey(c.Graph.Namespace),
+		SourceID:   graphKey(c.Graph.SourceID),
+		PolicyID:   graphKey(c.Graph.PolicyID),
+		MutationID: graphKey("demo-graph-v1:" + c.Graph.Namespace),
+		Snapshot:   snapshot, Nodes: generated.Nodes, Relations: generated.Relations,
+	}
+	var response webapi.GraphMaterializeResponse
+	err := p.doJSON(ctx, http.MethodPost,
+		c.BaseURL+"/api/v1/graph/materialize", token, workspaceID,
+		request, &response, http.StatusOK)
+	if err != nil {
+		return webapi.GraphMaterializeResponse{}, fmt.Errorf(
+			"materialize demo graph: %w", err)
+	}
+	return response, nil
+}
+
+func (p *provisioner) registerAgent(
+	ctx context.Context, c config, user userConfig,
+) error {
+	token := strings.TrimSpace(p.getenv(user.TokenEnv))
+	key := strings.TrimSpace(p.getenv(user.Agent.RegistrationKeyEnv))
+	if key == "" {
+		return fmt.Errorf("environment variable %s is required",
+			user.Agent.RegistrationKeyEnv)
+	}
+	now := time.Now().UTC()
+	contextValue := map[string]any{
+		"request_id":  graphKey("demo-agent-request:" + user.Agent.ID),
+		"reason_code": "demo_seed", "reason_detail": "refresh simulated demo agent",
+		"deadline": now.Add(30 * time.Second),
+	}
+	agentPath := c.BaseURL + "/api/v1/fleet/agents/" +
+		graphKey(user.Agent.ID)
+	var existing fleetDescriptorResponse
+	found, err := p.resolveAgent(
+		ctx, agentPath+"/resolve", token, contextValue, &existing)
+	if err != nil {
+		return fmt.Errorf("resolve agent %s: %w", user.Agent.ID, err)
+	}
+	lease := now.Add(23 * time.Hour)
+	if found {
+		var refreshed fleetDescriptorResponse
+		return p.doJSON(ctx, http.MethodPost, agentPath+"/heartbeat",
+			token, "", map[string]any{
+				"context": contextValue, "registration_key": graphKey(key),
+				"expected_generation": existing.Generation,
+				"lease_expires_at":    lease,
+			}, &refreshed, http.StatusOK)
+	}
+
+	var registered fleetDescriptorResponse
+	capabilities := []map[string]any{{
+		"name": user.Agent.Capability,
+		"actions": []map[string]any{{
+			"name":          user.Agent.Skills[0],
+			"input_schema":  map[string]any{"type": "object"},
+			"output_schema": map[string]any{"type": "object"},
+		}},
+	}}
+	return p.doJSON(ctx, http.MethodPost, c.BaseURL+"/api/v1/fleet/agents",
+		token, "", map[string]any{
+			"context": contextValue, "registration_key": graphKey(key),
+			"expected_generation": 0,
+			"descriptor": map[string]any{
+				"id":                   graphKey(user.Agent.ID),
+				"authorization_domain": []byte(c.Graph.AuthorizationDomain),
+				"scopes": []map[string]any{{
+					"source_id": []byte(c.Graph.SourceID),
+					"policy_id": []byte(c.Graph.PolicyID),
+				}},
+				"executor_ref": user.Agent.ExecutorRef,
+				"capabilities": capabilities, "lease_expires_at": lease,
+			},
+		}, &registered, http.StatusCreated)
+}
+
+func (p *provisioner) resolveAgent(
+	ctx context.Context, endpoint, token string, input any,
+	output *fleetDescriptorResponse,
+) (bool, error) {
+	body, err := json.Marshal(input)
+	if err != nil {
+		return false, err
+	}
+	request, err := http.NewRequestWithContext(
+		ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return false, err
+	}
+	request.Header.Set("Authorization", "Bearer "+token)
+	request.Header.Set("Accept", "application/json")
+	request.Header.Set("Content-Type", "application/json")
+	response, err := p.client.Do(request)
+	if err != nil {
+		return false, err
+	}
+	defer response.Body.Close()
+	if response.StatusCode == http.StatusNotFound {
+		return false, nil
+	}
+	if err := requireStatus(response, http.StatusOK); err != nil {
+		return false, err
+	}
+	if err := json.NewDecoder(response.Body).Decode(output); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func (p *provisioner) verifyOverview(
+	ctx context.Context, c config, token, workspaceID, encodedTeamID string,
+) (int, int, int, error) {
+	teamBytes, err := base64.RawURLEncoding.DecodeString(encodedTeamID)
+	if err != nil {
+		return 0, 0, 0, fmt.Errorf("decode team node ID: %w", err)
+	}
+	var response struct {
+		People     []json.RawMessage `json:"people"`
+		Agents     []json.RawMessage `json:"agents"`
+		WorkItems  []json.RawMessage `json:"work_items"`
+		Activities []json.RawMessage `json:"activities"`
+	}
+	err = p.doJSON(ctx, http.MethodPost, c.BaseURL+"/api/v1/team/overview",
+		token, workspaceID, map[string]any{
+			"team_id": string(teamBytes), "source_id": []byte(c.Graph.SourceID),
+			"policy_id": []byte(c.Graph.PolicyID), "history_days": activityDays,
+			"limit": 100,
+		}, &response, http.StatusOK)
+	if err != nil {
+		return 0, 0, 0, fmt.Errorf("verify team overview: %w", err)
+	}
+	if len(response.People) != 2 || len(response.Agents) != 2 ||
+		len(response.WorkItems) != workItemCount ||
+		len(response.Activities) != activityDays {
+		return 0, 0, 0, fmt.Errorf(
+			"team overview mismatch: people=%d agents=%d work_items=%d activities=%d",
+			len(response.People), len(response.Agents), len(response.WorkItems),
+			len(response.Activities))
+	}
+	return len(response.People), len(response.Agents), len(response.WorkItems), nil
+}
+
+func (p *provisioner) doJSON(
+	ctx context.Context, method, endpoint, token, workspaceID string,
+	input, output any, want int,
+) error {
+	body, err := json.Marshal(input)
+	if err != nil {
+		return err
+	}
+	request, err := http.NewRequestWithContext(
+		ctx, method, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	request.Header.Set("Authorization", "Bearer "+token)
+	request.Header.Set("Accept", "application/json")
+	request.Header.Set("Content-Type", "application/json")
+	if workspaceID != "" {
+		request.Header.Set("X-Shoal-Workspace-Request", "1")
+		request.Header.Set(webapi.WorkspaceIDHeader, workspaceID)
+	}
+	response, err := p.client.Do(request)
+	if err != nil {
+		return err
+	}
+	defer response.Body.Close()
+	if err := requireStatus(response, want); err != nil {
+		return err
+	}
+	if output == nil {
+		return nil
+	}
+	return json.NewDecoder(response.Body).Decode(output)
 }
 
 func (p *provisioner) putWorkspaceSettings(

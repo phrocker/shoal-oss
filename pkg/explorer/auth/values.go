@@ -56,13 +56,14 @@ const (
 type Operation string
 
 const (
-	OperationIngest       Operation = "ingest"
-	OperationList         Operation = "list"
-	OperationRead         Operation = "read"
-	OperationConnect      Operation = "connect"
-	OperationNeighborhood Operation = "neighborhood"
-	OperationRetrieve     Operation = "retrieve"
-	OperationValidate     Operation = "validation"
+	OperationIngest           Operation = "ingest"
+	OperationList             Operation = "list"
+	OperationRead             Operation = "read"
+	OperationConnect          Operation = "connect"
+	OperationGraphMaterialize Operation = "graph_materialize"
+	OperationNeighborhood     Operation = "neighborhood"
+	OperationRetrieve         Operation = "retrieve"
+	OperationValidate         Operation = "validation"
 
 	OperationInvoke                 Operation = "invoke"
 	OperationDispatch               Operation = "dispatch"
@@ -94,6 +95,7 @@ func ParseOperation(value string) (Operation, error) {
 func (o Operation) Validate() error {
 	switch o {
 	case OperationIngest, OperationList, OperationRead, OperationConnect,
+		OperationGraphMaterialize,
 		OperationNeighborhood, OperationRetrieve, OperationValidate,
 		OperationInvoke, OperationDispatch, OperationDelegate,
 		OperationAgentRegister, OperationAgentHeartbeat, OperationAgentRevoke,
@@ -164,6 +166,7 @@ func (r ServiceRole) Allows(operation Operation) bool {
 			operation == OperationValidate
 	case ServiceRoleDataWrite:
 		return operation == OperationIngest || operation == OperationConnect ||
+			operation == OperationGraphMaterialize ||
 			operation == OperationValidate
 	case ServiceRoleCoordination, ServiceRoleSecurityAdmin:
 		return operation == OperationValidate
