@@ -33,6 +33,14 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
+
+	"github.com/phrocker/shoal-oss/pkg/explorer"
+	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
+	"github.com/phrocker/shoal-oss/pkg/explorer/fleet"
+	"github.com/phrocker/shoal-oss/pkg/explorer/teamoverview"
+	"github.com/phrocker/shoal-oss/pkg/explorer/webapi"
+	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
 func TestBuildScenarioIsDeterministicAndComplete(t *testing.T) {
@@ -112,6 +120,126 @@ func TestBuildScenarioIsDeterministicAndComplete(t *testing.T) {
 			t.Fatalf("activity does not include actor %q: %#v", actor, actors)
 		}
 	}
+	graphKinds := make(map[string]int)
+	for _, node := range first.Nodes {
+		graphKinds[node.Kind]++
+	}
+	if graphKinds["team"] != 1 || graphKinds["person"] != 2 ||
+		graphKinds["agent"] != 2 || graphKinds["work_item"] != workItemCount ||
+		graphKinds["activity"] != activityDays {
+		t.Fatalf("graph kinds = %#v", graphKinds)
+	}
+}
+
+func TestGeneratedGraphIsTeamOverviewCompatible(t *testing.T) {
+	value := validConfig("https://shoal.example.test")
+	if err := value.validate(); err != nil {
+		t.Fatal(err)
+	}
+	generated, err := buildScenario(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	corpus, err := explorer.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer corpus.Close()
+	snapshot, _ := corpus.Snapshot(context.Background())
+	nodes := make([]explorer.GraphNodeSpec, len(generated.Nodes))
+	for index, node := range generated.Nodes {
+		key, _ := base64.RawURLEncoding.DecodeString(node.Key)
+		nodes[index] = explorer.GraphNodeSpec{
+			Key: key, Kind: node.Kind, Properties: node.Properties,
+		}
+	}
+	relations := make([]explorer.GraphRelationSpec, len(generated.Relations))
+	for index, relation := range generated.Relations {
+		key, _ := base64.RawURLEncoding.DecodeString(relation.Key)
+		from, _ := base64.RawURLEncoding.DecodeString(relation.From)
+		to, _ := base64.RawURLEncoding.DecodeString(relation.To)
+		relations[index] = explorer.GraphRelationSpec{
+			Key: key, From: from, To: to, Type: relation.Type,
+			Properties: relation.Properties,
+		}
+	}
+	result, err := corpus.MaterializeGraph(context.Background(),
+		explorer.GraphMaterializationRequest{
+			Namespace:         []byte(value.Graph.Namespace),
+			IdentityNamespace: []byte("test-policy"),
+			MutationID:        "demo-mutation", ExpectedSnapshot: snapshot,
+			Nodes: nodes, Relations: relations,
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var teamID shoal.ID
+	for _, node := range result.Nodes {
+		if string(node.Key) == value.Team.ID {
+			teamID = node.ID
+		}
+	}
+	now := time.Date(2026, 9, 7, 12, 0, 0, 0, time.UTC)
+	authority, err := auth.NewAuthorityWithClock(func() time.Time { return now })
+	if err != nil {
+		t.Fatal(err)
+	}
+	decision, err := auth.NewDecision(auth.DecisionConfig{
+		Subject: "tester", Actor: "tester", AuthorizationDomain: []byte(value.Graph.AuthorizationDomain),
+		AllowedOperations:  []auth.Operation{auth.OperationTeamOverviewRead},
+		PermittedSourceIDs: [][]byte{[]byte(value.Graph.SourceID)},
+		PermittedPolicyIDs: [][]byte{[]byte(value.Graph.PolicyID)},
+		PolicyGeneration:   1, AuthenticationExpires: now.Add(time.Hour),
+		RequestID: "overview-request",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, err := authority.Binder().Bind(context.Background(), decision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dependencies := overviewDependencies{agents: []fleet.Descriptor{
+		{ID: shoal.ID(value.Users[0].Agent.ID), LeaseExpiresAt: now.Add(time.Hour)},
+		{ID: shoal.ID(value.Users[1].Agent.ID), LeaseExpiresAt: now.Add(time.Hour)},
+	}}
+	service, err := teamoverview.NewService(teamoverview.Config{
+		Graph: corpus, Agents: dependencies, Actions: dependencies,
+		Interactions: dependencies, Resolver: authority.Resolver(),
+		Clock: func() time.Time { return now },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	overview, err := service.Overview(ctx, teamoverview.Request{
+		TeamID: teamID, SourceID: []byte(value.Graph.SourceID),
+		PolicyID: []byte(value.Graph.PolicyID), HistoryDays: activityDays,
+		Limit: 100,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(overview.People) != 2 || len(overview.Agents) != 2 ||
+		len(overview.WorkItems) != workItemCount ||
+		len(overview.Activities) != activityDays {
+		t.Fatalf("overview = people:%d agents:%d items:%d activities:%d %#v",
+			len(overview.People), len(overview.Agents), len(overview.WorkItems),
+			len(overview.Activities), overview.Activities)
+	}
+}
+
+type overviewDependencies struct {
+	agents []fleet.Descriptor
+}
+
+func (o overviewDependencies) List(context.Context, fleet.ListRequest) (fleet.ListPage, error) {
+	return fleet.ListPage{Descriptors: o.agents}, nil
+}
+func (overviewDependencies) TeamActions(context.Context, fleet.TeamActionListRequest) (fleet.ActionPage, error) {
+	return fleet.ActionPage{}, nil
+}
+func (overviewDependencies) InteractionRecordsPage(context.Context, shoal.ID, uint32) (explorer.InteractionRecordPage, error) {
+	return explorer.InteractionRecordPage{}, nil
 }
 
 func TestProvisionIsIdempotentAndUsesDistinctOwners(t *testing.T) {
@@ -127,8 +255,10 @@ func TestProvisionIsIdempotentAndUsesDistinctOwners(t *testing.T) {
 		t.Fatal(err)
 	}
 	tokens := map[string]string{
-		"SHOAL_DEMO_TOKEN_A": "token-a",
-		"SHOAL_DEMO_TOKEN_B": "token-b",
+		"SHOAL_DEMO_TOKEN_A":     "token-a",
+		"SHOAL_DEMO_TOKEN_B":     "token-b",
+		"SHOAL_DEMO_AGENT_KEY_A": "agent-key-a",
+		"SHOAL_DEMO_AGENT_KEY_B": "agent-key-b",
 	}
 	provision := provisioner{
 		client: server.Client(),
@@ -144,6 +274,12 @@ func TestProvisionIsIdempotentAndUsesDistinctOwners(t *testing.T) {
 	}
 	if len(first.UserSummaries) != 2 || len(second.UserSummaries) != 2 {
 		t.Fatalf("summaries = %#v %#v", first, second)
+	}
+	if first.GraphDisposition != "applied" ||
+		second.GraphDisposition != "unchanged" ||
+		first.OverviewPeople != 2 || first.OverviewAgents != 2 ||
+		first.OverviewWorkItems != workItemCount {
+		t.Fatalf("graph summaries = %#v %#v", first, second)
 	}
 	for _, user := range first.UserSummaries {
 		for name, disposition := range user.Files {
@@ -307,9 +443,13 @@ func validConfig(baseURL string) config {
 	return config{
 		BaseURL:       baseURL,
 		OIDCIssuer:    "https://identity.example.test",
-		ScenarioStart: "2026-08-24T00:00:00Z",
+		ScenarioStart: "2026-08-25T00:00:00Z",
 		Team: teamConfig{
 			ID: "demo-team", Name: "Example Delivery Team",
+		},
+		Graph: graphConfig{
+			Namespace: "demo-team-graph", AuthorizationDomain: "demo-domain",
+			SourceID: "demo-source", PolicyID: "demo-policy",
 		},
 		Workspace: workspaceConfig{
 			RetrievalTopK: 20, GraphDepth: 3, GraphFanout: 20,
@@ -322,8 +462,10 @@ func validConfig(baseURL string) config {
 				WorkspaceID: "demo-workspace-a", TokenEnv: "SHOAL_DEMO_TOKEN_A",
 				Agent: agentConfig{
 					ID: "agent-planning", Name: "Planning Agent",
-					Capability: "planning",
-					Skills:     []string{"triage", "dependency-analysis"},
+					Capability:         "planning",
+					Skills:             []string{"triage", "dependency-analysis"},
+					ExecutorRef:        "simulated-planning",
+					RegistrationKeyEnv: "SHOAL_DEMO_AGENT_KEY_A",
 				},
 			},
 			{
@@ -332,8 +474,10 @@ func validConfig(baseURL string) config {
 				WorkspaceID: "demo-workspace-b", TokenEnv: "SHOAL_DEMO_TOKEN_B",
 				Agent: agentConfig{
 					ID: "agent-delivery", Name: "Delivery Agent",
-					Capability: "delivery",
-					Skills:     []string{"validation", "release-readiness"},
+					Capability:         "delivery",
+					Skills:             []string{"validation", "release-readiness"},
+					ExecutorRef:        "simulated-delivery",
+					RegistrationKeyEnv: "SHOAL_DEMO_AGENT_KEY_B",
 				},
 			},
 		},
@@ -346,6 +490,8 @@ type provisionServerState struct {
 	files           map[string][]byte
 	identityCalls   map[string]int
 	tokenWorkspaces map[string]map[string]struct{}
+	graph           []byte
+	agents          map[string]int64
 }
 
 func newProvisionServerState() *provisionServerState {
@@ -355,6 +501,7 @@ func newProvisionServerState() *provisionServerState {
 		tokenWorkspaces: map[string]map[string]struct{}{
 			"token-a": {}, "token-b": {},
 		},
+		agents: make(map[string]int64),
 	}
 }
 
@@ -373,6 +520,33 @@ func (s *provisionServerState) serveHTTP(
 	case request.Method == http.MethodPost &&
 		request.URL.Path == "/api/v1/ingest":
 		s.ingest(writer, request, token)
+	case request.Method == http.MethodPost &&
+		request.URL.Path == "/api/v1/documents":
+		writeTestJSON(writer, http.StatusOK, map[string]any{
+			"snapshot": map[string]any{
+				"id": "snapshot-1", "as_of": "2026-09-07T00:00:00Z",
+				"frontier": "1",
+			}, "documents": []any{},
+		})
+	case request.Method == http.MethodPost &&
+		request.URL.Path == "/api/v1/graph/materialize":
+		s.graphMaterialize(writer, request)
+	case request.Method == http.MethodPost &&
+		request.URL.Path == "/api/v1/fleet/agents":
+		s.registerAgent(writer, request)
+	case request.Method == http.MethodPost &&
+		strings.HasSuffix(request.URL.Path, "/resolve"):
+		s.resolveAgent(writer, request)
+	case request.Method == http.MethodPost &&
+		strings.HasSuffix(request.URL.Path, "/heartbeat"):
+		s.heartbeatAgent(writer, request)
+	case request.Method == http.MethodPost &&
+		request.URL.Path == "/api/v1/team/overview":
+		writeTestJSON(writer, http.StatusOK, map[string]any{
+			"people": make([]any, 2), "agents": make([]any, 2),
+			"work_items": make([]any, workItemCount),
+			"activities": make([]any, activityDays),
+		})
 	default:
 		http.NotFound(writer, request)
 	}
@@ -397,8 +571,103 @@ func (s *provisionServerState) identity(
 	writeTestJSON(writer, http.StatusOK, map[string]any{
 		"authenticated": true, "subject": subject,
 		"operations": []string{
-			"ingest", "workspace_settings_read", "workspace_settings_write",
+			"ingest", "graph_materialize", "workspace_settings_read",
+			"workspace_settings_write", "agent_register", "agent_heartbeat",
+			"agent_resolve", "team_overview_read",
 		},
+	})
+}
+
+func (s *provisionServerState) graphMaterialize(
+	writer http.ResponseWriter, request *http.Request,
+) {
+	body, err := io.ReadAll(request.Body)
+	if err != nil {
+		http.Error(writer, err.Error(), http.StatusBadRequest)
+		return
+	}
+	var input webapi.GraphMaterializeRequest
+	if err := json.Unmarshal(body, &input); err != nil {
+		http.Error(writer, err.Error(), http.StatusBadRequest)
+		return
+	}
+	s.mu.Lock()
+	found := len(s.graph) != 0
+	if found && !bytes.Equal(s.graph, body) {
+		s.mu.Unlock()
+		http.Error(writer, "divergent graph", http.StatusConflict)
+		return
+	}
+	s.graph = append([]byte(nil), body...)
+	s.mu.Unlock()
+	nodes := make([]webapi.GraphMaterializeIdentity, len(input.Nodes))
+	for index, node := range input.Nodes {
+		key, _ := base64.RawURLEncoding.DecodeString(node.Key)
+		nodes[index] = webapi.GraphMaterializeIdentity{
+			Key: node.Key, ID: graphKey("node-" + string(key)),
+		}
+	}
+	disposition := "applied"
+	if found {
+		disposition = "unchanged"
+	}
+	writeTestJSON(writer, http.StatusOK, map[string]any{
+		"materialization_id": graphKey("materialization"), "mutation_id": input.MutationID,
+		"disposition": disposition, "snapshot": input.Snapshot, "nodes": nodes,
+	})
+}
+
+func (s *provisionServerState) registerAgent(
+	writer http.ResponseWriter, request *http.Request,
+) {
+	var input struct {
+		Descriptor struct {
+			ID string `json:"id"`
+		} `json:"descriptor"`
+	}
+	if err := json.NewDecoder(request.Body).Decode(&input); err != nil {
+		http.Error(writer, err.Error(), http.StatusBadRequest)
+		return
+	}
+	s.mu.Lock()
+	s.agents[input.Descriptor.ID] = 1
+	s.mu.Unlock()
+	writeTestJSON(writer, http.StatusCreated, map[string]any{
+		"id": input.Descriptor.ID, "generation": 1,
+		"lease_expires_at": time.Now().UTC().Add(time.Hour),
+	})
+}
+
+func (s *provisionServerState) resolveAgent(
+	writer http.ResponseWriter, request *http.Request,
+) {
+	parts := strings.Split(request.URL.Path, "/")
+	id := parts[len(parts)-2]
+	s.mu.Lock()
+	generation, ok := s.agents[id]
+	s.mu.Unlock()
+	if !ok {
+		http.NotFound(writer, request)
+		return
+	}
+	writeTestJSON(writer, http.StatusOK, map[string]any{
+		"id": id, "generation": generation,
+		"lease_expires_at": time.Now().UTC().Add(time.Hour),
+	})
+}
+
+func (s *provisionServerState) heartbeatAgent(
+	writer http.ResponseWriter, request *http.Request,
+) {
+	parts := strings.Split(request.URL.Path, "/")
+	id := parts[len(parts)-2]
+	s.mu.Lock()
+	s.agents[id]++
+	generation := s.agents[id]
+	s.mu.Unlock()
+	writeTestJSON(writer, http.StatusOK, map[string]any{
+		"id": id, "generation": generation,
+		"lease_expires_at": time.Now().UTC().Add(time.Hour),
 	})
 }
 

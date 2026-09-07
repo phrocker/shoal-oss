@@ -8,15 +8,18 @@ The seed contains:
 
 - one team;
 - two people mapped to configured OIDC `sub` values;
-- two **simulated fixture agents** (records only; the seed does not launch or
-  register an executor);
+- two simulated Fleet agents registered against host-owned executor references;
 - seven work items; and
 - one deterministic activity record on each of 14 consecutive UTC dates.
 
-Every fixture has stable IDs, timestamps, filenames, and content. Re-running the
-command sends the same workspace mutation IDs and the same uploads. Workspace
-settings use Shoal's compare-and-swap replay behavior, and uploads return
-`unchanged` after their first successful ingestion.
+Every fixture has stable IDs, timestamps, filenames, graph keys, and content.
+The seed publishes exact `team`, `person`, `agent`, `work_item`, and `activity`
+nodes plus direct `member_of`, `assigned_to`, and `blocked_by` relations through
+`POST /api/v1/graph/materialize`. IDs are derived from the trusted authorization
+scope, configured namespace, and opaque local key. Exact reruns return
+`unchanged`; divergent reuse of a namespace or mutation ID fails with a
+conflict. The command also refreshes the two Fleet leases and verifies the
+result through `POST /api/v1/team/overview`.
 
 ## 1. Run one shared service
 
@@ -39,13 +42,14 @@ Both demo users need authorization-claim values mapped to:
 | Mapping | Operations used by the demo |
 | --- | --- |
 | reader | list, read, connect, retrieve, neighborhood, workspace-settings read |
-| contributor | ingest and workspace-settings write, in addition to reader |
-| fleet | agent and action operations used by the optional Fleet walkthrough |
+| contributor | ingest, graph materialization, and workspace-settings write, in addition to reader |
+| fleet | agent registration, heartbeat, and resolution used by the seed |
 
 The seed command verifies each bearer token with `GET /api/v1/identity`. It
 refuses a token whose trusted Shoal subject is not
-`oidc:<configured-issuer>#<configured-subject>` or which lacks `ingest`,
-`workspace_settings_read`, or `workspace_settings_write`.
+`oidc:<configured-issuer>#<configured-subject>` or which lacks `ingest`, `graph_materialize`, `workspace_settings_read`,
+`workspace_settings_write`, `agent_register`, `agent_heartbeat`,
+`agent_resolve`, or `team_overview_read`.
 
 Persist the **whole** `-state-dir`. With the path above, the corpus (including
 workspace settings) is under `/var/lib/shoal/corpus` and the durable
@@ -60,8 +64,11 @@ Copy the example without committing the populated copy:
 Copy-Item deploy\shoal-explore-web\demo-scenario.json.example .\demo-scenario.json
 ```
 
-Replace only the public endpoint, exact OIDC issuer, the two users' raw subject
-claim values, and non-secret display values. Keep workspace IDs distinct:
+Replace the public endpoint, exact OIDC issuer, authorization domain, the two
+users' raw subject claim values, and non-secret display values. The configured
+graph source/policy IDs must match the host's trusted policy selector. Each
+`executor_ref` must appear in the host's configured Fleet executor registry.
+Keep workspace IDs distinct:
 workspace settings are owned by the authenticated subject that creates them,
 so one shared workspace ID cannot be provisioned for two owners.
 
@@ -73,6 +80,10 @@ $env:SHOAL_DEMO_TOKEN_ALEX = [System.Net.NetworkCredential]::new(
   "", (Read-Host "First user's access token" -AsSecureString)).Password
 $env:SHOAL_DEMO_TOKEN_SAM = [System.Net.NetworkCredential]::new(
   "", (Read-Host "Second user's access token" -AsSecureString)).Password
+$env:SHOAL_DEMO_AGENT_KEY_ALEX = [System.Net.NetworkCredential]::new(
+  "", (Read-Host "First agent registration key" -AsSecureString)).Password
+$env:SHOAL_DEMO_AGENT_KEY_SAM = [System.Net.NetworkCredential]::new(
+  "", (Read-Host "Second agent registration key" -AsSecureString)).Password
 go run .\cmd\shoal-demo-seed -config .\demo-scenario.json
 ```
 
@@ -80,13 +91,17 @@ The command provisions each workspace through
 `PUT /api/v1/workspaces/{workspace}/settings`, then uploads that user's stable
 fixture subset through `POST /api/v1/ingest` with both
 `X-Shoal-Workspace-Request: 1` and the user's `Shoal-Workspace-ID`.
+It then reads the current snapshot, performs one snapshot-CAS graph
+materialization, registers or heartbeats both Fleet agents, and validates the
+team overview.
 The JSON result prints each raw workspace ID and its canonical unpadded
 base64url `workspace_header` value. It never prints a bearer token.
 
-Run the same command again. All workspace mutations must replay at revision 1,
-and every file disposition must be `unchanged`. A conflict indicates that the
-same workspace or fixture filename was previously used with different content;
-choose new demo IDs rather than overwriting unrelated state.
+Run the same command again. All workspace mutations replay at revision 1,
+every file disposition and the graph disposition are `unchanged`, and Fleet
+leases are refreshed without duplicate agent IDs. A graph conflict means the
+namespace was previously used with different content; choose a new namespace
+rather than overwriting unrelated state.
 
 ## 3. Configure VS Code HTTP MCP
 
@@ -149,10 +164,9 @@ The shared service's `-allowed-host` value must exactly match the authority in
 5. Ask each user to retrieve the demo team, work items, and 14-day activity.
    The shared corpus is visible under the user's own narrowing settings, while
    recorded MCP operations are attributed to that user's trusted principal.
-6. Optionally exercise Fleet tools only after the host has registered matching
-   executor references and the user's OIDC claims include the fleet mapping.
-   The two fixture agents are intentionally labeled `mode: simulated`; the seed
-   itself claims no autonomous executor.
+6. Confirm the overview reports two active simulated agents. Registration does
+   not launch a process: each descriptor only refers to a host-owned executor.
+   Leases are at most 24 hours; rerun the seed before expiry to heartbeat them.
 7. Restart the service without replacing the state volume. Reconnect both
    users and confirm the fixtures and workspace settings remain available.
 

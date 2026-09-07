@@ -55,6 +55,7 @@ type Explorer struct {
 	interactionNodeIDs             map[shoal.ID]struct{}
 	interactionEdgeIDs             map[shoal.ID]struct{}
 	extractions                    map[shoal.ID]*persistedExtraction
+	graphMaterializations          map[shoal.ID]*persistedGraphMaterialization
 	ontologyProposals              map[shoal.ID]*persistedOntologyProposal
 	ontologyMutationIndeterminate  bool
 	graphNodes                     map[shoal.ID]graph.Node
@@ -333,6 +334,7 @@ func openWithEngine(
 		interactionNodeIDs:             make(map[shoal.ID]struct{}),
 		interactionEdgeIDs:             make(map[shoal.ID]struct{}),
 		extractions:                    make(map[shoal.ID]*persistedExtraction),
+		graphMaterializations:          make(map[shoal.ID]*persistedGraphMaterialization),
 		ontologyProposals:              make(map[shoal.ID]*persistedOntologyProposal),
 		embedder:                       options.Embedder,
 		embedders:                      embedders,
@@ -963,6 +965,53 @@ func (e *Explorer) computeCurrentGraph() (
 			if _, ok := edges[persisted.EdgeID]; ok {
 				assertions[persisted.EdgeID] = assertion
 			}
+		}
+	}
+	materializationIDs := make(
+		[]shoal.ID, 0, len(e.graphMaterializations))
+	for id := range e.graphMaterializations {
+		materializationIDs = append(materializationIDs, id)
+	}
+	sort.Slice(materializationIDs, func(i, j int) bool {
+		return shoal.CompareID(
+			materializationIDs[i], materializationIDs[j]) < 0
+	})
+	for _, id := range materializationIDs {
+		record := e.graphMaterializations[id]
+		if record == nil {
+			continue
+		}
+		for _, node := range record.Nodes {
+			if existing, exists := nodes[node.ID]; exists &&
+				!nodesEqual(existing, node) {
+				return nil, nil, nil, shoal.NewError(
+					shoal.ErrorConflict,
+					"materialized graph node ID already has different content",
+				)
+			}
+			nodes[node.ID] = cloneNode(node)
+		}
+		for _, edge := range record.Edges {
+			if _, from := nodes[edge.From]; !from {
+				return nil, nil, nil, shoal.NewError(
+					shoal.ErrorInternal,
+					"materialized graph edge source is missing",
+				)
+			}
+			if _, to := nodes[edge.To]; !to {
+				return nil, nil, nil, shoal.NewError(
+					shoal.ErrorInternal,
+					"materialized graph edge target is missing",
+				)
+			}
+			if existing, exists := edges[edge.ID]; exists &&
+				!edgesEqual(existing, edge) {
+				return nil, nil, nil, shoal.NewError(
+					shoal.ErrorConflict,
+					"materialized graph edge ID already has different content",
+				)
+			}
+			edges[edge.ID] = cloneEdge(edge)
 		}
 	}
 	// Interaction nodes share the corpus graph but are excluded from

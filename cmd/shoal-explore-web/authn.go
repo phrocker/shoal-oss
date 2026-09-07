@@ -67,6 +67,7 @@ var workspaceOperations = []auth.Operation{
 	auth.OperationList,
 	auth.OperationRead,
 	auth.OperationConnect,
+	auth.OperationGraphMaterialize,
 	auth.OperationNeighborhood,
 	auth.OperationRetrieve,
 	auth.OperationAnalyticsRead,

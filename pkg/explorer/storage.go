@@ -49,45 +49,48 @@ import (
 // kind, big-endian payload length, SHA-256 payload checksum, and gob payload.
 // It is intentionally separate from the future cross-adapter canonical codec.
 const (
-	explorerTable  = EmbeddedTableName
-	recordCF       = "record"
-	recordCQV1     = "v1"
-	recordCQV2     = "v2"
-	recordDeleteCQ = "deleted"
-	documentRow    = "document/"
-	edgeRow        = "edge/"
-	interactionRow = "interaction/"
-	foldRow        = "interaction-fold/"
-	extractionRow  = "extraction/"
-	snapshotRow    = "snapshot/"
-	proposalRow    = "ontology-proposal/"
-	transitionRow  = "ontology-proposal-transition/"
+	explorerTable           = EmbeddedTableName
+	recordCF                = "record"
+	recordCQV1              = "v1"
+	recordCQV2              = "v2"
+	recordDeleteCQ          = "deleted"
+	documentRow             = "document/"
+	edgeRow                 = "edge/"
+	interactionRow          = "interaction/"
+	foldRow                 = "interaction-fold/"
+	extractionRow           = "extraction/"
+	graphMaterializationRow = "graph-materialization/"
+	snapshotRow             = "snapshot/"
+	proposalRow             = "ontology-proposal/"
+	transitionRow           = "ontology-proposal-transition/"
 
-	embeddedRecordMagic                = "SHOALX2\x00"
-	embeddedEnvelopeVersion            = byte(1)
-	embeddedRecordDocument             = byte(1)
-	embeddedRecordEdge                 = byte(2)
-	embeddedRecordSnapshotAnchor       = byte(3)
-	embeddedRecordInteraction          = byte(4)
-	embeddedRecordInteractionSink      = byte(5)
-	embeddedRecordFold                 = byte(6)
-	embeddedRecordCursorKey            = byte(7)
-	embeddedRecordOntologyProposal     = byte(8)
-	embeddedRecordProposalTransition   = byte(9)
-	embeddedRecordExtraction           = byte(10)
-	embeddedRecordSnapshot             = byte(11)
-	embeddedEnvelopeHeader             = 8 + 1 + 1 + 8 + sha256.Size
-	maxEmbeddedDocumentBytes           = uint64(document.MaxRevisionSourceBytes) * 8
-	maxEmbeddedEdgeBytes               = uint64(2 * 1024 * 1024)
-	maxEmbeddedSnapshotAnchorBytes     = uint64(1024)
-	maxEmbeddedInteractionBytes        = uint64(64 * 1024 * 1024)
-	maxEmbeddedInteractionSinkBytes    = uint64(1024)
-	maxEmbeddedFoldBytes               = uint64(64 * 1024 * 1024)
-	maxEmbeddedCursorKeyBytes          = uint64(1024)
-	maxEmbeddedOntologyProposalBytes   = uint64(16 * 1024 * 1024)
-	maxEmbeddedProposalTransitionBytes = uint64(64 * 1024)
-	maxEmbeddedExtractionBytes         = uint64(16 * 1024 * 1024)
-	maxEmbeddedSnapshotBytes           = uint64(64 * 1024 * 1024)
+	embeddedRecordMagic                  = "SHOALX2\x00"
+	embeddedEnvelopeVersion              = byte(1)
+	embeddedRecordDocument               = byte(1)
+	embeddedRecordEdge                   = byte(2)
+	embeddedRecordSnapshotAnchor         = byte(3)
+	embeddedRecordInteraction            = byte(4)
+	embeddedRecordInteractionSink        = byte(5)
+	embeddedRecordFold                   = byte(6)
+	embeddedRecordCursorKey              = byte(7)
+	embeddedRecordOntologyProposal       = byte(8)
+	embeddedRecordProposalTransition     = byte(9)
+	embeddedRecordExtraction             = byte(10)
+	embeddedRecordSnapshot               = byte(11)
+	embeddedRecordGraphMaterialization   = byte(12)
+	embeddedEnvelopeHeader               = 8 + 1 + 1 + 8 + sha256.Size
+	maxEmbeddedDocumentBytes             = uint64(document.MaxRevisionSourceBytes) * 8
+	maxEmbeddedEdgeBytes                 = uint64(2 * 1024 * 1024)
+	maxEmbeddedSnapshotAnchorBytes       = uint64(1024)
+	maxEmbeddedInteractionBytes          = uint64(64 * 1024 * 1024)
+	maxEmbeddedInteractionSinkBytes      = uint64(1024)
+	maxEmbeddedFoldBytes                 = uint64(64 * 1024 * 1024)
+	maxEmbeddedCursorKeyBytes            = uint64(1024)
+	maxEmbeddedOntologyProposalBytes     = uint64(16 * 1024 * 1024)
+	maxEmbeddedProposalTransitionBytes   = uint64(64 * 1024)
+	maxEmbeddedExtractionBytes           = uint64(16 * 1024 * 1024)
+	maxEmbeddedSnapshotBytes             = uint64(64 * 1024 * 1024)
+	maxEmbeddedGraphMaterializationBytes = uint64(4 * 1024 * 1024)
 )
 
 var snapshotAnchorRow = []byte("meta/snapshot-anchor")
@@ -147,6 +150,10 @@ func edgeRecordRow(edgeID shoal.ID) []byte {
 	row = append(row, edgeRow...)
 	row = append(row, []byte(edgeID)...)
 	return row
+}
+
+func graphMaterializationRecordRow(id shoal.ID) []byte {
+	return append([]byte(graphMaterializationRow), []byte(id)...)
 }
 
 func interactionRecordRow(sessionID shoal.ID) []byte {
@@ -251,6 +258,12 @@ func (e *Explorer) load() error {
 			}
 		case bytes.HasPrefix(key.Row, []byte(extractionRow)):
 			if err := e.loadExtractionRecord(
+				key.Row, qualifier, scanner.Value(),
+			); err != nil {
+				return err
+			}
+		case bytes.HasPrefix(key.Row, []byte(graphMaterializationRow)):
+			if err := e.loadGraphMaterializationRecord(
 				key.Row, qualifier, scanner.Value(),
 			); err != nil {
 				return err
@@ -1210,6 +1223,8 @@ func embeddedRecordMaximum(kind byte) (uint64, error) {
 		return maxEmbeddedExtractionBytes, nil
 	case embeddedRecordSnapshot:
 		return maxEmbeddedSnapshotBytes, nil
+	case embeddedRecordGraphMaterialization:
+		return maxEmbeddedGraphMaterializationBytes, nil
 	default:
 		return 0, fmt.Errorf("embedded record kind %d is unsupported", kind)
 	}

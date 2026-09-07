@@ -309,6 +309,8 @@ func workspaceOperationForRequest(
 			path == "/api/v1/extract" ||
 			path == "/api/v1/derivation/recompute"):
 		return auth.OperationIngest, true
+	case method == http.MethodPost && path == "/api/v1/graph/materialize":
+		return auth.OperationGraphMaterialize, true
 	case method == http.MethodPost &&
 		(path == "/api/v1/changes" || path == "/api/v1/documents"):
 		return auth.OperationList, true
@@ -603,6 +605,7 @@ func requestMayCommit(method, path string) bool {
 	}
 	switch path {
 	case "/api/v1/ingest",
+		"/api/v1/graph/materialize",
 		"/api/v1/extract",
 		"/api/v1/derivation/recompute",
 		"/api/v1/ontology/proposals",
