@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/phrocker/shoal-oss/internal/explorercoord"
+	"github.com/phrocker/shoal-oss/internal/explorerfleetcap"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/explorer/coordination"
 	"github.com/phrocker/shoal-oss/pkg/explorer/fleet"
@@ -127,16 +128,17 @@ func composeWithPublisher(
 	cursorKey []byte,
 	clock func() time.Time,
 ) (*fleetevents.Service, *ActionEventPublisher, error) {
-	service, err := fleetevents.New(fleetevents.Config{
+	capability := explorerfleetcap.New()
+	service, err := fleetevents.NewWithLifecycleCapability(fleetevents.Config{
 		Backend: backend, Resolver: resolver, GenerationReader: generations,
 		LeaseValidator: leases, Auditor: auditor, CursorKey: cursorKey,
 		Clock: clock,
-	})
+	}, capability)
 	if err != nil {
 		return nil, nil, err
 	}
 	publisher, err := NewActionEventPublisher(
-		service, resolver, clock)
+		service, resolver, capability, clock)
 	if err != nil {
 		return nil, nil, err
 	}

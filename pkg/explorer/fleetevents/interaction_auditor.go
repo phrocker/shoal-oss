@@ -28,6 +28,7 @@ import (
 	"sort"
 	"time"
 
+	"github.com/phrocker/shoal-oss/internal/explorerfleetcap"
 	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/interaction"
@@ -55,7 +56,7 @@ type InteractionSnapshotProvider interface {
 
 type reconciliationResultSink interface {
 	RecordReconciledInteractionResult(
-		context.Context, interaction.Session,
+		context.Context, explorerfleetcap.Capability, interaction.Session,
 	) (interaction.Session, error)
 }
 
@@ -155,8 +156,14 @@ func (a *InteractionAuditor) RecordFleetActionRetry(
 }
 
 func (a *InteractionAuditor) RecordFleetActionReconciliation(
-	ctx context.Context, record AuditRecord,
+	ctx context.Context, capability explorerfleetcap.Capability,
+	record AuditRecord,
 ) error {
+	if !capability.Valid() {
+		return shoal.NewError(
+			shoal.ErrorUnauthorized,
+			"fleet reconciliation capability is invalid")
+	}
 	session, err := a.fleetActionSession(ctx, record)
 	if err != nil {
 		return err
@@ -176,7 +183,8 @@ func (a *InteractionAuditor) RecordFleetActionReconciliation(
 			shoal.ErrorUnavailable,
 			"trusted interaction reconciliation sink is unavailable")
 	}
-	persisted, err := reconciler.RecordReconciledInteractionResult(ctx, session)
+	persisted, err := reconciler.RecordReconciledInteractionResult(
+		ctx, capability, session)
 	return validateFleetReceipt(session, persisted, err)
 }
 

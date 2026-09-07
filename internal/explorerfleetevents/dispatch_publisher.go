@@ -27,6 +27,7 @@ import (
 	"errors"
 	"time"
 
+	"github.com/phrocker/shoal-oss/internal/explorerfleetcap"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/explorer/fleet"
 	"github.com/phrocker/shoal-oss/pkg/explorer/fleetevents"
@@ -37,9 +38,10 @@ import (
 // ActionEventPublisher adapts durable dispatch lifecycle transitions to the
 // fleet event log.
 type ActionEventPublisher struct {
-	service  *fleetevents.Service
-	resolver auth.Resolver
-	now      func() time.Time
+	service   *fleetevents.Service
+	resolver  auth.Resolver
+	reconcile explorerfleetcap.Capability
+	now       func() time.Time
 }
 
 var _ fleet.ActionEventPublisher = (*ActionEventPublisher)(nil)
@@ -47,13 +49,15 @@ var _ fleet.ActionEventPublisher = (*ActionEventPublisher)(nil)
 func NewActionEventPublisher(
 	service *fleetevents.Service,
 	resolver auth.Resolver,
+	capability explorerfleetcap.Capability,
 	clock func() time.Time,
 ) (*ActionEventPublisher, error) {
-	if service == nil || resolver == nil || clock == nil {
+	if service == nil || resolver == nil || !capability.Valid() || clock == nil {
 		return nil, errors.New("fleet events: action publisher dependencies are required")
 	}
 	return &ActionEventPublisher{
-		service: service, resolver: resolver, now: clock,
+		service: service, resolver: resolver,
+		reconcile: capability, now: clock,
 	}, nil
 }
 
@@ -104,15 +108,16 @@ func (p *ActionEventPublisher) PublishActionEvent(
 		OccurredAt:         record.UpdatedAt,
 	}
 
-	_, err = p.service.PublishLifecycle(ctx, operation, fleetevents.PublishRequest{
-		Token: token, RetryUntil: record.UpdatedAt.Add(fleetevents.MaxMutationRetryWindow),
-		Event: event,
-	}, fleetevents.LifecycleReceipt{
-		RequestID:                provenance.RequestID,
-		CorrelationID:            []byte(provenance.CorrelationID),
-		AuthorizationFingerprint: fingerprint,
-		AuthorizationExpiresAt:   expiresAt,
-	})
+	_, err = p.service.PublishLifecycle(
+		ctx, p.reconcile, operation, fleetevents.PublishRequest{
+			Token: token, RetryUntil: record.UpdatedAt.Add(fleetevents.MaxMutationRetryWindow),
+			Event: event,
+		}, fleetevents.LifecycleReceipt{
+			RequestID:                provenance.RequestID,
+			CorrelationID:            []byte(provenance.CorrelationID),
+			AuthorizationFingerprint: fingerprint,
+			AuthorizationExpiresAt:   expiresAt,
+		})
 	return err
 }
 

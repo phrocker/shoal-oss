@@ -13,6 +13,7 @@ import (
 
 	"github.com/phrocker/shoal-oss/internal/explorercoord"
 	"github.com/phrocker/shoal-oss/internal/explorerfleet"
+	"github.com/phrocker/shoal-oss/internal/explorerfleetcap"
 	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/explorer/fleet"
@@ -67,17 +68,19 @@ func TestRealDispatchPublishesAllLifecycleEventsIdempotently(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	eventService, err := fleetevents.New(fleetevents.Config{
+	capability := explorerfleetcap.New()
+	eventService, err := fleetevents.NewWithLifecycleCapability(fleetevents.Config{
 		Backend: eventBackend, Resolver: authority.Resolver(),
 		GenerationReader: integrationGeneration{}, LeaseValidator: integrationLease{},
 		Auditor: integrationAuditor{}, CursorKey: bytes.Repeat([]byte{7}, 32),
 		Clock: func() time.Time { return now },
-	})
+	}, capability)
 	if err != nil {
 		t.Fatal(err)
 	}
 	publisher, err := NewActionEventPublisher(
-		eventService, authority.Resolver(), func() time.Time { return now })
+		eventService, authority.Resolver(), capability,
+		func() time.Time { return now })
 	if err != nil {
 		t.Fatal(err)
 	}

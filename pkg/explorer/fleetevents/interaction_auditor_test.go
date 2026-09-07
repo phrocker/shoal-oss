@@ -26,6 +26,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/phrocker/shoal-oss/internal/explorerfleetcap"
 	"github.com/phrocker/shoal-oss/pkg/document"
 	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
@@ -402,7 +403,7 @@ func TestOperationInteractionAuditorUsesTrustedReconciliationSink(t *testing.T) 
 		AuthorizationExpiresAt:   now.Add(time.Hour), OccurredAt: now,
 	}
 	if err := auditor.RecordFleetActionReconciliation(
-		context.Background(), record,
+		context.Background(), explorerfleetcap.New(), record,
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -483,7 +484,8 @@ func (s *auditSink) RecordInteractionResult(
 }
 
 func (s *auditSink) RecordReconciledInteractionResult(
-	ctx context.Context, session interaction.Session,
+	ctx context.Context, _ explorerfleetcap.Capability,
+	session interaction.Session,
 ) (interaction.Session, error) {
 	s.reconciliations++
 	return s.RecordInteractionResult(ctx, session)
