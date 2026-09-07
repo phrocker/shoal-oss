@@ -288,10 +288,11 @@ func (f Fold) ID() (shoal.ID, error) {
 	return DerivedID("fold", parts...), nil
 }
 
-// Subgraph materializes the fold node and its edges. resolve supplies the
-// visibility labels of every source node the fold covers; if it fails for any
-// node the whole fold fails, rather than being written with an understated
-// visibility.
+// Subgraph materializes a compatibility fold that has no retained source-edge
+// provenance. Edge-bearing folds require SubgraphWithEvidence so edge-local
+// visibility cannot be omitted. resolve supplies the visibility labels of
+// every source node the fold covers; if it fails for any node the whole fold
+// fails rather than being written with understated visibility.
 //
 // The resulting visibility is the conjunction of every folded session's own
 // visibility and every touched source node's labels. Folding therefore never

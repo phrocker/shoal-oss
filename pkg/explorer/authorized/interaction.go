@@ -63,7 +63,11 @@ func (c *Client) AnalyticsInteractionSink() interaction.ResultSink {
 	if c == nil {
 		return nil
 	}
-	if _, err := c.interactionWriter(); err != nil {
+	writer, err := c.interactionWriter()
+	if err != nil {
+		return nil
+	}
+	if _, ok := writer.(interaction.ResultSink); !ok {
 		return nil
 	}
 	if isNilDependency(c.snapshotValidator) {
@@ -87,6 +91,12 @@ func (s operationInteractionSink) EnsureInteractionSink(
 	writer, err := s.client.interactionWriter()
 	if err != nil {
 		return err
+	}
+	if _, ok := writer.(interaction.ResultSink); !ok {
+		return shoal.NewError(
+			shoal.ErrorUnavailable,
+			"trusted interaction result sink is unavailable",
+		)
 	}
 	if err := writer.EnsureInteractionSink(ctx); err != nil {
 		return directBaseError(err)

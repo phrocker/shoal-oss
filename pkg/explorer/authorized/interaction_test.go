@@ -247,6 +247,15 @@ func TestAuthorizedResultPathRequiresResultSink(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	sink := client.AnalyticsInteractionSink()
+	if sink != nil {
+		t.Fatal("analytics exposed a result sink backed by a void-only writer")
+	}
+	if _, err := interaction.NewRecorder(
+		context.Background(), sink,
+	); !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
+		t.Fatalf("recorder setup with void-only sink = %v", err)
+	}
 	session := interaction.Session{
 		ID:         interaction.DerivedID("session", "result-sink-required"),
 		Operation:  interaction.OperationRetrieval,
