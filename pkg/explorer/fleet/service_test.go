@@ -22,6 +22,7 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"math"
 	"sort"
 	"sync"
 	"testing"
@@ -37,6 +38,19 @@ func TestCanonicalSchemaRejectsTrailingJSON(t *testing.T) {
 		json.RawMessage(`{"type":"object"} {"type":"string"}`),
 	); !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
 		t.Fatalf("trailing schema JSON = %v", err)
+	}
+}
+
+func TestGenerationValidationRejectsIncrementOverflow(t *testing.T) {
+	if err := validateGeneration(math.MaxInt64); !shoal.IsErrorCode(
+		err, shoal.ErrorInvalidArgument,
+	) {
+		t.Fatalf("register maximum generation error = %v", err)
+	}
+	if err := validateMutationIdentity(
+		"agent", "registration", math.MaxInt64,
+	); !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
+		t.Fatalf("mutation maximum generation error = %v", err)
 	}
 }
 

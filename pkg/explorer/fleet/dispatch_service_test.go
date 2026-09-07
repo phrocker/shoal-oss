@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
@@ -372,6 +373,189 @@ func TestDispatchCommittedEventAmbiguityReconcilesOnRetry(t *testing.T) {
 	reconciled, err := service.Enqueue(ctx, request)
 	if err != nil || reconciled.State != DispatchQueued || events.calls != 2 {
 		t.Fatalf("reconciled = %#v calls=%d err=%v", reconciled, events.calls, err)
+	}
+}
+
+func TestDispatchTransitionProvenanceSurvivesFreshRetryAndPolicyRefresh(
+	t *testing.T,
+) {
+	now := time.Date(2026, 9, 6, 12, 0, 0, 0, time.UTC)
+	authority, _ := auth.NewAuthorityWithClock(func() time.Time { return now })
+	registryStore := newMemoryStore()
+	registry, _ := NewService(Config{
+		Store: registryStore, Resolver: authority.Resolver(),
+		Recorder: &memoryRecorder{}, Snapshots: fixedSnapshot{now},
+		Executors: executorMap{"exec": &dispatchExecutor{}},
+		Clock:     func() time.Time { return now },
+	})
+	registryStore.records["agent"] = Stored{Descriptor: dispatchDescriptor(now)}
+	store := newMemoryDispatchStore()
+	events := &controlledDispatchEvents{}
+	service, _ := NewDispatchService(DispatchConfig{
+		Store: store, Registry: registry, Resolver: authority.Resolver(),
+		Recorder: &dispatchRecorder{}, Events: events,
+		Clock: func() time.Time { return now },
+	})
+
+	enqueueDecision := dispatchDecisionWithProvenance(
+		t, now, "enqueue-request", "enqueue-correlation", 1, now.Add(time.Hour),
+	)
+	enqueueCtx := bindDecision(t, authority, enqueueDecision)
+	queued, err := service.Enqueue(
+		enqueueCtx, dispatchEnqueueWithContext(
+			now, "enqueue-request", "enqueue-correlation",
+		),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	events.err = errors.New("event unavailable")
+	claimDecision := dispatchDecisionWithProvenance(
+		t, now, "claim-request", "claim-correlation", 1, now.Add(time.Hour),
+	)
+	claimCtx := bindDecision(t, authority, claimDecision)
+	claimRequest := ClaimRequest{
+		ID: queued.ID, ExpectedVersion: queued.Version, ClaimID: []byte("claim"),
+		Lease: time.Minute, Context: RequestContext{
+			RequestID: "claim-request", CorrelationID: "claim-correlation",
+			ReasonCode: "worker_claim", Deadline: now.Add(time.Hour),
+		},
+	}
+	if _, err := service.Claim(claimCtx, claimRequest); !errors.Is(
+		err, ErrActionCommitted,
+	) {
+		t.Fatalf("claim event ambiguity = %v", err)
+	}
+	claimed, err := store.GetAction(claimCtx, queued.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimProvenance := claimed.EventProvenance()
+	claimFingerprint, _ := auth.AuthorizationFingerprint(claimDecision)
+	if claimProvenance.RequestID != "claim-request" ||
+		claimProvenance.CorrelationID != "claim-correlation" ||
+		claimProvenance.AuthorizationFingerprint != claimFingerprint ||
+		!claimProvenance.AuthorizationExpiresAt.Equal(
+			claimDecision.AuthenticationExpires(),
+		) {
+		t.Fatalf("claim provenance = %#v", claimProvenance)
+	}
+
+	events.err = nil
+	retryDecision := dispatchDecisionWithProvenance(
+		t, now, "claim-retry", "claim-retry-correlation", 2, now.Add(2*time.Hour),
+	)
+	retryCtx := bindDecision(t, authority, retryDecision)
+	claimRequest.Context = RequestContext{
+		RequestID: "claim-retry", CorrelationID: "claim-retry-correlation",
+		ReasonCode: "worker_claim_retry", Deadline: now.Add(time.Hour),
+	}
+	replayed, err := service.Claim(retryCtx, claimRequest)
+	if err != nil || replayed.EventProvenance() != claimProvenance {
+		t.Fatalf("claim retry provenance = %#v, %v", replayed.EventProvenance(), err)
+	}
+
+	now = now.Add(2 * time.Minute)
+	cancelDecision := dispatchDecisionWithProvenance(
+		t, now, "cancel-request", "cancel-correlation", 3, now.Add(3*time.Hour),
+	)
+	cancelCtx := bindDecision(t, authority, cancelDecision)
+	events.err = errors.New("event unavailable")
+	cancelRequest := CancelRequest{
+		ID: queued.ID, ExpectedVersion: claimed.Version,
+		MutationKey: []byte("cancel"), Context: RequestContext{
+			RequestID: "cancel-request", CorrelationID: "cancel-correlation",
+			ReasonCode: "policy_refresh", Deadline: now.Add(time.Hour),
+		},
+	}
+	if _, err := service.Cancel(cancelCtx, cancelRequest); !errors.Is(
+		err, ErrActionCommitted,
+	) {
+		t.Fatalf("cancel event ambiguity = %v", err)
+	}
+	canceled, err := store.GetAction(cancelCtx, queued.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cancelProvenance := canceled.EventProvenance()
+	cancelFingerprint, _ := auth.AuthorizationFingerprint(cancelDecision)
+	if cancelProvenance.RequestID != "cancel-request" ||
+		cancelProvenance.CorrelationID != "cancel-correlation" ||
+		cancelProvenance.AuthorizationFingerprint != cancelFingerprint ||
+		!cancelProvenance.AuthorizationExpiresAt.Equal(
+			cancelDecision.AuthenticationExpires(),
+		) {
+		t.Fatalf("cancel provenance = %#v", cancelProvenance)
+	}
+
+	events.err = nil
+	cancelRetryDecision := dispatchDecisionWithProvenance(
+		t, now, "cancel-retry", "cancel-retry-correlation", 4, now.Add(4*time.Hour),
+	)
+	cancelRetryCtx := bindDecision(t, authority, cancelRetryDecision)
+	cancelRequest.Context = RequestContext{
+		RequestID: "cancel-retry", CorrelationID: "cancel-retry-correlation",
+		ReasonCode: "retry", Deadline: now.Add(time.Hour),
+	}
+	replayedCancel, err := service.Cancel(cancelRetryCtx, cancelRequest)
+	if err != nil || replayedCancel.EventProvenance() != cancelProvenance {
+		t.Fatalf(
+			"cancel retry provenance = %#v, %v",
+			replayedCancel.EventProvenance(), err,
+		)
+	}
+}
+
+func TestDispatchCancelAddsDispatchAuthorizationToInvokeAction(t *testing.T) {
+	now := time.Date(2026, 9, 6, 12, 0, 0, 0, time.UTC)
+	authority, _ := auth.NewAuthorityWithClock(func() time.Time { return now })
+	registryStore := newMemoryStore()
+	registry, _ := NewService(Config{
+		Store: registryStore, Resolver: authority.Resolver(),
+		Recorder: &memoryRecorder{}, Snapshots: fixedSnapshot{now},
+		Executors: executorMap{"exec": &dispatchExecutor{}},
+		Clock:     func() time.Time { return now },
+	})
+	registryStore.records["agent"] = Stored{Descriptor: dispatchDescriptor(now)}
+	store := newMemoryDispatchStore()
+	service, _ := NewDispatchService(DispatchConfig{
+		Store: store, Registry: registry, Resolver: authority.Resolver(),
+		Recorder: &dispatchRecorder{}, Events: dispatchEvents{},
+		Clock: func() time.Time { return now },
+	})
+	invokeDecision := dispatchDecision(
+		t, "owner", "actor", "invoke-request", auth.OperationInvoke,
+	)
+	invokeCtx := bindDecision(t, authority, invokeDecision)
+	queued, err := service.enqueue(
+		invokeCtx, dispatchEnqueue(now, "invoke-request"), auth.OperationInvoke,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(
+		queued.AuthorizedOperations, []auth.Operation{auth.OperationInvoke},
+	) {
+		t.Fatalf("invoke operations = %#v", queued.AuthorizedOperations)
+	}
+	cancelDecision := dispatchDecision(
+		t, "owner", "actor", "cancel-request", auth.OperationDispatch,
+	)
+	cancelCtx := bindDecision(t, authority, cancelDecision)
+	canceled, err := service.Cancel(cancelCtx, CancelRequest{
+		ID: queued.ID, ExpectedVersion: queued.Version,
+		MutationKey: []byte("cancel"), Context: dispatchContext(
+			now, "cancel-request",
+		),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(canceled.AuthorizedOperations, []auth.Operation{
+		auth.OperationDispatch, auth.OperationInvoke,
+	}) {
+		t.Fatalf("cancel operations = %#v", canceled.AuthorizedOperations)
 	}
 }
 
@@ -961,11 +1145,48 @@ func dispatchDecision(t *testing.T, subject, actor, request string, operations .
 	return decision
 }
 
+func dispatchDecisionWithProvenance(
+	t *testing.T,
+	now time.Time,
+	request, correlation string,
+	policyGeneration int64,
+	expires time.Time,
+) auth.Decision {
+	t.Helper()
+	decision, err := auth.NewDecision(auth.DecisionConfig{
+		Subject: "owner", Actor: "actor", AuthorizationDomain: []byte("domain"),
+		AllowedOperations: []auth.Operation{
+			auth.OperationDispatch, auth.OperationInvoke,
+		},
+		PermittedSourceIDs:    [][]byte{[]byte("source")},
+		PermittedPolicyIDs:    [][]byte{[]byte("policy")},
+		PolicyGeneration:      policyGeneration,
+		AuthenticationExpires: expires,
+		RequestID:             shoal.ID(request),
+		CorrelationID:         shoal.ID(correlation),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !now.Before(decision.AuthenticationExpires()) {
+		t.Fatal("test decision is already expired")
+	}
+	return decision
+}
+
 func dispatchContext(now time.Time, request string) RequestContext {
 	return RequestContext{
 		RequestID: shoal.ID(request), CorrelationID: "correlation",
 		ReasonCode: "operator_request", Deadline: now.Add(time.Hour),
 	}
+}
+
+func dispatchEnqueueWithContext(
+	now time.Time, request, correlation string,
+) EnqueueRequest {
+	result := dispatchEnqueue(now, request)
+	result.Context.CorrelationID = shoal.ID(correlation)
+	return result
 }
 
 func dispatchEnqueue(now time.Time, request string) EnqueueRequest {

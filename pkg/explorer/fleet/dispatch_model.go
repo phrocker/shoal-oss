@@ -70,47 +70,87 @@ type EvidenceRef struct {
 
 // ActionRecord is the durable source of truth for one dispatch.
 type ActionRecord struct {
-	ID                        []byte
-	IdempotencyKey            []byte
-	Version                   uint64
-	State                     DispatchState
-	AgentID                   shoal.ID
-	AgentGeneration           int64
-	Capability                string
-	Action                    string
-	SourceID                  []byte
-	PolicyID                  []byte
-	ObjectID                  shoal.ID
-	Input                     json.RawMessage
-	Output                    json.RawMessage
-	ErrorCode                 string
-	Subject                   shoal.ID
-	Actor                     shoal.ID
-	ClientID                  shoal.ID
-	OnBehalfOf                []shoal.ID
-	AuthorizationFingerprint  auth.Fingerprint
-	PolicyGeneration          int64
-	AuthorizationExpiresAt    time.Time
-	ExecutionFingerprint      auth.Fingerprint
-	ExecutionPolicyGeneration int64
-	ExecutionExpiresAt        time.Time
-	AuthorizedOperations      []auth.Operation
-	RequestID                 shoal.ID
-	CorrelationID             shoal.ID
-	Reason                    interaction.Reason
-	Deadline                  time.Time
-	CreatedAt                 time.Time
-	UpdatedAt                 time.Time
-	ClaimID                   []byte
-	ClaimFence                uint64
-	ClaimLease                time.Duration
-	ClaimLeaseUntil           time.Time
-	CancelKey                 []byte
-	ExecutorKey               []byte
-	EvidenceSnapshotID        shoal.ID
-	EvidenceSnapshotAsOf      time.Time
-	Evidence                  []EvidenceRef
-	EffectPossible            bool
+	ID                             []byte
+	IdempotencyKey                 []byte
+	Version                        uint64
+	State                          DispatchState
+	AgentID                        shoal.ID
+	AgentGeneration                int64
+	Capability                     string
+	Action                         string
+	SourceID                       []byte
+	PolicyID                       []byte
+	ObjectID                       shoal.ID
+	Input                          json.RawMessage
+	Output                         json.RawMessage
+	ErrorCode                      string
+	Subject                        shoal.ID
+	Actor                          shoal.ID
+	ClientID                       shoal.ID
+	OnBehalfOf                     []shoal.ID
+	AuthorizationFingerprint       auth.Fingerprint
+	PolicyGeneration               int64
+	AuthorizationExpiresAt         time.Time
+	ExecutionFingerprint           auth.Fingerprint
+	ExecutionPolicyGeneration      int64
+	ExecutionExpiresAt             time.Time
+	AuthorizedOperations           []auth.Operation
+	RequestID                      shoal.ID
+	CorrelationID                  shoal.ID
+	TransitionRequestID            shoal.ID
+	TransitionCorrelationID        shoal.ID
+	CancelAuthorizationFingerprint auth.Fingerprint
+	CancelAuthorizationExpiresAt   time.Time
+	Reason                         interaction.Reason
+	Deadline                       time.Time
+	CreatedAt                      time.Time
+	UpdatedAt                      time.Time
+	ClaimID                        []byte
+	ClaimFence                     uint64
+	ClaimLease                     time.Duration
+	ClaimLeaseUntil                time.Time
+	CancelKey                      []byte
+	ExecutorKey                    []byte
+	EvidenceSnapshotID             shoal.ID
+	EvidenceSnapshotAsOf           time.Time
+	Evidence                       []EvidenceRef
+	EffectPossible                 bool
+}
+
+// ActionEventProvenance identifies the authorization and request that
+// committed the record's current transition.
+type ActionEventProvenance struct {
+	RequestID                shoal.ID
+	CorrelationID            shoal.ID
+	AuthorizationFingerprint auth.Fingerprint
+	AuthorizationExpiresAt   time.Time
+}
+
+// EventProvenance returns durable transition provenance, falling back to the
+// enqueue provenance for records written before transition provenance existed.
+func (r ActionRecord) EventProvenance() ActionEventProvenance {
+	result := ActionEventProvenance{
+		RequestID: r.RequestID, CorrelationID: r.CorrelationID,
+		AuthorizationFingerprint: r.AuthorizationFingerprint,
+		AuthorizationExpiresAt:   r.AuthorizationExpiresAt,
+	}
+	if r.TransitionRequestID != "" {
+		result.RequestID = r.TransitionRequestID
+		result.CorrelationID = r.TransitionCorrelationID
+	}
+	switch r.State {
+	case DispatchCanceled:
+		if !r.CancelAuthorizationExpiresAt.IsZero() {
+			result.AuthorizationFingerprint = r.CancelAuthorizationFingerprint
+			result.AuthorizationExpiresAt = r.CancelAuthorizationExpiresAt
+		}
+	case DispatchClaimed, DispatchSucceeded, DispatchFailed:
+		if !r.ExecutionExpiresAt.IsZero() {
+			result.AuthorizationFingerprint = r.ExecutionFingerprint
+			result.AuthorizationExpiresAt = r.ExecutionExpiresAt
+		}
+	}
+	return result
 }
 
 type EnqueueRequest struct {
@@ -310,6 +350,29 @@ func (r ActionRecord) Validate() error {
 	}
 	if err := shoal.ValidateOptionalID("action correlation ID", r.CorrelationID); err != nil {
 		return err
+	}
+	if err := shoal.ValidateOptionalID(
+		"action transition request ID", r.TransitionRequestID,
+	); err != nil {
+		return err
+	}
+	if err := shoal.ValidateOptionalID(
+		"action transition correlation ID", r.TransitionCorrelationID,
+	); err != nil {
+		return err
+	}
+	if r.TransitionRequestID == "" && r.TransitionCorrelationID != "" {
+		return shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			"action transition correlation requires a request ID",
+		)
+	}
+	if r.CancelAuthorizationExpiresAt.IsZero() !=
+		(r.CancelAuthorizationFingerprint == auth.Fingerprint{}) {
+		return shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			"action cancellation authorization provenance is incomplete",
+		)
 	}
 	if err := r.Reason.Validate(); err != nil {
 		return err

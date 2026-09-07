@@ -23,6 +23,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"hash"
+	"math"
 	"reflect"
 	"time"
 
@@ -676,8 +677,11 @@ func authorizeDescriptor(decision auth.Decision, operation auth.Operation, descr
 }
 
 func validateGeneration(generation int64) error {
-	if generation < 0 {
-		return shoal.NewError(shoal.ErrorInvalidArgument, "expected generation cannot be negative")
+	if generation < 0 || generation == math.MaxInt64 {
+		return shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			"expected generation is outside the incrementable range",
+		)
 	}
 	return nil
 }
@@ -689,8 +693,11 @@ func validateMutationIdentity(id, key shoal.ID, generation int64) error {
 	if err := shoal.ValidateRequiredID("registration key", key); err != nil {
 		return err
 	}
-	if generation <= 0 {
-		return shoal.NewError(shoal.ErrorInvalidArgument, "expected generation must be positive")
+	if generation <= 0 || generation == math.MaxInt64 {
+		return shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			"expected generation must be positive and incrementable",
+		)
 	}
 	return nil
 }
