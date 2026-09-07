@@ -159,9 +159,6 @@ var oidcReaderOperations = []auth.Operation{
 	auth.OperationRetrieve,
 	auth.OperationWorkspaceSettingsRead,
 	auth.OperationAgentResolve,
-	auth.OperationSubscriptionCreate,
-	auth.OperationSubscriptionDelete,
-	auth.OperationSubscriptionDeliver,
 }
 
 // oidcContributorOperations additionally permits ingestion. It matches the
