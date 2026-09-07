@@ -221,6 +221,38 @@ func TestLifecycleRecorderRecoversDroppedCommittedResult(t *testing.T) {
 	}
 }
 
+func TestLifecycleRecorderRejectsDroppedDivergentCommittedResult(t *testing.T) {
+	cause := context.DeadlineExceeded
+	lifecycle := testLifecycle()
+	accepted := lifecycleSession(lifecycle)
+	accepted.RecordedAt = lifecycle.SnapshotAsOf.Add(time.Second)
+	accepted.Actor = interaction.ActorContext{
+		SubjectID: lifecycle.Subject, ActorID: lifecycle.Actor,
+		ClientID:   lifecycle.ClientID,
+		OnBehalfOf: append([]shoal.ID(nil), lifecycle.OnBehalfOf...),
+	}
+	accepted.Reason, _ = interaction.NewReason(
+		"audit_purpose", lifecycle.AuditPurpose,
+	)
+	accepted.ResultID = "different-agent"
+	store := &reconcilingLifecycleStore{
+		trustedLifecycleRecorder: trustedLifecycleRecorder{
+			lifecycle: lifecycle,
+		},
+		stored:    accepted,
+		recordErr: explorer.MarkCommittedInteraction(cause),
+	}
+	recorder, err := NewLifecycleRecorderWithReader(store, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = recorder.RecordLifecycle(context.Background(), lifecycle)
+	if !errors.Is(err, cause) || !explorer.IsCommittedInteraction(err) ||
+		!shoal.IsErrorCode(err, shoal.ErrorConflict) {
+		t.Fatalf("dropped divergent committed result = %v", err)
+	}
+}
+
 func TestLifecycleRecorderRejectsCommittedDivergentResult(t *testing.T) {
 	cause := context.DeadlineExceeded
 	sink := &trustedLifecycleRecorder{

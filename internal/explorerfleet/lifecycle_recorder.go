@@ -92,13 +92,19 @@ func (r *LifecycleRecorder) RecordLifecycle(
 				context.WithoutCancel(ctx), requested.ID,
 			)
 			if readErr == nil {
-				if reconcileErr := validateLifecycleReplay(
+				reconcileErr := validateLifecycleReplay(
 					record.Session, requested, lifecycle,
-				); reconcileErr == nil {
+				)
+				if reconcileErr == nil {
 					if interaction.IsCommittedRecord(recordErr) {
 						return recordErr
 					}
 					return nil
+				}
+				if interaction.IsCommittedRecord(recordErr) {
+					return committedLifecycleError(
+						recordErr, reconcileErr,
+					)
 				}
 			}
 		}

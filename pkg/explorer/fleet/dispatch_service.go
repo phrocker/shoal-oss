@@ -511,6 +511,10 @@ func (s *DispatchService) Cancel(ctx context.Context, request CancelRequest) (Ac
 	next.UpdatedAt = now
 	next.TransitionRequestID = decision.RequestID()
 	next.TransitionCorrelationID = decision.CorrelationID()
+	next.AuthorizedOperations = canonicalOperations(append(
+		next.AuthorizedOperations,
+		decisionOperations(decision, auth.OperationDispatch)...,
+	))
 	next.CancelAuthorizationFingerprint, err =
 		auth.AuthorizationFingerprint(decision)
 	if err != nil {

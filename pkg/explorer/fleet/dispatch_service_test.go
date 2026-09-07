@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
@@ -503,6 +504,58 @@ func TestDispatchTransitionProvenanceSurvivesFreshRetryAndPolicyRefresh(
 			"cancel retry provenance = %#v, %v",
 			replayedCancel.EventProvenance(), err,
 		)
+	}
+}
+
+func TestDispatchCancelAddsDispatchAuthorizationToInvokeAction(t *testing.T) {
+	now := time.Date(2026, 9, 6, 12, 0, 0, 0, time.UTC)
+	authority, _ := auth.NewAuthorityWithClock(func() time.Time { return now })
+	registryStore := newMemoryStore()
+	registry, _ := NewService(Config{
+		Store: registryStore, Resolver: authority.Resolver(),
+		Recorder: &memoryRecorder{}, Snapshots: fixedSnapshot{now},
+		Executors: executorMap{"exec": &dispatchExecutor{}},
+		Clock:     func() time.Time { return now },
+	})
+	registryStore.records["agent"] = Stored{Descriptor: dispatchDescriptor(now)}
+	store := newMemoryDispatchStore()
+	service, _ := NewDispatchService(DispatchConfig{
+		Store: store, Registry: registry, Resolver: authority.Resolver(),
+		Recorder: &dispatchRecorder{}, Events: dispatchEvents{},
+		Clock: func() time.Time { return now },
+	})
+	invokeDecision := dispatchDecision(
+		t, "owner", "actor", "invoke-request", auth.OperationInvoke,
+	)
+	invokeCtx := bindDecision(t, authority, invokeDecision)
+	queued, err := service.enqueue(
+		invokeCtx, dispatchEnqueue(now, "invoke-request"), auth.OperationInvoke,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(
+		queued.AuthorizedOperations, []auth.Operation{auth.OperationInvoke},
+	) {
+		t.Fatalf("invoke operations = %#v", queued.AuthorizedOperations)
+	}
+	cancelDecision := dispatchDecision(
+		t, "owner", "actor", "cancel-request", auth.OperationDispatch,
+	)
+	cancelCtx := bindDecision(t, authority, cancelDecision)
+	canceled, err := service.Cancel(cancelCtx, CancelRequest{
+		ID: queued.ID, ExpectedVersion: queued.Version,
+		MutationKey: []byte("cancel"), Context: dispatchContext(
+			now, "cancel-request",
+		),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(canceled.AuthorizedOperations, []auth.Operation{
+		auth.OperationDispatch, auth.OperationInvoke,
+	}) {
+		t.Fatalf("cancel operations = %#v", canceled.AuthorizedOperations)
 	}
 }
 
