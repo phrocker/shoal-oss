@@ -655,6 +655,9 @@ func (v *verifier) addNeighborhood(neighborhood explorer.Neighborhood) error {
 	if len(neighborhood.Edges) > v.limits.MaxGraphEdges {
 		return invalid("hydrated graph exceeds the edge bound")
 	}
+	if len(neighborhood.Assertions) > v.limits.MaxGraphEdges {
+		return invalid("hydrated graph exceeds the assertion bound")
+	}
 	payloadBytes, err := neighborhoodPayloadBytes(neighborhood)
 	if err != nil {
 		return err
@@ -701,6 +704,12 @@ func (v *verifier) addNeighborhood(neighborhood explorer.Neighborhood) error {
 			return invalid("hydrated graph assertion conflicts with prior content")
 		}
 	}
+	for edgeID, assertions := range localAssertions {
+		if existing, ok := v.assertions[edgeID]; ok &&
+			!reflect.DeepEqual(existing, assertions) {
+			return invalid("hydrated graph assertion conflicts with prior content")
+		}
+	}
 	additionalBytes := 0
 	additionalNodes := 0
 	for id, node := range localNodes {
@@ -727,13 +736,6 @@ func (v *verifier) addNeighborhood(neighborhood explorer.Neighborhood) error {
 			if !canonicalEqual(existing, edge) {
 				return invalid("hydrated graph edge conflicts with prior content")
 			}
-			for edgeID, assertions := range localAssertions {
-				existing := v.assertions[edgeID]
-				if len(existing) != 0 &&
-					!reflect.DeepEqual(existing, assertions) {
-					return invalid("hydrated graph assertion conflicts with prior content")
-				}
-			}
 			continue
 		}
 		additionalEdges++
@@ -745,6 +747,48 @@ func (v *verifier) addNeighborhood(neighborhood explorer.Neighborhood) error {
 			additionalBytes, edgePayloadBytes(edge), v.limits.MaxHydrationBytes-v.bytes)
 		if !ok {
 			return invalid("hydrated graph exceeds the byte bound")
+		}
+	}
+	assertionIDs := make([]shoal.ID, 0, len(localAssertionStates))
+	for assertionID := range localAssertionStates {
+		assertionIDs = append(assertionIDs, assertionID)
+	}
+	sort.Slice(assertionIDs, func(i, j int) bool {
+		return shoal.CompareID(assertionIDs[i], assertionIDs[j]) < 0
+	})
+	for _, assertionID := range assertionIDs {
+		state := localAssertionStates[assertionID]
+		existing, exists := v.assertionStates[assertionID]
+		if !exists {
+			var ok bool
+			additionalBytes, ok = addBounded(
+				additionalBytes,
+				assertionHydrationPayloadBytes(state),
+				v.limits.MaxHydrationBytes-v.bytes,
+			)
+			if !ok {
+				return invalid("hydrated graph assertion exceeds the byte bound")
+			}
+			continue
+		}
+		existingEdges := make(map[shoal.ID]struct{}, len(existing.edgeIDs))
+		for _, edgeID := range existing.edgeIDs {
+			existingEdges[edgeID] = struct{}{}
+		}
+		for _, edgeID := range state.edgeIDs {
+			if _, retained := existingEdges[edgeID]; retained {
+				continue
+			}
+			var ok bool
+			additionalBytes, ok = addBounded(
+				additionalBytes,
+				assertionReferencePayloadBytes(
+					assertionID, edgeID, state.assertion.Origin()),
+				v.limits.MaxHydrationBytes-v.bytes,
+			)
+			if !ok {
+				return invalid("hydrated graph assertion exceeds the byte bound")
+			}
 		}
 	}
 	for id, node := range localNodes {
@@ -834,14 +878,19 @@ func assertionsByNeighborhoodEdge(
 		sort.Slice(edgeIDs, func(i, j int) bool {
 			return shoal.CompareID(edgeIDs[i], edgeIDs[j]) < 0
 		})
-		if _, duplicate := byID[assertion.ID()]; duplicate {
-			return nil, nil, invalid(
-				"hydrated graph repeats an assertion identity")
-		}
-		byID[assertion.ID()] = assertionHydration{
+		state := assertionHydration{
 			assertion: assertion,
 			edgeIDs:   edgeIDs,
 		}
+		if existing, duplicate := byID[assertion.ID()]; duplicate {
+			if !reflect.DeepEqual(existing.assertion, state.assertion) ||
+				!reflect.DeepEqual(existing.edgeIDs, state.edgeIDs) {
+				return nil, nil, invalid(
+					"hydrated graph repeats an assertion identity with different content")
+			}
+			continue
+		}
+		byID[assertion.ID()] = state
 		for edgeID := range matched {
 			result[edgeID] = append(
 				result[edgeID],
@@ -1776,6 +1825,17 @@ func neighborhoodPayloadBytes(neighborhood explorer.Neighborhood) (int, error) {
 			return 0, invalid("hydrated graph byte size overflows")
 		}
 	}
+	for _, assertion := range neighborhood.Assertions {
+		if err := assertion.Validate(); err != nil {
+			return 0, err
+		}
+		var ok bool
+		total, ok = addBounded(
+			total, assertionPayloadBytes(assertion), int(^uint(0)>>1))
+		if !ok {
+			return 0, invalid("hydrated graph byte size overflows")
+		}
+	}
 	return total, nil
 }
 
@@ -1788,8 +1848,75 @@ func nodePayloadBytes(node graph.Node) int {
 }
 
 func edgePayloadBytes(edge graph.Edge) int {
-	return len(edge.ID) + len(edge.From) + len(edge.To) + len(edge.Type) + 8 +
-		metadataBytes(edge.Properties)
+	return len(edge.ID) + len(edge.From) + len(edge.To) + len(edge.Type) +
+		float64PayloadBytes + metadataBytes(edge.Properties)
+}
+
+const float64PayloadBytes = 8
+
+func assertionPayloadBytes(assertion ontology.Assertion) int {
+	object := assertion.Object()
+	target, _ := object.ReferenceValue()
+	total := len(assertion.ID()) + len(assertion.Subject()) +
+		len(assertion.Predicate()) + len(assertion.Origin()) +
+		len(object.Type()) + len(target) + float64PayloadBytes +
+		metadataBytes(assertion.Metadata())
+	if subjectType, ok := assertion.SubjectType(); ok {
+		total += len(subjectType)
+	}
+	if objectType, ok := assertion.ObjectType(); ok {
+		total += len(objectType)
+	}
+	if identity, ok := assertion.Ontology(); ok {
+		total += len(identity.SchemaID()) + len(identity.VersionID())
+	}
+	provenance := assertion.Provenance()
+	total += len(provenance.Provider()) + len(provenance.Model()) +
+		len(provenance.ModelVersion()) + len(provenance.Prompt()) +
+		len(provenance.PromptVersion()) + len(provenance.Extractor()) +
+		len(provenance.ExtractorVersion()) + metadataBytes(provenance.Metadata())
+	for _, evidence := range assertion.Evidence() {
+		total += evidenceRefPayloadBytes(evidence)
+	}
+	return total
+}
+
+func evidenceRefPayloadBytes(evidence ontology.EvidenceRef) int {
+	total := len(evidence.ID()) + len(evidence.Quote()) +
+		metadataBytes(evidence.Metadata())
+	citation := evidence.Citation()
+	total += len(citation.DocumentID) + len(citation.RevisionID) +
+		len(citation.SectionID) + len(citation.SpanID) + 24
+	if path, ok := evidence.Path(); ok {
+		total += pathPayloadBytes(path)
+	}
+	if derivation, ok := evidence.Derivation(); ok {
+		total += len(derivation.ID()) + len(derivation.EmbeddingModel()) +
+			len(derivation.EmbeddingModelVersion()) +
+			len(derivation.SimilarityMetric()) +
+			len(derivation.TessellationCell()) +
+			len(derivation.SourceEndpoint()) +
+			len(derivation.TargetEndpoint()) +
+			len(derivation.IteratorName()) + 2*float64PayloadBytes +
+			metadataBytes(derivation.IteratorOptions())
+	}
+	return total
+}
+
+func assertionHydrationPayloadBytes(state assertionHydration) int {
+	total := assertionPayloadBytes(state.assertion)
+	for _, edgeID := range state.edgeIDs {
+		total += assertionReferencePayloadBytes(
+			state.assertion.ID(), edgeID, state.assertion.Origin())
+	}
+	return total
+}
+
+func assertionReferencePayloadBytes(
+	assertionID, edgeID shoal.ID,
+	origin ontology.AssertionOrigin,
+) int {
+	return len(assertionID) + 2*len(edgeID) + len(origin)
 }
 
 func addBounded(total, addition, limit int) (int, bool) {
