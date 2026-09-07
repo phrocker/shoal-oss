@@ -491,6 +491,7 @@ func TestHTTPAskAdapterUsesSharedChatAndPersistsCompleteEvidence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	server.workspaceSettings = settingsProvider
 	workspaceID := shoal.ID("ask-workspace")
 	topK := uint32(4)
 	outputBytes := uint64(1 << 20)

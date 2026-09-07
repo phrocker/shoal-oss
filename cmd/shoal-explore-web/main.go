@@ -550,12 +550,13 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 		mcpTools = append(mcpTools, fleetTools...)
 	}
 	mcpServer, err := mcp.NewServer(mcp.Config{
-		Service:         service,
-		Authority:       authority,
-		Decisions:       mcp.DecisionProviderFunc(authority.Resolver().Resolve),
-		InteractionSink: opened.client,
-		Snapshots:       opened.client,
-		OptionalTools:   mcpTools,
+		Service:           service,
+		Authority:         authority,
+		Decisions:         mcp.DecisionProviderFunc(authority.Resolver().Resolve),
+		InteractionSink:   opened.client,
+		Snapshots:         opened.client,
+		WorkspaceSettings: opened.settings,
+		OptionalTools:     mcpTools,
 		ServerInfo: mcp.Implementation{
 			Name:        "shoal-explore-web",
 			Title:       "Shoal Explorer MCP",

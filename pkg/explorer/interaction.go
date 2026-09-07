@@ -184,6 +184,7 @@ func (e *Explorer) recordInteraction(
 		return interaction.Session{}, err
 	}
 	session = canonical
+	requiredVisibility := interaction.RequiredVisibility(ctx)
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if err := e.requireOpen(); err != nil {
@@ -201,6 +202,15 @@ func (e *Explorer) recordInteraction(
 		}
 	}
 	if existing, ok := e.interactions[session.ID]; ok {
+		if !visibilityCovered(
+			existing.Visibility,
+			interaction.Expression(requiredVisibility),
+		) {
+			return interaction.Session{}, shoal.NewError(
+				shoal.ErrorConflict,
+				"interaction retry requires stricter output visibility",
+			)
+		}
 		return interactionRetryResult(*existing, session)
 	}
 	// Sessions and folds are distinct maps but share one node namespace in the
@@ -214,6 +224,11 @@ func (e *Explorer) recordInteraction(
 	}
 	subgraph, err := session.SubgraphWithEvidence(
 		e.visibilityResolverLocked(), e.edgeVisibilityResolverLocked())
+	if err != nil {
+		return interaction.Session{}, err
+	}
+	subgraph, err = interaction.ConjoinSubgraphVisibility(
+		subgraph, requiredVisibility)
 	if err != nil {
 		return interaction.Session{}, err
 	}

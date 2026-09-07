@@ -104,6 +104,13 @@ func NewHTTPHandler(config HTTPConfig) (*HTTPHandler, error) {
 		return nil, shoal.NewError(
 			shoal.ErrorInvalidArgument, "MCP HTTP server is required")
 	}
+	if config.RequireWorkspaceSettings &&
+		isAbsent(config.Server.workspaceSettings) {
+		return nil, shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			"MCP workspace settings provider is required",
+		)
+	}
 	origins := make(map[string]struct{}, len(config.AllowedOrigins))
 	for _, raw := range config.AllowedOrigins {
 		normalized, err := normalizeHTTPOrigin(raw)
@@ -641,6 +648,7 @@ func httpResponseLimit(
 	hasWorkspace bool,
 ) int64 {
 	if !hasWorkspace ||
+		workspace.limits.OutputBytes == 0 ||
 		workspace.limits.OutputBytes >= uint64(maxHTTPResponseBytes) {
 		return maxHTTPResponseBytes
 	}

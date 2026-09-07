@@ -24,6 +24,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/explorer/webapi"
 	"github.com/phrocker/shoal-oss/pkg/explorer/workspace"
 	"github.com/phrocker/shoal-oss/pkg/retrieval"
@@ -43,7 +44,16 @@ func effectiveWorkspaceBinding(
 ) (workspaceBinding, bool, error) {
 	effective, ok := webapi.EffectiveWorkspaceSettings(ctx)
 	if !ok {
-		return workspaceBinding{}, false, nil
+		workspaceID, selected := webapi.EffectiveWorkspaceID(ctx)
+		if !selected {
+			return workspaceBinding{}, false, nil
+		}
+		if err := shoal.ValidateRequiredID(
+			"effective workspace ID", workspaceID,
+		); err != nil {
+			return workspaceBinding{}, false, err
+		}
+		return workspaceBinding{workspaceID: workspaceID}, true, nil
 	}
 	workspaceID, ok := webapi.EffectiveWorkspaceID(ctx)
 	if !ok {
@@ -111,8 +121,13 @@ func workspaceBindingForRequest(
 }
 
 func (b workspaceBinding) equal(other workspaceBinding) bool {
-	if b.workspaceID != other.workspaceID ||
-		b.settingsID != other.settingsID ||
+	if b.workspaceID != other.workspaceID {
+		return false
+	}
+	if b.settingsID == "" || other.settingsID == "" {
+		return b.settingsID == "" && other.settingsID == ""
+	}
+	if b.settingsID != other.settingsID ||
 		b.revision != other.revision ||
 		b.limits != other.limits ||
 		len(b.cacheDimensions) != len(other.cacheDimensions) {
@@ -127,7 +142,7 @@ func (b workspaceBinding) equal(other workspaceBinding) bool {
 }
 
 func (b workspaceBinding) headerValue() string {
-	if b.settingsID == "" {
+	if b.workspaceID == "" {
 		return ""
 	}
 	return base64.RawURLEncoding.EncodeToString([]byte(b.workspaceID))
@@ -137,6 +152,13 @@ func workspaceInitializeMeta(ctx context.Context) map[string]any {
 	binding, ok, err := effectiveWorkspaceBinding(ctx)
 	if err != nil || !ok {
 		return nil
+	}
+	if binding.settingsID == "" {
+		return map[string]any{
+			"shoal.workspace": map[string]any{
+				"id": binding.headerValue(),
+			},
+		}
 	}
 	return map[string]any{
 		"shoal.workspace": map[string]any{
@@ -154,6 +176,68 @@ func workspaceInitializeMeta(ctx context.Context) map[string]any {
 			},
 		},
 	}
+}
+
+func (s *Server) applyWorkspaceForOperation(
+	ctx context.Context,
+	decision auth.Decision,
+	operation auth.Operation,
+) (
+	context.Context,
+	auth.Decision,
+	int,
+	uint64,
+	error,
+) {
+	contextBudget, outputBudget := s.contextBudget, s.outputBudget
+	if effective, ok := webapi.EffectiveWorkspaceSettings(ctx); ok {
+		contextBudget, outputBudget = lowerWorkspaceBudgets(
+			contextBudget, outputBudget, effective.Limits().OutputBytes)
+		return ctx, decision, contextBudget, outputBudget, nil
+	}
+	workspaceID, selected := webapi.EffectiveWorkspaceID(ctx)
+	if !selected {
+		return ctx, decision, contextBudget, outputBudget, nil
+	}
+	if isAbsent(s.workspaceSettings) {
+		return nil, auth.Decision{}, 0, 0, shoal.NewError(
+			shoal.ErrorUnavailable,
+			"workspace settings application is unavailable",
+		)
+	}
+	bound, err := webapi.ApplyWorkspaceSettingsForOperation(
+		ctx, s.workspaceSettings, s.binder, workspaceID, operation,
+		workspace.MaximumLimits(), nil,
+	)
+	if err != nil {
+		return nil, auth.Decision{}, 0, 0, err
+	}
+	effective, ok := webapi.EffectiveWorkspaceSettings(bound)
+	if !ok {
+		return nil, auth.Decision{}, 0, 0, shoal.NewError(
+			shoal.ErrorInternal,
+			"effective workspace settings are unavailable",
+		)
+	}
+	decision = effective.Decision()
+	contextBudget, outputBudget = lowerWorkspaceBudgets(
+		contextBudget, outputBudget, effective.Limits().OutputBytes)
+	return withBoundHTTPDecision(bound, decision), decision,
+		contextBudget, outputBudget, nil
+}
+
+func lowerWorkspaceBudgets(
+	contextBudget int,
+	outputBudget uint64,
+	workspaceOutput uint64,
+) (int, uint64) {
+	if workspaceOutput < outputBudget {
+		outputBudget = workspaceOutput
+	}
+	if uint64(contextBudget) > outputBudget {
+		contextBudget = int(outputBudget)
+	}
+	return contextBudget, outputBudget
 }
 
 func cloneCacheDimensions(values map[string]uint64) map[string]uint64 {

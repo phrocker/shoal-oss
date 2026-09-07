@@ -639,6 +639,16 @@ func validateIngestArguments(request webapi.IngestRequest) error {
 func (s *Server) toolSuccessResult(
 	id json.RawMessage, value any,
 ) (ToolResult, error) {
+	return s.toolSuccessResultWithBudgets(
+		id, value, s.contextBudget, s.outputBudget)
+}
+
+func (s *Server) toolSuccessResultWithBudgets(
+	id json.RawMessage,
+	value any,
+	contextBudget int,
+	outputBudget uint64,
+) (ToolResult, error) {
 	encoded, err := json.Marshal(value)
 	if err != nil {
 		return ToolResult{}, shoal.NewError(
@@ -649,11 +659,11 @@ func (s *Server) toolSuccessResult(
 		return ToolResult{}, shoal.NewError(
 			shoal.ErrorInternal, "tool result must be a JSON object")
 	}
-	if uint64(len(encoded)) > s.outputBudget {
+	if uint64(len(encoded)) > outputBudget {
 		return ToolResult{}, shoal.NewError(
 			shoal.ErrorUnavailable, "tool result exceeds the effective output bound")
 	}
-	result, err := s.packToolResult(encoded)
+	result, err := s.packToolResultWithBudget(encoded, contextBudget)
 	if err != nil {
 		result = ToolResult{
 			Content:           []TextContent{},
@@ -661,11 +671,11 @@ func (s *Server) toolSuccessResult(
 			IsError:           false,
 		}
 	}
-	if s.toolResultFitsBudget(id, result) {
+	if s.toolResultFitsBudgetWithLimit(id, result, outputBudget) {
 		return result, nil
 	}
 	result.Content = []TextContent{}
-	if s.toolResultFitsBudget(id, result) {
+	if s.toolResultFitsBudgetWithLimit(id, result, outputBudget) {
 		return result, nil
 	}
 	return ToolResult{}, shoal.NewError(
@@ -677,9 +687,17 @@ func (s *Server) toolSuccessResult(
 func (s *Server) toolResultFitsBudget(
 	id json.RawMessage, result ToolResult,
 ) bool {
+	return s.toolResultFitsBudgetWithLimit(id, result, s.outputBudget)
+}
+
+func (s *Server) toolResultFitsBudgetWithLimit(
+	id json.RawMessage,
+	result ToolResult,
+	outputBudget uint64,
+) bool {
 	response := newResponse(id, result)
 	encoded, err := json.Marshal(response)
-	return err == nil && uint64(len(encoded)+1) <= s.outputBudget
+	return err == nil && uint64(len(encoded)+1) <= outputBudget
 }
 
 type structuredToolFailure struct {
@@ -719,12 +737,19 @@ func boundedToolFailure(failure toolFailure) toolFailure {
 }
 
 func (s *Server) packToolResult(encoded []byte) (ToolResult, error) {
-	if s == nil || isAbsent(s.compressor) || s.contextBudget < 0 {
+	return s.packToolResultWithBudget(encoded, s.contextBudget)
+}
+
+func (s *Server) packToolResultWithBudget(
+	encoded []byte,
+	contextBudget int,
+) (ToolResult, error) {
+	if s == nil || isAbsent(s.compressor) || contextBudget < 0 {
 		return ToolResult{}, shoal.NewError(
 			shoal.ErrorInternal, "context compression is unavailable")
 	}
 	compressed, err := s.compressor.CompressContext(CompressionInput{
-		BudgetBytes: s.contextBudget,
+		BudgetBytes: contextBudget,
 		Items: []CompressionItem{{
 			ID:       "tool-result",
 			Sequence: 1,
@@ -738,7 +763,7 @@ func (s *Server) packToolResult(encoded []byte) (ToolResult, error) {
 		return ToolResult{}, shoal.WrapError(
 			shoal.ErrorInternal, "compress tool result", err)
 	}
-	if err := validatePackedToolResult(compressed, encoded, s.contextBudget); err != nil {
+	if err := validatePackedToolResult(compressed, encoded, contextBudget); err != nil {
 		return ToolResult{}, err
 	}
 	content := make([]TextContent, 0, 1)

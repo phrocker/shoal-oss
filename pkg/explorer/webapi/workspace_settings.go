@@ -26,6 +26,7 @@ import (
 
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/explorer/workspace"
+	"github.com/phrocker/shoal-oss/pkg/interaction"
 	"github.com/phrocker/shoal-oss/pkg/ontology"
 	"github.com/phrocker/shoal-oss/pkg/retrieval"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
@@ -35,9 +36,22 @@ import (
 // non-settings API request. Its value is one canonical opaque wire ID.
 const WorkspaceIDHeader = "Shoal-Workspace-ID"
 
+// WorkspaceSettingsApplier narrows one authenticated request under the exact
+// operation that the consuming route will execute.
+type WorkspaceSettingsApplier interface {
+	ApplyForOperation(
+		context.Context,
+		shoal.ID,
+		auth.Operation,
+		workspace.Limits,
+		[]auth.Policy,
+	) (workspace.EffectiveDecision, error)
+}
+
 // WorkspaceSettingsProvider is the transport-neutral settings extension used
 // by the HTTP endpoint and future chat/MCP adapters.
 type WorkspaceSettingsProvider interface {
+	WorkspaceSettingsApplier
 	Get(context.Context, shoal.ID) (workspace.Settings, error)
 	Update(
 		context.Context,
@@ -55,13 +69,6 @@ type WorkspaceSettingsProvider interface {
 		shoal.ID,
 		ontology.OntologyIdentity,
 	) (workspace.Settings, error)
-	ApplyDecision(context.Context, shoal.ID) (auth.Decision, error)
-	Apply(
-		context.Context,
-		shoal.ID,
-		workspace.Limits,
-		[]auth.Policy,
-	) (workspace.EffectiveDecision, error)
 }
 
 type effectiveWorkspaceSettingsContextKey struct{}
@@ -153,18 +160,72 @@ func (h *Handler) applyWorkspaceSettings(
 		return nil, shoal.NewError(
 			shoal.ErrorInvalidArgument, "workspace settings header "+err.Error())
 	}
-	effective, err := h.workspaceSettings.Apply(
-		request.Context(), workspaceID, workspace.MaximumLimits(), nil)
+	if request.URL.Path == "/mcp" {
+		return withEffectiveWorkspaceID(request.Context(), workspaceID), nil
+	}
+	operation, ok := workspaceOperationForRequest(
+		request.Method, request.URL.Path)
+	if !ok {
+		return nil, shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			"workspace settings are not registered for this route",
+		)
+	}
+	return ApplyWorkspaceSettingsForOperation(
+		request.Context(), h.workspaceSettings, h.binder,
+		workspaceID, operation, workspace.MaximumLimits(), nil,
+	)
+}
+
+// ApplyWorkspaceSettingsForOperation loads and binds one owned workspace under
+// the exact operation that the consuming transport is about to execute.
+func ApplyWorkspaceSettingsForOperation(
+	ctx context.Context,
+	provider WorkspaceSettingsApplier,
+	binder auth.Binder,
+	workspaceID shoal.ID,
+	operation auth.Operation,
+	baseLimits workspace.Limits,
+	baseOutputPolicies []auth.Policy,
+) (context.Context, error) {
+	if ctx == nil || isAbsentInterface(provider) || isAbsentInterface(binder) {
+		return nil, shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			"workspace settings application dependencies are required",
+		)
+	}
+	effective, err := provider.ApplyForOperation(
+		ctx, workspaceID, operation, baseLimits, baseOutputPolicies)
 	if err != nil {
 		return nil, err
 	}
 	decision := effective.Decision()
-	ctx, err := h.binder.Bind(request.Context(), decision)
+	ctx, err = binder.Bind(ctx, decision)
 	if err != nil || ctx == nil {
 		return nil, authenticationDenied()
 	}
+	visibility, err := effective.OutputVisibility()
+	if err != nil {
+		return nil, err
+	}
+	labels, err := interaction.ParseVisibility(string(visibility))
+	if err != nil {
+		return nil, err
+	}
+	ctx, err = interaction.WithRequiredVisibility(ctx, labels)
+	if err != nil {
+		return nil, err
+	}
 	ctx = withEffectiveWorkspaceSettings(ctx, workspaceID, effective)
 	return withIdentity(ctx, decision), nil
+}
+
+func withEffectiveWorkspaceID(
+	ctx context.Context,
+	workspaceID shoal.ID,
+) context.Context {
+	return context.WithValue(
+		ctx, effectiveWorkspaceIDContextKey{}, workspaceID)
 }
 
 func withEffectiveWorkspaceSettings(
@@ -174,7 +235,101 @@ func withEffectiveWorkspaceSettings(
 ) context.Context {
 	ctx = context.WithValue(
 		ctx, effectiveWorkspaceSettingsContextKey{}, effective)
-	return context.WithValue(ctx, effectiveWorkspaceIDContextKey{}, workspaceID)
+	return withEffectiveWorkspaceID(ctx, workspaceID)
+}
+
+func workspaceOperationForRequest(
+	method, path string,
+) (auth.Operation, bool) {
+	if method == http.MethodHead {
+		method = http.MethodGet
+	}
+	switch {
+	case method == http.MethodGet &&
+		(path == "/api/v1/meta" ||
+			path == "/api/v1/identity" ||
+			path == "/api/v1/ontology" ||
+			path == "/api/v1/ontology/proposals" ||
+			path == "/api/v1/provenance" ||
+			strings.HasPrefix(path, "/api/v1/provenance/")):
+		return auth.OperationRead, true
+	case method == http.MethodGet &&
+		strings.HasPrefix(path, "/api/v1/ontology/proposals/") &&
+		strings.HasSuffix(path, "/blast-radius"):
+		return auth.OperationRead, true
+	case method == http.MethodPost &&
+		(path == "/api/v1/ingest" ||
+			path == "/api/v1/extract" ||
+			path == "/api/v1/derivation/recompute" ||
+			path == "/api/v1/ontology/proposals"):
+		return auth.OperationIngest, true
+	case method == http.MethodPost &&
+		strings.HasPrefix(path, "/api/v1/ontology/proposals/") &&
+		strings.HasSuffix(path, "/transition"):
+		return auth.OperationIngest, true
+	case method == http.MethodPost &&
+		(path == "/api/v1/changes" || path == "/api/v1/documents"):
+		return auth.OperationList, true
+	case method == http.MethodPost && path == "/api/v1/document":
+		return auth.OperationRead, true
+	case method == http.MethodPost &&
+		(path == "/api/v1/retrieve" ||
+			path == "/api/v1/ask" ||
+			path == "/api/v1/chat/stream"):
+		return auth.OperationRetrieve, true
+	case method == http.MethodPost &&
+		(path == "/api/v1/neighborhood" || path == "/api/v1/path"):
+		return auth.OperationNeighborhood, true
+	case method == http.MethodPost && path == "/api/v1/analytics":
+		return auth.OperationAnalyticsRead, true
+	case method == http.MethodPost &&
+		(path == "/api/v1/provenance/fold" ||
+			path == "/api/v1/provenance/unfold"):
+		return auth.OperationRead, true
+	case method == http.MethodPost && path == "/api/v1/fleet/agents":
+		return auth.OperationAgentRegister, true
+	case method == http.MethodPost &&
+		strings.HasPrefix(path, "/api/v1/fleet/agents/") &&
+		strings.HasSuffix(path, "/heartbeat"):
+		return auth.OperationAgentHeartbeat, true
+	case method == http.MethodPost &&
+		strings.HasPrefix(path, "/api/v1/fleet/agents/") &&
+		strings.HasSuffix(path, "/revoke"):
+		return auth.OperationAgentRevoke, true
+	case method == http.MethodPost &&
+		(path == "/api/v1/fleet/agents/resolve" ||
+			(strings.HasPrefix(path, "/api/v1/fleet/agents/") &&
+				strings.HasSuffix(path, "/resolve"))):
+		return auth.OperationAgentResolve, true
+	case method == http.MethodPost && path == "/api/v1/fleet/actions":
+		return auth.OperationDispatch, true
+	case method == http.MethodPost &&
+		(path == "/api/v1/fleet/actions/invoke" ||
+			path == "/api/v1/fleet/actions/pull" ||
+			(strings.HasPrefix(path, "/api/v1/fleet/actions/") &&
+				strings.HasSuffix(path, "/claim"))):
+		return auth.OperationInvoke, true
+	case method == http.MethodPost &&
+		strings.HasPrefix(path, "/api/v1/fleet/actions/") &&
+		(strings.HasSuffix(path, "/cancel") ||
+			strings.HasSuffix(path, "/status")):
+		return auth.OperationDispatch, true
+	case method == http.MethodPost &&
+		path == "/api/v1/fleet/events/subscriptions":
+		return auth.OperationSubscriptionCreate, true
+	case method == http.MethodDelete &&
+		strings.HasPrefix(path, "/api/v1/fleet/events/subscriptions/"):
+		return auth.OperationSubscriptionDelete, true
+	case method == http.MethodPost &&
+		strings.HasPrefix(path, "/api/v1/fleet/events/subscriptions/") &&
+		strings.HasSuffix(path, "/pull"):
+		return auth.OperationSubscriptionDeliver, true
+	case method == http.MethodPost &&
+		path == "/api/v1/fleet/events/publish":
+		return auth.OperationEventPublish, true
+	default:
+		return "", false
+	}
 }
 
 func applyWorkspaceRequestLimits(ctx context.Context, request any) {

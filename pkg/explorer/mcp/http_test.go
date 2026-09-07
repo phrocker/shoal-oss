@@ -553,6 +553,10 @@ func TestStreamableHTTPBindsWorkspaceRevisionDimensionsAndLimits(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	recordingSettings := &operationRecordingWorkspaceSettings{
+		WorkspaceSettingsProvider: settingsProvider,
+	}
+	server.workspaceSettings = recordingSettings
 	var requestNumber atomic.Uint64
 	authenticator := webapi.AuthenticatorFunc(func(
 		*http.Request,
@@ -610,7 +614,7 @@ func TestStreamableHTTPBindsWorkspaceRevisionDimensionsAndLimits(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := outer.SetWorkspaceSettingsProvider(settingsProvider); err != nil {
+	if err := outer.SetWorkspaceSettingsProvider(recordingSettings); err != nil {
 		t.Fatal(err)
 	}
 	if err := outer.MountAuthenticated("/mcp", mcpHandler); err != nil {
@@ -643,12 +647,8 @@ func TestStreamableHTTPBindsWorkspaceRevisionDimensionsAndLimits(t *testing.T) {
 	}
 	metadata, ok := result.Meta["shoal.workspace"].(map[string]any)
 	if !ok || metadata["id"] != workspaceAHeader ||
-		metadata["revision"] != float64(1) {
+		metadata["revision"] != nil {
 		t.Fatalf("workspace initialize metadata = %#v", result.Meta)
-	}
-	dimensions, ok := metadata["cache_dimensions"].(map[string]any)
-	if !ok || len(dimensions) == 0 {
-		t.Fatalf("workspace cache dimensions = %#v", metadata)
 	}
 	assertEmptyBody(t, postHTTPMCPWithWorkspace(
 		t, httpServer.Client(), httpServer.URL+"/mcp", "ignored",
@@ -679,13 +679,18 @@ func TestStreamableHTTPBindsWorkspaceRevisionDimensionsAndLimits(t *testing.T) {
 		t.Fatalf("effective retrieval top_k = %d, want 3",
 			observedTopK.Load())
 	}
+	if len(recordingSettings.operations) != 1 ||
+		recordingSettings.operations[0] != auth.OperationRetrieve {
+		t.Fatalf("workspace application operations = %v, want retrieve",
+			recordingSettings.operations)
+	}
 	mcpHandler.sessionsMu.Lock()
 	sessionState := mcpHandler.sessions[session]
 	mcpHandler.sessionsMu.Unlock()
 	if sessionState == nil ||
-		sessionState.dispatcher.outputBudget != outputLimit ||
-		sessionState.dispatcher.contextBudget != int(outputLimit) {
-		t.Fatalf("workspace session limits were not bound")
+		sessionState.workspace.workspaceID != workspaceA ||
+		sessionState.workspace.settingsID != "" {
+		t.Fatalf("workspace session selector was not bound")
 	}
 
 	decision := workspaceHTTPDecision(t, "workspace-a-update")
@@ -706,15 +711,25 @@ func TestStreamableHTTPBindsWorkspaceRevisionDimensionsAndLimits(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	stale := postHTTPMCPWithWorkspace(
+	updated := postHTTPMCPWithWorkspace(
 		t, httpServer.Client(), httpServer.URL+"/mcp", "ignored",
 		workspaceAHeader, session, ProtocolVersion,
-		`{"jsonrpc":"2.0","id":5,"method":"tools/list"}`)
-	if stale.StatusCode != http.StatusNotFound {
-		t.Fatalf("stale workspace session status = %d, want 404",
-			stale.StatusCode)
+		`{"jsonrpc":"2.0","id":5,"method":"tools/call",`+
+			`"params":{"name":"shoal.retrieve","arguments":{`+
+			`"query":{"text":"bounded","top_k":50,"modes":["lexical"]}}}}`)
+	if response := decodeHTTPResponse(t, updated); response.Error != nil ||
+		decodeToolResult(t, response).IsError {
+		t.Fatalf("updated workspace retrieval failed: %+v", response)
 	}
-	stale.Body.Close()
+	if observedTopK.Load() != 2 {
+		t.Fatalf("updated retrieval top_k = %d, want 2",
+			observedTopK.Load())
+	}
+	if len(recordingSettings.operations) != 2 ||
+		recordingSettings.operations[1] != auth.OperationRetrieve {
+		t.Fatalf("updated workspace application operations = %v",
+			recordingSettings.operations)
+	}
 }
 
 func TestHTTPResponseLimitCoversEnvelopeAndMarksToolCallIndeterminate(
@@ -1612,6 +1627,23 @@ func httpScopedDecision(
 type httpGenerationReader struct {
 	domain     []byte
 	generation int64
+}
+
+type operationRecordingWorkspaceSettings struct {
+	webapi.WorkspaceSettingsProvider
+	operations []auth.Operation
+}
+
+func (p *operationRecordingWorkspaceSettings) ApplyForOperation(
+	ctx context.Context,
+	workspaceID shoal.ID,
+	operation auth.Operation,
+	limits workspace.Limits,
+	outputPolicies []auth.Policy,
+) (workspace.EffectiveDecision, error) {
+	p.operations = append(p.operations, operation)
+	return p.WorkspaceSettingsProvider.ApplyForOperation(
+		ctx, workspaceID, operation, limits, outputPolicies)
 }
 
 func (r httpGenerationReader) CurrentPolicyGeneration(

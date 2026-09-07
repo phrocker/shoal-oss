@@ -407,7 +407,10 @@ func settingsHTTPDecision(
 		Subject: subject, Actor: "actor",
 		AuthorizationDomain: []byte("domain"),
 		AllowedOperations: []auth.Operation{
+			auth.OperationList,
+			auth.OperationNeighborhood,
 			auth.OperationRead,
+			auth.OperationRetrieve,
 			auth.OperationWorkspaceSettingsRead,
 			auth.OperationWorkspaceSettingsWrite,
 		},

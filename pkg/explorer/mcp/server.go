@@ -153,9 +153,12 @@ type Config struct {
 	// this sink only after that HTTP request has been authenticated and bound.
 	InteractionSink interaction.ResultSink
 	Snapshots       SnapshotProvider
-	ServerInfo      Implementation
-	OptionalTools   []OptionalToolProvider
-	Instructions    string
+	// WorkspaceSettings applies an HTTP-selected workspace under each tool's
+	// exact authorization operation. Stdio requests never carry a workspace.
+	WorkspaceSettings webapi.WorkspaceSettingsApplier
+	ServerInfo        Implementation
+	OptionalTools     []OptionalToolProvider
+	Instructions      string
 	// ContextCompressor controls the compatibility text rendering of structured
 	// results. Nil selects NativeContextCompressor.
 	ContextCompressor ContextCompressor
@@ -182,24 +185,25 @@ const (
 // Server implements the initialization-handshake MCP lifecycle over
 // newline-delimited JSON-RPC.
 type Server struct {
-	binder          auth.Binder
-	resolver        auth.Resolver
-	decisions       DecisionProvider
-	serverInfo      Implementation
-	instructions    string
-	requestID       func() (shoal.ID, error)
-	compressor      ContextCompressor
-	contextBudget   int
-	outputBudget    uint64
-	toolCallLimit   *fixedWindowLimiter
-	recorder        *interaction.Recorder
-	interactionSink interaction.ResultSink
-	snapshots       SnapshotProvider
-	interactionNow  func() time.Time
-	tools           []registeredTool
-	toolsByName     map[string]registeredTool
-	stateMu         sync.Mutex
-	state           serverState
+	binder            auth.Binder
+	resolver          auth.Resolver
+	decisions         DecisionProvider
+	serverInfo        Implementation
+	instructions      string
+	requestID         func() (shoal.ID, error)
+	compressor        ContextCompressor
+	contextBudget     int
+	outputBudget      uint64
+	toolCallLimit     *fixedWindowLimiter
+	recorder          *interaction.Recorder
+	interactionSink   interaction.ResultSink
+	snapshots         SnapshotProvider
+	workspaceSettings webapi.WorkspaceSettingsApplier
+	interactionNow    func() time.Time
+	tools             []registeredTool
+	toolsByName       map[string]registeredTool
+	stateMu           sync.Mutex
+	state             serverState
 }
 
 type registeredTool struct {
@@ -314,10 +318,12 @@ func NewServer(config Config) (*Server, error) {
 		serverInfo:   serverInfo,
 		instructions: instructions, requestID: requestID,
 		compressor: compressor, contextBudget: contextBudget,
-		outputBudget: outputBudget,
-		recorder:     config.Recorder, interactionSink: config.InteractionSink,
-		snapshots:      config.Snapshots,
-		interactionNow: interactionClock,
+		outputBudget:      outputBudget,
+		recorder:          config.Recorder,
+		interactionSink:   config.InteractionSink,
+		snapshots:         config.Snapshots,
+		workspaceSettings: config.WorkspaceSettings,
+		interactionNow:    interactionClock,
 		toolCallLimit: newFixedWindowLimiter(
 			toolCallsPerMinute, time.Minute, toolCallClock),
 		tools: tools, toolsByName: byName, state: stateAwaitInitialize,
@@ -349,12 +355,14 @@ func (s *Server) newProtocolSessionWithOutputBudget(limit uint64) *Server {
 		serverInfo:   cloneImplementation(s.serverInfo),
 		instructions: s.instructions, requestID: s.requestID,
 		compressor: s.compressor, contextBudget: contextBudget,
-		outputBudget: outputBudget,
-		recorder:     s.recorder, interactionSink: s.interactionSink,
-		snapshots:      s.snapshots,
-		interactionNow: s.interactionNow,
-		toolCallLimit:  s.toolCallLimit,
-		tools:          s.tools, toolsByName: s.toolsByName,
+		outputBudget:      outputBudget,
+		recorder:          s.recorder,
+		interactionSink:   s.interactionSink,
+		snapshots:         s.snapshots,
+		workspaceSettings: s.workspaceSettings,
+		interactionNow:    s.interactionNow,
+		toolCallLimit:     s.toolCallLimit,
+		tools:             s.tools, toolsByName: s.toolsByName,
 		state: stateAwaitInitialize,
 	}
 }
@@ -616,6 +624,14 @@ func (s *Server) callTool(ctx context.Context, request Request) *Response {
 		response := newResponse(request.ID, s.toolErrorResult(err))
 		return &response
 	}
+	contextBudget, outputBudget := s.contextBudget, s.outputBudget
+	bound, decision, contextBudget, outputBudget, err =
+		s.applyWorkspaceForOperation(
+			bound, decision, tool.authorizationOperation)
+	if err != nil {
+		response := newResponse(request.ID, s.toolErrorResult(err))
+		return &response
+	}
 	authorizationNow := s.interactionNow()
 	if authorizationNow.IsZero() ||
 		decision.Authorize(
@@ -738,7 +754,8 @@ func (s *Server) callTool(ctx context.Context, request Request) *Response {
 	}
 	var result ToolResult
 	if err == nil {
-		result, err = s.toolSuccessResult(request.ID, value)
+		result, err = s.toolSuccessResultWithBudgets(
+			request.ID, value, contextBudget, outputBudget)
 		if err != nil && mutating {
 			err = explorer.MarkIndeterminateCommit(shoal.WrapError(
 				shoal.ErrorInternal,

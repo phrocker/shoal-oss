@@ -160,7 +160,9 @@ func TestHTTPSelectableLensIsPerCallerAndPreservesSettings(t *testing.T) {
 			"mutation_id": base64.RawURLEncoding.EncodeToString(
 				[]byte("lens-settings-create")),
 			"settings": map[string]any{
-				"allowed_operations":   []string{"read"},
+				"allowed_operations": []string{
+					"list", "neighborhood", "read", "retrieve",
+				},
 				"permitted_source_ids": []string{sourceID},
 				"budgets": map[string]any{
 					"retrieval_top_k": topK,
@@ -266,8 +268,11 @@ func TestHTTPSelectableLensIsPerCallerAndPreservesSettings(t *testing.T) {
 	}
 	if selected.Revision != 2 ||
 		selected.Settings.AllowedOperations == nil ||
-		len(*selected.Settings.AllowedOperations) != 1 ||
-		(*selected.Settings.AllowedOperations)[0] != "read" ||
+		len(*selected.Settings.AllowedOperations) != 4 ||
+		(*selected.Settings.AllowedOperations)[0] != "list" ||
+		(*selected.Settings.AllowedOperations)[1] != "neighborhood" ||
+		(*selected.Settings.AllowedOperations)[2] != "read" ||
+		(*selected.Settings.AllowedOperations)[3] != "retrieve" ||
 		selected.Settings.PermittedSourceIDs == nil ||
 		len(*selected.Settings.PermittedSourceIDs) != 1 ||
 		selected.Settings.Budgets.RetrievalTopK == nil ||
@@ -289,7 +294,11 @@ func TestHTTPSelectableLensIsPerCallerAndPreservesSettings(t *testing.T) {
 	if err := json.Unmarshal(identityResponse.Body.Bytes(), &identity); err != nil {
 		t.Fatal(err)
 	}
-	if len(identity.Operations) != 1 || identity.Operations[0] != "read" ||
+	if len(identity.Operations) != 4 ||
+		identity.Operations[0] != "list" ||
+		identity.Operations[1] != "neighborhood" ||
+		identity.Operations[2] != "read" ||
+		identity.Operations[3] != "retrieve" ||
 		identity.SelectedOntology == nil ||
 		identity.SelectedOntology.VersionID != encodeTestID(second.VersionID()) ||
 		identity.Subject != "owner" || identity.Actor != "actor" ||
