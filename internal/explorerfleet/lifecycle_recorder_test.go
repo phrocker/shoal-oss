@@ -20,7 +20,7 @@ import (
 func TestLifecycleRecorderUsesExactPinsAndTrustedResult(t *testing.T) {
 	lifecycle := testLifecycle()
 	sink := &trustedLifecycleRecorder{lifecycle: lifecycle}
-	recorder, err := NewLifecycleRecorderFromRecorder(sink)
+	recorder, err := NewLifecycleRecorder(sink)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -56,7 +56,7 @@ func TestLifecycleRecorderUsesExactPinsAndTrustedResult(t *testing.T) {
 func TestLifecycleRecorderRetryIsByteStable(t *testing.T) {
 	lifecycle := testLifecycle()
 	sink := &trustedLifecycleRecorder{lifecycle: lifecycle}
-	recorder, err := NewLifecycleRecorderFromRecorder(sink)
+	recorder, err := NewLifecycleRecorder(sink)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -84,6 +84,27 @@ func TestLifecycleRecorderRetryIsByteStable(t *testing.T) {
 	if lifecycleSessionID(refreshed) != lifecycleSessionID(lifecycle) {
 		t.Fatal("renewed authority minted a duplicate lifecycle receipt ID")
 	}
+	store := &reconcilingLifecycleStore{trustedLifecycleRecorder: trustedLifecycleRecorder{
+		lifecycle: lifecycle,
+	}}
+	reconciling, err := NewLifecycleRecorderWithReader(store, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := reconciling.RecordLifecycle(
+		context.Background(), lifecycle,
+	); err != nil {
+		t.Fatal(err)
+	}
+	store.lifecycle = refreshed
+	if err := reconciling.RecordLifecycle(
+		context.Background(), refreshed,
+	); err != nil {
+		t.Fatalf("refreshed retry = %v", err)
+	}
+	if len(store.requests) != 2 {
+		t.Fatalf("record attempts = %d", len(store.requests))
+	}
 	expectedID := interaction.DerivedID(
 		"session", "fleet.lifecycle.v1", string(lifecycle.Operation),
 		string(lifecycle.RequestID), string(lifecycle.AgentID),
@@ -98,7 +119,7 @@ func TestLifecycleRecorderRetryIsByteStable(t *testing.T) {
 
 func TestLifecycleRecorderRejectsTypedNilAndMismatchedResult(t *testing.T) {
 	var typedNil *trustedLifecycleRecorder
-	if _, err := NewLifecycleRecorderFromRecorder(typedNil); !shoal.IsErrorCode(
+	if _, err := NewLifecycleRecorder(typedNil); !shoal.IsErrorCode(
 		err, shoal.ErrorInvalidArgument,
 	) {
 		t.Fatalf("typed-nil recorder = %v", err)
@@ -110,7 +131,7 @@ func TestLifecycleRecorderRejectsTypedNilAndMismatchedResult(t *testing.T) {
 			session.AuthorizationOperation = string(auth.OperationRetrieve)
 		},
 	}
-	recorder, err := NewLifecycleRecorderFromRecorder(sink)
+	recorder, err := NewLifecycleRecorder(sink)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -136,7 +157,7 @@ func TestLifecycleRecorderRejectsForgedTrustedEnrichment(t *testing.T) {
 	for name, mutate := range tests {
 		t.Run(name, func(t *testing.T) {
 			lifecycle := testLifecycle()
-			recorder, err := NewLifecycleRecorderFromRecorder(&trustedLifecycleRecorder{
+			recorder, err := NewLifecycleRecorder(&trustedLifecycleRecorder{
 				lifecycle: lifecycle,
 				mutate:    mutate,
 			})
@@ -159,13 +180,44 @@ func TestLifecycleRecorderPreservesCommittedAmbiguity(t *testing.T) {
 		err:                 explorer.MarkCommittedInteraction(cause),
 		returnResultOnError: true,
 	}
-	recorder, err := NewLifecycleRecorderFromRecorder(sink)
+	recorder, err := NewLifecycleRecorder(sink)
 	if err != nil {
 		t.Fatal(err)
 	}
 	err = recorder.RecordLifecycle(context.Background(), testLifecycle())
 	if !errors.Is(err, cause) || !explorer.IsCommittedInteraction(err) {
 		t.Fatalf("committed ambiguity = %v", err)
+	}
+}
+
+func TestLifecycleRecorderRecoversDroppedCommittedResult(t *testing.T) {
+	cause := context.DeadlineExceeded
+	lifecycle := testLifecycle()
+	accepted := lifecycleSession(lifecycle)
+	accepted.RecordedAt = lifecycle.SnapshotAsOf.Add(time.Second)
+	accepted.Actor = interaction.ActorContext{
+		SubjectID: lifecycle.Subject, ActorID: lifecycle.Actor,
+		ClientID:   lifecycle.ClientID,
+		OnBehalfOf: append([]shoal.ID(nil), lifecycle.OnBehalfOf...),
+	}
+	accepted.Reason, _ = interaction.NewReason(
+		"audit_purpose", lifecycle.AuditPurpose,
+	)
+	store := &reconcilingLifecycleStore{
+		trustedLifecycleRecorder: trustedLifecycleRecorder{
+			lifecycle: lifecycle,
+		},
+		stored:    accepted,
+		recordErr: explorer.MarkCommittedInteraction(cause),
+	}
+	recorder, err := NewLifecycleRecorderWithReader(store, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = recorder.RecordLifecycle(context.Background(), lifecycle)
+	if !errors.Is(err, cause) || !explorer.IsCommittedInteraction(err) ||
+		shoal.IsErrorCode(err, shoal.ErrorInternal) {
+		t.Fatalf("dropped committed result = %v", err)
 	}
 }
 
@@ -179,7 +231,7 @@ func TestLifecycleRecorderRejectsCommittedDivergentResult(t *testing.T) {
 			session.ResultID = "different-agent"
 		},
 	}
-	recorder, err := NewLifecycleRecorderFromRecorder(sink)
+	recorder, err := NewLifecycleRecorder(sink)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -199,7 +251,7 @@ func TestLifecycleRecorderRejectsTrustedChronology(t *testing.T) {
 			sink := &trustedLifecycleRecorder{
 				lifecycle: testLifecycle(), recordedAt: recordedAt,
 			}
-			recorder, err := NewLifecycleRecorderFromRecorder(sink)
+			recorder, err := NewLifecycleRecorder(sink)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -243,7 +295,19 @@ type trustedLifecycleRecorder struct {
 	returnResultOnError bool
 }
 
-func (r *trustedLifecycleRecorder) Record(
+func (*trustedLifecycleRecorder) EnsureInteractionSink(context.Context) error {
+	return nil
+}
+
+func (r *trustedLifecycleRecorder) RecordInteraction(
+	ctx context.Context,
+	request interaction.Session,
+) error {
+	_, err := r.RecordInteractionResult(ctx, request)
+	return err
+}
+
+func (r *trustedLifecycleRecorder) RecordInteractionResult(
 	_ context.Context,
 	request interaction.Session,
 ) (interaction.Session, error) {
@@ -274,4 +338,46 @@ func (r *trustedLifecycleRecorder) Record(
 		return result, r.err
 	}
 	return result, nil
+}
+
+type reconcilingLifecycleStore struct {
+	trustedLifecycleRecorder
+	stored    interaction.Session
+	recordErr error
+}
+
+func (r *reconcilingLifecycleStore) RecordInteractionResult(
+	ctx context.Context,
+	request interaction.Session,
+) (interaction.Session, error) {
+	if r.recordErr != nil {
+		r.requests = append(r.requests, request)
+		return interaction.Session{}, r.recordErr
+	}
+	if r.stored.ID != "" {
+		r.requests = append(r.requests, request)
+		return interaction.Session{}, shoal.NewError(
+			shoal.ErrorConflict,
+			"interaction session ID already exists with different content",
+		)
+	}
+	result, err := r.trustedLifecycleRecorder.RecordInteractionResult(
+		ctx, request,
+	)
+	if err == nil {
+		r.stored = result
+	}
+	return result, err
+}
+
+func (r *reconcilingLifecycleStore) InteractionRecord(
+	context.Context,
+	shoal.ID,
+) (explorer.InteractionRecord, error) {
+	if r.stored.ID == "" {
+		return explorer.InteractionRecord{}, shoal.NewError(
+			shoal.ErrorNotFound, "interaction receipt not found",
+		)
+	}
+	return explorer.InteractionRecord{Session: r.stored}, nil
 }

@@ -15,10 +15,12 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
-// LifecycleInteractionRecorder is the trusted interaction recorder boundary
-// used by the fleet lifecycle adapter.
-type LifecycleInteractionRecorder interface {
-	Record(context.Context, interaction.Session) (interaction.Session, error)
+// LifecycleInteractionReader reads authoritative committed lifecycle receipts
+// from the same corpus used by the result sink.
+type LifecycleInteractionReader interface {
+	InteractionRecord(
+		context.Context, shoal.ID,
+	) (explorer.InteractionRecord, error)
 }
 
 // LifecycleRecorder converts fleet lifecycle admissions into durable,
@@ -27,6 +29,9 @@ type LifecycleRecorder struct {
 	record func(
 		context.Context, interaction.Session,
 	) (interaction.Session, error)
+	read func(
+		context.Context, shoal.ID,
+	) (explorer.InteractionRecord, error)
 }
 
 // NewLifecycleRecorder constructs the production lifecycle receipt adapter.
@@ -44,18 +49,23 @@ func NewLifecycleRecorder(
 	}, nil
 }
 
-// NewLifecycleRecorderFromRecorder constructs the lifecycle adapter over the
-// shared trusted recorder used by hosted registry, dispatch, and event paths.
-func NewLifecycleRecorderFromRecorder(
-	recorder LifecycleInteractionRecorder,
+// NewLifecycleRecorderWithReader constructs the production adapter with an
+// authoritative same-corpus reader for refreshed retry reconciliation.
+func NewLifecycleRecorderWithReader(
+	recorder interaction.ResultSink,
+	reader LifecycleInteractionReader,
 ) (*LifecycleRecorder, error) {
-	if isNilLifecycleInteractionRecorder(recorder) {
+	if isNilLifecycleInteractionRecorder(recorder) ||
+		isNilLifecycleInteractionRecorder(reader) {
 		return nil, shoal.NewError(
 			shoal.ErrorInvalidArgument,
-			"fleet lifecycle interaction recorder is required",
+			"fleet lifecycle interaction recorder and reader are required",
 		)
 	}
-	return &LifecycleRecorder{record: recorder.Record}, nil
+	return &LifecycleRecorder{
+		record: recorder.RecordInteractionResult,
+		read:   reader.InteractionRecord,
+	}, nil
 }
 
 // RecordLifecycle records one stable pre-admission receipt. Actor, delegation,
@@ -76,8 +86,25 @@ func (r *LifecycleRecorder) RecordLifecycle(
 	}
 	requested := lifecycleSession(lifecycle)
 	persisted, recordErr := r.record(ctx, requested)
-	if recordErr != nil && !interaction.IsCommittedRecord(recordErr) {
-		return recordErr
+	if recordErr != nil {
+		if r.read != nil {
+			record, readErr := r.read(
+				context.WithoutCancel(ctx), requested.ID,
+			)
+			if readErr == nil {
+				if reconcileErr := validateLifecycleReplay(
+					record.Session, requested, lifecycle,
+				); reconcileErr == nil {
+					if interaction.IsCommittedRecord(recordErr) {
+						return recordErr
+					}
+					return nil
+				}
+			}
+		}
+		if !interaction.IsCommittedRecord(recordErr) || persisted.ID == "" {
+			return recordErr
+		}
 	}
 	expected := requested
 	expected.RecordedAt = persisted.RecordedAt
@@ -88,6 +115,7 @@ func (r *LifecycleRecorder) RecordLifecycle(
 		OnBehalfOf: append(
 			[]shoal.ID(nil), lifecycle.OnBehalfOf...),
 	}
+
 	if lifecycle.AuditPurpose != "" {
 		var err error
 		expected.Reason, err = interaction.NewReason(
@@ -115,6 +143,49 @@ func (r *LifecycleRecorder) RecordLifecycle(
 		))
 	}
 	return recordErr
+}
+
+func validateLifecycleReplay(
+	persisted interaction.Session,
+	requested interaction.Session,
+	lifecycle fleet.Lifecycle,
+) error {
+	canonical, err := persisted.Canonical()
+	if err != nil {
+		return err
+	}
+	if canonical.Actor.SubjectID != lifecycle.Subject {
+		return shoal.NewError(
+			shoal.ErrorUnauthorized,
+			"fleet lifecycle receipt belongs to another subject",
+		)
+	}
+	if canonical.RecordedAt.Before(canonical.SnapshotAsOf) ||
+		!canonical.RecordedAt.Before(canonical.AuthorizationExpiresAt) {
+		return shoal.NewError(
+			shoal.ErrorInternal,
+			"stored fleet lifecycle receipt has invalid chronology",
+		)
+	}
+	expected := requested
+	expected.RecordedAt = canonical.RecordedAt
+	expected.Actor = canonical.Actor
+	expected.Reason = canonical.Reason
+	expected.SnapshotID = canonical.SnapshotID
+	expected.SnapshotAsOf = canonical.SnapshotAsOf
+	expected.AuthorizationFingerprint = canonical.AuthorizationFingerprint
+	expected.AuthorizationExpiresAt = canonical.AuthorizationExpiresAt
+	expected, err = expected.Canonical()
+	if err != nil {
+		return err
+	}
+	if !reflect.DeepEqual(canonical, expected) {
+		return shoal.NewError(
+			shoal.ErrorConflict,
+			"stored fleet lifecycle receipt has different mutation identity",
+		)
+	}
+	return nil
 }
 
 func lifecycleSession(lifecycle fleet.Lifecycle) interaction.Session {
