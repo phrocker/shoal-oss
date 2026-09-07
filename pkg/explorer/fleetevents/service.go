@@ -29,6 +29,7 @@ import (
 	"reflect"
 	"time"
 
+	"github.com/phrocker/shoal-oss/internal/explorerfleetcap"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/interaction"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
@@ -57,9 +58,29 @@ type Service struct {
 	now         func() time.Time
 	poll        time.Duration
 	maxWait     time.Duration
+	reconcile   explorerfleetcap.Capability
 }
 
 func New(config Config) (*Service, error) {
+	return newService(config, explorerfleetcap.Capability{})
+}
+
+// NewWithLifecycleCapability constructs a service whose trusted lifecycle
+// publication path is available only to the host that owns capability.
+func NewWithLifecycleCapability(
+	config Config, capability explorerfleetcap.Capability,
+) (*Service, error) {
+	if !capability.Valid() {
+		return nil, shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			"fleet lifecycle capability is required")
+	}
+	return newService(config, capability)
+}
+
+func newService(
+	config Config, capability explorerfleetcap.Capability,
+) (*Service, error) {
 	if nilDependency(config.Backend) || nilDependency(config.Resolver) ||
 		nilDependency(config.GenerationReader) ||
 		nilDependency(config.LeaseValidator) ||
@@ -90,6 +111,7 @@ func New(config Config) (*Service, error) {
 		backend: config.Backend, resolver: config.Resolver, generations: config.GenerationReader,
 		leases: config.LeaseValidator, auditor: config.Auditor, cursors: codec,
 		now: config.Clock, poll: config.PollInterval, maxWait: config.MaxWait,
+		reconcile: capability,
 	}, nil
 }
 
@@ -243,9 +265,14 @@ func (s *Service) Publish(ctx context.Context, request PublishRequest) (PublishR
 // accepts only the narrow dispatch operations and preserves the caller's
 // canonical durable token unchanged across authorization refreshes.
 func (s *Service) PublishLifecycle(
-	ctx context.Context, operation auth.Operation, request PublishRequest,
-	receipt LifecycleReceipt,
+	ctx context.Context, capability explorerfleetcap.Capability,
+	operation auth.Operation, request PublishRequest, receipt LifecycleReceipt,
 ) (PublishResult, error) {
+	if !s.reconcile.Matches(capability) {
+		return PublishResult{}, shoal.NewError(
+			shoal.ErrorUnauthorized,
+			"fleet lifecycle capability is invalid")
+	}
 	expected, trusted := lifecycleOperation(request.Event.Kind)
 	enqueueInvoke := request.Event.Kind == "action.enqueued" &&
 		operation == auth.OperationInvoke
@@ -344,7 +371,8 @@ func (s *Service) publish(
 	var recordErr error
 	if lifecycleReceipt != nil {
 		if reconciler, ok := s.auditor.(ReconciliationAuditor); ok {
-			recordErr = reconciler.RecordFleetActionReconciliation(ctx, record)
+			recordErr = reconciler.RecordFleetActionReconciliation(
+				ctx, s.reconcile, record)
 		} else if result.Repeated {
 			if retryAuditor, retryOK := s.auditor.(RetryAuditor); retryOK {
 				recordErr = retryAuditor.RecordFleetActionRetry(ctx, record)

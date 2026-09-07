@@ -33,6 +33,7 @@ import (
 	"time"
 
 	"github.com/phrocker/shoal-oss/internal/explorercoord"
+	"github.com/phrocker/shoal-oss/internal/explorerfleetcap"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/explorer/coordination/transaction"
 	"github.com/phrocker/shoal-oss/pkg/explorer/fleet"
@@ -290,17 +291,18 @@ func TestActionEventPublisherRetrySurvivesPolicyGenerationChange(t *testing.T) {
 	auditor := &failingDispatchAuditor{
 		err: errors.New("recording failed"), records: &receipts,
 	}
-	service, err := fleetevents.New(fleetevents.Config{
+	capability := explorerfleetcap.New()
+	service, err := fleetevents.NewWithLifecycleCapability(fleetevents.Config{
 		Backend: backend, Resolver: resolver, GenerationReader: generations,
 		LeaseValidator: dispatchLeaseValidator{}, Auditor: auditor,
 		CursorKey: bytes.Repeat([]byte{7}, 32),
 		Clock:     func() time.Time { return now },
-	})
+	}, capability)
 	if err != nil {
 		t.Fatal(err)
 	}
 	publisher, err := NewActionEventPublisher(
-		service, resolver, func() time.Time { return now })
+		service, resolver, capability, func() time.Time { return now })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -639,7 +641,7 @@ func TestActionEventTokenRejectsMismatchedOrMissingTransition(t *testing.T) {
 
 func TestNewActionEventPublisherRejectsMissingDependencies(t *testing.T) {
 	if _, err := NewActionEventPublisher(
-		nil, nil, nil,
+		nil, nil, explorerfleetcap.Capability{}, nil,
 	); err == nil {
 		t.Fatal("missing dependencies succeeded")
 	}
@@ -678,17 +680,18 @@ func dispatchEventPublisher(
 	if err != nil {
 		t.Fatal(err)
 	}
-	service, err := fleetevents.New(fleetevents.Config{
+	capability := explorerfleetcap.New()
+	service, err := fleetevents.NewWithLifecycleCapability(fleetevents.Config{
 		Backend: backend, Resolver: resolver, GenerationReader: generations,
 		LeaseValidator: dispatchLeaseValidator{}, Auditor: auditor,
 		CursorKey: bytes.Repeat([]byte{7}, 32),
 		Clock:     func() time.Time { return now },
-	})
+	}, capability)
 	if err != nil {
 		t.Fatal(err)
 	}
 	publisher, err := NewActionEventPublisher(
-		service, resolver, func() time.Time { return now })
+		service, resolver, capability, func() time.Time { return now })
 	if err != nil {
 		t.Fatal(err)
 	}

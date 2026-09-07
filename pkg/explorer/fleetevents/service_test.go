@@ -30,6 +30,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/phrocker/shoal-oss/internal/explorerfleetcap"
 	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/interaction"
@@ -611,12 +612,13 @@ func TestPublishLifecycleKeepsStableTokenAndRejectsBroadOperation(t *testing.T) 
 	}
 	backend := &memoryBackend{}
 	audit := &auditor{}
-	service, err := New(Config{
+	capability := explorerfleetcap.New()
+	service, err := NewWithLifecycleCapability(Config{
 		Backend: backend, Resolver: resolver,
 		GenerationReader: &generationReader{generation: 7},
 		LeaseValidator:   &leaseValidator{}, Auditor: audit,
 		CursorKey: make([]byte, 32), Clock: func() time.Time { return now },
-	})
+	}, capability)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -637,7 +639,17 @@ func TestPublishLifecycleKeepsStableTokenAndRejectsBroadOperation(t *testing.T) 
 		AuthorizationExpiresAt: decision.AuthenticationExpires(),
 	}
 	if _, err := service.PublishLifecycle(
-		context.Background(), auth.OperationDispatch, request, receipt,
+		context.Background(), explorerfleetcap.New(),
+		auth.OperationDispatch, request, receipt,
+	); !shoal.IsErrorCode(err, shoal.ErrorUnauthorized) ||
+		len(backend.events) != 0 {
+		t.Fatalf(
+			"foreign lifecycle capability = %v, events = %d",
+			err, len(backend.events),
+		)
+	}
+	if _, err := service.PublishLifecycle(
+		context.Background(), capability, auth.OperationDispatch, request, receipt,
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -649,7 +661,7 @@ func TestPublishLifecycleKeepsStableTokenAndRejectsBroadOperation(t *testing.T) 
 		t.Fatalf("first lifecycle audit reconciliations = %d", audit.reconciliations)
 	}
 	if _, err := service.PublishLifecycle(
-		context.Background(), auth.OperationDispatch, request, receipt,
+		context.Background(), capability, auth.OperationDispatch, request, receipt,
 	); err != nil {
 		t.Fatalf("exact lifecycle retry = %v", err)
 	}
@@ -660,18 +672,18 @@ func TestPublishLifecycleKeepsStableTokenAndRejectsBroadOperation(t *testing.T) 
 		)
 	}
 	if _, err := service.PublishLifecycle(
-		context.Background(), auth.OperationEventPublish, request, receipt,
+		context.Background(), capability, auth.OperationEventPublish, request, receipt,
 	); err == nil {
 		t.Fatal("event_publish was accepted by the trusted lifecycle path")
 	}
 	if _, err := service.PublishLifecycle(
-		context.Background(), auth.OperationInvoke, request, receipt,
+		context.Background(), capability, auth.OperationInvoke, request, receipt,
 	); err == nil {
 		t.Fatal("invoke was accepted for a dispatch lifecycle event")
 	}
 	request.Event.Kind = "agent.completed"
 	if _, err := service.PublishLifecycle(
-		context.Background(), auth.OperationDispatch, request, receipt,
+		context.Background(), capability, auth.OperationDispatch, request, receipt,
 	); err == nil {
 		t.Fatal("non-lifecycle event was accepted by the trusted lifecycle path")
 	}
@@ -971,7 +983,7 @@ func (a *auditor) RecordFleetAction(_ context.Context, record AuditRecord) error
 }
 
 func (a *auditor) RecordFleetActionReconciliation(
-	ctx context.Context, record AuditRecord,
+	ctx context.Context, _ explorerfleetcap.Capability, record AuditRecord,
 ) error {
 	a.reconciliations++
 	return a.RecordFleetAction(ctx, record)

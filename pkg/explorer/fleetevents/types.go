@@ -31,6 +31,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/phrocker/shoal-oss/internal/explorerfleetcap"
 	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/interaction"
@@ -207,7 +208,9 @@ type RetryAuditor interface {
 // lifecycle transition under fresh authorization while preserving the
 // transition's original authorization pins.
 type ReconciliationAuditor interface {
-	RecordFleetActionReconciliation(context.Context, AuditRecord) error
+	RecordFleetActionReconciliation(
+		context.Context, explorerfleetcap.Capability, AuditRecord,
+	) error
 }
 
 // LeaseValidator rechecks the target agent's durable lease and delegation

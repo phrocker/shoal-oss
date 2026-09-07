@@ -27,6 +27,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/phrocker/shoal-oss/internal/explorerfleetcap"
+
 	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/explorer/authorized"
@@ -666,16 +668,28 @@ func TestFleetActionReconciliationPreservesChangedDurablePin(t *testing.T) {
 		t.Fatal("refreshed authorization fingerprint did not change")
 	}
 	sink := f.clientA.FleetActionInteractionSink(auth.OperationDispatch)
-	reconciler, ok := sink.(interface {
+	if _, exposed := sink.(interface {
 		RecordReconciledInteractionResult(
 			context.Context, interaction.Session,
+		) (interaction.Session, error)
+	}); exposed {
+		t.Fatal("ordinary fleet action sink exposes reconciliation without capability")
+	}
+	reconciler, ok := sink.(interface {
+		RecordReconciledInteractionResult(
+			context.Context, explorerfleetcap.Capability, interaction.Session,
 		) (interaction.Session, error)
 	})
 	if !ok {
 		t.Fatal("fleet sink does not support durable reconciliation")
 	}
+	if _, err := reconciler.RecordReconciledInteractionResult(
+		f.context(t, refreshed), explorerfleetcap.Capability{}, session,
+	); !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
+		t.Fatalf("zero reconciliation capability = %v", err)
+	}
 	stored, err := reconciler.RecordReconciledInteractionResult(
-		f.context(t, refreshed), session)
+		f.context(t, refreshed), explorerfleetcap.New(), session)
 	if err != nil {
 		t.Fatalf("first-write reconciliation = %v", err)
 	}
@@ -684,6 +698,32 @@ func TestFleetActionReconciliationPreservesChangedDurablePin(t *testing.T) {
 		!stored.AuthorizationExpiresAt.Equal(original.AuthenticationExpires()) ||
 		stored.RequestID != original.RequestID() {
 		t.Fatalf("durable authorization receipt changed: %#v", stored)
+	}
+
+	if _, err := f.clientA.Ingest(f.admin(t), explorer.Source{
+		URI:       "file:///fleet-reconciliation-retry.txt",
+		MediaType: explorer.MediaTypeText,
+		Content:   "advance the interaction snapshot after receipt commit",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	current, err := f.base.Snapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if shoal.ID(current.ID) == session.SnapshotID {
+		t.Fatal("interaction snapshot did not advance")
+	}
+	retry := session
+	retry.SnapshotID = shoal.ID(current.ID)
+	retry.SnapshotAsOf = current.AsOf
+	retried, err := reconciler.RecordReconciledInteractionResult(
+		f.context(t, refreshed), explorerfleetcap.New(), retry)
+	if err != nil {
+		t.Fatalf("authoritative receipt retry = %v", err)
+	}
+	if !reflect.DeepEqual(retried, stored) {
+		t.Fatalf("retry receipt changed: got %#v, want %#v", retried, stored)
 	}
 }
 

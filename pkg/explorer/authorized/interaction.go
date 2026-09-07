@@ -27,6 +27,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/phrocker/shoal-oss/internal/explorerfleetcap"
 	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/interaction"
@@ -170,9 +171,10 @@ func (s operationInteractionSink) RecordInteractionResult(
 // authorization receipt.
 func (s operationInteractionSink) RecordReconciledInteractionResult(
 	ctx context.Context,
+	capability explorerfleetcap.Capability,
 	session interaction.Session,
 ) (interaction.Session, error) {
-	if s.client == nil ||
+	if s.client == nil || !capability.Valid() ||
 		(s.operation != auth.OperationDispatch &&
 			s.operation != auth.OperationInvoke) {
 		return interaction.Session{}, shoal.NewError(
@@ -293,10 +295,17 @@ func (c *Client) recordInteractionWithEvidenceOperation(
 			)
 		}
 		existingCanonical, canonicalErr := existing.Session.Canonical()
-		retryCanonical := canonical
-		retryCanonical.RecordedAt = existingCanonical.RecordedAt
-		if canonicalErr != nil ||
-			!reflect.DeepEqual(existingCanonical, retryCanonical) {
+		matches := canonicalErr == nil
+		if durablePin {
+			matches = matches &&
+				durableInteractionRetryMatches(canonical, existingCanonical)
+		} else {
+			retryCanonical := canonical
+			retryCanonical.RecordedAt = existingCanonical.RecordedAt
+			matches = matches &&
+				reflect.DeepEqual(existingCanonical, retryCanonical)
+		}
+		if !matches {
 			return interaction.Session{}, shoal.NewError(
 				shoal.ErrorConflict,
 				"interaction session ID already exists with different content",
@@ -320,9 +329,9 @@ func (c *Client) recordInteractionWithEvidenceOperation(
 		}
 		deliveredAt := c.clock().UTC()
 		if deliveredAt.IsZero() ||
-			!interactionPinMatchesDecision(
-				existingCanonical, decision, deliveredAt,
-			) {
+			(!durablePin && !interactionPinMatchesDecision(
+				existingCanonical, decision, deliveredAt)) ||
+			(durablePin && !durableInteractionPinValid(existingCanonical)) {
 			return interaction.Session{}, authorizationDenied()
 		}
 		return existingCanonical, nil
@@ -467,6 +476,25 @@ func durableInteractionPinValid(session interaction.Session) bool {
 		!session.AuthorizationExpiresAt.IsZero() &&
 		session.AuthorizationExpiresAt.Location() == time.UTC &&
 		session.RecordedAt.Before(session.AuthorizationExpiresAt)
+}
+
+func durableInteractionRetryMatches(
+	requested, persisted interaction.Session,
+) bool {
+	if !durableInteractionPinValid(persisted) {
+		return false
+	}
+	requested.RecordedAt = persisted.RecordedAt
+	requested.Actor = persisted.Actor
+	requested.Reason = persisted.Reason
+	requested.SnapshotID = persisted.SnapshotID
+	requested.SnapshotAsOf = persisted.SnapshotAsOf
+	canonicalRequested, err := requested.Canonical()
+	if err != nil {
+		return false
+	}
+	canonicalPersisted, err := persisted.Canonical()
+	return err == nil && reflect.DeepEqual(canonicalRequested, canonicalPersisted)
 }
 
 func postCommitInteractionError(
