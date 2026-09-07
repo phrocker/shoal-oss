@@ -207,6 +207,22 @@ func TestFoldRevalidatesRetainedSourceEdgeVisibility(t *testing.T) {
 		t.Fatalf("rehydrated fold edges = %+v", rehydrated.Members)
 	}
 	corpus.mu.Lock()
+	corrupted := *currentRecord
+	corrupted.FoldID = legacyID
+	corrupted.Members = cloneFoldMembers(currentRecord.Members)
+	corrupted.Members[0].TouchedEdgeIDs = []shoal.ID{edge.ID}
+	delete(corpus.folds, fold.FoldID)
+	corpus.folds[legacyID] = &corrupted
+	corpus.mu.Unlock()
+	if _, err := corpus.RehydrateFold(
+		ctx, legacyID); !shoal.IsErrorCode(err, shoal.ErrorInternal) {
+		t.Fatalf("legacy ID accepted stored typed edge provenance: %v", err)
+	}
+	corpus.mu.Lock()
+	delete(corpus.folds, legacyID)
+	corpus.folds[fold.FoldID] = currentRecord
+	corpus.mu.Unlock()
+	corpus.mu.Lock()
 	corpus.interactions[session.ID].Deleted = true
 	corpus.mu.Unlock()
 	if touches, err := corpus.InteractionsTouching(

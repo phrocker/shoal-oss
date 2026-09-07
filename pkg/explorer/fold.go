@@ -510,6 +510,13 @@ func (e *Explorer) RehydrateFold(
 		SummaryDigest: record.SummaryDigest,
 		FoldedAt:      record.FoldedAt,
 	}
+	storedHasEdgeProvenance := false
+	for _, member := range fold.Members {
+		if len(member.TouchedEdgeIDs) > 0 {
+			storedHasEdgeProvenance = true
+			break
+		}
+	}
 	fold.Members, err = e.foldMembersWithSourceEdgesLocked(fold.Members)
 	if err != nil {
 		return interaction.Fold{}, err
@@ -519,7 +526,8 @@ func (e *Explorer) RehydrateFold(
 		return interaction.Fold{}, err
 	}
 	legacy, legacyErr := legacyFoldID(fold)
-	if legacyErr != nil || (derived != foldID && legacy != foldID) {
+	legacyMatches := !storedHasEdgeProvenance && legacy == foldID
+	if legacyErr != nil || (derived != foldID && !legacyMatches) {
 		return interaction.Fold{}, shoal.NewError(
 			shoal.ErrorInternal,
 			"stored fold does not hash to its own identity",

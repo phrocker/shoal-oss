@@ -264,6 +264,11 @@ func TestAuthorizedResultPathRequiresResultSink(t *testing.T) {
 		AuthorizationExpiresAt:   decision.AuthenticationExpires(),
 	}
 	ctx := f.context(t, decision)
+	if _, err := interaction.NewRecorder(
+		ctx, client,
+	); !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
+		t.Fatalf("direct recorder setup with void-only writer = %v", err)
+	}
 	if _, err := client.RecordInteractionResult(
 		ctx, session,
 	); !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {

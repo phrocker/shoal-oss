@@ -38,7 +38,7 @@ func (c *Client) FoldInteractions(
 	if err != nil {
 		return explorer.FoldResult{}, err
 	}
-	_, guard, _, err := c.begin(ctx, auth.OperationRead)
+	_, guard, _, err := c.begin(ctx, auth.OperationConnect)
 	if err != nil {
 		return explorer.FoldResult{}, err
 	}

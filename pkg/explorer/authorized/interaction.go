@@ -46,6 +46,12 @@ func (c *Client) EnsureInteractionSink(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	if _, ok := writer.(interaction.ResultSink); !ok {
+		return shoal.NewError(
+			shoal.ErrorUnavailable,
+			"trusted interaction result sink is unavailable",
+		)
+	}
 	if err := writer.EnsureInteractionSink(ctx); err != nil {
 		return directBaseError(err)
 	}

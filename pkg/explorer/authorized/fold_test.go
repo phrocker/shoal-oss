@@ -175,6 +175,65 @@ func TestAuthorizedFoldWithholdsCommittedResultAfterMemberReclassification(
 	}
 }
 
+func TestAuthorizedFoldRequiresMutationOperation(t *testing.T) {
+	f := newFixture(t)
+	receipt, err := f.clientA.Ingest(f.admin(t), explorer.Source{
+		URI:       "file:///fold-mutation-operation.txt",
+		MediaType: explorer.MediaTypeText,
+		Content:   "read access does not grant fold mutation",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	view, err := f.clientA.Document(
+		f.admin(t), receipt.Document.ID, receipt.Revision.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := f.base.Snapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.clock.Set(snapshot.AsOf.Add(time.Second))
+	writerDecision := f.decision(
+		t, "fold-writer",
+		[][]byte{f.sourceA}, [][]byte{f.policyA}, allOperations)
+	writerCtx := f.context(t, writerDecision)
+	fingerprint, err := auth.AuthorizationFingerprint(writerDecision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := interaction.Session{
+		ID:                       interaction.DerivedID("session", "fold-mutation-operation"),
+		RecordedAt:               f.clock.Now(),
+		SnapshotID:               shoal.ID(snapshot.ID),
+		SnapshotAsOf:             snapshot.AsOf,
+		AuthorizationFingerprint: shoal.ID(fingerprint.String()),
+		AuthorizationExpiresAt:   writerDecision.AuthenticationExpires(),
+		SeedNodeIDs:              []shoal.ID{firstSpanID(t, view)},
+	}
+	if err := f.clientA.RecordInteraction(writerCtx, session); err != nil {
+		t.Fatal(err)
+	}
+	readerDecision := f.decision(
+		t, "fold-reader",
+		[][]byte{f.sourceA}, [][]byte{f.policyA},
+		[]auth.Operation{auth.OperationRead})
+	if _, err := f.clientA.FoldInteractions(
+		f.context(t, readerDecision),
+		explorer.FoldRequest{SessionIDs: []shoal.ID{session.ID}},
+	); !shoal.IsErrorCode(err, shoal.ErrorUnauthorized) {
+		t.Fatalf("read-only fold mutation error = %v", err)
+	}
+	folds, err := f.base.Folds(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(folds) != 0 {
+		t.Fatalf("read-only principal created folds: %+v", folds)
+	}
+}
+
 func TestAuthorizedFoldMemberReadFailureIsNotConcealed(t *testing.T) {
 	f := newFixture(t)
 	snapshot, err := f.base.Snapshot(context.Background())
