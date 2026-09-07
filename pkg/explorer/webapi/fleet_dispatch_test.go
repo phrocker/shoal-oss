@@ -140,6 +140,20 @@ func TestNewFleetHandlerRequiresBothProviders(t *testing.T) {
 	if _, err := NewFleetHandler(&stubFleetProvider{}, nil); !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
 		t.Fatalf("missing dispatch provider = %v", err)
 	}
+	var typedNilRegistry *stubFleetProvider
+	if _, err := NewFleetHandler(typedNilRegistry, &stubDispatchProvider{}); !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
+		t.Fatalf("typed-nil registry provider = %v", err)
+	}
+	var typedNilDispatch *stubDispatchProvider
+	if _, err := NewFleetHandler(&stubFleetProvider{}, typedNilDispatch); !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
+		t.Fatalf("typed-nil dispatch provider = %v", err)
+	}
+	if _, err := NewFleetRegistryHandler(typedNilRegistry); !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
+		t.Fatalf("typed-nil standalone registry provider = %v", err)
+	}
+	if _, err := NewFleetDispatchHandler(typedNilDispatch); !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
+		t.Fatalf("typed-nil standalone dispatch provider = %v", err)
+	}
 	handler, err := NewFleetHandler(&stubFleetProvider{}, &stubDispatchProvider{})
 	if err != nil || handler == nil {
 		t.Fatalf("fleet handler = %v, %v", handler, err)

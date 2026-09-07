@@ -42,7 +42,7 @@ type FleetRegistryProvider interface {
 // adding another authentication boundary. Mount it through
 // Handler.MountAuthenticated at /api/v1/fleet/.
 func NewFleetRegistryHandler(provider FleetRegistryProvider) (http.Handler, error) {
-	if provider == nil {
+	if isAbsentInterface(provider) {
 		return nil, shoal.NewError(shoal.ErrorInvalidArgument, "fleet registry provider is required")
 	}
 	mux := http.NewServeMux()
