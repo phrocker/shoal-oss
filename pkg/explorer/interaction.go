@@ -914,6 +914,12 @@ func (e *Explorer) edgeVisibilityResolverLocked() interaction.VisibilityResolver
 func (e *Explorer) currentInteractionVisibilityLocked(
 	record persistedInteraction,
 ) (string, error) {
+	if !record.EdgeProvenanceComplete {
+		return "", shoal.NewError(
+			shoal.ErrorUnavailable,
+			"interaction source-edge provenance is incomplete",
+		)
+	}
 	references, err := record.Session.EvidenceReferences()
 	if err != nil {
 		return "", err

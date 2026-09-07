@@ -21,7 +21,6 @@ package authorized
 
 import (
 	"context"
-	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -1023,11 +1022,48 @@ func validateTrustedDerivedAssertions(
 		canonical, ok := trusted[id]
 		if !ok || canonical.ID() != id ||
 			canonical.Origin() != ontology.AssertionDerived ||
-			!reflect.DeepEqual(canonical, untrusted) {
+			!assertionsSemanticallyEqual(canonical, untrusted) {
 			return inconsistentBase()
 		}
 	}
 	return nil
+}
+
+func assertionsSemanticallyEqual(
+	left, right ontology.Assertion,
+) bool {
+	if left.ID() != right.ID() ||
+		!metadataSemanticallyEqual(left.Metadata(), right.Metadata()) {
+		return false
+	}
+	leftEvidence := left.Evidence()
+	rightEvidence := right.Evidence()
+	if len(leftEvidence) != len(rightEvidence) {
+		return false
+	}
+	for index := range leftEvidence {
+		if leftEvidence[index].ID() != rightEvidence[index].ID() ||
+			!metadataSemanticallyEqual(
+				leftEvidence[index].Metadata(),
+				rightEvidence[index].Metadata(),
+			) {
+			return false
+		}
+	}
+	return true
+}
+
+func metadataSemanticallyEqual(left, right shoal.Metadata) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for key, leftValue := range left {
+		rightValue, ok := right[key]
+		if !ok || rightValue != leftValue {
+			return false
+		}
+	}
+	return true
 }
 
 func derivedAssertionsByEdge(

@@ -648,7 +648,7 @@ func assertionNeighborhood(
 			Start: document.SourcePosition{Offset: 0, Page: 1},
 			End:   document.SourcePosition{Offset: 5, Page: 1},
 		},
-	}, "quote", nil)
+	}, payload, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -694,6 +694,31 @@ func assertionNeighborhood(
 		}},
 		Assertions: []ontology.Assertion{assertion},
 	}, assertion
+}
+
+func TestAssertionHydrationEnforcesCumulativeCount(t *testing.T) {
+	first, firstAssertion := assertionNeighborhood(
+		t, "shared-source", "shared-target", "shared-edge", "first")
+	second, secondAssertion := assertionNeighborhood(
+		t, "shared-source", "shared-target", "shared-edge", "second")
+	if firstAssertion.ID() == secondAssertion.ID() {
+		t.Fatal("fixture assertions unexpectedly share an identity")
+	}
+	limits := mustLimits(t, Limits{
+		MaxGraphNodes: 4, MaxGraphEdges: 1,
+	})
+	verifier, err := newVerifier(
+		context.Background(), nil, limits, nil,
+		[]explorer.Neighborhood{first},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := verifier.addNeighborhood(second); !shoal.IsErrorCode(
+		err, shoal.ErrorInvalidArgument,
+	) {
+		t.Fatalf("cumulative assertion count error = %v", err)
+	}
 }
 
 func TestMutationIsolationAndNoUncitedExplanationText(t *testing.T) {

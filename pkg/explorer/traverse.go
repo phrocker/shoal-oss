@@ -231,7 +231,7 @@ type interactionView struct {
 // stored records and must not be retained or mutated.
 func (e *Explorer) eachLiveInteractionLocked(visit func(interactionView)) {
 	for _, record := range e.interactions {
-		if record.Deleted {
+		if record.Deleted || !record.EdgeProvenanceComplete {
 			continue
 		}
 		view := interactionView{
@@ -309,7 +309,8 @@ func (e *Explorer) interactionViewVisibilityIsStaleLocked(
 }
 
 func (e *Explorer) interactionViewLocked(id shoal.ID) (interactionView, bool) {
-	if record, ok := e.interactions[id]; ok && !record.Deleted {
+	if record, ok := e.interactions[id]; ok && !record.Deleted &&
+		record.EdgeProvenanceComplete {
 		return interactionView{
 			id:            record.SessionID,
 			kind:          interaction.KindSession,

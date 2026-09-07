@@ -242,6 +242,70 @@ func TestFoldRevalidatesRetainedSourceEdgeVisibility(t *testing.T) {
 	}
 }
 
+func TestIncompleteInteractionEdgeProvenanceIsNotReadable(t *testing.T) {
+	ctx := context.Background()
+	corpus, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer corpus.Close()
+	receipt, err := corpus.Ingest(ctx, Source{
+		URI:       "file:///incomplete-edge-provenance.txt",
+		MediaType: MediaTypeText,
+		Content:   "incomplete provenance",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	view, err := corpus.Document(ctx, receipt.Document.ID, receipt.Revision.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := interaction.Session{
+		ID:          interaction.DerivedID("session", "incomplete-edge-provenance"),
+		RecordedAt:  time.Unix(1700000000, 0).UTC(),
+		Operation:   interaction.OperationRetrieval,
+		SeedNodeIDs: []shoal.ID{view.Root.Spans[0].ID},
+	}
+	if err := corpus.RecordInteraction(ctx, session); err != nil {
+		t.Fatal(err)
+	}
+	corpus.mu.Lock()
+	if !corpus.interactions[session.ID].EdgeProvenanceComplete {
+		corpus.mu.Unlock()
+		t.Fatal("new interaction did not record complete edge provenance")
+	}
+	corpus.interactions[session.ID].EdgeProvenanceComplete = false
+	corpus.mu.Unlock()
+
+	if summaries, err := corpus.Interactions(ctx); err != nil || len(summaries) != 0 {
+		t.Fatalf("incomplete interaction summaries = %+v, %v", summaries, err)
+	}
+	if records, err := corpus.InteractionRecords(ctx); err != nil || len(records) != 0 {
+		t.Fatalf("incomplete interaction records = %+v, %v", records, err)
+	}
+	if _, err := corpus.InteractionRecord(
+		ctx, session.ID); !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
+		t.Fatalf("incomplete interaction record error = %v", err)
+	}
+	if _, err := corpus.Interaction(
+		ctx, session.ID); !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
+		t.Fatalf("incomplete interaction error = %v", err)
+	}
+	if _, err := corpus.InteractionSubgraph(
+		ctx, session.ID); !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
+		t.Fatalf("incomplete interaction subgraph error = %v", err)
+	}
+	if touching, err := corpus.InteractionsTouching(
+		ctx, view.Root.Spans[0].ID); err != nil || len(touching) != 0 {
+		t.Fatalf("incomplete interaction traversal = %+v, %v", touching, err)
+	}
+	if _, err := corpus.RelatedInteractions(
+		ctx, session.ID); !shoal.IsErrorCode(err, shoal.ErrorNotFound) {
+		t.Fatalf("incomplete direct traversal error = %v", err)
+	}
+}
+
 func TestInteractionWriteResolvesCommittedIndeterminateOutcome(t *testing.T) {
 	ctx := context.Background()
 	corpus, err := Open(t.TempDir())

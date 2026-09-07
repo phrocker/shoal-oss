@@ -700,14 +700,18 @@ func (v *verifier) addNeighborhood(neighborhood explorer.Neighborhood) error {
 	}
 	for assertionID, state := range localAssertionStates {
 		if existing, ok := v.assertionStates[assertionID]; ok &&
-			!reflect.DeepEqual(existing.assertion, state.assertion) {
+			!assertionsSemanticallyEqual(existing.assertion, state.assertion) {
 			return invalid("hydrated graph assertion conflicts with prior content")
 		}
 	}
-	for edgeID, assertions := range localAssertions {
-		if existing, ok := v.assertions[edgeID]; ok &&
-			!reflect.DeepEqual(existing, assertions) {
-			return invalid("hydrated graph assertion conflicts with prior content")
+	additionalAssertions := 0
+	for assertionID := range localAssertionStates {
+		if _, exists := v.assertionStates[assertionID]; exists {
+			continue
+		}
+		additionalAssertions++
+		if len(v.assertionStates)+additionalAssertions > v.limits.MaxGraphEdges {
+			return invalid("hydrated graph exceeds the assertion bound")
 		}
 	}
 	additionalBytes := 0
@@ -802,7 +806,9 @@ func (v *verifier) addNeighborhood(neighborhood explorer.Neighborhood) error {
 		}
 	}
 	for edgeID, assertions := range localAssertions {
-		if _, exists := v.assertions[edgeID]; !exists {
+		if existing, exists := v.assertions[edgeID]; exists {
+			v.assertions[edgeID] = mergeAssertionReferences(existing, assertions)
+		} else {
 			v.assertions[edgeID] = append(
 				[]interaction.AssertionReference(nil), assertions...)
 		}
@@ -883,7 +889,7 @@ func assertionsByNeighborhoodEdge(
 			edgeIDs:   edgeIDs,
 		}
 		if existing, duplicate := byID[assertion.ID()]; duplicate {
-			if !reflect.DeepEqual(existing.assertion, state.assertion) ||
+			if !assertionsSemanticallyEqual(existing.assertion, state.assertion) ||
 				!reflect.DeepEqual(existing.edgeIDs, state.edgeIDs) {
 				return nil, nil, invalid(
 					"hydrated graph repeats an assertion identity with different content")
@@ -928,6 +934,68 @@ func mergeSortedIDs(left, right []shoal.ID) []shoal.ID {
 		}
 	}
 	return result
+}
+
+func mergeAssertionReferences(
+	left, right []interaction.AssertionReference,
+) []interaction.AssertionReference {
+	merged := append(
+		append([]interaction.AssertionReference(nil), left...), right...)
+	sort.Slice(merged, func(i, j int) bool {
+		if compared := shoal.CompareID(
+			merged[i].AssertionID, merged[j].AssertionID); compared != 0 {
+			return compared < 0
+		}
+		if compared := shoal.CompareID(
+			merged[i].EdgeID, merged[j].EdgeID); compared != 0 {
+			return compared < 0
+		}
+		return merged[i].Origin < merged[j].Origin
+	})
+	result := merged[:0]
+	for _, reference := range merged {
+		if len(result) == 0 || result[len(result)-1] != reference {
+			result = append(result, reference)
+		}
+	}
+	return result
+}
+
+func assertionsSemanticallyEqual(
+	left, right ontology.Assertion,
+) bool {
+	if left.ID() != right.ID() ||
+		!metadataSemanticallyEqual(left.Metadata(), right.Metadata()) {
+		return false
+	}
+	leftEvidence := left.Evidence()
+	rightEvidence := right.Evidence()
+	if len(leftEvidence) != len(rightEvidence) {
+		return false
+	}
+	for index := range leftEvidence {
+		if leftEvidence[index].ID() != rightEvidence[index].ID() ||
+			!metadataSemanticallyEqual(
+				leftEvidence[index].Metadata(),
+				rightEvidence[index].Metadata(),
+			) {
+			return false
+		}
+	}
+	return true
+}
+
+func metadataSemanticallyEqual(left, right shoal.Metadata) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for key, leftValue := range left {
+		rightValue, ok := right[key]
+		if !ok || rightValue != leftValue {
+			return false
+		}
+	}
+	return true
 }
 
 func assertionMatchesEvidenceEdge(
