@@ -31,8 +31,10 @@ import (
 	"sync"
 	"time"
 
+	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/explorer/webapi"
+	"github.com/phrocker/shoal-oss/pkg/interaction"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
@@ -48,7 +50,8 @@ const (
 	// structured tool result. StructuredContent remains complete.
 	DefaultContextBudgetBytes = 1 << 20
 	maxContextBudgetBytes     = int(webapi.MaxResponseBytes)
-	// DefaultToolCallsPerMinute bounds work accepted from one stdio process.
+	// DefaultToolCallsPerMinute bounds work accepted by one server process.
+	// HTTP sessions share this limiter so opening new sessions cannot bypass it.
 	DefaultToolCallsPerMinute = 120
 	MaxToolCallsPerMinute     = 100_000
 )
@@ -98,24 +101,74 @@ type OptionalToolProvider interface {
 	Call(context.Context, json.RawMessage) (any, error)
 }
 
-// Config constructs one MCP stdio server.
+// SnapshotProvider returns the exact authorized corpus snapshot observed by a
+// tool call. The authorized Explorer client implements this interface.
+type SnapshotProvider interface {
+	Snapshot(context.Context) (explorer.Snapshot, error)
+}
+
+// ToolObservation carries the complete provenance exposed by one tool result.
+// The node and evidence sets are never presentation-capped. Optional snapshot
+// and authorization pins let adapters prove that an already-recorded provider
+// response was produced under the same bound request.
+type ToolObservation struct {
+	SnapshotID               shoal.ID
+	SnapshotAsOf             time.Time
+	AuthorizationFingerprint shoal.ID
+	AuthorizationExpiresAt   time.Time
+	RequestID                shoal.ID
+	EmbeddingSpaceID         shoal.ID
+	EmbeddingSpaceIDs        []shoal.ID
+	RetrievedNodeIDs         []shoal.ID
+	RetrievedEvidence        []interaction.EvidenceReference
+	CitedNodeIDs             []shoal.ID
+	CitedEvidence            []interaction.EvidenceReference
+	RequiredVisibility       []string
+}
+
+// OptionalToolObservationProvider lets an extension report every source and
+// complete evidence reference its full structured result exposed.
+type OptionalToolObservationProvider interface {
+	ObserveToolResult(any) (ToolObservation, error)
+}
+
+// OptionalToolAuthorizationProvider declares the exact canonical auth
+// operation an extension performs. The dispatcher enforces its collection/
+// domain gate before calling the provider; target-bound providers must also
+// use Decision.AuthorizeObject through their existing capability seam.
+type OptionalToolAuthorizationProvider interface {
+	ToolAuthorizationOperation() auth.Operation
+}
+
+// Config constructs one transport-neutral MCP dispatcher with one stdio
+// protocol session. HTTP sessions clone only the lifecycle state; tools,
+// recorder, authorization capabilities, and limits remain shared.
 type Config struct {
-	Service       webapi.Service
-	Authority     *auth.Authority
-	Decisions     DecisionProvider
-	ServerInfo    Implementation
-	OptionalTools []OptionalToolProvider
-	Instructions  string
+	Service   webapi.Service
+	Authority *auth.Authority
+	Decisions DecisionProvider
+	Recorder  *interaction.Recorder
+	// InteractionSink supports HTTP, where no process-global principal exists
+	// at construction. Each tool call creates and verifies a recorder against
+	// this sink only after that HTTP request has been authenticated and bound.
+	InteractionSink interaction.ResultSink
+	Snapshots       SnapshotProvider
+	ServerInfo      Implementation
+	OptionalTools   []OptionalToolProvider
+	Instructions    string
 	// ContextCompressor controls the compatibility text rendering of structured
 	// results. Nil selects NativeContextCompressor.
 	ContextCompressor ContextCompressor
 	// ContextBudgetBytes defaults to DefaultContextBudgetBytes and cannot exceed
 	// the web API's public response bound.
 	ContextBudgetBytes int
+	// OutputBudgetBytes defaults to the web API's public response bound.
+	OutputBudgetBytes uint64
 	// ToolCallsPerMinute defaults to DefaultToolCallsPerMinute.
 	ToolCallsPerMinute int
 	requestIDFactory   func() (shoal.ID, error)
 	toolCallClock      func() time.Time
+	interactionClock   func() time.Time
 }
 
 type serverState uint8
@@ -129,24 +182,32 @@ const (
 // Server implements the initialization-handshake MCP lifecycle over
 // newline-delimited JSON-RPC.
 type Server struct {
-	binder        auth.Binder
-	decisions     DecisionProvider
-	serverInfo    Implementation
-	instructions  string
-	requestID     func() (shoal.ID, error)
-	compressor    ContextCompressor
-	contextBudget int
-	toolCallLimit *fixedWindowLimiter
-	tools         []registeredTool
-	toolsByName   map[string]registeredTool
-	stateMu       sync.Mutex
-	state         serverState
+	binder          auth.Binder
+	resolver        auth.Resolver
+	decisions       DecisionProvider
+	serverInfo      Implementation
+	instructions    string
+	requestID       func() (shoal.ID, error)
+	compressor      ContextCompressor
+	contextBudget   int
+	outputBudget    uint64
+	toolCallLimit   *fixedWindowLimiter
+	recorder        *interaction.Recorder
+	interactionSink interaction.ResultSink
+	snapshots       SnapshotProvider
+	interactionNow  func() time.Time
+	tools           []registeredTool
+	toolsByName     map[string]registeredTool
+	stateMu         sync.Mutex
+	state           serverState
 }
 
 type registeredTool struct {
-	definition  Tool
-	inputSchema *optionalToolInputSchema
-	call        func(context.Context, json.RawMessage) (any, error)
+	definition             Tool
+	inputSchema            *optionalToolInputSchema
+	authorizationOperation auth.Operation
+	call                   func(context.Context, json.RawMessage) (any, error)
+	observe                func(any) (ToolObservation, error)
 }
 
 // NewServer validates and snapshots the available tool surface. Optional tools
@@ -164,6 +225,15 @@ func NewServer(config Config) (*Server, error) {
 	if isAbsent(config.Decisions) {
 		return nil, shoal.NewError(
 			shoal.ErrorInvalidArgument, "MCP decision provider is required")
+	}
+	if config.Recorder == nil && isAbsent(config.InteractionSink) {
+		return nil, shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			"MCP interaction recorder or authorized sink is required")
+	}
+	if isAbsent(config.Snapshots) {
+		return nil, shoal.NewError(
+			shoal.ErrorInvalidArgument, "MCP snapshot provider is required")
 	}
 	serverInfo := cloneImplementation(config.ServerInfo)
 	if serverInfo.Name == "" {
@@ -196,6 +266,16 @@ func NewServer(config Config) (*Server, error) {
 		return nil, shoal.NewError(
 			shoal.ErrorInvalidArgument, "MCP context budget is invalid")
 	}
+	outputBudget := config.OutputBudgetBytes
+	if outputBudget == 0 {
+		outputBudget = webapi.MaxResponseBytes
+	}
+	if outputBudget > webapi.MaxResponseBytes {
+		return nil, shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			"MCP output budget exceeds the public response bound",
+		)
+	}
 	toolCallsPerMinute := config.ToolCallsPerMinute
 	if toolCallsPerMinute == 0 {
 		toolCallsPerMinute = DefaultToolCallsPerMinute
@@ -209,6 +289,10 @@ func NewServer(config Config) (*Server, error) {
 	if toolCallClock == nil {
 		toolCallClock = time.Now
 	}
+	interactionClock := config.interactionClock
+	if interactionClock == nil {
+		interactionClock = time.Now
+	}
 	tools, err := serviceTools(config.Service, config.OptionalTools)
 	if err != nil {
 		return nil, err
@@ -221,18 +305,58 @@ func NewServer(config Config) (*Server, error) {
 	if instructions != "" {
 		instructions += " "
 	}
-	instructions += "Shoal tools are authorized independently for every call. " +
+	instructions += "Shoal tools are authorized independently and durably recorded for every call. " +
 		"Context compression is applied to large compatibility text results and is distinct " +
-		"from Shoal provenance fold. Tool-call recording is deferred in v1."
+		"from Shoal provenance fold. Generic tool-call records do not create inference nodes."
 	return &Server{
-		binder: config.Authority.Binder(), decisions: config.Decisions,
+		binder: config.Authority.Binder(), resolver: config.Authority.Resolver(),
+		decisions:    config.Decisions,
 		serverInfo:   serverInfo,
 		instructions: instructions, requestID: requestID,
 		compressor: compressor, contextBudget: contextBudget,
+		outputBudget: outputBudget,
+		recorder:     config.Recorder, interactionSink: config.InteractionSink,
+		snapshots:      config.Snapshots,
+		interactionNow: interactionClock,
 		toolCallLimit: newFixedWindowLimiter(
 			toolCallsPerMinute, time.Minute, toolCallClock),
 		tools: tools, toolsByName: byName, state: stateAwaitInitialize,
 	}, nil
+}
+
+// newProtocolSession clones one dispatcher with independent lifecycle state.
+// The process-wide rate limiter remains shared so opening sessions cannot
+// bypass it. No identity or authorization decision is retained; HTTP
+// authenticates and binds every request afresh.
+func (s *Server) newProtocolSession() *Server {
+	return s.newProtocolSessionWithOutputBudget(0)
+}
+
+func (s *Server) newProtocolSessionWithOutputBudget(limit uint64) *Server {
+	if s == nil {
+		return nil
+	}
+	contextBudget := s.contextBudget
+	outputBudget := s.outputBudget
+	if limit > 0 && limit < outputBudget {
+		outputBudget = limit
+	}
+	if uint64(contextBudget) > outputBudget {
+		contextBudget = int(outputBudget)
+	}
+	return &Server{
+		binder: s.binder, resolver: s.resolver, decisions: s.decisions,
+		serverInfo:   cloneImplementation(s.serverInfo),
+		instructions: s.instructions, requestID: s.requestID,
+		compressor: s.compressor, contextBudget: contextBudget,
+		outputBudget: outputBudget,
+		recorder:     s.recorder, interactionSink: s.interactionSink,
+		snapshots:      s.snapshots,
+		interactionNow: s.interactionNow,
+		toolCallLimit:  s.toolCallLimit,
+		tools:          s.tools, toolsByName: s.toolsByName,
+		state: stateAwaitInitialize,
+	}
 }
 
 func cloneImplementation(value Implementation) Implementation {
@@ -329,7 +453,7 @@ func (s *Server) handle(ctx context.Context, request Request) *Response {
 	}
 	switch request.Method {
 	case "initialize":
-		return s.initialize(request)
+		return s.initialize(ctx, request)
 	case "ping":
 		if !validEmptyParams(request.Params) {
 			response := newErrorResponse(
@@ -360,7 +484,7 @@ func (s *Server) handle(ctx context.Context, request Request) *Response {
 	}
 }
 
-func (s *Server) initialize(request Request) *Response {
+func (s *Server) initialize(ctx context.Context, request Request) *Response {
 	s.stateMu.Lock()
 	defer s.stateMu.Unlock()
 	if s.state != stateAwaitInitialize {
@@ -388,6 +512,7 @@ func (s *Server) initialize(request Request) *Response {
 		},
 		ServerInfo:   s.serverInfo,
 		Instructions: s.instructions,
+		Meta:         workspaceInitializeMeta(ctx),
 	})
 	return &response
 }
@@ -453,6 +578,18 @@ func (s *Server) listTools(request Request) *Response {
 	return &response
 }
 
+func (s *Server) requestMutates(request Request) bool {
+	if request.Method != "tools/call" {
+		return false
+	}
+	var params CallToolParams
+	if strictDecode(request.Params, &params) != nil {
+		return false
+	}
+	tool, ok := s.toolsByName[params.Name]
+	return ok && toolMutates(tool.definition)
+}
+
 func (s *Server) callTool(ctx context.Context, request Request) *Response {
 	var params CallToolParams
 	if err := strictDecode(request.Params, &params); err != nil ||
@@ -474,7 +611,25 @@ func (s *Server) callTool(ctx context.Context, request Request) *Response {
 		return &response
 	}
 
-	bound, err := s.authorizedContext(ctx)
+	bound, decision, err := s.authorizedContext(ctx)
+	if err != nil {
+		response := newResponse(request.ID, s.toolErrorResult(err))
+		return &response
+	}
+	authorizationNow := s.interactionNow()
+	if authorizationNow.IsZero() ||
+		decision.Authorize(
+			tool.authorizationOperation,
+			auth.ResourceRequest{
+				AuthorizationDomain: decision.AuthorizationDomain(),
+			},
+			authorizationNow,
+		) != nil {
+		response := newResponse(request.ID, s.toolErrorResult(
+			shoal.NewError(shoal.ErrorUnauthorized, "authorization denied")))
+		return &response
+	}
+	snapshot, err := s.interactionSnapshot(bound)
 	if err != nil {
 		response := newResponse(request.ID, s.toolErrorResult(err))
 		return &response
@@ -485,22 +640,152 @@ func (s *Server) callTool(ctx context.Context, request Request) *Response {
 	}
 	if tool.inputSchema != nil {
 		if err := validateOptionalToolArguments(arguments, *tool.inputSchema); err != nil {
+			recordErr := s.recordToolOutcome(
+				bound, decision, snapshot, tool.authorizationOperation,
+				params.Name, arguments,
+				ToolObservation{}, true, "invalid_arguments", false,
+			)
+			if recordErr != nil {
+				err = recordErr
+			} else {
+				err = invalidToolArguments(params.Name)
+			}
 			response := newResponse(
-				request.ID, s.toolErrorResult(invalidToolArguments(params.Name)))
+				request.ID, s.toolErrorResult(err))
+			return &response
+		}
+	}
+	limitedArguments, limitErr := applyWorkspaceToolLimits(
+		bound, params.Name, arguments)
+	if limitErr != nil {
+		recordErr := s.recordToolOutcome(
+			bound, decision, snapshot, tool.authorizationOperation,
+			params.Name, arguments, ToolObservation{}, true,
+			toolStopReason(limitErr), false,
+		)
+		if recordErr != nil {
+			limitErr = recordErr
+		}
+		response := newResponse(request.ID, s.toolErrorResult(limitErr))
+		return &response
+	}
+	arguments = limitedArguments
+	mutating := toolMutates(tool.definition)
+	if mutating {
+		if err := s.recordToolAdmission(
+			bound, decision, snapshot, tool.authorizationOperation,
+			params.Name, arguments,
+		); err != nil {
+			response := newResponse(request.ID, s.toolErrorResult(
+				shoal.NewError(
+					shoal.ErrorUnavailable,
+					"tool admission could not be recorded; tool was not executed",
+				),
+			))
 			return &response
 		}
 	}
 	value, err := tool.call(bound, arguments)
+	if mutating && err != nil &&
+		!isPreEffectToolError(err) &&
+		!explorer.IsIndeterminateCommit(err) {
+		err = explorer.MarkIndeterminateCommit(shoal.WrapError(
+			shoal.ErrorUnavailable,
+			"mutating tool outcome is indeterminate; verify current state before retrying",
+			err,
+		))
+	}
+	effectSucceeded := err == nil
+	observation, observeErr := observeToolResult(tool, params.Name, value)
+	if effectSucceeded && observeErr == nil {
+		observation, observeErr = canonicalToolObservation(
+			bound, observation, decision)
+	}
+	if effectSucceeded && observeErr != nil {
+		if mutating {
+			err = explorer.MarkIndeterminateCommit(shoal.WrapError(
+				shoal.ErrorInternal,
+				"tool effect committed but source observation failed",
+				observeErr,
+			))
+		} else {
+			err = observeErr
+		}
+	}
+	outcomeSnapshot := snapshot
+	if observation.SnapshotID != "" || !observation.SnapshotAsOf.IsZero() {
+		outcomeSnapshot = explorer.Snapshot{
+			ID: string(observation.SnapshotID), AsOf: observation.SnapshotAsOf,
+		}
+	} else if mutating {
+		observed, snapshotErr := s.interactionSnapshot(bound)
+		if snapshotErr == nil {
+			outcomeSnapshot = observed
+		} else if effectSucceeded {
+			err = explorer.MarkIndeterminateCommit(shoal.WrapError(
+				shoal.ErrorUnavailable,
+				"tool effect committed but its resulting snapshot could not be observed",
+				snapshotErr,
+			))
+		}
+	}
+	if err == nil && params.Name == ToolRetrieve {
+		if recordErr := s.recordRetrievalOutcome(
+			bound, decision, outcomeSnapshot, arguments, observation,
+		); recordErr != nil {
+			err = recordErr
+		}
+	}
+	var result ToolResult
+	if err == nil {
+		result, err = s.toolSuccessResult(request.ID, value)
+		if err != nil && mutating {
+			err = explorer.MarkIndeterminateCommit(shoal.WrapError(
+				shoal.ErrorInternal,
+				"tool effect committed but its response could not be encoded",
+				err,
+			))
+		}
+	}
+	recordErr := s.recordToolOutcome(
+		bound, decision, outcomeSnapshot, tool.authorizationOperation,
+		params.Name, arguments, observation,
+		err != nil, toolStopReason(err), mutating,
+	)
+	if recordErr != nil {
+		if mutating {
+			recordErr = explorer.MarkIndeterminateCommit(shoal.WrapError(
+				shoal.ErrorUnavailable,
+				"tool effect may have committed but its durable outcome record failed; verify state before retrying",
+				recordErr,
+			))
+		} else {
+			recordErr = shoal.NewError(
+				shoal.ErrorUnavailable,
+				"tool result was withheld because durable recording failed",
+			)
+		}
+		response := newResponse(request.ID, s.toolErrorResult(recordErr))
+		return &response
+	}
+
 	if err != nil {
 		response := newResponse(request.ID, s.toolErrorResult(err))
 		return &response
 	}
-	result, err := s.toolSuccessResult(value)
-	if err != nil {
-		result = s.toolErrorResult(err)
-	}
 	response := newResponse(request.ID, result)
 	return &response
+}
+
+func (s *Server) interactionSnapshot(
+	ctx context.Context,
+) (explorer.Snapshot, error) {
+	if provider, ok := s.snapshots.(interface {
+		InteractionSnapshot(context.Context) (explorer.Snapshot, error)
+	}); ok && !isAbsent(provider) {
+		return provider.InteractionSnapshot(ctx)
+	}
+	return s.snapshots.Snapshot(ctx)
 }
 
 type fixedWindowLimiter struct {
@@ -540,27 +825,68 @@ func (l *fixedWindowLimiter) Allow() bool {
 	return true
 }
 
-func (s *Server) authorizedContext(ctx context.Context) (context.Context, error) {
+type boundHTTPDecisionKey struct{}
+
+func withBoundHTTPDecision(
+	ctx context.Context, decision auth.Decision,
+) context.Context {
+	return context.WithValue(ctx, boundHTTPDecisionKey{}, decision)
+}
+
+func (s *Server) authorizedContext(
+	ctx context.Context,
+) (context.Context, auth.Decision, error) {
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return nil, auth.Decision{}, err
+	}
+	if decision, ok := ctx.Value(boundHTTPDecisionKey{}).(auth.Decision); ok {
+		if _, err := auth.AuthorizationFingerprint(decision); err != nil {
+			return nil, auth.Decision{}, shoal.NewError(
+				shoal.ErrorUnauthorized, "authorization denied")
+		}
+		return ctx, decision, nil
 	}
 	template, err := s.decisions.Decision(ctx)
 	if err != nil {
 		if contextErr := ctx.Err(); contextErr != nil {
-			return nil, contextErr
+			return nil, auth.Decision{}, contextErr
 		}
-		return nil, shoal.NewError(shoal.ErrorUnauthorized, "authorization denied")
+		return nil, auth.Decision{}, shoal.NewError(
+			shoal.ErrorUnauthorized, "authorization denied")
 	}
 	requestID, err := s.requestID()
 	if err != nil {
-		return nil, shoal.NewError(
+		return nil, auth.Decision{}, shoal.NewError(
 			shoal.ErrorUnavailable, "request identity unavailable")
 	}
 	if err := shoal.ValidateRequiredID("MCP request ID", requestID); err != nil {
-		return nil, shoal.NewError(
+		return nil, auth.Decision{}, shoal.NewError(
 			shoal.ErrorUnavailable, "request identity unavailable")
 	}
-	decision, err := auth.NewDecision(auth.DecisionConfig{
+	decision, err := freshDecision(template, requestID)
+	if err != nil {
+		return nil, auth.Decision{}, shoal.NewError(
+			shoal.ErrorUnauthorized, "authorization denied")
+	}
+	bound, err := s.binder.Bind(ctx, decision)
+	if err != nil || bound == nil {
+		if contextErr := ctx.Err(); contextErr != nil {
+			return nil, auth.Decision{}, contextErr
+		}
+		return nil, auth.Decision{}, shoal.NewError(
+			shoal.ErrorUnauthorized, "authorization denied")
+	}
+	return bound, decision, nil
+}
+
+// freshDecision is the single integration point for additive trusted decision
+// fields. Keep it aligned with auth.DecisionConfig when new pins such as a
+// selected ontology lens are added.
+func freshDecision(
+	template auth.Decision, requestID shoal.ID,
+) (auth.Decision, error) {
+	selectedOntology, _ := template.SelectedOntology()
+	return auth.NewDecision(auth.DecisionConfig{
 		Subject:                template.Subject(),
 		Actor:                  template.Actor(),
 		ClientID:               template.ClientID(),
@@ -576,18 +902,8 @@ func (s *Server) authorizedContext(ctx context.Context) (context.Context, error)
 		AuditPurpose:           template.AuditPurpose(),
 		ServiceRole:            template.ServiceRole(),
 		ServiceCeilingIdentity: template.ServiceCeilingIdentity(),
+		SelectedOntology:       selectedOntology,
 	})
-	if err != nil {
-		return nil, shoal.NewError(shoal.ErrorUnauthorized, "authorization denied")
-	}
-	bound, err := s.binder.Bind(ctx, decision)
-	if err != nil || bound == nil {
-		if contextErr := ctx.Err(); contextErr != nil {
-			return nil, contextErr
-		}
-		return nil, shoal.NewError(shoal.ErrorUnauthorized, "authorization denied")
-	}
-	return bound, nil
 }
 
 func randomRequestID() (shoal.ID, error) {
@@ -670,18 +986,44 @@ func serviceTools(
 				shoal.ErrorInvalidArgument, "reserved MCP tool name")
 		}
 		provider := provider
+		var observe func(any) (ToolObservation, error)
+		if observer, ok := provider.(OptionalToolObservationProvider); ok {
+			observe = observer.ObserveToolResult
+		}
+		operationProvider, ok := provider.(OptionalToolAuthorizationProvider)
+		if !ok || isAbsent(operationProvider) {
+			return nil, shoal.NewError(
+				shoal.ErrorInvalidArgument,
+				"optional MCP tool authorization operation is required",
+			)
+		}
+		authorizationOperation := operationProvider.ToolAuthorizationOperation()
+		if err := authorizationOperation.Validate(); err != nil {
+			return nil, shoal.NewError(
+				shoal.ErrorInvalidArgument,
+				"optional MCP tool authorization operation is invalid",
+			)
+		}
 		tools = append(tools, registeredTool{
-			definition:  cloneTool(definition),
-			inputSchema: inputSchema,
+			definition:             cloneTool(definition),
+			inputSchema:            inputSchema,
+			authorizationOperation: authorizationOperation,
 			call: func(ctx context.Context, arguments json.RawMessage) (any, error) {
 				return provider.Call(ctx, append(json.RawMessage(nil), arguments...))
 			},
+			observe: observe,
 		})
 	}
 	sort.Slice(tools, func(left, right int) bool {
 		return tools[left].definition.Name < tools[right].definition.Name
 	})
 	for index := range tools {
+		if err := tools[index].authorizationOperation.Validate(); err != nil {
+			return nil, shoal.NewError(
+				shoal.ErrorInvalidArgument,
+				"MCP tool authorization operation is invalid",
+			)
+		}
 		if index > 0 &&
 			tools[index-1].definition.Name == tools[index].definition.Name {
 			return nil, shoal.NewError(

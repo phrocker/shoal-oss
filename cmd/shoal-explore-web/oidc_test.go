@@ -490,6 +490,11 @@ func TestOIDCClaimMappingPreservesIdentityAndDelegation(t *testing.T) {
 	if !operationsContain(decision.AllowedOperations(), auth.OperationIngest) {
 		t.Fatal("contributor mapping did not grant ingest")
 	}
+	if !operationsContain(
+		decision.AllowedOperations(), auth.OperationDelegate,
+	) {
+		t.Fatal("contributor mapping did not grant agent delegation")
+	}
 }
 
 func TestOIDCRejectsMalformedConfiguredIdentityClaims(t *testing.T) {

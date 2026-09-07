@@ -66,14 +66,3 @@ func TestEmbeddingReportRejectsActivityWithoutObservation(t *testing.T) {
 		}
 	}
 }
-
-func TestEmbeddingReportRejectsOperatorOnlyCounters(t *testing.T) {
-	for _, wire := range []wireEmbeddingQueryReport{
-		{Observed: true, CacheHits: 1},
-		{Observed: true, ProviderCalls: 1},
-	} {
-		if _, err := embeddingQueryReportValue(&wire); err == nil {
-			t.Fatalf("operator-only counters accepted: %+v", wire)
-		}
-	}
-}

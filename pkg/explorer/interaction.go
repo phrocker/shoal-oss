@@ -21,6 +21,7 @@ package explorer
 
 import (
 	"context"
+	"reflect"
 	"sort"
 	"time"
 
@@ -32,27 +33,94 @@ import (
 // InteractionSummary describes one recorded or tombstoned interaction session
 // without materializing its subgraph.
 type InteractionSummary struct {
-	SessionID  shoal.ID
-	RecordedAt time.Time
-	Visibility string
-	NodeCount  int
-	EdgeCount  int
-	Deleted    bool
-	DeletedAt  time.Time
+	SessionID                shoal.ID
+	InferenceID              shoal.ID
+	RecordedAt               time.Time
+	SnapshotID               shoal.ID
+	SnapshotAsOf             time.Time
+	AuthorizationFingerprint shoal.ID
+	AuthorizationExpiresAt   time.Time
+	AuthorizationOperation   string
+	EmbeddingSpaceID         shoal.ID
+	EmbeddingSpaceIDs        []shoal.ID
+	Operation                interaction.Operation
+	Actor                    interaction.ActorContext
+	Reason                   interaction.Reason
+	Visibility               string
+	NodeCount                int
+	EdgeCount                int
+	Deleted                  bool
+	DeletedAt                time.Time
 }
 
+// InteractionRecord is the bulk/point authorization view of one durable
+// interaction. TouchedNodeIDs is available even for legacy records whose typed
+// Session payload predates hydration support.
+type InteractionRecord struct {
+	Summary        InteractionSummary
+	Session        interaction.Session
+	TouchedNodeIDs []shoal.ID
+}
+
+type InteractionRecordPage struct {
+	Records   []InteractionRecord
+	NextAfter shoal.ID
+}
+
+const MaxInteractionRecordPageSize uint32 = 1000
+
 type persistedInteraction struct {
-	SessionID  shoal.ID
-	Nodes      []graph.Node
-	Edges      []graph.Edge
-	Visibility string
-	RecordedAt time.Time
-	Deleted    bool
-	DeletedAt  time.Time
+	SessionID                shoal.ID
+	Session                  interaction.Session
+	SnapshotID               shoal.ID
+	SnapshotAsOf             time.Time
+	AuthorizationFingerprint shoal.ID
+	AuthorizationExpiresAt   time.Time
+	AuthorizationOperation   string
+	EmbeddingSpaceID         shoal.ID
+	EmbeddingSpaceIDs        []shoal.ID
+	Operation                interaction.Operation
+	Actor                    interaction.ActorContext
+	Reason                   interaction.Reason
+	Nodes                    []graph.Node
+	Edges                    []graph.Edge
+	Visibility               string
+	RecordedAt               time.Time
+	Deleted                  bool
+	DeletedAt                time.Time
 }
 
 type persistedInteractionSink struct {
 	CheckedAt time.Time
+}
+
+// InteractionWriter is the durable append boundary consumed by production
+// inference recorders. Implementations must fail closed on an unavailable
+// sink and preserve indeterminate-commit errors unless the exact write can be
+// read back.
+type InteractionWriter interface {
+	EnsureInteractionSink(context.Context) error
+	RecordInteraction(context.Context, interaction.Session) error
+}
+
+// InteractionResultWriter extends InteractionWriter for product adapters that
+// must receive the exact canonical session accepted for persistence.
+type InteractionResultWriter interface {
+	InteractionWriter
+	RecordInteractionResult(
+		context.Context, interaction.Session,
+	) (interaction.Session, error)
+}
+
+// InteractionReader is the explicit opt-in surface for derived interaction
+// data. These methods are intentionally absent from Client, so source
+// retrieval cannot begin returning derived nodes by interface expansion.
+type InteractionReader interface {
+	Interactions(context.Context) ([]InteractionSummary, error)
+	InteractionRecords(context.Context) ([]InteractionRecord, error)
+	InteractionRecord(context.Context, shoal.ID) (InteractionRecord, error)
+	Interaction(context.Context, shoal.ID) (interaction.Session, error)
+	InteractionSubgraph(context.Context, shoal.ID) (Neighborhood, error)
 }
 
 // EnsureInteractionSink verifies at setup time that this corpus can durably
@@ -75,7 +143,7 @@ func (e *Explorer) EnsureInteractionSink(ctx context.Context) error {
 				"inference requires a writable interaction sink",
 		)
 	}
-	if err := e.writeRecord(
+	if err := e.writeInteractionRecord(
 		interactionSinkRow,
 		embeddedRecordInteractionSink,
 		persistedInteractionSink{CheckedAt: time.Now().UTC()},
@@ -94,69 +162,354 @@ func (e *Explorer) EnsureInteractionSink(ctx context.Context) error {
 // interaction.* nodes and edges in this corpus.
 //
 // The record's visibility is the conjunction of every visibility label of
-// every source node the session touched, retrieved as well as cited. It is
-// never derived from the asker's grants. If any touched node cannot be
-// resolved, nothing is written.
+// every source node and edge retained by the session's retrieved/cited
+// evidence, plus any producer-required output restriction. It is never derived
+// from the asker's grants. If any touched source cannot be resolved, nothing is
+// written.
 func (e *Explorer) RecordInteraction(
 	ctx context.Context, session interaction.Session,
 ) error {
+	_, err := e.recordInteraction(ctx, session)
+	return err
+}
+
+func (e *Explorer) recordInteraction(
+	ctx context.Context, session interaction.Session,
+) (interaction.Session, error) {
 	if err := contextError(ctx); err != nil {
-		return err
+		return interaction.Session{}, err
 	}
-	if err := session.Validate(); err != nil {
-		return err
+	canonical, err := session.Canonical()
+	if err != nil {
+		return interaction.Session{}, err
 	}
+	session = canonical
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if err := e.requireOpen(); err != nil {
-		return err
+		return interaction.Session{}, err
 	}
 	if err := e.requireWritableLocked(); err != nil {
-		return err
+		return interaction.Session{}, err
 	}
 	if err := e.ensureGraphLocked(); err != nil {
-		return err
+		return interaction.Session{}, err
+	}
+	if _, exists := e.interactions[session.ID]; !exists {
+		if err := e.reconcilePersistedInteractionLocked(session.ID); err != nil {
+			return interaction.Session{}, err
+		}
 	}
 	if existing, ok := e.interactions[session.ID]; ok {
-		if existing.Deleted {
-			return shoal.NewError(
-				shoal.ErrorConflict,
-				"interaction session ID was explicitly deleted and cannot be reused",
-			)
-		}
-		return shoal.NewError(
-			shoal.ErrorConflict, "interaction session ID already exists")
+		return interactionRetryResult(*existing, session)
 	}
 	// Sessions and folds are distinct maps but share one node namespace in the
 	// corpus graph, so an ID taken by either would silently overwrite the other
 	// during a graph rebuild and leave two records claiming one identity.
 	if _, ok := e.folds[session.ID]; ok {
-		return shoal.NewError(
+		return interaction.Session{}, shoal.NewError(
 			shoal.ErrorConflict,
 			"interaction session ID is already used by a fold",
 		)
 	}
-	subgraph, err := session.Subgraph(e.visibilityResolverLocked())
+	subgraph, err := session.SubgraphWithEvidence(
+		e.visibilityResolverLocked(), e.edgeVisibilityResolverLocked())
 	if err != nil {
-		return err
+		return interaction.Session{}, err
+	}
+	reservedNodes := append([]graph.Node(nil), subgraph.Nodes...)
+	reservedNodes = append(reservedNodes, graph.Node{
+		ID: interaction.TombstoneID(session.ID),
+	})
+	if err := e.requireInteractionGraphIDsAvailableLocked(
+		reservedNodes, subgraph.Edges,
+	); err != nil {
+		return interaction.Session{}, err
 	}
 	record := persistedInteraction{
-		SessionID:  session.ID,
+		SessionID:                session.ID,
+		Session:                  session,
+		SnapshotID:               session.SnapshotID,
+		SnapshotAsOf:             session.SnapshotAsOf,
+		AuthorizationFingerprint: session.AuthorizationFingerprint,
+		AuthorizationExpiresAt:   session.AuthorizationExpiresAt,
+		AuthorizationOperation:   session.AuthorizationOperation,
+		EmbeddingSpaceID:         session.EmbeddingSpaceID,
+		EmbeddingSpaceIDs: append(
+			[]shoal.ID(nil), session.EmbeddingSpaceIDs...),
+		Operation:  session.Operation,
+		Actor:      session.Actor,
+		Reason:     session.Reason,
 		Nodes:      subgraph.Nodes,
 		Edges:      subgraph.Edges,
 		Visibility: interaction.Expression(subgraph.Visibility),
 		RecordedAt: session.RecordedAt.UTC(),
 	}
+
 	if err := validatePersistedInteraction(record); err != nil {
-		return err
+		return interaction.Session{}, err
 	}
-	if err := e.writeRecord(
+	accepted, err := e.createInteractionRecord(
 		interactionRecordRow(session.ID), embeddedRecordInteraction, record,
-	); err != nil {
+	)
+	if err != nil {
+		return interaction.Session{}, err
+	}
+	if !accepted {
+		if err := e.reconcilePersistedInteractionLocked(session.ID); err != nil {
+			return interaction.Session{}, err
+		}
+		existing, ok := e.interactions[session.ID]
+		if !ok {
+			return interaction.Session{}, shoal.NewError(
+				shoal.ErrorUnavailable,
+				"interaction create was rejected without a durable winner",
+			)
+		}
+		return interactionRetryResult(*existing, session)
+	}
+	e.reserveInteractionRecordGraphIDsLocked(
+		record.SessionID, record.Nodes, record.Edges)
+	e.interactionOrder = insertOrderedID(e.interactionOrder, session.ID)
+	e.interactions[session.ID] = &record
+	if err := e.rebuildCurrentGraphLocked(); err != nil {
+		return interaction.Session{}, MarkCommittedInteraction(err)
+	}
+	if err := contextError(ctx); err != nil {
+		return interaction.Session{}, MarkCommittedInteraction(err)
+	}
+	return cloneInteractionSession(record.Session), nil
+}
+
+func (e *Explorer) requireInteractionGraphIDsAvailableLocked(
+	nodes []graph.Node, edges []graph.Edge,
+) error {
+	for _, node := range nodes {
+		if _, exists := e.interactionNodeIDs[node.ID]; exists {
+			return shoal.NewError(
+				shoal.ErrorConflict,
+				"interaction node ID is already reserved "+string(node.ID),
+			)
+		}
+		if existing, ok := e.graphNodes[node.ID]; ok {
+			return shoal.NewError(
+				shoal.ErrorConflict,
+				"interaction node ID collides with existing graph node "+
+					string(existing.ID),
+			)
+		}
+	}
+	for _, edge := range edges {
+		if _, exists := e.interactionEdgeIDs[edge.ID]; exists {
+			return shoal.NewError(
+				shoal.ErrorConflict,
+				"interaction edge ID is already reserved "+string(edge.ID),
+			)
+		}
+		if existing, ok := e.graphEdges[edge.ID]; ok {
+			return shoal.NewError(
+				shoal.ErrorConflict,
+				"interaction edge ID collides with existing graph edge "+
+					string(existing.ID),
+			)
+		}
+	}
+	return nil
+}
+
+func (e *Explorer) requireSourceGraphIDsAvailableLocked(
+	nodes []graph.Node, edges []graph.Edge,
+) error {
+	for _, node := range nodes {
+		if _, exists := e.interactionNodeIDs[node.ID]; exists {
+			return shoal.NewError(
+				shoal.ErrorConflict,
+				"source node ID collides with an interaction node",
+			)
+		}
+	}
+	for _, edge := range edges {
+		if _, exists := e.interactionEdgeIDs[edge.ID]; exists {
+			return shoal.NewError(
+				shoal.ErrorConflict,
+				"source edge ID collides with an interaction edge",
+			)
+		}
+	}
+	return nil
+}
+
+func (e *Explorer) reserveInteractionGraphIDsLocked(
+	nodes []graph.Node, edges []graph.Edge,
+) {
+	for _, node := range nodes {
+		e.interactionNodeIDs[node.ID] = struct{}{}
+	}
+	for _, edge := range edges {
+		e.interactionEdgeIDs[edge.ID] = struct{}{}
+	}
+}
+
+func (e *Explorer) reserveInteractionRecordGraphIDsLocked(
+	recordID shoal.ID, nodes []graph.Node, edges []graph.Edge,
+) {
+	e.reserveInteractionGraphIDsLocked(nodes, edges)
+	e.interactionNodeIDs[recordID] = struct{}{}
+	e.interactionNodeIDs[interaction.TombstoneID(recordID)] = struct{}{}
+}
+
+func (e *Explorer) reconcilePersistedInteractionLocked(
+	sessionID shoal.ID,
+) error {
+	record, found, err := e.lookupPersistedInteraction(sessionID)
+	if err != nil || !found {
 		return err
 	}
-	e.interactions[session.ID] = &record
-	return e.rebuildCurrentGraphLocked()
+	if current, ok := e.interactions[sessionID]; ok {
+		if persistedInteractionsEqual(*current, record) ||
+			(current.Deleted && !record.Deleted) {
+			return nil
+		}
+		if !current.Deleted && !record.Deleted {
+			return shoal.NewError(
+				shoal.ErrorConflict,
+				"durable interaction session has different live content",
+			)
+		}
+	}
+	copy := record
+	e.reserveInteractionRecordGraphIDsLocked(
+		copy.SessionID, copy.Nodes, copy.Edges)
+	e.interactionOrder = insertOrderedID(e.interactionOrder, sessionID)
+	e.interactions[sessionID] = &copy
+	if err := e.rebuildCurrentGraphLocked(); err != nil {
+		return MarkCommittedInteraction(err)
+	}
+	return nil
+}
+
+func (e *Explorer) reconcilePersistedFoldLocked(foldID shoal.ID) error {
+	record, found, err := e.lookupPersistedFold(foldID)
+	if err != nil || !found {
+		return err
+	}
+	if current, ok := e.folds[foldID]; ok {
+		if persistedFoldsEqual(*current, record) ||
+			(current.Deleted && !record.Deleted) {
+			return nil
+		}
+		if !current.Deleted && !record.Deleted {
+			return shoal.NewError(
+				shoal.ErrorConflict,
+				"durable fold has different live content",
+			)
+		}
+	}
+	copy := record
+	e.reserveInteractionRecordGraphIDsLocked(
+		copy.FoldID, copy.Nodes, copy.Edges)
+	e.foldOrder = insertOrderedID(e.foldOrder, foldID)
+	e.folds[foldID] = &copy
+	if err := e.rebuildCurrentGraphLocked(); err != nil {
+		return MarkCommittedInteraction(err)
+	}
+	return nil
+}
+
+func persistedInteractionsEqual(
+	left, right persistedInteraction,
+) bool {
+	switch {
+	case left.Session.ID == "" && right.Session.ID == "":
+	case left.Session.ID == "" || right.Session.ID == "":
+		return false
+	default:
+		leftSession, leftErr := left.Session.Canonical()
+		rightSession, rightErr := right.Session.Canonical()
+		if leftErr != nil || rightErr != nil {
+			return false
+		}
+		left.Session = leftSession
+		right.Session = rightSession
+	}
+	if len(left.Nodes) == 0 {
+		left.Nodes = nil
+	}
+	if len(right.Nodes) == 0 {
+		right.Nodes = nil
+	}
+	if len(left.Edges) == 0 {
+		left.Edges = nil
+	}
+	if len(right.Edges) == 0 {
+		right.Edges = nil
+	}
+	return reflect.DeepEqual(left, right)
+}
+
+func interactionRetryResult(
+	existing persistedInteraction, session interaction.Session,
+) (interaction.Session, error) {
+	if existing.Deleted {
+		return interaction.Session{}, shoal.NewError(
+			shoal.ErrorConflict,
+			"interaction session ID was explicitly deleted and cannot be reused",
+		)
+	}
+	if equivalentInteractionRetry(existing.Session, session) {
+		return cloneInteractionSession(existing.Session), nil
+	}
+	return interaction.Session{}, shoal.NewError(
+		shoal.ErrorConflict,
+		"interaction session ID already exists with different content",
+	)
+}
+
+func persistedFoldsEqual(left, right persistedFold) bool {
+	leftFold, leftErr := (interaction.Fold{
+		Members: left.Members, SummaryDigest: left.SummaryDigest,
+		FoldedAt: left.FoldedAt,
+	}).Canonical()
+	rightFold, rightErr := (interaction.Fold{
+		Members: right.Members, SummaryDigest: right.SummaryDigest,
+		FoldedAt: right.FoldedAt,
+	}).Canonical()
+	if leftErr != nil || rightErr != nil {
+		return false
+	}
+	left.Members = leftFold.Members
+	right.Members = rightFold.Members
+	if len(left.Nodes) == 0 {
+		left.Nodes = nil
+	}
+	if len(right.Nodes) == 0 {
+		right.Nodes = nil
+	}
+	if len(left.Edges) == 0 {
+		left.Edges = nil
+	}
+	if len(right.Edges) == 0 {
+		right.Edges = nil
+	}
+	return reflect.DeepEqual(left, right)
+}
+
+// RecordInteractionResult records a session and returns the exact canonical
+// value accepted for persistence. The returned value is independently owned.
+func (e *Explorer) RecordInteractionResult(
+	ctx context.Context, session interaction.Session,
+) (interaction.Session, error) {
+	return e.recordInteraction(ctx, session)
+}
+
+func equivalentInteractionRetry(
+	existing interaction.Session,
+	candidate interaction.Session,
+) bool {
+	candidate.RecordedAt = existing.RecordedAt
+	left, leftErr := existing.Canonical()
+	right, rightErr := candidate.Canonical()
+	return leftErr == nil && rightErr == nil && reflect.DeepEqual(left, right)
 }
 
 // DeleteInteraction removes one interaction session's nodes and edges and
@@ -179,6 +532,9 @@ func (e *Explorer) DeleteInteraction(
 		return interaction.Tombstone{}, err
 	}
 	if err := e.requireWritableLocked(); err != nil {
+		return interaction.Tombstone{}, err
+	}
+	if err := e.reconcilePersistedInteractionLocked(sessionID); err != nil {
 		return interaction.Tombstone{}, err
 	}
 	existing, ok := e.interactions[sessionID]
@@ -215,8 +571,26 @@ func (e *Explorer) DeleteInteraction(
 	if err != nil {
 		return interaction.Tombstone{}, err
 	}
+	if existingNode, exists := e.graphNodes[node.ID]; exists {
+		return interaction.Tombstone{}, shoal.NewError(
+			shoal.ErrorConflict,
+			"interaction tombstone ID collides with existing graph node "+
+				string(existingNode.ID),
+		)
+	}
 	record := persistedInteraction{
-		SessionID:  sessionID,
+		SessionID:                sessionID,
+		SnapshotID:               existing.SnapshotID,
+		SnapshotAsOf:             existing.SnapshotAsOf,
+		AuthorizationFingerprint: existing.AuthorizationFingerprint,
+		AuthorizationExpiresAt:   existing.AuthorizationExpiresAt,
+		AuthorizationOperation:   existing.AuthorizationOperation,
+		EmbeddingSpaceID:         existing.EmbeddingSpaceID,
+		EmbeddingSpaceIDs: append(
+			[]shoal.ID(nil), existing.EmbeddingSpaceIDs...),
+		Operation:  existing.Operation,
+		Actor:      existing.Actor,
+		Reason:     existing.Reason,
 		Nodes:      []graph.Node{node},
 		Visibility: existing.Visibility,
 		RecordedAt: existing.RecordedAt,
@@ -226,14 +600,27 @@ func (e *Explorer) DeleteInteraction(
 	if err := validatePersistedInteraction(record); err != nil {
 		return interaction.Tombstone{}, err
 	}
-	if err := e.writeRecord(
+	accepted, err := e.deleteInteractionRecord(
 		interactionRecordRow(sessionID), embeddedRecordInteraction, record,
-	); err != nil {
+	)
+	if err != nil {
 		return interaction.Tombstone{}, err
 	}
+	if !accepted {
+		if err := e.reconcilePersistedInteractionLocked(sessionID); err != nil {
+			return interaction.Tombstone{}, err
+		}
+		return interaction.Tombstone{}, shoal.NewError(
+			shoal.ErrorConflict,
+			"interaction deletion lost a concurrent durable race",
+		)
+	}
+	e.reserveInteractionRecordGraphIDsLocked(
+		record.SessionID, record.Nodes, record.Edges)
+	e.interactionOrder = insertOrderedID(e.interactionOrder, sessionID)
 	e.interactions[sessionID] = &record
 	if err := e.rebuildCurrentGraphLocked(); err != nil {
-		return interaction.Tombstone{}, err
+		return interaction.Tombstone{}, MarkCommittedInteraction(err)
 	}
 	return tombstone, nil
 }
@@ -252,8 +639,7 @@ func (e *Explorer) Interactions(ctx context.Context) ([]InteractionSummary, erro
 	summaries := make([]InteractionSummary, 0, len(e.interactions))
 	for _, record := range e.interactions {
 		if !record.Deleted {
-			current, err := e.currentSubgraphVisibilityLocked(
-				record.Nodes, record.Edges)
+			current, err := e.currentInteractionVisibilityLocked(record)
 			if err != nil || !visibilityCovered(record.Visibility, current) {
 				// Fail closed at read time: a live session whose evidence was
 				// reclassified to a stricter label after it was recorded is
@@ -263,20 +649,168 @@ func (e *Explorer) Interactions(ctx context.Context) ([]InteractionSummary, erro
 				continue
 			}
 		}
-		summaries = append(summaries, InteractionSummary{
-			SessionID:  record.SessionID,
-			RecordedAt: record.RecordedAt,
-			Visibility: record.Visibility,
-			NodeCount:  len(record.Nodes),
-			EdgeCount:  len(record.Edges),
-			Deleted:    record.Deleted,
-			DeletedAt:  record.DeletedAt,
-		})
+		summaries = append(summaries, interactionSummary(*record))
 	}
 	sort.Slice(summaries, func(i, j int) bool {
 		return shoal.CompareID(summaries[i].SessionID, summaries[j].SessionID) < 0
 	})
 	return summaries, nil
+}
+
+// InteractionRecords returns the explicit derived records in one read pass so
+// authorization wrappers can batch source-policy resolution instead of
+// performing one storage read and one policy round trip per interaction.
+func (e *Explorer) InteractionRecords(
+	ctx context.Context,
+) ([]InteractionRecord, error) {
+	if err := contextError(ctx); err != nil {
+		return nil, err
+	}
+	if err := e.acquireReadWithGraph(); err != nil {
+		return nil, err
+	}
+	defer e.mu.RUnlock()
+	records := make([]InteractionRecord, 0, len(e.interactions))
+	for _, stored := range e.interactions {
+		if !stored.Deleted {
+			current, err := e.currentInteractionVisibilityLocked(stored)
+			if err != nil || !visibilityCovered(stored.Visibility, current) {
+				continue
+			}
+		}
+		records = append(records, interactionRecord(*stored))
+	}
+	sort.Slice(records, func(i, j int) bool {
+		return shoal.CompareID(
+			records[i].Summary.SessionID,
+			records[j].Summary.SessionID,
+		) < 0
+	})
+	return records, nil
+}
+
+// InteractionRecordsPage returns a bounded ID-ordered slice of durable
+// interaction records. NextAfter is the last scanned ID when more records
+// remain, including when stale records were skipped.
+func (e *Explorer) InteractionRecordsPage(
+	ctx context.Context, after shoal.ID, limit uint32,
+) (InteractionRecordPage, error) {
+	if err := contextError(ctx); err != nil {
+		return InteractionRecordPage{}, err
+	}
+	if err := shoal.ValidateOptionalID(
+		"interaction page cursor", after,
+	); err != nil {
+		return InteractionRecordPage{}, err
+	}
+	if limit == 0 || limit > MaxInteractionRecordPageSize {
+		return InteractionRecordPage{}, shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			"interaction page limit is outside its bound",
+		)
+	}
+	if err := e.acquireReadWithGraph(); err != nil {
+		return InteractionRecordPage{}, err
+	}
+	defer e.mu.RUnlock()
+	start := sort.Search(len(e.interactionOrder), func(index int) bool {
+		return shoal.CompareID(e.interactionOrder[index], after) > 0
+	})
+	ids := e.interactionOrder[start:]
+	page := InteractionRecordPage{
+		Records: make([]InteractionRecord, 0, limit),
+	}
+	maxScanned := int(limit) * 8
+	for index, id := range ids {
+		if index >= maxScanned || len(page.Records) >= int(limit) {
+			page.NextAfter = ids[index-1]
+			break
+		}
+		stored := e.interactions[id]
+		if !stored.Deleted {
+			current, err := e.currentInteractionVisibilityLocked(stored)
+			if err != nil || !visibilityCovered(stored.Visibility, current) {
+				continue
+			}
+		}
+		page.Records = append(page.Records, interactionRecord(*stored))
+		if index+1 < len(ids) &&
+			len(page.Records) == int(limit) {
+			page.NextAfter = id
+		}
+	}
+	return page, nil
+}
+
+func insertOrderedID(values []shoal.ID, id shoal.ID) []shoal.ID {
+	index := sort.Search(len(values), func(index int) bool {
+		return shoal.CompareID(values[index], id) >= 0
+	})
+	if index < len(values) && values[index] == id {
+		return values
+	}
+	values = append(values, "")
+	copy(values[index+1:], values[index:])
+	values[index] = id
+	return values
+}
+
+// InteractionRecord returns one explicit derived record without scanning the
+// durable interaction history.
+func (e *Explorer) InteractionRecord(
+	ctx context.Context, sessionID shoal.ID,
+) (InteractionRecord, error) {
+	if err := contextError(ctx); err != nil {
+		return InteractionRecord{}, err
+	}
+	if err := shoal.ValidateRequiredID(
+		"interaction session ID", sessionID,
+	); err != nil {
+		return InteractionRecord{}, err
+	}
+	if err := e.acquireReadWithGraph(); err != nil {
+		return InteractionRecord{}, err
+	}
+	defer e.mu.RUnlock()
+	stored, ok := e.interactions[sessionID]
+	if !ok {
+		return InteractionRecord{}, shoal.NewError(
+			shoal.ErrorNotFound, "interaction session not found")
+	}
+	if !stored.Deleted {
+		current, err := e.currentInteractionVisibilityLocked(stored)
+		if err != nil {
+			return InteractionRecord{}, err
+		}
+		if !visibilityCovered(stored.Visibility, current) {
+			return InteractionRecord{}, staleDerivedVisibilityError()
+		}
+	}
+	return interactionRecord(*stored), nil
+}
+
+// Interaction returns the typed, redacted session record. This is an explicit
+// derived-data view: default retrieval never reaches it. Source visibility is
+// re-evaluated before hydration, so a later source tightening or revocation
+// fails closed rather than serving the record under its observed label.
+func (e *Explorer) Interaction(
+	ctx context.Context, sessionID shoal.ID,
+) (interaction.Session, error) {
+	record, err := e.InteractionRecord(ctx, sessionID)
+	if err != nil {
+		return interaction.Session{}, err
+	}
+	if record.Summary.Deleted {
+		return interaction.Session{}, shoal.NewError(
+			shoal.ErrorConflict, "interaction session was explicitly deleted")
+	}
+	if record.Session.ID == "" {
+		return interaction.Session{}, shoal.NewError(
+			shoal.ErrorUnavailable,
+			"legacy interaction record has no typed session payload",
+		)
+	}
+	return record.Session, nil
 }
 
 // InteractionSubgraph returns one recorded session's nodes and edges. This is
@@ -302,8 +836,7 @@ func (e *Explorer) InteractionSubgraph(
 			shoal.ErrorNotFound, "interaction session not found")
 	}
 	if !record.Deleted {
-		current, err := e.currentSubgraphVisibilityLocked(
-			record.Nodes, record.Edges)
+		current, err := e.currentInteractionVisibilityLocked(record)
 		if err != nil {
 			return Neighborhood{}, err
 		}
@@ -351,6 +884,94 @@ func (e *Explorer) visibilityResolverLocked() interaction.VisibilityResolver {
 		}
 		return interaction.NodeVisibility(node)
 	}
+}
+
+// edgeVisibilityResolverLocked is the edge counterpart to
+// visibilityResolverLocked. Unknown and interaction edges fail closed.
+func (e *Explorer) edgeVisibilityResolverLocked() interaction.EdgeVisibilityResolver {
+	return func(id shoal.ID) ([]string, error) {
+		edge, ok := e.graphEdges[id]
+		if !ok {
+			return nil, shoal.NewError(
+				shoal.ErrorUnavailable,
+				"interaction evidence edge "+string(id)+
+					" is no longer in the corpus graph")
+		}
+		if interaction.IsInteractionEdgeType(edge.Type) {
+			return nil, shoal.NewError(
+				shoal.ErrorUnavailable,
+				"interaction cannot treat another interaction edge as source evidence")
+		}
+		return interaction.EdgeVisibility(edge)
+	}
+}
+
+func (e *Explorer) currentInteractionVisibilityLocked(
+	record *persistedInteraction,
+) (string, error) {
+	if record == nil {
+		return "", shoal.NewError(
+			shoal.ErrorUnavailable, "interaction record is unavailable")
+	}
+	current, err := e.currentSubgraphVisibilityLocked(
+		record.Nodes, record.Edges)
+	if err != nil {
+		return "", err
+	}
+	nodeLabels, err := interaction.ParseVisibility(current)
+	if err != nil {
+		return "", err
+	}
+	edgeIDs := record.Session.TouchedEdgeIDs()
+	edgeSets := make([][]string, 0, len(edgeIDs)+2)
+	edgeSets = append(edgeSets, nodeLabels, record.Session.RequiredVisibility)
+	resolveEdge := e.edgeVisibilityResolverLocked()
+	for _, id := range edgeIDs {
+		labels, err := resolveEdge(id)
+		if err != nil {
+			return "", err
+		}
+		edgeSets = append(edgeSets, labels)
+	}
+	visibility, err := interaction.Conjoin(edgeSets...)
+	if err != nil {
+		return "", err
+	}
+	return interaction.Expression(visibility), nil
+}
+
+func (e *Explorer) currentFoldVisibilityLocked(
+	record *persistedFold,
+) (string, error) {
+	if record == nil {
+		return "", shoal.NewError(
+			shoal.ErrorUnavailable, "fold record is unavailable")
+	}
+	current, err := e.currentSubgraphVisibilityLocked(
+		record.Nodes, record.Edges)
+	if err != nil {
+		return "", err
+	}
+	nodeLabels, err := interaction.ParseVisibility(current)
+	if err != nil {
+		return "", err
+	}
+	edgeSets := make([][]string, 0, len(record.SourceEdgeIDs)+2)
+	edgeSets = append(
+		edgeSets, nodeLabels, record.RequiredVisibility)
+	resolveEdge := e.edgeVisibilityResolverLocked()
+	for _, id := range record.SourceEdgeIDs {
+		labels, err := resolveEdge(id)
+		if err != nil {
+			return "", err
+		}
+		edgeSets = append(edgeSets, labels)
+	}
+	visibility, err := interaction.Conjoin(edgeSets...)
+	if err != nil {
+		return "", err
+	}
+	return interaction.Expression(visibility), nil
 }
 
 // currentSubgraphVisibilityLocked re-derives, from the current corpus graph,
@@ -527,12 +1148,65 @@ func validatePersistedInteraction(record persistedInteraction) error {
 		return shoal.NewError(
 			shoal.ErrorInternal, "stored interaction time is missing")
 	}
+	if record.Operation != "" {
+		if err := record.Operation.Validate(); err != nil {
+			return err
+		}
+	}
+	if err := record.Actor.Validate(); err != nil {
+		return err
+	}
+	if err := record.Reason.Validate(); err != nil {
+		return err
+	}
 	if _, err := interaction.ParseVisibility(record.Visibility); err != nil {
 		return err
 	}
 	if record.Deleted && record.DeletedAt.IsZero() {
 		return shoal.NewError(
 			shoal.ErrorInternal, "stored interaction deletion time is missing")
+	}
+	if !record.Deleted && record.Session.ID != "" {
+		if err := record.Session.Validate(); err != nil {
+			return err
+		}
+		if record.Session.ID != record.SessionID ||
+			!record.Session.RecordedAt.UTC().Equal(record.RecordedAt.UTC()) {
+			return shoal.NewError(
+				shoal.ErrorInternal,
+				"stored interaction typed session does not match its envelope",
+			)
+		}
+		if record.Session.SnapshotID != record.SnapshotID ||
+			!record.Session.SnapshotAsOf.UTC().Equal(record.SnapshotAsOf.UTC()) ||
+			record.Session.AuthorizationFingerprint !=
+				record.AuthorizationFingerprint ||
+			!record.Session.AuthorizationExpiresAt.UTC().Equal(
+				record.AuthorizationExpiresAt.UTC()) ||
+			record.Session.AuthorizationOperation !=
+				record.AuthorizationOperation ||
+			record.Session.EmbeddingSpaceID != record.EmbeddingSpaceID ||
+			!equalIDs(
+				record.Session.EmbeddingSpaceIDs,
+				record.EmbeddingSpaceIDs,
+			) {
+			return shoal.NewError(
+				shoal.ErrorInternal,
+				"stored interaction execution pins do not match its envelope",
+			)
+		}
+		if record.Session.Operation != record.Operation ||
+			record.Session.Actor.SubjectID != record.Actor.SubjectID ||
+			record.Session.Actor.ActorID != record.Actor.ActorID ||
+			record.Session.Actor.ClientID != record.Actor.ClientID ||
+			!equalIDs(
+				record.Session.Actor.OnBehalfOf, record.Actor.OnBehalfOf) ||
+			record.Session.Reason != record.Reason {
+			return shoal.NewError(
+				shoal.ErrorInternal,
+				"stored interaction actor metadata does not match its envelope",
+			)
+		}
 	}
 	if len(record.Nodes) == 0 {
 		return shoal.NewError(
@@ -561,4 +1235,117 @@ func validatePersistedInteraction(record persistedInteraction) error {
 		}
 	}
 	return nil
+}
+
+func cloneInteractionSession(session interaction.Session) interaction.Session {
+	cloned := session
+	cloned.Actor = cloneActorContext(session.Actor)
+	cloned.RequiredVisibility = append(
+		[]string(nil), session.RequiredVisibility...)
+	cloned.EmbeddingSpaceIDs = append(
+		[]shoal.ID(nil), session.EmbeddingSpaceIDs...)
+	cloned.SeedNodeIDs = append([]shoal.ID(nil), session.SeedNodeIDs...)
+	cloned.SeedEvidence = cloneEvidenceReferences(session.SeedEvidence)
+	cloned.CitedNodeIDs = append([]shoal.ID(nil), session.CitedNodeIDs...)
+	cloned.CitedEvidence = cloneEvidenceReferences(session.CitedEvidence)
+	cloned.Turns = make([]interaction.Turn, len(session.Turns))
+	for index, turn := range session.Turns {
+		cloned.Turns[index] = turn
+		if turn.ToolCall != nil {
+			call := *turn.ToolCall
+			call.RetrievedNodeIDs = append(
+				[]shoal.ID(nil), turn.ToolCall.RetrievedNodeIDs...)
+			call.RetrievedEvidence = cloneEvidenceReferences(
+				turn.ToolCall.RetrievedEvidence)
+			cloned.Turns[index].ToolCall = &call
+		}
+	}
+	return cloned
+}
+
+func cloneEvidenceReferences(
+	values []interaction.EvidenceReference,
+) []interaction.EvidenceReference {
+	result := make([]interaction.EvidenceReference, len(values))
+	for index, value := range values {
+		canonical, _ := value.Canonical()
+		result[index] = canonical
+	}
+	return result
+}
+
+func interactionSummary(record persistedInteraction) InteractionSummary {
+	summary := InteractionSummary{
+		SessionID:                record.SessionID,
+		RecordedAt:               record.RecordedAt,
+		SnapshotID:               record.SnapshotID,
+		SnapshotAsOf:             record.SnapshotAsOf,
+		AuthorizationFingerprint: record.AuthorizationFingerprint,
+		AuthorizationExpiresAt:   record.AuthorizationExpiresAt,
+		AuthorizationOperation:   record.AuthorizationOperation,
+		EmbeddingSpaceID:         record.EmbeddingSpaceID,
+		EmbeddingSpaceIDs: append(
+			[]shoal.ID(nil), record.EmbeddingSpaceIDs...),
+		Operation:  record.Operation,
+		Actor:      cloneActorContext(record.Actor),
+		Reason:     record.Reason,
+		Visibility: record.Visibility,
+		NodeCount:  len(record.Nodes),
+		EdgeCount:  len(record.Edges),
+		Deleted:    record.Deleted,
+		DeletedAt:  record.DeletedAt,
+	}
+	if record.Operation.HasInference() {
+		summary.InferenceID = interaction.InferenceID(record.SessionID)
+	}
+	return summary
+}
+
+func interactionRecord(record persistedInteraction) InteractionRecord {
+	touched := interaction.TouchedNodes(record.Nodes, record.Edges)
+	ids := append(
+		append([]shoal.ID(nil), touched.RetrievedNodeIDs...),
+		touched.CitedNodeIDs...,
+	)
+	return InteractionRecord{
+		Summary:        interactionSummary(record),
+		Session:        cloneInteractionSession(record.Session),
+		TouchedNodeIDs: dedupeExplorerIDs(ids),
+	}
+}
+
+func dedupeExplorerIDs(ids []shoal.ID) []shoal.ID {
+	if len(ids) == 0 {
+		return nil
+	}
+	seen := make(map[shoal.ID]struct{}, len(ids))
+	result := make([]shoal.ID, 0, len(ids))
+	for _, id := range ids {
+		if _, duplicate := seen[id]; duplicate {
+			continue
+		}
+		seen[id] = struct{}{}
+		result = append(result, id)
+	}
+	sort.Slice(result, func(i, j int) bool {
+		return shoal.CompareID(result[i], result[j]) < 0
+	})
+	return result
+}
+
+func cloneActorContext(actor interaction.ActorContext) interaction.ActorContext {
+	actor.OnBehalfOf = append([]shoal.ID(nil), actor.OnBehalfOf...)
+	return actor
+}
+
+func equalIDs(left, right []shoal.ID) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
 }

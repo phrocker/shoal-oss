@@ -26,6 +26,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
@@ -77,7 +78,11 @@ func publicIngestError(err error) error {
 	default:
 		log.Printf("shoal explorer upload rejected: %v", err)
 	}
-	return shoal.NewError(code, "upload failed")
+	public := shoal.NewError(code, "upload failed")
+	if explorer.IsIndeterminateCommit(err) {
+		return explorer.MarkIndeterminateCommit(public)
+	}
+	return public
 }
 
 func publicUploadValidationError(err error) bool {

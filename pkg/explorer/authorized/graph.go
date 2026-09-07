@@ -21,6 +21,7 @@ package authorized
 
 import (
 	"context"
+	"reflect"
 	"strings"
 	"time"
 
@@ -134,10 +135,71 @@ func (c *Client) Neighborhood(
 	if err != nil {
 		return explorer.Neighborhood{}, err
 	}
+	result, err = c.applyOntologyLens(ctx, result, decision)
+	if err != nil {
+		return explorer.Neighborhood{}, err
+	}
 	if err := guard.Check(ctx); err != nil {
 		return explorer.Neighborhood{}, err
 	}
 	return result, nil
+}
+
+func (c *Client) applyOntologyLens(
+	ctx context.Context,
+	result explorer.Neighborhood,
+	decision auth.Decision,
+) (explorer.Neighborhood, error) {
+	selected, ok := decision.SelectedOntology()
+	if !ok {
+		return result, nil
+	}
+	interpreter := c.ontologyInterpreter
+	if isNilDependency(interpreter) {
+		for _, assertion := range result.Assertions {
+			result.Interpretations = append(result.Interpretations,
+				ontology.UnresolvedInterpretation(
+					assertion, selected, "ontology interpretation is unavailable"))
+		}
+		return result, nil
+	}
+	interpretations, err := interpreter.InterpretAssertions(
+		ctx, result.Assertions, selected)
+	if err != nil {
+		return explorer.Neighborhood{}, directBaseError(err)
+	}
+	if err := validateOntologyInterpretations(
+		result.Assertions, interpretations, selected,
+	); err != nil {
+		return explorer.Neighborhood{}, err
+	}
+	result.Interpretations = interpretations
+	return result, nil
+}
+
+func validateOntologyInterpretations(
+	assertions []ontology.Assertion,
+	interpretations []ontology.AssertionInterpretation,
+	selected ontology.OntologyIdentity,
+) error {
+	if len(interpretations) != len(assertions) {
+		return inconsistentOntologyInterpretation()
+	}
+	for index, interpretation := range interpretations {
+		if interpretation.Reader() != selected ||
+			!reflect.DeepEqual(
+				interpretation.Original(), assertions[index]) {
+			return inconsistentOntologyInterpretation()
+		}
+	}
+	return nil
+}
+
+func inconsistentOntologyInterpretation() error {
+	return shoal.NewError(
+		shoal.ErrorUnavailable,
+		"trusted ontology interpretation is inconsistent",
+	)
 }
 
 func (c *Client) edgeAllows(

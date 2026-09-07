@@ -21,6 +21,7 @@ package explorer
 
 import (
 	"context"
+	"slices"
 	"sort"
 	"time"
 
@@ -73,16 +74,25 @@ type FoldSummary struct {
 	DeletedAt     time.Time
 }
 
+type FoldSummaryPage struct {
+	Folds     []FoldSummary
+	NextAfter shoal.ID
+}
+
+const MaxFoldSummaryPageSize uint32 = 1000
+
 type persistedFold struct {
-	FoldID        shoal.ID
-	Members       []interaction.FoldMember
-	SummaryDigest string
-	Nodes         []graph.Node
-	Edges         []graph.Edge
-	Visibility    string
-	FoldedAt      time.Time
-	Deleted       bool
-	DeletedAt     time.Time
+	FoldID             shoal.ID
+	Members            []interaction.FoldMember
+	SummaryDigest      string
+	Nodes              []graph.Node
+	Edges              []graph.Edge
+	Visibility         string
+	SourceEdgeIDs      []shoal.ID
+	RequiredVisibility []string
+	FoldedAt           time.Time
+	Deleted            bool
+	DeletedAt          time.Time
 }
 
 // FoldInteractions folds one or more recorded sessions into a single derived
@@ -124,6 +134,8 @@ func (e *Explorer) FoldInteractions(
 	}
 
 	members := make([]interaction.FoldMember, 0, len(sessionIDs))
+	var sourceEdgeIDs []shoal.ID
+	var requiredVisibility []string
 	for _, sessionID := range sessionIDs {
 		record, ok := e.interactions[sessionID]
 		if !ok {
@@ -147,6 +159,15 @@ func (e *Explorer) FoldInteractions(
 			CitedNodeIDs:     touched.CitedNodeIDs,
 			Visibility:       visibility,
 		})
+		sourceEdgeIDs = append(
+			sourceEdgeIDs, record.Session.TouchedEdgeIDs()...)
+		requiredVisibility = append(
+			requiredVisibility, record.Session.RequiredVisibility...)
+	}
+	sourceEdgeIDs = dedupeExplorerIDs(sourceEdgeIDs)
+	requiredVisibility, err = interaction.Conjoin(requiredVisibility)
+	if err != nil {
+		return FoldResult{}, err
 	}
 
 	fold := interaction.Fold{
@@ -162,6 +183,11 @@ func (e *Explorer) FoldInteractions(
 	if err != nil {
 		return FoldResult{}, err
 	}
+	if _, exists := e.folds[subgraph.ID]; !exists {
+		if err := e.reconcilePersistedFoldLocked(subgraph.ID); err != nil {
+			return FoldResult{}, err
+		}
+	}
 	if existing, ok := e.folds[subgraph.ID]; ok {
 		return foldIdempotentResult(*existing, subgraph)
 	}
@@ -174,26 +200,54 @@ func (e *Explorer) FoldInteractions(
 			"fold identity is already used by an interaction session",
 		)
 	}
+	reservedNodes := append([]graph.Node(nil), subgraph.Nodes...)
+	reservedNodes = append(reservedNodes, graph.Node{
+		ID: interaction.TombstoneID(subgraph.ID),
+	})
+	if err := e.requireInteractionGraphIDsAvailableLocked(
+		reservedNodes, subgraph.Edges,
+	); err != nil {
+		return FoldResult{}, err
+	}
 	record := persistedFold{
-		FoldID:        subgraph.ID,
-		Members:       canonical.Members,
-		SummaryDigest: canonical.SummaryDigest,
-		Nodes:         subgraph.Nodes,
-		Edges:         subgraph.Edges,
-		Visibility:    interaction.Expression(subgraph.Visibility),
-		FoldedAt:      fold.FoldedAt,
+		FoldID:             subgraph.ID,
+		Members:            canonical.Members,
+		SummaryDigest:      canonical.SummaryDigest,
+		Nodes:              subgraph.Nodes,
+		Edges:              subgraph.Edges,
+		Visibility:         interaction.Expression(subgraph.Visibility),
+		SourceEdgeIDs:      sourceEdgeIDs,
+		RequiredVisibility: requiredVisibility,
+		FoldedAt:           fold.FoldedAt,
 	}
 	if err := validatePersistedFold(record); err != nil {
 		return FoldResult{}, err
 	}
-	if err := e.writeRecord(
+	accepted, err := e.createInteractionRecord(
 		foldRecordRow(record.FoldID), embeddedRecordFold, record,
-	); err != nil {
+	)
+	if err != nil {
 		return FoldResult{}, err
 	}
+	if !accepted {
+		if err := e.reconcilePersistedFoldLocked(record.FoldID); err != nil {
+			return FoldResult{}, err
+		}
+		existing, ok := e.folds[record.FoldID]
+		if !ok {
+			return FoldResult{}, shoal.NewError(
+				shoal.ErrorUnavailable,
+				"fold create was rejected without a durable winner",
+			)
+		}
+		return foldIdempotentResult(*existing, subgraph)
+	}
+	e.reserveInteractionRecordGraphIDsLocked(
+		record.FoldID, record.Nodes, record.Edges)
+	e.foldOrder = insertOrderedID(e.foldOrder, record.FoldID)
 	e.folds[record.FoldID] = &record
 	if err := e.rebuildCurrentGraphLocked(); err != nil {
-		return FoldResult{}, err
+		return FoldResult{}, MarkCommittedInteraction(err)
 	}
 	return FoldResult{
 		FoldID:         record.FoldID,
@@ -237,7 +291,7 @@ func (e *Explorer) RehydrateFold(
 		return interaction.Fold{}, shoal.NewError(
 			shoal.ErrorConflict, "fold was explicitly deleted")
 	}
-	current, err := e.currentSubgraphVisibilityLocked(record.Nodes, record.Edges)
+	current, err := e.currentFoldVisibilityLocked(record)
 	if err != nil {
 		return interaction.Fold{}, err
 	}
@@ -276,8 +330,7 @@ func (e *Explorer) Folds(ctx context.Context) ([]FoldSummary, error) {
 	summaries := make([]FoldSummary, 0, len(e.folds))
 	for _, record := range e.folds {
 		if !record.Deleted {
-			current, err := e.currentSubgraphVisibilityLocked(
-				record.Nodes, record.Edges)
+			current, err := e.currentFoldVisibilityLocked(record)
 			if err != nil || !visibilityCovered(record.Visibility, current) {
 				// Fail closed at read time: a live fold whose evidence was
 				// reclassified to a stricter label after it was folded is
@@ -305,6 +358,60 @@ func (e *Explorer) Folds(ctx context.Context) ([]FoldSummary, error) {
 	return summaries, nil
 }
 
+// FoldsPage returns a bounded ID-ordered slice of fold summaries.
+func (e *Explorer) FoldsPage(
+	ctx context.Context, after shoal.ID, limit uint32,
+) (FoldSummaryPage, error) {
+	if err := contextError(ctx); err != nil {
+		return FoldSummaryPage{}, err
+	}
+	if err := shoal.ValidateOptionalID("fold page cursor", after); err != nil {
+		return FoldSummaryPage{}, err
+	}
+	if limit == 0 || limit > MaxFoldSummaryPageSize {
+		return FoldSummaryPage{}, shoal.NewError(
+			shoal.ErrorInvalidArgument, "fold page limit is outside its bound")
+	}
+	if err := e.acquireReadWithGraph(); err != nil {
+		return FoldSummaryPage{}, err
+	}
+	defer e.mu.RUnlock()
+	start := sort.Search(len(e.foldOrder), func(index int) bool {
+		return shoal.CompareID(e.foldOrder[index], after) > 0
+	})
+	ids := e.foldOrder[start:]
+	page := FoldSummaryPage{Folds: make([]FoldSummary, 0, limit)}
+	maxScanned := int(limit) * 8
+	for index, id := range ids {
+		if index >= maxScanned || len(page.Folds) >= int(limit) {
+			page.NextAfter = ids[index-1]
+			break
+		}
+		record := e.folds[id]
+		if !record.Deleted {
+			current, err := e.currentFoldVisibilityLocked(record)
+			if err != nil || !visibilityCovered(record.Visibility, current) {
+				continue
+			}
+		}
+		page.Folds = append(page.Folds, FoldSummary{
+			FoldID:        record.FoldID,
+			FoldedAt:      record.FoldedAt,
+			Visibility:    record.Visibility,
+			SummaryDigest: record.SummaryDigest,
+			MemberCount:   len(record.Members),
+			NodeCount:     len(record.Nodes),
+			EdgeCount:     len(record.Edges),
+			Deleted:       record.Deleted,
+			DeletedAt:     record.DeletedAt,
+		})
+		if index+1 < len(ids) && len(page.Folds) == int(limit) {
+			page.NextAfter = id
+		}
+	}
+	return page, nil
+}
+
 // FoldSubgraph returns one stored fold's node and edges. This is the explicit
 // traversal entry point for a fold; it is never reached implicitly.
 func (e *Explorer) FoldSubgraph(
@@ -325,8 +432,7 @@ func (e *Explorer) FoldSubgraph(
 		return Neighborhood{}, shoal.NewError(shoal.ErrorNotFound, "fold not found")
 	}
 	if !record.Deleted {
-		current, err := e.currentSubgraphVisibilityLocked(
-			record.Nodes, record.Edges)
+		current, err := e.currentFoldVisibilityLocked(record)
 		if err != nil {
 			return Neighborhood{}, err
 		}
@@ -368,6 +474,9 @@ func (e *Explorer) DeleteFold(
 	if err := e.requireWritableLocked(); err != nil {
 		return interaction.Tombstone{}, err
 	}
+	if err := e.reconcilePersistedFoldLocked(foldID); err != nil {
+		return interaction.Tombstone{}, err
+	}
 	existing, ok := e.folds[foldID]
 	if !ok {
 		return interaction.Tombstone{}, shoal.NewError(
@@ -392,6 +501,13 @@ func (e *Explorer) DeleteFold(
 	if err != nil {
 		return interaction.Tombstone{}, err
 	}
+	if existingNode, exists := e.graphNodes[node.ID]; exists {
+		return interaction.Tombstone{}, shoal.NewError(
+			shoal.ErrorConflict,
+			"fold tombstone ID collides with existing graph node "+
+				string(existingNode.ID),
+		)
+	}
 	// The members are dropped, not retained beside the tombstone: a deleted
 	// fold must not keep a rehydratable copy of what it folded.
 	record := persistedFold{
@@ -405,14 +521,27 @@ func (e *Explorer) DeleteFold(
 	if err := validatePersistedFold(record); err != nil {
 		return interaction.Tombstone{}, err
 	}
-	if err := e.writeRecord(
+	accepted, err := e.deleteInteractionRecord(
 		foldRecordRow(foldID), embeddedRecordFold, record,
-	); err != nil {
+	)
+	if err != nil {
 		return interaction.Tombstone{}, err
 	}
+	if !accepted {
+		if err := e.reconcilePersistedFoldLocked(foldID); err != nil {
+			return interaction.Tombstone{}, err
+		}
+		return interaction.Tombstone{}, shoal.NewError(
+			shoal.ErrorConflict,
+			"fold deletion lost a concurrent durable race",
+		)
+	}
+	e.reserveInteractionRecordGraphIDsLocked(
+		record.FoldID, record.Nodes, record.Edges)
+	e.foldOrder = insertOrderedID(e.foldOrder, foldID)
 	e.folds[foldID] = &record
 	if err := e.rebuildCurrentGraphLocked(); err != nil {
-		return interaction.Tombstone{}, err
+		return interaction.Tombstone{}, MarkCommittedInteraction(err)
 	}
 	return tombstone, nil
 }
@@ -528,6 +657,22 @@ func validatePersistedFold(record persistedFold) error {
 	}
 	if _, err := interaction.ParseVisibility(record.Visibility); err != nil {
 		return err
+	}
+	if !equalIDs(record.SourceEdgeIDs, dedupeExplorerIDs(record.SourceEdgeIDs)) {
+		return shoal.NewError(
+			shoal.ErrorInternal,
+			"stored fold source edge IDs are not canonical",
+		)
+	}
+	requiredVisibility, err := interaction.Conjoin(record.RequiredVisibility)
+	if err != nil {
+		return err
+	}
+	if !slices.Equal(record.RequiredVisibility, requiredVisibility) {
+		return shoal.NewError(
+			shoal.ErrorInternal,
+			"stored fold required visibility is not canonical",
+		)
 	}
 	if record.Deleted && record.DeletedAt.IsZero() {
 		return shoal.NewError(

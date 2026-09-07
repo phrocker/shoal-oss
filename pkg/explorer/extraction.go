@@ -30,6 +30,7 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/extraction"
 	"github.com/phrocker/shoal-oss/pkg/graph"
 	"github.com/phrocker/shoal-oss/pkg/inference"
+	"github.com/phrocker/shoal-oss/pkg/interaction"
 	"github.com/phrocker/shoal-oss/pkg/model"
 	"github.com/phrocker/shoal-oss/pkg/ontology"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
@@ -124,6 +125,11 @@ func validatePersistedExtraction(record persistedExtraction) error {
 		if err := node.Validate(); err != nil {
 			return err
 		}
+		if interaction.IsInteractionID(node.ID) ||
+			interaction.IsInteractionKind(node.Kind) {
+			return fmt.Errorf(
+				"extraction cannot use the reserved interaction node namespace")
+		}
 	}
 	nodes := make(map[shoal.ID]struct{}, len(record.Nodes)+1)
 	nodes[record.DocumentID] = struct{}{}
@@ -133,6 +139,11 @@ func validatePersistedExtraction(record persistedExtraction) error {
 	for _, edge := range record.Edges {
 		if err := edge.Validate(); err != nil {
 			return err
+		}
+		if interaction.IsInteractionID(edge.ID) ||
+			interaction.IsInteractionEdgeType(edge.Type) {
+			return fmt.Errorf(
+				"extraction cannot use the reserved interaction edge namespace")
 		}
 		if _, ok := nodes[edge.From]; !ok {
 			return fmt.Errorf("extraction edge source is outside the extraction graph")
@@ -262,6 +273,11 @@ func (e *Explorer) CommitExtraction(
 	if current.Revision.ID != published.RevisionID {
 		return ExtractionResult{}, shoal.NewError(
 			shoal.ErrorConflict, "document changed before extraction publication")
+	}
+	if err := e.requireSourceGraphIDsAvailableLocked(
+		published.Nodes, published.Edges,
+	); err != nil {
+		return ExtractionResult{}, err
 	}
 	// This stable row overwrite is load-bearing; TestExtractDocumentRerunReusesSkillEntities pins idempotent re-publication.
 	if err := e.writeRecord(

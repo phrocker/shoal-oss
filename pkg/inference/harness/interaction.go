@@ -21,19 +21,18 @@ package harness
 
 import (
 	"context"
+	"reflect"
 	"time"
 
 	"github.com/phrocker/shoal-oss/pkg/interaction"
+	"github.com/phrocker/shoal-oss/pkg/retrieval"
+	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
 // InteractionSink is the durable corpus boundary a graph-backed recorder
-// writes through. *explorer.Explorer implements it.
-type InteractionSink interface {
-	// EnsureInteractionSink must report at setup time, not at first write,
-	// whether interactions can be durably recorded.
-	EnsureInteractionSink(context.Context) error
-	RecordInteraction(context.Context, interaction.Session) error
-}
+// writes through. It aliases the product-level interaction sink so inference,
+// retrieval, chat, and MCP adapters share one persistence contract.
+type InteractionSink = interaction.Sink
 
 // GraphRecorder writes execution records into the corpus graph under the
 // reserved interaction.* namespace.
@@ -53,13 +52,27 @@ func NewGraphRecorder(ctx context.Context, sink InteractionSink) (*GraphRecorder
 	if ctx == nil {
 		return nil, invalid("context is required")
 	}
-	if sink == nil {
+	if isNilInteractionSink(sink) {
 		return nil, invalid("interaction sink is required")
 	}
 	if err := sink.EnsureInteractionSink(ctx); err != nil {
 		return nil, err
 	}
 	return &GraphRecorder{sink: sink, now: time.Now}, nil
+}
+
+func isNilInteractionSink(sink InteractionSink) bool {
+	if sink == nil {
+		return true
+	}
+	value := reflect.ValueOf(sink)
+	switch value.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map,
+		reflect.Pointer, reflect.Slice:
+		return value.IsNil()
+	default:
+		return false
+	}
 }
 
 // SetClock configures the recorder clock so fixture evaluation can be
@@ -102,18 +115,57 @@ func InteractionSession(
 	); err != nil {
 		return interaction.Session{}, err
 	}
+	if err := validateLogicalID(
+		"evaluation snapshot ID", record.SnapshotID,
+	); err != nil {
+		return interaction.Session{}, err
+	}
+	if record.SnapshotAsOf.IsZero() {
+		return interaction.Session{}, invalid("evaluation snapshot time is required")
+	}
+	if err := validateLogicalID(
+		"evaluation authorization fingerprint",
+		record.AuthorizationFingerprint,
+	); err != nil {
+		return interaction.Session{}, err
+	}
+	if record.AuthorizationExpiresAt.IsZero() {
+		return interaction.Session{}, invalid(
+			"evaluation authorization expiry is required")
+	}
+	if (record.EmbeddingSpaceID == "") !=
+		(len(record.EmbeddingSpaceIDs) == 0) {
+		return interaction.Session{}, invalid(
+			"evaluation embedding space aggregate and constituents must be present together")
+	}
+	if len(record.EmbeddingSpaceIDs) > 0 {
+		aggregate, err := retrieval.EmbeddingSpaceSetID(
+			record.EmbeddingSpaceIDs...)
+		if err != nil || aggregate != record.EmbeddingSpaceID {
+			return interaction.Session{}, invalid(
+				"evaluation embedding space identity is not canonical")
+		}
+	}
 	session := interaction.Session{
-		ID:         interaction.SessionID(record.TranscriptID, recordedAt),
-		RecordedAt: recordedAt.UTC(),
+		ID:                       interaction.SessionID(record.TranscriptID, recordedAt),
+		RecordedAt:               recordedAt.UTC(),
+		Operation:                interaction.OperationInference,
+		SnapshotID:               record.SnapshotID,
+		SnapshotAsOf:             record.SnapshotAsOf,
+		AuthorizationFingerprint: record.AuthorizationFingerprint,
+		AuthorizationExpiresAt:   record.AuthorizationExpiresAt,
+		EmbeddingSpaceID:         record.EmbeddingSpaceID,
+		EmbeddingSpaceIDs: append(
+			[]shoal.ID(nil), record.EmbeddingSpaceIDs...),
 		Provenance: interaction.Provenance{
-			Harness:      record.Provenance.Harness(),
-			Provider:     record.Provenance.Provider(),
-			Model:        record.Provenance.Model().Model(),
-			ModelVersion: record.Provenance.Model().Version(),
-			PromptID:     record.Provenance.Prompt().TemplateID(),
-			PromptVer:    record.Provenance.Prompt().Version(),
+			Harness:      interactionIdentifier(record.Provenance.Harness()),
+			Provider:     interactionIdentifier(record.Provenance.Provider()),
+			Model:        interactionIdentifier(record.Provenance.Model().Model()),
+			ModelVersion: interactionIdentifier(record.Provenance.Model().Version()),
+			PromptID:     interactionIdentifier(record.Provenance.Prompt().TemplateID()),
+			PromptVer:    interactionIdentifier(record.Provenance.Prompt().Version()),
 			PromptHash:   record.Provenance.Prompt().Hash(),
-			ToolPolicy:   record.Provenance.ToolPolicy(),
+			ToolPolicy:   interactionIdentifier(record.Provenance.ToolPolicy()),
 		},
 		QueryDigest:   record.QueryDigest,
 		RequestID:     record.RequestID,
@@ -143,4 +195,22 @@ func InteractionSession(
 		return interaction.Session{}, err
 	}
 	return session, nil
+}
+
+func interactionIdentifier(value string) string {
+	if len(value) > interaction.MaxIdentifierBytes {
+		return "sha256:" + interaction.Digest(value)
+	}
+	for index := 0; index < len(value); index++ {
+		c := value[index]
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z',
+			c >= '0' && c <= '9':
+		case c == '_', c == '-', c == '.', c == ':', c == '/', c == '@',
+			c == '+':
+		default:
+			return "sha256:" + interaction.Digest(value)
+		}
+	}
+	return value
 }

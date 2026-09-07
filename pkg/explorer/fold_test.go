@@ -473,11 +473,8 @@ func TestSessionIDCannotCollideWithFoldID(t *testing.T) {
 	colliding.ID = fold.FoldID
 
 	err := corpus.RecordInteraction(ctx, colliding)
-	if err == nil {
-		t.Fatal("recording a session under an existing fold ID succeeded")
-	}
-	if !strings.Contains(err.Error(), "fold") {
-		t.Fatalf("error %q does not explain the fold collision", err)
+	if !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
+		t.Fatalf("recording a session under a reserved fold ID = %v", err)
 	}
 
 	// The fold must still resolve to the fold, not to the session.

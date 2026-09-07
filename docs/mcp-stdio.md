@@ -82,12 +82,19 @@ operation set is read-only:
 `list,read,neighborhood,retrieve,validation`. Generation defaults to `1`, and
 each decision lifetime defaults to `15m`.
 
+Generic interaction evidence is reauthorized with the legacy `retrieve`
+operation. An explicit identity therefore needs `retrieve` for tools whose
+records touch grounded source nodes. A source-free action record needs only
+the exact action operation that its provider enforces. The interaction
+`tool_call` value is provenance metadata, not an `auth.Operation`, and is never
+translated wholesale to fleet `invoke` or `dispatch`.
+
 The launcher configuration is the trusted identity source in stdio v1. The MCP
 server mints and binds a fresh authorization decision with a new request ID for
 every `tools/call`, but every caller connected to the same process uses the same
 configured identity. Stdio cannot independently authenticate remote callers.
-A future HTTP transport is required for independently authenticated per-call
-remote callers.
+Independently authenticated remote callers use the Streamable HTTP `/mcp`
+endpoint mounted by `shoal-explore-web`.
 
 The server enforces a fixed-window, per-process tool-call limit before
 authorization and dispatch. Exceeding the configured per-minute limit returns
@@ -101,10 +108,24 @@ advertised only when that service implements their public capability
 interfaces and any required runtime configuration is active. The embedded
 service currently supplies ingestion, recomputation, and the authorized
 changes feed in addition to the read tools. Extraction is not advertised by
-this launcher because it has no active ontology configuration.
+this launcher because it has no active ontology configuration. The standalone
+stdio launcher does not configure the web command's chat and provenance
+providers, so it does not advertise `shoal.ask` or
+`shoal.provenance.{list,inspect,fold,unfold}`. Those first-party adapters are
+available from the authenticated `/mcp` endpoint in `shoal-explore-web`.
 
-Tool-call recording is not implemented. The server does not claim to record or
-persist MCP invocations.
+Tool-call recording is mandatory and fail-closed. The command verifies the
+durable interaction sink during startup, then records each generic invocation
+as `OperationToolCall` under the same fresh decision used by the tool. Records
+carry the authorization fingerprint and expiry, canonical authorized operation,
+observed snapshot, hashed arguments, and complete retrieved source set. The MCP
+adapter does not supply actor or delegation metadata; the authorized client
+overwrites those fields from the bound decision and derives a hashed
+`AuditPurpose` reason when configured. Generic calls never synthesize inference
+nodes. A mutating tool is admitted to the recorder before dispatch; if its
+post-effect outcome cannot be recorded, the returned error is explicitly
+indeterminate and tells the client to inspect current state before deciding
+whether a retry is safe.
 
 Successful tool results always carry the complete web API wire object in
 `structuredContent`. The server also runs the compatibility text mirror through

@@ -51,6 +51,7 @@ type InitializeResult struct {
 	Capabilities    ServerCapabilities `json:"capabilities"`
 	ServerInfo      Implementation     `json:"serverInfo"`
 	Instructions    string             `json:"instructions,omitempty"`
+	Meta            map[string]any     `json:"_meta,omitempty"`
 }
 
 // EmptyParams accepts no method-specific values while retaining the standard

@@ -169,8 +169,20 @@ func TestExplorerToolHostAllowsFanoutOneMultiHopPath(t *testing.T) {
 
 func TestExplorerToolHostAllowsEmptyRetrieveResult(t *testing.T) {
 	pack, _, _ := fixture(t)
-	client := &boundedClientStub{}
-	host := &ExplorerToolHost{Client: client}
+	constituent, err := retrieval.EmbeddingSpaceIdentityID("space-v3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	spaceID, err := retrieval.EmbeddingSpaceSetID(constituent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &boundedClientStub{retrieveResponse: retrieval.Response{
+		EmbeddingSpaceID:  spaceID,
+		EmbeddingSpaceIDs: []shoal.ID{constituent},
+	}}
+	host := &ExplorerToolHost{
+		Client: client, RetrievalModes: []retrieval.Mode{retrieval.ModeVector}}
 	request, err := NewRetrieveRequest("no hits", 1)
 	if err != nil {
 		t.Fatal(err)
@@ -188,6 +200,13 @@ func TestExplorerToolHostAllowsEmptyRetrieveResult(t *testing.T) {
 	}
 	if len(result.Anchors()) != 0 || !client.retrieve.AsOf.Equal(pack.Snapshot().AsOf()) {
 		t.Fatalf("empty retrieve was not pinned and empty: %#v", result)
+	}
+	if result.EmbeddingSpaceID() != spaceID {
+		t.Fatalf("tool result embedding space = %q", result.EmbeddingSpaceID())
+	}
+	if got := result.EmbeddingSpaceIDs(); len(got) != 1 ||
+		got[0] != constituent {
+		t.Fatalf("tool result embedding constituents = %v", got)
 	}
 }
 

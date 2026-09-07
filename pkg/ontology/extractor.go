@@ -472,6 +472,19 @@ func (r ExtractionResult) Validate() error {
 		if err := validateBoundedMetadata(proposal.Metadata(), r.limits); err != nil {
 			return err
 		}
+		for _, morphism := range proposal.Morphisms() {
+			if uint64(len(morphism.Evidence())) > uint64(r.limits.MaxEvidence) {
+				return invalid("morphism evidence exceeds result limit")
+			}
+			if err := validateBoundedMetadata(morphism.Metadata(), r.limits); err != nil {
+				return err
+			}
+			for _, evidence := range morphism.Evidence() {
+				if err := validateBoundedEvidenceMetadata(evidence, r.limits); err != nil {
+					return err
+				}
+			}
+		}
 		if proposalPayloadBytes(proposal) > uint64(r.limits.MaxPayloadBytes) {
 			return invalid("proposal payload exceeds result limit")
 		}
@@ -1234,6 +1247,30 @@ func (c *payloadCounter) addProposal(proposal GovernedProposal) {
 		c.addString(transition.actor)
 		c.addString(transition.note)
 	}
+	for _, morphism := range proposal.morphisms {
+		c.addString(string(morphism.kind))
+		c.addString(string(morphism.safety))
+		c.addString(string(morphism.source.schemaID))
+		c.addString(string(morphism.source.versionID))
+		c.addString(string(morphism.target.schemaID))
+		c.addString(string(morphism.target.versionID))
+		for _, id := range morphism.sources {
+			c.addString(string(id))
+		}
+		for _, id := range morphism.targets {
+			c.addString(string(id))
+		}
+		c.addString(morphism.discriminator.metadataKey)
+		for _, choice := range morphism.discriminator.choices {
+			c.addString(choice.value)
+			c.addString(string(choice.target))
+		}
+		for _, evidence := range morphism.evidence {
+			c.addEvidence(evidence)
+		}
+		c.addString(morphism.rationale)
+		c.addMetadata(morphism.metadata)
+	}
 }
 
 func proposalPayloadBytes(proposal GovernedProposal) uint64 {
@@ -1246,6 +1283,35 @@ func proposalPayloadBytes(proposal GovernedProposal) uint64 {
 		ontologyVersionPayloadBytes(proposal.proposedVersion)
 	for _, transition := range proposal.transitions {
 		size += uint64(len(transition.actor) + len(transition.note))
+	}
+	for _, morphism := range proposal.morphisms {
+		counter := payloadCounter{limit: ^uint64(0)}
+		counter.addString(string(morphism.kind))
+		counter.addString(string(morphism.safety))
+		counter.addString(string(morphism.source.schemaID))
+		counter.addString(string(morphism.source.versionID))
+		counter.addString(string(morphism.target.schemaID))
+		counter.addString(string(morphism.target.versionID))
+		for _, id := range morphism.sources {
+			counter.addString(string(id))
+		}
+		for _, id := range morphism.targets {
+			counter.addString(string(id))
+		}
+		counter.addString(morphism.discriminator.metadataKey)
+		for _, choice := range morphism.discriminator.choices {
+			counter.addString(choice.value)
+			counter.addString(string(choice.target))
+		}
+		for _, evidence := range morphism.evidence {
+			counter.addEvidence(evidence)
+		}
+		counter.addString(morphism.rationale)
+		counter.addMetadata(morphism.metadata)
+		if counter.exceeded || counter.size > ^uint64(0)-size {
+			return ^uint64(0)
+		}
+		size += counter.size
 	}
 	return size
 }
