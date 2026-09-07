@@ -22,7 +22,6 @@ package fleetevents
 import (
 	"context"
 	"encoding/hex"
-	"reflect"
 
 	"github.com/phrocker/shoal-oss/pkg/explorer/fleet"
 	"github.com/phrocker/shoal-oss/pkg/interaction"
@@ -41,7 +40,7 @@ func NewInteractionAuditor(
 	sink interaction.ResultSink,
 	snapshots fleet.InteractionSnapshotProvider,
 ) (*InteractionAuditor, error) {
-	if isNilInteractionResultSink(sink) {
+	if interaction.IsNilResultSink(sink) {
 		return nil, shoal.NewError(
 			shoal.ErrorInvalidArgument, "interaction result sink is required")
 	}
@@ -163,19 +162,6 @@ func sameFleetReceipt(expected, persisted interaction.Session) bool {
 	}
 	return sameFleetIDs(persisted.SeedNodeIDs, expected.SeedNodeIDs) &&
 		sameFleetEvidence(persisted.SeedEvidence, expected.SeedEvidence)
-}
-
-func isNilInteractionResultSink(sink interaction.ResultSink) bool {
-	if sink == nil {
-		return true
-	}
-	value := reflect.ValueOf(sink)
-	switch value.Kind() {
-	case reflect.Chan, reflect.Func, reflect.Map, reflect.Pointer, reflect.Slice:
-		return value.IsNil()
-	default:
-		return false
-	}
 }
 
 func sameFleetIDs(left, right []shoal.ID) bool {

@@ -109,7 +109,7 @@ func ComposeHosted(ctx context.Context, config HostConfig) (*HostedServices, err
 		return nil, err
 	}
 	trustedInteractions, ok := config.InteractionStorage.(interaction.ResultSink)
-	if !ok || isNilInteractionResultSink(trustedInteractions) {
+	if !ok || interaction.IsNilResultSink(trustedInteractions) {
 		return nil, shoal.NewError(
 			shoal.ErrorInvalidArgument,
 			"fleet event interaction storage must implement interaction.ResultSink")

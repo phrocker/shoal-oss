@@ -58,7 +58,7 @@ func NewRecorder(ctx context.Context, sink ResultSink) (*Recorder, error) {
 		return nil, shoal.NewError(
 			shoal.ErrorInvalidArgument, "context is required")
 	}
-	if isNilSink(sink) {
+	if IsNilResultSink(sink) {
 		return nil, shoal.NewError(
 			shoal.ErrorInvalidArgument, "interaction sink is required")
 	}
@@ -89,7 +89,7 @@ func (r *Recorder) SetClock(now func() time.Time) error {
 func (r *Recorder) Record(
 	ctx context.Context, session Session,
 ) (Session, error) {
-	if r == nil || isNilSink(r.sink) {
+	if r == nil || IsNilResultSink(r.sink) {
 		return Session{}, shoal.NewError(
 			shoal.ErrorInvalidArgument, "interaction recorder is required")
 	}
@@ -107,14 +107,14 @@ func (r *Recorder) Record(
 	return r.sink.RecordInteractionResult(ctx, canonical)
 }
 
-func isNilSink(sink ResultSink) bool {
+// IsNilResultSink reports whether sink is nil or holds a typed nil value.
+func IsNilResultSink(sink ResultSink) bool {
 	if sink == nil {
 		return true
 	}
 	value := reflect.ValueOf(sink)
 	switch value.Kind() {
-	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map,
-		reflect.Pointer, reflect.Slice:
+	case reflect.Chan, reflect.Func, reflect.Map, reflect.Pointer, reflect.Slice:
 		return value.IsNil()
 	default:
 		return false

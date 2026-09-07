@@ -878,7 +878,10 @@ func (a *oidcAuthenticator) authority(
 		}
 		values = trimmed
 	}
-	operationSet := make(map[auth.Operation]struct{}, len(oidcFleetOperations)+len(oidcContributorOperations))
+	operationSet := make(
+		map[auth.Operation]struct{},
+		len(oidcFleetOperations)+len(oidcContributorOperations)+len(oidcReaderOperations),
+	)
 	var operations []auth.Operation
 	if hasMappedValue(values, a.fleetValues) {
 		operations = appendUniqueOperations(
