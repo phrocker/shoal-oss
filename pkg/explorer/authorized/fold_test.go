@@ -27,14 +27,16 @@ import (
 
 	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
+	"github.com/phrocker/shoal-oss/pkg/explorer/authorized"
 	"github.com/phrocker/shoal-oss/pkg/interaction"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
 type postFoldHookStore struct {
 	*explorer.Explorer
-	hook   func()
-	result explorer.FoldResult
+	hook          func()
+	rehydrateHook func()
+	result        explorer.FoldResult
 }
 
 func (s *postFoldHookStore) FoldInteractions(
@@ -49,6 +51,16 @@ func (s *postFoldHookStore) FoldInteractions(
 		}
 	}
 	return result, err
+}
+
+func (s *postFoldHookStore) RehydrateFold(
+	ctx context.Context, foldID shoal.ID,
+) (interaction.Fold, error) {
+	fold, err := s.Explorer.RehydrateFold(ctx, foldID)
+	if err == nil && s.rehydrateHook != nil {
+		s.rehydrateHook()
+	}
+	return fold, err
 }
 
 func TestAuthorizedFoldWithholdsCommittedResultAfterMemberReclassification(
@@ -158,6 +170,73 @@ func TestAuthorizedFoldWithholdsCommittedResultAfterMemberReclassification(
 				ctx, store.result.FoldID,
 			); !shoal.IsErrorCode(err, shoal.ErrorNotFound) {
 				t.Fatalf("reclassified fold rehydration = %v, want not found", err)
+			}
+		})
+	}
+}
+
+func TestAuthorizedFoldMemberReadFailureIsNotConcealed(t *testing.T) {
+	f := newFixture(t)
+	snapshot, err := f.base.Snapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.clock.Set(snapshot.AsOf.Add(time.Second))
+	decision := f.decision(
+		t, "fold-read-failure",
+		nil, nil, allOperations,
+	)
+	ctx := f.context(t, decision)
+	fingerprint, err := auth.AuthorizationFingerprint(decision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := interaction.Session{
+		ID:                       interaction.DerivedID("session", "fold-read-failure"),
+		RecordedAt:               f.clock.Now(),
+		SnapshotID:               shoal.ID(snapshot.ID),
+		SnapshotAsOf:             snapshot.AsOf,
+		AuthorizationFingerprint: shoal.ID(fingerprint.String()),
+		AuthorizationExpiresAt:   decision.AuthenticationExpires(),
+	}
+	if err := f.clientA.RecordInteraction(ctx, session); err != nil {
+		t.Fatal(err)
+	}
+	created, err := f.clientA.FoldInteractions(ctx, explorer.FoldRequest{
+		SessionIDs: []shoal.ID{session.ID},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, test := range []struct {
+		name string
+		call func(context.Context, *authorized.Client) error
+	}{
+		{
+			name: "list",
+			call: func(ctx context.Context, client *authorized.Client) error {
+				_, err := client.Folds(ctx)
+				return err
+			},
+		},
+		{
+			name: "rehydrate",
+			call: func(ctx context.Context, client *authorized.Client) error {
+				_, err := client.RehydrateFold(ctx, created.FoldID)
+				return err
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			cancelCtx, cancel := context.WithCancel(ctx)
+			store := &postFoldHookStore{Explorer: f.base}
+			store.rehydrateHook = cancel
+			client := f.newClient(
+				t, store, f.store, f.sourceA, f.policyA, nil)
+			err := test.call(cancelCtx, client)
+			if !shoal.IsErrorCode(err, shoal.ErrorCanceled) {
+				t.Fatalf("member read failure = %v, want canceled", err)
 			}
 		})
 	}

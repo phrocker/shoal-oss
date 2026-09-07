@@ -19,6 +19,7 @@
 package authorized
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -26,6 +27,30 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/interaction"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
+
+func TestFoldStoreNeverPromotesBase(t *testing.T) {
+	base, err := explorer.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer base.Close()
+	trusted, err := explorer.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer trusted.Close()
+	client := &Client{base: base, foldSource: trusted}
+	store, err := client.foldStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if store != trusted {
+		t.Fatal("untrusted base was promoted to the fold store")
+	}
+	if _, err := store.Folds(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
 
 func TestValidateDurableFoldResultAcceptsLegacyIdentity(t *testing.T) {
 	foldedAt := time.Unix(1700000000, 0).UTC()

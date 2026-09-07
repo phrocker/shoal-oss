@@ -167,6 +167,7 @@ func (f *fixture) newClient(
 		InteractionReader:      trustedInteractionReader(base),
 		SnapshotValidator:      trustedSnapshotValidator(base),
 		DerivedAssertionReader: trustedDerivedAssertionReader(base),
+		FoldStore:              trustedFoldStore(base),
 		Resolver:               f.authority.Resolver(),
 		PolicySelector:         selector,
 		EdgePolicySelector:     edgeSelector,
@@ -205,6 +206,11 @@ func trustedDerivedAssertionReader(
 ) authorized.DerivedAssertionReader {
 	reader, _ := base.(authorized.DerivedAssertionReader)
 	return reader
+}
+
+func trustedFoldStore(base explorer.Client) authorized.FoldStore {
+	store, _ := base.(authorized.FoldStore)
+	return store
 }
 
 func (f *fixture) decision(

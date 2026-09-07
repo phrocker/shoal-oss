@@ -28,12 +28,6 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
-type foldStore interface {
-	FoldInteractions(context.Context, explorer.FoldRequest) (explorer.FoldResult, error)
-	RehydrateFold(context.Context, shoal.ID) (interaction.Fold, error)
-	Folds(context.Context) ([]explorer.FoldSummary, error)
-}
-
 // FoldInteractions creates a native provenance fold only after every named
 // session and all source evidence it touched have been authorized for the
 // current caller.
@@ -170,7 +164,11 @@ func (c *Client) Folds(ctx context.Context) ([]explorer.FoldSummary, error) {
 			}
 			return nil, directBaseError(readErr)
 		}
-		if c.foldMembersVisible(ctx, fold) {
+		allowed, authorizationErr := c.foldMembersVisible(ctx, fold)
+		if authorizationErr != nil {
+			return nil, authorizationErr
+		}
+		if allowed {
 			visible = append(visible, value)
 		}
 	}
@@ -202,7 +200,11 @@ func (c *Client) RehydrateFold(
 		}
 		return interaction.Fold{}, directBaseError(err)
 	}
-	if !c.foldMembersVisible(ctx, fold) {
+	allowed, err := c.foldMembersVisible(ctx, fold)
+	if err != nil {
+		return interaction.Fold{}, err
+	}
+	if !allowed {
 		return interaction.Fold{}, auth.ObjectNotFound()
 	}
 	if err := guard.Check(ctx); err != nil {
@@ -213,22 +215,24 @@ func (c *Client) RehydrateFold(
 
 func (c *Client) foldMembersVisible(
 	ctx context.Context, fold interaction.Fold,
-) bool {
+) (bool, error) {
 	for _, member := range fold.Members {
 		if _, err := c.Interaction(ctx, member.SessionID); err != nil {
-			return false
+			if shoal.IsErrorCode(err, shoal.ErrorNotFound) {
+				return false, nil
+			}
+			return false, err
 		}
 	}
-	return true
+	return true, nil
 }
 
-func (c *Client) foldStore() (foldStore, error) {
-	store, ok := c.base.(foldStore)
-	if !ok || isNilDependency(store) {
+func (c *Client) foldStore() (FoldStore, error) {
+	if isNilDependency(c.foldSource) {
 		return nil, shoal.NewError(
 			shoal.ErrorUnavailable,
-			"underlying Explorer has no provenance fold store",
+			"trusted provenance fold store is unavailable",
 		)
 	}
-	return store, nil
+	return c.foldSource, nil
 }
