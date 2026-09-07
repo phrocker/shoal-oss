@@ -157,7 +157,7 @@ func (s *Service) Create(ctx context.Context, request CreateRequest) (Subscripti
 	}
 	if err := s.record(
 		ctx, decision, auth.OperationSubscriptionCreate, request.Token,
-		subscription.ID, nil, subscription.CreatedAt,
+		subscription.ID, nil, nil, nil, subscription.CreatedAt,
 	); err != nil {
 		return Subscription{}, classifyAuditError(err)
 	}
@@ -195,7 +195,7 @@ func (s *Service) Delete(ctx context.Context, request DeleteRequest) error {
 	}
 	if err := s.record(
 		ctx, decision, auth.OperationSubscriptionDelete, request.SubscriptionID,
-		subscription.ID, nil, subscription.RevokedAt,
+		subscription.ID, nil, nil, nil, subscription.RevokedAt,
 	); err != nil {
 		return classifyAuditError(err)
 	}
@@ -288,15 +288,13 @@ func (s *Service) publish(
 	if err != nil {
 		return PublishResult{}, mapContextError(err)
 	}
-	auditTime := now
-	if !scopePublicToken {
-		auditTime = request.Event.OccurredAt
-	}
+	auditTime := request.Event.OccurredAt
 	var recordErr error
 	if lifecycleReceipt == nil {
 		recordErr = s.record(
 			ctx, decision, operation, request.Event.ActionID,
-			result.EventID, request.Event.Evidence, auditTime,
+			result.EventID, request.Event.Evidence,
+			request.Event.ConsumedEvidence, request.Event.CitedEvidence, auditTime,
 		)
 	} else {
 		recordErr = s.auditor.RecordFleetAction(ctx, AuditRecord{
@@ -307,6 +305,8 @@ func (s *Service) publish(
 			AuthorizationExpiresAt:   lifecycleReceipt.AuthorizationExpiresAt,
 			ObjectID:                 cloneBytes(result.EventID),
 			Evidence:                 cloneEvidence(request.Event.Evidence),
+			ConsumedEvidence:         cloneEvidenceReferences(request.Event.ConsumedEvidence),
+			CitedEvidence:            cloneEvidenceReferences(request.Event.CitedEvidence),
 			OccurredAt:               auditTime,
 		})
 	}
@@ -336,6 +336,7 @@ func (s *Service) Pull(ctx context.Context, request PullRequest) (Page, error) {
 		return Page{}, err
 	}
 	deadline := s.now().UTC().Add(request.Wait)
+	pollDelay := s.poll
 	for {
 		events, pinnedFrontier, scanErr := s.backend.Scan(ctx, next, frontier, request.Limit)
 		if scanErr != nil {
@@ -396,7 +397,11 @@ func (s *Service) Pull(ctx context.Context, request PullRequest) (Page, error) {
 			}
 			return Page{Events: page, NextCursor: cursor, HighWater: 0, AtLeastOnce: true}, nil
 		}
-		timer := time.NewTimer(s.poll)
+		remaining := deadline.Sub(s.now().UTC())
+		if pollDelay > remaining {
+			pollDelay = remaining
+		}
+		timer := time.NewTimer(pollDelay)
 		select {
 		case <-ctx.Done():
 			timer.Stop()
@@ -415,6 +420,12 @@ func (s *Service) Pull(ctx context.Context, request PullRequest) (Page, error) {
 		}
 		subscription, decision, fingerprint =
 			freshSubscription, freshDecision, freshFingerprint
+		if pollDelay < time.Second {
+			pollDelay *= 2
+			if pollDelay > time.Second {
+				pollDelay = time.Second
+			}
+		}
 	}
 }
 
@@ -538,11 +549,25 @@ func (s *Service) authorize(
 		}
 	} else {
 		for _, item := range evidence {
-			if err := decision.AuthorizeObject(operation, auth.ResourceRequest{
-				AuthorizationDomain: decision.AuthorizationDomain(),
-				SourceID:            item.SourceID, PolicyID: item.PolicyID, ObjectID: item.ObjectID,
-			}, now); err != nil {
-				return auth.Decision{}, auth.GenerationGuard{}, err
+			objectIDs := []shoal.ID{item.ObjectID}
+			if item.Reference != nil {
+				objectIDs = append(objectIDs, ExactEvidenceReferenceIDs(*item.Reference)...)
+			}
+			seen := make(map[shoal.ID]struct{}, len(objectIDs))
+			for _, objectID := range objectIDs {
+				if objectID == "" {
+					continue
+				}
+				if _, ok := seen[objectID]; ok {
+					continue
+				}
+				seen[objectID] = struct{}{}
+				if err := decision.AuthorizeObject(operation, auth.ResourceRequest{
+					AuthorizationDomain: decision.AuthorizationDomain(),
+					SourceID:            item.SourceID, PolicyID: item.PolicyID, ObjectID: objectID,
+				}, now); err != nil {
+					return auth.Decision{}, auth.GenerationGuard{}, err
+				}
 			}
 		}
 	}
@@ -552,7 +577,8 @@ func (s *Service) authorize(
 
 func (s *Service) record(
 	ctx context.Context, decision auth.Decision, operation auth.Operation,
-	actionID, objectID []byte, evidence []Evidence, now time.Time,
+	actionID, objectID []byte, evidence []Evidence,
+	consumed, cited []interaction.EvidenceReference, now time.Time,
 ) error {
 	return s.auditor.RecordFleetAction(ctx, AuditRecord{
 		Operation: operation, ActionID: cloneBytes(actionID),
@@ -564,6 +590,8 @@ func (s *Service) record(
 		AuthorizationExpiresAt: decision.AuthenticationExpires(),
 		ObjectID:               cloneBytes(objectID),
 		Evidence:               cloneEvidence(evidence),
+		ConsumedEvidence:       cloneEvidenceReferences(consumed),
+		CitedEvidence:          cloneEvidenceReferences(cited),
 		OccurredAt:             now,
 	})
 }

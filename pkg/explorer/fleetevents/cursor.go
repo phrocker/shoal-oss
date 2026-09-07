@@ -34,9 +34,9 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 )
 
-const cursorVersion = 2
+const cursorVersion = 3
 
-var cursorAdditionalData = []byte("shoal-fleet-event-cursor-v2")
+var cursorAdditionalData = []byte("shoal-fleet-event-cursor-v3")
 
 type cursorState struct {
 	SubscriptionID []byte
@@ -88,7 +88,7 @@ func (c cursorCodec) seal(state cursorState) (string, error) {
 	_ = binary.Write(&body, binary.BigEndian, state.Generation)
 	_ = binary.Write(&body, binary.BigEndian, state.NextSequence)
 	_ = binary.Write(&body, binary.BigEndian, state.Frontier)
-	_ = binary.Write(&body, binary.BigEndian, state.ExpiresAt.Unix())
+	_ = binary.Write(&body, binary.BigEndian, state.ExpiresAt.UnixNano())
 	nonce := make([]byte, c.aead.NonceSize())
 	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
 		return "", err
@@ -135,7 +135,7 @@ func (c cursorCodec) open(value string, now time.Time) (cursorState, error) {
 		reader.Len() != 0 {
 		return cursorState{}, ErrCursorInvalid
 	}
-	state.ExpiresAt = time.Unix(expires, 0).UTC()
+	state.ExpiresAt = time.Unix(0, expires).UTC()
 	if !now.Before(state.ExpiresAt) || state.Generation == 0 || state.NextSequence == 0 {
 		return cursorState{}, ErrCursorInvalid
 	}

@@ -25,12 +25,12 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
-	"reflect"
 	"time"
 
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/explorer/fleet"
 	"github.com/phrocker/shoal-oss/pkg/explorer/fleetevents"
+	"github.com/phrocker/shoal-oss/pkg/interaction"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
@@ -90,49 +90,8 @@ func (p *ActionEventPublisher) PublishActionEvent(
 	}, now); err != nil {
 		return err
 	}
-	evidence := make([]fleetevents.Evidence, 0, len(record.Evidence)+1)
-	evidence = appendUniqueEvidence(evidence, fleetevents.Evidence{
-		SourceID: append([]byte(nil), record.SourceID...),
-		PolicyID: append([]byte(nil), record.PolicyID...),
-		ObjectID: record.ObjectID,
-	})
-	for _, reference := range record.Evidence {
-		converted := fleetevents.Evidence{
-			SourceID: append([]byte(nil), record.SourceID...),
-			PolicyID: append([]byte(nil), record.PolicyID...),
-			ObjectID: record.ObjectID, AnchorID: reference.AnchorID,
-			RevisionID: reference.Citation.RevisionID,
-			Start:      reference.Citation.Range.Start.Offset,
-			End:        reference.Citation.Range.End.Offset,
-			Visibility: append([]string(nil), reference.Visibility...),
-		}
-		if len(reference.NodeIDs) > 0 {
-			converted.NodeID = reference.NodeIDs[0]
-		}
-		if len(reference.EdgeIDs) > 0 {
-			converted.EdgeID = reference.EdgeIDs[0]
-		}
-		evidence = appendUniqueEvidence(evidence, converted)
-		if len(reference.NodeIDs) > 1 {
-			for _, nodeID := range reference.NodeIDs[1:] {
-				entry := converted
-				entry.NodeID, entry.EdgeID = nodeID, ""
-				evidence = appendUniqueEvidence(evidence, entry)
-			}
-		}
-		if len(reference.EdgeIDs) > 1 {
-			for _, edgeID := range reference.EdgeIDs[1:] {
-				entry := converted
-				entry.NodeID, entry.EdgeID = "", edgeID
-				evidence = appendUniqueEvidence(evidence, entry)
-			}
-		}
-		for _, assertion := range reference.Assertions {
-			entry := converted
-			entry.NodeID, entry.EdgeID = assertion.AssertionID, assertion.EdgeID
-			evidence = appendUniqueEvidence(evidence, entry)
-		}
-	}
+	references := actionEvidenceReferences(record.Evidence)
+	evidence := actionAuthorizationEvidence(record, references)
 	event := fleetevents.Event{
 		Kind:               kind,
 		ProducerID:         []byte(record.AgentID),
@@ -142,6 +101,7 @@ func (p *ActionEventPublisher) PublishActionEvent(
 		CorrelationID:      []byte(record.CorrelationID),
 		Reason:             record.Reason,
 		Evidence:           evidence,
+		ConsumedEvidence:   references,
 		OccurredAt:         record.UpdatedAt,
 	}
 
@@ -156,15 +116,74 @@ func (p *ActionEventPublisher) PublishActionEvent(
 	return err
 }
 
-func appendUniqueEvidence(
-	values []fleetevents.Evidence, candidate fleetevents.Evidence,
+func actionAuthorizationEvidence(
+	record fleet.ActionRecord,
+	references []interaction.EvidenceReference,
 ) []fleetevents.Evidence {
-	for _, value := range values {
-		if reflect.DeepEqual(value, candidate) {
-			return values
+	result := make([]fleetevents.Evidence, 0, 1+len(references))
+	covered := make(map[shoal.ID]struct{})
+	appendID := func(id shoal.ID, reference *interaction.EvidenceReference) {
+		result = append(result, fleetevents.Evidence{
+			SourceID: append([]byte(nil), record.SourceID...),
+			PolicyID: append([]byte(nil), record.PolicyID...),
+			ObjectID: id, Reference: reference,
+		})
+		covered[id] = struct{}{}
+		if reference != nil {
+			for _, exactID := range fleetevents.ExactEvidenceReferenceIDs(*reference) {
+				if exactID != "" {
+					covered[exactID] = struct{}{}
+				}
+			}
 		}
 	}
-	return append(values, candidate)
+	appendID(record.ObjectID, nil)
+	for _, reference := range references {
+		canonical := cloneActionEvidenceReference(reference)
+		var representative shoal.ID
+		for _, id := range fleetevents.ExactEvidenceReferenceIDs(canonical) {
+			if id == "" {
+				continue
+			}
+			if _, ok := covered[id]; !ok {
+				representative = id
+				break
+			}
+		}
+		if representative != "" {
+			appendID(representative, &canonical)
+		}
+	}
+	return result
+}
+
+func cloneActionEvidenceReference(
+	value interaction.EvidenceReference,
+) interaction.EvidenceReference {
+	value.NodeIDs = append([]shoal.ID(nil), value.NodeIDs...)
+	value.EdgeIDs = append([]shoal.ID(nil), value.EdgeIDs...)
+	value.Assertions = append(
+		[]interaction.AssertionReference(nil), value.Assertions...)
+	return value
+}
+
+func actionEvidenceReferences(
+	values []fleet.EvidenceRef,
+) []interaction.EvidenceReference {
+	if len(values) == 0 {
+		return nil
+	}
+	result := make([]interaction.EvidenceReference, len(values))
+	for i, value := range values {
+		result[i] = interaction.EvidenceReference{
+			AnchorID: value.AnchorID, Kind: value.Kind, Citation: value.Citation,
+			NodeIDs: append([]shoal.ID(nil), value.NodeIDs...),
+			EdgeIDs: append([]shoal.ID(nil), value.EdgeIDs...),
+			Assertions: append(
+				[]interaction.AssertionReference(nil), value.Assertions...),
+		}
+	}
+	return result
 }
 
 func actionEventAuthorization(

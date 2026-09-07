@@ -25,6 +25,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
+	"fmt"
 	"reflect"
 	"sync"
 	"sync/atomic"
@@ -277,7 +278,9 @@ func TestActionEventPublisherPreservesExecutorEvidence(t *testing.T) {
 		SourceID: []byte("source"), PolicyID: []byte("policy"), ObjectID: "object",
 		Reason: interaction.Reason{Code: "completed"}, UpdatedAt: now,
 		Evidence: []fleet.EvidenceRef{{
+			Kind:       interaction.EvidenceGraph,
 			NodeIDs:    []shoal.ID{"node", "node"},
+			EdgeIDs:    []shoal.ID{"edge"},
 			AnchorID:   "anchor",
 			Visibility: []string{"A", "B"},
 		}},
@@ -287,18 +290,65 @@ func TestActionEventPublisherPreservesExecutorEvidence(t *testing.T) {
 	); err != nil {
 		t.Fatal(err)
 	}
-	if backend.appends != 1 || len(backend.request.Event.Evidence) != 2 {
-		t.Fatalf("preserved evidence = %#v", backend.request.Event.Evidence)
+	if backend.appends != 1 || len(backend.request.Event.Evidence) != 2 ||
+		len(backend.request.Event.ConsumedEvidence) != 1 {
+		t.Fatalf("preserved evidence = %#v / %#v",
+			backend.request.Event.Evidence, backend.request.Event.ConsumedEvidence)
 	}
-	evidence := backend.request.Event.Evidence[1]
-	if evidence.NodeID != "node" || evidence.EdgeID != "" ||
+	evidence := backend.request.Event.ConsumedEvidence[0]
+	if !reflect.DeepEqual(evidence.NodeIDs, []shoal.ID{"node", "node"}) ||
+		!reflect.DeepEqual(evidence.EdgeIDs, []shoal.ID{"edge"}) ||
 		evidence.AnchorID != "anchor" ||
-		!reflect.DeepEqual(evidence.Visibility, []string{"A", "B"}) {
+		evidence.Kind != interaction.EvidenceGraph {
 		t.Fatalf("executor evidence = %#v", evidence)
 	}
-	record.Evidence[0].Visibility[0] = "changed"
-	if evidence.Visibility[0] != "A" {
-		t.Fatal("event evidence visibility aliases the action record")
+	referenceCount := 0
+	for _, item := range backend.request.Event.Evidence {
+		if item.Reference != nil {
+			referenceCount++
+			if !reflect.DeepEqual(*item.Reference, evidence) {
+				t.Fatalf("authorization evidence reference = %#v", item.Reference)
+			}
+		}
+	}
+	if referenceCount != 1 {
+		t.Fatalf("canonical authorization references = %d, want 1", referenceCount)
+	}
+	record.Evidence[0].NodeIDs[0] = "changed"
+	if evidence.NodeIDs[0] != "node" {
+		t.Fatal("event evidence aliases the action record")
+	}
+}
+
+func TestActionEventPublisherBoundsAuthorizationEvidenceByReferences(t *testing.T) {
+	now := time.Date(2026, 9, 7, 3, 40, 0, 0, time.UTC)
+	backend := &recordingBackend{}
+	publisher := dispatchEventPublisher(
+		t, backend, now, restartGenerationReader{}, restartAuditor{},
+		auth.OperationInvoke)
+	record := authorizedActionRecord(fleet.ActionRecord{
+		ID: []byte("action"), Version: 2, State: fleet.DispatchSucceeded,
+		AgentID: "agent", AgentGeneration: 1, ExecutorKey: []byte("executor"),
+		SourceID: []byte("source"), PolicyID: []byte("policy"), ObjectID: "object",
+		Reason: interaction.Reason{Code: "completed"}, UpdatedAt: now,
+	}, now, auth.OperationInvoke)
+	record.Evidence = make([]fleet.EvidenceRef, 129)
+	for index := range record.Evidence {
+		record.Evidence[index] = fleet.EvidenceRef{
+			AnchorID: shoal.ID(fmt.Sprintf("anchor-%03d", index)),
+			Kind:     interaction.EvidenceGraph,
+			NodeIDs:  []shoal.ID{shoal.ID(fmt.Sprintf("node-%03d", index))},
+		}
+	}
+	if err := publisher.PublishActionEvent(
+		context.Background(), "action.completed", record,
+	); err != nil {
+		t.Fatal(err)
+	}
+	evidence := backend.request.Event.Evidence
+	if len(evidence) != len(record.Evidence)+1 {
+		t.Fatalf("authorization evidence = %d, want %d",
+			len(evidence), len(record.Evidence)+1)
 	}
 }
 

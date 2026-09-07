@@ -22,9 +22,11 @@ package fleetevents
 import (
 	"context"
 	"errors"
+	"reflect"
 	"testing"
 	"time"
 
+	"github.com/phrocker/shoal-oss/pkg/document"
 	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/interaction"
@@ -63,11 +65,26 @@ func TestInteractionAuditorRecordsRedactedAction(t *testing.T) {
 		Evidence: []Evidence{
 			{
 				SourceID: []byte("source-a"), PolicyID: []byte("policy-a"),
-				ObjectID: "object-a", NodeID: "node-a", EdgeID: "edge-a",
-				AnchorID: "anchor-a", RevisionID: "revision-a",
+				ObjectID: "object-a",
 			},
 			{SourceID: []byte("source-b"), PolicyID: []byte("policy-b"), ObjectID: "object-b"},
 		},
+		ConsumedEvidence: []interaction.EvidenceReference{{
+			AnchorID: "anchor-a", Kind: interaction.EvidenceGraph,
+			NodeIDs: []shoal.ID{"node-a"},
+		}},
+		CitedEvidence: []interaction.EvidenceReference{{
+			AnchorID: "citation-a", Kind: interaction.EvidenceDocument,
+			Citation: document.Citation{
+				DocumentID: "document-a", RevisionID: "revision-a",
+				SectionID: "section-a",
+				Range: document.SourceRange{
+					Start: document.SourcePosition{Offset: 1},
+					End:   document.SourcePosition{Offset: 2},
+				},
+			},
+			NodeIDs: []shoal.ID{"document-a", "section-a"},
+		}},
 		AuthorizationFingerprint: auth.Fingerprint{1},
 		AuthorizationExpiresAt:   now.Add(time.Hour), OccurredAt: now,
 	})
@@ -84,11 +101,21 @@ func TestInteractionAuditorRecordsRedactedAction(t *testing.T) {
 		sink.sessions[0].Actor.ClientID != "" ||
 		len(sink.sessions[0].Actor.OnBehalfOf) != 0 ||
 		sink.sessions[0].Reason != (interaction.Reason{}) ||
-		len(sink.sessions[0].TouchedNodeIDs()) != 1 {
+		len(sink.sessions[0].SeedEvidence) != 0 ||
+		len(sink.sessions[0].Turns[0].ToolCall.RetrievedEvidence) != 1 ||
+		len(sink.sessions[0].CitedEvidence) != 1 ||
+		len(sink.sessions[0].TouchedNodeIDs()) != 3 {
 		t.Fatalf("session = %#v", sink.sessions)
 	}
-	if got := sink.sessions[0].TouchedNodeIDs(); got[0] != "node-a" {
-		t.Fatalf("evidence = %#v", sink.sessions[0].TouchedNodeIDs())
+	if got := sink.sessions[0].Turns[0].ToolCall.RetrievedEvidence; got[0].AnchorID != "anchor-a" {
+		t.Fatalf("retrieved evidence = %#v", got)
+	}
+	if got := sink.sessions[0].CitedEvidence; got[0].AnchorID != "citation-a" {
+		t.Fatalf("cited evidence = %#v", got)
+	}
+	if got := sink.sessions[0].TouchedNodeIDs(); !reflect.DeepEqual(
+		got, []shoal.ID{"document-a", "node-a", "section-a"}) {
+		t.Fatalf("evidence = %#v", got)
 	}
 }
 

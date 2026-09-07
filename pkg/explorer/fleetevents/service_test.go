@@ -24,6 +24,8 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
+	"fmt"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
@@ -248,6 +250,25 @@ func TestRecorderFailureReportsAmbiguousCommittedAction(t *testing.T) {
 	}
 }
 
+func TestPublishAuditIdentityUsesStableEventOccurrence(t *testing.T) {
+	now := time.Date(2026, 9, 5, 20, 0, 0, 0, time.UTC)
+	occurredAt := now.Add(-time.Minute)
+	backend := &memoryBackend{}
+	audit := &auditor{}
+	service := testService(t, "alice", now, backend, &generationReader{generation: 7},
+		&leaseValidator{}, audit)
+	event := eventAt(0)
+	event.OccurredAt = occurredAt
+	if _, err := service.Publish(context.Background(), PublishRequest{
+		Token: []byte("publish"), RetryUntil: now.Add(time.Hour), Event: event,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(audit.records) != 1 || !audit.records[0].OccurredAt.Equal(occurredAt) {
+		t.Fatalf("audit occurrence = %#v, want %s", audit.records, occurredAt)
+	}
+}
+
 func TestAuditErrorClassificationPreservesCommittedOutcome(t *testing.T) {
 	cause := errors.New("record accepted before failure")
 	committed := interaction.MarkCommittedRecord(cause)
@@ -407,6 +428,88 @@ func TestEventRequiresProducerGenerationAndTransitionIdentity(t *testing.T) {
 	event.TransitionID = nil
 	if _, err := normalizeEvent(event, true); err == nil {
 		t.Fatal("empty transition identity succeeded")
+	}
+}
+
+func TestEventRejectsConflictingEvidenceAnchorAcrossGroups(t *testing.T) {
+	event := eventAt(1)
+	event.ConsumedEvidence = []interaction.EvidenceReference{{
+		AnchorID: "shared-anchor", Kind: interaction.EvidenceGraph,
+		NodeIDs: []shoal.ID{"consumed-node"},
+	}}
+	event.CitedEvidence = []interaction.EvidenceReference{{
+		AnchorID: "shared-anchor", Kind: interaction.EvidenceGraph,
+		NodeIDs: []shoal.ID{"cited-node"},
+	}}
+	if _, err := normalizeEvent(event, true); err == nil {
+		t.Fatal("conflicting consumed/cited anchor succeeded")
+	}
+}
+
+func TestEventRejectsFlattenedEvidenceWithoutCanonicalReference(t *testing.T) {
+	for name, mutate := range map[string]func(*Evidence){
+		"node":     func(value *Evidence) { value.NodeID = "node" },
+		"edge":     func(value *Evidence) { value.EdgeID = "edge" },
+		"anchor":   func(value *Evidence) { value.AnchorID = "anchor" },
+		"revision": func(value *Evidence) { value.RevisionID = "revision" },
+		"range":    func(value *Evidence) { value.Start, value.End = 1, 2 },
+	} {
+		for _, withReference := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/reference=%t", name, withReference), func(t *testing.T) {
+				event := eventAt(1)
+				if withReference {
+					event.Evidence[0].Reference = &interaction.EvidenceReference{
+						AnchorID: "canonical-anchor", Kind: interaction.EvidenceGraph,
+						NodeIDs: []shoal.ID{"canonical-node"},
+					}
+					event.ConsumedEvidence = []interaction.EvidenceReference{
+						*event.Evidence[0].Reference,
+					}
+				}
+				mutate(&event.Evidence[0])
+				if _, err := normalizeEvent(event, true); err == nil {
+					t.Fatal("legacy flattened evidence succeeded")
+				}
+			})
+		}
+	}
+}
+
+func TestEventPreservesEvidenceGroupAndGraphPathOrder(t *testing.T) {
+	event := eventAt(1)
+	event.ConsumedEvidence = []interaction.EvidenceReference{
+		{
+			AnchorID: "second-anchor", Kind: interaction.EvidenceGraph,
+			NodeIDs: []shoal.ID{"node-b", "node-a"}, EdgeIDs: []shoal.ID{"edge-b-a"},
+		},
+		{
+			AnchorID: "first-anchor", Kind: interaction.EvidenceGraph,
+			NodeIDs: []shoal.ID{"node-a"},
+		},
+	}
+	event.CitedEvidence = []interaction.EvidenceReference{{
+		AnchorID: "cited-anchor", Kind: interaction.EvidenceGraph,
+		NodeIDs: []shoal.ID{"cited-node"},
+	}}
+	for _, id := range []shoal.ID{
+		"second-anchor", "node-b", "node-a", "edge-b-a",
+		"first-anchor", "cited-anchor", "cited-node",
+	} {
+		event.Evidence = append(event.Evidence, Evidence{
+			SourceID: []byte("source"), PolicyID: []byte("policy"),
+			ObjectID: id,
+		})
+	}
+	normalized, err := normalizeEvent(event, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if normalized.ConsumedEvidence[0].AnchorID != "second-anchor" ||
+		!reflect.DeepEqual(normalized.ConsumedEvidence[0].NodeIDs,
+			[]shoal.ID{"node-b", "node-a"}) ||
+		normalized.CitedEvidence[0].AnchorID != "cited-anchor" {
+		t.Fatalf("normalized evidence = %#v / %#v",
+			normalized.ConsumedEvidence, normalized.CitedEvidence)
 	}
 }
 
@@ -637,6 +740,29 @@ func TestCursorExpiresAndAEADIsRequired(t *testing.T) {
 		append([]byte{1}, bytes.Repeat([]byte{0x41}, 96)...))
 	if _, err := codec.open(legacy, now); !errors.Is(err, ErrCursorInvalid) {
 		t.Fatalf("legacy cursor error = %v", err)
+	}
+}
+
+func TestCursorPreservesSubsecondExpiry(t *testing.T) {
+	now := time.Date(2026, 9, 5, 20, 0, 0, 900_000_000, time.UTC)
+	codec, err := newCursorCodec(bytesOf(7, 32), 200*time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	value, err := codec.seal(cursorState{
+		SubscriptionID: []byte("subscription"), SubscriberID: "alice",
+		Fingerprint: auth.Fingerprint{1}, Generation: 1, NextSequence: 2,
+		ExpiresAt: now.Add(200 * time.Millisecond),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, err := codec.open(value, now.Add(100*time.Millisecond))
+	if err != nil || !state.ExpiresAt.Equal(now.Add(200*time.Millisecond)) {
+		t.Fatalf("subsecond cursor = %#v, %v", state, err)
+	}
+	if _, err := codec.open(value, now.Add(200*time.Millisecond)); !errors.Is(err, ErrCursorInvalid) {
+		t.Fatalf("expired subsecond cursor error = %v", err)
 	}
 }
 

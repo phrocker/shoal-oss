@@ -70,8 +70,9 @@ refreshes, and accepts only the original narrow
 durable action identity on every attempt. The five `action.*` lifecycle kinds
 are reserved from public publication, and each trusted kind is bound to its
 exact `dispatch` or `invoke` operation. Event evidence includes the base
-authorization target plus every executor node, edge, anchor, revision, range,
-and visibility field; visibility slices are copied and canonicalized.
+authorization target plus canonical executor node, edge, anchor, revision,
+range, and assertion references. Visibility remains trusted interaction-sink
+state and is re-derived from current labels rather than persisted from callers.
 Lifecycle receipts retain the durable transition's original authorization
 fingerprint, expiry, request, and correlation pins across an ambiguous retry,
 while the current decision is still reauthorized before each attempt.
