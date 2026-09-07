@@ -221,8 +221,9 @@ func TestReviewSettingsRejectExpiryDuringStoreRead(t *testing.T) {
 						ExpectedRevision: 1, MutationID: "update",
 					})
 			case "apply":
-				_, err = provider.Apply(
+				_, err = provider.ApplyForOperation(
 					context.Background(), "review-workspace",
+					auth.OperationRead,
 					MaximumLimits(), nil)
 			}
 			if !shoal.IsErrorCode(err, shoal.ErrorUnauthorized) {
@@ -278,8 +279,9 @@ func TestReviewSettingsRejectGenerationChangeDuringStoreRead(t *testing.T) {
 						ExpectedRevision: 1, MutationID: "revoked",
 					})
 			case "apply":
-				_, err = provider.Apply(
+				_, err = provider.ApplyForOperation(
 					context.Background(), "generation-workspace",
+					auth.OperationRead,
 					MaximumLimits(), nil)
 			}
 			if !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
@@ -493,8 +495,9 @@ func TestReviewServiceWriterOutputPolicyIsConsumerNeutral(t *testing.T) {
 			created.Narrowing.OutputPolicies[0].ServiceRole())
 	}
 	resolver.set(reader)
-	effective, err := provider.Apply(
-		context.Background(), "service-output", MaximumLimits(), nil)
+	effective, err := provider.ApplyForOperation(
+		context.Background(), "service-output", auth.OperationRetrieve,
+		MaximumLimits(), nil)
 	if err != nil {
 		t.Fatalf("reader apply: %v", err)
 	}
@@ -566,8 +569,9 @@ func TestReviewNarrowServiceRolesApplyOwnedWorkspaceRestrictions(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			effective, err := provider.Apply(
+			effective, err := provider.ApplyForOperation(
 				context.Background(), settings.WorkspaceID,
+				test.operation,
 				MaximumLimits(), nil)
 			if err != nil {
 				t.Fatalf(
@@ -896,8 +900,16 @@ func TestReviewSettingsStoreCompactsSupersededRevisions(t *testing.T) {
 			t.Fatalf("revision %d: %v", revision+1, err)
 		}
 	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := OpenDurableStore(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
 	rawVersions := 0
-	if err := store.engine.LookupRows(
+	if err := reopened.engine.LookupRows(
 		settingsTable,
 		[][]byte{settingsRow("retained-workspace")},
 		engine.ScanOptions{
@@ -916,14 +928,6 @@ func TestReviewSettingsStoreCompactsSupersededRevisions(t *testing.T) {
 	if rawVersions != 1 {
 		t.Fatalf("raw retained versions = %d, want 1", rawVersions)
 	}
-	if err := store.Close(); err != nil {
-		t.Fatal(err)
-	}
-	reopened, err := OpenDurableStore(directory)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer reopened.Close()
 	loaded, err := reopened.Load(context.Background(), "retained-workspace")
 	if err != nil {
 		t.Fatal(err)
@@ -932,6 +936,50 @@ func TestReviewSettingsStoreCompactsSupersededRevisions(t *testing.T) {
 		loaded.Narrowing.Budgets.RetrievalTopK == nil ||
 		*loaded.Narrowing.Budgets.RetrievalTopK != 9 {
 		t.Fatalf("retained settings = %#v", loaded)
+	}
+}
+
+func TestReviewSettingsStoreSchedulesCompactionOutsideStoreMutex(t *testing.T) {
+	store, err := OpenDurableStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if _, err := store.CompareAndSwap(
+		context.Background(), "background-compact", "owner", []byte("domain"),
+		0, "create", Narrowing{},
+	); err != nil {
+		t.Fatal(err)
+	}
+	store.maintenanceMu.Lock()
+	store.uncompacted = settingsCompactInterval - 1
+	store.maintenanceMu.Unlock()
+	started := make(chan struct{})
+	release := make(chan struct{})
+	defer close(release)
+	compact := store.compact
+	store.compact = func(table string, stack []iterrt.IterSpec) error {
+		close(started)
+		<-release
+		return compact(table, stack)
+	}
+	topK := uint32(5)
+	if _, err := store.CompareAndSwap(
+		context.Background(), "background-compact", "owner", []byte("domain"),
+		1, "narrow", Narrowing{
+			Budgets: Budgets{RetrievalTopK: &topK},
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("background compaction was not scheduled")
+	}
+	if _, err := store.Load(
+		context.Background(), "background-compact"); err != nil {
+		t.Fatalf("store mutex remained held during compaction: %v", err)
 	}
 }
 

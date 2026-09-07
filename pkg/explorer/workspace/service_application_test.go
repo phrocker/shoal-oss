@@ -120,8 +120,9 @@ func TestNarrowServiceRolesCanApplyOwnedWorkspaceRestrictions(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			effective, err := provider.Apply(
-				context.Background(), settings.WorkspaceID, MaximumLimits(), nil)
+			effective, err := provider.ApplyForOperation(
+				context.Background(), settings.WorkspaceID,
+				test.operation, MaximumLimits(), nil)
 			if err != nil {
 				t.Fatalf("owned narrowing disables otherwise-authorized %s: %v", test.operation, err)
 			}

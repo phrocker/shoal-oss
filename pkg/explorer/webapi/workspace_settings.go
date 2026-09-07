@@ -60,13 +60,6 @@ type WorkspaceSettingsProvider interface {
 		shoal.ID,
 		ontology.OntologyIdentity,
 	) (workspace.Settings, error)
-	ApplyDecision(context.Context, shoal.ID) (auth.Decision, error)
-	Apply(
-		context.Context,
-		shoal.ID,
-		workspace.Limits,
-		[]auth.Policy,
-	) (workspace.EffectiveDecision, error)
 	ApplyForOperation(
 		context.Context,
 		shoal.ID,
@@ -499,6 +492,18 @@ func applyWorkspaceMetadataLimits(
 	metadata.MaxNodes = min(metadata.MaxNodes, limits.GraphNodes)
 	metadata.MaxResponseBytes = min(
 		metadata.MaxResponseBytes, limits.OutputBytes)
+	if metadata.AnalyticsLimits != nil {
+		analyticsLimits := *metadata.AnalyticsLimits
+		analyticsLimits.MaxDepth = min(
+			analyticsLimits.MaxDepth, limits.GraphDepth)
+		analyticsLimits.MaxFanout = min(
+			analyticsLimits.MaxFanout, limits.GraphFanout)
+		analyticsLimits.MaxNodes = min(
+			analyticsLimits.MaxNodes, limits.GraphNodes)
+		analyticsLimits.MaxSeeds = min(
+			analyticsLimits.MaxSeeds, analyticsLimits.MaxNodes)
+		metadata.AnalyticsLimits = &analyticsLimits
+	}
 	return metadata
 }
 

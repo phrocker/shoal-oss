@@ -27,6 +27,7 @@ import (
 	"testing"
 	"time"
 
+	exploreranalytics "github.com/phrocker/shoal-oss/pkg/explorer/analytics"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/explorer/webapi"
 	"github.com/phrocker/shoal-oss/pkg/explorer/workspace"
@@ -86,6 +87,24 @@ func (s *lensObservingService) Path(
 ) (webapi.PathResponse, error) {
 	s.path = request
 	return webapi.PathResponse{}, nil
+}
+
+func (s *lensObservingService) AnalyticsLimits() (
+	exploreranalytics.Limits,
+	bool,
+) {
+	return exploreranalytics.DefaultLimits(), true
+}
+
+func (s *lensObservingService) Analytics(
+	context.Context,
+	webapi.AnalyticsRequest,
+) (webapi.AnalyticsResponse, error) {
+	return webapi.AnalyticsResponse{}, nil
+}
+
+func (s *lensObservingService) AnalyticsRecordingRequired() bool {
+	return true
 }
 
 func (c httpCallerOntologyChoices) ListOntologyChoices(
@@ -421,7 +440,12 @@ func TestHTTPSelectableLensIsPerCallerAndPreservesSettings(t *testing.T) {
 		t.Fatal(err)
 	}
 	if metadata.MaxTopK != topK || metadata.MaxDepth != depth ||
-		metadata.MaxFanout != fanout || metadata.MaxNodes != graphNodes {
+		metadata.MaxFanout != fanout || metadata.MaxNodes != graphNodes ||
+		metadata.AnalyticsLimits == nil ||
+		metadata.AnalyticsLimits.MaxDepth != depth ||
+		metadata.AnalyticsLimits.MaxFanout != fanout ||
+		metadata.AnalyticsLimits.MaxNodes != graphNodes ||
+		metadata.AnalyticsLimits.MaxSeeds > graphNodes {
 		t.Fatalf("effective metadata limits = %#v", metadata)
 	}
 

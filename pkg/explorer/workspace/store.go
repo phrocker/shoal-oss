@@ -54,6 +54,7 @@ const (
 	settingsRecordKind      = byte(1)
 	settingsEnvelopeHeader  = 8 + 1 + 1 + 8 + sha256.Size
 	maxSettingsRecordBytes  = uint64(8 << 20)
+	settingsCompactInterval = uint64(16)
 )
 
 // Store is the durable settings persistence contract used by Provider.
@@ -89,6 +90,12 @@ type DurableStore struct {
 	closeEngine  func() error
 	engineClosed bool
 	closed       bool
+
+	maintenanceMu  sync.Mutex
+	maintenanceWG  sync.WaitGroup
+	uncompacted    uint64
+	compacting     bool
+	maintenanceErr error
 }
 
 var sharedEngineStores = struct {
@@ -223,6 +230,9 @@ func (s *DurableStore) Close() error {
 	defer s.mu.Unlock()
 	if s.closed {
 		return nil
+	}
+	if err := s.finishMaintenanceLocked(); err != nil {
+		return err
 	}
 	if s.sharedEngine {
 		s.closed = true
@@ -480,18 +490,70 @@ func (s *DurableStore) retainCurrentLocked(hadPrevious bool) error {
 	if !hadPrevious {
 		return nil
 	}
-	if err := s.compact(settingsTable, []iterrt.IterSpec{{
+	s.scheduleCompaction()
+	return nil
+}
+
+func settingsCompactionStack() []iterrt.IterSpec {
+	return []iterrt.IterSpec{{
 		Name: iterrt.IterVersioning,
 		Options: map[string]string{
 			iterrt.VersioningOption: "1",
 		},
-	}}); err != nil {
-		return explorer.MarkIndeterminateCommit(shoal.WrapError(
-			shoal.ErrorUnavailable,
-			"compact committed workspace settings",
-			err,
-		))
+	}}
+}
+
+func (s *DurableStore) scheduleCompaction() {
+	s.maintenanceMu.Lock()
+	defer s.maintenanceMu.Unlock()
+	s.uncompacted++
+	if s.compacting || s.uncompacted < settingsCompactInterval {
+		return
 	}
+	s.compacting = true
+	s.uncompacted = 0
+	s.maintenanceWG.Add(1)
+	go s.runCompaction()
+}
+
+func (s *DurableStore) runCompaction() {
+	err := s.compact(settingsTable, settingsCompactionStack())
+	s.maintenanceMu.Lock()
+	s.compacting = false
+	s.maintenanceErr = err
+	retry := err == nil && s.uncompacted >= settingsCompactInterval
+	if retry {
+		s.compacting = true
+		s.uncompacted = 0
+		s.maintenanceWG.Add(1)
+	}
+	s.maintenanceMu.Unlock()
+	s.maintenanceWG.Done()
+	if retry {
+		go s.runCompaction()
+	}
+}
+
+func (s *DurableStore) finishMaintenanceLocked() error {
+	s.maintenanceWG.Wait()
+	s.maintenanceMu.Lock()
+	pending := s.uncompacted
+	maintenanceErr := s.maintenanceErr
+	s.maintenanceMu.Unlock()
+	if pending == 0 && maintenanceErr == nil {
+		return nil
+	}
+	if err := s.compact(settingsTable, settingsCompactionStack()); err != nil {
+		return shoal.WrapError(
+			shoal.ErrorInternal,
+			"compact workspace settings before close",
+			err,
+		)
+	}
+	s.maintenanceMu.Lock()
+	s.uncompacted = 0
+	s.maintenanceErr = nil
+	s.maintenanceMu.Unlock()
 	return nil
 }
 

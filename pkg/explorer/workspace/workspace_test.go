@@ -186,10 +186,11 @@ func TestProviderAppliesOnlyNarrowingAndPreservesDecision(t *testing.T) {
 		t.Fatalf("created settings = %#v", created)
 	}
 	baseOutput := testPolicy(t, base, "source-a", "policy-a", 3)
-	effective, err := provider.Effective(ctx, "workspace-one", Limits{
-		RetrievalTopK: 20, GraphDepth: 4, GraphFanout: 30,
-		GraphNodes: 200, OutputBytes: 1 << 20,
-	}, []auth.Policy{baseOutput})
+	effective, err := provider.ApplyForOperation(
+		ctx, "workspace-one", auth.OperationRead, Limits{
+			RetrievalTopK: 20, GraphDepth: 4, GraphFanout: 30,
+			GraphNodes: 200, OutputBytes: 1 << 20,
+		}, []auth.Policy{baseOutput})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -290,8 +291,9 @@ func TestEffectiveDecisionCannotReplaceIssuerSelectedOntology(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	effective, err := provider.Apply(
-		context.Background(), "workspace", testLimits(), nil)
+	effective, err := provider.ApplyForOperation(
+		context.Background(), "workspace", auth.OperationRead,
+		testLimits(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -382,8 +384,9 @@ func TestExplicitEmptyScopeDiffersFromOmission(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		effective, err := provider.Effective(
-			context.Background(), test.id, testLimits(), nil)
+		effective, err := provider.ApplyForOperation(
+			context.Background(), test.id, auth.OperationRead,
+			testLimits(), nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -561,7 +564,9 @@ func TestProviderRevalidatesRevokedDecisionAndOwnership(t *testing.T) {
 	resolver.set(testDecision(t, decisionOptions{
 		sources: [][]byte{[]byte("source-a")},
 	}))
-	_, err = provider.Effective(context.Background(), "owned", testLimits(), nil)
+	_, err = provider.ApplyForOperation(
+		context.Background(), "owned", auth.OperationRead,
+		testLimits(), nil)
 	if !shoal.IsErrorCode(err, shoal.ErrorUnauthorized) {
 		t.Fatalf("revoked source application error = %v", err)
 	}
@@ -708,8 +713,9 @@ func TestSelectableLensPreservesSettingsAndDoesNotLeakAcrossCallers(t *testing.T
 		len(selected.Narrowing.OutputPolicies) != 1 {
 		t.Fatalf("lens selection did not preserve settings: %#v", selected)
 	}
-	effective, err := provider.Apply(
-		context.Background(), "lens-workspace", testLimits(), nil)
+	effective, err := provider.ApplyForOperation(
+		context.Background(), "lens-workspace", auth.OperationRead,
+		testLimits(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -741,8 +747,9 @@ func TestSelectableLensPreservesSettingsAndDoesNotLeakAcrossCallers(t *testing.T
 	callerChoices.bySubject["owner"] = []OntologyChoice{
 		{Identity: first, Active: true},
 	}
-	if _, err := provider.Apply(
-		context.Background(), "lens-workspace", testLimits(), nil,
+	if _, err := provider.ApplyForOperation(
+		context.Background(), "lens-workspace", auth.OperationRead,
+		testLimits(), nil,
 	); !shoal.IsErrorCode(err, shoal.ErrorUnauthorized) {
 		t.Fatalf("revoked selected lens apply error = %v", err)
 	}

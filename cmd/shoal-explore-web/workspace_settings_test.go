@@ -122,8 +122,9 @@ func TestOpenServiceWiresDurableWorkspaceSettings(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	effective, err := opened.settings.Apply(
-		narrowContext, created.WorkspaceID, workspace.MaximumLimits(), nil)
+	effective, err := opened.settings.ApplyForOperation(
+		narrowContext, created.WorkspaceID,
+		auth.OperationRetrieve, workspace.MaximumLimits(), nil)
 	if err != nil {
 		t.Fatalf("apply selected lens for narrow service operation: %v", err)
 	}

@@ -531,7 +531,8 @@ func encodeComponentSelection(
 }
 
 func requireSameOrigin(request *http.Request) error {
-	switch site := request.Header.Get("Sec-Fetch-Site"); site {
+	site := request.Header.Get("Sec-Fetch-Site")
+	switch site {
 	case "", "none", "same-origin":
 	default:
 		return shoal.NewError(
@@ -551,6 +552,18 @@ func requireSameOrigin(request *http.Request) error {
 	if !sameOriginAuthority(parsed, request.Host) {
 		return shoal.NewError(
 			shoal.ErrorUnauthorized, "cross-origin settings mutation denied")
+	}
+	if site != "same-origin" {
+		requestScheme := "http"
+		if request.TLS != nil {
+			requestScheme = "https"
+		}
+		if !strings.EqualFold(parsed.Scheme, requestScheme) {
+			return shoal.NewError(
+				shoal.ErrorUnauthorized,
+				"cross-origin settings mutation denied",
+			)
+		}
 	}
 	return nil
 }

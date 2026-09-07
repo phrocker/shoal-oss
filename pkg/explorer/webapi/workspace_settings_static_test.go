@@ -169,7 +169,7 @@ vm.runInContext(fs.readFileSync("static/workspace-settings.js", "utf8"), context
 	}
 }
 
-func TestStaticWorkspaceSettingsLoadsLensAfterNewWorkspaceNotFound(t *testing.T) {
+func TestStaticWorkspaceSettingsLoadsLensAfterAuthorizedIdentityDenial(t *testing.T) {
 	if _, err := exec.LookPath("node"); err != nil {
 		if os.Getenv("CI") != "" {
 			t.Fatal("node is required for executable static UI checks in CI")
@@ -215,7 +215,12 @@ const window = {
     const url = new URL(String(input), "https://example.test/");
     calls.push(url.pathname);
     if (url.pathname === "/api/v1/identity") {
-      return {ok: false, status: 404, statusText: "Not Found"};
+      return {
+        ok: false,
+        status: 401,
+        statusText: "Unauthorized",
+        headers: new Headers(),
+      };
     }
     if (url.pathname.endsWith("/settings/lens")) {
       return {

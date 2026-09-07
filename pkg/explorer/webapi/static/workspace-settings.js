@@ -111,9 +111,13 @@
           headers: mergeRequestHeaders(input, init),
         })
       : await nativeFetch(input, init);
+    const bearerChallenge = response.headers &&
+      /^Bearer(?:\s|$)/i.test(
+        response.headers.get("WWW-Authenticate") || "");
     if (url.origin === window.location.origin &&
         url.pathname === "/api/v1/identity" &&
-        (response.ok || response.status === 404)) {
+        (response.ok || response.status === 404 ||
+          (response.status === 401 && !bearerChallenge))) {
       identityReady = true;
       queueLensLoad();
     }

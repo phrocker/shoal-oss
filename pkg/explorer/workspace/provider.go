@@ -448,32 +448,6 @@ func (p *Provider) SelectOntology(
 	return result, nil
 }
 
-// Effective returns a currently revalidated decision plus budget, output label,
-// and cache-partition effects for one owned workspace.
-func (p *Provider) Effective(
-	ctx context.Context,
-	workspaceID shoal.ID,
-	baseLimits Limits,
-	baseOutputPolicies []auth.Policy,
-) (EffectiveDecision, error) {
-	return p.Apply(ctx, workspaceID, baseLimits, baseOutputPolicies)
-}
-
-// Apply loads one owned settings revision and derives its complete effect from
-// the caller's current decision.
-func (p *Provider) Apply(
-	ctx context.Context,
-	workspaceID shoal.ID,
-	baseLimits Limits,
-	baseOutputPolicies []auth.Policy,
-) (EffectiveDecision, error) {
-	check, err := p.authorizeApplication(ctx, workspaceID, "")
-	if err != nil {
-		return EffectiveDecision{}, err
-	}
-	return p.apply(ctx, check, baseLimits, baseOutputPolicies)
-}
-
 // ApplyForOperation loads one owned settings revision and derives its complete
 // effect under the exact operation the consuming request will execute.
 func (p *Provider) ApplyForOperation(
@@ -554,13 +528,15 @@ func (p *Provider) apply(
 	return effective, nil
 }
 
-// ApplyDecision returns the current caller decision with only the selected
-// workspace's durable authorization and ontology narrowing applied.
-func (p *Provider) ApplyDecision(
+// ApplyDecisionForOperation returns the current caller decision with only the
+// selected workspace's durable narrowing for the exact consuming operation.
+func (p *Provider) ApplyDecisionForOperation(
 	ctx context.Context,
 	workspaceID shoal.ID,
+	operation auth.Operation,
 ) (auth.Decision, error) {
-	effective, err := p.Apply(ctx, workspaceID, MaximumLimits(), nil)
+	effective, err := p.ApplyForOperation(
+		ctx, workspaceID, operation, MaximumLimits(), nil)
 	if err != nil {
 		return auth.Decision{}, err
 	}
@@ -602,12 +578,8 @@ func (p *Provider) authorizeApplication(
 	if err != nil {
 		return authorizationCheck{}, err
 	}
-	if operation == "" {
-		operations := decision.AllowedOperations()
-		if len(operations) == 0 {
-			return authorizationCheck{}, authDenied()
-		}
-		operation = operations[0]
+	if err := operation.Validate(); err != nil {
+		return authorizationCheck{}, err
 	}
 	return p.authorizeDecision(
 		ctx, decision, operation, workspaceID)
