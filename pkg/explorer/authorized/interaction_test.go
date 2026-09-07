@@ -965,7 +965,7 @@ func TestAuthorizedExactRetryUsesTrustedDurableRecord(t *testing.T) {
 	}
 }
 
-func TestAuthorizedExactRetrySurvivesPolicyGenerationRefresh(t *testing.T) {
+func TestAuthorizedExactRetryRejectsStricterRequiredVisibility(t *testing.T) {
 	f := newFixture(t)
 	snapshot, err := f.base.Snapshot(context.Background())
 	if err != nil {
@@ -973,7 +973,7 @@ func TestAuthorizedExactRetrySurvivesPolicyGenerationRefresh(t *testing.T) {
 	}
 	f.clock.Set(snapshot.AsOf.Add(time.Second))
 	decision := f.decision(
-		t, "generation-refresh-recorder",
+		t, "retry-visibility",
 		[][]byte{f.sourceA}, [][]byte{f.policyA},
 		[]auth.Operation{auth.OperationRetrieve},
 	)
@@ -982,43 +982,44 @@ func TestAuthorizedExactRetrySurvivesPolicyGenerationRefresh(t *testing.T) {
 		t.Fatal(err)
 	}
 	session := interaction.Session{
-		ID:         interaction.DerivedID("session", "generation-refresh"),
-		Operation:  interaction.OperationRetrieval,
-		SnapshotID: shoal.ID(snapshot.ID), SnapshotAsOf: snapshot.AsOf,
+		ID: interaction.DerivedID(
+			"session", "authorized-retry-visibility"),
+		Operation:                interaction.OperationRetrieval,
+		SnapshotID:               shoal.ID(snapshot.ID),
+		SnapshotAsOf:             snapshot.AsOf,
 		AuthorizationFingerprint: shoal.ID(fingerprint.String()),
 		AuthorizationExpiresAt:   decision.AuthenticationExpires(),
 	}
-	first, err := f.clientA.RecordInteractionResult(
-		f.context(t, decision), session)
+	firstContext, err := interaction.WithRequiredVisibility(
+		f.context(t, decision), []string{"restricted"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := f.clientA.RecordInteractionResult(firstContext, session)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	f.reader.Set(f.domain, 2)
-	refreshed := f.decisionAtGeneration(
-		t, "generation-refresh-recorder",
-		[][]byte{f.sourceA}, [][]byte{f.policyA},
-		[]auth.Operation{auth.OperationRetrieve},
-		2,
-	)
-	retry := session
-	retry.SnapshotID = "newer-snapshot"
-	retry.SnapshotAsOf = retry.SnapshotAsOf.Add(time.Minute)
-	retried, err := f.clientA.RecordInteractionResult(
-		f.context(t, refreshed), retry)
+	f.clock.Set(f.clock.Now().Add(time.Second))
+	retryContext, err := interaction.WithRequiredVisibility(
+		f.context(t, decision), []string{"restricted", "sensitive"})
 	if err != nil {
-		t.Fatalf("exact retry after policy refresh was rejected: %v", err)
+		t.Fatal(err)
 	}
-	if !reflect.DeepEqual(retried, first) {
-		t.Fatalf("retry result differs: got %+v want %+v", retried, first)
+	if _, err := f.clientA.RecordInteractionResult(
+		retryContext, session,
+	); !shoal.IsErrorCode(err, shoal.ErrorConflict) {
+		t.Fatalf("stricter visibility retry error = %v", err)
 	}
 
-	divergent := session
-	divergent.QueryDigest = "different"
-	if _, err := f.clientA.RecordInteractionResult(
-		f.context(t, refreshed), divergent,
-	); !shoal.IsErrorCode(err, shoal.ErrorConflict) {
-		t.Fatalf("divergent retry error = %v, want conflict", err)
+	record, err := f.base.InteractionRecord(context.Background(), session.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.Summary.Visibility != "restricted" ||
+		record.Session.ID != first.ID ||
+		!record.Session.RecordedAt.Equal(first.RecordedAt) {
+		t.Fatalf("stricter retry changed durable record: %+v", record)
 	}
 }
 

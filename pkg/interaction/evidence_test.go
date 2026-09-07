@@ -1,13 +1,50 @@
 package interaction_test
 
 import (
+	"reflect"
 	"testing"
 	"time"
 
+	"github.com/phrocker/shoal-oss/pkg/document"
 	"github.com/phrocker/shoal-oss/pkg/interaction"
 	"github.com/phrocker/shoal-oss/pkg/ontology"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
+
+func TestDocumentEvidenceRetainsResolvedSourceRoles(t *testing.T) {
+	citation := document.Citation{
+		DocumentID: "document",
+		RevisionID: "revision",
+		SpanID:     "span",
+		Range: document.SourceRange{
+			Start: document.SourcePosition{Offset: 0},
+			End:   document.SourcePosition{Offset: 1},
+		},
+	}
+	reference := interaction.EvidenceReference{
+		AnchorID: "anchor",
+		Kind:     interaction.EvidenceDocument,
+		Citation: citation,
+		NodeIDs:  []shoal.ID{"span", "document", "section"},
+	}
+	canonical, err := reference.Canonical()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if canonical.Citation.SectionID != "" ||
+		!reflect.DeepEqual(
+			canonical.NodeIDs,
+			[]shoal.ID{"document", "section", "span"},
+		) {
+		t.Fatalf("canonical document evidence = %+v", canonical)
+	}
+
+	incomplete := reference
+	incomplete.NodeIDs = append(incomplete.NodeIDs, "untrusted-extra")
+	if err := incomplete.Validate(); err == nil {
+		t.Fatal("too many resolved source nodes were accepted")
+	}
+}
 
 func TestSessionCanonicalPreservesExactEvidence(t *testing.T) {
 	evidence := interaction.EvidenceReference{

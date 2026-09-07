@@ -569,6 +569,82 @@ func TestUnicodeExactQuoteOffsetsAreReverified(t *testing.T) {
 	}
 }
 
+func TestPartialDocumentCitationsCaptureResolvedProvenance(t *testing.T) {
+	for _, omitted := range []string{"section", "span"} {
+		t.Run(omitted, func(t *testing.T) {
+			fixture := newFixture(t, []sourceFixture{{
+				content: "# Partial\n\nResolved source roles remain authoritative.\n",
+			}}, false, "policy", "request")
+			citation, quote, ok := fixture.documentAnchors[0].Document()
+			if !ok {
+				t.Fatal("fixture anchor is not document evidence")
+			}
+			resolvedSectionID := citation.SectionID
+			resolvedSpanID := citation.SpanID
+			if omitted == "section" {
+				citation.SectionID = ""
+			} else {
+				citation.SpanID = ""
+			}
+			addition, err := inference.NewDocumentAnchor(citation, quote)
+			if err != nil {
+				t.Fatal(err)
+			}
+			result := fixture.extendedResult(t, addition)
+			builder, err := reasoning.NewBuilder(fixture.reader())
+			if err != nil {
+				t.Fatal(err)
+			}
+			prepared, err := builder.Build(
+				context.Background(), reasoning.BuildInput{
+					ContextPack: fixture.pack,
+					Result:      result,
+					Policy: reasoning.Policy{
+						ID: fixture.policyID,
+					},
+				})
+			if err != nil {
+				t.Fatal(err)
+			}
+			additions := prepared.CaptureMetadata().AdditionEvidence()
+			if len(additions) != 1 ||
+				additions[0].Citation != citation ||
+				len(additions[0].NodeIDs) != 3 ||
+				!testContainsID(additions[0].NodeIDs, resolvedSectionID) ||
+				!testContainsID(additions[0].NodeIDs, resolvedSpanID) {
+				t.Fatalf("resolved addition evidence = %+v", additions)
+			}
+			recorder, err := interaction.NewRecorder(
+				context.Background(), fixture.client)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := recorder.SetClock(func() time.Time {
+				return fixture.generatedAt.Add(time.Minute)
+			}); err != nil {
+				t.Fatal(err)
+			}
+			response, err := prepared.Capture(
+				context.Background(), recorder, captureSession(t, prepared))
+			if err != nil {
+				t.Fatal(err)
+			}
+			recorded := response.RecordedSession()
+			if len(recorded.Turns) != 1 ||
+				recorded.Turns[0].ToolCall == nil ||
+				len(recorded.Turns[0].ToolCall.RetrievedEvidence) != 1 {
+				t.Fatalf("recorded partial citation = %+v", recorded)
+			}
+			reference := recorded.Turns[0].ToolCall.RetrievedEvidence[0]
+			if reference.Citation != citation ||
+				!testContainsID(reference.NodeIDs, resolvedSectionID) ||
+				!testContainsID(reference.NodeIDs, resolvedSpanID) {
+				t.Fatalf("recorded resolved roles = %+v", reference)
+			}
+		})
+	}
+}
+
 func TestCitationAndRetrievedIdentitiesAreNotClippedAtTwenty(t *testing.T) {
 	sources := make([]sourceFixture, 21)
 	for index := range sources {
@@ -1352,4 +1428,13 @@ func assertStrings(t *testing.T, actual, expected []string) {
 			t.Fatalf("strings = %v, want %v", actual, expected)
 		}
 	}
+}
+
+func testContainsID(values []shoal.ID, target shoal.ID) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
 }

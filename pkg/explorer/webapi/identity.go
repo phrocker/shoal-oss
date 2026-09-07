@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
+	"github.com/phrocker/shoal-oss/pkg/ontology"
 )
 
 // IdentityResponse projects the trusted per-request decision into the browser
@@ -36,15 +37,22 @@ import (
 // deliberately omitted so the browser cannot reconstruct another principal's
 // visibility from its own identity view.
 type IdentityResponse struct {
-	Authenticated         bool      `json:"authenticated"`
-	Subject               string    `json:"subject,omitempty"`
-	Actor                 string    `json:"actor,omitempty"`
-	AuthorizationDomain   string    `json:"authorization_domain,omitempty"`
-	Operations            []string  `json:"operations"`
-	PolicyGeneration      int64     `json:"policy_generation,omitempty"`
-	AuthenticationExpires time.Time `json:"authentication_expires,omitempty"`
-	AuditPurpose          string    `json:"audit_purpose,omitempty"`
-	RequestID             string    `json:"request_id,omitempty"`
+	Authenticated         bool              `json:"authenticated"`
+	Subject               string            `json:"subject,omitempty"`
+	Actor                 string            `json:"actor,omitempty"`
+	AuthorizationDomain   string            `json:"authorization_domain,omitempty"`
+	Operations            []string          `json:"operations"`
+	PolicyGeneration      int64             `json:"policy_generation,omitempty"`
+	AuthenticationExpires time.Time         `json:"authentication_expires,omitempty"`
+	AuditPurpose          string            `json:"audit_purpose,omitempty"`
+	RequestID             string            `json:"request_id,omitempty"`
+	SelectedOntology      *IdentityOntology `json:"selected_ontology,omitempty"`
+}
+
+// IdentityOntology is the immutable read-time lens currently in force.
+type IdentityOntology struct {
+	SchemaID  string `json:"schema_id"`
+	VersionID string `json:"version_id"`
 }
 
 type identityContextKey struct{}
@@ -84,7 +92,17 @@ func projectDecision(decision auth.Decision) IdentityResponse {
 	if domain := decision.AuthorizationDomain(); len(domain) > 0 {
 		identity.AuthorizationDomain = string(domain)
 	}
+	if selected, ok := decision.SelectedOntology(); ok {
+		identity.SelectedOntology = identityOntology(selected)
+	}
 	return identity
+}
+
+func identityOntology(value ontology.OntologyIdentity) *IdentityOntology {
+	return &IdentityOntology{
+		SchemaID:  encodeID(value.SchemaID()),
+		VersionID: encodeID(value.VersionID()),
+	}
 }
 
 // unauthenticatedIdentity is the projection for a transport that established no

@@ -135,6 +135,7 @@ func analyticsEndpoint(service Service) http.HandlerFunc {
 			writeError(writer, shoal.NewError(shoal.ErrorInvalidArgument, err.Error()))
 			return
 		}
+		applyWorkspaceRequestLimits(request.Context(), &input)
 		if err := exploreranalytics.ValidateRequest(
 			exploreranalytics.Request{
 				SnapshotID: input.Snapshot.ID,

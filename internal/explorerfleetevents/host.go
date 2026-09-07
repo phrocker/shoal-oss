@@ -89,7 +89,14 @@ func ComposeHosted(ctx context.Context, config HostConfig) (*HostedServices, err
 	if err := recorder.SetClock(config.Clock); err != nil {
 		return nil, err
 	}
-	lifecycleRecorder, err := explorerfleet.NewLifecycleRecorder(recorder)
+	interactionReader, ok := config.Interaction.(explorerfleet.LifecycleInteractionReader)
+	if !ok {
+		return nil, shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			"interaction result sink must expose authoritative receipt reads")
+	}
+	lifecycleRecorder, err := explorerfleet.NewLifecycleRecorderWithReader(
+		config.Interaction, interactionReader)
 	if err != nil {
 		return nil, err
 	}

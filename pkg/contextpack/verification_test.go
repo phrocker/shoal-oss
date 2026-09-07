@@ -288,7 +288,7 @@ func TestVerifyResultProjectsGraphAdditionAssertionsAndVisibility(t *testing.T) 
 	}
 }
 
-func TestVerifiedDocumentReferenceRequiresExplicitSourceRoles(t *testing.T) {
+func TestVerifiedDocumentReferenceRetainsResolvedSourceRoles(t *testing.T) {
 	client, request, response, pins := embeddedFixture(t)
 	pack, err := (Builder{Reader: client}).Build(
 		context.Background(), InitialRequest{
@@ -300,6 +300,8 @@ func TestVerifiedDocumentReferenceRequiresExplicitSourceRoles(t *testing.T) {
 	}
 	citation := response.Results[0].Evidence[0].Citation
 	quote := response.Results[0].Evidence[0].Quote
+	resolvedSectionID := citation.SectionID
+	resolvedSpanID := citation.SpanID
 	citation.SpanID = ""
 	addition, err := inference.NewDocumentAnchor(citation, quote)
 	if err != nil {
@@ -333,12 +335,15 @@ func TestVerifiedDocumentReferenceRequiresExplicitSourceRoles(t *testing.T) {
 		if anchor.Anchor().ID() != addition.ID() {
 			continue
 		}
-		if _, err := anchor.EvidenceReference(); err == nil ||
-			!strings.Contains(
-				err.Error(),
-				"requires explicit section and span identities",
-			) {
-			t.Fatalf("incomplete source role projection error = %v", err)
+		reference, err := anchor.EvidenceReference()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if reference.Citation.SpanID != "" ||
+			len(reference.NodeIDs) != 3 ||
+			!testContainsID(reference.NodeIDs, resolvedSectionID) ||
+			!testContainsID(reference.NodeIDs, resolvedSpanID) {
+			t.Fatalf("resolved source role projection = %+v", reference)
 		}
 		return
 	}
@@ -394,6 +399,15 @@ func (r *verificationGraphReader) Neighborhood(
 }
 
 func containsString(values []string, target string) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
+}
+
+func testContainsID(values []shoal.ID, target shoal.ID) bool {
 	for _, value := range values {
 		if value == target {
 			return true

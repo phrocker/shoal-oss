@@ -223,6 +223,8 @@ func (s *DispatchService) Claim(ctx context.Context, request ClaimRequest) (Acti
 	}
 	next.UpdatedAt = now
 	next.Actor = decision.Actor()
+	next.TransitionRequestID = decision.RequestID()
+	next.TransitionCorrelationID = decision.CorrelationID()
 	next.AuthorizedOperations = canonicalOperations(append(
 		next.AuthorizedOperations, decisionOperations(decision, auth.OperationInvoke)...))
 	next.ExecutionFingerprint, err = auth.AuthorizationFingerprint(decision)
@@ -415,6 +417,8 @@ func (s *DispatchService) ExecuteClaim(ctx context.Context, claimed ActionRecord
 	}
 	next.ExecutionPolicyGeneration = finalDecision.PolicyGeneration()
 	next.ExecutionExpiresAt = finalDecision.AuthenticationExpires()
+	next.TransitionRequestID = finalDecision.RequestID()
+	next.TransitionCorrelationID = finalDecision.CorrelationID()
 	if err := s.recorder.RecordAction(ctx, ActionAudit{
 		Phase: "effect_outcome", Operation: auth.OperationInvoke, Record: next, EffectError: executionErr,
 	}); err != nil {
@@ -505,6 +509,18 @@ func (s *DispatchService) Cancel(ctx context.Context, request CancelRequest) (Ac
 	next.State = DispatchCanceled
 	next.CancelKey = append([]byte(nil), request.MutationKey...)
 	next.UpdatedAt = now
+	next.TransitionRequestID = decision.RequestID()
+	next.TransitionCorrelationID = decision.CorrelationID()
+	next.AuthorizedOperations = canonicalOperations(append(
+		next.AuthorizedOperations,
+		decisionOperations(decision, auth.OperationDispatch)...,
+	))
+	next.CancelAuthorizationFingerprint, err =
+		auth.AuthorizationFingerprint(decision)
+	if err != nil {
+		return ActionRecord{}, err
+	}
+	next.CancelAuthorizationExpiresAt = decision.AuthenticationExpires()
 	if err := s.recorder.RecordAction(ctx, ActionAudit{Phase: "cancel_admission", Operation: auth.OperationDispatch, Record: next}); err != nil {
 		return ActionRecord{}, errors.Join(ErrRecordingUnavailable, err)
 	}

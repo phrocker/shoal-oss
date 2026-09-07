@@ -95,6 +95,57 @@ func TestInteractionWriteResolvesCommittedIndeterminateOutcome(t *testing.T) {
 	}
 }
 
+func TestInteractionWriteConjoinsRequiredOutputVisibility(t *testing.T) {
+	corpus, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer corpus.Close()
+	receipt, err := corpus.Ingest(context.Background(), Source{
+		URI: "file:///source.txt", MediaType: MediaTypeText,
+		Content: "durable source",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	view, err := corpus.Document(
+		context.Background(), receipt.Document.ID, receipt.Revision.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := interaction.Session{
+		ID:                       "interaction.session_workspace-output",
+		RecordedAt:               time.Unix(1700000000, 0).UTC(),
+		SnapshotID:               "snapshot",
+		SnapshotAsOf:             time.Unix(1699999990, 0).UTC(),
+		AuthorizationFingerprint: "auth-sha256:test",
+		AuthorizationExpiresAt:   time.Unix(1700003600, 0).UTC(),
+		SeedNodeIDs:              []shoal.ID{view.Root.Spans[0].ID},
+	}
+	ctx, err := interaction.WithRequiredVisibility(
+		context.Background(), []string{"policy:a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := corpus.RecordInteraction(ctx, session); err != nil {
+		t.Fatal(err)
+	}
+	record := corpus.interactions[session.ID]
+	if record == nil || record.Visibility != "policy:a" {
+		t.Fatalf("recorded visibility = %#v", record)
+	}
+	stricter, err := interaction.WithRequiredVisibility(
+		context.Background(), []string{"policy:a", "policy:b"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := corpus.RecordInteraction(
+		stricter, session,
+	); !shoal.IsErrorCode(err, shoal.ErrorConflict) {
+		t.Fatalf("stricter retry error = %v, want conflict", err)
+	}
+}
+
 func TestInteractionWritePreservesUnresolvedIndeterminateOutcome(t *testing.T) {
 	ctx := context.Background()
 	corpus, err := Open(t.TempDir())

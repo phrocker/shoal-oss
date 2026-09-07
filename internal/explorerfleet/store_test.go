@@ -20,6 +20,7 @@ package explorerfleet
 import (
 	"context"
 	"encoding/json"
+	"math"
 	"sync"
 	"testing"
 	"time"
@@ -30,6 +31,18 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/explorer/fleet"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
+
+func TestStoreRejectsGenerationOverflowBeforeRuntimeAccess(t *testing.T) {
+	descriptor := testDescriptor("agent", math.MinInt64)
+	_, err := (&Store{}).Apply(context.Background(), fleet.Mutation{
+		RegistrationKey:    "overflow",
+		ExpectedGeneration: math.MaxInt64,
+		Descriptor:         descriptor,
+	})
+	if !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
+		t.Fatalf("generation overflow = %v", err)
+	}
+}
 
 func TestStoreCASReplayAndRevocation(t *testing.T) {
 	directory := t.TempDir()

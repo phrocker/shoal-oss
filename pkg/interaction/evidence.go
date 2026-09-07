@@ -86,20 +86,27 @@ func (r EvidenceReference) Validate() error {
 				shoal.ErrorInvalidArgument,
 				"document evidence cannot contain graph edge references")
 		}
-		var required []shoal.ID
-		for _, id := range []shoal.ID{
-			r.Citation.DocumentID, r.Citation.SectionID, r.Citation.SpanID,
-		} {
-			if id != "" {
-				required = append(required, id)
-			}
+		required := []shoal.ID{r.Citation.DocumentID}
+		if r.Citation.SectionID != "" {
+			required = append(required, r.Citation.SectionID)
+		}
+		if r.Citation.SpanID != "" {
+			required = append(required, r.Citation.SpanID)
 		}
 		required = dedupeIDs(required)
 		actual := dedupeIDs(r.NodeIDs)
-		if !equalIDs(actual, required) {
+		if len(actual) > 3 ||
+			(len(actual) != len(required) && len(actual) != 3) {
 			return shoal.NewError(
 				shoal.ErrorInvalidArgument,
-				"document evidence nodes do not exactly match its citation")
+				"document evidence nodes do not match its citation source roles")
+		}
+		for _, id := range required {
+			if !containsEvidenceID(actual, id) {
+				return shoal.NewError(
+					shoal.ErrorInvalidArgument,
+					"document evidence nodes do not match its citation source roles")
+			}
 		}
 	case EvidenceGraph:
 		if r.Citation != (document.Citation{}) || len(r.NodeIDs) == 0 {

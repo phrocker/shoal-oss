@@ -1651,12 +1651,6 @@ func validateCitationEvidence(evidence CitationEvidence) error {
 		if err := evidence.Citation.Validate(); err != nil {
 			return err
 		}
-		if evidence.Citation.SectionID == "" ||
-			evidence.Citation.SpanID == "" {
-			return shoal.NewError(
-				shoal.ErrorInvalidArgument,
-				"citation evidence requires explicit section and span identities")
-		}
 		if len(evidence.SourceIDs) != 3 {
 			return shoal.NewError(
 				shoal.ErrorInvalidArgument,
