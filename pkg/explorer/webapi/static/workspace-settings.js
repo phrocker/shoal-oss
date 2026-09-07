@@ -75,8 +75,7 @@
   function workspaceAppliesTo(pathname) {
     if (pathname === "/api/v1/auth-config" ||
         workspaceManagementPath(pathname)) return false;
-    return pathname.startsWith("/api/v1/") ||
-      pathname === "/mcp" || pathname.startsWith("/mcp/");
+    return pathname.startsWith("/api/v1/");
   }
 
   function mergeRequestHeaders(input, init) {

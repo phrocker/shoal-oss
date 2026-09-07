@@ -983,6 +983,43 @@ func TestReviewSettingsStoreSchedulesCompactionOutsideStoreMutex(t *testing.T) {
 	}
 }
 
+func TestReviewSettingsReplayDoesNotScheduleCompaction(t *testing.T) {
+	store, err := OpenDurableStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	created, err := store.CompareAndSwap(
+		context.Background(), "replay-compact", "owner", []byte("domain"),
+		0, "create", Narrowing{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.maintenanceMu.Lock()
+	store.uncompacted = settingsCompactInterval - 1
+	store.maintenanceMu.Unlock()
+	compactions := 0
+	compact := store.compact
+	store.compact = func(table string, stack []iterrt.IterSpec) error {
+		compactions++
+		return compact(table, stack)
+	}
+	replayed, err := store.CompareAndSwap(
+		context.Background(), "replay-compact", "owner", []byte("domain"),
+		0, "create", Narrowing{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if replayed.Revision != created.Revision {
+		t.Fatalf("replayed revision = %d, want %d",
+			replayed.Revision, created.Revision)
+	}
+	time.Sleep(20 * time.Millisecond)
+	if compactions != 0 {
+		t.Fatalf("exact replay scheduled %d compactions", compactions)
+	}
+}
+
 func TestReviewSettingsStoreCanUseNonOwningSharedEngine(t *testing.T) {
 	eng, err := engine.Open(t.TempDir(), engine.Options{})
 	if err != nil {

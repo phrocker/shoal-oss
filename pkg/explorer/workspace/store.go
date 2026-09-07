@@ -363,11 +363,6 @@ func (s *DurableStore) CompareAndSwap(
 		current, found, owner, authorizationDomain,
 		expectedRevision, mutationID, digest,
 	); replayed || err != nil {
-		if replayed && err == nil {
-			if retentionErr := s.retainCurrentLocked(found); retentionErr != nil {
-				return result, retentionErr
-			}
-		}
 		return result, err
 	}
 	if found {

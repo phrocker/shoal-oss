@@ -149,8 +149,8 @@ vm.runInContext(fs.readFileSync("static/workspace-settings.js", "utf8"), context
   );
   await window.fetch("/mcp", {method: "POST"});
   assert.strictEqual(
-    calls[3].init.headers.get("Shoal-Workspace-ID"),
-    "d29ya3NwYWNl",
+    new Headers(calls[3].init.headers).has("Shoal-Workspace-ID"),
+    false,
   );
   await window.fetch("/api/v1/auth-config");
   assert.strictEqual(
