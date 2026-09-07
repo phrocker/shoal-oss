@@ -1,0 +1,176 @@
+# Deterministic two-user Shoal demo
+
+This guide provisions a repeatable public-OSS demonstration against one shared
+`shoal-explore-web` service. Two OIDC-authenticated people use the same HTTP
+MCP endpoint, but each uses distinct owner-bound workspace settings.
+
+The seed contains:
+
+- one team;
+- two people mapped to configured OIDC `sub` values;
+- two **simulated fixture agents** (records only; the seed does not launch or
+  register an executor);
+- seven work items; and
+- one deterministic activity record on each of 14 consecutive UTC dates.
+
+Every fixture has stable IDs, timestamps, filenames, and content. Re-running the
+command sends the same workspace mutation IDs and the same uploads. Workspace
+settings use Shoal's compare-and-swap replay behavior, and uploads return
+`unchanged` after their first successful ingestion.
+
+## 1. Run one shared service
+
+Use the same image for local and shared deployments. A shared deployment needs
+OIDC, an exact allowed host, and one persistent state root:
+
+```console
+shoal-explore-web \
+  -state-dir=/var/lib/shoal \
+  -listen=0.0.0.0:8098 \
+  -allowed-host=shoal.example.test
+```
+
+Set the provider-neutral OIDC environment variables shown in
+`deploy/shoal-explore-web/shared.env.example`. Do not use `-dev-auth` on a
+shared listener.
+
+Both demo users need authorization-claim values mapped to:
+
+| Mapping | Operations used by the demo |
+| --- | --- |
+| reader | list, read, connect, retrieve, neighborhood, workspace-settings read |
+| contributor | ingest and workspace-settings write, in addition to reader |
+| fleet | agent and action operations used by the optional Fleet walkthrough |
+
+The seed command verifies each bearer token with `GET /api/v1/identity`. It
+refuses a token whose trusted Shoal subject is not
+`oidc:<configured-issuer>#<configured-subject>` or which lacks `ingest`,
+`workspace_settings_read`, or `workspace_settings_write`.
+
+Persist the **whole** `-state-dir`. With the path above, the corpus (including
+workspace settings) is under `/var/lib/shoal/corpus` and the durable
+authorization catalog is under `/var/lib/shoal/policy`. Both directories must
+survive restarts, and the service must remain a single writer.
+
+## 2. Configure and run the seed
+
+Copy the example without committing the populated copy:
+
+```console
+Copy-Item deploy\shoal-explore-web\demo-scenario.json.example .\demo-scenario.json
+```
+
+Replace only the public endpoint, exact OIDC issuer, the two users' raw subject
+claim values, and non-secret display values. Keep workspace IDs distinct:
+workspace settings are owned by the authenticated subject that creates them,
+so one shared workspace ID cannot be provisioned for two owners.
+
+Put short-lived access tokens in the named environment variables, never in the
+JSON file:
+
+```powershell
+$env:SHOAL_DEMO_TOKEN_ALEX = [System.Net.NetworkCredential]::new(
+  "", (Read-Host "First user's access token" -AsSecureString)).Password
+$env:SHOAL_DEMO_TOKEN_SAM = [System.Net.NetworkCredential]::new(
+  "", (Read-Host "Second user's access token" -AsSecureString)).Password
+go run .\cmd\shoal-demo-seed -config .\demo-scenario.json
+```
+
+The command provisions each workspace through
+`PUT /api/v1/workspaces/{workspace}/settings`, then uploads that user's stable
+fixture subset through `POST /api/v1/ingest` with both
+`X-Shoal-Workspace-Request: 1` and the user's `Shoal-Workspace-ID`.
+The JSON result prints each raw workspace ID and its canonical unpadded
+base64url `workspace_header` value. It never prints a bearer token.
+
+Run the same command again. All workspace mutations must replay at revision 1,
+and every file disposition must be `unchanged`. A conflict indicates that the
+same workspace or fixture filename was previously used with different content;
+choose new demo IDs rather than overwriting unrelated state.
+
+## 3. Configure VS Code HTTP MCP
+
+Shoal exposes one shared Streamable HTTP endpoint:
+
+```text
+https://shoal.example.test/mcp
+```
+
+Copy `.vscode/mcp.json.example` to `.vscode/mcp.json`. The checked-in example
+contains no endpoint, subject, tenant, token, or workspace value. Each user
+starts VS Code with their own process environment:
+
+```powershell
+$env:SHOAL_MCP_URL = "https://shoal.example.test/mcp"
+$env:SHOAL_MCP_BEARER_TOKEN = [System.Net.NetworkCredential]::new(
+  "", (Read-Host "This user's access token" -AsSecureString)).Password
+$env:SHOAL_MCP_WORKSPACE_ID = "<this user's workspace_header from the seed>"
+code .
+```
+
+The two users set the same `SHOAL_MCP_URL`, but different bearer tokens and
+different `SHOAL_MCP_WORKSPACE_ID` values. The required configured headers are:
+
+- `Authorization: Bearer ...` — authenticates the caller; and
+- `Shoal-Workspace-ID: ...` — selects only settings owned by that caller.
+
+VS Code supplies the MCP `Accept`, content type, protocol-version, and session
+headers as part of the Streamable HTTP lifecycle. For direct protocol
+diagnostics, clients must advertise both `application/json` and
+`text/event-stream`; after initialization they must return the
+`MCP-Session-Id` and `MCP-Protocol-Version` headers.
+
+### Bearer-token workaround and refresh limitation
+
+Shoal currently validates bearer tokens but does not publish the MCP OAuth
+discovery/challenge flow that would let VS Code acquire and refresh them. The
+environment-backed `Authorization` header is therefore a workaround, not an
+automatic sign-in flow. When a token expires, close the VS Code process that
+inherited it, obtain a new token, update `SHOAL_MCP_BEARER_TOKEN`, relaunch VS
+Code, and restart the Shoal MCP server. Do not put a live token in
+`.vscode/mcp.json`, user settings, source control, terminal history, or the
+scenario JSON.
+
+The shared service's `-allowed-host` value must exactly match the authority in
+`SHOAL_MCP_URL` (hostname comparison is case-insensitive; ports are exact).
+`X-Forwarded-Host` is not trusted.
+
+## 4. Two-user walkthrough
+
+1. Start the shared service and confirm its state root is on persistent
+   storage.
+2. Run the seed once with both users' tokens, then rerun it and confirm all
+   fixture dispositions are `unchanged`.
+3. User A launches VS Code with User A's token and workspace header. User B
+   launches a separate VS Code process with User B's values. Both point to the
+   same `/mcp` URL.
+4. In each window, run **MCP: List Servers**, start `shoal`, and inspect the
+   server output if initialization fails.
+5. Ask each user to retrieve the demo team, work items, and 14-day activity.
+   The shared corpus is visible under the user's own narrowing settings, while
+   recorded MCP operations are attributed to that user's trusted principal.
+6. Optionally exercise Fleet tools only after the host has registered matching
+   executor references and the user's OIDC claims include the fleet mapping.
+   The two fixture agents are intentionally labeled `mode: simulated`; the seed
+   itself claims no autonomous executor.
+7. Restart the service without replacing the state volume. Reconnect both
+   users and confirm the fixtures and workspace settings remain available.
+
+## 5. Visibility boundary
+
+Shoal records interactions only when a request reaches a Shoal HTTP/MCP
+operation. It does **not** observe arbitrary editor activity.
+
+To demonstrate the boundary:
+
+1. Call `shoal.provenance.list` and note the latest interaction.
+2. Edit and save a file directly in VS Code.
+3. Run a terminal command and `git status` without invoking a Shoal tool.
+4. Call `shoal.provenance.list` again.
+
+Steps 2 and 3 produce **no Shoal interaction** because no request crossed the
+Shoal MCP boundary. The second provenance call records its own MCP tool use, so
+compare the records immediately before that final call (or filter out the two
+list calls). Shoal must not be presented as capturing file edits, terminal
+commands, Git operations, complete Copilot conversations, or reasoning that
+occurred outside its tools.

@@ -183,6 +183,10 @@ request must carry one canonical `Shoal-Workspace-ID` header. The initialize
 result reports the applied workspace identity, settings revision, cache
 dimensions, and limits in `_meta["shoal.workspace"]`.
 
+For a deterministic two-user shared-service setup, including owner-bound
+workspace provisioning and a VS Code Streamable HTTP template, see
+[`docs/multi-user-demo.md`](docs/multi-user-demo.md).
+
 The first-party web command also exposes `shoal.ask` and
 `shoal.provenance.{list,inspect,fold,unfold}` through adapters over the same
 chat and interaction providers used by the HTTP API. Ask returns complete
