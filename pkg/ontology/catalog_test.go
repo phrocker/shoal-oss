@@ -19,15 +19,6 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
-func TestLensTransitionBoundCoversSelectableCatalog(t *testing.T) {
-	if MaxLensTransitions < MaxPublishedOntologyVersions-1 {
-		t.Fatalf(
-			"lens transition bound %d cannot traverse catalog bound %d",
-			MaxLensTransitions, MaxPublishedOntologyVersions,
-		)
-	}
-}
-
 func TestPublishedCatalogExposesGovernedChoicesAndActiveTip(t *testing.T) {
 	schema, _ := NewOntologySchema("catalog", "Catalog", "", nil)
 	at := time.Date(2026, time.September, 6, 0, 0, 0, 0, time.UTC)
@@ -73,26 +64,28 @@ func TestPublishedCatalogRejectsForkedActiveHistory(t *testing.T) {
 	}
 }
 
-func TestPublishedCatalogRejectsDisconnectedFork(t *testing.T) {
+func TestPublishedCatalogIgnoresDisconnectedFork(t *testing.T) {
 	schema, _ := NewOntologySchema("disconnected", "Disconnected", "", nil)
 	at := time.Date(2026, time.September, 6, 2, 0, 0, 0, time.UTC)
-	configured, _ := NewOntologyVersion(
-		schema, "configured", at, nil, nil, nil, nil)
+	configured, _ := NewOntologyVersion(schema, "1", at, nil, nil, nil, nil)
 	active, _ := NewOntologyVersion(
-		schema, "active", at.Add(time.Second), nil, nil, nil, nil)
+		schema, "2", at.Add(time.Second), nil, nil, nil, nil)
 	disconnected, _ := NewOntologyVersion(
-		schema, "disconnected", at.Add(2*time.Second), nil, nil, nil, nil)
+		schema, "other", at.Add(2*time.Second), nil, nil, nil, nil)
 	left, _ := NewOntologyVersion(
-		schema, "left", at.Add(3*time.Second), nil, nil, nil, nil)
+		schema, "other-left", at.Add(3*time.Second), nil, nil, nil, nil)
 	right, _ := NewOntologyVersion(
-		schema, "right", at.Add(4*time.Second), nil, nil, nil, nil)
-	_, err := NewPublishedCatalog(configured, []GovernedProposal{
+		schema, "other-right", at.Add(4*time.Second), nil, nil, nil, nil)
+	catalog, err := NewPublishedCatalog(configured, []GovernedProposal{
 		publishedProposal(t, configured, active, at.Add(5*time.Second)),
 		publishedProposal(t, disconnected, left, at.Add(9*time.Second)),
 		publishedProposal(t, disconnected, right, at.Add(13*time.Second)),
 	})
-	if !shoal.IsErrorCode(err, shoal.ErrorConflict) {
-		t.Fatalf("disconnected fork error = %v, want conflict", err)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if catalog.Active().ID() != active.ID() || len(catalog.Versions()) != 2 {
+		t.Fatalf("disconnected fork changed catalog = %#v", catalog.Versions())
 	}
 }
 

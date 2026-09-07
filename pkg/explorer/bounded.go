@@ -24,7 +24,6 @@ import (
 	"encoding/hex"
 	"math"
 	"sort"
-	"strings"
 	"time"
 
 	"github.com/phrocker/shoal-oss/pkg/document"
@@ -94,18 +93,6 @@ func (e *Explorer) ValidateEvidenceSnapshot(
 	}
 	return e.validateEvidenceSnapshotLocked(
 		id, asOf, nodeIDs, edgeIDs, references)
-}
-
-// ValidateSnapshotEvidence preserves the edge-aware validator contract for
-// callers that do not carry structured evidence references.
-func (e *Explorer) ValidateSnapshotEvidence(
-	ctx context.Context,
-	id shoal.ID,
-	asOf time.Time,
-	nodeIDs []shoal.ID,
-	edgeIDs []shoal.ID,
-) error {
-	return e.ValidateEvidenceSnapshot(ctx, id, asOf, nodeIDs, edgeIDs, nil)
 }
 
 func (e *Explorer) validateEvidenceSnapshotLocked(
@@ -280,15 +267,13 @@ func (e *Explorer) validateEvidenceReferenceLocked(
 				"interaction graph evidence omits authoritative assertions",
 			)
 		}
-		if strings.HasPrefix(string(canonical.AnchorID), "evidence-anchor:") {
-			anchor, err := inference.NewGraphAnchorWithAssertions(
-				path, canonical.Assertions)
-			if err != nil || anchor.ID() != canonical.AnchorID {
-				return shoal.NewError(
-					shoal.ErrorConflict,
-					"interaction graph anchor identity is not authoritative",
-				)
-			}
+		anchor, err := inference.NewGraphAnchorWithAssertions(
+			path, canonical.Assertions)
+		if err != nil || anchor.ID() != canonical.AnchorID {
+			return shoal.NewError(
+				shoal.ErrorConflict,
+				"interaction graph anchor identity is not authoritative",
+			)
 		}
 	default:
 		return shoal.NewError(

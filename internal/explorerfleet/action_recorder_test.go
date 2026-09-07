@@ -20,21 +20,6 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
-type fixedActionSnapshot struct{ snapshot explorer.Snapshot }
-
-func (s fixedActionSnapshot) InteractionSnapshot(
-	context.Context,
-) (explorer.Snapshot, error) {
-	return s.snapshot, nil
-}
-
-func testActionSnapshots() fixedActionSnapshot {
-	return fixedActionSnapshot{snapshot: explorer.Snapshot{
-		ID:   "trusted-snapshot",
-		AsOf: time.Date(2026, 9, 6, 8, 30, 0, 0, time.UTC),
-	}}
-}
-
 func TestActionRecorderPreservesExactEvidenceAndTrustedResult(t *testing.T) {
 	record := testActionRecord()
 	record.EvidenceSnapshotID = "snapshot"
@@ -42,7 +27,7 @@ func TestActionRecorderPreservesExactEvidenceAndTrustedResult(t *testing.T) {
 	record.ExecutionFingerprint = auth.Fingerprint(sha256.Sum256([]byte("authorization")))
 	record.ExecutionExpiresAt = record.Deadline
 	sink := &capturingActionRecorder{record: record}
-	recorder, err := NewActionRecorder(sink, testActionSnapshots())
+	recorder, err := NewActionRecorder(sink)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -107,20 +92,14 @@ func TestActionRecorderPreservesExactEvidenceAndTrustedResult(t *testing.T) {
 
 func TestActionRecorderRejectsAbsentAndDivergentResult(t *testing.T) {
 	var typedNil *capturingActionRecorder
-	if _, err := NewActionRecorder(typedNil, testActionSnapshots()); !shoal.IsErrorCode(
+	if _, err := NewActionRecorder(typedNil); !shoal.IsErrorCode(
 		err, shoal.ErrorInvalidArgument,
 	) {
 		t.Fatalf("typed nil recorder error = %v", err)
 	}
-	var typedNilSnapshots *fixedActionSnapshot
-	if _, err := NewActionRecorder(
-		&capturingActionRecorder{}, typedNilSnapshots,
-	); !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
-		t.Fatalf("typed nil snapshots error = %v", err)
-	}
 	record := testActionRecord()
 	sink := &capturingActionRecorder{record: record, diverge: true}
-	recorder, err := NewActionRecorder(sink, testActionSnapshots())
+	recorder, err := NewActionRecorder(sink)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -141,7 +120,7 @@ func TestActionRecorderReturnsSinkErrorsUnchanged(t *testing.T) {
 	sinkErr := errors.New("ambiguous durable sink")
 	recorder, err := NewActionRecorder(&capturingActionRecorder{
 		record: record, err: sinkErr,
-	}, testActionSnapshots())
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -167,7 +146,7 @@ func TestActionRecorderMarksErrorCodeOutcomeFailed(t *testing.T) {
 	record.EffectPossible = true
 	record.ErrorCode = "executor_failure"
 	sink := &capturingActionRecorder{record: record}
-	recorder, err := NewActionRecorder(sink, testActionSnapshots())
+	recorder, err := NewActionRecorder(sink)
 	if err != nil {
 		t.Fatal(err)
 	}

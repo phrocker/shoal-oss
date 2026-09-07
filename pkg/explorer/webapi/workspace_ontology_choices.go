@@ -29,42 +29,25 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
-// GovernedOntologyProposalSource exposes durable proposal history without
-// routing through the generic graph-read authorization path.
-type GovernedOntologyProposalSource interface {
-	OntologyProposals(context.Context) ([]ontology.GovernedProposal, error)
-}
-
 // GovernedOntologyChoices adapts the live RDO publication state to the
 // workspace settings eligibility contract.
 type GovernedOntologyChoices struct {
-	configured *ontology.OntologyVersion
-	source     GovernedOntologyProposalSource
+	source OntologyCatalogProvider
 }
 
 // NewGovernedOntologyChoices constructs a live, read-only choice adapter.
+// source must expose a trusted caller-independent catalog; request-scoped
+// authorization is applied separately to each workspace operation.
 func NewGovernedOntologyChoices(
-	configured *ontology.OntologyVersion,
-	source GovernedOntologyProposalSource,
+	source OntologyCatalogProvider,
 ) (*GovernedOntologyChoices, error) {
-	if absentGovernedOntologyProposalSource(source) {
+	if absentOntologyCatalogProvider(source) {
 		return nil, shoal.NewError(
 			shoal.ErrorInvalidArgument,
 			"governed ontology source is required",
 		)
 	}
-	var cloned *ontology.OntologyVersion
-	if configured != nil {
-		if err := configured.Validate(); err != nil {
-			return nil, err
-		}
-		value := *configured
-		cloned = &value
-	}
-	return &GovernedOntologyChoices{
-		configured: cloned,
-		source:     source,
-	}, nil
+	return &GovernedOntologyChoices{source: source}, nil
 }
 
 // ListOntologyChoices returns only the active ontology and its retained
@@ -72,26 +55,31 @@ func NewGovernedOntologyChoices(
 // selectable.
 func (c *GovernedOntologyChoices) ListOntologyChoices(
 	ctx context.Context,
-	_ auth.Decision,
+	decision auth.Decision,
 ) ([]workspace.OntologyChoice, error) {
-	if c.configured == nil {
+	catalog, configured, err := c.catalog(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if !configured {
 		return []workspace.OntologyChoice{}, nil
 	}
-	proposals, err := c.source.OntologyProposals(ctx)
-	if err != nil {
-		return nil, err
-	}
-	catalog, err := boundedOntologyCatalog(*c.configured, proposals)
-	if err != nil {
-		return nil, err
-	}
 	active := catalog.ActiveIdentity()
-	identities := catalog.Identities()
-	choices := make([]workspace.OntologyChoice, 0, len(identities))
-	for index := len(identities) - 1; index >= 0; index-- {
-		identity := identities[index]
+	versions := catalog.Versions()
+	choices := make([]workspace.OntologyChoice, 0, len(versions))
+	selected, selectedSet := decision.SelectedOntology()
+	for index := len(versions) - 1; index >= 0; index-- {
+		version := versions[index]
+		identity, err := ontology.NewOntologyIdentity(version)
+		if err != nil {
+			return nil, err
+		}
+		if selectedSet && identity != selected {
+			continue
+		}
 		choices = append(choices, workspace.OntologyChoice{
 			Identity: identity,
+			Version:  version.Version(),
 			Active:   identity == active,
 		})
 	}
@@ -108,20 +96,48 @@ func (c *GovernedOntologyChoices) AuthorizeOntology(
 	if err := identity.Validate(); err != nil {
 		return err
 	}
-	choices, err := c.ListOntologyChoices(ctx, decision)
+	if selected, ok := decision.SelectedOntology(); ok && selected != identity {
+		return shoal.NewError(shoal.ErrorUnauthorized, "authorization denied")
+	}
+	catalog, configured, err := c.catalog(ctx)
 	if err != nil {
 		return err
 	}
-	for _, choice := range choices {
-		if choice.Identity == identity {
-			return nil
-		}
+	if configured && catalog.Contains(identity) {
+		return nil
 	}
 	return shoal.NewError(shoal.ErrorUnauthorized, "authorization denied")
 }
 
-func absentGovernedOntologyProposalSource(
-	value GovernedOntologyProposalSource,
+// AuthorizeOntologyForOperation checks one identity through the service's
+// non-disclosing membership seam when available. Catalog listing remains
+// reserved for explicit settings management reads and writes.
+func (c *GovernedOntologyChoices) AuthorizeOntologyForOperation(
+	ctx context.Context,
+	decision auth.Decision,
+	identity ontology.OntologyIdentity,
+	operation auth.Operation,
+) error {
+	if err := identity.Validate(); err != nil {
+		return err
+	}
+	if selected, ok := decision.SelectedOntology(); ok && selected != identity {
+		return shoal.NewError(shoal.ErrorUnauthorized, "authorization denied")
+	}
+	if authorizer, ok := c.source.(OntologySelectionAuthorizer); ok {
+		return authorizer.AuthorizeOntologySelection(ctx, identity, operation)
+	}
+	return c.AuthorizeOntology(ctx, decision, identity)
+}
+
+func (c *GovernedOntologyChoices) catalog(
+	ctx context.Context,
+) (ontology.PublishedCatalog, bool, error) {
+	return c.source.OntologyCatalog(ctx)
+}
+
+func absentOntologyCatalogProvider(
+	value OntologyCatalogProvider,
 ) bool {
 	if value == nil {
 		return true

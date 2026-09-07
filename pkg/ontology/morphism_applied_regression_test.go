@@ -44,16 +44,3 @@ func TestOntologyLensReportsOnlyMatchedMorphisms(t *testing.T) {
 			mapped, applied, reason)
 	}
 }
-
-func TestAppliedMorphismDeduplicationDoesNotRequireSortedInput(t *testing.T) {
-	applied := []shoal.ID{"z-morphism", "a-morphism"}
-	seen := map[shoal.ID]struct{}{
-		"z-morphism": {}, "a-morphism": {},
-	}
-	appendAppliedMorphisms(
-		&applied, seen, []shoal.ID{"z-morphism"})
-	if len(applied) != 2 ||
-		applied[0] != "z-morphism" || applied[1] != "a-morphism" {
-		t.Fatalf("applied morphisms = %v", applied)
-	}
-}

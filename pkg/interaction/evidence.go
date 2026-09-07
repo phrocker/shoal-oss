@@ -21,7 +21,6 @@ package interaction
 
 import (
 	"sort"
-	"strings"
 
 	"github.com/phrocker/shoal-oss/pkg/document"
 	"github.com/phrocker/shoal-oss/pkg/ontology"
@@ -115,8 +114,7 @@ func (r EvidenceReference) Validate() error {
 				shoal.ErrorInvalidArgument,
 				"graph evidence has an invalid variant")
 		}
-		if strings.HasPrefix(string(r.AnchorID), "evidence-anchor:") &&
-			len(r.EdgeIDs) != len(r.NodeIDs)-1 {
+		if len(r.EdgeIDs) != len(r.NodeIDs)-1 {
 			return shoal.NewError(
 				shoal.ErrorInvalidArgument,
 				"graph evidence path has inconsistent edges")

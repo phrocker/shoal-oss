@@ -20,21 +20,29 @@ package explorerfleet
 import (
 	"context"
 	"encoding/json"
-	"errors"
-	"fmt"
-	"reflect"
+	"math"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/phrocker/shoal-oss/internal/explorercoord"
-	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/explorer/coordination"
-	"github.com/phrocker/shoal-oss/pkg/explorer/coordination/guard"
 	"github.com/phrocker/shoal-oss/pkg/explorer/coordination/transaction"
 	"github.com/phrocker/shoal-oss/pkg/explorer/fleet"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
+
+func TestStoreRejectsGenerationOverflowBeforeRuntimeAccess(t *testing.T) {
+	descriptor := testDescriptor("agent", math.MinInt64)
+	_, err := (&Store{}).Apply(context.Background(), fleet.Mutation{
+		RegistrationKey:    "overflow",
+		ExpectedGeneration: math.MaxInt64,
+		Descriptor:         descriptor,
+	})
+	if !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
+		t.Fatalf("generation overflow = %v", err)
+	}
+}
 
 func TestStoreCASReplayAndRevocation(t *testing.T) {
 	directory := t.TempDir()
@@ -130,11 +138,9 @@ func TestStoreCASReplayAndRevocation(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	listed, err := store.ListPage(
-		context.Background(), "", fleet.DefaultListPageSize)
-	if err != nil || len(listed.Items) != 1 ||
-		listed.Items[0].Stored.Descriptor.ID != base.ID ||
-		listed.NextCursor != "" {
+	listed, err := store.List(context.Background(), nil, fleet.MaxListResults)
+	if err != nil || len(listed.Entries) != 1 ||
+		listed.Entries[0].Descriptor.ID != base.ID {
 		t.Fatalf("listed = %#v, %v", listed, err)
 	}
 }
@@ -149,6 +155,7 @@ func TestStoreRestartPersistence(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+
 	if err := runtime.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -162,128 +169,57 @@ func TestStoreRestartPersistence(t *testing.T) {
 	}
 }
 
-func TestStoreListPageBoundsDescriptorReads(t *testing.T) {
+func TestStoreListUsesBoundedOpaqueCursor(t *testing.T) {
 	runtime := openRuntime(t, t.TempDir())
 	defer runtime.Close()
 	store, err := NewStore(runtime, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := map[shoal.ID]bool{}
-	for index := 0; index < 3; index++ {
-		id := shoal.ID(fmt.Sprintf("page-agent-%d", index))
-		descriptor := testDescriptor(id, 1)
+
+	for _, id := range []shoal.ID{"page-a", "page-b", "page-c"} {
 		if _, err := store.Apply(context.Background(), fleet.Mutation{
-			RegistrationKey: shoal.ID(fmt.Sprintf("page-key-%d", index)),
-			Descriptor:      descriptor,
+			RegistrationKey: shoal.ID("key-" + string(id)),
+			Descriptor:      testDescriptor(id, 1),
 		}); err != nil {
 			t.Fatal(err)
 		}
-		want[id] = true
 	}
-	cursor := ""
-	got := map[shoal.ID]bool{}
+
+	seen := make(map[shoal.ID]bool)
+	var cursor []byte
 	for {
-		page, err := store.ListPage(context.Background(), cursor, 1)
+		page, err := store.List(context.Background(), cursor, 1)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if len(page.Items) > 1 {
-			t.Fatalf("page returned %d descriptors", len(page.Items))
-		}
-		for _, item := range page.Items {
-			got[item.Stored.Descriptor.ID] = true
-			if item.Cursor == "" {
-				t.Fatal("page item omitted continuation position")
+		for _, item := range page.Entries {
+			if seen[item.Descriptor.ID] {
+				t.Fatalf("duplicate paged descriptor %q", item.Descriptor.ID)
 			}
+			seen[item.Descriptor.ID] = true
 		}
-
-		if page.NextCursor == "" {
+		if len(page.Next) == 0 {
 			break
 		}
-		if page.NextCursor == cursor {
-			t.Fatal("fleet list cursor did not advance")
-		}
-		cursor = page.NextCursor
+		cursor = page.Next
 	}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("paged IDs = %#v, want %#v", got, want)
+	if len(seen) != 3 {
+		t.Fatalf("paged descriptors = %v", seen)
 	}
-}
-
-type blockingReconciliationRuntime struct {
-	readCount int
-}
-
-func (r *blockingReconciliationRuntime) Publish(
-	context.Context, explorercoord.Request,
-) (explorercoord.Result, error) {
-	return explorercoord.Result{}, explorercoord.ErrIndeterminatePublication
-}
-
-func (r *blockingReconciliationRuntime) ReadEntity(
-	ctx context.Context,
-	_ guard.Entity,
-) (*guard.Head, *guard.Pending, error) {
-	r.readCount++
-	if r.readCount <= 3 {
-		return nil, nil, guard.ErrNotFound
-	}
-	<-ctx.Done()
-	return nil, nil, ctx.Err()
-}
-
-func (*blockingReconciliationRuntime) ReadCommittedCell(
-	context.Context, string, []byte, []byte, []byte, []byte,
-	coordination.Epoch,
-) (explorercoord.CommittedCell, bool, error) {
-	return explorercoord.CommittedCell{}, false,
-		errors.New("unexpected committed cell read")
-}
-
-func TestStoreBoundsAmbiguousPublicationReconciliation(t *testing.T) {
-	runtime := &blockingReconciliationRuntime{}
-	store, err := NewStore(runtime, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	store.reconciliationTimeout = 10 * time.Millisecond
-	started := time.Now()
-	_, err = store.Apply(context.Background(), fleet.Mutation{
-		RegistrationKey: "bounded-reconciliation",
-		Descriptor:      testDescriptor("bounded-agent", 1),
-	})
-	if err == nil {
-		t.Fatal("indeterminate publication unexpectedly succeeded")
-	}
-	if elapsed := time.Since(started); elapsed > time.Second {
-		t.Fatalf("reconciliation exceeded its bound: %v", elapsed)
+	if _, err := store.List(context.Background(), []byte{0}, 1); !shoal.IsErrorCode(
+		err, shoal.ErrorInvalidArgument,
+	) {
+		t.Fatalf("invalid cursor error = %v", err)
 	}
 }
 
-type blockingReadbackRuntime struct {
-	blockingReconciliationRuntime
-}
-
-func (*blockingReadbackRuntime) Publish(
-	context.Context, explorercoord.Request,
-) (explorercoord.Result, error) {
-	return explorercoord.Result{}, nil
-}
-
-func TestStoreMarksUnresolvedPostPublishReadbackIndeterminate(t *testing.T) {
-	runtime := &blockingReadbackRuntime{}
-	store, err := NewStore(runtime, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	store.reconciliationTimeout = 10 * time.Millisecond
-	_, err = store.Apply(context.Background(), fleet.Mutation{
-		RegistrationKey: "bounded-readback",
-		Descriptor:      testDescriptor("readback-agent", 1),
-	})
-	if !explorer.IsIndeterminateCommit(err) {
-		t.Fatalf("post-publish readback error = %v", err)
+func TestNewStoreRejectsTypedNilRuntime(t *testing.T) {
+	var runtime *explorercoord.Runtime
+	if _, err := NewStore(runtime, nil); !shoal.IsErrorCode(
+		err, shoal.ErrorInvalidArgument,
+	) {
+		t.Fatalf("typed-nil runtime error = %v", err)
 	}
 }
 

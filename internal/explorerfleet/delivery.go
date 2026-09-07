@@ -19,6 +19,7 @@ package explorerfleet
 
 import (
 	"context"
+	"reflect"
 
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/explorer/fleet"
@@ -44,7 +45,9 @@ func NewDeliveryLeaseValidator(
 	registry *fleet.Service,
 	resolver auth.Resolver,
 ) (*DeliveryLeaseValidator, error) {
-	if registry == nil || isNilDependency(resolver) {
+	if registry == nil || resolver == nil ||
+		(reflect.ValueOf(resolver).Kind() == reflect.Pointer &&
+			reflect.ValueOf(resolver).IsNil()) {
 		return nil, shoal.NewError(
 			shoal.ErrorInvalidArgument,
 			"delivery lease validator dependencies are required",
@@ -76,6 +79,7 @@ func (v *DeliveryLeaseValidator) ValidateDelivery(
 	if freshFingerprint != suppliedFingerprint ||
 		fresh.RequestID() != supplied.RequestID() ||
 		fresh.CorrelationID() != supplied.CorrelationID() ||
+		fresh.AuditPurpose() != supplied.AuditPurpose() ||
 		!fresh.AuthenticationExpires().Equal(supplied.AuthenticationExpires()) {
 		return shoal.NewError(
 			shoal.ErrorUnauthorized,

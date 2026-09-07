@@ -298,7 +298,9 @@ func latentAssertionGraphEdge(
 }
 
 // ProducerGraphElementsForAssertion reconstructs the canonical provenance
-// graph elements for a derived assertion.
+// nodes and produced edge for a derived assertion from its trusted derivation
+// record. Callers must compare all three values exactly before accepting a
+// projection supplied by an untrusted graph reader.
 func ProducerGraphElementsForAssertion(
 	assertion ontology.Assertion,
 ) (graph.Node, graph.Node, graph.Edge, bool, error) {

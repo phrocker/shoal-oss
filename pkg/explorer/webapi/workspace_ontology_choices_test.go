@@ -28,22 +28,31 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
-type mutableGovernedOntologySource struct {
-	proposals []ontology.GovernedProposal
+type mutableGovernedOntologyCatalog struct {
+	configured *ontology.OntologyVersion
+	proposals  []ontology.GovernedProposal
 }
 
-func (s *mutableGovernedOntologySource) OntologyProposals(
+func (s *mutableGovernedOntologyCatalog) OntologyCatalog(
 	context.Context,
-) ([]ontology.GovernedProposal, error) {
-	return append([]ontology.GovernedProposal(nil), s.proposals...), nil
+) (ontology.PublishedCatalog, bool, error) {
+	if s.configured == nil {
+		return ontology.PublishedCatalog{}, false, nil
+	}
+	catalog, err := boundedOntologyCatalog(*s.configured, s.proposals)
+	if err != nil {
+		return ontology.PublishedCatalog{}, false, err
+	}
+	return catalog, true, nil
 }
 
 func TestGovernedOntologyChoicesUsesLivePublishedAncestry(t *testing.T) {
 	first, second, third, published := governedOntologyFixture(t)
-	source := &mutableGovernedOntologySource{
-		proposals: []ontology.GovernedProposal{published},
+	source := &mutableGovernedOntologyCatalog{
+		configured: &first,
+		proposals:  []ontology.GovernedProposal{published},
 	}
-	choices, err := NewGovernedOntologyChoices(&first, source)
+	choices, err := NewGovernedOntologyChoices(source)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -57,7 +66,9 @@ func TestGovernedOntologyChoicesUsesLivePublishedAncestry(t *testing.T) {
 	thirdIdentity, _ := ontology.NewOntologyIdentity(third)
 	if len(listed) != 2 ||
 		listed[0].Identity != secondIdentity || !listed[0].Active ||
-		listed[1].Identity != firstIdentity || listed[1].Active {
+		listed[0].Version != "2" ||
+		listed[1].Identity != firstIdentity || listed[1].Active ||
+		listed[1].Version != "1" {
 		t.Fatalf("published choices = %#v", listed)
 	}
 	if err := choices.AuthorizeOntology(
@@ -69,6 +80,31 @@ func TestGovernedOntologyChoicesUsesLivePublishedAncestry(t *testing.T) {
 	); !shoal.IsErrorCode(err, shoal.ErrorUnauthorized) {
 		t.Fatalf("unpublished choice error = %v", err)
 	}
+	issuer, err := auth.NewDecision(auth.DecisionConfig{
+		Subject: "owner", Actor: "actor",
+		AuthorizationDomain: []byte("domain"),
+		AllowedOperations:   []auth.Operation{auth.OperationWorkspaceSettingsRead},
+		PolicyGeneration:    1,
+		AuthenticationExpires: time.Date(
+			2030, 1, 1, 0, 0, 0, 0, time.UTC),
+		RequestID:        "request",
+		SelectedOntology: firstIdentity,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	filtered, err := choices.ListOntologyChoices(context.Background(), issuer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(filtered) != 1 || filtered[0].Identity != firstIdentity {
+		t.Fatalf("issuer-selected choices = %#v", filtered)
+	}
+	if err := choices.AuthorizeOntology(
+		context.Background(), issuer, secondIdentity,
+	); !shoal.IsErrorCode(err, shoal.ErrorUnauthorized) {
+		t.Fatalf("issuer lens replacement error = %v", err)
+	}
 
 	source.proposals = nil
 	listed, err = choices.ListOntologyChoices(
@@ -77,14 +113,14 @@ func TestGovernedOntologyChoicesUsesLivePublishedAncestry(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(listed) != 1 || listed[0].Identity != firstIdentity ||
-		!listed[0].Active {
+		!listed[0].Active || listed[0].Version != "1" {
 		t.Fatalf("live active choice = %#v", listed)
 	}
 }
 
 func TestGovernedOntologyChoicesWithoutConfiguredRootIsEmpty(t *testing.T) {
-	source := &mutableGovernedOntologySource{}
-	choices, err := NewGovernedOntologyChoices(nil, source)
+	source := &mutableGovernedOntologyCatalog{}
+	choices, err := NewGovernedOntologyChoices(source)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -108,8 +144,11 @@ func TestPublishedOntologyHistoryAcceptsExactBound(t *testing.T) {
 	if active.ID() != expected.ID() {
 		t.Fatalf("active = %s, want %s", active.ID(), expected.ID())
 	}
-	source := &mutableGovernedOntologySource{proposals: proposals}
-	choices, err := NewGovernedOntologyChoices(&configured, source)
+	source := &mutableGovernedOntologyCatalog{
+		configured: &configured,
+		proposals:  proposals,
+	}
+	choices, err := NewGovernedOntologyChoices(source)
 	if err != nil {
 		t.Fatal(err)
 	}

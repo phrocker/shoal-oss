@@ -31,7 +31,7 @@ type FleetDispatchProvider interface {
 // adding another authentication boundary. Mount it through
 // Handler.MountAuthenticated at /api/v1/fleet/.
 func NewFleetDispatchHandler(provider FleetDispatchProvider) (http.Handler, error) {
-	if isAbsentInterface(provider) {
+	if provider == nil {
 		return nil, shoal.NewError(shoal.ErrorInvalidArgument, "fleet dispatch provider is required")
 	}
 	mux := http.NewServeMux()
@@ -42,7 +42,7 @@ func NewFleetDispatchHandler(provider FleetDispatchProvider) (http.Handler, erro
 // MountFleetDispatch is retained for dispatch-only tests and compatibility.
 // Hosted startup must instead mount NewFleetHandler once at FleetRoutePrefix.
 func (h *Handler) MountFleetDispatch(provider FleetDispatchProvider) error {
-	if h == nil || isAbsentInterface(provider) {
+	if h == nil || provider == nil {
 		return shoal.NewError(shoal.ErrorInvalidArgument, "fleet dispatch provider is required")
 	}
 	if isAbsentInterface(h.authenticator) || isAbsentInterface(h.binder) {

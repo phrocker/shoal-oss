@@ -448,33 +448,6 @@ func (p *Provider) SelectOntology(
 	return result, nil
 }
 
-// Effective is the compatibility entry point for callers that have not yet
-// identified their consuming operation. New integrations must use
-// ApplyForOperation.
-func (p *Provider) Effective(
-	ctx context.Context,
-	workspaceID shoal.ID,
-	baseLimits Limits,
-	baseOutputPolicies []auth.Policy,
-) (EffectiveDecision, error) {
-	return p.Apply(ctx, workspaceID, baseLimits, baseOutputPolicies)
-}
-
-// Apply is the compatibility entry point for legacy transports. New
-// integrations must use ApplyForOperation with the exact consuming operation.
-func (p *Provider) Apply(
-	ctx context.Context,
-	workspaceID shoal.ID,
-	baseLimits Limits,
-	baseOutputPolicies []auth.Policy,
-) (EffectiveDecision, error) {
-	check, err := p.authorizeApplication(ctx, workspaceID, "")
-	if err != nil {
-		return EffectiveDecision{}, err
-	}
-	return p.apply(ctx, check, baseLimits, baseOutputPolicies)
-}
-
 // ApplyForOperation loads one owned settings revision and derives its complete
 // effect under the exact operation the consuming request will execute.
 func (p *Provider) ApplyForOperation(
@@ -570,19 +543,6 @@ func (p *Provider) ApplyDecisionForOperation(
 	return effective.Decision(), nil
 }
 
-// ApplyDecision is the compatibility entry point for legacy transports. New
-// integrations must use ApplyDecisionForOperation.
-func (p *Provider) ApplyDecision(
-	ctx context.Context,
-	workspaceID shoal.ID,
-) (auth.Decision, error) {
-	effective, err := p.Apply(ctx, workspaceID, MaximumLimits(), nil)
-	if err != nil {
-		return auth.Decision{}, err
-	}
-	return effective.Decision(), nil
-}
-
 type authorizationCheck struct {
 	decision    auth.Decision
 	guard       auth.GenerationGuard
@@ -618,13 +578,7 @@ func (p *Provider) authorizeApplication(
 	if err != nil {
 		return authorizationCheck{}, err
 	}
-	if operation == "" {
-		operations := decision.AllowedOperations()
-		if len(operations) == 0 {
-			return authorizationCheck{}, authDenied()
-		}
-		operation = operations[0]
-	} else if err := operation.Validate(); err != nil {
+	if err := operation.Validate(); err != nil {
 		return authorizationCheck{}, err
 	}
 	return p.authorizeDecision(

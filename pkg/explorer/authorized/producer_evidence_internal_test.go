@@ -35,6 +35,7 @@ func TestProducerDerivationEdgeRequiresCanonicalReconstruction(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	defer corpus.Close()
 	source, err := corpus.Ingest(ctx, explorer.Source{
 		URI:       "file:///producer-proof-source.txt",
@@ -149,5 +150,94 @@ func TestProducerDerivationEdgeRequiresCanonicalReconstruction(t *testing.T) {
 	forgedEdge.Properties["forged"] = "true"
 	if producerDerivationEdgeMatches(forgedEdge, raw, assertion) {
 		t.Fatal("forged produced edge was accepted")
+	}
+}
+
+func TestTrustedDerivedAssertionComparisonNormalizesEmptyMetadata(t *testing.T) {
+	derivation, err := ontology.NewAssertionDerivation(
+		"embedding-model", "v1", "cosine", 0.8, "cell-1", 0.9,
+		"source", "target", "iterator", nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nilEvidence, err := ontology.NewDerivationEvidenceRef(derivation, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	emptyEvidence, err := ontology.NewDerivationEvidenceRef(
+		derivation, shoal.Metadata{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	nilProvenance, err := ontology.NewExtractionProvenance(
+		"provider", "model", "v1", "prompt", "v1", "extractor", "v1", nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	emptyProvenance, err := ontology.NewExtractionProvenance(
+		"provider", "model", "v1", "prompt", "v1", "extractor", "v1",
+		shoal.Metadata{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	concept, err := ontology.NewConceptDefinition(
+		"test-node", "Test Node", "A test node", nil, nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	relationship, err := ontology.NewRelationshipDefinition(
+		"test-relation", "Test Relation", "Relates test nodes",
+		[]shoal.ID{concept.ID()}, []shoal.ID{concept.ID()}, nil, true, nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	value, err := ontology.NewReferenceValue("target")
+	if err != nil {
+		t.Fatal(err)
+	}
+	nilMetadata, err := ontology.NewAssertion(
+		"source", relationship.ID(), value, ontology.AssertionDerived, 0.9,
+		[]ontology.EvidenceRef{nilEvidence}, nilProvenance, nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	emptyMetadata, err := ontology.NewAssertion(
+		"source", relationship.ID(), value, ontology.AssertionDerived, 0.9,
+		[]ontology.EvidenceRef{emptyEvidence}, emptyProvenance, shoal.Metadata{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if nilMetadata.ID() != emptyMetadata.ID() {
+		t.Fatal("empty metadata changed canonical assertion identity")
+	}
+	if err := validateTrustedDerivedAssertions(
+		map[shoal.ID]ontology.Assertion{nilMetadata.ID(): nilMetadata},
+		map[shoal.ID]ontology.Assertion{emptyMetadata.ID(): emptyMetadata},
+	); err != nil {
+		t.Fatalf("semantic empty metadata comparison = %v", err)
+	}
+	presentEmpty, err := ontology.NewAssertion(
+		"source", relationship.ID(), value, ontology.AssertionDerived, 0.9,
+		[]ontology.EvidenceRef{nilEvidence}, nilProvenance,
+		shoal.Metadata{"present": ""},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if presentEmpty.ID() != nilMetadata.ID() {
+		t.Fatal("non-identity metadata changed assertion identity")
+	}
+	if err := validateTrustedDerivedAssertions(
+		map[shoal.ID]ontology.Assertion{nilMetadata.ID(): presentEmpty},
+		map[shoal.ID]ontology.Assertion{nilMetadata.ID(): nilMetadata},
+	); err == nil {
+		t.Fatal("present empty metadata key matched an absent key")
 	}
 }

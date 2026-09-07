@@ -166,6 +166,73 @@ func TestReadAssertionUnderResolvesOnlyExactRecordedVersion(t *testing.T) {
 	}
 }
 
+func TestOntologyLensRejectsAbsentDefinitionInExactVersion(t *testing.T) {
+	f := newMorphismFixture(t)
+	future, err := NewPropertyDefinition(
+		"future", "Future", "", ValueString, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertion := mustPropertyAssertion(
+		t, f.person.ID(), future.ID(), f.v1, nil, f.evidence, f.provenance)
+	lens, err := NewOntologyLensWithTransitions(f.v1, []OntologyTransition{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := lens.Read(assertion); got.Resolved() {
+		t.Fatalf("exact-version read resolved absent predicate: %#v", got)
+	}
+}
+
+func TestOntologyLensRejectsFutureDefinitionStampedWithSourceVersion(t *testing.T) {
+	f := newMorphismFixture(t)
+	future, err := NewPropertyDefinition(
+		"future", "Future", "", ValueString, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	basePerson, err := NewConceptDefinition(
+		"person", "Person", "", nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetPerson, err := NewConceptDefinition(
+		"person", "Person", "", []shoal.ID{future.ID()}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	schema, err := NewOntologySchema("future", "Future", "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	at := time.Date(2026, time.September, 6, 0, 0, 0, 0, time.UTC)
+	base, err := NewOntologyVersion(
+		schema, "1", at, []ConceptDefinition{basePerson}, nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target, err := NewOntologyVersion(
+		schema, "2", at.Add(time.Second), []ConceptDefinition{targetPerson},
+		nil, []PropertyDefinition{future}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	transition, err := NewOntologyTransition(base, target, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lens, err := NewOntologyLensWithTransitions(
+		target, []OntologyTransition{transition}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertion := mustPropertyAssertion(
+		t, basePerson.ID(), future.ID(), base, nil, f.evidence, f.provenance)
+	if got := lens.Read(assertion); got.Resolved() {
+		t.Fatalf("future definition retroactively resolved: %#v", got)
+	}
+}
+
 func mustIdentity(t *testing.T, version OntologyVersion) OntologyIdentity {
 	t.Helper()
 	identity, err := NewOntologyIdentity(version)
@@ -487,6 +554,152 @@ func TestOntologyLensReportsOnlyMorphismsAppliedToAssertion(t *testing.T) {
 	applied := read.AppliedMorphisms()
 	if !read.Resolved() || len(applied) != 1 || applied[0] != used.ID() {
 		t.Fatalf("applied morphisms = %v, want only %s", applied, used.ID())
+	}
+}
+
+func TestProposalRejectsRestrictingPreviouslyUnownedProperty(t *testing.T) {
+	schema, _ := NewOntologySchema("owners", "Owners", "", nil)
+	property, _ := NewPropertyDefinition(
+		"name", "Name", "", ValueString, nil, nil)
+	first, _ := NewConceptDefinition("first", "First", "", nil, nil)
+	second, _ := NewConceptDefinition("second", "Second", "", nil, nil)
+	restricted, _ := NewConceptDefinition(
+		"first", "First", "", []shoal.ID{property.ID()}, nil)
+	at := time.Date(2026, time.September, 6, 1, 0, 0, 0, time.UTC)
+	base, _ := NewOntologyVersion(
+		schema, "1", at, []ConceptDefinition{first, second}, nil,
+		[]PropertyDefinition{property}, nil)
+	target, _ := NewOntologyVersion(
+		schema, "2", at.Add(time.Second),
+		[]ConceptDefinition{restricted, second}, nil,
+		[]PropertyDefinition{property}, nil)
+	if _, err := NewOntologyTransition(base, target, nil); err == nil {
+		t.Fatal("unowned property became owner-restricted without an explicit transformation")
+	}
+}
+
+func TestInferredLensValidatesCompleteEvolution(t *testing.T) {
+	f := newMorphismFixture(t)
+	concepts := f.v2.Concepts()
+	for index, concept := range concepts {
+		if concept.ID() != f.person.ID() {
+			continue
+		}
+		changed, err := NewConceptDefinition(
+			concept.Key(), concept.Name(), "changed without a morphism",
+			concept.Properties(), concept.Metadata())
+		if err != nil {
+			t.Fatal(err)
+		}
+		concepts[index] = changed
+	}
+	target, err := NewOntologyVersion(
+		f.v2.Schema(), "inferred-invalid",
+		f.v2.CreatedAt().Add(time.Second), concepts,
+		f.v2.Relationships(), f.v2.Properties(), f.v2.Metadata())
+	if err != nil {
+		t.Fatal(err)
+	}
+	widen := mustMorphism(t, MorphismConfig{
+		Kind: MorphismWiden, SourceVersion: f.v1, TargetVersion: target,
+		Sources: []shoal.ID{f.v1rel.ID()}, Targets: []shoal.ID{f.v2rel.ID()},
+		Evidence: []EvidenceRef{f.evidence}, Rationale: "valid endpoint widening",
+	})
+	if _, err := NewOntologyLens(target, []OntologyMorphism{widen}); err == nil {
+		t.Fatal("inferred lens accepted unrelated semantic changes")
+	}
+}
+
+func TestExplicitTransitionUsesItsGovernedMorphisms(t *testing.T) {
+	f := newMorphismFixture(t)
+	schema, _ := NewOntologySchema("bound", "Bound", "", nil)
+	sourceProperty, _ := NewPropertyDefinition(
+		"old", "Old", "", ValueString, nil, nil)
+	governedProperty, _ := NewPropertyDefinition(
+		"governed", "Governed", "", ValueString, nil, nil)
+	otherProperty, _ := NewPropertyDefinition(
+		"other", "Other", "", ValueString, nil, nil)
+	sourceConcept, _ := NewConceptDefinition(
+		"person", "Person", "", []shoal.ID{sourceProperty.ID()}, nil)
+	targetConcept, _ := NewConceptDefinition(
+		"person", "Person", "",
+		[]shoal.ID{governedProperty.ID(), otherProperty.ID()}, nil)
+	at := time.Date(2026, time.September, 6, 2, 0, 0, 0, time.UTC)
+	source, _ := NewOntologyVersion(
+		schema, "1", at, []ConceptDefinition{sourceConcept}, nil,
+		[]PropertyDefinition{sourceProperty}, nil)
+	target, _ := NewOntologyVersion(
+		schema, "2", at.Add(time.Second), []ConceptDefinition{targetConcept}, nil,
+		[]PropertyDefinition{governedProperty, otherProperty}, nil)
+	governed := mustMorphism(t, MorphismConfig{
+		Kind: MorphismRename, SourceVersion: source, TargetVersion: target,
+		Sources:  []shoal.ID{sourceProperty.ID()},
+		Targets:  []shoal.ID{governedProperty.ID()},
+		Evidence: []EvidenceRef{f.evidence}, Rationale: "governed rename",
+	})
+	other := mustMorphism(t, MorphismConfig{
+		Kind: MorphismRename, SourceVersion: source, TargetVersion: target,
+		Sources:  []shoal.ID{sourceProperty.ID()},
+		Targets:  []shoal.ID{otherProperty.ID()},
+		Evidence: []EvidenceRef{f.evidence}, Rationale: "ungoverned rename",
+	})
+	transition, err := NewOntologyTransition(
+		source, target, []OntologyMorphism{governed})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lens, err := NewOntologyLensWithTransitions(
+		target, []OntologyTransition{transition}, []OntologyMorphism{other})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertion := mustPropertyAssertion(
+		t, sourceConcept.ID(), sourceProperty.ID(), source, nil,
+		f.evidence, f.provenance)
+	read := lens.Read(assertion)
+	if !read.Resolved() || read.Predicate() != governedProperty.ID() {
+		t.Fatalf("explicit transition used ungoverned morphism: %#v", read)
+	}
+}
+
+func TestOntologyLensTraversesBeyondLegacyDepth(t *testing.T) {
+	f := newMorphismFixture(t)
+	schema, _ := NewOntologySchema("long", "Long", "", nil)
+	property, _ := NewPropertyDefinition(
+		"name", "Name", "", ValueString, nil, nil)
+	person, _ := NewConceptDefinition(
+		"person", "Person", "", []shoal.ID{property.ID()}, nil)
+	at := time.Date(2026, time.September, 6, 3, 0, 0, 0, time.UTC)
+	versions := make([]OntologyVersion, 41)
+	for index := range versions {
+		version, err := NewOntologyVersion(
+			schema, strconv.Itoa(index), at.Add(time.Duration(index)*time.Second),
+			[]ConceptDefinition{person}, nil,
+			[]PropertyDefinition{property}, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		versions[index] = version
+	}
+	transitions := make([]OntologyTransition, 0, len(versions)-1)
+	for index := 1; index < len(versions); index++ {
+		transition, err := NewOntologyTransition(
+			versions[index-1], versions[index], nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		transitions = append(transitions, transition)
+	}
+	lens, err := NewOntologyLensWithTransitions(
+		versions[len(versions)-1], transitions, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertion := mustPropertyAssertion(
+		t, person.ID(), property.ID(), versions[0], nil,
+		f.evidence, f.provenance)
+	if read := lens.Read(assertion); !read.Resolved() {
+		t.Fatalf("governed 40-hop lens read = %#v", read)
 	}
 }
 

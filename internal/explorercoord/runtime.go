@@ -117,20 +117,6 @@ type Runtime struct {
 	intentCursor        []byte
 }
 
-// SharedEngine returns the runtime-owned engine for non-owning stores that
-// share this runtime's lifecycle. Callers must not close the returned engine.
-func (r *Runtime) SharedEngine() (*engine.Engine, error) {
-	if r == nil {
-		return nil, transaction.ErrUnavailable
-	}
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	if r.closed || r.engine == nil {
-		return nil, transaction.ErrUnavailable
-	}
-	return r.engine, nil
-}
-
 func Open(config Config) (*Runtime, error) {
 	if strings.TrimSpace(config.Directory) == "" {
 		return nil, errors.Join(transaction.ErrInvalid, errors.New("runtime directory is required"))
@@ -1256,6 +1242,21 @@ func (r *Runtime) Authority() transaction.Authority {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return cloneAuthority(r.authority)
+}
+
+// EmbeddedEngine returns the runtime-owned engine for in-process adapters that
+// must share its WAL and directory lock. Callers must not close the engine and
+// must release their adapters before closing the runtime.
+func (r *Runtime) EmbeddedEngine() *engine.Engine {
+	if r == nil {
+		return nil
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if r.closed {
+		return nil
+	}
+	return r.engine
 }
 
 // CurrentHead returns the authoritative allocator state for diagnostics and

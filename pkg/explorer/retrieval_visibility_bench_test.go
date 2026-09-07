@@ -43,7 +43,7 @@ func benchReadCorpus(b *testing.B, sessions int) (
 	restricted := ingestVisible(
 		b, corpus, "file:///incident.md", restrictedMarkdown, "secret&incident")
 	for i := 0; i < sessions; i++ {
-		id := shoal.ID("session-" + strconv.Itoa(i))
+		id := shoal.ID("interaction.session_" + strconv.Itoa(i))
 		recordedSession(
 			b, corpus, id,
 			[]shoal.ID{open[0], restricted[0]}, []shoal.ID{open[0]})

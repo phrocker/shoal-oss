@@ -23,6 +23,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -48,6 +49,7 @@ type stubSink struct {
 	ensured    int
 	recorded   int
 	lastRecord interaction.Session
+	mutate     func(*interaction.Session)
 }
 
 func (s *stubSink) EnsureInteractionSink(context.Context) error {
@@ -61,6 +63,49 @@ func (s *stubSink) RecordInteraction(
 	s.recorded++
 	s.lastRecord = session
 	return s.recordErr
+}
+
+func (s *stubSink) RecordInteractionResult(
+	_ context.Context, session interaction.Session,
+) (interaction.Session, error) {
+	s.recorded++
+	s.lastRecord = session
+	if s.recordErr != nil {
+		return interaction.Session{}, s.recordErr
+	}
+	if s.mutate != nil {
+		s.mutate(&session)
+	}
+	return session, nil
+}
+
+func TestGraphRecorderRejectsMismatchedPersistedResult(t *testing.T) {
+	sink := &stubSink{mutate: func(session *interaction.Session) {
+		session.ResultID = "different-result"
+	}}
+	recorder, err := NewGraphRecorder(context.Background(), sink)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := recorder.SetClock(func() time.Time { return fixedTime }); err != nil {
+		t.Fatal(err)
+	}
+	model, prompt := provenanceParts(t)
+	provenance, err := NewProvenance(
+		"fake-harness", model, prompt, "grounded-tools-v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	record := EvaluationRecord{
+		Provenance: provenance, TranscriptID: "mismatched-result",
+		SnapshotID: "snapshot", SnapshotAsOf: fixedTime.Add(-time.Minute),
+		AuthorizationFingerprint: "auth-sha256:mismatched-result",
+		AuthorizationExpiresAt:   fixedTime.Add(time.Hour),
+	}
+	if err := recorder.Record(context.Background(), record); !errors.Is(err, ErrInvalid) ||
+		!interaction.IsCommittedRecord(err) {
+		t.Fatalf("mismatched persisted result error = %v", err)
+	}
 }
 
 // TestGeneratorRequiresRecorder pins binding decision 4 structurally: there is
@@ -176,27 +221,51 @@ func TestNewGraphRecorderChecksSinkAtSetup(t *testing.T) {
 
 func TestInteractionSessionHashesOversizedIdentifiers(t *testing.T) {
 	model, prompt := provenanceParts(t)
-	provenance, err := NewProvenance(
-		strings.Repeat("a", interaction.MaxIdentifierBytes+1),
-		model, prompt, "grounded-tools-v1",
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	session, err := InteractionSession(EvaluationRecord{
-		Provenance:               provenance,
-		TranscriptID:             "transcript-long-identifier",
-		SnapshotID:               "snapshot-long-identifier",
-		SnapshotAsOf:             fixedTime.Add(-time.Minute),
-		AuthorizationFingerprint: "auth-sha256:long-identifier",
-		AuthorizationExpiresAt:   fixedTime.Add(time.Hour),
-	}, fixedTime)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.HasPrefix(session.Provenance.Harness, "sha256:") {
-		t.Fatalf("oversized harness identity was not hashed: %q",
-			session.Provenance.Harness)
+	for _, size := range []int{
+		interaction.MaxIdentifierBytes,
+		interaction.MaxIdentifierBytes + 1,
+		shoal.MaxSemanticStringBytes,
+	} {
+		t.Run(fmt.Sprintf("bytes-%d", size), func(t *testing.T) {
+			provenance, err := NewProvenance(
+				strings.Repeat("a", size),
+				model, prompt, "grounded-tools-v1",
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			sink := &stubSink{}
+			recorder, err := NewGraphRecorder(context.Background(), sink)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := recorder.SetClock(
+				func() time.Time { return fixedTime }); err != nil {
+				t.Fatal(err)
+			}
+			if err := recorder.Record(
+				context.Background(),
+				EvaluationRecord{
+					Provenance: provenance,
+					TranscriptID: shoal.ID(
+						fmt.Sprintf("transcript-identifier-%d", size)),
+					SnapshotID:               "snapshot-long-identifier",
+					SnapshotAsOf:             fixedTime.Add(-time.Minute),
+					AuthorizationFingerprint: "auth-sha256:long-identifier",
+					AuthorizationExpiresAt:   fixedTime.Add(time.Hour),
+				},
+			); err != nil {
+				t.Fatal(err)
+			}
+			got := sink.lastRecord.Provenance.Harness
+			if size <= interaction.MaxIdentifierBytes {
+				if got != strings.Repeat("a", size) {
+					t.Fatalf("boundary identifier = %q", got)
+				}
+			} else if !strings.HasPrefix(got, "sha256:") {
+				t.Fatalf("oversized harness identity was not hashed: %q", got)
+			}
+		})
 	}
 }
 
@@ -209,14 +278,6 @@ func TestInteractionSessionPreservesExecutionPins(t *testing.T) {
 	}
 	snapshotAt := fixedTime.Add(-time.Minute)
 	expiresAt := fixedTime.Add(time.Hour)
-	constituent, err := retrieval.EmbeddingSpaceIdentityID("embedding-space-v3")
-	if err != nil {
-		t.Fatal(err)
-	}
-	aggregate, err := retrieval.EmbeddingSpaceSetID(constituent)
-	if err != nil {
-		t.Fatal(err)
-	}
 	session, err := InteractionSession(EvaluationRecord{
 		Provenance:               provenance,
 		TranscriptID:             "transcript-pinned",
@@ -224,8 +285,6 @@ func TestInteractionSessionPreservesExecutionPins(t *testing.T) {
 		SnapshotAsOf:             snapshotAt,
 		AuthorizationFingerprint: "auth-sha256:pinned",
 		AuthorizationExpiresAt:   expiresAt,
-		EmbeddingSpaceID:         aggregate,
-		EmbeddingSpaceIDs:        []shoal.ID{constituent},
 	}, fixedTime)
 	if err != nil {
 		t.Fatal(err)
@@ -233,32 +292,39 @@ func TestInteractionSessionPreservesExecutionPins(t *testing.T) {
 	if session.SnapshotID != "snapshot-pinned" ||
 		!session.SnapshotAsOf.Equal(snapshotAt) ||
 		session.AuthorizationFingerprint != "auth-sha256:pinned" ||
-		!session.AuthorizationExpiresAt.Equal(expiresAt) ||
-		session.EmbeddingSpaceID != aggregate ||
-		len(session.EmbeddingSpaceIDs) != 1 ||
-		session.EmbeddingSpaceIDs[0] != constituent {
+		!session.AuthorizationExpiresAt.Equal(expiresAt) {
 		t.Fatalf("session pins = %+v", session)
 	}
 }
 
-func TestInteractionSessionRejectsIncompleteEmbeddingProvenance(t *testing.T) {
+func TestInteractionSessionPreservesCanonicalEmbeddingSpaces(t *testing.T) {
 	model, prompt := provenanceParts(t)
 	provenance, err := NewProvenance(
 		"fake-harness", model, prompt, "grounded-tools-v1")
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = InteractionSession(EvaluationRecord{
+	spaces, err := interaction.NewEmbeddingSpaceSet([]string{
+		"18:embedding-space-v15:alpha",
+		"18:embedding-space-v14:beta",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := InteractionSession(EvaluationRecord{
 		Provenance:               provenance,
-		TranscriptID:             "transcript-pinned",
-		SnapshotID:               "snapshot-pinned",
+		TranscriptID:             "transcript-spaces",
+		SnapshotID:               "snapshot-spaces",
 		SnapshotAsOf:             fixedTime.Add(-time.Minute),
-		AuthorizationFingerprint: "auth-sha256:pinned",
+		AuthorizationFingerprint: "auth-sha256:spaces",
 		AuthorizationExpiresAt:   fixedTime.Add(time.Hour),
-		EmbeddingSpaceID:         "aggregate-only",
+		EmbeddingSpaces:          spaces,
 	}, fixedTime)
-	if err == nil {
-		t.Fatalf("aggregate-only embedding provenance = %v", err)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(session.EmbeddingSpaces, spaces) {
+		t.Fatalf("session embedding spaces = %+v", session.EmbeddingSpaces)
 	}
 }
 
@@ -322,6 +388,18 @@ func TestGraphRecorderRecordsThroughTheSink(t *testing.T) {
 	}
 	if len(session.CitedNodeIDs) == 0 {
 		t.Fatal("session recorded no cited source node IDs")
+	}
+	if len(session.SeedEvidence) != 1 ||
+		session.SeedEvidence[0].AnchorID != initial.ID() {
+		t.Fatalf("session seed evidence = %+v", session.SeedEvidence)
+	}
+	if len(session.CitedEvidence) != 1 ||
+		session.CitedEvidence[0].AnchorID != initial.ID() {
+		t.Fatalf("session cited evidence = %+v", session.CitedEvidence)
+	}
+	if session.SeedEvidence[0].Citation.Range !=
+		session.CitedEvidence[0].Citation.Range {
+		t.Fatal("recorded evidence lost its exact source range")
 	}
 
 	sink.recordErr = errors.New("write refused")

@@ -66,11 +66,6 @@ func TestFleetRegistryMountRequiresAuthenticationAndUsesBoundDecision(t *testing
 	if err := handler.MountFleetRegistry(provider); err != nil {
 		t.Fatal(err)
 	}
-	if err := handler.MountFleetRegistry(provider); !shoal.IsErrorCode(
-		err, shoal.ErrorInvalidArgument,
-	) {
-		t.Fatalf("duplicate fleet mount = %v", err)
-	}
 	body, _ := json.Marshal(fleetRequestContextWire{
 		RequestID: encodeFleetID("request"), ReasonCode: "resolve",
 		Deadline: now.Add(time.Minute),
@@ -88,38 +83,21 @@ func TestFleetRegistryMountRequiresAuthenticationAndUsesBoundDecision(t *testing
 	if !provider.resolved || strings.Contains(response.Body.String(), "executor-secret") {
 		t.Fatalf("provider=%v body=%s", provider.resolved, response.Body.String())
 	}
-
-	listBody, _ := json.Marshal(fleetListWire{
-		Context: fleetRequestContextWire{
-			RequestID: encodeFleetID("request"), ReasonCode: "resolve",
-			Deadline: now.Add(time.Minute),
-		},
-		Limit: 7, Cursor: "opaque-cursor",
-	})
-	listRequest := httptest.NewRequest(
-		http.MethodPost, "http://example.test/api/v1/fleet/agents/resolve",
-		bytes.NewReader(listBody),
-	)
-	listRequest.Host = "example.test"
-	listRequest.Header.Set("Content-Type", "application/json")
-	listResponse := httptest.NewRecorder()
-	handler.ServeHTTP(listResponse, listRequest)
-	if listResponse.Code != http.StatusOK {
-		t.Fatalf("list status=%d body=%s",
-			listResponse.Code, listResponse.Body.String())
-	}
-	if provider.listRequest.Limit != 7 ||
-		provider.listRequest.Cursor != "opaque-cursor" ||
-		!strings.Contains(listResponse.Body.String(), `"next_cursor":"next"`) {
-		t.Fatalf("list request=%+v body=%s",
-			provider.listRequest, listResponse.Body.String())
-	}
 }
 
 type stubFleetProvider struct {
-	resolver    auth.Resolver
-	resolved    bool
-	listRequest fleet.ListRequest
+	resolver auth.Resolver
+	resolved bool
+}
+
+func TestMountFleetRegistryRejectsTypedNilProvider(t *testing.T) {
+	var provider *stubFleetProvider
+	handler := &Handler{}
+	if err := handler.MountFleetRegistry(provider); !shoal.IsErrorCode(
+		err, shoal.ErrorInvalidArgument,
+	) {
+		t.Fatalf("typed-nil provider = %v", err)
+	}
 }
 
 type stubWorkspaceService struct{}
@@ -164,9 +142,6 @@ func (p *stubFleetProvider) Resolve(ctx context.Context, request fleet.ResolveRe
 		Executor: "executor-secret",
 	}, nil
 }
-func (p *stubFleetProvider) List(
-	_ context.Context, request fleet.ListRequest,
-) (fleet.ListPage, error) {
-	p.listRequest = request
-	return fleet.ListPage{NextCursor: "next"}, nil
+func (*stubFleetProvider) List(context.Context, fleet.ListRequest) (fleet.ListPage, error) {
+	return fleet.ListPage{}, nil
 }

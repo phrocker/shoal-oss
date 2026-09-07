@@ -36,14 +36,17 @@ import (
 // handling of partial or over-broad results can be asserted directly.
 type recordingNodeStore struct {
 	PolicyStore
-	requests     [][]shoal.ID
-	result       map[shoal.ID]NodeRegistration
-	err          error
-	edgeRequests [][]shoal.ID
-	edgeResult   map[shoal.ID]EdgeRegistration
-	edgeErr      error
-	nodeCalls    int
-	edgeCalls    int
+	requests         [][]shoal.ID
+	result           map[shoal.ID]NodeRegistration
+	err              error
+	edgeRequests     [][]shoal.ID
+	edgeResult       map[shoal.ID]EdgeRegistration
+	edgeErr          error
+	revisionRequests [][]shoal.ID
+	revisionResult   map[shoal.ID]RevisionRegistration
+	revisionErr      error
+	nodeCalls        int
+	edgeCalls        int
 }
 
 // Node and Edge are overridden purely so a point lookup can be counted rather
@@ -87,6 +90,18 @@ func (s *recordingNodeStore) Edges(
 		return nil, s.edgeErr
 	}
 	return s.edgeResult, nil
+}
+
+func (s *recordingNodeStore) CurrentRevisions(
+	_ context.Context,
+	documentIDs []shoal.ID,
+) (map[shoal.ID]RevisionRegistration, error) {
+	s.revisionRequests = append(
+		s.revisionRequests, append([]shoal.ID(nil), documentIDs...))
+	if s.revisionErr != nil {
+		return nil, s.revisionErr
+	}
+	return s.revisionResult, nil
 }
 
 func batchTestRule(t *testing.T, source, policy string) AccessRule {
@@ -234,6 +249,66 @@ func TestResolveNodesDeduplicatesAndConfinesResults(t *testing.T) {
 	}
 }
 
+func TestResolveCurrentRevisionsDeduplicatesAndConfinesResults(t *testing.T) {
+	store := &recordingNodeStore{
+		revisionResult: map[shoal.ID]RevisionRegistration{
+			"document-a": {DocumentID: "document-a", RevisionID: "revision-a"},
+			"document-b": {DocumentID: "document-b", RevisionID: "revision-b"},
+			"extra":      {DocumentID: "extra", RevisionID: "revision-extra"},
+		},
+	}
+	client := &Client{policyStore: store}
+	resolved, err := client.resolveCurrentRevisions(
+		context.Background(),
+		[]shoal.ID{"document-a", "document-b", "document-a", "missing"},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(store.revisionRequests) != 1 {
+		t.Fatalf("batch lookups = %d, want exactly one", len(store.revisionRequests))
+	}
+	wantRequest := []shoal.ID{"document-a", "document-b", "missing"}
+	if !reflect.DeepEqual(store.revisionRequests[0], wantRequest) {
+		t.Fatalf("batched identifiers = %#v, want %#v",
+			store.revisionRequests[0], wantRequest)
+	}
+	if _, ok := resolved["extra"]; ok {
+		t.Fatal("batch result admitted an unrequested revision")
+	}
+	if _, ok := resolved["missing"]; ok {
+		t.Fatal("omitted document was reported as resolved")
+	}
+	if len(resolved) != 2 {
+		t.Fatalf("resolved = %#v, want document-a and document-b only", resolved)
+	}
+}
+
+func TestResolveCurrentRevisionsSkipsEmptyBatch(t *testing.T) {
+	store := &recordingNodeStore{}
+	client := &Client{policyStore: store}
+	resolved, err := client.resolveCurrentRevisions(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(store.revisionRequests) != 0 {
+		t.Fatalf("batch lookups = %d, want none", len(store.revisionRequests))
+	}
+	if len(resolved) != 0 {
+		t.Fatalf("resolved = %#v, want empty", resolved)
+	}
+}
+
+func TestResolveCurrentRevisionsPropagatesStoreFailureAsRead(t *testing.T) {
+	store := &recordingNodeStore{revisionErr: catalogUnavailable()}
+	client := &Client{policyStore: store}
+	if _, err := client.resolveCurrentRevisions(
+		context.Background(), []shoal.ID{"document-a"},
+	); !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
+		t.Fatalf("batch failure error = %v", err)
+	}
+}
+
 // TestResolveNodesSkipsEmptyBatch keeps a page with nothing to resolve from
 // spending a round trip.
 func TestResolveNodesSkipsEmptyBatch(t *testing.T) {
@@ -281,6 +356,7 @@ func TestMemoryPolicyStoreNodesMatchesNodeLoop(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+
 	requested := []shoal.ID{"document", "node-a", "node-a", "unregistered"}
 	batch, err := store.Nodes(ctx, requested)
 	if err != nil {
@@ -305,6 +381,73 @@ func TestMemoryPolicyStoreNodesMatchesNodeLoop(t *testing.T) {
 	}
 	if len(batch) != 2 {
 		t.Fatalf("batch = %#v, want one entry per distinct registered node", batch)
+	}
+}
+
+func TestMemoryPolicyStoreCurrentRevisionsMatchesPointLoop(t *testing.T) {
+	ctx := context.Background()
+	rule := batchTestRule(t, "source", "policy")
+	store := NewMemoryPolicyStore()
+	opaqueDocumentID := shoal.ID(string([]byte{'d', 0, 0xff}))
+	opaqueRevisionID := shoal.ID(string([]byte{'r', 0, 0xfe}))
+	for _, registration := range []RevisionRegistration{
+		{
+			DocumentID: "document-a", RevisionID: "revision-a",
+			NodeIDs: []shoal.ID{"document-a"},
+			ContentDigest: auth.DigestBytes(
+				"test-content", []byte("revision-a")),
+			Rule: rule, Current: true,
+		},
+		{
+			DocumentID: "document-b", RevisionID: "revision-b",
+			NodeIDs: []shoal.ID{"document-b"},
+			ContentDigest: auth.DigestBytes(
+				"test-content", []byte("revision-b")),
+			Rule: rule, Current: true,
+		},
+		{
+			DocumentID: opaqueDocumentID, RevisionID: opaqueRevisionID,
+			NodeIDs: []shoal.ID{opaqueDocumentID},
+			ContentDigest: auth.DigestBytes(
+				"test-content", []byte("opaque-revision")),
+			Rule: rule, Current: true,
+		},
+	} {
+		if err := store.PutRevision(ctx, registration); err != nil {
+			t.Fatal(err)
+		}
+	}
+	requested := []shoal.ID{
+		"document-a", opaqueDocumentID, "document-b", "document-a",
+		opaqueDocumentID, "unregistered",
+	}
+	batch, err := store.CurrentRevisions(ctx, requested)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected := make(map[shoal.ID]RevisionRegistration)
+	for _, documentID := range requested {
+		registration, ok, err := store.CurrentRevision(ctx, documentID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !ok {
+			if _, present := batch[documentID]; present {
+				t.Fatalf("batch reported unregistered document %q", documentID)
+			}
+			continue
+		}
+		expected[documentID] = registration
+	}
+	if !reflect.DeepEqual(batch, expected) {
+		t.Fatalf("batch = %#v, want %#v", batch, expected)
+	}
+	if len(batch) != 3 {
+		t.Fatalf("batch = %#v, want one entry per distinct registered document", batch)
+	}
+	if batch[opaqueDocumentID].RevisionID != opaqueRevisionID {
+		t.Fatalf("opaque revision identifier changed: got %q, want %q",
+			batch[opaqueDocumentID].RevisionID, opaqueRevisionID)
 	}
 }
 
@@ -348,6 +491,11 @@ func TestMemoryPolicyStoreBatchFailureOrderMatchesPointLoop(t *testing.T) {
 	); !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
 		t.Fatalf("nil store edge batch error = %v, want catalog unavailable", err)
 	}
+	if _, err := nilStore.CurrentRevisions(
+		ctx, []shoal.ID{"document-a", ""},
+	); !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
+		t.Fatalf("nil store revision batch error = %v, want catalog unavailable", err)
+	}
 	// An empty request makes no per-identifier call, so the receiver check is
 	// all that remains and must still reject.
 	if _, err := nilStore.Nodes(ctx, nil); !shoal.IsErrorCode(
@@ -359,6 +507,11 @@ func TestMemoryPolicyStoreBatchFailureOrderMatchesPointLoop(t *testing.T) {
 		err, shoal.ErrorUnavailable,
 	) {
 		t.Fatalf("nil store empty edge batch error = %v", err)
+	}
+	if _, err := nilStore.CurrentRevisions(ctx, nil); !shoal.IsErrorCode(
+		err, shoal.ErrorUnavailable,
+	) {
+		t.Fatalf("nil store empty revision batch error = %v", err)
 	}
 	// A live store still reports an invalid identifier, so moving the receiver
 	// check does not weaken argument validation.
@@ -372,6 +525,11 @@ func TestMemoryPolicyStoreBatchFailureOrderMatchesPointLoop(t *testing.T) {
 		ctx, []shoal.ID{"edge-a", ""},
 	); !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
 		t.Fatalf("invalid edge identifier error = %v", err)
+	}
+	if _, err := store.CurrentRevisions(
+		ctx, []shoal.ID{"document-a", ""},
+	); !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
+		t.Fatalf("invalid document identifier error = %v", err)
 	}
 }
 
@@ -534,6 +692,10 @@ func TestMemoryPolicyStoreBatchFailsOnTheFirstFailingIdentifier(t *testing.T) {
 		Edge: graph.Edge{ID: "corrupt-edge", From: "a", To: "b", Type: "link"},
 		Rule: corruptRule(),
 	}
+	store.current["corrupt-document"] = revisionKey{
+		documentID: "corrupt-document",
+		revisionID: "missing-revision",
+	}
 
 	// The point lookups establish the behaviour the batch must reproduce.
 	if _, _, err := store.Node(ctx, "corrupt-node"); !shoal.IsErrorCode(
@@ -546,6 +708,11 @@ func TestMemoryPolicyStoreBatchFailsOnTheFirstFailingIdentifier(t *testing.T) {
 	) {
 		t.Fatalf("corrupt edge point lookup error = %v", err)
 	}
+	if _, _, err := store.CurrentRevision(
+		ctx, "corrupt-document",
+	); !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
+		t.Fatalf("corrupt revision point lookup error = %v", err)
+	}
 
 	if _, err := store.Nodes(
 		ctx, []shoal.ID{"corrupt-node", ""},
@@ -556,6 +723,12 @@ func TestMemoryPolicyStoreBatchFailsOnTheFirstFailingIdentifier(t *testing.T) {
 		ctx, []shoal.ID{"corrupt-edge", ""},
 	); !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
 		t.Fatalf("edge batch error = %v, want the earlier corrupt registration", err)
+	}
+	if _, err := store.CurrentRevisions(
+		ctx, []shoal.ID{"corrupt-document", ""},
+	); !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
+		t.Fatalf(
+			"revision batch error = %v, want the earlier corrupt registration", err)
 	}
 	// Reversing the order reverses the reported failure, which is what makes
 	// this a request-order guarantee rather than a fixed precedence.
@@ -569,6 +742,12 @@ func TestMemoryPolicyStoreBatchFailsOnTheFirstFailingIdentifier(t *testing.T) {
 	); !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
 		t.Fatalf("edge batch error = %v, want the earlier invalid identifier", err)
 	}
+	if _, err := store.CurrentRevisions(
+		ctx, []shoal.ID{"", "corrupt-document"},
+	); !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
+		t.Fatalf(
+			"revision batch error = %v, want the earlier invalid identifier", err)
+	}
 }
 
 // TestMemoryPolicyStoreBatchSpendsContextChecksLikeAPointLoop compares a batch
@@ -580,6 +759,7 @@ func TestMemoryPolicyStoreBatchFailsOnTheFirstFailingIdentifier(t *testing.T) {
 func TestMemoryPolicyStoreBatchSpendsContextChecksLikeAPointLoop(t *testing.T) {
 	nodeIDs := []shoal.ID{"node-a", "node-b", "node-c"}
 	edgeIDs := []shoal.ID{"edge-a", "edge-b", "edge-c"}
+	documentIDs := []shoal.ID{"document-a", "document-b", "document-c"}
 	for budget := 0; budget <= len(nodeIDs)+1; budget++ {
 		for size := 1; size <= len(nodeIDs); size++ {
 			store := NewMemoryPolicyStore()
@@ -620,6 +800,27 @@ func TestMemoryPolicyStoreBatchSpendsContextChecksLikeAPointLoop(t *testing.T) {
 					"budget %d size %d: Edges error = %v, Edge loop error = %v",
 					budget, size, gotEdgeErr, wantEdgeErr)
 			}
+
+			remaining = budget
+			var wantRevisionErr error
+			for _, documentID := range documentIDs[:size] {
+				if _, _, err := store.CurrentRevision(
+					loopCtx, documentID,
+				); err != nil {
+					wantRevisionErr = err
+					break
+				}
+			}
+
+			remaining = budget
+			_, gotRevisionErr := store.CurrentRevisions(
+				loopCtx, documentIDs[:size])
+			if !sameErrorCode(gotRevisionErr, wantRevisionErr) {
+				t.Fatalf(
+					"budget %d size %d: CurrentRevisions error = %v, "+
+						"CurrentRevision loop error = %v",
+					budget, size, gotRevisionErr, wantRevisionErr)
+			}
 		}
 	}
 }
@@ -642,6 +843,11 @@ func TestMemoryPolicyStoreEmptyBatchStillChecksContext(t *testing.T) {
 	) {
 		t.Fatalf("empty edge batch error = %v, want cancellation", err)
 	}
+	if _, err := store.CurrentRevisions(cancelled, nil); !shoal.IsErrorCode(
+		err, shoal.ErrorCanceled,
+	) {
+		t.Fatalf("empty revision batch error = %v, want cancellation", err)
+	}
 	// A live empty request under a healthy context resolves to an empty result
 	// rather than an error.
 	resolvedNodes, err := store.Nodes(context.Background(), nil)
@@ -651,6 +857,10 @@ func TestMemoryPolicyStoreEmptyBatchStillChecksContext(t *testing.T) {
 	resolvedEdges, err := store.Edges(context.Background(), nil)
 	if err != nil || len(resolvedEdges) != 0 {
 		t.Fatalf("empty edge batch = %#v err = %v", resolvedEdges, err)
+	}
+	resolvedRevisions, err := store.CurrentRevisions(context.Background(), nil)
+	if err != nil || len(resolvedRevisions) != 0 {
+		t.Fatalf("empty revision batch = %#v err = %v", resolvedRevisions, err)
 	}
 	// A nil receiver reports catalog-unavailable even with nothing to look up.
 	var nilStore *MemoryPolicyStore
@@ -663,6 +873,11 @@ func TestMemoryPolicyStoreEmptyBatchStillChecksContext(t *testing.T) {
 		err, shoal.ErrorUnavailable,
 	) {
 		t.Fatalf("nil store empty edge batch error = %v", err)
+	}
+	if _, err := nilStore.CurrentRevisions(
+		context.Background(), nil,
+	); !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
+		t.Fatalf("nil store empty revision batch error = %v", err)
 	}
 }
 

@@ -36,22 +36,13 @@ import (
 // non-settings API request. Its value is one canonical opaque wire ID.
 const WorkspaceIDHeader = "Shoal-Workspace-ID"
 
-// WorkspaceSettingsApplier narrows one authenticated request under the exact
-// operation that the consuming route will execute.
-type WorkspaceSettingsApplier interface {
-	ApplyForOperation(
-		context.Context,
-		shoal.ID,
-		auth.Operation,
-		workspace.Limits,
-		[]auth.Policy,
-	) (workspace.EffectiveDecision, error)
-}
+// WorkspaceOutputVisibilityHeader carries the canonical conjunction every
+// response or derived interaction produced under effective settings requires.
+const WorkspaceOutputVisibilityHeader = "Shoal-Output-Visibility"
 
 // WorkspaceSettingsProvider is the transport-neutral settings extension used
 // by the HTTP endpoint and future chat/MCP adapters.
 type WorkspaceSettingsProvider interface {
-	WorkspaceSettingsApplier
 	Get(context.Context, shoal.ID) (workspace.Settings, error)
 	Update(
 		context.Context,
@@ -69,10 +60,40 @@ type WorkspaceSettingsProvider interface {
 		shoal.ID,
 		ontology.OntologyIdentity,
 	) (workspace.Settings, error)
+	ApplyForOperation(
+		context.Context,
+		shoal.ID,
+		auth.Operation,
+		workspace.Limits,
+		[]auth.Policy,
+	) (workspace.EffectiveDecision, error)
+}
+
+// WorkspaceSettingsHTTPConfig configures the independently mountable settings
+// management handler.
+type WorkspaceSettingsHTTPConfig struct {
+	Provider WorkspaceSettingsProvider
+}
+
+// NewWorkspaceSettingsHTTPHandler constructs the settings management subtree.
+// The returned handler performs authorization through Provider but must be
+// mounted behind the host's existing authentication and host/origin gates.
+func NewWorkspaceSettingsHTTPHandler(
+	config WorkspaceSettingsHTTPConfig,
+) (http.Handler, error) {
+	if isAbsentInterface(config.Provider) {
+		return nil, shoal.NewError(
+			shoal.ErrorInvalidArgument, "workspace settings provider is required")
+	}
+	routes := &Handler{
+		mux:               http.NewServeMux(),
+		workspaceSettings: config.Provider,
+	}
+	routes.registerWorkspaceSettingsRoutes()
+	return routes.mux, nil
 }
 
 type effectiveWorkspaceSettingsContextKey struct{}
-type effectiveWorkspaceIDContextKey struct{}
 
 // EffectiveWorkspaceSettings returns the authenticated workspace settings
 // effect already applied by Handler.ServeHTTP. Additive mounted transports can
@@ -86,14 +107,6 @@ func EffectiveWorkspaceSettings(
 	return effective, ok
 }
 
-// EffectiveWorkspaceID returns the authenticated workspace selector already
-// resolved by Handler.ServeHTTP.
-func EffectiveWorkspaceID(ctx context.Context) (shoal.ID, bool) {
-	workspaceID, ok := ctx.Value(
-		effectiveWorkspaceIDContextKey{}).(shoal.ID)
-	return workspaceID, ok
-}
-
 type workspaceResponseWriter struct {
 	http.ResponseWriter
 	maxResponseBytes        uint64
@@ -104,26 +117,11 @@ func (w workspaceResponseWriter) Unwrap() http.ResponseWriter {
 	return w.ResponseWriter
 }
 
-func responseSupportsFlush(writer http.ResponseWriter) bool {
-	for depth := 0; writer != nil && depth < 100; depth++ {
-		if _, ok := writer.(http.Flusher); ok {
-			return true
-		}
-		unwrapper, ok := writer.(interface {
-			Unwrap() http.ResponseWriter
-		})
-		if !ok {
-			return false
-		}
-		writer = unwrapper.Unwrap()
-	}
-	return false
-}
-
-// SetWorkspaceSettingsProvider enables the settings routes on a constructed
-// handler. Authentication and host-authority checks remain centralized in
-// ServeHTTP.
-func (h *Handler) SetWorkspaceSettingsProvider(
+// ConfigureWorkspaceSettings enables effective-decision application without
+// registering management routes. It is intended for hosts that mount the
+// handler returned by NewWorkspaceSettingsHTTPHandler through their existing
+// authenticated routing seam.
+func (h *Handler) ConfigureWorkspaceSettings(
 	provider WorkspaceSettingsProvider,
 ) error {
 	if h == nil {
@@ -140,8 +138,39 @@ func (h *Handler) SetWorkspaceSettingsProvider(
 			"workspace settings require an authenticated handler",
 		)
 	}
+	if h.workspaceSettingsMounted {
+		return shoal.NewError(
+			shoal.ErrorConflict, "workspace settings routes are already mounted")
+	}
 	h.workspaceSettings = provider
 	return nil
+}
+
+// MountWorkspaceSettings configures effective-decision application and mounts
+// the settings management subtree behind this Handler's existing gates.
+func (h *Handler) MountWorkspaceSettings(
+	config WorkspaceSettingsHTTPConfig,
+) error {
+	if err := h.ConfigureWorkspaceSettings(config.Provider); err != nil {
+		return err
+	}
+	settingsHandler, err := NewWorkspaceSettingsHTTPHandler(config)
+	if err != nil {
+		return err
+	}
+	h.mux.Handle("GET /api/v1/workspaces/", settingsHandler)
+	h.mux.Handle("PUT /api/v1/workspaces/", settingsHandler)
+	h.workspaceSettingsMounted = true
+	return nil
+}
+
+// SetWorkspaceSettingsProvider preserves the original one-call integration
+// surface and delegates to MountWorkspaceSettings.
+func (h *Handler) SetWorkspaceSettingsProvider(
+	provider WorkspaceSettingsProvider,
+) error {
+	return h.MountWorkspaceSettings(
+		WorkspaceSettingsHTTPConfig{Provider: provider})
 }
 
 func (h *Handler) applyWorkspaceSettings(
@@ -151,57 +180,33 @@ func (h *Handler) applyWorkspaceSettings(
 		isWorkspaceSettingsManagementPath(request.URL.Path) {
 		return request.Context(), nil
 	}
-	encoded := request.Header.Get(WorkspaceIDHeader)
-	if encoded == "" {
+	workspaceID, present, err := workspaceIDFromHeader(request.Header)
+	if err != nil {
+		return nil, err
+	}
+	if !present {
 		return request.Context(), nil
 	}
-	workspaceID, err := decodeID(encoded)
-	if err != nil {
-		return nil, shoal.NewError(
-			shoal.ErrorInvalidArgument, "workspace settings header "+err.Error())
-	}
-	if request.URL.Path == "/mcp" {
-		return withEffectiveWorkspaceID(request.Context(), workspaceID), nil
-	}
-	operation, ok := workspaceOperationForRequest(
+	operation, apply := workspaceOperationForRequest(
 		request.Method, request.URL.Path)
-	if !ok {
+	if !apply {
 		return nil, shoal.NewError(
 			shoal.ErrorInvalidArgument,
 			"workspace settings are not registered for this route",
 		)
 	}
-	return ApplyWorkspaceSettingsForOperation(
-		request.Context(), h.workspaceSettings, h.binder,
-		workspaceID, operation, workspace.MaximumLimits(), nil,
-	)
-}
-
-// ApplyWorkspaceSettingsForOperation loads and binds one owned workspace under
-// the exact operation that the consuming transport is about to execute.
-func ApplyWorkspaceSettingsForOperation(
-	ctx context.Context,
-	provider WorkspaceSettingsApplier,
-	binder auth.Binder,
-	workspaceID shoal.ID,
-	operation auth.Operation,
-	baseLimits workspace.Limits,
-	baseOutputPolicies []auth.Policy,
-) (context.Context, error) {
-	if ctx == nil || isAbsentInterface(provider) || isAbsentInterface(binder) {
-		return nil, shoal.NewError(
-			shoal.ErrorInvalidArgument,
-			"workspace settings application dependencies are required",
-		)
-	}
-	effective, err := provider.ApplyForOperation(
-		ctx, workspaceID, operation, baseLimits, baseOutputPolicies)
+	effective, err := h.workspaceSettings.ApplyForOperation(
+		request.Context(), workspaceID, operation,
+		workspace.MaximumLimits(), nil)
 	if err != nil {
 		return nil, err
 	}
 	decision := effective.Decision()
-	ctx, err = binder.Bind(ctx, decision)
-	if err != nil || ctx == nil {
+	ctx, err := h.binder.Bind(request.Context(), decision)
+	if err != nil {
+		return nil, authenticationDenied()
+	}
+	if ctx == nil {
 		return nil, authenticationDenied()
 	}
 	visibility, err := effective.OutputVisibility()
@@ -216,26 +221,8 @@ func ApplyWorkspaceSettingsForOperation(
 	if err != nil {
 		return nil, err
 	}
-	ctx = withEffectiveWorkspaceSettings(ctx, workspaceID, effective)
+	ctx = withEffectiveWorkspaceSettings(ctx, effective)
 	return withIdentity(ctx, decision), nil
-}
-
-func withEffectiveWorkspaceID(
-	ctx context.Context,
-	workspaceID shoal.ID,
-) context.Context {
-	return context.WithValue(
-		ctx, effectiveWorkspaceIDContextKey{}, workspaceID)
-}
-
-func withEffectiveWorkspaceSettings(
-	ctx context.Context,
-	workspaceID shoal.ID,
-	effective workspace.EffectiveDecision,
-) context.Context {
-	ctx = context.WithValue(
-		ctx, effectiveWorkspaceSettingsContextKey{}, effective)
-	return withEffectiveWorkspaceID(ctx, workspaceID)
 }
 
 func workspaceOperationForRequest(
@@ -245,47 +232,41 @@ func workspaceOperationForRequest(
 		method = http.MethodGet
 	}
 	switch {
-	case method == http.MethodGet &&
-		(path == "/api/v1/meta" ||
-			path == "/api/v1/identity" ||
-			path == "/api/v1/ontology" ||
-			path == "/api/v1/ontology/proposals" ||
-			path == "/api/v1/provenance" ||
-			strings.HasPrefix(path, "/api/v1/provenance/")):
+	case method == http.MethodGet && path == "/api/v1/meta":
+		return auth.OperationRead, true
+	case method == http.MethodGet && path == "/api/v1/identity":
+		return auth.OperationRead, true
+	case method == http.MethodGet && path == "/api/v1/ontology":
+		return auth.OperationRead, true
+	case method == http.MethodGet && path == "/api/v1/ontology/proposals":
 		return auth.OperationRead, true
 	case method == http.MethodGet &&
 		strings.HasPrefix(path, "/api/v1/ontology/proposals/") &&
 		strings.HasSuffix(path, "/blast-radius"):
 		return auth.OperationRead, true
-	case method == http.MethodPost &&
-		(path == "/api/v1/ingest" ||
-			path == "/api/v1/extract" ||
-			path == "/api/v1/derivation/recompute" ||
-			path == "/api/v1/ontology/proposals"):
+	case method == http.MethodPost && path == "/api/v1/ontology/proposals":
 		return auth.OperationIngest, true
 	case method == http.MethodPost &&
 		strings.HasPrefix(path, "/api/v1/ontology/proposals/") &&
 		strings.HasSuffix(path, "/transition"):
 		return auth.OperationIngest, true
 	case method == http.MethodPost &&
+		(path == "/api/v1/ingest" ||
+			path == "/api/v1/extract" ||
+			path == "/api/v1/derivation/recompute"):
+		return auth.OperationIngest, true
+	case method == http.MethodPost &&
 		(path == "/api/v1/changes" || path == "/api/v1/documents"):
 		return auth.OperationList, true
 	case method == http.MethodPost && path == "/api/v1/document":
 		return auth.OperationRead, true
-	case method == http.MethodPost &&
-		(path == "/api/v1/retrieve" ||
-			path == "/api/v1/ask" ||
-			path == "/api/v1/chat/stream"):
+	case method == http.MethodPost && path == "/api/v1/retrieve":
 		return auth.OperationRetrieve, true
 	case method == http.MethodPost &&
 		(path == "/api/v1/neighborhood" || path == "/api/v1/path"):
 		return auth.OperationNeighborhood, true
 	case method == http.MethodPost && path == "/api/v1/analytics":
 		return auth.OperationAnalyticsRead, true
-	case method == http.MethodPost &&
-		(path == "/api/v1/provenance/fold" ||
-			path == "/api/v1/provenance/unfold"):
-		return auth.OperationRead, true
 	case method == http.MethodPost && path == "/api/v1/fleet/agents":
 		return auth.OperationAgentRegister, true
 	case method == http.MethodPost &&
@@ -320,16 +301,45 @@ func workspaceOperationForRequest(
 	case method == http.MethodDelete &&
 		strings.HasPrefix(path, "/api/v1/fleet/events/subscriptions/"):
 		return auth.OperationSubscriptionDelete, true
-	case method == http.MethodPost &&
-		strings.HasPrefix(path, "/api/v1/fleet/events/subscriptions/") &&
-		strings.HasSuffix(path, "/pull"):
-		return auth.OperationSubscriptionDeliver, true
-	case method == http.MethodPost &&
-		path == "/api/v1/fleet/events/publish":
+	case method == http.MethodPost && path == "/api/v1/fleet/events/publish":
 		return auth.OperationEventPublish, true
 	default:
 		return "", false
 	}
+}
+
+func workspaceIDFromHeader(
+	header http.Header,
+) (shoal.ID, bool, error) {
+	values := header.Values(WorkspaceIDHeader)
+	if len(values) == 0 {
+		return "", false, nil
+	}
+	if len(values) != 1 || values[0] == "" ||
+		strings.TrimSpace(values[0]) != values[0] {
+		return "", false, shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			"workspace settings header must contain one canonical opaque ID",
+		)
+	}
+	workspaceID, err := decodeWorkspaceOpaqueID(
+		"workspace settings header", values[0])
+	if err != nil {
+		return "", false, err
+	}
+	return workspaceID, true, nil
+}
+
+func withEffectiveWorkspaceSettings(
+	ctx context.Context,
+	effective workspace.EffectiveDecision,
+) context.Context {
+	return context.WithValue(
+		ctx, effectiveWorkspaceSettingsContextKey{}, effective)
+}
+
+func workspaceOutputVisibility(ctx context.Context) string {
+	return interaction.Expression(interaction.RequiredVisibility(ctx))
 }
 
 func applyWorkspaceRequestLimits(ctx context.Context, request any) {
@@ -340,24 +350,116 @@ func applyWorkspaceRequestLimits(ctx context.Context, request any) {
 	limits := effective.Limits()
 	switch value := request.(type) {
 	case *RetrievalRequest:
-		value.Query.TopK = lowerRequestLimit(
-			value.Query.TopK, retrieval.DefaultTopK, limits.RetrievalTopK)
+		narrowed := ClampWorkspaceRequestLimits(
+			workspace.Limits{RetrievalTopK: value.Query.TopK},
+			workspace.Limits{RetrievalTopK: retrieval.DefaultTopK},
+			limits,
+		)
+		value.Query.TopK = narrowed.RetrievalTopK
 	case *NeighborhoodRequest:
-		value.Depth = lowerRequestLimit(
-			value.Depth, DefaultDepth, limits.GraphDepth)
-		value.Fanout = lowerRequestLimit(
-			value.Fanout, DefaultFanout, limits.GraphFanout)
-		value.MaxNodes = lowerRequestLimit(
-			value.MaxNodes, DefaultMaxNodes, limits.GraphNodes)
+		narrowed := ClampWorkspaceRequestLimits(
+			workspace.Limits{
+				GraphDepth:  value.Depth,
+				GraphFanout: value.Fanout,
+				GraphNodes:  value.MaxNodes,
+			},
+			workspace.Limits{
+				GraphDepth:  DefaultDepth,
+				GraphFanout: DefaultFanout,
+				GraphNodes:  DefaultMaxNodes,
+			},
+			limits,
+		)
+		value.Depth = narrowed.GraphDepth
+		value.Fanout = narrowed.GraphFanout
+		value.MaxNodes = narrowed.GraphNodes
 	case *PathRequest:
-		value.MaxDepth = lowerRequestLimit(
-			value.MaxDepth, DefaultDepth, limits.GraphDepth)
-		value.Fanout = lowerRequestLimit(
-			value.Fanout, DefaultFanout, limits.GraphFanout)
+		narrowed := ClampWorkspaceRequestLimits(
+			workspace.Limits{
+				GraphDepth:  value.MaxDepth,
+				GraphFanout: value.Fanout,
+			},
+			workspace.Limits{
+				GraphDepth:  DefaultDepth,
+				GraphFanout: DefaultFanout,
+			},
+			limits,
+		)
+		value.MaxDepth = narrowed.GraphDepth
+		value.Fanout = narrowed.GraphFanout
+	case *AnalyticsRequest:
+		applyAnalyticsWorkspaceLimits(value, limits)
+	}
+}
+
+func applyAnalyticsWorkspaceLimits(
+	request *AnalyticsRequest,
+	limits workspace.Limits,
+) {
+	if request == nil {
+		return
+	}
+	narrowed := ClampWorkspaceRequestLimits(
+		workspace.Limits{
+			GraphDepth:  request.Scope.Depth,
+			GraphFanout: request.Scope.Fanout,
+			GraphNodes:  request.Scope.MaxNodes,
+		},
+		workspace.Limits{},
+		limits,
+	)
+	request.Scope.Depth = narrowed.GraphDepth
+	request.Scope.Fanout = narrowed.GraphFanout
+	request.Scope.MaxNodes = narrowed.GraphNodes
+}
+
+// ClampWorkspaceRequestLimits replaces zero request values with their defaults
+// and lowers every request dimension to its effective workspace maximum.
+func ClampWorkspaceRequestLimits(
+	requested workspace.Limits,
+	defaults workspace.Limits,
+	maximum workspace.Limits,
+) workspace.Limits {
+	return workspace.Limits{
+		RetrievalTopK: lowerRequestLimit(
+			requested.RetrievalTopK,
+			defaults.RetrievalTopK,
+			maximum.RetrievalTopK,
+		),
+		GraphDepth: lowerRequestLimit(
+			requested.GraphDepth,
+			defaults.GraphDepth,
+			maximum.GraphDepth,
+		),
+		GraphFanout: lowerRequestLimit(
+			requested.GraphFanout,
+			defaults.GraphFanout,
+			maximum.GraphFanout,
+		),
+		GraphNodes: lowerRequestLimit(
+			requested.GraphNodes,
+			defaults.GraphNodes,
+			maximum.GraphNodes,
+		),
+		OutputBytes: lowerRequestByteLimit(
+			requested.OutputBytes,
+			defaults.OutputBytes,
+			maximum.OutputBytes,
+		),
 	}
 }
 
 func lowerRequestLimit(value, defaultValue, maximum uint32) uint32 {
+	if value == 0 {
+		value = defaultValue
+	}
+	if value > maximum {
+		return maximum
+	}
+	return value
+}
+
+func lowerRequestByteLimit(value, defaultValue, maximum uint64) uint64 {
 	if value == 0 {
 		value = defaultValue
 	}
@@ -390,6 +492,18 @@ func applyWorkspaceMetadataLimits(
 	metadata.MaxNodes = min(metadata.MaxNodes, limits.GraphNodes)
 	metadata.MaxResponseBytes = min(
 		metadata.MaxResponseBytes, limits.OutputBytes)
+	if metadata.AnalyticsLimits != nil {
+		analyticsLimits := *metadata.AnalyticsLimits
+		analyticsLimits.MaxDepth = min(
+			analyticsLimits.MaxDepth, limits.GraphDepth)
+		analyticsLimits.MaxFanout = min(
+			analyticsLimits.MaxFanout, limits.GraphFanout)
+		analyticsLimits.MaxNodes = min(
+			analyticsLimits.MaxNodes, limits.GraphNodes)
+		analyticsLimits.MaxSeeds = min(
+			analyticsLimits.MaxSeeds, analyticsLimits.MaxNodes)
+		metadata.AnalyticsLimits = &analyticsLimits
+	}
 	return metadata
 }
 
@@ -420,27 +534,33 @@ func isWorkspaceSettingsManagementPath(path string) bool {
 }
 
 func requestMayCommit(method, path string) bool {
+	if method == http.MethodDelete {
+		return strings.HasPrefix(
+			path, "/api/v1/fleet/events/subscriptions/")
+	}
 	if method != http.MethodPost {
 		return false
-	}
-	if path == "/mcp" {
-		// The outer handler cannot inspect the JSON-RPC method without
-		// consuming the body. Treat MCP POST overflow conservatively because
-		// tools may durably mutate before their response is written.
-		return true
 	}
 	switch path {
 	case "/api/v1/ingest",
 		"/api/v1/extract",
 		"/api/v1/derivation/recompute",
 		"/api/v1/ontology/proposals",
-		"/api/v1/ask",
-		"/api/v1/chat/stream",
-		"/api/v1/provenance/fold":
+		"/api/v1/analytics",
+		"/api/v1/fleet/agents",
+		"/api/v1/fleet/actions",
+		"/api/v1/fleet/actions/invoke",
+		"/api/v1/fleet/events/subscriptions",
+		"/api/v1/fleet/events/publish":
 		return true
 	default:
-		return strings.HasPrefix(path, "/api/v1/fleet/") ||
-			(strings.HasPrefix(path, "/api/v1/ontology/proposals/") &&
-				strings.HasSuffix(path, "/transition"))
+		return (strings.HasPrefix(path, "/api/v1/ontology/proposals/") &&
+			strings.HasSuffix(path, "/transition")) ||
+			(strings.HasPrefix(path, "/api/v1/fleet/agents/") &&
+				(strings.HasSuffix(path, "/heartbeat") ||
+					strings.HasSuffix(path, "/revoke"))) ||
+			(strings.HasPrefix(path, "/api/v1/fleet/actions/") &&
+				(strings.HasSuffix(path, "/claim") ||
+					strings.HasSuffix(path, "/cancel")))
 	}
 }

@@ -41,31 +41,35 @@ import (
 // TestCountingPolicyStoreCountsEveryPolicyStoreRead fails if a read method is
 // added to the interface without being classified here.
 type policyStoreTrips struct {
-	node            int
-	nodes           int
-	edge            int
-	edges           int
-	revision        int
-	currentRevision int
-	sourceClaim     int
+	node             int
+	nodes            int
+	edge             int
+	edges            int
+	revision         int
+	currentRevision  int
+	currentRevisions int
+	sourceClaim      int
 
-	batchedNodeIDs   int
-	batchedEdgeIDs   int
-	largestNodeBatch int
-	largestEdgeBatch int
+	batchedNodeIDs       int
+	batchedEdgeIDs       int
+	batchedDocumentIDs   int
+	largestNodeBatch     int
+	largestEdgeBatch     int
+	largestDocumentBatch int
 }
 
 // roundTripCounts is the comparable subset of policyStoreTrips holding only
 // call counts. The batch-size telemetry is deliberately excluded because it
 // legitimately grows with page size; only the number of calls must stay flat.
 type roundTripCounts struct {
-	node            int
-	nodes           int
-	edge            int
-	edges           int
-	revision        int
-	currentRevision int
-	sourceClaim     int
+	node             int
+	nodes            int
+	edge             int
+	edges            int
+	revision         int
+	currentRevision  int
+	currentRevisions int
+	sourceClaim      int
 }
 
 // roundTrips is every counted policy-store call, without the batch-size
@@ -74,14 +78,15 @@ func (t policyStoreTrips) roundTrips() roundTripCounts {
 	return roundTripCounts{
 		node: t.node, nodes: t.nodes, edge: t.edge, edges: t.edges,
 		revision: t.revision, currentRevision: t.currentRevision,
-		sourceClaim: t.sourceClaim,
+		currentRevisions: t.currentRevisions,
+		sourceClaim:      t.sourceClaim,
 	}
 }
 
 // total is every policy-store round trip, batched or not.
 func (t policyStoreTrips) total() int {
 	return t.node + t.nodes + t.edge + t.edges +
-		t.revision + t.currentRevision + t.sourceClaim
+		t.revision + t.currentRevision + t.currentRevisions + t.sourceClaim
 }
 
 // perItem is the round trips that still cost one call per item, and is the
@@ -96,7 +101,8 @@ func (t policyStoreTrips) byMethod() map[string]int {
 	return map[string]int{
 		"Node": t.node, "Nodes": t.nodes, "Edge": t.edge, "Edges": t.edges,
 		"Revision": t.revision, "CurrentRevision": t.currentRevision,
-		"SourceClaim": t.sourceClaim,
+		"CurrentRevisions": t.currentRevisions,
+		"SourceClaim":      t.sourceClaim,
 	}
 }
 
@@ -107,17 +113,21 @@ func (t policyStoreTrips) byMethod() map[string]int {
 // batch that returned fewer registrations than were asked for.
 type countingPolicyStore struct {
 	authorized.PolicyStore
-	mu             sync.Mutex
-	trips          policyStoreTrips
-	latency        time.Duration
-	duplicateBatch bool
-	hidden         map[shoal.ID]struct{}
+	mu              sync.Mutex
+	trips           policyStoreTrips
+	latency         time.Duration
+	duplicateBatch  bool
+	hiddenNodes     map[shoal.ID]struct{}
+	hiddenEdges     map[shoal.ID]struct{}
+	hiddenRevisions map[shoal.ID]struct{}
 }
 
 func newCountingPolicyStore(inner authorized.PolicyStore) *countingPolicyStore {
 	return &countingPolicyStore{
-		PolicyStore: inner,
-		hidden:      make(map[shoal.ID]struct{}),
+		PolicyStore:     inner,
+		hiddenNodes:     make(map[shoal.ID]struct{}),
+		hiddenEdges:     make(map[shoal.ID]struct{}),
+		hiddenRevisions: make(map[shoal.ID]struct{}),
 	}
 }
 
@@ -146,13 +156,27 @@ func (s *countingPolicyStore) setLatency(latency time.Duration) {
 	s.latency = latency
 }
 
-// withholdFromBatch drops the identifiers from every subsequent batch result
-// while leaving point lookups intact, simulating a partial batch response.
-func (s *countingPolicyStore) withholdFromBatch(ids ...shoal.ID) {
+func (s *countingPolicyStore) withholdNodes(ids ...shoal.ID) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, id := range ids {
-		s.hidden[id] = struct{}{}
+		s.hiddenNodes[id] = struct{}{}
+	}
+}
+
+func (s *countingPolicyStore) withholdEdges(ids ...shoal.ID) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, id := range ids {
+		s.hiddenEdges[id] = struct{}{}
+	}
+}
+
+func (s *countingPolicyStore) withholdRevisions(ids ...shoal.ID) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, id := range ids {
+		s.hiddenRevisions[id] = struct{}{}
 	}
 }
 
@@ -213,7 +237,7 @@ func (s *countingPolicyStore) Nodes(
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for nodeID := range s.hidden {
+	for nodeID := range s.hiddenNodes {
 		delete(resolved, nodeID)
 	}
 	return resolved, nil
@@ -239,7 +263,7 @@ func (s *countingPolicyStore) Edges(
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for edgeID := range s.hidden {
+	for edgeID := range s.hiddenEdges {
 		delete(resolved, edgeID)
 	}
 	return resolved, nil
@@ -259,6 +283,38 @@ func (s *countingPolicyStore) CurrentRevision(
 ) (authorized.RevisionRegistration, bool, error) {
 	s.enterRead(func(trips *policyStoreTrips) { trips.currentRevision++ })
 	return s.PolicyStore.CurrentRevision(ctx, documentID)
+}
+
+func (s *countingPolicyStore) CurrentRevisions(
+	ctx context.Context,
+	documentIDs []shoal.ID,
+) (map[shoal.ID]authorized.RevisionRegistration, error) {
+	seen := make(map[shoal.ID]struct{}, len(documentIDs))
+	duplicate := false
+	for _, documentID := range documentIDs {
+		if _, repeated := seen[documentID]; repeated {
+			duplicate = true
+		}
+		seen[documentID] = struct{}{}
+	}
+	s.mu.Lock()
+	s.duplicateBatch = s.duplicateBatch || duplicate
+	s.trips.batchedDocumentIDs += len(documentIDs)
+	if len(documentIDs) > s.trips.largestDocumentBatch {
+		s.trips.largestDocumentBatch = len(documentIDs)
+	}
+	s.mu.Unlock()
+	s.enterRead(func(trips *policyStoreTrips) { trips.currentRevisions++ })
+	resolved, err := s.PolicyStore.CurrentRevisions(ctx, documentIDs)
+	if err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for documentID := range s.hiddenRevisions {
+		delete(resolved, documentID)
+	}
+	return resolved, nil
 }
 
 func (s *countingPolicyStore) SourceClaim(
@@ -293,6 +349,52 @@ func batchFixture(
 	counting := newCountingPolicyStore(f.store)
 	client := f.newClient(t, f.base, counting, f.sourceA, f.policyA, nil)
 	return f, client, counting, nodeIDs
+}
+
+func TestDocumentsBatchesCurrentRevisionReads(t *testing.T) {
+	f, client, counting, documents := batchFixture(t, 4)
+	counting.reset()
+	summaries, err := client.Documents(f.alice(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(summaries) != len(documents) {
+		t.Fatalf("documents = %d, want %d", len(summaries), len(documents))
+	}
+	trips := counting.snapshot()
+	if trips.currentRevision != 0 || trips.currentRevisions != 1 {
+		t.Fatalf("current revision reads = %d point, %d batch, want 0 and 1",
+			trips.currentRevision, trips.currentRevisions)
+	}
+	if trips.batchedDocumentIDs != len(documents) ||
+		trips.largestDocumentBatch != len(documents) {
+		t.Fatalf("batched document identifiers = %d (largest %d), want %d",
+			trips.batchedDocumentIDs, trips.largestDocumentBatch, len(documents))
+	}
+	if counting.sawDuplicateBatch() {
+		t.Fatal("document batch repeated an identifier")
+	}
+}
+
+// TestDocumentsDeniesRevisionMissingFromBatchResult is the fail-closed
+// mutation guard for revision batching: a document omitted by the batch must
+// remain hidden even though its point lookup still succeeds.
+func TestDocumentsDeniesRevisionMissingFromBatchResult(t *testing.T) {
+	f, client, counting, documents := batchFixture(t, 3)
+	counting.withholdRevisions(documents[1])
+	summaries, err := client.Documents(f.alice(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(summaries) != len(documents)-1 {
+		t.Fatalf("documents = %d, want %d after one omitted registration",
+			len(summaries), len(documents)-1)
+	}
+	for _, summary := range summaries {
+		if summary.Document.ID == documents[1] {
+			t.Fatal("document omitted from the revision batch was authorized")
+		}
+	}
 }
 
 func connectBatchEdge(
@@ -392,19 +494,15 @@ func TestNeighborhoodBatchesLookupsPerPage(t *testing.T) {
 		t.Fatalf("batched edge identifiers = %d, want %d candidate page edges",
 			denseTrips.largestEdgeBatch, len(dense.Edges))
 	}
-	// CurrentRevision is still resolved one document at a time during
-	// canonicalization. That is proportional to distinct documents in the page,
-	// never to edge count, so it does not reintroduce the edge-count coupling
-	// this test guards. Batching it is tracked separately.
-	if denseTrips.currentRevision != sparseTrips.currentRevision {
-		t.Fatalf("per-document reads moved with edge count: %d then %d",
-			sparseTrips.currentRevision, denseTrips.currentRevision)
+	if denseTrips.currentRevision != 0 || denseTrips.currentRevisions != 2 {
+		t.Fatalf("current revision reads = %d point, %d batch, want 0 and 2",
+			denseTrips.currentRevision, denseTrips.currentRevisions)
 	}
 	// Resolving each item individually costs one seed lookup, one lookup per
 	// page node, two per admitted edge and one Edge lookup per candidate edge.
 	// Recording it keeps the regression this test guards explicit.
 	perItemBaseline := len(request.NodeIDs) + len(dense.Nodes) +
-		3*len(dense.Edges) + denseTrips.currentRevision
+		3*len(dense.Edges) + len(dense.Nodes)
 	if denseTrips.total() >= perItemBaseline {
 		t.Fatalf("policy store reads = %d, want fewer than the %d per-item lookups",
 			denseTrips.total(), perItemBaseline)
@@ -447,8 +545,12 @@ func TestBoundedNeighborhoodBatchesEndpointLookupsPerPage(t *testing.T) {
 		t.Fatalf("bounded batch lookups = %d node, %d edge, want one of each",
 			trips.nodes, trips.edges)
 	}
+	if trips.currentRevision != 0 || trips.currentRevisions != 2 {
+		t.Fatalf("bounded current revision reads = %d point, %d batch, want 0 and 2",
+			trips.currentRevision, trips.currentRevisions)
+	}
 	perItemBaseline := len(request.NodeIDs) + len(page.Neighborhood.Nodes) +
-		3*len(page.Neighborhood.Edges) + trips.currentRevision
+		3*len(page.Neighborhood.Edges) + len(page.Neighborhood.Nodes)
 	if trips.total() >= perItemBaseline {
 		t.Fatalf("bounded reads = %+v, want fewer than %d per-item lookups",
 			trips, perItemBaseline)
@@ -493,7 +595,7 @@ func TestNeighborhoodRoundTripLatencyTracksBatchCount(t *testing.T) {
 			elapsed, trips.total())
 	}
 	perItemBaseline := 1 + len(neighborhood.Nodes) +
-		3*len(neighborhood.Edges) + trips.currentRevision
+		3*len(neighborhood.Edges) + len(neighborhood.Nodes)
 	// The upper bound is asserted on the counters, not the clock. A wall-clock
 	// ceiling is nondeterministic — Sleep guarantees only a minimum, so a
 	// loaded host can push a correctly batched call past any budget — and it is
@@ -514,6 +616,10 @@ func TestNeighborhoodRoundTripLatencyTracksBatchCount(t *testing.T) {
 	if trips.nodes != 1 || trips.edges != 1 {
 		t.Fatalf("batch lookups = %d node and %d edge, want one of each",
 			trips.nodes, trips.edges)
+	}
+	if trips.currentRevision != 0 || trips.currentRevisions != 2 {
+		t.Fatalf("current revision reads = %d point, %d batch, want 0 and 2",
+			trips.currentRevision, trips.currentRevisions)
 	}
 	t.Logf("policy store reads %+v (total %d) cost %s at %s per round trip",
 		trips, trips.total(), elapsed, latency)
@@ -542,7 +648,7 @@ func TestNeighborhoodDeniesNodeMissingFromBatchResult(t *testing.T) {
 		t.Fatalf("baseline neighborhood = %#v", before)
 	}
 
-	counting.withholdFromBatch(documents[1])
+	counting.withholdNodes(documents[1])
 	after, err := client.Neighborhood(f.alice(t), request)
 	if err != nil {
 		t.Fatal(err)
@@ -576,7 +682,7 @@ func TestBoundedNeighborhoodDeniesNodeMissingFromBatchResult(t *testing.T) {
 		MaxScannedEdges: 16, EdgeTypes: []string{"link"},
 		Direction: explorer.GraphDirectionOutgoing,
 	}
-	counting.withholdFromBatch(documents[2])
+	counting.withholdNodes(documents[2])
 	page, err := client.BoundedNeighborhood(f.alice(t), request)
 	if err != nil {
 		t.Fatal(err)
@@ -606,7 +712,7 @@ func TestNeighborhoodDeniesEveryEdgeWhenBatchResultIsEmpty(t *testing.T) {
 			t, f, admin, shoal.ID(fmt.Sprintf("empty-%d", index)),
 			documents[0], documents[index])
 	}
-	counting.withholdFromBatch(documents...)
+	counting.withholdNodes(documents...)
 	_, err := client.Neighborhood(f.alice(t), explorer.NeighborhoodRequest{
 		NodeIDs: []shoal.ID{documents[0]}, Depth: 2, EdgeTypes: []string{"link"},
 	})
@@ -639,7 +745,7 @@ func TestNeighborhoodDeniesEdgeMissingFromBatchResult(t *testing.T) {
 		t.Fatalf("baseline edges = %d, want 3", len(before.Edges))
 	}
 
-	counting.withholdFromBatch(edgeIDs[0])
+	counting.withholdEdges(edgeIDs[0])
 	after, err := client.Neighborhood(f.alice(t), request)
 	if err != nil {
 		t.Fatal(err)
@@ -656,7 +762,7 @@ func TestNeighborhoodDeniesEdgeMissingFromBatchResult(t *testing.T) {
 		t.Fatal("a node reachable only through the missing edge stayed in the page")
 	}
 
-	counting.withholdFromBatch(edgeIDs...)
+	counting.withholdEdges(edgeIDs...)
 	empty, err := client.Neighborhood(f.alice(t), request)
 	if err != nil {
 		t.Fatal(err)
@@ -681,7 +787,7 @@ func TestBoundedNeighborhoodDeniesEdgeMissingFromBatchResult(t *testing.T) {
 		MaxScannedEdges: 16, EdgeTypes: []string{"link"},
 		Direction: explorer.GraphDirectionOutgoing,
 	}
-	counting.withholdFromBatch("bounded-missing-edge-2")
+	counting.withholdEdges("bounded-missing-edge-2")
 	page, err := client.BoundedNeighborhood(f.alice(t), request)
 	if err != nil {
 		t.Fatal(err)
@@ -702,7 +808,8 @@ func TestBoundedNeighborhoodDeniesEdgeMissingFromBatchResult(t *testing.T) {
 var (
 	countedPolicyStoreReads = map[string]struct{}{
 		"Node": {}, "Nodes": {}, "Edge": {}, "Edges": {},
-		"Revision": {}, "CurrentRevision": {}, "SourceClaim": {},
+		"Revision": {}, "CurrentRevision": {}, "CurrentRevisions": {},
+		"SourceClaim": {},
 	}
 	uncountedPolicyStoreMethods = map[string]struct{}{
 		"AcquireMutation": {}, "CompareAndSwapSourceClaim": {},
@@ -767,6 +874,9 @@ func TestCountingPolicyStoreCountsEveryPolicyStoreRead(t *testing.T) {
 		},
 		"CurrentRevision": func(s *countingPolicyStore) {
 			_, _, _ = s.CurrentRevision(ctx, "document-a")
+		},
+		"CurrentRevisions": func(s *countingPolicyStore) {
+			_, _ = s.CurrentRevisions(ctx, []shoal.ID{"document-a"})
 		},
 		"SourceClaim": func(s *countingPolicyStore) {
 			_, _, _ = s.SourceClaim(ctx, "file:///source-a.txt")

@@ -20,7 +20,7 @@ func NewFleetHandler(
 	registry FleetRegistryProvider,
 	dispatch FleetDispatchProvider,
 ) (http.Handler, error) {
-	if isAbsentInterface(registry) || isAbsentInterface(dispatch) {
+	if registry == nil || dispatch == nil {
 		return nil, shoal.NewError(
 			shoal.ErrorInvalidArgument,
 			"fleet registry and dispatch providers are required",

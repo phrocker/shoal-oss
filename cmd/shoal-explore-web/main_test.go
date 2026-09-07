@@ -34,11 +34,10 @@ import (
 	"github.com/phrocker/shoal-oss/internal/explorercoord"
 	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
+	"github.com/phrocker/shoal-oss/pkg/explorer/authorized"
 	"github.com/phrocker/shoal-oss/pkg/explorer/coordination"
 	"github.com/phrocker/shoal-oss/pkg/explorer/coordination/transaction"
-	"github.com/phrocker/shoal-oss/pkg/explorer/mcp"
 	"github.com/phrocker/shoal-oss/pkg/explorer/webapi"
-	"github.com/phrocker/shoal-oss/pkg/interaction"
 	"github.com/phrocker/shoal-oss/pkg/model"
 )
 
@@ -332,21 +331,66 @@ func TestEmbeddedServiceStartsTransactionalRuntimeExclusively(t *testing.T) {
 	reopened.close()
 }
 
+func TestAuthorizedClientUsesRuntimeInteractionDependencies(t *testing.T) {
+	embedded, err := explorercoord.OpenExplorer(explorercoord.Config{
+		Directory: commandTestDirectory(t),
+		Domain:    workspacePublicationDomain,
+		Owner:     workspaceRuntimeOwner,
+		Authority: transaction.Authority{
+			Generation: 1, Fence: 1, Holder: workspaceRuntimeOwner,
+			Mode:                coordination.WriterModeEmbeddedPrimary,
+			RetentionGeneration: 1, HistoryFloor: 1,
+		},
+	}, explorer.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = embedded.Close() })
+	store, err := authorized.OpenDurablePolicyStore(commandTestDirectory(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	authority := auth.NewAuthority()
+	client, err := authorizedClient(
+		embedded.Explorer, store, authority.Resolver(),
+		fixedGenerationReader{
+			domain:     workspaceAuthorizationDomain,
+			generation: workspacePolicyGeneration,
+		},
+		time.Now,
+		authorized.MosaicBudget{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decision, err := mintDevelopmentDecision(t)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, err := authority.Binder().Bind(context.Background(), decision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := client.EnsureInteractionSink(ctx); err != nil {
+		t.Fatalf("runtime interaction sink is not wired: %v", err)
+	}
+	sessions, err := client.Interactions(ctx)
+	if err != nil {
+		t.Fatalf("runtime interaction reader is not wired: %v", err)
+	}
+	if len(sessions) != 0 {
+		t.Fatalf("new runtime already contains %d interactions", len(sessions))
+	}
+}
+
 func commandTestDirectory(t *testing.T) string {
 	t.Helper()
 	directory, err := os.MkdirTemp(".", ".transaction-runtime-test-")
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() {
-		for _, path := range []string{
-			directory,
-			policyStoreDir(directory),
-			workspaceSettingsStoreDir(directory),
-		} {
-			_ = os.RemoveAll(path)
-		}
-	})
+	t.Cleanup(func() { _ = os.RemoveAll(directory) })
 	return directory
 }
 

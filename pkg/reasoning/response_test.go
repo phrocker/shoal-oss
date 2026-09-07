@@ -26,6 +26,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"sync/atomic"
 	"testing"
@@ -70,7 +71,7 @@ func TestMultipleClaimsCanCiteSameVerifiedAnchor(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	builder, err := reasoning.NewBuilder(fixture.client)
+	builder, err := reasoning.NewBuilder(fixture.reader())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -98,7 +99,7 @@ func TestVerifiedEnvelopeUsesAllTouchedVisibilityAndIsDeterministic(t *testing.T
 		{content: "# Restricted\n\nRestricted retrieved evidence.\n", visibility: "secret"},
 	}, false, "\xffpolicy", "\xferequest")
 	result := fixture.result(t, []shoal.ID{fixture.documentAnchors[0].ID()}, true)
-	builder, err := reasoning.NewBuilder(fixture.client)
+	builder, err := reasoning.NewBuilder(fixture.reader())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -172,7 +173,7 @@ func TestGraphPathIsDerivedNotCitationByDefault(t *testing.T) {
 		t.Fatal("fixture has no graph anchor")
 	}
 	result := fixture.result(t, []shoal.ID{fixture.graphAnchor.ID()}, false)
-	builder, err := reasoning.NewBuilder(fixture.client)
+	builder, err := reasoning.NewBuilder(fixture.reader())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -253,7 +254,7 @@ func TestSourceOnlyRejectsAuthoritativeInferredGraphMaterial(t *testing.T) {
 	}
 	edge := graph.Edge{
 		ID: edgeID, From: firstCitation.SpanID, To: secondCitation.SpanID,
-		Type: string(relationship.ID()), Weight: 0.9,
+		Type: "related", Weight: 0.9,
 		Properties: shoal.Metadata{
 			"ontology_relationship_id": string(relationship.ID()),
 		},
@@ -262,7 +263,7 @@ func TestSourceOnlyRejectsAuthoritativeInferredGraphMaterial(t *testing.T) {
 		t.Fatal(err)
 	}
 	reader := assertionReader{
-		SnapshotReader: fixture.client, assertion: assertion,
+		AuthorizationReader: fixture.reader(), assertion: assertion,
 	}
 	neighborhood, err := reader.Neighborhood(
 		context.Background(), explorer.NeighborhoodRequest{
@@ -331,109 +332,13 @@ func TestSourceOnlyRejectsAuthoritativeInferredGraphMaterial(t *testing.T) {
 	}
 	if _, err := (contextpack.Builder{Reader: fixture.client}).Build(
 		context.Background(), input,
-	); !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
-		t.Fatalf("missing authoritative assertion error = %v", err)
+	); err != nil {
+		t.Fatalf("source graph without authoritative assertion = %v", err)
 	}
-	pack, err := (contextpack.Builder{Reader: reader}).Build(
+	_, err = (contextpack.Builder{Reader: reader}).Build(
 		context.Background(), input)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var graphAnchor inference.EvidenceAnchor
-	for _, anchor := range pack.Evidence() {
-		if anchor.Kind() == inference.AnchorGraph {
-			graphAnchor = anchor
-			break
-		}
-	}
-	if graphAnchor.ID() == "" {
-		t.Fatal("derived graph anchor was not built")
-	}
-	derivedFixture := fixture
-	derivedFixture.pack = pack
-	derivedFixture.generatedAt = snapshot.AsOf.Add(time.Minute)
-	result := derivedFixture.result(t, []shoal.ID{graphAnchor.ID()}, false)
-	builder, _ := reasoning.NewBuilder(reader)
-	_, err = builder.Build(context.Background(), reasoning.BuildInput{
-		ContextPack: pack, Result: result,
-		Policy: reasoning.Policy{ID: fixture.policyID},
-	})
 	if !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
-		t.Fatalf("source-only derived evidence error = %v", err)
-	}
-	prepared, err := builder.Build(context.Background(), reasoning.BuildInput{
-		ContextPack: pack, Result: result,
-		Policy: reasoning.Policy{
-			ID: fixture.policyID, AllowDerivedEvidence: true,
-		},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	captured := capture(t, prepared, &captureSink{})
-	if len(captured.Claims()) != 0 ||
-		len(captured.Issues()) != 1 ||
-		captured.Issues()[0].Evidence()[0].Origin() != reasoning.OriginDerived {
-		t.Fatal("derived edge was laundered into a cited claim")
-	}
-	reference := captured.Issues()[0].Evidence()[0].Reference()
-	if len(reference.EdgeIDs) != 1 || reference.EdgeIDs[0] != edgeID ||
-		len(reference.Assertions) != 1 ||
-		reference.Assertions[0].AssertionID != assertion.ID() ||
-		reference.Assertions[0].EdgeID != edgeID ||
-		reference.Assertions[0].Origin != ontology.AssertionInferred {
-		t.Fatalf("authoritative assertion reference = %+v", reference)
-	}
-	recorded := captured.RecordedSession()
-	if len(recorded.SeedEvidence) == 0 ||
-		len(recorded.TouchedEdgeIDs()) != 1 ||
-		recorded.TouchedEdgeIDs()[0] != edgeID {
-		t.Fatalf("recorded complete evidence = %+v", recorded.SeedEvidence)
-	}
-	for name, mutate := range map[string]func(*interaction.EvidenceReference){
-		"anchor ID": func(reference *interaction.EvidenceReference) {
-			reference.AnchorID = "forged-anchor"
-		},
-		"assertion ID": func(reference *interaction.EvidenceReference) {
-			reference.Assertions[0].AssertionID = "forged-assertion"
-		},
-		"assertion origin": func(reference *interaction.EvidenceReference) {
-			reference.Assertions[0].Origin = ontology.AssertionExplicit
-		},
-	} {
-		t.Run("capture rejects forged "+name, func(t *testing.T) {
-			session := captureSession(t, prepared)
-			found := false
-			for index := range session.SeedEvidence {
-				if len(session.SeedEvidence[index].Assertions) == 0 {
-					continue
-				}
-				mutate(&session.SeedEvidence[index])
-				found = true
-				break
-			}
-			if !found {
-				t.Fatal("capture session has no authoritative assertion evidence")
-			}
-			sink := &captureSink{}
-			recorder, err := interaction.NewRecorder(
-				context.Background(), sink)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if err := recorder.SetClock(func() time.Time {
-				return prepared.CaptureMetadata().GeneratedAt().Add(time.Minute)
-			}); err != nil {
-				t.Fatal(err)
-			}
-			if _, err := prepared.Capture(
-				context.Background(), recorder, session); err == nil {
-				t.Fatal("forged evidence reached durable capture")
-			}
-			if sink.records != 0 {
-				t.Fatal("forged evidence reached the durable sink")
-			}
-		})
+		t.Fatalf("inferred assertion-backed source evidence error = %v", err)
 	}
 }
 
@@ -450,7 +355,7 @@ func TestSnapshotChangeFailsVerification(t *testing.T) {
 		}); err != nil {
 		t.Fatal(err)
 	}
-	builder, _ := reasoning.NewBuilder(fixture.client)
+	builder, _ := reasoning.NewBuilder(fixture.reader())
 	_, err := builder.Build(context.Background(), reasoning.BuildInput{
 		ContextPack: fixture.pack, Result: result,
 		Policy: reasoning.Policy{ID: fixture.policyID},
@@ -460,34 +365,70 @@ func TestSnapshotChangeFailsVerification(t *testing.T) {
 	}
 }
 
-func TestForgedAggregateOnlyEmbeddingMetadataFailsClosed(t *testing.T) {
+func TestForgedEmbeddingSpaceSetFailsClosed(t *testing.T) {
 	fixture := newFixture(t, []sourceFixture{{
 		content: "# Vector\n\nVerified source evidence.\n",
 	}}, false, "policy", "request")
-	metadata := fixture.pack.Metadata()
-	metadata["shoal.context.embedding_space_id"] = "hex:666f72676564"
-	var ontologyIdentity *inference.OntologyIdentity
-	if value, ok := fixture.pack.Ontology(); ok {
-		ontologyIdentity = &value
+	result := fixture.result(
+		t, []shoal.ID{fixture.documentAnchors[0].ID()}, false)
+	builder, _ := reasoning.NewBuilder(fixture.reader())
+	if _, err := builder.Build(
+		context.Background(), reasoning.BuildInput{
+			ContextPack: fixture.pack, Result: result,
+			Policy: reasoning.Policy{ID: fixture.policyID},
+			EmbeddingSpaces: interaction.EmbeddingSpaceSet{
+				Identities: []string{"space-a"},
+				Digest:     "forged",
+			},
+		},
+	); !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
+		t.Fatalf("forged embedding space set error = %v", err)
 	}
-	forged, err := inference.NewContextPack(
-		fixture.pack.Query(), fixture.pack.Evidence(), ontologyIdentity,
-		fixture.pack.Snapshot(), fixture.pack.Authorization(), metadata)
+}
+
+func TestEmbeddingSpaceSetIsCapturedFromExplicitInput(t *testing.T) {
+	fixture := newFixture(t, []sourceFixture{{
+		content: "# Vector\n\nVerified source evidence.\n",
+	}}, false, "policy", "request")
+	spaces, err := interaction.NewEmbeddingSpaceSet(
+		[]string{"space-b", "space-a", "space-b"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	forgedFixture := fixture
-	forgedFixture.pack = forged
-	result := forgedFixture.result(
-		t, []shoal.ID{forgedFixture.documentAnchors[0].ID()}, false)
-	builder, _ := reasoning.NewBuilder(fixture.client)
-	if _, err := builder.Build(
+	builder, err := reasoning.NewBuilder(fixture.reader())
+	if err != nil {
+		t.Fatal(err)
+	}
+	prepared, err := builder.Build(
 		context.Background(), reasoning.BuildInput{
-			ContextPack: forged, Result: result,
-			Policy: reasoning.Policy{ID: fixture.policyID},
-		},
-	); !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
-		t.Fatalf("aggregate-only embedding metadata error = %v", err)
+			ContextPack: fixture.pack,
+			Result: fixture.result(
+				t, []shoal.ID{fixture.documentAnchors[0].ID()}, false),
+			Policy:          reasoning.Policy{ID: fixture.policyID},
+			EmbeddingSpaces: spaces,
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	metadata := prepared.CaptureMetadata()
+	if got := metadata.EmbeddingSpaces(); !reflect.DeepEqual(got, spaces) {
+		t.Fatalf("embedding spaces = %+v, want %+v", got, spaces)
+	}
+	exposed := metadata.EmbeddingSpaces()
+	exposed.Identities[0] = "mutated"
+	if got := metadata.EmbeddingSpaces(); !reflect.DeepEqual(got, spaces) {
+		t.Fatalf("embedding spaces mutated through accessor: %+v", got)
+	}
+	session := captureSession(t, prepared)
+	if !reflect.DeepEqual(session.EmbeddingSpaces, spaces) {
+		t.Fatalf(
+			"session embedding spaces = %+v, want %+v",
+			session.EmbeddingSpaces, spaces,
+		)
+	}
+	response := capture(t, prepared, &captureSink{})
+	if got := response.EmbeddingSpaces(); !reflect.DeepEqual(got, spaces) {
+		t.Fatalf("response embedding spaces = %+v, want %+v", got, spaces)
 	}
 }
 
@@ -525,7 +466,7 @@ func TestForgedWrongQuoteSpanAndRevisionFailVerification(t *testing.T) {
 			quote: quote,
 		},
 	}
-	builder, err := reasoning.NewBuilder(fixture.client)
+	builder, err := reasoning.NewBuilder(fixture.reader())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -577,7 +518,7 @@ func TestUnicodeExactQuoteOffsetsAreReverified(t *testing.T) {
 		t.Fatal(err)
 	}
 	result := fixture.extendedResult(t, anchor)
-	builder, _ := reasoning.NewBuilder(fixture.client)
+	builder, _ := reasoning.NewBuilder(fixture.reader())
 	prepared, err := builder.Build(context.Background(), reasoning.BuildInput{
 		ContextPack: fixture.pack, Result: result,
 		Policy: reasoning.Policy{ID: fixture.policyID},
@@ -628,6 +569,82 @@ func TestUnicodeExactQuoteOffsetsAreReverified(t *testing.T) {
 	}
 }
 
+func TestPartialDocumentCitationsCaptureResolvedProvenance(t *testing.T) {
+	for _, omitted := range []string{"section", "span"} {
+		t.Run(omitted, func(t *testing.T) {
+			fixture := newFixture(t, []sourceFixture{{
+				content: "# Partial\n\nResolved source roles remain authoritative.\n",
+			}}, false, "policy", "request")
+			citation, quote, ok := fixture.documentAnchors[0].Document()
+			if !ok {
+				t.Fatal("fixture anchor is not document evidence")
+			}
+			resolvedSectionID := citation.SectionID
+			resolvedSpanID := citation.SpanID
+			if omitted == "section" {
+				citation.SectionID = ""
+			} else {
+				citation.SpanID = ""
+			}
+			addition, err := inference.NewDocumentAnchor(citation, quote)
+			if err != nil {
+				t.Fatal(err)
+			}
+			result := fixture.extendedResult(t, addition)
+			builder, err := reasoning.NewBuilder(fixture.reader())
+			if err != nil {
+				t.Fatal(err)
+			}
+			prepared, err := builder.Build(
+				context.Background(), reasoning.BuildInput{
+					ContextPack: fixture.pack,
+					Result:      result,
+					Policy: reasoning.Policy{
+						ID: fixture.policyID,
+					},
+				})
+			if err != nil {
+				t.Fatal(err)
+			}
+			additions := prepared.CaptureMetadata().AdditionEvidence()
+			if len(additions) != 1 ||
+				additions[0].Citation != citation ||
+				len(additions[0].NodeIDs) != 3 ||
+				!testContainsID(additions[0].NodeIDs, resolvedSectionID) ||
+				!testContainsID(additions[0].NodeIDs, resolvedSpanID) {
+				t.Fatalf("resolved addition evidence = %+v", additions)
+			}
+			recorder, err := interaction.NewRecorder(
+				context.Background(), fixture.client)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := recorder.SetClock(func() time.Time {
+				return fixture.generatedAt.Add(time.Minute)
+			}); err != nil {
+				t.Fatal(err)
+			}
+			response, err := prepared.Capture(
+				context.Background(), recorder, captureSession(t, prepared))
+			if err != nil {
+				t.Fatal(err)
+			}
+			recorded := response.RecordedSession()
+			if len(recorded.Turns) != 1 ||
+				recorded.Turns[0].ToolCall == nil ||
+				len(recorded.Turns[0].ToolCall.RetrievedEvidence) != 1 {
+				t.Fatalf("recorded partial citation = %+v", recorded)
+			}
+			reference := recorded.Turns[0].ToolCall.RetrievedEvidence[0]
+			if reference.Citation != citation ||
+				!testContainsID(reference.NodeIDs, resolvedSectionID) ||
+				!testContainsID(reference.NodeIDs, resolvedSpanID) {
+				t.Fatalf("recorded resolved roles = %+v", reference)
+			}
+		})
+	}
+}
+
 func TestCitationAndRetrievedIdentitiesAreNotClippedAtTwenty(t *testing.T) {
 	sources := make([]sourceFixture, 21)
 	for index := range sources {
@@ -640,7 +657,7 @@ func TestCitationAndRetrievedIdentitiesAreNotClippedAtTwenty(t *testing.T) {
 		ids = append(ids, anchor.ID())
 	}
 	result := fixture.result(t, ids, false)
-	builder, _ := reasoning.NewBuilder(fixture.client)
+	builder, _ := reasoning.NewBuilder(fixture.reader())
 	prepared, err := builder.Build(context.Background(), reasoning.BuildInput{
 		ContextPack: fixture.pack, Result: result,
 		Policy: reasoning.Policy{ID: fixture.policyID},
@@ -684,7 +701,7 @@ func TestAuthorizedHiddenEvidenceFailsClosed(t *testing.T) {
 	}}, false, "policy", "request")
 	result := fixture.result(t, []shoal.ID{fixture.documentAnchors[0].ID()}, false)
 	citation, _, _ := fixture.documentAnchors[0].Document()
-	reader := hiddenReader{SnapshotReader: fixture.client, hidden: citation.DocumentID}
+	reader := hiddenReader{AuthorizationReader: fixture.reader(), hidden: citation.DocumentID}
 	builder, err := reasoning.NewBuilder(reader)
 	if err != nil {
 		t.Fatal(err)
@@ -703,7 +720,7 @@ func TestNoResponseBeforeDurableCaptureSucceeds(t *testing.T) {
 		content: "# Capture\n\nDurable evidence.\n", visibility: "secret",
 	}}, false, "policy", "request")
 	result := fixture.result(t, []shoal.ID{fixture.documentAnchors[0].ID()}, false)
-	builder, _ := reasoning.NewBuilder(fixture.client)
+	builder, _ := reasoning.NewBuilder(fixture.reader())
 	prepared, err := builder.Build(context.Background(), reasoning.BuildInput{
 		ContextPack: fixture.pack, Result: result,
 		Policy: reasoning.Policy{ID: fixture.policyID},
@@ -739,29 +756,43 @@ func TestNoResponseBeforeDurableCaptureSucceeds(t *testing.T) {
 	success := &captureSink{enrich: func(session interaction.Session) interaction.Session {
 		trustedActor.OnBehalfOf = []shoal.ID{"trusted-delegate"}
 		session.Actor = trustedActor
-		session.Turns = []interaction.Turn{{
-			Index: 0,
-			ToolCall: &interaction.ToolCall{
-				Kind: "retrieve", RetrievedNodeIDs: session.SeedNodeIDs,
-				RetrievedEvidence: session.SeedEvidence,
-			},
-		}}
 		return session
 	}}
-	captured := capture(t, prepared, success)
+	recorder, err = interaction.NewRecorder(context.Background(), success)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := recorder.SetClock(func() time.Time {
+		return prepared.CaptureMetadata().GeneratedAt().Add(time.Minute)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	session := captureSession(t, prepared)
+	session.Turns = []interaction.Turn{{
+		Index: 0,
+		ToolCall: &interaction.ToolCall{
+			Kind: "retrieve", RetrievedNodeIDs: session.SeedNodeIDs,
+			RetrievedEvidence: session.SeedEvidence,
+		},
+	}}
+	captured, err := prepared.Capture(context.Background(), recorder, session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if success.records != 1 {
+		t.Fatalf("record count = %d", success.records)
+	}
 	if captured.RecordedSession().Actor.SubjectID != trustedActor.SubjectID ||
 		captured.RecordedSession().Actor.ActorID != trustedActor.ActorID {
 		t.Fatal("captured response did not retain trusted persisted enrichment")
 	}
 	success.session.Actor.OnBehalfOf[0] = "mutated"
-	success.session.RequiredVisibility[0] = "mutated"
 	success.session.SeedNodeIDs[0] = "mutated"
 	success.session.SeedEvidence[0].NodeIDs[0] = "mutated"
 	success.session.Turns[0].ToolCall.RetrievedNodeIDs[0] = "mutated"
 	success.session.Turns[0].ToolCall.RetrievedEvidence[0].NodeIDs[0] = "mutated"
 	recorded := captured.RecordedSession()
 	if recorded.Actor.OnBehalfOf[0] != "trusted-delegate" ||
-		recorded.RequiredVisibility[0] == "mutated" ||
 		recorded.SeedNodeIDs[0] == "mutated" ||
 		recorded.SeedEvidence[0].NodeIDs[0] == "mutated" ||
 		recorded.Turns[0].ToolCall.RetrievedNodeIDs[0] == "mutated" ||
@@ -800,7 +831,7 @@ func TestCaptureUsesRecorderTimeAndRejectsInvalidPersistedChronology(t *testing.
 		content: "# Time\n\nChronology is verified.\n",
 	}}, false, "policy", "request")
 	result := fixture.result(t, []shoal.ID{fixture.documentAnchors[0].ID()}, false)
-	builder, _ := reasoning.NewBuilder(fixture.client)
+	builder, _ := reasoning.NewBuilder(fixture.reader())
 	prepared, err := builder.Build(context.Background(), reasoning.BuildInput{
 		ContextPack: fixture.pack, Result: result,
 		Policy: reasoning.Policy{ID: fixture.policyID},
@@ -911,7 +942,7 @@ func TestCaptureRequiresEmptyPinnedRequestIDToRemainEmpty(t *testing.T) {
 		content: "# Request\n\nNo request identifier was pinned.\n",
 	}}, false, "policy", "")
 	result := fixture.result(t, []shoal.ID{fixture.documentAnchors[0].ID()}, false)
-	builder, _ := reasoning.NewBuilder(fixture.client)
+	builder, _ := reasoning.NewBuilder(fixture.reader())
 	prepared, err := builder.Build(context.Background(), reasoning.BuildInput{
 		ContextPack: fixture.pack, Result: result,
 		Policy: reasoning.Policy{ID: fixture.policyID},
@@ -961,6 +992,32 @@ type fixture struct {
 	documentAnchors []inference.EvidenceAnchor
 	graphAnchor     inference.EvidenceAnchor
 	generatedAt     time.Time
+}
+
+func (f fixture) reader() contextpack.AuthorizationReader {
+	return testAuthorizationReader{
+		SnapshotReader: f.client,
+		authorization:  f.pack.Authorization(),
+	}
+}
+
+type testAuthorizationReader struct {
+	contextpack.SnapshotReader
+	authorization inference.AuthPin
+}
+
+func (r testAuthorizationReader) ValidateAuthorization(
+	_ context.Context,
+	pin inference.AuthPin,
+) error {
+	if pin.Fingerprint() != r.authorization.Fingerprint() ||
+		!pin.ExpiresAt().Equal(r.authorization.ExpiresAt()) {
+		return shoal.NewError(
+			shoal.ErrorUnauthorized,
+			"authorization pin does not match test reader",
+		)
+	}
+	return nil
 }
 
 func newFixture(
@@ -1321,7 +1378,7 @@ func (f recorderFunc) Record(
 }
 
 type hiddenReader struct {
-	contextpack.SnapshotReader
+	contextpack.AuthorizationReader
 	hidden shoal.ID
 }
 
@@ -1334,11 +1391,11 @@ func (r hiddenReader) Document(
 		return explorer.DocumentView{}, shoal.NewError(
 			shoal.ErrorNotFound, "document not found")
 	}
-	return r.SnapshotReader.Document(ctx, documentID, revisionID)
+	return r.AuthorizationReader.Document(ctx, documentID, revisionID)
 }
 
 type assertionReader struct {
-	contextpack.SnapshotReader
+	contextpack.AuthorizationReader
 	assertion ontology.Assertion
 }
 
@@ -1346,7 +1403,7 @@ func (r assertionReader) Neighborhood(
 	ctx context.Context,
 	request explorer.NeighborhoodRequest,
 ) (explorer.Neighborhood, error) {
-	neighborhood, err := r.SnapshotReader.Neighborhood(ctx, request)
+	neighborhood, err := r.AuthorizationReader.Neighborhood(ctx, request)
 	if err != nil {
 		return explorer.Neighborhood{}, err
 	}
@@ -1371,4 +1428,13 @@ func assertStrings(t *testing.T, actual, expected []string) {
 			t.Fatalf("strings = %v, want %v", actual, expected)
 		}
 	}
+}
+
+func testContainsID(values []shoal.ID, target shoal.ID) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
 }

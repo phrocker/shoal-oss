@@ -45,6 +45,14 @@ type SnapshotReader interface {
 	Snapshot(context.Context) (explorer.Snapshot, error)
 }
 
+// AuthorizationReader is the authorization-enforcing verification seam.
+// Validation is performed before and after hydration so a result cannot be
+// accepted under a different, expired, or revoked authorization decision.
+type AuthorizationReader interface {
+	SnapshotReader
+	ValidateAuthorization(context.Context, inference.AuthPin) error
+}
+
 // VerifiedSource is one exact source-node identity and its declared
 // visibility at the verified snapshot.
 type VerifiedSource struct {
@@ -118,6 +126,11 @@ func (a VerifiedAnchor) EvidenceReference() (
 		if !ok {
 			return interaction.EvidenceReference{}, invalid(
 				"verified document evidence is unavailable")
+		}
+		if len(a.sources) != 3 ||
+			a.sources[0].ID() != citation.DocumentID {
+			return interaction.EvidenceReference{}, invalid(
+				"verified document evidence has incomplete resolved source roles")
 		}
 		reference.Kind = interaction.EvidenceDocument
 		reference.Citation = citation
@@ -195,10 +208,10 @@ func (b Builder) VerifyResult(
 	if err := result.ValidateFor(pack); err != nil {
 		return ResultVerification{}, err
 	}
-	reader, ok := b.Reader.(SnapshotReader)
+	reader, ok := b.Reader.(AuthorizationReader)
 	if !ok || reader == nil || nilSnapshotReader(reader) {
 		return ResultVerification{}, invalid(
-			"result verification requires a snapshot-aware authorized reader")
+			"result verification requires an authorization-aware snapshot reader")
 	}
 	limits, err := normalizeLimits(b.Limits)
 	if err != nil {
@@ -209,6 +222,10 @@ func (b Builder) VerifyResult(
 		return ResultVerification{}, err
 	}
 	if err := verifySnapshot(pack.Snapshot(), before); err != nil {
+		return ResultVerification{}, err
+	}
+	if err := reader.ValidateAuthorization(
+		ctx, pack.Authorization()); err != nil {
 		return ResultVerification{}, err
 	}
 
@@ -256,6 +273,10 @@ func (b Builder) VerifyResult(
 		)
 	}
 	if err := verifySnapshot(pack.Snapshot(), after); err != nil {
+		return ResultVerification{}, err
+	}
+	if err := reader.ValidateAuthorization(
+		ctx, pack.Authorization()); err != nil {
 		return ResultVerification{}, err
 	}
 	return ResultVerification{
@@ -311,15 +332,12 @@ func (v *verifier) verifyAnchor(
 			return VerifiedAnchor{}, invalid(
 				"graph evidence variant is unavailable")
 		}
-		verified, err := v.graphAnchor(path)
+		verifiedAnchor, assertions, err := v.verifyResultGraphAnchor(
+			anchor, path)
 		if err != nil {
 			return VerifiedAnchor{}, err
 		}
 		sources := make([]VerifiedSource, 0, len(path.Nodes))
-		assertions, err := v.assertionsForPath(path)
-		if err != nil {
-			return VerifiedAnchor{}, err
-		}
 		visibilitySets := make([][]string, 0, len(path.Nodes)+len(path.Edges))
 		for _, node := range path.Nodes {
 			labels, err := interaction.NodeVisibility(node)
@@ -343,7 +361,7 @@ func (v *verifier) verifyAnchor(
 			return VerifiedAnchor{}, err
 		}
 		return VerifiedAnchor{
-			anchor:     verified,
+			anchor:     verifiedAnchor,
 			sources:    sources,
 			assertions: assertions,
 			visibility: visibility,
@@ -352,6 +370,98 @@ func (v *verifier) verifyAnchor(
 	default:
 		return VerifiedAnchor{}, invalid("unknown evidence anchor kind")
 	}
+}
+
+func (v *verifier) verifyResultGraphAnchor(
+	anchor inference.EvidenceAnchor,
+	path graph.Path,
+) (inference.EvidenceAnchor, []VerifiedAssertion, error) {
+	if err := path.Validate(); err != nil {
+		return inference.EvidenceAnchor{}, nil, err
+	}
+	if len(path.Nodes) > v.limits.MaxPathNodes ||
+		len(path.Edges) > v.limits.MaxGraphEdges {
+		return inference.EvidenceAnchor{}, nil, invalid(
+			"graph evidence path exceeds verification bounds")
+	}
+	path = clonePath(path)
+	nodeIDs := make([]shoal.ID, 0, len(path.Nodes))
+	missing := false
+	for index, node := range path.Nodes {
+		node = canonicalNode(node)
+		path.Nodes[index] = node
+		nodeIDs = append(nodeIDs, node.ID)
+		if existing, ok := v.nodes[node.ID]; !ok ||
+			!canonicalEqual(existing, node) {
+			missing = true
+		}
+	}
+	for _, edge := range path.Edges {
+		if existing, ok := v.edges[edge.ID]; !ok ||
+			!canonicalEqual(existing, edge) {
+			missing = true
+		}
+	}
+	if missing {
+		if v.reader == nil {
+			return inference.EvidenceAnchor{}, nil, invalid(
+				"graph hydration is required for verification")
+		}
+		request := explorer.NeighborhoodRequest{NodeIDs: nodeIDs, Depth: 1}
+		neighborhood, err := v.reader.Neighborhood(v.ctx, request)
+		if err != nil {
+			return inference.EvidenceAnchor{}, nil, err
+		}
+		if err := validateNeighborhoodResponse(
+			request, neighborhood, v.limits); err != nil {
+			return inference.EvidenceAnchor{}, nil, err
+		}
+		if err := v.addNeighborhood(neighborhood); err != nil {
+			return inference.EvidenceAnchor{}, nil, err
+		}
+	}
+	for _, node := range path.Nodes {
+		existing, ok := v.nodes[node.ID]
+		if !ok || !canonicalEqual(existing, node) {
+			return inference.EvidenceAnchor{}, nil, invalid(
+				"graph path node does not match hydrated Explorer data")
+		}
+	}
+	for _, edge := range path.Edges {
+		existing, ok := v.edges[edge.ID]
+		if !ok || !canonicalEqual(existing, edge) {
+			return inference.EvidenceAnchor{}, nil, invalid(
+				"graph path edge does not match hydrated Explorer data")
+		}
+	}
+	assertions, err := v.assertionsForPath(path)
+	if err != nil {
+		return inference.EvidenceAnchor{}, nil, err
+	}
+	verified, err := inference.NewGraphAnchorWithAssertions(
+		path, verifiedAssertionReferences(assertions))
+	if err != nil {
+		return inference.EvidenceAnchor{}, nil, err
+	}
+	if verified.ID() != anchor.ID() {
+		return inference.EvidenceAnchor{}, nil, invalid(
+			"graph evidence assertions do not match authoritative provenance")
+	}
+	return verified, assertions, nil
+}
+
+func verifiedAssertionReferences(
+	assertions []VerifiedAssertion,
+) []interaction.AssertionReference {
+	result := make([]interaction.AssertionReference, len(assertions))
+	for index, assertion := range assertions {
+		result[index] = interaction.AssertionReference{
+			AssertionID: assertion.assertionID,
+			EdgeID:      assertion.edgeID,
+			Origin:      assertion.origin,
+		}
+	}
+	return result
 }
 
 func (v *verifier) assertionsForPath(
@@ -382,8 +492,7 @@ func (v *verifier) assertionsForPath(
 				return nil, invalid(
 					"graph path assertion ID does not match its authoritative edge")
 			}
-			if origin := edge.Properties["ontology.assertion.origin"]; origin != "" &&
-				origin != string(reference.Origin) {
+			if origin := edge.Properties["ontology.assertion.origin"]; origin != "" && origin != string(reference.Origin) {
 				return nil, invalid(
 					"graph path origin does not match its authoritative assertion")
 			}

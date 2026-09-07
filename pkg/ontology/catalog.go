@@ -47,7 +47,7 @@ func NewPublishedCatalog(
 		return PublishedCatalog{}, invalid(
 			"published ontology catalog exceeds the public bound")
 	}
-	outgoing := make(map[shoal.ID]GovernedProposal)
+	outgoing := make(map[shoal.ID][]GovernedProposal)
 	for _, proposal := range proposals {
 		if err := proposal.Validate(); err != nil {
 			return PublishedCatalog{}, err
@@ -60,11 +60,7 @@ func NewPublishedCatalog(
 		if !ok {
 			continue
 		}
-		if _, duplicate := outgoing[baseID]; duplicate {
-			return PublishedCatalog{}, shoal.NewError(
-				shoal.ErrorConflict, "published ontology history is ambiguous")
-		}
-		outgoing[baseID] = proposal
+		outgoing[baseID] = append(outgoing[baseID], proposal)
 	}
 	catalog := PublishedCatalog{
 		versions: []OntologyVersion{configured.clone()},
@@ -72,11 +68,15 @@ func NewPublishedCatalog(
 	active := configured
 	visited := map[shoal.ID]struct{}{active.ID(): {}}
 	for len(catalog.versions) <= MaxPublishedOntologyVersions {
-		next, ok := outgoing[active.ID()]
-		if !ok {
+		next := outgoing[active.ID()]
+		if len(next) == 0 {
 			return catalog, nil
 		}
-		active = next.ProposedVersion()
+		if len(next) != 1 {
+			return PublishedCatalog{}, shoal.NewError(
+				shoal.ErrorConflict, "published ontology history is ambiguous")
+		}
+		active = next[0].ProposedVersion()
 		if _, cycle := visited[active.ID()]; cycle {
 			return PublishedCatalog{}, shoal.NewError(
 				shoal.ErrorConflict, "published ontology history contains a cycle")

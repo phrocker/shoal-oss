@@ -32,6 +32,31 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
+type canonicalDocumentIndexKey struct{}
+
+func (c *Client) withCanonicalDocumentIndex(
+	ctx context.Context,
+) (context.Context, error) {
+	if _, ok := ctx.Value(canonicalDocumentIndexKey{}).(map[shoal.ID]shoal.ID); ok {
+		return ctx, nil
+	}
+	summaries, err := c.base.Documents(ctx)
+	if err != nil {
+		return nil, err
+	}
+	currentBase := make(map[shoal.ID]shoal.ID, len(summaries))
+	for _, summary := range summaries {
+		if err := validateSummary(summary); err != nil {
+			return nil, inconsistentBase()
+		}
+		if _, duplicate := currentBase[summary.Document.ID]; duplicate {
+			return nil, inconsistentBase()
+		}
+		currentBase[summary.Document.ID] = summary.Revision.ID
+	}
+	return context.WithValue(ctx, canonicalDocumentIndexKey{}, currentBase), nil
+}
+
 // Connect authorizes both current endpoints and stores only the trusted
 // edge-local policy. Endpoint rules are re-evaluated dynamically on every use.
 func (c *Client) Connect(ctx context.Context, edge graph.Edge) error {
@@ -131,7 +156,12 @@ func (c *Client) Neighborhood(
 		return explorer.Neighborhood{}, directBaseError(err)
 	}
 	result, err := c.filterNeighborhood(
-		ctx, raw, normalized, explorer.GraphDirectionBoth, decision, now, false)
+		ctx, raw, normalized, explorer.GraphDirectionBoth, decision, now, false,
+		auth.OperationNeighborhood)
+	if err != nil {
+		return explorer.Neighborhood{}, err
+	}
+	result, err = c.applyOntologyLens(ctx, result, decision)
 	if err != nil {
 		return explorer.Neighborhood{}, err
 	}
@@ -168,38 +198,8 @@ func (c *Client) applyOntologyLens(
 	if err != nil {
 		return explorer.Neighborhood{}, directBaseError(err)
 	}
-	if err := validateOntologyInterpretations(
-		result.Assertions, interpretations, selected,
-	); err != nil {
-		return explorer.Neighborhood{}, err
-	}
 	result.Interpretations = interpretations
 	return result, nil
-}
-
-func validateOntologyInterpretations(
-	assertions []ontology.Assertion,
-	interpretations []ontology.AssertionInterpretation,
-	selected ontology.OntologyIdentity,
-) error {
-	if len(interpretations) != len(assertions) {
-		return inconsistentOntologyInterpretation()
-	}
-	for index, interpretation := range interpretations {
-		if interpretation.Reader() != selected ||
-			!reflect.DeepEqual(
-				interpretation.Original(), assertions[index]) {
-			return inconsistentOntologyInterpretation()
-		}
-	}
-	return nil
-}
-
-func inconsistentOntologyInterpretation() error {
-	return shoal.NewError(
-		shoal.ErrorUnavailable,
-		"trusted ontology interpretation is inconsistent",
-	)
 }
 
 func (c *Client) edgeAllows(
@@ -227,6 +227,42 @@ func (c *Client) edgeAllows(
 // registered and therefore denies. A partial result therefore authorizes only
 // the identifiers it does carry, and an empty one authorizes nothing.
 type registeredNodes map[shoal.ID]NodeRegistration
+
+type currentRevisions map[shoal.ID]RevisionRegistration
+
+// resolveCurrentRevisions resolves distinct document identifiers in one
+// policy-store round trip. Omitted registrations retain the point lookup's
+// fail-closed !ok meaning, and results for unrequested identifiers are ignored.
+func (c *Client) resolveCurrentRevisions(
+	ctx context.Context,
+	documentIDs []shoal.ID,
+) (currentRevisions, error) {
+	distinct := make([]shoal.ID, 0, len(documentIDs))
+	requested := make(map[shoal.ID]struct{}, len(documentIDs))
+	for _, documentID := range documentIDs {
+		if _, duplicate := requested[documentID]; duplicate {
+			continue
+		}
+		requested[documentID] = struct{}{}
+		distinct = append(distinct, documentID)
+	}
+	if len(distinct) == 0 {
+		return currentRevisions{}, nil
+	}
+	batch, err := c.policyStore.CurrentRevisions(ctx, distinct)
+	if err != nil {
+		return nil, policyCatalogReadError(ctx, err)
+	}
+	resolved := make(currentRevisions, len(distinct))
+	for _, documentID := range distinct {
+		registration, ok := batch[documentID]
+		if !ok {
+			continue
+		}
+		resolved[documentID] = registration
+	}
+	return resolved, nil
+}
 
 // resolveNodes collapses the identifiers it is given into a single policy-store
 // round trip, or none at all when there is nothing to resolve, deduplicating
@@ -398,38 +434,57 @@ func (c *Client) canonicalRegisteredNodes(
 	ctx context.Context,
 	registrations map[shoal.ID]NodeRegistration,
 ) (map[shoal.ID]graph.Node, error) {
-	summaries, err := c.base.Documents(ctx)
-	if err != nil {
-		return nil, err
+	return c.canonicalRegisteredNodesCached(ctx, registrations, nil)
+}
+
+func (c *Client) canonicalRegisteredNodesCached(
+	ctx context.Context,
+	registrations map[shoal.ID]NodeRegistration,
+	canonicalDocuments map[shoal.ID]*canonicalRetrievalDocument,
+) (map[shoal.ID]graph.Node, error) {
+	currentBase, ok := ctx.Value(
+		canonicalDocumentIndexKey{}).(map[shoal.ID]shoal.ID)
+	if !ok {
+		indexed, err := c.withCanonicalDocumentIndex(ctx)
+		if err != nil {
+			return nil, err
+		}
+		currentBase = indexed.Value(
+			canonicalDocumentIndexKey{}).(map[shoal.ID]shoal.ID)
 	}
-	currentBase := make(map[shoal.ID]shoal.ID, len(summaries))
-	for _, summary := range summaries {
-		if err := validateSummary(summary); err != nil {
-			return nil, inconsistentBase()
-		}
-		if _, duplicate := currentBase[summary.Document.ID]; duplicate {
-			return nil, inconsistentBase()
-		}
-		currentBase[summary.Document.ID] = summary.Revision.ID
+	if canonicalDocuments == nil {
+		canonicalDocuments = make(map[shoal.ID]*canonicalRetrievalDocument)
 	}
 	required := make(map[shoal.ID]shoal.ID)
 	for _, registration := range registrations {
+		if registration.Node.ID != "" {
+			continue
+		}
+		if cached, ok := canonicalDocuments[registration.DocumentID]; ok {
+			if cached.registration.RevisionID != registration.RevisionID {
+				return nil, inconsistentBase()
+			}
+			continue
+		}
 		if revisionID, ok := required[registration.DocumentID]; ok &&
 			revisionID != registration.RevisionID {
 			return nil, inconsistentBase()
 		}
 		required[registration.DocumentID] = registration.RevisionID
 	}
-	canonicalDocuments := make(
-		map[shoal.ID]*canonicalRetrievalDocument, len(required))
+	documentIDs := make([]shoal.ID, 0, len(required))
 	for documentID, revisionID := range required {
 		if currentBase[documentID] != revisionID {
 			return nil, auth.ObjectNotFound()
 		}
-		current, ok, err := c.policyStore.CurrentRevision(ctx, documentID)
-		if err != nil {
-			return nil, policyCatalogReadError(ctx, err)
-		}
+		documentIDs = append(documentIDs, documentID)
+	}
+	currentRevisions, err := c.resolveCurrentRevisions(ctx, documentIDs)
+	if err != nil {
+		return nil, err
+	}
+	for documentID, revisionID := range required {
+		current, ok := currentRevisions[documentID]
 		if !ok || current.RevisionID != revisionID {
 			return nil, auth.ObjectNotFound()
 		}

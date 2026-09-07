@@ -259,6 +259,22 @@ func TestIndeterminateOntologyMutationBlocksFurtherWritesUntilReopen(t *testing.
 		); !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
 			t.Fatalf("read after indeterminate mutation = %v", err)
 		}
+		if _, err := corpus.OntologyProposalMutationState(
+			context.Background(), base, "",
+		); !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
+			t.Fatalf("mutation state after indeterminate mutation = %v", err)
+		}
+		if _, err := corpus.PublishedOntologyCatalog(
+			context.Background(), base,
+		); !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
+			t.Fatalf("catalog after indeterminate mutation = %v", err)
+		}
+		selected, _ := ontology.NewOntologyIdentity(target)
+		if _, err := corpus.InterpretAssertions(
+			context.Background(), nil, selected,
+		); !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
+			t.Fatalf("lens read after indeterminate mutation = %v", err)
+		}
 	})
 	t.Run("transition", func(t *testing.T) {
 		data := filepath.Join(t.TempDir(), "corpus")
@@ -285,6 +301,22 @@ func TestIndeterminateOntologyMutationBlocksFurtherWritesUntilReopen(t *testing.
 		); !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
 			t.Fatalf("read after indeterminate transition = %v", err)
 		}
+		if _, err := corpus.OntologyProposalMutationState(
+			context.Background(), base, proposal.ID(),
+		); !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
+			t.Fatalf("mutation state after indeterminate transition = %v", err)
+		}
+		if _, err := corpus.PublishedOntologyCatalog(
+			context.Background(), base,
+		); !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
+			t.Fatalf("catalog after indeterminate transition = %v", err)
+		}
+		selected, _ := ontology.NewOntologyIdentity(target)
+		if _, err := corpus.InterpretAssertions(
+			context.Background(), nil, selected,
+		); !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
+			t.Fatalf("lens read after indeterminate transition = %v", err)
+		}
 		if err := corpus.Close(); err != nil {
 			t.Fatal(err)
 		}
@@ -299,6 +331,21 @@ func TestIndeterminateOntologyMutationBlocksFurtherWritesUntilReopen(t *testing.
 		}
 		if len(stored) != 1 || stored[0].State() != ontology.ProposalDraft {
 			t.Fatalf("blocked transition mutated proposal = %#v", stored)
+		}
+		if _, err := corpus.InterpretAssertions(
+			context.Background(), nil, selected,
+		); err != nil {
+			t.Fatalf("lens read after reopen = %v", err)
+		}
+		state, err := corpus.OntologyProposalMutationState(
+			context.Background(), base, proposal.ID())
+		if err != nil || !state.ProposalFound() {
+			t.Fatalf("mutation state after reopen = %#v, %v", state, err)
+		}
+		if _, err := corpus.PublishedOntologyCatalog(
+			context.Background(), base,
+		); err != nil {
+			t.Fatalf("catalog after reopen = %v", err)
 		}
 	})
 }
@@ -479,6 +526,60 @@ func TestUnrelatedSchemaForkDoesNotPoisonSelectedOntology(t *testing.T) {
 		context.Background(), []ontology.Assertion{assertion}, identity)
 	if err != nil || len(read) != 1 || !read[0].Resolved() {
 		t.Fatalf("unrelated fork poisoned selected schema: %#v, err=%v", read, err)
+	}
+}
+
+func TestDisconnectedSameSchemaForkDoesNotPoisonExactRead(t *testing.T) {
+	corpus, err := Open(filepath.Join(t.TempDir(), "corpus"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer corpus.Close()
+	at := time.Date(2026, 9, 6, 4, 30, 0, 0, time.UTC)
+	schema, _ := ontology.NewOntologySchema("selected", "Selected", "", nil)
+	property, _ := ontology.NewPropertyDefinition(
+		"name", "Name", "", ontology.ValueString, nil, nil)
+	concept, _ := ontology.NewConceptDefinition(
+		"person", "Person", "", []shoal.ID{property.ID()}, nil)
+	selected, _ := ontology.NewOntologyVersion(
+		schema, "1", at, []ontology.ConceptDefinition{concept},
+		nil, []ontology.PropertyDefinition{property}, nil)
+	disconnected, _ := ontology.NewOntologyVersion(
+		schema, "other", at.Add(time.Second), nil, nil, nil, nil)
+	left, _ := ontology.NewOntologyVersion(
+		schema, "other-left", at.Add(2*time.Second), nil, nil, nil, nil)
+	right, _ := ontology.NewOntologyVersion(
+		schema, "other-right", at.Add(3*time.Second), nil, nil, nil, nil)
+	corpus.mu.Lock()
+	for _, proposal := range []ontology.GovernedProposal{
+		mustPublishedProposal(t, schema, disconnected, left, at.Add(4*time.Second)),
+		mustPublishedProposal(t, schema, disconnected, right, at.Add(8*time.Second)),
+	} {
+		record := mustPersistedPublishedProposal(t, proposal, disconnected)
+		copy := record
+		corpus.ontologyProposals[proposal.ID()] = &copy
+	}
+	corpus.mu.Unlock()
+	evidence, _ := ontology.NewEvidenceRef(document.Citation{
+		DocumentID: "doc", RevisionID: "rev", SectionID: "section",
+		Range: document.SourceRange{},
+	}, "", nil)
+	provenance, _ := ontology.NewExtractionProvenance(
+		"provider", "model", "1", "prompt", "1", "extractor", "1", nil)
+	value, _ := ontology.NewStringValue("Ada")
+	identity, _ := ontology.NewOntologyIdentity(selected)
+	assertion, err := ontology.NewAssertion(
+		"person-1", property.ID(), value, ontology.AssertionExplicit, 1,
+		[]ontology.EvidenceRef{evidence}, provenance, nil,
+		ontology.WithAssertionSubjectType(concept.ID()),
+		ontology.WithAssertionOntology(identity))
+	if err != nil {
+		t.Fatal(err)
+	}
+	read, err := corpus.InterpretAssertions(
+		context.Background(), []ontology.Assertion{assertion}, identity)
+	if err != nil || len(read) != 1 || !read[0].Resolved() {
+		t.Fatalf("disconnected same-schema fork poisoned exact read: %#v, %v", read, err)
 	}
 }
 

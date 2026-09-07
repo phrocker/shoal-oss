@@ -25,25 +25,18 @@ type ActionInteractionRecorder interface {
 // ActionRecorder records exact action evidence through the result-returning
 // interaction recorder and rejects any sink result that changes the effect.
 type ActionRecorder struct {
-	recorder  ActionInteractionRecorder
-	snapshots fleet.InteractionSnapshotProvider
+	recorder ActionInteractionRecorder
 }
 
 func NewActionRecorder(
 	recorder ActionInteractionRecorder,
-	snapshots fleet.InteractionSnapshotProvider,
 ) (*ActionRecorder, error) {
 	if isNilActionInteractionRecorder(recorder) {
 		return nil, shoal.NewError(
 			shoal.ErrorInvalidArgument,
 			"fleet action interaction recorder is required")
 	}
-	if isNilDependency(snapshots) {
-		return nil, shoal.NewError(
-			shoal.ErrorInvalidArgument,
-			"fleet action snapshot provider is required")
-	}
-	return &ActionRecorder{recorder: recorder, snapshots: snapshots}, nil
+	return &ActionRecorder{recorder: recorder}, nil
 }
 
 func (r *ActionRecorder) RecordAction(
@@ -62,7 +55,6 @@ func (r *ActionRecorder) RecordAction(
 	}
 	evidence := make([]interaction.EvidenceReference, len(audit.Record.Evidence))
 	retrievedNodeIDs := make([]shoal.ID, 0, len(audit.Record.Evidence))
-	requiredVisibility := make([]string, 0, len(audit.Record.Evidence))
 	for index, item := range audit.Record.Evidence {
 		evidence[index] = interaction.EvidenceReference{
 			AnchorID: item.AnchorID, Kind: item.Kind, Citation: item.Citation,
@@ -72,21 +64,15 @@ func (r *ActionRecorder) RecordAction(
 				[]interaction.AssertionReference(nil), item.Assertions...),
 		}
 		retrievedNodeIDs = append(retrievedNodeIDs, item.NodeIDs...)
-		requiredVisibility = append(requiredVisibility, item.Visibility...)
-	}
-	requestedVisibility, err := interaction.Conjoin(requiredVisibility)
-	if err != nil {
-		return err
 	}
 	requested := interaction.Session{
 		ID: actionSessionID(audit), Operation: interaction.OperationToolCall,
 		AuthorizationOperation: string(audit.Operation),
 		QueryDigest: interaction.Digest(
 			string(audit.Operation) + ":" + audit.Phase),
-		RequestID:          audit.Record.RequestID,
-		ResultID:           shoal.ID(hex.EncodeToString(audit.Record.ID)),
-		StopReason:         audit.Phase,
-		RequiredVisibility: requestedVisibility,
+		RequestID:  audit.Record.RequestID,
+		ResultID:   shoal.ID(hex.EncodeToString(audit.Record.ID)),
+		StopReason: audit.Phase,
 		Turns: []interaction.Turn{{
 			Index:    0,
 			Decision: actionIdentifier(audit),
@@ -102,22 +88,10 @@ func (r *ActionRecorder) RecordAction(
 	if len(evidence) > 0 {
 		requested.SnapshotID = audit.Record.EvidenceSnapshotID
 		requested.SnapshotAsOf = audit.Record.EvidenceSnapshotAsOf
-	} else {
-		snapshot, err := r.snapshots.InteractionSnapshot(ctx)
-		if err != nil {
-			return err
-		}
-		requested.SnapshotID = shoal.ID(snapshot.ID)
-		requested.SnapshotAsOf = snapshot.AsOf.UTC()
+		requested.AuthorizationFingerprint = shoal.ID(
+			audit.Record.ExecutionFingerprint.String())
+		requested.AuthorizationExpiresAt = audit.Record.ExecutionExpiresAt
 	}
-	fingerprint, expiresAt :=
-		audit.Record.ExecutionFingerprint, audit.Record.ExecutionExpiresAt
-	if expiresAt.IsZero() {
-		fingerprint, expiresAt =
-			audit.Record.AuthorizationFingerprint, audit.Record.AuthorizationExpiresAt
-	}
-	requested.AuthorizationFingerprint = shoal.ID(fingerprint.String())
-	requested.AuthorizationExpiresAt = expiresAt
 	persisted, err := r.recorder.Record(ctx, requested)
 	if err != nil {
 		return err

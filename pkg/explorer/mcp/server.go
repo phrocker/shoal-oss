@@ -880,30 +880,8 @@ func (s *Server) authorizedContext(
 		return nil, auth.Decision{}, shoal.NewError(
 			shoal.ErrorUnavailable, "request identity unavailable")
 	}
-	decision, err := freshDecision(template, requestID)
-	if err != nil {
-		return nil, auth.Decision{}, shoal.NewError(
-			shoal.ErrorUnauthorized, "authorization denied")
-	}
-	bound, err := s.binder.Bind(ctx, decision)
-	if err != nil || bound == nil {
-		if contextErr := ctx.Err(); contextErr != nil {
-			return nil, auth.Decision{}, contextErr
-		}
-		return nil, auth.Decision{}, shoal.NewError(
-			shoal.ErrorUnauthorized, "authorization denied")
-	}
-	return bound, decision, nil
-}
-
-// freshDecision is the single integration point for additive trusted decision
-// fields. Keep it aligned with auth.DecisionConfig when new pins such as a
-// selected ontology lens are added.
-func freshDecision(
-	template auth.Decision, requestID shoal.ID,
-) (auth.Decision, error) {
 	selectedOntology, _ := template.SelectedOntology()
-	return auth.NewDecision(auth.DecisionConfig{
+	decision, err := auth.NewDecision(auth.DecisionConfig{
 		Subject:                template.Subject(),
 		Actor:                  template.Actor(),
 		ClientID:               template.ClientID(),

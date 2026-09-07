@@ -150,6 +150,7 @@ var roleOperationCeilings = map[auth.ServiceRole]map[auth.Operation]bool{
 	),
 	auth.ServiceRoleAnalytics: operationSet(
 		auth.OperationAnalyticsRead,
+		auth.OperationRetrieve,
 		auth.OperationValidate,
 	),
 	auth.ServiceRoleWorkspaceSettingsRead: operationSet(

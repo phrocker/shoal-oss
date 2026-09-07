@@ -20,6 +20,9 @@
 package authorized_test
 
 import (
+	"context"
+	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/phrocker/shoal-oss/pkg/explorer"
@@ -27,6 +30,189 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/ontology"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
+
+type countingCanonicalBase struct {
+	*explorer.Explorer
+	documentsCalls int
+	documentCalls  int
+}
+
+type pagedCountingCanonicalBase struct {
+	*countingCanonicalBase
+	pages     int
+	pageCalls int
+}
+
+type mutatingDocumentsCanonicalBase struct {
+	*explorer.Explorer
+	documentsCalls int
+	mutated        bool
+}
+
+func (b *countingCanonicalBase) Documents(
+	ctx context.Context,
+) ([]explorer.DocumentSummary, error) {
+	b.documentsCalls++
+	return b.Explorer.Documents(ctx)
+}
+
+func (b *countingCanonicalBase) Document(
+	ctx context.Context, documentID, revisionID shoal.ID,
+) (explorer.DocumentView, error) {
+	b.documentCalls++
+	return b.Explorer.Document(ctx, documentID, revisionID)
+}
+
+func (b *mutatingDocumentsCanonicalBase) Documents(
+	ctx context.Context,
+) ([]explorer.DocumentSummary, error) {
+	documents, err := b.Explorer.Documents(ctx)
+	b.documentsCalls++
+	if err != nil || b.mutated || b.documentsCalls < 2 {
+		return documents, err
+	}
+	b.mutated = true
+	return documents, nil
+}
+
+func (b *mutatingDocumentsCanonicalBase) Snapshot(
+	ctx context.Context,
+) (explorer.Snapshot, error) {
+	snapshot, err := b.Explorer.Snapshot(ctx)
+	if err == nil && b.mutated {
+		snapshot.ID += "-after-documents"
+		snapshot.Frontier++
+	}
+	return snapshot, err
+}
+
+func (b *pagedCountingCanonicalBase) BoundedNeighborhood(
+	ctx context.Context,
+	request explorer.BoundedNeighborhoodRequest,
+) (explorer.BoundedNeighborhood, error) {
+	sourceRequest := request
+	sourceRequest.AfterEdgeID = ""
+	result, err := b.Explorer.BoundedNeighborhood(ctx, sourceRequest)
+	if err != nil {
+		return explorer.BoundedNeighborhood{}, err
+	}
+	b.pageCalls++
+	result.ScannedEdges = uint32(len(result.Neighborhood.Edges))
+	result.ScannedEdgesKnown = true
+	result.Continuation = b.pageCalls < b.pages
+	result.Truncated = result.Continuation
+	result.NextAfterEdgeID = ""
+	if result.Continuation {
+		result.NextAfterEdgeID = shoal.ID(
+			"forced-canonical-page-" + strconv.Itoa(b.pageCalls))
+	}
+	return result, nil
+}
+
+func TestAuthorizedDerivedAssertionsShareCanonicalNodeHydration(t *testing.T) {
+	f := newFixture(t)
+	admin := f.admin(t)
+	source, err := f.clientA.Ingest(admin, explorer.Source{
+		URI: "file:///batched-assertion-source.txt", MediaType: explorer.MediaTypeText,
+		Content: "batched assertion source",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	target, err := f.clientA.Ingest(admin, explorer.Source{
+		URI: "file:///batched-assertion-target.txt", MediaType: explorer.MediaTypeText,
+		Content: strings.Repeat("batched assertion target\n\n", 16),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetView, err := f.base.Document(
+		admin, target.Document.ID, target.Revision.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetIDs := []shoal.ID{
+		target.Document.ID, targetView.Root.Section.ID,
+	}
+	for _, span := range targetView.Root.Spans {
+		targetIDs = append(targetIDs, span.ID)
+	}
+	cells := make([]explorer.LatentLinkCell, 0, len(targetIDs))
+	for _, targetID := range targetIDs {
+		cells = append(cells, authorizedLatentCell(
+			source.Document.ID, targetID, int64(len(cells)+1)))
+	}
+	if err := f.base.PutLatentLinkCells(admin, cells); err != nil {
+		t.Fatal(err)
+	}
+	counted := &countingCanonicalBase{Explorer: f.base}
+	base := &pagedCountingCanonicalBase{
+		countingCanonicalBase: counted,
+		pages:                 3,
+	}
+	client := f.newClient(t, base, f.store, f.sourceA, f.policyA, nil)
+	result, err := client.BoundedNeighborhood(
+		f.alice(t),
+		explorer.BoundedNeighborhoodRequest{
+			NodeIDs: []shoal.ID{source.Document.ID},
+			Depth:   1, Fanout: 64, MaxNodes: 64,
+			MaxScannedEdges: 256,
+			EdgeTypes:       []string{authorizedLatentEdgeType(t)},
+			Direction:       explorer.GraphDirectionOutgoing,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Neighborhood.Assertions) != len(cells) {
+		t.Fatalf(
+			"authorized assertions = %d, want %d",
+			len(result.Neighborhood.Assertions), len(cells),
+		)
+	}
+	if base.pageCalls != base.pages {
+		t.Fatalf("bounded page calls = %d, want %d", base.pageCalls, base.pages)
+	}
+	if counted.documentsCalls != 2 || counted.documentCalls != 3 {
+		t.Fatalf(
+			"canonical hydration calls = Documents:%d Document:%d, want 2 and 3",
+			counted.documentsCalls, counted.documentCalls,
+		)
+	}
+}
+
+func TestAuthorizedBoundedSnapshotPrecedesCanonicalIndex(t *testing.T) {
+	f := newFixture(t)
+	source, err := f.clientA.Ingest(f.admin(t), explorer.Source{
+		URI:       "file:///snapshot-ordering-source.txt",
+		MediaType: explorer.MediaTypeText,
+		Content:   "snapshot ordering source",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := &mutatingDocumentsCanonicalBase{
+		Explorer: f.base,
+	}
+	client := f.newClient(t, base, f.store, f.sourceA, f.policyA, nil)
+	_, err = client.BoundedNeighborhood(
+		f.alice(t),
+		explorer.BoundedNeighborhoodRequest{
+			NodeIDs:         []shoal.ID{source.Document.ID},
+			Depth:           1,
+			Fanout:          10,
+			MaxNodes:        10,
+			MaxScannedEdges: 10,
+			Direction:       explorer.GraphDirectionBoth,
+		},
+	)
+	if !shoal.IsErrorCode(err, shoal.ErrorConflict) {
+		t.Fatalf("bounded snapshot ordering error = %v, want conflict", err)
+	}
+	if !base.mutated {
+		t.Fatal("canonical index did not trigger test mutation")
+	}
+}
 
 func TestAuthorizedLatentAssertionWithholdsUnauthorizedTarget(t *testing.T) {
 	f := newFixture(t)

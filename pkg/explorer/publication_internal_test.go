@@ -28,11 +28,14 @@ import (
 	"testing"
 	"time"
 
+	"github.com/phrocker/shoal-oss/internal/cclient"
+	"github.com/phrocker/shoal-oss/internal/engine"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
 type rejectingPublicationAdapter struct {
 	published         bool
+	committed         bool
 	committedRequests []RecordPublication
 }
 
@@ -49,7 +52,7 @@ func (a *rejectingPublicationAdapter) RecordCommitted(
 	request RecordPublication,
 ) (bool, error) {
 	a.committedRequests = append(a.committedRequests, request)
-	return false, nil
+	return a.committed, nil
 }
 
 func (*rejectingPublicationAdapter) RecordHead(
@@ -159,6 +162,78 @@ func TestLegacyDocumentRecordRequiresPublicationProof(t *testing.T) {
 	}
 	if len(corpus.documents) != 0 {
 		t.Fatal("uncommitted legacy document was loaded")
+	}
+}
+
+func TestLegacyDocumentCommitGatePrecedesJSONValidation(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		committed bool
+		wantError bool
+	}{
+		{name: "uncommitted residue is ignored"},
+		{name: "committed corruption fails", committed: true, wantError: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			eng, err := engine.Open(t.TempDir(), engine.Options{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer eng.Close()
+			if err := eng.CreateTable(explorerTable, engine.TableOptions{}); err != nil {
+				t.Fatal(err)
+			}
+			row := []byte(documentRow + "uncommitted/revision")
+			mutation, err := cclient.NewMutation(row)
+			if err != nil {
+				t.Fatal(err)
+			}
+			invalid := []byte(`{"value":"\ud83d"}`)
+			mutation.PutLatest(
+				[]byte(recordCF),
+				[]byte(recordCQV1),
+				nil,
+				invalid,
+			)
+			if err := eng.Write(
+				explorerTable,
+				[]*cclient.Mutation{mutation},
+			); err != nil {
+				t.Fatal(err)
+			}
+			adapter := &rejectingPublicationAdapter{
+				committed: test.committed,
+			}
+			corpus, err := OpenWithEmbeddedEngine(
+				eng,
+				Options{},
+				adapter,
+			)
+			if test.wantError {
+				if !shoal.IsErrorCode(err, shoal.ErrorInternal) {
+					if corpus != nil {
+						_ = corpus.Close()
+					}
+					t.Fatalf("committed corrupt v1 open = %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("uncommitted corrupt v1 open = %v", err)
+			}
+			defer corpus.Close()
+			documents, err := corpus.Documents(context.Background())
+			if err != nil || len(documents) != 0 {
+				t.Fatalf("uncommitted corrupt v1 documents = %#v, %v", documents, err)
+			}
+			if len(adapter.committedRequests) != 1 ||
+				!bytes.Equal(
+					adapter.committedRequests[0].Qualifier,
+					[]byte(recordCQV1),
+				) {
+				t.Fatalf("v1 commitment probes = %#v", adapter.committedRequests)
+			}
+		})
 	}
 }
 

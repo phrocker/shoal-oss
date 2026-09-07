@@ -47,13 +47,18 @@ import (
 var citationWireSequence atomic.Uint64
 
 func TestCitationEnvelopeOpaqueIDRoundTrip(t *testing.T) {
-	client, pack, result, policyID := citationWireFixture(t)
-	builder, err := reasoning.NewBuilder(client)
+	client, reader, pack, result, policyID := citationWireFixture(t)
+	builder, err := reasoning.NewBuilder(reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	embeddingSpaces, err := interaction.NewEmbeddingSpaceSet(
+		[]string{"model:v2", "model:v1"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	prepared, err := builder.Build(context.Background(), reasoning.BuildInput{
-		ContextPack: pack, Result: result,
+		ContextPack: pack, Result: result, EmbeddingSpaces: embeddingSpaces,
 		Policy: reasoning.Policy{
 			ID: policyID, ExtraOutputVisibility: []string{"api"},
 		},
@@ -83,25 +88,14 @@ func TestCitationEnvelopeOpaqueIDRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(summaries) != 1 || summaries[0].Visibility != "api&internal" {
+	if len(summaries) != 1 || summaries[0].Visibility != "internal" {
 		t.Fatalf("durable response visibility = %+v", summaries)
 	}
 	original := NewCitationEnvelope(response)
-	constituents := []shoal.ID{
-		shoal.ID([]byte{0, 0xff, 'a'}),
-		shoal.ID([]byte{0, 0xff, 'b'}),
-	}
-	original.EmbeddingSpaceID, err =
-		retrieval.EmbeddingSpaceSetID(constituents...)
-	if err != nil {
-		t.Fatal(err)
-	}
-	original.EmbeddingSpaceIDs = constituents
-	original.ID, err = reasoning.CanonicalResponseID(
-		original.SessionID, original.RecordedAt,
-		citationResponseIdentity(original))
-	if err != nil {
-		t.Fatal(err)
+	if got := original.EffectiveVisibility; !reflect.DeepEqual(
+		got, []string{"api", "internal"},
+	) {
+		t.Fatalf("response visibility = %v", got)
 	}
 	encoded, err := json.Marshal(original)
 	if err != nil {
@@ -143,11 +137,22 @@ func TestCitationEnvelopeOpaqueIDRoundTrip(t *testing.T) {
 		len(decoded.CitedSourceIDs) != len(original.CitedSourceIDs) {
 		t.Fatal("wire round trip changed provenance cardinality")
 	}
-	if len(decoded.EmbeddingSpaceIDs) != len(constituents) ||
-		decoded.EmbeddingSpaceIDs[0] != constituents[0] ||
-		decoded.EmbeddingSpaceIDs[1] != constituents[1] {
-		t.Fatalf("wire round trip changed embedding constituents: %v",
-			decoded.EmbeddingSpaceIDs)
+	if !reflect.DeepEqual(decoded.EmbeddingSpaces, embeddingSpaces) {
+		t.Fatalf(
+			"wire embedding spaces = %+v, want %+v",
+			decoded.EmbeddingSpaces, embeddingSpaces,
+		)
+	}
+	forgedEmbeddingDigest := bytes.Replace(
+		encoded,
+		[]byte(embeddingSpaces.Digest),
+		[]byte(strings.Repeat("0", len(embeddingSpaces.Digest))),
+		1,
+	)
+	if err := json.Unmarshal(
+		forgedEmbeddingDigest, &CitationEnvelope{},
+	); err == nil {
+		t.Fatal("forged embedding-space digest was accepted")
 	}
 	encodedQuote, err := json.Marshal(original.Evidence[0].Quote)
 	if err != nil {
@@ -267,10 +272,20 @@ func TestCitationEnvelopeOpaqueIDRoundTrip(t *testing.T) {
 	if _, err := json.Marshal(hiddenSource); err == nil {
 		t.Fatal("source visibility omitted from effective output label")
 	}
+	underLabeledEvidence := original
+	underLabeledEvidence.Evidence = append(
+		[]CitationEvidence(nil), original.Evidence...)
+	underLabeledEvidence.Evidence[0].Visibility = nil
+	if _, err := json.Marshal(underLabeledEvidence); err == nil {
+		t.Fatal("document evidence omitted source visibility")
+	}
 	mergedVisibility := original
 	mergedVisibility.Sources = append(
 		[]CitationSource(nil), original.Sources...)
 	mergedVisibility.Sources[0].Visibility = []string{"internal", "secret"}
+	mergedVisibility.Evidence = append(
+		[]CitationEvidence(nil), original.Evidence...)
+	mergedVisibility.Evidence[0].Visibility = []string{"internal", "secret"}
 	mergedVisibility.EffectiveVisibility = []string{"api", "internal", "secret"}
 	mergedVisibility.ID, err = reasoning.CanonicalResponseID(
 		mergedVisibility.SessionID,
@@ -300,10 +315,20 @@ func TestCitationEnvelopeOpaqueIDRoundTrip(t *testing.T) {
 			omit(&citation)
 			candidate.Evidence[0].Citation = &citation
 			reanchorCitationDocumentEnvelope(t, &candidate)
-			if _, err := json.Marshal(candidate); err != nil {
+			payload, err := json.Marshal(candidate)
+			if err != nil {
+				t.Fatalf("omitted %s identity error = %v", name, err)
+			}
+			var roundTrip CitationEnvelope
+			if err := json.Unmarshal(payload, &roundTrip); err != nil {
+				t.Fatal(err)
+			}
+			if roundTrip.Evidence[0].SectionID == "" ||
+				roundTrip.Evidence[0].SpanID == "" {
 				t.Fatalf(
-					"valid citation with omitted %s ID: %v; anchor=%q sources=%+v",
-					name, err, candidate.Evidence[0].AnchorID, candidate.Sources)
+					"omitted %s identity lost resolved roles: %+v",
+					name, roundTrip.Evidence[0],
+				)
 			}
 		})
 	}
@@ -710,11 +735,17 @@ func TestCitationEnvelopeAssertionReferencesRoundTrip(t *testing.T) {
 			Type: "related", Weight: 1,
 			Properties: shoal.Metadata{
 				ontologyRelationshipIDProperty:  "relationship",
+				ontologyAssertionIDProperty:     "assertion",
 				ontologyAssertionOriginProperty: string(ontology.AssertionInferred),
 			},
 		}},
 	}
-	anchor, err := inference.NewGraphAnchor(path)
+	assertionReferences := []interaction.AssertionReference{{
+		AssertionID: "assertion", EdgeID: "edge",
+		Origin: ontology.AssertionInferred,
+	}}
+	anchor, err := inference.NewGraphAnchorWithAssertions(
+		path, assertionReferences)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -880,6 +911,10 @@ func TestCitationEnvelopeAssertionReferencesRoundTrip(t *testing.T) {
 			value.Evidence[0].Path.Edges[0].Properties[ontologyAssertionOriginProperty] =
 				string(ontology.AssertionExplicit)
 		},
+		"mismatched assertion identity": func(value *CitationEnvelope) {
+			value.Evidence[0].Path.Edges[0].Properties[ontologyAssertionIDProperty] =
+				"different-assertion"
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			var invalid CitationEnvelope
@@ -887,21 +922,67 @@ func TestCitationEnvelopeAssertionReferencesRoundTrip(t *testing.T) {
 				t.Fatal(err)
 			}
 			mutate(&invalid)
-			reanchorCitationGraphEnvelope(t, &invalid)
-			if _, err := json.Marshal(invalid); err == nil {
+			validationErr := reanchorCitationGraphEnvelope(t, &invalid)
+			if validationErr == nil {
+				_, validationErr = json.Marshal(invalid)
+			}
+			if validationErr == nil {
 				t.Fatal("invalid graph citation semantics were accepted")
 			}
 		})
 	}
 }
 
+func TestCitationEvidenceAllowsAssertionAcrossMultipleEdges(t *testing.T) {
+	path := graph.Path{
+		Nodes: []graph.Node{{ID: "a"}, {ID: "b"}, {ID: "c"}},
+		Edges: []graph.Edge{
+			{ID: "edge-a", From: "a", To: "b", Type: "related", Weight: 1},
+			{ID: "edge-b", From: "b", To: "c", Type: "related", Weight: 1},
+		},
+	}
+	references := []interaction.AssertionReference{
+		{AssertionID: "assertion", EdgeID: "edge-a", Origin: ontology.AssertionExplicit},
+		{AssertionID: "assertion", EdgeID: "edge-b", Origin: ontology.AssertionExplicit},
+	}
+	anchor, err := inference.NewGraphAnchorWithAssertions(path, references)
+	if err != nil {
+		t.Fatal(err)
+	}
+	evidence := CitationEvidence{
+		AnchorID: anchor.ID(), SnapshotID: "snapshot",
+		SnapshotAsOf: time.Date(2026, 9, 6, 12, 0, 0, 0, time.UTC),
+		Status:       reasoning.VerificationVerified,
+		Use:          reasoning.EvidenceDerived, Origin: reasoning.OriginSource,
+		SourceIDs: []shoal.ID{"a", "b", "c"}, Path: &path,
+		Assertions: []CitationAssertion{
+			{AssertionID: "assertion", EdgeID: "edge-a", Origin: ontology.AssertionExplicit},
+			{AssertionID: "assertion", EdgeID: "edge-b", Origin: ontology.AssertionExplicit},
+		},
+	}
+	if err := validateCitationEvidence(evidence); err != nil {
+		t.Fatalf("multi-edge assertion evidence rejected: %v", err)
+	}
+}
+
 func reanchorCitationGraphEnvelope(
 	t *testing.T,
 	envelope *CitationEnvelope,
-) {
+) error {
 	t.Helper()
 	oldAnchorID := envelope.Evidence[0].AnchorID
-	anchor, err := inference.NewGraphAnchor(*envelope.Evidence[0].Path)
+	assertions := make(
+		[]interaction.AssertionReference,
+		len(envelope.Evidence[0].Assertions),
+	)
+	for index, assertion := range envelope.Evidence[0].Assertions {
+		assertions[index] = interaction.AssertionReference{
+			AssertionID: assertion.AssertionID,
+			EdgeID:      assertion.EdgeID, Origin: assertion.Origin,
+		}
+	}
+	anchor, err := inference.NewGraphAnchorWithAssertions(
+		*envelope.Evidence[0].Path, assertions)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -960,9 +1041,7 @@ func reanchorCitationGraphEnvelope(
 		envelope.RecordedAt,
 		citationResponseIdentity(*envelope),
 	)
-	if err != nil {
-		t.Fatal(err)
-	}
+	return err
 }
 
 func reanchorCitationDocumentEnvelope(
@@ -1083,7 +1162,13 @@ func citationTestIDs(count int) []shoal.ID {
 
 func citationWireFixture(
 	t *testing.T,
-) (*explorer.Explorer, inference.ContextPack, inference.InferenceResult, shoal.ID) {
+) (
+	*explorer.Explorer,
+	contextpack.AuthorizationReader,
+	inference.ContextPack,
+	inference.InferenceResult,
+	shoal.ID,
+) {
 	t.Helper()
 	path := filepath.Join(
 		"testdata",
@@ -1206,7 +1291,30 @@ func citationWireFixture(
 	if err != nil {
 		t.Fatal(err)
 	}
-	return client, pack, result, policyID
+	reader := citationAuthorizationReader{
+		SnapshotReader: client,
+		authorization:  authPin,
+	}
+	return client, reader, pack, result, policyID
+}
+
+type citationAuthorizationReader struct {
+	contextpack.SnapshotReader
+	authorization inference.AuthPin
+}
+
+func (r citationAuthorizationReader) ValidateAuthorization(
+	_ context.Context,
+	pin inference.AuthPin,
+) error {
+	if pin.Fingerprint() != r.authorization.Fingerprint() ||
+		!pin.ExpiresAt().Equal(r.authorization.ExpiresAt()) {
+		return shoal.NewError(
+			shoal.ErrorUnauthorized,
+			"authorization pin does not match citation fixture",
+		)
+	}
+	return nil
 }
 
 func firstCitationWireSpan(

@@ -32,7 +32,6 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/explorer/webapi"
-	"github.com/phrocker/shoal-oss/pkg/interaction"
 	"github.com/phrocker/shoal-oss/pkg/ontology"
 	"github.com/phrocker/shoal-oss/pkg/retrieval"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
@@ -588,7 +587,7 @@ func TestToolCallPreservesNoLensDefault(t *testing.T) {
 			return webapi.DocumentsResponse{}, nil
 		},
 	}
-	server, err := newRecordedTestServer(t, Config{
+	server, err := NewServer(Config{
 		Service: service, Authority: authority,
 		Decisions: DecisionProviderFunc(func(context.Context) (auth.Decision, error) {
 			return template, nil

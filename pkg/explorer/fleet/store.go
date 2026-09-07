@@ -19,6 +19,7 @@ package fleet
 
 import (
 	"context"
+	"crypto/sha256"
 	"time"
 
 	"github.com/phrocker/shoal-oss/pkg/explorer"
@@ -27,9 +28,10 @@ import (
 )
 
 type Stored struct {
-	Descriptor Descriptor
-	Digest     [32]byte
-	Epoch      int64
+	Descriptor         Descriptor
+	RegistrationDigest [32]byte
+	Digest             [32]byte
+	Epoch              int64
 }
 
 type Mutation struct {
@@ -38,14 +40,9 @@ type Mutation struct {
 	Descriptor         Descriptor
 }
 
-type StoredListItem struct {
-	Stored Stored
-	Cursor string
-}
-
 type StoredPage struct {
-	Items      []StoredListItem
-	NextCursor string
+	Entries []Stored
+	Next    []byte
 }
 
 // Store is the durable registry boundary. Apply must use a storage-level CAS
@@ -53,7 +50,7 @@ type StoredPage struct {
 type Store interface {
 	Apply(context.Context, Mutation) (Stored, error)
 	Get(context.Context, shoal.ID) (Stored, error)
-	ListPage(context.Context, string, uint32) (StoredPage, error)
+	List(context.Context, []byte, int) (StoredPage, error)
 }
 
 type Lifecycle struct {
@@ -65,6 +62,7 @@ type Lifecycle struct {
 	ClientID                 shoal.ID
 	OnBehalfOf               []shoal.ID
 	AgentID                  shoal.ID
+	MutationDigest           [sha256.Size]byte
 	ReasonCode               string
 	ReasonDetail             string
 	Deadline                 int64

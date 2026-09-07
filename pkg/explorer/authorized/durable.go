@@ -648,6 +648,14 @@ func (s *DurablePolicyStore) CurrentRevision(
 	return s.memoryStore().CurrentRevision(ctx, documentID)
 }
 
+// CurrentRevisions is a pure read delegated unchanged to the memory store.
+func (s *DurablePolicyStore) CurrentRevisions(
+	ctx context.Context,
+	documentIDs []shoal.ID,
+) (map[shoal.ID]RevisionRegistration, error) {
+	return s.memoryStore().CurrentRevisions(ctx, documentIDs)
+}
+
 // Node is a pure read delegated to the memory store.
 func (s *DurablePolicyStore) Node(
 	ctx context.Context,

@@ -300,6 +300,44 @@ func TestBoundedNeighborhoodChargesSuppressedEdgesAgainstScanLimit(t *testing.T)
 	}
 }
 
+func TestBoundedNeighborhoodDoesNotTrustUnderreportedScanCount(t *testing.T) {
+	client, base := authorizedPaginationClient(t, false)
+	base.underreportedScans = true
+	_, err := client.BoundedNeighborhood(
+		context.Background(),
+		explorer.BoundedNeighborhoodRequest{
+			NodeIDs: []shoal.ID{"node-seed"}, Depth: 1,
+			Fanout: 2, MaxNodes: 2, MaxScannedEdges: 2,
+			Direction: explorer.GraphDirectionOutgoing,
+		},
+	)
+	if !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
+		t.Fatalf("underreported scan error = %v", err)
+	}
+	if base.calls != 1 {
+		t.Fatalf("underreported scan calls = %d, want 1", base.calls)
+	}
+}
+
+func TestBoundedNeighborhoodRejectsScanCountAbovePageFanout(t *testing.T) {
+	client, base := authorizedPaginationClient(t, false)
+	base.overreportedScans = true
+	_, err := client.BoundedNeighborhood(
+		context.Background(),
+		explorer.BoundedNeighborhoodRequest{
+			NodeIDs: []shoal.ID{"node-seed"}, Depth: 1,
+			Fanout: 1, MaxNodes: 2, MaxScannedEdges: 2,
+			Direction: explorer.GraphDirectionOutgoing,
+		},
+	)
+	if !shoal.IsErrorCode(err, shoal.ErrorInternal) {
+		t.Fatalf("overreported scan error = %v", err)
+	}
+	if base.calls != 1 {
+		t.Fatalf("overreported scan calls = %d, want 1", base.calls)
+	}
+}
+
 func TestBoundedNeighborhoodPreservesKnownZeroScanCount(t *testing.T) {
 	client, base := authorizedPaginationClient(t, false)
 	base.knownZero = true
@@ -462,6 +500,7 @@ func TestBoundedNeighborhoodRechecksGenerationAfterOntologyLens(t *testing.T) {
 					return generation, nil
 				})
 			client.clock = func() time.Time { return now }
+			client.ontologyInterpreter = base
 			base.interpret = func() { generation = 2 }
 			_, err = client.BoundedNeighborhood(
 				context.Background(), explorer.BoundedNeighborhoodRequest{
@@ -472,14 +511,6 @@ func TestBoundedNeighborhoodRechecksGenerationAfterOntologyLens(t *testing.T) {
 				t.Fatalf("generation change after lens = %v, want unavailable", err)
 			}
 		})
-	}
-}
-
-func TestOntologyInterpretationsMustMatchAuthorizedAssertions(t *testing.T) {
-	if err := validateOntologyInterpretations(
-		[]ontology.Assertion{{}}, nil, ontology.OntologyIdentity{},
-	); !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
-		t.Fatalf("missing interpretation error = %v", err)
 	}
 }
 
@@ -506,7 +537,6 @@ func TestOntologyLensRequiresExplicitTrustedInterpreter(t *testing.T) {
 	}
 	called := false
 	base.interpret = func() { called = true }
-	client.ontologyInterpreter = nil
 	result, err := client.applyOntologyLens(
 		context.Background(), explorer.Neighborhood{}, decision)
 	if err != nil {
@@ -522,6 +552,37 @@ func TestOntologyLensRequiresExplicitTrustedInterpreter(t *testing.T) {
 	}
 	if !called {
 		t.Fatal("explicit trusted interpreter was not invoked")
+	}
+}
+
+func TestOntologyLensPropagatesTrustedInterpreterUnavailability(t *testing.T) {
+	client, base := authorizedPaginationClient(t, false)
+	schema, _ := ontology.NewOntologySchema("uncertain", "Uncertain", "", nil)
+	version, _ := ontology.NewOntologyVersion(
+		schema, "1", time.Date(2026, time.September, 6, 0, 0, 0, 0, time.UTC),
+		nil, nil, nil, nil)
+	selected, _ := ontology.NewOntologyIdentity(version)
+	decision, err := auth.NewDecision(auth.DecisionConfig{
+		Subject: "subject", Actor: "actor",
+		AuthorizationDomain: []byte("domain"),
+		AllowedOperations:   []auth.Operation{auth.OperationNeighborhood},
+		PermittedSourceIDs:  [][]byte{[]byte("source")},
+		PermittedPolicyIDs:  [][]byte{[]byte("policy")},
+		PolicyGeneration:    1,
+		AuthenticationExpires: time.Date(
+			2026, time.September, 6, 1, 0, 0, 0, time.UTC),
+		RequestID: "request", SelectedOntology: selected,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	base.interpretErr = shoal.NewError(
+		shoal.ErrorUnavailable, "ontology mutation outcome is indeterminate")
+	client.ontologyInterpreter = base
+	if _, err := client.applyOntologyLens(
+		context.Background(), explorer.Neighborhood{}, decision,
+	); !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
+		t.Fatalf("trusted interpreter unavailability = %v", err)
 	}
 }
 
@@ -626,10 +687,13 @@ type pagedBoundedBase struct {
 	nodes                        map[shoal.ID]graph.Node
 	hiddenOnly                   bool
 	interpret                    func()
+	interpretErr                 error
 	omittedOnly                  bool
 	knownZero                    bool
 	knownZeroContinuation        bool
 	advanceWithoutContinuation   bool
+	underreportedScans           bool
+	overreportedScans            bool
 	truncatedWithoutContinuation bool
 }
 
@@ -640,6 +704,9 @@ func (b *pagedBoundedBase) InterpretAssertions(
 ) ([]ontology.AssertionInterpretation, error) {
 	if b.interpret != nil {
 		b.interpret()
+	}
+	if b.interpretErr != nil {
+		return nil, b.interpretErr
 	}
 	result := make([]ontology.AssertionInterpretation, 0, len(assertions))
 	for _, assertion := range assertions {
@@ -688,6 +755,23 @@ func (b *pagedBoundedBase) BoundedNeighborhood(
 			},
 			Truncated: true, NextAfterEdgeID: "edge-progress",
 			Continuation: true, ScannedEdgesKnown: true,
+		}, nil
+	}
+	if b.underreportedScans {
+		return explorer.BoundedNeighborhood{
+			Neighborhood: explorer.Neighborhood{
+				Nodes: []graph.Node{b.nodes["node-seed"]},
+			},
+			Truncated: true, NextAfterEdgeID: "edge-progress",
+			Continuation: true, ScannedEdges: 1, ScannedEdgesKnown: true,
+		}, nil
+	}
+	if b.overreportedScans {
+		return explorer.BoundedNeighborhood{
+			Neighborhood: explorer.Neighborhood{
+				Nodes: []graph.Node{b.nodes["node-seed"]},
+			},
+			ScannedEdges: 2, ScannedEdgesKnown: true,
 		}, nil
 	}
 	if b.advanceWithoutContinuation {

@@ -27,6 +27,7 @@ import (
 	"testing"
 	"time"
 
+	exploreranalytics "github.com/phrocker/shoal-oss/pkg/explorer/analytics"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/explorer/webapi"
 	"github.com/phrocker/shoal-oss/pkg/explorer/workspace"
@@ -56,6 +57,14 @@ func (s *lensObservingService) Documents(
 	return webapi.DocumentsResponse{}, nil
 }
 
+func (s *lensObservingService) Document(
+	ctx context.Context,
+	_ webapi.DocumentRequest,
+) (webapi.DocumentResponse, error) {
+	s.effective, s.found = webapi.EffectiveWorkspaceSettings(ctx)
+	return webapi.DocumentResponse{}, nil
+}
+
 func (s *lensObservingService) Retrieve(
 	_ context.Context,
 	request webapi.RetrievalRequest,
@@ -78,6 +87,24 @@ func (s *lensObservingService) Path(
 ) (webapi.PathResponse, error) {
 	s.path = request
 	return webapi.PathResponse{}, nil
+}
+
+func (s *lensObservingService) AnalyticsLimits() (
+	exploreranalytics.Limits,
+	bool,
+) {
+	return exploreranalytics.DefaultLimits(), true
+}
+
+func (s *lensObservingService) Analytics(
+	context.Context,
+	webapi.AnalyticsRequest,
+) (webapi.AnalyticsResponse, error) {
+	return webapi.AnalyticsResponse{}, nil
+}
+
+func (s *lensObservingService) AnalyticsRecordingRequired() bool {
+	return true
 }
 
 func (c httpCallerOntologyChoices) ListOntologyChoices(
@@ -123,10 +150,10 @@ func TestHTTPSelectableLensIsPerCallerAndPreservesSettings(t *testing.T) {
 	options.OntologyChoices = httpCallerOntologyChoices{
 		bySubject: map[shoal.ID][]workspace.OntologyChoice{
 			"owner": {
-				{Identity: first, Active: true},
-				{Identity: second},
+				{Identity: first, Version: "1", Active: true},
+				{Identity: second, Version: "2"},
 			},
-			"other": {{Identity: second, Active: true}},
+			"other": {{Identity: second, Version: "2", Active: true}},
 		},
 	}
 	provider, err := workspace.NewProvider(store, options)
@@ -137,7 +164,7 @@ func TestHTTPSelectableLensIsPerCallerAndPreservesSettings(t *testing.T) {
 	handler, err := webapi.NewAuthenticatedHandler(
 		service,
 		webapi.AuthenticatorFunc(func(request *http.Request) (auth.Decision, error) {
-			return settingsHTTPDecision(
+			return settingsLensHTTPDecision(
 				t, now, shoal.ID(request.Header.Get("X-Test-Subject"))), nil
 		}),
 		authority.Binder(), "example.test",
@@ -161,7 +188,7 @@ func TestHTTPSelectableLensIsPerCallerAndPreservesSettings(t *testing.T) {
 				[]byte("lens-settings-create")),
 			"settings": map[string]any{
 				"allowed_operations": []string{
-					"list", "neighborhood", "read", "retrieve",
+					"neighborhood", "read", "retrieve",
 				},
 				"permitted_source_ids": []string{sourceID},
 				"budgets": map[string]any{
@@ -195,6 +222,9 @@ func TestHTTPSelectableLensIsPerCallerAndPreservesSettings(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(choices.Choices) != 2 || !choices.Choices[0].Active ||
+		!choices.Choices[0].Identity.Known ||
+		choices.Choices[0].Version != "1" ||
+		choices.Active != choices.Choices[0].Identity ||
 		choices.SettingsRevision != 1 {
 		t.Fatalf("owner lens choices = %#v", choices)
 	}
@@ -219,8 +249,11 @@ func TestHTTPSelectableLensIsPerCallerAndPreservesSettings(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(otherChoices.Choices) != 1 ||
-		otherChoices.Choices[0].SchemaID != encodeTestID(second.SchemaID()) ||
-		otherChoices.Choices[0].VersionID != encodeTestID(second.VersionID()) {
+		otherChoices.Choices[0].Identity.SchemaID !=
+			encodeTestID(second.SchemaID()) ||
+		otherChoices.Choices[0].Identity.VersionID !=
+			encodeTestID(second.VersionID()) ||
+		otherChoices.Choices[0].Version != "2" {
 		t.Fatalf("other caller choices leaked owner eligibility: %#v", otherChoices)
 	}
 
@@ -230,10 +263,7 @@ func TestHTTPSelectableLensIsPerCallerAndPreservesSettings(t *testing.T) {
 			"expected_revision": 1,
 			"mutation_id": base64.RawURLEncoding.EncodeToString(
 				[]byte("lens-select")),
-			"selected_ontology": map[string]any{
-				"schema_id":  encodeTestID(second.SchemaID()),
-				"version_id": encodeTestID(second.VersionID()),
-			},
+			"selected_ontology": workspaceOntologyProjection(second),
 		},
 		"owner", "http://example.test")
 	if response.Code != http.StatusOK {
@@ -246,10 +276,7 @@ func TestHTTPSelectableLensIsPerCallerAndPreservesSettings(t *testing.T) {
 			"expected_revision": 1,
 			"mutation_id": base64.RawURLEncoding.EncodeToString(
 				[]byte("lens-select-stale")),
-			"selected_ontology": map[string]any{
-				"schema_id":  encodeTestID(first.SchemaID()),
-				"version_id": encodeTestID(first.VersionID()),
-			},
+			"selected_ontology": workspaceOntologyProjection(first),
 		},
 		"owner", "http://example.test")
 	if stale.Code != http.StatusConflict {
@@ -268,16 +295,18 @@ func TestHTTPSelectableLensIsPerCallerAndPreservesSettings(t *testing.T) {
 	}
 	if selected.Revision != 2 ||
 		selected.Settings.AllowedOperations == nil ||
-		len(*selected.Settings.AllowedOperations) != 4 ||
-		(*selected.Settings.AllowedOperations)[0] != "list" ||
-		(*selected.Settings.AllowedOperations)[1] != "neighborhood" ||
-		(*selected.Settings.AllowedOperations)[2] != "read" ||
-		(*selected.Settings.AllowedOperations)[3] != "retrieve" ||
+		len(*selected.Settings.AllowedOperations) != 3 ||
+		(*selected.Settings.AllowedOperations)[0] != "neighborhood" ||
+		(*selected.Settings.AllowedOperations)[1] != "read" ||
+		(*selected.Settings.AllowedOperations)[2] != "retrieve" ||
 		selected.Settings.PermittedSourceIDs == nil ||
 		len(*selected.Settings.PermittedSourceIDs) != 1 ||
 		selected.Settings.Budgets.RetrievalTopK == nil ||
 		*selected.Settings.Budgets.RetrievalTopK != topK ||
 		selected.Settings.SelectedOntology == nil ||
+		!selected.Settings.SelectedOntology.Known ||
+		selected.Settings.SelectedOntology.Reading !=
+			string(ontology.OntologySameVersion) ||
 		selected.Settings.SelectedOntology.VersionID !=
 			encodeTestID(second.VersionID()) {
 		t.Fatalf("selected lens did not preserve settings: %#v", selected)
@@ -294,11 +323,10 @@ func TestHTTPSelectableLensIsPerCallerAndPreservesSettings(t *testing.T) {
 	if err := json.Unmarshal(identityResponse.Body.Bytes(), &identity); err != nil {
 		t.Fatal(err)
 	}
-	if len(identity.Operations) != 4 ||
-		identity.Operations[0] != "list" ||
-		identity.Operations[1] != "neighborhood" ||
-		identity.Operations[2] != "read" ||
-		identity.Operations[3] != "retrieve" ||
+	if len(identity.Operations) != 3 ||
+		identity.Operations[0] != "neighborhood" ||
+		identity.Operations[1] != "read" ||
+		identity.Operations[2] != "retrieve" ||
 		identity.SelectedOntology == nil ||
 		identity.SelectedOntology.VersionID != encodeTestID(second.VersionID()) ||
 		identity.Subject != "owner" || identity.Actor != "actor" ||
@@ -319,6 +347,13 @@ func TestHTTPSelectableLensIsPerCallerAndPreservesSettings(t *testing.T) {
 		len(baseIdentity.Operations) <= len(identity.Operations) {
 		t.Fatalf("base identity was unexpectedly replaced: %#v", baseIdentity)
 	}
+	unregistered := settingsWorkspaceRequest(
+		t, handler, http.MethodPost, "/mcp",
+		map[string]any{}, "owner", workspacePath)
+	if unregistered.Code != http.StatusBadRequest {
+		t.Fatalf("unregistered workspace route status = %d, body = %s",
+			unregistered.Code, unregistered.Body.String())
+	}
 	crossCaller := settingsWorkspaceRequest(
 		t, handler, http.MethodGet, "/api/v1/identity",
 		nil, "other", workspacePath)
@@ -328,12 +363,12 @@ func TestHTTPSelectableLensIsPerCallerAndPreservesSettings(t *testing.T) {
 			crossCaller.Code, crossCaller.Header().Get("WWW-Authenticate"),
 			crossCaller.Body.String())
 	}
-	documents := settingsWorkspaceRequest(
-		t, handler, http.MethodPost, "/api/v1/documents",
-		map[string]any{}, "owner", workspacePath)
-	if documents.Code != http.StatusOK {
-		t.Fatalf("effective documents status = %d, body = %s",
-			documents.Code, documents.Body.String())
+	document := settingsWorkspaceRequest(
+		t, handler, http.MethodPost, "/api/v1/document",
+		map[string]any{"document_id": "document"}, "owner", workspacePath)
+	if document.Code != http.StatusOK {
+		t.Fatalf("effective document status = %d, body = %s",
+			document.Code, document.Body.String())
 	}
 	if !service.found ||
 		service.effective.Revision() != selected.Revision ||
@@ -345,6 +380,16 @@ func TestHTTPSelectableLensIsPerCallerAndPreservesSettings(t *testing.T) {
 		service.effective.SettingsID() == "" {
 		t.Fatalf("mounted transport effective settings = found %v, %#v",
 			service.found, service.effective)
+	}
+	visibility, err := service.effective.OutputVisibility()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if document.Header().Get(webapi.WorkspaceOutputVisibilityHeader) !=
+		string(visibility) {
+		t.Fatalf("workspace output visibility header = %q, want %q",
+			document.Header().Get(webapi.WorkspaceOutputVisibilityHeader),
+			visibility)
 	}
 
 	retrieve := settingsWorkspaceRequest(
@@ -395,7 +440,12 @@ func TestHTTPSelectableLensIsPerCallerAndPreservesSettings(t *testing.T) {
 		t.Fatal(err)
 	}
 	if metadata.MaxTopK != topK || metadata.MaxDepth != depth ||
-		metadata.MaxFanout != fanout || metadata.MaxNodes != graphNodes {
+		metadata.MaxFanout != fanout || metadata.MaxNodes != graphNodes ||
+		metadata.AnalyticsLimits == nil ||
+		metadata.AnalyticsLimits.MaxDepth != depth ||
+		metadata.AnalyticsLimits.MaxFanout != fanout ||
+		metadata.AnalyticsLimits.MaxNodes != graphNodes ||
+		metadata.AnalyticsLimits.MaxSeeds > graphNodes {
 		t.Fatalf("effective metadata limits = %#v", metadata)
 	}
 
@@ -430,6 +480,34 @@ func TestHTTPSelectableLensIsPerCallerAndPreservesSettings(t *testing.T) {
 		t.Fatalf("limited output body = %d bytes, want <= %d",
 			limited.Body.Len(), outputBytes)
 	}
+}
+
+func settingsLensHTTPDecision(
+	t *testing.T,
+	now time.Time,
+	subject shoal.ID,
+) auth.Decision {
+	t.Helper()
+	decision, err := auth.NewDecision(auth.DecisionConfig{
+		Subject: subject, Actor: "actor",
+		AuthorizationDomain: []byte("domain"),
+		AllowedOperations: []auth.Operation{
+			auth.OperationNeighborhood,
+			auth.OperationRead,
+			auth.OperationRetrieve,
+			auth.OperationWorkspaceSettingsRead,
+			auth.OperationWorkspaceSettingsWrite,
+		},
+		PermittedSourceIDs:    [][]byte{[]byte("source-a")},
+		PermittedPolicyIDs:    [][]byte{[]byte("policy-a")},
+		PolicyGeneration:      1,
+		AuthenticationExpires: now.Add(time.Hour),
+		RequestID:             "request",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return decision
 }
 
 func settingsHTTPOntologies(
@@ -473,6 +551,17 @@ func mustComponent(t *testing.T, value []byte) string {
 
 func encodeTestID(value shoal.ID) string {
 	return base64.RawURLEncoding.EncodeToString([]byte(value))
+}
+
+func workspaceOntologyProjection(
+	identity ontology.OntologyIdentity,
+) map[string]any {
+	return map[string]any{
+		"known":      true,
+		"schema_id":  encodeTestID(identity.SchemaID()),
+		"version_id": encodeTestID(identity.VersionID()),
+		"reading":    string(ontology.OntologySameVersion),
+	}
 }
 
 func settingsWorkspaceRequest(

@@ -52,16 +52,14 @@ var staticFiles embed.FS
 
 // Handler exposes only the logical Explorer API and static workspace assets.
 type Handler struct {
-	service             Service
-	mux                 *http.ServeMux
-	authority           hostAuthority
-	authenticator       Authenticator
-	binder              auth.Binder
-	browserAuth         *BrowserAuthConfig
-	workspaceSettings   WorkspaceSettingsProvider
-	chatProvider        AskProvider
-	interactionProvider InteractionProvider
-	preAuth             map[string]preAuthenticationValidator
+	service                  Service
+	mux                      *http.ServeMux
+	authority                hostAuthority
+	authenticator            Authenticator
+	binder                   auth.Binder
+	browserAuth              *BrowserAuthConfig
+	workspaceSettings        WorkspaceSettingsProvider
+	workspaceSettingsMounted bool
 }
 
 // NewHandler constructs the standard HTTP transport without caller identity.
@@ -141,9 +139,12 @@ func (h *Handler) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 			return
 		}
 		request = request.WithContext(ctx)
+		if visibility := workspaceOutputVisibility(ctx); visibility != "" {
+			writer.Header().Set(
+				WorkspaceOutputVisibilityHeader, visibility)
+		}
 		if _, ok := EffectiveWorkspaceSettings(ctx); ok &&
-			(strings.HasPrefix(request.URL.Path, "/api/v1/") ||
-				path.Clean(request.URL.Path) == "/mcp") {
+			strings.HasPrefix(request.URL.Path, "/api/v1/") {
 			writer = workspaceResponseWriter{
 				ResponseWriter:   writer,
 				maxResponseBytes: responseLimitForContext(ctx),
@@ -252,7 +253,7 @@ func (h *Handler) routes() {
 	h.mux.HandleFunc("POST /api/v1/retrieve", endpoint(h.service.Retrieve))
 	h.mux.HandleFunc("POST /api/v1/neighborhood", endpoint(h.service.Neighborhood))
 	h.mux.HandleFunc("POST /api/v1/path", endpoint(h.service.Path))
-	h.registerWorkspaceSettingsRoutes()
+	h.mux.HandleFunc("POST /api/v1/analytics", analyticsEndpoint(h.service))
 
 	content, _ := fs.Sub(staticFiles, "static")
 	h.mux.Handle("GET /assets/", http.StripPrefix("/assets/", http.FileServer(http.FS(content))))
@@ -282,19 +283,34 @@ func metadataFor(ctx context.Context, service Service) (MetadataResponse, error)
 		if _, ok := service.(ChangeProvider); !ok {
 			metadata.Capabilities.Changes = false
 		}
+		if _, limits, ok := analyticsProvider(service); ok &&
+			metadata.Capabilities.Analytics {
+			metadata.AnalyticsLimits = &limits
+			metadata.AnalyticsRecordingRequired = true
+		} else {
+			metadata.Capabilities.Analytics = false
+			metadata.AnalyticsLimits = nil
+			metadata.AnalyticsRecordingRequired = false
+		}
 		return metadata, nil
 	}
 	capabilities, err := capabilitiesFor(ctx, service)
 	if err != nil {
 		return MetadataResponse{}, err
 	}
-	return MetadataResponse{
+	metadata := MetadataResponse{
 		MaxPageSize: MaxPageSize, MaxTopK: MaxTopK, MaxDepth: MaxDepth,
 		MaxFanout: MaxFanout, MaxNodes: MaxNodes, MaxEdgeTypes: MaxEdgeTypes,
 		MaxResponseBytes: MaxResponseBytes, MaxUploadFiles: MaxUploadFiles,
 		MaxUploadFileBytes: MaxUploadFileBytes, MaxUploadTotalBytes: MaxUploadTotalBytes,
 		Capabilities: capabilities,
-	}, nil
+	}
+	if _, limits, ok := analyticsProvider(service); ok &&
+		capabilities.Analytics {
+		metadata.AnalyticsLimits = &limits
+		metadata.AnalyticsRecordingRequired = true
+	}
+	return metadata, nil
 }
 
 func capabilitiesFor(ctx context.Context, service Service) (Capabilities, error) {
@@ -310,6 +326,7 @@ func capabilitiesFor(ctx context.Context, service Service) (Capabilities, error)
 		if _, ok := service.(ChangeProvider); !ok {
 			capabilities.Changes = false
 		}
+		_, _, capabilities.Analytics = analyticsProvider(service)
 		return capabilities, nil
 	}
 	capabilities, err := provider.Capabilities(ctx)
@@ -324,6 +341,9 @@ func capabilitiesFor(ctx context.Context, service Service) (Capabilities, error)
 	}
 	if _, ok := service.(ChangeProvider); !ok {
 		capabilities.Changes = false
+	}
+	if capabilities.Analytics {
+		_, _, capabilities.Analytics = analyticsProvider(service)
 	}
 	return capabilities, nil
 }
@@ -444,7 +464,36 @@ func writeResponse(writer http.ResponseWriter, status int, value any) {
 	var body limitedResponseBuffer
 	body.limit = int64(responseLimitFor(writer))
 	if err := json.NewEncoder(&body).Encode(value); err != nil {
-		writeResponseEncodingFailure(writer, status)
+		success := status >= http.StatusOK && status < http.StatusMultipleChoices
+		if !success {
+			writer.Header().Set("Content-Type", "application/json; charset=utf-8")
+			writer.WriteHeader(status)
+			return
+		}
+		indeterminate := responseOverflowIsIndeterminate(writer)
+		status := http.StatusInternalServerError
+		code := shoal.ErrorInternal
+		if indeterminate {
+			writer.Header().Set(
+				CommitOutcomeHeader, CommitOutcomeIndeterminate)
+			status, code = http.StatusServiceUnavailable, shoal.ErrorUnavailable
+		}
+		var fallback limitedResponseBuffer
+		fallback.limit = body.limit
+		fallbackErr := json.NewEncoder(&fallback).Encode(struct {
+			Code          shoal.ErrorCode `json:"code"`
+			Message       string          `json:"message"`
+			Indeterminate bool            `json:"indeterminate,omitempty"`
+		}{
+			Code:          code,
+			Message:       "response exceeds output byte limit",
+			Indeterminate: indeterminate,
+		})
+		writer.Header().Set("Content-Type", "application/json; charset=utf-8")
+		writer.WriteHeader(status)
+		if fallbackErr == nil && fallback.Len() <= int(body.limit) {
+			_, _ = writer.Write(fallback.Bytes())
+		}
 		return
 	}
 	writer.Header().Set("Content-Type", "application/json; charset=utf-8")
@@ -531,11 +580,11 @@ func writeError(writer http.ResponseWriter, err error) {
 	writeResponse(writer, status, struct {
 		Code          shoal.ErrorCode           `json:"code"`
 		Message       string                    `json:"message"`
-		Indeterminate bool                      `json:"indeterminate,omitempty"`
 		Embedding     *wireEmbeddingQueryReport `json:"embedding,omitempty"`
+		Indeterminate bool                      `json:"indeterminate,omitempty"`
 	}{
 		Code: code, Message: err.Error(),
-		Indeterminate: indeterminate, Embedding: embedding,
+		Embedding: embedding, Indeterminate: indeterminate,
 	})
 }
 

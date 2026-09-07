@@ -36,12 +36,9 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
-// SnapshotValidator verifies a genuine corpus frontier pin and complete
-// touched source-node membership.
+// SnapshotValidator verifies corpus frontiers pinned into interaction records.
 type SnapshotValidator interface {
-	ValidateSnapshot(
-		context.Context, shoal.ID, time.Time, []shoal.ID,
-	) error
+	ValidateSnapshot(context.Context, shoal.ID, time.Time, []shoal.ID) error
 }
 
 // EvidenceSnapshotValidator additionally binds exact source evidence to the
@@ -60,6 +57,17 @@ type DerivedAssertionReader interface {
 	DerivedAssertions(
 		context.Context, []shoal.ID,
 	) (map[shoal.ID]ontology.Assertion, error)
+}
+
+// FoldStore is the explicitly trusted durable source for provenance folds.
+// It is separate from Base because fold acknowledgements and rehydrated
+// provenance are authorization evidence.
+type FoldStore interface {
+	FoldInteractions(
+		context.Context, explorer.FoldRequest,
+	) (explorer.FoldResult, error)
+	RehydrateFold(context.Context, shoal.ID) (interaction.Fold, error)
+	Folds(context.Context) ([]explorer.FoldSummary, error)
 }
 
 // Config supplies the trusted dependencies for an authorization-enforcing
@@ -88,6 +96,10 @@ type Config struct {
 	// trusted dependency also implements DerivedAssertionReader. Base is never
 	// promoted implicitly.
 	DerivedAssertionReader DerivedAssertionReader
+	// FoldStore is the explicitly trusted durable fold source. When omitted,
+	// NewClient may use SnapshotValidator if that separately trusted
+	// dependency also implements FoldStore. Base is never promoted implicitly.
+	FoldStore FoldStore
 	// OntologyInterpreter is an optional explicitly trusted read-time
 	// interpreter. It is separate from Base because Base graph responses are
 	// untrusted and must never be allowed to inject interpretations.
@@ -114,11 +126,11 @@ type Config struct {
 type Client struct {
 	base                explorer.Client
 	vectorScorer        VectorScorer
-	vectorSpaceResolver VectorEmbeddingSpaceResolver
 	interactionSink     explorer.InteractionWriter
 	interactionSource   explorer.InteractionReader
 	snapshotValidator   SnapshotValidator
 	derivedAssertions   DerivedAssertionReader
+	foldSource          FoldStore
 	ontologyInterpreter explorer.OntologyInterpreter
 	ontologyProposals   explorer.OntologyProposalStore
 	resolver            auth.Resolver
@@ -162,32 +174,24 @@ func NewClient(config Config) (*Client, error) {
 	if config.Clock == nil {
 		return nil, dependencyRequired("clock")
 	}
-	var vectorSpaceResolver VectorEmbeddingSpaceResolver
-	if !isNilDependency(config.VectorScorer) {
-		var ok bool
-		vectorSpaceResolver, ok =
-			config.VectorScorer.(VectorEmbeddingSpaceResolver)
-		if !ok || isNilDependency(vectorSpaceResolver) {
-			return nil, dependencyRequired(
-				"trusted vector embedding provenance")
-		}
-	}
 	hasInteractionWriter := !isNilDependency(config.InteractionWriter)
 	hasInteractionReader := !isNilDependency(config.InteractionReader)
 	hasSnapshotValidator := !isNilDependency(config.SnapshotValidator)
-	if hasInteractionWriter &&
-		(!hasInteractionReader || !hasSnapshotValidator) {
+	if hasInteractionWriter && (!hasInteractionReader || !hasSnapshotValidator) {
 		return nil, dependencyRequired(
 			"trusted interaction writer, reader, and snapshot validator")
 	}
-	if (hasInteractionReader || hasSnapshotValidator) &&
-		!hasInteractionWriter {
+	if hasSnapshotValidator && !hasInteractionWriter {
 		return nil, dependencyRequired("trusted interaction writer")
 	}
 	derivedAssertions := config.DerivedAssertionReader
 	if isNilDependency(derivedAssertions) && hasSnapshotValidator {
 		derivedAssertions, _ =
 			config.SnapshotValidator.(DerivedAssertionReader)
+	}
+	foldStore := config.FoldStore
+	if isNilDependency(foldStore) && hasSnapshotValidator {
+		foldStore, _ = config.SnapshotValidator.(FoldStore)
 	}
 	edgeSelector := config.EdgePolicySelector
 	if isNilDependency(edgeSelector) {
@@ -211,11 +215,11 @@ func NewClient(config Config) (*Client, error) {
 	return &Client{
 		base:                config.Base,
 		vectorScorer:        config.VectorScorer,
-		vectorSpaceResolver: vectorSpaceResolver,
 		interactionSink:     config.InteractionWriter,
 		interactionSource:   config.InteractionReader,
 		snapshotValidator:   config.SnapshotValidator,
 		derivedAssertions:   derivedAssertions,
+		foldSource:          foldStore,
 		ontologyInterpreter: config.OntologyInterpreter,
 		ontologyProposals:   config.OntologyProposalStore,
 		resolver:            config.Resolver,
@@ -504,10 +508,12 @@ func (c *Client) authorizeLegacySource(
 	if !found {
 		return nil
 	}
-	registration, ok, err := c.policyStore.CurrentRevision(ctx, documentID)
+	currentRevisions, err := c.resolveCurrentRevisions(
+		ctx, []shoal.ID{documentID})
 	if err != nil {
-		return policyCatalogReadError(ctx, err)
+		return err
 	}
+	registration, ok := currentRevisions[documentID]
 	if !ok {
 		return catalogUnavailable()
 	}
@@ -563,6 +569,107 @@ func (c *Client) begin(
 		return auth.Decision{}, auth.GenerationGuard{}, time.Time{}, err
 	}
 	return decision, guard, now, nil
+}
+
+func (c *Client) beginOneOf(
+	ctx context.Context,
+	operations ...auth.Operation,
+) (
+	auth.Decision,
+	auth.GenerationGuard,
+	time.Time,
+	auth.Operation,
+	error,
+) {
+	if err := contextFailure(ctx); err != nil {
+		return auth.Decision{}, auth.GenerationGuard{}, time.Time{}, "", err
+	}
+	if len(operations) == 0 {
+		return auth.Decision{}, auth.GenerationGuard{}, time.Time{}, "",
+			authorizationDenied()
+	}
+	decision, err := c.resolver.Resolve(ctx)
+	if err != nil {
+		return auth.Decision{}, auth.GenerationGuard{}, time.Time{}, "",
+			resolverFailure(ctx, err)
+	}
+	now := c.clock()
+	if now.IsZero() {
+		return auth.Decision{}, auth.GenerationGuard{}, time.Time{}, "",
+			authorizationDenied()
+	}
+	request := auth.ResourceRequest{
+		AuthorizationDomain: decision.AuthorizationDomain(),
+	}
+	var selected auth.Operation
+	for _, operation := range operations {
+		if err := operation.Validate(); err != nil {
+			return auth.Decision{}, auth.GenerationGuard{}, time.Time{}, "", err
+		}
+		if err := decision.Authorize(operation, request, now); err == nil {
+			selected = operation
+			break
+		}
+	}
+	if selected == "" {
+		if contextErr := contextFailure(ctx); contextErr != nil {
+			return auth.Decision{}, auth.GenerationGuard{}, time.Time{}, "", contextErr
+		}
+		return auth.Decision{}, auth.GenerationGuard{}, time.Time{}, "",
+			authorizationDenied()
+	}
+	guard, err := auth.NewGenerationGuard(decision, c.generationReader)
+	if err != nil {
+		return auth.Decision{}, auth.GenerationGuard{}, time.Time{}, "",
+			authorizationDenied()
+	}
+	if err := guard.Check(ctx); err != nil {
+		return auth.Decision{}, auth.GenerationGuard{}, time.Time{}, "", err
+	}
+	return decision, guard, now, selected, nil
+}
+
+// beginAny authorizes a setup-time operation that is not tied to one specific
+// operation. It still requires a live, in-domain credential and a policy
+// generation guard, but accepts any operation the decision itself grants, so
+// an action-only grant is not rejected the way pinning setup to Retrieve
+// would reject it. A decision that grants nothing is denied.
+func (c *Client) beginAny(ctx context.Context) (auth.GenerationGuard, error) {
+	if err := contextFailure(ctx); err != nil {
+		return auth.GenerationGuard{}, err
+	}
+	decision, err := c.resolver.Resolve(ctx)
+	if err != nil {
+		return auth.GenerationGuard{}, resolverFailure(ctx, err)
+	}
+	now := c.clock()
+	if now.IsZero() {
+		return auth.GenerationGuard{}, authorizationDenied()
+	}
+	request := auth.ResourceRequest{
+		AuthorizationDomain: decision.AuthorizationDomain(),
+	}
+	granted := false
+	for _, operation := range decision.AllowedOperations() {
+		if err := decision.Authorize(operation, request, now); err == nil {
+			granted = true
+			break
+		}
+	}
+	if !granted {
+		if contextErr := contextFailure(ctx); contextErr != nil {
+			return auth.GenerationGuard{}, contextErr
+		}
+		return auth.GenerationGuard{}, authorizationDenied()
+	}
+	guard, err := auth.NewGenerationGuard(decision, c.generationReader)
+	if err != nil {
+		return auth.GenerationGuard{}, authorizationDenied()
+	}
+	if err := guard.Check(ctx); err != nil {
+		return auth.GenerationGuard{}, err
+	}
+	return guard, nil
 }
 
 func (c *Client) selectIngestRule(

@@ -39,10 +39,6 @@ type DispatchStore struct {
 type DispatchRuntime interface {
 	Runtime
 	CurrentHead(context.Context) (coordination.AllocatorHeadV1, error)
-	ScanCommitted(
-		context.Context,
-		explorercoord.CommittedScanRequest,
-	) (explorercoord.CommittedPage, error)
 	ReadCommittedCell(
 		context.Context,
 		string,

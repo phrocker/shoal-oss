@@ -25,6 +25,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/json"
+	"io"
 	"sort"
 	"strings"
 	"time"
@@ -43,9 +44,7 @@ const (
 	MaxLease              = 24 * time.Hour
 	MaxReasonCodeBytes    = 64
 	MaxRegistrationKeyLen = 1024
-	DefaultListPageSize   = 25
-	MaxListPageSize       = 32
-	MaxListCursorBytes    = 4096
+	MaxDelegationDepth    = 64
 )
 
 type Scope struct {
@@ -79,7 +78,6 @@ type Descriptor struct {
 	LeaseExpiresAt      time.Time    `json:"lease_expires_at"`
 	UpdatedAt           time.Time    `json:"updated_at"`
 	RevokedAt           time.Time    `json:"revoked_at,omitempty"`
-	RegistrationDigest  [32]byte     `json:"-"`
 }
 
 type Spec struct {
@@ -131,13 +129,15 @@ type ListRequest struct {
 	Context   RequestContext `json:"context"`
 	SourceIDs [][]byte       `json:"source_ids,omitempty"`
 	PolicyIDs [][]byte       `json:"policy_ids,omitempty"`
-	Limit     uint32         `json:"limit,omitempty"`
-	Cursor    string         `json:"cursor,omitempty"`
+	Cursor    []byte         `json:"cursor,omitempty"`
+	Limit     int            `json:"limit"`
 }
+
+const MaxListResults = 16
 
 type ListPage struct {
 	Descriptors []Descriptor
-	NextCursor  string
+	Next        []byte
 }
 
 type Executor interface{}
@@ -161,6 +161,12 @@ func (r RequestContext) validate(now time.Time) error {
 	if r.Deadline.IsZero() || r.Deadline.Location() != time.UTC ||
 		!now.Before(r.Deadline) {
 		return shoal.NewError(shoal.ErrorDeadline, "request deadline has elapsed")
+	}
+	if !time.Unix(0, r.Deadline.UnixNano()).UTC().Equal(r.Deadline) {
+		return shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			"request deadline is outside the durable timestamp range",
+		)
 	}
 	if r.ReasonCode == "" || len(r.ReasonCode) > MaxReasonCodeBytes ||
 		strings.TrimSpace(r.ReasonCode) != r.ReasonCode {
@@ -289,6 +295,10 @@ func canonicalSchema(raw json.RawMessage) (json.RawMessage, error) {
 	decoder.UseNumber()
 	if err := decoder.Decode(&value); err != nil {
 		return nil, shoal.NewError(shoal.ErrorInvalidArgument, "action schema is invalid JSON")
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		return nil, shoal.NewError(
+			shoal.ErrorInvalidArgument, "action schema contains trailing JSON")
 	}
 	if _, ok := value.(map[string]any); !ok {
 		return nil, shoal.NewError(shoal.ErrorInvalidArgument, "action schema must be an object")

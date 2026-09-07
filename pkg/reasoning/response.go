@@ -103,9 +103,10 @@ type Policy struct {
 // BuildInput is the complete successful generator output to verify. Generator
 // errors are returned by the producer and are never converted into a response.
 type BuildInput struct {
-	ContextPack inference.ContextPack
-	Result      inference.InferenceResult
-	Policy      Policy
+	ContextPack     inference.ContextPack
+	Result          inference.InferenceResult
+	Policy          Policy
+	EmbeddingSpaces interaction.EmbeddingSpaceSet
 }
 
 // Builder verifies result evidence through the same contextpack hydration
@@ -122,14 +123,14 @@ type Recorder interface {
 
 // NewBuilder constructs a response builder over an authorized,
 // snapshot-aware evidence reader.
-func NewBuilder(reader contextpack.SnapshotReader) (*Builder, error) {
+func NewBuilder(reader contextpack.AuthorizationReader) (*Builder, error) {
 	return NewBuilderWithLimits(reader, contextpack.Limits{})
 }
 
 // NewBuilderWithLimits constructs a response builder with the same explicit
 // hydration limits used to build its context packs.
 func NewBuilderWithLimits(
-	reader contextpack.SnapshotReader,
+	reader contextpack.AuthorizationReader,
 	limits contextpack.Limits,
 ) (*Builder, error) {
 	if reader == nil || isNil(reader) {
@@ -272,8 +273,7 @@ type ResponseIdentity struct {
 	SnapshotAsOf             time.Time
 	AuthorizationFingerprint shoal.ID
 	AuthorizationExpiresAt   time.Time
-	EmbeddingSpaceID         shoal.ID
-	EmbeddingSpaceIDs        []shoal.ID
+	EmbeddingSpaces          interaction.EmbeddingSpaceSet
 	GeneratedAt              time.Time
 	EffectiveVisibility      []string
 	RetrievedSourceIDs       []shoal.ID
@@ -295,8 +295,7 @@ type CaptureMetadata struct {
 	requestID                 shoal.ID
 	snapshot                  inference.SnapshotPin
 	authorization             inference.AuthPin
-	embeddingSpaceID          shoal.ID
-	embeddingSpaceIDs         []shoal.ID
+	embeddingSpaces           interaction.EmbeddingSpaceSet
 	generatedAt               time.Time
 	retrievedSourceIDs        []shoal.ID
 	citedSourceIDs            []shoal.ID
@@ -319,11 +318,9 @@ func (m CaptureMetadata) Snapshot() inference.SnapshotPin {
 func (m CaptureMetadata) Authorization() inference.AuthPin {
 	return m.authorization
 }
-func (m CaptureMetadata) EmbeddingSpaceID() shoal.ID {
-	return m.embeddingSpaceID
-}
-func (m CaptureMetadata) EmbeddingSpaceIDs() []shoal.ID {
-	return append([]shoal.ID(nil), m.embeddingSpaceIDs...)
+func (m CaptureMetadata) EmbeddingSpaces() interaction.EmbeddingSpaceSet {
+	result, _ := m.embeddingSpaces.Canonical()
+	return result
 }
 func (m CaptureMetadata) GeneratedAt() time.Time { return m.generatedAt }
 func (m CaptureMetadata) RetrievedSourceIDs() []shoal.ID {
@@ -379,18 +376,14 @@ func (m CaptureMetadata) NewSession(
 		SnapshotAsOf:             m.snapshot.AsOf(),
 		AuthorizationFingerprint: m.authorization.Fingerprint(),
 		AuthorizationExpiresAt:   m.authorization.ExpiresAt(),
-		EmbeddingSpaceID:         m.embeddingSpaceID,
-		EmbeddingSpaceIDs: append(
-			[]shoal.ID(nil), m.embeddingSpaceIDs...),
-		RequestID:     m.requestID,
-		ContextPackID: m.contextPackID,
-		ResultID:      m.resultID,
-		RequiredVisibility: append(
-			[]string(nil), m.effectiveOutputVisibility...),
-		SeedNodeIDs:   append([]shoal.ID(nil), m.seedSourceIDs...),
-		CitedNodeIDs:  append([]shoal.ID(nil), m.citedSourceIDs...),
-		SeedEvidence:  cloneInteractionEvidence(m.seedEvidence),
-		CitedEvidence: cloneInteractionEvidence(m.citedEvidence),
+		EmbeddingSpaces:          m.EmbeddingSpaces(),
+		RequestID:                m.requestID,
+		ContextPackID:            m.contextPackID,
+		ResultID:                 m.resultID,
+		SeedNodeIDs:              append([]shoal.ID(nil), m.seedSourceIDs...),
+		CitedNodeIDs:             append([]shoal.ID(nil), m.citedSourceIDs...),
+		SeedEvidence:             cloneInteractionEvidence(m.seedEvidence),
+		CitedEvidence:            cloneInteractionEvidence(m.citedEvidence),
 	}
 	validation := session
 	validation.RecordedAt = m.generatedAt
@@ -407,8 +400,7 @@ type responseData struct {
 	requestID                 shoal.ID
 	snapshot                  inference.SnapshotPin
 	authorization             inference.AuthPin
-	embeddingSpaceID          shoal.ID
-	embeddingSpaceIDs         []shoal.ID
+	embeddingSpaces           interaction.EmbeddingSpaceSet
 	generatedAt               time.Time
 	effectiveOutputVisibility []string
 	retrievedSourceIDs        []shoal.ID
@@ -462,9 +454,9 @@ func (r Response) PolicyID() shoal.ID               { return r.data.policyID }
 func (r Response) RequestID() shoal.ID              { return r.data.requestID }
 func (r Response) Snapshot() inference.SnapshotPin  { return r.data.snapshot }
 func (r Response) Authorization() inference.AuthPin { return r.data.authorization }
-func (r Response) EmbeddingSpaceID() shoal.ID       { return r.data.embeddingSpaceID }
-func (r Response) EmbeddingSpaceIDs() []shoal.ID {
-	return append([]shoal.ID(nil), r.data.embeddingSpaceIDs...)
+func (r Response) EmbeddingSpaces() interaction.EmbeddingSpaceSet {
+	result, _ := r.data.embeddingSpaces.Canonical()
+	return result
 }
 func (r Response) GeneratedAt() time.Time { return r.data.generatedAt }
 func (r Response) EffectiveOutputVisibility() []string {
@@ -503,7 +495,10 @@ func (r Response) Validate() error {
 		!r.session.RecordedAt.Equal(r.recordedAt) {
 		return invalid("reasoning response session identity is inconsistent")
 	}
-	fingerprint := responseFingerprint(r.data)
+	fingerprint, err := responseFingerprint(r.data)
+	if err != nil {
+		return err
+	}
 	if fingerprint != r.data.fingerprint {
 		return invalid("reasoning response verification fingerprint is not canonical")
 	}
@@ -534,8 +529,9 @@ func (b *Builder) Build(
 	return PreparedResponse{
 		builder: b,
 		input: BuildInput{
-			ContextPack: input.ContextPack,
-			Result:      input.Result,
+			ContextPack:     input.ContextPack,
+			Result:          input.Result,
+			EmbeddingSpaces: data.embeddingSpaces,
 			Policy: Policy{
 				ID: input.Policy.ID,
 				ExtraOutputVisibility: append(
@@ -588,13 +584,13 @@ func (p PreparedResponse) Capture(
 	}
 	recorded, err = recorded.Canonical()
 	if err != nil {
-		return Response{}, explorer.MarkCommittedInteraction(fmt.Errorf(
-			"persisted interaction session: %w", err))
+		return Response{}, explorer.MarkCommittedInteraction(
+			fmt.Errorf("persisted interaction session: %w", err))
 	}
 	if err := validateCaptureSession(
 		recorded, captureMetadata(before)); err != nil {
-		return Response{}, explorer.MarkCommittedInteraction(fmt.Errorf(
-			"persisted interaction session: %w", err))
+		return Response{}, explorer.MarkCommittedInteraction(
+			fmt.Errorf("persisted interaction session: %w", err))
 	}
 	if recorded.ID != callerSession.ID ||
 		recorded.Operation != callerSession.Operation {
@@ -826,11 +822,7 @@ func (b *Builder) assemble(
 	if err != nil {
 		return responseData{}, err
 	}
-	embeddingSpaceID, _, err := contextpack.EmbeddingSpaceID(input.ContextPack)
-	if err != nil {
-		return responseData{}, err
-	}
-	embeddingSpaceIDs, err := contextpack.EmbeddingSpaceIDs(input.ContextPack)
+	embeddingSpaces, err := input.EmbeddingSpaces.Canonical()
 	if err != nil {
 		return responseData{}, err
 	}
@@ -841,8 +833,7 @@ func (b *Builder) assemble(
 		requestID:                 requestID,
 		snapshot:                  input.ContextPack.Snapshot(),
 		authorization:             input.ContextPack.Authorization(),
-		embeddingSpaceID:          embeddingSpaceID,
-		embeddingSpaceIDs:         embeddingSpaceIDs,
+		embeddingSpaces:           embeddingSpaces,
 		generatedAt:               input.Result.GeneratedAt(),
 		effectiveOutputVisibility: outputVisibility,
 		retrievedSourceIDs:        retrieved,
@@ -858,7 +849,10 @@ func (b *Builder) assemble(
 		claims:                    claims,
 		issues:                    issues,
 	}
-	data.fingerprint = responseFingerprint(data)
+	data.fingerprint, err = responseFingerprint(data)
+	if err != nil {
+		return responseData{}, err
+	}
 	return data, nil
 }
 
@@ -1031,10 +1025,11 @@ func validateCaptureSession(
 		return invalid(
 			"interaction session authorization does not match the reasoning result")
 	}
-	if canonical.EmbeddingSpaceID != metadata.embeddingSpaceID ||
-		!equalIDs(canonical.EmbeddingSpaceIDs, metadata.embeddingSpaceIDs) {
+	if !reflect.DeepEqual(
+		canonical.EmbeddingSpaces, metadata.embeddingSpaces,
+	) {
 		return invalid(
-			"interaction session embedding space does not match the reasoning result")
+			"interaction session embedding spaces do not match the reasoning result")
 	}
 	if canonical.RecordedAt.Before(metadata.snapshot.AsOf()) ||
 		canonical.RecordedAt.Before(metadata.generatedAt) {
@@ -1046,13 +1041,6 @@ func validateCaptureSession(
 		return shoal.NewError(
 			shoal.ErrorUnauthorized,
 			"interaction session recording time is outside authorization")
-	}
-	if !equalStrings(
-		canonical.RequiredVisibility,
-		metadata.effectiveOutputVisibility,
-	) {
-		return invalid(
-			"interaction session output visibility does not match the reasoning result")
 	}
 	if canonical.RequestID != metadata.requestID {
 		return invalid(
@@ -1080,8 +1068,12 @@ func validateCaptureSession(
 		return invalid(
 			"interaction session seed evidence does not match initial context")
 	}
+	retrievedEvidence, err := retrievedSessionEvidence(canonical)
+	if err != nil {
+		return err
+	}
 	if !equalInteractionEvidence(
-		canonical.RetrievedEvidence(), metadata.retrievedEvidence,
+		retrievedEvidence, metadata.retrievedEvidence,
 	) {
 		return invalid(
 			"interaction session retrieved evidence does not match verification")
@@ -1095,17 +1087,47 @@ func validateCaptureSession(
 	return nil
 }
 
+func retrievedSessionEvidence(
+	session interaction.Session,
+) ([]interaction.EvidenceReference, error) {
+	values := append(
+		[]interaction.EvidenceReference(nil), session.SeedEvidence...)
+	for _, turn := range session.Turns {
+		if turn.ToolCall != nil {
+			values = append(values, turn.ToolCall.RetrievedEvidence...)
+		}
+	}
+	byAnchor := make(map[shoal.ID]interaction.EvidenceReference, len(values))
+	for _, value := range values {
+		canonical, err := value.Canonical()
+		if err != nil {
+			return nil, err
+		}
+		if existing, duplicate := byAnchor[canonical.AnchorID]; duplicate {
+			if !interactionEvidenceEqual(existing, canonical) {
+				return nil, invalid(
+					"interaction session contains conflicting retrieved evidence")
+			}
+			continue
+		}
+		byAnchor[canonical.AnchorID] = canonical
+	}
+	result := make([]interaction.EvidenceReference, 0, len(byAnchor))
+	for _, value := range byAnchor {
+		result = append(result, value)
+	}
+	return canonicalInteractionEvidence(result)
+}
+
 func captureMetadata(data responseData) CaptureMetadata {
 	return CaptureMetadata{
-		contextPackID:    data.contextPackID,
-		resultID:         data.resultID,
-		policyID:         data.policyID,
-		requestID:        data.requestID,
-		snapshot:         data.snapshot,
-		authorization:    data.authorization,
-		embeddingSpaceID: data.embeddingSpaceID,
-		embeddingSpaceIDs: append(
-			[]shoal.ID(nil), data.embeddingSpaceIDs...),
+		contextPackID:      data.contextPackID,
+		resultID:           data.resultID,
+		policyID:           data.policyID,
+		requestID:          data.requestID,
+		snapshot:           data.snapshot,
+		authorization:      data.authorization,
+		embeddingSpaces:    cloneEmbeddingSpaces(data.embeddingSpaces),
 		generatedAt:        data.generatedAt,
 		retrievedSourceIDs: append([]shoal.ID(nil), data.retrievedSourceIDs...),
 		citedSourceIDs:     append([]shoal.ID(nil), data.citedSourceIDs...),
@@ -1120,7 +1142,7 @@ func captureMetadata(data responseData) CaptureMetadata {
 	}
 }
 
-func responseFingerprint(data responseData) string {
+func responseFingerprint(data responseData) (string, error) {
 	return ResponseFingerprint(responseIdentity(data))
 }
 
@@ -1131,10 +1153,8 @@ func responseIdentity(data responseData) ResponseIdentity {
 		SnapshotID: data.snapshot.ID(), SnapshotAsOf: data.snapshot.AsOf(),
 		AuthorizationFingerprint: data.authorization.Fingerprint(),
 		AuthorizationExpiresAt:   data.authorization.ExpiresAt(),
-		EmbeddingSpaceID:         data.embeddingSpaceID,
-		EmbeddingSpaceIDs: append(
-			[]shoal.ID(nil), data.embeddingSpaceIDs...),
-		GeneratedAt: data.generatedAt,
+		EmbeddingSpaces:          cloneEmbeddingSpaces(data.embeddingSpaces),
+		GeneratedAt:              data.generatedAt,
 		EffectiveVisibility: append(
 			[]string(nil), data.effectiveOutputVisibility...),
 		RetrievedSourceIDs: append(
@@ -1176,7 +1196,20 @@ func responseIdentity(data responseData) ResponseIdentity {
 
 // ResponseFingerprint derives the canonical verification fingerprint shared
 // by immutable responses and strict transport adapters.
-func ResponseFingerprint(identity ResponseIdentity) string {
+func ResponseFingerprint(identity ResponseIdentity) (string, error) {
+	embeddingSpaces, err := identity.EmbeddingSpaces.Canonical()
+	if err != nil {
+		return "", fmt.Errorf("embedding spaces: %w", err)
+	}
+	retrievedEvidence, err := canonicalInteractionEvidence(
+		identity.RetrievedEvidence)
+	if err != nil {
+		return "", fmt.Errorf("retrieved evidence: %w", err)
+	}
+	citedEvidence, err := canonicalInteractionEvidence(identity.CitedEvidence)
+	if err != nil {
+		return "", fmt.Errorf("cited evidence: %w", err)
+	}
 	retrievedSourceIDs := append(
 		[]shoal.ID(nil), identity.RetrievedSourceIDs...)
 	sort.Slice(retrievedSourceIDs, func(i, j int) bool {
@@ -1217,11 +1250,11 @@ func ResponseFingerprint(identity ResponseIdentity) string {
 		identity.SnapshotAsOf.UTC().Format(time.RFC3339Nano),
 		string(identity.AuthorizationFingerprint),
 		identity.AuthorizationExpiresAt.UTC().Format(time.RFC3339Nano),
-		string(identity.EmbeddingSpaceID),
+		embeddingSpaces.Digest,
 		identity.GeneratedAt.UTC().Format(time.RFC3339Nano),
 	}
-	for _, embeddingSpaceID := range identity.EmbeddingSpaceIDs {
-		parts = append(parts, string(embeddingSpaceID))
+	for _, embeddingSpace := range embeddingSpaces.Identities {
+		parts = append(parts, "embedding-space", embeddingSpace)
 	}
 	for _, visibility := range identity.EffectiveVisibility {
 		parts = append(parts, "visibility", visibility)
@@ -1245,10 +1278,10 @@ func ResponseFingerprint(identity ResponseIdentity) string {
 			parts = append(parts, "source-visibility", visibility)
 		}
 	}
-	for _, reference := range canonicalInteractionEvidence(identity.RetrievedEvidence) {
+	for _, reference := range retrievedEvidence {
 		parts = append(parts, interactionEvidenceParts("retrieved-evidence", reference)...)
 	}
-	for _, reference := range canonicalInteractionEvidence(identity.CitedEvidence) {
+	for _, reference := range citedEvidence {
 		parts = append(parts, interactionEvidenceParts("cited-evidence", reference)...)
 	}
 	for _, evidence := range evidenceItems {
@@ -1283,7 +1316,7 @@ func ResponseFingerprint(identity ResponseIdentity) string {
 			string(issue.OutcomeID),
 			issue.Input, issue.Reason)
 	}
-	return string(deriveID("reasoning-verification", parts...))
+	return string(deriveID("reasoning-verification", parts...)), nil
 }
 
 // CanonicalResponseID derives the stable ID for a durably captured response.
@@ -1299,11 +1332,15 @@ func CanonicalResponseID(
 	if recordedAt.IsZero() {
 		return "", invalid("reasoning response recording time is required")
 	}
+	fingerprint, err := ResponseFingerprint(identity)
+	if err != nil {
+		return "", err
+	}
 	return deriveID(
 		"reasoning-response",
 		string(sessionID),
 		recordedAt.UTC().Format(time.RFC3339Nano),
-		ResponseFingerprint(identity),
+		fingerprint,
 	), nil
 }
 
@@ -1427,6 +1464,7 @@ func cloneIssues(input []Issue) []Issue {
 }
 
 func cloneResponseData(data responseData) responseData {
+	data.embeddingSpaces = cloneEmbeddingSpaces(data.embeddingSpaces)
 	data.effectiveOutputVisibility = append(
 		[]string(nil), data.effectiveOutputVisibility...)
 	data.retrievedSourceIDs = append(
@@ -1448,32 +1486,57 @@ func cloneResponseData(data responseData) responseData {
 	return data
 }
 
+func cloneEmbeddingSpaces(
+	value interaction.EmbeddingSpaceSet,
+) interaction.EmbeddingSpaceSet {
+	result, _ := value.Canonical()
+	return result
+}
+
 func cloneInteractionEvidence(
 	values []interaction.EvidenceReference,
 ) []interaction.EvidenceReference {
 	result := make([]interaction.EvidenceReference, len(values))
 	for index, value := range values {
-		result[index], _ = value.Canonical()
+		result[index] = value
+		result[index].NodeIDs = append([]shoal.ID(nil), value.NodeIDs...)
+		result[index].EdgeIDs = append([]shoal.ID(nil), value.EdgeIDs...)
+		result[index].Assertions = append(
+			[]interaction.AssertionReference(nil), value.Assertions...)
 	}
 	return result
 }
 
 func canonicalInteractionEvidence(
 	values []interaction.EvidenceReference,
-) []interaction.EvidenceReference {
-	result := cloneInteractionEvidence(values)
+) ([]interaction.EvidenceReference, error) {
+	result := make([]interaction.EvidenceReference, len(values))
+	for index, value := range values {
+		canonical, err := value.Canonical()
+		if err != nil {
+			return nil, err
+		}
+		result[index] = canonical
+	}
 	sort.Slice(result, func(i, j int) bool {
 		return shoal.CompareID(
 			result[i].AnchorID, result[j].AnchorID) < 0
 	})
-	return result
+	return result, nil
 }
 
 func equalInteractionEvidence(
 	left, right []interaction.EvidenceReference,
 ) bool {
-	left = canonicalInteractionEvidence(left)
-	right = canonicalInteractionEvidence(right)
+	var err error
+	left, err = canonicalInteractionEvidence(left)
+	if err != nil {
+		return false
+	}
+	right, err = canonicalInteractionEvidence(right)
+	if err != nil {
+		return false
+	}
 	if len(left) != len(right) {
 		return false
 	}
@@ -1490,8 +1553,8 @@ func interactionEvidenceEqual(
 ) bool {
 	if left.AnchorID != right.AnchorID || left.Kind != right.Kind ||
 		left.Citation != right.Citation ||
-		!equalIDs(left.NodeIDs, right.NodeIDs) ||
-		!equalIDs(left.EdgeIDs, right.EdgeIDs) ||
+		!reflect.DeepEqual(left.NodeIDs, right.NodeIDs) ||
+		!reflect.DeepEqual(left.EdgeIDs, right.EdgeIDs) ||
 		len(left.Assertions) != len(right.Assertions) {
 		return false
 	}

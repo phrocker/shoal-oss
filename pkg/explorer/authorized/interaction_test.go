@@ -22,516 +22,19 @@ package authorized_test
 import (
 	"context"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/phrocker/shoal-oss/pkg/document"
 	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/explorer/authorized"
 	"github.com/phrocker/shoal-oss/pkg/graph"
 	"github.com/phrocker/shoal-oss/pkg/inference"
 	"github.com/phrocker/shoal-oss/pkg/interaction"
-	"github.com/phrocker/shoal-oss/pkg/ontology"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
-
-func TestAuthorizedInteractionRejectsForgedDocumentEvidence(t *testing.T) {
-	f := newFixture(t)
-	firstReceipt, err := f.clientA.Ingest(f.admin(t), explorer.Source{
-		URI: "file:///first-evidence.txt", MediaType: explorer.MediaTypeText,
-		Content: "first evidence",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	secondReceipt, err := f.clientA.Ingest(f.admin(t), explorer.Source{
-		URI: "file:///second-evidence.txt", MediaType: explorer.MediaTypeText,
-		Content: "second evidence",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	firstView, err := f.clientA.Document(
-		f.admin(t), firstReceipt.Document.ID, firstReceipt.Revision.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	secondView, err := f.clientA.Document(
-		f.admin(t), secondReceipt.Document.ID, secondReceipt.Revision.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	firstSpan := firstDocumentSpan(t, firstView)
-	secondSpan := firstDocumentSpan(t, secondView)
-	citation := document.Citation{
-		DocumentID: firstSpan.DocumentID,
-		RevisionID: firstSpan.RevisionID,
-		SectionID:  firstSpan.SectionID,
-		SpanID:     firstSpan.ID,
-		Range:      firstSpan.Range,
-	}
-	anchor, err := inference.NewDocumentAnchor(citation, firstSpan.Text)
-	if err != nil {
-		t.Fatal(err)
-	}
-	reference := interaction.EvidenceReference{
-		AnchorID: anchor.ID(),
-		Kind:     interaction.EvidenceDocument,
-		Citation: citation,
-		NodeIDs: []shoal.ID{
-			citation.DocumentID, citation.SectionID, citation.SpanID,
-		},
-	}
-	snapshot, err := f.base.Snapshot(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	f.clock.Set(snapshot.AsOf.Add(time.Second))
-	decision := f.decision(
-		t, "forged-document-evidence",
-		[][]byte{f.sourceA}, [][]byte{f.policyA},
-		[]auth.Operation{
-			auth.OperationRead, auth.OperationRetrieve, auth.OperationValidate,
-		},
-	)
-	fingerprint, err := auth.AuthorizationFingerprint(decision)
-	if err != nil {
-		t.Fatal(err)
-	}
-	baseSession := interaction.Session{
-		ID:                       "forged-document-session",
-		SnapshotID:               shoal.ID(snapshot.ID),
-		SnapshotAsOf:             snapshot.AsOf,
-		AuthorizationFingerprint: shoal.ID(fingerprint.String()),
-		AuthorizationExpiresAt:   decision.AuthenticationExpires(),
-		SeedNodeIDs:              reference.NodeIDs,
-		SeedEvidence:             []interaction.EvidenceReference{reference},
-	}
-	accepted := baseSession
-	accepted.ID = "verified-document-session"
-	if err := f.clientA.RecordInteraction(
-		f.context(t, decision), accepted,
-	); err != nil {
-		t.Fatalf("verified document evidence was rejected: %v", err)
-	}
-	tests := []struct {
-		name   string
-		mutate func(*interaction.Session)
-	}{
-		{
-			name: "anchor",
-			mutate: func(session *interaction.Session) {
-				session.SeedEvidence[0].AnchorID = "forged-anchor"
-			},
-		},
-		{
-			name: "section",
-			mutate: func(session *interaction.Session) {
-				session.SeedEvidence[0].Citation.SectionID =
-					secondSpan.SectionID
-				session.SeedEvidence[0].NodeIDs = []shoal.ID{
-					citation.DocumentID,
-					secondSpan.SectionID,
-					citation.SpanID,
-				}
-				session.SeedNodeIDs = session.SeedEvidence[0].NodeIDs
-			},
-		},
-		{
-			name: "span",
-			mutate: func(session *interaction.Session) {
-				session.SeedEvidence[0].Citation.SpanID = secondSpan.ID
-				session.SeedEvidence[0].NodeIDs = []shoal.ID{
-					citation.DocumentID,
-					citation.SectionID,
-					secondSpan.ID,
-				}
-				session.SeedNodeIDs = session.SeedEvidence[0].NodeIDs
-			},
-		},
-		{
-			name: "range",
-			mutate: func(session *interaction.Session) {
-				session.SeedEvidence[0].Citation.Range.End.Offset--
-			},
-		},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			session := baseSession
-			session.ID = shoal.ID(string(session.ID) + "-" + test.name)
-			session.SeedNodeIDs = append(
-				[]shoal.ID(nil), baseSession.SeedNodeIDs...)
-			session.SeedEvidence = append(
-				[]interaction.EvidenceReference(nil), baseSession.SeedEvidence...)
-			session.SeedEvidence[0].NodeIDs = append(
-				[]shoal.ID(nil), baseSession.SeedEvidence[0].NodeIDs...)
-			test.mutate(&session)
-			if err := f.clientA.RecordInteraction(
-				f.context(t, decision), session,
-			); err == nil {
-				t.Fatal("forged document evidence was recorded")
-			}
-		})
-	}
-	records, err := f.base.InteractionRecords(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(records) != 1 || records[0].Session.ID != accepted.ID {
-		t.Fatalf("forged evidence produced durable records: %+v", records)
-	}
-}
-
-type assertionInteractionBase struct {
-	*explorer.Explorer
-	assertion ontology.Assertion
-}
-
-func (b *assertionInteractionBase) Neighborhood(
-	ctx context.Context,
-	request explorer.NeighborhoodRequest,
-) (explorer.Neighborhood, error) {
-	result, err := b.Explorer.Neighborhood(ctx, request)
-	if err == nil {
-		result.Assertions = append(result.Assertions, b.assertion)
-	}
-	return result, err
-}
-
-func TestAuthorizedInteractionRejectsForgedAssertionEvidence(t *testing.T) {
-	f := newFixture(t)
-	firstReceipt, err := f.clientA.Ingest(f.admin(t), explorer.Source{
-		URI: "file:///assertion-first.txt", MediaType: explorer.MediaTypeText,
-		Content: "assertion first",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	secondReceipt, err := f.clientA.Ingest(f.admin(t), explorer.Source{
-		URI: "file:///assertion-second.txt", MediaType: explorer.MediaTypeText,
-		Content: "assertion second",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	firstView, err := f.clientA.Document(
-		f.admin(t), firstReceipt.Document.ID, firstReceipt.Revision.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	secondView, err := f.clientA.Document(
-		f.admin(t), secondReceipt.Document.ID, secondReceipt.Revision.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	firstSpan := firstDocumentSpan(t, firstView)
-	secondSpan := firstDocumentSpan(t, secondView)
-	firstCitation := document.Citation{
-		DocumentID: firstSpan.DocumentID,
-		RevisionID: firstSpan.RevisionID,
-		SectionID:  firstSpan.SectionID,
-		SpanID:     firstSpan.ID,
-		Range:      firstSpan.Range,
-	}
-	evidenceRef, err := ontology.NewEvidenceRef(
-		firstCitation, firstSpan.Text, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	provenance, err := ontology.NewExtractionProvenance(
-		"test", "model", "v1", "prompt", "v1", "extractor", "v1", nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	concept, err := ontology.NewConceptDefinition(
-		"endpoint", "Endpoint", "", nil, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	relationship, err := ontology.NewRelationshipDefinition(
-		"related", "Related", "",
-		[]shoal.ID{concept.ID()}, []shoal.ID{concept.ID()}, nil, false, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	object, err := ontology.NewReferenceValue(secondSpan.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	edgeID := shoal.ID("authoritative-assertion-edge")
-	assertion, err := ontology.NewAssertion(
-		firstSpan.ID, relationship.ID(), object,
-		ontology.AssertionInferred, 0.9,
-		[]ontology.EvidenceRef{evidenceRef}, provenance,
-		shoal.Metadata{"shoal.graph.edge_id": string(edgeID)})
-	if err != nil {
-		t.Fatal(err)
-	}
-	edge := graph.Edge{
-		ID: edgeID, From: firstSpan.ID, To: secondSpan.ID,
-		Type: "related", Weight: 0.9,
-		Properties: shoal.Metadata{
-			"ontology_relationship_id":  string(relationship.ID()),
-			"ontology.assertion.origin": string(assertion.Origin()),
-		},
-	}
-	if err := f.clientA.Connect(f.admin(t), edge); err != nil {
-		t.Fatal(err)
-	}
-	base := &assertionInteractionBase{
-		Explorer:  f.base,
-		assertion: assertion,
-	}
-	client := f.newClient(
-		t, base, f.store, f.sourceA, f.policyA, nil)
-	raw, err := base.Neighborhood(
-		context.Background(),
-		explorer.NeighborhoodRequest{
-			NodeIDs: []shoal.ID{firstSpan.ID, secondSpan.ID},
-			Depth:   1,
-		})
-	if err != nil {
-		t.Fatal(err)
-	}
-	nodesByID := make(map[shoal.ID]graph.Node, len(raw.Nodes))
-	for _, node := range raw.Nodes {
-		nodesByID[node.ID] = node
-	}
-	assertionReference := interaction.AssertionReference{
-		AssertionID: assertion.ID(),
-		EdgeID:      edge.ID,
-		Origin:      assertion.Origin(),
-	}
-	anchor, err := inference.NewGraphAnchorWithAssertions(graph.Path{
-		Nodes: []graph.Node{
-			nodesByID[firstSpan.ID],
-			nodesByID[secondSpan.ID],
-		},
-		Edges: []graph.Edge{edge},
-	}, []interaction.AssertionReference{assertionReference})
-	if err != nil {
-		t.Fatal(err)
-	}
-	reference := interaction.EvidenceReference{
-		AnchorID:   anchor.ID(),
-		Kind:       interaction.EvidenceGraph,
-		NodeIDs:    []shoal.ID{firstSpan.ID, secondSpan.ID},
-		EdgeIDs:    []shoal.ID{edge.ID},
-		Assertions: []interaction.AssertionReference{assertionReference},
-	}
-	snapshot, err := f.base.Snapshot(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	f.clock.Set(snapshot.AsOf.Add(time.Second))
-	decision := f.decision(
-		t, "forged-assertion-evidence",
-		[][]byte{f.sourceA}, [][]byte{f.policyA},
-		[]auth.Operation{
-			auth.OperationRead, auth.OperationRetrieve, auth.OperationValidate,
-		},
-	)
-	fingerprint, err := auth.AuthorizationFingerprint(decision)
-	if err != nil {
-		t.Fatal(err)
-	}
-	baseSession := interaction.Session{
-		ID:                       "forged-assertion-session",
-		SnapshotID:               shoal.ID(snapshot.ID),
-		SnapshotAsOf:             snapshot.AsOf,
-		AuthorizationFingerprint: shoal.ID(fingerprint.String()),
-		AuthorizationExpiresAt:   decision.AuthenticationExpires(),
-		SeedNodeIDs:              reference.NodeIDs,
-		SeedEvidence:             []interaction.EvidenceReference{reference},
-	}
-	accepted := baseSession
-	accepted.ID = "untrusted-assertion-session"
-	if err := client.RecordInteraction(
-		f.context(t, decision), accepted,
-	); !shoal.IsErrorCode(err, shoal.ErrorConflict) {
-		t.Fatalf("untrusted assertion evidence error = %v", err)
-	}
-	tests := []struct {
-		name   string
-		mutate func(*interaction.Session)
-	}{
-		{
-			name: "assertion-id",
-			mutate: func(session *interaction.Session) {
-				session.SeedEvidence[0].Assertions[0].AssertionID =
-					"forged-assertion"
-			},
-		},
-		{
-			name: "assertion-origin",
-			mutate: func(session *interaction.Session) {
-				session.SeedEvidence[0].Assertions[0].Origin =
-					ontology.AssertionExplicit
-			},
-		},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			session := baseSession
-			session.ID = shoal.ID(string(session.ID) + "-" + test.name)
-			session.SeedNodeIDs = append(
-				[]shoal.ID(nil), baseSession.SeedNodeIDs...)
-			session.SeedEvidence = append(
-				[]interaction.EvidenceReference(nil), baseSession.SeedEvidence...)
-			session.SeedEvidence[0].NodeIDs = append(
-				[]shoal.ID(nil), reference.NodeIDs...)
-			session.SeedEvidence[0].EdgeIDs = append(
-				[]shoal.ID(nil), reference.EdgeIDs...)
-			session.SeedEvidence[0].Assertions = append(
-				[]interaction.AssertionReference(nil), reference.Assertions...)
-			test.mutate(&session)
-			if err := client.RecordInteraction(
-				f.context(t, decision), session,
-			); err == nil {
-				t.Fatal("forged assertion evidence was recorded")
-			}
-		})
-	}
-	records, err := f.base.InteractionRecords(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(records) != 0 {
-		t.Fatalf("forged assertion evidence produced records: %+v", records)
-	}
-}
-
-func firstDocumentSpan(
-	t *testing.T,
-	view explorer.DocumentView,
-) document.Span {
-	t.Helper()
-	var visit func(explorer.SectionView) (document.Span, bool)
-	visit = func(section explorer.SectionView) (document.Span, bool) {
-		if len(section.Spans) != 0 {
-			return section.Spans[0], true
-		}
-		for _, child := range section.Children {
-			if span, ok := visit(child); ok {
-				return span, true
-			}
-		}
-		return document.Span{}, false
-	}
-	span, ok := visit(view.Root)
-	if !ok {
-		t.Fatal("document has no span")
-	}
-	return span
-}
-
-func TestAuthorizedInteractionRequiresCurrentEdgeAuthorization(t *testing.T) {
-	f := newFixture(t)
-	receipt, err := f.clientA.Ingest(f.admin(t), explorer.Source{
-		URI: "file:///edge-evidence.txt", MediaType: explorer.MediaTypeText,
-		Content: "edge evidence",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	view, err := f.clientA.Document(
-		f.admin(t), receipt.Document.ID, receipt.Revision.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	spanID := firstSpanID(t, view)
-	edgeSelector, err := authorized.NewStaticPolicySelector(
-		f.sourceA, f.policyB)
-	if err != nil {
-		t.Fatal(err)
-	}
-	edgeClient := f.newClient(
-		t, f.base, f.store, f.sourceA, f.policyA, edgeSelector)
-	edge := graph.Edge{
-		ID:   "restricted-evidence-edge",
-		From: receipt.Document.ID, To: spanID,
-		Type: "related", Weight: 1,
-	}
-	if err := edgeClient.Connect(f.admin(t), edge); err != nil {
-		t.Fatal(err)
-	}
-	snapshot, err := f.base.Snapshot(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	f.clock.Set(snapshot.AsOf.Add(time.Second))
-	neighborhood, err := f.base.Neighborhood(
-		context.Background(),
-		explorer.NeighborhoodRequest{NodeIDs: []shoal.ID{spanID}, Depth: 1},
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	nodesByID := make(map[shoal.ID]graph.Node, len(neighborhood.Nodes))
-	for _, node := range neighborhood.Nodes {
-		nodesByID[node.ID] = node
-	}
-	anchor, err := inference.NewGraphAnchor(graph.Path{
-		Nodes: []graph.Node{
-			nodesByID[receipt.Document.ID],
-			nodesByID[spanID],
-		},
-		Edges: []graph.Edge{edge},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	reference := interaction.EvidenceReference{
-		AnchorID: anchor.ID(), Kind: interaction.EvidenceGraph,
-		NodeIDs: []shoal.ID{receipt.Document.ID, spanID},
-		EdgeIDs: []shoal.ID{edge.ID},
-	}
-	denied := f.decision(
-		t, "edge-denied",
-		[][]byte{f.sourceA}, [][]byte{f.policyA},
-		[]auth.Operation{
-			auth.OperationRead, auth.OperationRetrieve, auth.OperationValidate,
-		},
-	)
-	deniedFingerprint, err := auth.AuthorizationFingerprint(denied)
-	if err != nil {
-		t.Fatal(err)
-	}
-	session := interaction.Session{
-		ID: "edge-session", RecordedAt: f.clock.Now(),
-		SnapshotID: shoal.ID(snapshot.ID), SnapshotAsOf: snapshot.AsOf,
-		AuthorizationFingerprint: shoal.ID(deniedFingerprint.String()),
-		AuthorizationExpiresAt:   denied.AuthenticationExpires(),
-		SeedNodeIDs:              []shoal.ID{receipt.Document.ID, spanID},
-		SeedEvidence:             []interaction.EvidenceReference{reference},
-	}
-	if err := f.clientA.RecordInteraction(
-		f.context(t, denied), session,
-	); !shoal.IsErrorCode(err, shoal.ErrorNotFound) {
-		t.Fatalf("edge-denied interaction error = %v", err)
-	}
-	allowed := f.decision(
-		t, "edge-allowed",
-		[][]byte{f.sourceA}, [][]byte{f.policyA, f.policyB},
-		[]auth.Operation{
-			auth.OperationRead, auth.OperationRetrieve, auth.OperationValidate,
-		},
-	)
-	allowedFingerprint, err := auth.AuthorizationFingerprint(allowed)
-	if err != nil {
-		t.Fatal(err)
-	}
-	session.ID = "edge-session-allowed"
-	session.AuthorizationFingerprint = shoal.ID(allowedFingerprint.String())
-	session.AuthorizationExpiresAt = allowed.AuthenticationExpires()
-	if err := edgeClient.RecordInteraction(
-		f.context(t, allowed), session); err != nil {
-		t.Fatal(err)
-	}
-}
 
 type generationChangingInteractionBase struct {
 	*explorer.Explorer
@@ -581,6 +84,62 @@ type countingInteractionStore struct {
 	nodesCalls int
 }
 
+type edgeHidingInteractionStore struct {
+	authorized.PolicyStore
+	hidden shoal.ID
+}
+
+func exactAuthorizedGraphEvidence(
+	t testing.TB, corpus *explorer.Explorer, edge graph.Edge,
+) interaction.EvidenceReference {
+	t.Helper()
+	neighborhood, err := corpus.Neighborhood(
+		context.Background(), explorer.NeighborhoodRequest{
+			NodeIDs: []shoal.ID{edge.From}, Depth: 1,
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	nodes := make(map[shoal.ID]graph.Node, len(neighborhood.Nodes))
+	for _, node := range neighborhood.Nodes {
+		nodes[node.ID] = node
+	}
+	var exact graph.Edge
+	for _, candidate := range neighborhood.Edges {
+		if candidate.ID == edge.ID {
+			exact = candidate
+			break
+		}
+	}
+	if exact.ID == "" || nodes[edge.From].ID == "" || nodes[edge.To].ID == "" {
+		t.Fatal("exact graph evidence is unavailable")
+	}
+	anchor, err := inference.NewGraphAnchor(graph.Path{
+		Nodes: []graph.Node{nodes[edge.From], nodes[edge.To]},
+		Edges: []graph.Edge{exact},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reference, err := anchor.EvidenceReference()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return reference
+}
+
+func (s edgeHidingInteractionStore) Edges(
+	ctx context.Context,
+	ids []shoal.ID,
+) (map[shoal.ID]authorized.EdgeRegistration, error) {
+	result, err := s.PolicyStore.Edges(ctx, ids)
+	if err != nil {
+		return nil, err
+	}
+	delete(result, s.hidden)
+	return result, nil
+}
+
 func (s *countingInteractionStore) Nodes(
 	ctx context.Context, ids []shoal.ID,
 ) (map[shoal.ID]authorized.NodeRegistration, error) {
@@ -592,6 +151,45 @@ type countingInteractionBase struct {
 	*explorer.Explorer
 	recordCalls  int
 	recordsCalls int
+}
+
+type hiddenFirstInteractionRecordBase struct {
+	*explorer.Explorer
+	hidden bool
+}
+
+func (b *hiddenFirstInteractionRecordBase) InteractionRecord(
+	ctx context.Context, id shoal.ID,
+) (explorer.InteractionRecord, error) {
+	if !b.hidden {
+		b.hidden = true
+		return explorer.InteractionRecord{}, shoal.NewError(
+			shoal.ErrorNotFound, "simulated concurrent retry winner")
+	}
+	return b.Explorer.InteractionRecord(ctx, id)
+}
+
+type mutatingInteractionSnapshotBase struct {
+	*explorer.Explorer
+	mutate func() error
+}
+
+func (b *mutatingInteractionSnapshotBase) ValidateSnapshot(
+	ctx context.Context,
+	id shoal.ID,
+	asOf time.Time,
+	nodeIDs []shoal.ID,
+) error {
+	if err := b.Explorer.ValidateSnapshot(
+		ctx, id, asOf, nodeIDs); err != nil {
+		return err
+	}
+	if b.mutate == nil {
+		return nil
+	}
+	mutate := b.mutate
+	b.mutate = nil
+	return mutate()
 }
 
 type rejectingSnapshotValidator struct {
@@ -649,6 +247,15 @@ func TestAuthorizedResultPathRequiresResultSink(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	sink := client.AnalyticsInteractionSink()
+	if sink != nil {
+		t.Fatal("analytics exposed a result sink backed by a void-only writer")
+	}
+	if _, err := interaction.NewRecorder(
+		context.Background(), sink,
+	); !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
+		t.Fatalf("recorder setup with void-only sink = %v", err)
+	}
 	session := interaction.Session{
 		ID:         interaction.DerivedID("session", "result-sink-required"),
 		Operation:  interaction.OperationRetrieval,
@@ -657,6 +264,11 @@ func TestAuthorizedResultPathRequiresResultSink(t *testing.T) {
 		AuthorizationExpiresAt:   decision.AuthenticationExpires(),
 	}
 	ctx := f.context(t, decision)
+	if _, err := interaction.NewRecorder(
+		ctx, client,
+	); !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
+		t.Fatalf("direct recorder setup with void-only writer = %v", err)
+	}
 	if _, err := client.RecordInteractionResult(
 		ctx, session,
 	); !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
@@ -677,6 +289,7 @@ func TestAuthorizedInteractionRecorderAndViews(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	snapshot, err := f.base.Snapshot(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -704,7 +317,7 @@ func TestAuthorizedInteractionRecorderAndViews(t *testing.T) {
 		t.Fatal(err)
 	}
 	session := interaction.Session{
-		ID:                       "session-authorized",
+		ID:                       "interaction.session_authorized",
 		RecordedAt:               f.clock.Now(),
 		SnapshotID:               shoal.ID(snapshot.ID),
 		SnapshotAsOf:             snapshot.AsOf,
@@ -717,17 +330,6 @@ func TestAuthorizedInteractionRecorderAndViews(t *testing.T) {
 	}
 	if err := f.clientA.RecordInteraction(ctx, session); err != nil {
 		t.Fatal(err)
-	}
-	f.clock.Set(snapshot.AsOf.Add(2 * time.Second))
-	retry := session
-	retry.RecordedAt = snapshot.AsOf.Add(-time.Hour)
-	persisted, err := f.clientA.RecordInteractionResult(ctx, retry)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !persisted.RecordedAt.Equal(session.RecordedAt) {
-		t.Fatalf("authorized retry time = %v, want %v",
-			persisted.RecordedAt, session.RecordedAt)
 	}
 	hydrated, err := f.clientA.Interaction(ctx, session.ID)
 	if err != nil {
@@ -786,6 +388,273 @@ func TestAuthorizedInteractionRecorderAndViews(t *testing.T) {
 	}
 }
 
+func TestAuthorizedInteractionReauthorizesExactSourceEdge(t *testing.T) {
+	f := newFixture(t)
+	receipt, err := f.clientA.Ingest(f.admin(t), explorer.Source{
+		URI:       "file:///authorized-edge-interaction.txt",
+		MediaType: explorer.MediaTypeText,
+		Content:   "authorized edge interaction evidence",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	view, err := f.clientA.Document(
+		f.admin(t), receipt.Document.ID, receipt.Revision.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	edge := graph.Edge{
+		ID:     "application-evidence-edge",
+		From:   receipt.Document.ID,
+		To:     firstSpanID(t, view),
+		Type:   "supports",
+		Weight: 1,
+	}
+	if err := f.clientA.Connect(f.admin(t), edge); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := f.base.Snapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.clock.Set(snapshot.AsOf.Add(time.Second))
+	decision := f.decision(
+		t, "edge-recorder", [][]byte{f.sourceA}, [][]byte{f.policyA},
+		[]auth.Operation{
+			auth.OperationConnect,
+			auth.OperationRead,
+			auth.OperationRetrieve,
+			auth.OperationValidate,
+		},
+	)
+	ctx := f.context(t, decision)
+	fingerprint, err := auth.AuthorizationFingerprint(decision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	evidence := exactAuthorizedGraphEvidence(t, f.base, edge)
+	session := interaction.Session{
+		ID:                       interaction.DerivedID("session", "authorized-edge"),
+		RecordedAt:               f.clock.Now(),
+		Operation:                interaction.OperationToolCall,
+		AuthorizationOperation:   string(auth.OperationConnect),
+		SnapshotID:               shoal.ID(snapshot.ID),
+		SnapshotAsOf:             snapshot.AsOf,
+		AuthorizationFingerprint: shoal.ID(fingerprint.String()),
+		AuthorizationExpiresAt:   decision.AuthenticationExpires(),
+		SeedNodeIDs:              []shoal.ID{edge.From, edge.To},
+		SeedEvidence:             []interaction.EvidenceReference{evidence},
+	}
+	if err := f.clientA.RecordInteraction(ctx, session); err != nil {
+		t.Fatal(err)
+	}
+	record, err := f.clientA.InteractionRecord(ctx, session.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(record.TouchedEdgeIDs) != 1 ||
+		record.TouchedEdgeIDs[0] != edge.ID {
+		t.Fatalf("touched edges = %v", record.TouchedEdgeIDs)
+	}
+	if record.Summary.AuthorizationOperation !=
+		string(auth.OperationConnect) {
+		t.Fatalf("authorization operation = %q",
+			record.Summary.AuthorizationOperation)
+	}
+
+	retrieveOnly := f.decision(
+		t, "edge-retrieve-only",
+		[][]byte{f.sourceA}, [][]byte{f.policyA},
+		[]auth.Operation{auth.OperationRetrieve},
+	)
+	retrieveFingerprint, err := auth.AuthorizationFingerprint(retrieveOnly)
+	if err != nil {
+		t.Fatal(err)
+	}
+	denied := session
+	denied.ID = interaction.DerivedID(
+		"session", "unauthorized-edge-operation")
+	denied.AuthorizationFingerprint =
+		shoal.ID(retrieveFingerprint.String())
+	denied.AuthorizationExpiresAt =
+		retrieveOnly.AuthenticationExpires()
+	if err := f.clientA.RecordInteraction(
+		f.context(t, retrieveOnly), denied,
+	); !shoal.IsErrorCode(err, shoal.ErrorUnauthorized) {
+		t.Fatalf("unauthorized exact operation error = %v", err)
+	}
+	connectOnly := f.decision(
+		t, "edge-connect-only",
+		[][]byte{f.sourceA}, [][]byte{f.policyA},
+		[]auth.Operation{auth.OperationConnect},
+	)
+	connectFingerprint, err := auth.AuthorizationFingerprint(connectOnly)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deniedEvidence := session
+	deniedEvidence.ID = interaction.DerivedID(
+		"session", "unauthorized-edge-evidence")
+	deniedEvidence.AuthorizationFingerprint =
+		shoal.ID(connectFingerprint.String())
+	deniedEvidence.AuthorizationExpiresAt =
+		connectOnly.AuthenticationExpires()
+	if err := f.clientA.RecordInteraction(
+		f.context(t, connectOnly), deniedEvidence,
+	); !shoal.IsErrorCode(err, shoal.ErrorNotFound) {
+		t.Fatalf("missing retrieve authorization error = %v", err)
+	}
+
+	revoked := f.newClient(
+		t, f.base,
+		edgeHidingInteractionStore{
+			PolicyStore: f.store,
+			hidden:      edge.ID,
+		},
+		f.sourceA, f.policyA, nil,
+	)
+	if _, err := revoked.Interaction(
+		ctx, session.ID,
+	); !shoal.IsErrorCode(err, shoal.ErrorNotFound) {
+		t.Fatalf("revoked edge left interaction readable: %v", err)
+	}
+	rejected := session
+	rejected.ID = interaction.DerivedID("session", "revoked-edge-write")
+	if err := revoked.RecordInteraction(ctx, rejected); !shoal.IsErrorCode(
+		err, shoal.ErrorNotFound,
+	) {
+		t.Fatalf("revoked edge recording error = %v", err)
+	}
+	if _, err := f.base.InteractionRecord(
+		context.Background(), rejected.ID,
+	); !shoal.IsErrorCode(err, shoal.ErrorNotFound) {
+		t.Fatalf("revoked edge recording persisted a record: %v", err)
+	}
+}
+
+func TestAuthorizedRecorderSetupRequiresLiveCredential(t *testing.T) {
+	f := newFixture(t)
+	if err := f.clientA.EnsureInteractionSink(
+		context.Background(),
+	); !shoal.IsErrorCode(err, shoal.ErrorUnauthorized) {
+		t.Fatalf("credential-less recorder setup = %v", err)
+	}
+	expired := f.decision(
+		t, "expired-recorder",
+		[][]byte{f.sourceA}, [][]byte{f.policyA},
+		[]auth.Operation{auth.OperationConnect},
+	)
+	ctx := f.context(t, expired)
+	f.clock.Set(expired.AuthenticationExpires().Add(time.Second))
+	if err := f.clientA.EnsureInteractionSink(
+		ctx,
+	); !shoal.IsErrorCode(err, shoal.ErrorUnauthorized) {
+		t.Fatalf("expired recorder setup = %v", err)
+	}
+}
+
+func TestAuthorizedRecorderSetupSupportsEvidenceEmptyActionOnlyGrant(t *testing.T) {
+	f := newFixture(t)
+	snapshot, err := f.base.Snapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.clock.Set(snapshot.AsOf.Add(time.Second))
+	decision := f.decision(
+		t, "action-only-recorder",
+		[][]byte{f.sourceA}, [][]byte{f.policyA},
+		[]auth.Operation{auth.OperationConnect},
+	)
+	ctx := f.context(t, decision)
+	recorder, err := interaction.NewRecorder(ctx, f.clientA)
+	if err != nil {
+		t.Fatalf("action-only recorder setup = %v", err)
+	}
+	if err := recorder.SetClock(f.clock.Now); err != nil {
+		t.Fatal(err)
+	}
+	fingerprint, err := auth.AuthorizationFingerprint(decision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := interaction.Session{
+		ID: interaction.DerivedID(
+			"session", "action-only-recorder"),
+		Operation:                interaction.OperationToolCall,
+		AuthorizationOperation:   string(auth.OperationConnect),
+		SnapshotID:               shoal.ID(snapshot.ID),
+		SnapshotAsOf:             snapshot.AsOf,
+		AuthorizationFingerprint: shoal.ID(fingerprint.String()),
+		AuthorizationExpiresAt:   decision.AuthenticationExpires(),
+		Turns: []interaction.Turn{{
+			Index: 0, Decision: string(auth.OperationConnect),
+			ToolCall: &interaction.ToolCall{
+				Kind: string(auth.OperationConnect),
+			},
+		}},
+	}
+	persisted, err := recorder.Record(ctx, request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if persisted.AuthorizationOperation !=
+		string(auth.OperationConnect) ||
+		persisted.Actor.SubjectID != decision.Subject() ||
+		persisted.Actor.ActorID != decision.Actor() ||
+		len(persisted.TouchedNodeIDs()) != 0 {
+		t.Fatalf("action-only persisted session = %+v", persisted)
+	}
+}
+
+func TestAuthorizedInteractionPreservesNarrowerExpiry(t *testing.T) {
+	f := newFixture(t)
+	snapshot, err := f.base.Snapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.clock.Set(snapshot.AsOf.Add(time.Second))
+	decision := f.decision(
+		t, "narrow-expiry",
+		[][]byte{f.sourceA}, [][]byte{f.policyA},
+		[]auth.Operation{auth.OperationRetrieve},
+	)
+	fingerprint, err := auth.AuthorizationFingerprint(decision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	narrowExpiry := f.clock.Now().Add(5 * time.Minute)
+	session := interaction.Session{
+		ID:                       interaction.DerivedID("session", "narrow-expiry"),
+		Operation:                interaction.OperationRetrieval,
+		SnapshotID:               shoal.ID(snapshot.ID),
+		SnapshotAsOf:             snapshot.AsOf,
+		AuthorizationFingerprint: shoal.ID(fingerprint.String()),
+		AuthorizationExpiresAt:   narrowExpiry,
+	}
+	persisted, err := f.clientA.RecordInteractionResult(
+		f.context(t, decision), session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !persisted.AuthorizationExpiresAt.Equal(narrowExpiry) {
+		t.Fatalf("persisted expiry = %v, want %v",
+			persisted.AuthorizationExpiresAt, narrowExpiry)
+	}
+	record, err := f.base.InteractionRecord(
+		context.Background(), session.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !record.Session.AuthorizationExpiresAt.Equal(narrowExpiry) ||
+		!record.Summary.AuthorizationExpiresAt.Equal(narrowExpiry) {
+		t.Fatalf("durable expiry = session %v summary %v, want %v",
+			record.Session.AuthorizationExpiresAt,
+			record.Summary.AuthorizationExpiresAt,
+			narrowExpiry,
+		)
+	}
+}
+
 func TestAuthorizedInteractionEnrichesTrustedActorDelegationAndReason(t *testing.T) {
 	f := newFixture(t)
 	receipt, err := f.clientA.Ingest(f.admin(t), explorer.Source{
@@ -837,7 +706,7 @@ func TestAuthorizedInteractionEnrichesTrustedActorDelegationAndReason(t *testing
 		t.Fatal(err)
 	}
 	session := interaction.Session{
-		ID:         "session-actor-context",
+		ID:         "interaction.session_actor-context",
 		RecordedAt: f.clock.Now(),
 		Operation:  interaction.OperationRetrieval,
 		Actor: interaction.ActorContext{
@@ -910,60 +779,6 @@ func TestAuthorizedInteractionEnrichesTrustedActorDelegationAndReason(t *testing
 	}
 }
 
-func TestAuthorizedInteractionUsesTheRecordedToolOperation(t *testing.T) {
-	f := newFixture(t)
-	snapshot, err := f.base.Snapshot(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	f.clock.Set(snapshot.AsOf.Add(time.Second))
-	decision := f.decision(
-		t,
-		"list-only-recorder",
-		[][]byte{f.sourceA},
-		[][]byte{f.policyA},
-		[]auth.Operation{auth.OperationList, auth.OperationValidate},
-	)
-	ctx := f.context(t, decision)
-	snapshot, err = f.clientA.InteractionSnapshot(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	recorder, err := interaction.NewRecorder(ctx, f.clientA)
-	if err != nil {
-		t.Fatalf("list-only recorder setup: %v", err)
-	}
-	fingerprint, err := auth.AuthorizationFingerprint(decision)
-	if err != nil {
-		t.Fatal(err)
-	}
-	session := interaction.Session{
-		ID:                       "session-list-only",
-		RecordedAt:               f.clock.Now(),
-		Operation:                interaction.OperationToolCall,
-		AuthorizationOperation:   string(auth.OperationList),
-		SnapshotID:               shoal.ID(snapshot.ID),
-		SnapshotAsOf:             snapshot.AsOf,
-		AuthorizationFingerprint: shoal.ID(fingerprint.String()),
-		AuthorizationExpiresAt:   decision.AuthenticationExpires(),
-		Turns: []interaction.Turn{{
-			Index:    0,
-			ToolCall: &interaction.ToolCall{Kind: "shoal.documents"},
-		}},
-	}
-	if _, err := recorder.Record(ctx, session); err != nil {
-		t.Fatalf("list-only interaction record: %v", err)
-	}
-	legacy := session
-	legacy.ID = "session-default-retrieve"
-	legacy.AuthorizationOperation = ""
-	if _, err := recorder.Record(ctx, legacy); !shoal.IsErrorCode(
-		err, shoal.ErrorUnauthorized,
-	) {
-		t.Fatalf("default retrieve operation with list-only decision = %v", err)
-	}
-}
-
 func TestAuthorizedInteractionRecorderRejectsWrongPin(t *testing.T) {
 	f := newFixture(t)
 	receipt, err := f.clientA.Ingest(f.admin(t), explorer.Source{
@@ -998,7 +813,7 @@ func TestAuthorizedInteractionRecorderRejectsWrongPin(t *testing.T) {
 		t.Fatal(err)
 	}
 	session := interaction.Session{
-		ID:                       "session-wrong-pin",
+		ID:                       "interaction.session_wrong-pin",
 		RecordedAt:               f.clock.Now(),
 		SnapshotID:               shoal.ID(snapshot.ID),
 		SnapshotAsOf:             snapshot.AsOf,
@@ -1020,21 +835,15 @@ func TestAuthorizedInteractionRecorderRejectsWrongPin(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	session.ID = "session-shorter-expiry"
+	session.ID = "interaction.session_wrong-snapshot"
 	session.AuthorizationFingerprint = shoal.ID(fingerprint.String())
-	session.AuthorizationExpiresAt = f.clock.Now().Add(time.Minute)
-	if err := f.clientA.RecordInteraction(ctx, session); err != nil {
-		t.Fatalf("shorter live authorization expiry record = %v", err)
-	}
-	session.ID = "session-wrong-snapshot"
-	session.AuthorizationExpiresAt = decision.AuthenticationExpires()
 	session.SnapshotID = "forged-snapshot"
 	if err := f.clientA.RecordInteraction(
 		ctx, session,
 	); !shoal.IsErrorCode(err, shoal.ErrorConflict) {
 		t.Fatalf("forged snapshot record = %v", err)
 	}
-	session.ID = "session-expired-pin"
+	session.ID = "interaction.session_expired-pin"
 	session.SnapshotID = shoal.ID(snapshot.ID)
 	session.SnapshotAsOf = snapshot.AsOf
 	session.RecordedAt = snapshot.AsOf
@@ -1104,6 +913,71 @@ func TestAuthorizedInteractionAcceptsTrustedHistoricalSnapshot(t *testing.T) {
 	}
 }
 
+func TestAuthorizedNewWriteRechecksSnapshotAfterConcurrentIngest(t *testing.T) {
+	f := newFixture(t)
+	source := explorer.Source{
+		URI:       "file:///snapshot-race.txt",
+		MediaType: explorer.MediaTypeText,
+		Content:   "original evidence",
+	}
+	receipt, err := f.clientA.Ingest(f.admin(t), source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := f.base.Snapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.clock.Set(snapshot.AsOf.Add(time.Second))
+	decision := f.decision(
+		t, "snapshot-race",
+		[][]byte{f.sourceA}, [][]byte{f.policyA},
+		[]auth.Operation{auth.OperationRead, auth.OperationRetrieve},
+	)
+	view, err := f.clientA.Document(
+		f.context(t, decision), receipt.Document.ID, receipt.Revision.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fingerprint, err := auth.AuthorizationFingerprint(decision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := &mutatingInteractionSnapshotBase{Explorer: f.base}
+	base.mutate = func() error {
+		_, mutateErr := f.base.Ingest(context.Background(), explorer.Source{
+			URI:       source.URI,
+			MediaType: source.MediaType,
+			Content:   source.Content,
+			Metadata: shoal.Metadata{
+				interaction.PropertyVisibility: "restricted",
+			},
+		})
+		return mutateErr
+	}
+	client := f.newClient(
+		t, base, f.store, f.sourceA, f.policyA, nil)
+	session := interaction.Session{
+		ID:                       interaction.DerivedID("session", "snapshot-race"),
+		Operation:                interaction.OperationRetrieval,
+		SnapshotID:               shoal.ID(snapshot.ID),
+		SnapshotAsOf:             snapshot.AsOf,
+		AuthorizationFingerprint: shoal.ID(fingerprint.String()),
+		AuthorizationExpiresAt:   decision.AuthenticationExpires(),
+		SeedNodeIDs:              []shoal.ID{firstSpanID(t, view)},
+	}
+	if _, err := client.RecordInteractionResult(
+		f.context(t, decision), session,
+	); !shoal.IsErrorCode(err, shoal.ErrorConflict) {
+		t.Fatalf("stale snapshot write error = %v", err)
+	}
+	if _, err := f.base.InteractionRecord(
+		context.Background(), session.ID,
+	); !shoal.IsErrorCode(err, shoal.ErrorNotFound) {
+		t.Fatalf("stale snapshot write persisted a record: %v", err)
+	}
+}
+
 func TestAuthorizedExactRetryUsesTrustedDurableRecord(t *testing.T) {
 	f := newFixture(t)
 	snapshot, err := f.base.Snapshot(context.Background())
@@ -1122,7 +996,8 @@ func TestAuthorizedExactRetryUsesTrustedDurableRecord(t *testing.T) {
 	}
 	session := interaction.Session{
 		ID:         interaction.DerivedID("session", "authorized-retry"),
-		RecordedAt: f.clock.Now(), Operation: interaction.OperationRetrieval,
+		RecordedAt: snapshot.AsOf.Add(-time.Hour),
+		Operation:  interaction.OperationRetrieval,
 		SnapshotID: shoal.ID(snapshot.ID), SnapshotAsOf: snapshot.AsOf,
 		AuthorizationFingerprint: shoal.ID(fingerprint.String()),
 		AuthorizationExpiresAt:   decision.AuthenticationExpires(),
@@ -1131,6 +1006,9 @@ func TestAuthorizedExactRetryUsesTrustedDurableRecord(t *testing.T) {
 	first, err := f.clientA.RecordInteractionResult(ctx, session)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if !first.RecordedAt.Equal(f.clock.Now()) {
+		t.Fatalf("accepted caller timestamp %v", first.RecordedAt)
 	}
 	selector, err := authorized.NewStaticPolicySelector(f.sourceA, f.policyA)
 	if err != nil {
@@ -1147,6 +1025,8 @@ func TestAuthorizedExactRetryUsesTrustedDurableRecord(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	f.clock.Set(f.clock.Now().Add(time.Second))
+	session.RecordedAt = snapshot.AsOf.Add(24 * time.Hour)
 	retried, err := retryClient.RecordInteractionResult(ctx, session)
 	if err != nil {
 		t.Fatalf("exact durable retry was rejected: %v", err)
@@ -1157,6 +1037,228 @@ func TestAuthorizedExactRetryUsesTrustedDurableRecord(t *testing.T) {
 	if validator.calls != 0 {
 		t.Fatalf("exact retry consulted snapshot validator %d times",
 			validator.calls)
+	}
+}
+
+func TestAuthorizedExactRetryRejectsStricterRequiredVisibility(t *testing.T) {
+	f := newFixture(t)
+	snapshot, err := f.base.Snapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.clock.Set(snapshot.AsOf.Add(time.Second))
+	decision := f.decision(
+		t, "retry-visibility",
+		[][]byte{f.sourceA}, [][]byte{f.policyA},
+		[]auth.Operation{auth.OperationRetrieve},
+	)
+	fingerprint, err := auth.AuthorizationFingerprint(decision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := interaction.Session{
+		ID: interaction.DerivedID(
+			"session", "authorized-retry-visibility"),
+		Operation:                interaction.OperationRetrieval,
+		SnapshotID:               shoal.ID(snapshot.ID),
+		SnapshotAsOf:             snapshot.AsOf,
+		AuthorizationFingerprint: shoal.ID(fingerprint.String()),
+		AuthorizationExpiresAt:   decision.AuthenticationExpires(),
+	}
+	firstContext, err := interaction.WithRequiredVisibility(
+		f.context(t, decision), []string{"restricted"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := f.clientA.RecordInteractionResult(firstContext, session)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	f.clock.Set(f.clock.Now().Add(time.Second))
+	retryContext, err := interaction.WithRequiredVisibility(
+		f.context(t, decision), []string{"restricted", "sensitive"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.clientA.RecordInteractionResult(
+		retryContext, session,
+	); !shoal.IsErrorCode(err, shoal.ErrorConflict) {
+		t.Fatalf("stricter visibility retry error = %v", err)
+	}
+
+	record, err := f.base.InteractionRecord(context.Background(), session.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.Summary.Visibility != "restricted" ||
+		record.Session.ID != first.ID ||
+		!record.Session.RecordedAt.Equal(first.RecordedAt) {
+		t.Fatalf("stricter retry changed durable record: %+v", record)
+	}
+}
+
+func TestAuthorizedResultSinkExactRetryAfterReopen(t *testing.T) {
+	f := newFixture(t)
+	snapshot, err := f.base.Snapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstTime := snapshot.AsOf.Add(time.Second)
+	f.clock.Set(firstTime)
+	decision := f.decision(
+		t, "restart-retry",
+		[][]byte{f.sourceA}, [][]byte{f.policyA},
+		[]auth.Operation{auth.OperationRetrieve},
+	)
+	fingerprint, err := auth.AuthorizationFingerprint(decision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := interaction.Session{
+		ID:                       interaction.DerivedID("session", "authorized-restart-retry"),
+		RecordedAt:               snapshot.AsOf.Add(-time.Hour),
+		Operation:                interaction.OperationRetrieval,
+		SnapshotID:               shoal.ID(snapshot.ID),
+		SnapshotAsOf:             snapshot.AsOf,
+		AuthorizationFingerprint: shoal.ID(fingerprint.String()),
+		AuthorizationExpiresAt:   decision.AuthenticationExpires(),
+	}
+	ctx := f.context(t, decision)
+	recorder, err := interaction.NewRecorder(ctx, f.clientA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := recorder.SetClock(f.clock.Now); err != nil {
+		t.Fatal(err)
+	}
+	first, err := recorder.Record(ctx, session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !first.RecordedAt.Equal(firstTime) {
+		t.Fatalf("first accepted time = %v", first.RecordedAt)
+	}
+	if err := f.base.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := explorer.Open(f.dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = reopened.Close() })
+	retryClient := f.newClient(
+		t, reopened, f.store, f.sourceA, f.policyA, nil)
+	retryRecorder, err := interaction.NewRecorder(ctx, retryClient)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.clock.Set(firstTime.Add(time.Minute))
+	if err := retryRecorder.SetClock(f.clock.Now); err != nil {
+		t.Fatal(err)
+	}
+	session.RecordedAt = firstTime.Add(24 * time.Hour)
+	retried, err := retryRecorder.Record(ctx, session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(retried, first) {
+		t.Fatalf("reopened retry = %+v, want %+v", retried, first)
+	}
+	records, err := reopened.InteractionRecords(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 1 {
+		t.Fatalf("durable record count = %d", len(records))
+	}
+}
+
+func TestAuthorizedResultSinkAdoptsConcurrentRetryWinner(t *testing.T) {
+	f := newFixture(t)
+	snapshot, err := f.base.Snapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstTime := snapshot.AsOf.Add(time.Second)
+	f.clock.Set(firstTime)
+	decision := f.decision(
+		t, "concurrent-retry",
+		[][]byte{f.sourceA}, [][]byte{f.policyA},
+		[]auth.Operation{auth.OperationRetrieve},
+	)
+	fingerprint, err := auth.AuthorizationFingerprint(decision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := interaction.Session{
+		ID:                       interaction.DerivedID("session", "concurrent-retry"),
+		Operation:                interaction.OperationRetrieval,
+		SnapshotID:               shoal.ID(snapshot.ID),
+		SnapshotAsOf:             snapshot.AsOf,
+		AuthorizationFingerprint: shoal.ID(fingerprint.String()),
+		AuthorizationExpiresAt:   decision.AuthenticationExpires(),
+	}
+	ctx := f.context(t, decision)
+	first, err := f.clientA.RecordInteractionResult(ctx, session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.clock.Set(firstTime.Add(time.Minute))
+	base := &hiddenFirstInteractionRecordBase{Explorer: f.base}
+	retryClient := f.newClient(
+		t, base, f.store, f.sourceA, f.policyA, nil)
+	retried, err := retryClient.RecordInteractionResult(ctx, session)
+	if err != nil {
+		t.Fatalf("concurrent durable winner was rejected: %v", err)
+	}
+	if !reflect.DeepEqual(retried, first) {
+		t.Fatalf("concurrent retry = %+v, want %+v", retried, first)
+	}
+}
+
+func TestAuthorizedInteractionMarksPostSinkExpiryCommitted(t *testing.T) {
+	f := newFixture(t)
+	snapshot, err := f.base.Snapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.clock.Set(snapshot.AsOf.Add(time.Second))
+	decision := f.decision(
+		t, "post-sink-expiry",
+		[][]byte{f.sourceA}, [][]byte{f.policyA},
+		[]auth.Operation{auth.OperationRetrieve},
+	)
+	fingerprint, err := auth.AuthorizationFingerprint(decision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := &generationChangingInteractionBase{Explorer: f.base}
+	base.after = func() {
+		f.clock.Set(decision.AuthenticationExpires())
+	}
+	client := f.newClient(
+		t, base, f.store, f.sourceA, f.policyA, nil)
+	session := interaction.Session{
+		ID:                       interaction.DerivedID("session", "post-sink-expiry"),
+		Operation:                interaction.OperationRetrieval,
+		SnapshotID:               shoal.ID(snapshot.ID),
+		SnapshotAsOf:             snapshot.AsOf,
+		AuthorizationFingerprint: shoal.ID(fingerprint.String()),
+		AuthorizationExpiresAt:   decision.AuthenticationExpires(),
+	}
+	recorded, err := client.RecordInteractionResult(
+		f.context(t, decision), session)
+	if !explorer.IsCommittedInteraction(err) ||
+		!shoal.IsErrorCode(err, shoal.ErrorUnauthorized) {
+		t.Fatalf("post-sink expiry error = %v", err)
+	}
+	if recorded.ID != session.ID {
+		t.Fatalf("committed session = %+v", recorded)
+	}
+	if _, err := f.base.InteractionRecord(
+		context.Background(), session.ID); err != nil {
+		t.Fatalf("committed record unavailable: %v", err)
 	}
 }
 
@@ -1198,7 +1300,7 @@ func TestAuthorizedTombstoneSubgraphDoesNotLeakExistence(t *testing.T) {
 		t.Fatal(err)
 	}
 	session := interaction.Session{
-		ID:                       "session-deleted-authorized",
+		ID:                       "interaction.session_deleted-authorized",
 		RecordedAt:               f.clock.Now(),
 		SnapshotID:               shoal.ID(snapshot.ID),
 		SnapshotAsOf:             snapshot.AsOf,
@@ -1315,7 +1417,7 @@ func TestAuthorizedInteractionMarksPostCommitGenerationFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	session := interaction.Session{
-		ID:                       "session-post-commit-generation",
+		ID:                       "interaction.session_post-commit-generation",
 		RecordedAt:               f.clock.Now(),
 		SnapshotID:               shoal.ID(snapshot.ID),
 		SnapshotAsOf:             snapshot.AsOf,
@@ -1357,7 +1459,7 @@ func TestAuthorizedInteractionRejectsForgedSinkResult(t *testing.T) {
 		t.Fatal(err)
 	}
 	session := interaction.Session{
-		ID:                       "session-forged-result",
+		ID:                       "interaction.session_forged-result",
 		RecordedAt:               f.clock.Now(),
 		Operation:                interaction.OperationRetrieval,
 		SnapshotID:               shoal.ID(snapshot.ID),
@@ -1377,65 +1479,6 @@ func TestAuthorizedInteractionRejectsForgedSinkResult(t *testing.T) {
 	}
 	if stored.Actor.SubjectID != decision.Subject() {
 		t.Fatalf("stored actor was forged: %+v", stored.Actor)
-	}
-}
-
-func TestAuthorizedInteractionMarksPostCommitExpiry(t *testing.T) {
-	f := newFixture(t)
-	receipt, err := f.clientA.Ingest(f.admin(t), explorer.Source{
-		URI: "file:///post-commit-expiry.txt", MediaType: explorer.MediaTypeText,
-		Content: "post commit expiry evidence",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	snapshot, err := f.base.Snapshot(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	f.clock.Set(snapshot.AsOf.Add(time.Second))
-	decision := f.decision(
-		t, "expiry-recorder", [][]byte{f.sourceA}, [][]byte{f.policyA},
-		[]auth.Operation{
-			auth.OperationRead, auth.OperationRetrieve, auth.OperationValidate,
-		},
-	)
-	ctx := f.context(t, decision)
-	view, err := f.clientA.Document(
-		ctx, receipt.Document.ID, receipt.Revision.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	fingerprint, err := auth.AuthorizationFingerprint(decision)
-	if err != nil {
-		t.Fatal(err)
-	}
-	base := &generationChangingInteractionBase{
-		Explorer: f.base,
-		after: func() {
-			f.clock.Set(decision.AuthenticationExpires())
-		},
-	}
-	client := f.newClient(
-		t, base, f.store, f.sourceA, f.policyA, nil)
-	recorder, err := interaction.NewRecorder(ctx, client)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := recorder.SetClock(f.clock.Now); err != nil {
-		t.Fatal(err)
-	}
-	session := interaction.Session{
-		ID:         "session-post-commit-expiry",
-		SnapshotID: shoal.ID(snapshot.ID), SnapshotAsOf: snapshot.AsOf,
-		AuthorizationFingerprint: shoal.ID(fingerprint.String()),
-		AuthorizationExpiresAt:   decision.AuthenticationExpires(),
-		SeedNodeIDs:              []shoal.ID{firstSpanID(t, view)},
-	}
-	if _, err := recorder.Record(
-		ctx, session,
-	); !explorer.IsCommittedInteraction(err) {
-		t.Fatalf("post-commit expiry error = %v", err)
 	}
 }
 
@@ -1475,7 +1518,7 @@ func TestAuthorizedInteractionReadsUseBulkAndPointPaths(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, id := range []shoal.ID{"session-bulk-a", "session-bulk-b"} {
+	for _, id := range []shoal.ID{"interaction.session_bulk-a", "interaction.session_bulk-b"} {
 		if err := f.clientA.RecordInteraction(ctx, interaction.Session{
 			ID:                       id,
 			RecordedAt:               f.clock.Now(),
@@ -1504,7 +1547,7 @@ func TestAuthorizedInteractionReadsUseBulkAndPointPaths(t *testing.T) {
 		)
 	}
 	if _, err := client.InteractionSubgraph(
-		ctx, "session-bulk-a",
+		ctx, "interaction.session_bulk-a",
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -1538,7 +1581,7 @@ func TestSourceLessInteractionRequiresOriginalAuthorizationProjection(t *testing
 		t.Fatal(err)
 	}
 	session := interaction.Session{
-		ID:                       "session-source-less",
+		ID:                       "interaction.session_source-less",
 		RecordedAt:               f.clock.Now(),
 		Operation:                interaction.OperationRetrieval,
 		SnapshotID:               shoal.ID(snapshot.ID),
@@ -1618,5 +1661,99 @@ func TestInteractionReadsRequireExplicitTrustedReader(t *testing.T) {
 		f.context(t, decision),
 	); !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
 		t.Fatalf("implicit base interaction writer error = %v", err)
+	}
+}
+
+type syntheticInteractionBase struct {
+	*explorer.Explorer
+	records []explorer.InteractionRecord
+}
+
+func (b *syntheticInteractionBase) InteractionRecords(
+	context.Context,
+) ([]explorer.InteractionRecord, error) {
+	return b.records, nil
+}
+
+type batchBoundedStore struct {
+	authorized.PolicyStore
+	nodeCalls    int
+	largestBatch int
+}
+
+func (s *batchBoundedStore) Nodes(
+	ctx context.Context, ids []shoal.ID,
+) (map[shoal.ID]authorized.NodeRegistration, error) {
+	s.nodeCalls++
+	if len(ids) > s.largestBatch {
+		s.largestBatch = len(ids)
+	}
+	return s.PolicyStore.Nodes(ctx, ids)
+}
+
+// TestAuthorizedInteractionListAuthorizesBoundedBatches pins the read-path
+// bound: interaction provenance is intentionally uncapped per record, so a
+// list must never submit the union of the whole durable history in one
+// policy-store lookup. Authorization is a conjunction, so batching cannot
+// change the fail-closed outcome.
+func TestAuthorizedInteractionListAuthorizesBoundedBatches(t *testing.T) {
+	f := newFixture(t)
+	const (
+		records       = 8
+		nodesPerBatch = 500
+		bound         = 1024
+	)
+	synthetic := make([]explorer.InteractionRecord, 0, records)
+	for record := 0; record < records; record++ {
+		nodeIDs := make([]shoal.ID, 0, nodesPerBatch)
+		for node := 0; node < nodesPerBatch; node++ {
+			nodeIDs = append(nodeIDs, shoal.ID(
+				"unregistered-"+strconv.Itoa(record)+"-"+strconv.Itoa(node)))
+		}
+		synthetic = append(synthetic, explorer.InteractionRecord{
+			Summary: explorer.InteractionSummary{
+				SessionID: shoal.ID(
+					"interaction.session_bounded-" + strconv.Itoa(record)),
+			},
+			TouchedNodeIDs: nodeIDs,
+		})
+	}
+	// One record whose own provenance exceeds the bound proves a single
+	// uncapped record is chunked rather than submitted whole.
+	oversized := make([]shoal.ID, 0, 2*bound)
+	for node := 0; node < 2*bound; node++ {
+		oversized = append(
+			oversized, shoal.ID("unregistered-large-"+strconv.Itoa(node)))
+	}
+	synthetic = append(synthetic, explorer.InteractionRecord{
+		Summary: explorer.InteractionSummary{
+			SessionID: "interaction.session_bounded-large",
+		},
+		TouchedNodeIDs: oversized,
+	})
+	base := &syntheticInteractionBase{Explorer: f.base, records: synthetic}
+	store := &batchBoundedStore{PolicyStore: f.store}
+	client := f.newClient(t, base, store, f.sourceA, f.policyA, nil)
+	decision := f.decision(
+		t,
+		"bounded-reader",
+		[][]byte{f.sourceA},
+		[][]byte{f.policyA},
+		[]auth.Operation{auth.OperationRead},
+	)
+	visible, err := client.InteractionRecords(f.context(t, decision))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(visible) != 0 {
+		t.Fatalf("unregistered provenance was authorized: %d", len(visible))
+	}
+	if store.largestBatch > bound {
+		t.Fatalf("policy lookup batch = %d, want at most %d",
+			store.largestBatch, bound)
+	}
+	if store.nodeCalls < records*nodesPerBatch/bound {
+		t.Fatalf("node lookups = %d, want the list split into batches",
+			store.nodeCalls)
 	}
 }

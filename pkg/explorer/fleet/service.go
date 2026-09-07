@@ -20,10 +20,13 @@ package fleet
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/binary"
+	"hash"
 	"math"
+	"reflect"
 	"time"
 
-	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
@@ -47,16 +50,31 @@ type Service struct {
 }
 
 func NewService(config Config) (*Service, error) {
-	if config.Store == nil || config.Resolver == nil || config.Recorder == nil ||
-		config.Snapshots == nil ||
-		config.Executors == nil || config.Clock == nil {
+	if nilDependency(config.Store) || nilDependency(config.Resolver) ||
+		nilDependency(config.Recorder) || nilDependency(config.Snapshots) ||
+		nilDependency(config.Executors) || config.Clock == nil {
 		return nil, shoal.NewError(shoal.ErrorInvalidArgument, "fleet registry dependencies are required")
 	}
+
 	return &Service{
 		store: config.Store, resolver: config.Resolver, recorder: config.Recorder,
 		snapshots: config.Snapshots,
 		executors: config.Executors, clock: config.Clock,
 	}, nil
+}
+
+func nilDependency(value any) bool {
+	if value == nil {
+		return true
+	}
+	reflected := reflect.ValueOf(value)
+	switch reflected.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map,
+		reflect.Pointer, reflect.Slice:
+		return reflected.IsNil()
+	default:
+		return false
+	}
 }
 
 func (s *Service) Register(ctx context.Context, request RegisterRequest) (Descriptor, error) {
@@ -72,28 +90,45 @@ func (s *Service) Register(ctx context.Context, request RegisterRequest) (Descri
 	if err := shoal.ValidateRequiredID("registration key", request.RegistrationKey); err != nil {
 		return Descriptor{}, err
 	}
+	if err := shoal.ValidateRequiredID("agent ID", request.Spec.ID); err != nil {
+		return Descriptor{}, err
+	}
+	if replay, ok, err := s.registrationReplay(
+		ctx, decision, now, request,
+	); err != nil {
+		return Descriptor{}, err
+	} else if ok {
+		return replay, nil
+	}
 	spec, err := request.Spec.canonical(now)
 	if err != nil {
 		return Descriptor{}, err
 	}
-	if _, ok := s.executors.ResolveExecutor(spec.ExecutorRef); !ok {
-		return Descriptor{}, shoal.NewError(shoal.ErrorInvalidArgument, "executor reference is not registered by the host")
-	}
 	if err := authorizeScopes(decision, auth.OperationAgentRegister, spec.ID,
 		spec.AuthorizationDomain, spec.Scopes, now); err != nil {
 		return Descriptor{}, err
+	}
+	if _, ok := s.executors.ResolveExecutor(spec.ExecutorRef); !ok {
+		return Descriptor{}, shoal.NewError(shoal.ErrorInvalidArgument, "executor reference is not registered by the host")
 	}
 	if spec.ParentID != "" {
 		if err := authorizeScopes(decision, auth.OperationDelegate, spec.ID,
 			spec.AuthorizationDomain, spec.Scopes, now); err != nil {
 			return Descriptor{}, err
 		}
-		parent, err := s.active(ctx, spec.ParentID, now, nil)
+		parentChain, err := s.activeChain(ctx, spec.ParentID, now)
 		if err != nil {
 			return Descriptor{}, err
 		}
-		if parent.Subject != decision.Subject() ||
-			!bytes.Equal(parent.AuthorizationDomain, spec.AuthorizationDomain) ||
+		parent := parentChain[0]
+		if parent.Subject != decision.Subject() {
+			return Descriptor{}, auth.ObjectNotFound()
+		}
+		if len(parentChain) >= MaxDelegationDepth {
+			return Descriptor{}, shoal.NewError(
+				shoal.ErrorInvalidArgument, "agent delegation depth exceeds its bound")
+		}
+		if !bytes.Equal(parent.AuthorizationDomain, spec.AuthorizationDomain) ||
 			!scopesSubset(spec.Scopes, parent.Scopes) ||
 			!capabilitiesSubset(spec.Capabilities, parent.Capabilities) ||
 			spec.LeaseExpiresAt.After(parent.LeaseExpiresAt) {
@@ -111,6 +146,11 @@ func (s *Service) Register(ctx context.Context, request RegisterRequest) (Descri
 		if descriptorExpired(current.Descriptor, now) {
 			return Descriptor{}, auth.ObjectNotFound()
 		}
+		if err := authorizeDescriptor(
+			decision, auth.OperationAgentRegister, current.Descriptor, now,
+		); err != nil {
+			return Descriptor{}, err
+		}
 		if !bytes.Equal(current.Descriptor.AuthorizationDomain, spec.AuthorizationDomain) ||
 			!scopesSubset(spec.Scopes, current.Descriptor.Scopes) ||
 			!capabilitiesSubset(spec.Capabilities, current.Descriptor.Capabilities) {
@@ -127,17 +167,64 @@ func (s *Service) Register(ctx context.Context, request RegisterRequest) (Descri
 		ExecutorRef: spec.ExecutorRef, Capabilities: spec.Capabilities,
 		LeaseExpiresAt: spec.LeaseExpiresAt, UpdatedAt: now.UTC(),
 	}
-	if err := s.record(ctx, decision, request.Context, auth.OperationAgentRegister, descriptor.ID); err != nil {
+	mutation := Mutation{RegistrationKey: request.RegistrationKey,
+		ExpectedGeneration: request.ExpectedGeneration, Descriptor: descriptor}
+	if err := s.record(ctx, decision, request.Context, auth.OperationAgentRegister,
+		descriptor.ID, registryMutationDigest(mutation)); err != nil {
 		return Descriptor{}, err
 	}
-	stored, err := s.store.Apply(ctx, Mutation{
-		RegistrationKey:    request.RegistrationKey,
-		ExpectedGeneration: request.ExpectedGeneration, Descriptor: descriptor,
-	})
+	stored, err := s.store.Apply(ctx, mutation)
 	if err != nil {
 		return Descriptor{}, err
 	}
 	return cloneDescriptor(stored.Descriptor), nil
+}
+
+func (s *Service) registrationReplay(
+	ctx context.Context,
+	decision auth.Decision,
+	now time.Time,
+	request RegisterRequest,
+) (Descriptor, bool, error) {
+	current, err := s.store.Get(ctx, request.Spec.ID)
+	if err != nil {
+		if shoal.IsErrorCode(err, shoal.ErrorNotFound) {
+			return Descriptor{}, false, nil
+		}
+		return Descriptor{}, false, concealStoreRead(err)
+	}
+	keyDigest := sha256.Sum256([]byte(request.RegistrationKey))
+	if current.Descriptor.Generation != request.ExpectedGeneration+1 ||
+		current.RegistrationDigest != keyDigest {
+		return Descriptor{}, false, nil
+	}
+	if current.Descriptor.Subject != decision.Subject() {
+		return Descriptor{}, false, auth.ObjectNotFound()
+	}
+	spec, err := request.Spec.canonical(current.Descriptor.UpdatedAt)
+	if err != nil {
+		return Descriptor{}, false, shoal.NewError(
+			shoal.ErrorConflict, "registration key replay is divergent")
+	}
+	candidate := Descriptor{
+		ID: spec.ID, Generation: request.ExpectedGeneration + 1,
+		Subject: current.Descriptor.Subject, Actor: current.Descriptor.Actor,
+		ParentID: spec.ParentID, AuthorizationDomain: spec.AuthorizationDomain,
+		Scopes: spec.Scopes, ExecutorRef: spec.ExecutorRef,
+		Capabilities: spec.Capabilities, LeaseExpiresAt: spec.LeaseExpiresAt,
+		UpdatedAt: current.Descriptor.UpdatedAt,
+	}
+	if descriptorDigest(candidate) != descriptorDigest(current.Descriptor) {
+		return Descriptor{}, false, shoal.NewError(
+			shoal.ErrorConflict, "registration key replay is divergent")
+	}
+	if err := authorizeScopes(
+		decision, auth.OperationAgentRegister, spec.ID,
+		spec.AuthorizationDomain, spec.Scopes, now,
+	); err != nil {
+		return Descriptor{}, false, err
+	}
+	return cloneDescriptor(current.Descriptor), true, nil
 }
 
 func (s *Service) Heartbeat(ctx context.Context, request HeartbeatRequest) (Descriptor, error) {
@@ -150,23 +237,23 @@ func (s *Service) Heartbeat(ctx context.Context, request HeartbeatRequest) (Desc
 	if err := validateMutationIdentity(request.ID, request.RegistrationKey, request.ExpectedGeneration); err != nil {
 		return Descriptor{}, err
 	}
-	currentDescriptor, err := s.active(ctx, request.ID, now, nil)
+	currentDescriptor, err := s.active(ctx, request.ID, now)
 	if err != nil {
 		return Descriptor{}, concealStoreRead(err)
 	}
 	current := Stored{Descriptor: currentDescriptor}
-	if err := authorizeDescriptor(decision, auth.OperationAgentHeartbeat, current.Descriptor, now); err != nil {
-		return Descriptor{}, err
-	}
 	if current.Descriptor.Subject != decision.Subject() {
 		return Descriptor{}, auth.ObjectNotFound()
+	}
+	if err := authorizeDescriptor(decision, auth.OperationAgentHeartbeat, current.Descriptor, now); err != nil {
+		return Descriptor{}, err
 	}
 	if request.LeaseExpiresAt.Location() != time.UTC || !now.Before(request.LeaseExpiresAt) ||
 		request.LeaseExpiresAt.Sub(now) > MaxLease {
 		return Descriptor{}, shoal.NewError(shoal.ErrorInvalidArgument, "agent lease is outside its bound")
 	}
 	if current.Descriptor.ParentID != "" {
-		parent, err := s.active(ctx, current.Descriptor.ParentID, now, nil)
+		parent, err := s.active(ctx, current.Descriptor.ParentID, now)
 		if err != nil {
 			return Descriptor{}, err
 		}
@@ -179,13 +266,13 @@ func (s *Service) Heartbeat(ctx context.Context, request HeartbeatRequest) (Desc
 	next.Actor = decision.Actor()
 	next.LeaseExpiresAt = request.LeaseExpiresAt
 	next.UpdatedAt = now.UTC()
-	if err := s.record(ctx, decision, request.Context, auth.OperationAgentHeartbeat, request.ID); err != nil {
+	mutation := Mutation{RegistrationKey: request.RegistrationKey,
+		ExpectedGeneration: request.ExpectedGeneration, Descriptor: next}
+	if err := s.record(ctx, decision, request.Context, auth.OperationAgentHeartbeat,
+		request.ID, registryMutationDigest(mutation)); err != nil {
 		return Descriptor{}, err
 	}
-	stored, err := s.store.Apply(ctx, Mutation{
-		RegistrationKey:    request.RegistrationKey,
-		ExpectedGeneration: request.ExpectedGeneration, Descriptor: next,
-	})
+	stored, err := s.store.Apply(ctx, mutation)
 	if err != nil {
 		return Descriptor{}, err
 	}
@@ -206,21 +293,30 @@ func (s *Service) Revoke(ctx context.Context, request RevokeRequest) (Descriptor
 	if err != nil {
 		return Descriptor{}, concealStoreRead(err)
 	}
+	if current.Descriptor.Subject != decision.Subject() {
+		return Descriptor{}, auth.ObjectNotFound()
+	}
 	if err := authorizeDescriptor(decision, auth.OperationAgentRevoke, current.Descriptor, now); err != nil {
 		return Descriptor{}, err
 	}
 	next := cloneDescriptor(current.Descriptor)
-	next.Generation = request.ExpectedGeneration + 1
-	next.Actor = decision.Actor()
-	next.RevokedAt = now.UTC()
-	next.UpdatedAt = now.UTC()
-	if err := s.record(ctx, decision, request.Context, auth.OperationAgentRevoke, request.ID); err != nil {
+	keyDigest := sha256.Sum256([]byte(request.RegistrationKey))
+	replay := current.Descriptor.Generation == request.ExpectedGeneration+1 &&
+		!current.Descriptor.RevokedAt.IsZero() &&
+		current.RegistrationDigest == keyDigest
+	if !replay {
+		next.Generation = request.ExpectedGeneration + 1
+		next.Actor = decision.Actor()
+		next.RevokedAt = now.UTC()
+		next.UpdatedAt = now.UTC()
+	}
+	mutation := Mutation{RegistrationKey: request.RegistrationKey,
+		ExpectedGeneration: request.ExpectedGeneration, Descriptor: next}
+	if err := s.record(ctx, decision, request.Context, auth.OperationAgentRevoke,
+		request.ID, registryMutationDigest(mutation)); err != nil {
 		return Descriptor{}, err
 	}
-	stored, err := s.store.Apply(ctx, Mutation{
-		RegistrationKey:    request.RegistrationKey,
-		ExpectedGeneration: request.ExpectedGeneration, Descriptor: next,
-	})
+	stored, err := s.store.Apply(ctx, mutation)
 	if err != nil {
 		return Descriptor{}, err
 	}
@@ -241,7 +337,8 @@ func (s *Service) Resolve(ctx context.Context, request ResolveRequest) (Resolved
 	if err != nil {
 		return Resolved{}, err
 	}
-	if err := s.record(ctx, decision, request.Context, auth.OperationAgentResolve, request.ID); err != nil {
+	if err := s.record(ctx, decision, request.Context, auth.OperationAgentResolve,
+		request.ID, [sha256.Size]byte{}); err != nil {
 		return Resolved{}, err
 	}
 	executor, ok := s.executors.ResolveExecutor(descriptor.ExecutorRef)
@@ -258,6 +355,14 @@ func (s *Service) List(ctx context.Context, request ListRequest) (ListPage, erro
 	if err != nil {
 		return ListPage{}, err
 	}
+	if request.Limit < 0 || request.Limit > MaxListResults {
+		return ListPage{}, shoal.NewError(
+			shoal.ErrorInvalidArgument, "agent list limit is outside its bound")
+	}
+	limit := request.Limit
+	if limit == 0 {
+		limit = MaxListResults
+	}
 	if _, err := decision.IntersectSourceIDs(auth.OperationAgentResolve,
 		decision.AuthorizationDomain(), request.SourceIDs, now); err != nil {
 		return ListPage{}, err
@@ -266,75 +371,50 @@ func (s *Service) List(ctx context.Context, request ListRequest) (ListPage, erro
 		decision.AuthorizationDomain(), request.PolicyIDs, now); err != nil {
 		return ListPage{}, err
 	}
-	if request.Limit == 0 {
-		request.Limit = DefaultListPageSize
-	}
-	if request.Limit > MaxListPageSize ||
-		len(request.Cursor) > MaxListCursorBytes {
-		return ListPage{}, shoal.NewError(
-			shoal.ErrorInvalidArgument,
-			"fleet list pagination is outside its bound",
-		)
-	}
-	if err := s.record(ctx, decision, request.Context, auth.OperationAgentResolve, "fleet-list"); err != nil {
+	if err := s.record(ctx, decision, request.Context, auth.OperationAgentResolve,
+		"fleet-list", [sha256.Size]byte{}); err != nil {
 		return ListPage{}, err
 	}
-	const scanMultiplier = 8
-	maxScanned := int(request.Limit) * scanMultiplier
-	cursor := request.Cursor
-	result := make([]Descriptor, 0, request.Limit)
-	for scanned, pages := 0, 0; scanned < maxScanned && pages < scanMultiplier; pages++ {
-		pageCursor := cursor
-		pageLimit := min(MaxListPageSize, uint32(maxScanned-scanned))
-		page, err := s.store.ListPage(ctx, cursor, pageLimit)
+	result := ListPage{
+		Descriptors: make([]Descriptor, 0, limit),
+	}
+	cursor := append([]byte(nil), request.Cursor...)
+	var continuation []byte
+	const maxDiscoveryScans = 1024
+	for scanned := 0; scanned < maxDiscoveryScans; scanned++ {
+		stored, err := s.store.List(ctx, cursor, 1)
 		if err != nil {
 			return ListPage{}, err
 		}
-		if len(page.Items) > int(pageLimit) ||
-			(len(page.Items) == 0 && page.NextCursor != "" &&
-				page.NextCursor == pageCursor) {
-			return ListPage{}, shoal.NewError(
-				shoal.ErrorInternal, "fleet store returned an invalid page")
+		if len(stored.Entries) == 0 {
+			return result, nil
 		}
-		for index, item := range page.Items {
-			if item.Cursor == "" || item.Cursor == cursor {
-				return ListPage{}, shoal.NewError(
-					shoal.ErrorInternal,
-					"fleet store returned an invalid item cursor",
-				)
-			}
-			scanned++
-			cursor = item.Cursor
-			descriptor := item.Stored.Descriptor
-			if !matchesFilter(descriptor, request) || descriptorExpired(descriptor, now) {
-				continue
-			}
-			if authorizeDescriptor(decision, auth.OperationAgentResolve, descriptor, now) != nil {
-				continue
-			}
-			if descriptor.ParentID != "" {
-				if _, err := s.authorizedActive(ctx, decision, descriptor.ParentID, now); err != nil {
-					continue
-				}
-			}
-			result = append(result, cloneDescriptor(descriptor))
-			if len(result) == int(request.Limit) {
-				next := ""
-				if index+1 < len(page.Items) || page.NextCursor != "" {
-					next = cursor
-				}
-				return ListPage{
-					Descriptors: result,
-					NextCursor:  next,
-				}, nil
+		item := stored.Entries[0]
+		descriptor := item.Descriptor
+		visible := matchesFilter(descriptor, request) && !descriptorExpired(descriptor, now) &&
+			authorizeDescriptor(decision, auth.OperationAgentResolve, descriptor, now) == nil
+		if visible && descriptor.ParentID != "" {
+			if _, parentErr := s.authorizedActive(
+				ctx, decision, descriptor.ParentID, now,
+			); parentErr != nil {
+				visible = false
 			}
 		}
-		if page.NextCursor == "" {
-			return ListPage{Descriptors: result}, nil
+		if visible {
+			if len(result.Descriptors) == limit {
+				result.Next = continuation
+				return result, nil
+			}
+			result.Descriptors = append(result.Descriptors, cloneDescriptor(descriptor))
+			continuation = append([]byte(nil), stored.Next...)
 		}
-		cursor = page.NextCursor
+		if len(stored.Next) == 0 {
+			return result, nil
+		}
+		cursor = stored.Next
 	}
-	return ListPage{Descriptors: result, NextCursor: cursor}, nil
+	result.Next = append([]byte(nil), cursor...)
+	return result, nil
 }
 
 // ValidateDelivery is the narrow structural adapter consumed by durable event
@@ -429,63 +509,77 @@ func (s *Service) withRequestDeadline(
 }
 
 func (s *Service) authorizedActive(ctx context.Context, decision auth.Decision, id shoal.ID, now time.Time) (Descriptor, error) {
-	descriptor, err := s.active(ctx, id, now, nil)
+	chain, err := s.activeChain(ctx, id, now)
 	if err != nil {
 		return Descriptor{}, err
 	}
-	if err := authorizeDescriptor(decision, auth.OperationAgentResolve, descriptor, now); err != nil {
-		return Descriptor{}, err
+	for _, descriptor := range chain {
+		if err := authorizeDescriptor(
+			decision, auth.OperationAgentResolve, descriptor, now,
+		); err != nil {
+			return Descriptor{}, auth.ObjectNotFound()
+		}
 	}
-	return descriptor, nil
-}
-
-// InteractionSnapshot returns a fresh authoritative corpus snapshot for
-// downstream fleet lifecycle recording.
-func (s *Service) InteractionSnapshot(
-	ctx context.Context,
-) (explorer.Snapshot, error) {
-	if s == nil || s.snapshots == nil {
-		return explorer.Snapshot{}, shoal.NewError(
-			shoal.ErrorUnavailable,
-			"fleet interaction snapshot provider is unavailable",
-		)
-	}
-	return s.snapshots.InteractionSnapshot(ctx)
+	return chain[0], nil
 }
 
 func (s *Service) active(
 	ctx context.Context,
 	id shoal.ID,
 	now time.Time,
-	seen map[shoal.ID]struct{},
 ) (Descriptor, error) {
-	if seen == nil {
-		seen = make(map[shoal.ID]struct{})
-	}
-	if _, exists := seen[id]; exists {
-		return Descriptor{}, auth.ObjectNotFound()
-	}
-	seen[id] = struct{}{}
-	stored, err := s.store.Get(ctx, id)
+	chain, err := s.activeChain(ctx, id, now)
 	if err != nil {
-		return Descriptor{}, concealStoreRead(err)
+		return Descriptor{}, err
 	}
-	descriptor := stored.Descriptor
-	if descriptorExpired(descriptor, now) {
-		return Descriptor{}, auth.ObjectNotFound()
+	return chain[0], nil
+}
+
+func (s *Service) activeChain(
+	ctx context.Context,
+	id shoal.ID,
+	now time.Time,
+) ([]Descriptor, error) {
+	seen := make(map[shoal.ID]struct{}, MaxDelegationDepth)
+	chain := make([]Descriptor, 0, MaxDelegationDepth)
+	currentID := id
+	for len(chain) < MaxDelegationDepth {
+		if _, exists := seen[currentID]; exists {
+			return nil, auth.ObjectNotFound()
+		}
+		seen[currentID] = struct{}{}
+		stored, err := s.store.Get(ctx, currentID)
+		if err != nil {
+			return nil, concealStoreRead(err)
+		}
+		descriptor := stored.Descriptor
+		if descriptorExpired(descriptor, now) {
+			return nil, auth.ObjectNotFound()
+		}
+		chain = append(chain, descriptor)
+		if descriptor.ParentID == "" {
+			if err := validateDelegationChain(chain); err != nil {
+				return nil, err
+			}
+			return chain, nil
+		}
+		currentID = descriptor.ParentID
 	}
-	if descriptor.ParentID != "" {
-		parent, err := s.active(ctx, descriptor.ParentID, now, seen)
-		if err != nil ||
-			descriptor.Subject != parent.Subject ||
+	return nil, auth.ObjectNotFound()
+}
+
+func validateDelegationChain(chain []Descriptor) error {
+	for index := 0; index+1 < len(chain); index++ {
+		descriptor, parent := chain[index], chain[index+1]
+		if descriptor.Subject != parent.Subject ||
 			!bytes.Equal(descriptor.AuthorizationDomain, parent.AuthorizationDomain) ||
 			!scopesSubset(descriptor.Scopes, parent.Scopes) ||
 			!capabilitiesSubset(descriptor.Capabilities, parent.Capabilities) ||
 			descriptor.LeaseExpiresAt.After(parent.LeaseExpiresAt) {
-			return Descriptor{}, auth.ObjectNotFound()
+			return auth.ObjectNotFound()
 		}
 	}
-	return descriptor, nil
+	return nil
 }
 
 func (s *Service) record(
@@ -494,6 +588,7 @@ func (s *Service) record(
 	request RequestContext,
 	operation auth.Operation,
 	id shoal.ID,
+	mutationDigest [sha256.Size]byte,
 ) error {
 	fingerprint, err := auth.AuthorizationFingerprint(decision)
 	if err != nil {
@@ -508,7 +603,8 @@ func (s *Service) record(
 		CorrelationID: decision.CorrelationID(), Subject: decision.Subject(),
 		Actor: decision.Actor(), ClientID: decision.ClientID(),
 		OnBehalfOf: decision.OnBehalfOf(), AgentID: id,
-		ReasonCode: request.ReasonCode, ReasonDetail: request.ReasonDetail,
+		MutationDigest: mutationDigest,
+		ReasonCode:     request.ReasonCode, ReasonDetail: request.ReasonDetail,
 		Deadline:                 request.Deadline.UnixNano(),
 		AuthorizationFingerprint: fingerprint,
 		AuthorizationExpiresAt:   decision.AuthenticationExpires(),
@@ -516,6 +612,51 @@ func (s *Service) record(
 		SnapshotID:               shoal.ID(snapshot.ID),
 		SnapshotAsOf:             snapshot.AsOf.UTC(),
 	})
+}
+
+func registryMutationDigest(mutation Mutation) [sha256.Size]byte {
+	digest := sha256.New()
+	writeRegistryDigestField(digest, []byte("shoal.fleet.registry-mutation.v1"))
+	writeRegistryDigestField(digest, []byte(mutation.RegistrationKey))
+	writeRegistryDigestInt64(digest, mutation.ExpectedGeneration)
+	descriptor := mutation.Descriptor
+	writeRegistryDigestField(digest, []byte(descriptor.ID))
+	writeRegistryDigestInt64(digest, descriptor.Generation)
+	writeRegistryDigestField(digest, []byte(descriptor.Subject))
+	writeRegistryDigestField(digest, []byte(descriptor.Actor))
+	writeRegistryDigestField(digest, []byte(descriptor.ParentID))
+	writeRegistryDigestField(digest, descriptor.AuthorizationDomain)
+	for _, scope := range descriptor.Scopes {
+		writeRegistryDigestField(digest, scope.SourceID)
+		writeRegistryDigestField(digest, scope.PolicyID)
+	}
+	writeRegistryDigestField(digest, []byte(descriptor.ExecutorRef))
+	for _, capability := range descriptor.Capabilities {
+		writeRegistryDigestField(digest, []byte(capability.Name))
+		for _, action := range capability.Actions {
+			writeRegistryDigestField(digest, []byte(action.Name))
+			writeRegistryDigestField(digest, action.InputSchema)
+			writeRegistryDigestField(digest, action.OutputSchema)
+		}
+	}
+	writeRegistryDigestInt64(digest, descriptor.LeaseExpiresAt.UnixNano())
+	writeRegistryDigestInt64(digest, descriptor.RevokedAt.UnixNano())
+	var result [sha256.Size]byte
+	copy(result[:], digest.Sum(nil))
+	return result
+}
+
+func writeRegistryDigestField(digest hash.Hash, value []byte) {
+	var size [8]byte
+	binary.BigEndian.PutUint64(size[:], uint64(len(value)))
+	_, _ = digest.Write(size[:])
+	_, _ = digest.Write(value)
+}
+
+func writeRegistryDigestInt64(digest hash.Hash, value int64) {
+	var encoded [8]byte
+	binary.BigEndian.PutUint64(encoded[:], uint64(value))
+	writeRegistryDigestField(digest, encoded[:])
 }
 
 func authorizeScopes(decision auth.Decision, operation auth.Operation, id shoal.ID, domain []byte, scopes []Scope, now time.Time) error {

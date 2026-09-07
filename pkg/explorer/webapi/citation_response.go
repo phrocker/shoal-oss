@@ -37,12 +37,12 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/interaction"
 	"github.com/phrocker/shoal-oss/pkg/ontology"
 	"github.com/phrocker/shoal-oss/pkg/reasoning"
-	"github.com/phrocker/shoal-oss/pkg/retrieval"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
 const (
 	ontologyRelationshipIDProperty  = "ontology_relationship_id"
+	ontologyAssertionIDProperty     = "ontology.assertion.id"
 	ontologyAssertionOriginProperty = "ontology.assertion.origin"
 
 	// MaxCitationEnvelopeBytes bounds one encoded provider request/response.
@@ -55,42 +55,31 @@ const (
 // response. Custom JSON encoding preserves every opaque ID as unpadded
 // base64url, including IDs containing arbitrary non-UTF-8 bytes.
 type CitationEnvelope struct {
-	Finalized                 bool
-	DurablyRecorded           bool
-	Verification              reasoning.VerificationStatus
-	OutputVisibility          string
-	WorkspaceSettingsID       shoal.ID
-	WorkspaceSettingsRevision uint64
-	OntologyInterpretation    *OntologyInterpretation
-	ID                        shoal.ID
-	SessionID                 shoal.ID
-	RecordedAt                time.Time
-	ContextPackID             shoal.ID
-	ResultID                  shoal.ID
-	PolicyID                  shoal.ID
-	RequestID                 shoal.ID
-	SnapshotID                shoal.ID
-	SnapshotAsOf              time.Time
-	AuthorizationFingerprint  shoal.ID
-	AuthorizationExpiresAt    time.Time
-	EmbeddingSpaceID          shoal.ID
-	EmbeddingSpaceIDs         []shoal.ID
-	GeneratedAt               time.Time
-	EffectiveVisibility       []string
-	RetrievedSourceIDs        []shoal.ID
-	CitedSourceIDs            []shoal.ID
-	Sources                   []CitationSource
-	Evidence                  []CitationEvidence
-	Claims                    []CitationClaim
-	Issues                    []CitationIssue
-
-	recordedSession interaction.Session
+	ID                       shoal.ID
+	SessionID                shoal.ID
+	RecordedAt               time.Time
+	ContextPackID            shoal.ID
+	ResultID                 shoal.ID
+	PolicyID                 shoal.ID
+	RequestID                shoal.ID
+	SnapshotID               shoal.ID
+	SnapshotAsOf             time.Time
+	AuthorizationFingerprint shoal.ID
+	AuthorizationExpiresAt   time.Time
+	EmbeddingSpaces          interaction.EmbeddingSpaceSet
+	GeneratedAt              time.Time
+	EffectiveVisibility      []string
+	RetrievedSourceIDs       []shoal.ID
+	CitedSourceIDs           []shoal.ID
+	Sources                  []CitationSource
+	Evidence                 []CitationEvidence
+	Claims                   []CitationClaim
+	Issues                   []CitationIssue
 }
 
-type OntologyInterpretation struct {
-	Status    string
-	SchemaID  shoal.ID
-	VersionID shoal.ID
+type wireEmbeddingSpaceSet struct {
+	Identities []string `json:"identities"`
+	Digest     string   `json:"digest"`
 }
 
 type CitationSource struct {
@@ -113,7 +102,6 @@ type CitationEvidence struct {
 	FromAddition bool
 	Citation     *document.Citation
 	Quote        string
-	SourceURI    string
 	Path         *graph.Path
 	Assertions   []CitationAssertion
 }
@@ -179,14 +167,12 @@ func NewCitationEnvelope(response reasoning.Response) CitationEnvelope {
 		SnapshotAsOf:             snapshot.AsOf(),
 		AuthorizationFingerprint: authorization.Fingerprint(),
 		AuthorizationExpiresAt:   authorization.ExpiresAt(),
-		EmbeddingSpaceID:         response.EmbeddingSpaceID(),
-		EmbeddingSpaceIDs:        response.EmbeddingSpaceIDs(),
+		EmbeddingSpaces:          response.EmbeddingSpaces(),
 		GeneratedAt:              response.GeneratedAt(),
 		EffectiveVisibility: append(
 			[]string(nil), response.EffectiveOutputVisibility()...),
 		RetrievedSourceIDs: response.RetrievedSourceIDs(),
 		CitedSourceIDs:     response.CitedSourceIDs(),
-		recordedSession:    response.RecordedSession(),
 	}
 	for _, source := range response.Sources() {
 		envelope.Sources = append(envelope.Sources, CitationSource{
@@ -293,40 +279,26 @@ func citationEvidenceValue(value reasoning.Evidence) CitationEvidence {
 }
 
 type wireCitationEnvelope struct {
-	Finalized                 bool                         `json:"finalized"`
-	DurablyRecorded           bool                         `json:"durably_recorded"`
-	Verification              reasoning.VerificationStatus `json:"verification"`
-	OutputVisibility          string                       `json:"output_visibility"`
-	WorkspaceSettingsID       string                       `json:"workspace_settings_id,omitempty"`
-	WorkspaceSettingsRevision uint64                       `json:"workspace_settings_revision,omitempty"`
-	OntologyInterpretation    *wireOntologyInterpretation  `json:"ontology_interpretation"`
-	ID                        string                       `json:"id"`
-	SessionID                 string                       `json:"session_id"`
-	RecordedAt                time.Time                    `json:"recorded_at"`
-	ContextPackID             string                       `json:"context_pack_id"`
-	ResultID                  string                       `json:"result_id"`
-	PolicyID                  string                       `json:"policy_id"`
-	RequestID                 string                       `json:"request_id,omitempty"`
-	SnapshotID                string                       `json:"snapshot_id"`
-	SnapshotAsOf              time.Time                    `json:"snapshot_as_of"`
-	AuthorizationFingerprint  string                       `json:"authorization_fingerprint"`
-	AuthorizationExpiresAt    time.Time                    `json:"authorization_expires_at"`
-	EmbeddingSpaceID          string                       `json:"embedding_space_id,omitempty"`
-	EmbeddingSpaceIDs         []string                     `json:"embedding_space_ids,omitempty"`
-	GeneratedAt               time.Time                    `json:"generated_at"`
-	EffectiveVisibility       []string                     `json:"effective_visibility"`
-	RetrievedSourceIDs        []string                     `json:"retrieved_source_ids"`
-	CitedSourceIDs            []string                     `json:"cited_source_ids"`
-	Sources                   []wireCitationSource         `json:"sources"`
-	Evidence                  []wireCitationEvidence       `json:"evidence"`
-	Claims                    []wireCitationClaim          `json:"claims"`
-	Issues                    []wireCitationIssue          `json:"issues"`
-}
-
-type wireOntologyInterpretation struct {
-	Status    string `json:"status"`
-	SchemaID  string `json:"schema_id,omitempty"`
-	VersionID string `json:"version_id,omitempty"`
+	ID                       string                 `json:"id"`
+	SessionID                string                 `json:"session_id"`
+	RecordedAt               time.Time              `json:"recorded_at"`
+	ContextPackID            string                 `json:"context_pack_id"`
+	ResultID                 string                 `json:"result_id"`
+	PolicyID                 string                 `json:"policy_id"`
+	RequestID                string                 `json:"request_id,omitempty"`
+	SnapshotID               string                 `json:"snapshot_id"`
+	SnapshotAsOf             time.Time              `json:"snapshot_as_of"`
+	AuthorizationFingerprint string                 `json:"authorization_fingerprint"`
+	AuthorizationExpiresAt   time.Time              `json:"authorization_expires_at"`
+	EmbeddingSpaces          *wireEmbeddingSpaceSet `json:"embedding_spaces,omitempty"`
+	GeneratedAt              time.Time              `json:"generated_at"`
+	EffectiveVisibility      []string               `json:"effective_visibility"`
+	RetrievedSourceIDs       []string               `json:"retrieved_source_ids"`
+	CitedSourceIDs           []string               `json:"cited_source_ids"`
+	Sources                  []wireCitationSource   `json:"sources"`
+	Evidence                 []wireCitationEvidence `json:"evidence"`
+	Claims                   []wireCitationClaim    `json:"claims"`
+	Issues                   []wireCitationIssue    `json:"issues"`
 }
 
 type wireCitationSource struct {
@@ -349,7 +321,6 @@ type wireCitationEvidence struct {
 	FromAddition bool                         `json:"from_addition"`
 	Citation     *wireCitation                `json:"citation,omitempty"`
 	Quote        string                       `json:"quote,omitempty"`
-	SourceURI    string                       `json:"source_uri,omitempty"`
 	Path         *wirePath                    `json:"path,omitempty"`
 	Assertions   []wireCitationAssertion      `json:"assertions,omitempty"`
 }
@@ -413,28 +384,22 @@ func (e CitationEnvelope) MarshalJSON() ([]byte, error) {
 		return nil, err
 	}
 	wire := wireCitationEnvelope{
-		Finalized: e.Finalized, DurablyRecorded: e.DurablyRecorded,
-		Verification: e.Verification, OutputVisibility: e.OutputVisibility,
-		WorkspaceSettingsID:       encodeOptionalID(e.WorkspaceSettingsID),
-		WorkspaceSettingsRevision: e.WorkspaceSettingsRevision,
-		ID:                        encodeID(e.ID), SessionID: encodeID(e.SessionID), RecordedAt: e.RecordedAt,
+		ID: encodeID(e.ID), SessionID: encodeID(e.SessionID), RecordedAt: e.RecordedAt,
 		ContextPackID: encodeID(e.ContextPackID), ResultID: encodeID(e.ResultID),
 		PolicyID: encodeID(e.PolicyID), RequestID: encodeOptionalID(e.RequestID),
 		SnapshotID: encodeID(e.SnapshotID), SnapshotAsOf: e.SnapshotAsOf,
 		AuthorizationFingerprint: encodeID(e.AuthorizationFingerprint),
 		AuthorizationExpiresAt:   e.AuthorizationExpiresAt,
-		EmbeddingSpaceID:         encodeOptionalID(e.EmbeddingSpaceID),
-		EmbeddingSpaceIDs:        encodeIDs(e.EmbeddingSpaceIDs),
 		GeneratedAt:              e.GeneratedAt,
 		EffectiveVisibility:      append([]string(nil), e.EffectiveVisibility...),
 		RetrievedSourceIDs:       encodeIDs(e.RetrievedSourceIDs),
 		CitedSourceIDs:           encodeIDs(e.CitedSourceIDs),
 	}
-	if e.OntologyInterpretation != nil {
-		wire.OntologyInterpretation = &wireOntologyInterpretation{
-			Status:    e.OntologyInterpretation.Status,
-			SchemaID:  encodeOptionalID(e.OntologyInterpretation.SchemaID),
-			VersionID: encodeOptionalID(e.OntologyInterpretation.VersionID),
+	if len(e.EmbeddingSpaces.Identities) > 0 {
+		wire.EmbeddingSpaces = &wireEmbeddingSpaceSet{
+			Identities: append(
+				[]string(nil), e.EmbeddingSpaces.Identities...),
+			Digest: e.EmbeddingSpaces.Digest,
 		}
 	}
 	for _, source := range e.Sources {
@@ -508,7 +473,6 @@ func wireCitationEvidenceValue(
 		SpanID:       encodeOptionalID(value.SpanID),
 		Visibility:   append([]string(nil), value.Visibility...),
 		FromAddition: value.FromAddition, Quote: value.Quote,
-		SourceURI: value.SourceURI,
 	}
 	if value.Citation != nil {
 		citation := wireCitationValue(*value.Citation)
@@ -555,27 +519,6 @@ func citationEnvelopeValue(
 ) (CitationEnvelope, error) {
 	var result CitationEnvelope
 	var err error
-	result.Finalized = wire.Finalized
-	result.DurablyRecorded = wire.DurablyRecorded
-	result.Verification = wire.Verification
-	result.OutputVisibility = wire.OutputVisibility
-	result.WorkspaceSettingsRevision = wire.WorkspaceSettingsRevision
-	result.WorkspaceSettingsID, err = decodeOptionalID(wire.WorkspaceSettingsID)
-	if err != nil {
-		return CitationEnvelope{}, fmt.Errorf("workspace_settings_id: %w", err)
-	}
-	if wire.OntologyInterpretation != nil {
-		interpretation := &OntologyInterpretation{Status: wire.OntologyInterpretation.Status}
-		interpretation.SchemaID, err = decodeOptionalID(wire.OntologyInterpretation.SchemaID)
-		if err != nil {
-			return CitationEnvelope{}, fmt.Errorf("ontology_interpretation.schema_id: %w", err)
-		}
-		interpretation.VersionID, err = decodeOptionalID(wire.OntologyInterpretation.VersionID)
-		if err != nil {
-			return CitationEnvelope{}, fmt.Errorf("ontology_interpretation.version_id: %w", err)
-		}
-		result.OntologyInterpretation = interpretation
-	}
 	for name, source := range map[string]string{
 		"id": wire.ID, "session_id": wire.SessionID,
 		"context_pack_id": wire.ContextPackID, "result_id": wire.ResultID,
@@ -607,13 +550,18 @@ func citationEnvelopeValue(
 	if err != nil {
 		return CitationEnvelope{}, fmt.Errorf("request_id: %w", err)
 	}
-	result.EmbeddingSpaceID, err = decodeOptionalCitationID(wire.EmbeddingSpaceID)
-	if err != nil {
-		return CitationEnvelope{}, fmt.Errorf("embedding_space_id: %w", err)
-	}
-	result.EmbeddingSpaceIDs, err = decodeCitationIDs(wire.EmbeddingSpaceIDs)
-	if err != nil {
-		return CitationEnvelope{}, fmt.Errorf("embedding_space_ids: %w", err)
+	if wire.EmbeddingSpaces != nil {
+		result.EmbeddingSpaces, err = interaction.NewEmbeddingSpaceSet(
+			wire.EmbeddingSpaces.Identities)
+		if err != nil {
+			return CitationEnvelope{}, fmt.Errorf("embedding_spaces: %w", err)
+		}
+		if result.EmbeddingSpaces.Digest != wire.EmbeddingSpaces.Digest {
+			return CitationEnvelope{}, shoal.NewError(
+				shoal.ErrorInvalidArgument,
+				"embedding_spaces digest is not canonical",
+			)
+		}
 	}
 	result.RecordedAt = wire.RecordedAt
 	result.SnapshotAsOf = wire.SnapshotAsOf
@@ -772,7 +720,6 @@ func citationEvidenceFromWire(
 		SectionID: sectionID, SpanID: spanID,
 		Visibility:   append([]string(nil), wire.Visibility...),
 		FromAddition: wire.FromAddition, Quote: wire.Quote,
-		SourceURI: wire.SourceURI,
 	}
 	if wire.Citation != nil {
 		citation, err := citationValueStrict(*wire.Citation)
@@ -1025,33 +972,8 @@ func (e CitationEnvelope) Validate() error {
 		"citation request ID", e.RequestID); err != nil {
 		return err
 	}
-	if err := shoal.ValidateOptionalID(
-		"citation embedding space ID", e.EmbeddingSpaceID); err != nil {
+	if err := e.EmbeddingSpaces.Validate(); err != nil {
 		return err
-	}
-	if e.EmbeddingSpaceID == "" && len(e.EmbeddingSpaceIDs) > 0 {
-		return shoal.NewError(shoal.ErrorInvalidArgument,
-			"citation embedding space constituents require an aggregate ID")
-	}
-	for index, id := range e.EmbeddingSpaceIDs {
-		if err := shoal.ValidateRequiredID(
-			"citation embedding space constituent ID", id); err != nil {
-			return err
-		}
-		if index > 0 && shoal.CompareID(e.EmbeddingSpaceIDs[index-1], id) >= 0 {
-			return shoal.NewError(shoal.ErrorInvalidArgument,
-				"citation embedding space constituents are not canonical")
-		}
-	}
-	if len(e.EmbeddingSpaceIDs) > 0 {
-		expected, err := retrieval.EmbeddingSpaceSetID(e.EmbeddingSpaceIDs...)
-		if err != nil {
-			return err
-		}
-		if expected != e.EmbeddingSpaceID {
-			return shoal.NewError(shoal.ErrorInvalidArgument,
-				"citation embedding space set identity is not canonical")
-		}
 	}
 	for name, value := range map[string]time.Time{
 		"citation recorded time":        e.RecordedAt,
@@ -1562,10 +1484,8 @@ func citationResponseIdentity(e CitationEnvelope) reasoning.ResponseIdentity {
 		SnapshotID: e.SnapshotID, SnapshotAsOf: e.SnapshotAsOf,
 		AuthorizationFingerprint: e.AuthorizationFingerprint,
 		AuthorizationExpiresAt:   e.AuthorizationExpiresAt,
-		EmbeddingSpaceID:         e.EmbeddingSpaceID,
-		EmbeddingSpaceIDs: append(
-			[]shoal.ID(nil), e.EmbeddingSpaceIDs...),
-		GeneratedAt: e.GeneratedAt,
+		EmbeddingSpaces:          e.EmbeddingSpaces,
+		GeneratedAt:              e.GeneratedAt,
 		EffectiveVisibility: append(
 			[]string(nil), e.EffectiveVisibility...),
 		RetrievedSourceIDs: append(
@@ -1638,7 +1558,7 @@ func citationInteractionReference(
 	}
 	if evidence.Path != nil {
 		reference.Kind = interaction.EvidenceGraph
-		reference.NodeIDs = reference.NodeIDs[:0]
+		reference.NodeIDs = nil
 		for _, node := range evidence.Path.Nodes {
 			reference.NodeIDs = append(reference.NodeIDs, node.ID)
 		}
@@ -1665,7 +1585,16 @@ func citationInferenceAnchor(
 		return inference.NewDocumentAnchor(
 			*evidence.Citation, evidence.Quote)
 	case reasoning.EvidenceDerived:
-		return inference.NewGraphAnchor(*evidence.Path)
+		assertions := make(
+			[]interaction.AssertionReference, len(evidence.Assertions))
+		for index, assertion := range evidence.Assertions {
+			assertions[index] = interaction.AssertionReference{
+				AssertionID: assertion.AssertionID,
+				EdgeID:      assertion.EdgeID, Origin: assertion.Origin,
+			}
+		}
+		return inference.NewGraphAnchorWithAssertions(
+			*evidence.Path, assertions)
 	default:
 		return inference.EvidenceAnchor{}, shoal.NewError(
 			shoal.ErrorInvalidArgument, "citation evidence use is invalid")
@@ -1785,7 +1714,16 @@ func validateCitationEvidence(evidence CitationEvidence) error {
 				shoal.ErrorInvalidArgument,
 				"derived evidence sources do not match path nodes")
 		}
-		anchor, err := inference.NewGraphAnchor(*evidence.Path)
+		assertions := make(
+			[]interaction.AssertionReference, len(evidence.Assertions))
+		for index, assertion := range evidence.Assertions {
+			assertions[index] = interaction.AssertionReference{
+				AssertionID: assertion.AssertionID,
+				EdgeID:      assertion.EdgeID, Origin: assertion.Origin,
+			}
+		}
+		anchor, err := inference.NewGraphAnchorWithAssertions(
+			*evidence.Path, assertions)
 		if err != nil {
 			return err
 		}
@@ -1803,9 +1741,21 @@ func validateCitationEvidence(evidence CitationEvidence) error {
 		return shoal.NewError(
 			shoal.ErrorInvalidArgument, "citation evidence origin is invalid")
 	}
-	seenAssertions := make(map[shoal.ID]struct{}, len(evidence.Assertions))
+	type assertionKey struct {
+		assertionID shoal.ID
+		edgeID      shoal.ID
+	}
+	seenAssertions := make(
+		map[assertionKey]struct{}, len(evidence.Assertions))
 	assertionsByEdge := make(
-		map[shoal.ID]CitationAssertion, len(evidence.Assertions))
+		map[shoal.ID][]CitationAssertion, len(evidence.Assertions))
+	pathEdges := make(map[shoal.ID]struct{})
+	if evidence.Path != nil {
+		pathEdges = make(map[shoal.ID]struct{}, len(evidence.Path.Edges))
+		for _, edge := range evidence.Path.Edges {
+			pathEdges[edge.ID] = struct{}{}
+		}
+	}
 	derivedPath := false
 	for _, assertion := range evidence.Assertions {
 		if err := shoal.ValidateRequiredID(
@@ -1816,20 +1766,19 @@ func validateCitationEvidence(evidence CitationEvidence) error {
 			"citation assertion edge ID", assertion.EdgeID); err != nil {
 			return err
 		}
-		if _, duplicate := seenAssertions[assertion.AssertionID]; duplicate {
+		key := assertionKey{
+			assertionID: assertion.AssertionID,
+			edgeID:      assertion.EdgeID,
+		}
+		if _, duplicate := seenAssertions[key]; duplicate {
 			return shoal.NewError(
 				shoal.ErrorInvalidArgument,
 				"citation evidence contains duplicate assertions")
 		}
-		seenAssertions[assertion.AssertionID] = struct{}{}
-		if _, duplicate := assertionsByEdge[assertion.EdgeID]; duplicate {
-			return shoal.NewError(
-				shoal.ErrorInvalidArgument,
-				"citation evidence contains multiple assertions for one edge")
-		}
-		assertionsByEdge[assertion.EdgeID] = assertion
-		if evidence.Path == nil ||
-			!pathContainsEdge(*evidence.Path, assertion.EdgeID) {
+		seenAssertions[key] = struct{}{}
+		assertionsByEdge[assertion.EdgeID] = append(
+			assertionsByEdge[assertion.EdgeID], assertion)
+		if _, ok := pathEdges[assertion.EdgeID]; !ok {
 			return shoal.NewError(
 				shoal.ErrorInvalidArgument,
 				"citation assertion does not match a path edge")
@@ -1866,20 +1815,34 @@ func validateCitationEvidence(evidence CitationEvidence) error {
 					string(ontology.AssertionDerived) {
 				derivedPath = true
 			}
-			assertion, hasAssertion := assertionsByEdge[edge.ID]
+			assertions := assertionsByEdge[edge.ID]
+			hasAssertion := len(assertions) > 0
 			hasAssertionMarker :=
 				edge.Properties[ontologyRelationshipIDProperty] != "" ||
+					edge.Properties[ontologyAssertionIDProperty] != "" ||
 					edge.Properties[ontologyAssertionOriginProperty] != ""
 			if hasAssertionMarker && !hasAssertion {
 				return shoal.NewError(
 					shoal.ErrorInvalidArgument,
 					"graph path edge is missing its assertion reference")
 			}
-			if origin := edge.Properties[ontologyAssertionOriginProperty]; hasAssertion && origin != "" &&
-				origin != string(assertion.Origin) {
-				return shoal.NewError(
-					shoal.ErrorInvalidArgument,
-					"graph path assertion origin does not match its edge")
+			if origin := edge.Properties[ontologyAssertionOriginProperty]; hasAssertion && origin != "" {
+				for _, assertion := range assertions {
+					if origin != string(assertion.Origin) {
+						return shoal.NewError(
+							shoal.ErrorInvalidArgument,
+							"graph path assertion origin does not match its edge")
+					}
+				}
+			}
+			if assertionID := edge.Properties[ontologyAssertionIDProperty]; hasAssertion && assertionID != "" {
+				for _, assertion := range assertions {
+					if shoal.ID(assertionID) != assertion.AssertionID {
+						return shoal.NewError(
+							shoal.ErrorInvalidArgument,
+							"graph path assertion ID does not match its edge")
+					}
+				}
 			}
 		}
 		expectedOrigin := reasoning.OriginSource
@@ -1931,11 +1894,7 @@ func validateCitationEvidenceVisibility(
 	if err != nil {
 		return err
 	}
-	matches := equalCitationStrings(evidence.Visibility, required)
-	if evidence.Path == nil {
-		matches = visibilityCovers(required, evidence.Visibility)
-	}
-	if !matches {
+	if !equalCitationStrings(evidence.Visibility, required) {
 		return shoal.NewError(
 			shoal.ErrorInvalidArgument,
 			"citation evidence visibility does not match its sources")
@@ -2231,15 +2190,6 @@ func visibilityCovers(actual, required []string) bool {
 func containsWireID(values []shoal.ID, target shoal.ID) bool {
 	for _, value := range values {
 		if value == target {
-			return true
-		}
-	}
-	return false
-}
-
-func pathContainsEdge(path graph.Path, id shoal.ID) bool {
-	for _, edge := range path.Edges {
-		if edge.ID == id {
 			return true
 		}
 	}

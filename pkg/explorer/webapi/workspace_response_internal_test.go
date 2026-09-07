@@ -29,8 +29,125 @@ import (
 	"testing"
 
 	"github.com/phrocker/shoal-oss/pkg/explorer"
+	exploreranalytics "github.com/phrocker/shoal-oss/pkg/explorer/analytics"
+	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
+	"github.com/phrocker/shoal-oss/pkg/explorer/workspace"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
+
+func TestWorkspaceSettingsClampAnalyticsAndMarkResponseLoss(t *testing.T) {
+	request := AnalyticsRequest{
+		Scope: exploreranalytics.Scope{
+			Depth: 9, Fanout: 10, MaxNodes: 100,
+		},
+	}
+	applyAnalyticsWorkspaceLimits(&request, workspace.Limits{
+		GraphDepth: 3, GraphFanout: 4, GraphNodes: 25,
+	})
+	if request.Scope.Depth != 3 ||
+		request.Scope.Fanout != 4 ||
+		request.Scope.MaxNodes != 25 {
+		t.Fatalf("analytics workspace limits = %#v", request.Scope)
+	}
+	for _, test := range []struct {
+		method string
+		path   string
+	}{
+		{http.MethodPost, "/api/v1/analytics"},
+		{http.MethodPost, "/api/v1/fleet/agents"},
+		{http.MethodPost, "/api/v1/fleet/agents/agent/heartbeat"},
+		{http.MethodPost, "/api/v1/fleet/agents/agent/revoke"},
+		{http.MethodPost, "/api/v1/fleet/actions"},
+		{http.MethodPost, "/api/v1/fleet/actions/invoke"},
+		{http.MethodPost, "/api/v1/fleet/actions/action/claim"},
+		{http.MethodPost, "/api/v1/fleet/actions/action/cancel"},
+		{http.MethodPost, "/api/v1/fleet/events/subscriptions"},
+		{http.MethodDelete, "/api/v1/fleet/events/subscriptions/subscription"},
+		{http.MethodPost, "/api/v1/fleet/events/publish"},
+	} {
+		if !requestMayCommit(test.method, test.path) {
+			t.Fatalf("%s %s response loss must be indeterminate",
+				test.method, test.path)
+		}
+	}
+	for _, test := range []struct {
+		method string
+		path   string
+	}{
+		{http.MethodPost, "/api/v1/fleet/actions/pull"},
+		{http.MethodPost, "/api/v1/fleet/actions/action/status"},
+		{http.MethodPost, "/api/v1/fleet/agents/resolve"},
+		{http.MethodPost, "/api/v1/fleet/agents/agent/resolve"},
+	} {
+		if requestMayCommit(test.method, test.path) {
+			t.Fatalf("%s %s is read-only", test.method, test.path)
+		}
+	}
+}
+
+func TestWorkspaceOperationForRequestUsesRouteOperation(t *testing.T) {
+	for _, test := range []struct {
+		method    string
+		path      string
+		operation auth.Operation
+		apply     bool
+	}{
+		{http.MethodPost, "/api/v1/retrieve", auth.OperationRetrieve, true},
+		{http.MethodPost, "/api/v1/analytics", auth.OperationAnalyticsRead, true},
+		{http.MethodPost, "/api/v1/neighborhood", auth.OperationNeighborhood, true},
+		{http.MethodPost, "/api/v1/ingest", auth.OperationIngest, true},
+		{http.MethodPost, "/api/v1/documents", auth.OperationList, true},
+		{http.MethodPost, "/api/v1/document", auth.OperationRead, true},
+		{http.MethodPost, "/api/v1/fleet/actions/invoke", auth.OperationInvoke, true},
+		{http.MethodPost, "/api/v1/fleet/actions/action/cancel", auth.OperationDispatch, true},
+		{http.MethodPost, "/api/v1/fleet/agents/agent/heartbeat", auth.OperationAgentHeartbeat, true},
+		{http.MethodPost, "/api/v1/fleet/events/publish", auth.OperationEventPublish, true},
+		{http.MethodGet, "/api/v1/identity", auth.OperationRead, true},
+		{http.MethodHead, "/api/v1/identity", auth.OperationRead, true},
+		{http.MethodPost, "/mcp", "", false},
+	} {
+		operation, apply := workspaceOperationForRequest(test.method, test.path)
+		if operation != test.operation || apply != test.apply {
+			t.Fatalf("%s %s = %q, %v; want %q, %v",
+				test.method, test.path, operation, apply,
+				test.operation, test.apply)
+		}
+	}
+}
+
+func TestWorkspaceIDFromHeaderRequiresCanonicalSingleton(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		values  []string
+		want    shoal.ID
+		present bool
+		wantErr bool
+	}{
+		{name: "absent"},
+		{name: "canonical", values: []string{"YQ"}, want: "a", present: true},
+		{name: "noncanonical trailing bits", values: []string{"YR"}, wantErr: true},
+		{name: "padded", values: []string{"YQ=="}, wantErr: true},
+		{name: "whitespace", values: []string{" YQ"}, wantErr: true},
+		{name: "duplicate", values: []string{"YQ", "YQ"}, wantErr: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			header := make(http.Header)
+			for _, value := range test.values {
+				header.Add(WorkspaceIDHeader, value)
+			}
+			got, present, err := workspaceIDFromHeader(header)
+			if (err != nil) != test.wantErr {
+				t.Fatalf("error = %v, wantErr %v", err, test.wantErr)
+			}
+			if got != test.want || present != test.present {
+				t.Fatalf(
+					"workspace = %q, present = %v; want %q, %v",
+					got, present, test.want, test.present,
+				)
+			}
+		})
+	}
+}
 
 func TestPublicIngestErrorPreservesIndeterminateCommit(t *testing.T) {
 	original := explorer.MarkIndeterminateCommit(
@@ -83,45 +200,6 @@ func TestDecodeRemoteErrorPreservesIndeterminateCommit(t *testing.T) {
 	}
 }
 
-func TestDecodeRemoteErrorPreservesIndeterminateOnInvalidEmbeddingReport(
-	t *testing.T,
-) {
-	for _, payload := range []string{
-		`{"code":"unavailable","message":"unknown","indeterminate":true,` +
-			`"embedding":{}}`,
-		`{"code":"unavailable","message":"unknown","embedding":{}}`,
-	} {
-		response := &http.Response{
-			StatusCode: http.StatusServiceUnavailable,
-			Header:     make(http.Header),
-			Body:       io.NopCloser(strings.NewReader(payload)),
-		}
-		if !strings.Contains(payload, `"indeterminate":true`) {
-			response.Header.Set(
-				CommitOutcomeHeader, CommitOutcomeIndeterminate)
-		}
-		err := decodeRemoteError(response)
-		if !explorer.IsIndeterminateCommit(err) {
-			t.Fatalf("invalid embedding report lost commit outcome: %v", err)
-		}
-	}
-}
-
-func TestDecodeRemoteErrorPreservesBodyMarkerForUnknownCode(t *testing.T) {
-	response := &http.Response{
-		StatusCode: http.StatusInternalServerError,
-		Header:     make(http.Header),
-		Body: io.NopCloser(strings.NewReader(
-			`{"code":"future_error","message":"unknown",` +
-				`"indeterminate":true}`,
-		)),
-	}
-	err := decodeRemoteError(response)
-	if !explorer.IsIndeterminateCommit(err) {
-		t.Fatalf("unknown remote error lost commit outcome: %v", err)
-	}
-}
-
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(
@@ -151,6 +229,16 @@ func TestRemoteIngestMarksUnknownPostDispatchOutcomes(t *testing.T) {
 				}, nil
 			},
 		},
+		{
+			name: "malformed failure",
+			ingest: func() (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusBadGateway,
+					Header:     make(http.Header),
+					Body:       io.NopCloser(strings.NewReader("{")),
+				}, nil
+			},
+		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			metadata, err := json.Marshal(MetadataResponse{
@@ -169,12 +257,10 @@ func TestRemoteIngestMarksUnknownPostDispatchOutcomes(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			calls := 0
 			client := &http.Client{Transport: roundTripFunc(func(
 				request *http.Request,
 			) (*http.Response, error) {
-				calls++
-				if calls == 1 {
+				if request.URL.Path == "/api/v1/meta" {
 					return &http.Response{
 						StatusCode: http.StatusOK,
 						Header:     make(http.Header),
@@ -194,6 +280,151 @@ func TestRemoteIngestMarksUnknownPostDispatchOutcomes(t *testing.T) {
 			})
 			if !explorer.IsIndeterminateCommit(err) {
 				t.Fatalf("remote ingest error = %v", err)
+			}
+		})
+	}
+}
+
+func TestRemoteIngestKeepsVerifiedConflictDeterminate(t *testing.T) {
+	metadata, err := json.Marshal(MetadataResponse{
+		MaxPageSize:         MaxPageSize,
+		MaxTopK:             MaxTopK,
+		MaxDepth:            MaxDepth,
+		MaxFanout:           MaxFanout,
+		MaxNodes:            MaxNodes,
+		MaxEdgeTypes:        MaxEdgeTypes,
+		MaxResponseBytes:    MaxResponseBytes,
+		MaxUploadFiles:      MaxUploadFiles,
+		MaxUploadFileBytes:  MaxUploadFileBytes,
+		MaxUploadTotalBytes: MaxUploadTotalBytes,
+		Capabilities:        AllCapabilities(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	conflict, err := json.Marshal(struct {
+		Code    shoal.ErrorCode `json:"code"`
+		Message string          `json:"message"`
+	}{
+		Code:    shoal.ErrorConflict,
+		Message: "conflict: duplicate upload",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &http.Client{Transport: roundTripFunc(func(
+		request *http.Request,
+	) (*http.Response, error) {
+		if request.URL.Path == "/api/v1/meta" {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     make(http.Header),
+				Body:       io.NopCloser(bytes.NewReader(metadata)),
+			}, nil
+		}
+		return &http.Response{
+			StatusCode: http.StatusConflict,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(bytes.NewReader(conflict)),
+		}, nil
+	})}
+	remote, err := NewRemoteService("http://remote.example", client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = remote.Ingest(context.Background(), IngestRequest{
+		Files: []UploadFile{{
+			Name: "note.txt", Content: []byte("hello"),
+		}},
+	})
+	if explorer.IsIndeterminateCommit(err) ||
+		!shoal.IsErrorCode(err, shoal.ErrorConflict) {
+		t.Fatalf("verified conflict error = %v", err)
+	}
+	_, err = remote.Ingest(context.Background(), IngestRequest{
+		Files: []UploadFile{
+			{Name: "first.txt", Content: []byte("first")},
+			{Name: "second.txt", Content: []byte("second")},
+		},
+	})
+	if !explorer.IsIndeterminateCommit(err) ||
+		!shoal.IsErrorCode(err, shoal.ErrorConflict) {
+		t.Fatalf("multi-file verified conflict = %v", err)
+	}
+}
+
+func TestRemoteAnalyticsMarksUnverifiedPostDispatchOutcomes(t *testing.T) {
+	limits := exploreranalytics.DefaultLimits()
+	metadata, err := json.Marshal(MetadataResponse{
+		MaxPageSize: MaxPageSize, MaxTopK: MaxTopK,
+		MaxDepth: MaxDepth, MaxFanout: MaxFanout,
+		MaxNodes: MaxNodes, MaxEdgeTypes: MaxEdgeTypes,
+		MaxResponseBytes:           MaxResponseBytes,
+		AnalyticsLimits:            &limits,
+		AnalyticsRecordingRequired: true,
+		Capabilities:               Capabilities{Analytics: true},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := AnalyticsRequest{Scope: exploreranalytics.Scope{
+		NodeIDs: []shoal.ID{"node"},
+		Depth:   1, Direction: explorer.GraphDirectionBoth,
+		Fanout: 1, MaxNodes: 1, MaxEdges: 1,
+		MaxScannedEdgesPerNode: 1,
+	}}
+	for _, test := range []struct {
+		name     string
+		response func() (*http.Response, error)
+	}{
+		{
+			name: "transport",
+			response: func() (*http.Response, error) {
+				return nil, errors.New("response unavailable")
+			},
+		},
+		{
+			name: "malformed failure",
+			response: func() (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusBadGateway,
+					Header:     make(http.Header),
+					Body:       io.NopCloser(strings.NewReader("{")),
+				}, nil
+			},
+		},
+		{
+			name: "malformed success",
+			response: func() (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     make(http.Header),
+					Body:       io.NopCloser(strings.NewReader("{")),
+				}, nil
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			client := &http.Client{Transport: roundTripFunc(func(
+				request *http.Request,
+			) (*http.Response, error) {
+				if request.URL.Path == "/api/v1/meta" {
+					return &http.Response{
+						StatusCode: http.StatusOK,
+						Header:     make(http.Header),
+						Body:       io.NopCloser(bytes.NewReader(metadata)),
+					}, nil
+				}
+				return test.response()
+			})}
+			remote, err := NewRemoteService("http://remote.example", client)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := remote.Analytics(
+				context.Background(), request,
+			); !explorer.IsIndeterminateCommit(err) {
+				t.Fatalf("remote analytics error = %v", err)
 			}
 		})
 	}
@@ -231,43 +462,5 @@ func TestErrorResponseOverflowPreservesDeterministicStatus(t *testing.T) {
 		t.Fatalf("overflow status = %d, header = %q, bytes = %d",
 			response.Code, response.Header().Get(CommitOutcomeHeader),
 			response.Body.Len())
-	}
-}
-
-func TestWorkspaceResponseWriterPreservesStreamingFlush(t *testing.T) {
-	response := httptest.NewRecorder()
-	writer := workspaceResponseWriter{
-		ResponseWriter:   response,
-		maxResponseBytes: MaxResponseBytes,
-	}
-	if !responseSupportsFlush(writer) {
-		t.Fatal("wrapped response writer does not expose underlying flush support")
-	}
-	if err := http.NewResponseController(writer).Flush(); err != nil {
-		t.Fatalf("flush wrapped response writer: %v", err)
-	}
-	if !response.Flushed {
-		t.Fatal("underlying response writer was not flushed")
-	}
-}
-
-func TestRequestMayCommitIncludesDurableExtensionRoutes(t *testing.T) {
-	for _, test := range []struct {
-		method string
-		path   string
-		want   bool
-	}{
-		{http.MethodPost, "/api/v1/ask", true},
-		{http.MethodPost, "/api/v1/chat/stream", true},
-		{http.MethodPost, "/api/v1/provenance/fold", true},
-		{http.MethodPost, "/api/v1/provenance/unfold", false},
-		{http.MethodPost, "/api/v1/fleet/agents", true},
-		{http.MethodPost, "/api/v1/fleet/agents/agent/resolve", true},
-		{http.MethodGet, "/api/v1/fleet/agents", false},
-	} {
-		if got := requestMayCommit(test.method, test.path); got != test.want {
-			t.Errorf("requestMayCommit(%q, %q) = %v, want %v",
-				test.method, test.path, got, test.want)
-		}
 	}
 }

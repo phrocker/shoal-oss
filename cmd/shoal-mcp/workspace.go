@@ -48,24 +48,26 @@ func buildApplication(
 	if err != nil {
 		return nil, err
 	}
-	setupDecision, err := identity.Decision(ctx)
-	if err != nil {
-		return nil, errors.Join(err, closeWorkspace())
-	}
-	setupContext, err := authority.Binder().Bind(ctx, setupDecision)
-	if err != nil {
-		return nil, errors.Join(err, closeWorkspace())
-	}
-	recorder, err := interaction.NewRecorder(setupContext, client)
-	if err != nil {
-		return nil, errors.Join(err, closeWorkspace())
+	var optionalTools []mcp.OptionalToolProvider
+	if identityAllows(config.identity, auth.OperationAnalyticsRead) {
+		limits, available := service.AnalyticsLimits()
+		if !available {
+			return nil, errors.Join(
+				fmt.Errorf("analytics was authorized but its provider is unavailable"),
+				closeWorkspace(),
+			)
+		}
+		provider, providerErr := mcp.NewAnalyticsTool(service, limits)
+		if providerErr != nil {
+			return nil, errors.Join(providerErr, closeWorkspace())
+		}
+		optionalTools = append(optionalTools, provider)
 	}
 	server, err := mcp.NewServer(mcp.Config{
-		Service:   service,
-		Authority: authority,
-		Decisions: identity,
-		Recorder:  recorder,
-		Snapshots: client,
+		Service:       service,
+		Authority:     authority,
+		Decisions:     identity,
+		OptionalTools: optionalTools,
 		ServerInfo: mcp.Implementation{
 			Name:        "shoal-mcp",
 			Title:       "Shoal Explorer MCP",
@@ -75,8 +77,10 @@ func buildApplication(
 		Instructions: "This stdio v1 process uses one trusted launcher-configured " +
 			"identity for every caller connected to it. A fresh decision and " +
 			"RequestID are bound for each tools/call, but stdio cannot " +
-			"independently authenticate remote callers; use the authenticated " +
-			"Streamable HTTP /mcp endpoint for independent remote identities.",
+			"independently authenticate remote callers; a future HTTP transport " +
+			"is required for independently authenticated per-call remote callers. " +
+			"shoal.analytics requires durable interaction recording before success; " +
+			"other stdio tool-call recording is not implemented.",
 		ContextBudgetBytes: config.contextBudgetBytes,
 		ToolCallsPerMinute: config.toolCallsPerMinute,
 	})
@@ -88,6 +92,15 @@ func buildApplication(
 		return nil, errors.Join(err, closeWorkspace())
 	}
 	return app, nil
+}
+
+func identityAllows(config identityConfig, operation auth.Operation) bool {
+	for _, allowed := range config.operations {
+		if allowed == operation {
+			return true
+		}
+	}
+	return false
 }
 
 func openWorkspace(
@@ -137,17 +150,16 @@ func openWorkspace(
 	}
 	scorer, _ := any(corpus).(authorized.VectorScorer)
 	client, err := authorized.NewClient(authorized.Config{
-		Base:                   corpus,
-		VectorScorer:           scorer,
-		InteractionWriter:      corpus,
-		InteractionReader:      corpus,
-		OntologyInterpreter:    corpus,
-		OntologyProposalStore:  corpus,
-		SnapshotValidator:      corpus,
-		DerivedAssertionReader: corpus,
-		Resolver:               authority.Resolver(),
-		PolicySelector:         selector,
-		PolicyStore:            store,
+		Base:                  corpus,
+		VectorScorer:          scorer,
+		OntologyInterpreter:   corpus,
+		OntologyProposalStore: corpus,
+		InteractionWriter:     corpus,
+		InteractionReader:     corpus,
+		SnapshotValidator:     corpus,
+		Resolver:              authority.Resolver(),
+		PolicySelector:        selector,
+		PolicyStore:           store,
 		GenerationReader: configuredGenerationReader{
 			domain:     append([]byte(nil), config.identity.domain...),
 			generation: config.identity.policyGeneration,

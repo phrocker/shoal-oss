@@ -157,8 +157,8 @@ var oidcReaderOperations = []auth.Operation{
 	auth.OperationConnect,
 	auth.OperationNeighborhood,
 	auth.OperationRetrieve,
+	auth.OperationAnalyticsRead,
 	auth.OperationWorkspaceSettingsRead,
-	auth.OperationAgentResolve,
 }
 
 // oidcContributorOperations additionally permits ingestion. It matches the
@@ -170,24 +170,9 @@ var oidcContributorOperations = []auth.Operation{
 	auth.OperationConnect,
 	auth.OperationNeighborhood,
 	auth.OperationRetrieve,
+	auth.OperationAnalyticsRead,
 	auth.OperationWorkspaceSettingsRead,
 	auth.OperationWorkspaceSettingsWrite,
-}
-
-// oidcFleetOperations is the explicit control-plane ceiling for operators who
-// opt in via -oidc-fleet-values.
-var oidcFleetOperations = []auth.Operation{
-	auth.OperationAgentRegister,
-	auth.OperationAgentHeartbeat,
-	auth.OperationAgentRevoke,
-	auth.OperationAgentResolve,
-	auth.OperationDelegate,
-	auth.OperationDispatch,
-	auth.OperationInvoke,
-	auth.OperationSubscriptionCreate,
-	auth.OperationSubscriptionDelete,
-	auth.OperationSubscriptionDeliver,
-	auth.OperationEventPublish,
 }
 
 // oidcConfig is the operator-supplied, provider-neutral configuration. A

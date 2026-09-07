@@ -4,9 +4,8 @@ This change implements the backend and governance portion of issue #279 as a
 conservative read-time lens over immutable assertions. The source graph remains
 schema-neutral and ingestion is not rejected merely because an unrelated
 ontology does not describe it. Host integrations can select a lens through
-`auth.DecisionConfig.SelectedOntology`. The first-party workspace settings
-provider and browser UI expose the governed catalog and bind the selected lens
-into each effective request decision.
+`auth.DecisionConfig.SelectedOntology`; first-party workspace settings and UI
+selection are intentionally tracked separately and are not claimed here.
 
 ## Source-evidence matrix
 
@@ -62,6 +61,27 @@ into each effective request decision.
 - `authorized.Config.OntologyInterpreter` is the explicit trusted
   interpretation dependency. The authorization wrapper never accepts
   interpretations from its untrusted graph `Base`.
+- `authorized.Config.OntologyProposalStore` is the explicit trusted governance
+  dependency. Proposal state, evidence references, and canonical citation
+  bytes used by authorization are never accepted from the untrusted graph
+  `Base`.
+- Citation-backed governance evidence may omit its quote. A supplied quote
+  must exactly match the cited immutable source bytes; omitting it never
+  skips citation validation or source authorization.
+- `explorer.OntologyProposalMutationStateProvider` exposes only the active
+  ontology and a requested proposal's base identity to ingest-authorized
+  mutation preflight. Mutation callers do not receive the governed proposal
+  corpus and do not need unrelated read authority.
+- `explorer.OntologyActiveStateProvider` derives the global durable active tip
+  without proposal bodies. Extraction uses the ingest-authorized mutation
+  state, while selectable proposal/catalog views apply read and evidence
+  authorization independently.
+- `explorer.PublishedOntologyCatalogProvider` exposes the bounded canonical
+  published chain without proposal bodies. The authorized implementation
+  accepts only workspace-settings read or write authority, checks current
+  evidence object policies for every reachable transition, and rechecks the
+  policy generation before returning. Raw proposal reads remain protected by
+  `OperationRead`.
 - `webapi.NeighborhoodResponse.OntologyInterpretations` and
   `webapi.PathResponse.OntologyInterpretations` expose effective and original
   identities, safety-path IDs, and unresolved reasons.
@@ -69,14 +89,25 @@ into each effective request decision.
   evidence uses the same opaque-ID citation/path codecs as other Explorer APIs.
   Morphism-level metadata in drafts and projections uses the same base64url
   key/value entry codec as evidence metadata, preserving opaque bytes and
-  canonical morphism identities. Metadata keys and values are byte-oriented:
-  validation applies public byte-size bounds, and the JSON transport preserves
-  arbitrary bytes with the canonical base64url entry codec.
+  canonical morphism identities. The ontology model still requires canonical
+  UTF-8 metadata: invalid byte sequences are rejected, not silently replaced
+  by the JSON transport before validation.
 - Published proposal transitions form the durable active-version chain.
   Publication rejects stale bases, and `ActiveOntology` replays the chain after
   restart, including a terminal chain of exactly 256 transitions.
 - An indeterminate proposal or transition write fail-closes subsequent ontology
-  mutations until the corpus is reopened and durable state is replayed.
+  mutations, mutation preflight, proposal reads, and read-time interpretation
+  until the corpus is reopened and durable state is replayed.
+- Governed proposal evidence is accepted only when the mutation caller is
+  authorized for every cited revision and path object. Proposal reads expose
+  full evidence only when every referenced object is authorized; mutation
+  responses retain opaque evidence IDs without returning evidence contents.
+- HTTP transitions enforce their complete response projection bounds under the
+  store's write lock before appending the transition. A domain-valid proposal
+  that exceeds the HTTP evidence, discriminator, or ontology size limits is
+  rejected without changing its state or the active ontology. The lower-level
+  transition API retains its domain bounds. Unexpected projection failures
+  after a provider reports success carry indeterminate-commit semantics.
 - A corpus admits at most 256 durable proposals across all schemas and lifecycle
   states. Admission is checked under the store's write lock before persistence,
   including concurrent requests through different service instances. Identical

@@ -165,7 +165,78 @@ func validateProposalEvolution(
 				"relationship endpoint change requires an explicit morphism")
 		}
 	}
+	if err := validatePropertyOwnershipEvolution(base, proposed, morphisms); err != nil {
+		return err
+	}
 	return nil
+}
+
+func validatePropertyOwnershipEvolution(
+	base, proposed OntologyVersion,
+	morphisms []OntologyMorphism,
+) error {
+	for _, property := range base.properties {
+		targets, _, err := mappedDefinitionTargets(
+			property.ID(), "property", morphisms)
+		if err != nil {
+			return err
+		}
+		sourceOwners := propertyOwners(base, property.ID())
+		mappedOwners, err := mappedOwnerSet(sourceOwners, morphisms)
+		if err != nil {
+			return err
+		}
+		for _, targetID := range targets {
+			if !definitionExists(proposed, targetID) {
+				continue
+			}
+			targetOwners := propertyOwners(proposed, targetID)
+			if len(sourceOwners) == 0 && len(targetOwners) > 0 {
+				return invalid(
+					"unowned property cannot become owner-restricted without an explicit supported transformation")
+			}
+			if len(sourceOwners) > 0 && len(targetOwners) > 0 &&
+				!idSubset(mappedOwners, targetOwners) {
+				return invalid(
+					"property ownership cannot narrow without an explicit supported transformation")
+			}
+		}
+	}
+	return nil
+}
+
+func propertyOwners(version OntologyVersion, propertyID shoal.ID) []shoal.ID {
+	var owners []shoal.ID
+	for _, concept := range version.concepts {
+		if containsID(concept.properties, propertyID) {
+			owners = append(owners, concept.ID())
+		}
+	}
+	for _, relationship := range version.relationships {
+		if containsID(relationship.properties, propertyID) {
+			owners = append(owners, relationship.ID())
+		}
+	}
+	return canonicalUniqueIDs(owners)
+}
+
+func mappedOwnerSet(
+	owners []shoal.ID,
+	morphisms []OntologyMorphism,
+) ([]shoal.ID, error) {
+	var mapped []shoal.ID
+	for _, owner := range owners {
+		namespace := IDNamespace(owner)
+		if namespace != "concept" && namespace != "relationship" {
+			return nil, invalid("property owner has an unexpected namespace")
+		}
+		targets, _, err := mappedDefinitionTargets(owner, namespace, morphisms)
+		if err != nil {
+			return nil, err
+		}
+		mapped = append(mapped, targets...)
+	}
+	return canonicalUniqueIDs(mapped), nil
 }
 
 func mappedDefinitionSet(

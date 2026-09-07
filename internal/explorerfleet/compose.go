@@ -42,8 +42,9 @@ func ConfigureRuntime(config explorercoord.Config) explorercoord.Config {
 	return config
 }
 
-// Compose constructs the registry with a host-supplied lifecycle
-// recorder. Production startup owns the authorized ResultSink adapter.
+// Compose constructs the registry with a host-supplied lifecycle recorder.
+// Production startup must inject the finalized authorized ResultSink/evidence
+// adapter; this package does not synthesize trusted interaction fields.
 func Compose(
 	runtime *explorercoord.Runtime,
 	resolver auth.Resolver,

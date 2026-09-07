@@ -237,6 +237,41 @@ func (f Fold) ID() (shoal.ID, error) {
 	if err != nil {
 		return "", err
 	}
+	hasEdgeProvenance := false
+	for _, member := range canonical.Members {
+		if len(member.TouchedEdgeIDs) > 0 {
+			hasEdgeProvenance = true
+			break
+		}
+	}
+	if hasEdgeProvenance {
+		parts := []string{
+			"edge-provenance-v1",
+			"members", strconv.Itoa(len(canonical.Members)),
+		}
+		for _, member := range canonical.Members {
+			parts = append(parts, "session", string(member.SessionID))
+			parts = append(
+				parts, "retrieved", strconv.Itoa(len(member.RetrievedNodeIDs)))
+			for _, id := range member.RetrievedNodeIDs {
+				parts = append(parts, string(id))
+			}
+			parts = append(parts, "cited", strconv.Itoa(len(member.CitedNodeIDs)))
+			for _, id := range member.CitedNodeIDs {
+				parts = append(parts, string(id))
+			}
+			parts = append(
+				parts, "edges", strconv.Itoa(len(member.TouchedEdgeIDs)))
+			for _, id := range member.TouchedEdgeIDs {
+				parts = append(parts, string(id))
+			}
+		}
+		parts = append(parts, "summary", canonical.SummaryDigest)
+		return DerivedID("fold", parts...), nil
+	}
+
+	// Preserve the original identity encoding for folds without typed edge
+	// provenance so durable legacy records remain addressable.
 	parts := make([]string, 0, 4*len(canonical.Members)+2)
 	for _, member := range canonical.Members {
 		parts = append(parts, "session", string(member.SessionID))
@@ -259,10 +294,11 @@ func (f Fold) ID() (shoal.ID, error) {
 	return DerivedID("fold", parts...), nil
 }
 
-// Subgraph materializes the fold node and its edges. resolve supplies the
-// visibility labels of every source node the fold covers; if it fails for any
-// node the whole fold fails, rather than being written with an understated
-// visibility.
+// Subgraph materializes a compatibility fold that has no retained source-edge
+// provenance. Edge-bearing folds require SubgraphWithEvidence so edge-local
+// visibility cannot be omitted. resolve supplies the visibility labels of
+// every source node the fold covers; if it fails for any node the whole fold
+// fails rather than being written with understated visibility.
 //
 // The resulting visibility is the conjunction of every folded session's own
 // visibility and every touched source node's labels. Folding therefore never

@@ -83,29 +83,29 @@ func TestRevokedSourceHidesSessionAtReadTime(t *testing.T) {
 	defer corpus.Close()
 
 	open := ingestVisible(t, corpus, "file:///runbook.md", publicMarkdown, "ops")
-	recordedSession(t, corpus, "session-ops", open[:1], open[:1])
+	recordedSession(t, corpus, "interaction.session_ops", open[:1], open[:1])
 
 	// Before tightening the session is fully readable and labelled "ops".
 	summaries, err := corpus.Interactions(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := containsSession(summaries, "session-ops"); got == nil {
-		t.Fatal("session-ops was not listed before tightening")
+	if got := containsSession(summaries, "interaction.session_ops"); got == nil {
+		t.Fatal("interaction.session_ops was not listed before tightening")
 	} else if got.Visibility != "ops" {
-		t.Fatalf("session-ops visibility = %q, want ops", got.Visibility)
+		t.Fatalf("interaction.session_ops visibility = %q, want ops", got.Visibility)
 	}
-	if _, err := corpus.InteractionSubgraph(ctx, "session-ops"); err != nil {
+	if _, err := corpus.InteractionSubgraph(ctx, "interaction.session_ops"); err != nil {
 		t.Fatalf("InteractionSubgraph before tightening = %v", err)
 	}
 	touching, err := corpus.InteractionsTouching(ctx, open[0])
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(touching) != 1 || touching[0].InteractionID != "session-ops" {
+	if len(touching) != 1 || touching[0].InteractionID != "interaction.session_ops" {
 		t.Fatalf("InteractionsTouching before tightening = %+v", touching)
 	}
-	if _, err := corpus.RelatedInteractions(ctx, "session-ops"); err != nil {
+	if _, err := corpus.RelatedInteractions(ctx, "interaction.session_ops"); err != nil {
 		t.Fatalf("RelatedInteractions before tightening = %v", err)
 	}
 
@@ -118,10 +118,10 @@ func TestRevokedSourceHidesSessionAtReadTime(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := containsSession(summaries, "session-ops"); got != nil {
-		t.Fatalf("session-ops still listed after tightening: %+v", got)
+	if got := containsSession(summaries, "interaction.session_ops"); got != nil {
+		t.Fatalf("interaction.session_ops still listed after tightening: %+v", got)
 	}
-	if _, err := corpus.InteractionSubgraph(ctx, "session-ops"); !shoal.IsErrorCode(
+	if _, err := corpus.InteractionSubgraph(ctx, "interaction.session_ops"); !shoal.IsErrorCode(
 		err, shoal.ErrorUnavailable,
 	) {
 		t.Fatalf("InteractionSubgraph after tightening = %v, want Unavailable", err)
@@ -133,7 +133,7 @@ func TestRevokedSourceHidesSessionAtReadTime(t *testing.T) {
 	if len(touching) != 0 {
 		t.Fatalf("InteractionsTouching after tightening = %+v, want empty", touching)
 	}
-	if _, err := corpus.RelatedInteractions(ctx, "session-ops"); !shoal.IsErrorCode(
+	if _, err := corpus.RelatedInteractions(ctx, "interaction.session_ops"); !shoal.IsErrorCode(
 		err, shoal.ErrorUnavailable,
 	) {
 		t.Fatalf("RelatedInteractions after tightening = %v, want Unavailable", err)
@@ -153,9 +153,9 @@ func TestReclassifiedSourceDeniesPreviouslyAuthorizedReader(t *testing.T) {
 	defer corpus.Close()
 
 	open := ingestVisible(t, corpus, "file:///runbook.md", publicMarkdown, "ops")
-	recordedSession(t, corpus, "session-ops", open[:1], open[:1])
+	recordedSession(t, corpus, "interaction.session_ops", open[:1], open[:1])
 
-	sub, err := corpus.InteractionSubgraph(ctx, "session-ops")
+	sub, err := corpus.InteractionSubgraph(ctx, "interaction.session_ops")
 	if err != nil {
 		t.Fatalf("read before reclassification = %v", err)
 	}
@@ -167,7 +167,7 @@ func TestReclassifiedSourceDeniesPreviouslyAuthorizedReader(t *testing.T) {
 	// not hold.
 	tighten(t, corpus, "file:///runbook.md", publicMarkdown, "ops&classified")
 
-	if _, err := corpus.InteractionSubgraph(ctx, "session-ops"); !shoal.IsErrorCode(
+	if _, err := corpus.InteractionSubgraph(ctx, "interaction.session_ops"); !shoal.IsErrorCode(
 		err, shoal.ErrorUnavailable,
 	) {
 		t.Fatalf(
@@ -186,12 +186,12 @@ func TestReclassifiedSourceHidesFold(t *testing.T) {
 	defer corpus.Close()
 
 	recordedSession(
-		t, corpus, "session-restricted",
+		t, corpus, "interaction.session_restricted",
 		[]shoal.ID{restricted[0], open[0]}, []shoal.ID{open[0]})
 	recordedSession(
-		t, corpus, "session-open", []shoal.ID{open[0]}, []shoal.ID{open[0]})
+		t, corpus, "interaction.session_open", []shoal.ID{open[0]}, []shoal.ID{open[0]})
 
-	fold := foldOf(t, corpus, "session-restricted", "session-open")
+	fold := foldOf(t, corpus, "interaction.session_restricted", "interaction.session_open")
 
 	// The fold is readable and carries the conjunction before tightening.
 	folds, err := corpus.Folds(ctx)
@@ -246,16 +246,16 @@ func TestTighteningInvalidatesAPriorPermissiveRead(t *testing.T) {
 	}
 
 	open := ingestVisible(t, corpus, "file:///runbook.md", publicMarkdown, "ops")
-	recordedSession(t, corpus, "session-ops", open[:1], open[:1])
+	recordedSession(t, corpus, "interaction.session_ops", open[:1], open[:1])
 
 	// A permissive read happens first; any cache would be warm and permissive.
-	if _, err := corpus.InteractionSubgraph(ctx, "session-ops"); err != nil {
+	if _, err := corpus.InteractionSubgraph(ctx, "interaction.session_ops"); err != nil {
 		t.Fatalf("permissive read before tightening = %v", err)
 	}
 
 	tighten(t, corpus, "file:///runbook.md", publicMarkdown, "ops&secret")
 
-	if _, err := corpus.InteractionSubgraph(ctx, "session-ops"); !shoal.IsErrorCode(
+	if _, err := corpus.InteractionSubgraph(ctx, "interaction.session_ops"); !shoal.IsErrorCode(
 		err, shoal.ErrorUnavailable,
 	) {
 		t.Fatalf("warm read after tightening = %v, want Unavailable", err)
@@ -270,7 +270,7 @@ func TestTighteningInvalidatesAPriorPermissiveRead(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer reopened.Close()
-	if _, err := reopened.InteractionSubgraph(ctx, "session-ops"); !shoal.IsErrorCode(
+	if _, err := reopened.InteractionSubgraph(ctx, "interaction.session_ops"); !shoal.IsErrorCode(
 		err, shoal.ErrorUnavailable,
 	) {
 		t.Fatalf("cold read after tightening = %v, want Unavailable", err)
@@ -291,9 +291,9 @@ func TestTombstonedRecordKeepsOriginalVisibilityAfterTightening(t *testing.T) {
 	defer corpus.Close()
 
 	open := ingestVisible(t, corpus, "file:///runbook.md", publicMarkdown, "ops")
-	recordedSession(t, corpus, "session-deleted", open[:1], open[:1])
+	recordedSession(t, corpus, "interaction.session_deleted", open[:1], open[:1])
 
-	if _, err := corpus.DeleteInteraction(ctx, "session-deleted"); err != nil {
+	if _, err := corpus.DeleteInteraction(ctx, "interaction.session_deleted"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -304,7 +304,7 @@ func TestTombstonedRecordKeepsOriginalVisibilityAfterTightening(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got := containsSession(summaries, "session-deleted")
+	got := containsSession(summaries, "interaction.session_deleted")
 	if got == nil {
 		t.Fatal("tombstoned record dropped from listing after tightening")
 	}
@@ -314,7 +314,7 @@ func TestTombstonedRecordKeepsOriginalVisibilityAfterTightening(t *testing.T) {
 	if got.Visibility != "ops" {
 		t.Fatalf("tombstone visibility = %q, want ops (original)", got.Visibility)
 	}
-	sub, err := corpus.InteractionSubgraph(ctx, "session-deleted")
+	sub, err := corpus.InteractionSubgraph(ctx, "interaction.session_deleted")
 	if err != nil {
 		t.Fatalf("InteractionSubgraph for tombstone = %v", err)
 	}
@@ -340,17 +340,17 @@ func TestDeclassifiedSourceStillServesRecord(t *testing.T) {
 
 	open := ingestVisible(
 		t, corpus, "file:///incident.md", restrictedMarkdown, "incident&secret")
-	recordedSession(t, corpus, "session-secret", open[:1], open[:1])
+	recordedSession(t, corpus, "interaction.session_secret", open[:1], open[:1])
 
 	// Baseline: the session is readable and carries the conjunction.
 	summaries, err := corpus.Interactions(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := containsSession(summaries, "session-secret"); got == nil {
-		t.Fatal("session-secret was not listed before declassification")
+	if got := containsSession(summaries, "interaction.session_secret"); got == nil {
+		t.Fatal("interaction.session_secret was not listed before declassification")
 	} else if got.Visibility != "incident&secret" {
-		t.Fatalf("session-secret visibility = %q, want incident&secret", got.Visibility)
+		t.Fatalf("interaction.session_secret visibility = %q, want incident&secret", got.Visibility)
 	}
 
 	// Declassify: re-ingest identical content dropping the "secret" label. The
@@ -362,26 +362,26 @@ func TestDeclassifiedSourceStillServesRecord(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got := containsSession(summaries, "session-secret")
+	got := containsSession(summaries, "interaction.session_secret")
 	if got == nil {
-		t.Fatal("session-secret lost from listing after declassification (data loss)")
+		t.Fatal("interaction.session_secret lost from listing after declassification (data loss)")
 	}
 	// The record is still labelled with its stricter stored visibility; it is
 	// served under the label it was derived at, never downgraded.
 	if got.Visibility != "incident&secret" {
 		t.Fatalf(
-			"session-secret visibility = %q after declassification, want incident&secret",
+			"interaction.session_secret visibility = %q after declassification, want incident&secret",
 			got.Visibility,
 		)
 	}
-	if _, err := corpus.InteractionSubgraph(ctx, "session-secret"); err != nil {
+	if _, err := corpus.InteractionSubgraph(ctx, "interaction.session_secret"); err != nil {
 		t.Fatalf("InteractionSubgraph after declassification = %v, want served", err)
 	}
 	touching, err := corpus.InteractionsTouching(ctx, open[0])
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(touching) != 1 || touching[0].InteractionID != "session-secret" {
+	if len(touching) != 1 || touching[0].InteractionID != "interaction.session_secret" {
 		t.Fatalf("InteractionsTouching after declassification = %+v", touching)
 	}
 }
@@ -402,9 +402,9 @@ func TestMixedRelabelWithNewLabelStillRefuses(t *testing.T) {
 
 	open := ingestVisible(
 		t, corpus, "file:///incident.md", restrictedMarkdown, "incident&secret")
-	recordedSession(t, corpus, "session-secret", open[:1], open[:1])
+	recordedSession(t, corpus, "interaction.session_secret", open[:1], open[:1])
 
-	if _, err := corpus.InteractionSubgraph(ctx, "session-secret"); err != nil {
+	if _, err := corpus.InteractionSubgraph(ctx, "interaction.session_secret"); err != nil {
 		t.Fatalf("read before relabel = %v", err)
 	}
 
@@ -416,10 +416,10 @@ func TestMixedRelabelWithNewLabelStillRefuses(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := containsSession(summaries, "session-secret"); got != nil {
-		t.Fatalf("session-secret still listed after mixed relabel: %+v", got)
+	if got := containsSession(summaries, "interaction.session_secret"); got != nil {
+		t.Fatalf("interaction.session_secret still listed after mixed relabel: %+v", got)
 	}
-	if _, err := corpus.InteractionSubgraph(ctx, "session-secret"); !shoal.IsErrorCode(
+	if _, err := corpus.InteractionSubgraph(ctx, "interaction.session_secret"); !shoal.IsErrorCode(
 		err, shoal.ErrorUnavailable,
 	) {
 		t.Fatalf(

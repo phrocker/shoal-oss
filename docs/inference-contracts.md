@@ -35,6 +35,21 @@ its quote against retained canonical source with
 model, enforcing authorization at retrieval time, and implementing the
 `Generator` interface.
 
+Explorer's durable snapshot proof binds canonical source nodes, edges, and
+assertions, including each assertion's mapped edge, origin, and annotation
+metadata. A historical pin cannot justify an assertion added or changed after
+that snapshot merely because its source edge is unchanged. This proof is
+rechecked under the interaction write lock and survives reopening the corpus.
+Graph references must include the complete authoritative assertion set for
+their path edges; recomputing a plain anchor does not permit omitting origins.
+Legacy snapshot records without assertion state can still prove their recorded
+node and edge state, but cannot authorize new assertion-backed evidence; callers
+must obtain a new snapshot for that evidence. Current authorization checks remain
+required independently of historical proof.
+Snapshot identities are equality frontiers, not ordered change cursors. When
+identical logical state reappears, its registered snapshot identity and `AsOf`
+are reused rather than assigning a conflicting observation time.
+
 ## Tool-using agent harness
 
 The harness exposes typed `retrieve`, `open_section`, `neighbors`, and `stop`
@@ -108,6 +123,17 @@ Two obligations follow for any `Recorder` implementation:
 
 Recording happens on the cache-hit path as well as the miss path. A cached
 answer is still an answer that was served, so it still produces a record.
+
+An authorized result sink may return an earlier `RecordedAt` for an exact
+concurrent retry only when a trusted durable point-read confirms the entire
+returned session. This verification does not require an additional read grant.
+A failed post-write verification cannot produce success or imply rollback;
+an unavailable durable read preserves both committed and indeterminate markers.
+
+Both the product recorder and harness compare successful result-sink receipts
+with the requested canonical session. Only trusted time, actor, reason, and a
+previously unspecified authorization operation may be enriched. Changed work,
+evidence, or pins fail with a committed marker rather than reporting success.
 
 No Copilot, SDK-process, or other hosted execution backend is bundled. Future
 backends can implement `Runner` without changing inference contracts; the

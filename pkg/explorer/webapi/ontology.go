@@ -23,6 +23,8 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/phrocker/shoal-oss/pkg/explorer"
+	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/ontology"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
@@ -46,10 +48,22 @@ type ActiveOntologyProvider interface {
 }
 
 // OntologyCatalogProvider exposes the canonical governed choice set and its
-// durable active tip. Callers must still apply their own authorization policy;
-// the catalog prevents them from duplicating publication-chain/CAS semantics.
+// durable active tip. Authorized backends enforce catalog access before this
+// method returns; callers still enforce issuer-selected-lens constraints. The
+// catalog prevents either layer from duplicating publication-chain/CAS
+// semantics.
 type OntologyCatalogProvider interface {
 	OntologyCatalog(context.Context) (ontology.PublishedCatalog, bool, error)
+}
+
+// OntologySelectionAuthorizer checks one published identity under the exact
+// operation whose decision is being narrowed without exposing the catalog.
+type OntologySelectionAuthorizer interface {
+	AuthorizeOntologySelection(
+		context.Context,
+		ontology.OntologyIdentity,
+		auth.Operation,
+	) error
 }
 
 // OntologyResponse is the stable browser contract for the currently active
@@ -224,26 +238,105 @@ func (s *EmbeddedService) OntologyCatalog(
 	s.ontologyMu.RLock()
 	if s.ontologyVersion == nil {
 		s.ontologyMu.RUnlock()
+		return ontology.OntologyVersion{}, false, nil
+	}
+	configured := *s.ontologyVersion
+	s.ontologyMu.RUnlock()
+	if provider, ok := s.client.(explorer.OntologyActiveStateProvider); ok {
+		active, err := provider.OntologyActiveState(ctx, configured)
+		return active, true, err
+	}
+	catalog, _, err := s.OntologyCatalog(ctx)
+	if err != nil {
+		return ontology.OntologyVersion{}, false, err
+	}
+	return catalog.Active(), true, nil
+}
+
+func (s *EmbeddedService) OntologyCatalog(
+	ctx context.Context,
+) (ontology.PublishedCatalog, bool, error) {
+	if ctx == nil {
+		return ontology.PublishedCatalog{}, false, shoal.NewError(
+			shoal.ErrorInvalidArgument, "context is required")
+	}
+	if err := ctx.Err(); err != nil {
+		return ontology.PublishedCatalog{}, false, err
+	}
+	s.ontologyMu.RLock()
+	if s.ontologyVersion == nil {
+		s.ontologyMu.RUnlock()
 		return ontology.PublishedCatalog{}, false, nil
 	}
 	configured := *s.ontologyVersion
 	s.ontologyMu.RUnlock()
-	store, ok := s.client.(interface {
-		OntologyProposals(context.Context) ([]ontology.GovernedProposal, error)
-	})
-	if !ok {
-		catalog, err := boundedOntologyCatalog(configured, nil)
+	if provider, ok := s.client.(explorer.PublishedOntologyCatalogProvider); ok {
+		catalog, err := provider.PublishedOntologyCatalog(ctx, configured)
 		return catalog, true, err
 	}
-	proposals, err := store.OntologyProposals(ctx)
-	if err != nil {
-		return ontology.PublishedCatalog{}, false, err
+	if _, exposesRawProposals := s.client.(ontologyProposalReadClient); exposesRawProposals {
+		return ontology.PublishedCatalog{}, false, shoal.NewError(
+			shoal.ErrorUnavailable,
+			"workspace capability \"published ontology catalog\" is unavailable",
+		)
 	}
-	catalog, err := boundedOntologyCatalog(configured, proposals)
-	if err != nil {
-		return ontology.PublishedCatalog{}, false, err
+	catalog, err := boundedOntologyCatalog(configured, nil)
+	return catalog, true, err
+}
+
+// AuthorizeOntologySelection checks one governed published identity without
+// requiring the caller to have workspace-settings catalog read authority.
+func (s *EmbeddedService) AuthorizeOntologySelection(
+	ctx context.Context,
+	identity ontology.OntologyIdentity,
+	operation auth.Operation,
+) error {
+	if ctx == nil {
+		return shoal.NewError(shoal.ErrorInvalidArgument, "context is required")
 	}
-	return catalog, true, nil
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := identity.Validate(); err != nil {
+		return err
+	}
+	if err := operation.Validate(); err != nil {
+		return err
+	}
+	s.ontologyMu.RLock()
+	if s.ontologyVersion == nil {
+		s.ontologyMu.RUnlock()
+		return auth.ObjectNotFound()
+	}
+	configured := *s.ontologyVersion
+	s.ontologyMu.RUnlock()
+	provider, ok := s.client.(interface {
+		AuthorizePublishedOntology(
+			context.Context,
+			ontology.OntologyVersion,
+			ontology.OntologyIdentity,
+			auth.Operation,
+		) error
+	})
+	if ok {
+		return provider.AuthorizePublishedOntology(
+			ctx, configured, identity, operation)
+	}
+	catalog, configuredSet, err := s.OntologyCatalog(ctx)
+	if err != nil {
+		return err
+	}
+	if !configuredSet || !catalog.Contains(identity) {
+		return auth.ObjectNotFound()
+	}
+	return nil
+}
+
+func boundedOntologyCatalog(
+	configured ontology.OntologyVersion,
+	proposals []ontology.GovernedProposal,
+) (ontology.PublishedCatalog, error) {
+	return explorer.NewPublishedOntologyCatalog(configured, proposals)
 }
 
 func replayPublishedOntology(
@@ -255,27 +348,6 @@ func replayPublishedOntology(
 		return ontology.OntologyVersion{}, err
 	}
 	return catalog.Active(), nil
-}
-
-func boundedOntologyCatalog(
-	configured ontology.OntologyVersion,
-	proposals []ontology.GovernedProposal,
-) (ontology.PublishedCatalog, error) {
-	if len(proposals) > int(MaxOntologyProposals) {
-		return ontology.PublishedCatalog{}, ontologyBoundError(
-			"proposal", len(proposals), MaxOntologyProposals)
-	}
-	catalog, err := ontology.NewPublishedCatalog(configured, proposals)
-	if err != nil {
-		return ontology.PublishedCatalog{}, err
-	}
-	if len(catalog.Versions()) > int(MaxOntologyProposals)+1 {
-		return ontology.PublishedCatalog{}, shoal.NewError(
-			shoal.ErrorUnavailable,
-			"published ontology history exceeds the service bound",
-		)
-	}
-	return catalog, nil
 }
 
 func ontologyFor(ctx context.Context, service Service) (OntologyResponse, error) {
@@ -325,65 +397,19 @@ func ontologyLimits() OntologyDescriptionLimits {
 	}
 }
 
+func ontologyProjectionLimits() explorer.OntologyProjectionLimits {
+	return explorer.OntologyProjectionLimits{
+		MaxConcepts: MaxOntologyConcepts, MaxRelationships: MaxOntologyRelationships,
+		MaxProperties: MaxOntologyProperties, MaxDefinitionProperties: MaxOntologyDefinitionProperties,
+		MaxRelationshipEndpointSets: MaxOntologyRelationshipEndpointSets,
+		MaxConstraintsPerProperty:   MaxOntologyConstraintsPerProperty,
+		MaxAllowedValues:            MaxOntologyAllowedValues, MaxTransitions: MaxOntologyProposalTransitions,
+		MaxMorphismEvidence: MaxEvidencePerResult, MaxDiscriminatorChoices: MaxOntologyConcepts,
+	}
+}
+
 func enforceOntologyBounds(version ontology.OntologyVersion) error {
-	concepts := version.Concepts()
-	if uint32(len(concepts)) > MaxOntologyConcepts {
-		return ontologyBoundError("concept", len(concepts), MaxOntologyConcepts)
-	}
-	relationships := version.Relationships()
-	if uint32(len(relationships)) > MaxOntologyRelationships {
-		return ontologyBoundError(
-			"relationship", len(relationships), MaxOntologyRelationships)
-	}
-	properties := version.Properties()
-	if uint32(len(properties)) > MaxOntologyProperties {
-		return ontologyBoundError("property", len(properties), MaxOntologyProperties)
-	}
-	for _, concept := range concepts {
-		if uint32(len(concept.Properties())) > MaxOntologyDefinitionProperties {
-			return ontologyBoundError(
-				"concept property reference", len(concept.Properties()),
-				MaxOntologyDefinitionProperties,
-			)
-		}
-	}
-	for _, relationship := range relationships {
-		if uint32(len(relationship.FromConcepts())) > MaxOntologyRelationshipEndpointSets {
-			return ontologyBoundError(
-				"relationship source concept reference",
-				len(relationship.FromConcepts()), MaxOntologyRelationshipEndpointSets,
-			)
-		}
-		if uint32(len(relationship.ToConcepts())) > MaxOntologyRelationshipEndpointSets {
-			return ontologyBoundError(
-				"relationship target concept reference",
-				len(relationship.ToConcepts()), MaxOntologyRelationshipEndpointSets,
-			)
-		}
-		if uint32(len(relationship.Properties())) > MaxOntologyDefinitionProperties {
-			return ontologyBoundError(
-				"relationship property reference", len(relationship.Properties()),
-				MaxOntologyDefinitionProperties,
-			)
-		}
-	}
-	for _, property := range properties {
-		constraints := property.Constraints()
-		if uint32(len(constraints)) > MaxOntologyConstraintsPerProperty {
-			return ontologyBoundError(
-				"property constraint", len(constraints),
-				MaxOntologyConstraintsPerProperty,
-			)
-		}
-		for _, constraint := range constraints {
-			allowed := constraint.AllowedValues()
-			if uint32(len(allowed)) > MaxOntologyAllowedValues {
-				return ontologyBoundError(
-					"allowed value", len(allowed), MaxOntologyAllowedValues)
-			}
-		}
-	}
-	return nil
+	return ontologyProjectionLimits().ValidateVersion(version)
 }
 
 func ontologyBoundError(name string, count int, limit uint32) error {

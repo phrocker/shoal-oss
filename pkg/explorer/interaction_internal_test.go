@@ -33,163 +33,21 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
-func TestInteractionResultCancellationAfterCommitIsMarked(t *testing.T) {
-	corpus, session := internalInteractionFixture(t, "cancel")
-	ctx, cancel := context.WithCancel(context.Background())
-	write := corpus.writeRecord
-	corpus.interactionRecordWriter = func(
-		row []byte, kind byte, value any,
-	) error {
-		if err := write(row, kind, value); err != nil {
-			return err
-		}
-		cancel()
-		return nil
-	}
-	recorded, err := corpus.RecordInteractionResult(ctx, session)
-	if !IsCommittedInteraction(err) {
-		t.Fatalf("post-commit cancellation error = %v", err)
-	}
-	if recorded.ID != "" {
-		t.Fatalf("committed failure returned success-shaped session: %+v", recorded)
-	}
-	if _, err := corpus.Interaction(
-		context.Background(), session.ID); err != nil {
-		t.Fatalf("canceled committed interaction is not durable: %v", err)
-	}
+type stagedCancellationContext struct {
+	context.Context
+	mu          sync.Mutex
+	calls       int
+	cancelAfter int
 }
 
-func TestInteractionResultWinsConcurrentDeletion(t *testing.T) {
-	corpus, session := internalInteractionFixture(t, "delete-race")
-	write := corpus.writeRecord
-	entered := make(chan struct{})
-	release := make(chan struct{})
-	var once sync.Once
-	corpus.interactionRecordWriter = func(
-		row []byte, kind byte, value any,
-	) error {
-		if err := write(row, kind, value); err != nil {
-			return err
-		}
-		once.Do(func() { close(entered) })
-		<-release
-		return nil
+func (c *stagedCancellationContext) Err() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.calls++
+	if c.calls >= c.cancelAfter {
+		return context.Canceled
 	}
-	type result struct {
-		session interaction.Session
-		err     error
-	}
-	recorded := make(chan result, 1)
-	go func() {
-		value, err := corpus.RecordInteractionResult(
-			context.Background(), session)
-		recorded <- result{session: value, err: err}
-	}()
-	<-entered
-	deleted := make(chan error, 1)
-	go func() {
-		_, err := corpus.DeleteInteraction(
-			context.Background(), session.ID)
-		deleted <- err
-	}()
-	time.Sleep(10 * time.Millisecond)
-	close(release)
-	got := <-recorded
-	if got.err != nil || got.session.ID != session.ID {
-		t.Fatalf("record result = %+v, %v", got.session, got.err)
-	}
-	if err := <-deleted; err != nil {
-		t.Fatalf("concurrent deletion error = %v", err)
-	}
-}
-
-func TestInteractionResultWinsConcurrentVisibilityChange(t *testing.T) {
-	corpus, session := internalInteractionFixture(t, "visibility-race")
-	write := corpus.writeRecord
-	entered := make(chan struct{})
-	release := make(chan struct{})
-	var once sync.Once
-	corpus.interactionRecordWriter = func(
-		row []byte, kind byte, value any,
-	) error {
-		if err := write(row, kind, value); err != nil {
-			return err
-		}
-		once.Do(func() { close(entered) })
-		<-release
-		return nil
-	}
-	type result struct {
-		session interaction.Session
-		err     error
-	}
-	recorded := make(chan result, 1)
-	go func() {
-		value, err := corpus.RecordInteractionResult(
-			context.Background(), session)
-		recorded <- result{session: value, err: err}
-	}()
-	<-entered
-	replaced := make(chan error, 1)
-	go func() {
-		_, err := corpus.Ingest(context.Background(), Source{
-			URI: "file:///visibility-race.txt", MediaType: MediaTypeText,
-			Content: "replacement source",
-			Metadata: shoal.Metadata{
-				interaction.PropertyVisibility: "new-secret",
-			},
-		})
-		replaced <- err
-	}()
-	time.Sleep(10 * time.Millisecond)
-	close(release)
-	got := <-recorded
-	if got.err != nil || got.session.ID != session.ID {
-		t.Fatalf("record result = %+v, %v", got.session, got.err)
-	}
-	if err := <-replaced; err != nil {
-		t.Fatalf("concurrent source replacement error = %v", err)
-	}
-}
-
-func internalInteractionFixture(
-	t *testing.T, name string,
-) (*Explorer, interaction.Session) {
-	t.Helper()
-	corpus, err := Open(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		if err := corpus.Close(); err != nil {
-			t.Errorf("close corpus: %v", err)
-		}
-	})
-	receipt, err := corpus.Ingest(context.Background(), Source{
-		URI: "file:///" + name + ".txt", MediaType: MediaTypeText,
-		Content: "source evidence",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	view, err := corpus.Document(
-		context.Background(), receipt.Document.ID, receipt.Revision.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	snapshot, err := corpus.Snapshot(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	recordedAt := snapshot.AsOf.Add(time.Second)
-	return corpus, interaction.Session{
-		ID: shoal.ID(name + "-session"), RecordedAt: recordedAt,
-		Operation:  interaction.OperationChat,
-		SnapshotID: "snapshot", SnapshotAsOf: snapshot.AsOf,
-		AuthorizationFingerprint: "auth",
-		AuthorizationExpiresAt:   recordedAt.Add(time.Hour),
-		SeedNodeIDs:              []shoal.ID{view.Root.Spans[0].ID},
-	}
+	return nil
 }
 
 func TestFoldRevalidatesRetainedSourceEdgeVisibility(t *testing.T) {
@@ -349,6 +207,22 @@ func TestFoldRevalidatesRetainedSourceEdgeVisibility(t *testing.T) {
 		t.Fatalf("rehydrated fold edges = %+v", rehydrated.Members)
 	}
 	corpus.mu.Lock()
+	corrupted := *currentRecord
+	corrupted.FoldID = legacyID
+	corrupted.Members = cloneFoldMembers(currentRecord.Members)
+	corrupted.Members[0].TouchedEdgeIDs = []shoal.ID{edge.ID}
+	delete(corpus.folds, fold.FoldID)
+	corpus.folds[legacyID] = &corrupted
+	corpus.mu.Unlock()
+	if _, err := corpus.RehydrateFold(
+		ctx, legacyID); !shoal.IsErrorCode(err, shoal.ErrorInternal) {
+		t.Fatalf("legacy ID accepted stored typed edge provenance: %v", err)
+	}
+	corpus.mu.Lock()
+	delete(corpus.folds, legacyID)
+	corpus.folds[fold.FoldID] = currentRecord
+	corpus.mu.Unlock()
+	corpus.mu.Lock()
 	corpus.interactions[session.ID].Deleted = true
 	corpus.mu.Unlock()
 	if touches, err := corpus.InteractionsTouching(
@@ -384,6 +258,70 @@ func TestFoldRevalidatesRetainedSourceEdgeVisibility(t *testing.T) {
 	}
 }
 
+func TestIncompleteInteractionEdgeProvenanceIsNotReadable(t *testing.T) {
+	ctx := context.Background()
+	corpus, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer corpus.Close()
+	receipt, err := corpus.Ingest(ctx, Source{
+		URI:       "file:///incomplete-edge-provenance.txt",
+		MediaType: MediaTypeText,
+		Content:   "incomplete provenance",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	view, err := corpus.Document(ctx, receipt.Document.ID, receipt.Revision.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := interaction.Session{
+		ID:          interaction.DerivedID("session", "incomplete-edge-provenance"),
+		RecordedAt:  time.Unix(1700000000, 0).UTC(),
+		Operation:   interaction.OperationRetrieval,
+		SeedNodeIDs: []shoal.ID{view.Root.Spans[0].ID},
+	}
+	if err := corpus.RecordInteraction(ctx, session); err != nil {
+		t.Fatal(err)
+	}
+	corpus.mu.Lock()
+	if !corpus.interactions[session.ID].EdgeProvenanceComplete {
+		corpus.mu.Unlock()
+		t.Fatal("new interaction did not record complete edge provenance")
+	}
+	corpus.interactions[session.ID].EdgeProvenanceComplete = false
+	corpus.mu.Unlock()
+
+	if summaries, err := corpus.Interactions(ctx); err != nil || len(summaries) != 0 {
+		t.Fatalf("incomplete interaction summaries = %+v, %v", summaries, err)
+	}
+	if records, err := corpus.InteractionRecords(ctx); err != nil || len(records) != 0 {
+		t.Fatalf("incomplete interaction records = %+v, %v", records, err)
+	}
+	if _, err := corpus.InteractionRecord(
+		ctx, session.ID); !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
+		t.Fatalf("incomplete interaction record error = %v", err)
+	}
+	if _, err := corpus.Interaction(
+		ctx, session.ID); !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
+		t.Fatalf("incomplete interaction error = %v", err)
+	}
+	if _, err := corpus.InteractionSubgraph(
+		ctx, session.ID); !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
+		t.Fatalf("incomplete interaction subgraph error = %v", err)
+	}
+	if touching, err := corpus.InteractionsTouching(
+		ctx, view.Root.Spans[0].ID); err != nil || len(touching) != 0 {
+		t.Fatalf("incomplete interaction traversal = %+v, %v", touching, err)
+	}
+	if _, err := corpus.RelatedInteractions(
+		ctx, session.ID); !shoal.IsErrorCode(err, shoal.ErrorNotFound) {
+		t.Fatalf("incomplete direct traversal error = %v", err)
+	}
+}
+
 func TestInteractionWriteResolvesCommittedIndeterminateOutcome(t *testing.T) {
 	ctx := context.Background()
 	corpus, err := Open(t.TempDir())
@@ -405,7 +343,7 @@ func TestInteractionWriteResolvesCommittedIndeterminateOutcome(t *testing.T) {
 	}
 	spanID := view.Root.Spans[0].ID
 	session := interaction.Session{
-		ID:                       "session-indeterminate-committed",
+		ID:                       "interaction.session_indeterminate-committed",
 		RecordedAt:               time.Unix(1700000000, 0).UTC(),
 		SnapshotID:               "snapshot",
 		SnapshotAsOf:             time.Unix(1699999990, 0).UTC(),
@@ -430,6 +368,57 @@ func TestInteractionWriteResolvesCommittedIndeterminateOutcome(t *testing.T) {
 	}
 }
 
+func TestInteractionWriteConjoinsRequiredOutputVisibility(t *testing.T) {
+	corpus, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer corpus.Close()
+	receipt, err := corpus.Ingest(context.Background(), Source{
+		URI: "file:///source.txt", MediaType: MediaTypeText,
+		Content: "durable source",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	view, err := corpus.Document(
+		context.Background(), receipt.Document.ID, receipt.Revision.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := interaction.Session{
+		ID:                       "interaction.session_workspace-output",
+		RecordedAt:               time.Unix(1700000000, 0).UTC(),
+		SnapshotID:               "snapshot",
+		SnapshotAsOf:             time.Unix(1699999990, 0).UTC(),
+		AuthorizationFingerprint: "auth-sha256:test",
+		AuthorizationExpiresAt:   time.Unix(1700003600, 0).UTC(),
+		SeedNodeIDs:              []shoal.ID{view.Root.Spans[0].ID},
+	}
+	ctx, err := interaction.WithRequiredVisibility(
+		context.Background(), []string{"policy:a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := corpus.RecordInteraction(ctx, session); err != nil {
+		t.Fatal(err)
+	}
+	record := corpus.interactions[session.ID]
+	if record == nil || record.Visibility != "policy:a" {
+		t.Fatalf("recorded visibility = %#v", record)
+	}
+	stricter, err := interaction.WithRequiredVisibility(
+		context.Background(), []string{"policy:a", "policy:b"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := corpus.RecordInteraction(
+		stricter, session,
+	); !shoal.IsErrorCode(err, shoal.ErrorConflict) {
+		t.Fatalf("stricter retry error = %v, want conflict", err)
+	}
+}
+
 func TestInteractionWritePreservesUnresolvedIndeterminateOutcome(t *testing.T) {
 	ctx := context.Background()
 	dataDir := t.TempDir()
@@ -451,7 +440,7 @@ func TestInteractionWritePreservesUnresolvedIndeterminateOutcome(t *testing.T) {
 		t.Fatal(err)
 	}
 	session := interaction.Session{
-		ID:                       "session-indeterminate-absent",
+		ID:                       "interaction.session_indeterminate-absent",
 		RecordedAt:               time.Unix(1700000000, 0).UTC(),
 		SnapshotID:               "snapshot",
 		SnapshotAsOf:             time.Unix(1699999990, 0).UTC(),
@@ -498,6 +487,215 @@ func TestInteractionWritePreservesUnresolvedIndeterminateOutcome(t *testing.T) {
 		Content:   "recovered",
 	}); err != nil {
 		t.Fatalf("reopened corpus stayed poisoned: %v", err)
+	}
+}
+
+func TestInteractionResultMarksCancellationAfterDurableCommit(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	corpus, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	defer corpus.Close()
+	write := corpus.writeRecord
+	corpus.interactionRecordWriter = func(
+		row []byte, kind byte, value any,
+	) error {
+		if err := write(row, kind, value); err != nil {
+			return err
+		}
+		cancel()
+		return nil
+	}
+	session := interaction.Session{
+		ID:         interaction.DerivedID("session", "cancel-after-commit"),
+		RecordedAt: time.Unix(1700000000, 0).UTC(),
+		Operation:  interaction.OperationToolCall,
+	}
+	accepted, err := corpus.RecordInteractionResult(ctx, session)
+	if !IsCommittedInteraction(err) ||
+		!shoal.IsErrorCode(err, shoal.ErrorCanceled) {
+		t.Fatalf("post-commit cancellation error = %v", err)
+	}
+	if accepted.ID != session.ID {
+		t.Fatalf("accepted session = %+v", accepted)
+	}
+	if _, err := corpus.Interaction(
+		context.Background(), session.ID); err != nil {
+		t.Fatalf("committed session is unavailable: %v", err)
+	}
+}
+
+func TestInteractionResultDoesNotPerformPostCommitPublicRead(t *testing.T) {
+	corpus, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer corpus.Close()
+	ctx := &stagedCancellationContext{
+		Context: context.Background(), cancelAfter: 3,
+	}
+	session := interaction.Session{
+		ID:         interaction.DerivedID("session", "single-lock-result"),
+		RecordedAt: time.Unix(1700000000, 0).UTC(),
+		Operation:  interaction.OperationToolCall,
+	}
+	accepted, err := corpus.RecordInteractionResult(ctx, session)
+	if err != nil {
+		t.Fatalf("atomic result performed a post-commit read: %v", err)
+	}
+	if accepted.ID != session.ID {
+		t.Fatalf("accepted session = %+v", accepted)
+	}
+	ctx.mu.Lock()
+	calls := ctx.calls
+	ctx.mu.Unlock()
+	if calls != 2 {
+		t.Fatalf("context checks = %d, want admission and post-commit only", calls)
+	}
+}
+
+func TestInteractionResultIsAtomicAgainstConcurrentDeletion(t *testing.T) {
+	ctx := context.Background()
+	corpus, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer corpus.Close()
+	session := interaction.Session{
+		ID:         interaction.DerivedID("session", "delete-race"),
+		RecordedAt: time.Unix(1700000000, 0).UTC(),
+		Operation:  interaction.OperationToolCall,
+	}
+	written := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	write := corpus.writeRecord
+	corpus.interactionRecordWriter = func(
+		row []byte, kind byte, value any,
+	) error {
+		if err := write(row, kind, value); err != nil {
+			return err
+		}
+		if record, ok := value.(persistedInteraction); ok &&
+			!record.Deleted {
+			once.Do(func() {
+				close(written)
+				<-release
+			})
+		}
+		return nil
+	}
+	type result struct {
+		session interaction.Session
+		err     error
+	}
+	recorded := make(chan result, 1)
+	go func() {
+		accepted, recordErr := corpus.RecordInteractionResult(ctx, session)
+		recorded <- result{session: accepted, err: recordErr}
+	}()
+	<-written
+	deleteStarted := make(chan struct{})
+	deleted := make(chan error, 1)
+	go func() {
+		close(deleteStarted)
+		_, deleteErr := corpus.DeleteInteraction(ctx, session.ID)
+		deleted <- deleteErr
+	}()
+	<-deleteStarted
+	time.Sleep(20 * time.Millisecond)
+	close(release)
+	recordResult := <-recorded
+	if recordResult.err != nil || recordResult.session.ID != session.ID {
+		t.Fatalf("atomic record result = %+v, %v",
+			recordResult.session, recordResult.err)
+	}
+	if err := <-deleted; err != nil {
+		t.Fatalf("concurrent deletion failed: %v", err)
+	}
+}
+
+func TestInteractionResultDoesNotRereadAfterVisibilityTightening(t *testing.T) {
+	ctx := context.Background()
+	corpus, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer corpus.Close()
+	source := Source{
+		URI: "file:///visibility-race.txt", MediaType: MediaTypeText,
+		Content: "stable source",
+	}
+	receipt, err := corpus.Ingest(ctx, source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	view, err := corpus.Document(
+		ctx, receipt.Document.ID, receipt.Revision.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := interaction.Session{
+		ID:          interaction.DerivedID("session", "visibility-race"),
+		RecordedAt:  time.Unix(1700000000, 0).UTC(),
+		Operation:   interaction.OperationRetrieval,
+		SeedNodeIDs: []shoal.ID{view.Root.Spans[0].ID},
+	}
+	written := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	write := corpus.writeRecord
+	corpus.interactionRecordWriter = func(
+		row []byte, kind byte, value any,
+	) error {
+		if err := write(row, kind, value); err != nil {
+			return err
+		}
+		if record, ok := value.(persistedInteraction); ok &&
+			!record.Deleted {
+			once.Do(func() {
+				close(written)
+				<-release
+			})
+		}
+		return nil
+	}
+	type result struct {
+		session interaction.Session
+		err     error
+	}
+	recorded := make(chan result, 1)
+	go func() {
+		accepted, recordErr := corpus.RecordInteractionResult(ctx, session)
+		recorded <- result{session: accepted, err: recordErr}
+	}()
+	<-written
+	ingestStarted := make(chan struct{})
+	ingested := make(chan error, 1)
+	go func() {
+		close(ingestStarted)
+		source.Metadata = shoal.Metadata{
+			interaction.PropertyVisibility: "restricted",
+		}
+		_, ingestErr := corpus.Ingest(ctx, source)
+		ingested <- ingestErr
+	}()
+	<-ingestStarted
+	time.Sleep(20 * time.Millisecond)
+	close(release)
+	recordResult := <-recorded
+	if recordResult.err != nil || recordResult.session.ID != session.ID {
+		t.Fatalf("atomic record result = %+v, %v",
+			recordResult.session, recordResult.err)
+	}
+	if err := <-ingested; err != nil {
+		t.Fatalf("visibility tightening failed: %v", err)
+	}
+	if _, err := corpus.InteractionRecord(
+		ctx, session.ID); err == nil {
+		t.Fatal("tightened source left the interaction readable")
 	}
 }
 
@@ -591,139 +789,115 @@ func TestFoldRetryAdoptsCommittedRecord(t *testing.T) {
 	}
 }
 
-func TestFoldVisibilityTracksPersistedEdgeAndOutputRestrictions(t *testing.T) {
-	corpus := &Explorer{
-		graphInitialized: true,
-		graphNodes: map[shoal.ID]graph.Node{
-			"source": {
-				ID: "source", Kind: "source",
-				Properties: shoal.Metadata{
-					interaction.PropertyVisibility: "source",
-				},
+func TestFoldRetryRejectsCommittedRecordAfterSourceChange(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		change func(*testing.T, *Explorer, Source, shoal.ID)
+	}{
+		{
+			name: "visibility reclassification",
+			change: func(
+				t *testing.T, corpus *Explorer, source Source, _ shoal.ID,
+			) {
+				source.Metadata = shoal.Metadata{
+					interaction.PropertyVisibility: "restricted",
+				}
+				if _, err := corpus.Ingest(
+					context.Background(), source); err != nil {
+					t.Fatal(err)
+				}
 			},
 		},
-		graphEdges: map[shoal.ID]graph.Edge{
-			"evidence-edge": {
-				ID: "evidence-edge", From: "left", To: "right", Type: "links",
-				Properties: shoal.Metadata{
-					interaction.PropertyVisibility: "edge",
-				},
+		{
+			name: "member deletion",
+			change: func(
+				t *testing.T, corpus *Explorer, _ Source, sessionID shoal.ID,
+			) {
+				if _, err := corpus.DeleteInteraction(
+					context.Background(), sessionID); err != nil {
+					t.Fatal(err)
+				}
 			},
 		},
-	}
-	record := &persistedFold{
-		Nodes: []graph.Node{{ID: "fold", Kind: interaction.KindFold}},
-		Edges: []graph.Edge{{
-			ID: "retrieved", From: "fold", To: "source",
-			Type: interaction.EdgeRetrieved,
-		}},
-		SourceEdgeIDs:      []shoal.ID{"evidence-edge"},
-		RequiredVisibility: []string{"output"},
-		Visibility:         "edge&output&source",
-	}
-	current, err := corpus.currentFoldVisibilityLocked(record)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if current != record.Visibility {
-		t.Fatalf("current fold visibility = %q, want %q",
-			current, record.Visibility)
-	}
-	edge := corpus.graphEdges["evidence-edge"]
-	edge.Properties[interaction.PropertyVisibility] = "edge&tight"
-	corpus.graphEdges["evidence-edge"] = edge
-	current, err = corpus.currentFoldVisibilityLocked(record)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if visibilityCovered(record.Visibility, current) {
-		t.Fatalf("tightened edge remained covered: stored=%q current=%q",
-			record.Visibility, current)
-	}
-}
-
-func TestInteractionVisibilityTracksPersistedEdgeAndOutputRestrictions(
-	t *testing.T,
-) {
-	corpus := &Explorer{
-		graphInitialized: true,
-		graphNodes: map[shoal.ID]graph.Node{
-			"source": {
-				ID: "source", Kind: "source",
-				Properties: shoal.Metadata{
-					interaction.PropertyVisibility: "source",
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			corpus, err := Open(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer corpus.Close()
+			source := Source{
+				URI:       "file:///fold-retry-source.txt",
+				MediaType: MediaTypeText,
+				Content:   "stable fold source",
+				Metadata: shoal.Metadata{
+					interaction.PropertyVisibility: "open",
 				},
-			},
-		},
-		graphEdges: map[shoal.ID]graph.Edge{
-			"evidence-edge": {
-				ID: "evidence-edge", From: "left", To: "right", Type: "links",
-				Properties: shoal.Metadata{
-					interaction.PropertyVisibility: "edge",
-				},
-			},
-		},
-	}
-	record := &persistedInteraction{
-		SessionID: "session",
-		Session: interaction.Session{
-			ID:                 "session",
-			RequiredVisibility: []string{"output"},
-			CitedEvidence: []interaction.EvidenceReference{{
-				AnchorID: "anchor", Kind: interaction.EvidenceGraph,
-				NodeIDs: []shoal.ID{"source"},
-				EdgeIDs: []shoal.ID{"evidence-edge"},
-			}},
-		},
-		Nodes: []graph.Node{{ID: "session", Kind: interaction.KindSession}},
-		Edges: []graph.Edge{{
-			ID: "cited", From: "session", To: "source",
-			Type: interaction.EdgeCited,
-		}},
-		Visibility: "edge&output&source",
-	}
-	corpus.interactions = map[shoal.ID]*persistedInteraction{
-		record.SessionID: record,
-	}
-	corpus.interactionOrder = []shoal.ID{record.SessionID}
-	current, err := corpus.currentInteractionVisibilityLocked(record)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if current != record.Visibility {
-		t.Fatalf("current interaction visibility = %q, want %q",
-			current, record.Visibility)
-	}
-	if records, err := corpus.InteractionRecords(
-		context.Background(),
-	); err != nil || len(records) != 1 {
-		t.Fatalf("initial interaction records = %d, %v", len(records), err)
-	}
-	if _, err := corpus.InteractionRecord(
-		context.Background(), record.SessionID,
-	); err != nil {
-		t.Fatalf("initial interaction point read = %v", err)
-	}
-	edge := corpus.graphEdges["evidence-edge"]
-	edge.Properties[interaction.PropertyVisibility] = "edge&tight"
-	corpus.graphEdges["evidence-edge"] = edge
-	current, err = corpus.currentInteractionVisibilityLocked(record)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if visibilityCovered(record.Visibility, current) {
-		t.Fatalf("tightened edge remained covered: stored=%q current=%q",
-			record.Visibility, current)
-	}
-	if records, err := corpus.InteractionRecords(
-		context.Background(),
-	); err != nil || len(records) != 0 {
-		t.Fatalf("tightened interaction records = %d, %v", len(records), err)
-	}
-	if _, err := corpus.InteractionRecord(
-		context.Background(), record.SessionID,
-	); !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
-		t.Fatalf("tightened interaction point read = %v", err)
+			}
+			receipt, err := corpus.Ingest(ctx, source)
+			if err != nil {
+				t.Fatal(err)
+			}
+			view, err := corpus.Document(
+				ctx, receipt.Document.ID, receipt.Revision.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			session := interaction.Session{
+				ID: interaction.DerivedID(
+					"session", "fold-source-change", test.name),
+				RecordedAt:  time.Unix(1700000000, 0).UTC(),
+				Operation:   interaction.OperationRetrieval,
+				SeedNodeIDs: []shoal.ID{view.Root.Spans[0].ID},
+			}
+			if err := corpus.RecordInteraction(ctx, session); err != nil {
+				t.Fatal(err)
+			}
+			summaryDigest := interaction.Digest(
+				"fold source change " + test.name)
+			write := corpus.writeRecord
+			foldWrites := 0
+			var accepted persistedFold
+			corpus.interactionRecordWriter = func(
+				row []byte, kind byte, value any,
+			) error {
+				if fold, ok := value.(persistedFold); ok &&
+					!fold.Deleted {
+					foldWrites++
+					if foldWrites > 1 {
+						return errors.New("unexpected second fold write")
+					}
+					accepted = fold
+					if err := write(row, kind, value); err != nil {
+						return err
+					}
+					return errors.New("simulated committed fold error")
+				}
+				return write(row, kind, value)
+			}
+			if _, err := corpus.FoldInteractions(ctx, FoldRequest{
+				SessionIDs:    []shoal.ID{session.ID},
+				SummaryDigest: summaryDigest,
+			}); err == nil {
+				t.Fatalf("initial fold error = %v", err)
+			}
+			if accepted.FoldID == "" || foldWrites != 1 {
+				t.Fatalf("accepted fold = %+v, writes = %d",
+					accepted, foldWrites)
+			}
+			test.change(t, corpus, source, session.ID)
+			_, err = corpus.FoldInteractions(ctx, FoldRequest{
+				SessionIDs:    []shoal.ID{session.ID},
+				SummaryDigest: summaryDigest,
+			})
+			if err == nil {
+				t.Fatal("committed fold retry reused stale member evidence")
+			}
+			if foldWrites != 1 {
+				t.Fatalf("fold writes = %d", foldWrites)
+			}
+		})
 	}
 }
 
@@ -906,5 +1080,154 @@ func TestConditionalInteractionCreateKeepsOneWinner(t *testing.T) {
 	}
 	if stored.Session.StopReason != first.Session.StopReason {
 		t.Fatalf("durable winner = %+v", stored.Session)
+	}
+}
+
+func TestInteractionRetryCancellationRemainsCommitted(t *testing.T) {
+	corpus, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer corpus.Close()
+	session := interaction.Session{
+		ID:         interaction.DerivedID("session", "retry-cancellation"),
+		RecordedAt: time.Unix(1700000000, 0).UTC(),
+		Operation:  interaction.OperationToolCall,
+	}
+	first, err := corpus.RecordInteractionResult(context.Background(), session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The exact record is already durable, so the retry observes it and only
+	// then sees the cancellation.
+	ctx := &stagedCancellationContext{
+		Context: context.Background(), cancelAfter: 2,
+	}
+	retried, err := corpus.RecordInteractionResult(ctx, session)
+	if err == nil {
+		t.Fatal("cancellation after durable reconciliation was not reported")
+	}
+	if !IsCommittedInteraction(err) {
+		t.Fatalf("durable retry cancellation reported as rollback: %v", err)
+	}
+	if !reflect.DeepEqual(retried, first) {
+		t.Fatalf("reconciled session = %+v, want %+v", retried, first)
+	}
+}
+
+// TestSnapshotObjectDigestSeparatesOpaqueBytes pins that the snapshot binding
+// digest distinguishes graph objects whose opaque IDs, endpoints, or metadata
+// differ only in bytes that a JSON encoding would fold onto U+FFFD.
+func TestSnapshotObjectDigestSeparatesOpaqueBytes(t *testing.T) {
+	pinnedEdge := graph.Edge{
+		ID: "edge", From: "from", To: shoal.ID([]byte{0xFF}), Type: "cites",
+	}
+	mutatedEdge := pinnedEdge
+	mutatedEdge.To = shoal.ID([]byte{0xFE})
+	pinned, err := snapshotObjectDigest(pinnedEdge)
+	if err != nil {
+		t.Fatalf("digest pinned edge: %v", err)
+	}
+	mutated, err := snapshotObjectDigest(mutatedEdge)
+	if err != nil {
+		t.Fatalf("digest mutated edge: %v", err)
+	}
+	if pinned == mutated {
+		t.Fatal("mutated edge endpoint kept its pinned snapshot digest")
+	}
+	pinnedNode := graph.Node{
+		ID:         "node",
+		Kind:       "entity",
+		Properties: shoal.Metadata{"p": string([]byte{0xFF, 'A'})},
+	}
+	mutatedNode := graph.Node{
+		ID:         "node",
+		Kind:       "entity",
+		Properties: shoal.Metadata{"p": string([]byte{0x80, 'A'})},
+	}
+	pinned, err = snapshotObjectDigest(pinnedNode)
+	if err != nil {
+		t.Fatalf("digest pinned node: %v", err)
+	}
+	mutated, err = snapshotObjectDigest(mutatedNode)
+	if err != nil {
+		t.Fatalf("digest mutated node: %v", err)
+	}
+	if pinned == mutated {
+		t.Fatal("mutated node metadata kept its pinned snapshot digest")
+	}
+	if _, err := snapshotObjectDigest("unsupported"); err == nil {
+		t.Fatal("expected an error for an unknown snapshot object")
+	}
+}
+
+// TestDeletedFoldMemberProvenanceIsNotRehydratable pins that a fold whose
+// create returned an indeterminate commit cannot be used to recover the
+// provenance of a member session that was deleted before the fold was
+// reconciled. The in-memory guard in DeleteInteraction cannot see that fold,
+// so the retention contract has to hold at the exposure points too.
+func TestDeletedFoldMemberProvenanceIsNotRehydratable(t *testing.T) {
+	ctx := context.Background()
+	corpus, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer corpus.Close()
+	receipt, err := corpus.Ingest(ctx, Source{
+		URI:       "file:///deleted-fold-member.txt",
+		MediaType: MediaTypeText,
+		Content:   "folded member source",
+		Metadata: shoal.Metadata{
+			interaction.PropertyVisibility: "open",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	view, err := corpus.Document(ctx, receipt.Document.ID, receipt.Revision.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := interaction.Session{
+		ID:          interaction.DerivedID("session", "deleted-fold-member"),
+		RecordedAt:  time.Unix(1700000000, 0).UTC(),
+		Operation:   interaction.OperationRetrieval,
+		SeedNodeIDs: []shoal.ID{view.Root.Spans[0].ID},
+	}
+	if err := corpus.RecordInteraction(ctx, session); err != nil {
+		t.Fatal(err)
+	}
+	request := FoldRequest{
+		SessionIDs:    []shoal.ID{session.ID},
+		SummaryDigest: interaction.Digest("deleted fold member"),
+	}
+	write := corpus.writeRecord
+	var accepted persistedFold
+	corpus.interactionRecordWriter = func(
+		row []byte, kind byte, value any,
+	) error {
+		if fold, ok := value.(persistedFold); ok && !fold.Deleted {
+			accepted = fold
+			if err := write(row, kind, value); err != nil {
+				return err
+			}
+			return errors.New("simulated committed fold error")
+		}
+		return write(row, kind, value)
+	}
+	if _, err := corpus.FoldInteractions(ctx, request); err == nil {
+		t.Fatal("expected the simulated committed fold error")
+	}
+	if _, err := corpus.DeleteInteraction(ctx, session.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := corpus.FoldInteractions(ctx, request); err == nil {
+		t.Fatal("committed fold retry reused a deleted member")
+	}
+	if _, err := corpus.RehydrateFold(ctx, accepted.FoldID); err == nil {
+		t.Fatal("rehydrated the provenance of a deleted session")
+	}
+	if _, err := corpus.FoldSubgraph(ctx, accepted.FoldID); err == nil {
+		t.Fatal("served the subgraph of a deleted session's provenance")
 	}
 }

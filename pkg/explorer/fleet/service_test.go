@@ -19,7 +19,9 @@ package fleet
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
+	"fmt"
 	"math"
 	"sort"
 	"sync"
@@ -30,6 +32,14 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
+
+func TestCanonicalSchemaRejectsTrailingJSON(t *testing.T) {
+	if _, err := canonicalSchema(
+		json.RawMessage(`{"type":"object"} {"type":"string"}`),
+	); !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
+		t.Fatalf("trailing schema JSON = %v", err)
+	}
+}
 
 func TestGenerationValidationRejectsIncrementOverflow(t *testing.T) {
 	if err := validateGeneration(math.MaxInt64); !shoal.IsErrorCode(
@@ -44,78 +54,187 @@ func TestGenerationValidationRejectsIncrementOverflow(t *testing.T) {
 	}
 }
 
-func TestServiceListPaginatesAfterIncrementalFiltering(t *testing.T) {
-	now := time.Date(2026, 9, 6, 12, 0, 0, 0, time.UTC)
+func TestRegisterExactReplaySurvivesLeaseExpiry(t *testing.T) {
+	now := time.Date(2026, 9, 6, 8, 0, 0, 0, time.UTC)
 	authority, err := auth.NewAuthorityWithClock(func() time.Time { return now })
 	if err != nil {
 		t.Fatal(err)
 	}
-	store := newMemoryStore()
-	for _, value := range []struct {
-		id     shoal.ID
-		source string
-	}{
-		{id: "agent-a", source: "source-b"},
-		{id: "agent-b", source: "source-a"},
-		{id: "agent-c", source: "source-a"},
-	} {
-		descriptor := Descriptor{
-			ID: value.id, Generation: 1,
-			Subject: "owner", Actor: "owner-actor",
-			AuthorizationDomain: []byte("domain"),
-			Scopes: []Scope{{
-				SourceID: []byte(value.source), PolicyID: []byte("policy"),
-			}},
-			ExecutorRef: "exec",
-			Capabilities: []Capability{{
-				Name: "search", Actions: []Action{{
-					Name:         "query",
-					InputSchema:  json.RawMessage(`{"type":"object"}`),
-					OutputSchema: json.RawMessage(`{"type":"object"}`),
-				}},
-			}},
-			LeaseExpiresAt: now.Add(time.Hour), UpdatedAt: now,
-		}
-		store.records[value.id] = Stored{Descriptor: descriptor}
-	}
+	recorder := &memoryRecorder{}
 	service, err := NewService(Config{
-		Store: store, Resolver: authority.Resolver(),
-		Recorder: &memoryRecorder{}, Snapshots: fixedSnapshot{now},
+		Store: newMemoryStore(), Resolver: authority.Resolver(),
+		Recorder: recorder, Snapshots: fixedSnapshot{now},
 		Executors: executorMap{"exec": struct{}{}},
 		Clock:     func() time.Time { return now },
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	list := func(requestID shoal.ID, cursor string) ListPage {
-		t.Helper()
-		decision := testDecision(
-			t, "owner", "owner-actor", string(requestID),
-			[][]byte{[]byte("source-a")},
-		)
-		page, listErr := service.List(
-			bindDecision(t, authority, decision),
-			ListRequest{
-				Context: requestContext(now, string(requestID)),
-				Limit:   1, Cursor: cursor,
-			},
-		)
-		if listErr != nil {
-			t.Fatal(listErr)
+	decision := testDecision(
+		t, "owner", "owner-actor", "late-retry", [][]byte{[]byte("source-a")})
+	ctx := bindDecision(t, authority, decision)
+	request := registerRequest(
+		now, "late-retry", "late-retry-agent", "", "source-a")
+	request.Spec.LeaseExpiresAt = now.Add(time.Second)
+
+	registered, err := service.Register(ctx, request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(2 * time.Second)
+	replayed, err := service.Register(ctx, request)
+	if err != nil {
+		t.Fatalf("exact replay after lease expiry = %v", err)
+	}
+	if descriptorDigest(replayed) != descriptorDigest(registered) {
+		t.Fatal("exact replay did not return the original descriptor")
+	}
+	recorder.mu.Lock()
+	recordCount := len(recorder.records)
+	recorder.mu.Unlock()
+	if recordCount != 1 {
+		t.Fatalf("lifecycle record count = %d, want 1", recordCount)
+	}
+
+	divergent := request
+	divergent.Spec.ExecutorRef = "changed"
+	if _, err := service.Register(ctx, divergent); !shoal.IsErrorCode(
+		err, shoal.ErrorConflict,
+	) {
+		t.Fatalf("divergent late replay = %v", err)
+	}
+}
+
+func TestActiveChainIsBoundedAndHidesUnauthorizedParents(t *testing.T) {
+	now := time.Date(2026, 9, 6, 8, 0, 0, 0, time.UTC)
+	store := newMemoryStore()
+	service := &Service{store: store}
+	for index := 0; index <= MaxDelegationDepth; index++ {
+		id := shoal.ID(string(rune('a' + index)))
+		parent := shoal.ID("")
+		if index < MaxDelegationDepth {
+			parent = shoal.ID(string(rune('a' + index + 1)))
 		}
-		return page
+
+		store.records[id] = Stored{Descriptor: Descriptor{
+			ID: id, Generation: 1, Subject: "owner", ParentID: parent,
+			AuthorizationDomain: []byte("domain"),
+			Scopes:              []Scope{{SourceID: []byte("source-a"), PolicyID: []byte("policy")}},
+			Capabilities:        []Capability{{Name: "search"}},
+			LeaseExpiresAt:      now.Add(time.Hour),
+		}}
 	}
-	first := list("list-1", "")
-	if len(first.Descriptors) != 1 ||
-		first.Descriptors[0].ID != "agent-b" ||
-		first.NextCursor == "" {
-		t.Fatalf("first filtered page = %#v", first)
+	if _, err := service.active(
+		context.Background(), "a", now,
+	); !shoal.IsErrorCode(err, shoal.ErrorNotFound) {
+		t.Fatalf("over-depth delegation = %v", err)
 	}
-	second := list("list-2", first.NextCursor)
-	if len(second.Descriptors) != 1 ||
-		second.Descriptors[0].ID != "agent-c" ||
-		second.NextCursor != "" {
-		t.Fatalf("second filtered page = %#v", second)
+
+	child := store.records["a"]
+	child.Descriptor.ParentID = "parent"
+	store.records["a"] = child
+	store.records["parent"] = Stored{Descriptor: Descriptor{
+		ID: "parent", Generation: 1, Subject: "owner",
+		AuthorizationDomain: []byte("domain"),
+		Scopes: []Scope{
+			{SourceID: []byte("source-a"), PolicyID: []byte("policy")},
+			{SourceID: []byte("source-b"), PolicyID: []byte("policy")},
+		},
+		Capabilities:   []Capability{{Name: "search"}},
+		LeaseExpiresAt: now.Add(time.Hour),
+	}}
+	decision := testDecision(
+		t, "peer", "peer-actor", "request", [][]byte{[]byte("source-a")})
+	if _, err := service.authorizedActive(
+		context.Background(), decision, "a", now,
+	); !shoal.IsErrorCode(err, shoal.ErrorNotFound) {
+		t.Fatalf("hidden parent resolution = %v", err)
+	}
+}
+
+func TestRegisterRejectsOverDepthAndConcealsForeignParent(t *testing.T) {
+	now := time.Date(2026, 9, 6, 8, 0, 0, 0, time.UTC)
+	authority, err := auth.NewAuthorityWithClock(func() time.Time { return now })
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	store := newMemoryStore()
+	service, err := NewService(Config{
+		Store: store, Resolver: authority.Resolver(), Recorder: &memoryRecorder{},
+		Snapshots: fixedSnapshot{now},
+		Executors: executorMap{"exec": struct{}{}}, Clock: func() time.Time { return now },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	decision := testDecision(
+		t, "owner", "owner-actor", "depth-request", [][]byte{[]byte("source-a")})
+	ctx := bindDecision(t, authority, decision)
+	parent := shoal.ID("")
+	for index := 0; index < MaxDelegationDepth; index++ {
+		id := shoal.ID(fmt.Sprintf("depth-%02d", index))
+		request := registerRequest(
+			now, "depth-request", string(id), string(parent), "source-a")
+		if _, err := service.Register(ctx, request); err != nil {
+			t.Fatalf("register depth %d: %v", index+1, err)
+		}
+		parent = id
+	}
+	overDepth := registerRequest(
+		now, "depth-request", "depth-overflow", string(parent), "source-a")
+	if _, err := service.Register(ctx, overDepth); !shoal.IsErrorCode(
+		err, shoal.ErrorInvalidArgument,
+	) {
+		t.Fatalf("over-depth registration = %v", err)
+	}
+
+	foreignSpec := registerRequest(
+		now, "depth-request", "foreign-parent", "", "source-a").Spec
+	foreign, err := foreignSpec.canonical(now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.records[foreign.ID] = Stored{Descriptor: Descriptor{
+		ID: foreign.ID, Generation: 1, Subject: "other", Actor: "other-actor",
+		AuthorizationDomain: foreign.AuthorizationDomain, Scopes: foreign.Scopes,
+		ExecutorRef: foreign.ExecutorRef, Capabilities: foreign.Capabilities,
+		LeaseExpiresAt: foreign.LeaseExpiresAt, UpdatedAt: now,
+	}}
+	child := registerRequest(
+		now, "depth-request", "foreign-child", string(foreign.ID), "source-a")
+	if _, err := service.Register(ctx, child); !shoal.IsErrorCode(
+		err, shoal.ErrorNotFound,
+	) {
+		t.Fatalf("foreign parent registration = %v", err)
+	}
+}
+
+func TestRegisterDoesNotProbeExecutorBeforeScopeAuthorization(t *testing.T) {
+	now := time.Date(2026, 9, 6, 8, 0, 0, 0, time.UTC)
+	authority, err := auth.NewAuthorityWithClock(func() time.Time { return now })
+	if err != nil {
+		t.Fatal(err)
+	}
+	executors := &countingExecutorRegistry{known: true}
+	service, err := NewService(Config{
+		Store: newMemoryStore(), Resolver: authority.Resolver(),
+		Recorder: &memoryRecorder{}, Snapshots: fixedSnapshot{now},
+		Executors: executors, Clock: func() time.Time { return now },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	decision := testDecision(
+		t, "owner", "owner-actor", "scope-request", [][]byte{[]byte("source-a")})
+	request := registerRequest(now, "scope-request", "agent", "", "source-b")
+	if _, err := service.Register(
+		bindDecision(t, authority, decision), request,
+	); err == nil {
+		t.Fatalf("unauthorized registration = %v", err)
+	}
+	if executors.calls != 0 {
+		t.Fatalf("unauthorized registration probed executor registry %d times", executors.calls)
 	}
 }
 
@@ -226,6 +345,13 @@ func TestServiceAuthorizationDelegationLeaseAndRevocation(t *testing.T) {
 	}); !shoal.IsErrorCode(err, shoal.ErrorUnauthorized) {
 		t.Fatalf("delegated heartbeat lease widening = %v", err)
 	}
+	if _, err := service.Heartbeat(otherCtx, HeartbeatRequest{
+		Context: requestContext(now, "request-3"), RegistrationKey: "foreign-heartbeat",
+		ID: parent.ID, ExpectedGeneration: parent.Generation,
+		LeaseExpiresAt: now.Add(time.Hour),
+	}); !shoal.IsErrorCode(err, shoal.ErrorNotFound) {
+		t.Fatalf("cross-principal heartbeat = %v", err)
+	}
 	heartbeat, err := service.Heartbeat(heartbeatCtx, HeartbeatRequest{
 		Context: requestContext(now, "request-4"), RegistrationKey: "heartbeat-key",
 		ID: parent.ID, ExpectedGeneration: parent.Generation,
@@ -246,11 +372,30 @@ func TestServiceAuthorizationDelegationLeaseAndRevocation(t *testing.T) {
 	revokeDecision := testDecision(t, "owner", "owner-actor", "request-5",
 		[][]byte{[]byte("source-a"), []byte("source-b")})
 	revokeCtx := bindDecision(t, authority, revokeDecision)
-	if _, err := service.Revoke(revokeCtx, RevokeRequest{
+	if _, err := service.Revoke(otherCtx, RevokeRequest{
+		Context: requestContext(now, "request-3"), RegistrationKey: "foreign-revoke",
+		ID: parent.ID, ExpectedGeneration: heartbeat.Generation,
+	}); !shoal.IsErrorCode(err, shoal.ErrorNotFound) {
+		t.Fatalf("cross-principal revoke = %v", err)
+	}
+	revoked, err := service.Revoke(revokeCtx, RevokeRequest{
 		Context: requestContext(now, "request-5"), RegistrationKey: "revoke-key",
 		ID: parent.ID, ExpectedGeneration: heartbeat.Generation,
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatal(err)
+	}
+	now = now.Add(time.Minute)
+	replayed, err := service.Revoke(revokeCtx, RevokeRequest{
+		Context: requestContext(now, "request-5"), RegistrationKey: "revoke-key",
+		ID: parent.ID, ExpectedGeneration: heartbeat.Generation,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if replayed.Generation != revoked.Generation ||
+		!replayed.RevokedAt.Equal(revoked.RevokedAt) {
+		t.Fatalf("replayed revoke changed descriptor: before=%#v after=%#v", revoked, replayed)
 	}
 	if _, err := service.Resolve(revokeCtx, ResolveRequest{
 		Context: requestContext(now, "request-5"), ID: parent.ID,
@@ -272,8 +417,8 @@ func TestServiceAuthorizationDelegationLeaseAndRevocation(t *testing.T) {
 	) {
 		t.Fatalf("parent-revoked current delivery validation = %v", err)
 	}
-	if recorder.count() != 5 {
-		t.Fatalf("lifecycle records = %d, want 5", recorder.count())
+	if recorder.count() != 6 {
+		t.Fatalf("lifecycle records = %d, want 6", recorder.count())
 	}
 }
 
@@ -310,17 +455,69 @@ func TestServiceRecorderAndAmbiguousStoreFailClosed(t *testing.T) {
 	}
 }
 
-type memoryStore struct {
-	mu       sync.Mutex
-	records  map[shoal.ID]Stored
-	keys     map[shoal.ID][32]byte
-	applyErr error
+func TestLifecycleCarriesTrustedAuthorizationPins(t *testing.T) {
+	now := time.Date(2026, 9, 5, 20, 0, 0, 0, time.UTC)
+	authority, err := auth.NewAuthorityWithClock(func() time.Time { return now })
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder := &memoryRecorder{}
+	service, err := NewService(Config{
+		Store: newMemoryStore(), Resolver: authority.Resolver(), Recorder: recorder,
+		Snapshots: fixedSnapshot{now},
+		Executors: executorMap{"exec": struct{}{}}, Clock: func() time.Time { return now },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	decision := testDecision(t, "owner", "actor", "request-pins", [][]byte{[]byte("source-a")})
+	ctx := bindDecision(t, authority, decision)
+	if _, err := service.Register(ctx, registerRequest(
+		now, "request-pins", "pinned-agent", "", "source-a",
+	)); err != nil {
+		t.Fatal(err)
+	}
+	record := recorder.last(t)
+	fingerprint, err := auth.AuthorizationFingerprint(decision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.Operation != auth.OperationAgentRegister ||
+		record.AuthorizationFingerprint != fingerprint ||
+		!record.AuthorizationExpiresAt.Equal(decision.AuthenticationExpires()) ||
+		record.AuditPurpose != decision.AuditPurpose() ||
+		record.SnapshotID != "snapshot" || !record.SnapshotAsOf.Equal(now) {
+		t.Fatalf("lifecycle authorization pins = %#v", record)
+	}
+}
+
+func TestServiceRejectsTypedNilRecorder(t *testing.T) {
+	now := time.Date(2026, 9, 5, 20, 0, 0, 0, time.UTC)
+	authority, err := auth.NewAuthorityWithClock(func() time.Time { return now })
+	if err != nil {
+		t.Fatal(err)
+	}
+	var recorder *memoryRecorder
+	if _, err := NewService(Config{
+		Store: newMemoryStore(), Resolver: authority.Resolver(), Recorder: recorder,
+		Snapshots: fixedSnapshot{now}, Executors: executorMap{"exec": struct{}{}},
+		Clock: func() time.Time { return now },
+	}); !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
+		t.Fatalf("typed-nil recorder = %v", err)
+	}
 }
 
 type fixedSnapshot struct{ now time.Time }
 
 func (s fixedSnapshot) InteractionSnapshot(context.Context) (explorer.Snapshot, error) {
 	return explorer.Snapshot{ID: "snapshot", AsOf: s.now, Frontier: 1}, nil
+}
+
+type memoryStore struct {
+	mu       sync.Mutex
+	records  map[shoal.ID]Stored
+	keys     map[shoal.ID][32]byte
+	applyErr error
 }
 
 func newMemoryStore() *memoryStore {
@@ -334,11 +531,22 @@ func (s *memoryStore) Apply(_ context.Context, mutation Mutation) (Stored, error
 		return Stored{}, s.applyErr
 	}
 	current, exists := s.records[mutation.Descriptor.ID]
+	keyDigest := sha256.Sum256([]byte(mutation.RegistrationKey))
+	if exists &&
+		current.Descriptor.Generation == mutation.ExpectedGeneration+1 &&
+		current.RegistrationDigest == keyDigest &&
+		current.Digest == descriptorDigest(mutation.Descriptor) {
+		return current, nil
+	}
 	if (!exists && mutation.ExpectedGeneration != 0) ||
 		(exists && current.Descriptor.Generation != mutation.ExpectedGeneration) {
 		return Stored{}, shoal.NewError(shoal.ErrorConflict, "generation conflict")
 	}
-	stored := Stored{Descriptor: cloneDescriptor(mutation.Descriptor), Epoch: mutation.Descriptor.Generation}
+	stored := Stored{
+		Descriptor:         cloneDescriptor(mutation.Descriptor),
+		RegistrationDigest: keyDigest,
+		Epoch:              mutation.Descriptor.Generation,
+	}
 	stored.Digest = descriptorDigest(stored.Descriptor)
 	s.records[mutation.Descriptor.ID] = stored
 	return stored, nil
@@ -355,44 +563,59 @@ func (s *memoryStore) Get(_ context.Context, id shoal.ID) (Stored, error) {
 	return stored, nil
 }
 
-func (s *memoryStore) ListPage(
-	_ context.Context, cursor string, limit uint32,
+func (s *memoryStore) List(
+	_ context.Context, cursor []byte, limit int,
 ) (StoredPage, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	ids := make([]shoal.ID, 0, len(s.records))
-	for id := range s.records {
-		ids = append(ids, id)
-	}
-	sort.Slice(ids, func(i, j int) bool {
-		return shoal.CompareID(ids[i], ids[j]) < 0
-	})
-	start := sort.Search(len(ids), func(index int) bool {
-		return shoal.CompareID(ids[index], shoal.ID(cursor)) > 0
-	})
-	result := StoredPage{
-		Items: make([]StoredListItem, 0, limit),
-	}
-	for _, id := range ids[start:] {
-		stored := s.records[id]
+	result := make([]Stored, 0, len(s.records))
+	for _, stored := range s.records {
 		stored.Descriptor = cloneDescriptor(stored.Descriptor)
-		result.Items = append(result.Items, StoredListItem{
-			Stored: stored, Cursor: string(id),
-		})
-		if len(result.Items) == int(limit) {
-			if start+len(result.Items) < len(ids) {
-				result.NextCursor = string(id)
-			}
+		result = append(result, stored)
+	}
+	sort.Slice(result, func(i, j int) bool {
+		return result[i].Descriptor.ID < result[j].Descriptor.ID
+	})
+	page := StoredPage{}
+	after := shoal.ID(string(cursor))
+	for _, stored := range result {
+		if stored.Descriptor.ID <= after {
+			continue
+		}
+		if len(page.Entries) == limit {
+			page.Next = []byte(page.Entries[len(page.Entries)-1].Descriptor.ID)
 			break
 		}
+		page.Entries = append(page.Entries, stored)
 	}
-	return result, nil
+	return page, nil
 }
 
 type memoryRecorder struct {
 	mu      sync.Mutex
 	records []Lifecycle
 	err     error
+}
+
+func TestRegistryMutationDigestIgnoresServerAcceptanceTime(t *testing.T) {
+	mutation := Mutation{
+		RegistrationKey:    "retry-key",
+		ExpectedGeneration: 4,
+		Descriptor: Descriptor{
+			ID: "agent", Generation: 5, Subject: "subject", Actor: "actor",
+			AuthorizationDomain: []byte("domain"), ExecutorRef: "executor",
+			LeaseExpiresAt: time.Unix(100, 0), UpdatedAt: time.Unix(10, 0),
+		},
+	}
+	first := registryMutationDigest(mutation)
+	mutation.Descriptor.UpdatedAt = time.Unix(20, 0)
+	if second := registryMutationDigest(mutation); second != first {
+		t.Fatal("server-derived acceptance time changed logical mutation digest")
+	}
+	mutation.Descriptor.LeaseExpiresAt = time.Unix(101, 0)
+	if changed := registryMutationDigest(mutation); changed == first {
+		t.Fatal("logical mutation change did not change digest")
+	}
 }
 
 func (r *memoryRecorder) RecordLifecycle(_ context.Context, lifecycle Lifecycle) error {
@@ -406,12 +629,31 @@ func (r *memoryRecorder) count() int {
 	defer r.mu.Unlock()
 	return len(r.records)
 }
+func (r *memoryRecorder) last(t *testing.T) Lifecycle {
+	t.Helper()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if len(r.records) == 0 {
+		t.Fatal("no lifecycle records")
+	}
+	return r.records[len(r.records)-1]
+}
 
 type executorMap map[string]Executor
 
 func (m executorMap) ResolveExecutor(ref string) (Executor, bool) {
 	executor, ok := m[ref]
 	return executor, ok
+}
+
+type countingExecutorRegistry struct {
+	calls int
+	known bool
+}
+
+func (r *countingExecutorRegistry) ResolveExecutor(string) (Executor, bool) {
+	r.calls++
+	return struct{}{}, r.known
 }
 
 func testDecision(t *testing.T, subject, actor, requestID string, sources [][]byte) auth.Decision {

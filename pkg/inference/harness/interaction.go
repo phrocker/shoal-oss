@@ -97,6 +97,17 @@ func (r *GraphRecorder) Record(ctx context.Context, record EvaluationRecord) err
 	if err != nil {
 		return err
 	}
+	if sink, ok := r.sink.(interaction.ResultSink); ok {
+		persisted, err := sink.RecordInteractionResult(ctx, session)
+		if err != nil {
+			return err
+		}
+		if err := interaction.ValidateRecordedSession(session, persisted); err != nil {
+			return interaction.MarkCommittedRecord(invalid(
+				"interaction sink returned an invalid or mismatched persisted session"))
+		}
+		return nil
+	}
 	return r.sink.RecordInteraction(ctx, session)
 }
 
@@ -133,19 +144,6 @@ func InteractionSession(
 		return interaction.Session{}, invalid(
 			"evaluation authorization expiry is required")
 	}
-	if (record.EmbeddingSpaceID == "") !=
-		(len(record.EmbeddingSpaceIDs) == 0) {
-		return interaction.Session{}, invalid(
-			"evaluation embedding space aggregate and constituents must be present together")
-	}
-	if len(record.EmbeddingSpaceIDs) > 0 {
-		aggregate, err := retrieval.EmbeddingSpaceSetID(
-			record.EmbeddingSpaceIDs...)
-		if err != nil || aggregate != record.EmbeddingSpaceID {
-			return interaction.Session{}, invalid(
-				"evaluation embedding space identity is not canonical")
-		}
-	}
 	session := interaction.Session{
 		ID:                       interaction.SessionID(record.TranscriptID, recordedAt),
 		RecordedAt:               recordedAt.UTC(),
@@ -154,9 +152,8 @@ func InteractionSession(
 		SnapshotAsOf:             record.SnapshotAsOf,
 		AuthorizationFingerprint: record.AuthorizationFingerprint,
 		AuthorizationExpiresAt:   record.AuthorizationExpiresAt,
-		EmbeddingSpaceID:         record.EmbeddingSpaceID,
-		EmbeddingSpaceIDs: append(
-			[]shoal.ID(nil), record.EmbeddingSpaceIDs...),
+		AuthorizationOperation:   record.AuthorizationOperation,
+		EmbeddingSpaces:          record.EmbeddingSpaces,
 		Provenance: interaction.Provenance{
 			Harness:      interactionIdentifier(record.Provenance.Harness()),
 			Provider:     interactionIdentifier(record.Provenance.Provider()),
@@ -173,7 +170,9 @@ func InteractionSession(
 		ResultID:      record.ResultID,
 		StopReason:    string(record.StopReason),
 		SeedNodeIDs:   record.SeedNodeIDs,
+		SeedEvidence:  record.SeedEvidence,
 		CitedNodeIDs:  record.CitedNodeIDs,
+		CitedEvidence: record.CitedEvidence,
 	}
 	for _, turn := range record.Turns {
 		mapped := interaction.Turn{
@@ -185,8 +184,9 @@ func InteractionSession(
 		}
 		if turn.ToolKind != "" {
 			mapped.ToolCall = &interaction.ToolCall{
-				Kind:             string(turn.ToolKind),
-				RetrievedNodeIDs: turn.RetrievedNodeIDs,
+				Kind:              string(turn.ToolKind),
+				RetrievedNodeIDs:  turn.RetrievedNodeIDs,
+				RetrievedEvidence: turn.RetrievedEvidence,
 			}
 		}
 		session.Turns = append(session.Turns, mapped)

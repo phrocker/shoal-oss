@@ -32,6 +32,7 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/explorer/webapi"
 	"github.com/phrocker/shoal-oss/pkg/explorer/workspace"
+	"github.com/phrocker/shoal-oss/pkg/ontology"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
@@ -145,6 +146,11 @@ func TestHTTPWorkspaceSettingsRoundTripAuthorizationAndRestart(t *testing.T) {
 	if err := handler.SetWorkspaceSettingsProvider(provider); err != nil {
 		t.Fatal(err)
 	}
+	if err := handler.MountWorkspaceSettings(
+		webapi.WorkspaceSettingsHTTPConfig{Provider: provider},
+	); !shoal.IsErrorCode(err, shoal.ErrorConflict) {
+		t.Fatalf("duplicate mount error = %v, want conflict", err)
+	}
 
 	workspacePath := base64.RawURLEncoding.EncodeToString([]byte("workspace-http"))
 	mutationID := base64.RawURLEncoding.EncodeToString([]byte("mutation-http"))
@@ -231,6 +237,38 @@ func TestHTTPWorkspaceSettingsRoundTripAuthorizationAndRestart(t *testing.T) {
 		t.Fatalf("cross-origin PUT status = %d, body = %s",
 			response.Code, response.Body.String())
 	}
+	response = settingsRequest(
+		t, handler, http.MethodPut,
+		"/api/v1/workspaces/"+workspacePath+"/settings",
+		body, "owner", "https://example.test")
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("untrusted cross-scheme PUT status = %d, body = %s",
+			response.Code, response.Body.String())
+	}
+	response = settingsRequestWithFetchSite(
+		t, handler, http.MethodPut,
+		"/api/v1/workspaces/"+workspacePath+"/settings",
+		body, "owner", "https://example.test", "same-origin")
+	if response.Code != http.StatusCreated {
+		t.Fatalf("TLS-terminating proxy PUT status = %d, body = %s",
+			response.Code, response.Body.String())
+	}
+	response = settingsRequestWithFetchSite(
+		t, handler, http.MethodPut,
+		"/api/v1/workspaces/"+workspacePath+"/settings",
+		body, "owner", "https://example.test:443", "same-origin")
+	if response.Code != http.StatusCreated {
+		t.Fatalf("default-port proxy PUT status = %d, body = %s",
+			response.Code, response.Body.String())
+	}
+	response = settingsRequestWithFetchSite(
+		t, handler, http.MethodPut,
+		"/api/v1/workspaces/"+workspacePath+"/settings",
+		body, "owner", "https://example.test", "same-site")
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("cross-scheme PUT status = %d, body = %s",
+			response.Code, response.Body.String())
+	}
 
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
@@ -309,6 +347,13 @@ func TestHTTPWorkspaceSettingsRejectsBoundsAndUnknownFields(t *testing.T) {
 	}
 	path := "/api/v1/workspaces/" +
 		base64.RawURLEncoding.EncodeToString([]byte("bounded")) + "/settings"
+	noncanonicalPath := settingsRequest(
+		t, handler, http.MethodGet,
+		"/api/v1/workspaces/YR/settings", nil, "owner", "")
+	if noncanonicalPath.Code != http.StatusBadRequest {
+		t.Fatalf("noncanonical workspace status = %d, body = %s",
+			noncanonicalPath.Code, noncanonicalPath.Body.String())
+	}
 	for _, test := range []struct {
 		name string
 		body map[string]any
@@ -331,6 +376,28 @@ func TestHTTPWorkspaceSettingsRejectsBoundsAndUnknownFields(t *testing.T) {
 				"expected_revision": 0,
 				"mutation_id":       base64.RawURLEncoding.EncodeToString([]byte("unknown")),
 				"settings":          map[string]any{"ambient_lens": "forbidden"},
+			},
+		},
+		{
+			name: "noncanonical mutation ID",
+			body: map[string]any{
+				"expected_revision": 0,
+				"mutation_id":       "YR",
+				"settings":          map[string]any{},
+			},
+		},
+		{
+			name: "unknown ontology selection",
+			body: map[string]any{
+				"expected_revision": 0,
+				"mutation_id": base64.RawURLEncoding.EncodeToString(
+					[]byte("unknown-ontology")),
+				"settings": map[string]any{
+					"selected_ontology": map[string]any{
+						"known":   false,
+						"reading": string(ontology.OntologyUnresolved),
+					},
+				},
 			},
 		},
 	} {
@@ -397,6 +464,88 @@ func TestHTTPWorkspaceSettingsReportsIndeterminateCommit(t *testing.T) {
 	}
 }
 
+func TestWorkspaceSettingsHTTPHandlerIsIndependentlyMountable(t *testing.T) {
+	if _, err := webapi.NewWorkspaceSettingsHTTPHandler(
+		webapi.WorkspaceSettingsHTTPConfig{},
+	); !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
+		t.Fatalf("nil provider error = %v, want invalid_argument", err)
+	}
+
+	now := time.Date(2026, 9, 6, 9, 0, 0, 0, time.UTC)
+	authority, _ := auth.NewAuthorityWithClock(func() time.Time { return now })
+	store, err := workspace.OpenDurableStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	provider, err := workspace.NewProvider(
+		store, settingsProviderOptions(authority.Resolver(), now))
+	if err != nil {
+		t.Fatal(err)
+	}
+	decision := settingsHTTPDecision(t, now, "owner")
+	ctx, err := authority.Binder().Bind(context.Background(), decision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := provider.Update(ctx, "mounted", workspace.UpdateRequest{
+		MutationID: "create-mounted",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	handler, err := webapi.NewWorkspaceSettingsHTTPHandler(
+		webapi.WorkspaceSettingsHTTPConfig{Provider: provider})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(
+		http.MethodGet,
+		"http://example.test/api/v1/workspaces/"+
+			base64.RawURLEncoding.EncodeToString([]byte("mounted"))+
+			"/settings",
+		nil,
+	).WithContext(ctx)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("mounted settings status = %d, body = %s",
+			response.Code, response.Body.String())
+	}
+}
+
+func TestClampWorkspaceRequestLimits(t *testing.T) {
+	got := webapi.ClampWorkspaceRequestLimits(
+		workspace.Limits{
+			GraphDepth:  2,
+			GraphFanout: 10,
+		},
+		workspace.Limits{
+			RetrievalTopK: 8,
+			GraphDepth:    4,
+			GraphFanout:   6,
+			GraphNodes:    100,
+			OutputBytes:   4096,
+		},
+		workspace.Limits{
+			RetrievalTopK: 5,
+			GraphDepth:    3,
+			GraphFanout:   4,
+			GraphNodes:    25,
+			OutputBytes:   1024,
+		},
+	)
+	want := workspace.Limits{
+		RetrievalTopK: 5,
+		GraphDepth:    2,
+		GraphFanout:   4,
+		GraphNodes:    25,
+		OutputBytes:   1024,
+	}
+	if got != want {
+		t.Fatalf("limits = %#v, want %#v", got, want)
+	}
+}
+
 func settingsHTTPDecision(
 	t *testing.T,
 	now time.Time,
@@ -407,10 +556,7 @@ func settingsHTTPDecision(
 		Subject: subject, Actor: "actor",
 		AuthorizationDomain: []byte("domain"),
 		AllowedOperations: []auth.Operation{
-			auth.OperationList,
-			auth.OperationNeighborhood,
 			auth.OperationRead,
-			auth.OperationRetrieve,
 			auth.OperationWorkspaceSettingsRead,
 			auth.OperationWorkspaceSettingsWrite,
 		},
@@ -433,6 +579,17 @@ func settingsRequest(
 	body any,
 	subject, origin string,
 ) *httptest.ResponseRecorder {
+	return settingsRequestWithFetchSite(
+		t, handler, method, path, body, subject, origin, "")
+}
+
+func settingsRequestWithFetchSite(
+	t *testing.T,
+	handler http.Handler,
+	method, path string,
+	body any,
+	subject, origin, fetchSite string,
+) *httptest.ResponseRecorder {
 	t.Helper()
 	var encoded []byte
 	if body != nil {
@@ -450,6 +607,9 @@ func settingsRequest(
 	}
 	if origin != "" {
 		request.Header.Set("Origin", origin)
+	}
+	if fetchSite != "" {
+		request.Header.Set("Sec-Fetch-Site", fetchSite)
 	}
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, request)

@@ -42,9 +42,37 @@ type ResultSink interface {
 	RecordInteractionResult(context.Context, Session) (Session, error)
 }
 
+// ValidateRecordedSession checks a successful trusted sink receipt. The sink
+// may supply trusted admission time, actor and reason metadata, and a default
+// authorization operation, but cannot replace the recorded work or its pins.
+// Callers must mark a validation failure as committed, since writing succeeded.
+func ValidateRecordedSession(requested, persisted Session) error {
+	expected, err := requested.Canonical()
+	if err != nil {
+		return err
+	}
+	actual, err := persisted.Canonical()
+	if err != nil {
+		return err
+	}
+	expected.RecordedAt = actual.RecordedAt
+	expected.Actor = actual.Actor
+	expected.Reason = actual.Reason
+	if expected.AuthorizationOperation == "" {
+		expected.AuthorizationOperation = actual.AuthorizationOperation
+	}
+	if !reflect.DeepEqual(actual, expected) {
+		return shoal.NewError(
+			shoal.ErrorInternal,
+			"durable interaction sink returned a mismatched session",
+		)
+	}
+	return nil
+}
+
 // Recorder is the product-level fail-closed recorder for retrieval, chat, MCP,
-// and other non-harness adapters. It replaces caller time with its trusted UTC
-// clock, canonicalizes the Session, and returns only after the sink accepts the
+// and other non-harness adapters. It canonicalizes a typed Session, supplies a
+// UTC timestamp when one is absent, and returns only after the sink accepts the
 // durable record.
 type Recorder struct {
 	sink ResultSink
@@ -58,7 +86,7 @@ func NewRecorder(ctx context.Context, sink ResultSink) (*Recorder, error) {
 		return nil, shoal.NewError(
 			shoal.ErrorInvalidArgument, "context is required")
 	}
-	if IsNilResultSink(sink) {
+	if isNilSink(sink) {
 		return nil, shoal.NewError(
 			shoal.ErrorInvalidArgument, "interaction sink is required")
 	}
@@ -82,39 +110,85 @@ func (r *Recorder) SetClock(now func() time.Time) error {
 	return nil
 }
 
-// Record durably stores a typed interaction. RecordedAt is always replaced by
-// the recorder clock so a caller cannot backdate or future-date authorization.
-// IDs and all other security-relevant pins remain caller-supplied and validated
-// rather than guessed.
+// Record durably stores a typed interaction. RecordedAt is always overwritten
+// from the recorder's trusted clock; a caller cannot backdate or future-date
+// authorization chronology. On an exact retry, the ResultSink returns the
+// original accepted session and timestamp.
 func (r *Recorder) Record(
 	ctx context.Context, session Session,
 ) (Session, error) {
-	if r == nil || IsNilResultSink(r.sink) {
+	if r == nil || isNilSink(r.sink) {
 		return Session{}, shoal.NewError(
 			shoal.ErrorInvalidArgument, "interaction recorder is required")
 	}
-	recordedAt := r.now()
-	if recordedAt.IsZero() {
+	recordedAt := r.now().UTC()
+	if !session.AuthorizationExpiresAt.IsZero() &&
+		!recordedAt.Before(session.AuthorizationExpiresAt) {
 		return Session{}, shoal.NewError(
-			shoal.ErrorUnavailable,
-			"interaction recorder clock is unavailable")
+			shoal.ErrorUnauthorized,
+			"interaction authorization expired before recording",
+		)
 	}
-	session.RecordedAt = recordedAt.UTC()
+	session.RecordedAt = recordedAt
 	canonical, err := session.Canonical()
 	if err != nil {
 		return Session{}, err
 	}
-	return r.sink.RecordInteractionResult(ctx, canonical)
+	persisted, err := r.sink.RecordInteractionResult(ctx, canonical)
+	if err != nil {
+		return Session{}, err
+	}
+	persisted, err = persisted.Canonical()
+	if err != nil {
+		return Session{}, MarkCommittedRecord(
+			shoal.WrapError(
+				shoal.ErrorInternal,
+				"durable interaction sink returned an invalid session",
+				err,
+			),
+		)
+	}
+	if err := ValidateRecordedSession(canonical, persisted); err != nil {
+		return Session{}, MarkCommittedRecord(err)
+	}
+	deliveredAt := r.now().UTC()
+	if deliveredAt.IsZero() {
+		return persisted, MarkCommittedRecord(
+			shoal.NewError(
+				shoal.ErrorInternal,
+				"trusted interaction recorder clock is unavailable after persistence",
+			),
+		)
+	}
+	if !persisted.AuthorizationExpiresAt.IsZero() &&
+		!deliveredAt.Before(persisted.AuthorizationExpiresAt) {
+		return persisted, MarkCommittedRecord(
+			shoal.NewError(
+				shoal.ErrorUnauthorized,
+				"interaction authorization expired after durable recording",
+			),
+		)
+	}
+	if err := ctx.Err(); err != nil {
+		return persisted, MarkCommittedRecord(
+			shoal.WrapError(
+				shoal.ErrorUnavailable,
+				"interaction recording completed after request cancellation",
+				err,
+			),
+		)
+	}
+	return persisted, nil
 }
 
-// IsNilResultSink reports whether sink is nil or holds a typed nil value.
-func IsNilResultSink(sink ResultSink) bool {
+func isNilSink(sink ResultSink) bool {
 	if sink == nil {
 		return true
 	}
 	value := reflect.ValueOf(sink)
 	switch value.Kind() {
-	case reflect.Chan, reflect.Func, reflect.Map, reflect.Pointer, reflect.Slice:
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map,
+		reflect.Pointer, reflect.Slice:
 		return value.IsNil()
 	default:
 		return false

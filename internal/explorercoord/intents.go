@@ -69,6 +69,7 @@ type Cell struct {
 	Qualifier       []byte                  `json:"qualifier"`
 	Visibility      []byte                  `json:"visibility,omitempty"`
 	Value           []byte                  `json:"value"`
+	Delete          bool                    `json:"delete,omitempty"`
 	EpochTimestamp  bool                    `json:"epoch_timestamp"`
 	Timestamp       coordination.Epoch      `json:"timestamp,omitempty"`
 	LPART           coordination.LPART      `json:"lpart"`
@@ -1104,6 +1105,20 @@ func validateIntent(intent Intent) error {
 		if err := cell.CopyGeneration.Validate(); err != nil {
 			return errors.Join(transaction.ErrInvalid, err)
 		}
+		if cell.Delete {
+			if len(cell.Value) != 0 {
+				return errors.Join(
+					transaction.ErrInvalid,
+					errors.New("physical tombstone cannot carry a value"),
+				)
+			}
+			if !cell.EpochTimestamp {
+				return errors.Join(
+					transaction.ErrInvalid,
+					errors.New("physical tombstone requires the transaction epoch"),
+				)
+			}
+		}
 		if cell.EpochTimestamp {
 			if cell.Timestamp != 0 {
 				return errors.Join(transaction.ErrInvalid, errors.New("epoch and explicit timestamps are mutually exclusive"))
@@ -1255,12 +1270,19 @@ func buildPlan(intent Intent, logical coordination.Digest) (transaction.Plan, er
 		if cell.EpochTimestamp {
 			slot, timestamp = coordination.EpochSlotContent, 0
 		}
+		valueLength, valueDigest, err := transaction.PhysicalValueCommitment(
+			cell.Delete,
+			cell.Value,
+		)
+		if err != nil {
+			return transaction.Plan{}, err
+		}
 		entry := coordination.ManifestEntry{
 			Table: []byte(cell.Table), Row: append([]byte(nil), cell.Row...),
 			ColumnFamily:    append([]byte(nil), cell.Family...),
 			ColumnQualifier: append([]byte(nil), cell.Qualifier...),
 			EpochSlot:       slot, ExplicitTimestamp: timestamp,
-			ValueLength: uint32(len(cell.Value)), ValueDigest: coordination.Sum(cell.Value),
+			ValueLength: valueLength, ValueDigest: valueDigest,
 			LPART:            append(coordination.LPART(nil), cell.LPART...),
 			CopyGeneration:   cell.CopyGeneration,
 			VisibilityDigest: coordination.Sum(cell.Visibility),
@@ -1273,6 +1295,7 @@ func buildPlan(intent Intent, logical coordination.Digest) (transaction.Plan, er
 			cell: transaction.PhysicalCell{
 				Entry: entry, Value: append([]byte(nil), cell.Value...),
 				Visibility: append([]byte(nil), cell.Visibility...),
+				Delete:     cell.Delete,
 			},
 		}
 	}
@@ -1407,6 +1430,12 @@ func compareIntentCells(left, right Cell) int {
 	}
 	if left.Timestamp != right.Timestamp {
 		if left.Timestamp < right.Timestamp {
+			return -1
+		}
+		return 1
+	}
+	if left.Delete != right.Delete {
+		if !left.Delete {
 			return -1
 		}
 		return 1

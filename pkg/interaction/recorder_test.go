@@ -22,7 +22,6 @@ package interaction_test
 import (
 	"context"
 	"errors"
-	"reflect"
 	"testing"
 	"time"
 
@@ -97,27 +96,13 @@ func TestProductRecorderIsFailClosedAndCanonical(t *testing.T) {
 		recorded.SeedNodeIDs[0] != "span-a" {
 		t.Fatalf("canonical recorded session = %+v", recorded)
 	}
-	retried, err := recorder.Record(ctx, interaction.Session{
-		ID:         id,
-		RecordedAt: fixed.Add(-24 * time.Hour),
-		Operation:  interaction.OperationRetrieval,
-		SeedNodeIDs: []shoal.ID{
-			"span-b", "span-a", "span-b",
-		},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !reflect.DeepEqual(recorded, retried) {
-		t.Fatalf("identical retry changed canonical result: %+v != %+v",
-			recorded, retried)
-	}
 
 	sink.result = recorded
 	enrichedID := interaction.DerivedID("session", "enriched")
 	sink.result.ID = enrichedID
-	sink.result.RecordedAt = fixed.Add(time.Second)
+	sink.result.RecordedAt = fixed
 	sink.result.Operation = interaction.OperationToolCall
+	sink.result.SeedNodeIDs = nil
 	sink.result.Actor = interaction.ActorContext{
 		SubjectID: "trusted-subject",
 		ActorID:   "trusted-actor",
@@ -160,6 +145,106 @@ func TestProductRecorderIsFailClosedAndCanonical(t *testing.T) {
 		ctx, typedNil,
 	); !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
 		t.Fatalf("typed-nil sink error = %v", err)
+	}
+}
+
+func TestProductRecorderRejectsChangedWorkAsCommitted(t *testing.T) {
+	now := time.Date(2026, time.September, 6, 10, 0, 0, 0, time.UTC)
+	for name, mutate := range map[string]func(*interaction.Session){
+		"result":    func(s *interaction.Session) { s.ResultID = "different-result" },
+		"operation": func(s *interaction.Session) { s.AuthorizationOperation = "dispatch" },
+		"evidence":  func(s *interaction.Session) { s.SeedNodeIDs = []shoal.ID{"different-node"} },
+		"expiry":    func(s *interaction.Session) { s.AuthorizationExpiresAt = now.Add(2 * time.Hour) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			request := interaction.Session{
+				ID: interaction.DerivedID("session", name), RecordedAt: now,
+				Operation: interaction.OperationToolCall, AuthorizationOperation: "invoke",
+				SnapshotID: "snapshot", SnapshotAsOf: now.Add(-time.Minute),
+				AuthorizationFingerprint: "auth-sha256:test",
+				AuthorizationExpiresAt:   now.Add(time.Hour),
+			}
+			sink := &recorderSink{result: request}
+			mutate(&sink.result)
+			recorder, err := interaction.NewRecorder(context.Background(), sink)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := recorder.SetClock(func() time.Time { return now }); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := recorder.Record(context.Background(), request); !interaction.IsCommittedRecord(err) {
+				t.Fatalf("changed %s must fail as committed: %v", name, err)
+			}
+		})
+	}
+}
+
+func TestProductRecorderRejectsExpiredTrustedClockBeforeSink(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, time.September, 6, 10, 0, 0, 0, time.UTC)
+	sink := &recorderSink{}
+	recorder, err := interaction.NewRecorder(ctx, sink)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := recorder.SetClock(func() time.Time { return now }); err != nil {
+		t.Fatal(err)
+	}
+	_, err = recorder.Record(ctx, interaction.Session{
+		ID:                       interaction.DerivedID("session", "expired-before-sink"),
+		RecordedAt:               now.Add(-time.Hour),
+		Operation:                interaction.OperationRetrieval,
+		SnapshotID:               "snapshot-expired",
+		SnapshotAsOf:             now.Add(-2 * time.Hour),
+		AuthorizationFingerprint: "auth-sha256:expired",
+		AuthorizationExpiresAt:   now,
+	})
+	if !shoal.IsErrorCode(err, shoal.ErrorUnauthorized) {
+		t.Fatalf("expired trusted-clock error = %v", err)
+	}
+	if sink.recorded != nil {
+		t.Fatalf("expired recording invoked sink: %+v", sink.recorded)
+	}
+}
+
+func TestProductRecorderMarksPostSinkExpiryCommitted(t *testing.T) {
+	ctx := context.Background()
+	started := time.Date(2026, time.September, 6, 10, 0, 0, 0, time.UTC)
+	expires := started.Add(time.Second)
+	calls := 0
+	sink := &recorderSink{}
+	recorder, err := interaction.NewRecorder(ctx, sink)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := recorder.SetClock(func() time.Time {
+		calls++
+		if calls == 1 {
+			return started
+		}
+		return expires
+	}); err != nil {
+		t.Fatal(err)
+	}
+	recorded, err := recorder.Record(ctx, interaction.Session{
+		ID:                       interaction.DerivedID("session", "expires-after-sink"),
+		Operation:                interaction.OperationRetrieval,
+		SnapshotID:               "snapshot-live",
+		SnapshotAsOf:             started.Add(-time.Second),
+		AuthorizationFingerprint: "auth-sha256:live",
+		AuthorizationExpiresAt:   expires,
+	})
+	if !interaction.IsCommittedRecord(err) ||
+		!shoal.IsErrorCode(err, shoal.ErrorUnauthorized) {
+		t.Fatalf("post-sink expiry error = %v", err)
+	}
+	if recorded.ID == "" || len(sink.recorded) != 1 {
+		t.Fatalf("committed result = %+v, sink writes = %d",
+			recorded, len(sink.recorded))
+	}
+	if !recorded.RecordedAt.Equal(started) {
+		t.Fatalf("accepted timestamp = %v", recorded.RecordedAt)
 	}
 }
 

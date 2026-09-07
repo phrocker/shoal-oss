@@ -129,6 +129,35 @@ type PhysicalCell struct {
 	Entry      coordination.ManifestEntry
 	Value      []byte
 	Visibility []byte
+	Delete     bool
+}
+
+var physicalDeleteDigest = coordination.Sum([]byte("shoal-physical-delete-v1"))
+
+// PhysicalValueCommitment returns the manifest value commitment for a physical
+// write or tombstone. Tombstones use a domain-separated digest so they cannot
+// be confused with an ordinary empty value without changing the manifest wire
+// format.
+func PhysicalValueCommitment(
+	delete bool,
+	value []byte,
+) (uint32, coordination.Digest, error) {
+	if delete {
+		if len(value) != 0 {
+			return 0, coordination.Digest{}, errors.Join(
+				ErrInvalid,
+				errors.New("physical tombstone cannot carry a value"),
+			)
+		}
+		return 0, physicalDeleteDigest, nil
+	}
+	if len(value) > coordination.MaxManifestValueBytes {
+		return 0, coordination.Digest{}, errors.Join(
+			ErrInvalid,
+			errors.New("physical value exceeds its bound"),
+		)
+	}
+	return uint32(len(value)), coordination.Sum(value), nil
 }
 
 type CommitCopy struct {
@@ -163,10 +192,21 @@ func (p Plan) Validate() (coordination.ManifestSummary, error) {
 	}
 	for i := range entries {
 		cell := p.Cells[i]
+		valueLength, valueDigest, valueErr := PhysicalValueCommitment(
+			cell.Delete,
+			cell.Value,
+		)
+		if valueErr != nil {
+			return summary, fmt.Errorf(
+				"physical cell %d commitment is invalid: %w",
+				i,
+				valueErr,
+			)
+		}
 		if coordination.CompareManifestEntries(entries[i], cell.Entry) != 0 ||
 			!manifestEntryEqual(entries[i], cell.Entry) ||
-			uint32(len(cell.Value)) != cell.Entry.ValueLength ||
-			coordination.Sum(cell.Value) != cell.Entry.ValueDigest ||
+			valueLength != cell.Entry.ValueLength ||
+			valueDigest != cell.Entry.ValueDigest ||
 			coordination.Sum(cell.Visibility) != cell.Entry.VisibilityDigest {
 			return summary, fmt.Errorf("%w: physical cell %d disagrees with the manifest", ErrInvalid, i)
 		}

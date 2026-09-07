@@ -50,10 +50,8 @@ type Explorer struct {
 	edges                          map[shoal.ID]persistedEdge
 	interactions                   map[shoal.ID]*persistedInteraction
 	interactionLiveRecords         map[shoal.ID]*persistedInteraction
-	interactionOrder               []shoal.ID
 	folds                          map[shoal.ID]*persistedFold
 	foldLiveRecords                map[shoal.ID]*persistedFold
-	foldOrder                      []shoal.ID
 	interactionNodeIDs             map[shoal.ID]struct{}
 	interactionEdgeIDs             map[shoal.ID]struct{}
 	extractions                    map[shoal.ID]*persistedExtraction
@@ -86,7 +84,6 @@ type Explorer struct {
 	latestSnapshotNodeDigests      map[shoal.ID]string
 	latestSnapshotEdgeDigests      map[shoal.ID]string
 	latestSnapshotAssertionDigests map[shoal.ID]string
-	sourceEdgeBirth                map[shoal.ID]time.Time
 	snapshotAnchor                 time.Time
 	lastPublicationSequence        uint64
 	changeHistoryFloor             uint64
@@ -143,11 +140,14 @@ type EmbeddingQueryEvent struct {
 	SpaceIdentities []string
 	Attempted       []string
 	Completed       []string
-	FanoutLimit     int
-	CacheHits       int
-	ProviderCalls   int
-	Unavailable     []string
-	FanoutExceeded  bool
+	// Participating contains the stable spaces represented by successful
+	// scored outputs. It is empty when vector scoring produced no result.
+	Participating  []string
+	FanoutLimit    int
+	CacheHits      int
+	ProviderCalls  int
+	Unavailable    []string
+	FanoutExceeded bool
 }
 
 // EmbeddingQueryObserver receives one query event. Events contain no query
@@ -190,6 +190,7 @@ func cloneEmbeddingQueryEvent(event EmbeddingQueryEvent) EmbeddingQueryEvent {
 	event.SpaceIdentities = append([]string(nil), event.SpaceIdentities...)
 	event.Attempted = append([]string(nil), event.Attempted...)
 	event.Completed = append([]string(nil), event.Completed...)
+	event.Participating = append([]string(nil), event.Participating...)
 	event.Unavailable = append([]string(nil), event.Unavailable...)
 	return event
 }
@@ -346,7 +347,6 @@ func openWithEngine(
 		latestSnapshotNodeDigests:      make(map[shoal.ID]string),
 		latestSnapshotEdgeDigests:      make(map[shoal.ID]string),
 		latestSnapshotAssertionDigests: make(map[shoal.ID]string),
-		sourceEdgeBirth:                make(map[shoal.ID]time.Time),
 		readOnly:                       options.ReadOnly,
 		publication:                    publication,
 	}
@@ -536,10 +536,6 @@ func (e *Explorer) ingest(
 		if err != nil {
 			return IngestResult{}, err
 		}
-	}
-	if e.lastPublicationSequence == math.MaxUint64 {
-		return IngestResult{}, shoal.NewError(
-			shoal.ErrorUnavailable, "embedded publication sequence is exhausted")
 	}
 	if err := e.requireSourceGraphIDsAvailableLocked(
 		record.Nodes, record.Edges,

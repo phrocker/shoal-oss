@@ -190,14 +190,6 @@ func NewDurableStoreWithEngine(
 	return store, nil
 }
 
-// NewDurableStoreFromEngine is retained for compatibility with host branches
-// predating the canonical NewDurableStoreWithEngine name.
-func NewDurableStoreFromEngine(
-	eng *engine.Engine,
-) (*DurableStore, error) {
-	return NewDurableStoreWithEngine(eng)
-}
-
 func newDurableStore(
 	eng *engine.Engine,
 	lock *dirlock.Lock,

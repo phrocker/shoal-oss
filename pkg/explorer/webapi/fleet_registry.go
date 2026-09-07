@@ -42,7 +42,7 @@ type FleetRegistryProvider interface {
 // adding another authentication boundary. Mount it through
 // Handler.MountAuthenticated at /api/v1/fleet/.
 func NewFleetRegistryHandler(provider FleetRegistryProvider) (http.Handler, error) {
-	if isAbsentInterface(provider) {
+	if provider == nil {
 		return nil, shoal.NewError(shoal.ErrorInvalidArgument, "fleet registry provider is required")
 	}
 	mux := http.NewServeMux()
@@ -59,23 +59,6 @@ func (h *Handler) MountFleetRegistry(provider FleetRegistryProvider) error {
 	}
 	if isAbsentInterface(h.authenticator) || isAbsentInterface(h.binder) {
 		return shoal.NewError(shoal.ErrorInvalidArgument, "fleet registry requires authenticated transport")
-	}
-	for _, route := range []struct {
-		method string
-		path   string
-	}{
-		{http.MethodPost, "/api/v1/fleet/agents"},
-		{http.MethodPost, "/api/v1/fleet/agents/{agent}/heartbeat"},
-		{http.MethodPost, "/api/v1/fleet/agents/{agent}/revoke"},
-		{http.MethodPost, "/api/v1/fleet/agents/{agent}/resolve"},
-		{http.MethodPost, "/api/v1/fleet/agents/resolve"},
-	} {
-		if exactMuxPatternRegistered(h.mux, route.method, route.path) {
-			return shoal.NewError(
-				shoal.ErrorInvalidArgument,
-				"fleet registry route conflicts with an existing route",
-			)
-		}
 	}
 	mountFleetRegistry(h.mux, provider)
 	return nil
@@ -186,8 +169,8 @@ func mountFleetRegistry(mux *http.ServeMux, provider FleetRegistryProvider) {
 			Context:   requestContext,
 			SourceIDs: cloneWireBytes(input.SourceIDs),
 			PolicyIDs: cloneWireBytes(input.PolicyIDs),
+			Cursor:    append([]byte(nil), input.Cursor...),
 			Limit:     input.Limit,
-			Cursor:    input.Cursor,
 		})
 		if err != nil {
 			writeError(writer, err)
@@ -198,9 +181,9 @@ func mountFleetRegistry(mux *http.ServeMux, provider FleetRegistryProvider) {
 			response[i] = encodeFleetDescriptor(page.Descriptors[i])
 		}
 		writeResponse(writer, http.StatusOK, struct {
-			Agents     []fleetDescriptorWire `json:"agents"`
-			NextCursor string                `json:"next_cursor,omitempty"`
-		}{Agents: response, NextCursor: page.NextCursor})
+			Agents []fleetDescriptorWire `json:"agents"`
+			Next   []byte                `json:"next,omitempty"`
+		}{Agents: response, Next: page.Next})
 	})
 }
 
@@ -246,8 +229,8 @@ type fleetListWire struct {
 	Context   fleetRequestContextWire `json:"context"`
 	SourceIDs [][]byte                `json:"source_ids,omitempty"`
 	PolicyIDs [][]byte                `json:"policy_ids,omitempty"`
-	Limit     uint32                  `json:"limit,omitempty"`
-	Cursor    string                  `json:"cursor,omitempty"`
+	Cursor    []byte                  `json:"cursor,omitempty"`
+	Limit     int                     `json:"limit"`
 }
 
 type fleetDescriptorWire struct {
