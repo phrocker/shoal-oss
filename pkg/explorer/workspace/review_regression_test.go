@@ -33,6 +33,7 @@ import (
 	"github.com/phrocker/shoal-oss/accumulo"
 	"github.com/phrocker/shoal-oss/internal/dirlock"
 	"github.com/phrocker/shoal-oss/internal/engine"
+	"github.com/phrocker/shoal-oss/internal/iterrt"
 	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/ontology"
@@ -801,6 +802,136 @@ func TestReviewSettingsStoreRejectsPathAliasAndReopensAfterClose(t *testing.T) {
 	}
 	if err := reopened.Close(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestReviewSettingsStoreRetainsDirectoryLockWhenEngineCloseFails(
+	t *testing.T,
+) {
+	directory := t.TempDir()
+	store, err := OpenDurableStore(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	closeEngine := store.closeEngine
+	attempts := 0
+	store.closeEngine = func() error {
+		attempts++
+		if attempts == 1 {
+			return errors.New("simulated engine close failure")
+		}
+		return closeEngine()
+	}
+	if err := store.Close(); !shoal.IsErrorCode(err, shoal.ErrorInternal) {
+		t.Fatalf("first close error = %v", err)
+	}
+	if store.closed || store.engineClosed {
+		t.Fatalf("failed close marked store closed: %#v", store)
+	}
+	if second, err := OpenDurableStore(directory); !shoal.IsErrorCode(
+		err, shoal.ErrorUnavailable,
+	) {
+		if second != nil {
+			_ = second.Close()
+		}
+		t.Fatalf("failed engine close released directory lock: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("retry close: %v", err)
+	}
+	reopened, err := OpenDurableStore(directory)
+	if err != nil {
+		t.Fatalf("reopen after successful close retry: %v", err)
+	}
+	if err := reopened.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestReviewSettingsStoreRechecksCancellationAfterMutexWait(t *testing.T) {
+	store, err := OpenDurableStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	store.mu.Lock()
+	ctx, cancel := context.WithCancel(context.Background())
+	started := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		close(started)
+		_, err := store.CompareAndSwap(
+			ctx, "cancelled-workspace", "owner", []byte("domain"),
+			0, "cancelled-mutation", Narrowing{})
+		done <- err
+	}()
+	<-started
+	time.Sleep(10 * time.Millisecond)
+	cancel()
+	store.mu.Unlock()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("queued canceled mutation error = %v", err)
+	}
+	if _, err := store.Load(
+		context.Background(), "cancelled-workspace",
+	); !shoal.IsErrorCode(err, shoal.ErrorNotFound) {
+		t.Fatalf("queued canceled mutation committed: %v", err)
+	}
+}
+
+func TestReviewSettingsStoreCompactsSupersededRevisions(t *testing.T) {
+	directory := t.TempDir()
+	store, err := OpenDurableStore(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for revision := uint64(0); revision < 12; revision++ {
+		topK := uint32(20 - revision)
+		if _, err := store.CompareAndSwap(
+			context.Background(), "retained-workspace", "owner", []byte("domain"),
+			revision, shoal.ID(fmt.Sprintf("mutation-%d", revision)),
+			Narrowing{Budgets: Budgets{RetrievalTopK: &topK}},
+		); err != nil {
+			t.Fatalf("revision %d: %v", revision+1, err)
+		}
+	}
+	rawVersions := 0
+	if err := store.engine.LookupRows(
+		settingsTable,
+		[][]byte{settingsRow("retained-workspace")},
+		engine.ScanOptions{
+			ColumnFamilies:          [][]byte{[]byte(settingsCF)},
+			ColumnFamiliesInclusive: true,
+		},
+		func(_ int, key *iterrt.Key, _ []byte) {
+			if bytes.Equal(key.ColumnFamily, []byte(settingsCF)) &&
+				bytes.Equal(key.ColumnQualifier, []byte(settingsCQ)) {
+				rawVersions++
+			}
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if rawVersions != 1 {
+		t.Fatalf("raw retained versions = %d, want 1", rawVersions)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := OpenDurableStore(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	loaded, err := reopened.Load(context.Background(), "retained-workspace")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Revision != 12 ||
+		loaded.Narrowing.Budgets.RetrievalTopK == nil ||
+		*loaded.Narrowing.Budgets.RetrievalTopK != 9 {
+		t.Fatalf("retained settings = %#v", loaded)
 	}
 }
 

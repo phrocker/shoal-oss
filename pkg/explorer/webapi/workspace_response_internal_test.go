@@ -30,6 +30,7 @@ import (
 
 	"github.com/phrocker/shoal-oss/pkg/explorer"
 	exploreranalytics "github.com/phrocker/shoal-oss/pkg/explorer/analytics"
+	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/explorer/workspace"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
@@ -80,6 +81,35 @@ func TestWorkspaceSettingsClampAnalyticsAndMarkResponseLoss(t *testing.T) {
 	} {
 		if requestMayCommit(test.method, test.path) {
 			t.Fatalf("%s %s is read-only", test.method, test.path)
+		}
+	}
+}
+
+func TestWorkspaceOperationForRequestUsesRouteOperation(t *testing.T) {
+	for _, test := range []struct {
+		method    string
+		path      string
+		operation auth.Operation
+		apply     bool
+	}{
+		{http.MethodPost, "/api/v1/retrieve", auth.OperationRetrieve, true},
+		{http.MethodPost, "/api/v1/analytics", auth.OperationAnalyticsRead, true},
+		{http.MethodPost, "/api/v1/neighborhood", auth.OperationNeighborhood, true},
+		{http.MethodPost, "/api/v1/ingest", auth.OperationIngest, true},
+		{http.MethodPost, "/api/v1/documents", auth.OperationList, true},
+		{http.MethodPost, "/api/v1/document", auth.OperationRead, true},
+		{http.MethodPost, "/api/v1/fleet/actions/invoke", auth.OperationInvoke, true},
+		{http.MethodPost, "/api/v1/fleet/actions/action/cancel", auth.OperationDispatch, true},
+		{http.MethodPost, "/api/v1/fleet/agents/agent/heartbeat", auth.OperationAgentHeartbeat, true},
+		{http.MethodPost, "/api/v1/fleet/events/publish", auth.OperationEventPublish, true},
+		{http.MethodGet, "/api/v1/identity", auth.OperationRead, true},
+		{http.MethodPost, "/mcp", "", false},
+	} {
+		operation, apply := workspaceOperationForRequest(test.method, test.path)
+		if operation != test.operation || apply != test.apply {
+			t.Fatalf("%s %s = %q, %v; want %q, %v",
+				test.method, test.path, operation, apply,
+				test.operation, test.apply)
 		}
 	}
 }

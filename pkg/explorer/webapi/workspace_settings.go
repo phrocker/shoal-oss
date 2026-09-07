@@ -67,6 +67,13 @@ type WorkspaceSettingsProvider interface {
 		workspace.Limits,
 		[]auth.Policy,
 	) (workspace.EffectiveDecision, error)
+	ApplyForOperation(
+		context.Context,
+		shoal.ID,
+		auth.Operation,
+		workspace.Limits,
+		[]auth.Policy,
+	) (workspace.EffectiveDecision, error)
 }
 
 // WorkspaceSettingsHTTPConfig configures the independently mountable settings
@@ -187,8 +194,14 @@ func (h *Handler) applyWorkspaceSettings(
 	if !present {
 		return request.Context(), nil
 	}
-	effective, err := h.workspaceSettings.Apply(
-		request.Context(), workspaceID, workspace.MaximumLimits(), nil)
+	operation, apply := workspaceOperationForRequest(
+		request.Method, request.URL.Path)
+	if !apply {
+		return request.Context(), nil
+	}
+	effective, err := h.workspaceSettings.ApplyForOperation(
+		request.Context(), workspaceID, operation,
+		workspace.MaximumLimits(), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -214,6 +227,86 @@ func (h *Handler) applyWorkspaceSettings(
 	}
 	ctx = withEffectiveWorkspaceSettings(ctx, effective)
 	return withIdentity(ctx, decision), nil
+}
+
+func workspaceOperationForRequest(
+	method, path string,
+) (auth.Operation, bool) {
+	switch {
+	case method == http.MethodGet && path == "/api/v1/meta":
+		return auth.OperationRead, true
+	case method == http.MethodGet && path == "/api/v1/identity":
+		return auth.OperationRead, true
+	case method == http.MethodGet && path == "/api/v1/ontology":
+		return auth.OperationRead, true
+	case method == http.MethodGet && path == "/api/v1/ontology/proposals":
+		return auth.OperationRead, true
+	case method == http.MethodGet &&
+		strings.HasPrefix(path, "/api/v1/ontology/proposals/") &&
+		strings.HasSuffix(path, "/blast-radius"):
+		return auth.OperationRead, true
+	case method == http.MethodPost && path == "/api/v1/ontology/proposals":
+		return auth.OperationIngest, true
+	case method == http.MethodPost &&
+		strings.HasPrefix(path, "/api/v1/ontology/proposals/") &&
+		strings.HasSuffix(path, "/transition"):
+		return auth.OperationIngest, true
+	case method == http.MethodPost &&
+		(path == "/api/v1/ingest" ||
+			path == "/api/v1/extract" ||
+			path == "/api/v1/derivation/recompute"):
+		return auth.OperationIngest, true
+	case method == http.MethodPost &&
+		(path == "/api/v1/changes" || path == "/api/v1/documents"):
+		return auth.OperationList, true
+	case method == http.MethodPost && path == "/api/v1/document":
+		return auth.OperationRead, true
+	case method == http.MethodPost && path == "/api/v1/retrieve":
+		return auth.OperationRetrieve, true
+	case method == http.MethodPost &&
+		(path == "/api/v1/neighborhood" || path == "/api/v1/path"):
+		return auth.OperationNeighborhood, true
+	case method == http.MethodPost && path == "/api/v1/analytics":
+		return auth.OperationAnalyticsRead, true
+	case method == http.MethodPost && path == "/api/v1/fleet/agents":
+		return auth.OperationAgentRegister, true
+	case method == http.MethodPost &&
+		strings.HasPrefix(path, "/api/v1/fleet/agents/") &&
+		strings.HasSuffix(path, "/heartbeat"):
+		return auth.OperationAgentHeartbeat, true
+	case method == http.MethodPost &&
+		strings.HasPrefix(path, "/api/v1/fleet/agents/") &&
+		strings.HasSuffix(path, "/revoke"):
+		return auth.OperationAgentRevoke, true
+	case method == http.MethodPost &&
+		(path == "/api/v1/fleet/agents/resolve" ||
+			(strings.HasPrefix(path, "/api/v1/fleet/agents/") &&
+				strings.HasSuffix(path, "/resolve"))):
+		return auth.OperationAgentResolve, true
+	case method == http.MethodPost && path == "/api/v1/fleet/actions":
+		return auth.OperationDispatch, true
+	case method == http.MethodPost &&
+		(path == "/api/v1/fleet/actions/invoke" ||
+			path == "/api/v1/fleet/actions/pull" ||
+			(strings.HasPrefix(path, "/api/v1/fleet/actions/") &&
+				strings.HasSuffix(path, "/claim"))):
+		return auth.OperationInvoke, true
+	case method == http.MethodPost &&
+		strings.HasPrefix(path, "/api/v1/fleet/actions/") &&
+		(strings.HasSuffix(path, "/cancel") ||
+			strings.HasSuffix(path, "/status")):
+		return auth.OperationDispatch, true
+	case method == http.MethodPost &&
+		path == "/api/v1/fleet/events/subscriptions":
+		return auth.OperationSubscriptionCreate, true
+	case method == http.MethodDelete &&
+		strings.HasPrefix(path, "/api/v1/fleet/events/subscriptions/"):
+		return auth.OperationSubscriptionDelete, true
+	case method == http.MethodPost && path == "/api/v1/fleet/events/publish":
+		return auth.OperationEventPublish, true
+	default:
+		return "", false
+	}
 }
 
 func workspaceIDFromHeader(

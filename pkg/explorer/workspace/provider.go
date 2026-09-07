@@ -467,10 +467,39 @@ func (p *Provider) Apply(
 	baseLimits Limits,
 	baseOutputPolicies []auth.Policy,
 ) (EffectiveDecision, error) {
-	check, err := p.authorizeApplication(ctx, workspaceID)
+	check, err := p.authorizeApplication(ctx, workspaceID, "")
 	if err != nil {
 		return EffectiveDecision{}, err
 	}
+	return p.apply(ctx, check, baseLimits, baseOutputPolicies)
+}
+
+// ApplyForOperation loads one owned settings revision and derives its complete
+// effect under the exact operation the consuming request will execute.
+func (p *Provider) ApplyForOperation(
+	ctx context.Context,
+	workspaceID shoal.ID,
+	operation auth.Operation,
+	baseLimits Limits,
+	baseOutputPolicies []auth.Policy,
+) (EffectiveDecision, error) {
+	if err := operation.Validate(); err != nil {
+		return EffectiveDecision{}, err
+	}
+	check, err := p.authorizeApplication(ctx, workspaceID, operation)
+	if err != nil {
+		return EffectiveDecision{}, err
+	}
+	return p.apply(ctx, check, baseLimits, baseOutputPolicies)
+}
+
+func (p *Provider) apply(
+	ctx context.Context,
+	check authorizationCheck,
+	baseLimits Limits,
+	baseOutputPolicies []auth.Policy,
+) (EffectiveDecision, error) {
+	workspaceID := check.workspaceID
 	settings, err := p.store.Load(ctx, workspaceID)
 	if err != nil {
 		return EffectiveDecision{}, err
@@ -552,6 +581,7 @@ func (p *Provider) authorize(
 func (p *Provider) authorizeApplication(
 	ctx context.Context,
 	workspaceID shoal.ID,
+	operation auth.Operation,
 ) (authorizationCheck, error) {
 	if err := shoal.ValidateRequiredID("workspace ID", workspaceID); err != nil {
 		return authorizationCheck{}, err
@@ -560,12 +590,15 @@ func (p *Provider) authorizeApplication(
 	if err != nil {
 		return authorizationCheck{}, err
 	}
-	operations := decision.AllowedOperations()
-	if len(operations) == 0 {
-		return authorizationCheck{}, authDenied()
+	if operation == "" {
+		operations := decision.AllowedOperations()
+		if len(operations) == 0 {
+			return authorizationCheck{}, authDenied()
+		}
+		operation = operations[0]
 	}
 	return p.authorizeDecision(
-		ctx, decision, operations[0], workspaceID)
+		ctx, decision, operation, workspaceID)
 }
 
 func (p *Provider) authorizeDecision(
