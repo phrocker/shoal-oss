@@ -395,6 +395,17 @@ func TestHTTPToolCallPersistsAuthorizedInteractionAcrossRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	historical, err := client.Snapshot(aliceContext)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.Ingest(aliceContext, explorer.Source{
+		URI:       "file:///later.md",
+		MediaType: explorer.MediaTypeMarkdown,
+		Content:   "# Later\n\nUnrelated publication after the captured frontier.\n",
+	}); err != nil {
+		t.Fatal(err)
+	}
 	service, err := webapi.NewEmbeddedService(client)
 	if err != nil {
 		t.Fatal(err)
@@ -402,7 +413,8 @@ func TestHTTPToolCallPersistsAuthorizedInteractionAcrossRestart(t *testing.T) {
 	server, err := NewServer(Config{
 		Service: service, Authority: authority,
 		Decisions:       DecisionProviderFunc(authority.Resolver().Resolve),
-		InteractionSink: client, Snapshots: client,
+		InteractionSink: client,
+		Snapshots:       testSnapshotProvider{snapshot: historical},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -448,11 +460,14 @@ func TestHTTPToolCallPersistsAuthorizedInteractionAcrossRestart(t *testing.T) {
 		session, ProtocolVersion,
 		`{"jsonrpc":"2.0","method":"notifications/initialized"}`)
 	assertEmptyBody(t, initialized)
+	documentID := base64.RawURLEncoding.EncodeToString(
+		[]byte(ingested.Document.ID))
 	listed := postHTTPMCP(
 		t, httpServer.Client(), httpServer.URL+"/mcp", "alice",
 		session, ProtocolVersion,
 		`{"jsonrpc":"2.0","id":2,"method":"tools/call",`+
-			`"params":{"name":"shoal.documents","arguments":{}}}`)
+			`"params":{"name":"shoal.document","arguments":{"document_id":"`+
+			documentID+`"}}}`)
 	response := decodeHTTPResponse(t, listed)
 	if response.Error != nil || decodeToolResult(t, response).IsError {
 		t.Fatalf("documents response = %+v", response)
@@ -478,7 +493,9 @@ func TestHTTPToolCallPersistsAuthorizedInteractionAcrossRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	if recorded.Operation != interaction.OperationToolCall ||
-		recorded.AuthorizationOperation != string(auth.OperationList) ||
+		recorded.AuthorizationOperation != string(auth.OperationRead) ||
+		recorded.SnapshotID != shoal.ID(historical.ID) ||
+		!recorded.SnapshotAsOf.Equal(historical.AsOf) ||
 		recorded.Actor.SubjectID != "alice" ||
 		recorded.Reason.Code != "audit_purpose" ||
 		recorded.Reason.Digest !=
