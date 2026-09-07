@@ -25,11 +25,15 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/phrocker/shoal-oss/accumulo"
+	"github.com/phrocker/shoal-oss/internal/dirlock"
 	"github.com/phrocker/shoal-oss/internal/engine"
+	"github.com/phrocker/shoal-oss/internal/iterrt"
 	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/ontology"
@@ -217,8 +221,9 @@ func TestReviewSettingsRejectExpiryDuringStoreRead(t *testing.T) {
 						ExpectedRevision: 1, MutationID: "update",
 					})
 			case "apply":
-				_, err = provider.Apply(
+				_, err = provider.ApplyForOperation(
 					context.Background(), "review-workspace",
+					auth.OperationRead,
 					MaximumLimits(), nil)
 			}
 			if !shoal.IsErrorCode(err, shoal.ErrorUnauthorized) {
@@ -274,8 +279,9 @@ func TestReviewSettingsRejectGenerationChangeDuringStoreRead(t *testing.T) {
 						ExpectedRevision: 1, MutationID: "revoked",
 					})
 			case "apply":
-				_, err = provider.Apply(
+				_, err = provider.ApplyForOperation(
 					context.Background(), "generation-workspace",
+					auth.OperationRead,
 					MaximumLimits(), nil)
 			}
 			if !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
@@ -438,10 +444,11 @@ func TestReviewServiceWriterOutputPolicyIsConsumerNeutral(t *testing.T) {
 		},
 	})
 	reader := testDecision(t, decisionOptions{
-		serviceRole: auth.ServiceRoleWorkspaceSettingsRead,
-		ceilingID:   "reader-ceiling",
+		serviceRole: auth.ServiceRoleDataRead,
+		ceilingID:   "data-reader-ceiling",
 		operations: []auth.Operation{
-			auth.OperationWorkspaceSettingsRead,
+			auth.OperationRead,
+			auth.OperationRetrieve,
 		},
 	})
 	writerCeiling := serviceCeilingForDecision(
@@ -459,7 +466,7 @@ func TestReviewServiceWriterOutputPolicyIsConsumerNeutral(t *testing.T) {
 		GenerationReader: testGenerationReader{generation: 7},
 		CeilingResolver: roleCeilingResolver{
 			auth.ServiceRoleWorkspaceSettingsWrite: writerCeiling,
-			auth.ServiceRoleWorkspaceSettingsRead:  readerCeiling,
+			auth.ServiceRoleDataRead:               readerCeiling,
 		},
 		Clock: func() time.Time { return testNow },
 	})
@@ -488,14 +495,113 @@ func TestReviewServiceWriterOutputPolicyIsConsumerNeutral(t *testing.T) {
 			created.Narrowing.OutputPolicies[0].ServiceRole())
 	}
 	resolver.set(reader)
-	effective, err := provider.Apply(
-		context.Background(), "service-output", MaximumLimits(), nil)
+	effective, err := provider.ApplyForOperation(
+		context.Background(), "service-output", auth.OperationRetrieve,
+		MaximumLimits(), nil)
 	if err != nil {
 		t.Fatalf("reader apply: %v", err)
 	}
 	if len(effective.OutputPolicies()) != 1 ||
 		effective.OutputPolicies()[0].ServiceRole() != "" {
 		t.Fatalf("effective output policies = %#v", effective.OutputPolicies())
+	}
+	if err := effective.Decision().Authorize(
+		auth.OperationRetrieve,
+		auth.ResourceRequest{
+			AuthorizationDomain: effective.Decision().AuthorizationDomain(),
+		},
+		testNow,
+	); err != nil {
+		t.Fatalf("effective data-read decision cannot retrieve: %v", err)
+	}
+}
+
+func TestReviewNarrowServiceRolesApplyOwnedWorkspaceRestrictions(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		role      auth.ServiceRole
+		operation auth.Operation
+	}{
+		{"invocation", auth.ServiceRoleActionInvocation, auth.OperationInvoke},
+		{"analytics", auth.ServiceRoleAnalytics, auth.OperationAnalyticsRead},
+		{"retrieval", auth.ServiceRoleDataRead, auth.OperationRetrieve},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			store, err := OpenDurableStore(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close()
+			base := testDecision(t, decisionOptions{
+				serviceRole: test.role,
+				ceilingID:   "narrow-role-ceiling",
+				operations:  []auth.Operation{test.operation},
+			})
+			restriction, err := auth.NewPolicy(auth.PolicyConfig{
+				AuthorizationDomain: base.AuthorizationDomain(),
+				SourceID:            []byte("source-a"),
+				GrantPolicyID:       []byte("policy-a"),
+				Epoch:               1,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			outputBytes := uint64(1024)
+			settings, err := store.CompareAndSwap(
+				context.Background(), "owned-workspace", base.Subject(),
+				base.AuthorizationDomain(), 0, "create",
+				Narrowing{
+					Budgets:        Budgets{OutputBytes: &outputBytes},
+					OutputPolicies: []auth.Policy{restriction},
+				},
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ceiling := serviceCeilingForDecision(
+				t, base, "source-a", "policy-a", 1)
+			provider, err := NewProvider(store, ProviderOptions{
+				Resolver:         &mutableResolver{decision: base},
+				GenerationReader: testGenerationReader{generation: 7},
+				CeilingResolver:  roleCeilingResolver{test.role: ceiling},
+				Clock:            func() time.Time { return testNow },
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			effective, err := provider.ApplyForOperation(
+				context.Background(), settings.WorkspaceID,
+				test.operation,
+				MaximumLimits(), nil)
+			if err != nil {
+				t.Fatalf(
+					"owned narrowing disables otherwise-authorized %s: %v",
+					test.operation, err)
+			}
+			if effective.Limits().OutputBytes != outputBytes ||
+				effective.Revision() != settings.Revision ||
+				len(effective.OutputPolicies()) != 1 ||
+				effective.OutputPolicies()[0].ServiceRole() != "" {
+				t.Fatalf("workspace restriction was not applied: %#v", effective)
+			}
+			resource := auth.ResourceRequest{
+				AuthorizationDomain: base.AuthorizationDomain(),
+				SourceID:            []byte("source-a"),
+				PolicyID:            []byte("policy-a"),
+			}
+			if err := effective.Decision().Authorize(
+				test.operation, resource, testNow,
+			); err != nil {
+				t.Fatalf("narrowing lost the service operation: %v", err)
+			}
+			if _, err := provider.Get(
+				context.Background(), settings.WorkspaceID,
+			); !shoal.IsErrorCode(err, shoal.ErrorUnauthorized) {
+				t.Fatalf(
+					"application granted settings-management read access: %v",
+					err)
+			}
+		})
 	}
 }
 
@@ -612,6 +718,54 @@ func TestReviewSettingsConditionalWriteErrorReadback(t *testing.T) {
 			t.Fatalf("unknown result = %#v, error = %v", result, err)
 		}
 	})
+
+	t.Run("malformed committed result", func(t *testing.T) {
+		store, err := OpenDurableStore(t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer store.Close()
+		write := store.conditionalWrite
+		store.conditionalWrite = func(
+			table string,
+			mutations []engine.ConditionalMutation,
+		) ([]bool, error) {
+			if _, err := write(table, mutations); err != nil {
+				return nil, err
+			}
+			return nil, nil
+		}
+		result, err := store.CompareAndSwap(
+			context.Background(), "malformed-committed",
+			"owner", []byte("domain"), 0, "mutation", Narrowing{})
+		if err != nil || result.Revision != 1 {
+			t.Fatalf("malformed committed result = %#v, error = %v",
+				result, err)
+		}
+	})
+
+	t.Run("malformed unknown result", func(t *testing.T) {
+		store, err := OpenDurableStore(t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer store.Close()
+		store.conditionalWrite = func(
+			string,
+			[]engine.ConditionalMutation,
+		) ([]bool, error) {
+			return nil, nil
+		}
+		result, err := store.CompareAndSwap(
+			context.Background(), "malformed-unknown",
+			"owner", []byte("domain"), 0, "mutation", Narrowing{})
+		if result.WorkspaceID != "" || result.Revision != 0 ||
+			!explorer.IsIndeterminateCommit(err) ||
+			!shoal.IsErrorCode(err, shoal.ErrorInternal) {
+			t.Fatalf("malformed unknown result = %#v, error = %v",
+				result, err)
+		}
+	})
 }
 
 func TestReviewSettingsReadbackConcealsForeignWinner(t *testing.T) {
@@ -635,10 +789,371 @@ func TestReviewSettingsRejectConcurrentDirectoryOpen(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if _, err := os.Stat(filepath.Join(directory, settingsLockFile)); err != nil {
+		t.Fatalf("settings lock file: %v", err)
+	}
 	defer first.Close()
 	second, err := OpenDurableStore(directory)
 	if err == nil {
 		defer second.Close()
 		t.Fatal("two independent settings engines accepted the same WAL directory")
+	}
+}
+
+func TestReviewSettingsRejectExplorerRuntimeDirectory(t *testing.T) {
+	directory := t.TempDir()
+	runtime, err := explorer.Open(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := OpenDurableStore(directory); !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
+		t.Fatalf("expected unavailable while explorer runtime owns directory, got %v", err)
+	}
+	if err := runtime.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err := OpenDurableStore(directory)
+	if err != nil {
+		t.Fatalf("open settings store after explorer runtime close: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestReviewSettingsStoreRejectsPathAliasAndReopensAfterClose(t *testing.T) {
+	root := t.TempDir()
+	directory := filepath.Join(root, "settings")
+	aliasParent := filepath.Join(root, "alias")
+	if err := os.MkdirAll(directory, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(aliasParent, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(aliasParent, "..", "settings")
+	first, err := OpenDurableStore(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second, err := OpenDurableStore(alias); !errors.Is(err, dirlock.ErrLocked) ||
+		!shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
+		if second != nil {
+			_ = second.Close()
+		}
+		t.Fatalf("path-alias open error = %v", err)
+	}
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := OpenDurableStore(directory)
+	if err != nil {
+		t.Fatalf("reopen after close: %v", err)
+	}
+	if err := reopened.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestReviewSettingsStoreRetainsDirectoryLockWhenEngineCloseFails(
+	t *testing.T,
+) {
+	directory := t.TempDir()
+	store, err := OpenDurableStore(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	closeEngine := store.closeEngine
+	attempts := 0
+	store.closeEngine = func() error {
+		attempts++
+		if attempts == 1 {
+			return errors.New("simulated engine close failure")
+		}
+		return closeEngine()
+	}
+	if err := store.Close(); !shoal.IsErrorCode(err, shoal.ErrorInternal) {
+		t.Fatalf("first close error = %v", err)
+	}
+	if store.closed || store.engineClosed {
+		t.Fatalf("failed close marked store closed: %#v", store)
+	}
+	if second, err := OpenDurableStore(directory); !shoal.IsErrorCode(
+		err, shoal.ErrorUnavailable,
+	) {
+		if second != nil {
+			_ = second.Close()
+		}
+		t.Fatalf("failed engine close released directory lock: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("retry close: %v", err)
+	}
+	reopened, err := OpenDurableStore(directory)
+	if err != nil {
+		t.Fatalf("reopen after successful close retry: %v", err)
+	}
+	if err := reopened.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestReviewSettingsStoreRechecksCancellationAfterMutexWait(t *testing.T) {
+	store, err := OpenDurableStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	store.mu.Lock()
+	ctx, cancel := context.WithCancel(context.Background())
+	started := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		close(started)
+		_, err := store.CompareAndSwap(
+			ctx, "cancelled-workspace", "owner", []byte("domain"),
+			0, "cancelled-mutation", Narrowing{})
+		done <- err
+	}()
+	<-started
+	time.Sleep(10 * time.Millisecond)
+	cancel()
+	store.mu.Unlock()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("queued canceled mutation error = %v", err)
+	}
+	if _, err := store.Load(
+		context.Background(), "cancelled-workspace",
+	); !shoal.IsErrorCode(err, shoal.ErrorNotFound) {
+		t.Fatalf("queued canceled mutation committed: %v", err)
+	}
+}
+
+func TestReviewSettingsStoreCompactsSupersededRevisions(t *testing.T) {
+	directory := t.TempDir()
+	store, err := OpenDurableStore(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for revision := uint64(0); revision < 12; revision++ {
+		topK := uint32(20 - revision)
+		if _, err := store.CompareAndSwap(
+			context.Background(), "retained-workspace", "owner", []byte("domain"),
+			revision, shoal.ID(fmt.Sprintf("mutation-%d", revision)),
+			Narrowing{Budgets: Budgets{RetrievalTopK: &topK}},
+		); err != nil {
+			t.Fatalf("revision %d: %v", revision+1, err)
+		}
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := OpenDurableStore(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	rawVersions := 0
+	if err := reopened.engine.LookupRows(
+		settingsTable,
+		[][]byte{settingsRow("retained-workspace")},
+		engine.ScanOptions{
+			ColumnFamilies:          [][]byte{[]byte(settingsCF)},
+			ColumnFamiliesInclusive: true,
+		},
+		func(_ int, key *iterrt.Key, _ []byte) {
+			if bytes.Equal(key.ColumnFamily, []byte(settingsCF)) &&
+				bytes.Equal(key.ColumnQualifier, []byte(settingsCQ)) {
+				rawVersions++
+			}
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if rawVersions != 1 {
+		t.Fatalf("raw retained versions = %d, want 1", rawVersions)
+	}
+	loaded, err := reopened.Load(context.Background(), "retained-workspace")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Revision != 12 ||
+		loaded.Narrowing.Budgets.RetrievalTopK == nil ||
+		*loaded.Narrowing.Budgets.RetrievalTopK != 9 {
+		t.Fatalf("retained settings = %#v", loaded)
+	}
+}
+
+func TestReviewSettingsStoreSchedulesCompactionOutsideStoreMutex(t *testing.T) {
+	store, err := OpenDurableStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if _, err := store.CompareAndSwap(
+		context.Background(), "background-compact", "owner", []byte("domain"),
+		0, "create", Narrowing{},
+	); err != nil {
+		t.Fatal(err)
+	}
+	store.maintenanceMu.Lock()
+	store.uncompacted = settingsCompactInterval - 1
+	store.maintenanceMu.Unlock()
+	started := make(chan struct{})
+	release := make(chan struct{})
+	defer close(release)
+	compact := store.compact
+	store.compact = func(table string, stack []iterrt.IterSpec) error {
+		close(started)
+		<-release
+		return compact(table, stack)
+	}
+	topK := uint32(5)
+	if _, err := store.CompareAndSwap(
+		context.Background(), "background-compact", "owner", []byte("domain"),
+		1, "narrow", Narrowing{
+			Budgets: Budgets{RetrievalTopK: &topK},
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("background compaction was not scheduled")
+	}
+	if _, err := store.Load(
+		context.Background(), "background-compact"); err != nil {
+		t.Fatalf("store mutex remained held during compaction: %v", err)
+	}
+}
+
+func TestReviewSettingsReplayDoesNotScheduleCompaction(t *testing.T) {
+	store, err := OpenDurableStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	created, err := store.CompareAndSwap(
+		context.Background(), "replay-compact", "owner", []byte("domain"),
+		0, "create", Narrowing{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.maintenanceMu.Lock()
+	store.uncompacted = settingsCompactInterval - 1
+	store.maintenanceMu.Unlock()
+	compactions := 0
+	compact := store.compact
+	store.compact = func(table string, stack []iterrt.IterSpec) error {
+		compactions++
+		return compact(table, stack)
+	}
+	replayed, err := store.CompareAndSwap(
+		context.Background(), "replay-compact", "owner", []byte("domain"),
+		0, "create", Narrowing{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if replayed.Revision != created.Revision {
+		t.Fatalf("replayed revision = %d, want %d",
+			replayed.Revision, created.Revision)
+	}
+	time.Sleep(20 * time.Millisecond)
+	if compactions != 0 {
+		t.Fatalf("exact replay scheduled %d compactions", compactions)
+	}
+}
+
+func TestReviewSettingsStoreCanUseNonOwningSharedEngine(t *testing.T) {
+	eng, err := engine.Open(t.TempDir(), engine.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close()
+
+	store, err := NewDurableStoreWithEngine(eng)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewDurableStoreWithEngine(eng); !shoal.IsErrorCode(
+		err, shoal.ErrorUnavailable,
+	) {
+		t.Fatalf("duplicate shared-engine store error = %v", err)
+	}
+	created, err := store.CompareAndSwap(
+		context.Background(), "shared-workspace", "owner", []byte("domain"),
+		0, "create", Narrowing{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := NewDurableStoreWithEngine(eng)
+	if err != nil {
+		t.Fatalf("reattach after store close: %v", err)
+	}
+	loaded, err := reopened.Load(context.Background(), "shared-workspace")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Revision != created.Revision ||
+		loaded.SettingsID != created.SettingsID {
+		t.Fatalf("shared-engine reload = %#v, want %#v", loaded, created)
+	}
+	if err := reopened.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := eng.CreateTable(
+		"after-settings-close", engine.TableOptions{},
+	); err != nil {
+		t.Fatalf("settings store closed its caller-owned engine: %v", err)
+	}
+}
+
+func TestReviewStoreCASRechecksMonotonicityAtAcceptedRevision(t *testing.T) {
+	store, err := OpenDurableStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if _, err := store.CompareAndSwap(
+		context.Background(), "race-monotonic", "owner", []byte("domain"),
+		0, "create", Narrowing{},
+	); err != nil {
+		t.Fatal(err)
+	}
+	topK := uint32(5)
+	narrowed, err := store.CompareAndSwap(
+		context.Background(), "race-monotonic", "owner", []byte("domain"),
+		1, "narrow", Narrowing{
+			Budgets: Budgets{RetrievalTopK: &topK},
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if narrowed.Revision != 2 {
+		t.Fatalf("narrowed revision = %d", narrowed.Revision)
+	}
+	if _, err := store.CompareAndSwap(
+		context.Background(), "race-monotonic", "owner", []byte("domain"),
+		2, "stale-future", Narrowing{},
+	); !shoal.IsErrorCode(err, shoal.ErrorUnauthorized) {
+		t.Fatalf("store widening error = %v", err)
+	}
+	current, err := store.Load(context.Background(), "race-monotonic")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.Revision != 2 ||
+		current.Narrowing.Budgets.RetrievalTopK == nil ||
+		*current.Narrowing.Budgets.RetrievalTopK != topK {
+		t.Fatalf("current settings = %#v", current)
 	}
 }

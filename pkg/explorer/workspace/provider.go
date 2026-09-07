@@ -42,6 +42,32 @@ type OntologyChoices interface {
 	AuthorizeOntology(context.Context, auth.Decision, ontology.OntologyIdentity) error
 }
 
+// OperationOntologyChoices authorizes a selected ontology under the exact
+// operation whose decision is being narrowed.
+type OperationOntologyChoices interface {
+	OntologyChoices
+	AuthorizeOntologyForOperation(
+		context.Context,
+		auth.Decision,
+		ontology.OntologyIdentity,
+		auth.Operation,
+	) error
+}
+
+func authorizeOntologyForOperation(
+	ctx context.Context,
+	choices OntologyChoices,
+	decision auth.Decision,
+	identity ontology.OntologyIdentity,
+	operation auth.Operation,
+) error {
+	if operationChoices, ok := choices.(OperationOntologyChoices); ok {
+		return operationChoices.AuthorizeOntologyForOperation(
+			ctx, decision, identity, operation)
+	}
+	return choices.AuthorizeOntology(ctx, decision, identity)
+}
+
 // CeilingResolver returns the configured ceiling for a trusted service
 // decision. User decisions do not require a service ceiling.
 type CeilingResolver interface {
@@ -268,6 +294,7 @@ func (p *Provider) Update(
 // from the trusted ontology provider; settings never mutate that pointer.
 type OntologyChoice struct {
 	Identity ontology.OntologyIdentity
+	Version  string
 	Active   bool
 }
 
@@ -320,6 +347,18 @@ func (p *Provider) ListOntologyChoices(
 	if err != nil {
 		return OntologyChoiceSet{}, err
 	}
+	if selected, ok := check.decision.SelectedOntology(); ok {
+		filtered := choices[:0]
+		for _, choice := range choices {
+			if choice.Identity == selected {
+				filtered = append(filtered, choice)
+			}
+		}
+		if len(filtered) == 0 {
+			return OntologyChoiceSet{}, authDenied()
+		}
+		choices = filtered
+	}
 	if result.SelectedOntology.Present {
 		found := false
 		for _, choice := range choices {
@@ -357,8 +396,10 @@ func (p *Provider) SelectOntology(
 		return Settings{}, err
 	}
 	if absent(p.ontologyChoices) ||
-		p.ontologyChoices.AuthorizeOntology(
-			ctx, check.decision, identity) != nil {
+		authorizeOntologyForOperation(
+			ctx, p.ontologyChoices, check.decision, identity,
+			auth.OperationWorkspaceSettingsWrite,
+		) != nil {
 		return Settings{}, authDenied()
 	}
 	var current Settings
@@ -407,8 +448,9 @@ func (p *Provider) SelectOntology(
 	return result, nil
 }
 
-// Effective returns a currently revalidated decision plus budget, output label,
-// and cache-partition effects for one owned workspace.
+// Effective is the compatibility entry point for callers that have not yet
+// identified their consuming operation. New integrations must use
+// ApplyForOperation.
 func (p *Provider) Effective(
 	ctx context.Context,
 	workspaceID shoal.ID,
@@ -418,19 +460,47 @@ func (p *Provider) Effective(
 	return p.Apply(ctx, workspaceID, baseLimits, baseOutputPolicies)
 }
 
-// Apply loads one owned settings revision and derives its complete effect from
-// the caller's current decision.
+// Apply is the compatibility entry point for legacy transports. New
+// integrations must use ApplyForOperation with the exact consuming operation.
 func (p *Provider) Apply(
 	ctx context.Context,
 	workspaceID shoal.ID,
 	baseLimits Limits,
 	baseOutputPolicies []auth.Policy,
 ) (EffectiveDecision, error) {
-	check, err := p.authorize(
-		ctx, auth.OperationWorkspaceSettingsRead, workspaceID)
+	check, err := p.authorizeApplication(ctx, workspaceID, "")
 	if err != nil {
 		return EffectiveDecision{}, err
 	}
+	return p.apply(ctx, check, baseLimits, baseOutputPolicies)
+}
+
+// ApplyForOperation loads one owned settings revision and derives its complete
+// effect under the exact operation the consuming request will execute.
+func (p *Provider) ApplyForOperation(
+	ctx context.Context,
+	workspaceID shoal.ID,
+	operation auth.Operation,
+	baseLimits Limits,
+	baseOutputPolicies []auth.Policy,
+) (EffectiveDecision, error) {
+	if err := operation.Validate(); err != nil {
+		return EffectiveDecision{}, err
+	}
+	check, err := p.authorizeApplication(ctx, workspaceID, operation)
+	if err != nil {
+		return EffectiveDecision{}, err
+	}
+	return p.apply(ctx, check, baseLimits, baseOutputPolicies)
+}
+
+func (p *Provider) apply(
+	ctx context.Context,
+	check authorizationCheck,
+	baseLimits Limits,
+	baseOutputPolicies []auth.Policy,
+) (EffectiveDecision, error) {
+	workspaceID := check.workspaceID
 	settings, err := p.store.Load(ctx, workspaceID)
 	if err != nil {
 		return EffectiveDecision{}, err
@@ -446,7 +516,8 @@ func (p *Provider) Apply(
 		return EffectiveDecision{}, err
 	}
 	options := ApplyOptions{
-		Now: p.clock(), BaseLimits: baseLimits,
+		Now: p.clock(), Operation: check.operation,
+		BaseLimits:         baseLimits,
 		BaseOutputPolicies: baseOutputPolicies,
 		OntologyChoices:    p.ontologyChoices,
 	}
@@ -466,14 +537,41 @@ func (p *Provider) Apply(
 	if err != nil {
 		return EffectiveDecision{}, err
 	}
+	effectiveNow := p.clock()
+	if effectiveNow.IsZero() ||
+		effective.Decision().Authorize(
+			check.operation,
+			auth.ResourceRequest{
+				AuthorizationDomain: effective.Decision().AuthorizationDomain(),
+				ObjectID:            workspaceID,
+			},
+			effectiveNow,
+		) != nil {
+		return EffectiveDecision{}, authDenied()
+	}
 	if err := p.recheck(ctx, check); err != nil {
 		return EffectiveDecision{}, err
 	}
 	return effective, nil
 }
 
-// ApplyDecision returns the current caller decision with only the selected
-// workspace's durable authorization and ontology narrowing applied.
+// ApplyDecisionForOperation returns the current caller decision with only the
+// selected workspace's durable narrowing for the exact consuming operation.
+func (p *Provider) ApplyDecisionForOperation(
+	ctx context.Context,
+	workspaceID shoal.ID,
+	operation auth.Operation,
+) (auth.Decision, error) {
+	effective, err := p.ApplyForOperation(
+		ctx, workspaceID, operation, MaximumLimits(), nil)
+	if err != nil {
+		return auth.Decision{}, err
+	}
+	return effective.Decision(), nil
+}
+
+// ApplyDecision is the compatibility entry point for legacy transports. New
+// integrations must use ApplyDecisionForOperation.
 func (p *Provider) ApplyDecision(
 	ctx context.Context,
 	workspaceID shoal.ID,
@@ -505,6 +603,40 @@ func (p *Provider) authorize(
 	if err != nil {
 		return authorizationCheck{}, err
 	}
+	return p.authorizeDecision(ctx, decision, operation, workspaceID)
+}
+
+func (p *Provider) authorizeApplication(
+	ctx context.Context,
+	workspaceID shoal.ID,
+	operation auth.Operation,
+) (authorizationCheck, error) {
+	if err := shoal.ValidateRequiredID("workspace ID", workspaceID); err != nil {
+		return authorizationCheck{}, err
+	}
+	decision, err := p.resolver.Resolve(ctx)
+	if err != nil {
+		return authorizationCheck{}, err
+	}
+	if operation == "" {
+		operations := decision.AllowedOperations()
+		if len(operations) == 0 {
+			return authorizationCheck{}, authDenied()
+		}
+		operation = operations[0]
+	} else if err := operation.Validate(); err != nil {
+		return authorizationCheck{}, err
+	}
+	return p.authorizeDecision(
+		ctx, decision, operation, workspaceID)
+}
+
+func (p *Provider) authorizeDecision(
+	ctx context.Context,
+	decision auth.Decision,
+	operation auth.Operation,
+	workspaceID shoal.ID,
+) (authorizationCheck, error) {
 	guard, err := auth.NewGenerationGuard(decision, p.generationReader)
 	if err != nil {
 		return authorizationCheck{}, authDenied()
@@ -583,11 +715,17 @@ func (p *Provider) normalizeUpdate(
 		return Narrowing{}, err
 	}
 	if ontologySelection.Present {
+		if selected, ok := decision.SelectedOntology(); ok &&
+			selected != ontologySelection.Identity {
+			return Narrowing{}, authDenied()
+		}
 		if absent(p.ontologyChoices) {
 			return Narrowing{}, authDenied()
 		}
-		if err := p.ontologyChoices.AuthorizeOntology(
-			ctx, decision, ontologySelection.Identity); err != nil {
+		if err := authorizeOntologyForOperation(
+			ctx, p.ontologyChoices, decision, ontologySelection.Identity,
+			auth.OperationWorkspaceSettingsWrite,
+		); err != nil {
 			return Narrowing{}, authDenied()
 		}
 	}
@@ -663,6 +801,7 @@ func (p *Provider) normalizeUpdate(
 // ApplyOptions supplies trusted non-settings limits and output policies.
 type ApplyOptions struct {
 	Now                time.Time
+	Operation          auth.Operation
 	BaseLimits         Limits
 	BaseOutputPolicies []auth.Policy
 	ServiceCeiling     *auth.ServiceCeiling
@@ -709,6 +848,9 @@ func (e EffectiveDecision) CacheDimensions() map[string]uint64 {
 
 // OutputVisibility conjoins all base and settings-added output policies.
 func (e EffectiveDecision) OutputVisibility() ([]byte, error) {
+	if len(e.outputPolicies) == 0 {
+		return nil, nil
+	}
 	return auth.ConjoinPolicies(e.outputPolicies...)
 }
 
@@ -737,8 +879,16 @@ func DeriveEffectiveDecision(
 	if options.Now.IsZero() {
 		return EffectiveDecision{}, invalid("application time is required")
 	}
+	operation := options.Operation
+	if operation == "" {
+		operations := base.AllowedOperations()
+		if len(operations) == 0 {
+			return EffectiveDecision{}, authDenied()
+		}
+		operation = operations[0]
+	}
 	if err := base.Authorize(
-		auth.OperationWorkspaceSettingsRead,
+		operation,
 		auth.ResourceRequest{
 			AuthorizationDomain: base.AuthorizationDomain(),
 			ObjectID:            settings.WorkspaceID,
@@ -773,11 +923,16 @@ func DeriveEffectiveDecision(
 	}
 	selected, selectedSet := base.SelectedOntology()
 	if narrowing.SelectedOntology.Present {
+		if selectedSet && selected != narrowing.SelectedOntology.Identity {
+			return EffectiveDecision{}, authDenied()
+		}
 		if absent(options.OntologyChoices) {
 			return EffectiveDecision{}, authDenied()
 		}
-		if err := options.OntologyChoices.AuthorizeOntology(
-			ctx, base, narrowing.SelectedOntology.Identity); err != nil {
+		if err := authorizeOntologyForOperation(
+			ctx, options.OntologyChoices, base,
+			narrowing.SelectedOntology.Identity, operation,
+		); err != nil {
 			return EffectiveDecision{}, authDenied()
 		}
 		selected = narrowing.SelectedOntology.Identity
@@ -791,7 +946,7 @@ func DeriveEffectiveDecision(
 			return EffectiveDecision{}, err
 		}
 		if err := authorizeOutputPolicy(
-			base, policy, options.ServiceCeiling, options.Now); err != nil {
+			base, operation, policy, options.ServiceCeiling, options.Now); err != nil {
 			return EffectiveDecision{}, authDenied()
 		}
 		settingsOutputPolicies = append(settingsOutputPolicies, policy)
@@ -806,7 +961,7 @@ func DeriveEffectiveDecision(
 	}
 	for _, policy := range options.BaseOutputPolicies {
 		if err := authorizeOutputPolicy(
-			base, policy, options.ServiceCeiling, options.Now); err != nil {
+			base, operation, policy, options.ServiceCeiling, options.Now); err != nil {
 			return EffectiveDecision{}, authDenied()
 		}
 	}
@@ -876,12 +1031,13 @@ func Apply(
 
 func authorizeOutputPolicy(
 	decision auth.Decision,
+	operation auth.Operation,
 	policy auth.Policy,
 	ceiling *auth.ServiceCeiling,
 	now time.Time,
 ) error {
 	if err := decision.Authorize(
-		auth.OperationWorkspaceSettingsRead,
+		operation,
 		auth.ResourceRequest{
 			AuthorizationDomain: policy.AuthorizationDomain(),
 			SourceID:            policy.SourceID(),
@@ -905,7 +1061,7 @@ func authorizeOutputPolicy(
 			return authDenied()
 		}
 		_, err = auth.DeriveScannerAuthorizations(
-			decision, auth.OperationWorkspaceSettingsRead,
+			decision, operation,
 			servicePolicy, *ceiling, now)
 		return err
 	}
@@ -1023,7 +1179,10 @@ func ensureMonotonic(previous, next Narrowing) error {
 		widenedIDSelection(previous.PermittedPolicyIDs, next.PermittedPolicyIDs) ||
 		widenedBudgets(previous.Budgets, next.Budgets) ||
 		!policySubset(previous.OutputPolicies, next.OutputPolicies) ||
-		(previous.SelectedOntology.Present && !next.SelectedOntology.Present) {
+		(previous.SelectedOntology.Present &&
+			(!next.SelectedOntology.Present ||
+				next.SelectedOntology.Identity !=
+					previous.SelectedOntology.Identity)) {
 		return authDenied()
 	}
 	return nil
