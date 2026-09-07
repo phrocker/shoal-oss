@@ -444,25 +444,6 @@ func (s *EmbeddedService) CreateOntologyProposal(
 	if err != nil {
 		return ontology.GovernedProposal{}, err
 	}
-	proposal, err := ontology.NewGovernedProposalWithMorphisms(
-		base.Schema(), base, proposed, morphisms,
-		ontologyActor(ctx), request.Rationale, now, nil)
-	if err != nil {
-		return ontology.GovernedProposal{}, err
-	}
-	if len(proposals) >= int(MaxOntologyProposals) {
-		existing := false
-		for _, candidate := range proposals {
-			if candidate.ID() == proposal.ID() {
-				existing = true
-				break
-			}
-		}
-		if !existing {
-			return ontology.GovernedProposal{}, ontologyBoundError(
-				"proposal", len(proposals)+1, MaxOntologyProposals)
-		}
-	}
 	if err := store.CreateOntologyProposal(ctx, proposal, base); err != nil {
 		return ontology.GovernedProposal{}, err
 	}

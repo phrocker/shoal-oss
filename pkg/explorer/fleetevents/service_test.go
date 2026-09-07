@@ -24,14 +24,25 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
+	"fmt"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/interaction"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
+
+func TestDeriveIDLengthFramesOpaqueParts(t *testing.T) {
+	left := deriveID("opaque", []byte{'a', 0, 'b'}, []byte("c"))
+	right := deriveID("opaque", []byte("a"), []byte{'b', 0, 'c'})
+	if bytes.Equal(left, right) {
+		t.Fatal("length-distinct opaque identity parts collided")
+	}
+}
 
 func TestCursorTamperCrossSubscriberAndRevocation(t *testing.T) {
 	now := time.Date(2026, 9, 5, 20, 0, 0, 0, time.UTC)
@@ -123,6 +134,47 @@ func TestServiceRejectsTransportRacingLongPollBound(t *testing.T) {
 	}
 }
 
+func TestPublishBoundsEvidenceBeforeAuthorization(t *testing.T) {
+	now := time.Date(2026, 9, 7, 10, 0, 0, 0, time.UTC)
+	resolver := &countingResolver{
+		err: errors.New("authorization should not run"),
+	}
+	service, err := New(Config{
+		Backend: &memoryBackend{}, Resolver: resolver,
+		GenerationReader: &generationReader{generation: 7},
+		LeaseValidator:   &leaseValidator{}, Auditor: &auditor{},
+		CursorKey: make([]byte, 32), Clock: func() time.Time { return now },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	evidence := make([]Evidence, MaxEvidence+1)
+	for index := range evidence {
+		evidence[index] = Evidence{
+			SourceID: []byte("source"), PolicyID: []byte("policy"),
+			ObjectID: shoal.ID(fmt.Sprintf("object-%d", index)),
+		}
+	}
+	_, err = service.Publish(context.Background(), PublishRequest{
+		Token: []byte("token"), RetryUntil: now.Add(time.Hour),
+		Event: Event{
+			Kind: "product.updated", ProducerID: []byte("producer"),
+			ActionID: []byte("action"), OccurredAt: now, Evidence: evidence,
+		},
+	})
+	if err == nil || resolver.calls != 0 {
+		t.Fatalf("oversized evidence error = %v, resolver calls = %d", err, resolver.calls)
+	}
+}
+
+func TestPublicationUnknownMapsToIndeterminateUnavailable(t *testing.T) {
+	err := mapContextError(ErrPublicationUnknown)
+	if !explorer.IsIndeterminateCommit(err) ||
+		!shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
+		t.Fatalf("publication unknown mapping = %v", err)
+	}
+}
+
 func TestPullResyncAndMidPageGenerationChange(t *testing.T) {
 	now := time.Date(2026, 9, 5, 20, 0, 0, 0, time.UTC)
 	backend := &memoryBackend{floor: 4, events: []Event{eventAt(4), eventAt(5)}}
@@ -159,7 +211,7 @@ func TestPullDropsEventDeniedOnlyByFinalAuthorizationCheck(t *testing.T) {
 	allowed, err := auth.NewDecision(auth.DecisionConfig{
 		Subject: "alice", Actor: "alice", RequestID: "request",
 		AuthorizationDomain: []byte("domain"),
-		AllowedOperations:   []auth.Operation{auth.OperationSubscriptionDeliver},
+		AllowedOperations:   []auth.Operation{auth.OperationSubscriptionCreate},
 		PermittedSourceIDs:  [][]byte{[]byte("source")},
 		PermittedPolicyIDs:  [][]byte{[]byte("policy")},
 		PolicyGeneration:    7, AuthenticationExpires: now.Add(time.Hour),
@@ -237,6 +289,56 @@ func TestRecorderFailureReportsAmbiguousCommittedAction(t *testing.T) {
 		len(audit.records[0].Evidence) != len(backend.events[0].Evidence) ||
 		audit.records[0].Evidence[0].ObjectID != backend.events[0].Evidence[0].ObjectID {
 		t.Fatalf("audit evidence = %#v", audit.records)
+	}
+}
+
+func TestPublishAuditIdentityUsesStableEventOccurrence(t *testing.T) {
+	now := time.Date(2026, 9, 5, 20, 0, 0, 0, time.UTC)
+	occurredAt := now.Add(-time.Minute)
+	backend := &memoryBackend{}
+	audit := &auditor{}
+	service := testService(t, "alice", now, backend, &generationReader{generation: 7},
+		&leaseValidator{}, audit)
+	event := eventAt(0)
+	event.OccurredAt = occurredAt
+	if _, err := service.Publish(context.Background(), PublishRequest{
+		Token: []byte("publish"), RetryUntil: now.Add(time.Hour), Event: event,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(audit.records) != 1 || !audit.records[0].OccurredAt.Equal(occurredAt) {
+		t.Fatalf("audit occurrence = %#v, want %s", audit.records, occurredAt)
+	}
+}
+
+func TestAuditErrorClassificationPreservesCommittedOutcome(t *testing.T) {
+	cause := errors.New("record accepted before failure")
+	committed := interaction.MarkCommittedRecord(cause)
+	if got := classifyAuditError(committed); !errors.Is(got, cause) ||
+		!interaction.IsCommittedRecord(got) ||
+		errors.Is(got, ErrAuditOutcomeUnknown) {
+		t.Fatalf("committed audit error = %v", got)
+	}
+	unclassified := classifyAuditError(cause)
+	if !errors.Is(unclassified, cause) ||
+		!errors.Is(unclassified, ErrAuditOutcomeUnknown) {
+		t.Fatalf("unclassified audit error = %v", unclassified)
+	}
+}
+
+func TestPublishPreservesKnownCommittedAuditOutcome(t *testing.T) {
+	now := time.Date(2026, 9, 5, 20, 0, 0, 0, time.UTC)
+	backend := &memoryBackend{}
+	cause := errors.New("record accepted before cancellation")
+	audit := &auditor{err: interaction.MarkCommittedRecord(cause)}
+	service := testService(t, "alice", now, backend, &generationReader{generation: 7},
+		&leaseValidator{}, audit)
+	_, err := service.Publish(context.Background(), PublishRequest{
+		Token: []byte("publish"), RetryUntil: now.Add(time.Hour), Event: eventAt(0),
+	})
+	if !errors.Is(err, cause) || !interaction.IsCommittedRecord(err) ||
+		errors.Is(err, ErrAuditOutcomeUnknown) || len(backend.events) != 1 {
+		t.Fatalf("publish error/events = %v/%d", err, len(backend.events))
 	}
 }
 
@@ -371,6 +473,88 @@ func TestEventRequiresProducerGenerationAndTransitionIdentity(t *testing.T) {
 	}
 }
 
+func TestEventRejectsConflictingEvidenceAnchorAcrossGroups(t *testing.T) {
+	event := eventAt(1)
+	event.ConsumedEvidence = []interaction.EvidenceReference{{
+		AnchorID: "shared-anchor", Kind: interaction.EvidenceGraph,
+		NodeIDs: []shoal.ID{"consumed-node"},
+	}}
+	event.CitedEvidence = []interaction.EvidenceReference{{
+		AnchorID: "shared-anchor", Kind: interaction.EvidenceGraph,
+		NodeIDs: []shoal.ID{"cited-node"},
+	}}
+	if _, err := normalizeEvent(event, true); err == nil {
+		t.Fatal("conflicting consumed/cited anchor succeeded")
+	}
+}
+
+func TestEventRejectsFlattenedEvidenceWithoutCanonicalReference(t *testing.T) {
+	for name, mutate := range map[string]func(*Evidence){
+		"node":     func(value *Evidence) { value.NodeID = "node" },
+		"edge":     func(value *Evidence) { value.EdgeID = "edge" },
+		"anchor":   func(value *Evidence) { value.AnchorID = "anchor" },
+		"revision": func(value *Evidence) { value.RevisionID = "revision" },
+		"range":    func(value *Evidence) { value.Start, value.End = 1, 2 },
+	} {
+		for _, withReference := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/reference=%t", name, withReference), func(t *testing.T) {
+				event := eventAt(1)
+				if withReference {
+					event.Evidence[0].Reference = &interaction.EvidenceReference{
+						AnchorID: "canonical-anchor", Kind: interaction.EvidenceGraph,
+						NodeIDs: []shoal.ID{"canonical-node"},
+					}
+					event.ConsumedEvidence = []interaction.EvidenceReference{
+						*event.Evidence[0].Reference,
+					}
+				}
+				mutate(&event.Evidence[0])
+				if _, err := normalizeEvent(event, true); err == nil {
+					t.Fatal("legacy flattened evidence succeeded")
+				}
+			})
+		}
+	}
+}
+
+func TestEventPreservesEvidenceGroupAndGraphPathOrder(t *testing.T) {
+	event := eventAt(1)
+	event.ConsumedEvidence = []interaction.EvidenceReference{
+		{
+			AnchorID: "second-anchor", Kind: interaction.EvidenceGraph,
+			NodeIDs: []shoal.ID{"node-b", "node-a"}, EdgeIDs: []shoal.ID{"edge-b-a"},
+		},
+		{
+			AnchorID: "first-anchor", Kind: interaction.EvidenceGraph,
+			NodeIDs: []shoal.ID{"node-a"},
+		},
+	}
+	event.CitedEvidence = []interaction.EvidenceReference{{
+		AnchorID: "cited-anchor", Kind: interaction.EvidenceGraph,
+		NodeIDs: []shoal.ID{"cited-node"},
+	}}
+	for _, id := range []shoal.ID{
+		"second-anchor", "node-b", "node-a", "edge-b-a",
+		"first-anchor", "cited-anchor", "cited-node",
+	} {
+		event.Evidence = append(event.Evidence, Evidence{
+			SourceID: []byte("source"), PolicyID: []byte("policy"),
+			ObjectID: id,
+		})
+	}
+	normalized, err := normalizeEvent(event, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if normalized.ConsumedEvidence[0].AnchorID != "second-anchor" ||
+		!reflect.DeepEqual(normalized.ConsumedEvidence[0].NodeIDs,
+			[]shoal.ID{"node-b", "node-a"}) ||
+		normalized.CitedEvidence[0].AnchorID != "cited-anchor" {
+		t.Fatalf("normalized evidence = %#v / %#v",
+			normalized.ConsumedEvidence, normalized.CitedEvidence)
+	}
+}
+
 func TestPublishLifecycleKeepsStableTokenAndRejectsBroadOperation(t *testing.T) {
 	now := time.Date(2026, 9, 5, 20, 0, 0, 0, time.UTC)
 	decision, err := auth.NewDecision(auth.DecisionConfig{
@@ -415,7 +599,6 @@ func TestPublishLifecycleKeepsStableTokenAndRejectsBroadOperation(t *testing.T) 
 		}(),
 		AuthorizationExpiresAt: decision.AuthenticationExpires(),
 	}
-	request.Event.Kind = "action.enqueued"
 	if _, err := service.PublishLifecycle(
 		context.Background(), auth.OperationDispatch, request, receipt,
 	); err != nil {
@@ -525,13 +708,10 @@ func TestSubscriptionRoleOnlyCanDeliverWithoutGenericRead(t *testing.T) {
 	decision, err := auth.NewDecision(auth.DecisionConfig{
 		Subject: "subscriber", Actor: "subscriber", RequestID: "request",
 		AuthorizationDomain: []byte("domain"),
-		AllowedOperations: []auth.Operation{
-			auth.OperationSubscriptionCreate,
-			auth.OperationSubscriptionDeliver,
-		},
-		PermittedSourceIDs: [][]byte{[]byte("source")},
-		PermittedPolicyIDs: [][]byte{[]byte("policy")},
-		PolicyGeneration:   7, AuthenticationExpires: now.Add(time.Hour),
+		AllowedOperations:   []auth.Operation{auth.OperationSubscriptionCreate},
+		PermittedSourceIDs:  [][]byte{[]byte("source")},
+		PermittedPolicyIDs:  [][]byte{[]byte("policy")},
+		PolicyGeneration:    7, AuthenticationExpires: now.Add(time.Hour),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -590,7 +770,11 @@ func TestCursorExpiresAndAEADIsRequired(t *testing.T) {
 	if _, err := codec.open(value, now.Add(time.Minute)); !errors.Is(err, ErrCursorInvalid) {
 		t.Fatalf("expired cursor error = %v", err)
 	}
-	mutated := value[:len(value)-1] + "A"
+	replacement := byte('A')
+	if value[len(value)-1] == replacement {
+		replacement = 'B'
+	}
+	mutated := value[:len(value)-1] + string(replacement)
 	if _, err := codec.open(mutated, now); !errors.Is(err, ErrCursorInvalid) {
 		t.Fatalf("unauthenticated mutation error = %v", err)
 	}
@@ -598,6 +782,29 @@ func TestCursorExpiresAndAEADIsRequired(t *testing.T) {
 		append([]byte{1}, bytes.Repeat([]byte{0x41}, 96)...))
 	if _, err := codec.open(legacy, now); !errors.Is(err, ErrCursorInvalid) {
 		t.Fatalf("legacy cursor error = %v", err)
+	}
+}
+
+func TestCursorPreservesSubsecondExpiry(t *testing.T) {
+	now := time.Date(2026, 9, 5, 20, 0, 0, 900_000_000, time.UTC)
+	codec, err := newCursorCodec(bytesOf(7, 32), 200*time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	value, err := codec.seal(cursorState{
+		SubscriptionID: []byte("subscription"), SubscriberID: "alice",
+		Fingerprint: auth.Fingerprint{1}, Generation: 1, NextSequence: 2,
+		ExpiresAt: now.Add(200 * time.Millisecond),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, err := codec.open(value, now.Add(100*time.Millisecond))
+	if err != nil || !state.ExpiresAt.Equal(now.Add(200*time.Millisecond)) {
+		t.Fatalf("subsecond cursor = %#v, %v", state, err)
+	}
+	if _, err := codec.open(value, now.Add(200*time.Millisecond)); !errors.Is(err, ErrCursorInvalid) {
+		t.Fatalf("expired subsecond cursor error = %v", err)
 	}
 }
 
@@ -611,7 +818,7 @@ func testService(
 		AuthorizationDomain: []byte("domain"),
 		AllowedOperations: []auth.Operation{
 			auth.OperationSubscriptionCreate, auth.OperationSubscriptionDelete,
-			auth.OperationEventPublish, auth.OperationSubscriptionDeliver,
+			auth.OperationEventPublish,
 		},
 		PermittedSourceIDs: [][]byte{[]byte("source")},
 		PermittedPolicyIDs: [][]byte{[]byte("policy")},
@@ -635,47 +842,6 @@ func testService(
 	return service
 }
 
-func TestNewRejectsTypedNilDependencies(t *testing.T) {
-	base := Config{
-		Backend: &memoryBackend{}, Resolver: &sequenceResolver{},
-		GenerationReader: &generationReader{}, LeaseValidator: &leaseValidator{},
-		Auditor: &auditor{}, CursorKey: make([]byte, 32),
-	}
-	tests := map[string]func(*Config){
-		"backend": func(config *Config) {
-			var value *memoryBackend
-			config.Backend = value
-		},
-		"resolver": func(config *Config) {
-			var value *sequenceResolver
-			config.Resolver = value
-		},
-		"generation reader": func(config *Config) {
-			var value *generationReader
-			config.GenerationReader = value
-		},
-		"lease validator": func(config *Config) {
-			var value *leaseValidator
-			config.LeaseValidator = value
-		},
-		"auditor": func(config *Config) {
-			var value *auditor
-			config.Auditor = value
-		},
-	}
-	for name, mutate := range tests {
-		t.Run(name, func(t *testing.T) {
-			config := base
-			mutate(&config)
-			if _, err := New(config); !shoal.IsErrorCode(
-				err, shoal.ErrorInvalidArgument,
-			) {
-				t.Fatalf("typed-nil dependency error = %v", err)
-			}
-		})
-	}
-}
-
 type generationReader struct {
 	mu         sync.Mutex
 	generation int64
@@ -685,6 +851,16 @@ type sequenceResolver struct {
 	mu              sync.Mutex
 	allowed, denied auth.Decision
 	calls, denyAt   int
+}
+
+type countingResolver struct {
+	calls int
+	err   error
+}
+
+func (r *countingResolver) Resolve(context.Context) (auth.Decision, error) {
+	r.calls++
+	return auth.Decision{}, r.err
 }
 
 func (r *sequenceResolver) Resolve(context.Context) (auth.Decision, error) {
@@ -784,18 +960,18 @@ func (b *memoryBackend) Subscription(context.Context, []byte) (Subscription, err
 func (b *memoryBackend) Delete(
 	_ context.Context, _ []byte, subscriberID shoal.ID, expected uint64,
 	_ time.Time, now time.Time,
-) (Subscription, error) {
+) (Subscription, bool, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if b.subscription.SubscriberID != subscriberID {
-		return Subscription{}, ErrSubscriptionNotFound
+		return Subscription{}, false, ErrSubscriptionNotFound
 	}
 	if b.subscription.Generation != expected {
-		return Subscription{}, ErrGenerationConflict
+		return Subscription{}, false, ErrGenerationConflict
 	}
 	b.subscription.Generation++
 	b.subscription.RevokedAt = now
-	return cloneSubscription(b.subscription), nil
+	return cloneSubscription(b.subscription), false, nil
 }
 
 func (b *memoryBackend) Append(_ context.Context, request PublishRequest, _ time.Time) (PublishResult, error) {
@@ -809,7 +985,9 @@ func (b *memoryBackend) Append(_ context.Context, request PublishRequest, _ time
 	if b.onAppend != nil {
 		b.onAppend()
 	}
-	return PublishResult{EventID: event.EventID, Sequence: event.Sequence}, nil
+	return PublishResult{
+		EventID: event.EventID, Sequence: event.Sequence, Audit: request.Audit,
+	}, nil
 }
 
 func (b *memoryBackend) Scan(

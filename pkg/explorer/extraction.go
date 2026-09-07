@@ -102,7 +102,6 @@ func (e *Explorer) loadExtractionRecord(row, qualifier, encoded []byte) error {
 			shoal.ErrorInternal, "stored explorer extraction row is invalid")
 	}
 	copy := record
-	e.registerSourceEdgeBirthLocked(copy.Edges, copy.PublishedAt)
 	e.extractions[record.ID] = &copy
 	return nil
 }
@@ -286,7 +285,6 @@ func (e *Explorer) CommitExtraction(
 	); err != nil {
 		return ExtractionResult{}, err
 	}
-	e.registerSourceEdgeBirthLocked(published.Edges, published.PublishedAt)
 	copy := published
 	e.extractions[published.ID] = &copy
 	if e.graphInitialized {

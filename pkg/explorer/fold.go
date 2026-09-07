@@ -82,17 +82,15 @@ type FoldSummaryPage struct {
 const MaxFoldSummaryPageSize uint32 = 1000
 
 type persistedFold struct {
-	FoldID             shoal.ID
-	Members            []interaction.FoldMember
-	SummaryDigest      string
-	Nodes              []graph.Node
-	Edges              []graph.Edge
-	Visibility         string
-	SourceEdgeIDs      []shoal.ID
-	RequiredVisibility []string
-	FoldedAt           time.Time
-	Deleted            bool
-	DeletedAt          time.Time
+	FoldID        shoal.ID
+	Members       []interaction.FoldMember
+	SummaryDigest string
+	Nodes         []graph.Node
+	Edges         []graph.Edge
+	Visibility    string
+	FoldedAt      time.Time
+	Deleted       bool
+	DeletedAt     time.Time
 }
 
 // FoldInteractions folds one or more recorded sessions into a single derived
@@ -263,15 +261,13 @@ func (e *Explorer) FoldInteractions(
 		return FoldResult{}, err
 	}
 	record := persistedFold{
-		FoldID:             subgraph.ID,
-		Members:            canonical.Members,
-		SummaryDigest:      canonical.SummaryDigest,
-		Nodes:              subgraph.Nodes,
-		Edges:              subgraph.Edges,
-		Visibility:         interaction.Expression(subgraph.Visibility),
-		SourceEdgeIDs:      sourceEdgeIDs,
-		RequiredVisibility: requiredVisibility,
-		FoldedAt:           fold.FoldedAt,
+		FoldID:        subgraph.ID,
+		Members:       canonical.Members,
+		SummaryDigest: canonical.SummaryDigest,
+		Nodes:         subgraph.Nodes,
+		Edges:         subgraph.Edges,
+		Visibility:    interaction.Expression(subgraph.Visibility),
+		FoldedAt:      fold.FoldedAt,
 	}
 	if err := validatePersistedFold(record); err != nil {
 		return FoldResult{}, err
@@ -589,60 +585,6 @@ func (e *Explorer) Folds(ctx context.Context) ([]FoldSummary, error) {
 	return summaries, nil
 }
 
-// FoldsPage returns a bounded ID-ordered slice of fold summaries.
-func (e *Explorer) FoldsPage(
-	ctx context.Context, after shoal.ID, limit uint32,
-) (FoldSummaryPage, error) {
-	if err := contextError(ctx); err != nil {
-		return FoldSummaryPage{}, err
-	}
-	if err := shoal.ValidateOptionalID("fold page cursor", after); err != nil {
-		return FoldSummaryPage{}, err
-	}
-	if limit == 0 || limit > MaxFoldSummaryPageSize {
-		return FoldSummaryPage{}, shoal.NewError(
-			shoal.ErrorInvalidArgument, "fold page limit is outside its bound")
-	}
-	if err := e.acquireReadWithGraph(); err != nil {
-		return FoldSummaryPage{}, err
-	}
-	defer e.mu.RUnlock()
-	start := sort.Search(len(e.foldOrder), func(index int) bool {
-		return shoal.CompareID(e.foldOrder[index], after) > 0
-	})
-	ids := e.foldOrder[start:]
-	page := FoldSummaryPage{Folds: make([]FoldSummary, 0, limit)}
-	maxScanned := int(limit) * 8
-	for index, id := range ids {
-		if index >= maxScanned || len(page.Folds) >= int(limit) {
-			page.NextAfter = ids[index-1]
-			break
-		}
-		record := e.folds[id]
-		if !record.Deleted {
-			current, err := e.currentFoldVisibilityLocked(record)
-			if err != nil || !visibilityCovered(record.Visibility, current) {
-				continue
-			}
-		}
-		page.Folds = append(page.Folds, FoldSummary{
-			FoldID:        record.FoldID,
-			FoldedAt:      record.FoldedAt,
-			Visibility:    record.Visibility,
-			SummaryDigest: record.SummaryDigest,
-			MemberCount:   len(record.Members),
-			NodeCount:     len(record.Nodes),
-			EdgeCount:     len(record.Edges),
-			Deleted:       record.Deleted,
-			DeletedAt:     record.DeletedAt,
-		})
-		if index+1 < len(ids) && len(page.Folds) == int(limit) {
-			page.NextAfter = id
-		}
-	}
-	return page, nil
-}
-
 // FoldSubgraph returns one stored fold's node and edges. This is the explicit
 // traversal entry point for a fold; it is never reached implicitly.
 func (e *Explorer) FoldSubgraph(
@@ -930,22 +872,6 @@ func validatePersistedFold(record persistedFold) error {
 	}
 	if _, err := interaction.ParseVisibility(record.Visibility); err != nil {
 		return err
-	}
-	if !equalIDs(record.SourceEdgeIDs, dedupeExplorerIDs(record.SourceEdgeIDs)) {
-		return shoal.NewError(
-			shoal.ErrorInternal,
-			"stored fold source edge IDs are not canonical",
-		)
-	}
-	requiredVisibility, err := interaction.Conjoin(record.RequiredVisibility)
-	if err != nil {
-		return err
-	}
-	if !slices.Equal(record.RequiredVisibility, requiredVisibility) {
-		return shoal.NewError(
-			shoal.ErrorInternal,
-			"stored fold required visibility is not canonical",
-		)
 	}
 	if record.Deleted && record.DeletedAt.IsZero() {
 		return shoal.NewError(

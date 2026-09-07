@@ -162,12 +162,10 @@ func (s *Server) recordObservedInteraction(
 		AuthorizationExpiresAt:   decision.AuthenticationExpires(),
 		AuthorizationOperation:   string(authorizationOperation),
 		EmbeddingSpaceID:         observation.EmbeddingSpaceID,
-		EmbeddingSpaceIDs: append(
-			[]shoal.ID(nil), observation.EmbeddingSpaceIDs...),
-		QueryDigest: interaction.Digest(string(arguments)),
-		RequestID:   decision.RequestID(),
-		ResultID:    resultID,
-		StopReason:  stopReason,
+		QueryDigest:              interaction.Digest(string(arguments)),
+		RequestID:                decision.RequestID(),
+		ResultID:                 resultID,
+		StopReason:               stopReason,
 		SeedNodeIDs: append(
 			[]shoal.ID(nil), observation.RetrievedNodeIDs...),
 		SeedEvidence: cloneEvidenceReferences(

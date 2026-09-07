@@ -133,11 +133,10 @@ func TestBoundedNeighborhoodPagesPastHiddenEdges(t *testing.T) {
 	}
 	base := &pagedBoundedBase{view: view, nodes: canonical.nodes}
 	client, err := NewClient(Config{
-		Base:                base,
-		OntologyInterpreter: base,
-		Resolver:            resolverFunc(func(context.Context) (auth.Decision, error) { return decision, nil }),
-		PolicySelector:      selector,
-		PolicyStore:         store,
+		Base:           base,
+		Resolver:       resolverFunc(func(context.Context) (auth.Decision, error) { return decision, nil }),
+		PolicySelector: selector,
+		PolicyStore:    store,
 		GenerationReader: generationReaderFunc(func(context.Context, []byte) (int64, error) {
 			return 1, nil
 		}),
@@ -665,11 +664,10 @@ func authorizedPaginationClient(t *testing.T, hiddenOnly bool) (*Client, *pagedB
 	}
 	base := &pagedBoundedBase{view: view, nodes: canonical.nodes, hiddenOnly: hiddenOnly}
 	client, err := NewClient(Config{
-		Base:                base,
-		OntologyInterpreter: base,
-		Resolver:            resolverFunc(func(context.Context) (auth.Decision, error) { return decision, nil }),
-		PolicySelector:      selector,
-		PolicyStore:         store,
+		Base:           base,
+		Resolver:       resolverFunc(func(context.Context) (auth.Decision, error) { return decision, nil }),
+		PolicySelector: selector,
+		PolicyStore:    store,
 		GenerationReader: generationReaderFunc(func(context.Context, []byte) (int64, error) {
 			return 1, nil
 		}),

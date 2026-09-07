@@ -46,14 +46,20 @@ type HostConfig struct {
 	// Interaction must be the authorization-enforcing result sink for the
 	// request context, not the underlying corpus sink.
 	Interaction interaction.ResultSink
+	// EventInteraction returns an authorization-enforcing sink bound to the
+	// supplied fleet operation. It must not derive trust from session content.
+	EventInteraction func(auth.Operation) interaction.ResultSink
 	// InteractionStorage is the underlying durable sink. It is checked during
 	// startup without requiring a request-bound authorization decision.
 	InteractionStorage interaction.Sink
-	Snapshots          fleet.InteractionSnapshotProvider
-	Executors          fleet.ExecutorRegistry
-	CursorKeys         CursorKeyStore
-	Visibility         []byte
-	Clock              func() time.Time
+	// InteractionReader is the same-corpus authoritative reader used only to
+	// reconcile durable receipts; it must not require request read permission.
+	InteractionReader fleetevents.InteractionReceiptReader
+	Snapshots         fleet.InteractionSnapshotProvider
+	Executors         fleet.ExecutorRegistry
+	CursorKeys        CursorKeyStore
+	Visibility        []byte
+	Clock             func() time.Time
 }
 
 // HostedServices is the compact production construction and mounting seam.
@@ -74,26 +80,26 @@ func ConfigureHostedRuntime(config *explorercoord.Config) {
 }
 
 // ComposeHosted constructs the registry and event service with one durable
-// interaction recorder and a domain-separated event cursor key.
+// interaction sink and a domain-separated event cursor key.
 func ComposeHosted(ctx context.Context, config HostConfig) (*HostedServices, error) {
 	if ctx == nil {
 		return nil, shoal.NewError(shoal.ErrorInvalidArgument, "context is required")
 	}
-	recorder, err := interaction.NewRecorder(ctx, hostedInteractionSink{
-		storage: config.InteractionStorage,
-		result:  config.Interaction,
-	})
-	if err != nil {
+	if config.InteractionStorage == nil || config.Interaction == nil ||
+		config.EventInteraction == nil {
+		return nil, shoal.NewError(
+			shoal.ErrorInvalidArgument, "interaction sinks are required")
+	}
+	if err := config.InteractionStorage.EnsureInteractionSink(ctx); err != nil {
 		return nil, err
 	}
-	if err := recorder.SetClock(config.Clock); err != nil {
-		return nil, err
+	if config.InteractionReader == nil {
+		return nil, shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			"authoritative interaction receipt reader is required")
 	}
-	lifecycleRecorder, err := explorerfleet.NewLifecycleRecorder(
-		hostedInteractionSink{
-			storage: config.InteractionStorage,
-			result:  config.Interaction,
-		})
+	lifecycleRecorder, err := explorerfleet.NewLifecycleRecorderWithReader(
+		config.Interaction, config.InteractionReader)
 	if err != nil {
 		return nil, err
 	}
@@ -102,26 +108,16 @@ func ComposeHosted(ctx context.Context, config HostConfig) (*HostedServices, err
 		return nil, err
 	}
 	registry, err := explorerfleet.Compose(
-		config.Runtime, config.Resolver, lifecycleRecorder, config.Snapshots,
-		config.Executors,
+		config.Runtime, config.Resolver, lifecycleRecorder,
+		config.Snapshots, config.Executors,
 		config.Visibility, config.Clock)
 	if err != nil {
 		return nil, err
 	}
-	trustedInteractions, ok := config.InteractionStorage.(interaction.ResultSink)
-	if !ok && config.InteractionStorage != nil {
-		return nil, shoal.NewError(
-			shoal.ErrorInvalidArgument,
-			"fleet event interaction storage must implement interaction.ResultSink")
-	}
-	if interaction.IsNilResultSink(trustedInteractions) {
-		return nil, shoal.NewError(
-			shoal.ErrorInvalidArgument,
-			"fleet event interaction storage is required")
-	}
-	events, actionEvents, err := ComposeWithPublisher(
+	events, actionEvents, err := ComposeWithPublisherAndReader(
 		config.Runtime, config.Domain, config.Resolver, config.Generations,
-		recorder, trustedInteractions, registry, cursorKey, config.Clock)
+		config.EventInteraction, config.InteractionReader, config.Snapshots,
+		registry, cursorKey, config.Clock)
 	if err != nil {
 		return nil, err
 	}
@@ -142,40 +138,14 @@ func (s *HostedServices) DispatchDependencies() (
 	return s.registry, s.actionEvents, nil
 }
 
-// Mount adds both products to the authenticated Handler.
+// Mount adds only the more-specific event subtree to the authenticated
+// Handler. Hosted startup must mount the combined registry/dispatch handler
+// separately with webapi.NewFleetHandler at webapi.FleetRoutePrefix.
 func (s *HostedServices) Mount(handler *webapi.Handler) error {
-	if s == nil || handler == nil || s.registry == nil || s.events == nil {
+	if s == nil || handler == nil || s.events == nil {
 		return shoal.NewError(shoal.ErrorInvalidArgument, "hosted fleet services are required")
 	}
-	if err := handler.MountFleetRegistry(s.registry); err != nil {
-		return err
-	}
 	return handler.MountFleetEvents(s.events)
-}
-
-type hostedInteractionSink struct {
-	storage interaction.Sink
-	result  interaction.ResultSink
-}
-
-func (s hostedInteractionSink) EnsureInteractionSink(ctx context.Context) error {
-	if s.storage == nil || s.result == nil {
-		return shoal.NewError(
-			shoal.ErrorInvalidArgument, "interaction sinks are required")
-	}
-	return s.storage.EnsureInteractionSink(ctx)
-}
-
-func (s hostedInteractionSink) RecordInteraction(
-	ctx context.Context, session interaction.Session,
-) error {
-	return s.result.RecordInteraction(ctx, session)
-}
-
-func (s hostedInteractionSink) RecordInteractionResult(
-	ctx context.Context, session interaction.Session,
-) (interaction.Session, error) {
-	return s.result.RecordInteractionResult(ctx, session)
 }
 
 // CursorKeyStore provides a durable, load-or-create corpus key. Implementations

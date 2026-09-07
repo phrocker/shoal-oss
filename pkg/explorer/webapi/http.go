@@ -60,6 +60,10 @@ type Handler struct {
 	browserAuth              *BrowserAuthConfig
 	workspaceSettings        WorkspaceSettingsProvider
 	workspaceSettingsMounted bool
+	chatProvider             AskProvider
+	interactionProvider      InteractionProvider
+	preAuth                  map[string]preAuthenticationValidator
+	authenticatedMounts      map[string]http.Handler
 }
 
 // NewHandler constructs the standard HTTP transport without caller identity.
@@ -90,8 +94,9 @@ func NewHandler(service Service, allowedAuthorities ...string) (*Handler, error)
 	}
 	handler := &Handler{
 		service: service, mux: http.NewServeMux(),
-		authority: authority,
-		preAuth:   make(map[string]preAuthenticationValidator),
+		authority:           authority,
+		preAuth:             make(map[string]preAuthenticationValidator),
+		authenticatedMounts: make(map[string]http.Handler),
 	}
 	handler.routes()
 	return handler, nil
@@ -113,7 +118,8 @@ func (h *Handler) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	if cleanedPath == "" {
 		cleanedPath = "/"
 	}
-	if validator := h.preAuth[path.Clean(cleanedPath)]; validator != nil {
+	cleanedPath = path.Clean(cleanedPath)
+	if validator := h.mountedValidator(cleanedPath); validator != nil {
 		if status := validator.ValidatePreAuthentication(request); status != 0 {
 			http.Error(writer, http.StatusText(status), status)
 			return
@@ -154,6 +160,39 @@ func (h *Handler) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 		}
 	}
 	h.mux.ServeHTTP(writer, request)
+}
+
+func (h *Handler) mountedValidator(
+	requestPath string,
+) preAuthenticationValidator {
+	var selected preAuthenticationValidator
+	longest := 0
+	for prefix, validator := range h.preAuth {
+		cleanedPrefix := strings.TrimSuffix(prefix, "/")
+		matches := requestPath == cleanedPrefix
+		if strings.HasSuffix(prefix, "/") {
+			matches = matches || strings.HasPrefix(requestPath, cleanedPrefix+"/")
+		}
+		if matches &&
+			len(cleanedPrefix) > longest {
+			selected, longest = validator, len(cleanedPrefix)
+		}
+	}
+	return selected
+}
+
+func (h *Handler) mountedHandler(requestPath string) http.Handler {
+	var selected http.Handler
+	longest := 0
+	for prefix, handler := range h.authenticatedMounts {
+		root := strings.TrimSuffix(prefix, "/")
+		if (requestPath == root ||
+			strings.HasSuffix(prefix, "/") && strings.HasPrefix(requestPath, root+"/")) &&
+			len(root) > longest {
+			selected, longest = handler, len(root)
+		}
+	}
+	return selected
 }
 
 func (h *Handler) routes() {

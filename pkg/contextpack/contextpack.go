@@ -2017,7 +2017,10 @@ func validateUniqueIDs(name string, ids []shoal.ID) error {
 
 func cloneResponse(response retrieval.Response) retrieval.Response {
 	cloned := retrieval.Response{
-		RequestID: response.RequestID,
+		RequestID:        response.RequestID,
+		EmbeddingSpaceID: response.EmbeddingSpaceID,
+		EmbeddingSpaceIDs: append(
+			[]shoal.ID(nil), response.EmbeddingSpaceIDs...),
 	}
 	cloned.Results = make([]retrieval.Result, len(response.Results))
 	for i, result := range response.Results {

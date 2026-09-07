@@ -79,7 +79,7 @@ func TestAnalyticsOptionalToolAdvertisesAndInvokesOnlyWithLimits(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	server, err := NewServer(Config{
+	server, err := newRecordedTestServer(t, Config{
 		Service: service, Authority: authority,
 		Decisions: DecisionProviderFunc(func(context.Context) (auth.Decision, error) {
 			return decision, nil

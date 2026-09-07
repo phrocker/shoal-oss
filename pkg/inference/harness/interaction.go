@@ -25,8 +25,6 @@ import (
 	"time"
 
 	"github.com/phrocker/shoal-oss/pkg/interaction"
-	"github.com/phrocker/shoal-oss/pkg/retrieval"
-	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
 // InteractionSink is the durable corpus boundary a graph-backed recorder

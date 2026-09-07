@@ -589,6 +589,12 @@ func (r chatContextReader) Snapshot(ctx context.Context) (explorer.Snapshot, err
 	return r.client.Snapshot(ctx)
 }
 
+func (r chatContextReader) ValidateAuthorization(
+	ctx context.Context, pin inference.AuthPin,
+) error {
+	return r.client.ValidateAuthorization(ctx, pin)
+}
+
 func (r chatContextReader) Document(ctx context.Context, documentID, revisionID shoal.ID) (explorer.DocumentView, error) {
 	return r.client.Document(ctx, documentID, revisionID)
 }
@@ -664,10 +670,8 @@ func (r *chatRetrievalRecorder) Record(
 		AuthorizationFingerprint: r.authorization.Fingerprint(),
 		AuthorizationExpiresAt:   r.authorization.ExpiresAt(),
 		EmbeddingSpaceID:         response.EmbeddingSpaceID,
-		EmbeddingSpaceIDs: append(
-			[]shoal.ID(nil), response.EmbeddingSpaceIDs...),
-		QueryDigest: interaction.Digest(request.Text),
-		RequestID:   response.RequestID,
+		QueryDigest:              interaction.Digest(request.Text),
+		RequestID:                response.RequestID,
 		RequiredVisibility: append(
 			[]string(nil), r.requiredVisibility...),
 		SeedNodeIDs: retrievalSourceIDs(response),

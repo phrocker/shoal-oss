@@ -25,16 +25,20 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/phrocker/shoal-oss/internal/explorercoord"
+	"github.com/phrocker/shoal-oss/pkg/document"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/explorer/coordination"
+	"github.com/phrocker/shoal-oss/pkg/explorer/coordination/guard"
 	"github.com/phrocker/shoal-oss/pkg/explorer/coordination/transaction"
 	"github.com/phrocker/shoal-oss/pkg/explorer/fleetevents"
 	"github.com/phrocker/shoal-oss/pkg/interaction"
+	"github.com/phrocker/shoal-oss/pkg/ontology"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
@@ -93,7 +97,8 @@ func TestAdapterConcurrentAppendRestartResume(t *testing.T) {
 	divergent.Kind = "different"
 	if _, err := adapter.Append(context.Background(), fleetevents.PublishRequest{
 		Token: []byte("token-00"), RetryUntil: retryUntil, Event: divergent,
-	}, appendNow); !errors.Is(err, transaction.ErrConflict) {
+	}, appendNow); !errors.Is(err, transaction.ErrConflict) ||
+		!shoal.IsErrorCode(err, shoal.ErrorConflict) {
 		t.Fatalf("divergent retry error = %v, want conflict", err)
 	}
 	for index := 0; index < count; index++ {
@@ -135,6 +140,137 @@ func TestAdapterConcurrentAppendRestartResume(t *testing.T) {
 	}
 }
 
+func TestAdapterOpaqueIDsRemainByteSafeAcrossRestart(t *testing.T) {
+	ctx := context.Background()
+	config := runtimeConfig(t.TempDir())
+	runtime, err := explorercoord.Open(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	adapter, err := New(runtime, config.Domain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 9, 6, 22, 0, 0, 0, time.UTC)
+	request := fleetevents.CreateRequest{
+		Token: []byte("opaque-create"), SubscriberID: shoal.ID(string([]byte{0xff})),
+		AgentID: shoal.ID(string([]byte{'a', 0xfe})), AgentGeneration: 1,
+		TTL: time.Hour, RetryUntil: now.Add(time.Hour),
+	}
+	fingerprint := auth.Fingerprint{1}
+	created, repeated, err := adapter.Create(ctx, request, fingerprint, 1, now)
+	if err != nil || repeated {
+		t.Fatalf("create = %#v, repeated %v, %v", created, repeated, err)
+	}
+	divergent := request
+	divergent.SubscriberID = shoal.ID(string([]byte{0xfe}))
+	if _, _, err := adapter.Create(
+		ctx, divergent, fingerprint, 1, now,
+	); !errors.Is(err, transaction.ErrConflict) ||
+		!shoal.IsErrorCode(err, shoal.ErrorConflict) {
+		t.Fatalf("byte-distinct create retry error = %v, want conflict", err)
+	}
+
+	event := testEvent(0)
+	event.ProducerID = []byte{0xff, 0x00}
+	event.Evidence[0].ObjectID = shoal.ID(string([]byte{0xff}))
+	event.ConsumedEvidence = []interaction.EvidenceReference{{
+		AnchorID: shoal.ID(string([]byte{0xfc})),
+		Kind:     interaction.EvidenceGraph,
+		NodeIDs: []shoal.ID{
+			shoal.ID(string([]byte{0xfe})),
+			shoal.ID(string([]byte{0xfb})),
+		},
+		EdgeIDs: []shoal.ID{shoal.ID(string([]byte{0xfd}))},
+		Assertions: []interaction.AssertionReference{{
+			AssertionID: shoal.ID(string([]byte{0xfa})),
+			EdgeID:      shoal.ID(string([]byte{0xfd})),
+			Origin:      ontology.AssertionDerived,
+		}},
+	}}
+	event.CitedEvidence = []interaction.EvidenceReference{{
+		AnchorID: shoal.ID(string([]byte{0xf9})),
+		Kind:     interaction.EvidenceDocument,
+		Citation: document.Citation{
+			DocumentID: shoal.ID(string([]byte{0xf8})),
+			RevisionID: shoal.ID(string([]byte{0xf7})),
+			SectionID:  shoal.ID(string([]byte{0xf6})),
+			SpanID:     shoal.ID(string([]byte{0xf5})),
+			Range: document.SourceRange{
+				Start: document.SourcePosition{Offset: 3, Page: 1},
+				End:   document.SourcePosition{Offset: 9, Page: 2},
+			},
+		},
+		NodeIDs: []shoal.ID{
+			shoal.ID(string([]byte{0xf8})),
+			shoal.ID(string([]byte{0xf6})),
+			shoal.ID(string([]byte{0xf5})),
+		},
+	}}
+	reference := event.ConsumedEvidence[0]
+	event.Evidence[0].Reference = &reference
+	audit := fleetevents.LifecycleReceipt{
+		RequestID:                shoal.ID(string([]byte{0xff, 0x00, 'r'})),
+		CorrelationID:            []byte{0xfe, 0x00, 'c'},
+		AuthorizationFingerprint: auth.Fingerprint{9},
+		AuthorizationExpiresAt:   now.Add(time.Hour),
+	}
+	if _, err := adapter.Append(ctx, fleetevents.PublishRequest{
+		Token: []byte("opaque-event"), RetryUntil: now.Add(time.Hour),
+		Event: event, Audit: audit,
+	}, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.Close(); err != nil {
+		t.Fatal(err)
+	}
+	runtime, err = explorercoord.Open(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.Close()
+	adapter, err = New(runtime, config.Domain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reloaded, err := adapter.Subscription(ctx, created.ID)
+	if err != nil || reloaded.SubscriberID != request.SubscriberID ||
+		reloaded.AgentID != request.AgentID {
+		t.Fatalf("reloaded subscription = %#v, %v", reloaded, err)
+	}
+	events, _, err := adapter.Scan(ctx, 1, 0, 1)
+	if err != nil || len(events) != 1 ||
+		!reflect.DeepEqual(events[0], fleetevents.Event{
+			Sequence: 1, EventID: events[0].EventID, Kind: event.Kind,
+			ProducerID: event.ProducerID, ProducerGeneration: event.ProducerGeneration,
+			ActionID: event.ActionID, TransitionID: event.TransitionID,
+			CorrelationID: event.CorrelationID, Reason: event.Reason,
+			Evidence: event.Evidence, ConsumedEvidence: event.ConsumedEvidence,
+			CitedEvidence: event.CitedEvidence,
+			OccurredAt:    event.OccurredAt,
+		}) {
+		t.Fatalf("reloaded event = %#v, %v", events, err)
+	}
+	repeatedEvent, err := adapter.Append(ctx, fleetevents.PublishRequest{
+		Token: []byte("opaque-event"), RetryUntil: now.Add(time.Hour),
+		Event: event, Audit: fleetevents.LifecycleReceipt{
+			RequestID: "fresh-attempt",
+		},
+	}, now)
+	if err != nil || !repeatedEvent.Repeated ||
+		!reflect.DeepEqual(repeatedEvent.Audit, audit) {
+		t.Fatalf("reloaded audit receipt = %#v, %v", repeatedEvent, err)
+	}
+}
+
+func TestDigestLengthFramesOpaqueParts(t *testing.T) {
+	left := digest("opaque", []byte{'a', 0, 'b'}, []byte("c"))
+	right := digest("opaque", []byte("a"), []byte{'b', 0, 'c'})
+	if bytes.Equal(left, right) {
+		t.Fatal("length-distinct opaque identity parts collided")
+	}
+}
+
 func TestAdapterRetentionFloorAndIdempotencyExpirySurviveRestart(t *testing.T) {
 	ctx := context.Background()
 	config := runtimeConfig(t.TempDir())
@@ -148,6 +284,8 @@ func TestAdapterRetentionFloorAndIdempotencyExpirySurviveRestart(t *testing.T) {
 	}
 	start := time.Date(2026, 9, 6, 6, 0, 0, 0, time.UTC)
 	var firstEventID []byte
+	var historicalFrontier coordination.Epoch
+	var historyFloor coordination.Epoch
 	for index := 0; index < 5; index++ {
 		event := testEvent(index)
 		event.OccurredAt = start.Add(time.Duration(index) * time.Minute)
@@ -163,6 +301,17 @@ func TestAdapterRetentionFloorAndIdempotencyExpirySurviveRestart(t *testing.T) {
 		}
 		if index == 0 {
 			firstEventID = append([]byte(nil), result.EventID...)
+		}
+		if index == 2 {
+			page, scanErr := runtime.ScanCommitted(
+				ctx, explorercoord.CommittedScanRequest{
+					Table: Table, RowPrefix: eventPrefix,
+					Family: recordFamily, Qualifier: recordQualifier, Limit: 10,
+				})
+			if scanErr != nil || len(page.Cells) != 3 {
+				t.Fatalf("pre-prune event rows = %d, %v", len(page.Cells), scanErr)
+			}
+			historicalFrontier, historyFloor = page.Frontier, page.HistoryFloor
 		}
 	}
 	if _, _, err := adapter.Scan(ctx, 1, 0, 3); !errors.Is(
@@ -181,6 +330,37 @@ func TestAdapterRetentionFloorAndIdempotencyExpirySurviveRestart(t *testing.T) {
 	})
 	if err != nil || len(page.Cells) != 3 {
 		t.Fatalf("bounded event rows = %d, %v", len(page.Cells), err)
+	}
+	if page.HistoryFloor != historyFloor {
+		t.Fatalf(
+			"prune changed shared history floor from %d to %d",
+			historyFloor, page.HistoryFloor,
+		)
+	}
+	historical, err := runtime.ScanCommitted(ctx, explorercoord.CommittedScanRequest{
+		Table: Table, RowPrefix: eventPrefix, Family: recordFamily,
+		Qualifier: recordQualifier, Frontier: historicalFrontier, Limit: 10,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	historicalEvents, err := decodeSortedEvents(historical.Cells, 1, 10)
+	if err != nil || len(historicalEvents) != 3 ||
+		historicalEvents[0].Sequence != 1 ||
+		historicalEvents[2].Sequence != 3 {
+		t.Fatalf("historical event rows = %#v, %v", historicalEvents, err)
+	}
+	retired, _, err := runtime.ReadEntity(ctx, adapter.eventSlotEntity(1))
+	if err != nil || retired == nil || retired.State != guard.StateTombstone {
+		t.Fatalf("retired event guard = %#v, %v", retired, err)
+	}
+	replacement, _, err := runtime.ReadEntity(ctx, adapter.eventSlotEntity(4))
+	if err != nil || replacement == nil || replacement.State != guard.StateLive {
+		t.Fatalf("replacement event guard = %#v, %v", replacement, err)
+	}
+	if _, _, found, err := adapter.readPublicationEvent(
+		ctx, firstEventID); err != nil || found {
+		t.Fatalf("retired publication index found = %v, %v", found, err)
 	}
 	if err := runtime.Close(); err != nil {
 		t.Fatal(err)
@@ -375,7 +555,7 @@ func TestAdapterSubscriptionGenerationCAS(t *testing.T) {
 		t.Fatalf("loaded subscription = %#v, %v", loaded, err)
 	}
 	deleteRetryUntil := now.Add(30 * time.Minute)
-	deleted, err := adapter.Delete(
+	deleted, _, err := adapter.Delete(
 		context.Background(), subscription.ID, "subscriber", 1,
 		deleteRetryUntil, now.Add(time.Minute))
 	if err != nil {
@@ -384,13 +564,13 @@ func TestAdapterSubscriptionGenerationCAS(t *testing.T) {
 	if deleted.Generation != 2 || deleted.RevokedAt.IsZero() {
 		t.Fatalf("deleted subscription = %#v", deleted)
 	}
-	replayed, err := adapter.Delete(
+	replayed, _, err := adapter.Delete(
 		context.Background(), subscription.ID, "subscriber", 1,
 		deleteRetryUntil, now.Add(2*time.Minute))
 	if err != nil || !replayed.RevokedAt.Equal(deleted.RevokedAt) {
 		t.Fatalf("exact deletion replay = %#v, %v", replayed, err)
 	}
-	if _, err := adapter.Delete(
+	if _, _, err := adapter.Delete(
 		context.Background(), subscription.ID, "subscriber", 2,
 		deleteRetryUntil, now.Add(2*time.Minute),
 	); !errors.Is(err, fleetevents.ErrGenerationConflict) {
@@ -598,7 +778,6 @@ func restartService(
 		AuthorizationDomain: []byte("domain"),
 		AllowedOperations: []auth.Operation{
 			auth.OperationSubscriptionCreate, auth.OperationEventPublish,
-			auth.OperationSubscriptionDeliver,
 		},
 		PermittedSourceIDs: [][]byte{[]byte("source")},
 		PermittedPolicyIDs: [][]byte{[]byte("policy")},
@@ -639,7 +818,6 @@ func durableRetryService(
 		CorrelationID: "correlation", AuthorizationDomain: []byte("domain"),
 		AllowedOperations: []auth.Operation{
 			auth.OperationSubscriptionCreate, auth.OperationSubscriptionDelete,
-			auth.OperationSubscriptionDeliver,
 		},
 		PermittedSourceIDs: [][]byte{[]byte("source")},
 		PermittedPolicyIDs: [][]byte{[]byte("policy")},

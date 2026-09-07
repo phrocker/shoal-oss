@@ -102,6 +102,7 @@ func TestWorkspaceOperationForRequestUsesRouteOperation(t *testing.T) {
 		{http.MethodPost, "/api/v1/fleet/actions/action/cancel", auth.OperationDispatch, true},
 		{http.MethodPost, "/api/v1/fleet/agents/agent/heartbeat", auth.OperationAgentHeartbeat, true},
 		{http.MethodPost, "/api/v1/fleet/events/publish", auth.OperationEventPublish, true},
+		{http.MethodPost, "/api/v1/fleet/events/subscriptions/id/pull", auth.OperationSubscriptionCreate, true},
 		{http.MethodGet, "/api/v1/identity", auth.OperationRead, true},
 		{http.MethodHead, "/api/v1/identity", auth.OperationRead, true},
 		{http.MethodPost, "/mcp", "", false},

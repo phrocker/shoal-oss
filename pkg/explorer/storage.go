@@ -41,7 +41,6 @@ import (
 	"github.com/phrocker/shoal-oss/internal/engine"
 	"github.com/phrocker/shoal-oss/internal/iterrt"
 	"github.com/phrocker/shoal-oss/pkg/document"
-	"github.com/phrocker/shoal-oss/pkg/graph"
 	"github.com/phrocker/shoal-oss/pkg/interaction"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
@@ -538,7 +537,6 @@ func (e *Explorer) loadDocumentRecord(
 		e.documents[record.Document.ID] = make(map[shoal.ID]*persistedDocument)
 	}
 	copy := record
-	e.registerSourceEdgeBirthLocked(copy.Edges, copy.PublishedAt)
 	e.documents[record.Document.ID][record.Revision.ID] = &copy
 	if record.PublicationSequence > e.lastPublicationSequence {
 		e.lastPublicationSequence = record.PublicationSequence
@@ -586,8 +584,6 @@ func (e *Explorer) loadEdgeRecord(
 	}
 	formats[record.Edge.ID] = format
 	e.edges[record.Edge.ID] = record
-	e.registerSourceEdgeBirthLocked(
-		[]graph.Edge{record.Edge}, record.PublishedAt)
 	return nil
 }
 
@@ -635,8 +631,6 @@ func (e *Explorer) loadInteractionRecord(row, qualifier, encoded []byte) error {
 		}
 	}
 	copy := record
-	e.interactionOrder = insertOrderedID(
-		e.interactionOrder, record.SessionID)
 	e.interactions[record.SessionID] = &copy
 	return nil
 }
@@ -684,7 +678,6 @@ func (e *Explorer) loadFoldRecord(row, qualifier, encoded []byte) error {
 		}
 	}
 	copy := record
-	e.foldOrder = insertOrderedID(e.foldOrder, record.FoldID)
 	e.folds[record.FoldID] = &copy
 	return nil
 }

@@ -66,16 +66,6 @@ type InteractionRecord struct {
 	TouchedEdgeIDs []shoal.ID
 }
 
-// InteractionRecord is the bulk/point authorization view of one durable
-// interaction. TouchedNodeIDs is available even for legacy records whose typed
-// Session payload predates hydration support.
-type InteractionRecord struct {
-	Summary        InteractionSummary
-	Session        interaction.Session
-	TouchedNodeIDs []shoal.ID
-	TouchedEdgeIDs []shoal.ID
-}
-
 type InteractionRecordPage struct {
 	Records   []InteractionRecord
 	NextAfter shoal.ID
@@ -178,10 +168,9 @@ func (e *Explorer) EnsureInteractionSink(ctx context.Context) error {
 // interaction.* nodes and edges in this corpus.
 //
 // The record's visibility is the conjunction of every visibility label of
-// every source node and edge retained by the session's retrieved/cited
-// evidence, plus any producer-required output restriction. It is never derived
-// from the asker's grants. If any touched source cannot be resolved, nothing is
-// written.
+// every source node the session touched, retrieved as well as cited. It is
+// never derived from the asker's grants. If any touched node cannot be
+// resolved, nothing is written.
 func (e *Explorer) RecordInteraction(
 	ctx context.Context, session interaction.Session,
 ) error {

@@ -218,22 +218,12 @@ func (s *EmbeddedService) SetOntologyVersion(version ontology.OntologyVersion) e
 func (s *EmbeddedService) ActiveOntology(
 	ctx context.Context,
 ) (ontology.OntologyVersion, bool, error) {
-	catalog, configured, err := s.OntologyCatalog(ctx)
-	if err != nil || !configured {
-		return ontology.OntologyVersion{}, configured, err
-	}
-	return catalog.Active(), true, nil
-}
-
-func (s *EmbeddedService) OntologyCatalog(
-	ctx context.Context,
-) (ontology.PublishedCatalog, bool, error) {
 	if ctx == nil {
-		return ontology.PublishedCatalog{}, false, shoal.NewError(
+		return ontology.OntologyVersion{}, false, shoal.NewError(
 			shoal.ErrorInvalidArgument, "context is required")
 	}
 	if err := ctx.Err(); err != nil {
-		return ontology.PublishedCatalog{}, false, err
+		return ontology.OntologyVersion{}, false, err
 	}
 	s.ontologyMu.RLock()
 	if s.ontologyVersion == nil {

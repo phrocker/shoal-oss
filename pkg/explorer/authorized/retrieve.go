@@ -291,13 +291,12 @@ func (c *Client) retrieve(
 		return retrieval.Response{}, err
 	}
 	var vectorScores map[shoal.ID]shoal.Score
-	var embeddingSpaceIDs []shoal.ID
 	if vectorRequest {
 		nodeScope := make(map[shoal.ID]struct{}, len(projected.Scope.NodeIDs))
 		for _, nodeID := range projected.Scope.NodeIDs {
 			nodeScope[nodeID] = struct{}{}
 		}
-		vectorScores, embeddingSpaceIDs, err = c.authorizedVectorScores(
+		vectorScores, err = c.authorizedVectorScores(
 			observedCtx, projected, corpus, nodeScope)
 		if err != nil {
 			return retrieval.Response{}, err
@@ -320,8 +319,7 @@ func (c *Client) retrieve(
 		return retrieval.Response{}, inconsistentRetrieval()
 	}
 	if err := c.validateRetrievedResponseWithVectorScores(
-		ctx, response, projected, corpus, decision, now,
-		vectorScores, embeddingSpaceIDs,
+		ctx, response, projected, corpus, decision, now, vectorScores,
 	); err != nil {
 		return retrieval.Response{}, err
 	}

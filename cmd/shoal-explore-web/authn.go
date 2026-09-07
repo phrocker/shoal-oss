@@ -72,6 +72,17 @@ var workspaceOperations = []auth.Operation{
 	auth.OperationAnalyticsRead,
 	auth.OperationWorkspaceSettingsRead,
 	auth.OperationWorkspaceSettingsWrite,
+	auth.OperationAgentRegister,
+	auth.OperationAgentHeartbeat,
+	auth.OperationAgentRevoke,
+	auth.OperationAgentResolve,
+	auth.OperationDelegate,
+	auth.OperationDispatch,
+	auth.OperationInvoke,
+	auth.OperationSubscriptionCreate,
+	auth.OperationSubscriptionDelete,
+	auth.OperationSubscriptionDeliver,
+	auth.OperationEventPublish,
 }
 
 // developmentAuthenticator mints one short-lived decision per request for a

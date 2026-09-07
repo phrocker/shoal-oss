@@ -34,13 +34,18 @@ import (
 	"time"
 
 	"github.com/phrocker/shoal-oss/internal/explorercoord"
+	"github.com/phrocker/shoal-oss/internal/explorerfleet"
+	"github.com/phrocker/shoal-oss/internal/explorerfleetevents"
 	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/explorer/authorized"
 	"github.com/phrocker/shoal-oss/pkg/explorer/coordination"
 	"github.com/phrocker/shoal-oss/pkg/explorer/coordination/transaction"
+	"github.com/phrocker/shoal-oss/pkg/explorer/fleet"
+	"github.com/phrocker/shoal-oss/pkg/explorer/mcp"
 	"github.com/phrocker/shoal-oss/pkg/explorer/webapi"
 	"github.com/phrocker/shoal-oss/pkg/explorer/workspace"
+	"github.com/phrocker/shoal-oss/pkg/interaction"
 	"github.com/phrocker/shoal-oss/pkg/model"
 	"github.com/phrocker/shoal-oss/pkg/ontology"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
@@ -66,18 +71,17 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 	backend := flags.String("backend", "embedded", "Explorer backend: embedded or remote")
 	stateDir := flags.String(
 		"state-dir", "",
-		"Recommended workspace state root. The corpus and durable policy "+
-			"catalog are created as corpus/ and policy/ inside it; workspace "+
-			"settings are stored in corpus/, so mounting "+
+		"Recommended workspace state root. The corpus (including workspace "+
+			"settings) and durable policy catalog are created as corpus/ and policy/ "+
+			"inside it, so mounting "+
 			"this one directory as a volume persists everything a restart "+
 			"needs. Overrides -data when set",
 	)
 	data := flags.String(
 		"data", ".shoal/explorer",
 		"Legacy Explorer corpus directory (used when -state-dir is unset). The "+
-			"durable policy catalog is placed in a sibling directory; workspace "+
-			"settings are stored in the corpus, and both directories must be "+
-			"persisted for the workspace to survive a restart",
+			"workspace settings share this corpus engine; the durable policy catalog "+
+			"is placed in a sibling directory and both must be persisted across restart",
 	)
 	policyDirFlag := flags.String(
 		"policy-dir", "",
@@ -491,8 +495,117 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 		listener.Close()
 		return err
 	}
+	var chat webapi.AskProvider
+	var provenance webapi.InteractionProvider
 	if opened.settings != nil {
 		if err := handler.SetWorkspaceSettingsProvider(opened.settings); err != nil {
+			listener.Close()
+			return err
+		}
+		if opened.client != nil {
+			chat, provenance, err = newChatProviders(
+				ctx, opened.client, authority.Resolver(), chatModelConfig{
+					provider: *chatProvider, model: *chatModel, baseURL: *chatBaseURL,
+					apiKeyEnv: *chatAPIKeyEnv, organization: *chatOrganization,
+					project: *chatProject, retrievalModes: chatRetrievalModes(embedding),
+				})
+			if err != nil {
+				listener.Close()
+				return err
+			}
+			if err := handler.SetChatProvider(chat); err != nil {
+				listener.Close()
+				return err
+			}
+			if err := handler.SetInteractionProvider(provenance); err != nil {
+				listener.Close()
+				return err
+			}
+		}
+	}
+	var mcpTools []mcp.OptionalToolProvider
+	if chat != nil {
+		askTool, err := mcp.NewAskTool(chat)
+		if err != nil {
+			listener.Close()
+			return err
+		}
+		mcpTools = append(mcpTools, askTool)
+	}
+	if provenance != nil {
+		provenanceTools, err := mcp.NewInteractionTools(provenance)
+		if err != nil {
+			listener.Close()
+			return err
+		}
+		mcpTools = append(mcpTools, provenanceTools...)
+	}
+	if opened.fleetDispatch != nil {
+		fleetTools, err := mcp.NewFleetDispatchTools(
+			opened.fleetDispatch, authority.Resolver())
+		if err != nil {
+			listener.Close()
+			return err
+		}
+		mcpTools = append(mcpTools, fleetTools...)
+	}
+	mcpServer, err := mcp.NewServer(mcp.Config{
+		Service:           service,
+		Authority:         authority,
+		Decisions:         mcp.DecisionProviderFunc(authority.Resolver().Resolve),
+		InteractionSink:   opened.client,
+		Snapshots:         opened.client,
+		WorkspaceSettings: opened.settings,
+		OptionalTools:     mcpTools,
+		ServerInfo: mcp.Implementation{
+			Name:        "shoal-explore-web",
+			Title:       "Shoal Explorer MCP",
+			Version:     "1",
+			Description: "Authenticated Shoal Explorer over Streamable HTTP",
+		},
+		Instructions: "Every HTTP request is independently authenticated. " +
+			"Session IDs retain protocol state only and never carry authority.",
+	})
+	if err != nil {
+		listener.Close()
+		return err
+	}
+	mcpHTTP, err := mcp.NewHTTPHandler(mcp.HTTPConfig{
+		Server:                   mcpServer,
+		AllowedOrigins:           mcp.OriginsForAuthorities(allowedAuthorities),
+		RequireWorkspaceSettings: opened.settings != nil,
+	})
+	if err != nil {
+		listener.Close()
+		return err
+	}
+	if err := handler.MountAuthenticated("/mcp", mcpHTTP); err != nil {
+		listener.Close()
+		return err
+	}
+	if opened.fleetRegistry != nil || opened.fleetDispatch != nil ||
+		opened.fleetEvents != nil {
+		if opened.fleetRegistry == nil || opened.fleetDispatch == nil ||
+			opened.fleetEvents == nil {
+			listener.Close()
+			return shoal.NewError(
+				shoal.ErrorUnavailable,
+				"fleet HTTP dependencies are incomplete",
+			)
+		}
+		fleetHandler, err := webapi.NewFleetHandler(
+			opened.fleetRegistry, opened.fleetDispatch)
+		if err != nil {
+			listener.Close()
+			return err
+		}
+		if err := handler.MountAuthenticated(
+			webapi.FleetRoutePrefix, fleetHandler,
+		); err != nil {
+			listener.Close()
+			return err
+		}
+		if err := handler.MountFleetEvents(opened.fleetEvents); err != nil {
 			listener.Close()
 			return err
 		}
@@ -681,10 +794,14 @@ type serviceConfig struct {
 // startup backfill registered, so the operator can be told exactly what the
 // development principal was granted.
 type openedService struct {
-	service    webapi.Service
-	settings   webapi.WorkspaceSettingsProvider
-	backfilled int
-	close      func()
+	service       webapi.Service
+	settings      webapi.WorkspaceSettingsProvider
+	fleetRegistry webapi.FleetRegistryProvider
+	fleetDispatch webapi.FleetDispatchProvider
+	fleetEvents   webapi.FleetEventService
+	client        *authorized.Client
+	backfilled    int
+	close         func()
 }
 
 var (
@@ -699,7 +816,7 @@ func openService(
 	closed := openedService{close: func() {}}
 	switch config.backend {
 	case "embedded":
-		embedded, err := explorercoord.OpenExplorer(explorercoord.Config{
+		runtimeConfig := explorercoord.Config{
 			Directory: config.data,
 			Domain:    workspacePublicationDomain,
 			Owner:     workspaceRuntimeOwner,
@@ -712,7 +829,10 @@ func openService(
 				HistoryFloor:        1,
 			},
 			Clock: config.clock,
-		}, explorer.Options{Embedder: config.embedder})
+		}
+		explorerfleetevents.ConfigureHostedRuntime(&runtimeConfig)
+		embedded, err := explorercoord.OpenExplorer(
+			runtimeConfig, explorer.Options{Embedder: config.embedder})
 		if err != nil {
 			return closed, err
 		}
@@ -746,13 +866,105 @@ func openService(
 				return closed, err
 			}
 		}
-		generationReader := fixedGenerationReader{
-			domain:     workspaceAuthorizationDomain,
-			generation: workspacePolicyGeneration,
+		generationReader := config.generationReader
+		if isNilFleetDependency(generationReader) {
+			generationReader = fixedGenerationReader{
+				domain:     workspaceAuthorizationDomain,
+				generation: workspacePolicyGeneration,
+			}
 		}
 		client, err := authorizedClient(
 			corpus, store, config.resolver, generationReader,
 			config.clock, config.mosaic)
+		if err != nil {
+			store.Close()
+			embedded.Close()
+			return closed, err
+		}
+		if err := corpus.EnsureInteractionSink(ctx); err != nil {
+			store.Close()
+			embedded.Close()
+			return closed, err
+		}
+		interactionRecorder, err := interaction.NewRecorder(
+			ctx, fleetInteractionSink{durable: corpus, authorized: client})
+		if err != nil {
+			store.Close()
+			embedded.Close()
+			return closed, err
+		}
+		if err := interactionRecorder.SetClock(config.clock); err != nil {
+			store.Close()
+			embedded.Close()
+			return closed, err
+		}
+		fleetLifecycleRecorder, err := explorerfleet.NewLifecycleRecorder(
+			fleetInteractionSink{durable: corpus, authorized: client})
+		if err != nil {
+			store.Close()
+			embedded.Close()
+			return closed, err
+		}
+		executors := config.executors
+		if executors == nil {
+			executors = configuredFleetExecutors{}
+		}
+		snapshots, err := explorerfleet.NewInteractionSnapshotProvider(corpus)
+		if err != nil {
+			store.Close()
+			embedded.Close()
+			return closed, err
+		}
+		fleetRegistry, err := explorerfleet.Compose(
+			embedded.Runtime, config.resolver, fleetLifecycleRecorder, snapshots,
+			executors, nil, config.clock)
+		if err != nil {
+			store.Close()
+			embedded.Close()
+			return closed, err
+		}
+		cursorKey, err := explorerfleetevents.LoadOrCreateCursorKey(ctx, corpus)
+		if err != nil {
+			store.Close()
+			embedded.Close()
+			return closed, err
+		}
+		fleetEvents, actionEvents, err :=
+			explorerfleetevents.ComposeWithPublisher(
+				embedded.Runtime, workspacePublicationDomain, config.resolver,
+				generationReader, interactionRecorder, snapshots, fleetRegistry,
+				cursorKey, config.clock,
+			)
+		if err != nil {
+			store.Close()
+			embedded.Close()
+			return closed, err
+		}
+		actionRecorder, err := explorerfleet.NewActionRecorder(
+			interactionRecorder)
+		if err != nil {
+			store.Close()
+			embedded.Close()
+			return closed, err
+		}
+		fleetDispatch, err := explorerfleet.ComposeDispatch(
+			embedded.Runtime, fleetRegistry, config.resolver, actionRecorder,
+			actionEvents, nil, config.clock,
+		)
+		if err != nil {
+			store.Close()
+			embedded.Close()
+			return closed, err
+		}
+		boundFleetDispatch, err := newBoundFleetDispatch(
+			fleetDispatch, config.resolver)
+		if err != nil {
+			store.Close()
+			embedded.Close()
+			return closed, err
+		}
+		boundFleetRegistry, err := newBoundFleetRegistry(
+			fleetRegistry, config.resolver)
 		if err != nil {
 			store.Close()
 			embedded.Close()
@@ -815,9 +1027,13 @@ func openService(
 			return closed, err
 		}
 		return openedService{
-			service:    service,
-			settings:   settingsProvider,
-			backfilled: backfilled,
+			service:       service,
+			settings:      settingsProvider,
+			fleetRegistry: boundFleetRegistry,
+			fleetDispatch: boundFleetDispatch,
+			fleetEvents:   fleetEvents,
+			client:        client,
+			backfilled:    backfilled,
 			close: func() {
 				settingsStore.Close()
 				store.Close()
@@ -985,18 +1201,19 @@ func authorizedClient(
 	}
 	scorer, _ := any(corpus).(authorized.VectorScorer)
 	return authorized.NewClient(authorized.Config{
-		Base:                  corpus,
-		VectorScorer:          scorer,
-		OntologyInterpreter:   corpus,
-		OntologyProposalStore: corpus,
-		InteractionWriter:     corpus,
-		InteractionReader:     corpus,
-		SnapshotValidator:     corpus,
-		Resolver:              resolver,
-		PolicySelector:        selector,
-		PolicyStore:           store,
-		GenerationReader:      generationReader,
-		Clock:                 clock,
-		Mosaic:                mosaic,
+		Base:                   corpus,
+		VectorScorer:           scorer,
+		InteractionWriter:      corpus,
+		InteractionReader:      corpus,
+		OntologyInterpreter:    corpus,
+		OntologyProposalStore:  corpus,
+		SnapshotValidator:      corpus,
+		DerivedAssertionReader: corpus,
+		Resolver:               resolver,
+		PolicySelector:         selector,
+		PolicyStore:            store,
+		GenerationReader:       generationReader,
+		Clock:                  clock,
+		Mosaic:                 mosaic,
 	})
 }

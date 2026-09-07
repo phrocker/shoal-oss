@@ -765,7 +765,7 @@ func (s *Server) callTool(ctx context.Context, request Request) *Response {
 		}
 	}
 	recordErr := s.recordToolOutcome(
-		bound, decision, outcomeSnapshot, tool.authorizationOperation,
+		context.WithoutCancel(bound), decision, outcomeSnapshot, tool.authorizationOperation,
 		params.Name, arguments, observation,
 		err != nil, toolStopReason(err), mutating,
 	)
@@ -899,6 +899,19 @@ func (s *Server) authorizedContext(
 		ServiceCeilingIdentity: template.ServiceCeilingIdentity(),
 		SelectedOntology:       selectedOntology,
 	})
+	if err != nil {
+		return nil, auth.Decision{}, shoal.NewError(
+			shoal.ErrorUnauthorized, "authorization denied")
+	}
+	bound, err := s.binder.Bind(ctx, decision)
+	if err != nil || bound == nil {
+		if contextErr := ctx.Err(); contextErr != nil {
+			return nil, auth.Decision{}, contextErr
+		}
+		return nil, auth.Decision{}, shoal.NewError(
+			shoal.ErrorUnauthorized, "authorization denied")
+	}
+	return bound, decision, nil
 }
 
 func randomRequestID() (shoal.ID, error) {

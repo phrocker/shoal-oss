@@ -86,9 +86,19 @@ func (e CitationEnvelope) InteractionEvidence() (
 	if err != nil {
 		return nil, nil, err
 	}
-	retrieved = session.RetrievedEvidence()
+	retrieved = sessionRetrievedEvidence(session)
 	cited = append([]interaction.EvidenceReference(nil), session.CitedEvidence...)
 	return retrieved, cited, nil
+}
+
+func sessionRetrievedEvidence(session interaction.Session) []interaction.EvidenceReference {
+	values := append([]interaction.EvidenceReference(nil), session.SeedEvidence...)
+	for _, turn := range session.Turns {
+		if turn.ToolCall != nil {
+			values = append(values, turn.ToolCall.RetrievedEvidence...)
+		}
+	}
+	return values
 }
 
 func projectCitationEvidence(e CitationEnvelope) CitationEvidenceProjection {
@@ -100,6 +110,7 @@ func projectCitationEvidence(e CitationEnvelope) CitationEvidenceProjection {
 		EmbeddingSpaceIDs:   canonicalProjectionIDs(e.EmbeddingSpaceIDs),
 		Anchors:             make([]CitationEvidenceAnchor, 0, len(e.Evidence)),
 	}
+
 	var edgeIDs []shoal.ID
 	var assertionIDs []shoal.ID
 	for _, evidence := range e.Evidence {

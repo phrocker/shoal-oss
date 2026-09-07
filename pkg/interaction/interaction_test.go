@@ -29,47 +29,8 @@ import (
 
 	"github.com/phrocker/shoal-oss/pkg/graph"
 	"github.com/phrocker/shoal-oss/pkg/interaction"
-	"github.com/phrocker/shoal-oss/pkg/retrieval"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
-
-func TestSessionPreservesCanonicalEmbeddingConstituents(t *testing.T) {
-	first, err := retrieval.EmbeddingSpaceIdentityID("first-space")
-	if err != nil {
-		t.Fatal(err)
-	}
-	second, err := retrieval.EmbeddingSpaceIdentityID("second-space")
-	if err != nil {
-		t.Fatal(err)
-	}
-	constituents := []shoal.ID{first, second}
-	if shoal.CompareID(constituents[0], constituents[1]) > 0 {
-		constituents[0], constituents[1] = constituents[1], constituents[0]
-	}
-	aggregate, err := retrieval.EmbeddingSpaceSetID(constituents...)
-	if err != nil {
-		t.Fatal(err)
-	}
-	recordedAt := time.Date(2026, 9, 6, 12, 0, 0, 0, time.UTC)
-	session := interaction.Session{
-		ID: "session", RecordedAt: recordedAt,
-		Operation:        interaction.OperationRetrieval,
-		EmbeddingSpaceID: aggregate, EmbeddingSpaceIDs: constituents,
-	}
-	canonical, err := session.Canonical()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(canonical.EmbeddingSpaceIDs) != 2 ||
-		canonical.EmbeddingSpaceIDs[0] != constituents[0] ||
-		canonical.EmbeddingSpaceIDs[1] != constituents[1] {
-		t.Fatalf("embedding constituents = %v", canonical.EmbeddingSpaceIDs)
-	}
-	canonical.EmbeddingSpaceIDs[0] = "mutated"
-	if session.EmbeddingSpaceIDs[0] == "mutated" {
-		t.Fatal("canonical session aliases embedding constituents")
-	}
-}
 
 func TestConjoinIsSortedUniqueUnion(t *testing.T) {
 	labels, err := interaction.Conjoin(

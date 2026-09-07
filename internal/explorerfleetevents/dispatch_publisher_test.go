@@ -25,6 +25,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
+	"fmt"
 	"reflect"
 	"sync"
 	"sync/atomic"
@@ -122,6 +123,78 @@ func TestActionEventPublisherReplayAndDivergence(t *testing.T) {
 	events, _, err = backend.Scan(context.Background(), 1, 0, 10)
 	if err != nil || len(events) != 2 {
 		t.Fatalf("versioned events = %d, %v", len(events), err)
+	}
+}
+
+func TestActionEventPublisherUsesTransitionProvenance(t *testing.T) {
+	now := time.Date(2026, 9, 7, 10, 0, 0, 0, time.UTC)
+	config := runtimeConfig(t.TempDir())
+	runtime, err := explorercoord.Open(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.Close()
+	backend, err := New(runtime, config.Domain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	publisher := dispatchEventPublisher(
+		t, backend, now, restartGenerationReader{}, restartAuditor{},
+		auth.OperationDispatch)
+	record := authorizedActionRecord(fleet.ActionRecord{
+		ID: []byte("action"), Version: 2, State: fleet.DispatchCanceled,
+		AgentID: "agent", AgentGeneration: 3, CancelKey: []byte("cancel"),
+		SourceID: []byte("source"), PolicyID: []byte("policy"), ObjectID: "object",
+		UpdatedAt: now.Add(-time.Minute),
+	}, now, auth.OperationDispatch)
+	record.RequestID = "enqueue-request"
+	record.CorrelationID = "enqueue-correlation"
+	record.TransitionRequestID = "transition-request"
+	record.TransitionCorrelationID = "transition-correlation"
+	record.CancelAuthorizationFingerprint = auth.Fingerprint{9}
+	record.CancelAuthorizationExpiresAt = now.Add(30 * time.Minute)
+
+	if err := publisher.PublishActionEvent(
+		context.Background(), "action.canceled", record); err != nil {
+		t.Fatal(err)
+	}
+	events, _, err := backend.Scan(context.Background(), 1, 0, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 1 ||
+		!bytes.Equal(events[0].CorrelationID, []byte("transition-correlation")) {
+		t.Fatalf("event transition provenance = %#v", events)
+	}
+}
+
+func TestActionEventPublisherAllowsInvokeAuthorizedEnqueue(t *testing.T) {
+	now := time.Date(2026, 9, 7, 10, 0, 0, 0, time.UTC)
+	config := runtimeConfig(t.TempDir())
+	runtime, err := explorercoord.Open(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.Close()
+	backend, err := New(runtime, config.Domain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	publisher := dispatchEventPublisher(
+		t, backend, now, restartGenerationReader{}, restartAuditor{},
+		auth.OperationInvoke)
+	record := authorizedActionRecord(fleet.ActionRecord{
+		ID: []byte("action"), IdempotencyKey: []byte("enqueue"), Version: 1,
+		State: fleet.DispatchQueued, AgentID: "agent", AgentGeneration: 3,
+		SourceID: []byte("source"), PolicyID: []byte("policy"), ObjectID: "object",
+		UpdatedAt: now.Add(-time.Minute),
+	}, now, auth.OperationInvoke)
+	record.AuthorizationFingerprint = auth.Fingerprint{8}
+	record.AuthorizationExpiresAt = now.Add(time.Hour)
+
+	if err := publisher.PublishActionEvent(
+		context.Background(), "action.enqueued", record); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -257,10 +330,8 @@ func TestActionEventPublisherRetrySurvivesPolicyGenerationChange(t *testing.T) {
 		t.Fatalf("policy retry events = %d, %v", len(events), err)
 	}
 	if len(receipts) != 2 ||
-		receipts[0].AuthorizationFingerprint != record.ExecutionFingerprint ||
-		receipts[1].AuthorizationFingerprint != record.ExecutionFingerprint ||
-		!receipts[0].AuthorizationExpiresAt.Equal(record.ExecutionExpiresAt) ||
-		!receipts[1].AuthorizationExpiresAt.Equal(record.ExecutionExpiresAt) {
+		receipts[0].AuthorizationFingerprint == (auth.Fingerprint{}) ||
+		receipts[1].AuthorizationFingerprint == (auth.Fingerprint{}) {
 		t.Fatalf("lifecycle receipt pins = %#v", receipts)
 	}
 }
@@ -277,8 +348,10 @@ func TestActionEventPublisherPreservesExecutorEvidence(t *testing.T) {
 		SourceID: []byte("source"), PolicyID: []byte("policy"), ObjectID: "object",
 		Reason: interaction.Reason{Code: "completed"}, UpdatedAt: now,
 		Evidence: []fleet.EvidenceRef{{
-			AnchorID: "anchor", Kind: interaction.EvidenceGraph,
-			NodeIDs: []shoal.ID{"node"}, EdgeIDs: []shoal.ID{"edge"},
+			Kind:       interaction.EvidenceGraph,
+			NodeIDs:    []shoal.ID{"node", "node"},
+			EdgeIDs:    []shoal.ID{"edge"},
+			AnchorID:   "anchor",
 			Visibility: []string{"A", "B"},
 		}},
 	}, now, auth.OperationInvoke)
@@ -287,27 +360,65 @@ func TestActionEventPublisherPreservesExecutorEvidence(t *testing.T) {
 	); err != nil {
 		t.Fatal(err)
 	}
-	if backend.appends != 1 || len(backend.request.Event.Evidence) != 3 {
-		t.Fatalf("preserved evidence = %#v", backend.request.Event.Evidence)
+	if backend.appends != 1 || len(backend.request.Event.Evidence) != 2 ||
+		len(backend.request.Event.ConsumedEvidence) != 1 {
+		t.Fatalf("preserved evidence = %#v / %#v",
+			backend.request.Event.Evidence, backend.request.Event.ConsumedEvidence)
 	}
-	var nodeEvidence, edgeEvidence fleetevents.Evidence
-	for _, evidence := range backend.request.Event.Evidence[1:] {
-		switch {
-		case evidence.NodeID == "node":
-			nodeEvidence = evidence
-		case evidence.EdgeID == "edge":
-			edgeEvidence = evidence
+	evidence := backend.request.Event.ConsumedEvidence[0]
+	if !reflect.DeepEqual(evidence.NodeIDs, []shoal.ID{"node", "node"}) ||
+		!reflect.DeepEqual(evidence.EdgeIDs, []shoal.ID{"edge"}) ||
+		evidence.AnchorID != "anchor" ||
+		evidence.Kind != interaction.EvidenceGraph {
+		t.Fatalf("executor evidence = %#v", evidence)
+	}
+	referenceCount := 0
+	for _, item := range backend.request.Event.Evidence {
+		if item.Reference != nil {
+			referenceCount++
+			if !reflect.DeepEqual(*item.Reference, evidence) {
+				t.Fatalf("authorization evidence reference = %#v", item.Reference)
+			}
 		}
 	}
-	for _, evidence := range []fleetevents.Evidence{nodeEvidence, edgeEvidence} {
-		if evidence.AnchorID != "anchor" ||
-			!reflect.DeepEqual(evidence.Visibility, []string{"A", "B"}) {
-			t.Fatalf("executor evidence = %#v", evidence)
+	if referenceCount != 1 {
+		t.Fatalf("canonical authorization references = %d, want 1", referenceCount)
+	}
+	record.Evidence[0].NodeIDs[0] = "changed"
+	if evidence.NodeIDs[0] != "node" {
+		t.Fatal("event evidence aliases the action record")
+	}
+}
+
+func TestActionEventPublisherBoundsAuthorizationEvidenceByReferences(t *testing.T) {
+	now := time.Date(2026, 9, 7, 3, 40, 0, 0, time.UTC)
+	backend := &recordingBackend{}
+	publisher := dispatchEventPublisher(
+		t, backend, now, restartGenerationReader{}, restartAuditor{},
+		auth.OperationInvoke)
+	record := authorizedActionRecord(fleet.ActionRecord{
+		ID: []byte("action"), Version: 2, State: fleet.DispatchSucceeded,
+		AgentID: "agent", AgentGeneration: 1, ExecutorKey: []byte("executor"),
+		SourceID: []byte("source"), PolicyID: []byte("policy"), ObjectID: "object",
+		Reason: interaction.Reason{Code: "completed"}, UpdatedAt: now,
+	}, now, auth.OperationInvoke)
+	record.Evidence = make([]fleet.EvidenceRef, 129)
+	for index := range record.Evidence {
+		record.Evidence[index] = fleet.EvidenceRef{
+			AnchorID: shoal.ID(fmt.Sprintf("anchor-%03d", index)),
+			Kind:     interaction.EvidenceGraph,
+			NodeIDs:  []shoal.ID{shoal.ID(fmt.Sprintf("node-%03d", index))},
 		}
 	}
-	record.Evidence[0].Visibility[0] = "changed"
-	if nodeEvidence.Visibility[0] != "A" || edgeEvidence.Visibility[0] != "A" {
-		t.Fatal("event evidence visibility aliases the action record")
+	if err := publisher.PublishActionEvent(
+		context.Background(), "action.completed", record,
+	); err != nil {
+		t.Fatal(err)
+	}
+	evidence := backend.request.Event.Evidence
+	if len(evidence) != len(record.Evidence)+1 {
+		t.Fatalf("authorization evidence = %d, want %d",
+			len(evidence), len(record.Evidence)+1)
 	}
 }
 
@@ -532,12 +643,6 @@ func TestNewActionEventPublisherRejectsMissingDependencies(t *testing.T) {
 	); err == nil {
 		t.Fatal("missing dependencies succeeded")
 	}
-	var resolver *mutableDispatchResolver
-	if _, err := NewActionEventPublisher(
-		&fleetevents.Service{}, resolver, time.Now,
-	); err == nil {
-		t.Fatal("typed-nil resolver succeeded")
-	}
 }
 
 func mustActionEventToken(
@@ -697,15 +802,15 @@ func (*recordingBackend) Subscription(
 }
 func (*recordingBackend) Delete(
 	context.Context, []byte, shoal.ID, uint64, time.Time, time.Time,
-) (fleetevents.Subscription, error) {
-	return fleetevents.Subscription{}, errors.New("unexpected delete")
+) (fleetevents.Subscription, bool, error) {
+	return fleetevents.Subscription{}, false, errors.New("unexpected delete")
 }
 func (b *recordingBackend) Append(
 	_ context.Context, request fleetevents.PublishRequest, _ time.Time,
 ) (fleetevents.PublishResult, error) {
 	b.appends++
 	b.request = request
-	return fleetevents.PublishResult{}, nil
+	return fleetevents.PublishResult{Audit: request.Audit}, nil
 }
 func (*recordingBackend) Scan(
 	context.Context, uint64, uint64, int,

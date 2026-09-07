@@ -46,11 +46,16 @@ func (h *Handler) MountAuthenticated(
 		return shoal.NewError(
 			shoal.ErrorInvalidArgument, "mounted handler is required")
 	}
+	root := strings.TrimSuffix(pattern, "/")
 	if !validAuthenticatedMountPattern(pattern) ||
-		pattern == "/api/v1/auth-config" ||
-		pattern == "/assets" || strings.HasPrefix(pattern, "/assets/") {
+		conflictsWithWorkspaceRoute(root) {
 		return shoal.NewError(
 			shoal.ErrorInvalidArgument, "authenticated mount pattern is invalid")
+	}
+	for mounted := range h.authenticatedMounts {
+		if strings.TrimSuffix(mounted, "/") == root {
+			return authenticatedMountConflict()
+		}
 	}
 	for _, method := range []string{
 		http.MethodGet, http.MethodHead, http.MethodPost, http.MethodDelete,
@@ -67,10 +72,29 @@ func (h *Handler) MountAuthenticated(
 	h.mux.Handle("POST "+pattern, handler)
 	h.mux.Handle("GET "+pattern, handler)
 	h.mux.Handle("DELETE "+pattern, handler)
+	h.authenticatedMounts[pattern] = handler
 	if validator, ok := handler.(preAuthenticationValidator); ok {
 		h.preAuth[pattern] = validator
 	}
 	return nil
+}
+
+func conflictsWithWorkspaceRoute(mount string) bool {
+	protected := []string{
+		"/api/v1/meta", "/api/v1/identity", "/api/v1/ontology",
+		"/api/v1/auth-config", "/api/v1/ingest", "/api/v1/extract",
+		"/api/v1/derivation/recompute", "/api/v1/changes",
+		"/api/v1/documents", "/api/v1/document", "/api/v1/retrieve",
+		"/api/v1/neighborhood", "/api/v1/path", "/api/v1/analytics",
+		"/api/v1/workspaces", "/assets",
+	}
+	for _, route := range protected {
+		if mount == route || strings.HasPrefix(route, mount+"/") ||
+			strings.HasPrefix(mount, route+"/") {
+			return true
+		}
+	}
+	return false
 }
 
 func exactMuxPatternRegistered(

@@ -425,6 +425,36 @@ func (c *Client) InteractionRecords(
 	return visible, nil
 }
 
+func (c *Client) InteractionRecordsPage(
+	ctx context.Context, after shoal.ID, limit uint32,
+) (explorer.InteractionRecordPage, error) {
+	if err := shoal.ValidateOptionalID("interaction page cursor", after); err != nil {
+		return explorer.InteractionRecordPage{}, err
+	}
+	if limit == 0 || limit > explorer.MaxInteractionRecordPageSize {
+		return explorer.InteractionRecordPage{}, shoal.NewError(
+			shoal.ErrorInvalidArgument, "interaction page limit is outside its bound")
+	}
+	records, err := c.InteractionRecords(ctx)
+	if err != nil {
+		return explorer.InteractionRecordPage{}, err
+	}
+	page := explorer.InteractionRecordPage{
+		Records: make([]explorer.InteractionRecord, 0, limit),
+	}
+	for _, record := range records {
+		if shoal.CompareID(record.Summary.SessionID, after) <= 0 {
+			continue
+		}
+		if len(page.Records) == int(limit) {
+			page.NextAfter = page.Records[len(page.Records)-1].Summary.SessionID
+			break
+		}
+		page.Records = append(page.Records, record)
+	}
+	return page, nil
+}
+
 // maxInteractionAuthorizationIDs bounds how many provenance identifiers one
 // policy-store lookup may carry while authorizing a list of interaction
 // records. Interaction provenance is intentionally uncapped per record, so

@@ -23,11 +23,13 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"errors"
-	"reflect"
+	"hash"
 	"time"
 
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
+	"github.com/phrocker/shoal-oss/pkg/interaction"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
@@ -57,11 +59,8 @@ type Service struct {
 }
 
 func New(config Config) (*Service, error) {
-	if isNilEventDependency(config.Backend) ||
-		isNilEventDependency(config.Resolver) ||
-		isNilEventDependency(config.GenerationReader) ||
-		isNilEventDependency(config.LeaseValidator) ||
-		isNilEventDependency(config.Auditor) {
+	if config.Backend == nil || config.Resolver == nil || config.GenerationReader == nil ||
+		config.LeaseValidator == nil || config.Auditor == nil {
 		return nil, shoal.NewError(shoal.ErrorInvalidArgument, "fleet event dependencies are required")
 	}
 	if config.Clock == nil {
@@ -89,20 +88,6 @@ func New(config Config) (*Service, error) {
 		leases: config.LeaseValidator, auditor: config.Auditor, cursors: codec,
 		now: config.Clock, poll: config.PollInterval, maxWait: config.MaxWait,
 	}, nil
-}
-
-func isNilEventDependency(value any) bool {
-	if value == nil {
-		return true
-	}
-	reflected := reflect.ValueOf(value)
-	switch reflected.Kind() {
-	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map,
-		reflect.Pointer, reflect.Slice:
-		return reflected.IsNil()
-	default:
-		return false
-	}
 }
 
 func (s *Service) Create(ctx context.Context, request CreateRequest) (Subscription, error) {
@@ -166,15 +151,24 @@ func (s *Service) Create(ctx context.Context, request CreateRequest) (Subscripti
 	if err := guard.Check(ctx); err != nil {
 		return Subscription{}, err
 	}
-	subscription, _, err := s.backend.Create(ctx, request, fingerprint, decision.PolicyGeneration(), now)
+	audit := lifecycleReceiptForDecision(decision, fingerprint)
+	var subscription Subscription
+	var repeated bool
+	if backend, ok := s.backend.(MutationReceiptBackend); ok {
+		subscription, audit, repeated, err = backend.CreateWithAudit(
+			ctx, request, fingerprint, decision.PolicyGeneration(), audit, now)
+	} else {
+		subscription, repeated, err = s.backend.Create(
+			ctx, request, fingerprint, decision.PolicyGeneration(), now)
+	}
 	if err != nil {
 		return Subscription{}, mapContextError(err)
 	}
-	if err := s.record(
-		ctx, decision, auth.OperationSubscriptionCreate, request.Token,
-		subscription.ID, nil, subscription.CreatedAt,
+	if err := s.recordWithReceipt(
+		ctx, audit, auth.OperationSubscriptionCreate, request.Token,
+		subscription.ID, nil, nil, nil, subscription.CreatedAt, repeated,
 	); err != nil {
-		return Subscription{}, errors.Join(ErrAuditOutcomeUnknown, err)
+		return Subscription{}, classifyAuditError(err)
 	}
 	if err := guard.Check(ctx); err != nil {
 		return Subscription{}, errors.Join(ErrActionCommitted, err)
@@ -201,18 +195,30 @@ func (s *Service) Delete(ctx context.Context, request DeleteRequest) error {
 	if err := guard.Check(ctx); err != nil {
 		return err
 	}
-	subscription, err := s.backend.Delete(
-		ctx, request.SubscriptionID, decision.Subject(), request.ExpectedGeneration,
-		request.RetryUntil, now,
-	)
+	fingerprint, err := auth.AuthorizationFingerprint(decision)
+	if err != nil {
+		return err
+	}
+	audit := lifecycleReceiptForDecision(decision, fingerprint)
+	var subscription Subscription
+	var repeated bool
+	if backend, ok := s.backend.(MutationReceiptBackend); ok {
+		subscription, audit, repeated, err = backend.DeleteWithAudit(
+			ctx, request.SubscriptionID, decision.Subject(),
+			request.ExpectedGeneration, request.RetryUntil, audit, now)
+	} else {
+		subscription, repeated, err = s.backend.Delete(
+			ctx, request.SubscriptionID, decision.Subject(),
+			request.ExpectedGeneration, request.RetryUntil, now)
+	}
 	if err != nil {
 		return nonDisclosingSubscriptionError(err)
 	}
-	if err := s.record(
-		ctx, decision, auth.OperationSubscriptionDelete, request.SubscriptionID,
-		subscription.ID, nil, subscription.RevokedAt,
+	if err := s.recordWithReceipt(
+		ctx, audit, auth.OperationSubscriptionDelete, request.SubscriptionID,
+		subscription.ID, nil, nil, nil, subscription.RevokedAt, repeated,
 	); err != nil {
-		return errors.Join(ErrAuditOutcomeUnknown, err)
+		return classifyAuditError(err)
 	}
 	if err := guard.Check(ctx); err != nil {
 		return errors.Join(ErrActionCommitted, err)
@@ -238,7 +244,9 @@ func (s *Service) PublishLifecycle(
 	receipt LifecycleReceipt,
 ) (PublishResult, error) {
 	expected, trusted := lifecycleOperation(request.Event.Kind)
-	if !trusted || operation != expected {
+	enqueueInvoke := request.Event.Kind == "action.enqueued" &&
+		operation == auth.OperationInvoke
+	if !trusted || operation != expected && !enqueueInvoke {
 		return PublishResult{}, shoal.NewError(
 			shoal.ErrorInvalidArgument, "fleet lifecycle publication operation is invalid")
 	}
@@ -274,15 +282,16 @@ func (s *Service) publish(
 	); err != nil {
 		return PublishResult{}, err
 	}
-	decision, guard, err := s.authorize(ctx, operation, request.Event.Evidence, now)
-	if err != nil {
-		return PublishResult{}, err
-	}
 	if err := validateID("event publication token", request.Token, false); err != nil {
 		return PublishResult{}, err
 	}
 	request.Event.OccurredAt = request.Event.OccurredAt.UTC()
+	var err error
 	request.Event, err = normalizeEvent(request.Event, false)
+	if err != nil {
+		return PublishResult{}, err
+	}
+	decision, guard, err := s.authorize(ctx, operation, request.Event.Evidence, now)
 	if err != nil {
 		return PublishResult{}, err
 	}
@@ -299,34 +308,48 @@ func (s *Service) publish(
 			[]byte(decision.Subject()), fingerprint.Bytes(), request.Token,
 		)
 	}
+	if lifecycleReceipt != nil {
+		request.Audit = *lifecycleReceipt
+	} else {
+		request.Audit = LifecycleReceipt{
+			RequestID:                decision.RequestID(),
+			CorrelationID:            []byte(decision.CorrelationID()),
+			AuthorizationFingerprint: fingerprint,
+			AuthorizationExpiresAt:   decision.AuthenticationExpires(),
+		}
+	}
 	result, err := s.backend.Append(ctx, request, now)
 	if err != nil {
 		return PublishResult{}, mapContextError(err)
 	}
-	auditTime := now
-	if !scopePublicToken {
-		auditTime = request.Event.OccurredAt
+	if result.Audit.AuthorizationFingerprint == (auth.Fingerprint{}) {
+		result.Audit = request.Audit
 	}
+	auditTime := request.Event.OccurredAt
+	record := AuditRecord{
+		Operation: operation, ActionID: cloneBytes(request.Event.ActionID),
+		ObjectID:         cloneBytes(result.EventID),
+		Evidence:         cloneEvidence(request.Event.Evidence),
+		ConsumedEvidence: cloneEvidenceReferences(request.Event.ConsumedEvidence),
+		CitedEvidence:    cloneEvidenceReferences(request.Event.CitedEvidence),
+		OccurredAt:       auditTime,
+	}
+	record.RequestID = result.Audit.RequestID
+	record.CorrelationID = cloneBytes(result.Audit.CorrelationID)
+	record.AuthorizationFingerprint = result.Audit.AuthorizationFingerprint
+	record.AuthorizationExpiresAt = result.Audit.AuthorizationExpiresAt
 	var recordErr error
-	if lifecycleReceipt == nil {
-		recordErr = s.record(
-			ctx, decision, operation, request.Event.ActionID,
-			result.EventID, request.Event.Evidence, auditTime,
-		)
+	if result.Repeated {
+		if retryAuditor, ok := s.auditor.(RetryAuditor); ok {
+			recordErr = retryAuditor.RecordFleetActionRetry(ctx, record)
+		} else {
+			recordErr = s.auditor.RecordFleetAction(ctx, record)
+		}
 	} else {
-		recordErr = s.auditor.RecordFleetAction(ctx, AuditRecord{
-			Operation: operation, ActionID: cloneBytes(request.Event.ActionID),
-			RequestID:                lifecycleReceipt.RequestID,
-			CorrelationID:            cloneBytes(lifecycleReceipt.CorrelationID),
-			AuthorizationFingerprint: lifecycleReceipt.AuthorizationFingerprint,
-			AuthorizationExpiresAt:   lifecycleReceipt.AuthorizationExpiresAt,
-			ObjectID:                 cloneBytes(result.EventID),
-			Evidence:                 cloneEvidence(request.Event.Evidence),
-			OccurredAt:               auditTime,
-		})
+		recordErr = s.auditor.RecordFleetAction(ctx, record)
 	}
 	if recordErr != nil {
-		return PublishResult{}, errors.Join(ErrAuditOutcomeUnknown, recordErr)
+		return PublishResult{}, classifyAuditError(recordErr)
 	}
 	if err := guard.Check(ctx); err != nil {
 		return PublishResult{}, errors.Join(ErrActionCommitted, err)
@@ -351,6 +374,7 @@ func (s *Service) Pull(ctx context.Context, request PullRequest) (Page, error) {
 		return Page{}, err
 	}
 	deadline := s.now().UTC().Add(request.Wait)
+	pollDelay := s.poll
 	for {
 		events, pinnedFrontier, scanErr := s.backend.Scan(ctx, next, frontier, request.Limit)
 		if scanErr != nil {
@@ -375,7 +399,9 @@ func (s *Service) Pull(ctx context.Context, request PullRequest) (Page, error) {
 			freshSubscription, freshDecision, freshFingerprint, _, _, refreshErr :=
 				s.deliveryState(ctx, PullRequest{SubscriptionID: request.SubscriptionID}, s.now().UTC())
 			if refreshErr != nil {
-				return Page{}, refreshErr
+				return Page{}, shoal.WrapError(
+					shoal.ErrorUnavailable,
+					"subscription authorization changed", refreshErr)
 			}
 			if freshSubscription.Generation != subscription.Generation ||
 				freshDecision.Subject() != decision.Subject() ||
@@ -411,7 +437,11 @@ func (s *Service) Pull(ctx context.Context, request PullRequest) (Page, error) {
 			}
 			return Page{Events: page, NextCursor: cursor, HighWater: 0, AtLeastOnce: true}, nil
 		}
-		timer := time.NewTimer(s.poll)
+		remaining := deadline.Sub(s.now().UTC())
+		if pollDelay > remaining {
+			pollDelay = remaining
+		}
+		timer := time.NewTimer(pollDelay)
 		select {
 		case <-ctx.Done():
 			timer.Stop()
@@ -421,7 +451,9 @@ func (s *Service) Pull(ctx context.Context, request PullRequest) (Page, error) {
 		freshSubscription, freshDecision, freshFingerprint, _, _, refreshErr :=
 			s.deliveryState(ctx, PullRequest{SubscriptionID: request.SubscriptionID}, s.now().UTC())
 		if refreshErr != nil {
-			return Page{}, refreshErr
+			return Page{}, shoal.WrapError(
+				shoal.ErrorUnavailable,
+				"subscription authorization changed", refreshErr)
 		}
 		if freshSubscription.Generation != subscription.Generation ||
 			freshDecision.Subject() != decision.Subject() ||
@@ -430,7 +462,20 @@ func (s *Service) Pull(ctx context.Context, request PullRequest) (Page, error) {
 		}
 		subscription, decision, fingerprint =
 			freshSubscription, freshDecision, freshFingerprint
+		if pollDelay < time.Second {
+			pollDelay *= 2
+			if pollDelay > time.Second {
+				pollDelay = time.Second
+			}
+		}
 	}
+}
+
+func classifyAuditError(err error) error {
+	if err == nil || interaction.IsCommittedRecord(err) {
+		return err
+	}
+	return errors.Join(ErrAuditOutcomeUnknown, err)
 }
 
 func validateRetryUntil(
@@ -453,7 +498,7 @@ func validateRetryUntil(
 func (s *Service) deliveryState(
 	ctx context.Context, request PullRequest, now time.Time,
 ) (Subscription, auth.Decision, auth.Fingerprint, uint64, uint64, error) {
-	decision, guard, err := s.authorize(ctx, auth.OperationSubscriptionDeliver, nil, now)
+	decision, guard, err := s.authorize(ctx, auth.OperationSubscriptionCreate, nil, now)
 	if err != nil {
 		return Subscription{}, auth.Decision{}, auth.Fingerprint{}, 0, 0, err
 	}
@@ -502,7 +547,7 @@ func (s *Service) authorizeDelivery(
 ) (bool, error) {
 	now := s.now().UTC()
 	fresh, guard, err := s.authorize(
-		ctx, auth.OperationSubscriptionDeliver, event.Evidence, now)
+		ctx, auth.OperationSubscriptionCreate, event.Evidence, now)
 	if err != nil {
 		if shoal.IsErrorCode(err, shoal.ErrorUnauthorized) || shoal.IsErrorCode(err, shoal.ErrorNotFound) {
 			return false, nil
@@ -546,11 +591,25 @@ func (s *Service) authorize(
 		}
 	} else {
 		for _, item := range evidence {
-			if err := decision.AuthorizeObject(operation, auth.ResourceRequest{
-				AuthorizationDomain: decision.AuthorizationDomain(),
-				SourceID:            item.SourceID, PolicyID: item.PolicyID, ObjectID: item.ObjectID,
-			}, now); err != nil {
-				return auth.Decision{}, auth.GenerationGuard{}, err
+			objectIDs := []shoal.ID{item.ObjectID}
+			if item.Reference != nil {
+				objectIDs = append(objectIDs, ExactEvidenceReferenceIDs(*item.Reference)...)
+			}
+			seen := make(map[shoal.ID]struct{}, len(objectIDs))
+			for _, objectID := range objectIDs {
+				if objectID == "" {
+					continue
+				}
+				if _, ok := seen[objectID]; ok {
+					continue
+				}
+				seen[objectID] = struct{}{}
+				if err := decision.AuthorizeObject(operation, auth.ResourceRequest{
+					AuthorizationDomain: decision.AuthorizationDomain(),
+					SourceID:            item.SourceID, PolicyID: item.PolicyID, ObjectID: objectID,
+				}, now); err != nil {
+					return auth.Decision{}, auth.GenerationGuard{}, err
+				}
 			}
 		}
 	}
@@ -560,9 +619,21 @@ func (s *Service) authorize(
 
 func (s *Service) record(
 	ctx context.Context, decision auth.Decision, operation auth.Operation,
-	actionID, objectID []byte, evidence []Evidence, now time.Time,
+	actionID, objectID []byte, evidence []Evidence,
+	consumed, cited []interaction.EvidenceReference, now time.Time,
 ) error {
-	return s.auditor.RecordFleetAction(ctx, AuditRecord{
+	return s.recordWithRetry(
+		ctx, decision, operation, actionID, objectID, evidence,
+		consumed, cited, now, false)
+}
+
+func (s *Service) recordWithRetry(
+	ctx context.Context, decision auth.Decision, operation auth.Operation,
+	actionID, objectID []byte, evidence []Evidence,
+	consumed, cited []interaction.EvidenceReference, now time.Time,
+	repeated bool,
+) error {
+	record := AuditRecord{
 		Operation: operation, ActionID: cloneBytes(actionID),
 		RequestID: decision.RequestID(), CorrelationID: []byte(decision.CorrelationID()),
 		AuthorizationFingerprint: func() auth.Fingerprint {
@@ -572,8 +643,50 @@ func (s *Service) record(
 		AuthorizationExpiresAt: decision.AuthenticationExpires(),
 		ObjectID:               cloneBytes(objectID),
 		Evidence:               cloneEvidence(evidence),
+		ConsumedEvidence:       cloneEvidenceReferences(consumed),
+		CitedEvidence:          cloneEvidenceReferences(cited),
 		OccurredAt:             now,
-	})
+	}
+	if repeated {
+		if retryAuditor, ok := s.auditor.(RetryAuditor); ok {
+			return retryAuditor.RecordFleetActionRetry(ctx, record)
+		}
+	}
+	return s.auditor.RecordFleetAction(ctx, record)
+}
+
+func (s *Service) recordWithReceipt(
+	ctx context.Context, receipt LifecycleReceipt, operation auth.Operation,
+	actionID, objectID []byte, evidence []Evidence,
+	consumed, cited []interaction.EvidenceReference, now time.Time,
+	repeated bool,
+) error {
+	record := AuditRecord{
+		Operation: operation, ActionID: cloneBytes(actionID),
+		RequestID: receipt.RequestID, CorrelationID: cloneBytes(receipt.CorrelationID),
+		AuthorizationFingerprint: receipt.AuthorizationFingerprint,
+		AuthorizationExpiresAt:   receipt.AuthorizationExpiresAt,
+		ObjectID:                 cloneBytes(objectID), Evidence: cloneEvidence(evidence),
+		ConsumedEvidence: cloneEvidenceReferences(consumed),
+		CitedEvidence:    cloneEvidenceReferences(cited), OccurredAt: now,
+	}
+	if repeated {
+		if retryAuditor, ok := s.auditor.(RetryAuditor); ok {
+			return retryAuditor.RecordFleetActionRetry(ctx, record)
+		}
+	}
+	return s.auditor.RecordFleetAction(ctx, record)
+}
+
+func lifecycleReceiptForDecision(
+	decision auth.Decision, fingerprint auth.Fingerprint,
+) LifecycleReceipt {
+	return LifecycleReceipt{
+		RequestID:                decision.RequestID(),
+		CorrelationID:            []byte(decision.CorrelationID()),
+		AuthorizationFingerprint: fingerprint,
+		AuthorizationExpiresAt:   decision.AuthenticationExpires(),
+	}
 }
 
 func matchesFilter(filter Filter, event Event) bool {
@@ -603,10 +716,16 @@ func nonDisclosingSubscriptionError(err error) error {
 
 func deriveID(tag string, parts ...[]byte) []byte {
 	hash := sha256.New()
-	hash.Write([]byte(tag))
+	writeHashField(hash, []byte(tag))
 	for _, part := range parts {
-		hash.Write([]byte{0})
-		hash.Write(part)
+		writeHashField(hash, part)
 	}
 	return hash.Sum(nil)
+}
+
+func writeHashField(hash hash.Hash, value []byte) {
+	var size [8]byte
+	binary.BigEndian.PutUint64(size[:], uint64(len(value)))
+	_, _ = hash.Write(size[:])
+	_, _ = hash.Write(value)
 }

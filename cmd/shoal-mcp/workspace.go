@@ -28,7 +28,6 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/explorer/authorized"
 	"github.com/phrocker/shoal-oss/pkg/explorer/mcp"
 	"github.com/phrocker/shoal-oss/pkg/explorer/webapi"
-	"github.com/phrocker/shoal-oss/pkg/interaction"
 )
 
 func buildApplication(
@@ -64,10 +63,12 @@ func buildApplication(
 		optionalTools = append(optionalTools, provider)
 	}
 	server, err := mcp.NewServer(mcp.Config{
-		Service:       service,
-		Authority:     authority,
-		Decisions:     identity,
-		OptionalTools: optionalTools,
+		Service:         service,
+		Authority:       authority,
+		Decisions:       identity,
+		InteractionSink: client,
+		Snapshots:       client,
+		OptionalTools:   optionalTools,
 		ServerInfo: mcp.Implementation{
 			Name:        "shoal-mcp",
 			Title:       "Shoal Explorer MCP",
@@ -76,9 +77,8 @@ func buildApplication(
 		},
 		Instructions: "This stdio v1 process uses one trusted launcher-configured " +
 			"identity for every caller connected to it. A fresh decision and " +
-			"RequestID are bound for each tools/call, but stdio cannot " +
-			"independently authenticate remote callers; a future HTTP transport " +
-			"is required for independently authenticated per-call remote callers. " +
+			"RequestID are bound for each tools/call; independently authenticated " +
+			"remote callers use the Streamable HTTP /mcp transport. " +
 			"shoal.analytics requires durable interaction recording before success; " +
 			"other stdio tool-call recording is not implemented.",
 		ContextBudgetBytes: config.contextBudgetBytes,

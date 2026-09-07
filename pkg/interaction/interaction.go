@@ -29,16 +29,14 @@
 // as though it were source evidence.
 //
 // An interaction node carries the conjunction of every visibility label of
-// every source node it touched plus any producer-required output restriction.
-// Visibility is never derived from the asker's grant set, because that would
-// let a highly cleared user's session become a covert channel. A reviewed
-// declassification path is deliberately absent from this package; it is a
-// later, explicit, authority-bearing action.
+// every source node it touched. Visibility is never derived from the asker's
+// grant set, because that would let a highly cleared user's session become a
+// covert channel. A reviewed declassification path is deliberately absent from
+// this package; it is a later, explicit, authority-bearing action.
 package interaction
 
 import (
 	"crypto/sha256"
-	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
 	"sort"
@@ -185,9 +183,9 @@ func IsInteractionEdgeType(edgeType string) bool {
 	return strings.HasPrefix(edgeType, EdgeTypePrefix)
 }
 
-// ToolCall is one tool invocation made inside a turn. RetrievedNodeIDs preserve
-// the source graph projection used by existing readers; RetrievedEvidence
-// retains complete exact anchor, edge, and assertion provenance.
+// ToolCall is one tool invocation made inside a turn. RetrievedNodeIDs are the
+// source graph nodes the call put in front of the model, not only the ones it
+// went on to cite.
 type ToolCall struct {
 	Kind              string
 	RetrievedNodeIDs  []shoal.ID
@@ -352,9 +350,9 @@ type Provenance struct {
 }
 
 // Session is one recorded inference. It carries identities, digests, counts,
-// and complete redacted evidence references. It never carries the question,
-// prompt, answer text, evidence quotes, authorization grants, or model-chosen
-// correlation strings.
+// and the source node IDs it touched. It never carries the question, the
+// prompt, the answer text, evidence quotes, authorization grants, or
+// model-chosen correlation strings.
 type Session struct {
 	ID                       shoal.ID
 	RecordedAt               time.Time
@@ -418,10 +416,6 @@ type Subgraph struct {
 // must return an error for a node it cannot resolve so recording fails closed
 // rather than silently under-labeling an interaction record.
 type VisibilityResolver func(shoal.ID) ([]string, error)
-
-// EdgeVisibilityResolver reports the current visibility labels required by a
-// source graph edge.
-type EdgeVisibilityResolver func(shoal.ID) ([]string, error)
 
 // NodeVisibility reads the declared visibility labels of a graph node. A node
 // with no declared labels is public.
@@ -724,39 +718,6 @@ func (s Session) Validate() error {
 		if err := shoal.ValidateRequiredID("interaction seed node ID", id); err != nil {
 			return err
 		}
-		for _, evidence := range s.SeedEvidence {
-			if err := evidence.Validate(); err != nil {
-				return err
-			}
-		}
-		if len(s.SeedEvidence) > 0 &&
-			!equalIDs(dedupeIDs(s.SeedNodeIDs), evidenceNodeIDs(s.SeedEvidence)) {
-			return shoal.NewError(
-				shoal.ErrorInvalidArgument,
-				"interaction seed nodes do not match seed evidence")
-		}
-	}
-	for _, evidence := range s.SeedEvidence {
-		if err := evidence.Validate(); err != nil {
-			return err
-		}
-	}
-	if len(s.SeedEvidence) > 0 &&
-		!equalIDs(dedupeIDs(s.SeedNodeIDs), evidenceNodeIDs(s.SeedEvidence)) {
-		return shoal.NewError(
-			shoal.ErrorInvalidArgument,
-			"interaction seed nodes do not match seed evidence")
-	}
-	for _, evidence := range s.SeedEvidence {
-		if err := evidence.Validate(); err != nil {
-			return err
-		}
-	}
-	if len(s.SeedEvidence) > 0 &&
-		!equalIDs(dedupeIDs(s.SeedNodeIDs), evidenceNodeIDs(s.SeedEvidence)) {
-		return shoal.NewError(
-			shoal.ErrorInvalidArgument,
-			"interaction seed nodes do not match seed evidence")
 	}
 	for _, evidence := range s.SeedEvidence {
 		if err := evidence.Validate(); err != nil {
@@ -772,17 +733,6 @@ func (s Session) Validate() error {
 	for _, id := range s.CitedNodeIDs {
 		if err := shoal.ValidateRequiredID("interaction cited node ID", id); err != nil {
 			return err
-		}
-		for _, evidence := range s.CitedEvidence {
-			if err := evidence.Validate(); err != nil {
-				return err
-			}
-		}
-		if len(s.CitedEvidence) > 0 &&
-			!equalIDs(dedupeIDs(s.CitedNodeIDs), evidenceNodeIDs(s.CitedEvidence)) {
-			return shoal.NewError(
-				shoal.ErrorInvalidArgument,
-				"interaction cited nodes do not match cited evidence")
 		}
 	}
 	for _, evidence := range s.CitedEvidence {
@@ -982,9 +932,8 @@ func (s Session) evidenceReferenceValues() []EvidenceReference {
 
 // Subgraph materializes the session, turn, and tool-call nodes with their
 // retrieved and cited edges. resolve supplies the visibility labels of every
-// touched source node; those labels are conjoined with RequiredVisibility. If
-// resolution fails for any node, the whole record fails rather than being
-// written with an understated visibility.
+// touched source node; if it fails for any node, the whole record fails rather
+// than being written with an understated visibility.
 func (s Session) Subgraph(resolve VisibilityResolver) (Subgraph, error) {
 	return s.SubgraphWithEvidence(resolve, nil)
 }
@@ -1033,32 +982,6 @@ func (s Session) SubgraphWithEvidence(
 				shoal.ErrorInvalidArgument,
 				"interaction edge visibility resolver is required",
 			)
-		}
-		sets := make([][]string, 0, len(ids))
-		for _, id := range ids {
-			if cached, ok := edgeCache[id]; ok {
-				sets = append(sets, cached)
-				continue
-			}
-			labels, err := resolveEdge(id)
-			if err != nil {
-				return nil, err
-			}
-			normalized, err := Conjoin(labels)
-			if err != nil {
-				return nil, err
-			}
-			edgeCache[id] = normalized
-			sets = append(sets, normalized)
-		}
-		return Conjoin(sets...)
-	}
-	edgeCache := make(map[shoal.ID][]string)
-	labelsForEdges := func(ids []shoal.ID) ([]string, error) {
-		if len(ids) > 0 && resolveEdge == nil {
-			return nil, shoal.NewError(
-				shoal.ErrorInvalidArgument,
-				"interaction edge visibility resolver is required")
 		}
 		sets := make([][]string, 0, len(ids))
 		for _, id := range ids {

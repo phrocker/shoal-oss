@@ -25,12 +25,12 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
-	"reflect"
 	"time"
 
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/explorer/fleet"
 	"github.com/phrocker/shoal-oss/pkg/explorer/fleetevents"
+	"github.com/phrocker/shoal-oss/pkg/interaction"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
@@ -49,26 +49,12 @@ func NewActionEventPublisher(
 	resolver auth.Resolver,
 	clock func() time.Time,
 ) (*ActionEventPublisher, error) {
-	if service == nil || isNilPublisherDependency(resolver) || clock == nil {
+	if service == nil || resolver == nil || clock == nil {
 		return nil, errors.New("fleet events: action publisher dependencies are required")
 	}
 	return &ActionEventPublisher{
 		service: service, resolver: resolver, now: clock,
 	}, nil
-}
-
-func isNilPublisherDependency(value any) bool {
-	if value == nil {
-		return true
-	}
-	reflected := reflect.ValueOf(value)
-	switch reflected.Kind() {
-	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map,
-		reflect.Pointer, reflect.Slice:
-		return reflected.IsNil()
-	default:
-		return false
-	}
 }
 
 func (p *ActionEventPublisher) PublishActionEvent(
@@ -82,6 +68,7 @@ func (p *ActionEventPublisher) PublishActionEvent(
 	if err != nil {
 		return err
 	}
+	provenance := record.EventProvenance()
 	now := p.now().UTC()
 	decision, err := p.resolver.Resolve(ctx)
 	if err != nil {
@@ -89,8 +76,6 @@ func (p *ActionEventPublisher) PublishActionEvent(
 	}
 	if decision.Subject() != record.Subject || decision.Actor() != record.Actor ||
 		decision.ClientID() != record.ClientID ||
-		decision.RequestID() != record.RequestID ||
-		decision.CorrelationID() != record.CorrelationID ||
 		!sameIDs(decision.OnBehalfOf(), record.OnBehalfOf) {
 		return shoal.NewError(
 			shoal.ErrorUnauthorized,
@@ -104,97 +89,134 @@ func (p *ActionEventPublisher) PublishActionEvent(
 	}, now); err != nil {
 		return err
 	}
-	evidence := []fleetevents.Evidence{{
-		SourceID: append([]byte(nil), record.SourceID...),
-		PolicyID: append([]byte(nil), record.PolicyID...),
-		ObjectID: record.ObjectID,
-	}}
-	for _, reference := range record.Evidence {
-		if len(reference.Assertions) != 0 {
-			return shoal.NewError(
-				shoal.ErrorInvalidArgument,
-				"fleet action event assertion evidence is not representable",
-			)
-		}
-		common := fleetevents.Evidence{
-			SourceID: append([]byte(nil), record.SourceID...),
-			PolicyID: append([]byte(nil), record.PolicyID...),
-			ObjectID: record.ObjectID, AnchorID: reference.AnchorID,
-			Visibility: append([]string(nil), reference.Visibility...),
-		}
-		if reference.Citation.RevisionID != "" {
-			common.ObjectID = reference.Citation.DocumentID
-			common.RevisionID = reference.Citation.RevisionID
-			common.Start = reference.Citation.Range.Start.Offset
-			common.End = reference.Citation.Range.End.Offset
-		}
-		for _, nodeID := range reference.NodeIDs {
-			item := common
-			item.NodeID = nodeID
-			evidence = append(evidence, item)
-		}
-		for _, edgeID := range reference.EdgeIDs {
-			item := common
-			item.EdgeID = edgeID
-			evidence = append(evidence, item)
-		}
-	}
-	if len(evidence) > fleetevents.MaxEvidence {
-		return shoal.NewError(
-			shoal.ErrorInvalidArgument,
-			"fleet action event evidence exceeds its bound",
-		)
-	}
+	references := actionEvidenceReferences(record.Evidence)
+	evidence := actionAuthorizationEvidence(record, references)
 	event := fleetevents.Event{
 		Kind:               kind,
 		ProducerID:         []byte(record.AgentID),
 		ProducerGeneration: record.AgentGeneration,
 		ActionID:           append([]byte(nil), record.ID...),
 		TransitionID:       transitionID,
-		CorrelationID:      []byte(record.CorrelationID),
+		CorrelationID:      []byte(provenance.CorrelationID),
 		Reason:             record.Reason,
 		Evidence:           evidence,
+		ConsumedEvidence:   references,
 		OccurredAt:         record.UpdatedAt,
 	}
+
 	_, err = p.service.PublishLifecycle(ctx, operation, fleetevents.PublishRequest{
 		Token: token, RetryUntil: record.UpdatedAt.Add(fleetevents.MaxMutationRetryWindow),
 		Event: event,
 	}, fleetevents.LifecycleReceipt{
-		RequestID: record.RequestID, CorrelationID: []byte(record.CorrelationID),
+		RequestID:                provenance.RequestID,
+		CorrelationID:            []byte(provenance.CorrelationID),
 		AuthorizationFingerprint: fingerprint,
 		AuthorizationExpiresAt:   expiresAt,
 	})
 	return err
 }
 
+func actionAuthorizationEvidence(
+	record fleet.ActionRecord,
+	references []interaction.EvidenceReference,
+) []fleetevents.Evidence {
+	result := make([]fleetevents.Evidence, 0, 1+len(references))
+	covered := make(map[shoal.ID]struct{})
+	appendID := func(id shoal.ID, reference *interaction.EvidenceReference) {
+		result = append(result, fleetevents.Evidence{
+			SourceID: append([]byte(nil), record.SourceID...),
+			PolicyID: append([]byte(nil), record.PolicyID...),
+			ObjectID: id, Reference: reference,
+		})
+		covered[id] = struct{}{}
+		if reference != nil {
+			for _, exactID := range fleetevents.ExactEvidenceReferenceIDs(*reference) {
+				if exactID != "" {
+					covered[exactID] = struct{}{}
+				}
+			}
+		}
+	}
+	appendID(record.ObjectID, nil)
+	for _, reference := range references {
+		canonical := cloneActionEvidenceReference(reference)
+		var representative shoal.ID
+		for _, id := range fleetevents.ExactEvidenceReferenceIDs(canonical) {
+			if id == "" {
+				continue
+			}
+			if _, ok := covered[id]; !ok {
+				representative = id
+				break
+			}
+		}
+		if representative != "" {
+			appendID(representative, &canonical)
+		}
+	}
+	return result
+}
+
+func cloneActionEvidenceReference(
+	value interaction.EvidenceReference,
+) interaction.EvidenceReference {
+	value.NodeIDs = append([]shoal.ID(nil), value.NodeIDs...)
+	value.EdgeIDs = append([]shoal.ID(nil), value.EdgeIDs...)
+	value.Assertions = append(
+		[]interaction.AssertionReference(nil), value.Assertions...)
+	return value
+}
+
+func actionEvidenceReferences(
+	values []fleet.EvidenceRef,
+) []interaction.EvidenceReference {
+	if len(values) == 0 {
+		return nil
+	}
+	result := make([]interaction.EvidenceReference, len(values))
+	for i, value := range values {
+		result[i] = interaction.EvidenceReference{
+			AnchorID: value.AnchorID, Kind: value.Kind, Citation: value.Citation,
+			NodeIDs: append([]shoal.ID(nil), value.NodeIDs...),
+			EdgeIDs: append([]shoal.ID(nil), value.EdgeIDs...),
+			Assertions: append(
+				[]interaction.AssertionReference(nil), value.Assertions...),
+		}
+	}
+	return result
+}
+
 func actionEventAuthorization(
 	kind string, record fleet.ActionRecord,
 ) (auth.Operation, auth.Fingerprint, time.Time, error) {
 	var operation auth.Operation
-	var fingerprint auth.Fingerprint
-	var expiresAt time.Time
+	provenance := record.EventProvenance()
 	switch kind {
-	case "action.enqueued", "action.canceled":
+	case "action.enqueued":
+		if containsOperation(record.AuthorizedOperations, auth.OperationDispatch) {
+			operation = auth.OperationDispatch
+		} else {
+			operation = auth.OperationInvoke
+		}
+	case "action.canceled":
 		operation = auth.OperationDispatch
-		fingerprint = record.AuthorizationFingerprint
-		expiresAt = record.AuthorizationExpiresAt
 	case "action.claimed", "action.completed", "action.failed":
 		operation = auth.OperationInvoke
-		fingerprint = record.ExecutionFingerprint
-		expiresAt = record.ExecutionExpiresAt
 	default:
 		return "", auth.Fingerprint{}, time.Time{}, shoal.NewError(
 			shoal.ErrorInvalidArgument, "fleet action event kind is invalid")
 	}
-	if fingerprint == (auth.Fingerprint{}) || expiresAt.IsZero() ||
-		expiresAt.Location() != time.UTC ||
+	if provenance.AuthorizationFingerprint == (auth.Fingerprint{}) ||
+		provenance.AuthorizationExpiresAt.IsZero() ||
+		provenance.AuthorizationExpiresAt.Location() != time.UTC ||
 		!containsOperation(record.AuthorizedOperations, operation) {
 		return "", auth.Fingerprint{}, time.Time{}, shoal.NewError(
 			shoal.ErrorInvalidArgument,
 			"fleet action event authorization provenance is incomplete",
 		)
 	}
-	return operation, fingerprint, expiresAt, nil
+	return operation, provenance.AuthorizationFingerprint,
+		provenance.AuthorizationExpiresAt, nil
 }
 
 func containsOperation(values []auth.Operation, wanted auth.Operation) bool {

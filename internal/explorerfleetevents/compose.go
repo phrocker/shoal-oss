@@ -28,7 +28,6 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/explorer/fleet"
 	"github.com/phrocker/shoal-oss/pkg/explorer/fleetevents"
 	"github.com/phrocker/shoal-oss/pkg/interaction"
-	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
 // ConfigureRuntime adds the fleet-event physical table before
@@ -54,14 +53,14 @@ func Compose(
 	resolver auth.Resolver,
 	generations auth.GenerationReader,
 	interactionRecorder *interaction.Recorder,
-	trustedInteractions interaction.ResultSink,
+	snapshots fleet.InteractionSnapshotProvider,
 	leases fleetevents.LeaseValidator,
 	cursorKey []byte,
 	clock func() time.Time,
 ) (*fleetevents.Service, error) {
 	service, _, err := ComposeWithPublisher(
 		runtime, domain, resolver, generations, interactionRecorder,
-		trustedInteractions, leases, cursorKey, clock,
+		snapshots, leases, cursorKey, clock,
 	)
 	return service, err
 }
@@ -74,32 +73,60 @@ func ComposeWithPublisher(
 	resolver auth.Resolver,
 	generations auth.GenerationReader,
 	interactionRecorder *interaction.Recorder,
-	trustedInteractions interaction.ResultSink,
+	snapshots fleet.InteractionSnapshotProvider,
 	leases fleetevents.LeaseValidator,
 	cursorKey []byte,
 	clock func() time.Time,
 ) (*fleetevents.Service, *ActionEventPublisher, error) {
-	if interaction.IsNilResultSink(trustedInteractions) {
-		return nil, nil, shoal.NewError(
-			shoal.ErrorInvalidArgument,
-			"fleet event interaction sink is required")
-	}
 	backend, err := New(runtime, domain)
 	if err != nil {
 		return nil, nil, err
 	}
-	snapshots, ok := leases.(fleet.InteractionSnapshotProvider)
-	if !ok {
-		return nil, nil, shoal.NewError(
-			shoal.ErrorInvalidArgument,
-			"fleet event snapshot provider is required",
-		)
-	}
 	auditor, err := fleetevents.NewInteractionAuditor(
-		interactionRecorder, trustedInteractions, snapshots)
+		interactionRecorder, snapshots)
 	if err != nil {
 		return nil, nil, err
 	}
+	return composeWithPublisher(
+		backend, resolver, generations, auditor, leases, cursorKey, clock)
+}
+
+// ComposeWithPublisherAndReader constructs the production event service with
+// authoritative interaction-receipt reconciliation for exact retries.
+func ComposeWithPublisherAndReader(
+	runtime *explorercoord.Runtime,
+	domain coordination.DomainID,
+	resolver auth.Resolver,
+	generations auth.GenerationReader,
+	interactionSinkFor func(auth.Operation) interaction.ResultSink,
+	interactionReader fleetevents.InteractionReceiptReader,
+	snapshots fleet.InteractionSnapshotProvider,
+	leases fleetevents.LeaseValidator,
+	cursorKey []byte,
+	clock func() time.Time,
+) (*fleetevents.Service, *ActionEventPublisher, error) {
+	backend, err := New(runtime, domain)
+	if err != nil {
+		return nil, nil, err
+	}
+	auditor, err := fleetevents.NewOperationInteractionAuditorWithReader(
+		interactionSinkFor, interactionReader, snapshots)
+	if err != nil {
+		return nil, nil, err
+	}
+	return composeWithPublisher(
+		backend, resolver, generations, auditor, leases, cursorKey, clock)
+}
+
+func composeWithPublisher(
+	backend fleetevents.Backend,
+	resolver auth.Resolver,
+	generations auth.GenerationReader,
+	auditor fleetevents.Auditor,
+	leases fleetevents.LeaseValidator,
+	cursorKey []byte,
+	clock func() time.Time,
+) (*fleetevents.Service, *ActionEventPublisher, error) {
 	service, err := fleetevents.New(fleetevents.Config{
 		Backend: backend, Resolver: resolver, GenerationReader: generations,
 		LeaseValidator: leases, Auditor: auditor, CursorKey: cursorKey,

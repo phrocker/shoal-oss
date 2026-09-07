@@ -19,20 +19,22 @@ under durable compare-and-swap. Delivery uses the runtime-owned
 that an event committed, and prepared, quarantined, and aborted cells are
 excluded. Pull cursors are authenticated,
 expiring, opaque, and scoped to the subscription, subscriber, subscription
-generation, and exact authorization fingerprint. Version 2 cursors encrypt and
-authenticate their complete contents with AES-GCM; version 1 and other legacy
+generation, and exact authorization fingerprint. Version 3 cursors encrypt and
+authenticate their complete contents with AES-GCM; earlier and other legacy
 formats are rejected. Their 32-byte encryption root is domain-separated from a
 durable per-corpus load-or-create key, so cursors survive process restart but
-not corpus replacement. Delivery requires the narrow
-`subscription_deliver` authorization operation rather than generic data read
+not corpus replacement. Delivery reuses the narrow
+`subscription_create` authorization operation rather than generic data read
 or event publication. It rechecks
 authorization generation and the target agent's exact positive registry
 generation, lease, revocation, parent delegation, and narrowing before and
 after page computation.
 
-The event log retains 4,096 logical event slots by default and durably records
+The event log retains 10,000 logical event slots by default and durably records
 its event-local readable floor without advancing the shared runtime history
-floor. Reused slots and guards bound the live event coordinate set. Every
+floor. Expired cells are physically tombstoned with their owning guards while
+the floor advances atomically; sequence-specific guards prevent a retired
+ownership claim from being revived when a physical slot is reused. Every
 publication declares a UTC retry deadline no more than 24 hours ahead; a slot
 cannot be retired before that backend-enforced deadline, regardless of the
 caller-controlled event occurrence time. Capacity fails closed while an
@@ -49,27 +51,28 @@ allowing an ambiguous interaction receipt to be repaired during the declared
 retry window. Expired mutation retries return
 `fleetevents.ErrMutationExpired`; unexpired receipt-slot collisions return
 `fleetevents.ErrRetentionCapacity` rather than repurposing a receipt.
-Physical cleanup of historical cell versions remains the responsibility of
-the configured Explorer storage compactor.
+Older values remain readable only from valid pre-prune frontiers; current
+committed scans hide them.
 
 `internal/explorerfleetevents.NewActionEventPublisher` maps durable dispatch
 lifecycle transitions into this log. Each envelope carries the immutable
 producer generation and an opaque SHA-256 transition ID derived from the event
-kind, action ID, agent ID and generation, and a separately hashed exact
-dispatch transition discriminator. Every component is uint64 length-framed;
-raw enqueue, claim, execution, and cancellation keys are never exposed. The publication
-token is keyed only by kind, action ID, and durable action version, so changing
-the transition ID, producer identity, or generation for the same transition
-conflicts against canonical event content instead of appending a second event.
-Exact retries remain idempotent. Trusted lifecycle publication is separate
+kind, action ID, and exact dispatch transition discriminator. The publication
+token binds only the kind, action ID, and durable action version. Immutable
+producer identity, producer generation, and transition identity remain in the
+canonical persisted envelope, so a same-version divergent retry conflicts
+rather than appending another event. Every hashed component is uint64
+length-framed; raw enqueue, claim, execution, and cancellation keys are never
+exposed, and exact retries remain idempotent. Trusted lifecycle publication is separate
 from public `event_publish`, preserves its canonical token across authorization
-refreshes, and requires the original narrow
+refreshes, and accepts only the original narrow
 `dispatch` or `invoke` authorization, not `event_publish`, and reauthorizes the
 durable action identity on every attempt. The five `action.*` lifecycle kinds
 are reserved from public publication, and each trusted kind is bound to its
 exact `dispatch` or `invoke` operation. Event evidence includes the base
-authorization target plus every executor node, edge, anchor, revision, range,
-and visibility field; visibility slices are copied and canonicalized.
+authorization target plus canonical executor node, edge, anchor, revision,
+range, and assertion references. Visibility remains trusted interaction-sink
+state and is re-derived from current labels rather than persisted from callers.
 Lifecycle receipts retain the durable transition's original authorization
 fingerprint, expiry, request, and correlation pins across an ambiguous retry,
 while the current decision is still reauthorized before each attempt.

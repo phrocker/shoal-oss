@@ -299,7 +299,7 @@ func TestCitationObservationPreservesCompleteEvidence(t *testing.T) {
 			AnchorID: interaction.DerivedID(
 				"mcp_citation_path", "document-anchor"),
 			Kind:    interaction.EvidenceGraph,
-			NodeIDs: []shoal.ID{"document", "section", "span"},
+			NodeIDs: []shoal.ID{"document", "section"},
 			EdgeIDs: []shoal.ID{"contains-edge"},
 		},
 		{

@@ -266,33 +266,18 @@ func (e *Explorer) eachLiveInteractionLocked(visit func(interactionView)) {
 	}
 }
 
-func (e *Explorer) interactionViewVisibilityIsStaleLocked(
-	view interactionView,
+// subgraphVisibilityIsStaleLocked reports whether a live record's stored
+// visibility no longer covers what its touched source nodes require now, or can
+// no longer be derived at all. Provenance traversal withholds stale records so
+// a tightening re-ingest cannot leave a previously derived record disclosed
+// under its now under-labelled stored visibility. A merely loosened source
+// still covers the stored label and is not stale. See issue #273. The caller
+// must hold at least e.mu.RLock.
+func (e *Explorer) subgraphVisibilityIsStaleLocked(
+	nodes []graph.Node, edges []graph.Edge, stored string,
 ) bool {
-	current, err := e.currentSubgraphVisibilityLocked(view.nodes, view.edges)
-	if err != nil {
-		return true
-	}
-	sets := make([][]string, 0, len(view.sourceEdgeIDs)+2)
-	if current != "" {
-		labels, err := interaction.ParseVisibility(current)
-		if err != nil {
-			return true
-		}
-		sets = append(sets, labels)
-	}
-	sets = append(sets, view.requiredVisibility)
-	resolveEdge := e.edgeVisibilityResolverLocked()
-	for _, edgeID := range view.sourceEdgeIDs {
-		labels, err := resolveEdge(edgeID)
-		if err != nil {
-			return true
-		}
-		sets = append(sets, labels)
-	}
-	labels, err := interaction.Conjoin(sets...)
-	return err != nil ||
-		!visibilityCovered(view.visibility, interaction.Expression(labels))
+	current, err := e.currentSubgraphVisibilityLocked(nodes, edges)
+	return err != nil || !visibilityCovered(stored, current)
 }
 
 func (e *Explorer) interactionViewVisibilityIsStaleLocked(

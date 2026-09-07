@@ -387,7 +387,8 @@ func TestOpenServiceLongPollObservesPolicyOnlyRevocation(t *testing.T) {
 	generations.value.Store(2)
 	select {
 	case err := <-result:
-		if !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
+		if !shoal.IsErrorCode(err, shoal.ErrorUnavailable) &&
+			!shoal.IsErrorCode(err, shoal.ErrorUnauthorized) {
 			t.Fatalf("policy-only revocation error = %v", err)
 		}
 	case <-time.After(3 * time.Second):

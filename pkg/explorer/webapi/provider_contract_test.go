@@ -36,8 +36,8 @@ import (
 )
 
 func TestCitationEnvelopeInteractionEvidenceUsesAcceptedSession(t *testing.T) {
-	client, pack, result, policyID := citationWireFixture(t)
-	builder, err := reasoning.NewBuilder(client)
+	client, reader, pack, result, policyID := citationWireFixture(t)
+	builder, err := reasoning.NewBuilder(reader)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -72,7 +72,7 @@ func TestCitationEnvelopeInteractionEvidenceUsesAcceptedSession(t *testing.T) {
 		t.Fatal(err)
 	}
 	accepted := response.RecordedSession()
-	if !reflect.DeepEqual(retrieved, accepted.RetrievedEvidence()) ||
+	if !reflect.DeepEqual(retrieved, sessionRetrievedEvidence(accepted)) ||
 		!reflect.DeepEqual(cited, accepted.CitedEvidence) {
 		t.Fatal("interaction evidence differs from the accepted session")
 	}
@@ -86,15 +86,15 @@ func TestCitationEnvelopeInteractionEvidenceUsesAcceptedSession(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !reflect.DeepEqual(retrievedAgain, accepted.RetrievedEvidence()) ||
+	if !reflect.DeepEqual(retrievedAgain, sessionRetrievedEvidence(accepted)) ||
 		!reflect.DeepEqual(citedAgain, accepted.CitedEvidence) {
 		t.Fatal("returned interaction evidence aliases the envelope session")
 	}
 }
 
 func TestCitationEnvelopeInteractionEvidenceIsNotWireReconstructed(t *testing.T) {
-	client, pack, result, policyID := citationWireFixture(t)
-	builder, err := reasoning.NewBuilder(client)
+	client, reader, pack, result, policyID := citationWireFixture(t)
+	builder, err := reasoning.NewBuilder(reader)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -137,8 +137,8 @@ func TestCitationEnvelopeInteractionEvidenceIsNotWireReconstructed(t *testing.T)
 }
 
 func TestCitationEvidenceProjectionPreservesCompleteDomainEvidence(t *testing.T) {
-	client, pack, result, policyID := citationWireFixture(t)
-	builder, err := reasoning.NewBuilder(client)
+	client, reader, pack, result, policyID := citationWireFixture(t)
+	builder, err := reasoning.NewBuilder(reader)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -205,8 +205,8 @@ func TestCitationEvidenceProjectionPreservesCompleteDomainEvidence(t *testing.T)
 }
 
 func TestCitationEvidenceProjectionDoesNotAliasEnvelope(t *testing.T) {
-	client, pack, result, policyID := citationWireFixture(t)
-	builder, err := reasoning.NewBuilder(client)
+	client, reader, pack, result, policyID := citationWireFixture(t)
+	builder, err := reasoning.NewBuilder(reader)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -282,15 +282,10 @@ func (s integrationRegistryStore) Get(
 	}
 	return s.stored, nil
 }
-func (s integrationRegistryStore) ListPage(
-	_ context.Context, cursor string, limit uint32,
+func (s integrationRegistryStore) List(
+	context.Context, []byte, int,
 ) (fleet.StoredPage, error) {
-	if cursor != "" || limit == 0 {
-		return fleet.StoredPage{}, nil
-	}
-	return fleet.StoredPage{Items: []fleet.StoredListItem{{
-		Stored: s.stored, Cursor: string(s.stored.Descriptor.ID),
-	}}}, nil
+	return fleet.StoredPage{Entries: []fleet.Stored{s.stored}}, nil
 }
 
 type integrationExecutors map[string]fleet.Executor

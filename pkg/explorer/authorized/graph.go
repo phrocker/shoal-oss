@@ -21,7 +21,6 @@ package authorized
 
 import (
 	"context"
-	"reflect"
 	"strings"
 	"time"
 
@@ -158,10 +157,6 @@ func (c *Client) Neighborhood(
 	result, err := c.filterNeighborhood(
 		ctx, raw, normalized, explorer.GraphDirectionBoth, decision, now, false,
 		auth.OperationNeighborhood)
-	if err != nil {
-		return explorer.Neighborhood{}, err
-	}
-	result, err = c.applyOntologyLens(ctx, result, decision)
 	if err != nil {
 		return explorer.Neighborhood{}, err
 	}

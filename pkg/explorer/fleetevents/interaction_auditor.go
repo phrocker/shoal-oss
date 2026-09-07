@@ -21,11 +21,15 @@ package fleetevents
 
 import (
 	"context"
+	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"reflect"
+	"sort"
+	"time"
 
+	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
-	"github.com/phrocker/shoal-oss/pkg/explorer/fleet"
 	"github.com/phrocker/shoal-oss/pkg/interaction"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
@@ -35,209 +39,273 @@ import (
 // opaque object identities.
 type InteractionAuditor struct {
 	recorder  *interaction.Recorder
-	trusted   interaction.ResultSink
-	snapshots fleet.InteractionSnapshotProvider
+	result    interaction.ResultSink
+	resultFor func(auth.Operation) interaction.ResultSink
+	reader    InteractionReceiptReader
+	snapshots InteractionSnapshotProvider
 }
 
-const (
-	fleetAuditStopNoEvidence              = "no_evidence"
-	fleetAuditStopRedactedNonNodeEvidence = "redacted_non_node_evidence"
-	fleetAuditStopMixedEvidence           = "redacted_and_source_node_evidence"
-	fleetAuditStopSourceNodeEvidence      = "source_node_evidence"
-)
+type InteractionReceiptReader interface {
+	InteractionRecord(context.Context, shoal.ID) (explorer.InteractionRecord, error)
+}
+
+type InteractionSnapshotProvider interface {
+	InteractionSnapshot(context.Context) (explorer.Snapshot, error)
+}
 
 func NewInteractionAuditor(
-	recorder *interaction.Recorder,
-	trusted interaction.ResultSink,
-	snapshots fleet.InteractionSnapshotProvider,
+	recorder *interaction.Recorder, snapshots InteractionSnapshotProvider,
 ) (*InteractionAuditor, error) {
-	if recorder == nil {
-		return nil, shoal.NewError(
-			shoal.ErrorInvalidArgument, "interaction recorder is required")
-	}
-	if interaction.IsNilResultSink(trusted) {
+	if recorder == nil || snapshots == nil {
 		return nil, shoal.NewError(
 			shoal.ErrorInvalidArgument,
-			"trusted interaction result sink is required")
+			"interaction recorder and snapshot provider are required")
 	}
-	if isNilSnapshotProvider(snapshots) {
+	return &InteractionAuditor{recorder: recorder, snapshots: snapshots}, nil
+}
+
+func NewInteractionAuditorWithReader(
+	result interaction.ResultSink,
+	reader InteractionReceiptReader,
+	snapshots InteractionSnapshotProvider,
+) (*InteractionAuditor, error) {
+	if result == nil || reader == nil || snapshots == nil {
 		return nil, shoal.NewError(
-			shoal.ErrorInvalidArgument, "interaction snapshot provider is required")
+			shoal.ErrorInvalidArgument,
+			"interaction result sink, reader, and snapshot provider are required")
 	}
 	return &InteractionAuditor{
-		recorder: recorder, trusted: trusted, snapshots: snapshots,
+		result: result, reader: reader, snapshots: snapshots,
 	}, nil
 }
 
-func isNilSnapshotProvider(value fleet.InteractionSnapshotProvider) bool {
-	if value == nil {
-		return true
+func NewOperationInteractionAuditorWithReader(
+	resultFor func(auth.Operation) interaction.ResultSink,
+	reader InteractionReceiptReader,
+	snapshots InteractionSnapshotProvider,
+) (*InteractionAuditor, error) {
+	if resultFor == nil || reader == nil || snapshots == nil {
+		return nil, shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			"operation interaction sink, reader, and snapshot provider are required")
 	}
-	reflected := reflect.ValueOf(value)
-	switch reflected.Kind() {
-	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map,
-		reflect.Pointer, reflect.Slice:
-		return reflected.IsNil()
-	default:
-		return false
-	}
+	return &InteractionAuditor{
+		resultFor: resultFor, reader: reader, snapshots: snapshots,
+	}, nil
 }
 
 func (a *InteractionAuditor) RecordFleetAction(ctx context.Context, record AuditRecord) error {
-	sessionID := shoal.ID(hex.EncodeToString(deriveID(
-		"fleet-action-session-v1", []byte(record.Operation), record.ActionID,
-		record.ObjectID, record.CorrelationID,
-	)))
-	snapshot, err := a.snapshots.InteractionSnapshot(ctx)
+	session, err := a.fleetActionSession(ctx, record)
 	if err != nil {
 		return err
 	}
-	seedEvidence := fleetInteractionEvidence(record)
-	seedNodeIDs := make([]shoal.ID, 0, len(seedEvidence))
-	for _, evidence := range seedEvidence {
-		seedNodeIDs = append(seedNodeIDs, evidence.NodeIDs...)
+	var persisted interaction.Session
+	result := a.result
+	if a.resultFor != nil {
+		result = a.resultFor(record.Operation)
+		if result == nil {
+			return shoal.NewError(
+				shoal.ErrorUnavailable,
+				"operation-bound interaction sink is unavailable")
+		}
 	}
-	stopReason := fleetAuditStopNoEvidence
-	switch {
-	case len(record.Evidence) > len(seedEvidence) && len(seedEvidence) > 0:
-		stopReason = fleetAuditStopMixedEvidence
-	case len(record.Evidence) > len(seedEvidence):
-		stopReason = fleetAuditStopRedactedNonNodeEvidence
-	case len(seedEvidence) > 0:
-		stopReason = fleetAuditStopSourceNodeEvidence
+	if result != nil {
+		persisted, err = result.RecordInteractionResult(ctx, session)
+	} else {
+		persisted, err = a.recorder.Record(ctx, session)
 	}
-	recordedAt := record.OccurredAt.UTC()
-	if recordedAt.IsZero() || recordedAt.Before(snapshot.AsOf) {
-		// Interaction receipts must not predate the snapshot whose source
-		// membership they pin; older lifecycle event times are audit inputs, not
-		// proof that this snapshot already existed.
-		recordedAt = snapshot.AsOf.UTC()
+	return validateFleetReceipt(session, persisted, err)
+}
+
+func (a *InteractionAuditor) RecordFleetActionRetry(
+	ctx context.Context, record AuditRecord,
+) error {
+	sessionID, err := fleetActionSessionID(record)
+	if err != nil {
+		return err
 	}
-	session := interaction.Session{
-		ID: sessionID, RecordedAt: recordedAt, Operation: interaction.OperationToolCall,
+	if a.reader != nil {
+		stored, readErr := a.reader.InteractionRecord(
+			context.WithoutCancel(ctx), sessionID)
+		if readErr != nil {
+			return readErr
+		}
+		if stored.Summary.Deleted {
+			return explorer.MarkCommittedInteraction(shoal.NewError(
+				shoal.ErrorNotFound, "fleet interaction receipt was deleted"))
+		}
+		requested, buildErr := a.fleetActionSession(ctx, record)
+		if buildErr != nil {
+			return buildErr
+		}
+		if sameFleetReceipt(requested, stored.Session) {
+			return nil
+		}
+		return explorer.MarkCommittedInteraction(shoal.NewError(
+			shoal.ErrorInternal,
+			"persisted fleet interaction receipt does not match request"))
+	}
+	return a.RecordFleetAction(ctx, record)
+}
+
+func (a *InteractionAuditor) fleetActionSession(
+	ctx context.Context, record AuditRecord,
+) (interaction.Session, error) {
+	sessionID, err := fleetActionSessionID(record)
+	if err != nil {
+		return interaction.Session{}, err
+	}
+	snapshot, err := a.snapshots.InteractionSnapshot(ctx)
+	if err != nil {
+		return interaction.Session{}, err
+	}
+	return interaction.Session{
+		ID: sessionID, RecordedAt: record.OccurredAt, Operation: interaction.OperationToolCall,
 		AuthorizationFingerprint: shoal.ID(
 			record.AuthorizationFingerprint.String()),
 		AuthorizationExpiresAt: record.AuthorizationExpiresAt,
 		AuthorizationOperation: string(record.Operation),
 		SnapshotID:             shoal.ID(snapshot.ID), SnapshotAsOf: snapshot.AsOf,
-		RequestID: record.RequestID,
-		QueryDigest: interaction.Digest(
-			string(record.ActionID) + "\x00" + string(record.CorrelationID)),
-		SeedNodeIDs: seedNodeIDs, SeedEvidence: seedEvidence,
-		StopReason: stopReason,
+		RequestID:     record.RequestID,
+		QueryDigest:   interaction.Digest(hex.EncodeToString(auditDigest(record))),
+		CitedNodeIDs:  evidenceNodeIDs(record.CitedEvidence),
+		CitedEvidence: cloneEvidenceReferences(record.CitedEvidence),
 		Turns: []interaction.Turn{{
 			Index: 0, Decision: string(record.Operation),
-			ToolCall: &interaction.ToolCall{Kind: "fleet." + string(record.Operation)},
+			ToolCall: &interaction.ToolCall{
+				Kind:              "fleet." + string(record.Operation),
+				RetrievedNodeIDs:  evidenceNodeIDs(record.ConsumedEvidence),
+				RetrievedEvidence: cloneEvidenceReferences(record.ConsumedEvidence),
+			},
 		}},
-	}
-	session, err = session.Canonical()
-	if err != nil {
-		return err
-	}
-	var persisted interaction.Session
-	switch record.Operation {
-	case auth.OperationDispatch, auth.OperationInvoke:
-		persisted, err = a.trusted.RecordInteractionResult(ctx, session)
-	default:
-		persisted, err = a.recorder.Record(ctx, session)
-	}
-	if err != nil {
+	}, nil
+}
+
+func fleetActionSessionID(record AuditRecord) (shoal.ID, error) {
+	correlationID := shoal.ID(hex.EncodeToString(deriveID(
+		"fleet-action-session-v1", []byte(record.Operation), record.ActionID,
+		record.ObjectID,
+	)))
+	return interaction.OperationSessionID(
+		interaction.OperationToolCall, correlationID, record.OccurredAt)
+}
+
+func validateFleetReceipt(
+	session, persisted interaction.Session, err error,
+) error {
+	if err != nil && !interaction.IsCommittedRecord(err) {
 		return err
 	}
 	if !sameFleetReceipt(session, persisted) {
-		return shoal.NewError(
-			shoal.ErrorInternal, "persisted fleet interaction receipt does not match request")
+		mismatch := explorer.MarkCommittedInteraction(shoal.NewError(
+			shoal.ErrorInternal,
+			"persisted fleet interaction receipt does not match request"))
+		if err != nil {
+			return errors.Join(err, mismatch)
+		}
+		return mismatch
+	}
+	if err != nil {
+		return err
 	}
 	return nil
 }
 
-func fleetInteractionEvidence(record AuditRecord) []interaction.EvidenceReference {
-	evidence := make([]interaction.EvidenceReference, 0, len(record.Evidence))
-	for _, item := range record.Evidence {
-		// Only actual source graph nodes can be validated as touched interaction
-		// nodes. Object, edge-only, anchor, and revision IDs stay out of
-		// SeedNodeIDs so the interaction sink never tries to authorize them as
-		// source nodes.
-		if item.NodeID == "" {
-			continue
-		}
-		anchorID := item.AnchorID
-		if anchorID == "" {
-			anchorID = shoal.ID(hex.EncodeToString(deriveID(
-				"fleet-event-evidence-anchor-v1",
-				record.ActionID, record.ObjectID, []byte(item.ObjectID),
-				[]byte(item.NodeID), []byte(item.EdgeID),
-				[]byte(item.RevisionID),
-			)))
-		}
-		reference := interaction.EvidenceReference{
-			AnchorID: anchorID,
-			Kind:     interaction.EvidenceGraph,
-			NodeIDs:  []shoal.ID{item.NodeID},
-		}
-		if item.EdgeID != "" {
-			reference.EdgeIDs = []shoal.ID{item.EdgeID}
-		}
-		evidence = append(evidence, reference)
-	}
-	return evidence
-}
-
 func sameFleetReceipt(expected, persisted interaction.Session) bool {
-	persisted, err := persisted.Canonical()
+	if persisted.ID != expected.ID ||
+		persisted.Operation != interaction.OperationToolCall ||
+		persisted.RecordedAt.IsZero() ||
+		persisted.RecordedAt.Location() != time.UTC ||
+		persisted.Actor.SubjectID == "" ||
+		persisted.Actor.ActorID == "" ||
+		persisted.Actor.Validate() != nil ||
+		persisted.Reason.Validate() != nil {
+		return false
+	}
+	expected.RecordedAt = persisted.RecordedAt
+	expected.Actor = persisted.Actor
+	expected.Reason = persisted.Reason
+	expected.SnapshotID = persisted.SnapshotID
+	expected.SnapshotAsOf = persisted.SnapshotAsOf
+	canonicalExpected, err := expected.Canonical()
 	if err != nil {
 		return false
 	}
-	if persisted.ID != expected.ID ||
-		persisted.Operation != interaction.OperationToolCall ||
-		persisted.SnapshotID != expected.SnapshotID ||
-		!persisted.SnapshotAsOf.Equal(expected.SnapshotAsOf) ||
-		persisted.AuthorizationOperation != expected.AuthorizationOperation ||
-		persisted.AuthorizationFingerprint != expected.AuthorizationFingerprint ||
-		!persisted.AuthorizationExpiresAt.Equal(expected.AuthorizationExpiresAt) ||
-		persisted.RequestID != expected.RequestID ||
-		persisted.StopReason != expected.StopReason ||
-		len(persisted.Turns) != 1 ||
-		persisted.Turns[0].ToolCall == nil ||
-		persisted.Turns[0].ToolCall.Kind != expected.Turns[0].ToolCall.Kind {
+	canonicalPersisted, err := persisted.Canonical()
+	if err != nil {
 		return false
 	}
-	return sameFleetIDs(persisted.SeedNodeIDs, expected.SeedNodeIDs) &&
-		sameFleetEvidence(persisted.SeedEvidence, expected.SeedEvidence)
+	return reflect.DeepEqual(canonicalExpected, canonicalPersisted)
 }
 
-func sameFleetIDs(left, right []shoal.ID) bool {
-	if len(left) != len(right) {
-		return false
+func auditDigest(record AuditRecord) []byte {
+	parts := [][]byte{
+		[]byte(record.Operation), record.ActionID, []byte(record.RequestID),
+		record.CorrelationID, record.ObjectID, encodedUint64(uint64(len(record.Evidence))),
 	}
-	for i := range left {
-		if left[i] != right[i] {
-			return false
-		}
+	for _, evidence := range record.Evidence {
+		parts = append(parts,
+			evidence.SourceID, evidence.PolicyID, []byte(evidence.ObjectID),
+		)
 	}
-	return true
+	parts = append(parts, encodedUint64(uint64(len(record.ConsumedEvidence))))
+	parts = appendEvidenceDigestParts(parts, record.ConsumedEvidence)
+	parts = append(parts, encodedUint64(uint64(len(record.CitedEvidence))))
+	parts = appendEvidenceDigestParts(parts, record.CitedEvidence)
+	return deriveID("fleet-action-audit-v3", parts...)
 }
 
-func sameFleetEvidence(
-	left, right []interaction.EvidenceReference,
-) bool {
-	if len(left) != len(right) {
-		return false
-	}
-	for i := range left {
-		if left[i].AnchorID != right[i].AnchorID ||
-			left[i].Kind != right[i].Kind ||
-			left[i].Citation != right[i].Citation ||
-			!sameFleetIDs(left[i].NodeIDs, right[i].NodeIDs) ||
-			!sameFleetIDs(left[i].EdgeIDs, right[i].EdgeIDs) ||
-			len(left[i].Assertions) != len(right[i].Assertions) {
-			return false
-		}
-		for j := range left[i].Assertions {
-			if left[i].Assertions[j] != right[i].Assertions[j] {
-				return false
-			}
+func evidenceNodeIDs(references []interaction.EvidenceReference) []shoal.ID {
+	seen := make(map[shoal.ID]struct{})
+	for _, reference := range references {
+		for _, id := range reference.NodeIDs {
+			seen[id] = struct{}{}
 		}
 	}
-	return true
+	result := make([]shoal.ID, 0, len(seen))
+	for id := range seen {
+		result = append(result, id)
+	}
+	sort.Slice(result, func(i, j int) bool {
+		return shoal.CompareID(result[i], result[j]) < 0
+	})
+	return result
+}
+
+func appendEvidenceDigestParts(
+	parts [][]byte, references []interaction.EvidenceReference,
+) [][]byte {
+	for _, reference := range references {
+		parts = append(parts,
+			[]byte(reference.AnchorID), []byte(reference.Kind),
+			[]byte(reference.Citation.DocumentID),
+			[]byte(reference.Citation.RevisionID),
+			[]byte(reference.Citation.SectionID),
+			[]byte(reference.Citation.SpanID),
+			encodedUint64(uint64(reference.Citation.Range.Start.Offset)),
+			encodedUint64(uint64(reference.Citation.Range.Start.Page)),
+			encodedUint64(uint64(reference.Citation.Range.End.Offset)),
+			encodedUint64(uint64(reference.Citation.Range.End.Page)),
+			encodedUint64(uint64(len(reference.NodeIDs))),
+		)
+		for _, id := range reference.NodeIDs {
+			parts = append(parts, []byte(id))
+		}
+		parts = append(parts, encodedUint64(uint64(len(reference.EdgeIDs))))
+		for _, id := range reference.EdgeIDs {
+			parts = append(parts, []byte(id))
+		}
+		parts = append(parts, encodedUint64(uint64(len(reference.Assertions))))
+		for _, assertion := range reference.Assertions {
+			parts = append(parts, []byte(assertion.AssertionID),
+				[]byte(assertion.EdgeID), []byte(assertion.Origin))
+		}
+	}
+	return parts
+}
+
+func encodedUint64(value uint64) []byte {
+	encoded := make([]byte, 8)
+	binary.BigEndian.PutUint64(encoded, value)
+	return encoded
 }
