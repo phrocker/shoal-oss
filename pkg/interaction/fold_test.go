@@ -209,7 +209,7 @@ func TestFoldSubgraphKeepsRetrievedAndCitedDistinct(t *testing.T) {
 // inside an interaction record are never mistaken for source provenance.
 func TestTouchedNodesIgnoresSubgraphInternalEdges(t *testing.T) {
 	session := interaction.Session{
-		ID:          "session-internal",
+		ID:          interaction.DerivedID("session", "internal"),
 		RecordedAt:  time.Unix(1700000000, 0).UTC(),
 		SeedNodeIDs: []shoal.ID{"span-1"},
 		Turns: []interaction.Turn{{

@@ -125,6 +125,20 @@ func (b *reportingVectorBackend) VectorScores(
 	)
 }
 
+func (b *reportingVectorBackend) VectorEmbeddingSpaceIDs(
+	ctx context.Context,
+	request explorer.VectorScoreRequest,
+) ([]shoal.ID, error) {
+	resolver, ok := b.scorer.(authorized.VectorEmbeddingSpaceResolver)
+	if !ok {
+		return nil, shoal.NewError(
+			shoal.ErrorUnavailable,
+			"trusted vector embedding provenance is unavailable",
+		)
+	}
+	return resolver.VectorEmbeddingSpaceIDs(ctx, request)
+}
+
 func (b *reportingVectorBackend) eventForDocuments(
 	documentIDs []shoal.ID,
 	cacheHit bool,

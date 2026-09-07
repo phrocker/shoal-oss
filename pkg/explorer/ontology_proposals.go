@@ -30,10 +30,16 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
+// MaxOntologyProposals bounds the total durable proposals in one corpus,
+// including proposals that have reached a terminal state.
+const MaxOntologyProposals uint32 = 256
+
 // OntologyProposalStore is the optional durable proposal lifecycle held by a
-// Shoal Explorer corpus.
+// Shoal Explorer corpus. New proposals must be admitted atomically against
+// MaxOntologyProposals; identical retries do not consume another slot.
 type OntologyProposalStore interface {
 	OntologyProposals(context.Context) ([]ontology.GovernedProposal, error)
+	OntologyProposalsForMutation(context.Context) ([]ontology.GovernedProposal, error)
 	CreateOntologyProposal(
 		context.Context, ontology.GovernedProposal, ontology.OntologyVersion,
 	) error
@@ -47,6 +53,15 @@ type OntologyProposalStore interface {
 	) (ontology.GovernedProposal, error)
 }
 
+// OntologyProposalsForMutation returns the same immutable snapshot as
+// OntologyProposals. Authorization wrappers expose it under mutation authority
+// so publication CAS does not require a separate read grant.
+func (e *Explorer) OntologyProposalsForMutation(
+	ctx context.Context,
+) ([]ontology.GovernedProposal, error) {
+	return e.OntologyProposals(ctx)
+}
+
 type persistedOntologyProposal struct {
 	ProposalID      shoal.ID
 	Schema          persistedOntologySchema
@@ -56,7 +71,19 @@ type persistedOntologyProposal struct {
 	Rationale       string
 	CreatedAt       time.Time
 	Metadata        shoal.Metadata
+	Morphisms       []persistedOntologyMorphism
 	transitions     []persistedProposalTransition
+}
+
+type persistedOntologyMorphism struct {
+	Kind             ontology.MorphismKind
+	Sources          []shoal.ID
+	Targets          []shoal.ID
+	DiscriminatorKey string
+	Discriminator    map[string]shoal.ID
+	Evidence         []persistedEvidenceRef
+	Rationale        string
+	Metadata         shoal.Metadata
 }
 
 type persistedOntologySchema struct {
@@ -204,6 +231,10 @@ func (e *Explorer) CreateOntologyProposal(
 		return shoal.NewError(
 			shoal.ErrorUnavailable, "ontology proposal ID collision")
 	}
+	if len(e.ontologyProposals) >= int(MaxOntologyProposals) {
+		return shoal.NewError(
+			shoal.ErrorUnavailable, "ontology proposals exceed the corpus bound")
+	}
 	if err := e.writeRecord(
 		ontologyProposalRecordRow(record.ProposalID),
 		embeddedRecordOntologyProposal,
@@ -249,6 +280,45 @@ func (e *Explorer) TransitionOntologyProposal(
 		return ontology.GovernedProposal{}, shoal.WrapError(
 			shoal.ErrorInternal, "stored ontology proposal is invalid", err)
 	}
+	if next == ontology.ProposalPublished {
+		currentBase, currentHasBase := current.BaseVersionID()
+		for otherID, otherRecord := range e.ontologyProposals {
+			if otherID == proposalID {
+				continue
+			}
+			other, restoreErr := otherRecord.proposal()
+			if restoreErr != nil {
+				return ontology.GovernedProposal{}, shoal.WrapError(
+					shoal.ErrorInternal, "stored ontology proposal is invalid", restoreErr)
+			}
+			otherBase, otherHasBase := other.BaseVersionID()
+			if other.State() == ontology.ProposalPublished &&
+				otherHasBase == currentHasBase &&
+				otherBase == currentBase {
+				return ontology.GovernedProposal{}, shoal.NewError(
+					shoal.ErrorConflict,
+					"another proposal already advanced this ontology base version",
+				)
+			}
+		}
+		if currentHasBase {
+			cyclic, cycleErr := e.publishedOntologyPathLocked(
+				current.Schema().ID(),
+				current.ProposedVersion().ID(),
+				currentBase,
+				proposalID,
+			)
+			if cycleErr != nil {
+				return ontology.GovernedProposal{}, cycleErr
+			}
+			if cyclic {
+				return ontology.GovernedProposal{}, shoal.NewError(
+					shoal.ErrorConflict,
+					"ontology publication would create a cycle",
+				)
+			}
+		}
+	}
 	// This advance is load-bearing; TestOntologyProposalTransitionsSurviveCoarseClockGranularity
 	// pins that back-to-back transitions still record strictly increasing times
 	// on platforms whose wall clock does not tick between two reads.
@@ -260,6 +330,7 @@ func (e *Explorer) TransitionOntologyProposal(
 	if err != nil {
 		return ontology.GovernedProposal{}, err
 	}
+
 	if len(record.transitions) == math.MaxUint32 {
 		return ontology.GovernedProposal{}, shoal.NewError(
 			shoal.ErrorUnavailable, "ontology proposal transition sequence is exhausted")
@@ -283,6 +354,46 @@ func (e *Explorer) TransitionOntologyProposal(
 	}
 	record.transitions = nextTransitions
 	return updated, nil
+}
+
+func (e *Explorer) publishedOntologyPathLocked(
+	schemaID, from, to, excludedProposalID shoal.ID,
+) (bool, error) {
+	outgoing := make(map[shoal.ID][]shoal.ID)
+	for id, record := range e.ontologyProposals {
+		if id == excludedProposalID {
+			continue
+		}
+		proposal, err := record.proposal()
+		if err != nil {
+			return false, shoal.WrapError(
+				shoal.ErrorInternal,
+				"stored ontology proposal is invalid",
+				err,
+			)
+		}
+		base, hasBase := proposal.BaseVersionID()
+		if proposal.State() != ontology.ProposalPublished ||
+			proposal.Schema().ID() != schemaID || !hasBase {
+			continue
+		}
+		outgoing[base] = append(outgoing[base], proposal.ProposedVersion().ID())
+	}
+	pending := []shoal.ID{from}
+	visited := make(map[shoal.ID]struct{})
+	for len(pending) > 0 {
+		current := pending[len(pending)-1]
+		pending = pending[:len(pending)-1]
+		if current == to {
+			return true, nil
+		}
+		if _, seen := visited[current]; seen {
+			continue
+		}
+		visited[current] = struct{}{}
+		pending = append(pending, outgoing[current]...)
+	}
+	return false, nil
 }
 
 // advanceProposalTransitionTime returns the earliest time that keeps a
@@ -423,8 +534,17 @@ func (p *persistedOntologyProposal) proposalBase() (ontology.GovernedProposal, e
 	if err != nil {
 		return ontology.GovernedProposal{}, err
 	}
-	proposal, err := ontology.NewGovernedProposal(
-		schema, base, proposed, p.ProposedBy, p.Rationale, p.CreatedAt, p.Metadata)
+	morphisms := make([]ontology.OntologyMorphism, 0, len(p.Morphisms))
+	for _, item := range p.Morphisms {
+		morphism, err := restoreOntologyMorphism(item, base, proposed)
+		if err != nil {
+			return ontology.GovernedProposal{}, err
+		}
+		morphisms = append(morphisms, morphism)
+	}
+	proposal, err := ontology.NewGovernedProposalWithMorphisms(
+		schema, base, proposed, morphisms,
+		p.ProposedBy, p.Rationale, p.CreatedAt, p.Metadata)
 	if err != nil {
 		return ontology.GovernedProposal{}, err
 	}
@@ -470,7 +590,73 @@ func persistOntologyProposal(
 		CreatedAt:       proposal.CreatedAt(),
 		Metadata:        proposal.Metadata(),
 	}
+	for _, morphism := range proposal.Morphisms() {
+		persisted, err := persistOntologyMorphism(morphism)
+		if err != nil {
+			return persistedOntologyProposal{}, err
+		}
+		record.Morphisms = append(record.Morphisms, persisted)
+	}
 	return record, nil
+}
+
+func persistOntologyMorphism(
+	morphism ontology.OntologyMorphism,
+) (persistedOntologyMorphism, error) {
+	record := persistedOntologyMorphism{
+		Kind: morphism.Kind(), Sources: morphism.Sources(), Targets: morphism.Targets(),
+		DiscriminatorKey: morphism.Discriminator().MetadataKey(),
+		Discriminator:    morphism.Discriminator().Choices(),
+		Rationale:        morphism.Rationale(), Metadata: morphism.Metadata(),
+	}
+	for _, evidence := range morphism.Evidence() {
+		if _, derived := evidence.Derivation(); derived {
+			return persistedOntologyMorphism{}, shoal.NewError(
+				shoal.ErrorInvalidArgument,
+				"ontology morphism persistence requires citation evidence",
+			)
+		}
+		path, hasPath := evidence.Path()
+		record.Evidence = append(record.Evidence, persistedEvidenceRef{
+			Citation: evidence.Citation(), Quote: evidence.Quote(),
+			Path: path, HasPath: hasPath, Metadata: evidence.Metadata(),
+		})
+	}
+	return record, nil
+}
+
+func restoreOntologyMorphism(
+	record persistedOntologyMorphism,
+	source, target ontology.OntologyVersion,
+) (ontology.OntologyMorphism, error) {
+	evidence := make([]ontology.EvidenceRef, 0, len(record.Evidence))
+	for _, item := range record.Evidence {
+		var options []ontology.EvidenceOption
+		if item.HasPath {
+			options = append(options, ontology.WithEvidencePath(item.Path))
+		}
+		ref, err := ontology.NewEvidenceRef(
+			item.Citation, item.Quote, item.Metadata, options...)
+		if err != nil {
+			return ontology.OntologyMorphism{}, err
+		}
+		evidence = append(evidence, ref)
+	}
+	var discriminator ontology.MorphismDiscriminator
+	var err error
+	if record.Kind == ontology.MorphismSplit {
+		discriminator, err = ontology.NewMorphismDiscriminator(
+			record.DiscriminatorKey, record.Discriminator)
+		if err != nil {
+			return ontology.OntologyMorphism{}, err
+		}
+	}
+	return ontology.NewOntologyMorphism(ontology.MorphismConfig{
+		Kind: record.Kind, SourceVersion: source, TargetVersion: target,
+		Sources: record.Sources, Targets: record.Targets,
+		Discriminator: discriminator, Evidence: evidence,
+		Rationale: record.Rationale, Metadata: record.Metadata,
+	})
 }
 
 func persistOntologySchema(schema ontology.OntologySchema) persistedOntologySchema {

@@ -150,7 +150,8 @@ func (e *Explorer) RelatedInteractions(
 			shoal.ErrorNotFound, "interaction not found")
 	}
 	if e.subgraphVisibilityIsStaleLocked(
-		origin.nodes, origin.edges, origin.visibility) {
+		origin.nodes, origin.edges, origin.sourceEdgeIDs,
+		origin.requiredVisibility, origin.visibility) {
 		return nil, staleDerivedVisibilityError()
 	}
 	originTouched := interaction.TouchedNodes(origin.nodes, origin.edges)
@@ -218,12 +219,14 @@ func (e *Explorer) RelatedInteractions(
 // interactionView is the read-only shape shared by a recorded session and a
 // fold for traversal purposes.
 type interactionView struct {
-	id         shoal.ID
-	kind       string
-	nodes      []graph.Node
-	edges      []graph.Edge
-	recordedAt time.Time
-	visibility string
+	id                 shoal.ID
+	kind               string
+	nodes              []graph.Node
+	edges              []graph.Edge
+	recordedAt         time.Time
+	visibility         string
+	sourceEdgeIDs      []shoal.ID
+	requiredVisibility []string
 }
 
 // eachLiveInteractionLocked visits every session and fold that has not been
@@ -235,16 +238,20 @@ func (e *Explorer) eachLiveInteractionLocked(visit func(interactionView)) {
 			continue
 		}
 		if e.subgraphVisibilityIsStaleLocked(
-			record.Nodes, record.Edges, record.Visibility) {
+			record.Nodes, record.Edges, record.Session.TouchedEdgeIDs(),
+			record.Session.RequiredVisibility, record.Visibility) {
 			continue
 		}
 		visit(interactionView{
-			id:         record.SessionID,
-			kind:       interaction.KindSession,
-			nodes:      record.Nodes,
-			edges:      record.Edges,
-			recordedAt: record.RecordedAt,
-			visibility: record.Visibility,
+			id:            record.SessionID,
+			kind:          interaction.KindSession,
+			nodes:         record.Nodes,
+			edges:         record.Edges,
+			recordedAt:    record.RecordedAt,
+			visibility:    record.Visibility,
+			sourceEdgeIDs: record.Session.TouchedEdgeIDs(),
+			requiredVisibility: append(
+				[]string(nil), record.Session.RequiredVisibility...),
 		})
 	}
 	for _, record := range e.folds {
@@ -252,7 +259,8 @@ func (e *Explorer) eachLiveInteractionLocked(visit func(interactionView)) {
 			continue
 		}
 		if e.subgraphVisibilityIsStaleLocked(
-			record.Nodes, record.Edges, record.Visibility) {
+			record.Nodes, record.Edges, record.SourceEdgeIDs,
+			record.RequiredVisibility, record.Visibility) {
 			continue
 		}
 		visit(interactionView{
@@ -262,6 +270,10 @@ func (e *Explorer) eachLiveInteractionLocked(visit func(interactionView)) {
 			edges:      record.Edges,
 			recordedAt: record.FoldedAt,
 			visibility: record.Visibility,
+			sourceEdgeIDs: append(
+				[]shoal.ID(nil), record.SourceEdgeIDs...),
+			requiredVisibility: append(
+				[]string(nil), record.RequiredVisibility...),
 		})
 	}
 }
@@ -274,21 +286,50 @@ func (e *Explorer) eachLiveInteractionLocked(visit func(interactionView)) {
 // still covers the stored label and is not stale. See issue #273. The caller
 // must hold at least e.mu.RLock.
 func (e *Explorer) subgraphVisibilityIsStaleLocked(
-	nodes []graph.Node, edges []graph.Edge, stored string,
+	nodes []graph.Node,
+	edges []graph.Edge,
+	sourceEdgeIDs []shoal.ID,
+	requiredVisibility []string,
+	stored string,
 ) bool {
 	current, err := e.currentSubgraphVisibilityLocked(nodes, edges)
+	if err != nil {
+		return true
+	}
+	sets := make([][]string, 0, len(sourceEdgeIDs)+2)
+	nodeLabels, err := interaction.ParseVisibility(current)
+	if err != nil {
+		return true
+	}
+	sets = append(sets, nodeLabels, requiredVisibility)
+	resolveEdge := e.edgeVisibilityResolverLocked()
+	for _, id := range sourceEdgeIDs {
+		labels, edgeErr := resolveEdge(id)
+		if edgeErr != nil {
+			return true
+		}
+		sets = append(sets, labels)
+	}
+	labels, err := interaction.Conjoin(sets...)
+	if err != nil {
+		return true
+	}
+	current = interaction.Expression(labels)
 	return err != nil || !visibilityCovered(stored, current)
 }
 
 func (e *Explorer) interactionViewLocked(id shoal.ID) (interactionView, bool) {
 	if record, ok := e.interactions[id]; ok && !record.Deleted {
 		return interactionView{
-			id:         record.SessionID,
-			kind:       interaction.KindSession,
-			nodes:      record.Nodes,
-			edges:      record.Edges,
-			recordedAt: record.RecordedAt,
-			visibility: record.Visibility,
+			id:            record.SessionID,
+			kind:          interaction.KindSession,
+			nodes:         record.Nodes,
+			edges:         record.Edges,
+			recordedAt:    record.RecordedAt,
+			visibility:    record.Visibility,
+			sourceEdgeIDs: record.Session.TouchedEdgeIDs(),
+			requiredVisibility: append(
+				[]string(nil), record.Session.RequiredVisibility...),
 		}, true
 	}
 	if record, ok := e.folds[id]; ok && !record.Deleted {
@@ -299,6 +340,10 @@ func (e *Explorer) interactionViewLocked(id shoal.ID) (interactionView, bool) {
 			edges:      record.Edges,
 			recordedAt: record.FoldedAt,
 			visibility: record.Visibility,
+			sourceEdgeIDs: append(
+				[]shoal.ID(nil), record.SourceEdgeIDs...),
+			requiredVisibility: append(
+				[]string(nil), record.RequiredVisibility...),
 		}, true
 	}
 	return interactionView{}, false

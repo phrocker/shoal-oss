@@ -520,6 +520,11 @@ func (r *DocumentResponse) UnmarshalJSON(data []byte) error {
 
 func (r RetrievalResponse) MarshalJSON() ([]byte, error) {
 	results := make([]any, 0, len(r.Retrieval.Results))
+	embeddingSpaceIDs := make(
+		[]string, len(r.Retrieval.EmbeddingSpaceIDs))
+	for index, id := range r.Retrieval.EmbeddingSpaceIDs {
+		embeddingSpaceIDs[index] = encodeID(id)
+	}
 	for _, result := range r.Retrieval.Results {
 		evidence := make([]any, 0, len(result.Evidence))
 		for _, item := range result.Evidence {
@@ -550,10 +555,15 @@ func (r RetrievalResponse) MarshalJSON() ([]byte, error) {
 		Restricted uint32                    `json:"restricted,omitempty"`
 		Embedding  *wireEmbeddingQueryReport `json:"embedding,omitempty"`
 	}{r.Snapshot, struct {
-		RequestID string `json:"request_id,omitempty"`
-		Results   []any  `json:"results"`
+		RequestID         string   `json:"request_id,omitempty"`
+		EmbeddingSpaceID  string   `json:"embedding_space_id,omitempty"`
+		EmbeddingSpaceIDs []string `json:"embedding_space_ids,omitempty"`
+		Results           []any    `json:"results"`
 	}{
-		encodeOptionalID(r.Retrieval.RequestID), results,
+		encodeOptionalID(r.Retrieval.RequestID),
+		encodeOptionalID(r.Retrieval.EmbeddingSpaceID),
+		embeddingSpaceIDs,
+		results,
 	}, r.Suppressed, r.Restricted, wireEmbeddingQueryReportValue(r.Embedding)})
 }
 
@@ -561,8 +571,10 @@ func (r *RetrievalResponse) UnmarshalJSON(data []byte) error {
 	var wire struct {
 		Snapshot  Snapshot `json:"snapshot"`
 		Retrieval struct {
-			RequestID string `json:"request_id,omitempty"`
-			Results   []struct {
+			RequestID         string   `json:"request_id,omitempty"`
+			EmbeddingSpaceID  string   `json:"embedding_space_id,omitempty"`
+			EmbeddingSpaceIDs []string `json:"embedding_space_ids,omitempty"`
+			Results           []struct {
 				ID       string      `json:"id"`
 				Score    shoal.Score `json:"score"`
 				Evidence []struct {
@@ -584,6 +596,20 @@ func (r *RetrievalResponse) UnmarshalJSON(data []byte) error {
 	requestID, err := decodeOptionalID(wire.Retrieval.RequestID)
 	if err != nil {
 		return fmt.Errorf("retrieval.request_id: %w", err)
+	}
+	embeddingSpaceID, err := decodeOptionalID(
+		wire.Retrieval.EmbeddingSpaceID)
+	if err != nil {
+		return fmt.Errorf("retrieval.embedding_space_id: %w", err)
+	}
+	embeddingSpaceIDs := make(
+		[]shoal.ID, len(wire.Retrieval.EmbeddingSpaceIDs))
+	for index, encoded := range wire.Retrieval.EmbeddingSpaceIDs {
+		embeddingSpaceIDs[index], err = decodeID(encoded)
+		if err != nil {
+			return fmt.Errorf(
+				"retrieval.embedding_space_ids: %w", err)
+		}
 	}
 	results := make([]retrieval.Result, 0, len(wire.Retrieval.Results))
 	for _, item := range wire.Retrieval.Results {
@@ -626,8 +652,13 @@ func (r *RetrievalResponse) UnmarshalJSON(data []byte) error {
 		}
 	}
 	*r = RetrievalResponse{
-		Snapshot:   wire.Snapshot,
-		Retrieval:  retrieval.Response{RequestID: requestID, Results: results},
+		Snapshot: wire.Snapshot,
+		Retrieval: retrieval.Response{
+			RequestID:         requestID,
+			EmbeddingSpaceID:  embeddingSpaceID,
+			EmbeddingSpaceIDs: embeddingSpaceIDs,
+			Results:           results,
+		},
 		Suppressed: wire.Suppressed,
 		Restricted: wire.Restricted,
 		Embedding:  embedding,
@@ -666,6 +697,7 @@ func wireEmbeddingQueryReportValue(
 	}
 	return &wireEmbeddingQueryReport{
 		Spaces: spaces, FanoutLimit: report.FanoutLimit,
+		CacheHits: report.CacheHits, ProviderCalls: report.ProviderCalls,
 		Observed: report.Observed, Suppressed: report.Suppressed,
 		Restricted: report.Restricted, Degraded: report.Degraded,
 		FanoutExceeded: report.FanoutExceeded,
@@ -678,13 +710,10 @@ func embeddingQueryReportValue(
 	if wire == nil {
 		return nil, nil
 	}
-	if wire.CacheHits != 0 || wire.ProviderCalls != 0 {
-		return nil, fmt.Errorf(
-			"embedding cache/provider counters are operator-only")
-	}
 	report := &authorized.EmbeddingQueryReport{
 		FanoutLimit: wire.FanoutLimit,
-		Observed:    wire.Observed, Suppressed: wire.Suppressed,
+		CacheHits:   wire.CacheHits, ProviderCalls: wire.ProviderCalls,
+		Observed: wire.Observed, Suppressed: wire.Suppressed,
 		Restricted: wire.Restricted, Degraded: wire.Degraded,
 		FanoutExceeded: wire.FanoutExceeded,
 	}
@@ -735,19 +764,22 @@ func embeddingQueryReportValue(
 
 func (r NeighborhoodResponse) MarshalJSON() ([]byte, error) {
 	return json.Marshal(struct {
-		Snapshot     Snapshot `json:"snapshot"`
-		Neighborhood any      `json:"neighborhood"`
-		Truncated    bool     `json:"truncated"`
-		NextCursor   string   `json:"next_cursor,omitempty"`
-	}{r.Snapshot, wireNeighborhoodValue(r.Neighborhood), r.Truncated, r.NextCursor})
+		Snapshot                Snapshot                       `json:"snapshot"`
+		Neighborhood            any                            `json:"neighborhood"`
+		OntologyInterpretations []OntologyInterpretationReport `json:"ontology_interpretations,omitempty"`
+		Truncated               bool                           `json:"truncated"`
+		NextCursor              string                         `json:"next_cursor,omitempty"`
+	}{r.Snapshot, wireNeighborhoodValue(r.Neighborhood), r.OntologyInterpretations,
+		r.Truncated, r.NextCursor})
 }
 
 func (r *NeighborhoodResponse) UnmarshalJSON(data []byte) error {
 	var wire struct {
-		Snapshot     Snapshot         `json:"snapshot"`
-		Neighborhood wireNeighborhood `json:"neighborhood"`
-		Truncated    bool             `json:"truncated"`
-		NextCursor   string           `json:"next_cursor,omitempty"`
+		Snapshot                Snapshot                       `json:"snapshot"`
+		Neighborhood            wireNeighborhood               `json:"neighborhood"`
+		OntologyInterpretations []OntologyInterpretationReport `json:"ontology_interpretations,omitempty"`
+		Truncated               bool                           `json:"truncated"`
+		NextCursor              string                         `json:"next_cursor,omitempty"`
 	}
 	if err := strictUnmarshal(data, &wire); err != nil {
 		return err
@@ -758,7 +790,8 @@ func (r *NeighborhoodResponse) UnmarshalJSON(data []byte) error {
 	}
 	*r = NeighborhoodResponse{
 		Snapshot: wire.Snapshot, Neighborhood: neighborhood,
-		Truncated: wire.Truncated, NextCursor: wire.NextCursor,
+		OntologyInterpretations: wire.OntologyInterpretations,
+		Truncated:               wire.Truncated, NextCursor: wire.NextCursor,
 	}
 	return nil
 }
@@ -769,17 +802,19 @@ func (r PathResponse) MarshalJSON() ([]byte, error) {
 		assertions = append(assertions, wireAssertionValue(assertion))
 	}
 	return json.Marshal(struct {
-		Snapshot   Snapshot        `json:"snapshot"`
-		Path       wirePath        `json:"path"`
-		Assertions []wireAssertion `json:"assertions,omitempty"`
-	}{r.Snapshot, wirePathValue(r.Path), assertions})
+		Snapshot                Snapshot                       `json:"snapshot"`
+		Path                    wirePath                       `json:"path"`
+		Assertions              []wireAssertion                `json:"assertions,omitempty"`
+		OntologyInterpretations []OntologyInterpretationReport `json:"ontology_interpretations,omitempty"`
+	}{r.Snapshot, wirePathValue(r.Path), assertions, r.OntologyInterpretations})
 }
 
 func (r *PathResponse) UnmarshalJSON(data []byte) error {
 	var wire struct {
-		Snapshot   Snapshot        `json:"snapshot"`
-		Path       wirePath        `json:"path"`
-		Assertions []wireAssertion `json:"assertions,omitempty"`
+		Snapshot                Snapshot                       `json:"snapshot"`
+		Path                    wirePath                       `json:"path"`
+		Assertions              []wireAssertion                `json:"assertions,omitempty"`
+		OntologyInterpretations []OntologyInterpretationReport `json:"ontology_interpretations,omitempty"`
 	}
 	if err := strictUnmarshal(data, &wire); err != nil {
 		return err
@@ -798,6 +833,7 @@ func (r *PathResponse) UnmarshalJSON(data []byte) error {
 	}
 	*r = PathResponse{
 		Snapshot: wire.Snapshot, Path: path, Assertions: assertions,
+		OntologyInterpretations: wire.OntologyInterpretations,
 	}
 	return nil
 }

@@ -21,6 +21,8 @@ package explorer_test
 
 import (
 	"context"
+	"fmt"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -91,8 +93,13 @@ func recordedSession(
 ) interaction.Session {
 	t.Helper()
 	session := interaction.Session{
-		ID:         id,
-		RecordedAt: time.Unix(1700000000, 0).UTC(),
+		ID:                       id,
+		RecordedAt:               time.Unix(1700000000, 0).UTC(),
+		SnapshotID:               "snapshot-observed",
+		SnapshotAsOf:             time.Unix(1699999900, 0).UTC(),
+		AuthorizationFingerprint: "auth-sha256:test",
+		AuthorizationExpiresAt:   time.Unix(1700003600, 0).UTC(),
+		EmbeddingSpaceID:         "embedding-space-test",
 		Provenance: interaction.Provenance{
 			Harness:  "shoal.harness.v1",
 			Provider: "fake",
@@ -126,6 +133,7 @@ func TestInteractionVisibilityIsConjunctionOfTouchedSpans(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	defer corpus.Close()
 
 	restricted := ingestVisible(
@@ -190,6 +198,393 @@ func TestInteractionVisibilityIsConjunctionOfTouchedSpans(t *testing.T) {
 	}
 	if citedRestricted {
 		t.Fatal("restricted span was not cited but has a cited edge")
+	}
+}
+
+func TestInteractionHydratesAllProvenanceWithoutMovingSnapshot(t *testing.T) {
+	ctx := context.Background()
+	dataDir := t.TempDir()
+	corpus, err := explorer.Open(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer corpus.Close()
+
+	var source strings.Builder
+	for index := 0; index < 25; index++ {
+		source.WriteString("# Section ")
+		source.WriteString(strconv.Itoa(index))
+		source.WriteString("\n\nsource token ")
+		source.WriteString(strconv.Itoa(index))
+		source.WriteString("\n\n")
+	}
+	spans := ingestVisible(
+		t, corpus, "file:///many.md", source.String(), "ops")
+	if len(spans) < 21 {
+		t.Fatalf("ingest produced %d spans, want at least 21", len(spans))
+	}
+	before, err := corpus.Snapshot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := recordedSession(
+		t, corpus, "session-durable", spans, []shoal.ID{spans[len(spans)-1]})
+	after, err := corpus.Snapshot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if before != after {
+		t.Fatalf("interaction write moved content snapshot: before=%+v after=%+v",
+			before, after)
+	}
+	if err := corpus.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := explorer.Open(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	hydrated, err := reopened.Interaction(ctx, session.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hydrated.SnapshotID != session.SnapshotID ||
+		!hydrated.SnapshotAsOf.Equal(session.SnapshotAsOf) ||
+		hydrated.AuthorizationFingerprint != session.AuthorizationFingerprint ||
+		!hydrated.AuthorizationExpiresAt.Equal(session.AuthorizationExpiresAt) ||
+		hydrated.EmbeddingSpaceID != session.EmbeddingSpaceID {
+		t.Fatalf("hydrated pins = %+v, want %+v", hydrated, session)
+	}
+	if len(hydrated.SeedNodeIDs) != len(spans) ||
+		hydrated.SeedNodeIDs[len(hydrated.SeedNodeIDs)-1] != spans[len(spans)-1] {
+		t.Fatalf("hydrated retrieved IDs = %d, late source was lost",
+			len(hydrated.SeedNodeIDs))
+	}
+	subgraph, err := reopened.InteractionSubgraph(ctx, session.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	retrieved, cited := 0, 0
+	inferenceFound := false
+	for _, node := range subgraph.Nodes {
+		if node.ID == interaction.InferenceID(session.ID) &&
+			node.Kind == interaction.KindInference {
+			inferenceFound = true
+		}
+	}
+	for _, edge := range subgraph.Edges {
+		switch edge.Type {
+		case interaction.EdgeRetrieved:
+			retrieved++
+		case interaction.EdgeCited:
+			cited++
+		}
+	}
+	if !inferenceFound || retrieved != len(spans)*2 || cited != 1 {
+		t.Fatalf("inference=%t retrieved=%d cited=%d",
+			inferenceFound, retrieved, cited)
+	}
+}
+
+func TestGenericRecorderSurvivesRestartAndStaysSourceOnly(t *testing.T) {
+	ctx := context.Background()
+	dataDir := t.TempDir()
+	corpus, err := explorer.Open(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	spans := ingestVisible(
+		t, corpus, "file:///generic-retrieval.md", publicMarkdown, "ops")
+	before, err := corpus.Snapshot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recordedAt := before.AsOf.Add(time.Second)
+	recorder, err := interaction.NewRecorder(ctx, corpus)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := recorder.SetClock(func() time.Time { return recordedAt }); err != nil {
+		t.Fatal(err)
+	}
+	sessionID, err := interaction.OperationSessionID(
+		interaction.OperationRetrieval, "retrieval-request-1", recordedAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reason, err := interaction.NewReason(
+		"retrieve_context", "assemble grounded context")
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorded, err := recorder.Record(ctx, interaction.Session{
+		ID:        sessionID,
+		Operation: interaction.OperationRetrieval,
+		Actor: interaction.ActorContext{
+			SubjectID:  "subject-1",
+			ActorID:    "agent-1",
+			ClientID:   "client-1",
+			OnBehalfOf: []shoal.ID{"delegate-1", "delegate-2"},
+		},
+		Reason:                   reason,
+		SnapshotID:               shoal.ID(before.ID),
+		SnapshotAsOf:             before.AsOf,
+		AuthorizationFingerprint: "auth-sha256:generic-recorder",
+		AuthorizationExpiresAt:   before.AsOf.Add(time.Hour),
+		SeedNodeIDs:              spans,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	after, err := corpus.Snapshot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if before != after {
+		t.Fatalf("generic recorder moved snapshot: before=%+v after=%+v",
+			before, after)
+	}
+	response, err := corpus.Retrieve(ctx, retrieval.Request{
+		Text:  "exponential backoff",
+		TopK:  50,
+		Modes: []retrieval.Mode{retrieval.ModeLexical},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, result := range response.Results {
+		if interaction.IsInteractionID(result.ID) {
+			t.Fatalf("default retrieval returned derived result %q", result.ID)
+		}
+	}
+	if err := corpus.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := explorer.Open(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	hydrated, err := reopened.Interaction(ctx, recorded.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	summaries, err := reopened.Interactions(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(summaries) != 1 || summaries[0].InferenceID != "" {
+		t.Fatalf("generic interaction summary = %+v", summaries)
+	}
+	if hydrated.Operation != interaction.OperationRetrieval ||
+		hydrated.Actor.SubjectID != "subject-1" ||
+		hydrated.Actor.ActorID != "agent-1" ||
+		hydrated.Actor.ClientID != "client-1" ||
+		len(hydrated.Actor.OnBehalfOf) != 2 ||
+		hydrated.Reason != reason {
+		t.Fatalf("restarted interaction = %+v", hydrated)
+	}
+	subgraph, err := reopened.InteractionSubgraph(ctx, recorded.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, node := range subgraph.Nodes {
+		if node.Kind == interaction.KindInference {
+			t.Fatal("generic retrieval acquired an inference node after restart")
+		}
+	}
+
+}
+
+func TestGeneratedInteractionNodeIDsCannotCollide(t *testing.T) {
+	ctx := context.Background()
+	corpus, err := explorer.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer corpus.Close()
+	spans := ingestVisible(
+		t, corpus, "file:///collision.md", publicMarkdown, "ops")
+
+	const futureSessionID shoal.ID = "future-session"
+	collidingID := interaction.InferenceID(futureSessionID)
+	session := recordedSession(
+		t, corpus, "template-session", spans[:1], spans[:1])
+	session.ID = collidingID
+	if err := corpus.RecordInteraction(
+		ctx, session,
+	); !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
+		t.Fatalf("reserved inference-node ID accepted as a session: %v", err)
+	}
+
+	recordedSession(
+		t, corpus, "delete-target", spans[:1], spans[:1])
+	tombstoneCollisionID := interaction.TombstoneID("delete-target")
+	session.ID = tombstoneCollisionID
+	if err := corpus.RecordInteraction(
+		ctx, session,
+	); !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
+		t.Fatalf("reserved tombstone-node ID accepted as a session: %v", err)
+	}
+	if _, err := corpus.DeleteInteraction(ctx, "delete-target"); err != nil {
+		t.Fatalf("reserved ID prevented deletion: %v", err)
+	}
+}
+
+func TestFutureSourceCannotCollideWithRecordedSessionID(t *testing.T) {
+	ctx := context.Background()
+	futureSource := explorer.Source{
+		URI:       "file:///future-collision.txt",
+		MediaType: explorer.MediaTypeText,
+		Content:   "future source collision",
+	}
+	probe, err := explorer.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt, err := probe.Ingest(ctx, futureSource)
+	if err != nil {
+		t.Fatal(err)
+	}
+	view, err := probe.Document(ctx, receipt.Document.ID, receipt.Revision.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	futureNodeID := view.Root.Spans[0].ID
+	if err := probe.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	corpus, err := explorer.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer corpus.Close()
+	if err := corpus.RecordInteraction(ctx, interaction.Session{
+		ID:         futureNodeID,
+		RecordedAt: time.Unix(1700000000, 0).UTC(),
+		Operation:  interaction.OperationRetrieval,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := corpus.Ingest(
+		ctx, futureSource,
+	); !shoal.IsErrorCode(err, shoal.ErrorConflict) {
+		t.Fatalf("future source collision error = %v", err)
+	}
+	if _, err := corpus.Interaction(ctx, futureNodeID); err != nil {
+		t.Fatalf("collision attempt damaged interaction: %v", err)
+	}
+}
+
+func TestRecordInteractionExactRetryIsIdempotent(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	corpus, err := explorer.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := interaction.Session{
+		ID:         interaction.DerivedID("session", "idempotent"),
+		RecordedAt: time.Unix(1700000000, 0).UTC(),
+		Operation:  interaction.OperationRetrieval,
+	}
+	if err := corpus.RecordInteraction(ctx, session); err != nil {
+		t.Fatal(err)
+	}
+	if err := corpus.RecordInteraction(ctx, session); err != nil {
+		t.Fatalf("exact retry failed: %v", err)
+	}
+	if err := corpus.Close(); err != nil {
+		t.Fatal(err)
+	}
+	corpus, err = explorer.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer corpus.Close()
+	if err := corpus.RecordInteraction(ctx, session); err != nil {
+		t.Fatalf("exact retry after restart failed: %v", err)
+	}
+	different := session
+	different.StopReason = "different"
+	if err := corpus.RecordInteraction(
+		ctx, different,
+	); !shoal.IsErrorCode(err, shoal.ErrorConflict) {
+		t.Fatalf("conflicting retry error = %v", err)
+	}
+}
+
+func TestOversizedVisibilityPersistsAcrossRestart(t *testing.T) {
+	ctx := context.Background()
+	dataDir := t.TempDir()
+	corpus, err := explorer.Open(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const count = 70
+	var spans []shoal.ID
+	labels := make([]string, count)
+	for index := 0; index < count; index++ {
+		label := fmt.Sprintf(
+			"label-%03d-%s", index, strings.Repeat("x", 56))
+		labels[index] = label
+		visible := ingestVisible(
+			t,
+			corpus,
+			fmt.Sprintf("file:///visibility-%03d.md", index),
+			fmt.Sprintf("# Source %d\n\nvalue %d\n", index, index),
+			label,
+		)
+		spans = append(spans, visible[0])
+	}
+	expected := strings.Join(labels, "&")
+	if len(expected) <= shoal.MaxMetadataValueBytes {
+		t.Fatal("fixture did not exceed the graph metadata value bound")
+	}
+	recordedSession(
+		t, corpus, "session-oversized-visibility", spans, spans[len(spans)-1:])
+	subgraph, err := corpus.InteractionSubgraph(
+		ctx, "session-oversized-visibility")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sessionNode graph.Node
+	for _, node := range subgraph.Nodes {
+		if node.Kind == interaction.KindSession {
+			sessionNode = node
+			break
+		}
+	}
+	if sessionNode.Properties[interaction.PropertyVisibility] != "" ||
+		sessionNode.Properties[interaction.PropertyVisibilityDigest] !=
+			interaction.Digest(expected) ||
+		sessionNode.Properties[interaction.PropertyVisibilityCount] !=
+			strconv.Itoa(count) {
+		t.Fatalf("oversized visibility markers = %+v", sessionNode.Properties)
+	}
+	if err := corpus.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := explorer.Open(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	summaries, err := reopened.Interactions(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(summaries) != 1 {
+		t.Fatalf("reopened summaries = %+v", summaries)
+	}
+	if summaries[0].Visibility != expected {
+		t.Fatalf("reopened visibility length=%d, want %d",
+			len(summaries[0].Visibility), len(expected))
 	}
 }
 

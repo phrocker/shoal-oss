@@ -29,6 +29,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 )
 
 // TestListenAddressIsLoopback pins the classification that decides whether the
@@ -278,6 +280,11 @@ func TestSelectAuthenticatorFailsClosed(t *testing.T) {
 	if decision.Subject() != developmentSubject {
 		t.Fatalf("development subject = %q", decision.Subject())
 	}
+	if !operationsContain(
+		decision.AllowedOperations(), auth.OperationDelegate,
+	) {
+		t.Fatal("development principal cannot register delegated agents")
+	}
 	second, err := authenticator.Authenticate(request)
 	if err != nil {
 		t.Fatal(err)
@@ -389,6 +396,26 @@ func TestRunServesLoopbackDevelopmentPrincipal(t *testing.T) {
 	listed := postJSON(t, "http://"+address+"/api/v1/documents", `{"page":{"limit":10}}`)
 	if !strings.Contains(string(listed), "uploaded.md") {
 		t.Fatalf("workspace upload was not authorized for listing: %s", listed)
+	}
+	for _, route := range []string{
+		"/api/v1/fleet/agents",
+		"/api/v1/fleet/events/subscriptions",
+		"/api/v1/fleet/events/publish",
+	} {
+		response, err := client.Post(
+			"http://"+address+route,
+			"application/json",
+			strings.NewReader(`{}`),
+		)
+		if err != nil {
+			t.Fatalf("%s: %v", route, err)
+		}
+		_, _ = io.Copy(io.Discard, response.Body)
+		response.Body.Close()
+		if response.StatusCode == http.StatusNotFound ||
+			response.StatusCode == http.StatusMethodNotAllowed {
+			t.Fatalf("%s was not mounted: status = %s", route, response.Status)
+		}
 	}
 	cancel()
 	select {

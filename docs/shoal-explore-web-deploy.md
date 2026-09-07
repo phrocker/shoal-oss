@@ -161,8 +161,8 @@ closed. Authentication never falls back to anonymous or development authority.
 | `-oidc-issuer` / `SHOAL_OIDC_ISSUER` | Exact issuer required in both the discovery document and token. |
 | `-oidc-audience` / `SHOAL_OIDC_AUDIENCE` | Comma-separated accepted token audiences; at least one exact match is required. |
 | `-oidc-authorization-claim` / `SHOAL_OIDC_AUTHORIZATION_CLAIM` | Exact top-level string or string-array claim whose values are mapped to authority. |
-| `-oidc-reader-values` / `SHOAL_OIDC_READER_VALUES` | Comma-separated claim values granting list, read, connect, neighborhood, and retrieve. |
-| `-oidc-contributor-values` / `SHOAL_OIDC_CONTRIBUTOR_VALUES` | Comma-separated claim values granting the reader operations plus ingest. |
+| `-oidc-reader-values` / `SHOAL_OIDC_READER_VALUES` | Comma-separated claim values granting list, read, connect, neighborhood, retrieve, workspace-settings read, and agent resolve. |
+| `-oidc-contributor-values` / `SHOAL_OIDC_CONTRIBUTOR_VALUES` | Comma-separated claim values granting the reader operations plus ingest, workspace-settings write, agent register/heartbeat/revoke, and delegation for child-agent registration. |
 
 At least one reader or contributor value is required. A missing, malformed, or
 unmapped authorization claim is denied before a service operation runs.
@@ -266,6 +266,97 @@ at the chosen identity provider, permit CORS for the token endpoint, and grant
 the scopes named by `-oidc-browser-scope`. The browser sends no client secret.
 The server validates the resulting access token independently against its
 issuer, audience, signature, time, and claim-mapping configuration.
+
+## Streamable HTTP MCP
+
+The same authenticated workspace exposes MCP `2025-11-25` at `/mcp`. It uses
+the documented Streamable HTTP lifecycle: `POST initialize`, the returned
+`MCP-Session-Id`, `POST notifications/initialized`, and a
+`MCP-Protocol-Version: 2025-11-25` header on every subsequent request. Clients
+must advertise both `application/json` and `text/event-stream` in `Accept`;
+this implementation returns synchronous JSON responses and answers `GET /mcp`
+with `405 Method Not Allowed` because it emits no unsolicited SSE messages.
+
+`/mcp` is mounted inside the existing `webapi.Handler`, not beside it. Host
+authority validation and the configured development/OIDC authenticator
+therefore run before every MCP request. Every request must also carry exactly
+one `Shoal-Workspace-ID` header containing the unpadded base64url encoding of
+the owned workspace ID. Workspace settings narrow the issuer decision before
+MCP dispatch and lower retrieval, graph, output, and context limits. Session
+IDs retain lifecycle state only, are cryptographically random, and are bound to
+the caller's authorization fingerprint plus the effective workspace ID,
+settings ID, revision, cache dimensions, and limits. Another principal or
+workspace cannot reuse one; a policy-generation or settings change makes the
+old session absent. The initialize result reports the applied values in
+`_meta["shoal.workspace"]`. An `Origin`, when present, must exactly match an
+HTTP or HTTPS origin derived from the configured allowed Host authorities.
+
+Generic MCP tool calls are durably recorded as `OperationToolCall` through the
+authorized Explorer client. Recording is mandatory and fail-closed. Mutations
+receive a durable admission record before dispatch; if their post-effect
+outcome record fails, the response is explicitly indeterminate and directs the
+caller to inspect current state before considering a retry. The first-party command advertises `shoal.ask`,
+`shoal.provenance.{list,inspect,fold,unfold}`, and, when the embedded Fleet
+providers are available, `shoal.agent_dispatch` and `shoal.agent_invoke`.
+They use the same chat, interaction, registry, and dispatch providers as the
+HTTP API; no second reasoning or action pipeline is constructed.
+Ask observations preserve the exact complete evidence accepted with the durable
+interaction, including citations, nodes, edges, assertions, visibility, and
+embedding-space identities. Direct `shoal.retrieve` results also receive an
+independent retrieval capture in addition to the generic tool-call record.
+Provenance listing is bounded to 100 records by default (1,000 maximum) and
+returns an opaque `next_cursor` for both HTTP and MCP callers.
+`OperationToolCall` is only a provenance discriminator; the canonical
+authorized operation is stored separately, actor/delegation metadata comes only
+from the bound decision, and the authorized client derives the hashed
+audit-purpose reason. Grounded evidence remains reauthorized with the legacy
+`retrieve` operation, while source-free actions need only their exact authorized
+action. Fleet action tools must separately enforce that exact `auth.Operation`
+before effects.
+
+## Durable Fleet registry, dispatch, and events
+
+The embedded command composes the durable registry and dispatch services on
+the same transaction runtime, mounts their combined handler once at
+`/api/v1/fleet/`, and mounts the more-specific event subtree at
+`/api/v1/fleet/events/` through the same authenticated workspace handler.
+Register, heartbeat, revoke, resolve, list, enqueue, claim, cancel, status,
+pull, invoke, subscription, publication, and delivery operations use the same
+bound authorization resolver. Missing recorder, snapshot, generation, cursor,
+registry, dispatch, or event dependencies fail startup rather than advertising
+partial functionality. Every
+privileged mutation first records an `OperationToolCall` interaction carrying
+the exact `agent_*` authorization operation, decision fingerprint/expiry, and a
+fresh trusted interaction snapshot. The adapter supplies no actor or reason;
+the authorized interaction client derives trusted identity fields and validates
+the exact persisted receipt.
+
+Registry list requests accept an optional `limit` (default 25, maximum 32) and
+opaque `cursor`. Responses return at most that many authorized descriptors and
+an optional `next_cursor`; filtering advances through a bounded number of
+stored descriptors per request.
+
+Executor references are host-owned opaque capabilities. Configure their
+allowlist with `-fleet-executor-refs` or `SHOAL_FLEET_EXECUTOR_REFS` as a
+comma-separated list. An empty list is valid but fail-closed: registry reads
+remain available while new registrations are rejected because no executor is
+known to the host.
+
+Dispatch transitions publish stable `action.enqueued`, `action.claimed`,
+`action.completed`, `action.canceled`, and `action.failed` events. Raw
+idempotency, claim, executor, and cancellation keys remain private; envelopes
+carry the producer generation and an opaque hashed transition identity.
+Lifecycle publication reauthorizes the original exact `dispatch` or `invoke`
+operation and retains complete representable evidence. Subscription delivery
+uses the dedicated `subscription_deliver` operation and rechecks the shared
+policy-generation authority during long polls.
+
+Fleet event cursors are AES-GCM-protected, restart-stable, and scoped to the
+subscription and authorization identity. Event and subscription storage use
+4,096 bounded logical slots with an event-local durable retention floor.
+Expired publication retries fail closed. Historical physical cell-version
+cleanup remains the responsibility of normal Explorer storage compaction; the
+event subsystem does not advance a shared allocator history floor.
 
 ## Host authority (required for a public bind)
 

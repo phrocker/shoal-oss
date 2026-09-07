@@ -49,7 +49,13 @@ type Explorer struct {
 	documents               map[shoal.ID]map[shoal.ID]*persistedDocument
 	edges                   map[shoal.ID]persistedEdge
 	interactions            map[shoal.ID]*persistedInteraction
+	interactionLiveRecords  map[shoal.ID]*persistedInteraction
+	interactionOrder        []shoal.ID
 	folds                   map[shoal.ID]*persistedFold
+	foldLiveRecords         map[shoal.ID]*persistedFold
+	foldOrder               []shoal.ID
+	interactionNodeIDs      map[shoal.ID]struct{}
+	interactionEdgeIDs      map[shoal.ID]struct{}
 	extractions             map[shoal.ID]*persistedExtraction
 	ontologyProposals       map[shoal.ID]*persistedOntologyProposal
 	graphNodes              map[shoal.ID]graph.Node
@@ -74,10 +80,14 @@ type Explorer struct {
 	vectorProbeMu           sync.Mutex
 	vectorAvailability      vectorAvailabilityCache
 	snapshot                Snapshot
+	snapshotHistory         map[string]time.Time
+	sourceNodeBirth         map[shoal.ID]time.Time
+	sourceEdgeBirth         map[shoal.ID]time.Time
 	snapshotAnchor          time.Time
 	lastPublicationSequence uint64
 	changeHistoryFloor      uint64
 	changeCursorKey         []byte
+	interactionRecordWriter func([]byte, byte, any) error
 	readOnly                bool
 	publication             RecordPublicationAdapter
 	ownsEngine              bool
@@ -311,7 +321,11 @@ func openWithEngine(
 		documents:               make(map[shoal.ID]map[shoal.ID]*persistedDocument),
 		edges:                   make(map[shoal.ID]persistedEdge),
 		interactions:            make(map[shoal.ID]*persistedInteraction),
+		interactionLiveRecords:  make(map[shoal.ID]*persistedInteraction),
 		folds:                   make(map[shoal.ID]*persistedFold),
+		foldLiveRecords:         make(map[shoal.ID]*persistedFold),
+		interactionNodeIDs:      make(map[shoal.ID]struct{}),
+		interactionEdgeIDs:      make(map[shoal.ID]struct{}),
 		extractions:             make(map[shoal.ID]*persistedExtraction),
 		ontologyProposals:       make(map[shoal.ID]*persistedOntologyProposal),
 		embedder:                options.Embedder,
@@ -323,12 +337,17 @@ func openWithEngine(
 		recallEvidence:          cloneStringMap(options.RecallEvidence),
 		latentLinkProjection:    latentProjection,
 		maxLatentAssertions:     maxLatentAssertions,
+		snapshotHistory:         make(map[string]time.Time),
+		sourceNodeBirth:         make(map[shoal.ID]time.Time),
+		sourceEdgeBirth:         make(map[shoal.ID]time.Time),
 		readOnly:                options.ReadOnly,
 		publication:             publication,
 	}
 	if err := explorer.load(); err != nil {
 		return nil, err
 	}
+	explorer.interactionLiveRecords = nil
+	explorer.foldLiveRecords = nil
 	if explorer.snapshotAnchor.IsZero() {
 		explorer.snapshotAnchor = time.Now().UTC()
 		if !explorer.readOnly {
@@ -511,6 +530,15 @@ func (e *Explorer) ingest(
 			return IngestResult{}, err
 		}
 	}
+	if e.lastPublicationSequence == math.MaxUint64 {
+		return IngestResult{}, shoal.NewError(
+			shoal.ErrorUnavailable, "embedded publication sequence is exhausted")
+	}
+	if err := e.requireSourceGraphIDsAvailableLocked(
+		record.Nodes, record.Edges,
+	); err != nil {
+		return IngestResult{}, err
+	}
 	if record.Embeddings != nil {
 		if err := e.ensureEmbeddingSpaceCompatibleLocked(
 			record.Embeddings.Provenance,
@@ -551,6 +579,8 @@ func (e *Explorer) ingest(
 	if e.documents[record.Document.ID] == nil {
 		e.documents[record.Document.ID] = make(map[shoal.ID]*persistedDocument)
 	}
+	e.registerSourceNodeBirthLocked(record.Nodes, record.PublishedAt)
+	e.registerSourceEdgeBirthLocked(record.Edges, record.PublishedAt)
 	e.documents[record.Document.ID][record.Revision.ID] = record
 	e.invalidateVectorAvailabilityLocked()
 	if e.graphInitialized {
@@ -559,6 +589,42 @@ func (e *Explorer) ingest(
 		}
 	}
 	return ingestResult(record, IngestApplied), nil
+}
+
+func (e *Explorer) registerSourceNodeBirthLocked(
+	nodes []graph.Node, publishedAt time.Time,
+) {
+	if publishedAt.IsZero() {
+		return
+	}
+	publishedAt = publishedAt.UTC()
+	for _, node := range nodes {
+		if interaction.IsInteractionKind(node.Kind) {
+			continue
+		}
+		if existing, ok := e.sourceNodeBirth[node.ID]; !ok ||
+			publishedAt.Before(existing) {
+			e.sourceNodeBirth[node.ID] = publishedAt
+		}
+	}
+}
+
+func (e *Explorer) registerSourceEdgeBirthLocked(
+	edges []graph.Edge, publishedAt time.Time,
+) {
+	if publishedAt.IsZero() {
+		return
+	}
+	publishedAt = publishedAt.UTC()
+	for _, edge := range edges {
+		if interaction.IsInteractionEdgeType(edge.Type) {
+			continue
+		}
+		if existing, ok := e.sourceEdgeBirth[edge.ID]; !ok ||
+			publishedAt.Before(existing) {
+			e.sourceEdgeBirth[edge.ID] = publishedAt
+		}
+	}
 }
 
 // Documents lists the newest revision of every document.
@@ -658,6 +724,12 @@ func (e *Explorer) Connect(ctx context.Context, edge graph.Edge) error {
 	if err := validatePersistedEdge(edge); err != nil {
 		return err
 	}
+	if interaction.IsInteractionID(edge.ID) {
+		return shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			"applications cannot use the reserved interaction edge ID namespace",
+		)
+	}
 	if interaction.IsInteractionEdgeType(edge.Type) {
 		return shoal.NewError(
 			shoal.ErrorInvalidArgument,
@@ -713,11 +785,18 @@ func (e *Explorer) Connect(ctx context.Context, edge graph.Edge) error {
 		}
 		return shoal.NewError(shoal.ErrorConflict, "edge ID already has different content")
 	}
+	if err := e.requireSourceGraphIDsAvailableLocked(
+		nil, []graph.Edge{edge},
+	); err != nil {
+		return err
+	}
 	record := persistedEdge{Edge: cloneEdge(edge), PublishedAt: time.Now().UTC()}
 	if err := e.writeRecord(edgeRecordRow(edge.ID), embeddedRecordEdge, record); err != nil {
 		return err
 	}
 	e.edges[edge.ID] = record
+	e.registerSourceEdgeBirthLocked(
+		[]graph.Edge{record.Edge}, record.PublishedAt)
 	e.graphEdges[edge.ID] = cloneEdge(edge)
 	e.outgoing[edge.From] = append(e.outgoing[edge.From], edge.ID)
 	sort.Slice(e.outgoing[edge.From], func(i, j int) bool {
@@ -936,6 +1015,13 @@ func (e *Explorer) computeCurrentGraph() (
 	// revision) is dropped so the graph stays connected and valid.
 	for _, record := range e.interactions {
 		for _, node := range record.Nodes {
+			if existing, exists := nodes[node.ID]; exists &&
+				!nodesEqual(existing, node) {
+				return nil, nil, nil, shoal.NewError(
+					shoal.ErrorConflict,
+					"interaction node ID collides with source graph node",
+				)
+			}
 			nodes[node.ID] = node
 		}
 	}
@@ -943,6 +1029,13 @@ func (e *Explorer) computeCurrentGraph() (
 	// they inherit every default-exclusion rule sessions already have.
 	for _, record := range e.folds {
 		for _, node := range record.Nodes {
+			if existing, exists := nodes[node.ID]; exists &&
+				!nodesEqual(existing, node) {
+				return nil, nil, nil, shoal.NewError(
+					shoal.ErrorConflict,
+					"fold node ID collides with existing graph node",
+				)
+			}
 			nodes[node.ID] = node
 		}
 	}
@@ -1006,6 +1099,13 @@ func (e *Explorer) computeCurrentGraph() (
 			if _, to := nodes[edge.To]; !to {
 				continue
 			}
+			if existing, exists := edges[edge.ID]; exists &&
+				!edgesEqual(existing, edge) {
+				return nil, nil, nil, shoal.NewError(
+					shoal.ErrorConflict,
+					"interaction edge ID collides with source graph edge",
+				)
+			}
 			edges[edge.ID] = edge
 		}
 	}
@@ -1016,6 +1116,13 @@ func (e *Explorer) computeCurrentGraph() (
 			}
 			if _, to := nodes[edge.To]; !to {
 				continue
+			}
+			if existing, exists := edges[edge.ID]; exists &&
+				!edgesEqual(existing, edge) {
+				return nil, nil, nil, shoal.NewError(
+					shoal.ErrorConflict,
+					"fold edge ID collides with existing graph edge",
+				)
 			}
 			edges[edge.ID] = edge
 		}

@@ -156,9 +156,10 @@ func (r NeighborhoodRequest) Normalize() (NeighborhoodRequest, error) {
 
 // Neighborhood is a deterministic graph subgraph.
 type Neighborhood struct {
-	Nodes      []graph.Node
-	Edges      []graph.Edge
-	Assertions []ontology.Assertion
+	Nodes           []graph.Node
+	Edges           []graph.Edge
+	Assertions      []ontology.Assertion
+	Interpretations []ontology.AssertionInterpretation
 }
 
 // Snapshot identifies one immutable logical corpus frontier.
@@ -199,6 +200,10 @@ type BoundedNeighborhood struct {
 	Truncated       bool
 	NextAfterEdgeID shoal.ID
 	Continuation    bool
+	// ScannedEdges is the number of adjacency entries consumed to produce
+	// this page, including entries suppressed before materialization.
+	ScannedEdges      uint32
+	ScannedEdgesKnown bool
 }
 
 // BoundedClient is the backend boundary required by scalable Explorer

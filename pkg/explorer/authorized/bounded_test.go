@@ -29,6 +29,7 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/graph"
+	"github.com/phrocker/shoal-oss/pkg/ontology"
 	"github.com/phrocker/shoal-oss/pkg/retrieval"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
@@ -132,10 +133,11 @@ func TestBoundedNeighborhoodPagesPastHiddenEdges(t *testing.T) {
 	}
 	base := &pagedBoundedBase{view: view, nodes: canonical.nodes}
 	client, err := NewClient(Config{
-		Base:           base,
-		Resolver:       resolverFunc(func(context.Context) (auth.Decision, error) { return decision, nil }),
-		PolicySelector: selector,
-		PolicyStore:    store,
+		Base:                base,
+		OntologyInterpreter: base,
+		Resolver:            resolverFunc(func(context.Context) (auth.Decision, error) { return decision, nil }),
+		PolicySelector:      selector,
+		PolicyStore:         store,
 		GenerationReader: generationReaderFunc(func(context.Context, []byte) (int64, error) {
 			return 1, nil
 		}),
@@ -159,6 +161,9 @@ func TestBoundedNeighborhoodPagesPastHiddenEdges(t *testing.T) {
 	}
 	if got.Continuation || got.Truncated || got.NextAfterEdgeID != "" {
 		t.Fatalf("hidden base pagination leaked through result flags: %#v", got)
+	}
+	if got.ScannedEdgesKnown || got.ScannedEdges != 2 {
+		t.Fatalf("legacy scan accounting = %#v", got)
 	}
 }
 
@@ -276,6 +281,106 @@ func TestBoundedNeighborhoodFailsClosedWhenAuthorizedScanLimitExhausts(t *testin
 	}
 }
 
+func TestBoundedNeighborhoodChargesSuppressedEdgesAgainstScanLimit(t *testing.T) {
+	client, base := authorizedPaginationClient(t, false)
+	base.omittedOnly = true
+	_, err := client.BoundedNeighborhood(
+		context.Background(),
+		explorer.BoundedNeighborhoodRequest{
+			NodeIDs: []shoal.ID{"node-seed"}, Depth: 1,
+			Fanout: 1, MaxNodes: 2, MaxScannedEdges: 2,
+			Direction: explorer.GraphDirectionOutgoing,
+		},
+	)
+	if !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
+		t.Fatalf("suppressed-edge scan error = %v", err)
+	}
+	if base.calls != 2 {
+		t.Fatalf("suppressed-edge page calls = %d, want 2", base.calls)
+	}
+}
+
+func TestBoundedNeighborhoodPreservesKnownZeroScanCount(t *testing.T) {
+	client, base := authorizedPaginationClient(t, false)
+	base.knownZero = true
+	result, err := client.BoundedNeighborhood(
+		context.Background(),
+		explorer.BoundedNeighborhoodRequest{
+			NodeIDs: []shoal.ID{"node-seed"}, Depth: 1,
+			Fanout: 1, MaxNodes: 2, MaxScannedEdges: 1,
+			Direction:   explorer.GraphDirectionOutgoing,
+			AfterEdgeID: "edge-prior",
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.ScannedEdgesKnown || result.ScannedEdges != 0 {
+		t.Fatalf("known zero scan count = %#v", result)
+	}
+}
+
+func TestBoundedNeighborhoodRejectsKnownZeroAdvancingContinuation(t *testing.T) {
+	client, base := authorizedPaginationClient(t, false)
+	base.knownZeroContinuation = true
+	_, err := client.BoundedNeighborhood(
+		context.Background(),
+		explorer.BoundedNeighborhoodRequest{
+			NodeIDs: []shoal.ID{"node-seed"}, Depth: 1,
+			Fanout: 1, MaxNodes: 2, MaxScannedEdges: 1,
+			Direction: explorer.GraphDirectionOutgoing,
+		},
+	)
+	if !shoal.IsErrorCode(err, shoal.ErrorInternal) {
+		t.Fatalf("known-zero advancing continuation error = %v", err)
+	}
+	if base.calls != 1 {
+		t.Fatalf("malformed provider calls = %d, want 1", base.calls)
+	}
+}
+
+func TestBoundedNeighborhoodRejectsAdvanceWithoutContinuation(t *testing.T) {
+	client, base := authorizedPaginationClient(t, false)
+	base.advanceWithoutContinuation = true
+	_, err := client.BoundedNeighborhood(
+		context.Background(),
+		explorer.BoundedNeighborhoodRequest{
+			NodeIDs: []shoal.ID{"node-seed"}, Depth: 1,
+			Fanout: 1, MaxNodes: 2, MaxScannedEdges: 1,
+			Direction:   explorer.GraphDirectionOutgoing,
+			AfterEdgeID: "edge-prior",
+		},
+	)
+	if !shoal.IsErrorCode(err, shoal.ErrorInternal) {
+		t.Fatalf("cursor advance without continuation error = %v", err)
+	}
+	if base.calls != 1 {
+		t.Fatalf("malformed provider calls = %d, want 1", base.calls)
+	}
+}
+
+func TestBoundedNeighborhoodPreservesNonCursorTruncation(t *testing.T) {
+	client, base := authorizedPaginationClient(t, false)
+	base.truncatedWithoutContinuation = true
+	result, err := client.BoundedNeighborhood(
+		context.Background(),
+		explorer.BoundedNeighborhoodRequest{
+			NodeIDs: []shoal.ID{"node-seed"}, Depth: 1,
+			Fanout: 1, MaxNodes: 1, MaxScannedEdges: 1,
+			Direction: explorer.GraphDirectionOutgoing,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Truncated || result.Continuation ||
+		result.NextAfterEdgeID != "" ||
+		len(result.Neighborhood.Nodes) != 1 ||
+		len(result.Neighborhood.Edges) != 0 {
+		t.Fatalf("non-cursor truncation was lost: %#v", result)
+	}
+}
+
 func TestBoundedNeighborhoodRejectsZeroLimitsBeforeNormalization(t *testing.T) {
 	client, _ := authorizedPaginationClient(t, false)
 	for _, request := range []explorer.BoundedNeighborhoodRequest{
@@ -323,6 +428,58 @@ func TestAuthorizedVectorAvailabilityKeyLengthPrefixesIDs(t *testing.T) {
 	)
 	if left == right {
 		t.Fatalf("distinct visibility sets produced same key %q", left)
+	}
+}
+
+func TestBoundedNeighborhoodRechecksGenerationAfterOntologyLens(t *testing.T) {
+	for _, depth := range []uint32{1, 2} {
+		t.Run(fmt.Sprintf("depth-%d", depth), func(t *testing.T) {
+			client, base := authorizedPaginationClient(t, false)
+			schema, _ := ontology.NewOntologySchema("guard", "Guard", "", nil)
+			version, _ := ontology.NewOntologyVersion(
+				schema, "1", time.Date(2026, time.September, 6, 0, 0, 0, 0, time.UTC),
+				nil, nil, nil, nil)
+			selected, _ := ontology.NewOntologyIdentity(version)
+			now := time.Date(2026, time.September, 6, 0, 0, 0, 0, time.UTC)
+			decision, err := auth.NewDecision(auth.DecisionConfig{
+				Subject: "subject", Actor: "actor",
+				AuthorizationDomain: []byte("domain"),
+				AllowedOperations:   []auth.Operation{auth.OperationNeighborhood},
+				PermittedSourceIDs:  [][]byte{[]byte("source")},
+				PermittedPolicyIDs:  [][]byte{[]byte("policy")},
+				PolicyGeneration:    1, AuthenticationExpires: now.Add(time.Hour),
+				RequestID: "request", SelectedOntology: selected,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			generation := int64(1)
+			client.resolver = resolverFunc(func(context.Context) (auth.Decision, error) {
+				return decision, nil
+			})
+			client.generationReader = generationReaderFunc(
+				func(context.Context, []byte) (int64, error) {
+					return generation, nil
+				})
+			client.clock = func() time.Time { return now }
+			base.interpret = func() { generation = 2 }
+			_, err = client.BoundedNeighborhood(
+				context.Background(), explorer.BoundedNeighborhoodRequest{
+					NodeIDs: []shoal.ID{"node-seed"}, Depth: depth,
+					Fanout: 1, MaxNodes: 2, MaxScannedEdges: 2,
+				})
+			if !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
+				t.Fatalf("generation change after lens = %v, want unavailable", err)
+			}
+		})
+	}
+}
+
+func TestOntologyInterpretationsMustMatchAuthorizedAssertions(t *testing.T) {
+	if err := validateOntologyInterpretations(
+		[]ontology.Assertion{{}}, nil, ontology.OntologyIdentity{},
+	); !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
+		t.Fatalf("missing interpretation error = %v", err)
 	}
 }
 
@@ -405,10 +562,11 @@ func authorizedPaginationClient(t *testing.T, hiddenOnly bool) (*Client, *pagedB
 	}
 	base := &pagedBoundedBase{view: view, nodes: canonical.nodes, hiddenOnly: hiddenOnly}
 	client, err := NewClient(Config{
-		Base:           base,
-		Resolver:       resolverFunc(func(context.Context) (auth.Decision, error) { return decision, nil }),
-		PolicySelector: selector,
-		PolicyStore:    store,
+		Base:                base,
+		OntologyInterpreter: base,
+		Resolver:            resolverFunc(func(context.Context) (auth.Decision, error) { return decision, nil }),
+		PolicySelector:      selector,
+		PolicyStore:         store,
 		GenerationReader: generationReaderFunc(func(context.Context, []byte) (int64, error) {
 			return 1, nil
 		}),
@@ -421,10 +579,31 @@ func authorizedPaginationClient(t *testing.T, hiddenOnly bool) (*Client, *pagedB
 }
 
 type pagedBoundedBase struct {
-	calls      int
-	view       explorer.DocumentView
-	nodes      map[shoal.ID]graph.Node
-	hiddenOnly bool
+	calls                        int
+	view                         explorer.DocumentView
+	nodes                        map[shoal.ID]graph.Node
+	hiddenOnly                   bool
+	interpret                    func()
+	omittedOnly                  bool
+	knownZero                    bool
+	knownZeroContinuation        bool
+	advanceWithoutContinuation   bool
+	truncatedWithoutContinuation bool
+}
+
+func (b *pagedBoundedBase) InterpretAssertions(
+	_ context.Context,
+	assertions []ontology.Assertion,
+	selected ontology.OntologyIdentity,
+) ([]ontology.AssertionInterpretation, error) {
+	if b.interpret != nil {
+		b.interpret()
+	}
+	result := make([]ontology.AssertionInterpretation, 0, len(assertions))
+	for _, assertion := range assertions {
+		result = append(result, ontology.ReadAssertionUnder(assertion, selected))
+	}
+	return result, nil
 }
 
 func (b *pagedBoundedBase) Retrieve(context.Context, retrieval.Request) (retrieval.Response, error) {
@@ -460,6 +639,50 @@ func (b *pagedBoundedBase) BoundedNeighborhood(
 	request explorer.BoundedNeighborhoodRequest,
 ) (explorer.BoundedNeighborhood, error) {
 	b.calls++
+	if b.knownZeroContinuation {
+		return explorer.BoundedNeighborhood{
+			Neighborhood: explorer.Neighborhood{
+				Nodes: []graph.Node{b.nodes["node-seed"]},
+			},
+			Truncated: true, NextAfterEdgeID: "edge-progress",
+			Continuation: true, ScannedEdgesKnown: true,
+		}, nil
+	}
+	if b.advanceWithoutContinuation {
+		return explorer.BoundedNeighborhood{
+			Neighborhood: explorer.Neighborhood{
+				Nodes: []graph.Node{b.nodes["node-seed"]},
+			},
+			NextAfterEdgeID: "edge-progress",
+			ScannedEdges:    1, ScannedEdgesKnown: true,
+		}, nil
+	}
+	if b.knownZero {
+		return explorer.BoundedNeighborhood{
+			Neighborhood: explorer.Neighborhood{
+				Nodes: []graph.Node{b.nodes["node-seed"]},
+			},
+			NextAfterEdgeID:   request.AfterEdgeID,
+			ScannedEdgesKnown: true,
+		}, nil
+	}
+	if b.truncatedWithoutContinuation {
+		return explorer.BoundedNeighborhood{
+			Neighborhood: explorer.Neighborhood{
+				Nodes: []graph.Node{b.nodes["node-seed"]},
+			},
+			Truncated: true,
+		}, nil
+	}
+	if b.omittedOnly {
+		edgeID := shoal.ID(fmt.Sprintf("edge-omitted-%04d", b.calls))
+		return explorer.BoundedNeighborhood{
+			Neighborhood: explorer.Neighborhood{
+				Nodes: []graph.Node{b.nodes["node-seed"]},
+			},
+			Truncated: true, NextAfterEdgeID: edgeID, Continuation: true,
+		}, nil
+	}
 	if request.AfterEdgeID == "" || b.hiddenOnly {
 		hiddenEdgeID := shoal.ID("edge-a-hidden")
 		if b.hiddenOnly {

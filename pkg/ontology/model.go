@@ -1989,12 +1989,13 @@ func cloneProperties(values []PropertyDefinition) []PropertyDefinition {
 type ProposalState string
 
 const (
-	ProposalDraft     ProposalState = "draft"
-	ProposalSubmitted ProposalState = "submitted"
-	ProposalApproved  ProposalState = "approved"
-	ProposalPublished ProposalState = "published"
-	ProposalRejected  ProposalState = "rejected"
-	ProposalWithdrawn ProposalState = "withdrawn"
+	ProposalDraft        ProposalState = "draft"
+	ProposalSubmitted    ProposalState = "submitted"
+	ProposalApproved     ProposalState = "approved"
+	ProposalPublished    ProposalState = "published"
+	ProposalRejected     ProposalState = "rejected"
+	ProposalWithdrawn    ProposalState = "withdrawn"
+	MaxProposalMorphisms               = 128
 )
 
 // ProposalTransition records one immutable governance decision.
@@ -2063,6 +2064,7 @@ type GovernedProposal struct {
 	createdAt       time.Time
 	state           ProposalState
 	transitions     []ProposalTransition
+	morphisms       []OntologyMorphism
 	metadata        shoal.Metadata
 }
 
@@ -2076,9 +2078,27 @@ func NewGovernedProposal(
 	createdAt time.Time,
 	metadata shoal.Metadata,
 ) (GovernedProposal, error) {
+	return NewGovernedProposalWithMorphisms(
+		schema, baseVersion, proposedVersion, nil,
+		proposedBy, rationale, createdAt, metadata,
+	)
+}
+
+// NewGovernedProposalWithMorphisms creates a draft proposal whose immutable
+// semantic change set is governed by the same lifecycle as its version.
+func NewGovernedProposalWithMorphisms(
+	schema OntologySchema,
+	baseVersion OntologyVersion,
+	proposedVersion OntologyVersion,
+	morphisms []OntologyMorphism,
+	proposedBy, rationale string,
+	createdAt time.Time,
+	metadata shoal.Metadata,
+) (GovernedProposal, error) {
 	proposal := GovernedProposal{
 		schema:          schema.clone(),
 		proposedVersion: proposedVersion.clone(),
+		morphisms:       cloneMorphisms(morphisms),
 		proposedBy:      proposedBy, rationale: rationale,
 		createdAt: normalizeTime(createdAt), state: ProposalDraft,
 		metadata: cloneMetadata(metadata),
@@ -2131,6 +2151,25 @@ func (p GovernedProposal) Validate() error {
 	}
 	if p.baseVersionID == p.proposedVersion.ID() {
 		return invalid("proposal base and proposed versions must differ")
+	}
+	sourceIdentity := OntologyIdentity{
+		schemaID: p.baseSchemaID, versionID: p.baseVersionID,
+	}
+	targetIdentity, _ := NewOntologyIdentity(p.proposedVersion)
+	if len(p.morphisms) > MaxProposalMorphisms {
+		return invalid("proposal morphisms exceed the public bound")
+	}
+	for index, morphism := range p.morphisms {
+		if err := morphism.Validate(); err != nil {
+			return err
+		}
+		if p.baseVersionID == "" ||
+			morphism.Source() != sourceIdentity || morphism.Target() != targetIdentity {
+			return invalid("proposal morphism does not link its base and proposed versions")
+		}
+		if index > 0 && p.morphisms[index-1].ID() >= morphism.ID() {
+			return invalid("proposal morphisms must be unique and canonically ordered")
+		}
 	}
 	if !requiredWire(p.proposedBy) || !requiredWire(p.rationale) {
 		return invalid("proposal author and rationale are required")
@@ -2229,6 +2268,10 @@ func (p GovernedProposal) Transitions() []ProposalTransition {
 	return append([]ProposalTransition(nil), p.transitions...)
 }
 
+func (p GovernedProposal) Morphisms() []OntologyMorphism {
+	return cloneMorphisms(p.morphisms)
+}
+
 func (p GovernedProposal) Metadata() shoal.Metadata {
 	return cloneMetadata(p.metadata)
 }
@@ -2237,6 +2280,7 @@ func (p GovernedProposal) clone() GovernedProposal {
 	p.schema = p.schema.clone()
 	p.proposedVersion = p.proposedVersion.clone()
 	p.transitions = append([]ProposalTransition(nil), p.transitions...)
+	p.morphisms = cloneMorphisms(p.morphisms)
 	p.metadata = cloneMetadata(p.metadata)
 	return p
 }
@@ -2262,8 +2306,7 @@ func proposalID(proposal GovernedProposal) (shoal.ID, error) {
 	if err := validateTime(proposal.createdAt, "proposal creation time"); err != nil {
 		return "", err
 	}
-	return deriveID(
-		"proposal",
+	parts := []string{
 		string(proposal.schema.ID()),
 		canonicalOptional(
 			proposal.baseVersionID != "",
@@ -2273,7 +2316,27 @@ func proposalID(proposal GovernedProposal) (shoal.ID, error) {
 		proposal.proposedBy,
 		proposal.rationale,
 		canonicalTime(proposal.createdAt),
+	}
+	if len(proposal.morphisms) > 0 {
+		ids := make([]string, len(proposal.morphisms))
+		for i, morphism := range proposal.morphisms {
+			ids[i] = string(morphism.ID())
+		}
+		parts = append(parts, canonicalParts(ids...))
+	}
+	return deriveID(
+		"proposal",
+		parts...,
 	)
+}
+
+func cloneMorphisms(values []OntologyMorphism) []OntologyMorphism {
+	cloned := make([]OntologyMorphism, len(values))
+	for i, value := range values {
+		cloned[i] = value.clone()
+	}
+	sort.Slice(cloned, func(i, j int) bool { return cloned[i].ID() < cloned[j].ID() })
+	return cloned
 }
 
 func validProposalTransition(from, to ProposalState) bool {

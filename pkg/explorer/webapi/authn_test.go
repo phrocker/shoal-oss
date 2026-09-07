@@ -216,6 +216,8 @@ func authnDecisionFor(name string) (auth.Decision, error) {
 			auth.OperationNeighborhood,
 			auth.OperationRetrieve,
 		}
+	case "ingest-only":
+		config.AllowedOperations = []auth.Operation{auth.OperationIngest}
 	default:
 		return auth.Decision{}, shoal.NewError(
 			shoal.ErrorUnauthorized, "unknown principal")

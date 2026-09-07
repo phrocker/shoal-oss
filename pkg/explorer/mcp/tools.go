@@ -28,6 +28,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/phrocker/shoal-oss/pkg/explorer"
+	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/explorer/webapi"
 	"github.com/phrocker/shoal-oss/pkg/ontology"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
@@ -285,6 +286,7 @@ var (
 func mandatoryServiceTools(service webapi.Service) []registeredTool {
 	return []registeredTool{
 		{
+			authorizationOperation: auth.OperationList,
 			definition: Tool{
 				Name: ToolDocuments, Title: "List Shoal documents",
 				Description: "List an authorized page of current Shoal documents.",
@@ -303,6 +305,7 @@ func mandatoryServiceTools(service webapi.Service) []registeredTool {
 			},
 		},
 		{
+			authorizationOperation: auth.OperationRead,
 			definition: Tool{
 				Name: ToolDocument, Title: "Read a Shoal document",
 				Description: "Read one authorized immutable Shoal document hierarchy.",
@@ -328,6 +331,7 @@ func mandatoryServiceTools(service webapi.Service) []registeredTool {
 			},
 		},
 		{
+			authorizationOperation: auth.OperationRetrieve,
 			definition: Tool{
 				Name: ToolRetrieve, Title: "Retrieve Shoal knowledge",
 				Description: "Run an authorized bounded retrieval and return structured evidence.",
@@ -347,6 +351,7 @@ func mandatoryServiceTools(service webapi.Service) []registeredTool {
 			},
 		},
 		{
+			authorizationOperation: auth.OperationNeighborhood,
 			definition: Tool{
 				Name: ToolNeighborhood, Title: "Explore a Shoal neighborhood",
 				Description: "Expand an authorized bounded graph neighborhood.",
@@ -365,6 +370,7 @@ func mandatoryServiceTools(service webapi.Service) []registeredTool {
 			},
 		},
 		{
+			authorizationOperation: auth.OperationNeighborhood,
 			definition: Tool{
 				Name: ToolPath, Title: "Find a Shoal path",
 				Description: "Find one authorized bounded directed explanation path.",
@@ -391,6 +397,7 @@ func optionalServiceTools(service webapi.Service) []registeredTool {
 		ingestionAvailable(service) {
 		provider := provider
 		tools = append(tools, registeredTool{
+			authorizationOperation: auth.OperationIngest,
 			definition: Tool{
 				Name: ToolIngest, Title: "Ingest Shoal documents",
 				Description: "Ingest a bounded batch when the workspace implements ingestion.",
@@ -413,6 +420,7 @@ func optionalServiceTools(service webapi.Service) []registeredTool {
 		extractionAvailable(service) {
 		provider := provider
 		tools = append(tools, registeredTool{
+			authorizationOperation: auth.OperationIngest,
 			definition: Tool{
 				Name: ToolExtract, Title: "Extract Shoal knowledge",
 				Description: "Run explicit extraction when the workspace implements it.",
@@ -445,6 +453,7 @@ func optionalServiceTools(service webapi.Service) []registeredTool {
 	if provider, ok := service.(webapi.RecomputeProvider); ok && !isAbsent(provider) {
 		provider := provider
 		tools = append(tools, registeredTool{
+			authorizationOperation: auth.OperationNeighborhood,
 			definition: Tool{
 				Name: ToolRecompute, Title: "Recompute a Shoal derivation",
 				Description: "Recompute derivation evidence when the workspace implements it.",
@@ -469,6 +478,7 @@ func optionalServiceTools(service webapi.Service) []registeredTool {
 		changesAvailable(service) {
 		provider := provider
 		tools = append(tools, registeredTool{
+			authorizationOperation: auth.OperationList,
 			definition: Tool{
 				Name: ToolChanges, Title: "Read Shoal document changes",
 				Description: "Read the authorized resumable document-publication feed. " +
@@ -534,15 +544,26 @@ func decodeToolArguments(
 	toolName string,
 ) error {
 	if err := strictDecode(raw, value); err != nil {
-		return shoal.NewError(
-			shoal.ErrorInvalidArgument, toolName+" arguments are invalid")
+		return invalidToolArguments(toolName)
 	}
 	return nil
 }
 
+type preEffectToolError struct {
+	err error
+}
+
+func (e preEffectToolError) Error() string { return e.err.Error() }
+func (e preEffectToolError) Unwrap() error { return e.err }
+
 func invalidToolArguments(toolName string) error {
-	return shoal.NewError(
-		shoal.ErrorInvalidArgument, toolName+" arguments are invalid")
+	return preEffectToolError{err: shoal.NewError(
+		shoal.ErrorInvalidArgument, toolName+" arguments are invalid")}
+}
+
+func isPreEffectToolError(err error) bool {
+	var target preEffectToolError
+	return errors.As(err, &target)
 }
 
 func validateNeighborhoodArguments(request webapi.NeighborhoodRequest) error {
@@ -615,7 +636,9 @@ func validateIngestArguments(request webapi.IngestRequest) error {
 	return nil
 }
 
-func (s *Server) toolSuccessResult(value any) (ToolResult, error) {
+func (s *Server) toolSuccessResult(
+	id json.RawMessage, value any,
+) (ToolResult, error) {
 	encoded, err := json.Marshal(value)
 	if err != nil {
 		return ToolResult{}, shoal.NewError(
@@ -626,19 +649,37 @@ func (s *Server) toolSuccessResult(value any) (ToolResult, error) {
 		return ToolResult{}, shoal.NewError(
 			shoal.ErrorInternal, "tool result must be a JSON object")
 	}
-	if uint64(len(encoded)) > webapi.MaxResponseBytes {
+	if uint64(len(encoded)) > s.outputBudget {
 		return ToolResult{}, shoal.NewError(
-			shoal.ErrorUnavailable, "tool result exceeds the server bound")
+			shoal.ErrorUnavailable, "tool result exceeds the effective output bound")
 	}
 	result, err := s.packToolResult(encoded)
 	if err != nil {
-		return ToolResult{
+		result = ToolResult{
 			Content:           []TextContent{},
 			StructuredContent: append(json.RawMessage(nil), encoded...),
 			IsError:           false,
-		}, nil
+		}
 	}
-	return result, nil
+	if s.toolResultFitsBudget(id, result) {
+		return result, nil
+	}
+	result.Content = []TextContent{}
+	if s.toolResultFitsBudget(id, result) {
+		return result, nil
+	}
+	return ToolResult{}, shoal.NewError(
+		shoal.ErrorUnavailable,
+		"tool result exceeds the effective output bound",
+	)
+}
+
+func (s *Server) toolResultFitsBudget(
+	id json.RawMessage, result ToolResult,
+) bool {
+	response := newResponse(id, result)
+	encoded, err := json.Marshal(response)
+	return err == nil && uint64(len(encoded)+1) <= s.outputBudget
 }
 
 type structuredToolFailure struct {
@@ -763,6 +804,13 @@ func validatePackedToolResult(
 }
 
 func publicToolFailure(err error) toolFailure {
+	if explorer.IsIndeterminateCommit(err) {
+		return toolFailure{
+			Code: "indeterminate",
+			Message: "tool effect may have committed; verify current state " +
+				"before deciding whether a retry is safe",
+		}
+	}
 	if errors.Is(err, context.Canceled) {
 		return toolFailure{
 			Code: string(shoal.ErrorCanceled), Message: "tool execution canceled"}
@@ -881,6 +929,13 @@ func validateOptionalToolSchemaNode(
 		return errors.New("schema exceeds structural limits")
 	}
 	switch schema.Type {
+	case "":
+		if len(schema.Properties) != 0 || len(schema.Required) != 0 ||
+			schema.AdditionalProperties != nil || schema.Items != nil ||
+			schema.Enum != nil || hasScalarSchemaBounds(schema) {
+			return errors.New("untyped schema has validation keywords")
+		}
+		return nil
 	case "object":
 		if schema.Items != nil || hasScalarSchemaBounds(schema) {
 			return errors.New("object schema has incompatible keywords")
@@ -1038,6 +1093,8 @@ func validateOptionalToolValue(value any, schema optionalToolInputSchema) error 
 		}
 	}
 	switch schema.Type {
+	case "":
+		return nil
 	case "object":
 		object, ok := value.(map[string]any)
 		if !ok {

@@ -20,6 +20,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -35,7 +36,9 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/explorer/coordination"
 	"github.com/phrocker/shoal-oss/pkg/explorer/coordination/transaction"
+	"github.com/phrocker/shoal-oss/pkg/explorer/mcp"
 	"github.com/phrocker/shoal-oss/pkg/explorer/webapi"
+	"github.com/phrocker/shoal-oss/pkg/interaction"
 	"github.com/phrocker/shoal-oss/pkg/model"
 )
 
@@ -100,6 +103,30 @@ func TestDocumentedWebWorkspaceStartServesMeta(t *testing.T) {
 	if got, ok := documents["documents"].([]any); !ok || len(got) != 1 {
 		t.Fatalf("backfilled document was not served: %s", string(body))
 	}
+
+	workspaceID := createMCPWorkspace(t, baseURL)
+	session := initializeMountedMCP(t, baseURL, workspaceID)
+	postMountedMCP(
+		t, baseURL, workspaceID, session,
+		`{"jsonrpc":"2.0","method":"notifications/initialized"}`,
+		http.StatusAccepted,
+	)
+	mcpBody := postMountedMCP(
+		t, baseURL, workspaceID, session,
+		`{"jsonrpc":"2.0","id":"documents","method":"tools/call",`+
+			`"params":{"name":"shoal.documents","arguments":{}}}`,
+		http.StatusOK,
+	)
+	var mcpResponse struct {
+		Result mcp.ToolResult `json:"result"`
+	}
+	if err := json.Unmarshal(mcpBody, &mcpResponse); err != nil {
+		t.Fatalf("decode MCP response %s: %v", mcpBody, err)
+	}
+	if mcpResponse.Result.IsError {
+		t.Fatalf("mounted MCP documents failed: %s",
+			mcpResponse.Result.StructuredContent)
+	}
 	cancel()
 	select {
 	case err := <-done:
@@ -109,6 +136,118 @@ func TestDocumentedWebWorkspaceStartServesMeta(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("server did not shut down")
 	}
+	reopened, err := explorer.Open(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	interactions, err := reopened.Interactions(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(interactions) != 1 ||
+		interactions[0].Operation != interaction.OperationToolCall {
+		t.Fatalf("persisted MCP interactions = %+v", interactions)
+	}
+}
+
+func createMCPWorkspace(t *testing.T, baseURL string) string {
+	t.Helper()
+	workspaceID := base64.RawURLEncoding.EncodeToString(
+		[]byte("command-mcp-workspace"))
+	mutationID := base64.RawURLEncoding.EncodeToString(
+		[]byte("command-mcp-settings-create"))
+	request, err := http.NewRequest(
+		http.MethodPut,
+		baseURL+"/api/v1/workspaces/"+workspaceID+"/settings",
+		strings.NewReader(
+			`{"expected_revision":0,"mutation_id":"`+
+				mutationID+`","settings":{}}`,
+		),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusCreated {
+		body, _ := io.ReadAll(response.Body)
+		t.Fatalf("workspace creation status = %d: %s",
+			response.StatusCode, body)
+	}
+	return workspaceID
+}
+
+func initializeMountedMCP(
+	t *testing.T, baseURL string, workspaceID string,
+) string {
+	t.Helper()
+	request, err := http.NewRequest(http.MethodPost, baseURL+"/mcp",
+		strings.NewReader(
+			`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{`+
+				`"protocolVersion":"`+mcp.ProtocolVersion+`","capabilities":{},`+
+				`"clientInfo":{"name":"web-test","version":"1"}}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Accept", "application/json, text/event-stream")
+	request.Header.Set(webapi.WorkspaceIDHeader, workspaceID)
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(response.Body)
+		t.Fatalf("MCP initialize status = %d: %s", response.StatusCode, body)
+	}
+	session := response.Header.Get(mcp.SessionHeader)
+	if session == "" {
+		t.Fatal("MCP initialize omitted session")
+	}
+	return session
+}
+
+func postMountedMCP(
+	t *testing.T,
+	baseURL string,
+	workspaceID string,
+	session string,
+	body string,
+	wantStatus int,
+) []byte {
+	t.Helper()
+	request, err := http.NewRequest(
+		http.MethodPost, baseURL+"/mcp", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Accept", "application/json, text/event-stream")
+	request.Header.Set(webapi.WorkspaceIDHeader, workspaceID)
+	if session != "" {
+		request.Header.Set(mcp.SessionHeader, session)
+		request.Header.Set(mcp.ProtocolVersionHeader, mcp.ProtocolVersion)
+	}
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	encoded, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != wantStatus {
+		t.Fatalf("MCP status = %d, want %d: %s",
+			response.StatusCode, wantStatus, encoded)
+	}
+	return encoded
 }
 
 func TestDefaultListenAddressIsDocumented(t *testing.T) {
@@ -199,7 +338,15 @@ func commandTestDirectory(t *testing.T) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = os.RemoveAll(directory) })
+	t.Cleanup(func() {
+		for _, path := range []string{
+			directory,
+			policyStoreDir(directory),
+			workspaceSettingsStoreDir(directory),
+		} {
+			_ = os.RemoveAll(path)
+		}
+	})
 	return directory
 }
 

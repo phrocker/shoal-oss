@@ -54,6 +54,19 @@ func validateResponse(request retrieval.Request, response retrieval.Response) er
 	if err := validateWireString("request ID", string(response.RequestID)); err != nil {
 		return err
 	}
+	if err := validateWireString(
+		"embedding space ID", string(response.EmbeddingSpaceID),
+	); err != nil {
+		return err
+	}
+	for index, id := range response.EmbeddingSpaceIDs {
+		if err := validateWireString(
+			fmt.Sprintf("embedding space constituent ID %d", index),
+			string(id),
+		); err != nil {
+			return err
+		}
+	}
 	for resultIndex, result := range response.Results {
 		resultName := fmt.Sprintf("result %d", resultIndex)
 		if err := validateWireString(resultName+" ID", string(result.ID)); err != nil {
@@ -180,6 +193,18 @@ func validateProtoResponse(response *knowledgepb.RetrieveResponse) error {
 	}
 	if err := validateWireString("request ID", response.GetRequestId()); err != nil {
 		return err
+	}
+	if err := validateWireString(
+		"embedding space ID", response.GetEmbeddingSpaceId(),
+	); err != nil {
+		return err
+	}
+	for index, id := range response.GetEmbeddingSpaceIds() {
+		if err := validateWireString(
+			fmt.Sprintf("embedding space constituent ID %d", index), id,
+		); err != nil {
+			return err
+		}
 	}
 	for resultIndex, result := range response.GetResults() {
 		if result == nil {

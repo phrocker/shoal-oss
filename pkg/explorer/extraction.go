@@ -30,6 +30,7 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/extraction"
 	"github.com/phrocker/shoal-oss/pkg/graph"
 	"github.com/phrocker/shoal-oss/pkg/inference"
+	"github.com/phrocker/shoal-oss/pkg/interaction"
 	"github.com/phrocker/shoal-oss/pkg/model"
 	"github.com/phrocker/shoal-oss/pkg/ontology"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
@@ -101,6 +102,8 @@ func (e *Explorer) loadExtractionRecord(row, qualifier, encoded []byte) error {
 			shoal.ErrorInternal, "stored explorer extraction row is invalid")
 	}
 	copy := record
+	e.registerSourceNodeBirthLocked(copy.Nodes, copy.PublishedAt)
+	e.registerSourceEdgeBirthLocked(copy.Edges, copy.PublishedAt)
 	e.extractions[record.ID] = &copy
 	return nil
 }
@@ -124,6 +127,11 @@ func validatePersistedExtraction(record persistedExtraction) error {
 		if err := node.Validate(); err != nil {
 			return err
 		}
+		if interaction.IsInteractionID(node.ID) ||
+			interaction.IsInteractionKind(node.Kind) {
+			return fmt.Errorf(
+				"extraction cannot use the reserved interaction node namespace")
+		}
 	}
 	nodes := make(map[shoal.ID]struct{}, len(record.Nodes)+1)
 	nodes[record.DocumentID] = struct{}{}
@@ -133,6 +141,11 @@ func validatePersistedExtraction(record persistedExtraction) error {
 	for _, edge := range record.Edges {
 		if err := edge.Validate(); err != nil {
 			return err
+		}
+		if interaction.IsInteractionID(edge.ID) ||
+			interaction.IsInteractionEdgeType(edge.Type) {
+			return fmt.Errorf(
+				"extraction cannot use the reserved interaction edge namespace")
 		}
 		if _, ok := nodes[edge.From]; !ok {
 			return fmt.Errorf("extraction edge source is outside the extraction graph")
@@ -263,12 +276,19 @@ func (e *Explorer) CommitExtraction(
 		return ExtractionResult{}, shoal.NewError(
 			shoal.ErrorConflict, "document changed before extraction publication")
 	}
+	if err := e.requireSourceGraphIDsAvailableLocked(
+		published.Nodes, published.Edges,
+	); err != nil {
+		return ExtractionResult{}, err
+	}
 	// This stable row overwrite is load-bearing; TestExtractDocumentRerunReusesSkillEntities pins idempotent re-publication.
 	if err := e.writeRecord(
 		extractionRecordRow(published.ID), embeddedRecordExtraction, published,
 	); err != nil {
 		return ExtractionResult{}, err
 	}
+	e.registerSourceNodeBirthLocked(published.Nodes, published.PublishedAt)
+	e.registerSourceEdgeBirthLocked(published.Edges, published.PublishedAt)
 	copy := published
 	e.extractions[published.ID] = &copy
 	if e.graphInitialized {

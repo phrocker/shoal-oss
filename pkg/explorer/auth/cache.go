@@ -63,6 +63,8 @@ type CacheKey struct {
 	requestDigest            Digest
 	limitsDigest             Digest
 	indexGenerationsDigest   Digest
+	ontologySchemaDigest     Digest
+	ontologyVersionDigest    Digest
 	digest                   Digest
 	set                      bool
 }
@@ -125,6 +127,12 @@ func NewCacheKey(config CacheKeyConfig) (CacheKey, error) {
 		indexGenerationsDigest: indexDigest,
 		set:                    true,
 	}
+	if identity, ok := decision.SelectedOntology(); ok {
+		key.ontologySchemaDigest = DigestBytes(
+			"explorer-ontology-schema-v1", []byte(identity.SchemaID()))
+		key.ontologyVersionDigest = DigestBytes(
+			"explorer-ontology-version-v1", []byte(identity.VersionID()))
+	}
 	encoder := newDigestEncoder("explorer-cache-key-v1")
 	encoder.bytes(key.domainFingerprint[:])
 	encoder.bytes(key.authorizationFingerprint[:])
@@ -136,6 +144,10 @@ func NewCacheKey(config CacheKeyConfig) (CacheKey, error) {
 	encoder.bytes(key.requestDigest[:])
 	encoder.bytes(key.limitsDigest[:])
 	encoder.bytes(key.indexGenerationsDigest[:])
+	if decision.selectedOntology.Known() {
+		encoder.bytes(key.ontologySchemaDigest[:])
+		encoder.bytes(key.ontologyVersionDigest[:])
+	}
 	key.digest = encoder.sum()
 	return key, nil
 }
@@ -191,6 +203,9 @@ func (k CacheKey) LimitsDigest() Digest { return k.limitsDigest }
 func (k CacheKey) IndexGenerationsDigest() Digest {
 	return k.indexGenerationsDigest
 }
+
+func (k CacheKey) OntologySchemaDigest() Digest  { return k.ontologySchemaDigest }
+func (k CacheKey) OntologyVersionDigest() Digest { return k.ontologyVersionDigest }
 
 // String never renders raw query, scope, labels, IDs, or generation handles.
 func (k CacheKey) String() string { return "cache-key:" + k.digest.String() }

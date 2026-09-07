@@ -24,6 +24,7 @@ import (
 	"encoding/hex"
 	"math"
 	"sort"
+	"time"
 
 	"github.com/phrocker/shoal-oss/pkg/graph"
 	"github.com/phrocker/shoal-oss/pkg/interaction"
@@ -44,7 +45,149 @@ func (e *Explorer) Snapshot(ctx context.Context) (Snapshot, error) {
 	if err := e.ensureGraphLocked(); err != nil {
 		return Snapshot{}, err
 	}
+	if err := e.registerSnapshotLocked(e.snapshot); err != nil {
+		return Snapshot{}, err
+	}
 	return e.snapshot, nil
+}
+
+// ValidateSnapshot verifies that a snapshot pin names a genuine issued corpus
+// frontier. Historical frontiers remain valid after unrelated publications.
+func (e *Explorer) ValidateSnapshot(
+	ctx context.Context, id shoal.ID, asOf time.Time, nodeIDs []shoal.ID,
+) error {
+	if err := contextError(ctx); err != nil {
+		return err
+	}
+	if err := shoal.ValidateRequiredID("snapshot ID", id); err != nil {
+		return err
+	}
+	if asOf.IsZero() {
+		return shoal.NewError(
+			shoal.ErrorInvalidArgument, "snapshot time is required")
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if err := e.requireOpen(); err != nil {
+		return err
+	}
+	if err := e.ensureGraphLocked(); err != nil {
+		return err
+	}
+	observedAt, ok := e.snapshotHistory[string(id)]
+	if !ok || !observedAt.Equal(asOf.UTC()) {
+		return shoal.NewError(
+			shoal.ErrorConflict, "snapshot pin is not a trusted corpus frontier")
+	}
+	return e.validateSnapshotSourcesLocked(asOf.UTC(), nodeIDs, nil)
+}
+
+// ValidateSnapshotEvidence additionally verifies every supplied source node
+// and edge was present at the pinned frontier.
+func (e *Explorer) ValidateSnapshotEvidence(
+	ctx context.Context,
+	id shoal.ID,
+	asOf time.Time,
+	nodeIDs []shoal.ID,
+	edgeIDs []shoal.ID,
+) error {
+	if err := contextError(ctx); err != nil {
+		return err
+	}
+	if err := shoal.ValidateRequiredID("snapshot ID", id); err != nil {
+		return err
+	}
+	if asOf.IsZero() {
+		return shoal.NewError(
+			shoal.ErrorInvalidArgument, "snapshot time is required")
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if err := e.requireOpen(); err != nil {
+		return err
+	}
+	if err := e.ensureGraphLocked(); err != nil {
+		return err
+	}
+	observedAt, ok := e.snapshotHistory[string(id)]
+	if !ok || !observedAt.Equal(asOf.UTC()) {
+		return shoal.NewError(
+			shoal.ErrorConflict, "snapshot pin is not a trusted corpus frontier")
+	}
+	return e.validateSnapshotSourcesLocked(asOf.UTC(), nodeIDs, edgeIDs)
+}
+
+func (e *Explorer) validateSnapshotSourcesLocked(
+	asOf time.Time, nodeIDs, edgeIDs []shoal.ID,
+) error {
+	for _, nodeID := range nodeIDs {
+		node, current := e.graphNodes[nodeID]
+		bornAt, known := e.sourceNodeBirth[nodeID]
+		if !current || interaction.IsInteractionKind(node.Kind) ||
+			!known || bornAt.After(asOf) {
+			return shoal.NewError(
+				shoal.ErrorConflict,
+				"interaction source was not present in the pinned snapshot",
+			)
+		}
+	}
+	for _, edgeID := range edgeIDs {
+		edge, current := e.graphEdges[edgeID]
+		bornAt, known := e.sourceEdgeBirth[edgeID]
+		if !current || interaction.IsInteractionEdgeType(edge.Type) ||
+			!known || bornAt.After(asOf) {
+			return shoal.NewError(
+				shoal.ErrorConflict,
+				"interaction source edge was not present in the pinned snapshot",
+			)
+		}
+	}
+	return nil
+}
+
+func (e *Explorer) registerSnapshotLocked(snapshot Snapshot) error {
+	id := shoal.ID(snapshot.ID)
+	record := persistedSnapshot{ID: id, AsOf: snapshot.AsOf.UTC()}
+	if existing, ok := e.snapshotHistory[snapshot.ID]; ok {
+		if existing.Equal(record.AsOf) {
+			return nil
+		}
+		return shoal.NewError(
+			shoal.ErrorInternal,
+			"snapshot ID has conflicting observation times",
+		)
+	}
+	if e.readOnly {
+		e.snapshotHistory[snapshot.ID] = record.AsOf
+		return nil
+	}
+	accepted, err := e.conditionalInteractionRecord(
+		snapshotRecordRow(id),
+		embeddedRecordSnapshot,
+		record,
+		recordCQV2,
+		false,
+	)
+	if err != nil {
+		return err
+	}
+	if !accepted {
+		var current persistedSnapshot
+		found, err := e.lookupEmbeddedRecord(
+			snapshotRecordRow(id), embeddedRecordSnapshot, &current)
+		if err != nil {
+			return err
+		}
+		current.AsOf = current.AsOf.UTC()
+		if !found || !persistedSnapshotsEqual(current, record) {
+			return shoal.NewError(
+				shoal.ErrorConflict,
+				"snapshot ID is already registered with different content",
+			)
+		}
+	}
+	e.snapshotHistory[snapshot.ID] = record.AsOf
+	return nil
 }
 
 // BoundedNeighborhood expands the cached adjacency index without scanning or
@@ -114,6 +257,7 @@ func (e *Explorer) BoundedNeighborhood(
 	nextAfter := request.AfterEdgeID
 	continuation := false
 	stopExpansion := false
+	scannedEdges := uint32(0)
 	for level := uint32(0); level < normalized.Depth && len(frontier) > 0; level++ {
 		next := make([]shoal.ID, 0)
 		for _, seed := range frontier {
@@ -130,6 +274,9 @@ func (e *Explorer) BoundedNeighborhood(
 				}
 			}
 			for _, edgeID := range edgeIDs {
+				if scannedEdges < math.MaxUint32 {
+					scannedEdges++
+				}
 				edge := e.graphEdges[edgeID]
 				if len(typeFilter) > 0 {
 					if _, ok := typeFilter[edge.Type]; !ok {
@@ -203,6 +350,7 @@ func (e *Explorer) BoundedNeighborhood(
 	return BoundedNeighborhood{
 		Neighborhood: result, Truncated: truncated,
 		NextAfterEdgeID: nextAfter, Continuation: continuation,
+		ScannedEdges: scannedEdges, ScannedEdgesKnown: true,
 	}, nil
 }
 
