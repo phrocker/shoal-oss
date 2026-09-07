@@ -275,6 +275,10 @@ issuer, audience, signature, time, and claim-mapping configuration.
 
 ## Streamable HTTP MCP
 
+For a rehearsable two-user scenario, deterministic fixture provisioning, and a
+VS Code `.vscode/mcp.json` template, see
+[`multi-user-demo.md`](multi-user-demo.md).
+
 The same authenticated workspace exposes MCP `2025-11-25` at `/mcp`. It uses
 the documented Streamable HTTP lifecycle: `POST initialize`, the returned
 `MCP-Session-Id`, `POST notifications/initialized`, and a
