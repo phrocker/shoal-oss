@@ -452,8 +452,28 @@ func (s *DurableStore) CompareAndSwap(
 		return Settings{}, explorer.MarkIndeterminateCommit(writeErr)
 	}
 	if len(accepted) != 1 {
-		return Settings{}, shoal.NewError(
-			shoal.ErrorInternal, "workspace settings CAS returned an invalid result")
+		var resultErr error = shoal.NewError(
+			shoal.ErrorInternal,
+			"workspace settings CAS returned an invalid result",
+		)
+		winner, _, winnerFound, loadErr := s.loadLocked(workspaceID)
+		if loadErr == nil {
+			if replayed, result, replayErr := replayResult(
+				winner, winnerFound, owner, authorizationDomain,
+				expectedRevision, mutationID, digest,
+			); replayed {
+				if replayErr == nil {
+					if retentionErr := s.retainCurrentLocked(found); retentionErr != nil {
+						return result, retentionErr
+					}
+				}
+				return result, replayErr
+			}
+		}
+		if loadErr != nil {
+			resultErr = errors.Join(resultErr, loadErr)
+		}
+		return Settings{}, explorer.MarkIndeterminateCommit(resultErr)
 	}
 	if accepted[0] {
 		if err := s.retainCurrentLocked(found); err != nil {

@@ -718,6 +718,54 @@ func TestReviewSettingsConditionalWriteErrorReadback(t *testing.T) {
 			t.Fatalf("unknown result = %#v, error = %v", result, err)
 		}
 	})
+
+	t.Run("malformed committed result", func(t *testing.T) {
+		store, err := OpenDurableStore(t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer store.Close()
+		write := store.conditionalWrite
+		store.conditionalWrite = func(
+			table string,
+			mutations []engine.ConditionalMutation,
+		) ([]bool, error) {
+			if _, err := write(table, mutations); err != nil {
+				return nil, err
+			}
+			return nil, nil
+		}
+		result, err := store.CompareAndSwap(
+			context.Background(), "malformed-committed",
+			"owner", []byte("domain"), 0, "mutation", Narrowing{})
+		if err != nil || result.Revision != 1 {
+			t.Fatalf("malformed committed result = %#v, error = %v",
+				result, err)
+		}
+	})
+
+	t.Run("malformed unknown result", func(t *testing.T) {
+		store, err := OpenDurableStore(t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer store.Close()
+		store.conditionalWrite = func(
+			string,
+			[]engine.ConditionalMutation,
+		) ([]bool, error) {
+			return nil, nil
+		}
+		result, err := store.CompareAndSwap(
+			context.Background(), "malformed-unknown",
+			"owner", []byte("domain"), 0, "mutation", Narrowing{})
+		if result.WorkspaceID != "" || result.Revision != 0 ||
+			!explorer.IsIndeterminateCommit(err) ||
+			!shoal.IsErrorCode(err, shoal.ErrorInternal) {
+			t.Fatalf("malformed unknown result = %#v, error = %v",
+				result, err)
+		}
+	})
 }
 
 func TestReviewSettingsReadbackConcealsForeignWinner(t *testing.T) {
