@@ -92,6 +92,20 @@ func validateDurableFoldResult(
 	if err != nil {
 		return err
 	}
+	matchesID := result.FoldID == foldID
+	if !matchesID {
+		legacy := canonical
+		legacy.Members = make([]interaction.FoldMember, len(canonical.Members))
+		for index, member := range canonical.Members {
+			legacy.Members[index] = member
+			legacy.Members[index].TouchedEdgeIDs = nil
+		}
+		legacyID, legacyErr := legacy.ID()
+		if legacyErr != nil {
+			return legacyErr
+		}
+		matchesID = result.FoldID == legacyID
+	}
 	var retrieved, cited []shoal.ID
 	visibilitySets := make([][]string, 0, len(canonical.Members))
 	for _, member := range canonical.Members {
@@ -103,7 +117,7 @@ func validateDurableFoldResult(
 	if err != nil {
 		return err
 	}
-	if result.FoldID != foldID ||
+	if !matchesID ||
 		!result.FoldedAt.Equal(canonical.FoldedAt) ||
 		result.MemberCount != len(canonical.Members) ||
 		result.RetrievedCount != countDistinctIDs(retrieved) ||
