@@ -380,6 +380,10 @@ type Session struct {
 	ContextPackID   shoal.ID
 	ResultID        shoal.ID
 	StopReason      string
+	// RequiredVisibility is a producer-supplied output restriction conjoined
+	// with every touched source label. It can narrow but never replace
+	// source-derived visibility.
+	RequiredVisibility []string
 
 	// SeedNodeIDs are source nodes the session was shown before its first
 	// turn. They count as retrieved.
@@ -707,6 +711,9 @@ func (s Session) Validate() error {
 			"interaction cannot mix legacy and canonical embedding space pins",
 		)
 	}
+	if _, err := Conjoin(s.RequiredVisibility); err != nil {
+		return err
+	}
 	for _, id := range s.SeedNodeIDs {
 		if err := shoal.ValidateRequiredID("interaction seed node ID", id); err != nil {
 			return err
@@ -826,6 +833,10 @@ func (s Session) Canonical() (Session, error) {
 	}
 	canonical.Actor.OnBehalfOf = append(
 		[]shoal.ID(nil), s.Actor.OnBehalfOf...)
+	canonical.RequiredVisibility, err = Conjoin(s.RequiredVisibility)
+	if err != nil {
+		return Session{}, err
+	}
 	canonical.SeedNodeIDs = dedupeIDs(s.SeedNodeIDs)
 	canonical.SeedEvidence, err = canonicalEvidenceReferences(s.SeedEvidence)
 	if err != nil {
@@ -1258,7 +1269,8 @@ func (s Session) SubgraphWithEvidence(
 	if err != nil {
 		return Subgraph{}, err
 	}
-	visibility, err := Conjoin(nodeVisibility, edgeVisibility)
+	visibility, err := Conjoin(
+		nodeVisibility, edgeVisibility, s.RequiredVisibility)
 	if err != nil {
 		return Subgraph{}, err
 	}

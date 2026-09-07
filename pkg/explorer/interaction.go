@@ -80,6 +80,7 @@ type persistedInteraction struct {
 	Operation                interaction.Operation
 	Actor                    interaction.ActorContext
 	Reason                   interaction.Reason
+	EdgeProvenanceComplete   bool
 	Nodes                    []graph.Node
 	Edges                    []graph.Edge
 	Visibility               string
@@ -283,6 +284,7 @@ func (e *Explorer) recordInteractionResult(
 		Operation:                session.Operation,
 		Actor:                    session.Actor,
 		Reason:                   session.Reason,
+		EdgeProvenanceComplete:   true,
 		Nodes:                    subgraph.Nodes,
 		Edges:                    subgraph.Edges,
 		Visibility:               interaction.Expression(subgraph.Visibility),
@@ -912,6 +914,12 @@ func (e *Explorer) edgeVisibilityResolverLocked() interaction.VisibilityResolver
 func (e *Explorer) currentInteractionVisibilityLocked(
 	record persistedInteraction,
 ) (string, error) {
+	if !record.EdgeProvenanceComplete {
+		return "", shoal.NewError(
+			shoal.ErrorUnavailable,
+			"interaction source-edge provenance is incomplete",
+		)
+	}
 	references, err := record.Session.EvidenceReferences()
 	if err != nil {
 		return "", err
@@ -931,7 +939,7 @@ func (e *Explorer) currentInteractionVisibilityLocked(
 		return "", err
 	}
 	resolveEdge := e.edgeVisibilityResolverLocked()
-	sets := [][]string{nodeVisibility}
+	sets := [][]string{nodeVisibility, record.Session.RequiredVisibility}
 	for _, edgeID := range record.Session.TouchedEdgeIDs() {
 		labels, err := resolveEdge(edgeID)
 		if err != nil {
@@ -1177,6 +1185,15 @@ func validatePersistedInteraction(record persistedInteraction) error {
 				"stored interaction actor metadata does not match its envelope",
 			)
 		}
+		if !visibilityCovered(
+			record.Visibility,
+			interaction.Expression(record.Session.RequiredVisibility),
+		) {
+			return shoal.NewError(
+				shoal.ErrorInternal,
+				"stored interaction visibility omits its required output restriction",
+			)
+		}
 	}
 	if len(record.Nodes) == 0 {
 		return shoal.NewError(
@@ -1212,6 +1229,8 @@ func cloneInteractionSession(session interaction.Session) interaction.Session {
 	cloned.Actor = cloneActorContext(session.Actor)
 	cloned.EmbeddingSpaces.Identities = append(
 		[]string(nil), session.EmbeddingSpaces.Identities...)
+	cloned.RequiredVisibility = append(
+		[]string(nil), session.RequiredVisibility...)
 	cloned.SeedNodeIDs = append([]shoal.ID(nil), session.SeedNodeIDs...)
 	cloned.SeedEvidence = cloneEvidenceReferences(session.SeedEvidence)
 	cloned.CitedNodeIDs = append([]shoal.ID(nil), session.CitedNodeIDs...)

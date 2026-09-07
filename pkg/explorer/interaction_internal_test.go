@@ -28,6 +28,7 @@ import (
 	"time"
 
 	"github.com/phrocker/shoal-oss/pkg/graph"
+	"github.com/phrocker/shoal-oss/pkg/inference"
 	"github.com/phrocker/shoal-oss/pkg/interaction"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
@@ -47,6 +48,278 @@ func (c *stagedCancellationContext) Err() error {
 		return context.Canceled
 	}
 	return nil
+}
+
+func TestFoldRevalidatesRetainedSourceEdgeVisibility(t *testing.T) {
+	ctx := context.Background()
+	dataDir := t.TempDir()
+	corpus, err := Open(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = corpus.Close() })
+	receipt, err := corpus.Ingest(ctx, Source{
+		URI: "file:///fold-edge-visibility.txt", MediaType: MediaTypeText,
+		Content:  "fold edge visibility",
+		Metadata: shoal.Metadata{interaction.PropertyVisibility: "node-label"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	view, err := corpus.Document(ctx, receipt.Document.ID, receipt.Revision.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	edge := graph.Edge{
+		ID: "fold-source-edge", From: receipt.Document.ID,
+		To: view.Root.Spans[0].ID, Type: "supports", Weight: 1,
+		Properties: shoal.Metadata{interaction.PropertyVisibility: "edge-label"},
+	}
+	if err := corpus.Connect(ctx, edge); err != nil {
+		t.Fatal(err)
+	}
+	pin, err := corpus.Snapshot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	corpus.mu.RLock()
+	path := graph.Path{
+		Nodes: []graph.Node{
+			cloneNode(corpus.graphNodes[edge.From]),
+			cloneNode(corpus.graphNodes[edge.To]),
+		},
+		Edges: []graph.Edge{cloneEdge(corpus.graphEdges[edge.ID])},
+	}
+	corpus.mu.RUnlock()
+	anchor, err := inference.NewGraphAnchor(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := interaction.Session{
+		ID:         interaction.DerivedID("session", "fold-edge-visibility"),
+		RecordedAt: pin.AsOf.Add(time.Second),
+		Operation:  interaction.OperationRetrieval,
+		SnapshotID: shoal.ID(pin.ID), SnapshotAsOf: pin.AsOf,
+		AuthorizationFingerprint: "auth-sha256:fold-edge",
+		AuthorizationExpiresAt:   pin.AsOf.Add(time.Hour),
+		SeedNodeIDs:              []shoal.ID{edge.From, edge.To},
+		SeedEvidence: []interaction.EvidenceReference{{
+			AnchorID: anchor.ID(), Kind: interaction.EvidenceGraph,
+			NodeIDs: []shoal.ID{edge.From, edge.To},
+			EdgeIDs: []shoal.ID{edge.ID},
+		}},
+	}
+	if err := corpus.RecordInteraction(ctx, session); err != nil {
+		t.Fatal(err)
+	}
+	fold, err := corpus.FoldInteractions(ctx, FoldRequest{
+		SessionIDs: []shoal.ID{session.ID},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	corpus.mu.Lock()
+	edgeProvenanceComplete :=
+		corpus.interactions[session.ID].EdgeProvenanceComplete
+	corpus.interactions[session.ID].EdgeProvenanceComplete = false
+	corpus.mu.Unlock()
+	if _, err := corpus.FoldInteractions(ctx, FoldRequest{
+		SessionIDs:    []shoal.ID{session.ID},
+		SummaryDigest: interaction.Digest("unprovable legacy member"),
+	}); !shoal.IsErrorCode(err, shoal.ErrorConflict) {
+		t.Fatalf("fold with unavailable typed member provenance = %v", err)
+	}
+	corpus.mu.Lock()
+	corpus.interactions[session.ID].EdgeProvenanceComplete =
+		edgeProvenanceComplete
+	corpus.mu.Unlock()
+	if err := corpus.Close(); err != nil {
+		t.Fatal(err)
+	}
+	corpus, err = Open(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	corpus.mu.Lock()
+	edgeProvenanceComplete =
+		corpus.interactions[session.ID].EdgeProvenanceComplete
+	corpus.interactions[session.ID].EdgeProvenanceComplete = false
+	corpus.mu.Unlock()
+	interimRetry, err := corpus.FoldInteractions(ctx, FoldRequest{
+		SessionIDs: []shoal.ID{session.ID},
+	})
+	if err != nil || interimRetry.Created || interimRetry.FoldID != fold.FoldID ||
+		!interimRetry.FoldedAt.Equal(fold.FoldedAt) {
+		t.Fatalf("edge-inclusive interim fold retry = %+v, %v", interimRetry, err)
+	}
+	corpus.mu.Lock()
+	corpus.interactions[session.ID].EdgeProvenanceComplete =
+		edgeProvenanceComplete
+	corpus.mu.Unlock()
+	corpus.mu.Lock()
+	corpus.folds[fold.FoldID].Members[0].TouchedEdgeIDs = nil
+	corpus.mu.Unlock()
+	retried, err := corpus.FoldInteractions(ctx, FoldRequest{
+		SessionIDs: []shoal.ID{session.ID},
+	})
+	if err != nil || retried.Created || retried.FoldID != fold.FoldID ||
+		!retried.FoldedAt.Equal(fold.FoldedAt) {
+		t.Fatalf("legacy fold retry = %+v, %v", retried, err)
+	}
+	corpus.mu.Lock()
+	currentRecord := corpus.folds[fold.FoldID]
+	legacyRecord := *currentRecord
+	legacyRecord.Members = cloneFoldMembers(currentRecord.Members)
+	legacyFold := interaction.Fold{
+		Members: legacyRecord.Members, SummaryDigest: legacyRecord.SummaryDigest,
+		FoldedAt: legacyRecord.FoldedAt,
+	}
+	legacyID, legacyErr := legacyFold.ID()
+	if legacyErr != nil {
+		corpus.mu.Unlock()
+		t.Fatal(legacyErr)
+	}
+	delete(corpus.folds, fold.FoldID)
+	legacyRecord.FoldID = legacyID
+	corpus.folds[legacyID] = &legacyRecord
+	edgeProvenanceComplete =
+		corpus.interactions[session.ID].EdgeProvenanceComplete
+	corpus.interactions[session.ID].EdgeProvenanceComplete = false
+	corpus.mu.Unlock()
+	legacyRetry, err := corpus.FoldInteractions(ctx, FoldRequest{
+		SessionIDs: []shoal.ID{session.ID},
+	})
+	if err != nil || legacyRetry.Created || legacyRetry.FoldID != legacyID {
+		t.Fatalf("pre-edge legacy fold retry = %+v, %v", legacyRetry, err)
+	}
+	corpus.mu.Lock()
+	corpus.interactions[session.ID].EdgeProvenanceComplete =
+		edgeProvenanceComplete
+	delete(corpus.folds, legacyID)
+	corpus.folds[fold.FoldID] = currentRecord
+	corpus.mu.Unlock()
+	rehydrated, err := corpus.RehydrateFold(ctx, fold.FoldID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rehydrated.Members) != 1 ||
+		!reflect.DeepEqual(rehydrated.Members[0].TouchedEdgeIDs, []shoal.ID{edge.ID}) {
+		t.Fatalf("rehydrated fold edges = %+v", rehydrated.Members)
+	}
+	corpus.mu.Lock()
+	corrupted := *currentRecord
+	corrupted.FoldID = legacyID
+	corrupted.Members = cloneFoldMembers(currentRecord.Members)
+	corrupted.Members[0].TouchedEdgeIDs = []shoal.ID{edge.ID}
+	delete(corpus.folds, fold.FoldID)
+	corpus.folds[legacyID] = &corrupted
+	corpus.mu.Unlock()
+	if _, err := corpus.RehydrateFold(
+		ctx, legacyID); !shoal.IsErrorCode(err, shoal.ErrorInternal) {
+		t.Fatalf("legacy ID accepted stored typed edge provenance: %v", err)
+	}
+	corpus.mu.Lock()
+	delete(corpus.folds, legacyID)
+	corpus.folds[fold.FoldID] = currentRecord
+	corpus.mu.Unlock()
+	corpus.mu.Lock()
+	corpus.interactions[session.ID].Deleted = true
+	corpus.mu.Unlock()
+	if touches, err := corpus.InteractionsTouching(
+		ctx, edge.From); err != nil || len(touches) != 0 {
+		t.Fatalf("deleted member remained traversable: %+v, %v", touches, err)
+	}
+	if _, err := corpus.RelatedInteractions(
+		ctx, fold.FoldID); !shoal.IsErrorCode(err, shoal.ErrorNotFound) {
+		t.Fatalf("deleted-member fold traversal = %v", err)
+	}
+	corpus.mu.Lock()
+	corpus.interactions[session.ID].Deleted = false
+	corpus.mu.Unlock()
+	corpus.mu.Lock()
+	changed := cloneEdge(corpus.graphEdges[edge.ID])
+	changed.Properties[interaction.PropertyVisibility] = "edge-tightened"
+	corpus.graphEdges[edge.ID] = changed
+	corpus.mu.Unlock()
+	if _, err := corpus.RehydrateFold(
+		ctx, fold.FoldID); !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
+		t.Fatalf("rehydrated fold after edge tightening = %v", err)
+	}
+	if folds, err := corpus.Folds(ctx); err != nil || len(folds) != 0 {
+		t.Fatalf("fold list after edge tightening = %+v, %v", folds, err)
+	}
+	if _, err := corpus.FoldSubgraph(
+		ctx, fold.FoldID); !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
+		t.Fatalf("fold subgraph after edge tightening = %v", err)
+	}
+	if _, err := corpus.RelatedInteractions(
+		ctx, fold.FoldID); !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
+		t.Fatalf("fold traversal after edge tightening = %v", err)
+	}
+}
+
+func TestIncompleteInteractionEdgeProvenanceIsNotReadable(t *testing.T) {
+	ctx := context.Background()
+	corpus, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer corpus.Close()
+	receipt, err := corpus.Ingest(ctx, Source{
+		URI:       "file:///incomplete-edge-provenance.txt",
+		MediaType: MediaTypeText,
+		Content:   "incomplete provenance",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	view, err := corpus.Document(ctx, receipt.Document.ID, receipt.Revision.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := interaction.Session{
+		ID:          interaction.DerivedID("session", "incomplete-edge-provenance"),
+		RecordedAt:  time.Unix(1700000000, 0).UTC(),
+		Operation:   interaction.OperationRetrieval,
+		SeedNodeIDs: []shoal.ID{view.Root.Spans[0].ID},
+	}
+	if err := corpus.RecordInteraction(ctx, session); err != nil {
+		t.Fatal(err)
+	}
+	corpus.mu.Lock()
+	if !corpus.interactions[session.ID].EdgeProvenanceComplete {
+		corpus.mu.Unlock()
+		t.Fatal("new interaction did not record complete edge provenance")
+	}
+	corpus.interactions[session.ID].EdgeProvenanceComplete = false
+	corpus.mu.Unlock()
+
+	if summaries, err := corpus.Interactions(ctx); err != nil || len(summaries) != 0 {
+		t.Fatalf("incomplete interaction summaries = %+v, %v", summaries, err)
+	}
+	if records, err := corpus.InteractionRecords(ctx); err != nil || len(records) != 0 {
+		t.Fatalf("incomplete interaction records = %+v, %v", records, err)
+	}
+	if _, err := corpus.InteractionRecord(
+		ctx, session.ID); !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
+		t.Fatalf("incomplete interaction record error = %v", err)
+	}
+	if _, err := corpus.Interaction(
+		ctx, session.ID); !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
+		t.Fatalf("incomplete interaction error = %v", err)
+	}
+	if _, err := corpus.InteractionSubgraph(
+		ctx, session.ID); !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
+		t.Fatalf("incomplete interaction subgraph error = %v", err)
+	}
+	if touching, err := corpus.InteractionsTouching(
+		ctx, view.Root.Spans[0].ID); err != nil || len(touching) != 0 {
+		t.Fatalf("incomplete interaction traversal = %+v, %v", touching, err)
+	}
+	if _, err := corpus.RelatedInteractions(
+		ctx, session.ID); !shoal.IsErrorCode(err, shoal.ErrorNotFound) {
+		t.Fatalf("incomplete direct traversal error = %v", err)
+	}
 }
 
 func TestInteractionWriteResolvesCommittedIndeterminateOutcome(t *testing.T) {
@@ -148,12 +421,12 @@ func TestInteractionWriteConjoinsRequiredOutputVisibility(t *testing.T) {
 
 func TestInteractionWritePreservesUnresolvedIndeterminateOutcome(t *testing.T) {
 	ctx := context.Background()
-	corpus, err := Open(t.TempDir())
+	dataDir := t.TempDir()
+	corpus, err := Open(dataDir)
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	defer corpus.Close()
+	t.Cleanup(func() { _ = corpus.Close() })
 	receipt, err := corpus.Ingest(ctx, Source{
 		URI:       "file:///source.txt",
 		MediaType: MediaTypeText,
@@ -184,10 +457,36 @@ func TestInteractionWritePreservesUnresolvedIndeterminateOutcome(t *testing.T) {
 	if !IsIndeterminateCommit(err) {
 		t.Fatalf("unresolved write error = %v", err)
 	}
+	if _, err := corpus.Interaction(ctx, session.ID); !IsIndeterminateCommit(err) ||
+		!shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
+		t.Fatalf("indeterminate corpus did not fail closed: %v", err)
+	}
+	if _, err := corpus.Ingest(ctx, Source{
+		URI:       "file:///blocked-after-indeterminate.txt",
+		MediaType: MediaTypeText,
+		Content:   "must not publish",
+	}); !IsIndeterminateCommit(err) ||
+		!shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
+		t.Fatalf("indeterminate corpus accepted a later mutation: %v", err)
+	}
+	if err := corpus.Close(); err != nil {
+		t.Fatal(err)
+	}
+	corpus, err = Open(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if _, err := corpus.Interaction(ctx, session.ID); !shoal.IsErrorCode(
 		err, shoal.ErrorNotFound,
 	) {
-		t.Fatalf("uncommitted interaction became visible: %v", err)
+		t.Fatalf("absent interaction appeared after recovery: %v", err)
+	}
+	if _, err := corpus.Ingest(ctx, Source{
+		URI:       "file:///allowed-after-recovery.txt",
+		MediaType: MediaTypeText,
+		Content:   "recovered",
+	}); err != nil {
+		t.Fatalf("reopened corpus stayed poisoned: %v", err)
 	}
 }
 

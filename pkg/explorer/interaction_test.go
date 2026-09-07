@@ -338,6 +338,7 @@ func TestGenericRecorderSurvivesRestartAndStaysSourceOnly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = corpus.Close() })
 	spans := ingestVisible(
 		t, corpus, "file:///generic-retrieval.md", publicMarkdown, "ops")
 	before, err := corpus.Snapshot(ctx)
@@ -440,6 +441,63 @@ func TestGenericRecorderSurvivesRestartAndStaysSourceOnly(t *testing.T) {
 		}
 	}
 
+}
+
+func TestRequiredVisibilitySurvivesRestart(t *testing.T) {
+	ctx := context.Background()
+	dataDir := t.TempDir()
+	corpus, err := explorer.Open(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	spans := ingestVisible(
+		t, corpus, "file:///required-visibility.md", publicMarkdown, "internal")
+	snapshot, err := corpus.Snapshot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := interaction.Session{
+		ID:                       interaction.DerivedID("session", "required-visibility-restart"),
+		RecordedAt:               snapshot.AsOf.Add(time.Second),
+		Operation:                interaction.OperationRetrieval,
+		SnapshotID:               shoal.ID(snapshot.ID),
+		SnapshotAsOf:             snapshot.AsOf,
+		AuthorizationFingerprint: "auth-sha256:required-visibility",
+		AuthorizationExpiresAt:   snapshot.AsOf.Add(time.Hour),
+		RequiredVisibility:       []string{"api", "api"},
+		SeedNodeIDs:              spans,
+	}
+	accepted, err := corpus.RecordInteractionResult(ctx, session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if interaction.Expression(accepted.RequiredVisibility) != "api" {
+		t.Fatalf("accepted required visibility = %v",
+			accepted.RequiredVisibility)
+	}
+	if err := corpus.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := explorer.Open(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	hydrated, err := reopened.Interaction(ctx, session.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if interaction.Expression(hydrated.RequiredVisibility) != "api" {
+		t.Fatalf("restarted required visibility = %v",
+			hydrated.RequiredVisibility)
+	}
+	summaries, err := reopened.Interactions(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(summaries) != 1 || summaries[0].Visibility != "api&internal" {
+		t.Fatalf("restarted interaction summaries = %+v", summaries)
+	}
 }
 
 func TestExactEdgeEvidenceSurvivesRestart(t *testing.T) {

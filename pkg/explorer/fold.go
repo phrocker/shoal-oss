@@ -125,6 +125,7 @@ func (e *Explorer) FoldInteractions(
 	}
 
 	members := make([]interaction.FoldMember, 0, len(sessionIDs))
+	edgeProvenanceComplete := true
 	for _, sessionID := range sessionIDs {
 		record, ok, err := e.foldInteractionRecordLocked(sessionID)
 		if err != nil {
@@ -139,12 +140,18 @@ func (e *Explorer) FoldInteractions(
 			return FoldResult{}, err
 		}
 		touched := interaction.TouchedNodes(record.Nodes, record.Edges)
-		members = append(members, interaction.FoldMember{
+		member := interaction.FoldMember{
 			SessionID:        sessionID,
 			RetrievedNodeIDs: touched.RetrievedNodeIDs,
 			CitedNodeIDs:     touched.CitedNodeIDs,
 			Visibility:       visibility,
-		})
+		}
+		if !record.EdgeProvenanceComplete {
+			edgeProvenanceComplete = false
+		} else {
+			member.TouchedEdgeIDs = record.Session.TouchedEdgeIDs()
+		}
+		members = append(members, member)
 	}
 
 	fold := interaction.Fold{
@@ -160,16 +167,55 @@ func (e *Explorer) FoldInteractions(
 	if err != nil {
 		return FoldResult{}, err
 	}
+	legacyID, err := legacyFoldID(canonical)
+	if err != nil {
+		return FoldResult{}, err
+	}
 	if _, exists := e.folds[foldID]; !exists {
 		if err := e.reconcilePersistedFoldLocked(foldID); err != nil {
 			return FoldResult{}, err
 		}
 	}
 	if existing, ok := e.folds[foldID]; ok {
-		if err := e.validateFoldReuseLocked(*existing); err != nil {
-			return FoldResult{}, err
+		return e.foldIdempotentResultLocked(*existing, canonical)
+	}
+	if legacyID != foldID {
+		if _, exists := e.folds[legacyID]; !exists {
+			if err := e.reconcilePersistedFoldLocked(legacyID); err != nil {
+				return FoldResult{}, err
+			}
 		}
-		return foldIdempotentResult(*existing, canonical)
+		if existing, ok := e.folds[legacyID]; ok {
+			return e.foldIdempotentResultLocked(*existing, canonical)
+		}
+	}
+	if !edgeProvenanceComplete {
+		var compatible *persistedFold
+		for _, existing := range e.folds {
+			existingFold := interaction.Fold{
+				Members:       cloneFoldMembers(existing.Members),
+				SummaryDigest: existing.SummaryDigest,
+				FoldedAt:      existing.FoldedAt,
+			}
+			existingLegacyID, legacyErr := legacyFoldID(existingFold)
+			if legacyErr != nil || existingLegacyID != legacyID {
+				continue
+			}
+			if compatible != nil && compatible.FoldID != existing.FoldID {
+				return FoldResult{}, shoal.NewError(
+					shoal.ErrorConflict,
+					"multiple folds match legacy interaction provenance",
+				)
+			}
+			compatible = existing
+		}
+		if compatible != nil {
+			return e.foldIdempotentResultLocked(*compatible, canonical)
+		}
+		return FoldResult{}, shoal.NewError(
+			shoal.ErrorConflict,
+			"fold member source-edge provenance is unavailable",
+		)
 	}
 	for _, sessionID := range sessionIDs {
 		record, ok := e.interactions[sessionID]
@@ -184,7 +230,8 @@ func (e *Explorer) FoldInteractions(
 			)
 		}
 	}
-	subgraph, err := canonical.Subgraph(e.visibilityResolverLocked())
+	subgraph, err := canonical.SubgraphWithEvidence(
+		e.visibilityResolverLocked(), e.edgeVisibilityResolverLocked())
 	if err != nil {
 		return FoldResult{}, err
 	}
@@ -235,10 +282,7 @@ func (e *Explorer) FoldInteractions(
 				"fold create was rejected without a durable winner",
 			)
 		}
-		if err := e.validateFoldReuseLocked(*existing); err != nil {
-			return FoldResult{}, err
-		}
-		return foldIdempotentResult(*existing, canonical)
+		return e.foldIdempotentResultLocked(*existing, canonical)
 	}
 	e.reserveInteractionRecordGraphIDsLocked(
 		record.FoldID, record.Nodes, record.Edges)
@@ -257,7 +301,7 @@ func (e *Explorer) FoldInteractions(
 	}, nil
 }
 
-func (e *Explorer) validateFoldReuseLocked(record persistedFold) error {
+func (e *Explorer) validateFoldRetryLocked(record persistedFold) error {
 	if err := e.requireLiveFoldMembersLocked(record); err != nil {
 		return err
 	}
@@ -265,7 +309,40 @@ func (e *Explorer) validateFoldReuseLocked(record persistedFold) error {
 	if err != nil {
 		return err
 	}
-	if !visibilityCovered(record.Visibility, current) {
+	sets := [][]string{}
+	if current != "" {
+		labels, err := interaction.ParseVisibility(current)
+		if err != nil {
+			return err
+		}
+		sets = append(sets, labels)
+	}
+	resolveEdge := e.edgeVisibilityResolverLocked()
+	for _, member := range record.Members {
+		session, ok := e.interactions[member.SessionID]
+		if !ok || session.Deleted {
+			return shoal.NewError(
+				shoal.ErrorConflict,
+				"fold member session was explicitly deleted",
+			)
+		}
+		edgeIDs := member.TouchedEdgeIDs
+		if len(edgeIDs) == 0 && session.EdgeProvenanceComplete {
+			edgeIDs = session.Session.TouchedEdgeIDs()
+		}
+		for _, edgeID := range edgeIDs {
+			labels, err := resolveEdge(edgeID)
+			if err != nil {
+				return err
+			}
+			sets = append(sets, labels)
+		}
+	}
+	labels, err := interaction.Conjoin(sets...)
+	if err != nil {
+		return err
+	}
+	if !visibilityCovered(record.Visibility, interaction.Expression(labels)) {
 		return staleDerivedVisibilityError()
 	}
 	return nil
@@ -291,6 +368,85 @@ func (e *Explorer) requireLiveFoldMembersLocked(record persistedFold) error {
 		}
 	}
 	return nil
+}
+
+func (e *Explorer) currentFoldVisibilityLocked(
+	record persistedFold,
+) (string, error) {
+	current, err := e.currentSubgraphVisibilityLocked(record.Nodes, record.Edges)
+	if err != nil {
+		return "", err
+	}
+	sets := [][]string{}
+	if current != "" {
+		labels, err := interaction.ParseVisibility(current)
+		if err != nil {
+			return "", err
+		}
+		sets = append(sets, labels)
+	}
+	resolveEdge := e.edgeVisibilityResolverLocked()
+	edgeIDs, err := e.foldSourceEdgeIDsLocked(record)
+	if err != nil {
+		return "", err
+	}
+	for _, edgeID := range edgeIDs {
+		labels, err := resolveEdge(edgeID)
+		if err != nil {
+			return "", err
+		}
+		sets = append(sets, labels)
+	}
+	labels, err := interaction.Conjoin(sets...)
+	if err != nil {
+		return "", err
+	}
+	return interaction.Expression(labels), nil
+}
+
+func (e *Explorer) foldSourceEdgeIDsLocked(
+	record persistedFold,
+) ([]shoal.ID, error) {
+	var edgeIDs []shoal.ID
+	for _, member := range record.Members {
+		session, ok := e.interactions[member.SessionID]
+		if !ok || session.Deleted {
+			return nil, shoal.NewError(
+				shoal.ErrorConflict,
+				"fold member session was explicitly deleted",
+			)
+		}
+		memberEdges := member.TouchedEdgeIDs
+		if len(memberEdges) == 0 {
+			if !session.EdgeProvenanceComplete {
+				return nil, shoal.NewError(
+					shoal.ErrorConflict,
+					"fold source-edge provenance cannot be reconstructed",
+				)
+			}
+			memberEdges = session.Session.TouchedEdgeIDs()
+		}
+		edgeIDs = append(edgeIDs, memberEdges...)
+	}
+	sort.Slice(edgeIDs, func(i, j int) bool {
+		return shoal.CompareID(edgeIDs[i], edgeIDs[j]) < 0
+	})
+	result := edgeIDs[:0]
+	for _, edgeID := range edgeIDs {
+		if len(result) == 0 || result[len(result)-1] != edgeID {
+			result = append(result, edgeID)
+		}
+	}
+	return result, nil
+}
+
+func legacyFoldID(fold interaction.Fold) (shoal.ID, error) {
+	legacy := fold
+	legacy.Members = cloneFoldMembers(fold.Members)
+	for index := range legacy.Members {
+		legacy.Members[index].TouchedEdgeIDs = nil
+	}
+	return legacy.ID()
 }
 
 func (e *Explorer) foldInteractionRecordLocked(
@@ -342,7 +498,7 @@ func (e *Explorer) RehydrateFold(
 	if err := e.requireLiveFoldMembersLocked(*record); err != nil {
 		return interaction.Fold{}, err
 	}
-	current, err := e.currentSubgraphVisibilityLocked(record.Nodes, record.Edges)
+	current, err := e.currentFoldVisibilityLocked(*record)
 	if err != nil {
 		return interaction.Fold{}, err
 	}
@@ -354,11 +510,24 @@ func (e *Explorer) RehydrateFold(
 		SummaryDigest: record.SummaryDigest,
 		FoldedAt:      record.FoldedAt,
 	}
+	storedHasEdgeProvenance := false
+	for _, member := range fold.Members {
+		if len(member.TouchedEdgeIDs) > 0 {
+			storedHasEdgeProvenance = true
+			break
+		}
+	}
+	fold.Members, err = e.foldMembersWithSourceEdgesLocked(fold.Members)
+	if err != nil {
+		return interaction.Fold{}, err
+	}
 	derived, err := fold.ID()
 	if err != nil {
 		return interaction.Fold{}, err
 	}
-	if derived != foldID {
+	legacy, legacyErr := legacyFoldID(fold)
+	legacyMatches := !storedHasEdgeProvenance && legacy == foldID
+	if legacyErr != nil || (derived != foldID && !legacyMatches) {
 		return interaction.Fold{}, shoal.NewError(
 			shoal.ErrorInternal,
 			"stored fold does not hash to its own identity",
@@ -381,8 +550,7 @@ func (e *Explorer) Folds(ctx context.Context) ([]FoldSummary, error) {
 	summaries := make([]FoldSummary, 0, len(e.folds))
 	for _, record := range e.folds {
 		if !record.Deleted {
-			current, err := e.currentSubgraphVisibilityLocked(
-				record.Nodes, record.Edges)
+			current, err := e.currentFoldVisibilityLocked(*record)
 			if err != nil || !visibilityCovered(record.Visibility, current) {
 				// Fail closed at read time: a live fold whose evidence was
 				// reclassified to a stricter label after it was folded is
@@ -430,8 +598,7 @@ func (e *Explorer) FoldSubgraph(
 		return Neighborhood{}, shoal.NewError(shoal.ErrorNotFound, "fold not found")
 	}
 	if !record.Deleted {
-		current, err := e.currentSubgraphVisibilityLocked(
-			record.Nodes, record.Edges)
+		current, err := e.currentFoldVisibilityLocked(*record)
 		if err != nil {
 			return Neighborhood{}, err
 		}
@@ -567,7 +734,7 @@ func (e *Explorer) foldsReferencingLocked(sessionID shoal.ID) []shoal.ID {
 	return referencing
 }
 
-func foldIdempotentResult(
+func (e *Explorer) foldIdempotentResultLocked(
 	existing persistedFold, candidate interaction.Fold,
 ) (FoldResult, error) {
 	if existing.Deleted {
@@ -576,12 +743,35 @@ func foldIdempotentResult(
 			"fold identity was explicitly deleted and cannot be reused",
 		)
 	}
+	if err := e.validateFoldRetryLocked(existing); err != nil {
+		return FoldResult{}, err
+	}
+	members := cloneFoldMembers(existing.Members)
+	candidateMembers := cloneFoldMembers(candidate.Members)
+	candidateByID := make(map[shoal.ID]int, len(candidateMembers))
+	for index, member := range candidateMembers {
+		candidateByID[member.SessionID] = index
+	}
+	for index := range members {
+		candidateIndex, ok := candidateByID[members[index].SessionID]
+		if !ok {
+			continue
+		}
+		if len(members[index].TouchedEdgeIDs) == 0 {
+			members[index].TouchedEdgeIDs = append(
+				[]shoal.ID(nil), candidateMembers[candidateIndex].TouchedEdgeIDs...)
+		}
+		if len(candidateMembers[candidateIndex].TouchedEdgeIDs) == 0 {
+			candidateMembers[candidateIndex].TouchedEdgeIDs = append(
+				[]shoal.ID(nil), members[index].TouchedEdgeIDs...)
+		}
+	}
 	existingCanonical, err := (interaction.Fold{
-		Members: existing.Members, SummaryDigest: existing.SummaryDigest,
+		Members: members, SummaryDigest: existing.SummaryDigest,
 		FoldedAt: existing.FoldedAt,
 	}).Canonical()
 	if err != nil || !reflect.DeepEqual(
-		existingCanonical.Members, candidate.Members,
+		existingCanonical.Members, candidateMembers,
 	) || existingCanonical.SummaryDigest != candidate.SummaryDigest {
 		return FoldResult{}, shoal.NewError(
 			shoal.ErrorConflict,
@@ -598,6 +788,26 @@ func foldIdempotentResult(
 		RetrievedCount: len(touched.RetrievedNodeIDs),
 		CitedCount:     len(touched.CitedNodeIDs),
 	}, nil
+}
+
+func (e *Explorer) foldMembersWithSourceEdgesLocked(
+	members []interaction.FoldMember,
+) ([]interaction.FoldMember, error) {
+	result := cloneFoldMembers(members)
+	for index := range result {
+		if len(result[index].TouchedEdgeIDs) != 0 {
+			continue
+		}
+		session, ok := e.interactions[result[index].SessionID]
+		if !ok || session.Deleted || !session.EdgeProvenanceComplete {
+			return nil, shoal.NewError(
+				shoal.ErrorConflict,
+				"fold source-edge provenance cannot be reconstructed",
+			)
+		}
+		result[index].TouchedEdgeIDs = session.Session.TouchedEdgeIDs()
+	}
+	return result, nil
 }
 
 func normalizeFoldSessionIDs(ids []shoal.ID) ([]shoal.ID, error) {
@@ -639,6 +849,7 @@ func cloneFoldMembers(members []interaction.FoldMember) []interaction.FoldMember
 			SessionID:        member.SessionID,
 			RetrievedNodeIDs: append([]shoal.ID(nil), member.RetrievedNodeIDs...),
 			CitedNodeIDs:     append([]shoal.ID(nil), member.CitedNodeIDs...),
+			TouchedEdgeIDs:   append([]shoal.ID(nil), member.TouchedEdgeIDs...),
 			Visibility:       append([]string(nil), member.Visibility...),
 		})
 	}
