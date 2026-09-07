@@ -25,8 +25,43 @@ import (
 	"time"
 
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
+	"github.com/phrocker/shoal-oss/pkg/ontology"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
+
+type operationRecordingOntologyChoices struct {
+	identity  ontology.OntologyIdentity
+	operation auth.Operation
+}
+
+func (c *operationRecordingOntologyChoices) ListOntologyChoices(
+	context.Context,
+	auth.Decision,
+) ([]OntologyChoice, error) {
+	return []OntologyChoice{{Identity: c.identity, Active: true}}, nil
+}
+
+func (c *operationRecordingOntologyChoices) AuthorizeOntology(
+	context.Context,
+	auth.Decision,
+	ontology.OntologyIdentity,
+) error {
+	return shoal.NewError(
+		shoal.ErrorUnauthorized, "operation-specific authorization required")
+}
+
+func (c *operationRecordingOntologyChoices) AuthorizeOntologyForOperation(
+	_ context.Context,
+	_ auth.Decision,
+	identity ontology.OntologyIdentity,
+	operation auth.Operation,
+) error {
+	c.operation = operation
+	if identity != c.identity || operation != auth.OperationRetrieve {
+		return shoal.NewError(shoal.ErrorUnauthorized, "authorization denied")
+	}
+	return nil
+}
 
 func TestNarrowServiceRolesCanApplyOwnedWorkspaceRestrictions(t *testing.T) {
 	for _, test := range []struct {
@@ -110,5 +145,65 @@ func TestNarrowServiceRolesCanApplyOwnedWorkspaceRestrictions(t *testing.T) {
 				t.Fatalf("application granted settings-management read access: %v", err)
 			}
 		})
+	}
+}
+
+func TestApplyForOperationUsesConsumingOperationForSelectedLens(t *testing.T) {
+	store, err := OpenDurableStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	schema, err := ontology.NewOntologySchema("workspace", "Workspace", "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, err := ontology.NewOntologyVersion(
+		schema, "1", testNow, nil, nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity, err := ontology.NewOntologyIdentity(version)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := testDecision(t, decisionOptions{
+		operations: []auth.Operation{
+			auth.OperationAnalyticsRead,
+			auth.OperationRetrieve,
+		},
+	})
+	settings, err := store.CompareAndSwap(
+		context.Background(), "operation-workspace", base.Subject(),
+		base.AuthorizationDomain(), 0, "create",
+		Narrowing{SelectedOntology: OntologySelection{
+			Present: true, Identity: identity,
+		}},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	choices := &operationRecordingOntologyChoices{identity: identity}
+	provider, err := NewProvider(store, ProviderOptions{
+		Resolver:         &mutableResolver{decision: base},
+		GenerationReader: testGenerationReader{generation: 7},
+		OntologyChoices:  choices,
+		Clock:            func() time.Time { return testNow },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	effective, err := provider.ApplyForOperation(
+		context.Background(), settings.WorkspaceID,
+		auth.OperationRetrieve, MaximumLimits(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if choices.operation != auth.OperationRetrieve {
+		t.Fatalf("ontology authorization operation = %q", choices.operation)
+	}
+	selected, ok := effective.Decision().SelectedOntology()
+	if !ok || selected != identity {
+		t.Fatalf("effective selected ontology = %#v, %v", selected, ok)
 	}
 }

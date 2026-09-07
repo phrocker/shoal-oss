@@ -56,6 +56,14 @@ func (s *lensObservingService) Documents(
 	return webapi.DocumentsResponse{}, nil
 }
 
+func (s *lensObservingService) Document(
+	ctx context.Context,
+	_ webapi.DocumentRequest,
+) (webapi.DocumentResponse, error) {
+	s.effective, s.found = webapi.EffectiveWorkspaceSettings(ctx)
+	return webapi.DocumentResponse{}, nil
+}
+
 func (s *lensObservingService) Retrieve(
 	_ context.Context,
 	request webapi.RetrievalRequest,
@@ -137,7 +145,7 @@ func TestHTTPSelectableLensIsPerCallerAndPreservesSettings(t *testing.T) {
 	handler, err := webapi.NewAuthenticatedHandler(
 		service,
 		webapi.AuthenticatorFunc(func(request *http.Request) (auth.Decision, error) {
-			return settingsHTTPDecision(
+			return settingsLensHTTPDecision(
 				t, now, shoal.ID(request.Header.Get("X-Test-Subject"))), nil
 		}),
 		authority.Binder(), "example.test",
@@ -160,7 +168,9 @@ func TestHTTPSelectableLensIsPerCallerAndPreservesSettings(t *testing.T) {
 			"mutation_id": base64.RawURLEncoding.EncodeToString(
 				[]byte("lens-settings-create")),
 			"settings": map[string]any{
-				"allowed_operations":   []string{"read"},
+				"allowed_operations": []string{
+					"neighborhood", "read", "retrieve",
+				},
 				"permitted_source_ids": []string{sourceID},
 				"budgets": map[string]any{
 					"retrieval_top_k": topK,
@@ -266,8 +276,10 @@ func TestHTTPSelectableLensIsPerCallerAndPreservesSettings(t *testing.T) {
 	}
 	if selected.Revision != 2 ||
 		selected.Settings.AllowedOperations == nil ||
-		len(*selected.Settings.AllowedOperations) != 1 ||
-		(*selected.Settings.AllowedOperations)[0] != "read" ||
+		len(*selected.Settings.AllowedOperations) != 3 ||
+		(*selected.Settings.AllowedOperations)[0] != "neighborhood" ||
+		(*selected.Settings.AllowedOperations)[1] != "read" ||
+		(*selected.Settings.AllowedOperations)[2] != "retrieve" ||
 		selected.Settings.PermittedSourceIDs == nil ||
 		len(*selected.Settings.PermittedSourceIDs) != 1 ||
 		selected.Settings.Budgets.RetrievalTopK == nil ||
@@ -292,7 +304,10 @@ func TestHTTPSelectableLensIsPerCallerAndPreservesSettings(t *testing.T) {
 	if err := json.Unmarshal(identityResponse.Body.Bytes(), &identity); err != nil {
 		t.Fatal(err)
 	}
-	if len(identity.Operations) != 1 || identity.Operations[0] != "read" ||
+	if len(identity.Operations) != 3 ||
+		identity.Operations[0] != "neighborhood" ||
+		identity.Operations[1] != "read" ||
+		identity.Operations[2] != "retrieve" ||
 		identity.SelectedOntology == nil ||
 		identity.SelectedOntology.VersionID != encodeTestID(second.VersionID()) ||
 		identity.Subject != "owner" || identity.Actor != "actor" ||
@@ -322,12 +337,12 @@ func TestHTTPSelectableLensIsPerCallerAndPreservesSettings(t *testing.T) {
 			crossCaller.Code, crossCaller.Header().Get("WWW-Authenticate"),
 			crossCaller.Body.String())
 	}
-	documents := settingsWorkspaceRequest(
-		t, handler, http.MethodPost, "/api/v1/documents",
-		map[string]any{}, "owner", workspacePath)
-	if documents.Code != http.StatusOK {
-		t.Fatalf("effective documents status = %d, body = %s",
-			documents.Code, documents.Body.String())
+	document := settingsWorkspaceRequest(
+		t, handler, http.MethodPost, "/api/v1/document",
+		map[string]any{"document_id": "document"}, "owner", workspacePath)
+	if document.Code != http.StatusOK {
+		t.Fatalf("effective document status = %d, body = %s",
+			document.Code, document.Body.String())
 	}
 	if !service.found ||
 		service.effective.Revision() != selected.Revision ||
@@ -344,10 +359,10 @@ func TestHTTPSelectableLensIsPerCallerAndPreservesSettings(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if documents.Header().Get(webapi.WorkspaceOutputVisibilityHeader) !=
+	if document.Header().Get(webapi.WorkspaceOutputVisibilityHeader) !=
 		string(visibility) {
 		t.Fatalf("workspace output visibility header = %q, want %q",
-			documents.Header().Get(webapi.WorkspaceOutputVisibilityHeader),
+			document.Header().Get(webapi.WorkspaceOutputVisibilityHeader),
 			visibility)
 	}
 
@@ -434,6 +449,34 @@ func TestHTTPSelectableLensIsPerCallerAndPreservesSettings(t *testing.T) {
 		t.Fatalf("limited output body = %d bytes, want <= %d",
 			limited.Body.Len(), outputBytes)
 	}
+}
+
+func settingsLensHTTPDecision(
+	t *testing.T,
+	now time.Time,
+	subject shoal.ID,
+) auth.Decision {
+	t.Helper()
+	decision, err := auth.NewDecision(auth.DecisionConfig{
+		Subject: subject, Actor: "actor",
+		AuthorizationDomain: []byte("domain"),
+		AllowedOperations: []auth.Operation{
+			auth.OperationNeighborhood,
+			auth.OperationRead,
+			auth.OperationRetrieve,
+			auth.OperationWorkspaceSettingsRead,
+			auth.OperationWorkspaceSettingsWrite,
+		},
+		PermittedSourceIDs:    [][]byte{[]byte("source-a")},
+		PermittedPolicyIDs:    [][]byte{[]byte("policy-a")},
+		PolicyGeneration:      1,
+		AuthenticationExpires: now.Add(time.Hour),
+		RequestID:             "request",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return decision
 }
 
 func settingsHTTPOntologies(
