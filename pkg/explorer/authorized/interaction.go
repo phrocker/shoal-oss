@@ -21,7 +21,10 @@ package authorized
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"reflect"
+	"strings"
 	"time"
 
 	"github.com/phrocker/shoal-oss/pkg/explorer"
@@ -159,7 +162,26 @@ func (s operationInteractionSink) RecordInteractionResult(
 	}
 	session.AuthorizationOperation = string(s.operation)
 	return s.client.recordInteractionWithEvidenceOperation(
-		ctx, session, true, s.evidenceOperation)
+		ctx, session, true, s.evidenceOperation, false)
+}
+
+// RecordReconciledInteractionResult records a durable fleet transition after
+// fresh operation and evidence authorization without replacing its original
+// authorization receipt.
+func (s operationInteractionSink) RecordReconciledInteractionResult(
+	ctx context.Context,
+	session interaction.Session,
+) (interaction.Session, error) {
+	if s.client == nil ||
+		(s.operation != auth.OperationDispatch &&
+			s.operation != auth.OperationInvoke) {
+		return interaction.Session{}, shoal.NewError(
+			shoal.ErrorUnavailable,
+			"authorized fleet reconciliation sink is unavailable")
+	}
+	session.AuthorizationOperation = string(s.operation)
+	return s.client.recordInteractionWithEvidenceOperation(
+		ctx, session, true, s.evidenceOperation, true)
 }
 
 // RecordInteraction appends one redacted interaction after verifying that its
@@ -186,12 +208,12 @@ func (c *Client) recordInteraction(
 	ctx context.Context, session interaction.Session, requireResult bool,
 ) (interaction.Session, error) {
 	return c.recordInteractionWithEvidenceOperation(
-		ctx, session, requireResult, auth.OperationRetrieve)
+		ctx, session, requireResult, auth.OperationRetrieve, false)
 }
 
 func (c *Client) recordInteractionWithEvidenceOperation(
 	ctx context.Context, session interaction.Session, requireResult bool,
-	evidenceOperation auth.Operation,
+	evidenceOperation auth.Operation, durablePin bool,
 ) (interaction.Session, error) {
 	writer, err := c.interactionWriter()
 	if err != nil {
@@ -212,8 +234,17 @@ func (c *Client) recordInteractionWithEvidenceOperation(
 	if err != nil {
 		return interaction.Session{}, err
 	}
-	session.RecordedAt = now.UTC()
-	if !interactionPinMatchesDecision(session, decision, now) {
+	recordedAt := now.UTC()
+	if durablePin {
+		if !durableInteractionPinValid(session) {
+			return interaction.Session{}, shoal.NewError(
+				shoal.ErrorUnauthorized,
+				"durable interaction authorization receipt is invalid")
+		}
+		recordedAt = session.RecordedAt
+	}
+	session.RecordedAt = recordedAt
+	if !durablePin && !interactionPinMatchesDecision(session, decision, now) {
 		return interaction.Session{}, authorizationDenied()
 	}
 	canonical, err := session.Canonical()
@@ -336,14 +367,21 @@ func (c *Client) recordInteractionWithEvidenceOperation(
 	}
 	admittedAt := c.clock().UTC()
 	if admittedAt.IsZero() ||
-		!interactionPinMatchesDecision(canonical, decision, admittedAt) {
-		return interaction.Session{}, authorizationDenied()
+		(!durablePin &&
+			!interactionPinMatchesDecision(canonical, decision, admittedAt)) ||
+		(durablePin && !durableInteractionPinValid(canonical)) {
+		return interaction.Session{}, shoal.NewError(
+			shoal.ErrorUnauthorized,
+			"interaction authorization receipt is no longer valid")
 	}
-	canonical.RecordedAt = admittedAt
+	if !durablePin {
+		canonical.RecordedAt = admittedAt
+	}
 	canonical, err = canonical.Canonical()
 	if err != nil {
 		return interaction.Session{}, err
 	}
+
 	persisted := canonical
 	if hasResultWriter {
 		persisted, err = resultWriter.RecordInteractionResult(ctx, canonical)
@@ -394,7 +432,9 @@ func (c *Client) recordInteractionWithEvidenceOperation(
 	}
 	deliveredAt := c.clock().UTC()
 	if deliveredAt.IsZero() ||
-		!interactionPinMatchesDecision(persisted, decision, deliveredAt) {
+		(!durablePin &&
+			!interactionPinMatchesDecision(persisted, decision, deliveredAt)) ||
+		(durablePin && !durableInteractionPinValid(persisted)) {
 		if authorizationOperation == auth.OperationAnalyticsRead {
 			return persisted, explorer.MarkIndeterminateCommit(
 				authorizationDenied())
@@ -403,6 +443,30 @@ func (c *Client) recordInteractionWithEvidenceOperation(
 			authorizationDenied())
 	}
 	return persisted, nil
+}
+
+func durableInteractionPinValid(session interaction.Session) bool {
+	const prefix = "auth-sha256:"
+	fingerprint := string(session.AuthorizationFingerprint)
+	if !strings.HasPrefix(fingerprint, prefix) {
+		return false
+	}
+	encoded := strings.TrimPrefix(fingerprint, prefix)
+	decoded, err := hex.DecodeString(encoded)
+	if err != nil || len(decoded) != sha256.Size {
+		return false
+	}
+	nonzero := false
+	for _, value := range decoded {
+		nonzero = nonzero || value != 0
+	}
+	return nonzero &&
+		session.RequestID != "" &&
+		!session.RecordedAt.IsZero() &&
+		session.RecordedAt.Location() == time.UTC &&
+		!session.AuthorizationExpiresAt.IsZero() &&
+		session.AuthorizationExpiresAt.Location() == time.UTC &&
+		session.RecordedAt.Before(session.AuthorizationExpiresAt)
 }
 
 func postCommitInteractionError(

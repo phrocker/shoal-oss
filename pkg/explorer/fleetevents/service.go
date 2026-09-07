@@ -26,6 +26,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"hash"
+	"reflect"
 	"time"
 
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
@@ -59,8 +60,10 @@ type Service struct {
 }
 
 func New(config Config) (*Service, error) {
-	if config.Backend == nil || config.Resolver == nil || config.GenerationReader == nil ||
-		config.LeaseValidator == nil || config.Auditor == nil {
+	if nilDependency(config.Backend) || nilDependency(config.Resolver) ||
+		nilDependency(config.GenerationReader) ||
+		nilDependency(config.LeaseValidator) ||
+		nilDependency(config.Auditor) {
 		return nil, shoal.NewError(shoal.ErrorInvalidArgument, "fleet event dependencies are required")
 	}
 	if config.Clock == nil {
@@ -339,7 +342,19 @@ func (s *Service) publish(
 	record.AuthorizationFingerprint = result.Audit.AuthorizationFingerprint
 	record.AuthorizationExpiresAt = result.Audit.AuthorizationExpiresAt
 	var recordErr error
-	if result.Repeated {
+	if lifecycleReceipt != nil {
+		if reconciler, ok := s.auditor.(ReconciliationAuditor); ok {
+			recordErr = reconciler.RecordFleetActionReconciliation(ctx, record)
+		} else if result.Repeated {
+			if retryAuditor, retryOK := s.auditor.(RetryAuditor); retryOK {
+				recordErr = retryAuditor.RecordFleetActionRetry(ctx, record)
+			} else {
+				recordErr = s.auditor.RecordFleetAction(ctx, record)
+			}
+		} else {
+			recordErr = s.auditor.RecordFleetAction(ctx, record)
+		}
+	} else if result.Repeated {
 		if retryAuditor, ok := s.auditor.(RetryAuditor); ok {
 			recordErr = retryAuditor.RecordFleetActionRetry(ctx, record)
 		} else {
@@ -526,7 +541,13 @@ func (s *Service) deliveryState(
 		}
 		next = state.NextSequence
 		frontier = state.Frontier
+	} else {
+		next, err = s.backend.CurrentStart(ctx)
+		if err != nil {
+			return Subscription{}, auth.Decision{}, auth.Fingerprint{}, 0, 0, err
+		}
 	}
+
 	if err := s.leases.ValidateDelivery(
 		ctx, subscription.AgentID, subscription.AgentGeneration,
 	); err != nil {
@@ -536,6 +557,20 @@ func (s *Service) deliveryState(
 		return Subscription{}, auth.Decision{}, auth.Fingerprint{}, 0, 0, err
 	}
 	return subscription, decision, fingerprint, next, frontier, nil
+}
+
+func nilDependency(value any) bool {
+	if value == nil {
+		return true
+	}
+	reflected := reflect.ValueOf(value)
+	switch reflected.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map,
+		reflect.Pointer, reflect.Slice:
+		return reflected.IsNil()
+	default:
+		return false
+	}
 }
 
 func (s *Service) authorizeDelivery(

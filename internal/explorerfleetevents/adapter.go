@@ -1195,6 +1195,7 @@ func (a *Adapter) Scan(
 	if next == 0 {
 		next = 1
 	}
+
 	floor, _, err := a.readFloor(ctx)
 	if err != nil {
 		return nil, 0, err
@@ -1224,6 +1225,11 @@ func (a *Adapter) Scan(
 		return nil, 0, fleetevents.ErrResyncRequired
 	}
 	return events, uint64(usedFrontier), nil
+}
+
+func (a *Adapter) CurrentStart(ctx context.Context) (uint64, error) {
+	floor, _, err := a.readFloor(ctx)
+	return floor, err
 }
 
 func (a *Adapter) scanEventsAt(
