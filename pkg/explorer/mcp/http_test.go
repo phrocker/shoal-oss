@@ -26,6 +26,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -365,19 +366,23 @@ func TestHTTPToolCallPersistsAuthorizedInteractionAcrossRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	store := authorized.NewMemoryPolicyStore()
-	client, err := authorized.NewClient(authorized.Config{
-		Base: corpus, Resolver: authority.Resolver(),
-		InteractionWriter: corpus, InteractionReader: corpus,
-		SnapshotValidator: corpus,
-		PolicySelector:    selector, PolicyStore: store,
-		GenerationReader: httpGenerationReader{
-			domain: []byte("domain"), generation: 1,
-		},
-		Clock: time.Now,
-	})
-	if err != nil {
-		t.Fatal(err)
+	newClient := func(corpus *explorer.Explorer) *authorized.Client {
+		client, err := authorized.NewClient(authorized.Config{
+			Base: corpus, Resolver: authority.Resolver(),
+			InteractionWriter: corpus, InteractionReader: corpus,
+			SnapshotValidator: corpus,
+			PolicySelector:    selector, PolicyStore: store,
+			GenerationReader: httpGenerationReader{
+				domain: []byte("domain"), generation: 1,
+			},
+			Clock: time.Now,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return client
 	}
+	client := newClient(corpus)
 	alice := httpScopedDecision(
 		t, "alice", "ingest-request", time.Now().Add(time.Hour),
 		sourceID, policyID)
@@ -395,6 +400,14 @@ func TestHTTPToolCallPersistsAuthorizedInteractionAcrossRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	document, err := client.Document(
+		aliceContext, ingested.Document.ID, ingested.Revision.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expectedTouched := appendSectionIDs(
+		[]shoal.ID{document.Document.ID}, document.Root)
+	expectedTouched = canonicalObservedIDs(expectedTouched)
 	historical, err := client.Snapshot(aliceContext)
 	if err != nil {
 		t.Fatal(err)
@@ -406,6 +419,14 @@ func TestHTTPToolCallPersistsAuthorizedInteractionAcrossRestart(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+	if err := corpus.Close(); err != nil {
+		t.Fatal(err)
+	}
+	corpus, err = explorer.Open(corpusDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client = newClient(corpus)
 	service, err := webapi.NewEmbeddedService(client)
 	if err != nil {
 		t.Fatal(err)
@@ -502,10 +523,7 @@ func TestHTTPToolCallPersistsAuthorizedInteractionAcrossRestart(t *testing.T) {
 			interaction.Digest("test HTTP MCP request") ||
 		len(recorded.Turns) != 1 ||
 		recorded.Turns[0].ToolCall == nil ||
-		!containsObservedID(
-			recorded.Turns[0].ToolCall.RetrievedNodeIDs,
-			ingested.Document.ID,
-		) {
+		!reflect.DeepEqual(recorded.TouchedNodeIDs(), expectedTouched) {
 		t.Fatalf("recorded interaction = %+v", recorded)
 	}
 	if summaries[0].Visibility != "restricted" {
