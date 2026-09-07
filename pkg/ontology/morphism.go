@@ -27,7 +27,7 @@ import (
 )
 
 const (
-	MaxLensTransitions              = 32
+	MaxLensTransitions              = MaxPublishedOntologyVersions
 	MaxMorphismEvidence             = 256
 	MaxMorphismDiscriminatorChoices = 4096
 )

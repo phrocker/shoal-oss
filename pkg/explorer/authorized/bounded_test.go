@@ -506,6 +506,7 @@ func TestOntologyLensRequiresExplicitTrustedInterpreter(t *testing.T) {
 	}
 	called := false
 	base.interpret = func() { called = true }
+	client.ontologyInterpreter = nil
 	result, err := client.applyOntologyLens(
 		context.Background(), explorer.Neighborhood{}, decision)
 	if err != nil {
