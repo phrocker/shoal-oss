@@ -160,11 +160,62 @@ func TestActionRecorderMarksErrorCodeOutcomeFailed(t *testing.T) {
 	}
 }
 
+func TestActionRecorderPinsNoEvidenceToTrustedSnapshot(t *testing.T) {
+	record := testActionRecord()
+	record.AuthorizationFingerprint = auth.Fingerprint(
+		sha256.Sum256([]byte("authorization")))
+	snapshot := explorer.Snapshot{
+		ID:   "snapshot",
+		AsOf: time.Date(2026, 9, 6, 8, 30, 0, 0, time.UTC),
+	}
+	sink := &capturingActionRecorder{record: record}
+	recorder, err := NewActionRecorderWithSnapshots(
+		sink, fixedActionSnapshotProvider{snapshot: snapshot})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := recorder.RecordAction(context.Background(), fleet.ActionAudit{
+		Phase: "enqueue_admission", Operation: auth.OperationDispatch,
+		Record: record,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(sink.sessions) != 1 {
+		t.Fatalf("captured sessions = %d", len(sink.sessions))
+	}
+	session := sink.sessions[0]
+	if session.SnapshotID != shoal.ID(snapshot.ID) ||
+		!session.SnapshotAsOf.Equal(snapshot.AsOf) ||
+		session.AuthorizationFingerprint !=
+			shoal.ID(record.AuthorizationFingerprint.String()) ||
+		!session.AuthorizationExpiresAt.Equal(
+			record.AuthorizationExpiresAt) {
+		t.Fatalf("action audit pins = %#v", session)
+	}
+
+	var typedNil *fixedActionSnapshotProvider
+	if _, err := NewActionRecorderWithSnapshots(
+		sink, typedNil,
+	); !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
+		t.Fatalf("typed nil snapshot provider error = %v", err)
+	}
+}
+
 type capturingActionRecorder struct {
 	sessions []interaction.Session
 	record   fleet.ActionRecord
 	err      error
 	diverge  bool
+}
+
+type fixedActionSnapshotProvider struct {
+	snapshot explorer.Snapshot
+}
+
+func (p fixedActionSnapshotProvider) InteractionSnapshot(
+	context.Context,
+) (explorer.Snapshot, error) {
+	return p.snapshot, nil
 }
 
 func (r *capturingActionRecorder) Record(

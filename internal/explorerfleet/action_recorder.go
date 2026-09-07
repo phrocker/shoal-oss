@@ -25,7 +25,8 @@ type ActionInteractionRecorder interface {
 // ActionRecorder records exact action evidence through the result-returning
 // interaction recorder and rejects any sink result that changes the effect.
 type ActionRecorder struct {
-	recorder ActionInteractionRecorder
+	recorder  ActionInteractionRecorder
+	snapshots fleet.InteractionSnapshotProvider
 }
 
 func NewActionRecorder(
@@ -37,6 +38,21 @@ func NewActionRecorder(
 			"fleet action interaction recorder is required")
 	}
 	return &ActionRecorder{recorder: recorder}, nil
+}
+
+// NewActionRecorderWithSnapshots additionally pins action audits without
+// executor evidence to the host's current durable corpus snapshot.
+func NewActionRecorderWithSnapshots(
+	recorder ActionInteractionRecorder,
+	snapshots fleet.InteractionSnapshotProvider,
+) (*ActionRecorder, error) {
+	if isNilActionInteractionRecorder(recorder) ||
+		isNilActionSnapshotProvider(snapshots) {
+		return nil, shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			"fleet action recorder dependencies are required")
+	}
+	return &ActionRecorder{recorder: recorder, snapshots: snapshots}, nil
 }
 
 func (r *ActionRecorder) RecordAction(
@@ -91,6 +107,18 @@ func (r *ActionRecorder) RecordAction(
 		requested.AuthorizationFingerprint = shoal.ID(
 			audit.Record.ExecutionFingerprint.String())
 		requested.AuthorizationExpiresAt = audit.Record.ExecutionExpiresAt
+	} else if r.snapshots != nil {
+		snapshot, err := r.snapshots.InteractionSnapshot(ctx)
+		if err != nil {
+			return err
+		}
+		provenance := audit.Record.EventProvenance()
+		requested.SnapshotID = shoal.ID(snapshot.ID)
+		requested.SnapshotAsOf = snapshot.AsOf
+		requested.AuthorizationFingerprint = shoal.ID(
+			provenance.AuthorizationFingerprint.String())
+		requested.AuthorizationExpiresAt =
+			provenance.AuthorizationExpiresAt
 	}
 	persisted, err := r.recorder.Record(ctx, requested)
 	if err != nil {
@@ -144,6 +172,22 @@ func isNilActionInteractionRecorder(recorder ActionInteractionRecorder) bool {
 		return true
 	}
 	value := reflect.ValueOf(recorder)
+	switch value.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map,
+		reflect.Pointer, reflect.Slice:
+		return value.IsNil()
+	default:
+		return false
+	}
+}
+
+func isNilActionSnapshotProvider(
+	provider fleet.InteractionSnapshotProvider,
+) bool {
+	if provider == nil {
+		return true
+	}
+	value := reflect.ValueOf(provider)
 	switch value.Kind() {
 	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map,
 		reflect.Pointer, reflect.Slice:

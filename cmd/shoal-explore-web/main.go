@@ -959,8 +959,8 @@ func openService(
 			embedded.Close()
 			return closed, err
 		}
-		actionRecorder, err := explorerfleet.NewActionRecorder(
-			interactionRecorder)
+		actionRecorder, err := explorerfleet.NewActionRecorderWithSnapshots(
+			interactionRecorder, snapshots)
 		if err != nil {
 			store.Close()
 			embedded.Close()

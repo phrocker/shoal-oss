@@ -206,3 +206,23 @@ compare the records immediately before that final call (or filter out the two
 list calls). Shoal must not be presented as capturing file edits, terminal
 commands, Git operations, complete Copilot conversations, or reasoning that
 occurred outside its tools.
+
+## 6. Automated acceptance coverage
+
+Run the deterministic two-user acceptance harness without OIDC credentials:
+
+```console
+go test ./cmd/shoal-explore-web -run TestTwoUserHTTPMCPDemoAcceptance -count=1
+```
+
+The test starts one shared authenticated HTTP service with injected Alice and
+Bob tokens, separate owner-bound workspaces, isolated MCP sessions, and a
+simulated Fleet executor. It verifies durable MCP ingestion and listing,
+server-generated correlation, Fleet dispatch and invocation, cross-user
+evidence visibility, team-overview changes, and persistence across restart. It
+also performs editor-, terminal-, and Git-like filesystem fixture operations
+and verifies that they create no interaction records.
+
+The injected authenticator, static team graph, and executor are test fixtures;
+the harness does not claim live OIDC sign-in, external agent execution, or
+visibility into activity that does not cross the Shoal HTTP/MCP boundary.
