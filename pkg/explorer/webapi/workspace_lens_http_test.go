@@ -328,6 +328,13 @@ func TestHTTPSelectableLensIsPerCallerAndPreservesSettings(t *testing.T) {
 		len(baseIdentity.Operations) <= len(identity.Operations) {
 		t.Fatalf("base identity was unexpectedly replaced: %#v", baseIdentity)
 	}
+	unregistered := settingsWorkspaceRequest(
+		t, handler, http.MethodPost, "/mcp",
+		map[string]any{}, "owner", workspacePath)
+	if unregistered.Code != http.StatusBadRequest {
+		t.Fatalf("unregistered workspace route status = %d, body = %s",
+			unregistered.Code, unregistered.Body.String())
+	}
 	crossCaller := settingsWorkspaceRequest(
 		t, handler, http.MethodGet, "/api/v1/identity",
 		nil, "other", workspacePath)

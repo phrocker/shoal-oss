@@ -206,4 +206,27 @@ func TestApplyForOperationUsesConsumingOperationForSelectedLens(t *testing.T) {
 	if !ok || selected != identity {
 		t.Fatalf("effective selected ontology = %#v, %v", selected, ok)
 	}
+
+	removed, err := store.CompareAndSwap(
+		context.Background(), "removed-operation-workspace", base.Subject(),
+		base.AuthorizationDomain(), 0, "remove-retrieve",
+		Narrowing{
+			AllowedOperations: OperationSelection{
+				Present: true,
+				Values:  []auth.Operation{auth.OperationAnalyticsRead},
+			},
+			SelectedOntology: OntologySelection{
+				Present: true, Identity: identity,
+			},
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := provider.ApplyForOperation(
+		context.Background(), removed.WorkspaceID,
+		auth.OperationRetrieve, MaximumLimits(), nil,
+	); !shoal.IsErrorCode(err, shoal.ErrorUnauthorized) {
+		t.Fatalf("removed consuming operation error = %v", err)
+	}
 }

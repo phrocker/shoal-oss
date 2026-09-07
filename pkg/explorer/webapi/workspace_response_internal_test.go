@@ -103,6 +103,7 @@ func TestWorkspaceOperationForRequestUsesRouteOperation(t *testing.T) {
 		{http.MethodPost, "/api/v1/fleet/agents/agent/heartbeat", auth.OperationAgentHeartbeat, true},
 		{http.MethodPost, "/api/v1/fleet/events/publish", auth.OperationEventPublish, true},
 		{http.MethodGet, "/api/v1/identity", auth.OperationRead, true},
+		{http.MethodHead, "/api/v1/identity", auth.OperationRead, true},
 		{http.MethodPost, "/mcp", "", false},
 	} {
 		operation, apply := workspaceOperationForRequest(test.method, test.path)
