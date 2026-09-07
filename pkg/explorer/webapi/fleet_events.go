@@ -25,8 +25,10 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/phrocker/shoal-oss/pkg/document"
 	"github.com/phrocker/shoal-oss/pkg/explorer/fleetevents"
 	"github.com/phrocker/shoal-oss/pkg/interaction"
+	"github.com/phrocker/shoal-oss/pkg/ontology"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
@@ -222,31 +224,52 @@ type fleetSubscriptionDeleteRequest struct {
 }
 
 type fleetEvidence struct {
-	SourceID   string   `json:"source_id"`
-	PolicyID   string   `json:"policy_id"`
-	ObjectID   string   `json:"object_id"`
-	NodeID     string   `json:"node_id,omitempty"`
-	EdgeID     string   `json:"edge_id,omitempty"`
-	AnchorID   string   `json:"anchor_id,omitempty"`
-	RevisionID string   `json:"revision_id,omitempty"`
-	Start      int64    `json:"start,omitempty"`
-	End        int64    `json:"end,omitempty"`
-	Visibility []string `json:"visibility,omitempty"`
+	SourceID string `json:"source_id"`
+	PolicyID string `json:"policy_id"`
+	ObjectID string `json:"object_id"`
+}
+
+type fleetEvidenceReference struct {
+	AnchorID   string                    `json:"anchor_id"`
+	Kind       interaction.EvidenceKind  `json:"kind"`
+	Citation   fleetCitation             `json:"citation"`
+	NodeIDs    []string                  `json:"node_ids,omitempty"`
+	EdgeIDs    []string                  `json:"edge_ids,omitempty"`
+	Assertions []fleetAssertionReference `json:"assertions,omitempty"`
+}
+
+type fleetCitation struct {
+	DocumentID string `json:"document_id,omitempty"`
+	RevisionID string `json:"revision_id,omitempty"`
+	SectionID  string `json:"section_id,omitempty"`
+	SpanID     string `json:"span_id,omitempty"`
+	Start      int64  `json:"start,omitempty"`
+	End        int64  `json:"end,omitempty"`
+	StartPage  int32  `json:"start_page,omitempty"`
+	EndPage    int32  `json:"end_page,omitempty"`
+}
+
+type fleetAssertionReference struct {
+	AssertionID string                   `json:"assertion_id"`
+	EdgeID      string                   `json:"edge_id"`
+	Origin      ontology.AssertionOrigin `json:"origin"`
 }
 
 type fleetEventPublishRequest struct {
-	Token              string          `json:"token"`
-	Kind               string          `json:"kind"`
-	ProducerID         string          `json:"producer_id"`
-	ProducerGeneration int64           `json:"producer_generation"`
-	ActionID           string          `json:"action_id"`
-	TransitionID       string          `json:"transition_id"`
-	CorrelationID      string          `json:"correlation_id,omitempty"`
-	ReasonCode         string          `json:"reason_code,omitempty"`
-	ReasonDigest       string          `json:"reason_digest,omitempty"`
-	Evidence           []fleetEvidence `json:"evidence"`
-	OccurredAt         time.Time       `json:"occurred_at"`
-	RetryUntil         time.Time       `json:"retry_until"`
+	Token              string                   `json:"token"`
+	Kind               string                   `json:"kind"`
+	ProducerID         string                   `json:"producer_id"`
+	ProducerGeneration int64                    `json:"producer_generation"`
+	ActionID           string                   `json:"action_id"`
+	TransitionID       string                   `json:"transition_id"`
+	CorrelationID      string                   `json:"correlation_id,omitempty"`
+	ReasonCode         string                   `json:"reason_code,omitempty"`
+	ReasonDigest       string                   `json:"reason_digest,omitempty"`
+	Evidence           []fleetEvidence          `json:"evidence"`
+	ConsumedEvidence   []fleetEvidenceReference `json:"consumed_evidence,omitempty"`
+	CitedEvidence      []fleetEvidenceReference `json:"cited_evidence,omitempty"`
+	OccurredAt         time.Time                `json:"occurred_at"`
+	RetryUntil         time.Time                `json:"retry_until"`
 }
 
 func (r fleetEventPublishRequest) domain() (fleetevents.PublishRequest, error) {
@@ -287,31 +310,21 @@ func (r fleetEventPublishRequest) domain() (fleetevents.PublishRequest, error) {
 		if err != nil {
 			return fleetevents.PublishRequest{}, err
 		}
-		for _, field := range []struct {
-			input  string
-			target *shoal.ID
-		}{
-			{r.Evidence[i].NodeID, &evidence[i].NodeID},
-			{r.Evidence[i].EdgeID, &evidence[i].EdgeID},
-			{r.Evidence[i].AnchorID, &evidence[i].AnchorID},
-			{r.Evidence[i].RevisionID, &evidence[i].RevisionID},
-		} {
-			if field.input == "" {
-				continue
-			}
-			*field.target, err = decodeID(field.input)
-			if err != nil {
-				return fleetevents.PublishRequest{}, err
-			}
-		}
-		evidence[i].Start, evidence[i].End = r.Evidence[i].Start, r.Evidence[i].End
-		evidence[i].Visibility = append([]string(nil), r.Evidence[i].Visibility...)
+	}
+	consumed, err := fleetEvidenceReferencesDomain(r.ConsumedEvidence)
+	if err != nil {
+		return fleetevents.PublishRequest{}, err
+	}
+	cited, err := fleetEvidenceReferencesDomain(r.CitedEvidence)
+	if err != nil {
+		return fleetevents.PublishRequest{}, err
 	}
 	return fleetevents.PublishRequest{Token: token, RetryUntil: r.RetryUntil, Event: fleetevents.Event{
 		Kind: r.Kind, ProducerID: producer, ProducerGeneration: r.ProducerGeneration,
 		ActionID: action, TransitionID: transition, CorrelationID: correlation,
 		Reason:   interaction.Reason{Code: r.ReasonCode, Digest: r.ReasonDigest},
-		Evidence: evidence, OccurredAt: r.OccurredAt,
+		Evidence: evidence, ConsumedEvidence: consumed, CitedEvidence: cited,
+		OccurredAt: r.OccurredAt,
 	}}, nil
 }
 
@@ -345,18 +358,20 @@ type fleetEventPublishResponse struct {
 }
 
 type fleetEventResponse struct {
-	Sequence           uint64          `json:"sequence"`
-	EventID            string          `json:"event_id"`
-	Kind               string          `json:"kind"`
-	ProducerID         string          `json:"producer_id"`
-	ProducerGeneration int64           `json:"producer_generation"`
-	ActionID           string          `json:"action_id"`
-	TransitionID       string          `json:"transition_id"`
-	CorrelationID      string          `json:"correlation_id,omitempty"`
-	ReasonCode         string          `json:"reason_code,omitempty"`
-	ReasonDigest       string          `json:"reason_digest,omitempty"`
-	Evidence           []fleetEvidence `json:"evidence"`
-	OccurredAt         time.Time       `json:"occurred_at"`
+	Sequence           uint64                   `json:"sequence"`
+	EventID            string                   `json:"event_id"`
+	Kind               string                   `json:"kind"`
+	ProducerID         string                   `json:"producer_id"`
+	ProducerGeneration int64                    `json:"producer_generation"`
+	ActionID           string                   `json:"action_id"`
+	TransitionID       string                   `json:"transition_id"`
+	CorrelationID      string                   `json:"correlation_id,omitempty"`
+	ReasonCode         string                   `json:"reason_code,omitempty"`
+	ReasonDigest       string                   `json:"reason_digest,omitempty"`
+	Evidence           []fleetEvidence          `json:"evidence"`
+	ConsumedEvidence   []fleetEvidenceReference `json:"consumed_evidence,omitempty"`
+	CitedEvidence      []fleetEvidenceReference `json:"cited_evidence,omitempty"`
+	OccurredAt         time.Time                `json:"occurred_at"`
 }
 
 type fleetEventPage struct {
@@ -380,6 +395,8 @@ func fleetEventPageFrom(page fleetevents.Page) fleetEventPage {
 			TransitionID:       encodeFleetOpaqueID(event.TransitionID),
 			ReasonCode:         event.Reason.Code, ReasonDigest: event.Reason.Digest,
 			Evidence: make([]fleetEvidence, len(event.Evidence)), OccurredAt: event.OccurredAt,
+			ConsumedEvidence: fleetEvidenceReferencesFrom(event.ConsumedEvidence),
+			CitedEvidence:    fleetEvidenceReferencesFrom(event.CitedEvidence),
 		}
 		if len(event.CorrelationID) > 0 {
 			item.CorrelationID = encodeFleetOpaqueID(event.CorrelationID)
@@ -387,19 +404,124 @@ func fleetEventPageFrom(page fleetevents.Page) fleetEventPage {
 		for j, evidence := range event.Evidence {
 			item.Evidence[j] = fleetEvidence{
 				SourceID: encodeFleetOpaqueID(evidence.SourceID), PolicyID: encodeFleetOpaqueID(evidence.PolicyID),
-				ObjectID:   encodeID(evidence.ObjectID),
-				NodeID:     encodeOptionalFleetID(evidence.NodeID),
-				EdgeID:     encodeOptionalFleetID(evidence.EdgeID),
-				AnchorID:   encodeOptionalFleetID(evidence.AnchorID),
-				RevisionID: encodeOptionalFleetID(evidence.RevisionID),
-				Start:      evidence.Start, End: evidence.End,
-				Visibility: append([]string(nil), evidence.Visibility...),
+				ObjectID: encodeID(evidence.ObjectID),
 			}
 		}
-
 		result.Events[i] = item
 	}
 	return result
+}
+
+func fleetEvidenceReferencesDomain(
+	values []fleetEvidenceReference,
+) ([]interaction.EvidenceReference, error) {
+	result := make([]interaction.EvidenceReference, len(values))
+	for i, value := range values {
+		anchorID, err := decodeID(value.AnchorID)
+		if err != nil {
+			return nil, err
+		}
+		result[i] = interaction.EvidenceReference{
+			AnchorID: anchorID, Kind: value.Kind,
+			Citation: document.Citation{
+				Range: document.SourceRange{
+					Start: document.SourcePosition{Offset: value.Citation.Start, Page: value.Citation.StartPage},
+					End:   document.SourcePosition{Offset: value.Citation.End, Page: value.Citation.EndPage},
+				},
+			},
+		}
+		for _, field := range []struct {
+			input  string
+			target *shoal.ID
+		}{
+			{value.Citation.DocumentID, &result[i].Citation.DocumentID},
+			{value.Citation.RevisionID, &result[i].Citation.RevisionID},
+			{value.Citation.SectionID, &result[i].Citation.SectionID},
+			{value.Citation.SpanID, &result[i].Citation.SpanID},
+		} {
+			if field.input == "" {
+				continue
+			}
+			*field.target, err = decodeID(field.input)
+			if err != nil {
+				return nil, err
+			}
+		}
+		result[i].NodeIDs, err = decodeEventEvidenceIDs(value.NodeIDs)
+		if err != nil {
+			return nil, err
+		}
+		result[i].EdgeIDs, err = decodeEventEvidenceIDs(value.EdgeIDs)
+		if err != nil {
+			return nil, err
+		}
+		result[i].Assertions = make([]interaction.AssertionReference, len(value.Assertions))
+		for j, assertion := range value.Assertions {
+			assertionID, err := decodeID(assertion.AssertionID)
+			if err != nil {
+				return nil, err
+			}
+			edgeID, err := decodeID(assertion.EdgeID)
+			if err != nil {
+				return nil, err
+			}
+			result[i].Assertions[j] = interaction.AssertionReference{
+				AssertionID: assertionID, EdgeID: edgeID, Origin: assertion.Origin,
+			}
+		}
+	}
+	return result, nil
+}
+
+func fleetEvidenceReferencesFrom(
+	values []interaction.EvidenceReference,
+) []fleetEvidenceReference {
+	result := make([]fleetEvidenceReference, len(values))
+	for i, value := range values {
+		result[i] = fleetEvidenceReference{
+			AnchorID: encodeID(value.AnchorID), Kind: value.Kind,
+			Citation: fleetCitation{
+				DocumentID: encodeOptionalFleetID(value.Citation.DocumentID),
+				RevisionID: encodeOptionalFleetID(value.Citation.RevisionID),
+				SectionID:  encodeOptionalFleetID(value.Citation.SectionID),
+				SpanID:     encodeOptionalFleetID(value.Citation.SpanID),
+				Start:      value.Citation.Range.Start.Offset,
+				End:        value.Citation.Range.End.Offset,
+				StartPage:  value.Citation.Range.Start.Page,
+				EndPage:    value.Citation.Range.End.Page,
+			},
+			NodeIDs:    encodeEventEvidenceIDs(value.NodeIDs),
+			EdgeIDs:    encodeEventEvidenceIDs(value.EdgeIDs),
+			Assertions: make([]fleetAssertionReference, len(value.Assertions)),
+		}
+		for j, assertion := range value.Assertions {
+			result[i].Assertions[j] = fleetAssertionReference{
+				AssertionID: encodeID(assertion.AssertionID),
+				EdgeID:      encodeID(assertion.EdgeID), Origin: assertion.Origin,
+			}
+		}
+	}
+	return result
+}
+
+func encodeEventEvidenceIDs(values []shoal.ID) []string {
+	result := make([]string, len(values))
+	for i, value := range values {
+		result[i] = encodeID(value)
+	}
+	return result
+}
+
+func decodeEventEvidenceIDs(values []string) ([]shoal.ID, error) {
+	result := make([]shoal.ID, len(values))
+	for i, value := range values {
+		decoded, err := decodeID(value)
+		if err != nil {
+			return nil, err
+		}
+		result[i] = decoded
+	}
+	return result, nil
 }
 
 func encodeOptionalFleetID(value shoal.ID) string {

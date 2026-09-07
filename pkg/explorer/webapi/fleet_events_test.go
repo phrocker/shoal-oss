@@ -30,8 +30,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/phrocker/shoal-oss/pkg/document"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/explorer/fleetevents"
+	"github.com/phrocker/shoal-oss/pkg/interaction"
+	"github.com/phrocker/shoal-oss/pkg/ontology"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
@@ -304,22 +307,38 @@ func TestFleetEventTransportRoundTripsPublicIDs(t *testing.T) {
 		RetryUntil: time.Date(2026, 9, 6, 21, 0, 0, 0, time.UTC),
 		Evidence: []fleetEvidence{{
 			SourceID: "c291cmNl", PolicyID: "cG9saWN5", ObjectID: encodeID(object),
-			NodeID: encodeID("node"), EdgeID: encodeID("edge"),
-			AnchorID: encodeID("anchor"), RevisionID: encodeID("revision"),
-			Start: 3, End: 9, Visibility: []string{"A", "B"},
+		}},
+		ConsumedEvidence: []fleetEvidenceReference{{
+			AnchorID: encodeID("graph-anchor"), Kind: interaction.EvidenceGraph,
+			NodeIDs: []string{encodeID("node-a"), encodeID("node-b")},
+			EdgeIDs: []string{encodeID("edge")},
+			Assertions: []fleetAssertionReference{{
+				AssertionID: encodeID("assertion"), EdgeID: encodeID("edge"),
+				Origin: ontology.AssertionExplicit,
+			}},
+		}},
+		CitedEvidence: []fleetEvidenceReference{{
+			AnchorID: encodeID("document-anchor"), Kind: interaction.EvidenceDocument,
+			Citation: fleetCitation{
+				DocumentID: encodeID("document"), RevisionID: encodeID("revision"),
+				SectionID: encodeID("section"), SpanID: encodeID("span"),
+				Start: 3, End: 9, StartPage: 1, EndPage: 2,
+			},
+			NodeIDs: []string{encodeID("document"), encodeID("section"), encodeID("span")},
 		}},
 	}).domain()
 	if err != nil {
 		t.Fatal(err)
 	}
 	if publish.Event.Evidence[0].ObjectID != object ||
-		publish.Event.Evidence[0].NodeID != "node" ||
-		publish.Event.Evidence[0].EdgeID != "edge" ||
-		publish.Event.Evidence[0].AnchorID != "anchor" ||
-		publish.Event.Evidence[0].RevisionID != "revision" ||
-		publish.Event.Evidence[0].Start != 3 ||
-		publish.Event.Evidence[0].End != 9 ||
-		!reflect.DeepEqual(publish.Event.Evidence[0].Visibility, []string{"A", "B"}) ||
+		len(publish.Event.ConsumedEvidence) != 1 ||
+		publish.Event.ConsumedEvidence[0].AnchorID != "graph-anchor" ||
+		!reflect.DeepEqual(publish.Event.ConsumedEvidence[0].NodeIDs,
+			[]shoal.ID{"node-a", "node-b"}) ||
+		len(publish.Event.ConsumedEvidence[0].Assertions) != 1 ||
+		len(publish.Event.CitedEvidence) != 1 ||
+		publish.Event.CitedEvidence[0].Citation.RevisionID != "revision" ||
+		publish.Event.CitedEvidence[0].Citation.Range.Start.Page != 1 ||
 		publish.Event.ProducerGeneration != 9 ||
 		!publish.RetryUntil.Equal(time.Date(2026, 9, 6, 21, 0, 0, 0, time.UTC)) ||
 		!bytes.Equal(publish.Event.TransitionID, []byte("transition")) {
@@ -330,9 +349,26 @@ func TestFleetEventTransportRoundTripsPublicIDs(t *testing.T) {
 		ProducerGeneration: 9, ActionID: []byte("action"),
 		TransitionID: []byte("transition"),
 		Evidence: []fleetevents.Evidence{{
-			ObjectID: object, NodeID: "node", EdgeID: "edge",
-			AnchorID: "anchor", RevisionID: "revision",
-			Start: 3, End: 9, Visibility: []string{"A", "B"},
+			SourceID: []byte("source"), PolicyID: []byte("policy"), ObjectID: object,
+		}},
+		ConsumedEvidence: []interaction.EvidenceReference{{
+			AnchorID: "graph-anchor", Kind: interaction.EvidenceGraph,
+			NodeIDs: []shoal.ID{"node-a", "node-b"}, EdgeIDs: []shoal.ID{"edge"},
+			Assertions: []interaction.AssertionReference{{
+				AssertionID: "assertion", EdgeID: "edge", Origin: ontology.AssertionExplicit,
+			}},
+		}},
+		CitedEvidence: []interaction.EvidenceReference{{
+			AnchorID: "document-anchor", Kind: interaction.EvidenceDocument,
+			Citation: document.Citation{
+				DocumentID: "document", RevisionID: "revision",
+				SectionID: "section", SpanID: "span",
+				Range: document.SourceRange{
+					Start: document.SourcePosition{Offset: 3, Page: 1},
+					End:   document.SourcePosition{Offset: 9, Page: 2},
+				},
+			},
+			NodeIDs: []shoal.ID{"document", "section", "span"},
 		}},
 	}}})
 	decoded, err := decodeID(wire.Events[0].Evidence[0].ObjectID)
@@ -341,8 +377,10 @@ func TestFleetEventTransportRoundTripsPublicIDs(t *testing.T) {
 	}
 	if wire.Events[0].ProducerGeneration != 9 ||
 		wire.Events[0].TransitionID != "dHJhbnNpdGlvbg" ||
-		wire.Events[0].Evidence[0].NodeID != encodeID("node") ||
-		!reflect.DeepEqual(wire.Events[0].Evidence[0].Visibility, []string{"A", "B"}) {
+		len(wire.Events[0].ConsumedEvidence) != 1 ||
+		wire.Events[0].ConsumedEvidence[0].Assertions[0].Origin != ontology.AssertionExplicit ||
+		len(wire.Events[0].CitedEvidence) != 1 ||
+		wire.Events[0].CitedEvidence[0].Citation.SpanID != encodeID("span") {
 		t.Fatalf("wire transition identity = %#v", wire.Events[0])
 	}
 }

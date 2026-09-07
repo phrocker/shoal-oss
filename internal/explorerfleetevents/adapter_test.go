@@ -31,12 +31,14 @@ import (
 	"time"
 
 	"github.com/phrocker/shoal-oss/internal/explorercoord"
+	"github.com/phrocker/shoal-oss/pkg/document"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/explorer/coordination"
 	"github.com/phrocker/shoal-oss/pkg/explorer/coordination/guard"
 	"github.com/phrocker/shoal-oss/pkg/explorer/coordination/transaction"
 	"github.com/phrocker/shoal-oss/pkg/explorer/fleetevents"
 	"github.com/phrocker/shoal-oss/pkg/interaction"
+	"github.com/phrocker/shoal-oss/pkg/ontology"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
@@ -170,10 +172,39 @@ func TestAdapterOpaqueIDsRemainByteSafeAcrossRestart(t *testing.T) {
 	event := testEvent(0)
 	event.ProducerID = []byte{0xff, 0x00}
 	event.Evidence[0].ObjectID = shoal.ID(string([]byte{0xff}))
-	event.Evidence[0].NodeID = shoal.ID(string([]byte{0xfe}))
-	event.Evidence[0].EdgeID = shoal.ID(string([]byte{0xfd}))
-	event.Evidence[0].AnchorID = shoal.ID(string([]byte{0xfc}))
-	event.Evidence[0].RevisionID = shoal.ID(string([]byte{0xfb}))
+	event.ConsumedEvidence = []interaction.EvidenceReference{{
+		AnchorID: shoal.ID(string([]byte{0xfc})),
+		Kind:     interaction.EvidenceGraph,
+		NodeIDs: []shoal.ID{
+			shoal.ID(string([]byte{0xfe})),
+			shoal.ID(string([]byte{0xfb})),
+		},
+		EdgeIDs: []shoal.ID{shoal.ID(string([]byte{0xfd}))},
+		Assertions: []interaction.AssertionReference{{
+			AssertionID: shoal.ID(string([]byte{0xfa})),
+			EdgeID:      shoal.ID(string([]byte{0xfd})),
+			Origin:      ontology.AssertionDerived,
+		}},
+	}}
+	event.CitedEvidence = []interaction.EvidenceReference{{
+		AnchorID: shoal.ID(string([]byte{0xf9})),
+		Kind:     interaction.EvidenceDocument,
+		Citation: document.Citation{
+			DocumentID: shoal.ID(string([]byte{0xf8})),
+			RevisionID: shoal.ID(string([]byte{0xf7})),
+			SectionID:  shoal.ID(string([]byte{0xf6})),
+			SpanID:     shoal.ID(string([]byte{0xf5})),
+			Range: document.SourceRange{
+				Start: document.SourcePosition{Offset: 3, Page: 1},
+				End:   document.SourcePosition{Offset: 9, Page: 2},
+			},
+		},
+		NodeIDs: []shoal.ID{
+			shoal.ID(string([]byte{0xf8})),
+			shoal.ID(string([]byte{0xf6})),
+			shoal.ID(string([]byte{0xf5})),
+		},
+	}}
 	if _, err := adapter.Append(ctx, fleetevents.PublishRequest{
 		Token: []byte("opaque-event"), RetryUntil: now.Add(time.Hour),
 		Event: event,
@@ -204,7 +235,9 @@ func TestAdapterOpaqueIDsRemainByteSafeAcrossRestart(t *testing.T) {
 			ProducerID: event.ProducerID, ProducerGeneration: event.ProducerGeneration,
 			ActionID: event.ActionID, TransitionID: event.TransitionID,
 			CorrelationID: event.CorrelationID, Reason: event.Reason,
-			Evidence: event.Evidence, OccurredAt: event.OccurredAt,
+			Evidence: event.Evidence, ConsumedEvidence: event.ConsumedEvidence,
+			CitedEvidence: event.CitedEvidence,
+			OccurredAt:    event.OccurredAt,
 		}) {
 		t.Fatalf("reloaded event = %#v, %v", events, err)
 	}

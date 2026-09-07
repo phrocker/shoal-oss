@@ -24,6 +24,7 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
@@ -407,6 +408,50 @@ func TestEventRequiresProducerGenerationAndTransitionIdentity(t *testing.T) {
 	event.TransitionID = nil
 	if _, err := normalizeEvent(event, true); err == nil {
 		t.Fatal("empty transition identity succeeded")
+	}
+}
+
+func TestEventRejectsConflictingEvidenceAnchorAcrossGroups(t *testing.T) {
+	event := eventAt(1)
+	event.ConsumedEvidence = []interaction.EvidenceReference{{
+		AnchorID: "shared-anchor", Kind: interaction.EvidenceGraph,
+		NodeIDs: []shoal.ID{"consumed-node"},
+	}}
+	event.CitedEvidence = []interaction.EvidenceReference{{
+		AnchorID: "shared-anchor", Kind: interaction.EvidenceGraph,
+		NodeIDs: []shoal.ID{"cited-node"},
+	}}
+	if _, err := normalizeEvent(event, true); err == nil {
+		t.Fatal("conflicting consumed/cited anchor succeeded")
+	}
+}
+
+func TestEventPreservesEvidenceGroupAndGraphPathOrder(t *testing.T) {
+	event := eventAt(1)
+	event.ConsumedEvidence = []interaction.EvidenceReference{
+		{
+			AnchorID: "second-anchor", Kind: interaction.EvidenceGraph,
+			NodeIDs: []shoal.ID{"node-b", "node-a"}, EdgeIDs: []shoal.ID{"edge-b-a"},
+		},
+		{
+			AnchorID: "first-anchor", Kind: interaction.EvidenceGraph,
+			NodeIDs: []shoal.ID{"node-a"},
+		},
+	}
+	event.CitedEvidence = []interaction.EvidenceReference{{
+		AnchorID: "cited-anchor", Kind: interaction.EvidenceGraph,
+		NodeIDs: []shoal.ID{"cited-node"},
+	}}
+	normalized, err := normalizeEvent(event, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if normalized.ConsumedEvidence[0].AnchorID != "second-anchor" ||
+		!reflect.DeepEqual(normalized.ConsumedEvidence[0].NodeIDs,
+			[]shoal.ID{"node-b", "node-a"}) ||
+		normalized.CitedEvidence[0].AnchorID != "cited-anchor" {
+		t.Fatalf("normalized evidence = %#v / %#v",
+			normalized.ConsumedEvidence, normalized.CitedEvidence)
 	}
 }
 

@@ -64,20 +64,12 @@ var (
 	ErrSubscriptionNotFound = errors.New("fleet events: subscription not found")
 )
 
-// Evidence is the complete authorization join for an event. It contains only
-// opaque identities; event payloads, credentials, callbacks, and egress
-// destinations are deliberately absent from this API.
+// Evidence is the authorization join for an event. Exact consumed and cited
+// evidence remains grouped separately on Event.
 type Evidence struct {
-	SourceID   []byte
-	PolicyID   []byte
-	ObjectID   shoal.ID
-	NodeID     shoal.ID
-	EdgeID     shoal.ID
-	AnchorID   shoal.ID
-	RevisionID shoal.ID
-	Start      int64
-	End        int64
-	Visibility []string
+	SourceID []byte
+	PolicyID []byte
+	ObjectID shoal.ID
 }
 
 // Event is one committed event envelope. Sequence is assigned by the durable
@@ -93,6 +85,8 @@ type Event struct {
 	CorrelationID      []byte
 	Reason             interaction.Reason
 	Evidence           []Evidence
+	ConsumedEvidence   []interaction.EvidenceReference
+	CitedEvidence      []interaction.EvidenceReference
 	OccurredAt         time.Time
 }
 
@@ -170,6 +164,8 @@ type AuditRecord struct {
 	CorrelationID            []byte
 	ObjectID                 []byte
 	Evidence                 []Evidence
+	ConsumedEvidence         []interaction.EvidenceReference
+	CitedEvidence            []interaction.EvidenceReference
 	AuthorizationFingerprint auth.Fingerprint
 	AuthorizationExpiresAt   time.Time
 	OccurredAt               time.Time
@@ -213,6 +209,8 @@ func cloneEvent(event Event) Event {
 	result.TransitionID = cloneBytes(event.TransitionID)
 	result.CorrelationID = cloneBytes(event.CorrelationID)
 	result.Evidence = cloneEvidence(event.Evidence)
+	result.ConsumedEvidence = cloneEvidenceReferences(event.ConsumedEvidence)
+	result.CitedEvidence = cloneEvidenceReferences(event.CitedEvidence)
 	return result
 }
 
@@ -222,12 +220,25 @@ func cloneEvidence(evidence []Evidence) []Evidence {
 		result[i] = Evidence{
 			SourceID: cloneBytes(evidence[i].SourceID),
 			PolicyID: cloneBytes(evidence[i].PolicyID),
-			ObjectID: evidence[i].ObjectID, NodeID: evidence[i].NodeID,
-			EdgeID: evidence[i].EdgeID, AnchorID: evidence[i].AnchorID,
-			RevisionID: evidence[i].RevisionID, Start: evidence[i].Start,
-			End:        evidence[i].End,
-			Visibility: append([]string(nil), evidence[i].Visibility...),
+			ObjectID: evidence[i].ObjectID,
 		}
+	}
+	return result
+}
+
+func cloneEvidenceReferences(
+	references []interaction.EvidenceReference,
+) []interaction.EvidenceReference {
+	if len(references) == 0 {
+		return nil
+	}
+	result := make([]interaction.EvidenceReference, len(references))
+	for i, reference := range references {
+		result[i] = reference
+		result[i].NodeIDs = append([]shoal.ID(nil), reference.NodeIDs...)
+		result[i].EdgeIDs = append([]shoal.ID(nil), reference.EdgeIDs...)
+		result[i].Assertions = append(
+			[]interaction.AssertionReference(nil), reference.Assertions...)
 	}
 	return result
 }
@@ -315,9 +326,6 @@ func normalizeEvent(event Event, requireSequence bool) (Event, error) {
 		if err := shoal.ValidateRequiredID("event object ID", result.Evidence[i].ObjectID); err != nil {
 			return Event{}, err
 		}
-		if err := validateEventEvidenceReference(result.Evidence[i]); err != nil {
-			return Event{}, err
-		}
 	}
 	sort.Slice(result.Evidence, func(i, j int) bool {
 		return compareEvidence(result.Evidence[i], result.Evidence[j]) < 0
@@ -327,6 +335,12 @@ func normalizeEvent(event Event, requireSequence bool) (Event, error) {
 			return Event{}, shoal.NewError(shoal.ErrorInvalidArgument, "event evidence contains a duplicate")
 		}
 	}
+	consumed, cited, err := canonicalEvidenceGroups(
+		result.ConsumedEvidence, result.CitedEvidence)
+	if err != nil {
+		return Event{}, err
+	}
+	result.ConsumedEvidence, result.CitedEvidence = consumed, cited
 	if result.OccurredAt.IsZero() || result.OccurredAt.Location() != time.UTC {
 		return Event{}, shoal.NewError(shoal.ErrorInvalidArgument, "event occurrence time must be UTC")
 	}
@@ -338,91 +352,50 @@ func compareEvidence(left, right Evidence) int {
 		{left.SourceID, right.SourceID},
 		{left.PolicyID, right.PolicyID},
 		{[]byte(left.ObjectID), []byte(right.ObjectID)},
-		{[]byte(left.NodeID), []byte(right.NodeID)},
-		{[]byte(left.EdgeID), []byte(right.EdgeID)},
-		{[]byte(left.AnchorID), []byte(right.AnchorID)},
-		{[]byte(left.RevisionID), []byte(right.RevisionID)},
 	} {
 		if comparison := bytes.Compare(pair[0], pair[1]); comparison != 0 {
 			return comparison
 		}
 	}
-	if left.Start < right.Start {
-		return -1
-	}
-	if left.Start > right.Start {
-		return 1
-	}
-	if left.End < right.End {
-		return -1
-	}
-	if left.End > right.End {
-		return 1
-	}
-	for index := 0; index < len(left.Visibility) && index < len(right.Visibility); index++ {
-		if left.Visibility[index] < right.Visibility[index] {
-			return -1
-		}
-		if left.Visibility[index] > right.Visibility[index] {
-			return 1
-		}
-	}
-	if len(left.Visibility) < len(right.Visibility) {
-		return -1
-	}
-	if len(left.Visibility) > len(right.Visibility) {
-		return 1
-	}
 	return 0
 }
 
-func validateEventEvidenceReference(value Evidence) error {
-	hasReference := value.NodeID != "" || value.EdgeID != "" ||
-		value.AnchorID != "" || value.RevisionID != "" ||
-		value.Start != 0 || value.End != 0 || len(value.Visibility) != 0
-	if !hasReference {
-		return nil
+func canonicalEvidenceGroups(
+	consumed, cited []interaction.EvidenceReference,
+) ([]interaction.EvidenceReference, []interaction.EvidenceReference, error) {
+	if len(consumed)+len(cited) > MaxEvidence {
+		return nil, nil, shoal.NewError(
+			shoal.ErrorInvalidArgument, "event exact evidence exceeds its bound")
 	}
-	if value.NodeID == "" && value.EdgeID == "" {
-		return shoal.NewError(
-			shoal.ErrorInvalidArgument, "event evidence node or edge is required")
-	}
-	for name, id := range map[string]shoal.ID{
-		"event evidence node": value.NodeID, "event evidence edge": value.EdgeID,
-		"event evidence anchor":   value.AnchorID,
-		"event evidence revision": value.RevisionID,
-	} {
-		if err := shoal.ValidateOptionalID(name, id); err != nil {
-			return err
+	canonicalize := func(
+		values []interaction.EvidenceReference,
+	) ([]interaction.EvidenceReference, error) {
+		result := make([]interaction.EvidenceReference, len(values))
+		for i, value := range values {
+			canonical, err := value.Canonical()
+			if err != nil {
+				return nil, err
+			}
+			result[i] = canonical
 		}
+		return result, nil
 	}
-	if value.Start < 0 || value.End < value.Start {
-		return shoal.NewError(
-			shoal.ErrorInvalidArgument, "event evidence range is invalid")
-	}
-	if value.AnchorID == "" && (value.Start != 0 || value.End != 0) {
-		return shoal.NewError(
-			shoal.ErrorInvalidArgument, "event evidence range requires an anchor")
-	}
-	if len(value.Visibility) == 0 {
-		return shoal.NewError(
-			shoal.ErrorInvalidArgument, "event evidence visibility is required")
-	}
-	normalized, err := interaction.Conjoin(value.Visibility)
+	canonicalConsumed, err := canonicalize(consumed)
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
-	if len(normalized) != len(value.Visibility) {
-		return shoal.NewError(
-			shoal.ErrorInvalidArgument, "event evidence visibility must be canonical")
+	canonicalCited, err := canonicalize(cited)
+	if err != nil {
+		return nil, nil, err
 	}
-	for index := range normalized {
-		if normalized[index] != value.Visibility[index] {
-			return shoal.NewError(
-				shoal.ErrorInvalidArgument, "event evidence visibility must be canonical")
-		}
+	session := interaction.Session{
+		SeedEvidence:  canonicalConsumed,
+		CitedEvidence: canonicalCited,
 	}
-	return nil
+	if _, err := session.EvidenceReferences(); err != nil {
+		return nil, nil, err
+	}
+	return canonicalConsumed, canonicalCited, nil
 }
 
 func validateID(name string, value []byte, optional bool) error {

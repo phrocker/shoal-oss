@@ -277,7 +277,9 @@ func TestActionEventPublisherPreservesExecutorEvidence(t *testing.T) {
 		SourceID: []byte("source"), PolicyID: []byte("policy"), ObjectID: "object",
 		Reason: interaction.Reason{Code: "completed"}, UpdatedAt: now,
 		Evidence: []fleet.EvidenceRef{{
+			Kind:       interaction.EvidenceGraph,
 			NodeIDs:    []shoal.ID{"node", "node"},
+			EdgeIDs:    []shoal.ID{"edge"},
 			AnchorID:   "anchor",
 			Visibility: []string{"A", "B"},
 		}},
@@ -287,18 +289,21 @@ func TestActionEventPublisherPreservesExecutorEvidence(t *testing.T) {
 	); err != nil {
 		t.Fatal(err)
 	}
-	if backend.appends != 1 || len(backend.request.Event.Evidence) != 2 {
-		t.Fatalf("preserved evidence = %#v", backend.request.Event.Evidence)
+	if backend.appends != 1 || len(backend.request.Event.Evidence) != 1 ||
+		len(backend.request.Event.ConsumedEvidence) != 1 {
+		t.Fatalf("preserved evidence = %#v / %#v",
+			backend.request.Event.Evidence, backend.request.Event.ConsumedEvidence)
 	}
-	evidence := backend.request.Event.Evidence[1]
-	if evidence.NodeID != "node" || evidence.EdgeID != "" ||
+	evidence := backend.request.Event.ConsumedEvidence[0]
+	if !reflect.DeepEqual(evidence.NodeIDs, []shoal.ID{"node", "node"}) ||
+		!reflect.DeepEqual(evidence.EdgeIDs, []shoal.ID{"edge"}) ||
 		evidence.AnchorID != "anchor" ||
-		!reflect.DeepEqual(evidence.Visibility, []string{"A", "B"}) {
+		evidence.Kind != interaction.EvidenceGraph {
 		t.Fatalf("executor evidence = %#v", evidence)
 	}
-	record.Evidence[0].Visibility[0] = "changed"
-	if evidence.Visibility[0] != "A" {
-		t.Fatal("event evidence visibility aliases the action record")
+	record.Evidence[0].NodeIDs[0] = "changed"
+	if evidence.NodeIDs[0] != "node" {
+		t.Fatal("event evidence aliases the action record")
 	}
 }
 

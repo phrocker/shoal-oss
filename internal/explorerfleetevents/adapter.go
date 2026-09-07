@@ -33,12 +33,14 @@ import (
 	"time"
 
 	"github.com/phrocker/shoal-oss/internal/explorercoord"
+	"github.com/phrocker/shoal-oss/pkg/document"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/explorer/coordination"
 	"github.com/phrocker/shoal-oss/pkg/explorer/coordination/guard"
 	"github.com/phrocker/shoal-oss/pkg/explorer/coordination/transaction"
 	"github.com/phrocker/shoal-oss/pkg/explorer/fleetevents"
 	"github.com/phrocker/shoal-oss/pkg/interaction"
+	"github.com/phrocker/shoal-oss/pkg/ontology"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
@@ -138,11 +140,28 @@ type subscriptionWire struct {
 }
 
 type evidenceWire struct {
-	SourceID, PolicyID       []byte
-	ObjectID, NodeID, EdgeID []byte
-	AnchorID, RevisionID     []byte
-	Start, End               int64
-	Visibility               []string
+	SourceID, PolicyID []byte
+	ObjectID           []byte
+}
+
+type evidenceReferenceWire struct {
+	AnchorID   []byte
+	Kind       interaction.EvidenceKind
+	Citation   citationWire
+	NodeIDs    [][]byte
+	EdgeIDs    [][]byte
+	Assertions []assertionReferenceWire
+}
+
+type citationWire struct {
+	DocumentID, RevisionID, SectionID, SpanID []byte
+	StartOffset, EndOffset                    int64
+	StartPage, EndPage                        int32
+}
+
+type assertionReferenceWire struct {
+	AssertionID, EdgeID []byte
+	Origin              ontology.AssertionOrigin
 }
 
 type eventWire struct {
@@ -153,6 +172,8 @@ type eventWire struct {
 	ProducerGeneration            int64
 	Reason                        interaction.Reason
 	Evidence                      []evidenceWire
+	ConsumedEvidence              []evidenceReferenceWire
+	CitedEvidence                 []evidenceReferenceWire
 	OccurredAt                    time.Time
 }
 
@@ -183,10 +204,7 @@ func eventToWire(value fleetevents.Event) eventWire {
 	for i, item := range value.Evidence {
 		evidence[i] = evidenceWire{
 			SourceID: item.SourceID, PolicyID: item.PolicyID,
-			ObjectID: []byte(item.ObjectID), NodeID: []byte(item.NodeID),
-			EdgeID: []byte(item.EdgeID), AnchorID: []byte(item.AnchorID),
-			RevisionID: []byte(item.RevisionID), Start: item.Start, End: item.End,
-			Visibility: item.Visibility,
+			ObjectID: []byte(item.ObjectID),
 		}
 	}
 	return eventWire{
@@ -194,7 +212,10 @@ func eventToWire(value fleetevents.Event) eventWire {
 		ProducerID: value.ProducerID, ProducerGeneration: value.ProducerGeneration,
 		ActionID: value.ActionID, TransitionID: value.TransitionID,
 		CorrelationID: value.CorrelationID, Reason: value.Reason,
-		Evidence: evidence, OccurredAt: value.OccurredAt,
+		Evidence:         evidence,
+		ConsumedEvidence: evidenceReferencesToWire(value.ConsumedEvidence),
+		CitedEvidence:    evidenceReferencesToWire(value.CitedEvidence),
+		OccurredAt:       value.OccurredAt,
 	}
 }
 
@@ -203,10 +224,7 @@ func (value eventWire) domain() fleetevents.Event {
 	for i, item := range value.Evidence {
 		evidence[i] = fleetevents.Evidence{
 			SourceID: item.SourceID, PolicyID: item.PolicyID,
-			ObjectID: shoal.ID(item.ObjectID), NodeID: shoal.ID(item.NodeID),
-			EdgeID: shoal.ID(item.EdgeID), AnchorID: shoal.ID(item.AnchorID),
-			RevisionID: shoal.ID(item.RevisionID), Start: item.Start, End: item.End,
-			Visibility: item.Visibility,
+			ObjectID: shoal.ID(item.ObjectID),
 		}
 	}
 	return fleetevents.Event{
@@ -214,8 +232,106 @@ func (value eventWire) domain() fleetevents.Event {
 		ProducerID: value.ProducerID, ProducerGeneration: value.ProducerGeneration,
 		ActionID: value.ActionID, TransitionID: value.TransitionID,
 		CorrelationID: value.CorrelationID, Reason: value.Reason,
-		Evidence: evidence, OccurredAt: value.OccurredAt,
+		Evidence:         evidence,
+		ConsumedEvidence: evidenceReferencesFromWire(value.ConsumedEvidence),
+		CitedEvidence:    evidenceReferencesFromWire(value.CitedEvidence),
+		OccurredAt:       value.OccurredAt,
 	}
+}
+
+func evidenceReferencesToWire(
+	values []interaction.EvidenceReference,
+) []evidenceReferenceWire {
+	if len(values) == 0 {
+		return nil
+	}
+	result := make([]evidenceReferenceWire, len(values))
+	for i, value := range values {
+		result[i] = evidenceReferenceWire{
+			AnchorID: []byte(value.AnchorID), Kind: value.Kind,
+			Citation: citationWire{
+				DocumentID:  []byte(value.Citation.DocumentID),
+				RevisionID:  []byte(value.Citation.RevisionID),
+				SectionID:   []byte(value.Citation.SectionID),
+				SpanID:      []byte(value.Citation.SpanID),
+				StartOffset: value.Citation.Range.Start.Offset,
+				EndOffset:   value.Citation.Range.End.Offset,
+				StartPage:   value.Citation.Range.Start.Page,
+				EndPage:     value.Citation.Range.End.Page,
+			},
+			NodeIDs:    idsToWire(value.NodeIDs),
+			EdgeIDs:    idsToWire(value.EdgeIDs),
+			Assertions: make([]assertionReferenceWire, len(value.Assertions)),
+		}
+		for j, assertion := range value.Assertions {
+			result[i].Assertions[j] = assertionReferenceWire{
+				AssertionID: []byte(assertion.AssertionID),
+				EdgeID:      []byte(assertion.EdgeID), Origin: assertion.Origin,
+			}
+		}
+	}
+	return result
+}
+
+func evidenceReferencesFromWire(
+	values []evidenceReferenceWire,
+) []interaction.EvidenceReference {
+	if len(values) == 0 {
+		return nil
+	}
+	result := make([]interaction.EvidenceReference, len(values))
+	for i, value := range values {
+		result[i] = interaction.EvidenceReference{
+			AnchorID: shoal.ID(value.AnchorID), Kind: value.Kind,
+			Citation: document.Citation{
+				DocumentID: shoal.ID(value.Citation.DocumentID),
+				RevisionID: shoal.ID(value.Citation.RevisionID),
+				SectionID:  shoal.ID(value.Citation.SectionID),
+				SpanID:     shoal.ID(value.Citation.SpanID),
+				Range: document.SourceRange{
+					Start: document.SourcePosition{
+						Offset: value.Citation.StartOffset, Page: value.Citation.StartPage},
+					End: document.SourcePosition{
+						Offset: value.Citation.EndOffset, Page: value.Citation.EndPage},
+				},
+			},
+			NodeIDs: idsFromWire(value.NodeIDs),
+			EdgeIDs: idsFromWire(value.EdgeIDs),
+		}
+		if len(value.Assertions) > 0 {
+			result[i].Assertions = make(
+				[]interaction.AssertionReference, len(value.Assertions))
+		}
+		for j, assertion := range value.Assertions {
+			result[i].Assertions[j] = interaction.AssertionReference{
+				AssertionID: shoal.ID(assertion.AssertionID),
+				EdgeID:      shoal.ID(assertion.EdgeID), Origin: assertion.Origin,
+			}
+		}
+	}
+	return result
+}
+
+func idsToWire(values []shoal.ID) [][]byte {
+	if len(values) == 0 {
+		return nil
+	}
+	result := make([][]byte, len(values))
+	for i, value := range values {
+		result[i] = []byte(value)
+	}
+	return result
+}
+
+func idsFromWire(values [][]byte) []shoal.ID {
+	if len(values) == 0 {
+		return nil
+	}
+	result := make([]shoal.ID, len(values))
+	for i, value := range values {
+		result[i] = shoal.ID(value)
+	}
+	return result
 }
 
 func (r subscriptionRecord) MarshalJSON() ([]byte, error) {

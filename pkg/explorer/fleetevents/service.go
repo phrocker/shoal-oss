@@ -157,7 +157,7 @@ func (s *Service) Create(ctx context.Context, request CreateRequest) (Subscripti
 	}
 	if err := s.record(
 		ctx, decision, auth.OperationSubscriptionCreate, request.Token,
-		subscription.ID, nil, subscription.CreatedAt,
+		subscription.ID, nil, nil, nil, subscription.CreatedAt,
 	); err != nil {
 		return Subscription{}, classifyAuditError(err)
 	}
@@ -195,7 +195,7 @@ func (s *Service) Delete(ctx context.Context, request DeleteRequest) error {
 	}
 	if err := s.record(
 		ctx, decision, auth.OperationSubscriptionDelete, request.SubscriptionID,
-		subscription.ID, nil, subscription.RevokedAt,
+		subscription.ID, nil, nil, nil, subscription.RevokedAt,
 	); err != nil {
 		return classifyAuditError(err)
 	}
@@ -296,7 +296,8 @@ func (s *Service) publish(
 	if lifecycleReceipt == nil {
 		recordErr = s.record(
 			ctx, decision, operation, request.Event.ActionID,
-			result.EventID, request.Event.Evidence, auditTime,
+			result.EventID, request.Event.Evidence,
+			request.Event.ConsumedEvidence, request.Event.CitedEvidence, auditTime,
 		)
 	} else {
 		recordErr = s.auditor.RecordFleetAction(ctx, AuditRecord{
@@ -307,6 +308,8 @@ func (s *Service) publish(
 			AuthorizationExpiresAt:   lifecycleReceipt.AuthorizationExpiresAt,
 			ObjectID:                 cloneBytes(result.EventID),
 			Evidence:                 cloneEvidence(request.Event.Evidence),
+			ConsumedEvidence:         cloneEvidenceReferences(request.Event.ConsumedEvidence),
+			CitedEvidence:            cloneEvidenceReferences(request.Event.CitedEvidence),
 			OccurredAt:               auditTime,
 		})
 	}
@@ -552,7 +555,8 @@ func (s *Service) authorize(
 
 func (s *Service) record(
 	ctx context.Context, decision auth.Decision, operation auth.Operation,
-	actionID, objectID []byte, evidence []Evidence, now time.Time,
+	actionID, objectID []byte, evidence []Evidence,
+	consumed, cited []interaction.EvidenceReference, now time.Time,
 ) error {
 	return s.auditor.RecordFleetAction(ctx, AuditRecord{
 		Operation: operation, ActionID: cloneBytes(actionID),
@@ -564,6 +568,8 @@ func (s *Service) record(
 		AuthorizationExpiresAt: decision.AuthenticationExpires(),
 		ObjectID:               cloneBytes(objectID),
 		Evidence:               cloneEvidence(evidence),
+		ConsumedEvidence:       cloneEvidenceReferences(consumed),
+		CitedEvidence:          cloneEvidenceReferences(cited),
 		OccurredAt:             now,
 	})
 }
