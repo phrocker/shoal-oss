@@ -89,6 +89,7 @@ type Explorer struct {
 	changeHistoryFloor             uint64
 	changeCursorKey                []byte
 	interactionRecordWriter        func([]byte, byte, any) error
+	indeterminateInteractionErr    error
 	readOnly                       bool
 	publication                    RecordPublicationAdapter
 	ownsEngine                     bool
@@ -852,6 +853,9 @@ func (e *Explorer) Neighborhood(
 func (e *Explorer) requireOpen() error {
 	if e.closed {
 		return shoal.NewError(shoal.ErrorUnavailable, "explorer is closed")
+	}
+	if e.indeterminateInteractionErr != nil {
+		return e.indeterminateInteractionErr
 	}
 	return nil
 }

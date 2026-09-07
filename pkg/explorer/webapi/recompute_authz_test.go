@@ -65,13 +65,14 @@ func newRecomputeAuthzFixture(t *testing.T) *recomputeAuthzFixture {
 			t.Fatal(err)
 		}
 		client, err := authorized.NewClient(authorized.Config{
-			Base:             corpus,
-			VectorScorer:     scorer,
-			Resolver:         authority.Resolver(),
-			PolicySelector:   selector,
-			PolicyStore:      store,
-			GenerationReader: authnGenerationReader{},
-			Clock:            time.Now,
+			Base:                   corpus,
+			VectorScorer:           scorer,
+			DerivedAssertionReader: corpus,
+			Resolver:               authority.Resolver(),
+			PolicySelector:         selector,
+			PolicyStore:            store,
+			GenerationReader:       authnGenerationReader{},
+			Clock:                  time.Now,
 		})
 		if err != nil {
 			t.Fatal(err)

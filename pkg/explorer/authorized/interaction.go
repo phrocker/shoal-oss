@@ -46,6 +46,12 @@ func (c *Client) EnsureInteractionSink(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	if _, ok := writer.(interaction.ResultSink); !ok {
+		return shoal.NewError(
+			shoal.ErrorUnavailable,
+			"trusted interaction result sink is unavailable",
+		)
+	}
 	if err := writer.EnsureInteractionSink(ctx); err != nil {
 		return directBaseError(err)
 	}
@@ -63,7 +69,11 @@ func (c *Client) AnalyticsInteractionSink() interaction.ResultSink {
 	if c == nil {
 		return nil
 	}
-	if _, err := c.interactionWriter(); err != nil {
+	writer, err := c.interactionWriter()
+	if err != nil {
+		return nil
+	}
+	if _, ok := writer.(interaction.ResultSink); !ok {
 		return nil
 	}
 	if isNilDependency(c.snapshotValidator) {
@@ -88,6 +98,12 @@ func (s operationInteractionSink) EnsureInteractionSink(
 	if err != nil {
 		return err
 	}
+	if _, ok := writer.(interaction.ResultSink); !ok {
+		return shoal.NewError(
+			shoal.ErrorUnavailable,
+			"trusted interaction result sink is unavailable",
+		)
+	}
 	if err := writer.EnsureInteractionSink(ctx); err != nil {
 		return directBaseError(err)
 	}
@@ -111,7 +127,7 @@ func (s operationInteractionSink) RecordInteractionResult(
 			shoal.ErrorUnavailable, "authorized interaction sink is unavailable")
 	}
 	session.AuthorizationOperation = string(s.operation)
-	return s.client.recordInteraction(ctx, session)
+	return s.client.recordInteraction(ctx, session, true)
 }
 
 // RecordInteraction appends one redacted interaction after verifying that its
@@ -121,7 +137,7 @@ func (s operationInteractionSink) RecordInteractionResult(
 func (c *Client) RecordInteraction(
 	ctx context.Context, session interaction.Session,
 ) error {
-	_, err := c.recordInteraction(ctx, session)
+	_, err := c.recordInteraction(ctx, session, false)
 	return err
 }
 
@@ -131,15 +147,22 @@ func (c *Client) RecordInteraction(
 func (c *Client) RecordInteractionResult(
 	ctx context.Context, session interaction.Session,
 ) (interaction.Session, error) {
-	return c.recordInteraction(ctx, session)
+	return c.recordInteraction(ctx, session, true)
 }
 
 func (c *Client) recordInteraction(
-	ctx context.Context, session interaction.Session,
+	ctx context.Context, session interaction.Session, requireResult bool,
 ) (interaction.Session, error) {
 	writer, err := c.interactionWriter()
 	if err != nil {
 		return interaction.Session{}, err
+	}
+	resultWriter, hasResultWriter := writer.(interaction.ResultSink)
+	if requireResult && !hasResultWriter {
+		return interaction.Session{}, shoal.NewError(
+			shoal.ErrorUnavailable,
+			"trusted interaction result sink is unavailable",
+		)
 	}
 	authorizationOperation := auth.OperationRetrieve
 	if session.AuthorizationOperation != "" {
@@ -282,7 +305,7 @@ func (c *Client) recordInteraction(
 		return interaction.Session{}, err
 	}
 	persisted := canonical
-	if resultWriter, ok := writer.(interaction.ResultSink); ok {
+	if hasResultWriter {
 		persisted, err = resultWriter.RecordInteractionResult(ctx, canonical)
 	} else {
 		err = writer.RecordInteraction(ctx, canonical)
@@ -290,7 +313,7 @@ func (c *Client) recordInteraction(
 	if err != nil {
 		return persisted, directBaseError(err)
 	}
-	if _, ok := writer.(interaction.ResultSink); ok {
+	if hasResultWriter {
 		returned, canonicalErr := persisted.Canonical()
 		expected := canonical
 		expected.RecordedAt = returned.RecordedAt

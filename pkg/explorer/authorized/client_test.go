@@ -161,17 +161,19 @@ func (f *fixture) newClient(
 		t.Fatal(err)
 	}
 	client, err := authorized.NewClient(authorized.Config{
-		Base:               base,
-		VectorScorer:       trustedVectorScorer(base),
-		InteractionWriter:  trustedInteractionWriter(base),
-		InteractionReader:  trustedInteractionReader(base),
-		SnapshotValidator:  trustedSnapshotValidator(base),
-		Resolver:           f.authority.Resolver(),
-		PolicySelector:     selector,
-		EdgePolicySelector: edgeSelector,
-		PolicyStore:        store,
-		GenerationReader:   f.reader,
-		Clock:              f.clock.Now,
+		Base:                   base,
+		VectorScorer:           trustedVectorScorer(base),
+		InteractionWriter:      trustedInteractionWriter(base),
+		InteractionReader:      trustedInteractionReader(base),
+		SnapshotValidator:      trustedSnapshotValidator(base),
+		DerivedAssertionReader: trustedDerivedAssertionReader(base),
+		FoldStore:              trustedFoldStore(base),
+		Resolver:               f.authority.Resolver(),
+		PolicySelector:         selector,
+		EdgePolicySelector:     edgeSelector,
+		PolicyStore:            store,
+		GenerationReader:       f.reader,
+		Clock:                  f.clock.Now,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -197,6 +199,18 @@ func trustedInteractionWriter(base explorer.Client) explorer.InteractionWriter {
 func trustedSnapshotValidator(base explorer.Client) authorized.SnapshotValidator {
 	validator, _ := base.(authorized.SnapshotValidator)
 	return validator
+}
+
+func trustedDerivedAssertionReader(
+	base explorer.Client,
+) authorized.DerivedAssertionReader {
+	reader, _ := base.(authorized.DerivedAssertionReader)
+	return reader
+}
+
+func trustedFoldStore(base explorer.Client) authorized.FoldStore {
+	store, _ := base.(authorized.FoldStore)
+	return store
 }
 
 func (f *fixture) decision(
