@@ -309,6 +309,15 @@ func (e *Explorer) recordInteractionResult(
 				"interaction create was rejected without a durable winner",
 			)
 		}
+		if !visibilityCovered(
+			existing.Visibility,
+			interaction.Expression(requiredVisibility),
+		) {
+			return interaction.Session{}, shoal.NewError(
+				shoal.ErrorConflict,
+				"interaction retry requires stricter output visibility",
+			)
+		}
 		if err := interactionRetryResult(*existing, session); err != nil {
 			return interaction.Session{}, err
 		}

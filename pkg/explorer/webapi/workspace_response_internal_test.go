@@ -257,12 +257,10 @@ func TestRemoteIngestMarksUnknownPostDispatchOutcomes(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			calls := 0
 			client := &http.Client{Transport: roundTripFunc(func(
 				request *http.Request,
 			) (*http.Response, error) {
-				calls++
-				if calls == 1 {
+				if request.URL.Path == "/api/v1/meta" {
 					return &http.Response{
 						StatusCode: http.StatusOK,
 						Header:     make(http.Header),
@@ -314,12 +312,10 @@ func TestRemoteIngestKeepsVerifiedConflictDeterminate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	calls := 0
 	client := &http.Client{Transport: roundTripFunc(func(
 		request *http.Request,
 	) (*http.Response, error) {
-		calls++
-		if calls == 1 {
+		if request.URL.Path == "/api/v1/meta" {
 			return &http.Response{
 				StatusCode: http.StatusOK,
 				Header:     make(http.Header),
@@ -344,6 +340,93 @@ func TestRemoteIngestKeepsVerifiedConflictDeterminate(t *testing.T) {
 	if explorer.IsIndeterminateCommit(err) ||
 		!shoal.IsErrorCode(err, shoal.ErrorConflict) {
 		t.Fatalf("verified conflict error = %v", err)
+	}
+	_, err = remote.Ingest(context.Background(), IngestRequest{
+		Files: []UploadFile{
+			{Name: "first.txt", Content: []byte("first")},
+			{Name: "second.txt", Content: []byte("second")},
+		},
+	})
+	if !explorer.IsIndeterminateCommit(err) ||
+		!shoal.IsErrorCode(err, shoal.ErrorConflict) {
+		t.Fatalf("multi-file verified conflict = %v", err)
+	}
+}
+
+func TestRemoteAnalyticsMarksUnverifiedPostDispatchOutcomes(t *testing.T) {
+	limits := exploreranalytics.DefaultLimits()
+	metadata, err := json.Marshal(MetadataResponse{
+		MaxPageSize: MaxPageSize, MaxTopK: MaxTopK,
+		MaxDepth: MaxDepth, MaxFanout: MaxFanout,
+		MaxNodes: MaxNodes, MaxEdgeTypes: MaxEdgeTypes,
+		MaxResponseBytes:           MaxResponseBytes,
+		AnalyticsLimits:            &limits,
+		AnalyticsRecordingRequired: true,
+		Capabilities:               Capabilities{Analytics: true},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := AnalyticsRequest{Scope: exploreranalytics.Scope{
+		NodeIDs: []shoal.ID{"node"},
+		Depth:   1, Direction: explorer.GraphDirectionBoth,
+		Fanout: 1, MaxNodes: 1, MaxEdges: 1,
+		MaxScannedEdgesPerNode: 1,
+	}}
+	for _, test := range []struct {
+		name     string
+		response func() (*http.Response, error)
+	}{
+		{
+			name: "transport",
+			response: func() (*http.Response, error) {
+				return nil, errors.New("response unavailable")
+			},
+		},
+		{
+			name: "malformed failure",
+			response: func() (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusBadGateway,
+					Header:     make(http.Header),
+					Body:       io.NopCloser(strings.NewReader("{")),
+				}, nil
+			},
+		},
+		{
+			name: "malformed success",
+			response: func() (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     make(http.Header),
+					Body:       io.NopCloser(strings.NewReader("{")),
+				}, nil
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			client := &http.Client{Transport: roundTripFunc(func(
+				request *http.Request,
+			) (*http.Response, error) {
+				if request.URL.Path == "/api/v1/meta" {
+					return &http.Response{
+						StatusCode: http.StatusOK,
+						Header:     make(http.Header),
+						Body:       io.NopCloser(bytes.NewReader(metadata)),
+					}, nil
+				}
+				return test.response()
+			})}
+			remote, err := NewRemoteService("http://remote.example", client)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := remote.Analytics(
+				context.Background(), request,
+			); !explorer.IsIndeterminateCommit(err) {
+				t.Fatalf("remote analytics error = %v", err)
+			}
+		})
 	}
 }
 

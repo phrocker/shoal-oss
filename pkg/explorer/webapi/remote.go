@@ -154,7 +154,8 @@ func (s *RemoteService) Ingest(
 	defer httpResponse.Body.Close()
 	if httpResponse.StatusCode < 200 || httpResponse.StatusCode >= 300 {
 		remoteErr, verified := decodeRemoteErrorOutcome(httpResponse)
-		if !verified && !explorer.IsIndeterminateCommit(remoteErr) {
+		if (len(request.Files) > 1 || !verified) &&
+			!explorer.IsIndeterminateCommit(remoteErr) {
 			remoteErr = explorer.MarkIndeterminateCommit(remoteErr)
 		}
 		return IngestResponse{}, remoteErr
@@ -467,9 +468,9 @@ func (s *RemoteService) Analytics(
 		return AnalyticsResponse{}, err
 	}
 	var response AnalyticsResponse
-	if err := s.post(
+	if err := s.postWithCommitOutcome(
 		ctx, CapabilityAnalytics, "analytics", request, &response,
-		maxRemoteResponseBytes,
+		maxRemoteResponseBytes, true,
 	); err != nil {
 		return AnalyticsResponse{}, err
 	}
@@ -489,6 +490,19 @@ func (s *RemoteService) post(
 	response any,
 	responseLimit int64,
 ) error {
+	return s.postWithCommitOutcome(
+		ctx, capability, path, request, response, responseLimit, false)
+}
+
+func (s *RemoteService) postWithCommitOutcome(
+	ctx context.Context,
+	capability Capability,
+	path string,
+	request any,
+	response any,
+	responseLimit int64,
+	mayCommit bool,
+) error {
 	if err := s.ensureCapability(ctx, capability); err != nil {
 		return err
 	}
@@ -505,16 +519,29 @@ func (s *RemoteService) post(
 	httpRequest.Header.Set("Accept", "application/json")
 	httpResponse, err := s.client.Do(httpRequest)
 	if err != nil {
-		return shoal.WrapError(
+		remoteErr := shoal.WrapError(
 			remoteTransportCode(err), "remote workspace unavailable", err)
+		if mayCommit {
+			return explorer.MarkIndeterminateCommit(remoteErr)
+		}
+		return remoteErr
 	}
 	defer httpResponse.Body.Close()
 	if httpResponse.StatusCode < 200 || httpResponse.StatusCode >= 300 {
-		return decodeRemoteError(httpResponse)
+		remoteErr, verified := decodeRemoteErrorOutcome(httpResponse)
+		if mayCommit && !verified &&
+			!explorer.IsIndeterminateCommit(remoteErr) {
+			remoteErr = explorer.MarkIndeterminateCommit(remoteErr)
+		}
+		return remoteErr
 	}
 	if err := decodeOneJSON(httpResponse.Body, response, responseLimit); err != nil {
-		return shoal.WrapError(
+		remoteErr := shoal.WrapError(
 			remoteDecodeCode(err), "decode remote workspace response", err)
+		if mayCommit {
+			return explorer.MarkIndeterminateCommit(remoteErr)
+		}
+		return remoteErr
 	}
 	return nil
 }
