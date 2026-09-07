@@ -27,12 +27,56 @@ import (
 	"time"
 
 	"github.com/phrocker/shoal-oss/accumulo"
+	"github.com/phrocker/shoal-oss/internal/engine"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/ontology"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
 var testNow = time.Date(2026, 9, 5, 18, 0, 0, 0, time.UTC)
+
+func TestSharedEngineStoreIsNonOwning(t *testing.T) {
+	eng, err := engine.Open(t.TempDir(), engine.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close()
+	store, err := NewDurableStoreFromEngine(eng)
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err := store.CompareAndSwap(
+		context.Background(), "shared-workspace", "owner", []byte("domain"),
+		0, "create", Narrowing{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	peer, err := NewDurableStoreFromEngine(eng)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := peer.CompareAndSwap(
+		context.Background(), "shared-workspace", "owner", []byte("domain"),
+		0, "conflicting-create", Narrowing{},
+	); !shoal.IsErrorCode(err, shoal.ErrorConflict) {
+		t.Fatalf("peer stale revision error = %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := peer.Load(context.Background(), "shared-workspace")
+	if err != nil {
+		t.Fatalf("shared engine was closed by peer store: %v", err)
+	}
+	if loaded.Revision != created.Revision ||
+		loaded.SettingsID != created.SettingsID {
+		t.Fatalf("peer loaded settings = %#v, want %#v", loaded, created)
+	}
+	if err := peer.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
 
 type mutableResolver struct {
 	mu       sync.RWMutex

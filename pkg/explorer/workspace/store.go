@@ -81,7 +81,8 @@ type DurableStore struct {
 	conditionalWrite func(
 		string, []engine.ConditionalMutation,
 	) ([]bool, error)
-	closed bool
+	ownsEngine bool
+	closed     bool
 }
 
 type persistedSettings struct {
@@ -151,10 +152,36 @@ func OpenDurableStore(dir string) (*DurableStore, error) {
 		engine:           eng,
 		lock:             lock,
 		conditionalWrite: eng.ConditionalWrite,
+		ownsEngine:       true,
 	}, nil
 }
 
-// Close flushes and closes the settings engine.
+// NewDurableStoreFromEngine creates a non-owning settings store backed by an
+// already-open shared engine. Closing the store never closes the engine.
+func NewDurableStoreFromEngine(eng *engine.Engine) (*DurableStore, error) {
+	if eng == nil {
+		return nil, invalid("shared settings engine is required")
+	}
+	found := false
+	for _, table := range eng.TableNames() {
+		if table == settingsTable {
+			found = true
+			break
+		}
+	}
+	if !found {
+		if err := eng.CreateTable(settingsTable, engine.TableOptions{}); err != nil {
+			return nil, shoal.WrapError(
+				shoal.ErrorInternal, "create workspace settings table", err)
+		}
+	}
+	return &DurableStore{
+		engine: eng, conditionalWrite: eng.ConditionalWrite,
+	}, nil
+}
+
+// Close releases resources owned by the store. A store created from a shared
+// engine becomes unusable without closing that engine.
 func (s *DurableStore) Close() error {
 	if s == nil {
 		return nil
@@ -165,8 +192,13 @@ func (s *DurableStore) Close() error {
 		return nil
 	}
 	s.closed = true
-	engineErr := s.engine.Close()
-	lockErr := s.lock.Close()
+	var engineErr, lockErr error
+	if s.ownsEngine {
+		engineErr = s.engine.Close()
+		if s.lock != nil {
+			lockErr = s.lock.Close()
+		}
+	}
 	if engineErr != nil || lockErr != nil {
 		return shoal.WrapError(
 			shoal.ErrorInternal,

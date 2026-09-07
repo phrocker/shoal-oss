@@ -92,20 +92,24 @@ both persistent directories inside it:
 
 ```
 /var/lib/shoal/                 <- the declared VOLUME (mount THIS, persist THIS)
-├── corpus/                      <- the document corpus
-│   └── _shoal_explorer/         <- the corpus engine's table
+├── corpus/                      <- the shared corpus engine
+│   ├── _shoal_explorer/         <- the document corpus table
+│   └── _shoal_workspace_settings/ <- workspace settings in the same engine
 └── policy/                      <- the durable authorization catalog (#284/#288)
     └── _shoal_policy/           <- the policy store's table
 ```
 
 **One sentence: persist `/var/lib/shoal` — the whole state root — and both the
-corpus and the authorization catalog survive a restart.**
+corpus (including workspace settings) and authorization catalog survive a
+restart.**
 
 The authorization catalog is a **sibling** of the corpus, never a child of it:
 the corpus engine treats every subdirectory of the corpus directory as a table,
 so nesting the catalog there would corrupt table discovery. `-state-dir` keeps
 them as siblings under one mount, which removes the earlier string-suffix
-coupling entirely.
+coupling entirely. Workspace settings are different: they intentionally use a
+dedicated table in the already-open corpus engine, so the host does not open a
+second WAL, directory lock, or sidecar settings engine.
 
 Flag precedence (see `resolveWorkspacePaths` and `TestResolveWorkspacePathsPrecedence`):
 

@@ -117,6 +117,20 @@ type Runtime struct {
 	intentCursor        []byte
 }
 
+// SharedEngine returns the runtime-owned engine for non-owning stores that
+// share this runtime's lifecycle. Callers must not close the returned engine.
+func (r *Runtime) SharedEngine() (*engine.Engine, error) {
+	if r == nil {
+		return nil, transaction.ErrUnavailable
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if r.closed || r.engine == nil {
+		return nil, transaction.ErrUnavailable
+	}
+	return r.engine, nil
+}
+
 func Open(config Config) (*Runtime, error) {
 	if strings.TrimSpace(config.Directory) == "" {
 		return nil, errors.Join(transaction.ErrInvalid, errors.New("runtime directory is required"))

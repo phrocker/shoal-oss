@@ -71,8 +71,8 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 	backend := flags.String("backend", "embedded", "Explorer backend: embedded or remote")
 	stateDir := flags.String(
 		"state-dir", "",
-		"Recommended workspace state root. The corpus and durable policy "+
-			"catalog and settings are created as corpus/, policy/, and settings/ "+
+		"Recommended workspace state root. The corpus (including workspace "+
+			"settings) and durable policy catalog are created as corpus/ and policy/ "+
 			"inside it, so mounting "+
 			"this one directory as a volume persists everything a restart "+
 			"needs. Overrides -data when set",
@@ -80,8 +80,8 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 	data := flags.String(
 		"data", ".shoal/explorer",
 		"Legacy Explorer corpus directory (used when -state-dir is unset). The "+
-			"durable policy catalog and workspace settings are placed in sibling "+
-			"directories; all must be persisted for the workspace to survive a restart",
+			"workspace settings share this corpus engine; the durable policy catalog "+
+			"is placed in a sibling directory and both must be persisted across restart",
 	)
 	policyDirFlag := flags.String(
 		"policy-dir", "",
@@ -996,8 +996,13 @@ func openService(
 				return closed, err
 			}
 		}
-		settingsStore, err := workspace.OpenDurableStore(
-			workspaceSettingsStoreDir(config.data))
+		sharedEngine, err := embedded.Runtime.SharedEngine()
+		if err != nil {
+			store.Close()
+			embedded.Close()
+			return closed, err
+		}
+		settingsStore, err := workspace.NewDurableStoreFromEngine(sharedEngine)
 		if err != nil {
 			store.Close()
 			embedded.Close()

@@ -79,8 +79,8 @@ func TestOpenServiceWiresDurableWorkspaceSettings(t *testing.T) {
 		t.Fatal(err)
 	}
 	opened.close()
-	if _, err := os.Stat(filepath.Join(root, "settings")); err != nil {
-		t.Fatalf("durable settings directory: %v", err)
+	if _, err := os.Stat(filepath.Join(root, "settings")); !os.IsNotExist(err) {
+		t.Fatalf("unexpected sidecar settings directory: %v", err)
 	}
 
 	reopened, err := openService(context.Background(), config)
