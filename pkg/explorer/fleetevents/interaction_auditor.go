@@ -66,6 +66,13 @@ func (a *InteractionAuditor) RecordFleetAction(ctx context.Context, record Audit
 	for _, evidence := range seedEvidence {
 		seedNodeIDs = append(seedNodeIDs, evidence.NodeIDs...)
 	}
+	stopReason := "no_evidence"
+	switch {
+	case len(record.Evidence) > len(seedEvidence):
+		stopReason = "redacted_non_node_evidence"
+	case len(seedEvidence) > 0:
+		stopReason = "source_node_evidence"
+	}
 	recordedAt := record.OccurredAt.UTC()
 	if recordedAt.IsZero() || recordedAt.Before(snapshot.AsOf) {
 		// Interaction receipts must not predate the snapshot whose source
@@ -84,6 +91,7 @@ func (a *InteractionAuditor) RecordFleetAction(ctx context.Context, record Audit
 		QueryDigest: interaction.Digest(
 			string(record.ActionID) + "\x00" + string(record.CorrelationID)),
 		SeedNodeIDs: seedNodeIDs, SeedEvidence: seedEvidence,
+		StopReason: stopReason,
 		Turns: []interaction.Turn{{
 			Index: 0, Decision: string(record.Operation),
 			ToolCall: &interaction.ToolCall{Kind: "fleet." + string(record.Operation)},
@@ -147,13 +155,14 @@ func sameFleetReceipt(expected, persisted interaction.Session) bool {
 		persisted.AuthorizationFingerprint != expected.AuthorizationFingerprint ||
 		!persisted.AuthorizationExpiresAt.Equal(expected.AuthorizationExpiresAt) ||
 		persisted.RequestID != expected.RequestID ||
+		persisted.StopReason != expected.StopReason ||
 		len(persisted.Turns) != 1 ||
 		persisted.Turns[0].ToolCall == nil ||
 		persisted.Turns[0].ToolCall.Kind != expected.Turns[0].ToolCall.Kind {
 		return false
 	}
-	return reflect.DeepEqual(persisted.SeedNodeIDs, expected.SeedNodeIDs) &&
-		reflect.DeepEqual(persisted.SeedEvidence, expected.SeedEvidence)
+	return sameFleetIDs(persisted.SeedNodeIDs, expected.SeedNodeIDs) &&
+		sameFleetEvidence(persisted.SeedEvidence, expected.SeedEvidence)
 }
 
 func isNilInteractionResultSink(sink interaction.ResultSink) bool {
@@ -168,4 +177,40 @@ func isNilInteractionResultSink(sink interaction.ResultSink) bool {
 	default:
 		return false
 	}
+}
+
+func sameFleetIDs(left, right []shoal.ID) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if left[i] != right[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func sameFleetEvidence(
+	left, right []interaction.EvidenceReference,
+) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if left[i].AnchorID != right[i].AnchorID ||
+			left[i].Kind != right[i].Kind ||
+			left[i].Citation != right[i].Citation ||
+			!sameFleetIDs(left[i].NodeIDs, right[i].NodeIDs) ||
+			!sameFleetIDs(left[i].EdgeIDs, right[i].EdgeIDs) ||
+			len(left[i].Assertions) != len(right[i].Assertions) {
+			return false
+		}
+		for j := range left[i].Assertions {
+			if left[i].Assertions[j] != right[i].Assertions[j] {
+				return false
+			}
+		}
+	}
+	return true
 }

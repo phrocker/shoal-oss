@@ -112,7 +112,7 @@ func ComposeHosted(ctx context.Context, config HostConfig) (*HostedServices, err
 	if !ok || trustedInteractions == nil {
 		return nil, shoal.NewError(
 			shoal.ErrorInvalidArgument,
-			"fleet event interaction storage result sink is required")
+			"fleet event interaction storage must implement interaction.ResultSink")
 	}
 	events, actionEvents, err := ComposeWithPublisher(
 		config.Runtime, config.Domain, config.Resolver, config.Generations,

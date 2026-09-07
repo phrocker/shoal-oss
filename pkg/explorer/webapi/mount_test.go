@@ -51,7 +51,8 @@ func TestMountAuthenticatedRejectsNonLiteralPatterns(t *testing.T) {
 		"/mcp?query", "/mcp#fragment", "POST /mcp", "/mcp\\child",
 	} {
 		t.Run(pattern, func(t *testing.T) {
-			handler := authenticatedMountTestHandler(t)
+			handler := authenticatedTestHandler(
+				t, &stubWorkspaceService{}, auth.OperationRead)
 			if err := handler.MountAuthenticated(
 				pattern, &mountedTestHandler{},
 			); err == nil {
@@ -65,7 +66,8 @@ func TestMountAuthenticatedRejectsNonLiteralPatterns(t *testing.T) {
 }
 
 func TestMountAuthenticatedAllowsNormalizedSubtree(t *testing.T) {
-	handler := authenticatedMountTestHandler(t)
+	handler := authenticatedTestHandler(
+		t, &stubWorkspaceService{}, auth.OperationRead)
 	mounted := &mountedTestHandler{}
 	if err := handler.MountAuthenticated("/api/v1/fleet/", mounted); err != nil {
 		t.Fatal(err)
@@ -86,7 +88,8 @@ func TestMountAuthenticatedConflictIsAtomic(t *testing.T) {
 	) {
 		writer.WriteHeader(http.StatusAccepted)
 	})
-	handler := authenticatedMountTestHandler(t)
+	handler := authenticatedTestHandler(
+		t, &stubWorkspaceService{}, auth.OperationRead)
 	handler.mux = mux
 	mounted := &mountedTestHandler{}
 	if err := handler.MountAuthenticated("/mcp", mounted); err == nil {
@@ -107,7 +110,8 @@ func TestMountAuthenticatedConflictIsAtomic(t *testing.T) {
 }
 
 func TestMountAuthenticatedDispatchesOnlySupportedMethods(t *testing.T) {
-	handler := authenticatedMountTestHandler(t)
+	handler := authenticatedTestHandler(
+		t, &stubWorkspaceService{}, auth.OperationRead)
 	mounted := &mountedTestHandler{}
 	if err := handler.MountAuthenticated("/mcp", mounted); err != nil {
 		t.Fatal(err)
@@ -147,7 +151,9 @@ func TestMountAuthenticatedRejectsAnonymousHandler(t *testing.T) {
 	}
 }
 
-func authenticatedMountTestHandler(t *testing.T) *Handler {
+func authenticatedTestHandler(
+	t *testing.T, service Service, operations ...auth.Operation,
+) *Handler {
 	t.Helper()
 	now := time.Date(2026, 9, 7, 2, 0, 0, 0, time.UTC)
 	authority, err := auth.NewAuthorityWithClock(func() time.Time { return now })
@@ -156,19 +162,22 @@ func authenticatedMountTestHandler(t *testing.T) *Handler {
 	}
 	decision, err := auth.NewDecision(auth.DecisionConfig{
 		Subject: "subject", Actor: "actor", AuthorizationDomain: []byte("domain"),
-		AllowedOperations: []auth.Operation{auth.OperationRead},
+		AllowedOperations: operations,
 		PolicyGeneration:  1, AuthenticationExpires: now.Add(time.Hour),
 		RequestID: "request", CorrelationID: "correlation",
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	return &Handler{
-		mux: http.NewServeMux(), preAuth: make(
-			map[string]preAuthenticationValidator),
-		authenticator: AuthenticatorFunc(func(*http.Request) (auth.Decision, error) {
+	handler, err := NewAuthenticatedHandler(
+		service,
+		AuthenticatorFunc(func(*http.Request) (auth.Decision, error) {
 			return decision, nil
 		}),
-		binder: authority.Binder(),
+		authority.Binder(), "example.test",
+	)
+	if err != nil {
+		t.Fatal(err)
 	}
+	return handler
 }

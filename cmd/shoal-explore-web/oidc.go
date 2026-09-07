@@ -371,8 +371,8 @@ func newOIDCAuthenticator(
 		!config.allowUnmappedAuthorization {
 		return nil, shoal.NewError(
 			shoal.ErrorInvalidArgument,
-			"at least one -oidc-reader-values, -oidc-contributor-values, or -oidc-fleet-values "+
-				"mapping is required")
+			"at least one -oidc-reader-values, "+
+				"-oidc-contributor-values, or -oidc-fleet-values mapping is required")
 	}
 
 	httpClient := config.httpClient
@@ -878,15 +878,19 @@ func (a *oidcAuthenticator) authority(
 		}
 		values = trimmed
 	}
+	operationSet := make(map[auth.Operation]struct{}, len(oidcFleetOperations)+len(oidcContributorOperations))
 	var operations []auth.Operation
 	if hasMappedValue(values, a.fleetValues) {
-		operations = appendUniqueOperations(operations, oidcFleetOperations)
+		operations = appendUniqueOperations(
+			operations, operationSet, oidcFleetOperations)
 	}
 	if hasMappedValue(values, a.contributorValues) {
-		operations = appendUniqueOperations(operations, oidcContributorOperations)
+		operations = appendUniqueOperations(
+			operations, operationSet, oidcContributorOperations)
 	}
 	if hasMappedValue(values, a.readerClaimValues) {
-		operations = appendUniqueOperations(operations, oidcReaderOperations)
+		operations = appendUniqueOperations(
+			operations, operationSet, oidcReaderOperations)
 	}
 	if len(operations) > 0 {
 		return operations,
@@ -902,12 +906,9 @@ func (a *oidcAuthenticator) authority(
 
 func appendUniqueOperations(
 	operations []auth.Operation,
+	seen map[auth.Operation]struct{},
 	values []auth.Operation,
 ) []auth.Operation {
-	seen := make(map[auth.Operation]struct{}, len(operations)+len(values))
-	for _, operation := range operations {
-		seen[operation] = struct{}{}
-	}
 	for _, operation := range values {
 		if _, ok := seen[operation]; ok {
 			continue

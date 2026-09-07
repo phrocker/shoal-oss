@@ -129,34 +129,8 @@ func TestCombinedFleetAndEventMountsRemainIsolated(t *testing.T) {
 }
 
 func TestFleetRoutesRoundTripReturnedOpaqueID(t *testing.T) {
-	now := time.Date(2026, 9, 6, 1, 0, 0, 0, time.UTC)
-	authority, err := auth.NewAuthorityWithClock(func() time.Time { return now })
-	if err != nil {
-		t.Fatal(err)
-	}
-	decision, err := auth.NewDecision(auth.DecisionConfig{
-		Subject: "subject", Actor: "actor", AuthorizationDomain: []byte("domain"),
-		AllowedOperations: []auth.Operation{
-			auth.OperationSubscriptionCreate,
-		},
-		PermittedSourceIDs: [][]byte{[]byte("source")},
-		PermittedPolicyIDs: [][]byte{[]byte("policy")},
-		PolicyGeneration:   1, AuthenticationExpires: now.Add(time.Hour),
-		RequestID: "request", CorrelationID: "correlation",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	handler, err := NewAuthenticatedHandler(
-		fleetBaseService{},
-		AuthenticatorFunc(func(*http.Request) (auth.Decision, error) {
-			return decision, nil
-		}),
-		authority.Binder(), "example.test",
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
+	handler := authenticatedTestHandler(
+		t, fleetBaseService{}, auth.OperationSubscriptionCreate)
 	service := &fleetTransportService{id: []byte{0, 0xff, '/', 0x80}}
 	if err := handler.MountFleetEvents(service); err != nil {
 		t.Fatal(err)
