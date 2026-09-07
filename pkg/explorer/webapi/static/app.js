@@ -3276,6 +3276,10 @@ function resetIdentityBoundUI() {
   state.workspaceID = "";
   state.workspaceSettings = null;
   state.lensChoices = null;
+  if (typeof window !== "undefined" && window.ShoalTeamOverview &&
+      typeof window.ShoalTeamOverview.reset === "function") {
+    window.ShoalTeamOverview.reset();
+  }
   const workspace = document.getElementById("workspace-id");
   if (workspace) workspace.value = "";
   for (const id of ["chat-results", "provenance-results"]) {
