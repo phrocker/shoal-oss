@@ -156,7 +156,39 @@ The shared service's `-allowed-host` value must exactly match the authority in
 7. Restart the service without replacing the state volume. Reconnect both
    users and confirm the fixtures and workspace settings remain available.
 
-## 5. Visibility boundary
+## 5. Team dashboard
+
+Open the Explorer web UI and select **Team**. Enter the configured team ID and
+the exact authorized source and grant-policy wire IDs, then choose a bounded
+history window (maximum 31 days) and activity page size (maximum 100). If the
+selected workspace narrows to exactly one source and policy, **Load team**
+fills those IDs from the workspace settings.
+
+The dashboard calls `POST /api/v1/team/overview` and presents:
+
+- bounded overview metrics, roster, agents, and work items;
+- a unified activity timeline with explicit pagination;
+- daily activity and current-versus-previous seven-day trends;
+- panels clearly labeled as heuristic bottleneck, improvement, and automation
+  signals; and
+- exact evidence, source, and policy identifiers.
+
+**Refresh** starts a new bounded snapshot. **More activity** continues only the
+current snapshot cursor. **Export JSON** downloads the authorized response and
+the currently loaded activity pages. **Print** uses a report layout that omits
+navigation and controls.
+
+The UI does not make authorization decisions. A challenged `401` asks the user
+to sign in again, an authorization denial remains an explicit denial, and a
+non-disclosing `404` is described only as “unavailable or withheld.” Empty or
+truncated sections do not claim that hidden data is absent.
+
+The team endpoint consumes graph nodes and direct `member_of`, `assigned_to`,
+and `blocked_by` relations. Corpus fixture ingestion alone does not invent
+those relationships; the demo environment must materialize the team graph
+using the schema published by `pkg/explorer/teamoverview`.
+
+## 6. Visibility boundary
 
 Shoal records interactions only when a request reaches a Shoal HTTP/MCP
 operation. It does **not** observe arbitrary editor activity.
