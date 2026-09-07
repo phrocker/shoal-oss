@@ -195,6 +195,27 @@ func (e *Explorer) validateEvidenceReferenceLocked(
 				"interaction citation anchor identity is not authoritative",
 			)
 		}
+		sectionID, spanID, err := resolveCitationSourceRoles(
+			record, canonical.Citation, quote)
+		if err != nil {
+			return shoal.WrapError(
+				shoal.ErrorConflict,
+				"interaction citation source roles are not authoritative",
+				err,
+			)
+		}
+		expectedNodeIDs := []shoal.ID{
+			canonical.Citation.DocumentID, sectionID, spanID,
+		}
+		sort.Slice(expectedNodeIDs, func(i, j int) bool {
+			return shoal.CompareID(expectedNodeIDs[i], expectedNodeIDs[j]) < 0
+		})
+		if !equalIDs(canonical.NodeIDs, expectedNodeIDs) {
+			return shoal.NewError(
+				shoal.ErrorConflict,
+				"interaction citation source roles are not authoritative",
+			)
+		}
 	case interaction.EvidenceGraph:
 		path := graph.Path{
 			Nodes: make([]graph.Node, len(canonical.NodeIDs)),
@@ -261,6 +282,51 @@ func (e *Explorer) validateEvidenceReferenceLocked(
 		)
 	}
 	return nil
+}
+
+func resolveCitationSourceRoles(
+	record *persistedDocument,
+	citation document.Citation,
+	quote string,
+) (shoal.ID, shoal.ID, error) {
+	if citation.SpanID != "" {
+		for _, span := range record.Spans {
+			if span.ID == citation.SpanID {
+				return span.SectionID, span.ID, nil
+			}
+		}
+		return "", "", shoal.NewError(
+			shoal.ErrorNotFound, "cited span was not found")
+	}
+
+	var matched document.Span
+	for _, span := range record.Spans {
+		if span.SectionID != citation.SectionID ||
+			span.Range.Start.Offset > citation.Range.Start.Offset ||
+			span.Range.End.Offset < citation.Range.End.Offset {
+			continue
+		}
+		start := citation.Range.Start.Offset - span.Range.Start.Offset
+		end := citation.Range.End.Offset - span.Range.Start.Offset
+		if start < 0 || end < start || end > int64(len(span.Text)) ||
+			span.Text[start:end] != quote {
+			continue
+		}
+		if matched.ID != "" {
+			return "", "", shoal.NewError(
+				shoal.ErrorInvalidArgument,
+				"citation resolves to more than one source span",
+			)
+		}
+		matched = span
+	}
+	if matched.ID == "" {
+		return "", "", shoal.NewError(
+			shoal.ErrorNotFound,
+			"citation does not resolve to an exact source span",
+		)
+	}
+	return matched.SectionID, matched.ID, nil
 }
 
 func (e *Explorer) validateAssertionReferenceLocked(
