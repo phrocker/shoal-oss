@@ -5,12 +5,9 @@ package explorerfleet
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/binary"
 	"encoding/hex"
-	"hash"
+	"errors"
 	"reflect"
-	"strconv"
 
 	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/explorer/fleet"
@@ -21,17 +18,35 @@ import (
 // LifecycleInteractionRecorder is the trusted interaction recorder boundary
 // used by the fleet lifecycle adapter.
 type LifecycleInteractionRecorder interface {
-	interaction.ResultSink
+	Record(context.Context, interaction.Session) (interaction.Session, error)
 }
 
 // LifecycleRecorder converts fleet lifecycle admissions into durable,
 // authorization-pinned interaction receipts.
 type LifecycleRecorder struct {
-	recorder LifecycleInteractionRecorder
+	record func(
+		context.Context, interaction.Session,
+	) (interaction.Session, error)
 }
 
 // NewLifecycleRecorder constructs the production lifecycle receipt adapter.
 func NewLifecycleRecorder(
+	recorder interaction.ResultSink,
+) (*LifecycleRecorder, error) {
+	if isNilLifecycleInteractionRecorder(recorder) {
+		return nil, shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			"fleet lifecycle interaction recorder is required",
+		)
+	}
+	return &LifecycleRecorder{
+		record: recorder.RecordInteractionResult,
+	}, nil
+}
+
+// NewLifecycleRecorderFromRecorder constructs the lifecycle adapter over the
+// shared trusted recorder used by hosted registry, dispatch, and event paths.
+func NewLifecycleRecorderFromRecorder(
 	recorder LifecycleInteractionRecorder,
 ) (*LifecycleRecorder, error) {
 	if isNilLifecycleInteractionRecorder(recorder) {
@@ -40,7 +55,7 @@ func NewLifecycleRecorder(
 			"fleet lifecycle interaction recorder is required",
 		)
 	}
-	return &LifecycleRecorder{recorder: recorder}, nil
+	return &LifecycleRecorder{record: recorder.Record}, nil
 }
 
 // RecordLifecycle records one stable pre-admission receipt. Actor, delegation,
@@ -50,7 +65,7 @@ func (r *LifecycleRecorder) RecordLifecycle(
 	ctx context.Context,
 	lifecycle fleet.Lifecycle,
 ) error {
-	if r == nil || isNilLifecycleInteractionRecorder(r.recorder) {
+	if r == nil || r.record == nil {
 		return shoal.NewError(
 			shoal.ErrorInvalidArgument,
 			"fleet lifecycle recorder is required",
@@ -60,9 +75,9 @@ func (r *LifecycleRecorder) RecordLifecycle(
 		return err
 	}
 	requested := lifecycleSession(lifecycle)
-	persisted, err := r.recorder.RecordInteractionResult(ctx, requested)
-	if err != nil {
-		return err
+	persisted, recordErr := r.record(ctx, requested)
+	if recordErr != nil && !interaction.IsCommittedRecord(recordErr) {
+		return recordErr
 	}
 	expected := requested
 	expected.RecordedAt = persisted.RecordedAt
@@ -74,40 +89,46 @@ func (r *LifecycleRecorder) RecordLifecycle(
 			[]shoal.ID(nil), lifecycle.OnBehalfOf...),
 	}
 	if lifecycle.AuditPurpose != "" {
+		var err error
 		expected.Reason, err = interaction.NewReason(
 			"audit_purpose", lifecycle.AuditPurpose)
 		if err != nil {
-			return err
+			return committedLifecycleError(recordErr, err)
 		}
 	}
-	expected, err = expected.Canonical()
+	if persisted.RecordedAt.Before(lifecycle.SnapshotAsOf) ||
+		!persisted.RecordedAt.Before(lifecycle.AuthorizationExpiresAt) {
+		return committedLifecycleError(recordErr, shoal.NewError(
+			shoal.ErrorInternal,
+			"fleet lifecycle recorder returned an invalid trusted chronology",
+		))
+	}
+	expected, err := expected.Canonical()
 	if err != nil {
-		return err
+		return committedLifecycleError(recordErr, err)
 	}
 	persisted, err = persisted.Canonical()
 	if err != nil || !reflect.DeepEqual(persisted, expected) {
-		return explorer.MarkCommittedInteraction(shoal.NewError(
+		return committedLifecycleError(recordErr, shoal.NewError(
 			shoal.ErrorInternal,
 			"fleet lifecycle recorder returned a mismatched trusted session",
 		))
 	}
-	return nil
+	return recordErr
 }
 
 func lifecycleSession(lifecycle fleet.Lifecycle) interaction.Session {
-	recordedAt := lifecycle.SnapshotAsOf.UTC()
-	action := "fleet." + string(lifecycle.Operation) + ".admitted"
+	operation := string(lifecycle.Operation)
 	return interaction.Session{
 		ID:                       lifecycleSessionID(lifecycle),
-		RecordedAt:               recordedAt,
 		Operation:                interaction.OperationToolCall,
 		SnapshotID:               lifecycle.SnapshotID,
-		SnapshotAsOf:             recordedAt,
+		SnapshotAsOf:             lifecycle.SnapshotAsOf.UTC(),
 		AuthorizationFingerprint: shoal.ID(lifecycle.AuthorizationFingerprint.String()),
 		AuthorizationExpiresAt:   lifecycle.AuthorizationExpiresAt.UTC(),
-		AuthorizationOperation:   string(lifecycle.Operation),
+		AuthorizationOperation:   operation,
 		QueryDigest: interaction.Digest(
-			string(lifecycle.Operation) + "\x00" + string(lifecycle.AgentID) +
+			operation + "\x00" + string(lifecycle.AgentID) +
 				"\x00" + hex.EncodeToString(lifecycle.MutationDigest[:]),
 		),
 		RequestID:  lifecycle.RequestID,
@@ -115,57 +136,34 @@ func lifecycleSession(lifecycle fleet.Lifecycle) interaction.Session {
 		StopReason: "pre_admission",
 		Turns: []interaction.Turn{{
 			Index:    0,
-			Decision: action,
+			Decision: "admitted:" + operation,
 			ToolCall: &interaction.ToolCall{
-				Kind: action,
+				Kind: "fleet.registry." + operation,
 			},
 		}},
 	}
 }
 
 func lifecycleSessionID(lifecycle fleet.Lifecycle) shoal.ID {
-	digest := sha256.New()
-	writeLifecycleField(digest, []byte("shoal.fleet.lifecycle.v1"))
-	writeLifecycleField(digest, []byte(lifecycle.Operation))
-	writeLifecycleField(digest, []byte(lifecycle.RequestID))
-	writeLifecycleField(digest, []byte(lifecycle.CorrelationID))
-	writeLifecycleField(digest, []byte(lifecycle.Subject))
-	writeLifecycleField(digest, []byte(lifecycle.Actor))
-	writeLifecycleField(digest, []byte(lifecycle.ClientID))
-	for _, id := range lifecycle.OnBehalfOf {
-		writeLifecycleField(digest, []byte(id))
-	}
-	writeLifecycleField(digest, []byte(lifecycle.AgentID))
-	writeLifecycleField(digest, lifecycle.MutationDigest[:])
-	writeLifecycleField(
-		digest, []byte(strconv.FormatInt(lifecycle.Deadline, 10)))
-	writeLifecycleField(
-		digest, []byte(lifecycle.AuthorizationFingerprint.String()))
-	writeLifecycleField(
-		digest,
-		[]byte(lifecycle.AuthorizationExpiresAt.UTC().Format(
-			"2006-01-02T15:04:05.999999999Z07:00")),
-	)
-	writeLifecycleField(digest, []byte(lifecycle.AuditPurpose))
-	writeLifecycleField(digest, []byte(lifecycle.SnapshotID))
-	writeLifecycleField(
-		digest,
-		[]byte(lifecycle.SnapshotAsOf.UTC().Format(
-			"2006-01-02T15:04:05.999999999Z07:00")),
-	)
 	return interaction.DerivedID(
-		"session", hex.EncodeToString(digest.Sum(nil)))
+		"session",
+		"fleet.lifecycle.v1",
+		string(lifecycle.Operation),
+		string(lifecycle.RequestID),
+		string(lifecycle.AgentID),
+	)
 }
 
-func writeLifecycleField(digest hash.Hash, value []byte) {
-	var length [8]byte
-	binary.BigEndian.PutUint64(length[:], uint64(len(value)))
-	_, _ = digest.Write(length[:])
-	_, _ = digest.Write(value)
+func committedLifecycleError(recordErr, validationErr error) error {
+	if recordErr != nil {
+		return explorer.MarkCommittedInteraction(errors.Join(
+			recordErr, validationErr))
+	}
+	return explorer.MarkCommittedInteraction(validationErr)
 }
 
 func isNilLifecycleInteractionRecorder(
-	recorder LifecycleInteractionRecorder,
+	recorder any,
 ) bool {
 	if recorder == nil {
 		return true
