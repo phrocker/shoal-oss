@@ -239,6 +239,67 @@ func TestPublishedOntologyCatalogRechecksRevokedGeneration(t *testing.T) {
 	}
 }
 
+func TestPublishedOntologyCatalogRechecksCredentialExpiry(t *testing.T) {
+	ctx := context.Background()
+	at := time.Date(2026, time.September, 7, 1, 0, 0, 0, time.UTC)
+	corpus, err := explorer.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer corpus.Close()
+	schema, _ := ontology.NewOntologySchema("expiry", "Expiry", "", nil)
+	base, _ := ontology.NewOntologyVersion(schema, "1", at, nil, nil, nil, nil)
+	target, _ := ontology.NewOntologyVersion(
+		schema, "2", at.Add(time.Second), nil, nil, nil, nil)
+	proposal, _ := ontology.NewGovernedProposal(
+		schema, base, target, "author", "publish", at.Add(2*time.Second), nil)
+	publishOntologyCatalogProposal(t, corpus, proposal, base, at)
+	targetIdentity := mustOntologyCatalogIdentity(t, target)
+
+	for _, test := range []struct {
+		name      string
+		operation auth.Operation
+		call      func(*Client) error
+	}{
+		{
+			name:      "catalog",
+			operation: auth.OperationWorkspaceSettingsRead,
+			call: func(client *Client) error {
+				_, err := client.PublishedOntologyCatalog(ctx, base)
+				return err
+			},
+		},
+		{
+			name:      "membership",
+			operation: auth.OperationRetrieve,
+			call: func(client *Client) error {
+				return client.AuthorizePublishedOntology(
+					ctx, base, targetIdentity, auth.OperationRetrieve)
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			decision := ontologyCatalogDecision(
+				t, test.operation, []byte("source"), at)
+			now := at.Add(30 * time.Minute)
+			store := &generationChangingOntologyCatalogStore{
+				Explorer: corpus,
+				after:    func() { now = decision.AuthenticationExpires() },
+			}
+			client := newOntologyCatalogClientWithClock(
+				t, corpus, store, decision,
+				func(context.Context, []byte) (int64, error) { return 1, nil },
+				nil, func() time.Time { return now },
+			)
+			if err := test.call(client); !shoal.IsErrorCode(
+				err, shoal.ErrorUnauthorized,
+			) {
+				t.Fatalf("expired catalog authorization = %v", err)
+			}
+		})
+	}
+}
+
 type generationChangingOntologyCatalogStore struct {
 	*explorer.Explorer
 	after func()
@@ -263,6 +324,21 @@ func newOntologyCatalogClient(
 	policyStore PolicyStore,
 	at time.Time,
 ) *Client {
+	return newOntologyCatalogClientWithClock(
+		t, base, store, decision, generation, policyStore,
+		func() time.Time { return at.Add(30 * time.Minute) },
+	)
+}
+
+func newOntologyCatalogClientWithClock(
+	t *testing.T,
+	base explorer.Client,
+	store explorer.OntologyProposalStore,
+	decision auth.Decision,
+	generation func(context.Context, []byte) (int64, error),
+	policyStore PolicyStore,
+	clock func() time.Time,
+) *Client {
 	t.Helper()
 	selector, err := NewStaticPolicySelector([]byte("source"), []byte("policy"))
 	if err != nil {
@@ -280,7 +356,7 @@ func newOntologyCatalogClient(
 		PolicySelector:   selector,
 		PolicyStore:      policyStore,
 		GenerationReader: generationReaderFunc(generation),
-		Clock:            func() time.Time { return at.Add(30 * time.Minute) },
+		Clock:            clock,
 	})
 	if err != nil {
 		t.Fatal(err)

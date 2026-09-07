@@ -295,6 +295,17 @@ func (c *Client) publishedOntologyCatalog(
 	if err := guard.Check(ctx); err != nil {
 		return ontology.PublishedCatalog{}, err
 	}
+	freshNow := c.clock()
+	if freshNow.IsZero() ||
+		decision.Authorize(
+			operation,
+			auth.ResourceRequest{
+				AuthorizationDomain: decision.AuthorizationDomain(),
+			},
+			freshNow,
+		) != nil {
+		return ontology.PublishedCatalog{}, authorizationDenied()
+	}
 	return catalog, nil
 }
 
