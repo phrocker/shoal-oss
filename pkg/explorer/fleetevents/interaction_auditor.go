@@ -36,6 +36,12 @@ type InteractionAuditor struct {
 	snapshots fleet.InteractionSnapshotProvider
 }
 
+const (
+	fleetAuditStopNoEvidence              = "no_evidence"
+	fleetAuditStopRedactedNonNodeEvidence = "redacted_non_node_evidence"
+	fleetAuditStopSourceNodeEvidence      = "source_node_evidence"
+)
+
 func NewInteractionAuditor(
 	sink interaction.ResultSink,
 	snapshots fleet.InteractionSnapshotProvider,
@@ -65,12 +71,12 @@ func (a *InteractionAuditor) RecordFleetAction(ctx context.Context, record Audit
 	for _, evidence := range seedEvidence {
 		seedNodeIDs = append(seedNodeIDs, evidence.NodeIDs...)
 	}
-	stopReason := "no_evidence"
+	stopReason := fleetAuditStopNoEvidence
 	switch {
 	case len(record.Evidence) > len(seedEvidence):
-		stopReason = "redacted_non_node_evidence"
+		stopReason = fleetAuditStopRedactedNonNodeEvidence
 	case len(seedEvidence) > 0:
-		stopReason = "source_node_evidence"
+		stopReason = fleetAuditStopSourceNodeEvidence
 	}
 	recordedAt := record.OccurredAt.UTC()
 	if recordedAt.IsZero() || recordedAt.Before(snapshot.AsOf) {
