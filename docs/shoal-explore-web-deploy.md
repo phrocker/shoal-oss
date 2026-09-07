@@ -163,11 +163,12 @@ closed. Authentication never falls back to anonymous or development authority.
 | `-oidc-authorization-claim` / `SHOAL_OIDC_AUTHORIZATION_CLAIM` | Exact top-level string or string-array claim whose values are mapped to authority. |
 | `-oidc-reader-values` / `SHOAL_OIDC_READER_VALUES` | Comma-separated claim values granting list, read, connect, neighborhood, retrieve, workspace-settings read, and agent resolve. |
 | `-oidc-contributor-values` / `SHOAL_OIDC_CONTRIBUTOR_VALUES` | Comma-separated claim values granting ingest and workspace-settings write in addition to reader operations. |
-| `-oidc-fleet-values` / `SHOAL_OIDC_FLEET_VALUES` | Comma-separated claim values granting Fleet control-plane access: agent register/heartbeat/revoke/resolve, delegation for child-agent registration, dispatch/invoke, subscription create/delete/deliver, and event publication. |
+| `-oidc-fleet-values` / `SHOAL_OIDC_FLEET_VALUES` | Comma-separated claim values granting Fleet control-plane access: agent register/heartbeat/revoke, delegation for child-agent registration, dispatch/invoke, subscription create/delete/deliver, and event publication. |
 
 At least one reader, contributor, or Fleet value is required. A missing,
 malformed, or unmapped authorization claim is denied before a service operation runs.
-Authentication alone never grants corpus access.
+Authentication alone never grants corpus access, and a Fleet-only mapping is
+valid without a reader or contributor mapping.
 
 The subject defaults to the standard `sub` claim. Optional exact top-level
 claim mappings preserve richer decision identity and delegation:
