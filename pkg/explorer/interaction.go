@@ -939,7 +939,7 @@ func (e *Explorer) currentInteractionVisibilityLocked(
 		return "", err
 	}
 	resolveEdge := e.edgeVisibilityResolverLocked()
-	sets := [][]string{nodeVisibility}
+	sets := [][]string{nodeVisibility, record.Session.RequiredVisibility}
 	for _, edgeID := range record.Session.TouchedEdgeIDs() {
 		labels, err := resolveEdge(edgeID)
 		if err != nil {
@@ -1185,6 +1185,15 @@ func validatePersistedInteraction(record persistedInteraction) error {
 				"stored interaction actor metadata does not match its envelope",
 			)
 		}
+		if !visibilityCovered(
+			record.Visibility,
+			interaction.Expression(record.Session.RequiredVisibility),
+		) {
+			return shoal.NewError(
+				shoal.ErrorInternal,
+				"stored interaction visibility omits its required output restriction",
+			)
+		}
 	}
 	if len(record.Nodes) == 0 {
 		return shoal.NewError(
@@ -1220,6 +1229,8 @@ func cloneInteractionSession(session interaction.Session) interaction.Session {
 	cloned.Actor = cloneActorContext(session.Actor)
 	cloned.EmbeddingSpaces.Identities = append(
 		[]string(nil), session.EmbeddingSpaces.Identities...)
+	cloned.RequiredVisibility = append(
+		[]string(nil), session.RequiredVisibility...)
 	cloned.SeedNodeIDs = append([]shoal.ID(nil), session.SeedNodeIDs...)
 	cloned.SeedEvidence = cloneEvidenceReferences(session.SeedEvidence)
 	cloned.CitedNodeIDs = append([]shoal.ID(nil), session.CitedNodeIDs...)
