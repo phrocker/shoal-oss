@@ -21,7 +21,7 @@ import (
 // LifecycleInteractionRecorder is the trusted interaction recorder boundary
 // used by the fleet lifecycle adapter.
 type LifecycleInteractionRecorder interface {
-	interaction.ResultSink
+	Record(context.Context, interaction.Session) (interaction.Session, error)
 }
 
 // LifecycleRecorder converts fleet lifecycle admissions into durable,
@@ -60,7 +60,7 @@ func (r *LifecycleRecorder) RecordLifecycle(
 		return err
 	}
 	requested := lifecycleSession(lifecycle)
-	persisted, err := r.recorder.RecordInteractionResult(ctx, requested)
+	persisted, err := r.recorder.Record(ctx, requested)
 	if err != nil {
 		return err
 	}

@@ -22,6 +22,7 @@ package authorized
 import (
 	"context"
 	"reflect"
+	"strings"
 	"time"
 
 	"github.com/phrocker/shoal-oss/pkg/explorer"
@@ -149,6 +150,61 @@ func (c *Client) recordInteraction(
 	if err != nil {
 		return interaction.Session{}, err
 	}
+	reader, err := c.interactionReader()
+	if err != nil {
+		return interaction.Session{}, err
+	}
+	existing, readErr := reader.InteractionRecord(ctx, session.ID)
+	switch {
+	case readErr == nil:
+		if existing.Summary.Deleted || existing.Session.ID == "" {
+			return interaction.Session{}, shoal.NewError(
+				shoal.ErrorConflict,
+				"interaction session ID is not available for an exact retry",
+			)
+		}
+		existingCanonical, canonicalErr := existing.Session.Canonical()
+		retryCanonical := session
+		retryCanonical.RecordedAt = existingCanonical.RecordedAt
+		retryCanonical.Actor = existingCanonical.Actor
+		retryCanonical.Reason = existingCanonical.Reason
+		retryCanonical.SnapshotID = existingCanonical.SnapshotID
+		retryCanonical.SnapshotAsOf = existingCanonical.SnapshotAsOf
+		retryCanonical, retryErr := retryCanonical.Canonical()
+		currentActor := interaction.ActorContext{
+			SubjectID:  decision.Subject(),
+			ActorID:    decision.Actor(),
+			ClientID:   decision.ClientID(),
+			OnBehalfOf: decision.OnBehalfOf(),
+		}
+		if canonicalErr != nil ||
+			!reflect.DeepEqual(existingCanonical.Actor, currentActor) {
+			return interaction.Session{}, authorizationDenied()
+		}
+		if retryErr != nil ||
+			!reflect.DeepEqual(existingCanonical, retryCanonical) {
+			return interaction.Session{}, shoal.NewError(
+				shoal.ErrorConflict,
+				"interaction session ID already exists with different content",
+			)
+		}
+		if err := c.authorizeInteractionEvidence(
+			ctx,
+			existingCanonical.TouchedNodeIDs(),
+			existingCanonical.TouchedEdgeIDs(),
+			decision,
+			interactionEvidenceOperation(existingCanonical, authorizationOperation),
+			now,
+		); err != nil {
+			return interaction.Session{}, err
+		}
+		if err := guard.Check(ctx); err != nil {
+			return interaction.Session{}, err
+		}
+		return existingCanonical, nil
+	case !shoal.IsErrorCode(readErr, shoal.ErrorNotFound):
+		return interaction.Session{}, directBaseError(readErr)
+	}
 	session.RecordedAt = now.UTC()
 	if !interactionPinMatchesDecision(session, decision, now) {
 		return interaction.Session{}, authorizationDenied()
@@ -180,48 +236,12 @@ func (c *Client) recordInteraction(
 		canonical.TouchedNodeIDs(),
 		canonical.TouchedEdgeIDs(),
 		decision,
-		auth.OperationRetrieve,
+		interactionEvidenceOperation(canonical, authorizationOperation),
 		now,
 	); err != nil {
 		return interaction.Session{}, err
 	}
-	reader, err := c.interactionReader()
-	if err != nil {
-		return interaction.Session{}, err
-	}
-	existing, readErr := reader.InteractionRecord(ctx, canonical.ID)
-	switch {
-	case readErr == nil:
-		if existing.Summary.Deleted || existing.Session.ID == "" {
-			return interaction.Session{}, shoal.NewError(
-				shoal.ErrorConflict,
-				"interaction session ID is not available for an exact retry",
-			)
-		}
-		existingCanonical, canonicalErr := existing.Session.Canonical()
-		retryCanonical := canonical
-		retryCanonical.RecordedAt = existingCanonical.RecordedAt
-		if canonicalErr != nil ||
-			!reflect.DeepEqual(existingCanonical, retryCanonical) {
-			return interaction.Session{}, shoal.NewError(
-				shoal.ErrorConflict,
-				"interaction session ID already exists with different content",
-			)
-		}
-		if err := guard.Check(ctx); err != nil {
-			return interaction.Session{}, err
-		}
-		deliveredAt := c.clock().UTC()
-		if deliveredAt.IsZero() ||
-			!interactionPinMatchesDecision(
-				existingCanonical, decision, deliveredAt,
-			) {
-			return interaction.Session{}, authorizationDenied()
-		}
-		return existingCanonical, nil
-	case !shoal.IsErrorCode(readErr, shoal.ErrorNotFound):
-		return interaction.Session{}, directBaseError(readErr)
-	}
+
 	if isNilDependency(c.snapshotValidator) {
 		return interaction.Session{}, shoal.NewError(
 			shoal.ErrorUnavailable,
@@ -329,6 +349,18 @@ func (c *Client) recordInteraction(
 	return persisted, nil
 }
 
+func interactionEvidenceOperation(
+	session interaction.Session, authorized auth.Operation,
+) auth.Operation {
+	for _, turn := range session.Turns {
+		if turn.ToolCall != nil &&
+			strings.HasPrefix(turn.ToolCall.Kind, "fleet.") {
+			return authorized
+		}
+	}
+	return auth.OperationRetrieve
+}
+
 func postCommitInteractionError(
 	operation auth.Operation, err error,
 ) error {
@@ -336,6 +368,57 @@ func postCommitInteractionError(
 		return explorer.MarkIndeterminateCommit(err)
 	}
 	return explorer.MarkCommittedInteraction(err)
+}
+
+func (c *Client) beginInteraction(
+	ctx context.Context,
+) (auth.Decision, auth.GenerationGuard, time.Time, error) {
+	if err := contextFailure(ctx); err != nil {
+		return auth.Decision{}, auth.GenerationGuard{}, time.Time{}, err
+	}
+	decision, err := c.resolver.Resolve(ctx)
+	if err != nil {
+		return auth.Decision{}, auth.GenerationGuard{}, time.Time{},
+			resolverFailure(ctx, err)
+	}
+	now := c.clock()
+	if now.IsZero() || !now.Before(decision.AuthenticationExpires()) {
+		return auth.Decision{}, auth.GenerationGuard{}, time.Time{},
+			authorizationDenied()
+	}
+	guard, err := auth.NewGenerationGuard(decision, c.generationReader)
+	if err != nil {
+		return auth.Decision{}, auth.GenerationGuard{}, time.Time{},
+			authorizationDenied()
+	}
+	if err := guard.Check(ctx); err != nil {
+		return auth.Decision{}, auth.GenerationGuard{}, time.Time{}, err
+	}
+	return decision, guard, now, nil
+}
+
+// InteractionSnapshot returns a fresh trusted content snapshot for one
+// lifecycle receipt, with the request's authorization generation guarded
+// across the read.
+func (c *Client) InteractionSnapshot(
+	ctx context.Context,
+) (explorer.Snapshot, error) {
+	bounded, err := c.boundedBase()
+	if err != nil {
+		return explorer.Snapshot{}, err
+	}
+	_, guard, _, err := c.beginInteraction(ctx)
+	if err != nil {
+		return explorer.Snapshot{}, err
+	}
+	snapshot, err := bounded.Snapshot(ctx)
+	if err != nil {
+		return explorer.Snapshot{}, directBaseError(err)
+	}
+	if err := guard.Check(ctx); err != nil {
+		return explorer.Snapshot{}, err
+	}
+	return snapshot, nil
 }
 
 // Interactions lists only derived records whose complete current source set

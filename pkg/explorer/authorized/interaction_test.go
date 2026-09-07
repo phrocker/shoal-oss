@@ -965,6 +965,63 @@ func TestAuthorizedExactRetryUsesTrustedDurableRecord(t *testing.T) {
 	}
 }
 
+func TestAuthorizedExactRetrySurvivesPolicyGenerationRefresh(t *testing.T) {
+	f := newFixture(t)
+	snapshot, err := f.base.Snapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.clock.Set(snapshot.AsOf.Add(time.Second))
+	decision := f.decision(
+		t, "generation-refresh-recorder",
+		[][]byte{f.sourceA}, [][]byte{f.policyA},
+		[]auth.Operation{auth.OperationRetrieve},
+	)
+	fingerprint, err := auth.AuthorizationFingerprint(decision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := interaction.Session{
+		ID:         interaction.DerivedID("session", "generation-refresh"),
+		Operation:  interaction.OperationRetrieval,
+		SnapshotID: shoal.ID(snapshot.ID), SnapshotAsOf: snapshot.AsOf,
+		AuthorizationFingerprint: shoal.ID(fingerprint.String()),
+		AuthorizationExpiresAt:   decision.AuthenticationExpires(),
+	}
+	first, err := f.clientA.RecordInteractionResult(
+		f.context(t, decision), session)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	f.reader.Set(f.domain, 2)
+	refreshed := f.decisionAtGeneration(
+		t, "generation-refresh-recorder",
+		[][]byte{f.sourceA}, [][]byte{f.policyA},
+		[]auth.Operation{auth.OperationRetrieve},
+		2,
+	)
+	retry := session
+	retry.SnapshotID = "newer-snapshot"
+	retry.SnapshotAsOf = retry.SnapshotAsOf.Add(time.Minute)
+	retried, err := f.clientA.RecordInteractionResult(
+		f.context(t, refreshed), retry)
+	if err != nil {
+		t.Fatalf("exact retry after policy refresh was rejected: %v", err)
+	}
+	if !reflect.DeepEqual(retried, first) {
+		t.Fatalf("retry result differs: got %+v want %+v", retried, first)
+	}
+
+	divergent := session
+	divergent.QueryDigest = "different"
+	if _, err := f.clientA.RecordInteractionResult(
+		f.context(t, refreshed), divergent,
+	); !shoal.IsErrorCode(err, shoal.ErrorConflict) {
+		t.Fatalf("divergent retry error = %v, want conflict", err)
+	}
+}
+
 func TestAuthorizedResultSinkExactRetryAfterReopen(t *testing.T) {
 	f := newFixture(t)
 	snapshot, err := f.base.Snapshot(context.Background())
