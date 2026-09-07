@@ -31,6 +31,8 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/graph"
+	"github.com/phrocker/shoal-oss/pkg/interaction"
+	"github.com/phrocker/shoal-oss/pkg/ontology"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
@@ -42,11 +44,22 @@ type SnapshotValidator interface {
 	) error
 }
 
-// SnapshotEvidenceValidator additionally verifies touched source membership.
-type SnapshotEvidenceValidator interface {
-	ValidateSnapshotEvidence(
+// EvidenceSnapshotValidator additionally binds exact source evidence to the
+// pinned corpus frontier.
+type EvidenceSnapshotValidator interface {
+	SnapshotValidator
+	ValidateEvidenceSnapshot(
 		context.Context, shoal.ID, time.Time, []shoal.ID, []shoal.ID,
+		[]interaction.EvidenceReference,
 	) error
+}
+
+// DerivedAssertionReader supplies canonical derived assertions independently
+// of the untrusted graph response being authorized.
+type DerivedAssertionReader interface {
+	DerivedAssertions(
+		context.Context, []shoal.ID,
+	) (map[shoal.ID]ontology.Assertion, error)
 }
 
 // Config supplies the trusted dependencies for an authorization-enforcing
@@ -66,19 +79,29 @@ type Config struct {
 	// authorization decisions for derived views depend on the stored source
 	// set and authorization fingerprint.
 	InteractionReader explorer.InteractionReader
-	// OntologyInterpreter is an optional explicitly trusted read-time
-	// interpreter. It is separate from Base because Base responses are
-	// untrusted and cannot establish authorized interpretation provenance.
-	OntologyInterpreter explorer.OntologyInterpreter
 	// SnapshotValidator is the explicitly trusted verifier for historical
 	// corpus frontiers pinned into interaction records.
-	SnapshotValidator  SnapshotValidator
-	Resolver           auth.Resolver
-	PolicySelector     PolicySelector
-	EdgePolicySelector EdgePolicySelector
-	PolicyStore        PolicyStore
-	GenerationReader   auth.GenerationReader
-	Clock              func() time.Time
+	SnapshotValidator SnapshotValidator
+	// DerivedAssertionReader is the explicitly trusted source used to
+	// reconstruct producer provenance returned by an untrusted graph reader.
+	// When omitted, NewClient may use SnapshotValidator if that independently
+	// trusted dependency also implements DerivedAssertionReader. Base is never
+	// promoted implicitly.
+	DerivedAssertionReader DerivedAssertionReader
+	// OntologyInterpreter is an optional explicitly trusted read-time
+	// interpreter. It is separate from Base because Base graph responses are
+	// untrusted and must never be allowed to inject interpretations.
+	OntologyInterpreter explorer.OntologyInterpreter
+	// OntologyProposalStore is the optional explicitly trusted governance
+	// store. It is separate from Base because proposal state, evidence, and
+	// citation bytes participate in authorization decisions.
+	OntologyProposalStore explorer.OntologyProposalStore
+	Resolver              auth.Resolver
+	PolicySelector        PolicySelector
+	EdgePolicySelector    EdgePolicySelector
+	PolicyStore           PolicyStore
+	GenerationReader      auth.GenerationReader
+	Clock                 func() time.Time
 	// Mosaic optionally enables the sensitivity-domain co-occurrence budget
 	// that defends against the mosaic effect. A zero MaxDomains disables it; a
 	// nonzero MaxDomains requires PolicyStore to implement CoOccurrenceLedger
@@ -94,8 +117,10 @@ type Client struct {
 	vectorSpaceResolver VectorEmbeddingSpaceResolver
 	interactionSink     explorer.InteractionWriter
 	interactionSource   explorer.InteractionReader
-	ontologyInterpreter explorer.OntologyInterpreter
 	snapshotValidator   SnapshotValidator
+	derivedAssertions   DerivedAssertionReader
+	ontologyInterpreter explorer.OntologyInterpreter
+	ontologyProposals   explorer.OntologyProposalStore
 	resolver            auth.Resolver
 	policySelector      PolicySelector
 	edgePolicySelector  EdgePolicySelector
@@ -159,6 +184,11 @@ func NewClient(config Config) (*Client, error) {
 		!hasInteractionWriter {
 		return nil, dependencyRequired("trusted interaction writer")
 	}
+	derivedAssertions := config.DerivedAssertionReader
+	if isNilDependency(derivedAssertions) && hasSnapshotValidator {
+		derivedAssertions, _ =
+			config.SnapshotValidator.(DerivedAssertionReader)
+	}
 	edgeSelector := config.EdgePolicySelector
 	if isNilDependency(edgeSelector) {
 		var ok bool
@@ -184,8 +214,10 @@ func NewClient(config Config) (*Client, error) {
 		vectorSpaceResolver: vectorSpaceResolver,
 		interactionSink:     config.InteractionWriter,
 		interactionSource:   config.InteractionReader,
-		ontologyInterpreter: config.OntologyInterpreter,
 		snapshotValidator:   config.SnapshotValidator,
+		derivedAssertions:   derivedAssertions,
+		ontologyInterpreter: config.OntologyInterpreter,
+		ontologyProposals:   config.OntologyProposalStore,
 		resolver:            config.Resolver,
 		policySelector:      config.PolicySelector,
 		edgePolicySelector:  edgeSelector,

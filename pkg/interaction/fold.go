@@ -62,6 +62,7 @@ type FoldMember struct {
 	SessionID        shoal.ID
 	RetrievedNodeIDs []shoal.ID
 	CitedNodeIDs     []shoal.ID
+	TouchedEdgeIDs   []shoal.ID
 	// Visibility is the folded session's own recorded visibility. It is
 	// conjoined into the fold so a fold can never be readable by someone who
 	// could not read a session it summarizes.
@@ -93,6 +94,7 @@ type FoldSubgraph struct {
 	RetrievedNodeIDs []shoal.ID
 	CitedNodeIDs     []shoal.ID
 	TouchedNodeIDs   []shoal.ID
+	TouchedEdgeIDs   []shoal.ID
 }
 
 // TouchedSet is the retrieved/cited split recovered from a materialized
@@ -156,6 +158,7 @@ func (f Fold) Canonical() (Fold, error) {
 			SessionID:        member.SessionID,
 			RetrievedNodeIDs: dedupeIDs(member.RetrievedNodeIDs),
 			CitedNodeIDs:     dedupeIDs(member.CitedNodeIDs),
+			TouchedEdgeIDs:   dedupeIDs(member.TouchedEdgeIDs),
 			Visibility:       visibility,
 		})
 	}
@@ -206,6 +209,17 @@ func (f Fold) Validate() error {
 				return err
 			}
 		}
+		for _, id := range member.TouchedEdgeIDs {
+			if err := shoal.ValidateRequiredID("fold touched edge ID", id); err != nil {
+				return err
+			}
+			if IsInteractionID(id) {
+				return shoal.NewError(
+					shoal.ErrorInvalidArgument,
+					"fold cannot treat an interaction edge as source evidence",
+				)
+			}
+		}
 	}
 	return nil
 }
@@ -234,6 +248,12 @@ func (f Fold) ID() (shoal.ID, error) {
 		for _, id := range member.CitedNodeIDs {
 			parts = append(parts, string(id))
 		}
+		if len(member.TouchedEdgeIDs) > 0 {
+			parts = append(parts, "edges")
+			for _, id := range member.TouchedEdgeIDs {
+				parts = append(parts, string(id))
+			}
+		}
 	}
 	parts = append(parts, "summary", canonical.SummaryDigest)
 	return DerivedID("fold", parts...), nil
@@ -249,10 +269,19 @@ func (f Fold) ID() (shoal.ID, error) {
 // widens visibility: the fold requires at least everything each of its parts
 // required.
 func (f Fold) Subgraph(resolve VisibilityResolver) (FoldSubgraph, error) {
+	return f.SubgraphWithEvidence(resolve, nil)
+}
+
+// SubgraphWithEvidence additionally resolves every exact source edge retained
+// by the folded members, so edge-local labels can never be omitted.
+func (f Fold) SubgraphWithEvidence(
+	resolveNode VisibilityResolver,
+	resolveEdge VisibilityResolver,
+) (FoldSubgraph, error) {
 	if err := f.Validate(); err != nil {
 		return FoldSubgraph{}, err
 	}
-	if resolve == nil {
+	if resolveNode == nil {
 		return FoldSubgraph{}, shoal.NewError(
 			shoal.ErrorInvalidArgument, "fold visibility resolver is required")
 	}
@@ -269,18 +298,35 @@ func (f Fold) Subgraph(resolve VisibilityResolver) (FoldSubgraph, error) {
 		return FoldSubgraph{}, err
 	}
 
-	var retrieved, cited []shoal.ID
+	var retrieved, cited, touchedEdges []shoal.ID
 	sets := make([][]string, 0, len(canonical.Members)+1)
 	for _, member := range canonical.Members {
 		retrieved = append(retrieved, member.RetrievedNodeIDs...)
 		cited = append(cited, member.CitedNodeIDs...)
+		touchedEdges = append(touchedEdges, member.TouchedEdgeIDs...)
 		sets = append(sets, member.Visibility)
 	}
 	retrieved = dedupeIDs(retrieved)
 	cited = dedupeIDs(cited)
 	touched := dedupeIDs(append(append([]shoal.ID(nil), retrieved...), cited...))
+	touchedEdges = dedupeIDs(touchedEdges)
 	for _, id := range touched {
-		labels, err := resolve(id)
+		labels, err := resolveNode(id)
+		if err != nil {
+			return FoldSubgraph{}, err
+		}
+		normalized, err := Conjoin(labels)
+		if err != nil {
+			return FoldSubgraph{}, err
+		}
+		sets = append(sets, normalized)
+	}
+	if len(touchedEdges) > 0 && resolveEdge == nil {
+		return FoldSubgraph{}, shoal.NewError(
+			shoal.ErrorInvalidArgument, "fold edge visibility resolver is required")
+	}
+	for _, id := range touchedEdges {
+		labels, err := resolveEdge(id)
 		if err != nil {
 			return FoldSubgraph{}, err
 		}
@@ -339,6 +385,7 @@ func (f Fold) Subgraph(resolve VisibilityResolver) (FoldSubgraph, error) {
 		RetrievedNodeIDs: retrieved,
 		CitedNodeIDs:     cited,
 		TouchedNodeIDs:   touched,
+		TouchedEdgeIDs:   touchedEdges,
 	}, nil
 }
 

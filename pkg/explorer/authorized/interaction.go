@@ -48,6 +48,68 @@ func (c *Client) EnsureInteractionSink(ctx context.Context) error {
 	return guard.Check(ctx)
 }
 
+type operationInteractionSink struct {
+	client    *Client
+	operation auth.Operation
+}
+
+// AnalyticsInteractionSink returns the durable interaction sink bound to the
+// analytics authorization operation.
+func (c *Client) AnalyticsInteractionSink() interaction.ResultSink {
+	if c == nil {
+		return nil
+	}
+	if _, err := c.interactionWriter(); err != nil {
+		return nil
+	}
+	if isNilDependency(c.snapshotValidator) {
+		return nil
+	}
+	if _, ok := c.snapshotValidator.(EvidenceSnapshotValidator); !ok {
+		return nil
+	}
+	return operationInteractionSink{
+		client: c, operation: auth.OperationAnalyticsRead,
+	}
+}
+
+func (s operationInteractionSink) EnsureInteractionSink(
+	ctx context.Context,
+) error {
+	if s.client == nil {
+		return shoal.NewError(
+			shoal.ErrorUnavailable, "authorized interaction sink is unavailable")
+	}
+	writer, err := s.client.interactionWriter()
+	if err != nil {
+		return err
+	}
+	if err := writer.EnsureInteractionSink(ctx); err != nil {
+		return directBaseError(err)
+	}
+	return nil
+}
+
+func (s operationInteractionSink) RecordInteraction(
+	ctx context.Context,
+	session interaction.Session,
+) error {
+	_, err := s.RecordInteractionResult(ctx, session)
+	return err
+}
+
+func (s operationInteractionSink) RecordInteractionResult(
+	ctx context.Context,
+	session interaction.Session,
+) (interaction.Session, error) {
+	if s.client == nil {
+		return interaction.Session{}, shoal.NewError(
+			shoal.ErrorUnavailable, "authorized interaction sink is unavailable")
+	}
+	session.AuthorizationOperation = string(s.operation)
+	return s.client.recordInteraction(ctx, session, true)
+}
+
 // RecordInteraction appends one redacted interaction after verifying that its
 // pinned authorization is the exact current decision and that every source
 // node it retrieved or cited is still authorized. A revoked or missing source
@@ -55,7 +117,7 @@ func (c *Client) EnsureInteractionSink(ctx context.Context) error {
 func (c *Client) RecordInteraction(
 	ctx context.Context, session interaction.Session,
 ) error {
-	_, err := c.recordInteraction(ctx, session)
+	_, err := c.recordInteraction(ctx, session, false)
 	return err
 }
 
@@ -65,45 +127,38 @@ func (c *Client) RecordInteraction(
 func (c *Client) RecordInteractionResult(
 	ctx context.Context, session interaction.Session,
 ) (interaction.Session, error) {
-	return c.recordInteraction(ctx, session)
+	return c.recordInteraction(ctx, session, true)
 }
 
 func (c *Client) recordInteraction(
-	ctx context.Context, session interaction.Session,
+	ctx context.Context, session interaction.Session, requireResult bool,
 ) (interaction.Session, error) {
 	writer, err := c.interactionWriter()
 	if err != nil {
 		return interaction.Session{}, err
 	}
-	decision, guard, now, err := c.beginInteraction(ctx)
+	resultWriter, hasResultWriter := writer.(interaction.ResultSink)
+	if requireResult && !hasResultWriter {
+		return interaction.Session{}, shoal.NewError(
+			shoal.ErrorUnavailable,
+			"trusted interaction result sink is unavailable",
+		)
+	}
+	authorizationOperation := auth.OperationRetrieve
+	if session.AuthorizationOperation != "" {
+		authorizationOperation = auth.Operation(session.AuthorizationOperation)
+	}
+	decision, guard, now, err := c.begin(ctx, authorizationOperation)
 	if err != nil {
 		return interaction.Session{}, err
 	}
-	if !session.AuthorizationExpiresAt.IsZero() &&
-		!now.Before(session.AuthorizationExpiresAt) {
-		return interaction.Session{}, authorizationDenied()
-	}
 	session.RecordedAt = now.UTC()
-	if !now.Before(session.AuthorizationExpiresAt) {
+	if !interactionPinMatchesDecision(session, decision, now) {
 		return interaction.Session{}, authorizationDenied()
 	}
 	canonical, err := session.Canonical()
 	if err != nil {
 		return interaction.Session{}, err
-	}
-	authorizedOperation := auth.Operation(canonical.AuthorizationOperation)
-	if authorizedOperation == "" {
-		authorizedOperation = auth.OperationRetrieve
-		canonical.AuthorizationOperation = string(authorizedOperation)
-	}
-	if authorizedOperation.Validate() != nil ||
-		decision.Authorize(authorizedOperation, auth.ResourceRequest{
-			AuthorizationDomain: decision.AuthorizationDomain(),
-		}, now) != nil {
-		return interaction.Session{}, authorizationDenied()
-	}
-	if !interactionPinMatchesDecision(canonical, decision, now) {
-		return interaction.Session{}, authorizationDenied()
 	}
 	canonical.Actor = interaction.ActorContext{
 		SubjectID:  decision.Subject(),
@@ -123,31 +178,13 @@ func (c *Client) recordInteraction(
 	if err != nil {
 		return interaction.Session{}, err
 	}
-	touchedNodes := canonical.TouchedNodeIDs()
-	touchedEdges := canonical.TouchedEdgeIDs()
-	if len(touchedNodes) > 0 || len(touchedEdges) > 0 {
-		if err := decision.Authorize(
-			auth.OperationRetrieve,
-			auth.ResourceRequest{
-				AuthorizationDomain: decision.AuthorizationDomain(),
-			},
-			now,
-		); err != nil {
-			return interaction.Session{}, authorizationDenied()
-		}
-		if err := c.authorizeInteractionSources(
-			ctx, touchedNodes, decision, auth.OperationRetrieve, now,
-		); err != nil {
-			return interaction.Session{}, err
-		}
-		if err := c.authorizeInteractionEdges(
-			ctx, touchedEdges, decision, auth.OperationRetrieve, now,
-		); err != nil {
-			return interaction.Session{}, err
-		}
-	}
-	if err := c.verifyInteractionEvidence(
-		ctx, canonical, decision, now,
+	if err := c.authorizeInteractionEvidence(
+		ctx,
+		canonical.TouchedNodeIDs(),
+		canonical.TouchedEdgeIDs(),
+		decision,
+		auth.OperationRetrieve,
+		now,
 	); err != nil {
 		return interaction.Session{}, err
 	}
@@ -165,15 +202,37 @@ func (c *Client) recordInteraction(
 			)
 		}
 		existingCanonical, canonicalErr := existing.Session.Canonical()
+		retryCanonical := canonical
+		retryCanonical.RecordedAt = existingCanonical.RecordedAt
 		if canonicalErr != nil ||
-			!equivalentPersistedInteraction(existingCanonical, canonical) {
+			!reflect.DeepEqual(existingCanonical, retryCanonical) {
 			return interaction.Session{}, shoal.NewError(
 				shoal.ErrorConflict,
 				"interaction session ID already exists with different content",
 			)
 		}
+		storedVisibility, visibilityErr := interaction.ParseVisibility(
+			existing.Summary.Visibility)
+		requiredVisibility := interaction.RequiredVisibility(ctx)
+		combinedVisibility, combinedErr := interaction.Conjoin(
+			storedVisibility, requiredVisibility)
+		if visibilityErr != nil || combinedErr != nil ||
+			interaction.Expression(combinedVisibility) !=
+				interaction.Expression(storedVisibility) {
+			return interaction.Session{}, shoal.NewError(
+				shoal.ErrorConflict,
+				"interaction retry requires stricter output visibility",
+			)
+		}
 		if err := guard.Check(ctx); err != nil {
 			return interaction.Session{}, err
+		}
+		deliveredAt := c.clock().UTC()
+		if deliveredAt.IsZero() ||
+			!interactionPinMatchesDecision(
+				existingCanonical, decision, deliveredAt,
+			) {
+			return interaction.Session{}, authorizationDenied()
 		}
 		return existingCanonical, nil
 	case !shoal.IsErrorCode(readErr, shoal.ErrorNotFound):
@@ -185,57 +244,102 @@ func (c *Client) recordInteraction(
 			"trusted interaction snapshot validator is unavailable",
 		)
 	}
-	if err := c.snapshotValidator.ValidateSnapshot(
-		ctx, canonical.SnapshotID, canonical.SnapshotAsOf,
-		touchedNodes,
-	); err != nil {
-		return interaction.Session{}, directBaseError(err)
-	}
-	if validator, ok := c.snapshotValidator.(SnapshotEvidenceValidator); ok {
-		if err := validator.ValidateSnapshotEvidence(
-			ctx, canonical.SnapshotID, canonical.SnapshotAsOf,
-			touchedNodes, touchedEdges,
-		); err != nil {
-			return interaction.Session{}, directBaseError(err)
-		}
-	}
-	if err := guard.Check(ctx); err != nil {
+	edgeIDs := canonical.TouchedEdgeIDs()
+	references, err := canonical.EvidenceReferences()
+	if err != nil {
 		return interaction.Session{}, err
 	}
-	persisted := canonical
-	if resultWriter, ok := writer.(interaction.ResultSink); ok {
-		persisted, err = resultWriter.RecordInteractionResult(ctx, canonical)
+	if len(references) > 0 || len(edgeIDs) > 0 {
+		validator, ok := c.snapshotValidator.(EvidenceSnapshotValidator)
+		if !ok {
+			return interaction.Session{}, shoal.NewError(
+				shoal.ErrorUnavailable,
+				"trusted interaction evidence validator is unavailable",
+			)
+		}
+		err = validator.ValidateEvidenceSnapshot(
+			ctx, canonical.SnapshotID, canonical.SnapshotAsOf,
+			canonical.TouchedNodeIDs(), edgeIDs,
+			references,
+		)
 	} else {
-		err = writer.RecordInteraction(ctx, canonical)
+		err = c.snapshotValidator.ValidateSnapshot(
+			ctx, canonical.SnapshotID, canonical.SnapshotAsOf,
+			canonical.TouchedNodeIDs(),
+		)
 	}
 	if err != nil {
 		return interaction.Session{}, directBaseError(err)
 	}
 	if err := guard.Check(ctx); err != nil {
-		return interaction.Session{}, explorer.MarkCommittedInteraction(err)
+		return interaction.Session{}, err
 	}
-	if _, ok := writer.(interaction.ResultSink); ok {
+	admittedAt := c.clock().UTC()
+	if admittedAt.IsZero() ||
+		!interactionPinMatchesDecision(canonical, decision, admittedAt) {
+		return interaction.Session{}, authorizationDenied()
+	}
+	canonical.RecordedAt = admittedAt
+	canonical, err = canonical.Canonical()
+	if err != nil {
+		return interaction.Session{}, err
+	}
+	persisted := canonical
+	if hasResultWriter {
+		persisted, err = resultWriter.RecordInteractionResult(ctx, canonical)
+	} else {
+		err = writer.RecordInteraction(ctx, canonical)
+	}
+	if err != nil {
+		return persisted, directBaseError(err)
+	}
+	if hasResultWriter {
 		returned, canonicalErr := persisted.Canonical()
-		if canonicalErr != nil ||
-			!equivalentPersistedInteraction(returned, canonical) {
-			return interaction.Session{}, explorer.MarkCommittedInteraction(
+		expected := canonical
+		expected.RecordedAt = returned.RecordedAt
+		if canonicalErr != nil || !reflect.DeepEqual(returned, expected) {
+			return persisted, explorer.MarkCommittedInteraction(
 				shoal.NewError(
 					shoal.ErrorInternal,
 					"durable interaction sink returned a different record",
 				),
 			)
 		}
+		if !returned.RecordedAt.Equal(canonical.RecordedAt) {
+			// Only a durable retry winner may replace the admitted timestamp.
+			stored, readErr := reader.InteractionRecord(ctx, canonical.ID)
+			if readErr != nil {
+				return persisted, explorer.MarkCommittedInteraction(
+					explorer.MarkIndeterminateCommit(directBaseError(readErr)),
+				)
+			}
+			durable, durableErr := stored.Session.Canonical()
+			if stored.Summary.Deleted || durableErr != nil ||
+				!reflect.DeepEqual(durable, returned) {
+				return persisted, explorer.MarkCommittedInteraction(
+					shoal.NewError(
+						shoal.ErrorInternal,
+						"durable interaction sink returned an unverified timestamp",
+					),
+				)
+			}
+		}
 		persisted = returned
 	}
-	completedAt := c.clock()
-	if completedAt.IsZero() || decision.Authorize(
-		authorizedOperation,
-		auth.ResourceRequest{
-			AuthorizationDomain: decision.AuthorizationDomain(),
-		},
-		completedAt,
-	) != nil {
-		return interaction.Session{}, explorer.MarkCommittedInteraction(
+	if err := guard.Check(ctx); err != nil {
+		if authorizationOperation == auth.OperationAnalyticsRead {
+			return persisted, explorer.MarkIndeterminateCommit(err)
+		}
+		return persisted, explorer.MarkCommittedInteraction(err)
+	}
+	deliveredAt := c.clock().UTC()
+	if deliveredAt.IsZero() ||
+		!interactionPinMatchesDecision(persisted, decision, deliveredAt) {
+		if authorizationOperation == auth.OperationAnalyticsRead {
+			return persisted, explorer.MarkIndeterminateCommit(
+				authorizationDenied())
+		}
+		return persisted, explorer.MarkCommittedInteraction(
 			authorizationDenied())
 	}
 	return persisted, nil
@@ -608,6 +712,260 @@ func (c *Client) InteractionSubgraph(
 func interactionSubgraphIsTombstone(subgraph explorer.Neighborhood) bool {
 	return len(subgraph.Nodes) == 1 &&
 		subgraph.Nodes[0].Kind == interaction.KindTombstone
+}
+
+// maxInteractionAuthorizationIDs bounds how many provenance identifiers one
+// policy-store lookup may carry while authorizing a list of interaction
+// records. Interaction provenance is intentionally uncapped per record, so
+// without this bound a single list call would submit the union of the whole
+// durable corpus in one request. Records are grouped into batches under this
+// bound instead, and one record whose own provenance exceeds it is authorized
+// in bounded chunks of its own.
+const maxInteractionAuthorizationIDs = 1024
+
+// authorizeInteractionRecords decides visibility for every record in list
+// order without ever holding more than one bounded batch of registrations.
+func (c *Client) authorizeInteractionRecords(
+	ctx context.Context,
+	records []explorer.InteractionRecord,
+	decision auth.Decision,
+	now time.Time,
+) ([]bool, error) {
+	allowed := make([]bool, len(records))
+	batch := make([]int, 0, len(records))
+	batchIDs := 0
+	flush := func() error {
+		if len(batch) == 0 {
+			return nil
+		}
+		if err := c.authorizeInteractionBatch(
+			ctx, records, batch, allowed, decision, now,
+		); err != nil {
+			return err
+		}
+		batch = batch[:0]
+		batchIDs = 0
+		return nil
+	}
+	for index, record := range records {
+		if record.Summary.Deleted || len(record.TouchedNodeIDs) == 0 {
+			// Tombstones discarded their source edges, and a zero-hit record
+			// never had any, so both are visible only to the exact
+			// authorization projection that created them.
+			allowed[index] = summaryFingerprintMatchesDecision(
+				record.Summary, decision)
+			continue
+		}
+		count := interactionAuthorizationCost(
+			len(record.TouchedNodeIDs), len(record.TouchedEdgeIDs))
+		if batchIDs > 0 && batchIDs+count > maxInteractionAuthorizationIDs {
+			if err := flush(); err != nil {
+				return nil, err
+			}
+		}
+		batch = append(batch, index)
+		batchIDs += count
+		if batchIDs >= maxInteractionAuthorizationIDs {
+			if err := flush(); err != nil {
+				return nil, err
+			}
+		}
+	}
+	if err := flush(); err != nil {
+		return nil, err
+	}
+	return allowed, nil
+}
+
+// authorizeInteractionBatch resolves one bounded batch of records in a single
+// edge and node lookup pair. A record whose own provenance is larger than the
+// batch bound is the only member of its batch and is resolved in chunks.
+func (c *Client) authorizeInteractionBatch(
+	ctx context.Context,
+	records []explorer.InteractionRecord,
+	batch []int,
+	allowed []bool,
+	decision auth.Decision,
+	now time.Time,
+) error {
+	batchNodeIDs := make([]shoal.ID, 0, maxInteractionAuthorizationIDs)
+	batchEdgeIDs := make([]shoal.ID, 0, maxInteractionAuthorizationIDs)
+	for _, index := range batch {
+		batchNodeIDs = append(batchNodeIDs, records[index].TouchedNodeIDs...)
+		batchEdgeIDs = append(batchEdgeIDs, records[index].TouchedEdgeIDs...)
+	}
+	if interactionAuthorizationCost(
+		len(batchNodeIDs), len(batchEdgeIDs),
+	) > maxInteractionAuthorizationIDs {
+		for _, index := range batch {
+			decided, err := c.interactionEvidenceAllowsBounded(
+				ctx,
+				records[index].TouchedNodeIDs,
+				records[index].TouchedEdgeIDs,
+				decision,
+				auth.OperationRead,
+				now,
+			)
+			if err != nil {
+				return err
+			}
+			allowed[index] = decided
+		}
+		return nil
+	}
+	edges, err := c.resolveEdges(ctx, batchEdgeIDs)
+	if err != nil {
+		return err
+	}
+	for _, registration := range edges {
+		batchNodeIDs = append(
+			batchNodeIDs, registration.Edge.From, registration.Edge.To)
+	}
+	registrations, err := c.resolveNodes(ctx, batchNodeIDs)
+	if err != nil {
+		return err
+	}
+	for _, index := range batch {
+		decided, err := interactionEvidenceAllows(
+			registrations, edges,
+			records[index].TouchedNodeIDs, records[index].TouchedEdgeIDs,
+			decision, auth.OperationRead, now,
+		)
+		if err != nil {
+			return err
+		}
+		allowed[index] = decided
+	}
+	return nil
+}
+
+func (c *Client) authorizeInteractionEvidence(
+	ctx context.Context,
+	nodeIDs []shoal.ID,
+	edgeIDs []shoal.ID,
+	decision auth.Decision,
+	operation auth.Operation,
+	now time.Time,
+) error {
+	allowed, err := c.interactionEvidenceAllowsBounded(
+		ctx, nodeIDs, edgeIDs, decision, operation, now)
+	if err != nil {
+		return err
+	}
+	if !allowed {
+		return auth.ObjectNotFound()
+	}
+	return nil
+}
+
+// interactionEvidenceAllowsBounded authorizes one record's uncapped provenance
+// without ever submitting more than maxInteractionAuthorizationIDs identifiers
+// in a single policy-store lookup. Authorization is a conjunction, so chunking
+// preserves the fail-closed result exactly.
+func (c *Client) interactionEvidenceAllowsBounded(
+	ctx context.Context,
+	nodeIDs []shoal.ID,
+	edgeIDs []shoal.ID,
+	decision auth.Decision,
+	operation auth.Operation,
+	now time.Time,
+) (bool, error) {
+	for start := 0; start < len(edgeIDs); {
+		end := chunkEnd(start, len(edgeIDs), maxInteractionAuthorizationIDs/2)
+		chunk := edgeIDs[start:end]
+		start = end
+		edges, err := c.resolveEdges(ctx, chunk)
+		if err != nil {
+			return false, err
+		}
+		endpoints := make([]shoal.ID, 0, 2*len(edges))
+		for _, registration := range edges {
+			endpoints = append(
+				endpoints, registration.Edge.From, registration.Edge.To)
+		}
+		registrations, err := c.resolveNodes(ctx, endpoints)
+		if err != nil {
+			return false, err
+		}
+		allowed, err := interactionEvidenceAllows(
+			registrations, edges, endpoints, chunk, decision, operation, now)
+		if err != nil || !allowed {
+			return false, err
+		}
+	}
+	for start := 0; start < len(nodeIDs); {
+		end := chunkEnd(start, len(nodeIDs), maxInteractionAuthorizationIDs)
+		chunk := nodeIDs[start:end]
+		start = end
+		registrations, err := c.resolveNodes(ctx, chunk)
+		if err != nil {
+			return false, err
+		}
+		allowed, err := interactionEvidenceAllows(
+			registrations, nil, chunk, nil, decision, operation, now)
+		if err != nil || !allowed {
+			return false, err
+		}
+	}
+	return true, nil
+}
+
+// chunkEnd is the exclusive end of the chunk of at most size elements that
+// starts at start.
+func chunkEnd(start, length, size int) int {
+	end := start + size
+	if end > length {
+		return length
+	}
+	return end
+}
+
+// interactionAuthorizationCost is the number of identifiers a batch submits to
+// the policy store. Every edge costs its own identifier plus the two endpoint
+// node identifiers its registration expands into, so the bound holds for the
+// node lookup as well as the edge lookup.
+func interactionAuthorizationCost(nodes, edges int) int {
+	return nodes + 3*edges
+}
+
+func interactionEvidenceAllows(
+	registrations registeredNodes,
+	edges registeredEdges,
+	nodeIDs []shoal.ID,
+	edgeIDs []shoal.ID,
+	decision auth.Decision,
+	operation auth.Operation,
+	now time.Time,
+) (bool, error) {
+	for _, nodeID := range nodeIDs {
+		registration, ok := registrations[nodeID]
+		if !ok {
+			return false, nil
+		}
+		allowed, err := ruleAllows(
+			registration.Rule, decision, operation, now)
+		if err != nil {
+			return false, err
+		}
+		if !allowed {
+			return false, nil
+		}
+	}
+	for _, edgeID := range edgeIDs {
+		registration, ok := edges[edgeID]
+		if !ok || registration.Edge.ID != edgeID {
+			return false, nil
+		}
+		allowed, err := edgeAllowsResolved(
+			registrations, registration, decision, operation, now)
+		if err != nil {
+			return false, err
+		}
+		if !allowed {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 func (c *Client) authorizeInteractionSources(

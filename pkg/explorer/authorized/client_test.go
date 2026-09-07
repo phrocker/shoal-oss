@@ -158,18 +158,20 @@ func (f *fixture) newClient(
 		t.Fatal(err)
 	}
 	client, err := authorized.NewClient(authorized.Config{
-		Base:                base,
-		VectorScorer:        trustedVectorScorer(base),
-		InteractionWriter:   trustedInteractionWriter(base),
-		InteractionReader:   trustedInteractionReader(base),
-		OntologyInterpreter: trustedOntologyInterpreter(base),
-		SnapshotValidator:   trustedSnapshotValidator(base),
-		Resolver:            f.authority.Resolver(),
-		PolicySelector:      selector,
-		EdgePolicySelector:  edgeSelector,
-		PolicyStore:         store,
-		GenerationReader:    f.reader,
-		Clock:               f.clock.Now,
+		Base:                   base,
+		VectorScorer:           trustedVectorScorer(base),
+		InteractionWriter:      trustedInteractionWriter(base),
+		InteractionReader:      trustedInteractionReader(base),
+		OntologyInterpreter:    trustedOntologyInterpreter(base),
+		OntologyProposalStore:  trustedOntologyProposalStore(base),
+		SnapshotValidator:      trustedSnapshotValidator(base),
+		DerivedAssertionReader: trustedDerivedAssertionReader(base),
+		Resolver:               f.authority.Resolver(),
+		PolicySelector:         selector,
+		EdgePolicySelector:     edgeSelector,
+		PolicyStore:            store,
+		GenerationReader:       f.reader,
+		Clock:                  f.clock.Now,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -199,9 +201,23 @@ func trustedOntologyInterpreter(
 	return interpreter
 }
 
+func trustedOntologyProposalStore(
+	base explorer.Client,
+) explorer.OntologyProposalStore {
+	store, _ := base.(explorer.OntologyProposalStore)
+	return store
+}
+
 func trustedSnapshotValidator(base explorer.Client) authorized.SnapshotValidator {
 	validator, _ := base.(authorized.SnapshotValidator)
 	return validator
+}
+
+func trustedDerivedAssertionReader(
+	base explorer.Client,
+) authorized.DerivedAssertionReader {
+	reader, _ := base.(authorized.DerivedAssertionReader)
+	return reader
 }
 
 func (f *fixture) decision(

@@ -87,7 +87,8 @@ func TestPublishedOntologyRemainsDurableWhenFinalGenerationGuardFails(t *testing
 		t.Fatal(err)
 	}
 	client, err := NewClient(Config{
-		Base: baseClient,
+		Base:                  baseClient,
+		OntologyProposalStore: baseClient,
 		Resolver: resolverFunc(func(context.Context) (auth.Decision, error) {
 			return decision, nil
 		}),

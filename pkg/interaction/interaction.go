@@ -941,6 +941,19 @@ func (s Session) RetrievedEvidence() []EvidenceReference {
 	return canonical
 }
 
+// EvidenceReferences returns the complete canonical evidence set attached to
+// the session across seeds, citations, and tool turns.
+func (s Session) EvidenceReferences() ([]EvidenceReference, error) {
+	values := append([]EvidenceReference(nil), s.SeedEvidence...)
+	values = append(values, s.CitedEvidence...)
+	for _, turn := range s.Turns {
+		if turn.ToolCall != nil {
+			values = append(values, turn.ToolCall.RetrievedEvidence...)
+		}
+	}
+	return canonicalEvidenceReferences(values)
+}
+
 // TouchedEdgeIDs returns the complete canonical set of source graph edges
 // represented by retrieved or cited evidence.
 func (s Session) TouchedEdgeIDs() []shoal.ID {

@@ -43,56 +43,60 @@ import (
 // Explorer is a durable embedded implementation of the Explorer and Retriever
 // contracts. Its API contains no engine, cell, or storage-format types.
 type Explorer struct {
-	mu                      sync.RWMutex
-	engine                  *engine.Engine
-	lock                    *dirlock.Lock
-	documents               map[shoal.ID]map[shoal.ID]*persistedDocument
-	edges                   map[shoal.ID]persistedEdge
-	interactions            map[shoal.ID]*persistedInteraction
-	interactionLiveRecords  map[shoal.ID]*persistedInteraction
-	interactionOrder        []shoal.ID
-	folds                   map[shoal.ID]*persistedFold
-	foldLiveRecords         map[shoal.ID]*persistedFold
-	foldOrder               []shoal.ID
-	interactionNodeIDs      map[shoal.ID]struct{}
-	interactionEdgeIDs      map[shoal.ID]struct{}
-	extractions             map[shoal.ID]*persistedExtraction
-	ontologyProposals       map[shoal.ID]*persistedOntologyProposal
-	graphNodes              map[shoal.ID]graph.Node
-	graphEdges              map[shoal.ID]graph.Edge
-	graphAssertions         map[shoal.ID]ontology.Assertion
-	outgoing                map[shoal.ID][]shoal.ID
-	incoming                map[shoal.ID][]shoal.ID
-	graphErr                error
-	graphInitialized        bool
-	embedder                model.Embedder
-	embedders               map[string]model.Embedder
-	maxEmbeddingSpaceFanout int
-	queryEmbeddingMu        sync.Mutex
-	queryEmbeddingCache     map[embeddingQueryCacheKey]cachedQueryEmbedding
-	queryEmbeddingOrder     []embeddingQueryCacheKey
-	maxQueryEmbeddingCache  int
-	embeddingQueryObserver  EmbeddingQueryObserver
-	recallEvidence          map[string]string
-	embeddingSpace          embeddingSpaceCache
-	latentLinkProjection    LatentLinkAssertionProjection
-	maxLatentAssertions     uint32
-	vectorProbeMu           sync.Mutex
-	vectorAvailability      vectorAvailabilityCache
-	snapshot                Snapshot
-	snapshotHistory         map[string]persistedSnapshot
-	latestSnapshotID        shoal.ID
-	latestSnapshotNodes     map[shoal.ID]struct{}
-	sourceEdgeBirth         map[shoal.ID]time.Time
-	snapshotAnchor          time.Time
-	lastPublicationSequence uint64
-	changeHistoryFloor      uint64
-	changeCursorKey         []byte
-	interactionRecordWriter func([]byte, byte, any) error
-	readOnly                bool
-	publication             RecordPublicationAdapter
-	ownsEngine              bool
-	closed                  bool
+	mu                             sync.RWMutex
+	engine                         *engine.Engine
+	lock                           *dirlock.Lock
+	documents                      map[shoal.ID]map[shoal.ID]*persistedDocument
+	edges                          map[shoal.ID]persistedEdge
+	interactions                   map[shoal.ID]*persistedInteraction
+	interactionLiveRecords         map[shoal.ID]*persistedInteraction
+	interactionOrder               []shoal.ID
+	folds                          map[shoal.ID]*persistedFold
+	foldLiveRecords                map[shoal.ID]*persistedFold
+	foldOrder                      []shoal.ID
+	interactionNodeIDs             map[shoal.ID]struct{}
+	interactionEdgeIDs             map[shoal.ID]struct{}
+	extractions                    map[shoal.ID]*persistedExtraction
+	ontologyProposals              map[shoal.ID]*persistedOntologyProposal
+	ontologyMutationIndeterminate  bool
+	graphNodes                     map[shoal.ID]graph.Node
+	graphEdges                     map[shoal.ID]graph.Edge
+	graphAssertions                map[shoal.ID]ontology.Assertion
+	outgoing                       map[shoal.ID][]shoal.ID
+	incoming                       map[shoal.ID][]shoal.ID
+	graphErr                       error
+	graphInitialized               bool
+	embedder                       model.Embedder
+	embedders                      map[string]model.Embedder
+	maxEmbeddingSpaceFanout        int
+	queryEmbeddingMu               sync.Mutex
+	queryEmbeddingCache            map[embeddingQueryCacheKey]cachedQueryEmbedding
+	queryEmbeddingOrder            []embeddingQueryCacheKey
+	maxQueryEmbeddingCache         int
+	embeddingQueryObserver         EmbeddingQueryObserver
+	recallEvidence                 map[string]string
+	embeddingSpace                 embeddingSpaceCache
+	latentLinkProjection           LatentLinkAssertionProjection
+	maxLatentAssertions            uint32
+	vectorProbeMu                  sync.Mutex
+	vectorAvailability             vectorAvailabilityCache
+	snapshot                       Snapshot
+	snapshotHistory                map[string]persistedSnapshot
+	latestSnapshotID               shoal.ID
+	latestSnapshotNodeDigests      map[shoal.ID]string
+	latestSnapshotEdgeDigests      map[shoal.ID]string
+	latestSnapshotAssertionDigests map[shoal.ID]string
+	sourceEdgeBirth                map[shoal.ID]time.Time
+	snapshotAnchor                 time.Time
+	lastPublicationSequence        uint64
+	changeHistoryFloor             uint64
+	changeCursorKey                []byte
+	interactionRecordWriter        func([]byte, byte, any) error
+	indeterminateInteractionErr    error
+	readOnly                       bool
+	publication                    RecordPublicationAdapter
+	ownsEngine                     bool
+	closed                         bool
 }
 
 type persistedDocument struct {
@@ -318,31 +322,33 @@ func openWithEngine(
 		}
 	}
 	explorer := &Explorer{
-		engine:                  eng,
-		documents:               make(map[shoal.ID]map[shoal.ID]*persistedDocument),
-		edges:                   make(map[shoal.ID]persistedEdge),
-		interactions:            make(map[shoal.ID]*persistedInteraction),
-		interactionLiveRecords:  make(map[shoal.ID]*persistedInteraction),
-		folds:                   make(map[shoal.ID]*persistedFold),
-		foldLiveRecords:         make(map[shoal.ID]*persistedFold),
-		interactionNodeIDs:      make(map[shoal.ID]struct{}),
-		interactionEdgeIDs:      make(map[shoal.ID]struct{}),
-		extractions:             make(map[shoal.ID]*persistedExtraction),
-		ontologyProposals:       make(map[shoal.ID]*persistedOntologyProposal),
-		embedder:                options.Embedder,
-		embedders:               embedders,
-		maxEmbeddingSpaceFanout: maxFanout,
-		queryEmbeddingCache:     make(map[embeddingQueryCacheKey]cachedQueryEmbedding),
-		maxQueryEmbeddingCache:  maxQueryCache,
-		embeddingQueryObserver:  options.EmbeddingQueryObserver,
-		recallEvidence:          cloneStringMap(options.RecallEvidence),
-		latentLinkProjection:    latentProjection,
-		maxLatentAssertions:     maxLatentAssertions,
-		snapshotHistory:         make(map[string]persistedSnapshot),
-		latestSnapshotNodes:     make(map[shoal.ID]struct{}),
-		sourceEdgeBirth:         make(map[shoal.ID]time.Time),
-		readOnly:                options.ReadOnly,
-		publication:             publication,
+		engine:                         eng,
+		documents:                      make(map[shoal.ID]map[shoal.ID]*persistedDocument),
+		edges:                          make(map[shoal.ID]persistedEdge),
+		interactions:                   make(map[shoal.ID]*persistedInteraction),
+		interactionLiveRecords:         make(map[shoal.ID]*persistedInteraction),
+		folds:                          make(map[shoal.ID]*persistedFold),
+		foldLiveRecords:                make(map[shoal.ID]*persistedFold),
+		interactionNodeIDs:             make(map[shoal.ID]struct{}),
+		interactionEdgeIDs:             make(map[shoal.ID]struct{}),
+		extractions:                    make(map[shoal.ID]*persistedExtraction),
+		ontologyProposals:              make(map[shoal.ID]*persistedOntologyProposal),
+		embedder:                       options.Embedder,
+		embedders:                      embedders,
+		maxEmbeddingSpaceFanout:        maxFanout,
+		queryEmbeddingCache:            make(map[embeddingQueryCacheKey]cachedQueryEmbedding),
+		maxQueryEmbeddingCache:         maxQueryCache,
+		embeddingQueryObserver:         options.EmbeddingQueryObserver,
+		recallEvidence:                 cloneStringMap(options.RecallEvidence),
+		latentLinkProjection:           latentProjection,
+		maxLatentAssertions:            maxLatentAssertions,
+		snapshotHistory:                make(map[string]persistedSnapshot),
+		latestSnapshotNodeDigests:      make(map[shoal.ID]string),
+		latestSnapshotEdgeDigests:      make(map[shoal.ID]string),
+		latestSnapshotAssertionDigests: make(map[shoal.ID]string),
+		sourceEdgeBirth:                make(map[shoal.ID]time.Time),
+		readOnly:                       options.ReadOnly,
+		publication:                    publication,
 	}
 	if err := explorer.load(); err != nil {
 		return nil, err
@@ -580,7 +586,6 @@ func (e *Explorer) ingest(
 	if e.documents[record.Document.ID] == nil {
 		e.documents[record.Document.ID] = make(map[shoal.ID]*persistedDocument)
 	}
-	e.registerSourceEdgeBirthLocked(record.Edges, record.PublishedAt)
 	e.documents[record.Document.ID][record.Revision.ID] = record
 	e.invalidateVectorAvailabilityLocked()
 	if e.graphInitialized {
@@ -777,8 +782,6 @@ func (e *Explorer) Connect(ctx context.Context, edge graph.Edge) error {
 		return err
 	}
 	e.edges[edge.ID] = record
-	e.registerSourceEdgeBirthLocked(
-		[]graph.Edge{record.Edge}, record.PublishedAt)
 	e.graphEdges[edge.ID] = cloneEdge(edge)
 	e.outgoing[edge.From] = append(e.outgoing[edge.From], edge.ID)
 	sort.Slice(e.outgoing[edge.From], func(i, j int) bool {
@@ -882,6 +885,9 @@ func (e *Explorer) Neighborhood(
 func (e *Explorer) requireOpen() error {
 	if e.closed {
 		return shoal.NewError(shoal.ErrorUnavailable, "explorer is closed")
+	}
+	if e.indeterminateInteractionErr != nil {
+		return e.indeterminateInteractionErr
 	}
 	return nil
 }
@@ -1048,7 +1054,7 @@ func (e *Explorer) computeCurrentGraph() (
 		edges[edge.ID] = edge
 		assertions[edge.ID] = assertion
 		producer, assertionNode, derivationEdge, ok, err :=
-			producerGraphElementsForAssertion(assertion)
+			ProducerGraphElementsForAssertion(assertion)
 		if err != nil {
 			return nil, nil, nil, err
 		}

@@ -60,6 +60,7 @@ type InteractionRecord struct {
 	Summary        InteractionSummary
 	Session        interaction.Session
 	TouchedNodeIDs []shoal.ID
+	TouchedEdgeIDs []shoal.ID
 }
 
 type InteractionRecordPage struct {
@@ -82,6 +83,7 @@ type persistedInteraction struct {
 	Operation                interaction.Operation
 	Actor                    interaction.ActorContext
 	Reason                   interaction.Reason
+	EdgeProvenanceComplete   bool
 	Nodes                    []graph.Node
 	Edges                    []graph.Edge
 	Visibility               string
@@ -252,13 +254,14 @@ func (e *Explorer) recordInteraction(
 		EmbeddingSpaceID:         session.EmbeddingSpaceID,
 		EmbeddingSpaceIDs: append(
 			[]shoal.ID(nil), session.EmbeddingSpaceIDs...),
-		Operation:  session.Operation,
-		Actor:      session.Actor,
-		Reason:     session.Reason,
-		Nodes:      subgraph.Nodes,
-		Edges:      subgraph.Edges,
-		Visibility: interaction.Expression(subgraph.Visibility),
-		RecordedAt: session.RecordedAt.UTC(),
+		Operation:              session.Operation,
+		Actor:                  session.Actor,
+		Reason:                 session.Reason,
+		EdgeProvenanceComplete: true,
+		Nodes:                  subgraph.Nodes,
+		Edges:                  subgraph.Edges,
+		Visibility:             interaction.Expression(subgraph.Visibility),
+		RecordedAt:             session.RecordedAt.UTC(),
 	}
 
 	if err := validatePersistedInteraction(record); err != nil {
@@ -971,11 +974,18 @@ func (e *Explorer) currentFoldVisibilityLocked(
 	if err != nil {
 		return "", err
 	}
-	edgeSets := make([][]string, 0, len(record.SourceEdgeIDs)+2)
+	sourceEdgeIDs := record.SourceEdgeIDs
+	if len(sourceEdgeIDs) == 0 {
+		sourceEdgeIDs, err = e.foldSourceEdgeIDsLocked(*record)
+		if err != nil {
+			return "", err
+		}
+	}
+	edgeSets := make([][]string, 0, len(sourceEdgeIDs)+2)
 	edgeSets = append(
 		edgeSets, nodeLabels, record.RequiredVisibility)
 	resolveEdge := e.edgeVisibilityResolverLocked()
-	for _, id := range record.SourceEdgeIDs {
+	for _, id := range sourceEdgeIDs {
 		labels, err := resolveEdge(id)
 		if err != nil {
 			return "", err
@@ -1326,6 +1336,7 @@ func interactionRecord(record persistedInteraction) InteractionRecord {
 		Summary:        interactionSummary(record),
 		Session:        cloneInteractionSession(record.Session),
 		TouchedNodeIDs: dedupeExplorerIDs(ids),
+		TouchedEdgeIDs: record.Session.TouchedEdgeIDs(),
 	}
 }
 

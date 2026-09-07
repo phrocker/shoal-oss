@@ -136,10 +136,9 @@ func (c *Client) TransitionOntologyProposal(
 }
 
 func (c *Client) ontologyProposalStore() (explorer.OntologyProposalStore, error) {
-	store, ok := c.base.(explorer.OntologyProposalStore)
-	if !ok {
+	if isNilDependency(c.ontologyProposals) {
 		return nil, shoal.NewError(
 			shoal.ErrorUnavailable, "workspace capability \"ontology proposals\" is unavailable")
 	}
-	return store, nil
+	return c.ontologyProposals, nil
 }

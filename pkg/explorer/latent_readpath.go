@@ -297,7 +297,9 @@ func latentAssertionGraphEdge(
 	return edge, true, nil
 }
 
-func producerGraphElementsForAssertion(
+// ProducerGraphElementsForAssertion reconstructs the canonical provenance
+// graph elements for a derived assertion.
+func ProducerGraphElementsForAssertion(
 	assertion ontology.Assertion,
 ) (graph.Node, graph.Node, graph.Edge, bool, error) {
 	if assertion.Origin() != ontology.AssertionDerived {
@@ -348,6 +350,35 @@ func producerGraphElementsForAssertion(
 		return graph.Node{}, graph.Node{}, graph.Edge{}, false, err
 	}
 	return producer, assertionNode, derivationEdge, true, nil
+}
+
+// DerivedAssertions returns canonical derived assertions by assertion ID from
+// the current graph. Missing or non-derived IDs are omitted so callers can
+// fail closed without learning whether another assertion kind exists.
+func (e *Explorer) DerivedAssertions(
+	ctx context.Context, ids []shoal.ID,
+) (map[shoal.ID]ontology.Assertion, error) {
+	if err := contextError(ctx); err != nil {
+		return nil, err
+	}
+	if err := e.acquireReadWithGraph(); err != nil {
+		return nil, err
+	}
+	defer e.mu.RUnlock()
+	result := make(map[shoal.ID]ontology.Assertion, len(ids))
+	for _, id := range ids {
+		if err := shoal.ValidateRequiredID(
+			"derived assertion ID", id); err != nil {
+			return nil, err
+		}
+		assertion, ok := e.graphAssertions[id]
+		if !ok || assertion.ID() != id ||
+			assertion.Origin() != ontology.AssertionDerived {
+			continue
+		}
+		result[id] = assertion
+	}
+	return result, nil
 }
 
 func producerGraphNode(

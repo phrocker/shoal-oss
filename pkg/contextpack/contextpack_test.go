@@ -35,6 +35,7 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/graph"
 	"github.com/phrocker/shoal-oss/pkg/inference"
 	"github.com/phrocker/shoal-oss/pkg/interaction"
+	"github.com/phrocker/shoal-oss/pkg/ontology"
 	"github.com/phrocker/shoal-oss/pkg/retrieval"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
@@ -717,6 +718,199 @@ func TestMutationIsolationAndNoUncitedExplanationText(t *testing.T) {
 		if _, quote, ok := anchor.Document(); ok && strings.Contains(quote, uncited) {
 			t.Fatal("uncited explanation prose entered evidence")
 		}
+	}
+}
+
+func TestGraphAnchorRejectsAuthoritativeDerivedAssertion(t *testing.T) {
+	value, err := ontology.NewReferenceValue("target")
+	if err != nil {
+		t.Fatal(err)
+	}
+	derivation, err := ontology.NewAssertionDerivation(
+		"embedding-model", "v1", "cosine", 0.8, "cell-1", 0.9,
+		"source", "target", "iterator", nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	evidence, err := ontology.NewDerivationEvidenceRef(derivation, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	provenance, err := ontology.NewExtractionProvenance(
+		"provider", "model", "v1", "prompt", "v1", "extractor", "v1", nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	concept, err := ontology.NewConceptDefinition(
+		"graph-node", "Graph Node", "A graph node", nil, nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	relationship, err := ontology.NewRelationshipDefinition(
+		"related-to", "Related To", "Relates two graph nodes",
+		[]shoal.ID{concept.ID()}, []shoal.ID{concept.ID()}, nil, true, nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	predicate := relationship.ID()
+	assertion, err := ontology.NewAssertion(
+		"source", predicate, value, ontology.AssertionDerived, 0.9,
+		[]ontology.EvidenceRef{evidence}, provenance, nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := graph.Path{
+		Nodes: []graph.Node{{ID: "source"}, {ID: "target"}},
+		Edges: []graph.Edge{{
+			ID: assertion.ID(), From: "source", To: "target",
+			Type: string(predicate), Weight: 0.9,
+		}},
+	}
+	verifier, err := newVerifier(
+		context.Background(), nil, mustLimits(t, Limits{}), nil,
+		[]explorer.Neighborhood{{
+			Nodes: path.Nodes, Edges: path.Edges,
+			Assertions: []ontology.Assertion{assertion},
+		}},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := verifier.graphAnchor(path); !shoal.IsErrorCode(
+		err, shoal.ErrorInvalidArgument,
+	) {
+		t.Fatalf("derived assertion graph anchor error = %v", err)
+	}
+}
+
+func TestGraphAnchorCarriesAuthoritativeExplicitAssertion(t *testing.T) {
+	testGraphAnchorCarriesAuthoritativeAssertion(t, ontology.AssertionExplicit)
+}
+
+func TestGraphAnchorCarriesAuthoritativeInferredAssertion(t *testing.T) {
+	testGraphAnchorCarriesAuthoritativeAssertion(t, ontology.AssertionInferred)
+}
+
+func testGraphAnchorCarriesAuthoritativeAssertion(t *testing.T, origin ontology.AssertionOrigin) {
+	t.Helper()
+	_, _, response, _ := embeddedFixture(t)
+	citation := response.Results[0].Evidence[0].Citation
+	quote := response.Results[0].Evidence[0].Quote
+	evidence, err := ontology.NewEvidenceRef(citation, quote, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	provenance, err := ontology.NewExtractionProvenance(
+		"provider", "model", "v1", "prompt", "v1", "extractor", "v1", nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	concept, err := ontology.NewConceptDefinition(
+		"source-node", "Source Node", "A source graph node", nil, nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	relationship, err := ontology.NewRelationshipDefinition(
+		"supports", "Supports", "Supports another graph node",
+		[]shoal.ID{concept.ID()}, []shoal.ID{concept.ID()}, nil, true, nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	value, err := ontology.NewReferenceValue("target")
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertion, err := ontology.NewAssertion(
+		"source", relationship.ID(), value, origin, 1,
+		[]ontology.EvidenceRef{evidence}, provenance,
+		shoal.Metadata{"shoal.graph.edge_id": "edge-1"},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := graph.Path{
+		Nodes: []graph.Node{{ID: "source"}, {ID: "target"}},
+		Edges: []graph.Edge{{
+			ID: "edge-1", From: "source", To: "target",
+			Type: string(relationship.ID()), Weight: 1,
+		}},
+	}
+	verifier, err := newVerifier(
+		context.Background(), nil, mustLimits(t, Limits{}), nil,
+		[]explorer.Neighborhood{{
+			Nodes: path.Nodes, Edges: path.Edges,
+			Assertions: []ontology.Assertion{assertion},
+		}},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	anchor, err := verifier.graphAnchor(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reference, err := anchor.EvidenceReference()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reference.Assertions) != 1 ||
+		reference.Assertions[0].AssertionID != assertion.ID() ||
+		reference.Assertions[0].EdgeID != "edge-1" ||
+		reference.Assertions[0].Origin != origin {
+		t.Fatalf("authoritative assertion reference = %+v", reference.Assertions)
+	}
+	changed, err := ontology.NewAssertion(
+		"source", relationship.ID(), value, origin, 1,
+		[]ontology.EvidenceRef{evidence}, provenance,
+		shoal.Metadata{
+			"shoal.graph.edge_id": "edge-1",
+			"annotation":          "changed without changing assertion identity",
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changed.ID() != assertion.ID() {
+		t.Fatal("fixture metadata unexpectedly changed the assertion identity")
+	}
+	if err := verifier.addNeighborhood(explorer.Neighborhood{
+		Nodes: path.Nodes, Edges: path.Edges,
+		Assertions: []ontology.Assertion{changed},
+	}); !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
+		t.Fatalf("changed assertion metadata across hydrations = %v", err)
+	}
+	remapped, err := ontology.NewAssertion(
+		"source", relationship.ID(), value, origin, 1,
+		[]ontology.EvidenceRef{evidence}, provenance,
+		shoal.Metadata{"shoal.graph.edge_id": "edge-2"},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	remappedEdge := path.Edges[0]
+	remappedEdge.ID = "edge-2"
+	if err := verifier.addNeighborhood(explorer.Neighborhood{
+		Nodes: path.Nodes, Edges: []graph.Edge{remappedEdge},
+		Assertions: []ontology.Assertion{remapped},
+	}); !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
+		t.Fatalf("changed assertion edge mapping across hydrations = %v", err)
+	}
+	if _, err := newVerifier(
+		context.Background(), nil, mustLimits(t, Limits{}), nil,
+		[]explorer.Neighborhood{{
+			Nodes: path.Nodes, Edges: path.Edges,
+			Assertions: []ontology.Assertion{assertion, changed},
+		}},
+	); !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
+		t.Fatalf("duplicate assertion identity in one hydration = %v", err)
 	}
 }
 

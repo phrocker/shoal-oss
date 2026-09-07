@@ -21,6 +21,7 @@ package authorized
 
 import (
 	"context"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -615,6 +616,67 @@ func (c *Client) filterNeighborhood(
 		rawNodes[node.ID] = cloneGraphNode(node)
 		rawNodeIDs = append(rawNodeIDs, node.ID)
 	}
+	derivedAssertions, err := derivedAssertionsByEdge(raw.Assertions)
+	if err != nil {
+		return explorer.Neighborhood{}, err
+	}
+	typeFilter := make(map[string]struct{}, len(normalized.EdgeTypes))
+	for _, edgeType := range normalized.EdgeTypes {
+		typeFilter[edgeType] = struct{}{}
+	}
+	requiredDerivedAssertions := make(
+		map[shoal.ID]ontology.Assertion, len(derivedAssertions))
+	for _, edge := range raw.Edges {
+		if len(typeFilter) > 0 {
+			if _, ok := typeFilter[edge.Type]; !ok {
+				continue
+			}
+		}
+		if assertion, ok := derivedAssertions[edge.ID]; ok &&
+			assertion.Origin() == ontology.AssertionDerived {
+			requiredDerivedAssertions[assertion.ID()] = assertion
+		}
+		if edge.Type == graph.EdgeTypeProduced {
+			if assertion, ok := derivedAssertions[edge.To]; ok {
+				requiredDerivedAssertions[assertion.ID()] = assertion
+			}
+		}
+	}
+	if len(requiredDerivedAssertions) > 0 {
+		if isNilDependency(c.derivedAssertions) {
+			return explorer.Neighborhood{}, shoal.NewError(
+				shoal.ErrorUnavailable,
+				"trusted derived assertion reader is unavailable",
+			)
+		}
+		ids := make([]shoal.ID, 0, len(requiredDerivedAssertions))
+		for id := range requiredDerivedAssertions {
+			ids = append(ids, id)
+		}
+		trusted, err := c.derivedAssertions.DerivedAssertions(ctx, ids)
+		if err != nil {
+			return explorer.Neighborhood{}, directBaseError(err)
+		}
+		if err := validateTrustedDerivedAssertions(
+			requiredDerivedAssertions, trusted); err != nil {
+			return explorer.Neighborhood{}, err
+		}
+		for id := range requiredDerivedAssertions {
+			requiredDerivedAssertions[id] = trusted[id]
+		}
+		for edgeID, assertion := range derivedAssertions {
+			if canonical, ok := trusted[assertion.ID()]; ok {
+				derivedAssertions[edgeID] = canonical
+			}
+		}
+	}
+	for _, assertion := range requiredDerivedAssertions {
+		target, ok := assertion.Object().ReferenceValue()
+		if !ok {
+			continue
+		}
+		rawNodeIDs = append(rawNodeIDs, assertion.Subject(), target)
+	}
 	resolved, err := c.resolveNodes(ctx, rawNodeIDs)
 	if err != nil {
 		return explorer.Neighborhood{}, err
@@ -651,14 +713,6 @@ func (c *Client) filterNeighborhood(
 		visibleNodes[nodeID] = node
 	}
 
-	typeFilter := make(map[string]struct{}, len(normalized.EdgeTypes))
-	for _, edgeType := range normalized.EdgeTypes {
-		typeFilter[edgeType] = struct{}{}
-	}
-	derivedAssertions, err := derivedAssertionsByEdge(raw.Assertions)
-	if err != nil {
-		return explorer.Neighborhood{}, err
-	}
 	admittedEdges := make(map[shoal.ID]graph.Edge, len(raw.Edges))
 	admittedAssertions := make(map[shoal.ID]ontology.Assertion, len(raw.Assertions))
 	candidateEdges := make([]graph.Edge, 0, len(raw.Edges))
@@ -850,6 +904,20 @@ func reachableThrough(
 	return nil
 }
 
+func validateTrustedDerivedAssertions(
+	claimed, trusted map[shoal.ID]ontology.Assertion,
+) error {
+	for id, untrusted := range claimed {
+		canonical, ok := trusted[id]
+		if !ok || canonical.ID() != id ||
+			canonical.Origin() != ontology.AssertionDerived ||
+			!reflect.DeepEqual(canonical, untrusted) {
+			return inconsistentBase()
+		}
+	}
+	return nil
+}
+
 func derivedAssertionsByEdge(
 	assertions []ontology.Assertion,
 ) (map[shoal.ID]ontology.Assertion, error) {
@@ -901,27 +969,20 @@ func producerDerivationEdgeMatches(
 	rawNodes map[shoal.ID]graph.Node,
 	assertion ontology.Assertion,
 ) bool {
-	producer, ok := rawNodes[edge.From]
-	if !ok || producer.Kind != graph.NodeKindProducer {
+	producer, assertionNode, producedEdge, ok, err :=
+		explorer.ProducerGraphElementsForAssertion(assertion)
+	if err != nil || !ok || !graphEdgesEqual(producedEdge, edge) {
 		return false
 	}
-	assertionNode, ok := rawNodes[edge.To]
-	if !ok || assertionNode.Kind != graph.NodeKindDerivedAssertion {
+	rawProducer, ok := rawNodes[producer.ID]
+	if !ok || !graphNodesEqual(rawProducer, producer) {
 		return false
 	}
-	if assertionNode.ID != assertion.ID() {
+	rawAssertion, ok := rawNodes[assertionNode.ID]
+	if !ok || !graphNodesEqual(rawAssertion, assertionNode) {
 		return false
 	}
-	assertionID, ok := edge.Properties[derivedAssertionPropertyAssertionID]
-	if !ok || shoal.ID(assertionID) != assertion.ID() {
-		return false
-	}
-	derivation, ok := assertion.Evidence()[0].Derivation()
-	if !ok {
-		return false
-	}
-	return edge.Properties[derivedAssertionPropertyDerivationID] ==
-		string(derivation.ID())
+	return true
 }
 
 func (c *Client) derivedAssertionEndpointsAllow(

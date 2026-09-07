@@ -300,26 +300,27 @@ func TestAuthorizedInteractionRejectsForgedAssertionEvidence(t *testing.T) {
 	for _, node := range raw.Nodes {
 		nodesByID[node.ID] = node
 	}
-	anchor, err := inference.NewGraphAnchor(graph.Path{
+	assertionReference := interaction.AssertionReference{
+		AssertionID: assertion.ID(),
+		EdgeID:      edge.ID,
+		Origin:      assertion.Origin(),
+	}
+	anchor, err := inference.NewGraphAnchorWithAssertions(graph.Path{
 		Nodes: []graph.Node{
 			nodesByID[firstSpan.ID],
 			nodesByID[secondSpan.ID],
 		},
 		Edges: []graph.Edge{edge},
-	})
+	}, []interaction.AssertionReference{assertionReference})
 	if err != nil {
 		t.Fatal(err)
 	}
 	reference := interaction.EvidenceReference{
-		AnchorID: anchor.ID(),
-		Kind:     interaction.EvidenceGraph,
-		NodeIDs:  []shoal.ID{firstSpan.ID, secondSpan.ID},
-		EdgeIDs:  []shoal.ID{edge.ID},
-		Assertions: []interaction.AssertionReference{{
-			AssertionID: assertion.ID(),
-			EdgeID:      edge.ID,
-			Origin:      assertion.Origin(),
-		}},
+		AnchorID:   anchor.ID(),
+		Kind:       interaction.EvidenceGraph,
+		NodeIDs:    []shoal.ID{firstSpan.ID, secondSpan.ID},
+		EdgeIDs:    []shoal.ID{edge.ID},
+		Assertions: []interaction.AssertionReference{assertionReference},
 	}
 	snapshot, err := f.base.Snapshot(context.Background())
 	if err != nil {
@@ -347,11 +348,11 @@ func TestAuthorizedInteractionRejectsForgedAssertionEvidence(t *testing.T) {
 		SeedEvidence:             []interaction.EvidenceReference{reference},
 	}
 	accepted := baseSession
-	accepted.ID = "verified-assertion-session"
+	accepted.ID = "untrusted-assertion-session"
 	if err := client.RecordInteraction(
 		f.context(t, decision), accepted,
-	); err != nil {
-		t.Fatalf("verified assertion evidence was rejected: %v", err)
+	); !shoal.IsErrorCode(err, shoal.ErrorConflict) {
+		t.Fatalf("untrusted assertion evidence error = %v", err)
 	}
 	tests := []struct {
 		name   string
@@ -398,7 +399,7 @@ func TestAuthorizedInteractionRejectsForgedAssertionEvidence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(records) != 1 || records[0].Session.ID != accepted.ID {
+	if len(records) != 0 {
 		t.Fatalf("forged assertion evidence produced records: %+v", records)
 	}
 }
@@ -450,7 +451,8 @@ func TestAuthorizedInteractionRequiresCurrentEdgeAuthorization(t *testing.T) {
 	edgeClient := f.newClient(
 		t, f.base, f.store, f.sourceA, f.policyA, edgeSelector)
 	edge := graph.Edge{
-		ID: "restricted-evidence-edge", From: spanID, To: spanID,
+		ID:   "restricted-evidence-edge",
+		From: receipt.Document.ID, To: spanID,
 		Type: "related", Weight: 1,
 	}
 	if err := edgeClient.Connect(f.admin(t), edge); err != nil {
@@ -468,15 +470,15 @@ func TestAuthorizedInteractionRequiresCurrentEdgeAuthorization(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var spanNode graph.Node
+	nodesByID := make(map[shoal.ID]graph.Node, len(neighborhood.Nodes))
 	for _, node := range neighborhood.Nodes {
-		if node.ID == spanID {
-			spanNode = node
-			break
-		}
+		nodesByID[node.ID] = node
 	}
 	anchor, err := inference.NewGraphAnchor(graph.Path{
-		Nodes: []graph.Node{spanNode, spanNode},
+		Nodes: []graph.Node{
+			nodesByID[receipt.Document.ID],
+			nodesByID[spanID],
+		},
 		Edges: []graph.Edge{edge},
 	})
 	if err != nil {
@@ -484,7 +486,8 @@ func TestAuthorizedInteractionRequiresCurrentEdgeAuthorization(t *testing.T) {
 	}
 	reference := interaction.EvidenceReference{
 		AnchorID: anchor.ID(), Kind: interaction.EvidenceGraph,
-		NodeIDs: []shoal.ID{spanID}, EdgeIDs: []shoal.ID{edge.ID},
+		NodeIDs: []shoal.ID{receipt.Document.ID, spanID},
+		EdgeIDs: []shoal.ID{edge.ID},
 	}
 	denied := f.decision(
 		t, "edge-denied",
@@ -502,7 +505,7 @@ func TestAuthorizedInteractionRequiresCurrentEdgeAuthorization(t *testing.T) {
 		SnapshotID: shoal.ID(snapshot.ID), SnapshotAsOf: snapshot.AsOf,
 		AuthorizationFingerprint: shoal.ID(deniedFingerprint.String()),
 		AuthorizationExpiresAt:   denied.AuthenticationExpires(),
-		SeedNodeIDs:              []shoal.ID{spanID},
+		SeedNodeIDs:              []shoal.ID{receipt.Document.ID, spanID},
 		SeedEvidence:             []interaction.EvidenceReference{reference},
 	}
 	if err := f.clientA.RecordInteraction(
@@ -547,6 +550,20 @@ func (b *generationChangingInteractionBase) RecordInteractionResult(
 
 type forgedResultInteractionBase struct {
 	*explorer.Explorer
+}
+
+type voidOnlyInteractionWriter struct {
+	writer explorer.InteractionWriter
+}
+
+func (w voidOnlyInteractionWriter) EnsureInteractionSink(ctx context.Context) error {
+	return w.writer.EnsureInteractionSink(ctx)
+}
+
+func (w voidOnlyInteractionWriter) RecordInteraction(
+	ctx context.Context, session interaction.Session,
+) error {
+	return w.writer.RecordInteraction(ctx, session)
 }
 
 func (b *forgedResultInteractionBase) RecordInteractionResult(
@@ -601,6 +618,53 @@ func (b *countingInteractionBase) InteractionRecords(
 ) ([]explorer.InteractionRecord, error) {
 	b.recordsCalls++
 	return b.Explorer.InteractionRecords(ctx)
+}
+
+func TestAuthorizedResultPathRequiresResultSink(t *testing.T) {
+	f := newFixture(t)
+	snapshot, err := f.base.Snapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.clock.Set(snapshot.AsOf.Add(time.Second))
+	decision := f.decision(
+		t, "result-sink-required",
+		nil, nil, []auth.Operation{auth.OperationRetrieve},
+	)
+	fingerprint, err := auth.AuthorizationFingerprint(decision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	selector, err := authorized.NewStaticPolicySelector(f.sourceA, f.policyA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, err := authorized.NewClient(authorized.Config{
+		Base: f.base, VectorScorer: f.base,
+		InteractionWriter: voidOnlyInteractionWriter{writer: f.base},
+		InteractionReader: f.base, SnapshotValidator: f.base,
+		Resolver: f.authority.Resolver(), PolicySelector: selector,
+		PolicyStore: f.store, GenerationReader: f.reader, Clock: f.clock.Now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := interaction.Session{
+		ID:         interaction.DerivedID("session", "result-sink-required"),
+		Operation:  interaction.OperationRetrieval,
+		SnapshotID: shoal.ID(snapshot.ID), SnapshotAsOf: snapshot.AsOf,
+		AuthorizationFingerprint: shoal.ID(fingerprint.String()),
+		AuthorizationExpiresAt:   decision.AuthenticationExpires(),
+	}
+	ctx := f.context(t, decision)
+	if _, err := client.RecordInteractionResult(
+		ctx, session,
+	); !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
+		t.Fatalf("result path without ResultSink = %v", err)
+	}
+	if err := client.RecordInteraction(ctx, session); err != nil {
+		t.Fatalf("legacy void record path = %v", err)
+	}
 }
 
 func TestAuthorizedInteractionRecorderAndViews(t *testing.T) {

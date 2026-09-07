@@ -358,9 +358,11 @@ func (v *verifier) assertionsForPath(
 ) ([]VerifiedAssertion, error) {
 	assertions := make([]VerifiedAssertion, 0, len(path.Edges))
 	for _, edge := range path.Edges {
-		assertion, hasAssertion := v.assertions[edge.ID]
+		references := v.assertions[edge.ID]
+		hasAssertion := len(references) > 0
 		hasAssertionMarker :=
 			edge.Properties["ontology_relationship_id"] != "" ||
+				edge.Properties["ontology.assertion.id"] != "" ||
 				edge.Properties["ontology.assertion.origin"] != ""
 		if hasAssertionMarker && !hasAssertion {
 			return nil, invalid(
@@ -369,27 +371,27 @@ func (v *verifier) assertionsForPath(
 		if !hasAssertion {
 			continue
 		}
-		target, ok := assertion.Object().ReferenceValue()
-		if !ok || assertion.Subject() != edge.From ||
-			target != edge.To ||
-			assertion.Confidence() != edge.Weight {
-			return nil, invalid(
-				"graph path edge does not match its authoritative assertion")
+		for _, reference := range references {
+			if reference.EdgeID != edge.ID {
+				return nil, invalid(
+					"graph path assertion does not match its edge")
+			}
+			if assertionID := edge.Properties["ontology.assertion.id"]; assertionID != "" &&
+				shoal.ID(assertionID) != reference.AssertionID {
+				return nil, invalid(
+					"graph path assertion ID does not match its authoritative edge")
+			}
+			if origin := edge.Properties["ontology.assertion.origin"]; origin != "" &&
+				origin != string(reference.Origin) {
+				return nil, invalid(
+					"graph path origin does not match its authoritative assertion")
+			}
+			assertions = append(assertions, VerifiedAssertion{
+				assertionID: reference.AssertionID,
+				edgeID:      reference.EdgeID,
+				origin:      reference.Origin,
+			})
 		}
-		if relationship := edge.Properties["ontology_relationship_id"]; relationship != "" &&
-			relationship != string(assertion.Predicate()) {
-			return nil, invalid(
-				"graph path relationship does not match its authoritative assertion")
-		}
-		if origin := edge.Properties["ontology.assertion.origin"]; origin != "" && origin != string(assertion.Origin()) {
-			return nil, invalid(
-				"graph path origin does not match its authoritative assertion")
-		}
-		assertions = append(assertions, VerifiedAssertion{
-			assertionID: assertion.ID(),
-			edgeID:      edge.ID,
-			origin:      assertion.Origin(),
-		})
 	}
 	sort.Slice(assertions, func(i, j int) bool {
 		return shoal.CompareID(
