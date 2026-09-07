@@ -36,6 +36,7 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/explorer/mcp"
 	"github.com/phrocker/shoal-oss/pkg/explorer/webapi"
+	"github.com/phrocker/shoal-oss/pkg/interaction"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
@@ -244,8 +245,8 @@ func TestStdioSmokeUsesEmbeddedExplorerAndKeepsStdoutPure(t *testing.T) {
 	mustDecode(t, responses[0].Result, &initialized)
 	for _, text := range []string{
 		"launcher-configured identity",
-		"future HTTP transport",
-		"recording is not implemented",
+		"Streamable HTTP /mcp",
+		"durably recorded",
 	} {
 		if !strings.Contains(initialized.Instructions, text) {
 			t.Fatalf("instructions missing %q: %s", text, initialized.Instructions)
@@ -292,6 +293,23 @@ func TestStdioSmokeUsesEmbeddedExplorerAndKeepsStdoutPure(t *testing.T) {
 		documents.Documents[0].Document.Title != "smoke.md" {
 		t.Fatalf("documents = %+v", documents.Documents)
 	}
+	corpus, err := explorer.Open(filepath.Join(stateDir, "corpus"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer corpus.Close()
+	sessions, err := corpus.Interactions(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sessions) != 3 {
+		t.Fatalf("recorded MCP sessions = %d, want 3", len(sessions))
+	}
+	for _, session := range sessions {
+		if session.Operation != interaction.OperationToolCall {
+			t.Fatalf("recorded operation = %q", session.Operation)
+		}
+	}
 }
 
 func TestProcessIdentityIsBoundFreshForEveryToolCall(t *testing.T) {
@@ -309,8 +327,14 @@ func TestProcessIdentityIsBoundFreshForEveryToolCall(t *testing.T) {
 		t.Fatal(err)
 	}
 	service := &requestIDService{resolver: authority.Resolver()}
+	recorder, err := interaction.NewRecorder(
+		context.Background(), commandInteractionSink{})
+	if err != nil {
+		t.Fatal(err)
+	}
 	server, err := mcp.NewServer(mcp.Config{
 		Service: service, Authority: authority, Decisions: identity,
+		Recorder: recorder, Snapshots: service,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -371,7 +395,7 @@ func TestUnregisteredExistingCorpusIsRefused(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, closeWorkspace, err := openWorkspace(
+	_, _, closeWorkspace, err := openWorkspace(
 		context.Background(),
 		commandConfig{
 			corpusDir: corpusDir,
@@ -556,6 +580,14 @@ type requestIDService struct {
 	requestIDs []shoal.ID
 }
 
+func (*requestIDService) Snapshot(
+	context.Context,
+) (explorer.Snapshot, error) {
+	return explorer.Snapshot{
+		ID: "snapshot", AsOf: time.Now().UTC(),
+	}, nil
+}
+
 func (s *requestIDService) Documents(
 	ctx context.Context,
 	_ webapi.DocumentsRequest,
@@ -596,6 +628,24 @@ func (*requestIDService) Path(
 	webapi.PathRequest,
 ) (webapi.PathResponse, error) {
 	return webapi.PathResponse{}, nil
+}
+
+type commandInteractionSink struct{}
+
+func (commandInteractionSink) EnsureInteractionSink(context.Context) error {
+	return nil
+}
+
+func (commandInteractionSink) RecordInteraction(
+	context.Context, interaction.Session,
+) error {
+	return nil
+}
+
+func (commandInteractionSink) RecordInteractionResult(
+	_ context.Context, session interaction.Session,
+) (interaction.Session, error) {
+	return session, nil
 }
 
 type fakeServer struct {

@@ -178,6 +178,36 @@ func (c *Client) Folds(ctx context.Context) ([]explorer.FoldSummary, error) {
 	return visible, nil
 }
 
+func (c *Client) FoldsPage(
+	ctx context.Context, after shoal.ID, limit uint32,
+) (explorer.FoldSummaryPage, error) {
+	if err := shoal.ValidateOptionalID("fold page cursor", after); err != nil {
+		return explorer.FoldSummaryPage{}, err
+	}
+	if limit == 0 || limit > explorer.MaxFoldSummaryPageSize {
+		return explorer.FoldSummaryPage{}, shoal.NewError(
+			shoal.ErrorInvalidArgument, "fold page limit is outside its bound")
+	}
+	folds, err := c.Folds(ctx)
+	if err != nil {
+		return explorer.FoldSummaryPage{}, err
+	}
+	page := explorer.FoldSummaryPage{
+		Folds: make([]explorer.FoldSummary, 0, limit),
+	}
+	for _, fold := range folds {
+		if shoal.CompareID(fold.FoldID, after) <= 0 {
+			continue
+		}
+		if len(page.Folds) == int(limit) {
+			page.NextAfter = page.Folds[len(page.Folds)-1].FoldID
+			break
+		}
+		page.Folds = append(page.Folds, fold)
+	}
+	return page, nil
+}
+
 // RehydrateFold returns the exact retrieved/cited split only when every folded
 // session remains visible to the current caller.
 func (c *Client) RehydrateFold(

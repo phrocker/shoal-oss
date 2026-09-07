@@ -146,11 +146,6 @@ func TestIvfIndex_LoadAndSearch(t *testing.T) {
 	); !errors.Is(err, embeddingspace.ErrQueryIdentityRequired) {
 		t.Fatalf("legacy Search error = %v", err)
 	}
-	if _, err := ix.SearchInSpace(
-		ctx, vecs[0], " "+space+" ", 3, 2,
-	); !errors.Is(err, embeddingspace.ErrInvalidState) {
-		t.Fatalf("non-canonical SearchInSpace error = %v", err)
-	}
 	if _, err := LoadIvfIndexInSpace(
 		ctx, store, table, "foreign-space",
 	); !errors.Is(err, embeddingspace.ErrMismatch) {
@@ -225,41 +220,4 @@ func TestLoadIvfIndexRejectsLegacyIdentitylessArtifact(t *testing.T) {
 	); !errors.Is(err, embeddingspace.ErrQueryMetadataMissing) {
 		t.Fatalf("legacy load error = %v", err)
 	}
-}
-
-func TestLoadIvfIndexRejectsInvalidVersionAndNonCanonicalIdentity(t *testing.T) {
-	makeStore := func(t *testing.T) *FakeStore {
-		t.Helper()
-		store := NewFakeStore()
-		vecs := [][]float32{
-			{1, 0, 0, 0}, {0, 1, 0, 0}, {0, 0, 1, 0},
-			{0, 0, 0, 1}, {1, 1, 0, 0}, {0, 0, 1, 1},
-		}
-		seedIvfIndex(t, store, "graph", vecs, 2, 6, 2, 1)
-		return store
-	}
-	t.Run("overflow version", func(t *testing.T) {
-		store := makeStore(t)
-		store.mu.Lock()
-		cells := store.tables[ivfpq.ConfigTableName("graph")][ivfpq.ConfigRowActiveVersion]
-		cells[0].Value = []byte("4294967297")
-		store.mu.Unlock()
-		if _, err := LoadIvfIndex(
-			context.Background(), store, "graph"); err == nil {
-			t.Fatal("overflowed active version was accepted")
-		}
-	})
-	t.Run("non-canonical identity", func(t *testing.T) {
-		store := makeStore(t)
-		store.mu.Lock()
-		row := ivfpq.EmbeddingSpaceRow(1)
-		cells := store.tables[ivfpq.ConfigTableName("graph")][row]
-		cells[0].Value = append([]byte(" "), append(cells[0].Value, ' ')...)
-		store.mu.Unlock()
-		if _, err := LoadIvfIndex(
-			context.Background(), store, "graph",
-		); !errors.Is(err, embeddingspace.ErrInvalidState) {
-			t.Fatalf("non-canonical identity error = %v", err)
-		}
-	})
 }

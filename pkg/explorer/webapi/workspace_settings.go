@@ -69,6 +69,16 @@ type WorkspaceSettingsProvider interface {
 	) (workspace.EffectiveDecision, error)
 }
 
+type WorkspaceSettingsApplier interface {
+	ApplyForOperation(
+		context.Context,
+		shoal.ID,
+		auth.Operation,
+		workspace.Limits,
+		[]auth.Policy,
+	) (workspace.EffectiveDecision, error)
+}
+
 // WorkspaceSettingsHTTPConfig configures the independently mountable settings
 // management handler.
 type WorkspaceSettingsHTTPConfig struct {
@@ -94,6 +104,7 @@ func NewWorkspaceSettingsHTTPHandler(
 }
 
 type effectiveWorkspaceSettingsContextKey struct{}
+type effectiveWorkspaceIDContextKey struct{}
 
 // EffectiveWorkspaceSettings returns the authenticated workspace settings
 // effect already applied by Handler.ServeHTTP. Additive mounted transports can
@@ -107,6 +118,11 @@ func EffectiveWorkspaceSettings(
 	return effective, ok
 }
 
+func EffectiveWorkspaceID(ctx context.Context) (shoal.ID, bool) {
+	workspaceID, ok := ctx.Value(effectiveWorkspaceIDContextKey{}).(shoal.ID)
+	return workspaceID, ok
+}
+
 type workspaceResponseWriter struct {
 	http.ResponseWriter
 	maxResponseBytes        uint64
@@ -115,6 +131,22 @@ type workspaceResponseWriter struct {
 
 func (w workspaceResponseWriter) Unwrap() http.ResponseWriter {
 	return w.ResponseWriter
+}
+
+func responseSupportsFlush(writer http.ResponseWriter) bool {
+	for depth := 0; writer != nil && depth < 100; depth++ {
+		if _, ok := writer.(http.Flusher); ok {
+			return true
+		}
+		unwrapper, ok := writer.(interface {
+			Unwrap() http.ResponseWriter
+		})
+		if !ok {
+			return false
+		}
+		writer = unwrapper.Unwrap()
+	}
+	return false
 }
 
 // ConfigureWorkspaceSettings enables effective-decision application without
@@ -187,6 +219,10 @@ func (h *Handler) applyWorkspaceSettings(
 	if !present {
 		return request.Context(), nil
 	}
+	if request.URL.Path == "/mcp" && h.mountedHandler("/mcp") != nil {
+		return context.WithValue(
+			request.Context(), effectiveWorkspaceIDContextKey{}, workspaceID), nil
+	}
 	operation, apply := workspaceOperationForRequest(
 		request.Method, request.URL.Path)
 	if !apply {
@@ -195,14 +231,32 @@ func (h *Handler) applyWorkspaceSettings(
 			"workspace settings are not registered for this route",
 		)
 	}
-	effective, err := h.workspaceSettings.ApplyForOperation(
-		request.Context(), workspaceID, operation,
-		workspace.MaximumLimits(), nil)
+	return ApplyWorkspaceSettingsForOperation(
+		request.Context(), h.workspaceSettings, h.binder,
+		workspaceID, operation, workspace.MaximumLimits(), nil)
+}
+
+func ApplyWorkspaceSettingsForOperation(
+	ctx context.Context,
+	provider WorkspaceSettingsApplier,
+	binder auth.Binder,
+	workspaceID shoal.ID,
+	operation auth.Operation,
+	baseLimits workspace.Limits,
+	baseOutputPolicies []auth.Policy,
+) (context.Context, error) {
+	if ctx == nil || isAbsentInterface(provider) || isAbsentInterface(binder) {
+		return nil, shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			"workspace settings application dependencies are required")
+	}
+	effective, err := provider.ApplyForOperation(
+		ctx, workspaceID, operation, baseLimits, baseOutputPolicies)
 	if err != nil {
 		return nil, err
 	}
 	decision := effective.Decision()
-	ctx, err := h.binder.Bind(request.Context(), decision)
+	ctx, err = binder.Bind(ctx, decision)
 	if err != nil {
 		return nil, authenticationDenied()
 	}

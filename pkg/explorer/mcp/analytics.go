@@ -24,6 +24,7 @@ import (
 
 	"github.com/phrocker/shoal-oss/pkg/explorer"
 	exploreranalytics "github.com/phrocker/shoal-oss/pkg/explorer/analytics"
+	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/explorer/webapi"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
@@ -135,6 +136,10 @@ func (p *analyticsToolProvider) Tool() Tool {
 		return Tool{}
 	}
 	return cloneTool(p.tool)
+}
+
+func (*analyticsToolProvider) ToolAuthorizationOperation() auth.Operation {
+	return auth.OperationAnalyticsRead
 }
 
 func (p *analyticsToolProvider) Call(

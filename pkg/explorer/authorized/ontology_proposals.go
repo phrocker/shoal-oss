@@ -95,7 +95,10 @@ func (c *Client) CreateOntologyProposal(
 	if err := store.CreateOntologyProposal(ctx, proposal, baseVersion); err != nil {
 		return directBaseError(err)
 	}
-	return guard.Check(ctx)
+	if err := guard.Check(ctx); err != nil {
+		return explorer.MarkIndeterminateCommit(err)
+	}
+	return nil
 }
 
 func (c *Client) OntologyProposalMutationState(

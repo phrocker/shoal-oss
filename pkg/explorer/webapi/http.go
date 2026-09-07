@@ -60,6 +60,8 @@ type Handler struct {
 	browserAuth              *BrowserAuthConfig
 	workspaceSettings        WorkspaceSettingsProvider
 	workspaceSettingsMounted bool
+	chatProvider             AskProvider
+	interactionProvider      InteractionProvider
 	preAuth                  map[string]preAuthenticationValidator
 	authenticatedMounts      map[string]http.Handler
 }
@@ -157,24 +159,7 @@ func (h *Handler) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 			}
 		}
 	}
-	if mounted := h.mountedHandler(cleanedPath); mounted != nil {
-		mounted.ServeHTTP(writer, request)
-		return
-	}
 	h.mux.ServeHTTP(writer, request)
-}
-
-func (h *Handler) mountedHandler(requestPath string) http.Handler {
-	var selected http.Handler
-	longest := 0
-	for prefix, handler := range h.authenticatedMounts {
-		cleanedPrefix := strings.TrimSuffix(prefix, "/")
-		if mountedPathMatches(prefix, cleanedPrefix, requestPath) &&
-			len(cleanedPrefix) > longest {
-			selected, longest = handler, len(cleanedPrefix)
-		}
-	}
-	return selected
 }
 
 func (h *Handler) mountedValidator(
@@ -184,7 +169,11 @@ func (h *Handler) mountedValidator(
 	longest := 0
 	for prefix, validator := range h.preAuth {
 		cleanedPrefix := strings.TrimSuffix(prefix, "/")
-		if mountedPathMatches(prefix, cleanedPrefix, requestPath) &&
+		matches := requestPath == cleanedPrefix
+		if strings.HasSuffix(prefix, "/") {
+			matches = matches || strings.HasPrefix(requestPath, cleanedPrefix+"/")
+		}
+		if matches &&
 			len(cleanedPrefix) > longest {
 			selected, longest = validator, len(cleanedPrefix)
 		}
@@ -192,12 +181,18 @@ func (h *Handler) mountedValidator(
 	return selected
 }
 
-func mountedPathMatches(pattern, cleanedPattern, requestPath string) bool {
-	if strings.HasSuffix(pattern, "/") {
-		return requestPath == cleanedPattern ||
-			strings.HasPrefix(requestPath, cleanedPattern+"/")
+func (h *Handler) mountedHandler(requestPath string) http.Handler {
+	var selected http.Handler
+	longest := 0
+	for prefix, handler := range h.authenticatedMounts {
+		root := strings.TrimSuffix(prefix, "/")
+		if (requestPath == root ||
+			strings.HasSuffix(prefix, "/") && strings.HasPrefix(requestPath, root+"/")) &&
+			len(root) > longest {
+			selected, longest = handler, len(root)
+		}
 	}
-	return requestPath == cleanedPattern
+	return selected
 }
 
 func (h *Handler) routes() {
@@ -543,6 +538,38 @@ func writeResponse(writer http.ResponseWriter, status int, value any) {
 	writer.Header().Set("Content-Type", "application/json; charset=utf-8")
 	writer.WriteHeader(status)
 	_, _ = writer.Write(body.Bytes())
+}
+
+func writeResponseEncodingFailure(writer http.ResponseWriter, status int) {
+	success := status >= http.StatusOK && status < http.StatusMultipleChoices
+	if !success {
+		writer.Header().Set("Content-Type", "application/json; charset=utf-8")
+		writer.WriteHeader(status)
+		return
+	}
+	indeterminate := responseOverflowIsIndeterminate(writer)
+	status = http.StatusInternalServerError
+	code := shoal.ErrorInternal
+	if indeterminate {
+		writer.Header().Set(CommitOutcomeHeader, CommitOutcomeIndeterminate)
+		status, code = http.StatusServiceUnavailable, shoal.ErrorUnavailable
+	}
+	var fallback limitedResponseBuffer
+	fallback.limit = int64(responseLimitFor(writer))
+	fallbackErr := json.NewEncoder(&fallback).Encode(struct {
+		Code          shoal.ErrorCode `json:"code"`
+		Message       string          `json:"message"`
+		Indeterminate bool            `json:"indeterminate,omitempty"`
+	}{
+		Code:          code,
+		Message:       "response exceeds output byte limit",
+		Indeterminate: indeterminate,
+	})
+	writer.Header().Set("Content-Type", "application/json; charset=utf-8")
+	writer.WriteHeader(status)
+	if fallbackErr == nil {
+		_, _ = writer.Write(fallback.Bytes())
+	}
 }
 
 type limitedResponseBuffer struct {

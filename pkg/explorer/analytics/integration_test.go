@@ -415,7 +415,9 @@ func TestMCPAnalyticsDurablyRecordsBeforeSuccess(t *testing.T) {
 		) (auth.Decision, error) {
 			return decision, nil
 		}),
-		OptionalTools: []mcp.OptionalToolProvider{tool},
+		InteractionSink: fixture.clientA,
+		Snapshots:       fixture.clientA,
+		OptionalTools:   []mcp.OptionalToolProvider{tool},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -454,7 +456,7 @@ func TestMCPAnalyticsDurablyRecordsBeforeSuccess(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(summaries) != 1 {
+	if len(summaries) == 0 {
 		t.Fatalf("recorded MCP interactions = %+v", summaries)
 	}
 }

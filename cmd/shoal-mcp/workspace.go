@@ -42,7 +42,7 @@ func buildApplication(
 	if err != nil {
 		return nil, err
 	}
-	service, closeWorkspace, err := openWorkspace(
+	service, client, closeWorkspace, err := openWorkspace(
 		ctx, config, authority, time.Now)
 	if err != nil {
 		return nil, err
@@ -63,10 +63,12 @@ func buildApplication(
 		optionalTools = append(optionalTools, provider)
 	}
 	server, err := mcp.NewServer(mcp.Config{
-		Service:       service,
-		Authority:     authority,
-		Decisions:     identity,
-		OptionalTools: optionalTools,
+		Service:         service,
+		Authority:       authority,
+		Decisions:       identity,
+		InteractionSink: client,
+		Snapshots:       client,
+		OptionalTools:   optionalTools,
 		ServerInfo: mcp.Implementation{
 			Name:        "shoal-mcp",
 			Title:       "Shoal Explorer MCP",
@@ -75,9 +77,8 @@ func buildApplication(
 		},
 		Instructions: "This stdio v1 process uses one trusted launcher-configured " +
 			"identity for every caller connected to it. A fresh decision and " +
-			"RequestID are bound for each tools/call, but stdio cannot " +
-			"independently authenticate remote callers; a future HTTP transport " +
-			"is required for independently authenticated per-call remote callers. " +
+			"RequestID are bound for each tools/call; independently authenticated " +
+			"remote callers use the Streamable HTTP /mcp transport. " +
 			"shoal.analytics requires durable interaction recording before success; " +
 			"other stdio tool-call recording is not implemented.",
 		ContextBudgetBytes: config.contextBudgetBytes,
@@ -107,41 +108,45 @@ func openWorkspace(
 	config commandConfig,
 	authority *auth.Authority,
 	clock func() time.Time,
-) (*webapi.EmbeddedService, func() error, error) {
+) (*webapi.EmbeddedService, *authorized.Client, func() error, error) {
 	noClose := func() error { return nil }
 	if ctx == nil {
-		return nil, noClose, fmt.Errorf("context is required")
+		return nil, nil, noClose, fmt.Errorf("context is required")
 	}
 	if stringsBlank(config.corpusDir) || stringsBlank(config.policyDir) {
-		return nil, noClose, fmt.Errorf("corpus and policy directories are required")
+		return nil, nil, noClose, fmt.Errorf("corpus and policy directories are required")
 	}
 	if authority == nil {
-		return nil, noClose, fmt.Errorf("authorization authority is required")
+		return nil, nil, noClose, fmt.Errorf("authorization authority is required")
 	}
 	if clock == nil {
-		return nil, noClose, fmt.Errorf("workspace clock is required")
+		return nil, nil, noClose, fmt.Errorf("workspace clock is required")
 	}
 
 	corpus, err := explorer.Open(config.corpusDir)
 	if err != nil {
-		return nil, noClose, err
+		return nil, nil, noClose, err
+	}
+	if err := corpus.EnsureInteractionSink(ctx); err != nil {
+		_ = corpus.Close()
+		return nil, nil, noClose, err
 	}
 	closeCorpus := func() error { return corpus.Close() }
 	store, err := authorized.OpenDurablePolicyStore(config.policyDir)
 	if err != nil {
-		return nil, noClose, errors.Join(err, closeCorpus())
+		return nil, nil, noClose, errors.Join(err, closeCorpus())
 	}
 	closeWorkspace := func() error {
 		return errors.Join(store.Close(), corpus.Close())
 	}
 	if err := refuseUnregisteredCorpus(
 		ctx, corpus, store, config.corpusDir, config.policyDir); err != nil {
-		return nil, noClose, errors.Join(err, closeWorkspace())
+		return nil, nil, noClose, errors.Join(err, closeWorkspace())
 	}
 	selector, err := authorized.NewStaticPolicySelector(
 		config.identity.sourceID, config.identity.policyID)
 	if err != nil {
-		return nil, noClose, errors.Join(err, closeWorkspace())
+		return nil, nil, noClose, errors.Join(err, closeWorkspace())
 	}
 	scorer, _ := any(corpus).(authorized.VectorScorer)
 	client, err := authorized.NewClient(authorized.Config{
@@ -162,13 +167,13 @@ func openWorkspace(
 		Clock: clock,
 	})
 	if err != nil {
-		return nil, noClose, errors.Join(err, closeWorkspace())
+		return nil, nil, noClose, errors.Join(err, closeWorkspace())
 	}
 	service, err := webapi.NewEmbeddedService(client)
 	if err != nil {
-		return nil, noClose, errors.Join(err, closeWorkspace())
+		return nil, nil, noClose, errors.Join(err, closeWorkspace())
 	}
-	return service, closeWorkspace, nil
+	return service, client, closeWorkspace, nil
 }
 
 func refuseUnregisteredCorpus(

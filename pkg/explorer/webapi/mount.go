@@ -21,6 +21,7 @@ import (
 	"net/http"
 	"path"
 	"strings"
+	"unicode"
 
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
@@ -35,7 +36,9 @@ type preAuthenticationValidator interface {
 func (h *Handler) MountAuthenticated(
 	pattern string, handler http.Handler,
 ) (err error) {
-	if h == nil || h.mux == nil {
+	if h == nil || h.mux == nil ||
+		isAbsentInterface(h.authenticator) ||
+		isAbsentInterface(h.binder) {
 		return shoal.NewError(
 			shoal.ErrorInvalidArgument, "workspace handler is required")
 	}
@@ -43,31 +46,32 @@ func (h *Handler) MountAuthenticated(
 		return shoal.NewError(
 			shoal.ErrorInvalidArgument, "mounted handler is required")
 	}
-	if isAbsentInterface(h.authenticator) || isAbsentInterface(h.binder) {
-		return shoal.NewError(
-			shoal.ErrorInvalidArgument,
-			"authenticated mount requires authentication dependencies")
-	}
-	cleaned := path.Clean(pattern)
-	canonical := cleaned
-	if strings.HasSuffix(pattern, "/") && canonical != "/" {
-		canonical += "/"
-	}
-	if !strings.HasPrefix(pattern, "/") || pattern == "/" || pattern != canonical ||
-		cleaned == "/api/v1/auth-config" ||
-		cleaned == "/assets" || strings.HasPrefix(cleaned, "/assets/") ||
-		conflictsWithWorkspaceRoute(cleaned) {
+	root := strings.TrimSuffix(pattern, "/")
+	if !validAuthenticatedMountPattern(pattern) ||
+		conflictsWithWorkspaceRoute(root) {
 		return shoal.NewError(
 			shoal.ErrorInvalidArgument, "authenticated mount pattern is invalid")
 	}
-	root := strings.TrimSuffix(pattern, "/")
 	for mounted := range h.authenticatedMounts {
 		if strings.TrimSuffix(mounted, "/") == root {
-			return shoal.NewError(
-				shoal.ErrorInvalidArgument,
-				"authenticated mount pattern conflicts with an existing route")
+			return authenticatedMountConflict()
 		}
 	}
+	for _, method := range []string{
+		http.MethodGet, http.MethodHead, http.MethodPost, http.MethodDelete,
+	} {
+		if exactMuxPatternRegistered(h.mux, method, pattern) {
+			return authenticatedMountConflict()
+		}
+	}
+	defer func() {
+		if recover() != nil {
+			err = authenticatedMountConflict()
+		}
+	}()
+	h.mux.Handle("POST "+pattern, handler)
+	h.mux.Handle("GET "+pattern, handler)
+	h.mux.Handle("DELETE "+pattern, handler)
 	h.authenticatedMounts[pattern] = handler
 	if validator, ok := handler.(preAuthenticationValidator); ok {
 		h.preAuth[pattern] = validator
@@ -82,7 +86,7 @@ func conflictsWithWorkspaceRoute(mount string) bool {
 		"/api/v1/derivation/recompute", "/api/v1/changes",
 		"/api/v1/documents", "/api/v1/document", "/api/v1/retrieve",
 		"/api/v1/neighborhood", "/api/v1/path", "/api/v1/analytics",
-		"/api/v1/workspaces",
+		"/api/v1/workspaces", "/assets",
 	}
 	for _, route := range protected {
 		if mount == route || strings.HasPrefix(route, mount+"/") ||
@@ -91,4 +95,43 @@ func conflictsWithWorkspaceRoute(mount string) bool {
 		}
 	}
 	return false
+}
+
+func exactMuxPatternRegistered(
+	mux *http.ServeMux, method string, pathValue string,
+) bool {
+	request, err := http.NewRequest(method, "http://shoal.invalid"+pathValue, nil)
+	if err != nil {
+		return true
+	}
+	_, matched := mux.Handler(request)
+	if separator := strings.LastIndexByte(matched, ' '); separator >= 0 {
+		matched = matched[separator+1:]
+	}
+	return matched == pathValue
+}
+
+func authenticatedMountConflict() error {
+	return shoal.NewError(
+		shoal.ErrorInvalidArgument,
+		"authenticated mount pattern conflicts with an existing route",
+	)
+}
+
+func validAuthenticatedMountPattern(pattern string) bool {
+	if !strings.HasPrefix(pattern, "/") || pattern == "/" ||
+		strings.ContainsAny(pattern, "{}%?#\\") {
+		return false
+	}
+	clean := path.Clean(pattern)
+	if clean != pattern &&
+		(!strings.HasSuffix(pattern, "/") || clean+"/" != pattern) {
+		return false
+	}
+	for _, value := range pattern {
+		if unicode.IsSpace(value) || unicode.IsControl(value) {
+			return false
+		}
+	}
+	return true
 }

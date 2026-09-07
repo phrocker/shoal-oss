@@ -166,12 +166,36 @@ go run ./cmd/shoal-mcp -state-dir .shoal/mcp -dev-auth
 Stdout is reserved for MCP protocol messages and diagnostics go only to stderr.
 Identity is supplied by trusted process configuration in stdio v1 and rebound
 with a fresh request ID for each tool call. All callers connected to one process
-therefore share that configured identity; independently authenticated remote
-callers require a future HTTP transport. Tool-call recording is not
-implemented. The structured result remains complete while duplicate text
-rendering is context-budgeted by the native compressor; this is not Shoal's
-provenance `fold`. See [`docs/mcp-stdio.md`](docs/mcp-stdio.md) for
-configuration, storage policy, limitations, and a no-cluster smoke invocation.
+therefore share that configured identity. Generic tool calls are durably
+recorded fail-closed as `OperationToolCall`, with no synthesized inference node.
+The structured result remains complete while duplicate text rendering is
+context-budgeted by the native compressor; this is not Shoal's provenance
+`fold`. See [`docs/mcp-stdio.md`](docs/mcp-stdio.md) for configuration, storage
+policy, limitations, and a no-cluster smoke invocation.
+
+`shoal-explore-web` mounts the same dispatcher at `/mcp` using MCP 2025-11-25
+Streamable HTTP. Every HTTP request passes through the existing Host gate and
+configured development/OIDC authenticator before reaching MCP. Sessions retain
+only lifecycle state and are bound to the caller's authorization fingerprint
+and the effective workspace settings revision/cache dimensions; they cannot
+transfer identity, authority, or workspace state between principals. Every
+request must carry one canonical `Shoal-Workspace-ID` header. The initialize
+result reports the applied workspace identity, settings revision, cache
+dimensions, and limits in `_meta["shoal.workspace"]`.
+
+The first-party web command also exposes `shoal.ask` and
+`shoal.provenance.{list,inspect,fold,unfold}` through adapters over the same
+chat and interaction providers used by the HTTP API. Ask returns complete
+structured citation evidence. Generic invocations are recorded fail-closed as
+`OperationToolCall`; directly surfaced `shoal.retrieve` results additionally
+receive their independent retrieval capture.
+
+The embedded web workspace also mounts the durable agent registry under
+`/api/v1/fleet/agents`. Executor references must be explicitly allowlisted with
+`-fleet-executor-refs`; without configured references, registration fails
+closed. Registry mutations are recorded through the same authorized interaction
+sink with exact `agent_*` operation and snapshot pins. Dispatch and event
+transport remain separate.
 
 ### Trees, graphs, and vectors are complementary
 

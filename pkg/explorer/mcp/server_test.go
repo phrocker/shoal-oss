@@ -32,6 +32,7 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/explorer/webapi"
+	"github.com/phrocker/shoal-oss/pkg/interaction"
 	"github.com/phrocker/shoal-oss/pkg/ontology"
 	"github.com/phrocker/shoal-oss/pkg/retrieval"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
@@ -76,8 +77,9 @@ func TestServeNegotiatesVersionAndEnforcesInitializationOrdering(t *testing.T) {
 	if result.Capabilities.Tools == nil || result.Capabilities.Tools.ListChanged {
 		t.Fatalf("tools capability = %+v", result.Capabilities.Tools)
 	}
-	if !strings.Contains(result.Instructions, "recording is deferred") {
-		t.Fatalf("instructions claim unsupported recording: %q", result.Instructions)
+	if !strings.Contains(result.Instructions, "durably recorded") ||
+		strings.Contains(result.Instructions, "recording is deferred") {
+		t.Fatalf("instructions do not describe active recording: %q", result.Instructions)
 	}
 	var awaitingNotification Response
 	mustUnmarshal(t, lines[2], &awaitingNotification)
@@ -537,7 +539,7 @@ func TestEveryToolCallBindsFreshDecisionAndRequestID(t *testing.T) {
 			return webapi.DocumentsResponse{}, nil
 		},
 	}
-	server, err := NewServer(Config{
+	server, err := newRecordedTestServer(t, Config{
 		Service: service, Authority: authority,
 		Decisions: DecisionProviderFunc(func(context.Context) (auth.Decision, error) {
 			decisions++
@@ -586,7 +588,7 @@ func TestToolCallPreservesNoLensDefault(t *testing.T) {
 			return webapi.DocumentsResponse{}, nil
 		},
 	}
-	server, err := NewServer(Config{
+	server, err := newRecordedTestServer(t, Config{
 		Service: service, Authority: authority,
 		Decisions: DecisionProviderFunc(func(context.Context) (auth.Decision, error) {
 			return template, nil
@@ -771,7 +773,7 @@ func TestAuthorizationFailuresDoNotInvokeService(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			serviceCalls := 0
-			server, err := NewServer(Config{
+			server, err := newRecordedTestServer(t, Config{
 				Service: &stubService{
 					documents: func(
 						context.Context,
@@ -817,7 +819,7 @@ func TestToolCallRateLimitRunsBeforeAuthorizationAndDispatch(t *testing.T) {
 	now := time.Date(2026, 9, 5, 15, 0, 0, 0, time.UTC)
 	decisionCalls := 0
 	serviceCalls := 0
-	server, err := NewServer(Config{
+	server, err := newRecordedTestServer(t, Config{
 		Service: &stubService{
 			documents: func(
 				context.Context,
@@ -917,7 +919,7 @@ func TestToolResultCompressionRunsOnResponsePath(t *testing.T) {
 			}, nil
 		},
 	}
-	server, err := NewServer(Config{
+	server, err := newRecordedTestServer(t, Config{
 		Service: service, Authority: authority,
 		Decisions: DecisionProviderFunc(func(context.Context) (auth.Decision, error) {
 			return testDecision(t), nil
@@ -956,7 +958,7 @@ func TestToolResultCompressionRunsOnResponsePath(t *testing.T) {
 
 func TestCompressionFailurePreservesStructuredSuccess(t *testing.T) {
 	serviceCalls := 0
-	server, err := NewServer(Config{
+	server, err := newRecordedTestServer(t, Config{
 		Service: &stubService{
 			documents: func(
 				context.Context,
@@ -1025,7 +1027,7 @@ func TestCompressedRetrievalPreservesCitationsAndOpaqueIDs(t *testing.T) {
 		},
 	}
 	authority := auth.NewAuthority()
-	server, err := NewServer(Config{
+	server, err := newRecordedTestServer(t, Config{
 		Service: service, Authority: authority,
 		Decisions: DecisionProviderFunc(func(context.Context) (auth.Decision, error) {
 			return testDecision(t), nil
@@ -1067,7 +1069,7 @@ func TestCompressedRetrievalPreservesCitationsAndOpaqueIDs(t *testing.T) {
 func TestToolErrorsBypassCompressionAndPreserveErrorSemantics(t *testing.T) {
 	compressor := &recordingCompressor{}
 	authority := auth.NewAuthority()
-	server, err := NewServer(Config{
+	server, err := newRecordedTestServer(t, Config{
 		Service: &stubService{
 			documents: func(
 				context.Context,
@@ -1249,7 +1251,7 @@ func TestNewServerRejectsInvalidExtensionConfiguration(t *testing.T) {
 		Name: "invalid", Description: "invalid schema",
 		InputSchema: json.RawMessage(`{"type":"array"}`),
 	}}
-	if _, err := NewServer(Config{
+	if _, err := newRecordedTestServer(t, Config{
 		Service: &stubService{}, Authority: authority, Decisions: decisions,
 		OptionalTools: []OptionalToolProvider{invalidSchema},
 	}); err == nil {
@@ -1260,7 +1262,7 @@ func TestNewServerRejectsInvalidExtensionConfiguration(t *testing.T) {
 		InputSchema: json.RawMessage(
 			`{"type":"object","properties":5}`),
 	}}
-	if _, err := NewServer(Config{
+	if _, err := newRecordedTestServer(t, Config{
 		Service: &stubService{}, Authority: authority, Decisions: decisions,
 		OptionalTools: []OptionalToolProvider{invalidProperties},
 	}); err == nil {
@@ -1271,7 +1273,7 @@ func TestNewServerRejectsInvalidExtensionConfiguration(t *testing.T) {
 		InputSchema:  json.RawMessage(`{"type":"object"}`),
 		OutputSchema: json.RawMessage(`{"type":"object"}`),
 	}}
-	if _, err := NewServer(Config{
+	if _, err := newRecordedTestServer(t, Config{
 		Service: &stubService{}, Authority: authority, Decisions: decisions,
 		OptionalTools: []OptionalToolProvider{outputSchema},
 	}); err == nil {
@@ -1283,7 +1285,7 @@ func TestNewServerRejectsInvalidExtensionConfiguration(t *testing.T) {
 			InputSchema: json.RawMessage(`{"type":"object"}`),
 			Execution:   &ToolExecution{TaskSupport: mode},
 		}}
-		if _, err := NewServer(Config{
+		if _, err := newRecordedTestServer(t, Config{
 			Service: &stubService{}, Authority: authority, Decisions: decisions,
 			OptionalTools: []OptionalToolProvider{taskTool},
 		}); err == nil {
@@ -1295,40 +1297,71 @@ func TestNewServerRejectsInvalidExtensionConfiguration(t *testing.T) {
 		InputSchema: json.RawMessage(`{"type":"object"}`),
 		Execution:   &ToolExecution{TaskSupport: "forbidden"},
 	}}
-	if _, err := NewServer(Config{
+	if _, err := newRecordedTestServer(t, Config{
 		Service: &stubService{}, Authority: authority, Decisions: decisions,
 		OptionalTools: []OptionalToolProvider{synchronous},
 	}); err != nil {
 		t.Fatalf("explicit forbidden task mode was rejected: %v", err)
 	}
+	unscoped := unscopedOptionalProvider{tool: Tool{
+		Name: "unscoped", Description: "missing authorization operation",
+		InputSchema: json.RawMessage(`{"type":"object"}`),
+		Annotations: readOnlyAnnotations(),
+	}}
+	if _, err := newRecordedTestServer(t, Config{
+		Service: &stubService{}, Authority: authority, Decisions: decisions,
+		OptionalTools: []OptionalToolProvider{unscoped},
+	}); err == nil {
+		t.Fatal("optional tool without authorization operation was accepted")
+	}
 	spoofedChanges := optionalProvider{tool: Tool{
 		Name: ToolChanges, Description: "spoofed changes",
 		InputSchema: json.RawMessage(`{"type":"object"}`),
 	}}
-	if _, err := NewServer(Config{
+	if _, err := newRecordedTestServer(t, Config{
 		Service: &stubService{}, Authority: authority, Decisions: decisions,
 		OptionalTools: []OptionalToolProvider{spoofedChanges},
 	}); err == nil {
 		t.Fatal("reserved change tool was accepted without ChangeProvider")
 	}
 	var typedNilCompressor *recordingCompressor
-	if _, err := NewServer(Config{
+	if _, err := newRecordedTestServer(t, Config{
 		Service: &stubService{}, Authority: authority, Decisions: decisions,
 		ContextCompressor: typedNilCompressor,
 	}); err == nil {
 		t.Fatal("typed-nil context compressor was accepted")
 	}
-	if _, err := NewServer(Config{
+	if _, err := newRecordedTestServer(t, Config{
 		Service: &stubService{}, Authority: authority, Decisions: decisions,
 		ContextBudgetBytes: maxContextBudgetBytes + 1,
 	}); err == nil {
 		t.Fatal("oversized context budget was accepted")
 	}
-	if _, err := NewServer(Config{
+	if _, err := newRecordedTestServer(t, Config{
 		Service: &stubService{}, Authority: authority, Decisions: decisions,
 		ToolCallsPerMinute: MaxToolCallsPerMinute + 1,
 	}); err == nil {
 		t.Fatal("oversized tool call rate limit was accepted")
+	}
+}
+
+func TestNewServerRequiresUsableInteractionRecorder(t *testing.T) {
+	base := Config{
+		Service: &stubService{}, Authority: auth.NewAuthority(),
+		Decisions: DecisionProviderFunc(func(context.Context) (auth.Decision, error) {
+			return testDecision(t), nil
+		}),
+		Snapshots: testSnapshotProvider{snapshot: explorer.Snapshot{
+			ID: "snapshot", AsOf: time.Now().UTC(),
+		}},
+	}
+	if _, err := NewServer(base); err == nil {
+		t.Fatal("server accepted missing interaction recorder")
+	}
+	var typedNil *testInteractionSink
+	base.InteractionSink = typedNil
+	if _, err := NewServer(base); err == nil {
+		t.Fatal("server accepted typed-nil interaction sink")
 	}
 }
 
@@ -1610,12 +1643,34 @@ func (s *allOptionalService) Changes(
 }
 
 type optionalProvider struct {
+	tool      Tool
+	operation auth.Operation
+	call      func(context.Context, json.RawMessage) (any, error)
+}
+
+type unscopedOptionalProvider struct {
 	tool Tool
-	call func(context.Context, json.RawMessage) (any, error)
+}
+
+func (p unscopedOptionalProvider) Tool() Tool {
+	return p.tool
+}
+
+func (unscopedOptionalProvider) Call(
+	context.Context, json.RawMessage,
+) (any, error) {
+	return struct{}{}, nil
 }
 
 func (p optionalProvider) Tool() Tool {
 	return p.tool
+}
+
+func (p optionalProvider) ToolAuthorizationOperation() auth.Operation {
+	if p.operation == "" {
+		return auth.OperationRetrieve
+	}
+	return p.operation
 }
 
 func (p optionalProvider) Call(
@@ -1656,7 +1711,7 @@ func newTestServer(
 ) (*Server, *auth.Authority) {
 	t.Helper()
 	authority := auth.NewAuthority()
-	server, err := NewServer(Config{
+	server, err := newRecordedTestServer(t, Config{
 		Service: service, Authority: authority,
 		Decisions: DecisionProviderFunc(func(context.Context) (auth.Decision, error) {
 			return testDecision(t), nil
@@ -1668,6 +1723,65 @@ func newTestServer(
 		t.Fatalf("NewServer: %v", err)
 	}
 	return server, authority
+}
+
+type testInteractionSink struct {
+	sessions []interaction.Session
+	err      error
+}
+
+func (*testInteractionSink) EnsureInteractionSink(context.Context) error {
+	return nil
+}
+
+func (s *testInteractionSink) RecordInteraction(
+	ctx context.Context, session interaction.Session,
+) error {
+	_, err := s.RecordInteractionResult(ctx, session)
+	return err
+}
+
+func (s *testInteractionSink) RecordInteractionResult(
+	_ context.Context, session interaction.Session,
+) (interaction.Session, error) {
+	if s.err != nil {
+		return interaction.Session{}, s.err
+	}
+	s.sessions = append(s.sessions, session)
+	return session, nil
+}
+
+type testSnapshotProvider struct {
+	snapshot explorer.Snapshot
+	err      error
+}
+
+func (s testSnapshotProvider) Snapshot(
+	context.Context,
+) (explorer.Snapshot, error) {
+	if s.err != nil {
+		return explorer.Snapshot{}, s.err
+	}
+	return s.snapshot, nil
+}
+
+func newRecordedTestServer(t *testing.T, config Config) (*Server, error) {
+	t.Helper()
+	if config.Recorder == nil {
+		recorder, err := interaction.NewRecorder(
+			context.Background(), &testInteractionSink{})
+		if err != nil {
+			t.Fatalf("NewRecorder: %v", err)
+		}
+		config.Recorder = recorder
+	}
+	if isAbsent(config.Snapshots) {
+		config.Snapshots = testSnapshotProvider{snapshot: explorer.Snapshot{
+			ID:   "snapshot",
+			AsOf: time.Now().UTC(),
+		}}
+	}
+	return NewServer(config)
 }
 
 func testDecision(t *testing.T) auth.Decision {

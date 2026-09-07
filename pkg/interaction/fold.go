@@ -283,6 +283,12 @@ func (f Fold) ID() (shoal.ID, error) {
 		for _, id := range member.CitedNodeIDs {
 			parts = append(parts, string(id))
 		}
+		if len(member.TouchedEdgeIDs) > 0 {
+			parts = append(parts, "edges")
+			for _, id := range member.TouchedEdgeIDs {
+				parts = append(parts, string(id))
+			}
+		}
 	}
 	parts = append(parts, "summary", canonical.SummaryDigest)
 	return DerivedID("fold", parts...), nil

@@ -76,52 +76,49 @@ func LoadIvfIndex(ctx context.Context, store EmbedStore, graphTable string) (*Iv
 		return nil, fmt.Errorf("agentmem: no trained IVF-PQ index for %q (missing %s in %s)",
 			graphTable, ivfpq.ConfigRowActiveVersion, cfgTable)
 	}
-	parsedVersion, err := strconv.ParseInt(
-		strings.TrimSpace(string(versionBlob)), 10, 32)
+	v, err := strconv.Atoi(strings.TrimSpace(string(versionBlob)))
 	if err != nil {
 		return nil, fmt.Errorf("agentmem: bad active version %q: %w", versionBlob, err)
 	}
-	version := int32(parsedVersion)
+	version := int32(v)
 	spaceBlob, err := readConfigCell(
 		ctx, store, cfgTable, ivfpq.EmbeddingSpaceRow(version))
 	if err != nil {
-		return nil, fmt.Errorf(
-			"agentmem: read embedding space v%d: %w", parsedVersion, err)
+		return nil, fmt.Errorf("agentmem: read embedding space v%d: %w", v, err)
 	}
 	if spaceBlob == nil {
 		return nil, fmt.Errorf(
 			"%w: legacy IVF-PQ codebook v%d has no embedding-space identity",
-			embeddingspace.ErrQueryMetadataMissing, parsedVersion)
+			embeddingspace.ErrQueryMetadataMissing, v)
 	}
-	space := string(spaceBlob)
-	if err := (embeddingspace.FileState{
-		State: embeddingspace.StateHasEmbeddings, Identity: space,
-	}).Validate(); err != nil {
+	space := strings.TrimSpace(string(spaceBlob))
+	if err := embeddingspace.ValidateQueryStates(
+		"load agent-memory IVF index", space); err != nil {
 		return nil, err
 	}
 
 	pqBlob, err := readConfigCell(ctx, store, cfgTable, ivfpq.PQRow(version))
 	if err != nil {
-		return nil, fmt.Errorf("agentmem: read PQ codebook v%d: %w", parsedVersion, err)
+		return nil, fmt.Errorf("agentmem: read PQ codebook v%d: %w", v, err)
 	}
 	if pqBlob == nil {
 		return nil, fmt.Errorf("agentmem: missing PQ codebook %s in %s", ivfpq.PQRow(version), cfgTable)
 	}
 	pq, err := ivfpq.FromBytes(pqBlob)
 	if err != nil {
-		return nil, fmt.Errorf("agentmem: parse PQ codebook v%d: %w", parsedVersion, err)
+		return nil, fmt.Errorf("agentmem: parse PQ codebook v%d: %w", v, err)
 	}
 
 	centBlob, err := readConfigCell(ctx, store, cfgTable, ivfpq.CentroidsRow(version))
 	if err != nil {
-		return nil, fmt.Errorf("agentmem: read centroids v%d: %w", parsedVersion, err)
+		return nil, fmt.Errorf("agentmem: read centroids v%d: %w", v, err)
 	}
 	if centBlob == nil {
 		return nil, fmt.Errorf("agentmem: missing centroids %s in %s", ivfpq.CentroidsRow(version), cfgTable)
 	}
 	cent, err := ivfpq.CentroidsFromBytes(centBlob)
 	if err != nil {
-		return nil, fmt.Errorf("agentmem: parse centroids v%d: %w", parsedVersion, err)
+		return nil, fmt.Errorf("agentmem: parse centroids v%d: %w", v, err)
 	}
 
 	return &IvfIndex{
@@ -172,10 +169,6 @@ func (ix *IvfIndex) SearchInSpace(
 	embeddingSpace string,
 	topK, nprobe int,
 ) ([]IvfResult, error) {
-	if err := embeddingspace.ValidateQueryStates(
-		"search agent-memory IVF index", embeddingSpace); err != nil {
-		return nil, err
-	}
 	if err := embeddingspace.EnsureSameIdentity(
 		"search agent-memory IVF index", ix.space, embeddingSpace); err != nil {
 		return nil, err
@@ -226,8 +219,7 @@ func (ix *IvfIndex) SearchInSpace(
 			case ivfpq.QualPQCode:
 				entry.code = append([]byte(nil), cell.Value...)
 			case ivfpq.QualCodebookVersion:
-				value, err := strconv.ParseInt(
-					strings.TrimSpace(string(cell.Value)), 10, 32)
+				value, err := strconv.Atoi(strings.TrimSpace(string(cell.Value)))
 				if err != nil {
 					continue
 				}
@@ -295,10 +287,6 @@ func (ix *IvfIndex) AddInSpace(
 	vec []float32,
 	embeddingSpace string,
 ) error {
-	if err := embeddingspace.ValidateQueryStates(
-		"update agent-memory IVF index", embeddingSpace); err != nil {
-		return err
-	}
 	if err := embeddingspace.EnsureSameIdentity(
 		"update agent-memory IVF index", ix.space, embeddingSpace); err != nil {
 		return err

@@ -442,7 +442,9 @@ func (s *Service) Pull(ctx context.Context, request PullRequest) (Page, error) {
 			freshSubscription, freshDecision, freshFingerprint, _, _, refreshErr :=
 				s.deliveryState(ctx, PullRequest{SubscriptionID: request.SubscriptionID}, s.now().UTC())
 			if refreshErr != nil {
-				return Page{}, refreshErr
+				return Page{}, shoal.WrapError(
+					shoal.ErrorUnavailable,
+					"subscription authorization changed", refreshErr)
 			}
 			if freshSubscription.Generation != subscription.Generation ||
 				freshDecision.Subject() != decision.Subject() ||
@@ -492,7 +494,9 @@ func (s *Service) Pull(ctx context.Context, request PullRequest) (Page, error) {
 		freshSubscription, freshDecision, freshFingerprint, _, _, refreshErr :=
 			s.deliveryState(ctx, PullRequest{SubscriptionID: request.SubscriptionID}, s.now().UTC())
 		if refreshErr != nil {
-			return Page{}, refreshErr
+			return Page{}, shoal.WrapError(
+				shoal.ErrorUnavailable,
+				"subscription authorization changed", refreshErr)
 		}
 		if freshSubscription.Generation != subscription.Generation ||
 			freshDecision.Subject() != decision.Subject() ||

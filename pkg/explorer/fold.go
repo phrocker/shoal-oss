@@ -74,6 +74,13 @@ type FoldSummary struct {
 	DeletedAt     time.Time
 }
 
+type FoldSummaryPage struct {
+	Folds     []FoldSummary
+	NextAfter shoal.ID
+}
+
+const MaxFoldSummaryPageSize uint32 = 1000
+
 type persistedFold struct {
 	FoldID        shoal.ID
 	Members       []interaction.FoldMember

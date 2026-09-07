@@ -157,8 +157,8 @@ var oidcReaderOperations = []auth.Operation{
 	auth.OperationConnect,
 	auth.OperationNeighborhood,
 	auth.OperationRetrieve,
-	auth.OperationAnalyticsRead,
 	auth.OperationWorkspaceSettingsRead,
+	auth.OperationAgentResolve,
 }
 
 // oidcContributorOperations additionally permits ingestion. It matches the
@@ -170,9 +170,24 @@ var oidcContributorOperations = []auth.Operation{
 	auth.OperationConnect,
 	auth.OperationNeighborhood,
 	auth.OperationRetrieve,
-	auth.OperationAnalyticsRead,
 	auth.OperationWorkspaceSettingsRead,
 	auth.OperationWorkspaceSettingsWrite,
+}
+
+// oidcFleetOperations is the explicit control-plane ceiling for operators who
+// opt in via -oidc-fleet-values.
+var oidcFleetOperations = []auth.Operation{
+	auth.OperationAgentRegister,
+	auth.OperationAgentHeartbeat,
+	auth.OperationAgentRevoke,
+	auth.OperationAgentResolve,
+	auth.OperationDelegate,
+	auth.OperationDispatch,
+	auth.OperationInvoke,
+	auth.OperationSubscriptionCreate,
+	auth.OperationSubscriptionDelete,
+	auth.OperationSubscriptionDeliver,
+	auth.OperationEventPublish,
 }
 
 // oidcConfig is the operator-supplied, provider-neutral configuration. A
@@ -204,6 +219,7 @@ type oidcConfig struct {
 	authorizationClaim   string
 	readerClaimValues    []string
 	contributorValues    []string
+	fleetValues          []string
 	// Browser login is optional. When browserClientID is set, browserScope is
 	// required and endpoints are either supplied explicitly or read from OIDC
 	// discovery metadata.
@@ -238,7 +254,8 @@ func (c oidcConfig) configured() bool {
 		c.subjectFallbackClaim != "" ||
 		c.clientIDClaim != "" || c.delegationClaim != "" ||
 		c.authorizationClaim != "" || len(c.readerClaimValues) > 0 ||
-		len(c.contributorValues) > 0 || c.browserClientID != "" ||
+		len(c.contributorValues) > 0 || len(c.fleetValues) > 0 ||
+		c.browserClientID != "" ||
 		c.browserScope != "" || c.authorizationEndpoint != "" ||
 		c.tokenEndpoint != ""
 }
@@ -257,6 +274,7 @@ type oidcAuthenticator struct {
 	authorizationClaim         string
 	readerClaimValues          map[string]struct{}
 	contributorValues          map[string]struct{}
+	fleetValues                map[string]struct{}
 	authenticationLeeway       time.Duration
 	identityPrefix             string
 	defaultActor               shoal.ID
@@ -344,12 +362,14 @@ func newOIDCAuthenticator(
 	}
 	readerClaimValues := normalizeValueSet(config.readerClaimValues)
 	contributorValues := normalizeValueSet(config.contributorValues)
+	fleetValues := normalizeValueSet(config.fleetValues)
 	if len(readerClaimValues) == 0 && len(contributorValues) == 0 &&
+		len(fleetValues) == 0 &&
 		!config.allowUnmappedAuthorization {
 		return nil, shoal.NewError(
 			shoal.ErrorInvalidArgument,
-			"at least one -oidc-reader-values or -oidc-contributor-values "+
-				"mapping is required")
+			"at least one -oidc-reader-values, "+
+				"-oidc-contributor-values, or -oidc-fleet-values mapping is required")
 	}
 
 	httpClient := config.httpClient
@@ -417,6 +437,7 @@ func newOIDCAuthenticator(
 		authorizationClaim:         authorizationClaim,
 		readerClaimValues:          readerClaimValues,
 		contributorValues:          contributorValues,
+		fleetValues:                fleetValues,
 		authenticationLeeway:       skew,
 		identityPrefix:             firstNonEmpty(config.identityPrefix, oidcIdentityPrefix+issuer+"#"),
 		defaultActor:               firstNonZeroID(config.defaultActor, oidcActor),
@@ -854,14 +875,25 @@ func (a *oidcAuthenticator) authority(
 		}
 		values = trimmed
 	}
+	operationSet := make(
+		map[auth.Operation]struct{},
+		len(oidcFleetOperations)+len(oidcContributorOperations)+len(oidcReaderOperations),
+	)
+	var operations []auth.Operation
+	if hasMappedValue(values, a.fleetValues) {
+		operations = appendUniqueOperations(
+			operations, operationSet, oidcFleetOperations)
+	}
 	if hasMappedValue(values, a.contributorValues) {
-		return oidcContributorOperations,
-			[][]byte{workspaceSourceID},
-			[][]byte{workspaceGrantPolicyID},
-			true
+		operations = appendUniqueOperations(
+			operations, operationSet, oidcContributorOperations)
 	}
 	if hasMappedValue(values, a.readerClaimValues) {
-		return oidcReaderOperations,
+		operations = appendUniqueOperations(
+			operations, operationSet, oidcReaderOperations)
+	}
+	if len(operations) > 0 {
+		return operations,
 			[][]byte{workspaceSourceID},
 			[][]byte{workspaceGrantPolicyID},
 			true
@@ -870,6 +902,21 @@ func (a *oidcAuthenticator) authority(
 		return []auth.Operation{auth.OperationList}, nil, nil, true
 	}
 	return nil, nil, nil, false
+}
+
+func appendUniqueOperations(
+	operations []auth.Operation,
+	seen map[auth.Operation]struct{},
+	values []auth.Operation,
+) []auth.Operation {
+	for _, operation := range values {
+		if _, ok := seen[operation]; ok {
+			continue
+		}
+		seen[operation] = struct{}{}
+		operations = append(operations, operation)
+	}
+	return operations
 }
 
 // hasMappedValue reports whether any token claim value is explicitly mapped.

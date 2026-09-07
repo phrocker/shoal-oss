@@ -55,26 +55,43 @@ const (
 // response. Custom JSON encoding preserves every opaque ID as unpadded
 // base64url, including IDs containing arbitrary non-UTF-8 bytes.
 type CitationEnvelope struct {
-	ID                       shoal.ID
-	SessionID                shoal.ID
-	RecordedAt               time.Time
-	ContextPackID            shoal.ID
-	ResultID                 shoal.ID
-	PolicyID                 shoal.ID
-	RequestID                shoal.ID
-	SnapshotID               shoal.ID
-	SnapshotAsOf             time.Time
-	AuthorizationFingerprint shoal.ID
-	AuthorizationExpiresAt   time.Time
-	EmbeddingSpaces          interaction.EmbeddingSpaceSet
-	GeneratedAt              time.Time
-	EffectiveVisibility      []string
-	RetrievedSourceIDs       []shoal.ID
-	CitedSourceIDs           []shoal.ID
-	Sources                  []CitationSource
-	Evidence                 []CitationEvidence
-	Claims                   []CitationClaim
-	Issues                   []CitationIssue
+	Finalized                 bool
+	DurablyRecorded           bool
+	Verification              reasoning.VerificationStatus
+	OutputVisibility          string
+	WorkspaceSettingsID       shoal.ID
+	WorkspaceSettingsRevision uint64
+	OntologyInterpretation    *OntologyInterpretation
+	ID                        shoal.ID
+	SessionID                 shoal.ID
+	RecordedAt                time.Time
+	ContextPackID             shoal.ID
+	ResultID                  shoal.ID
+	PolicyID                  shoal.ID
+	RequestID                 shoal.ID
+	SnapshotID                shoal.ID
+	SnapshotAsOf              time.Time
+	AuthorizationFingerprint  shoal.ID
+	AuthorizationExpiresAt    time.Time
+	EmbeddingSpaces           interaction.EmbeddingSpaceSet
+	EmbeddingSpaceID          shoal.ID
+	EmbeddingSpaceIDs         []shoal.ID
+	GeneratedAt               time.Time
+	EffectiveVisibility       []string
+	RetrievedSourceIDs        []shoal.ID
+	CitedSourceIDs            []shoal.ID
+	Sources                   []CitationSource
+	Evidence                  []CitationEvidence
+	Claims                    []CitationClaim
+	Issues                    []CitationIssue
+
+	recordedSession interaction.Session
+}
+
+type OntologyInterpretation struct {
+	Status    string
+	SchemaID  shoal.ID
+	VersionID shoal.ID
 }
 
 type wireEmbeddingSpaceSet struct {
@@ -102,6 +119,7 @@ type CitationEvidence struct {
 	FromAddition bool
 	Citation     *document.Citation
 	Quote        string
+	SourceURI    string
 	Path         *graph.Path
 	Assertions   []CitationAssertion
 }
@@ -173,6 +191,7 @@ func NewCitationEnvelope(response reasoning.Response) CitationEnvelope {
 			[]string(nil), response.EffectiveOutputVisibility()...),
 		RetrievedSourceIDs: response.RetrievedSourceIDs(),
 		CitedSourceIDs:     response.CitedSourceIDs(),
+		recordedSession:    response.RecordedSession(),
 	}
 	for _, source := range response.Sources() {
 		envelope.Sources = append(envelope.Sources, CitationSource{
@@ -279,26 +298,39 @@ func citationEvidenceValue(value reasoning.Evidence) CitationEvidence {
 }
 
 type wireCitationEnvelope struct {
-	ID                       string                 `json:"id"`
-	SessionID                string                 `json:"session_id"`
-	RecordedAt               time.Time              `json:"recorded_at"`
-	ContextPackID            string                 `json:"context_pack_id"`
-	ResultID                 string                 `json:"result_id"`
-	PolicyID                 string                 `json:"policy_id"`
-	RequestID                string                 `json:"request_id,omitempty"`
-	SnapshotID               string                 `json:"snapshot_id"`
-	SnapshotAsOf             time.Time              `json:"snapshot_as_of"`
-	AuthorizationFingerprint string                 `json:"authorization_fingerprint"`
-	AuthorizationExpiresAt   time.Time              `json:"authorization_expires_at"`
-	EmbeddingSpaces          *wireEmbeddingSpaceSet `json:"embedding_spaces,omitempty"`
-	GeneratedAt              time.Time              `json:"generated_at"`
-	EffectiveVisibility      []string               `json:"effective_visibility"`
-	RetrievedSourceIDs       []string               `json:"retrieved_source_ids"`
-	CitedSourceIDs           []string               `json:"cited_source_ids"`
-	Sources                  []wireCitationSource   `json:"sources"`
-	Evidence                 []wireCitationEvidence `json:"evidence"`
-	Claims                   []wireCitationClaim    `json:"claims"`
-	Issues                   []wireCitationIssue    `json:"issues"`
+	Finalized                 bool                         `json:"finalized"`
+	DurablyRecorded           bool                         `json:"durably_recorded"`
+	Verification              reasoning.VerificationStatus `json:"verification"`
+	OutputVisibility          string                       `json:"output_visibility"`
+	WorkspaceSettingsID       string                       `json:"workspace_settings_id,omitempty"`
+	WorkspaceSettingsRevision uint64                       `json:"workspace_settings_revision,omitempty"`
+	OntologyInterpretation    *wireOntologyInterpretation  `json:"ontology_interpretation"`
+	ID                        string                       `json:"id"`
+	SessionID                 string                       `json:"session_id"`
+	RecordedAt                time.Time                    `json:"recorded_at"`
+	ContextPackID             string                       `json:"context_pack_id"`
+	ResultID                  string                       `json:"result_id"`
+	PolicyID                  string                       `json:"policy_id"`
+	RequestID                 string                       `json:"request_id,omitempty"`
+	SnapshotID                string                       `json:"snapshot_id"`
+	SnapshotAsOf              time.Time                    `json:"snapshot_as_of"`
+	AuthorizationFingerprint  string                       `json:"authorization_fingerprint"`
+	AuthorizationExpiresAt    time.Time                    `json:"authorization_expires_at"`
+	EmbeddingSpaces           *wireEmbeddingSpaceSet       `json:"embedding_spaces,omitempty"`
+	GeneratedAt               time.Time                    `json:"generated_at"`
+	EffectiveVisibility       []string                     `json:"effective_visibility"`
+	RetrievedSourceIDs        []string                     `json:"retrieved_source_ids"`
+	CitedSourceIDs            []string                     `json:"cited_source_ids"`
+	Sources                   []wireCitationSource         `json:"sources"`
+	Evidence                  []wireCitationEvidence       `json:"evidence"`
+	Claims                    []wireCitationClaim          `json:"claims"`
+	Issues                    []wireCitationIssue          `json:"issues"`
+}
+
+type wireOntologyInterpretation struct {
+	Status    string `json:"status"`
+	SchemaID  string `json:"schema_id,omitempty"`
+	VersionID string `json:"version_id,omitempty"`
 }
 
 type wireCitationSource struct {
@@ -321,6 +353,7 @@ type wireCitationEvidence struct {
 	FromAddition bool                         `json:"from_addition"`
 	Citation     *wireCitation                `json:"citation,omitempty"`
 	Quote        string                       `json:"quote,omitempty"`
+	SourceURI    string                       `json:"source_uri,omitempty"`
 	Path         *wirePath                    `json:"path,omitempty"`
 	Assertions   []wireCitationAssertion      `json:"assertions,omitempty"`
 }
@@ -384,7 +417,11 @@ func (e CitationEnvelope) MarshalJSON() ([]byte, error) {
 		return nil, err
 	}
 	wire := wireCitationEnvelope{
-		ID: encodeID(e.ID), SessionID: encodeID(e.SessionID), RecordedAt: e.RecordedAt,
+		Finalized: e.Finalized, DurablyRecorded: e.DurablyRecorded,
+		Verification: e.Verification, OutputVisibility: e.OutputVisibility,
+		WorkspaceSettingsID:       encodeOptionalID(e.WorkspaceSettingsID),
+		WorkspaceSettingsRevision: e.WorkspaceSettingsRevision,
+		ID:                        encodeID(e.ID), SessionID: encodeID(e.SessionID), RecordedAt: e.RecordedAt,
 		ContextPackID: encodeID(e.ContextPackID), ResultID: encodeID(e.ResultID),
 		PolicyID: encodeID(e.PolicyID), RequestID: encodeOptionalID(e.RequestID),
 		SnapshotID: encodeID(e.SnapshotID), SnapshotAsOf: e.SnapshotAsOf,
@@ -394,6 +431,13 @@ func (e CitationEnvelope) MarshalJSON() ([]byte, error) {
 		EffectiveVisibility:      append([]string(nil), e.EffectiveVisibility...),
 		RetrievedSourceIDs:       encodeIDs(e.RetrievedSourceIDs),
 		CitedSourceIDs:           encodeIDs(e.CitedSourceIDs),
+	}
+	if e.OntologyInterpretation != nil {
+		wire.OntologyInterpretation = &wireOntologyInterpretation{
+			Status:    e.OntologyInterpretation.Status,
+			SchemaID:  encodeOptionalID(e.OntologyInterpretation.SchemaID),
+			VersionID: encodeOptionalID(e.OntologyInterpretation.VersionID),
+		}
 	}
 	if len(e.EmbeddingSpaces.Identities) > 0 {
 		wire.EmbeddingSpaces = &wireEmbeddingSpaceSet{
@@ -473,6 +517,7 @@ func wireCitationEvidenceValue(
 		SpanID:       encodeOptionalID(value.SpanID),
 		Visibility:   append([]string(nil), value.Visibility...),
 		FromAddition: value.FromAddition, Quote: value.Quote,
+		SourceURI: value.SourceURI,
 	}
 	if value.Citation != nil {
 		citation := wireCitationValue(*value.Citation)
@@ -519,6 +564,27 @@ func citationEnvelopeValue(
 ) (CitationEnvelope, error) {
 	var result CitationEnvelope
 	var err error
+	result.Finalized = wire.Finalized
+	result.DurablyRecorded = wire.DurablyRecorded
+	result.Verification = wire.Verification
+	result.OutputVisibility = wire.OutputVisibility
+	result.WorkspaceSettingsRevision = wire.WorkspaceSettingsRevision
+	result.WorkspaceSettingsID, err = decodeOptionalID(wire.WorkspaceSettingsID)
+	if err != nil {
+		return CitationEnvelope{}, fmt.Errorf("workspace_settings_id: %w", err)
+	}
+	if wire.OntologyInterpretation != nil {
+		interpretation := &OntologyInterpretation{Status: wire.OntologyInterpretation.Status}
+		interpretation.SchemaID, err = decodeOptionalID(wire.OntologyInterpretation.SchemaID)
+		if err != nil {
+			return CitationEnvelope{}, fmt.Errorf("ontology_interpretation.schema_id: %w", err)
+		}
+		interpretation.VersionID, err = decodeOptionalID(wire.OntologyInterpretation.VersionID)
+		if err != nil {
+			return CitationEnvelope{}, fmt.Errorf("ontology_interpretation.version_id: %w", err)
+		}
+		result.OntologyInterpretation = interpretation
+	}
 	for name, source := range map[string]string{
 		"id": wire.ID, "session_id": wire.SessionID,
 		"context_pack_id": wire.ContextPackID, "result_id": wire.ResultID,
@@ -720,6 +786,7 @@ func citationEvidenceFromWire(
 		SectionID: sectionID, SpanID: spanID,
 		Visibility:   append([]string(nil), wire.Visibility...),
 		FromAddition: wire.FromAddition, Quote: wire.Quote,
+		SourceURI: wire.SourceURI,
 	}
 	if wire.Citation != nil {
 		citation, err := citationValueStrict(*wire.Citation)

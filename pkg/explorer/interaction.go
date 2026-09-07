@@ -66,6 +66,13 @@ type InteractionRecord struct {
 	TouchedEdgeIDs []shoal.ID
 }
 
+type InteractionRecordPage struct {
+	Records   []InteractionRecord
+	NextAfter shoal.ID
+}
+
+const MaxInteractionRecordPageSize uint32 = 1000
+
 type persistedInteraction struct {
 	SessionID                shoal.ID
 	Session                  interaction.Session
