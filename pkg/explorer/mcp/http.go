@@ -21,6 +21,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -82,6 +83,7 @@ type HTTPHandler struct {
 type httpSession struct {
 	dispatcher   *Server
 	owner        auth.Fingerprint
+	correlation  shoal.ID
 	version      string
 	expiresAt    time.Time
 	workspace    workspaceBinding
@@ -303,7 +305,14 @@ func (h *HTTPHandler) servePost(
 		return
 	}
 	mutating := session.dispatcher.requestMutates(message)
-	ctx := withBoundHTTPDecision(request.Context(), decision)
+	ctx, err := session.dispatcher.bindHTTPSessionDecision(
+		request.Context(), decision, session.correlation)
+	if err != nil {
+		writer.Header().Set("WWW-Authenticate", "Bearer")
+		h.writeHTTPError(writer, http.StatusUnauthorized,
+			newError(codeInvalidRequest, "authentication required"))
+		return
+	}
 	var cancel context.CancelFunc
 	if !message.isNotification() {
 		ctx, cancel, err = session.register(ctx, message.ID)
@@ -385,9 +394,12 @@ func (h *HTTPHandler) initializeHTTP(
 			newError(codeInternalError, "session could not be created"))
 		return
 	}
+	correlation := httpSessionCorrelationID(
+		sessionID, fingerprint, workspace, hasWorkspace)
 	session := &httpSession{
 		dispatcher: dispatcher, owner: fingerprint,
-		version: ProtocolVersion, expiresAt: h.now().Add(h.ttl),
+		correlation: correlation,
+		version:     ProtocolVersion, expiresAt: h.now().Add(h.ttl),
 		workspace: workspace, hasWorkspace: hasWorkspace,
 		active: make(map[string]context.CancelFunc),
 	}
@@ -582,6 +594,34 @@ func randomHTTPSessionID() (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(value[:]), nil
+}
+
+func httpSessionCorrelationID(
+	sessionID string,
+	owner auth.Fingerprint,
+	workspace workspaceBinding,
+	hasWorkspace bool,
+) shoal.ID {
+	hash := sha256.New()
+	writeCorrelationPart(hash, "shoal-mcp-http-session-correlation-v1")
+	writeCorrelationPart(hash, sessionID)
+	writeCorrelationPart(hash, owner.String())
+	if hasWorkspace {
+		writeCorrelationPart(hash, workspace.headerValue())
+		writeCorrelationPart(hash, string(workspace.settingsID))
+		writeCorrelationPart(hash, strconv.FormatUint(workspace.revision, 10))
+	}
+	return shoal.ID("mcp-session-" + hex.EncodeToString(hash.Sum(nil)))
+}
+
+type correlationHash interface {
+	Write([]byte) (int, error)
+}
+
+func writeCorrelationPart(hash correlationHash, value string) {
+	_, _ = hash.Write([]byte(strconv.Itoa(len(value))))
+	_, _ = hash.Write([]byte{0})
+	_, _ = hash.Write([]byte(value))
 }
 
 func (h *HTTPHandler) writeHTTPError(
