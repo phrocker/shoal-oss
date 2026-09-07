@@ -29,6 +29,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -366,11 +367,14 @@ func TestHTTPToolCallPersistsAuthorizedInteractionAcrossRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	store := authorized.NewMemoryPolicyStore()
-	newClient := func(corpus *explorer.Explorer) *authorized.Client {
+	newClient := func(
+		corpus *explorer.Explorer,
+		validator authorized.SnapshotValidator,
+	) *authorized.Client {
 		client, err := authorized.NewClient(authorized.Config{
 			Base: corpus, Resolver: authority.Resolver(),
 			InteractionWriter: corpus, InteractionReader: corpus,
-			SnapshotValidator: corpus,
+			SnapshotValidator: validator,
 			PolicySelector:    selector, PolicyStore: store,
 			GenerationReader: httpGenerationReader{
 				domain: []byte("domain"), generation: 1,
@@ -382,7 +386,7 @@ func TestHTTPToolCallPersistsAuthorizedInteractionAcrossRestart(t *testing.T) {
 		}
 		return client
 	}
-	client := newClient(corpus)
+	client := newClient(corpus, corpus)
 	alice := httpScopedDecision(
 		t, "alice", "ingest-request", time.Now().Add(time.Hour),
 		sourceID, policyID)
@@ -426,7 +430,8 @@ func TestHTTPToolCallPersistsAuthorizedInteractionAcrossRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	client = newClient(corpus)
+	validator := &recordingSnapshotValidator{delegate: corpus}
+	client = newClient(corpus, validator)
 	service, err := webapi.NewEmbeddedService(client)
 	if err != nil {
 		t.Fatal(err)
@@ -525,6 +530,16 @@ func TestHTTPToolCallPersistsAuthorizedInteractionAcrossRestart(t *testing.T) {
 		recorded.Turns[0].ToolCall == nil ||
 		!reflect.DeepEqual(recorded.TouchedNodeIDs(), expectedTouched) {
 		t.Fatalf("recorded interaction = %+v", recorded)
+	}
+	validatedID, validatedAt, validatedNodes := validator.observation()
+	if validatedID != shoal.ID(historical.ID) ||
+		!validatedAt.Equal(historical.AsOf) ||
+		!reflect.DeepEqual(validatedNodes, expectedTouched) {
+		t.Fatalf(
+			"snapshot validation = %q/%s/%v, want %q/%s/%v",
+			validatedID, validatedAt, validatedNodes,
+			historical.ID, historical.AsOf, expectedTouched,
+		)
 	}
 	if summaries[0].Visibility != "restricted" {
 		t.Fatalf("recorded visibility = %q", summaries[0].Visibility)
@@ -1657,6 +1672,36 @@ func httpScopedDecision(
 		t.Fatal(err)
 	}
 	return decision
+}
+
+type recordingSnapshotValidator struct {
+	delegate authorized.SnapshotValidator
+	mu       sync.Mutex
+	id       shoal.ID
+	asOf     time.Time
+	nodeIDs  []shoal.ID
+}
+
+func (v *recordingSnapshotValidator) ValidateSnapshot(
+	ctx context.Context,
+	id shoal.ID,
+	asOf time.Time,
+	nodeIDs []shoal.ID,
+) error {
+	v.mu.Lock()
+	v.id = id
+	v.asOf = asOf
+	v.nodeIDs = append([]shoal.ID(nil), nodeIDs...)
+	v.mu.Unlock()
+	return v.delegate.ValidateSnapshot(ctx, id, asOf, nodeIDs)
+}
+
+func (v *recordingSnapshotValidator) observation() (
+	shoal.ID, time.Time, []shoal.ID,
+) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	return v.id, v.asOf, append([]shoal.ID(nil), v.nodeIDs...)
 }
 
 type httpGenerationReader struct {
