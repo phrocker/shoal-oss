@@ -82,7 +82,7 @@ func ComposeWithPublisher(
 	if interaction.IsNilResultSink(trustedInteractions) {
 		return nil, nil, shoal.NewError(
 			shoal.ErrorInvalidArgument,
-			"fleet event interaction storage must implement interaction.ResultSink")
+			"fleet event interaction sink is required")
 	}
 	backend, err := New(runtime, domain)
 	if err != nil {

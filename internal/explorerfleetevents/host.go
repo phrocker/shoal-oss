@@ -108,6 +108,11 @@ func ComposeHosted(ctx context.Context, config HostConfig) (*HostedServices, err
 	if err != nil {
 		return nil, err
 	}
+	if config.InteractionStorage == nil {
+		return nil, shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			"fleet event interaction storage is required")
+	}
 	trustedInteractions, ok := config.InteractionStorage.(interaction.ResultSink)
 	if !ok {
 		return nil, shoal.NewError(
