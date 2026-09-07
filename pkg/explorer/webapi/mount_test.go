@@ -82,15 +82,13 @@ func TestMountAuthenticatedAllowsNormalizedSubtree(t *testing.T) {
 }
 
 func TestMountAuthenticatedConflictIsAtomic(t *testing.T) {
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /mcp", func(
+	handler := authenticatedTestHandler(
+		t, &stubWorkspaceService{}, auth.OperationRead)
+	handler.mux.HandleFunc("GET /mcp", func(
 		writer http.ResponseWriter, _ *http.Request,
 	) {
 		writer.WriteHeader(http.StatusAccepted)
 	})
-	handler := authenticatedTestHandler(
-		t, &stubWorkspaceService{}, auth.OperationRead)
-	handler.mux = mux
 	mounted := &mountedTestHandler{}
 	if err := handler.MountAuthenticated("/mcp", mounted); err == nil {
 		t.Fatal("conflicting authenticated mount succeeded")
@@ -99,7 +97,7 @@ func TestMountAuthenticatedConflictIsAtomic(t *testing.T) {
 		t.Fatal("failed mount installed pre-auth state")
 	}
 	response := httptest.NewRecorder()
-	mux.ServeHTTP(
+	handler.mux.ServeHTTP(
 		response, httptest.NewRequest(http.MethodPost, "/mcp", nil))
 	if mounted.calls != 0 {
 		t.Fatal("failed mount left a live partial route")

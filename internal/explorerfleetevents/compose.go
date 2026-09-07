@@ -20,6 +20,7 @@
 package explorerfleetevents
 
 import (
+	"reflect"
 	"time"
 
 	"github.com/phrocker/shoal-oss/internal/explorercoord"
@@ -79,6 +80,11 @@ func ComposeWithPublisher(
 	cursorKey []byte,
 	clock func() time.Time,
 ) (*fleetevents.Service, *ActionEventPublisher, error) {
+	if isNilInteractionResultSink(trustedInteractions) {
+		return nil, nil, shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			"fleet event interaction storage must implement interaction.ResultSink")
+	}
 	backend, err := New(runtime, domain)
 	if err != nil {
 		return nil, nil, err
@@ -109,4 +115,17 @@ func ComposeWithPublisher(
 		return nil, nil, err
 	}
 	return service, publisher, nil
+}
+
+func isNilInteractionResultSink(sink interaction.ResultSink) bool {
+	if sink == nil {
+		return true
+	}
+	value := reflect.ValueOf(sink)
+	switch value.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Map, reflect.Pointer, reflect.Slice:
+		return value.IsNil()
+	default:
+		return false
+	}
 }
