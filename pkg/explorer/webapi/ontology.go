@@ -232,29 +232,18 @@ func (s *EmbeddedService) OntologyCatalog(
 		OntologyProposals(context.Context) ([]ontology.GovernedProposal, error)
 	})
 	if !ok {
-		catalog, err := boundedOntologyCatalog(configured, nil)
+		catalog, err := ontology.NewPublishedCatalog(configured, nil)
 		return catalog, true, err
 	}
 	proposals, err := store.OntologyProposals(ctx)
 	if err != nil {
 		return ontology.PublishedCatalog{}, false, err
 	}
-	catalog, err := boundedOntologyCatalog(configured, proposals)
+	catalog, err := ontology.NewPublishedCatalog(configured, proposals)
 	if err != nil {
 		return ontology.PublishedCatalog{}, false, err
 	}
 	return catalog, true, nil
-}
-
-func boundedOntologyCatalog(
-	configured ontology.OntologyVersion,
-	proposals []ontology.GovernedProposal,
-) (ontology.PublishedCatalog, error) {
-	if len(proposals) > int(MaxOntologyProposals) {
-		return ontology.PublishedCatalog{}, ontologyBoundError(
-			"proposal", len(proposals), MaxOntologyProposals)
-	}
-	return ontology.NewPublishedCatalog(configured, proposals)
 }
 
 func replayPublishedOntology(
@@ -266,6 +255,23 @@ func replayPublishedOntology(
 		return ontology.OntologyVersion{}, err
 	}
 	return catalog.Active(), nil
+}
+
+func boundedOntologyCatalog(
+	configured ontology.OntologyVersion,
+	proposals []ontology.GovernedProposal,
+) (ontology.PublishedCatalog, error) {
+	catalog, err := ontology.NewPublishedCatalog(configured, proposals)
+	if err != nil {
+		return ontology.PublishedCatalog{}, err
+	}
+	if len(catalog.Versions()) > int(MaxOntologyProposals)+1 {
+		return ontology.PublishedCatalog{}, shoal.NewError(
+			shoal.ErrorUnavailable,
+			"published ontology history exceeds the service bound",
+		)
+	}
+	return catalog, nil
 }
 
 func ontologyFor(ctx context.Context, service Service) (OntologyResponse, error) {
