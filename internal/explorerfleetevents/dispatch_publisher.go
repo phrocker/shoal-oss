@@ -242,21 +242,11 @@ func actionEventIdentities(
 			"fleet action event identity is incomplete",
 		)
 	}
-	discriminatorHash := sha256.New()
-	_, _ = discriminatorHash.Write(
-		[]byte("shoal-fleet-action-transition-discriminator-v2"))
-	writeTokenField(discriminatorHash, transition)
-	hashedTransition := discriminatorHash.Sum(nil)
-
 	transitionHash := sha256.New()
-	_, _ = transitionHash.Write([]byte("shoal-fleet-action-transition-id-v2"))
+	_, _ = transitionHash.Write([]byte("shoal-fleet-action-transition-id-v3"))
 	writeTokenField(transitionHash, []byte(kind))
 	writeTokenField(transitionHash, record.ID)
-	writeTokenField(transitionHash, []byte(record.AgentID))
-	var generation [8]byte
-	binary.BigEndian.PutUint64(generation[:], uint64(record.AgentGeneration))
-	writeTokenField(transitionHash, generation[:])
-	writeTokenField(transitionHash, hashedTransition)
+	writeTokenField(transitionHash, transition)
 	transitionID := transitionHash.Sum(nil)
 
 	hash := sha256.New()
