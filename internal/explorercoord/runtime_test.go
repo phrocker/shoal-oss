@@ -874,6 +874,28 @@ func TestRuntimeRejectsSecondOpenAndStaleFence(t *testing.T) {
 	}
 }
 
+func TestRuntimeEmbeddedEngineLifetime(t *testing.T) {
+	var nilRuntime *Runtime
+	if got := nilRuntime.EmbeddedEngine(); got != nil {
+		t.Fatalf("nil runtime engine = %p", got)
+	}
+
+	runtime, err := Open(testRuntimeConfig(t, testDirectory(t)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	eng := runtime.EmbeddedEngine()
+	if eng == nil || eng != runtime.engine {
+		t.Fatalf("embedded engine = %p, runtime engine = %p", eng, runtime.engine)
+	}
+	if err := runtime.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if got := runtime.EmbeddedEngine(); got != nil {
+		t.Fatalf("closed runtime engine = %p", got)
+	}
+}
+
 func TestRuntimeReconcilesAmbiguousCommitCAS(t *testing.T) {
 	config := testRuntimeConfig(t, testDirectory(t))
 	var mu sync.Mutex

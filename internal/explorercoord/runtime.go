@@ -1244,6 +1244,21 @@ func (r *Runtime) Authority() transaction.Authority {
 	return cloneAuthority(r.authority)
 }
 
+// EmbeddedEngine returns the runtime-owned engine for in-process adapters that
+// must share its WAL and directory lock. Callers must not close the engine and
+// must release their adapters before closing the runtime.
+func (r *Runtime) EmbeddedEngine() *engine.Engine {
+	if r == nil {
+		return nil
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if r.closed {
+		return nil
+	}
+	return r.engine
+}
+
 // CurrentHead returns the authoritative allocator state for diagnostics and
 // dependency code that needs the current publication frontier.
 func (r *Runtime) CurrentHead(
