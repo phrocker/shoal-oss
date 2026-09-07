@@ -39,6 +39,7 @@ type InteractionAuditor struct {
 const (
 	fleetAuditStopNoEvidence              = "no_evidence"
 	fleetAuditStopRedactedNonNodeEvidence = "redacted_non_node_evidence"
+	fleetAuditStopMixedEvidence           = "redacted_and_source_node_evidence"
 	fleetAuditStopSourceNodeEvidence      = "source_node_evidence"
 )
 
@@ -73,6 +74,8 @@ func (a *InteractionAuditor) RecordFleetAction(ctx context.Context, record Audit
 	}
 	stopReason := fleetAuditStopNoEvidence
 	switch {
+	case len(record.Evidence) > len(seedEvidence) && len(seedEvidence) > 0:
+		stopReason = fleetAuditStopMixedEvidence
 	case len(record.Evidence) > len(seedEvidence):
 		stopReason = fleetAuditStopRedactedNonNodeEvidence
 	case len(seedEvidence) > 0:
