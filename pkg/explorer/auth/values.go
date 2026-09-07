@@ -76,6 +76,7 @@ const (
 	OperationSubscriptionDeliver    Operation = "subscription_deliver"
 	OperationEventPublish           Operation = "event_publish"
 	OperationAnalyticsRead          Operation = "analytics_read"
+	OperationTeamOverviewRead       Operation = "team_overview_read"
 	OperationWorkspaceSettingsRead  Operation = "workspace_settings_read"
 	OperationWorkspaceSettingsWrite Operation = "workspace_settings_write"
 )
@@ -99,7 +100,8 @@ func (o Operation) Validate() error {
 		OperationAgentResolve, OperationSubscriptionCreate,
 		OperationSubscriptionDelete, OperationSubscriptionDeliver,
 		OperationEventPublish,
-		OperationAnalyticsRead, OperationWorkspaceSettingsRead,
+		OperationAnalyticsRead, OperationTeamOverviewRead,
+		OperationWorkspaceSettingsRead,
 		OperationWorkspaceSettingsWrite:
 		return nil
 	default:
@@ -127,6 +129,7 @@ const (
 	ServiceRoleSubscription           ServiceRole = "subscription"
 	ServiceRoleEventPublication       ServiceRole = "event_publication"
 	ServiceRoleAnalytics              ServiceRole = "analytics"
+	ServiceRoleTeamOverview           ServiceRole = "team_overview"
 	ServiceRoleWorkspaceSettingsRead  ServiceRole = "workspace_settings_read"
 	ServiceRoleWorkspaceSettingsWrite ServiceRole = "workspace_settings_write"
 )
@@ -140,7 +143,8 @@ func (r ServiceRole) Validate() error {
 		ServiceRoleDelegation, ServiceRoleAgentRegistration,
 		ServiceRoleAgentRevocation, ServiceRoleAgentResolution,
 		ServiceRoleSubscription, ServiceRoleEventPublication,
-		ServiceRoleAnalytics, ServiceRoleWorkspaceSettingsRead,
+		ServiceRoleAnalytics, ServiceRoleTeamOverview,
+		ServiceRoleWorkspaceSettingsRead,
 		ServiceRoleWorkspaceSettingsWrite:
 		return nil
 	default:
@@ -192,6 +196,9 @@ func (r ServiceRole) Allows(operation Operation) bool {
 	case ServiceRoleAnalytics:
 		return operation == OperationAnalyticsRead ||
 			operation == OperationRetrieve ||
+			operation == OperationValidate
+	case ServiceRoleTeamOverview:
+		return operation == OperationTeamOverviewRead ||
 			operation == OperationValidate
 	case ServiceRoleWorkspaceSettingsRead:
 		return operation == OperationWorkspaceSettingsRead ||

@@ -11,6 +11,8 @@ import (
 	"encoding/json"
 	"errors"
 	"hash"
+	"slices"
+	"sort"
 	"time"
 
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
@@ -576,6 +578,153 @@ func (s *DispatchService) Status(ctx context.Context, request StatusRequest) (Ac
 		return ActionRecord{}, err
 	}
 	return s.authorizedCurrent(ctx, decision, request.ID, auth.OperationDispatch, now)
+}
+
+// TeamActions returns a bounded page of action records authorized for the
+// read-only team overview. Unlike worker Pull, it includes terminal states and
+// does not require the reader to be the action's originating principal.
+func (s *DispatchService) TeamActions(
+	ctx context.Context,
+	request TeamActionListRequest,
+) (ActionPage, error) {
+	ctx, cancel := s.deadline(ctx, request.Context)
+	defer cancel()
+	now := s.clock().UTC()
+	if err := request.Context.validate(now); err != nil {
+		return ActionPage{}, err
+	}
+	decision, err := s.resolver.Resolve(ctx)
+	if err != nil {
+		return ActionPage{}, err
+	}
+	if decision.RequestID() != request.Context.RequestID ||
+		decision.CorrelationID() != request.Context.CorrelationID {
+		return ActionPage{}, shoal.NewError(
+			shoal.ErrorUnauthorized,
+			"request identity does not match authentication",
+		)
+	}
+	if err := decision.Authorize(
+		auth.OperationTeamOverviewRead,
+		auth.ResourceRequest{
+			AuthorizationDomain: decision.AuthorizationDomain(),
+		},
+		now,
+	); err != nil {
+		return ActionPage{}, err
+	}
+	if request.Limit <= 0 || request.Limit > MaxDispatchListResults {
+		return ActionPage{}, shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			"team action list limit is outside its bound",
+		)
+	}
+	if len(request.SourceIDs) == 0 || len(request.PolicyIDs) == 0 {
+		return ActionPage{}, shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			"team action source and policy filters are required",
+		)
+	}
+	sources, err := decision.IntersectSourceIDs(
+		auth.OperationTeamOverviewRead, decision.AuthorizationDomain(),
+		request.SourceIDs, now)
+	if err != nil {
+		return ActionPage{}, err
+	}
+	policies, err := decision.IntersectPolicyIDs(
+		auth.OperationTeamOverviewRead, decision.AuthorizationDomain(),
+		request.PolicyIDs, now)
+	if err != nil {
+		return ActionPage{}, err
+	}
+	if len(sources) == 0 || len(policies) == 0 {
+		return ActionPage{}, nil
+	}
+	objects, err := canonicalOptionalIDs(
+		"team action object", request.ObjectIDs)
+	if err != nil {
+		return ActionPage{}, err
+	}
+	agents, err := canonicalOptionalIDs(
+		"team action agent", request.AgentIDs)
+	if err != nil {
+		return ActionPage{}, err
+	}
+	result := ActionPage{Actions: make([]ActionRecord, 0, request.Limit)}
+	cursor := append([]byte(nil), request.After...)
+	var continuation []byte
+	const maxDiscoveryScans = 4096
+	for scanned := 0; scanned < maxDiscoveryScans; scanned++ {
+		page, scanErr := s.store.ScanActions(ctx, cursor, 1)
+		if scanErr != nil {
+			return ActionPage{}, scanErr
+		}
+		if len(page.Actions) == 0 {
+			return result, nil
+		}
+		record := page.Actions[0]
+		visible := containsByteValue(sources, record.SourceID) &&
+			containsByteValue(policies, record.PolicyID) &&
+			containsIDValue(objects, record.ObjectID) &&
+			containsIDValue(agents, record.AgentID) &&
+			decision.AuthorizeObject(
+				auth.OperationTeamOverviewRead,
+				auth.ResourceRequest{
+					AuthorizationDomain: decision.AuthorizationDomain(),
+					SourceID:            record.SourceID,
+					PolicyID:            record.PolicyID,
+					ObjectID:            record.ObjectID,
+				},
+				now,
+			) == nil
+		if visible {
+			if len(result.Actions) == request.Limit {
+				result.Next = continuation
+				return result, nil
+			}
+			result.Actions = append(result.Actions, cloneActionRecord(record))
+			continuation = append([]byte(nil), page.Next...)
+		}
+		if len(page.Next) == 0 {
+			return result, nil
+		}
+		cursor = page.Next
+	}
+	result.Next = append([]byte(nil), cursor...)
+	return result, nil
+}
+
+func canonicalOptionalIDs(name string, values []shoal.ID) ([]shoal.ID, error) {
+	result := append([]shoal.ID(nil), values...)
+	for _, value := range result {
+		if err := shoal.ValidateRequiredID(name, value); err != nil {
+			return nil, err
+		}
+	}
+	sort.Slice(result, func(i, j int) bool {
+		return shoal.CompareID(result[i], result[j]) < 0
+	})
+	return slices.Compact(result), nil
+}
+
+func containsIDValue(values []shoal.ID, value shoal.ID) bool {
+	if len(values) == 0 {
+		return true
+	}
+	index := sort.Search(len(values), func(i int) bool {
+		return shoal.CompareID(values[i], value) >= 0
+	})
+	return index < len(values) && values[index] == value
+}
+
+func containsByteValue(values [][]byte, value []byte) bool {
+	if len(values) == 0 {
+		return false
+	}
+	index := sort.Search(len(values), func(i int) bool {
+		return bytes.Compare(values[i], value) >= 0
+	})
+	return index < len(values) && bytes.Equal(values[index], value)
 }
 
 func (s *DispatchService) Pull(ctx context.Context, request PullActionsRequest) (ActionPage, error) {

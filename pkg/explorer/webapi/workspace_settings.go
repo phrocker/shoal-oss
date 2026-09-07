@@ -321,6 +321,8 @@ func workspaceOperationForRequest(
 		return auth.OperationNeighborhood, true
 	case method == http.MethodPost && path == "/api/v1/analytics":
 		return auth.OperationAnalyticsRead, true
+	case method == http.MethodPost && path == TeamOverviewRoute:
+		return auth.OperationTeamOverviewRead, true
 	case method == http.MethodPost && path == "/api/v1/fleet/agents":
 		return auth.OperationAgentRegister, true
 	case method == http.MethodPost &&

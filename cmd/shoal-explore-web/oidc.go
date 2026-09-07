@@ -159,6 +159,7 @@ var oidcReaderOperations = []auth.Operation{
 	auth.OperationRetrieve,
 	auth.OperationWorkspaceSettingsRead,
 	auth.OperationAgentResolve,
+	auth.OperationTeamOverviewRead,
 }
 
 // oidcContributorOperations additionally permits ingestion. It matches the
@@ -172,6 +173,8 @@ var oidcContributorOperations = []auth.Operation{
 	auth.OperationRetrieve,
 	auth.OperationWorkspaceSettingsRead,
 	auth.OperationWorkspaceSettingsWrite,
+	auth.OperationAgentResolve,
+	auth.OperationTeamOverviewRead,
 }
 
 // oidcFleetOperations is the explicit control-plane ceiling for operators who

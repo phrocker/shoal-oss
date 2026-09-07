@@ -201,6 +201,18 @@ type ActionPage struct {
 	Next    []byte
 }
 
+// TeamActionListRequest asks for a bounded page of action state visible to a
+// team-overview reader. The object and agent filters are narrowing only.
+type TeamActionListRequest struct {
+	After     []byte
+	Limit     int
+	SourceIDs [][]byte
+	PolicyIDs [][]byte
+	ObjectIDs []shoal.ID
+	AgentIDs  []shoal.ID
+	Context   RequestContext
+}
+
 type InvokeRequest struct {
 	Enqueue EnqueueRequest
 	ClaimID []byte

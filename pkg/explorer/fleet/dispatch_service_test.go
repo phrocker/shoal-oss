@@ -143,6 +143,84 @@ func TestDispatchInvokeOnlyAuthorizationEnqueuesAndExecutes(t *testing.T) {
 	}
 }
 
+func TestTeamActionsSharesScopedStateWithoutPrincipalLeak(t *testing.T) {
+	now := time.Date(2026, 9, 6, 12, 0, 0, 0, time.UTC)
+	authority, _ := auth.NewAuthorityWithClock(func() time.Time { return now })
+	registry, _ := NewService(Config{
+		Store: newMemoryStore(), Resolver: authority.Resolver(),
+		Recorder: &memoryRecorder{}, Snapshots: fixedSnapshot{now},
+		Executors: executorMap{}, Clock: func() time.Time { return now },
+	})
+	store := newMemoryDispatchStore()
+	store.records["visible-action"] = ActionRecord{
+		ID: []byte("visible-action"), State: DispatchSucceeded,
+		AgentID: "agent", SourceID: []byte("source"),
+		PolicyID: []byte("policy"), ObjectID: "object",
+		Subject: "alice", Actor: "alice",
+	}
+	store.records["hidden-action"] = ActionRecord{
+		ID: []byte("hidden-action"), State: DispatchFailed,
+		AgentID: "agent", SourceID: []byte("hidden"),
+		PolicyID: []byte("hidden"), ObjectID: "object",
+		Subject: "alice", Actor: "alice",
+	}
+	service, _ := NewDispatchService(DispatchConfig{
+		Store: store, Registry: registry, Resolver: authority.Resolver(),
+		Recorder: &dispatchRecorder{}, Events: dispatchEvents{},
+		Clock: func() time.Time { return now },
+	})
+	decision := dispatchDecision(
+		t, "bob", "bob", "request", auth.OperationTeamOverviewRead)
+	ctx := bindDecision(t, authority, decision)
+	page, err := service.TeamActions(ctx, TeamActionListRequest{
+		Limit: 10, SourceIDs: [][]byte{[]byte("source")},
+		PolicyIDs: [][]byte{[]byte("policy")},
+		ObjectIDs: []shoal.ID{"object"}, AgentIDs: []shoal.ID{"agent"},
+		Context: RequestContext{
+			RequestID: "request", CorrelationID: "correlation",
+			ReasonCode: "team_overview", Deadline: now.Add(time.Hour),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Actions) != 1 ||
+		string(page.Actions[0].ID) != "visible-action" {
+		t.Fatalf("visible actions = %#v", page.Actions)
+	}
+
+	denied := dispatchDecision(
+		t, "mallory", "mallory", "denied", auth.OperationTeamOverviewRead)
+	deniedConfig := auth.DecisionConfig{
+		Subject: "mallory", Actor: "mallory",
+		AuthorizationDomain: []byte("domain"),
+		AllowedOperations:   []auth.Operation{auth.OperationTeamOverviewRead},
+		PermittedSourceIDs:  [][]byte{[]byte("other")},
+		PermittedPolicyIDs:  [][]byte{[]byte("other")},
+		PolicyGeneration:    1, AuthenticationExpires: now.Add(time.Hour),
+		RequestID: "denied", CorrelationID: "correlation",
+	}
+	denied, err = auth.NewDecision(deniedConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deniedCtx := bindDecision(t, authority, denied)
+	page, err = service.TeamActions(deniedCtx, TeamActionListRequest{
+		Limit: 10, SourceIDs: [][]byte{[]byte("source")},
+		PolicyIDs: [][]byte{[]byte("policy")},
+		Context: RequestContext{
+			RequestID: "denied", CorrelationID: "correlation",
+			ReasonCode: "team_overview", Deadline: now.Add(time.Hour),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Actions) != 0 {
+		t.Fatalf("unauthorized actions = %#v", page.Actions)
+	}
+}
+
 func TestDispatchFailsClosedBeforeEffectAndOnRevokedLease(t *testing.T) {
 	now := time.Date(2026, 9, 6, 12, 0, 0, 0, time.UTC)
 	authority, _ := auth.NewAuthorityWithClock(func() time.Time { return now })
