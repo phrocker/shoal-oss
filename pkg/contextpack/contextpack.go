@@ -403,21 +403,27 @@ func (b Builder) ExpandNeighbors(
 }
 
 type verifier struct {
-	ctx        context.Context
-	reader     Reader
-	limits     Limits
-	documents  map[documentKey]*documentIndex
-	nodes      map[shoal.ID]graph.Node
-	edges      map[shoal.ID]graph.Edge
-	assertions map[shoal.ID][]interaction.AssertionReference
-	sections   int
-	spans      int
-	bytes      int
+	ctx             context.Context
+	reader          Reader
+	limits          Limits
+	documents       map[documentKey]*documentIndex
+	nodes           map[shoal.ID]graph.Node
+	edges           map[shoal.ID]graph.Edge
+	assertions      map[shoal.ID][]interaction.AssertionReference
+	assertionStates map[shoal.ID]assertionHydration
+	sections        int
+	spans           int
+	bytes           int
 }
 
 type documentKey struct {
 	documentID shoal.ID
 	revisionID shoal.ID
+}
+
+type assertionHydration struct {
+	assertion ontology.Assertion
+	edgeIDs   []shoal.ID
 }
 
 type documentIndex struct {
@@ -438,10 +444,11 @@ func newVerifier(
 ) (*verifier, error) {
 	v := &verifier{
 		ctx: ctx, reader: reader, limits: limits,
-		documents:  make(map[documentKey]*documentIndex),
-		nodes:      make(map[shoal.ID]graph.Node),
-		edges:      make(map[shoal.ID]graph.Edge),
-		assertions: make(map[shoal.ID][]interaction.AssertionReference),
+		documents:       make(map[documentKey]*documentIndex),
+		nodes:           make(map[shoal.ID]graph.Node),
+		edges:           make(map[shoal.ID]graph.Edge),
+		assertions:      make(map[shoal.ID][]interaction.AssertionReference),
+		assertionStates: make(map[shoal.ID]assertionHydration),
 	}
 	if len(views) > limits.MaxDocuments {
 		return nil, invalid("hydrated documents exceed the document bound")
@@ -683,10 +690,17 @@ func (v *verifier) addNeighborhood(neighborhood explorer.Neighborhood) error {
 		}
 		localEdges[edge.ID] = edge
 	}
-	localAssertions, err := assertionsByNeighborhoodEdge(
+	localAssertions, localAssertionStates, err := assertionsByNeighborhoodEdge(
 		neighborhood.Assertions, localEdges)
 	if err != nil {
 		return err
+	}
+	for assertionID, state := range localAssertionStates {
+		if existing, ok := v.assertionStates[assertionID]; ok &&
+			(!reflect.DeepEqual(existing.assertion, state.assertion) ||
+				!reflect.DeepEqual(existing.edgeIDs, state.edgeIDs)) {
+			return invalid("hydrated graph assertion conflicts with prior content")
+		}
 	}
 	additionalBytes := 0
 	additionalNodes := 0
@@ -750,6 +764,14 @@ func (v *verifier) addNeighborhood(neighborhood explorer.Neighborhood) error {
 				[]interaction.AssertionReference(nil), assertions...)
 		}
 	}
+	for assertionID, state := range localAssertionStates {
+		if _, exists := v.assertionStates[assertionID]; !exists {
+			v.assertionStates[assertionID] = assertionHydration{
+				assertion: state.assertion,
+				edgeIDs:   append([]shoal.ID(nil), state.edgeIDs...),
+			}
+		}
+	}
 	v.bytes += additionalBytes
 	return nil
 }
@@ -757,22 +779,27 @@ func (v *verifier) addNeighborhood(neighborhood explorer.Neighborhood) error {
 func assertionsByNeighborhoodEdge(
 	assertions []ontology.Assertion,
 	edges map[shoal.ID]graph.Edge,
-) (map[shoal.ID][]interaction.AssertionReference, error) {
+) (
+	map[shoal.ID][]interaction.AssertionReference,
+	map[shoal.ID]assertionHydration,
+	error,
+) {
 	const (
 		assertionEdgeIDProperty = "shoal.graph.edge_id"
 		assertionIDProperty     = "ontology.assertion.id"
 	)
 	result := make(map[shoal.ID][]interaction.AssertionReference)
+	byID := make(map[shoal.ID]assertionHydration, len(assertions))
 	for _, assertion := range assertions {
 		if err := assertion.Validate(); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		matched := make(map[shoal.ID]struct{})
 		if edgeID := shoal.ID(
 			assertion.Metadata()[assertionEdgeIDProperty]); edgeID != "" {
 			if edge, ok := edges[edgeID]; ok {
 				if !assertionMatchesEvidenceEdge(assertion, edge) {
-					return nil, invalid(
+					return nil, nil, invalid(
 						"hydrated assertion does not match its graph edge")
 				}
 				matched[edgeID] = struct{}{}
@@ -780,7 +807,7 @@ func assertionsByNeighborhoodEdge(
 		}
 		if edge, ok := edges[assertion.ID()]; ok {
 			if !assertionMatchesEvidenceEdge(assertion, edge) {
-				return nil, invalid(
+				return nil, nil, invalid(
 					"hydrated assertion does not match its graph edge")
 			}
 			matched[assertion.ID()] = struct{}{}
@@ -788,15 +815,30 @@ func assertionsByNeighborhoodEdge(
 		for edgeID, edge := range edges {
 			if shoal.ID(edge.Properties[assertionIDProperty]) == assertion.ID() {
 				if assertion.Origin() != ontology.AssertionDerived {
-					return nil, invalid(
+					return nil, nil, invalid(
 						"non-derived assertion has a derivation edge")
 				}
 				matched[edgeID] = struct{}{}
 			}
 		}
 		if len(matched) == 0 {
-			return nil, invalid(
+			return nil, nil, invalid(
 				"hydrated graph assertion has no authoritative edge")
+		}
+		edgeIDs := make([]shoal.ID, 0, len(matched))
+		for edgeID := range matched {
+			edgeIDs = append(edgeIDs, edgeID)
+		}
+		sort.Slice(edgeIDs, func(i, j int) bool {
+			return shoal.CompareID(edgeIDs[i], edgeIDs[j]) < 0
+		})
+		if _, duplicate := byID[assertion.ID()]; duplicate {
+			return nil, nil, invalid(
+				"hydrated graph repeats an assertion identity")
+		}
+		byID[assertion.ID()] = assertionHydration{
+			assertion: assertion,
+			edgeIDs:   edgeIDs,
 		}
 		for edgeID := range matched {
 			result[edgeID] = append(
@@ -820,7 +862,7 @@ func assertionsByNeighborhoodEdge(
 			return result[edgeID][i].Origin < result[edgeID][j].Origin
 		})
 	}
-	return result, nil
+	return result, byID, nil
 }
 
 func assertionMatchesEvidenceEdge(

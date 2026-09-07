@@ -20,6 +20,7 @@
 package interaction_test
 
 import (
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -121,6 +122,60 @@ func TestFoldIdentityIsContentAddressed(t *testing.T) {
 	}
 	if third == first {
 		t.Fatal("folds with different cited sets collided")
+	}
+}
+
+func TestFoldRetainsAndConjoinsExactSourceEdges(t *testing.T) {
+	fold := interaction.Fold{
+		Members: []interaction.FoldMember{{
+			SessionID:        interaction.DerivedID("session", "edge-fold"),
+			RetrievedNodeIDs: []shoal.ID{"source-a", "source-b"},
+			TouchedEdgeIDs:   []shoal.ID{"source-edge"},
+		}},
+		FoldedAt: time.Unix(1700000000, 0).UTC(),
+	}
+	if _, err := fold.Subgraph(func(shoal.ID) ([]string, error) {
+		return nil, nil
+	}); !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
+		t.Fatalf("fold without edge resolver = %v", err)
+	}
+	subgraph, err := fold.SubgraphWithEvidence(
+		func(shoal.ID) ([]string, error) { return []string{"node-label"}, nil },
+		func(id shoal.ID) ([]string, error) {
+			if id != "source-edge" {
+				t.Fatalf("resolved edge = %q", id)
+			}
+			return []string{"edge-label"}, nil
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := interaction.Expression(subgraph.Visibility); got != "edge-label&node-label" {
+		t.Fatalf("fold visibility = %q", got)
+	}
+	if !reflect.DeepEqual(subgraph.TouchedEdgeIDs, []shoal.ID{"source-edge"}) {
+		t.Fatalf("fold subgraph edges = %v", subgraph.TouchedEdgeIDs)
+	}
+	canonical, err := fold.Canonical()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(canonical.Members[0].TouchedEdgeIDs) != 1 ||
+		canonical.Members[0].TouchedEdgeIDs[0] != "source-edge" {
+		t.Fatalf("canonical fold lost touched edges: %+v", canonical.Members[0])
+	}
+	withEdgesID, err := canonical.ID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	canonical.Members[0].TouchedEdgeIDs = nil
+	legacyID, err := canonical.ID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if withEdgesID == legacyID {
+		t.Fatal("edge-bearing fold identity omitted exact source edges")
 	}
 }
 

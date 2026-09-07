@@ -32,6 +32,7 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/graph"
 	"github.com/phrocker/shoal-oss/pkg/interaction"
+	"github.com/phrocker/shoal-oss/pkg/ontology"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
@@ -48,6 +49,14 @@ type EvidenceSnapshotValidator interface {
 		context.Context, shoal.ID, time.Time, []shoal.ID, []shoal.ID,
 		[]interaction.EvidenceReference,
 	) error
+}
+
+// DerivedAssertionReader supplies canonical derived assertions independently
+// of the untrusted graph response being authorized.
+type DerivedAssertionReader interface {
+	DerivedAssertions(
+		context.Context, []shoal.ID,
+	) (map[shoal.ID]ontology.Assertion, error)
 }
 
 // Config supplies the trusted dependencies for an authorization-enforcing
@@ -70,6 +79,12 @@ type Config struct {
 	// SnapshotValidator is the explicitly trusted verifier for historical
 	// corpus frontiers pinned into interaction records.
 	SnapshotValidator SnapshotValidator
+	// DerivedAssertionReader is the explicitly trusted source used to
+	// reconstruct producer provenance returned by an untrusted graph reader.
+	// When omitted, NewClient may use SnapshotValidator if that independently
+	// trusted dependency also implements DerivedAssertionReader. Base is never
+	// promoted implicitly.
+	DerivedAssertionReader DerivedAssertionReader
 	// OntologyInterpreter is an optional explicitly trusted read-time
 	// interpreter. It is separate from Base because Base graph responses are
 	// untrusted and must never be allowed to inject interpretations.
@@ -99,6 +114,7 @@ type Client struct {
 	interactionSink     explorer.InteractionWriter
 	interactionSource   explorer.InteractionReader
 	snapshotValidator   SnapshotValidator
+	derivedAssertions   DerivedAssertionReader
 	ontologyInterpreter explorer.OntologyInterpreter
 	ontologyProposals   explorer.OntologyProposalStore
 	resolver            auth.Resolver
@@ -152,6 +168,11 @@ func NewClient(config Config) (*Client, error) {
 	if hasSnapshotValidator && !hasInteractionWriter {
 		return nil, dependencyRequired("trusted interaction writer")
 	}
+	derivedAssertions := config.DerivedAssertionReader
+	if isNilDependency(derivedAssertions) && hasSnapshotValidator {
+		derivedAssertions, _ =
+			config.SnapshotValidator.(DerivedAssertionReader)
+	}
 	edgeSelector := config.EdgePolicySelector
 	if isNilDependency(edgeSelector) {
 		var ok bool
@@ -177,6 +198,7 @@ func NewClient(config Config) (*Client, error) {
 		interactionSink:     config.InteractionWriter,
 		interactionSource:   config.InteractionReader,
 		snapshotValidator:   config.SnapshotValidator,
+		derivedAssertions:   derivedAssertions,
 		ontologyInterpreter: config.OntologyInterpreter,
 		ontologyProposals:   config.OntologyProposalStore,
 		resolver:            config.Resolver,

@@ -21,6 +21,7 @@ package authorized
 
 import (
 	"context"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -728,6 +729,34 @@ func (c *Client) filterNeighborhood(
 			}
 		}
 	}
+	if len(requiredDerivedAssertions) > 0 {
+		if isNilDependency(c.derivedAssertions) {
+			return explorer.Neighborhood{}, shoal.NewError(
+				shoal.ErrorUnavailable,
+				"trusted derived assertion reader is unavailable",
+			)
+		}
+		ids := make([]shoal.ID, 0, len(requiredDerivedAssertions))
+		for id := range requiredDerivedAssertions {
+			ids = append(ids, id)
+		}
+		trusted, err := c.derivedAssertions.DerivedAssertions(ctx, ids)
+		if err != nil {
+			return explorer.Neighborhood{}, directBaseError(err)
+		}
+		if err := validateTrustedDerivedAssertions(
+			requiredDerivedAssertions, trusted); err != nil {
+			return explorer.Neighborhood{}, err
+		}
+		for id := range requiredDerivedAssertions {
+			requiredDerivedAssertions[id] = trusted[id]
+		}
+		for edgeID, assertion := range derivedAssertions {
+			if canonical, ok := trusted[assertion.ID()]; ok {
+				derivedAssertions[edgeID] = canonical
+			}
+		}
+	}
 	for _, assertion := range requiredDerivedAssertions {
 		target, ok := assertion.Object().ReferenceValue()
 		if !ok {
@@ -982,6 +1011,20 @@ func reachableThrough(
 			return []shoal.ID{edge.To}
 		case to:
 			return []shoal.ID{edge.From}
+		}
+	}
+	return nil
+}
+
+func validateTrustedDerivedAssertions(
+	claimed, trusted map[shoal.ID]ontology.Assertion,
+) error {
+	for id, untrusted := range claimed {
+		canonical, ok := trusted[id]
+		if !ok || canonical.ID() != id ||
+			canonical.Origin() != ontology.AssertionDerived ||
+			!reflect.DeepEqual(canonical, untrusted) {
+			return inconsistentBase()
 		}
 	}
 	return nil

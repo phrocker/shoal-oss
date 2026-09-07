@@ -729,6 +729,51 @@ func testGraphAnchorCarriesAuthoritativeAssertion(t *testing.T, origin ontology.
 		reference.Assertions[0].Origin != origin {
 		t.Fatalf("authoritative assertion reference = %+v", reference.Assertions)
 	}
+	changed, err := ontology.NewAssertion(
+		"source", relationship.ID(), value, origin, 1,
+		[]ontology.EvidenceRef{evidence}, provenance,
+		shoal.Metadata{
+			"shoal.graph.edge_id": "edge-1",
+			"annotation":          "changed without changing assertion identity",
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changed.ID() != assertion.ID() {
+		t.Fatal("fixture metadata unexpectedly changed the assertion identity")
+	}
+	if err := verifier.addNeighborhood(explorer.Neighborhood{
+		Nodes: path.Nodes, Edges: path.Edges,
+		Assertions: []ontology.Assertion{changed},
+	}); !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
+		t.Fatalf("changed assertion metadata across hydrations = %v", err)
+	}
+	remapped, err := ontology.NewAssertion(
+		"source", relationship.ID(), value, origin, 1,
+		[]ontology.EvidenceRef{evidence}, provenance,
+		shoal.Metadata{"shoal.graph.edge_id": "edge-2"},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	remappedEdge := path.Edges[0]
+	remappedEdge.ID = "edge-2"
+	if err := verifier.addNeighborhood(explorer.Neighborhood{
+		Nodes: path.Nodes, Edges: []graph.Edge{remappedEdge},
+		Assertions: []ontology.Assertion{remapped},
+	}); !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
+		t.Fatalf("changed assertion edge mapping across hydrations = %v", err)
+	}
+	if _, err := newVerifier(
+		context.Background(), nil, mustLimits(t, Limits{}), nil,
+		[]explorer.Neighborhood{{
+			Nodes: path.Nodes, Edges: path.Edges,
+			Assertions: []ontology.Assertion{assertion, changed},
+		}},
+	); !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
+		t.Fatalf("duplicate assertion identity in one hydration = %v", err)
+	}
 }
 
 func TestCancellationAndAuthorizedNotFoundShape(t *testing.T) {

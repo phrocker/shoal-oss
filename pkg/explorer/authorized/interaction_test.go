@@ -55,6 +55,20 @@ type forgedResultInteractionBase struct {
 	*explorer.Explorer
 }
 
+type voidOnlyInteractionWriter struct {
+	writer explorer.InteractionWriter
+}
+
+func (w voidOnlyInteractionWriter) EnsureInteractionSink(ctx context.Context) error {
+	return w.writer.EnsureInteractionSink(ctx)
+}
+
+func (w voidOnlyInteractionWriter) RecordInteraction(
+	ctx context.Context, session interaction.Session,
+) error {
+	return w.writer.RecordInteraction(ctx, session)
+}
+
 func (b *forgedResultInteractionBase) RecordInteractionResult(
 	ctx context.Context, session interaction.Session,
 ) (interaction.Session, error) {
@@ -202,6 +216,53 @@ func (b *countingInteractionBase) InteractionRecords(
 ) ([]explorer.InteractionRecord, error) {
 	b.recordsCalls++
 	return b.Explorer.InteractionRecords(ctx)
+}
+
+func TestAuthorizedResultPathRequiresResultSink(t *testing.T) {
+	f := newFixture(t)
+	snapshot, err := f.base.Snapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.clock.Set(snapshot.AsOf.Add(time.Second))
+	decision := f.decision(
+		t, "result-sink-required",
+		nil, nil, []auth.Operation{auth.OperationRetrieve},
+	)
+	fingerprint, err := auth.AuthorizationFingerprint(decision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	selector, err := authorized.NewStaticPolicySelector(f.sourceA, f.policyA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, err := authorized.NewClient(authorized.Config{
+		Base: f.base, VectorScorer: f.base,
+		InteractionWriter: voidOnlyInteractionWriter{writer: f.base},
+		InteractionReader: f.base, SnapshotValidator: f.base,
+		Resolver: f.authority.Resolver(), PolicySelector: selector,
+		PolicyStore: f.store, GenerationReader: f.reader, Clock: f.clock.Now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := interaction.Session{
+		ID:         interaction.DerivedID("session", "result-sink-required"),
+		Operation:  interaction.OperationRetrieval,
+		SnapshotID: shoal.ID(snapshot.ID), SnapshotAsOf: snapshot.AsOf,
+		AuthorizationFingerprint: shoal.ID(fingerprint.String()),
+		AuthorizationExpiresAt:   decision.AuthenticationExpires(),
+	}
+	ctx := f.context(t, decision)
+	if _, err := client.RecordInteractionResult(
+		ctx, session,
+	); !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
+		t.Fatalf("result path without ResultSink = %v", err)
+	}
+	if err := client.RecordInteraction(ctx, session); err != nil {
+		t.Fatalf("legacy void record path = %v", err)
+	}
 }
 
 func TestAuthorizedInteractionRecorderAndViews(t *testing.T) {

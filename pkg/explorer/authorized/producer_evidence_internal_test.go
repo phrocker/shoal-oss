@@ -25,6 +25,7 @@ import (
 
 	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/graph"
+	"github.com/phrocker/shoal-oss/pkg/ontology"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
@@ -75,6 +76,47 @@ func TestProducerDerivationEdgeRequiresCanonicalReconstruction(t *testing.T) {
 		t.Fatalf("assertions = %d", len(result.Neighborhood.Assertions))
 	}
 	assertion := result.Neighborhood.Assertions[0]
+	if err := validateTrustedDerivedAssertions(
+		map[shoal.ID]ontology.Assertion{assertion.ID(): assertion},
+		map[shoal.ID]ontology.Assertion{assertion.ID(): assertion},
+	); err != nil {
+		t.Fatalf("canonical assertion rejected: %v", err)
+	}
+	metadata := assertion.Metadata()
+	metadata["forged"] = "true"
+	options := []ontology.AssertionOption{}
+	if subjectType, present := assertion.SubjectType(); present {
+		options = append(options, ontology.WithAssertionSubjectType(subjectType))
+	}
+	if objectType, present := assertion.ObjectType(); present {
+		options = append(options, ontology.WithAssertionObjectType(objectType))
+	}
+	if identity, present := assertion.Ontology(); present {
+		options = append(options, ontology.WithAssertionOntology(identity))
+	}
+	forgedClaim, err := ontology.NewAssertion(
+		assertion.Subject(), assertion.Predicate(), assertion.Object(),
+		assertion.Origin(), assertion.Confidence(), assertion.Evidence(),
+		assertion.Provenance(), metadata, options...,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if forgedClaim.ID() != assertion.ID() {
+		t.Fatal("fixture metadata unexpectedly changed assertion identity")
+	}
+	if err := validateTrustedDerivedAssertions(
+		map[shoal.ID]ontology.Assertion{assertion.ID(): forgedClaim},
+		map[shoal.ID]ontology.Assertion{assertion.ID(): assertion},
+	); err == nil {
+		t.Fatal("forged assertion metadata was accepted")
+	}
+	if err := validateTrustedDerivedAssertions(
+		map[shoal.ID]ontology.Assertion{assertion.ID(): assertion},
+		map[shoal.ID]ontology.Assertion{},
+	); err == nil {
+		t.Fatal("missing trusted assertion was accepted")
+	}
 	producer, assertionNode, edge, ok, err :=
 		explorer.ProducerGraphElementsForAssertion(assertion)
 	if err != nil || !ok {

@@ -80,6 +80,7 @@ type persistedInteraction struct {
 	Operation                interaction.Operation
 	Actor                    interaction.ActorContext
 	Reason                   interaction.Reason
+	EdgeProvenanceComplete   bool
 	Nodes                    []graph.Node
 	Edges                    []graph.Edge
 	Visibility               string
@@ -283,6 +284,7 @@ func (e *Explorer) recordInteractionResult(
 		Operation:                session.Operation,
 		Actor:                    session.Actor,
 		Reason:                   session.Reason,
+		EdgeProvenanceComplete:   true,
 		Nodes:                    subgraph.Nodes,
 		Edges:                    subgraph.Edges,
 		Visibility:               interaction.Expression(subgraph.Visibility),
