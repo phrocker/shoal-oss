@@ -232,14 +232,14 @@ func (s *EmbeddedService) OntologyCatalog(
 		OntologyProposals(context.Context) ([]ontology.GovernedProposal, error)
 	})
 	if !ok {
-		catalog, err := ontology.NewPublishedCatalog(configured, nil)
+		catalog, err := boundedOntologyCatalog(configured, nil)
 		return catalog, true, err
 	}
 	proposals, err := store.OntologyProposals(ctx)
 	if err != nil {
 		return ontology.PublishedCatalog{}, false, err
 	}
-	catalog, err := ontology.NewPublishedCatalog(configured, proposals)
+	catalog, err := boundedOntologyCatalog(configured, proposals)
 	if err != nil {
 		return ontology.PublishedCatalog{}, false, err
 	}
@@ -261,6 +261,10 @@ func boundedOntologyCatalog(
 	configured ontology.OntologyVersion,
 	proposals []ontology.GovernedProposal,
 ) (ontology.PublishedCatalog, error) {
+	if len(proposals) > int(MaxOntologyProposals) {
+		return ontology.PublishedCatalog{}, ontologyBoundError(
+			"proposal", len(proposals), MaxOntologyProposals)
+	}
 	catalog, err := ontology.NewPublishedCatalog(configured, proposals)
 	if err != nil {
 		return ontology.PublishedCatalog{}, err
