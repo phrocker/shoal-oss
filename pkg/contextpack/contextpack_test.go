@@ -643,6 +643,29 @@ func TestGraphAnchorRejectsAuthoritativeDerivedAssertion(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	producedEdge := graph.Edge{
+		ID:     "produced-edge",
+		From:   "producer",
+		To:     assertion.ID(),
+		Type:   graph.EdgeTypeProduced,
+		Weight: 1,
+		Properties: shoal.Metadata{
+			"ontology.assertion.id": string(assertion.ID()),
+		},
+	}
+	if err := verifier.addNeighborhood(explorer.Neighborhood{
+		Nodes:      []graph.Node{{ID: "producer"}, {ID: assertion.ID()}},
+		Edges:      []graph.Edge{producedEdge},
+		Assertions: []ontology.Assertion{assertion},
+	}); err != nil {
+		t.Fatalf("page-local assertion edge hydration = %v", err)
+	}
+	state := verifier.assertionStates[assertion.ID()]
+	if len(state.edgeIDs) != 2 ||
+		state.edgeIDs[0] != assertion.ID() ||
+		state.edgeIDs[1] != producedEdge.ID {
+		t.Fatalf("accumulated assertion edges = %v", state.edgeIDs)
+	}
 	if _, err := verifier.graphAnchor(path); !shoal.IsErrorCode(
 		err, shoal.ErrorInvalidArgument,
 	) {

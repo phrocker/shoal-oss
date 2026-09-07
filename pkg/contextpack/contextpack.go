@@ -697,8 +697,7 @@ func (v *verifier) addNeighborhood(neighborhood explorer.Neighborhood) error {
 	}
 	for assertionID, state := range localAssertionStates {
 		if existing, ok := v.assertionStates[assertionID]; ok &&
-			(!reflect.DeepEqual(existing.assertion, state.assertion) ||
-				!reflect.DeepEqual(existing.edgeIDs, state.edgeIDs)) {
+			!reflect.DeepEqual(existing.assertion, state.assertion) {
 			return invalid("hydrated graph assertion conflicts with prior content")
 		}
 	}
@@ -765,7 +764,10 @@ func (v *verifier) addNeighborhood(neighborhood explorer.Neighborhood) error {
 		}
 	}
 	for assertionID, state := range localAssertionStates {
-		if _, exists := v.assertionStates[assertionID]; !exists {
+		if existing, exists := v.assertionStates[assertionID]; exists {
+			existing.edgeIDs = mergeSortedIDs(existing.edgeIDs, state.edgeIDs)
+			v.assertionStates[assertionID] = existing
+		} else {
 			v.assertionStates[assertionID] = assertionHydration{
 				assertion: state.assertion,
 				edgeIDs:   append([]shoal.ID(nil), state.edgeIDs...),
@@ -863,6 +865,20 @@ func assertionsByNeighborhoodEdge(
 		})
 	}
 	return result, byID, nil
+}
+
+func mergeSortedIDs(left, right []shoal.ID) []shoal.ID {
+	merged := append(append([]shoal.ID(nil), left...), right...)
+	sort.Slice(merged, func(i, j int) bool {
+		return shoal.CompareID(merged[i], merged[j]) < 0
+	})
+	result := merged[:0]
+	for _, id := range merged {
+		if len(result) == 0 || result[len(result)-1] != id {
+			result = append(result, id)
+		}
+	}
+	return result
 }
 
 func assertionMatchesEvidenceEdge(

@@ -179,6 +179,38 @@ func TestFoldRetainsAndConjoinsExactSourceEdges(t *testing.T) {
 	}
 }
 
+func TestFoldEdgeIdentityEncodingSeparatesOpaqueListValues(t *testing.T) {
+	sessionID := interaction.DerivedID("session", "opaque-edge-boundary")
+	summary := interaction.Digest("opaque edge boundary")
+	legacy := interaction.Fold{
+		Members: []interaction.FoldMember{{
+			SessionID:    sessionID,
+			CitedNodeIDs: []shoal.ID{"edges", "z"},
+		}},
+		SummaryDigest: summary,
+		FoldedAt:      time.Unix(1700000000, 0).UTC(),
+	}
+	withEdges := interaction.Fold{
+		Members: []interaction.FoldMember{{
+			SessionID:      sessionID,
+			TouchedEdgeIDs: []shoal.ID{"z"},
+		}},
+		SummaryDigest: summary,
+		FoldedAt:      legacy.FoldedAt,
+	}
+	legacyID, err := legacy.ID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	edgeID, err := withEdges.ID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if legacyID == edgeID {
+		t.Fatal("opaque cited IDs collided with typed edge provenance")
+	}
+}
+
 // TestFoldVisibilityIsConjunctionOfEverythingFolded pins requirement 2:
 // summarizing never widens visibility. The fold requires every label of every
 // folded session and every label of every source node those sessions touched.

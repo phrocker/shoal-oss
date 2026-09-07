@@ -237,6 +237,41 @@ func (f Fold) ID() (shoal.ID, error) {
 	if err != nil {
 		return "", err
 	}
+	hasEdgeProvenance := false
+	for _, member := range canonical.Members {
+		if len(member.TouchedEdgeIDs) > 0 {
+			hasEdgeProvenance = true
+			break
+		}
+	}
+	if hasEdgeProvenance {
+		parts := []string{
+			"edge-provenance-v1",
+			"members", strconv.Itoa(len(canonical.Members)),
+		}
+		for _, member := range canonical.Members {
+			parts = append(parts, "session", string(member.SessionID))
+			parts = append(
+				parts, "retrieved", strconv.Itoa(len(member.RetrievedNodeIDs)))
+			for _, id := range member.RetrievedNodeIDs {
+				parts = append(parts, string(id))
+			}
+			parts = append(parts, "cited", strconv.Itoa(len(member.CitedNodeIDs)))
+			for _, id := range member.CitedNodeIDs {
+				parts = append(parts, string(id))
+			}
+			parts = append(
+				parts, "edges", strconv.Itoa(len(member.TouchedEdgeIDs)))
+			for _, id := range member.TouchedEdgeIDs {
+				parts = append(parts, string(id))
+			}
+		}
+		parts = append(parts, "summary", canonical.SummaryDigest)
+		return DerivedID("fold", parts...), nil
+	}
+
+	// Preserve the original identity encoding for folds without typed edge
+	// provenance so durable legacy records remain addressable.
 	parts := make([]string, 0, 4*len(canonical.Members)+2)
 	for _, member := range canonical.Members {
 		parts = append(parts, "session", string(member.SessionID))
@@ -247,12 +282,6 @@ func (f Fold) ID() (shoal.ID, error) {
 		parts = append(parts, "cited")
 		for _, id := range member.CitedNodeIDs {
 			parts = append(parts, string(id))
-		}
-		if len(member.TouchedEdgeIDs) > 0 {
-			parts = append(parts, "edges")
-			for _, id := range member.TouchedEdgeIDs {
-				parts = append(parts, string(id))
-			}
 		}
 	}
 	parts = append(parts, "summary", canonical.SummaryDigest)
