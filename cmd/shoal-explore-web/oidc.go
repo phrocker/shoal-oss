@@ -175,6 +175,11 @@ var oidcContributorOperations = []auth.Operation{
 	auth.OperationRetrieve,
 	auth.OperationWorkspaceSettingsRead,
 	auth.OperationWorkspaceSettingsWrite,
+}
+
+// oidcFleetOperations is the explicit control-plane ceiling for operators who
+// opt in via -oidc-fleet-values.
+var oidcFleetOperations = []auth.Operation{
 	auth.OperationAgentRegister,
 	auth.OperationAgentHeartbeat,
 	auth.OperationAgentRevoke,
@@ -217,6 +222,7 @@ type oidcConfig struct {
 	authorizationClaim   string
 	readerClaimValues    []string
 	contributorValues    []string
+	fleetValues          []string
 	// Browser login is optional. When browserClientID is set, browserScope is
 	// required and endpoints are either supplied explicitly or read from OIDC
 	// discovery metadata.
@@ -251,7 +257,8 @@ func (c oidcConfig) configured() bool {
 		c.subjectFallbackClaim != "" ||
 		c.clientIDClaim != "" || c.delegationClaim != "" ||
 		c.authorizationClaim != "" || len(c.readerClaimValues) > 0 ||
-		len(c.contributorValues) > 0 || c.browserClientID != "" ||
+		len(c.contributorValues) > 0 || len(c.fleetValues) > 0 ||
+		c.browserClientID != "" ||
 		c.browserScope != "" || c.authorizationEndpoint != "" ||
 		c.tokenEndpoint != ""
 }
@@ -270,6 +277,7 @@ type oidcAuthenticator struct {
 	authorizationClaim         string
 	readerClaimValues          map[string]struct{}
 	contributorValues          map[string]struct{}
+	fleetValues                map[string]struct{}
 	authenticationLeeway       time.Duration
 	identityPrefix             string
 	defaultActor               shoal.ID
@@ -357,11 +365,13 @@ func newOIDCAuthenticator(
 	}
 	readerClaimValues := normalizeValueSet(config.readerClaimValues)
 	contributorValues := normalizeValueSet(config.contributorValues)
+	fleetValues := normalizeValueSet(config.fleetValues)
 	if len(readerClaimValues) == 0 && len(contributorValues) == 0 &&
+		len(fleetValues) == 0 &&
 		!config.allowUnmappedAuthorization {
 		return nil, shoal.NewError(
 			shoal.ErrorInvalidArgument,
-			"at least one -oidc-reader-values or -oidc-contributor-values "+
+			"at least one -oidc-reader-values, -oidc-contributor-values, or -oidc-fleet-values "+
 				"mapping is required")
 	}
 
@@ -430,6 +440,7 @@ func newOIDCAuthenticator(
 		authorizationClaim:         authorizationClaim,
 		readerClaimValues:          readerClaimValues,
 		contributorValues:          contributorValues,
+		fleetValues:                fleetValues,
 		authenticationLeeway:       skew,
 		identityPrefix:             firstNonEmpty(config.identityPrefix, oidcIdentityPrefix+issuer+"#"),
 		defaultActor:               firstNonZeroID(config.defaultActor, oidcActor),
@@ -866,6 +877,12 @@ func (a *oidcAuthenticator) authority(
 			trimmed = append(trimmed, strings.TrimSpace(value))
 		}
 		values = trimmed
+	}
+	if hasMappedValue(values, a.fleetValues) {
+		return oidcFleetOperations,
+			[][]byte{workspaceSourceID},
+			[][]byte{workspaceGrantPolicyID},
+			true
 	}
 	if hasMappedValue(values, a.contributorValues) {
 		return oidcContributorOperations,

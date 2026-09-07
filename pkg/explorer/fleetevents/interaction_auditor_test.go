@@ -41,16 +41,9 @@ func (s fixedAuditSnapshot) InteractionSnapshot(
 
 func TestInteractionAuditorRecordsRedactedAction(t *testing.T) {
 	sink := &auditSink{}
-	recorder, err := interaction.NewRecorder(context.Background(), sink)
-	if err != nil {
-		t.Fatal(err)
-	}
 	now := time.Date(2026, 9, 5, 20, 0, 0, 0, time.UTC)
-	if err := recorder.SetClock(func() time.Time { return now }); err != nil {
-		t.Fatal(err)
-	}
 	auditor, err := NewInteractionAuditor(
-		recorder, fixedAuditSnapshot{at: now})
+		sink, fixedAuditSnapshot{at: now})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -82,14 +75,19 @@ func TestInteractionAuditorRecordsRedactedAction(t *testing.T) {
 		sink.sessions[0].Actor.ClientID != "" ||
 		len(sink.sessions[0].Actor.OnBehalfOf) != 0 ||
 		sink.sessions[0].Reason != (interaction.Reason{}) ||
-		len(sink.sessions[0].TouchedNodeIDs()) != 6 {
+		len(sink.sessions[0].TouchedNodeIDs()) != 1 ||
+		len(sink.sessions[0].TouchedEdgeIDs()) != 1 {
 		t.Fatalf("session = %#v", sink.sessions)
 	}
-	if got := sink.sessions[0].TouchedNodeIDs(); got[0] != "anchor-a" ||
-		got[1] != "edge-a" || got[2] != "node-a" ||
-		got[3] != "object-a" || got[4] != "object-b" ||
-		got[5] != "revision-a" {
-		t.Fatalf("evidence = %#v", sink.sessions[0].TouchedNodeIDs())
+	if got := sink.sessions[0].TouchedNodeIDs(); got[0] != "node-a" {
+		t.Fatalf("node evidence = %#v", got)
+	}
+	if got := sink.sessions[0].TouchedEdgeIDs(); got[0] != "edge-a" {
+		t.Fatalf("edge evidence = %#v", got)
+	}
+	if len(sink.sessions[0].SeedEvidence) != 1 ||
+		sink.sessions[0].SeedEvidence[0].AnchorID != "anchor-a" {
+		t.Fatalf("typed evidence = %#v", sink.sessions[0].SeedEvidence)
 	}
 }
 
@@ -99,12 +97,8 @@ func TestInteractionAuditorRejectsMismatchedPersistedReceipt(t *testing.T) {
 		session.AuthorizationOperation = string(auth.OperationSubscriptionCreate)
 		return session
 	}}
-	recorder, err := interaction.NewRecorder(context.Background(), sink)
-	if err != nil {
-		t.Fatal(err)
-	}
 	auditor, err := NewInteractionAuditor(
-		recorder, fixedAuditSnapshot{at: now})
+		sink, fixedAuditSnapshot{at: now})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -122,12 +116,7 @@ func TestInteractionAuditorRejectsNilRecorder(t *testing.T) {
 	if _, err := NewInteractionAuditor(nil, fixedAuditSnapshot{}); err == nil {
 		t.Fatal("nil recorder succeeded")
 	}
-	recorder, err := interaction.NewRecorder(
-		context.Background(), &auditSink{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := NewInteractionAuditor(recorder, nil); err == nil {
+	if _, err := NewInteractionAuditor(&auditSink{}, nil); err == nil {
 		t.Fatal("nil snapshot provider succeeded")
 	}
 }
@@ -151,8 +140,6 @@ func (s *auditSink) RecordInteractionResult(
 		return interaction.Session{}, err
 	}
 	result := session
-	result.Actor = interaction.ActorContext{SubjectID: "trusted-subject"}
-	result.Reason = interaction.Reason{Code: "audit_purpose"}
 	if s.mutateResult != nil {
 		result = s.mutateResult(result)
 	}

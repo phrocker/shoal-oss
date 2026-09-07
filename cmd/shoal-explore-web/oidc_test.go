@@ -490,10 +490,40 @@ func TestOIDCClaimMappingPreservesIdentityAndDelegation(t *testing.T) {
 	if !operationsContain(decision.AllowedOperations(), auth.OperationIngest) {
 		t.Fatal("contributor mapping did not grant ingest")
 	}
-	if !operationsContain(
-		decision.AllowedOperations(), auth.OperationDelegate,
-	) {
-		t.Fatal("contributor mapping did not grant agent delegation")
+	if operationsContain(decision.AllowedOperations(), auth.OperationDelegate) {
+		t.Fatal("contributor mapping granted agent delegation")
+	}
+}
+
+func TestOIDCFleetMappingIsSeparateFromContributor(t *testing.T) {
+	issuer := newFakeOIDCIssuer(t)
+	now := time.Now()
+	config := issuer.testConfig(fixedClock(now))
+	config.fleetValues = []string{"fleet"}
+	authenticator := newTestOIDCAuthenticator(t, config)
+
+	claims := issuer.defaultClaims(now)
+	claims["access"] = "fleet"
+	decision, err := authenticator.Authenticate(
+		bearerRequest(issuer.signRS256(t, testKID, claims)))
+	if err != nil {
+		t.Fatalf("fleet token rejected: %v", err)
+	}
+	for _, operation := range []auth.Operation{
+		auth.OperationAgentRegister,
+		auth.OperationAgentRevoke,
+		auth.OperationDelegate,
+		auth.OperationDispatch,
+		auth.OperationInvoke,
+		auth.OperationSubscriptionCreate,
+		auth.OperationEventPublish,
+	} {
+		if !operationsContain(decision.AllowedOperations(), operation) {
+			t.Fatalf("fleet mapping omitted %s", operation)
+		}
+	}
+	if operationsContain(decision.AllowedOperations(), auth.OperationIngest) {
+		t.Fatal("fleet mapping granted contributor ingest")
 	}
 }
 

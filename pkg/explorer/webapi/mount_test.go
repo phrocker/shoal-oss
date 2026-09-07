@@ -23,6 +23,10 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
+
+	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
+	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
 type mountedTestHandler struct {
@@ -47,10 +51,7 @@ func TestMountAuthenticatedRejectsNonLiteralPatterns(t *testing.T) {
 		"/mcp?query", "/mcp#fragment", "POST /mcp", "/mcp\\child",
 	} {
 		t.Run(pattern, func(t *testing.T) {
-			handler := &Handler{
-				mux: http.NewServeMux(), preAuth: make(
-					map[string]preAuthenticationValidator),
-			}
+			handler := authenticatedMountTestHandler(t)
 			if err := handler.MountAuthenticated(
 				pattern, &mountedTestHandler{},
 			); err == nil {
@@ -64,10 +65,7 @@ func TestMountAuthenticatedRejectsNonLiteralPatterns(t *testing.T) {
 }
 
 func TestMountAuthenticatedAllowsNormalizedSubtree(t *testing.T) {
-	handler := &Handler{
-		mux: http.NewServeMux(), preAuth: make(
-			map[string]preAuthenticationValidator),
-	}
+	handler := authenticatedMountTestHandler(t)
 	mounted := &mountedTestHandler{}
 	if err := handler.MountAuthenticated("/api/v1/fleet/", mounted); err != nil {
 		t.Fatal(err)
@@ -88,9 +86,8 @@ func TestMountAuthenticatedConflictIsAtomic(t *testing.T) {
 	) {
 		writer.WriteHeader(http.StatusAccepted)
 	})
-	handler := &Handler{
-		mux: mux, preAuth: make(map[string]preAuthenticationValidator),
-	}
+	handler := authenticatedMountTestHandler(t)
+	handler.mux = mux
 	mounted := &mountedTestHandler{}
 	if err := handler.MountAuthenticated("/mcp", mounted); err == nil {
 		t.Fatal("conflicting authenticated mount succeeded")
@@ -110,10 +107,7 @@ func TestMountAuthenticatedConflictIsAtomic(t *testing.T) {
 }
 
 func TestMountAuthenticatedDispatchesOnlySupportedMethods(t *testing.T) {
-	handler := &Handler{
-		mux: http.NewServeMux(), preAuth: make(
-			map[string]preAuthenticationValidator),
-	}
+	handler := authenticatedMountTestHandler(t)
 	mounted := &mountedTestHandler{}
 	if err := handler.MountAuthenticated("/mcp", mounted); err != nil {
 		t.Fatal(err)
@@ -139,5 +133,42 @@ func TestMountAuthenticatedDispatchesOnlySupportedMethods(t *testing.T) {
 	}
 	if mounted.calls != 4 {
 		t.Fatalf("mounted handler calls = %d, want 4", mounted.calls)
+	}
+}
+
+func TestMountAuthenticatedRejectsAnonymousHandler(t *testing.T) {
+	handler, err := NewHandler(&stubWorkspaceService{}, "example.test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = handler.MountAuthenticated("/mcp", &mountedTestHandler{})
+	if !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
+		t.Fatalf("anonymous authenticated mount = %v", err)
+	}
+}
+
+func authenticatedMountTestHandler(t *testing.T) *Handler {
+	t.Helper()
+	now := time.Date(2026, 9, 7, 2, 0, 0, 0, time.UTC)
+	authority, err := auth.NewAuthorityWithClock(func() time.Time { return now })
+	if err != nil {
+		t.Fatal(err)
+	}
+	decision, err := auth.NewDecision(auth.DecisionConfig{
+		Subject: "subject", Actor: "actor", AuthorizationDomain: []byte("domain"),
+		AllowedOperations: []auth.Operation{auth.OperationRead},
+		PolicyGeneration:  1, AuthenticationExpires: now.Add(time.Hour),
+		RequestID: "request", CorrelationID: "correlation",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &Handler{
+		mux: http.NewServeMux(), preAuth: make(
+			map[string]preAuthenticationValidator),
+		authenticator: AuthenticatorFunc(func(*http.Request) (auth.Decision, error) {
+			return decision, nil
+		}),
+		binder: authority.Binder(),
 	}
 }

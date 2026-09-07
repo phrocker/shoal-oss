@@ -238,6 +238,11 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 		"Comma-separated authorization-claim values granted read and ingest "+
 			"access; environment fallback SHOAL_OIDC_CONTRIBUTOR_VALUES",
 	)
+	oidcFleetValues := flags.String(
+		"oidc-fleet-values", "",
+		"Comma-separated authorization-claim values granted Fleet control-plane "+
+			"access; environment fallback SHOAL_OIDC_FLEET_VALUES",
+	)
 	oidcBrowserClientID := flags.String(
 		"oidc-browser-client-id", "",
 		"Optional public-client ID enabling browser Authorization Code + PKCE; "+
@@ -347,6 +352,8 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 		contributorValues: splitCommaList(firstNonEmpty(
 			*oidcContributorValues,
 			os.Getenv("SHOAL_OIDC_CONTRIBUTOR_VALUES"))),
+		fleetValues: splitCommaList(firstNonEmpty(
+			*oidcFleetValues, os.Getenv("SHOAL_OIDC_FLEET_VALUES"))),
 		browserClientID: firstNonEmpty(
 			*oidcBrowserClientID, os.Getenv("SHOAL_OIDC_BROWSER_CLIENT_ID")),
 		browserScope: firstNonEmpty(
@@ -924,7 +931,7 @@ func openService(
 		fleetEvents, actionEvents, err :=
 			explorerfleetevents.ComposeWithPublisher(
 				embedded.Runtime, workspacePublicationDomain, config.resolver,
-				generationReader, interactionRecorder, fleetRegistry,
+				generationReader, interactionRecorder, corpus, fleetRegistry,
 				cursorKey, config.clock,
 			)
 		if err != nil {

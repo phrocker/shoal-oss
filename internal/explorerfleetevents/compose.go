@@ -54,13 +54,14 @@ func Compose(
 	resolver auth.Resolver,
 	generations auth.GenerationReader,
 	interactionRecorder *interaction.Recorder,
+	trustedInteractions interaction.ResultSink,
 	leases fleetevents.LeaseValidator,
 	cursorKey []byte,
 	clock func() time.Time,
 ) (*fleetevents.Service, error) {
 	service, _, err := ComposeWithPublisher(
 		runtime, domain, resolver, generations, interactionRecorder,
-		leases, cursorKey, clock,
+		trustedInteractions, leases, cursorKey, clock,
 	)
 	return service, err
 }
@@ -73,6 +74,7 @@ func ComposeWithPublisher(
 	resolver auth.Resolver,
 	generations auth.GenerationReader,
 	interactionRecorder *interaction.Recorder,
+	trustedInteractions interaction.ResultSink,
 	leases fleetevents.LeaseValidator,
 	cursorKey []byte,
 	clock func() time.Time,
@@ -89,7 +91,7 @@ func ComposeWithPublisher(
 		)
 	}
 	auditor, err := fleetevents.NewInteractionAuditor(
-		interactionRecorder, snapshots)
+		trustedInteractions, snapshots)
 	if err != nil {
 		return nil, nil, err
 	}

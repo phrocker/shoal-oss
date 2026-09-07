@@ -36,7 +36,9 @@ type preAuthenticationValidator interface {
 func (h *Handler) MountAuthenticated(
 	pattern string, handler http.Handler,
 ) (err error) {
-	if h == nil || h.mux == nil {
+	if h == nil || h.mux == nil ||
+		isAbsentInterface(h.authenticator) ||
+		isAbsentInterface(h.binder) {
 		return shoal.NewError(
 			shoal.ErrorInvalidArgument, "workspace handler is required")
 	}

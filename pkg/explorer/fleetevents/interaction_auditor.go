@@ -20,10 +20,9 @@
 package fleetevents
 
 import (
-	"bytes"
 	"context"
 	"encoding/hex"
-	"sort"
+	"reflect"
 
 	"github.com/phrocker/shoal-oss/pkg/explorer/fleet"
 	"github.com/phrocker/shoal-oss/pkg/interaction"
@@ -34,18 +33,18 @@ import (
 // durable interaction recorder without persisting event payloads or raw
 // opaque object identities.
 type InteractionAuditor struct {
-	recorder  *interaction.Recorder
+	sink      interaction.ResultSink
 	snapshots fleet.InteractionSnapshotProvider
 }
 
 func NewInteractionAuditor(
-	recorder *interaction.Recorder,
+	sink interaction.ResultSink,
 	snapshots fleet.InteractionSnapshotProvider,
 ) (*InteractionAuditor, error) {
-	if recorder == nil || snapshots == nil {
+	if isNilInteractionResultSink(sink) || snapshots == nil {
 		return nil, shoal.NewError(shoal.ErrorInvalidArgument, "interaction recorder is required")
 	}
-	return &InteractionAuditor{recorder: recorder, snapshots: snapshots}, nil
+	return &InteractionAuditor{sink: sink, snapshots: snapshots}, nil
 }
 
 func (a *InteractionAuditor) RecordFleetAction(ctx context.Context, record AuditRecord) error {
@@ -57,20 +56,17 @@ func (a *InteractionAuditor) RecordFleetAction(ctx context.Context, record Audit
 	if err != nil {
 		return err
 	}
-	evidenceIDs := make([]shoal.ID, 0, len(record.Evidence)*5)
-	for _, evidence := range record.Evidence {
-		evidenceIDs = append(evidenceIDs, evidence.ObjectID)
-		for _, id := range []shoal.ID{
-			evidence.NodeID, evidence.EdgeID,
-			evidence.AnchorID, evidence.RevisionID,
-		} {
-			if id != "" {
-				evidenceIDs = append(evidenceIDs, id)
-			}
-		}
+	seedEvidence := fleetInteractionEvidence(record)
+	seedNodeIDs := make([]shoal.ID, 0, len(seedEvidence))
+	for _, evidence := range seedEvidence {
+		seedNodeIDs = append(seedNodeIDs, evidence.NodeIDs...)
+	}
+	recordedAt := record.OccurredAt.UTC()
+	if recordedAt.IsZero() || recordedAt.Before(snapshot.AsOf) {
+		recordedAt = snapshot.AsOf.UTC()
 	}
 	session := interaction.Session{
-		ID: sessionID, RecordedAt: record.OccurredAt, Operation: interaction.OperationToolCall,
+		ID: sessionID, RecordedAt: recordedAt, Operation: interaction.OperationToolCall,
 		AuthorizationFingerprint: shoal.ID(
 			record.AuthorizationFingerprint.String()),
 		AuthorizationExpiresAt: record.AuthorizationExpiresAt,
@@ -79,13 +75,17 @@ func (a *InteractionAuditor) RecordFleetAction(ctx context.Context, record Audit
 		RequestID: record.RequestID,
 		QueryDigest: interaction.Digest(
 			string(record.ActionID) + "\x00" + string(record.CorrelationID)),
-		SeedNodeIDs: evidenceIDs,
+		SeedNodeIDs: seedNodeIDs, SeedEvidence: seedEvidence,
 		Turns: []interaction.Turn{{
 			Index: 0, Decision: string(record.Operation),
 			ToolCall: &interaction.ToolCall{Kind: "fleet." + string(record.Operation)},
 		}},
 	}
-	persisted, err := a.recorder.Record(ctx, session)
+	session, err = session.Canonical()
+	if err != nil {
+		return err
+	}
+	persisted, err := a.sink.RecordInteractionResult(ctx, session)
 	if err != nil {
 		return err
 	}
@@ -96,7 +96,39 @@ func (a *InteractionAuditor) RecordFleetAction(ctx context.Context, record Audit
 	return nil
 }
 
+func fleetInteractionEvidence(record AuditRecord) []interaction.EvidenceReference {
+	evidence := make([]interaction.EvidenceReference, 0, len(record.Evidence))
+	for _, item := range record.Evidence {
+		if item.NodeID == "" {
+			continue
+		}
+		anchorID := item.AnchorID
+		if anchorID == "" {
+			anchorID = shoal.ID(hex.EncodeToString(deriveID(
+				"fleet-event-evidence-anchor-v1",
+				record.ActionID, record.ObjectID, []byte(item.ObjectID),
+				[]byte(item.NodeID), []byte(item.EdgeID),
+				[]byte(item.RevisionID),
+			)))
+		}
+		reference := interaction.EvidenceReference{
+			AnchorID: anchorID,
+			Kind:     interaction.EvidenceGraph,
+			NodeIDs:  []shoal.ID{item.NodeID},
+		}
+		if item.EdgeID != "" {
+			reference.EdgeIDs = []shoal.ID{item.EdgeID}
+		}
+		evidence = append(evidence, reference)
+	}
+	return evidence
+}
+
 func sameFleetReceipt(expected, persisted interaction.Session) bool {
+	persisted, err := persisted.Canonical()
+	if err != nil {
+		return false
+	}
 	if persisted.ID != expected.ID ||
 		persisted.Operation != interaction.OperationToolCall ||
 		persisted.AuthorizationOperation != expected.AuthorizationOperation ||
@@ -108,21 +140,20 @@ func sameFleetReceipt(expected, persisted interaction.Session) bool {
 		persisted.Turns[0].ToolCall.Kind != expected.Turns[0].ToolCall.Kind {
 		return false
 	}
-	expectedEvidence := expected.TouchedNodeIDs()
-	persistedEvidence := persisted.TouchedNodeIDs()
-	sort.Slice(expectedEvidence, func(i, j int) bool {
-		return bytes.Compare([]byte(expectedEvidence[i]), []byte(expectedEvidence[j])) < 0
-	})
-	sort.Slice(persistedEvidence, func(i, j int) bool {
-		return bytes.Compare([]byte(persistedEvidence[i]), []byte(persistedEvidence[j])) < 0
-	})
-	if len(expectedEvidence) != len(persistedEvidence) {
+	return reflect.DeepEqual(persisted.SeedNodeIDs, expected.SeedNodeIDs) &&
+		reflect.DeepEqual(persisted.SeedEvidence, expected.SeedEvidence)
+}
+
+func isNilInteractionResultSink(sink interaction.ResultSink) bool {
+	if sink == nil {
+		return true
+	}
+	value := reflect.ValueOf(sink)
+	switch value.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map,
+		reflect.Pointer, reflect.Slice:
+		return value.IsNil()
+	default:
 		return false
 	}
-	for i := range expectedEvidence {
-		if expectedEvidence[i] != persistedEvidence[i] {
-			return false
-		}
-	}
-	return true
 }
