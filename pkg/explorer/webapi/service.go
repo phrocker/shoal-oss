@@ -1165,13 +1165,21 @@ func assertionsForPath(
 	if len(assertions) == 0 || len(path.Edges) == 0 {
 		return nil
 	}
-	byID := make(map[shoal.ID]ontology.Assertion, len(assertions))
+	byEdge := make(map[shoal.ID]ontology.Assertion, len(assertions))
 	for _, assertion := range assertions {
-		byID[assertion.ID()] = assertion
+		edgeID := assertion.ID()
+		// Extracted relationships retain their assertion identity separately
+		// from the graph edge. Derived assertions use their own ID as the edge.
+		if assertion.Origin() != ontology.AssertionDerived {
+			if linked := assertion.Metadata()["shoal.graph.edge_id"]; linked != "" {
+				edgeID = shoal.ID(linked)
+			}
+		}
+		byEdge[edgeID] = assertion
 	}
 	selected := make([]ontology.Assertion, 0, len(path.Edges))
 	for _, edge := range path.Edges {
-		if assertion, ok := byID[edge.ID]; ok {
+		if assertion, ok := byEdge[edge.ID]; ok {
 			selected = append(selected, assertion)
 		}
 	}

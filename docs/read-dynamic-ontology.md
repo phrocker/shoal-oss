@@ -1,13 +1,16 @@
 # Read-time dynamic ontology
 
-This change implements the backend and governance portion of issue #279 as a
-conservative read-time lens over immutable assertions. The source graph remains
-schema-neutral and ingestion is not rejected merely because an unrelated
-ontology does not describe it. Host integrations can select a lens through
-`auth.DecisionConfig.SelectedOntology`; first-party workspace settings and UI
-selection are intentionally tracked separately and are not claimed here.
+RDO implements issue #279 as a conservative read-time lens over immutable
+assertions, including governed evolution and first-party workspace selection.
+The source graph remains schema-neutral and ingestion is not rejected merely
+because an unrelated ontology does not describe it. Host integrations select a
+lens through `auth.DecisionConfig.SelectedOntology`; browser workspace settings select
+from the authorized, published ontology catalog.
 
 ## Source-evidence matrix
+
+The following matrix records the original backend implementation baseline,
+not an inventory of remaining work.
 
 | Prerequisite from #279 | Source evidence at implementation baseline | Result |
 |---|---|---|
@@ -41,6 +44,39 @@ selection are intentionally tracked separately and are not claimed here.
   morphisms is excluded from the interpretation path, preserving unresolved
   history instead of silently adopting the changed meaning.
 - A decision without `SelectedOntology` preserves the previous no-lens result.
+
+## Caller-held workspace lenses
+
+The embedded web workspace wires durable settings to the live governed catalog.
+The browser settings panel lists choices and persists a caller-owned selection:
+
+- `GET /api/v1/workspaces/{workspace_id}/settings/lens` lists the active version
+  and retained published ancestors visible to the authenticated caller.
+- `PUT` to the same route selects a lens with `expected_revision`,
+  `mutation_id`, and `selected_ontology`; it preserves existing operation,
+  source, policy, budget, and output restrictions.
+- Workspace IDs and ontology schema/version IDs use the API's base64url opaque
+  ID codec. Reads carry the selected workspace in `Shoal-Workspace-ID`.
+- Workspace settings require their respective read/write authority; ordinary
+  reads reauthorize the selected published identity for the actual operation.
+  A lens cannot grant access to otherwise unauthorized observations or evidence.
+- A workspace pin is monotonic: it cannot be cleared or replaced. A caller
+  authorized for multiple versions can pin another owned workspace to a different
+  lens. An issuer-pinned ontology cannot be overridden by workspace settings.
+- Neighborhoods and paths return unchanged assertions with separate
+  `ontology_interpretations`. Extracted path assertions are joined through their
+  retained `shoal.graph.edge_id`, not by assuming assertion IDs equal graph edge
+  IDs. Derived assertions retain their existing ID-based association.
+
+`TestRDOCallerLensesOverStoredGraph` in
+`pkg/explorer/webapi/rdo_acceptance_test.go` exercises actual deterministic skill
+extraction, evidence-authorized morphism publication, HTTP settings selection,
+and authorized neighborhood/path reads over one persisted graph. It verifies
+different interpretations for two callers, no interpretation from unpublished
+morphisms, same-caller fingerprint/cache isolation across separately pinned
+workspaces, no-lens behavior, and unchanged observations after corpus/settings
+restart. Existing ontology model tests cover the asymmetric safety classes,
+including narrowing, split discriminators, and lossy merges.
 
 ## Integration API
 
