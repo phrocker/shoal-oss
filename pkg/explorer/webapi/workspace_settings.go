@@ -290,6 +290,16 @@ func workspaceOperationForRequest(
 		return auth.OperationRead, true
 	case method == http.MethodGet && path == "/api/v1/identity":
 		return auth.OperationRead, true
+	case method == http.MethodGet &&
+		(path == "/api/v1/provenance" ||
+			(strings.HasPrefix(path, "/api/v1/provenance/") &&
+				len(strings.TrimPrefix(path, "/api/v1/provenance/")) > 0 &&
+				!strings.Contains(strings.TrimPrefix(path, "/api/v1/provenance/"), "/"))):
+		return auth.OperationRead, true
+	case method == http.MethodPost && path == "/api/v1/provenance/fold":
+		return auth.OperationConnect, true
+	case method == http.MethodPost && path == "/api/v1/provenance/unfold":
+		return auth.OperationRead, true
 	case method == http.MethodGet && path == "/api/v1/ontology":
 		return auth.OperationRead, true
 	case method == http.MethodGet && path == "/api/v1/ontology/proposals":
@@ -316,7 +326,9 @@ func workspaceOperationForRequest(
 		return auth.OperationList, true
 	case method == http.MethodPost && path == "/api/v1/document":
 		return auth.OperationRead, true
-	case method == http.MethodPost && path == "/api/v1/retrieve":
+	case method == http.MethodPost &&
+		(path == "/api/v1/retrieve" || path == "/api/v1/ask" ||
+			path == "/api/v1/chat/stream"):
 		return auth.OperationRetrieve, true
 	case method == http.MethodPost &&
 		(path == "/api/v1/neighborhood" || path == "/api/v1/path"):

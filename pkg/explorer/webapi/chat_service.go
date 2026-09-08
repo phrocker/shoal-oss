@@ -192,7 +192,10 @@ func (s *ChatService) Ask(ctx context.Context, input AskRequest) (CitationEnvelo
 				return CitationEnvelope{}, err
 			}
 			if len(label) > 0 {
-				extraVisibility = append(extraVisibility, string(label))
+				extraVisibility, err = interaction.ParseVisibility(string(label))
+				if err != nil {
+					return CitationEnvelope{}, err
+				}
 			}
 		}
 		settingsID = effective.SettingsID()
@@ -348,6 +351,7 @@ func (s *ChatService) Ask(ctx context.Context, input AskRequest) (CitationEnvelo
 	session.QueryDigest = executionSession.QueryDigest
 	session.StopReason = executionSession.StopReason
 	session.Turns = executionSession.Turns
+	session.RequiredVisibility = metadata.EffectiveOutputVisibility()
 	captured, err := prepared.Capture(ctx, productRecorder, session)
 	if err != nil {
 		return CitationEnvelope{}, fmt.Errorf("capture verified chat response: %w", err)

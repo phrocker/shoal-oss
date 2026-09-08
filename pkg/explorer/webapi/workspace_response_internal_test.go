@@ -93,6 +93,18 @@ func TestWorkspaceOperationForRequestUsesRouteOperation(t *testing.T) {
 		apply     bool
 	}{
 		{http.MethodPost, "/api/v1/retrieve", auth.OperationRetrieve, true},
+		{http.MethodPost, "/api/v1/ask", auth.OperationRetrieve, true},
+		{http.MethodPost, "/api/v1/chat/stream", auth.OperationRetrieve, true},
+		{http.MethodGet, "/api/v1/ask", "", false},
+		{http.MethodGet, "/api/v1/chat/stream", "", false},
+		{http.MethodGet, "/api/v1/provenance", auth.OperationRead, true},
+		{http.MethodGet, "/api/v1/provenance/c2Vzc2lvbg", auth.OperationRead, true},
+		{http.MethodHead, "/api/v1/provenance/c2Vzc2lvbg", auth.OperationRead, true},
+		{http.MethodPost, "/api/v1/provenance/fold", auth.OperationConnect, true},
+		{http.MethodPost, "/api/v1/provenance/unfold", auth.OperationRead, true},
+		{http.MethodGet, "/api/v1/provenance/", "", false},
+		{http.MethodGet, "/api/v1/provenance/session/unknown", "", false},
+		{http.MethodPost, "/api/v1/provenance/session", "", false},
 		{http.MethodPost, "/api/v1/analytics", auth.OperationAnalyticsRead, true},
 		{http.MethodPost, TeamOverviewRoute, auth.OperationTeamOverviewRead, true},
 		{http.MethodPost, "/api/v1/neighborhood", auth.OperationNeighborhood, true},
