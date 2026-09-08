@@ -46,7 +46,7 @@ import (
 )
 
 func TestStreamableHTTPFleetCallsUseTrustedSessionCorrelation(t *testing.T) {
-	now := time.Date(2026, 9, 7, 12, 0, 0, 0, time.UTC)
+	now := time.Now().UTC()
 	authority := auth.NewAuthority()
 	fleetService := &httpFleetToolService{}
 	tools, err := NewFleetDispatchTools(

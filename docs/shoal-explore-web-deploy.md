@@ -324,6 +324,30 @@ audit-purpose reason. Grounded evidence remains reauthorized with the legacy
 action. Fleet action tools must separately enforce that exact `auth.Operation`
 before effects.
 
+### Recorded chat and workspace provenance acceptance
+
+`POST /api/v1/ask` and `POST /api/v1/chat/stream` apply the selected
+`Shoal-Workspace-ID` settings under the retrieval operation. The stream emits
+one structured `complete` SSE event only after durable capture, not speculative
+model tokens. Workspace output policies are parsed as conjunctions of labels;
+their join with verified evidence is recorded on the chat session and returned
+with its structured, verified citations.
+
+The same workspace header applies to provenance list/inspection and unfold
+under `read`, and to provenance fold under `connect`. These are provenance
+folds, not context compression.
+
+The following local acceptance matrix exercises REST ask, SSE chat, and HTTP
+MCP ask with 24 cited documents, a nonpublic workspace output policy, and
+provenance inspection/fold/unfold. It verifies complete citation sets and
+withholds output when retrieval, inference, chat capture, or the MCP outcome
+record fails. It uses embedded Shoal storage and a deterministic test model;
+no model service or live cluster is required.
+
+```bash
+go test ./pkg/explorer/mcp ./pkg/explorer/webapi -run 'TestHTTPAskAdapterUsesSharedChatAndPersistsCompleteEvidence|TestHTTPChatSurfacesWithholdUnrecordedOutput|TestObservedEvidenceNodeSetsIgnoreOrdering|TestWorkspaceOperationForRequestUsesRouteOperation' -count=1
+```
+
 ## Durable Fleet registry, dispatch, and events
 
 The embedded command composes the durable registry and dispatch services on

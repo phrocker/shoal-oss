@@ -23,9 +23,12 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -38,8 +41,8 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/explorer/workspace"
 	"github.com/phrocker/shoal-oss/pkg/graph"
 	"github.com/phrocker/shoal-oss/pkg/inference"
+	"github.com/phrocker/shoal-oss/pkg/inference/harness"
 	"github.com/phrocker/shoal-oss/pkg/interaction"
-	"github.com/phrocker/shoal-oss/pkg/model"
 	"github.com/phrocker/shoal-oss/pkg/ontology"
 	"github.com/phrocker/shoal-oss/pkg/reasoning"
 	"github.com/phrocker/shoal-oss/pkg/retrieval"
@@ -387,6 +390,33 @@ func TestCitationObservationPreservesCompleteEvidence(t *testing.T) {
 }
 
 func TestHTTPAskAdapterUsesSharedChatAndPersistsCompleteEvidence(t *testing.T) {
+	for _, surface := range []string{"mcp", "ask", "stream"} {
+		t.Run(surface, func(t *testing.T) {
+			testHTTPRecordedChatSurface(t, surface, "")
+		})
+	}
+}
+
+func TestHTTPChatSurfacesWithholdUnrecordedOutput(t *testing.T) {
+	for _, surface := range []string{"mcp", "ask", "stream"} {
+		for _, operation := range []interaction.Operation{
+			interaction.OperationRetrieval,
+			interaction.OperationInference,
+			interaction.OperationChat,
+			interaction.OperationToolCall,
+		} {
+			if operation == interaction.OperationToolCall && surface != "mcp" {
+				continue
+			}
+			t.Run(surface+"/"+string(operation), func(t *testing.T) {
+				testHTTPRecordedChatSurface(t, surface, operation)
+			})
+		}
+	}
+}
+
+func testHTTPRecordedChatSurface(t *testing.T, surface string, failOperation interaction.Operation) {
+	t.Helper()
 	corpus, err := explorer.Open(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -405,8 +435,9 @@ func TestHTTPAskAdapterUsesSharedChatAndPersistsCompleteEvidence(t *testing.T) {
 	generations := httpGenerationReader{
 		domain: []byte("domain"), generation: 1,
 	}
+	sink := &chatAcceptanceSink{Explorer: corpus, failOperation: failOperation}
 	client, err := authorized.NewClient(authorized.Config{
-		Base: corpus, InteractionWriter: corpus, InteractionReader: corpus,
+		Base: corpus, InteractionWriter: sink, InteractionReader: corpus,
 		SnapshotValidator: corpus,
 		Resolver:          authority.Resolver(), PolicySelector: selector,
 		PolicyStore:      authorized.NewMemoryPolicyStore(),
@@ -421,12 +452,18 @@ func TestHTTPAskAdapterUsesSharedChatAndPersistsCompleteEvidence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := client.Ingest(setupContext, explorer.Source{
-		URI:       "file:///mcp-chat.md",
-		MediaType: explorer.MediaTypeMarkdown,
-		Content:   "# MCP Chat\n\nDurable evidence is recorded before delivery.\n",
-	}); err != nil {
-		t.Fatal(err)
+	documentCount := 24
+	if failOperation != "" {
+		documentCount = 1
+	}
+	for index := 0; index < documentCount; index++ {
+		if _, err := client.Ingest(setupContext, explorer.Source{
+			URI:       "file:///mcp-chat-" + strconv.Itoa(index) + ".md",
+			MediaType: explorer.MediaTypeMarkdown,
+			Content:   "# MCP Chat\n\nDurable evidence is recorded before delivery " + strconv.Itoa(index) + ".\n",
+		}); err != nil {
+			t.Fatal(err)
+		}
 	}
 	service, err := webapi.NewEmbeddedService(client)
 	if err != nil {
@@ -437,15 +474,20 @@ func TestHTTPAskAdapterUsesSharedChatAndPersistsCompleteEvidence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	generator := &chatAcceptanceGenerator{}
 	chat, err := webapi.NewChatService(
 		context.Background(),
 		webapi.ChatConfig{
 			Client: client, Resolver: authority.Resolver(),
-			Generator: model.FakeGenerator{Model: "deterministic"},
+			Generator: generator,
 			Model:     provenance,
-			RetrievalModes: []retrieval.Mode{
-				retrieval.ModeLexical, retrieval.ModeTree,
+			Budgets: harness.Budgets{
+				MaxSteps: 8, MaxElapsed: 30 * time.Second,
+				MaxInputTokens: 1_000_000, MaxOutputTokens: 8192, MaxEvidence: 128,
+				MaxGraphHops: 4, MaxGraphNodes: 128, MaxFanout: 32,
+				MaxRepeatedAction: 2,
 			},
+			RetrievalModes: []retrieval.Mode{retrieval.ModeLexical},
 		},
 	)
 	if err != nil {
@@ -493,18 +535,22 @@ func TestHTTPAskAdapterUsesSharedChatAndPersistsCompleteEvidence(t *testing.T) {
 	}
 	server.workspaceSettings = settingsProvider
 	workspaceID := shoal.ID("ask-workspace")
-	topK := uint32(4)
+	topK := uint32(32)
 	outputBytes := uint64(1 << 20)
-	if _, err := settingsProvider.Update(
+	settings, err := settingsProvider.Update(
 		setupContext, workspaceID, workspace.UpdateRequest{
 			ExpectedRevision: 0, MutationID: "ask-workspace-create",
 			Narrowing: workspace.UpdateNarrowing{
 				Budgets: workspace.Budgets{
 					RetrievalTopK: &topK, OutputBytes: &outputBytes,
 				},
+				OutputPolicies: []workspace.OutputPolicySpec{{
+					SourceID: sourceID, GrantPolicyID: policyID, Epoch: 1,
+				}},
 			},
 		},
-	); err != nil {
+	)
+	if err != nil {
 		t.Fatal(err)
 	}
 	workspaceHeader := base64.RawURLEncoding.EncodeToString(
@@ -554,38 +600,120 @@ func TestHTTPAskAdapterUsesSharedChatAndPersistsCompleteEvidence(t *testing.T) {
 	httpServer.Start()
 	t.Cleanup(httpServer.Close)
 
-	session, _ := initializeHTTPWithWorkspace(
-		t, httpServer.Client(), httpServer.URL+"/mcp",
-		"ignored", workspaceHeader, "1")
-	assertEmptyBody(t, postHTTPMCPWithWorkspace(
-		t, httpServer.Client(), httpServer.URL+"/mcp", "ignored",
-		workspaceHeader, session, ProtocolVersion,
-		`{"jsonrpc":"2.0","method":"notifications/initialized"}`))
-	response := postHTTPMCPWithWorkspace(
-		t, httpServer.Client(), httpServer.URL+"/mcp", "ignored",
-		workspaceHeader, session, ProtocolVersion,
-		`{"jsonrpc":"2.0","id":"ask","method":"tools/call",`+
-			`"params":{"name":"shoal.ask","arguments":{`+
-			`"question":"What does the MCP chat document say?","top_k":1}}}`)
-	decoded := decodeHTTPResponse(t, response)
-	result := decodeToolResult(t, decoded)
-	if decoded.Error != nil || result.IsError {
-		observation, observationErr := observeCitationEnvelope(
-			capturedAsk.response)
-		projection, projectionErr := capturedAsk.response.EvidenceProjection()
-		_, canonicalErr := canonicalToolObservation(
-			context.Background(), observation, lastDecision)
-		t.Fatalf("MCP ask failed: %+v / %s; provider = %v; observation = %v; projection = %+v/%v; canonical = %v",
-			decoded.Error, result.StructuredContent,
-			capturedAsk.err, observationErr, projection, projectionErr,
-			errors.Join(canonicalErr, capturedSink.lastError))
-	}
 	var envelope webapi.CitationEnvelope
-	if err := json.Unmarshal(result.StructuredContent, &envelope); err != nil {
-		t.Fatal(err)
+	if surface == "mcp" {
+		session, _ := initializeHTTPWithWorkspace(
+			t, httpServer.Client(), httpServer.URL+"/mcp",
+			"ignored", workspaceHeader, "1")
+		assertEmptyBody(t, postHTTPMCPWithWorkspace(
+			t, httpServer.Client(), httpServer.URL+"/mcp", "ignored",
+			workspaceHeader, session, ProtocolVersion,
+			`{"jsonrpc":"2.0","method":"notifications/initialized"}`))
+		response := postHTTPMCPWithWorkspace(
+			t, httpServer.Client(), httpServer.URL+"/mcp", "ignored",
+			workspaceHeader, session, ProtocolVersion,
+			`{"jsonrpc":"2.0","id":"ask","method":"tools/call",`+
+				`"params":{"name":"shoal.ask","arguments":{`+
+				`"question":"Durable evidence","top_k":24}}}`)
+		decoded := decodeHTTPResponse(t, response)
+		result := decodeToolResult(t, decoded)
+		if failOperation != "" {
+			if decoded.Error != nil || !result.IsError ||
+				bytes.Contains(result.StructuredContent, []byte(chatAcceptanceAnswer)) {
+				t.Fatalf("unrecorded MCP output was not a structured tool failure: %+v / %s", decoded.Error, result.StructuredContent)
+			}
+			assertChatRecordingFailure(t, sink, generator)
+			return
+		}
+		if decoded.Error != nil || result.IsError {
+			observation, observationErr := observeCitationEnvelope(
+				capturedAsk.response)
+			projection, projectionErr := capturedAsk.response.EvidenceProjection()
+			_, canonicalErr := canonicalToolObservation(
+				context.Background(), observation, lastDecision)
+			t.Fatalf("MCP ask failed: %+v / %s; provider = %v; observation = %v; projection = %+v/%v; canonical = %v",
+				decoded.Error, result.StructuredContent,
+				capturedAsk.err, observationErr, projection, projectionErr,
+				errors.Join(canonicalErr, capturedSink.lastError))
+		}
+		if err := json.Unmarshal(result.StructuredContent, &envelope); err != nil {
+			t.Fatal(err)
+		}
+	} else {
+		path := "/api/v1/ask"
+		if surface == "stream" {
+			path = "/api/v1/chat/stream"
+		}
+		request, err := http.NewRequest(http.MethodPost, httpServer.URL+path,
+			strings.NewReader(`{"question":"Durable evidence","top_k":24}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set(webapi.WorkspaceIDHeader, workspaceHeader)
+		response, err := httpServer.Client().Do(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer response.Body.Close()
+		body, err := io.ReadAll(response.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if failOperation != "" {
+			if response.StatusCode == http.StatusOK ||
+				bytes.Contains(body, []byte(chatAcceptanceAnswer)) ||
+				bytes.Contains(body, []byte("event: complete")) ||
+				strings.Contains(response.Header.Get("Content-Type"), "text/event-stream") {
+				t.Fatalf("unrecorded %s output escaped: status=%d body=%s", surface, response.StatusCode, body)
+			}
+			assertChatRecordingFailure(t, sink, generator)
+			return
+		}
+		if response.StatusCode != http.StatusOK {
+			t.Fatalf("%s returned %d: %s", surface, response.StatusCode, body)
+		}
+		if surface == "stream" {
+			if response.Header.Get("Content-Type") != "text/event-stream" ||
+				!bytes.HasPrefix(body, []byte("event: complete\n")) ||
+				bytes.Count(body, []byte("event: ")) != 1 {
+				t.Fatalf("expected a single durably finalized SSE event: %s", body)
+			}
+			_, data, found := bytes.Cut(body, []byte("\ndata: "))
+			if !found {
+				t.Fatalf("SSE completion omitted structured data: %s", body)
+			}
+			body = bytes.TrimSpace(data)
+		}
+		if err := json.Unmarshal(body, &envelope); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if err := envelope.Validate(); err != nil {
 		t.Fatal(err)
+	}
+	if !envelope.Finalized || !envelope.DurablyRecorded ||
+		envelope.Verification != reasoning.VerificationVerified ||
+		envelope.WorkspaceSettingsID != settings.SettingsID || envelope.WorkspaceSettingsRevision != settings.Revision {
+		t.Fatalf("chat lost finalization or workspace binding: finalized=%v recorded=%v verification=%s settings=%s/%d",
+			envelope.Finalized, envelope.DurablyRecorded, envelope.Verification,
+			envelope.WorkspaceSettingsID, envelope.WorkspaceSettingsRevision)
+	}
+	if envelope.OutputVisibility == "" || envelope.OutputVisibility == "public" ||
+		envelope.OutputVisibility != interaction.Expression(envelope.EffectiveVisibility) {
+		t.Fatalf("chat lost settings-defined output restriction: %q", envelope.OutputVisibility)
+	}
+	citedDocuments := make(map[shoal.ID]bool)
+	for _, evidence := range envelope.Evidence {
+		if evidence.Citation != nil && evidence.Use == reasoning.EvidenceCited {
+			if evidence.Status != reasoning.VerificationVerified || evidence.SourceURI == "" {
+				t.Fatalf("citation lost verification or source link: %+v", evidence)
+			}
+			citedDocuments[evidence.Citation.DocumentID] = true
+		}
+	}
+	if len(citedDocuments) != documentCount {
+		t.Fatalf("cited document set was truncated: got %d, want %d", len(citedDocuments), documentCount)
 	}
 
 	readDecision := workspaceHTTPDecision(t, "ask-read")
@@ -600,8 +728,12 @@ func TestHTTPAskAdapterUsesSharedChatAndPersistsCompleteEvidence(t *testing.T) {
 	}
 	operations := make(map[interaction.Operation]int)
 	var outcome interaction.Session
+	var chatSession interaction.Session
 	for _, record := range records {
 		operations[record.Session.Operation]++
+		if record.Session.Operation == interaction.OperationChat {
+			chatSession = record.Session
+		}
 		if record.Session.Operation == interaction.OperationToolCall &&
 			record.Session.StopReason == "succeeded" &&
 			len(record.Session.Turns) == 1 &&
@@ -612,8 +744,23 @@ func TestHTTPAskAdapterUsesSharedChatAndPersistsCompleteEvidence(t *testing.T) {
 	}
 	if operations[interaction.OperationRetrieval] == 0 ||
 		operations[interaction.OperationChat] != 1 ||
-		outcome.ID == "" {
+		operations[interaction.OperationInference] != 1 ||
+		(surface == "mcp" && outcome.ID == "") {
 		t.Fatalf("recorded MCP/chat operations = %+v", operations)
+	}
+	if chatSession.ID != envelope.SessionID ||
+		chatSession.AuthorizationFingerprint != envelope.AuthorizationFingerprint ||
+		chatSession.Actor.SubjectID != "workspace-user" ||
+		!reflect.DeepEqual(chatSession.CitedNodeIDs, envelope.CitedSourceIDs) {
+		t.Fatalf("durable chat lost response identity, authority, or citations: %+v", chatSession)
+	}
+	if interaction.Expression(chatSession.RequiredVisibility) != envelope.OutputVisibility {
+		t.Fatalf("durable chat lost the settings-defined output label: %q != %q",
+			interaction.Expression(chatSession.RequiredVisibility), envelope.OutputVisibility)
+	}
+	assertWorkspaceChatProvenance(t, httpServer, workspaceHeader, envelope)
+	if surface != "mcp" {
+		return
 	}
 	if len(outcome.Turns[0].ToolCall.RetrievedEvidence) == 0 ||
 		len(outcome.CitedNodeIDs) != len(envelope.CitedSourceIDs) ||

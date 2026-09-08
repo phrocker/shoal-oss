@@ -494,8 +494,11 @@ func canonicalToolObservation(
 				return ToolObservation{}, policyErr
 			}
 			if len(policy) > 0 {
-				requiredVisibility = append(
-					requiredVisibility, string(policy))
+				labels, err := interaction.ParseVisibility(string(policy))
+				if err != nil {
+					return ToolObservation{}, err
+				}
+				requiredVisibility = append(requiredVisibility, labels...)
 			}
 		}
 	}
@@ -656,5 +659,8 @@ func canonicalObservedIDs(ids []shoal.ID) []shoal.ID {
 		seen[id] = struct{}{}
 		result = append(result, id)
 	}
+	sort.Slice(result, func(i, j int) bool {
+		return shoal.CompareID(result[i], result[j]) < 0
+	})
 	return result
 }

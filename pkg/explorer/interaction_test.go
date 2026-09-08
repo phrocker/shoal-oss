@@ -443,6 +443,122 @@ func TestGenericRecorderSurvivesRestartAndStaysSourceOnly(t *testing.T) {
 
 }
 
+func TestInteractionLifecyclePreservesPinnedSourceReads(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	corpus, restricted, open := foldedCorpus(t, dir)
+	t.Cleanup(func() { _ = corpus.Close() })
+	snapshot, err := corpus.Snapshot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Like ExplorerToolHost, pin the current frontier separately: embedded
+	// Retrieve deliberately does not implement historical Request.AsOf reads.
+	requests := []retrieval.Request{
+		{
+			Text: "retry budget exhausted", TopK: 50,
+			Modes: []retrieval.Mode{retrieval.ModeLexical},
+		},
+		{
+			Text: "retry budget exhausted", TopK: 50,
+			Modes: []retrieval.Mode{
+				retrieval.ModeLexical, retrieval.ModeTree, retrieval.ModeGraph,
+			},
+		},
+	}
+	baseline := make([]retrieval.Response, len(requests))
+	for i, request := range requests {
+		baseline[i], err = corpus.Retrieve(ctx, request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(baseline[i].Results) == 0 {
+			t.Fatalf("baseline modes %v returned no source evidence", request.Modes)
+		}
+	}
+	assertPinnedReads := func(stage string) {
+		t.Helper()
+		current, err := corpus.Snapshot(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if current != snapshot {
+			t.Fatalf("%s moved the content snapshot: %+v != %+v",
+				stage, current, snapshot)
+		}
+		if err := corpus.ValidateSnapshot(
+			ctx, shoal.ID(snapshot.ID), snapshot.AsOf,
+			[]shoal.ID{restricted[0], open[0]},
+		); err != nil {
+			t.Fatalf("%s invalidated pinned source evidence: %v", stage, err)
+		}
+		for i, request := range requests {
+			got, err := corpus.Retrieve(ctx, request)
+			if err != nil {
+				t.Fatalf("%s modes %v: %v", stage, request.Modes, err)
+			}
+			if !reflect.DeepEqual(got, baseline[i]) {
+				t.Fatalf("%s changed pinned source response for modes %v:\ngot %+v\nwant %+v",
+					stage, request.Modes, got, baseline[i])
+			}
+			for _, result := range got.Results {
+				if interaction.IsInteractionID(result.ID) {
+					t.Fatalf("%s returned derived result %q", stage, result.ID)
+				}
+				for _, evidence := range result.Evidence {
+					assertNoInteractionNodes(
+						t, stage, evidence.Path.Nodes, evidence.Path.Edges)
+				}
+			}
+		}
+	}
+	reopen := func() {
+		t.Helper()
+		if err := corpus.Close(); err != nil {
+			t.Fatal(err)
+		}
+		reopened, err := explorer.Open(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		corpus = reopened
+	}
+
+	recorder, err := interaction.NewRecorder(ctx, corpus)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := recorder.Record(ctx, interaction.Session{
+		ID:                       "interaction.session_pinned-lifecycle",
+		Operation:                interaction.OperationRetrieval,
+		SnapshotID:               shoal.ID(snapshot.ID),
+		SnapshotAsOf:             snapshot.AsOf,
+		AuthorizationFingerprint: "auth-sha256:pinned-lifecycle",
+		AuthorizationExpiresAt:   snapshot.AsOf.Add(time.Hour),
+		SeedNodeIDs:              []shoal.ID{restricted[0], open[0]},
+		CitedNodeIDs:             []shoal.ID{open[0]},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertPinnedReads("capture")
+	fold := foldOf(t, corpus, session.ID)
+	assertPinnedReads("fold")
+	reopen()
+	assertPinnedReads("reopened fold")
+
+	if _, err := corpus.DeleteFold(ctx, fold.FoldID); err != nil {
+		t.Fatal(err)
+	}
+	assertPinnedReads("fold tombstone")
+	if _, err := corpus.DeleteInteraction(ctx, session.ID); err != nil {
+		t.Fatal(err)
+	}
+	assertPinnedReads("session tombstone")
+	reopen()
+	assertPinnedReads("reopened tombstones")
+}
+
 func TestRequiredVisibilitySurvivesRestart(t *testing.T) {
 	ctx := context.Background()
 	dataDir := t.TempDir()
