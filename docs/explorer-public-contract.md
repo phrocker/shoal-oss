@@ -165,8 +165,9 @@ one compact vertex that can later be unfolded back into what it replaced.
   retrieved as well as cited. Summarizing can therefore only narrow visibility,
   never widen it. That is precisely why publishing a redacted public summary
   must be a separate, explicit, reviewed action; **no declassification
-  primitive exists**, and the authority model it would need is still open in
-  issue #128.
+  primitive exists**. The declassification workflow and its authority model
+  remain deferred; issue #128 tracks deployment coordination authority, not
+  declassification.
 - Fold identity is content-addressed over the canonical folded provenance and
   the summary digest. The same input always folds to the same vertex, so
   refolding is idempotent rather than a conflict. Neither the fold time nor the
