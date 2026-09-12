@@ -293,15 +293,19 @@ func (e *Engine) ExportRFiles(ctx context.Context, tableName string, dst storage
 	}
 
 	e.mu.RLock()
-	tbl, ok := e.tables[tableName]
-	var configuredFormat tablet.FileFormat
-	if ok {
-		configuredFormat = tbl.fileFormat()
+	if err := e.requireAuthorityLocked(); err != nil {
+		e.mu.RUnlock()
+		return nil, err
 	}
-	e.mu.RUnlock()
+	tbl, ok := e.tables[tableName]
 	if !ok {
+		e.mu.RUnlock()
 		return nil, fmt.Errorf("engine: table %q not found", tableName)
 	}
+	tbl.formatMu.RLock()
+	e.mu.RUnlock()
+	defer tbl.formatMu.RUnlock()
+	configuredFormat := tbl.format
 
 	files := tbl.rfiles()
 	compatibility := exportCompatibility(files)
@@ -959,6 +963,12 @@ func (r *verificationReaderAt) firstError() error {
 // per-cell tenant visibility stamps providing isolation; see
 // RFileExportOptions.StampVisibilityLabel).
 func (e *Engine) ImportRFileManifest(ctx context.Context, manifest *RFileExportManifest) (err error) {
+	e.mu.RLock()
+	if authorityErr := e.requireAuthorityLocked(); authorityErr != nil {
+		e.mu.RUnlock()
+		return authorityErr
+	}
+	e.mu.RUnlock()
 	if manifest == nil {
 		return errors.New("engine: nil RFile import manifest")
 	}
@@ -986,6 +996,16 @@ func (e *Engine) ImportRFileManifest(ctx context.Context, manifest *RFileExportM
 			err = rollback.cleanup(err)
 		}
 	}()
+	filesByTablet := make(map[int][]string)
+	for _, file := range stagedFiles {
+		filesByTablet[file.TabletIndex] = append(filesByTablet[file.TabletIndex], file.DestinationPath)
+	}
+
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if err := e.requireAuthorityLocked(); err != nil {
+		return err
+	}
 	tableDir := filepath.Join(e.dir, manifest.SourceTable)
 	for _, tb := range manifest.Tablets {
 		if err := os.MkdirAll(filepath.Join(tableDir, fmt.Sprintf("t-%04d", tb.Index)), 0o755); err != nil {
@@ -997,13 +1017,6 @@ func (e *Engine) ImportRFileManifest(ctx context.Context, manifest *RFileExportM
 			return fmt.Errorf("engine: mkdir imported tablet: %w", err)
 		}
 	}
-	filesByTablet := make(map[int][]string)
-	for _, file := range stagedFiles {
-		filesByTablet[file.TabletIndex] = append(filesByTablet[file.TabletIndex], file.DestinationPath)
-	}
-
-	e.mu.Lock()
-	defer e.mu.Unlock()
 	if existing, exists := e.tables[manifest.SourceTable]; exists {
 		if len(splits) != len(existing.splits) {
 			return fmt.Errorf("engine: cannot merge import for table %q: manifest has %d tablet(s), open table has %d (divergent splits unsupported)",

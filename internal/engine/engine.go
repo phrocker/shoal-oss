@@ -50,6 +50,7 @@ import (
 	"time"
 
 	"github.com/phrocker/shoal-oss/internal/cclient"
+	"github.com/phrocker/shoal-oss/internal/coordination"
 	"github.com/phrocker/shoal-oss/internal/embeddingspace"
 	"github.com/phrocker/shoal-oss/internal/iterrt"
 	"github.com/phrocker/shoal-oss/internal/localwal"
@@ -70,6 +71,9 @@ type Engine struct {
 	walSyncMode     localwal.SyncMode
 	walSyncInterval time.Duration
 	backend         storage.Backend
+	authority       coordination.Lease
+	authoritySource coordination.Validator
+	closed          bool
 
 	metrics engineCounters
 
@@ -133,6 +137,20 @@ func Open(dir string, opts Options) (*Engine, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("engine: mkdir %s: %w", dir, err)
 	}
+	authoritySource, err := coordination.NewEmbeddedCoordinator(dir, "")
+	if err != nil {
+		return nil, fmt.Errorf("engine: configure authority: %w", err)
+	}
+	authority, err := authoritySource.Acquire(context.Background(), "engine")
+	if err != nil {
+		return nil, fmt.Errorf("engine: acquire authority: %w", err)
+	}
+	releaseAuthority := true
+	defer func() {
+		if releaseAuthority {
+			_ = authority.Release(context.Background())
+		}
+	}()
 	backend := opts.Backend
 	if backend == nil {
 		backend = local.New()
@@ -149,6 +167,8 @@ func Open(dir string, opts Options) (*Engine, error) {
 		walSyncMode:     opts.WALSyncMode,
 		walSyncInterval: opts.WALSyncInterval,
 		backend:         backend,
+		authority:       authority,
+		authoritySource: authoritySource,
 	}
 
 	// Discover existing tables (each subdirectory is a table)
@@ -166,6 +186,7 @@ func Open(dir string, opts Options) (*Engine, error) {
 			eng.tables[e.Name()] = tbl
 		}
 	}
+	releaseAuthority = false
 	return eng, nil
 }
 
@@ -174,6 +195,9 @@ func Open(dir string, opts Options) (*Engine, error) {
 func (e *Engine) CreateTable(name string, opts TableOptions) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	if err := e.requireAuthorityLocked(); err != nil {
+		return err
+	}
 
 	if _, exists := e.tables[name]; exists {
 		return fmt.Errorf("engine: table %q already exists", name)
@@ -203,8 +227,11 @@ func (e *Engine) CreateTable(name string, opts TableOptions) error {
 // the correct tablet based on the table's SplitPolicy.
 func (e *Engine) Write(table string, mutations []*cclient.Mutation) error {
 	e.mu.RLock()
+	defer e.mu.RUnlock()
+	if err := e.requireAuthorityLocked(); err != nil {
+		return err
+	}
 	tbl, ok := e.tables[table]
-	e.mu.RUnlock()
 	if !ok {
 		return fmt.Errorf("engine: table %q not found", table)
 	}
@@ -249,8 +276,11 @@ func (e *Engine) ConditionalWrite(table string, mutations []ConditionalMutation)
 		}
 	}
 	e.mu.RLock()
+	defer e.mu.RUnlock()
+	if err := e.requireAuthorityLocked(); err != nil {
+		return nil, err
+	}
 	tbl, ok := e.tables[table]
-	e.mu.RUnlock()
 	if !ok {
 		return nil, fmt.Errorf("engine: table %q not found", table)
 	}
@@ -319,6 +349,9 @@ func (e *Engine) SetTableStorageFormat(tableName string, format StorageFormat) e
 	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	if err := e.requireAuthorityLocked(); err != nil {
+		return err
+	}
 	tbl, ok := e.tables[tableName]
 	if !ok {
 		return fmt.Errorf("engine: table %q not found", tableName)
@@ -328,8 +361,11 @@ func (e *Engine) SetTableStorageFormat(tableName string, format StorageFormat) e
 
 func (e *Engine) SetTableTargetEmbeddingSpace(tableName, identity string) error {
 	e.mu.RLock()
+	defer e.mu.RUnlock()
+	if err := e.requireAuthorityLocked(); err != nil {
+		return err
+	}
 	tbl, ok := e.tables[tableName]
-	e.mu.RUnlock()
 	if !ok {
 		return fmt.Errorf("engine: table %q not found", tableName)
 	}
@@ -352,8 +388,11 @@ func (e *Engine) SetTableDefaultEmbedding(
 	tableName string, state embeddingspace.FileState,
 ) error {
 	e.mu.RLock()
+	defer e.mu.RUnlock()
+	if err := e.requireAuthorityLocked(); err != nil {
+		return err
+	}
 	tbl, ok := e.tables[tableName]
-	e.mu.RUnlock()
 	if !ok {
 		return fmt.Errorf("engine: table %q not found", tableName)
 	}
@@ -430,8 +469,11 @@ func (e *Engine) MigrateTableStorageFormat(tableName string, format StorageForma
 		return err
 	}
 	e.mu.RLock()
+	defer e.mu.RUnlock()
+	if err := e.requireAuthorityLocked(); err != nil {
+		return err
+	}
 	tbl, ok := e.tables[tableName]
-	e.mu.RUnlock()
 	if !ok {
 		return fmt.Errorf("engine: table %q not found", tableName)
 	}
@@ -571,8 +613,11 @@ func (e *Engine) Neighbors(tableName string, rows [][]byte, edgeCF []byte, opts 
 // Flush forces all memtables in the named table to disk.
 func (e *Engine) Flush(table string) error {
 	e.mu.RLock()
+	defer e.mu.RUnlock()
+	if err := e.requireAuthorityLocked(); err != nil {
+		return err
+	}
 	tbl, ok := e.tables[table]
-	e.mu.RUnlock()
 	if !ok {
 		return fmt.Errorf("engine: table %q not found", table)
 	}
@@ -588,8 +633,11 @@ func (e *Engine) Flush(table string) error {
 // (decay, prune, dedup) run.
 func (e *Engine) Compact(table string, stack []iterrt.IterSpec) error {
 	e.mu.RLock()
+	defer e.mu.RUnlock()
+	if err := e.requireAuthorityLocked(); err != nil {
+		return err
+	}
 	tbl, ok := e.tables[table]
-	e.mu.RUnlock()
 	if !ok {
 		return fmt.Errorf("engine: table %q not found", table)
 	}
@@ -664,13 +712,49 @@ func (e *Engine) Metrics() Metrics {
 func (e *Engine) Close() error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	if e.closed {
+		return nil
+	}
+	e.closed = true
 	var firstErr error
 	for name, tbl := range e.tables {
 		if err := tbl.close(); err != nil && firstErr == nil {
 			firstErr = fmt.Errorf("engine: close table %s: %w", name, err)
 		}
 	}
-	return firstErr
+	return errors.Join(firstErr, e.authority.Release(context.Background()))
+}
+
+// AuthorityToken returns immutable proof of this engine process's current
+// embedded authority tenure.
+func (e *Engine) AuthorityToken() coordination.AuthorityToken {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	if e.authority == nil {
+		return coordination.AuthorityToken{}
+	}
+	return e.authority.Token()
+}
+
+// ValidateAuthority rejects work stamped by an earlier engine process or
+// authority generation.
+func (e *Engine) ValidateAuthority(ctx context.Context, token coordination.AuthorityToken) error {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	if e.closed || e.authoritySource == nil {
+		return coordination.ErrLeaseLost
+	}
+	return e.authoritySource.Validate(ctx, token)
+}
+
+func (e *Engine) requireAuthorityLocked() error {
+	if e.closed || e.authority == nil {
+		return coordination.ErrLeaseLost
+	}
+	if err := e.authority.Renew(context.Background()); err != nil {
+		return fmt.Errorf("engine: authority: %w", err)
+	}
+	return nil
 }
 
 // Scanner is a pull-based iterator over scan results from one or more

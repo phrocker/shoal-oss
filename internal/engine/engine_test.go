@@ -26,12 +26,50 @@ import (
 	"testing"
 
 	"github.com/phrocker/shoal-oss/internal/cclient"
+	"github.com/phrocker/shoal-oss/internal/coordination"
 	"github.com/phrocker/shoal-oss/internal/engine"
 	"github.com/phrocker/shoal-oss/internal/iterrt"
 	"github.com/phrocker/shoal-oss/internal/storage"
 	"github.com/phrocker/shoal-oss/internal/storage/memory"
 	"github.com/phrocker/shoal-oss/internal/tablet"
 )
+
+func TestEngineEmbeddedAuthorityFencesConcurrentAndStaleProcesses(t *testing.T) {
+	dir := t.TempDir()
+	first, err := engine.Open(dir, engine.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstToken := first.AuthorityToken()
+	if err := firstToken.Validate(); err != nil {
+		t.Fatalf("authority token: %v", err)
+	}
+	if _, err := engine.Open(dir, engine.Options{}); err == nil {
+		t.Fatal("concurrent engine open succeeded")
+	}
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := first.Write("graph", nil); !errors.Is(err, coordination.ErrLeaseLost) {
+		t.Fatalf("write after authority release = %v, want ErrLeaseLost", err)
+	}
+
+	second, err := engine.Open(dir, engine.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+	secondToken := second.AuthorityToken()
+	if secondToken.Generation <= firstToken.Generation {
+		t.Fatalf("restart generation = %d, want > %d", secondToken.Generation, firstToken.Generation)
+	}
+	if err := second.ValidateAuthority(context.Background(), firstToken); !errors.Is(err, coordination.ErrStaleToken) {
+		t.Fatalf("old token validation = %v, want ErrStaleToken", err)
+	}
+	if err := second.ValidateAuthority(context.Background(), secondToken); err != nil {
+		t.Fatalf("current token validation: %v", err)
+	}
+}
 
 type removeFailBackend struct {
 	*memory.Backend
