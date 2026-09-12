@@ -80,11 +80,7 @@ func (f *fakeAuthority) FenceDestination(_ context.Context, intent *Intent) (Aut
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.fences++
-	return AuthorityToken{
-		Domain: "accumulo", Resource: "table/42", Owner: "manager-a",
-		LeaseID: "manager-lock-2", Epoch: intent.SourceAuthority.Epoch + 1,
-		Generation: "lock-2", Attempt: "attempt-2",
-	}, "42", nil
+	return AuthorityToken{Domain: "accumulo", Epoch: intent.SourceAuthority.Epoch + 1, Generation: "lock-2", Attempt: "attempt-2"}, "42", nil
 }
 func (f *fakeAuthority) FreezeSource(context.Context, *Intent) (string, error) {
 	f.mu.Lock()
@@ -133,11 +129,7 @@ func durableFixture(t *testing.T, mode Mode) (*Machine, Request, *fakeDurablePro
 	}
 	req := Request{
 		Mode: mode, ProducerID: "agent-a", SourceGeneration: 7,
-		SourceAuthority: AuthorityToken{
-			Domain: "embedded", Resource: "table/events", Owner: "writer-a",
-			LeaseID: "local-lock-7", Epoch: 4, Generation: "manifest-7",
-			Attempt: "writer-a",
-		},
+		SourceAuthority:  AuthorityToken{Domain: "embedded", Epoch: 4, Generation: "manifest-7", Attempt: "writer-a"},
 		DestinationTable: "events", Manifest: manifest,
 	}
 	if mode == ModeFanIn {

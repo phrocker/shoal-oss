@@ -293,18 +293,19 @@ func (e *Engine) ExportRFiles(ctx context.Context, tableName string, dst storage
 	}
 
 	e.mu.RLock()
-	defer e.mu.RUnlock()
 	if err := e.requireAuthorityLocked(); err != nil {
+		e.mu.RUnlock()
 		return nil, err
 	}
 	tbl, ok := e.tables[tableName]
-	var configuredFormat tablet.FileFormat
-	if ok {
-		configuredFormat = tbl.fileFormat()
-	}
 	if !ok {
+		e.mu.RUnlock()
 		return nil, fmt.Errorf("engine: table %q not found", tableName)
 	}
+	tbl.formatMu.RLock()
+	e.mu.RUnlock()
+	defer tbl.formatMu.RUnlock()
+	configuredFormat := tbl.format
 
 	files := tbl.rfiles()
 	compatibility := exportCompatibility(files)

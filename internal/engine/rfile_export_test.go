@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/phrocker/shoal-oss/internal/cclient"
 	"github.com/phrocker/shoal-oss/internal/iterrt"
@@ -30,6 +31,30 @@ type exportSourceBackend struct{}
 
 func (exportSourceBackend) Open(context.Context, string) (storage.File, error) {
 	return exportFailingFile{}, nil
+}
+
+type blockingExportBackend struct {
+	*memory.Backend
+	started     chan struct{}
+	release     chan struct{}
+	startOnce   sync.Once
+	releaseOnce sync.Once
+}
+
+func (b *blockingExportBackend) Open(ctx context.Context, path string) (storage.File, error) {
+	if strings.HasSuffix(path, ".rf") {
+		b.startOnce.Do(func() { close(b.started) })
+		select {
+		case <-b.release:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	return b.Backend.Open(ctx, path)
+}
+
+func (b *blockingExportBackend) unblock() {
+	b.releaseOnce.Do(func() { close(b.release) })
 }
 
 type committedImportBackend struct {
@@ -110,6 +135,72 @@ func TestCopyWithSHA256AbortsDestinationOnReadFailure(t *testing.T) {
 	}
 	if writer.closed {
 		t.Fatal("failed export closed and could have committed destination")
+	}
+}
+
+func TestExportSerializesWithCompaction(t *testing.T) {
+	backend := &blockingExportBackend{
+		Backend: memory.New(),
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	t.Cleanup(backend.unblock)
+	eng, err := Open(t.TempDir(), Options{Backend: backend})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close()
+	if err := eng.CreateTable("graph", TableOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	mutation, err := cclient.NewMutation([]byte("row"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	mutation.PutLatest([]byte("cf"), []byte("cq"), nil, []byte("value"))
+	if err := eng.Write("graph", []*cclient.Mutation{mutation}); err != nil {
+		t.Fatal(err)
+	}
+
+	exportDone := make(chan error, 1)
+	go func() {
+		_, err := eng.ExportRFiles(context.Background(), "graph", memory.New(), RFileExportOptions{
+			DestinationRoot: "export",
+		})
+		exportDone <- err
+	}()
+	select {
+	case <-backend.started:
+	case <-time.After(time.Second):
+		t.Fatal("export did not begin reading its immutable snapshot")
+	}
+	if err := eng.CreateTable("other", TableOptions{}); err != nil {
+		t.Fatalf("create unrelated table during export: %v", err)
+	}
+
+	compactDone := make(chan error, 1)
+	go func() { compactDone <- eng.Compact("graph", nil) }()
+	select {
+	case err := <-compactDone:
+		t.Fatalf("compaction completed during export: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	otherMutation, err := cclient.NewMutation([]byte("other-row"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherMutation.PutLatest([]byte("cf"), []byte("cq"), nil, []byte("value"))
+	if err := eng.Write("other", []*cclient.Mutation{otherMutation}); err != nil {
+		t.Fatalf("write to unrelated table while compaction waited: %v", err)
+	}
+
+	backend.unblock()
+	if err := <-exportDone; err != nil {
+		t.Fatalf("export: %v", err)
+	}
+	if err := <-compactDone; err != nil {
+		t.Fatalf("compact: %v", err)
 	}
 }
 

@@ -168,7 +168,11 @@ Shoal must not make a coordination service carry data-plane load.
 The process acquires exclusive OS/PVC ownership before opening a writable
 engine. Every durable manifest replacement increments a generation with atomic
 replacement or backend compare-and-swap. A second process cannot open the same
-writer domain merely because it can read the files.
+writer domain merely because it can read the files. The held OS lock is the
+live lease; the manifest is durable fencing state validated while acquiring or
+advancing authority, not a second lease polled on every mutation. The lock and
+manifest paths are coordinator-owned, and out-of-band removal or replacement is
+storage corruption rather than a handoff mechanism.
 
 ### 5.2 Shoal-only Kubernetes
 
@@ -321,8 +325,8 @@ tests are part of the deliverable.
   `internal/coordination` defines authority, membership, lease, watch, and
   validation interfaces; the embedded engine holds an OS/PVC lock and persists
   a monotonic manifest generation. The shared conformance suite covers
-  acquisition, renewal, loss, stale tokens, duplicate release, restart, and
-  epoch advancement.
+  acquisition, renewal, stale tokens, duplicate release, restart, and epoch
+  advancement; embedded fault tests additionally cover authority loss.
 - [x] **Phase 2 — Accumulo authority.** The tserver ServiceLock lifecycle,
   compatible descriptors, generation-bound assignment attempts, session-loss
   shutdown, and stale-generation rejection are implemented and tested under

@@ -238,9 +238,7 @@ func (c *EmbeddedCoordinator) Validate(ctx context.Context, token AuthorityToken
 	if c.current == nil || !c.current.active || c.current.token != token {
 		return ErrStaleToken
 	}
-	c.current.mu.Lock()
-	defer c.current.mu.Unlock()
-	return c.current.validateCurrentLocked()
+	return nil
 }
 
 func (c *EmbeddedCoordinator) publishLocked(event Event) {
@@ -278,11 +276,14 @@ func (l *embeddedLease) Renew(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	l.coordinator.mu.Lock()
-	defer l.coordinator.mu.Unlock()
+	// The held OS lock is the live lease. The manifest is durable fencing state
+	// and is revalidated only while acquiring or advancing that fence.
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	return l.validateCurrentLocked()
+	if !l.active {
+		return ErrLeaseLost
+	}
+	return nil
 }
 
 func (l *embeddedLease) AdvanceEpoch(ctx context.Context, next uint64) (AuthorityToken, error) {
@@ -354,20 +355,6 @@ func (l *embeddedLease) Release(ctx context.Context) error {
 	}
 	lockErr := l.loseLocked(EventReleased)
 	return errors.Join(persistErr, lockErr)
-}
-
-func (l *embeddedLease) validateCurrentLocked() error {
-	if !l.active || l.coordinator.current != l {
-		return ErrLeaseLost
-	}
-	current, found, err := readEmbeddedManifest(l.coordinator.directory)
-	if err != nil {
-		return errors.Join(ErrLeaseLost, err, l.loseLocked(EventLost))
-	}
-	if !found || !current.Active || current.token() != l.token {
-		return errors.Join(ErrLeaseLost, l.loseLocked(EventLost))
-	}
-	return nil
 }
 
 func (l *embeddedLease) loseLocked(kind EventKind) error {

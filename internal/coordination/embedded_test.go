@@ -62,7 +62,7 @@ func TestEmbeddedCoordinatorRejectsConcurrentProcessAuthority(t *testing.T) {
 	}
 }
 
-func TestEmbeddedCoordinatorLosesAuthorityWhenManifestChanges(t *testing.T) {
+func TestEmbeddedCoordinatorEpochAdvanceFailsClosedWhenManifestChanges(t *testing.T) {
 	directory := t.TempDir()
 	first, err := coordination.NewEmbeddedCoordinator(directory, "owner-a")
 	if err != nil {
@@ -83,8 +83,9 @@ func TestEmbeddedCoordinatorLosesAuthorityWhenManifestChanges(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := lease.Renew(context.Background()); !errors.Is(err, coordination.ErrLeaseLost) {
-		t.Fatalf("renew after manifest change = %v, want ErrLeaseLost", err)
+	epochLease := lease.(coordination.EpochLease)
+	if _, err := epochLease.AdvanceEpoch(context.Background(), token.Epoch+1); !errors.Is(err, coordination.ErrLeaseLost) {
+		t.Fatalf("advance after manifest change = %v, want ErrLeaseLost", err)
 	}
 	select {
 	case <-lease.Lost():
