@@ -45,13 +45,17 @@ const (
 
 type AuthorityToken struct {
 	Domain     string `json:"domain"`
+	Resource   string `json:"resource"`
+	Owner      string `json:"owner"`
+	LeaseID    string `json:"lease_id"`
 	Epoch      uint64 `json:"epoch"`
 	Generation string `json:"generation"`
 	Attempt    string `json:"attempt"`
 }
 
 func (t AuthorityToken) validate(name string) error {
-	if t.Domain == "" || t.Epoch == 0 || t.Generation == "" || t.Attempt == "" {
+	if t.Domain == "" || t.Resource == "" || t.Owner == "" || t.LeaseID == "" ||
+		t.Epoch == 0 || t.Generation == "" || t.Attempt == "" {
 		return fmt.Errorf("promotion: incomplete %s authority token", name)
 	}
 	return nil
@@ -458,8 +462,10 @@ func deterministicIntentID(req Request, manifestHash string) string {
 	raw := strings.Join([]string{
 		string(req.Mode), req.ParentPromotionID, req.ProducerID,
 		fmt.Sprint(req.SourceGeneration), req.Manifest.SourceTable, manifestHash,
-		req.SourceAuthority.Domain, fmt.Sprint(req.SourceAuthority.Epoch),
-		req.SourceAuthority.Generation, req.DestinationTable,
+		req.SourceAuthority.Domain, req.SourceAuthority.Resource,
+		req.SourceAuthority.Owner, req.SourceAuthority.LeaseID,
+		fmt.Sprint(req.SourceAuthority.Epoch), req.SourceAuthority.Generation,
+		req.SourceAuthority.Attempt, req.DestinationTable,
 	}, "\x00")
 	sum := sha256.Sum256([]byte(raw))
 	return hex.EncodeToString(sum[:16])

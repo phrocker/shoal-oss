@@ -86,12 +86,15 @@ func (e *Engine) ExportRFilesIncremental(ctx context.Context, tableName string, 
 	}
 
 	e.mu.RLock()
+	defer e.mu.RUnlock()
+	if err := e.requireAuthorityLocked(); err != nil {
+		return nil, err
+	}
 	tbl, ok := e.tables[tableName]
 	var configuredFormat tablet.FileFormat
 	if ok {
 		configuredFormat = tbl.fileFormat()
 	}
-	e.mu.RUnlock()
 	if !ok {
 		return nil, fmt.Errorf("engine: table %q not found", tableName)
 	}
