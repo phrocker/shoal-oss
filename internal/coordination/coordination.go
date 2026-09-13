@@ -75,6 +75,9 @@ const (
 	EventFenced   EventKind = "fenced"
 	EventReleased EventKind = "released"
 	EventLost     EventKind = "lost"
+	// EventResync indicates that intermediate events were coalesced. Observers
+	// must call Members to obtain the current authoritative state.
+	EventResync EventKind = "resync"
 )
 
 type Event struct {

@@ -187,6 +187,51 @@ func TestEmbeddedCoordinatorWatchRetainsTerminalEventForSlowConsumer(t *testing.
 	assertWatchKind(t, events, coordination.EventReleased)
 }
 
+func TestEmbeddedCoordinatorWatchSignalsResyncOnOverflow(t *testing.T) {
+	coordinator, err := coordination.NewEmbeddedCoordinator(t.TempDir(), "owner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	events, err := coordinator.Watch(ctx, "table/graph")
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, err := coordinator.Acquire(context.Background(), "table/graph")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lease.Release(context.Background())
+	epochLease := lease.(coordination.EpochLease)
+	token := lease.Token()
+	for range 80 {
+		token, err = epochLease.AdvanceEpoch(context.Background(), token.Epoch+1)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	for {
+		select {
+		case event := <-events:
+			if event.Kind != coordination.EventResync {
+				continue
+			}
+			members, err := coordinator.Members(context.Background(), "table/graph")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(members) != 1 || members[0].Token != token {
+				t.Fatalf("members after resync = %+v, want current token %+v", members, token)
+			}
+			return
+		case <-time.After(time.Second):
+			t.Fatal("timed out waiting for resync event")
+		}
+	}
+}
+
 func assertWatchKind(t *testing.T, events <-chan coordination.Event, want coordination.EventKind) {
 	t.Helper()
 	select {

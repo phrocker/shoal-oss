@@ -41,6 +41,7 @@ const (
 	embeddedManifestFile = ".shoal-authority.json"
 	embeddedManifestSize = 64 << 10
 	embeddedVersion      = 1
+	embeddedWatchQueue   = 64
 )
 
 type embeddedManifest struct {
@@ -244,7 +245,14 @@ func (c *EmbeddedCoordinator) publishLocked(event Event) {
 		if watcher.resource != event.Member.Token.Resource {
 			continue
 		}
-		watcher.pending = append(watcher.pending, event)
+		if len(watcher.pending) >= embeddedWatchQueue {
+			watcher.pending = []Event{{
+				Kind:   EventResync,
+				Member: event.Member,
+			}}
+		} else {
+			watcher.pending = append(watcher.pending, event)
+		}
 		select {
 		case watcher.wake <- struct{}{}:
 		default:
@@ -273,7 +281,12 @@ func (c *EmbeddedCoordinator) deliverWatcher(
 			continue
 		}
 		event := watcher.pending[0]
-		watcher.pending = watcher.pending[1:]
+		watcher.pending[0] = Event{}
+		if len(watcher.pending) == 1 {
+			watcher.pending = nil
+		} else {
+			watcher.pending = watcher.pending[1:]
+		}
 		c.mu.Unlock()
 
 		select {
