@@ -730,7 +730,7 @@ func (e *Engine) Close() error {
 func (e *Engine) AuthorityToken() coordination.AuthorityToken {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
-	if e.authority == nil {
+	if e.closed || e.authority == nil {
 		return coordination.AuthorityToken{}
 	}
 	return e.authority.Token()

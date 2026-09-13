@@ -76,13 +76,15 @@ type EmbeddedCoordinator struct {
 
 	mu          sync.Mutex
 	current     *embeddedLease
-	watchers    map[uint64]embeddedWatcher
+	watchers    map[uint64]*embeddedWatcher
 	nextWatcher uint64
 }
 
 type embeddedWatcher struct {
 	resource string
 	events   chan Event
+	pending  []Event
+	wake     chan struct{}
 }
 
 func NewEmbeddedCoordinator(directory, owner string) (*EmbeddedCoordinator, error) {
@@ -102,7 +104,7 @@ func NewEmbeddedCoordinator(directory, owner string) (*EmbeddedCoordinator, erro
 	return &EmbeddedCoordinator{
 		directory: filepath.Clean(canonical),
 		owner:     owner,
-		watchers:  make(map[uint64]embeddedWatcher),
+		watchers:  make(map[uint64]*embeddedWatcher),
 	}, nil
 }
 
@@ -190,28 +192,24 @@ func (c *EmbeddedCoordinator) Watch(ctx context.Context, resource string) (<-cha
 	if resource == "" {
 		return nil, errors.New("coordination: resource is required")
 	}
-	ch := make(chan Event, 4)
+	watcher := &embeddedWatcher{
+		resource: resource,
+		events:   make(chan Event, 4),
+		wake:     make(chan struct{}, 1),
+	}
 	c.mu.Lock()
 	id := c.nextWatcher
 	c.nextWatcher++
-	c.watchers[id] = embeddedWatcher{resource: resource, events: ch}
+	c.watchers[id] = watcher
 	if c.current != nil && c.current.active && c.current.token.Resource == resource {
-		ch <- Event{
+		watcher.pending = append(watcher.pending, Event{
 			Kind:   EventAcquired,
 			Member: Member{ID: c.current.token.Owner, Token: c.current.token},
-		}
+		})
 	}
 	c.mu.Unlock()
-	go func() {
-		<-ctx.Done()
-		c.mu.Lock()
-		if watched, ok := c.watchers[id]; ok {
-			delete(c.watchers, id)
-			close(watched.events)
-		}
-		c.mu.Unlock()
-	}()
-	return ch, nil
+	go c.deliverWatcher(ctx, id, watcher)
+	return watcher.events, nil
 }
 
 func (c *EmbeddedCoordinator) Members(ctx context.Context, resource string) ([]Member, error) {
@@ -246,9 +244,45 @@ func (c *EmbeddedCoordinator) publishLocked(event Event) {
 		if watcher.resource != event.Member.Token.Resource {
 			continue
 		}
+		watcher.pending = append(watcher.pending, event)
+		select {
+		case watcher.wake <- struct{}{}:
+		default:
+		}
+	}
+}
+
+func (c *EmbeddedCoordinator) deliverWatcher(
+	ctx context.Context,
+	id uint64,
+	watcher *embeddedWatcher,
+) {
+	defer close(watcher.events)
+	for {
+		c.mu.Lock()
+		if len(watcher.pending) == 0 {
+			c.mu.Unlock()
+			select {
+			case <-ctx.Done():
+				c.mu.Lock()
+				delete(c.watchers, id)
+				c.mu.Unlock()
+				return
+			case <-watcher.wake:
+			}
+			continue
+		}
+		event := watcher.pending[0]
+		watcher.pending = watcher.pending[1:]
+		c.mu.Unlock()
+
 		select {
 		case watcher.events <- event:
-		default:
+		case <-ctx.Done():
+			c.mu.Lock()
+			delete(c.watchers, id)
+			c.mu.Unlock()
+			return
 		}
 	}
 }

@@ -37,6 +37,25 @@ func TestEmbeddedCoordinatorConformance(t *testing.T) {
 	directory := t.TempDir()
 	coordtest.Run(t, func(owner string) (coordination.Coordinator, error) {
 		return coordination.NewEmbeddedCoordinator(directory, owner)
+	}, func(_ context.Context, _ coordination.Coordinator, lease coordination.Lease) error {
+		manifestPath := filepath.Join(directory, ".shoal-authority.json")
+		data, err := os.ReadFile(manifestPath)
+		if err != nil {
+			return err
+		}
+		data = []byte(strings.Replace(string(data), `"active": true`, `"active": false`, 1))
+		if err := os.WriteFile(manifestPath, data, 0o600); err != nil {
+			return err
+		}
+		token := lease.Token()
+		_, err = lease.(coordination.EpochLease).AdvanceEpoch(context.Background(), token.Epoch+1)
+		if err == nil {
+			return errors.New("fault injection did not lose lease")
+		}
+		if !errors.Is(err, coordination.ErrLeaseLost) {
+			return err
+		}
+		return nil
 	})
 }
 
@@ -113,6 +132,7 @@ func TestEmbeddedCoordinatorWatchIsResourceScoped(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	events, err := coordinator.Watch(ctx, "table/other")
@@ -129,6 +149,53 @@ func TestEmbeddedCoordinatorWatchIsResourceScoped(t *testing.T) {
 	case event := <-events:
 		t.Fatalf("unrelated event delivered: %+v", event)
 	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+func TestEmbeddedCoordinatorWatchRetainsTerminalEventForSlowConsumer(t *testing.T) {
+	coordinator, err := coordination.NewEmbeddedCoordinator(t.TempDir(), "owner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	events, err := coordinator.Watch(ctx, "table/graph")
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, err := coordinator.Acquire(context.Background(), "table/graph")
+	if err != nil {
+		t.Fatal(err)
+	}
+	epochLease := lease.(coordination.EpochLease)
+	token := lease.Token()
+	const advances = 8
+	for i := uint64(1); i <= advances; i++ {
+		token, err = epochLease.AdvanceEpoch(context.Background(), token.Epoch+1)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := lease.Release(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	assertWatchKind(t, events, coordination.EventAcquired)
+	for range advances {
+		assertWatchKind(t, events, coordination.EventFenced)
+	}
+	assertWatchKind(t, events, coordination.EventReleased)
+}
+
+func assertWatchKind(t *testing.T, events <-chan coordination.Event, want coordination.EventKind) {
+	t.Helper()
+	select {
+	case event := <-events:
+		if event.Kind != want {
+			t.Fatalf("event kind = %s, want %s", event.Kind, want)
+		}
+	case <-time.After(time.Second):
+		t.Fatalf("timed out waiting for %s event", want)
 	}
 }
 

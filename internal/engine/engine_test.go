@@ -50,6 +50,9 @@ func TestEngineEmbeddedAuthorityFencesConcurrentAndStaleProcesses(t *testing.T) 
 	if err := first.Close(); err != nil {
 		t.Fatal(err)
 	}
+	if token := first.AuthorityToken(); token != (coordination.AuthorityToken{}) {
+		t.Fatalf("authority token after close = %+v, want zero token", token)
+	}
 	if err := first.Write("graph", nil); !errors.Is(err, coordination.ErrLeaseLost) {
 		t.Fatalf("write after authority release = %v, want ErrLeaseLost", err)
 	}

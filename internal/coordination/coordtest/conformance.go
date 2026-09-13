@@ -34,7 +34,14 @@ import (
 // on every call.
 type Factory func(owner string) (coordination.Coordinator, error)
 
-func Run(t *testing.T, factory Factory) {
+// FaultInjector must make lease lose authority without calling Release.
+type FaultInjector func(
+	context.Context,
+	coordination.Coordinator,
+	coordination.Lease,
+) error
+
+func Run(t *testing.T, factory Factory, injectFault FaultInjector) {
 	t.Helper()
 	const resource = "table/graph"
 
@@ -130,6 +137,55 @@ func Run(t *testing.T, factory Factory) {
 	}
 	if err := second.Release(context.Background()); err != nil {
 		t.Fatalf("release restarted lease: %v", err)
+	}
+
+	faultCoordinator, err := factory("owner-c")
+	if err != nil {
+		t.Fatal(err)
+	}
+	faultContext, cancelFaultWatch := context.WithCancel(context.Background())
+	defer cancelFaultWatch()
+	faultWatch, err := faultCoordinator.Watch(faultContext, resource)
+	if err != nil {
+		t.Fatal(err)
+	}
+	faultLease, err := faultCoordinator.Acquire(context.Background(), resource)
+	if err != nil {
+		t.Fatalf("fault tenure acquire: %v", err)
+	}
+	faultToken := faultLease.Token()
+	assertEvent(t, faultWatch, coordination.EventAcquired, faultToken)
+	delayedCallback := func(validator coordination.Validator) error {
+		return validator.Validate(context.Background(), faultToken)
+	}
+	if err := injectFault(context.Background(), faultCoordinator, faultLease); err != nil {
+		t.Fatalf("inject lease loss: %v", err)
+	}
+	select {
+	case <-faultLease.Lost():
+	default:
+		t.Fatal("involuntary loss did not close loss signal")
+	}
+	if err := faultLease.Renew(context.Background()); !errors.Is(err, coordination.ErrLeaseLost) {
+		t.Fatalf("renew after involuntary loss = %v, want ErrLeaseLost", err)
+	}
+	assertEvent(t, faultWatch, coordination.EventLost, faultToken)
+
+	replacementCoordinator, err := factory("owner-d")
+	if err != nil {
+		t.Fatal(err)
+	}
+	replacement, err := replacementCoordinator.Acquire(context.Background(), resource)
+	if err != nil {
+		t.Fatalf("post-loss acquire: %v", err)
+	}
+	defer replacement.Release(context.Background())
+	replacementValidator, ok := replacementCoordinator.(coordination.Validator)
+	if !ok {
+		t.Fatal("replacement coordinator does not implement token validation")
+	}
+	if err := delayedCallback(replacementValidator); !errors.Is(err, coordination.ErrStaleToken) {
+		t.Fatalf("delayed stale callback = %v, want ErrStaleToken", err)
 	}
 }
 
