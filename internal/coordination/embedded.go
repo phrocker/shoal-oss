@@ -85,8 +85,12 @@ type EmbeddedCoordinator struct {
 type embeddedWatcher struct {
 	resource string
 	events   chan Event
-	pending  []Event
 	wake     chan struct{}
+
+	mu      sync.Mutex
+	pending [embeddedWatchQueue]Event
+	head    int
+	size    int
 }
 
 func NewEmbeddedCoordinator(directory, owner string) (*EmbeddedCoordinator, error) {
@@ -197,7 +201,6 @@ func (c *EmbeddedCoordinator) Watch(ctx context.Context, resource string) (<-cha
 	watcher := &embeddedWatcher{
 		resource: resource,
 		events:   make(chan Event, 4),
-		pending:  make([]Event, 0, embeddedWatchQueue),
 		wake:     make(chan struct{}, 1),
 	}
 	c.mu.Lock()
@@ -205,7 +208,7 @@ func (c *EmbeddedCoordinator) Watch(ctx context.Context, resource string) (<-cha
 	c.nextWatcher++
 	c.watchers[id] = watcher
 	if c.current != nil && c.current.active && c.current.token.Resource == resource {
-		watcher.pending = append(watcher.pending, Event{
+		watcher.enqueue(Event{
 			Kind:   EventAcquired,
 			Member: Member{ID: c.current.token.Owner, Token: c.current.token},
 		})
@@ -247,20 +250,44 @@ func (c *EmbeddedCoordinator) publishLocked(event Event) {
 		if watcher.resource != event.Member.Token.Resource {
 			continue
 		}
-		if len(watcher.pending) >= embeddedWatchQueue {
-			// Resync membership is informational; observers must call Members.
-			watcher.pending = append(watcher.pending[:0], Event{
-				Kind:   EventResync,
-				Member: event.Member,
-			})
-		} else {
-			watcher.pending = append(watcher.pending, event)
-		}
-		select {
-		case watcher.wake <- struct{}{}:
-		default:
-		}
+		watcher.enqueue(event)
 	}
+}
+
+func (w *embeddedWatcher) enqueue(event Event) {
+	w.mu.Lock()
+	if w.size == len(w.pending) {
+		clear(w.pending[:])
+		w.head = 0
+		w.size = 1
+		// Resync membership is informational; observers must call Members.
+		w.pending[0] = Event{Kind: EventResync, Member: event.Member}
+	} else {
+		tail := (w.head + w.size) % len(w.pending)
+		w.pending[tail] = event
+		w.size++
+	}
+	w.mu.Unlock()
+	select {
+	case w.wake <- struct{}{}:
+	default:
+	}
+}
+
+func (w *embeddedWatcher) dequeue() (Event, bool) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.size == 0 {
+		return Event{}, false
+	}
+	event := w.pending[w.head]
+	w.pending[w.head] = Event{}
+	w.head = (w.head + 1) % len(w.pending)
+	w.size--
+	if w.size == 0 {
+		w.head = 0
+	}
+	return event, true
 }
 
 func (c *EmbeddedCoordinator) deliverWatcher(
@@ -270,9 +297,8 @@ func (c *EmbeddedCoordinator) deliverWatcher(
 ) {
 	defer close(watcher.events)
 	for {
-		c.mu.Lock()
-		if len(watcher.pending) == 0 {
-			c.mu.Unlock()
+		event, ok := watcher.dequeue()
+		if !ok {
 			select {
 			case <-ctx.Done():
 				c.mu.Lock()
@@ -283,12 +309,6 @@ func (c *EmbeddedCoordinator) deliverWatcher(
 			}
 			continue
 		}
-		event := watcher.pending[0]
-		copy(watcher.pending, watcher.pending[1:])
-		last := len(watcher.pending) - 1
-		watcher.pending[last] = Event{}
-		watcher.pending = watcher.pending[:last]
-		c.mu.Unlock()
 
 		select {
 		case watcher.events <- event:
