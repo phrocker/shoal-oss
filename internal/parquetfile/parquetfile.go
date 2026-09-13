@@ -22,8 +22,8 @@ type EncodeOptions struct {
 }
 
 // Cell is the Parquet representation of one Accumulo key/value entry.
-// Every key component remains binary and is dictionary-encoded with ZSTD
-// compression so arbitrary Accumulo keys round-trip compactly.
+// Key components remain binary so arbitrary Accumulo keys round-trip. Byte-array
+// columns use dictionary encoding and ZSTD compression for compact storage.
 type Cell struct {
 	Row       []byte `parquet:"row,dict,zstd"`
 	CF        []byte `parquet:"cf,dict,zstd"`

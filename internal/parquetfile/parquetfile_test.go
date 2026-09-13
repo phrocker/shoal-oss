@@ -84,4 +84,16 @@ func TestEncodeCompressesRepeatedCells(t *testing.T) {
 	if len(data) >= maxEncodedSize {
 		t.Fatalf("encoded size = %d, want less than %d", len(data), maxEncodedSize)
 	}
+	got, err := Decode(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != len(cells) {
+		t.Fatalf("decoded cells = %d, want %d", len(got), len(cells))
+	}
+	for i := range cells {
+		if !got[i].Key.Equal(cells[i].Key) || !bytes.Equal(got[i].Value, cells[i].Value) {
+			t.Fatalf("cell %d did not round-trip", i)
+		}
+	}
 }
