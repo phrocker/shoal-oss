@@ -197,6 +197,7 @@ func (c *EmbeddedCoordinator) Watch(ctx context.Context, resource string) (<-cha
 	watcher := &embeddedWatcher{
 		resource: resource,
 		events:   make(chan Event, 4),
+		pending:  make([]Event, 0, embeddedWatchQueue),
 		wake:     make(chan struct{}, 1),
 	}
 	c.mu.Lock()
@@ -247,10 +248,11 @@ func (c *EmbeddedCoordinator) publishLocked(event Event) {
 			continue
 		}
 		if len(watcher.pending) >= embeddedWatchQueue {
-			watcher.pending = []Event{{
+			// Resync membership is informational; observers must call Members.
+			watcher.pending = append(watcher.pending[:0], Event{
 				Kind:   EventResync,
 				Member: event.Member,
-			}}
+			})
 		} else {
 			watcher.pending = append(watcher.pending, event)
 		}
@@ -282,12 +284,10 @@ func (c *EmbeddedCoordinator) deliverWatcher(
 			continue
 		}
 		event := watcher.pending[0]
-		watcher.pending[0] = Event{}
-		if len(watcher.pending) == 1 {
-			watcher.pending = nil
-		} else {
-			watcher.pending = watcher.pending[1:]
-		}
+		copy(watcher.pending, watcher.pending[1:])
+		last := len(watcher.pending) - 1
+		watcher.pending[last] = Event{}
+		watcher.pending = watcher.pending[:last]
 		c.mu.Unlock()
 
 		select {
