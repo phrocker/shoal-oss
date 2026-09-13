@@ -49,7 +49,11 @@ func TestEncodeDecodePreservesAccumuloKey(t *testing.T) {
 }
 
 func TestEncodeCompressesRepeatedCells(t *testing.T) {
-	const cellCount = 8192
+	const (
+		cellCount      = 8192
+		timestampBytes = 8
+		deletedBytes   = 1
+	)
 	cells := make([]iterrt.Cell, cellCount)
 	var rawSize int
 	for i := range cells {
@@ -67,7 +71,7 @@ func TestEncodeCompressesRepeatedCells(t *testing.T) {
 			len(cells[i].Key.ColumnFamily) +
 			len(cells[i].Key.ColumnQualifier) +
 			len(cells[i].Key.ColumnVisibility) +
-			8 + 1 + len(cells[i].Value)
+			timestampBytes + deletedBytes + len(cells[i].Value)
 	}
 	src := iterrt.NewSliceSource(cells)
 	if err := src.Init(nil, nil, iterrt.IteratorEnvironment{}); err != nil {
