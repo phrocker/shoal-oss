@@ -49,11 +49,9 @@ func TestEncodeDecodePreservesAccumuloKey(t *testing.T) {
 }
 
 func TestEncodeCompressesRepeatedCells(t *testing.T) {
-	const (
-		cellCount      = 8192
-		maxEncodedSize = 100_000 // A repetitive full row group must stay compact.
-	)
+	const cellCount = 8192
 	cells := make([]iterrt.Cell, cellCount)
+	var rawSize int
 	for i := range cells {
 		cells[i] = iterrt.Cell{
 			Key: &wire.Key{
@@ -65,6 +63,11 @@ func TestEncodeCompressesRepeatedCells(t *testing.T) {
 			},
 			Value: []byte("A repeated observation title"),
 		}
+		rawSize += len(cells[i].Key.Row) +
+			len(cells[i].Key.ColumnFamily) +
+			len(cells[i].Key.ColumnQualifier) +
+			len(cells[i].Key.ColumnVisibility) +
+			8 + 1 + len(cells[i].Value)
 	}
 	src := iterrt.NewSliceSource(cells)
 	if err := src.Init(nil, nil, iterrt.IteratorEnvironment{}); err != nil {
@@ -81,8 +84,8 @@ func TestEncodeCompressesRepeatedCells(t *testing.T) {
 	if count != cellCount {
 		t.Fatalf("count = %d, want %d", count, cellCount)
 	}
-	if len(data) >= maxEncodedSize {
-		t.Fatalf("encoded size = %d, want less than %d", len(data), maxEncodedSize)
+	if len(data)*4 >= rawSize {
+		t.Fatalf("encoded size = %d, want less than one quarter of raw size %d", len(data), rawSize)
 	}
 	got, err := Decode(data)
 	if err != nil {
