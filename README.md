@@ -261,7 +261,7 @@ Run the lower-level embedded engine without ZooKeeper or Accumulo:
 go run ./cmd/shoal-embed init --table events --workload analytical \
   --data ~/.shoal/data
 printf '%s\n' \
-  '{"row":"event:1","entries":[{"cf":"meta","cq":"type","value":"login"}]}' |
+  '{"row":"evt:1","entries":[{"cf":"meta","cq":"type","value":"login"}]}' |
   go run ./cmd/shoal-embed write --table events --data ~/.shoal/data
 go run ./cmd/shoal-embed scan --table events --data ~/.shoal/data
 ```
@@ -319,7 +319,7 @@ the loop. Point it at a data directory and go:
 make build   # builds cmd/shoal-embed (and everything else) via go build ./...
 
 # create an operational table (auto selects RFile), optionally pre-split
-shoal-embed init   --table graph --splits "entity:,event:,knowledge:" --data ~/.shoal/data
+shoal-embed init   --table graph --splits "ent:,evt:,knowledge:" --data ~/.shoal/data
 
 # create a scan/aggregate-heavy SQL table (auto selects Parquet)
 shoal-embed init   --table events_analytics --workload analytical --data ~/.shoal/data
@@ -328,7 +328,7 @@ shoal-embed init   --table events_analytics --workload analytical --data ~/.shoa
 shoal-embed write  --table graph --data ~/.shoal/data < mutations.jsonl
 
 # scan back out as JSON lines
-shoal-embed scan   --table graph --row-prefix "entity:" --data ~/.shoal/data
+shoal-embed scan   --table graph --row-prefix "ent:" --data ~/.shoal/data
 
 # flush + compact, or print status
 shoal-embed compact --table graph --data ~/.shoal/data
@@ -342,6 +342,14 @@ shoal-embed compact --table graph --format parquet --data ~/.shoal/data
 shoal-embed serve  --data ~/.shoal/data --port 9876
 ```
 
+`shoal-embed write` accepts arbitrary row keys, but ShoalQL's default graph
+catalog exposes only rows with its graph-schema prefixes: the logical `events`
+table contains rows beginning `evt:`, and `entities` contains rows beginning
+`ent:`. Both logical tables use the physical table selected by `shoal-sql`'s
+`-table` option. Rows under any other prefix remain available to embedded scans
+but are not part of either ShoalQL table, so external writers must use these
+exact prefixes when their data needs to be queried through ShoalQL.
+
 The server is also published as a non-root, multi-architecture container at
 `ghcr.io/phrocker/shoal-oss/shoal-embed`. It starts the gRPC and observability
 listeners with container-safe defaults and includes `proto/embed.proto` for
@@ -354,7 +362,7 @@ Programmatic use mirrors the CLI:
 ```go
 eng, _ := engine.Open("~/.shoal/data", engine.Options{})
 eng.CreateTable("graph", engine.TableOptions{
-    Splits: engine.PrefixSplit("entity:", "event:", "knowledge:"),
+    Splits: engine.PrefixSplit("ent:", "evt:", "knowledge:"),
 })
 eng.Write("graph", mutations)
 sc, _ := eng.Scan("graph", iterrt.InfiniteRange(), engine.ScanOptions{})
