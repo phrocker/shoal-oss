@@ -41,7 +41,8 @@ const (
 	embeddedManifestFile = ".shoal-authority.json"
 	embeddedManifestSize = 64 << 10
 	embeddedVersion      = 1
-	embeddedWatchQueue   = 64
+	// Bound per-watcher memory while allowing routine bursts without resync.
+	embeddedWatchQueue = 64
 )
 
 type embeddedManifest struct {

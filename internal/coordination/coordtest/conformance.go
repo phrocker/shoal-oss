@@ -163,8 +163,8 @@ func Run(t *testing.T, factory Factory, injectFault FaultInjector) {
 	}
 	select {
 	case <-faultLease.Lost():
-	default:
-		t.Fatal("involuntary loss did not close loss signal")
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for involuntary loss signal")
 	}
 	if err := faultLease.Renew(context.Background()); !errors.Is(err, coordination.ErrLeaseLost) {
 		t.Fatalf("renew after involuntary loss = %v, want ErrLeaseLost", err)
