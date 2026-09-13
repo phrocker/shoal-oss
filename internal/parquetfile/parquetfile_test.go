@@ -50,9 +50,10 @@ func TestEncodeDecodePreservesAccumuloKey(t *testing.T) {
 
 func TestEncodeCompressesRepeatedCells(t *testing.T) {
 	const (
-		cellCount      = 8192
-		timestampBytes = 8
-		deletedBytes   = 1
+		cellCount           = 8192
+		timestampBytes      = 8
+		deletedBytes        = 1
+		minCompressionRatio = 4 // Repeated fields should shrink to less than one quarter.
 	)
 	cells := make([]iterrt.Cell, cellCount)
 	var rawSize int
@@ -88,7 +89,7 @@ func TestEncodeCompressesRepeatedCells(t *testing.T) {
 	if count != cellCount {
 		t.Fatalf("count = %d, want %d", count, cellCount)
 	}
-	if len(data)*4 >= rawSize {
+	if len(data)*minCompressionRatio >= rawSize {
 		t.Fatalf("encoded size = %d, want less than one quarter of raw size %d", len(data), rawSize)
 	}
 	got, err := Decode(data)
