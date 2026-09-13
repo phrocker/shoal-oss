@@ -319,7 +319,7 @@ the loop. Point it at a data directory and go:
 make build   # builds cmd/shoal-embed (and everything else) via go build ./...
 
 # create an operational table (auto selects RFile), optionally pre-split
-shoal-embed init   --table graph --splits "ent:,evt:,knowledge:" --data ~/.shoal/data
+shoal-embed init   --table graph --splits "ent:,evt:" --data ~/.shoal/data
 
 # create a scan/aggregate-heavy SQL table (auto selects Parquet)
 shoal-embed init   --table events_analytics --workload analytical --data ~/.shoal/data
@@ -362,7 +362,7 @@ Programmatic use mirrors the CLI:
 ```go
 eng, _ := engine.Open("~/.shoal/data", engine.Options{})
 eng.CreateTable("graph", engine.TableOptions{
-    Splits: engine.PrefixSplit("ent:", "evt:", "knowledge:"),
+    Splits: engine.PrefixSplit("ent:", "evt:"),
 })
 eng.Write("graph", mutations)
 sc, _ := eng.Scan("graph", iterrt.InfiniteRange(), engine.ScanOptions{})
