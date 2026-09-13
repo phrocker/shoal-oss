@@ -344,11 +344,12 @@ shoal-embed serve  --data ~/.shoal/data --port 9876
 
 `shoal-embed write` accepts arbitrary row keys, but ShoalQL's default graph
 catalog exposes only rows with its graph-schema prefixes: the logical `events`
-table contains rows beginning `evt:`, and `entities` contains rows beginning
-`ent:`. Both logical tables use the physical table selected by `shoal-sql`'s
-`-table` option. Rows under any other prefix remain available to embedded scans
-but are not part of either ShoalQL table, so external writers must use these
-exact prefixes when their data needs to be queried through ShoalQL.
+table contains rows beginning with `evt:`, and `entities` contains rows
+beginning with `ent:`. Both logical tables use the physical table selected by
+`shoal-sql`'s `-table` option. Rows under any other prefix remain available to
+embedded scans but are not part of either ShoalQL table, so external writers
+must use these exact prefixes when their data needs to be queried through
+ShoalQL.
 
 The server is also published as a non-root, multi-architecture container at
 `ghcr.io/phrocker/shoal-oss/shoal-embed`. It starts the gRPC and observability
