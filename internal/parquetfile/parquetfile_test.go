@@ -2,6 +2,7 @@ package parquetfile
 
 import (
 	"bytes"
+	"fmt"
 	"testing"
 
 	"github.com/phrocker/shoal-oss/internal/iterrt"
@@ -22,6 +23,7 @@ func TestEncodeDecodePreservesAccumuloKey(t *testing.T) {
 			Value: []byte{0xfe, 0x00},
 		},
 	}
+
 	src := iterrt.NewSliceSource(cells)
 	if err := src.Init(nil, nil, iterrt.IteratorEnvironment{}); err != nil {
 		t.Fatal(err)
@@ -43,5 +45,40 @@ func TestEncodeDecodePreservesAccumuloKey(t *testing.T) {
 	}
 	if len(got) != 1 || !got[0].Key.Equal(cells[0].Key) || !bytes.Equal(got[0].Value, cells[0].Value) {
 		t.Fatalf("round trip = %+v", got)
+	}
+}
+
+func TestEncodeCompressesRepeatedCells(t *testing.T) {
+	const cellCount = 8192
+	cells := make([]iterrt.Cell, cellCount)
+	for i := range cells {
+		cells[i] = iterrt.Cell{
+			Key: &wire.Key{
+				Row:              []byte(fmt.Sprintf("obs:project:%06d", i)),
+				ColumnFamily:     []byte("crawl"),
+				ColumnQualifier:  []byte("title"),
+				ColumnVisibility: []byte(""),
+				Timestamp:        42,
+			},
+			Value: []byte("A repeated observation title"),
+		}
+	}
+	src := iterrt.NewSliceSource(cells)
+	if err := src.Init(nil, nil, iterrt.IteratorEnvironment{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := src.Seek(iterrt.InfiniteRange(), nil, false); err != nil {
+		t.Fatal(err)
+	}
+
+	data, count, err := Encode(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != cellCount {
+		t.Fatalf("count = %d, want %d", count, cellCount)
+	}
+	if len(data) >= 100_000 {
+		t.Fatalf("encoded size = %d, want less than 100000", len(data))
 	}
 }
