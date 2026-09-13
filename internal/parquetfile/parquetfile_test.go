@@ -49,7 +49,10 @@ func TestEncodeDecodePreservesAccumuloKey(t *testing.T) {
 }
 
 func TestEncodeCompressesRepeatedCells(t *testing.T) {
-	const cellCount = 8192
+	const (
+		cellCount      = 8192
+		maxEncodedSize = 100_000 // A repetitive full row group must stay compact.
+	)
 	cells := make([]iterrt.Cell, cellCount)
 	for i := range cells {
 		cells[i] = iterrt.Cell{
@@ -78,7 +81,7 @@ func TestEncodeCompressesRepeatedCells(t *testing.T) {
 	if count != cellCount {
 		t.Fatalf("count = %d, want %d", count, cellCount)
 	}
-	if len(data) >= 100_000 {
-		t.Fatalf("encoded size = %d, want less than 100000", len(data))
+	if len(data) >= maxEncodedSize {
+		t.Fatalf("encoded size = %d, want less than %d", len(data), maxEncodedSize)
 	}
 }
