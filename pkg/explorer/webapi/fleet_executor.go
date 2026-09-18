@@ -27,7 +27,6 @@ import (
 
 	"github.com/phrocker/shoal-oss/pkg/explorer/fleet"
 	"github.com/phrocker/shoal-oss/pkg/interaction"
-	"github.com/phrocker/shoal-oss/pkg/reasoning"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
@@ -77,14 +76,21 @@ const (
 // Executor error codes. They are recorded verbatim on a failed ActionRecord
 // and are stable wire values.
 const (
-	AskErrorUnsupportedAction    = "unsupported_action"
-	AskErrorInvalidInput         = "invalid_input"
-	AskErrorReasoningFailed      = "reasoning_failed"
-	AskErrorUnverified           = "unverified_response"
-	AskErrorUngroundedClaims     = "ungrounded_claims"
-	AskErrorRetrieveUnauthorized = "retrieve_unauthorized"
-	AskErrorEvidenceSkew         = "evidence_snapshot_skew"
-	AskErrorOutputEncoding       = "output_encoding_failed"
+	AskErrorUnsupportedAction = "unsupported_action"
+	AskErrorInvalidInput      = "invalid_input"
+	AskErrorReasoningFailed   = "reasoning_failed"
+	AskErrorUnverified        = "unverified_response"
+	AskErrorUngroundedClaims  = "ungrounded_claims"
+	// AskErrorReasoningUnauthorized covers every authorization refusal from
+	// the reasoning path. The usual cause is an agent principal granted
+	// invoke and dispatch but not retrieve, but a workspace limit set to zero
+	// and a per-object or mosaic-budget denial land here too, so the code does
+	// not claim to name which.
+	AskErrorReasoningUnauthorized = "reasoning_unauthorized"
+	AskErrorEvidenceSkew          = "evidence_snapshot_skew"
+	AskErrorEvidenceUnpinned      = "evidence_unpinned"
+	AskErrorEvidenceUnrecordable  = "evidence_unrecordable"
+	AskErrorOutputEncoding        = "output_encoding_failed"
 )
 
 // AskExecutorConfig configures one executor. Provider is required and is
@@ -160,12 +166,13 @@ func AskActionOutputSchema() json.RawMessage {
 		`"session_id":{"type":"string"},` +
 		`"evidence_count":{"type":"integer"},` +
 		`"evidence_considered":{"type":"integer"},` +
+		`"evidence_unusable":{"type":"integer"},` +
 		`"evidence_truncated":{"type":"boolean"},` +
 		`"claim_count":{"type":"integer"},` +
 		`"issue_count":{"type":"integer"}},` +
 		`"required":["verification","evidence_count","evidence_considered",` +
-		`"evidence_truncated","claim_count","issue_count"],` +
-		`"additionalProperties":false}`)
+		`"evidence_unusable","evidence_truncated","claim_count",` +
+		`"issue_count"],"additionalProperties":false}`)
 }
 
 type askExecutorInput struct {
@@ -185,10 +192,15 @@ type AskExecutionOutput struct {
 	// a fully-cited document anchor costs three and an evidence-rich answer
 	// truncates well before the reasoning harness anchor limit. Without this a
 	// reader cannot tell a complete grounding from a clipped one.
-	EvidenceConsidered int  `json:"evidence_considered"`
-	EvidenceTruncated  bool `json:"evidence_truncated"`
-	ClaimCount         int  `json:"claim_count"`
-	IssueCount         int  `json:"issue_count"`
+	EvidenceConsidered int `json:"evidence_considered"`
+	// EvidenceUnusable counts anchors the envelope offered that could not be
+	// expressed as a dispatch evidence reference at all. It is separate from
+	// truncation because the two mean different things: an unusable anchor is
+	// a correctness problem upstream, a truncated one is a bounds problem.
+	EvidenceUnusable  int  `json:"evidence_unusable"`
+	EvidenceTruncated bool `json:"evidence_truncated"`
+	ClaimCount        int  `json:"claim_count"`
+	IssueCount        int  `json:"issue_count"`
 }
 
 // Execute runs one claimed action. The dispatch service owns the claim fence,
@@ -215,31 +227,39 @@ func (e *AskExecutor) Execute(
 		ctx, AskRequest{Question: input.Question, TopK: input.TopK})
 	if err != nil {
 		if shoal.IsErrorCode(err, shoal.ErrorUnauthorized) {
-			// The reasoning service authorizes retrieval separately. An agent
-			// principal granted only invoke and dispatch lands here on every
-			// action, so name the missing grant instead of reporting a
-			// generic reasoning failure.
+			// Distinguish an authorization refusal from a model or transport
+			// failure. The error itself carries which refusal it was.
 			return fleet.ExecutionResult{
-				ErrorCode: AskErrorRetrieveUnauthorized}, err
+				ErrorCode: AskErrorReasoningUnauthorized}, err
 		}
 		return fleet.ExecutionResult{ErrorCode: AskErrorReasoningFailed}, err
 	}
-	if !envelope.Finalized || !envelope.DurablyRecorded ||
-		envelope.Verification != reasoning.VerificationVerified {
-		return fleet.ExecutionResult{ErrorCode: AskErrorUnverified},
-			shoal.NewError(shoal.ErrorInternal,
-				"ask response was not verified and durably recorded")
+	// Both consumers take the same AskProvider, so the executor applies the
+	// chat transport's own finalization contract rather than a weaker subset
+	// of it: output visibility matching the verified evidence, a complete
+	// workspace settings identity, and a resolved ontology interpretation are
+	// all part of what "verified" means here.
+	if err := validateFinalizedChatResponse(envelope); err != nil {
+		return fleet.ExecutionResult{ErrorCode: AskErrorUnverified}, err
 	}
-	evidence, considered := askExecutorEvidence(envelope)
+	evidence, tally := askExecutorEvidence(envelope)
 	// The guard is on what the envelope offered, not on what survived
 	// translation: an answer whose anchors were all unusable is exactly the
 	// case that must not commit.
-	if len(envelope.Evidence) > 0 && len(evidence) == 0 {
-		// Every anchor was unusable. Succeeding here would commit a record
-		// asserting claims that the record itself does not ground.
-		return fleet.ExecutionResult{ErrorCode: AskErrorUngroundedClaims},
-			shoal.NewError(shoal.ErrorInternal,
-				"no verified evidence survived translation")
+	if tally.considered > 0 && len(evidence) == 0 {
+		// Nothing could be recorded. Succeeding would commit a record
+		// asserting claims that the record itself does not ground. Name which
+		// of the two causes it was, because they need different responses: an
+		// unusable anchor is a correctness problem in the reasoning path,
+		// while an anchor too large to pin is a bounds problem.
+		code := AskErrorUngroundedClaims
+		detail := "no verified evidence survived translation"
+		if tally.usable > 0 {
+			code = AskErrorEvidenceUnrecordable
+			detail = "verified evidence exceeds the recordable member bound"
+		}
+		return fleet.ExecutionResult{ErrorCode: code},
+			shoal.NewError(shoal.ErrorInternal, detail)
 	}
 	result := fleet.ExecutionResult{
 		Output: nil, Evidence: evidence,
@@ -248,6 +268,13 @@ func (e *AskExecutor) Execute(
 		// A snapshot pin is only meaningful alongside evidence, and the
 		// dispatch service rejects one without it.
 		asOf := envelope.SnapshotAsOf.UTC()
+		if envelope.SnapshotID == "" || asOf.IsZero() {
+			// The dispatch service requires a pin alongside evidence and would
+			// otherwise reject the whole batch under a code naming nothing.
+			return fleet.ExecutionResult{ErrorCode: AskErrorEvidenceUnpinned},
+				shoal.NewError(shoal.ErrorInternal,
+					"verified evidence has no snapshot pin")
+		}
 		if asOf.After(e.clock().UTC()) {
 			// The service would reject this as outside execution bounds. Fail
 			// with a code that names the cause instead of a generic evidence
@@ -260,7 +287,7 @@ func (e *AskExecutor) Execute(
 		result.EvidenceSnapshotAsOf = asOf
 	}
 	output, err := json.Marshal(
-		askExecutorOutput(envelope, len(evidence), considered))
+		askExecutorOutput(envelope, len(evidence), tally))
 	if err != nil {
 		return fleet.ExecutionResult{ErrorCode: AskErrorOutputEncoding}, err
 	}
@@ -294,13 +321,14 @@ func decodeAskExecutorInput(raw json.RawMessage) (askExecutorInput, error) {
 }
 
 func askExecutorOutput(
-	envelope CitationEnvelope, evidenceCount, considered int,
+	envelope CitationEnvelope, evidenceCount int, tally askEvidenceTally,
 ) AskExecutionOutput {
 	output := AskExecutionOutput{
 		Verification:       string(envelope.Verification),
 		EvidenceCount:      evidenceCount,
-		EvidenceConsidered: considered,
-		EvidenceTruncated:  considered > evidenceCount,
+		EvidenceConsidered: tally.considered,
+		EvidenceUnusable:   tally.considered - tally.usable,
+		EvidenceTruncated:  tally.usable > evidenceCount,
 		ClaimCount:         len(envelope.Claims),
 		IssueCount:         len(envelope.Issues),
 	}
@@ -319,14 +347,24 @@ func askExecutorOutput(
 // satisfy an evidence variant is skipped rather than failing the batch: a
 // single malformed anchor must not discard a verified answer. Execute refuses
 // to succeed if nothing survives.
-// The second return is the number of distinct, usable anchors the envelope
-// offered. It exceeds len(refs) exactly when the dispatch member bound dropped
-// evidence the answer was actually grounded in, which the receipt reports.
-func askExecutorEvidence(envelope CitationEnvelope) ([]fleet.EvidenceRef, int) {
+// askEvidenceTally separates the two ways an offered anchor fails to reach the
+// record. Collapsing them would let a partially grounded answer report as a
+// complete one, which is the distinction the receipt exists to preserve.
+type askEvidenceTally struct {
+	// considered counts every distinct anchor the envelope offered.
+	considered int
+	// usable counts those that translated into a valid reference, whether or
+	// not the member bound then left room to record them.
+	usable int
+}
+
+func askExecutorEvidence(
+	envelope CitationEnvelope,
+) ([]fleet.EvidenceRef, askEvidenceTally) {
 	refs := make([]fleet.EvidenceRef, 0, len(envelope.Evidence))
 	seen := make(map[shoal.ID]struct{}, len(envelope.Evidence))
+	var tally askEvidenceTally
 	members := 0
-	considered := 0
 	for _, evidence := range envelope.Evidence {
 		if evidence.AnchorID == "" {
 			continue
@@ -334,12 +372,13 @@ func askExecutorEvidence(envelope CitationEnvelope) ([]fleet.EvidenceRef, int) {
 		if _, duplicate := seen[evidence.AnchorID]; duplicate {
 			continue
 		}
+		seen[evidence.AnchorID] = struct{}{}
+		tally.considered++
 		ref, ok := askExecutorEvidenceRef(evidence)
 		if !ok {
 			continue
 		}
-		seen[evidence.AnchorID] = struct{}{}
-		considered++
+		tally.usable++
 		cost := len(ref.NodeIDs) + len(ref.EdgeIDs) + len(ref.Assertions)
 		if len(refs) >= fleet.MaxActionEvidence {
 			continue
@@ -352,7 +391,7 @@ func askExecutorEvidence(envelope CitationEnvelope) ([]fleet.EvidenceRef, int) {
 		members += cost
 		refs = append(refs, ref)
 	}
-	return refs, considered
+	return refs, tally
 }
 
 func askExecutorEvidenceRef(

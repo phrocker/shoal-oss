@@ -30,10 +30,12 @@ import (
 	"time"
 
 	"github.com/phrocker/shoal-oss/pkg/document"
+	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/explorer/fleet"
 	"github.com/phrocker/shoal-oss/pkg/explorer/webapi"
 	"github.com/phrocker/shoal-oss/pkg/graph"
+	"github.com/phrocker/shoal-oss/pkg/inference"
 	"github.com/phrocker/shoal-oss/pkg/interaction"
 	"github.com/phrocker/shoal-oss/pkg/ontology"
 	"github.com/phrocker/shoal-oss/pkg/reasoning"
@@ -70,9 +72,14 @@ func verifiedAskEnvelope(asOf time.Time) webapi.CitationEnvelope {
 		Finalized:       true,
 		DurablyRecorded: true,
 		Verification:    reasoning.VerificationVerified,
-		SessionID:       "session",
-		SnapshotID:      "snapshot",
-		SnapshotAsOf:    asOf,
+		// The executor applies validateFinalizedChatResponse, so an envelope
+		// must also carry a matching output visibility, a consistent workspace
+		// settings identity, and a resolved ontology interpretation.
+		OutputVisibility:       "public",
+		OntologyInterpretation: &webapi.OntologyInterpretation{Status: "unresolved"},
+		SessionID:              "session",
+		SnapshotID:             "snapshot",
+		SnapshotAsOf:           asOf,
 		Evidence: []webapi.CitationEvidence{{
 			AnchorID:   "anchor",
 			Citation:   &citation,
@@ -519,6 +526,7 @@ func TestAskExecutorOutputCarriesNoDocumentContent(t *testing.T) {
 	envelope := verifiedAskEnvelope(time.Now().UTC().Add(-time.Hour))
 	// The effective output label expression is itself derived from the
 	// retrieved sources, so it must not reach the receipt either.
+	envelope.EffectiveVisibility = []string{"secret", "project-x"}
 	envelope.OutputVisibility = "secret&project-x"
 	envelope.Issues = []webapi.CitationIssue{{
 		Kind: "unsupported", Reason: "restricted phrasing from a source document",
@@ -549,7 +557,8 @@ func TestAskExecutorOutputCarriesNoDocumentContent(t *testing.T) {
 	allowed := map[string]bool{
 		"verification": true, "snapshot_id": true, "session_id": true,
 		"evidence_count": true, "evidence_considered": true,
-		"evidence_truncated": true, "claim_count": true, "issue_count": true,
+		"evidence_unusable": true, "evidence_truncated": true,
+		"claim_count": true, "issue_count": true,
 	}
 	for key := range receipt {
 		if !allowed[key] {
@@ -604,8 +613,8 @@ func TestAskExecutorReportsEvidenceTruncation(t *testing.T) {
 	if err := json.Unmarshal(result.Output, &output); err != nil {
 		t.Fatal(err)
 	}
-	if output.EvidenceConsidered != 120 {
-		t.Fatalf("considered = %d", output.EvidenceConsidered)
+	if output.EvidenceConsidered != 120 || output.EvidenceUnusable != 0 {
+		t.Fatalf("tally = %#v", output)
 	}
 	if !output.EvidenceTruncated {
 		t.Fatal("a clipped grounding must be reported as truncated")
@@ -656,10 +665,10 @@ func TestAskExecutorUsesResolvedCitationSourceRoles(t *testing.T) {
 	}
 }
 
-// TestAskExecutorNamesMissingRetrieveGrant proves an agent principal granted
-// only invoke and dispatch gets a code naming the missing grant, not a generic
-// reasoning failure that looks like a model outage.
-func TestAskExecutorNamesMissingRetrieveGrant(t *testing.T) {
+// TestAskExecutorSeparatesAuthorizationRefusal proves an authorization refusal
+// from the reasoning path is distinguishable from a model or transport failure.
+// The usual cause is an agent principal granted invoke but not retrieve.
+func TestAskExecutorSeparatesAuthorizationRefusal(t *testing.T) {
 	executor, err := webapi.NewAskExecutor(webapi.AskExecutorConfig{
 		Provider: &stubAskProvider{
 			err: shoal.NewError(shoal.ErrorUnauthorized, "retrieve is not permitted"),
@@ -672,7 +681,7 @@ func TestAskExecutorNamesMissingRetrieveGrant(t *testing.T) {
 		Capability: webapi.AskCapability, Action: webapi.AskAction,
 		Input: json.RawMessage(`{"question":"anything"}`),
 	})
-	if err == nil || result.ErrorCode != webapi.AskErrorRetrieveUnauthorized {
+	if err == nil || result.ErrorCode != webapi.AskErrorReasoningUnauthorized {
 		t.Fatalf("result = %#v, err = %v", result, err)
 	}
 }
@@ -692,4 +701,293 @@ func TestBindRejectsTypedNilExecutor(t *testing.T) {
 	if _, ok := bound.(fleet.ActionExecutor); ok {
 		t.Fatal("a refused binding must not replace the placeholder")
 	}
+}
+
+// TestAskExecutorReportsUnusableEvidenceSeparately proves an anchor dropped as
+// unexpressible is reported distinctly from one dropped for the member bound.
+// Collapsing the two would let a partially grounded answer present as complete.
+func TestAskExecutorReportsUnusableEvidenceSeparately(t *testing.T) {
+	envelope := verifiedAskEnvelope(time.Now().UTC().Add(-time.Hour))
+	unrevisioned := document.Citation{DocumentID: "other", SectionID: "section"}
+	envelope.Evidence = append(envelope.Evidence, webapi.CitationEvidence{
+		AnchorID: "malformed", Citation: &unrevisioned,
+		Visibility: []string{"public"},
+	})
+	executor, err := webapi.NewAskExecutor(webapi.AskExecutorConfig{
+		Provider: &stubAskProvider{envelope: envelope},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := executor.Execute(context.Background(), fleet.Invocation{
+		Capability: webapi.AskCapability, Action: webapi.AskAction,
+		Input: json.RawMessage(`{"question":"anything"}`),
+	})
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	var output webapi.AskExecutionOutput
+	if err := json.Unmarshal(result.Output, &output); err != nil {
+		t.Fatal(err)
+	}
+	if output.EvidenceConsidered != 2 || output.EvidenceUnusable != 1 ||
+		output.EvidenceCount != 1 || output.EvidenceTruncated {
+		t.Fatalf("a dropped anchor was not reported: %#v", output)
+	}
+}
+
+// TestAskExecutorRejectsUnpinnedEvidence proves evidence without a snapshot pin
+// fails with a code naming the cause, rather than the generic evidence
+// rejection the dispatch service would otherwise record.
+func TestAskExecutorRejectsUnpinnedEvidence(t *testing.T) {
+	envelope := verifiedAskEnvelope(time.Now().UTC().Add(-time.Hour))
+	envelope.SnapshotID = ""
+	envelope.SnapshotAsOf = time.Time{}
+	executor, err := webapi.NewAskExecutor(webapi.AskExecutorConfig{
+		Provider: &stubAskProvider{envelope: envelope},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := executor.Execute(context.Background(), fleet.Invocation{
+		Capability: webapi.AskCapability, Action: webapi.AskAction,
+		Input: json.RawMessage(`{"question":"anything"}`),
+	})
+	if err == nil || result.ErrorCode != webapi.AskErrorEvidenceUnpinned {
+		t.Fatalf("result = %#v, err = %v", result, err)
+	}
+}
+
+// TestAskExecutorNamesUnrecordableEvidence proves a fully grounded answer whose
+// single anchor cannot fit the dispatch member bound fails as unrecordable, not
+// as ungrounded. The two need different responses: one is a bounds problem, the
+// other a correctness problem in the reasoning path.
+func TestAskExecutorNamesUnrecordableEvidence(t *testing.T) {
+	envelope := verifiedAskEnvelope(time.Now().UTC().Add(-time.Hour))
+	nodes := make([]graph.Node, 0, 400)
+	edges := make([]graph.Edge, 0, 399)
+	for index := 0; index < 400; index++ {
+		nodes = append(nodes, graph.Node{ID: shoal.ID("n" + strconv.Itoa(index))})
+		if index > 0 {
+			edges = append(edges, graph.Edge{
+				ID:   shoal.ID("e" + strconv.Itoa(index)),
+				From: shoal.ID("n" + strconv.Itoa(index-1)),
+				To:   shoal.ID("n" + strconv.Itoa(index)),
+			})
+		}
+	}
+	envelope.Evidence = []webapi.CitationEvidence{{
+		AnchorID: "huge", Path: &graph.Path{Nodes: nodes, Edges: edges},
+		Visibility: []string{"public"},
+	}}
+	executor, err := webapi.NewAskExecutor(webapi.AskExecutorConfig{
+		Provider: &stubAskProvider{envelope: envelope},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := executor.Execute(context.Background(), fleet.Invocation{
+		Capability: webapi.AskCapability, Action: webapi.AskAction,
+		Input: json.RawMessage(`{"question":"anything"}`),
+	})
+	if err == nil || result.ErrorCode != webapi.AskErrorEvidenceUnrecordable {
+		t.Fatalf("result = %#v, err = %v", result, err)
+	}
+}
+
+// TestAskExecutorAppliesChatFinalizationContract proves the executor refuses an
+// envelope the chat transport would refuse. Both consumers take the same
+// provider, so a weaker check here would commit as a durable effect what the
+// HTTP path rejects.
+func TestAskExecutorAppliesChatFinalizationContract(t *testing.T) {
+	envelope := verifiedAskEnvelope(time.Now().UTC().Add(-time.Hour))
+	envelope.OntologyInterpretation = nil
+	executor, err := webapi.NewAskExecutor(webapi.AskExecutorConfig{
+		Provider: &stubAskProvider{envelope: envelope},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := executor.Execute(context.Background(), fleet.Invocation{
+		Capability: webapi.AskCapability, Action: webapi.AskAction,
+		Input: json.RawMessage(`{"question":"anything"}`),
+	})
+	if err == nil || result.ErrorCode != webapi.AskErrorUnverified {
+		t.Fatalf("result = %#v, err = %v", result, err)
+	}
+	mismatched := verifiedAskEnvelope(time.Now().UTC().Add(-time.Hour))
+	mismatched.EffectiveVisibility = []string{"secret"}
+	executor, err = webapi.NewAskExecutor(webapi.AskExecutorConfig{
+		Provider: &stubAskProvider{envelope: mismatched},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err = executor.Execute(context.Background(), fleet.Invocation{
+		Capability: webapi.AskCapability, Action: webapi.AskAction,
+		Input: json.RawMessage(`{"question":"anything"}`),
+	})
+	if err == nil || result.ErrorCode != webapi.AskErrorUnverified {
+		t.Fatalf("visibility mismatch accepted: %#v, %v", result, err)
+	}
+}
+
+// TestAskExecutorCommitsEvidenceAgainstRealCorpus is the acceptance test for
+// the evidence-carrying commit path. The sibling end-to-end test runs an
+// evidence-free envelope, which takes the no-evidence branch everywhere: no
+// snapshot pin, and ActionRecorder falls through to its own snapshot instead of
+// the branch that pins EvidenceSnapshotID and ExecutionFingerprint and
+// authorizes every evidence node. This test ingests a real document and cites
+// its real identities so that branch actually runs.
+func TestAskExecutorCommitsEvidenceAgainstRealCorpus(t *testing.T) {
+	root := t.TempDir()
+	now := time.Now().UTC().Add(time.Minute)
+	authority := auth.NewAuthority()
+	// The envelope cannot be built until a corpus exists, but the executor must
+	// be bound before openService composes the fleet, so the provider is filled
+	// in after ingest.
+	provider := &stubAskProvider{}
+	executor, err := webapi.NewAskExecutor(webapi.AskExecutorConfig{
+		Provider: provider, Clock: func() time.Time { return now },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	executors := configuredFleetExecutors{"ask": configuredFleetExecutor{
+		reference: "ask",
+	}}
+	if err := executors.bind("ask", executor); err != nil {
+		t.Fatal(err)
+	}
+	opened, err := openService(context.Background(), serviceConfig{
+		backend: "embedded", data: filepath.Join(root, "corpus"),
+		policyDir: filepath.Join(root, "policy"),
+		resolver:  authority.Resolver(), clock: func() time.Time { return now },
+		executors: executors,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer opened.close()
+	if opened.client == nil {
+		t.Skip("embedded service exposes no authorized client")
+	}
+
+	ingestCtx, err := authority.Binder().Bind(context.Background(), askDecision(
+		t, now, "ask-ingest",
+		auth.OperationIngest, auth.OperationRead, auth.OperationRetrieve))
+	if err != nil {
+		t.Fatal(err)
+	}
+	const content = "# Promotion\n\nLocal tables promote under a fenced handoff.\n"
+	ingested, err := opened.client.Ingest(ingestCtx, explorer.Source{
+		URI: "shoal://test/promotion.md", Title: "Promotion",
+		MediaType: "text/markdown", Content: content,
+	})
+	if err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+	view, err := opened.client.Document(
+		ingestCtx, ingested.Document.ID, ingested.Revision.ID)
+	if err != nil {
+		t.Fatalf("read ingested document: %v", err)
+	}
+	section, span, ok := firstCitableSpan(view.Root)
+	if !ok {
+		t.Fatal("ingested document produced no citable span")
+	}
+	snapshot, err := opened.client.Snapshot(ingestCtx)
+	if err != nil {
+		t.Fatalf("snapshot: %v", err)
+	}
+
+	citation := document.Citation{
+		DocumentID: ingested.Document.ID, RevisionID: ingested.Revision.ID,
+		SectionID: section.ID, SpanID: span.ID, Range: span.Range,
+	}
+	// The interaction sink recomputes the anchor from the citation and its
+	// resolved quote and rejects any other identity, so the test derives the
+	// same one rather than inventing a label.
+	quote := content[span.Range.Start.Offset:span.Range.End.Offset]
+	anchor, err := inference.NewDocumentAnchor(citation, quote)
+	if err != nil {
+		t.Fatalf("derive document anchor: %v", err)
+	}
+	envelope := verifiedAskEnvelope(snapshot.AsOf)
+	envelope.SnapshotID = shoal.ID(snapshot.ID)
+	envelope.Evidence = []webapi.CitationEvidence{{
+		AnchorID: anchor.ID(), Citation: &citation,
+		SourceIDs:  []shoal.ID{ingested.Document.ID, section.ID, span.ID},
+		Visibility: []string{"public"},
+	}}
+	provider.envelope = envelope
+
+	registerCtx, err := authority.Binder().Bind(context.Background(),
+		askDecision(t, now, "ask-register2", auth.OperationAgentRegister))
+	if err != nil {
+		t.Fatal(err)
+	}
+	descriptor, err := opened.fleetRegistry.Register(
+		registerCtx, fleet.RegisterRequest{
+			Context: fleet.RequestContext{
+				RequestID: "register", ReasonCode: "test",
+				Deadline: now.Add(time.Minute),
+			},
+			RegistrationKey: "ask-registration",
+			Spec:            askAgentSpec(now),
+		})
+	if err != nil {
+		t.Fatalf("register ask agent: %v", err)
+	}
+
+	invokeCtx, err := authority.Binder().Bind(context.Background(), askDecision(
+		t, now, "ask-invoke2", auth.OperationInvoke, auth.OperationRetrieve))
+	if err != nil {
+		t.Fatal(err)
+	}
+	record, err := opened.fleetDispatch.Invoke(invokeCtx, fleet.InvokeRequest{
+		Enqueue: fleet.EnqueueRequest{
+			ID: []byte("ask-evidence"), IdempotencyKey: []byte("ask-evidence-key"),
+			AgentID: descriptor.ID, AgentGeneration: descriptor.Generation,
+			Capability: webapi.AskCapability, Action: webapi.AskAction,
+			SourceID: workspaceSourceID, PolicyID: workspaceGrantPolicyID,
+			ObjectID: "corpus",
+			Input:    json.RawMessage(`{"question":"what gates promotion?"}`),
+			Context: fleet.RequestContext{
+				RequestID: "invoke", CorrelationID: "ask-correlation",
+				ReasonCode: "test", Deadline: now.Add(time.Minute),
+			},
+		},
+		ClaimID: []byte("ask-evidence-claim"), Lease: time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("invoke with corpus-backed evidence: %v", err)
+	}
+	if record.State != fleet.DispatchSucceeded {
+		t.Fatalf("action state = %q, error code = %q", record.State, record.ErrorCode)
+	}
+	if len(record.Evidence) != 1 ||
+		record.Evidence[0].Citation.DocumentID != ingested.Document.ID {
+		t.Fatalf("recorded evidence = %#v", record.Evidence)
+	}
+	if record.EvidenceSnapshotID != shoal.ID(snapshot.ID) {
+		t.Fatalf("evidence snapshot = %q", record.EvidenceSnapshotID)
+	}
+	if record.ExecutionFingerprint.String() == "" {
+		t.Fatal("an evidence-carrying commit must pin its execution fingerprint")
+	}
+}
+
+func firstCitableSpan(
+	view explorer.SectionView,
+) (document.Section, document.Span, bool) {
+	if len(view.Spans) > 0 {
+		return view.Section, view.Spans[0], true
+	}
+	for _, child := range view.Children {
+		if section, span, ok := firstCitableSpan(child); ok {
+			return section, span, ok
+		}
+	}
+	return document.Section{}, document.Span{}, false
 }
