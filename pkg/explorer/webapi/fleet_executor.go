@@ -235,31 +235,33 @@ func (e *AskExecutor) Execute(
 		return fleet.ExecutionResult{ErrorCode: AskErrorReasoningFailed}, err
 	}
 	// Both consumers take the same AskProvider, so the executor applies the
-	// chat transport's own finalization contract rather than a weaker subset
-	// of it: output visibility matching the verified evidence, a complete
-	// workspace settings identity, and a resolved ontology interpretation are
-	// all part of what "verified" means here.
+	// chat transport's own contract rather than a weaker subset of it, in the
+	// same order. Validate is the check that matters most here: it enforces
+	// per-anchor verification status, that source roles match the citation,
+	// that the quote matches its range, and that the anchor is the canonical
+	// content-derived identity. This path writes those anchors into a durable
+	// attestation-bearing record, so it is the path that most needs them.
+	if err := envelope.Validate(); err != nil {
+		return failAfterAsk(envelope, askEvidenceTally{}, AskErrorUnverified)
+	}
 	if err := validateFinalizedChatResponse(envelope); err != nil {
-		return fleet.ExecutionResult{ErrorCode: AskErrorUnverified}, err
+		return failAfterAsk(envelope, askEvidenceTally{}, AskErrorUnverified)
 	}
 	evidence, tally := askExecutorEvidence(envelope)
 	// The guard is on what the envelope offered, not on what survived
 	// translation: an answer whose anchors were all unusable is exactly the
 	// case that must not commit.
-	if tally.considered > 0 && len(evidence) == 0 {
+	if (tally.considered > 0 || len(envelope.Claims) > 0) && len(evidence) == 0 {
 		// Nothing could be recorded. Succeeding would commit a record
 		// asserting claims that the record itself does not ground. Name which
 		// of the two causes it was, because they need different responses: an
 		// unusable anchor is a correctness problem in the reasoning path,
 		// while an anchor too large to pin is a bounds problem.
 		code := AskErrorUngroundedClaims
-		detail := "no verified evidence survived translation"
 		if tally.usable > 0 {
 			code = AskErrorEvidenceUnrecordable
-			detail = "verified evidence exceeds the recordable member bound"
 		}
-		return fleet.ExecutionResult{ErrorCode: code},
-			shoal.NewError(shoal.ErrorInternal, detail)
+		return failAfterAsk(envelope, tally, code)
 	}
 	result := fleet.ExecutionResult{
 		Output: nil, Evidence: evidence,
@@ -271,17 +273,13 @@ func (e *AskExecutor) Execute(
 		if envelope.SnapshotID == "" || asOf.IsZero() {
 			// The dispatch service requires a pin alongside evidence and would
 			// otherwise reject the whole batch under a code naming nothing.
-			return fleet.ExecutionResult{ErrorCode: AskErrorEvidenceUnpinned},
-				shoal.NewError(shoal.ErrorInternal,
-					"verified evidence has no snapshot pin")
+			return failAfterAsk(envelope, tally, AskErrorEvidenceUnpinned)
 		}
 		if asOf.After(e.clock().UTC()) {
 			// The service would reject this as outside execution bounds. Fail
 			// with a code that names the cause instead of a generic evidence
 			// rejection; the pin is provenance and is never rewritten.
-			return fleet.ExecutionResult{ErrorCode: AskErrorEvidenceSkew},
-				shoal.NewError(shoal.ErrorInternal,
-					"evidence snapshot is ahead of the execution clock")
+			return failAfterAsk(envelope, tally, AskErrorEvidenceSkew)
 		}
 		result.EvidenceSnapshotID = envelope.SnapshotID
 		result.EvidenceSnapshotAsOf = asOf
@@ -293,6 +291,25 @@ func (e *AskExecutor) Execute(
 	}
 	result.Output = output
 	return result, nil
+}
+
+// failAfterAsk records a failure that happened after the reasoning call ran.
+// The model call has been made and the interaction durably recorded, so the
+// failed record must still carry the session identity: it is the only route
+// back to a reasoning session that was already performed and paid for.
+//
+// Returning a nil error is deliberate. The dispatch service skips output
+// entirely when the executor returns an error, so returning one here would
+// discard the receipt and leave the operator with a bare code. The non-empty
+// error code still commits the action as failed.
+func failAfterAsk(
+	envelope CitationEnvelope, tally askEvidenceTally, code string,
+) (fleet.ExecutionResult, error) {
+	output, err := json.Marshal(askExecutorOutput(envelope, 0, tally))
+	if err != nil {
+		return fleet.ExecutionResult{ErrorCode: AskErrorOutputEncoding}, err
+	}
+	return fleet.ExecutionResult{ErrorCode: code, Output: output}, nil
 }
 
 func decodeAskExecutorInput(raw json.RawMessage) (askExecutorInput, error) {
@@ -367,6 +384,10 @@ func askExecutorEvidence(
 	members := 0
 	for _, evidence := range envelope.Evidence {
 		if evidence.AnchorID == "" {
+			// Counted, never usable. Skipping it before the tally would hide
+			// the loss and let the ungrounded guard pass on an envelope whose
+			// anchors were all anonymous.
+			tally.considered++
 			continue
 		}
 		if _, duplicate := seen[evidence.AnchorID]; duplicate {
@@ -397,10 +418,12 @@ func askExecutorEvidence(
 func askExecutorEvidenceRef(
 	evidence CitationEvidence,
 ) (fleet.EvidenceRef, bool) {
+	// An empty label set is public. A source that declares no visibility is
+	// unrestricted, so its evidence legitimately carries no labels and must be
+	// recorded rather than dropped; dropping it made every action against an
+	// unlabeled corpus fail.
 	visibility, err := interaction.Conjoin(evidence.Visibility)
-	if err != nil || len(visibility) == 0 {
-		// Dispatch evidence requires visibility; an unlabeled anchor cannot be
-		// attributed and is dropped rather than recorded without a label.
+	if err != nil {
 		return fleet.EvidenceRef{}, false
 	}
 	var ref fleet.EvidenceRef
