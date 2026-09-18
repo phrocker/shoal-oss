@@ -20,6 +20,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -31,7 +32,9 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/explorer/fleet"
 	"github.com/phrocker/shoal-oss/pkg/explorer/webapi"
+	"github.com/phrocker/shoal-oss/pkg/graph"
 	"github.com/phrocker/shoal-oss/pkg/interaction"
+	"github.com/phrocker/shoal-oss/pkg/ontology"
 	"github.com/phrocker/shoal-oss/pkg/reasoning"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
@@ -366,5 +369,192 @@ func TestBindRejectsUnallowlistedExecutorReference(t *testing.T) {
 	}
 	if _, ok := bound.(fleet.ActionExecutor); !ok {
 		t.Fatal("a bound reference must resolve to a real action executor")
+	}
+}
+
+// TestAskExecutorForwardsAbsentTopKForWorkspaceClamping proves the executor
+// does not substitute its own retrieval width. Sending a constant here would
+// exceed a workspace whose retrieval limit is lower than that constant and
+// fail an action the same principal can ask over chat.
+func TestAskExecutorForwardsAbsentTopKForWorkspaceClamping(t *testing.T) {
+	provider := &stubAskProvider{
+		envelope: verifiedAskEnvelope(time.Now().UTC().Add(-time.Hour)),
+	}
+	executor, err := webapi.NewAskExecutor(
+		webapi.AskExecutorConfig{Provider: provider})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := executor.Execute(context.Background(), fleet.Invocation{
+		Capability: webapi.AskCapability, Action: webapi.AskAction,
+		Input: json.RawMessage(`{"question":"anything"}`),
+	}); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	if provider.last.TopK != 0 {
+		t.Fatalf("absent top_k was rewritten to %d", provider.last.TopK)
+	}
+	if _, err := executor.Execute(context.Background(), fleet.Invocation{
+		Capability: webapi.AskCapability, Action: webapi.AskAction,
+		Input: json.RawMessage(`{"question":"anything","top_k":3}`),
+	}); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	if provider.last.TopK != 3 {
+		t.Fatalf("explicit top_k = %d", provider.last.TopK)
+	}
+}
+
+// TestAskExecutorFailsWhenNoEvidenceSurvives proves a verified answer whose
+// anchors are all unusable fails rather than committing a record that asserts
+// claims the record does not ground.
+func TestAskExecutorFailsWhenNoEvidenceSurvives(t *testing.T) {
+	envelope := verifiedAskEnvelope(time.Now().UTC().Add(-time.Hour))
+	envelope.Evidence[0].Visibility = nil
+	executor, err := webapi.NewAskExecutor(webapi.AskExecutorConfig{
+		Provider: &stubAskProvider{envelope: envelope},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := executor.Execute(context.Background(), fleet.Invocation{
+		Capability: webapi.AskCapability, Action: webapi.AskAction,
+		Input: json.RawMessage(`{"question":"anything"}`),
+	})
+	if err == nil {
+		t.Fatal("an answer with no usable evidence must fail the action")
+	}
+	if result.ErrorCode != webapi.AskErrorUngroundedClaims {
+		t.Fatalf("error code = %q", result.ErrorCode)
+	}
+}
+
+// TestAskExecutorSkipsMalformedEvidenceWithoutFailingBatch proves one bad
+// anchor is dropped rather than discarding a verified answer. A citation
+// without a revision cannot validate, and a graph anchor carrying an assertion
+// for an edge it does not reference must shed that assertion rather than
+// producing a reference the dispatch service rejects wholesale.
+func TestAskExecutorSkipsMalformedEvidenceWithoutFailingBatch(t *testing.T) {
+	now := time.Now().UTC()
+	envelope := verifiedAskEnvelope(now.Add(-time.Hour))
+	unrevisioned := document.Citation{DocumentID: "other", SectionID: "section"}
+	envelope.Evidence = append(envelope.Evidence,
+		webapi.CitationEvidence{
+			AnchorID: "malformed", Citation: &unrevisioned,
+			Visibility: []string{"public"},
+		},
+		webapi.CitationEvidence{
+			AnchorID: "graph",
+			Path: &graph.Path{
+				Nodes: []graph.Node{{ID: "node"}},
+			},
+			Assertions: []webapi.CitationAssertion{{
+				AssertionID: "assertion", EdgeID: "unreferenced",
+				Origin: ontology.AssertionExplicit,
+			}},
+			Visibility: []string{"public"},
+		},
+	)
+	executor, err := webapi.NewAskExecutor(webapi.AskExecutorConfig{
+		Provider: &stubAskProvider{envelope: envelope},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := executor.Execute(context.Background(), fleet.Invocation{
+		Capability: webapi.AskCapability, Action: webapi.AskAction,
+		Input: json.RawMessage(`{"question":"anything"}`),
+	})
+	if err != nil {
+		t.Fatalf("one malformed anchor discarded a verified answer: %v", err)
+	}
+	if len(result.Evidence) != 2 {
+		t.Fatalf("evidence = %#v", result.Evidence)
+	}
+	for _, evidence := range result.Evidence {
+		if evidence.AnchorID == "malformed" {
+			t.Fatal("an unvalidatable citation must be skipped")
+		}
+		if evidence.AnchorID == "graph" && len(evidence.Assertions) != 0 {
+			t.Fatalf("an unreferenced assertion survived: %#v", evidence)
+		}
+		reference := interaction.EvidenceReference{
+			AnchorID: evidence.AnchorID, Kind: evidence.Kind,
+			Citation: evidence.Citation, NodeIDs: evidence.NodeIDs,
+			EdgeIDs: evidence.EdgeIDs, Assertions: evidence.Assertions,
+		}
+		if _, err := reference.Canonical(); err != nil {
+			t.Fatalf("surviving evidence is not canonical: %v", err)
+		}
+	}
+}
+
+// TestAskExecutorRejectsFutureSnapshot proves a snapshot pinned ahead of the
+// execution clock fails with a code that names the cause, rather than being
+// rewritten to fit or rejected generically by the dispatch service.
+func TestAskExecutorRejectsFutureSnapshot(t *testing.T) {
+	now := time.Now().UTC()
+	executor, err := webapi.NewAskExecutor(webapi.AskExecutorConfig{
+		Provider: &stubAskProvider{envelope: verifiedAskEnvelope(now.Add(time.Hour))},
+		Clock:    func() time.Time { return now },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := executor.Execute(context.Background(), fleet.Invocation{
+		Capability: webapi.AskCapability, Action: webapi.AskAction,
+		Input: json.RawMessage(`{"question":"anything"}`),
+	})
+	if err == nil || result.ErrorCode != webapi.AskErrorEvidenceSkew {
+		t.Fatalf("result = %#v, err = %v", result, err)
+	}
+}
+
+// TestAskExecutorOutputCarriesNoDocumentContent proves the action receipt
+// holds no document-derived content. TeamActions serializes Output to any
+// reader authorized on the action's scope without checking visibility labels,
+// so claim values, issue reasons, and ontology identifiers must not appear.
+func TestAskExecutorOutputCarriesNoDocumentContent(t *testing.T) {
+	envelope := verifiedAskEnvelope(time.Now().UTC().Add(-time.Hour))
+	envelope.OutputVisibility = "public"
+	envelope.Issues = []webapi.CitationIssue{{
+		Kind: "unsupported", Reason: "restricted phrasing from a source document",
+	}}
+	executor, err := webapi.NewAskExecutor(webapi.AskExecutorConfig{
+		Provider: &stubAskProvider{envelope: envelope},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := executor.Execute(context.Background(), fleet.Invocation{
+		Capability: webapi.AskCapability, Action: webapi.AskAction,
+		Input: json.RawMessage(`{"question":"anything"}`),
+	})
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	if bytes.Contains(result.Output, []byte("restricted phrasing")) {
+		t.Fatalf("issue text leaked into the action receipt: %s", result.Output)
+	}
+	var receipt map[string]any
+	if err := json.Unmarshal(result.Output, &receipt); err != nil {
+		t.Fatal(err)
+	}
+	allowed := map[string]bool{
+		"verification": true, "output_visibility": true, "snapshot_id": true,
+		"session_id": true, "evidence_count": true, "claim_count": true,
+		"issue_count": true,
+	}
+	for key := range receipt {
+		if !allowed[key] {
+			t.Fatalf("unexpected receipt field %q", key)
+		}
+	}
+	var output webapi.AskExecutionOutput
+	if err := json.Unmarshal(result.Output, &output); err != nil {
+		t.Fatal(err)
+	}
+	if output.IssueCount != 1 || output.OutputVisibility != "public" {
+		t.Fatalf("receipt = %#v", output)
 	}
 }

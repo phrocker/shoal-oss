@@ -22,13 +22,11 @@ package webapi
 import (
 	"context"
 	"encoding/json"
-	"strconv"
 	"strings"
 	"time"
 
 	"github.com/phrocker/shoal-oss/pkg/explorer/fleet"
 	"github.com/phrocker/shoal-oss/pkg/interaction"
-	"github.com/phrocker/shoal-oss/pkg/ontology"
 	"github.com/phrocker/shoal-oss/pkg/reasoning"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
@@ -44,6 +42,16 @@ import (
 // It deliberately refuses any response that is not finalized, durably
 // recorded, and verified, so a dispatch action can never commit a successful
 // effect over ungrounded output.
+//
+// Action output is a receipt, not the answer. DispatchService.TeamActions
+// authorizes a reader on (domain, source, policy, object) and applies no
+// visibility-label check before serializing ActionRecord.Output, so anything
+// this executor writes there is readable by a principal who does not hold the
+// source labels. Claim values, issue reasons, and ontology identifiers are all
+// derived from retrieved documents, so none of them belong in Output. The
+// receipt reports only what the execution did; the verified claims stay
+// reachable through the visibility-enforcing interaction path using the
+// recorded session ID.
 const (
 	// AskCapability and AskAction name the single capability this executor
 	// serves. A descriptor must declare both for resolution to select it.
@@ -53,8 +61,6 @@ const (
 	// MaxAskQuestionBytes bounds one decoded question independently of the
 	// action's declared input schema.
 	MaxAskQuestionBytes = 4096
-
-	defaultAskTopK uint32 = 8
 )
 
 // Executor error codes. They are recorded verbatim on a failed ActionRecord
@@ -65,24 +71,28 @@ const (
 	AskErrorReasoningFailed   = "reasoning_failed"
 	AskErrorUnverified        = "unverified_response"
 	AskErrorInvalidEvidence   = "invalid_evidence"
+	AskErrorUngroundedClaims  = "ungrounded_claims"
+	AskErrorEvidenceSkew      = "evidence_snapshot_skew"
 	AskErrorOutputEncoding    = "output_encoding_failed"
 )
 
 // AskExecutorConfig configures one executor. Provider is required and is
 // always an authorization-enforcing reasoning service.
 type AskExecutorConfig struct {
-	Provider    AskProvider
-	Capability  string
-	Action      string
-	DefaultTopK uint32
+	Provider   AskProvider
+	Capability string
+	Action     string
+	// Clock defaults to time.Now and exists so snapshot-skew detection is
+	// testable. It is never used to stamp provenance.
+	Clock func() time.Time
 }
 
 // AskExecutor implements fleet.ActionExecutor.
 type AskExecutor struct {
-	provider    AskProvider
-	capability  string
-	action      string
-	defaultTopK uint32
+	provider   AskProvider
+	capability string
+	action     string
+	clock      func() time.Time
 }
 
 var _ fleet.ActionExecutor = (*AskExecutor)(nil)
@@ -106,17 +116,13 @@ func NewAskExecutor(config AskExecutorConfig) (*AskExecutor, error) {
 		return nil, shoal.NewError(
 			shoal.ErrorInvalidArgument, "ask executor capability and action must be canonical")
 	}
-	topK := config.DefaultTopK
-	if topK == 0 {
-		topK = defaultAskTopK
-	}
-	if topK > MaxTopK {
-		return nil, shoal.NewError(
-			shoal.ErrorInvalidArgument, "ask executor default top_k exceeds the transport limit")
+	clock := config.Clock
+	if clock == nil {
+		clock = time.Now
 	}
 	return &AskExecutor{
 		provider: config.Provider, capability: capability,
-		action: action, defaultTopK: topK,
+		action: action, clock: clock,
 	}, nil
 }
 
@@ -139,19 +145,14 @@ func AskActionInputSchema() json.RawMessage {
 func AskActionOutputSchema() json.RawMessage {
 	return json.RawMessage(`{"type":"object","properties":{` +
 		`"verification":{"type":"string"},` +
+		`"output_visibility":{"type":"string"},` +
 		`"snapshot_id":{"type":"string"},` +
 		`"session_id":{"type":"string"},` +
 		`"evidence_count":{"type":"integer"},` +
-		`"claims":{"type":"array","items":{"type":"object","properties":{` +
-		`"subject":{"type":"string"},"predicate":{"type":"string"},` +
-		`"object":{"type":"string"},"object_type":{"type":"string"},` +
-		`"status":{"type":"string"},"confidence":{"type":"number"}},` +
-		`"additionalProperties":false}},` +
-		`"issues":{"type":"array","items":{"type":"object","properties":{` +
-		`"kind":{"type":"string"},"reason":{"type":"string"}},` +
-		`"additionalProperties":false}}},` +
-		`"required":["verification","evidence_count","claims","issues"],` +
-		`"additionalProperties":false}`)
+		`"claim_count":{"type":"integer"},` +
+		`"issue_count":{"type":"integer"}},` +
+		`"required":["verification","evidence_count","claim_count",` +
+		`"issue_count"],"additionalProperties":false}`)
 }
 
 type askExecutorInput struct {
@@ -159,31 +160,16 @@ type askExecutorInput struct {
 	TopK     uint32 `json:"top_k,omitempty"`
 }
 
-// AskOutputClaim is one verified claim in executor output. Opaque IDs are
-// unpadded base64url so they round-trip losslessly.
-type AskOutputClaim struct {
-	Subject    string  `json:"subject"`
-	Predicate  string  `json:"predicate"`
-	Object     string  `json:"object"`
-	ObjectType string  `json:"object_type"`
-	Status     string  `json:"status"`
-	Confidence float64 `json:"confidence"`
-}
-
-// AskOutputIssue is one unresolved issue reported instead of a claim.
-type AskOutputIssue struct {
-	Kind   string `json:"kind"`
-	Reason string `json:"reason"`
-}
-
-// AskExecutionOutput is the executor's action output document.
+// AskExecutionOutput is the executor's action output receipt. It deliberately
+// carries no document-derived content: see the AskExecutor doc comment.
 type AskExecutionOutput struct {
-	Verification  string           `json:"verification"`
-	SnapshotID    string           `json:"snapshot_id,omitempty"`
-	SessionID     string           `json:"session_id,omitempty"`
-	EvidenceCount int              `json:"evidence_count"`
-	Claims        []AskOutputClaim `json:"claims"`
-	Issues        []AskOutputIssue `json:"issues"`
+	Verification     string `json:"verification"`
+	OutputVisibility string `json:"output_visibility,omitempty"`
+	SnapshotID       string `json:"snapshot_id,omitempty"`
+	SessionID        string `json:"session_id,omitempty"`
+	EvidenceCount    int    `json:"evidence_count"`
+	ClaimCount       int    `json:"claim_count"`
+	IssueCount       int    `json:"issue_count"`
 }
 
 // Execute runs one claimed action. The dispatch service owns the claim fence,
@@ -202,12 +188,12 @@ func (e *AskExecutor) Execute(
 	if err != nil {
 		return fleet.ExecutionResult{ErrorCode: AskErrorInvalidInput}, err
 	}
-	topK := input.TopK
-	if topK == 0 {
-		topK = e.defaultTopK
-	}
+	// An absent top_k is forwarded as zero so the reasoning service applies
+	// its own workspace-aware default. Substituting a constant here would
+	// exceed a workspace whose retrieval limit is lower and fail the action
+	// for a question the same principal can ask over chat.
 	envelope, err := e.provider.Ask(
-		ctx, AskRequest{Question: input.Question, TopK: topK})
+		ctx, AskRequest{Question: input.Question, TopK: input.TopK})
 	if err != nil {
 		return fleet.ExecutionResult{ErrorCode: AskErrorReasoningFailed}, err
 	}
@@ -221,17 +207,36 @@ func (e *AskExecutor) Execute(
 	if err != nil {
 		return fleet.ExecutionResult{ErrorCode: AskErrorInvalidEvidence}, err
 	}
+	if len(envelope.Evidence) > 0 && len(evidence) == 0 {
+		// Every anchor was unusable. Succeeding here would commit a record
+		// asserting claims that the record itself does not ground.
+		return fleet.ExecutionResult{ErrorCode: AskErrorUngroundedClaims},
+			shoal.NewError(shoal.ErrorInternal,
+				"no verified evidence survived translation")
+	}
+	result := fleet.ExecutionResult{
+		Output: nil, Evidence: evidence,
+	}
+	if len(evidence) > 0 {
+		// A snapshot pin is only meaningful alongside evidence, and the
+		// dispatch service rejects one without it.
+		asOf := envelope.SnapshotAsOf.UTC()
+		if asOf.After(e.clock().UTC()) {
+			// The service would reject this as outside execution bounds. Fail
+			// with a code that names the cause instead of a generic evidence
+			// rejection; the pin is provenance and is never rewritten.
+			return fleet.ExecutionResult{ErrorCode: AskErrorEvidenceSkew},
+				shoal.NewError(shoal.ErrorInternal,
+					"evidence snapshot is ahead of the execution clock")
+		}
+		result.EvidenceSnapshotID = envelope.SnapshotID
+		result.EvidenceSnapshotAsOf = asOf
+	}
 	output, err := json.Marshal(askExecutorOutput(envelope, len(evidence)))
 	if err != nil {
 		return fleet.ExecutionResult{ErrorCode: AskErrorOutputEncoding}, err
 	}
-	result := fleet.ExecutionResult{Output: output, Evidence: evidence}
-	if len(evidence) > 0 {
-		// A snapshot pin is only meaningful alongside evidence, and the
-		// dispatch service rejects one without it.
-		result.EvidenceSnapshotID = envelope.SnapshotID
-		result.EvidenceSnapshotAsOf = envelope.SnapshotAsOf.UTC()
-	}
+	result.Output = output
 	return result, nil
 }
 
@@ -264,10 +269,11 @@ func askExecutorOutput(
 	envelope CitationEnvelope, evidenceCount int,
 ) AskExecutionOutput {
 	output := AskExecutionOutput{
-		Verification:  string(envelope.Verification),
-		EvidenceCount: evidenceCount,
-		Claims:        make([]AskOutputClaim, 0, len(envelope.Claims)),
-		Issues:        make([]AskOutputIssue, 0, len(envelope.Issues)),
+		Verification:     string(envelope.Verification),
+		OutputVisibility: envelope.OutputVisibility,
+		EvidenceCount:    evidenceCount,
+		ClaimCount:       len(envelope.Claims),
+		IssueCount:       len(envelope.Issues),
 	}
 	if evidenceCount > 0 {
 		output.SnapshotID = encodeID(envelope.SnapshotID)
@@ -275,58 +281,15 @@ func askExecutorOutput(
 	if envelope.SessionID != "" {
 		output.SessionID = encodeID(envelope.SessionID)
 	}
-	for _, claim := range envelope.Claims {
-		object, objectType := askExecutorValue(claim.Object)
-		output.Claims = append(output.Claims, AskOutputClaim{
-			Subject:    encodeID(claim.Subject),
-			Predicate:  encodeID(claim.Predicate),
-			Object:     object,
-			ObjectType: objectType,
-			Status:     string(claim.Status),
-			Confidence: float64(claim.Confidence),
-		})
-	}
-	for _, issue := range envelope.Issues {
-		output.Issues = append(output.Issues, AskOutputIssue{
-			Kind: string(issue.Kind), Reason: issue.Reason,
-		})
-	}
 	return output
 }
 
-// askExecutorValue renders one ontology value as a JSON string plus its
-// declared type, so output stays inside the declarative schema subset while
-// preserving the value's kind.
-func askExecutorValue(value ontology.Value) (string, string) {
-	switch value.Type() {
-	case ontology.ValueString:
-		text, _ := value.StringValue()
-		return text, string(value.Type())
-	case ontology.ValueInteger:
-		number, _ := value.IntegerValue()
-		return strconv.FormatInt(number, 10), string(value.Type())
-	case ontology.ValueNumber:
-		number, _ := value.NumberValue()
-		return strconv.FormatFloat(number, 'g', -1, 64), string(value.Type())
-	case ontology.ValueBoolean:
-		boolean, _ := value.BooleanValue()
-		return strconv.FormatBool(boolean), string(value.Type())
-	case ontology.ValueTimestamp:
-		stamp, _ := value.TimestampValue()
-		return stamp.UTC().Format(time.RFC3339Nano), string(value.Type())
-	case ontology.ValueReference:
-		reference, _ := value.ReferenceValue()
-		return encodeID(reference), string(value.Type())
-	default:
-		return "", string(value.Type())
-	}
-}
-
 // askExecutorEvidence translates verified citation evidence into dispatch
-// evidence references. It emits only entries that satisfy the interaction
-// evidence variants — an exact document citation, or a connected graph path —
-// and stops at the dispatch member bound rather than producing a reference the
-// service would reject wholesale.
+// evidence references. Every candidate is canonicalized through the same
+// interaction validation the dispatch service applies, and one that does not
+// satisfy an evidence variant is skipped rather than failing the batch: a
+// single malformed anchor must not discard a verified answer. Execute refuses
+// to succeed if nothing survives.
 func askExecutorEvidence(envelope CitationEnvelope) ([]fleet.EvidenceRef, error) {
 	refs := make([]fleet.EvidenceRef, 0, len(envelope.Evidence))
 	seen := make(map[shoal.ID]struct{}, len(envelope.Evidence))
@@ -338,17 +301,18 @@ func askExecutorEvidence(envelope CitationEnvelope) ([]fleet.EvidenceRef, error)
 		if _, duplicate := seen[evidence.AnchorID]; duplicate {
 			continue
 		}
-		ref, ok, err := askExecutorEvidenceRef(evidence)
-		if err != nil {
-			return nil, err
-		}
+		ref, ok := askExecutorEvidenceRef(evidence)
 		if !ok {
 			continue
 		}
 		cost := len(ref.NodeIDs) + len(ref.EdgeIDs) + len(ref.Assertions)
-		if members+cost > fleet.MaxActionEvidence ||
-			len(refs) >= fleet.MaxActionEvidence {
+		if len(refs) >= fleet.MaxActionEvidence {
 			break
+		}
+		if members+cost > fleet.MaxActionEvidence {
+			// One oversized path must not discard every smaller anchor after
+			// it, so keep packing what still fits.
+			continue
 		}
 		members += cost
 		seen[evidence.AnchorID] = struct{}{}
@@ -359,16 +323,14 @@ func askExecutorEvidence(envelope CitationEnvelope) ([]fleet.EvidenceRef, error)
 
 func askExecutorEvidenceRef(
 	evidence CitationEvidence,
-) (fleet.EvidenceRef, bool, error) {
+) (fleet.EvidenceRef, bool) {
 	visibility, err := interaction.Conjoin(evidence.Visibility)
-	if err != nil {
-		return fleet.EvidenceRef{}, false, err
-	}
-	if len(visibility) == 0 {
+	if err != nil || len(visibility) == 0 {
 		// Dispatch evidence requires visibility; an unlabeled anchor cannot be
 		// attributed and is dropped rather than recorded without a label.
-		return fleet.EvidenceRef{}, false, nil
+		return fleet.EvidenceRef{}, false
 	}
+	var ref fleet.EvidenceRef
 	switch {
 	case evidence.Citation != nil:
 		citation := *evidence.Citation
@@ -379,18 +341,15 @@ func askExecutorEvidenceRef(
 		if citation.SpanID != "" {
 			nodes = append(nodes, citation.SpanID)
 		}
-		return fleet.EvidenceRef{
+		ref = fleet.EvidenceRef{
 			AnchorID:   evidence.AnchorID,
 			Kind:       interaction.EvidenceDocument,
 			Citation:   citation,
 			NodeIDs:    dedupeAskEvidenceIDs(nodes),
 			Visibility: visibility,
-		}, true, nil
+		}
 	case evidence.Path != nil && len(evidence.Path.Nodes) > 0:
 		path := *evidence.Path
-		if len(path.Edges) != len(path.Nodes)-1 {
-			return fleet.EvidenceRef{}, false, nil
-		}
 		nodes := make([]shoal.ID, 0, len(path.Nodes))
 		for _, node := range path.Nodes {
 			nodes = append(nodes, node.ID)
@@ -401,36 +360,53 @@ func askExecutorEvidenceRef(
 		}
 		assertions := make([]interaction.AssertionReference, 0, len(evidence.Assertions))
 		for _, assertion := range evidence.Assertions {
+			// An assertion must name an edge this path actually references.
+			if !containsAskEvidenceID(edges, assertion.EdgeID) {
+				continue
+			}
 			assertions = append(assertions, interaction.AssertionReference{
 				AssertionID: assertion.AssertionID,
 				EdgeID:      assertion.EdgeID,
 				Origin:      assertion.Origin,
 			})
 		}
-		return fleet.EvidenceRef{
+		ref = fleet.EvidenceRef{
 			AnchorID:   evidence.AnchorID,
 			Kind:       interaction.EvidenceGraph,
 			NodeIDs:    nodes,
 			EdgeIDs:    edges,
 			Assertions: assertions,
 			Visibility: visibility,
-		}, true, nil
+		}
 	default:
-		return fleet.EvidenceRef{}, false, nil
+		return fleet.EvidenceRef{}, false
 	}
+	canonical, err := interaction.EvidenceReference{
+		AnchorID: ref.AnchorID, Kind: ref.Kind, Citation: ref.Citation,
+		NodeIDs: ref.NodeIDs, EdgeIDs: ref.EdgeIDs, Assertions: ref.Assertions,
+	}.Canonical()
+	if err != nil {
+		return fleet.EvidenceRef{}, false
+	}
+	ref.NodeIDs = canonical.NodeIDs
+	ref.EdgeIDs = canonical.EdgeIDs
+	ref.Assertions = canonical.Assertions
+	return ref, true
+}
+
+func containsAskEvidenceID(values []shoal.ID, value shoal.ID) bool {
+	for _, existing := range values {
+		if existing == value {
+			return true
+		}
+	}
+	return false
 }
 
 func dedupeAskEvidenceIDs(values []shoal.ID) []shoal.ID {
 	result := make([]shoal.ID, 0, len(values))
 	for _, value := range values {
-		duplicate := false
-		for _, existing := range result {
-			if existing == value {
-				duplicate = true
-				break
-			}
-		}
-		if !duplicate {
+		if !containsAskEvidenceID(result, value) {
 			result = append(result, value)
 		}
 	}
