@@ -21,6 +21,8 @@ package main
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"reflect"
 	"strings"
 
@@ -73,6 +75,30 @@ func (r configuredFleetExecutors) ResolveExecutor(
 ) (fleet.Executor, bool) {
 	executor, ok := r[reference]
 	return executor, ok
+}
+
+// bind attaches a real executor implementation to a reference the host has
+// already allowlisted. An unbound reference keeps its existing meaning: a
+// descriptor may register against it, and an invocation fails closed because
+// the placeholder implements no action execution. Binding happens once during
+// composition, before the listener serves, so the registry is never mutated
+// concurrently with resolution.
+func (r configuredFleetExecutors) bind(
+	reference string, executor fleet.Executor,
+) error {
+	if _, allowed := r[reference]; !allowed {
+		return fmt.Errorf(
+			"fleet executor reference %q is not in -fleet-executor-refs",
+			reference)
+	}
+	// fleet.Executor is an empty interface, so a typed nil would satisfy a
+	// plain nil check, resolve, satisfy the ActionExecutor assertion, and then
+	// panic mid-dispatch after the effect-admission record is already written.
+	if isNilFleetDependency(executor) {
+		return errors.New("fleet executor binding requires an implementation")
+	}
+	r[reference] = executor
+	return nil
 }
 
 func (s fleetInteractionSink) EnsureInteractionSink(ctx context.Context) error {

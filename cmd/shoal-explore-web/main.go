@@ -154,6 +154,14 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 		"Comma-separated opaque executor references accepted by the durable "+
 			"agent registry; empty keeps registration fail-closed",
 	)
+	fleetAskExecutorRef := flags.String(
+		"fleet-ask-executor-ref", os.Getenv("SHOAL_FLEET_ASK_EXECUTOR_REF"),
+		"Executor reference bound to the built-in grounded-reasoning "+
+			"executor; must also appear in -fleet-executor-refs and requires "+
+			"a configured chat provider. An agent principal invoking this "+
+			"executor needs the retrieve grant in addition to invoke, because "+
+			"the reasoning path authorizes retrieval on its own terms",
+	)
 	developmentAuth := flags.Bool(
 		"dev-auth", false,
 		"Authenticate every request as a fixed development principal; "+
@@ -522,6 +530,24 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 				listener.Close()
 				return err
 			}
+		}
+	}
+	if *fleetAskExecutorRef != "" {
+		if chat == nil {
+			listener.Close()
+			return errors.New(
+				"-fleet-ask-executor-ref requires workspace settings and a " +
+					"configured chat provider")
+		}
+		askExecutor, err := webapi.NewAskExecutor(
+			webapi.AskExecutorConfig{Provider: chat})
+		if err != nil {
+			listener.Close()
+			return err
+		}
+		if err := executors.bind(*fleetAskExecutorRef, askExecutor); err != nil {
+			listener.Close()
+			return err
 		}
 	}
 	var mcpTools []mcp.OptionalToolProvider

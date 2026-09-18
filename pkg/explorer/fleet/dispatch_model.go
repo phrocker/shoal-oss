@@ -569,9 +569,11 @@ func validateEvidence(values []EvidenceRef) error {
 		if err != nil {
 			return err
 		}
-		if len(value.Visibility) == 0 {
-			return shoal.NewError(shoal.ErrorInvalidArgument, "evidence visibility is required")
-		}
+		// An empty label set is public: a source that declares no visibility
+		// is unrestricted everywhere else in the platform, and evidence drawn
+		// from one therefore carries no labels. Requiring a label here made
+		// every anchor from an unlabeled corpus unrecordable. A reader
+		// matching labels must treat the empty set as matching every reader.
 		normalized, err := interaction.Conjoin(value.Visibility)
 		if err != nil {
 			return err
