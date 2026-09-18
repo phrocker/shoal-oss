@@ -41,7 +41,16 @@ import (
 //
 // It deliberately refuses any response that is not finalized, durably
 // recorded, and verified, so a dispatch action can never commit a successful
-// effect over ungrounded output.
+// effect over an answer the reasoning path did not ground.
+//
+// What the record carries is bounded separately from whether the answer is
+// grounded. The dispatch evidence bound counts members rather than anchors,
+// and a cited document anchor costs three, so a record holds at most 85 of
+// them while the reasoning harness allows far more. Anchors a claim cites are
+// packed first and the receipt reports what was left out. Failing the action
+// instead would discard a verified answer that the chat path returns happily,
+// after the model call was already billed; the complete grounding stays
+// durably recorded in the interaction session the receipt names.
 //
 // The invoking decision must carry auth.OperationRetrieve in addition to
 // auth.OperationInvoke: the reasoning service authorizes retrieval on its own
@@ -208,11 +217,13 @@ func AskActionOutputSchema() json.RawMessage {
 		`"evidence_considered":{"type":"integer"},` +
 		`"evidence_unusable":{"type":"integer"},` +
 		`"evidence_truncated":{"type":"boolean"},` +
+		`"cited_evidence_truncated":{"type":"boolean"},` +
 		`"claim_count":{"type":"integer"},` +
 		`"issue_count":{"type":"integer"}},` +
 		`"required":["verification","evidence_count","evidence_considered",` +
-		`"evidence_unusable","evidence_truncated","claim_count",` +
-		`"issue_count"],"additionalProperties":false}`)
+		`"evidence_unusable","evidence_truncated",` +
+		`"cited_evidence_truncated","claim_count","issue_count"],` +
+		`"additionalProperties":false}`)
 }
 
 type askExecutorInput struct {
@@ -239,8 +250,15 @@ type AskExecutionOutput struct {
 	// a correctness problem upstream, a truncated one is a bounds problem.
 	EvidenceUnusable  int  `json:"evidence_unusable"`
 	EvidenceTruncated bool `json:"evidence_truncated"`
-	ClaimCount        int  `json:"claim_count"`
-	IssueCount        int  `json:"issue_count"`
+	// CitedEvidenceTruncated reports that an anchor one of the answer's own
+	// claims rests on is absent from this record. Anchors a claim cites are
+	// packed first, so ordinary truncation drops retrieved-but-uncited
+	// evidence and leaves this false. When it is true the complete grounding
+	// is still durably recorded in the interaction session named by SessionID;
+	// it is this record that is bounded, not the answer.
+	CitedEvidenceTruncated bool `json:"cited_evidence_truncated"`
+	ClaimCount             int  `json:"claim_count"`
+	IssueCount             int  `json:"issue_count"`
 }
 
 // Execute runs one claimed action. The dispatch service owns the claim fence,
@@ -305,12 +323,6 @@ func (e *AskExecutor) Execute(
 			code = AskErrorEvidenceUnrecordable
 		}
 		return failAfterAsk(envelope, tally, code)
-	}
-	if tally.citedDropped {
-		// A claim in this answer rests on an anchor the record cannot hold.
-		// Committing would assert that claim over grounding the record does
-		// not carry, which is the case the whole guard exists to prevent.
-		return failAfterAsk(envelope, tally, AskErrorEvidenceUnrecordable)
 	}
 	result := fleet.ExecutionResult{
 		Output: nil, Evidence: evidence,
@@ -432,13 +444,14 @@ func askExecutorOutput(
 	envelope CitationEnvelope, evidenceCount int, tally askEvidenceTally,
 ) AskExecutionOutput {
 	output := AskExecutionOutput{
-		Verification:       string(envelope.Verification),
-		EvidenceCount:      evidenceCount,
-		EvidenceConsidered: tally.considered,
-		EvidenceUnusable:   tally.considered - tally.usable,
-		EvidenceTruncated:  tally.truncated,
-		ClaimCount:         len(envelope.Claims),
-		IssueCount:         len(envelope.Issues),
+		Verification:           string(envelope.Verification),
+		EvidenceCount:          evidenceCount,
+		EvidenceConsidered:     tally.considered,
+		EvidenceUnusable:       tally.considered - tally.usable,
+		EvidenceTruncated:      tally.truncated,
+		CitedEvidenceTruncated: tally.citedDropped,
+		ClaimCount:             len(envelope.Claims),
+		IssueCount:             len(envelope.Issues),
 	}
 	if envelope.SnapshotID != "" {
 		// Reported whenever it is known, not only on success: the pin is the
@@ -501,6 +514,12 @@ func askExecutorEvidence(
 		tally.considered++
 		ref, ok := askExecutorEvidenceRef(evidence)
 		if !ok {
+			if _, isCited := cited[evidence.AnchorID]; isCited {
+				// As lost to the record as one the bound could not fit.
+				// Setting this only in the packing loop would leave the
+				// guard depending on an invariant owned by another file.
+				tally.citedDropped = true
+			}
 			continue
 		}
 		tally.usable++

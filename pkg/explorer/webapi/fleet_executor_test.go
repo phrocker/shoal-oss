@@ -387,7 +387,8 @@ func TestAskExecutorOutputCarriesNoDocumentContent(t *testing.T) {
 		"verification": true, "snapshot_id": true, "session_id": true,
 		"evidence_count": true, "evidence_considered": true,
 		"evidence_unusable": true, "evidence_truncated": true,
-		"claim_count": true, "issue_count": true,
+		"cited_evidence_truncated": true, "claim_count": true,
+		"issue_count": true,
 	}
 	for key := range receipt {
 		if !allowed[key] {
@@ -655,10 +656,12 @@ func TestAskEvidenceMapperPacksCitedAnchorsFirst(t *testing.T) {
 	}
 }
 
-// TestAskExecutorRefusesToDropCitedGrounding proves that when a claim rests on
-// an anchor the record cannot hold, the action fails instead of committing a
-// claim the record does not ground.
-func TestAskExecutorRefusesToDropCitedGrounding(t *testing.T) {
+// TestAskExecutorReportsCitedGroundingLeftOut proves that when a claim rests on
+// an anchor the record cannot hold, the receipt says so. Failing the action
+// instead would discard a verified answer the chat path returns happily, after
+// the model call was already billed; the complete grounding stays in the
+// interaction session the receipt names.
+func TestAskExecutorReportsCitedGroundingLeftOut(t *testing.T) {
 	now := time.Now().UTC()
 	envelope := verifiedAskEnvelope(t, now.Add(-time.Hour))
 	nodes := make([]graph.Node, 0, 400)
@@ -686,5 +689,35 @@ func TestAskExecutorRefusesToDropCitedGrounding(t *testing.T) {
 	}
 	if len(refs) == 0 {
 		t.Fatal("the smaller anchors should still have been packed")
+	}
+	output := askExecutorOutput(envelope, len(refs), tally)
+	if !output.CitedEvidenceTruncated || output.SessionID == "" {
+		t.Fatalf("receipt must name the session holding the full grounding: %#v",
+			output)
+	}
+}
+
+// TestAskEvidenceMapperReportsUntranslatableCitedAnchors proves an anchor a
+// claim cites that cannot be expressed at all is reported the same way as one
+// the bound could not fit. Setting the flag only in the packing loop would
+// leave the guard depending on an invariant owned by another file.
+func TestAskEvidenceMapperReportsUntranslatableCitedAnchors(t *testing.T) {
+	now := time.Now().UTC()
+	valid := validCitationEvidence(t, "primary", "quote", nil, "snapshot", now)
+	envelope := CitationEnvelope{
+		Evidence: []CitationEvidence{
+			valid,
+			{AnchorID: "unexpressible"},
+		},
+		Claims: []CitationClaim{{
+			CitationAnchorIDs: []shoal.ID{valid.AnchorID, "unexpressible"},
+		}},
+	}
+	refs, tally := askExecutorEvidence(envelope)
+	if len(refs) != 1 {
+		t.Fatalf("refs = %#v", refs)
+	}
+	if !tally.citedDropped || tally.truncated {
+		t.Fatalf("tally = %#v", tally)
 	}
 }
