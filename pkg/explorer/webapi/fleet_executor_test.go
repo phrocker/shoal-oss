@@ -245,17 +245,8 @@ func TestAskExecutorAppliesChatFinalizationContract(t *testing.T) {
 		"missing ontology interpretation": func(e *CitationEnvelope) {
 			e.OntologyInterpretation = nil
 		},
-		"output visibility not derived from evidence": func(e *CitationEnvelope) {
-			e.EffectiveVisibility = []string{"secret"}
-		},
-		"unverified": func(e *CitationEnvelope) {
+		"response not verified": func(e *CitationEnvelope) {
 			e.Verification = reasoning.VerificationUnverified
-		},
-		"anchor identity is not canonical": func(e *CitationEnvelope) {
-			e.Evidence[0].AnchorID = "forged"
-		},
-		"evidence not verified": func(e *CitationEnvelope) {
-			e.Evidence[0].Status = reasoning.VerificationUnverified
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -313,6 +304,48 @@ func TestAskExecutorRejectsFutureSnapshot(t *testing.T) {
 	}
 	if result.ErrorCode != AskErrorEvidenceSkew || len(result.Evidence) != 0 {
 		t.Fatalf("result = %#v", result)
+	}
+	var output AskExecutionOutput
+	if err := json.Unmarshal(result.Output, &output); err != nil {
+		t.Fatal(err)
+	}
+	// Nothing was truncated: the member bound was never reached. Deriving the
+	// flag from the recorded count would report every post-translation failure
+	// as an overflow.
+	if output.EvidenceTruncated {
+		t.Fatalf("skew reported as truncation: %#v", output)
+	}
+	// The pin is the subject of this failure, so the operator must be able to
+	// see which one was ahead.
+	if output.SnapshotID == "" {
+		t.Fatalf("skew receipt omits the snapshot pin: %#v", output)
+	}
+}
+
+// TestAskExecutorRecordsSourceLabels proves a labeled source's labels reach the
+// recorded evidence. The empty case means public; this is the other half, and
+// it is the value a dispatch reader will match on once #369 enforces labels.
+func TestAskExecutorRecordsSourceLabels(t *testing.T) {
+	now := time.Now().UTC()
+	envelope := verifiedAskEnvelope(t, now.Add(-time.Hour))
+	labeled := validCitationEvidence(t, "primary", "a cited passage",
+		[]string{"project-x", "secret"}, "snapshot", now.Add(-time.Hour))
+	envelope.Evidence = []CitationEvidence{labeled}
+	refs, tally := askExecutorEvidence(envelope)
+	if len(refs) != 1 || tally.usable != 1 {
+		t.Fatalf("refs = %#v, tally = %#v", refs, tally)
+	}
+	conjoined, err := interaction.Conjoin(labeled.Visibility)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(refs[0].Visibility) != len(conjoined) {
+		t.Fatalf("visibility = %#v", refs[0].Visibility)
+	}
+	for index := range conjoined {
+		if refs[0].Visibility[index] != conjoined[index] {
+			t.Fatalf("visibility = %#v, want %#v", refs[0].Visibility, conjoined)
+		}
 	}
 }
 
@@ -494,5 +527,51 @@ func TestAskEvidenceMapperPacksWithinTheMemberBound(t *testing.T) {
 	output := askExecutorOutput(envelope, len(refs), tally)
 	if !output.EvidenceTruncated || output.EvidenceUnusable != 0 {
 		t.Fatalf("receipt = %#v", output)
+	}
+}
+
+// TestAskExecutorSeparatesStructuralRejection proves a structurally invalid
+// envelope is distinguishable from one that is merely not finalized. Both are
+// refused, but they need different responses: one is a provider correctness
+// problem, the other a workspace or ontology state problem.
+func TestAskExecutorSeparatesStructuralRejection(t *testing.T) {
+	now := time.Now().UTC()
+	for name, mutate := range map[string]func(*CitationEnvelope){
+		"anchor identity is not canonical": func(e *CitationEnvelope) {
+			e.Evidence[0].AnchorID = "forged"
+		},
+		"evidence not verified": func(e *CitationEnvelope) {
+			e.Evidence[0].Status = reasoning.VerificationUnverified
+		},
+		// Evidence visibility must conjoin to the response's effective
+		// visibility, which Validate cross-checks before finalization runs.
+		"output visibility not derived from evidence": func(e *CitationEnvelope) {
+			e.EffectiveVisibility = []string{"secret"}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			envelope := verifiedAskEnvelope(t, now.Add(-time.Hour))
+			mutate(&envelope)
+			executor, err := NewAskExecutor(AskExecutorConfig{
+				Provider: &stubAskProvider{envelope: envelope},
+				Clock:    func() time.Time { return now },
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			result, err := executor.Execute(context.Background(), fleet.Invocation{
+				Capability: AskCapability, Action: AskAction,
+				Input: json.RawMessage(`{"question":"anything"}`),
+			})
+			if err != nil {
+				t.Fatalf("a post-Ask failure must still return a receipt: %v", err)
+			}
+			if result.ErrorCode != AskErrorInvalidEnvelope {
+				t.Fatalf("error code = %q", result.ErrorCode)
+			}
+			if len(result.Evidence) != 0 {
+				t.Fatalf("a refused envelope recorded evidence: %#v", result.Evidence)
+			}
+		})
 	}
 }

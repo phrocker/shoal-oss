@@ -45,7 +45,8 @@ import (
 // The invoking decision must carry auth.OperationRetrieve in addition to
 // auth.OperationInvoke: the reasoning service authorizes retrieval on its own
 // terms. A principal granted only invoke and dispatch fails every action with
-// AskErrorRetrieveUnauthorized rather than a generic reasoning failure.
+// AskErrorReasoningUnauthorized, which separates an authorization refusal from
+// a model or transport failure but does not identify which refusal it was.
 //
 // Action output is a receipt, not the answer. DispatchService.Status, Pull and
 // TeamActions authorize a reader on (domain, source, policy, object) and apply
@@ -81,6 +82,14 @@ const (
 	AskErrorReasoningFailed   = "reasoning_failed"
 	AskErrorUnverified        = "unverified_response"
 	AskErrorUngroundedClaims  = "ungrounded_claims"
+	// AskErrorInvalidEnvelope separates a structurally invalid response from
+	// one that is merely not finalized. Neither code carries the underlying
+	// reason: a validation message can name document identifiers, and the
+	// action record is durable and read without a visibility-label check, so
+	// the rule that keeps content out of the receipt keeps it out of the error
+	// code too. A composition owner that needs the detail has it at the
+	// provider boundary.
+	AskErrorInvalidEnvelope = "invalid_envelope"
 	// AskErrorReasoningUnauthorized covers every authorization refusal from
 	// the reasoning path. The usual cause is an agent principal granted
 	// invoke and dispatch but not retrieve, but a workspace limit set to zero
@@ -242,7 +251,7 @@ func (e *AskExecutor) Execute(
 	// content-derived identity. This path writes those anchors into a durable
 	// attestation-bearing record, so it is the path that most needs them.
 	if err := envelope.Validate(); err != nil {
-		return failAfterAsk(envelope, askEvidenceTally{}, AskErrorUnverified)
+		return failAfterAsk(envelope, askEvidenceTally{}, AskErrorInvalidEnvelope)
 	}
 	if err := validateFinalizedChatResponse(envelope); err != nil {
 		return failAfterAsk(envelope, askEvidenceTally{}, AskErrorUnverified)
@@ -345,11 +354,14 @@ func askExecutorOutput(
 		EvidenceCount:      evidenceCount,
 		EvidenceConsidered: tally.considered,
 		EvidenceUnusable:   tally.considered - tally.usable,
-		EvidenceTruncated:  tally.usable > evidenceCount,
+		EvidenceTruncated:  tally.truncated,
 		ClaimCount:         len(envelope.Claims),
 		IssueCount:         len(envelope.Issues),
 	}
-	if evidenceCount > 0 {
+	if envelope.SnapshotID != "" {
+		// Reported whenever it is known, not only on success: the pin is the
+		// subject of the unpinned and skew failures, and an operator cannot
+		// diagnose either without seeing it.
 		output.SnapshotID = encodeID(envelope.SnapshotID)
 	}
 	if envelope.SessionID != "" {
@@ -373,6 +385,11 @@ type askEvidenceTally struct {
 	// usable counts those that translated into a valid reference, whether or
 	// not the member bound then left room to record them.
 	usable int
+	// truncated records that the member bound dropped a usable reference.
+	// Deriving this from the recorded count instead would report every
+	// post-translation failure as a truncation, because those paths report no
+	// recorded evidence at all.
+	truncated bool
 }
 
 func askExecutorEvidence(
@@ -402,11 +419,13 @@ func askExecutorEvidence(
 		tally.usable++
 		cost := len(ref.NodeIDs) + len(ref.EdgeIDs) + len(ref.Assertions)
 		if len(refs) >= fleet.MaxActionEvidence {
+			tally.truncated = true
 			continue
 		}
 		if members+cost > fleet.MaxActionEvidence {
 			// One oversized path must not discard every smaller anchor after
 			// it, so keep packing what still fits.
+			tally.truncated = true
 			continue
 		}
 		members += cost
