@@ -43,15 +43,26 @@ import (
 // recorded, and verified, so a dispatch action can never commit a successful
 // effect over ungrounded output.
 //
-// Action output is a receipt, not the answer. DispatchService.TeamActions
-// authorizes a reader on (domain, source, policy, object) and applies no
-// visibility-label check before serializing ActionRecord.Output, so anything
+// The invoking decision must carry auth.OperationRetrieve in addition to
+// auth.OperationInvoke: the reasoning service authorizes retrieval on its own
+// terms. A principal granted only invoke and dispatch fails every action with
+// AskErrorRetrieveUnauthorized rather than a generic reasoning failure.
+//
+// Action output is a receipt, not the answer. DispatchService.Status, Pull and
+// TeamActions authorize a reader on (domain, source, policy, object) and apply
+// no visibility-label check before serializing an ActionRecord, so anything
 // this executor writes there is readable by a principal who does not hold the
-// source labels. Claim values, issue reasons, and ontology identifiers are all
-// derived from retrieved documents, so none of them belong in Output. The
-// receipt reports only what the execution did; the verified claims stay
-// reachable through the visibility-enforcing interaction path using the
-// recorded session ID.
+// source labels. Claim values, issue reasons, ontology identifiers, and the
+// effective output label expression are all derived from retrieved documents,
+// so none of them belong in Output. The receipt reports only what the
+// execution did; the verified claims stay reachable through the
+// visibility-enforcing interaction path using the recorded session ID.
+//
+// ActionRecord.Evidence is the larger surface and is not addressed here: it
+// carries citation identifiers, offsets, and label expressions past the same
+// unenforced read path. Each reference records its own Visibility, but no
+// reader applies it. That gap belongs to the dispatch read path rather than to
+// this executor and is tracked by issue #369.
 const (
 	// AskCapability and AskAction name the single capability this executor
 	// serves. A descriptor must declare both for resolution to select it.
@@ -66,14 +77,14 @@ const (
 // Executor error codes. They are recorded verbatim on a failed ActionRecord
 // and are stable wire values.
 const (
-	AskErrorUnsupportedAction = "unsupported_action"
-	AskErrorInvalidInput      = "invalid_input"
-	AskErrorReasoningFailed   = "reasoning_failed"
-	AskErrorUnverified        = "unverified_response"
-	AskErrorInvalidEvidence   = "invalid_evidence"
-	AskErrorUngroundedClaims  = "ungrounded_claims"
-	AskErrorEvidenceSkew      = "evidence_snapshot_skew"
-	AskErrorOutputEncoding    = "output_encoding_failed"
+	AskErrorUnsupportedAction    = "unsupported_action"
+	AskErrorInvalidInput         = "invalid_input"
+	AskErrorReasoningFailed      = "reasoning_failed"
+	AskErrorUnverified           = "unverified_response"
+	AskErrorUngroundedClaims     = "ungrounded_claims"
+	AskErrorRetrieveUnauthorized = "retrieve_unauthorized"
+	AskErrorEvidenceSkew         = "evidence_snapshot_skew"
+	AskErrorOutputEncoding       = "output_encoding_failed"
 )
 
 // AskExecutorConfig configures one executor. Provider is required and is
@@ -145,14 +156,16 @@ func AskActionInputSchema() json.RawMessage {
 func AskActionOutputSchema() json.RawMessage {
 	return json.RawMessage(`{"type":"object","properties":{` +
 		`"verification":{"type":"string"},` +
-		`"output_visibility":{"type":"string"},` +
 		`"snapshot_id":{"type":"string"},` +
 		`"session_id":{"type":"string"},` +
 		`"evidence_count":{"type":"integer"},` +
+		`"evidence_considered":{"type":"integer"},` +
+		`"evidence_truncated":{"type":"boolean"},` +
 		`"claim_count":{"type":"integer"},` +
 		`"issue_count":{"type":"integer"}},` +
-		`"required":["verification","evidence_count","claim_count",` +
-		`"issue_count"],"additionalProperties":false}`)
+		`"required":["verification","evidence_count","evidence_considered",` +
+		`"evidence_truncated","claim_count","issue_count"],` +
+		`"additionalProperties":false}`)
 }
 
 type askExecutorInput struct {
@@ -163,13 +176,19 @@ type askExecutorInput struct {
 // AskExecutionOutput is the executor's action output receipt. It deliberately
 // carries no document-derived content: see the AskExecutor doc comment.
 type AskExecutionOutput struct {
-	Verification     string `json:"verification"`
-	OutputVisibility string `json:"output_visibility,omitempty"`
-	SnapshotID       string `json:"snapshot_id,omitempty"`
-	SessionID        string `json:"session_id,omitempty"`
-	EvidenceCount    int    `json:"evidence_count"`
-	ClaimCount       int    `json:"claim_count"`
-	IssueCount       int    `json:"issue_count"`
+	Verification  string `json:"verification"`
+	SnapshotID    string `json:"snapshot_id,omitempty"`
+	SessionID     string `json:"session_id,omitempty"`
+	EvidenceCount int    `json:"evidence_count"`
+	// EvidenceConsidered and EvidenceTruncated report when the dispatch member
+	// bound dropped usable anchors. The bound counts members, not anchors, so
+	// a fully-cited document anchor costs three and an evidence-rich answer
+	// truncates well before the reasoning harness anchor limit. Without this a
+	// reader cannot tell a complete grounding from a clipped one.
+	EvidenceConsidered int  `json:"evidence_considered"`
+	EvidenceTruncated  bool `json:"evidence_truncated"`
+	ClaimCount         int  `json:"claim_count"`
+	IssueCount         int  `json:"issue_count"`
 }
 
 // Execute runs one claimed action. The dispatch service owns the claim fence,
@@ -195,6 +214,14 @@ func (e *AskExecutor) Execute(
 	envelope, err := e.provider.Ask(
 		ctx, AskRequest{Question: input.Question, TopK: input.TopK})
 	if err != nil {
+		if shoal.IsErrorCode(err, shoal.ErrorUnauthorized) {
+			// The reasoning service authorizes retrieval separately. An agent
+			// principal granted only invoke and dispatch lands here on every
+			// action, so name the missing grant instead of reporting a
+			// generic reasoning failure.
+			return fleet.ExecutionResult{
+				ErrorCode: AskErrorRetrieveUnauthorized}, err
+		}
 		return fleet.ExecutionResult{ErrorCode: AskErrorReasoningFailed}, err
 	}
 	if !envelope.Finalized || !envelope.DurablyRecorded ||
@@ -203,10 +230,10 @@ func (e *AskExecutor) Execute(
 			shoal.NewError(shoal.ErrorInternal,
 				"ask response was not verified and durably recorded")
 	}
-	evidence, err := askExecutorEvidence(envelope)
-	if err != nil {
-		return fleet.ExecutionResult{ErrorCode: AskErrorInvalidEvidence}, err
-	}
+	evidence, considered := askExecutorEvidence(envelope)
+	// The guard is on what the envelope offered, not on what survived
+	// translation: an answer whose anchors were all unusable is exactly the
+	// case that must not commit.
 	if len(envelope.Evidence) > 0 && len(evidence) == 0 {
 		// Every anchor was unusable. Succeeding here would commit a record
 		// asserting claims that the record itself does not ground.
@@ -232,7 +259,8 @@ func (e *AskExecutor) Execute(
 		result.EvidenceSnapshotID = envelope.SnapshotID
 		result.EvidenceSnapshotAsOf = asOf
 	}
-	output, err := json.Marshal(askExecutorOutput(envelope, len(evidence)))
+	output, err := json.Marshal(
+		askExecutorOutput(envelope, len(evidence), considered))
 	if err != nil {
 		return fleet.ExecutionResult{ErrorCode: AskErrorOutputEncoding}, err
 	}
@@ -266,14 +294,15 @@ func decodeAskExecutorInput(raw json.RawMessage) (askExecutorInput, error) {
 }
 
 func askExecutorOutput(
-	envelope CitationEnvelope, evidenceCount int,
+	envelope CitationEnvelope, evidenceCount, considered int,
 ) AskExecutionOutput {
 	output := AskExecutionOutput{
-		Verification:     string(envelope.Verification),
-		OutputVisibility: envelope.OutputVisibility,
-		EvidenceCount:    evidenceCount,
-		ClaimCount:       len(envelope.Claims),
-		IssueCount:       len(envelope.Issues),
+		Verification:       string(envelope.Verification),
+		EvidenceCount:      evidenceCount,
+		EvidenceConsidered: considered,
+		EvidenceTruncated:  considered > evidenceCount,
+		ClaimCount:         len(envelope.Claims),
+		IssueCount:         len(envelope.Issues),
 	}
 	if evidenceCount > 0 {
 		output.SnapshotID = encodeID(envelope.SnapshotID)
@@ -290,10 +319,14 @@ func askExecutorOutput(
 // satisfy an evidence variant is skipped rather than failing the batch: a
 // single malformed anchor must not discard a verified answer. Execute refuses
 // to succeed if nothing survives.
-func askExecutorEvidence(envelope CitationEnvelope) ([]fleet.EvidenceRef, error) {
+// The second return is the number of distinct, usable anchors the envelope
+// offered. It exceeds len(refs) exactly when the dispatch member bound dropped
+// evidence the answer was actually grounded in, which the receipt reports.
+func askExecutorEvidence(envelope CitationEnvelope) ([]fleet.EvidenceRef, int) {
 	refs := make([]fleet.EvidenceRef, 0, len(envelope.Evidence))
 	seen := make(map[shoal.ID]struct{}, len(envelope.Evidence))
 	members := 0
+	considered := 0
 	for _, evidence := range envelope.Evidence {
 		if evidence.AnchorID == "" {
 			continue
@@ -305,9 +338,11 @@ func askExecutorEvidence(envelope CitationEnvelope) ([]fleet.EvidenceRef, error)
 		if !ok {
 			continue
 		}
+		seen[evidence.AnchorID] = struct{}{}
+		considered++
 		cost := len(ref.NodeIDs) + len(ref.EdgeIDs) + len(ref.Assertions)
 		if len(refs) >= fleet.MaxActionEvidence {
-			break
+			continue
 		}
 		if members+cost > fleet.MaxActionEvidence {
 			// One oversized path must not discard every smaller anchor after
@@ -315,10 +350,9 @@ func askExecutorEvidence(envelope CitationEnvelope) ([]fleet.EvidenceRef, error)
 			continue
 		}
 		members += cost
-		seen[evidence.AnchorID] = struct{}{}
 		refs = append(refs, ref)
 	}
-	return refs, nil
+	return refs, considered
 }
 
 func askExecutorEvidenceRef(
@@ -334,12 +368,21 @@ func askExecutorEvidenceRef(
 	switch {
 	case evidence.Citation != nil:
 		citation := *evidence.Citation
-		nodes := []shoal.ID{citation.DocumentID}
-		if citation.SectionID != "" {
-			nodes = append(nodes, citation.SectionID)
-		}
-		if citation.SpanID != "" {
-			nodes = append(nodes, citation.SpanID)
+		// The verifier resolves a citation's document, section, and span
+		// identities into SourceIDs even when the model cited at document
+		// granularity, and the interaction record for this anchor uses those
+		// three roles. Rebuilding the roles from the raw citation would commit
+		// a narrower grounding than the interaction record asserts for the
+		// same anchor.
+		nodes := append([]shoal.ID(nil), evidence.SourceIDs...)
+		if len(nodes) != 3 {
+			nodes = []shoal.ID{citation.DocumentID}
+			if citation.SectionID != "" {
+				nodes = append(nodes, citation.SectionID)
+			}
+			if citation.SpanID != "" {
+				nodes = append(nodes, citation.SpanID)
+			}
 		}
 		ref = fleet.EvidenceRef{
 			AnchorID:   evidence.AnchorID,

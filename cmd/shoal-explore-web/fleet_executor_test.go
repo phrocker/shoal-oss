@@ -25,6 +25,7 @@ import (
 	"encoding/json"
 	"errors"
 	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 
@@ -516,7 +517,9 @@ func TestAskExecutorRejectsFutureSnapshot(t *testing.T) {
 // so claim values, issue reasons, and ontology identifiers must not appear.
 func TestAskExecutorOutputCarriesNoDocumentContent(t *testing.T) {
 	envelope := verifiedAskEnvelope(time.Now().UTC().Add(-time.Hour))
-	envelope.OutputVisibility = "public"
+	// The effective output label expression is itself derived from the
+	// retrieved sources, so it must not reach the receipt either.
+	envelope.OutputVisibility = "secret&project-x"
 	envelope.Issues = []webapi.CitationIssue{{
 		Kind: "unsupported", Reason: "restricted phrasing from a source document",
 	}}
@@ -536,14 +539,17 @@ func TestAskExecutorOutputCarriesNoDocumentContent(t *testing.T) {
 	if bytes.Contains(result.Output, []byte("restricted phrasing")) {
 		t.Fatalf("issue text leaked into the action receipt: %s", result.Output)
 	}
+	if bytes.Contains(result.Output, []byte("project-x")) {
+		t.Fatalf("source label expression leaked into the receipt: %s", result.Output)
+	}
 	var receipt map[string]any
 	if err := json.Unmarshal(result.Output, &receipt); err != nil {
 		t.Fatal(err)
 	}
 	allowed := map[string]bool{
-		"verification": true, "output_visibility": true, "snapshot_id": true,
-		"session_id": true, "evidence_count": true, "claim_count": true,
-		"issue_count": true,
+		"verification": true, "snapshot_id": true, "session_id": true,
+		"evidence_count": true, "evidence_considered": true,
+		"evidence_truncated": true, "claim_count": true, "issue_count": true,
 	}
 	for key := range receipt {
 		if !allowed[key] {
@@ -554,7 +560,136 @@ func TestAskExecutorOutputCarriesNoDocumentContent(t *testing.T) {
 	if err := json.Unmarshal(result.Output, &output); err != nil {
 		t.Fatal(err)
 	}
-	if output.IssueCount != 1 || output.OutputVisibility != "public" {
+	if output.IssueCount != 1 {
 		t.Fatalf("receipt = %#v", output)
+	}
+}
+
+// TestAskExecutorReportsEvidenceTruncation proves a receipt distinguishes a
+// complete grounding from a clipped one. The dispatch bound counts evidence
+// members rather than anchors, so an evidence-rich verified answer truncates
+// well before the reasoning harness anchor limit, and a reader who cannot see
+// that would read the claim count as fully grounded.
+func TestAskExecutorReportsEvidenceTruncation(t *testing.T) {
+	now := time.Now().UTC()
+	envelope := verifiedAskEnvelope(now.Add(-time.Hour))
+	envelope.Evidence = nil
+	// Each fully-cited document anchor costs three members against a bound of
+	// 256, so 120 anchors cannot all be recorded.
+	for index := 0; index < 120; index++ {
+		suffix := shoal.ID(strconv.Itoa(index))
+		citation := document.Citation{
+			DocumentID: "document" + suffix, RevisionID: "revision" + suffix,
+			SectionID: "section" + suffix, SpanID: "span" + suffix,
+		}
+		envelope.Evidence = append(envelope.Evidence, webapi.CitationEvidence{
+			AnchorID: "anchor" + suffix, Citation: &citation,
+			Visibility: []string{"public"},
+		})
+	}
+	executor, err := webapi.NewAskExecutor(webapi.AskExecutorConfig{
+		Provider: &stubAskProvider{envelope: envelope},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := executor.Execute(context.Background(), fleet.Invocation{
+		Capability: webapi.AskCapability, Action: webapi.AskAction,
+		Input: json.RawMessage(`{"question":"anything"}`),
+	})
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	var output webapi.AskExecutionOutput
+	if err := json.Unmarshal(result.Output, &output); err != nil {
+		t.Fatal(err)
+	}
+	if output.EvidenceConsidered != 120 {
+		t.Fatalf("considered = %d", output.EvidenceConsidered)
+	}
+	if !output.EvidenceTruncated {
+		t.Fatal("a clipped grounding must be reported as truncated")
+	}
+	if output.EvidenceCount != len(result.Evidence) ||
+		output.EvidenceCount >= output.EvidenceConsidered {
+		t.Fatalf("receipt = %#v, recorded = %d", output, len(result.Evidence))
+	}
+}
+
+// TestAskExecutorUsesResolvedCitationSourceRoles proves the recorded evidence
+// carries the same document, section, and span roles the verifier resolved,
+// rather than a narrower set rebuilt from a document-granularity citation.
+func TestAskExecutorUsesResolvedCitationSourceRoles(t *testing.T) {
+	now := time.Now().UTC()
+	envelope := verifiedAskEnvelope(now.Add(-time.Hour))
+	envelope.Evidence[0].Citation = &document.Citation{
+		DocumentID: "document", RevisionID: "revision", SectionID: "section",
+	}
+	envelope.Evidence[0].SourceIDs = []shoal.ID{"document", "section", "span"}
+	executor, err := webapi.NewAskExecutor(webapi.AskExecutorConfig{
+		Provider: &stubAskProvider{envelope: envelope},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := executor.Execute(context.Background(), fleet.Invocation{
+		Capability: webapi.AskCapability, Action: webapi.AskAction,
+		Input: json.RawMessage(`{"question":"anything"}`),
+	})
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	if len(result.Evidence) != 1 || len(result.Evidence[0].NodeIDs) != 3 {
+		t.Fatalf("evidence = %#v", result.Evidence)
+	}
+	for _, want := range []shoal.ID{"document", "section", "span"} {
+		found := false
+		for _, got := range result.Evidence[0].NodeIDs {
+			if got == want {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("resolved role %q missing from %#v",
+				want, result.Evidence[0].NodeIDs)
+		}
+	}
+}
+
+// TestAskExecutorNamesMissingRetrieveGrant proves an agent principal granted
+// only invoke and dispatch gets a code naming the missing grant, not a generic
+// reasoning failure that looks like a model outage.
+func TestAskExecutorNamesMissingRetrieveGrant(t *testing.T) {
+	executor, err := webapi.NewAskExecutor(webapi.AskExecutorConfig{
+		Provider: &stubAskProvider{
+			err: shoal.NewError(shoal.ErrorUnauthorized, "retrieve is not permitted"),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := executor.Execute(context.Background(), fleet.Invocation{
+		Capability: webapi.AskCapability, Action: webapi.AskAction,
+		Input: json.RawMessage(`{"question":"anything"}`),
+	})
+	if err == nil || result.ErrorCode != webapi.AskErrorRetrieveUnauthorized {
+		t.Fatalf("result = %#v, err = %v", result, err)
+	}
+}
+
+// TestBindRejectsTypedNilExecutor proves a typed nil cannot enter the registry.
+// fleet.Executor is an empty interface, so a plain nil check would admit one,
+// and it would panic mid-dispatch after the effect-admission record is written.
+func TestBindRejectsTypedNilExecutor(t *testing.T) {
+	registry := configuredFleetExecutors{"allowed": configuredFleetExecutor{
+		reference: "allowed",
+	}}
+	var typedNil *webapi.AskExecutor
+	if err := registry.bind("allowed", typedNil); err == nil {
+		t.Fatal("a typed-nil executor must be refused")
+	}
+	bound, _ := registry.ResolveExecutor("allowed")
+	if _, ok := bound.(fleet.ActionExecutor); ok {
+		t.Fatal("a refused binding must not replace the placeholder")
 	}
 }

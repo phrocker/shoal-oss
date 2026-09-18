@@ -158,7 +158,9 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 		"fleet-ask-executor-ref", os.Getenv("SHOAL_FLEET_ASK_EXECUTOR_REF"),
 		"Executor reference bound to the built-in grounded-reasoning "+
 			"executor; must also appear in -fleet-executor-refs and requires "+
-			"a configured chat provider",
+			"a configured chat provider. An agent principal invoking this "+
+			"executor needs the retrieve grant in addition to invoke, because "+
+			"the reasoning path authorizes retrieval on its own terms",
 	)
 	developmentAuth := flags.Bool(
 		"dev-auth", false,

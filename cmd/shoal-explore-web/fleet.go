@@ -91,7 +91,10 @@ func (r configuredFleetExecutors) bind(
 			"fleet executor reference %q is not in -fleet-executor-refs",
 			reference)
 	}
-	if executor == nil {
+	// fleet.Executor is an empty interface, so a typed nil would satisfy a
+	// plain nil check, resolve, satisfy the ActionExecutor assertion, and then
+	// panic mid-dispatch after the effect-admission record is already written.
+	if isNilFleetDependency(executor) {
 		return errors.New("fleet executor binding requires an implementation")
 	}
 	r[reference] = executor
