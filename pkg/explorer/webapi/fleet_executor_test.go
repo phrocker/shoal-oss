@@ -575,3 +575,116 @@ func TestAskExecutorSeparatesStructuralRejection(t *testing.T) {
 		})
 	}
 }
+
+// TestAskExecutorIsIdempotentForOneExecutorKey proves a retried action does not
+// bill a second model call. The dispatch service threads a stable executor key
+// into every invocation for this purpose: an ambiguous execution leaves the
+// action claimed, and once the claim lease expires it is re-claimed and
+// executed again.
+func TestAskExecutorIsIdempotentForOneExecutorKey(t *testing.T) {
+	now := time.Now().UTC()
+	provider := &stubAskProvider{envelope: verifiedAskEnvelope(t, now.Add(-time.Hour))}
+	executor, err := NewAskExecutor(AskExecutorConfig{
+		Provider: provider, Clock: func() time.Time { return now },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	invocation := fleet.Invocation{
+		Capability: AskCapability, Action: AskAction,
+		IdempotencyKey: []byte("executor-key"),
+		Input:          json.RawMessage(`{"question":"anything"}`),
+	}
+	first, err := executor.Execute(context.Background(), invocation)
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	second, err := executor.Execute(context.Background(), invocation)
+	if err != nil {
+		t.Fatalf("retry: %v", err)
+	}
+	if provider.calls != 1 {
+		t.Fatalf("a retry billed %d model calls", provider.calls)
+	}
+	if !bytes.Equal(first.Output, second.Output) ||
+		len(first.Evidence) != len(second.Evidence) ||
+		first.EvidenceSnapshotID != second.EvidenceSnapshotID {
+		t.Fatalf("retry returned a different result:\n%#v\n%#v", first, second)
+	}
+	// A different action must not be served from the first one's result.
+	invocation.IdempotencyKey = []byte("other-key")
+	if _, err := executor.Execute(context.Background(), invocation); err != nil {
+		t.Fatalf("second action: %v", err)
+	}
+	if provider.calls != 2 {
+		t.Fatalf("distinct executor keys shared a result: %d calls", provider.calls)
+	}
+}
+
+// TestAskEvidenceMapperPacksCitedAnchorsFirst proves the member bound drops
+// retrieved-but-uncited evidence before anything a claim rests on. Without the
+// ordering an evidence-rich answer would commit as succeeded while the anchors
+// its own claims cite were the ones discarded.
+func TestAskEvidenceMapperPacksCitedAnchorsFirst(t *testing.T) {
+	now := time.Now().UTC()
+	envelope := CitationEnvelope{}
+	var cited []shoal.ID
+	for index := 0; index < 120; index++ {
+		evidence := validCitationEvidence(
+			t, "doc"+strconv.Itoa(index), "quote", nil, "snapshot", now)
+		envelope.Evidence = append(envelope.Evidence, evidence)
+		// The claim rests on the anchors that arrive last, so only the
+		// cited-first ordering can keep them.
+		if index >= 110 {
+			cited = append(cited, evidence.AnchorID)
+		}
+	}
+	envelope.Claims = []CitationClaim{{CitationAnchorIDs: cited}}
+	refs, tally := askExecutorEvidence(envelope)
+	if !tally.truncated || tally.citedDropped {
+		t.Fatalf("tally = %#v", tally)
+	}
+	recorded := make(map[shoal.ID]struct{}, len(refs))
+	for _, ref := range refs {
+		recorded[ref.AnchorID] = struct{}{}
+	}
+	for _, anchorID := range cited {
+		if _, ok := recorded[anchorID]; !ok {
+			t.Fatalf("a cited anchor was dropped: %q", anchorID)
+		}
+	}
+}
+
+// TestAskExecutorRefusesToDropCitedGrounding proves that when a claim rests on
+// an anchor the record cannot hold, the action fails instead of committing a
+// claim the record does not ground.
+func TestAskExecutorRefusesToDropCitedGrounding(t *testing.T) {
+	now := time.Now().UTC()
+	envelope := verifiedAskEnvelope(t, now.Add(-time.Hour))
+	nodes := make([]graph.Node, 0, 400)
+	edges := make([]graph.Edge, 0, 399)
+	for index := 0; index < 400; index++ {
+		nodes = append(nodes, graph.Node{ID: shoal.ID("n" + strconv.Itoa(index))})
+		if index > 0 {
+			edges = append(edges, graph.Edge{
+				ID:   shoal.ID("e" + strconv.Itoa(index)),
+				From: shoal.ID("n" + strconv.Itoa(index-1)),
+				To:   shoal.ID("n" + strconv.Itoa(index)),
+			})
+		}
+	}
+	oversized := CitationEvidence{
+		AnchorID: "huge", Path: &graph.Path{Nodes: nodes, Edges: edges},
+	}
+	envelope.Evidence = append(envelope.Evidence, oversized)
+	envelope.Claims = []CitationClaim{{
+		CitationAnchorIDs: []shoal.ID{oversized.AnchorID},
+	}}
+	refs, tally := askExecutorEvidence(envelope)
+	if !tally.citedDropped {
+		t.Fatalf("an unrecordable cited anchor was not reported: %#v", tally)
+	}
+	if len(refs) == 0 {
+		t.Fatal("the smaller anchors should still have been packed")
+	}
+}

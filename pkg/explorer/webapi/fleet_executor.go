@@ -23,6 +23,7 @@ import (
 	"context"
 	"encoding/json"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/phrocker/shoal-oss/pkg/explorer/fleet"
@@ -72,6 +73,8 @@ const (
 	// MaxAskQuestionBytes bounds one decoded question independently of the
 	// action's declared input schema.
 	MaxAskQuestionBytes = 4096
+
+	defaultAskRecentResults = 256
 )
 
 // Executor error codes. They are recorded verbatim on a failed ActionRecord
@@ -90,11 +93,13 @@ const (
 	// code too. A composition owner that needs the detail has it at the
 	// provider boundary.
 	AskErrorInvalidEnvelope = "invalid_envelope"
-	// AskErrorReasoningUnauthorized covers every authorization refusal from
-	// the reasoning path. The usual cause is an agent principal granted
-	// invoke and dispatch but not retrieve, but a workspace limit set to zero
-	// and a per-object or mosaic-budget denial land here too, so the code does
-	// not claim to name which.
+	// AskErrorReasoningUnauthorized covers an authorization refusal the
+	// reasoning path reports as unauthorized. In practice that is an agent
+	// principal granted invoke and dispatch but not retrieve, and a workspace
+	// whose chat resources are disabled. Object-level denial is reported as
+	// not-found rather than unauthorized, so it lands in
+	// AskErrorReasoningFailed; the code does not claim to name which refusal
+	// occurred.
 	AskErrorReasoningUnauthorized = "reasoning_unauthorized"
 	AskErrorEvidenceSkew          = "evidence_snapshot_skew"
 	AskErrorEvidenceUnpinned      = "evidence_unpinned"
@@ -108,6 +113,9 @@ type AskExecutorConfig struct {
 	Provider   AskProvider
 	Capability string
 	Action     string
+	// MaxRecentResults bounds the in-process result cache that makes a retried
+	// action idempotent. Zero uses the default.
+	MaxRecentResults int
 	// Clock defaults to time.Now and exists so snapshot-skew detection is
 	// testable. It is never used to stamp provenance.
 	Clock func() time.Time
@@ -119,6 +127,20 @@ type AskExecutor struct {
 	capability string
 	action     string
 	clock      func() time.Time
+
+	// recent makes a retried action idempotent within this process. The
+	// dispatch service threads a stable executor key into every invocation for
+	// exactly this purpose: an ambiguous execution leaves the action claimed,
+	// and once the claim lease expires it is re-claimed and executed again.
+	// Without this, that retry bills a second model call and records a second
+	// durable interaction session for one action.
+	//
+	// It is in-process only, so it does not survive restart. Durable
+	// idempotency belongs with the retry and reaping work in #363.
+	mu     sync.Mutex
+	recent map[string]fleet.ExecutionResult
+	order  []string
+	limit  int
 }
 
 var _ fleet.ActionExecutor = (*AskExecutor)(nil)
@@ -146,9 +168,18 @@ func NewAskExecutor(config AskExecutorConfig) (*AskExecutor, error) {
 	if clock == nil {
 		clock = time.Now
 	}
+	limit := config.MaxRecentResults
+	if limit == 0 {
+		limit = defaultAskRecentResults
+	}
+	if limit < 0 {
+		return nil, shoal.NewError(
+			shoal.ErrorInvalidArgument, "ask executor result cache bound is negative")
+	}
 	return &AskExecutor{
 		provider: config.Provider, capability: capability,
 		action: action, clock: clock,
+		recent: make(map[string]fleet.ExecutionResult, limit), limit: limit,
 	}, nil
 }
 
@@ -228,6 +259,9 @@ func (e *AskExecutor) Execute(
 	if err != nil {
 		return fleet.ExecutionResult{ErrorCode: AskErrorInvalidInput}, err
 	}
+	if cached, ok := e.recall(invocation.IdempotencyKey); ok {
+		return cached, nil
+	}
 	// An absent top_k is forwarded as zero so the reasoning service applies
 	// its own workspace-aware default. Substituting a constant here would
 	// exceed a workspace whose retrieval limit is lower and fail the action
@@ -272,6 +306,12 @@ func (e *AskExecutor) Execute(
 		}
 		return failAfterAsk(envelope, tally, code)
 	}
+	if tally.citedDropped {
+		// A claim in this answer rests on an anchor the record cannot hold.
+		// Committing would assert that claim over grounding the record does
+		// not carry, which is the case the whole guard exists to prevent.
+		return failAfterAsk(envelope, tally, AskErrorEvidenceUnrecordable)
+	}
 	result := fleet.ExecutionResult{
 		Output: nil, Evidence: evidence,
 	}
@@ -299,7 +339,49 @@ func (e *AskExecutor) Execute(
 		return fleet.ExecutionResult{ErrorCode: AskErrorOutputEncoding}, err
 	}
 	result.Output = output
+	e.remember(invocation.IdempotencyKey, result)
 	return result, nil
+}
+
+// recall returns a result already produced for this executor key. The key is
+// stable across retries of one action, so returning the first result is what
+// makes a retry idempotent rather than a second billed model call.
+func (e *AskExecutor) recall(key []byte) (fleet.ExecutionResult, bool) {
+	if len(key) == 0 || e.limit == 0 {
+		return fleet.ExecutionResult{}, false
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	result, ok := e.recent[string(key)]
+	if !ok {
+		return fleet.ExecutionResult{}, false
+	}
+	return cloneAskExecutionResult(result), true
+}
+
+func (e *AskExecutor) remember(key []byte, result fleet.ExecutionResult) {
+	if len(key) == 0 || e.limit == 0 {
+		return
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	identity := string(key)
+	if _, exists := e.recent[identity]; exists {
+		return
+	}
+	if len(e.order) >= e.limit {
+		delete(e.recent, e.order[0])
+		e.order = e.order[1:]
+	}
+	e.recent[identity] = cloneAskExecutionResult(result)
+	e.order = append(e.order, identity)
+}
+
+func cloneAskExecutionResult(result fleet.ExecutionResult) fleet.ExecutionResult {
+	clone := result
+	clone.Output = append(json.RawMessage(nil), result.Output...)
+	clone.Evidence = append([]fleet.EvidenceRef(nil), result.Evidence...)
+	return clone
 }
 
 // failAfterAsk records a failure that happened after the reasoning call ran.
@@ -390,15 +472,20 @@ type askEvidenceTally struct {
 	// post-translation failure as a truncation, because those paths report no
 	// recorded evidence at all.
 	truncated bool
+	// citedDropped records that the bound dropped an anchor a recorded claim
+	// cites. Anchors are packed cited-first so this is not reachable by
+	// ordinary truncation; when it does happen the answer's own claims are
+	// ungrounded in the record and the action must not commit.
+	citedDropped bool
 }
 
 func askExecutorEvidence(
 	envelope CitationEnvelope,
 ) ([]fleet.EvidenceRef, askEvidenceTally) {
-	refs := make([]fleet.EvidenceRef, 0, len(envelope.Evidence))
-	seen := make(map[shoal.ID]struct{}, len(envelope.Evidence))
 	var tally askEvidenceTally
-	members := 0
+	cited := askCitedAnchors(envelope)
+	usable := make([]fleet.EvidenceRef, 0, len(envelope.Evidence))
+	seen := make(map[shoal.ID]struct{}, len(envelope.Evidence))
 	for _, evidence := range envelope.Evidence {
 		if evidence.AnchorID == "" {
 			// Counted, never usable. Skipping it before the tally would hide
@@ -417,21 +504,51 @@ func askExecutorEvidence(
 			continue
 		}
 		tally.usable++
-		cost := len(ref.NodeIDs) + len(ref.EdgeIDs) + len(ref.Assertions)
-		if len(refs) >= fleet.MaxActionEvidence {
-			tally.truncated = true
-			continue
+		usable = append(usable, ref)
+	}
+	// Anchors a claim cites are packed first. The dispatch bound counts
+	// evidence members rather than anchors, so an evidence-rich answer
+	// truncates well before the reasoning harness anchor limit; without this
+	// ordering the bound could drop exactly the anchors the recorded claims
+	// depend on and still commit as succeeded.
+	refs := make([]fleet.EvidenceRef, 0, len(usable))
+	members := 0
+	for _, preferCited := range []bool{true, false} {
+		for _, ref := range usable {
+			_, isCited := cited[ref.AnchorID]
+			if isCited != preferCited {
+				continue
+			}
+			cost := len(ref.NodeIDs) + len(ref.EdgeIDs) + len(ref.Assertions)
+			if len(refs) >= fleet.MaxActionEvidence ||
+				members+cost > fleet.MaxActionEvidence {
+				// One oversized path must not discard every smaller anchor
+				// after it, so keep packing what still fits.
+				tally.truncated = true
+				if isCited {
+					tally.citedDropped = true
+				}
+				continue
+			}
+			members += cost
+			refs = append(refs, ref)
 		}
-		if members+cost > fleet.MaxActionEvidence {
-			// One oversized path must not discard every smaller anchor after
-			// it, so keep packing what still fits.
-			tally.truncated = true
-			continue
-		}
-		members += cost
-		refs = append(refs, ref)
 	}
 	return refs, tally
+}
+
+// askCitedAnchors collects the anchors the response's own claims rest on.
+func askCitedAnchors(envelope CitationEnvelope) map[shoal.ID]struct{} {
+	cited := make(map[shoal.ID]struct{})
+	for _, claim := range envelope.Claims {
+		for _, anchorID := range claim.CitationAnchorIDs {
+			cited[anchorID] = struct{}{}
+		}
+		for _, anchorID := range claim.DerivedEvidenceAnchorIDs {
+			cited[anchorID] = struct{}{}
+		}
+	}
+	return cited
 }
 
 func askExecutorEvidenceRef(
