@@ -162,6 +162,18 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 			"executor needs the retrieve grant in addition to invoke, because "+
 			"the reasoning path authorizes retrieval on its own terms",
 	)
+	concealWithholding := flags.Bool(
+		"conceal-withholding",
+		concealWithholdingDefault(),
+		"Remove the withheld-document counts from responses. Off by default: "+
+			"the counts are emitted deliberately so a short answer is never "+
+			"silently mistaken for an empty corpus. The counts are "+
+			"corpus-wide and identical for every query, so they disclose how "+
+			"much a caller cannot read and signal when that changes, not "+
+			"which terms match. Turn this on for a compartmented deployment "+
+			"that declines to disclose either. Audit records both counts "+
+			"either way",
+	)
 	developmentAuth := flags.Bool(
 		"dev-auth", false,
 		"Authenticate every request as a fixed development principal; "+
@@ -463,6 +475,8 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 		backfill:  backfill,
 		ontology:  activeOntology,
 		executors: executors,
+
+		concealWithholding: *concealWithholding,
 		mosaic: authorized.MosaicBudget{
 			MaxDomains: uint32(*mosaicBudget),
 			Window:     *mosaicWindow,
@@ -818,6 +832,9 @@ type serviceConfig struct {
 	// ontology is an optional immutable snapshot configured at startup for the
 	// read-only ontology description endpoint.
 	ontology *ontology.OntologyVersion
+	// concealWithholding removes the withholding counts from responses. See
+	// the -conceal-withholding flag.
+	concealWithholding bool
 	// executors is the host-owned allowlist of opaque fleet executor
 	// references. A non-nil empty registry keeps agent registration disabled.
 	executors fleet.ExecutorRegistry
@@ -849,6 +866,19 @@ var (
 	workspacePublicationDomain = coordination.DomainID("shoal-explore-web/publication")
 	workspaceRuntimeOwner      = coordination.OwnerID("shoal-explore-web/runtime")
 )
+
+// concealWithholdingDefault resolves the environment default for
+// -conceal-withholding. Only the documented value enables it, so a stray value
+// cannot switch concealment on.
+//
+// The converse does not hold and is worth stating plainly: an unrecognized
+// value such as "true" or "1 " leaves concealment off. Exact matching cannot
+// prevent accidental disablement, so an operator who depends on concealment
+// should set the flag, where a typo is rejected by the parser, rather than the
+// environment variable, where it is silently ignored.
+func concealWithholdingDefault() bool {
+	return os.Getenv("SHOAL_CONCEAL_WITHHOLDING") == "1"
+}
 
 func openService(
 	ctx context.Context,
@@ -1041,6 +1071,7 @@ func openService(
 			embedded.Close()
 			return closed, err
 		}
+		service.ConcealWithholding(config.concealWithholding)
 		if config.ontology != nil {
 			// This call is load-bearing; TestOntologyProposalLifecycleUsesStartedEmbeddedWorkspace
 			// pins that startup wires -ontology-file into the real EmbeddedService

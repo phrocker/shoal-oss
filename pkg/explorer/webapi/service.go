@@ -173,6 +173,56 @@ type EmbeddedService struct {
 	ontologyPublishMu sync.Mutex
 	ontologyVersion   *ontology.OntologyVersion
 	clock             func() time.Time
+	// concealWithholding suppresses the withholding counts in responses. The
+	// default is false, preserving the deliberate disclosure documented on
+	// retrieveReporting: a caller should not silently mistake a short answer
+	// for "nothing exists".
+	//
+	// What the counts disclose is volume, not content and not per-query
+	// existence. Both are computed over the whole corpus before retrieval, so
+	// the same identity sees the same numbers for every query; they move when
+	// the corpus or the identity's grants change. A compartmented deployment
+	// may still decline to tell a caller how much it cannot see, or to hand it
+	// a change signal for content it has no grant for. Neither mode changes
+	// what is recorded for audit.
+	concealWithholding bool
+}
+
+// ConcealWithholding suppresses the withholding counts in every response that
+// carries them. Both counts are concealed together: a response that omits one
+// and emits the other would itself distinguish the two reason classes.
+//
+// It must be set during composition, before the service serves a request.
+func (s *EmbeddedService) ConcealWithholding(conceal bool) {
+	s.concealWithholding = conceal
+}
+
+// disclose returns the counts a response may carry for this service.
+func (s *EmbeddedService) disclose(
+	disclosure authorized.Disclosure,
+) authorized.Disclosure {
+	if s.concealWithholding {
+		return authorized.Disclosure{}
+	}
+	return disclosure
+}
+
+// discloseEmbedding clears the withholding booleans an embedding report
+// derives from the same counts. Concealing the counts while leaving these set
+// would keep the signal in a narrower form rather than removing it. Every
+// other field of the report is request-local observability and is preserved.
+func (s *EmbeddedService) discloseEmbedding(
+	report *authorized.EmbeddingQueryReport,
+) *authorized.EmbeddingQueryReport {
+	if report == nil || !s.concealWithholding {
+		return report
+	}
+	concealed := *report
+	concealed.Spaces = append(
+		[]authorized.EmbeddingSpaceReport(nil), report.Spaces...)
+	concealed.Suppressed = false
+	concealed.Restricted = false
+	return &concealed
 }
 
 // NewEmbeddedService creates a local service without exposing the embedded
@@ -511,11 +561,12 @@ func (s *EmbeddedService) Documents(
 	if end > len(documents) {
 		end = len(documents)
 	}
+	disclosed := s.disclose(disclosure)
 	response := DocumentsResponse{
 		Snapshot:   snapshot,
 		Documents:  append([]explorer.DocumentSummary(nil), documents[offset:end]...),
-		Suppressed: disclosure.Suppressed,
-		Restricted: disclosure.Restricted,
+		Suppressed: disclosed.Suppressed,
+		Restricted: disclosed.Restricted,
 	}
 	if end < len(documents) {
 		response.NextCursor = encodeCursor(snapshot.ID, end)
@@ -632,8 +683,8 @@ func (s *EmbeddedService) Retrieve(
 	query.AsOf = time.Time{}
 	response, report, err := s.retrieveReporting(ctx, query)
 	if err != nil {
-		if report.Embedding != nil {
-			return RetrievalResponse{}, newEmbeddingQueryError(err, *report.Embedding)
+		if concealed := s.discloseEmbedding(report.Embedding); concealed != nil {
+			return RetrievalResponse{}, newEmbeddingQueryError(err, *concealed)
 		}
 		return RetrievalResponse{}, err
 	}
@@ -644,11 +695,12 @@ func (s *EmbeddedService) Retrieve(
 	if err := s.confirmSnapshot(ctx, snapshot); err != nil {
 		return RetrievalResponse{}, err
 	}
+	disclosed := s.disclose(report.Disclosure)
 	return RetrievalResponse{
 		Snapshot: snapshot, Retrieval: response,
-		Suppressed: report.Disclosure.Suppressed,
-		Restricted: report.Disclosure.Restricted,
-		Embedding:  report.Embedding,
+		Suppressed: disclosed.Suppressed,
+		Restricted: disclosed.Restricted,
+		Embedding:  s.discloseEmbedding(report.Embedding),
 	}, nil
 }
 
