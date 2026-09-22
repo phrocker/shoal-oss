@@ -1,6 +1,7 @@
 # Shoal
 
-Shoal governs what an AI system knows, and what it is allowed to do with it.
+Shoal is a knowledge database built around enforcement: it governs what an AI
+system knows, and what it is allowed to do with it.
 
 That sounds like two products. It's one, because neither half is trustworthy
 alone. A retrieval layer that can't show where an answer came from produces
@@ -30,7 +31,10 @@ ways that would be hard to notice.
 
 **A restricted term and a nonexistent one give you the same answer, byte for
 byte.** You can't tell them apart, which means you can't map what's behind the
-wall by watching how the refusals differ.
+wall by watching how the refusals differ. There's a conformance suite that
+holds this, comparing encoded responses rather than named fields so a field
+added later can't quietly reintroduce the difference:
+[`internal/disclosureconformance`](internal/disclosureconformance).
 
 **Vector search that isn't configured fails.** It doesn't quietly fall back to
 lexical and hand you something that looks like a match.
