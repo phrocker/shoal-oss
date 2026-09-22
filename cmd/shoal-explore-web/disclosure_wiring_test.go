@@ -180,3 +180,23 @@ func TestConcealWithholdingFlagIsRegistered(t *testing.T) {
 		t.Fatalf("-conceal-withholding is not registered: %v", err)
 	}
 }
+
+// A fully end-to-end HTTP test of this flag is not achievable under -dev-auth,
+// and the attempt is recorded here rather than shipped as a test that passes
+// without exercising anything.
+//
+// The counts are only observable when something is withheld, and under
+// -dev-auth nothing ever is: developmentBackfill exists specifically to grant
+// the documents already on disk to the development principal, so a corpus
+// served under an empty policy catalog is repaired at startup rather than
+// withheld. The mosaic route is closed too, because the command uses a single
+// static policy selector and therefore has one sensitivity domain, which no
+// co-occurrence budget can restrict. Producing a withheld response over HTTP
+// would require real OIDC authentication with a narrowed principal.
+//
+// What remains uncovered is one assignment, from the parsed flag into
+// serviceConfig. TestConcealWithholdingFlagIsRegistered covers the parse,
+// TestConcealWithholdingReachesTheDeployedService covers everything after the
+// config field, and neither sees that line. Closing it honestly needs either
+// non-development authentication in the test, or extracting the flag-to-config
+// mapping so both halves meet; it is not closed by a test that cannot fail.

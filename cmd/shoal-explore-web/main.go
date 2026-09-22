@@ -868,9 +868,14 @@ var (
 )
 
 // concealWithholdingDefault resolves the environment default for
-// -conceal-withholding. Only the documented value enables it: a security
-// option must not be switched on by a typo, and must not be silently left off
-// by one either, which is why the accepted spelling is exact.
+// -conceal-withholding. Only the documented value enables it, so a stray value
+// cannot switch concealment on.
+//
+// The converse does not hold and is worth stating plainly: an unrecognized
+// value such as "true" or "1 " leaves concealment off. Exact matching cannot
+// prevent accidental disablement, so an operator who depends on concealment
+// should set the flag, where a typo is rejected by the parser, rather than the
+// environment variable, where it is silently ignored.
 func concealWithholdingDefault() bool {
 	return os.Getenv("SHOAL_CONCEAL_WITHHOLDING") == "1"
 }
