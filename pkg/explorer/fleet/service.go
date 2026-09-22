@@ -764,9 +764,15 @@ func capabilitiesSubset(child, parent []Capability) bool {
 		for _, wantedAction := range wantedCapability.Actions {
 			found := false
 			for _, allowedAction := range allowed.Actions {
+				// Effect is part of what delegation may narrow. Without it a
+				// child, or a later generation, could turn an evidence-only
+				// action into an external one and still pass as a subset,
+				// which would let the effect boundary be widened by exactly
+				// the path that exists to prevent widening.
 				if wantedAction.Name == allowedAction.Name &&
 					bytes.Equal(wantedAction.InputSchema, allowedAction.InputSchema) &&
-					bytes.Equal(wantedAction.OutputSchema, allowedAction.OutputSchema) {
+					bytes.Equal(wantedAction.OutputSchema, allowedAction.OutputSchema) &&
+					!wantedAction.Effect.exceeds(allowedAction.Effect) {
 					found = true
 					break
 				}

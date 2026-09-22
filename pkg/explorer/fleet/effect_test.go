@@ -108,3 +108,26 @@ func TestUnknownEffectFailsClosed(t *testing.T) {
 		t.Fatal("an unknown effect class must be refused")
 	}
 }
+
+// TestDelegationCannotWidenEffect proves effect is part of what delegation may
+// narrow. Without it a child, or a later generation, could turn an
+// evidence-only action into an external one and still pass the subset check
+// that exists to stop widening, whenever its executor had an external ceiling.
+func TestDelegationCannotWidenEffect(t *testing.T) {
+	evidence := evidenceAction()
+	external := []Capability{{Name: "explorer.reason", Actions: []Action{{
+		Name: "ask", Effect: EffectExternal,
+		InputSchema: anyObject, OutputSchema: anyObject,
+	}}}}
+
+	if capabilitiesSubset(external, evidence) {
+		t.Fatal("a child must not widen an evidence-only action to external")
+	}
+	if !capabilitiesSubset(evidence, external) {
+		t.Fatal("a child may narrow an external action to evidence-only")
+	}
+	if !capabilitiesSubset(evidence, evidence) ||
+		!capabilitiesSubset(external, external) {
+		t.Fatal("an unchanged effect must remain a subset of itself")
+	}
+}
