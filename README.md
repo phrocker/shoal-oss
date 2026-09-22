@@ -3,10 +3,9 @@
 Shoal is a knowledge database built around enforcement: it governs what an AI
 system knows, and what it is allowed to do with it.
 
-That sounds like two products. It's one, because neither half is trustworthy
-alone. A retrieval layer that can't show where an answer came from produces
-confident nonsense. An access-control layer that doesn't understand content can
-only guard whole files.
+Neither half is much use alone. A retrieval layer that can't show where an
+answer came from produces confident nonsense. An access-control layer that
+doesn't understand content can only guard whole files.
 
 Plenty of tools give you citations. A citation is a display format, and it's
 worth whatever the reader is willing to go check, which in practice is nothing.
@@ -249,9 +248,11 @@ advertises the corpus tools: `shoal.retrieve`, `shoal.documents`,
 `shoal.document`, `shoal.neighborhood`, `shoal.path`, `shoal.changes`,
 `shoal.ingest` and `shoal.recompute`.
 
-Grounded ask, provenance and context compression are not on this surface. They
-need a model provider and a workspace the stdio launcher does not configure, so
-they are served by the authenticated web `/mcp` endpoint instead.
+Grounded ask and provenance are not on this surface. They need a model provider
+and a workspace the stdio launcher does not configure, so they are served by
+the authenticated web `/mcp` endpoint instead. Context compression is not a
+tool and does not appear in that list, but it is on by default here: every
+successful tool result is packed through it.
 
 ```bash
 go run ./cmd/shoal-mcp -state-dir .shoal/mcp -dev-auth
