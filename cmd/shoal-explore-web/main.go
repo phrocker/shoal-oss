@@ -162,6 +162,17 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 			"executor needs the retrieve grant in addition to invoke, because "+
 			"the reasoning path authorizes retrieval on its own terms",
 	)
+	concealWithholding := flags.Bool(
+		"conceal-withholding",
+		os.Getenv("SHOAL_CONCEAL_WITHHOLDING") == "1",
+		"Remove the withheld-document counts from responses. Off by default: "+
+			"the counts are emitted deliberately so a short answer is never "+
+			"silently mistaken for an empty corpus. Turn it on for a "+
+			"compartmented deployment, where a caller who cannot tell "+
+			"\"nothing matched\" from \"something was withheld\" is preferred "+
+			"to one who can probe compartment membership by watching the "+
+			"count move. Audit records both counts either way",
+	)
 	developmentAuth := flags.Bool(
 		"dev-auth", false,
 		"Authenticate every request as a fixed development principal; "+
@@ -463,6 +474,8 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 		backfill:  backfill,
 		ontology:  activeOntology,
 		executors: executors,
+
+		concealWithholding: *concealWithholding,
 		mosaic: authorized.MosaicBudget{
 			MaxDomains: uint32(*mosaicBudget),
 			Window:     *mosaicWindow,
@@ -818,6 +831,9 @@ type serviceConfig struct {
 	// ontology is an optional immutable snapshot configured at startup for the
 	// read-only ontology description endpoint.
 	ontology *ontology.OntologyVersion
+	// concealWithholding removes the withholding counts from responses. See
+	// the -conceal-withholding flag.
+	concealWithholding bool
 	// executors is the host-owned allowlist of opaque fleet executor
 	// references. A non-nil empty registry keeps agent registration disabled.
 	executors fleet.ExecutorRegistry
@@ -1041,6 +1057,7 @@ func openService(
 			embedded.Close()
 			return closed, err
 		}
+		service.ConcealWithholding(config.concealWithholding)
 		if config.ontology != nil {
 			// This call is load-bearing; TestOntologyProposalLifecycleUsesStartedEmbeddedWorkspace
 			// pins that startup wires -ontology-file into the real EmbeddedService
