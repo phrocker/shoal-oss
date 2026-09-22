@@ -21,6 +21,9 @@ package webapi
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
+	"net/http/httptest"
 	"testing"
 	"time"
 
@@ -28,6 +31,7 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/explorer/authorized"
 	"github.com/phrocker/shoal-oss/pkg/retrieval"
+	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
 // withholdingClientStub serves one snapshot and reports whatever withholding
@@ -40,6 +44,9 @@ type withholdingClientStub struct {
 	snapshot   explorer.Snapshot
 	disclosure authorized.Disclosure
 	embedding  *authorized.EmbeddingQueryReport
+	// retrieveErr makes the stub fail the way a provider outage does, so the
+	// error branch that carries an embedding report is exercised too.
+	retrieveErr error
 }
 
 func (c *withholdingClientStub) Snapshot(
@@ -59,7 +66,7 @@ func (c *withholdingClientStub) RetrieveWithReport(
 ) (retrieval.Response, authorized.RetrievalReport, error) {
 	return retrieval.Response{}, authorized.RetrievalReport{
 		Disclosure: c.disclosure, Embedding: c.embedding,
-	}, nil
+	}, c.retrieveErr
 }
 
 func withholdingService(
@@ -67,7 +74,16 @@ func withholdingService(
 	embedding *authorized.EmbeddingQueryReport,
 ) *EmbeddedService {
 	t.Helper()
+	return withholdingServiceFailing(t, conceal, disclosure, embedding, nil)
+}
+
+func withholdingServiceFailing(
+	t *testing.T, conceal bool, disclosure authorized.Disclosure,
+	embedding *authorized.EmbeddingQueryReport, retrieveErr error,
+) *EmbeddedService {
+	t.Helper()
 	service, err := NewEmbeddedService(&withholdingClientStub{
+		retrieveErr: retrieveErr,
 		snapshot: explorer.Snapshot{
 			ID: "snapshot", AsOf: time.Unix(0, 0).UTC(), Frontier: 1,
 		},
@@ -172,4 +188,76 @@ func TestDefaultDisclosureRemainsDeliberate(t *testing.T) {
 			Reason:          reason,
 		},
 	)
+}
+
+// failedRetrievalOutcome is what a caller observes when retrieval fails while
+// an embedding report is in flight. The report rides out on the error, so the
+// error is as much a disclosure surface as a successful body is.
+type failedRetrievalOutcome struct {
+	ErrorText string                    `json:"error_text"`
+	Embedding *wireEmbeddingQueryReport `json:"embedding,omitempty"`
+	Status    int                       `json:"status"`
+	Body      json.RawMessage           `json:"body"`
+}
+
+func failedRetrievalProbe(
+	t *testing.T, conceal bool, disclosure authorized.Disclosure,
+	embedding *authorized.EmbeddingQueryReport,
+) failedRetrievalOutcome {
+	t.Helper()
+	service := withholdingServiceFailing(t, conceal, disclosure, embedding,
+		shoal.NewError(shoal.ErrorUnavailable, "embedding provider is down"))
+	_, err := service.Retrieve(context.Background(), RetrievalRequest{
+		Query: retrieval.Request{
+			Text: "probe", TopK: 4, Modes: []retrieval.Mode{retrieval.ModeVector},
+		},
+	})
+	if err == nil {
+		t.Fatal("the probe requires a failing retrieval")
+	}
+	outcome := failedRetrievalOutcome{ErrorText: err.Error()}
+	var embeddingErr *EmbeddingQueryError
+	if errors.As(err, &embeddingErr) {
+		report := embeddingErr.EmbeddingQueryReport()
+		outcome.Embedding = wireEmbeddingQueryReportValue(&report)
+	}
+	// The HTTP encoding is the surface a caller actually reads, so compare
+	// that too rather than only the value the service returned.
+	recorder := httptest.NewRecorder()
+	writeError(recorder, err)
+	outcome.Status = recorder.Code
+	outcome.Body = json.RawMessage(recorder.Body.Bytes())
+	return outcome
+}
+
+// TestConcealedFailedRetrievalDoesNotDiscloseWithholding covers the error
+// branch. A failing retrieval still carries the embedding report, and that
+// report's derived withholding booleans must be concealed exactly as they are
+// on the success path, including in the encoded HTTP error a caller reads.
+func TestConcealedFailedRetrievalDoesNotDiscloseWithholding(t *testing.T) {
+	withheld := &authorized.EmbeddingQueryReport{
+		Observed: true, FanoutLimit: 4, Degraded: true,
+		Suppressed: true, Restricted: true,
+	}
+	control := &authorized.EmbeddingQueryReport{
+		Observed: true, FanoutLimit: 4, Degraded: true,
+	}
+	disclosureconformance.Run(t, disclosureconformance.Probe{
+		Name:     "retrieve/failed-with-embedding-report",
+		Withheld: failedRetrievalProbe(t, true, probeWithheld, withheld),
+		Control:  failedRetrievalProbe(t, true, probeControl, control),
+	})
+}
+
+// TestFailedRetrievalDoesNotMutateTheAuditReport proves concealment copies the
+// report on the error path as it does on the success path. The original is
+// still the value the audit trail keeps.
+func TestFailedRetrievalDoesNotMutateTheAuditReport(t *testing.T) {
+	report := &authorized.EmbeddingQueryReport{
+		Observed: true, Suppressed: true, Restricted: true,
+	}
+	failedRetrievalProbe(t, true, probeWithheld, report)
+	if !report.Suppressed || !report.Restricted {
+		t.Fatalf("concealment mutated the audit report: %#v", report)
+	}
 }

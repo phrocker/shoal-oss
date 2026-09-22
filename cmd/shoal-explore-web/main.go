@@ -164,7 +164,7 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 	)
 	concealWithholding := flags.Bool(
 		"conceal-withholding",
-		os.Getenv("SHOAL_CONCEAL_WITHHOLDING") == "1",
+		concealWithholdingDefault(),
 		"Remove the withheld-document counts from responses. Off by default: "+
 			"the counts are emitted deliberately so a short answer is never "+
 			"silently mistaken for an empty corpus. The counts are "+
@@ -866,6 +866,14 @@ var (
 	workspacePublicationDomain = coordination.DomainID("shoal-explore-web/publication")
 	workspaceRuntimeOwner      = coordination.OwnerID("shoal-explore-web/runtime")
 )
+
+// concealWithholdingDefault resolves the environment default for
+// -conceal-withholding. Only the documented value enables it: a security
+// option must not be switched on by a typo, and must not be silently left off
+// by one either, which is why the accepted spelling is exact.
+func concealWithholdingDefault() bool {
+	return os.Getenv("SHOAL_CONCEAL_WITHHOLDING") == "1"
+}
 
 func openService(
 	ctx context.Context,
