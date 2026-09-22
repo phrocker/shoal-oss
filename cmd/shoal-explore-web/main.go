@@ -167,11 +167,12 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 		os.Getenv("SHOAL_CONCEAL_WITHHOLDING") == "1",
 		"Remove the withheld-document counts from responses. Off by default: "+
 			"the counts are emitted deliberately so a short answer is never "+
-			"silently mistaken for an empty corpus. Turn it on for a "+
-			"compartmented deployment, where a caller who cannot tell "+
-			"\"nothing matched\" from \"something was withheld\" is preferred "+
-			"to one who can probe compartment membership by watching the "+
-			"count move. Audit records both counts either way",
+			"silently mistaken for an empty corpus. The counts are "+
+			"corpus-wide and identical for every query, so they disclose how "+
+			"much a caller cannot read and signal when that changes, not "+
+			"which terms match. Turn this on for a compartmented deployment "+
+			"that declines to disclose either. Audit records both counts "+
+			"either way",
 	)
 	developmentAuth := flags.Bool(
 		"dev-auth", false,

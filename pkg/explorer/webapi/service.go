@@ -176,11 +176,15 @@ type EmbeddedService struct {
 	// concealWithholding suppresses the withholding counts in responses. The
 	// default is false, preserving the deliberate disclosure documented on
 	// retrieveReporting: a caller should not silently mistake a short answer
-	// for "nothing exists". A compartmented deployment makes the opposite
-	// trade, preferring a caller who cannot separate "nothing matched" from
-	// "something was withheld" over one who can probe compartment membership
-	// by watching the number move. Neither mode changes what is recorded for
-	// audit.
+	// for "nothing exists".
+	//
+	// What the counts disclose is volume, not content and not per-query
+	// existence. Both are computed over the whole corpus before retrieval, so
+	// the same identity sees the same numbers for every query; they move when
+	// the corpus or the identity's grants change. A compartmented deployment
+	// may still decline to tell a caller how much it cannot see, or to hand it
+	// a change signal for content it has no grant for. Neither mode changes
+	// what is recorded for audit.
 	concealWithholding bool
 }
 
