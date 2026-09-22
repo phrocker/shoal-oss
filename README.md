@@ -1,112 +1,129 @@
 # Shoal
 
-**No authority without evidence.**
+Shoal governs what an AI system knows, and what it is allowed to do with it.
 
-Shoal is an evidence plane for AI systems. Claims, retrieval, and actions stay
-bound to the sources, identity, authorization, and system state that justify
-them. When that binding cannot be established, Shoal refuses instead of
-degrading quietly.
+That sounds like two products. It's one, because neither half is trustworthy
+alone. A retrieval layer that can't show where an answer came from produces
+confident nonsense. An access-control layer that doesn't understand content can
+only guard whole files.
 
-Most systems in this space offer citations. Citations are presentation: a
-footnote is only as good as the discipline of whoever checks it. Shoal enforces
-the binding in the architecture, so the unverified path is not available to
-callers, applications, or agents.
+Plenty of tools give you citations. A citation is a display format, and it's
+worth whatever the reader is willing to go check, which in practice is nothing.
+Shoal moves the checking into the write path and the query path, where skipping
+it isn't an option.
 
-## What Shoal refuses to do
+Some of what that means, concretely:
 
-| It will not | Because |
-|---|---|
-| Assert a claim it cannot cite | Only claims backed by verified citations become output. The rest are recorded as unresolved issues, so a thin answer is visible as thin rather than dressed up |
-| Persist a citation that was not derived from the source | Anchor identity is recomputed from the citation and its resolved quote on write. An invented or edited anchor is rejected, not stored |
-| Search what you may not read | Documents outside a caller's authorization are removed from the candidate set before scoring, so unauthorized content cannot influence a result it can never appear in |
-| Let an empty result and a withheld one look different | A term whose matches exist but are withheld returns exactly what a term matching nothing returns, so a caller cannot probe for the existence of content it may not read |
-| Substitute a retrieval strategy you did not ask for | An unconfigured vector mode fails explicitly. It never silently falls back to lexical and calls it a match |
-| Serve without an identity | The local development authenticator refuses any listener another host can reach; the remote backend is closed because it cannot yet carry the caller's decision upstream |
+**You can't store a citation Shoal didn't derive.** An anchor ID is computed
+from the citation and the quote it actually resolves to, and it gets recomputed
+on write. Hand it an ID you invented and the record is rejected. This is not a
+lint rule you can turn off.
 
-That last row is the pattern, not an exception. Where Shoal cannot preserve the
-evidence-to-authority chain, the feature is closed rather than left permissive.
+**A claim with no citation doesn't become an answer.** It becomes a logged
+issue. If the model had nothing to stand on, the response says so instead of
+producing a fluent paragraph that reads like it did.
 
-## Sixty seconds
+**Documents you can't read never reach the scorer.** They're dropped from the
+candidate set before ranking, not filtered out of the results afterward. So
+content you're not cleared for can't influence what comes back, including in
+ways that would be hard to notice.
+
+**A restricted term and a nonexistent one give you the same answer, byte for
+byte.** You can't tell them apart, which means you can't map what's behind the
+wall by watching how the refusals differ.
+
+**Vector search that isn't configured fails.** It doesn't quietly fall back to
+lexical and hand you something that looks like a match.
+
+**Nothing serves without an identity.** The dev-mode authenticator refuses to
+start on any address another machine can reach. The remote backend is disabled
+entirely, because there's currently no way to carry the caller's authorization
+across that hop, and serving it unauthenticated wasn't an option worth taking.
+
+That last one is the general pattern. Where Shoal can't keep the chain from
+evidence to authority intact, the feature is off rather than permissive.
+
+## Try it
 
 ```bash
-# 1. Ingest a source into a durable local corpus.
+# Put a document in a local corpus.
 go run ./cmd/shoal-explore ingest \
   -data .shoal/explorer -file docs/platform-product-plan.md
 
-# 2. Ask a grounded question. The default provider is deterministic and
-#    offline, so this works with no API key and no network.
+# Ask it something. Default provider is deterministic and offline,
+# so no API key and no network.
 go run ./cmd/shoal-explore ask \
   -data .shoal/explorer \
   -question "what gates local to cluster promotion?"
 ```
 
-You get verified claims with exact document, revision, and byte-range
-citations, the graph paths behind them, the snapshot the answer was pinned to,
-and a trace of how it was reached. Ask about something the corpus does not
-cover and you get a grounded no-answer with an unresolved issue, not an
-invention.
+You'll get claims with document, revision and byte-range citations, the graph
+paths behind them, the snapshot the whole thing was pinned to, and a trace of
+how it got there. Ask about something the corpus doesn't cover and you get a
+no-answer with a logged issue, not an invention.
 
-Swap the provider for a local Ollama model or an OpenAI-compatible endpoint
-with `-provider`; nothing above changes.
+`-provider ollama` or `-provider openai-compatible` swaps the model. Nothing
+else changes.
 
-One honest note about this path. `shoal-explore` is a single-user local tool
-and reports `AuthorizationEnforced: false` in its own output, because there is
-no principal to enforce against. The authorization rows in the table above are
-enforced by the authorized client that backs the web workspace, the MCP server,
-and anything else serving more than one identity. Shoal says which of the two
-you are running rather than letting you assume.
+Worth knowing before you read the list above and then run this: `shoal-explore`
+prints `AuthorizationEnforced: false`. It's a single-user local tool and there's
+no principal to enforce against. The authorization behavior comes from the
+authorized client underneath the web workspace and the MCP server. Shoal tells
+you which one you're running rather than letting you assume.
 
-## Why this rather than a bigger context window
+## Why bother, when context windows keep growing
 
-Models, tool protocols, and agent frameworks are converging fast. An agent that
-can call your ticket system is not scarce, and will be less scarce next year.
+Models, tool protocols and agent frameworks are converging. An agent that can
+call your ticket tracker isn't scarce now and will be less scarce next year.
 
-What stays scarce is the ability to establish, at the moment a decision is
-made: what is known, why it is believed, whether it is still valid, whether
-this actor may rely on it, and whether the resulting action is permitted.
+What's hard is being able to say, at the moment something is about to happen:
+here's what we know, here's why we believe it, here's whether it still holds,
+here's whether this actor may rely on it, and here's whether the action is
+permitted. That chain is what Shoal keeps intact.
 
-Shoal keeps that chain intact and checkable. Because the knowledge plane is
-separate from model execution, the model, the harness, and the tool protocol
-can all be replaced without discarding the accumulated, attributable
-understanding underneath.
+Because the knowledge side is separate from model execution, you can replace
+the model, the harness and the tool protocol without throwing away what's
+accumulated underneath.
 
-Two honest limits. Provenance proves where a belief came from, not that it
-still holds, which is why snapshot identity, revisions, `as_of`, and ontology
-evolution matter as much as citation does. And a verified, authorized,
-correctly cited claim can still be wrong if the world moved; the record is
-designed to make that detectable, not impossible.
+Two things this doesn't get you. Provenance tells you where a belief came from,
+not whether it's still true, which is why snapshots, revisions, `as_of` and
+ontology evolution carry as much weight here as citations do. And a correctly
+cited, properly authorized claim can still be wrong because the world moved.
+The record is built to make that detectable. It can't make it impossible.
 
-## Where Shoal stops
+## What Shoal doesn't do
 
-Shoal governs the epistemic and authorization boundary around execution. It
-does not compete with the execution ecosystem.
+Shoal handles the knowledge and the permission around execution. It isn't
+trying to be your agent runtime.
 
-It registers agents, narrows their capabilities, leases and dispatches work,
-records execution evidence, and publishes lifecycle events. It will run work
-whose only effect is on its own evidence record, such as answering a grounded
-question about its corpus. Anything with an effect outside that boundary is
-dispatched to an external executor and recorded, never performed by Shoal.
+It registers agents, narrows what they're allowed to do, leases and dispatches
+work, takes back execution evidence, and publishes lifecycle events. It will
+run work whose only effect lands in its own evidence record, like answering a
+question about its corpus. Anything that touches the outside world gets
+dispatched to an executor and recorded, not performed here.
 
-That keeps model and harness commoditization working in your favour: whatever
-executes the work, the warrant for why it was allowed lives here.
+Which is deliberate: whatever ends up doing the work, the reason it was allowed
+to lives in Shoal.
 
+## What people build with it
 
-## Is this for you?
+Long-document work, where structure matters and you need the exact passage
+back rather than a paraphrase: technical manuals, contracts, filings, runbooks.
 
-- **Document intelligence** — navigate long technical, legal, financial, and
-  operational sources by structure, then retrieve exact cited passages.
-- **Code exploration** — connect files, symbols, revisions, diagnostics, and
-  source ranges without coupling Shoal to one parser.
-- **Cross-document knowledge graphs** — relate evidence across sources and
-  inspect the path behind a result.
-- **Private knowledge for agents** — keep source content and indexes inside
-  your own infrastructure, with authorization enforced on every read.
-- **Grounded inference contracts** — assemble immutable evidence packs from
-  verified results and validate provenance-bearing claims without coupling to
-  a model vendor or transport.
-- **Local-to-cluster** — prototype against an embedded corpus and keep the
-  same graph, document, and retrieval contracts as storage moves toward
-  Accumulo scale.
+Code exploration, connecting files, symbols, revisions, diagnostics and source
+ranges. Shoal doesn't care which parser produced them.
+
+Knowledge graphs that cross documents, where the useful part is being able to
+see the path the answer took, not just the answer.
+
+Private corpora for agents, where the content and the indexes stay inside your
+infrastructure and every read goes through authorization.
+
+Grounded inference, where you want claims bound to immutable evidence and you
+don't want to marry a model vendor or a transport to get it.
+
+And the local-to-cluster case: start against an embedded corpus, keep the same
+document, graph and retrieval contracts as storage grows toward Accumulo.
 
 ## Choose a path
 
@@ -188,46 +205,44 @@ no semantic quality claim. Anthropic publishes no embeddings API, so hosted
 embedding paths are OpenAI-compatible endpoints or Voyage. Credentials for
 hosted providers are resolved at request time and are never printed or stored.
 
-### Local web workspace
+### Web workspace
 
-`shoal-explore-web` serves an evidence-first browser workspace over an existing
-corpus: paged documents with their authored hierarchy, retrieval with exact
-revision and span citations and score explanations, and a bounded interactive
-graph canvas with cursor-based expansion and directed path finding.
+`shoal-explore-web` puts a browser front end on an existing corpus: paged
+documents that keep their authored hierarchy, retrieval with exact revision and
+span citations plus score explanations, and a graph canvas you can expand node
+by node and run path finding on.
 
 ```bash
 go run ./cmd/shoal-explore-web \
   -data .shoal/explorer -listen 127.0.0.1:8080 -dev-auth
 ```
 
-Every request is authorized. The transport binds one trusted decision per
-request and serves through the decision-enforcing client, so a caller sees only
-the documents, spans, edges, and evidence its decision permits; a request that
-cannot be authenticated is answered `401` and never reaches the service.
+Every request carries one authorization decision, bound at the transport and
+enforced underneath, so you see only the documents, spans, edges and evidence
+that decision allows. Anything that can't be authenticated gets a `401` and
+never reaches the service at all.
 
-`-dev-auth` is a loopback-only development authenticator and refuses any
-listener another host can reach. Exposing the workspace requires the
-provider-neutral OIDC authenticator, and the `-backend remote` mode stays
-closed until it can carry the caller's decision upstream. Deployment,
-authentication, and the startup policy backfill are covered in
+`-dev-auth` only works on loopback and refuses to start on an address another
+machine can reach. Going beyond your own host means configuring OIDC.
+`-backend remote` is currently disabled, because the caller's decision can't be
+carried across that hop yet. Deployment, auth setup and the startup policy
+backfill are in
 [`docs/shoal-explore-web-deploy.md`](docs/shoal-explore-web-deploy.md).
 
-### MCP stdio workspace
+### MCP
 
-`shoal-mcp` serves the same authorized embedded workspace over
-newline-delimited JSON-RPC on stdin and stdout, so an MCP-capable agent gets
-retrieval, documents, graph neighborhoods, grounded ask, provenance, and
-context compression under the same authorization and recording rules as the
-browser.
+`shoal-mcp` exposes the same authorized workspace over JSON-RPC on stdin and
+stdout, so an MCP client gets retrieval, documents, graph neighborhoods,
+grounded ask, provenance and context compression with the same authorization
+and recording as the browser.
 
 ```bash
 go run ./cmd/shoal-mcp -data .shoal/explorer
 ```
 
-The launcher configuration is the trusted identity source: the command grants
-nothing implicitly and refuses to serve rather than assume an identity. Tool
-surface, recording, and configuration are documented in
-[`docs/mcp-stdio.md`](docs/mcp-stdio.md).
+Identity comes from the launcher configuration. The command grants nothing on
+its own and would rather refuse to serve than guess who's calling. Tools,
+recording and configuration: [`docs/mcp-stdio.md`](docs/mcp-stdio.md).
 
 ### Trees, graphs, and vectors are complementary
 
