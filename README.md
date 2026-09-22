@@ -1,34 +1,139 @@
-# shoal
+# Shoal
 
-**Turn documents and code into navigable, attributable knowledge. Start
-embedded, then scale the same data model and query semantics to Accumulo.**
+**No authority without evidence.**
 
-Shoal is a local-to-cluster knowledge plane for applications and agent
-systems. It combines hierarchical documents, typed graph relationships,
-lexical and vector indexes, temporal queries, authorization, and exact source
-citations. The Explorer product layer gives users a simple workflow without
-restricting the platform to one parser, one retrieval strategy, or one model
-provider.
+Shoal is an evidence plane for AI systems. Claims, retrieval, and actions stay
+bound to the sources, identity, authorization, and system state that justify
+them. When that binding cannot be established, Shoal refuses instead of
+degrading quietly.
 
-## What can you build?
+Most systems in this space offer citations. Citations are presentation: a
+footnote is only as good as the discipline of whoever checks it. Shoal enforces
+the binding in the architecture, so the unverified path is not available to
+callers, applications, or agents.
 
-- **Document intelligence:** navigate long technical, legal, financial, and
-  operational documents by structure, then retrieve exact cited passages.
-- **Code exploration:** connect files, symbols, revisions, diagnostics, and
+## What Shoal refuses to do
+
+| It will not | Because |
+|---|---|
+| Assert a claim it cannot cite | Only claims backed by verified citations become output. The rest are recorded as unresolved issues, so a thin answer is visible as thin rather than dressed up |
+| Persist a citation that was not derived from the source | Anchor identity is recomputed from the citation and its resolved quote on write. An invented or edited anchor is rejected, not stored |
+| Search what you may not read | Documents outside a caller's authorization are removed from the candidate set before scoring, so unauthorized content cannot influence a result it can never appear in |
+| Let an empty result and a withheld one look different | A term whose matches exist but are withheld returns exactly what a term matching nothing returns, so a caller cannot probe for the existence of content it may not read |
+| Substitute a retrieval strategy you did not ask for | An unconfigured vector mode fails explicitly. It never silently falls back to lexical and calls it a match |
+| Serve without an identity | The local development authenticator refuses any listener another host can reach; the remote backend is closed because it cannot yet carry the caller's decision upstream |
+
+That last row is the pattern, not an exception. Where Shoal cannot preserve the
+evidence-to-authority chain, the feature is closed rather than left permissive.
+
+## Sixty seconds
+
+```bash
+# 1. Ingest a source into a durable local corpus.
+go run ./cmd/shoal-explore ingest \
+  -data .shoal/explorer -file docs/platform-product-plan.md
+
+# 2. Ask a grounded question. The default provider is deterministic and
+#    offline, so this works with no API key and no network.
+go run ./cmd/shoal-explore ask \
+  -data .shoal/explorer \
+  -question "what gates local to cluster promotion?"
+```
+
+You get verified claims with exact document, revision, and byte-range
+citations, the graph paths behind them, the snapshot the answer was pinned to,
+and a trace of how it was reached. Ask about something the corpus does not
+cover and you get a grounded no-answer with an unresolved issue, not an
+invention.
+
+Swap the provider for a local Ollama model or an OpenAI-compatible endpoint
+with `-provider`; nothing above changes.
+
+One honest note about this path. `shoal-explore` is a single-user local tool
+and reports `AuthorizationEnforced: false` in its own output, because there is
+no principal to enforce against. The authorization rows in the table above are
+enforced by the authorized client that backs the web workspace, the MCP server,
+and anything else serving more than one identity. Shoal says which of the two
+you are running rather than letting you assume.
+
+## Why this rather than a bigger context window
+
+Models, tool protocols, and agent frameworks are converging fast. An agent that
+can call your ticket system is not scarce, and will be less scarce next year.
+
+What stays scarce is the ability to establish, at the moment a decision is
+made: what is known, why it is believed, whether it is still valid, whether
+this actor may rely on it, and whether the resulting action is permitted.
+
+Shoal keeps that chain intact and checkable. Because the knowledge plane is
+separate from model execution, the model, the harness, and the tool protocol
+can all be replaced without discarding the accumulated, attributable
+understanding underneath.
+
+Two honest limits. Provenance proves where a belief came from, not that it
+still holds, which is why snapshot identity, revisions, `as_of`, and ontology
+evolution matter as much as citation does. And a verified, authorized,
+correctly cited claim can still be wrong if the world moved; the record is
+designed to make that detectable, not impossible.
+
+## Where Shoal stops
+
+Shoal governs the epistemic and authorization boundary around execution. It
+does not compete with the execution ecosystem.
+
+It registers agents, narrows their capabilities, leases and dispatches work,
+records execution evidence, and publishes lifecycle events. It will run work
+whose only effect is on its own evidence record, such as answering a grounded
+question about its corpus. Anything with an effect outside that boundary is
+dispatched to an external executor and recorded, never performed by Shoal.
+
+That keeps model and harness commoditization working in your favour: whatever
+executes the work, the warrant for why it was allowed lives here.
+
+
+## Is this for you?
+
+- **Document intelligence** — navigate long technical, legal, financial, and
+  operational sources by structure, then retrieve exact cited passages.
+- **Code exploration** — connect files, symbols, revisions, diagnostics, and
   source ranges without coupling Shoal to one parser.
-- **Cross-document knowledge graphs:** relate evidence across documents and
+- **Cross-document knowledge graphs** — relate evidence across sources and
   inspect the path behind a result.
-- **Private knowledge for agents:** keep source content and indexes local or
-  inside your own infrastructure; model and workflow execution stay outside
-  Shoal.
-- **Grounded inference contracts:** assemble immutable document and graph
-  evidence packs from verified Explorer results, expand explicitly selected
-  sections or graph neighborhoods, and validate structured,
-  provenance-bearing claims without coupling applications to a model vendor
-  or transport.
-- **Local-to-cluster applications:** prototype against an embedded corpus and
-  retain the graph, document, and retrieval contracts as storage moves toward
+- **Private knowledge for agents** — keep source content and indexes inside
+  your own infrastructure, with authorization enforced on every read.
+- **Grounded inference contracts** — assemble immutable evidence packs from
+  verified results and validate provenance-bearing claims without coupling to
+  a model vendor or transport.
+- **Local-to-cluster** — prototype against an embedded corpus and keep the
+  same graph, document, and retrieval contracts as storage moves toward
   Accumulo scale.
+
+## Choose a path
+
+| Goal | Start here |
+|---|---|
+| Ingest and explore a cited document corpus | [Explorer alpha](#explorer-alpha-ingest-explore-retrieve) |
+| Build with the public knowledge contracts | [`pkg/document`](pkg/document) · [`pkg/graph`](pkg/graph) · [`pkg/retrieval`](pkg/retrieval) · [`pkg/ontology`](pkg/ontology) · [`pkg/inference`](pkg/inference) · [`pkg/explorer`](pkg/explorer) |
+| Define grounded generation boundaries | [`docs/inference-contracts.md`](docs/inference-contracts.md) |
+| Run a local database with RFile or Parquet | [Embedded engine](#embedded-engine-standalone-no-zookeeper) |
+| Use Sharkbite import-compatible Python APIs | [`python/README.md`](python/README.md) |
+| Embed the Accumulo client or stable C ABI | [`accumulo/`](accumulo/) · [`capi/README.md`](capi/README.md) |
+| Evaluate Shoal replacement roles with Accumulo | [`FEATURES.md`](FEATURES.md#accumulo-replacement-roles) · [`docs/tserver-hosting-lifecycle.md`](docs/tserver-hosting-lifecycle.md) |
+| Validate against an exact Accumulo 4 cluster | [`test/accumulo/README.md`](test/accumulo/README.md) |
+
+See [`FEATURES.md`](FEATURES.md) for the complete capability and validation
+matrix, and [`docs/platform-product-plan.md`](docs/platform-product-plan.md)
+for the accepted local-to-Accumulo product direction. Production replacement
+roles remain gated by the live conformance verdicts tracked in
+[issue #74](https://github.com/phrocker/shoal-oss/issues/74).
+
+`pkg/inference` provides public, provider-neutral contracts, and
+`pkg/contextpack` deterministically builds bounded packs from Explorer
+retrieval and hydration APIs. `pkg/inference/harness` can run a bounded
+model-guided loop over an already authorized Explorer client and returns an
+inspectable trace. Shoal does not ship a Copilot/SDK hosted execution backend
+by default.
+
 
 ## Explorer alpha: ingest, explore, retrieve
 
@@ -41,29 +146,17 @@ web workspace, see
 [`docs/explorer-demo-walkthrough.md`](docs/explorer-demo-walkthrough.md).
 
 ```bash
-# 1. Ingest a source into a durable local corpus.
-go run ./cmd/shoal-explore ingest \
-  -data .shoal/explorer -file docs/platform-product-plan.md
-
-# 2. List documents, then inspect one document or graph neighborhood.
+# List documents, then inspect one document or graph neighborhood.
 go run ./cmd/shoal-explore list -data .shoal/explorer
 go run ./cmd/shoal-explore outline \
   -data .shoal/explorer -document <document-id>
 go run ./cmd/shoal-explore neighbors \
   -data .shoal/explorer -node <section-or-document-id> -depth 2
 
-# 3. Retrieve evidence with exact source ranges and an explanation path.
+# Retrieve evidence with exact source ranges and an explanation path.
 go run ./cmd/shoal-explore query \
   -data .shoal/explorer \
   -text "what gates local to cluster promotion?"
-
-# 4. Ask a grounded question. The default fake provider is deterministic and
-#    offline; use -provider ollama or -provider openai-compatible for local or
-#    authenticated API-key-backed models.
-go run ./cmd/shoal-explore ask \
-  -data .shoal/explorer \
-  -provider fake \
-  -question "what gates local to cluster promotion?"
 ```
 
 Explorer currently provides deterministic lexical, tree, and hierarchy-graph
@@ -95,111 +188,46 @@ no semantic quality claim. Anthropic publishes no embeddings API, so hosted
 embedding paths are OpenAI-compatible endpoints or Voyage. Credentials for
 hosted providers are resolved at request time and are never printed or stored.
 
-### Optional local web workspace
+### Local web workspace
 
-The separate `shoal-explore-web` binary serves an evidence-first workspace
-over an existing embedded Explorer corpus:
+`shoal-explore-web` serves an evidence-first browser workspace over an existing
+corpus: paged documents with their authored hierarchy, retrieval with exact
+revision and span citations and score explanations, and a bounded interactive
+graph canvas with cursor-based expansion and directed path finding.
 
 ```bash
 go run ./cmd/shoal-explore-web \
-  -data .shoal/explorer \
-  -listen 127.0.0.1:8080 \
-  -dev-auth
+  -data .shoal/explorer -listen 127.0.0.1:8080 -dev-auth
 ```
 
-Every request is authorized. The transport binds one trusted
-`pkg/explorer/auth` decision per request and serves the corpus through the
-decision-enforcing `pkg/explorer/authorized` client, so a caller sees only the
-documents, spans, edges, and retrieval evidence its decision permits. A request
-that cannot be authenticated is answered `401` and never reaches the service.
+Every request is authorized. The transport binds one trusted decision per
+request and serves through the decision-enforcing client, so a caller sees only
+the documents, spans, edges, and evidence its decision permits; a request that
+cannot be authenticated is answered `401` and never reaches the service.
 
-`-dev-auth` is the localhost development authenticator: it mints one fixed,
-clearly-named development principal (`development-principal@localhost`) for
-every request. It is refused unless the resolved listen address is
-loopback-only, so `:8080`, `0.0.0.0:8080`, and `[::]:8080` all cause the server
-to exit with a diagnostic instead of serving. Exposing the workspace beyond
-this host requires the provider-neutral OIDC authenticator (`-oidc-*`; see
-[`docs/shoal-explore-web-deploy.md`](docs/shoal-explore-web-deploy.md)); without
-it the server refuses to start rather than serve anonymously.
-
-The embedded backend registers authorization policy in an in-memory catalog for
-the lifetime of the process (issue #284). To keep a restart from presenting an
-empty workspace, `-dev-auth` on a loopback listener grants the documents already
-in the corpus directory to the development principal at startup and reports how
-many. That backfill is refused for any real authenticator and for any listener
-another host can reach, it grants nothing that re-ingesting the same files would
-not, and it does not persist: it runs again on the next start.
-
-Serving the same browser contract through another Explorer web API endpoint
-(`-backend remote`) is currently refused: there is no way yet to forward the
-caller's decision across that hop, so the upstream call would carry no identity
-at all. The backend is closed rather than left unauthorized.
-
-Open <http://127.0.0.1:8080>. The workspace lists and pages documents,
-preserves the authored hierarchy, retrieves exact revision/span citations and
-score explanations, and provides an interactive bounded graph canvas with
-cursor-based node expansion and directed path finding. Retrieval controls
-include vector mode; the embedded backend continues to fail that mode
-explicitly until a vector strategy is configured.
-
-The browser communicates only with `/api/v1/*`, a logical Explorer service
-contract. Requests and responses carry a snapshot ID and `as_of` value;
-document pages use snapshot-bound cursors, and the server enforces retrieval
-top-k plus graph depth, fanout, and node bounds. Opaque Shoal IDs use
-unpadded base64url on the HTTP wire so every valid ID round-trips. The first
-backend adapts the embedded `pkg/explorer` client behind the authorized client;
-the remote backend proxies the same contract, negotiates logical feature
-capabilities via `/api/v1/meta`, advertises the aggregate JSON response budget
-as `max_response_bytes`, and keeps unsupported-feature decisions server-side,
-but is not selectable from `shoal-explore-web` until it can carry the caller's
-authorization decision upstream.
+`-dev-auth` is a loopback-only development authenticator and refuses any
+listener another host can reach. Exposing the workspace requires the
+provider-neutral OIDC authenticator, and the `-backend remote` mode stays
+closed until it can carry the caller's decision upstream. Deployment,
+authentication, and the startup policy backfill are covered in
+[`docs/shoal-explore-web-deploy.md`](docs/shoal-explore-web-deploy.md).
 
 ### MCP stdio workspace
 
-`shoal-mcp` serves a real embedded, authorized Explorer workspace over
-newline-delimited JSON-RPC on stdin/stdout:
+`shoal-mcp` serves the same authorized embedded workspace over
+newline-delimited JSON-RPC on stdin and stdout, so an MCP-capable agent gets
+retrieval, documents, graph neighborhoods, grounded ask, provenance, and
+context compression under the same authorization and recording rules as the
+browser.
 
 ```bash
-go run ./cmd/shoal-mcp -state-dir .shoal/mcp -dev-auth
+go run ./cmd/shoal-mcp -data .shoal/explorer
 ```
 
-Stdout is reserved for MCP protocol messages and diagnostics go only to stderr.
-Identity is supplied by trusted process configuration in stdio v1 and rebound
-with a fresh request ID for each tool call. All callers connected to one process
-therefore share that configured identity. Generic tool calls are durably
-recorded fail-closed as `OperationToolCall`, with no synthesized inference node.
-The structured result remains complete while duplicate text rendering is
-context-budgeted by the native compressor; this is not Shoal's provenance
-`fold`. See [`docs/mcp-stdio.md`](docs/mcp-stdio.md) for configuration, storage
-policy, limitations, and a no-cluster smoke invocation.
-
-`shoal-explore-web` mounts the same dispatcher at `/mcp` using MCP 2025-11-25
-Streamable HTTP. Every HTTP request passes through the existing Host gate and
-configured development/OIDC authenticator before reaching MCP. Sessions retain
-only lifecycle state and are bound to the caller's authorization fingerprint
-and the effective workspace settings revision/cache dimensions; they cannot
-transfer identity, authority, or workspace state between principals. Every
-request must carry one canonical `Shoal-Workspace-ID` header. The initialize
-result reports the applied workspace identity, settings revision, cache
-dimensions, and limits in `_meta["shoal.workspace"]`.
-
-For a deterministic two-user shared-service setup, including owner-bound
-workspace provisioning and a VS Code Streamable HTTP template, see
-[`docs/multi-user-demo.md`](docs/multi-user-demo.md).
-
-The first-party web command also exposes `shoal.ask` and
-`shoal.provenance.{list,inspect,fold,unfold}` through adapters over the same
-chat and interaction providers used by the HTTP API. Ask returns complete
-structured citation evidence. Generic invocations are recorded fail-closed as
-`OperationToolCall`; directly surfaced `shoal.retrieve` results additionally
-receive their independent retrieval capture.
-
-The embedded web workspace also mounts the durable agent registry under
-`/api/v1/fleet/agents`. Executor references must be explicitly allowlisted with
-`-fleet-executor-refs`; without configured references, registration fails
-closed. Registry mutations are recorded through the same authorized interaction
-sink with exact `agent_*` operation and snapshot pins. Dispatch and event
-transport remain separate.
+The launcher configuration is the trusted identity source: the command grants
+nothing implicitly and refuses to serve rather than assume an identity. Tool
+surface, recording, and configuration are documented in
+[`docs/mcp-stdio.md`](docs/mcp-stdio.md).
 
 ### Trees, graphs, and vectors are complementary
 
@@ -210,31 +238,6 @@ typed cross-document graph traversal, temporal state, and authorization.
 Explorer is therefore an opinionated view over general document, graph, and
 retrieval APIs—not a tree-only storage system.
 
-## Choose a path
-
-| Goal | Start here |
-|---|---|
-| Ingest and explore a cited document corpus | [Explorer alpha](#explorer-alpha-ingest-explore-retrieve) |
-| Build with the public knowledge contracts | [`pkg/document`](pkg/document) · [`pkg/graph`](pkg/graph) · [`pkg/retrieval`](pkg/retrieval) · [`pkg/ontology`](pkg/ontology) · [`pkg/inference`](pkg/inference) · [`pkg/explorer`](pkg/explorer) |
-| Define grounded generation boundaries | [`docs/inference-contracts.md`](docs/inference-contracts.md) |
-| Run a local database with RFile or Parquet | [Embedded engine](#embedded-engine-standalone-no-zookeeper) |
-| Use Sharkbite import-compatible Python APIs | [`python/README.md`](python/README.md) |
-| Embed the Accumulo client or stable C ABI | [`accumulo/`](accumulo/) · [`capi/README.md`](capi/README.md) |
-| Evaluate Shoal replacement roles with Accumulo | [`FEATURES.md`](FEATURES.md#accumulo-replacement-roles) · [`docs/tserver-hosting-lifecycle.md`](docs/tserver-hosting-lifecycle.md) |
-| Validate against an exact Accumulo 4 cluster | [`test/accumulo/README.md`](test/accumulo/README.md) |
-
-See [`FEATURES.md`](FEATURES.md) for the complete capability and validation
-matrix, and [`docs/platform-product-plan.md`](docs/platform-product-plan.md)
-for the accepted local-to-Accumulo product direction. Production replacement
-roles remain gated by the live conformance verdicts tracked in
-[issue #74](https://github.com/phrocker/shoal-oss/issues/74).
-
-`pkg/inference` provides public, provider-neutral contracts, and
-`pkg/contextpack` deterministically builds bounded packs from Explorer
-retrieval and hydration APIs. `pkg/inference/harness` can run a bounded
-model-guided loop over an already authorized Explorer client and returns an
-inspectable trace. Shoal does not ship a Copilot/SDK hosted execution backend
-by default.
 
 ## Build and platform quick start
 
