@@ -97,13 +97,21 @@ Shoal handles the knowledge and the permission around execution. It isn't
 trying to be your agent runtime.
 
 It registers agents, narrows what they're allowed to do, leases and dispatches
-work, takes back execution evidence, and publishes lifecycle events. It will
-run work whose only effect lands in its own evidence record, like answering a
-question about its corpus. Anything that touches the outside world gets
-dispatched to an executor and recorded, not performed here.
+work, takes back execution evidence, and publishes lifecycle events. The only
+executor that ships runs work whose effect lands in Shoal's own evidence
+record: answering a question about the corpus. Anything touching the outside
+world is meant to be dispatched to an executor and recorded, not performed
+here.
 
-Which is deliberate: whatever ends up doing the work, the reason it was allowed
-to lives in Shoal.
+Meant to be, because right now that line is held by which executor is bound
+rather than by anything in the interface. `ActionExecutor` is an ordinary Go
+interface, and a host that binds an implementation doing external work would
+not be stopped. Making the boundary enforceable, so a capability declaring an
+external effect can't register against an in-process executor, is
+[#366](https://github.com/phrocker/shoal-oss/issues/366).
+
+The point of the boundary either way: whatever ends up doing the work, the
+reason it was allowed to lives in Shoal.
 
 ## What people build with it
 
@@ -237,11 +245,25 @@ grounded ask, provenance and context compression with the same authorization
 and recording as the browser.
 
 ```bash
-go run ./cmd/shoal-mcp -data .shoal/explorer
+go run ./cmd/shoal-mcp -state-dir .shoal/mcp -dev-auth
 ```
 
 Identity comes from the launcher configuration. The command grants nothing on
-its own and would rather refuse to serve than guess who's calling. Tools,
+its own and would rather refuse to serve than guess who's calling, so without
+`-dev-auth` or explicit identity flags it exits instead of starting.
+
+Note that this is its own workspace, not the corpus from the quickstart above.
+Point it at that one and it refuses:
+
+```
+refusing to serve corpus .shoal/explorer with 1 document(s) because policy
+catalog .shoal/explorer-policy has no authorization registrations
+```
+
+Which is the behavior, not a papercut. Documents ingested by a single-user
+local tool carry no authorization registrations, and rather than serve them to
+an MCP client under an invented identity, it stops and tells you what is
+missing. Ingest through an authorized workspace and it will serve. Tools,
 recording and configuration: [`docs/mcp-stdio.md`](docs/mcp-stdio.md).
 
 ### Trees, graphs, and vectors are complementary
