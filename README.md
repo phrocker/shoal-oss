@@ -239,10 +239,15 @@ backfill are in
 
 ### MCP
 
-`shoal-mcp` exposes the same authorized workspace over JSON-RPC on stdin and
-stdout, so an MCP client gets retrieval, documents, graph neighborhoods,
-grounded ask, provenance and context compression with the same authorization
-and recording as the browser.
+`shoal-mcp` exposes the authorized workspace over JSON-RPC on stdin and stdout,
+under the same authorization and recording as the browser. The stdio launcher
+advertises the corpus tools: `shoal.retrieve`, `shoal.documents`,
+`shoal.document`, `shoal.neighborhood`, `shoal.path`, `shoal.changes`,
+`shoal.ingest` and `shoal.recompute`.
+
+Grounded ask, provenance and context compression are not on this surface. They
+need a model provider and a workspace the stdio launcher does not configure, so
+they are served by the authenticated web `/mcp` endpoint instead.
 
 ```bash
 go run ./cmd/shoal-mcp -state-dir .shoal/mcp -dev-auth
