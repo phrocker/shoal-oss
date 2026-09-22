@@ -108,8 +108,17 @@ func (s *Service) Register(ctx context.Context, request RegisterRequest) (Descri
 		spec.AuthorizationDomain, spec.Scopes, now); err != nil {
 		return Descriptor{}, err
 	}
-	if _, ok := s.executors.ResolveExecutor(spec.ExecutorRef); !ok {
+	executor, ok := s.executors.ResolveExecutor(spec.ExecutorRef)
+	if !ok {
 		return Descriptor{}, shoal.NewError(shoal.ErrorInvalidArgument, "executor reference is not registered by the host")
+	}
+	// Refuse a descriptor that could never run within its own declaration.
+	// Catching it here rather than at invoke means an agent claiming an
+	// external effect against an evidence-only executor never becomes
+	// registered state that looks operable.
+	if err := validateDeclaredEffects(
+		spec.Capabilities, executorCeiling(executor)); err != nil {
+		return Descriptor{}, err
 	}
 	if spec.ParentID != "" {
 		if err := authorizeScopes(decision, auth.OperationDelegate, spec.ID,
@@ -674,6 +683,23 @@ func authorizeScopes(decision auth.Decision, operation auth.Operation, id shoal.
 func authorizeDescriptor(decision auth.Decision, operation auth.Operation, descriptor Descriptor, now time.Time) error {
 	return authorizeScopes(decision, operation, descriptor.ID,
 		descriptor.AuthorizationDomain, descriptor.Scopes, now)
+}
+
+// validateDeclaredEffects refuses any action whose declared effect exceeds
+// what the host permits its bound executor to do.
+func validateDeclaredEffects(capabilities []Capability, ceiling Effect) error {
+	for _, capability := range capabilities {
+		for _, action := range capability.Actions {
+			if action.Effect.exceeds(ceiling) {
+				return shoal.NewError(
+					shoal.ErrorInvalidArgument,
+					"action declares an external effect but its executor is "+
+						"bound for evidence-only work; external effects are "+
+						"dispatched, not performed in process")
+			}
+		}
+	}
+	return nil
 }
 
 func validateGeneration(generation int64) error {

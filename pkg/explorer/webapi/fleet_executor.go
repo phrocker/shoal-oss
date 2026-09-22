@@ -197,6 +197,12 @@ func NewAskExecutor(config AskExecutorConfig) (*AskExecutor, error) {
 func (e *AskExecutor) Capability() string { return e.capability }
 func (e *AskExecutor) Action() string     { return e.action }
 
+// MaxEffect declares this executor as evidence-only. Everything it does lands
+// in Shoal's own record: it reads the corpus under the caller's decision, runs
+// inference, and returns verified claims. It reaches nothing outside that, and
+// an action declaring an external effect will not resolve to it.
+func (e *AskExecutor) MaxEffect() fleet.Effect { return fleet.EffectEvidence }
+
 // AskActionInputSchema is the declarative schema a descriptor must register
 // for this action. Registering it from here keeps admission and execution from
 // drifting apart.

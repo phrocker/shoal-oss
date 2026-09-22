@@ -52,10 +52,52 @@ type Scope struct {
 	PolicyID []byte `json:"policy_id"`
 }
 
+// Effect classifies where an action's consequences land. It is the boundary
+// between what Shoal will run itself and what it will only dispatch.
+//
+// This is a declaration check, not a sandbox. Nothing prevents Go code bound
+// as an in-process executor from opening a socket, and nothing here tries to.
+// What it prevents is the mismatch: an action declaring an external effect
+// cannot resolve to an executor the host bound as evidence-only, so external
+// work cannot be performed in-process by accident or by a descriptor that
+// claims otherwise. A host that binds an executor doing external work under an
+// evidence-only ceiling has misdeclared its own configuration, and no
+// invariant here can detect that.
+type Effect string
+
+const (
+	// EffectEvidence is work whose only consequence is Shoal's own evidence
+	// record: answering a question about the corpus, recording an
+	// interaction. It is the zero value, so a descriptor written before this
+	// field existed keeps its previous meaning.
+	EffectEvidence Effect = ""
+	// EffectExternal is work that touches anything outside that record. Shoal
+	// dispatches it and records the outcome; it does not run it.
+	EffectExternal Effect = "external"
+)
+
+func (e Effect) validate() error {
+	switch e {
+	case EffectEvidence, EffectExternal:
+		return nil
+	default:
+		return shoal.NewError(
+			shoal.ErrorInvalidArgument, "action effect is not a known class")
+	}
+}
+
+// exceeds reports whether this effect is beyond what a ceiling permits.
+func (e Effect) exceeds(ceiling Effect) bool {
+	return e == EffectExternal && ceiling != EffectExternal
+}
+
 type Action struct {
 	Name         string          `json:"name"`
 	InputSchema  json.RawMessage `json:"input_schema"`
 	OutputSchema json.RawMessage `json:"output_schema"`
+	// Effect declares where this action's consequences land. Empty means
+	// evidence-only.
+	Effect Effect `json:"effect,omitempty"`
 }
 
 type Capability struct {
@@ -141,6 +183,22 @@ type ListPage struct {
 }
 
 type Executor interface{}
+
+// EffectBounded is the host's declaration of what an executor is permitted to
+// do. An executor that does not implement it is treated as evidence-only,
+// which is the conservative reading: a host that wants an executor to perform
+// external work has to say so.
+type EffectBounded interface {
+	MaxEffect() Effect
+}
+
+// executorCeiling reports the effect class an executor may serve.
+func executorCeiling(executor Executor) Effect {
+	if bounded, ok := executor.(EffectBounded); ok {
+		return bounded.MaxEffect()
+	}
+	return EffectEvidence
+}
 
 type ExecutorRegistry interface {
 	ResolveExecutor(string) (Executor, bool)
@@ -264,8 +322,12 @@ func canonicalCapabilities(input []Capability) ([]Capability, error) {
 			if err != nil {
 				return nil, err
 			}
+			if err := action.Effect.validate(); err != nil {
+				return nil, err
+			}
 			result[i].Actions[j] = Action{
-				Name: action.Name, InputSchema: inputSchema, OutputSchema: outputSchema,
+				Name: action.Name, InputSchema: inputSchema,
+				OutputSchema: outputSchema, Effect: action.Effect,
 			}
 		}
 		sort.Slice(result[i].Actions, func(a, b int) bool {

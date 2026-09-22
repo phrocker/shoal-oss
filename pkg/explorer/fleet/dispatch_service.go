@@ -960,6 +960,16 @@ func (s *Service) resolveAction(
 	if !ok {
 		return Descriptor{}, Action{}, nil, shoal.NewError(shoal.ErrorUnavailable, "registered executor does not implement action execution")
 	}
+	// Re-checked at resolution, not only at registration. A host can rebind an
+	// executor reference to a narrower ceiling while descriptors registered
+	// under the old one are still live, and those must stop resolving rather
+	// than keep running against a binding that no longer permits them.
+	if selected.Effect.exceeds(executorCeiling(raw)) {
+		return Descriptor{}, Action{}, nil, shoal.NewError(
+			shoal.ErrorUnavailable,
+			"action declares an external effect but its executor is bound "+
+				"for evidence-only work")
+	}
 	return cloneDescriptor(descriptor), *selected, executor, nil
 }
 
