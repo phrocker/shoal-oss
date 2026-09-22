@@ -1,11 +1,11 @@
 # Shoal
 
-Shoal governs what an AI system knows, and what it is allowed to do with it.
+Shoal is a knowledge database built around enforcement: it governs what an AI
+system knows, and what it is allowed to do with it.
 
-That sounds like two products. It's one, because neither half is trustworthy
-alone. A retrieval layer that can't show where an answer came from produces
-confident nonsense. An access-control layer that doesn't understand content can
-only guard whole files.
+Neither half is much use alone. A retrieval layer that can't show where an
+answer came from produces confident nonsense. An access-control layer that
+doesn't understand content can only guard whole files.
 
 Plenty of tools give you citations. A citation is a display format, and it's
 worth whatever the reader is willing to go check, which in practice is nothing.
@@ -30,7 +30,10 @@ ways that would be hard to notice.
 
 **A restricted term and a nonexistent one give you the same answer, byte for
 byte.** You can't tell them apart, which means you can't map what's behind the
-wall by watching how the refusals differ.
+wall by watching how the refusals differ. There's a conformance suite that
+holds this, comparing encoded responses rather than named fields so a field
+added later can't quietly reintroduce the difference:
+[`internal/disclosureconformance`](internal/disclosureconformance).
 
 **Vector search that isn't configured fails.** It doesn't quietly fall back to
 lexical and hand you something that looks like a match.
@@ -239,10 +242,17 @@ backfill are in
 
 ### MCP
 
-`shoal-mcp` exposes the same authorized workspace over JSON-RPC on stdin and
-stdout, so an MCP client gets retrieval, documents, graph neighborhoods,
-grounded ask, provenance and context compression with the same authorization
-and recording as the browser.
+`shoal-mcp` exposes the authorized workspace over JSON-RPC on stdin and stdout,
+under the same authorization and recording as the browser. The stdio launcher
+advertises the corpus tools: `shoal.retrieve`, `shoal.documents`,
+`shoal.document`, `shoal.neighborhood`, `shoal.path`, `shoal.changes`,
+`shoal.ingest` and `shoal.recompute`.
+
+Grounded ask and provenance are not on this surface. They need a model provider
+and a workspace the stdio launcher does not configure, so they are served by
+the authenticated web `/mcp` endpoint instead. Context compression is not a
+tool and does not appear in that list, but it is on by default here: every
+successful tool result is packed through it.
 
 ```bash
 go run ./cmd/shoal-mcp -state-dir .shoal/mcp -dev-auth
