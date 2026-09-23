@@ -57,10 +57,15 @@ type Corpus struct {
 
 	authority *auth.Authority
 	clock     func() time.Time
-	sourceA   []byte
-	policyA   []byte
-	sourceB   []byte
-	policyB   []byte
+	// restricted names a real node in the compartment the uncleared principal
+	// cannot read. Probing it is the point: the interesting question is
+	// whether asking about something real-but-forbidden looks different from
+	// asking about something that was never there.
+	restricted shoal.ID
+	sourceA    []byte
+	policyA    []byte
+	sourceB    []byte
+	policyB    []byte
 }
 
 type fixtureGenerations struct {
@@ -120,13 +125,15 @@ func NewCorpus(t *testing.T) *Corpus {
 	}); err != nil {
 		t.Fatalf("ingest open document: %v", err)
 	}
-	if _, err := restricted.Ingest(admin, explorer.Source{
+	hidden, err := restricted.Ingest(admin, explorer.Source{
 		URI: "file:///restricted.txt", Title: "Restricted",
 		MediaType: explorer.MediaTypeText,
 		Content:   "project " + RestrictedTerm + " ships in spring",
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatalf("ingest restricted document: %v", err)
 	}
+	corpus.restricted = hidden.Document.ID
 	return corpus
 }
 
@@ -161,6 +168,16 @@ func (c *Corpus) newClient(
 		t.Fatal(err)
 	}
 	return client
+}
+
+// RestrictedNodeID is a node that exists in the corpus and that the uncleared
+// principal holds no grant for.
+func (c *Corpus) RestrictedNodeID() shoal.ID { return c.restricted }
+
+// AbsentNodeID is well-formed and names nothing. It is the control for every
+// probe about the restricted node.
+func (c *Corpus) AbsentNodeID() shoal.ID {
+	return shoal.ID("doc_00000000000000000000000000000000")
 }
 
 // Clock is the fixture's clock, for a service that must agree with it.

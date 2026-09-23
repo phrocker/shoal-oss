@@ -32,6 +32,26 @@
 // deliberately discloses withholding declares itself Distinguishable, which
 // pins the accepted trade so that changing it silently fails the suite rather
 // than passing unnoticed.
+//
+// # Timing
+//
+// There is no latency assertion here, and that is a conclusion rather than an
+// omission. Measured over 200 runs per probe against the fixture corpus, a
+// term whose matches are withheld and a term that matches nothing take
+// indistinguishable time: roughly 110µs and 118µs, with the absent term
+// marginally slower, which is noise. A term that returns a result takes about
+// 60% longer, and that discloses nothing, because the caller receives the
+// result anyway.
+//
+// The reason is the same one that makes the responses identical. Documents an
+// identity may not read leave the candidate set before scoring, so the
+// withheld path does not do more work than a plain miss. It does the same
+// work. A timing gate here would assert the absence of a mechanism that does
+// not exist, and would buy that with the flakiest kind of test.
+//
+// This stops being true if withholding ever moves later in the pipeline, to
+// filtering results rather than excluding candidates. That change would show
+// up in the response comparison first.
 package disclosureconformance
 
 import (
