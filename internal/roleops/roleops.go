@@ -130,8 +130,15 @@ func dependenciesSnapshot(dependencies *Dependencies) []Dependency {
 
 type Server struct {
 	http *http.Server
-	done chan error
-	once sync.Once
+	// done is closed once the serve loop has returned. It carries no value,
+	// because a value can only be delivered to one receiver: when it did, a
+	// caller watching Done and a caller in Shutdown raced for the serve error
+	// and whichever lost observed nil.
+	done chan struct{}
+	// serveErr is written once before done is closed, so every goroutine that
+	// observes the close is guaranteed to see it.
+	serveErr error
+	once     sync.Once
 }
 
 func Start(address string, handler http.Handler, tlsConfig *tls.Config) (*Server, error) {
@@ -142,26 +149,50 @@ func Start(address string, handler http.Handler, tlsConfig *tls.Config) (*Server
 	if tlsConfig != nil {
 		listener = tls.NewListener(listener, tlsConfig.Clone())
 	}
+	return serve(address, listener, handler), nil
+}
+
+// serve is the half of Start that does not bind, so a test can supply a
+// listener that fails and assert what happens to the resulting serve error.
+// Without a seam here the error path is unreachable, and a regression test for
+// it can only assert the nil case, which passes whether or not the error is
+// delivered at all.
+func serve(address string, listener net.Listener, handler http.Handler) *Server {
 	server := &Server{
 		http: &http.Server{
 			Addr:              address,
 			Handler:           handler,
 			ReadHeaderTimeout: 5 * time.Second,
 		},
-		done: make(chan error, 1),
+		done: make(chan struct{}),
 	}
 	go func() {
 		err := server.http.Serve(listener)
 		if errors.Is(err, http.ErrServerClosed) {
 			err = nil
 		}
-		server.done <- err
+		server.serveErr = err
 		close(server.done)
 	}()
-	return server, nil
+	return server
 }
 
-func (s *Server) Done() <-chan error { return s.done }
+// Done is closed when the serve loop has returned. Once it is readable the
+// loop has exited, so a caller that shuts down and then releases the
+// listener's resources is not racing it.
+func (s *Server) Done() <-chan struct{} { return s.done }
+
+// Err reports why the serve loop returned. It is only meaningful once Done is
+// readable, and every caller sees the same value rather than the first one
+// consuming it.
+func (s *Server) Err() error {
+	select {
+	case <-s.done:
+		return s.serveErr
+	default:
+		return nil
+	}
+}
 
 func (s *Server) Shutdown(ctx context.Context) error {
 	if s == nil {
@@ -174,8 +205,8 @@ func (s *Server) Shutdown(ctx context.Context) error {
 			_ = s.http.Close()
 		}
 		select {
-		case serveErr := <-s.done:
-			shutdownErr = errors.Join(shutdownErr, serveErr)
+		case <-s.done:
+			shutdownErr = errors.Join(shutdownErr, s.serveErr)
 		case <-ctx.Done():
 			_ = s.http.Close()
 			shutdownErr = errors.Join(shutdownErr, ctx.Err())
