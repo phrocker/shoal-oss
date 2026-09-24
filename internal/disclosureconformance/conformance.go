@@ -50,8 +50,14 @@
 // not exist, and would buy that with the flakiest kind of test.
 //
 // This stops being true if withholding ever moves later in the pipeline, to
-// filtering results rather than excluding candidates. That change would show
-// up in the response comparison first.
+// scoring hidden candidates and filtering them afterward rather than excluding
+// them up front. That change would not be caught here: filtering after scoring
+// can produce byte-identical responses while doing strictly more work on the
+// withheld path, which is a timing distinction with no response distinction.
+//
+// So the condition is explicit rather than delegated. Anyone moving where
+// candidates are filtered has to re-measure timing, because no test in this
+// package will notice.
 package disclosureconformance
 
 import (
