@@ -149,6 +149,15 @@ func Start(address string, handler http.Handler, tlsConfig *tls.Config) (*Server
 	if tlsConfig != nil {
 		listener = tls.NewListener(listener, tlsConfig.Clone())
 	}
+	return serve(address, listener, handler), nil
+}
+
+// serve is the half of Start that does not bind, so a test can supply a
+// listener that fails and assert what happens to the resulting serve error.
+// Without a seam here the error path is unreachable, and a regression test for
+// it can only assert the nil case, which passes whether or not the error is
+// delivered at all.
+func serve(address string, listener net.Listener, handler http.Handler) *Server {
 	server := &Server{
 		http: &http.Server{
 			Addr:              address,
@@ -165,7 +174,7 @@ func Start(address string, handler http.Handler, tlsConfig *tls.Config) (*Server
 		server.serveErr = err
 		close(server.done)
 	}()
-	return server, nil
+	return server
 }
 
 // Done is closed when the serve loop has returned. Once it is readable the
