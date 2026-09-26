@@ -197,11 +197,27 @@ func NewAskExecutor(config AskExecutorConfig) (*AskExecutor, error) {
 func (e *AskExecutor) Capability() string { return e.capability }
 func (e *AskExecutor) Action() string     { return e.action }
 
-// MaxEffect declares this executor as evidence-only. Everything it does lands
-// in Shoal's own record: it reads the corpus under the caller's decision, runs
-// inference, and returns verified claims. It reaches nothing outside that, and
-// an action declaring an external effect will not resolve to it.
-func (e *AskExecutor) MaxEffect() fleet.Effect { return fleet.EffectEvidence }
+// This executor deliberately declares no effect ceiling, and the reason is
+// worth stating because the obvious declaration would be false.
+//
+// It mutates nothing outside Shoal, so fleet.EffectEvidence looks correct. But
+// it hands retrieved passages to a configured model provider, and that provider
+// may post them off-host: the web composition builds it from Ollama or an
+// OpenAI-compatible generator, and only the former is loopback by default.
+// Declaring evidence-only would assert that nothing leaves the host, while the
+// action may transmit corpus content and incur a billed call.
+//
+// The wider class is not the answer either. Declaring external would raise this
+// executor's ceiling and let genuinely external actions resolve to it, which is
+// worse than understating.
+//
+// The current two classes split on mutation and cannot express transmission, so
+// no honest declaration exists yet. Leaving it undeclared falls back to
+// evidence-only, which is the conservative reading for *enforcement*: an action
+// declaring an external effect still will not resolve here. It is not a claim
+// about what this executor does. Issue #385 adds the missing class, at which
+// point the ceiling should be derived from the configured provider rather than
+// returned as a constant.
 
 // AskActionInputSchema is the declarative schema a descriptor must register
 // for this action. Registering it from here keeps admission and execution from
