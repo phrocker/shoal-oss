@@ -87,8 +87,30 @@ func (e Effect) validate() error {
 }
 
 // exceeds reports whether this effect is beyond what a ceiling permits.
+//
+// Unrecognized values fail closed, and asymmetrically, because the two sides
+// mean opposite things. Registration validates a declaration, but the durable
+// decoder reads whatever string is stored, so a malformed or tampered
+// descriptor can reach resolution without ever having passed validation. An
+// unrecognized *declaration* is therefore treated as beyond every ceiling: it
+// is an unproven claim and gets the most restrictive reading. An unrecognized
+// *ceiling* is treated as permitting only evidence: it is a host that failed to
+// declare its own configuration and gets the least permissive reading.
+//
+// Both directions resolve to refusing more, never less. Comparing against the
+// exact external string alone made every unknown value permitted, which is the
+// opposite of what the class is for.
 func (e Effect) exceeds(ceiling Effect) bool {
-	return e == EffectExternal && ceiling != EffectExternal
+	declarationKnown := e.validate() == nil
+	ceilingKnown := ceiling.validate() == nil
+	switch {
+	case !declarationKnown:
+		return true
+	case !ceilingKnown:
+		return e != EffectEvidence
+	default:
+		return e == EffectExternal && ceiling != EffectExternal
+	}
 }
 
 type Action struct {

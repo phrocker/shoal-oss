@@ -173,3 +173,57 @@ func TestMutationDigestSeparatesEffects(t *testing.T) {
 		t.Fatal("the digest must stay stable for an unchanged effect")
 	}
 }
+
+// TestUnknownEffectsFailClosedAtResolution is the regression test for a
+// high-severity hole. Registration validates a declared effect, but the durable
+// decoder reads whatever string is stored, so a malformed or tampered
+// descriptor can reach resolution having never passed validation. Comparing
+// only against the exact external string made every unrecognized value
+// permitted under an evidence-only ceiling, which inverts the purpose of the
+// class.
+func TestUnknownEffectsFailClosedAtResolution(t *testing.T) {
+	unknown := Effect("something-nobody-defined")
+
+	// An unrecognized declaration is an unproven claim: beyond every ceiling.
+	for _, ceiling := range []Effect{EffectEvidence, EffectExternal, unknown} {
+		if !unknown.exceeds(ceiling) {
+			t.Fatalf("unknown declaration was permitted under ceiling %q", ceiling)
+		}
+	}
+
+	// An unrecognized ceiling is a host that failed to declare itself: it
+	// permits evidence and nothing more.
+	if EffectEvidence.exceeds(unknown) {
+		t.Fatal("evidence-only work must remain permitted under an unknown ceiling")
+	}
+	if !EffectExternal.exceeds(unknown) {
+		t.Fatal("an unknown ceiling must not authorize external work")
+	}
+
+	// The known cases are unchanged.
+	if EffectExternal.exceeds(EffectEvidence) != true ||
+		EffectExternal.exceeds(EffectExternal) != false ||
+		EffectEvidence.exceeds(EffectEvidence) != false ||
+		EffectEvidence.exceeds(EffectExternal) != false {
+		t.Fatal("the recognized comparisons changed")
+	}
+}
+
+// TestUnknownEffectFromStorageIsRefusedAtRegistration pins the same rule
+// through the narrowing comparison, which is the other place a stored value is
+// compared rather than validated.
+func TestUnknownEffectFromStorageIsRefusedAtRegistration(t *testing.T) {
+	unknown := []Capability{{Name: "explorer.reason", Actions: []Action{{
+		Name: "ask", Effect: Effect("decoded-from-a-tampered-record"),
+		InputSchema: anyObject, OutputSchema: anyObject,
+	}}}}
+	if err := validateDeclaredEffects(unknown, EffectEvidence); err == nil {
+		t.Fatal("an unknown declared effect must not register")
+	}
+	if err := validateDeclaredEffects(unknown, EffectExternal); err == nil {
+		t.Fatal("an unknown declared effect must not register even at the widest ceiling")
+	}
+	if capabilitiesSubset(unknown, evidenceAction()) {
+		t.Fatal("an unknown effect must not pass the narrowing check")
+	}
+}
