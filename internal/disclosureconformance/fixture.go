@@ -28,6 +28,7 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/explorer/authorized"
+	"github.com/phrocker/shoal-oss/pkg/graph"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
@@ -62,10 +63,15 @@ type Corpus struct {
 	// whether asking about something real-but-forbidden looks different from
 	// asking about something that was never there.
 	restricted shoal.ID
-	sourceA    []byte
-	policyA    []byte
-	sourceB    []byte
-	policyB    []byte
+	// open names a node every principal may read. A path probe needs it as the
+	// source, because a request whose source is forbidden is rejected at seed
+	// authorization before target resolution runs, and would only re-test the
+	// neighborhood negative path.
+	open    shoal.ID
+	sourceA []byte
+	policyA []byte
+	sourceB []byte
+	policyB []byte
 }
 
 type fixtureGenerations struct {
@@ -119,12 +125,14 @@ func NewCorpus(t *testing.T) *Corpus {
 	corpus.Client = open
 
 	admin := corpus.Cleared(t)
-	if _, err := open.Ingest(admin, explorer.Source{
+	visible, err := open.Ingest(admin, explorer.Source{
 		URI: "file:///open.txt", Title: "Open", MediaType: explorer.MediaTypeText,
 		Content: "the " + OpenTerm + " bed is shallow",
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatalf("ingest open document: %v", err)
 	}
+	corpus.open = visible.Document.ID
 	hidden, err := restricted.Ingest(admin, explorer.Source{
 		URI: "file:///restricted.txt", Title: "Restricted",
 		MediaType: explorer.MediaTypeText,
@@ -134,6 +142,16 @@ func NewCorpus(t *testing.T) *Corpus {
 		t.Fatalf("ingest restricted document: %v", err)
 	}
 	corpus.restricted = hidden.Document.ID
+	// A directed edge from the readable document to the restricted one, so a
+	// path probe can hold the source constant and vary only the target. The
+	// cleared principal can resolve this path; the uncleared one must not be
+	// able to distinguish it from a path to a node that does not exist.
+	if err := open.Connect(admin, graph.Edge{
+		ID: "edge_disclosure_probe", From: corpus.open, To: corpus.restricted,
+		Type: "references", Weight: 1,
+	}); err != nil {
+		t.Fatalf("connect the probe edge: %v", err)
+	}
 	return corpus
 }
 
@@ -169,6 +187,10 @@ func (c *Corpus) newClient(
 	}
 	return client
 }
+
+// OpenNodeID is a node every principal may read. Path probes use it as the
+// source so that only the target varies.
+func (c *Corpus) OpenNodeID() shoal.ID { return c.open }
 
 // RestrictedNodeID is a node that exists in the corpus and that the uncleared
 // principal holds no grant for.

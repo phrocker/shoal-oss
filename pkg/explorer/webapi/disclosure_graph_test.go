@@ -100,10 +100,14 @@ func TestServedGraphSurfacesAreUniform(t *testing.T) {
 			Withheld: servedNeighborhood(t, service, ctx, restricted),
 			Control:  servedNeighborhood(t, service, ctx, absent),
 		},
+		// Only the target varies. Changing the source as well would be
+		// rejected at seed authorization inside BoundedNeighborhood before
+		// target resolution runs, which merely repeats the neighborhood
+		// negative path and cannot catch a target-resolution oracle.
 		disclosureconformance.Probe{
 			Name:     "served-path/withheld-target-vs-absent-target",
-			Withheld: servedPath(t, service, ctx, restricted, restricted),
-			Control:  servedPath(t, service, ctx, absent, absent),
+			Withheld: servedPath(t, service, ctx, corpus.OpenNodeID(), restricted),
+			Control:  servedPath(t, service, ctx, corpus.OpenNodeID(), absent),
 		},
 	)
 }
@@ -131,5 +135,28 @@ func TestClearedPrincipalReachesTheServedGraph(t *testing.T) {
 		t, service, corpus.Uncleared(t), corpus.RestrictedNodeID())
 	if uncleared.ErrorText == "" {
 		t.Fatal("the uncleared principal must not expand it")
+	}
+}
+
+// TestClearedPrincipalResolvesThePathToTheRestrictedTarget guards the path
+// probe specifically. Without it, comparing two unresolvable paths would pass
+// while proving nothing about target resolution: the cleared principal must be
+// able to resolve the very path the uncleared principal is refused.
+func TestClearedPrincipalResolvesThePathToTheRestrictedTarget(t *testing.T) {
+	corpus := disclosureconformance.NewCorpus(t)
+	service, err := NewEmbeddedService(corpus.Client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cleared := servedPath(t, service, corpus.Cleared(t),
+		corpus.OpenNodeID(), corpus.RestrictedNodeID())
+	if cleared.ErrorText != "" {
+		t.Fatalf("the cleared principal must resolve the path: %s",
+			cleared.ErrorText)
+	}
+	if cleared.Path == nil || len(cleared.Path.Path.Nodes) == 0 {
+		t.Fatalf("the fixture must connect the open node to the restricted "+
+			"one, or the path probe varies a target that is unreachable "+
+			"either way: %#v", cleared.Path)
 	}
 }
