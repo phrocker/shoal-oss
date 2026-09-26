@@ -131,3 +131,45 @@ func TestDelegationCannotWidenEffect(t *testing.T) {
 		t.Fatal("an unchanged effect must remain a subset of itself")
 	}
 }
+
+// TestEffectSurvivesCloning proves the field is carried by cloneDescriptor.
+// It was not, so a registered external action was returned to callers, and
+// re-resolved, as evidence-only: the boundary was enforced once at
+// registration and then silently dropped.
+func TestEffectSurvivesCloning(t *testing.T) {
+	descriptor := Descriptor{Capabilities: []Capability{{
+		Name: "deploy", Actions: []Action{{
+			Name: "ship", Effect: EffectExternal,
+			InputSchema: anyObject, OutputSchema: anyObject,
+		}},
+	}}}
+	clone := cloneDescriptor(descriptor)
+	if got := clone.Capabilities[0].Actions[0].Effect; got != EffectExternal {
+		t.Fatalf("cloned effect = %q, want %q", got, EffectExternal)
+	}
+}
+
+// TestMutationDigestSeparatesEffects proves an otherwise identical
+// registration with a different effect is a different mutation. The digest
+// omitted the field, so an exact replay could swap an evidence-only action for
+// an external one under the same mutation identity and be treated as the same
+// request.
+func TestMutationDigestSeparatesEffects(t *testing.T) {
+	mutation := func(effect Effect) Mutation {
+		return Mutation{Descriptor: Descriptor{
+			ID: "agent", Generation: 1,
+			Capabilities: []Capability{{Name: "deploy", Actions: []Action{{
+				Name: "ship", Effect: effect,
+				InputSchema: anyObject, OutputSchema: anyObject,
+			}}}},
+		}}
+	}
+	evidence := registryMutationDigest(mutation(EffectEvidence))
+	external := registryMutationDigest(mutation(EffectExternal))
+	if evidence == external {
+		t.Fatal("effect must change the mutation digest")
+	}
+	if registryMutationDigest(mutation(EffectExternal)) != external {
+		t.Fatal("the digest must stay stable for an unchanged effect")
+	}
+}

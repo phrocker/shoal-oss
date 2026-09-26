@@ -644,6 +644,11 @@ func registryMutationDigest(mutation Mutation) [sha256.Size]byte {
 		writeRegistryDigestField(digest, []byte(capability.Name))
 		for _, action := range capability.Actions {
 			writeRegistryDigestField(digest, []byte(action.Name))
+			// Hashed so an exact registration replay that changes only the
+			// effect is divergent rather than identical. Omitting it let a
+			// replay quietly swap an evidence-only action for an external one
+			// under the same mutation identity.
+			writeRegistryDigestField(digest, []byte(action.Effect))
 			writeRegistryDigestField(digest, action.InputSchema)
 			writeRegistryDigestField(digest, action.OutputSchema)
 		}

@@ -406,6 +406,7 @@ func cloneDescriptor(input Descriptor) Descriptor {
 			action := input.Capabilities[i].Actions[j]
 			result.Capabilities[i].Actions[j] = Action{
 				Name:         action.Name,
+				Effect:       action.Effect,
 				InputSchema:  append(json.RawMessage(nil), action.InputSchema...),
 				OutputSchema: append(json.RawMessage(nil), action.OutputSchema...),
 			}
