@@ -363,6 +363,7 @@ func cloneFleetCapabilities(input []fleet.Capability) []fleet.Capability {
 		for j := range input[i].Actions {
 			result[i].Actions[j] = fleet.Action{
 				Name:         input[i].Actions[j].Name,
+				Effect:       input[i].Actions[j].Effect,
 				InputSchema:  append(json.RawMessage(nil), input[i].Actions[j].InputSchema...),
 				OutputSchema: append(json.RawMessage(nil), input[i].Actions[j].OutputSchema...),
 			}

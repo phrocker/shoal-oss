@@ -108,8 +108,17 @@ func (s *Service) Register(ctx context.Context, request RegisterRequest) (Descri
 		spec.AuthorizationDomain, spec.Scopes, now); err != nil {
 		return Descriptor{}, err
 	}
-	if _, ok := s.executors.ResolveExecutor(spec.ExecutorRef); !ok {
+	executor, ok := s.executors.ResolveExecutor(spec.ExecutorRef)
+	if !ok {
 		return Descriptor{}, shoal.NewError(shoal.ErrorInvalidArgument, "executor reference is not registered by the host")
+	}
+	// Refuse a descriptor that could never run within its own declaration.
+	// Catching it here rather than at invoke means an agent claiming an
+	// external effect against an evidence-only executor never becomes
+	// registered state that looks operable.
+	if err := validateDeclaredEffects(
+		spec.Capabilities, executorCeiling(executor)); err != nil {
+		return Descriptor{}, err
 	}
 	if spec.ParentID != "" {
 		if err := authorizeScopes(decision, auth.OperationDelegate, spec.ID,
@@ -635,6 +644,11 @@ func registryMutationDigest(mutation Mutation) [sha256.Size]byte {
 		writeRegistryDigestField(digest, []byte(capability.Name))
 		for _, action := range capability.Actions {
 			writeRegistryDigestField(digest, []byte(action.Name))
+			// Hashed so an exact registration replay that changes only the
+			// effect is divergent rather than identical. Omitting it let a
+			// replay quietly swap an evidence-only action for an external one
+			// under the same mutation identity.
+			writeRegistryDigestField(digest, []byte(action.Effect))
 			writeRegistryDigestField(digest, action.InputSchema)
 			writeRegistryDigestField(digest, action.OutputSchema)
 		}
@@ -674,6 +688,23 @@ func authorizeScopes(decision auth.Decision, operation auth.Operation, id shoal.
 func authorizeDescriptor(decision auth.Decision, operation auth.Operation, descriptor Descriptor, now time.Time) error {
 	return authorizeScopes(decision, operation, descriptor.ID,
 		descriptor.AuthorizationDomain, descriptor.Scopes, now)
+}
+
+// validateDeclaredEffects refuses any action whose declared effect exceeds
+// what the host permits its bound executor to do.
+func validateDeclaredEffects(capabilities []Capability, ceiling Effect) error {
+	for _, capability := range capabilities {
+		for _, action := range capability.Actions {
+			if action.Effect.exceeds(ceiling) {
+				return shoal.NewError(
+					shoal.ErrorInvalidArgument,
+					"action declares an external effect but its executor is "+
+						"bound for evidence-only work; external effects are "+
+						"dispatched, not performed in process")
+			}
+		}
+	}
+	return nil
 }
 
 func validateGeneration(generation int64) error {
@@ -738,9 +769,15 @@ func capabilitiesSubset(child, parent []Capability) bool {
 		for _, wantedAction := range wantedCapability.Actions {
 			found := false
 			for _, allowedAction := range allowed.Actions {
+				// Effect is part of what delegation may narrow. Without it a
+				// child, or a later generation, could turn an evidence-only
+				// action into an external one and still pass as a subset,
+				// which would let the effect boundary be widened by exactly
+				// the path that exists to prevent widening.
 				if wantedAction.Name == allowedAction.Name &&
 					bytes.Equal(wantedAction.InputSchema, allowedAction.InputSchema) &&
-					bytes.Equal(wantedAction.OutputSchema, allowedAction.OutputSchema) {
+					bytes.Equal(wantedAction.OutputSchema, allowedAction.OutputSchema) &&
+					!wantedAction.Effect.exceeds(allowedAction.Effect) {
 					found = true
 					break
 				}
