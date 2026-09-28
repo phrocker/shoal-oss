@@ -145,3 +145,38 @@ func (p *stubFleetProvider) Resolve(ctx context.Context, request fleet.ResolveRe
 func (*stubFleetProvider) List(context.Context, fleet.ListRequest) (fleet.ListPage, error) {
 	return fleet.ListPage{}, nil
 }
+
+// TestCloneFleetCapabilitiesCarriesTheEffect guards the HTTP boundary's copy of
+// an authorization-relevant field. cloneFleetCapabilities is a separate
+// propagation path from the fleet package's own cloneDescriptor, so the effect
+// tests there stay green if this assignment is dropped — and dropping it would
+// present an external action to an API consumer as evidence-only, which is the
+// safe-looking direction and therefore the dangerous one.
+func TestCloneFleetCapabilitiesCarriesTheEffect(t *testing.T) {
+	schema := json.RawMessage(`{"type":"object"}`)
+	source := []fleet.Capability{{Name: "deploy", Actions: []fleet.Action{
+		{
+			Name: "ship", Effect: fleet.EffectExternal,
+			InputSchema: schema, OutputSchema: schema,
+		},
+		{
+			Name:        "describe",
+			InputSchema: schema, OutputSchema: schema,
+		},
+	}}}
+	cloned := cloneFleetCapabilities(source)
+	if len(cloned) != 1 || len(cloned[0].Actions) != 2 {
+		t.Fatalf("clone shape = %#v", cloned)
+	}
+	if got := cloned[0].Actions[0].Effect; got != fleet.EffectExternal {
+		t.Fatalf("external effect became %q at the API boundary", got)
+	}
+	if got := cloned[0].Actions[1].Effect; got != fleet.EffectEvidence {
+		t.Fatalf("evidence effect became %q", got)
+	}
+	// The clone must be independent, or a caller could mutate registry state.
+	cloned[0].Actions[0].Effect = fleet.EffectEvidence
+	if source[0].Actions[0].Effect != fleet.EffectExternal {
+		t.Fatal("clone aliased the source capability")
+	}
+}

@@ -38,9 +38,14 @@ import (
 )
 
 const (
-	Table               = "_shoal_explorer_fleet"
-	agentKind    byte   = 'A'
-	codecVersion uint16 = 1
+	Table          = "_shoal_explorer_fleet"
+	agentKind byte = 'A'
+	// codecVersion 2 adds the action effect class. Version 1 records predate
+	// it and decode as fleet.EffectEvidence, which is the zero value and the
+	// meaning they were written with, so an existing corpus keeps working
+	// without a migration.
+	codecVersion       uint16 = 2
+	codecVersionEffect uint16 = 2
 )
 
 var (
@@ -381,6 +386,7 @@ func encodeDescriptor(
 		writeU32(&buffer, uint32(len(capability.Actions)))
 		for _, action := range capability.Actions {
 			writeString(&buffer, action.Name)
+			writeString(&buffer, string(action.Effect))
 			writeBytes(&buffer, action.InputSchema)
 			writeBytes(&buffer, action.OutputSchema)
 		}
@@ -402,7 +408,11 @@ func decodeDescriptor(value []byte) (
 ) {
 	reader := bytes.NewReader(value)
 	version, err := readU16(reader)
-	if err != nil || version != codecVersion {
+	// Both versions are accepted on read. A version-1 record was written
+	// before the effect class existed and carries no field for it, so it
+	// decodes with the zero value, which is the meaning it was written with.
+	// Only version 2 is written.
+	if err != nil || (version != 1 && version != codecVersion) {
 		return fleet.Descriptor{}, [sha256.Size]byte{},
 			errors.New("unknown descriptor encoding")
 	}
@@ -467,6 +477,13 @@ func decodeDescriptor(value []byte) (
 			action := &descriptor.Capabilities[i].Actions[j]
 			if action.Name, err = readString(reader, fleet.MaxNameBytes); err != nil {
 				return fleet.Descriptor{}, [sha256.Size]byte{}, err
+			}
+			if version >= codecVersionEffect {
+				effect, effectErr := readString(reader, fleet.MaxNameBytes)
+				if effectErr != nil {
+					return fleet.Descriptor{}, [sha256.Size]byte{}, effectErr
+				}
+				action.Effect = fleet.Effect(effect)
 			}
 			if action.InputSchema, err = readBytes(reader, fleet.MaxSchemaBytes); err != nil {
 				return fleet.Descriptor{}, [sha256.Size]byte{}, err

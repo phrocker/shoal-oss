@@ -108,8 +108,17 @@ func (s *Service) Register(ctx context.Context, request RegisterRequest) (Descri
 		spec.AuthorizationDomain, spec.Scopes, now); err != nil {
 		return Descriptor{}, err
 	}
-	if _, ok := s.executors.ResolveExecutor(spec.ExecutorRef); !ok {
+	executor, ok := s.executors.ResolveExecutor(spec.ExecutorRef)
+	if !ok {
 		return Descriptor{}, shoal.NewError(shoal.ErrorInvalidArgument, "executor reference is not registered by the host")
+	}
+	// Refuse a descriptor that could never run within its own declaration.
+	// Catching it here rather than at invoke means an agent claiming an
+	// external effect against an evidence-only executor never becomes
+	// registered state that looks operable.
+	if err := validateDeclaredEffects(
+		spec.Capabilities, executorCeiling(executor)); err != nil {
+		return Descriptor{}, err
 	}
 	if spec.ParentID != "" {
 		if err := authorizeScopes(decision, auth.OperationDelegate, spec.ID,
@@ -635,6 +644,22 @@ func registryMutationDigest(mutation Mutation) [sha256.Size]byte {
 		writeRegistryDigestField(digest, []byte(capability.Name))
 		for _, action := range capability.Actions {
 			writeRegistryDigestField(digest, []byte(action.Name))
+			// Appended only for a non-evidence effect, so an evidence-only
+			// mutation hashes exactly as it did before this field existed.
+			//
+			// Hashing the zero value would have changed the bytes of every
+			// existing mutation, because an empty field still contributes its
+			// eight-byte length prefix, while the namespace above still says
+			// v1. This digest is embedded in the lifecycle QueryDigest, where
+			// a changed value reads as a divergent mutation, so a heartbeat or
+			// revoke retry that spans an upgrade would have been rejected.
+			//
+			// External still differs from evidence, because it appends bytes
+			// evidence does not, which is what keeps a replay from quietly
+			// swapping one for the other under the same mutation identity.
+			if action.Effect != EffectEvidence {
+				writeRegistryDigestField(digest, []byte(action.Effect))
+			}
 			writeRegistryDigestField(digest, action.InputSchema)
 			writeRegistryDigestField(digest, action.OutputSchema)
 		}
@@ -674,6 +699,23 @@ func authorizeScopes(decision auth.Decision, operation auth.Operation, id shoal.
 func authorizeDescriptor(decision auth.Decision, operation auth.Operation, descriptor Descriptor, now time.Time) error {
 	return authorizeScopes(decision, operation, descriptor.ID,
 		descriptor.AuthorizationDomain, descriptor.Scopes, now)
+}
+
+// validateDeclaredEffects refuses any action whose declared effect exceeds
+// what the host permits its bound executor to do.
+func validateDeclaredEffects(capabilities []Capability, ceiling Effect) error {
+	for _, capability := range capabilities {
+		for _, action := range capability.Actions {
+			if action.Effect.exceeds(ceiling) {
+				return shoal.NewError(
+					shoal.ErrorInvalidArgument,
+					"action declares an external effect but its executor is "+
+						"bound for evidence-only work; external effects are "+
+						"dispatched, not performed in process")
+			}
+		}
+	}
+	return nil
 }
 
 func validateGeneration(generation int64) error {
@@ -738,9 +780,15 @@ func capabilitiesSubset(child, parent []Capability) bool {
 		for _, wantedAction := range wantedCapability.Actions {
 			found := false
 			for _, allowedAction := range allowed.Actions {
+				// Effect is part of what delegation may narrow. Without it a
+				// child, or a later generation, could turn an evidence-only
+				// action into an external one and still pass as a subset,
+				// which would let the effect boundary be widened by exactly
+				// the path that exists to prevent widening.
 				if wantedAction.Name == allowedAction.Name &&
 					bytes.Equal(wantedAction.InputSchema, allowedAction.InputSchema) &&
-					bytes.Equal(wantedAction.OutputSchema, allowedAction.OutputSchema) {
+					bytes.Equal(wantedAction.OutputSchema, allowedAction.OutputSchema) &&
+					!wantedAction.Effect.exceeds(allowedAction.Effect) {
 					found = true
 					break
 				}

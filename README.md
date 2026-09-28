@@ -101,17 +101,26 @@ trying to be your agent runtime.
 
 It registers agents, narrows what they're allowed to do, leases and dispatches
 work, takes back execution evidence, and publishes lifecycle events. The only
-executor that ships runs work whose effect lands in Shoal's own evidence
-record: answering a question about the corpus. Anything touching the outside
-world is meant to be dispatched to an executor and recorded, not performed
-here.
+executor that ships answers questions about the corpus, which mutates nothing
+outside Shoal. Anything that changes the outside world is dispatched to an
+executor and recorded, not performed here.
 
-Meant to be, because right now that line is held by which executor is bound
-rather than by anything in the interface. `ActionExecutor` is an ordinary Go
-interface, and a host that binds an implementation doing external work would
-not be stopped. Making the boundary enforceable, so a capability declaring an
-external effect can't register against an in-process executor, is
-[#366](https://github.com/phrocker/shoal-oss/issues/366).
+That line is enforced, not just intended. An action declares whether it
+mutates anything outside Shoal, the host declares what it permits an executor
+to do, and an action declaring an external effect can neither register against
+an evidence-only executor nor resolve to one later if the host rebinds the
+reference. Unrecognized values fail closed in both directions.
+
+It is a declaration check, not a sandbox. Nothing stops Go code a host chose to
+bind from opening a socket, and nothing tries to. What it stops is the
+mismatch, where an action claims external work and quietly runs in-process
+anyway.
+
+One honest gap: the two classes split on *mutation*, so they cannot express
+transmission. An action that sends corpus content to a hosted model and changes
+nothing outside is evidence-only under this definition — accurate about
+consequence, silent about disclosure. That is
+[#385](https://github.com/phrocker/shoal-oss/issues/385).
 
 The point of the boundary either way: whatever ends up doing the work, the
 reason it was allowed to lives in Shoal.
