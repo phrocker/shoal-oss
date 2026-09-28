@@ -1,0 +1,43 @@
+name: Helm chart
+
+# The explorer templates exist to make a misconfiguration fail at render rather
+# than at runtime in a pod log. A guard that stops firing is invisible: the
+# chart still renders, still installs, and produces a workspace that denies
+# everything or answers nothing. This runs the same checks locally available
+# through deploy/helm/validate-chart.sh so that cannot happen quietly.
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/helm-chart.yml"
+      - "deploy/helm/**"
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/helm-chart.yml"
+      - "deploy/helm/**"
+
+concurrency:
+  group: helm-chart-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: lint / render / guards
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.16.2
+      - name: Install kubeconform
+        run: |
+          version=v0.6.7
+          curl -fsSL "https://github.com/yannh/kubeconform/releases/download/${version}/kubeconform-linux-amd64.tar.gz" |
+            tar -xz -C /usr/local/bin kubeconform
+          kubeconform -v
+      - name: Validate the chart
+        run: ./deploy/helm/validate-chart.sh

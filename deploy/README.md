@@ -32,6 +32,8 @@ work is ordered under #128 rather than implied by the StatefulSet alone.
 - `../Dockerfile`: multi-stage image containing `/shoal-embed`, `/shoal`, and `/shoal-tserver`.
 - `k8s/`: plain Kubernetes YAML for the write tier, read fleet, shared ConfigMap, and placeholder Secret.
 - `helm/shoal/`: minimal Helm chart wrapping the same resources.
+- `../Dockerfile.shoal-explore-web`: the authorized plane image (`shoal-explore-web`).
+- `helm/validate-chart.sh`: chart checks — lint, render, schema, and every configuration guard.
 
 ## Build and push
 
@@ -80,6 +82,52 @@ helm upgrade --install shoal deploy/helm/shoal -f deploy/helm/shoal/values-singl
 helm upgrade --install shoal deploy/helm/shoal -f deploy/helm/shoal/values-distributed.yaml
 helm upgrade --install shoal deploy/helm/shoal -f deploy/helm/shoal/values-accumulo.yaml
 ```
+
+### The authorized plane
+
+The three modes above describe a storage topology. The **explorer** —
+`shoal-explore-web`, the process that holds a decision, enforces the disclosure
+controls, and owns the Fleet registry and execution boundary — is orthogonal to
+all three and composes with any of them, so it is not derived from `mode`. It is
+off by default and enabled explicitly.
+
+```bash
+helm upgrade --install shoal deploy/helm/shoal -f deploy/helm/shoal/values-explorer.yaml \
+  --set explorer.image.repository=ghcr.io/YOUR_ORG/shoal-explore-web \
+  --set explorer.image.tag=TAG
+```
+
+`values-explorer.yaml` is the authorized plane on its own, with no
+Accumulo-replacement roles. To add it to a storage deployment, set
+`explorer.enabled=true` alongside any other profile.
+
+The chart **refuses to render** a configuration that would start and then deny
+or answer nothing. Authentication is a required decision with one valid value
+(`explorer.auth.mode: oidc`); `-dev-auth` is not offered, because it is refused
+on any non-loopback listener and a pod behind a Service must bind one.
+`explorer.allowedHosts` is required, because an empty allow-list answers every
+request with `421`. `explorer.replicas` above one is refused: the corpus,
+workspace settings and durable policy catalog share one state root on a
+ReadWriteOnce volume, with no coordination protocol between two processes over
+it. A remote chat or embedding provider without a credential Secret is refused,
+and so is an ask executor reference the allow-list does not name.
+
+Probes address a **separate health port** (`-health-address`), never the
+workspace port. The workspace refuses any request whose `Host` is not an exactly
+configured authority, and a kubelet addresses the pod by its runtime-assigned
+IP, which no static allow-list can name — a probe there answers `421` and the
+pod never becomes ready. See the health-surface section of
+[`docs/shoal-explore-web-deploy.md`](../docs/shoal-explore-web-deploy.md).
+
+Run the chart checks before changing any of this:
+
+```bash
+deploy/helm/validate-chart.sh
+```
+
+It renders every profile, schema-checks the output, and asserts that each guard
+still refuses and each valid configuration still renders. A guard that silently
+stops firing is the failure this exists to catch.
 
 Replace the example image and environment-specific storage, ZooKeeper,
 credentials, and HDFS values before deployment. Role-level `enabled` values

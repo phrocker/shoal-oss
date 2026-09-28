@@ -10,3 +10,84 @@
 {{- if and (eq .Values.mode "distributed") $writeTierEnabled (gt (int .Values.writeTier.replicas) 1) -}}
 {{- fail "distributed mode supports exactly one writable writeTier replica until the Kubernetes Lease adapter exists" -}}
 {{- end -}}
+{{- if eq (include "shoal.explorerEnabled" .) "true" -}}
+{{- $explorer := .Values.explorer -}}
+{{- $oidc := $explorer.auth.oidc -}}
+
+{{- /* Authentication is a required decision, and OIDC is the only valid one.
+       -dev-auth is refused on any non-loopback listener, and a pod reached
+       through a Service must bind one, so a chart could only render it into a
+       workspace that cannot start. */ -}}
+{{- if ne $explorer.auth.mode "oidc" -}}
+{{- fail (printf "explorer.auth.mode must be set to \"oidc\" (got %q). The Explorer refuses to serve without an authenticator, and -dev-auth is not an option in a cluster: it is refused on any non-loopback listener, which a pod behind a Service must bind. Configure explorer.auth.oidc" $explorer.auth.mode) -}}
+{{- end -}}
+{{- if not $oidc.issuer -}}
+{{- fail "explorer.auth.oidc.issuer is required: tokens are validated against an exact issuer" -}}
+{{- end -}}
+{{- if not $oidc.audiences -}}
+{{- fail "explorer.auth.oidc.audiences is required: at least one audience must match a token exactly, or every token is rejected" -}}
+{{- end -}}
+{{- if not $oidc.authorizationClaim -}}
+{{- fail "explorer.auth.oidc.authorizationClaim is required: without it no token carries workspace authority and every authenticated caller is denied" -}}
+{{- end -}}
+{{- /* A mapped claim with no values is fail-closed but indistinguishable from
+       an outage, and it is the most common way to deploy a workspace that
+       authenticates everyone and authorizes no one. */ -}}
+{{- if not (or $oidc.readerValues (or $oidc.contributorValues $oidc.fleetValues)) -}}
+{{- fail "explorer.auth.oidc needs at least one of readerValues, contributorValues or fleetValues: the authorization claim is mapped to nothing, so every authenticated caller would be denied" -}}
+{{- end -}}
+
+{{- /* An empty allow-list refuses every request with 421, because the resolved
+       listen address of a pod is an authority no real client sends. */ -}}
+{{- if not $explorer.allowedHosts -}}
+{{- fail "explorer.allowedHosts is required: the workspace binds a non-loopback address in a pod, and with no allow-list every request is refused with 421 Misdirected Request. List the external authority clients actually send (usually the port-less ingress name)" -}}
+{{- end -}}
+
+{{- /* One state root, one engine, no coordination protocol between two
+       processes over it. */ -}}
+{{- if gt (int $explorer.replicas) 1 -}}
+{{- fail "explorer.replicas must be 1: the corpus, workspace settings and durable policy catalog live in one state root on a ReadWriteOnce volume, and there is no coordination protocol between two processes over it. A second replica is not a scale-out, it is two writers to one engine" -}}
+{{- end -}}
+{{- if lt (int $explorer.replicas) 0 -}}
+{{- fail "explorer.replicas must be 0 or 1" -}}
+{{- end -}}
+
+{{- /* The mosaic budget is inert without a window to accumulate over. */ -}}
+{{- if and (gt (int $explorer.disclosure.mosaic.maxDomains) 0) (not $explorer.disclosure.mosaic.window) -}}
+{{- fail "explorer.disclosure.mosaic.window is required when maxDomains is above zero: the distinct-domain count accumulates over that window and never resets without one" -}}
+{{- end -}}
+
+{{- /* A credential that is never projected into the pod becomes a request-time
+       failure in whichever code path first needs the model. */ -}}
+{{- if $explorer.chat.provider -}}
+{{- if not $explorer.chat.model -}}
+{{- fail "explorer.chat.model is required when explorer.chat.provider is set" -}}
+{{- end -}}
+{{- if and (not (hasPrefix "http://127.0.0.1" $explorer.chat.baseURL)) (not (hasPrefix "http://localhost" $explorer.chat.baseURL)) -}}
+{{- if not $explorer.chat.credentialSecretName -}}
+{{- fail (printf "explorer.chat.credentialSecretName is required for a remote chat base URL (%q): the workspace reads %s at request time, and nothing projects it into the pod without a Secret" $explorer.chat.baseURL $explorer.chat.apiKeyEnv) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- if and $explorer.embedding.provider (has $explorer.embedding.provider (list "openai" "voyage")) -}}
+{{- if not $explorer.embedding.credentialSecretName -}}
+{{- fail (printf "explorer.embedding.credentialSecretName is required for the %s embedding provider: it is unconditionally remote and needs a credential in the pod" $explorer.embedding.provider) -}}
+{{- end -}}
+{{- end -}}
+
+{{- /* The ask executor is bound by reference, and the registry only accepts a
+       reference the allow-list names. */ -}}
+{{- if $explorer.fleet.askExecutorRef -}}
+{{- if not (has $explorer.fleet.askExecutorRef $explorer.fleet.executorRefs) -}}
+{{- fail (printf "explorer.fleet.askExecutorRef %q must also appear in explorer.fleet.executorRefs, or registration stays fail-closed against it" $explorer.fleet.askExecutorRef) -}}
+{{- end -}}
+{{- if not $explorer.chat.provider -}}
+{{- fail "explorer.fleet.askExecutorRef requires a configured explorer.chat.provider: the grounded-reasoning executor has no model to run without one" -}}
+{{- end -}}
+{{- end -}}
+
+{{- /* Two listeners on one port silently means one of them is not serving. */ -}}
+{{- if eq (int $explorer.containerPort) (int $explorer.healthPort) -}}
+{{- fail "explorer.healthPort must differ from explorer.containerPort: they are two listeners and cannot share a port" -}}
+{{- end -}}
+{{- end -}}
