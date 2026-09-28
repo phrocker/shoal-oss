@@ -1,0 +1,37 @@
+# The authorized plane on its own: no Accumulo-replacement storage roles.
+#
+#   helm install shoal deploy/helm/shoal -f deploy/helm/shoal/values-explorer.yaml \
+#     --set explorer.image.repository=ghcr.io/YOUR_ORG/shoal-explore-web \
+#     --set explorer.image.tag=TAG
+#
+# Every value below that reads REPLACE_ME must be set. The chart refuses to
+# render otherwise, rather than deploying a workspace that starts and then
+# denies or refuses everything.
+mode: single
+objectStorage:
+  # No storage tier in this profile, so no object-storage credentials.
+  createSecret: false
+writeTier:
+  enabled: false
+
+explorer:
+  enabled: true
+  image:
+    repository: ghcr.io/YOUR_ORG/shoal-explore-web
+    tag: TAG
+  # The external authority clients actually send. Usually the port-less ingress
+  # name, since TLS terminates there.
+  allowedHosts:
+    - REPLACE_ME.example.test
+  auth:
+    mode: oidc
+    oidc:
+      issuer: https://REPLACE_ME/
+      audiences:
+        - REPLACE_ME
+      authorizationClaim: groups
+      readerValues:
+        - REPLACE_ME-readers
+      contributorValues:
+        - REPLACE_ME-contributors
+  storageSize: 20Gi

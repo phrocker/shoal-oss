@@ -140,3 +140,142 @@ compactor:
   updateStrategy: {partition: 0}
   podDisruptionBudget: {enabled: true, maxUnavailable: 1}
   tls: {enabled: false, secretName: "", requireClientCert: false}
+
+# The authorized plane: the process that holds a decision, enforces the
+# disclosure controls, and owns the Fleet registry and execution boundary.
+#
+# It is off by default and not derived from `mode`. The modes above describe a
+# storage topology (which write authority, which read fleet); the explorer is
+# orthogonal to all three and composes with any of them, so deriving it from
+# `mode` would make one of those modes silently mean something it does not.
+explorer:
+  enabled: false
+  # A separate image from the storage tier: built by Dockerfile.shoal-explore-web
+  # with its own entrypoint and embedded UI.
+  image:
+    repository: ghcr.io/example/shoal-explore-web
+    tag: dev
+    pullPolicy: IfNotPresent
+  # One replica, and validate.yaml refuses more.
+  #
+  # The workspace keeps its corpus, workspace settings and durable policy
+  # catalog in one state root on a ReadWriteOnce volume, and there is no
+  # coordination protocol between two processes over the same directory. A
+  # second replica is not a scale-out, it is two writers to one engine.
+  replicas: 1
+  servicePort: 8098
+  containerPort: 8098
+  # The orchestrator probe surface (-health-address). It is a second listener
+  # because the workspace listener refuses any request whose Host is not an
+  # exactly configured authority, which a kubelet addressing the pod by its
+  # runtime-assigned IP can never satisfy. See docs/shoal-explore-web-deploy.md.
+  healthPort: 8099
+  # Required. The external authorities this instance answers to, exactly
+  # matched. Empty means every request is refused with 421, so validate.yaml
+  # refuses to render rather than deploy a workspace that answers nothing.
+  # Usually the port-less external name, since TLS terminates at the ingress.
+  allowedHosts: []
+  # The single state root. -state-dir places the corpus at <stateDir>/corpus and
+  # the durable policy catalog at <stateDir>/policy, so this one mount carries
+  # everything a restart needs.
+  stateDir: /var/lib/shoal
+  storageSize: 20Gi
+  storageClassName: ""
+  terminationGracePeriodSeconds: 45
+  service:
+    type: ClusterIP
+    annotations: {}
+  # Authentication is a required decision with exactly one valid value.
+  #
+  # -dev-auth is not offered. It is refused on any non-loopback listener
+  # (cmd/shoal-explore-web/authn.go), and a pod reached through a Service must
+  # bind a non-loopback address, so a chart that rendered it would produce a
+  # workspace that cannot start. Leaving this unset fails at render with that
+  # explanation rather than at runtime in a pod log.
+  auth:
+    mode: ""  # must be set to: oidc
+    oidc:
+      issuer: ""
+      # At least one audience is required; at least one must match exactly.
+      audiences: []
+      discoveryURL: ""
+      jwksURI: ""
+      allowedAlgs: ""      # defaults to RS256; HS* and none are always rejected
+      clockSkew: ""        # defaults to 60s, capped at 5m
+      subjectClaim: ""     # defaults to sub
+      actorClaim: ""
+      clientIDClaim: ""
+      delegationClaim: ""
+      # Required: the claim whose values map to workspace authority, and at
+      # least one mapping for it. Without a mapping every authenticated caller
+      # is denied, which is fail-closed but indistinguishable from an outage.
+      authorizationClaim: ""
+      readerValues: []
+      contributorValues: []
+      fleetValues: []
+      # Optional browser Authorization Code + PKCE login.
+      browserClientID: ""
+      browserScope: ""
+  # Disclosure posture. Both settings are deployment choices, not defaults to
+  # inherit silently: see docs/shoal-explore-web-deploy.md and #372.
+  disclosure:
+    # Remove the withheld-document counts from responses. Off by default: the
+    # counts are corpus-wide and identical for every query, so they disclose how
+    # much a caller cannot read, not which terms match. Turn this on for a
+    # compartmented deployment that declines to disclose either. Audit records
+    # both counts either way.
+    concealWithholding: false
+    # The sensitivity-domain co-occurrence budget (the mosaic control).
+    # maxDomains 0 disables it. When enabled, the workspace requires a durable
+    # co-occurrence ledger and fails closed at construction without one.
+    mosaic:
+      maxDomains: 0
+      window: 1h
+  # Grounded chat provider. Required for the built-in reasoning executor.
+  chat:
+    provider: ""   # ollama or openai-compatible
+    model: ""
+    baseURL: ""
+    # Environment variable the workspace reads at request time. The chart
+    # projects it from credentialSecretName/credentialSecretKey when both are
+    # set; validate.yaml requires them for a provider whose base URL is remote.
+    apiKeyEnv: SHOAL_OPENAI_API_KEY
+    credentialSecretName: ""
+    credentialSecretKey: api-key
+    organization: ""
+    project: ""
+  # Embedded vector provider. Empty disables vector retrieval; lexical retrieval
+  # is unaffected.
+  embedding:
+    provider: ""   # fake, lexical, ollama, openai, or voyage
+    model: ""
+    baseURL: ""
+    apiKeyEnv: OPENAI_API_KEY
+    dimensions: 0
+    credentialSecretName: ""
+    credentialSecretKey: api-key
+  # The execution boundary (#381). Registration is fail-closed: a descriptor can
+  # only name an executor reference this list allows.
+  fleet:
+    executorRefs: []
+    # Bound to the built-in grounded-reasoning executor. Must also appear in
+    # executorRefs and requires a configured chat provider.
+    askExecutorRef: ""
+  ontologyFile: ""
+  resources:
+    requests:
+      cpu: 500m
+      memory: 1Gi
+    limits:
+      cpu: "2"
+      memory: 4Gi
+  podDisruptionBudget:
+    # Single replica with no handoff path: refuse voluntary eviction rather than
+    # silently taking the only authorized plane offline. Matches writeTier.
+    enabled: true
+    maxUnavailable: 0
+  updateStrategy:
+    partition: 0
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}

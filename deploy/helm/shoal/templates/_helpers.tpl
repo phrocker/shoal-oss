@@ -55,3 +55,17 @@ app.kubernetes.io/part-of: shoal-platform
 {{- eq .Values.mode "accumulo" -}}
 {{- end -}}
 {{- end -}}
+
+{{- define "shoal.explorerEnabled" -}}
+{{- .Values.explorer.enabled -}}
+{{- end -}}
+
+{{- define "shoal.explorerName" -}}
+{{- printf "%s-explorer" (include "shoal.fullname" .) | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+
+{{- define "shoal.explorerSelectorLabels" -}}
+app.kubernetes.io/name: shoal-explore-web
+app.kubernetes.io/instance: {{ .Release.Name }}
+app.kubernetes.io/component: explorer
+{{- end -}}
