@@ -191,3 +191,40 @@ func TestServeErrorReachesBothObservers(t *testing.T) {
 		t.Fatalf("Err after shutdown = %v", server.Err())
 	}
 }
+
+// TestShutdownJoinsEvenWhenTheContextIsAlreadyDone covers the branch the
+// happy-path test cannot reach. With an expired context the select's Done case
+// is immediately ready and can win before the serve goroutine has closed its
+// channel, so returning there would break the join this function promises.
+// Close unblocks Serve, so waiting is bounded rather than a deadlock.
+//
+// It is reachable in practice: shoal-compactor reuses a shutdown context after
+// waiting on another server, by which point it may already be expired.
+func TestShutdownJoinsEvenWhenTheContextIsAlreadyDone(t *testing.T) {
+	server, err := Start("127.0.0.1:0", Handler(NewDependencies(), nil), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expired, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	done := make(chan error, 1)
+	go func() { done <- server.Shutdown(expired) }()
+
+	// Deliberately no assertion on the returned error. Both select cases can
+	// be ready at once and Go picks among them at random, and http.Shutdown
+	// returns nil when it finishes closing before the context is consulted, so
+	// whether a context cause appears is genuinely nondeterministic here. The
+	// property under test is the join.
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("shutdown blocked instead of joining a closed serve loop")
+	}
+
+	select {
+	case <-server.Done():
+	default:
+		t.Fatal("shutdown returned on the context before the serve loop ended")
+	}
+}

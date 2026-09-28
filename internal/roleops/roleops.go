@@ -208,8 +208,18 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		case <-s.done:
 			shutdownErr = errors.Join(shutdownErr, s.serveErr)
 		case <-ctx.Done():
+			// Close unblocks Serve, so the join below is bounded by the
+			// goroutine finishing rather than by the caller's deadline.
+			//
+			// Returning on the context alone would let Shutdown outrun the
+			// serve loop, which is the ordering this function exists to
+			// guarantee. It is reachable whenever the context is already done
+			// on entry, including a shutdown context reused after waiting on
+			// another server, because a ready Done case can win the select
+			// before the goroutine has closed s.done.
 			_ = s.http.Close()
-			shutdownErr = errors.Join(shutdownErr, ctx.Err())
+			<-s.done
+			shutdownErr = errors.Join(shutdownErr, ctx.Err(), s.serveErr)
 		}
 	})
 	return shutdownErr
