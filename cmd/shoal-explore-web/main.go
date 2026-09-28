@@ -91,6 +91,21 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 			"survive a restart",
 	)
 	listen := flags.String("listen", "127.0.0.1:8080", "HTTP listen address")
+	healthAddress := flags.String(
+		"health-address", os.Getenv("SHOAL_HEALTH_ADDRESS"),
+		"Optional separate listen address serving GET /healthz and GET /readyz "+
+			"for orchestrator probes. Empty disables it. This is a second "+
+			"listener on purpose: the workspace listener refuses any request "+
+			"whose Host is not an exactly configured authority, which a probe "+
+			"addressing the pod by its runtime-assigned IP can never satisfy. "+
+			"The surface answers with a status code and a fixed string and "+
+			"reads no corpus, policy or identity state, so it is safe to bind "+
+			"where the workspace port is not. /readyz reports not-ready until "+
+			"the workspace is serving and again as soon as shutdown begins, so "+
+			"a draining instance leaves Service endpoints before it stops "+
+			"accepting; /healthz stays ok throughout a drain. Environment "+
+			"fallback SHOAL_HEALTH_ADDRESS",
+	)
 	allowedHost := flags.String(
 		"allowed-host", "",
 		"Comma-separated exact-match allow-list of external authorities (host "+
@@ -723,17 +738,42 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 		}
 	}
 	fmt.Fprintf(output, "Shoal Explorer listening at http://%s\n", listener.Addr())
+	// Bound here, after the corpus and policy catalog are open and the handler
+	// is built, so that the health port accepting a connection already means
+	// construction finished. A bind failure is fatal rather than degraded: an
+	// operator who asked for a probe surface and silently did not get one would
+	// read every probe failure as the workspace being down.
+	health := (*healthServer)(nil)
+	state := &healthState{}
+	if address := strings.TrimSpace(*healthAddress); address != "" {
+		health, err = startHealthServer(address, state)
+		if err != nil {
+			listener.Close()
+			return fmt.Errorf("listen on %s: %w", address, err)
+		}
+		fmt.Fprintf(output, "Health surface listening at http://%s\n", health.address())
+	}
 	shutdownDone := make(chan error, 1)
 	go func() {
 		<-ctx.Done()
+		// drain drops readiness before the workspace stops accepting, so the
+		// instance keeps answering requests already routed to it while the
+		// endpoints controller stops routing new ones.
 		shutdown, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		shutdownDone <- server.Shutdown(shutdown)
+		shutdownDone <- drain(shutdown, state, server, health)
 	}()
+	state.markReady()
 	err = server.Serve(listener)
 	if errors.Is(err, http.ErrServerClosed) {
 		return <-shutdownDone
 	}
+	// The workspace serve loop failed on its own. Nothing signalled the
+	// shutdown goroutine, so close the health listener here rather than leaking
+	// it past the returning process.
+	shutdown, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_ = drain(shutdown, state, server, health)
 	return err
 }
 
