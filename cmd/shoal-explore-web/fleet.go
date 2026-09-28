@@ -274,6 +274,22 @@ func (r *boundFleetDispatch) Claim(
 	return r.service.Claim(ctx, request)
 }
 
+// CompleteClaim closes the loop for a worker that performed the effect out of
+// process. The bound request context is applied exactly as every other
+// dispatch call applies it, so a remote completion is authenticated as the
+// caller and never as the process.
+func (r *boundFleetDispatch) CompleteClaim(
+	ctx context.Context,
+	request fleet.CompletionRequest,
+) (fleet.ActionRecord, error) {
+	bound, err := r.requestContext(ctx, request.Context)
+	if err != nil {
+		return fleet.ActionRecord{}, err
+	}
+	request.Context = bound
+	return r.service.CompleteClaim(ctx, request)
+}
+
 func (r *boundFleetDispatch) Cancel(
 	ctx context.Context,
 	request fleet.CancelRequest,

@@ -1807,6 +1807,12 @@ func (*httpFleetToolService) Claim(
 	return fleet.ActionRecord{}, nil
 }
 
+func (*httpFleetToolService) CompleteClaim(
+	context.Context, fleet.CompletionRequest,
+) (fleet.ActionRecord, error) {
+	return fleet.ActionRecord{}, nil
+}
+
 func (*httpFleetToolService) Cancel(
 	context.Context, fleet.CancelRequest,
 ) (fleet.ActionRecord, error) {

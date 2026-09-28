@@ -25,6 +25,7 @@ type FleetDispatchProvider interface {
 	Status(context.Context, fleet.StatusRequest) (fleet.ActionRecord, error)
 	Pull(context.Context, fleet.PullActionsRequest) (fleet.ActionPage, error)
 	Invoke(context.Context, fleet.InvokeRequest) (fleet.ActionRecord, error)
+	CompleteClaim(context.Context, fleet.CompletionRequest) (fleet.ActionRecord, error)
 }
 
 // NewFleetDispatchHandler returns the fleet dispatch HTTP surface without
@@ -152,6 +153,53 @@ func mountFleetDispatch(mux *http.ServeMux, provider FleetDispatchProvider) {
 		}
 		writeResponse(w, http.StatusOK, encodeFleetAction(result))
 	})
+	mux.HandleFunc("POST /api/v1/fleet/actions/{action}/complete", func(w http.ResponseWriter, r *http.Request) {
+		actionID, err := decodeWireBytes("action ID", r.PathValue("action"), false)
+		if err != nil {
+			writeError(w, fleetDispatchError(err))
+			return
+		}
+		var wire fleetCompletionWire
+		if err := decodeRequest(w, r, &wire); err != nil {
+			writeError(w, shoal.NewError(shoal.ErrorInvalidArgument, err.Error()))
+			return
+		}
+		contextValue, err := wire.Context.decode()
+		if err != nil {
+			writeError(w, fleetDispatchError(err))
+			return
+		}
+		claimID, err := decodeWireBytes("claim ID", wire.ClaimID, false)
+		if err != nil {
+			writeError(w, fleetDispatchError(err))
+			return
+		}
+		snapshotID, err := decodeOptionalID(wire.EvidenceSnapshotID)
+		if err != nil {
+			writeError(w, fleetDispatchError(err))
+			return
+		}
+		evidence, err := decodeEvidence(wire.Evidence)
+		if err != nil {
+			writeError(w, fleetDispatchError(err))
+			return
+		}
+		result, err := provider.CompleteClaim(r.Context(), fleet.CompletionRequest{
+			ID: actionID, ExpectedVersion: wire.ExpectedVersion, ClaimID: claimID,
+			Failed: wire.Failed, Context: contextValue,
+			Result: fleet.ExecutionResult{
+				Output: wire.Output, ErrorCode: wire.ErrorCode,
+				EvidenceSnapshotID:   snapshotID,
+				EvidenceSnapshotAsOf: wire.EvidenceSnapshotAsOf,
+				Evidence:             evidence,
+			},
+		})
+		if err != nil {
+			writeError(w, fleetDispatchError(err))
+			return
+		}
+		writeResponse(w, http.StatusOK, encodeFleetAction(result))
+	})
 	mux.HandleFunc("POST /api/v1/fleet/actions/{action}/cancel", func(w http.ResponseWriter, r *http.Request) {
 		actionID, err := decodeWireBytes("action ID", r.PathValue("action"), false)
 		if err != nil {
@@ -261,6 +309,21 @@ type fleetCancelWire struct {
 	Context         fleetRequestContextWire `json:"context"`
 	ExpectedVersion uint64                  `json:"expected_version"`
 	MutationKey     string                  `json:"mutation_key"`
+}
+
+// fleetCompletionWire is a remote worker reporting an outcome. It carries the
+// same fields an in-process ActionExecutor returns, and the service validates
+// them identically.
+type fleetCompletionWire struct {
+	Context              fleetRequestContextWire `json:"context"`
+	ExpectedVersion      uint64                  `json:"expected_version"`
+	ClaimID              string                  `json:"claim_id"`
+	Output               json.RawMessage         `json:"output,omitempty"`
+	ErrorCode            string                  `json:"error_code,omitempty"`
+	Failed               bool                    `json:"failed,omitempty"`
+	EvidenceSnapshotID   string                  `json:"evidence_snapshot_id,omitempty"`
+	EvidenceSnapshotAsOf time.Time               `json:"evidence_snapshot_as_of,omitempty"`
+	Evidence             []fleetEvidenceWire     `json:"evidence,omitempty"`
 }
 
 type fleetEvidenceWire struct {

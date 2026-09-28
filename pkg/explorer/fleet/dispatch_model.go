@@ -185,6 +185,31 @@ type CancelRequest struct {
 	Context     RequestContext
 }
 
+// CompletionRequest is a remote worker reporting the outcome of work it
+// performed out of process.
+//
+// It is bound to a claim, not to an action. ClaimID and ExpectedVersion must
+// name the claim the reporter actually holds: a worker whose lease expired
+// while it was working must be refused rather than allowed to overwrite
+// whatever happened next, because by then the action may have been reclaimed
+// and run again by someone else.
+//
+// Result carries exactly what an in-process ActionExecutor returns, and is
+// validated identically. A remote worker cannot record output or evidence an
+// in-process one could not.
+type CompletionRequest struct {
+	ID              []byte
+	ExpectedVersion uint64
+	// ClaimID must equal the claim currently held on the action.
+	ClaimID []byte
+	Result  ExecutionResult
+	// Failed reports that the work did not succeed. Result.ErrorCode carries
+	// the reason. The two are separate because a worker that fails with no
+	// error code is a protocol error, not a success.
+	Failed  bool
+	Context RequestContext
+}
+
 type StatusRequest struct {
 	ID      []byte
 	Context RequestContext
