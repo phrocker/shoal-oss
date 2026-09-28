@@ -21,6 +21,7 @@ package fleet
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"testing"
 	"time"
@@ -383,4 +384,29 @@ func effectDecision(t *testing.T, requestID string) auth.Decision {
 		t.Fatal(err)
 	}
 	return decision
+}
+
+// TestEvidenceMutationDigestIsUnchangedAcrossTheUpgrade pins the byte-level
+// stability of an evidence-only mutation digest. The value below was computed
+// from main before the effect field existed.
+//
+// It matters because the digest namespace is still v1 and the value is
+// embedded in the lifecycle QueryDigest, where a changed digest reads as a
+// divergent mutation. Hashing the zero value would have changed every existing
+// mutation, since an empty field still contributes its eight-byte length
+// prefix, and a heartbeat or revoke retry that spanned an upgrade would then
+// have been rejected.
+func TestEvidenceMutationDigestIsUnchangedAcrossTheUpgrade(t *testing.T) {
+	const beforeTheEffectField = "990a0fe870e3c27d873e281441bcb7cb" +
+		"cf299cf6dd5c6a5060d3dda992d5512f"
+	digest := registryMutationDigest(Mutation{Descriptor: Descriptor{
+		ID: "agent", Generation: 1,
+		Capabilities: []Capability{{Name: "deploy", Actions: []Action{{
+			Name: "ship", InputSchema: anyObject, OutputSchema: anyObject,
+		}}}},
+	}})
+	if got := hex.EncodeToString(digest[:]); got != beforeTheEffectField {
+		t.Fatalf("evidence-only mutation digest changed\n got  %s\n want %s",
+			got, beforeTheEffectField)
+	}
 }

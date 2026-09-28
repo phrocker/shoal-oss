@@ -644,11 +644,22 @@ func registryMutationDigest(mutation Mutation) [sha256.Size]byte {
 		writeRegistryDigestField(digest, []byte(capability.Name))
 		for _, action := range capability.Actions {
 			writeRegistryDigestField(digest, []byte(action.Name))
-			// Hashed so an exact registration replay that changes only the
-			// effect is divergent rather than identical. Omitting it let a
-			// replay quietly swap an evidence-only action for an external one
-			// under the same mutation identity.
-			writeRegistryDigestField(digest, []byte(action.Effect))
+			// Appended only for a non-evidence effect, so an evidence-only
+			// mutation hashes exactly as it did before this field existed.
+			//
+			// Hashing the zero value would have changed the bytes of every
+			// existing mutation, because an empty field still contributes its
+			// eight-byte length prefix, while the namespace above still says
+			// v1. This digest is embedded in the lifecycle QueryDigest, where
+			// a changed value reads as a divergent mutation, so a heartbeat or
+			// revoke retry that spans an upgrade would have been rejected.
+			//
+			// External still differs from evidence, because it appends bytes
+			// evidence does not, which is what keeps a replay from quietly
+			// swapping one for the other under the same mutation identity.
+			if action.Effect != EffectEvidence {
+				writeRegistryDigestField(digest, []byte(action.Effect))
+			}
 			writeRegistryDigestField(digest, action.InputSchema)
 			writeRegistryDigestField(digest, action.OutputSchema)
 		}
