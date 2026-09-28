@@ -65,14 +65,27 @@ type Scope struct {
 // invariant here can detect that.
 type Effect string
 
+// These two classes split on *mutation*, and only on mutation. They cannot
+// express transmission: an action that sends content off-host and changes
+// nothing is EffectEvidence under this definition, which is accurate about
+// consequence and silent about disclosure. Issue #385 adds the missing class.
+// Until it lands, an action that transmits has no declaration that is both
+// honest and available, so declare by what it changes and record the
+// limitation rather than picking whichever class feels safer.
 const (
-	// EffectEvidence is work whose only consequence is Shoal's own evidence
-	// record: answering a question about the corpus, recording an
-	// interaction. It is the zero value, so a descriptor written before this
-	// field existed keeps its previous meaning.
+	// EffectEvidence is work that mutates nothing outside Shoal. Recording an
+	// interaction is the clearest case. It is the zero value, so a descriptor
+	// written before this field existed keeps its previous meaning.
+	//
+	// It does not assert that nothing left the host. Reading the corpus and
+	// handing passages to a configured model provider mutates nothing and is
+	// therefore evidence under this definition, while the provider may be
+	// off-host. That is the gap #385 closes.
 	EffectEvidence Effect = ""
-	// EffectExternal is work that touches anything outside that record. Shoal
-	// dispatches it and records the outcome; it does not run it.
+	// EffectExternal is work that mutates something outside Shoal's evidence
+	// record: writing to another system, changing a host, sending a message
+	// that someone acts on. Shoal dispatches it and records the outcome; it
+	// does not run it.
 	EffectExternal Effect = "external"
 )
 
