@@ -441,6 +441,59 @@ most common way to trip over the gate; refusals themselves are not logged
 per-request, because the `Host` is attacker-controlled and would invite a log
 flood.
 
+## Orchestrator probes: the health surface
+
+The host-authority gate above runs before routing, before authentication, and
+before anything else. That is correct for the workspace, and it makes the
+workspace port unusable as a probe target under an orchestrator: a Kubernetes
+kubelet addresses a pod by its runtime-assigned IP, which no static
+`-allowed-host` list can name, so every probe answers `421` and the pod never
+becomes ready.
+
+`-health-address` (environment fallback `SHOAL_HEALTH_ADDRESS`) opens a second
+listener for exactly this. Empty disables it, so a local or compose deployment
+is unchanged.
+
+| Route     | Meaning                                                                 |
+| --------- | ----------------------------------------------------------------------- |
+| `GET /healthz` | The process is up. Stays `200` throughout a drain.                 |
+| `GET /readyz`  | The workspace is serving. `503` before it serves and from the moment shutdown begins. |
+
+Both answer with a status code and a fixed string. Neither reads the corpus,
+the policy catalog, the authenticator, or the request, so binding this port
+where the workspace port may not be bound discloses nothing beyond the fact
+that a Shoal process is listening — which the open socket already says. Any
+other path is a `404`; the surface is two routes and cannot grow by accident.
+
+The split between the two routes is what makes a rolling update safe.
+Readiness drops **before** the workspace stops accepting, so the endpoints
+controller removes the pod from the Service while it is still finishing
+in-flight requests. Liveness does not drop, because a pod shedding traffic on
+purpose has not failed, and restarting it would throw away the graceful close.
+
+The listener is opened after the corpus and policy catalog are open. That
+ordering matters: a probe that connects at all already means construction
+finished, so there is no window in which a TCP check reports ready while the
+workspace is still opening its corpus. The workspace listener cannot offer that,
+because it is deliberately bound early so an address the workspace may not serve
+is refused before any state is touched.
+
+A `-health-address` that cannot be bound is fatal. An operator who asked for a
+probe surface and silently did not get one would read every probe failure as
+the workspace being down.
+
+```console
+$ shoal-explore-web -listen 0.0.0.0:8098 -allowed-host explorer.example.test \
+    -health-address 0.0.0.0:8099 ...
+Shoal Explorer listening at http://0.0.0.0:8098
+Health surface listening at http://0.0.0.0:8099
+
+$ curl -s -o /dev/null -w '%{http_code}\n' -H 'Host: 10.1.2.3:8098' http://10.1.2.3:8098/api/v1/auth-config
+421
+$ curl -s -o /dev/null -w '%{http_code}\n' -H 'Host: 10.1.2.3:8099' http://10.1.2.3:8099/readyz
+200
+```
+
 ## The unsafe-configuration guard
 
 The dangerous combination — a shared/public bind with the development

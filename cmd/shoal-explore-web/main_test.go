@@ -452,7 +452,11 @@ func waitForListeningURL(t *testing.T, output *lockedBuffer) string {
 	for time.Now().Before(deadline) {
 		line := output.String()
 		if index := strings.Index(line, "http://"); index >= 0 {
-			return strings.TrimSpace(line[index:])
+			// Stop at the first whitespace rather than the end of the buffer:
+			// the process can report a second listener (the health surface) on
+			// a following line, and taking the remainder would return both
+			// addresses joined by a newline.
+			return strings.TrimSpace(strings.Fields(line[index:])[0])
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
