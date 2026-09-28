@@ -389,7 +389,8 @@ func main() {
 			die("shoal-compactor: operations listener: %v", err)
 		}
 		go func() {
-			if err := <-operations.Done(); err != nil {
+			<-operations.Done()
+			if err := operations.Err(); err != nil {
 				logger.Error("metrics server failed", slog.String("err", err.Error()))
 				cancel()
 			}

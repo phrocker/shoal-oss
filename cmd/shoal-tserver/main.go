@@ -320,7 +320,8 @@ func main() {
 			die("operations listener: %v", err)
 		}
 		go func() {
-			if err := <-operations.Done(); err != nil {
+			<-operations.Done()
+			if err := operations.Err(); err != nil {
 				select {
 				case serverErr <- err:
 				default:
