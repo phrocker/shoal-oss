@@ -67,6 +67,13 @@ func TestWorkspaceSettingsClampAnalyticsAndMarkResponseLoss(t *testing.T) {
 		// invites a retry of an external effect that already happened.
 		{http.MethodPost, "/api/v1/fleet/actions/action/complete"},
 		{http.MethodPost, "/api/v1/fleet/actions/action/cancel"},
+		// A request commits the grant or the refusal, and a report commits the
+		// terminal record for a call the caller has already made. Losing
+		// either response to the output limit must read as indeterminate: a
+		// deterministic failure tells a caller nothing committed and invites it
+		// to retry an egress that already happened.
+		{http.MethodPost, "/api/v1/admission/request"},
+		{http.MethodPost, "/api/v1/admission/report"},
 		{http.MethodPost, "/api/v1/fleet/events/subscriptions"},
 		{http.MethodDelete, "/api/v1/fleet/events/subscriptions/subscription"},
 		{http.MethodPost, "/api/v1/fleet/events/publish"},
@@ -82,6 +89,8 @@ func TestWorkspaceSettingsClampAnalyticsAndMarkResponseLoss(t *testing.T) {
 	}{
 		{http.MethodPost, "/api/v1/fleet/actions/pull"},
 		{http.MethodPost, "/api/v1/fleet/actions/action/status"},
+		// Listing what is outstanding writes nothing.
+		{http.MethodPost, "/api/v1/admission/outstanding"},
 		{http.MethodPost, "/api/v1/fleet/agents/resolve"},
 		{http.MethodPost, "/api/v1/fleet/agents/agent/resolve"},
 	} {
@@ -124,6 +133,14 @@ func TestWorkspaceOperationForRequestUsesRouteOperation(t *testing.T) {
 		// registered for the workspace, so the handler is never reached at all.
 		{http.MethodPost, "/api/v1/fleet/actions/action/complete", auth.OperationInvoke, true},
 		{http.MethodPost, "/api/v1/fleet/actions/action/cancel", auth.OperationDispatch, true},
+		// All three admission routes, for the same reason: unlisted here, a
+		// caller sending a workspace ID is refused before the handler runs, so
+		// the whole surface is invisible to any workspace-scoped client.
+		{http.MethodPost, "/api/v1/admission/request", auth.OperationInvoke, true},
+		{http.MethodPost, "/api/v1/admission/report", auth.OperationInvoke, true},
+		{http.MethodPost, "/api/v1/admission/outstanding", auth.OperationInvoke, true},
+		{http.MethodGet, "/api/v1/admission/request", "", false},
+		{http.MethodPost, "/api/v1/admission/unknown", "", false},
 		{http.MethodPost, "/api/v1/fleet/agents/agent/heartbeat", auth.OperationAgentHeartbeat, true},
 		{http.MethodPost, "/api/v1/fleet/events/publish", auth.OperationEventPublish, true},
 		{http.MethodPost, "/api/v1/fleet/events/subscriptions/id/pull", auth.OperationSubscriptionCreate, true},

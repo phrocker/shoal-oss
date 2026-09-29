@@ -6,6 +6,7 @@ package fleet
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"sort"
@@ -262,12 +263,25 @@ func NewAdmissionService(config AdmissionConfig) (*AdmissionService, error) {
 
 // Request adjudicates a call that has not happened yet.
 //
-// The durable record is written before the answer is returned, in both
-// directions. A granted admission is a claimed action; a denied one is a
-// cancelled action. Answering without writing would leave the plane unable to
-// say afterwards what it permitted, which is the whole of the audit
-// requirement: this is the one surface where the work Shoal is accountable for
-// is work Shoal did not perform and cannot observe.
+// Every check happens before anything durable is written, and the answer is
+// then committed as exactly one record: a grant is a claimed action, a refusal
+// is a cancelled one. An admission never passes through the queued state.
+//
+// That is not tidiness, it is the stop. Writing a queued record first and
+// deciding afterwards opens a window in which an ungranted — possibly refused —
+// admission exists as an action waiting for a worker. Pull returns it to the
+// same principal, Claim on the dispatch surface hands out a live claim against
+// it, and under the execution boundary a claim is permission to perform the
+// declared effect out of process. A refusal would become permission through a
+// different door, which is precisely what this surface exists to prevent.
+//
+// Cancelling the queued record when a later step fails does not close that
+// window. The cancel is a second mutation that can fail for the same reasons
+// the first step did, and when it does the orphan is still there with nothing
+// to show for the attempt. The only failure mode that is actually safe is
+// having written nothing: the caller receives a transport error and fails
+// closed, which is what a caller of this surface must do with an unreachable
+// decision plane anyway.
 func (s *AdmissionService) Request(
 	ctx context.Context, request AdmissionRequest,
 ) (AdmissionGrant, error) {
@@ -301,90 +315,221 @@ func (s *AdmissionService) Request(
 	if err != nil {
 		return AdmissionGrant{}, err
 	}
-	queued, err := dispatch.enqueue(ctx, EnqueueRequest{
+	// The same record an enqueue of this request would build, validated
+	// identically and not written. It carries the declaration, so what was
+	// admitted is part of the record's identity and a retry cannot change it.
+	base, action, err := dispatch.queuedRecord(ctx, decision, EnqueueRequest{
 		ID: request.ID, IdempotencyKey: request.IdempotencyKey,
 		AgentID: request.AgentID, AgentGeneration: request.AgentGeneration,
 		Capability: request.Capability, Action: request.Action,
 		SourceID: request.SourceID, PolicyID: request.PolicyID,
 		ObjectID: request.ObjectID, Input: request.Input,
 		Context: request.Context,
-	}, auth.OperationInvoke)
+	}, auth.OperationInvoke, now)
 	if err != nil {
 		return AdmissionGrant{}, err
 	}
-	// A replayed request whose first attempt was refused answers from the record
-	// rather than re-adjudicating. Re-running the decision would let a caller
-	// retry a denial until the state it depended on moved, and the cancelled
-	// record is the durable statement that this admission was refused.
-	if queued.State == DispatchCanceled {
-		return AdmissionGrant{Outcome: AdmissionDenied}, nil
+	base.AdmittedEffects = declared
+	base.AdmittedDisclosures = disclosureDigest(disclosures)
+
+	current, readErr := dispatch.store.GetAction(ctx, request.ID)
+	if readErr != nil && !errors.Is(readErr, ErrActionNotFound) {
+		return AdmissionGrant{}, readErr
 	}
-	if queued.State.terminal() {
-		return AdmissionGrant{}, ErrActionTerminal
+	if readErr == nil {
+		return s.replay(ctx, decision, request, disclosures, current, base, now)
 	}
 	// The declaration is checked against what the descriptor permits, resolved
 	// under this decision. The ceiling the executor was bound to is already
 	// enforced inside resolveActionBinding, so an action can neither declare
 	// more than its executor may do nor be admitted for more than it declares.
-	_, action, _, err := dispatch.registry.resolveActionBinding(
-		ctx, decision, queued.AgentID, queued.AgentGeneration,
-		queued.Capability, queued.Action, queued.SourceID, queued.PolicyID,
-		queued.ObjectID, auth.OperationInvoke, now,
-	)
-	if err != nil {
-		return AdmissionGrant{}, err
-	}
 	if declared.exceeds(action.Effects) {
-		return s.deny(ctx, request, queued)
+		return s.deny(ctx, base, decision)
 	}
 	obligations, err := s.obligations(ctx, decision, request, disclosures, now)
 	if err != nil {
 		return AdmissionGrant{}, err
 	}
-	if queued.State == DispatchClaimed {
-		// A replayed request whose first attempt was granted. Claim recognises
-		// its own replay only from the queued version, which this record is
-		// past, so the live grant is returned directly. A live claim under a
-		// different token is someone else's admission for the same identity and
-		// must not be handed over.
-		if !bytes.Equal(queued.ClaimID, request.TokenID) ||
-			!now.Before(queued.ClaimLeaseUntil) {
-			return AdmissionGrant{}, ErrAdmissionConflict
-		}
-		return grantFor(queued, obligations), nil
-	}
-	granted, err := dispatch.Claim(ctx, ClaimRequest{
-		ID: queued.ID, ExpectedVersion: queued.Version,
-		ClaimID: request.TokenID, Lease: request.Lease,
-		Context: request.Context,
-	})
+	granted, err := s.commit(ctx, admitted(base, action, request, decision, now))
 	if err != nil {
 		return AdmissionGrant{}, err
 	}
 	return grantFor(granted, obligations), nil
 }
 
-// deny records the refusal durably before returning it.
+// replay answers a request whose admission identity already exists.
 //
-// It cancels rather than leaving the request queued. A queued admission is
-// indistinguishable from work waiting for a worker, and an operator reading the
-// record later would see a backlog where there were refusals.
-//
-// The mutation key is the tuple digest over the admission's own identity — the
-// same construction the executor key uses, reused rather than reinvented — so a
-// retried request replays on to the same cancelled record instead of
-// conflicting with its own first refusal.
-func (s *AdmissionService) deny(
-	ctx context.Context, request AdmissionRequest, queued ActionRecord,
+// A stored record that is not this request is a conflict, never a second
+// adjudication: the action ID and the token are the caller's to choose, and
+// reusing them for a different declaration has to fail rather than quietly
+// produce a different answer under the same token.
+func (s *AdmissionService) replay(
+	ctx context.Context,
+	decision auth.Decision,
+	request AdmissionRequest,
+	disclosures []shoal.ID,
+	current, base ActionRecord,
+	now time.Time,
 ) (AdmissionGrant, error) {
-	if _, err := s.dispatch.cancel(ctx, CancelRequest{
-		ID: queued.ID, ExpectedVersion: queued.Version,
-		MutationKey: executorKey(queued.ID, []byte("shoal.fleet.admission-denied.v1")),
-		Context:     request.Context,
-	}, auth.OperationInvoke); err != nil {
+	if !equivalentEnqueue(current, base) {
+		return AdmissionGrant{}, ErrAdmissionConflict
+	}
+	switch {
+	case current.State == DispatchCanceled:
+		// A refusal answers from the record rather than being re-adjudicated.
+		// Re-running the decision would let a caller retry a denial until the
+		// state it depended on moved, and the cancelled record is the durable
+		// statement that this admission was refused.
+		return AdmissionGrant{Outcome: AdmissionDenied}, nil
+	case current.State != DispatchClaimed:
+		// Already reported. The queued state also lands here and is currently
+		// unreachable — an admission always declares an effect and a dispatch
+		// enqueue never does, so equivalentEnqueue above has already refused
+		// any queued record. The arm is total anyway, because the alternative
+		// is a state this function silently treats as a live grant if the two
+		// surfaces ever converge.
+		return AdmissionGrant{}, ErrActionTerminal
+	}
+	// A live claim under a different token is someone else's admission for the
+	// same identity and must not be handed over.
+	if !bytes.Equal(current.ClaimID, request.TokenID) ||
+		!now.Before(current.ClaimLeaseUntil) {
+		return AdmissionGrant{}, ErrAdmissionConflict
+	}
+	obligations, err := s.obligations(ctx, decision, request, disclosures, now)
+	if err != nil {
+		return AdmissionGrant{}, err
+	}
+	return grantFor(current, obligations), nil
+}
+
+// admitted turns the adjudicated base record into the claimed record a grant
+// commits.
+//
+// The claim state is built here rather than by calling Claim, because Claim is
+// a second mutation and the whole point is that there is only one. Everything
+// Claim would set is set: the fence starts at one, the lease is clamped to the
+// action deadline, and the execution authorization provenance comes from this
+// decision.
+func admitted(
+	base ActionRecord,
+	action Action,
+	request AdmissionRequest,
+	decision auth.Decision,
+	now time.Time,
+) ActionRecord {
+	record := base
+	record.State = DispatchClaimed
+	record.ClaimID = append([]byte(nil), request.TokenID...)
+	record.ClaimFence = 1
+	record.ClaimLease = request.Lease
+	record.ClaimLeaseUntil = now.Add(request.Lease)
+	if record.ClaimLeaseUntil.After(record.Deadline) {
+		record.ClaimLeaseUntil = record.Deadline
+	}
+	record.ExecutionFingerprint = record.AuthorizationFingerprint
+	record.ExecutionPolicyGeneration = decision.PolicyGeneration()
+	record.ExecutionExpiresAt = decision.AuthenticationExpires()
+	// Charged from the action's declared effects rather than from the narrower
+	// set this admission declared, exactly as Claim charges it. The record has
+	// to agree with what a plain dispatch claim of the same action would say;
+	// an admission that declared less has still been handed a claim on an
+	// action that declares more, and nothing outside the caller constrains
+	// which of the two it acts on.
+	if action.Effects.contains(EffectMutatesExternal) {
+		record.EffectPossible = true
+	}
+	return record
+}
+
+// deny commits the refusal as a cancelled record.
+//
+// It is written directly rather than queued and then cancelled. A cancellation
+// that has to be reached through the queued state is two mutations, and a
+// failure between them leaves a refused admission sitting in the queue as
+// claimable work.
+//
+// The cancel mutation key is the tuple digest over the admission's own identity
+// — the same construction the executor key uses, reused rather than reinvented
+// — so the record a retry would build is byte-identical to the one already
+// stored and replays on to it.
+func (s *AdmissionService) deny(
+	ctx context.Context,
+	base ActionRecord,
+	decision auth.Decision,
+) (AdmissionGrant, error) {
+	record := base
+	record.State = DispatchCanceled
+	record.CancelKey = executorKey(
+		base.ID, []byte("shoal.fleet.admission-denied.v1"))
+	// Cancellation provenance is written even though this record is born
+	// cancelled and the enqueue provenance would answer identically. A refusal
+	// and a cancellation have to read the same way to an operator; a record
+	// missing the fields its neighbours carry is one someone has to reason
+	// about before trusting.
+	record.CancelAuthorizationFingerprint = base.AuthorizationFingerprint
+	record.CancelAuthorizationExpiresAt = decision.AuthenticationExpires()
+	record.TransitionRequestID = decision.RequestID()
+	record.TransitionCorrelationID = decision.CorrelationID()
+	if _, err := s.commit(ctx, record); err != nil {
 		return AdmissionGrant{}, err
 	}
 	return AdmissionGrant{Outcome: AdmissionDenied}, nil
+}
+
+// commit writes the one durable record an admission produces.
+//
+// The audit entry precedes the write, as it does for every other dispatch
+// mutation, so no admission can be granted or refused without the privileged
+// action record that says so. The transition kind is derived from the record's
+// own state rather than passed in: a mismatch between the two is what
+// NewActionTransition refuses, and deriving it makes the mismatch
+// unconstructible.
+func (s *AdmissionService) commit(
+	ctx context.Context, record ActionRecord,
+) (ActionRecord, error) {
+	kind := actionEventKind(record)
+	phase := "admission_grant"
+	if record.State == DispatchCanceled {
+		phase = "admission_denial"
+	}
+	if err := s.dispatch.recorder.RecordAction(ctx, ActionAudit{
+		Phase: phase, Operation: auth.OperationInvoke, Record: record,
+	}); err != nil {
+		return ActionRecord{}, errors.Join(ErrRecordingUnavailable, err)
+	}
+	stored, err := s.dispatch.store.ApplyAction(ctx, DispatchMutation{
+		Token: transitionToken(
+			"admission", record.ID, record.IdempotencyKey, record.Version),
+		ExpectedVersion: 0, TransitionKind: kind, Record: record,
+	})
+	if err != nil {
+		return ActionRecord{}, err
+	}
+	if err := s.dispatch.publishTransition(
+		context.WithoutCancel(ctx), actionEventKind(stored), stored,
+	); err != nil {
+		return ActionRecord{}, errors.Join(ErrActionCommitted, err)
+	}
+	return stored, nil
+}
+
+// disclosureDigest reduces a canonical declared reference set to the value the
+// durable record carries, or nil when nothing was declared.
+//
+// Length-prefixed per element so no two distinct sets collide by
+// concatenation: without the prefix, {"ab","c"} and {"a","bc"} would digest
+// identically and a retry could swap one declaration for the other.
+func disclosureDigest(disclosures []shoal.ID) []byte {
+	if len(disclosures) == 0 {
+		return nil
+	}
+	digest := sha256.New()
+	writeDispatchTupleField(digest, []byte("shoal.fleet.admission-disclosures.v1"))
+	for _, reference := range disclosures {
+		writeDispatchTupleField(digest, []byte(reference))
+	}
+	return digest.Sum(nil)
 }
 
 func grantFor(record ActionRecord, obligations Obligations) AdmissionGrant {
@@ -500,14 +645,23 @@ func (s *AdmissionService) Report(
 			shoal.ErrorInvalidArgument,
 			"a failed admission report requires an error code")
 	}
-	// A report is either an outcome or a failure. Allowing both would leave the
+	// A report is either an outcome or a failure, and both halves of that have
+	// to be enforced. Allowing an outcome to carry an error code would leave the
 	// committed record's shape depending on which the completion path resolved
-	// first, and the replay comparison below could then accept a report that
-	// differed from what was stored.
+	// first. Allowing a failure to carry an outcome is worse: the completion
+	// path discards it, so the durable record says nothing about it, and the
+	// replay comparison below would then read any two failures with the same
+	// error code as the same report — letting a caller replace the outcome it
+	// reported with a different one and be told the second was recorded.
 	if !report.Failed && report.ErrorCode != "" {
 		return ActionRecord{}, shoal.NewError(
 			shoal.ErrorInvalidArgument,
 			"a successful admission report carries no error code")
+	}
+	if report.Failed && len(report.Outcome) > 0 {
+		return ActionRecord{}, shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			"a failed admission report carries no outcome")
 	}
 	current, err := dispatch.authorizedCurrent(
 		ctx, decision, report.Token.ActionID, auth.OperationInvoke, now)
@@ -554,10 +708,30 @@ func (s *AdmissionService) Report(
 		Result:  ExecutionResult{Output: report.Outcome, ErrorCode: report.ErrorCode},
 		Context: report.Context,
 	})
+	if err == nil {
+		return record, nil
+	}
 	if errors.Is(err, ErrClaimLost) {
 		return ActionRecord{}, ErrAdmissionSpent
 	}
-	return record, err
+	// Reporting a failure is a successful report. The completion path is built
+	// for an executor, where a failed outcome is the executor's error and is
+	// returned alongside the committed record; here the failure is the news,
+	// not an error in delivering it.
+	//
+	// Without this the first response to a reported failure is an error and the
+	// identical retry is a receipt, so what the caller sees depends on whether
+	// its own report committed — the exact confusion the one-shot token and the
+	// replay comparison exist to remove.
+	//
+	// The guard is the replay comparison itself, so only a record that is this
+	// report, committed, is converted. An ambiguous outcome returns a zero
+	// record and an output or evidence rejection stores an error code this
+	// report did not send; neither matches, and both stay errors.
+	if report.Failed && sameReportedOutcome(record, report, nil) {
+		return record, nil
+	}
+	return ActionRecord{}, err
 }
 
 // reportedOutput returns the canonical stored form of a report's outcome, so a

@@ -4,6 +4,7 @@
 package fleet
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
+	"github.com/phrocker/shoal-oss/pkg/interaction"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
@@ -66,6 +68,10 @@ func admissionDescriptor(now time.Time) Descriptor {
 			{
 				Name: "summarize", InputSchema: schema, OutputSchema: schema,
 				Effects: Effects{EffectReadsCorpus},
+			},
+			{
+				Name: "publish", InputSchema: schema, OutputSchema: schema,
+				Effects: Effects{EffectMutatesExternal},
 			},
 		}}},
 	}
@@ -249,9 +255,12 @@ func TestAdmissionAllowsDeclaredEffectAndIssuesALiveToken(t *testing.T) {
 	if grant.Outcome != AdmissionAllowed {
 		t.Fatalf("outcome = %q", grant.Outcome)
 	}
+	// Version one, not two. A grant is a single durable write: the record is
+	// born claimed and never passes through the queued state where an
+	// ungranted admission would be claimable work.
 	if string(grant.Token.ActionID) != "admission" ||
 		string(grant.Token.TokenID) != "token-admission" ||
-		grant.Token.Version != 2 {
+		grant.Token.Version != 1 {
 		t.Fatalf("token = %#v", grant.Token)
 	}
 	if !grant.Token.ExpiresAt.Equal(harness.now.Add(time.Minute)) {
@@ -628,6 +637,436 @@ func TestOutstandingHidesOtherPrincipalsGrants(t *testing.T) {
 	}
 	if len(page.Admissions) != 0 {
 		t.Fatalf("leaked admissions: %#v", page.Admissions)
+	}
+}
+
+// TestAdmissionReplayCannotChangeWhatWasAdmitted pins the durable declaration.
+//
+// The laundering it prevents: ask with corpus references, receive obligations
+// restricting them, then replay the same action ID, idempotency key and token
+// with the references removed. Before the declaration was part of the record's
+// identity that replay was recognised as the same request, obligations were
+// recomputed over nothing, and the answer was an unrestricted allow for a token
+// that was already live.
+func TestAdmissionReplayCannotChangeWhatWasAdmitted(t *testing.T) {
+	restrictor := &stubRestrictor{allowed: []shoal.ID{"doc-a"}}
+	harness := newAdmissionHarness(t, restrictor)
+	first := harness.request(
+		"request", "admission", "complete", Effects{EffectEgressesContent},
+		[]shoal.ID{"doc-a", "doc-b"})
+	grant, err := harness.service.Request(harness.context(t, "request"), first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if grant.Outcome != AdmissionObligated ||
+		len(grant.Obligations.Withhold) != 1 {
+		t.Fatalf("first grant = %#v", grant)
+	}
+
+	laundered := first
+	laundered.Disclosures = nil
+	if _, err := harness.service.Request(
+		harness.context(t, "request"), laundered,
+	); !errors.Is(err, ErrAdmissionConflict) {
+		t.Fatalf("replay without disclosures = %v", err)
+	}
+	widened := first
+	widened.Effects = Effects{EffectEgressesContent, EffectReadsCorpus}
+	if _, err := harness.service.Request(
+		harness.context(t, "request"), widened,
+	); !errors.Is(err, ErrAdmissionConflict) {
+		t.Fatalf("replay with a wider effect set = %v", err)
+	}
+	// Same size, different contents. A comparison that stopped at the length
+	// would let a caller admitted to egress replay as a corpus read and keep
+	// the live token, so the audit record would name an effect nobody was
+	// granted.
+	swapped := first
+	swapped.Effects = Effects{EffectReadsCorpus}
+	if _, err := harness.service.Request(
+		harness.context(t, "request"), swapped,
+	); !errors.Is(err, ErrAdmissionConflict) {
+		t.Fatalf("replay with a swapped effect set = %v", err)
+	}
+	narrowed := first
+	narrowed.Disclosures = []shoal.ID{"doc-a"}
+	if _, err := harness.service.Request(
+		harness.context(t, "request"), narrowed,
+	); !errors.Is(err, ErrAdmissionConflict) {
+		t.Fatalf("replay with fewer disclosures = %v", err)
+	}
+
+	// The identical request still replays on to its own grant, or a caller that
+	// lost a response could never recover its token.
+	again, err := harness.service.Request(harness.context(t, "request"), first)
+	if err != nil {
+		t.Fatalf("identical replay = %v", err)
+	}
+	if again.Outcome != AdmissionObligated ||
+		!bytes.Equal(again.Token.TokenID, grant.Token.TokenID) ||
+		again.Token.Version != grant.Token.Version {
+		t.Fatalf("identical replay = %#v", again)
+	}
+}
+
+// TestDispatchEnqueueCannotReuseAnAdmissionIdentity pins the same binding from
+// the other side. The declaration is part of enqueue equivalence, so a plain
+// dispatch enqueue cannot land on an admission's record and inherit its token.
+func TestDispatchEnqueueCannotReuseAnAdmissionIdentity(t *testing.T) {
+	harness := newAdmissionHarness(t, nil)
+	if _, err := harness.service.Request(
+		harness.context(t, "request"), harness.request(
+			"request", "admission", "complete",
+			Effects{EffectEgressesContent}, nil)); err != nil {
+		t.Fatal(err)
+	}
+	dispatcher := bindDecision(t, harness.authority, dispatchDecision(
+		t, "owner", "actor", "request", auth.OperationDispatch))
+	if _, err := harness.dispatch.Enqueue(dispatcher, EnqueueRequest{
+		ID:      []byte("admission"),
+		AgentID: "agent", AgentGeneration: 1,
+		IdempotencyKey: []byte("idempotency-admission"),
+		Capability:     "model", Action: "complete",
+		SourceID: []byte("source"), PolicyID: []byte("policy"),
+		ObjectID: "object",
+		Input:    json.RawMessage(`{"prompt_digest":"abc"}`),
+		Context:  dispatchContext(harness.now, "request"),
+	},
+	); !errors.Is(err, ErrActionConflict) {
+		t.Fatalf("dispatch enqueue over an admission = %v", err)
+	}
+}
+
+// TestAdmissionNeverLeavesClaimableWork pins the stop.
+//
+// No admission outcome — granted, refused, or abandoned part way through
+// adjudication — may leave a record Pull will hand back. A queued record is
+// claimable through the dispatch surface, and under the execution boundary a
+// claim is permission to perform the declared effect out of process, so a
+// refused or never-decided admission sitting in the queue is the refusal being
+// laundered into permission through a different door.
+func TestAdmissionNeverLeavesClaimableWork(t *testing.T) {
+	failing := &stubRestrictor{err: errors.New("ledger unavailable")}
+	harness := newAdmissionHarness(t, failing)
+
+	// Adjudication fails after every check that precedes the write.
+	if _, err := harness.service.Request(
+		harness.context(t, "request"), harness.request(
+			"request", "aborted", "complete", Effects{EffectEgressesContent},
+			[]shoal.ID{"doc-a"}),
+	); err == nil {
+		t.Fatal("restrictor failure produced an answer")
+	}
+	if _, err := harness.store.GetAction(
+		context.Background(), []byte("aborted"),
+	); !errors.Is(err, ErrActionNotFound) {
+		t.Fatalf("aborted admission left a record: %v", err)
+	}
+
+	if _, err := harness.service.Request(
+		harness.context(t, "request"), harness.request(
+			"request", "refused", "summarize", Effects{EffectEgressesContent},
+			nil)); err != nil {
+		t.Fatal(err)
+	}
+	refused, err := harness.store.GetAction(
+		context.Background(), []byte("refused"))
+	if err != nil || refused.State != DispatchCanceled || refused.Version != 1 {
+		t.Fatalf("refusal record = %#v, %v", refused, err)
+	}
+
+	harness.service.restrictor = nil
+	if _, err := harness.service.Request(
+		harness.context(t, "request"), harness.request(
+			"request", "granted", "complete", Effects{EffectEgressesContent},
+			nil)); err != nil {
+		t.Fatal(err)
+	}
+
+	page, err := harness.dispatch.Pull(
+		harness.context(t, "request"), PullActionsRequest{
+			Limit: 16, Context: dispatchContext(harness.now, "request"),
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Actions) != 0 {
+		t.Fatalf("admission left claimable work: %#v", page.Actions)
+	}
+}
+
+// TestReportRefusesAFailureCarryingAnOutcome pins the half of "either an
+// outcome or a failure" that the completion path cannot enforce for us.
+//
+// The completion path discards a failed report's outcome, so the durable record
+// says nothing about it and the replay comparison would read any two failures
+// with the same error code as the same report. A caller could then report a
+// failure, then replace the outcome it carried and be told the second landed.
+func TestReportRefusesAFailureCarryingAnOutcome(t *testing.T) {
+	harness := newAdmissionHarness(t, nil)
+	grant, err := harness.service.Request(
+		harness.context(t, "request"), harness.request(
+			"request", "admission", "complete",
+			Effects{EffectEgressesContent}, nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := harness.service.Report(
+		harness.context(t, "report"), AdmissionReport{
+			Token: grant.Token, Failed: true, ErrorCode: "upstream_refused",
+			Outcome: json.RawMessage(`{"tokens":41}`),
+			Context: dispatchContext(harness.now, "report"),
+		},
+	); !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
+		t.Fatalf("failure carrying an outcome = %v", err)
+	}
+	if stored, err := harness.store.GetAction(
+		context.Background(), []byte("admission"),
+	); err != nil || stored.State != DispatchClaimed {
+		t.Fatalf("refused report moved the record: %#v, %v", stored, err)
+	}
+}
+
+// TestReportingAFailureIsASuccessfulReport pins that the first response and the
+// retry agree.
+//
+// The completion path is built for an executor, where a failed outcome is the
+// executor's error and comes back alongside the committed record. Propagating
+// it here made the first response an error and the identical retry a receipt,
+// so what a caller saw depended on whether its own report had committed — the
+// exact confusion the one-shot token exists to remove.
+func TestReportingAFailureIsASuccessfulReport(t *testing.T) {
+	harness := newAdmissionHarness(t, nil)
+	grant, err := harness.service.Request(
+		harness.context(t, "request"), harness.request(
+			"request", "admission", "complete",
+			Effects{EffectEgressesContent}, nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	report := AdmissionReport{
+		Token: grant.Token, Failed: true, ErrorCode: "upstream_refused",
+		Context: dispatchContext(harness.now, "report"),
+	}
+	record, err := harness.service.Report(harness.context(t, "report"), report)
+	if err != nil {
+		t.Fatalf("reported failure = %v", err)
+	}
+	if record.State != DispatchFailed ||
+		record.ErrorCode != "upstream_refused" {
+		t.Fatalf("failure record = %#v", record)
+	}
+	replay, err := harness.service.Report(harness.context(t, "report"), report)
+	if err != nil {
+		t.Fatalf("replayed failure = %v", err)
+	}
+	if replay.Version != record.Version || replay.State != record.State {
+		t.Fatalf("replay disagreed with the first response: %#v vs %#v",
+			replay, record)
+	}
+}
+
+// TestReportKeepsAnUnconfirmedOutcomeAnError pins the boundary of that
+// conversion. Only a record that is this report, committed, becomes a receipt;
+// an outcome the service cannot confirm it wrote must stay an error, or a
+// caller learns its report landed when nothing says it did.
+func TestReportKeepsAnUnconfirmedOutcomeAnError(t *testing.T) {
+	harness := newAdmissionHarness(t, nil)
+	grant, err := harness.service.Request(
+		harness.context(t, "request"), harness.request(
+			"request", "admission", "complete",
+			Effects{EffectEgressesContent}, nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	harness.recorder.failPhase = "effect_outcome"
+	if _, err := harness.service.Report(
+		harness.context(t, "report"), AdmissionReport{
+			Token: grant.Token, Failed: true, ErrorCode: "upstream_refused",
+			Context: dispatchContext(harness.now, "report"),
+		},
+	); !errors.Is(err, ErrExecutionAmbiguous) {
+		t.Fatalf("unrecordable failure = %v", err)
+	}
+}
+
+// TestAdmissionDisclosureDigestSeparatesDistinctSets pins the framing. Without
+// a length prefix per element, two different declarations concatenate to the
+// same bytes and a retry could swap one for the other under a live token.
+func TestAdmissionDisclosureDigestSeparatesDistinctSets(t *testing.T) {
+	left := disclosureDigest([]shoal.ID{"ab", "c"})
+	right := disclosureDigest([]shoal.ID{"a", "bc"})
+	if bytes.Equal(left, right) {
+		t.Fatalf("distinct declarations digest identically: %x", left)
+	}
+	if disclosureDigest(nil) != nil {
+		t.Fatal("an empty declaration must digest to nothing")
+	}
+	if !bytes.Equal(left, disclosureDigest([]shoal.ID{"ab", "c"})) {
+		t.Fatal("the same declaration must digest identically")
+	}
+}
+
+// TestAdmittedDeclarationShapeIsValidated pins what a durable record may say it
+// admitted. Membership is deliberately not checked — an unrecognised class is
+// refused at resolution, and refusing to decode would lose the audit trail for
+// exactly the admissions most worth reading — but shape is, because shape is
+// what makes two declarations comparable.
+func TestAdmittedDeclarationShapeIsValidated(t *testing.T) {
+	now := time.Date(2026, 9, 6, 12, 0, 0, 0, time.UTC)
+	base := ActionRecord{
+		ID: []byte("action"), IdempotencyKey: []byte("key"), Version: 1,
+		State: DispatchQueued, AgentID: "agent", AgentGeneration: 1,
+		Capability: "model", Action: "complete",
+		SourceID: []byte("source"), PolicyID: []byte("policy"),
+		ObjectID: "object", Input: json.RawMessage(`{}`),
+		Subject: "owner", Actor: "actor", PolicyGeneration: 1,
+		AuthorizationExpiresAt: now.Add(time.Hour), RequestID: "request",
+		Reason:               mustReason(t),
+		AuthorizedOperations: []auth.Operation{auth.OperationInvoke},
+		ExecutorKey:          []byte("executor"),
+		Deadline:             now.Add(time.Hour), CreatedAt: now, UpdatedAt: now,
+	}
+	if err := base.Validate(); err != nil {
+		t.Fatalf("baseline record = %v", err)
+	}
+
+	unordered := base
+	unordered.AdmittedEffects = Effects{
+		EffectReadsCorpus, EffectEgressesContent}
+	if err := unordered.Validate(); err == nil {
+		t.Fatal("accepted a non-canonical declared effect set")
+	}
+	duplicated := base
+	duplicated.AdmittedEffects = Effects{
+		EffectReadsCorpus, EffectReadsCorpus}
+	if err := duplicated.Validate(); err == nil {
+		t.Fatal("accepted a duplicated declared effect")
+	}
+	unknown := base
+	unknown.AdmittedEffects = Effects{"invented"}
+	if err := unknown.Validate(); err != nil {
+		t.Fatalf("refused to decode an unrecognised class: %v", err)
+	}
+
+	stunted := base
+	stunted.AdmittedEffects = Effects{EffectEgressesContent}
+	stunted.AdmittedDisclosures = []byte("not-a-digest")
+	if err := stunted.Validate(); err == nil {
+		t.Fatal("accepted a disclosure field that is not a digest")
+	}
+	orphaned := base
+	orphaned.AdmittedDisclosures = disclosureDigest([]shoal.ID{"doc-a"})
+	if err := orphaned.Validate(); err == nil {
+		t.Fatal("accepted declared references with no declared effect")
+	}
+	whole := base
+	whole.AdmittedEffects = Effects{EffectEgressesContent}
+	whole.AdmittedDisclosures = disclosureDigest([]shoal.ID{"doc-a"})
+	if err := whole.Validate(); err != nil {
+		t.Fatalf("complete declaration = %v", err)
+	}
+}
+
+// TestAdmissionRecordDoesNotAliasItsDeclaration pins that a record handed out
+// shares no backing array with the one the store holds.
+//
+// Copying the struct carries the slice headers on its own, so the declaration
+// survives a clone that forgets to reallocate — what it does not survive is a
+// caller writing through the header it was given. A record that aliases store
+// state lets whatever holds it edit what was admitted after the fact.
+func TestAdmissionRecordDoesNotAliasItsDeclaration(t *testing.T) {
+	harness := newAdmissionHarness(t, nil)
+	if _, err := harness.service.Request(
+		harness.context(t, "request"), harness.request(
+			"request", "admission", "complete",
+			Effects{EffectEgressesContent},
+			[]shoal.ID{"doc-a"})); err != nil {
+		t.Fatal(err)
+	}
+	handed, err := harness.store.GetAction(
+		context.Background(), []byte("admission"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(handed.AdmittedEffects) != 1 ||
+		len(handed.AdmittedDisclosures) == 0 {
+		t.Fatalf("stored declaration = %#v", handed)
+	}
+	handed.AdmittedEffects[0] = EffectMutatesExternal
+	handed.AdmittedDisclosures[0] ^= 0xff
+
+	reread, err := harness.store.GetAction(
+		context.Background(), []byte("admission"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reread.AdmittedEffects[0] != EffectEgressesContent {
+		t.Fatalf("declared effects were edited through the handed record: %#v",
+			reread.AdmittedEffects)
+	}
+	if bytes.Equal(reread.AdmittedDisclosures, handed.AdmittedDisclosures) {
+		t.Fatal("declared references were edited through the handed record")
+	}
+}
+
+func mustReason(t *testing.T) interaction.Reason {
+	t.Helper()
+	reason, err := interaction.NewReason("operator_request", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return reason
+}
+
+// TestAdmissionClampsItsLeaseToTheActionDeadline pins that a token never
+// outlives the action it was granted against. A token live past the deadline is
+// one the report path will refuse, so issuing it tells a caller it has longer
+// than it does.
+func TestAdmissionClampsItsLeaseToTheActionDeadline(t *testing.T) {
+	harness := newAdmissionHarness(t, nil)
+	request := harness.request(
+		"request", "admission", "complete", Effects{EffectEgressesContent}, nil)
+	request.Lease = time.Minute
+	request.Context.Deadline = harness.now.Add(30 * time.Second)
+	grant, err := harness.service.Request(
+		harness.context(t, "request"), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !grant.Token.ExpiresAt.Equal(harness.now.Add(30 * time.Second)) {
+		t.Fatalf("token expiry = %s, want the action deadline",
+			grant.Token.ExpiresAt)
+	}
+}
+
+// TestAdmissionChargesAPossibleExternalEffectLikeAClaim pins that a grant and a
+// plain dispatch claim of the same action agree about what may already have
+// happened. Egress is deliberately not charged: transmitting content is a
+// disclosure, not an effect leaving a record elsewhere to reconcile against.
+func TestAdmissionChargesAPossibleExternalEffectLikeAClaim(t *testing.T) {
+	harness := newAdmissionHarness(t, nil)
+	if _, err := harness.service.Request(
+		harness.context(t, "request"), harness.request(
+			"request", "mutating", "publish",
+			Effects{EffectMutatesExternal}, nil)); err != nil {
+		t.Fatal(err)
+	}
+	mutating, err := harness.store.GetAction(
+		context.Background(), []byte("mutating"))
+	if err != nil || !mutating.EffectPossible {
+		t.Fatalf("external-effect admission = %#v, %v", mutating, err)
+	}
+	if _, err := harness.service.Request(
+		harness.context(t, "request"), harness.request(
+			"request", "egressing", "complete",
+			Effects{EffectEgressesContent}, nil)); err != nil {
+		t.Fatal(err)
+	}
+	egressing, err := harness.store.GetAction(
+		context.Background(), []byte("egressing"))
+	if err != nil || egressing.EffectPossible {
+		t.Fatalf("egress-only admission = %#v, %v", egressing, err)
 	}
 }
 

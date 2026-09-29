@@ -235,6 +235,25 @@ func (e Effects) digestBytes() []byte {
 	return []byte(strings.Join(ordered, ","))
 }
 
+// equalEffects reports exact set equality over two canonical declarations.
+//
+// Order-sensitive on purpose. Every declaration that reaches a durable record
+// has been through canonicalEffects, and ActionRecord.Validate refuses a stored
+// one that is not canonically ordered, so two equal sets always compare equal
+// here. Making it order-insensitive instead would mean accepting a record whose
+// ordering says it was assembled by something that skipped canonicalisation.
+func equalEffects(left, right Effects) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if left[i] != right[i] {
+			return false
+		}
+	}
+	return true
+}
+
 // clone returns an independent copy, so a returned descriptor cannot be used
 // to mutate registry state.
 func (e Effects) clone() Effects {

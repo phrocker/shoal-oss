@@ -366,6 +366,19 @@ func workspaceOperationForRequest(
 		(strings.HasSuffix(path, "/cancel") ||
 			strings.HasSuffix(path, "/status")):
 		return auth.OperationDispatch, true
+	// Admission is invoke on all three. Asking whether a call may happen,
+	// reporting what it did, and listing what is still outstanding are all the
+	// same authority as performing the work would be — the caller is the one
+	// that would act, and nothing here is a lesser right than dispatching.
+	//
+	// A route missing from this table is not a 404: ServeHTTP consults it
+	// before dispatching, so a caller sending a workspace ID would be refused
+	// as not registered and the admission handlers would never run at all.
+	case method == http.MethodPost &&
+		(path == "/api/v1/admission/request" ||
+			path == "/api/v1/admission/report" ||
+			path == "/api/v1/admission/outstanding"):
+		return auth.OperationInvoke, true
 	case method == http.MethodPost &&
 		path == "/api/v1/fleet/events/subscriptions":
 		return auth.OperationSubscriptionCreate, true
@@ -626,6 +639,16 @@ func requestMayCommit(method, path string) bool {
 		"/api/v1/fleet/agents",
 		"/api/v1/fleet/actions",
 		"/api/v1/fleet/actions/invoke",
+		// Admission commits its ActionRecord before the response is encoded.
+		// A request commits the grant or the refusal; a report commits the
+		// terminal record for a call the caller has already made. If either
+		// response is lost — to the workspace output limit like anything else
+		// — the caller must be told the outcome is indeterminate rather than
+		// that nothing committed. A deterministic failure on /request invites
+		// a retry that will now conflict with the caller's own live grant, and
+		// on /report it invites re-reporting an egress that already happened.
+		"/api/v1/admission/request",
+		"/api/v1/admission/report",
 		"/api/v1/fleet/events/subscriptions",
 		"/api/v1/fleet/events/publish":
 		return true

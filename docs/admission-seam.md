@@ -24,7 +24,6 @@ token is its claim:
 
 | admission | dispatch state | lifecycle event |
 | --- | --- | --- |
-| requested | `queued` | `action.enqueued` |
 | granted | `claimed` | `action.claimed` |
 | refused | `canceled` | `action.canceled` |
 | reported | `succeeded` / `failed` | `action.completed` / `action.failed` |
@@ -38,6 +37,49 @@ to disagree.
 
 The consequence worth stating: an outstanding admission and an outstanding
 claim are indistinguishable, because they are the same thing.
+
+### An admission is never queued
+
+The table has no `queued` row, and that is the stop rather than an omission.
+
+Every check runs before anything durable is written, and the answer is then
+committed as exactly one record at version one — claimed for a grant, cancelled
+for a refusal. Writing a queued record first and deciding afterwards would open
+a window in which an ungranted, possibly refused, admission exists as an action
+waiting for a worker. `Pull` returns it to the same principal, `Claim` on the
+dispatch surface hands out a live claim against it, and under the execution
+boundary a claim is permission to perform the declared effect out of process. A
+refusal would become permission through a different door.
+
+Cancelling the queued record when a later step fails does not close that
+window: the cancel is a second mutation that can fail for the same reasons the
+first step did, and when it does the orphan is still there. The only safe
+failure mode is having written nothing — the caller gets a transport error and
+fails closed, which is what a caller of this surface must do with an
+unreachable decision plane anyway.
+
+One integration consequence: `action.enqueued` is never published for an
+admission. Anything reading the lifecycle stream — the accumulator in #389 in
+particular — must key on `action.claimed` and `action.canceled`.
+
+### The record carries what was admitted
+
+`ActionRecord.AdmittedEffects` holds the declared effect set and
+`AdmittedDisclosures` a digest of the declared corpus references, and both are
+part of `equivalentEnqueue` — the record's retry identity.
+
+Without that, a caller could ask with corpus references, receive obligations
+restricting them, then replay the same action ID, idempotency key and token
+with the references removed: the record would be recognised as the same
+request, obligations would be recomputed over nothing, and the reply would be
+an unrestricted allow for a token that is already live. The declaration has to
+be pinned by the record, not merely adjudicated on the way past it. A retry
+that changes it is a conflict.
+
+The references are a digest rather than a list because they are corpus
+identities the caller supplied, and copying them into a dispatch record would
+put a caller's claimed reading list somewhere the team overview reads. Refusing
+a changed retry needs only equality.
 
 ## The three answers
 
@@ -126,9 +168,23 @@ same token and be told the second was recorded. So the admission path resolves
 the terminal case first and accepts only a byte-identical replay of what is
 already committed. Everything else is `conflict`.
 
-A report is either an outcome or a failure, never both. A failure without an
-error code and an outcome carrying one are both refused, so the committed
-record's shape does not depend on which branch resolved first.
+A report is either an outcome or a failure, never both, and all three ways of
+violating that are refused: a failure without an error code, an outcome
+carrying one, and a failure carrying an outcome. The last matters most — the
+completion path discards a failed report's outcome, so the record would say
+nothing about it and the replay comparison would read any two failures with the
+same error code as the same report.
+
+**Reporting a failure is a successful report.** The completion path is built
+for an executor, where a failed outcome is the executor's error and is returned
+alongside the committed record; here the failure is the news, not an error in
+delivering it. So a committed record that matches the report is a receipt.
+Propagating the completion path's error instead would make the first response
+to a reported failure an error and the identical retry a receipt, so what the
+caller saw would depend on whether its own report had committed — the exact
+confusion the one-shot token exists to remove. The conversion is guarded by the
+replay comparison itself: an outcome the service cannot confirm it wrote stays
+an error.
 
 ## Outstanding
 

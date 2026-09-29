@@ -6,6 +6,7 @@ package fleet
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -115,6 +116,73 @@ type ActionRecord struct {
 	EvidenceSnapshotAsOf           time.Time
 	Evidence                       []EvidenceRef
 	EffectPossible                 bool
+	// AdmittedEffects is the effect set a pre-call admission declared it was
+	// about to perform. Empty on an action that was dispatched rather than
+	// admitted.
+	//
+	// It is part of the record's enqueue identity, not decoration. Without it
+	// the durable record says only that some admission was granted under this
+	// token, and a retry carrying a different declaration is indistinguishable
+	// from the original — so a caller could be admitted for one thing and hold
+	// a token that reads as permission for another.
+	AdmittedEffects Effects
+	// AdmittedDisclosures is a digest over the canonical corpus references an
+	// admission declared its payload would carry, or nil when it declared none.
+	//
+	// A digest rather than the references themselves. The references are corpus
+	// identities the caller supplied, and copying them into a dispatch record
+	// would put a caller's claimed reading list somewhere the team overview
+	// reads. What the record has to do is refuse a retry that changes them,
+	// which needs only equality.
+	AdmittedDisclosures []byte
+}
+
+// MaxAdmittedEffects bounds the declared set a durable record may carry. The
+// taxonomy has three classes; the bound is larger so a record written by a
+// build that knows more of them still decodes here and is refused at
+// resolution, which is where an unrecognised class is supposed to be caught.
+const MaxAdmittedEffects = 16
+
+// validateAdmittedDeclaration checks the shape of what an admission declared.
+//
+// Membership is deliberately not checked. A durable decoder reads whatever
+// strings are stored, and Effects.exceeds already fails closed on a class it
+// does not recognise — refusing to decode the record instead would turn a
+// forward-compatible record into an undecodable one and lose the audit trail
+// for exactly the admissions most worth reading.
+//
+// Canonical order is checked, because it is what makes two declarations
+// comparable: the same classes in a different order are the same declaration
+// and must not produce a record a retry cannot match.
+func validateAdmittedDeclaration(record ActionRecord) error {
+	if len(record.AdmittedEffects) > MaxAdmittedEffects {
+		return shoal.NewError(
+			shoal.ErrorInvalidArgument, "admitted effects exceed their bound")
+	}
+	for i := 1; i < len(record.AdmittedEffects); i++ {
+		if record.AdmittedEffects[i-1] >= record.AdmittedEffects[i] {
+			return shoal.NewError(
+				shoal.ErrorInvalidArgument, "admitted effects are not canonical")
+		}
+	}
+	if len(record.AdmittedDisclosures) == 0 {
+		return nil
+	}
+	if len(record.AdmittedDisclosures) != sha256.Size {
+		return shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			"admitted disclosure digest is not a digest")
+	}
+	// Declared references without a declared effect is not a shape any
+	// admission can produce: Request refuses an empty effect set before it
+	// reaches a record. A record carrying one has been assembled by something
+	// that skipped that check.
+	if len(record.AdmittedEffects) == 0 {
+		return shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			"admitted disclosures require an admitted effect")
+	}
+	return nil
 }
 
 // ActionEventProvenance identifies the authorization and request that
@@ -564,6 +632,9 @@ func (r ActionRecord) Validate() error {
 			shoal.ErrorInvalidArgument,
 			"action evidence snapshot requires evidence")
 	}
+	if err := validateAdmittedDeclaration(r); err != nil {
+		return err
+	}
 	return validateEvidence(r.Evidence)
 }
 
@@ -855,6 +926,9 @@ func cloneActionRecord(input ActionRecord) ActionRecord {
 	result.CancelKey = append([]byte(nil), input.CancelKey...)
 	result.ExecutorKey = append([]byte(nil), input.ExecutorKey...)
 	result.Evidence = cloneActionEvidence(input.Evidence)
+	result.AdmittedEffects = input.AdmittedEffects.clone()
+	result.AdmittedDisclosures = append(
+		[]byte(nil), input.AdmittedDisclosures...)
 	return result
 }
 

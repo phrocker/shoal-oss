@@ -64,60 +64,9 @@ func (s *DispatchService) enqueue(
 	if err != nil {
 		return ActionRecord{}, err
 	}
-
-	if err := validateOpaque("action ID", request.ID, false); err != nil {
-		return ActionRecord{}, err
-	}
-	if err := validateOpaque("action idempotency key", request.IdempotencyKey, false); err != nil {
-		return ActionRecord{}, err
-	}
-	if request.AgentGeneration <= 0 {
-		return ActionRecord{}, shoal.NewError(shoal.ErrorInvalidArgument, "agent generation must be positive")
-	}
-	if err := validateName("capability", request.Capability); err != nil {
-		return ActionRecord{}, err
-	}
-	if err := validateName("action", request.Action); err != nil {
-		return ActionRecord{}, err
-	}
-	if request.Context.Deadline.Sub(now) > MaxActionDeadline {
-		return ActionRecord{}, shoal.NewError(shoal.ErrorInvalidArgument, "action deadline exceeds its bound")
-	}
-	// Binding, not execution: queueing work for an executor that runs out of
-	// process must not require it to be runnable here.
-	descriptor, action, _, err := s.registry.resolveActionBinding(
-		ctx, decision, request.AgentID, request.AgentGeneration,
-		request.Capability, request.Action, request.SourceID, request.PolicyID,
-		request.ObjectID, operation, now,
-	)
+	record, _, err := s.queuedRecord(ctx, decision, request, operation, now)
 	if err != nil {
 		return ActionRecord{}, err
-	}
-	input, err := validateAgainstSchema(action.InputSchema, request.Input, "action input", MaxActionPayloadBytes)
-	if err != nil {
-		return ActionRecord{}, err
-	}
-	reason, err := interaction.NewReason(request.Context.ReasonCode, request.Context.ReasonDetail)
-	if err != nil {
-		return ActionRecord{}, err
-	}
-	fingerprint, err := auth.AuthorizationFingerprint(decision)
-	if err != nil {
-		return ActionRecord{}, err
-	}
-	record := ActionRecord{
-		ID: append([]byte(nil), request.ID...), IdempotencyKey: append([]byte(nil), request.IdempotencyKey...),
-		Version: 1, State: DispatchQueued, AgentID: descriptor.ID,
-		AgentGeneration: descriptor.Generation, Capability: request.Capability, Action: request.Action,
-		SourceID: append([]byte(nil), request.SourceID...), PolicyID: append([]byte(nil), request.PolicyID...),
-		ObjectID: request.ObjectID, Input: input, Subject: decision.Subject(), Actor: decision.Actor(),
-		ClientID: decision.ClientID(), OnBehalfOf: decision.OnBehalfOf(),
-		AuthorizationFingerprint: fingerprint, PolicyGeneration: decision.PolicyGeneration(),
-		AuthorizationExpiresAt: decision.AuthenticationExpires(),
-		AuthorizedOperations:   decisionOperations(decision, operation),
-		RequestID:              decision.RequestID(), CorrelationID: decision.CorrelationID(),
-		Reason: reason, Deadline: request.Context.Deadline.UTC(), CreatedAt: now, UpdatedAt: now,
-		ExecutorKey: executorKey(request.ID, request.IdempotencyKey),
 	}
 	if current, readErr := s.store.GetAction(ctx, request.ID); readErr == nil {
 		if equivalentEnqueue(current, record) {
@@ -149,6 +98,79 @@ func (s *DispatchService) enqueue(
 		return ActionRecord{}, errors.Join(ErrActionCommitted, err)
 	}
 	return cloneActionRecord(stored), nil
+}
+
+// queuedRecord validates a dispatch request and builds the version-1 record an
+// enqueue would commit, without committing anything.
+//
+// It is split out so admission can reach the same record without going through
+// the queued state. Every check an enqueue makes has to be made before an
+// admission writes anything, and the alternative — admission repeating the
+// validation itself — is how a second entry point ends up admitting an input
+// the first would have refused. The resolved Action comes back with it because
+// admission needs the declared effect ceiling, and resolving twice would ask
+// the registry a question it has already answered.
+func (s *DispatchService) queuedRecord(
+	ctx context.Context,
+	decision auth.Decision,
+	request EnqueueRequest,
+	operation auth.Operation,
+	now time.Time,
+) (ActionRecord, Action, error) {
+	if err := validateOpaque("action ID", request.ID, false); err != nil {
+		return ActionRecord{}, Action{}, err
+	}
+	if err := validateOpaque("action idempotency key", request.IdempotencyKey, false); err != nil {
+		return ActionRecord{}, Action{}, err
+	}
+	if request.AgentGeneration <= 0 {
+		return ActionRecord{}, Action{}, shoal.NewError(shoal.ErrorInvalidArgument, "agent generation must be positive")
+	}
+	if err := validateName("capability", request.Capability); err != nil {
+		return ActionRecord{}, Action{}, err
+	}
+	if err := validateName("action", request.Action); err != nil {
+		return ActionRecord{}, Action{}, err
+	}
+	if request.Context.Deadline.Sub(now) > MaxActionDeadline {
+		return ActionRecord{}, Action{}, shoal.NewError(shoal.ErrorInvalidArgument, "action deadline exceeds its bound")
+	}
+	// Binding, not execution: queueing work for an executor that runs out of
+	// process must not require it to be runnable here.
+	descriptor, action, _, err := s.registry.resolveActionBinding(
+		ctx, decision, request.AgentID, request.AgentGeneration,
+		request.Capability, request.Action, request.SourceID, request.PolicyID,
+		request.ObjectID, operation, now,
+	)
+	if err != nil {
+		return ActionRecord{}, Action{}, err
+	}
+	input, err := validateAgainstSchema(action.InputSchema, request.Input, "action input", MaxActionPayloadBytes)
+	if err != nil {
+		return ActionRecord{}, Action{}, err
+	}
+	reason, err := interaction.NewReason(request.Context.ReasonCode, request.Context.ReasonDetail)
+	if err != nil {
+		return ActionRecord{}, Action{}, err
+	}
+	fingerprint, err := auth.AuthorizationFingerprint(decision)
+	if err != nil {
+		return ActionRecord{}, Action{}, err
+	}
+	return ActionRecord{
+		ID: append([]byte(nil), request.ID...), IdempotencyKey: append([]byte(nil), request.IdempotencyKey...),
+		Version: 1, State: DispatchQueued, AgentID: descriptor.ID,
+		AgentGeneration: descriptor.Generation, Capability: request.Capability, Action: request.Action,
+		SourceID: append([]byte(nil), request.SourceID...), PolicyID: append([]byte(nil), request.PolicyID...),
+		ObjectID: request.ObjectID, Input: input, Subject: decision.Subject(), Actor: decision.Actor(),
+		ClientID: decision.ClientID(), OnBehalfOf: decision.OnBehalfOf(),
+		AuthorizationFingerprint: fingerprint, PolicyGeneration: decision.PolicyGeneration(),
+		AuthorizationExpiresAt: decision.AuthenticationExpires(),
+		AuthorizedOperations:   decisionOperations(decision, operation),
+		RequestID:              decision.RequestID(), CorrelationID: decision.CorrelationID(),
+		Reason: reason, Deadline: request.Context.Deadline.UTC(), CreatedAt: now, UpdatedAt: now,
+		ExecutorKey: executorKey(request.ID, request.IdempotencyKey),
+	}, action, nil
 }
 
 func (s *DispatchService) Invoke(ctx context.Context, request InvokeRequest) (ActionRecord, error) {
@@ -695,34 +717,14 @@ func validateExecutionEvidence(
 func (s *DispatchService) Cancel(ctx context.Context, request CancelRequest) (ActionRecord, error) {
 	ctx, cancel := s.deadline(ctx, request.Context)
 	defer cancel()
-	return s.cancel(ctx, request, auth.OperationDispatch)
-}
-
-// cancel is the cancellation transition, parameterised by the operation that
-// authorizes it.
-//
-// Cancelling on someone's behalf is dispatch. Refusing an admission is not: the
-// caller asking is the caller that would have performed the effect, and it
-// holds invoke rather than dispatch. Without the split, a refusal could only be
-// recorded for a principal that also happened to hold dispatch, and every other
-// caller would be denied with nothing durable saying so — the one outcome this
-// plane most needs the record for.
-//
-// The caller is responsible for the request deadline, which the exported entry
-// point applies and the admission path applies once for the whole request.
-func (s *DispatchService) cancel(
-	ctx context.Context,
-	request CancelRequest,
-	operation auth.Operation,
-) (ActionRecord, error) {
-	decision, now, err := s.begin(ctx, operation, request.Context)
+	decision, now, err := s.begin(ctx, auth.OperationDispatch, request.Context)
 	if err != nil {
 		return ActionRecord{}, err
 	}
 	if err := validateOpaque("cancel mutation key", request.MutationKey, false); err != nil {
 		return ActionRecord{}, err
 	}
-	current, err := s.authorizedCurrent(ctx, decision, request.ID, operation, now)
+	current, err := s.authorizedCurrent(ctx, decision, request.ID, auth.OperationDispatch, now)
 	if err != nil {
 		return ActionRecord{}, err
 	}
@@ -754,7 +756,7 @@ func (s *DispatchService) cancel(
 	next.TransitionCorrelationID = decision.CorrelationID()
 	next.AuthorizedOperations = canonicalOperations(append(
 		next.AuthorizedOperations,
-		decisionOperations(decision, operation)...,
+		decisionOperations(decision, auth.OperationDispatch)...,
 	))
 	next.CancelAuthorizationFingerprint, err =
 		auth.AuthorizationFingerprint(decision)
@@ -762,7 +764,7 @@ func (s *DispatchService) cancel(
 		return ActionRecord{}, err
 	}
 	next.CancelAuthorizationExpiresAt = decision.AuthenticationExpires()
-	if err := s.recorder.RecordAction(ctx, ActionAudit{Phase: "cancel_admission", Operation: operation, Record: next}); err != nil {
+	if err := s.recorder.RecordAction(ctx, ActionAudit{Phase: "cancel_admission", Operation: auth.OperationDispatch, Record: next}); err != nil {
 		return ActionRecord{}, errors.Join(ErrRecordingUnavailable, err)
 	}
 	stored, err := s.store.ApplyAction(ctx, DispatchMutation{
@@ -1270,8 +1272,21 @@ func writeDispatchTupleField(digest hash.Hash, value []byte) {
 	_, _ = digest.Write(value)
 }
 
+// equivalentEnqueue reports whether an existing record is the same request as
+// the one being written, so a retry replays instead of conflicting.
+//
+// What an admission declared is part of that identity. Without the two
+// Admitted fields below, a caller could ask for an admission carrying corpus
+// references, receive obligations restricting them, and then replay the same
+// action ID, idempotency key and token with the reference list removed: the
+// record would still be recognised as the same request, obligations would be
+// recomputed over nothing, and the reply would be an unrestricted allow for a
+// token that is already live. The declaration has to be pinned by the record,
+// not merely adjudicated on the way past it.
 func equivalentEnqueue(current, wanted ActionRecord) bool {
-	return bytes.Equal(current.ID, wanted.ID) &&
+	return equalEffects(current.AdmittedEffects, wanted.AdmittedEffects) &&
+		bytes.Equal(current.AdmittedDisclosures, wanted.AdmittedDisclosures) &&
+		bytes.Equal(current.ID, wanted.ID) &&
 		bytes.Equal(current.IdempotencyKey, wanted.IdempotencyKey) &&
 		current.AgentID == wanted.AgentID &&
 		current.AgentGeneration == wanted.AgentGeneration &&
