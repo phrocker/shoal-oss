@@ -83,7 +83,9 @@ func (s *DispatchService) enqueue(
 	if request.Context.Deadline.Sub(now) > MaxActionDeadline {
 		return ActionRecord{}, shoal.NewError(shoal.ErrorInvalidArgument, "action deadline exceeds its bound")
 	}
-	descriptor, action, _, err := s.registry.resolveAction(
+	// Binding, not execution: queueing work for an executor that runs out of
+	// process must not require it to be runnable here.
+	descriptor, action, _, err := s.registry.resolveActionBinding(
 		ctx, decision, request.AgentID, request.AgentGeneration,
 		request.Capability, request.Action, request.SourceID, request.PolicyID,
 		request.ObjectID, operation, now,
@@ -230,9 +232,40 @@ func (s *DispatchService) Claim(ctx context.Context, request ClaimRequest) (Acti
 	if !now.Before(current.Deadline) {
 		return ActionRecord{}, ErrClaimLost
 	}
+	// Resolved for the declared Effect, which decides whether claiming this
+	// action already makes an effect possible.
+	//
+	// authorizedCurrent above has already resolved the action and refused a
+	// descriptor revoked, re-registered or narrowed since it was queued, so
+	// this adds no authorization — it is how the declaration is obtained, since
+	// authorizedCurrent discards what it resolved.
+	_, claimedAction, _, err := s.registry.resolveActionBinding(
+		ctx, decision, current.AgentID, current.AgentGeneration,
+		current.Capability, current.Action, current.SourceID, current.PolicyID,
+		current.ObjectID, auth.OperationInvoke, now,
+	)
+	if err != nil {
+		return ActionRecord{}, err
+	}
 	next := cloneActionRecord(current)
 	next.Version++
 	next.State = DispatchClaimed
+	// An external-effect action is possibly-effected from the moment it is
+	// claimed, not from the moment it is executed.
+	//
+	// An in-process executor sets this at execution because this process owns
+	// the window between admission and effect. A remote worker owns that window
+	// itself: once it holds the claim it may act at any time, and if it then
+	// goes silent the record must not say the effect certainly did not happen.
+	// Without this a lease that expires after the work was done is
+	// indistinguishable from one that expired before it started.
+	//
+	// It is narrowed by the declaration from #381 rather than set for every
+	// claim. An evidence-only action mutates nothing outside Shoal, so its
+	// outcome is visible in Shoal's own record and needs no assumption.
+	if claimedAction.Effect == EffectExternal {
+		next.EffectPossible = true
+	}
 	next.ClaimID = append([]byte(nil), request.ClaimID...)
 	next.ClaimFence++
 	next.ClaimLease = request.Lease
@@ -362,6 +395,153 @@ func (s *DispatchService) ExecuteClaim(ctx context.Context, claimed ActionRecord
 			CorrelationID: current.CorrelationID, Deadline: current.Deadline,
 		})
 	}()
+	return s.applyExecutionResult(ctx, current, action, result, executionErr)
+}
+
+// CompleteClaim records the outcome of work a remote executor performed out of
+// process.
+//
+// It exists because dispatch was one-directional. A worker outside this process
+// could pull an action, claim it under a fence, perform the work, and then had
+// nowhere to report: its lease expired and the action returned to the queue as
+// though nothing had happened, while the effect had already occurred. The
+// execution boundary (#381) refuses to run external work in process and points
+// at dispatch as the alternative; this is the half of dispatch that makes the
+// alternative reachable.
+//
+// Every check ExecuteClaim performs, this performs. The decision is resolved
+// and matched to the queued principal, the action is re-resolved through the
+// registry against the current generation and lease, and the claim fence and
+// version are confirmed before anything is written. The result then goes
+// through applyExecutionResult, the same terminal transition the in-process
+// path uses, which revalidates the fence after the fact and reports a loss as
+// ambiguity rather than overwriting whatever committed in the meantime.
+//
+// Reporting twice is safe. A worker that commits and then loses its response
+// replays the request and gets the committed record back, exactly as a repeated
+// ExecuteClaim does, because the terminal state at the expected version under
+// the same claim is recognised as the reporter's own work rather than a
+// conflict.
+func (s *DispatchService) CompleteClaim(ctx context.Context, request CompletionRequest) (ActionRecord, error) {
+	ctx, cancel := s.deadline(ctx, request.Context)
+	defer cancel()
+	decision, now, err := s.begin(ctx, auth.OperationInvoke, request.Context)
+	if err != nil {
+		return ActionRecord{}, err
+	}
+	if err := validateOpaque("action ID", request.ID, false); err != nil {
+		return ActionRecord{}, err
+	}
+	if err := validateOpaque("claim ID", request.ClaimID, false); err != nil {
+		return ActionRecord{}, err
+	}
+	if request.ExpectedVersion == 0 {
+		return ActionRecord{}, shoal.NewError(
+			shoal.ErrorInvalidArgument, "completion version is invalid")
+	}
+	// A failure with no reason is a protocol error. Recording it as a plain
+	// failure would lose the only thing the report carried.
+	if request.Failed && request.Result.ErrorCode == "" {
+		return ActionRecord{}, shoal.NewError(
+			shoal.ErrorInvalidArgument, "a failed completion requires an error code")
+	}
+	current, err := s.authorizedCurrent(ctx, decision, request.ID, auth.OperationInvoke, now)
+	if err != nil {
+		return ActionRecord{}, err
+	}
+	// A replayed report. The action is already terminal at the version this
+	// reporter expected to produce, under this reporter's own claim, so the
+	// work is committed and the response was lost. Republish and return it
+	// rather than reporting a conflict against the reporter's own write.
+	//
+	// Only succeeded and failed count, because only applyExecutionResult
+	// produces those and only it could have been this reporter's write. Cancel
+	// also lands on a terminal state at exactly version+1 while preserving the
+	// ClaimID it cancelled, so accepting any terminal state here would hand a
+	// late reporter the cancelled record and a 200 — telling it the work it
+	// performed was recorded, when the record says the opposite.
+	if (current.State == DispatchSucceeded || current.State == DispatchFailed) &&
+		current.Version == request.ExpectedVersion+1 &&
+		bytes.Equal(current.ClaimID, request.ClaimID) {
+		if err := s.publishTransition(
+			context.WithoutCancel(ctx), actionEventKind(current), current,
+		); err != nil {
+			return ActionRecord{}, errors.Join(ErrActionCommitted, err)
+		}
+		return cloneActionRecord(current), nil
+	}
+	if current.Version != request.ExpectedVersion ||
+		!bytes.Equal(current.ClaimID, request.ClaimID) ||
+		current.State != DispatchClaimed {
+		return ActionRecord{}, ErrClaimLost
+	}
+	// The lease and the action deadline are both checked here, before anything
+	// else is done. A worker reporting after either has passed has lost the
+	// right to write this record: the action may already have been reclaimed
+	// and run again.
+	//
+	// applyExecutionResult would catch this too, at the post-effect fence
+	// check, but it would report it as ErrExecutionAmbiguous — which says the
+	// service got far enough that it cannot tell whether the write landed.
+	// Refusing here keeps a plainly-late report a plain ErrClaimLost, and
+	// avoids resolving the registry and assembling a record for a report that
+	// was never going to be written.
+	//
+	// The deadline half is currently implied by the lease half: Claim clamps
+	// ClaimLeaseUntil to the action deadline, so a live lease always means a
+	// live deadline and no test can distinguish the two clauses. It is kept
+	// because it costs nothing and the clamp is maintained in a different
+	// function, but it is not load-bearing today and should not be read as a
+	// second, independent bound.
+	if !now.Before(current.ClaimLeaseUntil) || !now.Before(current.Deadline) {
+		return ActionRecord{}, ErrClaimLost
+	}
+	// The queued principal is confirmed by authorizedCurrent above, which
+	// refuses a mismatch as not-found rather than unauthorized so a caller
+	// cannot probe for actions belonging to someone else. ExecuteClaim repeats
+	// the check because it is handed a record instead of loading one; here it
+	// would be dead code, and a check no test can distinguish implies a
+	// guarantee that is not actually held at this point.
+	//
+	// Resolved for the Action, which carries the OutputSchema the report is
+	// validated against. authorizedCurrent above already resolved it once and
+	// refuses a descriptor revoked, re-registered or narrowed since the claim,
+	// so this is not a second authorization check — it is how the declared
+	// schema is obtained, since authorizedCurrent discards it.
+	_, action, _, err := s.registry.resolveActionBinding(
+		ctx, decision, current.AgentID, current.AgentGeneration,
+		current.Capability, current.Action, current.SourceID, current.PolicyID,
+		current.ObjectID, auth.OperationInvoke, now,
+	)
+	if err != nil {
+		return ActionRecord{}, err
+	}
+	var executionErr error
+	if request.Failed {
+		executionErr = shoal.NewError(shoal.ErrorInternal, "remote executor reported failure")
+	}
+	return s.applyExecutionResult(ctx, current, action, request.Result, executionErr)
+}
+
+// applyExecutionResult is the terminal transition: it turns an ExecutionResult
+// into a committed, audited, published ActionRecord.
+//
+// Both completion paths go through it — the in-process executor above and the
+// remote worker in CompleteClaim — so neither can validate less than the other.
+// Splitting this between them is how a remote worker ends up able to record
+// output or evidence that an in-process one could not.
+//
+// The caller has already confirmed the claim is live. This re-confirms it
+// anyway: everything after the effect races a lease that may have expired while
+// the effect was happening, and the point of the fence is that losing it after
+// the fact is reported rather than overwritten.
+func (s *DispatchService) applyExecutionResult(
+	ctx context.Context,
+	current ActionRecord,
+	action Action,
+	result ExecutionResult,
+	executionErr error,
+) (ActionRecord, error) {
 	finishNow := s.clock().UTC()
 	next := cloneActionRecord(current)
 	next.Version++
@@ -428,7 +608,10 @@ func (s *DispatchService) ExecuteClaim(ctx context.Context, claimed ActionRecord
 		return ActionRecord{}, errors.Join(ErrExecutionAmbiguous,
 			shoal.NewError(shoal.ErrorUnauthorized, "terminal execution identity changed"))
 	}
-	if _, _, _, err := s.registry.resolveAction(
+	// Binding, not execution. This runs on the remote path too, where there is
+	// no in-process executor to assert and demanding one would fail every
+	// remote completion at the last step.
+	if _, _, _, err := s.registry.resolveActionBinding(
 		ctx, finalDecision, current.AgentID, current.AgentGeneration,
 		current.Capability, current.Action, current.SourceID, current.PolicyID,
 		current.ObjectID, auth.OperationInvoke, finishNow,
@@ -753,7 +936,9 @@ func (s *DispatchService) Pull(ctx context.Context, request PullActionsRequest) 
 		if !sameActionPrincipal(decision, record) {
 			continue
 		}
-		if _, _, _, authorizeErr := s.registry.resolveAction(
+		// Binding, not execution: a remote worker pulling its own work would
+		// otherwise never see it.
+		if _, _, _, authorizeErr := s.registry.resolveActionBinding(
 			ctx, decision, record.AgentID, record.AgentGeneration,
 			record.Capability, record.Action, record.SourceID, record.PolicyID,
 			record.ObjectID, auth.OperationInvoke, now,
@@ -867,7 +1052,12 @@ func (s *DispatchService) authorizedCurrent(ctx context.Context, decision auth.D
 	}, now); err != nil {
 		return ActionRecord{}, auth.ObjectNotFound()
 	}
-	if _, _, _, err := s.registry.resolveAction(ctx, decision, current.AgentID, current.AgentGeneration,
+	// resolveActionBinding, not resolveAction: claiming, cancelling, inspecting
+	// and completing an action must work for an executor that runs out of
+	// process and has no in-process Execute. Only ExecuteClaim needs a runnable
+	// one. Every other check — generation, scope, authorization, delegation and
+	// the declared effect ceiling — is identical either way.
+	if _, _, _, err := s.registry.resolveActionBinding(ctx, decision, current.AgentID, current.AgentGeneration,
 		current.Capability, current.Action, current.SourceID, current.PolicyID, current.ObjectID,
 		operation, now); err != nil {
 		if shoal.IsErrorCode(err, shoal.ErrorUnauthorized) ||
@@ -896,6 +1086,9 @@ func sameActionPrincipal(decision auth.Decision, record ActionRecord) bool {
 	return true
 }
 
+// resolveAction resolves an action for in-process execution. It is
+// resolveActionBinding plus the assertion that the bound reference can actually
+// run the work here.
 func (s *Service) resolveAction(
 	ctx context.Context,
 	decision auth.Decision,
@@ -907,6 +1100,44 @@ func (s *Service) resolveAction(
 	operation auth.Operation,
 	now time.Time,
 ) (Descriptor, Action, ActionExecutor, error) {
+	descriptor, action, raw, err := s.resolveActionBinding(
+		ctx, decision, agentID, generation, capabilityName, actionName,
+		sourceID, policyID, objectID, operation, now,
+	)
+	if err != nil {
+		return Descriptor{}, Action{}, nil, err
+	}
+	executor, ok := raw.(ActionExecutor)
+	if !ok {
+		return Descriptor{}, Action{}, nil, shoal.NewError(shoal.ErrorUnavailable, "registered executor does not implement action execution")
+	}
+	return descriptor, action, executor, nil
+}
+
+// resolveActionBinding resolves an action and its bound executor reference
+// without requiring the reference to be runnable in this process.
+//
+// Authorization, scope, generation and the declared effect ceiling are all
+// checked exactly as they are for in-process execution — the only thing it does
+// not demand is an ActionExecutor implementation.
+//
+// That distinction is what makes an out-of-process executor possible. A gateway
+// proxy performs its work itself and reports through CompleteClaim; nothing in
+// this process ever runs it, so requiring it to supply an Execute method would
+// force every remote deployment to bind a stub whose only job is to be refused.
+// Claiming, cancelling, inspecting and completing an action therefore resolve
+// through here, and only ExecuteClaim demands a runnable executor.
+func (s *Service) resolveActionBinding(
+	ctx context.Context,
+	decision auth.Decision,
+	agentID shoal.ID,
+	generation int64,
+	capabilityName, actionName string,
+	sourceID, policyID []byte,
+	objectID shoal.ID,
+	operation auth.Operation,
+	now time.Time,
+) (Descriptor, Action, any, error) {
 	descriptor, err := s.active(ctx, agentID, now)
 	if err != nil || descriptor.Generation != generation {
 		return Descriptor{}, Action{}, nil, auth.ObjectNotFound()
@@ -956,10 +1187,6 @@ func (s *Service) resolveAction(
 	if !ok {
 		return Descriptor{}, Action{}, nil, shoal.NewError(shoal.ErrorUnavailable, "agent executor is unavailable")
 	}
-	executor, ok := raw.(ActionExecutor)
-	if !ok {
-		return Descriptor{}, Action{}, nil, shoal.NewError(shoal.ErrorUnavailable, "registered executor does not implement action execution")
-	}
 	// Re-checked at resolution, not only at registration. A host can rebind an
 	// executor reference to a narrower ceiling while descriptors registered
 	// under the old one are still live, and those must stop resolving rather
@@ -970,7 +1197,7 @@ func (s *Service) resolveAction(
 			"action declares an external effect but its executor is bound "+
 				"for evidence-only work")
 	}
-	return cloneDescriptor(descriptor), *selected, executor, nil
+	return cloneDescriptor(descriptor), *selected, raw, nil
 }
 
 func executorKey(actionID, idempotency []byte) []byte {

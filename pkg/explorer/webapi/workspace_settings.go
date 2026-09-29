@@ -358,7 +358,8 @@ func workspaceOperationForRequest(
 		(path == "/api/v1/fleet/actions/invoke" ||
 			path == "/api/v1/fleet/actions/pull" ||
 			(strings.HasPrefix(path, "/api/v1/fleet/actions/") &&
-				strings.HasSuffix(path, "/claim"))):
+				(strings.HasSuffix(path, "/claim") ||
+					strings.HasSuffix(path, "/complete")))):
 		return auth.OperationInvoke, true
 	case method == http.MethodPost &&
 		strings.HasPrefix(path, "/api/v1/fleet/actions/") &&
@@ -636,6 +637,7 @@ func requestMayCommit(method, path string) bool {
 					strings.HasSuffix(path, "/revoke"))) ||
 			(strings.HasPrefix(path, "/api/v1/fleet/actions/") &&
 				(strings.HasSuffix(path, "/claim") ||
+					strings.HasSuffix(path, "/complete") ||
 					strings.HasSuffix(path, "/cancel")))
 	}
 }

@@ -60,6 +60,12 @@ func TestWorkspaceSettingsClampAnalyticsAndMarkResponseLoss(t *testing.T) {
 		{http.MethodPost, "/api/v1/fleet/actions"},
 		{http.MethodPost, "/api/v1/fleet/actions/invoke"},
 		{http.MethodPost, "/api/v1/fleet/actions/action/claim"},
+		// Completion writes the terminal record for work an out-of-process
+		// worker has already performed. If its response is lost — including to
+		// the workspace output limit — the worker must be told the outcome is
+		// indeterminate, not that nothing committed: a deterministic failure
+		// invites a retry of an external effect that already happened.
+		{http.MethodPost, "/api/v1/fleet/actions/action/complete"},
 		{http.MethodPost, "/api/v1/fleet/actions/action/cancel"},
 		{http.MethodPost, "/api/v1/fleet/events/subscriptions"},
 		{http.MethodDelete, "/api/v1/fleet/events/subscriptions/subscription"},
@@ -112,6 +118,11 @@ func TestWorkspaceOperationForRequestUsesRouteOperation(t *testing.T) {
 		{http.MethodPost, "/api/v1/documents", auth.OperationList, true},
 		{http.MethodPost, "/api/v1/document", auth.OperationRead, true},
 		{http.MethodPost, "/api/v1/fleet/actions/invoke", auth.OperationInvoke, true},
+		{http.MethodPost, "/api/v1/fleet/actions/action/claim", auth.OperationInvoke, true},
+		// A route missing here is not a 404: ServeHTTP consults this table
+		// before dispatching, and an unlisted path is refused as not
+		// registered for the workspace, so the handler is never reached at all.
+		{http.MethodPost, "/api/v1/fleet/actions/action/complete", auth.OperationInvoke, true},
 		{http.MethodPost, "/api/v1/fleet/actions/action/cancel", auth.OperationDispatch, true},
 		{http.MethodPost, "/api/v1/fleet/agents/agent/heartbeat", auth.OperationAgentHeartbeat, true},
 		{http.MethodPost, "/api/v1/fleet/events/publish", auth.OperationEventPublish, true},

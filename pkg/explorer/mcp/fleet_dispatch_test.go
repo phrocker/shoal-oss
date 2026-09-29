@@ -163,6 +163,9 @@ func (s *fleetToolService) Invoke(
 func (*fleetToolService) Claim(context.Context, fleet.ClaimRequest) (fleet.ActionRecord, error) {
 	return fleet.ActionRecord{}, nil
 }
+func (*fleetToolService) CompleteClaim(context.Context, fleet.CompletionRequest) (fleet.ActionRecord, error) {
+	return fleet.ActionRecord{}, nil
+}
 func (*fleetToolService) Cancel(context.Context, fleet.CancelRequest) (fleet.ActionRecord, error) {
 	return fleet.ActionRecord{}, nil
 }

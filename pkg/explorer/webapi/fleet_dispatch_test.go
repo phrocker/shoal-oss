@@ -173,6 +173,9 @@ func (p *stubDispatchProvider) Enqueue(ctx context.Context, request fleet.Enqueu
 func (*stubDispatchProvider) Claim(context.Context, fleet.ClaimRequest) (fleet.ActionRecord, error) {
 	return fleet.ActionRecord{}, nil
 }
+func (*stubDispatchProvider) CompleteClaim(context.Context, fleet.CompletionRequest) (fleet.ActionRecord, error) {
+	return fleet.ActionRecord{}, nil
+}
 func (*stubDispatchProvider) Cancel(context.Context, fleet.CancelRequest) (fleet.ActionRecord, error) {
 	return fleet.ActionRecord{}, nil
 }
