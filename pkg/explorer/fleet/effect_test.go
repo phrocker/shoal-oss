@@ -23,6 +23,7 @@ import (
 	"context"
 	"encoding/hex"
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
@@ -350,6 +351,94 @@ func TestOmitsFailsClosedOnAnUnrecognizedFloor(t *testing.T) {
 	}
 	if everyEffect().omits(nil) {
 		t.Fatal("an empty floor was treated as unsatisfiable")
+	}
+}
+
+// TestTheLegacyEffectScalarIsStillAccepted covers the HTTP contract, not the
+// durable one. The registry wire embeds []Capability directly, so these struct
+// tags are the API: renaming the field outright rejects every pre-upgrade
+// registration at the transport, because the decoder disallows unknown fields.
+func TestTheLegacyEffectScalarIsStillAccepted(t *testing.T) {
+	for _, probe := range []struct {
+		name string
+		body string
+		want Effects
+	}{
+		{"legacy external", `{"name":"ship","effect":"external"}`,
+			Effects{EffectMutatesExternal}},
+		{"legacy evidence zero value", `{"name":"ship","effect":""}`, nil},
+		{"current spelling", `{"name":"ship","effects":["external"]}`,
+			Effects{EffectMutatesExternal}},
+		{"neither", `{"name":"ship"}`, nil},
+	} {
+		var action Action
+		if err := json.Unmarshal([]byte(probe.body), &action); err != nil {
+			t.Fatalf("%s: %v", probe.name, err)
+		}
+		if !action.Effects.equalForTest(probe.want) {
+			t.Fatalf("%s: effects = %v, want %v",
+				probe.name, action.Effects, probe.want)
+		}
+	}
+
+	// Both spellings at once is refused rather than merged. They would be two
+	// declarations of the same thing, and picking a winner silently would let a
+	// client believe it declared something it did not.
+	var action Action
+	err := json.Unmarshal(
+		[]byte(`{"name":"ship","effect":"external","effects":["reads-corpus"]}`),
+		&action)
+	if err == nil {
+		t.Fatal("a registration supplying both spellings was accepted")
+	}
+
+	// Unknown fields stay refused: a custom unmarshaler would otherwise lose
+	// the strictness the outer decoder cannot reach through it.
+	if err := json.Unmarshal([]byte(`{"name":"ship","effct":"external"}`), &action); err == nil {
+		t.Fatal("an unknown field was accepted inside an action")
+	}
+}
+
+// TestALegacyDescriptorStopsResolvingAgainstAFlooredExecutor pins a breaking
+// change rather than a bug.
+//
+// A descriptor written under the superseded taxonomy declared the evidence zero
+// value, which decodes to the empty set. Against an executor that now declares
+// a floor it omits that floor and stops resolving until it is re-registered.
+//
+// That is the intended outcome. Such a descriptor genuinely understates what
+// invoking it does, and it says nothing only because the taxonomy it was
+// written under could not say anything else. Grandfathering it would keep
+// exactly the descriptors the floor exists to reject — so this is tested, not
+// worked around, and the PR says so instead of claiming a migration-free
+// upgrade.
+func TestALegacyDescriptorStopsResolvingAgainstAFlooredExecutor(t *testing.T) {
+	legacy := []Capability{{Name: "explorer.reason", Actions: []Action{{
+		Name: "ask", InputSchema: anyObject, OutputSchema: anyObject,
+	}}}}
+	transmitting := flooredExecutor{
+		floor: Effects{EffectEgressesContent, EffectReadsCorpus},
+	}
+
+	err := validateDeclaredEffects(legacy,
+		executorFloor(transmitting), executorCeiling(transmitting))
+	if err == nil {
+		t.Fatal("a descriptor declaring nothing resolved against an executor " +
+			"that transmits on every invocation")
+	}
+	// The refusal has to name what is missing, or re-registering is guesswork.
+	for _, class := range []string{"egresses-content", "reads-corpus"} {
+		if !strings.Contains(err.Error(), class) {
+			t.Fatalf("refusal does not name the missing %q: %v", class, err)
+		}
+	}
+
+	// An executor that declares no floor is unaffected, which is why this
+	// breaks only the deployments where Shoal knows the executor transmits.
+	if err := validateDeclaredEffects(legacy,
+		executorFloor(ceilingExecutor{ceiling: everyEffect()}),
+		everyEffect()); err != nil {
+		t.Fatalf("a legacy descriptor broke against an unfloored executor: %v", err)
 	}
 }
 

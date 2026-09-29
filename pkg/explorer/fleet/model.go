@@ -253,6 +253,53 @@ type Action struct {
 	Effects Effects `json:"effects,omitempty"`
 }
 
+// UnmarshalJSON accepts the superseded scalar spelling of the effect field
+// alongside the current set.
+//
+// The registry wire embeds []Capability directly, so these struct tags are the
+// HTTP contract, not an internal detail. Renaming the field outright would
+// reject every pre-upgrade registration at the transport — decodeRequest
+// disallows unknown fields — before it could reach the durable compatibility
+// path. A client that has not been rebuilt is not a malformed client.
+//
+// "effect": "external" becomes {EffectMutatesExternal} and "effect": "" becomes
+// the empty set, which is what the same values decode to from a version-2
+// durable record. Supplying both spellings is refused rather than merged: they
+// would be two declarations of the same thing, and picking a winner silently
+// would let a client believe it declared something it did not.
+//
+// Unknown fields stay refused. The decoder below re-applies the strictness the
+// outer decoder cannot reach through a custom unmarshaler.
+func (a *Action) UnmarshalJSON(data []byte) error {
+	type actionFields struct {
+		Name         string          `json:"name"`
+		InputSchema  json.RawMessage `json:"input_schema"`
+		OutputSchema json.RawMessage `json:"output_schema"`
+		Effects      Effects         `json:"effects"`
+		LegacyEffect *Effect         `json:"effect"`
+	}
+	var fields actionFields
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&fields); err != nil {
+		return err
+	}
+	if fields.LegacyEffect != nil {
+		if fields.Effects != nil {
+			return shoal.NewError(shoal.ErrorInvalidArgument,
+				"action declares both effect and effects; supply only effects")
+		}
+		if *fields.LegacyEffect != "" {
+			fields.Effects = Effects{*fields.LegacyEffect}
+		}
+	}
+	*a = Action{
+		Name: fields.Name, InputSchema: fields.InputSchema,
+		OutputSchema: fields.OutputSchema, Effects: fields.Effects,
+	}
+	return nil
+}
+
 type Capability struct {
 	Name    string   `json:"name"`
 	Actions []Action `json:"actions"`

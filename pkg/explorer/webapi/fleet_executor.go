@@ -256,6 +256,18 @@ func AskActionEffects(provider AskProvider) fleet.Effects {
 // executor and leave a descriptor that reads as non-transmitting while every
 // call transmits. Egress leaves no trace in Shoal's own record, so that
 // descriptor would be the only place anyone could have noticed.
+//
+// This is a breaking change for descriptors registered before it, and
+// deliberately so. A descriptor written under the superseded taxonomy declared
+// the evidence zero value, which decodes to the empty set — so it omits this
+// floor and stops resolving until it is re-registered. That is not an upgrade
+// bug to paper over: such a descriptor genuinely understates what invoking it
+// does, and it says nothing only because the taxonomy it was written under
+// could not say anything else. Grandfathering it would keep exactly the
+// descriptors this floor exists to reject.
+//
+// The refusal names the missing classes, so an operator sees what to add.
+// docs/shoal-explore-web-deploy.md carries the re-registration note.
 func (e *AskExecutor) MinEffects() fleet.Effects { return e.MaxEffects() }
 
 // AskActionInputSchema is the declarative schema a descriptor must register
