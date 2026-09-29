@@ -1,5 +1,115 @@
 # Local authorization decision models: measured findings
 
+The newest supervised comparison yields a cheap CPU classifier, but **no
+accuracy or practical review-efficiency improvement has been established**.
+The code-only classifier retained 27/28 frontier-assessed and 24/25
+Claude-assessed relevant functions on 194 newly reserved functions. The older
+Laya comparator retained 28/28 and 24/25, respectively. PR #410 stays unmerged;
+full review remains mandatory.
+
+## Supervised classifier comparison: V8
+
+All previous V1–V6 labels were explicitly retired to development: 801 functions.
+Before fitting, 17 training rows were removed because their target or contextual
+bodies exactly matched reserved target bodies, leaving 784. Five whole-PR folds
+also purge matching held-out target bodies from training targets and context.
+Near-duplicates and shared contextual code remain possible; the
+[overlap audit](runs/context-v8/overlap-audit.json) records these limits.
+
+Ten matched supervised recipes compare code-only and contextual representations,
+using character, word and combined TF-IDF features with logistic classifiers.
+Context includes bounded callers/callees found by same-directory syntax, with
+pinned revisions, evidence hashes, omission counts and unresolved package/build,
+receiver, interface and cross-directory edges. This is a measured partial graph
+snapshot, not a resolved program graph. Revision and source hashes are receipts,
+not learned features.
+
+At a 98% development recall target, the best code-only recipe proposed 3.5% of
+source bytes for reduction; the best contextual recipe proposed 3.0%. Context improved the matched C=0.3 variant from 2.6% to 3.0%, but no
+context variant beat the best code-only candidate. These are selection
+estimates, not held-out performance. The selected code-only mixed-feature C=3
+model and its operating threshold were frozen before reserved labels were opened.
+
+| Reserved reference / measurement | CPU classifier | Earlier frozen Laya |
+| --- | ---: | ---: |
+| Frontier relevance retained | 27/28 (96.4%) | 28/28 (100%) |
+| Claude relevance retained | 24/25 (96%) | 24/25 (96%) |
+| Proposed lower-priority functions | 50/194 | 62/194 |
+| Proposed complete source-byte reduction | 7.1% | 13.7% |
+| Proposed function-diff-byte reduction | 12.2% | 22.9% |
+
+Both CPU references identify the missed `CausalInferenceIterator.Seek` in #302:
+it chooses the visibility label on derived output. This shows the need to
+recognize policy-bearing data propagation, not merely authorization calls.
+No unknown reference labels were lowered by the CPU classifier. These are
+proposed task-relevance labels, not verified defects. The small retrospective
+sample does not validate future exclusion safety.
+
+The CPU model took 206 ms to score the 194 inputs as a batch (about 1.06 ms
+amortized); Laya's median GPU inference was 20.49 ms per eligible input. These
+are different execution modes, not an end-to-end speed benchmark. Source
+extraction/context construction and downstream reviews are excluded. The
+selected classifier does not consume contextual features. Its 5 MiB JSON
+bundle contains numerical parameters and vocabulary, with class, shape,
+finite-value, recipe and evidence-contract validation. Export/restore parity
+and a separate 194-input replay are exact.
+
+Evidence: [training recipe](runs/context-v8/training/config.json),
+[code-only winner](runs/context-v8/training/candidate-4.json),
+[best context candidate](runs/context-v8/training/candidate-7.json),
+[frozen selection](runs/context-v8/selection.json),
+[frontier comparison](runs/context-v8/frontier-report.json),
+[Claude comparison](runs/context-v8/claude-report.json), and
+[replay verification](runs/context-v8/replay-verification.json).
+
+The first four code-bearing PRs in the reserved collection were selected for
+complete-PR paired reviews before reading labels. Every changed function was
+scored, beyond the smaller relevance sample. Those additional functions were
+not included in the reserved-target body purge; no independent relevance claim
+is made for them. Thirty declarations were nominally lowered; one complete
+helper body remained elsewhere in shared context. The omission audit preserves
+that fact.
+
+| Four complete-PR paired reviews | Full evidence | Candidate evidence |
+| --- | ---: | ---: |
+| Input tokens, including cache reads/writes | 361,689 | 351,706 |
+| Output tokens | 15,308 | 16,515 |
+| Sum of call duration | 160.2 s | 173.5 s |
+| Reported API cost | $3.1323 | $3.0766 |
+
+The [bounded source audit](runs/context-v8/paired/adjudication.json) confirms
+two findings shared by both arms: integer narrowing can disable the mosaic
+budget, and an extraction staleness check compares an explicitly requested
+revision with itself. The authorized wrapper mitigates the latter's ordinary
+path. Primary implementations behind four full-only claims remained present
+byte-for-byte in candidate packets; their security implications are conditional
+or unresolved. Other claims remain explicitly unadjudicated. Finding counts
+therefore cannot establish defect recall or quality parity.
+
+The [paired report](runs/context-v8/paired/report.json) measures **2.8% fewer
+input tokens**, more output tokens, and no speed gain in these calls. Shared
+caching, concurrency and stochastic findings confound cost and latency. This
+round supports CPU feasibility, not improved review quality or meaningful
+end-to-end savings. Adding unresolved neighboring code alone did not solve the
+problem. The next representation needs typed policy consumers and propagation
+of identity/visibility, with abstention for missing relationships; it must be
+selected on development data and tested on new frozen snapshots.
+
+Replay the shipped classifier without a GPU or hosted model:
+
+```sh
+gzip -dc showcases/pr-triage/runs/context-v8/reserved-inputs.json.gz > /tmp/shoal-v8-inputs.json
+python showcases/pr-triage/context_classifier.py predict \
+  --inputs /tmp/shoal-v8-inputs.json \
+  --model showcases/pr-triage/runs/context-v8/training/model.json \
+  --selection showcases/pr-triage/runs/context-v8/selection.json \
+  --output /tmp/shoal-v8-predictions-new.json
+```
+
+Use the pinned CPU dependencies. All outputs retain `action: full_review`.
+
+## Earlier live shadow result
+
 The continued live shadow test does **not** support promoting the current
 candidate. On four pinned open PRs, it retained 79/86 frontier-assessed relevant
 functions (91.9%), below the provisional 95% research target. Seven misses

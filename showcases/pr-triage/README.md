@@ -4,12 +4,12 @@ This external showcase tests the local-decision architecture in
 [the design](../../docs/local-decisions.md). It preserves full review for every
 change. It does not implement a Shoal review feature or production decision API.
 
-The [continued model comparison](MODEL-FINDINGS.md) finds that the current
-adapted Laya candidate is **not ready for promotion**: on four open PRs it
-retained 79/86 frontier-assessed relevant functions (91.9%). Corrected paired
-reviews measured 5.9% fewer input tokens, with stochastic findings and cache
-confounding. Earlier reserved results were more favorable; all experiments,
-misses and provenance limitations remain visible. Full review is mandatory.
+The [continued model comparison](MODEL-FINDINGS.md) now includes ten supervised
+CPU classifier recipes. The selected model retained 27/28 frontier-assessed and
+24/25 Claude-assessed relevant functions on 194 reserved functions, but did not
+beat Laya's accuracy. Complete-PR paired reviews saved only 2.8% of input tokens.
+The runnable data-only model is cheap; practical review-efficiency improvement
+remains unproven. Full review is mandatory and PR #410 remains unmerged.
 
 The [first measured run](runs/pilot-v1/report.md) covers four historical PRs,
 selected by the frozen [protocol](protocol.json). Of 93 changed Go functions,
