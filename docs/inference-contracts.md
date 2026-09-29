@@ -168,3 +168,14 @@ Unauthorized and absent content therefore retain the reader's
 indistinguishable not-found behavior. The package contains no storage rows,
 Accumulo visibility expressions, credentials, raw grants, generated prose, or
 model/provider calls.
+
+## Proposed typed local decisions
+
+[Local decisions over a measurable operational picture](local-decisions.md)
+describes a proposed provider-neutral decision contract alongside grounded
+text generation, with Laya as the first local predictor. It separates graph
+snapshot identity, observation coverage/freshness, predictions, consumer actions,
+and attributed outcomes. The PR-triage workflow is an external agent showcase;
+it is not a peer-review feature in Shoal. See the accompanying
+[validation report](local-decisions-validation.md) for tested integration
+assumptions and remaining work.
