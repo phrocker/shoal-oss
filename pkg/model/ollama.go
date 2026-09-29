@@ -55,7 +55,6 @@ type OllamaGenerator struct {
 	endpoint            string
 	httpClientIdentity  string
 	cacheIdentityUnsafe bool
-	egresses            bool
 }
 
 type OllamaEmbedder struct {
@@ -63,7 +62,6 @@ type OllamaEmbedder struct {
 	endpoint            string
 	httpClientIdentity  string
 	cacheIdentityUnsafe bool
-	egresses            bool
 }
 
 func NewOllamaGenerator(cfg OllamaConfig) (*OllamaGenerator, error) {
@@ -78,7 +76,6 @@ func NewOllamaGenerator(cfg OllamaConfig) (*OllamaGenerator, error) {
 	return &OllamaGenerator{
 		cfg: cfg, endpoint: endpoint,
 		httpClientIdentity: httpIdentity, cacheIdentityUnsafe: !cacheable,
-		egresses: egressesForConfiguredURL(cfg.BaseURL),
 	}, nil
 }
 
@@ -94,7 +91,6 @@ func NewOllamaEmbedder(cfg OllamaConfig) (*OllamaEmbedder, error) {
 	return &OllamaEmbedder{
 		cfg: cfg, endpoint: endpoint,
 		httpClientIdentity: httpIdentity, cacheIdentityUnsafe: !cacheable,
-		egresses: egressesForConfiguredURL(cfg.BaseURL),
 	}, nil
 }
 
@@ -435,14 +431,3 @@ var (
 	_ Embedder                       = (*OllamaEmbedder)(nil)
 	_ EmbeddingSpaceIdentityProvider = (*OllamaEmbedder)(nil)
 )
-
-// EgressesOffHost reports whether this Ollama endpoint is remote. A loopback
-// Ollama is the common local-first deployment and transmits nothing; the same
-// code against a hosted endpoint transmits everything it is given.
-func (o *OllamaGenerator) EgressesOffHost() bool {
-	return o == nil || o.egresses
-}
-
-func (o *OllamaEmbedder) EgressesOffHost() bool {
-	return o == nil || o.egresses
-}
