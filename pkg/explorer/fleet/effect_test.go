@@ -62,16 +62,13 @@ func evidenceAction() []Capability {
 // Shoal runs evidence-only work and dispatches the rest. An action declaring an
 // external effect cannot resolve to an executor the host bound for evidence.
 func TestExternalEffectNeedsAnExternalCeiling(t *testing.T) {
-	if err := validateDeclaredEffects(
-		externalAction(), nil); err == nil {
+	if err := validateDeclaredEffects(externalAction(), nil, nil); err == nil {
 		t.Fatal("an external action must not register against an evidence executor")
 	}
-	if err := validateDeclaredEffects(
-		externalAction(), everyEffect()); err != nil {
+	if err := validateDeclaredEffects(externalAction(), nil, everyEffect()); err != nil {
 		t.Fatalf("an external ceiling must admit an external action: %v", err)
 	}
-	if err := validateDeclaredEffects(
-		evidenceAction(), nil); err != nil {
+	if err := validateDeclaredEffects(evidenceAction(), nil, nil); err != nil {
 		t.Fatalf("evidence work must run under an evidence ceiling: %v", err)
 	}
 }
@@ -86,8 +83,9 @@ func TestUndeclaredExecutorIsEvidenceOnly(t *testing.T) {
 	if got := executorCeiling(ceilingExecutor{ceiling: everyEffect()}); got.exceeds(everyEffect()) {
 		t.Fatalf("declared ceiling = %q", got)
 	}
-	if err := validateDeclaredEffects(
-		externalAction(), executorCeiling(unboundedExecutor{})); err == nil {
+	if err := validateDeclaredEffects(externalAction(),
+		executorFloor(unboundedExecutor{}),
+		executorCeiling(unboundedExecutor{})); err == nil {
 		t.Fatal("an undeclared executor must not admit external work")
 	}
 }
@@ -283,6 +281,83 @@ func TestUnknownEffectsFailClosedAtResolution(t *testing.T) {
 	}
 }
 
+// TestAnActionCannotUnderstateWhatItsExecutorAlwaysDoes is the acceptance
+// criterion a ceiling alone cannot satisfy: an action declaring no egress must
+// not resolve to an executor that transmits on every invocation.
+//
+// The ceiling is an upper bound, so subset semantics happily permit an action
+// to declare less than the truth. The result would be a descriptor that reads
+// as non-transmitting while every call transmits — and because egress leaves
+// no trace in Shoal's own record, that descriptor is the only place anyone
+// could have noticed.
+func TestAnActionCannotUnderstateWhatItsExecutorAlwaysDoes(t *testing.T) {
+	transmitting := flooredExecutor{
+		floor: Effects{EffectEgressesContent, EffectReadsCorpus},
+	}
+	readsOnly := []Capability{{Name: "explorer.reason", Actions: []Action{{
+		Name: "ask", Effects: Effects{EffectReadsCorpus},
+		InputSchema: anyObject, OutputSchema: anyObject,
+	}}}}
+
+	// The ceiling check alone permits this: {reads-corpus} is a subset.
+	if readsOnly[0].Actions[0].Effects.exceeds(transmitting.MaxEffects()) {
+		t.Fatal("this test assumes the ceiling check permits the understatement")
+	}
+	if err := validateDeclaredEffects(readsOnly,
+		executorFloor(transmitting), executorCeiling(transmitting)); err == nil {
+		t.Fatal("an action declaring no egress registered against an executor " +
+			"that transmits on every invocation")
+	}
+
+	// Declaring the truth is accepted.
+	honest := []Capability{{Name: "explorer.reason", Actions: []Action{{
+		Name: "ask", Effects: Effects{EffectEgressesContent, EffectReadsCorpus},
+		InputSchema: anyObject, OutputSchema: anyObject,
+	}}}}
+	if err := validateDeclaredEffects(honest,
+		executorFloor(transmitting), executorCeiling(transmitting)); err != nil {
+		t.Fatalf("an honest declaration was refused: %v", err)
+	}
+
+	// An executor declaring no floor imposes none. That is a deliberate
+	// default, documented at executorFloor: a host binding a general-purpose
+	// executor declares the widest thing it permits, and forcing every action
+	// to restate the whole ceiling would make the declaration carry nothing.
+	if err := validateDeclaredEffects(readsOnly,
+		executorFloor(ceilingExecutor{ceiling: everyEffect()}),
+		everyEffect()); err != nil {
+		t.Fatalf("a ceiling-only executor imposed a floor: %v", err)
+	}
+}
+
+// TestOmitsFailsClosedOnAnUnrecognizedFloor mirrors exceeds: a floor value
+// nobody recognizes cannot be satisfied by any declaration.
+func TestOmitsFailsClosedOnAnUnrecognizedFloor(t *testing.T) {
+	unknown := Effects{Effect("invented-by-a-tampered-record")}
+	if !everyEffect().omits(unknown) {
+		t.Fatal("an unrecognized floor was treated as satisfied")
+	}
+	// The case containment alone cannot catch: a declaration naming the same
+	// unrecognized value as the floor. Membership would report it satisfied,
+	// so only validating the floor's own values refuses it.
+	if !unknown.omits(unknown) {
+		t.Fatal("a declaration satisfied a floor by naming the same " +
+			"unrecognized class: containment cannot distinguish an agreed-upon " +
+			"unknown from a validated one")
+	}
+	if !Effects(nil).omits(Effects{EffectReadsCorpus}) {
+		t.Fatal("an empty declaration satisfied a non-empty floor")
+	}
+	if everyEffect().omits(nil) {
+		t.Fatal("an empty floor was treated as unsatisfiable")
+	}
+}
+
+type flooredExecutor struct{ floor Effects }
+
+func (e flooredExecutor) MaxEffects() Effects { return e.floor }
+func (e flooredExecutor) MinEffects() Effects { return e.floor }
+
 // TestEffectClassesDoNotOrder is why this is a set rather than a ladder.
 //
 // Writing a local file mutates without transmitting; streaming a compartmented
@@ -346,10 +421,10 @@ func TestUnknownEffectFromStorageIsRefusedAtRegistration(t *testing.T) {
 		Name: "ask", Effects: Effects{Effect("decoded-from-a-tampered-record")},
 		InputSchema: anyObject, OutputSchema: anyObject,
 	}}}}
-	if err := validateDeclaredEffects(unknownCapabilities, nil); err == nil {
+	if err := validateDeclaredEffects(unknownCapabilities, nil, nil); err == nil {
 		t.Fatal("an unknown declared effect must not register")
 	}
-	if err := validateDeclaredEffects(unknownCapabilities, everyEffect()); err == nil {
+	if err := validateDeclaredEffects(unknownCapabilities, nil, everyEffect()); err == nil {
 		t.Fatal("an unknown declared effect must not register even at the widest ceiling")
 	}
 	if capabilitiesSubset(unknownCapabilities, evidenceAction()) {
@@ -468,16 +543,41 @@ func TestResolveActionRefusesAfterARebindToANarrowerCeiling(t *testing.T) {
 	if tracked.calls != 0 {
 		t.Fatalf("executor was invoked %d times despite the refusal", tracked.calls)
 	}
+
+	// The floor is re-checked at resolution for the same reason, and it is the
+	// direction registration cannot have caught: rebinding to an executor that
+	// now transmits on every invocation leaves a live descriptor whose
+	// declaration understates what running it does. Its ceiling is wide enough
+	// to keep the action within bounds, so only the floor refuses it.
+	widened := &countingActionExecutor{
+		ceiling: everyEffect(),
+		floor:   Effects{EffectEgressesContent},
+	}
+	executors["exec"] = widened
+
+	_, _, _, err = service.resolveAction(
+		ctx, decision, descriptor.ID, descriptor.Generation,
+		"search", "query", []byte("source-a"), []byte("policy"), "object",
+		auth.OperationInvoke, now)
+	if err == nil {
+		t.Fatal("resolution succeeded against an executor that now transmits " +
+			"on every invocation, under a descriptor declaring no egress")
+	}
+	if widened.calls != 0 {
+		t.Fatalf("executor was invoked %d times despite the refusal", widened.calls)
+	}
 }
 
 // countingActionExecutor implements execution and records whether it ran, so a
 // refusal can be distinguished from a silent success.
 type countingActionExecutor struct {
 	ceiling Effects
+	floor   Effects
 	calls   int
 }
 
 func (e *countingActionExecutor) MaxEffects() Effects { return e.ceiling }
+func (e *countingActionExecutor) MinEffects() Effects { return e.floor }
 
 func (e *countingActionExecutor) Execute(
 	context.Context, Invocation,

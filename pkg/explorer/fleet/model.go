@@ -345,12 +345,81 @@ type EffectBounded interface {
 	MaxEffects() Effects
 }
 
+// EffectFloored is an executor's declaration of what invoking it causes
+// *regardless of the action*, and it exists because a ceiling alone cannot
+// express that.
+//
+// A ceiling is an upper bound, so subset semantics permit an action to declare
+// less than the truth. A reasoning executor configured against a hosted model
+// transmits corpus content on every invocation, but an action declaring only
+// {EffectReadsCorpus} is a subset of its ceiling and resolves happily — leaving
+// a descriptor that reads as non-transmitting while every call transmits. That
+// is the wrong direction to be wrong in, because egress leaves no trace in
+// Shoal's own record for anyone to reconcile against later.
+//
+// An executor implementing this requires every action resolving to it to
+// declare at least these classes.
+type EffectFloored interface {
+	MinEffects() Effects
+}
+
 // executorCeiling reports the effect classes an executor may serve.
 func executorCeiling(executor Executor) Effects {
 	if bounded, ok := executor.(EffectBounded); ok {
 		return bounded.MaxEffects()
 	}
 	return nil
+}
+
+// executorFloor reports the effect classes invoking an executor always causes.
+//
+// The default is the empty set, not the ceiling. Defaulting to the ceiling
+// would be the more suspicious reading, but it would also be wrong for the
+// common case: a host binds a general-purpose external executor and declares
+// the widest thing it permits, while individual actions legitimately do less.
+// Forcing every action to restate the whole ceiling would make the declaration
+// carry no information at all.
+//
+// So this is a declaration seam like the ceiling, and it has the same limit: an
+// executor that transmits and declares no floor is a host misdescribing its own
+// configuration, which no invariant here can detect. What it does close is the
+// case where Shoal itself knows better — AskExecutor derives both bounds from
+// the provider it was configured with, so it cannot be bound as transmitting
+// and then have a non-transmitting action resolve to it.
+func executorFloor(executor Executor) Effects {
+	if floored, ok := executor.(EffectFloored); ok {
+		return floored.MinEffects()
+	}
+	return nil
+}
+
+// omits reports whether this declaration leaves out anything a floor requires.
+//
+// It is the mirror of exceeds and fails closed the same way: an unrecognised
+// value in the floor cannot be matched by any valid declaration, so it refuses.
+// missingFrom lists the floor classes this declaration leaves out, for an
+// error message that tells a registrant what to add.
+func (e Effects) missingFrom(floor Effects) []string {
+	var missing []string
+	for _, required := range floor {
+		if required.validate() != nil || !e.contains(required) {
+			missing = append(missing, string(required))
+		}
+	}
+	sort.Strings(missing)
+	return missing
+}
+
+func (e Effects) omits(floor Effects) bool {
+	for _, required := range floor {
+		if required.validate() != nil {
+			return true
+		}
+		if !e.contains(required) {
+			return true
+		}
+	}
+	return false
 }
 
 type ExecutorRegistry interface {

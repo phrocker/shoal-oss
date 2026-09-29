@@ -85,6 +85,22 @@ func TestAskExecutorCeilingFollowsTheConfiguredProvider(t *testing.T) {
 				t.Fatalf("%s: ceiling = %v, want %v", probe.name, got, probe.want)
 			}
 		}
+		// The floor equals the ceiling. For this executor the bound is not a
+		// permission envelope, it is a description: every invocation reads the
+		// corpus, and every invocation against a hosted provider transmits what
+		// it read. Declaring only the ceiling would let an action declare less
+		// than the truth and still resolve.
+		floor := executor.MinEffects()
+		if len(floor) != len(got) {
+			t.Fatalf("%s: floor = %v, ceiling = %v; they must match",
+				probe.name, floor, got)
+		}
+		for i := range floor {
+			if floor[i] != got[i] {
+				t.Fatalf("%s: floor = %v, ceiling = %v; they must match",
+					probe.name, floor, got)
+			}
+		}
 		// It never declares external mutation, whatever the provider: declaring
 		// it would raise the ceiling enough for genuinely external actions to
 		// resolve here.

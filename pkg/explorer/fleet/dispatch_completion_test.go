@@ -391,20 +391,24 @@ func (remoteOnlyExecutor) MaxEffects() Effects {
 	return Effects{EffectMutatesExternal}
 }
 
-// TestClaimMarksAnExternalEffectPossibleBeforeItHappens is the decision #384
-// asked for. A remote worker owns the window between claiming and acting. If it
+// TestClaimMarksAnUnrecoverableEffectPossibleBeforeItHappens is the decision
+// #384 asked for. A remote worker owns the window between claiming and acting. If it
 // then goes silent, the record must not say the effect certainly did not
 // happen — otherwise an expired lease after the work was done is
 // indistinguishable from one that expired before it started.
-func TestClaimMarksAnExternalEffectPossibleBeforeItHappens(t *testing.T) {
+func TestClaimMarksAnUnrecoverableEffectPossibleBeforeItHappens(t *testing.T) {
 	for _, probe := range []struct {
 		name    string
 		effects Effects
 		want    bool
 	}{
 		{"external mutation", Effects{EffectMutatesExternal}, true},
+		// Egress counts as much as mutation here. A worker can transmit and
+		// then go silent, and content that left the host cannot be recalled,
+		// so a record asserting no effect was possible would assert the one
+		// thing nobody knows.
+		{"egresses but does not mutate", Effects{EffectEgressesContent}, true},
 		{"reads corpus only", Effects{EffectReadsCorpus}, false},
-		{"egresses but does not mutate", Effects{EffectEgressesContent}, false},
 		{"declares nothing", nil, false},
 	} {
 		t.Run(probe.name, func(t *testing.T) {

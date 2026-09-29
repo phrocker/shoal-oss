@@ -219,13 +219,44 @@ func (e *AskExecutor) Action() string     { return e.action }
 // Shoal, and declaring it would raise the ceiling enough for genuinely
 // external actions to resolve here.
 func (e *AskExecutor) MaxEffects() fleet.Effects {
-	if e == nil || model.EgressesOffHost(e.provider) {
+	if e == nil {
+		return AskActionEffects(nil)
+	}
+	return AskActionEffects(e.provider)
+}
+
+// AskActionEffects is the effect set a descriptor must register for this
+// action against the given provider.
+//
+// It is exported for the same reason AskActionInputSchema is: registration and
+// execution must not drift apart. A registrant cannot guess this — the answer
+// depends on where the operator pointed the model provider, not on the action
+// — and a descriptor that guesses low is refused at registration rather than
+// silently accepted.
+//
+// A nil provider is not "no egress". There is no configured provider to reason
+// about, so it reports the wider set; the executor cannot run without one
+// anyway.
+func AskActionEffects(provider AskProvider) fleet.Effects {
+	if provider == nil || model.EgressesOffHost(provider) {
 		return fleet.Effects{
 			fleet.EffectEgressesContent, fleet.EffectReadsCorpus,
 		}
 	}
 	return fleet.Effects{fleet.EffectReadsCorpus}
 }
+
+// MinEffects is the same set, because for this executor the ceiling is not a
+// permission envelope — it is a description. Every invocation reads the corpus,
+// and every invocation against a hosted provider transmits what it read.
+//
+// Declaring only the ceiling would leave the gap that a ceiling cannot close:
+// subset semantics permit an action to declare less than the truth, so an
+// action declaring only {EffectReadsCorpus} would resolve to a transmitting
+// executor and leave a descriptor that reads as non-transmitting while every
+// call transmits. Egress leaves no trace in Shoal's own record, so that
+// descriptor would be the only place anyone could have noticed.
+func (e *AskExecutor) MinEffects() fleet.Effects { return e.MaxEffects() }
 
 // AskActionInputSchema is the declarative schema a descriptor must register
 // for this action. Registering it from here keeps admission and execution from

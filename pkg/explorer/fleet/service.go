@@ -25,6 +25,7 @@ import (
 	"hash"
 	"math"
 	"reflect"
+	"strings"
 	"time"
 
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
@@ -114,10 +115,10 @@ func (s *Service) Register(ctx context.Context, request RegisterRequest) (Descri
 	}
 	// Refuse a descriptor that could never run within its own declaration.
 	// Catching it here rather than at invoke means an agent claiming an
-	// external effect against an evidence-only executor never becomes
+	// a declaration that does not match its executor's binding never becomes
 	// registered state that looks operable.
-	if err := validateDeclaredEffects(
-		spec.Capabilities, executorCeiling(executor)); err != nil {
+	if err := validateDeclaredEffects(spec.Capabilities,
+		executorFloor(executor), executorCeiling(executor)); err != nil {
 		return Descriptor{}, err
 	}
 	if spec.ParentID != "" {
@@ -704,17 +705,37 @@ func authorizeDescriptor(decision auth.Decision, operation auth.Operation, descr
 		descriptor.AuthorizationDomain, descriptor.Scopes, now)
 }
 
-// validateDeclaredEffects refuses any action whose declared effect exceeds
-// what the host permits its bound executor to do.
-func validateDeclaredEffects(capabilities []Capability, ceiling Effects) error {
+// validateDeclaredEffects refuses any action whose declaration does not sit
+// between what its bound executor always does and what the host permits it to
+// do.
+//
+// Both directions matter and they fail for opposite reasons. Exceeding the
+// ceiling asks for authority the host did not grant. Omitting the floor
+// understates what will happen — a descriptor that reads as non-transmitting
+// while every invocation transmits — and that is the worse direction for
+// egress, which leaves no trace in Shoal's own record to reconcile against.
+func validateDeclaredEffects(capabilities []Capability, floor, ceiling Effects) error {
 	for _, capability := range capabilities {
 		for _, action := range capability.Actions {
 			if action.Effects.exceeds(ceiling) {
 				return shoal.NewError(
 					shoal.ErrorInvalidArgument,
-					"action declares an external effect but its executor is "+
-						"bound for evidence-only work; external effects are "+
-						"dispatched, not performed in process")
+					"action declares effects its executor is not bound to "+
+						"perform; effects beyond the binding are dispatched, "+
+						"not performed in process")
+			}
+			if missing := action.Effects.missingFrom(floor); len(missing) > 0 {
+				// The missing classes are named. They are host configuration,
+				// not another principal's data, so this discloses nothing — and
+				// a registrant cannot guess them, because they depend on how
+				// the operator configured the executor rather than on the
+				// action. Refusing without saying what is missing would make a
+				// correct registration a guessing game.
+				return shoal.NewError(
+					shoal.ErrorInvalidArgument,
+					"action omits effects its executor causes on every "+
+						"invocation ("+strings.Join(missing, ", ")+"); the "+
+						"declaration must not understate what running it does")
 			}
 		}
 	}
