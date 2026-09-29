@@ -1822,8 +1822,18 @@ func TestBackendAbortBoundsStalledCompleteAndCleansUpTemp(t *testing.T) {
 	}
 	start := time.Now()
 	err = w.(storage.Aborter).Abort()
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("Abort error = %v, want context deadline exceeded", err)
+	// The invariant is the bound below: Abort gives up on a stalled complete
+	// instead of blocking on it. Which context error carries that up is a race
+	// the test must not adjudicate — Abort cancels its own work to stop the
+	// stall, and the caller's deadline is running at the same time, so either
+	// can be the one observed. Asserting DeadlineExceeded specifically made a
+	// real invariant depend on which of the two won inside a 25ms budget, and
+	// it lost that race on CI (#411) while passing hundreds of local runs.
+	//
+	// What must hold is that Abort failed because the caller's context ended,
+	// by whichever route.
+	if !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled) {
+		t.Fatalf("Abort error = %v, want the caller's context to have ended", err)
 	}
 	if elapsed := time.Since(start); elapsed > time.Second {
 		t.Fatalf("Abort took %v; want bounded stalled complete failure", elapsed)
