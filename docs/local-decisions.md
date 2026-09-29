@@ -460,6 +460,23 @@ or Go parser/type-checker packages.
 ## Validation and tracking
 
 See [local validation](local-decisions-validation.md) for pinned upstream source,
-runtime/model identities, exact checks, results, and limitations. Issue links will
-be populated after adversarial review of this architecture. No issue is closed by
-this design note or by the runtime smoke test.
+runtime/model identities, exact checks, results, and limitations.
+
+Roadmap: [#401](https://github.com/phrocker/shoal-oss/issues/401). Architecture and probe: [draft PR #400](https://github.com/phrocker/shoal-oss/pull/400).
+
+| Issue | Deliverable | Implementation dependencies |
+| --- | --- | --- |
+| [#402](https://github.com/phrocker/shoal-oss/issues/402) | Typed tasks and measurable picture manifests | — |
+| [#403](https://github.com/phrocker/shoal-oss/issues/403) | Authorized durable predictions and outcomes | [#402](https://github.com/phrocker/shoal-oss/issues/402) |
+| [#404](https://github.com/phrocker/shoal-oss/issues/404) | Pinned local Laya adapter | [#402](https://github.com/phrocker/shoal-oss/issues/402) |
+| [#405](https://github.com/phrocker/shoal-oss/issues/405) | Dataset snapshots and temporal replay | [#402](https://github.com/phrocker/shoal-oss/issues/402), [#403](https://github.com/phrocker/shoal-oss/issues/403) |
+| [#406](https://github.com/phrocker/shoal-oss/issues/406) | Calibration, fine-tuning, promotion, rollback | [#404](https://github.com/phrocker/shoal-oss/issues/404), [#405](https://github.com/phrocker/shoal-oss/issues/405) |
+| [#407](https://github.com/phrocker/shoal-oss/issues/407) | External GitHub/Go evidence collector | [#402](https://github.com/phrocker/shoal-oss/issues/402) |
+| [#408](https://github.com/phrocker/shoal-oss/issues/408) | External adversarial adjudication agents | [#407](https://github.com/phrocker/shoal-oss/issues/407), [#403](https://github.com/phrocker/shoal-oss/issues/403) |
+| [#409](https://github.com/phrocker/shoal-oss/issues/409) | Shadow evaluation and later exclusion gate | [#404](https://github.com/phrocker/shoal-oss/issues/404), [#405](https://github.com/phrocker/shoal-oss/issues/405), [#407](https://github.com/phrocker/shoal-oss/issues/407), [#408](https://github.com/phrocker/shoal-oss/issues/408) |
+
+Laya serving also composes with the durable receipt issue. Calibration/training
+follows the first measured shadow baseline; it does not block that first slice.
+All implementation issues remain open. This design note and runtime smoke test
+close none of them.
+
