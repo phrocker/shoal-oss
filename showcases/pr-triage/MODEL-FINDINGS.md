@@ -1,12 +1,101 @@
 # Local authorization decision models: measured findings
 
-Laya now has a credible **shadow candidate**: low-rank encoder adaptation
-retained 33/34 adjudicated relevant functions on a new 189-function sample,
-while proposing 19.1% of function-diff bytes for reduced review. This is a
-retrospective relevance result, not verified defect recall or permission to
-exclude source. Full review remains mandatory.
+The continued live shadow test does **not** support promoting the current
+candidate. On four pinned open PRs, it retained 79/86 frontier-assessed relevant
+functions (91.9%), below the provisional 95% research target. Seven misses
+survived targeted source-based reconsideration. Full review remains mandatory;
+PR #410 remains unmerged.
 
-## Latest result: adapted Laya on changed-code evidence
+## Continued shadow: existing open PRs and actual paired reviews
+
+The frozen checkpoint and threshold scored every changed function in open PRs
+#399, #361, #360 and #357: 153 functions, with 32 proposed reductions. This is an
+existing-open-PR snapshot, not prospective data created after registration.
+The [protocol](experiments/live-v6.json) selects all open PRs except this
+experiment. Exact rendered diff states have no collisions with development or
+V5; shared code families and other correlations remain possible.
+
+The [blinded reference](runs/live-v6/frontier.json) and
+[comparison](runs/live-v6/frontier-report.json) identify seven lowered relevant
+functions: the bound admission `Outstanding`, `Report` and `requestContext`
+methods, admission request decoding, embedded lease `AdvanceEpoch` and
+`Release`, and the corrupt-manifest fail-closed test. The
+[targeted reconsideration](runs/live-v6/miss-adjudication.json) preserves all
+seven, with pinned callers and counterarguments. It is the same assessor
+reconsidering selected misses, not an independent defect oracle or a complete
+new adjudication.
+
+Two independent, tool-free Claude calls per PR compared full and candidate
+packets. The first construction was flawed: shared file patches retained 31/32
+nominally omitted function bodies. Its 6.1% input-token reduction mostly
+measured duplicate removal. Historical prompts, responses, differing hash
+conventions and the [audit](runs/live-v6/code-audit.json) remain intact.
+
+The corrected comparison uses complete before/after changed declarations and
+source-span separation from shared file context. An
+[omission audit](runs/live-v6/paired-v2/omission-audit.json) verifies none of the
+32 omitted complete bodies remain. Non-function context stays in both arms;
+initializer ordering and rename evidence retain full fallback patches.
+
+| Corrected paired calls | Full evidence | Candidate evidence |
+| --- | ---: | ---: |
+| Input tokens, including cache reads/writes | 249,461 | 234,798 |
+| Output tokens | 12,902 | 10,233 |
+| Sum of call duration | 140.8 s | 111.7 s |
+| Reported API cost | $2.1864 | $1.9935 |
+
+The measured input reduction is **5.9%**, not the earlier 19.1% function-diff
+byte estimate. These four pairs are one stochastic call per arm, with shared
+provider caches and concurrent execution. Output, duration and cost differences
+cannot be attributed solely to source reduction. The identical doc-only
+control prompts also produce different responses and costs. Actual returned
+model identities and full usage are preserved in the
+[paired report](runs/live-v6/paired-v2/report.json).
+
+The [source adjudication](runs/live-v6/paired-v2/adjudication.json) supports
+three manifestations in PR #399: concurrent differing admission reports can be
+falsely acknowledged through terminal replay; generic dispatch routes bypass
+admission lifecycle checks; and admission APIs expose ordinary same-principal
+dispatch claims. The full arm surfaced all three, while the candidate arm
+surfaced only the generic-route bypass. These share underlying lifecycle/type
+confusion and are not three independent proven vulnerabilities. Core implicated
+service code was present identically in both packets, so the difference cannot
+be causally attributed to the 32 omissions. Static source adjudication does not
+substitute for exploit or concurrency reproduction. Earlier cursor/existence
+oracle claims were pre-existing, and the reported Open cleanup leak was refuted.
+
+Paired packet construction uses an explicit one-million-byte prompt bound,
+separate from the original collector's 120,000-byte whole-diff packet bound.
+Every declaration and context source remains pinned. Hardened replay enforces
+frozen selection consistency, preserves pure renames, rejects undecodable paths,
+and hashes raw prompt bytes. The [hardening receipt](runs/live-v6/paired-v2/hardening-audit.json)
+records byte-identical prompts for this cohort after those repairs.
+
+Rebuild packets and regenerate the corrected report (use new output paths):
+
+```sh
+python showcases/pr-triage/paired_review.py \
+  --repo . --extractor /tmp/shoal-shadow-extract \
+  --manifest showcases/pr-triage/runs/live-v6/manifest.json \
+  --predictions showcases/pr-triage/runs/live-v6/predictions.json \
+  --selection showcases/pr-triage/runs/live-v6/selection.json \
+  --output /tmp/shoal-paired-new
+python showcases/pr-triage/paired_report.py \
+  --run showcases/pr-triage/runs/live-v6/paired-v2 \
+  --output /tmp/shoal-paired-report-new.json
+```
+
+The new run therefore fails the relevance gate and has only modest measured
+input reduction. Do not describe it as established review-cost viability.
+The next candidate needs causal caller/policy-consumer evidence, especially
+for small identity-binding and authority-lifecycle helpers, plus explicit
+abstention when that evidence is missing. Keep model and threshold selection
+separate from new evaluation data. A
+[prospective protocol](experiments/prospective-v7.json) is registered for ten
+subsequently observed eligible snapshots; no persistent polling service has
+been installed and no future results are claimed.
+
+## Earlier reserved result: adapted Laya on changed-code evidence
 
 The frozen candidate uses the pinned English checkpoint with rank-8,
 alpha-16 encoder adapters and a trained decision head. Base encoder weights

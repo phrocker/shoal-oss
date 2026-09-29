@@ -86,6 +86,26 @@ class ShadowTest(unittest.TestCase):
             self.assertEqual(case['units'][0]['symbol'],'file_path')
             self.assertEqual(case['review_packet']['disposition'],'non_utf8_patch')
             self.assertEqual(len(case['files']),3)
+    def test_pinned_snapshot_uses_explicit_base_not_first_parent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);extractor=root/'extract';extractor.write_bytes(b'fixture')
+            head='a'*40;base='b'*40
+            protocol={'source_anchor':head,'snapshots':[{'pr':9,'head':head,'base':base}],
+                      'cohort_size':1,'mode':'existing_open_pr_shadow',
+                      'limits':{'max_files_per_pr':100,'max_review_packet_bytes':1000},'context_limitations':'fixture'}
+            path=root/'protocol.json';path.write_text(json.dumps(protocol))
+            calls=[]
+            def git(repo,*args):
+                calls.append(args)
+                if args[0]=='rev-parse':return args[-1].split('^')[0].encode()+b'\n'
+                if args[0]=='diff':return b''
+                raise AssertionError(args)
+            with patch.object(shadow,'git',side_effect=git):
+                shadow.collect(SimpleNamespace(protocol=path,output=root/'run',repo=root,extractor=extractor))
+            case=json.loads((root/'run/manifest.json').read_text())['cases'][0]
+            self.assertEqual(case['base'],base);self.assertEqual(case['head'],head)
+            self.assertTrue(all(base in call and head in call for call in calls if call[0]=='diff'))
+
     def test_rounding_accepted_invalid_mass_and_nan_rejected(self):
         def response(probs):return {'answers':{'boundary':{'type':'choice','choice':'a','probabilities':probs}}}
         self.assertEqual(shadow.validate_answer(response({'a':.3333,'b':.3333,'c':.3333}),{'a':1,'b':2,'c':3})['choice'],'a')

@@ -4,13 +4,12 @@ This external showcase tests the local-decision architecture in
 [the design](../../docs/local-decisions.md). It preserves full review for every
 change. It does not implement a Shoal review feature or production decision API.
 
-The [follow-up model comparison](MODEL-FINDINGS.md) now identifies an adapted
-Laya shadow candidate: 33/34 adjudicated relevant functions retained on a
-separately reserved 189-function sample, with 19.1% of function-diff bytes
-proposed for reduced review. The known identity-configuration miss and reviewer
-dissent remain explicit. Full review is mandatory. The findings include a
-local checkpoint, replay commands, independent assessments, failed candidates,
-code-volume measurements and limitations.
+The [continued model comparison](MODEL-FINDINGS.md) finds that the current
+adapted Laya candidate is **not ready for promotion**: on four open PRs it
+retained 79/86 frontier-assessed relevant functions (91.9%). Corrected paired
+reviews measured 5.9% fewer input tokens, with stochastic findings and cache
+confounding. Earlier reserved results were more favorable; all experiments,
+misses and provenance limitations remain visible. Full review is mandatory.
 
 The [first measured run](runs/pilot-v1/report.md) covers four historical PRs,
 selected by the frozen [protocol](protocol.json). Of 93 changed Go functions,

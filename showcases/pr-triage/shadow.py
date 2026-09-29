@@ -150,23 +150,36 @@ def collect(args):
     if not re.fullmatch(r"[0-9a-f]{7,40}", anchor):
         raise ValueError("source anchor must be a commit hash")
     resolved = git(args.repo, "rev-parse", "--verify", anchor + "^{commit}").decode().strip()
-    commits = git(args.repo, "log", resolved, "--first-parent", "--format=%H%x09%s", "-40").decode().splitlines()
     selected = []
-    for row in commits:
-        sha, title = row.split("\t", 1)
-        match = re.search(r"\(#(\d+)\)$", title)
-        if match:
-            selected.append((sha, int(match.group(1))))
-        if len(selected) == protocol["cohort_size"]:
-            break
+    if "snapshots" in protocol:
+        for snapshot in protocol["snapshots"]:
+            if not isinstance(snapshot["pr"], int) or snapshot["pr"] <= 0:
+                raise ValueError("invalid PR number")
+            revisions = []
+            for field in ("head", "base"):
+                revision = snapshot[field]
+                if not re.fullmatch(r"[0-9a-f]{40}", revision):
+                    raise ValueError("snapshot revisions must be full commit hashes")
+                revisions.append(git(args.repo, "rev-parse", "--verify", revision + "^{commit}").decode().strip())
+            selected.append((revisions[0], snapshot["pr"], revisions[1]))
+        if len({pr for _, pr, _ in selected}) != len(selected):
+            raise ValueError("duplicate PR snapshot")
+    else:
+        commits = git(args.repo, "log", resolved, "--first-parent", "--format=%H%x09%s", "-40").decode().splitlines()
+        for row in commits:
+            sha, title = row.split("\t", 1)
+            match = re.search(r"\(#(\d+)\)$", title)
+            if match:
+                selected.append((sha, int(match.group(1)), git(args.repo, "rev-parse", sha + "^").decode().strip()))
+            if len(selected) == protocol["cohort_size"]:
+                break
     if len(selected) != protocol["cohort_size"]:
-        raise ValueError("insufficient merged PRs at anchor")
+        raise ValueError("cohort size mismatch")
     args.output.mkdir(parents=True)
     (args.output / "review-packets").mkdir()
     write_new(args.output / "protocol.json", protocol)
     cases = []
-    for head, pr in selected:
-        base = git(args.repo, "rev-parse", head + "^").decode().strip()
+    for head, pr, base in selected:
         paths = changed_paths(git(args.repo, "diff", "--no-ext-diff", "--name-status", "-z", "-M", base, head))
         case = {"pr": pr, "base": base, "head": head, "files": [], "units": []}
         for index, item in enumerate(paths):
