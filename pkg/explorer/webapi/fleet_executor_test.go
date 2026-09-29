@@ -38,6 +38,72 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
+// TestAskExecutorCeilingFollowsTheConfiguredProvider is the acceptance
+// criterion #385 exists for: the same executor's ceiling differs between a
+// loopback provider and a hosted one, because egress is configuration rather
+// than code.
+//
+// Before this, the executor declared nothing at all — the two-class taxonomy
+// split on mutation and could not express transmission, so no honest
+// declaration existed. Handing corpus passages to a hosted model was classified
+// as the most benign thing available.
+func TestAskExecutorCeilingFollowsTheConfiguredProvider(t *testing.T) {
+	for _, probe := range []struct {
+		name     string
+		provider AskProvider
+		want     fleet.Effects
+	}{
+		{
+			"loopback provider transmits nothing",
+			&stubAskProvider{egresses: false},
+			fleet.Effects{fleet.EffectReadsCorpus},
+		},
+		{
+			"hosted provider transmits corpus content",
+			&stubAskProvider{egresses: true},
+			fleet.Effects{fleet.EffectEgressesContent, fleet.EffectReadsCorpus},
+		},
+		{
+			// Silence is not evidence that content stays put.
+			"a provider that cannot classify itself",
+			unclassifiableAskProvider{},
+			fleet.Effects{fleet.EffectEgressesContent, fleet.EffectReadsCorpus},
+		},
+	} {
+		executor, err := NewAskExecutor(AskExecutorConfig{
+			Provider: probe.provider, Capability: "explorer.reason", Action: "ask",
+		})
+		if err != nil {
+			t.Fatalf("%s: %v", probe.name, err)
+		}
+		got := executor.MaxEffects()
+		if len(got) != len(probe.want) {
+			t.Fatalf("%s: ceiling = %v, want %v", probe.name, got, probe.want)
+		}
+		for i := range got {
+			if got[i] != probe.want[i] {
+				t.Fatalf("%s: ceiling = %v, want %v", probe.name, got, probe.want)
+			}
+		}
+		// It never declares external mutation, whatever the provider: declaring
+		// it would raise the ceiling enough for genuinely external actions to
+		// resolve here.
+		for _, effect := range got {
+			if effect == fleet.EffectMutatesExternal {
+				t.Fatalf("%s: the reasoning executor declared external mutation", probe.name)
+			}
+		}
+	}
+}
+
+// unclassifiableAskProvider implements no egress reporting, so it is the
+// fail-closed case.
+type unclassifiableAskProvider struct{}
+
+func (unclassifiableAskProvider) Ask(context.Context, AskRequest) (CitationEnvelope, error) {
+	return CitationEnvelope{}, nil
+}
+
 // stubAskProvider stands in for the authorized reasoning service so the
 // executor's own translation and guard behavior can be exercised in isolation.
 // The end-to-end acceptance test in cmd/shoal-explore-web uses the real
@@ -47,7 +113,12 @@ type stubAskProvider struct {
 	err      error
 	calls    int
 	last     AskRequest
+	egresses bool
 }
+
+// EgressesOffHost makes this stub classifiable, the way ChatService is through
+// its configured generator.
+func (p *stubAskProvider) EgressesOffHost() bool { return p.egresses }
 
 func (p *stubAskProvider) Ask(
 	_ context.Context, request AskRequest,

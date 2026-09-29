@@ -40,12 +40,21 @@ import (
 const (
 	Table          = "_shoal_explorer_fleet"
 	agentKind byte = 'A'
-	// codecVersion 2 adds the action effect class. Version 1 records predate
-	// it and decode as fleet.EffectEvidence, which is the zero value and the
-	// meaning they were written with, so an existing corpus keeps working
-	// without a migration.
-	codecVersion       uint16 = 2
-	codecVersionEffect uint16 = 2
+	// codecVersion 3 makes the action effect a set.
+	//
+	// Version 1 records predate the field entirely and decode as the empty set,
+	// which is the zero value and the meaning they were written with. Version 2
+	// records hold a single class string, which maps to a one-element set (or
+	// the empty set for the old evidence zero value). Both keep their meaning
+	// without a migration pass, and the digest encoding is pinned so they keep
+	// their mutation identity too — see fleet.Effects.digestBytes.
+	codecVersion        uint16 = 3
+	codecVersionEffect  uint16 = 2
+	codecVersionEffects uint16 = 3
+	// maxEncodedEffects bounds the decoded set. The taxonomy has three classes,
+	// so anything larger is a malformed or hostile record rather than a
+	// declaration, and it must not be able to allocate freely.
+	maxEncodedEffects uint32 = 16
 )
 
 var (
@@ -386,7 +395,10 @@ func encodeDescriptor(
 		writeU32(&buffer, uint32(len(capability.Actions)))
 		for _, action := range capability.Actions {
 			writeString(&buffer, action.Name)
-			writeString(&buffer, string(action.Effect))
+			writeU32(&buffer, uint32(len(action.Effects)))
+			for _, effect := range action.Effects {
+				writeString(&buffer, string(effect))
+			}
 			writeBytes(&buffer, action.InputSchema)
 			writeBytes(&buffer, action.OutputSchema)
 		}
@@ -408,11 +420,11 @@ func decodeDescriptor(value []byte) (
 ) {
 	reader := bytes.NewReader(value)
 	version, err := readU16(reader)
-	// Both versions are accepted on read. A version-1 record was written
-	// before the effect class existed and carries no field for it, so it
-	// decodes with the zero value, which is the meaning it was written with.
-	// Only version 2 is written.
-	if err != nil || (version != 1 && version != codecVersion) {
+	// Every shipped version is accepted, not just the current one: a record
+	// written by an older build must keep decoding, and each version's effect
+	// encoding is handled explicitly below.
+	if err != nil || (version != 1 && version != codecVersionEffect &&
+		version != codecVersion) {
 		return fleet.Descriptor{}, [sha256.Size]byte{},
 			errors.New("unknown descriptor encoding")
 	}
@@ -478,12 +490,41 @@ func decodeDescriptor(value []byte) (
 			if action.Name, err = readString(reader, fleet.MaxNameBytes); err != nil {
 				return fleet.Descriptor{}, [sha256.Size]byte{}, err
 			}
-			if version >= codecVersionEffect {
+			switch {
+			case version >= codecVersionEffects:
+				count, countErr := readU32(reader)
+				if countErr != nil {
+					return fleet.Descriptor{}, [sha256.Size]byte{}, countErr
+				}
+				if count > maxEncodedEffects {
+					return fleet.Descriptor{}, [sha256.Size]byte{}, shoal.NewError(
+						shoal.ErrorInvalidArgument,
+						"fleet record declares more effects than the taxonomy has")
+				}
+				if count > 0 {
+					action.Effects = make(fleet.Effects, count)
+					for k := range action.Effects {
+						effect, effectErr := readString(reader, fleet.MaxNameBytes)
+						if effectErr != nil {
+							return fleet.Descriptor{}, [sha256.Size]byte{}, effectErr
+						}
+						action.Effects[k] = fleet.Effect(effect)
+					}
+				}
+			case version >= codecVersionEffect:
+				// A version 2 record holds one class string. The empty string
+				// was the old evidence zero value and means the empty set; any
+				// other value becomes a one-element set. The external class
+				// kept its wire string across the change, so an external
+				// action decodes to exactly {EffectMutatesExternal} and keeps
+				// both its meaning and its digest.
 				effect, effectErr := readString(reader, fleet.MaxNameBytes)
 				if effectErr != nil {
 					return fleet.Descriptor{}, [sha256.Size]byte{}, effectErr
 				}
-				action.Effect = fleet.Effect(effect)
+				if effect != "" {
+					action.Effects = fleet.Effects{fleet.Effect(effect)}
+				}
 			}
 			if action.InputSchema, err = readBytes(reader, fleet.MaxSchemaBytes); err != nil {
 				return fleet.Descriptor{}, [sha256.Size]byte{}, err

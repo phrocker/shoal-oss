@@ -32,15 +32,22 @@ import (
 
 var anyObject = json.RawMessage(`{"type":"object"}`)
 
-type ceilingExecutor struct{ ceiling Effect }
+type ceilingExecutor struct{ ceiling Effects }
 
-func (e ceilingExecutor) MaxEffect() Effect { return e.ceiling }
+func (e ceilingExecutor) MaxEffects() Effects { return e.ceiling }
 
 type unboundedExecutor struct{}
 
+// everyEffect is the widest ceiling a host can declare.
+func everyEffect() Effects {
+	return Effects{
+		EffectEgressesContent, EffectMutatesExternal, EffectReadsCorpus,
+	}
+}
+
 func externalAction() []Capability {
 	return []Capability{{Name: "deploy", Actions: []Action{{
-		Name: "ship", Effect: EffectExternal,
+		Name: "ship", Effects: Effects{EffectMutatesExternal},
 		InputSchema: anyObject, OutputSchema: anyObject,
 	}}}}
 }
@@ -56,15 +63,15 @@ func evidenceAction() []Capability {
 // external effect cannot resolve to an executor the host bound for evidence.
 func TestExternalEffectNeedsAnExternalCeiling(t *testing.T) {
 	if err := validateDeclaredEffects(
-		externalAction(), EffectEvidence); err == nil {
+		externalAction(), nil); err == nil {
 		t.Fatal("an external action must not register against an evidence executor")
 	}
 	if err := validateDeclaredEffects(
-		externalAction(), EffectExternal); err != nil {
+		externalAction(), everyEffect()); err != nil {
 		t.Fatalf("an external ceiling must admit an external action: %v", err)
 	}
 	if err := validateDeclaredEffects(
-		evidenceAction(), EffectEvidence); err != nil {
+		evidenceAction(), nil); err != nil {
 		t.Fatalf("evidence work must run under an evidence ceiling: %v", err)
 	}
 }
@@ -73,10 +80,10 @@ func TestExternalEffectNeedsAnExternalCeiling(t *testing.T) {
 // that wants an executor to perform external work has to say so; forgetting to
 // declare must not widen what an executor may run.
 func TestUndeclaredExecutorIsEvidenceOnly(t *testing.T) {
-	if got := executorCeiling(unboundedExecutor{}); got != EffectEvidence {
+	if got := executorCeiling(unboundedExecutor{}); len(got) != 0 {
 		t.Fatalf("undeclared executor ceiling = %q", got)
 	}
-	if got := executorCeiling(ceilingExecutor{ceiling: EffectExternal}); got != EffectExternal {
+	if got := executorCeiling(ceilingExecutor{ceiling: everyEffect()}); got.exceeds(everyEffect()) {
 		t.Fatalf("declared ceiling = %q", got)
 	}
 	if err := validateDeclaredEffects(
@@ -89,15 +96,15 @@ func TestUndeclaredExecutorIsEvidenceOnly(t *testing.T) {
 // evidence-only, so descriptors registered before this field existed continue
 // to resolve exactly as they did.
 func TestAbsentEffectKeepsItsPreviousMeaning(t *testing.T) {
-	if EffectEvidence != "" {
+	if len(Effects(nil)) != 0 {
 		t.Fatal("evidence must be the zero value or existing descriptors change meaning")
 	}
 	canonical, err := canonicalCapabilities(evidenceAction())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if canonical[0].Actions[0].Effect != EffectEvidence {
-		t.Fatalf("absent effect canonicalized to %q", canonical[0].Actions[0].Effect)
+	if len(canonical[0].Actions[0].Effects) != 0 {
+		t.Fatalf("absent effect canonicalized to %q", canonical[0].Actions[0].Effects)
 	}
 }
 
@@ -106,7 +113,7 @@ func TestAbsentEffectKeepsItsPreviousMeaning(t *testing.T) {
 func TestUnknownEffectFailsClosed(t *testing.T) {
 	_, err := canonicalCapabilities([]Capability{{
 		Name: "c", Actions: []Action{{
-			Name: "a", Effect: Effect("whatever"),
+			Name: "a", Effects: Effects{Effect("whatever")},
 			InputSchema: anyObject, OutputSchema: anyObject,
 		}},
 	}})
@@ -122,7 +129,7 @@ func TestUnknownEffectFailsClosed(t *testing.T) {
 func TestDelegationCannotWidenEffect(t *testing.T) {
 	evidence := evidenceAction()
 	external := []Capability{{Name: "explorer.reason", Actions: []Action{{
-		Name: "ask", Effect: EffectExternal,
+		Name: "ask", Effects: Effects{EffectMutatesExternal},
 		InputSchema: anyObject, OutputSchema: anyObject,
 	}}}}
 
@@ -145,13 +152,13 @@ func TestDelegationCannotWidenEffect(t *testing.T) {
 func TestEffectSurvivesCloning(t *testing.T) {
 	descriptor := Descriptor{Capabilities: []Capability{{
 		Name: "deploy", Actions: []Action{{
-			Name: "ship", Effect: EffectExternal,
+			Name: "ship", Effects: Effects{EffectMutatesExternal},
 			InputSchema: anyObject, OutputSchema: anyObject,
 		}},
 	}}}
 	clone := cloneDescriptor(descriptor)
-	if got := clone.Capabilities[0].Actions[0].Effect; got != EffectExternal {
-		t.Fatalf("cloned effect = %q, want %q", got, EffectExternal)
+	if got := clone.Capabilities[0].Actions[0].Effects; !got.equalForTest(Effects{EffectMutatesExternal}) {
+		t.Fatalf("cloned effects = %v, want %v", got, Effects{EffectMutatesExternal})
 	}
 }
 
@@ -161,22 +168,68 @@ func TestEffectSurvivesCloning(t *testing.T) {
 // an external one under the same mutation identity and be treated as the same
 // request.
 func TestMutationDigestSeparatesEffects(t *testing.T) {
-	mutation := func(effect Effect) Mutation {
+	mutation := func(effects Effects) Mutation {
 		return Mutation{Descriptor: Descriptor{
 			ID: "agent", Generation: 1,
 			Capabilities: []Capability{{Name: "deploy", Actions: []Action{{
-				Name: "ship", Effect: effect,
+				Name: "ship", Effects: effects,
 				InputSchema: anyObject, OutputSchema: anyObject,
 			}}}},
 		}}
 	}
-	evidence := registryMutationDigest(mutation(EffectEvidence))
-	external := registryMutationDigest(mutation(EffectExternal))
+	evidence := registryMutationDigest(mutation(nil))
+	external := registryMutationDigest(mutation(Effects{EffectMutatesExternal}))
 	if evidence == external {
 		t.Fatal("effect must change the mutation digest")
 	}
-	if registryMutationDigest(mutation(EffectExternal)) != external {
+	if registryMutationDigest(mutation(Effects{EffectMutatesExternal})) != external {
 		t.Fatal("the digest must stay stable for an unchanged effect")
+	}
+	// Distinct classes are distinct mutations, and a wider set is distinct
+	// from either — otherwise a replay could widen a declaration under the
+	// same mutation identity.
+	egress := registryMutationDigest(mutation(Effects{EffectEgressesContent}))
+	both := registryMutationDigest(mutation(Effects{
+		EffectEgressesContent, EffectMutatesExternal,
+	}))
+	if egress == external || both == external || both == egress || egress == evidence {
+		t.Fatal("distinct effect sets collided in the mutation digest")
+	}
+	// Declaration order is not part of the declaration.
+	reordered := registryMutationDigest(mutation(Effects{
+		EffectMutatesExternal, EffectEgressesContent,
+	}))
+	if reordered == both {
+		return
+	}
+	t.Fatal("declaration order changed the mutation digest; canonicalization " +
+		"must happen before hashing")
+}
+
+// TestExternalMutationDigestIsUnchangedAcrossTheSetUpgrade is the cross-upgrade
+// half of the golden test below.
+//
+// Before this change an external action hashed the bare string "external".
+// That value is embedded in the lifecycle QueryDigest, where a changed digest
+// reads as a divergent mutation, so a heartbeat or revoke retry spanning the
+// upgrade would be rejected. EffectMutatesExternal therefore keeps that exact
+// wire string, and a set holding only it contributes exactly those bytes.
+func TestExternalMutationDigestIsUnchangedAcrossTheSetUpgrade(t *testing.T) {
+	declared := Effects{EffectMutatesExternal}
+	if got := string(declared.digestBytes()); got != "external" {
+		t.Fatalf("external-only digest bytes = %q, want %q: a heartbeat or "+
+			"revoke retry spanning the upgrade would be rejected as a "+
+			"divergent mutation", got, "external")
+	}
+	if Effects(nil).digestBytes() != nil {
+		t.Fatal("an empty declaration must contribute no bytes at all: hashing " +
+			"an empty value still writes an eight-byte length prefix and would " +
+			"change every pre-existing digest")
+	}
+	// A set that could not have existed before is free to hash as itself.
+	wider := Effects{EffectEgressesContent, EffectMutatesExternal}
+	if got := string(wider.digestBytes()); got != "egresses-content,external" {
+		t.Fatalf("wider set digest bytes = %q", got)
 	}
 }
 
@@ -188,30 +241,100 @@ func TestMutationDigestSeparatesEffects(t *testing.T) {
 // permitted under an evidence-only ceiling, which inverts the purpose of the
 // class.
 func TestUnknownEffectsFailClosedAtResolution(t *testing.T) {
-	unknown := Effect("something-nobody-defined")
+	unknown := Effects{Effect("something-nobody-defined")}
+	external := Effects{EffectMutatesExternal}
 
 	// An unrecognized declaration is an unproven claim: beyond every ceiling.
-	for _, ceiling := range []Effect{EffectEvidence, EffectExternal, unknown} {
+	for _, ceiling := range []Effects{nil, everyEffect(), unknown} {
 		if !unknown.exceeds(ceiling) {
-			t.Fatalf("unknown declaration was permitted under ceiling %q", ceiling)
+			t.Fatalf("unknown declaration was permitted under ceiling %v", ceiling)
 		}
 	}
 
-	// An unrecognized ceiling is a host that failed to declare itself: it
-	// permits evidence and nothing more.
-	if EffectEvidence.exceeds(unknown) {
-		t.Fatal("evidence-only work must remain permitted under an unknown ceiling")
-	}
-	if !EffectExternal.exceeds(unknown) {
-		t.Fatal("an unknown ceiling must not authorize external work")
+	// The case neither subset containment nor either guard alone catches: a
+	// declaration and a ceiling naming the same unrecognized value. Containment
+	// alone would report it permitted, because the ceiling does contain it.
+	if !unknown.exceeds(unknown) {
+		t.Fatal("a declaration was permitted by a ceiling naming the same " +
+			"unrecognized class: containment cannot distinguish an agreed-upon " +
+			"unknown from a validated one")
 	}
 
-	// The known cases are unchanged.
-	if EffectExternal.exceeds(EffectEvidence) != true ||
-		EffectExternal.exceeds(EffectExternal) != false ||
-		EffectEvidence.exceeds(EffectEvidence) != false ||
-		EffectEvidence.exceeds(EffectExternal) != false {
+	// An unrecognized ceiling is a host that failed to declare itself: it
+	// permits the empty set and nothing more.
+	if Effects(nil).exceeds(unknown) {
+		t.Fatal("a declaration of nothing must remain permitted under an unknown ceiling")
+	}
+	if !external.exceeds(unknown) {
+		t.Fatal("an unknown ceiling must not authorize external work")
+	}
+	readsCorpus := Effects{EffectReadsCorpus}
+	if !readsCorpus.exceeds(unknown) {
+		t.Fatal("an unknown ceiling must not authorize corpus reads either")
+	}
+
+	// The recognized comparisons are plain subset semantics.
+	if external.exceeds(nil) != true ||
+		external.exceeds(external) != false ||
+		Effects(nil).exceeds(nil) != false ||
+		Effects(nil).exceeds(external) != false ||
+		external.exceeds(everyEffect()) != false {
 		t.Fatal("the recognized comparisons changed")
+	}
+}
+
+// TestEffectClassesDoNotOrder is why this is a set rather than a ladder.
+//
+// Writing a local file mutates without transmitting; streaming a compartmented
+// corpus to a hosted model transmits without mutating. Neither is a subset of
+// the other, so there is no answer to "does egress outrank mutation" — and any
+// ladder has to invent one.
+func TestEffectClassesDoNotOrder(t *testing.T) {
+	egress := Effects{EffectEgressesContent}
+	mutation := Effects{EffectMutatesExternal}
+
+	if !egress.exceeds(mutation) {
+		t.Fatal("egress was permitted by a ceiling that only allows mutation")
+	}
+	if !mutation.exceeds(egress) {
+		t.Fatal("mutation was permitted by a ceiling that only allows egress")
+	}
+	// Both are permitted by a ceiling that names both.
+	both := Effects{EffectEgressesContent, EffectMutatesExternal}
+	if egress.exceeds(both) || mutation.exceeds(both) || both.exceeds(both) {
+		t.Fatal("a ceiling naming both classes refused one of them")
+	}
+	// And a ceiling naming both does not thereby permit a third class.
+	readsCorpus := Effects{EffectReadsCorpus}
+	if !readsCorpus.exceeds(both) {
+		t.Fatal("a ceiling naming egress and mutation also permitted corpus reads")
+	}
+}
+
+// TestCanonicalEffectsSortsAndDeduplicates pins the property the digest
+// depends on: the same declared classes in a different order are the same
+// declaration, and must not hash differently.
+func TestCanonicalEffectsSortsAndDeduplicates(t *testing.T) {
+	canonical, err := canonicalEffects(Effects{
+		EffectMutatesExternal, EffectReadsCorpus, EffectMutatesExternal,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := Effects{EffectMutatesExternal, EffectReadsCorpus}
+	if !canonical.equalForTest(want) {
+		t.Fatalf("canonical = %v, want %v", canonical, want)
+	}
+	reordered, err := canonicalEffects(Effects{EffectReadsCorpus, EffectMutatesExternal})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reordered.equalForTest(canonical) {
+		t.Fatalf("declaration order changed the canonical form: %v vs %v",
+			reordered, canonical)
+	}
+	if _, err := canonicalEffects(Effects{EffectReadsCorpus, "invented"}); err == nil {
+		t.Fatal("an unknown class in a set was accepted")
 	}
 }
 
@@ -219,17 +342,17 @@ func TestUnknownEffectsFailClosedAtResolution(t *testing.T) {
 // through the narrowing comparison, which is the other place a stored value is
 // compared rather than validated.
 func TestUnknownEffectFromStorageIsRefusedAtRegistration(t *testing.T) {
-	unknown := []Capability{{Name: "explorer.reason", Actions: []Action{{
-		Name: "ask", Effect: Effect("decoded-from-a-tampered-record"),
+	unknownCapabilities := []Capability{{Name: "explorer.reason", Actions: []Action{{
+		Name: "ask", Effects: Effects{Effect("decoded-from-a-tampered-record")},
 		InputSchema: anyObject, OutputSchema: anyObject,
 	}}}}
-	if err := validateDeclaredEffects(unknown, EffectEvidence); err == nil {
+	if err := validateDeclaredEffects(unknownCapabilities, nil); err == nil {
 		t.Fatal("an unknown declared effect must not register")
 	}
-	if err := validateDeclaredEffects(unknown, EffectExternal); err == nil {
+	if err := validateDeclaredEffects(unknownCapabilities, everyEffect()); err == nil {
 		t.Fatal("an unknown declared effect must not register even at the widest ceiling")
 	}
-	if capabilitiesSubset(unknown, evidenceAction()) {
+	if capabilitiesSubset(unknownCapabilities, evidenceAction()) {
 		t.Fatal("an unknown effect must not pass the narrowing check")
 	}
 }
@@ -239,7 +362,7 @@ func TestUnknownEffectFromStorageIsRefusedAtRegistration(t *testing.T) {
 // real enforcement call rather than the validator underneath it.
 func externalRegisterRequest(now time.Time, requestID, id, source string) RegisterRequest {
 	request := registerRequest(now, requestID, id, "", source)
-	request.Spec.Capabilities[0].Actions[0].Effect = EffectExternal
+	request.Spec.Capabilities[0].Actions[0].Effects = Effects{EffectMutatesExternal}
 	return request
 }
 
@@ -271,7 +394,7 @@ func TestServiceRegisterEnforcesTheEffectCeiling(t *testing.T) {
 
 	// An executor the host bound for evidence-only work must refuse an
 	// external declaration at registration.
-	evidenceOnly := newService(ceilingExecutor{ceiling: EffectEvidence})
+	evidenceOnly := newService(ceilingExecutor{ceiling: nil})
 	if _, err := evidenceOnly.Register(ctx,
 		externalRegisterRequest(now, "effect-request", "agent", "source-a"),
 	); err == nil {
@@ -287,14 +410,14 @@ func TestServiceRegisterEnforcesTheEffectCeiling(t *testing.T) {
 	}
 
 	// A host that declared the wider ceiling admits it.
-	external := newService(ceilingExecutor{ceiling: EffectExternal})
+	external := newService(ceilingExecutor{ceiling: everyEffect()})
 	descriptor, err := external.Register(ctx,
 		externalRegisterRequest(now, "effect-request", "agent", "source-a"))
 	if err != nil {
 		t.Fatalf("Register refused an external action under an external ceiling: %v", err)
 	}
-	if got := descriptor.Capabilities[0].Actions[0].Effect; got != EffectExternal {
-		t.Fatalf("registered effect = %q, want %q", got, EffectExternal)
+	if got := descriptor.Capabilities[0].Actions[0].Effects; !got.equalForTest(Effects{EffectMutatesExternal}) {
+		t.Fatalf("registered effects = %v, want %v", got, Effects{EffectMutatesExternal})
 	}
 }
 
@@ -312,7 +435,7 @@ func TestResolveActionRefusesAfterARebindToANarrowerCeiling(t *testing.T) {
 	store := newMemoryStore()
 	// The registry is mutable, standing in for a host that rebinds a reference
 	// between process starts while durable descriptors survive.
-	executors := executorMap{"exec": ceilingExecutor{ceiling: EffectExternal}}
+	executors := executorMap{"exec": ceilingExecutor{ceiling: everyEffect()}}
 	service, err := NewService(Config{
 		Store: store, Resolver: authority.Resolver(),
 		Recorder: &memoryRecorder{}, Snapshots: fixedSnapshot{now},
@@ -332,7 +455,7 @@ func TestResolveActionRefusesAfterARebindToANarrowerCeiling(t *testing.T) {
 	// Rebind to an executor that both implements execution and is bound for
 	// evidence-only work, so the refusal cannot be attributed to a missing
 	// ActionExecutor.
-	tracked := &countingActionExecutor{ceiling: EffectEvidence}
+	tracked := &countingActionExecutor{ceiling: nil}
 	executors["exec"] = tracked
 
 	_, _, _, err = service.resolveAction(
@@ -350,11 +473,11 @@ func TestResolveActionRefusesAfterARebindToANarrowerCeiling(t *testing.T) {
 // countingActionExecutor implements execution and records whether it ran, so a
 // refusal can be distinguished from a silent success.
 type countingActionExecutor struct {
-	ceiling Effect
+	ceiling Effects
 	calls   int
 }
 
-func (e *countingActionExecutor) MaxEffect() Effect { return e.ceiling }
+func (e *countingActionExecutor) MaxEffects() Effects { return e.ceiling }
 
 func (e *countingActionExecutor) Execute(
 	context.Context, Invocation,
@@ -409,4 +532,18 @@ func TestEvidenceMutationDigestIsUnchangedAcrossTheUpgrade(t *testing.T) {
 		t.Fatalf("evidence-only mutation digest changed\n got  %s\n want %s",
 			got, beforeTheEffectField)
 	}
+}
+
+// equalForTest compares two declarations elementwise. Production code never
+// needs this — sets are compared by exceeds — so it lives here.
+func (e Effects) equalForTest(other Effects) bool {
+	if len(e) != len(other) {
+		return false
+	}
+	for i := range e {
+		if e[i] != other[i] {
+			return false
+		}
+	}
+	return true
 }

@@ -87,6 +87,25 @@ type ChatService struct {
 	cache          *harness.MemoryCache
 }
 
+// EgressesOffHost reports whether this service's configured model provider
+// transmits content off the host.
+//
+// The answer comes from the generator that was actually configured, because it
+// is not a property of this code: the same service is egress-free against a
+// loopback provider and egress-bearing against a hosted one. A generator that
+// cannot classify itself is treated as egressing, which model.EgressesOffHost
+// handles.
+//
+// It exists so AskExecutor can declare an honest effect ceiling. The executor
+// holds an AskProvider rather than a generator, and this is the seam where the
+// generator actually lives.
+func (s *ChatService) EgressesOffHost() bool {
+	if s == nil {
+		return true
+	}
+	return model.EgressesOffHost(s.generator)
+}
+
 type citationDocumentKey struct {
 	documentID shoal.ID
 	revisionID shoal.ID

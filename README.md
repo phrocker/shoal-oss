@@ -105,22 +105,28 @@ executor that ships answers questions about the corpus, which mutates nothing
 outside Shoal. Anything that changes the outside world is dispatched to an
 executor and recorded, not performed here.
 
-That line is enforced, not just intended. An action declares whether it
-mutates anything outside Shoal, the host declares what it permits an executor
-to do, and an action declaring an external effect can neither register against
-an evidence-only executor nor resolve to one later if the host rebinds the
-reference. Unrecognized values fail closed in both directions.
+That line is enforced, not just intended. An action declares which effects it
+has, the host declares what it permits an executor to do, and an action asking
+for anything the executor was not bound for can neither register against it nor
+resolve to it later if the host rebinds the reference. Unrecognized values fail
+closed in both directions.
+
+There are three classes, and they are a set rather than a ladder: reading the
+corpus, transmitting content off-host, and changing something outside Shoal.
+They do not order. Writing a local file mutates without transmitting; streaming
+a compartmented corpus to a hosted model transmits without mutating. Neither is
+a subset of the other, so "does egress outrank mutation" has no answer and any
+ladder has to invent one.
+
+Transmission is configuration, not code. The same reasoning executor is
+egress-free against a loopback model provider and egress-bearing against a
+hosted one, so it derives its declaration from the provider it was actually
+configured with rather than returning a constant. A provider that cannot report
+its own posture is treated as transmitting.
 
 It is a declaration check, not a sandbox. Nothing stops Go code a host chose to
 bind from opening a socket, and nothing tries to. What it stops is the
-mismatch, where an action claims external work and quietly runs in-process
-anyway.
-
-One honest gap: the two classes split on *mutation*, so they cannot express
-transmission. An action that sends corpus content to a hosted model and changes
-nothing outside is evidence-only under this definition — accurate about
-consequence, silent about disclosure. That is
-[#385](https://github.com/phrocker/shoal-oss/issues/385).
+mismatch, where an action claims one thing and quietly does another in-process.
 
 The point of the boundary either way: whatever ends up doing the work, the
 reason it was allowed to lives in Shoal.

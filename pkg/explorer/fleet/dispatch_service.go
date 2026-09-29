@@ -261,9 +261,12 @@ func (s *DispatchService) Claim(ctx context.Context, request ClaimRequest) (Acti
 	// indistinguishable from one that expired before it started.
 	//
 	// It is narrowed by the declaration from #381 rather than set for every
-	// claim. An evidence-only action mutates nothing outside Shoal, so its
-	// outcome is visible in Shoal's own record and needs no assumption.
-	if claimedAction.Effect == EffectExternal {
+	// claim. An action that does not declare external mutation changes nothing
+	// outside Shoal, so its outcome is visible in Shoal's own record and needs
+	// no assumption. Egress is deliberately not included: transmitting content
+	// is a disclosure, not an effect that leaves a record elsewhere for an
+	// operator to reconcile against.
+	if claimedAction.Effects.contains(EffectMutatesExternal) {
 		next.EffectPossible = true
 	}
 	next.ClaimID = append([]byte(nil), request.ClaimID...)
@@ -1191,11 +1194,10 @@ func (s *Service) resolveActionBinding(
 	// executor reference to a narrower ceiling while descriptors registered
 	// under the old one are still live, and those must stop resolving rather
 	// than keep running against a binding that no longer permits them.
-	if selected.Effect.exceeds(executorCeiling(raw)) {
+	if selected.Effects.exceeds(executorCeiling(raw)) {
 		return Descriptor{}, Action{}, nil, shoal.NewError(
 			shoal.ErrorUnavailable,
-			"action declares an external effect but its executor is bound "+
-				"for evidence-only work")
+			"action declares effects its executor is not bound to perform")
 	}
 	return cloneDescriptor(descriptor), *selected, raw, nil
 }

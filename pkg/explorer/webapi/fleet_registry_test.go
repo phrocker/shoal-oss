@@ -156,7 +156,8 @@ func TestCloneFleetCapabilitiesCarriesTheEffect(t *testing.T) {
 	schema := json.RawMessage(`{"type":"object"}`)
 	source := []fleet.Capability{{Name: "deploy", Actions: []fleet.Action{
 		{
-			Name: "ship", Effect: fleet.EffectExternal,
+			Name:        "ship",
+			Effects:     fleet.Effects{fleet.EffectMutatesExternal},
 			InputSchema: schema, OutputSchema: schema,
 		},
 		{
@@ -168,15 +169,18 @@ func TestCloneFleetCapabilitiesCarriesTheEffect(t *testing.T) {
 	if len(cloned) != 1 || len(cloned[0].Actions) != 2 {
 		t.Fatalf("clone shape = %#v", cloned)
 	}
-	if got := cloned[0].Actions[0].Effect; got != fleet.EffectExternal {
-		t.Fatalf("external effect became %q at the API boundary", got)
+	got := cloned[0].Actions[0].Effects
+	if len(got) != 1 || got[0] != fleet.EffectMutatesExternal {
+		t.Fatalf("external effect became %v at the API boundary", got)
 	}
-	if got := cloned[0].Actions[1].Effect; got != fleet.EffectEvidence {
-		t.Fatalf("evidence effect became %q", got)
+	if declared := cloned[0].Actions[1].Effects; len(declared) != 0 {
+		t.Fatalf("an undeclared action became %v", declared)
 	}
 	// The clone must be independent, or a caller could mutate registry state.
-	cloned[0].Actions[0].Effect = fleet.EffectEvidence
-	if source[0].Actions[0].Effect != fleet.EffectExternal {
-		t.Fatal("clone aliased the source capability")
+	// A slice makes this sharper than the old scalar did: assigning to the
+	// field would not have aliased, but writing through it does.
+	cloned[0].Actions[0].Effects[0] = fleet.EffectReadsCorpus
+	if source[0].Actions[0].Effects[0] != fleet.EffectMutatesExternal {
+		t.Fatal("clone aliased the source capability's effect set")
 	}
 }

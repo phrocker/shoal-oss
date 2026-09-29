@@ -644,8 +644,10 @@ func registryMutationDigest(mutation Mutation) [sha256.Size]byte {
 		writeRegistryDigestField(digest, []byte(capability.Name))
 		for _, action := range capability.Actions {
 			writeRegistryDigestField(digest, []byte(action.Name))
-			// Appended only for a non-evidence effect, so an evidence-only
-			// mutation hashes exactly as it did before this field existed.
+			// Appended only for a non-empty declaration, so an action that
+			// declares nothing hashes exactly as it did before this field
+			// existed, and one declaring only external mutation hashes as it
+			// did under the superseded two-value taxonomy.
 			//
 			// Hashing the zero value would have changed the bytes of every
 			// existing mutation, because an empty field still contributes its
@@ -654,11 +656,12 @@ func registryMutationDigest(mutation Mutation) [sha256.Size]byte {
 			// a changed value reads as a divergent mutation, so a heartbeat or
 			// revoke retry that spans an upgrade would have been rejected.
 			//
-			// External still differs from evidence, because it appends bytes
-			// evidence does not, which is what keeps a replay from quietly
-			// swapping one for the other under the same mutation identity.
-			if action.Effect != EffectEvidence {
-				writeRegistryDigestField(digest, []byte(action.Effect))
+			// A non-empty declaration still differs from an empty one, because
+			// it appends bytes the empty one does not, which is what keeps a
+			// replay from quietly swapping one for the other under the same
+			// mutation identity. See Effects.digestBytes.
+			if bytes := action.Effects.digestBytes(); bytes != nil {
+				writeRegistryDigestField(digest, bytes)
 			}
 			writeRegistryDigestField(digest, action.InputSchema)
 			writeRegistryDigestField(digest, action.OutputSchema)
@@ -703,10 +706,10 @@ func authorizeDescriptor(decision auth.Decision, operation auth.Operation, descr
 
 // validateDeclaredEffects refuses any action whose declared effect exceeds
 // what the host permits its bound executor to do.
-func validateDeclaredEffects(capabilities []Capability, ceiling Effect) error {
+func validateDeclaredEffects(capabilities []Capability, ceiling Effects) error {
 	for _, capability := range capabilities {
 		for _, action := range capability.Actions {
-			if action.Effect.exceeds(ceiling) {
+			if action.Effects.exceeds(ceiling) {
 				return shoal.NewError(
 					shoal.ErrorInvalidArgument,
 					"action declares an external effect but its executor is "+
@@ -788,7 +791,7 @@ func capabilitiesSubset(child, parent []Capability) bool {
 				if wantedAction.Name == allowedAction.Name &&
 					bytes.Equal(wantedAction.InputSchema, allowedAction.InputSchema) &&
 					bytes.Equal(wantedAction.OutputSchema, allowedAction.OutputSchema) &&
-					!wantedAction.Effect.exceeds(allowedAction.Effect) {
+					!wantedAction.Effects.exceeds(allowedAction.Effects) {
 					found = true
 					break
 				}

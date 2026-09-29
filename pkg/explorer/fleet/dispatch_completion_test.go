@@ -28,12 +28,12 @@ type completionFixture struct {
 	clock *time.Time
 }
 
-func newCompletionFixture(t *testing.T, effect Effect) *completionFixture {
+func newCompletionFixture(t *testing.T, effects Effects) *completionFixture {
 	t.Helper()
-	return newCompletionFixtureWithExecutor(t, effect, &remoteBoundExecutor{})
+	return newCompletionFixtureWithExecutor(t, effects, &remoteBoundExecutor{})
 }
 
-func newCompletionFixtureWithExecutor(t *testing.T, effect Effect, executor any) *completionFixture {
+func newCompletionFixtureWithExecutor(t *testing.T, effects Effects, executor any) *completionFixture {
 	t.Helper()
 	now := time.Date(2026, 9, 6, 12, 0, 0, 0, time.UTC)
 	clock := now
@@ -52,7 +52,7 @@ func newCompletionFixtureWithExecutor(t *testing.T, effect Effect, executor any)
 		t.Fatal(err)
 	}
 	descriptor := dispatchDescriptor(now)
-	descriptor.Capabilities[0].Actions[0].Effect = effect
+	descriptor.Capabilities[0].Actions[0].Effects = effects
 	// The shared descriptor's lease and the enqueued action's deadline both sit
 	// one hour out, so advancing the clock far enough to expire the action
 	// deadline expires the agent lease first and the action is refused as
@@ -132,7 +132,9 @@ func (e *remoteBoundExecutor) Execute(context.Context, Invocation) (ExecutionRes
 		shoal.ErrorInternal, "the in-process executor ran for remote work")
 }
 
-func (*remoteBoundExecutor) MaxEffect() Effect { return EffectExternal }
+func (*remoteBoundExecutor) MaxEffects() Effects {
+	return Effects{EffectEgressesContent, EffectMutatesExternal, EffectReadsCorpus}
+}
 
 // TestCompleteClaimDrivesARemoteActionToSucceeded is the loop #384 is about:
 // a worker outside this process claims, performs the work, and reports. Before
@@ -140,7 +142,7 @@ func (*remoteBoundExecutor) MaxEffect() Effect { return EffectExternal }
 // action returned to the queue as though nothing had happened — while the
 // effect had already occurred.
 func TestCompleteClaimDrivesARemoteActionToSucceeded(t *testing.T) {
-	fixture := newCompletionFixture(t, EffectExternal)
+	fixture := newCompletionFixture(t, Effects{EffectMutatesExternal})
 
 	completed, err := fixture.service.CompleteClaim(fixture.ctx, fixture.completion())
 	if err != nil {
@@ -174,7 +176,7 @@ func TestCompleteClaimDrivesARemoteActionToSucceeded(t *testing.T) {
 
 // TestCompleteClaimRecordsAReportedFailure covers the other terminal state.
 func TestCompleteClaimRecordsAReportedFailure(t *testing.T) {
-	fixture := newCompletionFixture(t, EffectExternal)
+	fixture := newCompletionFixture(t, Effects{EffectMutatesExternal})
 
 	request := fixture.completion()
 	request.Failed = true
@@ -197,7 +199,7 @@ func TestCompleteClaimRecordsAReportedFailure(t *testing.T) {
 // failure with no error code would commit a terminal state that says nothing
 // about why, which is the one thing the report was for.
 func TestCompleteClaimRefusesAFailureWithNoReason(t *testing.T) {
-	fixture := newCompletionFixture(t, EffectExternal)
+	fixture := newCompletionFixture(t, Effects{EffectMutatesExternal})
 
 	request := fixture.completion()
 	request.Failed = true
@@ -222,7 +224,7 @@ func TestCompleteClaimRefusesAStaleClaim(t *testing.T) {
 		{"a future version", func(r *CompletionRequest) { r.ExpectedVersion += 2 }},
 	} {
 		t.Run(probe.name, func(t *testing.T) {
-			fixture := newCompletionFixture(t, EffectExternal)
+			fixture := newCompletionFixture(t, Effects{EffectMutatesExternal})
 			request := fixture.completion()
 			probe.mutate(&request)
 			if _, err := fixture.service.CompleteClaim(fixture.ctx, request); !errors.Is(err, ErrClaimLost) {
@@ -237,7 +239,7 @@ func TestCompleteClaimRefusesAStaleClaim(t *testing.T) {
 // requirement. A remote worker must not be able to record output that an
 // in-process executor could not.
 func TestCompleteClaimValidatesOutputAsTheInProcessPathDoes(t *testing.T) {
-	fixture := newCompletionFixture(t, EffectExternal)
+	fixture := newCompletionFixture(t, Effects{EffectMutatesExternal})
 
 	request := fixture.completion()
 	// The declared OutputSchema requires a boolean "ok" and forbids anything
@@ -262,7 +264,7 @@ func TestCompleteClaimValidatesOutputAsTheInProcessPathDoes(t *testing.T) {
 // TestCompleteClaimValidatesEvidenceAsTheInProcessPathDoes is the same
 // requirement for evidence, which is the half that reaches the audit record.
 func TestCompleteClaimValidatesEvidenceAsTheInProcessPathDoes(t *testing.T) {
-	fixture := newCompletionFixture(t, EffectExternal)
+	fixture := newCompletionFixture(t, Effects{EffectMutatesExternal})
 
 	request := fixture.completion()
 	// Evidence with no snapshot pin: there is nothing to say what the evidence
@@ -286,7 +288,7 @@ func TestCompleteClaimValidatesEvidenceAsTheInProcessPathDoes(t *testing.T) {
 // against its own write, or a worker with an unreliable connection can never
 // learn that its work landed.
 func TestCompleteClaimReplayReturnsTheCommittedRecord(t *testing.T) {
-	fixture := newCompletionFixture(t, EffectExternal)
+	fixture := newCompletionFixture(t, Effects{EffectMutatesExternal})
 
 	first, err := fixture.service.CompleteClaim(fixture.ctx, fixture.completion())
 	if err != nil {
@@ -314,7 +316,7 @@ func TestCompleteClaimReplayReturnsTheCommittedRecord(t *testing.T) {
 // external effect that is the worst possible answer: the effect happened, the
 // action says cancelled, and the worker was told everything was fine.
 func TestCompleteClaimDoesNotAcknowledgeACancelledAction(t *testing.T) {
-	fixture := newCompletionFixture(t, EffectExternal)
+	fixture := newCompletionFixture(t, Effects{EffectMutatesExternal})
 	// Cancel refuses a live claim, so the lease has to lapse first — which is
 	// also the only way a worker ends up reporting this late.
 	*fixture.clock = fixture.clock.Add(2 * time.Minute)
@@ -355,7 +357,7 @@ func TestCompleteClaimDoesNotAcknowledgeACancelledAction(t *testing.T) {
 // the reference below declares EffectExternal, and an evidence-only one would
 // still refuse this action.
 func TestRemoteExecutorNeedsNoInProcessExecute(t *testing.T) {
-	fixture := newCompletionFixtureWithExecutor(t, EffectExternal, remoteOnlyExecutor{})
+	fixture := newCompletionFixtureWithExecutor(t, Effects{EffectMutatesExternal}, remoteOnlyExecutor{})
 
 	if !fixture.claimed.EffectPossible {
 		t.Fatal("claiming an external action through a remote-only reference " +
@@ -374,7 +376,7 @@ func TestRemoteExecutorNeedsNoInProcessExecute(t *testing.T) {
 // the requirement for claim and completion must not let in-process execution
 // run against a reference that cannot run anything.
 func TestExecuteClaimStillRequiresARunnableExecutor(t *testing.T) {
-	fixture := newCompletionFixtureWithExecutor(t, EffectExternal, remoteOnlyExecutor{})
+	fixture := newCompletionFixtureWithExecutor(t, Effects{EffectMutatesExternal}, remoteOnlyExecutor{})
 
 	if _, err := fixture.service.ExecuteClaim(fixture.ctx, fixture.claimed); err == nil {
 		t.Fatal("ExecuteClaim ran an action whose executor has no Execute method")
@@ -385,7 +387,9 @@ func TestExecuteClaimStillRequiresARunnableExecutor(t *testing.T) {
 // declares an effect ceiling and deliberately implements no Execute.
 type remoteOnlyExecutor struct{}
 
-func (remoteOnlyExecutor) MaxEffect() Effect { return EffectExternal }
+func (remoteOnlyExecutor) MaxEffects() Effects {
+	return Effects{EffectMutatesExternal}
+}
 
 // TestClaimMarksAnExternalEffectPossibleBeforeItHappens is the decision #384
 // asked for. A remote worker owns the window between claiming and acting. If it
@@ -394,15 +398,17 @@ func (remoteOnlyExecutor) MaxEffect() Effect { return EffectExternal }
 // indistinguishable from one that expired before it started.
 func TestClaimMarksAnExternalEffectPossibleBeforeItHappens(t *testing.T) {
 	for _, probe := range []struct {
-		name   string
-		effect Effect
-		want   bool
+		name    string
+		effects Effects
+		want    bool
 	}{
-		{"external effect", EffectExternal, true},
-		{"evidence only", EffectEvidence, false},
+		{"external mutation", Effects{EffectMutatesExternal}, true},
+		{"reads corpus only", Effects{EffectReadsCorpus}, false},
+		{"egresses but does not mutate", Effects{EffectEgressesContent}, false},
+		{"declares nothing", nil, false},
 	} {
 		t.Run(probe.name, func(t *testing.T) {
-			fixture := newCompletionFixture(t, probe.effect)
+			fixture := newCompletionFixture(t, probe.effects)
 			if fixture.claimed.EffectPossible != probe.want {
 				t.Fatalf("claimed EffectPossible = %v, want %v",
 					fixture.claimed.EffectPossible, probe.want)
@@ -434,7 +440,7 @@ func TestClaimMarksAnExternalEffectPossibleBeforeItHappens(t *testing.T) {
 func TestCompleteClaimRefusesAnExpiredLease(t *testing.T) {
 	// The claim lease is a minute; the action deadline is an hour.
 	t.Run("past the claim lease", func(t *testing.T) {
-		fixture := newCompletionFixture(t, EffectExternal)
+		fixture := newCompletionFixture(t, Effects{EffectMutatesExternal})
 		*fixture.clock = fixture.clock.Add(2 * time.Minute)
 		_, err := fixture.service.CompleteClaim(fixture.ctx, fixture.completion())
 		if !errors.Is(err, ErrClaimLost) {
@@ -457,7 +463,7 @@ func TestCompleteClaimRefusesAnExpiredLease(t *testing.T) {
 	// that too, and the report would be refused by request validation before
 	// the action deadline was ever consulted — passing without exercising it.
 	t.Run("past the action deadline", func(t *testing.T) {
-		fixture := newCompletionFixture(t, EffectExternal)
+		fixture := newCompletionFixture(t, Effects{EffectMutatesExternal})
 		*fixture.clock = fixture.clock.Add(2 * time.Hour)
 		request := fixture.completion()
 		request.Context.Deadline = fixture.clock.Add(time.Hour)
@@ -477,7 +483,7 @@ func TestCompleteClaimRefusesAnExpiredLease(t *testing.T) {
 // committed would be told its own completion succeeded — while its external
 // effect went unrecorded, and the record described a different run.
 func TestCompleteClaimDoesNotHandOneWorkersRecordToAnother(t *testing.T) {
-	fixture := newCompletionFixture(t, EffectExternal)
+	fixture := newCompletionFixture(t, Effects{EffectMutatesExternal})
 
 	first, err := fixture.service.CompleteClaim(fixture.ctx, fixture.completion())
 	if err != nil {
@@ -501,7 +507,7 @@ func TestCompleteClaimDoesNotHandOneWorkersRecordToAnother(t *testing.T) {
 // redundant identity check: a caller who is not the queued principal is told
 // the action does not exist, rather than that it exists and is not theirs.
 func TestCompleteClaimHidesAnotherPrincipalsAction(t *testing.T) {
-	fixture := newCompletionFixture(t, EffectExternal)
+	fixture := newCompletionFixture(t, Effects{EffectMutatesExternal})
 
 	// Bound through the fixture's own authority: a decision the service's
 	// resolver cannot resolve would be refused for the wrong reason and the

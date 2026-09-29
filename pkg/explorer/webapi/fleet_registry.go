@@ -362,8 +362,10 @@ func cloneFleetCapabilities(input []fleet.Capability) []fleet.Capability {
 		result[i].Actions = make([]fleet.Action, len(input[i].Actions))
 		for j := range input[i].Actions {
 			result[i].Actions[j] = fleet.Action{
-				Name:         input[i].Actions[j].Name,
-				Effect:       input[i].Actions[j].Effect,
+				Name: input[i].Actions[j].Name,
+				// Copied, not aliased: a returned descriptor must not be
+				// usable to mutate the registry's declared effects.
+				Effects:      append(fleet.Effects(nil), input[i].Actions[j].Effects...),
 				InputSchema:  append(json.RawMessage(nil), input[i].Actions[j].InputSchema...),
 				OutputSchema: append(json.RawMessage(nil), input[i].Actions[j].OutputSchema...),
 			}
