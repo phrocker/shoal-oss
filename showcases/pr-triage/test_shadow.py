@@ -1,8 +1,12 @@
 # Licensed under the Apache License, Version 2.0. See LICENSE and NOTICE.
 import importlib.util
+import base64
+import json
 from pathlib import Path
 import tempfile
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 spec=importlib.util.spec_from_file_location('shadow',Path(__file__).with_name('shadow.py'))
 shadow=importlib.util.module_from_spec(spec);spec.loader.exec_module(shadow)
@@ -25,6 +29,51 @@ class ShadowTest(unittest.TestCase):
         decl={'key':'function:init','kind':'function','text':'func init(){}'}
         with self.assertRaises(ValueError):
             shadow.pair_declarations({'declarations':[decl,decl],'residue':''},{'declarations':[],'residue':''})
+    def test_inserted_and_removed_init_do_not_shift_unchanged_functions(self):
+        def declarations(bodies):
+            return {'declarations': [{'key': 'function:init' + (f'#{i+1}' if i else ''),
+                                     'kind': 'function', 'text': body} for i, body in enumerate(bodies)], 'residue': ''}
+        before = declarations(['first', 'second'])
+        after = declarations(['new', 'first', 'second'])
+        pairs = shadow.pair_declarations(before, after)
+        self.assertEqual(len(pairs), 1)
+        self.assertIsNone(pairs[0]['before'])
+        self.assertEqual(pairs[0]['after']['text'], 'new')
+        reverse = shadow.pair_declarations(after, before)
+        self.assertEqual(len(reverse), 1)
+        self.assertEqual(reverse[0]['before']['text'], 'new')
+        self.assertIsNone(reverse[0]['after'])
+    def test_non_utf8_paths_round_trip_losslessly(self):
+        raw = b'bad-\xff.go'
+        item = shadow.changed_paths(b'A\0' + raw + b'\0')[0]
+        self.assertEqual(base64.b64decode(item['non_utf8_paths_base64']['after_path']), raw)
+        # Safe JSON text, without a replacement character or surrogate encoding.
+        json.dumps(item, ensure_ascii=False).encode('utf-8')
+    def test_collect_accounts_for_rename_invalid_path_and_invalid_patch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            extractor = root/'extract'; extractor.write_bytes(b'fixture')
+            protocol = {'source_anchor':'abcdef0','cohort_size':1,'mode':'retrospective_reconstruction',
+                        'limits':{'max_files_per_pr':100,'max_file_bytes':1000,'max_review_packet_bytes':10000},
+                        'context_limitations':'fixture'}
+            protocol_path=root/'protocol.json';protocol_path.write_text(json.dumps(protocol))
+            def git(repo, *args):
+                if args[0]=='rev-parse':return b'abcdef012345\n'
+                if args[0]=='log':return b'abcdef012345\tFixture (#1)\n'
+                if '--name-status' in args:return b'R100\0old.go\0new.go\0A\0bad-\xff.go\0A\0invalid.go\0'
+                if args[0]=='diff':return b'diff\n+invalid \xff text\n'
+                raise AssertionError(args)
+            def source(repo, revision, path, maximum):
+                if path=='invalid.go':return {'disposition':'non_utf8'}
+                return {'disposition':'available','text':'package p\nfunc F() {}'}
+            parsed={'declarations':[{'key':'function:F','kind':'function','text':'func F() {}'}],'residue':'package p'}
+            with patch.object(shadow,'git',side_effect=git), patch.object(shadow,'source',side_effect=source), patch.object(shadow,'parsed',return_value=parsed):
+                shadow.collect(SimpleNamespace(protocol=protocol_path,output=root/'run',repo=root,extractor=extractor))
+            case=json.loads((root/'run/manifest.json').read_text())['cases'][0]
+            self.assertEqual([u['kind'] for u in case['units']],['file_context','non_utf8_path','source_unavailable'])
+            self.assertEqual(case['units'][0]['symbol'],'file_path')
+            self.assertEqual(case['review_packet']['disposition'],'non_utf8_patch')
+            self.assertEqual(len(case['files']),3)
     def test_rounding_accepted_invalid_mass_and_nan_rejected(self):
         def response(probs):return {'answers':{'boundary':{'type':'choice','choice':'a','probabilities':probs}}}
         self.assertEqual(shadow.validate_answer(response({'a':.3333,'b':.3333,'c':.3333}),{'a':1,'b':2,'c':3})['choice'],'a')

@@ -2,6 +2,7 @@
 # Licensed under the Apache License, Version 2.0. See LICENSE and NOTICE.
 """Bounded retrospective shadow pilot. Local artifacts are not Shoal API receipts."""
 import argparse
+import base64
 from collections import Counter
 import hashlib
 import importlib.metadata
@@ -36,17 +37,27 @@ def git(repo, *args):
 
 
 def changed_paths(raw):
-    parts = raw.decode("utf-8").split("\0")
+    parts = raw.split(b"\0")
     items = []
     i = 0
     while i < len(parts) and parts[i]:
-        status = parts[i]; i += 1
+        status = parts[i].decode("ascii"); i += 1
         old = parts[i]; i += 1
         new = old
         if status[0] in "RC":
             new = parts[i]; i += 1
-        items.append({"status": status, "before_path": None if status == "A" else old,
-                      "after_path": None if status == "D" else new})
+        item = {"status": status}
+        encoded = {}
+        for field, value in (("before_path", None if status == "A" else old),
+                             ("after_path", None if status == "D" else new)):
+            try:
+                item[field] = value.decode("utf-8") if value is not None else None
+            except UnicodeDecodeError:
+                encoded[field] = base64.b64encode(value).decode("ascii")
+                item[field] = "[non-UTF-8 path: " + encoded[field] + "]"
+        if encoded:
+            item["non_utf8_paths_base64"] = encoded
+        items.append(item)
     return items
 
 
@@ -83,11 +94,28 @@ def pair_declarations(before, after):
     if len(b) != len(before["declarations"]) or len(a) != len(after["declarations"]):
         raise ValueError("duplicate declaration key")
     pairs = []
-    for key in sorted(b.keys() | a.keys()):
-        left, right = b.get(key), a.get(key)
-        if left and right and left["text"] == right["text"]:
-            continue
-        pairs.append({"symbol": key, "kind": (right or left)["kind"], "before": left, "after": right})
+    # Ordinals distinguish legal repeated init declarations within one parse, but
+    # are not identities across revisions. Cancel identical bodies first.
+    base_key = lambda key: re.sub(r"#\d+$", "", key)
+    for key in sorted({base_key(k) for k in b.keys() | a.keys()}):
+        lefts = [d for k, d in b.items() if base_key(k) == key]
+        rights = [d for k, d in a.items() if base_key(k) == key]
+        duplicate = len(lefts) > 1 or len(rights) > 1
+        unmatched = []
+        for left in lefts:
+            match = next((i for i, right in enumerate(rights) if left["text"] == right["text"]), None)
+            if match is None:
+                unmatched.append(left)
+            else:
+                rights.pop(match)
+        for index in range(max(len(unmatched), len(rights))):
+            left = unmatched[index] if index < len(unmatched) else None
+            right = rights[index] if index < len(rights) else None
+            symbol = key if index == 0 else f"{key}#{index + 1}"
+            pair = {"symbol": symbol, "kind": (right or left)["kind"], "before": left, "after": right}
+            if duplicate:
+                pair["pairing"] = "unchanged_duplicates_by_content_then_remaining_source_order"
+            pairs.append(pair)
     if before["residue"] != after["residue"]:
         pairs.append({"symbol": "file_context", "kind": "file_context", "before": None, "after": None})
     return pairs
@@ -125,7 +153,9 @@ def collect(args):
             name = item["after_path"] or item["before_path"]
             file_record = {**item, "path": name}
             case["files"].append(file_record)
-            if index >= protocol["limits"]["max_files_per_pr"]:
+            if item.get("non_utf8_paths_base64"):
+                file_record["disposition"] = "non_utf8_path"
+            elif index >= protocol["limits"]["max_files_per_pr"]:
                 file_record["disposition"] = "file_count_limit"
             elif not name.endswith(".go"):
                 file_record["disposition"] = "non_go"
@@ -144,7 +174,10 @@ def collect(args):
                         file_record.update(disposition="parse_error", errors=errors)
                     else:
                         file_record["disposition"] = "parsed_go"
-                        for pair in pair_declarations(*parses):
+                        pairs = pair_declarations(*parses)
+                        if item["before_path"] and item["after_path"] and item["before_path"] != item["after_path"]:
+                            pairs.append({"symbol": "file_path", "kind": "file_context", "before": None, "after": None})
+                        for pair in pairs:
                             unit = {**pair, "path": name, "pr": pr, "base": base, "head": head,
                                     "before_path": item["before_path"], "after_path": item["after_path"],
                                     "optimization_eligible": False, "context": "syntax_only_no_dependency_bodies"}
@@ -154,15 +187,23 @@ def collect(args):
                 unit = {"path": name, "pr": pr, "base": base, "head": head, "symbol": "file",
                         "kind": file_record["disposition"], "before": None, "after": None,
                         "optimization_eligible": False, "context": "unsupported_file"}
+                if item.get("non_utf8_paths_base64"):
+                    unit["non_utf8_paths_base64"] = item["non_utf8_paths_base64"]
                 unit["id"] = digest(unit)
                 case["units"].append(unit)
         patch = git(args.repo, "diff", "--no-ext-diff", "--no-textconv", "--unified=5", base, head)
         case["patch_sha256"] = digest(patch)
         packet_path = args.output / "review-packets" / f"pr-{pr}.json"
+        try:
+            patch_text = patch.decode("utf-8")
+        except UnicodeDecodeError:
+            patch_text = None
         if len(patch) > protocol["limits"]["max_review_packet_bytes"]:
             case["review_packet"] = {"disposition": "packet_byte_limit", "bytes": len(patch)}
+        elif patch_text is None:
+            case["review_packet"] = {"disposition": "non_utf8_patch", "bytes": len(patch), "sha256": digest(patch)}
         else:
-            packet = {"pr": pr, "base": base, "head": head, "diff": patch.decode("utf-8"),
+            packet = {"pr": pr, "base": base, "head": head, "diff": patch_text,
                       "units": [{k: u[k] for k in ("id", "path", "symbol", "kind")} for u in case["units"]],
                       "limitations": protocol["context_limitations"]}
             write_new(packet_path, packet)

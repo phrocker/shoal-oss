@@ -48,9 +48,16 @@ def build(run, assessment_paths):
         raise ValueError('pilot must preserve full review for every unit')
     assessors=[]
     comparisons=[]
+    assessor_names=set()
+    assessment_digests=set()
     for path in assessment_paths:
         assessment,labels=load_assessment(path,units)
         name=assessment.get('assessor',path.stem)
+        assessment_digest=digest(assessment)
+        if name in assessor_names or assessment_digest in assessment_digests:
+            raise ValueError('duplicate assessor name or assessment digest')
+        assessor_names.add(name)
+        assessment_digests.add(assessment_digest)
         eligible=[p for p in indexed.values() if p['disposition']=='predicted']
         cross=Counter((p['answer']['choice'],labels[p['unit_id']]['label']) for p in eligible)
         base=Counter((p['baseline'],labels[p['unit_id']]['label']) for p in eligible)
@@ -89,6 +96,8 @@ def build(run, assessment_paths):
 
 def markdown(report):
     pop=report['population'];disp=report['dispositions'];lat=report['latency_ms']
+    median='n/a' if lat['median'] is None else f"{lat['median']:.2f} ms"
+    first='n/a' if lat['first'] is None else f"{lat['first']:.2f} ms"
     text=f'''# Retrospective authorization shadow pilot
 
 Protocol: `{report['protocol_id']}`. Report: `{report['id']}`.
@@ -107,8 +116,8 @@ relevance labels; the tables below measure agreement, not defect recall or accur
 | Non-function/unsupported units retained for full review | {disp.get('unsupported_unit',0)} |
 
 Raw Laya labels: `{json.dumps(report['model_labels'],sort_keys=True)}`.
-Median inference time: {lat['median']:.2f} ms across {lat['count']} requests;
-first request: {lat['first']:.2f} ms. These are local calls, not service throughput.
+Median inference time: {median} across {lat['count']} requests;
+first request: {first}. These are local calls, not service throughput.
 
 '''
     for assessor in report['assessors']:
