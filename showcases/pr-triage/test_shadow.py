@@ -49,6 +49,18 @@ class ShadowTest(unittest.TestCase):
         self.assertEqual(base64.b64decode(item['non_utf8_paths_base64']['after_path']), raw)
         # Safe JSON text, without a replacement character or surrogate encoding.
         json.dumps(item, ensure_ascii=False).encode('utf-8')
+    def test_reordered_initializers_remain_visible(self):
+        for kind, keys in [('function', ['function:init', 'function:init#2']), ('var', ['var:A', 'var:B'])]:
+            first={'key':keys[0],'kind':kind,'text':'registerPolicy()'}
+            second={'key':keys[1],'kind':kind,'text':'serveRequests()'}
+            before={'declarations':[first,second],'residue':'unchanged'}
+            # init keys are source-order ordinals in each parse; var names persist.
+            after={'declarations':[{**second,'key':keys[0] if kind=='function' else keys[1]},
+                                   {**first,'key':keys[1] if kind=='function' else keys[0]}],'residue':'unchanged'}
+            pairs=shadow.pair_declarations(before,after)
+            self.assertEqual(len(pairs),1)
+            self.assertEqual(pairs[0]['kind'],'file_context')
+            self.assertIn('initialization_order',pairs[0]['symbol'])
     def test_collect_accounts_for_rename_invalid_path_and_invalid_patch(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

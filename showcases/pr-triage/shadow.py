@@ -116,6 +116,26 @@ def pair_declarations(before, after):
             if duplicate:
                 pair["pairing"] = "unchanged_duplicates_by_content_then_remaining_source_order"
             pairs.append(pair)
+    # Unchanged initializers can still change behavior when reordered. Compare
+    # relative order of retained bodies, so a new init does not relabel every
+    # existing one, while swapping registration and serving remains visible.
+    for category in ("init", "var"):
+        def initializers(document):
+            return [(base_key(d["key"]), digest(d["text"])) for d in document["declarations"]
+                    if (base_key(d["key"]) == "function:init" if category == "init" else d["kind"] == "var")]
+        left_order, right_order = initializers(before), initializers(after)
+        common = Counter(left_order) & Counter(right_order)
+        def retained(order):
+            remaining = common.copy()
+            result = []
+            for identity in order:
+                if remaining[identity]:
+                    result.append(identity)
+                    remaining[identity] -= 1
+            return result
+        if retained(left_order) != retained(right_order):
+            pairs.append({"symbol": category + "_initialization_order", "kind": "file_context",
+                          "before": None, "after": None, "before_order": left_order, "after_order": right_order})
     if before["residue"] != after["residue"]:
         pairs.append({"symbol": "file_context", "kind": "file_context", "before": None, "after": None})
     return pairs
