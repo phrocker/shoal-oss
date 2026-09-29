@@ -479,4 +479,3 @@ Laya serving also composes with the durable receipt issue. Calibration/training
 follows the first measured shadow baseline; it does not block that first slice.
 All implementation issues remain open. This design note and runtime smoke test
 close none of them.
-
