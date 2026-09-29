@@ -47,6 +47,11 @@ func TestAdmittedDeclarationSurvivesTheDurableCodec(t *testing.T) {
 		record.AdmittedEffects = declared
 		if len(declared) > 0 {
 			record.AdmittedDisclosures = digest[:]
+			// The obligation rides the same round trip. It is the decision the
+			// token was granted under, and a replay rebuilds the answer from
+			// it, so losing it on encode would silently turn every retry into a
+			// re-adjudication.
+			record.AdmittedObligation = []byte{0b0000_0101}
 		}
 		encoded, err := encodeAction(record)
 		if err != nil {
@@ -80,7 +85,8 @@ func TestActionRecordsWrittenBeforeAdmissionDecodeUnchanged(t *testing.T) {
 		t.Fatalf("a record written before admission must still decode: %v", err)
 	}
 	if len(decoded.AdmittedEffects) != 0 ||
-		len(decoded.AdmittedDisclosures) != 0 {
+		len(decoded.AdmittedDisclosures) != 0 ||
+		len(decoded.AdmittedObligation) != 0 {
 		t.Fatalf("a dispatched action acquired a declaration: %#v", decoded)
 	}
 	if !reflect.DeepEqual(decoded, legacy) {

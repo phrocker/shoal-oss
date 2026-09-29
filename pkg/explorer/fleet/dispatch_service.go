@@ -271,7 +271,52 @@ func (s *DispatchService) Claim(ctx context.Context, request ClaimRequest) (Acti
 	}
 	next := cloneActionRecord(current)
 	next.Version++
-	next.State = DispatchClaimed
+	next, err = applyClaim(
+		next, claimedAction, request.ClaimID, request.Lease, decision, now)
+	if err != nil {
+		return ActionRecord{}, err
+	}
+	if err := s.recorder.RecordAction(ctx, ActionAudit{Phase: "claim_admission", Operation: auth.OperationInvoke, Record: next}); err != nil {
+		return ActionRecord{}, errors.Join(ErrRecordingUnavailable, err)
+	}
+	stored, err := s.store.ApplyAction(ctx, DispatchMutation{
+		Token:           transitionToken("claim", request.ID, request.ClaimID, next.Version),
+		ExpectedVersion: current.Version, ExpectedFence: current.ClaimFence,
+		TransitionKind: "action.claimed", Record: next,
+	})
+	if err != nil {
+		return ActionRecord{}, err
+	}
+	if err := s.publishTransition(
+		context.WithoutCancel(ctx), "action.claimed", stored,
+	); err != nil {
+		return ActionRecord{}, errors.Join(ErrActionCommitted, err)
+	}
+	return cloneActionRecord(stored), nil
+}
+
+// applyClaim turns a record into a claimed one. It is the only place that
+// transition is written.
+//
+// Both callers reach it: the dispatch Claim mutation and the admission grant,
+// which is born claimed in a single write rather than queued and then claimed.
+// They were separate once, and they drifted within one release — the egress
+// correction below landed on Claim and not on admission, so an egress-only
+// admission sat outstanding asserting that no effect was possible, which is the
+// exact assertion the flag exists to avoid making. A matched pair of conditions
+// is a promise someone has to keep; one function is a fact.
+//
+// The fence is incremented rather than assigned, so a re-claim advances it and
+// a record that has never been claimed lands on one.
+func applyClaim(
+	record ActionRecord,
+	action Action,
+	claimID []byte,
+	lease time.Duration,
+	decision auth.Decision,
+	now time.Time,
+) (ActionRecord, error) {
+	record.State = DispatchClaimed
 	// An external-effect action is possibly-effected from the moment it is
 	// claimed, not from the moment it is executed.
 	//
@@ -293,46 +338,32 @@ func (s *DispatchService) Claim(ctx context.Context, request ClaimRequest) (Acti
 	// Content that left the host cannot be recalled, which makes an
 	// unacknowledged possible egress exactly the kind of uncertainty this flag
 	// exists to preserve.
-	if claimedAction.Effects.contains(EffectMutatesExternal) ||
-		claimedAction.Effects.contains(EffectEgressesContent) {
-		next.EffectPossible = true
+	if action.Effects.contains(EffectMutatesExternal) ||
+		action.Effects.contains(EffectEgressesContent) {
+		record.EffectPossible = true
 	}
-	next.ClaimID = append([]byte(nil), request.ClaimID...)
-	next.ClaimFence++
-	next.ClaimLease = request.Lease
-	next.ClaimLeaseUntil = now.Add(request.Lease)
-	if next.ClaimLeaseUntil.After(next.Deadline) {
-		next.ClaimLeaseUntil = next.Deadline
+	record.ClaimID = append([]byte(nil), claimID...)
+	record.ClaimFence++
+	record.ClaimLease = lease
+	record.ClaimLeaseUntil = now.Add(lease)
+	if record.ClaimLeaseUntil.After(record.Deadline) {
+		record.ClaimLeaseUntil = record.Deadline
 	}
-	next.UpdatedAt = now
-	next.Actor = decision.Actor()
-	next.TransitionRequestID = decision.RequestID()
-	next.TransitionCorrelationID = decision.CorrelationID()
-	next.AuthorizedOperations = canonicalOperations(append(
-		next.AuthorizedOperations, decisionOperations(decision, auth.OperationInvoke)...))
-	next.ExecutionFingerprint, err = auth.AuthorizationFingerprint(decision)
+	record.UpdatedAt = now
+	record.Actor = decision.Actor()
+	record.TransitionRequestID = decision.RequestID()
+	record.TransitionCorrelationID = decision.CorrelationID()
+	record.AuthorizedOperations = canonicalOperations(append(
+		record.AuthorizedOperations,
+		decisionOperations(decision, auth.OperationInvoke)...))
+	fingerprint, err := auth.AuthorizationFingerprint(decision)
 	if err != nil {
 		return ActionRecord{}, err
 	}
-	next.ExecutionPolicyGeneration = decision.PolicyGeneration()
-	next.ExecutionExpiresAt = decision.AuthenticationExpires()
-	if err := s.recorder.RecordAction(ctx, ActionAudit{Phase: "claim_admission", Operation: auth.OperationInvoke, Record: next}); err != nil {
-		return ActionRecord{}, errors.Join(ErrRecordingUnavailable, err)
-	}
-	stored, err := s.store.ApplyAction(ctx, DispatchMutation{
-		Token:           transitionToken("claim", request.ID, request.ClaimID, next.Version),
-		ExpectedVersion: current.Version, ExpectedFence: current.ClaimFence,
-		TransitionKind: "action.claimed", Record: next,
-	})
-	if err != nil {
-		return ActionRecord{}, err
-	}
-	if err := s.publishTransition(
-		context.WithoutCancel(ctx), "action.claimed", stored,
-	); err != nil {
-		return ActionRecord{}, errors.Join(ErrActionCommitted, err)
-	}
-	return cloneActionRecord(stored), nil
+	record.ExecutionFingerprint = fingerprint
+	record.ExecutionPolicyGeneration = decision.PolicyGeneration()
+	record.ExecutionExpiresAt = decision.AuthenticationExpires()
+	return record, nil
 }
 
 func (s *DispatchService) ExecuteClaim(ctx context.Context, claimed ActionRecord) (ActionRecord, error) {

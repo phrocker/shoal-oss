@@ -135,7 +135,28 @@ type ActionRecord struct {
 	// reads. What the record has to do is refuse a retry that changes them,
 	// which needs only equality.
 	AdmittedDisclosures []byte
+	// AdmittedObligation is the obligation returned with the grant, as a bitmap
+	// over the canonical order of the declared references. Bit i set means the
+	// reference at index i must be withheld.
+	//
+	// The obligation is the decision, and a decision that is recomputed is not
+	// the decision that was made. The co-occurrence budget it comes from is
+	// windowed and moves as an identity reads, so recomputing on a retry can
+	// return a weaker obligation for a token that is already live — a caller
+	// could replay its way out of a restriction — and a restrictor that is
+	// briefly unreachable would make an already-granted admission impossible to
+	// recover at all.
+	//
+	// Indices rather than identities, for the reason AdmittedDisclosures is a
+	// digest: positions disclose nothing without the list they index, and the
+	// caller supplies that list again on the retry, where the digest proves it
+	// is the same one.
+	AdmittedObligation []byte
 }
+
+// MaxAdmittedObligationBytes bounds the obligation bitmap: one bit per
+// reference the declaration may carry.
+const MaxAdmittedObligationBytes = (MaxActionEvidence + 7) / 8
 
 // MaxAdmittedEffects bounds the declared set a durable record may carry. The
 // taxonomy has three classes; the bound is larger so a record written by a
@@ -164,6 +185,19 @@ func validateAdmittedDeclaration(record ActionRecord) error {
 			return shoal.NewError(
 				shoal.ErrorInvalidArgument, "admitted effects are not canonical")
 		}
+	}
+	if len(record.AdmittedObligation) > MaxAdmittedObligationBytes {
+		return shoal.NewError(
+			shoal.ErrorInvalidArgument, "admitted obligation exceeds its bound")
+	}
+	// An obligation names positions in a declared reference list. Without the
+	// list there is nothing for it to index, so a record carrying one and no
+	// declaration has been assembled by something that skipped the grant path.
+	if len(record.AdmittedObligation) > 0 &&
+		len(record.AdmittedDisclosures) == 0 {
+		return shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			"admitted obligation requires declared references")
 	}
 	if len(record.AdmittedDisclosures) == 0 {
 		return nil
@@ -929,7 +963,19 @@ func cloneActionRecord(input ActionRecord) ActionRecord {
 	result.AdmittedEffects = input.AdmittedEffects.clone()
 	result.AdmittedDisclosures = append(
 		[]byte(nil), input.AdmittedDisclosures...)
+	result.AdmittedObligation = append(
+		[]byte(nil), input.AdmittedObligation...)
 	return result
+}
+
+// isAdmission reports whether this record was produced by the pre-call
+// admission seam rather than by dispatch.
+//
+// The declared effect set is the marker, and it is a reliable one in both
+// directions: an admission is refused before it reaches a record unless it
+// declares an effect, and no dispatch enqueue ever sets one.
+func (r ActionRecord) isAdmission() bool {
+	return len(r.AdmittedEffects) > 0
 }
 
 func cloneActionEvidence(input []EvidenceRef) []EvidenceRef {

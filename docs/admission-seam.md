@@ -35,8 +35,9 @@ permission Shoal granted, whose outcome Shoal has not yet seen. A second record
 type would have given the two different durability and a second place for them
 to disagree.
 
-The consequence worth stating: an outstanding admission and an outstanding
-claim are indistinguishable, because they are the same thing.
+The consequence worth stating: an admission and a claim are the same kind of
+thing, so the same machinery serves both. They are still told apart — see the
+admission marker below — because the two surfaces close them differently.
 
 ### An admission is never queued
 
@@ -80,6 +81,35 @@ The references are a digest rather than a list because they are corpus
 identities the caller supplied, and copying them into a dispatch record would
 put a caller's claimed reading list somewhere the team overview reads. Refusing
 a changed retry needs only equality.
+
+`AdmittedObligation` holds the obligation the grant returned, as a bitmap over
+the canonical order of the declared references. **A replay returns that
+obligation; it never recomputes one.** The co-occurrence budget is windowed and
+moves as an identity reads, so recomputing would let a caller replay its way
+into a weaker obligation while holding the same live token — and would make an
+already-granted admission unrecoverable for as long as the restrictor was
+unreachable, which is the case a retry exists for. Positions rather than
+identities, for the same reason the declaration is a digest: a position
+discloses nothing without the list it indexes, and the caller supplies that
+list again on the retry, where the digest proves it is the same one.
+
+### An admission is distinguishable from a dispatch action
+
+`AdmittedEffects` is the marker — an admission is refused before it reaches a
+record unless it declares an effect, and no dispatch enqueue ever sets one.
+
+Both read paths check it. `report` refuses a dispatch action as not-found:
+without that, a claimed dispatch action owned by the same caller passes every
+other check and gets completed under admission's semantics rather than its own,
+and those differ where it matters — a reported failure is a receipt here and
+the executor's error there, so a worker would be told its failed work had
+succeeded. `outstanding` filters on it too, because listing a record this
+surface refuses to close would name work the caller cannot act on.
+
+This narrows a claim made earlier in this document. Before the marker existed,
+an outstanding admission and an outstanding claim genuinely were
+indistinguishable; they are not any more, and the surface no longer pretends
+otherwise.
 
 ## The three answers
 
@@ -174,6 +204,15 @@ carrying one, and a failure carrying an outcome. The last matters most — the
 completion path discards a failed report's outcome, so the record would say
 nothing about it and the replay comparison would read any two failures with the
 same error code as the same report.
+
+The error code and the outcome are both validated *before* anything is
+completed. The completion path is written for an executor that has already
+performed the work, so it records a malformed result as
+`invalid_executor_error` or `invalid_executor_output` rather than refusing it.
+Reaching that from here would spend a live one-shot token on a failure the
+caller was never told about and leave it unable to report the outcome it
+actually has. Nothing about the underlying call is known from a malformed
+report, so it is refused with no durable transition and the token stays usable.
 
 **Reporting a failure is a successful report.** The completion path is built
 for an executor, where a failed outcome is the executor's error and is returned

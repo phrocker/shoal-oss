@@ -47,6 +47,23 @@ func (r *stubRestrictor) RestrictDisclosure(
 	return append([]shoal.ID(nil), r.allowed...), nil
 }
 
+// wideningRestrictor admits one more reference on every call, standing in for
+// the co-occurrence budget's window moving between a grant and a retry. A
+// service that re-adjudicates a replay hands the later, weaker answer back.
+type wideningRestrictor struct {
+	calls int
+}
+
+func (r *wideningRestrictor) RestrictDisclosure(
+	_ context.Context, references []shoal.ID,
+) ([]shoal.ID, error) {
+	r.calls++
+	if r.calls > len(references) {
+		return append([]shoal.ID(nil), references...), nil
+	}
+	return append([]shoal.ID(nil), references[:r.calls-1]...), nil
+}
+
 // admissionDescriptor declares one action per effect class combination the
 // tests need, bound to an executor whose ceiling covers all of them, so a
 // denial in these tests is always the action's declaration and never the
@@ -890,6 +907,307 @@ func TestReportKeepsAnUnconfirmedOutcomeAnError(t *testing.T) {
 	}
 }
 
+// TestReplayReturnsTheObligationTheTokenWasGrantedUnder pins that the decision
+// is replayed, not re-made.
+//
+// The restrictor is windowed and observes intervening calls, so recomputing on
+// a retry can return a weaker obligation for a token that is already live — a
+// caller could replay its way out of a restriction it was told to honour. The
+// stub here returns a narrower answer on every call, which a recomputing
+// implementation would hand straight back.
+func TestReplayReturnsTheObligationTheTokenWasGrantedUnder(t *testing.T) {
+	restrictor := &wideningRestrictor{}
+	harness := newAdmissionHarness(t, restrictor)
+	request := harness.request(
+		"request", "admission", "complete", Effects{EffectEgressesContent},
+		[]shoal.ID{"doc-a", "doc-b"})
+	grant, err := harness.service.Request(
+		harness.context(t, "request"), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if grant.Outcome != AdmissionObligated ||
+		len(grant.Obligations.Withhold) != 2 {
+		t.Fatalf("first grant = %#v", grant)
+	}
+
+	replayed, err := harness.service.Request(
+		harness.context(t, "request"), request)
+	if err != nil {
+		t.Fatalf("replay = %v", err)
+	}
+	if replayed.Outcome != grant.Outcome ||
+		len(replayed.Obligations.Withhold) != 2 ||
+		replayed.Obligations.Withhold[0] != grant.Obligations.Withhold[0] ||
+		replayed.Obligations.Withhold[1] != grant.Obligations.Withhold[1] {
+		t.Fatalf("replay weakened the obligation: %#v, was %#v",
+			replayed.Obligations, grant.Obligations)
+	}
+	if restrictor.calls != 1 {
+		t.Fatalf("replay re-adjudicated: restrictor called %d times",
+			restrictor.calls)
+	}
+}
+
+// TestReplayRecoversAGrantWhileTheRestrictorIsDown pins the other half. An
+// admission that was granted must stay recoverable: a caller that lost its
+// response has an outstanding token it cannot report against until it can read
+// the grant back, and a transient outage in a control that has already been
+// consulted must not extend into one.
+func TestReplayRecoversAGrantWhileTheRestrictorIsDown(t *testing.T) {
+	restrictor := &stubRestrictor{allowed: []shoal.ID{"doc-a"}}
+	harness := newAdmissionHarness(t, restrictor)
+	request := harness.request(
+		"request", "admission", "complete", Effects{EffectEgressesContent},
+		[]shoal.ID{"doc-a", "doc-b"})
+	grant, err := harness.service.Request(
+		harness.context(t, "request"), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	restrictor.err = errors.New("ledger unavailable")
+	replayed, err := harness.service.Request(
+		harness.context(t, "request"), request)
+	if err != nil {
+		t.Fatalf("replay during a restrictor outage = %v", err)
+	}
+	if !bytes.Equal(replayed.Token.TokenID, grant.Token.TokenID) ||
+		replayed.Token.Version != grant.Token.Version {
+		t.Fatalf("replay = %#v, want the original token %#v",
+			replayed.Token, grant.Token)
+	}
+	if len(replayed.Obligations.Withhold) != 1 ||
+		replayed.Obligations.Withhold[0] != "doc-b" {
+		t.Fatalf("replayed obligation = %#v", replayed.Obligations)
+	}
+}
+
+// TestObligationBitmapRoundTripsPositions pins the encoding the replay depends
+// on: the stored positions must name the same references when indexed back
+// against the declared list, and nothing must be stored when nothing is
+// withheld.
+func TestObligationBitmapRoundTripsPositions(t *testing.T) {
+	declared := make([]shoal.ID, 20)
+	for i := range declared {
+		declared[i] = shoal.ID("doc-" + string(rune('a'+i)))
+	}
+	withheld := Obligations{Withhold: []shoal.ID{
+		declared[0], declared[7], declared[8], declared[19],
+	}}
+	bitmap := obligationBitmap(declared, withheld)
+	if len(bitmap) != 3 {
+		t.Fatalf("bitmap length = %d, want one bit per declared reference", len(bitmap))
+	}
+	rebuilt := obligationFromBitmap(bitmap, declared)
+	if len(rebuilt.Withhold) != len(withheld.Withhold) {
+		t.Fatalf("rebuilt = %#v, want %#v", rebuilt, withheld)
+	}
+	for i := range withheld.Withhold {
+		if rebuilt.Withhold[i] != withheld.Withhold[i] {
+			t.Fatalf("rebuilt[%d] = %q, want %q",
+				i, rebuilt.Withhold[i], withheld.Withhold[i])
+		}
+	}
+	if obligationBitmap(declared, Obligations{}) != nil {
+		t.Fatal("an empty obligation must store nothing")
+	}
+	if len(obligationFromBitmap(nil, declared).Withhold) != 0 {
+		t.Fatal("no stored obligation must rebuild as no obligation")
+	}
+}
+
+// TestReportRefusesAMalformedFailureWithoutSpendingTheToken pins that a report
+// the service will not record leaves the token usable.
+//
+// The completion path is written for an executor that has already performed the
+// work, so it records a malformed result as invalid_executor_error rather than
+// refusing it. Reaching that from here would spend a live one-shot token on a
+// failure the caller was never told about, and leave it unable to report the
+// outcome it actually has.
+func TestReportRefusesAMalformedFailureWithoutSpendingTheToken(t *testing.T) {
+	harness := newAdmissionHarness(t, nil)
+	grant, err := harness.service.Request(
+		harness.context(t, "request"), harness.request(
+			"request", "admission", "complete",
+			Effects{EffectEgressesContent}, nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, code := range []string{
+		strings.Repeat("x", MaxActionErrorBytes+1),
+		" untrimmed",
+	} {
+		if _, err := harness.service.Report(
+			harness.context(t, "report"), AdmissionReport{
+				Token: grant.Token, Failed: true, ErrorCode: code,
+				Context: dispatchContext(harness.now, "report"),
+			},
+		); !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
+			t.Fatalf("malformed error code %q = %v", code, err)
+		}
+	}
+	// A malformed outcome is the same shape of problem and gets the same
+	// answer: the completion path would commit invalid_executor_output.
+	if _, err := harness.service.Report(
+		harness.context(t, "report"), AdmissionReport{
+			Token: grant.Token, Outcome: json.RawMessage(`"not-an-object"`),
+			Context: dispatchContext(harness.now, "report"),
+		},
+	); !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
+		t.Fatalf("malformed outcome = %v", err)
+	}
+
+	stored, err := harness.store.GetAction(
+		context.Background(), []byte("admission"))
+	if err != nil || stored.State != DispatchClaimed || stored.Version != 1 {
+		t.Fatalf("a refused report moved the record: %#v, %v", stored, err)
+	}
+	// The token still works.
+	if _, err := harness.service.Report(
+		harness.context(t, "report"), AdmissionReport{
+			Token: grant.Token, Outcome: json.RawMessage(`{"tokens":1}`),
+			Context: dispatchContext(harness.now, "report"),
+		}); err != nil {
+		t.Fatalf("token was spent by the refused reports: %v", err)
+	}
+}
+
+// TestAdmissionSurfaceRefusesOrdinaryDispatchActions pins the read side of the
+// admission marker.
+//
+// A claimed dispatch action owned by the same principal passes every other
+// check on the report path — the registry resolves it, the claim is live — and
+// would then be completed under this surface's semantics rather than its own. A
+// reported failure is a receipt here and the executor's error there, so a
+// worker completing through this endpoint would be told its failed work had
+// succeeded.
+func TestAdmissionSurfaceRefusesOrdinaryDispatchActions(t *testing.T) {
+	harness := newAdmissionHarness(t, nil)
+	dispatcher := bindDecision(t, harness.authority, dispatchDecision(
+		t, "owner", "actor", "request",
+		auth.OperationDispatch, auth.OperationInvoke))
+	queued, err := harness.dispatch.Enqueue(dispatcher, EnqueueRequest{
+		ID: []byte("dispatched"), IdempotencyKey: []byte("idempotency-dispatched"),
+		AgentID: "agent", AgentGeneration: 1,
+		Capability: "model", Action: "complete",
+		SourceID: []byte("source"), PolicyID: []byte("policy"),
+		ObjectID: "object",
+		Input:    json.RawMessage(`{"prompt_digest":"abc"}`),
+		Context:  dispatchContext(harness.now, "request"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := harness.dispatch.Claim(dispatcher, ClaimRequest{
+		ID: queued.ID, ExpectedVersion: queued.Version,
+		ClaimID: []byte("worker"), Lease: time.Minute,
+		Context: dispatchContext(harness.now, "request"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Not-found, and identical to a token naming nothing at all: the caller
+	// owns this record, and saying so would distinguish a dispatch action it
+	// holds from an admission identity that does not exist.
+	token := AdmissionToken{
+		ActionID: claimed.ID, TokenID: claimed.ClaimID,
+		Version: claimed.Version,
+	}
+	_, presentErr := harness.service.Report(
+		harness.context(t, "report"), AdmissionReport{
+			Token: token, Outcome: json.RawMessage(`{"tokens":1}`),
+			Context: dispatchContext(harness.now, "report"),
+		})
+	absent := token
+	absent.ActionID = []byte("never-existed")
+	_, absentErr := harness.service.Report(
+		harness.context(t, "report"), AdmissionReport{
+			Token: absent, Outcome: json.RawMessage(`{"tokens":1}`),
+			Context: dispatchContext(harness.now, "report"),
+		})
+	if !shoal.IsErrorCode(presentErr, shoal.ErrorNotFound) {
+		t.Fatalf("reporting a dispatch action = %v", presentErr)
+	}
+	if presentErr.Error() != absentErr.Error() {
+		t.Fatalf("refusal distinguished a dispatch action from nothing: %q vs %q",
+			presentErr, absentErr)
+	}
+	if stored, err := harness.store.GetAction(
+		context.Background(), []byte("dispatched"),
+	); err != nil || stored.State != DispatchClaimed {
+		t.Fatalf("refused report moved the dispatch record: %#v, %v", stored, err)
+	}
+
+	// Nor is it outstanding. Listing a record this surface refuses to close
+	// would name work the caller cannot act on.
+	page, err := harness.service.Outstanding(
+		harness.context(t, "list"), OutstandingAdmissionsRequest{
+			Limit: 16, Context: dispatchContext(harness.now, "list"),
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Admissions) != 0 {
+		t.Fatalf("dispatch claim listed as an outstanding admission: %#v",
+			page.Admissions)
+	}
+}
+
+// TestDispatchReclaimAdvancesTheFence pins that the shared claim transition
+// advances the fence rather than assigning it.
+//
+// An admission is born claimed at fence one, which an assignment would also
+// produce — so the two cases only diverge on a re-claim, where a stale worker
+// holding the previous fence must become detectable. Nothing pinned this before
+// the two paths were merged into one function, and a shared assignment would
+// have silently let a reclaimed action keep its old fence.
+func TestDispatchReclaimAdvancesTheFence(t *testing.T) {
+	harness := newAdmissionHarness(t, nil)
+	dispatcher := bindDecision(t, harness.authority, dispatchDecision(
+		t, "owner", "actor", "request",
+		auth.OperationDispatch, auth.OperationInvoke))
+	queued, err := harness.dispatch.Enqueue(dispatcher, EnqueueRequest{
+		ID: []byte("dispatched"), IdempotencyKey: []byte("idempotency-dispatched"),
+		AgentID: "agent", AgentGeneration: 1,
+		Capability: "model", Action: "complete",
+		SourceID: []byte("source"), PolicyID: []byte("policy"),
+		ObjectID: "object",
+		Input:    json.RawMessage(`{"prompt_digest":"abc"}`),
+		Context:  dispatchContext(harness.now, "request"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := harness.dispatch.Claim(dispatcher, ClaimRequest{
+		ID: queued.ID, ExpectedVersion: queued.Version,
+		ClaimID: []byte("worker-one"), Lease: time.Minute,
+		Context: dispatchContext(harness.now, "request"),
+	})
+	if err != nil || first.ClaimFence != 1 {
+		t.Fatalf("first claim = %#v, %v", first, err)
+	}
+
+	// The lease lapses and a second worker takes the action.
+	harness.now = harness.now.Add(2 * time.Minute)
+	reclaimer := bindDecision(t, harness.authority, dispatchDecision(
+		t, "owner", "actor", "retry",
+		auth.OperationDispatch, auth.OperationInvoke))
+	second, err := harness.dispatch.Claim(reclaimer, ClaimRequest{
+		ID: queued.ID, ExpectedVersion: first.Version,
+		ClaimID: []byte("worker-two"), Lease: time.Minute,
+		Context: dispatchContext(harness.now, "retry"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.ClaimFence != first.ClaimFence+1 {
+		t.Fatalf("reclaim fence = %d, want %d",
+			second.ClaimFence, first.ClaimFence+1)
+	}
+}
+
 // TestAdmissionDisclosureDigestSeparatesDistinctSets pins the framing. Without
 // a length prefix per element, two different declarations concatenate to the
 // same bytes and a retry could swap one for the other under a live token.
@@ -966,6 +1284,27 @@ func TestAdmittedDeclarationShapeIsValidated(t *testing.T) {
 	if err := whole.Validate(); err != nil {
 		t.Fatalf("complete declaration = %v", err)
 	}
+
+	// An obligation names positions in a declared list. Without the list there
+	// is nothing for it to index, and a record carrying one has been assembled
+	// by something that did not go through the grant path.
+	unanchored := base
+	unanchored.AdmittedEffects = Effects{EffectEgressesContent}
+	unanchored.AdmittedObligation = []byte{0b0000_0001}
+	if err := unanchored.Validate(); err == nil {
+		t.Fatal("accepted an obligation with no declared references")
+	}
+	oversized := whole
+	oversized.AdmittedObligation = make(
+		[]byte, MaxAdmittedObligationBytes+1)
+	if err := oversized.Validate(); err == nil {
+		t.Fatal("accepted an obligation wider than the declaration bound")
+	}
+	obliged := whole
+	obliged.AdmittedObligation = []byte{0b0000_0001}
+	if err := obliged.Validate(); err != nil {
+		t.Fatalf("complete obligation = %v", err)
+	}
 }
 
 // TestAdmissionRecordDoesNotAliasItsDeclaration pins that a record handed out
@@ -976,12 +1315,15 @@ func TestAdmittedDeclarationShapeIsValidated(t *testing.T) {
 // caller writing through the header it was given. A record that aliases store
 // state lets whatever holds it edit what was admitted after the fact.
 func TestAdmissionRecordDoesNotAliasItsDeclaration(t *testing.T) {
-	harness := newAdmissionHarness(t, nil)
+	// A restrictor that withholds, so the record carries an obligation as well
+	// as a declaration; all three fields have to be independently owned.
+	restrictor := &stubRestrictor{allowed: []shoal.ID{"doc-a"}}
+	harness := newAdmissionHarness(t, restrictor)
 	if _, err := harness.service.Request(
 		harness.context(t, "request"), harness.request(
 			"request", "admission", "complete",
 			Effects{EffectEgressesContent},
-			[]shoal.ID{"doc-a"})); err != nil {
+			[]shoal.ID{"doc-a", "doc-b"})); err != nil {
 		t.Fatal(err)
 	}
 	handed, err := harness.store.GetAction(
@@ -990,11 +1332,13 @@ func TestAdmissionRecordDoesNotAliasItsDeclaration(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(handed.AdmittedEffects) != 1 ||
-		len(handed.AdmittedDisclosures) == 0 {
+		len(handed.AdmittedDisclosures) == 0 ||
+		len(handed.AdmittedObligation) == 0 {
 		t.Fatalf("stored declaration = %#v", handed)
 	}
 	handed.AdmittedEffects[0] = EffectMutatesExternal
 	handed.AdmittedDisclosures[0] ^= 0xff
+	handed.AdmittedObligation[0] ^= 0xff
 
 	reread, err := harness.store.GetAction(
 		context.Background(), []byte("admission"))
@@ -1007,6 +1351,11 @@ func TestAdmissionRecordDoesNotAliasItsDeclaration(t *testing.T) {
 	}
 	if bytes.Equal(reread.AdmittedDisclosures, handed.AdmittedDisclosures) {
 		t.Fatal("declared references were edited through the handed record")
+	}
+	// The obligation most of all: editing it through a handed-out record would
+	// change what a replay tells the caller to withhold.
+	if bytes.Equal(reread.AdmittedObligation, handed.AdmittedObligation) {
+		t.Fatal("the obligation was edited through the handed record")
 	}
 }
 
@@ -1040,33 +1389,120 @@ func TestAdmissionClampsItsLeaseToTheActionDeadline(t *testing.T) {
 	}
 }
 
-// TestAdmissionChargesAPossibleExternalEffectLikeAClaim pins that a grant and a
-// plain dispatch claim of the same action agree about what may already have
-// happened. Egress is deliberately not charged: transmitting content is a
-// disclosure, not an effect leaving a record elsewhere to reconcile against.
-func TestAdmissionChargesAPossibleExternalEffectLikeAClaim(t *testing.T) {
+// TestAdmissionChargesAPossibleEffectExactlyAsAClaimDoes pins that a grant and
+// a plain dispatch claim of the same action agree about what may already have
+// happened.
+//
+// Egress counts. An earlier version of this test asserted the opposite,
+// carrying forward a rationale that had already been corrected on the dispatch
+// side — so the test defended the drift instead of catching it. A caller
+// granted permission to transmit may have transmitted before it went silent,
+// and content that left the host cannot be recalled, so a record asserting no
+// effect was possible asserts the one thing nobody knows.
+func TestAdmissionChargesAPossibleEffectExactlyAsAClaimDoes(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		id     string
+		action string
+		effect Effect
+	}{
+		{"external", "mutating", "publish", EffectMutatesExternal},
+		{"egress", "egressing", "complete", EffectEgressesContent},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			harness := newAdmissionHarness(t, nil)
+			if _, err := harness.service.Request(
+				harness.context(t, "request"), harness.request(
+					"request", test.id, test.action,
+					Effects{test.effect}, nil)); err != nil {
+				t.Fatal(err)
+			}
+			granted, err := harness.store.GetAction(
+				context.Background(), []byte(test.id))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !granted.EffectPossible {
+				t.Fatalf("%s admission left EffectPossible false", test.name)
+			}
+		})
+	}
+
+	// An action that neither transmits nor mutates leaves its whole outcome in
+	// Shoal's own record, so nothing has to be assumed about it. Without this
+	// the assertion above would pass against a grant that set the flag
+	// unconditionally.
 	harness := newAdmissionHarness(t, nil)
 	if _, err := harness.service.Request(
 		harness.context(t, "request"), harness.request(
-			"request", "mutating", "publish",
-			Effects{EffectMutatesExternal}, nil)); err != nil {
+			"request", "reading", "summarize",
+			Effects{EffectReadsCorpus}, nil)); err != nil {
 		t.Fatal(err)
 	}
-	mutating, err := harness.store.GetAction(
-		context.Background(), []byte("mutating"))
-	if err != nil || !mutating.EffectPossible {
-		t.Fatalf("external-effect admission = %#v, %v", mutating, err)
+	reading, err := harness.store.GetAction(
+		context.Background(), []byte("reading"))
+	if err != nil || reading.EffectPossible {
+		t.Fatalf("corpus-read admission = %#v, %v", reading, err)
 	}
+}
+
+// TestAdmissionAndDispatchClaimAgreeOnTheRecord pins the structural fix behind
+// that agreement: the two paths write the same claim state because they are the
+// same function, not because two conditions were kept in step.
+func TestAdmissionAndDispatchClaimAgreeOnTheRecord(t *testing.T) {
+	harness := newAdmissionHarness(t, nil)
 	if _, err := harness.service.Request(
 		harness.context(t, "request"), harness.request(
-			"request", "egressing", "complete",
+			"request", "admitted", "complete",
 			Effects{EffectEgressesContent}, nil)); err != nil {
 		t.Fatal(err)
 	}
-	egressing, err := harness.store.GetAction(
-		context.Background(), []byte("egressing"))
-	if err != nil || egressing.EffectPossible {
-		t.Fatalf("egress-only admission = %#v, %v", egressing, err)
+	admitted, err := harness.store.GetAction(
+		context.Background(), []byte("admitted"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	dispatcher := bindDecision(t, harness.authority, dispatchDecision(
+		t, "owner", "actor", "request",
+		auth.OperationDispatch, auth.OperationInvoke))
+	queued, err := harness.dispatch.Enqueue(dispatcher, EnqueueRequest{
+		ID: []byte("dispatched"), IdempotencyKey: []byte("idempotency-dispatched"),
+		AgentID: "agent", AgentGeneration: 1,
+		Capability: "model", Action: "complete",
+		SourceID: []byte("source"), PolicyID: []byte("policy"),
+		ObjectID: "object",
+		Input:    json.RawMessage(`{"prompt_digest":"abc"}`),
+		Context:  dispatchContext(harness.now, "request"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := harness.dispatch.Claim(dispatcher, ClaimRequest{
+		ID: queued.ID, ExpectedVersion: queued.Version,
+		ClaimID: []byte("token-dispatched"), Lease: time.Minute,
+		Context: dispatchContext(harness.now, "request"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if admitted.EffectPossible != claimed.EffectPossible {
+		t.Fatalf("EffectPossible: admission %v, dispatch claim %v",
+			admitted.EffectPossible, claimed.EffectPossible)
+	}
+	// The execution fingerprint is deliberately not compared. It digests the
+	// decision, and the two paths cannot run under the same one: Enqueue
+	// requires dispatch authority and an admission requires only invoke. Every
+	// other part of the claim state is a function of the action and the lease,
+	// so it must match exactly.
+	if admitted.State != claimed.State ||
+		admitted.ClaimFence != claimed.ClaimFence ||
+		admitted.ClaimLease != claimed.ClaimLease ||
+		!admitted.ClaimLeaseUntil.Equal(claimed.ClaimLeaseUntil) ||
+		admitted.ExecutionPolicyGeneration != claimed.ExecutionPolicyGeneration ||
+		!admitted.ExecutionExpiresAt.Equal(claimed.ExecutionExpiresAt) {
+		t.Fatalf("claim state diverged:\n admission %#v\n dispatch  %#v",
+			admitted, claimed)
 	}
 }
 

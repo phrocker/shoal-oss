@@ -337,7 +337,7 @@ func (s *AdmissionService) Request(
 		return AdmissionGrant{}, readErr
 	}
 	if readErr == nil {
-		return s.replay(ctx, decision, request, disclosures, current, base, now)
+		return s.replay(request, disclosures, current, base, now)
 	}
 	// The declaration is checked against what the descriptor permits, resolved
 	// under this decision. The ceiling the executor was bound to is already
@@ -350,7 +350,13 @@ func (s *AdmissionService) Request(
 	if err != nil {
 		return AdmissionGrant{}, err
 	}
-	granted, err := s.commit(ctx, admitted(base, action, request, decision, now))
+	record, err := applyClaim(
+		base, action, request.TokenID, request.Lease, decision, now)
+	if err != nil {
+		return AdmissionGrant{}, err
+	}
+	record.AdmittedObligation = obligationBitmap(disclosures, obligations)
+	granted, err := s.commit(ctx, record)
 	if err != nil {
 		return AdmissionGrant{}, err
 	}
@@ -363,9 +369,12 @@ func (s *AdmissionService) Request(
 // adjudication: the action ID and the token are the caller's to choose, and
 // reusing them for a different declaration has to fail rather than quietly
 // produce a different answer under the same token.
+// It takes no context and no decision, and that absence is the point: a replay
+// consults nothing. Both were parameters until the obligation became durable,
+// and needing neither is how this function now demonstrates that it re-runs no
+// control. The caller's authority is still checked — Request resolves the
+// action binding under the decision before it ever gets here.
 func (s *AdmissionService) replay(
-	ctx context.Context,
-	decision auth.Decision,
 	request AdmissionRequest,
 	disclosures []shoal.ID,
 	current, base ActionRecord,
@@ -396,50 +405,59 @@ func (s *AdmissionService) replay(
 		!now.Before(current.ClaimLeaseUntil) {
 		return AdmissionGrant{}, ErrAdmissionConflict
 	}
-	obligations, err := s.obligations(ctx, decision, request, disclosures, now)
-	if err != nil {
-		return AdmissionGrant{}, err
-	}
-	return grantFor(current, obligations), nil
+	// Replayed from the record, never recomputed. The obligation is the
+	// decision this token was granted under, and the control it comes from is
+	// windowed: recomputing it here would let a caller replay into a weaker
+	// obligation while holding the same live token, and would make a grant
+	// unrecoverable for as long as the restrictor was unreachable. The digest
+	// compared above proves the declared list is the one these indices index.
+	return grantFor(
+		current, obligationFromBitmap(current.AdmittedObligation, disclosures),
+	), nil
 }
 
-// admitted turns the adjudicated base record into the claimed record a grant
-// commits.
+// obligationBitmap records which of the canonically ordered declared references
+// the grant obliged the caller to withhold.
 //
-// The claim state is built here rather than by calling Claim, because Claim is
-// a second mutation and the whole point is that there is only one. Everything
-// Claim would set is set: the fence starts at one, the lease is clamped to the
-// action deadline, and the execution authorization provenance comes from this
-// decision.
-func admitted(
-	base ActionRecord,
-	action Action,
-	request AdmissionRequest,
-	decision auth.Decision,
-	now time.Time,
-) ActionRecord {
-	record := base
-	record.State = DispatchClaimed
-	record.ClaimID = append([]byte(nil), request.TokenID...)
-	record.ClaimFence = 1
-	record.ClaimLease = request.Lease
-	record.ClaimLeaseUntil = now.Add(request.Lease)
-	if record.ClaimLeaseUntil.After(record.Deadline) {
-		record.ClaimLeaseUntil = record.Deadline
+// Positions, not identities: the record must not carry another principal's
+// corpus references, and a position is meaningless without the list it indexes.
+// Nil when nothing is withheld, so an unobligated grant and a dispatched action
+// store the same absence.
+func obligationBitmap(
+	disclosures []shoal.ID, obligations Obligations,
+) []byte {
+	if len(obligations.Withhold) == 0 {
+		return nil
 	}
-	record.ExecutionFingerprint = record.AuthorizationFingerprint
-	record.ExecutionPolicyGeneration = decision.PolicyGeneration()
-	record.ExecutionExpiresAt = decision.AuthenticationExpires()
-	// Charged from the action's declared effects rather than from the narrower
-	// set this admission declared, exactly as Claim charges it. The record has
-	// to agree with what a plain dispatch claim of the same action would say;
-	// an admission that declared less has still been handed a claim on an
-	// action that declares more, and nothing outside the caller constrains
-	// which of the two it acts on.
-	if action.Effects.contains(EffectMutatesExternal) {
-		record.EffectPossible = true
+	withheld := make(map[shoal.ID]struct{}, len(obligations.Withhold))
+	for _, reference := range obligations.Withhold {
+		withheld[reference] = struct{}{}
 	}
-	return record
+	bitmap := make([]byte, (len(disclosures)+7)/8)
+	for index, reference := range disclosures {
+		if _, ok := withheld[reference]; ok {
+			bitmap[index/8] |= 1 << (index % 8)
+		}
+	}
+	return bitmap
+}
+
+// obligationFromBitmap rebuilds a stored obligation against the declared list
+// the caller supplied again.
+//
+// A bit set beyond the declared list is ignored rather than rejected. The
+// digest has already proven this is the same declaration the bitmap was built
+// from, so a position past its end cannot come from a caller changing the list;
+// it can only come from a tampered record, and the conservative reading of one
+// is the obligation it can still express rather than none at all.
+func obligationFromBitmap(bitmap []byte, disclosures []shoal.ID) Obligations {
+	var result Obligations
+	for index, reference := range disclosures {
+		if index/8 < len(bitmap) && bitmap[index/8]&(1<<(index%8)) != 0 {
+			result.Withhold = append(result.Withhold, reference)
+		}
+	}
+	return result
 }
 
 // deny commits the refusal as a cancelled record.
@@ -663,6 +681,18 @@ func (s *AdmissionService) Report(
 			shoal.ErrorInvalidArgument,
 			"a failed admission report carries no outcome")
 	}
+	// Validated here rather than left to the completion path. That path is
+	// written for an executor which has already performed the work, so a
+	// malformed result has to be recorded as something: it commits
+	// invalid_executor_error and returns an error. For a report that is exactly
+	// wrong — it spends a live one-shot token on a failure the caller was never
+	// told about, and leaves it unable to report the outcome it actually has.
+	// Nothing about the underlying call is known from a malformed report, so
+	// refusing it before anything is written is the only answer that keeps the
+	// token usable.
+	if err := validateActionErrorCode(report.ErrorCode); err != nil {
+		return ActionRecord{}, err
+	}
 	current, err := dispatch.authorizedCurrent(
 		ctx, decision, report.Token.ActionID, auth.OperationInvoke, now)
 	if err != nil {
@@ -678,6 +708,20 @@ func (s *AdmissionService) Report(
 		}
 		return ActionRecord{}, err
 	}
+	// A dispatch action is not an admission and cannot be closed here. It would
+	// otherwise pass every check above — the principal owns it, the registry
+	// resolves it, the claim is live — and be completed under this surface's
+	// semantics instead of its own. Those differ where it matters: a reported
+	// failure is a receipt here and the executor's error there, so a worker
+	// completing through this endpoint would be told its failed work was
+	// recorded successfully.
+	//
+	// Not-found, not unauthorized. The caller may hold the record; what it does
+	// not hold is an admission, and saying which would distinguish a dispatch
+	// action it owns from an admission identity that does not exist.
+	if !current.isAdmission() {
+		return ActionRecord{}, auth.ObjectNotFound()
+	}
 	// Resolved for the OutputSchema the report is validated against.
 	// authorizedCurrent has already resolved and authorized this action and
 	// discarded what it resolved; this is how the declared schema is obtained,
@@ -690,9 +734,18 @@ func (s *AdmissionService) Report(
 	if err != nil {
 		return ActionRecord{}, err
 	}
-	output, outputErr := reportedOutput(action, report)
+	// The outcome is validated against the declared schema here for the same
+	// reason the error code is, and before the terminal check for the same
+	// reason again: the completion path would commit invalid_executor_output
+	// and spend the token, and answering "spent" to a malformed report would
+	// tell a caller its report was well formed and merely late. A malformed
+	// report is malformed whether or not the token is still live.
+	output, err := reportedOutput(action, report)
+	if err != nil {
+		return ActionRecord{}, err
+	}
 	if current.State.terminal() {
-		if outputErr != nil || !sameReportedOutcome(current, report, output) {
+		if !sameReportedOutcome(current, report, output) {
 			return ActionRecord{}, ErrAdmissionSpent
 		}
 		if err := dispatch.publishTransition(
@@ -799,6 +852,14 @@ func (s *AdmissionService) Outstanding(
 	result := OutstandingAdmissionsPage{Next: append([]byte(nil), page.Next...)}
 	for _, record := range page.Actions {
 		if record.State != DispatchClaimed {
+			continue
+		}
+		// A worker's ordinary claim is not an outstanding admission. Before the
+		// record carried a marker the two were genuinely indistinguishable and
+		// this listed both, which was defensible then and is not now: Report
+		// refuses a dispatch action, so listing one here would name something
+		// as outstanding that this surface will not let the caller close.
+		if !record.isAdmission() {
 			continue
 		}
 		if !sameActionPrincipal(decision, record) {
