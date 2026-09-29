@@ -47,7 +47,7 @@ func (bindStubProvider) Ask(
 	return webapi.CitationEnvelope{}, errors.New("bind stub is never invoked")
 }
 
-func askAgentSpec(now time.Time) fleet.Spec {
+func askAgentSpec(now time.Time, provider webapi.AskProvider) fleet.Spec {
 	return fleet.Spec{
 		ID: "ask-agent", AuthorizationDomain: workspaceAuthorizationDomain,
 		Scopes: []fleet.Scope{{
@@ -60,6 +60,12 @@ func askAgentSpec(now time.Time) fleet.Spec {
 				Name:         webapi.AskAction,
 				InputSchema:  webapi.AskActionInputSchema(),
 				OutputSchema: webapi.AskActionOutputSchema(),
+				// Taken from the same exported source the executor derives its
+				// own bound from, rather than restated here. A descriptor that
+				// understates is refused at registration, and what it must
+				// declare depends on where the operator pointed the model
+				// provider — which is not something a registrant can guess.
+				Effects: webapi.AskActionEffects(provider),
 			}},
 		}},
 		LeaseExpiresAt: now.Add(10 * time.Minute),
@@ -212,7 +218,7 @@ func TestAskExecutorCommitsEvidenceAgainstRealCorpus(t *testing.T) {
 				Deadline: now.Add(time.Minute),
 			},
 			RegistrationKey: "ask-registration",
-			Spec:            askAgentSpec(now),
+			Spec:            askAgentSpec(now, chat),
 		})
 	if err != nil {
 		t.Fatalf("register ask agent: %v", err)

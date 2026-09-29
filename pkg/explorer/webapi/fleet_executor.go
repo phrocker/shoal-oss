@@ -28,6 +28,7 @@ import (
 
 	"github.com/phrocker/shoal-oss/pkg/explorer/fleet"
 	"github.com/phrocker/shoal-oss/pkg/interaction"
+	"github.com/phrocker/shoal-oss/pkg/model"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
@@ -197,27 +198,77 @@ func NewAskExecutor(config AskExecutorConfig) (*AskExecutor, error) {
 func (e *AskExecutor) Capability() string { return e.capability }
 func (e *AskExecutor) Action() string     { return e.action }
 
-// This executor deliberately declares no effect ceiling, and the reason is
-// worth stating because the obvious declaration would be false.
+// MaxEffects declares what this executor may do, derived from the provider it
+// was actually configured with.
 //
-// It mutates nothing outside Shoal, so fleet.EffectEvidence looks correct. But
-// it hands retrieved passages to a configured model provider, and that provider
-// may post them off-host: the web composition builds it from Ollama or an
-// OpenAI-compatible generator, and only the former is loopback by default.
-// Declaring evidence-only would assert that nothing leaves the host, while the
-// action may transmit corpus content and incur a billed call.
+// It always reads the corpus: that is the whole of what it does inside Shoal.
 //
-// The wider class is not the answer either. Declaring external would raise this
-// executor's ceiling and let genuinely external actions resolve to it, which is
-// worse than understating.
+// Whether it also transmits is not a property of this code. The executor hands
+// retrieved passages to a configured model provider, and the web composition
+// builds that from Ollama or an OpenAI-compatible generator against whatever
+// base URL the operator supplied. The same executor is egress-free against a
+// loopback provider and egress-bearing against a hosted one, so a constant
+// would be wrong for one of those deployments — which is why this returned
+// nothing at all until the taxonomy could express transmission (#385).
 //
-// The current two classes split on mutation and cannot express transmission, so
-// no honest declaration exists yet. Leaving it undeclared falls back to
-// evidence-only, which is the conservative reading for *enforcement*: an action
-// declaring an external effect still will not resolve here. It is not a claim
-// about what this executor does. Issue #385 adds the missing class, at which
-// point the ceiling should be derived from the configured provider rather than
-// returned as a constant.
+// A provider that cannot report its posture is treated as egressing. Silence
+// is not evidence that content stays put, and the permissive reading is the
+// wrong default for exactly the class that exists to gate transmission.
+//
+// It never declares external mutation. This executor changes nothing outside
+// Shoal, and declaring it would raise the ceiling enough for genuinely
+// external actions to resolve here.
+func (e *AskExecutor) MaxEffects() fleet.Effects {
+	if e == nil {
+		return AskActionEffects(nil)
+	}
+	return AskActionEffects(e.provider)
+}
+
+// AskActionEffects is the effect set a descriptor must register for this
+// action against the given provider.
+//
+// It is exported for the same reason AskActionInputSchema is: registration and
+// execution must not drift apart. A registrant cannot guess this — the answer
+// depends on where the operator pointed the model provider, not on the action
+// — and a descriptor that guesses low is refused at registration rather than
+// silently accepted.
+//
+// A nil provider is not "no egress". There is no configured provider to reason
+// about, so it reports the wider set; the executor cannot run without one
+// anyway.
+func AskActionEffects(provider AskProvider) fleet.Effects {
+	if provider == nil || model.EgressesOffHost(provider) {
+		return fleet.Effects{
+			fleet.EffectEgressesContent, fleet.EffectReadsCorpus,
+		}
+	}
+	return fleet.Effects{fleet.EffectReadsCorpus}
+}
+
+// MinEffects is the same set, because for this executor the ceiling is not a
+// permission envelope — it is a description. Every invocation reads the corpus,
+// and every invocation against a hosted provider transmits what it read.
+//
+// Declaring only the ceiling would leave the gap that a ceiling cannot close:
+// subset semantics permit an action to declare less than the truth, so an
+// action declaring only {EffectReadsCorpus} would resolve to a transmitting
+// executor and leave a descriptor that reads as non-transmitting while every
+// call transmits. Egress leaves no trace in Shoal's own record, so that
+// descriptor would be the only place anyone could have noticed.
+//
+// This is a breaking change for descriptors registered before it, and
+// deliberately so. A descriptor written under the superseded taxonomy declared
+// the evidence zero value, which decodes to the empty set — so it omits this
+// floor and stops resolving until it is re-registered. That is not an upgrade
+// bug to paper over: such a descriptor genuinely understates what invoking it
+// does, and it says nothing only because the taxonomy it was written under
+// could not say anything else. Grandfathering it would keep exactly the
+// descriptors this floor exists to reject.
+//
+// The refusal names the missing classes, so an operator sees what to add.
+// docs/shoal-explore-web-deploy.md carries the re-registration note.
+func (e *AskExecutor) MinEffects() fleet.Effects { return e.MaxEffects() }
 
 // AskActionInputSchema is the declarative schema a descriptor must register
 // for this action. Registering it from here keeps admission and execution from

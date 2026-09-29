@@ -65,33 +65,41 @@ type Scope struct {
 // invariant here can detect that.
 type Effect string
 
-// These two classes split on *mutation*, and only on mutation. They cannot
-// express transmission: an action that sends content off-host and changes
-// nothing is EffectEvidence under this definition, which is accurate about
-// consequence and silent about disclosure. Issue #385 adds the missing class.
-// Until it lands, an action that transmits has no declaration that is both
-// honest and available, so declare by what it changes and record the
-// limitation rather than picking whichever class feels safer.
+// The classes are a set, not a ladder, because the risks they name do not
+// order. Writing a local file mutates without transmitting. Streaming a
+// compartmented corpus to a hosted model transmits without mutating. Neither
+// is a subset of the other, so there is no answer to "does egress outrank
+// mutation" — and a ladder forces one.
+//
+// A set also matches machinery that already exists: capabilitiesSubset and
+// scopesSubset are subset semantics, and delegation narrowing falls out
+// unchanged.
 const (
-	// EffectEvidence is work that mutates nothing outside Shoal. Recording an
-	// interaction is the clearest case. It is the zero value, so a descriptor
-	// written before this field existed keeps its previous meaning.
+	// EffectReadsCorpus is work that reads Shoal's own evidence record.
+	EffectReadsCorpus Effect = "reads-corpus"
+	// EffectEgressesContent is work that transmits corpus content off the host
+	// running Shoal.
 	//
-	// It does not assert that nothing left the host. Reading the corpus and
-	// handing passages to a configured model provider mutates nothing and is
-	// therefore evidence under this definition, while the provider may be
-	// off-host. That is the gap #385 closes.
-	EffectEvidence Effect = ""
-	// EffectExternal is work that mutates something outside Shoal's evidence
-	// record: writing to another system, changing a host, sending a message
-	// that someone acts on. Shoal dispatches it and records the outcome; it
+	// It is not a property of the code. The same executor is egress-free
+	// against a loopback model provider and egress-bearing against a hosted
+	// one, so an executor declaring this must derive it from the provider it
+	// was actually configured with.
+	EffectEgressesContent Effect = "egresses-content"
+	// EffectMutatesExternal is work that changes something outside Shoal's
+	// evidence record: writing to another system, changing a host, sending a
+	// message someone acts on. Shoal dispatches it and records the outcome; it
 	// does not run it.
-	EffectExternal Effect = "external"
+	//
+	// Its wire value is deliberately the string the superseded two-value
+	// taxonomy used for the same meaning, so a descriptor written before the
+	// set existed decodes to exactly this and hashes identically. See
+	// Effects.digestBytes.
+	EffectMutatesExternal Effect = "external"
 )
 
 func (e Effect) validate() error {
 	switch e {
-	case EffectEvidence, EffectExternal:
+	case EffectReadsCorpus, EffectEgressesContent, EffectMutatesExternal:
 		return nil
 	default:
 		return shoal.NewError(
@@ -99,40 +107,256 @@ func (e Effect) validate() error {
 	}
 }
 
-// exceeds reports whether this effect is beyond what a ceiling permits.
+// Effects is a declared set of effect classes.
 //
-// Unrecognized values fail closed, and asymmetrically, because the two sides
-// mean opposite things. Registration validates a declaration, but the durable
-// decoder reads whatever string is stored, so a malformed or tampered
-// descriptor can reach resolution without ever having passed validation. An
-// unrecognized *declaration* is therefore treated as beyond every ceiling: it
-// is an unproven claim and gets the most restrictive reading. An unrecognized
-// *ceiling* is treated as permitting only evidence: it is a host that failed to
-// declare its own configuration and gets the least permissive reading.
+// The empty set is the zero value and means the action's consequences land
+// nowhere this taxonomy names — it reads nothing, transmits nothing and
+// changes nothing outside Shoal. That is also what a descriptor written before
+// this field existed decodes to, so old records keep their previous meaning.
+type Effects []Effect
+
+// canonicalEffects sorts and deduplicates a declared set, rejecting any class
+// it does not recognise.
 //
-// Both directions resolve to refusing more, never less. Comparing against the
-// exact external string alone made every unknown value permitted, which is the
-// opposite of what the class is for.
-func (e Effect) exceeds(ceiling Effect) bool {
-	declarationKnown := e.validate() == nil
-	ceilingKnown := ceiling.validate() == nil
-	switch {
-	case !declarationKnown:
-		return true
-	case !ceilingKnown:
-		return e != EffectEvidence
-	default:
-		return e == EffectExternal && ceiling != EffectExternal
+// Canonical order is what makes the set comparable and hashable: two
+// descriptors declaring the same classes in different order are the same
+// declaration and must not produce different digests.
+func canonicalEffects(declared Effects) (Effects, error) {
+	if len(declared) == 0 {
+		return nil, nil
 	}
+	seen := make(map[Effect]struct{}, len(declared))
+	result := make(Effects, 0, len(declared))
+	for _, effect := range declared {
+		if err := effect.validate(); err != nil {
+			return nil, err
+		}
+		if _, duplicate := seen[effect]; duplicate {
+			continue
+		}
+		seen[effect] = struct{}{}
+		result = append(result, effect)
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i] < result[j] })
+	return result, nil
+}
+
+// contains reports set membership.
+func (e Effects) contains(effect Effect) bool {
+	for _, declared := range e {
+		if declared == effect {
+			return true
+		}
+	}
+	return false
+}
+
+// exceeds reports whether this declaration asks for anything a ceiling does not
+// permit — that is, whether it is not a subset of the ceiling.
+//
+// Unrecognised values fail closed, and asymmetrically, because the two sides
+// mean opposite things. Registration validates a declaration, but the durable
+// decoder reads whatever strings are stored, so a malformed or tampered
+// descriptor can reach resolution without ever having passed validation.
+//
+// An unrecognised *declaration* is beyond every ceiling: it is an unproven
+// claim and gets the most restrictive reading. An unrecognised *ceiling*
+// permits nothing: it is a host that failed to declare its own configuration,
+// and the least permissive reading is the empty set. Both directions resolve to
+// refusing more, never less.
+//
+// The two guards overlap on purpose, and no single mutation of either is
+// observable: subset semantics already refuse an unrecognised declaration
+// against a valid ceiling, and an unrecognised ceiling member against a valid
+// declaration. What neither the subset check nor one guard alone catches is a
+// declaration and a ceiling that name the *same* unrecognised value, where
+// containment would report it permitted. Removing both is caught;
+// TestUnknownEffectsFailClosedAtResolution pins that case explicitly.
+func (e Effects) exceeds(ceiling Effects) bool {
+	for _, declared := range e {
+		if declared.validate() != nil {
+			return true
+		}
+	}
+	for _, permitted := range ceiling {
+		if permitted.validate() != nil {
+			return len(e) > 0
+		}
+	}
+	for _, declared := range e {
+		if !ceiling.contains(declared) {
+			return true
+		}
+	}
+	return false
+}
+
+// digestBytes returns what this set contributes to the registry mutation
+// digest, or nil to contribute nothing at all.
+//
+// Two cases must reproduce exactly what the superseded encoding produced,
+// because the digest namespace is still v1 and the value is embedded in the
+// lifecycle QueryDigest, where a changed digest reads as a divergent mutation.
+// A heartbeat or revoke retry that spans an upgrade would then be rejected.
+//
+//   - The empty set contributes nothing. That is the explicit branch below.
+//     Hashing an empty value is not the same thing: it still writes an
+//     eight-byte length prefix and would change every pre-existing digest.
+//   - Exactly {EffectMutatesExternal} must contribute the bare string the old
+//     external class wrote. There is no branch for it, and deliberately so:
+//     EffectMutatesExternal *is* that string, and joining a one-element set
+//     yields it unchanged. The compatibility lives in the constant's wire
+//     value, not in a special case here — which is the more robust place for
+//     it, since a special case can be removed without anything failing.
+//
+// Any other set is new — no descriptor could have declared it before this
+// change — so it is free to hash as its canonical comma-joined form.
+func (e Effects) digestBytes() []byte {
+	// Sorted and deduplicated here rather than trusting the caller. The same
+	// classes declared in a different order are the same declaration and must
+	// not hash differently, and this is reached from registryMutationDigest,
+	// which is handed a Mutation that has not necessarily been through
+	// canonicalCapabilities yet. Unknown values are not rejected here — they
+	// are refused at registration and at resolution — but they are ordered, so
+	// a tampered record still hashes deterministically.
+	ordered := make([]string, 0, len(e))
+	seen := make(map[Effect]struct{}, len(e))
+	for _, effect := range e {
+		if _, duplicate := seen[effect]; duplicate {
+			continue
+		}
+		seen[effect] = struct{}{}
+		ordered = append(ordered, string(effect))
+	}
+	sort.Strings(ordered)
+	if len(ordered) == 0 {
+		return nil
+	}
+	return []byte(strings.Join(ordered, ","))
+}
+
+// clone returns an independent copy, so a returned descriptor cannot be used
+// to mutate registry state.
+func (e Effects) clone() Effects {
+	if len(e) == 0 {
+		return nil
+	}
+	return append(Effects(nil), e...)
 }
 
 type Action struct {
 	Name         string          `json:"name"`
 	InputSchema  json.RawMessage `json:"input_schema"`
 	OutputSchema json.RawMessage `json:"output_schema"`
-	// Effect declares where this action's consequences land. Empty means
-	// evidence-only.
-	Effect Effect `json:"effect,omitempty"`
+	// Effects declares where this action's consequences land. The empty set
+	// means they land nowhere this taxonomy names.
+	Effects Effects `json:"effects,omitempty"`
+}
+
+// legacyEffect projects a set onto the superseded scalar spelling.
+//
+// That taxonomy had one axis — does this mutate anything outside Shoal — so
+// the projection is exactly that question, with one case it cannot answer.
+//
+//	{}                              ""          declares nothing
+//	{reads-corpus}                  ""          reading mutates nothing outside
+//	{mutates-external}              "external"
+//	{reads-corpus, mutates-external} "external"
+//
+// A set containing egress has no legacy value at all, and the two candidates
+// are not equally wrong. Reporting "" would tell a client that an action
+// shipping corpus content to a third party mutates nothing outside — true on
+// the old axis, and exactly the silence this whole change exists to end.
+// Reporting "external" overstates, and a client reading it treats the action as
+// work Shoal dispatches rather than performs. Overstating is the direction that
+// fails safe, so egress projects to "external".
+func (e Effects) legacyEffect() Effect {
+	if e.contains(EffectMutatesExternal) || e.contains(EffectEgressesContent) {
+		return EffectMutatesExternal
+	}
+	return ""
+}
+
+// MarshalJSON emits both spellings.
+//
+// Accepting the old request spelling does not preserve the wire API on its own.
+// The registry wire embeds []Capability directly, so a response that carries
+// only "effects" is silently lossy to a client that has not been rebuilt: it
+// unmarshals into its old model, finds no "effect" key, and reads the zero
+// value — concluding that an action mutating or transmitting does neither. That
+// is the safe-looking direction and therefore the dangerous one.
+//
+// Emitting the projection alongside the set means such a client is wrong only
+// in the cautious direction, and a current client reads "effects" and is not
+// wrong at all.
+func (a Action) MarshalJSON() ([]byte, error) {
+	type actionFields struct {
+		Name         string          `json:"name"`
+		InputSchema  json.RawMessage `json:"input_schema"`
+		OutputSchema json.RawMessage `json:"output_schema"`
+		Effects      Effects         `json:"effects,omitempty"`
+		LegacyEffect Effect          `json:"effect,omitempty"`
+	}
+	return json.Marshal(actionFields{
+		Name: a.Name, InputSchema: a.InputSchema,
+		OutputSchema: a.OutputSchema, Effects: a.Effects,
+		LegacyEffect: a.Effects.legacyEffect(),
+	})
+}
+
+// UnmarshalJSON accepts the superseded scalar spelling of the effect field
+// alongside the current set.
+//
+// The registry wire embeds []Capability directly, so these struct tags are the
+// HTTP contract, not an internal detail. Renaming the field outright would
+// reject every pre-upgrade registration at the transport — decodeRequest
+// disallows unknown fields — before it could reach the durable compatibility
+// path. A client that has not been rebuilt is not a malformed client.
+//
+// "effect": "external" becomes {EffectMutatesExternal} and "effect": "" becomes
+// the empty set, which is what the same values decode to from a version-2
+// durable record. Supplying both spellings is refused rather than merged: they
+// would be two declarations of the same thing, and picking a winner silently
+// would let a client believe it declared something it did not.
+//
+// Unknown fields stay refused. The decoder below re-applies the strictness the
+// outer decoder cannot reach through a custom unmarshaler.
+func (a *Action) UnmarshalJSON(data []byte) error {
+	type actionFields struct {
+		Name         string          `json:"name"`
+		InputSchema  json.RawMessage `json:"input_schema"`
+		OutputSchema json.RawMessage `json:"output_schema"`
+		Effects      Effects         `json:"effects"`
+		LegacyEffect *Effect         `json:"effect"`
+	}
+	var fields actionFields
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&fields); err != nil {
+		return err
+	}
+	if fields.LegacyEffect != nil {
+		if fields.Effects != nil {
+			// Both spellings are accepted together only when they agree,
+			// because that is what a client echoing one of our own responses
+			// sends back — MarshalJSON emits the projection alongside the set.
+			// Disagreement is two different declarations of the same thing, and
+			// picking a winner silently would let a client believe it declared
+			// something it did not.
+			if *fields.LegacyEffect != fields.Effects.legacyEffect() {
+				return shoal.NewError(shoal.ErrorInvalidArgument,
+					"action declares effect and effects inconsistently; "+
+						"supply only effects")
+			}
+		} else if *fields.LegacyEffect != "" {
+			fields.Effects = Effects{*fields.LegacyEffect}
+		}
+	}
+	*a = Action{
+		Name: fields.Name, InputSchema: fields.InputSchema,
+		OutputSchema: fields.OutputSchema, Effects: fields.Effects,
+	}
+	return nil
 }
 
 type Capability struct {
@@ -220,19 +444,88 @@ type ListPage struct {
 type Executor interface{}
 
 // EffectBounded is the host's declaration of what an executor is permitted to
-// do. An executor that does not implement it is treated as evidence-only,
-// which is the conservative reading: a host that wants an executor to perform
-// external work has to say so.
+// do. An executor that does not implement it permits nothing, which is the
+// conservative reading: a host that wants an executor to read the corpus,
+// transmit content, or perform external work has to say so.
 type EffectBounded interface {
-	MaxEffect() Effect
+	MaxEffects() Effects
 }
 
-// executorCeiling reports the effect class an executor may serve.
-func executorCeiling(executor Executor) Effect {
+// EffectFloored is an executor's declaration of what invoking it causes
+// *regardless of the action*, and it exists because a ceiling alone cannot
+// express that.
+//
+// A ceiling is an upper bound, so subset semantics permit an action to declare
+// less than the truth. A reasoning executor configured against a hosted model
+// transmits corpus content on every invocation, but an action declaring only
+// {EffectReadsCorpus} is a subset of its ceiling and resolves happily — leaving
+// a descriptor that reads as non-transmitting while every call transmits. That
+// is the wrong direction to be wrong in, because egress leaves no trace in
+// Shoal's own record for anyone to reconcile against later.
+//
+// An executor implementing this requires every action resolving to it to
+// declare at least these classes.
+type EffectFloored interface {
+	MinEffects() Effects
+}
+
+// executorCeiling reports the effect classes an executor may serve.
+func executorCeiling(executor Executor) Effects {
 	if bounded, ok := executor.(EffectBounded); ok {
-		return bounded.MaxEffect()
+		return bounded.MaxEffects()
 	}
-	return EffectEvidence
+	return nil
+}
+
+// executorFloor reports the effect classes invoking an executor always causes.
+//
+// The default is the empty set, not the ceiling. Defaulting to the ceiling
+// would be the more suspicious reading, but it would also be wrong for the
+// common case: a host binds a general-purpose external executor and declares
+// the widest thing it permits, while individual actions legitimately do less.
+// Forcing every action to restate the whole ceiling would make the declaration
+// carry no information at all.
+//
+// So this is a declaration seam like the ceiling, and it has the same limit: an
+// executor that transmits and declares no floor is a host misdescribing its own
+// configuration, which no invariant here can detect. What it does close is the
+// case where Shoal itself knows better — AskExecutor derives both bounds from
+// the provider it was configured with, so it cannot be bound as transmitting
+// and then have a non-transmitting action resolve to it.
+func executorFloor(executor Executor) Effects {
+	if floored, ok := executor.(EffectFloored); ok {
+		return floored.MinEffects()
+	}
+	return nil
+}
+
+// omits reports whether this declaration leaves out anything a floor requires.
+//
+// It is the mirror of exceeds and fails closed the same way: an unrecognised
+// value in the floor cannot be matched by any valid declaration, so it refuses.
+// missingFrom lists the floor classes this declaration leaves out, for an
+// error message that tells a registrant what to add.
+func (e Effects) missingFrom(floor Effects) []string {
+	var missing []string
+	for _, required := range floor {
+		if required.validate() != nil || !e.contains(required) {
+			missing = append(missing, string(required))
+		}
+	}
+	sort.Strings(missing)
+	return missing
+}
+
+func (e Effects) omits(floor Effects) bool {
+	for _, required := range floor {
+		if required.validate() != nil {
+			return true
+		}
+		if !e.contains(required) {
+			return true
+		}
+	}
+	return false
 }
 
 type ExecutorRegistry interface {
@@ -357,12 +650,13 @@ func canonicalCapabilities(input []Capability) ([]Capability, error) {
 			if err != nil {
 				return nil, err
 			}
-			if err := action.Effect.validate(); err != nil {
+			effects, err := canonicalEffects(action.Effects)
+			if err != nil {
 				return nil, err
 			}
 			result[i].Actions[j] = Action{
 				Name: action.Name, InputSchema: inputSchema,
-				OutputSchema: outputSchema, Effect: action.Effect,
+				OutputSchema: outputSchema, Effects: effects,
 			}
 		}
 		sort.Slice(result[i].Actions, func(a, b int) bool {
@@ -441,7 +735,7 @@ func cloneDescriptor(input Descriptor) Descriptor {
 			action := input.Capabilities[i].Actions[j]
 			result.Capabilities[i].Actions[j] = Action{
 				Name:         action.Name,
-				Effect:       action.Effect,
+				Effects:      action.Effects.clone(),
 				InputSchema:  append(json.RawMessage(nil), action.InputSchema...),
 				OutputSchema: append(json.RawMessage(nil), action.OutputSchema...),
 			}

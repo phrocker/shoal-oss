@@ -307,34 +307,48 @@ around (Q5).
 ## 6. What must not move into Shoal
 
 The SSH, RDP and API proxies are externally-effecting by definition, and Shoal
-runs only work whose effect lands in its own evidence record. On
-`feat/effect-boundary` that is a type: `Effect`, with `EffectEvidence` the zero
-value and `EffectExternal`, declared per `Action` and checked against the
-executor's ceiling (`feat/effect-boundary:pkg/explorer/fleet/model.go:66-101`,
-with `EffectBounded` and `executorCeiling` at `:191-198`).
+runs only work whose effect lands in its own evidence record.
 
-**Verify before relying on this: `Effect` is not on main.** I grepped `pkg/`,
-`internal/` and `cmd/` on the working branch and found no `Effect` type in
-`pkg/explorer/fleet/model.go`; it exists only on `feat/effect-boundary` (commits
-`4ea3207`, `f4e4fe4`) — PR #381 against issue #366, as the README says
-(README:108-114). Any plan depending on an enforced boundary depends on it.
+**This section was written against an unmerged branch and has been corrected.**
+It originally said the `Effect` type was not on main and existed only on
+`feat/effect-boundary`. That was true when written; #381, #384 and #385 have
+since landed, and three of the claims below changed materially.
 
-On that branch `validateDeclaredEffects` refuses to register a descriptor whose
-action declares `EffectExternal` against an executor the host bound as
-evidence-only (`service.go:690-702`, from `Register` at `:119`); `resolveAction`
-re-checks at dispatch, so rebinding an executor to a narrower ceiling stops live
-descriptors (`dispatch_service.go:967`); and `capabilitiesSubset` treats effect
-as something delegation may narrow but never widen (`service.go:752-780`). The
-shipped `AskExecutor` declares `MaxEffect() == EffectEvidence`
-(`webapi/fleet_executor.go:204`).
+`Effects` is a declared *set* per `Action`, not the two-value ladder the
+original note described: `EffectReadsCorpus`, `EffectEgressesContent` and
+`EffectMutatesExternal`, checked against the executor's ceiling via
+`EffectBounded.MaxEffects()` and `executorCeiling`. The classes do not order —
+writing a local file mutates without transmitting, streaming a corpus to a
+hosted model transmits without mutating — so `exceeds` is subset semantics
+rather than a comparison.
+
+`validateDeclaredEffects` refuses to register a descriptor whose action declares
+effects its executor was not bound for; `resolveActionBinding` re-checks at
+dispatch, so rebinding an executor to a narrower ceiling stops live descriptors;
+and `capabilitiesSubset` treats effects as something delegation may narrow but
+never widen.
+
+`AskExecutor` no longer declares a constant. It derives its ceiling from the
+model provider it was actually configured with, because transmission is
+configuration rather than code: the same executor is egress-free against a
+loopback provider and egress-bearing against a hosted one. A provider that
+cannot report its posture is treated as transmitting.
 
 **How a Sentrius proxy would register.** `POST /api/v1/fleet/agents`
 (`pkg/explorer/webapi/fleet_registry.go:68`) with a `Spec{ID,
 AuthorizationDomain, Scopes, ExecutorRef, Capabilities, LeaseExpiresAt}`
-(`fleet/model.go:76-84`) whose `Action` entries carry `Effect: EffectExternal`.
-Because the host binds no in-process executor willing to serve external effect,
-that descriptor can never resolve to in-process execution — a structural
-refusal, not a convention. The proxy heartbeats to hold its lease, work is
+whose `Action` entries carry `Effects: {EffectMutatesExternal}`. Because the
+host binds no in-process executor willing to serve external effect, that
+descriptor can never resolve to in-process execution — a structural refusal,
+not a convention.
+
+Corrected since #384: the bound reference needs no in-process `Execute` at all.
+`resolveAction` used to assert `ActionExecutor` for every path, which would have
+forced a remote deployment to bind a stub whose only purpose was to be refused.
+`resolveActionBinding` performs the same resolution — generation, scope,
+authorization, delegation, effect ceiling — without that assertion, and only
+`ExecuteClaim` demands something runnable. A gateway proxy therefore binds a
+reference that declares `MaxEffects()` and implements nothing else. The proxy heartbeats to hold its lease, work is
 enqueued (`POST /api/v1/fleet/actions`), and the proxy pulls and claims with a
 lease and fence (`fleet_dispatch.go:97-154`). The `ActionRecord` binds subject,
 actor, client, delegation chain, authorization fingerprint, policy generation

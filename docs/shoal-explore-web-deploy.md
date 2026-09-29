@@ -495,6 +495,43 @@ They render every profile, schema-check the output, and assert that each guard
 above still refuses and each valid configuration still renders. A guard that
 silently stops firing is the failure they exist to catch.
 
+## Upgrading: re-register reasoning descriptors
+
+The effect taxonomy became a set of classes — `reads-corpus`,
+`egresses-content`, `mutates-external` — replacing a two-value split that could
+only describe mutation. Durable records decode without a migration: a
+descriptor written before the change keeps its stored meaning, and the HTTP
+surface still accepts the superseded `"effect": "external"` spelling alongside
+the current `"effects": ["external"]`.
+
+**One thing does not survive the upgrade, deliberately.** A descriptor
+registered against the built-in reasoning executor declared the old evidence
+value, which decodes to an empty set. That executor now declares what invoking
+it *always* does — it reads the corpus, and against a hosted model provider it
+transmits what it read — and an action may not declare less than that. So those
+descriptors are refused until re-registered with their effects declared.
+
+This is the control working rather than an upgrade defect. Such a descriptor
+genuinely understates what running it does, and it says nothing only because
+the taxonomy it was written under could not say anything else. Accepting it
+would keep exactly the descriptors the check exists to reject: one that reads
+as non-transmitting while every call ships corpus content to a third party.
+
+The refusal names the missing classes:
+
+```console
+invalid_argument: action omits effects its executor causes on every invocation
+(egresses-content, reads-corpus); the declaration must not understate what
+running it does
+```
+
+Re-register with those classes in `effects`. What to declare depends on where
+`-chat-base-url` points, not on the action — a loopback provider transmits
+nothing — so take it from the executor rather than hardcoding it.
+
+Descriptors bound to any other executor are unaffected: an executor that
+declares no floor imposes none.
+
 ## Orchestrator probes: the health surface
 
 The host-authority gate above runs before routing, before authentication, and

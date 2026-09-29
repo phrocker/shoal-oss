@@ -260,10 +260,19 @@ func (s *DispatchService) Claim(ctx context.Context, request ClaimRequest) (Acti
 	// Without this a lease that expires after the work was done is
 	// indistinguishable from one that expired before it started.
 	//
-	// It is narrowed by the declaration from #381 rather than set for every
-	// claim. An evidence-only action mutates nothing outside Shoal, so its
-	// outcome is visible in Shoal's own record and needs no assumption.
-	if claimedAction.Effect == EffectExternal {
+	// It is narrowed by the declaration rather than set for every claim. An
+	// action that neither mutates externally nor transmits leaves its whole
+	// outcome in Shoal's own record, so nothing has to be assumed about it.
+	//
+	// Egress counts. An earlier version excluded it on the grounds that
+	// transmitting is a disclosure rather than an effect to reconcile against,
+	// and that was wrong: a worker can transmit and then go silent, and a
+	// record saying no effect was possible asserts the one thing nobody knows.
+	// Content that left the host cannot be recalled, which makes an
+	// unacknowledged possible egress exactly the kind of uncertainty this flag
+	// exists to preserve.
+	if claimedAction.Effects.contains(EffectMutatesExternal) ||
+		claimedAction.Effects.contains(EffectEgressesContent) {
 		next.EffectPossible = true
 	}
 	next.ClaimID = append([]byte(nil), request.ClaimID...)
@@ -1191,11 +1200,19 @@ func (s *Service) resolveActionBinding(
 	// executor reference to a narrower ceiling while descriptors registered
 	// under the old one are still live, and those must stop resolving rather
 	// than keep running against a binding that no longer permits them.
-	if selected.Effect.exceeds(executorCeiling(raw)) {
+	if selected.Effects.exceeds(executorCeiling(raw)) {
 		return Descriptor{}, Action{}, nil, shoal.NewError(
 			shoal.ErrorUnavailable,
-			"action declares an external effect but its executor is bound "+
-				"for evidence-only work")
+			"action declares effects its executor is not bound to perform")
+	}
+	// Re-checked here too, and for the same reason as the ceiling: a host can
+	// rebind a reference to an executor that now always transmits, and a
+	// descriptor registered against the old binding must stop resolving rather
+	// than keep running while understating what it does.
+	if selected.Effects.omits(executorFloor(raw)) {
+		return Descriptor{}, Action{}, nil, shoal.NewError(
+			shoal.ErrorUnavailable,
+			"action omits effects its executor causes on every invocation")
 	}
 	return cloneDescriptor(descriptor), *selected, raw, nil
 }
