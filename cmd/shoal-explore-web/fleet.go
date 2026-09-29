@@ -337,3 +337,77 @@ func (r *boundFleetDispatch) Invoke(
 	request.Enqueue.Context = bound
 	return r.service.Invoke(ctx, request)
 }
+
+// boundAdmission binds the pre-call admission seam to the authenticated request
+// exactly as the dispatch surface is bound.
+//
+// The binding is the security property, not a convenience: the request and
+// correlation identity come from the resolved decision rather than from the
+// body, so a proxy cannot ask for admission under a request identity that is
+// not its own.
+type boundAdmission struct {
+	service  *fleet.AdmissionService
+	resolver auth.Resolver
+}
+
+func newBoundAdmission(
+	service *fleet.AdmissionService,
+	resolver auth.Resolver,
+) (*boundAdmission, error) {
+	if service == nil || isNilFleetDependency(resolver) {
+		return nil, shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			"bound admission dependencies are required",
+		)
+	}
+	return &boundAdmission{service: service, resolver: resolver}, nil
+}
+
+func (r *boundAdmission) requestContext(
+	ctx context.Context,
+	request fleet.RequestContext,
+) (fleet.RequestContext, error) {
+	decision, err := r.resolver.Resolve(ctx)
+	if err != nil {
+		return fleet.RequestContext{}, err
+	}
+	request.RequestID = decision.RequestID()
+	request.CorrelationID = decision.CorrelationID()
+	return request, nil
+}
+
+func (r *boundAdmission) Request(
+	ctx context.Context,
+	request fleet.AdmissionRequest,
+) (fleet.AdmissionGrant, error) {
+	bound, err := r.requestContext(ctx, request.Context)
+	if err != nil {
+		return fleet.AdmissionGrant{}, err
+	}
+	request.Context = bound
+	return r.service.Request(ctx, request)
+}
+
+func (r *boundAdmission) Report(
+	ctx context.Context,
+	report fleet.AdmissionReport,
+) (fleet.ActionRecord, error) {
+	bound, err := r.requestContext(ctx, report.Context)
+	if err != nil {
+		return fleet.ActionRecord{}, err
+	}
+	report.Context = bound
+	return r.service.Report(ctx, report)
+}
+
+func (r *boundAdmission) Outstanding(
+	ctx context.Context,
+	request fleet.OutstandingAdmissionsRequest,
+) (fleet.OutstandingAdmissionsPage, error) {
+	bound, err := r.requestContext(ctx, request.Context)
+	if err != nil {
+		return fleet.OutstandingAdmissionsPage{}, err
+	}
+	request.Context = bound
+	return r.service.Outstanding(ctx, request)
+}

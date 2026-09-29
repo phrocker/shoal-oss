@@ -695,14 +695,34 @@ func validateExecutionEvidence(
 func (s *DispatchService) Cancel(ctx context.Context, request CancelRequest) (ActionRecord, error) {
 	ctx, cancel := s.deadline(ctx, request.Context)
 	defer cancel()
-	decision, now, err := s.begin(ctx, auth.OperationDispatch, request.Context)
+	return s.cancel(ctx, request, auth.OperationDispatch)
+}
+
+// cancel is the cancellation transition, parameterised by the operation that
+// authorizes it.
+//
+// Cancelling on someone's behalf is dispatch. Refusing an admission is not: the
+// caller asking is the caller that would have performed the effect, and it
+// holds invoke rather than dispatch. Without the split, a refusal could only be
+// recorded for a principal that also happened to hold dispatch, and every other
+// caller would be denied with nothing durable saying so — the one outcome this
+// plane most needs the record for.
+//
+// The caller is responsible for the request deadline, which the exported entry
+// point applies and the admission path applies once for the whole request.
+func (s *DispatchService) cancel(
+	ctx context.Context,
+	request CancelRequest,
+	operation auth.Operation,
+) (ActionRecord, error) {
+	decision, now, err := s.begin(ctx, operation, request.Context)
 	if err != nil {
 		return ActionRecord{}, err
 	}
 	if err := validateOpaque("cancel mutation key", request.MutationKey, false); err != nil {
 		return ActionRecord{}, err
 	}
-	current, err := s.authorizedCurrent(ctx, decision, request.ID, auth.OperationDispatch, now)
+	current, err := s.authorizedCurrent(ctx, decision, request.ID, operation, now)
 	if err != nil {
 		return ActionRecord{}, err
 	}
@@ -734,7 +754,7 @@ func (s *DispatchService) Cancel(ctx context.Context, request CancelRequest) (Ac
 	next.TransitionCorrelationID = decision.CorrelationID()
 	next.AuthorizedOperations = canonicalOperations(append(
 		next.AuthorizedOperations,
-		decisionOperations(decision, auth.OperationDispatch)...,
+		decisionOperations(decision, operation)...,
 	))
 	next.CancelAuthorizationFingerprint, err =
 		auth.AuthorizationFingerprint(decision)
@@ -742,7 +762,7 @@ func (s *DispatchService) Cancel(ctx context.Context, request CancelRequest) (Ac
 		return ActionRecord{}, err
 	}
 	next.CancelAuthorizationExpiresAt = decision.AuthenticationExpires()
-	if err := s.recorder.RecordAction(ctx, ActionAudit{Phase: "cancel_admission", Operation: auth.OperationDispatch, Record: next}); err != nil {
+	if err := s.recorder.RecordAction(ctx, ActionAudit{Phase: "cancel_admission", Operation: operation, Record: next}); err != nil {
 		return ActionRecord{}, errors.Join(ErrRecordingUnavailable, err)
 	}
 	stored, err := s.store.ApplyAction(ctx, DispatchMutation{

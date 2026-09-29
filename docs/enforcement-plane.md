@@ -1,8 +1,10 @@
 # An enforcement plane that can stop an LLM
 
-Design note. Nothing here is implemented; the parts described as existing were
-read in this repository and are cited. The parts described as missing have
-issues.
+Design note. The parts described as existing were read in this repository and
+are cited. The parts described as missing have issues; the pre-call admission
+surface among them has since been built and is described in
+`docs/admission-seam.md`, and the "What is missing" section below says exactly
+which half of it that covers.
 
 ## The constraint that shapes the design
 
@@ -120,10 +122,18 @@ only terminal paths are in-process execution or cancellation. A gateway outside
 the process can take work and has nowhere to report an `ExecutionResult`.
 Tracked as #384.
 
-**There is no pre-call admission hook.** `harness.Budgets` are static ceilings
-fixed at construction. There is no seam where the loop asks an accumulator
-whether to proceed, and no way for a budget to be a function of accumulated
-state rather than a constant.
+**There is no pre-call admission hook *inside the harness*.**
+`harness.Budgets` are static ceilings fixed at construction. There is still no
+seam where the in-process loop asks an accumulator whether to proceed, and no
+way for a budget to be a function of accumulated state rather than a constant.
+
+The out-of-process half of this now exists: `/api/v1/admission/request` and
+`/api/v1/admission/report` (#388, `docs/admission-seam.md`) let an external
+caller ask before the effect and report after it. That is loop one and loop two
+for callers Shoal does not contain. It does not give the harness the same seam,
+and the two should not be conflated: the harness runs inside this process and
+can be asked directly, while the admission surface exists precisely because the
+caller cannot be.
 
 **The accumulator is not general.** `MosaicBudget` charges distinct sensitivity
 domains. A risk plane wants the same durable, windowed, per-identity machinery
@@ -170,9 +180,16 @@ pretend the machinery supplies it.
    is the smallest of these.
 2. Generalize the accumulator: keep `MosaicBudget`'s windowing, persistence and
    enforcement, make the charged signal pluggable.
-3. A pre-call admission seam in the harness, so step two above exists.
+3. A pre-call admission seam in the harness, so step two above exists. The
+   out-of-process seam is done (#388); the in-process one is not.
 4. #384, completion reporting, when an out-of-process gateway is actually
    built.
+
+`MosaicBudget` is already reachable pre-call from outside the process:
+`authorized.Client.RestrictDisclosure` charges it over a caller-declared
+reference set and reports what survives, so admission can express the budget as
+an obligation rather than only as an internal withholding. The signal is still
+hard-coded to sensitivity-domain co-occurrence; that is what step two changes.
 
 Streaming abort is deliberately last and optional. It improves cost and latency
 and does not change what was disclosed.
