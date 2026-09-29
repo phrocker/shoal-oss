@@ -63,9 +63,15 @@ if ! python3 -c 'import yaml' 2>/dev/null; then
 fi
 
 note "== lint =="
-for values in values.yaml values-single.yaml values-distributed.yaml values-accumulo.yaml values-explorer.yaml; do
+for values in values.yaml values-single.yaml values-distributed.yaml values-accumulo.yaml; do
   helm lint "$chart" -f "$chart/$values" >/dev/null || fail "helm lint $values"
 done
+# The explorer profile is linted with the overrides that make it valid.
+# Linting it as shipped lints nothing: its required values are empty on
+# purpose, so the templates refuse, and `helm lint` reports a template failure
+# as INFO and still exits 0 — a check that cannot fail and would also break
+# outright under a helm version that treats it as an error.
+helm lint "$chart" "${explorer_base[@]}" >/dev/null || fail "helm lint values-explorer.yaml"
 
 note "== every profile renders =="
 for values in values.yaml values-single.yaml values-distributed.yaml values-accumulo.yaml; do
@@ -114,6 +120,12 @@ refuses "blank role value only"         "${explorer_base[@]}" --set 'explorer.au
 refuses "blank allowed host only"       "${explorer_base[@]}" --set 'explorer.allowedHosts={ }'
 refuses "placeholder issuer"            "${explorer_base[@]}" --set explorer.auth.oidc.issuer=https://REPLACE_ME/
 refuses "placeholder allowed host"      "${explorer_base[@]}" --set 'explorer.allowedHosts={REPLACE_ME.example.test}'
+# A placeholder in a role mapping is worse than a non-working deployment: it is
+# a working one that authorizes the literal claim "REPLACE_ME", denying every
+# real caller while the chart reports success.
+refuses "placeholder reader value"      "${explorer_base[@]}" --set 'explorer.auth.oidc.readerValues={REPLACE_ME}'
+refuses "placeholder contributor value" "${explorer_base[@]}" --set 'explorer.auth.oidc.contributorValues={REPLACE_ME}'
+refuses "placeholder fleet value"       "${explorer_base[@]}" --set 'explorer.auth.oidc.fleetValues={REPLACE_ME}'
 
 note "== valid configurations still render =="
 renders "loopback chat needs no credential" "${explorer_base[@]}" --set explorer.chat.provider=ollama,explorer.chat.model=llama3,explorer.chat.baseURL=http://localhost:11434
