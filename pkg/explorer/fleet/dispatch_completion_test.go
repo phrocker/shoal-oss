@@ -30,6 +30,11 @@ type completionFixture struct {
 
 func newCompletionFixture(t *testing.T, effect Effect) *completionFixture {
 	t.Helper()
+	return newCompletionFixtureWithExecutor(t, effect, &remoteBoundExecutor{})
+}
+
+func newCompletionFixtureWithExecutor(t *testing.T, effect Effect, executor any) *completionFixture {
+	t.Helper()
 	now := time.Date(2026, 9, 6, 12, 0, 0, 0, time.UTC)
 	clock := now
 	authority, err := auth.NewAuthorityWithClock(func() time.Time { return now })
@@ -40,7 +45,7 @@ func newCompletionFixture(t *testing.T, effect Effect) *completionFixture {
 	registry, err := NewService(Config{
 		Store: registryStore, Resolver: authority.Resolver(), Recorder: &memoryRecorder{},
 		Snapshots: fixedSnapshot{now},
-		Executors: executorMap{"exec": &remoteBoundExecutor{}},
+		Executors: executorMap{"exec": executor},
 		Clock:     func() time.Time { return clock },
 	})
 	if err != nil {
@@ -297,6 +302,90 @@ func TestCompleteClaimReplayReturnsTheCommittedRecord(t *testing.T) {
 			first, second)
 	}
 }
+
+// TestCompleteClaimDoesNotAcknowledgeACancelledAction is the case a terminal
+// state alone cannot distinguish.
+//
+// Cancel lands on a terminal state at exactly the version a reporter expected
+// to produce, and clones the record it cancelled — so it preserves that
+// reporter's own ClaimID. A replay check that accepted any terminal state would
+// therefore hand a late reporter the cancelled record with no error, telling it
+// the work it performed was recorded while the record says the opposite. For an
+// external effect that is the worst possible answer: the effect happened, the
+// action says cancelled, and the worker was told everything was fine.
+func TestCompleteClaimDoesNotAcknowledgeACancelledAction(t *testing.T) {
+	fixture := newCompletionFixture(t, EffectExternal)
+	// Cancel refuses a live claim, so the lease has to lapse first — which is
+	// also the only way a worker ends up reporting this late.
+	*fixture.clock = fixture.clock.Add(2 * time.Minute)
+	cancelled, err := fixture.service.Cancel(fixture.ctx, CancelRequest{
+		ID: fixture.claimed.ID, ExpectedVersion: fixture.claimed.Version,
+		MutationKey: []byte("cancel"),
+		Context:     dispatchContext(*fixture.clock, "request"),
+	})
+	if err != nil {
+		t.Fatalf("Cancel: %v", err)
+	}
+	if cancelled.State != DispatchCanceled ||
+		cancelled.Version != fixture.claimed.Version+1 ||
+		string(cancelled.ClaimID) != "claim" {
+		t.Fatalf("this test assumes cancel keeps the claim at version+1: %#v", cancelled)
+	}
+
+	request := fixture.completion()
+	request.Context.Deadline = fixture.clock.Add(time.Hour)
+	got, err := fixture.service.CompleteClaim(fixture.ctx, request)
+	if !errors.Is(err, ErrClaimLost) {
+		t.Fatalf("completion against a cancelled action = %v (record %#v), "+
+			"want ErrClaimLost", err, got)
+	}
+	stored, storeErr := fixture.store.GetAction(fixture.ctx, fixture.claimed.ID)
+	if storeErr != nil || stored.State != DispatchCanceled {
+		t.Fatalf("stored = %#v, %v", stored, storeErr)
+	}
+}
+
+// TestRemoteExecutorNeedsNoInProcessExecute is the topology this whole change
+// exists for. A gateway proxy performs its work itself and reports through
+// CompleteClaim; nothing in this process ever runs it.
+//
+// Requiring it to supply an Execute method would make every remote deployment
+// bind a stub whose only purpose is to be refused, so claim and completion
+// resolve through resolveActionBinding. The effect ceiling is still enforced —
+// the reference below declares EffectExternal, and an evidence-only one would
+// still refuse this action.
+func TestRemoteExecutorNeedsNoInProcessExecute(t *testing.T) {
+	fixture := newCompletionFixtureWithExecutor(t, EffectExternal, remoteOnlyExecutor{})
+
+	if !fixture.claimed.EffectPossible {
+		t.Fatal("claiming an external action through a remote-only reference " +
+			"did not mark the effect possible")
+	}
+	completed, err := fixture.service.CompleteClaim(fixture.ctx, fixture.completion())
+	if err != nil {
+		t.Fatalf("CompleteClaim through a remote-only executor: %v", err)
+	}
+	if completed.State != DispatchSucceeded {
+		t.Fatalf("state = %q, want %q", completed.State, DispatchSucceeded)
+	}
+}
+
+// TestExecuteClaimStillRequiresARunnableExecutor is the other half: relaxing
+// the requirement for claim and completion must not let in-process execution
+// run against a reference that cannot run anything.
+func TestExecuteClaimStillRequiresARunnableExecutor(t *testing.T) {
+	fixture := newCompletionFixtureWithExecutor(t, EffectExternal, remoteOnlyExecutor{})
+
+	if _, err := fixture.service.ExecuteClaim(fixture.ctx, fixture.claimed); err == nil {
+		t.Fatal("ExecuteClaim ran an action whose executor has no Execute method")
+	}
+}
+
+// remoteOnlyExecutor is a reference bound for work performed out of process. It
+// declares an effect ceiling and deliberately implements no Execute.
+type remoteOnlyExecutor struct{}
+
+func (remoteOnlyExecutor) MaxEffect() Effect { return EffectExternal }
 
 // TestClaimMarksAnExternalEffectPossibleBeforeItHappens is the decision #384
 // asked for. A remote worker owns the window between claiming and acting. If it

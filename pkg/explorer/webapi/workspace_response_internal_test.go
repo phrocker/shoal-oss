@@ -112,6 +112,11 @@ func TestWorkspaceOperationForRequestUsesRouteOperation(t *testing.T) {
 		{http.MethodPost, "/api/v1/documents", auth.OperationList, true},
 		{http.MethodPost, "/api/v1/document", auth.OperationRead, true},
 		{http.MethodPost, "/api/v1/fleet/actions/invoke", auth.OperationInvoke, true},
+		{http.MethodPost, "/api/v1/fleet/actions/action/claim", auth.OperationInvoke, true},
+		// A route missing here is not a 404: ServeHTTP consults this table
+		// before dispatching, and an unlisted path is refused as not
+		// registered for the workspace, so the handler is never reached at all.
+		{http.MethodPost, "/api/v1/fleet/actions/action/complete", auth.OperationInvoke, true},
 		{http.MethodPost, "/api/v1/fleet/actions/action/cancel", auth.OperationDispatch, true},
 		{http.MethodPost, "/api/v1/fleet/agents/agent/heartbeat", auth.OperationAgentHeartbeat, true},
 		{http.MethodPost, "/api/v1/fleet/events/publish", auth.OperationEventPublish, true},

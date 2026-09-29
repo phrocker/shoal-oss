@@ -83,7 +83,9 @@ func (s *DispatchService) enqueue(
 	if request.Context.Deadline.Sub(now) > MaxActionDeadline {
 		return ActionRecord{}, shoal.NewError(shoal.ErrorInvalidArgument, "action deadline exceeds its bound")
 	}
-	descriptor, action, _, err := s.registry.resolveAction(
+	// Binding, not execution: queueing work for an executor that runs out of
+	// process must not require it to be runnable here.
+	descriptor, action, _, err := s.registry.resolveActionBinding(
 		ctx, decision, request.AgentID, request.AgentGeneration,
 		request.Capability, request.Action, request.SourceID, request.PolicyID,
 		request.ObjectID, operation, now,
@@ -230,11 +232,14 @@ func (s *DispatchService) Claim(ctx context.Context, request ClaimRequest) (Acti
 	if !now.Before(current.Deadline) {
 		return ActionRecord{}, ErrClaimLost
 	}
-	// Resolved before the claim is written, for the effect declaration and for
-	// its own sake: a descriptor revoked or narrowed since the action was
-	// queued should refuse the claim rather than hand out work that will be
-	// refused at execution.
-	_, claimedAction, _, err := s.registry.resolveAction(
+	// Resolved for the declared Effect, which decides whether claiming this
+	// action already makes an effect possible.
+	//
+	// authorizedCurrent above has already resolved the action and refused a
+	// descriptor revoked, re-registered or narrowed since it was queued, so
+	// this adds no authorization — it is how the declaration is obtained, since
+	// authorizedCurrent discards what it resolved.
+	_, claimedAction, _, err := s.registry.resolveActionBinding(
 		ctx, decision, current.AgentID, current.AgentGeneration,
 		current.Capability, current.Action, current.SourceID, current.PolicyID,
 		current.ObjectID, auth.OperationInvoke, now,
@@ -448,7 +453,15 @@ func (s *DispatchService) CompleteClaim(ctx context.Context, request CompletionR
 	// reporter expected to produce, under this reporter's own claim, so the
 	// work is committed and the response was lost. Republish and return it
 	// rather than reporting a conflict against the reporter's own write.
-	if current.State.terminal() && current.Version == request.ExpectedVersion+1 &&
+	//
+	// Only succeeded and failed count, because only applyExecutionResult
+	// produces those and only it could have been this reporter's write. Cancel
+	// also lands on a terminal state at exactly version+1 while preserving the
+	// ClaimID it cancelled, so accepting any terminal state here would hand a
+	// late reporter the cancelled record and a 200 — telling it the work it
+	// performed was recorded, when the record says the opposite.
+	if (current.State == DispatchSucceeded || current.State == DispatchFailed) &&
+		current.Version == request.ExpectedVersion+1 &&
 		bytes.Equal(current.ClaimID, request.ClaimID) {
 		if err := s.publishTransition(
 			context.WithoutCancel(ctx), actionEventKind(current), current,
@@ -495,7 +508,7 @@ func (s *DispatchService) CompleteClaim(ctx context.Context, request CompletionR
 	// refuses a descriptor revoked, re-registered or narrowed since the claim,
 	// so this is not a second authorization check — it is how the declared
 	// schema is obtained, since authorizedCurrent discards it.
-	_, action, _, err := s.registry.resolveAction(
+	_, action, _, err := s.registry.resolveActionBinding(
 		ctx, decision, current.AgentID, current.AgentGeneration,
 		current.Capability, current.Action, current.SourceID, current.PolicyID,
 		current.ObjectID, auth.OperationInvoke, now,
@@ -595,7 +608,10 @@ func (s *DispatchService) applyExecutionResult(
 		return ActionRecord{}, errors.Join(ErrExecutionAmbiguous,
 			shoal.NewError(shoal.ErrorUnauthorized, "terminal execution identity changed"))
 	}
-	if _, _, _, err := s.registry.resolveAction(
+	// Binding, not execution. This runs on the remote path too, where there is
+	// no in-process executor to assert and demanding one would fail every
+	// remote completion at the last step.
+	if _, _, _, err := s.registry.resolveActionBinding(
 		ctx, finalDecision, current.AgentID, current.AgentGeneration,
 		current.Capability, current.Action, current.SourceID, current.PolicyID,
 		current.ObjectID, auth.OperationInvoke, finishNow,
@@ -920,7 +936,9 @@ func (s *DispatchService) Pull(ctx context.Context, request PullActionsRequest) 
 		if !sameActionPrincipal(decision, record) {
 			continue
 		}
-		if _, _, _, authorizeErr := s.registry.resolveAction(
+		// Binding, not execution: a remote worker pulling its own work would
+		// otherwise never see it.
+		if _, _, _, authorizeErr := s.registry.resolveActionBinding(
 			ctx, decision, record.AgentID, record.AgentGeneration,
 			record.Capability, record.Action, record.SourceID, record.PolicyID,
 			record.ObjectID, auth.OperationInvoke, now,
@@ -1034,7 +1052,12 @@ func (s *DispatchService) authorizedCurrent(ctx context.Context, decision auth.D
 	}, now); err != nil {
 		return ActionRecord{}, auth.ObjectNotFound()
 	}
-	if _, _, _, err := s.registry.resolveAction(ctx, decision, current.AgentID, current.AgentGeneration,
+	// resolveActionBinding, not resolveAction: claiming, cancelling, inspecting
+	// and completing an action must work for an executor that runs out of
+	// process and has no in-process Execute. Only ExecuteClaim needs a runnable
+	// one. Every other check — generation, scope, authorization, delegation and
+	// the declared effect ceiling — is identical either way.
+	if _, _, _, err := s.registry.resolveActionBinding(ctx, decision, current.AgentID, current.AgentGeneration,
 		current.Capability, current.Action, current.SourceID, current.PolicyID, current.ObjectID,
 		operation, now); err != nil {
 		if shoal.IsErrorCode(err, shoal.ErrorUnauthorized) ||
@@ -1063,6 +1086,9 @@ func sameActionPrincipal(decision auth.Decision, record ActionRecord) bool {
 	return true
 }
 
+// resolveAction resolves an action for in-process execution. It is
+// resolveActionBinding plus the assertion that the bound reference can actually
+// run the work here.
 func (s *Service) resolveAction(
 	ctx context.Context,
 	decision auth.Decision,
@@ -1074,6 +1100,44 @@ func (s *Service) resolveAction(
 	operation auth.Operation,
 	now time.Time,
 ) (Descriptor, Action, ActionExecutor, error) {
+	descriptor, action, raw, err := s.resolveActionBinding(
+		ctx, decision, agentID, generation, capabilityName, actionName,
+		sourceID, policyID, objectID, operation, now,
+	)
+	if err != nil {
+		return Descriptor{}, Action{}, nil, err
+	}
+	executor, ok := raw.(ActionExecutor)
+	if !ok {
+		return Descriptor{}, Action{}, nil, shoal.NewError(shoal.ErrorUnavailable, "registered executor does not implement action execution")
+	}
+	return descriptor, action, executor, nil
+}
+
+// resolveActionBinding resolves an action and its bound executor reference
+// without requiring the reference to be runnable in this process.
+//
+// Authorization, scope, generation and the declared effect ceiling are all
+// checked exactly as they are for in-process execution — the only thing it does
+// not demand is an ActionExecutor implementation.
+//
+// That distinction is what makes an out-of-process executor possible. A gateway
+// proxy performs its work itself and reports through CompleteClaim; nothing in
+// this process ever runs it, so requiring it to supply an Execute method would
+// force every remote deployment to bind a stub whose only job is to be refused.
+// Claiming, cancelling, inspecting and completing an action therefore resolve
+// through here, and only ExecuteClaim demands a runnable executor.
+func (s *Service) resolveActionBinding(
+	ctx context.Context,
+	decision auth.Decision,
+	agentID shoal.ID,
+	generation int64,
+	capabilityName, actionName string,
+	sourceID, policyID []byte,
+	objectID shoal.ID,
+	operation auth.Operation,
+	now time.Time,
+) (Descriptor, Action, any, error) {
 	descriptor, err := s.active(ctx, agentID, now)
 	if err != nil || descriptor.Generation != generation {
 		return Descriptor{}, Action{}, nil, auth.ObjectNotFound()
@@ -1123,10 +1187,6 @@ func (s *Service) resolveAction(
 	if !ok {
 		return Descriptor{}, Action{}, nil, shoal.NewError(shoal.ErrorUnavailable, "agent executor is unavailable")
 	}
-	executor, ok := raw.(ActionExecutor)
-	if !ok {
-		return Descriptor{}, Action{}, nil, shoal.NewError(shoal.ErrorUnavailable, "registered executor does not implement action execution")
-	}
 	// Re-checked at resolution, not only at registration. A host can rebind an
 	// executor reference to a narrower ceiling while descriptors registered
 	// under the old one are still live, and those must stop resolving rather
@@ -1137,7 +1197,7 @@ func (s *Service) resolveAction(
 			"action declares an external effect but its executor is bound "+
 				"for evidence-only work")
 	}
-	return cloneDescriptor(descriptor), *selected, executor, nil
+	return cloneDescriptor(descriptor), *selected, raw, nil
 }
 
 func executorKey(actionID, idempotency []byte) []byte {
