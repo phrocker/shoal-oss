@@ -253,6 +253,57 @@ type Action struct {
 	Effects Effects `json:"effects,omitempty"`
 }
 
+// legacyEffect projects a set onto the superseded scalar spelling.
+//
+// That taxonomy had one axis — does this mutate anything outside Shoal — so
+// the projection is exactly that question, with one case it cannot answer.
+//
+//	{}                              ""          declares nothing
+//	{reads-corpus}                  ""          reading mutates nothing outside
+//	{mutates-external}              "external"
+//	{reads-corpus, mutates-external} "external"
+//
+// A set containing egress has no legacy value at all, and the two candidates
+// are not equally wrong. Reporting "" would tell a client that an action
+// shipping corpus content to a third party mutates nothing outside — true on
+// the old axis, and exactly the silence this whole change exists to end.
+// Reporting "external" overstates, and a client reading it treats the action as
+// work Shoal dispatches rather than performs. Overstating is the direction that
+// fails safe, so egress projects to "external".
+func (e Effects) legacyEffect() Effect {
+	if e.contains(EffectMutatesExternal) || e.contains(EffectEgressesContent) {
+		return EffectMutatesExternal
+	}
+	return ""
+}
+
+// MarshalJSON emits both spellings.
+//
+// Accepting the old request spelling does not preserve the wire API on its own.
+// The registry wire embeds []Capability directly, so a response that carries
+// only "effects" is silently lossy to a client that has not been rebuilt: it
+// unmarshals into its old model, finds no "effect" key, and reads the zero
+// value — concluding that an action mutating or transmitting does neither. That
+// is the safe-looking direction and therefore the dangerous one.
+//
+// Emitting the projection alongside the set means such a client is wrong only
+// in the cautious direction, and a current client reads "effects" and is not
+// wrong at all.
+func (a Action) MarshalJSON() ([]byte, error) {
+	type actionFields struct {
+		Name         string          `json:"name"`
+		InputSchema  json.RawMessage `json:"input_schema"`
+		OutputSchema json.RawMessage `json:"output_schema"`
+		Effects      Effects         `json:"effects,omitempty"`
+		LegacyEffect Effect          `json:"effect,omitempty"`
+	}
+	return json.Marshal(actionFields{
+		Name: a.Name, InputSchema: a.InputSchema,
+		OutputSchema: a.OutputSchema, Effects: a.Effects,
+		LegacyEffect: a.Effects.legacyEffect(),
+	})
+}
+
 // UnmarshalJSON accepts the superseded scalar spelling of the effect field
 // alongside the current set.
 //
@@ -286,10 +337,18 @@ func (a *Action) UnmarshalJSON(data []byte) error {
 	}
 	if fields.LegacyEffect != nil {
 		if fields.Effects != nil {
-			return shoal.NewError(shoal.ErrorInvalidArgument,
-				"action declares both effect and effects; supply only effects")
-		}
-		if *fields.LegacyEffect != "" {
+			// Both spellings are accepted together only when they agree,
+			// because that is what a client echoing one of our own responses
+			// sends back — MarshalJSON emits the projection alongside the set.
+			// Disagreement is two different declarations of the same thing, and
+			// picking a winner silently would let a client believe it declared
+			// something it did not.
+			if *fields.LegacyEffect != fields.Effects.legacyEffect() {
+				return shoal.NewError(shoal.ErrorInvalidArgument,
+					"action declares effect and effects inconsistently; "+
+						"supply only effects")
+			}
+		} else if *fields.LegacyEffect != "" {
 			fields.Effects = Effects{*fields.LegacyEffect}
 		}
 	}

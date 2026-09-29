@@ -399,6 +399,93 @@ func TestTheLegacyEffectScalarIsStillAccepted(t *testing.T) {
 	}
 }
 
+// TestResponsesStillCarryTheLegacyEffectKey covers the other direction, which
+// accepting the old request spelling does not address on its own.
+//
+// The registry wire embeds []Capability directly, so a response carrying only
+// "effects" is silently lossy to a client that has not been rebuilt: it finds
+// no "effect" key and reads the zero value, concluding that an action which
+// mutates or transmits does neither. That is the safe-looking direction and
+// therefore the dangerous one.
+func TestResponsesStillCarryTheLegacyEffectKey(t *testing.T) {
+	for _, probe := range []struct {
+		name    string
+		effects Effects
+		legacy  string
+	}{
+		{"declares nothing", nil, ""},
+		// Reading the corpus mutates nothing outside, which is exactly what the
+		// old evidence value meant, so this projection is lossless.
+		{"reads corpus", Effects{EffectReadsCorpus}, ""},
+		{"external mutation", Effects{EffectMutatesExternal}, "external"},
+		{"reads and mutates",
+			Effects{EffectMutatesExternal, EffectReadsCorpus}, "external"},
+		// Egress has no legacy value. Reporting "" would tell an old client
+		// that an action shipping corpus content to a third party mutates
+		// nothing outside — true on the old axis, and exactly the silence this
+		// change exists to end. Overstating fails safe; understating does not.
+		{"egress alone", Effects{EffectEgressesContent}, "external"},
+		{"reads and egresses",
+			Effects{EffectEgressesContent, EffectReadsCorpus}, "external"},
+	} {
+		encoded, err := json.Marshal(Action{Name: "ask", Effects: probe.effects})
+		if err != nil {
+			t.Fatalf("%s: %v", probe.name, err)
+		}
+		var decoded struct {
+			Effect  *string  `json:"effect"`
+			Effects []string `json:"effects"`
+		}
+		if err := json.Unmarshal(encoded, &decoded); err != nil {
+			t.Fatalf("%s: %v", probe.name, err)
+		}
+		got := ""
+		if decoded.Effect != nil {
+			got = *decoded.Effect
+		}
+		if got != probe.legacy {
+			t.Fatalf("%s: legacy effect = %q, want %q (body %s)",
+				probe.name, got, probe.legacy, encoded)
+		}
+		if len(decoded.Effects) != len(probe.effects) {
+			t.Fatalf("%s: current spelling = %v, want %v",
+				probe.name, decoded.Effects, probe.effects)
+		}
+	}
+}
+
+// TestOurOwnResponseRoundTrips is why disagreement rather than presence is what
+// the decoder refuses. MarshalJSON emits both spellings, so a client echoing a
+// response back sends both, and refusing that outright would make our own
+// output unusable as input.
+func TestOurOwnResponseRoundTrips(t *testing.T) {
+	original := Action{
+		Name: "ask", InputSchema: anyObject, OutputSchema: anyObject,
+		Effects: Effects{EffectEgressesContent, EffectReadsCorpus},
+	}
+	encoded, err := json.Marshal(original)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var returned Action
+	if err := json.Unmarshal(encoded, &returned); err != nil {
+		t.Fatalf("our own response was refused as input: %v", err)
+	}
+	if !returned.Effects.equalForTest(original.Effects) {
+		t.Fatalf("round trip = %v, want %v", returned.Effects, original.Effects)
+	}
+
+	// Disagreement is still refused: two different declarations of the same
+	// thing, where picking a winner silently would let a client believe it
+	// declared something it did not.
+	var mismatched Action
+	err = json.Unmarshal(
+		[]byte(`{"name":"ask","effect":"","effects":["external"]}`), &mismatched)
+	if err == nil {
+		t.Fatal("a response contradicting itself was accepted")
+	}
+}
+
 // TestALegacyDescriptorStopsResolvingAgainstAFlooredExecutor pins a breaking
 // change rather than a bug.
 //
