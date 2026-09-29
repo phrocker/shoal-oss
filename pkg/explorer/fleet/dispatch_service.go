@@ -64,60 +64,9 @@ func (s *DispatchService) enqueue(
 	if err != nil {
 		return ActionRecord{}, err
 	}
-
-	if err := validateOpaque("action ID", request.ID, false); err != nil {
-		return ActionRecord{}, err
-	}
-	if err := validateOpaque("action idempotency key", request.IdempotencyKey, false); err != nil {
-		return ActionRecord{}, err
-	}
-	if request.AgentGeneration <= 0 {
-		return ActionRecord{}, shoal.NewError(shoal.ErrorInvalidArgument, "agent generation must be positive")
-	}
-	if err := validateName("capability", request.Capability); err != nil {
-		return ActionRecord{}, err
-	}
-	if err := validateName("action", request.Action); err != nil {
-		return ActionRecord{}, err
-	}
-	if request.Context.Deadline.Sub(now) > MaxActionDeadline {
-		return ActionRecord{}, shoal.NewError(shoal.ErrorInvalidArgument, "action deadline exceeds its bound")
-	}
-	// Binding, not execution: queueing work for an executor that runs out of
-	// process must not require it to be runnable here.
-	descriptor, action, _, err := s.registry.resolveActionBinding(
-		ctx, decision, request.AgentID, request.AgentGeneration,
-		request.Capability, request.Action, request.SourceID, request.PolicyID,
-		request.ObjectID, operation, now,
-	)
+	record, _, err := s.queuedRecord(ctx, decision, request, operation, now)
 	if err != nil {
 		return ActionRecord{}, err
-	}
-	input, err := validateAgainstSchema(action.InputSchema, request.Input, "action input", MaxActionPayloadBytes)
-	if err != nil {
-		return ActionRecord{}, err
-	}
-	reason, err := interaction.NewReason(request.Context.ReasonCode, request.Context.ReasonDetail)
-	if err != nil {
-		return ActionRecord{}, err
-	}
-	fingerprint, err := auth.AuthorizationFingerprint(decision)
-	if err != nil {
-		return ActionRecord{}, err
-	}
-	record := ActionRecord{
-		ID: append([]byte(nil), request.ID...), IdempotencyKey: append([]byte(nil), request.IdempotencyKey...),
-		Version: 1, State: DispatchQueued, AgentID: descriptor.ID,
-		AgentGeneration: descriptor.Generation, Capability: request.Capability, Action: request.Action,
-		SourceID: append([]byte(nil), request.SourceID...), PolicyID: append([]byte(nil), request.PolicyID...),
-		ObjectID: request.ObjectID, Input: input, Subject: decision.Subject(), Actor: decision.Actor(),
-		ClientID: decision.ClientID(), OnBehalfOf: decision.OnBehalfOf(),
-		AuthorizationFingerprint: fingerprint, PolicyGeneration: decision.PolicyGeneration(),
-		AuthorizationExpiresAt: decision.AuthenticationExpires(),
-		AuthorizedOperations:   decisionOperations(decision, operation),
-		RequestID:              decision.RequestID(), CorrelationID: decision.CorrelationID(),
-		Reason: reason, Deadline: request.Context.Deadline.UTC(), CreatedAt: now, UpdatedAt: now,
-		ExecutorKey: executorKey(request.ID, request.IdempotencyKey),
 	}
 	if current, readErr := s.store.GetAction(ctx, request.ID); readErr == nil {
 		if equivalentEnqueue(current, record) {
@@ -149,6 +98,79 @@ func (s *DispatchService) enqueue(
 		return ActionRecord{}, errors.Join(ErrActionCommitted, err)
 	}
 	return cloneActionRecord(stored), nil
+}
+
+// queuedRecord validates a dispatch request and builds the version-1 record an
+// enqueue would commit, without committing anything.
+//
+// It is split out so admission can reach the same record without going through
+// the queued state. Every check an enqueue makes has to be made before an
+// admission writes anything, and the alternative — admission repeating the
+// validation itself — is how a second entry point ends up admitting an input
+// the first would have refused. The resolved Action comes back with it because
+// admission needs the declared effect ceiling, and resolving twice would ask
+// the registry a question it has already answered.
+func (s *DispatchService) queuedRecord(
+	ctx context.Context,
+	decision auth.Decision,
+	request EnqueueRequest,
+	operation auth.Operation,
+	now time.Time,
+) (ActionRecord, Action, error) {
+	if err := validateOpaque("action ID", request.ID, false); err != nil {
+		return ActionRecord{}, Action{}, err
+	}
+	if err := validateOpaque("action idempotency key", request.IdempotencyKey, false); err != nil {
+		return ActionRecord{}, Action{}, err
+	}
+	if request.AgentGeneration <= 0 {
+		return ActionRecord{}, Action{}, shoal.NewError(shoal.ErrorInvalidArgument, "agent generation must be positive")
+	}
+	if err := validateName("capability", request.Capability); err != nil {
+		return ActionRecord{}, Action{}, err
+	}
+	if err := validateName("action", request.Action); err != nil {
+		return ActionRecord{}, Action{}, err
+	}
+	if request.Context.Deadline.Sub(now) > MaxActionDeadline {
+		return ActionRecord{}, Action{}, shoal.NewError(shoal.ErrorInvalidArgument, "action deadline exceeds its bound")
+	}
+	// Binding, not execution: queueing work for an executor that runs out of
+	// process must not require it to be runnable here.
+	descriptor, action, _, err := s.registry.resolveActionBinding(
+		ctx, decision, request.AgentID, request.AgentGeneration,
+		request.Capability, request.Action, request.SourceID, request.PolicyID,
+		request.ObjectID, operation, now,
+	)
+	if err != nil {
+		return ActionRecord{}, Action{}, err
+	}
+	input, err := validateAgainstSchema(action.InputSchema, request.Input, "action input", MaxActionPayloadBytes)
+	if err != nil {
+		return ActionRecord{}, Action{}, err
+	}
+	reason, err := interaction.NewReason(request.Context.ReasonCode, request.Context.ReasonDetail)
+	if err != nil {
+		return ActionRecord{}, Action{}, err
+	}
+	fingerprint, err := auth.AuthorizationFingerprint(decision)
+	if err != nil {
+		return ActionRecord{}, Action{}, err
+	}
+	return ActionRecord{
+		ID: append([]byte(nil), request.ID...), IdempotencyKey: append([]byte(nil), request.IdempotencyKey...),
+		Version: 1, State: DispatchQueued, AgentID: descriptor.ID,
+		AgentGeneration: descriptor.Generation, Capability: request.Capability, Action: request.Action,
+		SourceID: append([]byte(nil), request.SourceID...), PolicyID: append([]byte(nil), request.PolicyID...),
+		ObjectID: request.ObjectID, Input: input, Subject: decision.Subject(), Actor: decision.Actor(),
+		ClientID: decision.ClientID(), OnBehalfOf: decision.OnBehalfOf(),
+		AuthorizationFingerprint: fingerprint, PolicyGeneration: decision.PolicyGeneration(),
+		AuthorizationExpiresAt: decision.AuthenticationExpires(),
+		AuthorizedOperations:   decisionOperations(decision, operation),
+		RequestID:              decision.RequestID(), CorrelationID: decision.CorrelationID(),
+		Reason: reason, Deadline: request.Context.Deadline.UTC(), CreatedAt: now, UpdatedAt: now,
+		ExecutorKey: executorKey(request.ID, request.IdempotencyKey),
+	}, action, nil
 }
 
 func (s *DispatchService) Invoke(ctx context.Context, request InvokeRequest) (ActionRecord, error) {
@@ -249,7 +271,52 @@ func (s *DispatchService) Claim(ctx context.Context, request ClaimRequest) (Acti
 	}
 	next := cloneActionRecord(current)
 	next.Version++
-	next.State = DispatchClaimed
+	next, err = applyClaim(
+		next, claimedAction, request.ClaimID, request.Lease, decision, now)
+	if err != nil {
+		return ActionRecord{}, err
+	}
+	if err := s.recorder.RecordAction(ctx, ActionAudit{Phase: "claim_admission", Operation: auth.OperationInvoke, Record: next}); err != nil {
+		return ActionRecord{}, errors.Join(ErrRecordingUnavailable, err)
+	}
+	stored, err := s.store.ApplyAction(ctx, DispatchMutation{
+		Token:           transitionToken("claim", request.ID, request.ClaimID, next.Version),
+		ExpectedVersion: current.Version, ExpectedFence: current.ClaimFence,
+		TransitionKind: "action.claimed", Record: next,
+	})
+	if err != nil {
+		return ActionRecord{}, err
+	}
+	if err := s.publishTransition(
+		context.WithoutCancel(ctx), "action.claimed", stored,
+	); err != nil {
+		return ActionRecord{}, errors.Join(ErrActionCommitted, err)
+	}
+	return cloneActionRecord(stored), nil
+}
+
+// applyClaim turns a record into a claimed one. It is the only place that
+// transition is written.
+//
+// Both callers reach it: the dispatch Claim mutation and the admission grant,
+// which is born claimed in a single write rather than queued and then claimed.
+// They were separate once, and they drifted within one release — the egress
+// correction below landed on Claim and not on admission, so an egress-only
+// admission sat outstanding asserting that no effect was possible, which is the
+// exact assertion the flag exists to avoid making. A matched pair of conditions
+// is a promise someone has to keep; one function is a fact.
+//
+// The fence is incremented rather than assigned, so a re-claim advances it and
+// a record that has never been claimed lands on one.
+func applyClaim(
+	record ActionRecord,
+	action Action,
+	claimID []byte,
+	lease time.Duration,
+	decision auth.Decision,
+	now time.Time,
+) (ActionRecord, error) {
+	record.State = DispatchClaimed
 	// An external-effect action is possibly-effected from the moment it is
 	// claimed, not from the moment it is executed.
 	//
@@ -271,46 +338,32 @@ func (s *DispatchService) Claim(ctx context.Context, request ClaimRequest) (Acti
 	// Content that left the host cannot be recalled, which makes an
 	// unacknowledged possible egress exactly the kind of uncertainty this flag
 	// exists to preserve.
-	if claimedAction.Effects.contains(EffectMutatesExternal) ||
-		claimedAction.Effects.contains(EffectEgressesContent) {
-		next.EffectPossible = true
+	if action.Effects.contains(EffectMutatesExternal) ||
+		action.Effects.contains(EffectEgressesContent) {
+		record.EffectPossible = true
 	}
-	next.ClaimID = append([]byte(nil), request.ClaimID...)
-	next.ClaimFence++
-	next.ClaimLease = request.Lease
-	next.ClaimLeaseUntil = now.Add(request.Lease)
-	if next.ClaimLeaseUntil.After(next.Deadline) {
-		next.ClaimLeaseUntil = next.Deadline
+	record.ClaimID = append([]byte(nil), claimID...)
+	record.ClaimFence++
+	record.ClaimLease = lease
+	record.ClaimLeaseUntil = now.Add(lease)
+	if record.ClaimLeaseUntil.After(record.Deadline) {
+		record.ClaimLeaseUntil = record.Deadline
 	}
-	next.UpdatedAt = now
-	next.Actor = decision.Actor()
-	next.TransitionRequestID = decision.RequestID()
-	next.TransitionCorrelationID = decision.CorrelationID()
-	next.AuthorizedOperations = canonicalOperations(append(
-		next.AuthorizedOperations, decisionOperations(decision, auth.OperationInvoke)...))
-	next.ExecutionFingerprint, err = auth.AuthorizationFingerprint(decision)
+	record.UpdatedAt = now
+	record.Actor = decision.Actor()
+	record.TransitionRequestID = decision.RequestID()
+	record.TransitionCorrelationID = decision.CorrelationID()
+	record.AuthorizedOperations = canonicalOperations(append(
+		record.AuthorizedOperations,
+		decisionOperations(decision, auth.OperationInvoke)...))
+	fingerprint, err := auth.AuthorizationFingerprint(decision)
 	if err != nil {
 		return ActionRecord{}, err
 	}
-	next.ExecutionPolicyGeneration = decision.PolicyGeneration()
-	next.ExecutionExpiresAt = decision.AuthenticationExpires()
-	if err := s.recorder.RecordAction(ctx, ActionAudit{Phase: "claim_admission", Operation: auth.OperationInvoke, Record: next}); err != nil {
-		return ActionRecord{}, errors.Join(ErrRecordingUnavailable, err)
-	}
-	stored, err := s.store.ApplyAction(ctx, DispatchMutation{
-		Token:           transitionToken("claim", request.ID, request.ClaimID, next.Version),
-		ExpectedVersion: current.Version, ExpectedFence: current.ClaimFence,
-		TransitionKind: "action.claimed", Record: next,
-	})
-	if err != nil {
-		return ActionRecord{}, err
-	}
-	if err := s.publishTransition(
-		context.WithoutCancel(ctx), "action.claimed", stored,
-	); err != nil {
-		return ActionRecord{}, errors.Join(ErrActionCommitted, err)
-	}
-	return cloneActionRecord(stored), nil
+	record.ExecutionFingerprint = fingerprint
+	record.ExecutionPolicyGeneration = decision.PolicyGeneration()
+	record.ExecutionExpiresAt = decision.AuthenticationExpires()
+	return record, nil
 }
 
 func (s *DispatchService) ExecuteClaim(ctx context.Context, claimed ActionRecord) (ActionRecord, error) {
@@ -1250,8 +1303,21 @@ func writeDispatchTupleField(digest hash.Hash, value []byte) {
 	_, _ = digest.Write(value)
 }
 
+// equivalentEnqueue reports whether an existing record is the same request as
+// the one being written, so a retry replays instead of conflicting.
+//
+// What an admission declared is part of that identity. Without the two
+// Admitted fields below, a caller could ask for an admission carrying corpus
+// references, receive obligations restricting them, and then replay the same
+// action ID, idempotency key and token with the reference list removed: the
+// record would still be recognised as the same request, obligations would be
+// recomputed over nothing, and the reply would be an unrestricted allow for a
+// token that is already live. The declaration has to be pinned by the record,
+// not merely adjudicated on the way past it.
 func equivalentEnqueue(current, wanted ActionRecord) bool {
-	return bytes.Equal(current.ID, wanted.ID) &&
+	return equalEffects(current.AdmittedEffects, wanted.AdmittedEffects) &&
+		bytes.Equal(current.AdmittedDisclosures, wanted.AdmittedDisclosures) &&
+		bytes.Equal(current.ID, wanted.ID) &&
 		bytes.Equal(current.IdempotencyKey, wanted.IdempotencyKey) &&
 		current.AgentID == wanted.AgentID &&
 		current.AgentGeneration == wanted.AgentGeneration &&

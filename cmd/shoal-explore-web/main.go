@@ -666,6 +666,19 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 			return err
 		}
 	}
+	if opened.admission != nil {
+		admissionHandler, err := webapi.NewAdmissionHandler(opened.admission)
+		if err != nil {
+			listener.Close()
+			return err
+		}
+		if err := handler.MountAuthenticated(
+			webapi.AdmissionRoutePrefix, admissionHandler,
+		); err != nil {
+			listener.Close()
+			return err
+		}
+	}
 	if opened.teamOverview != nil {
 		teamHandler, err := webapi.NewTeamOverviewHandler(opened.teamOverview)
 		if err != nil {
@@ -896,6 +909,7 @@ type openedService struct {
 	fleetRegistry webapi.FleetRegistryProvider
 	fleetDispatch webapi.FleetDispatchProvider
 	fleetEvents   webapi.FleetEventService
+	admission     webapi.AdmissionProvider
 	teamOverview  webapi.TeamOverviewProvider
 	client        *authorized.Client
 	backfilled    int
@@ -1094,6 +1108,28 @@ func openService(
 			embedded.Close()
 			return closed, err
 		}
+		// The authorized client is wired as the restrictor so the
+		// co-occurrence budget an operator configured is the budget an
+		// out-of-process caller is obliged by. Leaving it out would not
+		// disable the control — the read path would still withhold — it
+		// would make admission narrower than the plane it speaks for, and
+		// a proxy would be told to send content the corpus would have held
+		// back.
+		admissionService, err := fleet.NewAdmissionService(fleet.AdmissionConfig{
+			Dispatch: fleetDispatch, Restrictor: client,
+		})
+		if err != nil {
+			store.Close()
+			embedded.Close()
+			return closed, err
+		}
+		boundAdmissionService, err := newBoundAdmission(
+			admissionService, config.resolver)
+		if err != nil {
+			store.Close()
+			embedded.Close()
+			return closed, err
+		}
 		// The development-only backfill migrates a corpus whose documents were
 		// ingested before the policy catalog was durable: their authorization
 		// registrations are absent until re-registered once. A failure here is
@@ -1157,6 +1193,7 @@ func openService(
 			fleetRegistry: boundFleetRegistry,
 			fleetDispatch: boundFleetDispatch,
 			fleetEvents:   fleetEvents,
+			admission:     boundAdmissionService,
 			teamOverview:  teamOverview,
 			client:        client,
 			backfilled:    backfilled,
