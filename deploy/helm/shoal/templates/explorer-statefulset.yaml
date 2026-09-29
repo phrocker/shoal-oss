@@ -1,0 +1,230 @@
+{{- if eq (include "shoal.explorerEnabled" .) "true" }}
+{{- $explorer := .Values.explorer -}}
+{{- $oidc := $explorer.auth.oidc -}}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "shoal.explorerName" . }}
+  labels:
+    {{- include "shoal.labels" . | nindent 4 }}
+    app.kubernetes.io/component: explorer
+spec:
+  # A StatefulSet rather than a Deployment, and not for ordinal identity: its
+  # rolling update stops the old pod before starting the new one. A Deployment
+  # surges by default, which would put two processes on one ReadWriteOnce state
+  # root — the split-brain the workspace has no protocol for.
+  replicas: {{ $explorer.replicas }}
+  serviceName: {{ include "shoal.explorerHeadlessName" . }}
+  podManagementPolicy: OrderedReady
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      partition: {{ $explorer.updateStrategy.partition }}
+  selector:
+    matchLabels:
+      {{- include "shoal.explorerSelectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "shoal.explorerSelectorLabels" . | nindent 8 }}
+        app.kubernetes.io/part-of: shoal-platform
+    spec:
+      # Every setting is an argument on this pod spec rather than a ConfigMap.
+      # A changed argument changes the pod template and rolls the pod on its
+      # own; a ConfigMap would need a checksum annotation to get the same
+      # effect, and without one an edited disclosure setting would leave the
+      # running process on the old posture while the chart claimed the new one.
+      terminationGracePeriodSeconds: {{ $explorer.terminationGracePeriodSeconds }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      {{- with $explorer.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $explorer.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $explorer.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: shoal-explore-web
+          image: "{{ $explorer.image.repository }}:{{ $explorer.image.tag }}"
+          imagePullPolicy: {{ $explorer.image.pullPolicy }}
+          command: ["/usr/local/bin/shoal-explore-web"]
+          args:
+            # One state root: -state-dir places the corpus and the durable
+            # policy catalog beneath it, so the single mount below persists
+            # everything a restart needs.
+            - -state-dir={{ $explorer.stateDir }}
+            - -listen=0.0.0.0:{{ $explorer.containerPort }}
+            - -health-address=0.0.0.0:{{ $explorer.healthPort }}
+            - -allowed-host={{ join "," $explorer.allowedHosts }}
+            {{- if $explorer.disclosure.concealWithholding }}
+            - -conceal-withholding
+            {{- end }}
+            {{- if gt (int $explorer.disclosure.mosaic.maxDomains) 0 }}
+            - -mosaic-budget={{ $explorer.disclosure.mosaic.maxDomains }}
+            - -mosaic-window={{ $explorer.disclosure.mosaic.window }}
+            {{- end }}
+            - -oidc-issuer={{ $oidc.issuer }}
+            - -oidc-audience={{ join "," $oidc.audiences }}
+            - -oidc-authorization-claim={{ $oidc.authorizationClaim }}
+            {{- with $oidc.discoveryURL }}
+            - -oidc-discovery-url={{ . }}
+            {{- end }}
+            {{- with $oidc.jwksURI }}
+            - -oidc-jwks-uri={{ . }}
+            {{- end }}
+            {{- with $oidc.allowedAlgs }}
+            - -oidc-allowed-algs={{ . }}
+            {{- end }}
+            {{- with $oidc.clockSkew }}
+            - -oidc-clock-skew={{ . }}
+            {{- end }}
+            {{- with $oidc.subjectClaim }}
+            - -oidc-subject-claim={{ . }}
+            {{- end }}
+            {{- with $oidc.actorClaim }}
+            - -oidc-actor-claim={{ . }}
+            {{- end }}
+            {{- with $oidc.clientIDClaim }}
+            - -oidc-client-id-claim={{ . }}
+            {{- end }}
+            {{- with $oidc.delegationClaim }}
+            - -oidc-delegation-claim={{ . }}
+            {{- end }}
+            {{- with $oidc.readerValues }}
+            - -oidc-reader-values={{ join "," . }}
+            {{- end }}
+            {{- with $oidc.contributorValues }}
+            - -oidc-contributor-values={{ join "," . }}
+            {{- end }}
+            {{- with $oidc.fleetValues }}
+            - -oidc-fleet-values={{ join "," . }}
+            {{- end }}
+            {{- with $oidc.browserClientID }}
+            - -oidc-browser-client-id={{ . }}
+            {{- end }}
+            {{- with $oidc.browserScope }}
+            - -oidc-browser-scope={{ . }}
+            {{- end }}
+            {{- with $explorer.chat.provider }}
+            - -chat-provider={{ . }}
+            - -chat-model={{ $explorer.chat.model }}
+            - -chat-base-url={{ $explorer.chat.baseURL }}
+            - -chat-api-key-env={{ $explorer.chat.apiKeyEnv }}
+            {{- with $explorer.chat.organization }}
+            - -chat-organization={{ . }}
+            {{- end }}
+            {{- with $explorer.chat.project }}
+            - -chat-project={{ . }}
+            {{- end }}
+            {{- end }}
+            {{- with $explorer.embedding.provider }}
+            - -embedding-provider={{ . }}
+            - -embedding-model={{ $explorer.embedding.model }}
+            - -embedding-dimensions={{ $explorer.embedding.dimensions }}
+            {{- with $explorer.embedding.baseURL }}
+            - -embedding-base-url={{ . }}
+            {{- end }}
+            - -embedding-api-key-env={{ $explorer.embedding.apiKeyEnv }}
+            {{- end }}
+            {{- with $explorer.fleet.executorRefs }}
+            - -fleet-executor-refs={{ join "," . }}
+            {{- end }}
+            {{- with $explorer.fleet.askExecutorRef }}
+            - -fleet-ask-executor-ref={{ . }}
+            {{- end }}
+            {{- with $explorer.ontologyFile }}
+            - -ontology-file={{ . }}
+            {{- end }}
+          {{- if or (and $explorer.chat.credentialSecretName $explorer.chat.provider) (and $explorer.embedding.credentialSecretName $explorer.embedding.provider) }}
+          env:
+            {{- if and $explorer.chat.credentialSecretName $explorer.chat.provider }}
+            - name: {{ $explorer.chat.apiKeyEnv }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $explorer.chat.credentialSecretName }}
+                  key: {{ $explorer.chat.credentialSecretKey }}
+            {{- end }}
+            {{- if and $explorer.embedding.credentialSecretName $explorer.embedding.provider }}
+            - name: {{ $explorer.embedding.apiKeyEnv }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $explorer.embedding.credentialSecretName }}
+                  key: {{ $explorer.embedding.credentialSecretKey }}
+            {{- end }}
+          {{- end }}
+          ports:
+            - name: http
+              containerPort: {{ $explorer.containerPort }}
+            - name: health
+              containerPort: {{ $explorer.healthPort }}
+          volumeMounts:
+            - name: state
+              mountPath: {{ $explorer.stateDir }}
+            # The root filesystem is read-only, and the engine writes temporary
+            # files outside the state root on some paths (for example
+            # internal/engine/rfile_export.go, which creates its verification
+            # file in the system temp directory). An emptyDir keeps those
+            # working without giving the rest of the root back.
+            - name: tmp
+              mountPath: /tmp
+          # Both probes address the health port, never the workspace port. The
+          # workspace refuses any request whose Host is not an exactly
+          # configured authority, and a kubelet addresses the pod by its
+          # runtime-assigned IP, which allowedHosts cannot name. A probe there
+          # answers 421 and the pod never becomes ready.
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: health
+            initialDelaySeconds: 3
+            periodSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          # The corpus and policy catalog can take a while to open on a large
+          # state root. A startup probe gives that time without also making the
+          # liveness probe slow to notice a wedged process afterwards.
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            periodSeconds: 5
+            failureThreshold: 60
+          resources:
+            {{- toYaml $explorer.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        - name: tmp
+          emptyDir: {}
+  volumeClaimTemplates:
+    - metadata:
+        name: state
+      spec:
+        # ReadWriteOnce is the honest access mode: one process owns this engine.
+        accessModes: ["ReadWriteOnce"]
+        {{- with $explorer.storageClassName }}
+        storageClassName: {{ . }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ $explorer.storageSize }}
+{{- end }}

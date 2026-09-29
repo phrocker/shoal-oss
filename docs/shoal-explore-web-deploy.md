@@ -441,6 +441,60 @@ most common way to trip over the gate; refusals themselves are not logged
 per-request, because the `Host` is attacker-controlled and would invite a log
 flood.
 
+## Kubernetes: the Helm chart
+
+`deploy/helm/shoal` renders the workspace as a StatefulSet with a Service, a
+PodDisruptionBudget and a persistent state volume. The `explorer` values block
+is off by default and independent of the chart's `mode`, which selects a storage
+topology the workspace does not depend on.
+
+```console
+$ cp deploy/helm/shoal/values-explorer.yaml my-explorer-values.yaml
+$ helm upgrade --install shoal deploy/helm/shoal -f my-explorer-values.yaml \
+    --set explorer.image.repository=ghcr.io/YOUR_ORG/shoal-explore-web \
+    --set explorer.image.tag=TAG
+```
+
+The profile **does not install as shipped**. Every value it leaves empty is one
+the chart refuses to render without, because each is a setting whose absence
+produces a workspace that starts and then denies or answers nothing — the
+failure mode this guide's unsafe-configuration section exists to prevent, moved
+from a pod log to `helm template`. Working through the errors in order fills the
+profile.
+
+The refusals:
+
+| Setting | Why the chart will not render without it |
+| --- | --- |
+| `explorer.auth.mode: oidc` | The only valid value. `-dev-auth` is refused on any non-loopback listener, and a pod reached through a Service must bind one, so a chart could only render it into a workspace that cannot start. |
+| `explorer.allowedHosts` | An empty allow-list answers every request `421` (see host authority, above). |
+| `explorer.auth.oidc.issuer`, `audiences`, `authorizationClaim` | Each is required for token validation; a blank or whitespace-only value is treated as missing, because the workspace drops empty entries and then reports the setting absent. |
+| one of `readerValues` / `contributorValues` / `fleetValues` | A claim mapped to nothing denies every authenticated caller, which is fail-closed but indistinguishable from an outage. |
+| `explorer.replicas` above 1 | The corpus, workspace settings and policy catalog share one state root on a `ReadWriteOnce` volume, with no coordination protocol between two processes over it. |
+| a remote chat or embedding provider without a credential Secret | The credential is read at request time and nothing projects it into the pod. |
+| any value still containing `REPLACE_ME` | A placeholder is not configuration. |
+
+Two chart choices follow from this document rather than from Kubernetes
+convention. It is a **StatefulSet** not for ordinal identity but because its
+rolling update stops the old pod before starting the new one, where a Deployment
+surges by default and would put two processes on the one state root the
+split-brain guard exists to prevent. And **every setting is a container
+argument**, not a ConfigMap, so a changed setting rolls the pod on its own; a
+ConfigMap without a checksum annotation would leave the running process on the
+old disclosure posture while the chart claimed the new one.
+
+Probes address the health port below, never the workspace port.
+
+Before changing the chart, run its checks:
+
+```console
+$ deploy/helm/validate-chart.sh
+```
+
+They render every profile, schema-check the output, and assert that each guard
+above still refuses and each valid configuration still renders. A guard that
+silently stops firing is the failure they exist to catch.
+
 ## Orchestrator probes: the health surface
 
 The host-authority gate above runs before routing, before authentication, and

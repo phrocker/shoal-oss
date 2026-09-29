@@ -1,0 +1,41 @@
+{{- if eq (include "shoal.explorerEnabled" .) "true" }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "shoal.explorerName" . }}
+  labels:
+    {{- include "shoal.labels" . | nindent 4 }}
+    app.kubernetes.io/component: explorer
+  {{- with .Values.explorer.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.explorer.service.type }}
+  selector:
+    {{- include "shoal.explorerSelectorLabels" . | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ .Values.explorer.servicePort }}
+      targetPort: http
+---
+# Headless governing Service for the StatefulSet. It carries no health port:
+# the probe surface is for the kubelet, which reaches the pod directly, and
+# publishing it would make an unauthenticated endpoint routable in-cluster for
+# no reason.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "shoal.explorerHeadlessName" . }}
+  labels:
+    {{- include "shoal.labels" . | nindent 4 }}
+    app.kubernetes.io/component: explorer
+spec:
+  clusterIP: None
+  selector:
+    {{- include "shoal.explorerSelectorLabels" . | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ .Values.explorer.servicePort }}
+      targetPort: http
+{{- end }}
