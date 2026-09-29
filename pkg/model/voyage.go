@@ -320,3 +320,7 @@ var (
 	_ Embedder                       = (*VoyageEmbedder)(nil)
 	_ EmbeddingSpaceIdentityProvider = (*VoyageEmbedder)(nil)
 )
+
+// EgressesOffHost is unconditionally true. Voyage is a hosted API; there is no
+// configuration of it that keeps content on this host.
+func (v *VoyageEmbedder) EgressesOffHost() bool { return true }

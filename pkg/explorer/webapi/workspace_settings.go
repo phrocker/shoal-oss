@@ -637,6 +637,7 @@ func requestMayCommit(method, path string) bool {
 					strings.HasSuffix(path, "/revoke"))) ||
 			(strings.HasPrefix(path, "/api/v1/fleet/actions/") &&
 				(strings.HasSuffix(path, "/claim") ||
+					strings.HasSuffix(path, "/complete") ||
 					strings.HasSuffix(path, "/cancel")))
 	}
 }

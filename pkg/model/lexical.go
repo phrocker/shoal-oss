@@ -187,3 +187,7 @@ var (
 	_ Embedder                       = (*LexicalEmbedder)(nil)
 	_ EmbeddingSpaceIdentityProvider = (*LexicalEmbedder)(nil)
 )
+
+// EgressesOffHost is false: the lexical embedder is a pure function of its
+// input and reaches no endpoint.
+func (*LexicalEmbedder) EgressesOffHost() bool { return false }

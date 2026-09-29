@@ -60,6 +60,12 @@ func TestWorkspaceSettingsClampAnalyticsAndMarkResponseLoss(t *testing.T) {
 		{http.MethodPost, "/api/v1/fleet/actions"},
 		{http.MethodPost, "/api/v1/fleet/actions/invoke"},
 		{http.MethodPost, "/api/v1/fleet/actions/action/claim"},
+		// Completion writes the terminal record for work an out-of-process
+		// worker has already performed. If its response is lost — including to
+		// the workspace output limit — the worker must be told the outcome is
+		// indeterminate, not that nothing committed: a deterministic failure
+		// invites a retry of an external effect that already happened.
+		{http.MethodPost, "/api/v1/fleet/actions/action/complete"},
 		{http.MethodPost, "/api/v1/fleet/actions/action/cancel"},
 		{http.MethodPost, "/api/v1/fleet/events/subscriptions"},
 		{http.MethodDelete, "/api/v1/fleet/events/subscriptions/subscription"},

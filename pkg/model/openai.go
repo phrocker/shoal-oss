@@ -80,6 +80,7 @@ type openAIClient struct {
 	httpClient          *http.Client
 	httpClientIdentity  string
 	cacheIdentityUnsafe bool
+	egresses            bool
 	timeout             time.Duration
 	maxTextBytes        int64
 	maxRequestBytes     int64
@@ -420,6 +421,7 @@ func validateOpenAIConfig(cfg OpenAIConfig, needGeneration, needEmbedding bool) 
 	}
 	return &openAIClient{
 		baseURL:             strings.TrimSuffix(baseURL, "/"),
+		egresses:            egressesForConfiguredURL(baseURL),
 		generationModel:     generationModel,
 		embeddingModel:      embeddingModel,
 		embeddingDimensions: cfg.EmbeddingDimensions,
@@ -614,3 +616,17 @@ var (
 	_ Embedder                       = (*OpenAIEmbedder)(nil)
 	_ EmbeddingSpaceIdentityProvider = (*OpenAIEmbedder)(nil)
 )
+
+// EgressesOffHost reports whether this OpenAI-compatible endpoint is remote.
+//
+// The class is configuration, not code: the same client against a loopback
+// inference server transmits nothing, and against a hosted API transmits every
+// prompt it is given. A nil client is unconfigured rather than local, so it
+// fails closed.
+func (o *OpenAIGenerator) EgressesOffHost() bool {
+	return o == nil || o.client == nil || o.client.egresses
+}
+
+func (o *OpenAIEmbedder) EgressesOffHost() bool {
+	return o == nil || o.client == nil || o.client.egresses
+}
