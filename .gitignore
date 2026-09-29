@@ -36,3 +36,6 @@ __pycache__/
 python/src/sharkbite/.libs/
 .review-worktrees/
 test/accumulo/.live/
+
+# Local experimental model checkpoints; receipts and source stay versioned.
+showcases/pr-triage/local-artifacts/

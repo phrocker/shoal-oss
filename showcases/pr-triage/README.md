@@ -4,6 +4,14 @@ This external showcase tests the local-decision architecture in
 [the design](../../docs/local-decisions.md). It preserves full review for every
 change. It does not implement a Shoal review feature or production decision API.
 
+The [follow-up model comparison](MODEL-FINDINGS.md) now identifies an adapted
+Laya shadow candidate: 33/34 adjudicated relevant functions retained on a
+separately reserved 189-function sample, with 19.1% of function-diff bytes
+proposed for reduced review. The known identity-configuration miss and reviewer
+dissent remain explicit. Full review is mandatory. The findings include a
+local checkpoint, replay commands, independent assessments, failed candidates,
+code-volume measurements and limitations.
+
 The [first measured run](runs/pilot-v1/report.md) covers four historical PRs,
 selected by the frozen [protocol](protocol.json). Of 93 changed Go functions,
 55 complete before/after inputs fit the pinned Laya model's 512-token budget;
@@ -70,11 +78,12 @@ are recorded separately in `predictor-artifacts.json`.
 
 ## What remains
 
-This retrospective cohort measures feasibility, context coverage and proposed
-label agreement. It has no human-adjudicated defect oracle, held-out quality
-estimate, paired downstream review, or measured token savings. The next step
-is to adjudicate disagreements and challenge agreed negatives, then freeze a
-separate prospective cohort before changing context construction or tuning.
+The initial pilot above remains development evidence. Follow-up experiments
+add separate retrospective cohorts and adjudication, but there is still no
+human-adjudicated defect oracle, prospective quality estimate, paired
+downstream review, or measured LLM token savings. The next promotion gate is
+a prospective shadow cohort and paired downstream reviews. Caller and policy
+consumer evidence is a concrete context improvement for further Laya work.
 
 The files are local experiment artifacts, not production Shoal receipts or a
 fully materialized operational graph. The collector, adjudication workflow
