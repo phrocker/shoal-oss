@@ -44,6 +44,7 @@ type VoyageEmbedder struct {
 	endpoint            string
 	httpClientIdentity  string
 	cacheIdentityUnsafe bool
+	egresses            bool
 }
 
 func NewVoyageEmbedder(cfg VoyageConfig) (*VoyageEmbedder, error) {
@@ -57,6 +58,7 @@ func NewVoyageEmbedder(cfg VoyageConfig) (*VoyageEmbedder, error) {
 	}
 	return &VoyageEmbedder{
 		cfg: cfg, endpoint: endpoint, httpClientIdentity: httpIdentity, cacheIdentityUnsafe: !cacheable,
+		egresses: egressesForConfiguredURL(cfg.BaseURL),
 	}, nil
 }
 
@@ -320,3 +322,19 @@ var (
 	_ Embedder                       = (*VoyageEmbedder)(nil)
 	_ EmbeddingSpaceIdentityProvider = (*VoyageEmbedder)(nil)
 )
+
+// EgressesOffHost reports whether this Voyage endpoint is remote.
+//
+// The obvious answer is "always": Voyage is a hosted API. But
+// validateVoyageConfig deliberately accepts a loopback HTTP base URL, the same
+// as the Ollama and OpenAI-compatible providers, so a local Voyage-compatible
+// service is a configuration this package supports — and the existing tests
+// run against exactly that through httptest. A constant here would report
+// those as transmitting off-host when nothing leaves the machine.
+//
+// So this classifies the validated configuration like every other provider.
+// That is the whole point of the class: egress is a property of where the
+// endpoint is, not of which vendor's wire format it speaks.
+func (v *VoyageEmbedder) EgressesOffHost() bool {
+	return v == nil || v.egresses
+}

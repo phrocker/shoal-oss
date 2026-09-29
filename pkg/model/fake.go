@@ -343,3 +343,9 @@ var (
 	_ Embedder                       = FakeEmbedder{}
 	_ EmbeddingSpaceIdentityProvider = FakeEmbedder{}
 )
+
+// EgressesOffHost is false for the in-process fakes. They compute in this
+// process and reach no endpoint at all.
+func (FakeGenerator) EgressesOffHost() bool { return false }
+
+func (FakeEmbedder) EgressesOffHost() bool { return false }
