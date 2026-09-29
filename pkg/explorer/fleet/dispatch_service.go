@@ -231,6 +231,21 @@ func (s *DispatchService) Claim(ctx context.Context, request ClaimRequest) (Acti
 	if err != nil {
 		return ActionRecord{}, err
 	}
+	// An admission is not dispatch work. Merging the two claim paths gave
+	// dispatch's reclaim semantics reach over admission records, and a reclaim
+	// means nothing for an admission: the grant was made to one caller which was
+	// told it may perform an effect, and nobody else can finish that. Only the
+	// original caller knows whether the effect happened, so a second party
+	// taking the record and reporting an outcome would be recording a fiction.
+	//
+	// An expired admission is abandoned, not reclaimable, and a claimed record
+	// with a lapsed lease is the honest statement of that — it is exactly what
+	// Outstanding reports as Expired. Refused as not-found, because the caller
+	// does hold the record and saying so would separate an admission it owns
+	// from an action ID that does not exist.
+	if current.isAdmission() {
+		return ActionRecord{}, auth.ObjectNotFound()
+	}
 	if current.Version != request.ExpectedVersion {
 		if current.State == DispatchClaimed &&
 			current.Version == request.ExpectedVersion+1 &&
@@ -484,7 +499,29 @@ func (s *DispatchService) ExecuteClaim(ctx context.Context, claimed ActionRecord
 // ExecuteClaim does, because the terminal state at the expected version under
 // the same claim is recognised as the reporter's own work rather than a
 // conflict.
+// CompleteClaim is the dispatch surface's completion. It refuses an admission,
+// which the admission surface closes through its own path.
+//
+// This is not only about a reclaimed record. An admission token carries the
+// action ID, the claim ID and the version, which is everything this request
+// needs — so the caller that holds a live grant could always have completed it
+// here instead of reporting, skipping the one-shot rule, the exact-replay
+// comparison and the malformed-report rejection that the admission path exists
+// to apply. The expiry the review traced is one way in; holding your own token
+// is the other, and it needs no expiry at all.
 func (s *DispatchService) CompleteClaim(ctx context.Context, request CompletionRequest) (ActionRecord, error) {
+	return s.completeClaim(ctx, request, true)
+}
+
+// completeClaim is the shared body. refuseAdmissions is false only for the
+// admission surface, which reaches it having already applied its own
+// validation; splitting it that way keeps one completion implementation rather
+// than a second one that could validate less.
+func (s *DispatchService) completeClaim(
+	ctx context.Context,
+	request CompletionRequest,
+	refuseAdmissions bool,
+) (ActionRecord, error) {
 	ctx, cancel := s.deadline(ctx, request.Context)
 	defer cancel()
 	decision, now, err := s.begin(ctx, auth.OperationInvoke, request.Context)
@@ -510,6 +547,9 @@ func (s *DispatchService) CompleteClaim(ctx context.Context, request CompletionR
 	current, err := s.authorizedCurrent(ctx, decision, request.ID, auth.OperationInvoke, now)
 	if err != nil {
 		return ActionRecord{}, err
+	}
+	if refuseAdmissions && current.isAdmission() {
+		return ActionRecord{}, auth.ObjectNotFound()
 	}
 	// A replayed report. The action is already terminal at the version this
 	// reporter expected to produce, under this reporter's own claim, so the
@@ -759,6 +799,14 @@ func (s *DispatchService) Cancel(ctx context.Context, request CancelRequest) (Ac
 	if err != nil {
 		return ActionRecord{}, err
 	}
+	// Cancelling an admission here would rewrite an abandoned grant as a
+	// refusal, and those are opposite statements: a cancelled admission says
+	// Shoal refused, while an expired claimed one says Shoal permitted an effect
+	// and never learned what happened. Refused as not-found for the same reason
+	// Claim refuses it.
+	if current.isAdmission() {
+		return ActionRecord{}, auth.ObjectNotFound()
+	}
 	if current.Version != request.ExpectedVersion {
 		if current.State == DispatchCanceled &&
 			current.Version == request.ExpectedVersion+1 &&
@@ -988,6 +1036,14 @@ func (s *DispatchService) Pull(ctx context.Context, request PullActionsRequest) 
 	}
 	result := ActionPage{Next: append([]byte(nil), page.Next...)}
 	for _, record := range page.Actions {
+		// An admission is never work a dispatch worker may take. It is only
+		// ever claimed, and this loop returns a claimed record whose lease has
+		// lapsed — which for an admission is not work waiting to be redone but
+		// a grant nobody came back to report on. Claim refuses it anyway; this
+		// keeps it out of the listing that would otherwise offer it.
+		if record.isAdmission() {
+			continue
+		}
 		if record.State != DispatchQueued &&
 			!(record.State == DispatchClaimed && !now.Before(record.ClaimLeaseUntil)) {
 			continue

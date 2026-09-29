@@ -315,11 +315,19 @@ func (s *AdmissionService) Request(
 	if err != nil {
 		return AdmissionGrant{}, err
 	}
+	if err := validateOpaque("admission ID", request.ID, false); err != nil {
+		return AdmissionGrant{}, err
+	}
+	// The durable identity, which is not the one the caller supplied. See
+	// admissionActionID: the caller names its admission, the durable namespace
+	// is global, and without this two principals naming the same admission
+	// would be able to detect each other.
+	actionID := admissionActionID(decision, request.ID)
 	// The same record an enqueue of this request would build, validated
 	// identically and not written. It carries the declaration, so what was
 	// admitted is part of the record's identity and a retry cannot change it.
 	base, action, err := dispatch.queuedRecord(ctx, decision, EnqueueRequest{
-		ID: request.ID, IdempotencyKey: request.IdempotencyKey,
+		ID: actionID, IdempotencyKey: request.IdempotencyKey,
 		AgentID: request.AgentID, AgentGeneration: request.AgentGeneration,
 		Capability: request.Capability, Action: request.Action,
 		SourceID: request.SourceID, PolicyID: request.PolicyID,
@@ -332,7 +340,10 @@ func (s *AdmissionService) Request(
 	base.AdmittedEffects = declared
 	base.AdmittedDisclosures = disclosureDigest(disclosures)
 
-	current, readErr := dispatch.store.GetAction(ctx, request.ID)
+	// Read at the derived identity, which is why this is a raw store read and
+	// not authorizedCurrent. A principal check here would have nothing to
+	// refuse: no other principal's record can be at this ID.
+	current, readErr := dispatch.store.GetAction(ctx, actionID)
 	if readErr != nil && !errors.Is(readErr, ErrActionNotFound) {
 		return AdmissionGrant{}, readErr
 	}
@@ -530,6 +541,42 @@ func (s *AdmissionService) commit(
 		return ActionRecord{}, errors.Join(ErrActionCommitted, err)
 	}
 	return stored, nil
+}
+
+// admissionActionID derives the durable record identity for a caller-supplied
+// admission ID.
+//
+// The caller names its own admission and the durable namespace is global, so
+// two principals naming the same admission would land on one record. The
+// collision is not the problem; its observability is. An unheld name produced a
+// grant and a name another principal held produced a conflict, so a caller with
+// a valid action template could enumerate other principals' admissions by
+// probing names and watching which answer came back — a different status code,
+// not merely a different message.
+//
+// Binding the principal into the identity dissolves the question instead of
+// matching the two answers. Two principals using the same name hold two
+// different records, neither can address the other's, and there is nothing left
+// to tell apart. Matching the answers would have been the fragile fix: it has
+// to be re-established at every branch that can distinguish them, including the
+// write, where a collision surfaces from the store itself.
+//
+// Every component of the principal is included, because every component is part
+// of what authorizedCurrent compares when it decides a record belongs to a
+// caller. An identity that differs only in its delegation chain is a different
+// principal there and must be one here.
+func admissionActionID(decision auth.Decision, supplied []byte) []byte {
+	digest := sha256.New()
+	writeDispatchTupleField(digest, []byte("shoal.fleet.admission-id.v1"))
+	writeDispatchTupleField(digest, decision.AuthorizationDomain())
+	writeDispatchTupleField(digest, []byte(decision.Subject()))
+	writeDispatchTupleField(digest, []byte(decision.Actor()))
+	writeDispatchTupleField(digest, []byte(decision.ClientID()))
+	for _, identity := range decision.OnBehalfOf() {
+		writeDispatchTupleField(digest, []byte(identity))
+	}
+	writeDispatchTupleField(digest, supplied)
+	return digest.Sum(nil)
 }
 
 // disclosureDigest reduces a canonical declared reference set to the value the
@@ -755,12 +802,15 @@ func (s *AdmissionService) Report(
 		}
 		return cloneActionRecord(current), nil
 	}
-	record, err := dispatch.CompleteClaim(ctx, CompletionRequest{
+	// The unexported completion: this is the admission surface's own path, and
+	// it has already applied the validation the exported entry point refuses
+	// admissions in order to protect.
+	record, err := dispatch.completeClaim(ctx, CompletionRequest{
 		ID: report.Token.ActionID, ExpectedVersion: report.Token.Version,
 		ClaimID: report.Token.TokenID, Failed: report.Failed,
 		Result:  ExecutionResult{Output: report.Outcome, ErrorCode: report.ErrorCode},
 		Context: report.Context,
-	})
+	}, false)
 	if err == nil {
 		return record, nil
 	}

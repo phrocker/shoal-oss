@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/phrocker/shoal-oss/internal/disclosureconformance"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/interaction"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
@@ -161,6 +162,22 @@ func (h *admissionHarness) invokeOnlyContext(
 		t, "owner", "actor", request, auth.OperationInvoke))
 }
 
+// storedID is where an admission this harness's principal names lands in the
+// store. The durable ID is derived from the principal, so a test that looks for
+// the caller-supplied name finds nothing.
+func (h *admissionHarness) storedID(t *testing.T, id string) []byte {
+	t.Helper()
+	return admissionActionID(
+		dispatchDecision(t, "owner", "actor", "request", auth.OperationInvoke),
+		[]byte(id))
+}
+
+// stored reads the record for an admission by the name its caller gave it.
+func (h *admissionHarness) stored(t *testing.T, id string) (ActionRecord, error) {
+	t.Helper()
+	return h.store.GetAction(context.Background(), h.storedID(t, id))
+}
+
 func (h *admissionHarness) request(
 	request, id, action string,
 	effects Effects,
@@ -196,7 +213,7 @@ func TestAdmissionDeniesEffectBeyondDeclaredCapability(t *testing.T) {
 		grant.Token.Version != 0 {
 		t.Fatalf("denial issued a token: %#v", grant.Token)
 	}
-	stored, err := harness.store.GetAction(ctx, []byte("admission"))
+	stored, err := harness.stored(t, "admission")
 	if err != nil {
 		t.Fatalf("stored denial = %v", err)
 	}
@@ -275,7 +292,7 @@ func TestAdmissionAllowsDeclaredEffectAndIssuesALiveToken(t *testing.T) {
 	// Version one, not two. A grant is a single durable write: the record is
 	// born claimed and never passes through the queued state where an
 	// ungranted admission would be claimable work.
-	if string(grant.Token.ActionID) != "admission" ||
+	if !bytes.Equal(grant.Token.ActionID, harness.storedID(t, "admission")) ||
 		string(grant.Token.TokenID) != "token-admission" ||
 		grant.Token.Version != 1 {
 		t.Fatalf("token = %#v", grant.Token)
@@ -283,7 +300,7 @@ func TestAdmissionAllowsDeclaredEffectAndIssuesALiveToken(t *testing.T) {
 	if !grant.Token.ExpiresAt.Equal(harness.now.Add(time.Minute)) {
 		t.Fatalf("token expiry = %s", grant.Token.ExpiresAt)
 	}
-	stored, err := harness.store.GetAction(ctx, []byte("admission"))
+	stored, err := harness.stored(t, "admission")
 	if err != nil || stored.State != DispatchClaimed {
 		t.Fatalf("stored grant = %#v, %v", stored, err)
 	}
@@ -500,7 +517,7 @@ func TestReportRejectsATokenSpentOnADenial(t *testing.T) {
 	if _, err := harness.service.Report(
 		harness.context(t, "report"), AdmissionReport{
 			Token: AdmissionToken{
-				ActionID: []byte("admission"),
+				ActionID: harness.storedID(t, "admission"),
 				TokenID:  []byte("token-admission"), Version: 1,
 			},
 			Outcome: json.RawMessage(`{"tokens":1}`),
@@ -597,7 +614,8 @@ func TestOutstandingShowsAGrantNobodyReported(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(page.Admissions) != 1 ||
-		string(page.Admissions[0].ActionID) != "admission" ||
+		!bytes.Equal(page.Admissions[0].ActionID,
+			harness.storedID(t, "admission")) ||
 		string(page.Admissions[0].TokenID) != "token-admission" ||
 		page.Admissions[0].Expired {
 		t.Fatalf("outstanding = %#v", page.Admissions)
@@ -726,20 +744,28 @@ func TestAdmissionReplayCannotChangeWhatWasAdmitted(t *testing.T) {
 	}
 }
 
-// TestDispatchEnqueueCannotReuseAnAdmissionIdentity pins the same binding from
-// the other side. The declaration is part of enqueue equivalence, so a plain
-// dispatch enqueue cannot land on an admission's record and inherit its token.
-func TestDispatchEnqueueCannotReuseAnAdmissionIdentity(t *testing.T) {
+// TestDispatchEnqueueCannotReachAnAdmissionRecord pins that the two surfaces do
+// not share a name space at all.
+//
+// An earlier version of this test asserted that a dispatch enqueue at the
+// admission's name conflicted with it, which was true when the caller's name
+// was the durable ID. It is not any more: the durable ID is derived from the
+// principal, so the same name is two different records and the dispatch enqueue
+// simply succeeds beside the admission rather than colliding with it. The
+// guarantee is stronger — there is no name a dispatch caller can supply that
+// addresses an admission — so the test asserts that instead.
+func TestDispatchEnqueueCannotReachAnAdmissionRecord(t *testing.T) {
 	harness := newAdmissionHarness(t, nil)
-	if _, err := harness.service.Request(
+	grant, err := harness.service.Request(
 		harness.context(t, "request"), harness.request(
 			"request", "admission", "complete",
-			Effects{EffectEgressesContent}, nil)); err != nil {
+			Effects{EffectEgressesContent}, nil))
+	if err != nil {
 		t.Fatal(err)
 	}
 	dispatcher := bindDecision(t, harness.authority, dispatchDecision(
 		t, "owner", "actor", "request", auth.OperationDispatch))
-	if _, err := harness.dispatch.Enqueue(dispatcher, EnqueueRequest{
+	queued, err := harness.dispatch.Enqueue(dispatcher, EnqueueRequest{
 		ID:      []byte("admission"),
 		AgentID: "agent", AgentGeneration: 1,
 		IdempotencyKey: []byte("idempotency-admission"),
@@ -748,9 +774,21 @@ func TestDispatchEnqueueCannotReuseAnAdmissionIdentity(t *testing.T) {
 		ObjectID: "object",
 		Input:    json.RawMessage(`{"prompt_digest":"abc"}`),
 		Context:  dispatchContext(harness.now, "request"),
-	},
-	); !errors.Is(err, ErrActionConflict) {
-		t.Fatalf("dispatch enqueue over an admission = %v", err)
+	})
+	if err != nil {
+		t.Fatalf("dispatch enqueue beside an admission = %v", err)
+	}
+	if bytes.Equal(queued.ID, grant.Token.ActionID) {
+		t.Fatal("a dispatch enqueue landed on the admission's record")
+	}
+	if queued.State != DispatchQueued || queued.isAdmission() {
+		t.Fatalf("dispatch record = %#v", queued)
+	}
+	// The admission is untouched and still claimed under its own token.
+	admission, err := harness.stored(t, "admission")
+	if err != nil || admission.State != DispatchClaimed ||
+		!bytes.Equal(admission.ClaimID, grant.Token.TokenID) {
+		t.Fatalf("admission record = %#v, %v", admission, err)
 	}
 }
 
@@ -774,9 +812,7 @@ func TestAdmissionNeverLeavesClaimableWork(t *testing.T) {
 	); err == nil {
 		t.Fatal("restrictor failure produced an answer")
 	}
-	if _, err := harness.store.GetAction(
-		context.Background(), []byte("aborted"),
-	); !errors.Is(err, ErrActionNotFound) {
+	if _, err := harness.stored(t, "aborted"); !errors.Is(err, ErrActionNotFound) {
 		t.Fatalf("aborted admission left a record: %v", err)
 	}
 
@@ -786,8 +822,7 @@ func TestAdmissionNeverLeavesClaimableWork(t *testing.T) {
 			nil)); err != nil {
 		t.Fatal(err)
 	}
-	refused, err := harness.store.GetAction(
-		context.Background(), []byte("refused"))
+	refused, err := harness.stored(t, "refused")
 	if err != nil || refused.State != DispatchCanceled || refused.Version != 1 {
 		t.Fatalf("refusal record = %#v, %v", refused, err)
 	}
@@ -837,9 +872,8 @@ func TestReportRefusesAFailureCarryingAnOutcome(t *testing.T) {
 	); !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
 		t.Fatalf("failure carrying an outcome = %v", err)
 	}
-	if stored, err := harness.store.GetAction(
-		context.Background(), []byte("admission"),
-	); err != nil || stored.State != DispatchClaimed {
+	if stored, err := harness.stored(t, "admission"); err != nil ||
+		stored.State != DispatchClaimed {
 		t.Fatalf("refused report moved the record: %#v, %v", stored, err)
 	}
 }
@@ -1058,8 +1092,7 @@ func TestReportRefusesAMalformedFailureWithoutSpendingTheToken(t *testing.T) {
 		t.Fatalf("malformed outcome = %v", err)
 	}
 
-	stored, err := harness.store.GetAction(
-		context.Background(), []byte("admission"))
+	stored, err := harness.stored(t, "admission")
 	if err != nil || stored.State != DispatchClaimed || stored.Version != 1 {
 		t.Fatalf("a refused report moved the record: %#v, %v", stored, err)
 	}
@@ -1208,6 +1241,404 @@ func TestDispatchReclaimAdvancesTheFence(t *testing.T) {
 	}
 }
 
+// TestDispatchCannotReclaimOrCloseAnAdmission pins that the dispatch surface
+// will not touch an admission record.
+//
+// Merging the two claim paths gave dispatch's reclaim semantics reach over
+// admissions, and the token a caller already holds carries everything
+// CompleteClaim needs — so the bypass does not even require an expiry. Both
+// routes are covered: a live admission closed through dispatch completion, and
+// an expired one reclaimed and then closed.
+func TestDispatchCannotReclaimOrCloseAnAdmission(t *testing.T) {
+	harness := newAdmissionHarness(t, nil)
+	grant, err := harness.service.Request(
+		harness.context(t, "request"), harness.request(
+			"request", "admission", "complete",
+			Effects{EffectEgressesContent}, nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker := bindDecision(t, harness.authority, dispatchDecision(
+		t, "owner", "actor", "worker",
+		auth.OperationDispatch, auth.OperationInvoke))
+
+	// The live token, used against dispatch completion. This needs no expiry:
+	// the caller holds the action ID, the claim ID and the version already.
+	if _, err := harness.dispatch.CompleteClaim(worker, CompletionRequest{
+		ID: grant.Token.ActionID, ExpectedVersion: grant.Token.Version,
+		ClaimID: grant.Token.TokenID,
+		Result:  ExecutionResult{Output: json.RawMessage(`{"tokens":1}`)},
+		Context: dispatchContext(harness.now, "worker"),
+	}); !shoal.IsErrorCode(err, shoal.ErrorNotFound) {
+		t.Fatalf("dispatch completion of a live admission = %v", err)
+	}
+
+	// The lease lapses. A dispatch worker must not see it, reclaim it, or
+	// cancel it.
+	harness.now = harness.now.Add(2 * time.Minute)
+	page, err := harness.dispatch.Pull(worker, PullActionsRequest{
+		Limit: 16, Context: dispatchContext(harness.now, "worker"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Actions) != 0 {
+		t.Fatalf("expired admission offered as dispatch work: %#v", page.Actions)
+	}
+	if _, err := harness.dispatch.Claim(worker, ClaimRequest{
+		ID: grant.Token.ActionID, ExpectedVersion: grant.Token.Version,
+		ClaimID: []byte("worker-token"), Lease: time.Minute,
+		Context: dispatchContext(harness.now, "worker"),
+	}); !shoal.IsErrorCode(err, shoal.ErrorNotFound) {
+		t.Fatalf("dispatch reclaim of an expired admission = %v", err)
+	}
+	if _, err := harness.dispatch.Cancel(worker, CancelRequest{
+		ID: grant.Token.ActionID, ExpectedVersion: grant.Token.Version,
+		MutationKey: []byte("worker-cancel"),
+		Context:     dispatchContext(harness.now, "worker"),
+	}); !shoal.IsErrorCode(err, shoal.ErrorNotFound) {
+		t.Fatalf("dispatch cancel of an expired admission = %v", err)
+	}
+
+	// The record is untouched, and still says exactly what happened: permission
+	// was granted and nobody came back.
+	stored, err := harness.stored(t, "admission")
+	if err != nil || stored.State != DispatchClaimed || stored.Version != 1 ||
+		!bytes.Equal(stored.ClaimID, grant.Token.TokenID) {
+		t.Fatalf("admission record = %#v, %v", stored, err)
+	}
+	outstanding, err := harness.service.Outstanding(
+		harness.context(t, "list"), OutstandingAdmissionsRequest{
+			Limit: 16, Context: dispatchContext(harness.now, "list"),
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(outstanding.Admissions) != 1 || !outstanding.Admissions[0].Expired {
+		t.Fatalf("outstanding = %#v", outstanding.Admissions)
+	}
+}
+
+// TestDispatchStillServesItsOwnActions pins the other side of that guard: the
+// refusal is scoped to admissions, not to every claimed record. Without this a
+// guard that refused everything would pass every assertion above.
+func TestDispatchStillServesItsOwnActions(t *testing.T) {
+	harness := newAdmissionHarness(t, nil)
+	worker := bindDecision(t, harness.authority, dispatchDecision(
+		t, "owner", "actor", "worker",
+		auth.OperationDispatch, auth.OperationInvoke))
+	queued, err := harness.dispatch.Enqueue(worker, EnqueueRequest{
+		ID: []byte("dispatched"), IdempotencyKey: []byte("idempotency-dispatched"),
+		AgentID: "agent", AgentGeneration: 1,
+		Capability: "model", Action: "complete",
+		SourceID: []byte("source"), PolicyID: []byte("policy"),
+		ObjectID: "object",
+		Input:    json.RawMessage(`{"prompt_digest":"abc"}`),
+		Context:  dispatchContext(harness.now, "worker"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	page, err := harness.dispatch.Pull(worker, PullActionsRequest{
+		Limit: 16, Context: dispatchContext(harness.now, "worker"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Actions) != 1 ||
+		!bytes.Equal(page.Actions[0].ID, queued.ID) {
+		t.Fatalf("dispatch pull = %#v", page.Actions)
+	}
+	claimed, err := harness.dispatch.Claim(worker, ClaimRequest{
+		ID: queued.ID, ExpectedVersion: queued.Version,
+		ClaimID: []byte("worker-token"), Lease: time.Minute,
+		Context: dispatchContext(harness.now, "worker"),
+	})
+	if err != nil {
+		t.Fatalf("dispatch claim of its own action = %v", err)
+	}
+	if _, err := harness.dispatch.CompleteClaim(worker, CompletionRequest{
+		ID: claimed.ID, ExpectedVersion: claimed.Version,
+		ClaimID: claimed.ClaimID,
+		Result:  ExecutionResult{Output: json.RawMessage(`{"tokens":1}`)},
+		Context: dispatchContext(harness.now, "worker"),
+	}); err != nil {
+		t.Fatalf("dispatch completion of its own action = %v", err)
+	}
+}
+
+// TestAdmissionIDIsBoundToItsPrincipal pins that a caller's chosen name is its
+// own, so two principals naming the same admission do not meet.
+func TestAdmissionIDIsBoundToItsPrincipal(t *testing.T) {
+	harness := newAdmissionHarness(t, nil)
+	mine := harness.context(t, "request")
+	theirs := bindDecision(t, harness.authority, dispatchDecision(
+		t, "other", "other", "request",
+		auth.OperationInvoke, auth.OperationRetrieve))
+
+	first, err := harness.service.Request(mine, harness.request(
+		"request", "shared-name", "complete",
+		Effects{EffectEgressesContent}, nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The same name, a different principal. Before the identity was derived,
+	// this was a conflict against a record the second caller could not see.
+	second, err := harness.service.Request(theirs, harness.request(
+		"request", "shared-name", "complete",
+		Effects{EffectEgressesContent}, nil))
+	if err != nil {
+		t.Fatalf("second principal naming the same admission = %v", err)
+	}
+	if second.Outcome != AdmissionAllowed {
+		t.Fatalf("second principal outcome = %q", second.Outcome)
+	}
+	if bytes.Equal(first.Token.ActionID, second.Token.ActionID) {
+		t.Fatal("two principals share one admission record")
+	}
+	// Neither can reach the other's, even holding the derived ID.
+	if _, err := harness.service.Report(theirs, AdmissionReport{
+		Token:   first.Token,
+		Outcome: json.RawMessage(`{"tokens":1}`),
+		Context: dispatchContext(harness.now, "request"),
+	}); !shoal.IsErrorCode(err, shoal.ErrorNotFound) {
+		t.Fatalf("cross-principal report = %v", err)
+	}
+}
+
+// principalDecision builds a decision varying only the identity components the
+// derived admission ID is supposed to separate.
+func principalDecision(
+	t *testing.T, subject, actor, client string, onBehalfOf []shoal.ID,
+) auth.Decision {
+	t.Helper()
+	decision, err := auth.NewDecision(auth.DecisionConfig{
+		Subject: shoal.ID(subject), Actor: shoal.ID(actor),
+		ClientID: shoal.ID(client), OnBehalfOf: onBehalfOf,
+		AuthorizationDomain: []byte("domain"),
+		AllowedOperations:   []auth.Operation{auth.OperationInvoke},
+		PermittedSourceIDs:  [][]byte{[]byte("source")},
+		PermittedPolicyIDs:  [][]byte{[]byte("policy")},
+		PolicyGeneration:    1,
+		AuthenticationExpires: time.Date(
+			2026, 9, 7, 0, 0, 0, 0, time.UTC),
+		RequestID: "request", CorrelationID: "correlation",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return decision
+}
+
+// TestAdmissionIDSeparatesEveryPrincipalComponent pins that the derived
+// identity varies with every part of the principal, and that no part can be
+// collided with its neighbour by moving bytes across the boundary.
+//
+// Each case varies exactly one component. Varying two at once — which an
+// earlier version of this test did — passes against a derivation that ignores
+// either one of them, because the other still separates the pair.
+func TestAdmissionIDSeparatesEveryPrincipalComponent(t *testing.T) {
+	base := principalDecision(t, "owner", "actor", "client", nil)
+	baseID := admissionActionID(base, []byte("name"))
+
+	for _, test := range []struct {
+		name     string
+		decision auth.Decision
+		supplied string
+	}{
+		{"subject", principalDecision(
+			t, "other", "actor", "client", nil), "name"},
+		{"actor", principalDecision(
+			t, "owner", "other", "client", nil), "name"},
+		{"client", principalDecision(
+			t, "owner", "actor", "other", nil), "name"},
+		{"delegation", principalDecision(
+			t, "owner", "actor", "client",
+			[]shoal.ID{"delegate"}), "name"},
+		{"supplied name", base, "other"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got := admissionActionID(test.decision, []byte(test.supplied))
+			if bytes.Equal(got, baseID) {
+				t.Fatalf("%s does not change the derived identity", test.name)
+			}
+		})
+	}
+
+	// Framing, checked on each boundary between adjacent variable-length
+	// components. Without a length prefix these pairs concatenate identically
+	// and two principals share one record, which is the whole of what the
+	// derivation exists to prevent.
+	for _, test := range []struct {
+		name          string
+		leftDecision  auth.Decision
+		leftName      string
+		rightDecision auth.Decision
+		rightName     string
+	}{
+		{
+			name:          "subject/actor",
+			leftDecision:  principalDecision(t, "ab", "c", "client", nil),
+			leftName:      "name",
+			rightDecision: principalDecision(t, "a", "bc", "client", nil),
+			rightName:     "name",
+		},
+		{
+			name:          "actor/client",
+			leftDecision:  principalDecision(t, "owner", "ab", "c", nil),
+			leftName:      "name",
+			rightDecision: principalDecision(t, "owner", "a", "bc", nil),
+			rightName:     "name",
+		},
+		{
+			name:          "client/supplied",
+			leftDecision:  principalDecision(t, "owner", "actor", "ab", nil),
+			leftName:      "c",
+			rightDecision: principalDecision(t, "owner", "actor", "a", nil),
+			rightName:     "bc",
+		},
+		{
+			name: "delegation/supplied",
+			leftDecision: principalDecision(
+				t, "owner", "actor", "client", []shoal.ID{"ab"}),
+			leftName: "c",
+			rightDecision: principalDecision(
+				t, "owner", "actor", "client", []shoal.ID{"a"}),
+			rightName: "bc",
+		},
+	} {
+		t.Run("framing/"+test.name, func(t *testing.T) {
+			left := admissionActionID(
+				test.leftDecision, []byte(test.leftName))
+			right := admissionActionID(
+				test.rightDecision, []byte(test.rightName))
+			if bytes.Equal(left, right) {
+				t.Fatalf("%s boundary collides: %x", test.name, left)
+			}
+		})
+	}
+
+	// Stable for one principal and name, or no retry could find its own record.
+	// The request identity deliberately does not participate.
+	if !bytes.Equal(baseID, admissionActionID(base, []byte("name"))) {
+		t.Fatal("the derived identity is not stable")
+	}
+}
+
+// TestAdmissionRequiresAWellFormedID pins that the caller's name is validated
+// before it is digested. Everything is digestible, so without this an empty or
+// oversized name would derive a perfectly valid record identity and be accepted
+// where every other surface refuses it.
+func TestAdmissionRequiresAWellFormedID(t *testing.T) {
+	harness := newAdmissionHarness(t, nil)
+	for _, name := range []string{"", strings.Repeat("x", MaxActionIDBytes+1)} {
+		request := harness.request(
+			"request", "placeholder", "complete",
+			Effects{EffectEgressesContent}, nil)
+		request.ID = []byte(name)
+		if _, err := harness.service.Request(
+			harness.context(t, "request"), request,
+		); !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
+			t.Fatalf("admission ID of %d bytes = %v", len(name), err)
+		}
+	}
+}
+
+// TestAdmissionAnswersAreIndistinguishableAcrossPrincipals is the enumeration
+// pin, and it compares encoded answers rather than statuses.
+//
+// The bug it covers returned a 200 grant for a name nobody held and a 409
+// conflict for a name another principal held, so probing names enumerated other
+// principals' admissions. A test asserting "both succeed" would pass against a
+// version that merely returned the same status while differing in the token, or
+// the outcome, or a field added later — so the whole encoded answer is
+// compared, with the token normalised only for the request identity that
+// legitimately varies between two probes.
+func TestAdmissionAnswersAreIndistinguishableAcrossPrincipals(t *testing.T) {
+	probe := func(t *testing.T, occupied bool) AdmissionGrant {
+		t.Helper()
+		harness := newAdmissionHarness(t, nil)
+		if occupied {
+			theirs := bindDecision(t, harness.authority, dispatchDecision(
+				t, "other", "other", "request",
+				auth.OperationInvoke, auth.OperationRetrieve))
+			if _, err := harness.service.Request(theirs, harness.request(
+				"request", "probe-target", "complete",
+				Effects{EffectEgressesContent}, nil)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		grant, err := harness.service.Request(
+			harness.context(t, "request"), harness.request(
+				"request", "probe-target", "complete",
+				Effects{EffectEgressesContent}, nil))
+		if err != nil {
+			t.Fatalf("probe (occupied=%v) = %v", occupied, err)
+		}
+		return grant
+	}
+	disclosureconformance.Run(t, disclosureconformance.Probe{
+		Name:     "admission/request-name-held-by-another-principal",
+		Withheld: admissionProbeResponse(probe(t, true)),
+		Control:  admissionProbeResponse(probe(t, false)),
+	})
+}
+
+// admissionProbeResponse renders a grant the way a caller receives it, so the
+// comparison covers every field rather than the ones a test remembered to name.
+func admissionProbeResponse(grant AdmissionGrant) map[string]any {
+	withhold := make([]string, 0, len(grant.Obligations.Withhold))
+	for _, reference := range grant.Obligations.Withhold {
+		withhold = append(withhold, string(reference))
+	}
+	return map[string]any{
+		"outcome":    string(grant.Outcome),
+		"action_id":  grant.Token.ActionID,
+		"token_id":   grant.Token.TokenID,
+		"version":    grant.Token.Version,
+		"expires_at": grant.Token.ExpiresAt,
+		"withhold":   withhold,
+	}
+}
+
+// TestAdmissionReportRefusalsAreIndistinguishable pins the same property on the
+// report path, which was already correct and is easy to regress: an absent
+// admission and another principal's admission must produce the same bytes, not
+// merely the same status.
+func TestAdmissionReportRefusalsAreIndistinguishable(t *testing.T) {
+	harness := newAdmissionHarness(t, nil)
+	theirs := bindDecision(t, harness.authority, dispatchDecision(
+		t, "other", "other", "request",
+		auth.OperationInvoke, auth.OperationRetrieve))
+	foreign, err := harness.service.Request(theirs, harness.request(
+		"request", "theirs", "complete",
+		Effects{EffectEgressesContent}, nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	report := func(actionID []byte) map[string]any {
+		_, err := harness.service.Report(
+			harness.context(t, "report"), AdmissionReport{
+				Token: AdmissionToken{
+					ActionID: actionID, TokenID: []byte("token-theirs"),
+					Version: 1,
+				},
+				Outcome: json.RawMessage(`{"tokens":1}`),
+				Context: dispatchContext(harness.now, "report"),
+			})
+		return map[string]any{
+			"error":     err.Error(),
+			"not_found": shoal.IsErrorCode(err, shoal.ErrorNotFound),
+			"conflict":  shoal.IsErrorCode(err, shoal.ErrorConflict),
+		}
+	}
+	disclosureconformance.Run(t, disclosureconformance.Probe{
+		Name:     "admission/report-token-of-another-principal",
+		Withheld: report(foreign.Token.ActionID),
+		Control:  report(harness.storedID(t, "never-existed")),
+	})
+}
+
 // TestAdmissionDisclosureDigestSeparatesDistinctSets pins the framing. Without
 // a length prefix per element, two different declarations concatenate to the
 // same bytes and a retry could swap one for the other under a live token.
@@ -1326,8 +1757,7 @@ func TestAdmissionRecordDoesNotAliasItsDeclaration(t *testing.T) {
 			[]shoal.ID{"doc-a", "doc-b"})); err != nil {
 		t.Fatal(err)
 	}
-	handed, err := harness.store.GetAction(
-		context.Background(), []byte("admission"))
+	handed, err := harness.stored(t, "admission")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1340,8 +1770,7 @@ func TestAdmissionRecordDoesNotAliasItsDeclaration(t *testing.T) {
 	handed.AdmittedDisclosures[0] ^= 0xff
 	handed.AdmittedObligation[0] ^= 0xff
 
-	reread, err := harness.store.GetAction(
-		context.Background(), []byte("admission"))
+	reread, err := harness.stored(t, "admission")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1417,8 +1846,7 @@ func TestAdmissionChargesAPossibleEffectExactlyAsAClaimDoes(t *testing.T) {
 					Effects{test.effect}, nil)); err != nil {
 				t.Fatal(err)
 			}
-			granted, err := harness.store.GetAction(
-				context.Background(), []byte(test.id))
+			granted, err := harness.stored(t, test.id)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1439,8 +1867,7 @@ func TestAdmissionChargesAPossibleEffectExactlyAsAClaimDoes(t *testing.T) {
 			Effects{EffectReadsCorpus}, nil)); err != nil {
 		t.Fatal(err)
 	}
-	reading, err := harness.store.GetAction(
-		context.Background(), []byte("reading"))
+	reading, err := harness.stored(t, "reading")
 	if err != nil || reading.EffectPossible {
 		t.Fatalf("corpus-read admission = %#v, %v", reading, err)
 	}
@@ -1457,8 +1884,7 @@ func TestAdmissionAndDispatchClaimAgreeOnTheRecord(t *testing.T) {
 			Effects{EffectEgressesContent}, nil)); err != nil {
 		t.Fatal(err)
 	}
-	admitted, err := harness.store.GetAction(
-		context.Background(), []byte("admitted"))
+	admitted, err := harness.stored(t, "admitted")
 	if err != nil {
 		t.Fatal(err)
 	}

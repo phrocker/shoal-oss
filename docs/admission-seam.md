@@ -93,6 +93,26 @@ identities, for the same reason the declaration is a digest: a position
 discloses nothing without the list it indexes, and the caller supplies that
 list again on the retry, where the digest proves it is the same one.
 
+### The durable identity is derived, not the caller's name
+
+A caller names its own admission, and the durable namespace is global. Those
+two facts together used to mean that two principals naming the same admission
+landed on one record — and, worse, that the collision was *visible*: an unheld
+name produced a grant and a name another principal held produced a conflict, a
+different status code, so probing names enumerated other principals'
+admissions.
+
+The durable ID is now `digest(authorization domain, subject, actor, client,
+delegation chain, caller's name)`, each component length-framed. Two principals
+using the same name hold two different records, neither can address the other's,
+and there is nothing left to tell apart. That is a stronger fix than matching
+the two answers, which would have to be re-established at every branch that can
+distinguish them — including the write, where a collision surfaces from the
+store itself rather than from any branch this code owns.
+
+The token carries the derived ID, which is opaque to the caller and needs to be:
+it is only ever handed back.
+
 ### An admission is distinguishable from a dispatch action
 
 `AdmittedEffects` is the marker — an admission is refused before it reaches a
@@ -110,6 +130,27 @@ This narrows a claim made earlier in this document. Before the marker existed,
 an outstanding admission and an outstanding claim genuinely were
 indistinguishable; they are not any more, and the surface no longer pretends
 otherwise.
+
+The dispatch surface checks the same marker, in the other direction. `Pull`
+skips admissions, and `Claim`, `Cancel` and `CompleteClaim` refuse them as
+not-found.
+
+That is the price of sharing one claim transition: merging the paths was right,
+and it gave dispatch's reclaim semantics reach over admission records. **A
+reclaim means nothing for an admission.** The grant was made to one caller which
+was told it may perform an effect; nobody else can finish that, and only the
+original caller knows whether the effect happened, so a second party taking the
+record and reporting an outcome would be recording a fiction. An expired
+admission is abandoned, and a claimed record with a lapsed lease is the honest
+statement of that — exactly what `outstanding` reports as `expired`. Cancelling
+one would be worse still, rewriting an abandoned grant as a refusal, which is
+the opposite statement.
+
+The completion guard is not only about expiry. An admission token carries the
+action ID, the claim ID and the version — everything dispatch completion needs —
+so a caller holding a live grant could always have completed it there instead of
+reporting, skipping the one-shot rule, the exact-replay comparison and the
+malformed-report rejection. That route needs no expiry at all.
 
 ## The three answers
 
