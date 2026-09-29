@@ -60,8 +60,29 @@ app.kubernetes.io/part-of: shoal-platform
 {{- .Values.explorer.enabled -}}
 {{- end -}}
 
+{{- /*
+Explorer names are built from one bounded stem so that every name derived from
+it fits Kubernetes' 63-character limit.
+
+Truncating the finished name is not enough: the headless Service name is the
+longest of them, and appending "-headless" to an already-63-character name
+produces 72. The stem reserves room for the longest suffix instead, so a long
+release name shortens the stem rather than overflowing the name.
+
+  stem            45
+  -explorer        9  -> 54
+  -explorer-headless 18 -> 63
+*/ -}}
+{{- define "shoal.explorerStem" -}}
+{{- include "shoal.fullname" . | trunc 45 | trimSuffix "-" -}}
+{{- end -}}
+
 {{- define "shoal.explorerName" -}}
-{{- printf "%s-explorer" (include "shoal.fullname" .) | trunc 63 | trimSuffix "-" -}}
+{{- printf "%s-explorer" (include "shoal.explorerStem" .) -}}
+{{- end -}}
+
+{{- define "shoal.explorerHeadlessName" -}}
+{{- printf "%s-explorer-headless" (include "shoal.explorerStem" .) -}}
 {{- end -}}
 
 {{- define "shoal.explorerSelectorLabels" -}}

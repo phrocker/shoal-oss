@@ -21,26 +21,51 @@
 {{- if ne $explorer.auth.mode "oidc" -}}
 {{- fail (printf "explorer.auth.mode must be set to \"oidc\" (got %q). The Explorer refuses to serve without an authenticator, and -dev-auth is not an option in a cluster: it is refused on any non-loopback listener, which a pod behind a Service must bind. Configure explorer.auth.oidc" $explorer.auth.mode) -}}
 {{- end -}}
-{{- if not $oidc.issuer -}}
+{{- /* Every required value is checked after trimming, and list values are
+       checked item by item.
+
+       A value that is present but blank is not a configured value. The
+       workspace drops empty entries in normalizeRequiredValues and then
+       reports the setting as missing, so a list holding only "" or " " renders
+       a pod that starts and exits during OIDC initialisation — the failure
+       these guards exist to move to render time. Length alone would pass it. */ -}}
+{{- if not (trim $oidc.issuer) -}}
 {{- fail "explorer.auth.oidc.issuer is required: tokens are validated against an exact issuer" -}}
 {{- end -}}
-{{- if not $oidc.audiences -}}
-{{- fail "explorer.auth.oidc.audiences is required: at least one audience must match a token exactly, or every token is rejected" -}}
+{{- $audiences := list -}}
+{{- range $oidc.audiences }}{{- if trim . }}{{- $audiences = append $audiences (trim .) }}{{- end }}{{- end -}}
+{{- if not $audiences -}}
+{{- fail "explorer.auth.oidc.audiences needs at least one non-blank value: at least one audience must match a token exactly, or every token is rejected" -}}
 {{- end -}}
-{{- if not $oidc.authorizationClaim -}}
+{{- if not (trim $oidc.authorizationClaim) -}}
 {{- fail "explorer.auth.oidc.authorizationClaim is required: without it no token carries workspace authority and every authenticated caller is denied" -}}
 {{- end -}}
 {{- /* A mapped claim with no values is fail-closed but indistinguishable from
        an outage, and it is the most common way to deploy a workspace that
        authenticates everyone and authorizes no one. */ -}}
-{{- if not (or $oidc.readerValues (or $oidc.contributorValues $oidc.fleetValues)) -}}
-{{- fail "explorer.auth.oidc needs at least one of readerValues, contributorValues or fleetValues: the authorization claim is mapped to nothing, so every authenticated caller would be denied" -}}
+{{- $roleValues := list -}}
+{{- range (concat $oidc.readerValues $oidc.contributorValues $oidc.fleetValues) }}{{- if trim . }}{{- $roleValues = append $roleValues (trim .) }}{{- end }}{{- end -}}
+{{- if not $roleValues -}}
+{{- fail "explorer.auth.oidc needs at least one non-blank value across readerValues, contributorValues and fleetValues: the authorization claim is mapped to nothing, so every authenticated caller would be denied" -}}
 {{- end -}}
 
 {{- /* An empty allow-list refuses every request with 421, because the resolved
        listen address of a pod is an authority no real client sends. */ -}}
-{{- if not $explorer.allowedHosts -}}
-{{- fail "explorer.allowedHosts is required: the workspace binds a non-loopback address in a pod, and with no allow-list every request is refused with 421 Misdirected Request. List the external authority clients actually send (usually the port-less ingress name)" -}}
+{{- $allowedHosts := list -}}
+{{- range $explorer.allowedHosts }}{{- if trim . }}{{- $allowedHosts = append $allowedHosts (trim .) }}{{- end }}{{- end -}}
+{{- if not $allowedHosts -}}
+{{- fail "explorer.allowedHosts needs at least one non-blank value: the workspace binds a non-loopback address in a pod, and with no allow-list every request is refused with 421 Misdirected Request. List the external authority clients actually send (usually the port-less ingress name)" -}}
+{{- end -}}
+
+{{- /* Placeholders are not configuration. The shipped profile leaves these
+       empty so the guards above fire, but a values file copied from the docs
+       can still carry the marker text through, and a pod that authenticates
+       nobody because its issuer is literally REPLACE_ME is the failure this
+       whole block exists to prevent. */ -}}
+{{- range (concat (list $oidc.issuer $oidc.authorizationClaim) $oidc.audiences $explorer.allowedHosts) -}}
+{{- if contains "REPLACE_ME" (toString .) -}}
+{{- fail (printf "explorer configuration still contains the placeholder %q: replace every REPLACE_ME before installing" (toString .)) -}}
+{{- end -}}
 {{- end -}}
 
 {{- /* One state root, one engine, no coordination protocol between two

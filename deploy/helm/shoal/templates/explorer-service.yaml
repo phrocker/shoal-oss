@@ -26,7 +26,7 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: {{ include "shoal.explorerName" . }}-headless
+  name: {{ include "shoal.explorerHeadlessName" . }}
   labels:
     {{- include "shoal.labels" . | nindent 4 }}
     app.kubernetes.io/component: explorer

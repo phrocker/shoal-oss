@@ -14,7 +14,7 @@ spec:
   # surges by default, which would put two processes on one ReadWriteOnce state
   # root — the split-brain the workspace has no protocol for.
   replicas: {{ $explorer.replicas }}
-  serviceName: {{ include "shoal.explorerName" . }}-headless
+  serviceName: {{ include "shoal.explorerHeadlessName" . }}
   podManagementPolicy: OrderedReady
   updateStrategy:
     type: RollingUpdate

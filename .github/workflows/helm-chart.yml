@@ -39,5 +39,12 @@ jobs:
           curl -fsSL "https://github.com/yannh/kubeconform/releases/download/${version}/kubeconform-linux-amd64.tar.gz" |
             tar -xz -C /usr/local/bin kubeconform
           kubeconform -v
+      - name: Install PyYAML
+        # The rendered-object checks parse Helm output with PyYAML, which is not
+        # in Python's standard library. The runner image happens to ship it
+        # today, so leaving it undeclared passes until the image changes and
+        # then fails as a ModuleNotFoundError that looks nothing like a chart
+        # problem.
+        run: python3 -m pip install --disable-pip-version-check 'pyyaml==6.0.2'
       - name: Validate the chart
         run: ./deploy/helm/validate-chart.sh

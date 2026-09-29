@@ -92,14 +92,19 @@ all three and composes with any of them, so it is not derived from `mode`. It is
 off by default and enabled explicitly.
 
 ```bash
-helm upgrade --install shoal deploy/helm/shoal -f deploy/helm/shoal/values-explorer.yaml \
+cp deploy/helm/shoal/values-explorer.yaml my-explorer-values.yaml
+# fill in allowedHosts, issuer, audiences, authorizationClaim and at least one
+# role mapping, then:
+helm upgrade --install shoal deploy/helm/shoal -f my-explorer-values.yaml \
   --set explorer.image.repository=ghcr.io/YOUR_ORG/shoal-explore-web \
   --set explorer.image.tag=TAG
 ```
 
 `values-explorer.yaml` is the authorized plane on its own, with no
-Accumulo-replacement roles. To add it to a storage deployment, set
-`explorer.enabled=true` alongside any other profile.
+Accumulo-replacement roles. **It does not install as shipped**: every required
+value is left empty so the guards below fire, and `helm template` names the
+first one missing. Fill them in, then install. To add the explorer to a storage
+deployment instead, set `explorer.enabled=true` alongside any other profile.
 
 The chart **refuses to render** a configuration that would start and then deny
 or answer nothing. Authentication is a required decision with one valid value
