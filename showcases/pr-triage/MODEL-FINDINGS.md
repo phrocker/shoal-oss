@@ -1,11 +1,23 @@
 # Local authorization decision models: measured findings
 
-The newest supervised comparison yields a cheap CPU classifier, but **no
-accuracy or practical review-efficiency improvement has been established**.
-The code-only classifier retained 27/28 frontier-assessed and 24/25
-Claude-assessed relevant functions on 194 newly reserved functions. The older
-Laya comparator retained 28/28 and 24/25, respectively. PR #410 stays unmerged;
-full review remains mandatory.
+The [V9 experiment](runs/operations-v9/README.md) establishes a stronger shadow
+candidate: code-only SVM retains 65/67 frontier and 64/64 Claude relevant
+functions, versus 61/67 and 59/64 for the older adapted Laya. Four complete-PR
+counterfactual pairs reduce actual input tokens by 16.4%. This is encouraging,
+but does not establish defect-detection parity or safe source exclusion.
+
+Generic AST operation features did not beat code alone. The new
+[learning-loop prototype](../../experiments/decision-learning/README.md) uses
+988 manifest-selected training examples to reproduce all 188 frozen scores.
+It preserves nineteen held-out assessor disagreements and returns hold under
+its new retrospective 98% gate. Full review remains mandatory; PR #410 is unmerged.
+
+The newly observed PR399 delta retains all 25 frontier and nine Claude relevant
+functions, lowering only one of 26 functions. Its family was seen in development;
+this is live same-family evidence, not independent future-PR validation.
+
+The earlier V8 results below remain historical evidence rather than the latest
+candidate assessment.
 
 ## Supervised classifier comparison: V8
 

@@ -4,12 +4,16 @@ This external showcase tests the local-decision architecture in
 [the design](../../docs/local-decisions.md). It preserves full review for every
 change. It does not implement a Shoal review feature or production decision API.
 
-The [continued model comparison](MODEL-FINDINGS.md) now includes ten supervised
-CPU classifier recipes. The selected model retained 27/28 frontier-assessed and
-24/25 Claude-assessed relevant functions on 194 reserved functions, but did not
-beat Laya's accuracy. Complete-PR paired reviews saved only 2.8% of input tokens.
-The runnable data-only model is cheap; practical review-efficiency improvement
-remains unproven. Full review is mandatory and PR #410 remains unmerged.
+The [V9 comparison](runs/operations-v9/README.md) now favors a code-only CPU SVM:
+65/67 frontier-assessed and 64/64 Claude-assessed relevant functions retained,
+versus Laya's 61/67 and 59/64. Four complete-PR counterfactual pairs used 16.4%
+fewer input tokens. Quality parity and safe exclusion remain unproven.
+
+The [offline learning loop](../../experiments/decision-learning/README.md)
+builds training manifests, quarantines conflicting labels and exact overlaps,
+refits the winner, and reproduces all 188 held-out scores exactly. Its promotion
+record correctly says hold: the new 98% gate is unmet and retrospective.
+Full review remains mandatory and PR #410 remains unmerged.
 
 The [first measured run](runs/pilot-v1/report.md) covers four historical PRs,
 selected by the frozen [protocol](protocol.json). Of 93 changed Go functions,

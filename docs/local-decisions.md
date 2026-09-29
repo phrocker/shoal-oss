@@ -457,6 +457,13 @@ this is not a second product integration or a model-quality benchmark. A package
 boundary test also rejects core dependencies on GitHub clients, showcase packages,
 or Go parser/type-checker packages.
 
+## Executable learning slice
+
+The [learning-loop extension](local-decision-learning.md) and
+[offline receipt framework](../experiments/decision-learning/README.md) now
+exercise dataset construction, manifest-driven refitting, audits and shadow-only
+promotion against real V9 evidence. Production integration remains outstanding.
+
 ## Validation and tracking
 
 See [local validation](local-decisions-validation.md) for pinned upstream source,
