@@ -140,10 +140,9 @@ type Client struct {
 	generationReader    auth.GenerationReader
 	clock               func() time.Time
 	mosaic              MosaicBudget
-	ledger              CoOccurrenceLedger
+	accumulator         *Accumulator[[]string]
 	mutationMu          sync.Mutex
 	vectorMu            sync.Mutex
-	budgetMu            sync.Mutex
 	vectorAvailability  authorizedVectorAvailabilityCache
 }
 
@@ -201,16 +200,9 @@ func NewClient(config Config) (*Client, error) {
 			return nil, dependencyRequired("edge policy selector")
 		}
 	}
-	var ledger CoOccurrenceLedger
-	if config.Mosaic.enabled() {
-		if config.Mosaic.Window <= 0 {
-			return nil, dependencyRequired("mosaic co-occurrence window")
-		}
-		var ok bool
-		ledger, ok = config.PolicyStore.(CoOccurrenceLedger)
-		if !ok || isNilDependency(ledger) {
-			return nil, dependencyRequired("co-occurrence ledger")
-		}
+	accumulator, err := config.Mosaic.accumulator(config.PolicyStore)
+	if err != nil {
+		return nil, err
 	}
 	return &Client{
 		base:                config.Base,
@@ -229,7 +221,7 @@ func NewClient(config Config) (*Client, error) {
 		generationReader:    config.GenerationReader,
 		clock:               config.Clock,
 		mosaic:              config.Mosaic,
-		ledger:              ledger,
+		accumulator:         accumulator,
 	}, nil
 }
 

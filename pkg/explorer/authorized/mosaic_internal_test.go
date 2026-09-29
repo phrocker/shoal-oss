@@ -48,10 +48,12 @@ func TestEmptySensitivityDomainIsProducible(t *testing.T) {
 // such document into one shared compartment and silently bypass the budget.
 // The guard must reject the read instead of returning a partial selection.
 func TestMosaicBudgetFailsClosedOnEmptySensitivityDomain(t *testing.T) {
-	client := &Client{
-		mosaic: MosaicBudget{MaxDomains: 4, Window: time.Hour},
-		ledger: NewMemoryPolicyStore(),
+	budget := MosaicBudget{MaxDomains: 4, Window: time.Hour}
+	accumulator, err := budget.accumulator(NewMemoryPolicyStore())
+	if err != nil {
+		t.Fatal(err)
 	}
+	client := &Client{mosaic: budget, accumulator: accumulator}
 
 	ungoverned := shoal.ID("doc-ungoverned")
 	selection, err := client.applyMosaicBudget(

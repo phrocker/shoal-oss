@@ -20,9 +20,7 @@
 package authorized
 
 import (
-	"bytes"
 	"context"
-	"encoding/binary"
 	"sort"
 	"time"
 
@@ -105,23 +103,6 @@ func (r AccessRule) sensitivityDomain() string {
 	).String()
 }
 
-// mosaicIdentityKey derives the stable per-identity ledger key from the
-// decision's authorization domain and subject. It is a one-way digest, so the
-// persisted co-occurrence records never carry the raw identity.
-func mosaicIdentityKey(decision auth.Decision) string {
-	var buf bytes.Buffer
-	writeComponent := func(value []byte) {
-		var length [8]byte
-		binary.BigEndian.PutUint64(length[:], uint64(len(value)))
-		_, _ = buf.Write(length[:])
-		_, _ = buf.Write(value)
-	}
-	writeComponent(decision.AuthorizationDomain())
-	writeComponent([]byte(decision.Subject()))
-	return auth.DigestBytes(
-		"explorer-mosaic-identity-v1", buf.Bytes()).String()
-}
-
 // mosaicSelection is the outcome of applying the co-occurrence budget to one
 // identity's ordered set of authorized documents: the documents that remain
 // visible and how many were withheld to stay within the budget.
@@ -170,8 +151,8 @@ func (c *Client) restrictCoOccurrence(
 // The charge is a set union over observed domains, so repeating an identical
 // read never double-charges: admitted domains are already present and re-admit
 // for free, and withheld domains remain withheld. The whole update runs under
-// budgetMu and persists through the ledger so concurrent reads by one identity
-// serialize and survive restarts.
+// the accumulator lock and persists through the ledger so concurrent reads by
+// one identity serialize and survive restarts.
 func (c *Client) applyMosaicBudget(
 	ctx context.Context,
 	decision auth.Decision,
@@ -179,66 +160,79 @@ func (c *Client) applyMosaicBudget(
 	order []shoal.ID,
 	domains map[shoal.ID]string,
 ) (mosaicSelection, error) {
-	c.budgetMu.Lock()
-	defer c.budgetMu.Unlock()
+	selection := mosaicSelection{allowed: make(map[shoal.ID]struct{}, len(order))}
+	_, err := c.accumulator.Update(ctx, decision, now, func(previous []string) ([]string, error) {
+		observed := make(map[string]struct{}, len(previous))
+		for _, domain := range previous {
+			observed[domain] = struct{}{}
+		}
+		budget := int(c.mosaic.MaxDomains)
+		for _, documentID := range order {
+			domain := domains[documentID]
+			if domain == "" {
+				// Every authorized document is governed by a nonempty rule, so an
+				// empty sensitivity domain is an internal inconsistency. Fail
+				// closed rather than collapse ungoverned documents into one shared
+				// compartment.
+				return nil, inconsistentBase()
+			}
+			if _, seen := observed[domain]; seen {
+				selection.allowed[documentID] = struct{}{}
+				continue
+			}
+			if len(observed) < budget {
+				observed[domain] = struct{}{}
+				selection.allowed[documentID] = struct{}{}
+				continue
+			}
+			// Load-bearing: the withholding branch is pinned by
+			// TestMosaicBudgetWithholdsCrossDomainResults; deleting the increment
+			// or the continue would let a restricted document through.
+			selection.restricted++
+		}
 
-	key := mosaicIdentityKey(decision)
-	record, found, err := c.ledger.LoadCoOccurrence(ctx, key)
+		domainsOut := make([]string, 0, len(observed))
+		for domain := range observed {
+			domainsOut = append(domainsOut, domain)
+		}
+		sort.Strings(domainsOut)
+		return domainsOut, nil
+	})
 	if err != nil {
 		return mosaicSelection{}, err
 	}
-
-	observed := make(map[string]struct{})
-	windowStart := now
-	// A found record within its window carries the domains already locked in;
-	// an expired window, a clock that moved backward, or a missing record all
-	// open a fresh window with no observed domains. Load-bearing: the reset is
-	// pinned by TestMosaicBudgetResetsAfterWindow.
-	if found &&
-		!now.Before(record.WindowStart) &&
-		now.Sub(record.WindowStart) < c.mosaic.Window {
-		windowStart = record.WindowStart
-		for _, domain := range record.Domains {
-			observed[domain] = struct{}{}
-		}
-	}
-
-	selection := mosaicSelection{allowed: make(map[shoal.ID]struct{}, len(order))}
-	budget := int(c.mosaic.MaxDomains)
-	for _, documentID := range order {
-		domain := domains[documentID]
-		if domain == "" {
-			// Every authorized document is governed by a nonempty rule, so an
-			// empty sensitivity domain is an internal inconsistency. Fail
-			// closed rather than collapse ungoverned documents into one shared
-			// compartment.
-			return mosaicSelection{}, inconsistentBase()
-		}
-		if _, seen := observed[domain]; seen {
-			selection.allowed[documentID] = struct{}{}
-			continue
-		}
-		if len(observed) < budget {
-			observed[domain] = struct{}{}
-			selection.allowed[documentID] = struct{}{}
-			continue
-		}
-		// Load-bearing: the withholding branch is pinned by
-		// TestMosaicBudgetWithholdsCrossDomainResults; deleting the increment
-		// or the continue would let a restricted document through.
-		selection.restricted++
-	}
-
-	domainsOut := make([]string, 0, len(observed))
-	for domain := range observed {
-		domainsOut = append(domainsOut, domain)
-	}
-	sort.Strings(domainsOut)
-	if err := c.ledger.StoreCoOccurrence(ctx, key, CoOccurrenceRecord{
-		WindowStart: windowStart,
-		Domains:     domainsOut,
-	}); err != nil {
-		return mosaicSelection{}, err
-	}
 	return selection, nil
+}
+
+// mosaicLedger adapts the existing record without changing its persisted schema.
+type mosaicLedger struct{ CoOccurrenceLedger }
+
+func (l mosaicLedger) Load(ctx context.Context, key string) (AccumulatorRecord[[]string], bool, error) {
+	record, found, err := l.LoadCoOccurrence(ctx, key)
+	return AccumulatorRecord[[]string]{WindowStart: record.WindowStart, State: record.Domains}, found, err
+}
+
+func (l mosaicLedger) Store(ctx context.Context, key string, record AccumulatorRecord[[]string]) error {
+	return l.StoreCoOccurrence(ctx, key, CoOccurrenceRecord{WindowStart: record.WindowStart, Domains: record.State})
+}
+
+func (b MosaicBudget) accumulator(store PolicyStore) (*Accumulator[[]string], error) {
+	if !b.enabled() {
+		return nil, nil
+	}
+	ledger, _ := store.(CoOccurrenceLedger)
+	// Do not hide a nil underlying ledger inside a nonnil adapter.
+	var adapter AccumulatorLedger[[]string]
+	if !isNilDependency(ledger) {
+		adapter = mosaicLedger{ledger}
+	}
+	accumulator, err := NewAccumulator(adapter, b.Window, "explorer-mosaic-identity-v1")
+	if err != nil {
+		// Preserve the existing construction errors as well as validation order.
+		if b.Window <= 0 {
+			return nil, dependencyRequired("mosaic co-occurrence window")
+		}
+		return nil, dependencyRequired("co-occurrence ledger")
+	}
+	return accumulator, nil
 }
