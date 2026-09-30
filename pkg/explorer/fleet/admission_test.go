@@ -28,6 +28,7 @@ type admissionHarness struct {
 	events    *controlledDispatchEvents
 	recorder  *dispatchRecorder
 	registry  *Service
+	executor  *runnableCeilingExecutor
 }
 
 type stubRestrictor struct {
@@ -63,6 +64,28 @@ func (r *wideningRestrictor) RestrictDisclosure(
 		return append([]shoal.ID(nil), references...), nil
 	}
 	return append([]shoal.ID(nil), references[:r.calls-1]...), nil
+}
+
+// runnableCeilingExecutor is bound with a ceiling *and* an Execute method.
+//
+// The Execute method is what makes the ExecuteClaim guard reachable at all:
+// without it resolveAction refuses the executor before ExecuteClaim ever loads
+// the record, so a test would pass on an error that says nothing about
+// admissions and the guard would go unexercised. A host that binds a runnable
+// executor for an action an admission is granted against reaches the guard, and
+// that is the configuration worth testing.
+type runnableCeilingExecutor struct {
+	ceiling Effects
+	calls   int
+}
+
+func (e *runnableCeilingExecutor) MaxEffects() Effects { return e.ceiling }
+
+func (e *runnableCeilingExecutor) Execute(
+	context.Context, Invocation,
+) (ExecutionResult, error) {
+	e.calls++
+	return ExecutionResult{Output: json.RawMessage(`{"ok":true}`)}, nil
 }
 
 // admissionDescriptor declares one action per effect class combination the
@@ -108,13 +131,14 @@ func newAdmissionHarness(
 		t.Fatal(err)
 	}
 	registryStore := newMemoryStore()
+	executor := &runnableCeilingExecutor{ceiling: Effects{
+		EffectReadsCorpus, EffectEgressesContent, EffectMutatesExternal,
+	}}
 	registry, err := NewService(Config{
 		Store: registryStore, Resolver: authority.Resolver(),
 		Recorder: &memoryRecorder{}, Snapshots: fixedSnapshot{harness.now},
-		Executors: executorMap{"exec": ceilingExecutor{ceiling: Effects{
-			EffectReadsCorpus, EffectEgressesContent, EffectMutatesExternal,
-		}}},
-		Clock: harness.clock,
+		Executors: executorMap{"exec": executor},
+		Clock:     harness.clock,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -123,6 +147,7 @@ func newAdmissionHarness(
 		Descriptor: admissionDescriptor(harness.now),
 	}
 	harness.registry = registry
+	harness.executor = executor
 	harness.store = newMemoryDispatchStore()
 	harness.recorder = &dispatchRecorder{}
 	harness.events = &controlledDispatchEvents{}
@@ -1273,6 +1298,67 @@ func TestDispatchCannotReclaimOrCloseAnAdmission(t *testing.T) {
 		t.Fatalf("dispatch completion of a live admission = %v", err)
 	}
 
+	// The same token against ExecuteClaim, which takes the record rather than
+	// an ID — so the caller synthesises it from what its own grant told it.
+	// This was the path the CompleteClaim guard missed.
+	synthesised, err := harness.stored(t, "admission")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := harness.dispatch.ExecuteClaim(
+		harness.context(t, "request"), synthesised,
+	); !shoal.IsErrorCode(err, shoal.ErrorNotFound) {
+		t.Fatalf("dispatch execution of a live admission = %v", err)
+	}
+	// The executor is runnable here, so the refusal has to be the guard rather
+	// than a missing Execute method — and nothing may have run.
+	if harness.executor.calls != 0 {
+		t.Fatalf("an admission was executed: %d calls", harness.executor.calls)
+	}
+	// The same record with the marker stripped is refused too: the guard reads
+	// the stored record, not the one the caller passed, so omitting the
+	// declaration does not dodge it.
+	stripped := synthesised
+	stripped.AdmittedEffects = nil
+	stripped.AdmittedDisclosures = nil
+	stripped.AdmittedObligation = nil
+	if _, err := harness.dispatch.ExecuteClaim(
+		harness.context(t, "request"), stripped,
+	); err == nil {
+		t.Fatal("a fabricated record without the marker was executed")
+	}
+	if harness.executor.calls != 0 {
+		t.Fatalf("an admission was executed: %d calls", harness.executor.calls)
+	}
+
+	// Status is the fourth path: it must not answer for an admission either.
+	if _, err := harness.dispatch.Status(worker, StatusRequest{
+		ID: grant.Token.ActionID, Context: dispatchContext(harness.now, "worker"),
+	}); !shoal.IsErrorCode(err, shoal.ErrorNotFound) {
+		t.Fatalf("dispatch status of an admission = %v", err)
+	}
+
+	// And the fifth: a team-overview reader must not be handed another
+	// principal's admission, with what it declared and what it was obliged to
+	// withhold.
+	reader := bindDecision(t, harness.authority, dispatchDecision(
+		t, "reader", "reader", "team", auth.OperationTeamOverviewRead))
+	team, err := harness.dispatch.TeamActions(reader, TeamActionListRequest{
+		Limit: 16, SourceIDs: [][]byte{[]byte("source")},
+		PolicyIDs: [][]byte{[]byte("policy")},
+		Context: RequestContext{
+			RequestID: "team", CorrelationID: "correlation",
+			ReasonCode: "team_overview", Deadline: harness.now.Add(time.Hour),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(team.Actions) != 0 {
+		t.Fatalf("admission visible to a team-overview reader: %#v",
+			team.Actions)
+	}
+
 	// The lease lapses. A dispatch worker must not see it, reclaim it, or
 	// cancel it.
 	harness.now = harness.now.Add(2 * time.Minute)
@@ -1357,6 +1443,13 @@ func TestDispatchStillServesItsOwnActions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dispatch claim of its own action = %v", err)
 	}
+	// Status too: the admission guard there must be scoped to admissions, or a
+	// guard refusing everything would satisfy every refusal assertion.
+	if status, err := harness.dispatch.Status(worker, StatusRequest{
+		ID: queued.ID, Context: dispatchContext(harness.now, "worker"),
+	}); err != nil || !bytes.Equal(status.ID, queued.ID) {
+		t.Fatalf("dispatch status of its own action = %#v, %v", status, err)
+	}
 	if _, err := harness.dispatch.CompleteClaim(worker, CompletionRequest{
 		ID: claimed.ID, ExpectedVersion: claimed.Version,
 		ClaimID: claimed.ClaimID,
@@ -1408,14 +1501,21 @@ func TestAdmissionIDIsBoundToItsPrincipal(t *testing.T) {
 
 // principalDecision builds a decision varying only the identity components the
 // derived admission ID is supposed to separate.
+//
+// The domain is a parameter, not a constant. It was a constant, which made the
+// table below unable to vary the one component its own helper pinned — so
+// deleting the domain from the derivation passed a table written specifically
+// to catch exactly that. A table-driven test is only as good as the fixture it
+// varies against, and a fixture that fixes a field silently removes it from
+// every case.
 func principalDecision(
-	t *testing.T, subject, actor, client string, onBehalfOf []shoal.ID,
+	t *testing.T, domain, subject, actor, client string, onBehalfOf []shoal.ID,
 ) auth.Decision {
 	t.Helper()
 	decision, err := auth.NewDecision(auth.DecisionConfig{
 		Subject: shoal.ID(subject), Actor: shoal.ID(actor),
 		ClientID: shoal.ID(client), OnBehalfOf: onBehalfOf,
-		AuthorizationDomain: []byte("domain"),
+		AuthorizationDomain: []byte(domain),
 		AllowedOperations:   []auth.Operation{auth.OperationInvoke},
 		PermittedSourceIDs:  [][]byte{[]byte("source")},
 		PermittedPolicyIDs:  [][]byte{[]byte("policy")},
@@ -1438,7 +1538,7 @@ func principalDecision(
 // earlier version of this test did — passes against a derivation that ignores
 // either one of them, because the other still separates the pair.
 func TestAdmissionIDSeparatesEveryPrincipalComponent(t *testing.T) {
-	base := principalDecision(t, "owner", "actor", "client", nil)
+	base := principalDecision(t, "domain", "owner", "actor", "client", nil)
 	baseID := admissionActionID(base, []byte("name"))
 
 	for _, test := range []struct {
@@ -1446,14 +1546,16 @@ func TestAdmissionIDSeparatesEveryPrincipalComponent(t *testing.T) {
 		decision auth.Decision
 		supplied string
 	}{
+		{"domain", principalDecision(
+			t, "other", "owner", "actor", "client", nil), "name"},
 		{"subject", principalDecision(
-			t, "other", "actor", "client", nil), "name"},
+			t, "domain", "other", "actor", "client", nil), "name"},
 		{"actor", principalDecision(
-			t, "owner", "other", "client", nil), "name"},
+			t, "domain", "owner", "other", "client", nil), "name"},
 		{"client", principalDecision(
-			t, "owner", "actor", "other", nil), "name"},
+			t, "domain", "owner", "actor", "other", nil), "name"},
 		{"delegation", principalDecision(
-			t, "owner", "actor", "client",
+			t, "domain", "owner", "actor", "client",
 			[]shoal.ID{"delegate"}), "name"},
 		{"supplied name", base, "other"},
 	} {
@@ -1477,33 +1579,48 @@ func TestAdmissionIDSeparatesEveryPrincipalComponent(t *testing.T) {
 		rightName     string
 	}{
 		{
-			name:          "subject/actor",
-			leftDecision:  principalDecision(t, "ab", "c", "client", nil),
-			leftName:      "name",
-			rightDecision: principalDecision(t, "a", "bc", "client", nil),
-			rightName:     "name",
+			name: "domain/subject",
+			leftDecision: principalDecision(
+				t, "ab", "c", "actor", "client", nil),
+			leftName: "name",
+			rightDecision: principalDecision(
+				t, "a", "bc", "actor", "client", nil),
+			rightName: "name",
 		},
 		{
-			name:          "actor/client",
-			leftDecision:  principalDecision(t, "owner", "ab", "c", nil),
-			leftName:      "name",
-			rightDecision: principalDecision(t, "owner", "a", "bc", nil),
-			rightName:     "name",
+			name: "subject/actor",
+			leftDecision: principalDecision(
+				t, "domain", "ab", "c", "client", nil),
+			leftName: "name",
+			rightDecision: principalDecision(
+				t, "domain", "a", "bc", "client", nil),
+			rightName: "name",
 		},
 		{
-			name:          "client/supplied",
-			leftDecision:  principalDecision(t, "owner", "actor", "ab", nil),
-			leftName:      "c",
-			rightDecision: principalDecision(t, "owner", "actor", "a", nil),
-			rightName:     "bc",
+			name: "actor/client",
+			leftDecision: principalDecision(
+				t, "domain", "owner", "ab", "c", nil),
+			leftName: "name",
+			rightDecision: principalDecision(
+				t, "domain", "owner", "a", "bc", nil),
+			rightName: "name",
+		},
+		{
+			name: "client/supplied",
+			leftDecision: principalDecision(
+				t, "domain", "owner", "actor", "ab", nil),
+			leftName: "c",
+			rightDecision: principalDecision(
+				t, "domain", "owner", "actor", "a", nil),
+			rightName: "bc",
 		},
 		{
 			name: "delegation/supplied",
 			leftDecision: principalDecision(
-				t, "owner", "actor", "client", []shoal.ID{"ab"}),
+				t, "domain", "owner", "actor", "client", []shoal.ID{"ab"}),
 			leftName: "c",
 			rightDecision: principalDecision(
-				t, "owner", "actor", "client", []shoal.ID{"a"}),
+				t, "domain", "owner", "actor", "client", []shoal.ID{"a"}),
 			rightName: "bc",
 		},
 	} {
@@ -1540,6 +1657,186 @@ func TestAdmissionRequiresAWellFormedID(t *testing.T) {
 			harness.context(t, "request"), request,
 		); !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
 			t.Fatalf("admission ID of %d bytes = %v", len(name), err)
+		}
+	}
+}
+
+// TestAdmissionRegionIsAPrefixNotASubstring pins that the reservation is
+// anchored at the start of the identity.
+//
+// A substring match would reserve every ID that happens to contain the marker
+// anywhere, refusing legitimate dispatch IDs a caller is entitled to use — and
+// a reservation that eats valid names is a denial of service rather than a
+// boundary.
+func TestAdmissionRegionIsAPrefixNotASubstring(t *testing.T) {
+	if !reservedAdmissionID(append(
+		append([]byte(nil), AdmissionIDPrefix...), []byte("tail")...)) {
+		t.Fatal("an identity in the region is not recognised")
+	}
+	embedded := append([]byte("x"), AdmissionIDPrefix...)
+	if reservedAdmissionID(embedded) {
+		t.Fatalf("an identity merely containing the marker is reserved: %q",
+			embedded)
+	}
+	harness := newAdmissionHarness(t, nil)
+	worker := bindDecision(t, harness.authority, dispatchDecision(
+		t, "owner", "actor", "request",
+		auth.OperationDispatch, auth.OperationInvoke))
+	if _, err := harness.dispatch.Enqueue(worker, EnqueueRequest{
+		ID: embedded, IdempotencyKey: []byte("idempotency-embedded"),
+		AgentID: "agent", AgentGeneration: 1,
+		Capability: "model", Action: "complete",
+		SourceID: []byte("source"), PolicyID: []byte("policy"),
+		ObjectID: "object",
+		Input:    json.RawMessage(`{"prompt_digest":"abc"}`),
+		Context:  dispatchContext(harness.now, "request"),
+	}); err != nil {
+		t.Fatalf("a legitimate ID containing the marker was refused: %v", err)
+	}
+}
+
+// TestDispatchCannotProbeAnAdmissionIdentity is the probe the earlier fix
+// missed, and it goes through Enqueue rather than the admission surface.
+//
+// The derivation is unkeyed over a principal tuple that is knowable, so an
+// attacker can compute a victim's admission ID. It then does not need the
+// admission endpoint at all: dispatch enqueue takes an arbitrary ID, raw-reads
+// it with no principal check, and answered conflict for an occupied one and
+// success for an unheld one. That is the oracle, and squatting an unheld ID
+// would additionally deny the victim its own admission by name.
+//
+// The answer is now the same whatever is stored there, which is why the probe
+// compares encoded answers rather than asserting "it errors".
+func TestDispatchCannotProbeAnAdmissionIdentity(t *testing.T) {
+	enqueueAt := func(t *testing.T, occupied bool) map[string]any {
+		t.Helper()
+		harness := newAdmissionHarness(t, nil)
+		victim := bindDecision(t, harness.authority, dispatchDecision(
+			t, "victim", "victim", "request",
+			auth.OperationInvoke, auth.OperationRetrieve))
+		victimID := admissionActionID(
+			dispatchDecision(t, "victim", "victim", "request",
+				auth.OperationInvoke),
+			[]byte("secret-name"))
+		if occupied {
+			if _, err := harness.service.Request(victim, harness.request(
+				"request", "secret-name", "complete",
+				Effects{EffectEgressesContent}, nil)); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := harness.store.GetAction(
+				context.Background(), victimID); err != nil {
+				t.Fatalf("victim admission is not where the attacker looks: %v", err)
+			}
+		}
+		attacker := bindDecision(t, harness.authority, dispatchDecision(
+			t, "owner", "actor", "request",
+			auth.OperationDispatch, auth.OperationInvoke))
+		_, err := harness.dispatch.Enqueue(attacker, EnqueueRequest{
+			ID: victimID, IdempotencyKey: []byte("probe"),
+			AgentID: "agent", AgentGeneration: 1,
+			Capability: "model", Action: "complete",
+			SourceID: []byte("source"), PolicyID: []byte("policy"),
+			ObjectID: "object",
+			Input:    json.RawMessage(`{"prompt_digest":"abc"}`),
+			Context:  dispatchContext(harness.now, "request"),
+		})
+		if err == nil {
+			t.Fatal("dispatch enqueue squatted an admission identity")
+		}
+		return map[string]any{
+			"error":            err.Error(),
+			"invalid_argument": shoal.IsErrorCode(err, shoal.ErrorInvalidArgument),
+			"conflict":         shoal.IsErrorCode(err, shoal.ErrorConflict),
+			"not_found":        shoal.IsErrorCode(err, shoal.ErrorNotFound),
+		}
+	}
+	disclosureconformance.Run(t, disclosureconformance.Probe{
+		Name:     "dispatch/enqueue-at-an-admission-identity",
+		Withheld: enqueueAt(t, true),
+		Control:  enqueueAt(t, false),
+	})
+}
+
+// TestDispatchSurfacesAnswerAlikeForAnAdmissionIdentity pins the uniformity the
+// guards buy: every dispatch entry point that takes an action ID gives one
+// answer for an admission-region identity, whether it is absent, another
+// principal's, or the caller's own. A caller that can separate those three has
+// the oracle back in a different shape.
+func TestDispatchSurfacesAnswerAlikeForAnAdmissionIdentity(t *testing.T) {
+	type answer struct {
+		claim    string
+		cancel   string
+		complete string
+		status   string
+	}
+	probe := func(t *testing.T, kind string) answer {
+		t.Helper()
+		harness := newAdmissionHarness(t, nil)
+		var target []byte
+		switch kind {
+		case "absent":
+			target = admissionActionID(
+				dispatchDecision(t, "owner", "actor", "request",
+					auth.OperationInvoke), []byte("never-requested"))
+		case "foreign":
+			other := bindDecision(t, harness.authority, dispatchDecision(
+				t, "victim", "victim", "request",
+				auth.OperationInvoke, auth.OperationRetrieve))
+			grant, err := harness.service.Request(other, harness.request(
+				"request", "theirs", "complete",
+				Effects{EffectEgressesContent}, nil))
+			if err != nil {
+				t.Fatal(err)
+			}
+			target = grant.Token.ActionID
+		case "own":
+			grant, err := harness.service.Request(
+				harness.context(t, "request"), harness.request(
+					"request", "mine", "complete",
+					Effects{EffectEgressesContent}, nil))
+			if err != nil {
+				t.Fatal(err)
+			}
+			target = grant.Token.ActionID
+		}
+		caller := bindDecision(t, harness.authority, dispatchDecision(
+			t, "owner", "actor", "request",
+			auth.OperationDispatch, auth.OperationInvoke))
+		message := func(err error) string {
+			if err == nil {
+				return "<accepted>"
+			}
+			return err.Error()
+		}
+		_, claimErr := harness.dispatch.Claim(caller, ClaimRequest{
+			ID: target, ExpectedVersion: 1, ClaimID: []byte("probe"),
+			Lease: time.Minute, Context: dispatchContext(harness.now, "request"),
+		})
+		_, cancelErr := harness.dispatch.Cancel(caller, CancelRequest{
+			ID: target, ExpectedVersion: 1, MutationKey: []byte("probe"),
+			Context: dispatchContext(harness.now, "request"),
+		})
+		_, completeErr := harness.dispatch.CompleteClaim(
+			caller, CompletionRequest{
+				ID: target, ExpectedVersion: 1, ClaimID: []byte("probe"),
+				Result:  ExecutionResult{Output: json.RawMessage(`{"ok":true}`)},
+				Context: dispatchContext(harness.now, "request"),
+			})
+		_, statusErr := harness.dispatch.Status(caller, StatusRequest{
+			ID: target, Context: dispatchContext(harness.now, "request"),
+		})
+		return answer{
+			claim: message(claimErr), cancel: message(cancelErr),
+			complete: message(completeErr), status: message(statusErr),
+		}
+	}
+	absent := probe(t, "absent")
+	for _, kind := range []string{"foreign", "own"} {
+		got := probe(t, kind)
+		if got != absent {
+			t.Fatalf("%s admission answers differently from an absent one:\n"+
+				" %s: %#v\n absent: %#v", kind, kind, got, absent)
 		}
 	}
 }

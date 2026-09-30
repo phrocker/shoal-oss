@@ -64,6 +64,24 @@ func (s *DispatchService) enqueue(
 	if err != nil {
 		return ActionRecord{}, err
 	}
+	// The admission region is refused here, and this is the only place it has
+	// to be: enqueue is the sole entry point at which a caller names a durable
+	// action it does not already own. Everything else takes an ID it must
+	// already hold, and answers a foreign or absent one identically.
+	//
+	// Refused before the store is read, and without regard to what is there,
+	// because the answer is the whole point. This read has no principal check —
+	// it cannot have one, since a caller legitimately enqueues at an ID nobody
+	// holds — so a conditional refusal would still separate occupied from
+	// absent. That was the live oracle: an admission ID is derivable from a
+	// principal tuple that is knowable, so a caller could compute a victim's
+	// admission ID, submit it here, and read occupancy off conflict versus
+	// success. It could also squat an unheld one and deny the victim its own
+	// admission by name.
+	if reservedAdmissionID(request.ID) {
+		return ActionRecord{}, shoal.NewError(
+			shoal.ErrorInvalidArgument, "action ID is reserved")
+	}
 	record, _, err := s.queuedRecord(ctx, decision, request, operation, now)
 	if err != nil {
 		return ActionRecord{}, err
@@ -405,6 +423,21 @@ func (s *DispatchService) ExecuteClaim(ctx context.Context, claimed ActionRecord
 	current, err := s.store.GetAction(ctx, claimed.ID)
 	if err != nil {
 		return ActionRecord{}, err
+	}
+	// The same refusal Claim, Cancel and CompleteClaim make, on the path that
+	// had been missed. ExecuteClaim is exported and terminal, and it takes the
+	// record rather than loading it from an ID, so a grant holder could
+	// synthesise one: it knows the ID, the token, the version, the action
+	// fields and the deadline, and that a fresh grant sits at fence one. The
+	// record it passes is then checked against the store, which agrees, and an
+	// execution result lands on the admission with none of the report checks.
+	//
+	// Placed after the load rather than against the argument, so it is the
+	// stored record that decides. A caller supplying a fabricated record that
+	// merely omits the marker is refused by the comparisons below; a caller
+	// naming a real admission is refused here.
+	if current.isAdmission() {
+		return ActionRecord{}, auth.ObjectNotFound()
 	}
 	if current.State.terminal() && current.Version == claimed.Version+1 &&
 		current.ClaimFence == claimed.ClaimFence &&
@@ -870,7 +903,24 @@ func (s *DispatchService) Status(ctx context.Context, request StatusRequest) (Ac
 	if err != nil {
 		return ActionRecord{}, err
 	}
-	return s.authorizedCurrent(ctx, decision, request.ID, auth.OperationDispatch, now)
+	current, err := s.authorizedCurrent(
+		ctx, decision, request.ID, auth.OperationDispatch, now)
+	if err != nil {
+		return ActionRecord{}, err
+	}
+	// The fourth path, found by looking for a third. Status discloses nothing
+	// across principals — authorizedCurrent has already refused a foreign
+	// record — so this is not the same class of hole as the terminal paths.
+	//
+	// It is still the last place a dispatch call answered differently for an
+	// admission, and that uniformity is worth having on its own: with this,
+	// every dispatch entry point gives one answer for an admission-region ID
+	// whether it is absent, another principal's, or the caller's own. An
+	// admission's state is Outstanding's to report.
+	if current.isAdmission() {
+		return ActionRecord{}, auth.ObjectNotFound()
+	}
+	return current, nil
 }
 
 // TeamActions returns a bounded page of action records authorized for the
@@ -956,6 +1006,20 @@ func (s *DispatchService) TeamActions(
 			return result, nil
 		}
 		record := page.Actions[0]
+		// The fifth path, and the only one of them with a cross-principal
+		// consequence. TeamActions deliberately does not require the reader to
+		// be the action's principal — that is what makes it a team view — so
+		// without this an admission belonging to one caller is handed to
+		// another with team-overview authority, carrying what that caller
+		// declared, the digest of the references it named, and the bitmap of
+		// the ones it was obliged to withhold.
+		//
+		// A team overview shows work agents are doing. An admission is one
+		// principal's pre-call decision, and it already has a listing surface
+		// that is principal-scoped.
+		if record.isAdmission() {
+			continue
+		}
 		visible := containsByteValue(sources, record.SourceID) &&
 			containsByteValue(policies, record.PolicyID) &&
 			containsIDValue(objects, record.ObjectID) &&
@@ -1153,6 +1217,22 @@ func (s *DispatchService) authorizedCurrent(ctx context.Context, decision auth.D
 	}
 	current, err := s.store.GetAction(ctx, id)
 	if err != nil {
+		// Absence answers exactly as a record the caller may not see does.
+		// These were different messages under one status: the store's own
+		// sentinel for absent, and the object-not-found shape below for
+		// foreign. That difference is #398, and it stops being a cosmetic
+		// inconsistency once admission identities are derivable — a caller can
+		// compute a victim's admission ID and read existence off the message,
+		// which is the enumeration the reserved namespace closed at enqueue,
+		// reopened through every ID-taking entry point.
+		//
+		// Normalised here rather than at each caller because every one of them
+		// — Claim, Cancel, Status, CompleteClaim — reaches the store through
+		// this function, and a per-caller fix is a fix that the next caller
+		// forgets.
+		if errors.Is(err, ErrActionNotFound) {
+			return ActionRecord{}, auth.ObjectNotFound()
+		}
 		return ActionRecord{}, err
 	}
 	if !sameActionPrincipal(decision, current) {

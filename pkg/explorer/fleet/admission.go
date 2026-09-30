@@ -543,28 +543,54 @@ func (s *AdmissionService) commit(
 	return stored, nil
 }
 
+// AdmissionIDPrefix reserves a region of the durable action identity space for
+// admissions. No caller may name an action inside it; see enqueue.
+//
+// This is what actually separates an admission from a dispatch action, and the
+// separation is reachability rather than secrecy. A caller cannot supply a
+// durable ID to the admission surface at all — Request derives one from the
+// caller's own decision — so the only way to name an arbitrary action is
+// through dispatch, and dispatch refuses every name in this region
+// unconditionally, whether or not anything is stored there.
+//
+// It begins with a NUL so it cannot collide with an identifier any caller would
+// plausibly choose, and carries its own name so a record dumped from the store
+// says what it is.
+var AdmissionIDPrefix = []byte("\x00shoal.admission\x00")
+
 // admissionActionID derives the durable record identity for a caller-supplied
-// admission ID.
+// admission name.
 //
-// The caller names its own admission and the durable namespace is global, so
-// two principals naming the same admission would land on one record. The
-// collision is not the problem; its observability is. An unheld name produced a
-// grant and a name another principal held produced a conflict, so a caller with
-// a valid action template could enumerate other principals' admissions by
-// probing names and watching which answer came back — a different status code,
-// not merely a different message.
+// What this does and does not do is worth stating exactly, because an earlier
+// version of this comment claimed more than the code delivered.
 //
-// Binding the principal into the identity dissolves the question instead of
-// matching the two answers. Two principals using the same name hold two
-// different records, neither can address the other's, and there is nothing left
-// to tell apart. Matching the answers would have been the fragile fix: it has
-// to be re-established at every branch that can distinguish them, including the
-// write, where a collision surfaces from the store itself.
+// It does keep two principals that choose the same name in two different
+// records. That is its job, and an unkeyed digest does it: the derivation only
+// has to be collision-free across principals, not unpredictable.
 //
-// Every component of the principal is included, because every component is part
-// of what authorizedCurrent compares when it decides a record belongs to a
-// caller. An identity that differs only in its delegation chain is a different
-// principal there and must be one here.
+// It does *not* make another principal's identity unguessable, and it never
+// could. The inputs are a workspace and a set of identities, which are knowable
+// in most deployments, and the digest is unkeyed — so anyone who knows the
+// tuple computes the result. The property the previous version claimed, that
+// "neither can address the other's", did not hold: addressing a record does not
+// require this surface. A caller could compute the victim's derived ID, submit
+// it to dispatch enqueue as an ordinary action ID, and learn from conflict
+// versus success whether it was occupied — and squat unheld ones, denying the
+// victim its own admission by name.
+//
+// Keying the digest would have hidden the ID without making it unreachable, and
+// an identifier's secrecy is not access control: anything that ever leaks one —
+// a log line, an expired token, a record read through another surface — hands
+// back the reachability. It would also need a durable secret with a rotation
+// story, and rotation re-derives every live admission's identity, orphaning
+// outstanding grants whose tokens no longer resolve. A reserved namespace costs
+// none of that and gives the stronger property, so the secrecy claim is gone
+// and AdmissionIDPrefix carries the weight.
+//
+// Every component of the principal participates, because every component is
+// what authorizedCurrent compares when it decides a record belongs to a caller.
+// An identity differing only in its delegation chain is a different principal
+// there and has to be one here.
 func admissionActionID(decision auth.Decision, supplied []byte) []byte {
 	digest := sha256.New()
 	writeDispatchTupleField(digest, []byte("shoal.fleet.admission-id.v1"))
@@ -576,7 +602,13 @@ func admissionActionID(decision auth.Decision, supplied []byte) []byte {
 		writeDispatchTupleField(digest, []byte(identity))
 	}
 	writeDispatchTupleField(digest, supplied)
-	return digest.Sum(nil)
+	return append(
+		append([]byte(nil), AdmissionIDPrefix...), digest.Sum(nil)...)
+}
+
+// reservedAdmissionID reports whether an identity names the admission region.
+func reservedAdmissionID(id []byte) bool {
+	return bytes.HasPrefix(id, AdmissionIDPrefix)
 }
 
 // disclosureDigest reduces a canonical declared reference set to the value the
@@ -740,19 +772,15 @@ func (s *AdmissionService) Report(
 	if err := validateActionErrorCode(report.ErrorCode); err != nil {
 		return ActionRecord{}, err
 	}
+	// An admission that does not exist and an admission belonging to someone
+	// else are the same answer, which authorizedCurrent now guarantees for
+	// every path that reaches the store through it. This used to normalise the
+	// absent case here; that was a fix in one caller for a property all of them
+	// need, and it is gone because the guarantee moved to where the two shapes
+	// actually meet.
 	current, err := dispatch.authorizedCurrent(
 		ctx, decision, report.Token.ActionID, auth.OperationInvoke, now)
 	if err != nil {
-		// An admission that does not exist and an admission belonging to
-		// someone else must be the same answer. They are not by default: the
-		// store reports absence with its own sentinel, while authorizedCurrent
-		// reports a principal mismatch with the object-not-found shape, and the
-		// two reach a caller as different messages. A caller holding neither
-		// could then tell which admission identities are in use by watching
-		// which refusal comes back, one guess at a time.
-		if errors.Is(err, ErrActionNotFound) {
-			return ActionRecord{}, auth.ObjectNotFound()
-		}
 		return ActionRecord{}, err
 	}
 	// A dispatch action is not an admission and cannot be closed here. It would

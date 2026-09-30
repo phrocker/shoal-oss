@@ -102,13 +102,35 @@ name produced a grant and a name another principal held produced a conflict, a
 different status code, so probing names enumerated other principals'
 admissions.
 
-The durable ID is now `digest(authorization domain, subject, actor, client,
-delegation chain, caller's name)`, each component length-framed. Two principals
-using the same name hold two different records, neither can address the other's,
-and there is nothing left to tell apart. That is a stronger fix than matching
-the two answers, which would have to be re-established at every branch that can
-distinguish them — including the write, where a collision surfaces from the
-store itself rather than from any branch this code owns.
+Two things do the work, and an earlier version of this section credited the
+wrong one.
+
+**The derivation keeps principals apart.** The durable ID is
+`digest(authorization domain, subject, actor, client, delegation chain,
+caller's name)`, each component length-framed, so two principals choosing the
+same name hold two different records. That is all it does. It is unkeyed over a
+tuple of a workspace and some identities — knowable in most deployments — so it
+makes nothing unguessable, and the previous claim that "neither can address the
+other's" was false. Addressing a record never required this surface: a caller
+could compute the victim's derived ID, submit it to dispatch enqueue as an
+ordinary action ID, and read occupancy off conflict versus success. It could
+also squat an unheld one and deny the victim its own admission by name.
+
+**A reserved namespace makes them unreachable.** `AdmissionIDPrefix` marks a
+region of the action identity space that no caller may name. `enqueue` refuses
+it unconditionally — before the store is read, and regardless of what is there
+— and that is the only place the refusal is needed, because enqueue is the one
+entry point at which a caller names a durable action it does not already own.
+Every other path takes an ID it must already hold and answers a foreign or
+absent one identically.
+
+A keyed digest was the other option and is the weaker one. It hides an
+identifier without making it unreachable, and secrecy of an identifier is not
+access control: anything that ever leaks one — a log line, an expired token, a
+record read through some other surface — hands the reachability back. It also
+needs a durable secret with a rotation story, and rotation re-derives every live
+admission's identity, orphaning outstanding grants whose tokens no longer
+resolve. The namespace costs none of that.
 
 The token carries the derived ID, which is opaque to the caller and needs to be:
 it is only ever handed back.
@@ -131,9 +153,29 @@ an outstanding admission and an outstanding claim genuinely were
 indistinguishable; they are not any more, and the surface no longer pretends
 otherwise.
 
-The dispatch surface checks the same marker, in the other direction. `Pull`
-skips admissions, and `Claim`, `Cancel` and `CompleteClaim` refuse them as
-not-found.
+The dispatch surface checks the same marker, in the other direction, at every
+path that takes or returns an action: `Pull` and `TeamActions` skip admissions,
+and `Claim`, `Cancel`, `CompleteClaim`, `ExecuteClaim` and `Status` refuse them
+as not-found.
+
+That list grew twice under review, one function at a time, which is worth
+recording. `ExecuteClaim` was missed because it takes the record rather than an
+ID, so a grant holder could synthesise the argument from what its own token told
+it — the guard therefore reads the *stored* record, not the one passed in, or
+omitting the marker would dodge it. `TeamActions` was missed because it is the
+one path that deliberately does not require the reader to be the action's
+principal, so an admission there is handed to *another* caller along with what
+the owner declared and was obliged to withhold. `Status` discloses nothing
+across principals and is guarded anyway, so that every dispatch entry point
+gives one answer for an admission-region identity whether it is absent, another
+principal's, or the caller's own.
+
+Absence and foreignness are normalised to one answer in `authorizedCurrent`
+rather than at each caller. They were different messages under one status, which
+was cosmetic while identities were opaque and stops being cosmetic once they are
+derivable: a caller could compute a victim's admission ID and read existence off
+the message, which is the enumeration the namespace closes at enqueue reopened
+through every other door.
 
 That is the price of sharing one claim transition: merging the paths was right,
 and it gave dispatch's reclaim semantics reach over admission records. **A
