@@ -15,6 +15,9 @@ def project(manifest, protocol, inventory):
         raise ValueError('snapshot must be acquired after protocol registration')
     if inventory['registered_protocol_id'] != protocol['id']:
         raise ValueError('inventory protocol mismatch')
+    families = [c['pr'] for c in manifest['cases']]
+    if len(families) != len(set(families)):
+        raise ValueError('duplicate PR cases')
     selected = {x['pr']: x for x in inventory['selected']}
     if len(selected) != len(inventory['selected']) or set(selected) != {c['pr'] for c in manifest['cases']}:
         raise ValueError('snapshot membership mismatch')

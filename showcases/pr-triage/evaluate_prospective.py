@@ -9,6 +9,7 @@ from pathlib import Path
 from candidates import checked
 from shadow import digest, write_new
 from paid_review import micros, receipt
+import prepare_references
 
 
 def assessment(root,manifest,protocol,pass_name,batches):
@@ -74,6 +75,43 @@ def read_budget(root,protocol,refs):
     return budget
 
 
+def unique_ids(values, name):
+    ids=set(values)
+    if len(values)!=len(ids):raise ValueError('duplicate '+name)
+    return ids
+
+
+def validate_membership(manifest,picture,inputs,predictions):
+    unique_ids([c['pr'] for c in manifest['cases']], 'PR cases')
+    ids=unique_ids([u['id'] for c in manifest['cases'] for u in c['units']], 'manifest unit IDs')
+    populations=[unique_ids(picture['sample_ids'], 'sample IDs'),
+        unique_ids([r['unit_id'] for r in inputs['rows']], 'input IDs'),
+        unique_ids([r['unit_id'] for r in predictions['predictions']], 'prediction IDs'),set(predictions['scores'])]
+    if any(population!=ids for population in populations):raise ValueError('input/prediction membership mismatch')
+    for value in predictions['scores'].values():
+        if value is not None and (type(value) not in (int,float) or not math.isfinite(value) or not 0<=value<=1):
+            raise ValueError('invalid frozen score')
+    if predictions['optimization_enabled'] is not False or any(r['action']!='full_review' or r['optimization_eligible'] is not False for r in predictions['predictions']):
+        raise ValueError('non-shadow action in experiment')
+    return ids
+
+
+def validate_prompts(root,manifest,protocol,batches):
+    if batches['runner_sha256']!=digest(Path(prepare_references.__file__).read_bytes()):
+        raise ValueError('reference preparer identity mismatch')
+    rendered=prepare_references.prompts(manifest,protocol)
+    expected=[]
+    for n,(pr,units,prompt) in enumerate(rendered):
+        raw=prompt.encode()
+        expected.append({'path':f'pr-{pr}-batch-{n}.txt','pr':pr,'unit_ids':[u['unit_id'] for u in units],
+                         'sha256':digest(raw),'bytes':len(raw)})
+    if batches['batches']!=expected:raise ValueError('noncanonical reference batches')
+    # Read only the reconstructed paths, after validating the entire receipt.
+    for batch,(_,_,prompt) in zip(expected,rendered):
+        if (root/'prompts'/batch['path']).read_bytes()!=prompt.encode():
+            raise ValueError('noncanonical reference prompt')
+
+
 def main():
     p=argparse.ArgumentParser(description=__doc__)
     for k in ('run','protocol','model','development','output'):p.add_argument('--'+k,type=Path,required=True)
@@ -85,16 +123,10 @@ def main():
     if dev['id']!=protocol['training_inputs_id']:raise ValueError('development identity mismatch')
     if predictions['model_id']!=model['id'] or predictions['inputs_id']!=inputs['id'] or predictions['threshold']!=protocol['threshold']:
         raise ValueError('prediction lineage mismatch')
-    if any(v is not None and (not isinstance(v,(int,float)) or not math.isfinite(v) or not 0<=v<=1) for v in predictions['scores'].values()):
-        raise ValueError('invalid frozen score')
-    if predictions['optimization_enabled'] is not False or any(r['action']!='full_review' or r['optimization_eligible'] is not False for r in predictions['predictions']):
-        raise ValueError('non-shadow action in experiment')
-    ids={u['id'] for c in manifest['cases'] for u in c['units']}
-    if ids!=set(predictions['scores']) or ids!={r['unit_id'] for r in inputs['rows']} or ids!=set(picture['sample_ids']):raise ValueError('input membership mismatch')
+    ids=validate_membership(manifest,picture,inputs,predictions)
     if picture['protocol_id']!=protocol['id'] or manifest['picture_id']!=picture['id'] or batches['protocol_id']!=protocol['id'] or batches['manifest_id']!=manifest['id']:
         raise ValueError('snapshot/prompt provenance mismatch')
-    for batch in batches['batches']:
-        if digest((root/'prompts'/batch['path']).read_bytes())!=batch['sha256']:raise ValueError('prompt changed')
+    validate_prompts(root,manifest,protocol,batches)
     bodies={h for r in dev['rows'] for h in r['target_body_sha256']};diffs={r['diff_state_sha256'] for r in dev['rows']}
     overlap={r['unit_id'] for r in inputs['rows'] if set(r['target_body_sha256'])&bodies or r['diff_state_sha256'] in diffs}
     results={};refs={}

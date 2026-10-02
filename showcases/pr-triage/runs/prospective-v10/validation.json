@@ -1,6 +1,6 @@
 {
   "tests": {
-    "showcase_python": 40,
+    "showcase_python": 49,
     "learning_core_python": 13,
     "go_packages": [
       "showcases/pr-triage/extract",
@@ -12,5 +12,12 @@
   "report_id": "158437a074e483803dc14531a8c6b164a0e08d8fb656552ea2cdab0895dee7eb",
   "api_file_inventory_matches_git_collection": true,
   "paid_replay_calls": 0,
-  "adversarial_review": "Fixed report path that created a missing budget database; reports now open read-only and reconcile assessed call hashes and costs."
+  "adversarial_review": "Fixed report path that created a missing budget database; reports now open read-only and reconcile assessed call hashes and costs.",
+  "copilot_review_fixes": [
+    "Canonical reviewer prompts and preparer identity verified against pinned manifest/protocol",
+    "Boolean scores rejected",
+    "Exact duplicate-free input, sample and prediction coverage required",
+    "Duplicate PR families rejected in collection and evaluation"
+  ],
+  "report_replay_identical_after_copilot_fixes": true
 }
