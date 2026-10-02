@@ -1,0 +1,16 @@
+{
+  "tests": {
+    "showcase_python": 40,
+    "learning_core_python": 13,
+    "go_packages": [
+      "showcases/pr-triage/extract",
+      "showcases/pr-triage/operations"
+    ]
+  },
+  "archive_members_verified": 36,
+  "report_replay_identical": true,
+  "report_id": "158437a074e483803dc14531a8c6b164a0e08d8fb656552ea2cdab0895dee7eb",
+  "api_file_inventory_matches_git_collection": true,
+  "paid_replay_calls": 0,
+  "adversarial_review": "Fixed report path that created a missing budget database; reports now open read-only and reconcile assessed call hashes and costs."
+}
