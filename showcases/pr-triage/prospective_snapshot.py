@@ -27,8 +27,24 @@ def project(manifest, protocol, inventory):
     if len(families) != len(set(families)):
         raise ValueError('duplicate PR cases')
     selected = {x['pr']: x for x in inventory['selected']}
-    if len(selected) != len(inventory['selected']) or set(selected) != {c['pr'] for c in manifest['cases']}:
+    if len(selected) != len(inventory['selected']) or list(selected) != families:
         raise ValueError('snapshot membership mismatch')
+    candidates = {c['pr']:c for c in inventory['candidates']}
+    if len(candidates)!=len(inventory['candidates']):raise ValueError('duplicate inventory candidates')
+    if [c['pr'] for c in inventory['candidates']]!=sorted(candidates):
+        raise ValueError('inventory candidates out of protocol order')
+    eligible=[c['pr'] for c in inventory['candidates'] if c['disposition']=='selected']
+    if list(selected)!=eligible or len(selected)>4:
+        raise ValueError('selection differs from inventory dispositions or cohort bound')
+    for case in manifest['cases']:
+        pin=selected[case['pr']];candidate=candidates[case['pr']]
+        created=datetime.fromisoformat(candidate['created_at'])
+        if created.tzinfo is None:raise ValueError('inventory creation time requires timezone')
+        stratum='created_after_registration' if created>registered else 'existing_at_registration'
+        if candidate['head']!=pin['head'] or pin['stratum']!=stratum:
+            raise ValueError('selection head or temporal stratum differs from inventory')
+        if not any(f['path'].endswith('.go') for f in case['files']):
+            raise ValueError('selected family has no changed Go files')
     nodes, edges, sample, counts = [], [], [], []
     for case in manifest['cases']:
         pin = selected[case['pr']]

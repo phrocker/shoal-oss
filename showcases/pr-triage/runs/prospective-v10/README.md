@@ -69,7 +69,9 @@ labels are relevance assessments, not defect truth or full-PR review parity.
   strata and unconditional full-review behavior. Code features and reported sizes
   are reconstructed from sampled source. The pinned CPU replay recomputes scores
   and dispositions before evaluation; a rehashed score file is insufficient.
-  Priced calls must have settled ledger entries. No consensus label is fabricated.
+  Priced calls must have settled ledger entries. Selection is reconciled with
+  retained raw PR/file inventories, and the picture/sample are rebuilt from the
+  full collected manifest. Empty cohorts remain pending. No consensus label is fabricated.
 
 The original protocol also caps the experiment at eight calls. Four remain,
 independently of the unspent dollar allowance. We will not silently increase
@@ -107,3 +109,9 @@ all original measurements and costs.
 The mutable budget database is retained for recovery; never create a fresh
 budget ledger for another batch in this experiment. The initial local
 registration is a Git receipt, not a trusted-server timestamp attestation.
+
+The original V10 builder fingerprint is explicitly recognized for historical
+replay, but its code is not executed: current validation reconstructs every
+semantic field while preserving that verified historical metadata. Unknown
+builder versions fail closed. The trust roots remain retained public-source
+observations; local hashes are not authenticated GitHub timestamps or signatures.

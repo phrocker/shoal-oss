@@ -112,7 +112,7 @@
     "fe52e6f4fa35f28b02753bca3acee8d81ffd38cff943ee4ae2d706117a493846"
   ],
   "family_count": 1,
-  "id": "af02dd069ee5bd14e2ced81cfa3f038ee52986de2632cd6e13bbd8f8caf119fa",
+  "id": "55ec989c9e5cdd42da3ed26a8366a703dcb972770f79b51e9249f0cca6c5fd97",
   "limitations": [
     "Same-provider repeated assessments are correlated, not two independent model families.",
     "Temporal strata present: existing_at_registration. Existing snapshots do not establish future-created-PR generalization.",
@@ -132,6 +132,7 @@
     "existing_at_registration/b: insufficient novel positives"
   ],
   "scores_recomputed": true,
+  "selection_rebuilt": true,
   "status": "hold",
   "temporal_strata": {
     "existing_at_registration": {

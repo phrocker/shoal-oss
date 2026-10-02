@@ -13,6 +13,7 @@ import prepare_references
 import paid_review
 from prospective_snapshot import validate_observation_order
 from verify_prospective_scores import validate_inputs, verify_scores
+from verify_prospective_selection import verify_selection
 
 
 def assessment(root,manifest,protocol,pass_name,batches):
@@ -135,6 +136,18 @@ def temporal_groups(manifest,picture):
     return result
 
 
+def gate_reasons(strata,gate):
+    reasons=[]
+    if not strata:reasons.append('Empty eligible cohort; collection remains pending')
+    for stratum,group in strata.items():
+        if len(group['families'])<gate['minimum_families']:reasons.append(stratum+': insufficient family count')
+        for name,result in group['assessments'].items():
+            m=result['without_exact_development_overlap']
+            if m['positive']<gate['minimum_positive_count_per_assessor']:reasons.append(stratum+'/'+name+': insufficient novel positives')
+            if m['recall'] is None or m['recall']<gate['minimum_recall'] or m['unknown_lowered_ids']:reasons.append(stratum+'/'+name+': quality gate unmet')
+    return reasons
+
+
 def main():
     p=argparse.ArgumentParser(description=__doc__)
     for k in ('run','protocol','model','development','output'):p.add_argument('--'+k,type=Path,required=True)
@@ -150,6 +163,7 @@ def main():
     if inventory['id']!=picture['inventory_id'] or inventory['registered_protocol_id']!=protocol['id']:
         raise ValueError('snapshot inventory provenance mismatch')
     validate_observation_order(manifest,protocol,inventory)
+    verify_selection(root,protocol,inventory,picture,manifest)
     ids=validate_membership(manifest,picture,inputs,predictions)
     if picture['protocol_id']!=protocol['id'] or manifest['picture_id']!=picture['id'] or batches['protocol_id']!=protocol['id'] or batches['manifest_id']!=manifest['id']:
         raise ValueError('snapshot/prompt provenance mismatch')
@@ -171,18 +185,13 @@ def main():
             strata[name]['assessments'][assessor]={'all':metric(labels,predictions,group['ids'],inputs),
                 'without_exact_development_overlap':metric(labels,predictions,group['ids']-overlap,inputs)}
     la={r['unit_id']:r['label'] for r in refs['a']['records']};lb={r['unit_id']:r['label'] for r in refs['b']['records']}
-    disagreements=sorted(i for i in ids if la[i]!=lb[i]);reasons=[];families=len(manifest['cases']);gate=protocol['evaluation']
-    for stratum,group in strata.items():
-        if len(group['families'])<gate['minimum_families']:reasons.append(stratum+': insufficient family count')
-        for name,result in group['assessments'].items():
-            m=result['without_exact_development_overlap']
-            if m['positive']<gate['minimum_positive_count_per_assessor']:reasons.append(stratum+'/'+name+': insufficient novel positives')
-            if m['recall'] is None or m['recall']<gate['minimum_recall'] or m['unknown_lowered_ids']:reasons.append(stratum+'/'+name+': quality gate unmet')
+    disagreements=sorted(i for i in ids if la[i]!=lb[i]);families=len(manifest['cases']);gate=protocol['evaluation']
+    reasons=gate_reasons(strata,gate)
     budget=read_budget(root,protocol,refs)
     out={'protocol_id':protocol['id'],'picture_id':picture['id'],'manifest_id':manifest['id'],'model_id':model['id'],
         'prediction_id':predictions['id'],'assessment_ids':{name:ref['id'] for name,ref in refs.items()},'assessments':results,'disagreement_ids':disagreements,'exact_development_overlap_ids':sorted(overlap),
         'temporal_strata':strata,'aggregate_metrics_scope':'Descriptive totals only; quality gates applied separately per temporal stratum.',
-        'scores_recomputed':True,'family_count':families,'budget':budget,'status':'hold' if reasons else 'shadow_evidence_only','reasons':reasons,
+        'scores_recomputed':True,'selection_rebuilt':True,'family_count':families,'budget':budget,'status':'hold' if reasons else 'shadow_evidence_only','reasons':reasons,
         'real_action':'full_review','optimization_enabled':False,
         'limitations':['Same-provider repeated assessments are correlated, not two independent model families.',
           'Temporal strata present: '+', '.join(sorted(strata))+'. Existing snapshots do not establish future-created-PR generalization.',

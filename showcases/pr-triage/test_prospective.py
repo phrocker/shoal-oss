@@ -54,7 +54,8 @@ class SnapshotTests(unittest.TestCase):
         self.p={'id':'p','registered_at_utc':'2026-10-02T00:00:00+00:00','excluded_families':[]}
         self.m={'id':'m','observed_at_unix':1790899201,'cases':[{'pr':1,'base':'b','head':'h','patch_sha256':'patch',
           'files':[{'path':'x.go','disposition':'parsed_go'}],'units':[{'id':'u','kind':'function','symbol':'F','path':'x.go','before':None,'after':{'text':'func F() {}'}}]}]}
-        self.i={'id':'i','observed_at_utc':'2026-10-02T00:00:00.500000+00:00','registered_protocol_id':'p','selected':[{'pr':1,'base':'b','head':'h','stratum':'existing_at_registration'}]}
+        self.i={'id':'i','observed_at_utc':'2026-10-02T00:00:00.500000+00:00','registered_protocol_id':'p','selected':[{'pr':1,'base':'b','head':'h','stratum':'existing_at_registration'}],
+                 'candidates':[{'pr':1,'head':'h','created_at':'2026-10-01T00:00:00+00:00','disposition':'selected'}]}
     def test_snapshot_keeps_unknown_coverage_and_all_dispositions(self):
         pic,sample=project(self.m,self.p,self.i)
         self.assertIsNone(pic['coverage'][0]['dependency_coverage_denominator'])
@@ -65,7 +66,7 @@ class SnapshotTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'after'):project(self.m,self.p,self.i)
     def test_head_drift_and_seen_families_rejected(self):
         self.i['selected'][0]['head']='different'
-        with self.assertRaisesRegex(ValueError,'revision'):project(self.m,self.p,self.i)
+        with self.assertRaisesRegex(ValueError,'revision|selection head'):project(self.m,self.p,self.i)
         self.i['selected'][0]['head']='h';self.p['excluded_families']=[1]
         with self.assertRaisesRegex(ValueError,'seen'):project(self.m,self.p,self.i)
 
