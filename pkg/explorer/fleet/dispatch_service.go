@@ -1037,16 +1037,26 @@ func (s *DispatchService) TeamActions(
 		if scanErr != nil {
 			return ActionPage{}, scanErr
 		}
-		if len(page.Actions) == 0 {
-			return result, nil
-		}
-		record := page.Actions[0]
 		// Advanced before anything can return or skip. It was at the bottom,
 		// which is what let a `continue` strand it; a cursor that only moves on
 		// the fall-through path is a cursor that stops moving the first time
 		// someone adds an early exit.
 		next := append([]byte(nil), page.Next...)
 		cursor = next
+		// An empty page is not an exhausted scan. scanDispatchActions can
+		// filter a page down to nothing and still have more to read — two
+		// consecutive admissions outside the reserved region spend both of its
+		// attempts — and treating that as the end reported end-of-scan with
+		// records still ahead. That was the same outage as the stranded cursor,
+		// with a narrower trigger: two pre-prefix admissions rather than one
+		// admission of any kind. Only an empty continuation means exhausted.
+		if len(page.Actions) == 0 {
+			if len(next) == 0 {
+				return result, nil
+			}
+			continue
+		}
+		record := page.Actions[0]
 		visible := containsByteValue(sources, record.SourceID) &&
 			containsByteValue(policies, record.PolicyID) &&
 			containsIDValue(objects, record.ObjectID) &&

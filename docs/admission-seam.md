@@ -116,8 +116,8 @@ could compute the victim's derived ID, submit it to dispatch enqueue as an
 ordinary action ID, and read occupancy off conflict versus success. It could
 also squat an unheld one and deny the victim its own admission by name.
 
-**A reserved namespace makes them unreachable.** `AdmissionIDPrefix` marks a
-region of the action identity space that no caller may name. `enqueue` refuses
+**A reserved namespace makes them unreachable.** `admissionIDNamespace` marks a
+span of the action identity space that no caller may name. `enqueue` refuses
 it unconditionally — before the store is read, and regardless of what is there
 — and that is the only place the refusal is needed, because enqueue is the one
 entry point at which a caller names a durable action it does not already own.
@@ -144,46 +144,58 @@ superseded identity scheme can therefore only exist in a deployment running an
 unreleased `main` build.
 
 Where one does exist, the derivation moved its durable key: it lives at the
-caller's own name, not at the derived one, so a request for it misses. Granting
-on that miss would issue a second live token for work already permitted, which
-is the worst outcome this surface has. So the miss is not granted. `Request`
-reads the caller-supplied name, and if an *unresolved* admission belonging to
-that same caller sits there, refuses with `ErrAdmissionUnmigrated` — an
-unavailable, not a denial, because the caller has done nothing wrong and can do
-nothing about it.
+caller's own name, not the derived one, so a request for it misses. Granting on
+that miss would issue a second live token for work already permitted, and for a
+record that is already terminal it is worse — a durable *denial* would be
+re-adjudicated and could come back granted, inverting a refusal that is on the
+record.
 
-Two properties make that narrow refusal sufficient rather than a half-measure:
+So this build will not adjudicate at all while such a record exists.
+`Request` reaches a whole-store verdict before anything else and refuses with
+`ErrAdmissionUnmigrated` — an unavailable, not a denial, because the caller has
+done nothing wrong and can do nothing about it. The verdict is cached once
+proven clean, since this build cannot write an unprefixed admission; a dirty or
+unreachable verdict is never cached, so clearing the records needs no restart.
 
-- **It drains.** A legacy grant's token still reports normally, so an in-flight
-  admission completes and its record goes terminal — after which the name is
-  servable again with no operator surgery. A global "serve no admissions while
-  any legacy record exists" would need a scan of the whole action space to prove
-  absence, and would freeze exactly the grants that would otherwise clear
-  themselves.
-- **It discloses nothing.** The refusal fires only for a record the caller owns.
-  A foreign legacy admission, or an ordinary action at the same name, falls
-  through to the normal grant and answers exactly as an unused name does —
-  otherwise the refusal would itself be a probe for other principals' legacy
-  admissions.
+**Why whole-store rather than per-record.** A per-record check was tried and
+cannot be made correct. The derivation treats the authorization domain as part
+of the principal, but an `ActionRecord` does not carry its domain — so a
+predicate over a legacy record can establish ownership only two ways, and both
+are wrong. `sameActionPrincipal` omits the domain, which hands the distinctive
+unmigrated error to an identically-named identity in another domain and reopens
+the existence oracle this work exists to close. Routing through
+`authorizedCurrent` to recover the domain from the agent descriptor is blind to
+any record whose agent generation has moved — and `Heartbeat` bumps the
+generation on every lease renewal, so it is blind to essentially all of them,
+and grants over them instead. Under-refusing double-grants, over-refusing
+enumerates, and the information needed to do neither is not in the record. A
+whole-store verdict has no ownership predicate to get wrong.
 
-If the detection cannot answer — the read fails for any reason other than
-absence — the request stops. Granting while unable to rule out a legacy record
-*is* the double grant.
+**What still works while the verdict is dirty.** `Report` and `Outstanding`
+deliberately do not consult it. A grant already issued must stay reportable, or
+upgrading strands the audit record for an effect that may already have
+happened, and those records are exactly what an operator has to find. So
+in-flight grants complete and remain visible; what stops is the issuing of new
+ones.
 
-Migration was considered and rejected. Replaying from a legacy record needs a
-comparison that ignores the identity, which weakens `equivalentEnqueue` for
-every caller, and it would still leave the legacy record enumerable through
-dispatch enqueue: that path must tell occupied from absent to be idempotent at
-all, and a legacy admission is indistinguishable by name from an ordinary
-action. So migration buys a subtle replay path and does not close the hole it
-exists for.
+**Draining means removing.** Reporting a legacy grant records its outcome but
+leaves a record written under the superseded scheme, so serving resumes only
+once the records are gone. That is deliberate: the alternative is a rule about
+which terminal states are safe to ignore, which is the per-record reasoning
+that just failed.
 
-**The residual, stated plainly:** while an unresolved legacy admission exists,
-its name remains enumerable through dispatch enqueue, because the reserved
-region cannot recognise an identity that predates it. That is #398's exposure
-over a caller-chosen name, and the remedy is to hold no such records — which is
-the default for anyone upgrading from a release, and which the refusal above
-drives towards for anyone who does.
+**If the verdict cannot be reached** — the scan errors, or exceeds its page
+bound — the request refuses. Serving while unable to prove no unmigrated record
+exists *is* the double grant. The bound is set far above any plausible store
+and exists so the loop terminates rather than as an operational limit.
+
+**The residual, stated plainly:** while a legacy admission exists, its name
+remains enumerable through dispatch enqueue, because the reserved span cannot
+recognise an identity that predates it. That is #398's exposure over a
+caller-chosen name. It is not closable in `enqueue` — that path must tell
+occupied from absent to be idempotent at all — so the remedy is to hold no such
+records, which is the default for anyone upgrading from a release and which the
+refusal above forces for anyone else.
 
 ### An admission is distinguishable from a dispatch action
 

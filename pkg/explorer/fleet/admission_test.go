@@ -1714,35 +1714,96 @@ func legacyAdmission(
 	}
 }
 
-// TestAdmissionRefusesRatherThanDoubleGranting pins the migration boundary.
+// TestAdmissionRefusesWhileUnmigratedRecordsRemain pins the migration
+// boundary, in both terminal shapes and the unresolved one.
 //
 // The derivation moved the durable key, so a request whose admission was
-// written under the caller's own name now misses — and granting on a miss would
-// issue a second live token for work already permitted. That is the worst
-// outcome this surface has, so it refuses instead, loudly and attributably.
-func TestAdmissionRefusesRatherThanDoubleGranting(t *testing.T) {
+// written under the caller's own name misses. Granting on that miss issues a
+// second live token for work already permitted; and for a terminal record it is
+// worse than duplication — a durable *denial* would be re-adjudicated and could
+// come back granted, inverting a refusal that is already recorded.
+//
+// Each shape is driven separately because they fail differently and a single
+// probe catches only one.
+func TestAdmissionRefusesWhileUnmigratedRecordsRemain(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		state DispatchState
+	}{
+		{"unresolved", DispatchClaimed},
+		{"reported", DispatchSucceeded},
+		{"denied", DispatchCanceled},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			harness := newAdmissionHarness(t, nil)
+			legacy := legacyAdmission(harness, "legacy-name", "owner", "actor")
+			legacy.State = test.state
+			switch test.state {
+			case DispatchSucceeded:
+				legacy.Output = json.RawMessage(`{"ok":true}`)
+				legacy.EffectPossible = true
+			case DispatchCanceled:
+				legacy.CancelKey = []byte("cancel-legacy")
+				legacy.CancelAuthorizationExpiresAt = legacy.ExecutionExpiresAt
+				legacy.CancelAuthorizationFingerprint = auth.Fingerprint{1}
+			}
+			harness.store.records[string(legacy.ID)] = legacy
+
+			// The same name, which is the double grant and, for a denial, the
+			// inversion of a recorded refusal.
+			grant, err := harness.service.Request(
+				harness.context(t, "request"), harness.request(
+					"request", "legacy-name", "complete",
+					Effects{EffectEgressesContent}, nil))
+			if !errors.Is(err, ErrAdmissionUnmigrated) {
+				t.Fatalf("request over a %s legacy admission = %#v, %v",
+					test.name, grant, err)
+			}
+			if len(grant.Token.ActionID) != 0 {
+				t.Fatalf("a token was issued alongside the refusal: %#v",
+					grant.Token)
+			}
+			if _, err := harness.stored(t, "legacy-name"); !errors.Is(
+				err, ErrActionNotFound) {
+				t.Fatalf("a second admission was written: %v", err)
+			}
+			// And any other name too: the verdict is about the store, not the
+			// request, so nothing is adjudicated while a record remains.
+			if _, err := harness.service.Request(
+				harness.context(t, "request"), harness.request(
+					"request", "unrelated", "complete",
+					Effects{EffectEgressesContent}, nil),
+			); !errors.Is(err, ErrAdmissionUnmigrated) {
+				t.Fatalf("unrelated request while unmigrated = %v", err)
+			}
+		})
+	}
+}
+
+// TestUnmigratedRecordsStillReportAndList pins that the refusal covers
+// adjudication only.
+//
+// A grant already issued must stay reportable, or upgrading strands the audit
+// record for an effect that may already have happened — and those records are
+// exactly what an operator has to find and drain. Serving resumes once they are
+// gone, which means removal rather than reporting: a reported legacy record is
+// still a record written under the superseded scheme.
+func TestUnmigratedRecordsStillReportAndList(t *testing.T) {
 	harness := newAdmissionHarness(t, nil)
 	legacy := legacyAdmission(harness, "legacy-name", "owner", "actor")
 	harness.store.records[string(legacy.ID)] = legacy
 
-	grant, err := harness.service.Request(
-		harness.context(t, "request"), harness.request(
-			"request", "legacy-name", "complete",
-			Effects{EffectEgressesContent}, nil))
-	if !errors.Is(err, ErrAdmissionUnmigrated) {
-		t.Fatalf("request over a legacy admission = %#v, %v", grant, err)
+	outstanding, err := harness.service.Outstanding(
+		harness.context(t, "list"), OutstandingAdmissionsRequest{
+			Limit: 16, Context: dispatchContext(harness.now, "list"),
+		})
+	if err != nil {
+		t.Fatalf("outstanding while unmigrated = %v", err)
 	}
-	// Nothing was granted and nothing was written at the derived identity.
-	if len(grant.Token.ActionID) != 0 {
-		t.Fatalf("a token was issued alongside the refusal: %#v", grant.Token)
+	if len(outstanding.Admissions) != 1 ||
+		!bytes.Equal(outstanding.Admissions[0].ActionID, legacy.ID) {
+		t.Fatalf("legacy grant is not visible: %#v", outstanding.Admissions)
 	}
-	if _, err := harness.stored(t, "legacy-name"); !errors.Is(
-		err, ErrActionNotFound) {
-		t.Fatalf("a second admission was written: %v", err)
-	}
-
-	// The legacy grant still reports, so it drains rather than stranding —
-	// which is why the refusal is this narrow instead of disabling the surface.
 	if _, err := harness.service.Report(
 		harness.context(t, "report"), AdmissionReport{
 			Token: AdmissionToken{
@@ -1753,73 +1814,270 @@ func TestAdmissionRefusesRatherThanDoubleGranting(t *testing.T) {
 		}); err != nil {
 		t.Fatalf("legacy grant could not be reported: %v", err)
 	}
-	// Once drained, the same name is servable again.
+	// Reported is not drained.
 	if _, err := harness.service.Request(
 		harness.context(t, "request"), harness.request(
-			"request", "legacy-name", "complete",
+			"request", "fresh", "complete",
+			Effects{EffectEgressesContent}, nil),
+	); !errors.Is(err, ErrAdmissionUnmigrated) {
+		t.Fatalf("serving resumed before the record was removed = %v", err)
+	}
+	// Removed is.
+	delete(harness.store.records, string(legacy.ID))
+	if _, err := harness.service.Request(
+		harness.context(t, "request"), harness.request(
+			"request", "fresh", "complete",
 			Effects{EffectEgressesContent}, nil)); err != nil {
-		t.Fatalf("request after the legacy grant drained = %v", err)
+		t.Fatalf("serving did not resume after removal = %v", err)
 	}
 }
 
-// TestUnmigratedRefusalDisclosesNothing pins that the refusal fires only for a
-// record the caller owns.
+// TestUnmigratedVerdictIsNotPerCaller pins that the refusal carries no
+// information about who holds what.
 //
-// Refusing on a foreign record would hand a caller a probe for other
-// principals' legacy admissions — the oracle the reserved region closes for
-// everything written since, reopened inside the one namespace that has no
-// region to lean on. A foreign record, and an ordinary dispatch action, must
-// answer exactly as an unused name does.
-func TestUnmigratedRefusalDisclosesNothing(t *testing.T) {
-	answer := func(t *testing.T, seed func(*admissionHarness)) string {
+// The per-record predicate it replaced could not manage that. The derivation
+// treats the authorization domain as part of the principal, an ActionRecord
+// does not carry its domain, and both ways to recover ownership are wrong:
+// sameActionPrincipal omits the domain and hands the distinctive error to an
+// identically-named identity elsewhere, while going through the agent
+// descriptor is blind to any record whose generation has moved — which
+// Heartbeat does on every lease renewal. A whole-store verdict has no ownership
+// predicate to get wrong.
+func TestUnmigratedVerdictIsNotPerCaller(t *testing.T) {
+	answer := func(t *testing.T, owner string) string {
 		t.Helper()
 		harness := newAdmissionHarness(t, nil)
-		seed(harness)
-		grant, err := harness.service.Request(
+		legacy := legacyAdmission(harness, "contested", owner, owner)
+		harness.store.records[string(legacy.ID)] = legacy
+		_, err := harness.service.Request(
 			harness.context(t, "request"), harness.request(
 				"request", "contested", "complete",
 				Effects{EffectEgressesContent}, nil))
-		if err != nil {
-			return "error: " + err.Error()
+		if err == nil {
+			t.Fatal("a request was served while unmigrated")
 		}
-		return fmt.Sprintf("outcome=%s version=%d", grant.Outcome,
-			grant.Token.Version)
+		return err.Error()
 	}
-	unused := answer(t, func(*admissionHarness) {})
-	foreign := answer(t, func(h *admissionHarness) {
-		record := legacyAdmission(h, "contested", "victim", "victim")
-		h.store.records[string(record.ID)] = record
-	})
-	ordinary := answer(t, func(h *admissionHarness) {
-		h.enqueueDispatchAction(t, "contested")
-	})
-	if foreign != unused {
-		t.Fatalf("a foreign legacy admission is detectable:\n foreign: %s\n"+
-			" unused:  %s", foreign, unused)
+	mine, theirs := answer(t, "owner"), answer(t, "victim")
+	if mine != theirs {
+		t.Fatalf("the verdict varies with who owns the record:\n mine:   %q\n"+
+			" theirs: %q", mine, theirs)
 	}
-	if ordinary != unused {
-		t.Fatalf("an ordinary action at the name is detectable:\n"+
-			" ordinary: %s\n unused:   %s", ordinary, unused)
+	// An ordinary dispatch action is not an unmigrated admission, so it must
+	// not refuse at all — otherwise every deployment with queued work would be
+	// told to migrate.
+	harness := newAdmissionHarness(t, nil)
+	harness.enqueueDispatchAction(t, "ordinary")
+	if _, err := harness.service.Request(
+		harness.context(t, "request"), harness.request(
+			"request", "ordinary", "complete",
+			Effects{EffectEgressesContent}, nil)); err != nil {
+		t.Fatalf("an ordinary action blocked admissions: %v", err)
 	}
 }
 
-// TestUnmigratedDetectionFailureStopsTheRequest pins what happens when the
-// check itself cannot answer. Granting while unable to rule out a legacy record
-// is the double grant, so an unreadable store stops the request.
-func TestUnmigratedDetectionFailureStopsTheRequest(t *testing.T) {
+// TestUnmigratedVerdictFailureStopsAdjudication pins what happens when the
+// verdict cannot be reached. Serving while unable to prove that no unmigrated
+// record exists is the double grant, so an unscannable store refuses.
+func TestUnmigratedVerdictFailureStopsAdjudication(t *testing.T) {
 	harness := newAdmissionHarness(t, nil)
 	broken := errors.New("store unavailable")
-	harness.store.failReads = map[string]error{"legacy-name": broken}
+	harness.store.failScan = broken
 	if _, err := harness.service.Request(
 		harness.context(t, "request"), harness.request(
-			"request", "legacy-name", "complete",
+			"request", "anything", "complete",
 			Effects{EffectEgressesContent}, nil),
 	); !errors.Is(err, broken) {
-		t.Fatalf("request with an unreadable legacy identity = %v", err)
+		t.Fatalf("request with an unscannable store = %v", err)
 	}
-	if _, err := harness.stored(t, "legacy-name"); !errors.Is(
+	if _, err := harness.stored(t, "anything"); !errors.Is(
 		err, ErrActionNotFound) {
-		t.Fatalf("an admission was granted despite the failed check: %v", err)
+		t.Fatalf("an admission was granted despite the failed verdict: %v", err)
+	}
+	// A failed verdict is not cached, or clearing the fault would need a
+	// restart.
+	// A second request while the fault persists must fail the same way. If the
+	// failure were cached as a verdict, this would succeed — and a store that
+	// recovered would never be re-examined either.
+	if _, err := harness.service.Request(
+		harness.context(t, "request"), harness.request(
+			"request", "anything", "complete",
+			Effects{EffectEgressesContent}, nil),
+	); !errors.Is(err, broken) {
+		t.Fatalf("second request with an unscannable store = %v", err)
+	}
+	harness.store.failScan = nil
+	if _, err := harness.service.Request(
+		harness.context(t, "request"), harness.request(
+			"request", "anything", "complete",
+			Effects{EffectEgressesContent}, nil)); err != nil {
+		t.Fatalf("request after the store recovered = %v", err)
+	}
+	// A proven verdict is cached, so the scan does not repeat per request.
+	harness.store.scans = 0
+	if _, err := harness.service.Request(
+		harness.context(t, "request"), harness.request(
+			"request", "second", "complete",
+			Effects{EffectEgressesContent}, nil)); err != nil {
+		t.Fatal(err)
+	}
+	if harness.store.scans != 0 {
+		t.Fatalf("a proven verdict was re-scanned: %d scans",
+			harness.store.scans)
+	}
+}
+
+// TestVerdictAcceptsAStoreFullOfProperlyNamedAdmissions pins the other half of
+// the verdict: admissions inside the reserved region are not unmigrated.
+//
+// The clean verdict is cached, so in a fresh harness the scan runs before any
+// admission exists and never sees one. A restart is what exercises it — the
+// process comes back with grants already in the store and the first request
+// scans over them. Without this, a verdict that ignored the region would refuse
+// every deployment that had ever granted an admission, and the suite would not
+// notice.
+func TestVerdictAcceptsAStoreFullOfProperlyNamedAdmissions(t *testing.T) {
+	harness := newAdmissionHarness(t, nil)
+	for index := 0; index < 3; index++ {
+		if _, err := harness.service.Request(
+			harness.context(t, "request"), harness.request(
+				"request", fmt.Sprintf("grant-%02d", index), "complete",
+				Effects{EffectEgressesContent}, nil)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A new service over the same store: the verdict starts unproven again.
+	restarted, err := NewAdmissionService(AdmissionConfig{
+		Dispatch: harness.dispatch,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := restarted.Request(
+		harness.context(t, "request"), harness.request(
+			"request", "after-restart", "complete",
+			Effects{EffectEgressesContent}, nil)); err != nil {
+		t.Fatalf("a store holding properly named admissions was refused: %v",
+			err)
+	}
+}
+
+// TestVerdictScansEveryPage pins that the verdict pages.
+//
+// A single-page scan proves nothing about a store larger than one page, and
+// every other fixture here fits in one. An unmigrated record beyond the first
+// page is the realistic shape — admissions accumulate behind ordinary work —
+// and a verdict that stopped early would certify a store it never read.
+func TestVerdictScansEveryPage(t *testing.T) {
+	harness := newAdmissionHarness(t, nil)
+	// Filler inserted directly: the verdict only reads, so the records need to
+	// exist and sort below the legacy one, not to be independently valid.
+	for index := 0; index < MaxDispatchListResults+10; index++ {
+		id := fmt.Sprintf("aa-filler-%04d", index)
+		harness.store.records[id] = ActionRecord{
+			ID: []byte(id), State: DispatchQueued, Subject: "owner",
+			Actor: "actor",
+		}
+	}
+	legacy := legacyAdmission(harness, "zz-legacy", "owner", "actor")
+	harness.store.records[string(legacy.ID)] = legacy
+
+	if _, err := harness.service.Request(
+		harness.context(t, "request"), harness.request(
+			"request", "anything", "complete",
+			Effects{EffectEgressesContent}, nil),
+	); !errors.Is(err, ErrAdmissionUnmigrated) {
+		t.Fatalf("an unmigrated record beyond the first page was missed = %v",
+			err)
+	}
+	if harness.store.scans < 2 {
+		t.Fatalf("the verdict read %d pages, so it did not page",
+			harness.store.scans)
+	}
+}
+
+// TestTwoUnmigratedAdmissionsDoNotHideLaterRecords pins the narrower form of
+// the outage.
+//
+// scanDispatchActions can filter a page down to nothing and still have more to
+// read: two consecutive admissions outside the reserved region spend both of
+// its attempts. TeamActions treated an empty page as an exhausted scan, so it
+// reported end-of-scan with records still ahead — the same outage as the
+// stranded cursor, triggered by two pre-prefix admissions rather than one
+// admission of any kind. One is covered already and would pass.
+func TestTwoUnmigratedAdmissionsDoNotHideLaterRecords(t *testing.T) {
+	harness := newAdmissionHarness(t, nil)
+	// Names ordered below "real-work" so the scan meets them first.
+	for _, name := range []string{"aaa-legacy-one", "aab-legacy-two"} {
+		legacy := legacyAdmission(harness, name, "owner", "actor")
+		harness.store.records[string(legacy.ID)] = legacy
+	}
+	queued := harness.enqueueDispatchAction(t, "real-work")
+
+	raw, err := harness.store.ScanActions(context.Background(), nil, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(raw.Actions) != 2 ||
+		!raw.Actions[0].isAdmission() || !raw.Actions[1].isAdmission() {
+		t.Fatalf("the fixture does not put two admissions first: %#v",
+			raw.Actions)
+	}
+
+	reader := bindDecision(t, harness.authority, dispatchDecision(
+		t, "reader", "reader", "team", auth.OperationTeamOverviewRead))
+	team, err := harness.dispatch.TeamActions(reader, TeamActionListRequest{
+		Limit: 10, SourceIDs: [][]byte{[]byte("source")},
+		PolicyIDs: [][]byte{[]byte("policy")},
+		Context: RequestContext{
+			RequestID: "team", CorrelationID: "correlation",
+			ReasonCode: "team_overview", Deadline: harness.now.Add(time.Hour),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(team.Actions) != 1 ||
+		!bytes.Equal(team.Actions[0].ID, queued.ID) {
+		t.Fatalf("two unmigrated admissions hid the later record: %#v",
+			team.Actions)
+	}
+}
+
+// TestAdmissionRegionSentinelIsUnnameable pins that the exclusive bound a scan
+// jumps to cannot itself hold an action.
+//
+// The sentinel is a cursor, and ScanActions starts strictly after its cursor.
+// So an ordinary action stored at exactly that identity would be skipped by
+// Pull and TeamActions for as long as it existed. Reserving the span rather
+// than only the admission prefix makes that unconstructible.
+func TestAdmissionRegionSentinelIsUnnameable(t *testing.T) {
+	sentinel := admissionRegionEnd()
+	if !reservedAdmissionID(sentinel) {
+		t.Fatalf("the region sentinel %q is a nameable identity", sentinel)
+	}
+	for _, admission := range [][]byte{
+		[]byte(admissionIDPrefix),
+		append([]byte(admissionIDPrefix), 0xff),
+	} {
+		if bytes.Compare(admission, sentinel) >= 0 {
+			t.Fatalf("sentinel %q does not bound %q", sentinel, admission)
+		}
+	}
+	harness := newAdmissionHarness(t, nil)
+	worker := bindDecision(t, harness.authority, dispatchDecision(
+		t, "owner", "actor", "request",
+		auth.OperationDispatch, auth.OperationInvoke))
+	if _, err := harness.dispatch.Enqueue(worker, EnqueueRequest{
+		ID: sentinel, IdempotencyKey: []byte("idempotency-sentinel"),
+		AgentID: "agent", AgentGeneration: 1,
+		Capability: "model", Action: "complete",
+		SourceID: []byte("source"), PolicyID: []byte("policy"),
+		ObjectID: "object",
+		Input:    json.RawMessage(`{"prompt_digest":"abc"}`),
+		Context:  dispatchContext(harness.now, "request"),
+	}); !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
+		t.Fatalf("an action was created at the region sentinel = %v", err)
 	}
 }
 

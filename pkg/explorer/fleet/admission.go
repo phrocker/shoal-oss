@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"sort"
+	"sync"
 	"time"
 
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
@@ -51,17 +52,22 @@ var (
 	// ErrAdmissionConflict reports an admission identity already granted to a
 	// different token.
 	ErrAdmissionConflict = errors.New("fleet admission: admission conflict")
-	// ErrAdmissionUnmigrated reports an admission this caller holds under the
-	// identity scheme that preceded the derived one, which this build cannot
-	// serve without risking a second grant for the same request.
+	// ErrAdmissionUnmigrated reports that the store still holds an admission
+	// written under the identity scheme that preceded the derived one, which
+	// this build cannot adjudicate around without risking a second grant for a
+	// request that already has one.
 	//
-	// It is deliberately loud and deliberately not a denial. A denial is a
-	// policy answer the caller should act on; this is an operator's problem,
-	// and the caller can do nothing about it but stop.
+	// It is a whole-store condition rather than a per-caller one, deliberately:
+	// see requireMigrated for why no per-record answer is correct. So it says
+	// nothing about the caller that received it and cannot be used to probe for
+	// anyone's records.
+	//
+	// Loud, and not a denial. A denial is a policy answer the caller should act
+	// on; this is an operator's problem and the caller can do nothing but stop.
 	ErrAdmissionUnmigrated = errors.New(
-		"fleet admission: an admission for this request exists under the " +
-			"superseded identity scheme and must be drained before this " +
-			"request can be served")
+		"fleet admission: the store holds admissions written under the " +
+			"superseded identity scheme, which must be drained before " +
+			"admissions can be served")
 )
 
 // MaxAdmissionDisclosures bounds the corpus references one admission may
@@ -260,6 +266,10 @@ type AdmissionConfig struct {
 type AdmissionService struct {
 	dispatch   *DispatchService
 	restrictor DisclosureRestrictor
+	// migrationMu guards migrated, and is held across the verifying scan so a
+	// burst of first requests performs one scan rather than one each.
+	migrationMu sync.Mutex
+	migrated    bool
 }
 
 func NewAdmissionService(config AdmissionConfig) (*AdmissionService, error) {
@@ -301,6 +311,13 @@ func (s *AdmissionService) Request(
 	defer cancel()
 	decision, now, err := dispatch.begin(ctx, auth.OperationInvoke, request.Context)
 	if err != nil {
+		return AdmissionGrant{}, err
+	}
+	// Before anything else, including any read of the caller's own identity:
+	// an admission written under the superseded identity scheme makes every
+	// answer here unsound, because the derivation moved the durable key and a
+	// request for such a record misses.
+	if err := s.requireMigrated(ctx); err != nil {
 		return AdmissionGrant{}, err
 	}
 	if err := validateOpaque("admission token ID", request.TokenID, false); err != nil {
@@ -361,14 +378,6 @@ func (s *AdmissionService) Request(
 	if readErr == nil {
 		return s.replay(request, disclosures, current, base, now)
 	}
-	// Nothing at the derived identity. Before granting, rule out an admission
-	// this caller already holds for the same request under the identity scheme
-	// that preceded the derivation, where the caller's own name *was* the
-	// durable key. Granting over one of those is a second live token for work
-	// already permitted, which is the worst outcome this surface has.
-	if err := s.refuseUnmigrated(ctx, decision, request.ID); err != nil {
-		return AdmissionGrant{}, err
-	}
 	// The declaration is checked against what the descriptor permits, resolved
 	// under this decision. The ceiling the executor was bound to is already
 	// enforced inside resolveActionBinding, so an action can neither declare
@@ -393,64 +402,67 @@ func (s *AdmissionService) Request(
 	return grantFor(granted, obligations), nil
 }
 
-// refuseUnmigrated refuses a request whose caller already holds an admission
-// for it under the superseded identity scheme.
+// requireMigrated refuses to adjudicate anything while an admission written
+// under the superseded identity scheme remains anywhere in the store.
 //
-// The identity scheme changed under this surface, and the change moved the
-// durable key: an admission written before it lives at the caller's own name,
-// not at the derived one. A request for that name now misses, and granting on a
-// miss would issue a second live token for work the caller was already
-// permitted to do.
+// This replaces a per-record check, and the reason is that no correct
+// per-record check exists.
 //
-// Refusing is chosen over migrating, and the reasoning is worth keeping.
-// Migrating means recognising the caller's own legacy record and replaying from
-// it, which needs a comparison that ignores the identity — weakening
-// equivalentEnqueue for every caller — and it would still leave the legacy
-// record enumerable through dispatch enqueue, because that path must
-// distinguish occupied from absent to be idempotent at all and a legacy
-// admission is indistinguishable by name from an ordinary action. So migration
-// buys a subtle replay path and does not close the hole it was meant to close.
+// The derivation treats the authorization domain as part of the principal, but
+// an ActionRecord does not carry its domain. So a predicate over a legacy
+// record can establish ownership only two ways, and both are wrong:
+// sameActionPrincipal omits the domain, which hands the distinctive
+// unmigrated error to an identically-named identity in another domain and
+// reopens the existence oracle this work exists to close; and routing through
+// authorizedCurrent to get the domain from the agent descriptor is blind to
+// any record whose agent generation has moved — which Heartbeat does on every
+// lease renewal, so it is blind to essentially all of them, and grants over
+// them instead. Under-refusing double-grants, over-refusing enumerates, and
+// the information needed to do neither is not in the record.
 //
-// The refusal is narrow on purpose, rather than a global "serve no admissions
-// while any legacy record exists". A global refusal needs a scan of the whole
-// action space to prove absence, and it would strand the very grants it is
-// protecting: a legacy admission's token still reports normally — Report
-// resolves any identity and the marker check admits it — so in-flight grants
-// drain on their own, and refusing the whole surface would prevent exactly
-// that. Narrow refusal plus natural drain empties the window; a global refusal
-// freezes it.
+// A whole-store verdict needs no ownership predicate at all, so neither failure
+// is expressible. Report and Outstanding deliberately do not consult it: a
+// grant already issued must still be reportable, or upgrading would strand the
+// audit record for an effect that may already have happened, and those records
+// are exactly what an operator has to drain.
 //
-// Disclosure: the only refusal is for a record this caller owns. A record
-// belonging to someone else, or an ordinary dispatch action, falls through to
-// the normal grant and answers exactly as an absent name does. Refusing on a
-// foreign record would hand a caller the ability to probe names for other
-// principals' legacy admissions, which is the oracle the reserved region closes
-// for everything written since.
-//
-// A read that fails for any other reason stops the request. Granting while
-// unable to rule out a legacy record is the double grant.
-func (s *AdmissionService) refuseUnmigrated(
-	ctx context.Context, decision auth.Decision, supplied []byte,
-) error {
-	legacy, err := s.dispatch.store.GetAction(ctx, supplied)
-	if err != nil {
-		if errors.Is(err, ErrActionNotFound) {
+// The clean verdict is cached because this build cannot write an unprefixed
+// admission, so absence once proven stays true. A dirty verdict is not cached:
+// the operator clears the records and the next request proceeds. The scan runs
+// under the mutex so a burst of first requests performs one scan rather than
+// one each.
+func (s *AdmissionService) requireMigrated(ctx context.Context) error {
+	s.migrationMu.Lock()
+	defer s.migrationMu.Unlock()
+	if s.migrated {
+		return nil
+	}
+	// Bounded so the loop terminates, and set far above any plausible store:
+	// at a full page each, this is tens of millions of actions. Exhausting it
+	// means absence could not be proven, which refuses rather than assumes —
+	// the same direction every other unanswerable question here takes.
+	const maxMigrationScans = 1 << 16
+	var cursor []byte
+	for scanned := 0; scanned < maxMigrationScans; scanned++ {
+		page, err := s.dispatch.store.ScanActions(
+			ctx, cursor, MaxDispatchListResults)
+		if err != nil {
+			return err
+		}
+		for _, record := range page.Actions {
+			if record.isAdmission() && !reservedAdmissionID(record.ID) {
+				return ErrAdmissionUnmigrated
+			}
+		}
+		if len(page.Next) == 0 {
+			s.migrated = true
 			return nil
 		}
-		return err
+		cursor = page.Next
 	}
-	// Only an unresolved one blocks. A terminal legacy record — reported,
-	// failed, or refused — cannot produce a second grant: its token is spent
-	// and its outcome is recorded, so a request for the same name is a new
-	// request and belongs at the derived identity. This is what makes the
-	// window drain rather than latch: report the legacy grant and the name is
-	// servable again, with no operator surgery needed for admissions that were
-	// in flight.
-	if legacy.isAdmission() && !legacy.State.terminal() &&
-		sameActionPrincipal(decision, legacy) {
-		return ErrAdmissionUnmigrated
-	}
-	return nil
+	return shoal.NewError(
+		shoal.ErrorUnavailable,
+		"admission cannot verify that no superseded identities remain")
 }
 
 // replay answers a request whose admission identity already exists.
@@ -636,34 +648,51 @@ func (s *AdmissionService) commit(
 // plausibly choose, and carries its own name so a record dumped from the store
 // says what it is.
 //
-// A constant, not a variable. It was an exported []byte, which is mutable
-// global state: another package could reassign it or write through the backing
-// array, changing the derivation and the reservation together at runtime —
-// orphaning every live grant, or removing the enqueue protection outright — and
-// racing with any concurrent request while it did. Nothing outside this package
-// needs to see it, so nothing outside can.
-const admissionIDPrefix = "\x00shoal.admission\x00"
+// Constants, not variables. The reservation was once an exported []byte, which
+// is mutable global state: another package could reassign it or write through
+// the backing array, changing the derivation and the reservation together at
+// runtime — orphaning every live grant, or removing the enqueue protection
+// outright — and racing with any concurrent request while it did. Nothing
+// outside this package needs to see them, so nothing outside can.
+const (
+	// admissionIDNamespace is the reserved span. Nothing a caller names may
+	// begin with it, which covers both the identities admissions occupy and the
+	// sentinel that bounds them.
+	admissionIDNamespace = "\x00shoal.admission"
+	// admissionIDPrefix is where admissions themselves live, one byte into the
+	// namespace. Its bytes are exactly what they were when the namespace and
+	// the prefix were the same string, so no derived identity moves.
+	admissionIDPrefix = admissionIDNamespace + "\x00"
+	// admissionIDSentinel bounds the region from above. It is inside the
+	// reserved namespace and therefore unnameable, which it has to be: a scan
+	// that jumps here starts strictly after it, so an ordinary action stored at
+	// exactly this identity would be skipped by Pull and TeamActions for as
+	// long as it existed. Reserving the span rather than just the prefix is what
+	// makes that unconstructible.
+	admissionIDSentinel = admissionIDNamespace + "\x01"
+)
 
-// reservedAdmissionID reports whether an identity names the admission region.
+// reservedAdmissionID reports whether an identity falls in the reserved span.
 //
 // Anchored at the start rather than matched anywhere: a substring test would
 // reserve every identity that happens to contain the marker, refusing
 // legitimate names a dispatch caller is entitled to use.
 func reservedAdmissionID(id []byte) bool {
-	return bytes.HasPrefix(id, []byte(admissionIDPrefix))
+	return bytes.HasPrefix(id, []byte(admissionIDNamespace))
 }
 
 // admissionRegionEnd is the smallest identity ordered after every admission.
 //
-// The region is contiguous — every admission identity is the prefix followed by
-// a digest, and no other identity may begin with the prefix — so incrementing
-// the prefix's final byte yields a bound that is above all of them and below
-// nothing else. That is what lets a scan step over the whole region in one move
-// instead of one record at a time; see scanDispatchActions.
+// The region is contiguous — every admission identity is admissionIDPrefix
+// followed by a digest — so the sentinel one byte above the prefix is ordered
+// above all of them and below every identity outside the namespace. That is
+// what lets a scan step over the whole region in one move instead of one record
+// at a time; see scanDispatchActions.
+//
+// Returned fresh on each call. A cached slice would be shared mutable state
+// that any caller could corrupt, moving the boundary for everyone.
 func admissionRegionEnd() []byte {
-	end := []byte(admissionIDPrefix)
-	end[len(end)-1]++
-	return end
+	return []byte(admissionIDSentinel)
 }
 
 // admissionActionID derives the durable record identity for a caller-supplied
@@ -693,7 +722,7 @@ func admissionRegionEnd() []byte {
 // story, and rotation re-derives every live admission's identity, orphaning
 // outstanding grants whose tokens no longer resolve. A reserved namespace costs
 // none of that and gives the stronger property, so the secrecy claim is gone
-// and AdmissionIDPrefix carries the weight.
+// and the reserved namespace carries the weight.
 //
 // Every component of the principal participates, because every component is
 // what authorizedCurrent compares when it decides a record belongs to a caller.

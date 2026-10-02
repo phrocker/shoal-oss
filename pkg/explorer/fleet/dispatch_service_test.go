@@ -907,6 +907,9 @@ type memoryDispatchStore struct {
 	// failReads makes one identity unreadable, so a test can drive the path a
 	// service takes when a check it must make cannot answer.
 	failReads map[string]error
+	// failScan makes scanning fail, so a test can drive the path a service
+	// takes when a verdict it must reach cannot be reached.
+	failScan error
 }
 
 type uniqueTokenDispatchStore struct {
@@ -1036,6 +1039,9 @@ func (s *memoryDispatchStore) ScanActions(_ context.Context, after []byte, limit
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.scans++
+	if s.failScan != nil {
+		return ActionPage{}, s.failScan
+	}
 	keys := make([]string, 0, len(s.records))
 	for key := range s.records {
 		if key <= string(after) {
