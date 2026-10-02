@@ -420,24 +420,18 @@ func (s *DispatchService) ExecuteClaim(ctx context.Context, claimed ActionRecord
 	if err != nil {
 		return ActionRecord{}, err
 	}
-	// Three refusals, all answering object-not-found, because this path had the
-	// enumeration still open: an absent identity came back as the store's own
-	// sentinel and a stored admission as object-not-found, which is two answers
-	// to the question this surface exists to stop answering.
+	// Absence answers as a record the caller may not act on does, which is what
+	// closes the enumeration on this path: the store's own sentinel for an
+	// absent identity and object-not-found for a stored admission were two
+	// answers to the question this surface exists to stop answering.
 	//
-	// The first two overlap, and no single mutation of either is observable —
-	// a reserved identity that is absent is caught by the normalisation, and a
-	// reserved identity that is stored is caught by the marker. They are both
-	// kept because they cover different inputs once you look past that case.
-	// The reserved check means such an identity never reaches the store at all,
-	// so there is no read and nothing to time. The normalisation is the only
-	// one that covers an *unreserved* absent identity against an unreserved
-	// stored admission, which is the pre-prefix pair below. Removing both is
-	// caught; TestExecuteClaimAnswersAlikeForAReservedIdentity pins the pair
-	// and the unprefixed pair separately.
-	if reservedAdmissionID(claimed.ID) {
-		return ActionRecord{}, auth.ObjectNotFound()
-	}
+	// There was a third refusal here, ahead of the read, for any identity in the
+	// reserved span. It is gone. It inferred "an admission, or nothing" from the
+	// identity, and the span held ordinary actions before it was reserved — so
+	// it made a legitimately created action permanently unexecutable. It was
+	// also redundant: a reserved identity that is absent is covered by the
+	// normalisation below and one that is stored by the marker check, which is
+	// why no mutation of it alone was ever observable.
 	current, err := s.store.GetAction(ctx, claimed.ID)
 	if err != nil {
 		if errors.Is(err, ErrActionNotFound) {
@@ -1121,66 +1115,42 @@ func containsByteValue(values [][]byte, value []byte) bool {
 }
 
 // scanDispatchActions scans committed actions for a surface that must not see
-// admissions, stepping over the admission region in one move rather than one
-// record at a time.
+// admissions, excluding them by their durable marker.
 //
-// Filtering admissions out inside a bounded scan was the first attempt and it
-// broke the listings it was protecting. A per-record skip spends the caller's
-// scan budget on records it can never be shown, and because the admission
-// region sorts before essentially every ordinary identity, the admissions come
-// first — so a deployment with more admissions than the budget gets an empty
-// page forever, having done the maximum possible work to produce it. One
-// admission per model call makes that the normal case, not an edge.
+// It used to skip them by key range instead, jumping over the reserved span in
+// one move. That was unsound for a reason no amount of care inside the jump
+// could fix: skipping a range asserts that everything in it is something the
+// caller must not see, and the span was a legal dispatch identity space before
+// it was reserved — so an ordinary action already stored there was skipped,
+// invisible to Pull and TeamActions with nothing to indicate it. Reachability
+// is a property of what a record *is*, which only the marker records, not of
+// where its identity happens to sort.
 //
-// The region is contiguous, which is the property that makes this cheap: when a
-// scan lands inside it, the cursor jumps to admissionRegionEnd and the whole
-// region is behind us in a single step, however many admissions it holds.
+// The jump existed to keep a caller's scan budget off admissions, which sorted
+// first. They sort last now, so the budget concern goes with the jump: a
+// listing reaches real work before it meets an admission, and only a caller
+// paging to the very end filters through them — having already been given
+// everything it asked for.
 //
-// Records whose identity predates the prefix are still filtered one at a time.
-// They are indistinguishable by identity — only the durable marker names them —
-// and they cost what any record invisible to a caller costs. The jump makes
-// every admission written from here on free; it cannot retroactively make the
-// earlier ones contiguous.
+// A page can still filter down to nothing, at that tail or wherever an
+// admission happens to sit, and the cursor is returned so the caller pages on.
+// An empty page is not an exhausted scan; only an empty continuation is.
 func (s *DispatchService) scanDispatchActions(
 	ctx context.Context, after []byte, limit int,
 ) (ActionPage, error) {
-	// One mechanism, applied at the top: a cursor inside the region becomes the
-	// bound just past it. That covers both ways a scan meets the region — a
-	// caller's cursor already pointing into it, and a scan that advanced into
-	// it — because the advance below hands the next attempt a cursor to
-	// normalise rather than jumping on its own. Two separate jumps was the
-	// first shape, and neither was individually observable: each masked the
-	// other.
-	//
-	// Two attempts at most. One page can be entirely admissions, and after the
-	// normalisation the cursor is past every one of them, so a third attempt
-	// could not differ. The final return carries the last attempt's cursor, so
-	// a caller whose page was filled by admissions the region cannot hold —
-	// those written before identities carried the prefix — pages onward rather
-	// than being told the scan is finished.
-	var result ActionPage
-	for attempt := 0; attempt < 2; attempt++ {
-		if reservedAdmissionID(after) {
-			after = admissionRegionEnd()
+	page, err := s.store.ScanActions(ctx, after, limit)
+	if err != nil {
+		return ActionPage{}, err
+	}
+	result := ActionPage{
+		Next:    append([]byte(nil), page.Next...),
+		Actions: make([]ActionRecord, 0, len(page.Actions)),
+	}
+	for _, record := range page.Actions {
+		if record.isAdmission() {
+			continue
 		}
-		page, err := s.store.ScanActions(ctx, after, limit)
-		if err != nil {
-			return ActionPage{}, err
-		}
-		result = ActionPage{
-			Next:    append([]byte(nil), page.Next...),
-			Actions: make([]ActionRecord, 0, len(page.Actions)),
-		}
-		for _, record := range page.Actions {
-			if record.isAdmission() {
-				continue
-			}
-			result.Actions = append(result.Actions, record)
-		}
-		if len(result.Actions) > 0 || len(page.Actions) == 0 {
-			return result, nil
-		}
-		after = page.Actions[len(page.Actions)-1].ID
+		result.Actions = append(result.Actions, record)
 	}
 	return result, nil
 }
@@ -1552,6 +1522,7 @@ func writeDispatchTupleField(digest hash.Hash, value []byte) {
 func equivalentEnqueue(current, wanted ActionRecord) bool {
 	return equalEffects(current.AdmittedEffects, wanted.AdmittedEffects) &&
 		bytes.Equal(current.AdmittedDisclosures, wanted.AdmittedDisclosures) &&
+		current.AdmittedIdentityScheme == wanted.AdmittedIdentityScheme &&
 		bytes.Equal(current.ID, wanted.ID) &&
 		bytes.Equal(current.IdempotencyKey, wanted.IdempotencyKey) &&
 		current.AgentID == wanted.AgentID &&

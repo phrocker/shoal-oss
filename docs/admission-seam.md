@@ -117,12 +117,39 @@ ordinary action ID, and read occupancy off conflict versus success. It could
 also squat an unheld one and deny the victim its own admission by name.
 
 **A reserved namespace makes them unreachable.** `admissionIDNamespace` marks a
-span of the action identity space that no caller may name. `enqueue` refuses
-it unconditionally — before the store is read, and regardless of what is there
-— and that is the only place the refusal is needed, because enqueue is the one
+span of the action identity space that no caller may name. `enqueue` refuses it
+unconditionally — before the store is read, and regardless of what is there —
+and that is the only place the refusal is needed, because enqueue is the one
 entry point at which a caller names a durable action it does not already own.
-Every other path takes an ID it must already hold and answers a foreign or
-absent one identically.
+Every other path takes an identity it must already hold and answers a foreign
+or absent one identically.
+
+The span begins with `0xff` so admissions sort after essentially every ordinary
+identity. That placement is load-bearing: it is what lets the listings exclude
+admissions by their durable marker alone. An earlier version put the span first
+and had the listings jump over the key range to keep their scan budget off it —
+a jump that necessarily skipped anything *else* in the range, including an
+ordinary action stored there before the span was reserved at all.
+
+**The span says nothing about what a record is.** It is a forward rule about
+what may be created, not a classifier. Reachability, ownership and identity
+scheme are all read from recorded state:
+
+| question | answered by |
+| --- | --- |
+| is this an admission? | `AdmittedEffects` is non-empty |
+| which identity scheme produced its key? | `AdmittedIdentityScheme` |
+| what was admitted? | `AdmittedEffects`, `AdmittedDisclosures` |
+| what was the caller obliged to withhold? | `AdmittedObligation` |
+
+Three consecutive review rounds found the same error here — a property inferred
+from data that did not carry it. Ownership inferred from a record with no
+domain. Identity scheme inferred from an identity that was caller-chosen.
+Reachability inferred from a span that predates the reservation. The table is
+the answer to the class: every decision reads a marker that was written when
+the fact was known, and the only remaining identity-derived rule is enqueue's
+refusal, which cannot be wrong about an existing record because it never looks
+at one.
 
 A keyed digest was the other option and is the weaker one. It hides an
 identifier without making it unreachable, and secrecy of an identifier is not
@@ -170,6 +197,30 @@ generation on every lease renewal, so it is blind to essentially all of them,
 and grants over them instead. Under-refusing double-grants, over-refusing
 enumerates, and the information needed to do neither is not in the record. A
 whole-store verdict has no ownership predicate to get wrong.
+
+**The scheme is read from a marker, not from the identity.** A legacy
+admission's key was caller-supplied opaque bytes, so it may lie anywhere —
+inside the reserved span included, and in the exact prefix-plus-digest shape a
+derived key has. An earlier verdict inferred "new scheme" from the span and so
+certified precisely that record as new: the retry derived a different key and
+issued a second live grant. `AdmittedIdentityScheme` settles it instead, and is
+sound for any identity, adversarial ones included. Its zero value is the
+superseded scheme, which is what a record written before the field existed
+decodes to — so the default is the safe reading rather than a lucky one.
+`equivalentEnqueue` compares it too, which refuses such a record as a conflict
+even if the verdict were somehow passed.
+
+**The second rollout condition: ordinary actions inside the span.** Action
+identities are arbitrary non-empty bytes and always have been, so the span was
+a legal place to store an ordinary action long before it was reserved — and
+unlike legacy *admissions*, which no release contains, such a record can exist
+in a store upgraded from `v1.3.0`. Nothing silently mishandles one: the listings
+exclude admissions by marker rather than by range, and `ExecuteClaim` no longer
+refuses an identity for its shape, so such an action stays listed, claimable
+and executable. What stays broken is narrow — `enqueue` refuses the span
+unconditionally, so the action cannot be enqueue-replayed and its idempotent
+retry fails. `ErrAdmissionSpanOccupied` reports it, separately from the legacy
+condition because the remedy differs.
 
 **What still works while the verdict is dirty.** `Report` and `Outstanding`
 deliberately do not consult it. A grant already issued must stay reportable, or

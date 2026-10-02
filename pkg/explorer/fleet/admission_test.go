@@ -286,11 +286,20 @@ func TestAdmissionDenialAnswersFromTheRecordOnReplay(t *testing.T) {
 // least classifiable request there is.
 func TestAdmissionRequiresADeclaredEffect(t *testing.T) {
 	harness := newAdmissionHarness(t, nil)
-	if _, err := harness.service.Request(
+	// The message matters, not only the code. An empty declaration is also
+	// refused downstream by ActionRecord.Validate, which rejects a scheme
+	// marker with no admitted effect — same code, but a message about record
+	// coherence rather than about what the caller sent. Asserting the message
+	// keeps the early refusal load-bearing instead of shadowed by the later
+	// one, and tells the caller what it actually got wrong.
+	_, err := harness.service.Request(
 		harness.context(t, "request"),
-		harness.request("request", "admission", "complete", nil, nil),
-	); !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
+		harness.request("request", "admission", "complete", nil, nil))
+	if !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
 		t.Fatalf("empty effect set = %v", err)
+	}
+	if !strings.Contains(err.Error(), "must declare an effect") {
+		t.Fatalf("empty effect set refused for the wrong reason: %v", err)
 	}
 	if _, err := harness.service.Request(
 		harness.context(t, "request"),
@@ -1711,6 +1720,8 @@ func legacyAdmission(
 		Deadline:        harness.now.Add(time.Hour),
 		CreatedAt:       harness.now, UpdatedAt: harness.now,
 		AdmittedEffects: Effects{EffectEgressesContent},
+		// No AdmittedIdentityScheme: zero is the superseded scheme, which is
+		// what a record written before the field existed decodes to.
 	}
 }
 
@@ -2007,7 +2018,10 @@ func TestVerdictScansEveryPage(t *testing.T) {
 // admission of any kind. One is covered already and would pass.
 func TestTwoUnmigratedAdmissionsDoNotHideLaterRecords(t *testing.T) {
 	harness := newAdmissionHarness(t, nil)
-	// Names ordered below "real-work" so the scan meets them first.
+	// Ordinary identities, ordered below "real-work" so the scan meets these
+	// two first. Legacy admissions carry caller-supplied identities and so can
+	// sort anywhere, which is exactly why the reserved span cannot be used to
+	// recognise them.
 	for _, name := range []string{"aaa-legacy-one", "aab-legacy-two"} {
 		legacy := legacyAdmission(harness, name, "owner", "actor")
 		harness.store.records[string(legacy.ID)] = legacy
@@ -2044,40 +2058,241 @@ func TestTwoUnmigratedAdmissionsDoNotHideLaterRecords(t *testing.T) {
 	}
 }
 
-// TestAdmissionRegionSentinelIsUnnameable pins that the exclusive bound a scan
-// jumps to cannot itself hold an action.
+// TestLegacyAdmissionInsideTheSpanIsStillLegacy is the adversarial case, and
+// the reason the verdict reads a marker rather than an identity.
 //
-// The sentinel is a cursor, and ScanActions starts strictly after its cursor.
-// So an ordinary action stored at exactly that identity would be skipped by
-// Pull and TeamActions for as long as it existed. Reserving the span rather
-// than only the admission prefix makes that unconstructible.
-func TestAdmissionRegionSentinelIsUnnameable(t *testing.T) {
-	sentinel := admissionRegionEnd()
-	if !reservedAdmissionID(sentinel) {
-		t.Fatalf("the region sentinel %q is a nameable identity", sentinel)
-	}
-	for _, admission := range [][]byte{
-		[]byte(admissionIDPrefix),
-		append([]byte(admissionIDPrefix), 0xff),
+// Legacy admission identities were caller-supplied opaque bytes, so one can sit
+// anywhere — including inside the reserved span, and including the exact
+// prefix-plus-digest shape a derived identity has. A verdict that inferred the
+// scheme from the span certified exactly that record as new, the retry derived
+// a different key, and a second live grant was issued for work already
+// permitted. A coincidental identity would not show this; the identity has to
+// be the one the derivation would produce.
+func TestLegacyAdmissionInsideTheSpanIsStillLegacy(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		id   func(h *admissionHarness, t *testing.T) []byte
+	}{
+		{
+			name: "the identity the derivation would produce",
+			id: func(h *admissionHarness, t *testing.T) []byte {
+				return h.storedID(t, "legacy-name")
+			},
+		},
+		{
+			name: "some other identity inside the span",
+			id: func(*admissionHarness, *testing.T) []byte {
+				return append([]byte(admissionIDPrefix), []byte("squatted")...)
+			},
+		},
 	} {
-		if bytes.Compare(admission, sentinel) >= 0 {
-			t.Fatalf("sentinel %q does not bound %q", sentinel, admission)
-		}
+		t.Run(test.name, func(t *testing.T) {
+			harness := newAdmissionHarness(t, nil)
+			legacy := legacyAdmission(harness, "placeholder", "owner", "actor")
+			legacy.ID = test.id(harness, t)
+			if !reservedAdmissionID(legacy.ID) {
+				t.Fatalf("the fixture identity is not in the span: %q",
+					legacy.ID)
+			}
+			if legacy.AdmittedIdentityScheme != 0 {
+				t.Fatal("the fixture is not a superseded-scheme record")
+			}
+			harness.store.records[string(legacy.ID)] = legacy
+
+			if _, err := harness.service.Request(
+				harness.context(t, "request"), harness.request(
+					"request", "legacy-name", "complete",
+					Effects{EffectEgressesContent}, nil),
+			); !errors.Is(err, ErrAdmissionUnmigrated) {
+				t.Fatalf("a legacy record inside the span was certified: %v",
+					err)
+			}
+			// And nothing was written, so no second grant exists.
+			stored, err := harness.store.GetAction(
+				context.Background(), harness.storedID(t, "legacy-name"))
+			if err == nil && stored.AdmittedIdentityScheme ==
+				AdmittedIdentitySchemeDerived {
+				t.Fatal("a second live grant was issued")
+			}
+		})
 	}
+}
+
+// TestEnqueueIdentityRejectsAMixedScheme pins the second layer under the
+// verdict, directly, because nothing reaches it through Request.
+//
+// If a legacy record sits at the identity the derivation would produce, the
+// verdict refuses the whole surface before replay is ever consulted — so the
+// scheme comparison inside equivalentEnqueue is unreachable from the outside
+// and no end-to-end mutation can observe it. It is kept because it is the thing
+// that would refuse such a record as a conflict rather than replaying it as its
+// own grant, were the verdict ever bypassed, and tested here so that keeping it
+// is a decision rather than an assumption.
+func TestEnqueueIdentityRejectsAMixedScheme(t *testing.T) {
+	harness := newAdmissionHarness(t, nil)
+	derived := legacyAdmission(harness, "name", "owner", "actor")
+	derived.ID = harness.storedID(t, "name")
+	derived.AdmittedIdentityScheme = AdmittedIdentitySchemeDerived
+
+	legacy := cloneActionRecord(derived)
+	legacy.AdmittedIdentityScheme = 0
+
+	if !equivalentEnqueue(derived, derived) {
+		t.Fatal("a record is not equivalent to itself")
+	}
+	if equivalentEnqueue(legacy, derived) {
+		t.Fatal("a superseded-scheme record is equivalent to a derived one")
+	}
+	if equivalentEnqueue(derived, legacy) {
+		t.Fatal("the comparison is not symmetric in the scheme")
+	}
+}
+
+// TestOrdinaryActionInsideTheSpanIsDetected pins the other direction of the
+// same root cause.
+//
+// Action identities are arbitrary non-empty bytes and always have been, so the
+// span was a legal place to store an ordinary action before it was reserved.
+// Nothing silently mishandles one now — the listings exclude admissions by
+// marker rather than by range, and ExecuteClaim no longer refuses an identity
+// for its shape — but enqueue refuses the span unconditionally, so such an
+// action cannot be enqueue-replayed. The verdict is what makes that visible to
+// an operator instead of leaving it latent.
+func TestOrdinaryActionInsideTheSpanIsDetected(t *testing.T) {
+	harness := newAdmissionHarness(t, nil)
+	squatted := append([]byte(admissionIDPrefix), []byte("ordinary")...)
+	harness.store.records[string(squatted)] = ActionRecord{
+		ID: squatted, IdempotencyKey: []byte("key"), Version: 1,
+		State: DispatchQueued, AgentID: "agent", AgentGeneration: 1,
+		Capability: "model", Action: "complete",
+		SourceID: []byte("source"), PolicyID: []byte("policy"),
+		ObjectID: "object", Input: json.RawMessage(`{"a":1}`),
+		Subject: "owner", Actor: "actor",
+		PolicyGeneration: 1, AuthorizationExpiresAt: harness.now.Add(time.Hour),
+		AuthorizedOperations: []auth.Operation{auth.OperationDispatch},
+		RequestID:            "request",
+		Reason:               interaction.Reason{Code: "operator_request"},
+		ExecutorKey:          []byte("executor"),
+		Deadline:             harness.now.Add(time.Hour),
+		CreatedAt:            harness.now, UpdatedAt: harness.now,
+	}
+	if _, err := harness.service.Request(
+		harness.context(t, "request"), harness.request(
+			"request", "anything", "complete",
+			Effects{EffectEgressesContent}, nil),
+	); !errors.Is(err, ErrAdmissionSpanOccupied) {
+		t.Fatalf("an ordinary action inside the span went undetected: %v", err)
+	}
+	// The two rollout conditions answer differently, because the remedies
+	// differ and an operator reading one should not go hunting for the other.
+	if errors.Is(ErrAdmissionSpanOccupied, ErrAdmissionUnmigrated) {
+		t.Fatal("the two rollout conditions are the same error")
+	}
+}
+
+// TestOrdinaryActionInsideTheSpanStaysReachable pins what the span rules may no
+// longer do to a record that predates them.
+//
+// It must still be listed and still be executable. Those were both broken: the
+// listings skipped the span by key range, and ExecuteClaim refused any identity
+// in it before reading anything. A record created legitimately became invisible
+// and unexecutable, with nothing to say so.
+func TestOrdinaryActionInsideTheSpanStaysReachable(t *testing.T) {
 	harness := newAdmissionHarness(t, nil)
 	worker := bindDecision(t, harness.authority, dispatchDecision(
 		t, "owner", "actor", "request",
 		auth.OperationDispatch, auth.OperationInvoke))
-	if _, err := harness.dispatch.Enqueue(worker, EnqueueRequest{
-		ID: sentinel, IdempotencyKey: []byte("idempotency-sentinel"),
+	// Written through the store, because enqueue refuses the span by design:
+	// the reservation is a forward rule about what a caller may name, and this
+	// record predates it.
+	squatted := append([]byte(admissionIDPrefix), []byte("ordinary")...)
+	seed, err := harness.dispatch.Enqueue(worker, EnqueueRequest{
+		ID: []byte("seed"), IdempotencyKey: []byte("idempotency-seed"),
 		AgentID: "agent", AgentGeneration: 1,
 		Capability: "model", Action: "complete",
 		SourceID: []byte("source"), PolicyID: []byte("policy"),
 		ObjectID: "object",
 		Input:    json.RawMessage(`{"prompt_digest":"abc"}`),
 		Context:  dispatchContext(harness.now, "request"),
-	}); !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
-		t.Fatalf("an action was created at the region sentinel = %v", err)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	relocated := cloneActionRecord(seed)
+	relocated.ID = squatted
+	relocated.ExecutorKey = executorKey(squatted, seed.IdempotencyKey)
+	harness.store.records[string(squatted)] = relocated
+	delete(harness.store.records, string(seed.ID))
+
+	page, err := harness.dispatch.Pull(worker, PullActionsRequest{
+		Limit: 16, Context: dispatchContext(harness.now, "request"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var listed bool
+	for _, record := range page.Actions {
+		if bytes.Equal(record.ID, squatted) {
+			listed = true
+		}
+	}
+	if !listed {
+		t.Fatalf("an ordinary action in the span is invisible to pull: %#v",
+			page.Actions)
+	}
+	claimed, err := harness.dispatch.Claim(worker, ClaimRequest{
+		ID: squatted, ExpectedVersion: relocated.Version,
+		ClaimID: []byte("worker-token"), Lease: time.Minute,
+		Context: dispatchContext(harness.now, "request"),
+	})
+	if err != nil {
+		t.Fatalf("an ordinary action in the span cannot be claimed: %v", err)
+	}
+	if _, err := harness.dispatch.ExecuteClaim(
+		harness.context(t, "request"), claimed); err != nil {
+		t.Fatalf("an ordinary action in the span cannot be executed: %v", err)
+	}
+	if harness.executor.calls != 1 {
+		t.Fatalf("executor calls = %d, want 1", harness.executor.calls)
+	}
+}
+
+// TestAdmissionsSortAfterOrdinaryWork pins the placement that replaced the
+// key-range jump.
+//
+// Filtering by marker is only cheap if a listing meets real work before it
+// meets admissions. When admissions sorted first, a listing's scan budget went
+// on records it could never return, which is what the jump existed to avoid —
+// and the jump is what skipped everything else in the range. The ordering is
+// now the mechanism, so it is asserted directly.
+func TestAdmissionsSortAfterOrdinaryWork(t *testing.T) {
+	harness := newAdmissionHarness(t, nil)
+	for index := 0; index < 20; index++ {
+		if _, err := harness.service.Request(
+			harness.context(t, "request"), harness.request(
+				"request", fmt.Sprintf("grant-%02d", index), "complete",
+				Effects{EffectEgressesContent}, nil)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	queued := harness.enqueueDispatchAction(t, "zzz-last-ordinary")
+
+	// One page of one, from the start: the ordinary action comes back even
+	// though it sorts after every other ordinary identity, because admissions
+	// are below none of them.
+	harness.store.scans = 0
+	page, err := harness.dispatch.scanDispatchActions(
+		context.Background(), nil, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Actions) != 1 ||
+		!bytes.Equal(page.Actions[0].ID, queued.ID) {
+		t.Fatalf("scan = %#v", page.Actions)
+	}
+	// And it cost one read, with no range skipping involved.
+	if harness.store.scans != 1 {
+		t.Fatalf("one page cost %d reads", harness.store.scans)
 	}
 }
 
@@ -2138,20 +2353,28 @@ func TestListingsStillWorkWithAdmissionsInTheStore(t *testing.T) {
 	queued := harness.enqueueDispatchAction(t, "real-work")
 
 	// The fixture's premise, asserted rather than assumed: the raw store hands
-	// back an admission first. If it did not, this test would pass against the
-	// defect it exists for — and it did not, until the scan double was made to
-	// walk identities in order instead of in map order.
+	// back the ordinary action before any admission, and hands an admission
+	// back last. That ordering is what makes filtering by marker cheap — a
+	// listing meets real work first — and it is the reason the key-range jump
+	// could be deleted. Asserting it here keeps the ordering load-bearing
+	// rather than incidental.
 	raw, err := harness.store.ScanActions(context.Background(), nil, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(raw.Actions) != 1 || !raw.Actions[0].isAdmission() {
-		t.Fatalf("the fixture does not put an admission first: %#v",
+	if len(raw.Actions) != 1 || raw.Actions[0].isAdmission() {
+		t.Fatalf("the fixture does not put ordinary work first: %#v",
 			raw.Actions)
 	}
+	tail, err := harness.store.ScanActions(
+		context.Background(), nil, MaxDispatchListResults)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if last := tail.Actions[len(tail.Actions)-1]; !last.isAdmission() {
+		t.Fatalf("admissions do not sort last: %q", last.ID)
+	}
 
-	// Every admission sorts ahead of the dispatch action, so a scan that walks
-	// them one at a time never reaches it.
 	worker := bindDecision(t, harness.authority, dispatchDecision(
 		t, "owner", "actor", "request",
 		auth.OperationDispatch, auth.OperationInvoke))
@@ -2187,79 +2410,6 @@ func TestListingsStillWorkWithAdmissionsInTheStore(t *testing.T) {
 		if record.isAdmission() {
 			t.Fatal("an admission reached a team-overview reader")
 		}
-	}
-}
-
-// TestPullFromInsideTheAdmissionRegionStillReturnsWork pins the cursor case.
-//
-// Pull's cursor comes from the caller, so it can point inside the admission
-// region — a worker that paged there once, or simply guessed. Without
-// normalising it the scan resumes inside a region whose records are all
-// filtered out, and the worker is handed an empty page for work that exists.
-func TestPullFromInsideTheAdmissionRegionStillReturnsWork(t *testing.T) {
-	harness := newAdmissionHarness(t, nil)
-	for index := 0; index < 6; index++ {
-		if _, err := harness.service.Request(
-			harness.context(t, "request"), harness.request(
-				"request", fmt.Sprintf("grant-%02d", index), "complete",
-				Effects{EffectEgressesContent}, nil)); err != nil {
-			t.Fatal(err)
-		}
-	}
-	queued := harness.enqueueDispatchAction(t, "real-work")
-
-	worker := bindDecision(t, harness.authority, dispatchDecision(
-		t, "owner", "actor", "request",
-		auth.OperationDispatch, auth.OperationInvoke))
-	inside := harness.storedID(t, "grant-00")
-	if !reservedAdmissionID(inside) {
-		t.Fatal("the fixture cursor is not inside the region")
-	}
-	page, err := harness.dispatch.Pull(worker, PullActionsRequest{
-		After: inside, Limit: 4,
-		Context: dispatchContext(harness.now, "request"),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(page.Actions) != 1 ||
-		!bytes.Equal(page.Actions[0].ID, queued.ID) {
-		t.Fatalf("pull resumed inside the region = %#v", page.Actions)
-	}
-}
-
-// TestScanStepsOverTheAdmissionRegionInOneMove pins the mechanism rather than
-// only the outcome: the region is skipped by moving the cursor past it, so the
-// cost does not grow with the number of admissions. A per-record filter would
-// satisfy the listing assertions above on a small enough fixture and still burn
-// a caller's budget in production.
-func TestScanStepsOverTheAdmissionRegionInOneMove(t *testing.T) {
-	harness := newAdmissionHarness(t, nil)
-	for index := 0; index < 12; index++ {
-		if _, err := harness.service.Request(
-			harness.context(t, "request"), harness.request(
-				"request", fmt.Sprintf("grant-%02d", index), "complete",
-				Effects{EffectEgressesContent}, nil)); err != nil {
-			t.Fatal(err)
-		}
-	}
-	queued := harness.enqueueDispatchAction(t, "real-work")
-
-	harness.store.scans = 0
-	page, err := harness.dispatch.scanDispatchActions(
-		context.Background(), nil, 1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(page.Actions) != 1 ||
-		!bytes.Equal(page.Actions[0].ID, queued.ID) {
-		t.Fatalf("scan = %#v", page.Actions)
-	}
-	// One scan lands in the region, one starts past it. Twelve admissions must
-	// not cost twelve scans.
-	if harness.store.scans > 2 {
-		t.Fatalf("stepping over 12 admissions took %d scans",
-			harness.store.scans)
 	}
 }
 
@@ -2431,25 +2581,6 @@ func TestDispatchRefusesAdmissionsWrittenBeforeThePrefix(t *testing.T) {
 		if bytes.Equal(record.ID, legacy.ID) {
 			t.Fatal("a pre-prefix admission was offered as dispatch work")
 		}
-	}
-}
-
-// TestAdmissionRegionEndIsNotSharedState pins that the region bound cannot be
-// corrupted by whoever asks for it. It is derived from a constant and returned
-// fresh; a shared slice would let one caller move the boundary for everyone.
-func TestAdmissionRegionEndIsNotSharedState(t *testing.T) {
-	first := admissionRegionEnd()
-	original := append([]byte(nil), first...)
-	for index := range first {
-		first[index] ^= 0xff
-	}
-	if !bytes.Equal(admissionRegionEnd(), original) {
-		t.Fatal("the admission region bound is shared mutable state")
-	}
-	// And it really is above every admission identity.
-	if !bytes.HasPrefix(original, []byte(admissionIDPrefix[:len(admissionIDPrefix)-1])) ||
-		bytes.Compare(original, []byte(admissionIDPrefix)) <= 0 {
-		t.Fatalf("region end %q does not bound the region", original)
 	}
 }
 
@@ -2824,6 +2955,28 @@ func TestAdmittedDeclarationShapeIsValidated(t *testing.T) {
 	obliged.AdmittedObligation = []byte{0b0000_0001}
 	if err := obliged.Validate(); err != nil {
 		t.Fatalf("complete obligation = %v", err)
+	}
+
+	// A scheme marker claims how an admission's key was produced, so it is
+	// incoherent on a record that is not an admission.
+	schemeOnly := base
+	schemeOnly.AdmittedIdentityScheme = AdmittedIdentitySchemeDerived
+	if err := schemeOnly.Validate(); err == nil {
+		t.Fatal("accepted an identity scheme with no admitted effect")
+	}
+	derived := whole
+	derived.AdmittedIdentityScheme = AdmittedIdentitySchemeDerived
+	if err := derived.Validate(); err != nil {
+		t.Fatalf("complete derived admission = %v", err)
+	}
+	// A scheme this build does not know still decodes. The verdict refuses
+	// anything that is not the derived marker, so an unrecognised value is
+	// refused at use rather than made undecodable — the same treatment an
+	// unrecognised effect class gets.
+	future := whole
+	future.AdmittedIdentityScheme = 99
+	if err := future.Validate(); err != nil {
+		t.Fatalf("a future identity scheme must still decode: %v", err)
 	}
 }
 
