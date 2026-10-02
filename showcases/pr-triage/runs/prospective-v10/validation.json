@@ -1,6 +1,6 @@
 {
   "tests": {
-    "showcase_python": 49,
+    "showcase_python": 51,
     "learning_core_python": 13,
     "go_packages": [
       "showcases/pr-triage/extract",
@@ -17,7 +17,9 @@
     "Canonical reviewer prompts and preparer identity verified against pinned manifest/protocol",
     "Boolean scores rejected",
     "Exact duplicate-free input, sample and prediction coverage required",
-    "Duplicate PR families rejected in collection and evaluation"
+    "Duplicate PR families rejected in collection and evaluation",
+    "Call receipts bound to expected pass/batch ID and paid runner identity",
+    "Registration < inventory observation <= source acquisition required in projection and evaluation"
   ],
   "report_replay_identical_after_copilot_fixes": true
 }

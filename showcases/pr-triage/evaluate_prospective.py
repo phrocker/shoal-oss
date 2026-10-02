@@ -10,6 +10,8 @@ from candidates import checked
 from shadow import digest, write_new
 from paid_review import micros, receipt
 import prepare_references
+import paid_review
+from prospective_snapshot import validate_observation_order
 
 
 def assessment(root,manifest,protocol,pass_name,batches):
@@ -18,6 +20,8 @@ def assessment(root,manifest,protocol,pass_name,batches):
     for n,batch in enumerate(batches['batches']):
         call_id=f"pr{batch['pr']}-{pass_name}-b{n}"
         response=root/'calls'/call_id/'response.json';call=json.loads((response.parent/'call.json').read_text())
+        if call.get('call_id')!=call_id or call.get('runner_sha256')!=digest(Path(paid_review.__file__).read_bytes()):
+            raise ValueError('review call identity or runner mismatch')
         if call['protocol_id']!=protocol['id'] or call['prompt_sha256']!=batch['sha256'] or call['response_sha256']!=digest(response.read_bytes()):
             raise ValueError('review response provenance mismatch')
         if call['started_at_unix'] <= manifest['observed_at_unix']:
@@ -123,6 +127,10 @@ def main():
     if dev['id']!=protocol['training_inputs_id']:raise ValueError('development identity mismatch')
     if predictions['model_id']!=model['id'] or predictions['inputs_id']!=inputs['id'] or predictions['threshold']!=protocol['threshold']:
         raise ValueError('prediction lineage mismatch')
+    inventory=checked(root/'inventory.json')
+    if inventory['id']!=picture['inventory_id'] or inventory['registered_protocol_id']!=protocol['id']:
+        raise ValueError('snapshot inventory provenance mismatch')
+    validate_observation_order(manifest,protocol,inventory)
     ids=validate_membership(manifest,picture,inputs,predictions)
     if picture['protocol_id']!=protocol['id'] or manifest['picture_id']!=picture['id'] or batches['protocol_id']!=protocol['id'] or batches['manifest_id']!=manifest['id']:
         raise ValueError('snapshot/prompt provenance mismatch')

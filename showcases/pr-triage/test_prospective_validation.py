@@ -41,7 +41,7 @@ class MembershipTests(unittest.TestCase):
         self.m['observed_at_unix']=1790899201
         protocol={'id':'p','registered_at_utc':'2026-10-02T00:00:00+00:00'}
         with self.assertRaisesRegex(ValueError,'duplicate PR'):
-            project(self.m,protocol,{'registered_protocol_id':'p','selected':[]})
+            project(self.m,protocol,{'observed_at_utc':'2026-10-02T00:00:00.500000+00:00','registered_protocol_id':'p','selected':[]})
 
 
 class PromptProvenanceTests(unittest.TestCase):
@@ -70,6 +70,41 @@ class PromptProvenanceTests(unittest.TestCase):
             self.b['batches'][0][key]=original
         self.b['batches']=[]
         with self.assertRaisesRegex(ValueError,'noncanonical'):self.check()
+
+
+class CallIdentityTests(unittest.TestCase):
+    def test_substituted_call_and_changed_runner_rejected(self):
+        import json
+        import paid_review
+        from evaluate_prospective import assessment
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);folder=root/'calls/pr1-b-b0';folder.mkdir(parents=True)
+            raw=json.dumps({'result':json.dumps({'status':'proposed','records':[{'unit_id':'u','label':'review','witness':'enforce()'}]})}).encode()
+            (folder/'response.json').write_bytes(raw)
+            call={'call_id':'pr1-b-b0','runner_sha256':digest(Path(paid_review.__file__).read_bytes()),
+                  'protocol_id':'p','prompt_sha256':'prompt','response_sha256':digest(raw),'started_at_unix':2,'exit_code':0}
+            manifest={'id':'m','observed_at_unix':1,'cases':[{'units':[{'id':'u'}]}]}
+            batches={'batches':[{'pr':1,'sha256':'prompt','unit_ids':['u']}]}
+            for field,value in [('call_id','pr1-a-b0'),('runner_sha256','changed')]:
+                (folder/'call.json').write_text(json.dumps(dict(call,**{field:value})))
+                with self.assertRaisesRegex(ValueError,'identity or runner'):
+                    assessment(root,manifest,{'id':'p'},'b',batches)
+            (folder/'call.json').write_text(json.dumps(call))
+            self.assertEqual(len(assessment(root,manifest,{'id':'p'},'b',batches)['records']),1)
+
+
+class InventoryOrderTests(unittest.TestCase):
+    def test_inventory_boundaries(self):
+        from test_prospective import SnapshotTests
+        fixture=SnapshotTests();fixture.setUp()
+        for stamp in ('2026-10-01T23:59:59+00:00','2026-10-02T00:00:00+00:00',
+                      '2026-10-02T00:00:02+00:00','2026-10-02T00:00:00.5'):
+            fixture.i['observed_at_utc']=stamp
+            with self.subTest(stamp=stamp),self.assertRaisesRegex(ValueError,'inventory must'):
+                project(fixture.m,fixture.p,fixture.i)
+        for stamp in ('2026-10-02T00:00:00.5+00:00','2026-10-02T00:00:01+00:00'):
+            fixture.i['observed_at_utc']=stamp
+            project(fixture.m,fixture.p,fixture.i)
 
 
 if __name__=='__main__':unittest.main()

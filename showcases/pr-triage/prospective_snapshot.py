@@ -8,11 +8,19 @@ from candidates import checked
 from shadow import digest, write_new
 
 
-def project(manifest, protocol, inventory):
+def validate_observation_order(manifest, protocol, inventory):
     registered = datetime.fromisoformat(protocol['registered_at_utc'])
     observed = datetime.fromtimestamp(manifest['observed_at_unix'], timezone.utc)
     if registered.tzinfo is None or observed <= registered:
         raise ValueError('snapshot must be acquired after protocol registration')
+    inventory_observed = datetime.fromisoformat(inventory['observed_at_utc'])
+    if inventory_observed.tzinfo is None or not registered < inventory_observed <= observed:
+        raise ValueError('inventory must follow registration and precede snapshot acquisition')
+    return registered, observed
+
+
+def project(manifest, protocol, inventory):
+    registered, observed = validate_observation_order(manifest, protocol, inventory)
     if inventory['registered_protocol_id'] != protocol['id']:
         raise ValueError('inventory protocol mismatch')
     families = [c['pr'] for c in manifest['cases']]

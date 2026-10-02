@@ -54,7 +54,7 @@ class SnapshotTests(unittest.TestCase):
         self.p={'id':'p','registered_at_utc':'2026-10-02T00:00:00+00:00','excluded_families':[]}
         self.m={'id':'m','observed_at_unix':1790899201,'cases':[{'pr':1,'base':'b','head':'h','patch_sha256':'patch',
           'files':[{'path':'x.go','disposition':'parsed_go'}],'units':[{'id':'u','kind':'function','symbol':'F','path':'x.go','before':None,'after':{'text':'func F() {}'}}]}]}
-        self.i={'id':'i','registered_protocol_id':'p','selected':[{'pr':1,'base':'b','head':'h','stratum':'existing_at_registration'}]}
+        self.i={'id':'i','observed_at_utc':'2026-10-02T00:00:00.500000+00:00','registered_protocol_id':'p','selected':[{'pr':1,'base':'b','head':'h','stratum':'existing_at_registration'}]}
     def test_snapshot_keeps_unknown_coverage_and_all_dispositions(self):
         pic,sample=project(self.m,self.p,self.i)
         self.assertIsNone(pic['coverage'][0]['dependency_coverage_denominator'])
