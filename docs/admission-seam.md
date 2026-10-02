@@ -135,6 +135,56 @@ resolve. The namespace costs none of that.
 The token carries the derived ID, which is opaque to the caller and needs to be:
 it is only ever handed back.
 
+### Rollout: records written before the identity was derived
+
+**This section is empty of consequence for anyone upgrading from a release.**
+The only release is `v1.3.0` (2026-08-26); the admission surface merged
+2026-09-29 and is not an ancestor of that tag. A record written under the
+superseded identity scheme can therefore only exist in a deployment running an
+unreleased `main` build.
+
+Where one does exist, the derivation moved its durable key: it lives at the
+caller's own name, not at the derived one, so a request for it misses. Granting
+on that miss would issue a second live token for work already permitted, which
+is the worst outcome this surface has. So the miss is not granted. `Request`
+reads the caller-supplied name, and if an *unresolved* admission belonging to
+that same caller sits there, refuses with `ErrAdmissionUnmigrated` — an
+unavailable, not a denial, because the caller has done nothing wrong and can do
+nothing about it.
+
+Two properties make that narrow refusal sufficient rather than a half-measure:
+
+- **It drains.** A legacy grant's token still reports normally, so an in-flight
+  admission completes and its record goes terminal — after which the name is
+  servable again with no operator surgery. A global "serve no admissions while
+  any legacy record exists" would need a scan of the whole action space to prove
+  absence, and would freeze exactly the grants that would otherwise clear
+  themselves.
+- **It discloses nothing.** The refusal fires only for a record the caller owns.
+  A foreign legacy admission, or an ordinary action at the same name, falls
+  through to the normal grant and answers exactly as an unused name does —
+  otherwise the refusal would itself be a probe for other principals' legacy
+  admissions.
+
+If the detection cannot answer — the read fails for any reason other than
+absence — the request stops. Granting while unable to rule out a legacy record
+*is* the double grant.
+
+Migration was considered and rejected. Replaying from a legacy record needs a
+comparison that ignores the identity, which weakens `equivalentEnqueue` for
+every caller, and it would still leave the legacy record enumerable through
+dispatch enqueue: that path must tell occupied from absent to be idempotent at
+all, and a legacy admission is indistinguishable by name from an ordinary
+action. So migration buys a subtle replay path and does not close the hole it
+exists for.
+
+**The residual, stated plainly:** while an unresolved legacy admission exists,
+its name remains enumerable through dispatch enqueue, because the reserved
+region cannot recognise an identity that predates it. That is #398's exposure
+over a caller-chosen name, and the remedy is to hold no such records — which is
+the default for anyone upgrading from a release, and which the refusal above
+drives towards for anyone who does.
+
 ### An admission is distinguishable from a dispatch action
 
 `AdmittedEffects` is the marker — an admission is refused before it reaches a

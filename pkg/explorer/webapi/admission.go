@@ -158,6 +158,13 @@ func admissionError(err error) error {
 		errors.Is(err, fleet.ErrAdmissionConflict):
 		return shoal.WrapError(
 			shoal.ErrorConflict, "admission token is not live", err)
+	// Unavailable, not a denial and not a conflict. The caller has done nothing
+	// wrong and cannot fix it; an operator has to drain a record written under
+	// the superseded identity scheme. The message is kept because it is only
+	// ever returned for a record the caller itself owns.
+	case errors.Is(err, fleet.ErrAdmissionUnmigrated):
+		return shoal.WrapError(
+			shoal.ErrorUnavailable, err.Error(), err)
 	default:
 		return fleetDispatchError(err)
 	}

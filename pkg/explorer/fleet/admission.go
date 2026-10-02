@@ -51,6 +51,17 @@ var (
 	// ErrAdmissionConflict reports an admission identity already granted to a
 	// different token.
 	ErrAdmissionConflict = errors.New("fleet admission: admission conflict")
+	// ErrAdmissionUnmigrated reports an admission this caller holds under the
+	// identity scheme that preceded the derived one, which this build cannot
+	// serve without risking a second grant for the same request.
+	//
+	// It is deliberately loud and deliberately not a denial. A denial is a
+	// policy answer the caller should act on; this is an operator's problem,
+	// and the caller can do nothing about it but stop.
+	ErrAdmissionUnmigrated = errors.New(
+		"fleet admission: an admission for this request exists under the " +
+			"superseded identity scheme and must be drained before this " +
+			"request can be served")
 )
 
 // MaxAdmissionDisclosures bounds the corpus references one admission may
@@ -350,6 +361,14 @@ func (s *AdmissionService) Request(
 	if readErr == nil {
 		return s.replay(request, disclosures, current, base, now)
 	}
+	// Nothing at the derived identity. Before granting, rule out an admission
+	// this caller already holds for the same request under the identity scheme
+	// that preceded the derivation, where the caller's own name *was* the
+	// durable key. Granting over one of those is a second live token for work
+	// already permitted, which is the worst outcome this surface has.
+	if err := s.refuseUnmigrated(ctx, decision, request.ID); err != nil {
+		return AdmissionGrant{}, err
+	}
 	// The declaration is checked against what the descriptor permits, resolved
 	// under this decision. The ceiling the executor was bound to is already
 	// enforced inside resolveActionBinding, so an action can neither declare
@@ -372,6 +391,66 @@ func (s *AdmissionService) Request(
 		return AdmissionGrant{}, err
 	}
 	return grantFor(granted, obligations), nil
+}
+
+// refuseUnmigrated refuses a request whose caller already holds an admission
+// for it under the superseded identity scheme.
+//
+// The identity scheme changed under this surface, and the change moved the
+// durable key: an admission written before it lives at the caller's own name,
+// not at the derived one. A request for that name now misses, and granting on a
+// miss would issue a second live token for work the caller was already
+// permitted to do.
+//
+// Refusing is chosen over migrating, and the reasoning is worth keeping.
+// Migrating means recognising the caller's own legacy record and replaying from
+// it, which needs a comparison that ignores the identity — weakening
+// equivalentEnqueue for every caller — and it would still leave the legacy
+// record enumerable through dispatch enqueue, because that path must
+// distinguish occupied from absent to be idempotent at all and a legacy
+// admission is indistinguishable by name from an ordinary action. So migration
+// buys a subtle replay path and does not close the hole it was meant to close.
+//
+// The refusal is narrow on purpose, rather than a global "serve no admissions
+// while any legacy record exists". A global refusal needs a scan of the whole
+// action space to prove absence, and it would strand the very grants it is
+// protecting: a legacy admission's token still reports normally — Report
+// resolves any identity and the marker check admits it — so in-flight grants
+// drain on their own, and refusing the whole surface would prevent exactly
+// that. Narrow refusal plus natural drain empties the window; a global refusal
+// freezes it.
+//
+// Disclosure: the only refusal is for a record this caller owns. A record
+// belonging to someone else, or an ordinary dispatch action, falls through to
+// the normal grant and answers exactly as an absent name does. Refusing on a
+// foreign record would hand a caller the ability to probe names for other
+// principals' legacy admissions, which is the oracle the reserved region closes
+// for everything written since.
+//
+// A read that fails for any other reason stops the request. Granting while
+// unable to rule out a legacy record is the double grant.
+func (s *AdmissionService) refuseUnmigrated(
+	ctx context.Context, decision auth.Decision, supplied []byte,
+) error {
+	legacy, err := s.dispatch.store.GetAction(ctx, supplied)
+	if err != nil {
+		if errors.Is(err, ErrActionNotFound) {
+			return nil
+		}
+		return err
+	}
+	// Only an unresolved one blocks. A terminal legacy record — reported,
+	// failed, or refused — cannot produce a second grant: its token is spent
+	// and its outcome is recorded, so a request for the same name is a new
+	// request and belongs at the derived identity. This is what makes the
+	// window drain rather than latch: report the legacy grant and the name is
+	// servable again, with no operator surgery needed for admissions that were
+	// in flight.
+	if legacy.isAdmission() && !legacy.State.terminal() &&
+		sameActionPrincipal(decision, legacy) {
+		return ErrAdmissionUnmigrated
+	}
+	return nil
 }
 
 // replay answers a request whose admission identity already exists.
@@ -543,7 +622,7 @@ func (s *AdmissionService) commit(
 	return stored, nil
 }
 
-// AdmissionIDPrefix reserves a region of the durable action identity space for
+// admissionIDPrefix reserves a region of the durable action identity space for
 // admissions. No caller may name an action inside it; see enqueue.
 //
 // This is what actually separates an admission from a dispatch action, and the
@@ -556,7 +635,36 @@ func (s *AdmissionService) commit(
 // It begins with a NUL so it cannot collide with an identifier any caller would
 // plausibly choose, and carries its own name so a record dumped from the store
 // says what it is.
-var AdmissionIDPrefix = []byte("\x00shoal.admission\x00")
+//
+// A constant, not a variable. It was an exported []byte, which is mutable
+// global state: another package could reassign it or write through the backing
+// array, changing the derivation and the reservation together at runtime —
+// orphaning every live grant, or removing the enqueue protection outright — and
+// racing with any concurrent request while it did. Nothing outside this package
+// needs to see it, so nothing outside can.
+const admissionIDPrefix = "\x00shoal.admission\x00"
+
+// reservedAdmissionID reports whether an identity names the admission region.
+//
+// Anchored at the start rather than matched anywhere: a substring test would
+// reserve every identity that happens to contain the marker, refusing
+// legitimate names a dispatch caller is entitled to use.
+func reservedAdmissionID(id []byte) bool {
+	return bytes.HasPrefix(id, []byte(admissionIDPrefix))
+}
+
+// admissionRegionEnd is the smallest identity ordered after every admission.
+//
+// The region is contiguous — every admission identity is the prefix followed by
+// a digest, and no other identity may begin with the prefix — so incrementing
+// the prefix's final byte yields a bound that is above all of them and below
+// nothing else. That is what lets a scan step over the whole region in one move
+// instead of one record at a time; see scanDispatchActions.
+func admissionRegionEnd() []byte {
+	end := []byte(admissionIDPrefix)
+	end[len(end)-1]++
+	return end
+}
 
 // admissionActionID derives the durable record identity for a caller-supplied
 // admission name.
@@ -603,12 +711,7 @@ func admissionActionID(decision auth.Decision, supplied []byte) []byte {
 	}
 	writeDispatchTupleField(digest, supplied)
 	return append(
-		append([]byte(nil), AdmissionIDPrefix...), digest.Sum(nil)...)
-}
-
-// reservedAdmissionID reports whether an identity names the admission region.
-func reservedAdmissionID(id []byte) bool {
-	return bytes.HasPrefix(id, AdmissionIDPrefix)
+		append([]byte(nil), admissionIDPrefix...), digest.Sum(nil)...)
 }
 
 // disclosureDigest reduces a canonical declared reference set to the value the

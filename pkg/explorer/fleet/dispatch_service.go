@@ -420,22 +420,44 @@ func (s *DispatchService) ExecuteClaim(ctx context.Context, claimed ActionRecord
 	if err != nil {
 		return ActionRecord{}, err
 	}
+	// Three refusals, all answering object-not-found, because this path had the
+	// enumeration still open: an absent identity came back as the store's own
+	// sentinel and a stored admission as object-not-found, which is two answers
+	// to the question this surface exists to stop answering.
+	//
+	// The first two overlap, and no single mutation of either is observable —
+	// a reserved identity that is absent is caught by the normalisation, and a
+	// reserved identity that is stored is caught by the marker. They are both
+	// kept because they cover different inputs once you look past that case.
+	// The reserved check means such an identity never reaches the store at all,
+	// so there is no read and nothing to time. The normalisation is the only
+	// one that covers an *unreserved* absent identity against an unreserved
+	// stored admission, which is the pre-prefix pair below. Removing both is
+	// caught; TestExecuteClaimAnswersAlikeForAReservedIdentity pins the pair
+	// and the unprefixed pair separately.
+	if reservedAdmissionID(claimed.ID) {
+		return ActionRecord{}, auth.ObjectNotFound()
+	}
 	current, err := s.store.GetAction(ctx, claimed.ID)
 	if err != nil {
+		if errors.Is(err, ErrActionNotFound) {
+			return ActionRecord{}, auth.ObjectNotFound()
+		}
 		return ActionRecord{}, err
 	}
-	// The same refusal Claim, Cancel and CompleteClaim make, on the path that
-	// had been missed. ExecuteClaim is exported and terminal, and it takes the
-	// record rather than loading it from an ID, so a grant holder could
-	// synthesise one: it knows the ID, the token, the version, the action
-	// fields and the deadline, and that a fresh grant sits at fence one. The
-	// record it passes is then checked against the store, which agrees, and an
-	// execution result lands on the admission with none of the report checks.
+	// The marker check stays, and it is not redundant with the prefix check
+	// above. An admission written before identities carried the prefix has an
+	// unprefixed identity that nothing can recognise by name — only the durable
+	// marker names it — so the prefix check alone would let exactly those
+	// records through. Any environment that ran the admission surface before
+	// this change holds them.
 	//
-	// Placed after the load rather than against the argument, so it is the
-	// stored record that decides. A caller supplying a fabricated record that
-	// merely omits the marker is refused by the comparisons below; a caller
-	// naming a real admission is refused here.
+	// Read from the stored record rather than the argument, so a caller that
+	// fabricates a record with the marker stripped does not dodge it. That
+	// matters here more than on the other paths: ExecuteClaim takes the record
+	// instead of loading it from an ID, and a grant holder knows the ID, the
+	// token, the version, the action fields and the deadline, and that a fresh
+	// grant sits at fence one.
 	if current.isAdmission() {
 		return ActionRecord{}, auth.ObjectNotFound()
 	}
@@ -998,7 +1020,20 @@ func (s *DispatchService) TeamActions(
 	var continuation []byte
 	const maxDiscoveryScans = 4096
 	for scanned := 0; scanned < maxDiscoveryScans; scanned++ {
-		page, scanErr := s.store.ScanActions(ctx, cursor, 1)
+		// Admissions are excluded here, and by the scan rather than by a filter
+		// in this loop. TeamActions deliberately does not require the reader to
+		// be the action's principal — that is what makes it a team view — so an
+		// admission reaching it is handed to another caller along with what its
+		// owner declared, the digest of the references it named, and the bitmap
+		// of the ones it was obliged to withhold.
+		//
+		// A filter here was the first attempt and it disabled this surface. It
+		// skipped the cursor advance at the bottom of the loop, so the first
+		// admission was rescanned four thousand times and nothing past it was
+		// ever reached — and admission identities sort first, so that was every
+		// deployment with one grant. scanDispatchActions steps over the region
+		// instead, which cannot interact with this loop's control flow at all.
+		page, scanErr := s.scanDispatchActions(ctx, cursor, 1)
 		if scanErr != nil {
 			return ActionPage{}, scanErr
 		}
@@ -1006,20 +1041,12 @@ func (s *DispatchService) TeamActions(
 			return result, nil
 		}
 		record := page.Actions[0]
-		// The fifth path, and the only one of them with a cross-principal
-		// consequence. TeamActions deliberately does not require the reader to
-		// be the action's principal — that is what makes it a team view — so
-		// without this an admission belonging to one caller is handed to
-		// another with team-overview authority, carrying what that caller
-		// declared, the digest of the references it named, and the bitmap of
-		// the ones it was obliged to withhold.
-		//
-		// A team overview shows work agents are doing. An admission is one
-		// principal's pre-call decision, and it already has a listing surface
-		// that is principal-scoped.
-		if record.isAdmission() {
-			continue
-		}
+		// Advanced before anything can return or skip. It was at the bottom,
+		// which is what let a `continue` strand it; a cursor that only moves on
+		// the fall-through path is a cursor that stops moving the first time
+		// someone adds an early exit.
+		next := append([]byte(nil), page.Next...)
+		cursor = next
 		visible := containsByteValue(sources, record.SourceID) &&
 			containsByteValue(policies, record.PolicyID) &&
 			containsIDValue(objects, record.ObjectID) &&
@@ -1040,12 +1067,11 @@ func (s *DispatchService) TeamActions(
 				return result, nil
 			}
 			result.Actions = append(result.Actions, cloneActionRecord(record))
-			continuation = append([]byte(nil), page.Next...)
+			continuation = append([]byte(nil), next...)
 		}
-		if len(page.Next) == 0 {
+		if len(next) == 0 {
 			return result, nil
 		}
-		cursor = page.Next
 	}
 	result.Next = append([]byte(nil), cursor...)
 	return result, nil
@@ -1084,6 +1110,71 @@ func containsByteValue(values [][]byte, value []byte) bool {
 	return index < len(values) && bytes.Equal(values[index], value)
 }
 
+// scanDispatchActions scans committed actions for a surface that must not see
+// admissions, stepping over the admission region in one move rather than one
+// record at a time.
+//
+// Filtering admissions out inside a bounded scan was the first attempt and it
+// broke the listings it was protecting. A per-record skip spends the caller's
+// scan budget on records it can never be shown, and because the admission
+// region sorts before essentially every ordinary identity, the admissions come
+// first — so a deployment with more admissions than the budget gets an empty
+// page forever, having done the maximum possible work to produce it. One
+// admission per model call makes that the normal case, not an edge.
+//
+// The region is contiguous, which is the property that makes this cheap: when a
+// scan lands inside it, the cursor jumps to admissionRegionEnd and the whole
+// region is behind us in a single step, however many admissions it holds.
+//
+// Records whose identity predates the prefix are still filtered one at a time.
+// They are indistinguishable by identity — only the durable marker names them —
+// and they cost what any record invisible to a caller costs. The jump makes
+// every admission written from here on free; it cannot retroactively make the
+// earlier ones contiguous.
+func (s *DispatchService) scanDispatchActions(
+	ctx context.Context, after []byte, limit int,
+) (ActionPage, error) {
+	// One mechanism, applied at the top: a cursor inside the region becomes the
+	// bound just past it. That covers both ways a scan meets the region — a
+	// caller's cursor already pointing into it, and a scan that advanced into
+	// it — because the advance below hands the next attempt a cursor to
+	// normalise rather than jumping on its own. Two separate jumps was the
+	// first shape, and neither was individually observable: each masked the
+	// other.
+	//
+	// Two attempts at most. One page can be entirely admissions, and after the
+	// normalisation the cursor is past every one of them, so a third attempt
+	// could not differ. The final return carries the last attempt's cursor, so
+	// a caller whose page was filled by admissions the region cannot hold —
+	// those written before identities carried the prefix — pages onward rather
+	// than being told the scan is finished.
+	var result ActionPage
+	for attempt := 0; attempt < 2; attempt++ {
+		if reservedAdmissionID(after) {
+			after = admissionRegionEnd()
+		}
+		page, err := s.store.ScanActions(ctx, after, limit)
+		if err != nil {
+			return ActionPage{}, err
+		}
+		result = ActionPage{
+			Next:    append([]byte(nil), page.Next...),
+			Actions: make([]ActionRecord, 0, len(page.Actions)),
+		}
+		for _, record := range page.Actions {
+			if record.isAdmission() {
+				continue
+			}
+			result.Actions = append(result.Actions, record)
+		}
+		if len(result.Actions) > 0 || len(page.Actions) == 0 {
+			return result, nil
+		}
+		after = page.Actions[len(page.Actions)-1].ID
+	}
+	return result, nil
+}
+
 func (s *DispatchService) Pull(ctx context.Context, request PullActionsRequest) (ActionPage, error) {
 	ctx, cancel := s.deadline(ctx, request.Context)
 	defer cancel()
@@ -1094,20 +1185,18 @@ func (s *DispatchService) Pull(ctx context.Context, request PullActionsRequest) 
 	if request.Limit <= 0 || request.Limit > MaxDispatchListResults {
 		return ActionPage{}, shoal.NewError(shoal.ErrorInvalidArgument, "dispatch pull limit is outside its bound")
 	}
-	page, err := s.store.ScanActions(ctx, request.After, request.Limit)
+	// An admission is never work a dispatch worker may take. It is only ever
+	// claimed, and this loop returns a claimed record whose lease has lapsed —
+	// which for an admission is not work waiting to be redone but a grant
+	// nobody came back to report on. Claim refuses it anyway; scanning past the
+	// region keeps it out of the listing that would otherwise offer it, and
+	// keeps it from consuming the page a worker asked for.
+	page, err := s.scanDispatchActions(ctx, request.After, request.Limit)
 	if err != nil {
 		return ActionPage{}, err
 	}
 	result := ActionPage{Next: append([]byte(nil), page.Next...)}
 	for _, record := range page.Actions {
-		// An admission is never work a dispatch worker may take. It is only
-		// ever claimed, and this loop returns a claimed record whose lease has
-		// lapsed — which for an admission is not work waiting to be redone but
-		// a grant nobody came back to report on. Claim refuses it anyway; this
-		// keeps it out of the listing that would otherwise offer it.
-		if record.isAdmission() {
-			continue
-		}
 		if record.State != DispatchQueued &&
 			!(record.State == DispatchClaimed && !now.Before(record.ClaimLeaseUntil)) {
 			continue
