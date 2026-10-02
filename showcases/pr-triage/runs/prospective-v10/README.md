@@ -65,8 +65,11 @@ labels are relevance assessments, not defect truth or full-PR review parity.
   stop further spending for reconciliation. The runner trusts provider-reported
   costs and CLI budget enforcement; it is not a billing-system spending lock.
 - `evaluate_prospective.py`: source/prompt/model identity checks, exact label
-  coverage, separate-assessor metrics, exact development-overlap strata and
-  unconditional full-review behavior. No consensus label is fabricated.
+  coverage, separate-assessor and temporal-cohort metrics, exact development-overlap
+  strata and unconditional full-review behavior. Code features and reported sizes
+  are reconstructed from sampled source. The pinned CPU replay recomputes scores
+  and dispositions before evaluation; a rehashed score file is insufficient.
+  Priced calls must have settled ledger entries. No consensus label is fabricated.
 
 The original protocol also caps the experiment at eight calls. Four remain,
 independently of the unspent dollar allowance. We will not silently increase
@@ -97,7 +100,10 @@ python showcases/pr-triage/evaluate_prospective.py \
   --output /tmp/v10-new-evaluation
 ```
 
-This command makes no paid calls. Compare its report identity to `report.json`.
+This command recomputes the frozen CPU model and makes no paid calls. Compare
+its report identity to `report.json`. The archive retains the original report;
+the current report adds temporal strata and verification metadata while preserving
+all original measurements and costs.
 The mutable budget database is retained for recovery; never create a fresh
 budget ledger for another batch in this experiment. The initial local
 registration is a Git receipt, not a trusted-server timestamp attestation.

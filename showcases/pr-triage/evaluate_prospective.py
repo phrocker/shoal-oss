@@ -12,6 +12,7 @@ from paid_review import micros, receipt
 import prepare_references
 import paid_review
 from prospective_snapshot import validate_observation_order
+from verify_prospective_scores import validate_inputs, verify_scores
 
 
 def assessment(root,manifest,protocol,pass_name,batches):
@@ -69,7 +70,10 @@ def read_budget(root,protocol,refs):
             if cid not in rows or rows[cid]['prompt_sha256']!=call['prompt_sha256']:
                 raise ValueError('assessed call absent from budget or prompt mismatch')
             row=rows[cid]
+            raw=json.loads((root/'calls'/cid/'response.json').read_text())
             if row['status']=='reserved':
+                if 'total_cost_usd' in raw:
+                    raise ValueError('priced response requires settled budget entry')
                 if row['charged_microusd']!=micros(protocol['budget']['call_reservation_usd']):
                     raise ValueError('unpriced call lost its reservation')
             else:
@@ -116,6 +120,21 @@ def validate_prompts(root,manifest,protocol,batches):
             raise ValueError('noncanonical reference prompt')
 
 
+def temporal_groups(manifest,picture):
+    families={c['pr'] for c in manifest['cases']}
+    coverage=picture['coverage']
+    if unique_ids([c['family'] for c in coverage],'coverage families')!=families:
+        raise ValueError('temporal coverage membership mismatch')
+    strata={c['family']:c['stratum'] for c in coverage}
+    if set(strata.values())-{'existing_at_registration','created_after_registration'}:
+        raise ValueError('unknown temporal stratum')
+    result={}
+    for case in manifest['cases']:
+        group=result.setdefault(strata[case['pr']],{'families':[],'ids':set()})
+        group['families'].append(case['pr']);group['ids'].update(u['id'] for u in case['units'])
+    return result
+
+
 def main():
     p=argparse.ArgumentParser(description=__doc__)
     for k in ('run','protocol','model','development','output'):p.add_argument('--'+k,type=Path,required=True)
@@ -134,6 +153,8 @@ def main():
     ids=validate_membership(manifest,picture,inputs,predictions)
     if picture['protocol_id']!=protocol['id'] or manifest['picture_id']!=picture['id'] or batches['protocol_id']!=protocol['id'] or batches['manifest_id']!=manifest['id']:
         raise ValueError('snapshot/prompt provenance mismatch')
+    validate_inputs(manifest,inputs,model)
+    verify_scores(root,a.model,predictions)
     validate_prompts(root,manifest,protocol,batches)
     bodies={h for r in dev['rows'] for h in r['target_body_sha256']};diffs={r['diff_state_sha256'] for r in dev['rows']}
     overlap={r['unit_id'] for r in inputs['rows'] if set(r['target_body_sha256'])&bodies or r['diff_state_sha256'] in diffs}
@@ -142,21 +163,29 @@ def main():
         ref=assessment(root,manifest,protocol,pass_name,batches);refs[pass_name]=ref
         labels={r['unit_id']:r['label'] for r in ref['records']}
         results[pass_name]={'all':metric(labels,predictions,ids,inputs),'without_exact_development_overlap':metric(labels,predictions,ids-overlap,inputs)}
+    strata={}
+    for name,group in temporal_groups(manifest,picture).items():
+        strata[name]={'families':group['families'],'assessments':{}}
+        for assessor,ref in refs.items():
+            labels={r['unit_id']:r['label'] for r in ref['records']}
+            strata[name]['assessments'][assessor]={'all':metric(labels,predictions,group['ids'],inputs),
+                'without_exact_development_overlap':metric(labels,predictions,group['ids']-overlap,inputs)}
     la={r['unit_id']:r['label'] for r in refs['a']['records']};lb={r['unit_id']:r['label'] for r in refs['b']['records']}
     disagreements=sorted(i for i in ids if la[i]!=lb[i]);reasons=[];families=len(manifest['cases']);gate=protocol['evaluation']
-    if families<gate['minimum_families']:reasons.append('Insufficient family count')
-    for name,result in results.items():
-        # Exact training duplicates cannot establish novel-case quality.
-        m=result['without_exact_development_overlap']
-        if m['positive']<gate['minimum_positive_count_per_assessor']:reasons.append(name+': insufficient novel positives')
-        if m['recall'] is None or m['recall']<gate['minimum_recall'] or m['unknown_lowered_ids']:reasons.append(name+': quality gate unmet')
+    for stratum,group in strata.items():
+        if len(group['families'])<gate['minimum_families']:reasons.append(stratum+': insufficient family count')
+        for name,result in group['assessments'].items():
+            m=result['without_exact_development_overlap']
+            if m['positive']<gate['minimum_positive_count_per_assessor']:reasons.append(stratum+'/'+name+': insufficient novel positives')
+            if m['recall'] is None or m['recall']<gate['minimum_recall'] or m['unknown_lowered_ids']:reasons.append(stratum+'/'+name+': quality gate unmet')
     budget=read_budget(root,protocol,refs)
     out={'protocol_id':protocol['id'],'picture_id':picture['id'],'manifest_id':manifest['id'],'model_id':model['id'],
         'prediction_id':predictions['id'],'assessment_ids':{name:ref['id'] for name,ref in refs.items()},'assessments':results,'disagreement_ids':disagreements,'exact_development_overlap_ids':sorted(overlap),
-        'family_count':families,'budget':budget,'status':'hold' if reasons else 'shadow_evidence_only','reasons':reasons,
+        'temporal_strata':strata,'aggregate_metrics_scope':'Descriptive totals only; quality gates applied separately per temporal stratum.',
+        'scores_recomputed':True,'family_count':families,'budget':budget,'status':'hold' if reasons else 'shadow_evidence_only','reasons':reasons,
         'real_action':'full_review','optimization_enabled':False,
         'limitations':['Same-provider repeated assessments are correlated, not two independent model families.',
-          'Existing-at-registration PR; prospective labeling does not establish future-created-PR generalization.',
+          'Temporal strata present: '+', '.join(sorted(strata))+'. Existing snapshots do not establish future-created-PR generalization.',
           'Only sampled functions assessed; no full-PR defect recall or downstream token savings measured.',
           'Exact hashes do not detect near-duplicates or policy-family dependence.']}
     out['id']=digest(out);a.output.mkdir()

@@ -1,4 +1,5 @@
 {
+  "aggregate_metrics_scope": "Descriptive totals only; quality gates applied separately per temporal stratum.",
   "assessment_ids": {
     "a": "19e665ced42cd727d95ea4875855fc3fda75c9aa09dd1ed70b9ed0b590890ebd",
     "b": "b17d5edd40df00595be225e4b400915fa11122d9ebdf1b842fb526c9c7fdfb62"
@@ -111,10 +112,10 @@
     "fe52e6f4fa35f28b02753bca3acee8d81ffd38cff943ee4ae2d706117a493846"
   ],
   "family_count": 1,
-  "id": "158437a074e483803dc14531a8c6b164a0e08d8fb656552ea2cdab0895dee7eb",
+  "id": "af02dd069ee5bd14e2ced81cfa3f038ee52986de2632cd6e13bbd8f8caf119fa",
   "limitations": [
     "Same-provider repeated assessments are correlated, not two independent model families.",
-    "Existing-at-registration PR; prospective labeling does not establish future-created-PR generalization.",
+    "Temporal strata present: existing_at_registration. Existing snapshots do not establish future-created-PR generalization.",
     "Only sampled functions assessed; no full-PR defect recall or downstream token savings measured.",
     "Exact hashes do not detect near-duplicates or policy-family dependence."
   ],
@@ -126,9 +127,71 @@
   "protocol_id": "7602a628b97b3811bcf4af43857661d5fa75ba6dff186ec46e2a380d592ea27e",
   "real_action": "full_review",
   "reasons": [
-    "Insufficient family count",
-    "a: insufficient novel positives",
-    "b: insufficient novel positives"
+    "existing_at_registration: insufficient family count",
+    "existing_at_registration/a: insufficient novel positives",
+    "existing_at_registration/b: insufficient novel positives"
   ],
-  "status": "hold"
+  "scores_recomputed": true,
+  "status": "hold",
+  "temporal_strata": {
+    "existing_at_registration": {
+      "assessments": {
+        "a": {
+          "all": {
+            "lower_priority_ids": [],
+            "missed_ids": [],
+            "positive": 15,
+            "proposed_lower_priority_source_bytes": 0,
+            "proposed_source_byte_reduction": 0.0,
+            "recall": 1.0,
+            "retained_positive": 15,
+            "source_bytes": 96463,
+            "units": 24,
+            "unknown_lowered_ids": []
+          },
+          "without_exact_development_overlap": {
+            "lower_priority_ids": [],
+            "missed_ids": [],
+            "positive": 10,
+            "proposed_lower_priority_source_bytes": 0,
+            "proposed_source_byte_reduction": 0.0,
+            "recall": 1.0,
+            "retained_positive": 10,
+            "source_bytes": 54541,
+            "units": 14,
+            "unknown_lowered_ids": []
+          }
+        },
+        "b": {
+          "all": {
+            "lower_priority_ids": [],
+            "missed_ids": [],
+            "positive": 15,
+            "proposed_lower_priority_source_bytes": 0,
+            "proposed_source_byte_reduction": 0.0,
+            "recall": 1.0,
+            "retained_positive": 15,
+            "source_bytes": 96463,
+            "units": 24,
+            "unknown_lowered_ids": []
+          },
+          "without_exact_development_overlap": {
+            "lower_priority_ids": [],
+            "missed_ids": [],
+            "positive": 10,
+            "proposed_lower_priority_source_bytes": 0,
+            "proposed_source_byte_reduction": 0.0,
+            "recall": 1.0,
+            "retained_positive": 10,
+            "source_bytes": 54541,
+            "units": 14,
+            "unknown_lowered_ids": []
+          }
+        }
+      },
+      "families": [
+        415
+      ]
+    }
+  }
 }
