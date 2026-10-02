@@ -1024,9 +1024,18 @@ func (s *DispatchService) TeamActions(
 		// A filter here was the first attempt and it disabled this surface. It
 		// skipped the cursor advance at the bottom of the loop, so the first
 		// admission was rescanned four thousand times and nothing past it was
-		// ever reached — and admission identities sort first, so that was every
-		// deployment with one grant. scanDispatchActions steps over the region
-		// instead, which cannot interact with this loop's control flow at all.
+		// ever reached — and admission identities sorted first back then, so
+		// that was every deployment with one grant. scanDispatchActions drops
+		// them instead, where it cannot interact with this loop's control flow
+		// at all.
+		//
+		// The budget below is affordable because the span is maximal, so this
+		// loop reaches every ordinary record before the first admission and
+		// spends nothing on them until there is nothing else left to find. The
+		// exception is an ordinary action stored inside the span before it was
+		// reserved, which sorts among the admissions; a deployment holding one
+		// is exactly the deployment ErrAdmissionSpanOccupied is refusing
+		// admission to until an operator clears it.
 		page, scanErr := s.scanDispatchActions(ctx, cursor, 1)
 		if scanErr != nil {
 			return ActionPage{}, scanErr
@@ -1127,14 +1136,25 @@ func containsByteValue(values [][]byte, value []byte) bool {
 // where its identity happens to sort.
 //
 // The jump existed to keep a caller's scan budget off admissions, which sorted
-// first. They sort last now, so the budget concern goes with the jump: a
-// listing reaches real work before it meets an admission, and only a caller
-// paging to the very end filters through them — having already been given
-// everything it asked for.
+// first. The budget concern goes with the jump because admissions now sort
+// after every ordinary identity, and that holds exactly rather than nearly:
+// admissionIDPrefix is maximal — every byte 0xff — so any identity outside the
+// span differs from it at a byte that is necessarily smaller and sorts below
+// the whole of it. A merely high prefix is not enough. When the span was
+// "\xffshoal.admission\x00" an ordinary \xff\xff sorted above every
+// admission, so a caller paging toward it spent the budget on grants first and
+// a large enough tail of them starved it outright — the same outage the jump
+// was covering for, reached from the other end.
 //
-// A page can still filter down to nothing, at that tail or wherever an
-// admission happens to sit, and the cursor is returned so the caller pages on.
-// An empty page is not an exhausted scan; only an empty continuation is.
+// What remains is a caller paging to the very end, which filters through the
+// span having already been given everything it asked for, and an ordinary
+// action stored inside the span before it was reserved, which sorts among the
+// admissions rather than below them. The second is the deployment
+// ErrAdmissionSpanOccupied refuses admission to.
+//
+// A page can still filter down to nothing at that tail, and the cursor is
+// returned so the caller pages on. An empty page is not an exhausted scan; only
+// an empty continuation is.
 func (s *DispatchService) scanDispatchActions(
 	ctx context.Context, after []byte, limit int,
 ) (ActionPage, error) {
@@ -1168,9 +1188,13 @@ func (s *DispatchService) Pull(ctx context.Context, request PullActionsRequest) 
 	// An admission is never work a dispatch worker may take. It is only ever
 	// claimed, and this loop returns a claimed record whose lease has lapsed —
 	// which for an admission is not work waiting to be redone but a grant
-	// nobody came back to report on. Claim refuses it anyway; scanning past the
-	// region keeps it out of the listing that would otherwise offer it, and
-	// keeps it from consuming the page a worker asked for.
+	// nobody came back to report on. Claim refuses it anyway; dropping it in
+	// the scan keeps it out of the listing that would otherwise offer it.
+	//
+	// This surface does not refill a page the filter emptied, so an admission
+	// ahead of ordinary work would cost a worker an empty page and a retry per
+	// grant. It cannot be ahead of any: the span is maximal, so every ordinary
+	// identity sorts below every admission.
 	page, err := s.scanDispatchActions(ctx, request.After, request.Limit)
 	if err != nil {
 		return ActionPage{}, err

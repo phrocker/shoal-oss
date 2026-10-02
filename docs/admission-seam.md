@@ -116,7 +116,7 @@ could compute the victim's derived ID, submit it to dispatch enqueue as an
 ordinary action ID, and read occupancy off conflict versus success. It could
 also squat an unheld one and deny the victim its own admission by name.
 
-**A reserved namespace makes them unreachable.** `admissionIDNamespace` marks a
+**A reserved namespace makes them unreachable.** `admissionIDPrefix` marks a
 span of the action identity space that no caller may name. `enqueue` refuses it
 unconditionally — before the store is read, and regardless of what is there —
 and that is the only place the refusal is needed, because enqueue is the one
@@ -124,12 +124,42 @@ entry point at which a caller names a durable action it does not already own.
 Every other path takes an identity it must already hold and answers a foreign
 or absent one identically.
 
-The span begins with `0xff` so admissions sort after essentially every ordinary
-identity. That placement is load-bearing: it is what lets the listings exclude
-admissions by their durable marker alone. An earlier version put the span first
-and had the listings jump over the key range to keep their scan budget off it —
-a jump that necessarily skipped anything *else* in the range, including an
-ordinary action stored there before the span was reserved at all.
+**Every byte of the span is `0xff`, and that is a correctness requirement.**
+The listings exclude admissions by their durable marker and keep no scan budget
+off them by position, which is only affordable if a scan meets every ordinary
+record before the first admission. A prefix delivers that if and only if it is
+*maximal* — every byte `0xff` — because only then does any identity outside the
+span differ from it at a byte that is necessarily smaller, and so sort below
+the whole span.
+
+Two earlier versions each got this wrong in the opposite direction. The first
+put the span at the *bottom* of the key space and had the listings jump over
+the key range to keep their scan budget off it — a jump that necessarily
+skipped anything *else* in the range, including an ordinary action stored there
+before the span was reserved at all. The second moved the span to
+`\xffshoal.admission\x00`, which stopped admissions sorting first without
+making them sort last: `'s'` leaves every byte above it free, so an ordinary
+`\xff\xff` sorted *after* every admission in the store. `Pull` does not refill
+a page its filter empties, so a worker got an empty page and a cursor for as
+long as the admission tail lasted, and `TeamActions` spent its bounded
+discovery budget before reaching the action at all — the same listing outage
+the move to `0xff` was meant to end, reached from the other end of the span.
+One byte of `0xff` was enough to stop admissions sorting first. It was not
+enough to make them sort last.
+
+**The span is four bytes wide, and the width is a rollout budget, not a
+secret.** Maximality fixes the ordering at any width, so width trades only
+against the second rollout condition below: a pre-existing ordinary action
+inside the span blocks the issuing of new admissions until an operator clears
+it. Action identities are opaque bytes with no charset rule, so a client
+minting random ones puts 1-in-256 of them under a one-byte span — enough that
+admission would refuse to start on a sizable store, and live dispatch records
+cannot always be deleted to unblock it. Four bytes makes that 1-in-2^32, under
+one expected collision in a store of a billion random identities. A longer span
+would not be more private, only less likely to be already occupied.
+
+The span also carries no readable tag inside it. A tag invites reading meaning
+back out of the identifier, which is the mistake three review rounds were.
 
 **The span says nothing about what a record is.** It is a forward rule about
 what may be created, not a classifier. Reachability, ownership and identity
@@ -214,13 +244,23 @@ even if the verdict were somehow passed.
 identities are arbitrary non-empty bytes and always have been, so the span was
 a legal place to store an ordinary action long before it was reserved — and
 unlike legacy *admissions*, which no release contains, such a record can exist
-in a store upgraded from `v1.3.0`. Nothing silently mishandles one: the listings
-exclude admissions by marker rather than by range, and `ExecuteClaim` no longer
-refuses an identity for its shape, so such an action stays listed, claimable
-and executable. What stays broken is narrow — `enqueue` refuses the span
-unconditionally, so the action cannot be enqueue-replayed and its idempotent
-retry fails. `ErrAdmissionSpanOccupied` reports it, separately from the legacy
-condition because the remedy differs.
+in a store upgraded from `v1.3.0`. The collision surface is every action
+identity beginning with four `0xff` bytes. An operator can enumerate it with a
+single range scan, and for a client minting text or UUID identities the set is
+empty by construction, because `0xff` is not a byte either produces.
+
+Nothing silently mishandles such a record: the listings exclude admissions by
+marker rather than by range, and `ExecuteClaim` no longer refuses an identity
+for its shape, so the action stays listed, claimable and executable. Two things
+are narrower than full service. `enqueue` refuses the span unconditionally, so
+the action cannot be enqueue-replayed and its idempotent retry fails. And
+because it sorts *among* the admissions rather than below them, a listing
+reaches it only after paging through every grant in the store — within
+`TeamActions`' discovery budget while the admission tail is small, and not
+beyond it. That is the one case the maximality argument above does not cover,
+and it is exactly the deployment `ErrAdmissionSpanOccupied` refuses to issue
+new admissions to until an operator clears the span. It is reported separately
+from the legacy condition because the remedy differs.
 
 **What still works while the verdict is dirty.** `Report` and `Outstanding`
 deliberately do not consult it. A grant already issued must stay reportable, or

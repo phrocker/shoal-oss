@@ -676,7 +676,7 @@ func (s *AdmissionService) commit(
 	return stored, nil
 }
 
-// admissionIDPrefix reserves a span of the durable action identity space for
+// admissionIDPrefix reserves the top of the durable action identity space for
 // admissions. No caller may name an action inside it; see enqueue.
 //
 // This is what separates an admission from a dispatch action on the way in, and
@@ -690,26 +690,44 @@ func (s *AdmissionService) commit(
 // and the distinction cost three review rounds: ownership was once inferred
 // from a record with no domain, identity scheme from an identity that was
 // caller-chosen, and reachability from a span that predates the reservation.
-// The span is a forward rule about creation, nothing more.
+// The span is a forward rule about creation, nothing more. That is also why it
+// carries no readable tag: a tag inside the identifier is an invitation to read
+// meaning back out of it, which is the mistake those three rounds were.
 //
-// It begins with 0xff so admissions sort after essentially every ordinary
-// identity, and that placement is load-bearing. The span used to begin with
-// NUL, which put admissions first, and the listings kept their scan budget off
-// them by jumping the key range — a jump that necessarily skipped anything else
-// in the range, including an ordinary action stored there before the span was
-// reserved at all. Sorting admissions last means a listing reaches real work
-// before it meets one, so nothing has to be skipped by position and filtering
-// on the marker is both correct and cheap.
+// Every byte is 0xff, and that is the whole correctness requirement. The
+// listings filter admissions out by marker and keep no budget off them by
+// position, which is only affordable if a scan meets every ordinary record
+// before it meets an admission. A prefix delivers that if and only if it is
+// maximal — every byte 0xff — because then any unreserved key differs from it
+// at some byte that is necessarily smaller, and so sorts below the entire span.
+// The span was briefly "\xffshoal.admission\x00", which is *not* maximal: 's'
+// leaves 0x74..0xff above it, so an ordinary \xff\xff sorted after every
+// admission and a large admission tail starved it. One byte of 0xff was enough
+// to stop admissions sorting first; it was not enough to make them sort last.
+//
+// Four bytes, not one. Maximality fixes the ordering at any width, so width
+// trades only against the rollout gate below: a pre-existing ordinary action
+// inside the span blocks admission until an operator clears it, and the span
+// was a legal dispatch name space before this release. Action identities are
+// opaque bytes with no charset rule, so a client minting random ones puts
+// 1-in-256 of them under a one-byte span — enough that admission would refuse
+// to start on a sizable store, and live dispatch records cannot always be
+// deleted to unblock it. Four bytes makes that 1-in-2^32, under one expected
+// collision in a store of a billion random identities, while reserving exactly
+// as much of the top of the key space as the ordering argument needs. Length
+// here is a collision budget, not a secret: a longer span is not more private,
+// only less likely to be already occupied.
 //
 // A constant, not a variable. It was once an exported []byte, which is mutable
 // global state: another package could reassign it or write through the backing
 // array, changing the derivation and the reservation together at runtime, and
 // racing with any concurrent request while it did.
 //
-// One constant, not a namespace with a prefix inside it. That split existed to
-// keep a scan's exclusive upper bound within the reservation; the bound went
-// with the jump, and the spare byte bought nothing any test could observe.
-const admissionIDPrefix = "\xffshoal.admission\x00"
+// One constant for the reservation and the derivation both. Two would have to
+// agree about which keys dispatch refuses and which keys Request mints, and a
+// derivation narrower than the reservation mints names dispatch is entitled to
+// refuse.
+const admissionIDPrefix = "\xff\xff\xff\xff"
 
 // reservedAdmissionID reports whether an identity falls in the reserved span.
 //

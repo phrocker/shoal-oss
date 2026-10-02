@@ -1633,6 +1633,31 @@ func TestAdmissionIDSeparatesEveryPrincipalComponent(t *testing.T) {
 				t, "domain", "owner", "actor", "client", []shoal.ID{"a"}),
 			rightName: "bc",
 		},
+		// The chain is written entry by entry, so the join between two of its
+		// entries is a boundary as well, and "each adjacent pair" above skipped
+		// it. Only the last entry's join to the supplied name was covered, and
+		// that one stays green while the supplied name is framed — so dropping
+		// the frame from chain entries collided two delegated principals with
+		// the matrix still passing. Identity collision is the one thing this
+		// derivation exists to prevent.
+		//
+		// The chain's other join, from the client ID into the first entry, is
+		// deliberately absent: the client ID carries its own frame, so the two
+		// sides differ there before the chain is reached whatever the chain
+		// does, and the case cannot fail. actor/client covers the client ID's
+		// framing. A case with no failure mode of its own would read as
+		// coverage without being any.
+		{
+			name: "delegation/delegation",
+			leftDecision: principalDecision(
+				t, "domain", "owner", "actor", "client",
+				[]shoal.ID{"ab", "c"}),
+			leftName: "name",
+			rightDecision: principalDecision(
+				t, "domain", "owner", "actor", "client",
+				[]shoal.ID{"a", "bc"}),
+			rightName: "name",
+		},
 	} {
 		t.Run("framing/"+test.name, func(t *testing.T) {
 			left := admissionActionID(
@@ -2278,8 +2303,10 @@ func TestAdmissionsSortAfterOrdinaryWork(t *testing.T) {
 	queued := harness.enqueueDispatchAction(t, "zzz-last-ordinary")
 
 	// One page of one, from the start: the ordinary action comes back even
-	// though it sorts after every other ordinary identity, because admissions
-	// are below none of them.
+	// though it sorts after every other ordinary identity in this fixture,
+	// because admissions are below none of them. A text identity only shows
+	// that much — 0xff beats every letter, so the high end of the identity
+	// space needs its own test, which is TestOrdinaryWorkAtTheTopOfTheKeySpace.
 	harness.store.scans = 0
 	page, err := harness.dispatch.scanDispatchActions(
 		context.Background(), nil, 1)
@@ -2293,6 +2320,125 @@ func TestAdmissionsSortAfterOrdinaryWork(t *testing.T) {
 	// And it cost one read, with no range skipping involved.
 	if harness.store.scans != 1 {
 		t.Fatalf("one page cost %d reads", harness.store.scans)
+	}
+}
+
+// identityJustBelowTheSpan returns a nameable action identity that sorts above
+// every other identity in these fixtures and immediately below the reserved
+// span: the prefix with its final byte decremented.
+//
+// Not padded out to the greatest nameable identity, because padding cannot
+// change which side of the span it falls on and the padded form overruns the
+// idempotency key bound. What this has to be is high enough that no ordinary
+// identity in the store sorts above it, so that if admissions can sort below
+// anything, they sort below this.
+func identityJustBelowTheSpan() []byte {
+	id := []byte(admissionIDPrefix)
+	id[len(id)-1]--
+	return id
+}
+
+// TestOrdinaryWorkAtTheTopOfTheKeySpace is the case a high prefix passes and
+// only a maximal one survives.
+//
+// The span was "\xffshoal.admission\x00", which stopped admissions sorting
+// first but did not make them sort last: 's' leaves every byte above it free,
+// so an ordinary \xff\xff sorted after every admission in the store. Pull does
+// not refill a page its filter emptied, so a worker asking for four records got
+// an empty page and a cursor for as long as the admissions lasted, and
+// TeamActions spent its bounded discovery budget before reaching the action at
+// all. Both are the listing outage that moving the span to 0xff was supposed to
+// end, reached from the other end of the span.
+//
+// The fixture identity is computed from the span rather than written out,
+// because which identity is the worst case depends on the span. \xff\xff is
+// the reviewer's example and is the right probe for a four-byte span; under a
+// one-byte span it is itself reserved, so a literal would fail this test by
+// becoming un-enqueueable — reporting a change in the span's width as an
+// ordering defect. Deriving it keeps the test about ordering alone.
+func TestOrdinaryWorkAtTheTopOfTheKeySpace(t *testing.T) {
+	harness := newAdmissionHarness(t, nil)
+	// More admissions than the page any caller below asks for, so a span that
+	// sorts them ahead of the action starves the request rather than merely
+	// reordering it.
+	for index := 0; index < 40; index++ {
+		if _, err := harness.service.Request(
+			harness.context(t, "request"), harness.request(
+				"request", fmt.Sprintf("grant-%02d", index), "complete",
+				Effects{EffectEgressesContent}, nil)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	queued := harness.enqueueDispatchAction(t, string(identityJustBelowTheSpan()))
+
+	// The ordering property itself is asserted by
+	// TestEveryAdmissionSortsAboveEveryNameableIdentity. This test asserts only
+	// what a caller observes, so that it fails as the listing outage it is
+	// rather than as a statement about a constant.
+	//
+	// Pull: one page, asked for four, with forty admissions in the store.
+	worker := bindDecision(t, harness.authority, dispatchDecision(
+		t, "owner", "actor", "request",
+		auth.OperationDispatch, auth.OperationInvoke))
+	pulled, err := harness.dispatch.Pull(worker, PullActionsRequest{
+		Limit: 4, Context: dispatchContext(harness.now, "request"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pulled.Actions) != 1 ||
+		!bytes.Equal(pulled.Actions[0].ID, queued.ID) {
+		t.Fatalf("pull starved by the admission tail = %#v", pulled.Actions)
+	}
+
+	// TeamActions: a bounded discovery budget, spent one record at a time.
+	reader := bindDecision(t, harness.authority, dispatchDecision(
+		t, "reader", "reader", "team", auth.OperationTeamOverviewRead))
+	team, err := harness.dispatch.TeamActions(reader, TeamActionListRequest{
+		Limit: 10, SourceIDs: [][]byte{[]byte("source")},
+		PolicyIDs: [][]byte{[]byte("policy")},
+		Context: RequestContext{
+			RequestID: "team", CorrelationID: "correlation",
+			ReasonCode: "team_overview", Deadline: harness.now.Add(time.Hour),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(team.Actions) != 1 ||
+		!bytes.Equal(team.Actions[0].ID, queued.ID) {
+		t.Fatalf("team listing starved by the admission tail = %#v",
+			team.Actions)
+	}
+}
+
+// TestEveryAdmissionSortsAboveEveryNameableIdentity pins maximality as a
+// property of the constant rather than of the fixtures that depend on it.
+//
+// The listing tests each pick one high identity and show it survives. That
+// catches a span above the identity picked and misses a span above only that
+// one, which is how "\xffshoal.admission\x00" passed a suite containing a
+// test named for this exact ordering. The guarantee is about every byte of the
+// prefix, so it is asserted that way: a prefix is maximal iff decrementing any
+// byte of it yields something that sorts below it, and a non-maximal prefix has
+// at least one byte whose successor values are nameable and above.
+func TestEveryAdmissionSortsAboveEveryNameableIdentity(t *testing.T) {
+	prefix := []byte(admissionIDPrefix)
+	for index := range prefix {
+		// Pad with 0xff to the length bound: the greatest identity sharing the
+		// first `index` bytes of the prefix and differing at `index`.
+		candidate := append(
+			append([]byte(nil), prefix[:index]...), prefix[index]+1)
+		for len(candidate) < MaxActionIDBytes {
+			candidate = append(candidate, 0xff)
+		}
+		// 0xff+1 wraps to 0, which sorts below rather than above, and that is
+		// precisely the byte value that leaves nothing nameable above it.
+		if prefix[index] != 0xff {
+			t.Fatalf("prefix byte %d is %#x, so %x is nameable and "+
+				"sorts above every admission",
+				index, prefix[index], candidate)
+		}
 	}
 }
 
