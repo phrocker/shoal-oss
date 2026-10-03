@@ -158,10 +158,11 @@ func admissionError(err error) error {
 		errors.Is(err, fleet.ErrAdmissionConflict):
 		return shoal.WrapError(
 			shoal.ErrorConflict, "admission token is not live", err)
-	// Unavailable, not a denial and not a conflict. The caller has done nothing
-	// wrong and cannot fix it; an operator has to drain a record written under
-	// the superseded identity scheme. The message is kept because it is only
-	// ever returned for a record the caller itself owns.
+	// These are whole-store rollout conditions, not caller-specific denials
+	// or conflicts. New admission requests stay unavailable while any principal has a
+	// legacy admission or an ordinary action occupies the reserved span.
+	// An operator must clear the condition. The fixed messages identify the
+	// rollout condition without naming the affected record or its principal.
 	case errors.Is(err, fleet.ErrAdmissionUnmigrated),
 		errors.Is(err, fleet.ErrAdmissionSpanOccupied):
 		return shoal.WrapError(

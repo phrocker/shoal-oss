@@ -439,12 +439,10 @@ func (s *DispatchService) ExecuteClaim(ctx context.Context, claimed ActionRecord
 		}
 		return ActionRecord{}, err
 	}
-	// The marker check stays, and it is not redundant with the prefix check
-	// above. An admission written before identities carried the prefix has an
-	// unprefixed identity that nothing can recognise by name — only the durable
-	// marker names it — so the prefix check alone would let exactly those
-	// records through. Any environment that ran the admission surface before
-	// this change holds them.
+	// The durable marker identifies admissions regardless of their identity
+	// format, including admissions written before the reserved prefix existed.
+	// This check rejects those records without treating an ordinary action in
+	// the reserved span as an admission.
 	//
 	// Read from the stored record rather than the argument, so a caller that
 	// fabricates a record with the marker stripped does not dodge it. That
