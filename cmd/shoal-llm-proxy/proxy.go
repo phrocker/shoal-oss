@@ -36,20 +36,60 @@ const maxRequestBytes = 8 << 20
 
 // proxy is the enforcement point: admit, apply, forward, report.
 type proxy struct {
-	admission  *admissionClient
-	upstream   *url.URL
-	client     *http.Client
-	credential func() (string, error)
-	clock      func() time.Time
+	admission    *admissionClient
+	upstream     *url.URL
+	client       *http.Client
+	credential   func() (string, error)
+	allowedHosts []string
+	clock        func() time.Time
 	// log receives operational events only. It is never given prompt or
 	// completion content; see logRefusal.
 	log func(string, ...any)
 }
 
-func (p *proxy) routes() *http.ServeMux {
+func (p *proxy) routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/chat/completions", p.completions)
-	return mux
+	return p.guardHost(mux)
+}
+
+// guardHost refuses any request whose Host is not an exactly configured
+// authority, before routing.
+//
+// Without it the default loopback listener is reachable by DNS rebinding: a
+// page in a browser resolves a name it controls to 127.0.0.1 and POSTs to the
+// proxy, which then spends the operator's upstream credential on a call the
+// operator never made. A JSON body is not protection — a form post with a
+// text/plain content type reaches the same handler, and this surface does not
+// require a preflight.
+//
+// Exact match, no wildcard and no suffix form, and X-Forwarded-Host is never
+// consulted; each of those is a known bypass. This mirrors the workspace gate
+// in pkg/explorer/webapi, which is also why the proxy needs a separate health
+// listener: a kubelet addresses the pod by an authority no static list can name.
+func (p *proxy) guardHost(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if !p.permits(request.Host) {
+			// A fixed body that never echoes the submitted authority, so the
+			// refusal cannot be used to probe what this proxy answers to.
+			http.Error(writer, "misdirected request", http.StatusMisdirectedRequest)
+			return
+		}
+		next.ServeHTTP(writer, request)
+	})
+}
+
+func (p *proxy) permits(authority string) bool {
+	candidate, ok := normalizeAuthority(authority)
+	if !ok {
+		return false
+	}
+	for _, allowed := range p.allowedHosts {
+		if allowed == candidate {
+			return true
+		}
+	}
+	return false
 }
 
 // completions is the whole contract in one function, in the order that matters:
@@ -289,17 +329,23 @@ func newProxy(
 	admission *admissionClient,
 	upstream string,
 	credential func() (string, error),
+	allowedHosts []string,
 	timeout time.Duration,
 	clock func() time.Time,
 	log func(string, ...any),
 ) (*proxy, error) {
-	parsed, err := url.Parse(upstream)
-	if err != nil || !parsed.IsAbs() || parsed.Hostname() == "" {
-		return nil, fmt.Errorf("upstream base URL must be absolute")
+	// The same transport policy as the admission URL, and for a sharper reason:
+	// this is the request that carries the operator's upstream credential and
+	// the caller's prompt. Allowing remote plain HTTP here would put both on
+	// the wire in clear, which is worse than the admission path where only the
+	// declaration travels.
+	parsed, err := absoluteURL(upstream)
+	if err != nil {
+		return nil, fmt.Errorf("upstream base URL %v", err)
 	}
 	return &proxy{
 		admission: admission, upstream: parsed,
 		client:     &http.Client{Timeout: timeout},
-		credential: credential, clock: clock, log: log,
+		credential: credential, allowedHosts: allowedHosts, clock: clock, log: log,
 	}, nil
 }

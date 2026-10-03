@@ -67,6 +67,7 @@ type admissionClient struct {
 	http       *http.Client
 	credential func() (string, error)
 
+	clock           func() time.Time
 	agentID         string
 	agentGeneration int64
 	capability      string
@@ -91,6 +92,34 @@ type admissionToken struct {
 	TokenID   string    `json:"token_id"`
 	Version   uint64    `json:"version"`
 	ExpiresAt time.Time `json:"expires_at"`
+}
+
+// reportable reports whether a grant's token could actually close the loop.
+//
+// minimumReportWindow is the margin the report itself needs. A token that
+// expires while the upstream call is still running cannot be reported at all,
+// so a grant arriving with less than this left is refused rather than spent.
+const minimumReportWindow = 5 * time.Second
+
+func (t *admissionToken) reportable(now time.Time) error {
+	if t == nil {
+		return errors.New("allowed without a token")
+	}
+	for name, value := range map[string]string{
+		"action ID": t.ActionID, "token ID": t.TokenID,
+	} {
+		decoded, err := base64.RawURLEncoding.DecodeString(value)
+		if err != nil || len(decoded) == 0 {
+			return fmt.Errorf("token %s is not a usable identity", name)
+		}
+	}
+	if t.Version == 0 {
+		return errors.New("token version is invalid")
+	}
+	if !t.ExpiresAt.IsZero() && t.ExpiresAt.Sub(now) < minimumReportWindow {
+		return errors.New("token expires before the call could be reported")
+	}
+	return nil
 }
 
 type requestContextWire struct {
@@ -187,11 +216,14 @@ func (c *admissionClient) request(
 		return grant{}, fmt.Errorf(
 			"%w: unrecognised admission outcome", ErrPlaneUnreachable)
 	}
-	if decoded.Token == nil {
-		// An allowance with no token cannot be reported, and an unreportable
-		// call is one the plane can never learn the outcome of.
-		return grant{}, fmt.Errorf(
-			"%w: allowed without a token", ErrPlaneUnreachable)
+	// An allowance the proxy could not report is refused before the egress,
+	// not discovered after it. Checking only for a nil token left every other
+	// unreportable shape through — an empty object, unparseable identities, a
+	// zero version, a lease already spent — and in each case the call would
+	// have been forwarded and the report then rejected, which is precisely the
+	// unreportable grant this refusal exists to prevent.
+	if err := decoded.Token.reportable(c.clockNow()); err != nil {
+		return grant{}, fmt.Errorf("%w: %v", ErrPlaneUnreachable, err)
 	}
 	return grant{Withhold: decoded.Withhold, token: *decoded.Token}, nil
 }
@@ -312,12 +344,17 @@ func absoluteURL(raw string) (*url.URL, error) {
 	if err != nil || !parsed.IsAbs() || parsed.Hostname() == "" {
 		return nil, errors.New("must be an absolute URL with a host")
 	}
-	if parsed.Scheme != "https" && !isLoopback(parsed.Hostname()) {
-		// Plain HTTP to a remote decision plane would put the proxy's bearer
-		// token and every declaration on the wire in clear. Loopback is
-		// exempted because it does not leave the host, which is the same line
-		// the model providers draw.
-		return nil, errors.New("must use https unless it addresses loopback")
+	if parsed.Scheme != "https" &&
+		!(parsed.Scheme == "http" && isLoopback(parsed.Hostname())) {
+		// Plain HTTP to a remote endpoint would put the bearer token and every
+		// declaration on the wire in clear. Loopback is exempted because it
+		// does not leave the host, which is the same line pkg/model draws for
+		// model providers.
+		//
+		// The exemption is for http specifically, not for every scheme on
+		// loopback. "ftp://localhost" is not a transport this can speak, and
+		// admitting it at startup only moves the failure to every request.
+		return nil, errors.New("must use https, or http addressing loopback")
 	}
 	return parsed, nil
 }
@@ -328,4 +365,39 @@ func isLoopback(host string) bool {
 	}
 	address := net.ParseIP(host)
 	return address != nil && address.IsLoopback()
+}
+
+// clockNow defaults so a zero-value client in a test still has a clock.
+func (c *admissionClient) clockNow() time.Time {
+	if c == nil || c.clock == nil {
+		return time.Now()
+	}
+	return c.clock()
+}
+
+// normalizeAuthority folds a Host or :authority into a comparable form, using
+// the standard library for the host:port split so bracketed IPv6 literals are
+// handled rather than guessed at.
+//
+// The host is lowercased because hostnames are case-insensitive, and a single
+// trailing dot is dropped so the FQDN-root spelling matches its bare form. Both
+// foldings apply to configured and request authorities alike, which is what
+// keeps the comparison symmetric.
+func normalizeAuthority(raw string) (string, bool) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return "", false
+	}
+	host, port, err := net.SplitHostPort(trimmed)
+	if err != nil {
+		host, port = trimmed, ""
+	}
+	host = strings.ToLower(strings.TrimSuffix(host, "."))
+	if host == "" {
+		return "", false
+	}
+	if port == "" {
+		return host, true
+	}
+	return net.JoinHostPort(host, port), true
 }

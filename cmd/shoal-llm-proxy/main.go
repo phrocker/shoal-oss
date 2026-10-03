@@ -38,6 +38,7 @@ import (
 	"time"
 
 	"github.com/phrocker/shoal-oss/internal/healthsurface"
+	"github.com/phrocker/shoal-oss/pkg/explorer/fleet"
 )
 
 func main() {
@@ -49,6 +50,14 @@ func main() {
 	}
 }
 
+// The defaults are named so a test can assert they satisfy validateDurations.
+// The previous pair did not, and reading the flag block does not reveal it:
+// the two values are declared forty lines apart.
+const (
+	defaultLease          = 4 * time.Minute
+	defaultRequestTimeout = 90 * time.Second
+)
+
 var listenTCP = net.Listen
 
 func run(ctx context.Context, args []string, output io.Writer) error {
@@ -56,6 +65,14 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 	flags.SetOutput(output)
 	listen := flags.String("listen", "127.0.0.1:8100",
 		"OpenAI-compatible listen address")
+	allowedHost := flags.String("allowed-host", "",
+		"Comma-separated exact-match allow-list of external authorities (host "+
+			"or host:port) an inbound Host or :authority must match. No "+
+			"wildcard, no suffix form, and X-Forwarded-Host is never trusted. "+
+			"Defaults to the resolved listen address, which is what makes a "+
+			"loopback default safe: without this gate a browser can DNS-rebind "+
+			"a name it controls to the loopback listener and spend the "+
+			"operator's upstream credential on a call nobody made")
 	healthAddress := flags.String("health-address", "",
 		"Optional separate listener serving GET /healthz and GET /readyz for "+
 			"orchestrator probes. Empty disables it. It is a second listener "+
@@ -85,11 +102,15 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 		"Scope source ID, unpadded base64url")
 	policyID := flags.String("policy-id", "",
 		"Scope policy ID, unpadded base64url")
-	lease := flags.Duration("lease", time.Minute,
+	lease := flags.Duration("lease", defaultLease,
 		"Admission lease. A call must be reported within it or the grant shows "+
-			"as outstanding")
-	requestTimeout := flags.Duration("request-timeout", 2*time.Minute,
-		"Upstream request timeout")
+			"as outstanding. The fleet refuses a lease above its claim ceiling "+
+			"rather than shortening it, so a value over that denies every "+
+			"call, and it must leave room for the upstream call plus the "+
+			"report after it")
+	requestTimeout := flags.Duration("request-timeout", defaultRequestTimeout,
+		"Upstream request timeout. It must fit inside the lease with the "+
+			"report window to spare")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -106,8 +127,8 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 	if strings.TrimSpace(*capability) == "" || strings.TrimSpace(*action) == "" {
 		return errors.New("-capability and -action are required")
 	}
-	if *lease <= 0 || *requestTimeout <= 0 {
-		return errors.New("-lease and -request-timeout must be positive")
+	if err := validateDurations(*lease, *requestTimeout); err != nil {
+		return err
 	}
 	source, err := decodeID("-source-id", *sourceID)
 	if err != nil {
@@ -136,16 +157,25 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 		capability: *capability, action: *action,
 		sourceID: source, policyID: policy, lease: *lease,
 	}
-	governed, err := newProxy(
-		admission, *upstreamBaseURL, credentialFromEnv(*upstreamKeyEnv),
-		*requestTimeout, time.Now, logf)
-	if err != nil {
-		return err
-	}
-
 	listener, err := listenTCP("tcp", *listen)
 	if err != nil {
 		return fmt.Errorf("listen on %s: %w", *listen, err)
+	}
+	// Resolved from the listener, not the requested address: a wildcard bind
+	// resolves to an authority real clients never send, so defaulting to it
+	// refuses everything rather than admitting anything. That is the intended
+	// outcome — a public bind must name its external authority explicitly.
+	allowedHosts, err := authorities(*allowedHost, listener.Addr().String())
+	if err != nil {
+		listener.Close()
+		return err
+	}
+	governed, err := newProxy(
+		admission, *upstreamBaseURL, credentialFromEnv(*upstreamKeyEnv),
+		allowedHosts, *requestTimeout, time.Now, logf)
+	if err != nil {
+		listener.Close()
+		return err
 	}
 	server := &http.Server{
 		Handler:           governed.routes(),
@@ -196,4 +226,49 @@ func credentialFromEnv(name string) func() (string, error) {
 		}
 		return value, nil
 	}
+}
+
+// authorities resolves the host allow-list, falling back to the bound address.
+func authorities(configured, resolved string) ([]string, error) {
+	candidates := strings.Split(configured, ",")
+	if strings.TrimSpace(configured) == "" {
+		candidates = []string{resolved}
+	}
+	result := make([]string, 0, len(candidates))
+	for _, candidate := range candidates {
+		normalized, ok := normalizeAuthority(candidate)
+		if !ok {
+			return nil, fmt.Errorf(
+				"-allowed-host %q is not a host or host:port", candidate)
+		}
+		result = append(result, normalized)
+	}
+	return result, nil
+}
+
+// validateDurations refuses a lease that cannot cover the call it admits.
+//
+// It is a function so the invariant can be tested without starting a listener.
+// The two rules fail for opposite reasons and neither degrades gracefully:
+//
+// Too large and the fleet refuses the lease outright rather than shortening it,
+// so every call is denied. Too small and the lease expires while the upstream
+// call is still running, so the call is forwarded and its report is then
+// rejected as expired — an unreportable grant guaranteed by configuration,
+// which no runtime check can recover. The shipped defaults did exactly that: a
+// one-minute lease against a two-minute timeout left every call over a minute
+// unreportable.
+func validateDurations(lease, requestTimeout time.Duration) error {
+	if lease <= 0 || requestTimeout <= 0 {
+		return errors.New("-lease and -request-timeout must be positive")
+	}
+	if lease > fleet.MaxActionClaimTTL {
+		return fmt.Errorf("-lease must not exceed %s", fleet.MaxActionClaimTTL)
+	}
+	if lease <= requestTimeout+minimumReportWindow {
+		return fmt.Errorf(
+			"-lease must exceed -request-timeout by at least %s so the call "+
+				"can still be reported", minimumReportWindow)
+	}
+	return nil
 }

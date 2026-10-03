@@ -19,6 +19,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -120,9 +121,14 @@ func newTestProxy(t *testing.T, plane *fakePlane, upstream *fakeUpstream) (*prox
 	governed, err := newProxy(
 		client, upstream.server.URL,
 		func() (string, error) { return "upstream-key", nil },
+		[]string{"example.test"},
 		5*time.Second, time.Now,
+		// The rendered line, not the format string. Capturing only the format
+		// made TestNoPromptOrCompletionIsLogged unable to fail for the one
+		// thing it is named for: content passed as an argument, which is how
+		// content would actually reach a log.
 		func(format string, values ...any) {
-			logged = append(logged, format)
+			logged = append(logged, fmt.Sprintf(format, values...))
 		})
 	if err != nil {
 		t.Fatal(err)
@@ -135,6 +141,7 @@ func post(t *testing.T, governed *proxy, body string) *httptest.ResponseRecorder
 	t.Helper()
 	request := httptest.NewRequest(
 		http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	request.Host = "example.test"
 	recorder := httptest.NewRecorder()
 	governed.routes().ServeHTTP(recorder, request)
 	return recorder
@@ -406,6 +413,40 @@ func TestAnAllowanceWithoutATokenIsRefused(t *testing.T) {
 	}
 	if upstream.calls != 0 {
 		t.Fatal("an allowance with no token let the call through")
+	}
+}
+
+// TestAForeignHostIsRefusedBeforeAnythingHappens is the DNS-rebinding gate.
+//
+// The default listener is loopback, so without this a page in a browser can
+// resolve a name it controls to 127.0.0.1, POST here, and spend the operator's
+// upstream credential on a call nobody made. A JSON body is not protection: a
+// form post with a text/plain content type reaches the same handler and needs
+// no preflight.
+func TestAForeignHostIsRefusedBeforeAnythingHappens(t *testing.T) {
+	plane := newFakePlane(t, outcomeAllowed, nil)
+	upstream := newFakeUpstream(t)
+	governed, _ := newTestProxy(t, plane, upstream)
+
+	request := httptest.NewRequest(
+		http.MethodPost, "/v1/chat/completions", strings.NewReader(plainCall))
+	request.Host = "attacker.example"
+	recorder := httptest.NewRecorder()
+	governed.routes().ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusMisdirectedRequest {
+		t.Fatalf("status = %d, want 421", recorder.Code)
+	}
+	if upstream.calls != 0 {
+		t.Fatal("a misdirected request reached the upstream")
+	}
+	// Refused before the plane is even asked: the gate runs before routing, so
+	// a rebound request costs no admission and no upstream credential.
+	if len(plane.requests) != 0 {
+		t.Fatalf("a misdirected request was adjudicated: %#v", plane.requests)
+	}
+	if strings.Contains(recorder.Body.String(), "attacker.example") {
+		t.Fatalf("the refusal echoes the submitted authority: %s", recorder.Body.String())
 	}
 }
 

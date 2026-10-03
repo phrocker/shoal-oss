@@ -156,6 +156,33 @@ func (r chatRequest) references() ([]string, error) {
 	return result, nil
 }
 
+// knownRoles is the finite vocabulary the OpenAI-compatible surface defines.
+//
+// It exists because a role is a free-form string on the wire, and a string the
+// proxy copies into the declaration is a channel for exactly the content the
+// declaration is supposed to exclude. A caller can put a prompt in
+// messages[].role, and nothing about the field's name stops it.
+var knownRoles = map[string]struct{}{
+	"system": {}, "user": {}, "assistant": {},
+	"tool": {}, "function": {}, "developer": {},
+}
+
+// roleOther is what an unrecognised role becomes in the declaration.
+//
+// Not the original string, and not an error either: refusing an unknown role
+// would make the proxy the reason an unmodified client breaks when the upstream
+// adds one, which is the thing it exists not to be. The request is forwarded
+// with the caller's role intact; only the declaration is sanitised, because the
+// declaration is the part that leaves for Shoal.
+const roleOther = "other"
+
+func classifyRole(role string) string {
+	if _, ok := knownRoles[strings.ToLower(strings.TrimSpace(role))]; ok {
+		return strings.ToLower(strings.TrimSpace(role))
+	}
+	return roleOther
+}
+
 // declaration is the shape the proxy sends in place of the payload.
 //
 // Sizes and counts only. A reviewer checking that Shoal never receives prompt
@@ -166,7 +193,7 @@ func (r chatRequest) declaration(references []string) json.RawMessage {
 	roles := make([]string, 0, len(r.messages))
 	total := 0
 	for _, message := range r.messages {
-		roles = append(roles, message.Role)
+		roles = append(roles, classifyRole(message.Role))
 		total += len(message.Content)
 	}
 	encoded, _ := json.Marshal(map[string]any{
