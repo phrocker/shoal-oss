@@ -1,5 +1,13 @@
 # Local authorization decision models: measured findings
 
+The [V10 prospective-assessment follow-up](runs/prospective-v10/README.md)
+retains all 24 sampled functions from the only eligible new family, PR415:
+15/15 relevant in each of two blinded Claude passes, with zero proposed savings.
+Ten functions overlap exact development bodies/diffs; on the remaining 14,
+each pass labels ten relevant. The PR existed before protocol registration.
+Four calls cost $1.046898; three family slots remain unfilled. The gate is on
+hold for insufficient families and novel positives. No model was retuned.
+
 The [V9 experiment](runs/operations-v9/README.md) establishes a stronger shadow
 candidate: code-only SVM retains 65/67 frontier and 64/64 Claude relevant
 functions, versus 61/67 and 59/64 for the older adapted Laya. Four complete-PR

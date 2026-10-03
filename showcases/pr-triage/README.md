@@ -4,6 +4,11 @@ This external showcase tests the local-decision architecture in
 [the design](../../docs/local-decisions.md). It preserves full review for every
 change. It does not implement a Shoal review feature or production decision API.
 
+The [budgeted V10 follow-up](runs/prospective-v10/README.md) has started with
+one eligible newly observed PR. Four blinded assessment calls cost $1.05 of the
+$25 allowance. The frozen classifier retained all 24 sampled functions, so no
+savings were proposed. Three family slots remain unfilled; the gate is on hold.
+
 The [V9 comparison](runs/operations-v9/README.md) now favors a code-only CPU SVM:
 65/67 frontier-assessed and 64/64 Claude-assessed relevant functions retained,
 versus Laya's 61/67 and 59/64. Four complete-PR counterfactual pairs used 16.4%
