@@ -1215,3 +1215,102 @@ func (f *failingWriter) Write(data []byte) (int, error) {
 	}
 	return len(data), nil
 }
+
+// TestTheHostGateHonoursEveryClaimItsCommentMakes pins the three defenses the
+// gate documents and had no test for.
+//
+// guardHost's comment says "exact match, no wildcard and no suffix form, and
+// X-Forwarded-Host is never consulted; each of those is a known bypass." Only
+// a wholly foreign authority was covered, which the first of those three would
+// catch on its own — so the suffix and header claims were assertions in a
+// comment. On this branch that has been the reliable predictor of a defect, so
+// they are assertions in a test now.
+func TestTheHostGateHonoursEveryClaimItsCommentMakes(t *testing.T) {
+	// Two authorities, one with a port, so the port-sensitivity of an exact
+	// match is covered in both directions rather than assumed.
+	allowed := []string{"example.test", "gateway.internal:8100"}
+
+	for _, probe := range []struct {
+		name      string
+		host      string
+		forwarded string
+		admit     bool
+	}{
+		{"the configured authority", "example.test", "", true},
+		{"the configured authority with a port", "gateway.internal:8100", "", true},
+
+		// Case and the FQDN root are folded, symmetrically, because hostnames
+		// are case-insensitive and "example.test." names the same host.
+		{"uppercase", "EXAMPLE.TEST", "", true},
+		{"mixed case", "Example.Test", "", true},
+		{"a trailing dot", "example.test.", "", true},
+		{"uppercase with a trailing dot", "EXAMPLE.TEST.", "", true},
+
+		// No suffix form. These are the rebinding payloads that a naive
+		// HasSuffix or Contains check admits, and each is a distinct trick.
+		{"a prefixed label", "evil.example.test", "", false},
+		{"the authority as a prefix of a longer one", "example.test.attacker.com", "", false},
+		{"a hyphen-glued neighbour", "evil-example.test", "", false},
+		{"the authority inside a longer label", "notexample.test", "", false},
+
+		// Exact includes the port. An allow-list entry names the authority
+		// clients actually send, and a port-less entry does not stand in for
+		// every port on that host.
+		{"a port where none was configured", "example.test:8100", "", false},
+		{"the wrong port", "gateway.internal:9999", "", false},
+		{"no port where one was configured", "gateway.internal", "", false},
+
+		// Degenerate authorities must not match anything, including a
+		// configured entry that was somehow blank.
+		{"an empty authority", "", "", false},
+		{"whitespace", "   ", "", false},
+		{"a bare port", ":8100", "", false},
+
+		// X-Forwarded-Host is never consulted, in either direction. Trusting
+		// it lets anything that can set a header name its own authority; and
+		// a legitimate request must not be refused because a proxy in front
+		// added one.
+		{"a foreign host claiming an allowed authority", "attacker.example", "example.test", false},
+		{"an allowed host with a foreign forwarded header", "example.test", "attacker.example", true},
+		{"an empty host with an allowed forwarded header", "", "example.test", false},
+	} {
+		plane := newFakePlane(t, outcomeAllowed, nil)
+		upstream := newFakeUpstream(t)
+		governed, _ := newTestProxy(t, plane, upstream)
+		governed.allowedHosts = allowed
+
+		request := httptest.NewRequest(
+			http.MethodPost, "/v1/chat/completions", strings.NewReader(plainCall))
+		request.Host = probe.host
+		if probe.forwarded != "" {
+			request.Header.Set("X-Forwarded-Host", probe.forwarded)
+		}
+		recorder := httptest.NewRecorder()
+		governed.routes().ServeHTTP(recorder, request)
+
+		if probe.admit {
+			if recorder.Code != http.StatusOK {
+				t.Fatalf("%s (%q): status = %d, want 200 — a gate nothing valid "+
+					"passes is a gate against the feature", probe.name, probe.host,
+					recorder.Code)
+			}
+			continue
+		}
+		if recorder.Code != http.StatusMisdirectedRequest {
+			t.Fatalf("%s (%q): status = %d, want 421", probe.name, probe.host,
+				recorder.Code)
+		}
+		// Refused before routing, so a rebound request costs no admission and
+		// no upstream credential. This is the half that makes the gate cheap.
+		if len(plane.requests) != 0 {
+			t.Fatalf("%s: a misdirected request was adjudicated", probe.name)
+		}
+		if upstream.calls != 0 {
+			t.Fatalf("%s: it reached the upstream", probe.name)
+		}
+		if probe.host != "" && strings.Contains(recorder.Body.String(), probe.host) {
+			t.Fatalf("%s: the refusal echoes the submitted authority: %s",
+				probe.name, recorder.Body.String())
+		}
+	}
+}

@@ -616,3 +616,93 @@ func TestTheUpstreamCredentialAlsoHasAFileForm(t *testing.T) {
 		t.Fatalf("run() did not apply the rule: %s", detail)
 	}
 }
+
+// TestAnAllowListEntryWithNoHostIsRefusedAtStartup covers the guard a mutation
+// showed nothing reached.
+//
+// Deleting the empty-host check in normalizeAuthority left every request-side
+// test passing, because a request authority of ":8100" fails to match any
+// sensible allow-list entry anyway. The check earns its place on the other
+// side: without it, ":8100" is accepted as a *configured* authority, and then
+// a request sending that literal Host matches it — an allow-list entry that
+// names no host, admitting calls on the strength of a port alone.
+//
+// Testing the consumer could not find that. The property belongs to the
+// producer, which is authorities().
+func TestAnAllowListEntryWithNoHostIsRefusedAtStartup(t *testing.T) {
+	for _, probe := range []string{
+		":8100",    // a bare port
+		".",        // the root label alone
+		"a.test, ", // a trailing empty element, which YAML makes easy to write
+		"a.test,,b.test",
+		" , ", // every element blank, which is not the same as unset
+	} {
+		if _, err := authorities(probe, "127.0.0.1:8100"); err == nil {
+			t.Fatalf("%q was accepted as an allow-list entry", probe)
+		}
+	}
+
+	// And the forms that must still work, or the guard refuses the feature.
+	for _, probe := range []struct {
+		configured string
+		want       []string
+	}{
+		{"example.test", []string{"example.test"}},
+		{"example.test:8100", []string{"example.test:8100"}},
+		{"EXAMPLE.TEST.", []string{"example.test"}},
+		{"a.test,b.test", []string{"a.test", "b.test"}},
+		{" a.test , b.test ", []string{"a.test", "b.test"}},
+		{"[::1]:8100", []string{"[::1]:8100"}},
+	} {
+		got, err := authorities(probe.configured, "127.0.0.1:8100")
+		if err != nil {
+			t.Fatalf("%q was refused: %v", probe.configured, err)
+		}
+		if len(got) != len(probe.want) {
+			t.Fatalf("%q = %v, want %v", probe.configured, got, probe.want)
+		}
+		for i := range got {
+			if got[i] != probe.want[i] {
+				t.Fatalf("%q = %v, want %v", probe.configured, got, probe.want)
+			}
+		}
+	}
+
+	// An unset configuration falls back to the bound address, which is what
+	// makes the loopback default safe rather than open. A blank value is unset
+	// rather than invalid — a flag given "" and a flag given " " are the same
+	// intent, and I had this in the refused list until the test said otherwise.
+	var got []string
+	var err error
+	for _, unset := range []string{"", " ", "   "} {
+		got, err = authorities(unset, "127.0.0.1:8100")
+		if err != nil || len(got) != 1 || got[0] != "127.0.0.1:8100" {
+			t.Fatalf("the fallback for %q = %v, %v; want the bound address",
+				unset, got, err)
+		}
+	}
+	// A wildcard bind is accepted as configuration and matches nothing, which
+	// is the property main.go claims and is not the same as being refused.
+	//
+	// I asserted a refusal here first and it failed: "[::]:8100" is a
+	// syntactically fine authority. The claim worth testing is the one the
+	// comment actually makes — defaulting to a wildcard bind refuses every real
+	// request rather than admitting any — so it belongs on the request side,
+	// not in rejecting the configuration.
+	for _, bound := range []string{"[::]:8100", "0.0.0.0:8100"} {
+		got, err = authorities("", bound)
+		if err != nil {
+			t.Fatalf("a wildcard bind was refused as configuration: %v", err)
+		}
+		governed := &proxy{allowedHosts: got}
+		for _, sent := range []string{
+			"shoal-llm-proxy.default.svc", "shoal-llm-proxy:8100",
+			"example.test", "127.0.0.1:8100", "localhost:8100",
+		} {
+			if governed.permits(sent) {
+				t.Fatalf("a wildcard bind (%s) admitted %q; a public bind must "+
+					"name its authority explicitly", bound, sent)
+			}
+		}
+	}
+}
