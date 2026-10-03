@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"sort"
+	"sync"
 	"time"
 
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
@@ -51,6 +52,34 @@ var (
 	// ErrAdmissionConflict reports an admission identity already granted to a
 	// different token.
 	ErrAdmissionConflict = errors.New("fleet admission: admission conflict")
+	// ErrAdmissionUnmigrated reports that the store still holds an admission
+	// written under the identity scheme that preceded the derived one, which
+	// this build cannot adjudicate around without risking a second grant for a
+	// request that already has one.
+	//
+	// It is a whole-store condition rather than a per-caller one, deliberately:
+	// see requireMigrated for why no per-record answer is correct. So it says
+	// nothing about the caller that received it and cannot be used to probe for
+	// anyone's records.
+	//
+	// Loud, and not a denial. A denial is a policy answer the caller should act
+	// on; this is an operator's problem and the caller can do nothing but stop.
+	ErrAdmissionUnmigrated = errors.New(
+		"fleet admission: the store holds admissions written under the " +
+			"superseded identity scheme, which must be drained before " +
+			"admissions can be served")
+	// ErrAdmissionSpanOccupied reports an ordinary action stored inside the
+	// reserved identity span, which was a legal place to put one before the
+	// span was reserved.
+	//
+	// Separate from ErrAdmissionUnmigrated because it is a different rollout
+	// condition with a different remedy, and an operator reading one should not
+	// go looking for the other. Both are whole-store conditions and neither
+	// names a record.
+	ErrAdmissionSpanOccupied = errors.New(
+		"fleet admission: the store holds ordinary actions inside the " +
+			"reserved admission identity span, which must be cleared before " +
+			"admissions can be served")
 )
 
 // MaxAdmissionDisclosures bounds the corpus references one admission may
@@ -249,6 +278,10 @@ type AdmissionConfig struct {
 type AdmissionService struct {
 	dispatch   *DispatchService
 	restrictor DisclosureRestrictor
+	// migrationMu guards migrated, and is held across the verifying scan so a
+	// burst of first requests performs one scan rather than one each.
+	migrationMu sync.Mutex
+	migrated    bool
 }
 
 func NewAdmissionService(config AdmissionConfig) (*AdmissionService, error) {
@@ -292,6 +325,13 @@ func (s *AdmissionService) Request(
 	if err != nil {
 		return AdmissionGrant{}, err
 	}
+	// Before anything else, including any read of the caller's own identity:
+	// an admission written under the superseded identity scheme makes every
+	// answer here unsound, because the derivation moved the durable key and a
+	// request for such a record misses.
+	if err := s.requireMigrated(ctx); err != nil {
+		return AdmissionGrant{}, err
+	}
 	if err := validateOpaque("admission token ID", request.TokenID, false); err != nil {
 		return AdmissionGrant{}, err
 	}
@@ -315,11 +355,19 @@ func (s *AdmissionService) Request(
 	if err != nil {
 		return AdmissionGrant{}, err
 	}
+	if err := validateOpaque("admission ID", request.ID, false); err != nil {
+		return AdmissionGrant{}, err
+	}
+	// The durable identity, which is not the one the caller supplied. See
+	// admissionActionID: the caller names its admission, the durable namespace
+	// is global, and without this two principals naming the same admission
+	// would be able to detect each other.
+	actionID := admissionActionID(decision, request.ID)
 	// The same record an enqueue of this request would build, validated
 	// identically and not written. It carries the declaration, so what was
 	// admitted is part of the record's identity and a retry cannot change it.
 	base, action, err := dispatch.queuedRecord(ctx, decision, EnqueueRequest{
-		ID: request.ID, IdempotencyKey: request.IdempotencyKey,
+		ID: actionID, IdempotencyKey: request.IdempotencyKey,
 		AgentID: request.AgentID, AgentGeneration: request.AgentGeneration,
 		Capability: request.Capability, Action: request.Action,
 		SourceID: request.SourceID, PolicyID: request.PolicyID,
@@ -331,8 +379,15 @@ func (s *AdmissionService) Request(
 	}
 	base.AdmittedEffects = declared
 	base.AdmittedDisclosures = disclosureDigest(disclosures)
+	// Recorded, not inferred. The verdict asks the record which scheme produced
+	// its key, because the key cannot answer: a caller-named legacy key may
+	// have any shape, including the shape a derived one has.
+	base.AdmittedIdentityScheme = AdmittedIdentitySchemeDerived
 
-	current, readErr := dispatch.store.GetAction(ctx, request.ID)
+	// Read at the derived identity, which is why this is a raw store read and
+	// not authorizedCurrent. A principal check here would have nothing to
+	// refuse: no other principal's record can be at this ID.
+	current, readErr := dispatch.store.GetAction(ctx, actionID)
 	if readErr != nil && !errors.Is(readErr, ErrActionNotFound) {
 		return AdmissionGrant{}, readErr
 	}
@@ -361,6 +416,95 @@ func (s *AdmissionService) Request(
 		return AdmissionGrant{}, err
 	}
 	return grantFor(granted, obligations), nil
+}
+
+// requireMigrated refuses to adjudicate while the store is in a state the
+// derived identity scheme does not describe.
+//
+// Two conditions, and neither is read off an identity.
+//
+// The first is an admission produced by the superseded scheme, which moved the
+// durable key: a request for such a record misses, and granting on the miss
+// issues a second live token for work already permitted. For a record that is
+// already terminal it is worse — a durable denial would be re-adjudicated and
+// could come back granted, inverting a refusal that is on the record.
+//
+// That is settled by the scheme marker rather than by where the identity sorts.
+// Under the superseded scheme the key was caller-supplied opaque bytes, so a
+// legacy key may lie anywhere, including inside the reserved span and including
+// the exact prefix-plus-digest shape a derived key has. An earlier version
+// inferred the scheme from the span and therefore certified exactly that record
+// as new. The marker is sound for any identity, adversarial ones included,
+// and the identity now plays no part.
+//
+// The second is an ordinary action inside the reserved span. The span was a
+// legal dispatch identity space before it was reserved — action identities are
+// arbitrary non-empty bytes and always have been — so a record created
+// legitimately can sit there. Nothing silently mis-handles it any more: the
+// listings exclude admissions by marker rather than by range, and ExecuteClaim
+// no longer refuses an identity for its shape. What remains broken is narrow
+// and real: enqueue refuses the span unconditionally, so such an action cannot
+// be enqueue-replayed, and its idempotent retry fails. Refusing admissions is
+// how that becomes visible to an operator instead of staying a latent oddity
+// in a store nobody is looking at.
+//
+// Why whole-store rather than per-record. The derivation treats the
+// authorization domain as part of the principal, and an ActionRecord does not
+// carry its domain — so a per-record ownership predicate can be built only two
+// ways and both are wrong. sameActionPrincipal omits the domain, which hands
+// the distinctive error to an identically-named identity elsewhere and reopens
+// the existence oracle. Recovering the domain through the agent descriptor is
+// blind to any record whose generation has moved, which Heartbeat does on every
+// lease renewal. A whole-store verdict has no ownership predicate to get wrong.
+//
+// Report and Outstanding deliberately do not consult this. A grant already
+// issued must stay reportable, or upgrading strands the audit record for an
+// effect that may already have happened — and those records are exactly what an
+// operator has to find.
+//
+// The clean verdict is cached: this build writes no unmarked admission and
+// refuses to create in the span, so absence once proven stays true. A dirty or
+// unreachable verdict is never cached, so clearing the records needs no
+// restart. The scan runs under the mutex so a burst of first requests performs
+// one scan rather than one each.
+func (s *AdmissionService) requireMigrated(ctx context.Context) error {
+	s.migrationMu.Lock()
+	defer s.migrationMu.Unlock()
+	if s.migrated {
+		return nil
+	}
+	// Bounded so the loop terminates, and set far above any plausible store: at
+	// a full page each, this is tens of millions of actions. Exhausting it means
+	// the state could not be established, which refuses rather than assumes.
+	const maxMigrationScans = 1 << 16
+	var cursor []byte
+	for scanned := 0; scanned < maxMigrationScans; scanned++ {
+		page, err := s.dispatch.store.ScanActions(
+			ctx, cursor, MaxDispatchListResults)
+		if err != nil {
+			return err
+		}
+		for _, record := range page.Actions {
+			if record.isAdmission() {
+				if record.AdmittedIdentityScheme !=
+					AdmittedIdentitySchemeDerived {
+					return ErrAdmissionUnmigrated
+				}
+				continue
+			}
+			if reservedAdmissionID(record.ID) {
+				return ErrAdmissionSpanOccupied
+			}
+		}
+		if len(page.Next) == 0 {
+			s.migrated = true
+			return nil
+		}
+		cursor = page.Next
+	}
+	return shoal.NewError(
+		shoal.ErrorUnavailable,
+		"admission cannot establish the state of the action identity space")
 }
 
 // replay answers a request whose admission identity already exists.
@@ -532,6 +676,116 @@ func (s *AdmissionService) commit(
 	return stored, nil
 }
 
+// admissionIDPrefix reserves the top of the durable action identity space for
+// admissions. No caller may name an action inside it; see enqueue.
+//
+// This is what separates an admission from a dispatch action on the way in, and
+// the separation is reachability rather than secrecy. A caller cannot supply a
+// durable identity to the admission surface at all — Request derives one from
+// the caller's own decision — so the only way to name an arbitrary action is
+// through dispatch, and dispatch refuses every name in this span
+// unconditionally, whether or not anything is stored there.
+//
+// It says nothing about what a record *is*. That is the durable marker's job,
+// and the distinction cost three review rounds: ownership was once inferred
+// from a record with no domain, identity scheme from an identity that was
+// caller-chosen, and reachability from a span that predates the reservation.
+// The span is a forward rule about creation, nothing more. That is also why it
+// carries no readable tag: a tag inside the identifier is an invitation to read
+// meaning back out of it, which is the mistake those three rounds were.
+//
+// Every byte is 0xff, and that is the whole correctness requirement. The
+// listings filter admissions out by marker and keep no budget off them by
+// position, which is only affordable if a scan meets every ordinary record
+// before it meets an admission. A prefix delivers that if and only if it is
+// maximal — every byte 0xff — because then any unreserved key differs from it
+// at some byte that is necessarily smaller, and so sorts below the entire span.
+// The span was briefly "\xffshoal.admission\x00", which is *not* maximal: 's'
+// leaves 0x74..0xff above it, so an ordinary \xff\xff sorted after every
+// admission and a large admission tail starved it. One byte of 0xff was enough
+// to stop admissions sorting first; it was not enough to make them sort last.
+//
+// Four bytes, not one. Maximality fixes the ordering at any width, so width
+// trades only against the rollout gate below: a pre-existing ordinary action
+// inside the span blocks admission until an operator clears it, and the span
+// was a legal dispatch name space before this release. Action identities are
+// opaque bytes with no charset rule, so a client minting random ones puts
+// 1-in-256 of them under a one-byte span — enough that admission would refuse
+// to start on a sizable store, and live dispatch records cannot always be
+// deleted to unblock it. Four bytes makes that 1-in-2^32, under one expected
+// collision in a store of a billion random identities, while reserving exactly
+// as much of the top of the key space as the ordering argument needs. Length
+// here is a collision budget, not a secret: a longer span is not more private,
+// only less likely to be already occupied.
+//
+// A constant, not a variable. It was once an exported []byte, which is mutable
+// global state: another package could reassign it or write through the backing
+// array, changing the derivation and the reservation together at runtime, and
+// racing with any concurrent request while it did.
+//
+// One constant for the reservation and the derivation both. Two would have to
+// agree about which keys dispatch refuses and which keys Request mints, and a
+// derivation narrower than the reservation mints names dispatch is entitled to
+// refuse.
+const admissionIDPrefix = "\xff\xff\xff\xff"
+
+// reservedAdmissionID reports whether an identity falls in the reserved span.
+//
+// Anchored at the start rather than matched anywhere: a substring test would
+// reserve every identity that happens to contain the marker, refusing
+// legitimate names a dispatch caller is entitled to use.
+func reservedAdmissionID(id []byte) bool {
+	return bytes.HasPrefix(id, []byte(admissionIDPrefix))
+}
+
+// admissionActionID derives the durable record identity for a caller-supplied
+// admission name.
+//
+// What this does and does not do is worth stating exactly, because an earlier
+// version of this comment claimed more than the code delivered.
+//
+// It does keep two principals that choose the same name in two different
+// records. That is its job, and an unkeyed digest does it: the derivation only
+// has to be collision-free across principals, not unpredictable.
+//
+// It does *not* make another principal's identity unguessable, and it never
+// could. The inputs are a workspace and a set of identities, which are knowable
+// in most deployments, and the digest is unkeyed — so anyone who knows the
+// tuple computes the result. The property the previous version claimed, that
+// "neither can address the other's", did not hold: addressing a record does not
+// require this surface. A caller could compute the victim's derived ID, submit
+// it to dispatch enqueue as an ordinary action ID, and learn from conflict
+// versus success whether it was occupied — and squat unheld ones, denying the
+// victim its own admission by name.
+//
+// Keying the digest would have hidden the ID without making it unreachable, and
+// an identifier's secrecy is not access control: anything that ever leaks one —
+// a log line, an expired token, a record read through another surface — hands
+// back the reachability. It would also need a durable secret with a rotation
+// story, and rotation re-derives every live admission's identity, orphaning
+// outstanding grants whose tokens no longer resolve. A reserved namespace costs
+// none of that and gives the stronger property, so the secrecy claim is gone
+// and the reserved namespace carries the weight.
+//
+// Every component of the principal participates, because every component is
+// what authorizedCurrent compares when it decides a record belongs to a caller.
+// An identity differing only in its delegation chain is a different principal
+// there and has to be one here.
+func admissionActionID(decision auth.Decision, supplied []byte) []byte {
+	digest := sha256.New()
+	writeDispatchTupleField(digest, []byte("shoal.fleet.admission-id.v1"))
+	writeDispatchTupleField(digest, decision.AuthorizationDomain())
+	writeDispatchTupleField(digest, []byte(decision.Subject()))
+	writeDispatchTupleField(digest, []byte(decision.Actor()))
+	writeDispatchTupleField(digest, []byte(decision.ClientID()))
+	for _, identity := range decision.OnBehalfOf() {
+		writeDispatchTupleField(digest, []byte(identity))
+	}
+	writeDispatchTupleField(digest, supplied)
+	return append(
+		append([]byte(nil), admissionIDPrefix...), digest.Sum(nil)...)
+}
+
 // disclosureDigest reduces a canonical declared reference set to the value the
 // durable record carries, or nil when nothing was declared.
 //
@@ -693,19 +947,15 @@ func (s *AdmissionService) Report(
 	if err := validateActionErrorCode(report.ErrorCode); err != nil {
 		return ActionRecord{}, err
 	}
+	// An admission that does not exist and an admission belonging to someone
+	// else are the same answer, which authorizedCurrent now guarantees for
+	// every path that reaches the store through it. This used to normalise the
+	// absent case here; that was a fix in one caller for a property all of them
+	// need, and it is gone because the guarantee moved to where the two shapes
+	// actually meet.
 	current, err := dispatch.authorizedCurrent(
 		ctx, decision, report.Token.ActionID, auth.OperationInvoke, now)
 	if err != nil {
-		// An admission that does not exist and an admission belonging to
-		// someone else must be the same answer. They are not by default: the
-		// store reports absence with its own sentinel, while authorizedCurrent
-		// reports a principal mismatch with the object-not-found shape, and the
-		// two reach a caller as different messages. A caller holding neither
-		// could then tell which admission identities are in use by watching
-		// which refusal comes back, one guess at a time.
-		if errors.Is(err, ErrActionNotFound) {
-			return ActionRecord{}, auth.ObjectNotFound()
-		}
 		return ActionRecord{}, err
 	}
 	// A dispatch action is not an admission and cannot be closed here. It would
@@ -755,12 +1005,15 @@ func (s *AdmissionService) Report(
 		}
 		return cloneActionRecord(current), nil
 	}
-	record, err := dispatch.CompleteClaim(ctx, CompletionRequest{
+	// The unexported completion: this is the admission surface's own path, and
+	// it has already applied the validation the exported entry point refuses
+	// admissions in order to protect.
+	record, err := dispatch.completeClaim(ctx, CompletionRequest{
 		ID: report.Token.ActionID, ExpectedVersion: report.Token.Version,
 		ClaimID: report.Token.TokenID, Failed: report.Failed,
 		Result:  ExecutionResult{Output: report.Outcome, ErrorCode: report.ErrorCode},
 		Context: report.Context,
-	})
+	}, false)
 	if err == nil {
 		return record, nil
 	}

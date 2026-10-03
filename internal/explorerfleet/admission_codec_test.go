@@ -52,6 +52,12 @@ func TestAdmittedDeclarationSurvivesTheDurableCodec(t *testing.T) {
 			// it, so losing it on encode would silently turn every retry into a
 			// re-adjudication.
 			record.AdmittedObligation = []byte{0b0000_0101}
+			// The scheme marker rides the same round trip. It is what the
+			// migration verdict reads instead of the identity, so losing it on
+			// encode would make every new admission look like one written
+			// under the superseded scheme and refuse the whole surface.
+			record.AdmittedIdentityScheme =
+				fleet.AdmittedIdentitySchemeDerived
 		}
 		encoded, err := encodeAction(record)
 		if err != nil {
@@ -86,7 +92,8 @@ func TestActionRecordsWrittenBeforeAdmissionDecodeUnchanged(t *testing.T) {
 	}
 	if len(decoded.AdmittedEffects) != 0 ||
 		len(decoded.AdmittedDisclosures) != 0 ||
-		len(decoded.AdmittedObligation) != 0 {
+		len(decoded.AdmittedObligation) != 0 ||
+		decoded.AdmittedIdentityScheme != 0 {
 		t.Fatalf("a dispatched action acquired a declaration: %#v", decoded)
 	}
 	if !reflect.DeepEqual(decoded, legacy) {

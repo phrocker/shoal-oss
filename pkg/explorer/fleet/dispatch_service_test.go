@@ -901,6 +901,15 @@ type memoryDispatchStore struct {
 	records     map[string]ActionRecord
 	transitions map[string]ActionTransition
 	completed   map[string]bool
+	// scans counts ScanActions calls, so a test can assert that stepping over
+	// a region costs a bounded number of them rather than one per record.
+	scans int
+	// failReads makes one identity unreadable, so a test can drive the path a
+	// service takes when a check it must make cannot answer.
+	failReads map[string]error
+	// failScan makes scanning fail, so a test can drive the path a service
+	// takes when a verdict it must reach cannot be reached.
+	failScan error
 }
 
 type uniqueTokenDispatchStore struct {
@@ -931,6 +940,9 @@ func newMemoryDispatchStore() *memoryDispatchStore {
 func (s *memoryDispatchStore) GetAction(_ context.Context, id []byte) (ActionRecord, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err, failing := s.failReads[string(id)]; failing {
+		return ActionRecord{}, err
+	}
 	record, ok := s.records[string(id)]
 	if !ok {
 		return ActionRecord{}, ErrActionNotFound
@@ -1016,14 +1028,31 @@ func (s *memoryDispatchStore) CompleteActionTransition(
 	return nil
 }
 
+// ScanActions walks records in ascending identity order.
+//
+// It iterated the map directly, which is to say in no order at all, and that
+// is why a cursor bug in TeamActions survived the whole suite: the defect
+// depended on admission identities sorting ahead of ordinary ones, and an
+// unordered double cannot express "ahead". A scan double that does not scan in
+// order models the one property every scan caller depends on incorrectly.
 func (s *memoryDispatchStore) ScanActions(_ context.Context, after []byte, limit int) (ActionPage, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	result := ActionPage{}
-	for key, record := range s.records {
+	s.scans++
+	if s.failScan != nil {
+		return ActionPage{}, s.failScan
+	}
+	keys := make([]string, 0, len(s.records))
+	for key := range s.records {
 		if key <= string(after) {
 			continue
 		}
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	result := ActionPage{}
+	for _, key := range keys {
+		record := s.records[key]
 		result.Actions = append(result.Actions, cloneActionRecord(record))
 		if len(result.Actions) == limit {
 			result.Next = append([]byte(nil), record.ID...)

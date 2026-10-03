@@ -64,6 +64,24 @@ func (s *DispatchService) enqueue(
 	if err != nil {
 		return ActionRecord{}, err
 	}
+	// The admission region is refused here, and this is the only place it has
+	// to be: enqueue is the sole entry point at which a caller names a durable
+	// action it does not already own. Everything else takes an ID it must
+	// already hold, and answers a foreign or absent one identically.
+	//
+	// Refused before the store is read, and without regard to what is there,
+	// because the answer is the whole point. This read has no principal check —
+	// it cannot have one, since a caller legitimately enqueues at an ID nobody
+	// holds — so a conditional refusal would still separate occupied from
+	// absent. That was the live oracle: an admission ID is derivable from a
+	// principal tuple that is knowable, so a caller could compute a victim's
+	// admission ID, submit it here, and read occupancy off conflict versus
+	// success. It could also squat an unheld one and deny the victim its own
+	// admission by name.
+	if reservedAdmissionID(request.ID) {
+		return ActionRecord{}, shoal.NewError(
+			shoal.ErrorInvalidArgument, "action ID is reserved")
+	}
 	record, _, err := s.queuedRecord(ctx, decision, request, operation, now)
 	if err != nil {
 		return ActionRecord{}, err
@@ -231,6 +249,21 @@ func (s *DispatchService) Claim(ctx context.Context, request ClaimRequest) (Acti
 	if err != nil {
 		return ActionRecord{}, err
 	}
+	// An admission is not dispatch work. Merging the two claim paths gave
+	// dispatch's reclaim semantics reach over admission records, and a reclaim
+	// means nothing for an admission: the grant was made to one caller which was
+	// told it may perform an effect, and nobody else can finish that. Only the
+	// original caller knows whether the effect happened, so a second party
+	// taking the record and reporting an outcome would be recording a fiction.
+	//
+	// An expired admission is abandoned, not reclaimable, and a claimed record
+	// with a lapsed lease is the honest statement of that — it is exactly what
+	// Outstanding reports as Expired. Refused as not-found, because the caller
+	// does hold the record and saying so would separate an admission it owns
+	// from an action ID that does not exist.
+	if current.isAdmission() {
+		return ActionRecord{}, auth.ObjectNotFound()
+	}
 	if current.Version != request.ExpectedVersion {
 		if current.State == DispatchClaimed &&
 			current.Version == request.ExpectedVersion+1 &&
@@ -387,9 +420,38 @@ func (s *DispatchService) ExecuteClaim(ctx context.Context, claimed ActionRecord
 	if err != nil {
 		return ActionRecord{}, err
 	}
+	// Absence answers as a record the caller may not act on does, which is what
+	// closes the enumeration on this path: the store's own sentinel for an
+	// absent identity and object-not-found for a stored admission were two
+	// answers to the question this surface exists to stop answering.
+	//
+	// There was a third refusal here, ahead of the read, for any identity in the
+	// reserved span. It is gone. It inferred "an admission, or nothing" from the
+	// identity, and the span held ordinary actions before it was reserved — so
+	// it made a legitimately created action permanently unexecutable. It was
+	// also redundant: a reserved identity that is absent is covered by the
+	// normalisation below and one that is stored by the marker check, which is
+	// why no mutation of it alone was ever observable.
 	current, err := s.store.GetAction(ctx, claimed.ID)
 	if err != nil {
+		if errors.Is(err, ErrActionNotFound) {
+			return ActionRecord{}, auth.ObjectNotFound()
+		}
 		return ActionRecord{}, err
+	}
+	// The durable marker identifies admissions regardless of their identity
+	// format, including admissions written before the reserved prefix existed.
+	// This check rejects those records without treating an ordinary action in
+	// the reserved span as an admission.
+	//
+	// Read from the stored record rather than the argument, so a caller that
+	// fabricates a record with the marker stripped does not dodge it. That
+	// matters here more than on the other paths: ExecuteClaim takes the record
+	// instead of loading it from an ID, and a grant holder knows the ID, the
+	// token, the version, the action fields and the deadline, and that a fresh
+	// grant sits at fence one.
+	if current.isAdmission() {
+		return ActionRecord{}, auth.ObjectNotFound()
 	}
 	if current.State.terminal() && current.Version == claimed.Version+1 &&
 		current.ClaimFence == claimed.ClaimFence &&
@@ -484,7 +546,29 @@ func (s *DispatchService) ExecuteClaim(ctx context.Context, claimed ActionRecord
 // ExecuteClaim does, because the terminal state at the expected version under
 // the same claim is recognised as the reporter's own work rather than a
 // conflict.
+// CompleteClaim is the dispatch surface's completion. It refuses an admission,
+// which the admission surface closes through its own path.
+//
+// This is not only about a reclaimed record. An admission token carries the
+// action ID, the claim ID and the version, which is everything this request
+// needs — so the caller that holds a live grant could always have completed it
+// here instead of reporting, skipping the one-shot rule, the exact-replay
+// comparison and the malformed-report rejection that the admission path exists
+// to apply. The expiry the review traced is one way in; holding your own token
+// is the other, and it needs no expiry at all.
 func (s *DispatchService) CompleteClaim(ctx context.Context, request CompletionRequest) (ActionRecord, error) {
+	return s.completeClaim(ctx, request, true)
+}
+
+// completeClaim is the shared body. refuseAdmissions is false only for the
+// admission surface, which reaches it having already applied its own
+// validation; splitting it that way keeps one completion implementation rather
+// than a second one that could validate less.
+func (s *DispatchService) completeClaim(
+	ctx context.Context,
+	request CompletionRequest,
+	refuseAdmissions bool,
+) (ActionRecord, error) {
 	ctx, cancel := s.deadline(ctx, request.Context)
 	defer cancel()
 	decision, now, err := s.begin(ctx, auth.OperationInvoke, request.Context)
@@ -510,6 +594,9 @@ func (s *DispatchService) CompleteClaim(ctx context.Context, request CompletionR
 	current, err := s.authorizedCurrent(ctx, decision, request.ID, auth.OperationInvoke, now)
 	if err != nil {
 		return ActionRecord{}, err
+	}
+	if refuseAdmissions && current.isAdmission() {
+		return ActionRecord{}, auth.ObjectNotFound()
 	}
 	// A replayed report. The action is already terminal at the version this
 	// reporter expected to produce, under this reporter's own claim, so the
@@ -759,6 +846,14 @@ func (s *DispatchService) Cancel(ctx context.Context, request CancelRequest) (Ac
 	if err != nil {
 		return ActionRecord{}, err
 	}
+	// Cancelling an admission here would rewrite an abandoned grant as a
+	// refusal, and those are opposite statements: a cancelled admission says
+	// Shoal refused, while an expired claimed one says Shoal permitted an effect
+	// and never learned what happened. Refused as not-found for the same reason
+	// Claim refuses it.
+	if current.isAdmission() {
+		return ActionRecord{}, auth.ObjectNotFound()
+	}
 	if current.Version != request.ExpectedVersion {
 		if current.State == DispatchCanceled &&
 			current.Version == request.ExpectedVersion+1 &&
@@ -822,7 +917,24 @@ func (s *DispatchService) Status(ctx context.Context, request StatusRequest) (Ac
 	if err != nil {
 		return ActionRecord{}, err
 	}
-	return s.authorizedCurrent(ctx, decision, request.ID, auth.OperationDispatch, now)
+	current, err := s.authorizedCurrent(
+		ctx, decision, request.ID, auth.OperationDispatch, now)
+	if err != nil {
+		return ActionRecord{}, err
+	}
+	// The fourth path, found by looking for a third. Status discloses nothing
+	// across principals — authorizedCurrent has already refused a foreign
+	// record — so this is not the same class of hole as the terminal paths.
+	//
+	// It is still the last place a dispatch call answered differently for an
+	// admission, and that uniformity is worth having on its own: with this,
+	// every dispatch entry point gives one answer for an admission-region ID
+	// whether it is absent, another principal's, or the caller's own. An
+	// admission's state is Outstanding's to report.
+	if current.isAdmission() {
+		return ActionRecord{}, auth.ObjectNotFound()
+	}
+	return current, nil
 }
 
 // TeamActions returns a bounded page of action records authorized for the
@@ -900,12 +1012,50 @@ func (s *DispatchService) TeamActions(
 	var continuation []byte
 	const maxDiscoveryScans = 4096
 	for scanned := 0; scanned < maxDiscoveryScans; scanned++ {
-		page, scanErr := s.store.ScanActions(ctx, cursor, 1)
+		// Admissions are excluded here, and by the scan rather than by a filter
+		// in this loop. TeamActions deliberately does not require the reader to
+		// be the action's principal — that is what makes it a team view — so an
+		// admission reaching it is handed to another caller along with what its
+		// owner declared, the digest of the references it named, and the bitmap
+		// of the ones it was obliged to withhold.
+		//
+		// A filter here was the first attempt and it disabled this surface. It
+		// skipped the cursor advance at the bottom of the loop, so the first
+		// admission was rescanned four thousand times and nothing past it was
+		// ever reached — and admission identities sorted first back then, so
+		// that was every deployment with one grant. scanDispatchActions drops
+		// them instead, where it cannot interact with this loop's control flow
+		// at all.
+		//
+		// The budget below is affordable because the span is maximal, so this
+		// loop reaches every ordinary record before the first admission and
+		// spends nothing on them until there is nothing else left to find. The
+		// exception is an ordinary action stored inside the span before it was
+		// reserved, which sorts among the admissions; a deployment holding one
+		// is exactly the deployment ErrAdmissionSpanOccupied is refusing
+		// admission to until an operator clears it.
+		page, scanErr := s.scanDispatchActions(ctx, cursor, 1)
 		if scanErr != nil {
 			return ActionPage{}, scanErr
 		}
+		// Advanced before anything can return or skip. It was at the bottom,
+		// which is what let a `continue` strand it; a cursor that only moves on
+		// the fall-through path is a cursor that stops moving the first time
+		// someone adds an early exit.
+		next := append([]byte(nil), page.Next...)
+		cursor = next
+		// An empty page is not an exhausted scan. scanDispatchActions can
+		// filter a page down to nothing and still have more to read — two
+		// consecutive admissions outside the reserved region spend both of its
+		// attempts — and treating that as the end reported end-of-scan with
+		// records still ahead. That was the same outage as the stranded cursor,
+		// with a narrower trigger: two pre-prefix admissions rather than one
+		// admission of any kind. Only an empty continuation means exhausted.
 		if len(page.Actions) == 0 {
-			return result, nil
+			if len(next) == 0 {
+				return result, nil
+			}
+			continue
 		}
 		record := page.Actions[0]
 		visible := containsByteValue(sources, record.SourceID) &&
@@ -928,12 +1078,11 @@ func (s *DispatchService) TeamActions(
 				return result, nil
 			}
 			result.Actions = append(result.Actions, cloneActionRecord(record))
-			continuation = append([]byte(nil), page.Next...)
+			continuation = append([]byte(nil), next...)
 		}
-		if len(page.Next) == 0 {
+		if len(next) == 0 {
 			return result, nil
 		}
-		cursor = page.Next
 	}
 	result.Next = append([]byte(nil), cursor...)
 	return result, nil
@@ -972,6 +1121,58 @@ func containsByteValue(values [][]byte, value []byte) bool {
 	return index < len(values) && bytes.Equal(values[index], value)
 }
 
+// scanDispatchActions scans committed actions for a surface that must not see
+// admissions, excluding them by their durable marker.
+//
+// It used to skip them by key range instead, jumping over the reserved span in
+// one move. That was unsound for a reason no amount of care inside the jump
+// could fix: skipping a range asserts that everything in it is something the
+// caller must not see, and the span was a legal dispatch identity space before
+// it was reserved — so an ordinary action already stored there was skipped,
+// invisible to Pull and TeamActions with nothing to indicate it. Reachability
+// is a property of what a record *is*, which only the marker records, not of
+// where its identity happens to sort.
+//
+// The jump existed to keep a caller's scan budget off admissions, which sorted
+// first. The budget concern goes with the jump because admissions now sort
+// after every ordinary identity, and that holds exactly rather than nearly:
+// admissionIDPrefix is maximal — every byte 0xff — so any identity outside the
+// span differs from it at a byte that is necessarily smaller and sorts below
+// the whole of it. A merely high prefix is not enough. When the span was
+// "\xffshoal.admission\x00" an ordinary \xff\xff sorted above every
+// admission, so a caller paging toward it spent the budget on grants first and
+// a large enough tail of them starved it outright — the same outage the jump
+// was covering for, reached from the other end.
+//
+// What remains is a caller paging to the very end, which filters through the
+// span having already been given everything it asked for, and an ordinary
+// action stored inside the span before it was reserved, which sorts among the
+// admissions rather than below them. The second is the deployment
+// ErrAdmissionSpanOccupied refuses admission to.
+//
+// A page can still filter down to nothing at that tail, and the cursor is
+// returned so the caller pages on. An empty page is not an exhausted scan; only
+// an empty continuation is.
+func (s *DispatchService) scanDispatchActions(
+	ctx context.Context, after []byte, limit int,
+) (ActionPage, error) {
+	page, err := s.store.ScanActions(ctx, after, limit)
+	if err != nil {
+		return ActionPage{}, err
+	}
+	result := ActionPage{
+		Next:    append([]byte(nil), page.Next...),
+		Actions: make([]ActionRecord, 0, len(page.Actions)),
+	}
+	for _, record := range page.Actions {
+		if record.isAdmission() {
+			continue
+		}
+		result.Actions = append(result.Actions, record)
+	}
+	return result, nil
+}
+
 func (s *DispatchService) Pull(ctx context.Context, request PullActionsRequest) (ActionPage, error) {
 	ctx, cancel := s.deadline(ctx, request.Context)
 	defer cancel()
@@ -982,7 +1183,17 @@ func (s *DispatchService) Pull(ctx context.Context, request PullActionsRequest) 
 	if request.Limit <= 0 || request.Limit > MaxDispatchListResults {
 		return ActionPage{}, shoal.NewError(shoal.ErrorInvalidArgument, "dispatch pull limit is outside its bound")
 	}
-	page, err := s.store.ScanActions(ctx, request.After, request.Limit)
+	// An admission is never work a dispatch worker may take. It is only ever
+	// claimed, and this loop returns a claimed record whose lease has lapsed —
+	// which for an admission is not work waiting to be redone but a grant
+	// nobody came back to report on. Claim refuses it anyway; dropping it in
+	// the scan keeps it out of the listing that would otherwise offer it.
+	//
+	// This surface does not refill a page the filter emptied, so an admission
+	// ahead of ordinary work would cost a worker an empty page and a retry per
+	// grant. It cannot be ahead of any: the span is maximal, so every ordinary
+	// identity sorts below every admission.
+	page, err := s.scanDispatchActions(ctx, request.After, request.Limit)
 	if err != nil {
 		return ActionPage{}, err
 	}
@@ -1097,6 +1308,22 @@ func (s *DispatchService) authorizedCurrent(ctx context.Context, decision auth.D
 	}
 	current, err := s.store.GetAction(ctx, id)
 	if err != nil {
+		// Absence answers exactly as a record the caller may not see does.
+		// These were different messages under one status: the store's own
+		// sentinel for absent, and the object-not-found shape below for
+		// foreign. That difference is #398, and it stops being a cosmetic
+		// inconsistency once admission identities are derivable — a caller can
+		// compute a victim's admission ID and read existence off the message,
+		// which is the enumeration the reserved namespace closed at enqueue,
+		// reopened through every ID-taking entry point.
+		//
+		// Normalised here rather than at each caller because every one of them
+		// — Claim, Cancel, Status, CompleteClaim — reaches the store through
+		// this function, and a per-caller fix is a fix that the next caller
+		// forgets.
+		if errors.Is(err, ErrActionNotFound) {
+			return ActionRecord{}, auth.ObjectNotFound()
+		}
 		return ActionRecord{}, err
 	}
 	if !sameActionPrincipal(decision, current) {
@@ -1317,6 +1544,7 @@ func writeDispatchTupleField(digest hash.Hash, value []byte) {
 func equivalentEnqueue(current, wanted ActionRecord) bool {
 	return equalEffects(current.AdmittedEffects, wanted.AdmittedEffects) &&
 		bytes.Equal(current.AdmittedDisclosures, wanted.AdmittedDisclosures) &&
+		current.AdmittedIdentityScheme == wanted.AdmittedIdentityScheme &&
 		bytes.Equal(current.ID, wanted.ID) &&
 		bytes.Equal(current.IdempotencyKey, wanted.IdempotencyKey) &&
 		current.AgentID == wanted.AgentID &&

@@ -152,7 +152,28 @@ type ActionRecord struct {
 	// caller supplies that list again on the retry, where the digest proves it
 	// is the same one.
 	AdmittedObligation []byte
+	// AdmittedIdentityScheme records which identity scheme produced this
+	// admission's durable key. Zero means the superseded one, where the key was
+	// the caller's own name; AdmittedIdentitySchemeDerived means the key is
+	// derived from the principal.
+	//
+	// It exists because the identity cannot answer this question. Under the
+	// superseded scheme the key was caller-supplied opaque bytes, so a legacy
+	// record's key may lie anywhere — including inside the reserved span, and
+	// including the exact prefix-plus-digest shape a derived key has. Reading
+	// the scheme off the key therefore certifies an adversarially-named legacy
+	// record as new, a retry derives a different key, and a second live grant is
+	// issued for work already permitted.
+	//
+	// Zero is the right value for a legacy record and gob gives it for free: a
+	// record written before this field existed decodes with it absent, which is
+	// exactly the claim "produced by the superseded scheme".
+	AdmittedIdentityScheme uint32
 }
+
+// AdmittedIdentitySchemeDerived marks an admission whose durable key is derived
+// from the principal rather than supplied by the caller.
+const AdmittedIdentitySchemeDerived uint32 = 1
 
 // MaxAdmittedObligationBytes bounds the obligation bitmap: one bit per
 // reference the declaration may carry.
@@ -185,6 +206,13 @@ func validateAdmittedDeclaration(record ActionRecord) error {
 			return shoal.NewError(
 				shoal.ErrorInvalidArgument, "admitted effects are not canonical")
 		}
+	}
+	// A scheme marker without an admission marker is incoherent: it claims how
+	// an admission's key was produced for a record that is not an admission.
+	if record.AdmittedIdentityScheme != 0 && len(record.AdmittedEffects) == 0 {
+		return shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			"admitted identity scheme requires an admitted effect")
 	}
 	if len(record.AdmittedObligation) > MaxAdmittedObligationBytes {
 		return shoal.NewError(
@@ -965,6 +993,9 @@ func cloneActionRecord(input ActionRecord) ActionRecord {
 		[]byte(nil), input.AdmittedDisclosures...)
 	result.AdmittedObligation = append(
 		[]byte(nil), input.AdmittedObligation...)
+	// AdmittedIdentityScheme needs no line: the struct assignment above copies
+	// a scalar, and unlike the slices there is no backing array to share. An
+	// explicit copy for it would be a line no mutation could observe.
 	return result
 }
 

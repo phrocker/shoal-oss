@@ -93,6 +93,201 @@ identities, for the same reason the declaration is a digest: a position
 discloses nothing without the list it indexes, and the caller supplies that
 list again on the retry, where the digest proves it is the same one.
 
+### The durable identity is derived, not the caller's name
+
+A caller names its own admission, and the durable namespace is global. Those
+two facts together used to mean that two principals naming the same admission
+landed on one record — and, worse, that the collision was *visible*: an unheld
+name produced a grant and a name another principal held produced a conflict, a
+different status code, so probing names enumerated other principals'
+admissions.
+
+Two things do the work, and an earlier version of this section credited the
+wrong one.
+
+**The derivation keeps principals apart.** The durable ID is
+`digest(authorization domain, subject, actor, client, delegation chain,
+caller's name)`, each component length-framed, so two principals choosing the
+same name hold two different records. That is all it does. It is unkeyed over a
+tuple of a workspace and some identities — knowable in most deployments — so it
+makes nothing unguessable, and the previous claim that "neither can address the
+other's" was false. Addressing a record never required this surface: a caller
+could compute the victim's derived ID, submit it to dispatch enqueue as an
+ordinary action ID, and read occupancy off conflict versus success. It could
+also squat an unheld one and deny the victim its own admission by name.
+
+**A reserved namespace makes them unreachable.** `admissionIDPrefix` marks a
+span of the action identity space that no caller may name. `enqueue` refuses it
+unconditionally — before the store is read, and regardless of what is there —
+and that is the only place the refusal is needed, because enqueue is the one
+entry point at which a caller names a durable action it does not already own.
+Every other path takes an identity it must already hold and answers a foreign
+or absent one identically.
+
+**Every byte of the span is `0xff`, and that is a correctness requirement.**
+The listings exclude admissions by their durable marker and keep no scan budget
+off them by position, which is only affordable if a scan meets every ordinary
+record before the first admission. A prefix delivers that if and only if it is
+*maximal* — every byte `0xff` — because only then does any identity outside the
+span differ from it at a byte that is necessarily smaller, and so sort below
+the whole span.
+
+Two earlier versions each got this wrong in the opposite direction. The first
+put the span at the *bottom* of the key space and had the listings jump over
+the key range to keep their scan budget off it — a jump that necessarily
+skipped anything *else* in the range, including an ordinary action stored there
+before the span was reserved at all. The second moved the span to
+`\xffshoal.admission\x00`, which stopped admissions sorting first without
+making them sort last: `'s'` leaves every byte above it free, so an ordinary
+`\xff\xff` sorted *after* every admission in the store. `Pull` does not refill
+a page its filter empties, so a worker got an empty page and a cursor for as
+long as the admission tail lasted, and `TeamActions` spent its bounded
+discovery budget before reaching the action at all — the same listing outage
+the move to `0xff` was meant to end, reached from the other end of the span.
+One byte of `0xff` was enough to stop admissions sorting first. It was not
+enough to make them sort last.
+
+**The span is four bytes wide, and the width is a rollout budget, not a
+secret.** Maximality fixes the ordering at any width, so width trades only
+against the second rollout condition below: a pre-existing ordinary action
+inside the span blocks the issuing of new admissions until an operator clears
+it. Action identities are opaque bytes with no charset rule, so a client
+minting random ones puts 1-in-256 of them under a one-byte span — enough that
+admission would refuse to start on a sizable store, and live dispatch records
+cannot always be deleted to unblock it. Four bytes makes that 1-in-2^32, under
+one expected collision in a store of a billion random identities. A longer span
+would not be more private, only less likely to be already occupied.
+
+The span also carries no readable tag inside it. A tag invites reading meaning
+back out of the identifier, which is the mistake three review rounds were.
+
+**The span says nothing about what a record is.** It is a forward rule about
+what may be created, not a classifier. Reachability, ownership and identity
+scheme are all read from recorded state:
+
+| question | answered by |
+| --- | --- |
+| is this an admission? | `AdmittedEffects` is non-empty |
+| which identity scheme produced its key? | `AdmittedIdentityScheme` |
+| what was admitted? | `AdmittedEffects`, `AdmittedDisclosures` |
+| what was the caller obliged to withhold? | `AdmittedObligation` |
+
+Three consecutive review rounds found the same error here — a property inferred
+from data that did not carry it. Ownership inferred from a record with no
+domain. Identity scheme inferred from an identity that was caller-chosen.
+Reachability inferred from a span that predates the reservation. The table is
+the answer to the class: every decision reads a marker that was written when
+the fact was known, and the only remaining identity-derived rule is enqueue's
+refusal, which cannot be wrong about an existing record because it never looks
+at one.
+
+A keyed digest was the other option and is the weaker one. It hides an
+identifier without making it unreachable, and secrecy of an identifier is not
+access control: anything that ever leaks one — a log line, an expired token, a
+record read through some other surface — hands the reachability back. It also
+needs a durable secret with a rotation story, and rotation re-derives every live
+admission's identity, orphaning outstanding grants whose tokens no longer
+resolve. The namespace costs none of that.
+
+The token carries the derived ID, which is opaque to the caller and needs to be:
+it is only ever handed back.
+
+### Rollout: records written before the identity was derived
+
+**This section is empty of consequence for anyone upgrading from a release.**
+The only release is `v1.3.0` (2026-08-26); the admission surface merged
+2026-09-29 and is not an ancestor of that tag. A record written under the
+superseded identity scheme can therefore only exist in a deployment running an
+unreleased `main` build.
+
+Where one does exist, the derivation moved its durable key: it lives at the
+caller's own name, not the derived one, so a request for it misses. Granting on
+that miss would issue a second live token for work already permitted, and for a
+record that is already terminal it is worse — a durable *denial* would be
+re-adjudicated and could come back granted, inverting a refusal that is on the
+record.
+
+So this build will not adjudicate at all while such a record exists.
+`Request` reaches a whole-store verdict before anything else and refuses with
+`ErrAdmissionUnmigrated` — an unavailable, not a denial, because the caller has
+done nothing wrong and can do nothing about it. The verdict is cached once
+proven clean, since this build cannot write an unprefixed admission; a dirty or
+unreachable verdict is never cached, so clearing the records needs no restart.
+
+**Why whole-store rather than per-record.** A per-record check was tried and
+cannot be made correct. The derivation treats the authorization domain as part
+of the principal, but an `ActionRecord` does not carry its domain — so a
+predicate over a legacy record can establish ownership only two ways, and both
+are wrong. `sameActionPrincipal` omits the domain, which hands the distinctive
+unmigrated error to an identically-named identity in another domain and reopens
+the existence oracle this work exists to close. Routing through
+`authorizedCurrent` to recover the domain from the agent descriptor is blind to
+any record whose agent generation has moved — and `Heartbeat` bumps the
+generation on every lease renewal, so it is blind to essentially all of them,
+and grants over them instead. Under-refusing double-grants, over-refusing
+enumerates, and the information needed to do neither is not in the record. A
+whole-store verdict has no ownership predicate to get wrong.
+
+**The scheme is read from a marker, not from the identity.** A legacy
+admission's key was caller-supplied opaque bytes, so it may lie anywhere —
+inside the reserved span included, and in the exact prefix-plus-digest shape a
+derived key has. An earlier verdict inferred "new scheme" from the span and so
+certified precisely that record as new: the retry derived a different key and
+issued a second live grant. `AdmittedIdentityScheme` settles it instead, and is
+sound for any identity, adversarial ones included. Its zero value is the
+superseded scheme, which is what a record written before the field existed
+decodes to — so the default is the safe reading rather than a lucky one.
+`equivalentEnqueue` compares it too, which refuses such a record as a conflict
+even if the verdict were somehow passed.
+
+**The second rollout condition: ordinary actions inside the span.** Action
+identities are arbitrary non-empty bytes and always have been, so the span was
+a legal place to store an ordinary action long before it was reserved — and
+unlike legacy *admissions*, which no release contains, such a record can exist
+in a store upgraded from `v1.3.0`. The collision surface is every action
+identity beginning with four `0xff` bytes. An operator can enumerate it with a
+single range scan, and for a client minting text or UUID identities the set is
+empty by construction, because `0xff` is not a byte either produces.
+
+Nothing silently mishandles such a record: the listings exclude admissions by
+marker rather than by range, and `ExecuteClaim` no longer refuses an identity
+for its shape, so the action stays listed, claimable and executable. Two things
+are narrower than full service. `enqueue` refuses the span unconditionally, so
+the action cannot be enqueue-replayed and its idempotent retry fails. And
+because it sorts *among* the admissions rather than below them, a listing
+reaches it only after paging through every grant in the store — within
+`TeamActions`' discovery budget while the admission tail is small, and not
+beyond it. That is the one case the maximality argument above does not cover,
+and it is exactly the deployment `ErrAdmissionSpanOccupied` refuses to issue
+new admissions to until an operator clears the span. It is reported separately
+from the legacy condition because the remedy differs.
+
+**What still works while the verdict is dirty.** `Report` and `Outstanding`
+deliberately do not consult it. A grant already issued must stay reportable, or
+upgrading strands the audit record for an effect that may already have
+happened, and those records are exactly what an operator has to find. So
+in-flight grants complete and remain visible; what stops is the issuing of new
+ones.
+
+**Draining means removing.** Reporting a legacy grant records its outcome but
+leaves a record written under the superseded scheme, so serving resumes only
+once the records are gone. That is deliberate: the alternative is a rule about
+which terminal states are safe to ignore, which is the per-record reasoning
+that just failed.
+
+**If the verdict cannot be reached** — the scan errors, or exceeds its page
+bound — the request refuses. Serving while unable to prove no unmigrated record
+exists *is* the double grant. The bound is set far above any plausible store
+and exists so the loop terminates rather than as an operational limit.
+
+**The residual, stated plainly:** while a legacy admission exists, its name
+remains enumerable through dispatch enqueue, because the reserved span cannot
+recognise an identity that predates it. That is #398's exposure over a
+caller-chosen name. It is not closable in `enqueue` — that path must tell
+occupied from absent to be idempotent at all — so the remedy is to hold no such
+records, which is the default for anyone upgrading from a release and which the
+refusal above forces for anyone else.
+
 ### An admission is distinguishable from a dispatch action
 
 `AdmittedEffects` is the marker — an admission is refused before it reaches a
@@ -110,6 +305,47 @@ This narrows a claim made earlier in this document. Before the marker existed,
 an outstanding admission and an outstanding claim genuinely were
 indistinguishable; they are not any more, and the surface no longer pretends
 otherwise.
+
+The dispatch surface checks the same marker, in the other direction, at every
+path that takes or returns an action: `Pull` and `TeamActions` skip admissions,
+and `Claim`, `Cancel`, `CompleteClaim`, `ExecuteClaim` and `Status` refuse them
+as not-found.
+
+That list grew twice under review, one function at a time, which is worth
+recording. `ExecuteClaim` was missed because it takes the record rather than an
+ID, so a grant holder could synthesise the argument from what its own token told
+it — the guard therefore reads the *stored* record, not the one passed in, or
+omitting the marker would dodge it. `TeamActions` was missed because it is the
+one path that deliberately does not require the reader to be the action's
+principal, so an admission there is handed to *another* caller along with what
+the owner declared and was obliged to withhold. `Status` discloses nothing
+across principals and is guarded anyway, so that every dispatch entry point
+gives one answer for an admission-region identity whether it is absent, another
+principal's, or the caller's own.
+
+Absence and foreignness are normalised to one answer in `authorizedCurrent`
+rather than at each caller. They were different messages under one status, which
+was cosmetic while identities were opaque and stops being cosmetic once they are
+derivable: a caller could compute a victim's admission ID and read existence off
+the message, which is the enumeration the namespace closes at enqueue reopened
+through every other door.
+
+That is the price of sharing one claim transition: merging the paths was right,
+and it gave dispatch's reclaim semantics reach over admission records. **A
+reclaim means nothing for an admission.** The grant was made to one caller which
+was told it may perform an effect; nobody else can finish that, and only the
+original caller knows whether the effect happened, so a second party taking the
+record and reporting an outcome would be recording a fiction. An expired
+admission is abandoned, and a claimed record with a lapsed lease is the honest
+statement of that — exactly what `outstanding` reports as `expired`. Cancelling
+one would be worse still, rewriting an abandoned grant as a refusal, which is
+the opposite statement.
+
+The completion guard is not only about expiry. An admission token carries the
+action ID, the claim ID and the version — everything dispatch completion needs —
+so a caller holding a live grant could always have completed it there instead of
+reporting, skipping the one-shot rule, the exact-replay comparison and the
+malformed-report rejection. That route needs no expiry at all.
 
 ## The three answers
 
