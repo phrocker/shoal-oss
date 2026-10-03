@@ -90,3 +90,98 @@ app.kubernetes.io/name: shoal-explore-web
 app.kubernetes.io/instance: {{ .Release.Name }}
 app.kubernetes.io/component: explorer
 {{- end -}}
+
+{{- define "shoal.llmProxyEnabled" -}}
+{{- .Values.llmProxy.enabled -}}
+{{- end -}}
+
+{{- /*
+The proxy's names come from a bounded stem for the same reason the explorer's
+do: Kubernetes rejects a name over 63 characters, and truncating the finished
+name does not help, because the suffix is appended after the truncation. The
+stem reserves room for the longest suffix instead, so a long release name
+shortens the stem rather than overflowing the name.
+
+  stem         53
+  -llm-proxy   10  -> 63
+*/ -}}
+{{- define "shoal.llmProxyStem" -}}
+{{- include "shoal.fullname" . | trunc 53 | trimSuffix "-" -}}
+{{- end -}}
+
+{{- define "shoal.llmProxyName" -}}
+{{- printf "%s-llm-proxy" (include "shoal.llmProxyStem" .) -}}
+{{- end -}}
+
+{{- /*
+A selector distinct from the explorer's and from the storage tier's. The two
+planes are separate processes deliberately, and a selector that could match
+either would let the Service carrying arbitrary prompt traffic land on the pod
+holding the policy store.
+*/ -}}
+{{- define "shoal.llmProxySelectorLabels" -}}
+app.kubernetes.io/name: shoal-llm-proxy
+app.kubernetes.io/instance: {{ .Release.Name }}
+app.kubernetes.io/component: llm-proxy
+{{- end -}}
+
+{{- /*
+The proxy's host allow-list, normalized and comma-joined for -allowed-host.
+
+One definition rather than two, because the guard in validate.yaml and the
+argument in the Deployment have to agree about what an entry is. A blank entry
+is not a configured authority — the gate drops it and then reports the setting
+as missing — so if the guard trimmed and the argument did not, the chart would
+pass its own check and then render `-allowed-host=` with a stray comma or a
+space inside an authority that is matched exactly. An authority with a space in
+it matches nothing, which is the 421 the guard exists to prevent, reached
+through the one path the guard was not looking at.
+
+Emits the empty string when nothing survives, which is what the guard tests.
+*/ -}}
+{{- define "shoal.llmProxyAllowedHosts" -}}
+{{- $hosts := list -}}
+{{- range (default (list) .Values.llmProxy.allowedHosts) -}}
+{{- if trim (default "" .) -}}
+{{- $hosts = append $hosts (trim .) -}}
+{{- end -}}
+{{- end -}}
+{{- join "," $hosts -}}
+{{- end -}}
+
+{{- /*
+Converts a Go duration literal to milliseconds so the chart can compare two of
+them, failing on anything Go itself would not parse.
+
+Helm has no duration type and no duration arithmetic, and the two durations the
+proxy takes are not independent: an upstream request timeout above the
+admission lease produces a call that outlives the permission it was granted
+under. Comparing them needs a number, and reading one out of "90s" is the only
+way to get it.
+
+Compound literals are accepted ("1m30s") because Go accepts them, and a guard
+that refused a duration the binary would take is a false refusal. The
+concatenation check is what makes that safe: it rejects anything with
+characters the unit scan did not consume, so "30sec", "5 s" and "1e3s" fail
+rather than silently parsing as their leading prefix. Fractional and unitless
+forms ("1.5m", "0") are refused deliberately — a bare 0 means "no timeout" to
+Go, which for this component is an upstream call that cannot outlive the lease
+because it cannot end.
+
+Takes a dict of name and value; emits the total in milliseconds.
+*/ -}}
+{{- define "shoal.durationMillis" -}}
+{{- $name := .name -}}
+{{- $value := trim (toString .value) -}}
+{{- $parts := regexFindAll "[0-9]+(ms|h|m|s)" $value -1 -}}
+{{- if or (not $parts) (ne (join "" $parts) $value) -}}
+{{- fail (printf "%s must be a Go duration built from whole numbers and the units ms, s, m or h — for example 30s, 2m or 1m30s (got %q). Anything else is not a duration the binary can parse, so the pod exits at startup with a flag error" $name $value) -}}
+{{- end -}}
+{{- $factors := dict "ms" 1 "s" 1000 "m" 60000 "h" 3600000 -}}
+{{- $total := int64 0 -}}
+{{- range $parts -}}
+{{- $unit := regexFind "(ms|h|m|s)$" . -}}
+{{- $total = add $total (mul (int64 (regexFind "^[0-9]+" .)) (index $factors $unit)) -}}
+{{- end -}}
+{{- $total -}}
+{{- end -}}

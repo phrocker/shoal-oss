@@ -279,3 +279,139 @@ explorer:
   nodeSelector: {}
   tolerations: []
   affinity: {}
+
+# The enforcement plane: an OpenAI-compatible endpoint a caller points at
+# instead of the real provider, which asks the explorer for admission before
+# each call and reports the outcome after it (#390).
+#
+# Off by default and not derived from `mode`, for the same reason the explorer
+# is not: `mode` chooses a storage topology, and the proxy composes with any of
+# them. It is a separate process from the explorer by design, not by packaging
+# convenience — it handles untrusted prompt content from arbitrary callers and
+# talks to third-party endpoints, and co-locating that with the policy store
+# would put prompt injection in the decision plane's address space.
+llmProxy:
+  enabled: false
+  # Its own image: a different binary with a different blast radius from both
+  # the storage tier and the explorer.
+  image:
+    repository: ghcr.io/example/shoal-llm-proxy
+    tag: dev
+    pullPolicy: IfNotPresent
+  # More than one, and that is the point rather than a tuning choice.
+  #
+  # The proxy holds no state root. Every request's decision lives in the
+  # explorer, the admission token travels in the request it was granted for,
+  # and nothing is cached across calls — so two replicas are two independent
+  # askers of the same plane, not two writers to one engine. The explorer
+  # refuses replicas above 1 for exactly the reason that does not apply here.
+  #
+  # It also must not be a singleton in practice: a denial here means the
+  # caller's work does not happen at all, so an unavailable proxy is an outage
+  # for everything behind it, not a degraded read path.
+  replicas: 2
+  servicePort: 8100
+  containerPort: 8100
+  # The orchestrator probe surface (-health-address). A second listener for the
+  # same reason as the explorer's: the OpenAI-compatible listener refuses any
+  # request whose Host is not an exactly configured authority, which a kubelet
+  # addressing the pod by its runtime-assigned IP can never satisfy.
+  healthPort: 8101
+  # Required. The external authorities this proxy answers to, exactly matched.
+  # Empty means every request is refused with 421, so validate.yaml refuses to
+  # render rather than deploy a proxy that governs nothing because it answers
+  # nothing. Usually the port-less in-cluster or ingress name clients are
+  # configured with as their OpenAI base URL.
+  allowedHosts: []
+  # The decision plane. Every one of these is required: a proxy that cannot ask
+  # must deny, and a proxy that denies everything is indistinguishable from a
+  # total outage of whatever is behind it.
+  admission:
+    # Base URL of the explorer's authenticated API (-admission-url).
+    url: ""
+    # Env var holding the bearer token the proxy presents to the explorer
+    # (-admission-token-env). The chart projects it from the Secret below.
+    tokenEnv: SHOAL_ADMISSION_TOKEN
+    # Required, always. The explorer's API has no unauthenticated mode in a
+    # cluster, so without a token every admission request is a 401 and the
+    # proxy fails closed on all of them.
+    credentialSecretName: ""
+    credentialSecretKey: token
+    # The admission lease (-lease): how long the granted token stays
+    # reportable. pkg/explorer/fleet caps it at MaxActionClaimTTL, five
+    # minutes, and refuses a request outside that bound — so a larger value
+    # here is not a longer lease, it is every call denied with an
+    # invalid-argument the caller cannot act on. validate.yaml holds the bound.
+    lease: 60s
+    # Plaintext to a non-loopback decision plane is refused at render.
+    #
+    # Over http:// the bearer token crosses the network in the clear and, worse,
+    # so does the verdict: anything on the path can rewrite a deny into an
+    # allow, which is the whole enforcement plane silently removed. Set this
+    # true only where a mesh provides the transport authentication the scheme
+    # would — an mTLS sidecar pair, where the proxy's http:// upstream is
+    # already an encrypted authenticated hop.
+    allowPlaintext: false
+  # The real provider the proxy forwards admitted calls to.
+  upstream:
+    baseURL: ""
+    # Env var holding the upstream credential (-upstream-api-key-env).
+    apiKeyEnv: SHOAL_UPSTREAM_API_KEY
+    credentialSecretName: ""
+    credentialSecretKey: api-key
+    # -request-timeout. Must not exceed admission.lease: an upstream call that
+    # can outlive the lease produces an admission that was granted, performed,
+    # and can no longer be reported against — an abandoned record whose outcome
+    # stays unknown. validate.yaml refuses that ordering.
+    requestTimeout: 30s
+  # The registered descriptor this proxy admits against. The explorer resolves
+  # all six together, and a value that is absent or wrong is not a startup
+  # failure — it is a proxy that comes up healthy and is refused by the plane on
+  # every request.
+  identity:
+    agentID: ""
+    # int64, positive. Note that this pins a descriptor *generation*: a
+    # re-registration bumps it, and this value has to be bumped with it.
+    agentGeneration: 1
+    capability: ""
+    action: ""
+    # Scope source and policy, canonical unpadded base64url as the API encodes
+    # every opaque identity.
+    sourceID: ""
+    policyID: ""
+  service:
+    type: ClusterIP
+    annotations: {}
+  terminationGracePeriodSeconds: 45
+  resources:
+    requests:
+      cpu: 250m
+      memory: 256Mi
+    limits:
+      cpu: "1"
+      memory: 1Gi
+  # Explicit rollout contract instead of relying on the apps/v1 default (25%
+  # each way, which rounds to 0/1 at the default two replicas — spelling it out
+  # pins that behavior at any replica count rather than leaving it to
+  # rounding). maxUnavailable: 0 keeps every replica serving through a rollout:
+  # no old pod is removed until a surge pod has passed readiness. For a plane
+  # whose unavailability stops the caller's work outright, that is the only
+  # defensible default.
+  strategy:
+    maxUnavailable: 0
+    maxSurge: 1
+  podDisruptionBudget:
+    enabled: true
+    # One voluntary disruption at a time, like the read fleet and unlike the
+    # explorer. maxUnavailable: 0 is refused at render here: the proxy is
+    # stateless and replaceable, so a budget that refuses every eviction buys
+    # no safety and instead wedges `kubectl drain` and autoscaler
+    # consolidation forever.
+    maxUnavailable: 1
+  nodeSelector: {}
+  tolerations: []
+  # Empty keeps the chart's default soft anti-affinity, which spreads replicas
+  # across nodes so a single node loss is not the whole plane. Setting this
+  # replaces that default outright rather than merging with it — see
+  # llm-proxy-deployment.yaml.
+  affinity: {}

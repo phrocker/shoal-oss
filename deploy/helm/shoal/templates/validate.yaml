@@ -121,3 +121,243 @@
 {{- fail "explorer.healthPort must differ from explorer.containerPort: they are two listeners and cannot share a port" -}}
 {{- end -}}
 {{- end -}}
+
+{{- /* The LLM proxy (#390).
+
+       Every refusal below exists because the alternative is not a crash. The
+       proxy is the one place in Shoal where a denial means the caller's work
+       does not happen at all, and it is required to fail closed — so almost
+       every way of misconfiguring it produces a pod that passes every probe
+       and refuses every request. From outside that is indistinguishable from a
+       total outage of whatever is configured to go through it, and it is what
+       these guards move from a production incident to `helm template`. */ -}}
+{{- if eq (include "shoal.llmProxyEnabled" .) "true" -}}
+{{- $proxy := .Values.llmProxy -}}
+{{- $admission := $proxy.admission -}}
+{{- $upstream := $proxy.upstream -}}
+{{- $identity := $proxy.identity -}}
+
+{{- /* Every value is normalized once, and `default ""` comes before `trim`
+       rather than after.
+
+       A values file that writes a key and leaves it empty — `url:` with
+       nothing after it — produces nil, not "". Three different things go wrong
+       with that, and all three were observed:
+
+       nil reaches `trim` as a type error, so the render fails with a Go
+       template stack location instead of the sentence saying what breaks;
+       `toString nil` is the string "<nil>", which is non-blank, so a
+       required-value check reads an absent value as configured and the pod
+       renders with an empty flag — the healthy-looking proxy that is refused
+       on every request, which is the exact failure these guards exist for;
+       and `concat` over a nil list panics with a nil pointer dereference,
+       which is a crash rather than a refusal.
+
+       Normalizing first is what makes "absent", "empty" and "whitespace" one
+       case everywhere below. */ -}}
+{{- $admissionURL := trim (default "" $admission.url) -}}
+{{- $admissionTokenEnv := trim (default "" $admission.tokenEnv) -}}
+{{- $admissionSecret := trim (default "" $admission.credentialSecretName) -}}
+{{- $admissionSecretKey := trim (default "" $admission.credentialSecretKey) -}}
+{{- $upstreamURL := trim (default "" $upstream.baseURL) -}}
+{{- $upstreamKeyEnv := trim (default "" $upstream.apiKeyEnv) -}}
+{{- $upstreamSecret := trim (default "" $upstream.credentialSecretName) -}}
+{{- $upstreamSecretKey := trim (default "" $upstream.credentialSecretKey) -}}
+{{- /* The allow-list comes from the same template the Deployment's
+       -allowed-host argument is built from, so the guard and the argument
+       cannot disagree about what counts as an entry. */ -}}
+{{- $allowedHosts := include "shoal.llmProxyAllowedHosts" . -}}
+
+{{- /* Each malformed-value guard below is gated on the value being present, so
+       the required-value guard above it is the one that owns the empty case.
+       Two guards that both fire on "" are one guard as far as any test can
+       tell, and the one that stops firing is then invisible. */ -}}
+
+{{- /* The decision plane's address. Without it the proxy has nothing to ask,
+       and a proxy that cannot ask must deny. */ -}}
+{{- if not $admissionURL -}}
+{{- fail "llmProxy.admission.url is required: the proxy asks the explorer for admission before every call, and one that cannot ask must deny. With no URL there is no decision plane, so every request behind this proxy is refused while the pod itself stays healthy" -}}
+{{- end -}}
+{{- if and $admissionURL (not (or (hasPrefix "http://" $admissionURL) (hasPrefix "https://" $admissionURL))) -}}
+{{- fail (printf "llmProxy.admission.url must be an absolute http:// or https:// base URL (got %q): a bare host is not a URL the proxy can resolve, so every admission request fails as a transport error and the proxy fails closed on all of them" $admissionURL) -}}
+{{- end -}}
+
+{{- /* Plaintext to a decision plane across a real network is refused, because
+       what travels in the clear is not only the credential.
+
+       Over http:// the bearer token crosses the network unprotected, and so
+       does the verdict. Anything on the path can rewrite a deny into an allow,
+       which removes the enforcement plane without removing any of the evidence
+       that it is running — the one failure here that is not fail-closed.
+       allowPlaintext exists for a mesh that supplies the transport
+       authentication the scheme would, and makes accepting it an explicit act
+       rather than a default. */ -}}
+{{- $admissionLoopback := or (hasPrefix "http://127.0.0.1" $admissionURL) (hasPrefix "http://localhost" $admissionURL) (hasPrefix "http://[::1]" $admissionURL) -}}
+{{- if and (hasPrefix "http://" $admissionURL) (not $admissionLoopback) (not $admission.allowPlaintext) -}}
+{{- fail (printf "llmProxy.admission.url %q is plaintext to a non-loopback decision plane: the bearer token crosses the network in the clear, and so does the verdict — anything on the path can rewrite a deny into an allow, which silently removes the enforcement plane while everything still looks healthy. Use https://, or set llmProxy.admission.allowPlaintext=true to accept it where a mesh already authenticates the hop" $admissionURL) -}}
+{{- end -}}
+
+{{- /* The explorer's API has no unauthenticated mode a pod can reach: this
+       chart refuses to render the workspace without an OIDC authenticator, and
+       -dev-auth cannot be bound on a non-loopback listener at all. So an
+       admission request carrying no bearer token is a 401, every time. */ -}}
+{{- if not $admissionTokenEnv -}}
+{{- fail "llmProxy.admission.tokenEnv is required: it names the environment variable the proxy reads the explorer bearer token from, and the chart has nothing to project the Secret into without it — so the proxy asks unauthenticated, is answered 401, and denies every call" -}}
+{{- end -}}
+{{- if not $admissionSecret -}}
+{{- fail (printf "llmProxy.admission.credentialSecretName is required: the explorer's API is authenticated in every deployment this chart can render, so with no token in %s every admission request is a 401 and the proxy denies every call — a pod that passes its probes and governs nothing through" (default "the admission token variable" $admissionTokenEnv)) -}}
+{{- end -}}
+{{- if not $admissionSecretKey -}}
+{{- fail "llmProxy.admission.credentialSecretKey is required: a secretKeyRef with no key does not resolve, so the pod never starts and sits in CreateContainerConfigError" -}}
+{{- end -}}
+
+{{- /* The lease the proxy asks for, against the bound the plane enforces.
+
+       pkg/explorer/fleet caps an admission lease at MaxActionClaimTTL, five
+       minutes, and refuses a request outside the bound with an invalid
+       argument. A larger value here is therefore not a longer lease, it is
+       every call denied — and denied in a way the caller cannot act on and the
+       operator cannot tell apart from a policy denial. */ -}}
+{{- $leaseMillis := int64 (include "shoal.durationMillis" (dict "name" "llmProxy.admission.lease" "value" (default "" $admission.lease))) -}}
+{{- if le $leaseMillis (int64 0) -}}
+{{- fail (printf "llmProxy.admission.lease must be positive (got %q): a non-positive lease is outside the bound the admission surface enforces, so every request is refused as an invalid argument" (trim (toString (default "" $admission.lease)))) -}}
+{{- end -}}
+{{- if gt $leaseMillis (int64 300000) -}}
+{{- fail (printf "llmProxy.admission.lease must not exceed 5m, the MaxActionClaimTTL the admission surface enforces (got %q): a longer lease is not accepted and shortened, it is refused — so every call behind this proxy is denied as an invalid argument, a denial the caller cannot act on and an operator cannot tell apart from policy" (trim (toString (default "" $admission.lease)))) -}}
+{{- end -}}
+
+{{- /* The provider an admitted call actually goes to. */ -}}
+{{- if not $upstreamURL -}}
+{{- fail "llmProxy.upstream.baseURL is required: the proxy forwards admitted calls to a real OpenAI-compatible provider, and with no upstream an admitted request has nowhere to go — the caller sees a failure on exactly the calls policy allowed, and the admission is spent on work that never happened" -}}
+{{- end -}}
+{{- if and $upstreamURL (not (or (hasPrefix "http://" $upstreamURL) (hasPrefix "https://" $upstreamURL))) -}}
+{{- fail (printf "llmProxy.upstream.baseURL must be an absolute http:// or https:// base URL (got %q): anything else is not a URL the proxy can forward to, so every admitted call fails in the hop after the decision" $upstreamURL) -}}
+{{- end -}}
+{{- if not $upstreamKeyEnv -}}
+{{- fail "llmProxy.upstream.apiKeyEnv is required: it names the environment variable carrying the upstream credential, and a pod env entry with no name is not a valid object — the API server rejects the Deployment outright" -}}
+{{- end -}}
+{{- /* Exactly the explorer's chat-provider rule, for exactly its reason: a
+       credential nothing projects into the pod becomes a failure at the moment
+       the first real call is forwarded. A loopback provider needs none. */ -}}
+{{- $upstreamLoopback := or (hasPrefix "http://127.0.0.1" $upstreamURL) (hasPrefix "http://localhost" $upstreamURL) (hasPrefix "http://[::1]" $upstreamURL) -}}
+{{- if and $upstreamURL (not $upstreamLoopback) (not $upstreamSecret) -}}
+{{- fail (printf "llmProxy.upstream.credentialSecretName is required for a remote upstream (%q): the proxy reads %s at request time and nothing projects it into the pod without a Secret, so every admitted call is rejected by the provider for want of a credential — after admission has already been spent on it" $upstreamURL (default "the upstream key variable" $upstreamKeyEnv)) -}}
+{{- end -}}
+{{- if and $upstreamSecret (not $upstreamSecretKey) -}}
+{{- fail "llmProxy.upstream.credentialSecretKey is required when a credential Secret is named: a secretKeyRef with no key does not resolve, so the pod never starts and sits in CreateContainerConfigError" -}}
+{{- end -}}
+
+{{- /* The request timeout against the lease.
+
+       An upstream call that may run longer than the lease is a granted
+       admission that is performed and can then no longer be reported against.
+       pkg/explorer/fleet calls such a record abandoned rather than resolved:
+       whether the effect happened is unknown and stays unknown. That breaks
+       the loop the report exists to close, and leaves the accumulator charging
+       nothing for work that did happen. */ -}}
+{{- $timeoutMillis := int64 (include "shoal.durationMillis" (dict "name" "llmProxy.upstream.requestTimeout" "value" (default "" $upstream.requestTimeout))) -}}
+{{- if le $timeoutMillis (int64 0) -}}
+{{- fail (printf "llmProxy.upstream.requestTimeout must be positive (got %q): an unbounded upstream call outlives its admission lease by construction, so the admission can never be reported and is abandoned rather than resolved" (trim (toString (default "" $upstream.requestTimeout)))) -}}
+{{- end -}}
+{{- /* Compared only when both are positive, so the two guards above own their
+       own cases: a zero lease must not be reported as a timeout problem. */ -}}
+{{- if and (gt $leaseMillis (int64 0)) (gt $timeoutMillis (int64 0)) (gt $timeoutMillis $leaseMillis) -}}
+{{- fail (printf "llmProxy.upstream.requestTimeout (%q) must not exceed llmProxy.admission.lease (%q): a call that outlives its lease is performed under a token that can no longer be reported against, so the admission is abandoned rather than resolved — the effect happened and Shoal never learns that it did" (trim (toString (default "" $upstream.requestTimeout))) (trim (toString (default "" $admission.lease)))) -}}
+{{- end -}}
+
+{{- /* The same host-authority gate the explorer has, with the same
+       consequence: the resolved listen address of a pod is an authority no
+       real client sends, so an empty allow-list refuses everything with 421.
+       Blank entries were dropped before the count, because a list holding only
+       "" is not a configured list — length alone would pass it. */ -}}
+{{- if not $allowedHosts -}}
+{{- fail "llmProxy.allowedHosts needs at least one non-blank value: the proxy binds a non-loopback address in a pod, and with no allow-list every request is refused with 421 Misdirected Request before admission is even asked. List the authority clients send as their OpenAI base URL (usually the port-less Service or ingress name)" -}}
+{{- end -}}
+
+{{- /* The registered descriptor this proxy admits against. The explorer
+       resolves the agent, capability, action and scope together through
+       resolveActionBinding, and a value that is missing is not a startup
+       failure — it is a proxy that comes up healthy and is refused by the
+       plane on every single request, with a denial that carries no reason by
+       design. There is nothing in the pod log to read. */ -}}
+{{- range $field := list "agentID" "capability" "action" "sourceID" "policyID" -}}
+{{- if not (trim (default "" (index $identity $field))) -}}
+{{- fail (printf "llmProxy.identity.%s is required: admission resolves the agent, capability, action and scope together, and an incomplete identity is refused by the plane on every request — the proxy stays healthy and denies every call, with a denial that names no reason by design" $field) -}}
+{{- end -}}
+{{- end -}}
+{{- if le (int64 (default 0 $identity.agentGeneration)) (int64 0) -}}
+{{- fail (printf "llmProxy.identity.agentGeneration must be a positive int64 (got %v): the dispatch surface refuses a non-positive generation as an invalid argument, so every admission request fails before any policy is consulted" (default 0 $identity.agentGeneration)) -}}
+{{- end -}}
+{{- /* Scope identities are canonical unpadded base64url on the wire, as every
+       opaque identity in the API is. A value with padding or a stray character
+       is not decodable, and a length of 4n+1 cannot be the encoding of any
+       byte string — the API refuses both as invalid arguments rather than
+       resolving them to some other scope, so this is a typo detector, not an
+       authorization check. Gated on the value being present: the required
+       guard above owns the empty case. */ -}}
+{{- range $field := list "sourceID" "policyID" -}}
+{{- $value := trim (default "" (index $identity $field)) -}}
+{{- if and $value (not (regexMatch "^[A-Za-z0-9_-]+$" $value)) -}}
+{{- fail (printf "llmProxy.identity.%s must be canonical unpadded base64url (got %q): the admission API refuses anything else as an invalid argument, so every request is denied for a reason that looks nothing like a typo in a values file" $field $value) -}}
+{{- end -}}
+{{- if and $value (eq (mod (len $value) 4) 1) -}}
+{{- fail (printf "llmProxy.identity.%s is %d characters, which no base64url encoding can be (a length of 4n+1 is impossible): the value is truncated, and the admission API refuses it as an invalid argument" $field (len $value)) -}}
+{{- end -}}
+{{- end -}}
+
+{{- /* Placeholders are not configuration. The shipped profile leaves the
+       required values empty so the guards above fire, but a values file copied
+       from the docs can carry the marker text through — and the dangerous case
+       is not the one that fails outright. An identity of literally REPLACE_ME
+       renders a proxy that is refused on every call while the chart reports
+       success, and an allowed host of REPLACE_ME.example.test renders one that
+       answers 421 to everything.
+
+       The allow-list is scanned through the normalized list, not the raw
+       value, because `concat` over a nil list panics — a crash instead of a
+       refusal, and one that only appears if a later edit moves this scan above
+       the allow-list guard. */ -}}
+{{- range (concat (list $admissionURL $upstreamURL $admissionSecret $upstreamSecret) (values (pick $identity "agentID" "capability" "action" "sourceID" "policyID")) (splitList "," $allowedHosts)) -}}
+{{- if contains "REPLACE_ME" (toString (default "" .)) -}}
+{{- fail (printf "llmProxy configuration still contains the placeholder %q: replace every REPLACE_ME before installing" (toString (default "" .))) -}}
+{{- end -}}
+{{- end -}}
+
+{{- /* Two listeners on one port silently means one of them is not serving,
+       and which one loses is decided by bind order rather than by the chart.
+       If the health listener wins, the proxy serves no traffic; if the
+       OpenAI-compatible listener wins, every probe answers 421 and the pod
+       never becomes ready. */ -}}
+{{- if eq (int $proxy.containerPort) (int $proxy.healthPort) -}}
+{{- fail "llmProxy.healthPort must differ from llmProxy.containerPort: they are two listeners and cannot share a port. Whichever binds second fails, and the pod is then either serving nothing or failing every probe" -}}
+{{- end -}}
+{{- range $field := list "containerPort" "healthPort" "servicePort" -}}
+{{- $port := int (default 0 (index $proxy $field)) -}}
+{{- if or (lt $port 1) (gt $port 65535) -}}
+{{- fail (printf "llmProxy.%s must be a port between 1 and 65535 (got %v): anything else is not a port the API server will accept, so the object is rejected at install" $field (default 0 (index $proxy $field))) -}}
+{{- end -}}
+{{- end -}}
+{{- /* The pod runs as uid 65532 with every capability dropped, so a privileged
+       port is not a choice the chart can honour on its behalf. */ -}}
+{{- range $field := list "containerPort" "healthPort" -}}
+{{- if lt (int (default 0 (index $proxy $field))) 1024 -}}
+{{- fail (printf "llmProxy.%s must be 1024 or above (got %d): the container runs as uid 65532 with all capabilities dropped, so it cannot bind a privileged port — the bind fails and the pod restarts forever" $field (int (default 0 (index $proxy $field)))) -}}
+{{- end -}}
+{{- end -}}
+
+{{- /* Replicas. The opposite rule from the explorer's, deliberately: more than
+       one is correct here, and only a negative count is nonsense. */ -}}
+{{- /* Matched as text rather than compared as a number, because `int` is
+       lossy in exactly the cases worth refusing: `int` of nil and of a
+       non-numeric string are both 0, which would render a Deployment with an
+       empty or surprising replica count instead of naming the bad value. */ -}}
+{{- if not (regexMatch "^[0-9]+$" (toString $proxy.replicas)) -}}
+{{- fail (printf "llmProxy.replicas must be a whole number, 0 or more (got %v). Unlike the explorer there is no upper bound: the proxy holds no state root, so replicas are independent askers of one decision plane rather than writers to one engine" $proxy.replicas) -}}
+{{- end -}}
+
+{{- /* A disruption budget that refuses every eviction protects a singleton.
+       This is not one, so it would only wedge drains. */ -}}
+{{- if and $proxy.podDisruptionBudget.enabled (eq (int (default 0 $proxy.podDisruptionBudget.maxUnavailable)) 0) -}}
+{{- fail "llmProxy.podDisruptionBudget.maxUnavailable must not be 0: the proxy is stateless and replaceable, so refusing every voluntary eviction protects nothing and instead makes kubectl drain and cluster-autoscaler consolidation block forever on a pod that could safely have moved. The explorer uses 0 because it is a singleton over one state root; this is not" -}}
+{{- end -}}
+{{- end -}}

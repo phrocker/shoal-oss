@@ -124,15 +124,56 @@ IP, which no static allow-list can name — a probe there answers `421` and the
 pod never becomes ready. See the health-surface section of
 [`docs/shoal-explore-web-deploy.md`](../docs/shoal-explore-web-deploy.md).
 
+### The enforcement plane
+
+The **LLM proxy** — `shoal-llm-proxy`, an OpenAI-compatible endpoint a caller
+points at instead of the real provider — asks the explorer for admission before
+each call and reports the outcome after it. It is a separate process on purpose:
+it handles untrusted prompt content from arbitrary callers and speaks to
+third-party endpoints, and co-locating that with the policy store would put
+prompt injection in the decision plane's address space. Like the explorer it is
+off by default and not derived from `mode`.
+
+```bash
+cp deploy/helm/shoal/values-llm-proxy.yaml my-llm-proxy-values.yaml
+# fill in allowedHosts, admission.url and credential, upstream.baseURL and
+# credential, and the six identity fields, then:
+helm upgrade --install shoal deploy/helm/shoal -f my-llm-proxy-values.yaml \
+  --set llmProxy.image.repository=ghcr.io/YOUR_ORG/shoal-llm-proxy \
+  --set llmProxy.image.tag=TAG
+```
+
+`values-llm-proxy.yaml` **does not install as shipped**, on the same principle.
+`llmProxy.admission.url` may name an explorer installed separately — the proxy
+needs one to ask, not one in the same release — and both planes compose from one
+values file.
+
+It is a **Deployment**, not a StatefulSet, and that single difference is the
+whole difference between the two planes. The proxy holds no state root, so
+replicas are independent askers of one decision plane: more than one is correct,
+the default is two, and `llmProxy.podDisruptionBudget.maxUnavailable: 0` is
+refused — the posture the explorer requires because it is a singleton would only
+wedge drains here.
+
+The refusals, the probe surface and the flag contract are in
+[`docs/llm-proxy-deploy.md`](../docs/llm-proxy-deploy.md). The short version:
+nearly every misconfiguration of this component produces a pod that passes every
+probe and denies every call, because it is required to fail closed — which from
+outside is a total outage of whatever is configured to go through it. That is
+what the render-time guards move to `helm template`.
+
 Run the chart checks before changing any of this:
 
 ```bash
 deploy/helm/validate-chart.sh
 ```
 
-It renders every profile, schema-checks the output, and asserts that each guard
-still refuses and each valid configuration still renders. A guard that silently
-stops firing is the failure this exists to catch.
+It renders every profile, schema-checks the output, asserts that each guard
+still refuses and each valid configuration still renders, and asserts that each
+plane's two listeners are wired end to end. A guard that silently stops firing
+is the failure this exists to catch, so the assertions themselves are
+mutation-tested: each guard is removed in turn and the case that must then fail
+is confirmed to fail.
 
 Replace the example image and environment-specific storage, ZooKeeper,
 credentials, and HDFS values before deployment. Role-level `enabled` values
