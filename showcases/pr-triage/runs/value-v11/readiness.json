@@ -1,0 +1,18 @@
+{
+  "status": "ready_awaiting_future_pr",
+  "protocol_id": "beb0b3abe8cdb39153e33924d6094e9fd76d645f879962b237e48ca082644c70",
+  "registration_commit": "75441df",
+  "new_paid_calls": 0,
+  "cumulative_reported_paid_usd": 1.046898,
+  "remaining_usd": 23.953102,
+  "remaining_cumulative_call_slots": 8,
+  "rehearsal": {
+    "source": "previously assessed PR415; pipeline check only, excluded from V11",
+    "status": "rehearsal_no_paid_calls",
+    "full_population_functions": 43,
+    "changed_units": 52,
+    "packets_prepared": 2,
+    "paid_calls_permitted": false
+  },
+  "background_polling_installed": false
+}
