@@ -675,7 +675,13 @@ func TestBackfillCapabilityHasOneMintSite(t *testing.T) {
 			return err
 		}
 		if entry.IsDir() {
-			if entry.Name() == ".git" || entry.Name() == "vendor" {
+			// Every dot-directory is skipped, not just .git. A git worktree
+			// created under .claude puts a second copy of this repository
+			// inside the tree this walk covers, so the scan finds the same
+			// mint site once per worktree and the count is whatever happens to
+			// be checked out locally. Naming .git alone made the test pass or
+			// fail on something no source change can affect.
+			if strings.HasPrefix(entry.Name(), ".") || entry.Name() == "vendor" {
 				return filepath.SkipDir
 			}
 			return nil

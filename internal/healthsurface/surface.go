@@ -15,7 +15,17 @@
 // specific language governing permissions and limitations
 // under the License.
 
-package main
+// Package healthsurface is the orchestrator probe listener shared by every
+// Shoal process that serves a request surface a kubelet cannot address.
+//
+// It is a package rather than a copy in each command because the two
+// properties that make it correct are orderings, not values — readiness drops
+// before the server stops accepting, and shutdown joins the serve loop before
+// reading its error. A second implementation would have to keep both
+// agreements, and a matched pair of implementations is a promise someone
+// eventually breaks. The dispatch and admission claim paths drifted twice
+// exactly that way.
+package healthsurface
 
 import (
 	"context"
@@ -53,16 +63,16 @@ import (
 // health handler. It is false until the workspace is actually serving and
 // false again as soon as shutdown begins, so a draining pod is removed from
 // Service endpoints before it stops accepting connections.
-type healthState struct {
+type State struct {
 	ready atomic.Bool
 }
 
-func (s *healthState) markReady()    { s.ready.Store(true) }
-func (s *healthState) markDraining() { s.ready.Store(false) }
+func (s *State) MarkReady()    { s.ready.Store(true) }
+func (s *State) MarkDraining() { s.ready.Store(false) }
 
 // newHealthHandler builds the health mux. Any path other than the two routes
 // is a 404 from the mux, so the surface cannot grow by accident.
-func newHealthHandler(state *healthState) http.Handler {
+func NewHandler(state *State) http.Handler {
 	mux := http.NewServeMux()
 	// Liveness answers for the process, not the workspace. It stays 200 while
 	// draining: a pod that is shedding traffic on purpose must not be killed
@@ -96,7 +106,7 @@ func writeHealth(writer http.ResponseWriter, status int, body string) {
 // reads a settled value, rather than racing a watcher and a caller for the
 // same error over a channel — the failure mode fixed in the roleops shutdown
 // path (#382).
-type healthServer struct {
+type Server struct {
 	listener net.Listener
 	server   *http.Server
 	done     chan struct{}
@@ -111,15 +121,15 @@ type healthServer struct {
 // a ready-looking socket while the workspace is still opening its corpus. The
 // workspace listener does not have that property, because it is bound early so
 // an address the workspace may not serve is refused before the corpus opens.
-func startHealthServer(address string, state *healthState) (*healthServer, error) {
-	listener, err := listenHealthTCP("tcp", address)
+func Start(address string, state *State) (*Server, error) {
+	listener, err := ListenTCP("tcp", address)
 	if err != nil {
 		return nil, err
 	}
-	health := &healthServer{
+	health := &Server{
 		listener: listener,
 		server: &http.Server{
-			Handler:           newHealthHandler(state),
+			Handler:           NewHandler(state),
 			ReadHeaderTimeout: 5 * time.Second,
 			ReadTimeout:       10 * time.Second,
 			WriteTimeout:      10 * time.Second,
@@ -139,11 +149,11 @@ func startHealthServer(address string, state *healthState) (*healthServer, error
 
 // listenHealthTCP is a variable so tests can prove a bind failure is reported
 // rather than swallowed.
-var listenHealthTCP = net.Listen
+var ListenTCP = net.Listen
 
 // address reports the resolved listen address, which differs from the
 // requested one whenever the request named port zero.
-func (h *healthServer) address() string {
+func (h *Server) Address() string {
 	if h == nil {
 		return ""
 	}
@@ -154,7 +164,7 @@ func (h *healthServer) address() string {
 // a serve loop that died on its own outranks a slow graceful close, because it
 // is the one that says the surface stopped answering for a reason nobody asked
 // for.
-func (h *healthServer) shutdown(ctx context.Context) error {
+func (h *Server) Shutdown(ctx context.Context) error {
 	if h == nil {
 		return nil
 	}
@@ -168,7 +178,7 @@ func (h *healthServer) shutdown(ctx context.Context) error {
 
 // gracefulServer is the part of *http.Server that drain needs, so a test can
 // observe the readiness bit at the moment the workspace is asked to stop.
-type gracefulServer interface {
+type GracefulServer interface {
 	Shutdown(context.Context) error
 }
 
@@ -184,10 +194,10 @@ type gracefulServer interface {
 // The health surface closes last, after the workspace has finished its
 // graceful close, so the not-ready answer stays available for as long as there
 // is a process to ask.
-func drain(ctx context.Context, state *healthState, workspace gracefulServer, health *healthServer) error {
-	state.markDraining()
+func Drain(ctx context.Context, state *State, workspace GracefulServer, health *Server) error {
+	state.MarkDraining()
 	closeErr := workspace.Shutdown(ctx)
-	if healthErr := health.shutdown(ctx); closeErr == nil {
+	if healthErr := health.Shutdown(ctx); closeErr == nil {
 		closeErr = healthErr
 	}
 	return closeErr
