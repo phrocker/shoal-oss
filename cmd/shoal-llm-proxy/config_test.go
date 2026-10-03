@@ -859,3 +859,52 @@ func TestAGrantNamingAnotherClaimIsRefused(t *testing.T) {
 		t.Fatalf("an echoed token was refused: %d %s", recorder.Code, recorder.Body.String())
 	}
 }
+
+// TestFleetNamesAreValidatedAtStartup moves a per-call 400 to a startup refusal.
+//
+// The admission service applies a grammar to capability and action names
+// (validateName in pkg/explorer/fleet/model.go): non-empty, at most
+// fleet.MaxNameBytes, no surrounding whitespace, and only letters, digits and
+// _-.: — and a name outside it takes a 400 on every admission, which this
+// client reports as plane_unavailable. So static configuration started cleanly,
+// passed both probes, and told every caller to retry a configuration error
+// while the operator saw what looked like an outage.
+//
+// The surrounding-whitespace case is the one the previous check actively hid:
+// it trimmed before testing for emptiness, so " complete" passed and was then
+// sent with the space for the plane to refuse.
+func TestFleetNamesAreValidatedAtStartup(t *testing.T) {
+	for _, probe := range []struct{ name, value, refused string }{
+		{"empty", "", "required"},
+		{"only whitespace", "   ", "whitespace"},
+		{"a leading space", " complete", "whitespace"},
+		{"a trailing space", "complete ", "whitespace"},
+		{"a space inside", "com plete", "letters, digits"},
+		{"a slash", "chat/completions", "letters, digits"},
+		{"an at sign", "complete@v1", "letters, digits"},
+		{"over the byte bound", strings.Repeat("a", fleet.MaxNameBytes+1), "at most"},
+	} {
+		detail := refusal(t, proxyArgs("-action", probe.value))
+		if !strings.Contains(detail, probe.refused) {
+			t.Fatalf("-action %q refused for the wrong reason: %s",
+				probe.name, detail)
+		}
+		// Both flags, or only one of them is guarded.
+		if detail = refusal(t, proxyArgs("-capability", probe.value)); !strings.Contains(
+			detail, probe.refused) {
+			t.Fatalf("-capability %q refused for the wrong reason: %s",
+				probe.name, detail)
+		}
+	}
+
+	// The grammar the plane does accept must still pass, or this refuses the
+	// feature. Every character class the service allows is covered.
+	for _, probe := range []string{
+		"complete", "chat.completions", "llm_proxy", "llm-proxy",
+		"chat:complete", "Complete9", strings.Repeat("a", fleet.MaxNameBytes),
+	} {
+		if err := fleetName("-action", probe); err != nil {
+			t.Fatalf("%q was refused: %v", probe, err)
+		}
+	}
+}

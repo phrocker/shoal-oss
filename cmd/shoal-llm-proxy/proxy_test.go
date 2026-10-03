@@ -18,6 +18,8 @@
 package main
 
 import (
+	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -29,6 +31,9 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/phrocker/shoal-oss/pkg/explorer/fleet"
+	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
 // fakePlane stands in for the explorer's admission surface.
@@ -106,7 +111,9 @@ type fakeUpstream struct {
 	// being built with a duplicated version segment.
 	paths    []string
 	location string
-	server   *httptest.Server
+	// headers the provider sets, so a test can assert what the proxy relays.
+	headers map[string]string
+	server  *httptest.Server
 }
 
 func newFakeUpstream(t *testing.T) *fakeUpstream {
@@ -119,6 +126,9 @@ func newFakeUpstream(t *testing.T) *fakeUpstream {
 			upstream.received, _ = io.ReadAll(request.Body)
 			if upstream.location != "" {
 				writer.Header().Set("Location", upstream.location)
+			}
+			for name, value := range upstream.headers {
+				writer.Header().Set(name, value)
 			}
 			writer.WriteHeader(upstream.status)
 			_, _ = io.WriteString(writer, upstream.body)
@@ -1516,5 +1526,200 @@ func TestANonTwoHundredUpstreamStatusIsNeverReportedAsWork(t *testing.T) {
 			t.Fatalf("status %d was reported as successful work: %+v",
 				probe.status, report)
 		}
+	}
+}
+
+// TestTheDeclaredEffectsFollowTheConfiguredProvider pins a contract the fleet
+// states and this proxy violated.
+//
+// pkg/explorer/fleet/model.go: EffectEgressesContent "is not a property of the
+// code. The same executor is egress-free against a loopback model provider and
+// egress-bearing against a hosted one, so an executor declaring this must
+// derive it from the provider it was actually configured with."
+//
+// It declared both classes unconditionally, defended by a comment arguing that
+// declaring less than you do is the understatement #385's effect floor refuses.
+// That is right about understatement and wrong here: the floor refuses too
+// little, so too much is never refused — it is silently *denied*. A policy
+// forbidding egress then denies every call on a deployment where nothing leaves
+// the host, and the chart supports exactly that deployment.
+func TestTheDeclaredEffectsFollowTheConfiguredProvider(t *testing.T) {
+	for _, probe := range []struct {
+		name   string
+		host   string
+		egress bool
+	}{
+		{"a hosted provider", "https://api.example.test/v1", true},
+		{"an IPv4 loopback sidecar", "http://127.0.0.1:11434/v1", false},
+		{"localhost", "http://localhost:11434/v1", false},
+		{"an IPv6 loopback sidecar", "http://[::1]:11434/v1", false},
+		{"elsewhere in 127.0.0.0/8", "http://127.5.5.5:11434/v1", false},
+		// A DNS name that merely looks local is not loopback, the same
+		// distinction the chart guard had to learn.
+		{"a host that only starts with localhost", "https://localhost.example/v1", true},
+	} {
+		parsed, err := url.Parse(probe.host)
+		if err != nil {
+			t.Fatal(err)
+		}
+		effects := declaredEffects(parsed)
+		hasEgress := false
+		hasCorpus := false
+		for _, effect := range effects {
+			switch effect {
+			case string(fleet.EffectEgressesContent):
+				hasEgress = true
+			case string(fleet.EffectReadsCorpus):
+				hasCorpus = true
+			}
+		}
+		if hasEgress != probe.egress {
+			t.Fatalf("%s (%s): egress declared = %v, want %v",
+				probe.name, probe.host, hasEgress, probe.egress)
+		}
+		// reads-corpus is unconditional: the proxy reads the references the
+		// caller declared whatever the provider is. Dropping it would be the
+		// understatement the effect floor actually exists to refuse.
+		if !hasCorpus {
+			t.Fatalf("%s: reads-corpus was not declared: %v", probe.name, effects)
+		}
+	}
+
+	// And it reaches the wire, which testing declaredEffects alone does not
+	// prove — the same gap a mutation found between absoluteURL and newProxy.
+	plane := newFakePlane(t, outcomeAllowed, nil)
+	upstream := newFakeUpstream(t)
+	governed, _ := newTestProxy(t, plane, upstream)
+	// The harness upstream is a loopback httptest server, so this is the
+	// sidecar case.
+	post(t, governed, plainCall)
+	if len(plane.requests) != 1 {
+		t.Fatalf("admissions = %d", len(plane.requests))
+	}
+	for _, effect := range plane.requests[0].Effects {
+		if effect == string(fleet.EffectEgressesContent) {
+			t.Fatalf("a loopback provider declared egress on the wire: %v",
+				plane.requests[0].Effects)
+		}
+	}
+
+	plane.requests = nil
+	remote, err := url.Parse("https://api.example.test/v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	governed.admission.effects = declaredEffects(remote)
+	post(t, governed, plainCall)
+	found := false
+	for _, effect := range plane.requests[0].Effects {
+		if effect == string(fleet.EffectEgressesContent) {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("a hosted provider did not declare egress: %v",
+			plane.requests[0].Effects)
+	}
+}
+
+// TestRetryAfterReachesTheCaller covers a header the proxy swallowed.
+//
+// Only Content-Type and Cache-Control were relayed, so a provider's backoff
+// instruction never arrived. This repository's own OpenAI client reads the
+// header (pkg/model/openai.go:584), so a Shoal-built caller behind this proxy
+// would retry a 429 immediately against a provider that asked it to wait — the
+// proxy turning a well-behaved client into a badly-behaved one, which is the
+// opposite of "an unmodified client is governed unchanged".
+func TestRetryAfterReachesTheCaller(t *testing.T) {
+	plane := newFakePlane(t, outcomeAllowed, nil)
+	upstream := newFakeUpstream(t)
+	upstream.status = http.StatusTooManyRequests
+	upstream.headers = map[string]string{"Retry-After": "42"}
+	governed, _ := newTestProxy(t, plane, upstream)
+
+	recorder := post(t, governed, plainCall)
+	if recorder.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429", recorder.Code)
+	}
+	if got := recorder.Header().Get("Retry-After"); got != "42" {
+		t.Fatalf("Retry-After = %q, want 42", got)
+	}
+	// Still reported as an upstream error, since no completion was produced.
+	if len(plane.reports) != 1 || plane.reports[0].ErrorCode != "upstream_error" {
+		t.Fatalf("reports = %+v", plane.reports)
+	}
+}
+
+// TestReferenceBoundsAreEnforcedLocally closes the half of the reference
+// contract that checking the encoding left open.
+//
+// A reference decoding to more than shoal.MaxIDBytes, or more references than
+// fleet.MaxAdmissionDisclosures, is refused by the plane with a 400 that post()
+// turns into ErrPlaneUnreachable — so the caller is told 503, which means
+// retry, for a request no retry can fix. Exactly the failure the base64url
+// check was added for, in the dimension that check did not cover.
+func TestReferenceBoundsAreEnforcedLocally(t *testing.T) {
+	oversized := base64.RawURLEncoding.EncodeToString(
+		bytes.Repeat([]byte("a"), shoal.MaxIDBytes+1))
+	tooMany := make([]string, fleet.MaxAdmissionDisclosures+1)
+	for i := range tooMany {
+		tooMany[i] = base64.RawURLEncoding.EncodeToString(
+			[]byte(fmt.Sprintf("doc-%d", i)))
+	}
+	encodedMany, err := json.Marshal(tooMany)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, probe := range []struct{ name, body string }{
+		{"a reference over the ID size bound", `{"model":"gpt",` +
+			`"messages":[{"role":"user","content":"hi"}],` +
+			`"shoal_references":["` + oversized + `"]}`},
+		{"more references than the plane accepts", `{"model":"gpt",` +
+			`"messages":[{"role":"user","content":"hi"}],` +
+			`"shoal_references":` + string(encodedMany) + `}`},
+	} {
+		plane := newFakePlane(t, outcomeAllowed, nil)
+		upstream := newFakeUpstream(t)
+		governed, _ := newTestProxy(t, plane, upstream)
+
+		recorder := post(t, governed, probe.body)
+		if recorder.Code != http.StatusBadRequest {
+			t.Fatalf("%s: status = %d, want 400 — a 503 tells the caller to "+
+				"retry a request no retry can fix", probe.name, recorder.Code)
+		}
+		if len(plane.requests) != 0 {
+			t.Fatalf("%s: it consumed a decision anyway", probe.name)
+		}
+	}
+
+	// And the bounds themselves are still reachable, or this refuses the
+	// feature rather than bounding it.
+	atLimit := make([]string, fleet.MaxAdmissionDisclosures)
+	for i := range atLimit {
+		atLimit[i] = base64.RawURLEncoding.EncodeToString(
+			[]byte(fmt.Sprintf("doc-%d", i)))
+	}
+	encodedLimit, err := json.Marshal(atLimit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plane := newFakePlane(t, outcomeAllowed, nil)
+	upstream := newFakeUpstream(t)
+	governed, _ := newTestProxy(t, plane, upstream)
+	recorder := post(t, governed,
+		`{"model":"gpt","messages":[{"role":"user","content":"hi"}],`+
+			`"shoal_references":`+string(encodedLimit)+`}`)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("a request exactly at the bound was refused: %d %s",
+			recorder.Code, recorder.Body.String())
+	}
+	atSize := base64.RawURLEncoding.EncodeToString(
+		bytes.Repeat([]byte("a"), shoal.MaxIDBytes))
+	recorder = post(t, governed,
+		`{"model":"gpt","messages":[{"role":"user","content":"hi"}],`+
+			`"shoal_references":["`+atSize+`"]}`)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("an ID exactly at the size bound was refused: %d", recorder.Code)
 	}
 }

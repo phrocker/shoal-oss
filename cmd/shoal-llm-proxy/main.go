@@ -199,8 +199,11 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 	if err != nil {
 		return err
 	}
-	if strings.TrimSpace(*capability) == "" || strings.TrimSpace(*action) == "" {
-		return errors.New("-capability and -action are required")
+	if err := fleetName("-capability", *capability); err != nil {
+		return err
+	}
+	if err := fleetName("-action", *action); err != nil {
+		return err
 	}
 	if err := validateDurations(*lease, *requestTimeout); err != nil {
 		return err
@@ -218,21 +221,27 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 		return fmt.Errorf("-admission-url %v", err)
 	}
 
-	// Credentials are read per request, not captured at start, so the value is
-	// never held in the proxy's own state where a crash dump would carry it.
+	// Credentials are read at the moment they are used rather than captured at
+	// start. What that buys, precisely:
 	//
-	// What that does NOT buy is rotation of an environment variable. A process
-	// environment is fixed once the container starts: updating the Secret
-	// behind a secretKeyRef leaves every running proxy on the old value until
-	// the pod is replaced, so reading os.Getenv per request re-reads the same
-	// string forever. An earlier comment here claimed otherwise, which was
-	// simply wrong.
+	// For the -file forms, rotation. The kubelet rewrites a projected token in
+	// place and a Secret mounted as a volume is updated too, so reading per
+	// request is the whole mechanism by which a rotating credential works.
 	//
-	// Rotation needs a source that can actually change underneath a running
-	// process, which is what the -file forms are for: the kubelet rewrites a
-	// projected token in place, and a Secret mounted as a volume is updated
-	// too. Per-request reading is what makes those forms work; for the env
-	// form it is only the crash-dump property.
+	// For the env form, almost nothing. A process environment is fixed once
+	// the container starts, so updating the Secret behind a secretKeyRef
+	// leaves every running proxy on the old value until the pod is replaced,
+	// and os.Getenv re-reads the same string forever. Nor does it keep the
+	// value out of process memory: the environment block holds it for the
+	// process lifetime, so a crash dump carries it whether this reads it once
+	// or a thousand times. All per-request lookup avoids is one extra cached
+	// copy.
+	//
+	// Two false claims have been corrected here, and the second was in the
+	// same paragraph as the first — the rotation claim was fixed a round
+	// before the crash-dump claim sitting beside it was noticed. A comment
+	// asserting a security property is worth no more than a test asserting
+	// one.
 	logf := func(format string, values ...any) {
 		fmt.Fprintf(output, format+"\n", values...)
 	}
@@ -339,8 +348,8 @@ var ErrNoCredential = errors.New("no credential is configured")
 // credentialFromEnv reads a secret at use time.
 //
 // Per request, but a container's environment does not change after start, so
-// this cannot rotate. See the note in run; use the -file form where the
-// credential must be rotatable.
+// this neither rotates nor keeps the value out of process memory. See the note
+// in run; use the -file form where either property is wanted.
 //
 // An unset variable is absence rather than breakage: the chart renders no env
 // entry at all when no Secret is named, which is how a loopback upstream is
@@ -408,6 +417,47 @@ func credentialSource(
 		return nil, fmt.Errorf("%s-env and %s-file are mutually exclusive", name, name)
 	}
 	return credentialFromFile(file), nil
+}
+
+// fleetName applies the grammar the admission service applies, at startup.
+//
+// It mirrors validateName in pkg/explorer/fleet/model.go, which is unexported —
+// a duplication worth naming out loud, since the two can drift. The bound is
+// taken from fleet.MaxNameBytes rather than copied, so at least the number
+// cannot.
+//
+// Without this, a name over the bound or carrying a stray space or an
+// unsupported character is static configuration that starts cleanly, passes
+// both probes, and then takes a 400 on every admission — which this client
+// reports as plane_unavailable, so the caller is told to retry a configuration
+// error and the operator sees what looks like an outage.
+//
+// The surrounding-whitespace case is the one a trim-based check actively hides.
+// The previous check trimmed before testing for emptiness, so " complete"
+// passed and was then sent with the space, which the plane refuses.
+func fleetName(flagName, value string) error {
+	if value == "" {
+		return fmt.Errorf("%s is required", flagName)
+	}
+	if len(value) > fleet.MaxNameBytes {
+		return fmt.Errorf("%s must be at most %d bytes", flagName, fleet.MaxNameBytes)
+	}
+	if strings.TrimSpace(value) != value {
+		return fmt.Errorf("%s must not have leading or trailing whitespace", flagName)
+	}
+	for _, character := range value {
+		switch {
+		case character >= 'a' && character <= 'z',
+			character >= 'A' && character <= 'Z',
+			character >= '0' && character <= '9',
+			character == '_', character == '-', character == '.', character == ':':
+		default:
+			return fmt.Errorf(
+				"%s may use only letters, digits, and _-.: (found %q)",
+				flagName, character)
+		}
+	}
+	return nil
 }
 
 // authorities resolves the host allow-list, falling back to the bound address.

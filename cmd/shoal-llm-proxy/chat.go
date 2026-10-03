@@ -23,6 +23,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+
+	"github.com/phrocker/shoal-oss/pkg/explorer/fleet"
+	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
 // The declaration is what Shoal receives. The prompt is not.
@@ -156,17 +159,34 @@ func (r chatRequest) references() ([]string, error) {
 		// for something no retry can fix. Classification is the whole point:
 		// an infrastructural failure and a bad request must not be the same
 		// answer, which is the criterion the plane-status table also covers.
-		if decoded, err := base64.RawURLEncoding.DecodeString(trimmed); err != nil ||
-			len(decoded) == 0 {
+		decoded, err := base64.RawURLEncoding.DecodeString(trimmed)
+		if err != nil || len(decoded) == 0 {
 			return nil, fmt.Errorf(
 				"%s entries must be unpadded base64url document IDs",
 				shoalReferencesField)
+		}
+		// The size bound the plane enforces, enforced here for the same reason
+		// the encoding is: over it the plane answers 400, post() turns that
+		// into ErrPlaneUnreachable, and the caller is told 503 — retry — for a
+		// request no retry can fix. Checking the syntax and not the size left
+		// exactly half of that closed.
+		if len(decoded) > shoal.MaxIDBytes {
+			return nil, fmt.Errorf(
+				"%s entries must decode to at most %d bytes",
+				shoalReferencesField, shoal.MaxIDBytes)
 		}
 		if _, duplicate := seen[trimmed]; duplicate {
 			continue
 		}
 		seen[trimmed] = struct{}{}
 		result = append(result, trimmed)
+	}
+	// The count bound, applied after de-duplication because that is the number
+	// the plane actually receives.
+	if len(result) > fleet.MaxAdmissionDisclosures {
+		return nil, fmt.Errorf(
+			"%s must name at most %d documents",
+			shoalReferencesField, fleet.MaxAdmissionDisclosures)
 	}
 	return result, nil
 }

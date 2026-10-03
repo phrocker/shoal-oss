@@ -550,6 +550,23 @@ assert_renders "a blank model entry is dropped" "\-model=gpt-4o$" "${llm_proxy_b
 assert_renders "models render as one joined argument" "\-model=gpt-4o,claude-opus-5$" "${llm_proxy_base[@]}" --set 'llmProxy.models={gpt-4o,claude-opus-5}'
 assert_renders "no models renders an empty flag" "\-model=$" "${llm_proxy_base[@]}"
 
+note "== a credential path names a file, not a directory =="
+# A trailing slash passes an absolute-path test and is not a file. The chart
+# derives the mount from the directory and the projected item from the base, so
+# "/var/run/secrets/shoal/" renders that exact flag while the credential lands
+# at "/var/run/secrets/shoal/shoal" — the proxy then opens a directory on every
+# request, and the pod passes both probes while denying every call.
+refuses_citing "must name a file" "a token path with a trailing slash" "${token_file_base[@]}" --set 'llmProxy.admission.tokenFile=/var/run/secrets/shoal/'
+# The matching upstream case lives with the upstream key fixture further down:
+# these arrays are ordinary shell arrays, so using one above its definition
+# expands to nothing and renders a chart with the proxy disabled — which is a
+# check that cannot fail, in a script rather than in Go this time.
+#
+# The same path without the slash still renders, or the guard refuses the
+# feature.
+renders "a token path naming a file"  "${token_file_base[@]}" --set 'llmProxy.admission.tokenFile=/var/run/secrets/shoal/token'
+assert_renders "and the flag matches the mount" "admission-token-file=/var/run/secrets/shoal/token$" "${token_file_base[@]}"
+
 note "== no Kubernetes API credential in the prompt-processing pod =="
 # This pod needs no API access: it speaks HTTP to the workspace and HTTP to the
 # provider, and touches the API server nowhere. The automatic mount put a token
@@ -654,6 +671,11 @@ renders "the upstream file form with apiKeyEnv at its default" "${upstream_key_f
 # render: the binary only refuses a *changed* variable name beside a file.
 renders "the upstream file form with apiKeyEnv blanked" "${upstream_key_file[@]}" --set llmProxy.upstream.apiKeyEnv=
 refuses "both upstream key forms chosen explicitly" "${upstream_key_file[@]}" --set llmProxy.upstream.apiKeyEnv=OTHER_VAR
+# A trailing slash is the token path's problem too; see that section. The chart
+# derives the mount from the directory and the item from the base, so the flag
+# would name a directory while the credential landed inside it.
+refuses_citing "must name a file" "a key path with a trailing slash" "${upstream_key_file[@]}" --set 'llmProxy.upstream.apiKeyFile=/var/run/secrets/upstream/'
+assert_renders "the key flag matches its mount" "upstream-api-key-file=/etc/shoal/upstream/api-key$" "${upstream_key_file[@]}"
 refuses "a relative upstream key file"      "${upstream_key_file[@]}" --set llmProxy.upstream.apiKeyFile=upstream/api-key
 refuses "an upstream key file at the filesystem root" "${upstream_key_file[@]}" --set llmProxy.upstream.apiKeyFile=/api-key
 # Cited: with the source guard gone the chart renders an empty volume source,

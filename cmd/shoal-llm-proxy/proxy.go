@@ -273,7 +273,12 @@ func (p *proxy) forward(
 	// The egress has now happened. Everything below reports it; nothing below
 	// can prevent it, and the proxy does not pretend otherwise — no mid-stream
 	// interception, because tokens already sent cannot be recalled (#390).
-	for _, header := range []string{"Content-Type", "Cache-Control"} {
+	// Retry-After travels because a provider's backoff instruction is useless
+	// to a caller that never sees it. This repository's own OpenAI client reads
+	// the header (pkg/model/openai.go:584), so a Shoal-built caller behind this
+	// proxy would retry a 429 immediately against a provider that asked it to
+	// wait — the proxy turning a well-behaved client into a badly-behaved one.
+	for _, header := range []string{"Content-Type", "Cache-Control", "Retry-After"} {
 		if value := response.Header.Get(header); value != "" {
 			writer.Header().Set(header, value)
 		}
@@ -437,6 +442,12 @@ func newProxy(
 	parsed, err := absoluteURL(upstream)
 	if err != nil {
 		return nil, fmt.Errorf("upstream base URL %v", err)
+	}
+	// The effect set is a property of the configured provider, so it is derived
+	// here, where the provider is resolved, rather than fixed at the admission
+	// client's construction, where the provider is not yet known.
+	if admission != nil {
+		admission.effects = declaredEffects(parsed)
 	}
 	return &proxy{
 		admission: admission, upstream: parsed,

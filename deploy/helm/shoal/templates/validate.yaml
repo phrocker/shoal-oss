@@ -261,6 +261,9 @@
 {{- if not (isAbs $tokenFile) -}}
 {{- fail (printf "llmProxy.admission.tokenFile must be an absolute path (got %q): the proxy opens it by name at request time, so a relative path resolves against a working directory nothing in the pod spec guarantees. The read then fails on every request while the pod itself stays healthy — the proxy passes every probe and denies every call. It is also the mount path the chart derives the token volume from, and a relative mount path is not a pod spec the API server accepts" $tokenFile) -}}
 {{- end -}}
+{{- if hasSuffix "/" $tokenFile -}}
+{{- fail (printf "llmProxy.admission.tokenFile must name a file, not a directory (got %q): a trailing slash still passes an absolute-path test, and the chart then derives the mount from its directory and the file name from its base — so the flag points at %q while the credential is written to %q, and every read opens a directory instead of a file. Drop the trailing slash" $tokenFile $tokenFile (printf "%s/%s" (dir $tokenFile) (base $tokenFile))) -}}
+{{- end -}}
 {{- if and (isAbs $tokenFile) (eq (dir $tokenFile) "/") -}}
 {{- fail (printf "llmProxy.admission.tokenFile must name a file inside a directory, not at the filesystem root (got %q): the chart mounts the token volume at the file's directory, and a volume mounted at / replaces the container's root filesystem — the binary at /usr/local/bin/shoal-llm-proxy disappears with it and the pod restarts forever. Use something like /var/run/secrets/shoal/token" $tokenFile) -}}
 {{- end -}}
@@ -409,6 +412,9 @@
 {{- end -}}
 {{- if not (isAbs $apiKeyFile) -}}
 {{- fail (printf "llmProxy.upstream.apiKeyFile must be an absolute path (got %q): the proxy opens it by name at request time, so a relative path resolves against a working directory nothing in the pod spec guarantees — every admitted call then fails on an unreadable credential, after the admission has been spent. It is also the mount path the chart derives the volume from, and a relative mount path is not a pod spec the API server accepts" $apiKeyFile) -}}
+{{- end -}}
+{{- if hasSuffix "/" $apiKeyFile -}}
+{{- fail (printf "llmProxy.upstream.apiKeyFile must name a file, not a directory (got %q): a trailing slash still passes an absolute-path test, and the chart then derives the mount from its directory and the file name from its base — so the flag points at %q while the credential is written to %q, and every read opens a directory instead of a file. Drop the trailing slash" $apiKeyFile $apiKeyFile (printf "%s/%s" (dir $apiKeyFile) (base $apiKeyFile))) -}}
 {{- end -}}
 {{- if and (isAbs $apiKeyFile) (eq (dir $apiKeyFile) "/") -}}
 {{- fail (printf "llmProxy.upstream.apiKeyFile must name a file inside a directory, not at the filesystem root (got %q): the chart mounts the credential volume at the file's directory, and a volume mounted at / replaces the container's root filesystem — the binary at /usr/local/bin/shoal-llm-proxy disappears with it and the pod restarts forever" $apiKeyFile) -}}

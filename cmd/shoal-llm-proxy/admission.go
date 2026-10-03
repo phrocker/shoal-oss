@@ -30,6 +30,8 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"github.com/phrocker/shoal-oss/pkg/explorer/fleet"
 )
 
 // The admission client is the proxy's whole relationship with Shoal.
@@ -72,9 +74,13 @@ type admissionClient struct {
 	agentGeneration int64
 	capability      string
 	action          string
-	sourceID        []byte
-	policyID        []byte
-	lease           time.Duration
+	// effects is the set this proxy declares, derived from the configured
+	// provider rather than hardcoded. Empty is never correct, so newProxy sets
+	// it where the provider is resolved.
+	effects  []string
+	sourceID []byte
+	policyID []byte
+	lease    time.Duration
 }
 
 // grant is what the proxy acts on.
@@ -201,10 +207,10 @@ func (c *admissionClient) request(
 		SourceID:        c.sourceID,
 		PolicyID:        c.policyID,
 		ObjectID:        identity.ObjectID,
-		// Both classes, always. The proxy reads the corpus references the
-		// caller declared and transmits them off-host; declaring less than it
-		// does is the understatement the effect floor exists to refuse (#385).
-		Effects:     []string{"egresses-content", "reads-corpus"},
+		// Derived from the configured provider, not fixed. See
+		// declaredEffects: the fleet contract requires it, and declaring
+		// egress against a loopback provider is denied rather than refused.
+		Effects:     c.effects,
 		Input:       declaration,
 		Disclosures: disclosures,
 		Lease:       c.lease,
@@ -424,6 +430,36 @@ func planeURL(raw string, allowPlaintext bool) (*url.URL, error) {
 		return nil, err
 	}
 	return relaxed, nil
+}
+
+// declaredEffects derives the effect set from the provider this proxy was
+// configured with, which the fleet contract requires rather than permits.
+//
+// pkg/explorer/fleet/model.go says it outright: EffectEgressesContent "is not a
+// property of the code. The same executor is egress-free against a loopback
+// model provider and egress-bearing against a hosted one, so an executor
+// declaring this must derive it from the provider it was actually configured
+// with."
+//
+// This declared both classes unconditionally, with a comment arguing that
+// declaring less than you do is the understatement #385's effect floor exists
+// to refuse. That reasoning is right about understatement and wrong about this:
+// the floor refuses declaring too little, so over-declaring is never refused —
+// it is silently denied instead. A policy that forbids egress then denies every
+// call on a deployment where nothing leaves the host, and the chart supports
+// exactly that deployment and asserts it renders. Over-declaration is not the
+// safe direction here, it is the invisible one.
+//
+// reads-corpus stays unconditional: the proxy reads the references the caller
+// declared whatever the provider is.
+func declaredEffects(upstream *url.URL) []string {
+	if upstream != nil && isLoopback(upstream.Hostname()) {
+		return []string{string(fleet.EffectReadsCorpus)}
+	}
+	return []string{
+		string(fleet.EffectEgressesContent),
+		string(fleet.EffectReadsCorpus),
+	}
 }
 
 func isLoopback(host string) bool {
