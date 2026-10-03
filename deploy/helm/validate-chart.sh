@@ -550,6 +550,36 @@ assert_renders "a blank model entry is dropped" "\-model=gpt-4o$" "${llm_proxy_b
 assert_renders "models render as one joined argument" "\-model=gpt-4o,claude-opus-5$" "${llm_proxy_base[@]}" --set 'llmProxy.models={gpt-4o,claude-opus-5}'
 assert_renders "no models renders an empty flag" "\-model=$" "${llm_proxy_base[@]}"
 
+note "== rollout and disruption values are validated as written =="
+# These reach the API server verbatim, and their only guard cast to int first —
+# which is where the value escapes. int 1.5 is 1 and int -1 is -1, so a guard
+# asking "did it cast to zero" approves both: the chart reports success and the
+# API server rejects the object at install or upgrade time.
+refuses_citing "non-negative whole number" "a fractional rollout surge" "${llm_proxy_base[@]}" --set-json llmProxy.strategy.maxSurge=1.5
+refuses_citing "non-negative whole number" "a negative rollout surge" "${llm_proxy_base[@]}" --set llmProxy.strategy.maxSurge=-1
+refuses_citing "non-negative whole number" "a fractional rollout maxUnavailable" "${llm_proxy_base[@]}" --set-json llmProxy.strategy.maxUnavailable=1.5
+refuses_citing "non-negative whole number" "a negative rollout maxUnavailable" "${llm_proxy_base[@]}" --set llmProxy.strategy.maxUnavailable=-1
+refuses_citing "non-negative whole number" "a fractional disruption budget" "${llm_proxy_base[@]}" --set-json llmProxy.podDisruptionBudget.maxUnavailable=1.5
+refuses_citing "non-negative whole number" "a negative disruption budget" "${llm_proxy_base[@]}" --set llmProxy.podDisruptionBudget.maxUnavailable=-1
+refuses_citing "non-negative whole number" "a nonsense rollout value" "${llm_proxy_base[@]}" --set-string llmProxy.strategy.maxSurge=lots
+# Both at zero is accepted by the API server and then never progresses: nothing
+# may be added and nothing taken down, so every upgrade hangs with no event
+# saying why. A values file that zeroes the surge "to be careful" produces it.
+refuses_citing "cannot both be 0" "a rollout that cannot start" "${llm_proxy_base[@]}" --set llmProxy.strategy.maxSurge=0,llmProxy.strategy.maxUnavailable=0
+# Percentages are an IntOrString and must still render, as must the shipped
+# pair — a guard that refuses the chart's own defaults is the first thing to
+# get wrong here, and did: Helm's "default" treats 0 as empty.
+renders "percentage rollout values"   "${llm_proxy_base[@]}" --set-string llmProxy.strategy.maxSurge=25%,llmProxy.strategy.maxUnavailable=0%
+renders "a percentage disruption budget" "${llm_proxy_base[@]}" --set-string llmProxy.podDisruptionBudget.maxUnavailable=50%
+renders "the shipped rollout pair"    "${llm_proxy_base[@]}" --set llmProxy.strategy.maxSurge=1,llmProxy.strategy.maxUnavailable=0
+renders "a larger surge"              "${llm_proxy_base[@]}" --set llmProxy.strategy.maxSurge=3,llmProxy.strategy.maxUnavailable=1
+# Zero is judged on what was written, so "0%" is zero and "50%" is not. The
+# pre-existing guard cast to int first, and int of "50%" is 0 — so a valid
+# percentage budget was refused as if it blocked every eviction, which is the
+# same cast-before-validating flaw one line further on.
+refuses_citing "must not be 0" "a disruption budget of 0%" "${llm_proxy_base[@]}" --set-string llmProxy.podDisruptionBudget.maxUnavailable=0%
+refuses_citing "cannot both be 0" "a rollout zeroed as percentages" "${llm_proxy_base[@]}" --set-string llmProxy.strategy.maxSurge=0%,llmProxy.strategy.maxUnavailable=0%
+
 note "== a credential path names a file, not a directory =="
 # A trailing slash passes an absolute-path test and is not a file. The chart
 # derives the mount from the directory and the projected item from the base, so

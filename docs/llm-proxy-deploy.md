@@ -96,15 +96,20 @@ claimed the new one.
 ### Credentials, and what "read per request" does and does not buy
 
 Both credentials are read at the moment they are used rather than captured at
-startup. That keeps the value out of the proxy's own state, where a crash dump
-would carry it.
+startup. **That is a rotation mechanism for file-backed sources, and nothing
+more.** Two earlier versions of this guide claimed more than that, so it is
+worth being exact about both halves.
 
-It does **not** make an environment variable rotatable, and an earlier version
-of this guide implied that it did. A process environment is fixed once the
-container starts: updating the Secret behind a `secretKeyRef` leaves every
-running proxy on the old value until the pod is replaced, so re-reading
-`os.Getenv` per request re-reads the same string forever. For the variable forms,
-per-request reading buys the crash-dump property and nothing else.
+It does not make an environment variable rotatable. A process environment is
+fixed once the container starts: updating the Secret behind a `secretKeyRef`
+leaves every running proxy on the old value until the pod is replaced, so
+re-reading `os.Getenv` per request re-reads the same string forever.
+
+And it does not keep a credential out of a crash dump. An environment value is
+process state and stays resident for the process lifetime, so a dump carries it
+however often it is read — and a file-backed credential is in memory too while
+a request is using it. For the variable forms, per-request reading avoids one
+extra cached copy and buys no security property at all.
 
 Rotation needs a source that can change underneath a running process, which is
 what the `-file` forms are for:

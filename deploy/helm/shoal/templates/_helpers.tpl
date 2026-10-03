@@ -308,3 +308,44 @@ true
 true
 {{- end -}}
 {{- end -}}
+
+{{- /*
+A rollout or disruption value, validated as written.
+
+These reach the API server verbatim, and the only guard they had cast to int
+first — which is exactly where the value escapes. int 1.5 is 1 and int -1 is
+-1, so a guard testing "did it cast to zero" approves both, the chart reports
+success, and the API server rejects the object at install or upgrade time.
+Casting before validating cannot see the thing it is validating.
+
+Kubernetes takes an IntOrString here: a non-negative whole number, or a
+percentage. Both forms are accepted and nothing else is, which is narrower than
+int and wider than a bare integer.
+*/ -}}
+{{- define "shoal.requireIntOrPercent" -}}
+{{- $name := .name -}}
+{{- /* No "default" here: Helm's default treats 0 as empty, so
+       `default "" 0` is "" and this guard refused the chart's own shipped
+       maxUnavailable: 0. The value is stringified directly, and a missing key
+       fails the match like any other non-value. */ -}}
+{{- $raw := trim (toString .value) -}}
+{{- if not (or (regexMatch "^(0|[1-9][0-9]*)$" $raw) (regexMatch "^(0|[1-9][0-9]*)%$" $raw)) -}}
+{{- fail (printf "%s must be a non-negative whole number or a percentage (got %q): it is rendered into the object verbatim, so the API server rejects the %s at install or upgrade time while the chart reports success. A fractional or negative value is not an IntOrString, and a guard that casts to int before testing cannot tell — int of 1.5 is 1 and int of -1 is -1" $name $raw (default "object" .kind)) -}}
+{{- end -}}
+{{- end -}}
+
+{{- /*
+Whether an IntOrString means zero, judged on what was written.
+
+"0" and "0%" both mean zero; "50%" does not. The guard that needed this cast
+with int first, and int of "50%" is 0 — so a perfectly valid percentage
+disruption budget was refused as if it were zero, with a message about
+blocking evictions that had nothing to do with it. Same flaw as the one
+requireIntOrPercent exists for, in the guard that was already there.
+*/ -}}
+{{- define "shoal.isZeroIntOrPercent" -}}
+{{- $raw := trim (toString .) -}}
+{{- if or (eq $raw "0") (eq $raw "0%") -}}
+true
+{{- end -}}
+{{- end -}}

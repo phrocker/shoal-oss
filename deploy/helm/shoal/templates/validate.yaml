@@ -635,7 +635,22 @@
 
 {{- /* A disruption budget that refuses every eviction protects a singleton.
        This is not one, so it would only wedge drains. */ -}}
-{{- if and $proxy.podDisruptionBudget.enabled (eq (int (default 0 $proxy.podDisruptionBudget.maxUnavailable)) 0) -}}
+{{- /* The rollout contract and the disruption budget both reach the API server
+       verbatim, so both are validated as written rather than after a cast. */ -}}
+{{- include "shoal.requireIntOrPercent" (dict "name" "llmProxy.strategy.maxUnavailable" "value" $proxy.strategy.maxUnavailable "kind" "Deployment") -}}
+{{- include "shoal.requireIntOrPercent" (dict "name" "llmProxy.strategy.maxSurge" "value" $proxy.strategy.maxSurge "kind" "Deployment") -}}
+{{- /* Both at zero is a rollout that cannot start: nothing may be taken down
+       and nothing may be added, so the Deployment is accepted and then never
+       progresses. The chart's own default pairs 0 with 1 for exactly that
+       reason — surge first, then replace — and a values file that zeroes the
+       surge to "be careful" produces an upgrade that hangs instead. */ -}}
+{{- if and (include "shoal.isZeroIntOrPercent" $proxy.strategy.maxUnavailable) (include "shoal.isZeroIntOrPercent" $proxy.strategy.maxSurge) -}}
+{{- fail "llmProxy.strategy.maxSurge and maxUnavailable cannot both be 0: nothing may be added and nothing may be taken down, so the Deployment is accepted and then never progresses — every upgrade hangs with no event saying why. Keep maxUnavailable at 0 and maxSurge at 1 or more, which surges a new pod before replacing an old one" -}}
+{{- end -}}
+{{- if $proxy.podDisruptionBudget.enabled -}}
+{{- include "shoal.requireIntOrPercent" (dict "name" "llmProxy.podDisruptionBudget.maxUnavailable" "value" $proxy.podDisruptionBudget.maxUnavailable "kind" "PodDisruptionBudget") -}}
+{{- end -}}
+{{- if and $proxy.podDisruptionBudget.enabled (include "shoal.isZeroIntOrPercent" $proxy.podDisruptionBudget.maxUnavailable) -}}
 {{- fail "llmProxy.podDisruptionBudget.maxUnavailable must not be 0: the proxy is stateless and replaceable, so refusing every voluntary eviction protects nothing and instead makes kubectl drain and cluster-autoscaler consolidation block forever on a pod that could safely have moved. The explorer uses 0 because it is a singleton over one state root; this is not" -}}
 {{- end -}}
 {{- end -}}

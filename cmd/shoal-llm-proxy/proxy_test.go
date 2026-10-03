@@ -1723,3 +1723,68 @@ func TestReferenceBoundsAreEnforcedLocally(t *testing.T) {
 		t.Fatalf("an ID exactly at the size bound was refused: %d", recorder.Code)
 	}
 }
+
+// TestTheShoalExtensionDoesNotReachTheProvider covers a disclosure the proxy
+// was adding on its own account.
+//
+// shoal_references is proxy metadata and was forwarded verbatim. The IDs name
+// governed documents the call concerns, so sending them to a third-party
+// provider tells that provider which of them this request is about — the proxy
+// declaring egresses-content and then adding a little more egress of its own,
+// as metadata, to the one party the egress policy is about. A strict
+// OpenAI-compatible server also rejects an unknown top-level field, so the
+// configuration most likely to be governed is the one most likely to break.
+//
+// The other half matters as much: genuinely unknown fields must survive. The
+// request body is a map rather than a struct precisely so the proxy is not the
+// reason a provider feature nobody here has heard of stops working.
+func TestTheShoalExtensionDoesNotReachTheProvider(t *testing.T) {
+	plane := newFakePlane(t, outcomeAllowed, nil)
+	upstream := newFakeUpstream(t)
+	governed, _ := newTestProxy(t, plane, upstream)
+
+	post(t, governed,
+		`{"model":"gpt","messages":[{"role":"user","content":"hi"}],`+
+			`"shoal_references":["`+docA+`"],`+
+			`"logprobs":true,"a_future_provider_field":{"nested":"keep-me"}}`)
+
+	forwarded := string(upstream.received)
+	if strings.Contains(forwarded, shoalReferencesField) {
+		t.Fatalf("the Shoal extension reached the provider: %s", forwarded)
+	}
+	if strings.Contains(forwarded, docA) {
+		t.Fatalf("a governed document ID reached the provider: %s", forwarded)
+	}
+	// Everything else is untouched, including a field this build knows nothing
+	// about and a nested value inside it.
+	for _, kept := range []string{`"model":"gpt"`, "logprobs", "a_future_provider_field", "keep-me", "hi"} {
+		if !strings.Contains(forwarded, kept) {
+			t.Fatalf("%s was dropped along with the extension: %s", kept, forwarded)
+		}
+	}
+
+	// And the plane still receives the reference count, because stripping the
+	// field from the egress must not stop the proxy declaring it.
+	if len(plane.requests) != 1 {
+		t.Fatalf("admissions = %d", len(plane.requests))
+	}
+	if !strings.Contains(string(plane.requests[0].Input), `"reference_count":1`) {
+		t.Fatalf("the declaration lost the reference count: %s",
+			plane.requests[0].Input)
+	}
+	if len(plane.requests[0].Disclosures) != 1 ||
+		plane.requests[0].Disclosures[0] != docA {
+		t.Fatalf("the disclosure was not declared: %v", plane.requests[0].Disclosures)
+	}
+
+	// A request with no references is forwarded unchanged rather than rebuilt,
+	// so the common path cannot reorder or lose anything.
+	upstream.received = nil
+	post(t, governed, plainCall)
+	if strings.Contains(string(upstream.received), shoalReferencesField) {
+		t.Fatalf("a field appeared from nowhere: %s", upstream.received)
+	}
+	if !strings.Contains(string(upstream.received), `"model":"gpt"`) {
+		t.Fatalf("the plain request was damaged: %s", upstream.received)
+	}
+}

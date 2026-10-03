@@ -248,6 +248,40 @@ func classifyModel(model string, allowed map[string]struct{}) string {
 	return modelOther
 }
 
+// outbound is the body the provider receives: the caller's request with
+// Shoal's own extension removed and everything else untouched.
+//
+// shoal_references is proxy metadata. It was forwarded verbatim, which is wrong
+// in two directions at once.
+//
+// It is a disclosure. The IDs name governed documents the call concerns, and
+// sending them to a third-party provider tells that provider which of them this
+// request is about — the proxy declaring egresses-content and then adding a
+// little more egress of its own, as metadata, to the one party the egress
+// policy is about.
+//
+// And it is a compatibility hazard: a strict OpenAI-compatible server rejects
+// an unknown top-level field, so the configuration most likely to be governed
+// is the one most likely to break.
+//
+// Only the known extension is removed. Genuinely unknown fields are preserved,
+// because the proxy must not be the reason a provider feature nobody here has
+// heard of stops working — which is the whole reason the body is a map rather
+// than a struct.
+func (r chatRequest) outbound() map[string]json.RawMessage {
+	if _, ok := r.body[shoalReferencesField]; !ok {
+		return r.body
+	}
+	body := make(map[string]json.RawMessage, len(r.body))
+	for key, value := range r.body {
+		if key == shoalReferencesField {
+			continue
+		}
+		body[key] = value
+	}
+	return body
+}
+
 // declaration is the shape the proxy sends in place of the payload.
 //
 // Sizes, counts, and strings the operator chose. A reviewer checking that Shoal
@@ -305,7 +339,7 @@ func (r chatRequest) declaration(
 // its own decision rather than papered over.
 func (r chatRequest) applyObligations(withhold []string) (json.RawMessage, bool, error) {
 	if len(withhold) == 0 {
-		encoded, err := json.Marshal(r.body)
+		encoded, err := json.Marshal(r.outbound())
 		return encoded, true, err
 	}
 	denied := make(map[string]struct{}, len(withhold))
