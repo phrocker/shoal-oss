@@ -29,7 +29,9 @@ is distinct from unknown; neither is a completeness claim.
 Source observations retain artifact/revision/digest, common origin, evidence role,
 author control, authority-policy reference and optional attestation reference.
 Predictions stay distinguishable from observations and approved procedures.
-Observed/received times precede the cutoff. Timezone and monotonic-clock details
+Observation time must be at or before receipt time, and receipt time must be
+at or before the cutoff (`ObservedAt <= ReceivedAt <= Cutoff`). The cutoff
+boundary is inclusive; authorization expiry remains exclusive. Timezone and monotonic-clock details
 do not change identity; a later receipt or collection does. The existing source
 snapshot and its historical `AsOf` remain unchanged. Acquisition time is not a
 source event timestamp; an old incident can be acquired during a new observation.
@@ -45,7 +47,11 @@ validation, not current permission to retrieve a receipt.
 
 The configs and all getters are copy-isolated. Count bounds and conservative
 aggregate byte preflight limit copying/serialization; the final encoded record
-is also bounded. IDs use a versioned namespace and canonical JSON encoding.
+is also bounded. IDs use a versioned namespace and the normalized structs encoded by Go
+`encoding/json.Marshal`, including its struct field order and escaping rules.
+This is deterministic within this Go contract, not a language-independent
+canonical JSON standard; clients must not assume ordinary JSON serialization
+in another language reproduces these digests.
 These are Go contracts, not a public wire or persisted storage codec: future
 HTTP/storage adapters must define explicit versioned envelopes and must not JSON
 marshal the private immutable objects directly.
