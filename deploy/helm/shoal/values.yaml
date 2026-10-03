@@ -323,6 +323,20 @@ llmProxy:
   # nothing. Usually the port-less in-cluster or ingress name clients are
   # configured with as their OpenAI base URL.
   allowedHosts: []
+  # The ServiceAccount the pod runs as. Empty means the namespace's `default`,
+  # which is what Kubernetes does and is fine for the environment-variable
+  # token form, where the pod's own identity is never used for anything.
+  #
+  # It stops being fine the moment the admission token is a projected
+  # ServiceAccount token, because that token's subject *is* this account. Left
+  # empty there, the credential the explorer authorizes is
+  # `system:serviceaccount:<namespace>:default` — an identity every other pod
+  # in the namespace can also obtain a token for, so authorizing the proxy
+  # authorizes the namespace. The chart refuses the projected form without an
+  # explicit name for that reason; naming `default` here is allowed, and is the
+  # explicit acceptance of a shared identity. The account is not created for
+  # you, like the Secrets.
+  serviceAccountName: ""
   # The decision plane. Every one of these is required: a proxy that cannot ask
   # must deny, and a proxy that denies everything is indistinguishable from a
   # total outage of whatever is behind it.
@@ -331,34 +345,185 @@ llmProxy:
     url: ""
     # Env var holding the bearer token the proxy presents to the explorer
     # (-admission-token-env). The chart projects it from the Secret below.
+    #
+    # This form cannot be rotated: a container's environment is fixed once the
+    # process starts, so updating the Secret behind a secretKeyRef leaves every
+    # running proxy on the old token until the pod is replaced. Use tokenFile
+    # below where the credential rotates.
+    #
+    # Ignored, and required to be left at this value, when tokenFile is set:
+    # the binary refuses an explicitly chosen env var alongside a file rather
+    # than ranking the two, so the chart refuses that pair as well.
     tokenEnv: SHOAL_ADMISSION_TOKEN
-    # Required, always. The explorer's API has no unauthenticated mode in a
-    # cluster, so without a token every admission request is a 401 and the
-    # proxy fails closed on all of them.
+    # Required whenever the token comes from the environment, and required
+    # again for tokenFileSource: secret, which mounts this same Secret as a
+    # file. The explorer's API has no unauthenticated mode in a cluster, so
+    # without a token every admission request is a 401 and the proxy fails
+    # closed on all of them.
+    #
+    # Refused with tokenFileSource: projected or volume, where nothing reads
+    # it. A Secret named there is a credential the operator believes is being
+    # presented and that the pod never looks at — and the symptom of the
+    # mistake is a 401 that names neither source.
     credentialSecretName: ""
     credentialSecretKey: token
+    # The file form: a path the proxy reads the bearer token from at request
+    # time instead of an environment variable (-admission-token-file). Empty
+    # keeps the env form above.
+    #
+    # It exists because a rotating credential is a file. The kubelet rewrites a
+    # projected ServiceAccount token in place when it rotates and never updates
+    # an environment variable, so with only the env form the admission
+    # credential has to be a long-lived static Secret — the thing projected
+    # tokens exist to avoid. Setting this switches the pod over completely: the
+    # chart renders -admission-token-file and no -admission-token-env, and
+    # projects no admission Secret into the environment. Both at once is
+    # refused by the binary at startup rather than resolved by precedence, so
+    # rendering both would be a pod that never serves.
+    #
+    # Must be absolute, and must name a file in a directory other than /. The
+    # directory is where the chart mounts the token volume: a relative path
+    # resolves against a working directory nothing guarantees, so every read
+    # fails while the pod stays healthy and denies every call, and a mount at /
+    # would replace the container's root filesystem and the binary with it.
+    tokenFile: ""
+    # Where that file comes from, when tokenFile is set.
+    #
+    #   projected  a projected ServiceAccount token volume, rendered and
+    #              mounted by the chart. The Kubernetes-native form and the
+    #              only one of the three with no static credential at rest.
+    #   secret     credentialSecretName above, mounted as a file instead of
+    #              projected into the environment. Worth having on its own:
+    #              the kubelet updates a mounted Secret's contents in place and
+    #              the proxy re-reads per request, so rotating the Secret's
+    #              value takes effect without rolling the pod, which the env
+    #              form cannot do at all.
+    #   volume     tokenVolume below, supplied verbatim — the seam for a CSI
+    #              driver the chart does not know about, such as SPIFFE, Vault
+    #              Agent or secrets-store-csi.
+    #
+    # Anything else renders -admission-token-file pointing at a path nothing
+    # mounts, which is an unreadable token on every request: a pod that passes
+    # every probe and denies every call.
+    tokenFileSource: projected
+    # The audience a projected token is issued for. Required with
+    # tokenFileSource: projected, refused with the other two, where nothing
+    # would consult it.
+    #
+    # Empty is not a usable default. A projected token with no audience is
+    # issued for the cluster's own API server, which the explorer is not and
+    # will not accept — so every admission request is a 401 and the proxy
+    # denies every call while looking entirely healthy. Set it to an audience
+    # the explorer's authenticator accepts (explorer.auth.oidc.audiences), and
+    # make sure that authenticator also trusts the cluster as an issuer.
+    tokenAudience: ""
+    # How long each projected token is issued for.
+    #
+    # 600 is the floor the API server enforces on a ServiceAccount token
+    # projection; below it the pod spec is invalid, so the Deployment is
+    # accepted and no pod is ever created from it. It is also where the refresh
+    # margin stops being comfortable. The kubelet rewrites the file at 80% of
+    # the lifetime, so the margin between the rewrite and the expiry is a fifth
+    # of this value and has to stay well clear of the kubelet's own
+    # re-projection cadence, about a minute: at 600 that margin is two minutes,
+    # and much below it the file could briefly hold a token that has expired.
+    #
+    # Longer than a day is accepted and not advised. The kubelet re-projects at
+    # 24h regardless, so extra validity buys no fewer rotations — it only
+    # widens the window in which a leaked token is still accepted.
+    tokenExpirationSeconds: 3600
+    # The volume *source* for tokenFileSource: volume — a csi:, secret: or
+    # projected: block with no name of its own. The chart supplies the name and
+    # the mount so the two cannot disagree about which volume lands where, and
+    # refuses a source that names itself. An empty map renders a volume with no
+    # source at all, which the API server rejects: the Deployment exists and no
+    # pod is created from it.
+    tokenVolume: {}
     # The admission lease (-lease): how long the granted token stays
     # reportable. pkg/explorer/fleet caps it at MaxActionClaimTTL, five
     # minutes, and refuses a request outside that bound — so a larger value
     # here is not a longer lease, it is every call denied with an
     # invalid-argument the caller cannot act on. validate.yaml holds the bound.
     lease: 60s
-    # Plaintext to a non-loopback decision plane is refused at render.
+    # Plaintext to a non-loopback decision plane is refused at render, and this
+    # is the acknowledgement that accepts it. It reaches the process as
+    # -allow-plaintext-admission, which the binary needs: without the flag it
+    # refuses a remote http:// admission URL at startup, so a chart that took
+    # this value and did not pass it on rendered cleanly and produced a pod in
+    # CrashLoopBackOff.
     #
     # Over http:// the bearer token crosses the network in the clear and, worse,
     # so does the verdict: anything on the path can rewrite a deny into an
     # allow, which is the whole enforcement plane silently removed. Set this
     # true only where a mesh provides the transport authentication the scheme
-    # would — an mTLS sidecar pair, where the proxy's http:// upstream is
-    # already an encrypted authenticated hop.
+    # would — an mTLS sidecar pair, where the hop to the explorer is already an
+    # encrypted authenticated one.
+    #
+    # It covers the admission hop and nothing else. There is deliberately no
+    # counterpart for upstream.baseURL: that request carries the prompt itself
+    # and the operator's provider credential, and a mesh that authenticates the
+    # hop to the explorer says nothing about the hop to a third party. A remote
+    # http:// upstream is refused at render with no way to accept it.
     allowPlaintext: false
   # The real provider the proxy forwards admitted calls to.
   upstream:
+    # Must be https:// unless it is loopback. A remote http:// provider is
+    # refused at render and by the binary at startup, with no acknowledgement
+    # that accepts it: this request carries the prompt and the credential.
+    #
+    # Include the version segment the provider documents, as every
+    # OpenAI-compatible base URL does (https://api.openai.com/v1,
+    # http://localhost:11434/v1). The proxy appends chat/completions to it.
     baseURL: ""
     # Env var holding the upstream credential (-upstream-api-key-env).
+    #
+    # This form cannot be rotated. A container's environment is fixed once the
+    # process starts, so updating the Secret behind a secretKeyRef leaves every
+    # running proxy on the old value until the pod is replaced — the proxy
+    # re-reads the variable per request, but a variable re-read is the same
+    # string forever. Use apiKeyFile below where the credential rotates.
     apiKeyEnv: SHOAL_UPSTREAM_API_KEY
+    # Required for any non-loopback provider unless apiKeyFile names a volume
+    # that carries the credential instead. With no credential at all, every
+    # admitted call is rejected by the provider — after the admission has been
+    # spent on it, so policy allowed work that then did not happen.
     credentialSecretName: ""
     credentialSecretKey: api-key
+    # The file form, matching admission.tokenFile: a path the proxy reads the
+    # provider credential from at request time (-upstream-api-key-file) instead
+    # of an environment variable. Empty keeps the env form above.
+    #
+    # Use it wherever the provider key rotates. A Secret mounted as a volume is
+    # updated in place by the kubelet and the per-request read picks the new
+    # value up; the same Secret behind a secretKeyRef does not change in a
+    # running container at all. Setting this renders -upstream-api-key-file and
+    # no -upstream-api-key-env, and projects no upstream Secret into the
+    # environment — the binary refuses both forms at once rather than ranking
+    # them, so rendering both would be a pod that never serves.
+    #
+    # Same path rules as admission.tokenFile, plus one more: if both files are
+    # used they must sit in different directories, because each is mounted at
+    # its own file's directory and two volumes cannot share a mount path.
+    apiKeyFile: ""
+    # Where that file comes from. Two sources here rather than the three
+    # admission.tokenFileSource offers:
+    #
+    #   secret  credentialSecretName above, mounted as a file.
+    #   volume  apiKeyVolume below, supplied verbatim — a CSI driver such as
+    #           secrets-store-csi, Vault Agent or External Secrets.
+    #
+    # There is no projected form, because a projected ServiceAccount token is a
+    # cluster-issued credential for a cluster verifier and a third-party
+    # provider is neither. Where a provider does accept one — workload identity
+    # federation — the volume source expresses that projection verbatim,
+    # audience and expiry included, which is strictly more than a second copy
+    # of those two keys here could say.
+    apiKeyFileSource: secret
+    # The volume *source* for apiKeyFileSource: volume, with no name of its
+    # own; the chart owns the name so the volume and its mount cannot name
+    # different things. An empty map renders a volume with no source, which the
+    # API server rejects: the Deployment exists and no pod is created from it.
+    apiKeyVolume: {}
     # -request-timeout. Must not exceed admission.lease: an upstream call that
     # can outlive the lease produces an admission that was granted, performed,
     # and can no longer be reported against — an abandoned record whose outcome
@@ -369,9 +534,23 @@ llmProxy:
   # failure — it is a proxy that comes up healthy and is refused by the plane on
   # every request.
   identity:
+    # Canonical unpadded base64url, like the scope identities below: the
+    # workspace decodes this field, and the binary refuses an undecodable value
+    # at startup. It is the encoded ID and not a descriptor's display name.
+    #
+    # The check catches encoding mistakes and not the class of wrong values. A
+    # shoal.ID is opaque and variable-length, so there is no width to validate,
+    # and a readable name that happens to decode is indistinguishable here from
+    # a real ID — "gateway" is five valid bytes. Only the workspace can tell
+    # those apart, and it denies every call when it cannot.
     agentID: ""
-    # int64, positive. Note that this pins a descriptor *generation*: a
-    # re-registration bumps it, and this value has to be bumped with it.
+    # A positive int64, written as a whole number. Not merely parseable as one:
+    # the value is rendered verbatim into -agent-generation, so 1.5 or 010 is
+    # either rejected by the flag parser at startup or silently read as some
+    # other number, and validate.yaml refuses both.
+    #
+    # Note that this pins a descriptor *generation*: a re-registration bumps
+    # it, and this value has to be bumped with it.
     agentGeneration: 1
     capability: ""
     action: ""
@@ -382,7 +561,22 @@ llmProxy:
   service:
     type: ClusterIP
     annotations: {}
-  terminationGracePeriodSeconds: 45
+  # Must exceed admission.lease, and validate.yaml refuses the pair when it
+  # does not.
+  #
+  # The proxy drains for the lease on SIGTERM, because the lease is the bound
+  # on an admitted call's whole lifetime including the report that closes it.
+  # This is the kubelet's budget for that same window: too small and SIGKILL
+  # arrives mid-drain, killing exactly the calls whose egress has already
+  # happened and whose grant has already been spent. That is an unreported
+  # grant produced by every rolling update, on a schedule and invisibly, while
+  # the pod terminates cleanly as far as the kubelet is concerned.
+  #
+  # 75 is the 60s default lease, plus the 5s margin the guard requires, plus
+  # ten seconds of headroom so a modest lease increase does not immediately
+  # have to be paired with a change here. Raise the lease past 70s and this
+  # has to move with it.
+  terminationGracePeriodSeconds: 75
   resources:
     requests:
       cpu: 250m

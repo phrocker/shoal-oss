@@ -150,6 +150,51 @@ Emits the empty string when nothing survives, which is what the guard tests.
 {{- end -}}
 
 {{- /*
+One credential volume, for either of the proxy's two -file credentials.
+
+The two break differently — an unreadable admission token denies every call,
+an unreadable upstream key fails calls policy already allowed — but the
+mechanism that delivers them is identical, and two copies of it would be two
+places for the mode, the path and the source to drift apart.
+
+Takes a dict: name, path, source, audience, expirationSeconds, secretName,
+secretKey, volume.
+
+The file name inside the volume is derived from the path the flag carries, so
+the projection and the flag cannot name different files. The directory half of
+that same path is the mountPath at the call site.
+
+defaultMode is 0440 and never 0400, which is the mistake worth spelling out.
+The kubelet writes projected and Secret volumes owned by root; the proxy
+container runs as uid 65532 with every capability dropped. At 0400 the one
+process that needs the credential cannot open it, and the failure is not a
+crash — the pod starts, passes both probes, and fails on the credential at
+every request. 0440 is readable exactly because the pod declares fsGroup 65532
+alongside it; neither half works without the other.
+*/ -}}
+{{- define "shoal.llmProxyCredentialVolume" -}}
+- name: {{ .name }}
+  {{- if eq .source "projected" }}
+  projected:
+    defaultMode: 0440
+    sources:
+      - serviceAccountToken:
+          path: {{ base .path }}
+          audience: {{ .audience }}
+          expirationSeconds: {{ .expirationSeconds }}
+  {{- else if eq .source "secret" }}
+  secret:
+    secretName: {{ .secretName }}
+    defaultMode: 0440
+    items:
+      - key: {{ .secretKey }}
+        path: {{ base .path }}
+  {{- else }}
+  {{- toYaml .volume | nindent 2 }}
+  {{- end }}
+{{- end -}}
+
+{{- /*
 Converts a Go duration literal to milliseconds so the chart can compare two of
 them, failing on anything Go itself would not parse.
 

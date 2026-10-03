@@ -159,10 +159,16 @@
 {{- $admissionTokenEnv := trim (default "" $admission.tokenEnv) -}}
 {{- $admissionSecret := trim (default "" $admission.credentialSecretName) -}}
 {{- $admissionSecretKey := trim (default "" $admission.credentialSecretKey) -}}
+{{- $tokenFile := trim (default "" $admission.tokenFile) -}}
+{{- $tokenSource := trim (default "" $admission.tokenFileSource) -}}
+{{- $tokenAudience := trim (default "" $admission.tokenAudience) -}}
+{{- $serviceAccount := trim (default "" $proxy.serviceAccountName) -}}
 {{- $upstreamURL := trim (default "" $upstream.baseURL) -}}
 {{- $upstreamKeyEnv := trim (default "" $upstream.apiKeyEnv) -}}
 {{- $upstreamSecret := trim (default "" $upstream.credentialSecretName) -}}
 {{- $upstreamSecretKey := trim (default "" $upstream.credentialSecretKey) -}}
+{{- $apiKeyFile := trim (default "" $upstream.apiKeyFile) -}}
+{{- $apiKeySource := trim (default "" $upstream.apiKeyFileSource) -}}
 {{- /* The allow-list comes from the same template the Deployment's
        -allowed-host argument is built from, so the guard and the argument
        cannot disagree about what counts as an entry. */ -}}
@@ -180,6 +186,14 @@
 {{- end -}}
 {{- if and $admissionURL (not (or (hasPrefix "http://" $admissionURL) (hasPrefix "https://" $admissionURL))) -}}
 {{- fail (printf "llmProxy.admission.url must be an absolute http:// or https:// base URL (got %q): a bare host is not a URL the proxy can resolve, so every admission request fails as a transport error and the proxy fails closed on all of them" $admissionURL) -}}
+{{- end -}}
+
+{{- /* The acknowledgement is a flag the chart renders verbatim, so its type is
+       the pod's startup. Go's boolean flag parser refuses `yes`, and YAML hands
+       it over as the string it is. Checked before the rule below uses it,
+       because a non-empty string is truthy there and would pass. */ -}}
+{{- if not (kindIs "bool" $admission.allowPlaintext) -}}
+{{- fail (printf "llmProxy.admission.allowPlaintext must be a boolean, true or false (got %q): the value is rendered verbatim into -allow-plaintext-admission, and Go's boolean flag parser refuses anything it cannot read as one — the pod exits at startup with a flag error. YAML words like yes and on are strings here, not booleans" (toString (default "" $admission.allowPlaintext))) -}}
 {{- end -}}
 
 {{- /* Plaintext to a decision plane across a real network is refused, because
@@ -200,15 +214,123 @@
 {{- /* The explorer's API has no unauthenticated mode a pod can reach: this
        chart refuses to render the workspace without an OIDC authenticator, and
        -dev-auth cannot be bound on a non-loopback listener at all. So an
-       admission request carrying no bearer token is a 401, every time. */ -}}
+       admission request carrying no bearer token is a 401, every time.
+
+       The credential has two forms and they require different things, so this
+       is two guard sets rather than one relaxed one. The env form needs a
+       variable name and a Secret to project into it. The file form needs none
+       of that and must not have it: the chart renders -admission-token-file
+       alone, so a Secret named alongside a projected token is a credential the
+       operator believes is being presented and that the pod never opens — the
+       invisible-credential failure the binary refuses the two flags over
+       (credentialSource in cmd/shoal-llm-proxy/main.go).
+
+       What stays identical across both is the consequence of getting it wrong.
+       There is no form in which a missing or wrong admission credential is a
+       crash: the proxy starts, binds, passes every probe, and answers 401 to
+       itself on every admission request, which it then fails closed on. */ -}}
+{{- if not $tokenFile -}}
 {{- if not $admissionTokenEnv -}}
 {{- fail "llmProxy.admission.tokenEnv is required: it names the environment variable the proxy reads the explorer bearer token from, and the chart has nothing to project the Secret into without it — so the proxy asks unauthenticated, is answered 401, and denies every call" -}}
 {{- end -}}
 {{- if not $admissionSecret -}}
-{{- fail (printf "llmProxy.admission.credentialSecretName is required: the explorer's API is authenticated in every deployment this chart can render, so with no token in %s every admission request is a 401 and the proxy denies every call — a pod that passes its probes and governs nothing through" (default "the admission token variable" $admissionTokenEnv)) -}}
+{{- fail (printf "llmProxy.admission.credentialSecretName is required: the explorer's API is authenticated in every deployment this chart can render, so with no token in %s every admission request is a 401 and the proxy denies every call — a pod that passes its probes and governs nothing through. Set llmProxy.admission.tokenFile instead if the token is to come from a file, which is the only form a rotating credential has" (default "the admission token variable" $admissionTokenEnv)) -}}
 {{- end -}}
 {{- if not $admissionSecretKey -}}
 {{- fail "llmProxy.admission.credentialSecretKey is required: a secretKeyRef with no key does not resolve, so the pod never starts and sits in CreateContainerConfigError" -}}
+{{- end -}}
+{{- else -}}
+
+{{- /* The file form.
+
+       Mutual exclusion first, and compared against the shipped default rather
+       than against emptiness. tokenEnv has a non-empty default, so its mere
+       presence cannot count as a second choice — the file form would be
+       unreachable without also blanking it. A *changed* value is a deliberate
+       second choice, and the binary refuses that pair at startup rather than
+       ranking the two, so rendering it would be a pod that never serves. The
+       string below is credentialSource's envDefault, which is this key's
+       default here for exactly that reason. */ -}}
+{{- if and $admissionTokenEnv (ne $admissionTokenEnv "SHOAL_ADMISSION_TOKEN") -}}
+{{- fail (printf "llmProxy.admission.tokenEnv (%q) cannot be set alongside llmProxy.admission.tokenFile (%q): the binary refuses an explicitly chosen -admission-token-env together with -admission-token-file rather than ranking them, because picking one silently makes the effective credential invisible — an operator who adds a file while a stale variable is still in the manifest cannot tell from the configuration which token is being presented, and the symptom of the wrong answer is an authentication failure that names neither. Leave tokenEnv at its default to use the file, or clear tokenFile to use the variable" $admissionTokenEnv $tokenFile) -}}
+{{- end -}}
+
+{{- /* The path is two things at once: the flag the binary reads, and the mount
+       the chart derives from it. Both fail silently if it is not an absolute
+       path to a file inside a real directory. */ -}}
+{{- if not (isAbs $tokenFile) -}}
+{{- fail (printf "llmProxy.admission.tokenFile must be an absolute path (got %q): the proxy opens it by name at request time, so a relative path resolves against a working directory nothing in the pod spec guarantees. The read then fails on every request while the pod itself stays healthy — the proxy passes every probe and denies every call. It is also the mount path the chart derives the token volume from, and a relative mount path is not a pod spec the API server accepts" $tokenFile) -}}
+{{- end -}}
+{{- if and (isAbs $tokenFile) (eq (dir $tokenFile) "/") -}}
+{{- fail (printf "llmProxy.admission.tokenFile must name a file inside a directory, not at the filesystem root (got %q): the chart mounts the token volume at the file's directory, and a volume mounted at / replaces the container's root filesystem — the binary at /usr/local/bin/shoal-llm-proxy disappears with it and the pod restarts forever. Use something like /var/run/secrets/shoal/token" $tokenFile) -}}
+{{- end -}}
+
+{{- /* Where the file comes from. A value the chart does not know renders
+       -admission-token-file pointing at a path nothing mounts, which is a
+       token the proxy cannot open on every request. */ -}}
+{{- if not (has $tokenSource (list "projected" "secret" "volume")) -}}
+{{- fail (printf "llmProxy.admission.tokenFileSource must be projected, secret or volume (got %q): anything else renders -admission-token-file=%s with no volume mounted there, so the proxy reads a path that does not exist on every request. That is not a startup failure — the pod comes up, passes every probe, and denies every call on an unreadable credential" $tokenSource $tokenFile) -}}
+{{- end -}}
+
+{{- /* A Secret is read in exactly one of the three sources. Named in either of
+       the others it is a credential nothing in the pod opens. */ -}}
+{{- if eq $tokenSource "secret" -}}
+{{- if not $admissionSecret -}}
+{{- fail "llmProxy.admission.credentialSecretName is required with llmProxy.admission.tokenFileSource: secret — that source mounts this Secret as the token file, so with none named the chart has no volume source to render and the pod spec is rejected. The Secret is also the whole credential: without it every admission request is a 401 and the proxy denies every call" -}}
+{{- end -}}
+{{- if not $admissionSecretKey -}}
+{{- fail "llmProxy.admission.credentialSecretKey is required with llmProxy.admission.tokenFileSource: secret: it is the key the chart projects into the token file, and a secret volume item with no key does not resolve — the kubelet never mounts the volume and the pod sits in ContainerCreating indefinitely rather than failing outright" -}}
+{{- end -}}
+{{- else if $admissionSecret -}}
+{{- fail (printf "llmProxy.admission.credentialSecretName (%q) is set with llmProxy.admission.tokenFileSource: %s, which does not read a Secret: the token comes from %s and this Secret is projected nowhere. The operator believes one credential is being presented and another one is, which is exactly the ambiguity the binary refuses two token flags over — and the symptom is a 401 on every admission request that names neither source. Clear it, or use tokenFileSource: secret to mount it as the token file" $admissionSecret $tokenSource (ternary "the pod's projected ServiceAccount token" "the volume in llmProxy.admission.tokenVolume" (eq $tokenSource "projected"))) -}}
+{{- end -}}
+
+{{- /* An audience is a projected token's verifier. With any other source
+       nothing consults it, so a value there describes a check that is not
+       happening. Refusable because this key's default is empty: a non-blank
+       value can only have been written deliberately, unlike tokenEnv's. */ -}}
+{{- if and $tokenAudience (ne $tokenSource "projected") -}}
+{{- fail (printf "llmProxy.admission.tokenAudience (%q) is set with llmProxy.admission.tokenFileSource: %s, which issues no token and has no audience to bind: the audience names the verifier a projected ServiceAccount token is minted for, and with this source the file holds whatever the Secret or the volume puts there. Leaving it set records an audience binding that does not exist anywhere in the deployment" $tokenAudience $tokenSource) -}}
+{{- end -}}
+
+{{- if eq $tokenSource "projected" -}}
+{{- /* A projected token's subject is the pod's ServiceAccount, so leaving the
+       account implicit means the identity the workspace authorizes is the
+       namespace's `default` — an account every other pod in the namespace can
+       also obtain a token for. Authorizing the proxy would authorize the
+       namespace. Naming `default` explicitly is allowed and is the
+       acknowledgement, in the way allowPlaintext is for the admission URL. */ -}}
+{{- if not $serviceAccount -}}
+{{- fail "llmProxy.serviceAccountName is required with llmProxy.admission.tokenFileSource: projected: a projected token's subject is the pod's ServiceAccount, and with none named that is the namespace's `default` — so the identity the workspace would have to authorize is one every other pod in the namespace can also mint a token for, and authorizing the proxy authorizes the namespace. Name the account the proxy runs as (the chart does not create it, as with the Secrets). Setting it to `default` explicitly is accepted, and is the acknowledgement that the admission identity is shared" -}}
+{{- end -}}
+{{- /* Without an audience the token is issued for the cluster's own API
+       server. The workspace is not that, and will not accept it. */ -}}
+{{- if not $tokenAudience -}}
+{{- fail "llmProxy.admission.tokenAudience is required with llmProxy.admission.tokenFileSource: projected: a ServiceAccount token projected with no audience is issued for the cluster's API server, which the explorer is not — so it is rejected as unauthenticated on every admission request and the proxy denies every call while passing every probe. Set it to an audience the explorer's authenticator accepts (explorer.auth.oidc.audiences), and make sure that authenticator also trusts the cluster as an issuer" -}}
+{{- end -}}
+{{- /* The lifetime, against the floor the API server enforces. Matched as text
+       first for the reason the replica count is: `int` of nil and of a
+       non-numeric string are both 0, which would render a projection the API
+       server rejects while naming no bad value. */ -}}
+{{- if not (regexMatch "^[0-9]+$" (toString (default "" $admission.tokenExpirationSeconds))) -}}
+{{- fail (printf "llmProxy.admission.tokenExpirationSeconds must be a whole number of seconds (got %v): anything else renders a projection the API server refuses as an invalid pod spec, which is the failure that does not look like one — the Deployment is accepted and no pod is ever created from it, so there is no pod log to read" (default "" $admission.tokenExpirationSeconds)) -}}
+{{- end -}}
+{{- if lt (int64 (default 0 $admission.tokenExpirationSeconds)) (int64 600) -}}
+{{- fail (printf "llmProxy.admission.tokenExpirationSeconds must be at least 600 (got %v): 600 seconds is the floor the API server enforces on a ServiceAccount token projection, and below it the pod spec is invalid — the Deployment is accepted and no pod is ever created from it, which produces a rollout that never completes and no pod log at all. The floor is also where the refresh margin stops being comfortable: the kubelet rewrites the file at 80%% of the lifetime, so the margin between the rewrite and the expiry is a fifth of this value, and it has to stay clear of the kubelet's own re-projection cadence of about a minute" (default "" $admission.tokenExpirationSeconds)) -}}
+{{- end -}}
+{{- end -}}
+
+{{- if eq $tokenSource "volume" -}}
+{{- /* The escape hatch, and the chart can check almost nothing about it: a
+       CSI driver's parameters are the driver's business. The two things it can
+       check are the two that make the volume unusable rather than wrong. */ -}}
+{{- if not $admission.tokenVolume -}}
+{{- fail "llmProxy.admission.tokenVolume is required with llmProxy.admission.tokenFileSource: volume: the chart renders this value as the token volume's source, and a volume with a name and no source is not a pod spec the API server accepts — the Deployment is created and no pod ever is. Supply the volume source itself (a csi:, secret: or projected: block), without a name: the chart owns the name so the volume and its mount cannot name different things" -}}
+{{- end -}}
+{{- if and $admission.tokenVolume (hasKey $admission.tokenVolume "name") -}}
+{{- fail (printf "llmProxy.admission.tokenVolume must not carry a name (got %q): the chart emits the name itself, so a second one renders a duplicate key in the volume — the API server rejects the pod spec under strict decoding, and where it does not, the volume is named something the volumeMount does not reference and the kubelet never mounts the token at all. Supply only the volume source" (toString (get $admission.tokenVolume "name"))) -}}
+{{- end -}}
+{{- end -}}
 {{- end -}}
 
 {{- /* The lease the proxy asks for, against the bound the plane enforces.
@@ -233,18 +355,86 @@
 {{- if and $upstreamURL (not (or (hasPrefix "http://" $upstreamURL) (hasPrefix "https://" $upstreamURL))) -}}
 {{- fail (printf "llmProxy.upstream.baseURL must be an absolute http:// or https:// base URL (got %q): anything else is not a URL the proxy can forward to, so every admitted call fails in the hop after the decision" $upstreamURL) -}}
 {{- end -}}
-{{- if not $upstreamKeyEnv -}}
-{{- fail "llmProxy.upstream.apiKeyEnv is required: it names the environment variable carrying the upstream credential, and a pod env entry with no name is not a valid object — the API server rejects the Deployment outright" -}}
+{{- /* And plaintext to a remote provider is refused outright, with no
+       acknowledgement that accepts it.
+
+       admission.allowPlaintext exists because a mesh can supply the transport
+       authentication the scheme would, for a hop that carries the declaration
+       and a bearer token. This hop carries the prompt itself and the
+       operator's provider credential, and a mesh that authenticates the hop to
+       the explorer says nothing about the hop to a third party — so there is
+       deliberately no flag to pass here. The binary refuses it at startup
+       either way, which makes rendering it a pod that never serves. */ -}}
+{{- $upstreamLoopback := or (hasPrefix "http://127.0.0.1" $upstreamURL) (hasPrefix "http://localhost" $upstreamURL) (hasPrefix "http://[::1]" $upstreamURL) -}}
+{{- if and (hasPrefix "http://" $upstreamURL) (not $upstreamLoopback) -}}
+{{- fail (printf "llmProxy.upstream.baseURL %q is plaintext to a remote provider: this request carries the caller's prompt and the operator's provider credential, both in the clear, and anything on the path can read or alter them. There is no acknowledgement for it, unlike llmProxy.admission.allowPlaintext — a mesh authenticating the hop to the explorer says nothing about the hop to a third party. The binary refuses it at startup too, so rendering it produces a pod that never serves. Use https://, or a loopback provider for a sidecar model server" $upstreamURL) -}}
 {{- end -}}
 {{- /* Exactly the explorer's chat-provider rule, for exactly its reason: a
        credential nothing projects into the pod becomes a failure at the moment
-       the first real call is forwarded. A loopback provider needs none. */ -}}
-{{- $upstreamLoopback := or (hasPrefix "http://127.0.0.1" $upstreamURL) (hasPrefix "http://localhost" $upstreamURL) (hasPrefix "http://[::1]" $upstreamURL) -}}
-{{- if and $upstreamURL (not $upstreamLoopback) (not $upstreamSecret) -}}
-{{- fail (printf "llmProxy.upstream.credentialSecretName is required for a remote upstream (%q): the proxy reads %s at request time and nothing projects it into the pod without a Secret, so every admitted call is rejected by the provider for want of a credential — after admission has already been spent on it" $upstreamURL (default "the upstream key variable" $upstreamKeyEnv)) -}}
+       the first real call is forwarded — after the admission has been spent on
+       a call policy allowed. A loopback provider needs none.
+
+       Two things can carry it now. A Secret, projected into the environment or
+       mounted as the file apiKeyFile names; or an operator-supplied volume,
+       which the chart cannot see inside. So the requirement is "some source",
+       and each source's own shape is checked below. */ -}}
+{{- $upstreamFromVolume := and $apiKeyFile (eq $apiKeySource "volume") -}}
+{{- if and $upstreamURL (not $upstreamLoopback) (not $upstreamSecret) (not $upstreamFromVolume) -}}
+{{- fail (printf "llmProxy.upstream.credentialSecretName is required for a remote upstream (%q): the proxy reads the credential at request time and nothing puts one in the pod without a Secret, so every admitted call is rejected by the provider for want of one — after admission has already been spent on it, which means policy allowed work that then did not happen. Name a Secret, or set llmProxy.upstream.apiKeyFile with apiKeyFileSource: volume if a CSI driver delivers the credential instead" $upstreamURL) -}}
 {{- end -}}
 {{- if and $upstreamSecret (not $upstreamSecretKey) -}}
 {{- fail "llmProxy.upstream.credentialSecretKey is required when a credential Secret is named: a secretKeyRef with no key does not resolve, so the pod never starts and sits in CreateContainerConfigError" -}}
+{{- end -}}
+
+{{- /* The upstream credential's own two forms, on the same rules as the
+       admission token's and for the same reason: the binary refuses an
+       explicitly chosen -upstream-api-key-env together with
+       -upstream-api-key-file rather than ranking them.
+
+       Why the file form exists here at all is worth stating, because an
+       earlier comment of ours had it backwards: reading os.Getenv per request
+       does not make an environment variable rotatable. A container's
+       environment is fixed once the process starts, so updating the Secret
+       behind a secretKeyRef leaves every running proxy on the old value until
+       the pod is replaced. A Secret mounted as a volume is updated in place,
+       and the per-request read picks it up — that is the whole difference, and
+       the only form in which rotating a provider key works without a roll. */ -}}
+{{- if not $apiKeyFile -}}
+{{- if not $upstreamKeyEnv -}}
+{{- fail "llmProxy.upstream.apiKeyEnv is required: it names the environment variable carrying the upstream credential, and a pod env entry with no name is not a valid object — the API server rejects the Deployment outright. Set llmProxy.upstream.apiKeyFile instead if the credential is to come from a file, which is the only form that can be rotated under a running pod" -}}
+{{- end -}}
+{{- else -}}
+{{- if and $upstreamKeyEnv (ne $upstreamKeyEnv "SHOAL_UPSTREAM_API_KEY") -}}
+{{- fail (printf "llmProxy.upstream.apiKeyEnv (%q) cannot be set alongside llmProxy.upstream.apiKeyFile (%q): the binary refuses an explicitly chosen -upstream-api-key-env together with -upstream-api-key-file rather than ranking them, because picking one silently makes the effective credential invisible — and the symptom of the wrong answer is a provider rejecting calls that policy allowed, naming neither source. Leave apiKeyEnv at its default to use the file, or clear apiKeyFile to use the variable" $upstreamKeyEnv $apiKeyFile) -}}
+{{- end -}}
+{{- if not (isAbs $apiKeyFile) -}}
+{{- fail (printf "llmProxy.upstream.apiKeyFile must be an absolute path (got %q): the proxy opens it by name at request time, so a relative path resolves against a working directory nothing in the pod spec guarantees — every admitted call then fails on an unreadable credential, after the admission has been spent. It is also the mount path the chart derives the volume from, and a relative mount path is not a pod spec the API server accepts" $apiKeyFile) -}}
+{{- end -}}
+{{- if and (isAbs $apiKeyFile) (eq (dir $apiKeyFile) "/") -}}
+{{- fail (printf "llmProxy.upstream.apiKeyFile must name a file inside a directory, not at the filesystem root (got %q): the chart mounts the credential volume at the file's directory, and a volume mounted at / replaces the container's root filesystem — the binary at /usr/local/bin/shoal-llm-proxy disappears with it and the pod restarts forever" $apiKeyFile) -}}
+{{- end -}}
+{{- if not (has $apiKeySource (list "secret" "volume")) -}}
+{{- fail (printf "llmProxy.upstream.apiKeyFileSource must be secret or volume (got %q): anything else renders -upstream-api-key-file=%s with no volume mounted there, so every admitted call fails on a path that does not exist in the container. There is deliberately no projected form here, unlike the admission token: a projected ServiceAccount token is a cluster-issued credential for a cluster verifier, and where a provider does accept one the volume source expresses that projection verbatim" $apiKeySource $apiKeyFile) -}}
+{{- end -}}
+{{- if and (eq $apiKeySource "secret") (not $upstreamSecret) -}}
+{{- fail "llmProxy.upstream.credentialSecretName is required with llmProxy.upstream.apiKeyFileSource: secret — that source mounts this Secret as the credential file, so with none named the chart has no volume source to render and the API server rejects the pod spec. A loopback provider that needs no credential should leave apiKeyFile empty rather than name a source with nothing behind it" -}}
+{{- end -}}
+{{- if eq $apiKeySource "volume" -}}
+{{- if not $upstream.apiKeyVolume -}}
+{{- fail "llmProxy.upstream.apiKeyVolume is required with llmProxy.upstream.apiKeyFileSource: volume: the chart renders this value as the credential volume's source, and a volume with a name and no source is not a pod spec the API server accepts — the Deployment is created and no pod ever is. Supply the volume source itself (a csi:, secret: or projected: block) without a name, which the chart owns" -}}
+{{- end -}}
+{{- if and $upstream.apiKeyVolume (hasKey $upstream.apiKeyVolume "name") -}}
+{{- fail (printf "llmProxy.upstream.apiKeyVolume must not carry a name (got %q): the chart emits the name itself, so a second one renders a duplicate key in the volume — the API server rejects the pod spec under strict decoding, and where it does not, the volume is named something the volumeMount does not reference and the kubelet never mounts the credential at all" (toString (get $upstream.apiKeyVolume "name"))) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{- /* And the two files cannot share a directory, because each is mounted at
+       its own file's directory and a mountPath has to be unique. Two volumes
+       on one path is refused by the API server, so the Deployment is created
+       and no pod ever is — a rollout that never completes, with no pod log. */ -}}
+{{- if and $tokenFile $apiKeyFile (eq (dir $tokenFile) (dir $apiKeyFile)) -}}
+{{- fail (printf "llmProxy.admission.tokenFile and llmProxy.upstream.apiKeyFile must not share a directory (both are in %q): each is mounted as its own volume at its own file's directory, and a pod cannot mount two volumes at one path — the API server refuses the pod spec, so the Deployment is created and no pod is ever made from it. Give them separate directories, for example /var/run/secrets/shoal/token and /var/run/secrets/upstream/api-key" (dir $tokenFile)) -}}
 {{- end -}}
 
 {{- /* The request timeout against the lease.
@@ -271,6 +461,42 @@
 {{- fail (printf "llmProxy.admission.lease (%q) must exceed llmProxy.upstream.requestTimeout (%q) by at least 5s: the report happens after the upstream call returns, so a lease that expires first means the call is performed under a token that can no longer be reported against — the effect happened and Shoal never learns that it did. The binary refuses this pair at startup, so rendering it produces a pod that never serves" (trim (toString (default "" $admission.lease))) (trim (toString (default "" $upstream.requestTimeout)))) -}}
 {{- end -}}
 
+{{- /* The termination grace period against the lease.
+
+       The proxy drains for the lease on SIGTERM — drainWindow is *lease in
+       cmd/shoal-llm-proxy/main.go — because the lease is already the bound on
+       an admitted call's whole lifetime including the report that closes it,
+       and that is the right worst case for a call admitted a moment before the
+       signal. terminationGracePeriodSeconds is the kubelet's budget for the
+       same window, so a grace period that does not cover it means SIGKILL
+       arrives mid-drain and kills exactly the calls whose egress has already
+       happened and whose grant has already been spent. Every rolling update
+       then produces unreported grants, on a schedule, while the pod terminates
+       cleanly as far as the kubelet is concerned — there is no restart, no
+       error and nothing in the pod's status to look at. The shipped values did
+       this: 45 seconds against a 60-second lease.
+
+       A margin rather than a strict inequality, for two reasons that are both
+       about the boundary and not about the drain. The grace period is whole
+       seconds and a lease is not, so a 60500ms lease against a 60s grace
+       period is "equal" in the only unit the kubelet has; and the process has
+       to return from the drain and exit *inside* the same budget, so equality
+       leaves the exit itself racing the SIGKILL. Five seconds is the same
+       margin the lease keeps over the request timeout, and it is the chart's
+       one unit of slack for the part that happens after the part being bounded.
+
+       Costing nothing in the common case is what makes the reservation
+       tolerable: Shutdown returns as soon as the last connection closes, so
+       the window is a ceiling and not a delay. A pod with nothing in flight
+       exits immediately. */ -}}
+{{- if not (regexMatch "^[0-9]+$" (toString (default "" $proxy.terminationGracePeriodSeconds))) -}}
+{{- fail (printf "llmProxy.terminationGracePeriodSeconds must be a whole number of seconds (got %v): anything else is not a value the API server accepts on a pod spec, so the object is rejected at install" (default "" $proxy.terminationGracePeriodSeconds)) -}}
+{{- end -}}
+{{- $graceMillis := mul (int64 (default 0 $proxy.terminationGracePeriodSeconds)) (int64 1000) -}}
+{{- if and (gt $leaseMillis (int64 0)) (lt (int64 $graceMillis) (add $leaseMillis $reportWindowMillis)) -}}
+{{- fail (printf "llmProxy.terminationGracePeriodSeconds (%v) must exceed llmProxy.admission.lease (%q) by at least 5s: the proxy drains for the lease on SIGTERM, because the lease is the bound on an admitted call's whole lifetime including the report that closes it. This value is the kubelet's budget for that same window, so a shorter one means SIGKILL arrives mid-drain and kills the calls whose egress has already happened and whose grant has already been spent — an unreported grant produced by every rolling update, on a schedule, while the pod terminates cleanly as far as the kubelet is concerned. The margin is required because the grace period is whole seconds while a lease need not be, and because the process still has to exit after the drain returns. Raise this, or shorten the lease — which also shortens the longest call the proxy will admit" (default "" $proxy.terminationGracePeriodSeconds) (trim (toString (default "" $admission.lease)))) -}}
+{{- end -}}
+
 {{- /* The same host-authority gate the explorer has, with the same
        consequence: the resolved listen address of a pod is an authority no
        real client sends, so an empty allow-list refuses everything with 421.
@@ -291,9 +517,41 @@
 {{- fail (printf "llmProxy.identity.%s is required: admission resolves the agent, capability, action and scope together, and an incomplete identity is refused by the plane on every request — the proxy stays healthy and denies every call, with a denial that names no reason by design" $field) -}}
 {{- end -}}
 {{- end -}}
-{{- if le (int64 (default 0 $identity.agentGeneration)) (int64 0) -}}
-{{- fail (printf "llmProxy.identity.agentGeneration must be a positive int64 (got %v): the dispatch surface refuses a non-positive generation as an invalid argument, so every admission request fails before any policy is consulted" (default 0 $identity.agentGeneration)) -}}
+{{- /* The generation, matched as text rather than converted — because the
+       value is rendered verbatim and the conversion is lossy in exactly the
+       cases worth refusing. `int64` of 1.5 is a positive 1, so a guard that
+       only tested positivity after converting passed it and then rendered
+       -agent-generation=1.5, which Go's integer flag parser rejects: the pod
+       exits at startup. A leading zero is worse than a refusal, because it
+       works — ParseInt reads 010 as octal 8, a generation nothing was
+       registered under, and the plane then denies every call. */ -}}
+{{- $generation := trim (toString (default "" $identity.agentGeneration)) -}}
+{{- if not (regexMatch "^[1-9][0-9]*$" $generation) -}}
+{{- fail (printf "llmProxy.identity.agentGeneration must be a positive whole number written plainly — no sign, no decimal point and no leading zero (got %q). It is rendered verbatim into -agent-generation: a non-integer is a flag parse error that exits the pod at startup, a leading zero is read as octal so 010 becomes 8 and names a generation nothing was registered under, and a non-positive value is refused by the dispatch surface as an invalid argument before any policy is consulted. Each of those denies every call" $generation) -}}
 {{- end -}}
+{{- if or (gt (len $generation) 19) (and (eq (len $generation) 19) (gt $generation "9223372036854775807")) -}}
+{{- fail (printf "llmProxy.identity.agentGeneration must fit in an int64 (got %q): -agent-generation is parsed as a 64-bit integer, so a larger value is a flag parse error at startup and the pod never serves" $generation) -}}
+{{- end -}}
+{{- /* The agent ID carries the same encoding as the scope identities, and the
+       binary now refuses an undecodable one at startup, so this is a render
+       refusal rather than a CrashLoopBackOff.
+
+       Be exact about what it reaches: encoding mistakes, not the class of
+       wrong values. A shoal.ID is opaque and variable-length, so there is no
+       width to validate, and a readable name that happens to decode is
+       indistinguishable here from a registered ID. Of fifteen plausible
+       names, eleven decode cleanly to garbage ("gateway" to five bytes,
+       "my-agent" to six) and four fail only on length. The four are caught;
+       the eleven are refused by the workspace on every request instead, as a
+       descriptor that does not exist. */ -}}
+{{- $agentID := trim (default "" $identity.agentID) -}}
+{{- if and $agentID (not (regexMatch "^[A-Za-z0-9_-]+$" $agentID)) -}}
+{{- fail (printf "llmProxy.identity.agentID must be canonical unpadded base64url (got %q): the workspace decodes this field and the binary refuses a value it cannot decode at startup, so the pod exits rather than serving. This is the encoded ID, not a descriptor's display name — and note that a name which happens to decode cannot be caught here, only by the workspace, which denies every call as a descriptor that does not exist" $agentID) -}}
+{{- end -}}
+{{- if and $agentID (eq (mod (len $agentID) 4) 1) -}}
+{{- fail (printf "llmProxy.identity.agentID is %d characters, which no base64url encoding can be (a length of 4n+1 is impossible): either the value is truncated or it is a display name rather than an encoded ID. The binary refuses it at startup, so the pod never serves" (len $agentID)) -}}
+{{- end -}}
+
 {{- /* Scope identities are canonical unpadded base64url on the wire, as every
        opaque identity in the API is. A value with padding or a stray character
        is not decodable, and a length of 4n+1 cannot be the encoding of any
@@ -323,7 +581,7 @@
        value, because `concat` over a nil list panics — a crash instead of a
        refusal, and one that only appears if a later edit moves this scan above
        the allow-list guard. */ -}}
-{{- range (concat (list $admissionURL $upstreamURL $admissionSecret $upstreamSecret) (values (pick $identity "agentID" "capability" "action" "sourceID" "policyID")) (splitList "," $allowedHosts)) -}}
+{{- range (concat (list $admissionURL $upstreamURL $admissionSecret $upstreamSecret $tokenFile $tokenAudience $serviceAccount $apiKeyFile) (values (pick $identity "agentID" "capability" "action" "sourceID" "policyID")) (splitList "," $allowedHosts)) -}}
 {{- if contains "REPLACE_ME" (toString (default "" .)) -}}
 {{- fail (printf "llmProxy configuration still contains the placeholder %q: replace every REPLACE_ME before installing" (toString (default "" .))) -}}
 {{- end -}}
@@ -338,6 +596,14 @@
 {{- fail "llmProxy.healthPort must differ from llmProxy.containerPort: they are two listeners and cannot share a port. Whichever binds second fails, and the pod is then either serving nothing or failing every probe" -}}
 {{- end -}}
 {{- range $field := list "containerPort" "healthPort" "servicePort" -}}
+{{- /* Matched as text before being compared as a number, for the reason the
+       agent generation is: every one of these is rendered verbatim — into
+       -listen, -health-address, a containerPort and a Service port — and `int`
+       of 8100.5 is a perfectly acceptable 8100, so a range check alone passes
+       a value the API server then rejects. */ -}}
+{{- if not (regexMatch "^[0-9]+$" (toString (default "" (index $proxy $field)))) -}}
+{{- fail (printf "llmProxy.%s must be a whole number (got %v): it is rendered verbatim into a listen address and a port declaration, so anything else is rejected by the API server at install or by the flag parser at startup" $field (default "" (index $proxy $field))) -}}
+{{- end -}}
 {{- $port := int (default 0 (index $proxy $field)) -}}
 {{- if or (lt $port 1) (gt $port 65535) -}}
 {{- fail (printf "llmProxy.%s must be a port between 1 and 65535 (got %v): anything else is not a port the API server will accept, so the object is rejected at install" $field (default 0 (index $proxy $field))) -}}
