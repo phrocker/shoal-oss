@@ -42,12 +42,19 @@ class SelectionTests(unittest.TestCase):
     def test_summary_cannot_override_raw_draft_head_or_creation_time(self):
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp)
-            raw=[{'number':1,'state':'open','draft':False,'head':{'sha':'h'},'created_at':'2026-10-01T00:00:00+00:00'}]
+            raw=[{'number':1,'state':'open','draft':False,'head':{'sha':'h'},
+                   'base':{'sha':'b'},'created_at':'2026-10-01T00:00:00+00:00'}]
             def write_raw():
                 b=json.dumps(raw).encode();(root/'raw-inventory.json').write_bytes(b);self.inventory['raw_inventory_sha256']=digest(b)
             (root/'raw-files-1.json').write_text(json.dumps([{'filename':'x.go'}]));write_raw()
             verify_inventory(root,self.inventory,self.protocol)
-            for field,value in [('state','closed'),('draft',True),('head',{'sha':'different'}),('created_at','2026-10-03T00:00:00+00:00')]:
+            # base is included because the selected pin is now bound to it. The
+            # stub omitted it, which is the reason that binding could not have
+            # existed: project() compares the pin's base only against the
+            # collected manifest, so a base substituted consistently in both
+            # agreed with itself and with nothing external.
+            for field,value in [('state','closed'),('draft',True),('head',{'sha':'different'}),
+                                ('base',{'sha':'substituted'}),('created_at','2026-10-03T00:00:00+00:00')]:
                 saved=raw[0][field];raw[0][field]=value;write_raw()
                 with self.subTest(field=field),self.assertRaises(ValueError):verify_inventory(root,self.inventory,self.protocol)
                 raw[0][field]=saved
