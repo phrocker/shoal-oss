@@ -267,9 +267,15 @@ renders "scaled to zero"                    "${llm_proxy_base[@]}" --set llmProx
 renders "loopback upstream needs no credential" "${llm_proxy_base[@]}" --set llmProxy.upstream.credentialSecretName=,llmProxy.upstream.baseURL=http://localhost:11434/v1
 renders "plaintext admission acknowledged"  "${llm_proxy_base[@]}" --set llmProxy.admission.url=http://shoal-explorer:8098,llmProxy.admission.allowPlaintext=true
 renders "loopback admission needs no acknowledgement" "${llm_proxy_base[@]}" --set llmProxy.admission.url=http://127.0.0.1:8098
-renders "lease exactly at the bound"        "${llm_proxy_base[@]}" --set llmProxy.admission.lease=5m,llmProxy.upstream.requestTimeout=5m
-renders "compound durations"                "${llm_proxy_base[@]}" --set llmProxy.admission.lease=1m30s,llmProxy.upstream.requestTimeout=1m30s
-renders "timeout equal to the lease"        "${llm_proxy_base[@]}" --set llmProxy.upstream.requestTimeout=60s
+# The fleet's claim ceiling is the upper bound, and the report window is the
+# lower one. A lease equal to the timeout is refused, not accepted: the binary
+# refuses that pair at startup, so rendering it would produce a pod that never
+# serves — which is the failure these guards exist to move to render time.
+renders "lease at the ceiling with room to report" "${llm_proxy_base[@]}" --set llmProxy.admission.lease=5m,llmProxy.upstream.requestTimeout=4m
+refuses "lease equal to the timeout"        "${llm_proxy_base[@]}" --set llmProxy.admission.lease=5m,llmProxy.upstream.requestTimeout=5m
+refuses "lease inside the report window"    "${llm_proxy_base[@]}" --set llmProxy.admission.lease=35s,llmProxy.upstream.requestTimeout=31s
+renders "compound durations"                "${llm_proxy_base[@]}" --set llmProxy.admission.lease=2m30s,llmProxy.upstream.requestTimeout=1m30s
+refuses "timeout equal to the lease"        "${llm_proxy_base[@]}" --set llmProxy.upstream.requestTimeout=60s
 renders "millisecond timeout"               "${llm_proxy_base[@]}" --set llmProxy.upstream.requestTimeout=500ms
 renders "disruption budget disabled"        "${llm_proxy_base[@]}" --set llmProxy.podDisruptionBudget.enabled=false,llmProxy.podDisruptionBudget.maxUnavailable=0
 renders "operator-supplied affinity"        "${llm_proxy_base[@]}" --set 'llmProxy.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms[0].matchExpressions[0].key=kubernetes.io/os' --set 'llmProxy.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms[0].matchExpressions[0].operator=In' --set 'llmProxy.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms[0].matchExpressions[0].values={linux}'

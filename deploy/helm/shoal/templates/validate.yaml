@@ -261,8 +261,14 @@
 {{- end -}}
 {{- /* Compared only when both are positive, so the two guards above own their
        own cases: a zero lease must not be reported as a timeout problem. */ -}}
-{{- if and (gt $leaseMillis (int64 0)) (gt $timeoutMillis (int64 0)) (gt $timeoutMillis $leaseMillis) -}}
-{{- fail (printf "llmProxy.upstream.requestTimeout (%q) must not exceed llmProxy.admission.lease (%q): a call that outlives its lease is performed under a token that can no longer be reported against, so the admission is abandoned rather than resolved — the effect happened and Shoal never learns that it did" (trim (toString (default "" $upstream.requestTimeout))) (trim (toString (default "" $admission.lease)))) -}}
+{{- /* The margin is the report's own window. The binary refuses a lease that
+       does not exceed the timeout by it, so "not exceeding the lease" is not
+       enough: equal values render a pod that fails at startup, which is the
+       CrashLoopBackOff these guards exist to turn into a render error. The
+       value matches minimumReportWindow in cmd/shoal-llm-proxy. */ -}}
+{{- $reportWindowMillis := int64 5000 -}}
+{{- if and (gt $leaseMillis (int64 0)) (gt $timeoutMillis (int64 0)) (le $leaseMillis (add $timeoutMillis $reportWindowMillis)) -}}
+{{- fail (printf "llmProxy.admission.lease (%q) must exceed llmProxy.upstream.requestTimeout (%q) by at least 5s: the report happens after the upstream call returns, so a lease that expires first means the call is performed under a token that can no longer be reported against — the effect happened and Shoal never learns that it did. The binary refuses this pair at startup, so rendering it produces a pod that never serves" (trim (toString (default "" $admission.lease))) (trim (toString (default "" $upstream.requestTimeout)))) -}}
 {{- end -}}
 
 {{- /* The same host-authority gate the explorer has, with the same
