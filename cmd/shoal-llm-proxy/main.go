@@ -308,16 +308,32 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 	return err
 }
 
+// ErrNoCredential says that no credential was supplied, as distinct from one
+// that was supplied and could not be read.
+//
+// The difference decides whether an unauthenticated request may be sent. A
+// loopback model server generally has no notion of a credential, so absence
+// there is a legitimate configuration — but "absent" and "configured and
+// broken" reached the forward path as the same bare error, so a loopback
+// upstream whose credential file had the wrong permissions forwarded the prompt
+// with no Authorization header instead of refusing. The comment there claimed
+// the opposite, and nothing in the code could have made it true.
+var ErrNoCredential = errors.New("no credential is configured")
+
 // credentialFromEnv reads a secret at use time.
 //
 // Per request, but a container's environment does not change after start, so
 // this cannot rotate. See the note in run; use the -file form where the
 // credential must be rotatable.
+//
+// An unset variable is absence rather than breakage: the chart renders no env
+// entry at all when no Secret is named, which is how a loopback upstream is
+// meant to be configured.
 func credentialFromEnv(name string) func() (string, error) {
 	return func() (string, error) {
 		value := strings.TrimSpace(os.Getenv(name))
 		if value == "" {
-			return "", fmt.Errorf("%s is empty", name)
+			return "", fmt.Errorf("%s: %w", name, ErrNoCredential)
 		}
 		return value, nil
 	}
@@ -329,6 +345,10 @@ func credentialFromEnv(name string) func() (string, error) {
 // the file in place, so a value captured at start would be the one that expired.
 func credentialFromFile(path string) func() (string, error) {
 	return func() (string, error) {
+		// Naming a file is configuring a credential, so every failure here is
+		// breakage and never absence. It must not wrap ErrNoCredential: that
+		// would let a loopback upstream treat an unreadable or empty file as
+		// "none was wanted" and forward the prompt unauthenticated.
 		raw, err := os.ReadFile(path)
 		if err != nil {
 			return "", fmt.Errorf("%s is unreadable: %w", path, err)

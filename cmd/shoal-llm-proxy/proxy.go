@@ -203,12 +203,17 @@ func (p *proxy) forward(
 	// one unconditionally, so that documented configuration refused every
 	// admitted call after admission had been spent on it.
 	//
-	// Optional is not the same as ignored: an unreadable or empty credential is
-	// still an error when one was configured, and a remote provider without one
-	// fails here rather than being sent an unauthenticated prompt.
+	// Optional is not the same as ignored, and the distinction has to be in the
+	// error rather than in a comment. Only ErrNoCredential — nothing supplied —
+	// is exempt, and only for loopback. A credential that was configured and
+	// could not be read is breakage: it refuses here instead of forwarding the
+	// prompt with no Authorization header, which is what a single bare error
+	// for both cases used to do to a loopback upstream whose token file had the
+	// wrong permissions.
 	credential, err := p.credential()
 	switch {
-	case err != nil && !isLoopback(p.upstream.Hostname()):
+	case err != nil &&
+		!(errors.Is(err, ErrNoCredential) && isLoopback(p.upstream.Hostname())):
 		p.reportFailure(request.Context(), granted.token, identity, "upstream_credential_unavailable")
 		p.refuse(writer, http.StatusBadGateway, "upstream_unreachable",
 			"the upstream provider could not be reached")

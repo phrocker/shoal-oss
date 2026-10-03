@@ -25,6 +25,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -701,7 +702,11 @@ func TestARedirectCannotCarryThePromptOffTheCheckedTransport(t *testing.T) {
 // unconditionally, so that documented configuration spent an admission and then
 // refused the call it had just been granted.
 func TestALoopbackProviderNeedsNoCredential(t *testing.T) {
-	absent := func() (string, error) { return "", errors.New("not configured") }
+	absent := func() (string, error) { return "", ErrNoCredential }
+	// Configured and unreadable, which must not be mistaken for absent.
+	broken := func() (string, error) {
+		return "", errors.New("/run/secrets/key is unreadable: permission denied")
+	}
 
 	t.Run("loopback forwards unauthenticated", func(t *testing.T) {
 		plane := newFakePlane(t, outcomeAllowed, nil)
@@ -711,6 +716,69 @@ func TestALoopbackProviderNeedsNoCredential(t *testing.T) {
 
 		if response := post(t, governed, plainCall); response.Code != http.StatusOK {
 			t.Fatalf("status = %d: %s", response.Code, response.Body.String())
+		}
+		if upstream.calls != 1 {
+			t.Fatalf("upstream calls = %d, want 1", upstream.calls)
+		}
+	})
+
+	// The case the first version of this fix got wrong, and the reason the
+	// exemption is keyed on a sentinel rather than on any error at all.
+	//
+	// A loopback upstream whose credential file has the wrong permissions is
+	// not a loopback upstream that wants no credential. Treating every error as
+	// absence forwarded the prompt with no Authorization header, and a comment
+	// claimed the opposite while nothing in the code could make it true.
+	t.Run("a broken credential is not an absent one", func(t *testing.T) {
+		plane := newFakePlane(t, outcomeAllowed, nil)
+		upstream := newFakeUpstream(t)
+		governed, _ := newTestProxy(t, plane, upstream)
+		governed.credential = broken
+
+		if response := post(t, governed, plainCall); response.Code != http.StatusBadGateway {
+			t.Fatalf("status = %d, want 502", response.Code)
+		}
+		if upstream.calls != 0 {
+			t.Fatal("a prompt was forwarded unauthenticated past a broken credential")
+		}
+		if len(plane.reports) != 1 ||
+			plane.reports[0].ErrorCode != "upstream_credential_unavailable" {
+			t.Fatalf("reports = %+v, want one naming the credential", plane.reports)
+		}
+	})
+
+	// The same property through the real credential readers rather than a stub.
+	//
+	// A mutation showed this was needed: making credentialFromFile's unreadable
+	// error wrap ErrNoCredential passed every test above, because all of them
+	// supplied the error directly. The sentinel's meaning is a contract between
+	// two functions, so a test that writes the error itself cannot check that
+	// the producer honours it — only that the consumer reads it.
+	t.Run("the real readers classify themselves correctly", func(t *testing.T) {
+		plane := newFakePlane(t, outcomeAllowed, nil)
+		upstream := newFakeUpstream(t)
+		governed, _ := newTestProxy(t, plane, upstream)
+
+		// A named file that cannot be read is a configured credential, so the
+		// loopback exemption must not apply to it.
+		governed.credential = credentialFromFile(
+			filepath.Join(t.TempDir(), "never-created"))
+		if response := post(t, governed, plainCall); response.Code != http.StatusBadGateway {
+			t.Fatalf("an unreadable key file was treated as no key file: %d",
+				response.Code)
+		}
+		if upstream.calls != 0 {
+			t.Fatal("a prompt was forwarded unauthenticated past an unreadable key file")
+		}
+
+		// An unset variable is absence: the chart renders no env entry at all
+		// when no Secret is named, which is how a loopback upstream is meant
+		// to be configured. This is the case that must still forward.
+		governed.credential = credentialFromEnv(
+			"SHOAL_TEST_UPSTREAM_KEY_DELIBERATELY_UNSET")
+		if response := post(t, governed, plainCall); response.Code != http.StatusOK {
+			t.Fatalf("a loopback upstream with no credential was refused: %d",
+				response.Code)
 		}
 		if upstream.calls != 1 {
 			t.Fatalf("upstream calls = %d, want 1", upstream.calls)
