@@ -85,6 +85,26 @@ spec:
       # token for.
       serviceAccountName: {{ . }}
       {{- end }}
+      # No Kubernetes API credential in the process that handles untrusted
+      # prompt text.
+      #
+      # This pod needs no API access at all: it speaks HTTP to the workspace
+      # with a bearer token and HTTP to the provider with another, and nothing
+      # it does touches the API server. The automatic mount put a token for its
+      # ServiceAccount in the filesystem anyway, so a compromise of the one
+      # process in this chart that parses arbitrary caller input inherited
+      # whatever RBAC the account carries — which is the opposite of the reason
+      # #390 makes the proxy a separate process from the workspace in the first
+      # place.
+      #
+      # It is unconditional rather than a values key, because a key could only
+      # ever be used to put back a credential nothing here consumes. This
+      # suppresses only the *automatic* mount: an explicit serviceAccountToken
+      # projection is a volume this template declares and the kubelet still
+      # mints it, which is what keeps llmProxy.admission.tokenFileSource
+      # "projected" working — asserted in validate-chart.sh rather than assumed,
+      # since the two settings look like they should conflict and do not.
+      automountServiceAccountToken: false
       securityContext:
         runAsNonRoot: true
         runAsUser: 65532

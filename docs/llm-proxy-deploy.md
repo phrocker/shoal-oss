@@ -136,6 +136,31 @@ token crosses the network in the clear and so does the verdict, and anything on
 the path can rewrite a deny into an allow — which removes the enforcement plane
 while leaving every sign that it is running.
 
+## No Kubernetes API credential in this pod
+
+The proxy pod sets `automountServiceAccountToken: false`, unconditionally.
+
+It needs no API access: it speaks HTTP to the workspace with a bearer token and
+HTTP to the provider with another, and nothing it does touches the API server.
+Without this, Kubernetes puts a token for the pod's ServiceAccount on the
+filesystem anyway — so a compromise of the one process in this chart that parses
+arbitrary caller input would inherit whatever RBAC that account carries. That is
+the opposite of the reason the proxy is a separate process from the workspace.
+
+This suppresses only the *automatic* mount. An explicit `serviceAccountToken`
+projection is a volume this chart declares, and the kubelet still mints it, so
+`llmProxy.admission.tokenFileSource: projected` is unaffected. The two settings
+look like they should conflict and do not — `validate-chart.sh` asserts the
+projection, its audience and the suppression together, because if that were
+wrong the projected-token form would be dead on arrival while every other check
+still passed.
+
+There is no values key for it, since one could only ever be used to put back a
+credential nothing here consumes. An operator who genuinely needs a token in
+this pod — for a sidecar, say — declares it as a volume through
+`llmProxy.admission.tokenVolume`, which is explicit and auditable in the values
+file rather than implicit in a default.
+
 ## Declared models, and why the list exists
 
 `-model` (`llmProxy.models`) names the models this deployment expects. It is

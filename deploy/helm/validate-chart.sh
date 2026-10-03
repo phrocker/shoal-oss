@@ -107,11 +107,12 @@ refuses() {
 # passing with the guard it is named for deleted — which is the defect this
 # script exists to prevent, arriving through the assertion instead of the
 # template. These pin the sentence.
-# A rendered argument, asserted exactly. "renders" only proves a values file
-# was not refused, which cannot see whether the flag the binary will parse says
-# what the operator asked for — and a list joined into one argument is exactly
-# where a blank element disappears quietly or arrives as an empty name.
-assert_arg() {
+# A pattern that must appear in the rendered output. "renders" only proves a
+# values file was not refused, which cannot see whether what the API server and
+# the binary actually receive says what the operator asked for — and a list
+# joined into one argument is exactly where a blank element disappears quietly
+# or arrives as an empty name.
+assert_renders() {
   local description="$1" pattern="$2"; shift 2
   local rendered
   if ! rendered=$(helm template shoal "$chart" "$@" 2>&1); then
@@ -119,8 +120,7 @@ assert_arg() {
     return
   fi
   if ! printf '%s\n' "$rendered" | grep -qE -- "$pattern"; then
-    fail "the rendered argument does not match /$pattern/: $description"
-    printf '%s\n' "$rendered" | grep -E -- '\-model=' | sed 's/^/      /' | head -3
+    fail "the rendered output does not match /$pattern/: $description"
   fi
 }
 
@@ -546,9 +546,27 @@ renders "one model named"        "${llm_proxy_base[@]}" --set 'llmProxy.models={
 renders "several models named"   "${llm_proxy_base[@]}" --set 'llmProxy.models={gpt-4o,claude-opus-5}'
 # Blank entries are dropped rather than rendered, since the list is joined into
 # one argument and a comma pair is an empty model name to the binary.
-assert_arg "a blank model entry is dropped" "\-model=gpt-4o$" "${llm_proxy_base[@]}" --set 'llmProxy.models={gpt-4o, }'
-assert_arg "models render as one joined argument" "\-model=gpt-4o,claude-opus-5$" "${llm_proxy_base[@]}" --set 'llmProxy.models={gpt-4o,claude-opus-5}'
-assert_arg "no models renders an empty flag" "\-model=$" "${llm_proxy_base[@]}"
+assert_renders "a blank model entry is dropped" "\-model=gpt-4o$" "${llm_proxy_base[@]}" --set 'llmProxy.models={gpt-4o, }'
+assert_renders "models render as one joined argument" "\-model=gpt-4o,claude-opus-5$" "${llm_proxy_base[@]}" --set 'llmProxy.models={gpt-4o,claude-opus-5}'
+assert_renders "no models renders an empty flag" "\-model=$" "${llm_proxy_base[@]}"
+
+note "== no Kubernetes API credential in the prompt-processing pod =="
+# This pod needs no API access: it speaks HTTP to the workspace and HTTP to the
+# provider, and touches the API server nowhere. The automatic mount put a token
+# for its ServiceAccount on the filesystem anyway, so a compromise of the one
+# process in this chart that parses arbitrary caller input inherited whatever
+# RBAC the account carries — the opposite of the reason the proxy is a separate
+# process from the workspace at all.
+assert_renders "the automatic token mount is off in the env form" "automountServiceAccountToken: false" "${llm_proxy_base[@]}"
+assert_renders "the automatic token mount is off in the file form" "automountServiceAccountToken: false" "${token_file_base[@]}"
+assert_renders "the automatic token mount is off with an operator volume" "automountServiceAccountToken: false" "${operator_volume[@]}" --set 'llmProxy.admission.tokenVolume.secret.secretName=shoal-admission-token' --set 'llmProxy.admission.tokenVolume.secret.defaultMode=288' --set 'llmProxy.admission.tokenVolume.secret.items[0].key=token' --set 'llmProxy.admission.tokenVolume.secret.items[0].path=token'
+# The pairing that looks like it should conflict and does not: suppressing the
+# automatic mount leaves an explicitly declared serviceAccountToken projection
+# alone, and the kubelet still mints it. Asserted rather than assumed, because
+# if it were wrong the whole projected-token form would be dead on arrival and
+# every other check here would still pass.
+assert_renders "an explicit projection survives it" "serviceAccountToken:" "${token_file_base[@]}"
+assert_renders "and keeps its audience" "audience: shoal" "${token_file_base[@]}"
 
 note "== both URLs are parsed, not prefix-matched =="
 # These guards tested hasPrefix "http://" and hasPrefix "http://localhost",
