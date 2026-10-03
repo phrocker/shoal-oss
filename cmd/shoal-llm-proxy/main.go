@@ -60,6 +60,11 @@ const (
 
 var listenTCP = net.Listen
 
+// drain is a variable for the same reason listenTCP is: the window it is given
+// is a correctness property, and the only way to observe one from outside is to
+// read the deadline off the context it arrives on.
+var drain = healthsurface.Drain
+
 func run(ctx context.Context, args []string, output io.Writer) error {
 	flags := flag.NewFlagSet("shoal-llm-proxy", flag.ContinueOnError)
 	flags.SetOutput(output)
@@ -231,21 +236,40 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 		fmt.Fprintf(output, "Health surface listening at http://%s\n", health.Address())
 	}
 
+	// The drain window is the lease, and deliberately not a number of its own.
+	//
+	// A ten-second drain abandoned in-flight connections, and an admitted call
+	// may run for the whole request timeout before it has anything to report —
+	// 90s by default. So every rolling update stranded the calls that were
+	// mid-flight: the egress had happened, the grant was spent, and the report
+	// that closes it was killed with the listener. An unreported grant is the
+	// one outcome this proxy exists to prevent, and a rollout produced them on
+	// purpose, on a schedule, invisibly.
+	//
+	// The lease is already the bound on an admitted call's entire lifetime
+	// including its report — that is what validateDurations checks it against —
+	// so it is the correct worst case for a call admitted a moment before the
+	// signal, and it needs no second invariant to keep it honest. The cost is
+	// explicit: a pod can take the lease to exit, so an operator who wants
+	// faster rollouts chooses a shorter lease, which shortens the longest call
+	// it will admit. The container's terminationGracePeriodSeconds must exceed
+	// this, or the kubelet sends SIGKILL and the strandings come back.
+	drainWindow := *lease
 	shutdownDone := make(chan error, 1)
 	go func() {
 		<-ctx.Done()
-		shutdown, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		shutdown, cancel := context.WithTimeout(context.Background(), drainWindow)
 		defer cancel()
-		shutdownDone <- healthsurface.Drain(shutdown, state, server, health)
+		shutdownDone <- drain(shutdown, state, server, health)
 	}()
 	state.MarkReady()
 	err = server.Serve(listener)
 	if errors.Is(err, http.ErrServerClosed) {
 		return <-shutdownDone
 	}
-	shutdown, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	shutdown, cancel := context.WithTimeout(context.Background(), drainWindow)
 	defer cancel()
-	_ = healthsurface.Drain(shutdown, state, server, health)
+	_ = drain(shutdown, state, server, health)
 	return err
 }
 

@@ -27,6 +27,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/phrocker/shoal-oss/internal/healthsurface"
 	"github.com/phrocker/shoal-oss/pkg/explorer/fleet"
 )
 
@@ -416,5 +417,86 @@ func TestTwoTokenSourcesAreRefusedRatherThanRanked(t *testing.T) {
 		"-admission-token-env", "OTHER_VAR", "-admission-token-file", "/run/token"))
 	if !strings.Contains(detail, "mutually exclusive") {
 		t.Fatalf("run() did not apply the rule: %s", detail)
+	}
+}
+
+// TestADrainingProxyWaitsOutTheCallsItAdmitted covers an unreported grant that
+// a rolling update produced on purpose, on a schedule, and invisibly.
+//
+// Shutdown abandons whatever is still connected when its context expires. The
+// window was a fixed ten seconds while an admitted call may run for the whole
+// request timeout — 90s by default — before it has anything to report. So every
+// rollout killed the calls that were mid-flight after the egress had happened
+// and the grant had been spent, which is the one outcome this proxy exists to
+// prevent.
+//
+// The window is the lease because the lease is already the bound on an admitted
+// call's entire lifetime including its report; that is what validateDurations
+// checks it against. Asserting it equals the lease rather than merely "enough"
+// is the point — "enough" is a second invariant that can drift from the first.
+//
+// A behavioural test cannot separate the two: distinguishing a 10s window from
+// a correct one needs an upstream call that outlives ten seconds, so the test
+// would cost more than the bug. The deadline is read off the context instead,
+// which is the same seam listenTCP exists for.
+func TestADrainingProxyWaitsOutTheCallsItAdmitted(t *testing.T) {
+	const lease = 70 * time.Second
+	restoreDrain, restoreListen := drain, listenTCP
+	t.Cleanup(func() { drain, listenTCP = restoreDrain, restoreListen })
+
+	windows := make(chan time.Duration, 4)
+	drain = func(
+		ctx context.Context, state *healthsurface.State,
+		workspace healthsurface.GracefulServer, health *healthsurface.Server,
+	) error {
+		deadline, ok := ctx.Deadline()
+		if !ok {
+			windows <- -1
+		} else {
+			windows <- time.Until(deadline)
+		}
+		return restoreDrain(ctx, state, workspace, health)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- run(ctx, proxyArgs(
+			"-listen", "127.0.0.1:0",
+			"-lease", lease.String(),
+			"-request-timeout", "60s",
+		), io.Discard)
+	}()
+
+	// Give the listener time to come up, then signal. A drain that never
+	// happened would hang here rather than report a wrong window, which the
+	// timeout below turns into a failure either way.
+	select {
+	case err := <-done:
+		t.Fatalf("the proxy exited before it was signalled: %v", err)
+	case <-time.After(250 * time.Millisecond):
+	}
+	cancel()
+
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the proxy did not exit after being signalled")
+	}
+
+	var window time.Duration
+	select {
+	case window = <-windows:
+	default:
+		t.Fatal("the proxy exited without draining, so admitted calls were cut off")
+	}
+	if window < 0 {
+		t.Fatal("the drain had no deadline, so a stuck call would hang shutdown forever")
+	}
+	// Generous slack for scheduling, far tighter than the gap to ten seconds.
+	if window < lease-5*time.Second || window > lease {
+		t.Fatalf("drain window = %s, want the lease (%s): a window shorter than "+
+			"an admitted call abandons it after the egress, stranding the grant",
+			window, lease)
 	}
 }
