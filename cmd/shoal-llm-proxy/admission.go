@@ -116,7 +116,16 @@ func (t *admissionToken) reportable(now time.Time) error {
 	if t.Version == 0 {
 		return errors.New("token version is invalid")
 	}
-	if !t.ExpiresAt.IsZero() && t.ExpiresAt.Sub(now) < minimumReportWindow {
+	// A missing expiry is refused rather than treated as "no deadline". The
+	// check read "if an expiry is set and it is too close", which let the one
+	// shape it most needed to catch straight through: a plane that answers
+	// without an expiry produced a token this function called reportable and
+	// nothing could establish a window for. Absent is not generous here, it is
+	// unknown, and an unknown deadline cannot be shown to leave room.
+	if t.ExpiresAt.IsZero() {
+		return errors.New("token carries no expiry, so no report window can be established")
+	}
+	if t.ExpiresAt.Sub(now) < minimumReportWindow {
 		return errors.New("token expires before the call could be reported")
 	}
 	return nil
@@ -337,6 +346,16 @@ func decodeID(name, value string) ([]byte, error) {
 	return decoded, nil
 }
 
+// newHTTPClient builds every outbound client this proxy uses.
+//
+// The redirect policy lives here rather than at each call site because it is a
+// security property, and a call site that only meant to change the transport
+// should not be able to drop it by assigning a fresh http.Client. The test
+// harness swaps the transport for the same reason.
+func newHTTPClient(timeout time.Duration) *http.Client {
+	return &http.Client{Timeout: timeout, CheckRedirect: refuseRedirect}
+}
+
 // absoluteURL parses a configured base URL and refuses anything that could not
 // address a service.
 func absoluteURL(raw string) (*url.URL, error) {
@@ -357,6 +376,37 @@ func absoluteURL(raw string) (*url.URL, error) {
 		return nil, errors.New("must use https, or http addressing loopback")
 	}
 	return parsed, nil
+}
+
+// planeURL applies absoluteURL to the admission plane, with the one
+// acknowledged exception.
+//
+// The chart already has llmProxy.admission.allowPlaintext for a mesh that
+// supplies the transport authentication the scheme would, and asserts that
+// configuration renders — but nothing carried the acknowledgement into the
+// process, so absoluteURL refused it at startup and the documented mesh
+// deployment produced a pod in CrashLoopBackOff. A chart that renders a
+// configuration the binary refuses is the third mismatch of this kind found on
+// this work; the acknowledgement is a flag now so the two agree.
+//
+// It is deliberately narrower than "allow plaintext". The upstream URL carries
+// the prompt and the operator's credential and has no opt-out, because a mesh
+// that authenticates the hop to the decision plane says nothing about the hop
+// to a third-party provider.
+func planeURL(raw string, allowPlaintext bool) (*url.URL, error) {
+	parsed, err := absoluteURL(raw)
+	if err == nil || !allowPlaintext {
+		return parsed, err
+	}
+	// Re-parse under the relaxed rule, still refusing anything that is not an
+	// absolute http(s) URL with a host. The acknowledgement covers the
+	// transport, not the shape.
+	relaxed, parseErr := url.Parse(strings.TrimSpace(raw))
+	if parseErr != nil || !relaxed.IsAbs() || relaxed.Hostname() == "" ||
+		relaxed.Scheme != "http" {
+		return nil, err
+	}
+	return relaxed, nil
 }
 
 func isLoopback(host string) bool {

@@ -29,6 +29,22 @@ import (
 	"time"
 )
 
+// refuseRedirect stops a redirect from escaping the transport rule.
+//
+// absoluteURL settles the scheme of the URL that is configured, and a followed
+// redirect is a different URL that it never saw. A 307 or 308 preserves the
+// method and body, so one hop to http:// replays the prompt — and, on the
+// upstream path, the operator's credential — in the clear, past a check that
+// passed. Go retains the Authorization header across a same-host redirect,
+// which is exactly the case a compromised or misconfigured provider would use.
+//
+// The 3xx is handed back as the response instead, so the caller sees the
+// provider's own answer and the outcome is reported as it happened. This
+// matches pkg/model/openai.go, which does the same for the same reason.
+func refuseRedirect(*http.Request, []*http.Request) error {
+	return http.ErrUseLastResponse
+}
+
 // maxRequestBytes bounds what the proxy will read from a caller. An
 // OpenAI-compatible body is prompt text; without a bound a caller could make
 // the proxy hold arbitrary memory before any decision is taken.
@@ -171,7 +187,7 @@ func (p *proxy) forward(
 	outbound json.RawMessage,
 	stream bool,
 ) {
-	endpoint := p.upstream.JoinPath("v1", "chat", "completions")
+	endpoint := p.upstream.JoinPath("chat", "completions")
 	upstreamRequest, err := http.NewRequestWithContext(
 		request.Context(), http.MethodPost, endpoint.String(), bytes.NewReader(outbound))
 	if err != nil {
@@ -180,14 +196,26 @@ func (p *proxy) forward(
 			"the upstream provider could not be reached")
 		return
 	}
+	// A credential is required of a remote provider and optional for a
+	// loopback one, because a local model server generally has no notion of
+	// one. The chart and the deployment guide already say so — a case asserts
+	// that a loopback upstream renders with no Secret — and this path demanded
+	// one unconditionally, so that documented configuration refused every
+	// admitted call after admission had been spent on it.
+	//
+	// Optional is not the same as ignored: an unreadable or empty credential is
+	// still an error when one was configured, and a remote provider without one
+	// fails here rather than being sent an unauthenticated prompt.
 	credential, err := p.credential()
-	if err != nil {
+	switch {
+	case err != nil && !isLoopback(p.upstream.Hostname()):
 		p.reportFailure(request.Context(), granted.token, identity, "upstream_credential_unavailable")
 		p.refuse(writer, http.StatusBadGateway, "upstream_unreachable",
 			"the upstream provider could not be reached")
 		return
+	case err == nil:
+		upstreamRequest.Header.Set("Authorization", "Bearer "+credential)
 	}
-	upstreamRequest.Header.Set("Authorization", "Bearer "+credential)
 	upstreamRequest.Header.Set("Content-Type", "application/json")
 	if accept := request.Header.Get("Accept"); accept != "" {
 		upstreamRequest.Header.Set("Accept", accept)
@@ -353,7 +381,7 @@ func newProxy(
 	}
 	return &proxy{
 		admission: admission, upstream: parsed,
-		client:     &http.Client{Timeout: timeout},
+		client:     newHTTPClient(timeout),
 		credential: credential, allowedHosts: allowedHosts, clock: clock, log: log,
 	}, nil
 }

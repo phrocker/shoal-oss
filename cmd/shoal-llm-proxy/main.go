@@ -83,6 +83,15 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 			"orchestrator probes. Empty disables it. It is a second listener "+
 			"because the request surface answers only the completions route "+
 			"and a probe must not be mistaken for a call")
+	allowPlaintextAdmission := flags.Bool("allow-plaintext-admission", false,
+		"Accept a remote http:// -admission-url. Off by default: over "+
+			"plaintext the bearer token and the verdict both cross the "+
+			"network in the clear, and anything on the path can rewrite a "+
+			"deny into an allow — which removes the enforcement plane while "+
+			"leaving every sign that it is running. This exists for a mesh "+
+			"that already authenticates the hop, and makes accepting it an "+
+			"explicit act. It does not apply to -upstream-base-url, which "+
+			"carries the prompt itself")
 	admissionURL := flags.String("admission-url", "",
 		"Base URL of the Shoal workspace whose admission surface decides each "+
 			"call. Required: without a decision plane this is a plain relay, "+
@@ -101,7 +110,15 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 	upstreamBaseURL := flags.String("upstream-base-url", "",
 		"The real OpenAI-compatible provider this proxy forwards to")
 	upstreamKeyEnv := flags.String("upstream-api-key-env", "SHOAL_UPSTREAM_API_KEY",
-		"Environment variable read at request time holding the upstream credential")
+		"Environment variable read at request time holding the upstream "+
+			"credential. A container's environment is fixed after start, so "+
+			"this form cannot be rotated without replacing the pod")
+	upstreamKeyFile := flags.String("upstream-api-key-file", "",
+		"File read at request time holding the upstream credential, instead "+
+			"of an environment variable. Use this where the credential "+
+			"rotates: a Secret mounted as a volume is updated in place, where "+
+			"the same Secret behind a secretKeyRef is not. Mutually "+
+			"exclusive with -upstream-api-key-env")
 	agentID := flags.String("agent-id", "",
 		"Registered descriptor this proxy admits against, as unpadded "+
 			"base64url. This is the encoded ID, not a descriptor's display "+
@@ -161,6 +178,12 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 	if err != nil {
 		return err
 	}
+	upstreamCredential, err := credentialSource(
+		"-upstream-api-key", *upstreamKeyEnv, *upstreamKeyFile,
+		flags.Lookup("upstream-api-key-env").DefValue)
+	if err != nil {
+		return err
+	}
 	if strings.TrimSpace(*capability) == "" || strings.TrimSpace(*action) == "" {
 		return errors.New("-capability and -action are required")
 	}
@@ -175,20 +198,32 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 	if err != nil {
 		return err
 	}
-	base, err := absoluteURL(*admissionURL)
+	base, err := planeURL(*admissionURL, *allowPlaintextAdmission)
 	if err != nil {
 		return fmt.Errorf("-admission-url %v", err)
 	}
 
-	// Credentials are read per request, not captured at start. A rotated
-	// secret then takes effect without a restart, and the value is never held
-	// in the proxy's own state where a crash dump would carry it.
+	// Credentials are read per request, not captured at start, so the value is
+	// never held in the proxy's own state where a crash dump would carry it.
+	//
+	// What that does NOT buy is rotation of an environment variable. A process
+	// environment is fixed once the container starts: updating the Secret
+	// behind a secretKeyRef leaves every running proxy on the old value until
+	// the pod is replaced, so reading os.Getenv per request re-reads the same
+	// string forever. An earlier comment here claimed otherwise, which was
+	// simply wrong.
+	//
+	// Rotation needs a source that can actually change underneath a running
+	// process, which is what the -file forms are for: the kubelet rewrites a
+	// projected token in place, and a Secret mounted as a volume is updated
+	// too. Per-request reading is what makes those forms work; for the env
+	// form it is only the crash-dump property.
 	logf := func(format string, values ...any) {
 		fmt.Fprintf(output, format+"\n", values...)
 	}
 	admission := &admissionClient{
 		base:       base,
-		http:       &http.Client{Timeout: *requestTimeout},
+		http:       newHTTPClient(*requestTimeout),
 		credential: admissionCredential,
 		agentID:    *agentID, agentGeneration: *agentGeneration,
 		capability: *capability, action: *action,
@@ -208,7 +243,7 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 		return err
 	}
 	governed, err := newProxy(
-		admission, *upstreamBaseURL, credentialFromEnv(*upstreamKeyEnv),
+		admission, *upstreamBaseURL, upstreamCredential,
 		allowedHosts, *requestTimeout, time.Now, logf)
 	if err != nil {
 		listener.Close()
@@ -274,6 +309,10 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 }
 
 // credentialFromEnv reads a secret at use time.
+//
+// Per request, but a container's environment does not change after start, so
+// this cannot rotate. See the note in run; use the -file form where the
+// credential must be rotatable.
 func credentialFromEnv(name string) func() (string, error) {
 	return func() (string, error) {
 		value := strings.TrimSpace(os.Getenv(name))

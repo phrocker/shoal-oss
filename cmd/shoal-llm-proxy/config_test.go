@@ -178,6 +178,14 @@ func TestAnUnreportableTokenIsRefusedBeforeTheEgress(t *testing.T) {
 		{"expiring inside the report window", &admissionToken{
 			ActionID: "YWN0aW9u", TokenID: "dG9rZW4", Version: 1,
 			ExpiresAt: now.Add(minimumReportWindow / 2)}},
+		// The shape the check was written to let through. It read "if an
+		// expiry is set and it is too close", so a plane answering without one
+		// produced a token this function called reportable while nothing could
+		// establish a window for it. Absent is not generous here, it is
+		// unknown, and an unknown deadline cannot be shown to leave room —
+		// which makes this the one case the whole guard most needed to catch.
+		{"no expiry at all", &admissionToken{
+			ActionID: "YWN0aW9u", TokenID: "dG9rZW4", Version: 1}},
 	} {
 		plane := newFakePlane(t, outcomeAllowed, nil)
 		plane.token = probe.token
@@ -281,13 +289,33 @@ func proxyArgs(overrides ...string) []string {
 // refusal drives run() and returns why it refused. Every probe here refuses
 // during configuration, which is before run() binds a listener — the point of
 // the exercise is that these are startup failures and not per-call ones.
+//
+// It must not hang when a probe is wrongly accepted, which is the state a
+// mutation deliberately creates: run() then reaches Serve and blocks forever,
+// so the mutant looks like a timeout instead of a failed assertion and the
+// whole suite stalls. An accepted configuration is cancelled and reported as
+// what it is. The listener is also asked for port 0 so a probe that does get
+// that far cannot collide with anything.
 func refusal(t *testing.T, args []string) string {
 	t.Helper()
-	err := run(context.Background(), args, io.Discard)
-	if err == nil {
-		t.Fatalf("configuration was accepted: %v", args)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- run(ctx, append([]string{"-listen", "127.0.0.1:0"}, args...), io.Discard)
+	}()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatalf("configuration was accepted: %v", args)
+		}
+		return err.Error()
+	case <-time.After(3 * time.Second):
+		cancel()
+		<-done
+		t.Fatalf("configuration was accepted and served: %v", args)
+		return ""
 	}
-	return err.Error()
 }
 
 // TestAMisencodedAgentIDIsRefusedAtStartup covers a contract that was stated
@@ -498,5 +526,93 @@ func TestADrainingProxyWaitsOutTheCallsItAdmitted(t *testing.T) {
 		t.Fatalf("drain window = %s, want the lease (%s): a window shorter than "+
 			"an admitted call abandons it after the egress, stranding the grant",
 			window, lease)
+	}
+}
+
+// TestAnAcknowledgedPlaintextPlaneIsAccepted closes a chart/binary mismatch.
+//
+// The chart has llmProxy.admission.allowPlaintext for a mesh that supplies the
+// transport authentication the scheme would, and validate-chart.sh asserts that
+// configuration *renders*. Nothing carried the acknowledgement into the
+// process, so absoluteURL refused it at startup: the documented mesh deployment
+// rendered cleanly and produced a pod in CrashLoopBackOff.
+//
+// The exception is deliberately narrow, and the narrowness is the part worth
+// pinning. It covers the admission plane, where only the declaration and the
+// bearer token travel — not the upstream, which carries the prompt itself and
+// has no opt-out, because a mesh authenticating the hop to the decision plane
+// says nothing about the hop to a third-party provider.
+func TestAnAcknowledgedPlaintextPlaneIsAccepted(t *testing.T) {
+	const remote = "http://shoal-explorer:8098"
+	if _, err := planeURL(remote, false); err == nil {
+		t.Fatal("remote plaintext was accepted without the acknowledgement")
+	}
+	parsed, err := planeURL(remote, true)
+	if err != nil {
+		t.Fatalf("the acknowledged configuration was refused: %v", err)
+	}
+	if parsed.Scheme != "http" || parsed.Host != "shoal-explorer:8098" {
+		t.Fatalf("parsed = %v, want the configured URL", parsed)
+	}
+
+	// The acknowledgement covers the transport, not the shape. A value that is
+	// not an absolute URL is still refused, or the flag becomes a way to skip
+	// validation rather than to accept one known risk.
+	for _, probe := range []string{"", "shoal-explorer:8098", "ftp://host/x", "http:///nohost"} {
+		if _, err = planeURL(probe, true); err == nil {
+			t.Fatalf("%q was accepted under the acknowledgement", probe)
+		}
+	}
+	// https still works with the flag set, and the flag does not downgrade it.
+	if parsed, err = planeURL("https://workspace.test", true); err != nil ||
+		parsed.Scheme != "https" {
+		t.Fatalf("https under the acknowledgement = %v, %v", parsed, err)
+	}
+
+	// And run() applies it, which is the half that testing planeURL alone does
+	// not reach — the same gap a mutation found for absoluteURL and newProxy.
+	detail := refusal(t, proxyArgs("-admission-url", remote))
+	if !strings.Contains(detail, "-admission-url") {
+		t.Fatalf("run() accepted remote plaintext by default: %s", detail)
+	}
+	if err = run(context.Background(), proxyArgs(
+		"-admission-url", remote, "-allow-plaintext-admission",
+		"-upstream-base-url", "ftp://nope",
+	), io.Discard); err == nil || !strings.Contains(err.Error(), "upstream") {
+		// Reaching the upstream check proves the admission URL was accepted;
+		// a deliberately bad upstream stops run() before it binds a listener.
+		t.Fatalf("run() did not honour the acknowledgement: %v", err)
+	}
+
+	// The exception does not extend to the upstream, which carries the prompt.
+	if _, err = absoluteURL("http://api.example.test"); err == nil {
+		t.Fatal("the upstream transport rule was relaxed too")
+	}
+}
+
+// TestTheUpstreamCredentialAlsoHasAFileForm is the symmetry the admission
+// token gained for the same reason: an environment variable cannot rotate.
+func TestTheUpstreamCredentialAlsoHasAFileForm(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "api-key")
+	if err := os.WriteFile(path, []byte("sk-first\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	read, err := credentialSource("-upstream-api-key", "", path, "SHOAL_UPSTREAM_API_KEY")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if value, readErr := read(); readErr != nil || value != "sk-first" {
+		t.Fatalf("credential = %q, %v", value, readErr)
+	}
+	if err = os.WriteFile(path, []byte("sk-rotated"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if value, readErr := read(); readErr != nil || value != "sk-rotated" {
+		t.Fatalf("credential = %q, %v; want the rotated value", value, readErr)
+	}
+	detail := refusal(t, proxyArgs(
+		"-upstream-api-key-env", "OTHER", "-upstream-api-key-file", path))
+	if !strings.Contains(detail, "mutually exclusive") {
+		t.Fatalf("run() did not apply the rule: %s", detail)
 	}
 }

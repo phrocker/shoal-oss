@@ -19,6 +19,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -85,6 +86,11 @@ type fakeUpstream struct {
 	status   int
 	body     string
 	calls    int
+	// paths records what was actually requested. The fake answered every path
+	// identically, which is why the acceptance test could not see the endpoint
+	// being built with a duplicated version segment.
+	paths    []string
+	location string
 	server   *httptest.Server
 }
 
@@ -94,7 +100,11 @@ func newFakeUpstream(t *testing.T) *fakeUpstream {
 	upstream.server = httptest.NewServer(http.HandlerFunc(
 		func(writer http.ResponseWriter, request *http.Request) {
 			upstream.calls++
+			upstream.paths = append(upstream.paths, request.URL.Path)
 			upstream.received, _ = io.ReadAll(request.Body)
+			if upstream.location != "" {
+				writer.Header().Set("Location", upstream.location)
+			}
 			writer.WriteHeader(upstream.status)
 			_, _ = io.WriteString(writer, upstream.body)
 		}))
@@ -109,8 +119,10 @@ func newTestProxy(t *testing.T, plane *fakePlane, upstream *fakeUpstream) (*prox
 	if err != nil {
 		t.Fatal(err)
 	}
+	planeClient := newHTTPClient(5 * time.Second)
+	planeClient.Transport = plane.server.Client().Transport
 	client := &admissionClient{
-		base: base, http: plane.server.Client(),
+		base: base, http: planeClient,
 		credential:      func() (string, error) { return "plane-token", nil },
 		agentID:         "agent",
 		agentGeneration: 1,
@@ -133,7 +145,11 @@ func newTestProxy(t *testing.T, plane *fakePlane, upstream *fakeUpstream) (*prox
 	if err != nil {
 		t.Fatal(err)
 	}
-	governed.client = upstream.server.Client()
+	// Only the transport is replaced. Assigning a whole http.Client here
+	// discarded the production redirect policy, which is how a test asserting
+	// that a redirect cannot carry the prompt passed against a client that
+	// followed one.
+	governed.client.Transport = upstream.server.Client().Transport
 	return governed, &logged
 }
 
@@ -529,4 +545,163 @@ func TestTheReportFitsInTheWindowReservedForIt(t *testing.T) {
 			"report that takes the time it is granted expires the lease",
 			headroom, minimumReportWindow)
 	}
+}
+
+// TestTheUpstreamPathIsTheDocumentedOne pins the endpoint the proxy builds.
+//
+// An OpenAI-compatible base URL conventionally carries the version segment —
+// OPENAI_BASE_URL is https://api.openai.com/v1, and the chart's own case uses
+// http://localhost:11434/v1. The proxy appended "v1/chat/completions" to that,
+// producing /v1/v1/chat/completions: a 404 from every real provider, against
+// the configuration the chart and the deployment guide both document.
+//
+// No test could see it because the fake upstream answered every path the same
+// way. That is the recurring shape of the defects found on this PR — a fixture
+// unable to express the condition, rather than a missing assertion — so the
+// fake records the path now and this asserts it exactly.
+func TestTheUpstreamPathIsTheDocumentedOne(t *testing.T) {
+	plane := newFakePlane(t, outcomeAllowed, nil)
+	upstream := newFakeUpstream(t)
+	governed, _ := newTestProxy(t, plane, upstream)
+	// A base with the version segment, as every OpenAI-compatible client and
+	// the chart's own rendering case supply it.
+	base, err := url.Parse(upstream.server.URL + "/v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	governed.upstream = base
+
+	if response := post(t, governed, plainCall); response.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", response.Code, response.Body.String())
+	}
+	if len(upstream.paths) != 1 || upstream.paths[0] != "/v1/chat/completions" {
+		t.Fatalf("upstream path = %v, want [/v1/chat/completions]", upstream.paths)
+	}
+}
+
+// TestARedirectCannotCarryThePromptOffTheCheckedTransport covers a hole in a
+// rule that is otherwise enforced carefully.
+//
+// absoluteURL settles the scheme of the URL that is configured. A followed
+// redirect is a different URL it never saw, and a 307 or 308 preserves the
+// method and the body — so one hop to http:// replays the prompt, and on the
+// upstream path the operator's credential with it, past a check that passed.
+// Go keeps the Authorization header across a same-host redirect, which is the
+// case that matters most.
+//
+// Both clients are covered, because the admission client had the same default
+// and the declaration is still worth not leaking.
+func TestARedirectCannotCarryThePromptOffTheCheckedTransport(t *testing.T) {
+	// Where a followed redirect would land. Nothing may reach it.
+	var landed int
+	elsewhere := httptest.NewServer(http.HandlerFunc(
+		func(writer http.ResponseWriter, _ *http.Request) {
+			landed++
+			writer.WriteHeader(http.StatusOK)
+		}))
+	t.Cleanup(elsewhere.Close)
+
+	t.Run("upstream", func(t *testing.T) {
+		plane := newFakePlane(t, outcomeAllowed, nil)
+		upstream := newFakeUpstream(t)
+		upstream.status, upstream.location, upstream.body =
+			http.StatusTemporaryRedirect, elsewhere.URL+"/v1/chat/completions", ""
+		governed, _ := newTestProxy(t, plane, upstream)
+
+		response := post(t, governed, plainCall)
+		if landed != 0 {
+			t.Fatal("the prompt was replayed to the redirect target")
+		}
+		// The 3xx is handed back as the provider's own answer, so the caller
+		// sees what happened rather than a synthesised error.
+		if response.Code != http.StatusTemporaryRedirect {
+			t.Fatalf("status = %d, want the upstream's 307", response.Code)
+		}
+		// And it is still reported: an unreported grant is the outcome this
+		// proxy exists to prevent, redirect or not.
+		if len(plane.reports) != 1 {
+			t.Fatalf("reports = %d, want 1", len(plane.reports))
+		}
+	})
+
+	t.Run("admission", func(t *testing.T) {
+		landed = 0
+		plane := newFakePlane(t, outcomeAllowed, nil)
+		upstream := newFakeUpstream(t)
+		governed, _ := newTestProxy(t, plane, upstream)
+		redirecting := httptest.NewServer(http.HandlerFunc(
+			func(writer http.ResponseWriter, request *http.Request) {
+				writer.Header().Set("Location", elsewhere.URL+request.URL.Path)
+				writer.WriteHeader(http.StatusTemporaryRedirect)
+			}))
+		t.Cleanup(redirecting.Close)
+		base, err := url.Parse(redirecting.URL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		governed.admission.base = base
+
+		response := post(t, governed, plainCall)
+		if landed != 0 {
+			t.Fatal("the declaration and bearer token were replayed to the redirect target")
+		}
+		// No decision means no call. The redirect is not an allow.
+		if upstream.calls != 0 {
+			t.Fatal("the call was forwarded without a decision")
+		}
+		if response.Code != http.StatusServiceUnavailable {
+			t.Fatalf("status = %d, want 503", response.Code)
+		}
+	})
+}
+
+// TestALoopbackProviderNeedsNoCredential covers a configuration the chart
+// asserts renders and the binary refused on every call.
+//
+// validate-chart.sh has a case named "loopback upstream needs no credential"
+// and the deployment guide says a loopback provider needs none — a local model
+// server generally has no notion of one. The forward path demanded a credential
+// unconditionally, so that documented configuration spent an admission and then
+// refused the call it had just been granted.
+func TestALoopbackProviderNeedsNoCredential(t *testing.T) {
+	absent := func() (string, error) { return "", errors.New("not configured") }
+
+	t.Run("loopback forwards unauthenticated", func(t *testing.T) {
+		plane := newFakePlane(t, outcomeAllowed, nil)
+		upstream := newFakeUpstream(t)
+		governed, _ := newTestProxy(t, plane, upstream)
+		governed.credential = absent
+
+		if response := post(t, governed, plainCall); response.Code != http.StatusOK {
+			t.Fatalf("status = %d: %s", response.Code, response.Body.String())
+		}
+		if upstream.calls != 1 {
+			t.Fatalf("upstream calls = %d, want 1", upstream.calls)
+		}
+	})
+
+	// Optional is not ignored. A remote provider with no credential fails here
+	// rather than being sent an unauthenticated prompt, which would reach a
+	// third party and be rejected — after the egress.
+	t.Run("a remote provider still requires one", func(t *testing.T) {
+		plane := newFakePlane(t, outcomeAllowed, nil)
+		upstream := newFakeUpstream(t)
+		governed, _ := newTestProxy(t, plane, upstream)
+		governed.credential = absent
+		remote, err := url.Parse("https://api.example.test/v1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		governed.upstream = remote
+
+		if response := post(t, governed, plainCall); response.Code != http.StatusBadGateway {
+			t.Fatalf("status = %d, want 502", response.Code)
+		}
+		if upstream.calls != 0 {
+			t.Fatal("a prompt was sent to a remote provider with no credential")
+		}
+		if len(plane.reports) != 1 || plane.reports[0].ErrorCode != "upstream_credential_unavailable" {
+			t.Fatalf("reports = %+v, want one naming the missing credential", plane.reports)
+		}
+	})
 }
