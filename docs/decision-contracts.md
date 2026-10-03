@@ -1,7 +1,8 @@
 # Decision task and picture contracts
 
 `pkg/decision` is the first production-package slice of #402. It constructs
-immutable, content-addressed task definitions and measured evidence pictures.
+immutable, content-addressed task definitions, measured evidence pictures,
+predictor identities, requests and validated prediction records.
 It does not yet serve predictions or provide the #418 HTTP API. Existing
 experimental models and persisted Mosaic records are unchanged.
 
@@ -68,10 +69,47 @@ A non-code service-prerequisite task is exercised in the contract tests; it does
 not demonstrate an operational risk classifier. Neither a valid task nor a valid
 picture authorizes exclusion or execution.
 
+## Predictor, request and result contracts
+
+`PredictorIdentity` binds artifact digests for weights, tokenizer and environment,
+plus runtime, formatting, calibration, effective device/precision and batch policy.
+A versioned uncalibrated configuration is valid; identity is not proof of quality.
+The registry must verify artifacts and supported runtime settings. Provider-native
+rounding tolerance is explicitly bounded and separate from replay tolerance.
+
+`DecisionRequest` binds a validated task, matching picture, predictor and resolved
+release to a principal, correlation, subject set and deadline. It checks membership,
+chronology and answer-count bounds. The subject set is explicit: a consumer can
+request a subset, but this never implies permission to omit other subjects from
+review. The future service authenticates the principal, resolves the release and
+reserves idempotency against this request before inference.
+
+`PredictionRecord` validates the returned request/predictor identities and device.
+Completed responses cover every requested subject/question pair exactly once.
+Choice/ordinal results may return labels alone, allowing classifiers that do not
+produce probabilities. If supplied, a distribution must include exactly the task
+labels, finite values in [0,1], and a sum within the pinned rounding tolerance.
+Native values are preserved; selected labels are not recomputed from argmax.
+Proposition questions require a finite probability in [0,1]. Model confidence,
+ranking margins and calibrated probability must not be substituted for each other.
+
+Abstention carries a reason and no prediction. Unknown or unsupported subjects and
+truncated input cannot receive scored answers in this first conservative contract.
+This does not yet implement the task's broader evidence-eligibility policy.
+Whole-request failure/abstention carries no partial results. A timeout/failure can
+be recorded after the deadline; successful results cannot. Recording historical
+failure grants no right to retrieve it after authorization expires. Times, device
+and provider identity are executor assertions until the service attests them.
+
+These records are not durable receipts. The store must still commit one result per
+reserved request, authenticate outcomes, recover uncertain requests and enforce
+current access. No predictor is executed by these constructors, and valid output
+does not authorize exclusion or operational permission.
+
 ## Remaining delivery
 
-#402 still needs predictor/runtime identities, requests/results, response validation,
-ranking/aggregation semantics and evidence eligibility. #403 owns durable receipts,
+#402 still needs ranking/aggregation semantics, full task-specific evidence
+eligibility and serving-adapter integration. #403 owns durable receipts,
 idempotency, attributed outcomes and authorization. #418 exposes those through
 an authenticated client/API slice. #405/#406 implement authorized training and
 release lifecycle; #419 enforces trust boundaries. The offline showcase remains
