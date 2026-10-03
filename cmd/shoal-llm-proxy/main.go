@@ -172,15 +172,21 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 	if _, err := decodeID("-agent-id", *agentID); err != nil {
 		return err
 	}
+	// What was passed, not what it resolved to. A flag left at its default is
+	// not a choice, and treating it as one is what made the mutual-exclusion
+	// rule miss the operator who typed the default.
+	chosen := map[string]bool{}
+	flags.Visit(func(f *flag.Flag) { chosen[f.Name] = true })
+
 	admissionCredential, err := credentialSource(
 		"-admission-token", *admissionTokenEnv, *admissionTokenFile,
-		flags.Lookup("admission-token-env").DefValue)
+		chosen["admission-token-env"])
 	if err != nil {
 		return err
 	}
 	upstreamCredential, err := credentialSource(
 		"-upstream-api-key", *upstreamKeyEnv, *upstreamKeyFile,
-		flags.Lookup("upstream-api-key-env").DefValue)
+		chosen["upstream-api-key-env"])
 	if err != nil {
 		return err
 	}
@@ -367,11 +373,19 @@ func credentialFromFile(path string) func() (string, error) {
 // invisible: an operator who adds a file while a stale env var is still in the
 // manifest cannot tell from the configuration which one is being presented, and
 // the symptom of the wrong answer is an authentication failure that names
-// neither. The env flag has a non-empty default, so "both set" means the
-// default was left in place rather than that two were chosen deliberately —
-// which is why the default is compared rather than emptiness.
+// neither.
+//
+// envChosen says whether the env flag was actually passed, which is the only
+// form of that question with no hole in it. This compared the flag's value
+// against its default instead, because the env flag ships with a non-empty
+// default and "both non-empty" would otherwise make the file form unreachable.
+// That let the exact case the rule exists to close straight through: an
+// operator who writes -admission-token-env=SHOAL_ADMISSION_TOKEN explicitly
+// beside a file got the file silently, having typed the default. flag.Visit
+// reports what was set rather than what it ended up as, so the rule can be
+// exact without costing reachability.
 func credentialSource(
-	name, fromEnv, fromFile, envDefault string,
+	name, fromEnv, fromFile string, envChosen bool,
 ) (func() (string, error), error) {
 	env, file := strings.TrimSpace(fromEnv), strings.TrimSpace(fromFile)
 	if file == "" {
@@ -380,7 +394,7 @@ func credentialSource(
 		}
 		return credentialFromEnv(env), nil
 	}
-	if env != "" && env != envDefault {
+	if envChosen {
 		return nil, fmt.Errorf("%s-env and %s-file are mutually exclusive", name, name)
 	}
 	return credentialFromFile(file), nil

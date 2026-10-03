@@ -374,7 +374,7 @@ func TestTheAdmissionTokenCanComeFromAFile(t *testing.T) {
 	if err := os.WriteFile(path, []byte("  first-token\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	read, err := credentialSource("-admission-token", "", path, "SHOAL_ADMISSION_TOKEN")
+	read, err := credentialSource("-admission-token", "", path, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -406,8 +406,7 @@ func TestTheAdmissionTokenCanComeFromAFile(t *testing.T) {
 		t.Fatal("an empty token file was accepted")
 	}
 	absent, err := credentialSource(
-		"-admission-token", "", filepath.Join(t.TempDir(), "absent"),
-		"SHOAL_ADMISSION_TOKEN")
+		"-admission-token", "", filepath.Join(t.TempDir(), "absent"), false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -429,22 +428,44 @@ func TestTheAdmissionTokenCanComeFromAFile(t *testing.T) {
 // unreachable without also blanking the env flag.
 func TestTwoTokenSourcesAreRefusedRatherThanRanked(t *testing.T) {
 	const envDefault = "SHOAL_ADMISSION_TOKEN"
-	if _, err := credentialSource(
-		"-admission-token", "OTHER_VAR", "/run/token", envDefault); err == nil {
-		t.Fatal("two explicitly chosen token sources were accepted")
+
+	// Passed beside a file, whatever its value — including the default, which
+	// is the case the old rule missed.
+	for _, value := range []string{"OTHER_VAR", envDefault} {
+		if _, err := credentialSource(
+			"-admission-token", value, "/run/token", true); err == nil {
+			t.Fatalf("-admission-token-env=%s was accepted beside a file", value)
+		}
 	}
+	// Not passed: the flag sits at its default, which is not a choice, so the
+	// file form is reachable without blanking anything.
 	if _, err := credentialSource(
-		"-admission-token", envDefault, "/run/token", envDefault); err != nil {
-		t.Fatalf("the file form is unreachable with the env flag at its default: %v", err)
+		"-admission-token", envDefault, "/run/token", false); err != nil {
+		t.Fatalf("the file form is unreachable with the env flag unset: %v", err)
 	}
-	if _, err := credentialSource("-admission-token", "", "", envDefault); err == nil {
+	if _, err := credentialSource("-admission-token", "", "", false); err == nil {
 		t.Fatal("no token source at all was accepted")
 	}
-	// And the refusal is reached through run(), not only in isolation.
-	detail := refusal(t, proxyArgs(
-		"-admission-token-env", "OTHER_VAR", "-admission-token-file", "/run/token"))
-	if !strings.Contains(detail, "mutually exclusive") {
-		t.Fatalf("run() did not apply the rule: %s", detail)
+
+	// Through run(), which is where the hole actually was: credentialSource
+	// could not see whether a flag had been passed, so run() had to tell it,
+	// and it told it the resolved value instead.
+	for _, value := range []string{"OTHER_VAR", envDefault} {
+		detail := refusal(t, proxyArgs(
+			"-admission-token-env", value, "-admission-token-file", "/run/token"))
+		if !strings.Contains(detail, "mutually exclusive") {
+			t.Fatalf("run() accepted -admission-token-env=%s beside a file: %s",
+				value, detail)
+		}
+	}
+	// And the same for the upstream credential, which has the same shape.
+	for _, value := range []string{"OTHER", "SHOAL_UPSTREAM_API_KEY"} {
+		detail := refusal(t, proxyArgs(
+			"-upstream-api-key-env", value, "-upstream-api-key-file", "/run/key"))
+		if !strings.Contains(detail, "mutually exclusive") {
+			t.Fatalf("run() accepted -upstream-api-key-env=%s beside a file: %s",
+				value, detail)
+		}
 	}
 }
 
@@ -578,9 +599,12 @@ func TestAnAcknowledgedPlaintextPlaneIsAccepted(t *testing.T) {
 	if err = run(context.Background(), proxyArgs(
 		"-admission-url", remote, "-allow-plaintext-admission",
 		"-upstream-base-url", "ftp://nope",
-	), io.Discard); err == nil || !strings.Contains(err.Error(), "upstream") {
+	), io.Discard); err == nil ||
+		!strings.Contains(err.Error(), "upstream base URL") {
 		// Reaching the upstream check proves the admission URL was accepted;
 		// a deliberately bad upstream stops run() before it binds a listener.
+		// Matching the upstream URL error specifically, not merely the word
+		// "upstream", which other refusals also contain.
 		t.Fatalf("run() did not honour the acknowledgement: %v", err)
 	}
 
@@ -597,7 +621,7 @@ func TestTheUpstreamCredentialAlsoHasAFileForm(t *testing.T) {
 	if err := os.WriteFile(path, []byte("sk-first\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	read, err := credentialSource("-upstream-api-key", "", path, "SHOAL_UPSTREAM_API_KEY")
+	read, err := credentialSource("-upstream-api-key", "", path, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -614,6 +638,21 @@ func TestTheUpstreamCredentialAlsoHasAFileForm(t *testing.T) {
 		"-upstream-api-key-env", "OTHER", "-upstream-api-key-file", path))
 	if !strings.Contains(detail, "mutually exclusive") {
 		t.Fatalf("run() did not apply the rule: %s", detail)
+	}
+	// Reachable without blanking the env flag, since leaving it at its default
+	// is not a choice. A rule that forced the operator to blank it would make
+	// the file form awkward enough to avoid.
+	//
+	// The assertion names the transport rule rather than just "upstream",
+	// which a mutation showed was necessary: swapping Visit for VisitAll makes
+	// every flag look chosen, and the resulting "mutually exclusive" refusal
+	// also contains the word "upstream". Reaching the URL check is what proves
+	// the credential stage was passed.
+	err = run(context.Background(), proxyArgs(
+		"-upstream-api-key-file", path, "-upstream-base-url", "ftp://nope",
+	), io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "must use https") {
+		t.Fatalf("the file form was not reachable on its own: %v", err)
 	}
 }
 
