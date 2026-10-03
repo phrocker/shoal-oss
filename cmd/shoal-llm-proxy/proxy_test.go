@@ -279,26 +279,61 @@ func TestAnUnreachablePlaneDeniesAndSaysSo(t *testing.T) {
 // TestObligationsAreAppliedToTheOutboundRequest is the criterion that fails if
 // the obligation is dropped. Obligations are better than refusal: the plane
 // said which part to remove, so removing it beats refusing the whole call.
-func TestObligationsAreAppliedToTheOutboundRequest(t *testing.T) {
+// TestAWithholdObligationCannotBeSatisfiedOnThisRequestShape replaces a test
+// that pinned the wrong behaviour.
+//
+// It used to assert that a withheld reference was removed from the forwarded
+// body and the others kept — the metadata edit — and it passed. What it never
+// asserted was that anything was withheld from the provider, which is what a
+// withhold obligation means. Nothing was: shoal_references is a flat list of
+// IDs, the material lives in messages[].content as free text, and nothing
+// connects the two, so the proxy removed the label and forwarded the content.
+// Providers ignore unknown fields, so even the label's removal changed nothing
+// about what the model received.
+//
+// The case below is the one the old test could not express, and is why greping
+// the forwarded body for the reference ID was never enough: the ID and the
+// material are different strings. A caller declares a restricted document and
+// pastes its text in. Under the old behaviour the text was forwarded with the
+// label stripped, and every assertion passed.
+func TestAWithholdObligationCannotBeSatisfiedOnThisRequestShape(t *testing.T) {
+	const material = "the restricted paragraph that doc-b actually contains"
 	plane := newFakePlane(t, outcomeObligated, []string{"doc-b"})
 	upstream := newFakeUpstream(t)
 	governed, _ := newTestProxy(t, plane, upstream)
 
 	recorder := post(t, governed,
-		`{"model":"gpt","messages":[{"role":"user","content":"hi"}],`+
+		`{"model":"gpt","messages":[{"role":"user","content":"`+material+`"}],`+
 			`"shoal_references":["doc-a","doc-b"]}`)
-	if recorder.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200: %s", recorder.Code, recorder.Body.String())
+
+	if recorder.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403: %s", recorder.Code, recorder.Body.String())
+	}
+	if upstream.calls != 0 {
+		t.Fatalf("the call was forwarded under an obligation nothing enforced: %s",
+			upstream.received)
+	}
+	if strings.Contains(string(upstream.received), material) {
+		t.Fatal("withheld material reached the provider")
+	}
+	// Reported as unsatisfiable, so the plane learns its obligation could not
+	// be met rather than that the caller went dark.
+	if len(plane.reports) != 1 || !plane.reports[0].Failed ||
+		plane.reports[0].ErrorCode != "obligation_unsatisfiable" {
+		t.Fatalf("reports = %+v, want one naming the unsatisfiable obligation",
+			plane.reports)
+	}
+
+	// An allow with no obligations still forwards, or this has turned the
+	// proxy into something that refuses everything the plane constrains and
+	// also everything it does not.
+	plane.withhold, plane.outcome = nil, outcomeAllowed
+	plane.reports = nil
+	if response := post(t, governed, plainCall); response.Code != http.StatusOK {
+		t.Fatalf("an unobligated call was refused: %d", response.Code)
 	}
 	if upstream.calls != 1 {
 		t.Fatalf("upstream calls = %d, want 1", upstream.calls)
-	}
-	forwarded := string(upstream.received)
-	if strings.Contains(forwarded, "doc-b") {
-		t.Fatalf("the withheld reference was forwarded: %s", forwarded)
-	}
-	if !strings.Contains(forwarded, "doc-a") {
-		t.Fatalf("a reference that was not withheld was dropped: %s", forwarded)
 	}
 }
 
@@ -306,8 +341,10 @@ func TestObligationsAreAppliedToTheOutboundRequest(t *testing.T) {
 // the whole call is right. The plane believes it constrained this call, so
 // ignoring an obligation it cannot satisfy would be worse than refusing.
 func TestAnUnsatisfiableObligationRefusesAndReports(t *testing.T) {
-	// The obligation names a reference the caller never declared, so there is
-	// nothing to drop that would satisfy it.
+	// The obligation names a reference the caller never declared. This is a
+	// different diagnosis from the case above — the plane and the caller
+	// disagree about what this call is, rather than the proxy being unable to
+	// locate content — and both refuse.
 	plane := newFakePlane(t, outcomeObligated, []string{"doc-never-declared"})
 	upstream := newFakeUpstream(t)
 	governed, _ := newTestProxy(t, plane, upstream)
