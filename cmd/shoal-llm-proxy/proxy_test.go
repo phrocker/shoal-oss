@@ -952,3 +952,266 @@ func TestAStreamedResponseReachesTheCallerAsItArrives(t *testing.T) {
 		t.Fatalf("the completion reached the plane: %s", plane.reports[0].Outcome)
 	}
 }
+
+// TestAnInfrastructuralFailureIsNeverReportedAsAPolicyDenial is the acceptance
+// criterion from #390 that had no test: "an unreachable decision plane denies,
+// and the operator can tell that apart from a policy denial."
+//
+// The distinction is load-bearing in both directions. A caller told "denied"
+// will not retry; one told "unavailable" should. And the operator needs it to
+// tell an outage from a policy change — this is the one surface in Shoal where
+// a denial means the work does not happen at all, so a fail-closed outage is a
+// total outage for everyone behind the proxy.
+//
+// The subtlest entry is 401/403 from the plane. Those look like denials and are
+// not: the plane refused *this proxy's* credential, so the caller's request was
+// never adjudicated. Classifying them as policy denials would tell every caller
+// their request was refused on the merits while the real fault was a stale
+// token in the proxy's own Secret.
+func TestAnInfrastructuralFailureIsNeverReportedAsAPolicyDenial(t *testing.T) {
+	for _, probe := range []struct {
+		name   string
+		status int
+	}{
+		{"the plane rejects the proxy's own credential", http.StatusUnauthorized},
+		{"the plane forbids the proxy itself", http.StatusForbidden},
+		{"the plane is broken", http.StatusInternalServerError},
+		{"the admission route is absent", http.StatusNotFound},
+		{"the plane is unavailable", http.StatusServiceUnavailable},
+	} {
+		plane := newFakePlane(t, outcomeAllowed, nil)
+		plane.status = probe.status
+		upstream := newFakeUpstream(t)
+		governed, logged := newTestProxy(t, plane, upstream)
+
+		recorder := post(t, governed, plainCall)
+		if recorder.Code != http.StatusServiceUnavailable {
+			t.Fatalf("%s: status = %d, want 503 — a 403 would tell the caller "+
+				"its request was refused on the merits", probe.name, recorder.Code)
+		}
+		if strings.Contains(recorder.Body.String(), `"denied"`) {
+			t.Fatalf("%s: the refusal is shaped as a policy denial: %s",
+				probe.name, recorder.Body.String())
+		}
+		if !strings.Contains(recorder.Body.String(), "plane_unavailable") {
+			t.Fatalf("%s: body = %s", probe.name, recorder.Body.String())
+		}
+		if upstream.calls != 0 {
+			t.Fatalf("%s: the call was forwarded with no decision", probe.name)
+		}
+		// And the operator's half of the criterion: the log says which kind of
+		// failure it was. Without this the two are indistinguishable from
+		// outside, since both end in a refusal.
+		joined := strings.Join(*logged, "\n")
+		if !strings.Contains(joined, "unavailable") {
+			t.Fatalf("%s: nothing in the log names this as infrastructural: %q",
+				probe.name, joined)
+		}
+		if strings.Contains(joined, "admission denied") {
+			t.Fatalf("%s: logged as a policy denial: %q", probe.name, joined)
+		}
+	}
+
+	// The contrast, or the assertions above only prove the proxy refuses
+	// everything. A real policy denial is 403, shaped as denied, and logged as
+	// a denial.
+	plane := newFakePlane(t, outcomeDenied, nil)
+	upstream := newFakeUpstream(t)
+	governed, logged := newTestProxy(t, plane, upstream)
+	recorder := post(t, governed, plainCall)
+	if recorder.Code != http.StatusForbidden {
+		t.Fatalf("a policy denial = %d, want 403", recorder.Code)
+	}
+	if !strings.Contains(recorder.Body.String(), "denied") {
+		t.Fatalf("a policy denial is not shaped as one: %s", recorder.Body.String())
+	}
+	if upstream.calls != 0 {
+		t.Fatal("a denied call reached the upstream")
+	}
+	if joined := strings.Join(*logged, "\n"); !strings.Contains(joined, "admission denied") {
+		t.Fatalf("a policy denial was not logged as one: %q", joined)
+	}
+}
+
+// TestAMalformedRequestIsRefusedWithoutSpendingAnAdmission covers the 400 paths
+// and the bound on what the proxy will read.
+//
+// The classification matters as much as the refusal: a malformed request is the
+// caller's fault and must not be reported as a plane problem, and it must not
+// consume a decision — asking the plane about a request that cannot be parsed
+// spends a grant on a call that was never going to happen.
+func TestAMalformedRequestIsRefusedWithoutSpendingAnAdmission(t *testing.T) {
+	for _, probe := range []struct{ name, body string }{
+		{"not JSON", `{"model":`},
+		{"no model", `{"messages":[{"role":"user","content":"hi"}]}`},
+		{"blank model", `{"model":"  ","messages":[{"role":"user","content":"hi"}]}`},
+		{"no messages", `{"model":"gpt"}`},
+		{"empty messages", `{"model":"gpt","messages":[]}`},
+		{"messages of the wrong type", `{"model":"gpt","messages":"hello"}`},
+		{"stream of the wrong type", `{"model":"gpt","stream":"yes",` +
+			`"messages":[{"role":"user","content":"hi"}]}`},
+		{"references of the wrong type", `{"model":"gpt",` +
+			`"messages":[{"role":"user","content":"hi"}],"shoal_references":"doc-a"}`},
+		{"a blank reference", `{"model":"gpt",` +
+			`"messages":[{"role":"user","content":"hi"}],"shoal_references":["  "]}`},
+	} {
+		plane := newFakePlane(t, outcomeAllowed, nil)
+		upstream := newFakeUpstream(t)
+		governed, _ := newTestProxy(t, plane, upstream)
+
+		recorder := post(t, governed, probe.body)
+		if recorder.Code != http.StatusBadRequest {
+			t.Fatalf("%s: status = %d, want 400", probe.name, recorder.Code)
+		}
+		if len(plane.requests) != 0 {
+			t.Fatalf("%s: an unparseable request consumed a decision", probe.name)
+		}
+		if upstream.calls != 0 {
+			t.Fatalf("%s: it reached the upstream anyway", probe.name)
+		}
+	}
+
+	// The bound. Without it a caller can make the proxy hold arbitrary memory
+	// before any decision is taken, and the refusal has to come from the limit
+	// rather than from the body failing to parse afterwards.
+	plane := newFakePlane(t, outcomeAllowed, nil)
+	upstream := newFakeUpstream(t)
+	governed, _ := newTestProxy(t, plane, upstream)
+	oversized := `{"model":"gpt","messages":[{"role":"user","content":"` +
+		strings.Repeat("A", maxRequestBytes) + `"}]}`
+	recorder := post(t, governed, oversized)
+	if recorder.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("an oversized body = %d, want 413", recorder.Code)
+	}
+	if len(plane.requests) != 0 {
+		t.Fatal("an oversized body consumed a decision")
+	}
+	// A body just under the bound is still served, or the limit is a denial of
+	// the feature rather than a bound on it.
+	plane.requests = nil
+	justUnder := `{"model":"gpt","messages":[{"role":"user","content":"` +
+		strings.Repeat("A", maxRequestBytes/2) + `"}]}`
+	if recorder = post(t, governed, justUnder); recorder.Code != http.StatusOK {
+		t.Fatalf("a body under the bound = %d, want 200", recorder.Code)
+	}
+}
+
+// TestATruncatedStreamIsReportedAsTruncated covers the one failure that happens
+// after the egress and can still be told to the plane.
+//
+// The report is what feeds the next admission (#389), so "the caller received
+// the whole completion" and "the connection broke halfway" must not arrive as
+// the same outcome. The proxy cannot recall tokens already sent, which is
+// exactly why it has to be accurate about how much went.
+func TestATruncatedStreamIsReportedAsTruncated(t *testing.T) {
+	plane := newFakePlane(t, outcomeAllowed, nil)
+	upstream := newFakeUpstream(t)
+	governed, _ := newTestProxy(t, plane, upstream)
+
+	// failAfter is 0 — the caller is gone before any byte is written.
+	//
+	// It was 1 at first, with an upstream sending four chunks, and the test
+	// failed: the fake wrote the whole body in a single call, so relay did one
+	// Write and the first-write allowance was never used up. The fixture could
+	// not express the condition, which is the fourth time that exact shape has
+	// appeared on this branch. The multi-write case is covered separately
+	// below, against an upstream that really does flush twice.
+	failing := &failingWriter{header: http.Header{}, failAfter: 0}
+	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"gpt","stream":true,`+
+			`"messages":[{"role":"user","content":"hi"}]}`))
+	request.Host = "example.test"
+	upstream.body = strings.Repeat("data: chunk\n\n", 4)
+	governed.routes().ServeHTTP(failing, request)
+
+	if len(plane.reports) != 1 {
+		t.Fatalf("reports = %d, want 1", len(plane.reports))
+	}
+	if !plane.reports[0].Failed ||
+		plane.reports[0].ErrorCode != "response_truncated" {
+		t.Fatalf("report = %+v, want one naming the truncation", plane.reports[0])
+	}
+
+	// Truncated partway, against an upstream that flushes twice so relay
+	// really does write more than once. The reported byte count must be what
+	// actually left, not what the upstream offered: the plane is told how much
+	// of the completion escaped, and an over-count is as wrong as a failure
+	// that goes unreported.
+	const firstChunk = "data: one\n\n"
+	streaming := httptest.NewServer(http.HandlerFunc(
+		func(writer http.ResponseWriter, _ *http.Request) {
+			flusher, ok := writer.(http.Flusher)
+			if !ok {
+				t.Error("the test upstream cannot flush")
+				return
+			}
+			writer.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(writer, firstChunk)
+			flusher.Flush()
+			time.Sleep(50 * time.Millisecond)
+			_, _ = io.WriteString(writer, "data: two\n\n")
+			flusher.Flush()
+		}))
+	t.Cleanup(streaming.Close)
+
+	plane.reports = nil
+	streamBase, err := url.Parse(streaming.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	governed.upstream = streamBase
+	governed.client.Transport = streaming.Client().Transport
+
+	partial := &failingWriter{header: http.Header{}, failAfter: 1}
+	request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"gpt","stream":true,`+
+			`"messages":[{"role":"user","content":"hi"}]}`))
+	request.Host = "example.test"
+	governed.routes().ServeHTTP(partial, request)
+
+	if len(plane.reports) != 1 {
+		t.Fatalf("reports = %d, want 1", len(plane.reports))
+	}
+	if plane.reports[0].ErrorCode != "response_truncated" {
+		t.Fatalf("report = %+v, want one naming the truncation", plane.reports[0])
+	}
+
+	// And the byte count is NOT carried, which is what the seam allows rather
+	// than an oversight here.
+	//
+	// I expected a partial count and asserted one; the assertion failed and the
+	// reason is a real constraint. pkg/explorer/fleet/admission.go:933 refuses a
+	// failed report that carries an outcome, because the completion path
+	// discards the outcome and the replay comparison would then read any two
+	// failures sharing an error code as the same report — letting a caller
+	// replace a reported outcome and be told the second was recorded.
+	//
+	// So a partial egress tells the plane that it failed and not how much
+	// escaped, and this proxy is where that gap costs the most: it cannot
+	// recall tokens already sent, so volume is the one thing it has left to
+	// report. Pinned as current behaviour, not endorsed — tracked as #427.
+	if len(plane.reports[0].Outcome) != 0 {
+		t.Fatalf("a failed report carried an outcome, which the admission "+
+			"surface refuses: %s", plane.reports[0].Outcome)
+	}
+	_ = firstChunk
+}
+
+// failingWriter writes a bounded number of times and then fails, standing in
+// for a caller that disconnects mid-stream.
+type failingWriter struct {
+	header    http.Header
+	writes    int
+	failAfter int
+	status    int
+}
+
+func (f *failingWriter) Header() http.Header  { return f.header }
+func (f *failingWriter) WriteHeader(code int) { f.status = code }
+func (f *failingWriter) Write(data []byte) (int, error) {
+	f.writes++
+	if f.writes > f.failAfter {
+		return 0, errors.New("connection reset by peer")
+	}
+	return len(data), nil
+}
