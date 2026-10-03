@@ -4,6 +4,11 @@ Status: proposed architecture and implementation plan, 2026-09-29. This document
 specifies new behavior; the local validation report records what was actually
 exercised. No production decision API or PR-review feature is introduced here.
 
+Implementation update (2026-10-03): `pkg/decision` now supplies immutable task
+and measured-picture contracts. See [contract boundaries](decision-contracts.md)
+for implemented validation and remaining service/predictor work. This does not
+complete #402 or authenticate source authority.
+
 ## Objective and boundary
 
 Shoal should let an agent make an inexpensive, bounded decision using an
