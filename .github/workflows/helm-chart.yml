@@ -1,10 +1,11 @@
 name: Helm chart
 
-# The explorer templates exist to make a misconfiguration fail at render rather
-# than at runtime in a pod log. A guard that stops firing is invisible: the
-# chart still renders, still installs, and produces a workspace that denies
-# everything or answers nothing. This runs the same checks locally available
-# through deploy/helm/validate-chart.sh so that cannot happen quietly.
+# The explorer and llm-proxy templates exist to make a misconfiguration fail at
+# render rather than at runtime in a pod log. A guard that stops firing is
+# invisible: the chart still renders, still installs, and produces a workspace
+# that denies everything or answers nothing — or an enforcement plane that
+# passes every probe and refuses every call. This runs the same checks locally
+# available through deploy/helm/validate-chart.sh so that cannot happen quietly.
 on:
   push:
     branches: [main]
