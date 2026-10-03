@@ -810,3 +810,145 @@ func TestALoopbackProviderNeedsNoCredential(t *testing.T) {
 		}
 	})
 }
+
+// TestAStreamedResponseReachesTheCallerAsItArrives covers the streaming branch
+// of relay, which coverage put at 11% — effectively only the non-streaming
+// io.Copy path had ever run.
+//
+// #390 requires streaming explicitly, and the acceptance criterion is specific:
+// "a streamed response is reported in full after completion, and the report is
+// what feeds the next admission." Both halves need a real server. An
+// httptest.ResponseRecorder is not an http.Flusher, so under a recorder the
+// flush is skipped and the test cannot distinguish a proxy that streams from
+// one that buffers the whole body and writes it at the end.
+//
+// The upstream here holds the second chunk back until the first has been read
+// through the proxy. If the proxy buffered, that read would block until the
+// upstream gave up, so the first chunk arriving is itself the assertion.
+func TestAStreamedResponseReachesTheCallerAsItArrives(t *testing.T) {
+	released := make(chan struct{})
+	firstSeen := make(chan struct{})
+	plane := newFakePlane(t, outcomeAllowed, nil)
+
+	upstream := httptest.NewServer(http.HandlerFunc(
+		func(writer http.ResponseWriter, _ *http.Request) {
+			writer.Header().Set("Content-Type", "text/event-stream")
+			writer.WriteHeader(http.StatusOK)
+			flusher, ok := writer.(http.Flusher)
+			if !ok {
+				t.Error("the test upstream cannot flush, so it proves nothing")
+				return
+			}
+			_, _ = io.WriteString(writer, "data: first\n\n")
+			flusher.Flush()
+			select {
+			case <-released:
+			case <-time.After(5 * time.Second):
+				t.Error("the first chunk never reached the caller, so the proxy buffered")
+			}
+			_, _ = io.WriteString(writer, "data: second\n\n")
+			flusher.Flush()
+		}))
+	t.Cleanup(upstream.Close)
+
+	base, err := url.Parse(plane.server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	planeClient := newHTTPClient(5 * time.Second)
+	planeClient.Transport = plane.server.Client().Transport
+	governed, err := newProxy(
+		&admissionClient{
+			base: base, http: planeClient,
+			credential:      func() (string, error) { return "plane-token", nil },
+			agentID:         "agent",
+			agentGeneration: 1,
+			capability:      "llm.proxy", action: "complete",
+			sourceID: []byte("source"), policyID: []byte("policy"),
+			lease: time.Minute,
+		},
+		upstream.URL,
+		func() (string, error) { return "upstream-key", nil },
+		[]string{"example.test"}, 10*time.Second, time.Now,
+		func(string, ...any) {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	governed.client.Transport = upstream.Client().Transport
+
+	// A real server, because the flush has to be observable end to end.
+	front := httptest.NewServer(governed.routes())
+	t.Cleanup(front.Close)
+
+	request, err := http.NewRequest(http.MethodPost, front.URL+"/v1/chat/completions",
+		strings.NewReader(`{"model":"gpt","stream":true,`+
+			`"messages":[{"role":"user","content":"hi"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Host = "example.test"
+	response, err := front.Client().Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d", response.StatusCode)
+	}
+
+	// Read the first event before the upstream has produced the second.
+	go func() {
+		buffer := make([]byte, 64)
+		read, readErr := response.Body.Read(buffer)
+		if readErr == nil && read > 0 && strings.Contains(string(buffer[:read]), "first") {
+			close(firstSeen)
+		}
+	}()
+	select {
+	case <-firstSeen:
+	case <-time.After(5 * time.Second):
+		t.Fatal("no chunk arrived before the stream completed: relay is buffering")
+	}
+	close(released)
+
+	rest, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(rest), "second") {
+		t.Fatalf("the rest of the stream was lost: %q", rest)
+	}
+
+	// Reported once, after the stream finished, and with the full byte count.
+	// Reporting before the end would record an outcome the proxy had not yet
+	// observed, which is why forward reports in exactly one place.
+	deadline := time.Now().Add(5 * time.Second)
+	for len(plane.reports) == 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if len(plane.reports) != 1 {
+		t.Fatalf("reports = %d, want exactly 1 after completion", len(plane.reports))
+	}
+	var outcome struct {
+		Status int   `json:"upstream_status"`
+		Bytes  int64 `json:"response_bytes"`
+	}
+	if err = json.Unmarshal(plane.reports[0].Outcome, &outcome); err != nil {
+		t.Fatal(err)
+	}
+	const total = len("data: first\n\n") + len("data: second\n\n")
+	if outcome.Bytes != int64(total) {
+		t.Fatalf("reported %d bytes, want %d: a partial count means the report "+
+			"does not describe the egress that happened", outcome.Bytes, total)
+	}
+	if outcome.Status != http.StatusOK {
+		t.Fatalf("reported status = %d", outcome.Status)
+	}
+	// The completion itself is never in the report. That is structural — the
+	// report is not given the body — and worth asserting against a change that
+	// would quietly add it.
+	if strings.Contains(string(plane.reports[0].Outcome), "first") ||
+		strings.Contains(string(plane.reports[0].Outcome), "second") {
+		t.Fatalf("the completion reached the plane: %s", plane.reports[0].Outcome)
+	}
+}
