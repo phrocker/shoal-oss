@@ -164,6 +164,15 @@ func post(t *testing.T, governed *proxy, body string) *httptest.ResponseRecorder
 	return recorder
 }
 
+// Document IDs as the plane actually spells them. "doc-a" is not a reference:
+// disclosures are decoded as unpadded base64url, so a readable name is a
+// malformed request rather than an unknown document.
+const (
+	docA             = "ZG9jLWE"
+	docB             = "ZG9jLWI"
+	docNeverDeclared = "ZG9jLW5ldmVyLWRlY2xhcmVk"
+)
+
 const plainCall = `{"model":"gpt","messages":[{"role":"user","content":"hello"}]}`
 
 // TestAnUnmodifiedClientIsGoverned is the acceptance criterion the proxy exists
@@ -299,13 +308,13 @@ func TestAnUnreachablePlaneDeniesAndSaysSo(t *testing.T) {
 // label stripped, and every assertion passed.
 func TestAWithholdObligationCannotBeSatisfiedOnThisRequestShape(t *testing.T) {
 	const material = "the restricted paragraph that doc-b actually contains"
-	plane := newFakePlane(t, outcomeObligated, []string{"doc-b"})
+	plane := newFakePlane(t, outcomeObligated, []string{docB})
 	upstream := newFakeUpstream(t)
 	governed, _ := newTestProxy(t, plane, upstream)
 
 	recorder := post(t, governed,
 		`{"model":"gpt","messages":[{"role":"user","content":"`+material+`"}],`+
-			`"shoal_references":["doc-a","doc-b"]}`)
+			`"shoal_references":["`+docA+`","`+docB+`"]}`)
 
 	if recorder.Code != http.StatusForbidden {
 		t.Fatalf("status = %d, want 403: %s", recorder.Code, recorder.Body.String())
@@ -346,13 +355,13 @@ func TestAnUnsatisfiableObligationRefusesAndReports(t *testing.T) {
 	// different diagnosis from the case above — the plane and the caller
 	// disagree about what this call is, rather than the proxy being unable to
 	// locate content — and both refuse.
-	plane := newFakePlane(t, outcomeObligated, []string{"doc-never-declared"})
+	plane := newFakePlane(t, outcomeObligated, []string{docNeverDeclared})
 	upstream := newFakeUpstream(t)
 	governed, _ := newTestProxy(t, plane, upstream)
 
 	recorder := post(t, governed,
 		`{"model":"gpt","messages":[{"role":"user","content":"hi"}],`+
-			`"shoal_references":["doc-a"]}`)
+			`"shoal_references":["`+docA+`"]}`)
 	if recorder.Code != http.StatusForbidden {
 		t.Fatalf("status = %d, want 403", recorder.Code)
 	}
@@ -1051,7 +1060,20 @@ func TestAMalformedRequestIsRefusedWithoutSpendingAnAdmission(t *testing.T) {
 		{"stream of the wrong type", `{"model":"gpt","stream":"yes",` +
 			`"messages":[{"role":"user","content":"hi"}]}`},
 		{"references of the wrong type", `{"model":"gpt",` +
-			`"messages":[{"role":"user","content":"hi"}],"shoal_references":"doc-a"}`},
+			`"messages":[{"role":"user","content":"hi"}],"shoal_references":"` +
+			docA + `"}`},
+		// A readable name, which is what anyone would pass and what no
+		// reference can be: the plane decodes disclosures as unpadded
+		// base64url, so this is permanently malformed. Without the local
+		// check it reached the plane as a 400 that post() turns into
+		// ErrPlaneUnreachable, and the caller was told 503 — retry — for
+		// something no retry can fix.
+		{"a readable reference name", `{"model":"gpt",` +
+			`"messages":[{"role":"user","content":"hi"}],` +
+			`"shoal_references":["doc-a"]}`},
+		{"a padded reference", `{"model":"gpt",` +
+			`"messages":[{"role":"user","content":"hi"}],` +
+			`"shoal_references":["ZG9jLWE="]}`},
 		{"a blank reference", `{"model":"gpt",` +
 			`"messages":[{"role":"user","content":"hi"}],"shoal_references":["  "]}`},
 	} {
@@ -1311,6 +1333,171 @@ func TestTheHostGateHonoursEveryClaimItsCommentMakes(t *testing.T) {
 		if probe.host != "" && strings.Contains(recorder.Body.String(), probe.host) {
 			t.Fatalf("%s: the refusal echoes the submitted authority: %s",
 				probe.name, recorder.Body.String())
+		}
+	}
+}
+
+// TestTheUpstreamCallFitsTheGrantItWasActuallyGiven covers the gap between the
+// lease that was asked for and the one that came back.
+//
+// validateDurations makes the *configured* lease outlast the configured timeout
+// with room to report. That is not enough: the fleet clamps the granted expiry
+// to the deadline this proxy sent before the admission round trip
+// (dispatch_service.go:381-383), so a slow plane spends the headroom. With the
+// chart's own 60s lease and 30s timeout, a 28s admission leaves 32s — reportable
+// says yes, 32s exceeds the 5s window — and a 30s upstream call then leaves 2s.
+// The egress happens and the report is refused as expired, which is the one
+// outcome this proxy exists to prevent, reached through a slow plane rather than
+// through misconfiguration.
+func TestTheUpstreamCallFitsTheGrantItWasActuallyGiven(t *testing.T) {
+	// A grant that was reportable when it arrived and is not by the time the
+	// call would start.
+	//
+	// The two checks share a threshold — reportable wants at least the report
+	// window remaining, and a positive budget wants more than it — so this is
+	// only reachable once time has passed between the grant and the forward.
+	// That is the real case: the clamped expiry is fixed at the moment the
+	// request was sent, and obligation handling, a retry, or a loaded host all
+	// consume it afterwards. The proxy's clock is moved on to model it, which
+	// is what that seam is for.
+	t.Run("a grant with no room left is refused before the egress", func(t *testing.T) {
+		plane := newFakePlane(t, outcomeAllowed, nil)
+		upstream := newFakeUpstream(t)
+		governed, logged := newTestProxy(t, plane, upstream)
+		// Six seconds remaining when the plane answers, so reportable accepts
+		// it; two seconds gone by the time the call would be made, leaving
+		// less than the report window.
+		plane.token.ExpiresAt = time.Now().Add(minimumReportWindow + time.Second)
+		governed.clock = func() time.Time { return time.Now().Add(2 * time.Second) }
+
+		recorder := post(t, governed, plainCall)
+		if upstream.calls != 0 {
+			t.Fatal("the call was forwarded under a grant that could not outlive it")
+		}
+		if recorder.Code != http.StatusServiceUnavailable {
+			t.Fatalf("status = %d, want 503", recorder.Code)
+		}
+		// Reported, so the plane learns the grant was returned unused rather
+		// than that the proxy went dark holding it.
+		if len(plane.reports) != 1 ||
+			plane.reports[0].ErrorCode != "grant_window_exhausted" {
+			t.Fatalf("reports = %+v, want one naming the exhausted window",
+				plane.reports)
+		}
+		if joined := strings.Join(*logged, "\n"); !strings.Contains(joined, "grant window") {
+			t.Fatalf("nothing in the log explains the refusal: %q", joined)
+		}
+	})
+
+	// The budget is applied to the call, not merely checked once. An upstream
+	// slower than the grant's remaining life must be cut off while the report
+	// is still possible, rather than running to the configured timeout.
+	t.Run("the call is bounded by the grant, not the timeout", func(t *testing.T) {
+		plane := newFakePlane(t, outcomeAllowed, nil)
+		// Released by cleanup as well as by cancellation. Blocking only on the
+		// request context deadlocked Close, which waits for outstanding
+		// handlers: the proxy's client gives up on the grant's budget, and the
+		// server-side context did not always observe that in time.
+		stop := make(chan struct{})
+		slow := httptest.NewServer(http.HandlerFunc(
+			func(writer http.ResponseWriter, request *http.Request) {
+				select {
+				case <-request.Context().Done():
+				case <-stop:
+				}
+			}))
+		t.Cleanup(func() {
+			close(stop)
+			slow.Close()
+		})
+		upstream := newFakeUpstream(t)
+		governed, _ := newTestProxy(t, plane, upstream)
+		base, err := url.Parse(slow.URL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		governed.upstream = base
+		governed.client.Transport = slow.Client().Transport
+		// The client timeout in the harness is 5s. A grant leaving 5.4s means
+		// the budget is 400ms, so a cut-off well under a second proves the
+		// grant bounded the call rather than the configured timeout.
+		plane.token.ExpiresAt = time.Now().Add(minimumReportWindow + 400*time.Millisecond)
+
+		started := time.Now()
+		recorder := post(t, governed, plainCall)
+		elapsed := time.Since(started)
+
+		if elapsed > 3*time.Second {
+			t.Fatalf("the call ran for %s: the configured timeout bounded it, "+
+				"not the grant", elapsed)
+		}
+		if recorder.Code != http.StatusBadGateway {
+			t.Fatalf("status = %d, want 502", recorder.Code)
+		}
+		if len(plane.reports) != 1 || !plane.reports[0].Failed {
+			t.Fatalf("reports = %+v, want one failure", plane.reports)
+		}
+	})
+
+	// And a healthy grant is untouched, or this is a refusal rather than a
+	// bound: the window must not shorten calls it has room for.
+	t.Run("a grant with room is not interfered with", func(t *testing.T) {
+		plane := newFakePlane(t, outcomeAllowed, nil)
+		upstream := newFakeUpstream(t)
+		governed, _ := newTestProxy(t, plane, upstream)
+		if recorder := post(t, governed, plainCall); recorder.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200: %s", recorder.Code, recorder.Body.String())
+		}
+		if upstream.calls != 1 {
+			t.Fatalf("upstream calls = %d, want 1", upstream.calls)
+		}
+	})
+}
+
+// TestANonTwoHundredUpstreamStatusIsNeverReportedAsWork covers a consequence of
+// refusing redirects.
+//
+// A 3xx used to pass the failure classification, which only looked at 4xx and
+// above. Since redirects are deliberately not followed, a 3xx is a response
+// with no completion in it — and reporting it as successful work would feed a
+// result into the next admission for a call that produced nothing.
+func TestANonTwoHundredUpstreamStatusIsNeverReportedAsWork(t *testing.T) {
+	for _, probe := range []struct {
+		status int
+		isWork bool
+	}{
+		{http.StatusOK, true},
+		{http.StatusCreated, true},
+		{http.StatusNoContent, true},
+		// The redirects the proxy refuses to follow.
+		{http.StatusMovedPermanently, false},
+		{http.StatusFound, false},
+		{http.StatusTemporaryRedirect, false},
+		{http.StatusPermanentRedirect, false},
+		{http.StatusNotModified, false},
+		{http.StatusTooManyRequests, false},
+		{http.StatusInternalServerError, false},
+	} {
+		plane := newFakePlane(t, outcomeAllowed, nil)
+		upstream := newFakeUpstream(t)
+		upstream.status = probe.status
+		governed, _ := newTestProxy(t, plane, upstream)
+
+		post(t, governed, plainCall)
+		if len(plane.reports) != 1 {
+			t.Fatalf("status %d: reports = %d, want 1", probe.status, len(plane.reports))
+		}
+		report := plane.reports[0]
+		if probe.isWork {
+			if report.Failed || report.ErrorCode != "" {
+				t.Fatalf("status %d was reported as a failure: %+v",
+					probe.status, report)
+			}
+			continue
+		}
+		if !report.Failed || report.ErrorCode != "upstream_error" {
+			t.Fatalf("status %d was reported as successful work: %+v",
+				probe.status, report)
 		}
 	}
 }

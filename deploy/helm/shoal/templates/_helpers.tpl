@@ -230,3 +230,42 @@ Takes a dict of name and value; emits the total in milliseconds.
 {{- end -}}
 {{- $total -}}
 {{- end -}}
+
+{{- /*
+The proxy's transport rule, as the binary spells it (absoluteURL and isLoopback
+in cmd/shoal-llm-proxy/admission.go): an absolute http(s) URL with a host, and
+http permitted only to loopback.
+
+These were scheme-prefix tests, which disagreed with the binary in both
+directions. "https://" has the prefix and no host, so the chart passed it and
+the binary refused it for having no host — a pod in CrashLoopBackOff from a
+values file the chart approved. And "http://localhost.example" has the
+"http://localhost" prefix without being loopback at all, so the chart treated a
+remote plaintext host as exempt while the binary refused it. Parsing is the only
+way to get both right, and urlParse gives the two fields the rule needs.
+
+The hostname is lowered because the binary compares it with EqualFold, so
+"HTTP://LOCALHOST" is loopback there and must be here. Go's url.Parse already
+lowers the scheme but not the host.
+*/ -}}
+{{- define "shoal.urlIsAbsolute" -}}
+{{- $parsed := urlParse . -}}
+{{- if and (has $parsed.scheme (list "http" "https")) $parsed.hostname -}}
+true
+{{- end -}}
+{{- end -}}
+
+{{- define "shoal.urlIsPlaintext" -}}
+{{- if eq (urlParse .).scheme "http" -}}
+true
+{{- end -}}
+{{- end -}}
+
+{{- /* 127.0.0.0/8 by prefix, matching net.IP.IsLoopback rather than just
+       127.0.0.1 — the binary accepts any address in that block. */ -}}
+{{- define "shoal.urlIsLoopback" -}}
+{{- $host := lower (urlParse .).hostname -}}
+{{- if or (eq $host "localhost") (eq $host "::1") (hasPrefix "127." $host) -}}
+true
+{{- end -}}
+{{- end -}}

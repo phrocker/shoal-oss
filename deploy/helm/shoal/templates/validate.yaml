@@ -184,8 +184,8 @@
 {{- if not $admissionURL -}}
 {{- fail "llmProxy.admission.url is required: the proxy asks the explorer for admission before every call, and one that cannot ask must deny. With no URL there is no decision plane, so every request behind this proxy is refused while the pod itself stays healthy" -}}
 {{- end -}}
-{{- if and $admissionURL (not (or (hasPrefix "http://" $admissionURL) (hasPrefix "https://" $admissionURL))) -}}
-{{- fail (printf "llmProxy.admission.url must be an absolute http:// or https:// base URL (got %q): a bare host is not a URL the proxy can resolve, so every admission request fails as a transport error and the proxy fails closed on all of them" $admissionURL) -}}
+{{- if and $admissionURL (not (include "shoal.urlIsAbsolute" $admissionURL)) -}}
+{{- fail (printf "llmProxy.admission.url must be an absolute http:// or https:// URL with a host (got %q): a bare host, a missing host, or another scheme is not a URL the proxy can resolve, so every admission request fails as a transport error and the proxy fails closed on all of them. The binary refuses it at startup, so rendering it produces a pod that never serves" $admissionURL) -}}
 {{- end -}}
 
 {{- /* The acknowledgement is a flag the chart renders verbatim, so its type is
@@ -206,8 +206,8 @@
        allowPlaintext exists for a mesh that supplies the transport
        authentication the scheme would, and makes accepting it an explicit act
        rather than a default. */ -}}
-{{- $admissionLoopback := or (hasPrefix "http://127.0.0.1" $admissionURL) (hasPrefix "http://localhost" $admissionURL) (hasPrefix "http://[::1]" $admissionURL) -}}
-{{- if and (hasPrefix "http://" $admissionURL) (not $admissionLoopback) (not $admission.allowPlaintext) -}}
+{{- $admissionLoopback := include "shoal.urlIsLoopback" $admissionURL -}}
+{{- if and (include "shoal.urlIsPlaintext" $admissionURL) (not $admissionLoopback) (not $admission.allowPlaintext) -}}
 {{- fail (printf "llmProxy.admission.url %q is plaintext to a non-loopback decision plane: the bearer token crosses the network in the clear, and so does the verdict — anything on the path can rewrite a deny into an allow, which silently removes the enforcement plane while everything still looks healthy. Use https://, or set llmProxy.admission.allowPlaintext=true to accept it where a mesh already authenticates the hop" $admissionURL) -}}
 {{- end -}}
 
@@ -352,8 +352,8 @@
 {{- if not $upstreamURL -}}
 {{- fail "llmProxy.upstream.baseURL is required: the proxy forwards admitted calls to a real OpenAI-compatible provider, and with no upstream an admitted request has nowhere to go — the caller sees a failure on exactly the calls policy allowed, and the admission is spent on work that never happened" -}}
 {{- end -}}
-{{- if and $upstreamURL (not (or (hasPrefix "http://" $upstreamURL) (hasPrefix "https://" $upstreamURL))) -}}
-{{- fail (printf "llmProxy.upstream.baseURL must be an absolute http:// or https:// base URL (got %q): anything else is not a URL the proxy can forward to, so every admitted call fails in the hop after the decision" $upstreamURL) -}}
+{{- if and $upstreamURL (not (include "shoal.urlIsAbsolute" $upstreamURL)) -}}
+{{- fail (printf "llmProxy.upstream.baseURL must be an absolute http:// or https:// URL with a host (got %q): anything else is not a URL the proxy can forward to, so every admitted call fails in the hop after the decision — and the binary refuses it at startup, so rendering it produces a pod that never serves" $upstreamURL) -}}
 {{- end -}}
 {{- /* And plaintext to a remote provider is refused outright, with no
        acknowledgement that accepts it.
@@ -365,8 +365,8 @@
        the explorer says nothing about the hop to a third party — so there is
        deliberately no flag to pass here. The binary refuses it at startup
        either way, which makes rendering it a pod that never serves. */ -}}
-{{- $upstreamLoopback := or (hasPrefix "http://127.0.0.1" $upstreamURL) (hasPrefix "http://localhost" $upstreamURL) (hasPrefix "http://[::1]" $upstreamURL) -}}
-{{- if and (hasPrefix "http://" $upstreamURL) (not $upstreamLoopback) -}}
+{{- $upstreamLoopback := include "shoal.urlIsLoopback" $upstreamURL -}}
+{{- if and (include "shoal.urlIsPlaintext" $upstreamURL) (not $upstreamLoopback) -}}
 {{- fail (printf "llmProxy.upstream.baseURL %q is plaintext to a remote provider: this request carries the caller's prompt and the operator's provider credential, both in the clear, and anything on the path can read or alter them. There is no acknowledgement for it, unlike llmProxy.admission.allowPlaintext — a mesh authenticating the hop to the explorer says nothing about the hop to a third party. The binary refuses it at startup too, so rendering it produces a pod that never serves. Use https://, or a loopback provider for a sidecar model server" $upstreamURL) -}}
 {{- end -}}
 {{- /* Exactly the explorer's chat-provider rule, for exactly its reason: a

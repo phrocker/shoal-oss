@@ -19,6 +19,7 @@ package main
 
 import (
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -146,6 +147,20 @@ func (r chatRequest) references() ([]string, error) {
 		trimmed := strings.TrimSpace(reference)
 		if trimmed == "" {
 			return nil, fmt.Errorf("%s must not contain a blank entry", shoalReferencesField)
+		}
+		// Validated here because these travel to the plane as disclosures, and
+		// it decodes them as unpadded base64url (webapi/wire.go). A reference
+		// like "doc-a" is a permanently malformed request, and without this it
+		// reached the plane as a 400 that post() turns into
+		// ErrPlaneUnreachable — so the caller was told 503, which means retry,
+		// for something no retry can fix. Classification is the whole point:
+		// an infrastructural failure and a bad request must not be the same
+		// answer, which is the criterion the plane-status table also covers.
+		if decoded, err := base64.RawURLEncoding.DecodeString(trimmed); err != nil ||
+			len(decoded) == 0 {
+			return nil, fmt.Errorf(
+				"%s entries must be unpadded base64url document IDs",
+				shoalReferencesField)
 		}
 		if _, duplicate := seen[trimmed]; duplicate {
 			continue

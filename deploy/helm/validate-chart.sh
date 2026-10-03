@@ -521,6 +521,33 @@ refuses "a plaintext remote upstream" "${llm_proxy_base[@]}" --set llmProxy.upst
 refuses_citing "is plaintext to a remote provider" "a plaintext remote upstream even with the admission acknowledgement" "${llm_proxy_base[@]}" --set llmProxy.upstream.baseURL=http://api.example.test/v1,llmProxy.admission.allowPlaintext=true
 renders "a loopback provider over http"     "${llm_proxy_base[@]}" --set llmProxy.upstream.baseURL=http://localhost:11434/v1,llmProxy.upstream.credentialSecretName=
 
+note "== both URLs are parsed, not prefix-matched =="
+# These guards tested hasPrefix "http://" and hasPrefix "http://localhost",
+# which disagreed with the binary in both directions. Every case below is one
+# the prefix form got wrong, and each produced a pod the chart had approved.
+#
+# Scheme present, host absent. The prefix matched, the binary refused it for
+# having no host, and the pod went into CrashLoopBackOff.
+refuses_citing "with a host" "an admission URL with a scheme and no host" "${llm_proxy_base[@]}" --set llmProxy.admission.url=https://
+refuses_citing "with a host" "an upstream URL with a scheme and no host" "${llm_proxy_base[@]}" --set llmProxy.upstream.baseURL=https://
+# A host that merely begins with "localhost". The prefix form read this as
+# loopback and exempted a remote plaintext hop from the rule entirely — the
+# direction that matters, since it waved through what the rule exists to stop.
+refuses_citing "is plaintext to a non-loopback decision plane" "an admission host that only starts with localhost" "${llm_proxy_base[@]}" --set llmProxy.admission.url=http://localhost.example:8098
+refuses_citing "is plaintext to a remote provider" "an upstream host that only starts with localhost" "${llm_proxy_base[@]}" --set llmProxy.upstream.baseURL=http://localhost.example:11434/v1,llmProxy.upstream.credentialSecretName=
+# A scheme-relative URL has a host and no scheme, and is not absolute.
+refuses_citing "with a host" "a scheme-relative admission URL" "${llm_proxy_base[@]}" --set llmProxy.admission.url=//shoal-explorer:8098
+refuses_citing "with a host" "a non-HTTP scheme" "${llm_proxy_base[@]}" --set llmProxy.admission.url=ftp://shoal-explorer:8098
+# And the loopback forms the binary accepts must all still render, or parsing
+# has traded one disagreement for another. isLoopback there is EqualFold on
+# "localhost" plus net.IP.IsLoopback, so the whole 127.0.0.0/8 block counts and
+# case does not.
+renders "a loopback admission URL in upper case" "${llm_proxy_base[@]}" --set llmProxy.admission.url=HTTP://LOCALHOST:8098
+renders "an admission URL elsewhere in 127.0.0.0/8" "${llm_proxy_base[@]}" --set llmProxy.admission.url=http://127.5.5.5:8098
+renders "an IPv6 loopback admission URL" "${llm_proxy_base[@]}" --set 'llmProxy.admission.url=http://[::1]:8098'
+renders "an IPv6 loopback upstream" "${llm_proxy_base[@]}" --set 'llmProxy.upstream.baseURL=http://[::1]:11434/v1' --set llmProxy.upstream.credentialSecretName=
+renders "an https URL with a port and a path" "${llm_proxy_base[@]}" --set llmProxy.admission.url=https://shoal.example.test:8443/base
+
 note "== values rendered verbatim are validated as written =="
 # Each of these is written into an argument or a port declaration unchanged, so
 # a guard that converts before testing passes a value the flag parser or the API

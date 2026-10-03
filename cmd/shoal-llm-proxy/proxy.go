@@ -187,9 +187,40 @@ func (p *proxy) forward(
 	outbound json.RawMessage,
 	stream bool,
 ) {
+	// The upstream call is bounded by the grant's real expiry, not only by the
+	// configured timeout.
+	//
+	// validateDurations makes the *configured* lease outlast the configured
+	// timeout with room to report, and that is not enough, because the fleet
+	// clamps the granted expiry to the deadline this proxy sent before the
+	// admission round trip (dispatch_service.go:381-383). A slow plane
+	// therefore spends the headroom: with the chart's own 60s lease and 30s
+	// timeout, a 28s admission leaves 32s, reportable says yes because 32s
+	// exceeds the 5s window, and a 30s upstream call then leaves 2s — the
+	// egress happens and the report is refused as expired.
+	//
+	// So the configured invariant is checked again against what was actually
+	// granted. A grant with no room left is refused before the egress rather
+	// than after it, which is the only point at which refusing is still worth
+	// anything.
+	ctx := request.Context()
+	if !granted.token.ExpiresAt.IsZero() {
+		budget := granted.token.ExpiresAt.Sub(p.clock()) - minimumReportWindow
+		if budget <= 0 {
+			p.log("grant window exhausted request_id=%s", identity.RequestID)
+			p.reportFailure(ctx, granted.token, identity, "grant_window_exhausted")
+			p.refuse(writer, http.StatusServiceUnavailable, "plane_unavailable",
+				"the decision plane could not be consulted")
+			return
+		}
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, budget)
+		defer cancel()
+	}
+
 	endpoint := p.upstream.JoinPath("chat", "completions")
 	upstreamRequest, err := http.NewRequestWithContext(
-		request.Context(), http.MethodPost, endpoint.String(), bytes.NewReader(outbound))
+		ctx, http.MethodPost, endpoint.String(), bytes.NewReader(outbound))
 	if err != nil {
 		p.reportFailure(request.Context(), granted.token, identity, "upstream_unreachable")
 		p.refuse(writer, http.StatusBadGateway, "upstream_unreachable",
@@ -250,7 +281,13 @@ func (p *proxy) forward(
 	switch {
 	case copyErr != nil:
 		failure = "response_truncated"
-	case response.StatusCode >= 400:
+	case response.StatusCode < 200 || response.StatusCode >= 300:
+		// Every non-2xx, not only 4xx and 5xx. Redirects are deliberately not
+		// followed, so a 3xx is a response with no completion in it — and this
+		// read it as successful work, which would feed a result into the next
+		// admission for a call that produced nothing. The redirect refusal is
+		// what made 3xx reachable as a terminal status, so this is a
+		// consequence of that fix rather than an independent oversight.
 		failure = "upstream_error"
 	}
 	p.reportOutcome(
