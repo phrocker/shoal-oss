@@ -74,7 +74,7 @@ picture authorizes exclusion or execution.
 `PredictorIdentity` binds artifact digests for weights, tokenizer and environment,
 plus runtime, formatting, preprocessing, calibration, effective device/precision
 and batch policy. The required preprocessing reference pins normalization, feature
-extraction, chunking and truncation rules separately from output formatting.
+extraction, chunking and truncation rules separately from serialization/formatting.
 A versioned uncalibrated configuration is valid; identity is not proof of quality.
 The registry must verify artifacts and supported runtime settings. Provider-native
 rounding tolerance is explicitly bounded and separate from replay tolerance.
