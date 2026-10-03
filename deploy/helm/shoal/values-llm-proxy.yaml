@@ -1,0 +1,77 @@
+# The enforcement plane on its own: the LLM proxy, no storage tier.
+#
+# This profile does not install as shipped, and that is deliberate. Every value
+# below that is empty is one the chart refuses to render without, because the
+# proxy's failure mode is not a crash. It is required to fail closed, so almost
+# every way of misconfiguring it produces a pod that passes every probe and
+# denies every call — indistinguishable from a total outage of whatever sits
+# behind it.
+#
+# Fill them in, then:
+#
+#   helm install shoal deploy/helm/shoal -f my-llm-proxy-values.yaml
+#
+# `helm template` names the first missing one, so working through the errors in
+# order is a usable checklist. See docs/llm-proxy-deploy.md.
+#
+# The explorer is not enabled here. The proxy needs one to ask, but it does not
+# need it in this release: admission.url can point at an explorer installed
+# separately, in another namespace, or in another cluster. Enabling both from
+# one values file is the combined install, not the default one — see the docs.
+mode: single
+objectStorage:
+  # No storage tier in this profile, so no object-storage credentials.
+  createSecret: false
+writeTier:
+  enabled: false
+
+llmProxy:
+  enabled: true
+  image:
+    repository: ghcr.io/YOUR_ORG/shoal-llm-proxy
+    tag: TAG
+  # Two, and raise it rather than lower it. The proxy is stateless, so replicas
+  # are independent askers of the same decision plane — and a denial here stops
+  # the caller's work outright, so an unavailable proxy is an outage for
+  # everything configured to go through it.
+  replicas: 2
+  # The authority clients send as their OpenAI base URL — usually the port-less
+  # Service or ingress name. With none, every request is refused with 421
+  # Misdirected Request before admission is even asked.
+  allowedHosts: []
+  admission:
+    # Base URL of the explorer's authenticated API.
+    url: ""
+    # Required. The explorer's API is authenticated in every deployment this
+    # chart can render, so without a token every admission request is a 401 and
+    # the proxy denies every call.
+    credentialSecretName: ""
+    credentialSecretKey: token
+    # Capped at 5m by the admission surface itself (MaxActionClaimTTL). A
+    # larger value is refused rather than shortened, which denies every call.
+    lease: 60s
+    # An in-cluster explorer is reached over http://, because the chart renders
+    # its listener plaintext behind a ClusterIP. Setting this to true is the
+    # acknowledgement that the token and the verdict cross the pod network in
+    # the clear; prefer https:// wherever the hop leaves the cluster.
+    allowPlaintext: false
+  upstream:
+    # The real OpenAI-compatible provider.
+    baseURL: ""
+    # Required for a remote provider: the credential is read at request time
+    # and nothing projects it into the pod without a Secret.
+    credentialSecretName: ""
+    credentialSecretKey: api-key
+    # Must not exceed admission.lease, or a call can outlive the permission it
+    # was granted under and the admission is abandoned rather than reported.
+    requestTimeout: 30s
+  # The registered descriptor this proxy admits against. All six are resolved
+  # together; an incomplete identity is refused by the plane on every request.
+  identity:
+    agentID: ""
+    agentGeneration: 1
+    capability: ""
+    action: ""
+    # Canonical unpadded base64url, as every opaque identity in the API is.
+    sourceID: ""
+    policyID: ""

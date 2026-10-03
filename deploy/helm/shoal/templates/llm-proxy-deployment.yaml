@@ -1,0 +1,183 @@
+{{- if eq (include "shoal.llmProxyEnabled" .) "true" }}
+{{- $proxy := .Values.llmProxy -}}
+apiVersion: apps/v1
+# A Deployment, where the explorer is a StatefulSet, and that single difference
+# is the whole difference between the two planes.
+#
+# The explorer needs its rolling update to stop the old pod before starting the
+# new one, because two processes over one ReadWriteOnce state root is a
+# split-brain it has no protocol for. The proxy has no state root at all: the
+# decision lives in the explorer, the admission token travels in the request it
+# was granted for, and nothing is retained between calls. So surging is correct
+# here, replicas are independent, and there is no volumeClaimTemplate, no
+# ordinal identity and no governing headless Service to need a StatefulSet for.
+kind: Deployment
+metadata:
+  name: {{ include "shoal.llmProxyName" . }}
+  labels:
+    {{- include "shoal.labels" . | nindent 4 }}
+    app.kubernetes.io/component: llm-proxy
+spec:
+  replicas: {{ $proxy.replicas }}
+  # Explicit rollout contract instead of the apps/v1 default. maxUnavailable: 0
+  # keeps every replica serving through a rollout: an old pod is never removed
+  # until a surge pod has passed readiness. A denial here means the caller's
+  # work does not happen at all, so a gap in capacity during an upgrade is an
+  # outage for everything behind the proxy, not a slow read.
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: {{ $proxy.strategy.maxUnavailable }}
+      maxSurge: {{ $proxy.strategy.maxSurge }}
+  selector:
+    matchLabels:
+      {{- include "shoal.llmProxySelectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "shoal.llmProxySelectorLabels" . | nindent 8 }}
+        app.kubernetes.io/part-of: shoal-platform
+    spec:
+      # Every setting is an argument on this pod spec rather than a ConfigMap,
+      # as on the explorer. A changed argument changes the pod template and
+      # rolls the pod on its own; a ConfigMap would need a checksum annotation
+      # to get the same effect, and without one an edited admission URL would
+      # leave the running proxy asking the old decision plane while the chart
+      # claimed the new one.
+      terminationGracePeriodSeconds: {{ $proxy.terminationGracePeriodSeconds }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      {{- with $proxy.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $proxy.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if $proxy.affinity }}
+      # An operator-supplied affinity replaces the default spread below rather
+      # than merging with it. Merging two affinity trees would produce a
+      # scheduling constraint neither the chart nor the operator wrote, and the
+      # failure would be a pod that never schedules.
+      affinity:
+        {{- toYaml $proxy.affinity | nindent 8 }}
+      {{- else }}
+      affinity:
+        # Soft, not required: spreading replicas across nodes is what keeps a
+        # single node loss from taking the whole enforcement plane with it, but
+        # a cluster with fewer nodes than replicas must still schedule. A
+        # required rule there would leave pods Pending, which for this
+        # component is the same as denying every call.
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    {{- include "shoal.llmProxySelectorLabels" . | nindent 20 }}
+                topologyKey: kubernetes.io/hostname
+      {{- end }}
+      containers:
+        - name: shoal-llm-proxy
+          image: "{{ $proxy.image.repository }}:{{ $proxy.image.tag }}"
+          imagePullPolicy: {{ $proxy.image.pullPolicy }}
+          command: ["/usr/local/bin/shoal-llm-proxy"]
+          # Every value is trimmed on the way into the argument, and the
+          # allow-list comes from the same template validate.yaml counts.
+          #
+          # The gate matches an authority exactly, so " llm.example.test"
+          # matches nothing — a 421 to every request, from a values file that
+          # only has a space in a YAML list. Trimming in the guard and not here
+          # would let the chart pass its own check and still render that.
+          args:
+            - -listen=0.0.0.0:{{ $proxy.containerPort }}
+            - -health-address=0.0.0.0:{{ $proxy.healthPort }}
+            - -allowed-host={{ include "shoal.llmProxyAllowedHosts" . }}
+            - -admission-url={{ trim (default "" $proxy.admission.url) }}
+            - -admission-token-env={{ trim (default "" $proxy.admission.tokenEnv) }}
+            - -upstream-base-url={{ trim (default "" $proxy.upstream.baseURL) }}
+            - -upstream-api-key-env={{ trim (default "" $proxy.upstream.apiKeyEnv) }}
+            - -agent-id={{ trim (default "" $proxy.identity.agentID) }}
+            - -agent-generation={{ $proxy.identity.agentGeneration }}
+            - -capability={{ trim (default "" $proxy.identity.capability) }}
+            - -action={{ trim (default "" $proxy.identity.action) }}
+            - -source-id={{ trim (default "" $proxy.identity.sourceID) }}
+            - -policy-id={{ trim (default "" $proxy.identity.policyID) }}
+            - -lease={{ trim (default "" $proxy.admission.lease) }}
+            - -request-timeout={{ trim (default "" $proxy.upstream.requestTimeout) }}
+          env:
+            # The admission credential is unconditional, not conditional on a
+            # secret being named: validate.yaml requires one. The explorer's
+            # API has no unauthenticated mode a pod can reach, so a proxy
+            # without this token gets a 401 to every admission request and
+            # fails closed on all of them — a pod that passes every probe and
+            # denies every call.
+            - name: {{ trim (default "" $proxy.admission.tokenEnv) }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ trim (default "" $proxy.admission.credentialSecretName) }}
+                  key: {{ trim (default "" $proxy.admission.credentialSecretKey) }}
+            {{- with trim (default "" $proxy.upstream.credentialSecretName) }}
+            - name: {{ trim (default "" $proxy.upstream.apiKeyEnv) }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ . }}
+                  key: {{ trim (default "" $proxy.upstream.credentialSecretKey) }}
+            {{- end }}
+          ports:
+            - name: http
+              containerPort: {{ $proxy.containerPort }}
+            - name: health
+              containerPort: {{ $proxy.healthPort }}
+          # Both probes address the health port, never the OpenAI-compatible
+          # port. That listener refuses any request whose Host is not an exactly
+          # configured authority, and a kubelet addresses the pod by its
+          # runtime-assigned IP, which allowedHosts cannot name. A probe there
+          # answers 421 and the pod never becomes ready.
+          #
+          # The split between the two routes is what makes a rollout safe:
+          # /readyz goes 503 before the listener stops accepting, so the
+          # endpoints controller removes this pod from the Service while it is
+          # still finishing in-flight requests, and /healthz stays 200 through
+          # the drain, because a pod shedding traffic on purpose has not failed
+          # and restarting it would discard the graceful close.
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: health
+            # Short period and a single failure: a failing readiness probe is
+            # the only thing that takes this pod out of the Service, so the
+            # window between the drain starting and traffic stopping is this
+            # interval. A slower probe spends that window answering requests
+            # the proxy has already decided to stop serving.
+            initialDelaySeconds: 2
+            periodSeconds: 3
+            failureThreshold: 1
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          # No startup probe, unlike the explorer. The explorer needs one
+          # because opening a large corpus and policy catalog takes time; the
+          # proxy opens nothing, so a startup probe would only postpone the
+          # first readiness check.
+          resources:
+            {{- toYaml $proxy.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            # No writable path anywhere in the pod, and no emptyDir to give one
+            # back. The proxy holds no state root and must not spool payloads:
+            # prompt and completion content is exactly what it is governing the
+            # egress of, and a scratch directory is where that content would
+            # end up on a node's disk.
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+{{- end }}
