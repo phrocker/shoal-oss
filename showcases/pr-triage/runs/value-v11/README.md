@@ -1,8 +1,10 @@
-# V11: whole-review value experiment, awaiting future PRs
+# V11: whole-review value experiment
 
 The protocol in `experiments/value-v11.json` was committed at `75441df` before
 collecting new source or labels. At registration there were no eligible open
-PRs, only three previously observed drafts. The user expects a new PR soon.
+PRs, only three previously observed drafts. The first eligible case is now [PR417](pr417/README.md): retained as oversized,
+with 3.1% proposed packet-byte reduction and no paid calls. Three cohort slots
+remain.
 No background polling service has been installed; collection is operator/agent
 invoked when the new PR is available.
 

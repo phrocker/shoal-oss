@@ -1,0 +1,95 @@
+{
+  "archive_sha256": "a1168da5cfaf816f789fb817235091a14ca58989748baa528e0340807226fec3",
+  "files": [
+    {
+      "path": "pr417-source/cohort-selection.json",
+      "bytes": 710,
+      "sha256": "e92c6007d6734c2f10b69260c0be1d769e7a3bea4fb72b4e5303e00750804bdc"
+    },
+    {
+      "path": "pr417-source/collected/manifest.json",
+      "bytes": 335893,
+      "sha256": "c0b696d22ffd256ae4d80b59183215bcb73e437b239c485f87a47093907e608a"
+    },
+    {
+      "path": "pr417-source/collected/protocol.json",
+      "bytes": 3331,
+      "sha256": "88e21c0be8d35124989670e7c0de4dfeacbd11c9de7740b53b4a619d6f6b2b57"
+    },
+    {
+      "path": "pr417-source/collected/review-packets/pr-417.json",
+      "bytes": 126824,
+      "sha256": "dd83c030343b8fc21fb27f76e88f9db2a8414534a70516c5c700785d1bf3b11d"
+    },
+    {
+      "path": "pr417-source/collection.json",
+      "bytes": 3331,
+      "sha256": "06565108ba71db677eb978d01509c69910fe4c7a98f808132d50f22b7aed3dfa"
+    },
+    {
+      "path": "pr417-source/files.json",
+      "bytes": 95638,
+      "sha256": "63ec2f131c40d96bf19961b88141313a905eb9b3d28eecd4ca9d17a39f03b4d2"
+    },
+    {
+      "path": "pr417-source/inventory.json",
+      "bytes": 92979,
+      "sha256": "6bb07b1d1b0ecd92fa80a8aaa67dd203a1cb7ead3869e4c92659490bd429c589"
+    },
+    {
+      "path": "pr417-source/pr-metadata.json",
+      "bytes": 24092,
+      "sha256": "5f57f5a268c4237d26121286f2d5e24c119a4ede00b71d5494acb0333db9821d"
+    },
+    {
+      "path": "pr417-pair/classifier-predictions.json",
+      "bytes": 32278,
+      "sha256": "ca9cbef1448cf2332de6cd3916e1de1820e412d2e491101e41cc0e4f2c64012d"
+    },
+    {
+      "path": "pr417-pair/classifier-selection.json",
+      "bytes": 329,
+      "sha256": "54333797d1b11aba2ac7c223cc94e50f342d405608d7e6ecef02d04f8320d09a"
+    },
+    {
+      "path": "pr417-pair/inputs.json",
+      "bytes": 235555,
+      "sha256": "f3e81e206100aed7050c175cd86b9e2a6314eb6abe637cd7c71a217ae4fc3084"
+    },
+    {
+      "path": "pr417-pair/packets.json",
+      "bytes": 1186,
+      "sha256": "df7febe723cfe99ccf0934d9784871566c1d3aa40ad41bfe4dbee369213001f3"
+    },
+    {
+      "path": "pr417-pair/pr-417-candidate.txt",
+      "bytes": 210362,
+      "sha256": "9694bacfb464eda5c720f156c92fc0f76849fe75eeeaa6e15140f19fd3e2bd62"
+    },
+    {
+      "path": "pr417-pair/pr-417-full.txt",
+      "bytes": 217092,
+      "sha256": "59dbfa4dfd5fcc42e7b272f30c874cfb813c8a9a3ec2cc06d5cd9f326bc3339b"
+    },
+    {
+      "path": "pr417-pair/pr-metadata.json",
+      "bytes": 24060,
+      "sha256": "b23f965e8aa087ce8ada8e58c8de6f3660109b6b41c43a3201602419a97f369e"
+    },
+    {
+      "path": "pr417-pair/shadow-predictions.json",
+      "bytes": 37911,
+      "sha256": "ccb8fe65c48cd5bbff4524a8b3406a12fe05a1ceb60c4b865bced87f173c921f"
+    },
+    {
+      "path": "pr417-pair/shadow-selection.json",
+      "bytes": 419,
+      "sha256": "6178eb0686e3b191761fa677c43f2314d8e34b0dbcf9421d4bda398bf94366f9"
+    },
+    {
+      "path": "pr417-pair/source-manifest.json",
+      "bytes": 335893,
+      "sha256": "c0b696d22ffd256ae4d80b59183215bcb73e437b239c485f87a47093907e608a"
+    }
+  ]
+}
