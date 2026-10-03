@@ -42,13 +42,35 @@ llmProxy:
   admission:
     # Base URL of the explorer's authenticated API.
     url: ""
-    # Required. The explorer's API is authenticated in every deployment this
-    # chart can render, so without a token every admission request is a 401 and
-    # the proxy denies every call.
+    # Required in this form. The explorer's API is authenticated in every
+    # deployment this chart can render, so without a token every admission
+    # request is a 401 and the proxy denies every call.
+    #
+    # The alternative is a file, which is the only form a rotating credential
+    # has: a projected ServiceAccount token is rewritten in place by the
+    # kubelet and never updates an environment variable, and a container's
+    # environment cannot change after start at all. Replace the two keys above
+    # with the three below for that — and see docs/llm-proxy-deploy.md, which
+    # has the whole worked example:
+    #
+    #   serviceAccountName: shoal-llm-proxy   (at the llmProxy level)
+    #   admission:
+    #     tokenFile: /var/run/secrets/shoal/token
+    #     tokenFileSource: projected
+    #     tokenAudience: shoal
+    #
+    # Exactly one form renders. The binary refuses both at once rather than
+    # ranking them, and naming a Secret beside a projected token is refused
+    # here too: it would be a credential the pod never opens.
     credentialSecretName: ""
     credentialSecretKey: token
     # Capped at 5m by the admission surface itself (MaxActionClaimTTL). A
     # larger value is refused rather than shortened, which denies every call.
+    #
+    # It is also the window the proxy drains for on SIGTERM, so
+    # terminationGracePeriodSeconds has to exceed it by at least 5s. Raising
+    # one without the other is refused at render: a SIGKILL mid-drain kills
+    # the calls whose grant has already been spent.
     lease: 60s
     # An in-cluster explorer is reached over http://, because the chart renders
     # its listener plaintext behind a ClusterIP. Setting this to true is the
@@ -56,10 +78,24 @@ llmProxy:
     # the clear; prefer https:// wherever the hop leaves the cluster.
     allowPlaintext: false
   upstream:
-    # The real OpenAI-compatible provider.
+    # The real OpenAI-compatible provider, including the version segment it
+    # documents (https://api.openai.com/v1, http://localhost:11434/v1). Must be
+    # https:// unless it is loopback: this request carries the prompt and the
+    # credential, and there is no acknowledgement that accepts plaintext here.
     baseURL: ""
     # Required for a remote provider: the credential is read at request time
-    # and nothing projects it into the pod without a Secret.
+    # and nothing puts it in the pod without a Secret.
+    #
+    # The same file form is available here, for the same reason — an
+    # environment variable cannot be rotated under a running pod, while a
+    # Secret mounted as a volume is updated in place:
+    #
+    #   upstream:
+    #     apiKeyFile: /etc/shoal/upstream/api-key
+    #     apiKeyFileSource: secret    # or volume, for a CSI driver
+    #
+    # The two credential files must sit in different directories, because each
+    # is mounted at its own file's directory.
     credentialSecretName: ""
     credentialSecretKey: api-key
     # Must not exceed admission.lease, or a call can outlive the permission it
@@ -68,6 +104,8 @@ llmProxy:
   # The registered descriptor this proxy admits against. All six are resolved
   # together; an incomplete identity is refused by the plane on every request.
   identity:
+    # Canonical unpadded base64url, like the scope identities below: this is
+    # the encoded ID, not a descriptor's display name.
     agentID: ""
     agentGeneration: 1
     capability: ""

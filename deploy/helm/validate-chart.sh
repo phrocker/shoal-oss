@@ -67,6 +67,22 @@ valid_llm_proxy=(
 )
 llm_proxy_base=(-f "$chart/values-llm-proxy.yaml" "${valid_llm_proxy[@]}")
 
+# The same configuration with the admission token coming from a file instead of
+# an environment variable, as a projected ServiceAccount token.
+#
+# It is a separate fixture rather than one more --set on the base, because the
+# two forms require different things and a fixture that carried both could not
+# express either. The admission Secret is cleared on purpose: naming one here
+# is refused, since nothing in the projected form reads it, and leaving it set
+# would make every case below pass or fail for that reason instead of its own.
+valid_token_file=(
+  --set llmProxy.admission.credentialSecretName=
+  --set llmProxy.admission.tokenFile=/var/run/secrets/shoal/token
+  --set llmProxy.admission.tokenAudience=shoal
+  --set llmProxy.serviceAccountName=shoal-llm-proxy
+)
+token_file_base=("${llm_proxy_base[@]}" "${valid_token_file[@]}")
+
 renders() {
   local description="$1"; shift
   if ! helm template shoal "$chart" "$@" >/dev/null 2>&1; then
@@ -79,6 +95,27 @@ refuses() {
   local description="$1"; shift
   if helm template shoal "$chart" "$@" >/dev/null 2>&1; then
     fail "should be refused but rendered: $description"
+  fi
+}
+
+# A refusal is only evidence of a guard when it is *that* guard's refusal.
+#
+# Several values below are refused by something downstream as well: an unknown
+# token file source also trips the audience rule, a non-numeric token lifetime
+# also casts to 0 and trips the floor, and an empty operator volume renders YAML
+# Helm itself rejects. A case that only asserted "did not render" would keep
+# passing with the guard it is named for deleted — which is the defect this
+# script exists to prevent, arriving through the assertion instead of the
+# template. These pin the sentence.
+refuses_citing() {
+  local expected="$1" description="$2"; shift 2
+  local output
+  if output="$(helm template shoal "$chart" "$@" 2>&1)"; then
+    fail "should be refused but rendered: $description"
+  elif ! printf '%s' "$output" | grep -qF -- "$expected"; then
+    fail "refused, but not by the guard under test: $description"
+    printf '%s' "$output" | grep -oE 'execution error.*' | head -1 |
+      cut -c1-200 | sed 's/^/      /'
   fi
 }
 
@@ -113,6 +150,39 @@ renders "storage tier plus llm proxy" -f "$chart/values.yaml" "${valid_llm_proxy
 renders "explorer plus llm proxy" "${explorer_base[@]}" "${valid_llm_proxy[@]}"
 refuses "values-llm-proxy.yaml as shipped" -f "$chart/values-llm-proxy.yaml"
 
+note "== the storage profiles are unchanged by the enforcement plane =="
+# The standing guarantee for this chart: work on the explorer and the proxy
+# changes nothing for an operator who has not enabled them. Both are off by
+# default and independent of `mode`, so each storage profile must render
+# byte-identically to the baseline — not merely "still render", which is what
+# the section above checks and what a stray always-rendered key would pass.
+#
+# The baseline is origin/main. A clone without it reports a skip rather than
+# quietly checking nothing, as the schema section does for kubeconform.
+baseline="${SHOAL_CHART_BASELINE:-origin/main}"
+# From the repository root, because an `archive` pathspec is resolved against
+# the working directory and the chart is three levels down.
+repository="$(git -C "$chart" rev-parse --show-toplevel 2>/dev/null || true)"
+if [ -n "$repository" ] &&
+  git -C "$repository" rev-parse --verify --quiet "$baseline" >/dev/null 2>&1; then
+  reference="$(mktemp -d)"
+  trap 'rm -rf "$reference"' EXIT
+  if git -C "$repository" archive "$baseline" deploy/helm/shoal | tar -x -C "$reference"; then
+    for values in values.yaml values-single.yaml values-distributed.yaml values-accumulo.yaml; do
+      if ! diff -u \
+        <(helm template shoal "$reference/deploy/helm/shoal" -f "$reference/deploy/helm/shoal/$values" 2>&1) \
+        <(helm template shoal "$chart" -f "$chart/$values" 2>&1) > "$reference/diff"; then
+        fail "$values no longer renders byte-identically to $baseline: the enforcement plane is off by default and must change nothing for anyone who has not enabled it"
+        head -20 "$reference/diff" | sed 's/^/      /'
+      fi
+    done
+  else
+    fail "could not export the chart at $baseline to compare against"
+  fi
+else
+  note "  skipped: $baseline is not in this clone (set SHOAL_CHART_BASELINE)"
+fi
+
 note "== schema =="
 if command -v kubeconform >/dev/null 2>&1; then
   for values in values.yaml values-single.yaml values-distributed.yaml values-accumulo.yaml; do
@@ -127,6 +197,10 @@ if command -v kubeconform >/dev/null 2>&1; then
     kubeconform -strict -summary - >/dev/null || fail "kubeconform values-llm-proxy.yaml"
   helm template shoal "$chart" "${explorer_base[@]}" "${valid_llm_proxy[@]}" |
     kubeconform -strict -summary - >/dev/null || fail "kubeconform explorer plus llm proxy"
+  # The file form renders a volume, a mount and an fsGroup the env form does
+  # not, so it is a different object shape and needs its own schema pass.
+  helm template shoal "$chart" "${token_file_base[@]}" |
+    kubeconform -strict -summary - >/dev/null || fail "kubeconform llm proxy with a projected token"
 else
   note "  skipped: kubeconform is not on PATH"
 fi
@@ -271,15 +345,259 @@ renders "loopback admission needs no acknowledgement" "${llm_proxy_base[@]}" --s
 # lower one. A lease equal to the timeout is refused, not accepted: the binary
 # refuses that pair at startup, so rendering it would produce a pod that never
 # serves — which is the failure these guards exist to move to render time.
-renders "lease at the ceiling with room to report" "${llm_proxy_base[@]}" --set llmProxy.admission.lease=5m,llmProxy.upstream.requestTimeout=4m
+# The grace period moves with the lease, because the proxy drains for the lease:
+# at the 5m ceiling the shipped 75s grace period is refused, and that refusal is
+# asserted below rather than worked around here.
+renders "lease at the ceiling with room to report" "${llm_proxy_base[@]}" --set llmProxy.admission.lease=5m,llmProxy.upstream.requestTimeout=4m,llmProxy.terminationGracePeriodSeconds=305
 refuses "lease equal to the timeout"        "${llm_proxy_base[@]}" --set llmProxy.admission.lease=5m,llmProxy.upstream.requestTimeout=5m
 refuses "lease inside the report window"    "${llm_proxy_base[@]}" --set llmProxy.admission.lease=35s,llmProxy.upstream.requestTimeout=31s
-renders "compound durations"                "${llm_proxy_base[@]}" --set llmProxy.admission.lease=2m30s,llmProxy.upstream.requestTimeout=1m30s
+renders "compound durations"                "${llm_proxy_base[@]}" --set llmProxy.admission.lease=2m30s,llmProxy.upstream.requestTimeout=1m30s,llmProxy.terminationGracePeriodSeconds=155
 refuses "timeout equal to the lease"        "${llm_proxy_base[@]}" --set llmProxy.upstream.requestTimeout=60s
 renders "millisecond timeout"               "${llm_proxy_base[@]}" --set llmProxy.upstream.requestTimeout=500ms
 renders "disruption budget disabled"        "${llm_proxy_base[@]}" --set llmProxy.podDisruptionBudget.enabled=false,llmProxy.podDisruptionBudget.maxUnavailable=0
 renders "operator-supplied affinity"        "${llm_proxy_base[@]}" --set 'llmProxy.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms[0].matchExpressions[0].key=kubernetes.io/os' --set 'llmProxy.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms[0].matchExpressions[0].operator=In' --set 'llmProxy.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms[0].matchExpressions[0].values={linux}'
 renders "several allowed hosts, trimmed"    "${llm_proxy_base[@]}" --set 'llmProxy.allowedHosts={ llm.example.test , llm-internal.example.test }'
+
+note "== the grace period covers the drain =="
+# The proxy drains for the lease on SIGTERM, because the lease is the bound on
+# an admitted call's whole lifetime including its report. terminationGracePeriod
+# is the kubelet's budget for that window, so a grace period inside it is a
+# SIGKILL mid-drain: the calls killed are exactly the ones whose egress has
+# already happened and whose grant has already been spent, and every rolling
+# update produces them on a schedule while the pod terminates cleanly.
+#
+# The shipped values did this — 45 against a 60s lease — which is why the
+# default moved and why both sides of the boundary are pinned here.
+refuses "grace period below the lease"      "${llm_proxy_base[@]}" --set llmProxy.terminationGracePeriodSeconds=30
+refuses "grace period equal to the lease"   "${llm_proxy_base[@]}" --set llmProxy.terminationGracePeriodSeconds=60
+# One second apart, on either side of the required 5s margin. A guard that only
+# refused a grace period *below* the lease would pass the first of these, and
+# the pod would be killed while the drain still had five seconds of work.
+refuses "grace period one second inside the margin" "${llm_proxy_base[@]}" --set llmProxy.terminationGracePeriodSeconds=64
+renders "grace period exactly the margin above the lease" "${llm_proxy_base[@]}" --set llmProxy.terminationGracePeriodSeconds=65
+refuses "the shipped grace period against a ceiling lease" "${llm_proxy_base[@]}" --set llmProxy.admission.lease=5m,llmProxy.upstream.requestTimeout=4m
+renders "a ceiling lease with the grace period raised" "${llm_proxy_base[@]}" --set llmProxy.admission.lease=5m,llmProxy.upstream.requestTimeout=4m,llmProxy.terminationGracePeriodSeconds=305
+refuses "zero grace period"                 "${llm_proxy_base[@]}" --set llmProxy.terminationGracePeriodSeconds=0
+# Cited, because a value that is not a number casts to 0 and is then refused by
+# the drain guard above as well.
+refuses_citing "must be a whole number of seconds" "null grace period" "${llm_proxy_base[@]}" --set llmProxy.terminationGracePeriodSeconds=null
+refuses_citing "must be a whole number of seconds" "negative grace period" "${llm_proxy_base[@]}" --set llmProxy.terminationGracePeriodSeconds=-1
+# A float that is comfortably above the lease, via --set-json for the reason the
+# token lifetime needs it: this is the only shape the whole-number guard alone
+# catches, because it casts to 75 and clears the drain guard.
+refuses_citing "must be a whole number of seconds" "fractional grace period" "${llm_proxy_base[@]}" --set-json 'llmProxy.terminationGracePeriodSeconds=75.5'
+
+note "== the admission token file form =="
+# The file form exists because a rotating credential is a file: the kubelet
+# rewrites a projected ServiceAccount token in place and never updates an
+# environment variable. Every refusal here is either a pod the binary rejects at
+# startup, a pod spec the API server rejects, or — the common case and the
+# dangerous one — a pod that comes up, passes every probe, and fails every
+# admission request on a credential it cannot read or that nothing accepts.
+renders "a projected ServiceAccount token"  "${token_file_base[@]}"
+# The binary compares -admission-token-env against its own flag default rather
+# than against emptiness, so the default being present is not a second choice.
+# If it were, the file form would be unreachable without also blanking the env
+# key, and this case is what proves the chart kept that property.
+renders "the file form with tokenEnv at its default" "${token_file_base[@]}" --set llmProxy.admission.tokenEnv=SHOAL_ADMISSION_TOKEN
+renders "the file form with tokenEnv blanked" "${token_file_base[@]}" --set llmProxy.admission.tokenEnv=
+refuses "both token forms chosen explicitly" "${token_file_base[@]}" --set llmProxy.admission.tokenEnv=OTHER_VAR
+# Blank and absent are the env form, not a broken file form — so these render
+# against the base's Secret rather than being refused. Without them, reading
+# `tokenFile` as configured-when-whitespace would be invisible.
+renders "a blank token file is the env form" "${llm_proxy_base[@]}" --set 'llmProxy.admission.tokenFile= '
+renders "a null token file is the env form"  "${llm_proxy_base[@]}" --set llmProxy.admission.tokenFile=null
+refuses "a relative token file"             "${token_file_base[@]}" --set llmProxy.admission.tokenFile=secrets/token
+refuses "a token file at the filesystem root" "${token_file_base[@]}" --set llmProxy.admission.tokenFile=/token
+# Cited, not merely refused: an unrecognised source leaves the audience set with
+# no projection to bind it to, so the audience guard refuses these too and a
+# bare `refuses` would pass with the source guard deleted.
+refuses_citing "tokenFileSource must be projected" "an unknown token file source" "${token_file_base[@]}" --set llmProxy.admission.tokenFileSource=serviceaccount
+refuses_citing "tokenFileSource must be projected" "a null token file source" "${token_file_base[@]}" --set llmProxy.admission.tokenFileSource=null
+refuses_citing "tokenFileSource must be projected" "a blank token file source" "${token_file_base[@]}" --set 'llmProxy.admission.tokenFileSource= '
+# A Secret named where nothing reads it is the invisible credential the binary
+# refuses two token flags over: the operator believes one thing is presented and
+# another is, and the symptom names neither.
+refuses "a projected token with an admission Secret" "${token_file_base[@]}" --set llmProxy.admission.credentialSecretName=shoal-admission-token
+refuses "an operator volume with an admission Secret" "${token_file_base[@]}" --set llmProxy.admission.tokenFileSource=volume,llmProxy.admission.tokenAudience=,llmProxy.admission.credentialSecretName=shoal-admission-token --set 'llmProxy.admission.tokenVolume.csi.driver=csi.spiffe.io'
+# Without an audience the projected token is issued for the cluster's own API
+# server, which the explorer is not: a 401 on every admission request.
+refuses "a projected token with no audience" "${token_file_base[@]}" --set llmProxy.admission.tokenAudience=
+refuses "a projected token with a blank audience" "${token_file_base[@]}" --set 'llmProxy.admission.tokenAudience= '
+refuses "a projected token with a placeholder audience" "${token_file_base[@]}" --set llmProxy.admission.tokenAudience=REPLACE_ME
+refuses "a placeholder token file"          "${token_file_base[@]}" --set llmProxy.admission.tokenFile=/var/run/REPLACE_ME/token
+# A projected token's subject is the pod's ServiceAccount. Left implicit it is
+# the namespace's `default`, so authorizing the proxy authorizes every pod in
+# the namespace.
+refuses "a projected token with no ServiceAccount" "${token_file_base[@]}" --set llmProxy.serviceAccountName=
+refuses "a projected token with a blank ServiceAccount" "${token_file_base[@]}" --set 'llmProxy.serviceAccountName= '
+renders "default named explicitly as the ServiceAccount" "${token_file_base[@]}" --set llmProxy.serviceAccountName=default
+# 600 is the API server's floor for a token projection. Below it the Deployment
+# is accepted and no pod is ever created from it, which is a rollout that never
+# completes and no pod log to read at all.
+refuses "a token lifetime below the API server floor" "${token_file_base[@]}" --set llmProxy.admission.tokenExpirationSeconds=599
+refuses "a zero token lifetime"             "${token_file_base[@]}" --set llmProxy.admission.tokenExpirationSeconds=0
+refuses "a negative token lifetime"         "${token_file_base[@]}" --set llmProxy.admission.tokenExpirationSeconds=-1
+# Cited for the reason above, from the other side: anything non-numeric casts to
+# 0, so the floor guard refuses all of these as well.
+refuses_citing "must be a whole number of seconds" "a null token lifetime" "${token_file_base[@]}" --set llmProxy.admission.tokenExpirationSeconds=null
+refuses_citing "must be a whole number of seconds" "an unparseable token lifetime" "${token_file_base[@]}" --set llmProxy.admission.tokenExpirationSeconds=1h
+# --set-json, because --set cannot express a float: it parses what it can as an
+# integer and keeps the rest as a string, and a string casts to 0 and lands on
+# the floor guard. A real fractional value is the one shape only the
+# whole-number guard can catch — it casts to a perfectly acceptable 600 — and
+# a values file can hold one, so the fixture has to be able to say it.
+refuses_citing "must be a whole number of seconds" "a fractional token lifetime" "${token_file_base[@]}" --set-json 'llmProxy.admission.tokenExpirationSeconds=600.5'
+renders "a token lifetime at the floor"     "${token_file_base[@]}" --set llmProxy.admission.tokenExpirationSeconds=600
+renders "a day-long token lifetime"         "${token_file_base[@]}" --set llmProxy.admission.tokenExpirationSeconds=86400
+# The file form with a loopback upstream is the one configuration where nothing
+# at all goes into the environment. `env:` with no entries under it is YAML
+# null, which the API server rejects as not a list, so the key has to be omitted
+# rather than emptied — and this is the only case that renders it.
+loopback_token_file=(
+  "${token_file_base[@]}"
+  --set llmProxy.upstream.credentialSecretName=
+  --set llmProxy.upstream.baseURL=http://localhost:11434/v1
+)
+renders "a token file with nothing in the environment" "${loopback_token_file[@]}"
+
+# The Secret-as-a-file source. Worth having rather than redundant with the env
+# form: the kubelet updates a mounted Secret's contents in place and the proxy
+# re-reads per request, so rotating the value takes effect without rolling the
+# pod — which an environment variable cannot do at all.
+secret_file=(
+  "${llm_proxy_base[@]}"
+  --set llmProxy.admission.tokenFile=/etc/shoal/admission/token
+  --set llmProxy.admission.tokenFileSource=secret
+)
+renders "the admission Secret mounted as a file" "${secret_file[@]}"
+refuses "a Secret file source with no Secret" "${secret_file[@]}" --set llmProxy.admission.credentialSecretName=
+refuses "a Secret file source with no key"  "${secret_file[@]}" --set llmProxy.admission.credentialSecretKey=
+# An audience names the verifier a projected token is minted for. With this
+# source nothing issues a token, so a value here records a binding that exists
+# nowhere in the deployment.
+refuses "a Secret file source with an audience" "${secret_file[@]}" --set llmProxy.admission.tokenAudience=shoal
+# The lifetime is only consulted for a projection, so a bad one here must not
+# refuse: a guard that fired anyway would be refusing a configuration that works.
+renders "a Secret file source ignores the token lifetime" "${secret_file[@]}" --set llmProxy.admission.tokenExpirationSeconds=1
+
+# The operator-supplied volume: the seam for a CSI driver the chart does not
+# model. It can check only the two things that make the volume unusable rather
+# than merely unknown.
+operator_volume=(
+  "${llm_proxy_base[@]}"
+  --set llmProxy.admission.credentialSecretName=
+  --set llmProxy.admission.tokenFile=/var/run/spiffe/token
+  --set llmProxy.admission.tokenFileSource=volume
+)
+renders "an operator-supplied CSI token volume" "${operator_volume[@]}" --set 'llmProxy.admission.tokenVolume.csi.driver=csi.spiffe.io' --set 'llmProxy.admission.tokenVolume.csi.readOnly=true'
+# Cited: with the guard gone the chart renders a volume whose source is an empty
+# flow mapping, which Helm refuses while parsing its own output — so the case
+# would pass for a reason that has nothing to do with the guard.
+refuses_citing "tokenVolume is required" "a volume source with no volume" "${operator_volume[@]}"
+refuses "a volume source that names itself" "${operator_volume[@]}" --set 'llmProxy.admission.tokenVolume.name=my-token' --set 'llmProxy.admission.tokenVolume.csi.driver=csi.spiffe.io'
+refuses "a volume source with an audience"  "${operator_volume[@]}" --set llmProxy.admission.tokenAudience=shoal --set 'llmProxy.admission.tokenVolume.csi.driver=csi.spiffe.io'
+
+# The env form's own guards still own the env form, which is what makes
+# relaxing them for the file form safe. Each of these is already asserted above
+# against llm_proxy_base; the point here is that the file form does not silently
+# relax them for everyone.
+renders "the env form still needs no volume" "${llm_proxy_base[@]}"
+refuses "the env form still needs a Secret"  "${llm_proxy_base[@]}" --set llmProxy.admission.credentialSecretName=
+refuses "the env form still needs a variable" "${llm_proxy_base[@]}" --set llmProxy.admission.tokenEnv=
+
+note "== the transport acknowledgement, and the one hop that has none =="
+# The acknowledgement is a flag now, because it was a values key that reached
+# nothing: the binary refuses a remote http:// admission URL without it, so the
+# documented mesh deployment rendered cleanly and produced CrashLoopBackOff.
+renders "plaintext admission acknowledged, as a flag" "${llm_proxy_base[@]}" --set llmProxy.admission.url=http://shoal-explorer:8098,llmProxy.admission.allowPlaintext=true
+# It is rendered verbatim into a boolean flag, so a YAML word that is not a
+# boolean is a pod that exits on a flag error.
+refuses "a non-boolean plaintext acknowledgement" "${llm_proxy_base[@]}" --set llmProxy.admission.url=http://shoal-explorer:8098 --set-string llmProxy.admission.allowPlaintext=yes
+# And the upstream hop has no acknowledgement at all: it carries the prompt and
+# the provider credential, so a mesh authenticating the hop to the explorer says
+# nothing about it. allowPlaintext must not open this one.
+refuses "a plaintext remote upstream" "${llm_proxy_base[@]}" --set llmProxy.upstream.baseURL=http://api.example.test/v1
+refuses_citing "is plaintext to a remote provider" "a plaintext remote upstream even with the admission acknowledgement" "${llm_proxy_base[@]}" --set llmProxy.upstream.baseURL=http://api.example.test/v1,llmProxy.admission.allowPlaintext=true
+renders "a loopback provider over http"     "${llm_proxy_base[@]}" --set llmProxy.upstream.baseURL=http://localhost:11434/v1,llmProxy.upstream.credentialSecretName=
+
+note "== values rendered verbatim are validated as written =="
+# Each of these is written into an argument or a port declaration unchanged, so
+# a guard that converts before testing passes a value the flag parser or the API
+# server then rejects. int64 of 1.5 is a positive 1; int of 8100.5 is 8100.
+refuses "a fractional agent generation"     "${llm_proxy_base[@]}" --set llmProxy.identity.agentGeneration=1.5
+# --set-string, because --set normalises 010 to 10 and the fixture would then be
+# unable to express the condition it is named for. Written as a string it
+# renders as 010, which Go parses as octal 8 — a generation nothing registered.
+refuses "an agent generation with a leading zero" "${llm_proxy_base[@]}" --set-string llmProxy.identity.agentGeneration=010
+refuses "an agent generation past the int64 maximum" "${llm_proxy_base[@]}" --set llmProxy.identity.agentGeneration=9223372036854775808
+refuses "a twenty-digit agent generation"   "${llm_proxy_base[@]}" --set llmProxy.identity.agentGeneration=99999999999999999999
+renders "the largest int64 agent generation" "${llm_proxy_base[@]}" --set llmProxy.identity.agentGeneration=9223372036854775807
+# Cited: a non-numeric port casts to 0 and the range guard refuses it too, so
+# only a float can attribute to the whole-number guard — and only --set-json can
+# express one.
+refuses_citing "llmProxy.containerPort must be a whole number" "a fractional container port" "${llm_proxy_base[@]}" --set-json 'llmProxy.containerPort=8100.5'
+refuses_citing "llmProxy.servicePort must be a whole number" "a fractional service port" "${llm_proxy_base[@]}" --set-json 'llmProxy.servicePort=8100.5'
+
+note "== the agent id is an encoding, not a name =="
+# The workspace decodes this field and the binary refuses an undecodable value
+# at startup. The guard reaches encoding mistakes and not the class: a readable
+# name that happens to decode is indistinguishable from a registered ID here.
+refuses "an agent id that is not base64url" "${llm_proxy_base[@]}" --set 'llmProxy.identity.agentID=governed/proxy'
+refuses "a padded agent id"                 "${llm_proxy_base[@]}" --set 'llmProxy.identity.agentID=Z292ZXJuZWQtcHJveHk='
+refuses "a truncated agent id"              "${llm_proxy_base[@]}" --set llmProxy.identity.agentID=Z292ZXJuZWQtcHJveHkBC
+# The documented limit, pinned so nobody later claims the guard catches it: a
+# display name of exactly the right shape decodes to garbage and renders.
+renders "a readable agent id that happens to decode" "${llm_proxy_base[@]}" --set llmProxy.identity.agentID=gateway
+
+note "== the upstream credential file form =="
+# The same reasoning as the admission token, applied to the provider key: an
+# environment variable cannot be rotated under a running pod, because a
+# container's environment is fixed after start. A Secret mounted as a volume is
+# updated in place and the per-request read picks it up.
+upstream_key_file=(
+  "${llm_proxy_base[@]}"
+  --set llmProxy.upstream.apiKeyFile=/etc/shoal/upstream/api-key
+  --set llmProxy.upstream.apiKeyFileSource=secret
+)
+renders "the provider key mounted as a file" "${upstream_key_file[@]}"
+renders "the upstream file form with apiKeyEnv at its default" "${upstream_key_file[@]}" --set llmProxy.upstream.apiKeyEnv=SHOAL_UPSTREAM_API_KEY
+# Blanking the variable is the other way to say "use the file", and it has to
+# render: the binary only refuses a *changed* variable name beside a file.
+renders "the upstream file form with apiKeyEnv blanked" "${upstream_key_file[@]}" --set llmProxy.upstream.apiKeyEnv=
+refuses "both upstream key forms chosen explicitly" "${upstream_key_file[@]}" --set llmProxy.upstream.apiKeyEnv=OTHER_VAR
+refuses "a relative upstream key file"      "${upstream_key_file[@]}" --set llmProxy.upstream.apiKeyFile=upstream/api-key
+refuses "an upstream key file at the filesystem root" "${upstream_key_file[@]}" --set llmProxy.upstream.apiKeyFile=/api-key
+# Cited: with the source guard gone the chart renders an empty volume source,
+# which Helm refuses while parsing its own output.
+refuses_citing "apiKeyFileSource must be secret or volume" "an unknown upstream key file source" "${upstream_key_file[@]}" --set llmProxy.upstream.apiKeyFileSource=projected
+# Against a loopback provider, so the remote-credential rule above cannot be
+# what refuses it: the Secret source with no Secret is its own failure.
+refuses "a Secret source for the provider key with no Secret" "${upstream_key_file[@]}" --set llmProxy.upstream.baseURL=http://localhost:11434/v1,llmProxy.upstream.credentialSecretName=
+refuses "a Secret source for the provider key with no key" "${upstream_key_file[@]}" --set llmProxy.upstream.credentialSecretKey=
+upstream_key_volume=(
+  "${llm_proxy_base[@]}"
+  --set llmProxy.upstream.credentialSecretName=
+  --set llmProxy.upstream.apiKeyFile=/etc/shoal/upstream/api-key
+  --set llmProxy.upstream.apiKeyFileSource=volume
+)
+# The relaxation that makes the volume source worth having: a remote provider
+# with no Secret anywhere must render, or a CSI-delivered credential is
+# unexpressible and the guard is a guard against the feature.
+renders "a remote provider whose key comes from a CSI volume" "${upstream_key_volume[@]}" --set 'llmProxy.upstream.apiKeyVolume.csi.driver=secrets-store.csi.k8s.io' --set 'llmProxy.upstream.apiKeyVolume.csi.readOnly=true'
+refuses_citing "apiKeyVolume is required" "an upstream volume source with no volume" "${upstream_key_volume[@]}"
+refuses "an upstream volume source that names itself" "${upstream_key_volume[@]}" --set 'llmProxy.upstream.apiKeyVolume.name=my-key' --set 'llmProxy.upstream.apiKeyVolume.csi.driver=secrets-store.csi.k8s.io'
+# Both credentials from files is the configuration the mount paths collide in.
+both_files=(
+  "${token_file_base[@]}"
+  --set llmProxy.upstream.apiKeyFile=/etc/shoal/upstream/api-key
+  --set llmProxy.upstream.apiKeyFileSource=secret
+)
+renders "both credentials from files in separate directories" "${both_files[@]}"
+refuses "both credentials from files in one directory" "${both_files[@]}" --set llmProxy.upstream.apiKeyFile=/var/run/secrets/shoal/api-key
+# Including the case where they are the same file, which is the same refusal
+# and the one an operator reaches by copying the path.
+refuses "both credentials from the same file" "${both_files[@]}" --set llmProxy.upstream.apiKeyFile=/var/run/secrets/shoal/token
 
 note "== the probe surface is wired end to end =="
 # Three separate things have to agree, and the pod never becomes ready if any
@@ -485,6 +803,315 @@ for problem in problems:
 raise SystemExit(1 if problems else 0)
 '; then
   fail "the llm proxy is not wired end to end (see above)"
+fi
+
+note "== each credential reaches the process in exactly one form =="
+# No `refuses` case can see any of this. A guard can only refuse a values file;
+# it cannot tell whether the pod that *did* render presents the credential the
+# operator configured, and every failure below produces a pod that starts,
+# passes both probes, and fails on the credential at request time:
+#
+#   both forms of one credential rendered at once, which the binary refuses at
+#   startup, or neither rendered at all;
+#   a file form rendered with the Secret still projected into the environment,
+#   so which credential is in use depends on the binary precedence rather than
+#   on the manifest;
+#   a mount path that is not the directory of the path in the flag, or a
+#   projected file name that is not its base name — either way the process
+#   opens a path nothing put a credential at;
+#   two credentials mounted at one path, which the API server refuses;
+#   a file mode the container cannot read. This is the one that cost the most
+#   thought: the kubelet writes projected and Secret volumes owned by root, the
+#   container runs as uid 65532 with every capability dropped, and 0400 with no
+#   fsGroup is a credential the only process that needs it cannot open. The
+#   symptom is a 401 on every call, which looks exactly like a policy problem;
+#   an `env:` key with nothing under it, which is YAML null and not a list;
+#   -allow-plaintext-admission not reaching the process, which is the defect
+#   that made the documented mesh deployment CrashLoopBackOff.
+#
+# Every form is checked, because "exactly one" is a claim about all of them.
+credential_wiring='
+import os, sys, yaml
+
+problems = []
+deployment = None
+for document in yaml.safe_load_all(sys.stdin):
+    if not document:
+        continue
+    labels = document.get("metadata", {}).get("labels", {})
+    if document.get("kind") == "Deployment" and labels.get(
+            "app.kubernetes.io/component") == "llm-proxy":
+        deployment = document
+
+if deployment is None:
+    print("no llm-proxy Deployment was rendered")
+    raise SystemExit(1)
+
+pod = deployment["spec"]["template"]["spec"]
+container = pod["containers"][0]
+security = pod.get("securityContext", {})
+fsgroup = security.get("fsGroup")
+run_as_group = security.get("runAsGroup")
+arguments = dict(
+    argument.split("=", 1) for argument in container["args"] if "=" in argument)
+if "env" in container and not container["env"]:
+    problems.append(
+        "env: is rendered with nothing under it, which is YAML null rather than "
+        "an empty list, and the API server rejects the pod spec"
+    )
+environment = {entry["name"]: entry for entry in container.get("env") or []}
+mounts = {mount["name"]: mount for mount in container.get("volumeMounts") or []}
+volumes = {volume["name"]: volume for volume in pod.get("volumes") or []}
+
+# The acknowledgement has to reach the process, or it acknowledges nothing: the
+# binary refuses a remote plaintext admission URL without it, which is the
+# CrashLoopBackOff a values key that reached nothing used to produce.
+acknowledged = arguments.get("-allow-plaintext-admission")
+if acknowledged not in ("true", "false"):
+    problems.append(
+        f"-allow-plaintext-admission is {acknowledged!r}: it is a boolean flag, "
+        "and anything else is a flag error at startup"
+    )
+plane = arguments.get("-admission-url", "")
+host = plane.split("//", 1)[-1].split("/", 1)[0].split(":")[0]
+if plane.startswith("http://") and host not in ("127.0.0.1", "localhost", "[") and (
+        acknowledged != "true"):
+    problems.append(
+        f"-admission-url is {plane} and -allow-plaintext-admission is "
+        f"{acknowledged}: the binary refuses a remote plaintext decision plane "
+        "without the acknowledgement, so this pod exits at startup"
+    )
+
+# volume name, file flag, variable flag, what the pod does without the
+# credential, and whether the variable form must be projected from a Secret.
+# The admission token must be: the workspace has no unauthenticated mode. The
+# provider credential need not: a loopback model server takes none.
+credentials = [
+    ("admission-token", "-admission-token-file", "-admission-token-env",
+     "denies every call", True),
+    ("upstream-api-key", "-upstream-api-key-file", "-upstream-api-key-env",
+     "fails every admitted call after the admission is spent", False),
+]
+expected_volumes = set()
+expected_variables = set()
+for name, file_flag, env_flag, consequence, must_project in credentials:
+    from_file = arguments.get(file_flag)
+    from_env = arguments.get(env_flag)
+    if from_file and from_env:
+        problems.append(
+            f"{file_flag} and {env_flag} are both rendered: the binary refuses "
+            "that pair at startup rather than ranking them, so this pod never "
+            "serves"
+        )
+    if not from_file and not from_env:
+        problems.append(f"neither {file_flag} nor {env_flag} is rendered")
+    if not from_file:
+        if from_env:
+            expected_variables.add(from_env)
+            if must_project and from_env not in environment:
+                problems.append(
+                    f"{from_env} is named by {env_flag} and projected from "
+                    f"nothing, so the proxy {consequence}"
+                )
+        if name in volumes or name in mounts:
+            problems.append(
+                f"the {env_flag} form rendered a {name} volume nothing reads")
+        continue
+
+    expected_volumes.add(name)
+    mount = mounts.get(name)
+    if mount is None:
+        problems.append(
+            f"{file_flag}={from_file} is rendered with no volumeMount, so the "
+            f"path does not exist in the container and the proxy {consequence}"
+        )
+    else:
+        mount_path = mount["mountPath"]
+        if mount_path != os.path.dirname(from_file):
+            problems.append(
+                f"{name} is mounted at {mount_path} but {file_flag} names "
+                f"{from_file}, so the process opens a path nothing mounts"
+            )
+        if not mount.get("readOnly"):
+            problems.append(f"the {name} mount is writable")
+
+    volume = volumes.get(name)
+    if volume is None:
+        problems.append(f"the {name} mount references a volume that is not declared")
+        continue
+    source = {key: value for key, value in volume.items() if key != "name"}
+    if len(source) != 1:
+        problems.append(f"the {name} volume has {len(source)} sources, not one")
+    kind = next(iter(source), None)
+    body = source.get(kind, {})
+
+    # The mode belongs to the chart for the sources it renders. An
+    # operator-supplied volume is theirs, and the chart can see nothing inside
+    # a CSI driver, so it is not checked here.
+    mode = body.get("defaultMode")
+    if kind in ("projected", "secret") and mode is None:
+        problems.append(
+            f"the {name} volume sets no defaultMode, so it takes 0644 and says "
+            "nothing about who can read the credential"
+        )
+    elif mode is not None:
+        if mode & 0o222:
+            problems.append(f"the {name} file is writable (mode {mode:04o})")
+        if not mode & 0o044:
+            problems.append(
+                f"the {name} file is mode {mode:04o}, which only its owner can "
+                "read. The kubelet writes it owned by root and the container "
+                "runs as uid 65532, so the one process that needs the "
+                f"credential cannot open it: the proxy starts, passes every "
+                f"probe, and {consequence}"
+            )
+        elif not mode & 0o004 and fsgroup != run_as_group:
+            problems.append(
+                f"the {name} file is group-readable (mode {mode:04o}) but "
+                f"fsGroup is {fsgroup} and the container runs as group "
+                f"{run_as_group}, so the group that can read it is not the "
+                "group the process is in"
+            )
+
+    # The file name inside the volume has to be the base name in the flag, from
+    # whichever side the volume builds it. Checking only the projected form left
+    # the Secret form free to mount the credential under another name — the
+    # process then opens a path the volume never creates.
+    if kind == "secret":
+        items = body.get("items") or []
+        names = [item.get("path") for item in items]
+        if names != [os.path.basename(from_file)]:
+            problems.append(
+                f"the {name} Secret is mounted as {names} but the flag names "
+                f"{os.path.basename(from_file)!r}, so the process opens a path "
+                "the volume does not create"
+            )
+        for item in items:
+            if not str(item.get("key", "")).strip():
+                problems.append(f"the {name} Secret item names no key")
+    if kind == "projected":
+        projections = [
+            entry["serviceAccountToken"]
+            for entry in body.get("sources", [])
+            if "serviceAccountToken" in entry
+        ]
+        if len(projections) != 1:
+            problems.append(
+                f"{len(projections)} token projections in {name}, not one")
+        for projection in projections:
+            projected_name = projection.get("path")
+            if projected_name != os.path.basename(from_file):
+                problems.append(
+                    f"the token is projected as {projected_name!r} but the flag "
+                    f"names {os.path.basename(from_file)!r}"
+                )
+            if not str(projection.get("audience", "")).strip():
+                problems.append(
+                    "the token is projected with no audience, so it is issued "
+                    "for the cluster API server and the explorer rejects every "
+                    "request"
+                )
+            expiry = projection.get("expirationSeconds")
+            if not isinstance(expiry, int) or expiry < 600:
+                problems.append(
+                    f"expirationSeconds is {expiry!r}: below the API server "
+                    "floor of 600 the pod spec is invalid and no pod is ever "
+                    "created"
+                )
+        if not str(pod.get("serviceAccountName", "")).strip():
+            problems.append(
+                "a projected token is rendered with no serviceAccountName, so "
+                "its subject is the namespace default account, which every "
+                "other pod in the namespace can also obtain a token for"
+            )
+
+# A Secret projected into a variable no flag names is the invisible credential
+# the mutual exclusion exists to prevent: the operator sees two sources in the
+# manifest and the binary picks one.
+from_secrets = {
+    name for name, entry in environment.items()
+    if "secretKeyRef" in entry.get("valueFrom", {})
+}
+unread = sorted(from_secrets - expected_variables)
+if unread:
+    problems.append(
+        f"a Secret is projected into {unread} that no flag names, so the "
+        "credential the process uses is not the one the manifest shows"
+    )
+paths = [mount["mountPath"] for mount in container.get("volumeMounts") or []]
+if len(paths) != len(set(paths)):
+    problems.append(
+        f"two volumes are mounted at one path ({paths}), which the API server "
+        "refuses: the Deployment is created and no pod ever is"
+    )
+unused = sorted(set(volumes) - expected_volumes)
+if unused:
+    problems.append(f"volumes nothing reads: {unused}")
+if not expected_volumes and "fsGroup" in security:
+    problems.append("an fsGroup is set with no volume to own")
+if not container["securityContext"].get("readOnlyRootFilesystem"):
+    problems.append("a credential mount came at the cost of a writable root filesystem")
+
+for problem in problems:
+    print(problem)
+raise SystemExit(1 if problems else 0)
+'
+wired() {
+  local description="$1"; shift
+  if ! helm template shoal "$chart" "$@" | python3 -c "$credential_wiring"; then
+    fail "the credentials are not wired end to end: $description (see above)"
+  fi
+}
+wired "a projected admission token"           "${token_file_base[@]}"
+wired "the admission Secret as a file"        "${secret_file[@]}"
+wired "a token file with nothing in the environment" "${loopback_token_file[@]}"
+# The operator volume is checked against the same rules as the chart's own
+# sources, with an explicit item and mode, because that is what makes the path
+# the flag names deterministic. A volume source that leaves either out puts the
+# credential wherever the Secret's keys happen to fall, which is the operator's
+# business and not something the chart can see — so the fixture says it the way
+# the guide tells an operator to.
+wired "an operator-supplied admission volume" "${operator_volume[@]}" --set 'llmProxy.admission.tokenVolume.secret.secretName=shoal-admission-token' --set 'llmProxy.admission.tokenVolume.secret.defaultMode=288' --set 'llmProxy.admission.tokenVolume.secret.items[0].key=token' --set 'llmProxy.admission.tokenVolume.secret.items[0].path=token'
+wired "the provider key as a file"            "${upstream_key_file[@]}"
+wired "both credentials from files"           "${both_files[@]}"
+wired "both credentials from the environment" "${llm_proxy_base[@]}"
+wired "a loopback provider that needs no credential" "${llm_proxy_base[@]}" --set llmProxy.upstream.baseURL=http://localhost:11434/v1,llmProxy.upstream.credentialSecretName=
+wired "an acknowledged plaintext decision plane" "${llm_proxy_base[@]}" --set llmProxy.admission.url=http://shoal-explorer:8098,llmProxy.admission.allowPlaintext=true
+
+note "== the guide's worked example still installs =="
+# The example in docs/llm-proxy-deploy.md is copied by operators verbatim, and a
+# values file in prose is the first thing to rot when a key is renamed or a new
+# refusal lands. So it is extracted from the document and rendered, rather than
+# trusted.
+#
+# It is the projected-token example specifically, because that is the one with
+# keys the chart refuses to render without — an audience, a ServiceAccount, no
+# admission Secret — and the one where a stale document produces a pod that
+# passes every probe and denies every call.
+guide="$chart/../../../docs/llm-proxy-deploy.md"
+if [ -f "$guide" ]; then
+  example="$(mktemp)"
+  python3 - "$guide" > "$example" <<'EXTRACT'
+import re, sys
+
+document = open(sys.argv[1]).read()
+heading = "### The values file, complete"
+if heading not in document:
+    raise SystemExit("the guide no longer has a complete values example")
+block = re.search(r"```yaml\n(.*?)```", document[document.index(heading):], re.S)
+if not block:
+    raise SystemExit("the example after that heading is not a yaml block")
+sys.stdout.write(block.group(1))
+EXTRACT
+  if [ -s "$example" ]; then
+    renders "the worked example from docs/llm-proxy-deploy.md" -f "$chart/values-llm-proxy.yaml" -f "$example"
+    wired "the worked example from docs/llm-proxy-deploy.md" -f "$chart/values-llm-proxy.yaml" -f "$example"
+  else
+    fail "could not extract the worked example from docs/llm-proxy-deploy.md"
+  fi
+  rm -f "$example"
+else
+  fail "docs/llm-proxy-deploy.md is missing: the worked example cannot be checked"
 fi
 
 note "== every rendered name fits the 63-character limit =="
