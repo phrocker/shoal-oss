@@ -34,11 +34,14 @@ const MaxAnswers = 4096
 // CalibrationID may identify a versioned uncalibrated configuration; a valid
 // identity makes no claim that returned probabilities are calibrated.
 type PredictorConfig struct {
-	Provider          string
-	RuntimeID         shoal.ID
-	WeightsDigest     string
-	TokenizerDigest   string
-	FormattingID      shoal.ID
+	Provider        string
+	RuntimeID       shoal.ID
+	WeightsDigest   string
+	TokenizerDigest string
+	FormattingID    shoal.ID
+	// PreprocessingID pins the complete input transformation contract, including
+	// normalization, feature extraction, chunking and truncation rules.
+	PreprocessingID   shoal.ID
 	CalibrationID     shoal.ID
 	EnvironmentDigest string
 	Device            string
@@ -61,7 +64,7 @@ func NewPredictorIdentity(c PredictorConfig) (PredictorIdentity, error) {
 			return PredictorIdentity{}, err
 		}
 	}
-	for _, id := range []shoal.ID{c.RuntimeID, c.FormattingID, c.CalibrationID, c.BatchPolicyID} {
+	for _, id := range []shoal.ID{c.RuntimeID, c.FormattingID, c.PreprocessingID, c.CalibrationID, c.BatchPolicyID} {
 		if err := requiredID(id); err != nil {
 			return PredictorIdentity{}, err
 		}
@@ -173,7 +176,11 @@ func NewDecisionRequest(task TaskSpec, picture PictureManifest, predictor Predic
 	if err != nil {
 		return DecisionRequest{}, err
 	}
-	return DecisionRequest{id, task, picture, predictor, c}, nil
+	request := DecisionRequest{id, task, picture, predictor, c}
+	if err := requestResponseBudget(request); err != nil {
+		return DecisionRequest{}, err
+	}
+	return request, nil
 }
 func (r DecisionRequest) ID() shoal.ID          { return r.id }
 func (r DecisionRequest) TaskID() shoal.ID      { return r.task.id }
@@ -268,37 +275,10 @@ func NewPredictionRecord(request DecisionRequest, c ResultConfig) (PredictionRec
 	if c.EffectiveDevice != request.predictor.config.Device && !(c.Status == Failed && c.EffectiveDevice == "") {
 		return PredictionRecord{}, invalid("unregistered effective device")
 	}
-	var budget byteBudget
-	if err := budget.charge(4096); err != nil {
+	if _, err := responseBudget(c); err != nil {
 		return PredictionRecord{}, err
 	}
-	if err := budget.text(c.Reason); err != nil {
-		return PredictionRecord{}, err
-	}
-	for _, a := range c.Answers {
-		if len(a.Distribution) > MaxLabels {
-			return PredictionRecord{}, invalid("too many distribution labels")
-		}
-		if err := budget.charge(1024); err != nil {
-			return PredictionRecord{}, err
-		}
-		if err := budget.ids(a.SubjectID, a.QuestionID); err != nil {
-			return PredictionRecord{}, err
-		}
-		for _, s := range []string{a.Label, a.Reason, string(a.Status)} {
-			if err := budget.text(s); err != nil {
-				return PredictionRecord{}, err
-			}
-		}
-		for _, d := range a.Distribution {
-			if err := budget.charge(128); err != nil {
-				return PredictionRecord{}, err
-			}
-			if err := budget.text(d.Label); err != nil {
-				return PredictionRecord{}, err
-			}
-		}
-	}
+
 	switch c.Status {
 	case Failed, Abstained:
 		if len(c.Answers) != 0 {
@@ -433,4 +413,100 @@ func positiveZero(v float64) float64 {
 		return 0
 	}
 	return v
+}
+
+// Shared accounting keeps request admission and result preflight consistent.
+func responseHeaderBudget(c ResultConfig) (byteBudget, error) {
+	var b byteBudget
+	if err := b.charge(4096); err != nil {
+		return 0, err
+	}
+	if err := b.ids(c.RequestID, c.PredictorID); err != nil {
+		return 0, err
+	}
+	for _, s := range []string{c.EffectiveDevice, string(c.Status), c.Reason} {
+		if err := b.text(s); err != nil {
+			return 0, err
+		}
+	}
+	return b, nil
+}
+func answerBudget(a Answer) (byteBudget, error) {
+	var b byteBudget
+	if len(a.Distribution) > MaxLabels {
+		return 0, invalid("too many distribution labels")
+	}
+	if err := b.charge(1024); err != nil {
+		return 0, err
+	}
+	if err := b.ids(a.SubjectID, a.QuestionID); err != nil {
+		return 0, err
+	}
+	for _, s := range []string{a.Label, a.Reason, string(a.Status)} {
+		if err := b.text(s); err != nil {
+			return 0, err
+		}
+	}
+	for _, d := range a.Distribution {
+		if err := b.charge(128); err != nil {
+			return 0, err
+		}
+		if err := b.text(d.Label); err != nil {
+			return 0, err
+		}
+	}
+	return b, nil
+}
+func responseBudget(c ResultConfig) (byteBudget, error) {
+	b, err := responseHeaderBudget(c)
+	if err != nil {
+		return 0, err
+	}
+	for _, a := range c.Answers {
+		size, err := answerBudget(a)
+		if err != nil {
+			return 0, err
+		}
+		if err := b.charge(int(size)); err != nil {
+			return 0, err
+		}
+	}
+	return b, nil
+}
+
+// Reserve room for every pair's label-only/proposition answer, or an abstention
+// with reason "unavailable", whichever costs more. Long task labels and repeated
+// subject/question IDs count for each pair. Optional distributions and longer
+// reasons remain subject to actual response preflight; admission does not promise
+// that every optional representation fits.
+func requestResponseBudget(r DecisionRequest) error {
+	b, err := responseHeaderBudget(ResultConfig{RequestID: r.id, PredictorID: r.predictor.id, EffectiveDevice: r.predictor.config.Device, Status: Completed})
+	if err != nil {
+		return err
+	}
+	for _, subject := range r.config.SubjectIDs {
+		for _, q := range r.task.config.Questions {
+			label := ""
+			for _, candidate := range q.Labels {
+				if len(candidate) > len(label) {
+					label = candidate
+				}
+			}
+			size, err := answerBudget(Answer{SubjectID: subject, QuestionID: q.ID, Status: Answered, Label: label})
+			if err != nil {
+				return err
+			}
+			abstain, err := answerBudget(Answer{SubjectID: subject, QuestionID: q.ID, Status: AnswerAbstained, Reason: "unavailable"})
+			if err != nil {
+				return err
+			}
+			if abstain > size {
+				size = abstain
+			}
+			if err := b.charge(int(size)); err != nil {
+				return invalid("request cannot fit a complete response")
+			}
+		}
+	}
+	return nil
 }

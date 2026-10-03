@@ -20,6 +20,7 @@
 package decision_test
 
 import (
+	"fmt"
 	"math"
 	"strings"
 	"testing"
@@ -30,7 +31,7 @@ import (
 )
 
 func predictorConfig() decision.PredictorConfig {
-	return decision.PredictorConfig{Provider: "local", RuntimeID: "runtime:1", WeightsDigest: strings.Repeat("a", 64), TokenizerDigest: strings.Repeat("b", 64), FormattingID: "format:1", CalibrationID: "uncalibrated:1", EnvironmentDigest: strings.Repeat("c", 64), Device: "cpu", Precision: "float64", BatchPolicyID: "batch:1", DistributionTolerance: 0.001, ReplayTolerance: 0.000001}
+	return decision.PredictorConfig{Provider: "local", RuntimeID: "runtime:1", WeightsDigest: strings.Repeat("a", 64), TokenizerDigest: strings.Repeat("b", 64), FormattingID: "format:1", PreprocessingID: "preprocessing:1", CalibrationID: "uncalibrated:1", EnvironmentDigest: strings.Repeat("c", 64), Device: "cpu", Precision: "float64", BatchPolicyID: "batch:1", DistributionTolerance: 0.001, ReplayTolerance: 0.000001}
 }
 func requestFixture(t *testing.T) (decision.DecisionRequest, decision.ResultConfig) {
 	t.Helper()
@@ -60,12 +61,13 @@ func TestPredictorIdentity(t *testing.T) {
 		t.Fatal(err)
 	}
 	for name, change := range map[string]func(*decision.PredictorConfig){
-		"weights":     func(c *decision.PredictorConfig) { c.WeightsDigest = strings.Repeat("d", 64) },
-		"runtime":     func(c *decision.PredictorConfig) { c.RuntimeID = "runtime:2" },
-		"device":      func(c *decision.PredictorConfig) { c.Device = "gpu:0" },
-		"batch":       func(c *decision.PredictorConfig) { c.BatchPolicyID = "batch:2" },
-		"calibration": func(c *decision.PredictorConfig) { c.CalibrationID = "calibrated:1" },
-		"rounding":    func(c *decision.PredictorConfig) { c.DistributionTolerance = 0 },
+		"weights":       func(c *decision.PredictorConfig) { c.WeightsDigest = strings.Repeat("d", 64) },
+		"preprocessing": func(c *decision.PredictorConfig) { c.PreprocessingID = "preprocessing:2" },
+		"runtime":       func(c *decision.PredictorConfig) { c.RuntimeID = "runtime:2" },
+		"device":        func(c *decision.PredictorConfig) { c.Device = "gpu:0" },
+		"batch":         func(c *decision.PredictorConfig) { c.BatchPolicyID = "batch:2" },
+		"calibration":   func(c *decision.PredictorConfig) { c.CalibrationID = "calibrated:1" },
+		"rounding":      func(c *decision.PredictorConfig) { c.DistributionTolerance = 0 },
 	} {
 		t.Run(name, func(t *testing.T) {
 			c := a.Config()
@@ -372,6 +374,111 @@ func TestRequestScopeAndReleaseChangeIdentity(t *testing.T) {
 			}
 			if original.ID() == other.ID() {
 				t.Fatal("request identity omitted binding")
+			}
+		})
+	}
+}
+
+func TestPreprocessingRequiredAndResponseSubstitutionRejected(t *testing.T) {
+	cfg := predictorConfig()
+	cfg.PreprocessingID = ""
+	if _, err := decision.NewPredictorIdentity(cfg); err == nil {
+		t.Fatal("missing preprocessing accepted")
+	}
+	cfg = predictorConfig()
+	cfg.PreprocessingID = "different-preprocessing"
+	other, err := decision.NewPredictorIdentity(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request, response := requestFixture(t)
+	response.PredictorID = other.ID()
+	if _, err := decision.NewPredictionRecord(request, response); err == nil {
+		t.Fatal("substituted preprocessing accepted")
+	}
+}
+
+func TestRequestResponseCapacityBoundary(t *testing.T) {
+	for _, mode := range []string{"short IDs", "long IDs", "long labels"} {
+		t.Run(mode, func(t *testing.T) {
+			pack, pc := fixture(t)
+			tc := taskConfig()
+			tc.Questions = nil
+			ids := make([]shoal.ID, 64)
+			anchor := pc.Subjects[0].EvidenceIDs[0]
+			pc.Subjects = nil
+			label := "high"
+			if mode == "long labels" {
+				label = strings.Repeat("x", shoal.MaxSemanticStringBytes)
+			}
+			for i := 0; i < 64; i++ {
+				subject := fmt.Sprintf("subject-%02d", i)
+				question := fmt.Sprintf("question-%02d", i)
+				if mode == "long IDs" {
+					subject += strings.Repeat("s", shoal.MaxIDBytes-len(subject))
+					question += strings.Repeat("q", shoal.MaxIDBytes-len(question))
+				}
+				ids[i] = shoal.ID(subject)
+				pc.Subjects = append(pc.Subjects, decision.Subject{ID: ids[i], SourceID: "source", Disposition: decision.Supported, EvidenceIDs: []shoal.ID{anchor}})
+				tc.Questions = append(tc.Questions, decision.Question{ID: shoal.ID(question), Kind: decision.Choice, RubricID: "rubric:1", Labels: []string{"low", label}})
+			}
+			task, err := decision.NewTaskSpec(tc)
+			if err != nil {
+				t.Fatal(err)
+			}
+			pc.TaskID = task.ID()
+			picture, err := decision.NewPictureManifest(pack, pc)
+			if err != nil {
+				t.Fatal(err)
+			}
+			model, err := decision.NewPredictorIdentity(predictorConfig())
+			if err != nil {
+				t.Fatal(err)
+			}
+			baseline, _ := requestFixture(t)
+			request := func(n int) (decision.DecisionRequest, error) {
+				c := baseline.Config()
+				c.SubjectIDs = ids[:n]
+				return decision.NewDecisionRequest(task, picture, model, c)
+			}
+			if _, err := request(64); err == nil {
+				t.Fatal("4096-pair unfulfillable request admitted")
+			}
+			low, high := 0, 64
+			for low+1 < high {
+				mid := (low + high) / 2
+				if _, err := request(mid); err != nil {
+					high = mid
+				} else {
+					low = mid
+				}
+			}
+			if low == 0 {
+				t.Fatal("no representable request admitted")
+			}
+			r, err := request(low)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := request(low + 1); err == nil {
+				t.Fatal("accepted request beyond byte capacity")
+			}
+			result := decision.ResultConfig{RequestID: r.ID(), PredictorID: model.ID(), EffectiveDevice: "cpu", Status: decision.Completed, CompletedAt: now.Add(time.Second)}
+			for _, subject := range r.Config().SubjectIDs {
+				for _, q := range tc.Questions {
+					result.Answers = append(result.Answers, decision.Answer{SubjectID: subject, QuestionID: q.ID, Status: decision.Answered, Label: label})
+				}
+			}
+			if _, err := decision.NewPredictionRecord(r, result); err != nil {
+				t.Fatal("admitted boundary cannot complete:", err)
+			}
+			for i := range result.Answers {
+				result.Answers[i].Label = ""
+				result.Answers[i].Status = decision.AnswerAbstained
+				result.Answers[i].Reason = "unavailable"
+			}
+			if _, err := decision.NewPredictionRecord(r, result); err != nil {
+				t.Fatal("admitted boundary cannot abstain completely:", err)
 			}
 		})
 	}

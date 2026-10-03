@@ -72,14 +72,21 @@ picture authorizes exclusion or execution.
 ## Predictor, request and result contracts
 
 `PredictorIdentity` binds artifact digests for weights, tokenizer and environment,
-plus runtime, formatting, calibration, effective device/precision and batch policy.
+plus runtime, formatting, preprocessing, calibration, effective device/precision
+and batch policy. The required preprocessing reference pins normalization, feature
+extraction, chunking and truncation rules separately from output formatting.
 A versioned uncalibrated configuration is valid; identity is not proof of quality.
 The registry must verify artifacts and supported runtime settings. Provider-native
 rounding tolerance is explicitly bounded and separate from replay tolerance.
 
 `DecisionRequest` binds a validated task, matching picture, predictor and resolved
 release to a principal, correlation, subject set and deadline. It checks membership,
-chronology and answer-count bounds. The subject set is explicit: a consumer can
+chronology and answer-count bounds. Request admission also uses the same response
+byte accounting as result validation, reserving space for every pair to return
+any task label without a distribution, a proposition probability, or an abstention
+with reason `unavailable`. `MaxAnswers` is an upper count limit, not a promise that
+every ID/label combination fits. Optional distributions and longer reasons must
+still fit the actual response budget. The subject set is explicit: a consumer can
 request a subset, but this never implies permission to omit other subjects from
 review. The future service authenticates the principal, resolves the release and
 reserves idempotency against this request before inference.
