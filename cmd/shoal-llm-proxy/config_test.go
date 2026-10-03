@@ -21,6 +21,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -137,7 +138,7 @@ func TestTheProxyRefusesAPlaintextUpstreamAtConstruction(t *testing.T) {
 	} {
 		_, err := newProxy(
 			client, probe.url, func() (string, error) { return "k", nil },
-			[]string{"example.test"}, time.Minute, time.Now,
+			[]string{"example.test"}, nil, time.Minute, time.Now,
 			func(string, ...any) {})
 		if probe.refused && err == nil {
 			t.Fatalf("%s upstream (%s) was accepted", probe.name, probe.url)
@@ -189,6 +190,9 @@ func TestAnUnreportableTokenIsRefusedBeforeTheEgress(t *testing.T) {
 	} {
 		plane := newFakePlane(t, outcomeAllowed, nil)
 		plane.token = probe.token
+		// These probes are about the token's own shape, so the fixture must
+		// not echo a usable ID over the one under test.
+		plane.echoTokenID = false
 		upstream := newFakeUpstream(t)
 		governed, _ := newTestProxy(t, plane, upstream)
 
@@ -743,5 +747,115 @@ func TestAnAllowListEntryWithNoHostIsRefusedAtStartup(t *testing.T) {
 					"name its authority explicitly", bound, sent)
 			}
 		}
+	}
+}
+
+// TestTheModelFieldCannotCarryThePrompt closes the channel that role closed,
+// in the one other place the declaration copied caller text verbatim.
+//
+// This is the same finding as the role one and I did not generalise it at the
+// time, which is the lesson worth recording: the fix was applied to the field
+// that had been named rather than to the property that had been broken. A
+// prompt or a secret fits in model exactly as well, and nothing about the
+// field's name prevents it.
+//
+// There is no finite vocabulary available here — model names are whatever a
+// provider serves — so the operator names the ones the deployment expects and
+// anything else becomes a marker.
+func TestTheModelFieldCannotCarryThePrompt(t *testing.T) {
+	const secret = "a-prompt-smuggled-through-the-model-field"
+	plane := newFakePlane(t, outcomeAllowed, nil)
+	upstream := newFakeUpstream(t)
+	governed, _ := newTestProxy(t, plane, upstream)
+
+	post(t, governed,
+		`{"model":"`+secret+`","messages":[{"role":"user","content":"hi"}]}`)
+	if len(plane.requests) != 1 {
+		t.Fatalf("admissions = %d", len(plane.requests))
+	}
+	everything, err := json.Marshal(plane.requests[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(everything), secret) {
+		t.Fatalf("the model reached the decision plane: %s", everything)
+	}
+	if !strings.Contains(string(plane.requests[0].Input), modelOther) {
+		t.Fatalf("an unnamed model left no trace at all: %s", plane.requests[0].Input)
+	}
+
+	// A named model is reported as itself, or the sanitisation has thrown away
+	// the signal along with the content. The harness names "gpt".
+	plane.requests = nil
+	post(t, governed, plainCall)
+	if !strings.Contains(string(plane.requests[0].Input), `"model":"gpt"`) {
+		t.Fatalf("a named model was not reported: %s", plane.requests[0].Input)
+	}
+
+	// The caller's own model still goes upstream. Rewriting it would make the
+	// proxy the reason an unmodified client gets a different answer.
+	if !strings.Contains(string(upstream.received), secret) {
+		// The first call carried the secret model; the second carried "gpt".
+		// Only the second is in upstream.received now, so check the request
+		// directly instead.
+		plane.requests = nil
+		post(t, governed,
+			`{"model":"`+secret+`","messages":[{"role":"user","content":"hi"}]}`)
+		if !strings.Contains(string(upstream.received), secret) {
+			t.Fatalf("the caller's model was rewritten: %s", upstream.received)
+		}
+	}
+
+	// With no allow-list at all, every model is a marker. This is the default
+	// and the reason the guarantee holds without configuration.
+	if got := classifyModel("gpt", nil); got != modelOther {
+		t.Fatalf("classifyModel with no allow-list = %q, want %q", got, modelOther)
+	}
+}
+
+// TestAGrantNamingAnotherClaimIsRefused covers an echo that was trusted.
+//
+// The claim is created under the token ID this proxy chose and sent — the
+// service sets ClaimID from request.TokenID — and the report selects the claim
+// by the ID that came back. So a response carrying a different ID does not
+// merely misdescribe this call: it makes the proxy forward the call and then
+// close somebody else's outstanding admission.
+//
+// Structural validation could not catch it, because a swapped ID is perfectly
+// well formed. The fake plane could not express it either: it returned a fixed
+// token ID rather than echoing the request's, so every test was running against
+// a plane that always disagreed and nothing noticed. It echoes now, which is
+// what a real plane does, and this probe is the one place that overrides it.
+func TestAGrantNamingAnotherClaimIsRefused(t *testing.T) {
+	plane := newFakePlane(t, outcomeAllowed, nil)
+	upstream := newFakeUpstream(t)
+	governed, _ := newTestProxy(t, plane, upstream)
+	// A well-formed, reportable token for a different claim.
+	plane.echoTokenID = false
+	plane.token = &admissionToken{
+		ActionID:  "YWN0aW9u",
+		TokenID:   "c29tZWJvZHktZWxzZQ",
+		Version:   1,
+		ExpiresAt: time.Now().Add(time.Minute),
+	}
+
+	recorder := post(t, governed, plainCall)
+	if upstream.calls != 0 {
+		t.Fatal("the call was forwarded under a grant naming another claim")
+	}
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", recorder.Code)
+	}
+	// Nothing is reported, because reporting is the harm: it would resolve the
+	// claim the response named, which is not this call's.
+	if len(plane.reports) != 0 {
+		t.Fatalf("a mismatched grant was reported anyway: %+v", plane.reports)
+	}
+
+	// And the echoed form is accepted, or this refuses every real grant.
+	plane.echoTokenID = true
+	plane.reports = nil
+	if recorder = post(t, governed, plainCall); recorder.Code != http.StatusOK {
+		t.Fatalf("an echoed token was refused: %d %s", recorder.Code, recorder.Body.String())
 	}
 }

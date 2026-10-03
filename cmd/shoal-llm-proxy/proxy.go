@@ -26,6 +26,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 )
 
@@ -57,7 +58,10 @@ type proxy struct {
 	client       *http.Client
 	credential   func() (string, error)
 	allowedHosts []string
-	clock        func() time.Time
+	// models the operator has named. Empty means every model is reported as a
+	// marker, which keeps caller text out of the declaration by default.
+	models map[string]struct{}
+	clock  func() time.Time
 	// log receives operational events only. It is never given prompt or
 	// completion content; see logRefusal.
 	log func(string, ...any)
@@ -137,7 +141,7 @@ func (p *proxy) completions(writer http.ResponseWriter, request *http.Request) {
 
 	now := p.clock()
 	granted, err := p.admission.request(
-		request.Context(), identity, parsed.declaration(references), references, now)
+		request.Context(), identity, parsed.declaration(references, p.models), references, now)
 	switch {
 	case errors.Is(err, ErrDenied):
 		// A policy denial. The body names no policy, compartment or document:
@@ -403,11 +407,24 @@ func (p *proxy) refuse(
 	})
 }
 
+// declaredModels folds the operator's list into a set, dropping blanks so a
+// trailing comma in a values file does not name an empty model.
+func declaredModels(names []string) map[string]struct{} {
+	set := make(map[string]struct{}, len(names))
+	for _, name := range names {
+		if trimmed := strings.TrimSpace(name); trimmed != "" {
+			set[trimmed] = struct{}{}
+		}
+	}
+	return set
+}
+
 func newProxy(
 	admission *admissionClient,
 	upstream string,
 	credential func() (string, error),
 	allowedHosts []string,
+	models []string,
 	timeout time.Duration,
 	clock func() time.Time,
 	log func(string, ...any),
@@ -424,6 +441,8 @@ func newProxy(
 	return &proxy{
 		admission: admission, upstream: parsed,
 		client:     newHTTPClient(timeout),
-		credential: credential, allowedHosts: allowedHosts, clock: clock, log: log,
+		credential: credential, allowedHosts: allowedHosts,
+		models: declaredModels(models),
+		clock:  clock, log: log,
 	}, nil
 }

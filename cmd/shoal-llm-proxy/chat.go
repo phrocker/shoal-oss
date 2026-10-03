@@ -198,13 +198,51 @@ func classifyRole(role string) string {
 	return roleOther
 }
 
+// modelOther marks a model the operator has not named, the way roleOther marks
+// a role the API does not define.
+const modelOther = "other"
+
+// classifyModel keeps caller text out of the declaration.
+//
+// model is a free-form string the caller controls, and it was copied verbatim —
+// the same hole as role, which this proxy already closed, and I did not
+// generalise the fix at the time. A prompt or a secret fits in model just as
+// well, and nothing about the field's name prevents it.
+//
+// A finite vocabulary is not available here: model names are whatever a
+// provider serves. So the operator names the ones this deployment expects
+// (-model) and the declaration reports the matched name — operator text, never
+// the caller's. Anything else becomes a marker.
+//
+// With no allow-list the declaration always says "other", which is the safe
+// default rather than an oversight: it costs the plane model granularity until
+// an operator opts in, and it closes the channel for every deployment that has
+// not. An unlisted model is still forwarded with the caller's own string, and
+// the plane can deny on "other" if it wants to; refusing here would make this
+// model gating, which #390 lists as a non-goal.
+func classifyModel(model string, allowed map[string]struct{}) string {
+	trimmed := strings.TrimSpace(model)
+	if _, ok := allowed[trimmed]; ok {
+		return trimmed
+	}
+	return modelOther
+}
+
 // declaration is the shape the proxy sends in place of the payload.
 //
-// Sizes and counts only. A reviewer checking that Shoal never receives prompt
-// text should be able to confirm it by reading this function, which is why it
-// builds the value explicitly rather than marshalling a struct that could later
-// gain a field carrying content.
-func (r chatRequest) declaration(references []string) json.RawMessage {
+// Sizes, counts, and strings the operator chose. A reviewer checking that Shoal
+// never receives prompt text should be able to confirm it by reading this
+// function, which is why it builds the value explicitly rather than marshalling
+// a struct that could later gain a field carrying content.
+//
+// The one caller-chosen thing that still travels is the reference list, and
+// that is deliberate: the plane cannot authorise disclosures it is not told
+// about. Those are constrained to decodable document IDs rather than free text,
+// which is a different thing from model and role, where the field had no
+// business carrying anything the caller composed.
+func (r chatRequest) declaration(
+	references []string, models map[string]struct{},
+) json.RawMessage {
 	roles := make([]string, 0, len(r.messages))
 	total := 0
 	for _, message := range r.messages {
@@ -212,7 +250,7 @@ func (r chatRequest) declaration(references []string) json.RawMessage {
 		total += len(message.Content)
 	}
 	encoded, _ := json.Marshal(map[string]any{
-		"model":           r.model,
+		"model":           classifyModel(r.model, models),
 		"message_count":   len(r.messages),
 		"message_roles":   roles,
 		"content_bytes":   total,

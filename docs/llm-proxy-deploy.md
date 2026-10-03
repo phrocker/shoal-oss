@@ -75,6 +75,7 @@ from a production incident to `helm template`.
 | `-admission-token-file` | File holding that token instead, read per request. The only form a rotating credential has. |
 | `-upstream-base-url` | The real OpenAI-compatible provider, including the version segment it documents. |
 | `-upstream-api-key-env` | Environment variable holding the upstream credential. Mutually exclusive with the file form. |
+| `-model` | Model names this deployment expects, comma-separated. Optional; see below. |
 | `-upstream-api-key-file` | File holding that credential instead, read per request. |
 | `-agent-id` | Registered descriptor this proxy admits against. |
 | `-agent-generation` | `int64`, positive. |
@@ -134,6 +135,31 @@ would, and it makes accepting that an explicit act: over plaintext the bearer
 token crosses the network in the clear and so does the verdict, and anything on
 the path can rewrite a deny into an allow — which removes the enforcement plane
 while leaving every sign that it is running.
+
+## Declared models, and why the list exists
+
+`-model` (`llmProxy.models`) names the models this deployment expects. It is
+optional, and an empty list is a working configuration.
+
+The reason it exists is not routing — `-model` restricts nothing, and an
+unlisted model is still forwarded. It is the declaration. The proxy sends Shoal
+a description of what a call would do and never the payload, and `model` is a
+caller-controlled free-text field: a prompt or a secret fits in it exactly as
+well as `gpt-4o` does. So the declaration reports a **named** model as itself
+and anything else as `other`, and the names come from the operator rather than
+from the request.
+
+The trade is explicit. With no list, no caller text can reach the plane through
+this field, and the plane also cannot write policy about which model was used —
+every call reports `other`. Naming models buys that granularity back for the
+ones you name. Either way the caller's own `model` value goes upstream
+unchanged, because rewriting it would make the proxy the reason an unmodified
+client gets a different answer.
+
+A plane that wants to refuse unfamiliar models can deny on `other`. Deciding
+that here would make the proxy a model gate, which #390 lists as a non-goal.
+
+## No plaintext acknowledgement for the provider hop
 
 There is deliberately no counterpart for `-upstream-base-url`. That request
 carries the prompt itself and the operator's provider credential, and a mesh

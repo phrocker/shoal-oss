@@ -36,15 +36,24 @@ type fakePlane struct {
 	outcome  string
 	withhold []string
 	token    *admissionToken
-	status   int
-	requests []admissionRequestWire
-	reports  []admissionReportWire
-	server   *httptest.Server
+	// echoTokenID mirrors what a real plane does: the claim is created under
+	// the token ID the caller sent, so the grant carries that ID back. The fake
+	// returned a fixed one, which made it unable to express the swapped-token
+	// case at all. A probe that is specifically about the token's shape turns
+	// this off, so the fixture does not repair the value under test.
+	echoTokenID bool
+	status      int
+	requests    []admissionRequestWire
+	reports     []admissionReportWire
+	server      *httptest.Server
 }
 
 func newFakePlane(t *testing.T, outcome string, withhold []string) *fakePlane {
 	t.Helper()
-	plane := &fakePlane{outcome: outcome, withhold: withhold, status: http.StatusOK}
+	plane := &fakePlane{
+		outcome: outcome, withhold: withhold,
+		status: http.StatusOK, echoTokenID: true,
+	}
 	plane.token = &admissionToken{
 		ActionID: "YWN0aW9u", TokenID: "dG9rZW4", Version: 1,
 		ExpiresAt: time.Now().Add(time.Minute),
@@ -66,6 +75,11 @@ func newFakePlane(t *testing.T, outcome string, withhold []string) *fakePlane {
 				}
 				if plane.outcome != outcomeDenied {
 					body.Token = plane.token
+					if plane.echoTokenID && plane.token != nil {
+						echoed := *plane.token
+						echoed.TokenID = decoded.TokenID
+						body.Token = &echoed
+					}
 				}
 				_ = json.NewEncoder(writer).Encode(body)
 			case strings.HasSuffix(request.URL.Path, "/report"):
@@ -135,6 +149,9 @@ func newTestProxy(t *testing.T, plane *fakePlane, upstream *fakeUpstream) (*prox
 		client, upstream.server.URL,
 		func() (string, error) { return "upstream-key", nil },
 		[]string{"example.test"},
+		// The harness names a model, so the role/model classification tests
+		// can tell a reported name from the marker.
+		[]string{"gpt"},
 		5*time.Second, time.Now,
 		// The rendered line, not the format string. Capturing only the format
 		// made TestNoPromptOrCompletionIsLogged unable to fail for the one
@@ -878,7 +895,7 @@ func TestAStreamedResponseReachesTheCallerAsItArrives(t *testing.T) {
 		},
 		upstream.URL,
 		func() (string, error) { return "upstream-key", nil },
-		[]string{"example.test"}, 10*time.Second, time.Now,
+		[]string{"example.test"}, []string{"gpt"}, 10*time.Second, time.Now,
 		func(string, ...any) {})
 	if err != nil {
 		t.Fatal(err)

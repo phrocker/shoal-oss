@@ -340,6 +340,14 @@ llmProxy:
   # The decision plane. Every one of these is required: a proxy that cannot ask
   # must deny, and a proxy that denies everything is indistinguishable from a
   # total outage of whatever is behind it.
+  # Model names this deployment expects (-model). Optional, and empty is a
+  # working configuration: the declaration the proxy sends the workspace reports
+  # a named model as itself and anything else as "other", because the model
+  # field is caller-controlled free text and a prompt fits in it as readily as a
+  # model name. Naming models here buys the plane policy granularity over which
+  # model was used; it does not restrict which models may be called, and an
+  # unlisted model is still forwarded for the plane to decide on.
+  models: []
   admission:
     # Base URL of the explorer's authenticated API (-admission-url).
     url: ""

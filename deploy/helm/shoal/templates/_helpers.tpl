@@ -139,6 +139,27 @@ through the one path the guard was not looking at.
 
 Emits the empty string when nothing survives, which is what the guard tests.
 */ -}}
+{{- /*
+The models this deployment names, trimmed the way the allow-list is and for the
+same reason: the value is joined into one argument, so a blank element would
+render a comma pair the binary reads as an empty model name.
+
+Empty is a working configuration, not a missing one. With no models named the
+declaration reports every model as "other", which keeps caller-controlled text
+out of what the workspace receives — the field is free-form, so a prompt fits
+in it as readily as a model name. Naming models here buys policy granularity
+and nothing else; it does not restrict which models may be called.
+*/ -}}
+{{- define "shoal.llmProxyModels" -}}
+{{- $models := list -}}
+{{- range (default (list) .Values.llmProxy.models) -}}
+{{- if trim (default "" .) -}}
+{{- $models = append $models (trim .) -}}
+{{- end -}}
+{{- end -}}
+{{- join "," $models -}}
+{{- end -}}
+
 {{- define "shoal.llmProxyAllowedHosts" -}}
 {{- $hosts := list -}}
 {{- range (default (list) .Values.llmProxy.allowedHosts) -}}
@@ -261,11 +282,29 @@ true
 {{- end -}}
 {{- end -}}
 
-{{- /* 127.0.0.0/8 by prefix, matching net.IP.IsLoopback rather than just
-       127.0.0.1 — the binary accepts any address in that block. */ -}}
+{{- /* 127.0.0.0/8, matched as an address rather than as a prefix.
+       net.IP.IsLoopback accepts any address in that block, so "127.0.0.1"
+       alone is too narrow — but "127." as a prefix is too broad in the
+       direction that matters: "127.example.com" is a DNS name the binary
+       refuses, and a prefix test approved it, which is the same
+       chart-renders-what-the-binary-refuses failure the parsing was meant to
+       end.
+
+       Each octet is bounded, because net.ParseIP refuses 127.0.0.256 and a
+       looser \d{1,3} would approve it. Go also refuses a short form like
+       "127.1", so a full dotted quad is required here too.
+
+       IPv6 loopback is matched as "::1" and its fully expanded spelling. Other
+       spellings (0::1, ::0001) are loopback to net.ParseIP and are refused
+       here, which is a false refusal rather than an approved-but-broken pod —
+       the safe direction for a guard to be wrong in, and stated so nobody
+       reads it as an oversight. */ -}}
 {{- define "shoal.urlIsLoopback" -}}
 {{- $host := lower (urlParse .).hostname -}}
-{{- if or (eq $host "localhost") (eq $host "::1") (hasPrefix "127." $host) -}}
+{{- $octet := "(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])" -}}
+{{- $v4 := printf "^127\\.%s\\.%s\\.%s$" $octet $octet $octet -}}
+{{- if or (eq $host "localhost") (eq $host "::1")
+          (eq $host "0:0:0:0:0:0:0:1") (regexMatch $v4 $host) -}}
 true
 {{- end -}}
 {{- end -}}

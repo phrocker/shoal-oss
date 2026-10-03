@@ -170,6 +170,10 @@ spec:
             - -admission-token-env={{ trim (default "" $proxy.admission.tokenEnv) }}
             {{- end }}
             - -upstream-base-url={{ trim (default "" $proxy.upstream.baseURL) }}
+            # Model names the declaration may report. Caller-controlled text
+            # never travels: an unnamed model is reported as "other", which is
+            # what makes an empty list safe rather than merely permissive.
+            - -model={{ include "shoal.llmProxyModels" . }}
             {{- if $apiKeyFile }}
             - -upstream-api-key-file={{ $apiKeyFile }}
             {{- else }}

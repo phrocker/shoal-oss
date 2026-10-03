@@ -109,6 +109,15 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 			"Mutually exclusive with -admission-token-env")
 	upstreamBaseURL := flags.String("upstream-base-url", "",
 		"The real OpenAI-compatible provider this proxy forwards to")
+	models := flags.String("model", "",
+		"Comma-separated model names this deployment expects. The declaration "+
+			"sent to the workspace reports the matched name, and reports any "+
+			"other model as \"other\" — because the field is caller-controlled "+
+			"and a prompt fits in it as readily as a model name. Empty means "+
+			"every model is reported as \"other\", which keeps caller text out "+
+			"of the declaration by default at the cost of model granularity in "+
+			"policy. Naming models here does not restrict which may be called: "+
+			"an unlisted model is still forwarded, and the plane may deny it")
 	upstreamKeyEnv := flags.String("upstream-api-key-env", "SHOAL_UPSTREAM_API_KEY",
 		"Environment variable read at request time holding the upstream "+
 			"credential. A container's environment is fixed after start, so "+
@@ -250,7 +259,8 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 	}
 	governed, err := newProxy(
 		admission, *upstreamBaseURL, upstreamCredential,
-		allowedHosts, *requestTimeout, time.Now, logf)
+		allowedHosts, strings.Split(*models, ","),
+		*requestTimeout, time.Now, logf)
 	if err != nil {
 		listener.Close()
 		return err

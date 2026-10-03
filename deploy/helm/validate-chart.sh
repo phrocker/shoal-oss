@@ -107,6 +107,23 @@ refuses() {
 # passing with the guard it is named for deleted — which is the defect this
 # script exists to prevent, arriving through the assertion instead of the
 # template. These pin the sentence.
+# A rendered argument, asserted exactly. "renders" only proves a values file
+# was not refused, which cannot see whether the flag the binary will parse says
+# what the operator asked for — and a list joined into one argument is exactly
+# where a blank element disappears quietly or arrives as an empty name.
+assert_arg() {
+  local description="$1" pattern="$2"; shift 2
+  local rendered
+  if ! rendered=$(helm template shoal "$chart" "$@" 2>&1); then
+    fail "should render but was refused: $description"
+    return
+  fi
+  if ! printf '%s\n' "$rendered" | grep -qE -- "$pattern"; then
+    fail "the rendered argument does not match /$pattern/: $description"
+    printf '%s\n' "$rendered" | grep -E -- '\-model=' | sed 's/^/      /' | head -3
+  fi
+}
+
 refuses_citing() {
   local expected="$1" description="$2"; shift 2
   local output
@@ -521,6 +538,18 @@ refuses "a plaintext remote upstream" "${llm_proxy_base[@]}" --set llmProxy.upst
 refuses_citing "is plaintext to a remote provider" "a plaintext remote upstream even with the admission acknowledgement" "${llm_proxy_base[@]}" --set llmProxy.upstream.baseURL=http://api.example.test/v1,llmProxy.admission.allowPlaintext=true
 renders "a loopback provider over http"     "${llm_proxy_base[@]}" --set llmProxy.upstream.baseURL=http://localhost:11434/v1,llmProxy.upstream.credentialSecretName=
 
+note "== the declared model list =="
+# Empty is valid: every model is then reported as "other", which is what keeps
+# caller text out of the declaration without configuration.
+renders "no models named"        "${llm_proxy_base[@]}"
+renders "one model named"        "${llm_proxy_base[@]}" --set 'llmProxy.models={gpt-4o}'
+renders "several models named"   "${llm_proxy_base[@]}" --set 'llmProxy.models={gpt-4o,claude-opus-5}'
+# Blank entries are dropped rather than rendered, since the list is joined into
+# one argument and a comma pair is an empty model name to the binary.
+assert_arg "a blank model entry is dropped" "\-model=gpt-4o$" "${llm_proxy_base[@]}" --set 'llmProxy.models={gpt-4o, }'
+assert_arg "models render as one joined argument" "\-model=gpt-4o,claude-opus-5$" "${llm_proxy_base[@]}" --set 'llmProxy.models={gpt-4o,claude-opus-5}'
+assert_arg "no models renders an empty flag" "\-model=$" "${llm_proxy_base[@]}"
+
 note "== both URLs are parsed, not prefix-matched =="
 # These guards tested hasPrefix "http://" and hasPrefix "http://localhost",
 # which disagreed with the binary in both directions. Every case below is one
@@ -547,6 +576,20 @@ renders "an admission URL elsewhere in 127.0.0.0/8" "${llm_proxy_base[@]}" --set
 renders "an IPv6 loopback admission URL" "${llm_proxy_base[@]}" --set 'llmProxy.admission.url=http://[::1]:8098'
 renders "an IPv6 loopback upstream" "${llm_proxy_base[@]}" --set 'llmProxy.upstream.baseURL=http://[::1]:11434/v1' --set llmProxy.upstream.credentialSecretName=
 renders "an https URL with a port and a path" "${llm_proxy_base[@]}" --set llmProxy.admission.url=https://shoal.example.test:8443/base
+# Loopback is matched as an address, not as a "127." prefix. The prefix form
+# classified the DNS name 127.example.com as loopback and exempted it from the
+# plaintext rule, which the binary then refuses at startup — the same
+# chart-approves-what-the-binary-refuses failure the parsing was meant to end.
+refuses_citing "is plaintext to a non-loopback decision plane" "a DNS name beginning with 127." "${llm_proxy_base[@]}" --set llmProxy.admission.url=http://127.example.com:8098
+refuses_citing "is plaintext to a remote provider" "an upstream DNS name beginning with 127." "${llm_proxy_base[@]}" --set llmProxy.upstream.baseURL=http://127.example.com:11434/v1,llmProxy.upstream.credentialSecretName=
+# Each octet is bounded, because net.ParseIP refuses this and a loose \d{1,3}
+# would approve it.
+refuses_citing "is plaintext to a non-loopback decision plane" "an octet above 255" "${llm_proxy_base[@]}" --set llmProxy.admission.url=http://127.0.0.256:8098
+# Go refuses the short form too, so a full dotted quad is required.
+refuses_citing "is plaintext to a non-loopback decision plane" "a short-form loopback address" "${llm_proxy_base[@]}" --set llmProxy.admission.url=http://127.1:8098
+# And the whole block still counts, as net.IP.IsLoopback has it.
+renders "the lowest address in 127.0.0.0/8" "${llm_proxy_base[@]}" --set llmProxy.admission.url=http://127.0.0.0:8098
+renders "the expanded IPv6 loopback spelling" "${llm_proxy_base[@]}" --set 'llmProxy.admission.url=http://[0:0:0:0:0:0:0:1]:8098'
 
 note "== values rendered verbatim are validated as written =="
 # Each of these is written into an argument or a port declaration unchanged, so

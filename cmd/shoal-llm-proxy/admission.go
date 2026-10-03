@@ -234,6 +234,23 @@ func (c *admissionClient) request(
 	if err := decoded.Token.reportable(c.clockNow()); err != nil {
 		return grant{}, fmt.Errorf("%w: %v", ErrPlaneUnreachable, err)
 	}
+	// The token ID is an echo, so it is checked rather than trusted.
+	//
+	// The claim is created under the token ID this proxy chose and sent
+	// (dispatch_service.go:378 sets ClaimID from request.TokenID), and the
+	// report selects the claim by the ID that came back. So a response carrying
+	// a different one does not merely misdescribe this call: it makes the proxy
+	// forward the call and then close somebody else's outstanding admission.
+	//
+	// Structural validity could not catch that, because a swapped ID is
+	// perfectly well formed. This is the same rule as not trusting
+	// X-Forwarded-Host — a value we are told, which we can compare against a
+	// value we know, must be compared.
+	if decoded.Token.TokenID != identity.TokenID {
+		return grant{}, fmt.Errorf(
+			"%w: the grant names a different claim than the one requested",
+			ErrPlaneUnreachable)
+	}
 	return grant{Withhold: decoded.Withhold, token: *decoded.Token}, nil
 }
 
