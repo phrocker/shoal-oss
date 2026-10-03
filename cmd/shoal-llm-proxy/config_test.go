@@ -18,7 +18,11 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -254,5 +258,163 @@ func TestTheShippedDefaultsSatisfyTheirOwnInvariant(t *testing.T) {
 	lease, timeout := defaultLease, defaultRequestTimeout
 	if err := validateDurations(lease, timeout); err != nil {
 		t.Fatalf("the shipped defaults violate the invariant: %v", err)
+	}
+}
+
+// proxyArgs is a configuration that run() accepts, so a probe can change one
+// field and attribute the refusal to that field.
+func proxyArgs(overrides ...string) []string {
+	args := []string{
+		"-admission-url", "https://workspace.test",
+		"-upstream-base-url", "https://api.example.test",
+		"-agent-id", "YWdlbnQ",
+		"-agent-generation", "1",
+		"-capability", "llm.proxy",
+		"-action", "complete",
+		"-source-id", "c291cmNl",
+		"-policy-id", "cG9saWN5",
+	}
+	return append(args, overrides...)
+}
+
+// refusal drives run() and returns why it refused. Every probe here refuses
+// during configuration, which is before run() binds a listener — the point of
+// the exercise is that these are startup failures and not per-call ones.
+func refusal(t *testing.T, args []string) string {
+	t.Helper()
+	err := run(context.Background(), args, io.Discard)
+	if err == nil {
+		t.Fatalf("configuration was accepted: %v", args)
+	}
+	return err.Error()
+}
+
+// TestAMisencodedAgentIDIsRefusedAtStartup covers a contract that was stated
+// nowhere and could not be guessed.
+//
+// The workspace decodes agent_id as unpadded base64url. The flag documented no
+// encoding and sent any string verbatim, so a descriptor's readable name — the
+// obvious thing to pass — was denied once per call as a descriptor that does
+// not exist. The operator reads that as a registration problem and goes looking
+// in the wrong place.
+//
+// What this check does and does not reach is worth being exact about, because
+// the gap is not fixable here. A shoal.ID is opaque and variable-length, so
+// there is no canonical width to compare against, and a readable name that
+// happens to decode is indistinguishable from a real ID at startup: of fifteen
+// plausible names, eleven decode cleanly to garbage. Those still fail at the
+// first call. What moves to startup is the encoding mistakes below — and the
+// value of that is not the count, it is that the error names the encoding
+// instead of blaming the registry.
+func TestAMisencodedAgentIDIsRefusedAtStartup(t *testing.T) {
+	for _, probe := range []struct{ name, id, refused string }{
+		// Undecodable length: anything with len%4 == 1, which catches a good
+		// share of short names ("proxy", "agent", "llm-proxy").
+		{"a name of undecodable length", "llm-proxy", "base64url"},
+		{"a short name of undecodable length", "proxy", "base64url"},
+		// Padding and the standard alphabet are the two ways someone who does
+		// know it is base64 still gets it wrong.
+		{"padded base64", "YWdlbnQ=", "base64url"},
+		{"standard base64 alphabet", "YWdlbnQ/", "base64url"},
+		{"empty", "", "-agent-id"},
+	} {
+		detail := refusal(t, proxyArgs("-agent-id", probe.id))
+		if !strings.Contains(detail, probe.refused) {
+			t.Fatalf("%s refused for the wrong reason: %s", probe.name, detail)
+		}
+	}
+
+	// The honest half of the contract, pinned so it is not mistaken for a
+	// guarantee later: a name that decodes is accepted here. If this ever
+	// starts refusing, something has learned to tell IDs apart locally and
+	// this test should be replaced rather than deleted.
+	if _, err := decodeID("-agent-id", "gateway"); err != nil {
+		t.Fatalf("a decodable name was refused, so the stated gap has closed: %v", err)
+	}
+}
+
+// TestTheAdmissionTokenCanComeFromAFile covers the form a rotating credential
+// actually takes.
+//
+// A projected ServiceAccount token is a file the kubelet rewrites in place when
+// it rotates. It never updates an environment variable, so a proxy that can
+// only read env could not use one at all — it would have to be given a static
+// secret, which is the thing projected tokens exist to avoid.
+func TestTheAdmissionTokenCanComeFromAFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "token")
+	if err := os.WriteFile(path, []byte("  first-token\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	read, err := credentialSource("-admission-token", "", path, "SHOAL_ADMISSION_TOKEN")
+	if err != nil {
+		t.Fatal(err)
+	}
+	value, err := read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if value != "first-token" {
+		t.Fatalf("token = %q, want the trimmed file contents", value)
+	}
+
+	// Read per call, not captured. If the file were read once at startup the
+	// proxy would keep presenting the token that has since expired, which is
+	// the entire failure mode rotation introduces.
+	if err := os.WriteFile(path, []byte("rotated-token"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if value, err = read(); err != nil || value != "rotated-token" {
+		t.Fatalf("token = %q, %v; want the rotated value", value, err)
+	}
+
+	// An unreadable or empty file is an error at use time rather than a silent
+	// empty bearer token, which the workspace would reject as unauthenticated
+	// and the operator would read as a policy problem.
+	if err := os.WriteFile(path, []byte("   \n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = read(); err == nil {
+		t.Fatal("an empty token file was accepted")
+	}
+	absent, err := credentialSource(
+		"-admission-token", "", filepath.Join(t.TempDir(), "absent"),
+		"SHOAL_ADMISSION_TOKEN")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = absent(); err == nil {
+		t.Fatal("a missing token file was accepted")
+	}
+}
+
+// TestTwoTokenSourcesAreRefusedRatherThanRanked pins the refusal instead of a
+// precedence rule.
+//
+// Picking one silently makes the effective credential invisible: an operator
+// who adds a file while a stale env var is still in the manifest cannot tell
+// from the configuration which is being presented, and the symptom of the wrong
+// choice is an authentication failure naming neither source.
+//
+// The env flag ships with a non-empty default, so the default being present
+// cannot count as a second choice — otherwise the file form would be
+// unreachable without also blanking the env flag.
+func TestTwoTokenSourcesAreRefusedRatherThanRanked(t *testing.T) {
+	const envDefault = "SHOAL_ADMISSION_TOKEN"
+	if _, err := credentialSource(
+		"-admission-token", "OTHER_VAR", "/run/token", envDefault); err == nil {
+		t.Fatal("two explicitly chosen token sources were accepted")
+	}
+	if _, err := credentialSource(
+		"-admission-token", envDefault, "/run/token", envDefault); err != nil {
+		t.Fatalf("the file form is unreachable with the env flag at its default: %v", err)
+	}
+	if _, err := credentialSource("-admission-token", "", "", envDefault); err == nil {
+		t.Fatal("no token source at all was accepted")
+	}
+	// And the refusal is reached through run(), not only in isolation.
+	detail := refusal(t, proxyArgs(
+		"-admission-token-env", "OTHER_VAR", "-admission-token-file", "/run/token"))
+	if !strings.Contains(detail, "mutually exclusive") {
+		t.Fatalf("run() did not apply the rule: %s", detail)
 	}
 }

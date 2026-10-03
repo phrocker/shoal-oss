@@ -269,6 +269,14 @@ func (p *proxy) relay(
 // A streamed response is reported once, after it finishes, which is why this
 // is the only place a forwarded call reports: reporting before the stream ends
 // would record an outcome the proxy had not yet observed.
+//
+// The report is bounded by minimumReportWindow rather than by a timeout of its
+// own, because that constant is the margin validateDurations withholds from the
+// lease for exactly this call. A separate bound would be a second number
+// obliged to agree with the first, and it already did not: the report was
+// allowed ten seconds inside a window reserved as five, so a report that took
+// the time it was given outlived the lease it was closing. One number cannot
+// drift from itself.
 func (p *proxy) reportOutcome(
 	ctx context.Context,
 	token admissionToken,
@@ -281,7 +289,7 @@ func (p *proxy) reportOutcome(
 		"upstream_status": status,
 		"response_bytes":  transferred,
 	})
-	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, minimumReportWindow)
 	defer cancel()
 	if err := p.admission.report(
 		ctx, token, identity, outcome, failure, p.clock()); err != nil {
@@ -295,7 +303,7 @@ func (p *proxy) reportOutcome(
 func (p *proxy) reportFailure(
 	ctx context.Context, token admissionToken, identity callerIdentity, code string,
 ) {
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), minimumReportWindow)
 	defer cancel()
 	if err := p.admission.report(
 		ctx, token, identity, nil, code, p.clock()); err != nil {

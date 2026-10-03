@@ -460,3 +460,73 @@ func assertRefusalNamesNothing(t *testing.T, body string) {
 		}
 	}
 }
+
+// deadlineRecorder records how long each outbound admission call was given.
+//
+// The bound cannot be observed from the plane's side: HTTP carries no client
+// deadline, so a handler sees only its own connection's context. It has to be
+// read from the outbound request before it leaves.
+type deadlineRecorder struct {
+	inner    http.RoundTripper
+	headroom map[string]time.Duration
+}
+
+func (d *deadlineRecorder) RoundTrip(request *http.Request) (*http.Response, error) {
+	key := "request"
+	if strings.HasSuffix(request.URL.Path, "/report") {
+		key = "report"
+	}
+	if deadline, ok := request.Context().Deadline(); ok {
+		d.headroom[key] = time.Until(deadline)
+	} else {
+		d.headroom[key] = -1
+	}
+	return d.inner.RoundTrip(request)
+}
+
+// TestTheReportFitsInTheWindowReservedForIt closes the gap between the two
+// numbers that have to agree.
+//
+// validateDurations withholds minimumReportWindow from the lease so the report
+// can still be made after the upstream call returns. The report then has to fit
+// in that margin — and it did not: it was given its own ten-second timeout
+// against a window reserved as five, so a report that used the time it was
+// granted outlived the lease it was closing. The failure needs an upstream call
+// that runs to the edge of the timeout to appear in production, which is why no
+// existing test saw it.
+//
+// Asserting an upper bound rather than an exact value is deliberate: a report
+// bounded more tightly than the reservation is still correct, one bounded
+// looser is the bug. The lower bound is here too, because an unbounded report
+// hangs the goroutine that should be closing the grant.
+func TestTheReportFitsInTheWindowReservedForIt(t *testing.T) {
+	plane := newFakePlane(t, outcomeAllowed, nil)
+	upstream := newFakeUpstream(t)
+	governed, _ := newTestProxy(t, plane, upstream)
+	recorder := &deadlineRecorder{
+		inner:    plane.server.Client().Transport,
+		headroom: map[string]time.Duration{},
+	}
+	governed.admission.http = &http.Client{Transport: recorder}
+
+	if response := post(t, governed, plainCall); response.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", response.Code, response.Body.String())
+	}
+	if len(plane.reports) != 1 {
+		t.Fatalf("reports = %d, want 1", len(plane.reports))
+	}
+
+	headroom, seen := recorder.headroom["report"]
+	if !seen {
+		t.Fatal("the report never went out, so its bound was never exercised")
+	}
+	if headroom <= 0 {
+		t.Fatal("the report carried no deadline; an unbounded report can " +
+			"outlive the lease it closes and never return")
+	}
+	if headroom > minimumReportWindow {
+		t.Fatalf("the report was given %s inside a window reserved as %s, so a "+
+			"report that takes the time it is granted expires the lease",
+			headroom, minimumReportWindow)
+	}
+}

@@ -86,12 +86,24 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 	admissionTokenEnv := flags.String("admission-token-env", "SHOAL_ADMISSION_TOKEN",
 		"Environment variable read at request time holding the bearer token "+
 			"this proxy presents to the workspace")
+	admissionTokenFile := flags.String("admission-token-file", "",
+		"File read at request time holding that bearer token, instead of an "+
+			"environment variable. This is the form a projected "+
+			"ServiceAccount token takes: the kubelet rewrites the file when it "+
+			"rotates the token and never updates an environment variable, so "+
+			"with only the env form a rotating token cannot be used at all. "+
+			"Mutually exclusive with -admission-token-env")
 	upstreamBaseURL := flags.String("upstream-base-url", "",
 		"The real OpenAI-compatible provider this proxy forwards to")
 	upstreamKeyEnv := flags.String("upstream-api-key-env", "SHOAL_UPSTREAM_API_KEY",
 		"Environment variable read at request time holding the upstream credential")
 	agentID := flags.String("agent-id", "",
-		"Registered descriptor this proxy admits against")
+		"Registered descriptor this proxy admits against, as unpadded "+
+			"base64url. This is the encoded ID, not a descriptor's display "+
+			"name: the workspace decodes the field, and a readable name "+
+			"either fails to decode or decodes to bytes nothing was "+
+			"registered under, which denies every call as a descriptor that "+
+			"does not exist")
 	agentGeneration := flags.Int64("agent-generation", 0,
 		"Generation of the registered descriptor; must be positive")
 	capability := flags.String("capability", "",
@@ -104,10 +116,11 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 		"Scope policy ID, unpadded base64url")
 	lease := flags.Duration("lease", defaultLease,
 		"Admission lease. A call must be reported within it or the grant shows "+
-			"as outstanding. The fleet refuses a lease above its claim ceiling "+
-			"rather than shortening it, so a value over that denies every "+
-			"call, and it must leave room for the upstream call plus the "+
-			"report after it")
+			"as outstanding. The fleet refuses a lease above "+
+			fleet.MaxActionClaimTTL.String()+" rather than shortening it, so a "+
+			"larger value denies every call instead of degrading, and it must "+
+			"exceed -request-timeout by at least "+
+			minimumReportWindow.String()+" so the call can still be reported")
 	requestTimeout := flags.Duration("request-timeout", defaultRequestTimeout,
 		"Upstream request timeout. It must fit inside the lease with the "+
 			"report window to spare")
@@ -123,6 +136,25 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 	}
 	if strings.TrimSpace(*agentID) == "" || *agentGeneration <= 0 {
 		return errors.New("-agent-id and a positive -agent-generation are required")
+	}
+	// Checked here and still sent verbatim: the workspace wants the encoded
+	// form, so this validates rather than converts. Without it a misencoded
+	// agent ID surfaces as a descriptor that does not exist, once per call,
+	// which names the wrong cause at the wrong time.
+	//
+	// It catches the encoding mistakes and not the whole class. A shoal.ID is
+	// opaque and variable-length, so there is no width to check and a name that
+	// happens to decode — "gateway" is five valid bytes — is indistinguishable
+	// here from a real ID. Only the workspace can tell those apart, and this
+	// proxy does not consult it until the first call (#390).
+	if _, err := decodeID("-agent-id", *agentID); err != nil {
+		return err
+	}
+	admissionCredential, err := credentialSource(
+		"-admission-token", *admissionTokenEnv, *admissionTokenFile,
+		flags.Lookup("admission-token-env").DefValue)
+	if err != nil {
+		return err
 	}
 	if strings.TrimSpace(*capability) == "" || strings.TrimSpace(*action) == "" {
 		return errors.New("-capability and -action are required")
@@ -152,7 +184,7 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 	admission := &admissionClient{
 		base:       base,
 		http:       &http.Client{Timeout: *requestTimeout},
-		credential: credentialFromEnv(*admissionTokenEnv),
+		credential: admissionCredential,
 		agentID:    *agentID, agentGeneration: *agentGeneration,
 		capability: *capability, action: *action,
 		sourceID: source, policyID: policy, lease: *lease,
@@ -226,6 +258,49 @@ func credentialFromEnv(name string) func() (string, error) {
 		}
 		return value, nil
 	}
+}
+
+// credentialFromFile reads a secret at use time, like credentialFromEnv.
+//
+// Reading per request is what makes a rotating token work: the kubelet replaces
+// the file in place, so a value captured at start would be the one that expired.
+func credentialFromFile(path string) func() (string, error) {
+	return func() (string, error) {
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			return "", fmt.Errorf("%s is unreadable: %w", path, err)
+		}
+		value := strings.TrimSpace(string(raw))
+		if value == "" {
+			return "", fmt.Errorf("%s is empty", path)
+		}
+		return value, nil
+	}
+}
+
+// credentialSource picks between the env and file forms, and refuses both.
+//
+// Taking one silently when both are set would make the effective credential
+// invisible: an operator who adds a file while a stale env var is still in the
+// manifest cannot tell from the configuration which one is being presented, and
+// the symptom of the wrong answer is an authentication failure that names
+// neither. The env flag has a non-empty default, so "both set" means the
+// default was left in place rather than that two were chosen deliberately —
+// which is why the default is compared rather than emptiness.
+func credentialSource(
+	name, fromEnv, fromFile, envDefault string,
+) (func() (string, error), error) {
+	env, file := strings.TrimSpace(fromEnv), strings.TrimSpace(fromFile)
+	if file == "" {
+		if env == "" {
+			return nil, fmt.Errorf("%s-env or %s-file is required", name, name)
+		}
+		return credentialFromEnv(env), nil
+	}
+	if env != "" && env != envDefault {
+		return nil, fmt.Errorf("%s-env and %s-file are mutually exclusive", name, name)
+	}
+	return credentialFromFile(file), nil
 }
 
 // authorities resolves the host allow-list, falling back to the bound address.
