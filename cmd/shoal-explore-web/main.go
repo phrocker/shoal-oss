@@ -36,6 +36,7 @@ import (
 	"github.com/phrocker/shoal-oss/internal/explorercoord"
 	"github.com/phrocker/shoal-oss/internal/explorerfleet"
 	"github.com/phrocker/shoal-oss/internal/explorerfleetevents"
+	"github.com/phrocker/shoal-oss/internal/healthsurface"
 	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/explorer/authorized"
@@ -756,15 +757,15 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 	// construction finished. A bind failure is fatal rather than degraded: an
 	// operator who asked for a probe surface and silently did not get one would
 	// read every probe failure as the workspace being down.
-	health := (*healthServer)(nil)
-	state := &healthState{}
+	health := (*healthsurface.Server)(nil)
+	state := &healthsurface.State{}
 	if address := strings.TrimSpace(*healthAddress); address != "" {
-		health, err = startHealthServer(address, state)
+		health, err = healthsurface.Start(address, state)
 		if err != nil {
 			listener.Close()
 			return fmt.Errorf("listen on %s: %w", address, err)
 		}
-		fmt.Fprintf(output, "Health surface listening at http://%s\n", health.address())
+		fmt.Fprintf(output, "Health surface listening at http://%s\n", health.Address())
 	}
 	shutdownDone := make(chan error, 1)
 	go func() {
@@ -774,9 +775,9 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 		// endpoints controller stops routing new ones.
 		shutdown, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		shutdownDone <- drain(shutdown, state, server, health)
+		shutdownDone <- healthsurface.Drain(shutdown, state, server, health)
 	}()
-	state.markReady()
+	state.MarkReady()
 	err = server.Serve(listener)
 	if errors.Is(err, http.ErrServerClosed) {
 		return <-shutdownDone
@@ -786,7 +787,7 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 	// it past the returning process.
 	shutdown, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	_ = drain(shutdown, state, server, health)
+	_ = healthsurface.Drain(shutdown, state, server, health)
 	return err
 }
 
