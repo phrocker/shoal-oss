@@ -109,7 +109,9 @@ be recorded after the deadline; successful results cannot. Recording historical
 failure grants no right to retrieve it after authorization expires. Times, device
 and provider identity are executor assertions until the service attests them.
 
-These records are not durable receipts. The store must still commit one result per
+These contracts alone are not durable receipts. The first internal persistence
+slice is described in [decision receipts](decision-receipts.md); authenticated
+service composition remains pending. The store/service must commit one result per
 reserved request, authenticate outcomes, recover uncertain requests and enforce
 current access. No predictor is executed by these constructors, and valid output
 does not authorize exclusion or operational permission.
