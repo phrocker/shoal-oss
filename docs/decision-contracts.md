@@ -102,7 +102,8 @@ ranking margins and calibrated probability must not be substituted for each othe
 
 Abstention carries a reason and no prediction. Unknown or unsupported subjects and
 truncated input cannot receive scored answers in this first conservative contract.
-This does not yet implement the task's broader evidence-eligibility policy.
+Task-specific policy is evaluated separately through `EvidenceEligibility`
+before inference and again when producing an inspection ranking.
 Whole-request failure/abstention carries no partial results. A timeout/failure can
 be recorded after the deadline; successful results cannot. Recording historical
 failure grants no right to retrieve it after authorization expires. Times, device
@@ -113,10 +114,62 @@ reserved request, authenticate outcomes, recover uncertain requests and enforce
 current access. No predictor is executed by these constructors, and valid output
 does not authorize exclusion or operational permission.
 
+## Evidence eligibility and inspection ranking
+
+`EvidencePolicy` pins a maximum observation age, allowed source roles and author
+controls, authority-policy references, an optional attestation-reference requirement,
+and coverage requirements with exact measurement IDs, units and methods. Register
+its content-derived ID as the task's `EvidencePolicyID`.
+
+`NewEvidenceEligibility(request, policy)` evaluates the picture before inference.
+Freshness is measured from source observation time at the request timestamp, with
+an inclusive age boundary. Neither a fresh receipt nor a recurring snapshot
+refreshes an old observation. Required coverage rejects missing measurements,
+unknown/zero denominators, changed measurement meanings and insufficient counts.
+Count comparisons use exact rational arithmetic against the recorded decimal
+threshold; very large incomplete counts cannot round up to 100 percent.
+
+All sources may affect the shared model input, so a stale or disallowed source
+anywhere in the picture prevents scoring across that picture. Subject dispositions
+are checked individually. An incomplete inventory can still support prioritizing
+supported subjects when the explicit policy permits its measured gaps. Eligibility
+preserves all subjects and records reasons instead of claiming missing evidence is
+safe. A service can use it to avoid inference on ineligible evidence.
+
+These are structural checks over pinned claims. An attestation reference is not a
+verified attestation, and an allowed authority-policy reference does not prove its
+origin. #403/#418 must resolve trusted registry policy, verify sources/attestations,
+and enforce current access before exposing eligibility or rankings. This package
+does not add provenance authenticity or a security admission decision.
+
+`RankingPlan` pins weighted questions, optional reversed directions and explicit
+priority values for nominal labels. Ordinal priorities follow task label order;
+proposition priorities use the native probability without claiming calibration.
+Weights are positive, bounded and normalized by their sum; relative-weight scaling
+avoids underflow when all weights are tiny. Choice mappings must cover exactly the
+task's labels. Register the plan ID as the task's `AggregationID`.
+
+`NewInspectionRanking(prediction, policy, plan)` validates those exact task bindings
+and recomputes eligibility. Any question abstention preserves ordinary inspection,
+even if the ranking plan does not use that question. The result includes **every
+picture subject**, including ones outside the prediction request:
+
+1. Unscored subjects appear first, ordered by subject ID, with explicit reasons.
+2. Scored subjects follow in descending weighted priority, tied by exact subject ID.
+
+A failure, abstention, unsupported disposition or omitted prediction never becomes
+a zero priority. Priority is an ordering score, not a probability of safety. No
+threshold, top-k cutoff or position permits exclusion. Entries do not duplicate
+source text or anchors: resolve them through the pinned authorized picture.
+Eligibility and ranking records have content identities and copy-isolated getters;
+recorded replay uses request time, not the current wall clock. Operational reuse
+must recheck freshness and authorization at the time of use.
+
 ## Remaining delivery
 
-#402 still needs ranking/aggregation semantics, full task-specific evidence
-eligibility and serving-adapter integration. #403 owns durable receipts,
+#402 now supplies task, picture, predictor, request/result, evidence-policy and
+ranking contracts. Serving-adapter integration and end-to-end conformance remain;
+no production classifier/API is wired by these constructors. #403 owns durable receipts,
 idempotency, attributed outcomes and authorization. #418 exposes those through
 an authenticated client/API slice. #405/#406 implement authorized training and
 release lifecycle; #419 enforces trust boundaries. The offline showcase remains

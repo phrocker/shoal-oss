@@ -382,8 +382,11 @@ func NewPredictionRecord(request DecisionRequest, c ResultConfig) (PredictionRec
 	}
 	return PredictionRecord{id, request, c}, nil
 }
-func (p PredictionRecord) ID() shoal.ID         { return p.id }
-func (p PredictionRecord) Config() ResultConfig { return cloneResult(p.config) }
+
+// Request returns the immutable request bound to this prediction.
+func (p PredictionRecord) Request() DecisionRequest { return p.request }
+func (p PredictionRecord) ID() shoal.ID             { return p.id }
+func (p PredictionRecord) Config() ResultConfig     { return cloneResult(p.config) }
 func (p PredictionRecord) Validate() error {
 	q, err := NewPredictionRecord(p.request, p.config)
 	if err != nil {
