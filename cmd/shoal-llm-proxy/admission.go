@@ -118,6 +118,18 @@ func (t *admissionToken) reportable(now time.Time) error {
 		if err != nil || len(decoded) == 0 {
 			return fmt.Errorf("token %s is not a usable identity", name)
 		}
+		// The byte bound the report endpoint applies, applied before the
+		// egress instead of after it. AdmissionToken.validate runs both IDs
+		// through validateOpaque, which refuses anything over
+		// fleet.MaxActionIDBytes — so an over-long ID is a grant that passes
+		// here, is spent on the upstream call, and can then never be reported.
+		// That is the exact outcome this function exists to prevent, and
+		// checking decodability without checking length left half of it open.
+		if len(decoded) > fleet.MaxActionIDBytes {
+			return fmt.Errorf(
+				"token %s exceeds the %d-byte bound the report endpoint applies",
+				name, fleet.MaxActionIDBytes)
+		}
 	}
 	if t.Version == 0 {
 		return errors.New("token version is invalid")

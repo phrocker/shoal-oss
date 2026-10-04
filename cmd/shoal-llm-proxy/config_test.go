@@ -18,10 +18,14 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"io"
+	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -179,6 +183,12 @@ func TestAnUnreportableTokenIsRefusedBeforeTheEgress(t *testing.T) {
 		{"expiring inside the report window", &admissionToken{
 			ActionID: "YWN0aW9u", TokenID: "dG9rZW4", Version: 1,
 			ExpiresAt: now.Add(minimumReportWindow / 2)}},
+		// The byte bound is covered separately, in
+		// TestAnOversizedActionIDIsRefusedBeforeTheEgress. Probes for it were
+		// here first and could not fail: this table disables token echo, so
+		// every token in it is already refused for naming a different claim,
+		// and the bound was never what the assertion measured.
+		//
 		// The shape the check was written to let through. It read "if an
 		// expiry is set and it is too close", so a plane answering without one
 		// produced a token this function called reportable while nothing could
@@ -906,5 +916,241 @@ func TestFleetNamesAreValidatedAtStartup(t *testing.T) {
 		if err := fleetName("-action", probe); err != nil {
 			t.Fatalf("%q was refused: %v", probe, err)
 		}
+	}
+}
+
+// TestTheAgentIDSentIsTheOneValidated closes a gap between a check and the
+// value it checked.
+//
+// decodeID trims before decoding, so " YWdlbnQ " validated cleanly and was then
+// stored and sent verbatim — and the workspace's decoder does not trim, so it
+// failed to decode there. Static configuration that passed startup produced a
+// 400 on every call, which this client reports as a retryable 503.
+//
+// The bug is the divergence: a value validated in one form and transmitted in
+// another. So the assertion has to be on what reaches the plane, not on whether
+// startup accepted it — my first version of this test checked that run() got as
+// far as binding a listener, which the untrimmed value also did. It could not
+// have failed for the thing it is named for.
+func TestTheAgentIDSentIsTheOneValidated(t *testing.T) {
+	// The premise, stated independently: the plane's decoder does not trim.
+	if _, err := base64.RawURLEncoding.DecodeString(" YWdlbnQ "); err == nil {
+		t.Fatal("the premise no longer holds: an untrimmed ID now decodes")
+	}
+
+	plane := newFakePlane(t, outcomeAllowed, nil)
+	upstream := newFakeUpstream(t)
+	// run() reads this at request time, and without it the admission POST
+	// fails as unauthenticated before the agent ID is ever sent — which is
+	// what the first run of this test actually measured.
+	t.Setenv("SHOAL_ADMISSION_TOKEN", "plane-token")
+
+	restore := listenTCP
+	t.Cleanup(func() { listenTCP = restore })
+	bound := make(chan string, 1)
+	listenTCP = func(network, address string) (net.Listener, error) {
+		listener, err := restore(network, address)
+		if err == nil {
+			bound <- listener.Addr().String()
+		}
+		return listener, err
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- run(ctx, []string{
+			"-listen", "127.0.0.1:0",
+			"-admission-url", plane.server.URL,
+			"-upstream-base-url", upstream.server.URL,
+			"-agent-id", " YWdlbnQ ",
+			"-agent-generation", "1",
+			"-capability", "llm.proxy",
+			"-action", "complete",
+			"-source-id", "c291cmNl",
+			"-policy-id", "cG9saWN5",
+			"-lease", "70s",
+			"-request-timeout", "60s",
+		}, io.Discard)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		<-done
+	})
+
+	var address string
+	select {
+	case address = <-bound:
+	case err := <-done:
+		t.Fatalf("the proxy exited before binding: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("the proxy never bound a listener")
+	}
+
+	// The default allow-list is the resolved listen address, which is the
+	// authority this request carries.
+	request, err := http.NewRequest(http.MethodPost,
+		"http://"+address+"/v1/chat/completions", strings.NewReader(plainCall))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Host = address
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(response.Body)
+		t.Fatalf("status = %d: %s", response.StatusCode, body)
+	}
+
+	if len(plane.requests) != 1 {
+		t.Fatalf("admissions = %d, want 1", len(plane.requests))
+	}
+	sent := plane.requests[0].AgentID
+	if sent != "YWdlbnQ" {
+		t.Fatalf("agent_id on the wire = %q, want the trimmed form that was "+
+			"validated: the plane's decoder does not trim, so this is a 400 on "+
+			"every call", sent)
+	}
+	if _, err = base64.RawURLEncoding.DecodeString(sent); err != nil {
+		t.Fatalf("the agent ID sent is not decodable by the plane: %v", err)
+	}
+}
+
+// TestReadinessIsNeverFlippedBackAfterShutdownBegins covers a startup race.
+//
+// MarkReady ran after the shutdown watcher was launched. A context already
+// cancelled — or cancelled during startup — lets the watcher run Drain and mark
+// the surface draining first, after which MarkReady flips readiness back to
+// true while the listener is already closing. A probe then gets a ready answer
+// from a process that is shutting down, which is the inverse of what the health
+// surface exists for.
+//
+// Marking ready before the watcher starts means every cancellation transition
+// happens after it and wins.
+func TestReadinessIsNeverFlippedBackAfterShutdownBegins(t *testing.T) {
+	plane := newFakePlane(t, outcomeAllowed, nil)
+	upstream := newFakeUpstream(t)
+	t.Setenv("SHOAL_ADMISSION_TOKEN", "plane-token")
+
+	restoreListen, restoreDrain := listenTCP, drain
+	t.Cleanup(func() { listenTCP, drain = restoreListen, restoreDrain })
+
+	// The invariant is about ordering, so it is observed at the moment the
+	// drain begins: readiness must already have been marked.
+	//
+	// Being exact about what this does and does not prove, because the
+	// alternative is pretending. Restoring the bug — MarkReady after the
+	// goroutine rather than before — does NOT fail this test, and 400
+	// iterations at GOMAXPROCS=8 did not trip it either. The window is one
+	// statement wide with no yield point in it, so the main goroutine
+	// effectively always reaches MarkReady before the watcher can enter the
+	// drain, even with the context already cancelled.
+	//
+	// So the fix is kept on correctness-by-construction grounds: with MarkReady
+	// before the goroutine exists, program order guarantees the ordering and no
+	// scheduling outcome can violate it. This test pins the invariant and would
+	// catch a larger reordering; it is not evidence that the narrow race was
+	// reachable, and it is recorded here as such rather than counted as a
+	// mutation caught.
+	var readyAtEntry []bool
+	drain = func(
+		ctx context.Context, state *healthsurface.State,
+		workspace healthsurface.GracefulServer, health *healthsurface.Server,
+	) error {
+		recorder := httptest.NewRecorder()
+		healthsurface.NewHandler(state).ServeHTTP(
+			recorder, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+		readyAtEntry = append(readyAtEntry, recorder.Code == http.StatusOK)
+		return restoreDrain(ctx, state, workspace, health)
+	}
+
+	// Cancelled before run() is called, so the watcher observes a closed
+	// channel immediately — the sharpest form of the race.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err := run(ctx, []string{
+		"-listen", "127.0.0.1:0",
+		"-admission-url", plane.server.URL,
+		"-upstream-base-url", upstream.server.URL,
+		"-agent-id", "YWdlbnQ", "-agent-generation", "1",
+		"-capability", "llm.proxy", "-action", "complete",
+		"-source-id", "c291cmNl", "-policy-id", "cG9saWN5",
+		"-lease", "70s", "-request-timeout", "60s",
+	}, io.Discard)
+	if err != nil {
+		t.Fatalf("run returned %v", err)
+	}
+	if len(readyAtEntry) == 0 {
+		t.Fatal("the drain never ran, so the ordering was never exercised")
+	}
+	for _, ready := range readyAtEntry {
+		if !ready {
+			t.Fatal("the drain began before readiness was marked, so the " +
+				"MarkReady that follows flips a draining surface back to " +
+				"ready while the listener is already closing")
+		}
+	}
+}
+
+// TestAnOversizedActionIDIsRefusedBeforeTheEgress covers the byte bound the
+// report endpoint applies, before the call rather than after it.
+//
+// AdmissionToken.validate runs both IDs through validateOpaque, which refuses
+// anything over fleet.MaxActionIDBytes. So an over-long ID is a grant that
+// passes reportable, is spent on the upstream call, and can then never be
+// reported — the exact outcome reportable exists to prevent. Checking
+// decodability without checking length left half of its purpose open.
+//
+// Token echo stays on here, which is the whole reason this is a separate test.
+// With echo off the grant is refused for naming a different claim and the bound
+// is never reached, so probes placed in the unreportable-token table could not
+// fail for the thing they were named for.
+//
+// Only the action ID is probed, and that is a statement about reachability
+// rather than an omission. The token ID is the one this proxy generated — 16
+// bytes from newCallerIdentity — and the echo check requires the response to
+// carry it back unchanged, so an over-long token ID cannot survive to reach the
+// bound. The loop checks both because the cost is nothing and the guarantee
+// then does not depend on two other rules holding.
+func TestAnOversizedActionIDIsRefusedBeforeTheEgress(t *testing.T) {
+	plane := newFakePlane(t, outcomeAllowed, nil)
+	upstream := newFakeUpstream(t)
+	governed, _ := newTestProxy(t, plane, upstream)
+	plane.token.ActionID = base64.RawURLEncoding.EncodeToString(
+		bytes.Repeat([]byte("a"), fleet.MaxActionIDBytes+1))
+
+	recorder := post(t, governed, plainCall)
+	if upstream.calls != 0 {
+		t.Fatal("the call was forwarded under a grant the report endpoint " +
+			"will refuse, which is an unreportable grant by construction")
+	}
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", recorder.Code)
+	}
+
+	// Exactly at the bound is accepted, or this refuses valid grants.
+	plane.token.ActionID = base64.RawURLEncoding.EncodeToString(
+		bytes.Repeat([]byte("a"), fleet.MaxActionIDBytes))
+	if recorder = post(t, governed, plainCall); recorder.Code != http.StatusOK {
+		t.Fatalf("an action ID exactly at the bound was refused: %d %s",
+			recorder.Code, recorder.Body.String())
+	}
+
+	// And the proxy's own token ID is well inside the bound, which is what
+	// makes the token-ID half of the loop unreachable rather than untested.
+	identity, err := newCallerIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := base64.RawURLEncoding.DecodeString(identity.TokenID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(decoded) > fleet.MaxActionIDBytes {
+		t.Fatalf("the proxy generates a token ID of %d bytes, over the bound",
+			len(decoded))
 	}
 }

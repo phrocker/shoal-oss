@@ -178,6 +178,21 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 	// happens to decode — "gateway" is five valid bytes — is indistinguishable
 	// here from a real ID. Only the workspace can tell those apart, and this
 	// proxy does not consult it until the first call (#390).
+	// Validated and normalized together, because the two must not diverge.
+	//
+	// decodeID trims before decoding, so " YWdlbnQ " validated cleanly here
+	// and was then stored and sent verbatim — and the workspace's decoder does
+	// not trim, so it failed to decode there. Static configuration that passed
+	// startup produced a 400 on every call, reported to the caller as a
+	// retryable 503. The flag's value is replaced with the form that was
+	// actually checked.
+	//
+	// This normalizes where -capability and -action refuse, and the difference
+	// is deliberate: whitespace in a fleet name is invalid at the plane and the
+	// operator needs to know, while whitespace around an opaque base64url blob
+	// is transport noise that the local decoder already ignores. What is not
+	// defensible is validating one form and sending another.
+	*agentID = strings.TrimSpace(*agentID)
 	if _, err := decodeID("-agent-id", *agentID); err != nil {
 		return err
 	}
@@ -315,6 +330,15 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 	// it will admit. The container's terminationGracePeriodSeconds must exceed
 	// this, or the kubelet sends SIGKILL and the strandings come back.
 	drainWindow := *lease
+	// Ready before the watcher starts, not after it.
+	//
+	// The watcher can observe an already-cancelled context, run Drain, and mark
+	// the surface draining before this line executes — after which MarkReady
+	// flips readiness back to true while the listener is already closing. A
+	// probe then gets a ready answer from a process that is shutting down,
+	// which is the inverse of what the health surface exists for. Marking ready
+	// first means every cancellation transition happens after it and wins.
+	state.MarkReady()
 	shutdownDone := make(chan error, 1)
 	go func() {
 		<-ctx.Done()
@@ -322,7 +346,6 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 		defer cancel()
 		shutdownDone <- drain(shutdown, state, server, health)
 	}()
-	state.MarkReady()
 	err = server.Serve(listener)
 	if errors.Is(err, http.ErrServerClosed) {
 		return <-shutdownDone
