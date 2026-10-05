@@ -22,8 +22,10 @@ package decisionstore
 import (
 	"context"
 	"errors"
+	"io/fs"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -556,5 +558,207 @@ func TestIndeterminateReservationNeverGrantsUnconfirmedOwnership(t *testing.T) {
 	replay, err := s.Reserve(ctx, testScope, key, request, time.Minute)
 	if err != nil || replay.Claim != nil || replay.Receipt.State != Pending {
 		t.Fatal("ambiguous pending reservation replaced:", err)
+	}
+}
+
+type delayedCAS struct {
+	CAS
+	afterRead  func()
+	afterWrite func()
+}
+
+func (d delayedCAS) ReadExact(ctx context.Context, c []allocator.Coordinate) ([]allocator.Cell, error) {
+	cells, err := d.CAS.ReadExact(ctx, c)
+	if d.afterRead != nil {
+		d.afterRead()
+	}
+	return cells, err
+}
+func (d delayedCAS) CompareAndMutate(ctx context.Context, m allocator.Mutation) (allocator.Status, error) {
+	status, err := d.CAS.CompareAndMutate(ctx, m)
+	if d.afterWrite != nil {
+		d.afterWrite()
+	}
+	return status, err
+}
+func TestReservationLatencyCannotGrantExpiredOwnership(t *testing.T) {
+	for _, mode := range []string{"read crosses deadline", "write crosses deadline", "write crosses lease"} {
+		t.Run(mode, func(t *testing.T) {
+			clock := now
+			eng, reader, backend := openStore(t, t.TempDir(), true, func() time.Time { return clock })
+			defer eng.Close()
+			delayed := delayedCAS{CAS: backend}
+			lease := 2 * time.Minute
+			switch mode {
+			case "read crosses deadline":
+				delayed.afterRead = func() { clock = now.Add(time.Minute) }
+			case "write crosses deadline":
+				delayed.afterWrite = func() { clock = now.Add(time.Minute) }
+			case "write crosses lease":
+				lease = time.Second
+				delayed.afterWrite = func() { clock = now.Add(time.Second) }
+			}
+			s, err := New(delayed, nil, func() time.Time { return clock })
+			if err != nil {
+				t.Fatal(err)
+			}
+			request, _ := requestFixture(t)
+			key := []byte(mode)
+			reservation, err := s.Reserve(context.Background(), testScope, key, request, lease)
+			if !errors.Is(err, ErrExpired) || reservation.Claim != nil {
+				t.Fatalf("expired ownership: %#v %v", reservation, err)
+			}
+			stored, err := reader.Get(context.Background(), testScope, key, request)
+			if mode == "read crosses deadline" {
+				if !errors.Is(err, ErrNotFound) {
+					t.Fatal("expired request written:", err)
+				}
+			} else if err != nil || stored.State != Pending {
+				t.Fatal("durable pending state lost:", err)
+			}
+		})
+	}
+}
+func TestNewSuccessAfterDeadlineRejected(t *testing.T) {
+	clock := now
+	ctx := context.Background()
+	eng, s, backend := openStore(t, t.TempDir(), true, func() time.Time { return clock })
+	defer eng.Close()
+	request, result := requestFixture(t)
+	key := []byte("late-success")
+	reserved, err := s.Reserve(ctx, testScope, key, request, 2*time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	delayed, err := New(delayedCAS{CAS: backend, afterRead: func() { clock = now.Add(61 * time.Second) }}, nil, func() time.Time { return clock })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := delayed.Commit(ctx, testScope, key, request, *reserved.Claim, result); !errors.Is(err, ErrExpired) {
+		t.Fatal("late success admitted:", err)
+	}
+	stored, err := s.Get(ctx, testScope, key, request)
+	if err != nil || stored.State != Pending {
+		t.Fatal("rejection consumed claim")
+	}
+	result.Status = decision.Failed
+	result.Answers = nil
+	result.Reason = "timeout"
+	result.CompletedAt = clock
+	if _, err := s.Commit(ctx, testScope, key, request, *reserved.Claim, result); err != nil {
+		t.Fatal("late failure rejected:", err)
+	}
+}
+func TestReclaimedLeaseRejectsCompletionBeforeClaim(t *testing.T) {
+	clock := now
+	ctx := context.Background()
+	eng, s, _ := openStore(t, t.TempDir(), true, func() time.Time { return clock })
+	defer eng.Close()
+	request, result := requestFixture(t)
+	key := []byte("old-completion")
+	if _, err := s.Reserve(ctx, testScope, key, request, time.Second); err != nil {
+		t.Fatal(err)
+	}
+	clock = now.Add(2 * time.Second)
+	renewed, err := s.Reserve(ctx, testScope, key, request, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Commit(ctx, testScope, key, request, *renewed.Claim, result); err == nil {
+		t.Fatal("pre-claim result accepted")
+	}
+	result.CompletedAt = clock
+	if _, err := s.Commit(ctx, testScope, key, request, *renewed.Claim, result); err != nil {
+		t.Fatal("inclusive claim boundary rejected:", err)
+	}
+}
+func TestReceiptTransitionsAcrossImmutableFormats(t *testing.T) {
+	for _, format := range []engine.StorageFormat{engine.StorageFormatRFile, engine.StorageFormatParquet} {
+		t.Run(string(format), func(t *testing.T) {
+			ctx := context.Background()
+			clock := now
+			dir := t.TempDir()
+			eng, err := engine.Open(dir, engine.Options{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { eng.Close() }()
+			if err := eng.CreateTable(Table, engine.TableOptions{FileFormat: format}); err != nil {
+				t.Fatal(err)
+			}
+			bind := func() *Store {
+				backend, err := explorercoord.NewEngineStore(eng, Table)
+				if err != nil {
+					t.Fatal(err)
+				}
+				s, err := New(backend, nil, func() time.Time { return clock })
+				if err != nil {
+					t.Fatal(err)
+				}
+				return s
+			}
+			reopen := func() {
+				if err := eng.Close(); err != nil {
+					t.Fatal(err)
+				}
+				eng, err = engine.Open(dir, engine.Options{})
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			s := bind()
+			request, result := requestFixture(t)
+			key := []byte("format")
+			first, err := s.Reserve(ctx, testScope, key, request, time.Second)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := eng.Flush(Table); err != nil {
+				t.Fatal(err)
+			}
+			extension := ".rf"
+			if format == engine.StorageFormatParquet {
+				extension = ".parquet"
+			}
+			files := 0
+			if err := filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
+				if err != nil {
+					return err
+				}
+				if !d.IsDir() && filepath.Ext(path) == extension {
+					files++
+				}
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if files == 0 {
+				t.Fatalf("flush produced no %s files", extension)
+			}
+			reopen()
+			s = bind()
+			clock = now.Add(2 * time.Second)
+			renewed, err := s.Reserve(ctx, testScope, key, request, time.Minute)
+			if err != nil || renewed.Claim == nil {
+				t.Fatal("flushed reservation cannot be reclaimed:", err)
+			}
+			if _, err := s.Commit(ctx, testScope, key, request, *first.Claim, result); !errors.Is(err, ErrConflict) {
+				t.Fatal("old owner survived flush/reopen:", err)
+			}
+			result.CompletedAt = clock
+			receipt, err := s.Commit(ctx, testScope, key, request, *renewed.Claim, result)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := eng.Flush(Table); err != nil {
+				t.Fatal(err)
+			}
+			reopen()
+			s = bind()
+			replay, err := s.Reserve(ctx, testScope, key, request, time.Minute)
+			if err != nil || replay.Claim != nil || replay.Receipt.PredictionID != receipt.PredictionID {
+				t.Fatal("flushed committed replay failed:", err)
+			}
+		})
 	}
 }

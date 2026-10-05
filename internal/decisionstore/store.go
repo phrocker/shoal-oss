@@ -132,13 +132,14 @@ func (s *Store) Reserve(ctx context.Context, scope Scope, key []byte, request de
 	if lease <= 0 || lease > MaxLease {
 		return Reservation{}, invalid("lease outside bounds")
 	}
-	now, err := s.clock()
-	if err != nil {
-		return Reservation{}, err
-	}
 	current, old, err := s.read(ctx, coord, request)
 	if err != nil && !errors.Is(err, ErrNotFound) {
 		return Reservation{}, err
+	}
+	// Read latency must not extend a deadline or revive a stale clock sample.
+	now, clockErr := s.clock()
+	if clockErr != nil {
+		return Reservation{}, clockErr
 	}
 	if err == nil {
 		if current.Receipt.State == Committed || now.Before(current.Receipt.LeaseUntil) {
@@ -168,6 +169,15 @@ func (s *Store) Reserve(ctx context.Context, scope Scope, key []byte, request de
 	next := row{Receipt: Receipt{ID: string(coord.Row), Version: version, State: Pending, RequestID: request.ID(), TaskID: request.TaskID(), PictureID: request.PictureID(), PredictorID: request.PredictorID(), CreatedAt: created, UpdatedAt: now, LeaseUntil: now.Add(lease)}, Token: hex.EncodeToString(token)}
 	if err := s.write(ctx, coord, old, next); err != nil {
 		return Reservation{}, err
+	}
+	// The CAS may itself have stalled. Preserve the durable pending receipt,
+	// but never return permission to start inference on an already expired claim.
+	returnedAt, err := s.clock()
+	if err != nil {
+		return Reservation{Receipt: cloneReceipt(next.Receipt)}, err
+	}
+	if returnedAt.Before(now) || !returnedAt.Before(rc.Deadline) || !returnedAt.Before(next.Receipt.LeaseUntil) {
+		return Reservation{Receipt: cloneReceipt(next.Receipt)}, ErrExpired
 	}
 	return Reservation{Receipt: cloneReceipt(next.Receipt), Claim: &Claim{Version: version, Token: next.Token}}, nil
 }
@@ -221,6 +231,12 @@ func (s *Store) Commit(ctx context.Context, scope Scope, key []byte, request dec
 	}
 	if !now.Before(current.Receipt.LeaseUntil) {
 		return Receipt{}, ErrExpired
+	}
+	if result.Status != decision.Failed && now.After(request.Config().Deadline) {
+		return Receipt{}, ErrExpired
+	}
+	if result.CompletedAt.Before(current.Receipt.UpdatedAt) {
+		return Receipt{}, invalid("result completion predates active claim")
 	}
 	if result.CompletedAt.After(now) {
 		return Receipt{}, invalid("result completion is in the future")

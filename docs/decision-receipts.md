@@ -6,7 +6,9 @@ idempotency key. It uses the existing `allocator` exact-read/row-CAS interface;
 `internal/explorercoord.EngineStore` supplies the tested embedded implementation.
 The composition owner creates the dedicated `_shoal_decision_receipts` table and
 uses the engine's full WAL synchronization mode for acknowledged-write durability.
-The receipt table is control state, separate from source snapshots and Mosaic's
+Writes use the WAL/memtable and flush through the configured engine table format
+(default RFile, optionally Parquet). The receipt table is control state, separate
+from source snapshots and Mosaic's
 persisted record format.
 
 This is an internal trusted store, not an authenticated public service. The caller
@@ -43,7 +45,13 @@ them in the service.
 An expired request with an abandoned lease remains visibly pending; the store
 cannot infer whether work occurred. Recovery does not silently renew its deadline
 or invent a negative result. A still-live lease can record a timeout/failure after
-the request deadline, consistent with the prediction contract. Full service-level
+the request deadline. New successful/abstained commits are rejected after the
+request deadline even when they claim an earlier completion time; exact committed
+replays remain available. Completion cannot predate the active claim. Reservation
+time is sampled after reading storage, and a write that returns after expiry
+leaves its pending record visible without returning an executable claim. Commit
+expiry is checked before the conditional mutation; storage latency is not an
+atomic wall-clock predicate, while version fencing remains atomic. Full service-level
 outcome reconciliation remains a follow-up. Lease time uses the trusted store
 clock; the host must provide an appropriate clock and handle skew across workers.
 
@@ -70,7 +78,11 @@ Tests use the real embedded engine, including abrupt subprocess exit without
 `Engine.Close` for both pending and committed records. They cover competing
 reservations/results, normal reopen, lost acknowledgements, unavailable
 reconciliation reads, stale-worker fencing, domain separation, conflicting
-requests/results, malformed outputs, late failures and corrupt records.
+requests/results, malformed outputs, late failures and corrupt records. Explicit
+RFile and Parquet cases verify physical flush files, reopen pending state, reclaim
+leases, fence old workers, and replay committed results after another flush/reopen.
+Latency tests cover reads/writes crossing deadlines and lease expiry; completion
+cannot precede a reclaimed lease.
 
 Run:
 
