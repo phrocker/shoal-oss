@@ -306,29 +306,12 @@ func NewInspectionRanking(prediction PredictionRecord, policy EvidencePolicy, pl
 	if r.task.config.EvidencePolicyID != policy.id || r.task.config.AggregationID != plan.id {
 		return InspectionRanking{}, invalid("ranking policies do not match task")
 	}
+	if err := plan.ValidateTask(r.task); err != nil {
+		return InspectionRanking{}, err
+	}
 	questions := map[shoal.ID]Question{}
 	for _, q := range r.task.config.Questions {
 		questions[q.ID] = q
-	}
-	for _, term := range plan.config.Terms {
-		q, ok := questions[term.QuestionID]
-		if !ok {
-			return InspectionRanking{}, invalid("ranking question outside task")
-		}
-		if q.Kind != Choice {
-			if len(term.Labels) != 0 {
-				return InspectionRanking{}, invalid("only choice questions accept label priorities")
-			}
-			continue
-		}
-		if len(term.Labels) != len(q.Labels) {
-			return InspectionRanking{}, invalid("choice ranking requires all task labels")
-		}
-		for i, l := range term.Labels {
-			if l.Label != q.Labels[i] {
-				return InspectionRanking{}, invalid("choice ranking label mismatch")
-			}
-		}
 	}
 	eligibility, err := NewEvidenceEligibility(r, policy)
 	if err != nil {
@@ -593,5 +576,44 @@ func (e EvidenceEligibility) Validate() error {
 	if other.id != e.id {
 		return invalid("eligibility identity mismatch")
 	}
+	return nil
+}
+
+// ValidateTask checks the registered aggregation binding and label meanings.
+func (p RankingPlan) ValidateTask(task TaskSpec) error {
+	if err := p.Validate(); err != nil {
+		return err
+	}
+	if err := task.Validate(); err != nil {
+		return err
+	}
+	if task.config.AggregationID != p.id {
+		return invalid("ranking plan does not match task")
+	}
+	questions := map[shoal.ID]Question{}
+	for _, q := range task.config.Questions {
+		questions[q.ID] = q
+	}
+	for _, term := range p.config.Terms {
+		q, ok := questions[term.QuestionID]
+		if !ok {
+			return invalid("ranking question outside task")
+		}
+		if q.Kind != Choice {
+			if len(term.Labels) != 0 {
+				return invalid("only choice questions accept label priorities")
+			}
+			continue
+		}
+		if len(term.Labels) != len(q.Labels) {
+			return invalid("choice ranking requires all task labels")
+		}
+		for i, l := range term.Labels {
+			if l.Label != q.Labels[i] {
+				return invalid("choice ranking label mismatch")
+			}
+		}
+	}
+
 	return nil
 }
