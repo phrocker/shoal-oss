@@ -90,9 +90,23 @@ Regression tests exercise:
 - Graph paths, ontology versions and assertion origins: exact identity survives
   serialization; this test does not establish authoritative graph provenance.
 
-This was an internal implementation/adversarial test review, not an independent
-model attestation or a new classifier-quality experiment. No Copilot review or paid
-inference is required for this slice.
+The initial pre-publication pass was a self-review. Three subsequent independent
+reviewer-agent rounds were run on 2026-10-06, with fixes and regression checks
+between rounds:
+
+| Round | Reviewed code | Result | Fix |
+|---|---|---|---|
+| 1 | `023a8e3` | P2: conflicting/corrupt versus absent storage errors bypassed post-I/O authorization and disclosed state after revocation. | `daf43a9`: reauthorize before exposing storage-dependent errors; test both existing and absent rows. |
+| 2 | `daf43a9` | P2: that reauthorization could hide indeterminate persistence behind cancellation/deadline or authority availability errors. | `4f8d232`: preserve `ErrIndeterminate` and the cause for unresolved writes; confirmed denial still masks state. |
+| 3 | `4f8d232` | No actionable findings in a fresh review of the full change and both fixes. | No implementation changes required. |
+
+The round-2 regression test failed before the fix for cancellation, deadline and
+authority outage, then passed after it; each case confirms the bytes actually
+persisted and can be recovered through a later authorized load. The full targeted
+race suite and vet checks passed on `4f8d232`. Reviewers used static analysis and
+local tests; these rounds do not verify a production authority or constitute
+exhaustive fuzzing, model attestation or a new classifier-quality experiment. No
+Copilot review or paid classifier inference was requested.
 
 Validation:
 
