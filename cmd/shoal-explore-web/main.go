@@ -178,6 +178,30 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 			"executor needs the retrieve grant in addition to invoke, because "+
 			"the reasoning path authorizes retrieval on its own terms",
 	)
+	fleetExternalExecutorRefs := flags.String(
+		"fleet-external-executor-refs",
+		os.Getenv("SHOAL_FLEET_EXTERNAL_EXECUTOR_REFS"),
+		"Comma-separated executor references bound with a ceiling of "+
+			"{external} and no floor, so a descriptor may register an action "+
+			"whose consequences land outside Shoal. Each must also appear in "+
+			"-fleet-executor-refs. Nothing is executed in process against "+
+			"these references: they implement no action execution, so work "+
+			"reaches them over the dispatch queue and the completion report "+
+			"is what Shoal records. Empty by default, and no other setting "+
+			"produces this ceiling — a reference that is merely allowlisted "+
+			"still permits nothing at all",
+	)
+	fleetExternalEgressExecutorRefs := flags.String(
+		"fleet-external-egress-executor-refs",
+		os.Getenv("SHOAL_FLEET_EXTERNAL_EGRESS_EXECUTOR_REFS"),
+		"Comma-separated executor references bound with a ceiling of "+
+			"{egresses-content, external} and no floor, for an external "+
+			"operation that also transmits corpus content off this host. "+
+			"Otherwise identical to -fleet-external-executor-refs, which a "+
+			"reference may not also appear in: transmission is a separate "+
+			"declaration so that it is never acquired by naming a reference "+
+			"for mutation alone",
+	)
 	concealWithholding := flags.Bool(
 		"conceal-withholding",
 		concealWithholdingDefault(),
@@ -358,6 +382,19 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 	executors, err := newConfiguredFleetExecutors(
 		splitCommaList(*fleetExecutorRefs))
 	if err != nil {
+		return err
+	}
+	// Bound here rather than beside the ask executor further down, because
+	// this binding waits on nothing: it declares a ceiling and performs no
+	// work, so it needs neither workspace settings nor a chat provider. The
+	// collision check is the reason it must not be deferred — a reference
+	// named by both this and -fleet-ask-executor-ref has to be refused
+	// whether or not the ask binding ever gets as far as being attempted.
+	if err := bindExternalFleetEffects(executors, externalFleetEffectBindings{
+		mutating:     splitCommaList(*fleetExternalExecutorRefs),
+		transmitting: splitCommaList(*fleetExternalEgressExecutorRefs),
+		askReference: *fleetAskExecutorRef,
+	}); err != nil {
 		return err
 	}
 
