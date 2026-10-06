@@ -17,7 +17,7 @@ load-bearing and was unspecified in a way that produces undetectable duplicate
 effects. All four are read first, because everything after them is contingent on
 how they are resolved.
 
-- [Blocked: a worker cannot learn what to do](#blocked-a-worker-cannot-learn-what-to-do)
+- [Blocked: the action's input is never sent to the worker](#blocked-the-actions-input-is-never-sent-to-the-worker)
 - [Blocked: the claimant must be the enqueuer](#blocked-the-claimant-must-be-the-enqueuer)
 - [The second blocker: every heartbeat invalidates every claim](#the-second-blocker-every-heartbeat-invalidates-every-claim)
 - [The third blocker: no executor may perform an external effect today](#the-third-blocker-no-executor-may-perform-an-external-effect-today)
@@ -41,7 +41,7 @@ how they are resolved.
 - [Specified nowhere, and needed on day one](#specified-nowhere-and-needed-on-day-one)
 - [Open decisions](#open-decisions)
 
-## Blocked: a worker cannot learn what to do
+## Blocked: the action's input is never sent to the worker
 
 **The action's input is never sent to a remote worker.** This is more
 fundamental than the four blockers below and was found last, which is its own
@@ -55,7 +55,17 @@ and every one of the seven responses that returns an action goes through that
 encoder. `Input` appears on the *enqueue* wire only.
 
 So a gateway can pull an action, claim it under a fence, and complete it without
-ever learning which request to make. Three statements in this document assume
+ever receiving the parameters of the operation it is supposed to perform. This is
+a missing wire field and nothing else — the data is on the record, validated
+against the action's `InputSchema` at enqueue, and the read encoder drops it.
+
+Worth stating because the gap invites a wrong fix: nothing on the worker's side
+can recover it. A worker that reconstructed a plausible request from the
+capability name and the action ID would be fabricating the parameters of an
+irreversible external effect, which is the worst failure available here — a
+refusal is recoverable and a wrong payment is not. Inference has a place in this
+architecture, in deciding *whether* an effect may happen; it has none in deciding
+*what* the effect is. Three statements in this document assume
 otherwise — "the worker reads an action's input, not the corpus", "`record.Input`
 is immutable, but the *request* is not the input", and "the registered `Action`
 carries the declared effect set and an input schema".
