@@ -69,13 +69,15 @@ and commit, pending/committed retries, provider failures/substitution/timeouts,
 input digest substitution/copy isolation, changed grants, caller scope identity,
 indeterminate reservations and typed-nil dependencies.
 
-The production retained-artifact catalog and registered local-model adapter are
-**not supplied by this slice**. The constructor requires their trusted interfaces;
-the tests do not establish source provenance verification or durable artifact
-retention. There is no public path that can omit those dependencies and still
-invoke a model.
+The [durable artifact catalog](decision-artifacts.md) now supplies retention and
+rehydration with mandatory current authority checks. Its service integration test
+replays a committed result after engine restart without reinvoking a model. A
+production task/evidence authority, request-registration path and registered
+local-model adapter remain outstanding. Tests use a fixed test registry and fake
+provider; they do not establish real-world provenance verification. There is no
+public path that can omit the trusted dependencies and still invoke a model.
 
-Remaining #403 work is durable authorized artifact retention/rehydration, attributed
+Remaining #403 work is production authority/registration integration, attributed
 append-only outcomes, adjudication permissions and lifecycle/audit integration.
 #418 still needs HTTP/SDK schemas and host wiring. The code-only classifier and
 other models remain offline showcase implementations until their pinned provider
