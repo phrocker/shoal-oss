@@ -425,6 +425,10 @@ func NewPictureManifest(pack inference.ContextPack, config PictureConfig) (Pictu
 	}
 	return PictureManifest{id, pack, config}, nil
 }
+
+// ContextPack returns the immutable evidence pack pinned by this picture.
+func (p PictureManifest) ContextPack() inference.ContextPack { return p.pack }
+
 func (p PictureManifest) ID() shoal.ID                     { return p.id }
 func (p PictureManifest) ContextPackID() shoal.ID          { return p.pack.ID() }
 func (p PictureManifest) Snapshot() inference.SnapshotPin  { return p.pack.Snapshot() }
