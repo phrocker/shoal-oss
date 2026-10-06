@@ -8,6 +8,14 @@ Nothing here is implemented yet. It exists because two decisions in #391 were
 underdetermined in a way that would have produced the wrong deployment, and one
 of its scope items asks for a mechanism that does not exist.
 
+**Two of its claims turned out to be worse than underdetermined.** An adversarial
+pass against the dispatch code found that the topology this document draws is the
+one the authorization predicate forbids, and that the descriptor heartbeat
+invalidates the claims the design depends on. Both are read first, below, because
+everything after them is contingent on how they are resolved.
+
+- [Blocked: the claimant must be the enqueuer](#blocked-the-claimant-must-be-the-enqueuer)
+- [The second blocker: every heartbeat invalidates every claim](#the-second-blocker-every-heartbeat-invalidates-every-claim)
 - [The thing that makes this different](#the-thing-that-makes-this-different)
 - [Two paths, and why both](#two-paths-and-why-both)
 - [What the fence does not protect](#what-the-fence-does-not-protect)
@@ -19,6 +27,102 @@ of its scope items asks for a mechanism that does not exist.
 - [Kubernetes reference](#kubernetes-reference)
 - [Failure modes an operator will see](#failure-modes-an-operator-will-see)
 - [Open decisions](#open-decisions)
+
+## Blocked: the claimant must be the enqueuer
+
+**Path A as drawn cannot work against the current dispatch surface, and this is
+the first thing to read.**
+
+`Pull` filters every candidate through `sameActionPrincipal`
+(`pkg/explorer/fleet/dispatch_service.go:1209`), and `Claim` and `CompleteClaim`
+reach the store only through `authorizedCurrent`, which applies the same
+predicate (`:1329`). That predicate requires the caller's decision to match the
+record on **all four** of `Subject`, `Actor`, `ClientID` and the full
+`OnBehalfOf` chain, by equality (`:1361`).
+
+So the topology this document draws —
+
+```
+agent ──enqueue──▶ [dispatch queue] ──▶ gateway worker
+```
+
+— is precisely the one the code forbids. An agent enqueues with its own token;
+the record stores the agent's principal. The gateway pulls with its own token;
+every record fails the predicate and is **silently skipped**. The gateway
+receives an empty page, forever, with no error and nothing in the explorer's logs
+to explain it. An operator sees a ready worker, a growing queue, and zero
+effects.
+
+Delegation does not rescue it. `OnBehalfOf` is compared by whole-chain equality,
+not as a prefix or a subset, so a worker acting on behalf of the enqueuing agent
+has a strictly different chain and is refused for that reason. `OperationDelegate`
+exists for narrowing a *descriptor*, which is a different question.
+
+Three ways out, none free:
+
+1. **The gateway enqueues its own work.** Then the agent is not the enqueuer, the
+   diagram above is wrong, and `Subject`/`Actor` on the record identify the
+   gateway rather than whoever wanted the effect — losing exactly the attribution
+   the evidence record exists to carry.
+2. **The gateway presents a credential that mints the enqueuer's decision
+   tuple.** This is impersonation: one gateway would hold the identity of every
+   agent that can enqueue to it. It also collapses the per-surface isolation this
+   document argues for, since two gateways sharing a principal can claim each
+   other's actions.
+3. **Relax the predicate for claiming, deliberately and narrowly.** A third
+   prerequisite alongside #430: a way for a registered executor to claim work
+   enqueued by another principal without inheriting that principal's identity —
+   for instance by binding the claim to the record's `AgentID` and the
+   executor's own registration rather than to the enqueuer's decision.
+
+Option 3 is the only one that keeps both the attribution and the isolation, and
+it is a change to the authorization model rather than a new route. It needs the
+same care `sameActionPrincipal` already shows: that predicate is applied at four
+separate points and normalises absent and foreign to one `ObjectNotFound`, which
+is what stops it being an existence oracle. Loosening it is the sort of change
+that reintroduces one.
+
+Until this is settled the rest of this document describes a system that cannot be
+built, and the deployment model below is contingent on which option is chosen —
+options 1 and 2 change what a gateway's identity even means.
+
+## The second blocker: every heartbeat invalidates every claim
+
+`Heartbeat` sets `next.Generation = request.ExpectedGeneration + 1`
+(`pkg/explorer/fleet/service.go:275`) — **every** descriptor lease renewal moves
+the generation. A queued record pins `AgentGeneration` at enqueue
+(`pkg/explorer/fleet/dispatch_service.go:181`), and `resolveActionBinding`
+returns `ObjectNotFound` when `descriptor.Generation != generation` (`:1431`).
+
+The codebase states this itself, in `pkg/explorer/fleet/admission.go:457`:
+"blind to any record whose generation has moved, **which Heartbeat does on every
+lease renewal**."
+
+So a gateway that heartbeats for liveness — which this document called
+`claimLease` "the heartbeat interval", conflating two unrelated heartbeats —
+invalidates its own in-flight claim and its own queued actions. The worker
+performs the effect and then `complete` returns **not-found**, which is the most
+misleading answer the API can give: not `ErrClaimLost`, not an ambiguity, but a
+claim that the action does not exist. A worker following this document's ordering
+would reasonably conclude it had the wrong ID.
+
+The same mechanism makes a **rolling restart** strand an in-flight effect: a new
+replica registers, the generation moves, and the draining replica finishes its
+operation and cannot report it. The grace period this document sizes so carefully
+is correctly sized and completely ineffective.
+
+It also means two replicas cannot share one descriptor identity, because
+`Heartbeat` and `Register` are compare-and-swap on `(RegistrationKey,
+ExpectedGeneration)`: the replicas race, and each win invalidates the other's
+live claims. "`replicas: 2` is safe because of the fence" was a claim about the
+claim, and the descriptor is a second shared mutable object this document did not
+consider.
+
+Resolving this needs a decision recorded here, not discovered later: either the
+gateway never heartbeats and registers once with a long lease out-of-band
+(accepting that its descriptor liveness signal then means nothing), or the
+generation pin has to tolerate a descriptor that has only been heartbeated —
+which is a semantic change to what the pin is for.
 
 ## The thing that makes this different
 
@@ -179,6 +283,22 @@ Deadline - now  ≤  target.idempotencyRetention
 An action whose remaining deadline outlives the target's dedup window is refused
 at claim rather than performed under a guarantee that has silently lapsed. With
 no declared retention, the target is in the second row of the table above.
+
+**These two claim-time rules can be jointly unsatisfiable, and an
+implementation has to say so rather than let them interact silently.** Claiming
+requires both
+
+```
+operationTimeout + reportWindow < Deadline - now  ≤  target.idempotencyRetention
+```
+
+so a retention window shorter than `operationTimeout + reportWindow` leaves an
+empty interval and **nothing is ever claimable**. Two individually correct
+guards then refuse every action, and the operator sees a gateway that never
+takes work with no indication that the pair is the problem. Validate the
+relationship where the configuration is read, not per claim:
+`idempotencyRetention` must exceed `operationTimeout + reportWindow` whenever it
+is set at all.
 
 Where the target does not accept one, the design must not claim what it cannot
 deliver. `EffectPossible` is set at claim time for any external-mutating or
@@ -436,9 +556,20 @@ gateways:
     dispatch:
       url: ""                # the explorer's authenticated API
       tokenFile: ""
-      claimLease: 60s        # ≤ MaxActionClaimTTL; the heartbeat interval
-      renewAfter: 30s        # claimLease / 2
-      operationTimeout: 30s
+      claimLease: 60s        # ≤ MaxActionClaimTTL; the silence interval
+      renewAfter: 30s        # claimLease / 2; floor it well above the
+                             # round-trip plus clock skew, or a renewal can
+                             # arrive after the lease it meant to extend
+      # Deliberately longer than claimLease, because that is the case the
+      # design exists for. An operationTimeout inside the lease never needs a
+      # renewal, so a sketch showing 30s against a 60s lease would make #430
+      # look like decoration and let an implementation skip it.
+      operationTimeout: 10m
+      # Must exceed operationTimeout + reportWindow (not claimLease). A long
+      # operationTimeout therefore forces a long grace period, which slows
+      # rollouts — the same trade the proxy's lease makes, and the reason to
+      # keep operationTimeout as tight as the surface actually needs.
+      terminationGracePeriodSeconds: 615
     paths:
       queue: true            # Path A
       inline: false          # Path B, refused unless target.idempotent
@@ -467,6 +598,11 @@ Deployment properties, with the reasoning that is not obvious:
   This is a correction to an earlier draft, which carried over the proxy's
   "drain for the lease" rule without noticing that renewal changes what the
   lease means.
+
+  It has a cost worth stating where someone sizing a cluster will see it: a long
+  `operationTimeout` forces a long grace period, and a long grace period slows
+  every rollout of that gateway. The knob is `operationTimeout`, and it should be
+  as tight as the surface genuinely needs rather than set to a round number.
 - **No `PodDisruptionBudget` subtlety.** A worker holding no claim is freely
   evictable; one holding a claim finishes it inside the grace period.
 - **Readiness means "pulling".** Liveness means the process is up. A worker that
