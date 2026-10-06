@@ -354,20 +354,54 @@ type fleetAssertionWire struct {
 }
 
 type fleetActionWire struct {
-	ID                   string              `json:"id"`
-	Version              uint64              `json:"version"`
-	State                fleet.DispatchState `json:"state"`
-	AgentID              string              `json:"agent_id"`
-	AgentGeneration      int64               `json:"agent_generation"`
-	Capability           string              `json:"capability"`
-	Action               string              `json:"action"`
-	Output               json.RawMessage     `json:"output,omitempty"`
-	ErrorCode            string              `json:"error_code,omitempty"`
-	RequestID            string              `json:"request_id"`
-	CorrelationID        string              `json:"correlation_id,omitempty"`
-	Deadline             time.Time           `json:"deadline"`
-	CreatedAt            time.Time           `json:"created_at"`
-	UpdatedAt            time.Time           `json:"updated_at"`
+	ID              string              `json:"id"`
+	Version         uint64              `json:"version"`
+	State           fleet.DispatchState `json:"state"`
+	AgentID         string              `json:"agent_id"`
+	AgentGeneration int64               `json:"agent_generation"`
+	Capability      string              `json:"capability"`
+	Action          string              `json:"action"`
+	// Input is what the work actually is, and without it an out-of-process
+	// worker can pull an action, claim it under a fence and complete it without
+	// ever receiving the operation's parameters. It was absent from this wire
+	// while being present on the enqueue wire, validated against the action's
+	// InputSchema at enqueue, and stored on the record — so the data was
+	// correct and simply never read back out (#435).
+	//
+	// Nothing on a worker's side recovers this. A worker reconstructing a
+	// plausible request from the capability name would be fabricating the
+	// parameters of an effect Shoal cannot undo, which is why the gap had to be
+	// closed here rather than worked around there.
+	//
+	// Emitted unconditionally because every consumer of this wire is already
+	// scoped to the action's own principal: the six existing-action routes
+	// reach the store through authorizedCurrent, and Pull filters on
+	// sameActionPrincipal. The read-only team overview does not use this
+	// encoder and never reads Input, which is what makes that safe — see the
+	// test that pins it.
+	Input         json.RawMessage `json:"input,omitempty"`
+	Output        json.RawMessage `json:"output,omitempty"`
+	ErrorCode     string          `json:"error_code,omitempty"`
+	RequestID     string          `json:"request_id"`
+	CorrelationID string          `json:"correlation_id,omitempty"`
+	Deadline      time.Time       `json:"deadline"`
+	CreatedAt     time.Time       `json:"created_at"`
+	UpdatedAt     time.Time       `json:"updated_at"`
+	// ExecutorKey is the idempotency key an in-process executor already
+	// receives (dispatch_service.go hands it over as IdempotencyKey), derived
+	// at enqueue as a length-prefixed digest over a domain tag, the action ID
+	// and the caller's idempotency key. An out-of-process worker performing an
+	// irreversible effect needs exactly that value for exactly that purpose: it
+	// is the stable identity that lets a target deduplicate a re-claim after a
+	// lease lapse.
+	//
+	// Exposing it is strictly better than having each worker invent a key. A
+	// hand-written digest over the same inputs is easy to get subtly wrong —
+	// omitting the length prefixes makes it non-injective, so a caller able to
+	// enqueue against two surfaces can make one key collide with another's, and
+	// a collision makes a provider return a cached success without performing
+	// the effect. That is worse than a duplicate, because nothing records it.
+	ExecutorKey          string              `json:"executor_key,omitempty"`
 	ClaimID              string              `json:"claim_id,omitempty"`
 	ClaimFence           uint64              `json:"claim_fence,omitempty"`
 	ClaimLeaseUntil      time.Time           `json:"claim_lease_until,omitempty"`
@@ -514,11 +548,14 @@ func encodeFleetAction(record fleet.ActionRecord) fleetActionWire {
 	return fleetActionWire{
 		ID: base64.RawURLEncoding.EncodeToString(record.ID), Version: record.Version, State: record.State,
 		AgentID: encodeFleetID(record.AgentID), AgentGeneration: record.AgentGeneration,
-		Capability: record.Capability, Action: record.Action, Output: append(json.RawMessage(nil), record.Output...),
+		Capability: record.Capability, Action: record.Action,
+		Input:     append(json.RawMessage(nil), record.Input...),
+		Output:    append(json.RawMessage(nil), record.Output...),
 		ErrorCode: record.ErrorCode, RequestID: encodeFleetID(record.RequestID),
 		CorrelationID: encodeFleetID(record.CorrelationID), Deadline: record.Deadline,
 		CreatedAt: record.CreatedAt, UpdatedAt: record.UpdatedAt,
-		ClaimID: base64.RawURLEncoding.EncodeToString(record.ClaimID), ClaimFence: record.ClaimFence,
+		ExecutorKey: base64.RawURLEncoding.EncodeToString(record.ExecutorKey),
+		ClaimID:     base64.RawURLEncoding.EncodeToString(record.ClaimID), ClaimFence: record.ClaimFence,
 		ClaimLeaseUntil: record.ClaimLeaseUntil, EffectPossible: record.EffectPossible,
 		EvidenceSnapshotID:   encodeFleetID(record.EvidenceSnapshotID),
 		EvidenceSnapshotAsOf: record.EvidenceSnapshotAsOf, Evidence: evidence,
