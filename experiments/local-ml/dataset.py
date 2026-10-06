@@ -14,6 +14,7 @@ MAX_BYTES = 16 * 1024 * 1024
 MAX_ROWS = 4096
 MAX_FEATURES = 65536
 MAX_SCALARS = 1_000_000
+MAX_ABS_FEATURE = 1_000_000
 MAX_TEXT_BYTES = 1024
 DATA_KEYS = frozenset(('schema', 'kind', 'task_id', 'question_id',
                        'feature_schema_id', 'labels', 'cutoff', 'provenance', 'rows'))
@@ -147,6 +148,10 @@ def validate_dataset(data):
                 finite = False
             if not finite:
                 raise DatasetError(f'{where}: feature must be finite float64')
+            if abs(value) > MAX_ABS_FEATURE:
+                raise DatasetError(
+                    f'{where}: feature magnitude exceeds {MAX_ABS_FEATURE}; '
+                    'apply a versioned external feature transform before export')
     try:
         size = len(canonical_bytes(data))
     except (ValueError, TypeError, UnicodeError) as exc:

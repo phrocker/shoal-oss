@@ -210,3 +210,52 @@ func TestRejectRequestBindings(t *testing.T) {
 		t.Fatal("wrong release accepted")
 	}
 }
+
+func TestFeatureMagnitudeBoundsAndArithmeticOverflow(t *testing.T) {
+	for _, tc := range []struct {
+		value string
+		valid bool
+	}{
+		{"1000000", true}, {"-1000000", true}, {"1000000.0001", false}, {"-1000000.0001", false}, {"1e308", false},
+	} {
+		input := []byte(`{"schema":1,"feature_schema_id":"features:1","subjects":[{"id":"s1","features":[` + tc.value + `,0]}]}`)
+		p, r := fixture(t, input)
+		_, err := p.Predict(context.Background(), r, input)
+		if (err == nil) != tc.valid {
+			t.Fatalf("value %s: %v", tc.value, err)
+		}
+	}
+	input := []byte(`{"schema":1,"feature_schema_id":"features:1","subjects":[{"id":"s1","features":[1000000,0]}]}`)
+	_, r := fixture(t, input)
+	// Coefficients and intercept are finite-only, independent of input bounds.
+	for _, tc := range []struct {
+		coeff, intercept float64
+		overflow         bool
+	}{
+		{1e308, 0, true}, {1, 1e308, false},
+	} {
+		m := map[string]any{}
+		if err := json.Unmarshal(modelBytes(string(r.TaskID())), &m); err != nil {
+			t.Fatal(err)
+		}
+		m["coefficients"] = []float64{tc.coeff, 0}
+		m["intercept"] = tc.intercept
+		b, err := json.Marshal(m)
+		if err != nil {
+			t.Fatal(err)
+		}
+		p := load(t, b)
+		rr, err := decision.NewDecisionRequest(r.Task(), r.Picture(), p.Identity(), r.Config())
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = p.Predict(context.Background(), rr, input)
+		if tc.overflow {
+			if err == nil || err.Error() != "nonfinite margin" {
+				t.Fatalf("expected arithmetic overflow, got %v", err)
+			}
+		} else if err != nil {
+			t.Fatal(err)
+		}
+	}
+}

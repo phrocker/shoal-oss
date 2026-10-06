@@ -128,6 +128,19 @@ class AdmissionTests(unittest.TestCase):
                 with self.assertRaises(dataset.DatasetError):
                     dataset.validate_dataset(fixture())
 
+    def test_feature_magnitude_bound_rejects_native_solver_hang_inputs(self):
+        data = fixture()
+        data['rows'][0]['features'] = [-1_000_000, 1_000_000.0]
+        original = copy.deepcopy(data)
+        self.assertEqual(dataset.validate_dataset(data), original)
+        for value in (-1e154, 1e154, -1_000_001, 1_000_001):
+            with self.subTest(value=value):
+                data['rows'][0]['features'] = [value, 1.0]
+                with self.assertRaisesRegex(dataset.DatasetError,
+                                            'versioned external feature transform'):
+                    dataset.validate_dataset(data)
+                self.assertEqual(data['rows'][0]['features'][0], value)
+
     def test_json_parser_attacks_and_bounded_read(self):
         raw = dataset.canonical_bytes(fixture())
         attacks = [raw.replace(b'"schema":1', b'"schema":1,"schema":1'),

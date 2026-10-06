@@ -45,8 +45,11 @@ import (
 
 const MaxModelBytes = 4 << 20
 const MaxFeatures = 65536
+
+// MaxAbsFeature bounds supplied numeric features; values are rejected, never clipped.
+const MaxAbsFeature = 1_000_000
 const runtimeID = "decisionlinear:serial-float64:v1"
-const formatterID = "decisionlinear:strict-numeric-json:v1"
+const formatterID = "decisionlinear:strict-numeric-json:v2"
 
 type Config struct {
 	ModelBytes     []byte
@@ -221,6 +224,9 @@ func (p *Provider) Predict(ctx context.Context, r decision.DecisionRequest, inpu
 				if err := ctx.Err(); err != nil {
 					return empty, err
 				}
+			}
+			if math.Abs(x) > MaxAbsFeature {
+				return empty, errors.New("feature magnitude exceeds bound")
 			}
 			product := float64(x * p.coefficients[i])
 			margin = float64(margin + product)

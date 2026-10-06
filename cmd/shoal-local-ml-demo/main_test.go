@@ -21,8 +21,10 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -140,5 +142,40 @@ func TestMissingReplayIdentityCannotBeRegenerated(t *testing.T) {
 	}
 	if _, err := inquire(model, digest, dir); err == nil {
 		t.Fatal("missing request identity silently replaced")
+	}
+}
+
+func TestStateDirectoryAncestorsSyncOnCreationAndRetry(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "new", "nested")
+	absolute, err := filepath.Abs(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var expected []string
+	for current := absolute; ; current = filepath.Dir(current) {
+		expected = append(expected, current)
+		if filepath.Dir(current) == current {
+			break
+		}
+	}
+	fault := errors.New("directory sync unavailable")
+	for _, fail := range []bool{true, false} {
+		var calls []string
+		err := makeStateDirectory(path, func(p string) error {
+			calls = append(calls, p)
+			if fail && len(calls) == 2 {
+				return fault
+			}
+			return nil
+		})
+		if fail {
+			if !errors.Is(err, fault) {
+				t.Fatal("sync failure hidden", err)
+			}
+		} else {
+			if err != nil || !reflect.DeepEqual(calls, expected) {
+				t.Fatalf("retry omitted ancestor synchronization: %v %v", calls, err)
+			}
+		}
 	}
 }

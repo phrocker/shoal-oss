@@ -101,12 +101,8 @@ func writeExclusive(path string, b []byte) error {
 	closeErr := f.Close()
 	// The filename anchors replay identity; syncing contents alone does not
 	// make its directory entry durable across a crash.
-	parent, openErr := os.Open(filepath.Dir(path))
-	var parentErr error
-	if openErr == nil {
-		parentErr = errors.Join(parent.Sync(), parent.Close())
-	}
-	if err := errors.Join(writeErr, syncErr, closeErr, openErr, parentErr); err != nil {
+	parentErr := syncDirectory(filepath.Dir(path))
+	if err := errors.Join(writeErr, syncErr, closeErr, parentErr); err != nil {
 		return fmt.Errorf("file may exist; durable publication unconfirmed: %w", err)
 	}
 	return nil
@@ -127,6 +123,34 @@ func readBounded(path string, max int) ([]byte, error) {
 	return b, nil
 }
 
+func syncDirectory(path string) error {
+	dir, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	return errors.Join(dir.Sync(), dir.Close())
+}
+
+// Sync every ancestor, including on retry: a prior failed sync may have left an
+// existing but not yet durable directory entry. The callback permits fault tests.
+func makeStateDirectory(path string, syncDir func(string) error) error {
+	absolute, err := filepath.Abs(path)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(absolute, 0700); err != nil {
+		return err
+	}
+	for current := absolute; ; current = filepath.Dir(current) {
+		if err := syncDir(current); err != nil {
+			return fmt.Errorf("state directory may exist; durable publication unconfirmed: %w", err)
+		}
+		if filepath.Dir(current) == current {
+			return nil
+		}
+	}
+}
+
 type demoState struct {
 	Schema      int
 	ModelSHA256 string
@@ -134,7 +158,7 @@ type demoState struct {
 }
 
 func state(dir, modelSHA string) (demoState, error) {
-	if err := os.MkdirAll(dir, 0700); err != nil {
+	if err := makeStateDirectory(dir, syncDirectory); err != nil {
 		return demoState{}, err
 	}
 	path := filepath.Join(dir, "demo-state.json")
