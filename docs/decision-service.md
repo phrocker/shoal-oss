@@ -9,7 +9,8 @@ This is an internal service, not yet an HTTP endpoint or a deployed classifier.
 ## Authorization and execution
 
 The service resolves an `auth.Decision` through Shoal's trusted resolver and checks
-operation permission before artifact lookup. Evaluation requires `invoke`; receipt
+operation permission before artifact lookup. Both methods reject malformed
+idempotency keys before artifact lookup, independent of request existence. Evaluation requires `invoke`; receipt
 reads require `read` on the registered task resource. Artifact authorization is
 additional: the mandatory `Artifacts.LoadAuthorized` integration must enforce
 current access to every contributing source, anchor and outcome, validate retained
@@ -46,7 +47,10 @@ cancellation and implement their own concurrency, egress and runtime isolation
 limits. The service does not hide an uncooperative worker in an unbounded goroutine.
 Hosts must also bound request/catalog/registry latency through the request context.
 Provider transport errors and malformed output become fixed-code failed receipts;
-raw exception text is not returned. No hosted fallback is selected implicitly.
+raw exception text is not returned. Service-generated failures omit unverified
+effective-device claims. Cancellation is checked at entry, around registry lookup
+and immediately before provider invocation; providers must still handle cancellation
+that races with invocation. No hosted fallback is selected implicitly.
 
 Access is checked again after reservation/registry work, after inference and after
 commit or receipt lookup. Revocation during inference can leave a pending record;

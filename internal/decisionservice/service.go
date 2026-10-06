@@ -108,12 +108,15 @@ type Response struct {
 }
 
 func (s *Service) Evaluate(ctx context.Context, requestID shoal.ID, key []byte) (Response, error) {
+	if err := validateKey(key); err != nil {
+		return Response{}, err
+	}
+	if err := ctx.Err(); err != nil {
+		return Response{}, err
+	}
 	principal, bundle, scope, err := s.authorize(ctx, requestID, auth.OperationInvoke)
 	if err != nil {
 		return Response{}, err
-	}
-	if len(key) == 0 || len(key) > shoal.MaxIDBytes {
-		return Response{}, shoal.NewError(shoal.ErrorInvalidArgument, "invalid idempotency key")
 	}
 	reservation, err := s.config.Receipts.Reserve(ctx, scope, key, bundle.Request, s.config.Lease)
 	if err != nil {
@@ -151,7 +154,13 @@ func (s *Service) Evaluate(ctx context.Context, requestID shoal.ID, key []byte) 
 	if ineligible {
 		result = terminal(bundle.Request, decision.Abstained, "evidence_ineligible", s.now())
 	} else {
+		if err := ctx.Err(); err != nil {
+			return Response{}, err
+		}
 		provider, resolveErr := s.config.Providers.Resolve(ctx, bundle.Request.Config().ReleaseID, bundle.Request.PredictorID())
+		if err := ctx.Err(); err != nil {
+			return Response{}, err
+		}
 		if resolveErr != nil || nilDependency(provider) {
 			result = terminal(bundle.Request, decision.Failed, "predictor_unavailable", s.now())
 		} else {
@@ -179,6 +188,10 @@ func (s *Service) Evaluate(ctx context.Context, requestID shoal.ID, key []byte) 
 					result = terminal(bundle.Request, decision.Failed, "deadline_exceeded", now)
 				} else {
 					callCtx, cancel := context.WithTimeout(ctx, until.Sub(now))
+					if err := callCtx.Err(); err != nil {
+						cancel()
+						return Response{}, err
+					}
 					native, predictErr := provider.Predict(callCtx, bundle.Request, append([]byte(nil), bundle.Input...))
 					callErr := callCtx.Err()
 					cancel()
@@ -218,6 +231,12 @@ func (s *Service) Evaluate(ctx context.Context, requestID shoal.ID, key []byte) 
 	return response(bundle, committed)
 }
 func (s *Service) Read(ctx context.Context, requestID shoal.ID, key []byte) (Response, error) {
+	if err := validateKey(key); err != nil {
+		return Response{}, err
+	}
+	if err := ctx.Err(); err != nil {
+		return Response{}, err
+	}
 	principal, bundle, scope, err := s.authorize(ctx, requestID, auth.OperationRead)
 	if err != nil {
 		return Response{}, err
@@ -323,10 +342,13 @@ func scopeFor(d auth.Decision) (decisionstore.Scope, error) {
 }
 func (s *Service) now() time.Time { return s.config.Clock().Round(0).UTC() }
 func terminal(r decision.DecisionRequest, status decision.ResultStatus, reason string, t time.Time) decision.ResultConfig {
-	// Abstention requires the registered device; failures may omit it. Runtime
-	// identity is available through the immutable request, without resolving a
-	// provider (which might be unavailable or forbidden for ineligible evidence).
-	return decision.ResultConfig{RequestID: r.ID(), PredictorID: r.PredictorID(), EffectiveDevice: r.Predictor().Config().Device, Status: status, Reason: reason, CompletedAt: t}
+	result := decision.ResultConfig{RequestID: r.ID(), PredictorID: r.PredictorID(), Status: status, Reason: reason, CompletedAt: t}
+	// The abstention contract requires the pinned device even when eligibility
+	// prevents execution. Failed receipts omit an unverified effective device.
+	if status == decision.Abstained {
+		result.EffectiveDevice = r.Predictor().Config().Device
+	}
+	return result
 }
 func response(b Bundle, r decisionstore.Receipt) (Response, error) {
 	if r.State == decisionstore.Pending {
@@ -368,4 +390,12 @@ func nilDependency(v any) bool {
 		return rv.IsNil()
 	}
 	return false
+}
+
+// Reject malformed keys independently of artifact existence for both operations.
+func validateKey(key []byte) error {
+	if len(key) == 0 || len(key) > shoal.MaxIDBytes {
+		return shoal.NewError(shoal.ErrorInvalidArgument, "invalid idempotency key")
+	}
+	return nil
 }

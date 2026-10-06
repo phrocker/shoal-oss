@@ -43,6 +43,7 @@ type catalog struct {
 	bundle  Bundle
 	revoked atomic.Bool
 	loads   atomic.Int32
+	onLoad  func()
 }
 
 func (c *catalog) LoadAuthorized(ctx context.Context, d auth.Decision, id shoal.ID) (Bundle, error) {
@@ -54,6 +55,9 @@ func (c *catalog) LoadAuthorized(ctx context.Context, d auth.Decision, id shoal.
 	// artifacts/provenance and every source-derived registration, not just grants.
 	if err := d.AuthorizeObject(auth.OperationRetrieve, auth.ResourceRequest{AuthorizationDomain: []byte("domain"), SourceID: []byte("evidence"), PolicyID: []byte("evidence-policy"), ObjectID: "source"}, c.bundle.Request.Config().RequestedAt); err != nil {
 		return Bundle{}, err
+	}
+	if c.onLoad != nil {
+		c.onLoad()
 	}
 	return c.bundle, nil
 }
@@ -71,14 +75,18 @@ func (p *provider) Predict(ctx context.Context, r decision.DecisionRequest, inpu
 }
 
 type registry struct {
-	p       *provider
-	calls   atomic.Int32
-	release shoal.ID
-	fail    bool
+	p         *provider
+	calls     atomic.Int32
+	release   shoal.ID
+	fail      bool
+	onResolve func()
 }
 
 func (r *registry) Resolve(_ context.Context, release, identity shoal.ID) (Predictor, error) {
 	r.calls.Add(1)
+	if r.onResolve != nil {
+		r.onResolve()
+	}
 	if r.fail || release != r.release {
 		return nil, errors.New("private registry diagnostic")
 	}
@@ -302,7 +310,7 @@ func TestIneligibleEvidenceAbstainsWithoutResolvingProvider(t *testing.T) {
 	}
 }
 func TestProviderFailuresBecomeBoundedFailedReceipts(t *testing.T) {
-	for _, mode := range []string{"error", "wrong identity", "malformed", "late", "unavailable"} {
+	for _, mode := range []string{"error", "wrong identity", "malformed", "late", "unavailable", "pre-invocation deadline"} {
 		t.Run(mode, func(t *testing.T) {
 			h := newHarness(t, false)
 			switch mode {
@@ -329,6 +337,8 @@ func TestProviderFailuresBecomeBoundedFailedReceipts(t *testing.T) {
 					h.clock.Add(int64(61 * time.Second))
 					return validOutput(r), nil
 				}
+			case "pre-invocation deadline":
+				h.registry.onResolve = func() { h.clock.Add(int64(61 * time.Second)) }
 			case "unavailable":
 				h.registry.fail = true
 			}
@@ -336,7 +346,7 @@ func TestProviderFailuresBecomeBoundedFailedReceipts(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if out.Receipt.Result.Status != decision.Failed || out.Ranking.Entries()[0].Score != nil || strings.Contains(out.Receipt.Result.Reason, "secret") {
+			if out.Receipt.Result.Status != decision.Failed || out.Receipt.Result.EffectiveDevice != "" || out.Ranking.Entries()[0].Score != nil || strings.Contains(out.Receipt.Result.Reason, "secret") {
 				t.Fatal("provider failure leaked or became a score")
 			}
 		})
@@ -552,5 +562,69 @@ func TestTypedNilDependenciesFailClosed(t *testing.T) {
 	}
 	if out.Receipt.Result.Status != decision.Failed {
 		t.Fatal("nil provider became success")
+	}
+}
+
+func TestMalformedKeysDoNotConsultArtifacts(t *testing.T) {
+	h := newHarness(t, false)
+	for _, operation := range []struct {
+		name string
+		call func(context.Context, shoal.ID, []byte) (Response, error)
+	}{{"evaluate", h.s.Evaluate}, {"read", h.s.Read}} {
+		for _, revoked := range []bool{false, true} {
+			h.catalog.revoked.Store(revoked)
+			for _, id := range []shoal.ID{h.catalog.bundle.Request.ID(), "absent"} {
+				for _, key := range [][]byte{nil, {}, make([]byte, shoal.MaxIDBytes+1)} {
+					out, err := operation.call(h.ctx, id, key)
+					if !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) || out.Receipt.ID != "" || out.Ranking != nil {
+						t.Fatalf("%s disclosed state for malformed key: %v", operation.name, err)
+					}
+				}
+			}
+		}
+	}
+	if h.catalog.loads.Load() != 0 || h.registry.calls.Load() != 0 {
+		t.Fatal("malformed key reached artifacts or registry")
+	}
+}
+
+func TestCancellationBeforeProviderInvocation(t *testing.T) {
+	for _, stage := range []string{"entry", "registry", "last authorization"} {
+		t.Run(stage, func(t *testing.T) {
+			h := newHarness(t, false)
+			ctx, cancel := context.WithCancel(h.ctx)
+			defer cancel()
+			if stage == "entry" {
+				cancel()
+			} else if stage == "registry" {
+				h.registry.onResolve = cancel
+			} else {
+				h.catalog.onLoad = func() {
+					if h.catalog.loads.Load() == 3 {
+						cancel()
+					}
+				}
+			}
+			out, err := h.s.Evaluate(ctx, h.catalog.bundle.Request.ID(), []byte("key"))
+			if !errors.Is(err, context.Canceled) || out.Receipt.ID != "" || out.Ranking != nil {
+				t.Fatalf("cancellation returned output: %v", err)
+			}
+			if h.registry.p.calls.Load() != 0 {
+				t.Fatal("canceled request invoked provider")
+			}
+			if stage == "entry" && h.catalog.loads.Load() != 0 {
+				t.Fatal("canceled request loaded artifacts")
+			}
+			if stage != "entry" {
+				scope, err := scopeFor(h.d)
+				if err != nil {
+					t.Fatal(err)
+				}
+				receipt, err := h.store.Get(h.ctx, scope, []byte("key"), h.catalog.bundle.Request)
+				if err != nil || receipt.State != decisionstore.Pending {
+					t.Fatalf("cancellation fabricated result: %v", err)
+				}
+			}
+		})
 	}
 }
