@@ -152,6 +152,34 @@ one action are exactly the case that needs collapsing, so a key including
 the second as new work — defeating the mechanism precisely when it is needed.
 The action's ID is the stable identity; the claim is not.
 
+Two things that "derived from the action" does not settle on its own:
+
+**The encoding.** An action ID is an opaque byte string, not a header value. The
+key is its **unpadded base64url form** — the same spelling the dispatch HTTP API
+already uses for `id`, so the key is literally the identifier an operator sees in
+`status` output, which also makes a duplicate traceable to its action by
+inspection. Picking any other encoding would mean two spellings of one identity.
+
+**The retention horizon, which is the part that actually decides the
+guarantee.** Accepting a key is not deduplicating against it forever. Providers
+hold keys for a bounded window — a day is typical — and the second attempt here
+is not a client retry milliseconds later; it is a *re-claim* after a lease
+expiry, bounded only by the action's `Deadline`, which may be up to
+`MaxActionDeadline` (24h). If the target's window is shorter than the action's
+deadline horizon, the key stops collapsing duplicates exactly in the long-running
+case this design exists to support.
+
+So the operator declares the target's window and the gateway enforces the
+relationship at claim time, before any effect:
+
+```
+Deadline - now  ≤  target.idempotencyRetention
+```
+
+An action whose remaining deadline outlives the target's dedup window is refused
+at claim rather than performed under a guarantee that has silently lapsed. With
+no declared retention, the target is in the second row of the table above.
+
 Where the target does not accept one, the design must not claim what it cannot
 deliver. `EffectPossible` is set at claim time for any external-mutating or
 egressing action and is **never cleared** — it is only ever set true
@@ -213,6 +241,20 @@ renew every L/2 while the operation runs
 abandon if a renewal is refused
 total duration bounded by the action's Deadline
 ```
+
+`reportWindow` has to be a defined number before any of that is normative, since
+it appears in two invariants and a grace-period calculation. It is a **fixed
+conservative margin of 5 seconds**, not a setting: the same value and the same
+reasoning as `minimumReportWindow` in `cmd/shoal-llm-proxy/admission.go:108`,
+because it is the same act — one authenticated POST to the explorer after the
+work is done. Making it configurable would invite an operator to tune away the
+margin that keeps a completed effect reportable, which is the one thing here
+that must not be tunable.
+
+It is deliberately the same number as the proxy's rather than coincidentally so.
+If the two ever need to differ, that is the signal to export one constant from
+`pkg/explorer/fleet` and have both derive from it, rather than to let two
+unexported fives drift apart.
 
 And the invariant to enforce **at claim time, before any effect** — the same
 shape as `validateDurations` in the LLM proxy:
@@ -290,9 +332,21 @@ Three things follow and are the real reason this is not merely tidier:
 
 **Network policy becomes expressible — to the extent the substrate allows.** A
 per-surface worker needs egress to exactly one target; a pool needs egress to all
-of them, which is not a policy so much as a hole. The explorer needs egress to
-none, and that asymmetry is only enforceable if the gateway is not also the
-explorer.
+of them, which is not a policy so much as a hole.
+
+An earlier draft added "and the explorer needs egress to none", which is false
+for supported deployments. `shoal-explore-web` takes `-chat-base-url` and
+`-embedding-base-url` and the chart has a guard specifically for a **remote**
+chat provider needing a credential Secret (`deploy/helm/shoal/templates/validate.yaml:96`),
+so a workspace configured with a hosted model egresses by design. The asymmetry
+is real only in a loopback-only configuration, where the explorer's providers are
+sidecars and its egress set is genuinely empty.
+
+What holds unconditionally is narrower and still worth having: the explorer's
+egress set is its *model providers*, and the gateway's is its *operational
+target*. Those are different destinations with different credentials, and keeping
+them in different pods is what lets a policy say so. Collapsed into one pod, the
+union is the policy.
 
 How enforceable the single-target half is depends on where the target lives, and
 an earlier draft of this document overstated it. A standard `NetworkPolicy`
@@ -338,7 +392,13 @@ than by a check:
   server nowhere — and this is the pod that both parses external responses and
   holds credentials that mutate production systems. Same reasoning as #417, more
   sharply.
-- **No egress except its own target and the explorer.** By `NetworkPolicy`.
+- **No egress except its own target, the explorer, and cluster DNS.** By
+  `NetworkPolicy`, with the DNS exception stated rather than implied: a policy
+  that omits egress to the cluster DNS service breaks resolution of every
+  hostname-based explorer or target URL before any application traffic is
+  attempted, and the failure looks like an unreachable plane rather than a
+  policy mistake. An earlier draft listed this invariant as two destinations,
+  which contradicted the network-policy section above it.
 - **No credential in an environment variable where it must rotate.** The `-file`
   forms exist for that, and per-request reading is what makes them work.
 
@@ -367,6 +427,12 @@ gateways:
       # mechanism, and Path A's guarantee is then the weaker of the two cases in
       # "What the fence does not protect" — which an operator should have to see.
       idempotencyKeyHeader: ""
+      # How long the target deduplicates against that key. The second attempt
+      # here is a re-claim after a lease expiry, not a client retry, so this has
+      # to cover the action's whole deadline horizon or the key stops collapsing
+      # duplicates in exactly the long-running case renewal exists for. The
+      # gateway refuses at claim when Deadline-now exceeds it.
+      idempotencyRetention: ""
     dispatch:
       url: ""                # the explorer's authenticated API
       tokenFile: ""
@@ -407,29 +473,52 @@ Deployment properties, with the reasoning that is not obvious:
   cannot reach the explorer is not ready, and not being ready is the correct
   fail-closed state: it simply stops taking work, and no effect occurs.
 
-That last point is a real asymmetry with the LLM proxy and worth stating plainly:
-**for Path A, an unreachable decision plane denies by construction.** There is no
-caller waiting and no refusal to synthesise — the worker stops pulling and
-nothing happens. Path B has to deny explicitly, exactly as the LLM proxy does.
+That last point is a real asymmetry with the LLM proxy, and it needs splitting by
+what the worker was doing when the plane went away.
+
+**For work not yet claimed, Path A denies by construction.** There is no caller
+waiting and no refusal to synthesise: the worker cannot pull, so it takes no
+work, and nothing happens. That is the strongest fail-closed property anywhere in
+this design and it is free.
+
+**For a claim already held, it is not fail-closed at all.** A worker that loses
+the plane mid-operation may still reach the target — they are different
+destinations and nothing couples their availability — so it can perform the
+effect and then fail both renewal and completion. That is the ambiguity above,
+reached through an outage rather than through a partition between worker and
+target. An earlier draft of this document claimed the fail-closed property
+without that qualification, which was the same mistake as claiming the fence
+protects the target: true of the record, not of the world.
+
+Path B has to deny explicitly, exactly as the LLM proxy does.
 
 ## Failure modes an operator will see
 
 | what happened | what the record says | what the operator sees |
 |---|---|---|
-| plane unreachable (Path A) | action stays queued | worker not ready; no effect |
+| plane unreachable, nothing claimed (Path A) | action stays queued | worker not ready; no effect |
+| plane unreachable while a claim is held | claim expires, action requeued | `EffectPossible` stands; the effect may have occurred |
 | plane unreachable (Path B) | nothing | `503`, distinguishable from a denial |
 | effects exceed the executor ceiling at registration | the descriptor is refused | registration fails; no action exists |
 | ceiling tightened after enqueue | action stops resolving for claim | queued work stops being handed out; no worker involved |
 | target unreachable | `failed` under fence | `EffectPossible` true, effect did not occur |
 | target timed out after the request left | `failed` under fence | `EffectPossible` true, effect **may** have occurred |
-| renewal refused mid-operation | claim lost, no completion | lifecycle event naming the ambiguity |
+| renewal refused mid-operation | claim lost, no completion; `EffectPossible` stands | `EffectPossible` on the record only, until a lost-fence route exists |
 | report under a stale fence | rejected | the rejection is surfaced, not swallowed |
-| worker killed mid-operation | lease expires, action requeued | `EffectPossible` true on the old record |
+| worker killed mid-operation | lease expires, action requeued | `EffectPossible` stands; a second claim may duplicate the effect |
+| target dedup window shorter than the deadline | refused at claim | no effect; the operator is told the horizon does not fit |
 
-The two rows carrying `EffectPossible` with "may have occurred" are the ones that
+The rows carrying `EffectPossible` with "may have occurred" are the ones that
 cannot be designed away. They are the cost of governing something irreversible,
 and the design's obligation is to make them visible rather than to round them to
 success or failure.
+
+This table has now contradicted the body of this document three times — an
+enqueue-time refusal that does not exist, a lifecycle event the public route
+cannot publish, and a fail-closed claim that holds only for unclaimed work. Each
+time the prose was corrected and the row was not. **A summary table is the last
+thing to re-read after any correction above it**, because it restates
+conclusions in a form that looks independent and is not.
 
 ## Open decisions
 
@@ -443,10 +532,11 @@ success or failure.
   signal is `EffectPossible` alone — the fact without the detail.
 - **Whether a target without an idempotency key is in scope at all.** Path A
   gives at-most-once at the target only where the target accepts a key derived
-  from the action. Where it does not, a partition can duplicate the effect and
-  the design can only make that detectable. For some surfaces that is
-  acceptable; for others the right answer is that this gateway is not sufficient,
-  and the values file should have to say which.
+  from the action *and* deduplicates against it for the action's whole deadline
+  horizon. Where it does not, a partition or an outage during a held claim can
+  duplicate the effect and the design can only make that detectable. For some
+  surfaces that is acceptable; for others the right answer is that this gateway
+  is not sufficient, and the values file should have to say which.
 - **Does Path B belong in the same binary?** It shares the target configuration
   and credential handling, which argues yes. It has entirely different semantics,
   which argues for a separate command so the missing guarantee cannot be reached
