@@ -117,3 +117,27 @@ source-to-model withdrawal; HTTP/SDK wiring; and the pinned Laya worker. Automat
 jobs may create candidates, but this slice never promotes one or permits source
 exclusion or risky operations. A successful synthetic run makes no model-quality
 claim about code review.
+
+## Executed evidence and independent review
+
+The [retained synthetic run](evidence/smoke-2026-10-06/smoke.json) was executed on
+`af1bb3e`: two separate training processes produced byte-identical model, recipe,
+runtime and receipt artifacts. Eight rows were fitted; four held-out synthetic sign
+labels matched the exported linear decision rule. The real Go inquiry made one
+model call in the first process and zero after restart, with identical stored
+request/receipt/prediction IDs. These are conformance observations, not code-review
+quality or an approval to promote the model. The tiny dataset and complete candidate
+artifacts are retained alongside the report.
+
+Three independent reviewer-agent rounds preceded publication:
+
+| Round | Result | Resolution |
+|---|---|---|
+| 1, initial working implementation | P2: missing directory fsync for trained artifacts and demo-state publication. | File → staging-directory → atomic rename → parent sync; explicit post-rename uncertainty. Demo syncs state-file parent. Included in `3bad915`. |
+| 2, `3bad915` | P2: newly created state ancestors were not durable; P2: extreme finite feature values stalled native fitting beyond the iteration bound. | Sync all state ancestors, including retries; reject feature magnitudes above 1,000,000 on training and serving, with no clipping. Fixed in `af1bb3e`. |
+| 3, `af1bb3e` | No actionable findings in a fresh full review. | No implementation changes after the clean round. |
+
+All 20 Python tests, targeted Go race tests and vet passed. Review included static
+analysis, syscall-order instrumentation and an externally timed numerical probe;
+it did not simulate a power loss or perform exhaustive fuzzing. No Copilot review
+or paid classifier experiment was requested.
