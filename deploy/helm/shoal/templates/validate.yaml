@@ -116,6 +116,56 @@
 {{- end -}}
 {{- end -}}
 
+{{- /* The external-effect bindings (#436).
+
+       These two lists are the only configuration in the chart that raises an
+       executor's effect ceiling to admit work whose consequences land outside
+       Shoal — the point at which Shoal stops containing an effect. Everything
+       else here is fail-closed by omission and stays that way: an allowlisted
+       reference nobody names below declares no ceiling, and a declaration of
+       {external} against it is refused at registration and again at
+       resolution.
+
+       So every guard in this block exists to stop a values file that *reads*
+       like that opt-in from quietly not being one, or from being one twice
+       over. None of them can be reached by leaving something unset. */ -}}
+{{- $claimedBy := dict -}}
+{{- range $key := list "externalExecutorRefs" "externalEgressExecutorRefs" -}}
+{{- range $reference := (index $explorer.fleet $key) -}}
+{{- /* Present but blank is not a configured reference. The workspace drops
+       empty entries when it splits the flag, so a list holding only "" or " "
+       binds nothing — and the failure is invisible, because the pod starts
+       and serves. The operator finds out when the gateway descriptor they
+       registered is refused for declaring an effect its executor is not bound
+       to perform, which reads as a bug in the descriptor. */ -}}
+{{- if not (trim (toString $reference)) -}}
+{{- fail (printf "explorer.fleet.%s contains a blank entry: the workspace drops empty entries when it splits the flag, so nothing is bound and the reference keeps permitting nothing. A descriptor declaring external effects against it would be refused at registration while the pod starts and serves normally" $key) -}}
+{{- end -}}
+{{- $trimmed := trim (toString $reference) -}}
+{{- /* Registration is fail-closed on the allow-list first, so a binding for a
+       reference the registry will not accept is unreachable. */ -}}
+{{- if not (has $trimmed $explorer.fleet.executorRefs) -}}
+{{- fail (printf "explorer.fleet.%s names %q, which is not in explorer.fleet.executorRefs: the registry refuses any descriptor naming a reference the allow-list does not carry, so this binding would never be reached and no external action could register at all" $key $trimmed) -}}
+{{- end -}}
+{{- /* One reference cannot carry both bindings, and these two are not narrower
+       and wider — they are incompatible. The grounded-reasoning executor's
+       floor equals its ceiling and deliberately excludes external mutation;
+       this binding has an external ceiling and no floor. Whichever bound last
+       at startup would overwrite the other. */ -}}
+{{- if and $explorer.fleet.askExecutorRef (eq $trimmed $explorer.fleet.askExecutorRef) -}}
+{{- fail (printf "explorer.fleet.%s names %q, which is also explorer.fleet.askExecutorRef: that reference carries the grounded-reasoning executor, whose effect floor equals its ceiling and excludes external mutation, so the two bindings cannot coexist and one would overwrite the other at startup — either ask descriptors stop resolving, or the reasoning executor answers through a reference configured as a dispatch-only gateway. Give the gateway its own reference" $key $trimmed) -}}
+{{- end -}}
+{{- /* Whether the operation transmits corpus content off the host is one
+       declaration per reference. Letting the wider ceiling win would mean
+       egress authority is acquired by listing a reference twice, which is
+       exactly the accidental widening the separate list exists to prevent. */ -}}
+{{- if and (hasKey $claimedBy $trimmed) (ne (get $claimedBy $trimmed) $key) -}}
+{{- fail (printf "explorer.fleet.%s names %q, which explorer.fleet.%s already names: the two lists declare different ceilings for one reference, and resolving that by binding order would hand it the wider one — so egress authority would be acquired by listing a reference twice. Name it in exactly one list" $key $trimmed (get $claimedBy $trimmed)) -}}
+{{- end -}}
+{{- $_ := set $claimedBy $trimmed $key -}}
+{{- end -}}
+{{- end -}}
+
 {{- /* Two listeners on one port silently means one of them is not serving. */ -}}
 {{- if eq (int $explorer.containerPort) (int $explorer.healthPort) -}}
 {{- fail "explorer.healthPort must differ from explorer.containerPort: they are two listeners and cannot share a port" -}}

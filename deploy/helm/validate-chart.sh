@@ -124,6 +124,23 @@ assert_renders() {
   fi
 }
 
+# The mirror, for a flag that must not appear unless an operator asked for it.
+# "renders" cannot see this and neither can assert_renders: a key that widened
+# an effect ceiling by default would render, validate, install, and pass every
+# positive assertion in this file. The absence is the property.
+assert_absent() {
+  local description="$1" pattern="$2"; shift 2
+  local rendered
+  if ! rendered=$(helm template shoal "$chart" "$@" 2>&1); then
+    fail "should render but was refused: $description"
+    return
+  fi
+  if printf '%s\n' "$rendered" | grep -qE -- "$pattern"; then
+    fail "the rendered output matches /$pattern/ and must not: $description"
+    printf '%s\n' "$rendered" | grep -E -- "$pattern" | head -3 | sed 's/^/      /'
+  fi
+}
+
 refuses_citing() {
   local expected="$1" description="$2"; shift 2
   local output
@@ -263,6 +280,57 @@ renders "ask executor wired"                "${explorer_base[@]}" --set 'explore
 renders "lexical embedding"                 "${explorer_base[@]}" --set explorer.embedding.provider=lexical,explorer.embedding.dimensions=256
 renders "scaled to zero"                    "${explorer_base[@]}" --set explorer.replicas=0
 renders "values around the blanks are trimmed" "${explorer_base[@]}" --set 'explorer.allowedHosts={ shoal.example.test , }'
+
+note "== the external-effect executor bindings =="
+# explorer.fleet.externalExecutorRefs and externalEgressExecutorRefs are the
+# only keys in this chart that raise an executor's effect ceiling to admit work
+# whose consequences land outside Shoal. Everything else in the enforcement
+# plane is fail-closed by omission; this is the one place an operator says "I
+# accept that Shoal will not perform this and will not undo it".
+#
+# So the first thing asserted is the absence, not a refusal: nothing an
+# operator leaves unset may produce that ceiling, and no positive assertion in
+# this file can see that.
+#
+# The refusals after it each cover a values file that reads like the opt-in
+# while not being one, or being one twice over. Every one is pinned to its own
+# sentence rather than asserted as "did not render": a blank entry is also
+# refused by the allow-list guard downstream of it, so that case would keep
+# passing with the guard it is named for deleted — and the other three are
+# cheap to pin once the helper is being used anyway.
+assert_absent "no configuration produces an external ceiling by omission" "fleet-external" "${explorer_base[@]}"
+assert_absent "nor does allowlisting a reference without naming it" "fleet-external" "${explorer_base[@]}" --set 'explorer.fleet.executorRefs={deploy}'
+refuses_citing "is not in explorer.fleet.executorRefs" "an external reference that is not allowlisted" "${explorer_base[@]}" --set 'explorer.fleet.externalExecutorRefs={deploy}'
+refuses_citing "is not in explorer.fleet.executorRefs" "a transmitting external reference that is not allowlisted" "${explorer_base[@]}" --set 'explorer.fleet.externalEgressExecutorRefs={notify}'
+# Present but blank binds nothing, and the pod starts and serves anyway — so
+# the operator learns about it when the gateway descriptor is refused.
+refuses_citing "contains a blank entry" "a blank external reference only" "${explorer_base[@]}" --set 'explorer.fleet.executorRefs={deploy}' --set 'explorer.fleet.externalExecutorRefs={ }'
+refuses_citing "contains a blank entry" "a blank transmitting reference only" "${explorer_base[@]}" --set 'explorer.fleet.executorRefs={notify}' --set 'explorer.fleet.externalEgressExecutorRefs={ }'
+# The grounded-reasoning executor's floor equals its ceiling and excludes
+# external mutation. One reference cannot carry both bindings, and the loser is
+# decided by startup order.
+refuses_citing "is also explorer.fleet.askExecutorRef" "the ask reference also bound for external mutation" "${explorer_base[@]}" --set 'explorer.fleet.executorRefs={ask}',explorer.fleet.askExecutorRef=ask,explorer.chat.provider=ollama,explorer.chat.model=m,explorer.chat.baseURL=http://localhost:11434 --set 'explorer.fleet.externalExecutorRefs={ask}'
+refuses_citing "is also explorer.fleet.askExecutorRef" "the ask reference also bound for transmitting external work" "${explorer_base[@]}" --set 'explorer.fleet.executorRefs={ask}',explorer.fleet.askExecutorRef=ask,explorer.chat.provider=ollama,explorer.chat.model=m,explorer.chat.baseURL=http://localhost:11434 --set 'explorer.fleet.externalEgressExecutorRefs={ask}'
+# Naming one reference in both lists is two different ceilings for it. The wider
+# one winning would mean egress authority is acquired by listing it twice.
+refuses_citing "already names" "one reference in both effect lists" "${explorer_base[@]}" --set 'explorer.fleet.executorRefs={deploy}' --set 'explorer.fleet.externalExecutorRefs={deploy}' --set 'explorer.fleet.externalEgressExecutorRefs={deploy}'
+
+# And the configurations that must still render. The flag value is asserted,
+# not just the absence of a refusal: a list joined into one argument is where a
+# dropped or mistyped element disappears quietly, and the whole point of the
+# pair of keys is that the two ceilings reach the process as different flags.
+assert_renders "an external gateway reference is bound" "\-fleet-external-executor-refs=deploy$" "${explorer_base[@]}" --set 'explorer.fleet.executorRefs={deploy}' --set 'explorer.fleet.externalExecutorRefs={deploy}'
+assert_renders "a transmitting external gateway is bound" "\-fleet-external-egress-executor-refs=notify$" "${explorer_base[@]}" --set 'explorer.fleet.executorRefs={notify}' --set 'explorer.fleet.externalEgressExecutorRefs={notify}'
+assert_absent "a mutating reference does not acquire the egress flag" "fleet-external-egress-executor-refs" "${explorer_base[@]}" --set 'explorer.fleet.executorRefs={deploy}' --set 'explorer.fleet.externalExecutorRefs={deploy}'
+assert_renders "several external references join into one argument" "\-fleet-external-executor-refs=deploy,restart$" "${explorer_base[@]}" --set 'explorer.fleet.executorRefs={deploy,restart}' --set 'explorer.fleet.externalExecutorRefs={deploy,restart}'
+# Distinct references in the two lists are not a collision: a deployment can
+# have one gateway that only mutates and another that also transmits.
+assert_renders "both ceilings on separate references" "\-fleet-external-egress-executor-refs=notify$" "${explorer_base[@]}" --set 'explorer.fleet.executorRefs={deploy,notify}' --set 'explorer.fleet.externalExecutorRefs={deploy}' --set 'explorer.fleet.externalEgressExecutorRefs={notify}'
+# The reasoning executor and a gateway coexist on separate references, which is
+# the configuration #391 needs: Shoal answers from the corpus in process and
+# dispatches the external work.
+assert_renders "the ask executor beside a gateway" "\-fleet-external-executor-refs=deploy$" "${explorer_base[@]}" --set 'explorer.fleet.executorRefs={ask,deploy}',explorer.fleet.askExecutorRef=ask,explorer.chat.provider=ollama,explorer.chat.model=m,explorer.chat.baseURL=http://localhost:11434 --set 'explorer.fleet.externalExecutorRefs={deploy}'
+assert_renders "and the ask binding survives it" "\-fleet-ask-executor-ref=ask$" "${explorer_base[@]}" --set 'explorer.fleet.executorRefs={ask,deploy}',explorer.fleet.askExecutorRef=ask,explorer.chat.provider=ollama,explorer.chat.model=m,explorer.chat.baseURL=http://localhost:11434 --set 'explorer.fleet.externalExecutorRefs={deploy}'
 
 note "== llm proxy guards refuse =="
 # The proxy's failure mode is not a crash. It is required to fail closed, so

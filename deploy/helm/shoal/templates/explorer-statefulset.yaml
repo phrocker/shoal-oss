@@ -143,6 +143,12 @@ spec:
             {{- with $explorer.fleet.askExecutorRef }}
             - -fleet-ask-executor-ref={{ . }}
             {{- end }}
+            {{- with $explorer.fleet.externalExecutorRefs }}
+            - -fleet-external-executor-refs={{ join "," . }}
+            {{- end }}
+            {{- with $explorer.fleet.externalEgressExecutorRefs }}
+            - -fleet-external-egress-executor-refs={{ join "," . }}
+            {{- end }}
             {{- with $explorer.ontologyFile }}
             - -ontology-file={{ . }}
             {{- end }}
