@@ -795,3 +795,60 @@ func TestRevocationDuringStorageDoesNotDiscloseErrorState(t *testing.T) {
 		}
 	}
 }
+
+// Force a deadline error at an exact I/O boundary without a timing-dependent test.
+type deadlineErrorContext struct{ context.Context }
+
+func (c deadlineErrorContext) Err() error {
+	if c.Context.Err() != nil {
+		return context.DeadlineExceeded
+	}
+	return nil
+}
+func TestUncertainWritePreservesAmbiguityAcrossReauthorizationFailure(t *testing.T) {
+	for _, mode := range []string{"cancel", "deadline", "authority outage", "revoked"} {
+		t.Run(mode, func(t *testing.T) {
+			r, d, ctx, resolver, clock := fixture(t)
+			c, a, _ := newCatalog(t, r, resolver, clock)
+			callCtx, cancel := context.WithCancel(ctx)
+			defer cancel()
+			var requestCtx context.Context = callCtx
+			if mode == "deadline" {
+				requestCtx = deadlineErrorContext{callCtx}
+			}
+			f := &faultyCAS{CAS: c.config.Backend, loseAck: true, failRead: true, afterWrite: func() {
+				switch mode {
+				case "cancel", "deadline":
+					cancel()
+				case "authority outage":
+					a.fail = true
+				case "revoked":
+					a.deny = true
+				}
+			}}
+			c.config.Backend = f
+			err := c.Retain(requestCtx, r)
+			if mode == "revoked" {
+				if !shoal.IsErrorCode(err, shoal.ErrorNotFound) || errors.Is(err, ErrIndeterminate) {
+					t.Fatal("denial disclosed ambiguous storage state", err)
+				}
+			} else {
+				if !errors.Is(err, ErrIndeterminate) {
+					t.Fatal("uncertain retention lost ambiguity", err)
+				}
+				if mode == "cancel" && !errors.Is(err, context.Canceled) {
+					t.Fatal("lost cancellation cause", err)
+				}
+				if mode == "deadline" && !errors.Is(err, context.DeadlineExceeded) {
+					t.Fatal("lost deadline cause", err)
+				}
+			}
+			a.fail = false
+			a.deny = false
+			f.failRead = false
+			if _, err := c.LoadAuthorized(ctx, d, a.id); err != nil {
+				t.Fatal("uncertain write did not persist as expected", err)
+			}
+		})
+	}
+}

@@ -28,6 +28,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"reflect"
 	"time"
 
@@ -112,6 +113,12 @@ func (c *Catalog) Retain(ctx context.Context, r Record) error {
 		// Errors can disclose storage state too. Recheck access after the last
 		// I/O before distinguishing a conflicting row from an absent one.
 		if _, err := c.reauthorize(ctx, d, id); err != nil {
+			// Confirmed denial masks storage state. Cancellation or an authority
+			// outage cannot establish rollback of an unresolved mutation.
+			unresolved := readErr != nil || (!bytes.Equal(stored, encoded) && (writeErr != nil || status != allocator.StatusRejected))
+			if unresolved && !shoal.IsErrorCode(err, shoal.ErrorNotFound) {
+				return errors.Join(ErrIndeterminate, err)
+			}
 			return err
 		}
 		if readErr != nil {
