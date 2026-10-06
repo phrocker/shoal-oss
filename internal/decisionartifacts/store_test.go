@@ -742,3 +742,56 @@ func TestHistoricalLoadRequiresCurrentEvidenceGrants(t *testing.T) {
 		}
 	}
 }
+
+type revokingReadCAS struct {
+	decisionstore.CAS
+	afterRead func()
+	corrupt   bool
+}
+
+func (b *revokingReadCAS) ReadExact(ctx context.Context, coords []allocator.Coordinate) ([]allocator.Cell, error) {
+	cells, err := b.CAS.ReadExact(ctx, coords)
+	if b.corrupt && len(cells) > 0 {
+		cells[0].Value = []byte("corrupt")
+	}
+	b.afterRead()
+	return cells, err
+}
+func TestRevocationDuringStorageDoesNotDiscloseErrorState(t *testing.T) {
+	for _, operation := range []string{"load", "retain conflict"} {
+		for _, exists := range []bool{false, true} {
+			name := operation + " absent"
+			if exists {
+				name = operation + " existing"
+			}
+			t.Run(name, func(t *testing.T) {
+				r, d, ctx, resolver, clock := fixture(t)
+				c, a, _ := newCatalog(t, r, resolver, clock)
+				if exists {
+					if err := c.Retain(ctx, r); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if operation == "load" {
+					// Corruption and absence must be indistinguishable after revocation.
+					c.config.Backend = &revokingReadCAS{CAS: c.config.Backend, corrupt: true, afterRead: func() { a.deny = true }}
+					b, err := c.LoadAuthorized(ctx, d, a.id)
+					if !shoal.IsErrorCode(err, shoal.ErrorNotFound) || b.Request.ID() != "" {
+						t.Fatal("read exposed storage state after revocation", err)
+					}
+				} else {
+					r.Bundle.TaskResource.SourceID = []byte("evidence")
+					var err error
+					a.expected, err = encode(r)
+					if err != nil {
+						t.Fatal(err)
+					}
+					c.config.Backend = &faultyCAS{CAS: c.config.Backend, afterWrite: func() { a.deny = true }}
+					if err := c.Retain(ctx, r); !shoal.IsErrorCode(err, shoal.ErrorNotFound) {
+						t.Fatal("write exposed conflict after revocation", err)
+					}
+				}
+			})
+		}
+	}
+}

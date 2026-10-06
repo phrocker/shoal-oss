@@ -109,6 +109,11 @@ func (c *Catalog) Retain(ctx context.Context, r Record) error {
 		// A lost acknowledgment is success only if the exact immutable row is read
 		// back. A failed read cannot prove rollback, even after a CAS rejection.
 		stored, readErr := c.read(ctx, coord)
+		// Errors can disclose storage state too. Recheck access after the last
+		// I/O before distinguishing a conflicting row from an absent one.
+		if _, err := c.reauthorize(ctx, d, id); err != nil {
+			return err
+		}
 		if readErr != nil {
 			return ErrIndeterminate
 		}
@@ -136,9 +141,13 @@ func (c *Catalog) LoadAuthorized(ctx context.Context, supplied auth.Decision, id
 	if err := c.preflight(ctx, d, id); err != nil {
 		return decisionservice.Bundle{}, err
 	}
-	encoded, err := c.read(ctx, c.coordinate(d, id))
+	encoded, readErr := c.read(ctx, c.coordinate(d, id))
+	current, err := c.reauthorize(ctx, d, id)
 	if err != nil {
 		return decisionservice.Bundle{}, err
+	}
+	if readErr != nil {
+		return decisionservice.Bundle{}, readErr
 	}
 	r, err := decode(encoded)
 	if err != nil {
@@ -146,10 +155,6 @@ func (c *Catalog) LoadAuthorized(ctx context.Context, supplied auth.Decision, id
 	}
 	if r.Bundle.Request.ID() != id {
 		return decisionservice.Bundle{}, ErrUnavailable
-	}
-	current, err := c.resolveSame(ctx, d)
-	if err != nil {
-		return decisionservice.Bundle{}, err
 	}
 	if err := c.check(ctx, current, r, encoded, false); err != nil {
 		return decisionservice.Bundle{}, err
@@ -227,6 +232,19 @@ func (c *Catalog) resolve(ctx context.Context) (auth.Decision, error) {
 	}
 	return d, nil
 }
+
+// reauthorize protects both successful payloads and storage-state errors.
+func (c *Catalog) reauthorize(ctx context.Context, before auth.Decision, id shoal.ID) (auth.Decision, error) {
+	current, err := c.resolveSame(ctx, before)
+	if err != nil {
+		return auth.Decision{}, err
+	}
+	if err := c.preflight(ctx, current, id); err != nil {
+		return auth.Decision{}, err
+	}
+	return current, nil
+}
+
 func (c *Catalog) resolveSame(ctx context.Context, before auth.Decision) (auth.Decision, error) {
 	d, err := c.resolve(ctx)
 	if err != nil {
