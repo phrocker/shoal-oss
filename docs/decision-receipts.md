@@ -91,7 +91,11 @@ go test -race ./internal/decisionstore ./pkg/decision ./internal/explorercoord
 go vet ./internal/decisionstore
 ```
 
-#403 remains open for authenticated service composition, attributed append-only
+The [authenticated service composition](decision-service.md) now exercises this
+store behind trusted resolver/artifact/provider interfaces. Production artifact
+retention and provider installation remain pending.
+
+#403 remains open for attributed append-only
 outcomes and their authorization/adjudication rules, durable artifact retention,
 and lifecycle/audit integration. #418 will wire registered providers and HTTP/SDK
 operations through that service. No model is invoked and no existing experiment,

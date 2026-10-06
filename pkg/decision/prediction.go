@@ -182,10 +182,19 @@ func NewDecisionRequest(task TaskSpec, picture PictureManifest, predictor Predic
 	}
 	return request, nil
 }
-func (r DecisionRequest) ID() shoal.ID          { return r.id }
-func (r DecisionRequest) TaskID() shoal.ID      { return r.task.id }
-func (r DecisionRequest) PictureID() shoal.ID   { return r.picture.id }
-func (r DecisionRequest) PredictorID() shoal.ID { return r.predictor.id }
+
+// Predictor returns the immutable runtime identity bound to this request.
+func (r DecisionRequest) Predictor() PredictorIdentity { return r.predictor }
+
+// Task returns the immutable registered task bound to this request.
+func (r DecisionRequest) Task() TaskSpec { return r.task }
+
+// Picture returns the immutable evidence picture bound to this request.
+func (r DecisionRequest) Picture() PictureManifest { return r.picture }
+func (r DecisionRequest) ID() shoal.ID             { return r.id }
+func (r DecisionRequest) TaskID() shoal.ID         { return r.task.id }
+func (r DecisionRequest) PictureID() shoal.ID      { return r.picture.id }
+func (r DecisionRequest) PredictorID() shoal.ID    { return r.predictor.id }
 func (r DecisionRequest) Config() RequestConfig {
 	c := r.config
 	c.SubjectIDs = append([]shoal.ID(nil), c.SubjectIDs...)
