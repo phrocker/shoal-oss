@@ -74,3 +74,27 @@ independent code review then reproduced a strict-decoding gap: Go's struct decod
 accepted case-insensitive field aliases and converted null scores to zero, even
 when the malformed manifest had a matching externally supplied hash. Required,
 case-sensitive field and type validation is necessary in addition to byte pins.
+
+The parser fix requires every field with its exact spelling and type, rejects
+nulls, and rejects invalid UTF-8 or unpaired Unicode escapes. Regression cases
+cover missing, null and aliased fields throughout the manifest. A fresh second
+independent code review of `11a42b9` found **no actionable findings**. It also
+independently compared retained subject identities, ordering and original scores
+to the pinned archive. No power-loss or concurrent filesystem-race simulation
+was performed.
+
+## Executed evidence
+
+The [retained summary](evidence/frozen-code-2026-10-06/summary.json) and
+[per-subject replay](evidence/frozen-code-2026-10-06/replay.json) record the run at
+`11a42b9`: **188/188 proposals matched**, with 47 lower priority and 141 retain.
+Two separate exports produced byte-identical artifacts across all 192 files;
+two separate Go replay processes produced byte-identical reports. These are
+recomputed provider results, not service receipt replay. All 26 Python tests,
+targeted Go race tests and vet passed. No paid classifier calls were made.
+
+The retained manifest binds the generated inputs and model. Recipe/runtime
+records describe the import. Reproduce the dense inputs with the commands above;
+they are intentionally omitted from the repository. This result establishes the
+frozen code model's numeric-provider compatibility on this cohort. It does not
+repair V9's known quality limitations or authorize source exclusion.
