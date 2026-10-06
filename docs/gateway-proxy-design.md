@@ -10,6 +10,7 @@ of its scope items asks for a mechanism that does not exist.
 
 - [The thing that makes this different](#the-thing-that-makes-this-different)
 - [Two paths, and why both](#two-paths-and-why-both)
+- [What the fence does not protect](#what-the-fence-does-not-protect)
 - [The fence, and what it costs](#the-fence-and-what-it-costs)
 - [Lease arithmetic](#lease-arithmetic)
 - [Reporting an ambiguity when the fence is gone](#reporting-an-ambiguity-when-the-fence-is-gone)
@@ -32,10 +33,14 @@ not undo them and will not pretend to.
 
 Two consequences shape everything below.
 
-**At-most-once is the guarantee, not at-least-once.** A duplicate disclosure is
-the same disclosure. A duplicate payment is a second payment. Anything in front
-of an irreversible effect that can be retried by a client is wrong by
+**At-most-once is the requirement, not at-least-once.** A duplicate disclosure
+is the same disclosure. A duplicate payment is a second payment. Anything in
+front of an irreversible effect that can be retried by a client is wrong by
 construction.
+
+Requirement, not guarantee — and the distinction is the sharpest thing in this
+document. See [What the fence does not
+protect](#what-the-fence-does-not-protect).
 
 **The declaration cannot come from the request.** `EffectMutatesExternal` is a
 property of the target, not of the code — the same statement
@@ -80,9 +85,10 @@ not re-evaluate the ceiling; registration and resolution do. An operator
 tightening a ceiling should expect already-queued work to stop resolving, not to
 have been rejected when it was enqueued.
 
-The claim then establishes a fence, which is what makes at-most-once meaningful:
-a second worker cannot claim a live action, and a report under a stale fence is
-rejected rather than accepted.
+The claim then establishes a fence. A second worker cannot claim a *live* action,
+and a report under a stale fence is rejected rather than accepted — so the
+**record** admits at most one completion per claim. That is necessary and it is
+not sufficient; the next section is about why.
 
 This is the only path with a fence, so **every non-idempotent operation must use
 it.**
@@ -114,6 +120,47 @@ values file where a reviewer can see it.
 A route declared idempotent and not actually idempotent is an operator error
 Shoal cannot detect. The design's job is to make the assertion explicit and
 auditable, not to pretend it can be verified.
+
+## What the fence does not protect
+
+The fence is a lock on Shoal's record. It is not a lock on the target, and
+nothing in Shoal can make it one.
+
+A worker that is partitioned, or paused long enough by GC or by the scheduler,
+can still be inside its operation when its lease expires. The action is then
+requeued, a second worker claims it under a new fence, and performs the same
+operation. The first worker's completion is rejected when it returns — correctly
+— but the effect has happened twice. The record is consistent and the world is
+not.
+
+This is the standard limit of fencing tokens: they only confer mutual exclusion
+if the **resource** validates them. Shoal's record validates the fence; Slack
+does not.
+
+So the honest statement of Path A's guarantee has two cases, and which one
+applies is a property of the target rather than of this design:
+
+| target | guarantee |
+|---|---|
+| accepts an idempotency key | at-most-once at the target |
+| does not | at-most-once absent a partition; a partition can duplicate, and the duplicate is **detectable but not preventable** |
+
+Where the target accepts one, the gateway must send an idempotency key, and
+**the key must be derived from the action, never from the claim.** Two claims of
+one action are exactly the case that needs collapsing, so a key including
+`ClaimFence` or `ClaimID` would differ between them and the target would treat
+the second as new work — defeating the mechanism precisely when it is needed.
+The action's ID is the stable identity; the claim is not.
+
+Where the target does not accept one, the design must not claim what it cannot
+deliver. `EffectPossible` is set at claim time for any external-mutating or
+egressing action and is **never cleared** — it is only ever set true
+(`pkg/explorer/fleet/dispatch_service.go:376`, `:698`) — so it survives the
+requeue and the second claim. An operator reconciling a duplicated effect has
+that flag and the fence history; they do not have prevention. For targets where
+a duplicate is unacceptable and no idempotency key exists, the correct answer is
+that this gateway is not sufficient, and saying so is better than shipping a
+guarantee that holds only until the first partition.
 
 ## The fence, and what it costs
 
@@ -185,15 +232,42 @@ A worker whose renewal is refused mid-operation cannot report through
 #391 requires be recorded "with enough detail that an operator can reconcile",
 and the obvious channel is unavailable by construction.
 
-The answer is to report it through a channel the fence does not gate:
-`/api/v1/fleet/events/publish`. The ambiguity becomes a lifecycle event naming
-the action, the lost claim, the target and what was attempted — not a completion,
-because the worker has no standing to complete anything, and not silence,
-because silence is indistinguishable from a worker that never started.
+Part of this is already solved and part of it is not, and an earlier draft of
+this document got the division wrong by proposing a lifecycle event the public
+route cannot carry.
 
-This gives the gateway a second authorization requirement (event publication)
-that is deliberately separate from its dispatch authorization, so losing a claim
-does not also cost it the ability to say so.
+**The fact survives without the worker doing anything.** `EffectPossible` is set
+at claim time for external-mutating and egressing actions and is never cleared —
+only ever set true (`pkg/explorer/fleet/dispatch_service.go:376`, `:698`). It
+therefore persists across lease expiry, requeue and re-claim. A record that has
+ever been claimed for an external effect carries "an effect may have happened"
+permanently, which is the part that matters most and costs nothing.
+
+**The detail does not, and the obvious route refuses it.**
+`/api/v1/fleet/events/publish` cannot publish a lifecycle event:
+`fleetevents.Service.Publish` rejects any reserved `action.*` kind outright
+("fleet lifecycle event kinds require trusted publication"), and
+`PublishLifecycle` is an in-process path requiring a reconcile capability and a
+`LifecycleReceipt` carrying a request ID, an authorization fingerprint, a UTC
+expiry and a matching correlation ID (`pkg/explorer/fleetevents/service.go:254-291`).
+An out-of-process worker can produce none of that, and should not be able to —
+that gate is what keeps the lifecycle record trustworthy.
+
+So the worker's options are a **non-reserved** event kind of its own
+(`gateway.effect_ambiguous`, say) through the public route, which needs a stated
+consumer contract because nothing correlates it to the `ActionRecord`
+automatically; or a dedicated route that attaches an ambiguity note to an action
+the caller can no longer complete.
+
+The second is better and is probably a prerequisite rather than a follow-on. An
+ambiguity that is reconcilable only by convention is one an operator has to know
+to go looking for, and the whole point is that they will be reconciling under
+time pressure. A route authorized like `complete` but accepting a *lost-fence*
+report would attach the detail to the record that already carries
+`EffectPossible`, which is where someone reconciling will actually look.
+
+Either way the gateway needs an authorization separate from its dispatch
+authorization, so losing a claim does not also cost it the ability to say so.
 
 ## The unit of deployment is the operational surface
 
@@ -214,11 +288,29 @@ compromise reaches one surface.
 
 Three things follow and are the real reason this is not merely tidier:
 
-**Network policy becomes expressible.** A per-surface worker needs egress to
-exactly one target, which a `NetworkPolicy` can state. A single pool needs egress
-to all of them, which is not a policy so much as a hole. The explorer needs
-egress to none, and that asymmetry is only enforceable if the gateway is not
-also the explorer.
+**Network policy becomes expressible — to the extent the substrate allows.** A
+per-surface worker needs egress to exactly one target; a pool needs egress to all
+of them, which is not a policy so much as a hole. The explorer needs egress to
+none, and that asymmetry is only enforceable if the gateway is not also the
+explorer.
+
+How enforceable the single-target half is depends on where the target lives, and
+an earlier draft of this document overstated it. A standard `NetworkPolicy`
+selects pods, namespaces and CIDRs — **not DNS names.** `slack.com` and
+`api.github.com` are not expressible in it, and egress to the cluster DNS
+service has to be permitted explicitly or name resolution fails before any
+policy question arises. So:
+
+| target | exact-target egress policy |
+|---|---|
+| in-cluster (a database `Service`) | expressible in standard `NetworkPolicy` |
+| external FQDN | needs an FQDN-aware CNI (Cilium and similar), a pinned CIDR set, or an egress proxy the policy *can* name |
+
+A pinned CIDR set for a SaaS target is a maintenance trap and should be treated
+as one; the provider changes it and the gateway fails closed at an unhelpful
+moment. Where none of the three is available, per-surface deployment still buys
+the credential and capability isolation below, and the network half should be
+described as what it is — unenforced — rather than assumed.
 
 **Credentials stop being ambient.** Each Deployment mounts one target credential.
 A worker performing a Slack post has no path to the database password, by
@@ -269,6 +361,12 @@ gateways:
       credentialSecretName: ""
       credentialFile: ""     # preferred: rotates under a running pod
       idempotent: false      # gates Path B; see "Two paths"
+      # Where the target accepts an idempotency key, name the header. The key is
+      # derived from the action ID and never from the claim, so two claims of one
+      # action collapse at the target. Empty means the target has no such
+      # mechanism, and Path A's guarantee is then the weaker of the two cases in
+      # "What the fence does not protect" — which an operator should have to see.
+      idempotencyKeyHeader: ""
     dispatch:
       url: ""                # the explorer's authenticated API
       tokenFile: ""
@@ -289,11 +387,20 @@ Deployment properties, with the reasoning that is not obvious:
 - **`replicas: 2` or more is safe for Path A, and that is because of the fence**,
   not despite it. Two workers cannot hold one action. This is the opposite of the
   explorer, which refuses a second replica.
-- **`terminationGracePeriodSeconds` must exceed `claimLease`.** On `SIGTERM` the
+- **`terminationGracePeriodSeconds` must exceed `operationTimeout` plus the
+  report window — not `claimLease`.** With renewal in place `claimLease` is only
+  the silence interval, and an operation is *expected* to outlive it across
+  several renewals, so sizing the grace period against the lease would cut off
+  exactly the long operations renewal exists to permit. The bound that matters is
+  how long the work itself can run plus the time to report it. On `SIGTERM` the
   worker stops pulling, finishes or abandons the claim it holds, reports, and
-  exits. A grace period shorter than the lease reintroduces the stranding that
-  #417 fixed for the proxy — and here the stranded thing is an irreversible
-  effect rather than a completion.
+  exits; a grace period shorter than that reintroduces the stranding #417 fixed
+  for the proxy, and here the stranded thing is an irreversible effect rather
+  than a completion.
+
+  This is a correction to an earlier draft, which carried over the proxy's
+  "drain for the lease" rule without noticing that renewal changes what the
+  lease means.
 - **No `PodDisruptionBudget` subtlety.** A worker holding no claim is freely
   evictable; one holding a claim finishes it inside the grace period.
 - **Readiness means "pulling".** Liveness means the process is up. A worker that
@@ -311,7 +418,8 @@ nothing happens. Path B has to deny explicitly, exactly as the LLM proxy does.
 |---|---|---|
 | plane unreachable (Path A) | action stays queued | worker not ready; no effect |
 | plane unreachable (Path B) | nothing | `503`, distinguishable from a denial |
-| effects exceed capabilities | refused at enqueue | the enqueue fails; no worker involved |
+| effects exceed the executor ceiling at registration | the descriptor is refused | registration fails; no action exists |
+| ceiling tightened after enqueue | action stops resolving for claim | queued work stops being handed out; no worker involved |
 | target unreachable | `failed` under fence | `EffectPossible` true, effect did not occur |
 | target timed out after the request left | `failed` under fence | `EffectPossible` true, effect **may** have occurred |
 | renewal refused mid-operation | claim lost, no completion | lifecycle event naming the ambiguity |
@@ -327,6 +435,18 @@ success or failure.
 
 - **#430 must land first.** Without renewal the fenced window is five minutes and
   the SSH and database surfaces #391 names are unreachable.
+- **How a lost-fence ambiguity reaches the record.** The public events route
+  cannot carry a lifecycle event, by design, and a non-reserved event kind is
+  reconcilable only by convention. A route that attaches an ambiguity note to an
+  action the caller can no longer complete is the better answer and is probably
+  a second prerequisite rather than a follow-on. Until it exists, the durable
+  signal is `EffectPossible` alone — the fact without the detail.
+- **Whether a target without an idempotency key is in scope at all.** Path A
+  gives at-most-once at the target only where the target accepts a key derived
+  from the action. Where it does not, a partition can duplicate the effect and
+  the design can only make that detectable. For some surfaces that is
+  acceptable; for others the right answer is that this gateway is not sufficient,
+  and the values file should have to say which.
 - **Does Path B belong in the same binary?** It shares the target configuration
   and credential handling, which argues yes. It has entirely different semantics,
   which argues for a separate command so the missing guarantee cannot be reached
