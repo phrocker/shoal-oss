@@ -953,8 +953,13 @@ func (s *AdmissionService) Report(
 	// absent case here; that was a fix in one caller for a property all of them
 	// need, and it is gone because the guarantee moved to where the two shapes
 	// actually meet.
-	current, err := dispatch.authorizedCurrent(
-		ctx, decision, report.Token.ActionID, auth.OperationInvoke, now)
+	// An admission is reported by the principal that requested it — the proxy
+	// holds one identity for both halves — so this keeps the principal
+	// requirement rather than taking the executor routes #437 added. An
+	// admission is also not reclaimable, so there is no second claimant for
+	// those routes to serve.
+	current, _, err := dispatch.authorizedCurrent(
+		ctx, decision, report.Token.ActionID, auth.OperationInvoke, true, now)
 	if err != nil {
 		return ActionRecord{}, err
 	}

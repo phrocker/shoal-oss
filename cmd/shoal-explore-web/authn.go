@@ -81,6 +81,7 @@ var workspaceOperations = []auth.Operation{
 	auth.OperationDelegate,
 	auth.OperationDispatch,
 	auth.OperationInvoke,
+	auth.OperationExecute,
 	auth.OperationSubscriptionCreate,
 	auth.OperationSubscriptionDelete,
 	auth.OperationSubscriptionDeliver,

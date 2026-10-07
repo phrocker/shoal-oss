@@ -65,7 +65,23 @@ const (
 	OperationRetrieve         Operation = "retrieve"
 	OperationValidate         Operation = "validation"
 
-	OperationInvoke                 Operation = "invoke"
+	OperationInvoke Operation = "invoke"
+	// OperationExecute is permission to take an agent's queued work and finish
+	// it — pull, claim and complete — as distinct from OperationInvoke, which
+	// is permission to ask that agent to do something.
+	//
+	// They were one operation, and that is what made an out-of-process
+	// executor impossible (#437). Claiming was authorized under invoke and
+	// additionally required the claimant to be the principal that enqueued, so
+	// an agent could enqueue work and a gateway could never take it: every
+	// record failed the predicate and was silently skipped, leaving a ready
+	// worker and a growing queue.
+	//
+	// Separating them is what lets the enqueuer and the executor be different
+	// principals without making every invoker an executor. An agent that may
+	// ask a gateway to post a message does not thereby gain the ability to
+	// claim another agent's queued work and read its input.
+	OperationExecute                Operation = "execute"
 	OperationDispatch               Operation = "dispatch"
 	OperationDelegate               Operation = "delegate"
 	OperationAgentRegister          Operation = "agent_register"
@@ -97,7 +113,7 @@ func (o Operation) Validate() error {
 	case OperationIngest, OperationList, OperationRead, OperationConnect,
 		OperationGraphMaterialize,
 		OperationNeighborhood, OperationRetrieve, OperationValidate,
-		OperationInvoke, OperationDispatch, OperationDelegate,
+		OperationInvoke, OperationExecute, OperationDispatch, OperationDelegate,
 		OperationAgentRegister, OperationAgentHeartbeat, OperationAgentRevoke,
 		OperationAgentResolve, OperationSubscriptionCreate,
 		OperationSubscriptionDelete, OperationSubscriptionDeliver,
@@ -122,7 +138,12 @@ const (
 	ServiceRoleMigration     ServiceRole = "migration"
 	ServiceRoleSecurityAdmin ServiceRole = "security_admin"
 
-	ServiceRoleActionInvocation       ServiceRole = "action_invocation"
+	ServiceRoleActionInvocation ServiceRole = "action_invocation"
+	// ServiceRoleActionExecution is the role a worker holds: it may take and
+	// finish queued work and do nothing else. Deliberately not granted by
+	// ServiceRoleActionInvocation, so a principal that may enqueue cannot
+	// thereby claim.
+	ServiceRoleActionExecution        ServiceRole = "action_execution"
 	ServiceRoleActionDispatch         ServiceRole = "action_dispatch"
 	ServiceRoleDelegation             ServiceRole = "delegation"
 	ServiceRoleAgentRegistration      ServiceRole = "agent_registration"
@@ -141,7 +162,8 @@ func (r ServiceRole) Validate() error {
 	switch r {
 	case ServiceRoleDataRead, ServiceRoleDataWrite, ServiceRoleCoordination,
 		ServiceRoleDerivation, ServiceRoleMigration, ServiceRoleSecurityAdmin,
-		ServiceRoleActionInvocation, ServiceRoleActionDispatch,
+		ServiceRoleActionInvocation, ServiceRoleActionExecution,
+		ServiceRoleActionDispatch,
 		ServiceRoleDelegation, ServiceRoleAgentRegistration,
 		ServiceRoleAgentRevocation, ServiceRoleAgentResolution,
 		ServiceRoleSubscription, ServiceRoleEventPublication,
@@ -177,6 +199,8 @@ func (r ServiceRole) Allows(operation Operation) bool {
 		return isLegacyMigrationOperation(operation)
 	case ServiceRoleActionInvocation:
 		return operation == OperationInvoke || operation == OperationValidate
+	case ServiceRoleActionExecution:
+		return operation == OperationExecute || operation == OperationValidate
 	case ServiceRoleActionDispatch:
 		return operation == OperationDispatch || operation == OperationValidate
 	case ServiceRoleDelegation:

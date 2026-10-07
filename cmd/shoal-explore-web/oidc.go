@@ -188,6 +188,14 @@ var oidcFleetOperations = []auth.Operation{
 	auth.OperationDelegate,
 	auth.OperationDispatch,
 	auth.OperationInvoke,
+	// Execute is permission to take queued work and finish it, which invoke
+	// deliberately no longer implies (#437). It is in this ceiling so the
+	// operation is reachable at all; note that one -oidc-fleet-values mapping
+	// grants both, so a token minted through it carries invoke and execute
+	// together. Expressing the split an operator actually wants — an agent
+	// that may enqueue and not claim, a worker that may claim and not enqueue
+	// — needs its own claim mapping, which this does not add.
+	auth.OperationExecute,
 	auth.OperationSubscriptionCreate,
 	auth.OperationSubscriptionDelete,
 	auth.OperationSubscriptionDeliver,
