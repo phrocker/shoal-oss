@@ -633,6 +633,7 @@ func requestMayCommit(method, path string) bool {
 	case "/api/v1/ingest",
 		"/api/v1/decisions",
 		"/api/v1/outcomes",
+		"/api/v1/adjudications",
 		// Collector writes commit before the response is encoded. Their
 		// receipts are small and fixed-shape so a narrow budget still fits;
 		// the GET read route commits nothing and is deliberately absent.
