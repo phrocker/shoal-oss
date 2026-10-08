@@ -44,6 +44,12 @@ Control, mode and the ceiling are not request fields; a body carrying them is
 rejected as unknown fields. No field carries a model score, and extraction
 confidence never maps to authority.
 
+A collector's identity (authorization domain, subject and client ID) is fixed
+for the life of its collector ID. Provisioning an existing ID with a different
+identity is a conflict, even after revocation; use a new collector ID. Revoked
+collectors may be re-provisioned with new authority, control or mode under the
+same identity.
+
 Only the provisioned principal can enroll or submit for a collector. Any other
 principal, including a delegated decision for the right subject, gets
 `404 not_found`, as if the collector did not exist. Writes require
@@ -69,6 +75,11 @@ An observation is accepted only from the collector's provisioned principal,
 only for an extractor its current enrollment declares, and only over an
 artifact that same collector recorded in its current generation.
 
+Artifacts are stored per generation: an artifact ID used in an earlier
+generation is invisible to the next one, which records its own reference.
+Every artifact and observation row also stores the authorization domain it was
+written in.
+
 `Confidence.Disposition` is `extracted`, `low_confidence` or `unextractable`,
 with an optional value in [0, 1]. It is how sure the extractor is that it read
 its input, not a judgement about the content.
@@ -81,11 +92,13 @@ written under. `GET /api/v1/collectors/observations/{id}` computes
 `status` from the collector's current registration: `quarantined` when the
 collector is revoked or the generation differs, otherwise `active`. Rows are
 never rewritten. Revoked collectors cannot enroll or submit. Re-provisioning
-starts the new generation; the old generation stays quarantined and its
-artifacts cannot carry new observations.
+starts the new generation; the old generation stays quarantined, its
+artifacts cannot carry new observations, and resubmitting an identical
+observation first recorded in it is refused rather than re-activated.
 
-Any caller with `OperationRead` in the collector's authorization domain may
-read an observation. Finer read scoping (by authority policy) is not
+Any caller with `OperationRead` in the authorization domain stored with an
+observation may read it. Reads are authorized against that stored domain, never
+against a later registration. Finer read scoping (by authority policy) is not
 implemented in this slice.
 
 ## Retries
@@ -95,7 +108,8 @@ Every write is idempotent and reports `indeterminate` (`503` with
 when the durable outcome is unknown. Retry with the identical request.
 
 - Enroll takes an `Idempotency-Key`. Same key and request return the original
-  receipt, including after a later enrollment superseded it. A different
+  receipt, including after a later enrollment superseded it and after its
+  attestation expired (expiry is applied when observations are mapped, below). A different
   request under the same key, or a key first used in an earlier generation, is
   a conflict. Re-enrolling (new key) within the ceiling replaces the current
   enrollment without changing the generation.
@@ -106,10 +120,16 @@ when the durable outcome is unknown. Retry with the identical request.
 The three write routes are listed in `requestMayCommit`
 (`pkg/explorer/webapi/workspace_settings.go`), so an over-budget response is
 reported as indeterminate rather than as a failure. Their receipts carry IDs,
-generation, state and receipt time, never submitted payloads or evidence, so a
-narrow workspace output budget does not make a committed write unreadable.
-Content is read back with the GET route, which commits nothing and is not
-listed.
+generation, state and receipt time, never submitted payloads or evidence, so
+their size does not grow with what was submitted. With every ID at
+`shoal.MaxIDBytes` the largest receipts measure 1600 bytes (enroll), 2860
+(artifact) and 2982 (observation)
+(`pkg/collector/api/receipt_size_test.go`). A workspace `OutputBytes` budget of
+at least `api.MaxReceiptBytes` (3072) therefore always returns a readable
+receipt. Below the size of a particular receipt, a write that committed
+reports indeterminate: safe, because a retry returns the same receipt, but
+unreadable under that budget. Content is read back with the GET route, which
+commits nothing and is not listed.
 
 ## Attestation
 
@@ -141,7 +161,11 @@ are stored as provenance; no policy consumes them yet.
 `collectorregistry.Source` maps an active observation onto `decision.Source` by
 value: `OriginID` is the collector, `AuthorityPolicyID` must be granted by the
 observation's enrollment and still provisioned, `Control` is the provisioned
-control, `AttestationID` is set only for verified attestation. This is an
+control. `AttestationID` is set only for verified attestation, and only when
+the observation's observed and received times both fall within the
+statement's `[IssuedAt, ExpiresAt)`. An enrollment lasts until revocation but
+its attestation does not; outside that window the attestation has lapsed
+(`collectorregistry.AttestationLapsed`) and the source carries none. This is an
 **internal adapter, not an agreed contract**; how pictures consume collector
 observations belongs to the decision track (#418).
 
@@ -150,18 +174,26 @@ observations belongs to the decision track (#418).
 `internal/importboundary` parses source files (it does not need the go command,
 so it works with `GOWORK=off`) and fails when:
 
-- A. anything under `pkg/`, `internal/` or `cmd/` imports `extensions/`;
-- B. an extension module imports a repository package outside
-  `pkg/sdk`, `pkg/collector`, `pkg/collector/api`, `pkg/decision/api`, `pkg/shoal`;
+- A. any package in the root module (not only `pkg/`, `internal/` and
+  `cmd/`) imports `extensions/`;
+- B. an extension module (any `go.mod` under `extensions/`, at any depth)
+  imports a repository package outside `pkg/sdk`, `pkg/collector`,
+  `pkg/collector/api`, `pkg/decision/api`, `pkg/shoal`; or declares a module
+  path other than the repository module plus its directory (a module naming
+  itself `.../internal` would otherwise exempt its own imports, and Go's
+  `internal` rule does not protect this tree from such a module); or replaces
+  anything other than the repository module with a relative path to this
+  tree; or a Go file under `extensions/` sits outside every extension module;
 - C. the in-repository import closure of those packages contains `internal/`.
 
 Fixtures under `internal/importboundary/testdata` prove each rule detects a
-violation. CI also vets and tests each `extensions/*` module on its own
+violation. CI also vets and tests every module under `extensions/` on its own
 `go.mod`, and fails if a core package links `golang.org/x/crypto/ssh`, an RDP
-library or Guacamole.
+library or Guacamole (a failing `go list` fails that check rather than passing
+it).
 
-`extensions/example-collector` is a synthetic file-tail collector using only the
-SDK. Run it against a host that provisioned it:
+`extensions/example-collector` is a synthetic file-tail collector that imports
+from Shoal only `pkg/sdk` and the allowlisted `pkg/collector` and `pkg/shoal`. Run it against a host that provisioned it:
 
 ```sh
 SHOAL_TOKEN=... go run ./extensions/example-collector \

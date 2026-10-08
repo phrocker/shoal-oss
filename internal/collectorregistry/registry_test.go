@@ -2,6 +2,7 @@
 package collectorregistry
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/sha256"
@@ -241,7 +242,8 @@ func TestExtractorVersionsShareLineageAndRevocationQuarantines(t *testing.T) {
 	if e != nil || !got.Quarantined {
 		t.Fatalf("re-provisioning released quarantine: %+v %v", got, e)
 	}
-	if _, e := v.registry.SubmitObservation(ctx, observation(t, v, "artifact:1", v1)); !errors.Is(e, api.ErrPermissionDenied) {
+	// The generation-1 artifact is invisible to generation 2.
+	if _, e := v.registry.SubmitObservation(ctx, observation(t, v, "artifact:1", v1)); !shoal.IsErrorCode(e, shoal.ErrorNotFound) {
 		t.Fatalf("observation over a revoked generation's artifact: %v", e)
 	}
 	if _, e := v.registry.SubmitArtifact(ctx, collectorID, ref); e != nil {
@@ -457,5 +459,144 @@ func TestCorruptRowsFailClosed(t *testing.T) {
 	tampered := []byte(strings.Replace(string(cell.Value), `"Schema":1`, `"Schema":1 `, 1))
 	if decode(tampered, &row) == nil {
 		t.Fatal("non-canonical row accepted")
+	}
+}
+
+// Finding 1: a revoked collector cannot be re-provisioned into another
+// domain or principal, rows keep their own domain, and a new generation never
+// sees an earlier generation's artifact.
+func TestIdentityIsFixedAndRowsKeepTheirDomain(t *testing.T) {
+	v := newEnv(t)
+	v.provision(t, collectorID, "tail", "authority:logs")
+	ctx := v.as(t, "tail")
+	if _, e := v.registry.Enroll(ctx, []byte("k"), enrollRequest(collectorID, "authority:logs")); e != nil {
+		t.Fatal(e)
+	}
+	ref := artifact(t, v, "artifact:1", "secret")
+	if _, e := v.registry.SubmitArtifact(ctx, collectorID, ref); e != nil {
+		t.Fatal(e)
+	}
+	o := observation(t, v, "artifact:1", v1)
+	if _, e := v.registry.SubmitObservation(ctx, o); e != nil {
+		t.Fatal(e)
+	}
+	if _, e := v.registry.Revoke(context.Background(), collectorID); e != nil {
+		t.Fatal(e)
+	}
+	for name, p := range map[string]Provisioning{
+		"domain":  {CollectorID: collectorID, Subject: "tail", ClientID: "client", Domain: []byte("other"), AuthorityPolicyIDs: []shoal.ID{"authority:logs"}, Control: collector.ExternalControlled, Mode: collector.ServerObserved},
+		"subject": {CollectorID: collectorID, Subject: "mallory", ClientID: "client", Domain: []byte("domain"), AuthorityPolicyIDs: []shoal.ID{"authority:logs"}, Control: collector.ExternalControlled, Mode: collector.ServerObserved},
+		"client":  {CollectorID: collectorID, Subject: "tail", ClientID: "other", Domain: []byte("domain"), AuthorityPolicyIDs: []shoal.ID{"authority:logs"}, Control: collector.ExternalControlled, Mode: collector.ServerObserved},
+	} {
+		if _, e := v.registry.Provision(context.Background(), p); !shoal.IsErrorCode(e, shoal.ErrorConflict) {
+			t.Fatalf("revoked collector re-provisioned with new %s: %v", name, e)
+		}
+	}
+	if reg, _ := v.registry.Registration(context.Background(), collectorID); !bytes.Equal(reg.Domain, []byte("domain")) || reg.Subject != "tail" {
+		t.Fatalf("identity changed: %+v", reg)
+	}
+	// A reader in another domain cannot see the row, whatever the registry
+	// says now; the original domain still can (quarantined).
+	other, e := auth.NewDecision(auth.DecisionConfig{Subject: "reader", Actor: "reader", ClientID: "client", AuthorizationDomain: []byte("other"), AllowedOperations: []auth.Operation{auth.OperationRead}, PolicyGeneration: 1, AuthenticationExpires: v.clock.Now().Add(time.Hour), RequestID: "r"})
+	if e != nil {
+		t.Fatal(e)
+	}
+	otherCtx, _ := v.authority.Binder().Bind(context.Background(), other)
+	if _, e := v.registry.ReadObservation(otherCtx, o.ID()); !shoal.IsErrorCode(e, shoal.ErrorNotFound) {
+		t.Fatalf("cross-domain read: %v", e)
+	}
+	if got, e := v.registry.ReadObservation(ctx, o.ID()); e != nil || !got.Quarantined {
+		t.Fatalf("original domain read: %+v %v", got, e)
+	}
+
+	// Re-provision with the same identity (and new terms). The old artifact
+	// ID is a fresh, distinct record in generation 2, never the old one.
+	if _, e := v.registry.Provision(context.Background(), Provisioning{CollectorID: collectorID, Subject: "tail", ClientID: "client", Domain: []byte("domain"), AuthorityPolicyIDs: []shoal.ID{"authority:logs", "authority:metrics"}, Control: collector.ExternalControlled, Mode: collector.ServerObserved}); e != nil {
+		t.Fatal(e)
+	}
+	if _, e := v.registry.Enroll(ctx, []byte("k2"), enrollRequest(collectorID, "authority:logs")); e != nil {
+		t.Fatal(e)
+	}
+	v.clock.Advance(time.Minute)
+	different := ref
+	different.Size++
+	got, e := v.registry.SubmitArtifact(ctx, collectorID, different)
+	if e != nil || got.Generation != 2 || !reflect.DeepEqual(got.Ref, different) {
+		t.Fatalf("generation 2 artifact under an old ID: %+v %v", got, e)
+	}
+	// Within generation 2 the ID is now taken by the new reference.
+	if _, e := v.registry.SubmitArtifact(ctx, collectorID, ref); !shoal.IsErrorCode(e, shoal.ErrorConflict) {
+		t.Fatalf("conflicting ref in generation 2: %v", e)
+	}
+}
+
+func TestResubmittingOldGenerationObservationStaysQuarantined(t *testing.T) {
+	v := newEnv(t)
+	v.provision(t, collectorID, "tail", "authority:logs")
+	ctx := v.as(t, "tail")
+	_, _ = v.registry.Enroll(ctx, []byte("k"), enrollRequest(collectorID, "authority:logs"))
+	ref := artifact(t, v, "artifact:1", "x")
+	_, _ = v.registry.SubmitArtifact(ctx, collectorID, ref)
+	o := observation(t, v, "artifact:1", v1)
+	if _, e := v.registry.SubmitObservation(ctx, o); e != nil {
+		t.Fatal(e)
+	}
+	_, _ = v.registry.Revoke(context.Background(), collectorID)
+	v.provision(t, collectorID, "tail", "authority:logs")
+	_, _ = v.registry.Enroll(ctx, []byte("k2"), enrollRequest(collectorID, "authority:logs"))
+	if _, e := v.registry.SubmitArtifact(ctx, collectorID, ref); e != nil {
+		t.Fatal(e)
+	}
+	if _, e := v.registry.SubmitObservation(ctx, o); !errors.Is(e, api.ErrPermissionDenied) {
+		t.Fatalf("old-generation observation resubmitted: %v", e)
+	}
+	if got, e := v.registry.ReadObservation(ctx, o.ID()); e != nil || !got.Quarantined {
+		t.Fatalf("old observation released: %+v %v", got, e)
+	}
+}
+
+// Finding 2: an attestation that expired before an observation does not
+// lend it an AttestationID, though the enrollment is still current.
+func TestSourceOmitsLapsedAttestation(t *testing.T) {
+	v := newEnv(t)
+	v.provision(t, collectorID, "tail", "authority:logs")
+	ctx := v.as(t, "tail")
+	request := enrollRequest(collectorID, "authority:logs")
+	request.Attestation = signedAttestation(t, v, []byte("k"), v.clock.Now().Add(time.Minute))
+	enrollment, e := v.registry.Enroll(ctx, []byte("k"), request)
+	if e != nil {
+		t.Fatal(e)
+	}
+	ref := artifact(t, v, "artifact:1", "body")
+	_, _ = v.registry.SubmitArtifact(ctx, collectorID, ref)
+	early := observation(t, v, "artifact:1", v1)
+	if _, e = v.registry.SubmitObservation(ctx, early); e != nil {
+		t.Fatal(e)
+	}
+	v.clock.Advance(2 * time.Minute)
+	late := observation(t, v, "artifact:1", v2)
+	if _, e = v.registry.SubmitObservation(ctx, late); e != nil {
+		t.Fatal(e)
+	}
+	// A same-key retry after expiry returns the original receipt.
+	if again, e := v.registry.Enroll(ctx, []byte("k"), request); e != nil || again.ID != enrollment.ID {
+		t.Fatalf("retry after expiry: %v", e)
+	}
+	reg, _ := v.registry.Registration(ctx, collectorID)
+	for _, tc := range []struct {
+		o      collector.Observation
+		lapsed bool
+	}{{early, false}, {late, true}} {
+		record, e := v.registry.ReadObservation(ctx, tc.o.ID())
+		if e != nil {
+			t.Fatal(e)
+		}
+		source, e := Source(reg, enrollment, record, "authority:logs")
+		if e != nil {
+			t.Fatal(e)
+		}
+		if AttestationLapsed(enrollment, record) != tc.lapsed || (source.AttestationID == "") != tc.lapsed {
+			t.Fatalf("lapsed=%v attestation=%q", tc.lapsed, source.AttestationID)
+		}
 	}
 }

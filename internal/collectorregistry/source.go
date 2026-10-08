@@ -3,6 +3,7 @@ package collectorregistry
 
 import (
 	"slices"
+	"time"
 
 	"github.com/phrocker/shoal-oss/pkg/collector"
 	"github.com/phrocker/shoal-oss/pkg/decision"
@@ -17,7 +18,8 @@ import (
 // AuthorityPolicyID must be both granted by the enrollment the observation
 // was recorded under and still provisioned; Control is the provisioned
 // control; AttestationID is set only for a verified attestation, never for a
-// claim. Extraction confidence is deliberately not carried: it is not
+// claim, and only while that attestation covers the observation (see
+// AttestationLapsed). Extraction confidence is deliberately not carried: it is not
 // authority. Quarantined observations are refused.
 func Source(reg collector.Registration, enrollment Enrollment, record ObservationRecord, authorityPolicyID shoal.ID) (decision.Source, error) {
 	c := record.Observation.Config()
@@ -58,8 +60,22 @@ func Source(reg collector.Registration, enrollment Enrollment, record Observatio
 		ObservedAt:        c.ObservedAt,
 		ReceivedAt:        record.ReceivedAt,
 	}
-	if enrollment.Attestation != nil {
+	if !AttestationLapsed(enrollment, record) {
 		source.AttestationID = enrollment.Attestation.ID()
 	}
 	return source, nil
+}
+
+// AttestationLapsed reports whether the enrollment's attestation does not
+// cover the observation. An enrollment lasts until revocation but a verified
+// statement only covers [IssuedAt, ExpiresAt); an observation observed or
+// received outside that window carries no AttestationID. A claim, or no
+// attestation at all, never covers anything.
+func AttestationLapsed(enrollment Enrollment, record ObservationRecord) bool {
+	a := enrollment.Attestation
+	if a == nil || a.Status != collector.AttestationVerified || a.ID() == "" {
+		return true
+	}
+	within := func(t time.Time) bool { return !t.Before(a.IssuedAt) && t.Before(a.ExpiresAt) }
+	return !within(record.Observation.Config().ObservedAt) || !within(record.ReceivedAt)
 }

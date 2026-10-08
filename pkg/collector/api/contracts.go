@@ -35,6 +35,11 @@ const (
 	MaxRequestBytes = 128 * 1024
 	// MaxResponseBytes bounds one response body.
 	MaxResponseBytes = 256 * 1024
+	// MaxReceiptBytes bounds every write receipt, with all IDs at
+	// shoal.MaxIDBytes. A workspace output budget of at least this size always
+	// returns a readable receipt from a committed write; below it a write that
+	// committed may report indeterminate.
+	MaxReceiptBytes = 3 * 1024
 )
 
 var (

@@ -112,7 +112,10 @@ type Enrollment struct {
 
 // ArtifactRecord is an immutable raw artifact reference.
 type ArtifactRecord struct {
-	CollectorID  shoal.ID
+	CollectorID shoal.ID
+	// Domain is the collector's authorization domain when written. Reads
+	// authorize against it, never against a later registration.
+	Domain       []byte
 	Ref          collector.ArtifactRef
 	Generation   int64
 	EnrollmentID shoal.ID
@@ -143,6 +146,7 @@ type enrollmentRow struct {
 }
 type observationRow struct {
 	ID           shoal.ID
+	Domain       []byte
 	Config       collector.ObservationConfig
 	Generation   int64
 	EnrollmentID shoal.ID
@@ -167,8 +171,11 @@ func (r *Registry) registrationCoordinate(id shoal.ID) allocator.Coordinate {
 func (r *Registry) enrollmentCoordinate(id shoal.ID, keyDigest string) allocator.Coordinate {
 	return r.coordinate("enrollment", string(id), keyDigest)
 }
-func (r *Registry) artifactCoordinate(id, artifact shoal.ID) allocator.Coordinate {
-	return r.coordinate("artifact", string(id), string(artifact))
+
+// Artifacts are keyed per generation, so a later generation never sees or
+// collides with an earlier generation's record.
+func (r *Registry) artifactCoordinate(id shoal.ID, generation int64, artifact shoal.ID) allocator.Coordinate {
+	return r.coordinate("artifact", string(id), fmt.Sprint(generation), string(artifact))
 }
 func (r *Registry) appliedCoordinate(id shoal.ID, keyDigest string) allocator.Coordinate {
 	return r.coordinate("applied", string(id), keyDigest)
@@ -343,9 +350,12 @@ func cloneRow(row registrationRow) registrationRow {
 
 // Provision grants a principal the right to act as a collector with the
 // given authority ceiling, control and mode. It is the only way authority is
-// assigned. Re-provisioning an active registration with different terms is a
-// conflict; revoke first. Provisioning a revoked registration reactivates it
-// at its new generation, leaving everything from earlier generations
+// assigned. A collector's identity (domain, subject, client) is fixed for its
+// lifetime: provisioning an existing collector ID with a different identity is
+// a conflict, even after revocation; use a new collector ID. Re-provisioning
+// an active registration with different terms is a conflict; revoke first.
+// Provisioning a revoked registration reactivates it at its new generation,
+// possibly with new terms, leaving everything from earlier generations
 // quarantined.
 func (r *Registry) Provision(ctx context.Context, p Provisioning) (collector.Registration, error) {
 	want, e := collector.Registration{CollectorID: p.CollectorID, Subject: p.Subject, ClientID: p.ClientID, Domain: p.Domain, AuthorityPolicyIDs: p.AuthorityPolicyIDs, Control: p.Control, Mode: p.Mode, Generation: 1, State: collector.Provisioned}.Canonical()
@@ -358,6 +368,9 @@ func (r *Registry) Provision(ctx context.Context, p Provisioning) (collector.Reg
 			return true, nil
 		}
 		current := row.Registration
+		if current.Subject != want.Subject || current.ClientID != want.ClientID || !bytes.Equal(current.Domain, want.Domain) {
+			return false, ErrConflict
+		}
 		if current.State == collector.Revoked {
 			want.Generation = current.Generation
 			*row = registrationRow{Registration: want}
@@ -595,13 +608,13 @@ func (r *Registry) activeRegistration(ctx context.Context, id shoal.ID, d auth.D
 	return row, nil
 }
 
-func (r *Registry) readArtifact(ctx context.Context, collectorID, artifactID shoal.ID) (ArtifactRecord, error) {
-	cell, e := r.read(ctx, r.artifactCoordinate(collectorID, artifactID))
+func (r *Registry) readArtifact(ctx context.Context, collectorID shoal.ID, generation int64, artifactID shoal.ID) (ArtifactRecord, error) {
+	cell, e := r.read(ctx, r.artifactCoordinate(collectorID, generation, artifactID))
 	if e != nil {
 		return ArtifactRecord{}, e
 	}
 	var record ArtifactRecord
-	if cell.Timestamp != 1 || decode(cell.Value, &record) != nil || record.CollectorID != collectorID || record.Ref.ID != artifactID || record.Ref.Validate() != nil {
+	if cell.Timestamp != 1 || decode(cell.Value, &record) != nil || record.CollectorID != collectorID || record.Generation != generation || len(record.Domain) == 0 || record.Ref.ID != artifactID || record.Ref.Validate() != nil {
 		return ArtifactRecord{}, ErrUnavailable
 	}
 	return record, nil
@@ -624,7 +637,8 @@ func (r *Registry) SubmitArtifact(ctx context.Context, collectorID shoal.ID, ref
 	if ref.ObservedAt.After(now) {
 		return ArtifactRecord{}, invalid()
 	}
-	existing, e := r.readArtifact(ctx, collectorID, ref.ID)
+	generation := row.Registration.Generation
+	existing, e := r.readArtifact(ctx, collectorID, generation, ref.ID)
 	if e == nil {
 		if !reflect.DeepEqual(existing.Ref, ref) {
 			return ArtifactRecord{}, ErrConflict
@@ -634,12 +648,12 @@ func (r *Registry) SubmitArtifact(ctx context.Context, collectorID shoal.ID, ref
 	if !shoal.IsErrorCode(e, shoal.ErrorNotFound) {
 		return ArtifactRecord{}, e
 	}
-	record := ArtifactRecord{CollectorID: collectorID, Ref: ref, Generation: row.Registration.Generation, EnrollmentID: row.Enrollment.ID, ReceivedAt: now}
+	record := ArtifactRecord{CollectorID: collectorID, Domain: bytes.Clone(row.Registration.Domain), Ref: ref, Generation: generation, EnrollmentID: row.Enrollment.ID, ReceivedAt: now}
 	value, e := encode(record)
 	if e != nil {
 		return ArtifactRecord{}, invalid()
 	}
-	stored, e := r.putImmutable(ctx, r.artifactCoordinate(collectorID, ref.ID), value)
+	stored, e := r.putImmutable(ctx, r.artifactCoordinate(collectorID, generation, ref.ID), value)
 	if e != nil {
 		return ArtifactRecord{}, e
 	}
@@ -647,7 +661,7 @@ func (r *Registry) SubmitArtifact(ctx context.Context, collectorID shoal.ID, ref
 	if decode(stored, &got) != nil {
 		return ArtifactRecord{}, indeterminate(ErrUnavailable)
 	}
-	if !reflect.DeepEqual(got.Ref, ref) || got.CollectorID != collectorID {
+	if !reflect.DeepEqual(got.Ref, ref) || got.CollectorID != collectorID || got.Generation != generation {
 		return ArtifactRecord{}, ErrConflict
 	}
 	if e = r.recheck(ctx, auth.OperationIngest, fp); e != nil {
@@ -662,7 +676,7 @@ func (r *Registry) readObservation(ctx context.Context, id shoal.ID) (observatio
 		return observationRow{}, collector.Observation{}, e
 	}
 	var row observationRow
-	if cell.Timestamp != 1 || decode(cell.Value, &row) != nil || row.ID != id {
+	if cell.Timestamp != 1 || decode(cell.Value, &row) != nil || row.ID != id || len(row.Domain) == 0 || row.Generation <= 0 {
 		return observationRow{}, collector.Observation{}, ErrUnavailable
 	}
 	o, e := collector.NewObservation(row.Config)
@@ -694,19 +708,18 @@ func (r *Registry) SubmitObservation(ctx context.Context, o collector.Observatio
 	if c.ObservedAt.After(now) {
 		return ObservationRecord{}, invalid()
 	}
-	artifact, e := r.readArtifact(ctx, c.CollectorID, c.ArtifactID)
+	// Only this generation's artifacts are visible here; an earlier
+	// generation's record under the same ID reads as absent.
+	artifact, e := r.readArtifact(ctx, c.CollectorID, row.Registration.Generation, c.ArtifactID)
 	if e != nil {
 		return ObservationRecord{}, e
-	}
-	if artifact.Generation != row.Registration.Generation {
-		return ObservationRecord{}, denied("artifact belongs to a revoked generation")
 	}
 	existing, _, e := r.readObservation(ctx, o.ID())
 	if e != nil && !shoal.IsErrorCode(e, shoal.ErrorNotFound) {
 		return ObservationRecord{}, e
 	}
 	if e != nil {
-		value, e := encode(observationRow{ID: o.ID(), Config: c, Generation: row.Registration.Generation, EnrollmentID: row.Enrollment.ID, ReceivedAt: now})
+		value, e := encode(observationRow{ID: o.ID(), Domain: bytes.Clone(row.Registration.Domain), Config: c, Generation: row.Registration.Generation, EnrollmentID: row.Enrollment.ID, ReceivedAt: now})
 		if e != nil {
 			return ObservationRecord{}, invalid()
 		}
@@ -721,6 +734,11 @@ func (r *Registry) SubmitObservation(ctx context.Context, o collector.Observatio
 	if !reflect.DeepEqual(existing.Config, c) {
 		return ObservationRecord{}, ErrConflict
 	}
+	// Identical content first recorded under a revoked generation stays
+	// quarantined; it is not re-activated by resubmission.
+	if existing.Generation != row.Registration.Generation {
+		return ObservationRecord{}, denied("observation recorded under a revoked generation")
+	}
 	if e = r.recheck(ctx, auth.OperationIngest, fp); e != nil {
 		return ObservationRecord{}, indeterminate(e)
 	}
@@ -728,7 +746,7 @@ func (r *Registry) SubmitObservation(ctx context.Context, o collector.Observatio
 }
 
 // ReadObservation returns an observation to any caller holding Read in the
-// collector's provisioned domain. Quarantine is computed from the collector's
+// authorization domain recorded with it when it was written. Quarantine is computed from the collector's
 // current registration: a revoked collector, or any generation other than the
 // current one, reads as quarantined.
 func (r *Registry) ReadObservation(ctx context.Context, id shoal.ID) (ObservationRecord, error) {
@@ -743,20 +761,25 @@ func (r *Registry) ReadObservation(ctx context.Context, id shoal.ID) (Observatio
 	if e != nil {
 		return ObservationRecord{}, e
 	}
-	reg, _, e := r.readRegistration(ctx, stored.Config.CollectorID)
-	if e != nil {
-		return ObservationRecord{}, ErrUnavailable
-	}
-	if !bytes.Equal(reg.Registration.Domain, d.AuthorizationDomain()) {
+	// Authorize against the domain recorded with the row, not the current
+	// registration, so no later provisioning can move old content.
+	if !bytes.Equal(stored.Domain, d.AuthorizationDomain()) {
 		return ObservationRecord{}, auth.ObjectNotFound()
 	}
-	artifact, e := r.readArtifact(ctx, stored.Config.CollectorID, stored.Config.ArtifactID)
+	reg, _, e := r.readRegistration(ctx, stored.Config.CollectorID)
+	if e != nil || !bytes.Equal(reg.Registration.Domain, stored.Domain) {
+		return ObservationRecord{}, ErrUnavailable
+	}
+	artifact, e := r.readArtifact(ctx, stored.Config.CollectorID, stored.Generation, stored.Config.ArtifactID)
 	if e != nil {
 		return ObservationRecord{}, ErrUnavailable
 	}
 	if e = r.recheck(ctx, auth.OperationRead, fp); e != nil {
 		return ObservationRecord{}, auth.ObjectNotFound()
 	}
-	quarantined := reg.Registration.State == collector.Revoked || reg.Registration.Generation != stored.Generation || artifact.Generation != stored.Generation
+	if !bytes.Equal(artifact.Domain, stored.Domain) {
+		return ObservationRecord{}, ErrUnavailable
+	}
+	quarantined := reg.Registration.State == collector.Revoked || reg.Registration.Generation != stored.Generation
 	return ObservationRecord{Observation: o, ArtifactDigest: artifact.Ref.Digest, Generation: stored.Generation, EnrollmentID: stored.EnrollmentID, ReceivedAt: stored.ReceivedAt, Quarantined: quarantined}, nil
 }

@@ -153,3 +153,15 @@ func TestArtifactValidation(t *testing.T) {
 		}
 	}
 }
+
+// Finding 3: -0 and +0 confidence are one observation.
+func TestNegativeZeroConfidenceIsNormalized(t *testing.T) {
+	zero, negative := 0.0, math.Copysign(0, -1)
+	a, b := config(), config()
+	a.Confidence.Value, b.Confidence.Value = &zero, &negative
+	x, e1 := collector.NewObservation(a)
+	y, e2 := collector.NewObservation(b)
+	if e1 != nil || e2 != nil || x.ID() != y.ID() || math.Signbit(*y.Config().Confidence.Value) {
+		t.Fatal("-0 confidence minted a distinct observation")
+	}
+}

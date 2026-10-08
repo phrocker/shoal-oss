@@ -509,6 +509,9 @@ func cloneObservation(c ObservationConfig) ObservationConfig {
 	}
 	if c.Confidence.Value != nil {
 		v := *c.Confidence.Value
+		if v == 0 {
+			v = 0 // Normalize -0 so it cannot mint a second identity.
+		}
 		c.Confidence.Value = &v
 	}
 	return c

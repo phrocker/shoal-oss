@@ -332,3 +332,40 @@ func TestCollectorReceiptsSurviveNarrowOutputBudget(t *testing.T) {
 		t.Fatalf("read: %d %s", w.Code, w.Body.String())
 	}
 }
+
+// At exactly MaxReceiptBytes a write with every ID at its maximum length
+// still returns a readable receipt; below the receipt's size the committed
+// write reports indeterminate (safe, but unreadable), never a failure.
+func TestCollectorReceiptBudgetBoundary(t *testing.T) {
+	f := newCollectorFixture(t)
+	long := shoal.ID(strings.Repeat("c", shoal.MaxIDBytes))
+	if _, e := f.registry.Provision(context.Background(), collectorregistry.Provisioning{CollectorID: long, Subject: "tail", ClientID: "client", Domain: []byte("domain"), AuthorityPolicyIDs: []shoal.ID{"authority:logs"}, Control: collector.ExternalControlled, Mode: collector.ServerObserved}); e != nil {
+		t.Fatal(e)
+	}
+	ctx, e := f.authority.Binder().Bind(context.Background(), f.decisions["tail"])
+	if e != nil {
+		t.Fatal(e)
+	}
+	handler, _ := NewCollectorHTTPHandler(f.provider, f.authority.Resolver())
+	serve := func(budget uint64, path string, body any) *httptest.ResponseRecorder {
+		r := collectorRequest(t, http.MethodPost, path, body).WithContext(ctx)
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(workspaceResponseWriter{ResponseWriter: w, maxResponseBytes: budget, indeterminateOnOverflow: requestMayCommit(r.Method, r.URL.Path)}, r)
+		return w
+	}
+	enroll := collector.EnrollRequest{CollectorID: long, RequestedAuthorityPolicyIDs: []shoal.ID{"authority:logs"}, Extractors: []collector.ExtractorRef{extractorV1}}
+	if w := serve(collectorapi.MaxReceiptBytes, collectorapi.EnrollRoute, collectorapi.EncodeEnroll(enroll)); w.Code != http.StatusOK {
+		t.Fatalf("enroll: %d %s", w.Code, w.Body.String())
+	}
+	ref := collectorArtifact(strings.Repeat("a", shoal.MaxIDBytes), "body")
+	w := serve(collectorapi.MaxReceiptBytes, collectorapi.ArtifactsRoute, collectorapi.EncodeArtifact(long, ref))
+	var receipt collectorapi.ArtifactReceipt
+	if w.Code != http.StatusOK || collectorapi.DecodeStrict(w.Body.Bytes(), &receipt) != nil || receipt.Validate() != nil {
+		t.Fatalf("max-ID receipt at MaxReceiptBytes: %d %s", w.Code, w.Body.String())
+	}
+	// Retry the same committed write under a budget smaller than its receipt.
+	w = serve(256, collectorapi.ArtifactsRoute, collectorapi.EncodeArtifact(long, ref))
+	if w.Code != http.StatusServiceUnavailable || w.Header().Get(CommitOutcomeHeader) != CommitOutcomeIndeterminate {
+		t.Fatalf("undersized budget: %d %v", w.Code, w.Header())
+	}
+}

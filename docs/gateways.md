@@ -90,9 +90,8 @@ the extension that exposed it can land together.
 
 The boundary follows the rule #402 states for decision contracts, "core imports
 do not depend on GitHub", and goes further by testing it: a new test (#446)
-fails if anything under `pkg/`, `internal/` or `cmd/` imports from
-`extensions/`, or if an extension imports anything other than the SDK and public
-`pkg/` contracts.
+fails if any package in the root module imports from `extensions/`, or if an
+extension imports anything other than the SDK and public `pkg/` contracts.
 
 **What the rule costs.** An extension cannot reach into internals, so core
 contracts must cover everything an extension needs. The first extension will
