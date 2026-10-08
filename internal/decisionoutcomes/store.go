@@ -229,6 +229,11 @@ func (s *Store) validateRow(raw []byte, id shoal.ID, d auth.Decision, p decision
 	if r.ScopeDigest != scopeFor(d) || r.Receipt.SubmitterID != d.Subject() || r.Receipt.ActorID != d.Actor() || r.Receipt.ClientID != d.ClientID() || !reflect.DeepEqual(r.Receipt.OnBehalfOf, d.OnBehalfOf()) {
 		return row{}, decision.OutcomeObservation{}, auth.ObjectNotFound()
 	}
+	// A valid row belonging to another prediction/request is outside this
+	// authorized lookup. Do not expose its existence through a validation error.
+	if c.RequestID != p.Request().ID() || c.PredictionID != p.ID() {
+		return row{}, decision.OutcomeObservation{}, auth.ObjectNotFound()
+	}
 	if !validHash(r.KeyDigest) || r.Receipt.ID != id || receiptID(r.ScopeDigest, c.RequestID, r.KeyDigest) != id || r.Receipt.State != "proposed" || !strings.HasPrefix(r.Receipt.AuthorizationFingerprint, "auth-sha256:") || !validHash(strings.TrimPrefix(r.Receipt.AuthorizationFingerprint, "auth-sha256:")) || r.Receipt.ReceivedAt.IsZero() || r.Receipt.ReceivedAt.After(now) || r.Receipt.ReceivedAt.Year() < 1 || r.Receipt.ReceivedAt.Year() > 9999 || r.Receipt.ReceivedAt != r.Receipt.ReceivedAt.Round(0).UTC() || r.Receipt.ReceivedAt.Before(p.Config().CompletedAt) || c.ObservedAt.After(r.Receipt.ReceivedAt) {
 		return row{}, decision.OutcomeObservation{}, ErrUnavailable
 	}

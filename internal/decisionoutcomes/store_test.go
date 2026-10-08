@@ -811,3 +811,77 @@ func TestIncompatiblePredecessorErrorDoesNotDiscloseRevokedEvidence(t *testing.T
 		t.Fatal("incompatible parent existence disclosed", e)
 	}
 }
+
+func alternativePrediction(t *testing.T, p decision.PredictionRecord, differentRequest bool) decision.PredictionRecord {
+	t.Helper()
+	request := p.Request()
+	result := p.Config()
+	if differentRequest {
+		cfg := request.Config()
+		cfg.CorrelationID = "other-call"
+		var e error
+		request, e = decision.NewDecisionRequest(request.Task(), request.Picture(), request.Predictor(), cfg)
+		if e != nil {
+			t.Fatal(e)
+		}
+		result.RequestID = request.ID()
+	} else {
+		result.Answers[0].Label = "ordinary"
+	}
+	alternate, e := decision.NewPredictionRecord(request, result)
+	if e != nil {
+		t.Fatal(e)
+	}
+	if alternate.ID() == p.ID() {
+		t.Fatal("fixture did not change prediction")
+	}
+	return alternate
+}
+func TestCrossPredictionPredecessorIndistinguishableFromAbsent(t *testing.T) {
+	for _, differentRequest := range []bool{false, true} {
+		name := "same-request"
+		if differentRequest {
+			name = "different-request"
+		}
+		t.Run(name, func(t *testing.T) {
+			s, b, a, ctx, c := storeFixture(t)
+			parent, e := appendCfg(s, ctx, "parent", c)
+			if e != nil {
+				t.Fatal(e)
+			}
+			a.prediction = alternativePrediction(t, a.prediction, differentRequest)
+			a.evidenceDenied.Store(shoal.ID("finding"), true)
+			next := c
+			next.RequestID = a.prediction.Request().ID()
+			next.PredictionID = a.prediction.ID()
+			next.EvidenceIDs = []shoal.ID{"current-evidence"}
+			next.Supersedes = parent.ID
+			before := b.writes.Load()
+			_, boundErr := appendCfg(s, ctx, "correction", next)
+			next.Supersedes = shoal.ID("outcome-receipt:" + strings.Repeat("0", 64))
+			_, missingErr := appendCfg(s, ctx, "correction", next)
+			if !shoal.IsErrorCode(boundErr, shoal.ErrorNotFound) || !shoal.IsErrorCode(missingErr, shoal.ErrorNotFound) || boundErr.Error() != missingErr.Error() || b.writes.Load() != before {
+				t.Fatalf("cross-prediction existence disclosed: bound=%v missing=%v", boundErr, missingErr)
+			}
+		})
+	}
+}
+func TestDirectWrongPredictionLookupMasksExistingReceipt(t *testing.T) {
+	s, b, a, ctx, c := storeFixture(t)
+	if _, e := appendCfg(s, ctx, "key", c); e != nil {
+		t.Fatal(e)
+	}
+	a.prediction = alternativePrediction(t, a.prediction, false)
+	a.evidenceDenied.Store(shoal.ID("finding"), true)
+	c.PredictionID = a.prediction.ID()
+	c.EvidenceIDs = []shoal.ID{"current-evidence"}
+	before := b.writes.Load()
+	_, readExisting := s.Read(ctx, c.RequestID, c.PredictionID, []byte("key"))
+	_, readMissing := s.Read(ctx, c.RequestID, c.PredictionID, []byte("missing"))
+	if !shoal.IsErrorCode(readExisting, shoal.ErrorNotFound) || !shoal.IsErrorCode(readMissing, shoal.ErrorNotFound) || readExisting.Error() != readMissing.Error() {
+		t.Fatalf("read revealed wrong-prediction receipt: existing=%v missing=%v", readExisting, readMissing)
+	}
+	if _, e := appendCfg(s, ctx, "key", c); !shoal.IsErrorCode(e, shoal.ErrorNotFound) || b.writes.Load() != before {
+		t.Fatal("append revealed wrong-prediction receipt or attempted write", e)
+	}
+}
