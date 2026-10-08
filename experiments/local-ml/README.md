@@ -14,7 +14,9 @@ work. The frozen V11 experiment and paid-inference budget are unchanged.
 
 The separate [frozen code conformance experiment](FROZEN_CODE.md) imports the
 retained V9 mixed TF-IDF model and checks its historical proposals through the
-same Go provider. It does not extend this synthetic authority into production.
+same Go provider. The [source-backed service example](FROZEN_SERVICE.md) adds
+local source authorization and durable receipts for that frozen cohort. Neither
+example supplies a production registration authority.
 
 ## Run
 
