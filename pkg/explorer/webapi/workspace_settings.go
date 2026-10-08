@@ -359,6 +359,33 @@ func workspaceOperationForRequest(
 			path == "/api/v1/fleet/actions/pull" ||
 			(strings.HasPrefix(path, "/api/v1/fleet/actions/") &&
 				(strings.HasSuffix(path, "/claim") ||
+					// The route a claim's holder uses between claiming and
+					// completing, under the same authority as the claim and
+					// the completion on either side of it.
+					//
+					// Unlisted, it was not a 404: applyWorkspaceSettings
+					// consults this table before dispatching, so a caller
+					// sending a workspace ID was refused "workspace settings
+					// are not registered for this route" before the handler
+					// ran — on the one route whose whole purpose is to let a
+					// worker report an effect it could not otherwise report.
+					//
+					// Invoke, because beginClaimant prefers execute and falls
+					// back to invoke, and because that is what /claim and
+					// /complete are already listed under. Binding a different
+					// operation here would break the sequence in the middle.
+					//
+					// What this does *not* do, because an earlier version of
+					// this comment claimed it did: make the route reachable
+					// for an execute-only caller. ApplyForOperation calls
+					// decision.Authorize with the operation named here, so a
+					// workspace-scoped worker must actually hold invoke. An
+					// execute-only worker is still refused — now at the
+					// authorization step rather than as an unregistered route.
+					// That is pre-existing and identical for /claim and
+					// /complete, so the sequence is consistent; it is not
+					// complete for the execute-only holder #437 introduced.
+					strings.HasSuffix(path, "/ambiguity") ||
 					strings.HasSuffix(path, "/complete")))):
 		return auth.OperationInvoke, true
 	case method == http.MethodPost &&
@@ -691,6 +718,14 @@ func requestMayCommit(method, path string) bool {
 			(strings.HasPrefix(path, "/api/v1/fleet/actions/") &&
 				(strings.HasSuffix(path, "/claim") ||
 					strings.HasSuffix(path, "/complete") ||
+					// A lost-fence report writes to the record before its
+					// response is encoded. It does not transition the action,
+					// but an over-budget response must still not be reported
+					// as a clean failure — on a route whose entire purpose is
+					// recording an ambiguity, telling the caller nothing
+					// happened when the report landed would be the worst
+					// possible answer.
+					strings.HasSuffix(path, "/ambiguity") ||
 					strings.HasSuffix(path, "/cancel"))) ||
 			// A decision commits; pending and status only read.
 			(strings.HasPrefix(path, "/api/v1/fleet/approvals/") &&

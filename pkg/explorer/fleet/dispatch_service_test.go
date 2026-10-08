@@ -1336,11 +1336,27 @@ func TestDispatchRestartPreservesStoredExecutorKeyAcrossAmbiguousRetry(t *testin
 type dispatchRecorder struct {
 	failPhase string
 	phases    []string
-	advance   func()
+	// operations is the phase-to-operation pairing, retained because keeping
+	// only the phase made every assertion about *which* operation a transition
+	// audits vacuous. A review found that mutating an audit's operation to one
+	// that did not authorize the call left the whole package green, including
+	// in a test whose docstring claimed to cover it.
+	operations map[string]auth.Operation
+	advance    func()
+}
+
+// recordedOperation returns the operation a phase was audited under, so a test
+// can assert the pairing rather than only that the phase happened.
+func (r *dispatchRecorder) recordedOperation(phase string) auth.Operation {
+	return r.operations[phase]
 }
 
 func (r *dispatchRecorder) RecordAction(_ context.Context, audit ActionAudit) error {
 	r.phases = append(r.phases, audit.Phase)
+	if r.operations == nil {
+		r.operations = map[string]auth.Operation{}
+	}
+	r.operations[audit.Phase] = audit.Operation
 	// The real ActionRecorder validates the operation before anything else
 	// (internal/explorerfleet/action_recorder.go:66), so a double that accepts
 	// an invalid one hides every caller that passes one. A fifth review round

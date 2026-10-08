@@ -66,6 +66,11 @@ func TestWorkspaceSettingsClampAnalyticsAndMarkResponseLoss(t *testing.T) {
 		// indeterminate, not that nothing committed: a deterministic failure
 		// invites a retry of an external effect that already happened.
 		{http.MethodPost, "/api/v1/fleet/actions/action/complete"},
+		// A report writes the record before its response is encoded, on a
+		// route whose entire purpose is recording that an effect may have
+		// happened. Telling its caller nothing committed would be the worst
+		// answer this surface can give.
+		{http.MethodPost, "/api/v1/fleet/actions/action/ambiguity"},
 		{http.MethodPost, "/api/v1/fleet/actions/action/cancel"},
 		// A request commits the grant or the refusal, and a report commits the
 		// terminal record for a call the caller has already made. Losing
@@ -141,6 +146,10 @@ func TestWorkspaceOperationForRequestUsesRouteOperation(t *testing.T) {
 		// registered for the workspace, so the handler is never reached at all.
 		{http.MethodPost, "/api/v1/fleet/actions/action/complete", auth.OperationInvoke, true},
 		{http.MethodPost, "/api/v1/fleet/actions/action/cancel", auth.OperationDispatch, true},
+		// The ambiguity route, under the same authority as the claim and the
+		// completion it sits between. Unlisted, a workspace-scoped worker was
+		// refused before the handler ran.
+		{http.MethodPost, "/api/v1/fleet/actions/action/ambiguity", auth.OperationInvoke, true},
 		// All three admission routes, for the same reason: unlisted here, a
 		// caller sending a workspace ID is refused before the handler runs, so
 		// the whole surface is invisible to any workspace-scoped client.

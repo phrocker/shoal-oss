@@ -175,3 +175,9 @@ func (*fleetToolService) Status(context.Context, fleet.StatusRequest) (fleet.Act
 func (*fleetToolService) Pull(context.Context, fleet.PullActionsRequest) (fleet.ActionPage, error) {
 	return fleet.ActionPage{}, nil
 }
+
+func (*fleetToolService) ReportAmbiguity(
+	context.Context, fleet.AmbiguityRequest,
+) (fleet.ActionRecord, error) {
+	return fleet.ActionRecord{}, nil
+}

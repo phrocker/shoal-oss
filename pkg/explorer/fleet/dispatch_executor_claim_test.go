@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"slices"
 	"strings"
 	"testing"
@@ -30,6 +31,7 @@ type executorClaimFixture struct {
 	authority     *auth.Authority
 	registryStore *memoryStore
 	dispatchStore *memoryDispatchStore
+	recorder      *dispatchRecorder
 	executors     executorMap
 	now           time.Time
 	// clock is what the service and the authority both read, so advancing it
@@ -59,6 +61,7 @@ func newExecutorClaimFixture(t *testing.T) *executorClaimFixture {
 	registryStore := newMemoryStore()
 	executors := executorMap{"exec": &remoteBoundExecutor{}}
 	dispatchStore := newMemoryDispatchStore()
+	recorder := &dispatchRecorder{}
 	registry, err := NewService(Config{
 		Store: registryStore, Resolver: authority.Resolver(), Recorder: &memoryRecorder{},
 		Snapshots: fixedSnapshot{now},
@@ -73,7 +76,7 @@ func newExecutorClaimFixture(t *testing.T) *executorClaimFixture {
 	registryStore.records["agent"] = Stored{Descriptor: descriptor}
 	service, err := NewDispatchService(DispatchConfig{
 		Store: dispatchStore, Registry: registry,
-		Resolver: authority.Resolver(), Recorder: &dispatchRecorder{},
+		Resolver: authority.Resolver(), Recorder: recorder,
 		Events: dispatchEvents{}, Clock: func() time.Time { return *clock },
 	})
 	if err != nil {
@@ -89,7 +92,8 @@ func newExecutorClaimFixture(t *testing.T) *executorClaimFixture {
 	return &executorClaimFixture{
 		service: service, queued: queued, enqueuer: enqueuer,
 		authority: authority, registryStore: registryStore, now: now,
-		executors: executors, dispatchStore: dispatchStore, clock: clock,
+		executors: executors, dispatchStore: dispatchStore,
+		recorder: recorder, clock: clock,
 	}
 }
 
@@ -1674,5 +1678,1230 @@ func TestAnUpgradeFindsARecordWithNoTransitionOperation(t *testing.T) {
 	}
 	if result.State != DispatchSucceeded {
 		t.Fatalf("the upgraded record did not complete: state=%s", result.State)
+	}
+}
+
+// lapsedClaimant claims an action with a one-nanosecond lease and advances the
+// clock past it, returning the worker, the fence it held, and the record as it
+// stood after the claim.
+//
+// It leaves the worker as the record's *current* claimant with a lapsed lease.
+// It does not reclaim the record, so a test needing the history path — where
+// the claimant fields name someone else — must take the record with a second
+// worker itself. An earlier version of this comment claimed the helper did
+// that, and named a function that does not exist; five tests that read it were
+// exercising a still-current claimant rather than the path they described.
+func (f *executorClaimFixture) lapsedClaimant(
+	t *testing.T, name string,
+) (context.Context, uint64, ActionRecord) {
+	t.Helper()
+	worker := f.namedWorker(t, name, auth.OperationExecute)
+	claimed, err := f.service.Claim(worker, ClaimRequest{
+		ID: f.queued.ID, ExpectedVersion: f.queued.Version,
+		ClaimID: []byte(name + "-claim"), Lease: time.Nanosecond,
+		Context: dispatchContext(f.now, name+"-request"),
+	})
+	if err != nil {
+		t.Fatalf("%s could not claim: %v", name, err)
+	}
+	f.advance(t, time.Second)
+	return worker, claimed.ClaimFence, claimed
+}
+
+// TestALapsedClaimantRecordsWhatItAttempted is #438's first acceptance
+// criterion: a worker whose renewal is refused mid-effect records what it
+// attempted, and an operator finds it on the action.
+//
+// The worker cannot use CompleteClaim — that route is gated on the fence it
+// just lost — and EffectPossible already says durably that an effect may have
+// happened. What was missing is the detail: what was attempted, against which
+// target, and the handle the target returned, which is the thing an operator
+// takes to the other system.
+func TestALapsedClaimantRecordsWhatItAttempted(t *testing.T) {
+	fixture := newExecutorClaimFixture(t)
+	worker, fence, claimed := fixture.lapsedClaimant(t, "worker")
+
+	// A second worker takes the record, so the first is no longer its
+	// claimant. This is the situation the route exists for, and the one the
+	// issue's own "require a claim_id the record has seen" rule could not
+	// express: the record keeps only the current claim ID.
+	second := fixture.namedWorker(t, "second", auth.OperationExecute)
+	reclaimed, err := fixture.service.Claim(second, ClaimRequest{
+		ID: fixture.queued.ID, ExpectedVersion: claimed.Version,
+		ClaimID: []byte("second-claim"), Lease: time.Minute,
+		Context: dispatchContext(fixture.now, "second-request"),
+	})
+	if err != nil {
+		t.Fatalf("the second worker could not take the lapsed claim: %v", err)
+	}
+	if reclaimed.ClaimantSubject == "worker-subject" {
+		t.Fatal("the record still names the first worker as claimant, so this " +
+			"test is not exercising a lapsed claimant")
+	}
+
+	reported, err := fixture.service.ReportAmbiguity(worker, AmbiguityRequest{
+		ID: fixture.queued.ID, ExpectedVersion: reclaimed.Version,
+		ClaimFence: fence, Outcome: AmbiguityOutcomeUnknown,
+		Target: "payments.example.test", Reference: "ch_1A2b3C",
+		Context: dispatchContext(fixture.now, "worker-request"),
+	})
+	if err != nil {
+		t.Fatalf("a worker that held the claim at fence %d cannot report: %v",
+			fence, err)
+	}
+
+	if len(reported.AmbiguityReports) != 1 {
+		t.Fatalf("report count = %d, want 1", len(reported.AmbiguityReports))
+	}
+	report := reported.AmbiguityReports[0]
+	if report.ClaimFence != fence ||
+		report.Outcome != AmbiguityOutcomeUnknown ||
+		report.Target != "payments.example.test" ||
+		report.Reference != "ch_1A2b3C" {
+		t.Fatalf("the report lost what the worker said: %+v", report)
+	}
+	// Attributed from the decision, never from the request, so a report says
+	// who made it rather than who claims to have made it.
+	if report.Subject != "worker-subject" || report.Actor != "worker-actor" {
+		t.Fatalf("the report is not attributed to the reporter: %+v", report)
+	}
+
+	// And an operator finds it. Status is the surface an operator reads, and
+	// the report has to be there rather than only in the service's return.
+	seen, err := fixture.service.Status(fixture.enqueuer, StatusRequest{
+		ID: fixture.queued.ID, Context: dispatchContext(fixture.now, "request"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(seen.AmbiguityReports) != 1 ||
+		seen.AmbiguityReports[0].Reference != "ch_1A2b3C" {
+		t.Fatalf("an operator reading Status does not find the report: %+v",
+			seen.AmbiguityReports)
+	}
+}
+
+// TestAnAmbiguityReportDoesNotTransitionTheAction is the second acceptance
+// criterion, and the reason this route is safe to expose to a caller that has
+// lost its claim.
+//
+// A worker without the fence has no standing to assert an outcome, only to say
+// what it tried. So the state, the claim and EffectPossible are all unchanged,
+// and in particular the fence does not advance — a report must not invalidate
+// whoever currently holds the claim.
+func TestAnAmbiguityReportDoesNotTransitionTheAction(t *testing.T) {
+	fixture := newExecutorClaimFixture(t)
+	worker, fence, claimed := fixture.lapsedClaimant(t, "worker")
+
+	before, err := fixture.service.Status(fixture.enqueuer, StatusRequest{
+		ID: fixture.queued.ID, Context: dispatchContext(fixture.now, "request"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	reported, err := fixture.service.ReportAmbiguity(worker, AmbiguityRequest{
+		ID: fixture.queued.ID, ExpectedVersion: claimed.Version,
+		ClaimFence: fence, Outcome: AmbiguityEffectObserved,
+		Context: dispatchContext(fixture.now, "worker-request"),
+	})
+	if err != nil {
+		t.Fatalf("the lapsed claimant could not report: %v", err)
+	}
+
+	if reported.State != before.State {
+		t.Fatalf("the report moved the action from %s to %s",
+			before.State, reported.State)
+	}
+	if reported.ClaimFence != before.ClaimFence {
+		t.Fatalf("the report advanced the fence from %d to %d, which would "+
+			"invalidate a live claimant's right to complete",
+			before.ClaimFence, reported.ClaimFence)
+	}
+	if !bytes.Equal(reported.ClaimID, before.ClaimID) {
+		t.Fatalf("the report changed the claim from %q to %q",
+			before.ClaimID, reported.ClaimID)
+	}
+	if reported.EffectPossible != before.EffectPossible {
+		t.Fatalf("the report changed EffectPossible from %v to %v",
+			before.EffectPossible, reported.EffectPossible)
+	}
+	// An AmbiguityEffectObserved report says the work succeeded. The record
+	// deliberately does not: this route cannot reach a terminal state, because
+	// a worker without the fence cannot be allowed to assert one.
+	if reported.State.terminal() {
+		t.Fatal("a report reached a terminal state, so a worker that lost its " +
+			"fence can assert an outcome after all")
+	}
+
+	// The version does advance, because this writes to the record and must
+	// serialise against concurrent writers.
+	if reported.Version != before.Version+1 {
+		t.Fatalf("version = %d, want %d", reported.Version, before.Version+1)
+	}
+}
+
+// TestOnlyAPrincipalTheRecordHasSeenMayReport is the third acceptance
+// criterion: a caller presenting a fence the record never held is refused.
+//
+// Refused as not-found rather than with a distinguishable error, because this
+// route is reachable by every principal authorized to execute the descriptor.
+// Telling one of them "that fence is not yours" confirms both that the action
+// exists and which fences it has been through.
+func TestOnlyAPrincipalTheRecordHasSeenMayReport(t *testing.T) {
+	fixture := newExecutorClaimFixture(t)
+	worker, fence, claimed := fixture.lapsedClaimant(t, "worker")
+
+	for _, probe := range []struct {
+		name    string
+		caller  func() context.Context
+		request func() AmbiguityRequest
+	}{
+		{
+			name: "a principal that never claimed",
+			caller: func() context.Context {
+				return fixture.namedWorker(t, "stranger", auth.OperationExecute)
+			},
+			request: func() AmbiguityRequest {
+				return AmbiguityRequest{
+					ID: fixture.queued.ID, ExpectedVersion: claimed.Version,
+					ClaimFence: fence, Outcome: AmbiguityOutcomeUnknown,
+					Context: dispatchContext(fixture.now, "stranger-request"),
+				}
+			},
+		},
+		{
+			name:   "a fence the record never reached",
+			caller: func() context.Context { return worker },
+			request: func() AmbiguityRequest {
+				return AmbiguityRequest{
+					ID: fixture.queued.ID, ExpectedVersion: claimed.Version,
+					ClaimFence: fence + 41, Outcome: AmbiguityOutcomeUnknown,
+					Context: dispatchContext(fixture.now, "worker-request"),
+				}
+			},
+		},
+		{
+			name:   "an action that does not exist",
+			caller: func() context.Context { return worker },
+			request: func() AmbiguityRequest {
+				return AmbiguityRequest{
+					ID: []byte("never-existed"), ExpectedVersion: 1,
+					ClaimFence: fence, Outcome: AmbiguityOutcomeUnknown,
+					Context: dispatchContext(fixture.now, "worker-request"),
+				}
+			},
+		},
+	} {
+		t.Run(probe.name, func(t *testing.T) {
+			_, err := fixture.service.ReportAmbiguity(
+				probe.caller(), probe.request())
+			if err == nil {
+				t.Fatal("the report was accepted")
+			}
+			if !shoal.IsErrorCode(err, shoal.ErrorNotFound) {
+				t.Fatalf("refusal is distinguishable from an absent action, "+
+					"which tells an execute-holder the action exists: %v", err)
+			}
+		})
+	}
+}
+
+// TestASecondReportDoesNotOverwriteTheFirst is the issue's last listed test,
+// and it is a requirement rather than an implementation detail.
+//
+// Two reports under one fence mean the worker retried. An operator wants both:
+// collapsing them would hide that the worker made two attempts at the same
+// target, which is exactly the shape of a double effect.
+func TestASecondReportDoesNotOverwriteTheFirst(t *testing.T) {
+	fixture := newExecutorClaimFixture(t)
+	worker, fence, claimed := fixture.lapsedClaimant(t, "worker")
+
+	first, err := fixture.service.ReportAmbiguity(worker, AmbiguityRequest{
+		ID: fixture.queued.ID, ExpectedVersion: claimed.Version,
+		ClaimFence: fence, Outcome: AmbiguityOutcomeUnknown,
+		Reference: "first-attempt",
+		Context:   dispatchContext(fixture.now, "worker-request"),
+	})
+	if err != nil {
+		t.Fatalf("the first report was refused: %v", err)
+	}
+
+	// A different outcome under the same fence, which is what a retry that got
+	// further looks like.
+	second, err := fixture.service.ReportAmbiguity(worker, AmbiguityRequest{
+		ID: fixture.queued.ID, ExpectedVersion: first.Version,
+		ClaimFence: fence, Outcome: AmbiguityEffectObserved,
+		Reference: "second-attempt",
+		Context:   dispatchContext(fixture.now, "worker-request"),
+	})
+	if err != nil {
+		t.Fatalf("the second report was refused: %v", err)
+	}
+	if len(second.AmbiguityReports) != 2 {
+		t.Fatalf("report count = %d, want 2 — the second overwrote the first, "+
+			"which hides that the worker attempted the target twice",
+			len(second.AmbiguityReports))
+	}
+	if second.AmbiguityReports[0].Reference != "first-attempt" ||
+		second.AmbiguityReports[1].Reference != "second-attempt" {
+		t.Fatalf("the reports are not in the order received: %+v",
+			second.AmbiguityReports)
+	}
+}
+
+// TestAnAmbiguityReportRefusesTargetControlledBytes pins the closed shape.
+//
+// Target and Reference describe a system Shoal does not control, so both values
+// are target-controlled and both reach the durable record and the team
+// overview. The design doc reaches the same conclusion for Output: a closed,
+// bounded shape gives a hostile or merely verbose target nothing.
+func TestAnAmbiguityReportRefusesTargetControlledBytes(t *testing.T) {
+	for _, probe := range []struct {
+		name   string
+		mutate func(*AmbiguityRequest)
+	}{
+		{"an outcome outside the vocabulary", func(r *AmbiguityRequest) {
+			r.Outcome = AmbiguityOutcome("probably_fine")
+		}},
+		{"an empty outcome", func(r *AmbiguityRequest) { r.Outcome = "" }},
+		{"a target past its bound", func(r *AmbiguityRequest) {
+			r.Target = strings.Repeat("t", MaxAmbiguityTargetBytes+1)
+		}},
+		{"a reference past its bound", func(r *AmbiguityRequest) {
+			r.Reference = strings.Repeat("r", MaxAmbiguityReferenceBytes+1)
+		}},
+		{"a control character in the target", func(r *AmbiguityRequest) {
+			r.Target = "host\x1b[31m"
+		}},
+		{"a newline in the reference", func(r *AmbiguityRequest) {
+			r.Reference = "ref\nsecond line"
+		}},
+		{"no fence", func(r *AmbiguityRequest) { r.ClaimFence = 0 }},
+	} {
+		t.Run(probe.name, func(t *testing.T) {
+			fixture := newExecutorClaimFixture(t)
+			worker, fence, claimed := fixture.lapsedClaimant(t, "worker")
+			request := AmbiguityRequest{
+				ID: fixture.queued.ID, ExpectedVersion: claimed.Version,
+				ClaimFence: fence, Outcome: AmbiguityOutcomeUnknown,
+				Context: dispatchContext(fixture.now, "worker-request"),
+			}
+			probe.mutate(&request)
+			if _, err := fixture.service.ReportAmbiguity(
+				worker, request); err == nil {
+				t.Fatal("accepted")
+			}
+		})
+	}
+
+	// And the shape it does accept, so the refusals above are not passing
+	// because nothing is acceptable.
+	fixture := newExecutorClaimFixture(t)
+	worker, fence, claimed := fixture.lapsedClaimant(t, "worker")
+	if _, err := fixture.service.ReportAmbiguity(worker, AmbiguityRequest{
+		ID: fixture.queued.ID, ExpectedVersion: claimed.Version,
+		ClaimFence: fence, Outcome: AmbiguityRequestNotSent,
+		Target: "queue.example.test", Reference: "msg-0001",
+		Context: dispatchContext(fixture.now, "worker-request"),
+	}); err != nil {
+		t.Fatalf("a well-formed report was refused: %v", err)
+	}
+}
+
+// TestTheClaimHistoryIsBoundedAndDropsTheOldest covers the cap, which exists
+// for a sharper reason than tidiness.
+//
+// encodeAction refuses a record past 3*MaxActionPayloadBytes, so an unbounded
+// history would eventually make a repeatedly re-claimed action *unwritable* —
+// bricking the record rather than merely growing it. The oldest entry is
+// dropped because the most recent holders are the ones whose effects may still
+// be unreconciled.
+func TestTheClaimHistoryIsBoundedAndDropsTheOldest(t *testing.T) {
+	fixture := newExecutorClaimFixture(t)
+	version := fixture.queued.Version
+	var firstFence uint64
+	// The most recent holder that is *not* the current claimant — one behind
+	// the final iteration — which is what the history lookup exists for.
+	var priorWorker context.Context
+	var priorFence uint64
+	var priorName string
+	var lastWorker context.Context
+	var lastFence uint64
+	var lastName string
+
+	// Two more claims than the bound. The first claim appends no prior holder
+	// — there is none — so N+1 claims produce only N history entries and would
+	// not overflow at all. An earlier version of this loop ran to N+1 and
+	// concluded the cap dropped the wrong end, when nothing had been dropped.
+	for index := 0; index <= MaxActionClaimHistory+1; index++ {
+		name := fmt.Sprintf("worker-%d", index)
+		worker := fixture.namedWorker(t, name, auth.OperationExecute)
+		claimed, err := fixture.service.Claim(worker, ClaimRequest{
+			ID: fixture.queued.ID, ExpectedVersion: version,
+			ClaimID: []byte(name), Lease: time.Nanosecond,
+			Context: dispatchContext(fixture.now, name+"-request"),
+		})
+		if err != nil {
+			t.Fatalf("%s could not claim: %v", name, err)
+		}
+		version = claimed.Version
+		if index == 0 {
+			firstFence = claimed.ClaimFence
+		}
+		priorWorker, priorFence, priorName = lastWorker, lastFence, lastName
+		lastWorker, lastFence, lastName = worker, claimed.ClaimFence, name
+		fixture.advance(t, time.Second)
+	}
+
+	current, err := fixture.service.Status(fixture.enqueuer, StatusRequest{
+		ID: fixture.queued.ID, Context: dispatchContext(fixture.now, "request"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(current.ClaimHistory) != MaxActionClaimHistory {
+		t.Fatalf("history length = %d, want %d",
+			len(current.ClaimHistory), MaxActionClaimHistory)
+	}
+	// The oldest went, not the newest.
+	for _, holder := range current.ClaimHistory {
+		if holder.ClaimFence == firstFence {
+			t.Fatalf("the oldest holder (fence %d) is still retained while the "+
+				"history is full, so the cap drops the wrong end", firstFence)
+		}
+	}
+	// The most recent *prior* holder can still report, which is the whole
+	// point of retaining any of them.
+	//
+	// Prior, not current. An earlier version of this used the final loop
+	// iteration's worker, which is the record's current claimant at the
+	// current fence — so it passed through sameClaimantPrincipal and never
+	// consulted the history at all. Disabling the entire history lookup in
+	// heldClaimAt left it green.
+	if priorWorker == nil {
+		t.Fatal("the loop did not retain a prior holder, so this case checks " +
+			"nothing")
+	}
+	if priorFence == current.ClaimFence {
+		t.Fatalf("the prior holder's fence (%d) is the current one, so this "+
+			"reaches the claimant branch rather than the history",
+			priorFence)
+	}
+	if _, err := fixture.service.ReportAmbiguity(
+		priorWorker, AmbiguityRequest{
+			ID: fixture.queued.ID, ClaimFence: priorFence,
+			Outcome: AmbiguityOutcomeUnknown,
+			// The request context's ID must match the reporting decision's,
+			// which is minted per worker name.
+			Context: dispatchContext(fixture.now, priorName+"-request"),
+		}); err != nil {
+		t.Fatalf("the most recent prior holder cannot report, so retaining "+
+			"the history buys nothing: %v", err)
+	}
+
+	// The dropped holder cannot, and is refused the same way a stranger is.
+	dropped := fixture.namedWorker(t, "worker-0", auth.OperationExecute)
+	_, err = fixture.service.ReportAmbiguity(dropped, AmbiguityRequest{
+		ID: fixture.queued.ID, ExpectedVersion: current.Version,
+		ClaimFence: firstFence, Outcome: AmbiguityOutcomeUnknown,
+		Context: dispatchContext(fixture.now, "worker-0-request"),
+	})
+	if err == nil {
+		t.Fatal("a holder dropped from the history can still report")
+	}
+	if !shoal.IsErrorCode(err, shoal.ErrorNotFound) {
+		t.Fatalf("a dropped holder is refused distinguishably: %v", err)
+	}
+}
+
+// TestReportsAreBoundedPerAction covers the other cap. The report list refuses
+// rather than dropping, because a report is evidence an operator is going to
+// read and silently discarding the first is worse than refusing the ninth.
+func TestReportsAreBoundedPerAction(t *testing.T) {
+	fixture := newExecutorClaimFixture(t)
+	worker, fence, claimed := fixture.lapsedClaimant(t, "worker")
+	version := claimed.Version
+
+	for index := 0; index < MaxActionAmbiguityReports; index++ {
+		reported, err := fixture.service.ReportAmbiguity(
+			worker, AmbiguityRequest{
+				ID: fixture.queued.ID, ExpectedVersion: version,
+				ClaimFence: fence, Outcome: AmbiguityOutcomeUnknown,
+				Reference: fmt.Sprintf("attempt-%d", index),
+				Context:   dispatchContext(fixture.now, "worker-request"),
+			})
+		if err != nil {
+			t.Fatalf("report %d was refused: %v", index, err)
+		}
+		version = reported.Version
+	}
+
+	_, err := fixture.service.ReportAmbiguity(worker, AmbiguityRequest{
+		ID: fixture.queued.ID, ExpectedVersion: version,
+		ClaimFence: fence, Outcome: AmbiguityOutcomeUnknown,
+		Reference: "one-too-many",
+		Context:   dispatchContext(fixture.now, "worker-request"),
+	})
+	if err == nil {
+		t.Fatalf("a %dth report was accepted, so the list is unbounded and an "+
+			"action can be made unwritable", MaxActionAmbiguityReports+1)
+	}
+	if !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
+		t.Fatalf("the refusal is not a bound violation: %v", err)
+	}
+
+	// The reports already recorded are intact — refusing the next one must not
+	// discard the ones an operator needs.
+	current, err := fixture.service.Status(fixture.enqueuer, StatusRequest{
+		ID: fixture.queued.ID, Context: dispatchContext(fixture.now, "request"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(current.AmbiguityReports) != MaxActionAmbiguityReports {
+		t.Fatalf("report count = %d after a refusal, want %d",
+			len(current.AmbiguityReports), MaxActionAmbiguityReports)
+	}
+}
+
+// TestAnAdmissionCannotBeReportedAsAmbiguous keeps the admission namespace out.
+//
+// An admission grant is reported through AdmissionService.Report, which has its
+// own terminal semantics. Refused as not-found for the same reason every other
+// dispatch route refuses one: the IDs are computable from a principal tuple, so
+// a distinguishable answer is a probe.
+func TestAnAdmissionCannotBeReportedAsAmbiguous(t *testing.T) {
+	fixture := newExecutorClaimFixture(t)
+	worker, fence, claimed := fixture.lapsedClaimant(t, "worker")
+
+	// Marked as an admission by the durable field isAdmission actually reads —
+	// a non-empty AdmittedEffects — rather than by its identity, which is the
+	// distinction the dispatch service already makes deliberately: the
+	// reserved span held ordinary actions before it was reserved.
+	stored := fixture.dispatchStore.records[string(fixture.queued.ID)]
+	stored.AdmittedEffects = Effects{EffectReadsCorpus}
+	fixture.dispatchStore.records[string(fixture.queued.ID)] = stored
+
+	_, err := fixture.service.ReportAmbiguity(worker, AmbiguityRequest{
+		ID: fixture.queued.ID, ExpectedVersion: claimed.Version,
+		ClaimFence: fence, Outcome: AmbiguityOutcomeUnknown,
+		Context: dispatchContext(fixture.now, "worker-request"),
+	})
+	if err == nil {
+		t.Fatal("an admission accepted a dispatch ambiguity report")
+	}
+	if !shoal.IsErrorCode(err, shoal.ErrorNotFound) {
+		t.Fatalf("an admission is refused distinguishably: %v", err)
+	}
+}
+
+// TestALapsedClaimantReportsWithoutKnowingTheVersion is the test the first
+// version of this route did not have, and its absence made the route unusable
+// by the only caller it exists for.
+//
+// A lapsed claimant cannot learn the record's current version. Status needs
+// OperationDispatch and the record's own principal; Pull withholds
+// live-claimed records, so a reclaimed action is absent from its page; and
+// ErrActionConflict carries no version. The other tests here all pass a
+// version obtained by being the party that reclaimed, which a real worker
+// never is — a fixture that can express something its subject cannot.
+//
+// So the version is optional. What must not change under a report is the
+// claim, and the store asserts that through ExpectedFence.
+func TestALapsedClaimantReportsWithoutKnowingTheVersion(t *testing.T) {
+	fixture := newExecutorClaimFixture(t)
+	worker, fence, claimed := fixture.lapsedClaimant(t, "worker")
+
+	// Someone else takes the record, moving the version past anything the
+	// first worker saw.
+	second := fixture.namedWorker(t, "second", auth.OperationExecute)
+	if _, err := fixture.service.Claim(second, ClaimRequest{
+		ID: fixture.queued.ID, ExpectedVersion: claimed.Version,
+		ClaimID: []byte("second-claim"), Lease: time.Minute,
+		Context: dispatchContext(fixture.now, "second-request"),
+	}); err != nil {
+		t.Fatalf("the second worker could not reclaim: %v", err)
+	}
+
+	// Everything the lapsed worker actually knows: the action ID and the fence
+	// it held. No version.
+	reported, err := fixture.service.ReportAmbiguity(worker, AmbiguityRequest{
+		ID: fixture.queued.ID, ClaimFence: fence,
+		Outcome: AmbiguityOutcomeUnknown, Reference: "ch_1A2b3C",
+		Context: dispatchContext(fixture.now, "worker-request"),
+	})
+	if err != nil {
+		t.Fatalf("a lapsed claimant cannot report without a version it has no "+
+			"way to obtain: %v", err)
+	}
+	if len(reported.AmbiguityReports) != 1 ||
+		reported.AmbiguityReports[0].Reference != "ch_1A2b3C" {
+		t.Fatalf("the report was not recorded: %+v", reported.AmbiguityReports)
+	}
+
+	// The stale version it does know is still refused when pinned, so the
+	// optional pin is a real check rather than ignored.
+	if _, err := fixture.service.ReportAmbiguity(worker, AmbiguityRequest{
+		ID: fixture.queued.ID, ExpectedVersion: claimed.Version,
+		ClaimFence: fence, Outcome: AmbiguityOutcomeUnknown,
+		Context: dispatchContext(fixture.now, "worker-request"),
+	}); !errors.Is(err, ErrActionConflict) {
+		t.Fatalf("a pinned stale version was not refused as a conflict: %v", err)
+	}
+
+	// And the second worker's claim is untouched by the report.
+	current, err := fixture.service.Status(fixture.enqueuer, StatusRequest{
+		ID: fixture.queued.ID, Context: dispatchContext(fixture.now, "request"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(current.ClaimID, []byte("second-claim")) {
+		t.Fatalf("the report disturbed the live claim: %q", current.ClaimID)
+	}
+}
+
+// TestAReportDoesNotStrandALiveClaimant is this route's central safety
+// property, and the first version of it asserted the wrong thing.
+//
+// A report advances the record version while leaving the state, the claim, the
+// fence and the lease alone. The completion path keyed on the version, so a
+// lapsed holder filing a report moved it out from under a live claimant, whose
+// completion then failed with ErrClaimLost while it held the claim at the right
+// fence and claim ID.
+//
+// That worker had no recourse: Status requires OperationDispatch and the
+// record's own principal, Pull withholds live-claimed records, and this route
+// has no replay branch. So an effect it had actually performed became
+// permanently unreportable — the precise harm #438 exists to prevent, caused by
+// #438.
+//
+// The original test checked the fence, the claim ID and EffectPossible and
+// never that a live claimant could still complete, which is the only assertion
+// that would have caught it. Asserted here from the live claimant's side.
+func TestAReportDoesNotStrandALiveClaimant(t *testing.T) {
+	fixture := newExecutorClaimFixture(t)
+	lapsed, fence, claimedByLapsed := fixture.lapsedClaimant(t, "lapsed")
+
+	// A second worker takes over and holds a live claim.
+	live := fixture.namedWorker(t, "live", auth.OperationExecute)
+	claimedByLive, err := fixture.service.Claim(live, ClaimRequest{
+		ID: fixture.queued.ID, ExpectedVersion: claimedByLapsed.Version,
+		ClaimID: []byte("live-claim"), Lease: time.Minute,
+		Context: dispatchContext(fixture.now, "live-request"),
+	})
+	if err != nil {
+		t.Fatalf("the live worker could not take the lapsed claim: %v", err)
+	}
+
+	// The lapsed holder reports, which is this route working as intended.
+	if _, err := fixture.service.ReportAmbiguity(lapsed, AmbiguityRequest{
+		ID: fixture.queued.ID, ClaimFence: fence,
+		Outcome: AmbiguityOutcomeUnknown,
+		Context: dispatchContext(fixture.now, "lapsed-request"),
+	}); err != nil {
+		t.Fatalf("the lapsed holder could not report: %v", err)
+	}
+
+	// The live claimant completes with the version it was handed at claim
+	// time, which is the only version it has — Status is closed to it and Pull
+	// withholds its own live-claimed record.
+	done, err := fixture.service.CompleteClaim(live, CompletionRequest{
+		ID: fixture.queued.ID, ExpectedVersion: claimedByLive.Version,
+		ClaimID: []byte("live-claim"),
+		// The fence it was handed at claim time, which is what binds a
+		// completion to its claim generation. A worker always has it.
+		ClaimFence: claimedByLive.ClaimFence,
+		Result:     ExecutionResult{Output: json.RawMessage(`{"ok":true}`)},
+		Context:    dispatchContext(fixture.now, "live-request"),
+	})
+	if err != nil {
+		t.Fatalf("another principal's report stranded the live claimant, so an "+
+			"effect it performed is permanently unreportable: %v", err)
+	}
+	if done.State != DispatchSucceeded ||
+		string(done.Output) != `{"ok":true}` {
+		t.Fatalf("the completion recorded the wrong outcome: state=%s output=%s",
+			done.State, done.Output)
+	}
+	// And the report survived the completion, so tolerating the drift did not
+	// cost the evidence.
+	if len(done.AmbiguityReports) != 1 {
+		t.Fatalf("the completion discarded the report: %+v", done.AmbiguityReports)
+	}
+}
+
+// TestAReportDoesNotStrandASynchronousInvoke is the same hazard on the
+// in-process path. ExecuteClaim re-reads the record twice and both gates keyed
+// on the version, so a report landing between Claim and execution stranded a
+// synchronous invoke exactly as it stranded a completion.
+func TestAReportDoesNotStrandASynchronousInvoke(t *testing.T) {
+	fixture := newExecutorClaimFixture(t)
+	fixture.bindExecutor(t, &inProcessExecutor{})
+	lapsed, fence, claimedByLapsed := fixture.lapsedClaimant(t, "lapsed")
+
+	// The enqueuer claims it next, which is the identity the in-process path
+	// requires: ExecuteClaim needs its caller to be both the record's
+	// principal and its claimant.
+	claimed, err := fixture.service.Claim(fixture.enqueuer, ClaimRequest{
+		ID: fixture.queued.ID, ExpectedVersion: claimedByLapsed.Version,
+		ClaimID: []byte("own-claim"), Lease: time.Minute,
+		Context: dispatchContext(fixture.now, "request"),
+	})
+	if err != nil {
+		t.Fatalf("the enqueuer could not claim: %v", err)
+	}
+
+	if _, err := fixture.service.ReportAmbiguity(lapsed, AmbiguityRequest{
+		ID: fixture.queued.ID, ClaimFence: fence,
+		Outcome: AmbiguityRequestNotSent,
+		Context: dispatchContext(fixture.now, "lapsed-request"),
+	}); err != nil {
+		t.Fatalf("the lapsed holder could not report: %v", err)
+	}
+
+	// ExecuteClaim is handed the record as it was at claim time.
+	result, err := fixture.service.ExecuteClaim(fixture.enqueuer, claimed)
+	if err != nil {
+		t.Fatalf("a report stranded the in-process execution path: %v", err)
+	}
+	if result.State != DispatchSucceeded {
+		t.Fatalf("the execution did not complete: state=%s", result.State)
+	}
+}
+
+// TestAFencelessCompletionStillComparesTheVersionExactly pins the fallback a
+// caller gets when it supplies no fence, which is the only branch of
+// completeClaim that still looks at the version.
+//
+// This test was named TestADriftLargerThanTheReportsIsStillRefused and its
+// docstring described a "tolerance"/"allowance" budget for version drift that
+// reports could account for. That mechanism was deleted rather than refined —
+// onlyAmbiguityReportsAdvanced is gone, because it was papering over a missing
+// fence check and widening the version comparison is what made the ABA break
+// possible. So the name and the whole rationale described code that no longer
+// exists, and the test was in fact exercising the plain exact-version
+// comparison in the fence-less else branch.
+//
+// That branch is still worth pinning: a caller written against the older
+// contract keeps the behaviour it was written against, strandable and all, and
+// nothing should quietly loosen it. The ambiguity report below is what makes
+// the pin stale by one more version than the claim alone would, which is the
+// shape a pre-fence caller actually hits.
+//
+// The honest statement of the property: with no fence, any version other than
+// exactly the one pinned is ErrClaimLost, whatever moved it.
+func TestAFencelessCompletionStillComparesTheVersionExactly(t *testing.T) {
+	fixture := newExecutorClaimFixture(t)
+	lapsed, fence, claimedByLapsed := fixture.lapsedClaimant(t, "lapsed")
+	live := fixture.namedWorker(t, "live", auth.OperationExecute)
+	claimedByLive, err := fixture.service.Claim(live, ClaimRequest{
+		ID: fixture.queued.ID, ExpectedVersion: claimedByLapsed.Version,
+		ClaimID: []byte("live-claim"), Lease: time.Minute,
+		Context: dispatchContext(fixture.now, "live-request"),
+	})
+	if err != nil {
+		t.Fatalf("the live worker could not claim: %v", err)
+	}
+	// One report, so exactly one version of drift is explainable.
+	if _, err := fixture.service.ReportAmbiguity(lapsed, AmbiguityRequest{
+		ID: fixture.queued.ID, ClaimFence: fence,
+		Outcome: AmbiguityOutcomeUnknown,
+		Context: dispatchContext(fixture.now, "lapsed-request"),
+	}); err != nil {
+		t.Fatalf("the lapsed holder could not report: %v", err)
+	}
+
+	// A pin one version behind the record. With no fence supplied, the
+	// comparison is exact, so this is refused regardless of what moved the
+	// version — here a report, which under the deleted tolerance would have
+	// been "explainable" and accepted.
+	stale := claimedByLive.Version - 1
+	if stale == 0 {
+		t.Fatalf("the fixture cannot express a non-zero stale pin: version %d",
+			claimedByLive.Version)
+	}
+	if _, err := fixture.service.CompleteClaim(live, CompletionRequest{
+		ID: fixture.queued.ID, ExpectedVersion: stale,
+		ClaimID: []byte("live-claim"),
+		Result:  ExecutionResult{Output: json.RawMessage(`{"ok":true}`)},
+		Context: dispatchContext(fixture.now, "live-request"),
+	}); !errors.Is(err, ErrClaimLost) {
+		t.Fatalf("a fence-less completion pinning a stale version was "+
+			"accepted, so the legacy branch has been loosened: %v", err)
+	}
+
+	// And the fence path is the supported one: the same caller, same stale
+	// version, presenting the fence it holds, completes. Without this the test
+	// above would also pass against a service that refused every completion.
+	if _, err := fixture.service.CompleteClaim(live, CompletionRequest{
+		ID: fixture.queued.ID, ExpectedVersion: stale,
+		ClaimFence: claimedByLive.ClaimFence,
+		ClaimID:    []byte("live-claim"),
+		Result:     ExecutionResult{Output: json.RawMessage(`{"ok":true}`)},
+		Context:    dispatchContext(fixture.now, "live-request"),
+	}); err != nil {
+		t.Fatalf("the fence path refused a live claimant holding the right "+
+			"fence, which is the stranding this route was fixed to stop: %v",
+			err)
+	}
+}
+
+// TestAnAmbiguityReportWritesNoOutboxRow pins the PR's claim that this route
+// publishes no event, which nothing asserted.
+//
+// It is not only about log volume. An outbox row for a report would be
+// publishable by whoever filed it and by nobody else, which is the
+// mixed-identity outbox #480 records as leavable undrainable by any principal.
+// A lapsed claimant is exactly the principal least able to drain one.
+func TestAnAmbiguityReportWritesNoOutboxRow(t *testing.T) {
+	fixture := newExecutorClaimFixture(t)
+	worker, fence, _ := fixture.lapsedClaimant(t, "worker")
+	before := len(fixture.dispatchStore.transitions)
+
+	if _, err := fixture.service.ReportAmbiguity(worker, AmbiguityRequest{
+		ID: fixture.queued.ID, ClaimFence: fence,
+		Outcome: AmbiguityOutcomeUnknown,
+		Context: dispatchContext(fixture.now, "worker-request"),
+	}); err != nil {
+		t.Fatalf("the report failed: %v", err)
+	}
+
+	if after := len(fixture.dispatchStore.transitions); after != before {
+		t.Fatalf("the report enqueued %d outbox rows; a row only its filer "+
+			"can publish is the mixed-identity outbox #480 describes",
+			after-before)
+	}
+}
+
+// TestAnAmbiguityReportAuditsItsOwnPhaseAndOperation covers the two audit
+// fields nothing pinned.
+//
+// The phase distinguishes this write in the audit trail from the five that
+// transition the action. The operation must be the one that authorized *this*
+// call rather than the record's last transition — reading the record's field
+// would attribute the report to whatever claimed the action, and would pass an
+// empty operation for a record claimed by a build without the field, which
+// RecordAction validates first and refuses as a 503.
+func TestAnAmbiguityReportAuditsItsOwnPhaseAndOperation(t *testing.T) {
+	fixture := newExecutorClaimFixture(t)
+	worker, fence, _ := fixture.lapsedClaimant(t, "worker")
+
+	// The record was claimed by this worker under execute, so a correct audit
+	// names execute. Clearing the record's own field proves the audit does not
+	// read it — a record from a build without the field must still report.
+	stored := fixture.dispatchStore.records[string(fixture.queued.ID)]
+	stored.TransitionOperation = ""
+	fixture.dispatchStore.records[string(fixture.queued.ID)] = stored
+
+	if _, err := fixture.service.ReportAmbiguity(worker, AmbiguityRequest{
+		ID: fixture.queued.ID, ClaimFence: fence,
+		Outcome: AmbiguityOutcomeUnknown,
+		Context: dispatchContext(fixture.now, "worker-request"),
+	}); err != nil {
+		t.Fatalf("a record with no recorded transition operation cannot be "+
+			"reported on, which is a 503 across an upgrade: %v", err)
+	}
+
+	var found bool
+	for _, phase := range fixture.recorder.phases {
+		if phase == "ambiguity_report" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("no ambiguity_report audit phase was recorded: %v",
+			fixture.recorder.phases)
+	}
+	// And the operation, which this test claimed to cover and did not. The
+	// recorder double kept only the phase, so changing the audited operation
+	// to one that had not authorized the call left the whole package green —
+	// the assertion above is satisfied by any operation that passes
+	// Operation.Validate, which every operation does.
+	if got := fixture.recorder.recordedOperation(
+		"ambiguity_report"); got != auth.OperationExecute {
+		t.Fatalf("the report was audited under %q, not the operation that "+
+			"authorized it: an auditor then attributes it to whatever "+
+			"claimed the action", got)
+	}
+}
+
+// TestAStaleGenerationCannotCommitOntoALiveOne is the ABA break a second
+// review found in the first attempt at the stranding fix, and the reason this
+// route binds on the fence rather than on a widened version comparison.
+//
+// The first attempt tolerated version drift that ambiguity reports could
+// account for. The budget was the record's *lifetime* report count while the
+// drift was measured from the caller's read, so reports filed before the read
+// bought slack without adding drift. A worker reusing one ClaimID across two
+// claim generations could then commit attempt one's outcome onto attempt two's
+// generation — terminating a claim that was still executing.
+//
+// ClaimID cannot prevent it: it is caller-chosen, nothing requires it to be
+// unique across generations, and a worker deriving it from the action ID is
+// doing something the model's own wording invites. The fence can, because
+// applyClaim increments it on every claim.
+func TestAStaleGenerationCannotCommitOntoALiveOne(t *testing.T) {
+	fixture := newExecutorClaimFixture(t)
+
+	// A lapsed holder files a report first, which under the old tolerance
+	// bought a version of slack without moving the caller's read.
+	other, otherFence, otherClaim := fixture.lapsedClaimant(t, "other")
+	if _, err := fixture.service.ReportAmbiguity(other, AmbiguityRequest{
+		ID: fixture.queued.ID, ClaimFence: otherFence,
+		Outcome: AmbiguityOutcomeUnknown,
+		Context: dispatchContext(fixture.now, "other-request"),
+	}); err != nil {
+		t.Fatalf("the lapsed holder could not report: %v", err)
+	}
+	reported, err := fixture.service.Status(fixture.enqueuer, StatusRequest{
+		ID: fixture.queued.ID, Context: dispatchContext(fixture.now, "request"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = otherClaim
+
+	// One worker, one reused ClaimID, two generations.
+	worker := fixture.namedWorker(t, "worker", auth.OperationExecute)
+	first, err := fixture.service.Claim(worker, ClaimRequest{
+		ID: fixture.queued.ID, ExpectedVersion: reported.Version,
+		ClaimID: []byte("reused"), Lease: time.Nanosecond,
+		Context: dispatchContext(fixture.now, "worker-request"),
+	})
+	if err != nil {
+		t.Fatalf("the first attempt could not claim: %v", err)
+	}
+	fixture.advance(t, time.Second)
+	second, err := fixture.service.Claim(worker, ClaimRequest{
+		ID: fixture.queued.ID, ExpectedVersion: first.Version,
+		ClaimID: []byte("reused"), Lease: time.Minute,
+		Context: dispatchContext(fixture.now, "worker-request"),
+	})
+	if err != nil {
+		t.Fatalf("the second attempt could not claim: %v", err)
+	}
+	if second.ClaimFence == first.ClaimFence {
+		t.Fatalf("both attempts share fence %d, so this test cannot "+
+			"distinguish them", first.ClaimFence)
+	}
+
+	// The first attempt completes late, under its own generation's fence.
+	// The second attempt is live and still executing.
+	_, err = fixture.service.CompleteClaim(worker, CompletionRequest{
+		ID: fixture.queued.ID, ExpectedVersion: first.Version,
+		ClaimID: []byte("reused"), ClaimFence: first.ClaimFence,
+		Result:  ExecutionResult{Output: json.RawMessage(`{"ok":false}`)},
+		Context: dispatchContext(fixture.now, "worker-request"),
+	})
+	if err == nil {
+		t.Fatal("a stale claim generation committed its outcome onto a live " +
+			"one, terminating a claim that was still executing")
+	}
+	if !errors.Is(err, ErrClaimLost) {
+		t.Fatalf("the refusal does not tell the stale attempt its claim is "+
+			"gone: %v", err)
+	}
+
+	// And the live generation still completes with its own outcome.
+	done, err := fixture.service.CompleteClaim(worker, CompletionRequest{
+		ID: fixture.queued.ID, ExpectedVersion: second.Version,
+		ClaimID: []byte("reused"), ClaimFence: second.ClaimFence,
+		Result:  ExecutionResult{Output: json.RawMessage(`{"ok":true}`)},
+		Context: dispatchContext(fixture.now, "worker-request"),
+	})
+	if err != nil {
+		t.Fatalf("the live generation was refused: %v", err)
+	}
+	if string(done.Output) != `{"ok":true}` {
+		t.Fatalf("the stale attempt's outcome was recorded: %s", done.Output)
+	}
+}
+
+// TestAReplayIsNotAnotherGenerationsOutcome is the second defect of that
+// attempt: dropping the version from the replay branch without putting the
+// fence in its place.
+//
+// Terminal plus a matching ClaimID is true of a *later* generation's
+// completion, so a worker reusing one ClaimID was handed attempt two's
+// committed outcome as though it were attempt one's — a success receipt for
+// someone else's result, which is the failure a worker cannot detect. It
+// needed no ambiguity report at all, and nothing in the repository covered it.
+func TestAReplayIsNotAnotherGenerationsOutcome(t *testing.T) {
+	fixture := newExecutorClaimFixture(t)
+	worker := fixture.namedWorker(t, "worker", auth.OperationExecute)
+
+	first, err := fixture.service.Claim(worker, ClaimRequest{
+		ID: fixture.queued.ID, ExpectedVersion: fixture.queued.Version,
+		ClaimID: []byte("reused"), Lease: time.Nanosecond,
+		Context: dispatchContext(fixture.now, "worker-request"),
+	})
+	if err != nil {
+		t.Fatalf("the first attempt could not claim: %v", err)
+	}
+	fixture.advance(t, time.Second)
+
+	// The second attempt claims under the same ClaimID and completes.
+	second, err := fixture.service.Claim(worker, ClaimRequest{
+		ID: fixture.queued.ID, ExpectedVersion: first.Version,
+		ClaimID: []byte("reused"), Lease: time.Minute,
+		Context: dispatchContext(fixture.now, "worker-request"),
+	})
+	if err != nil {
+		t.Fatalf("the second attempt could not claim: %v", err)
+	}
+	if _, err := fixture.service.CompleteClaim(worker, CompletionRequest{
+		ID: fixture.queued.ID, ExpectedVersion: second.Version,
+		ClaimID: []byte("reused"), ClaimFence: second.ClaimFence,
+		Result:  ExecutionResult{Output: json.RawMessage(`{"ok":false}`)},
+		Context: dispatchContext(fixture.now, "worker-request"),
+	}); err != nil {
+		t.Fatalf("the second attempt could not complete: %v", err)
+	}
+
+	// The first attempt retries, as it would after a lost response.
+	replayed, err := fixture.service.CompleteClaim(worker, CompletionRequest{
+		ID: fixture.queued.ID, ExpectedVersion: first.Version,
+		ClaimID: []byte("reused"), ClaimFence: first.ClaimFence,
+		Result:  ExecutionResult{Output: json.RawMessage(`{"ok":true}`)},
+		Context: dispatchContext(fixture.now, "worker-request"),
+	})
+	if err == nil {
+		t.Fatalf("the first attempt was handed another generation's outcome "+
+			"as its own: %s", replayed.Output)
+	}
+	if !errors.Is(err, ErrClaimLost) {
+		t.Fatalf("the refusal is not a lost claim: %v", err)
+	}
+}
+
+// TestAmbiguityTextRefusesNonPrintableCharacters covers the fix that
+// unicode.IsControl was the wrong test, which nothing asserted.
+//
+// IsControl is false for U+202E RIGHT-TO-LEFT OVERRIDE, the U+2066..U+2069
+// isolates, U+200E/U+200F, the zero-width characters and U+FEFF — all of which
+// reached the durable record while the comment claimed "printable and
+// single-line". U+202E is exactly the case the bound's own rationale names: a
+// value that is at worst a terminal escape in whatever renders it.
+//
+// The existing refusal table probed only ASCII controls, so the entire content
+// of the fix was uncovered.
+func TestAmbiguityTextRefusesNonPrintableCharacters(t *testing.T) {
+	for _, probe := range []struct {
+		name  string
+		value string
+	}{
+		// Built from rune values rather than written literally: a source file
+		// may not contain a byte order mark except at its start, and the
+		// literals also make the test unreadable in exactly the way these
+		// characters make a target unreadable.
+		{"right-to-left override", "host" + string(rune(0x202E)) + "evil"},
+		{"left-to-right isolate", "host" + string(rune(0x2066)) + "evil"},
+		{"pop directional isolate", "host" + string(rune(0x2069)) + "evil"},
+		{"left-to-right mark", "host" + string(rune(0x200E)) + "evil"},
+		{"zero-width space", "host" + string(rune(0x200B)) + "evil"},
+		{"soft hyphen", "host" + string(rune(0x00AD)) + "evil"},
+		{"byte order mark", "host" + string(rune(0xFEFF)) + "evil"},
+	} {
+		t.Run(probe.name, func(t *testing.T) {
+			fixture := newExecutorClaimFixture(t)
+			worker, fence, _ := fixture.lapsedClaimant(t, "worker")
+			if _, err := fixture.service.ReportAmbiguity(
+				worker, AmbiguityRequest{
+					ID: fixture.queued.ID, ClaimFence: fence,
+					Outcome: AmbiguityOutcomeUnknown, Target: probe.value,
+					Context: dispatchContext(fixture.now, "worker-request"),
+				}); err == nil {
+				t.Fatalf("%q was accepted into the durable record", probe.value)
+			}
+		})
+	}
+
+	// A non-ASCII value that *is* printable must still be accepted, or the
+	// stricter test would be refusing ordinary targets.
+	fixture := newExecutorClaimFixture(t)
+	worker, fence, _ := fixture.lapsedClaimant(t, "worker")
+	if _, err := fixture.service.ReportAmbiguity(worker, AmbiguityRequest{
+		ID: fixture.queued.ID, ClaimFence: fence,
+		Outcome:   AmbiguityOutcomeUnknown,
+		Target:    "zahlungen.beispiel.test",
+		Reference: "r" + string(rune(0x00E9)) + "f-001",
+		Context:   dispatchContext(fixture.now, "worker-request"),
+	}); err != nil {
+		t.Fatalf("a printable non-ASCII target was refused: %v", err)
+	}
+}
+
+// TestTheRetainedHolderCarriesItsOwnClaimID covers the ordering fix in
+// applyClaim, which nothing asserted.
+//
+// The history retains the *outgoing* holder, and the block read
+// record.ClaimID after the incoming claim had already overwritten it — so
+// every retained holder carried its successor's claim ID. No authorization
+// consequence, since heldClaimAt keys on the fence, but the history is
+// evidence an operator reads and it was wrong.
+func TestTheRetainedHolderCarriesItsOwnClaimID(t *testing.T) {
+	fixture := newExecutorClaimFixture(t)
+	first, _, claimedFirst := fixture.lapsedClaimant(t, "first")
+	_ = first
+
+	second := fixture.namedWorker(t, "second", auth.OperationExecute)
+	if _, err := fixture.service.Claim(second, ClaimRequest{
+		ID: fixture.queued.ID, ExpectedVersion: claimedFirst.Version,
+		ClaimID: []byte("second-claim"), Lease: time.Minute,
+		Context: dispatchContext(fixture.now, "second-request"),
+	}); err != nil {
+		t.Fatalf("the second worker could not claim: %v", err)
+	}
+
+	current, err := fixture.service.Status(fixture.enqueuer, StatusRequest{
+		ID: fixture.queued.ID, Context: dispatchContext(fixture.now, "request"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(current.ClaimHistory) != 1 {
+		t.Fatalf("history length = %d, want 1", len(current.ClaimHistory))
+	}
+	holder := current.ClaimHistory[0]
+	if !bytes.Equal(holder.ClaimID, []byte("first-claim")) {
+		t.Fatalf("the retained holder carries %q, want its own claim ID "+
+			"\"first-claim\" — reading record.ClaimID after the incoming claim "+
+			"overwrote it gives every holder its successor's", holder.ClaimID)
+	}
+	if holder.Subject != "first-subject" {
+		t.Fatalf("the retained holder is %q, not the outgoing one",
+			holder.Subject)
+	}
+}
+
+// TestAClaimHolderChainIsBoundedInBytes covers the aggregate bound, which
+// nothing asserted.
+//
+// MaxOnBehalfOfEntries bounds the chain by entry count and not by size. A
+// measurement found the chains were 89% of the record's worst-case growth:
+// eight holders with maximal chains reach 18% of the encoding ceiling alone,
+// and combined with a maximal input, output and evidence set they pushed a
+// record past what encodeAction accepts — the brick the cap exists to prevent.
+func TestAClaimHolderChainIsBoundedInBytes(t *testing.T) {
+	long := make([]shoal.ID, 0, 8)
+	for len(long) < 8 {
+		long = append(long, shoal.ID(strings.Repeat("d", 1024)))
+	}
+	holder := ClaimHolder{
+		Subject: "holder", Actor: "holder-actor",
+		ClaimID: []byte("claim"), ClaimFence: 1,
+		HeldAt:     time.Date(2026, 9, 6, 12, 0, 0, 0, time.UTC),
+		OnBehalfOf: long,
+	}
+	if err := holder.validate(); err == nil {
+		t.Fatalf("a delegation chain of %d bytes across %d entries was "+
+			"accepted, so the record is still brickable by a repeatedly "+
+			"re-claimed action", 8*1024, len(long))
+	}
+
+	// And a chain inside the bound is still accepted, so the byte cap is not
+	// simply refusing delegation.
+	holder.OnBehalfOf = []shoal.ID{shoal.ID(strings.Repeat("d", 512))}
+	if err := holder.validate(); err != nil {
+		t.Fatalf("a chain well inside the byte bound was refused: %v", err)
+	}
+}
+
+// TestAClaimantChainTooLongToRetainIsRefusedAtClaimTime closes the brick that
+// MaxClaimHolderChainBytes itself opened.
+//
+// ClaimantOnBehalfOf on the live record was bounded only by entry count — 64
+// entries of up to shoal.MaxIDBytes each, so 64 KB in the worst case — while a
+// retained ClaimHolder's chain was additionally bounded at
+// MaxClaimHolderChainBytes. A claimant whose chain fell between the two claimed
+// successfully, and then the *next* claim built a record that
+// ActionRecord.Validate refuses, so encodeAction refused the write and every
+// later claim by anyone was refused identically. The action sat in
+// DispatchClaimed with a dead lease and no principal could ever take it again.
+//
+// It was reproduced before it was fixed: a five-entry 5120-byte chain claimed
+// at version 2, its lease lapsed, and the next worker was refused "claim holder
+// delegation chain exceeds its byte bound" with the record still at version 2.
+//
+// Refused at claim time rather than truncated on retention, because
+// heldClaimAt compares a retained holder's chain element for element — so
+// dropping it would silently deny the ambiguity route to exactly the delegated
+// worker whose claim was taken over, the one caller that route exists for.
+//
+// The second half is what makes the first half mean anything: a chain just
+// inside the bound must still claim, lapse and be re-claimed. Without it this
+// test would pass against a service that refused every delegated claim.
+func TestAClaimantChainTooLongToRetainIsRefusedAtClaimTime(t *testing.T) {
+	chainOf := func(entries, size int) []shoal.ID {
+		chain := make([]shoal.ID, 0, entries)
+		for index := 0; index < entries; index++ {
+			chain = append(chain, shoal.ID(
+				strings.Repeat(string(rune('a'+index)), size)))
+		}
+		return chain
+	}
+
+	// Legal for a decision — five entries, well under MaxOnBehalfOfEntries,
+	// each well under shoal.MaxIDBytes — and 5120 bytes in aggregate, which no
+	// retained holder may carry.
+	fixture := newExecutorClaimFixture(t)
+	overLong := bindDecision(t, fixture.authority,
+		dispatchDecisionFor(t, principal{
+			subject: "long-subject", actor: "long-actor",
+			request: "long-request", onBehalfOf: chainOf(5, 1024),
+		}, auth.OperationExecute, auth.OperationDelegate))
+	_, err := fixture.service.Claim(overLong, ClaimRequest{
+		ID: fixture.queued.ID, ExpectedVersion: fixture.queued.Version,
+		ClaimID: []byte("long-claim"), Lease: time.Nanosecond,
+		Context: dispatchContext(fixture.now, "long-request"),
+	})
+	if err == nil {
+		t.Fatal("a claimant whose chain cannot be retained was accepted: the " +
+			"next claim will produce a record encodeAction refuses, and the " +
+			"action is then unclaimable by anyone, permanently")
+	}
+	if !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
+		t.Fatalf("refusal is not an invalid argument, so a caller cannot tell "+
+			"it is the chain rather than the record: %v", err)
+	}
+
+	// And a chain inside the bound survives the whole sequence the brick
+	// broke: claim, lapse, re-claim by someone else, and the retained holder
+	// is recognisable to the route that needs it.
+	fixture = newExecutorClaimFixture(t)
+	withinBound := chainOf(3, 1024)
+	delegated := bindDecision(t, fixture.authority,
+		dispatchDecisionFor(t, principal{
+			subject: "short-subject", actor: "short-actor",
+			request: "short-request", onBehalfOf: withinBound,
+		}, auth.OperationExecute, auth.OperationDelegate))
+	claimed, err := fixture.service.Claim(delegated, ClaimRequest{
+		ID: fixture.queued.ID, ExpectedVersion: fixture.queued.Version,
+		ClaimID: []byte("short-claim"), Lease: time.Nanosecond,
+		Context: dispatchContext(fixture.now, "short-request"),
+	})
+	if err != nil {
+		t.Fatalf("a delegated chain inside the bound was refused, so the "+
+			"bound above is refusing ordinary callers: %v", err)
+	}
+	fixture.advance(t, time.Second)
+	second := fixture.namedWorker(t, "second", auth.OperationExecute)
+	if _, err := fixture.service.Claim(second, ClaimRequest{
+		ID: fixture.queued.ID, ExpectedVersion: claimed.Version,
+		ClaimID: []byte("second-claim"), Lease: time.Minute,
+		Context: dispatchContext(fixture.now, "second-request"),
+	}); err != nil {
+		t.Fatalf("the re-claim that bricked is still refused: %v", err)
+	}
+	if _, err := fixture.service.ReportAmbiguity(
+		delegated, AmbiguityRequest{
+			ID: fixture.queued.ID, ClaimFence: claimed.ClaimFence,
+			Outcome: AmbiguityOutcomeUnknown,
+			Context: dispatchContext(fixture.now, "short-request"),
+		}); err != nil {
+		t.Fatalf("the displaced delegated holder cannot report what it "+
+			"attempted, so its retained chain was not recognised: %v", err)
 	}
 }
