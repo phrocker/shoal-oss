@@ -1280,7 +1280,12 @@ func (s *DispatchService) ReportAmbiguity(
 	if !heldClaimAt(decision, current, request.ClaimFence) {
 		return ActionRecord{}, auth.ObjectNotFound()
 	}
-	if current.Version != request.ExpectedVersion {
+	// Pinned only when the caller asked for it. See AmbiguityRequest's own
+	// documentation: the caller this route exists for cannot learn the current
+	// version, and version was never the invariant — the claim is, and the
+	// store asserts that through ExpectedFence below.
+	if request.ExpectedVersion != 0 &&
+		current.Version != request.ExpectedVersion {
 		return ActionRecord{}, ErrActionConflict
 	}
 	if len(current.AmbiguityReports) >= MaxActionAmbiguityReports {

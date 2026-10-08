@@ -2164,3 +2164,69 @@ func TestAnAdmissionCannotBeReportedAsAmbiguous(t *testing.T) {
 		t.Fatalf("an admission is refused distinguishably: %v", err)
 	}
 }
+
+// TestALapsedClaimantReportsWithoutKnowingTheVersion is the test the first
+// version of this route did not have, and its absence made the route unusable
+// by the only caller it exists for.
+//
+// A lapsed claimant cannot learn the record's current version. Status needs
+// OperationDispatch and the record's own principal; Pull withholds
+// live-claimed records, so a reclaimed action is absent from its page; and
+// ErrActionConflict carries no version. The other tests here all pass a
+// version obtained by being the party that reclaimed, which a real worker
+// never is — a fixture that can express something its subject cannot.
+//
+// So the version is optional. What must not change under a report is the
+// claim, and the store asserts that through ExpectedFence.
+func TestALapsedClaimantReportsWithoutKnowingTheVersion(t *testing.T) {
+	fixture := newExecutorClaimFixture(t)
+	worker, fence, claimed := fixture.lapsedClaimant(t, "worker")
+
+	// Someone else takes the record, moving the version past anything the
+	// first worker saw.
+	second := fixture.namedWorker(t, "second", auth.OperationExecute)
+	if _, err := fixture.service.Claim(second, ClaimRequest{
+		ID: fixture.queued.ID, ExpectedVersion: claimed.Version,
+		ClaimID: []byte("second-claim"), Lease: time.Minute,
+		Context: dispatchContext(fixture.now, "second-request"),
+	}); err != nil {
+		t.Fatalf("the second worker could not reclaim: %v", err)
+	}
+
+	// Everything the lapsed worker actually knows: the action ID and the fence
+	// it held. No version.
+	reported, err := fixture.service.ReportAmbiguity(worker, AmbiguityRequest{
+		ID: fixture.queued.ID, ClaimFence: fence,
+		Outcome: AmbiguityOutcomeUnknown, Reference: "ch_1A2b3C",
+		Context: dispatchContext(fixture.now, "worker-request"),
+	})
+	if err != nil {
+		t.Fatalf("a lapsed claimant cannot report without a version it has no "+
+			"way to obtain: %v", err)
+	}
+	if len(reported.AmbiguityReports) != 1 ||
+		reported.AmbiguityReports[0].Reference != "ch_1A2b3C" {
+		t.Fatalf("the report was not recorded: %+v", reported.AmbiguityReports)
+	}
+
+	// The stale version it does know is still refused when pinned, so the
+	// optional pin is a real check rather than ignored.
+	if _, err := fixture.service.ReportAmbiguity(worker, AmbiguityRequest{
+		ID: fixture.queued.ID, ExpectedVersion: claimed.Version,
+		ClaimFence: fence, Outcome: AmbiguityOutcomeUnknown,
+		Context: dispatchContext(fixture.now, "worker-request"),
+	}); !errors.Is(err, ErrActionConflict) {
+		t.Fatalf("a pinned stale version was not refused as a conflict: %v", err)
+	}
+
+	// And the second worker's claim is untouched by the report.
+	current, err := fixture.service.Status(fixture.enqueuer, StatusRequest{
+		ID: fixture.queued.ID, Context: dispatchContext(fixture.now, "request"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(current.ClaimID, []byte("second-claim")) {
+		t.Fatalf("the report disturbed the live claim: %q", current.ClaimID)
+	}
+}

@@ -683,9 +683,24 @@ type CompletionRequest struct {
 // without being able to report the outcome through CompleteClaim.
 type AmbiguityRequest struct {
 	ID []byte
-	// ExpectedVersion is the record version the reporter last saw. The report
-	// does not transition the action, but it does write to it, so it is
-	// serialised like any other mutation.
+	// ExpectedVersion optionally pins the record version. Zero means "append
+	// at whatever the version is now", which is the usual case and the only
+	// one the intended caller can express.
+	//
+	// A lapsed claimant cannot learn the current version by any route it is
+	// authorized for. Status requires OperationDispatch and the record's own
+	// principal; Pull withholds live-claimed records, so a reclaimed action is
+	// absent from its page; and ErrActionConflict carries no version. So
+	// requiring a version made this route unusable by the only caller it
+	// exists for — verified by execution, and the PR's own test passed only
+	// because it used the version the *reclaiming* party had been handed.
+	//
+	// Dropping the requirement is safe because version was never the
+	// invariant here. The report does not transition the action, and what must
+	// not change under it is the claim, which is asserted separately through
+	// the store's ExpectedFence. A caller that does know the version may still
+	// pin it, and two concurrent reports are serialised by the store's
+	// compare-and-set either way.
 	ExpectedVersion uint64
 	// ClaimFence is the attempt this report belongs to. The reporter must have
 	// held the claim at this fence — either it still holds it, or the record
