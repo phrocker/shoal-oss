@@ -26,6 +26,7 @@ type FleetDispatchProvider interface {
 	Pull(context.Context, fleet.PullActionsRequest) (fleet.ActionPage, error)
 	Invoke(context.Context, fleet.InvokeRequest) (fleet.ActionRecord, error)
 	CompleteClaim(context.Context, fleet.CompletionRequest) (fleet.ActionRecord, error)
+	ReportAmbiguity(context.Context, fleet.AmbiguityRequest) (fleet.ActionRecord, error)
 }
 
 // NewFleetDispatchHandler returns the fleet dispatch HTTP surface without
@@ -200,6 +201,38 @@ func mountFleetDispatch(mux *http.ServeMux, provider FleetDispatchProvider) {
 		}
 		writeResponse(w, http.StatusOK, encodeFleetAction(result))
 	})
+	// A worker that lost its fence mid-effect cannot use /complete, which is
+	// gated on the fence it lost. This route records what it attempted without
+	// transitioning the action (#438).
+	mux.HandleFunc("POST /api/v1/fleet/actions/{action}/ambiguity", func(w http.ResponseWriter, r *http.Request) {
+		actionID, err := decodeWireBytes("action ID", r.PathValue("action"), false)
+		if err != nil {
+			writeError(w, fleetDispatchError(err))
+			return
+		}
+		var wire fleetAmbiguityWire
+		if err := decodeRequest(w, r, &wire); err != nil {
+			writeError(w, shoal.NewError(shoal.ErrorInvalidArgument, err.Error()))
+			return
+		}
+		contextValue, err := wire.Context.decode()
+		if err != nil {
+			writeError(w, fleetDispatchError(err))
+			return
+		}
+		result, err := provider.ReportAmbiguity(r.Context(), fleet.AmbiguityRequest{
+			ID: actionID, ExpectedVersion: wire.ExpectedVersion,
+			ClaimFence: wire.ClaimFence,
+			Outcome:    fleet.AmbiguityOutcome(wire.Outcome),
+			Target:     wire.Target, Reference: wire.Reference,
+			Context: contextValue,
+		})
+		if err != nil {
+			writeError(w, fleetDispatchError(err))
+			return
+		}
+		writeResponse(w, http.StatusOK, encodeFleetAction(result))
+	})
 	mux.HandleFunc("POST /api/v1/fleet/actions/{action}/cancel", func(w http.ResponseWriter, r *http.Request) {
 		actionID, err := decodeWireBytes("action ID", r.PathValue("action"), false)
 		if err != nil {
@@ -329,6 +362,20 @@ type fleetCancelWire struct {
 // fleetCompletionWire is a remote worker reporting an outcome. It carries the
 // same fields an in-process ActionExecutor returns, and the service validates
 // them identically.
+// fleetAmbiguityWire is a lost-fence report.
+//
+// It names a fence rather than a claim ID: the record retains only the current
+// claim ID, and the caller this route exists for has had its claim taken over,
+// so the ID it held is gone from the record while its fence is not.
+type fleetAmbiguityWire struct {
+	Context         fleetRequestContextWire `json:"context"`
+	ExpectedVersion uint64                  `json:"expected_version"`
+	ClaimFence      uint64                  `json:"claim_fence"`
+	Outcome         string                  `json:"outcome"`
+	Target          string                  `json:"target,omitempty"`
+	Reference       string                  `json:"reference,omitempty"`
+}
+
 type fleetCompletionWire struct {
 	Context              fleetRequestContextWire `json:"context"`
 	ExpectedVersion      uint64                  `json:"expected_version"`
@@ -339,6 +386,16 @@ type fleetCompletionWire struct {
 	EvidenceSnapshotID   string                  `json:"evidence_snapshot_id,omitempty"`
 	EvidenceSnapshotAsOf time.Time               `json:"evidence_snapshot_as_of,omitempty"`
 	Evidence             []fleetEvidenceWire     `json:"evidence,omitempty"`
+}
+
+type fleetAmbiguityReportWire struct {
+	ClaimFence uint64    `json:"claim_fence"`
+	Outcome    string    `json:"outcome"`
+	Target     string    `json:"target,omitempty"`
+	Reference  string    `json:"reference,omitempty"`
+	Subject    string    `json:"subject"`
+	Actor      string    `json:"actor"`
+	ReportedAt time.Time `json:"reported_at"`
 }
 
 type fleetEvidenceWire struct {
@@ -447,14 +504,25 @@ type fleetActionWire struct {
 	// standard base64. This wire spells it raw-URL like every other byte field
 	// here. Both decode to the same key, so a worker must compare decoded bytes
 	// and never the two spellings against each other.
-	ExecutorKey          string              `json:"executor_key,omitempty"`
-	ClaimID              string              `json:"claim_id,omitempty"`
-	ClaimFence           uint64              `json:"claim_fence,omitempty"`
-	ClaimLeaseUntil      time.Time           `json:"claim_lease_until,omitempty"`
-	EffectPossible       bool                `json:"effect_possible"`
-	EvidenceSnapshotID   string              `json:"evidence_snapshot_id,omitempty"`
-	EvidenceSnapshotAsOf time.Time           `json:"evidence_snapshot_as_of,omitempty"`
-	Evidence             []fleetEvidenceWire `json:"evidence,omitempty"`
+	ExecutorKey     string    `json:"executor_key,omitempty"`
+	ClaimID         string    `json:"claim_id,omitempty"`
+	ClaimFence      uint64    `json:"claim_fence,omitempty"`
+	ClaimLeaseUntil time.Time `json:"claim_lease_until,omitempty"`
+	EffectPossible  bool      `json:"effect_possible"`
+	// AmbiguityReports accompany EffectPossible wherever it appears, because
+	// the flag says an effect may have happened and these say what was
+	// attempted. An operator reading one without the other has the question
+	// and not the evidence.
+	//
+	// The claim history is deliberately *not* on this wire. It exists so the
+	// service can recognise a lapsed claimant, and publishing it would hand
+	// every execute-holder in the scope a list of which principals have held a
+	// record and under which fences — an identity disclosure the route does
+	// not need to make.
+	AmbiguityReports     []fleetAmbiguityReportWire `json:"ambiguity_reports,omitempty"`
+	EvidenceSnapshotID   string                     `json:"evidence_snapshot_id,omitempty"`
+	EvidenceSnapshotAsOf time.Time                  `json:"evidence_snapshot_as_of,omitempty"`
+	Evidence             []fleetEvidenceWire        `json:"evidence,omitempty"`
 }
 
 func (w fleetEnqueueWire) decode(pathID []byte) (fleet.EnqueueRequest, error) {
@@ -601,6 +669,7 @@ func encodeFleetAction(record fleet.ActionRecord) fleetActionWire {
 		CreatedAt: record.CreatedAt, UpdatedAt: record.UpdatedAt,
 		ClaimID: base64.RawURLEncoding.EncodeToString(record.ClaimID), ClaimFence: record.ClaimFence,
 		ClaimLeaseUntil: record.ClaimLeaseUntil, EffectPossible: record.EffectPossible,
+		AmbiguityReports:     encodeFleetAmbiguityReports(record.AmbiguityReports),
 		EvidenceSnapshotID:   encodeFleetID(record.EvidenceSnapshotID),
 		EvidenceSnapshotAsOf: record.EvidenceSnapshotAsOf, Evidence: evidence,
 	}
@@ -623,6 +692,26 @@ func encodeClaimedFleetAction(record fleet.ActionRecord) fleetActionWire {
 	wire.Input = append(json.RawMessage(nil), record.Input...)
 	wire.ExecutorKey = base64.RawURLEncoding.EncodeToString(record.ExecutorKey)
 	return wire
+}
+
+func encodeFleetAmbiguityReports(
+	reports []fleet.AmbiguityReport,
+) []fleetAmbiguityReportWire {
+	if len(reports) == 0 {
+		return nil
+	}
+	result := make([]fleetAmbiguityReportWire, len(reports))
+	for index, report := range reports {
+		result[index] = fleetAmbiguityReportWire{
+			ClaimFence: report.ClaimFence,
+			Outcome:    string(report.Outcome),
+			Target:     report.Target, Reference: report.Reference,
+			Subject:    encodeFleetID(report.Subject),
+			Actor:      encodeFleetID(report.Actor),
+			ReportedAt: report.ReportedAt,
+		}
+	}
+	return result
 }
 
 func encodeFleetIDs(values []shoal.ID) []string {

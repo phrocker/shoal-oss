@@ -15,6 +15,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/phrocker/shoal-oss/pkg/document"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
@@ -31,6 +33,36 @@ const (
 	MaxActionClaimTTL      = 5 * time.Minute
 	MaxActionDeadline      = 24 * time.Hour
 	MaxDispatchListResults = 256
+	// MaxActionClaimHistory bounds how many prior claim holders a record
+	// retains, and MaxActionAmbiguityReports how many lost-fence reports it
+	// accumulates.
+	//
+	// Both are capped because both grow on caller-triggered transitions and
+	// encodeAction refuses a record over 3*MaxActionPayloadBytes — an
+	// unbounded list would eventually make the action *unwritable* rather than
+	// merely large, which bricks the record instead of degrading it. Eight is
+	// chosen to cover a lease that lapses and is re-taken several times during
+	// one long operation while staying far inside that ceiling.
+	//
+	// The claim history drops its oldest entry on overflow: the most recent
+	// claimants are the ones whose effects may be unreconciled. The report
+	// list refuses instead of dropping, because a report is evidence an
+	// operator is going to read and silently discarding the first one is worse
+	// than refusing the ninth.
+	MaxActionClaimHistory     = 8
+	MaxActionAmbiguityReports = 8
+	// MaxAmbiguityTargetBytes bounds the worker's identifier for the third
+	// party it was talking to, and MaxAmbiguityReferenceBytes the opaque
+	// handle that party returned.
+	//
+	// Both are deliberately small. They describe an interaction with a system
+	// Shoal does not control, so the bytes are target-controlled: they reach
+	// the durable record, action.* events and the team overview. A closed
+	// shape with tight bounds gives a hostile or merely verbose target
+	// nothing, which is the same reasoning docs/gateway-proxy-design.md
+	// applies to Output.
+	MaxAmbiguityTargetBytes    = 256
+	MaxAmbiguityReferenceBytes = 256
 )
 
 var (
@@ -70,6 +102,194 @@ type EvidenceRef struct {
 }
 
 // ActionRecord is the durable source of truth for one dispatch.
+// AmbiguityOutcome is what a worker observed before it lost the right to
+// report through complete.
+//
+// Closed rather than free text, for the reason the design doc gives for
+// Output: this value describes an interaction with a third party, so a string
+// field is a channel for target-controlled bytes into the durable record, the
+// action.* event stream and the team overview. An operator reconciling under
+// time pressure needs to sort records into groups, which an enumeration does
+// and prose does not.
+//
+// The three cases are the three an operator acts on differently, and the
+// distinction the design doc records as missing from the existing error
+// vocabulary: whether the request left the host at all.
+type AmbiguityOutcome string
+
+const (
+	// AmbiguityRequestNotSent means the worker had not yet transmitted
+	// anything when it lost its claim. The effect did not happen. This is the
+	// only one of the three that is good news, and it is worth recording
+	// rather than staying silent because it removes a record from the set an
+	// operator must reconcile by hand.
+	AmbiguityRequestNotSent AmbiguityOutcome = "request_not_sent"
+	// AmbiguityOutcomeUnknown means the request left the host and the worker
+	// never learned what happened to it. This is the case the route exists
+	// for.
+	AmbiguityOutcomeUnknown AmbiguityOutcome = "outcome_unknown"
+	// AmbiguityEffectObserved means the worker saw the effect succeed but
+	// could no longer report it through complete. The work is done; the record
+	// cannot say so, because this route deliberately does not reach a terminal
+	// state.
+	AmbiguityEffectObserved AmbiguityOutcome = "effect_observed"
+)
+
+func (o AmbiguityOutcome) validate() error {
+	switch o {
+	case AmbiguityRequestNotSent, AmbiguityOutcomeUnknown,
+		AmbiguityEffectObserved:
+		return nil
+	default:
+		return shoal.NewError(
+			shoal.ErrorInvalidArgument, "ambiguity outcome is invalid")
+	}
+}
+
+// ClaimHolder is one principal that held this record's claim, retained so a
+// worker that has since lost the claim can still be recognised.
+//
+// The record's own claimant fields carry only the *current* holder, and
+// applyClaim overwrites them on every re-claim — correctly, since only the
+// current holder may complete. That leaves the one caller a lost-fence report
+// exists for unable to prove it ever held anything: its lease lapsed and
+// another worker took the record, which is the only situation in which a
+// worker needs this route at all.
+type ClaimHolder struct {
+	Subject    shoal.ID
+	Actor      shoal.ID
+	ClientID   shoal.ID
+	OnBehalfOf []shoal.ID
+	ClaimID    []byte
+	// ClaimFence pins a holder to one attempt. A fence is already monotonic,
+	// so two reports from two attempts are distinguishable in the record
+	// without any reconciliation of their own.
+	ClaimFence uint64
+	HeldAt     time.Time
+}
+
+// AmbiguityReport is a worker's account of an effect it may have performed
+// without being able to report the outcome.
+type AmbiguityReport struct {
+	// ClaimFence identifies which attempt this report belongs to, and is what
+	// the reporter must present and the record must have seen.
+	ClaimFence uint64
+	Outcome    AmbiguityOutcome
+	// Target is the worker's identifier for the third party — a host, a queue
+	// name, an endpoint. Bounded and optional.
+	Target string
+	// Reference is an opaque handle the target returned, if the worker got one
+	// before losing the claim. It is the thing an operator takes to the other
+	// system, and the reason this route is worth more than EffectPossible
+	// alone.
+	Reference string
+	// Subject and Actor are the reporting principal, recorded from its
+	// decision rather than from the request, so the report is attributed
+	// rather than self-asserted.
+	Subject    shoal.ID
+	Actor      shoal.ID
+	ReportedAt time.Time
+}
+
+func (h ClaimHolder) validate() error {
+	if err := shoal.ValidateRequiredID("claim holder", h.Subject); err != nil {
+		return err
+	}
+	if err := shoal.ValidateRequiredID(
+		"claim holder actor", h.Actor); err != nil {
+		return err
+	}
+	if err := shoal.ValidateOptionalID(
+		"claim holder client", h.ClientID); err != nil {
+		return err
+	}
+	if len(h.OnBehalfOf) > auth.MaxOnBehalfOfEntries {
+		return shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			"claim holder delegation chain exceeds its bound")
+	}
+	for _, identity := range h.OnBehalfOf {
+		if err := shoal.ValidateRequiredID(
+			"claim holder delegation identity", identity); err != nil {
+			return err
+		}
+	}
+	if err := validateOpaque("claim holder claim ID", h.ClaimID, false); err != nil {
+		return err
+	}
+	// A fence of zero means no claim was ever taken, so a holder carrying one
+	// is a record that cannot be true.
+	if h.ClaimFence == 0 {
+		return shoal.NewError(
+			shoal.ErrorInvalidArgument, "claim holder fence is required")
+	}
+	if h.HeldAt.IsZero() || h.HeldAt.Location() != time.UTC {
+		return shoal.NewError(
+			shoal.ErrorInvalidArgument, "claim holder time is not UTC")
+	}
+	return nil
+}
+
+func (r AmbiguityReport) validate() error {
+	if r.ClaimFence == 0 {
+		return shoal.NewError(
+			shoal.ErrorInvalidArgument, "ambiguity report fence is required")
+	}
+	if err := r.Outcome.validate(); err != nil {
+		return err
+	}
+	// Bounded, and refused rather than truncated: a truncated target or
+	// reference is worse than none, because an operator would take it to the
+	// other system and get nothing.
+	if len(r.Target) > MaxAmbiguityTargetBytes {
+		return shoal.NewError(
+			shoal.ErrorInvalidArgument, "ambiguity target exceeds its bound")
+	}
+	if len(r.Reference) > MaxAmbiguityReferenceBytes {
+		return shoal.NewError(
+			shoal.ErrorInvalidArgument, "ambiguity reference exceeds its bound")
+	}
+	// Printable and single-line. Both values are target-controlled and both
+	// reach the team overview and the event stream, where a control character
+	// is at best unreadable and at worst a terminal escape in whatever renders
+	// it.
+	if err := validateAmbiguityText("ambiguity target", r.Target); err != nil {
+		return err
+	}
+	if err := validateAmbiguityText(
+		"ambiguity reference", r.Reference); err != nil {
+		return err
+	}
+	if err := shoal.ValidateRequiredID(
+		"ambiguity reporter", r.Subject); err != nil {
+		return err
+	}
+	if err := shoal.ValidateRequiredID(
+		"ambiguity reporter actor", r.Actor); err != nil {
+		return err
+	}
+	if r.ReportedAt.IsZero() || r.ReportedAt.Location() != time.UTC {
+		return shoal.NewError(
+			shoal.ErrorInvalidArgument, "ambiguity report time is not UTC")
+	}
+	return nil
+}
+
+func validateAmbiguityText(name, value string) error {
+	for _, codepoint := range value {
+		if unicode.IsControl(codepoint) {
+			return shoal.NewError(
+				shoal.ErrorInvalidArgument,
+				name+" contains a control character")
+		}
+	}
+	if !utf8.ValidString(value) {
+		return shoal.NewError(
+			shoal.ErrorInvalidArgument, name+" is not valid UTF-8")
+	}
+	return nil
+}
+
 type ActionRecord struct {
 	ID                             []byte
 	IdempotencyKey                 []byte
@@ -148,7 +368,16 @@ type ActionRecord struct {
 	// A failed publication is reported as ErrActionCommitted, so the write
 	// landed and the worker was told to reconcile. Recording the real
 	// operation is what lets the publisher ask the right question.
-	TransitionOperation  auth.Operation
+	TransitionOperation auth.Operation
+	// ClaimHistory retains prior claim holders, oldest first, so a worker
+	// whose claim was taken over can still be recognised by this record. See
+	// ClaimHolder.
+	ClaimHistory []ClaimHolder
+	// AmbiguityReports are lost-fence reports, in the order received. A second
+	// report under the same fence is appended rather than replacing the first:
+	// two reports from one attempt mean the worker retried, and that is
+	// information an operator wants rather than noise to collapse.
+	AmbiguityReports     []AmbiguityReport
 	ClaimantSubject      shoal.ID
 	ClaimantActor        shoal.ID
 	ClaimantClientID     shoal.ID
@@ -450,6 +679,29 @@ type CompletionRequest struct {
 	Context RequestContext
 }
 
+// AmbiguityRequest is a worker recording an effect it may have performed
+// without being able to report the outcome through CompleteClaim.
+type AmbiguityRequest struct {
+	ID []byte
+	// ExpectedVersion is the record version the reporter last saw. The report
+	// does not transition the action, but it does write to it, so it is
+	// serialised like any other mutation.
+	ExpectedVersion uint64
+	// ClaimFence is the attempt this report belongs to. The reporter must have
+	// held the claim at this fence — either it still holds it, or the record
+	// retains it in ClaimHistory.
+	//
+	// A fence rather than a claim ID, because the record keeps only the
+	// current claim ID while fences are monotonic and retained: the one caller
+	// this route exists for has had its claim taken over, so the ID it held is
+	// gone from the record while its fence is not.
+	ClaimFence uint64
+	Outcome    AmbiguityOutcome
+	Target     string
+	Reference  string
+	Context    RequestContext
+}
+
 type StatusRequest struct {
 	ID      []byte
 	Context RequestContext
@@ -711,6 +963,25 @@ func (r ActionRecord) Validate() error {
 	for _, identity := range r.ClaimantOnBehalfOf {
 		if err := shoal.ValidateRequiredID(
 			"action claimant delegation identity", identity); err != nil {
+			return err
+		}
+	}
+	if len(r.ClaimHistory) > MaxActionClaimHistory {
+		return shoal.NewError(
+			shoal.ErrorInvalidArgument, "action claim history exceeds its bound")
+	}
+	for _, holder := range r.ClaimHistory {
+		if err := holder.validate(); err != nil {
+			return err
+		}
+	}
+	if len(r.AmbiguityReports) > MaxActionAmbiguityReports {
+		return shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			"action ambiguity reports exceed their bound")
+	}
+	for _, report := range r.AmbiguityReports {
+		if err := report.validate(); err != nil {
 			return err
 		}
 	}
@@ -1130,6 +1401,19 @@ func cloneActionRecord(input ActionRecord) ActionRecord {
 	result.ClaimID = append([]byte(nil), input.ClaimID...)
 	result.ClaimantOnBehalfOf = append(
 		[]shoal.ID(nil), input.ClaimantOnBehalfOf...)
+	result.ClaimHistory = make([]ClaimHolder, len(input.ClaimHistory))
+	for index, holder := range input.ClaimHistory {
+		result.ClaimHistory[index] = holder
+		result.ClaimHistory[index].ClaimID = append(
+			[]byte(nil), holder.ClaimID...)
+		result.ClaimHistory[index].OnBehalfOf = append(
+			[]shoal.ID(nil), holder.OnBehalfOf...)
+	}
+	if input.ClaimHistory == nil {
+		result.ClaimHistory = nil
+	}
+	result.AmbiguityReports = append(
+		[]AmbiguityReport(nil), input.AmbiguityReports...)
 	result.CancelKey = append([]byte(nil), input.CancelKey...)
 	result.ExecutorKey = append([]byte(nil), input.ExecutorKey...)
 	result.Evidence = cloneActionEvidence(input.Evidence)

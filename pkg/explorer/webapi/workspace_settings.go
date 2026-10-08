@@ -691,6 +691,14 @@ func requestMayCommit(method, path string) bool {
 			(strings.HasPrefix(path, "/api/v1/fleet/actions/") &&
 				(strings.HasSuffix(path, "/claim") ||
 					strings.HasSuffix(path, "/complete") ||
+					// A lost-fence report writes to the record before its
+					// response is encoded. It does not transition the action,
+					// but an over-budget response must still not be reported
+					// as a clean failure — on a route whose entire purpose is
+					// recording an ambiguity, telling the caller nothing
+					// happened when the report landed would be the worst
+					// possible answer.
+					strings.HasSuffix(path, "/ambiguity") ||
 					strings.HasSuffix(path, "/cancel"))) ||
 			// A decision commits; pending and status only read.
 			(strings.HasPrefix(path, "/api/v1/fleet/approvals/") &&

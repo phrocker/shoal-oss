@@ -153,9 +153,10 @@ func TestNewFleetHandlerRequiresBothProviders(t *testing.T) {
 }
 
 type stubDispatchProvider struct {
-	resolver auth.Resolver
-	enqueued bool
-	actionID []byte
+	ambiguity fleet.AmbiguityRequest
+	resolver  auth.Resolver
+	enqueued  bool
+	actionID  []byte
 }
 
 func (p *stubDispatchProvider) Enqueue(ctx context.Context, request fleet.EnqueueRequest) (fleet.ActionRecord, error) {
@@ -189,6 +190,13 @@ func (*stubDispatchProvider) Pull(context.Context, fleet.PullActionsRequest) (fl
 	return fleet.ActionPage{}, nil
 }
 func (*stubDispatchProvider) Invoke(context.Context, fleet.InvokeRequest) (fleet.ActionRecord, error) {
+	return fleet.ActionRecord{}, nil
+}
+
+func (p *stubDispatchProvider) ReportAmbiguity(
+	_ context.Context, request fleet.AmbiguityRequest,
+) (fleet.ActionRecord, error) {
+	p.ambiguity = request
 	return fleet.ActionRecord{}, nil
 }
 
@@ -403,5 +411,133 @@ func TestTheTeamOverviewDoesNotReadActionInput(t *testing.T) {
 	walk("teamoverview.Response", reflect.TypeOf(teamoverview.Response{}))
 	if len(visited) < 2 {
 		t.Fatalf("walked %d struct types, so this guard checks nothing", len(visited))
+	}
+}
+
+// TestTheAmbiguityRouteDecodesAReportAndCommits covers the HTTP seam for #438,
+// including the thing that would be silently wrong: whether the route is
+// registered as commit-bearing.
+//
+// It writes to the record before its response is encoded, so an over-budget
+// response must be reported as an indeterminate commit rather than a clean
+// failure. On a route whose entire purpose is recording an ambiguity, telling
+// the caller nothing happened when the report landed would be the worst
+// available answer.
+func TestTheAmbiguityRouteDecodesAReportAndCommits(t *testing.T) {
+	if !requestMayCommit(
+		http.MethodPost, "/api/v1/fleet/actions/abc/ambiguity") {
+		t.Fatal("the ambiguity route is not commit-bearing, so an over-budget " +
+			"response is reported as a plain failure after the report landed")
+	}
+
+	now := time.Date(2026, 9, 6, 12, 0, 0, 0, time.UTC)
+	authority, _ := auth.NewAuthorityWithClock(func() time.Time { return now })
+	decision, err := auth.NewDecision(auth.DecisionConfig{
+		Subject: "subject", Actor: "actor", AuthorizationDomain: []byte("domain"),
+		AllowedOperations:  []auth.Operation{auth.OperationDispatch},
+		PermittedSourceIDs: [][]byte{[]byte("source")},
+		PermittedPolicyIDs: [][]byte{[]byte("policy")}, PolicyGeneration: 1,
+		AuthenticationExpires: now.Add(time.Hour), RequestID: "request",
+		CorrelationID: "correlation",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler, err := NewAuthenticatedHandler(&stubWorkspaceService{},
+		AuthenticatorFunc(func(*http.Request) (auth.Decision, error) {
+			return decision, nil
+		}),
+		authority.Binder(), "example.test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider := &stubDispatchProvider{resolver: authority.Resolver()}
+	if err := handler.MountFleetDispatch(provider); err != nil {
+		t.Fatal(err)
+	}
+
+	actionID := []byte{'a', 0, 255}
+	body, _ := json.Marshal(fleetAmbiguityWire{
+		Context: fleetRequestContextWire{
+			RequestID: encodeFleetID("request"), ReasonCode: "operator_request",
+			CorrelationID: encodeFleetID("correlation"),
+			Deadline:      now.Add(time.Minute),
+		},
+		ExpectedVersion: 7, ClaimFence: 3,
+		Outcome: "outcome_unknown",
+		Target:  "payments.example.test", Reference: "ch_1A2b3C",
+	})
+	request := httptest.NewRequest(http.MethodPost,
+		"http://example.test/api/v1/fleet/actions/"+
+			base64.RawURLEncoding.EncodeToString(actionID)+"/ambiguity",
+		bytes.NewReader(body))
+	request.Host = "example.test"
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+
+	got := provider.ambiguity
+	if !bytes.Equal(got.ID, actionID) {
+		t.Fatalf("action ID = %x, want %x", got.ID, actionID)
+	}
+	if got.ExpectedVersion != 7 || got.ClaimFence != 3 ||
+		got.Outcome != fleet.AmbiguityOutcomeUnknown ||
+		got.Target != "payments.example.test" || got.Reference != "ch_1A2b3C" {
+		t.Fatalf("the route lost part of the report: %+v", got)
+	}
+}
+
+// TestTheActionWireCarriesReportsButNotTheClaimHistory pins what #438 does and
+// does not publish.
+//
+// The reports accompany EffectPossible, because the flag says an effect may
+// have happened and the reports say what was attempted — an operator reading
+// one without the other has the question and not the evidence.
+//
+// The claim history is deliberately absent. It exists so the service can
+// recognise a lapsed claimant; publishing it would hand every execute-holder in
+// the scope a list of which principals have held a record and under which
+// fences, which is an identity disclosure the route has no need to make.
+func TestTheActionWireCarriesReportsButNotTheClaimHistory(t *testing.T) {
+	record := fleet.ActionRecord{
+		ID: []byte("action"), Version: 4, State: fleet.DispatchClaimed,
+		EffectPossible: true,
+		ClaimHistory: []fleet.ClaimHolder{{
+			Subject: "previous-holder", Actor: "previous-actor",
+			ClaimID: []byte("previous-claim"), ClaimFence: 1,
+		}},
+		AmbiguityReports: []fleet.AmbiguityReport{{
+			ClaimFence: 1, Outcome: fleet.AmbiguityOutcomeUnknown,
+			Target: "payments.example.test", Reference: "ch_1A2b3C",
+			Subject: "worker", Actor: "worker-actor",
+		}},
+	}
+
+	wire := encodeFleetAction(record)
+	if len(wire.AmbiguityReports) != 1 {
+		t.Fatalf("the wire drops the reports an operator needs: %+v", wire)
+	}
+	report := wire.AmbiguityReports[0]
+	if report.Reference != "ch_1A2b3C" || report.Outcome != "outcome_unknown" ||
+		report.ClaimFence != 1 {
+		t.Fatalf("the report lost its content on the wire: %+v", report)
+	}
+
+	encoded, err := json.Marshal(wire)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, absent := range []string{
+		"previous-holder", "previous-actor", "previous-claim",
+		"claim_history", "ClaimHistory",
+	} {
+		if strings.Contains(string(encoded), absent) {
+			t.Fatalf("the wire discloses the claim history (%q), which tells "+
+				"every execute-holder in the scope which principals have held "+
+				"this record: %s", absent, encoded)
+		}
 	}
 }

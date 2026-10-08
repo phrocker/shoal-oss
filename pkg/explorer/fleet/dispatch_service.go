@@ -446,6 +446,30 @@ func applyClaim(
 		record.EffectPossible = true
 	}
 	record.ClaimID = append([]byte(nil), claimID...)
+	// The outgoing holder is retained before the incoming one overwrites it.
+	//
+	// Overwriting is correct for who may *complete* — only the current holder
+	// may. It is wrong for who may *report an ambiguity*, because the caller
+	// that route exists for is precisely the one whose claim was taken over:
+	// its lease lapsed mid-effect and another worker now holds the record. The
+	// record would otherwise retain no evidence it ever held anything (#438).
+	//
+	// Oldest first, oldest dropped on overflow. The most recent holders are
+	// the ones whose effects may still be unreconciled, and the cap exists
+	// because encodeAction refuses a record past 3*MaxActionPayloadBytes — an
+	// unbounded history would make a repeatedly re-claimed action unwritable
+	// rather than merely large.
+	if record.ClaimantSubject != "" && record.ClaimFence > 0 {
+		record.ClaimHistory = appendClaimHolder(record.ClaimHistory, ClaimHolder{
+			Subject:    record.ClaimantSubject,
+			Actor:      record.ClaimantActor,
+			ClientID:   record.ClaimantClientID,
+			OnBehalfOf: append([]shoal.ID(nil), record.ClaimantOnBehalfOf...),
+			ClaimID:    append([]byte(nil), record.ClaimID...),
+			ClaimFence: record.ClaimFence,
+			HeldAt:     now,
+		})
+	}
 	// Who holds the claim, as distinct from which claim is held. A re-claim
 	// after a lapsed lease overwrites these, which is correct: the new
 	// claimant is the one that may report, and the previous one has already
@@ -1166,6 +1190,172 @@ func (s *DispatchService) Cancel(ctx context.Context, request CancelRequest) (Ac
 		return ActionRecord{}, errors.Join(ErrActionCommitted, err)
 	}
 	return cloneActionRecord(stored), nil
+}
+
+// ReportAmbiguity records what a worker attempted when it can no longer report
+// the outcome, which is the one case this dispatch surface could not express
+// (#438).
+//
+// A worker whose lease lapses or whose renewal is refused mid-effect cannot use
+// CompleteClaim: that route is gated on the fence it has just lost. The effect
+// may have happened, and EffectPossible already says so durably — what was
+// missing is *what* was attempted, against which target, and with what handle
+// if the target returned one. That handle is the whole value here: it is the
+// thing an operator takes to the other system, and it is what EffectPossible
+// alone cannot give them.
+//
+// Three properties make this safe to expose to a caller that has lost its
+// claim.
+//
+// It does not transition the action. The state, the claim and EffectPossible
+// are all unchanged — a worker that has lost the fence has no standing to
+// assert an outcome, only to say what it tried. The version advances because
+// this writes to the record and must serialise against concurrent writers; the
+// *fence* deliberately does not, so a report cannot invalidate a live
+// claimant's right to complete.
+//
+// It publishes no event. TransitionKind is empty, so the store writes the
+// record without enqueuing an outbox row. That is not merely economy: the five
+// lifecycle kinds are closed and the public events route refuses them, and a
+// row that only a lapsed claimant could publish is exactly the mixed-identity
+// outbox that can be left undrainable by any principal (#480).
+//
+// And it is attributed rather than self-asserted. The reporting principal is
+// recorded from its decision, never from the request, and a report is accepted
+// only from a principal the record has actually seen hold the claim at the
+// fence it names.
+func (s *DispatchService) ReportAmbiguity(
+	ctx context.Context, request AmbiguityRequest,
+) (ActionRecord, error) {
+	ctx, cancel := s.deadline(ctx, request.Context)
+	defer cancel()
+	decision, now, err := s.beginClaimant(ctx, request.Context)
+	if err != nil {
+		return ActionRecord{}, err
+	}
+	if err := request.Outcome.validate(); err != nil {
+		return ActionRecord{}, err
+	}
+	if request.ClaimFence == 0 {
+		return ActionRecord{}, shoal.NewError(
+			shoal.ErrorInvalidArgument, "ambiguity report fence is required")
+	}
+	// Bounds and shape are enforced here, at the boundary, rather than being
+	// left to ActionRecord.Validate. Record validation runs where a record is
+	// encoded, which is not every store, so relying on it let an over-long or
+	// control-character-bearing target through in testing — the values are
+	// target-controlled and this is the route they enter on, so this is where
+	// they have to be refused.
+	if err := validateAmbiguityText(
+		"ambiguity target", request.Target); err != nil {
+		return ActionRecord{}, err
+	}
+	if err := validateAmbiguityText(
+		"ambiguity reference", request.Reference); err != nil {
+		return ActionRecord{}, err
+	}
+	if len(request.Target) > MaxAmbiguityTargetBytes {
+		return ActionRecord{}, shoal.NewError(
+			shoal.ErrorInvalidArgument, "ambiguity target exceeds its bound")
+	}
+	if len(request.Reference) > MaxAmbiguityReferenceBytes {
+		return ActionRecord{}, shoal.NewError(
+			shoal.ErrorInvalidArgument, "ambiguity reference exceeds its bound")
+	}
+	current, _, _, err := s.authorizedClaimant(ctx, decision, request.ID, now)
+	if err != nil {
+		return ActionRecord{}, err
+	}
+	// An admission is not dispatch work and its grant is reported through
+	// AdmissionService.Report, which has its own terminal semantics. Refused
+	// as not-found for the same reason every other route refuses it.
+	if refuseAmbiguityAdmission(current) {
+		return ActionRecord{}, auth.ObjectNotFound()
+	}
+	// Held the claim at the fence it names — currently, or according to the
+	// retained history. Concealed rather than refused, because this route is
+	// reachable by every principal authorized to execute the descriptor and a
+	// distinguishable error would tell one of them that an action exists and
+	// which fences it has been through.
+	if !heldClaimAt(decision, current, request.ClaimFence) {
+		return ActionRecord{}, auth.ObjectNotFound()
+	}
+	if current.Version != request.ExpectedVersion {
+		return ActionRecord{}, ErrActionConflict
+	}
+	if len(current.AmbiguityReports) >= MaxActionAmbiguityReports {
+		return ActionRecord{}, shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			"action ambiguity reports exceed their bound")
+	}
+	next := cloneActionRecord(current)
+	next.Version++
+	next.UpdatedAt = now
+	next.TransitionRequestID = decision.RequestID()
+	next.TransitionCorrelationID = decision.CorrelationID()
+	// Appended, never replacing an existing report at the same fence. Two
+	// reports from one attempt mean the worker retried, and an operator wants
+	// both rather than the later one silently overwriting the earlier.
+	next.AmbiguityReports = append(next.AmbiguityReports, AmbiguityReport{
+		ClaimFence: request.ClaimFence,
+		Outcome:    request.Outcome,
+		Target:     request.Target,
+		Reference:  request.Reference,
+		Subject:    decision.Subject(),
+		Actor:      decision.Actor(),
+		ReportedAt: now,
+	})
+	if err := s.recorder.RecordAction(ctx, ActionAudit{
+		Phase: "ambiguity_report", Operation: current.TransitionOperation,
+		Record: next,
+	}); err != nil {
+		return ActionRecord{}, errors.Join(ErrRecordingUnavailable, err)
+	}
+	stored, err := s.store.ApplyAction(ctx, DispatchMutation{
+		Token: transitionToken(
+			"ambiguity", request.ID,
+			ambiguityMutationKey(request, decision), next.Version),
+		ExpectedVersion: current.Version,
+		// The fence is asserted unchanged rather than advanced. A report must
+		// not disturb whoever currently holds the claim.
+		ExpectedFence: current.ClaimFence,
+		Record:        next,
+	})
+	if err != nil {
+		return ActionRecord{}, err
+	}
+	return cloneActionRecord(stored), nil
+}
+
+// refuseAmbiguityAdmission keeps the admission namespace out of this route.
+func refuseAmbiguityAdmission(record ActionRecord) bool {
+	return record.isAdmission()
+}
+
+// ambiguityMutationKey makes the store token stable for one reporter's one
+// report of one attempt, so a retried request after a lost response is
+// recognised as the same write rather than appending a second report.
+//
+// Every component is length-prefixed through writeDispatchTupleField rather
+// than joined with a delimiter. A first version of this concatenated the
+// fields with NUL bytes, which is precisely the encoding executorKey's own
+// comment records as having been replaced for being non-injective: two
+// different tuples can produce one key, and here that would make two genuinely
+// different reports collide into one store token so the second would be
+// silently dropped as a replay of the first.
+func ambiguityMutationKey(
+	request AmbiguityRequest, decision auth.Decision,
+) []byte {
+	digest := sha256.New()
+	writeDispatchTupleField(digest, []byte("shoal.fleet.ambiguity-report.v1"))
+	writeDispatchTupleField(digest, request.ID)
+	writeDispatchTupleField(digest, []byte(decision.Subject()))
+	writeDispatchTupleField(digest, []byte(decision.Actor()))
+	writeDispatchTupleField(digest, []byte(decision.ClientID()))
+	writeDispatchTupleField(
+		digest, binary.BigEndian.AppendUint64(nil, request.ClaimFence))
+	writeDispatchTupleField(digest, []byte(request.Outcome))
+	return digest.Sum(nil)
 }
 
 func (s *DispatchService) Status(ctx context.Context, request StatusRequest) (ActionRecord, error) {
@@ -1903,6 +2093,71 @@ func standingOn(decision auth.Decision, record ActionRecord) bool {
 // decision carries it. That is the right default for a gob-decoded record from
 // an older build: it refuses the completion rather than accepting it, and the
 // worker's recourse is to re-claim, which writes the field.
+// appendClaimHolder adds a holder, dropping the oldest entry past the bound.
+//
+// A holder already present at the same fence is not duplicated: Claim's replay
+// branch returns before applyClaim, so this should not arise, but a retained
+// history is evidence an operator reads and a duplicate in it reads as two
+// attempts where there was one.
+func appendClaimHolder(
+	history []ClaimHolder, holder ClaimHolder,
+) []ClaimHolder {
+	for _, existing := range history {
+		if existing.ClaimFence == holder.ClaimFence &&
+			existing.Subject == holder.Subject {
+			return history
+		}
+	}
+	history = append(history, holder)
+	if len(history) > MaxActionClaimHistory {
+		history = history[len(history)-MaxActionClaimHistory:]
+	}
+	return history
+}
+
+// heldClaimAt reports whether this caller held the record's claim at the fence
+// it names.
+//
+// The current holder is included, because a worker can lose the right to
+// complete without the record being re-claimed — its lease lapses and nothing
+// has taken it yet, which is the common case for a short operation that
+// overran. Both are "held it then, cannot complete now".
+func heldClaimAt(
+	decision auth.Decision, record ActionRecord, fence uint64,
+) bool {
+	if fence == 0 {
+		return false
+	}
+	if record.ClaimFence == fence && sameClaimantPrincipal(decision, record) {
+		return true
+	}
+	for _, holder := range record.ClaimHistory {
+		if holder.ClaimFence != fence {
+			continue
+		}
+		if decision.Subject() != holder.Subject ||
+			decision.Actor() != holder.Actor ||
+			decision.ClientID() != holder.ClientID {
+			continue
+		}
+		left, right := decision.OnBehalfOf(), holder.OnBehalfOf
+		if len(left) != len(right) {
+			continue
+		}
+		matched := true
+		for i := range left {
+			if left[i] != right[i] {
+				matched = false
+				break
+			}
+		}
+		if matched {
+			return true
+		}
+	}
+	return false
+}
+
 func sameClaimantPrincipal(decision auth.Decision, record ActionRecord) bool {
 	if record.ClaimantSubject == "" {
 		return false
