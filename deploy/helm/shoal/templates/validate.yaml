@@ -133,8 +133,8 @@
 {{- if contains "," $text -}}
 {{- fail (printf "explorer.fleet.%s contains %q, which holds a comma: references are comma-joined into one container argument, so this single entry becomes two bindings and the collision guards below compare the unsplit string. Give each reference its own list entry" $setting $text) -}}
 {{- end -}}
-{{- if regexMatch "[[:cntrl:]]" $text -}}
-{{- fail (printf "explorer.fleet.%s contains %q, which holds a control character: the reference reaches the container inside one quoted argument, so it matches no registered executor and binds nothing while the pod starts and serves normally. Before those arguments were quoted, a newline here made the remainder of the entry an arbitrary argument of the explorer container" $setting $text) -}}
+{{- if regexMatch `[\p{Cc}\p{Zl}\p{Zp}]` $text -}}
+{{- fail (printf "explorer.fleet.%s contains %q, which holds a control or line-separator character: the reference reaches the container inside one quoted argument, so it matches no registered executor and binds nothing while the pod starts and serves normally. Before those arguments were quoted, a line break here made the remainder of the entry an arbitrary argument of the explorer container" $setting $text) -}}
 {{- end -}}
 {{- end -}}
 {{- end -}}
