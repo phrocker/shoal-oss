@@ -33,8 +33,8 @@ func (c *Client) ReadRegistration(ctx context.Context, requestID shoal.ID) (Regi
 	if c == nil {
 		return RegistrationReceipt{}, fmt.Errorf("nil decision client")
 	}
-	if _, err := DecodeID(EncodeID(requestID)); err != nil {
-		return RegistrationReceipt{}, err
+	if !strings.HasPrefix(string(requestID), "decision-registration:") || !outcomeDigest(strings.TrimPrefix(string(requestID), "decision-registration:")) {
+		return RegistrationReceipt{}, invalidRegistrationProtocol()
 	}
 	return c.callRegistration(ctx, http.MethodGet, EncodeID(requestID), nil, nil, nil)
 }
