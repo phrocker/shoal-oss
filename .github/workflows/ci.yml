@@ -140,6 +140,28 @@ jobs:
       - name: Test (race)
         run: go test -race -count=1 ${{ steps.pkgs.outputs.list }}
 
+      # Protocol adapters (SSH, RDP, Guacamole) live in extensions/ with their
+      # own go.mod. Fail if any of them is linked into a core package.
+      - name: Core links no SSH, RDP or Guacamole package
+        run: |
+          leaked=$(go list -deps ${{ steps.pkgs.outputs.list }} \
+            | grep -iE 'golang\.org/x/crypto/ssh|guacamole|freerdp|grdp' || true)
+          if [ -n "$leaked" ]; then
+            echo "Core packages depend on protocol adapter code:"
+            echo "$leaked"
+            exit 1
+          fi
+
+      # Extension modules are outside the root package set. Build each on its
+      # own go.mod (GOWORK stays off) so it cannot lean on the workspace.
+      - name: Extensions (vet / test)
+        run: |
+          for mod in extensions/*/go.mod; do
+            dir=$(dirname "$mod")
+            echo "== $dir"
+            (cd "$dir" && go vet ./... && go test -race -count=1 ./...)
+          done
+
   docker:
     name: docker image
     runs-on: ubuntu-latest
