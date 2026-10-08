@@ -151,12 +151,17 @@ case-insensitively, with Unicode folding (`ſ` folds to `s`), so without this
   commonest same-key conflict on a byte-identical retry means "the original is
   still in flight" (409 `idempotency_key_in_use` and its relatives), and it
   arrives exactly on the written → timeout → retry path. Reading it as success
-  records an effect that may yet fail. **In-progress codes must be configured
-  `retryable`, never `conflict`;** only a body value that means "this exact
-  request already succeeded" belongs in `equals`. For a natural DELETE, a
-  conflict on 404 needs the target's not-found marker in the body; a target
-  whose 404 carries none cannot have a replayed delete recognised, and it is
-  recorded as `target_rejected_404`.
+  records an effect that may yet fail. **In-progress codes must be
+  `retryable`, never in `equals`;** only a body value that means "this exact
+  request already succeeded" belongs there. A status may be both a conflict
+  status and retryable, which is how a provider that answers 409 for both
+  "already done" and "still in flight" is configured: the marker is success,
+  anything else under that status retries under the same key until the
+  provider replays the original outcome. A conflict status whose body lacks
+  the marker and that is *not* listed retryable is recorded `outcome_unknown`,
+  never `target_rejected`. For a natural DELETE, a conflict on 404 needs the
+  target's not-found marker in the body; a 404 without it is
+  `outcome_unknown`.
 - **Reference** is a target-side identifier copied into the record. Exactly
   one of `pointer` or `header`; the pattern is anchored by the gateway and must
   not match the empty string; a value over 256 bytes is dropped.
@@ -202,8 +207,9 @@ enqueue: a looser one lets work be queued and claimed — setting
 | not written (DNS, dial, TLS, egress refused) | retry | retry |
 | 2xx | success | success |
 | 2xx with `Idempotent-Replayed: true` | success, `replayed` (key only) | success |
-| configured conflict: status and body value both match | success, `conflict` | refused at config |
-| conflict status, body unreadable or oversize | `failed/outcome_unknown` | refused at config |
+| conflict status, body marker matches | success, `conflict` | refused at config |
+| conflict status, no marker (or body unreadable), status listed retryable | retry, same bytes | refused at config |
+| conflict status, no marker (or body unreadable), not retryable | `failed/outcome_unknown` | refused at config |
 | configured retryable status | retry, same bytes, honouring `Retry-After` seconds | `failed/outcome_unknown` |
 | written, then error, timeout or reset | retry, same bytes | `failed/outcome_unknown` |
 | 3xx (never followed) | `failed/outcome_unknown` | `failed/outcome_unknown` |
@@ -273,13 +279,18 @@ client resends the identical body once; the completion route's replay branch
 answers it with the committed record. If the resend's answer is lost too, the
 client returns `indeterminate` — never the first attempt's status, which
 describes a request whose outcome the resend was sent to learn. A definite
-answer to the resend (409, 404, …) is returned as it is.
+answer to the resend (409, 404, …) is returned as it is. A #492-shaped 400 or
+500 after a lost first attempt is *not* definite — the first attempt may have
+committed and that answer hides the record — so the record is read once more
+through the replay branch, and an unanswered read is `indeterminate`. A 400 or
+500 with no loss before it is answered by one resend whose result stands.
 
 **Recorded otherwise (permanent).** The committed record is compared with the
 report — state, error code, and for a success the output as a JSON value. Any
 difference returns the record with a `recorded_otherwise` error: the record is
-final and must not be reported again. The version is only required to have
-moved past the one reported against; it is not compared for equality.
+final and must not be reported again. The record's version must be exactly
+the reported version plus one: the route answers 200 only for a fresh terminal
+write or a replay of one, and a terminal record does not move past that.
 
 **#492 workaround (temporary).** Two behaviours of the completion route on
 main, pinned as *current* behaviour by the real-handler tests:
@@ -331,7 +342,9 @@ another fails if a field is added to the log record outside the policy.
   design states only the renewing form (`≥ renewAfter`).
 - **Conflict rules need a body value.** The design allows "status + optional
   JSON pointer value"; a status-only rule is refused, because the commonest
-  same-key conflict on a retry means "still in flight".
+  same-key conflict on a retry means "still in flight". A conflict status
+  without the marker retries if listed retryable and is otherwise
+  `outcome_unknown`, not `target_rejected_NNN`.
 - **Field names must be spelled exactly**, in the route table and the action's
   input, and the startup check also compares `input_schema`.
 - **A DELETE route takes no body**, matching its `InputSchema()`.

@@ -540,6 +540,11 @@ type Completion struct {
 // request whose outcome the resend was sent to learn, and reporting it would
 // turn "possibly committed" into a definite refusal.
 //
+// A 400 or 500 that follows a lost first attempt is not definite either: the
+// first attempt may have committed and this answer may hide the record, so it
+// is read once more, and an unanswered read is DispatchIndeterminate. A 400 or
+// 500 with no loss before it is answered by one resend whose result stands.
+//
 // The 400 and 500 triggers are a workaround for #492, to be removed when it
 // lands. On main, CompleteClaim returns the committed record together with an
 // error for a reported failure ("remote executor reported failure") and for a
@@ -592,14 +597,28 @@ func (c *DispatchClient) Complete(ctx context.Context, actionID []byte, completi
 	}
 	path := actionPath(actionID, "complete")
 	var response actionWire
+	unconfirmed := func(cause error) error {
+		return &DispatchError{Op: op, Kind: DispatchIndeterminate,
+			reason: "the report may have committed and the resend could not confirm it",
+			cause:  cause}
+	}
 	_, _, err = c.post(ctx, op, path, body, &response)
-	if completionNeedsResend(err) {
+	firstLost := responseLost(err)
+	if firstLost || hidesCommittedRecord(err) {
 		response = actionWire{}
 		_, _, err = c.post(ctx, op, path, body, &response)
-		if responseLost(err) {
-			return Action{}, &DispatchError{Op: op, Kind: DispatchIndeterminate,
-				reason: "the report may have committed and the resend could not confirm it",
-				cause:  err}
+		switch {
+		case responseLost(err):
+			return Action{}, unconfirmed(err)
+		case firstLost && hidesCommittedRecord(err):
+			// The first attempt may or may not have committed, and this
+			// answer is the #492 shape that hides a committed record. It is
+			// definite only when nothing came before it; after a loss, read
+			// the record once more through the replay branch.
+			response = actionWire{}
+			if _, _, err = c.post(ctx, op, path, body, &response); err != nil {
+				return Action{}, unconfirmed(err)
+			}
 		}
 	}
 	if err != nil {
@@ -609,12 +628,11 @@ func (c *DispatchClient) Complete(ctx context.Context, actionID []byte, completi
 	if err != nil {
 		return Action{}, &DispatchError{Op: op, Kind: DispatchProtocol, reason: err.Error()}
 	}
-	// The version is not compared for equality with ExpectedVersion+1: what
-	// authorizes a completion is holding the claim, and a record may carry
-	// versions written by reports the claim holder made (#484). It must only
-	// have moved past the version reported against.
+	// The completion route answers 200 only for a fresh terminal write or a
+	// replay of one, both at exactly ExpectedVersion+1, and a terminal record
+	// does not move past that. Any other version is not this report's record.
 	if !bytes.Equal(action.ID, actionID) || !bytes.Equal(action.ClaimID, completion.ClaimID) ||
-		action.Version <= completion.ExpectedVersion ||
+		action.Version != completion.ExpectedVersion+1 ||
 		(action.State != fleet.DispatchSucceeded && action.State != fleet.DispatchFailed) {
 		return Action{}, &DispatchError{Op: op, Kind: DispatchProtocol,
 			reason: "completion response does not describe this claim's terminal record"}
@@ -625,17 +643,11 @@ func (c *DispatchClient) Complete(ctx context.Context, actionID []byte, completi
 	return action, nil
 }
 
-// completionNeedsResend says whether a first completion attempt's answer
-// leaves the outcome unknown.
-func completionNeedsResend(err error) bool {
-	if err == nil {
-		return false
-	}
-	if responseLost(err) {
-		return true
-	}
-	// Workaround for #492; remove when the /complete handler returns the
-	// committed record it is given alongside an error.
+// hidesCommittedRecord is the #492 shape: a 400 or 500 from /complete may be
+// a terminal record that was written and then discarded by the handler.
+// Workaround for #492; remove when the handler returns the committed record
+// it is given alongside an error.
+func hidesCommittedRecord(err error) bool {
 	var dispatchErr *DispatchError
 	return errors.As(err, &dispatchErr) &&
 		(dispatchErr.Status == http.StatusInternalServerError ||

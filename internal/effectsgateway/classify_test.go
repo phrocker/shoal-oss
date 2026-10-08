@@ -40,7 +40,7 @@ const classifyTable = `[
  {"action":"lock","method":"POST","path":"/v1/locks",
   "effects":["external","egresses-content"],"idempotency":"key",
   "conflict":{"status":[409],"pointer":"/error/code","equals":["already_locked"]},
-  "retryable":[423],
+  "retryable":[409,423],
   "reference":{"header":"location","pattern":"/v1/locks/[0-9]+"}},
  {"action":"remove","method":"DELETE","path":"/v1/items/{id}",
   "effects":["external","egresses-content"],"idempotency":"natural",
@@ -148,30 +148,36 @@ func TestClassifyTable(t *testing.T) {
 			want{outcome: OutcomeSucceeded, kind: KindConflict, idempotency: "conflict"}},
 		{"key: conflict on a second rule", "lock", respond(409, `{"error":{"code":"already_locked"}}`),
 			want{outcome: OutcomeSucceeded, kind: KindConflict, idempotency: "conflict"}},
-		// FALSE SUCCESS if a same-key 409 without the marker counted: the
-		// commonest one means the original is still in flight.
-		{"key: same status, in-flight marker", "lock",
-			respond(409, `{"error":{"code":"idempotency_key_in_use"}}`),
-			want{outcome: OutcomeFailed, kind: KindRejected, code: "target_rejected_409"}},
-		{"key: same status, no body", "lock", respond(409, ``),
-			want{outcome: OutcomeFailed, kind: KindRejected, code: "target_rejected_409"}},
+		// One status for "already done" and "still in flight". FALSE SUCCESS
+		// if the in-flight answer counted as the conflict; FALSE FAILURE if it
+		// were target_rejected while the original may still succeed. Listed
+		// retryable too, it retries under the same key.
+		{"key: same status, in-flight marker, retryable", "lock",
+			respond(409, `{"error":{"code":"idempotency_key_in_use"}}`, "Retry-After", "2"),
+			want{outcome: OutcomeRetry, kind: KindRetryableStatus, retryAfter: 2 * time.Second}},
+		{"key: same status, no body, retryable", "lock", respond(409, ``),
+			want{outcome: OutcomeRetry, kind: KindRetryableStatus}},
+		{"key: same status, body oversize, retryable", "lock", oversize(409, `{"error":`),
+			want{outcome: OutcomeRetry, kind: KindRetryableStatus}},
+		{"key: retryable status outside the conflict rule", "lock", respond(423, ``),
+			want{outcome: OutcomeRetry, kind: KindRetryableStatus}},
 		{"natural: DELETE of what is already gone", "remove", respond(404, `{"error":"not_found"}`),
 			want{outcome: OutcomeSucceeded, kind: KindConflict, idempotency: "conflict"}},
+		// Not listed retryable: unknown, never target_rejected.
 		{"natural: 404 without the marker", "remove", respond(404, ``),
-			want{outcome: OutcomeFailed, kind: KindRejected, code: "target_rejected_404"}},
+			want{outcome: OutcomeFailed, kind: KindConflictUnmatched, code: ErrorOutcomeUnknown}},
+		// A conflict status without the marker, not listed retryable: the
+		// outcome is unknown, never a definite rejection.
 		{"key: conflict status, other error type", "charge",
-			respond(400, `{"error":{"type":"invalid_request_error"}}`),
-			want{outcome: OutcomeFailed, kind: KindRejected, code: "target_rejected_400"}},
-		{"key: conflict status, pointer absent", "charge", respond(400, `{"error":{}}`),
-			want{outcome: OutcomeFailed, kind: KindRejected, code: "target_rejected_400"}},
+			respond(400, `{"error":{"type":"invalid_request_error"}}`), want{outcome: OutcomeFailed, kind: KindConflictUnmatched, code: ErrorOutcomeUnknown}},
+		{"key: conflict status, pointer absent", "charge", respond(400, `{"error":{}}`), want{outcome: OutcomeFailed, kind: KindConflictUnmatched, code: ErrorOutcomeUnknown}},
 		{"key: conflict status, pointer not a string", "charge",
-			respond(400, `{"error":{"type":["idempotency_error"]}}`),
-			want{outcome: OutcomeFailed, kind: KindRejected, code: "target_rejected_400"}},
-		{"key: conflict status, body not JSON", "charge", respond(400, `<html>`),
-			want{outcome: OutcomeFailed, kind: KindRejected, code: "target_rejected_400"}},
+			respond(400, `{"error":{"type":["idempotency_error"]}}`), want{outcome: OutcomeFailed, kind: KindConflictUnmatched, code: ErrorOutcomeUnknown}},
+		{"key: conflict status, body not JSON", "charge", respond(400, `<html>`), want{outcome: OutcomeFailed, kind: KindConflictUnmatched, code: ErrorOutcomeUnknown}},
 		{"key: conflict status, body has trailing data", "charge",
-			respond(400, `{"error":{"type":"idempotency_error"}} {}`),
-			want{outcome: OutcomeFailed, kind: KindRejected, code: "target_rejected_400"}},
+			respond(400, `{"error":{"type":"idempotency_error"}} {}`), want{outcome: OutcomeFailed, kind: KindConflictUnmatched, code: ErrorOutcomeUnknown}},
+		{"key: status outside the conflict rule is still rejected", "charge", respond(402, `{}`),
+			want{outcome: OutcomeFailed, kind: KindRejected, code: "target_rejected_402"}},
 		// Unverifiable: neither guess is safe, so unknown.
 		{"key: conflict status, body oversize", "charge",
 			oversize(400, `{"error":{"type":"idempotency_error"`),

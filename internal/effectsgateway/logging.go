@@ -259,7 +259,7 @@ func closed(value string, valid bool) string {
 
 var validKinds = map[Kind]bool{
 	KindNotSent: true, KindSuccess: true, KindReplayed: true, KindConflict: true,
-	KindConflictUnverified: true, KindRetryableStatus: true,
+	KindConflictUnverified: true, KindConflictUnmatched: true, KindRetryableStatus: true,
 	KindWrittenNoResponse: true, KindRedirect: true, KindRejected: true,
 	KindInvalid: true,
 }

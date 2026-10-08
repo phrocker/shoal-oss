@@ -108,6 +108,7 @@ const (
 	KindReplayed           Kind = "replayed"
 	KindConflict           Kind = "conflict"
 	KindConflictUnverified Kind = "conflict_unverified"
+	KindConflictUnmatched  Kind = "conflict_unmatched"
 	KindRetryableStatus    Kind = "retryable_status"
 	KindWrittenNoResponse  Kind = "written_no_response"
 	KindRedirect           Kind = "redirect"
@@ -174,8 +175,9 @@ type output struct {
 //	observed                                   key / natural          unprotected
 //	not written (DNS, dial, TLS)               retry                  retry
 //	2xx                                        success                success
-//	configured conflict match                  success ("conflict")   (refused at config)
-//	conflict status, pointer unverifiable      failed/outcome_unknown (refused at config)
+//	conflict status, body marker matches       success ("conflict")   (refused at config)
+//	conflict status, no marker, retryable      retry                  (refused at config)
+//	conflict status, no marker, not retryable  failed/outcome_unknown (refused at config)
 //	configured retryable status                retry                  failed/outcome_unknown
 //	written, then error/timeout/reset          retry                  failed/outcome_unknown
 //	3xx (redirects are never followed)         failed/outcome_unknown failed/outcome_unknown
@@ -228,21 +230,30 @@ func Classify(route *Route, observation Observation) Classification {
 
 	case route.conflict != nil && route.conflict.matchesStatus(status):
 		matched, verifiable := route.conflict.matchesBody(response)
-		switch {
-		case matched:
+		if matched {
 			return succeeded(route, response, "conflict", KindConflict)
-		case !verifiable:
-			// The status says conflict and the body that would confirm it
-			// could not be read. Success and target_rejected would each be
-			// a guess, in opposite directions; unknown is the record that
-			// does not lie.
-			return Classification{
-				Outcome: OutcomeFailed, Kind: KindConflictUnverified,
-				Status: status, ErrorCode: ErrorOutcomeUnknown,
-			}
 		}
-		// The body was read and does not match: an ordinary rejection with a
-		// status that happens to be shared. Fall through to the rows below.
+		// The status is one the target uses for a key conflict and the body
+		// does not say "already done". On a same-key retry the likeliest
+		// meaning is "the original is still in flight", whose outcome is not
+		// yet known. Where the operator lists the status as retryable, the
+		// same key is sent again until the target replays the original
+		// outcome or the done marker; otherwise the record says unknown.
+		// target_rejected would be a false failure for an original that may
+		// still succeed. Conflict rules exist only on key and natural routes.
+		if _, retryable := route.retryable[status]; retryable {
+			result := Classification{Outcome: OutcomeRetry, Kind: KindRetryableStatus, Status: status}
+			result.RetryAfter, result.HasRetryAfter = retryAfter(response.Header)
+			return result
+		}
+		kind := KindConflictUnverified
+		if verifiable {
+			kind = KindConflictUnmatched
+		}
+		return Classification{
+			Outcome: OutcomeFailed, Kind: kind,
+			Status: status, ErrorCode: ErrorOutcomeUnknown,
+		}
 	}
 
 	if _, retryable := route.retryable[status]; retryable {

@@ -140,7 +140,6 @@ func TestParseRoutesRefusals(t *testing.T) {
 		{"conflict on unprotected", `[` + route(map[string]any{"idempotency": "unprotected", "conflict": map[string]any{"status": []int{409}}}) + `]`, "nothing a conflict"},
 		{"conflict without status", `[` + route(map[string]any{"conflict": map[string]any{}}) + `]`, "at least one status"},
 		{"conflict 2xx", `[` + route(map[string]any{"conflict": map[string]any{"status": []int{200}}}) + `]`, "400-599"},
-		{"conflict also retryable", `[` + route(map[string]any{"retryable": []int{409}, "conflict": map[string]any{"status": []int{409}}}) + `]`, "both a conflict and retryable"},
 		{"conflict status duplicated", `[` + route(map[string]any{"conflict": map[string]any{"status": []int{409, 409}}}) + `]`, "declared twice"},
 		{"conflict equals without pointer", `[` + route(map[string]any{"conflict": map[string]any{"status": []int{400}, "equals": []string{"x"}}}) + `]`, "pointer and equals are required"},
 		{"conflict pointer without equals", `[` + route(map[string]any{"conflict": map[string]any{"status": []int{400}, "pointer": "/error/type"}}) + `]`, "at least one value"},
@@ -433,6 +432,48 @@ func TestBindRefusesABodyOnDelete(t *testing.T) {
 	var inputErr *InputError
 	if !errors.As(err, &inputErr) {
 		t.Fatalf("a DELETE body = %v; InputSchema admits none, so the binder must not send one", err)
+	}
+}
+
+// TestConflictStatusMayAlsoBeRetryable: one status for "already done" and
+// "still in flight" is configured by listing it in both.
+func TestConflictStatusMayAlsoBeRetryable(t *testing.T) {
+	table := mustParseRoutes(t, `[`+route(map[string]any{
+		"retryable": []int{409},
+		"conflict":  map[string]any{"status": []int{409}, "pointer": "/error/code", "equals": []string{"already_done"}},
+	})+`]`)
+	if _, ok := table.Lookup("charge"); !ok {
+		t.Fatal("route missing")
+	}
+}
+
+// TestBindRefusalMessagesAreFixed fails if parser text — which can quote the
+// input — is reintroduced into the duplicate-key or decode refusals.
+func TestBindRefusalMessagesAreFixed(t *testing.T) {
+	table := mustParseRoutes(t, bindTable)
+	binder := mustBinder(t, "https://api.example.com")
+	charge := mustRoute(t, table, "charge")
+	for _, row := range []struct {
+		name, input, want string
+	}{
+		{"duplicate key", `{"path":{"account":"s3cret","account":"s3cret2"}}`,
+			"input is invalid: input must be one JSON object with no repeated key"},
+		{"truncated", `{"path":{"account":"s3cret`,
+			"input is invalid: input must be one JSON object with no repeated key"},
+		{"non-string path value", `{"path":{"account":12345}}`,
+			"input is invalid: input must be an object with only path, query and body, " +
+				"and path and query values must be strings"},
+		{"non-object path", `{"path":"s3cret"}`,
+			"input is invalid: input must be an object with only path, query and body, " +
+				"and path and query values must be strings"},
+		{"unknown key", `{"s3cret":1}`,
+			"input is invalid: input must be an object whose only fields are path, " +
+				"query and body, spelled exactly"},
+	} {
+		_, err := binder.Bind(charge, json.RawMessage(row.input), testKey(t))
+		if err == nil || err.Error() != row.want {
+			t.Errorf("%s: %v\nwant %q", row.name, err, row.want)
+		}
 	}
 }
 

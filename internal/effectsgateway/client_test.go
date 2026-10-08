@@ -308,6 +308,18 @@ func TestCompleteRecoversOnlyWhatTheResendConfirms(t *testing.T) {
 		{"indeterminate twice", success,
 			[]func() (*http.Response, error){reply(503, `{}`, indeterminate...), reply(503, `{}`, indeterminate...)},
 			DispatchIndeterminate, 2},
+		// A #492 400/500 after a lost first attempt is not definite: the
+		// record is read once more through the replay branch.
+		{"lost then 500 then the recorded failure", failure,
+			[]func() (*http.Response, error){lost, reply(500, `{}`), reply(200, failedRecord)}, "", 3},
+		{"lost then 400 then lost", success,
+			[]func() (*http.Response, error){lost, reply(400, `{}`), lost}, DispatchIndeterminate, 3},
+		{"lost then 500 then 500", failure,
+			[]func() (*http.Response, error){lost, reply(500, `{}`), reply(500, `{}`)}, DispatchIndeterminate, 3},
+		{"indeterminate then 400 then the record", success,
+			[]func() (*http.Response, error){reply(503, `{}`, indeterminate...), reply(400, `{}`),
+				reply(200, committed(t, 3, fleet.DispatchFailed, "invalid_executor_output", ""))},
+			DispatchRecordedOtherwise, 3},
 		// The resend's own definite answer describes the record now.
 		{"lost then conflict", success,
 			[]func() (*http.Response, error){lost, reply(409, `{"code":"conflict"}`)}, DispatchConflict, 2},
@@ -326,9 +338,11 @@ func TestCompleteRecoversOnlyWhatTheResendConfirms(t *testing.T) {
 		{"success recorded as failed", success,
 			[]func() (*http.Response, error){reply(400, `{}`), reply(200, committed(t, 3, fleet.DispatchFailed, "invalid_executor_output", ""))},
 			DispatchRecordedOtherwise, 2},
-		// Versions written by the claim holder's own reports are tolerated.
-		{"version drift past the report", failure,
-			[]func() (*http.Response, error){reply(200, committed(t, 5, fleet.DispatchFailed, "target_rejected_422", ""))}, "", 1},
+		// 200 comes only at exactly ExpectedVersion+1; anything else is not
+		// this report's record.
+		{"version past the report", failure,
+			[]func() (*http.Response, error){reply(200, committed(t, 5, fleet.DispatchFailed, "target_rejected_422", ""))},
+			DispatchProtocol, 1},
 		{"version not past the report", failure,
 			[]func() (*http.Response, error){reply(200, committed(t, 2, fleet.DispatchFailed, "target_rejected_422", ""))},
 			DispatchProtocol, 1},

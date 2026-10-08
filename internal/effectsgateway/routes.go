@@ -366,7 +366,7 @@ func (w routeWire) validate(derived fleet.Effects) (*Route, error) {
 				"natural; an unprotected route has nothing a conflict could " +
 				"be evidence of")
 		}
-		rule, err := w.Conflict.validate(route.retryable)
+		rule, err := w.Conflict.validate()
 		if err != nil {
 			return nil, fmt.Errorf("conflict: %w", err)
 		}
@@ -383,7 +383,13 @@ func (w routeWire) validate(derived fleet.Effects) (*Route, error) {
 	return route, nil
 }
 
-func (w *conflictWire) validate(retryable map[int]struct{}) (*conflictRule, error) {
+// A conflict status may also be retryable. The rule's body value is what
+// says "already done"; a provider that answers one status for both that and
+// "the original is still in flight" (409 with a done marker, and 409
+// idempotency_key_in_use) is configured by listing the status in both, so
+// the in-flight answer retries under the same key until the provider replays
+// the original outcome.
+func (w *conflictWire) validate() (*conflictRule, error) {
 	if len(w.Status) == 0 {
 		return nil, errors.New("status must name at least one status code")
 	}
@@ -393,11 +399,6 @@ func (w *conflictWire) validate(retryable map[int]struct{}) (*conflictRule, erro
 			// A 2xx is already success, and a 3xx is never evidence the
 			// effect happened.
 			return nil, fmt.Errorf("status %d is outside 400-599", status)
-		}
-		if _, overlap := retryable[status]; overlap {
-			return nil, fmt.Errorf("status %d is both a conflict and retryable; "+
-				"it cannot mean both \"the effect happened\" and \"try again\"",
-				status)
 		}
 		if _, duplicate := rule.status[status]; duplicate {
 			return nil, fmt.Errorf("status %d is declared twice", status)
