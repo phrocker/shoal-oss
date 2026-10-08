@@ -388,19 +388,19 @@ func TestApprovalHeldWorkIsNeverPerformedBeforeApproval(t *testing.T) {
 	// Path B cannot serve it, and the denial is durable: a replay answers
 	// from the record rather than re-adjudicating.
 	//
-	// The first answer is pinned as it is, not as it should be. The denial
-	// commits a cancelled record whose AuthorizedOperations is [invoke], and
-	// the hosted publisher (internal/explorerfleetevents,
-	// actionEventAuthorization) permits action.canceled only under dispatch,
-	// so the publication fails and the caller is told the committed outcome
-	// needs reconciliation. That is pre-existing — every admission denial,
-	// including the effect-ceiling one on main, takes this path — and it is
-	// in #480's area, which this change does not touch. Safety holds either
-	// way: nothing is granted, and the replay answers denied from the record.
-	// When the publisher is fixed, the first answer becomes a plain denial
-	// and this assertion should be flipped.
-	if grant, err := h.admit("admission-held"); !errors.Is(
-		err, fleet.ErrActionCommitted) || len(grant.Token.TokenID) != 0 {
+	// The first answer is the denial. This was pinned as ErrActionCommitted
+	// with a note to flip it when the publisher was fixed (#505): the denial
+	// committed a cancelled record whose AuthorizedOperations is [invoke],
+	// while the hosted publisher hardcoded dispatch for action.canceled, so
+	// the publication failed and the caller was told a committed outcome
+	// needed reconciliation. Nothing was ever granted, and the replay below
+	// answered correctly, which is why it survived three reviews.
+	//
+	// deny now records the operation it transitioned under, and both gates
+	// admit invoke for action.canceled.
+	if grant, err := h.admit("admission-held"); err != nil ||
+		grant.Outcome != fleet.AdmissionDenied ||
+		len(grant.Token.TokenID) != 0 {
 		t.Fatalf("path B first answer = %+v, %v", grant, err)
 	}
 	for attempt := 0; attempt < 2; attempt++ {

@@ -1278,6 +1278,13 @@ func (s *DispatchService) Cancel(ctx context.Context, request CancelRequest) (Ac
 	next := cloneActionRecord(current)
 	next.Version++
 	next.State = DispatchCanceled
+	// The cancellation's own operation, not the previous transition's.
+	//
+	// cloneActionRecord carries TransitionOperation forward, so a cancel of a
+	// *claimed* record used to leave the claim's operation on it — invoke, or
+	// execute since #437 — and a cancel of a queued record left it empty,
+	// because nothing sets it at enqueue. Neither describes this transition.
+	next.TransitionOperation = auth.OperationDispatch
 	next.CancelKey = append([]byte(nil), request.MutationKey...)
 	next.UpdatedAt = now
 	next.TransitionRequestID = decision.RequestID()

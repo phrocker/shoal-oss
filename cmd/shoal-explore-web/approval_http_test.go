@@ -131,15 +131,20 @@ func TestApprovalRequiredOverHTTP(t *testing.T) {
 		"object_id": encode([]byte("release-7")), "effects": []string{"external"},
 		"input": json.RawMessage(`{"version":"7"}`), "lease": int64(time.Minute),
 	}
-	// Path B. The first answer is 503 because the denial's cancellation
-	// cannot be published by the hosted publisher — the pre-existing defect
-	// described in TestApprovalHeldWorkIsNeverPerformedBeforeApproval. The
-	// denial is committed regardless, and the replay is the 200 denial a
-	// caller acts on, with no token.
+	// Path B answers the denial on the first attempt. This was pinned as a
+	// 503, because the denial's cancellation could not be published by the
+	// hosted publisher (#505) — fixed, so the first answer is now the 200 a
+	// caller acts on.
+	//
+	// The replay is kept and still asserted: answering identically from the
+	// record is the property that masked the defect for three reviews, and it
+	// is worth pinning on its own.
 	status, body = serve(admissionHandler, h.as(requester),
 		"/api/v1/admission/request", admission)
-	if status != http.StatusServiceUnavailable {
-		t.Fatalf("path B first answer = %d %v", status, body)
+	if status != http.StatusOK || body["outcome"] != "denied" ||
+		body["token"] != nil {
+		t.Fatalf("path B first answer = %d %v, want 200 denied with no token",
+			status, body)
 	}
 	status, body = serve(admissionHandler, h.as(requester),
 		"/api/v1/admission/request", admission)

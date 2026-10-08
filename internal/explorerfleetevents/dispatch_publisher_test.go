@@ -1025,3 +1025,93 @@ func foreignClaimantRecord(
 	record.ExecutionExpiresAt = now.Add(time.Hour)
 	return record
 }
+
+// TestCanceledPublicationNamesTheAuthorizingOperation pins the operation this
+// kind publishes under, for every record shape that reaches it — including the
+// two written by builds that predate the fix.
+//
+// The arm hardcoded dispatch, which refused every admission denial's
+// publication because a denial's AuthorizedOperations is [invoke]. The obvious
+// fix is to read record.TransitionOperation, and it is wrong in both
+// directions, which is why this table exists rather than a comment:
+//
+//   - cloneActionRecord carries that field forward, so a record cancelled
+//     while claimed holds the *claim's* operation. Reading it publishes such a
+//     record under invoke, which the canceller — who needs only dispatch —
+//     cannot authorize, turning a committed cancel into a 503.
+//   - a denial written before deny set the field has it empty, so any constant
+//     fallback outside its [invoke] set leaves it permanently unpublishable
+//     with an undrainable outbox row.
+//
+// AuthorizedOperations records what actually authorized the transition: Cancel
+// widens it with dispatch, and an admission denial carries [invoke] with
+// nothing widening it.
+func TestCanceledPublicationNamesTheAuthorizingOperation(t *testing.T) {
+	for _, probe := range []struct {
+		name string
+		// field is what TransitionOperation holds, which this arm must ignore.
+		field   auth.Operation
+		authOps []auth.Operation
+		want    auth.Operation
+	}{
+		{
+			name:  "a cancel written by this build",
+			field: auth.OperationDispatch,
+			authOps: []auth.Operation{
+				auth.OperationInvoke, auth.OperationDispatch},
+			want: auth.OperationDispatch,
+		},
+		{
+			name:    "an admission denial written by this build",
+			field:   auth.OperationInvoke,
+			authOps: []auth.Operation{auth.OperationInvoke},
+			want:    auth.OperationInvoke,
+		},
+		{
+			// The field says invoke because the claim did. Publishing under
+			// invoke here is the 503 this arm was changed to stop producing.
+			name:  "a pre-fix cancel of a record claimed under invoke",
+			field: auth.OperationInvoke,
+			authOps: []auth.Operation{
+				auth.OperationInvoke, auth.OperationDispatch},
+			want: auth.OperationDispatch,
+		},
+		{
+			name:  "a pre-fix cancel of a record claimed under execute",
+			field: auth.OperationExecute,
+			authOps: []auth.Operation{
+				auth.OperationExecute, auth.OperationDispatch},
+			want: auth.OperationDispatch,
+		},
+		{
+			// Unpublishable before this: the field is empty and dispatch is
+			// not in the set, so the provenance check refused it outright.
+			name:    "a pre-fix admission denial with no recorded operation",
+			field:   "",
+			authOps: []auth.Operation{auth.OperationInvoke},
+			want:    auth.OperationInvoke,
+		},
+	} {
+		t.Run(probe.name, func(t *testing.T) {
+			record := fleet.ActionRecord{
+				AuthorizationFingerprint: auth.Fingerprint{1},
+				AuthorizationExpiresAt: time.Date(
+					2030, 1, 1, 0, 0, 0, 0, time.UTC),
+				TransitionOperation:  probe.field,
+				AuthorizedOperations: probe.authOps,
+			}
+			operation, _, _, err := actionEventAuthorization(
+				"action.canceled", record)
+			if err != nil {
+				t.Fatalf("publication refused, so this record's lifecycle "+
+					"event is lost and its outbox row undrainable: %v", err)
+			}
+			if operation != probe.want {
+				t.Fatalf("operation = %q, want %q: publishing under an "+
+					"operation the canceller does not hold fails "+
+					"authorization and returns ErrActionCommitted for a "+
+					"transition that committed", operation, probe.want)
+			}
+		})
+	}
+}

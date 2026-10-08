@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -17,6 +18,7 @@ import (
 	"time"
 
 	"github.com/phrocker/shoal-oss/pkg/document"
+	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/explorer/fleet"
 	"github.com/phrocker/shoal-oss/pkg/explorer/teamoverview"
@@ -651,4 +653,80 @@ func mustJSON(t *testing.T, value any) string {
 		t.Fatal(err)
 	}
 	return string(encoded)
+}
+
+// TestFleetDispatchErrorMarksEveryIndeterminateJoin pins the whole arm order,
+// because reasoning about it in a comment is exactly what failed.
+//
+// fleetDispatchError is a switch, so the first matching arm wins, and
+// applyExecutionResult does not raise the ambiguity sentinel alone — it joins
+// it with whatever it found when it re-read the record after the effect. The
+// first version of the indeterminate arm sat below the not-found and conflict
+// arms, which shadowed it:
+//
+//	Join(ErrExecutionAmbiguous, ErrClaimLost)      → 409 conflict, unmarked
+//	Join(ErrExecutionAmbiguous, ErrActionNotFound) → 404, unmarked
+//	Join(ErrActionCommitted, ErrActionTerminal)    → 409 conflict, unmarked
+//
+// A 409 is worse than the bare 503 it replaced: it reads as "your request did
+// not apply", so a worker retries an external effect that may already have
+// happened. The arm's own comment reasoned only about the arm below it.
+//
+// Every join the service actually constructs is a row here, so adding a new
+// one without deciding its marking fails this test rather than shipping.
+func TestFleetDispatchErrorMarksEveryIndeterminateJoin(t *testing.T) {
+	for _, probe := range []struct {
+		name          string
+		err           error
+		indeterminate bool
+		code          shoal.ErrorCode
+	}{
+		// Raised by applyExecutionResult after the effect. All three must be
+		// marked: the effect may have occurred and Shoal cannot tell.
+		{"ambiguous alone", fleet.ErrExecutionAmbiguous,
+			true, shoal.ErrorUnavailable},
+		{"ambiguous joined with a lost claim",
+			errors.Join(fleet.ErrExecutionAmbiguous, fleet.ErrClaimLost),
+			true, shoal.ErrorUnavailable},
+		{"ambiguous joined with a missing record",
+			errors.Join(fleet.ErrExecutionAmbiguous, fleet.ErrActionNotFound),
+			true, shoal.ErrorUnavailable},
+		{"ambiguous joined with a recorder failure",
+			errors.Join(fleet.ErrExecutionAmbiguous, fleet.ErrRecordingUnavailable),
+			true, shoal.ErrorUnavailable},
+		// The transition was durably written and only its publication failed.
+		{"committed alone", fleet.ErrActionCommitted,
+			true, shoal.ErrorUnavailable},
+		{"committed joined with a terminal record",
+			errors.Join(fleet.ErrActionCommitted, fleet.ErrActionTerminal),
+			true, shoal.ErrorUnavailable},
+		// Nothing committed. A clean refusal the caller retries, and marking
+		// it would tell a caller to reconcile against a record that does not
+		// exist.
+		{"a lost claim alone", fleet.ErrClaimLost,
+			false, shoal.ErrorConflict},
+		{"a conflict alone", fleet.ErrActionConflict,
+			false, shoal.ErrorConflict},
+		{"a terminal record alone", fleet.ErrActionTerminal,
+			false, shoal.ErrorConflict},
+		{"a missing record alone", fleet.ErrActionNotFound,
+			false, shoal.ErrorNotFound},
+		{"a recorder failure alone", fleet.ErrRecordingUnavailable,
+			false, shoal.ErrorUnavailable},
+		{"approval required", fleet.ErrApprovalRequired,
+			false, shoal.ErrorConflict},
+	} {
+		t.Run(probe.name, func(t *testing.T) {
+			mapped := fleetDispatchError(probe.err)
+			if got := explorer.IsIndeterminateCommit(
+				mapped); got != probe.indeterminate {
+				t.Fatalf("indeterminate = %v, want %v: a caller distinguishes "+
+					"\"retry, nothing happened\" from \"stop, something may "+
+					"have happened\" on exactly this flag", got, probe.indeterminate)
+			}
+			if got := primaryErrorCode(mapped); got != probe.code {
+				t.Fatalf("code = %q, want %q", got, probe.code)
+			}
+		})
+	}
 }
