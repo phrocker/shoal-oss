@@ -873,6 +873,15 @@ func (s *DispatchService) completeClaim(
 		return ActionRecord{}, shoal.NewError(
 			shoal.ErrorInvalidArgument, "a failed completion requires an error code")
 	}
+	// Refused here, at the boundary, rather than left to the validation
+	// inside applyExecutionResult — which by then cannot tell a worker's code
+	// from one the service has just assigned, because both sit in the same
+	// field. This is the only place the code is known to have come from the
+	// caller (#508).
+	if err := validateReportedActionErrorCode(
+		request.Result.ErrorCode); err != nil {
+		return ActionRecord{}, err
+	}
 	current, action, authorizing, err := s.authorizedClaimant(
 		ctx, decision, request.ID, now)
 	if err != nil {
@@ -1091,11 +1100,19 @@ func (s *DispatchService) applyExecutionResult(
 	next.Version++
 	next.UpdatedAt = finishNow
 	next.EffectPossible = true
+	// Whose code this is, decided by which branch below writes it rather than
+	// by anything the caller said. A code present on entry came from the
+	// executor; every assignment below is the service adjudicating, and each
+	// one overwrites the origin with its own (#508).
+	if result.ErrorCode != "" {
+		next.ErrorCodeOrigin = ErrorCodeOriginExecutor
+	}
 	if executionErr == nil {
 		output, validateErr := validateAgainstSchema(action.OutputSchema, result.Output, "action output", MaxActionOutputBytes)
 		if validateErr != nil {
 			executionErr = validateErr
 			result.ErrorCode = "invalid_executor_output"
+			next.ErrorCodeOrigin = ErrorCodeOriginService
 		} else {
 			next.Output = output
 		}
@@ -1109,6 +1126,7 @@ func (s *DispatchService) applyExecutionResult(
 		if executionErr == nil {
 			executionErr = err
 			result.ErrorCode = "invalid_executor_evidence"
+			next.ErrorCodeOrigin = ErrorCodeOriginService
 		}
 	} else {
 		next.Evidence = result.Evidence
@@ -1118,6 +1136,7 @@ func (s *DispatchService) applyExecutionResult(
 	if err := validateActionErrorCode(result.ErrorCode); err != nil {
 		executionErr = err
 		result.ErrorCode = "invalid_executor_error"
+		next.ErrorCodeOrigin = ErrorCodeOriginService
 	}
 
 	if executionErr == nil && result.ErrorCode == "" {
@@ -1127,6 +1146,9 @@ func (s *DispatchService) applyExecutionResult(
 		next.ErrorCode = result.ErrorCode
 		if next.ErrorCode == "" {
 			next.ErrorCode = "executor_error"
+			// The service's own, assigned because the failure arrived with no
+			// reason at all.
+			next.ErrorCodeOrigin = ErrorCodeOriginService
 		}
 	}
 	latest, readErr := s.store.GetAction(ctx, current.ID)
