@@ -418,6 +418,41 @@ func applyClaim(
 	authorizing auth.Operation,
 	now time.Time,
 ) (ActionRecord, error) {
+	// The incoming claimant's chain is bounded here, by the bound a *retained*
+	// holder's chain is subject to, because this is where the asymmetry between
+	// the two became a brick.
+	//
+	// ClaimantOnBehalfOf on the live record is bounded only by entry count
+	// (auth.MaxOnBehalfOfEntries, each up to shoal.MaxIDBytes — 64 KB in the
+	// worst case), while a retained ClaimHolder's chain is additionally bounded
+	// at MaxClaimHolderChainBytes. A claimant whose chain fell between the two
+	// therefore claimed successfully, and then the *next* claim produced a
+	// record that ActionRecord.Validate refuses — so encodeAction refused the
+	// write, and every subsequent claim by anyone was refused the same way,
+	// forever, on an action stuck in DispatchClaimed with a dead lease.
+	//
+	// Verified by execution: a five-entry 5120-byte chain claims, lapses, and
+	// then the next worker is refused "claim holder delegation chain exceeds
+	// its byte bound" with the record still at the claimed version. That is
+	// precisely the brick MaxClaimHolderChainBytes was added to prevent,
+	// caused by MaxClaimHolderChainBytes.
+	//
+	// Refusing here rather than truncating the retained chain, because
+	// heldClaimAt compares the retained chain element for element: a truncated
+	// or omitted chain would silently deny the ambiguity route to exactly the
+	// delegated worker whose claim was taken over, which is the one caller
+	// that route exists for. A chain that cannot be retained is a chain whose
+	// holder could never be recognised, so refusing the claim is the honest
+	// answer and it arrives before any effect.
+	chainBytes := 0
+	for _, identity := range decision.OnBehalfOf() {
+		chainBytes += len(identity)
+	}
+	if chainBytes > MaxClaimHolderChainBytes {
+		return ActionRecord{}, shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			"claimant delegation chain exceeds its byte bound")
+	}
 	record.State = DispatchClaimed
 	record.TransitionOperation = authorizing
 	// An external-effect action is possibly-effected from the moment it is
@@ -445,7 +480,44 @@ func applyClaim(
 		action.Effects.contains(EffectEgressesContent) {
 		record.EffectPossible = true
 	}
+	// Read before the assignment below, because the history retains the
+	// *outgoing* holder. An earlier version of this block ran after
+	// record.ClaimID had already been overwritten, so every retained holder
+	// carried its successor's claim ID — no authorization consequence, since
+	// heldClaimAt keys on the fence, but wrong in evidence an operator reads.
+	outgoingClaimID := append([]byte(nil), record.ClaimID...)
 	record.ClaimID = append([]byte(nil), claimID...)
+	// The outgoing holder is retained before the incoming one overwrites it.
+	//
+	// Overwriting is correct for who may *complete* — only the current holder
+	// may. It is wrong for who may *report an ambiguity*, because the caller
+	// that route exists for is precisely the one whose claim was taken over:
+	// its lease lapsed mid-effect and another worker now holds the record. The
+	// record would otherwise retain no evidence it ever held anything (#438).
+	//
+	// Oldest first, oldest dropped on overflow. The most recent holders are
+	// the ones whose effects may still be unreconciled, and the cap exists
+	// because encodeAction refuses a record past 3*MaxActionPayloadBytes — an
+	// unbounded history would make a repeatedly re-claimed action unwritable
+	// rather than merely large.
+	if record.ClaimantSubject != "" && record.ClaimFence > 0 {
+		record.ClaimHistory = appendClaimHolder(record.ClaimHistory, ClaimHolder{
+			Subject:    record.ClaimantSubject,
+			Actor:      record.ClaimantActor,
+			ClientID:   record.ClaimantClientID,
+			OnBehalfOf: append([]shoal.ID(nil), record.ClaimantOnBehalfOf...),
+			ClaimID:    outgoingClaimID,
+			ClaimFence: record.ClaimFence,
+			// When that holder took the claim, not when its successor did.
+			// HeldAt was `now` — the incoming claimant's time — so every
+			// retained holder's timestamp recorded the moment it was
+			// *displaced*. The same category as the claim ID this block was
+			// just fixed to read before overwriting: no authorization
+			// consequence, because heldClaimAt keys on the fence, and wrong in
+			// evidence an operator reads.
+			HeldAt: record.ClaimLeaseUntil.Add(-record.ClaimLease),
+		})
+	}
 	// Who holds the claim, as distinct from which claim is held. A re-claim
 	// after a lapsed lease overwrites these, which is correct: the new
 	// claimant is the one that may report, and the previous one has already
@@ -609,8 +681,13 @@ func (s *DispatchService) ExecuteClaim(ctx context.Context, claimed ActionRecord
 	// Unreachable through Invoke today, since Cancel refuses a live claim and
 	// this function requires one, but it is the same asymmetry and it should
 	// not read differently in the two places.
+	// Keyed on the fence, not the version. This branch still compared
+	// version+1 after the first attempt at the stranding fix, so a report
+	// landing after a committed execution turned a retry into ErrClaimLost
+	// instead of returning the committed record — the same stranding, in the
+	// one place the fix did not reach. ReportAmbiguity does not check state,
+	// so a terminal record accepts one.
 	if (current.State == DispatchSucceeded || current.State == DispatchFailed) &&
-		current.Version == claimed.Version+1 &&
 		current.ClaimFence == claimed.ClaimFence &&
 		bytes.Equal(current.ClaimID, claimed.ClaimID) {
 		if err := s.publishTransition(
@@ -620,8 +697,12 @@ func (s *DispatchService) ExecuteClaim(ctx context.Context, claimed ActionRecord
 		}
 		return cloneActionRecord(current), nil
 	}
-	if current.Version != claimed.Version ||
-		current.ClaimFence != claimed.ClaimFence ||
+	// The fence, the claim, the state and the lease — not the version. This
+	// caller holds a record it was handed; what must still be true is that
+	// the claim generation is the same one. A report advances the version
+	// while leaving all four alone, and so does a renewal, and neither
+	// changes whose claim it is.
+	if current.ClaimFence != claimed.ClaimFence ||
 		!bytes.Equal(current.ClaimID, claimed.ClaimID) ||
 		current.State != DispatchClaimed || !now.Before(current.ClaimLeaseUntil) {
 		return ActionRecord{}, ErrClaimLost
@@ -673,8 +754,9 @@ func (s *DispatchService) ExecuteClaim(ctx context.Context, claimed ActionRecord
 	if err != nil {
 		return ActionRecord{}, err
 	}
-	if current.Version != claimed.Version ||
-		current.ClaimFence != claimed.ClaimFence ||
+	// Re-read immediately before the effect, on the same key as the gate
+	// above it.
+	if current.ClaimFence != claimed.ClaimFence ||
 		!bytes.Equal(current.ClaimID, claimed.ClaimID) ||
 		current.State != DispatchClaimed || !executionNow.Before(current.ClaimLeaseUntil) ||
 		!executionNow.Before(current.Deadline) {
@@ -727,29 +809,35 @@ func (s *DispatchService) ExecuteClaim(ctx context.Context, claimed ActionRecord
 // at dispatch as the alternative; this is the half of dispatch that makes the
 // alternative reachable.
 //
-// Every check ExecuteClaim performs, this performs. The decision is resolved
-// and matched to the queued principal, the action is re-resolved through the
-// registry against the current generation and lease, and the claim fence and
-// version are confirmed before anything is written. The result then goes
+// Every check ExecuteClaim performs, this performs. The decision is resolved,
+// the caller is matched to the claim's holder, the action is re-resolved
+// through the registry against the current generation and lease, and the claim
+// generation is confirmed before anything is written. The result then goes
 // through applyExecutionResult, the same terminal transition the in-process
 // path uses, which revalidates the fence after the fact and reports a loss as
 // ambiguity rather than overwriting whatever committed in the meantime.
 //
-// Reporting twice is safe. A worker that commits and then loses its response
-// replays the request and gets the committed record back, exactly as a repeated
-// ExecuteClaim does, because the terminal state at the expected version under
-// the same claim is recognised as the reporter's own work rather than a
-// conflict.
-// CompleteClaim is the dispatch surface's completion. It refuses an admission,
-// which the admission surface closes through its own path.
+// The generation, not the version. This said "the claim fence and version are
+// confirmed", which described the predicate before the fence bound it: when a
+// fence is supplied the version is not compared at all, because #438's
+// ambiguity route can advance it while leaving the claim intact and comparing
+// it exactly is what stranded a live claimant. A caller that supplies no fence
+// keeps the exact-version comparison, which is the contract it was written
+// against.
 //
-// This is not only about a reclaimed record. An admission token carries the
-// action ID, the claim ID and the version, which is everything this request
-// needs — so the caller that holds a live grant could always have completed it
-// here instead of reporting, skipping the one-shot rule, the exact-replay
-// comparison and the malformed-report rejection that the admission path exists
-// to apply. The expiry the review traced is one way in; holding your own token
-// is the other, and it needs no expiry at all.
+// Reporting twice is safe. A worker that commits and then loses its response
+// replays the request and gets the committed record back, exactly as a
+// repeated ExecuteClaim does, because a terminal state under the reporter's own
+// claim generation is recognised as its own work rather than a conflict.
+//
+// It refuses an admission, which the admission surface closes through its own
+// path. That is not only about a reclaimed record: an admission token carries
+// the action ID, the claim ID and the version, which is everything this
+// request needs — so the caller that holds a live grant could always have
+// completed it here instead of reporting, skipping the one-shot rule, the
+// exact-replay comparison and the malformed-report rejection that the
+// admission path exists to apply. The expiry the review traced is one way in;
+// holding your own token is the other, and it needs no expiry at all.
 func (s *DispatchService) CompleteClaim(ctx context.Context, request CompletionRequest) (ActionRecord, error) {
 	return s.completeClaim(ctx, request, true)
 }
@@ -841,20 +929,33 @@ func (s *DispatchService) completeClaim(
 	if !holdsClaimOn(decision, current) {
 		return ActionRecord{}, auth.ObjectNotFound()
 	}
-	// A replayed report. The action is already terminal at the version this
-	// reporter expected to produce, under this reporter's own claim, so the
-	// work is committed and the response was lost. Republish and return it
-	// rather than reporting a conflict against the reporter's own write.
+	// A replayed report: the action is already terminal under this reporter's
+	// own claim generation, so the work is committed and the response was
+	// lost. Republish and return it rather than reporting a conflict against
+	// the reporter's own write.
+	//
+	// Keyed on the generation, not the version. The sentence this replaces
+	// said "terminal at the version this reporter expected to produce", which
+	// was true of the old predicate and is false on the fence path, where the
+	// version is not compared at all — two comments were left stacked here,
+	// the first describing the code the second had replaced.
+	//
+	// Dropping the version without putting the fence in its place was the
+	// second defect of the first attempt at this: terminal plus a matching
+	// ClaimID is true of a *later* generation's completion, so a worker
+	// reusing one ClaimID was handed attempt two's committed outcome as though
+	// it were attempt one's. Verified by execution, and covered by nothing in
+	// the repository.
 	//
 	// Only succeeded and failed count, because only applyExecutionResult
 	// produces those and only it could have been this reporter's write. Cancel
-	// also lands on a terminal state at exactly version+1 while preserving the
-	// ClaimID it cancelled, so accepting any terminal state here would hand a
-	// late reporter the cancelled record and a 200 — telling it the work it
+	// also lands on a terminal state while preserving the ClaimID it
+	// cancelled, so accepting any terminal state here would hand a late
+	// reporter the cancelled record and a 200 — telling it the work it
 	// performed was recorded, when the record says the opposite.
 	if (current.State == DispatchSucceeded || current.State == DispatchFailed) &&
-		current.Version == request.ExpectedVersion+1 &&
-		bytes.Equal(current.ClaimID, request.ClaimID) {
+		bytes.Equal(current.ClaimID, request.ClaimID) &&
+		replayMatchesGeneration(current, request) {
 		if err := s.publishTransition(
 			context.WithoutCancel(ctx), actionEventKind(current), current,
 		); err != nil {
@@ -862,7 +963,50 @@ func (s *DispatchService) completeClaim(
 		}
 		return cloneActionRecord(current), nil
 	}
-	if current.Version != request.ExpectedVersion ||
+	// The claim generation, not the version.
+	//
+	// A completion's right to write this record comes from holding its claim:
+	// the ClaimID matches, the fence identifies which claim, the state is
+	// still Claimed, the lease is still live (checked below), the caller is
+	// the claimant (checked above), and the store compare-and-sets on what it
+	// just read.
+	//
+	// The version was standing in for the fence and doing it badly. It only
+	// behaved like a generation check because nothing could advance the
+	// version while leaving the claim intact — and #438's ambiguity route
+	// does exactly that, which is how a lapsed holder's report came to strand
+	// a live claimant with ErrClaimLost on work it had performed.
+	//
+	// The first attempt at this widened the version comparison to tolerate
+	// drift that reports could account for. That was wrong in a way worth
+	// recording: the budget was the record's *lifetime* report count while
+	// the drift was measured from the caller's read, so reports filed before
+	// the read bought slack without adding drift. A worker reusing one
+	// ClaimID across two claim generations could then commit attempt one's
+	// outcome onto attempt two's generation — an ABA break, verified by
+	// execution, where the version was the only thing that had been binding
+	// a completion to a generation and widening it removed that binding
+	// altogether.
+	//
+	// So the fence is compared instead, and the version is not compared at
+	// all when it is supplied. A caller that does not supply a fence keeps
+	// the old exact-version behaviour, which is strandable but is the
+	// contract it was written against.
+	//
+	// Two of the three conditions in the fence branch are defence in depth and
+	// are deliberately uncovered: removing `current.State != DispatchClaimed`
+	// or the ClaimID comparison each leaves the package green, because the
+	// lease check below masks the first and holdsClaimOn above masks the
+	// second. Neither is exploitable alone. They are kept because each masking
+	// check is a separate decision that could move, and said here because the
+	// convention in this file is to say which clauses no test can fail on.
+	if request.ClaimFence != 0 {
+		if current.ClaimFence != request.ClaimFence ||
+			!bytes.Equal(current.ClaimID, request.ClaimID) ||
+			current.State != DispatchClaimed {
+			return ActionRecord{}, ErrClaimLost
+		}
+	} else if current.Version != request.ExpectedVersion ||
 		!bytes.Equal(current.ClaimID, request.ClaimID) ||
 		current.State != DispatchClaimed {
 		return ActionRecord{}, ErrClaimLost
@@ -1166,6 +1310,369 @@ func (s *DispatchService) Cancel(ctx context.Context, request CancelRequest) (Ac
 		return ActionRecord{}, errors.Join(ErrActionCommitted, err)
 	}
 	return cloneActionRecord(stored), nil
+}
+
+// ExtendClaim renews a live claim's lease so the fenced window can cover an
+// operation longer than MaxActionClaimTTL (#430).
+//
+// Without it the fenced window is whatever was asked for at claim time,
+// bounded by a hard five minutes that the service refuses rather than clamps.
+// A worker whose operation outruns that has done something the record says did
+// not happen, which is the outcome #391 exists to prevent — and raising the
+// ceiling is not the fix, because a long lease is a long window in which a
+// dead worker's action is stuck.
+//
+// Renewal separates the two concerns the single number conflated.
+// MaxActionClaimTTL becomes a heartbeat interval: how long a worker may be
+// silent before it is assumed gone. The action's Deadline remains the total
+// budget, already set by the enqueuer, already bounded by MaxActionDeadline,
+// and already clamping ClaimLeaseUntil. So the total bound needs no new
+// concept and no new ceiling.
+//
+// Four semantics, each decided rather than discovered.
+//
+// The fence does not increment. ClaimFence identifies *which* claim, and the
+// claim has not changed — only its deadline has. Incrementing would invalidate
+// the fence the claimant is holding and break the report-under-the-same-fence
+// contract the gateway design depends on. The record Version increments
+// instead, and ExpectedVersion guards the mutation.
+//
+// An expired lease is not renewable, and that is the point rather than a
+// limitation. Once ClaimLeaseUntil has passed the action may already have been
+// reclaimed under a new ClaimID and fence, so renewing would hand two workers
+// a live claim. A worker whose extension is refused mid-operation is in the
+// ambiguous case — it may be about to perform, or have performed, an effect it
+// can no longer report — which is what EffectPossible and the #438 ambiguity
+// route exist for. The refusal is ErrClaimLost, distinguishable from a
+// transport failure, because a worker must be able to tell "my claim is gone,
+// treat this as ambiguous" from "retry the renewal".
+//
+// Shortening is refused. A lease moving ClaimLeaseUntil backwards is a worker
+// bug, and honouring it costs the claim it was trying to keep.
+//
+// And no lifecycle event is published. A heartbeat on a long operation would
+// emit one every few minutes per action and drown the event log in liveness;
+// ClaimLeaseUntil and Version already carry it and Status already exposes
+// them. TransitionKind is empty, so the store writes without enqueuing an
+// outbox row — which also keeps a renewal out of the mixed-identity outbox
+// that #480 found can be left undrainable.
+func (s *DispatchService) ExtendClaim(
+	ctx context.Context, request ExtendRequest,
+) (ActionRecord, error) {
+	ctx, cancel := s.deadline(ctx, request.Context)
+	defer cancel()
+	decision, now, err := s.beginClaimant(ctx, request.Context)
+	if err != nil {
+		return ActionRecord{}, err
+	}
+	if request.ExpectedVersion == 0 || request.Lease <= 0 ||
+		request.Lease > MaxActionClaimTTL {
+		return ActionRecord{}, shoal.NewError(
+			shoal.ErrorInvalidArgument, "claim version or lease is invalid")
+	}
+	if err := validateOpaque(
+		"claim ID", request.ClaimID, false); err != nil {
+		return ActionRecord{}, err
+	}
+	current, _, authorizing, err := s.authorizedClaimant(
+		ctx, decision, request.ID, now)
+	if err != nil {
+		return ActionRecord{}, err
+	}
+	// An admission's grant is not a claim a worker renews. Refused as
+	// not-found for the same reason every other dispatch route refuses one.
+	if current.isAdmission() {
+		return ActionRecord{}, auth.ObjectNotFound()
+	}
+	// Only the claim's holder may renew it, and a caller without standing is
+	// told what an absent action is told — this route is reachable by every
+	// principal authorized to execute the descriptor, so a distinguishable
+	// refusal would confirm the action exists.
+	if !holdsClaimOn(decision, current) ||
+		!bytes.Equal(current.ClaimID, request.ClaimID) {
+		return ActionRecord{}, auth.ObjectNotFound()
+	}
+	if current.Version != request.ExpectedVersion {
+		return ActionRecord{}, ErrActionConflict
+	}
+	// Claimed and live, in that order. A terminal record has no claim to
+	// renew; an expired one may already belong to someone else.
+	if current.State != DispatchClaimed ||
+		!now.Before(current.ClaimLeaseUntil) ||
+		!now.Before(current.Deadline) {
+		return ActionRecord{}, ErrClaimLost
+	}
+	extended := now.Add(request.Lease)
+	if extended.After(current.Deadline) {
+		extended = current.Deadline
+	}
+	// Refused rather than silently ignored, so a worker that has miscomputed
+	// its own budget finds out while it still holds the claim.
+	if !extended.After(current.ClaimLeaseUntil) {
+		return ActionRecord{}, shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			"claim extension does not move the lease forward")
+	}
+	next := cloneActionRecord(current)
+	next.Version++
+	next.ClaimLease = request.Lease
+	next.ClaimLeaseUntil = extended
+	next.UpdatedAt = now
+	next.TransitionRequestID = decision.RequestID()
+	next.TransitionCorrelationID = decision.CorrelationID()
+	if err := s.recorder.RecordAction(ctx, ActionAudit{
+		// The operation that authorized *this* call, for the reason
+		// ReportAmbiguity's own comment gives: reading the record's field
+		// attributes the renewal to whatever claimed the action, and passes an
+		// empty operation for a record claimed by a build without the field,
+		// which RecordAction validates first and refuses — joined with
+		// ErrRecordingUnavailable, so a 503.
+		//
+		// This route had neither of the two defences its siblings have.
+		// ReportAmbiguity uses the authorizing operation; ExecuteClaim keeps
+		// the record's and falls back to invoke when it is empty. ExtendClaim
+		// used the record's with no fallback, so a worker mid-long-operation
+		// across an upgrade could not renew, lost its claim, and landed in the
+		// ambiguity case — the exact outcome this route exists to prevent.
+		// Reproduced before fixing: "fleet dispatch: recording is
+		// unavailable", with errors.Is(err, ErrRecordingUnavailable) true.
+		Phase: "claim_extension", Operation: authorizing,
+		Record: next,
+	}); err != nil {
+		return ActionRecord{}, errors.Join(ErrRecordingUnavailable, err)
+	}
+	stored, err := s.store.ApplyAction(ctx, DispatchMutation{
+		Token: transitionToken(
+			"extend", request.ID, request.ClaimID, next.Version),
+		ExpectedVersion: current.Version,
+		// Asserted unchanged, not advanced. This is the invariant the whole
+		// route turns on.
+		ExpectedFence: current.ClaimFence,
+		Record:        next,
+	})
+	if err != nil {
+		return ActionRecord{}, err
+	}
+	return cloneActionRecord(stored), nil
+}
+
+// ReportAmbiguity records what a worker attempted when it can no longer report
+// the outcome, which is the one case this dispatch surface could not express
+// (#438).
+//
+// A worker whose lease lapses or whose renewal is refused mid-effect cannot use
+// CompleteClaim: that route is gated on the fence it has just lost. The effect
+// may have happened, and EffectPossible already says so durably — what was
+// missing is *what* was attempted, against which target, and with what handle
+// if the target returned one. That handle is the whole value here: it is the
+// thing an operator takes to the other system, and it is what EffectPossible
+// alone cannot give them.
+//
+// Three properties make this safe to expose to a caller that has lost its
+// claim.
+//
+// It does not transition the action. The state, the claim and EffectPossible
+// are all unchanged — a worker that has lost the fence has no standing to
+// assert an outcome, only to say what it tried. The version advances because
+// this writes to the record and must serialise against concurrent writers; the
+// *fence* deliberately does not, so a report cannot invalidate a live
+// claimant's right to complete.
+//
+// It publishes no event. TransitionKind is empty, so the store writes the
+// record without enqueuing an outbox row. That is not merely economy: the five
+// lifecycle kinds are closed and the public events route refuses them, and a
+// row that only a lapsed claimant could publish is exactly the mixed-identity
+// outbox that can be left undrainable by any principal (#480).
+//
+// And it is attributed rather than self-asserted. The reporting principal is
+// recorded from its decision, never from the request, and a report is accepted
+// only from a principal the record has actually seen hold the claim at the
+// fence it names.
+func (s *DispatchService) ReportAmbiguity(
+	ctx context.Context, request AmbiguityRequest,
+) (ActionRecord, error) {
+	ctx, cancel := s.deadline(ctx, request.Context)
+	defer cancel()
+	decision, now, err := s.beginClaimant(ctx, request.Context)
+	if err != nil {
+		return ActionRecord{}, err
+	}
+	if err := request.Outcome.validate(); err != nil {
+		return ActionRecord{}, err
+	}
+	if request.ClaimFence == 0 {
+		return ActionRecord{}, shoal.NewError(
+			shoal.ErrorInvalidArgument, "ambiguity report fence is required")
+	}
+	// Bounds and shape are enforced here, at the boundary, rather than being
+	// left to ActionRecord.Validate. Record validation runs where a record is
+	// encoded, which is not every store, so relying on it let an over-long or
+	// control-character-bearing target through in testing — the values are
+	// target-controlled and this is the route they enter on, so this is where
+	// they have to be refused.
+	if err := validateAmbiguityText(
+		"ambiguity target", request.Target); err != nil {
+		return ActionRecord{}, err
+	}
+	if err := validateAmbiguityText(
+		"ambiguity reference", request.Reference); err != nil {
+		return ActionRecord{}, err
+	}
+	if len(request.Target) > MaxAmbiguityTargetBytes {
+		return ActionRecord{}, shoal.NewError(
+			shoal.ErrorInvalidArgument, "ambiguity target exceeds its bound")
+	}
+	if len(request.Reference) > MaxAmbiguityReferenceBytes {
+		return ActionRecord{}, shoal.NewError(
+			shoal.ErrorInvalidArgument, "ambiguity reference exceeds its bound")
+	}
+	current, _, authorizing, err := s.authorizedClaimant(
+		ctx, decision, request.ID, now)
+	if err != nil {
+		return ActionRecord{}, err
+	}
+	// An admission is not dispatch work and its grant is reported through
+	// AdmissionService.Report, which has its own terminal semantics. Refused
+	// as not-found for the same reason every other route refuses it.
+	if refuseAmbiguityAdmission(current) {
+		return ActionRecord{}, auth.ObjectNotFound()
+	}
+	// Held the claim at the fence it names — currently, or according to the
+	// retained history. Concealed rather than refused, because this route is
+	// reachable by every principal authorized to execute the descriptor and a
+	// distinguishable error would tell one of them that an action exists and
+	// which fences it has been through.
+	if !heldClaimAt(decision, current, request.ClaimFence) {
+		return ActionRecord{}, auth.ObjectNotFound()
+	}
+	// Pinned only when the caller asked for it. See AmbiguityRequest's own
+	// documentation: the caller this route exists for cannot learn the current
+	// version, and version was never the invariant — the claim is, and the
+	// store asserts that through ExpectedFence below.
+	if request.ExpectedVersion != 0 &&
+		current.Version != request.ExpectedVersion {
+		return ActionRecord{}, ErrActionConflict
+	}
+	if len(current.AmbiguityReports) >= MaxActionAmbiguityReports {
+		return ActionRecord{}, shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			"action ambiguity reports exceed their bound")
+	}
+	next := cloneActionRecord(current)
+	next.Version++
+	next.UpdatedAt = now
+	next.TransitionRequestID = decision.RequestID()
+	next.TransitionCorrelationID = decision.CorrelationID()
+	// Appended, never replacing an existing report at the same fence. Two
+	// reports from one attempt mean the worker retried, and an operator wants
+	// both rather than the later one silently overwriting the earlier.
+	next.AmbiguityReports = append(next.AmbiguityReports, AmbiguityReport{
+		ClaimFence: request.ClaimFence,
+		Outcome:    request.Outcome,
+		Target:     request.Target,
+		Reference:  request.Reference,
+		Subject:    decision.Subject(),
+		Actor:      decision.Actor(),
+		ReportedAt: now,
+	})
+	// The operation that authorized *this* call, not the one the record's last
+	// transition carried. A report is its own authorized act, and
+	// authorizedClaimant has just told us which route admitted it — reading
+	// the record's field instead would attribute the report to whatever
+	// claimed the action, and would pass an empty operation for a record
+	// claimed by a build without the field, which RecordAction validates
+	// first and refuses as a 503.
+	if err := s.recorder.RecordAction(ctx, ActionAudit{
+		Phase: "ambiguity_report", Operation: authorizing,
+		Record: next,
+	}); err != nil {
+		return ActionRecord{}, errors.Join(ErrRecordingUnavailable, err)
+	}
+	stored, err := s.store.ApplyAction(ctx, DispatchMutation{
+		Token: transitionToken(
+			"ambiguity", request.ID,
+			ambiguityMutationKey(request, decision), next.Version),
+		ExpectedVersion: current.Version,
+		// The fence is asserted unchanged rather than advanced. A report must
+		// not disturb whoever currently holds the claim.
+		ExpectedFence: current.ClaimFence,
+		Record:        next,
+	})
+	if err != nil {
+		return ActionRecord{}, err
+	}
+	return cloneActionRecord(stored), nil
+}
+
+// replayMatchesGeneration reports whether a terminal record is the committed
+// outcome of the claim generation this caller is reporting under.
+//
+// The fence answers it exactly when supplied. Without one, the only thing
+// available is the pre-existing version arithmetic — a terminal record at
+// exactly the version this caller expected to produce — which is why a caller
+// that supplies no fence keeps that behaviour rather than a weaker one.
+func replayMatchesGeneration(
+	current ActionRecord, request CompletionRequest,
+) bool {
+	if request.ClaimFence != 0 {
+		return current.ClaimFence == request.ClaimFence
+	}
+	return current.Version == request.ExpectedVersion+1
+}
+
+// refuseAmbiguityAdmission keeps the admission namespace out of this route.
+func refuseAmbiguityAdmission(record ActionRecord) bool {
+	return record.isAdmission()
+}
+
+// ambiguityMutationKey derives the store token's discriminator from
+// everything that distinguishes one report from another.
+//
+// It is not a replay guard, and an earlier version of this comment claimed it
+// was. A byte-identical retry does not reach the store at all: the service's
+// own version handling answers first, so the token's stability is never what
+// deduplicates a lost response. What the token must do is differ whenever two
+// reports differ, so that transitionToken cannot fold two distinct writes into
+// one.
+//
+// No test can currently observe that, and that is worth saying rather than
+// contriving one. transitionToken folds in next.Version, which differs for
+// every report because each advances the version — so collapsing this whole
+// function to a constant leaves the suite green. The injectivity here is
+// defence against a future caller that derives a token without the version,
+// not something load-bearing today.
+//
+// Which also means the real protection is the version, and if that ever stops
+// being part of the token this function becomes load-bearing immediately. It
+// is written to be correct now so that it does not have to be discovered then.
+//
+// Every component is length-prefixed through writeDispatchTupleField rather
+// than joined with a delimiter. A first version of this concatenated the
+// fields with NUL bytes, which is precisely the encoding executorKey's own
+// comment records as having been replaced for being non-injective: two
+// different tuples can produce one key, and here that would make two genuinely
+// different reports collide into one store token so the second would be
+// silently dropped as a replay of the first.
+func ambiguityMutationKey(
+	request AmbiguityRequest, decision auth.Decision,
+) []byte {
+	digest := sha256.New()
+	writeDispatchTupleField(digest, []byte("shoal.fleet.ambiguity-report.v1"))
+	writeDispatchTupleField(digest, request.ID)
+	writeDispatchTupleField(digest, []byte(decision.Subject()))
+	writeDispatchTupleField(digest, []byte(decision.Actor()))
+	writeDispatchTupleField(digest, []byte(decision.ClientID()))
+	writeDispatchTupleField(
+		digest, binary.BigEndian.AppendUint64(nil, request.ClaimFence))
+	writeDispatchTupleField(digest, []byte(request.Outcome))
+	// Target and Reference are part of what makes two reports different. An
+	// earlier version omitted them, so two reports sharing the principal, the
+	// fence and the outcome produced one key — the exact collision the
+	// length-prefixing above was adopted to avoid. It was masked rather than
+	// prevented, because transitionToken folds in the record version.
+	writeDispatchTupleField(digest, []byte(request.Target))
+	writeDispatchTupleField(digest, []byte(request.Reference))
+	return digest.Sum(nil)
 }
 
 func (s *DispatchService) Status(ctx context.Context, request StatusRequest) (ActionRecord, error) {
@@ -1881,6 +2388,71 @@ func holdsClaimOn(decision auth.Decision, record ActionRecord) bool {
 func standingOn(decision auth.Decision, record ActionRecord) bool {
 	return sameActionPrincipal(decision, record) ||
 		sameClaimantPrincipal(decision, record)
+}
+
+// appendClaimHolder adds a holder, dropping the oldest entry past the bound.
+//
+// A holder already present at the same fence is not duplicated: Claim's replay
+// branch returns before applyClaim, so this should not arise, but a retained
+// history is evidence an operator reads and a duplicate in it reads as two
+// attempts where there was one.
+func appendClaimHolder(
+	history []ClaimHolder, holder ClaimHolder,
+) []ClaimHolder {
+	for _, existing := range history {
+		if existing.ClaimFence == holder.ClaimFence &&
+			existing.Subject == holder.Subject {
+			return history
+		}
+	}
+	history = append(history, holder)
+	if len(history) > MaxActionClaimHistory {
+		history = history[len(history)-MaxActionClaimHistory:]
+	}
+	return history
+}
+
+// heldClaimAt reports whether this caller held the record's claim at the fence
+// it names.
+//
+// The current holder is included, because a worker can lose the right to
+// complete without the record being re-claimed — its lease lapses and nothing
+// has taken it yet, which is the common case for a short operation that
+// overran. Both are "held it then, cannot complete now".
+func heldClaimAt(
+	decision auth.Decision, record ActionRecord, fence uint64,
+) bool {
+	if fence == 0 {
+		return false
+	}
+	if record.ClaimFence == fence && sameClaimantPrincipal(decision, record) {
+		return true
+	}
+	for _, holder := range record.ClaimHistory {
+		if holder.ClaimFence != fence {
+			continue
+		}
+		if decision.Subject() != holder.Subject ||
+			decision.Actor() != holder.Actor ||
+			decision.ClientID() != holder.ClientID {
+			continue
+		}
+		left, right := decision.OnBehalfOf(), holder.OnBehalfOf
+		if len(left) != len(right) {
+			continue
+		}
+		matched := true
+		for i := range left {
+			if left[i] != right[i] {
+				matched = false
+				break
+			}
+		}
+		if matched {
+			return true
+		}
+	}
+	return false
 }
 
 // sameClaimantPrincipal reports whether the caller is the principal that holds

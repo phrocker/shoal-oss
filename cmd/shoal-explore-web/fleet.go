@@ -314,6 +314,30 @@ func (r *boundFleetDispatch) CompleteClaim(
 	return r.service.CompleteClaim(ctx, request)
 }
 
+func (r *boundFleetDispatch) ExtendClaim(
+	ctx context.Context,
+	request fleet.ExtendRequest,
+) (fleet.ActionRecord, error) {
+	bound, err := r.requestContext(ctx, request.Context)
+	if err != nil {
+		return fleet.ActionRecord{}, err
+	}
+	request.Context = bound
+	return r.service.ExtendClaim(ctx, request)
+}
+
+func (r *boundFleetDispatch) ReportAmbiguity(
+	ctx context.Context,
+	request fleet.AmbiguityRequest,
+) (fleet.ActionRecord, error) {
+	bound, err := r.requestContext(ctx, request.Context)
+	if err != nil {
+		return fleet.ActionRecord{}, err
+	}
+	request.Context = bound
+	return r.service.ReportAmbiguity(ctx, request)
+}
+
 func (r *boundFleetDispatch) Cancel(
 	ctx context.Context,
 	request fleet.CancelRequest,
