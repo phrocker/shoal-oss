@@ -3891,3 +3891,77 @@ func TestEffectPossibleAnswersTheQuestionItNames(t *testing.T) {
 		}
 	})
 }
+
+// TestInvokeRefusesADispatchOnlyBindingWithoutClaiming is #455: a synchronous
+// invoke against a gateway-bound descriptor marked EffectPossible before
+// reaching any executor.
+//
+// ExecuteClaim asserts the bound reference implements ActionExecutor, and an
+// ExternalEffectBinding deliberately does not — the work reaches a gateway
+// over the dispatch queue and the completion report is what Shoal records, so
+// nothing runs in process. Reached through Invoke, that assertion failed
+// *after* Claim had committed, and Claim sets EffectPossible for an action
+// declaring external mutation or egress.
+//
+// So the record said an effect may have happened, for an action that provably
+// did nothing: the executor resolution failed in this process, before anything
+// was serialized and before anything left the host. The flag is monotonic
+// (#461), so it never washed out — every accidental invoke permanently added a
+// record to the set an operator reconciles by hand.
+//
+// The assertion that matters is not that the call fails. It failed before too.
+// It is that the record is left unclaimed and unmarked.
+func TestInvokeRefusesADispatchOnlyBindingWithoutClaiming(t *testing.T) {
+	fixture := newExecutorClaimFixture(t)
+
+	// An action that declares an external effect, so Claim would mark it.
+	stored := fixture.registryStore.records[fixture.queued.AgentID]
+	descriptor := cloneDescriptor(stored.Descriptor)
+	for capability := range descriptor.Capabilities {
+		for action := range descriptor.Capabilities[capability].Actions {
+			descriptor.Capabilities[capability].Actions[action].Effects =
+				Effects{EffectMutatesExternal}
+		}
+	}
+	stored.Descriptor = descriptor
+	fixture.registryStore.records[fixture.queued.AgentID] = stored
+
+	// A dispatch-only binding: it declares a ceiling and runs nothing.
+	binding, err := NewExternalEffectBinding(Effects{EffectMutatesExternal})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.executors["exec"] = binding
+
+	before := fixture.dispatchStore.records[string(fixture.queued.ID)]
+	if before.EffectPossible {
+		t.Fatal("the queued record already claims a possible effect, so this " +
+			"test cannot tell whether the invoke added one")
+	}
+
+	if _, err := fixture.service.Invoke(fixture.enqueuer, InvokeRequest{
+		Enqueue: dispatchEnqueue(fixture.now, "request"),
+		ClaimID: []byte("invoke-claim"), Lease: time.Minute,
+	}); err == nil {
+		t.Fatal("a synchronous invoke against a dispatch-only binding was " +
+			"accepted, so something ran that cannot run in process")
+	}
+
+	after := fixture.dispatchStore.records[string(fixture.queued.ID)]
+	if after.EffectPossible {
+		t.Fatal("the refused invoke left a record claiming an effect may " +
+			"have happened, for an action whose executor could not run here: " +
+			"the flag is monotonic, so an operator reconciles this by hand " +
+			"forever")
+	}
+	if after.State != DispatchQueued {
+		t.Fatalf("the refused invoke moved the record to %q; it should be "+
+			"left queued and claimable by a worker that can run it",
+			after.State)
+	}
+	if after.ClaimFence != before.ClaimFence {
+		t.Fatalf("the refused invoke advanced the claim fence from %d to %d, "+
+			"so it counts toward what an operator reads as re-claims",
+			before.ClaimFence, after.ClaimFence)
+	}
+}
