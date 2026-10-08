@@ -97,11 +97,33 @@ func (c *Client) AnalyticsInteractionSink() interaction.ResultSink {
 // and exact evidence are both authorized with the supplied fleet action
 // operation. Dispatch lifecycle evidence has already been admitted under that
 // operation and must not require the unrelated retrieve permission.
+//
+// OperationExecute is one of those operations (#437, #480). Omitting it did
+// not merely skip an audit: main.go falls back to the bare client when this
+// returns nil, the bare client has no reconciliation sink, and the auditor
+// answers "trusted interaction reconciliation sink is unavailable" — which
+// classifyAuditError turns into ErrAuditOutcomeUnknown and the dispatch
+// service joins with ErrActionCommitted. Every claim taken under execute
+// committed and then came back 503 "fleet action outcome requires
+// reconciliation", so the capability did not work end to end.
+// fleetActionLifecycleOperation is the set of operations a dispatch lifecycle
+// audit can be admitted under. Shared by the sink and its reconciliation
+// method because they were two separate literal comparisons of the same set,
+// and execute was missing from both — a surface that admits an operation it
+// cannot then reconcile is the 503 above with an extra step.
+func fleetActionLifecycleOperation(operation auth.Operation) bool {
+	switch operation {
+	case auth.OperationDispatch, auth.OperationInvoke, auth.OperationExecute:
+		return true
+	default:
+		return false
+	}
+}
+
 func (c *Client) FleetActionInteractionSink(
 	operation auth.Operation,
 ) interaction.ResultSink {
-	if c == nil ||
-		(operation != auth.OperationDispatch && operation != auth.OperationInvoke) {
+	if c == nil || !fleetActionLifecycleOperation(operation) {
 		return nil
 	}
 	writer, err := c.interactionWriter()
@@ -175,8 +197,7 @@ func (s operationInteractionSink) RecordReconciledInteractionResult(
 	session interaction.Session,
 ) (interaction.Session, error) {
 	if s.client == nil || !capability.Valid() ||
-		(s.operation != auth.OperationDispatch &&
-			s.operation != auth.OperationInvoke) {
+		!fleetActionLifecycleOperation(s.operation) {
 		return interaction.Session{}, shoal.NewError(
 			shoal.ErrorUnavailable,
 			"authorized fleet reconciliation sink is unavailable")

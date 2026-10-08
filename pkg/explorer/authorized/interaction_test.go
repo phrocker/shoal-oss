@@ -614,6 +614,97 @@ func TestFleetActionInteractionSinkUsesLifecycleOperationForEvidence(t *testing.
 		t.Fatalf("invoke-only lifecycle evidence = %v", err)
 	}
 
+	// Execute is the third fleet action operation (#437), and it was missing
+	// from this set — which is #480 item 1. main.go falls back to the bare
+	// client when this returns nil, the bare client has no reconciliation
+	// sink, and the auditor's "trusted interaction reconciliation sink is
+	// unavailable" becomes ErrAuditOutcomeUnknown joined with
+	// ErrActionCommitted. So every claim taken under execute committed and
+	// then answered 503 "fleet action outcome requires reconciliation": the
+	// write landed and the worker was told to reconcile it by hand.
+	executeDecision := f.decision(
+		t, "execute-only", [][]byte{f.sourceA}, [][]byte{f.policyA},
+		[]auth.Operation{auth.OperationExecute},
+	)
+	executeFingerprint, err := auth.AuthorizationFingerprint(executeDecision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	executeSession := session
+	executeSession.ID = interaction.DerivedID("session", "execute-evidence")
+	executeSession.AuthorizationFingerprint =
+		shoal.ID(executeFingerprint.String())
+	executeSession.AuthorizationExpiresAt =
+		executeDecision.AuthenticationExpires()
+	executeSink := f.clientA.FleetActionInteractionSink(auth.OperationExecute)
+	if executeSink == nil {
+		t.Fatal("execute interaction sink is unavailable, so a worker that " +
+			"claimed under execute commits its write and is then answered " +
+			"503 requires-reconciliation")
+	}
+	executeStored, err := executeSink.RecordInteractionResult(
+		f.context(t, executeDecision), executeSession)
+	if err != nil {
+		t.Fatalf("execute-only lifecycle evidence = %v", err)
+	}
+	if executeStored.AuthorizationOperation != string(auth.OperationExecute) {
+		t.Fatalf("authorization operation = %q, want %q",
+			executeStored.AuthorizationOperation, auth.OperationExecute)
+	}
+
+	// The second half, and the reason the predicate is shared: the
+	// reconciliation method compared the same set separately, so admitting
+	// execute at the sink while refusing it here would be the identical 503
+	// with one more step before it.
+	executeReconciler, ok := executeSink.(interface {
+		RecordReconciledInteractionResult(
+			context.Context, explorerfleetcap.Capability, interaction.Session,
+		) (interaction.Session, error)
+	})
+	if !ok {
+		t.Fatal("the execute sink does not support durable reconciliation, " +
+			"which is the sink the auditor actually needs")
+	}
+	// Asserted as parity against an operation already in the set rather than
+	// as a successful write. The durable receipt this fixture's session
+	// carries makes either call fail later in the same way, which is a
+	// property of the fixture and not of the gate — so the question that
+	// matters is whether execute is treated like dispatch, and the gate's own
+	// refusal (ErrorUnavailable, "authorized fleet reconciliation sink is
+	// unavailable") is distinguishable from anything past it.
+	dispatchReconciler, ok := f.clientA.FleetActionInteractionSink(
+		auth.OperationDispatch).(interface {
+		RecordReconciledInteractionResult(
+			context.Context, explorerfleetcap.Capability, interaction.Session,
+		) (interaction.Session, error)
+	})
+	if !ok {
+		t.Fatal("the dispatch sink does not support reconciliation, so there " +
+			"is nothing to compare execute against")
+	}
+	_, dispatchErr := dispatchReconciler.RecordReconciledInteractionResult(
+		f.context(t, decision), explorerfleetcap.New(), executeStored)
+	if shoal.IsErrorCode(dispatchErr, shoal.ErrorUnavailable) {
+		t.Fatalf("the control is not a control: dispatch reconciliation was "+
+			"itself refused by the gate (%v), so execute matching it proves "+
+			"nothing", dispatchErr)
+	}
+	_, executeErr := executeReconciler.RecordReconciledInteractionResult(
+		f.context(t, executeDecision), explorerfleetcap.New(), executeStored)
+	if shoal.IsErrorCode(executeErr, shoal.ErrorUnavailable) {
+		t.Fatalf("execute reconciliation was refused by the operation gate "+
+			"(%v) while dispatch was not (%v): a surface that admits an "+
+			"operation it cannot then reconcile is the same 503 with an "+
+			"extra step", executeErr, dispatchErr)
+	}
+
+	// And the set is still a set: an unrelated operation gets no sink, so
+	// this is not "any operation will do".
+	if stray := f.clientA.FleetActionInteractionSink(
+		auth.OperationRetrieve); stray != nil {
+		t.Fatal("an unrelated operation was handed a fleet lifecycle sink")
+	}
+
 	hidden := f.newClient(
 		t, f.base,
 		edgeHidingInteractionStore{
