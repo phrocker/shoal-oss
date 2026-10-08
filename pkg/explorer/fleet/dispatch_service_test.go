@@ -1341,6 +1341,15 @@ type dispatchRecorder struct {
 
 func (r *dispatchRecorder) RecordAction(_ context.Context, audit ActionAudit) error {
 	r.phases = append(r.phases, audit.Phase)
+	// The real ActionRecorder validates the operation before anything else
+	// (internal/explorerfleet/action_recorder.go:66), so a double that accepts
+	// an invalid one hides every caller that passes one. A fifth review round
+	// found that this double's permissiveness is the same shape of gap as the
+	// no-op event sink: the dependencies that validate are the ones stubbed
+	// with something that does not.
+	if err := audit.Operation.Validate(); err != nil {
+		return err
+	}
 	if r.advance != nil && audit.Phase == "effect_admission" {
 		r.advance()
 	}

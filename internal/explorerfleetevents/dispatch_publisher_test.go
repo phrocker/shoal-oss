@@ -958,6 +958,11 @@ func TestActionEventPublisherStillRequiresTheEnqueuerForCancellation(t *testing.
 		SourceID: []byte("source"), PolicyID: []byte("policy"), ObjectID: "object",
 		UpdatedAt: now.Add(-time.Minute), ClaimID: []byte("worker-claim"),
 		ClaimFence: 1,
+		// action.canceled carries the cancel key as its transition identity.
+		// Without one, actionEventTransition refuses before the identity rule
+		// is consulted at all — which is how this test came to pass against
+		// the very regression it is named for.
+		CancelKey: []byte("cancel-key"),
 	}, now, auth.OperationDispatch)
 	record.Subject = "enqueuer-subject"
 	record.Actor = "enqueuer-actor"
@@ -965,10 +970,19 @@ func TestActionEventPublisherStillRequiresTheEnqueuerForCancellation(t *testing.
 	record.ClaimantActor = "dispatcher"
 	record.TransitionOperation = auth.OperationDispatch
 
-	if err := publisher.PublishActionEvent(
-		context.Background(), "action.canceled", record); err == nil {
+	err = publisher.PublishActionEvent(
+		context.Background(), "action.canceled", record)
+	if err == nil {
 		t.Fatal("a claimant published a cancellation, so the claimant rule " +
 			"reaches a kind the claimant never performs")
+	}
+	// Asserted on the message, like the sibling test, because the refusal has
+	// to come from the identity rule. Any earlier refusal — a missing
+	// transition identity, an operation the record does not carry — would make
+	// this pass while the rule itself was wrong.
+	if !strings.Contains(err.Error(), "does not match durable transition") {
+		t.Fatalf("refused before the identity rule, so this test does not "+
+			"exercise what it is named for: %v", err)
 	}
 }
 

@@ -604,7 +604,18 @@ func (s *DispatchService) ExecuteClaim(ctx context.Context, claimed ActionRecord
 		current.State != DispatchClaimed || !now.Before(current.ClaimLeaseUntil) {
 		return ActionRecord{}, ErrClaimLost
 	}
-	if err := s.recorder.RecordAction(ctx, ActionAudit{Phase: "effect_admission", Operation: current.TransitionOperation, Record: current}); err != nil {
+	// Empty for a record claimed by a build that had no TransitionOperation,
+	// where the claimant was by construction the enqueuer and invoke is what
+	// authorized it. ActionRecorder.RecordAction validates the operation
+	// before anything else, so passing an empty one through would fail the
+	// audit and surface as 503 — reachable across an upgrade through Invoke's
+	// live-claim shortcut. The publisher has the same fallback for the same
+	// reason; this was the one consumer missing it.
+	admissionOperation := current.TransitionOperation
+	if admissionOperation == "" {
+		admissionOperation = auth.OperationInvoke
+	}
+	if err := s.recorder.RecordAction(ctx, ActionAudit{Phase: "effect_admission", Operation: admissionOperation, Record: current}); err != nil {
 		return ActionRecord{}, errors.Join(ErrRecordingUnavailable, err)
 	}
 	invocationDecision, err := s.resolver.Resolve(ctx)
@@ -667,8 +678,18 @@ func (s *DispatchService) ExecuteClaim(ctx context.Context, claimed ActionRecord
 			CorrelationID: current.CorrelationID, Deadline: current.Deadline,
 		})
 	}()
-	// In-process execution reaches here only through the enqueuer, which is
-	// gated on sameActionPrincipal above, so invoke is what authorized it.
+	// Invoke, because this path requires its caller to be both the record's
+	// own principal and the holder of its claim — sameActionPrincipal and
+	// holdsClaimOn, both checked against the stored record above. A caller
+	// satisfying both is the enqueuer that claimed its own action, and the
+	// enqueuer claims under invoke.
+	//
+	// That also makes applyExecutionResult's write of this value provably
+	// redundant here: cloneActionRecord carries the claim's operation forward,
+	// and the only caller who can reach this claimed under invoke too. No
+	// mutation of that assignment is observable, and it is kept because a
+	// future completion route authorized differently would otherwise silently
+	// record the claim's operation instead of its own.
 	return s.applyExecutionResult(
 		ctx, current, action, result, auth.OperationInvoke, executionErr)
 }
@@ -845,10 +866,19 @@ func (s *DispatchService) completeClaim(
 	if !now.Before(current.ClaimLeaseUntil) || !now.Before(current.Deadline) {
 		return ActionRecord{}, ErrClaimLost
 	}
-	// The queued principal is confirmed by authorizedCurrent above, which
-	// refuses a mismatch as not-found rather than unauthorized so a caller
-	// cannot probe for actions belonging to someone else. ExecuteClaim repeats
-	// the check because it is handed a record instead of loading one; here it
+	// The *claimant* is confirmed by holdsClaimOn above, which refuses a
+	// mismatch as not-found rather than unauthorized so a caller cannot probe
+	// for actions belonging to someone else.
+	//
+	// An earlier version of this said the queued principal is confirmed by
+	// authorizedCurrent, and used that to justify omitting a check here. It is
+	// false on the execute route: authorizedClaimant passes
+	// requirePrincipal=false there, so for a foreign claimant the queued
+	// principal is never confirmed at all. What is confirmed is that the
+	// caller holds the claim, which is the right question for a completion and
+	// is why the check it justified omitting is not needed — but the stated
+	// reason was wrong. ExecuteClaim repeats its own checks because it is
+	// handed a record instead of loading one; here it
 	// would be dead code, and a check no test can distinguish implies a
 	// guarantee that is not actually held at this point.
 	//

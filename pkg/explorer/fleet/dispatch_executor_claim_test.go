@@ -29,6 +29,7 @@ type executorClaimFixture struct {
 	enqueuer      context.Context
 	authority     *auth.Authority
 	registryStore *memoryStore
+	dispatchStore *memoryDispatchStore
 	executors     executorMap
 	now           time.Time
 	// clock is what the service and the authority both read, so advancing it
@@ -57,6 +58,7 @@ func newExecutorClaimFixture(t *testing.T) *executorClaimFixture {
 	}
 	registryStore := newMemoryStore()
 	executors := executorMap{"exec": &remoteBoundExecutor{}}
+	dispatchStore := newMemoryDispatchStore()
 	registry, err := NewService(Config{
 		Store: registryStore, Resolver: authority.Resolver(), Recorder: &memoryRecorder{},
 		Snapshots: fixedSnapshot{now},
@@ -70,7 +72,7 @@ func newExecutorClaimFixture(t *testing.T) *executorClaimFixture {
 	descriptor.LeaseExpiresAt = now.Add(24 * time.Hour)
 	registryStore.records["agent"] = Stored{Descriptor: descriptor}
 	service, err := NewDispatchService(DispatchConfig{
-		Store: newMemoryDispatchStore(), Registry: registry,
+		Store: dispatchStore, Registry: registry,
 		Resolver: authority.Resolver(), Recorder: &dispatchRecorder{},
 		Events: dispatchEvents{}, Clock: func() time.Time { return *clock },
 	})
@@ -87,7 +89,7 @@ func newExecutorClaimFixture(t *testing.T) *executorClaimFixture {
 	return &executorClaimFixture{
 		service: service, queued: queued, enqueuer: enqueuer,
 		authority: authority, registryStore: registryStore, now: now,
-		executors: executors, clock: clock,
+		executors: executors, dispatchStore: dispatchStore, clock: clock,
 	}
 }
 
@@ -1541,9 +1543,11 @@ func TestAForgedRecordCannotRetrieveAnothersAction(t *testing.T) {
 // decision, so the list asserts a capability rather than observing one. It
 // happened to be right while every claim was authorized under invoke.
 //
-// Without this, the whole plumbing from authorizedClaimant through applyClaim
-// could be replaced by a hardcoded invoke and only the publisher's own tests
-// would notice — and they set the field by hand, so they would not.
+// Without this, applyClaim's write could be replaced by a hardcoded invoke and
+// only the publisher's own tests would notice — and they set the field by hand,
+// so they would not. The claim half of this test is what catches that;
+// applyExecutionResult's write is not distinguishable by any reachable path,
+// for the reason recorded beside it.
 func TestARecordNamesTheOperationThatAuthorizedItsTransition(t *testing.T) {
 	t.Run("a claim taken under execute", func(t *testing.T) {
 		fixture := newExecutorClaimFixture(t)
@@ -1575,7 +1579,16 @@ func TestARecordNamesTheOperationThatAuthorizedItsTransition(t *testing.T) {
 				claimed.AuthorizedOperations)
 		}
 
-		// The completion is its own transition and records its own operation.
+		// The completion carries it too. This is a consistency check and not
+		// coverage of applyExecutionResult's write: cloneActionRecord carries
+		// the claim's operation forward, and no reachable path completes under
+		// an operation different from the one that claimed — ExecuteClaim
+		// requires its caller to be both the record's principal and its
+		// claimant, and completeClaim resolves the same routes in the same
+		// order. So deleting that assignment is not observable, which the
+		// production comment beside it now says. Asserting it here anyway is
+		// worth the line: if a future route completes under a different
+		// operation, this is what notices the field went stale.
 		done, err := fixture.service.CompleteClaim(worker, CompletionRequest{
 			ID: fixture.queued.ID, ExpectedVersion: claimed.Version,
 			ClaimID: []byte("worker-claim"),
@@ -1608,4 +1621,58 @@ func TestARecordNamesTheOperationThatAuthorizedItsTransition(t *testing.T) {
 				claimed.TransitionOperation)
 		}
 	})
+}
+
+// TestAnUpgradeFindsARecordWithNoTransitionOperation covers the one path where
+// the new field is absent on a live record, which is the case that reaches
+// production and never reaches a test written after the field exists.
+//
+// A record claimed by a build without TransitionOperation decodes with it
+// empty. ActionRecorder.RecordAction validates the operation before anything
+// else, so passing the empty value straight through fails the audit and
+// surfaces as 503 — and the route that gets there is Invoke's live-claim
+// shortcut, which calls ExecuteClaim directly for a record already claimed at
+// the ClaimID presented. The publisher has the same fallback for the same
+// reason; this was the one consumer missing it.
+//
+// Simulated by clearing the field in the store rather than by constructing a
+// record by hand, so the rest of the record is exactly what this build writes
+// and only the one field differs — which is what an upgrade actually looks
+// like.
+func TestAnUpgradeFindsARecordWithNoTransitionOperation(t *testing.T) {
+	fixture := newExecutorClaimFixture(t)
+	fixture.bindExecutor(t, &inProcessExecutor{})
+
+	claimed, err := fixture.service.Claim(fixture.enqueuer, ClaimRequest{
+		ID: fixture.queued.ID, ExpectedVersion: fixture.queued.Version,
+		ClaimID: []byte("own-claim"), Lease: time.Minute,
+		Context: dispatchContext(fixture.now, "request"),
+	})
+	if err != nil {
+		t.Fatalf("the enqueuer could not claim: %v", err)
+	}
+	if claimed.TransitionOperation == "" {
+		t.Fatal("the claim did not record an operation, so clearing it below " +
+			"changes nothing and this test would pass vacuously")
+	}
+
+	// What the previous build left behind: everything else as written, this
+	// one field absent.
+	stored := fixture.dispatchStore.records[string(fixture.queued.ID)]
+	stored.TransitionOperation = ""
+	fixture.dispatchStore.records[string(fixture.queued.ID)] = stored
+
+	// Invoke's live-claim shortcut: same ClaimID, lease still live, so it goes
+	// straight to ExecuteClaim without re-claiming.
+	result, err := fixture.service.Invoke(fixture.enqueuer, InvokeRequest{
+		Enqueue: dispatchEnqueue(fixture.now, "request"),
+		ClaimID: []byte("own-claim"), Lease: time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("a record claimed before TransitionOperation existed cannot "+
+			"be executed after an upgrade: %v", err)
+	}
+	if result.State != DispatchSucceeded {
+		t.Fatalf("the upgraded record did not complete: state=%s", result.State)
+	}
 }
