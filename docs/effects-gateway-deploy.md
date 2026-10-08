@@ -273,10 +273,18 @@ the no-proxy, no-jar and no-redirect rules.
 
 ## Completion: lost responses, and the wire as found on main
 
-**Lost response (permanent).** On a transport error, or a 503 with
-`Shoal-Commit-Outcome: indeterminate`, the report may have committed. The
-client resends the identical body once; the completion route's replay branch
-answers it with the committed record.
+**Lost or unreadable response (permanent).** The report may have committed
+after any of these first answers:
+
+- a transport error, or a 503 with `Shoal-Commit-Outcome: indeterminate`;
+- a 502 or 504 — a proxy in front of the explorer can answer either after the
+  explorer processed the request;
+- a 2xx whose body does not decode, or does not describe this claim's terminal
+  record at exactly the reported version plus one — the route answered
+  success, so something committed, and `protocol` alone would hide it.
+
+The client resends the identical body once; the completion route's replay
+branch answers it with the committed record.
 
 **Every 503 is possibly committed (interim, until #505).** Today
 `ErrExecutionAmbiguous` and `ErrActionCommitted` (a durable write whose
@@ -293,14 +301,14 @@ write, and the trigger narrows back to the header; the resend on a genuinely
 lost response stays.
 
 **After a possibly-committed answer, only a record is definite.** Once the
-first answer was a transport error, any 503, or a #492-shaped 400/500, the
+first answer was any of the above, any 503, or a #492-shaped 400/500, the
 client returns the committed record or `indeterminate`, nothing else:
 
 | resend answered | result |
 |---|---|
-| 200 with the record | the record (`recorded_otherwise` rules apply) |
-| transport error, or any 503 | `indeterminate` |
-| anything else — 409, 404, 400, 500, … | one third read through the replay branch; a record settles it, anything else is `indeterminate` |
+| 2xx with the record | the record (`recorded_otherwise` rules apply) |
+| transport error, any 503, 502 or 504 | `indeterminate` |
+| anything else — 409, 404, 400, 500, a 2xx that is not this report's record, … | one third read through the replay branch; a record settles it, anything else is `indeterminate` |
 
 It never returns the first attempt's status, which describes a request whose
 outcome the resend was sent to learn. A 409 or 404 answering the resend is not
@@ -382,6 +390,8 @@ another fails if a field is added to the log record outside the policy.
 - **Field names must be spelled exactly**, in the route table and the action's
   input, and the startup check also compares `input_schema`.
 - **A DELETE route takes no body**, matching its `InputSchema()`.
-- **The completion resend** recovers a lost response (permanent), until #505
-  any 503, and until #492 a 400 or 500; after any of these only a record is
-  definite, and everything else is `indeterminate`. Not in the design.
+- **The completion resend** recovers a lost or unreadable response — transport
+  error, indeterminate 503, 502, 504, or a 2xx that is not this report's
+  record (permanent) — and, until #505, any 503, and until #492 a 400 or 500;
+  after any of these only a record is definite, and everything else is
+  `indeterminate`. Not in the design.

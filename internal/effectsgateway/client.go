@@ -557,10 +557,12 @@ type Completion struct {
 // a claim about the corpus it never read.
 //
 // A lost response is recovered by resending the identical body once: on a
-// transport error, or on any 503, the report may have committed, and the
+// transport error, any 503, a 502 or 504 (a proxy can answer either after
+// the explorer processed the request), or a 2xx whose body does not decode or
+// does not describe this report's terminal record (the route answered
+// success, so something committed), the report may have committed, and the
 // completion route's replay branch answers a resend with the committed record.
-// The resend on a genuinely lost response (transport error, indeterminate
-// 503) is permanent.
+// The resend on a genuinely lost or unreadable answer is permanent.
 //
 // Every 503 counts, header or not — interim until #505. ErrExecutionAmbiguous
 // and ErrActionCommitted (a durable write whose publication failed) arrive
@@ -580,9 +582,11 @@ type Completion struct {
 // was sent to learn — and it never returns a refusal from the resend as
 // definite either:
 //
-//   - a resend answered by a transport error or any 503 is DispatchIndeterminate;
+//   - a resend answered by a transport error, any 503, or a 502 or 504 is
+//     DispatchIndeterminate;
 //   - a resend answered by anything else that is not a record — 409, 404, the
-//     #492 400/500, or any other status — is followed by one third read
+//     #492 400/500, a 2xx that is not this report's record, or any other
+//     status — is followed by one third read
 //     through the replay branch, and anything but a record is
 //     DispatchIndeterminate.
 //
@@ -653,19 +657,42 @@ func (c *DispatchClient) Complete(ctx context.Context, actionID []byte, completi
 		Failed: completion.Failed,
 	}
 	path := actionPath(actionID, "complete")
-	var response actionWire
 	unconfirmed := func(cause error) error {
 		return &DispatchError{Op: op, Kind: DispatchIndeterminate,
 			reason: "the report may have committed and the resend could not confirm it",
 			cause:  cause}
 	}
-	_, _, err = c.post(ctx, op, path, body, &response)
+	// attempt sends the body and returns this report's terminal record, or an
+	// error. A 2xx whose body does not decode or does not describe this
+	// claim's terminal record is DispatchProtocol, and only a 2xx produces
+	// that kind here.
+	attempt := func() (Action, error) {
+		var response actionWire
+		if _, _, err := c.post(ctx, op, path, body, &response); err != nil {
+			return Action{}, err
+		}
+		action, err := response.decode()
+		if err != nil {
+			return Action{}, &DispatchError{Op: op, Kind: DispatchProtocol, reason: err.Error()}
+		}
+		// The completion route answers 200 only for a fresh terminal write or
+		// a replay of one, both at exactly ExpectedVersion+1, and a terminal
+		// record does not move past that. Any other version is not this
+		// report's record.
+		if !bytes.Equal(action.ID, actionID) || !bytes.Equal(action.ClaimID, completion.ClaimID) ||
+			action.Version != completion.ExpectedVersion+1 ||
+			(action.State != fleet.DispatchSucceeded && action.State != fleet.DispatchFailed) {
+			return Action{}, &DispatchError{Op: op, Kind: DispatchProtocol,
+				reason: "completion response does not describe this claim's terminal record"}
+		}
+		return action, nil
+	}
+	action, err := attempt()
 	if mayHaveCommitted(err) || hidesCommittedRecord(err) {
-		response = actionWire{}
-		_, _, err = c.post(ctx, op, path, body, &response)
+		action, err = attempt()
 		switch {
 		case err == nil:
-		case mayHaveCommitted(err):
+		case answerLost(err):
 			return Action{}, unconfirmed(err)
 		default:
 			// Not a record, and not definite after a possibly-committed
@@ -674,29 +701,17 @@ func (c *DispatchClient) Complete(ctx context.Context, actionID []byte, completi
 			// a genuine error committing nothing — this resend may itself
 			// have committed the report and then had its record discarded.
 			// For a 409, 404 or any other refusal: the first attempt's write
-			// may still be in flight (ErrExecutionAmbiguous). Read once more
-			// through the replay branch; only a record settles it.
-			response = actionWire{}
-			if _, _, err = c.post(ctx, op, path, body, &response); err != nil {
+			// may still be in flight (ErrExecutionAmbiguous). For a 2xx that
+			// is not this report's record: the route answered success, so
+			// something committed. Read once more through the replay branch;
+			// only a record settles it.
+			if action, err = attempt(); err != nil {
 				return Action{}, unconfirmed(err)
 			}
 		}
 	}
 	if err != nil {
 		return Action{}, err
-	}
-	action, err := response.decode()
-	if err != nil {
-		return Action{}, &DispatchError{Op: op, Kind: DispatchProtocol, reason: err.Error()}
-	}
-	// The completion route answers 200 only for a fresh terminal write or a
-	// replay of one, both at exactly ExpectedVersion+1, and a terminal record
-	// does not move past that. Any other version is not this report's record.
-	if !bytes.Equal(action.ID, actionID) || !bytes.Equal(action.ClaimID, completion.ClaimID) ||
-		action.Version != completion.ExpectedVersion+1 ||
-		(action.State != fleet.DispatchSucceeded && action.State != fleet.DispatchFailed) {
-		return Action{}, &DispatchError{Op: op, Kind: DispatchProtocol,
-			reason: "completion response does not describe this claim's terminal record"}
 	}
 	if !recordedAsReported(action, completion) {
 		return action, &DispatchError{Op: op, Kind: DispatchRecordedOtherwise}
@@ -715,19 +730,36 @@ func hidesCommittedRecord(err error) bool {
 			dispatchErr.Status == http.StatusBadRequest)
 }
 
-// mayHaveCommitted is a transport failure or any 503: the request may have
-// been applied and its answer did not arrive, or arrived without saying so.
-//
-// The bare-503 half (DispatchUnavailable) is interim until #505: today
-// ErrExecutionAmbiguous and ErrActionCommitted reach the wire as bare 503s.
-// After #505 a header-less 503 is a clean pre-write refusal, and this narrows
-// to DispatchTransport and DispatchIndeterminate.
+// mayHaveCommitted is an answer after which the report may have committed:
+// a lost answer (answerLost), or a 2xx whose body does not decode or does not
+// describe this report's terminal record. The route answered success, so a
+// write or a replay happened; the identical resend reads the record back
+// through the replay branch rather than returning DispatchProtocol alone.
 func mayHaveCommitted(err error) bool {
-	switch DispatchKind(err) {
+	return answerLost(err) || DispatchKind(err) == DispatchProtocol
+}
+
+// answerLost is a request that may have been applied whose answer did not
+// arrive, or arrived without saying what happened:
+//
+//   - a transport failure, or an indeterminate 503 (permanent);
+//   - a 502 or 504, which a proxy in front of the explorer can answer after
+//     the explorer processed the request (permanent);
+//   - a bare 503 (DispatchUnavailable) — interim until #505: today
+//     ErrExecutionAmbiguous and ErrActionCommitted reach the wire as bare
+//     503s. After #505 a header-less 503 is a clean pre-write refusal and
+//     this case is dropped.
+func answerLost(err error) bool {
+	var dispatchErr *DispatchError
+	if !errors.As(err, &dispatchErr) {
+		return false
+	}
+	switch dispatchErr.Kind {
 	case DispatchTransport, DispatchIndeterminate, DispatchUnavailable:
 		return true
 	}
-	return false
+	return dispatchErr.Status == http.StatusBadGateway ||
+		dispatchErr.Status == http.StatusGatewayTimeout
 }
 
 // recordedAsReported compares the committed record with the report: state,
