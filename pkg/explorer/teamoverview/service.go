@@ -695,6 +695,11 @@ func buildActivities(
 func isFleetAuthorization(value string) bool {
 	switch auth.Operation(value) {
 	case auth.OperationDispatch, auth.OperationInvoke,
+		// Execute authorizes a claim or a completion since #437, so a
+		// lifecycle audit taken under it is fleet activity like any other.
+		// Omitting it classified every such audit as a user interaction, which
+		// surfaced it in the activity feed beside its own fleet_action entry.
+		auth.OperationExecute,
 		auth.OperationAgentRegister, auth.OperationAgentHeartbeat,
 		auth.OperationAgentRevoke, auth.OperationAgentResolve,
 		auth.OperationEventPublish:

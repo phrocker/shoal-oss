@@ -107,15 +107,61 @@ type ActionRecord struct {
 	CreatedAt                      time.Time
 	UpdatedAt                      time.Time
 	ClaimID                        []byte
-	ClaimFence                     uint64
-	ClaimLease                     time.Duration
-	ClaimLeaseUntil                time.Time
-	CancelKey                      []byte
-	ExecutorKey                    []byte
-	EvidenceSnapshotID             shoal.ID
-	EvidenceSnapshotAsOf           time.Time
-	Evidence                       []EvidenceRef
-	EffectPossible                 bool
+	// The claimant's own principal chain, recorded when the claim is taken
+	// and compared when it is reported on.
+	//
+	// ClaimID alone cannot do this job. It is caller-supplied with no entropy
+	// requirement — validateOpaque accepts one to MaxActionIDBytes bytes — and
+	// it is published: Status returns it to every co-principal, and Pull
+	// returns a claimed record whose lease has lapsed, ClaimID included, to
+	// every principal authorized to execute the descriptor. So it identifies
+	// *a* claim, not *who* holds it.
+	//
+	// That distinction did not matter while claiming was gated on
+	// sameActionPrincipal, because the claimant was by construction the
+	// enqueuer and the enqueuer's chain was already on the record. #437 made
+	// the claimant a different principal, at which point the record stopped
+	// carrying any statement of who holds the claim.
+	//
+	// Compared rather than the claim-time ExecutionFingerprint on purpose.
+	// That fingerprint covers policyGeneration, the operation set, the service
+	// role and the selected ontology as well as identity, so a routine policy
+	// reload would change it for every worker at once and strand every
+	// in-flight claim — each one mid-effect, with no way to report. Identity
+	// is the question being asked, so identity is what is stored.
+	// TransitionOperation is the operation that authorized the transition this
+	// record is currently in, as distinct from the operations its enqueuer
+	// held.
+	//
+	// AuthorizedOperations cannot answer this. It accumulates across
+	// transitions and, worse, it accumulates a *claim* rather than a fact:
+	// applyClaim merges decisionOperations(decision, OperationInvoke), and
+	// decisionOperations does not consult the decision at all — it returns the
+	// operation it was handed. So before #437, when every claim was authorized
+	// under invoke, the field happened to be true; after it, a record claimed
+	// under execute still asserts invoke.
+	//
+	// That mattered beyond the audit trail. The event publisher selects an
+	// operation per event kind and then authorizes the publishing decision
+	// against it, so a claim authorized under execute was published under
+	// invoke — which the claimant does not hold — and the publication failed.
+	// A failed publication is reported as ErrActionCommitted, so the write
+	// landed and the worker was told to reconcile. Recording the real
+	// operation is what lets the publisher ask the right question.
+	TransitionOperation  auth.Operation
+	ClaimantSubject      shoal.ID
+	ClaimantActor        shoal.ID
+	ClaimantClientID     shoal.ID
+	ClaimantOnBehalfOf   []shoal.ID
+	ClaimFence           uint64
+	ClaimLease           time.Duration
+	ClaimLeaseUntil      time.Time
+	CancelKey            []byte
+	ExecutorKey          []byte
+	EvidenceSnapshotID   shoal.ID
+	EvidenceSnapshotAsOf time.Time
+	Evidence             []EvidenceRef
+	EffectPossible       bool
 	// AdmittedEffects is the effect set a pre-call admission declared it was
 	// about to perform. Empty on an action that was dispatched rather than
 	// admitted.
@@ -574,6 +620,36 @@ func (r ActionRecord) Validate() error {
 			return err
 		}
 	}
+	// The claimant's chain is bounded and validated exactly like the
+	// enqueuer's. It reaches the record from a decision rather than from a
+	// request body, so this is defence in depth and nothing more — an earlier
+	// version of this comment claimed it guarded a record decoded from an
+	// older encoding, which cannot happen: such a record has no claimant chain
+	// at all, not an over-long one. What it does guard is a corrupt or
+	// tampered stored value.
+	if err := shoal.ValidateOptionalID(
+		"action claimant", r.ClaimantSubject); err != nil {
+		return err
+	}
+	if err := shoal.ValidateOptionalID(
+		"action claimant actor", r.ClaimantActor); err != nil {
+		return err
+	}
+	if err := shoal.ValidateOptionalID(
+		"action claimant client", r.ClaimantClientID); err != nil {
+		return err
+	}
+	if len(r.ClaimantOnBehalfOf) > auth.MaxOnBehalfOfEntries {
+		return shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			"action claimant delegation chain exceeds its bound")
+	}
+	for _, identity := range r.ClaimantOnBehalfOf {
+		if err := shoal.ValidateRequiredID(
+			"action claimant delegation identity", identity); err != nil {
+			return err
+		}
+	}
 	if r.PolicyGeneration <= 0 || r.AuthorizationExpiresAt.IsZero() {
 		return shoal.NewError(shoal.ErrorInvalidArgument, "action authorization provenance is incomplete")
 	}
@@ -985,6 +1061,8 @@ func cloneActionRecord(input ActionRecord) ActionRecord {
 	result.OnBehalfOf = append([]shoal.ID(nil), input.OnBehalfOf...)
 	result.AuthorizedOperations = append([]auth.Operation(nil), input.AuthorizedOperations...)
 	result.ClaimID = append([]byte(nil), input.ClaimID...)
+	result.ClaimantOnBehalfOf = append(
+		[]shoal.ID(nil), input.ClaimantOnBehalfOf...)
 	result.CancelKey = append([]byte(nil), input.CancelKey...)
 	result.ExecutorKey = append([]byte(nil), input.ExecutorKey...)
 	result.Evidence = cloneActionEvidence(input.Evidence)

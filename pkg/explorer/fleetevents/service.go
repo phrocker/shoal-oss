@@ -252,7 +252,7 @@ func (s *Service) Delete(ctx context.Context, request DeleteRequest) error {
 }
 
 func (s *Service) Publish(ctx context.Context, request PublishRequest) (PublishResult, error) {
-	if _, reserved := lifecycleOperation(request.Event.Kind); reserved {
+	if isReservedLifecycleKind(request.Event.Kind) {
 		return PublishResult{}, shoal.NewError(
 			shoal.ErrorInvalidArgument,
 			"fleet lifecycle event kinds require trusted publication",
@@ -273,10 +273,7 @@ func (s *Service) PublishLifecycle(
 			shoal.ErrorUnauthorized,
 			"fleet lifecycle capability is invalid")
 	}
-	expected, trusted := lifecycleOperation(request.Event.Kind)
-	enqueueInvoke := request.Event.Kind == "action.enqueued" &&
-		operation == auth.OperationInvoke
-	if !trusted || operation != expected && !enqueueInvoke {
+	if !lifecyclePublicationPermits(request.Event.Kind, operation) {
 		return PublishResult{}, shoal.NewError(
 			shoal.ErrorInvalidArgument, "fleet lifecycle publication operation is invalid")
 	}
@@ -291,15 +288,63 @@ func (s *Service) PublishLifecycle(
 	return s.publish(ctx, operation, request, false, &receipt)
 }
 
-func lifecycleOperation(kind string) (auth.Operation, bool) {
+// isReservedLifecycleKind reports whether a kind is one of the five the public
+// Publish route refuses outright. Reserved and permitted are two questions:
+// this one is about who may publish at all, the one below about which
+// operation authorizes a particular kind.
+func isReservedLifecycleKind(kind string) bool {
 	switch kind {
-	case "action.enqueued", "action.canceled":
-		return auth.OperationDispatch, true
-	case "action.claimed", "action.completed", "action.failed":
-		return auth.OperationInvoke, true
+	case "action.enqueued", "action.canceled",
+		"action.claimed", "action.completed", "action.failed":
+		return true
 	default:
-		return "", false
+		return false
 	}
+}
+
+// lifecyclePublicationPermits reports whether an operation may publish a
+// lifecycle event of this kind.
+//
+// Each kind lists every operation that can legitimately have authorized the
+// transition it describes, which is more than one for two of them.
+//
+// An enqueue is authorized by dispatch or by invoke, because a synchronous
+// invoke enqueues as a side effect of running the work.
+//
+// A claim or a completion is authorized by invoke or by execute. Execute is
+// the one #437 added: a principal granted it on the action's descriptor may
+// claim and complete work it did not enqueue, and need not hold invoke at all.
+// This gate previously admitted invoke alone, which did not merely mislabel
+// such an event — the publication was refused, and a refused publication is
+// returned as ErrActionCommitted, so the transition was durably written and
+// the worker was told to reconcile an outcome that had in fact been recorded.
+//
+// A cancellation is dispatch only. It is the enqueuer's lever, and no
+// execute-holder can reach Cancel.
+//
+// Written as an explicit set rather than one expected operation with an ad-hoc
+// exception beside it, which is what it replaced: the exception for an
+// invoke-authorized enqueue was a bare boolean at the call site, and adding a
+// second one for execute would have left the real rule spread across two
+// places.
+func lifecyclePublicationPermits(kind string, operation auth.Operation) bool {
+	var permitted []auth.Operation
+	switch kind {
+	case "action.enqueued":
+		permitted = []auth.Operation{auth.OperationDispatch, auth.OperationInvoke}
+	case "action.canceled":
+		permitted = []auth.Operation{auth.OperationDispatch}
+	case "action.claimed", "action.completed", "action.failed":
+		permitted = []auth.Operation{auth.OperationInvoke, auth.OperationExecute}
+	default:
+		return false
+	}
+	for _, candidate := range permitted {
+		if operation == candidate {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Service) publish(

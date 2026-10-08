@@ -201,8 +201,11 @@ func (s *DispatchService) Invoke(ctx context.Context, request InvokeRequest) (Ac
 		if authorizeErr != nil {
 			return ActionRecord{}, authorizeErr
 		}
-		current, currentErr := s.authorizedCurrent(
-			ctx, decision, queued.ID, auth.OperationInvoke, now,
+		// The enqueue replay path: the caller is by definition the principal
+		// that enqueued, so the principal requirement is kept rather than
+		// relaxed with the claimant routes.
+		current, _, currentErr := s.authorizedCurrent(
+			ctx, decision, queued.ID, auth.OperationInvoke, true, now,
 		)
 		if currentErr != nil {
 			return ActionRecord{}, currentErr
@@ -232,7 +235,7 @@ func (s *DispatchService) Invoke(ctx context.Context, request InvokeRequest) (Ac
 func (s *DispatchService) Claim(ctx context.Context, request ClaimRequest) (ActionRecord, error) {
 	ctx, cancel := s.deadline(ctx, request.Context)
 	defer cancel()
-	decision, now, err := s.begin(ctx, auth.OperationInvoke, request.Context)
+	decision, now, err := s.beginClaimant(ctx, request.Context)
 	if err != nil {
 		return ActionRecord{}, err
 	}
@@ -245,7 +248,8 @@ func (s *DispatchService) Claim(ctx context.Context, request ClaimRequest) (Acti
 	if request.ExpectedVersion == 0 || request.Lease <= 0 || request.Lease > MaxActionClaimTTL {
 		return ActionRecord{}, shoal.NewError(shoal.ErrorInvalidArgument, "claim version or lease is invalid")
 	}
-	current, err := s.authorizedCurrent(ctx, decision, request.ID, auth.OperationInvoke, now)
+	current, claimedAction, authorizing, err := s.authorizedClaimant(
+		ctx, decision, request.ID, now)
 	if err != nil {
 		return ActionRecord{}, err
 	}
@@ -265,10 +269,23 @@ func (s *DispatchService) Claim(ctx context.Context, request ClaimRequest) (Acti
 		return ActionRecord{}, auth.ObjectNotFound()
 	}
 	if current.Version != request.ExpectedVersion {
+		// A replayed claim: this caller's own claim landed and the response
+		// was lost, so return the record it already holds rather than a
+		// conflict against its own write.
+		//
+		// The claimant check belongs here for the same reason it belongs in
+		// completeClaim. Without it the branch keys on ClaimID, version and
+		// lease alone — all three of which a second execute-holder knows,
+		// because Pull returns a claimed record whose lease has lapsed with
+		// its ClaimID and version intact. That caller would receive the full
+		// record of a live claim it does not hold, including the action's
+		// input, which Pull deliberately withholds by excluding live-claimed
+		// records from the page.
 		if current.State == DispatchClaimed &&
 			current.Version == request.ExpectedVersion+1 &&
 			bytes.Equal(current.ClaimID, request.ClaimID) &&
-			current.ClaimLease == request.Lease {
+			current.ClaimLease == request.Lease &&
+			holdsClaimOn(decision, current) {
 			if err := s.publishTransition(
 				context.WithoutCancel(ctx), "action.claimed", current,
 			); err != nil {
@@ -276,40 +293,69 @@ func (s *DispatchService) Claim(ctx context.Context, request ClaimRequest) (Acti
 			}
 			return cloneActionRecord(current), nil
 		}
+		// A version mismatch is the first answer this route produces, so it is
+		// also the first place the record's existence can leak.
+		//
+		// Concealed only when Pull withholds the record. An earlier version of
+		// this concealed it unconditionally on the argument that a caller
+		// holding the right version never reaches this branch — which ignores
+		// the ordinary claim race. Two execute-holders pull the same page, one
+		// claims, and the other arrives here with the version it was handed.
+		// It needs a conflict so it re-pulls; a not-found for work it just saw
+		// in its own page is both useless and false.
+		if concealFrom(decision, current, now) {
+			return ActionRecord{}, auth.ObjectNotFound()
+		}
 		return ActionRecord{}, ErrActionConflict
 	}
+	// The three remaining answers are each the real reason for a caller with
+	// standing, and the answer an absent action gets otherwise. The
+	// live-claimed branch had no such check at all until a review found it:
+	// Pull withholds a live-claimed record, so claiming one by a guessed ID
+	// was returning a distinguishable conflict.
+	//
+	// concealFrom's observable-through-Pull disjunct is dead in all three,
+	// because each branch's own condition already implies Pull withholds the
+	// record. Only the version mismatch above exercises it. They use the same
+	// predicate anyway so that the rule is stated once rather than three times
+	// with one of them subtly different, which is how the live-claimed branch
+	// came to have no check in the first place.
 	if current.State == DispatchClaimed && now.Before(current.ClaimLeaseUntil) {
+		if concealFrom(decision, current, now) {
+			return ActionRecord{}, auth.ObjectNotFound()
+		}
 		return ActionRecord{}, ErrActionConflict
 	}
 	if current.State.terminal() {
+		if concealFrom(decision, current, now) {
+			return ActionRecord{}, auth.ObjectNotFound()
+		}
 		return ActionRecord{}, ErrActionTerminal
 	}
 	if !now.Before(current.Deadline) {
+		if concealFrom(decision, current, now) {
+			return ActionRecord{}, auth.ObjectNotFound()
+		}
 		return ActionRecord{}, ErrClaimLost
 	}
 	// Resolved for the declared Effect, which decides whether claiming this
 	// action already makes an effect possible.
 	//
-	// authorizedCurrent above has already resolved the action and refused a
-	// descriptor revoked, re-registered or narrowed since it was queued, so
-	// this adds no authorization — it is how the declaration is obtained, since
-	// authorizedCurrent discards what it resolved.
-	_, claimedAction, _, err := s.registry.resolveActionBinding(
-		ctx, decision, current.AgentID, current.AgentGeneration,
-		current.Capability, current.Action, current.SourceID, current.PolicyID,
-		current.ObjectID, auth.OperationInvoke, now,
-	)
-	if err != nil {
-		return ActionRecord{}, err
-	}
+	// The declaration comes from authorizedClaimant, which resolved it under
+	// whichever operation authorized this caller. This used to re-resolve with
+	// a hardcoded OperationInvoke under a comment saying it added no
+	// authorization — true while invoke was the only way in, and false the
+	// moment execute existed, because it then refused every worker authorized
+	// under execute.
 	next := cloneActionRecord(current)
 	next.Version++
 	next, err = applyClaim(
-		next, claimedAction, request.ClaimID, request.Lease, decision, now)
+		next, claimedAction, request.ClaimID, request.Lease,
+		decision, authorizing, now)
 	if err != nil {
 		return ActionRecord{}, err
 	}
-	if err := s.recorder.RecordAction(ctx, ActionAudit{Phase: "claim_admission", Operation: auth.OperationInvoke, Record: next}); err != nil {
+	if err := s.recorder.RecordAction(ctx, ActionAudit{Phase: "claim_admission", Operation: authorizing, Record: next}); err != nil {
 		return ActionRecord{}, errors.Join(ErrRecordingUnavailable, err)
 	}
 	stored, err := s.store.ApplyAction(ctx, DispatchMutation{
@@ -347,9 +393,11 @@ func applyClaim(
 	claimID []byte,
 	lease time.Duration,
 	decision auth.Decision,
+	authorizing auth.Operation,
 	now time.Time,
 ) (ActionRecord, error) {
 	record.State = DispatchClaimed
+	record.TransitionOperation = authorizing
 	// An external-effect action is possibly-effected from the moment it is
 	// claimed, not from the moment it is executed.
 	//
@@ -376,6 +424,15 @@ func applyClaim(
 		record.EffectPossible = true
 	}
 	record.ClaimID = append([]byte(nil), claimID...)
+	// Who holds the claim, as distinct from which claim is held. A re-claim
+	// after a lapsed lease overwrites these, which is correct: the new
+	// claimant is the one that may report, and the previous one has already
+	// lost the fence.
+	record.ClaimantSubject = decision.Subject()
+	record.ClaimantActor = decision.Actor()
+	record.ClaimantClientID = decision.ClientID()
+	record.ClaimantOnBehalfOf = append(
+		[]shoal.ID(nil), decision.OnBehalfOf()...)
 	record.ClaimFence++
 	record.ClaimLease = lease
 	record.ClaimLeaseUntil = now.Add(lease)
@@ -383,12 +440,26 @@ func applyClaim(
 		record.ClaimLeaseUntil = record.Deadline
 	}
 	record.UpdatedAt = now
-	record.Actor = decision.Actor()
+	// Actor is deliberately not written here. It names the principal the record
+	// belongs to, which sameActionPrincipal compares, and it is not a
+	// per-transition field however much the two lines below look like company.
+	//
+	// This used to assign decision.Actor() and was a no-op: the claimant was by
+	// construction the enqueuer, because claiming required the principal to
+	// match. #437 made a third party able to claim, and the same line then
+	// overwrote the record's principal — permanently, since the completion path
+	// clones the record forward and never restores it. The enqueuer was then
+	// refused Status and Cancel on its own in-flight action by the predicate
+	// that had just been handed the claimant's identity, with no fallback:
+	// TeamActions needs an operation fleet principals do not hold.
+	//
+	// So a claim records who holds the claim in ClaimID and the transition
+	// provenance below, and leaves the record's own principal alone.
 	record.TransitionRequestID = decision.RequestID()
 	record.TransitionCorrelationID = decision.CorrelationID()
 	record.AuthorizedOperations = canonicalOperations(append(
 		record.AuthorizedOperations,
-		decisionOperations(decision, auth.OperationInvoke)...))
+		decisionOperations(decision, authorizing)...))
 	fingerprint, err := auth.AuthorizationFingerprint(decision)
 	if err != nil {
 		return ActionRecord{}, err
@@ -411,6 +482,36 @@ func (s *DispatchService) ExecuteClaim(ctx context.Context, claimed ActionRecord
 	}
 	if !sameActionPrincipal(decision, claimed) {
 		return ActionRecord{}, shoal.NewError(shoal.ErrorUnauthorized, "execution identity does not match queued action")
+	}
+	// And the caller must hold the claim it is about to execute, not merely be
+	// the record's principal.
+	//
+	// This is the same gate completeClaim applies, and it has to be here too
+	// because Invoke reaches a terminal write without going through
+	// completeClaim at all: it calls Claim, and on a record already claimed at
+	// the presented ClaimID it calls straight through to here. So narrowing
+	// only the completion path left the hole open through a second door, which
+	// a review found by walking the entry points rather than the predicate.
+	//
+	// What it closed: an enqueuer reads the live ClaimID off Status — which
+	// Status discloses to every co-principal — and Invokes with it while a
+	// worker holds the claim. The in-process executor runs, the record goes
+	// terminal, and the worker's own report is then recognised by the replay
+	// branch and answered with a 200 carrying the enqueuer's output. A worker
+	// that performed the work is told it was recorded, as something else.
+	//
+	// Verified by execution. An earlier version of this comment scoped it to
+	// "only reachable where an in-process executor is bound" and said a
+	// gateway reference is refused earlier for want of an ActionExecutor. Both
+	// halves are wrong and the second is wrong structurally: the executor type
+	// assertion lives in resolveAction, which this function reaches *after*
+	// these gates, so nothing about an executor binding can refuse ahead of
+	// them. And pkg/explorer/webapi.AskExecutor is a real in-process
+	// ActionExecutor for explorer.reason/ask, so the hole was live in the
+	// shipped configuration rather than confined to a hypothetical one.
+	if !holdsClaimOn(decision, claimed) {
+		return ActionRecord{}, shoal.NewError(
+			shoal.ErrorUnauthorized, "execution identity does not hold the claim")
 	}
 	_, action, executor, err := s.registry.resolveAction(
 		ctx, decision, claimed.AgentID, claimed.AgentGeneration,
@@ -439,6 +540,10 @@ func (s *DispatchService) ExecuteClaim(ctx context.Context, claimed ActionRecord
 		}
 		return ActionRecord{}, err
 	}
+	storedDecision, err := s.resolver.Resolve(ctx)
+	if err != nil {
+		return ActionRecord{}, err
+	}
 	// The durable marker identifies admissions regardless of their identity
 	// format, including admissions written before the reserved prefix existed.
 	// This check rejects those records without treating an ordinary action in
@@ -453,7 +558,37 @@ func (s *DispatchService) ExecuteClaim(ctx context.Context, claimed ActionRecord
 	if current.isAdmission() {
 		return ActionRecord{}, auth.ObjectNotFound()
 	}
-	if current.State.terminal() && current.Version == claimed.Version+1 &&
+	// Against the stored record, and above the replay branch below it.
+	//
+	// The gates at the top of this function compare against the argument, and
+	// the argument is the caller's. A caller that writes its own principal
+	// into both the action slots and the claimant slots of a fabricated record
+	// satisfies them both, and the branch below then returns the *stored*
+	// record — its input, its executor key, its claim ID and its claimant —
+	// for any (ID, ClaimID, version, fence) tuple it can produce. Pull hands
+	// every one of those to any execute-holder once a lease lapses.
+	//
+	// So the checks that matter are these, not those. The ones above stay as a
+	// cheap early refusal on the normal path, where the argument is a record
+	// this service just produced.
+	//
+	// Normalised to not-found rather than unauthorized, because distinguishing
+	// them tells a caller that the action exists — the same three-way oracle
+	// (absent / present with the wrong claim / present with the right one)
+	// that the refusals in Claim were normalised to close.
+	if !sameActionPrincipal(storedDecision, current) ||
+		!holdsClaimOn(storedDecision, current) {
+		return ActionRecord{}, auth.ObjectNotFound()
+	}
+	// Succeeded or failed only, matching completeClaim's replay branch and for
+	// its reason: Cancel also lands on a terminal state at exactly version+1
+	// while preserving the ClaimID it cancelled, so accepting any terminal
+	// state would hand a late caller the cancelled record and a success.
+	// Unreachable through Invoke today, since Cancel refuses a live claim and
+	// this function requires one, but it is the same asymmetry and it should
+	// not read differently in the two places.
+	if (current.State == DispatchSucceeded || current.State == DispatchFailed) &&
+		current.Version == claimed.Version+1 &&
 		current.ClaimFence == claimed.ClaimFence &&
 		bytes.Equal(current.ClaimID, claimed.ClaimID) {
 		if err := s.publishTransition(
@@ -469,7 +604,18 @@ func (s *DispatchService) ExecuteClaim(ctx context.Context, claimed ActionRecord
 		current.State != DispatchClaimed || !now.Before(current.ClaimLeaseUntil) {
 		return ActionRecord{}, ErrClaimLost
 	}
-	if err := s.recorder.RecordAction(ctx, ActionAudit{Phase: "effect_admission", Operation: auth.OperationInvoke, Record: current}); err != nil {
+	// Empty for a record claimed by a build that had no TransitionOperation,
+	// where the claimant was by construction the enqueuer and invoke is what
+	// authorized it. ActionRecorder.RecordAction validates the operation
+	// before anything else, so passing an empty one through would fail the
+	// audit and surface as 503 — reachable across an upgrade through Invoke's
+	// live-claim shortcut. The publisher has the same fallback for the same
+	// reason; this was the one consumer missing it.
+	admissionOperation := current.TransitionOperation
+	if admissionOperation == "" {
+		admissionOperation = auth.OperationInvoke
+	}
+	if err := s.recorder.RecordAction(ctx, ActionAudit{Phase: "effect_admission", Operation: admissionOperation, Record: current}); err != nil {
 		return ActionRecord{}, errors.Join(ErrRecordingUnavailable, err)
 	}
 	invocationDecision, err := s.resolver.Resolve(ctx)
@@ -478,6 +624,19 @@ func (s *DispatchService) ExecuteClaim(ctx context.Context, claimed ActionRecord
 	}
 	if !sameActionPrincipal(invocationDecision, current) {
 		return ActionRecord{}, shoal.NewError(shoal.ErrorUnauthorized, "invocation identity changed")
+	}
+	// Re-checked against the record as stored. The entry gate above compares
+	// against a record the caller handed in, so on any path where that record
+	// is not the one this service just loaded, this is the check that binds.
+	//
+	// Either one alone refuses the reachable cases, so a mutation deleting one
+	// of them survives and only deleting both is caught — the same property
+	// the sameActionPrincipal pair above it has. That is what defence in depth
+	// looks like under mutation testing, and it is the reason to say so here:
+	// neither is dead code, and the next reader should delete neither.
+	if !holdsClaimOn(invocationDecision, current) {
+		return ActionRecord{}, shoal.NewError(
+			shoal.ErrorUnauthorized, "invocation identity does not hold the claim")
 	}
 	_, action, executor, err = s.registry.resolveAction(
 		ctx, invocationDecision, current.AgentID, current.AgentGeneration,
@@ -519,7 +678,20 @@ func (s *DispatchService) ExecuteClaim(ctx context.Context, claimed ActionRecord
 			CorrelationID: current.CorrelationID, Deadline: current.Deadline,
 		})
 	}()
-	return s.applyExecutionResult(ctx, current, action, result, executionErr)
+	// Invoke, because this path requires its caller to be both the record's
+	// own principal and the holder of its claim — sameActionPrincipal and
+	// holdsClaimOn, both checked against the stored record above. A caller
+	// satisfying both is the enqueuer that claimed its own action, and the
+	// enqueuer claims under invoke.
+	//
+	// That also makes applyExecutionResult's write of this value provably
+	// redundant here: cloneActionRecord carries the claim's operation forward,
+	// and the only caller who can reach this claimed under invoke too. No
+	// mutation of that assignment is observable, and it is kept because a
+	// future completion route authorized differently would otherwise silently
+	// record the claim's operation instead of its own.
+	return s.applyExecutionResult(
+		ctx, current, action, result, auth.OperationInvoke, executionErr)
 }
 
 // CompleteClaim records the outcome of work a remote executor performed out of
@@ -571,7 +743,7 @@ func (s *DispatchService) completeClaim(
 ) (ActionRecord, error) {
 	ctx, cancel := s.deadline(ctx, request.Context)
 	defer cancel()
-	decision, now, err := s.begin(ctx, auth.OperationInvoke, request.Context)
+	decision, now, err := s.beginClaimant(ctx, request.Context)
 	if err != nil {
 		return ActionRecord{}, err
 	}
@@ -591,11 +763,60 @@ func (s *DispatchService) completeClaim(
 		return ActionRecord{}, shoal.NewError(
 			shoal.ErrorInvalidArgument, "a failed completion requires an error code")
 	}
-	current, err := s.authorizedCurrent(ctx, decision, request.ID, auth.OperationInvoke, now)
+	current, action, authorizing, err := s.authorizedClaimant(
+		ctx, decision, request.ID, now)
 	if err != nil {
 		return ActionRecord{}, err
 	}
 	if refuseAdmissions && current.isAdmission() {
+		return ActionRecord{}, auth.ObjectNotFound()
+	}
+	// Only the principal holding the claim may report on it, and this runs
+	// before the replay branch rather than after.
+	//
+	// Ordering is the whole point. The replay branch exists so a worker whose
+	// response was lost gets its own committed outcome back instead of a
+	// conflict, and it keys on version and ClaimID. Placed after it, this
+	// check would still refuse the write — but a hijacker's write would
+	// already have landed, and the branch would then hand the real worker a
+	// 200 carrying the hijacker's output, telling it the work it actually
+	// performed was recorded when the record says something else.
+	//
+	// Concealed rather than refused, for the same reason every other refusal
+	// on these routes is: this one is reachable by every principal authorized
+	// to execute the descriptor, so a distinguishable error is the #398
+	// oracle. An earlier version of this comment argued the opposite — that
+	// the caller demonstrably knows the action exists because it presented a
+	// version and a ClaimID — and the code three lines below it already did
+	// the concealing. The argument was also wrong: presenting a guessed ID
+	// with any version is exactly how the probe works.
+	//
+	// The record's own principal is accepted only where the claim predates
+	// this field. That is narrower than it first shipped, and the narrowing
+	// closes a hole rather than tidying one.
+	//
+	// The reason to accept it at all is backward compatibility. Claiming and
+	// completing were both gated on sameActionPrincipal, so the claimant was
+	// always the enqueuer and no record needed to say so; every record written
+	// before ClaimantSubject existed therefore has an empty claimant chain and
+	// a legitimate reporter that is the record's own principal. Requiring the
+	// claimant alone would refuse all of them.
+	//
+	// The reason to accept it *only* then is that the enqueuer is otherwise
+	// just another principal that is not the claimant. Two things an earlier
+	// version of this comment asserted to excuse it are false, and both were
+	// checked: the enqueuer cannot "cancel it at any moment", because Cancel
+	// refuses while a claim is live and it must wait for the lease to lapse;
+	// and fabricating its own action's outcome does not "harm only itself",
+	// because the replay branch below then hands the worker that performed the
+	// effect a 200 carrying the fabrication — the identical failure this gate
+	// exists to prevent, with a narrower attacker.
+	//
+	// Nothing needs the wider form. An admission grant is claimed through
+	// applyClaim like any other, so it carries a claimant chain, and
+	// AdmissionService.Report already demands the record's own principal — so
+	// for every admission this build writes, the claimant check alone passes.
+	if !holdsClaimOn(decision, current) {
 		return ActionRecord{}, auth.ObjectNotFound()
 	}
 	// A replayed report. The action is already terminal at the version this
@@ -645,31 +866,34 @@ func (s *DispatchService) completeClaim(
 	if !now.Before(current.ClaimLeaseUntil) || !now.Before(current.Deadline) {
 		return ActionRecord{}, ErrClaimLost
 	}
-	// The queued principal is confirmed by authorizedCurrent above, which
-	// refuses a mismatch as not-found rather than unauthorized so a caller
-	// cannot probe for actions belonging to someone else. ExecuteClaim repeats
-	// the check because it is handed a record instead of loading one; here it
+	// The *claimant* is confirmed by holdsClaimOn above, which refuses a
+	// mismatch as not-found rather than unauthorized so a caller cannot probe
+	// for actions belonging to someone else.
+	//
+	// An earlier version of this said the queued principal is confirmed by
+	// authorizedCurrent, and used that to justify omitting a check here. It is
+	// false on the execute route: authorizedClaimant passes
+	// requirePrincipal=false there, so for a foreign claimant the queued
+	// principal is never confirmed at all. What is confirmed is that the
+	// caller holds the claim, which is the right question for a completion and
+	// is why the check it justified omitting is not needed — but the stated
+	// reason was wrong. ExecuteClaim repeats its own checks because it is
+	// handed a record instead of loading one; here it
 	// would be dead code, and a check no test can distinguish implies a
 	// guarantee that is not actually held at this point.
 	//
 	// Resolved for the Action, which carries the OutputSchema the report is
 	// validated against. authorizedCurrent above already resolved it once and
-	// refuses a descriptor revoked, re-registered or narrowed since the claim,
-	// so this is not a second authorization check — it is how the declared
-	// schema is obtained, since authorizedCurrent discards it.
-	_, action, _, err := s.registry.resolveActionBinding(
-		ctx, decision, current.AgentID, current.AgentGeneration,
-		current.Capability, current.Action, current.SourceID, current.PolicyID,
-		current.ObjectID, auth.OperationInvoke, now,
-	)
-	if err != nil {
-		return ActionRecord{}, err
-	}
+	// refuses a descriptor revoked, re-registered or narrowed since the claim.
+	// The declared schema comes back from it rather than from a second resolve
+	// with a hardcoded operation, which would refuse a worker authorized under
+	// execute.
 	var executionErr error
 	if request.Failed {
 		executionErr = shoal.NewError(shoal.ErrorInternal, "remote executor reported failure")
 	}
-	return s.applyExecutionResult(ctx, current, action, request.Result, executionErr)
+	return s.applyExecutionResult(
+		ctx, current, action, request.Result, authorizing, executionErr)
 }
 
 // applyExecutionResult is the terminal transition: it turns an ExecutionResult
@@ -689,10 +913,15 @@ func (s *DispatchService) applyExecutionResult(
 	current ActionRecord,
 	action Action,
 	result ExecutionResult,
+	authorizing auth.Operation,
 	executionErr error,
 ) (ActionRecord, error) {
 	finishNow := s.clock().UTC()
 	next := cloneActionRecord(current)
+	// The completion is a transition of its own and is authorized separately
+	// from the claim, so it records its own operation rather than inheriting
+	// the claim's.
+	next.TransitionOperation = authorizing
 	next.Version++
 	next.UpdatedAt = finishNow
 	next.EffectPossible = true
@@ -753,19 +982,26 @@ func (s *DispatchService) applyExecutionResult(
 	if err != nil {
 		return ActionRecord{}, errors.Join(ErrExecutionAmbiguous, err)
 	}
-	if !sameActionPrincipal(finalDecision, current) {
+	// Still authorized by either of the routes that let the caller take this
+	// work, re-evaluated against a decision resolved after the effect.
+	//
+	// This was sameActionPrincipal plus a resolveActionBinding with a hardcoded
+	// OperationInvoke, and it is the most expensive place that pairing could
+	// have been wrong: it runs *after* the external effect, so an executor
+	// refused here has performed the work and is then told its completion is
+	// ambiguous. A worker authorized under execute would have failed every
+	// completion at the last step, which looks exactly like the lease-loss case
+	// the ambiguity is reserved for.
+	//
+	// claimableBy resolves the binding itself, so this is one check rather than
+	// two and cannot disagree with the one Pull and Claim use.
+	stillClaimable, authorizeErr := s.claimableBy(ctx, finalDecision, current, finishNow)
+	if authorizeErr != nil {
+		return ActionRecord{}, errors.Join(ErrExecutionAmbiguous, authorizeErr)
+	}
+	if !stillClaimable {
 		return ActionRecord{}, errors.Join(ErrExecutionAmbiguous,
 			shoal.NewError(shoal.ErrorUnauthorized, "terminal execution identity changed"))
-	}
-	// Binding, not execution. This runs on the remote path too, where there is
-	// no in-process executor to assert and demanding one would fail every
-	// remote completion at the last step.
-	if _, _, _, err := s.registry.resolveActionBinding(
-		ctx, finalDecision, current.AgentID, current.AgentGeneration,
-		current.Capability, current.Action, current.SourceID, current.PolicyID,
-		current.ObjectID, auth.OperationInvoke, finishNow,
-	); err != nil {
-		return ActionRecord{}, errors.Join(ErrExecutionAmbiguous, err)
 	}
 	next.ExecutionFingerprint, err = auth.AuthorizationFingerprint(finalDecision)
 	if err != nil {
@@ -776,7 +1012,7 @@ func (s *DispatchService) applyExecutionResult(
 	next.TransitionRequestID = finalDecision.RequestID()
 	next.TransitionCorrelationID = finalDecision.CorrelationID()
 	if err := s.recorder.RecordAction(ctx, ActionAudit{
-		Phase: "effect_outcome", Operation: auth.OperationInvoke, Record: next, EffectError: executionErr,
+		Phase: "effect_outcome", Operation: authorizing, Record: next, EffectError: executionErr,
 	}); err != nil {
 		return ActionRecord{}, errors.Join(ErrExecutionAmbiguous, ErrRecordingUnavailable, err)
 	}
@@ -842,7 +1078,7 @@ func (s *DispatchService) Cancel(ctx context.Context, request CancelRequest) (Ac
 	if err := validateOpaque("cancel mutation key", request.MutationKey, false); err != nil {
 		return ActionRecord{}, err
 	}
-	current, err := s.authorizedCurrent(ctx, decision, request.ID, auth.OperationDispatch, now)
+	current, _, err := s.authorizedCurrent(ctx, decision, request.ID, auth.OperationDispatch, true, now)
 	if err != nil {
 		return ActionRecord{}, err
 	}
@@ -917,8 +1153,19 @@ func (s *DispatchService) Status(ctx context.Context, request StatusRequest) (Ac
 	if err != nil {
 		return ActionRecord{}, err
 	}
-	current, err := s.authorizedCurrent(
-		ctx, decision, request.ID, auth.OperationDispatch, now)
+	// Status keeps the principal requirement, unchanged. #437 separated
+	// execute from invoke for *claiming*; whether an executor should be able
+	// to read the status of work it holds is a different question with a
+	// different operation behind it, and bundling it here would widen dispatch
+	// rather than answer it.
+	//
+	// The consequence is worth naming: a worker cannot read the status of its
+	// own claim. It does not need to — Claim and CompleteClaim both return the
+	// record — but an operator reconciling goes through TeamActions, which has
+	// its own authorization and does not require the reader to be the
+	// originating principal.
+	current, _, err := s.authorizedCurrent(
+		ctx, decision, request.ID, auth.OperationDispatch, true, now)
 	if err != nil {
 		return ActionRecord{}, err
 	}
@@ -1176,7 +1423,7 @@ func (s *DispatchService) scanDispatchActions(
 func (s *DispatchService) Pull(ctx context.Context, request PullActionsRequest) (ActionPage, error) {
 	ctx, cancel := s.deadline(ctx, request.Context)
 	defer cancel()
-	decision, now, err := s.begin(ctx, auth.OperationInvoke, request.Context)
+	decision, now, err := s.beginClaimant(ctx, request.Context)
 	if err != nil {
 		return ActionPage{}, err
 	}
@@ -1206,21 +1453,24 @@ func (s *DispatchService) Pull(ctx context.Context, request PullActionsRequest) 
 		if !now.Before(record.Deadline) {
 			continue
 		}
-		if !sameActionPrincipal(decision, record) {
-			continue
-		}
-		// Binding, not execution: a remote worker pulling its own work would
-		// otherwise never see it.
-		if _, _, _, authorizeErr := s.registry.resolveActionBinding(
-			ctx, decision, record.AgentID, record.AgentGeneration,
-			record.Capability, record.Action, record.SourceID, record.PolicyID,
-			record.ObjectID, auth.OperationInvoke, now,
-		); authorizeErr != nil {
-			if shoal.IsErrorCode(authorizeErr, shoal.ErrorUnauthorized) ||
-				shoal.IsErrorCode(authorizeErr, shoal.ErrorNotFound) {
-				continue
-			}
+		// The same two routes authorizedClaimant takes, in the same order and
+		// for the same reason: an executor granted execute on this record's
+		// descriptor may take work it did not enqueue, and the enqueuing
+		// principal under invoke keeps working unchanged.
+		//
+		// Before #437 this filter required the caller to be the enqueuer, and
+		// that is what made a remote worker see an empty page forever — the
+		// records were skipped silently, so there was no error, no log line,
+		// and nothing to diagnose.
+		//
+		// Binding, not execution: a worker has no in-process Execute, so
+		// resolveActionBinding is the right resolver either way.
+		claimable, authorizeErr := s.claimableBy(ctx, decision, record, now)
+		if authorizeErr != nil {
 			return ActionPage{}, authorizeErr
+		}
+		if !claimable {
+			continue
 		}
 		result.Actions = append(result.Actions, cloneActionRecord(record))
 	}
@@ -1271,6 +1521,33 @@ func (s *DispatchService) publishTransition(
 	return s.ReconcileActionTransitions(ctx, record.ID)
 }
 
+// beginClaimant admits a caller holding either of the operations that
+// authorize taking work: execute, or invoke for the principal that enqueued.
+//
+// begin is a domain-level gate — it checks the operation against the
+// authorization domain with no object in the request — so a worker granted only
+// execute was refused here before any record was ever read. That made the
+// record-level routes in authorizedClaimant unreachable, which is the shape of
+// bug this whole change exists to remove: an authorization that fails at a door
+// nobody was looking at.
+//
+// Execute is tried first and invoke second, the same order and for the same
+// reason as authorizedClaimant: nothing that worked before stops working.
+// Failing both returns the invoke error, which is exactly what a caller holding
+// neither was told before this existed.
+func (s *DispatchService) beginClaimant(
+	ctx context.Context, request RequestContext,
+) (auth.Decision, time.Time, error) {
+	decision, now, err := s.begin(ctx, auth.OperationExecute, request)
+	if err == nil {
+		return decision, now, nil
+	}
+	if !shoal.IsErrorCode(err, shoal.ErrorUnauthorized) {
+		return auth.Decision{}, time.Time{}, err
+	}
+	return s.begin(ctx, auth.OperationInvoke, request)
+}
+
 func (s *DispatchService) begin(ctx context.Context, operation auth.Operation, request RequestContext) (auth.Decision, time.Time, error) {
 	now := s.clock().UTC()
 	if err := request.validate(now); err != nil {
@@ -1302,9 +1579,55 @@ func (s *DispatchService) deadline(ctx context.Context, request RequestContext) 
 	return context.WithTimeout(ctx, request.Deadline.Sub(now))
 }
 
-func (s *DispatchService) authorizedCurrent(ctx context.Context, decision auth.Decision, id []byte, operation auth.Operation, now time.Time) (ActionRecord, error) {
+// authorizedClaimant resolves an action for a caller that means to take or
+// finish the work, by either of the two routes that authorize it.
+//
+// An executor granted OperationExecute on the action's descriptor may claim
+// work it did not enqueue. That is the whole point of #437: a gateway performs
+// effects other agents asked for, and under one operation it could not — the
+// claimant had to be the principal that enqueued, so every record failed
+// sameActionPrincipal and was silently skipped, leaving a ready worker and a
+// growing queue with no error anywhere.
+//
+// The enqueuing principal with OperationInvoke remains a second route, so a
+// deployment that claims its own work keeps working without being regranted.
+// That ordering is deliberate: the broader route is tried first, and the
+// narrower principal-bound one only if it fails, so nothing that worked before
+// stops working.
+//
+// Both failures normalise to the same auth.ObjectNotFound() that every other
+// path through authorizedCurrent returns. Two routes must not become two
+// distinguishable answers — the absent-versus-foreign normalisation is what
+// stops this surface being an existence oracle (#398), and adding a second way
+// in is exactly how that gets reopened.
+func (s *DispatchService) authorizedClaimant(
+	ctx context.Context, decision auth.Decision, id []byte, now time.Time,
+) (ActionRecord, Action, auth.Operation, error) {
+	record, action, err := s.authorizedCurrent(ctx, decision, id, auth.OperationExecute, false, now)
+	if err == nil {
+		return record, action, auth.OperationExecute, nil
+	}
+	// Only an authorization answer is worth a second attempt. A malformed ID or
+	// a store failure is the same answer either way, and retrying it would turn
+	// one fault into two store reads.
+	if !shoal.IsErrorCode(err, shoal.ErrorNotFound) &&
+		!shoal.IsErrorCode(err, shoal.ErrorUnauthorized) {
+		return ActionRecord{}, Action{}, "", err
+	}
+	record, action, err = s.authorizedCurrent(ctx, decision, id, auth.OperationInvoke, true, now)
+	return record, action, auth.OperationInvoke, err
+}
+
+// authorizedCurrent resolves an existing action for one operation.
+//
+// requirePrincipal asks whether the caller must also be the principal that
+// enqueued the action. It is true for every operation that existed before
+// #437 — invoke and dispatch — and false only for OperationExecute, where the
+// grant on the descriptor is the authorization and requiring the enqueuer's
+// identity is what made an out-of-process executor impossible.
+func (s *DispatchService) authorizedCurrent(ctx context.Context, decision auth.Decision, id []byte, operation auth.Operation, requirePrincipal bool, now time.Time) (ActionRecord, Action, error) {
 	if err := validateOpaque("action ID", id, false); err != nil {
-		return ActionRecord{}, err
+		return ActionRecord{}, Action{}, err
 	}
 	current, err := s.store.GetAction(ctx, id)
 	if err != nil {
@@ -1322,15 +1645,16 @@ func (s *DispatchService) authorizedCurrent(ctx context.Context, decision auth.D
 		// this function, and a per-caller fix is a fix that the next caller
 		// forgets.
 		if errors.Is(err, ErrActionNotFound) {
-			return ActionRecord{}, auth.ObjectNotFound()
+			return ActionRecord{}, Action{}, auth.ObjectNotFound()
 		}
-		return ActionRecord{}, err
+		return ActionRecord{}, Action{}, err
 	}
-	if !sameActionPrincipal(decision, current) {
-		return ActionRecord{}, auth.ObjectNotFound()
+	if requirePrincipal && !sameActionPrincipal(decision, current) {
+		return ActionRecord{}, Action{}, auth.ObjectNotFound()
 	}
-	// Operation mapping is explicit: claim/execute/pull use invoke, while
-	// cancel/status use dispatch. Existing-action operations additionally bind
+	// Operation mapping is explicit: claim/complete/pull use execute and fall
+	// back to invoke for the enqueuing principal, while cancel/status use
+	// dispatch. Existing-action operations additionally bind
 	// authorization to the durable action ID before checking its execution
 	// target through registry.resolveAction.
 	if err := decision.AuthorizeObject(operation, auth.ResourceRequest{
@@ -1339,23 +1663,243 @@ func (s *DispatchService) authorizedCurrent(ctx context.Context, decision auth.D
 		PolicyID:            current.PolicyID,
 		ObjectID:            shoal.ID(current.ID),
 	}, now); err != nil {
-		return ActionRecord{}, auth.ObjectNotFound()
+		return ActionRecord{}, Action{}, auth.ObjectNotFound()
 	}
 	// resolveActionBinding, not resolveAction: claiming, cancelling, inspecting
 	// and completing an action must work for an executor that runs out of
 	// process and has no in-process Execute. Only ExecuteClaim needs a runnable
 	// one. Every other check — generation, scope, authorization, delegation and
 	// the declared effect ceiling — is identical either way.
-	if _, _, _, err := s.registry.resolveActionBinding(ctx, decision, current.AgentID, current.AgentGeneration,
+	// Resolved once and returned, rather than resolved here and re-resolved by
+	// the caller. Claim and CompleteClaim each used to resolve again with a
+	// hardcoded OperationInvoke under a comment saying it "adds no
+	// authorization" — which was true while invoke was the only way in and
+	// became false the moment execute existed: a worker authorized under
+	// execute was refused by the second call. Handing back the declaration
+	// removes the duplicate gate instead of teaching it the second operation.
+	_, resolved, _, err := s.registry.resolveActionBinding(ctx, decision, current.AgentID, current.AgentGeneration,
 		current.Capability, current.Action, current.SourceID, current.PolicyID, current.ObjectID,
-		operation, now); err != nil {
+		operation, now)
+	if err != nil {
 		if shoal.IsErrorCode(err, shoal.ErrorUnauthorized) ||
 			shoal.IsErrorCode(err, shoal.ErrorNotFound) {
-			return ActionRecord{}, auth.ObjectNotFound()
+			return ActionRecord{}, Action{}, auth.ObjectNotFound()
 		}
-		return ActionRecord{}, err
+		// Without the principal check, every failure here is one answer.
+		//
+		// resolveActionBinding returns a bare ErrorUnavailable when the
+		// executor is unregistered or the effect ceiling has narrowed, and that
+		// surfaces as a 503 where an absent record is a 404. For the enqueuing
+		// principal that distinction is information it already has. For a
+		// caller reaching a record on the strength of an execute grant it is an
+		// existence oracle, and it reaches the admission namespace — those IDs
+		// are computable from a principal tuple, and Claim's isAdmission
+		// refusal runs after this, so the 503 would arrive first.
+		//
+		// That is #398 reopened through a route that did not exist when the
+		// normalisation was written, which is why it is collapsed here rather
+		// than at the one caller that noticed.
+		if !requirePrincipal {
+			return ActionRecord{}, Action{}, auth.ObjectNotFound()
+		}
+		return ActionRecord{}, Action{}, err
 	}
-	return cloneActionRecord(current), nil
+	return cloneActionRecord(current), resolved, nil
+}
+
+// claimableBy reports whether this caller may take this record, by either
+// route, and separates "not for you" from a fault.
+//
+// That separation is why this is a function rather than two inline conditions.
+// An authorization answer is a skip: the page continues and the caller simply
+// does not see the record. A fault on the caller's own record aborts the page,
+// because telling a caller its queue is empty is a worse answer than telling
+// it the lookup failed.
+//
+// The bound on how much that buys is worth stating, because an earlier version
+// of this comment claimed more. resolveActionBinding collapses every error
+// from Service.active into auth.ObjectNotFound(), and active propagates real
+// store faults up the delegation chain — so a descriptor-store outage already
+// reads here as "no such record" and already produces a silent empty page.
+// That is pre-existing behaviour and this function does not change it. What it
+// does is stop a *foreign* record's fault from aborting a page it has no
+// business aborting, which is a narrower and real guarantee.
+func (s *DispatchService) claimableBy(
+	ctx context.Context, decision auth.Decision, record ActionRecord, now time.Time,
+) (bool, error) {
+	for _, route := range []struct {
+		operation        auth.Operation
+		requirePrincipal bool
+	}{
+		{auth.OperationExecute, false},
+		{auth.OperationInvoke, true},
+	} {
+		if route.requirePrincipal && !sameActionPrincipal(decision, record) {
+			continue
+		}
+		_, _, _, err := s.registry.resolveActionBinding(
+			ctx, decision, record.AgentID, record.AgentGeneration,
+			record.Capability, record.Action, record.SourceID, record.PolicyID,
+			record.ObjectID, route.operation, now,
+		)
+		if err == nil {
+			return true, nil
+		}
+		if shoal.IsErrorCode(err, shoal.ErrorUnauthorized) ||
+			shoal.IsErrorCode(err, shoal.ErrorNotFound) {
+			continue
+		}
+		// A real fault, and whose record it is decides whether the caller is
+		// entitled to hear about it.
+		//
+		// On the enqueuer's own record it aborts, as it always has: a registry
+		// that cannot answer is not the same as a record that is not yours, and
+		// swallowing it would turn an outage into an empty queue.
+		//
+		// On somebody else's it is a skip. Before #437 the principal check ran
+		// first and such a record never reached this call, so one foreign
+		// action with an unregistered executor could not affect your page. With
+		// two routes it would abort the page of every execute-holder in the
+		// scope, on every pull, until that record expired — a shared-queue
+		// outage any principal able to enqueue could plant.
+		if sameActionPrincipal(decision, record) {
+			return false, err
+		}
+	}
+	return false, nil
+}
+
+// observableThroughPull reports whether Pull's *state* filter would return
+// this record.
+//
+// It mirrors that filter and the two must not drift. It is not the whole of
+// Pull's selection: Pull also drops admission records and applies claimableBy
+// per record, and this takes no decision so it structurally cannot express the
+// second. An earlier version of this comment said "mirrors the filter in Pull
+// exactly", which invited a future caller where the difference would matter.
+//
+// Neither omission is reachable from the callers it has. Claim refuses an
+// admission with auth.ObjectNotFound() before any branch that consults this,
+// and by the time one is reached authorizedClaimant has already succeeded —
+// which is strictly stronger than claimableBy, since it resolves the same
+// binding and additionally authorizes the record's own ID. A caller admitted
+// through the invoke fallback is the enqueuer, so standingOn holds regardless.
+//
+// It is the discriminator for whether concealing a refusal buys anything. A
+// record Pull already hands this caller cannot be concealed by any answer
+// Claim gives, so refusing with the real error discloses nothing and is far
+// more useful: the loser of an ordinary claim race needs a conflict, not a
+// not-found for work it just saw in its own page. A record Pull withholds is
+// the opposite — there, the error is the only channel, so it has to be the
+// same error an absent action produces.
+//
+// Note which states those are, because an earlier version of this reasoning
+// got it backwards and said a live-claimed record was already visible through
+// Pull. It is not: Pull returns a claimed record only once its lease has
+// lapsed. So live-claimed is withheld, and claiming one had been answering
+// with a distinguishable ErrActionConflict.
+func observableThroughPull(record ActionRecord, now time.Time) bool {
+	if record.State != DispatchQueued &&
+		!(record.State == DispatchClaimed && !now.Before(record.ClaimLeaseUntil)) {
+		return false
+	}
+	return now.Before(record.Deadline)
+}
+
+// concealFrom reports whether a refusal about this record must be replaced with
+// the answer an absent action gets, rather than the real reason.
+func concealFrom(
+	decision auth.Decision, record ActionRecord, now time.Time,
+) bool {
+	return !standingOn(decision, record) &&
+		!observableThroughPull(record, now)
+}
+
+// holdsClaimOn reports whether this caller may act as the holder of this
+// record's claim — which is what both writing a terminal outcome and replaying
+// a claim amount to.
+//
+// Narrower than standingOn on purpose. standingOn answers "may this caller be
+// told the record exists", where the enqueuer always qualifies because it is
+// the record's own principal. Reporting is a different question: it is a claim
+// to have performed the work, and the only principal that can have done so is
+// the one holding the claim.
+//
+// The enqueuer is admitted only when the record carries no claimant at all.
+// Nothing this build writes produces that: applyClaim is the only writer of
+// those fields and auth.NewDecision requires a non-empty Subject. So in
+// practice it means the claim was taken by a build that had no such field,
+// where the claimant was by construction the enqueuer. It is not an invariant
+// the type enforces — ActionRecord.Validate accepts an empty claimant on a
+// claimed record, deliberately, so a stored record from that build still
+// decodes and still validates.
+func holdsClaimOn(decision auth.Decision, record ActionRecord) bool {
+	if sameClaimantPrincipal(decision, record) {
+		return true
+	}
+	return record.ClaimantSubject == "" && sameActionPrincipal(decision, record)
+}
+
+// standingOn reports whether this caller has any standing to be told that this
+// record exists: it is either the principal that enqueued it or the principal
+// that holds its claim.
+//
+// Before #437 the question could not arise. Every route resolved through
+// authorizedCurrent, which required sameActionPrincipal unconditionally, so a
+// caller with no standing was already refused with auth.ObjectNotFound() and
+// could not reach a handler at all. The execute routes removed that gate by
+// design — a worker must be able to claim work it did not enqueue — and the
+// handlers behind them answer with ErrActionTerminal, ErrActionConflict and
+// ErrClaimLost, none of which an absent action produces.
+//
+// That is the #398 existence oracle, reopened through routes that did not
+// exist when the normalisation was written. Action IDs are caller-chosen
+// opaque bytes, so they are guessable, and the records that leak are exactly
+// the ones Pull does not show: terminal, and past their deadline.
+func standingOn(decision auth.Decision, record ActionRecord) bool {
+	return sameActionPrincipal(decision, record) ||
+		sameClaimantPrincipal(decision, record)
+}
+
+// sameClaimantPrincipal reports whether the caller is the principal that holds
+// the record's claim.
+//
+// This is the gate #437 removed without replacing. Claiming and completing
+// were both authorized under OperationInvoke and both additionally required
+// sameActionPrincipal, so the claimant was the enqueuer and the enqueuer's
+// chain was on the record. Relaxing claiming to OperationExecute left the
+// completion predicate as version, state and ClaimID — and ClaimID is
+// caller-supplied, unconstrained in entropy, and published to co-principals on
+// Status and to every execute-holder on Pull once a lease lapses. So a second
+// execute-holder that had never claimed anything could present another
+// worker's ClaimID and commit a fabricated outcome; worse, the replay branch
+// then handed the real worker a success receipt carrying the fabrication,
+// which is the one failure a worker cannot detect.
+//
+// A record claimed before this field existed has an empty chain, and an empty
+// chain matches nothing — shoal.ID("") is not a valid principal and no
+// decision carries it. That is the right default for a gob-decoded record from
+// an older build: it refuses the completion rather than accepting it, and the
+// worker's recourse is to re-claim, which writes the field.
+func sameClaimantPrincipal(decision auth.Decision, record ActionRecord) bool {
+	if record.ClaimantSubject == "" {
+		return false
+	}
+	if decision.Subject() != record.ClaimantSubject ||
+		decision.Actor() != record.ClaimantActor ||
+		decision.ClientID() != record.ClaimantClientID {
+		return false
+	}
+	left, right := decision.OnBehalfOf(), record.ClaimantOnBehalfOf
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if left[i] != right[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func sameActionPrincipal(decision auth.Decision, record ActionRecord) bool {

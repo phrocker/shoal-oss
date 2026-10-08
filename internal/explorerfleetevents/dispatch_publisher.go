@@ -78,9 +78,7 @@ func (p *ActionEventPublisher) PublishActionEvent(
 	if err != nil {
 		return err
 	}
-	if decision.Subject() != record.Subject || decision.Actor() != record.Actor ||
-		decision.ClientID() != record.ClientID ||
-		!sameIDs(decision.OnBehalfOf(), record.OnBehalfOf) {
+	if !publisherMatchesTransition(decision, kind, record) {
 		return shoal.NewError(
 			shoal.ErrorUnauthorized,
 			"fleet action event authorization does not match durable transition",
@@ -191,6 +189,41 @@ func actionEvidenceReferences(
 	return result
 }
 
+// publisherMatchesTransition reports whether the publishing decision is the
+// principal that performed the transition being published.
+//
+// For an enqueue or a cancellation that is the record's own principal. For a
+// claim or a completion it is the record's *claimant*, which since #437 need
+// not be the same principal — applyClaim deliberately leaves the record's own
+// identity alone, so a record claimed by a worker still names its enqueuer.
+//
+// Comparing against the enqueuer for every kind is what made #437's capability
+// fail in the hosted build: a worker's claim and completion both failed to
+// publish, and a failed publication is reported as ErrActionCommitted, so the
+// write landed and the worker was told to reconcile an outcome that was
+// actually recorded. Nothing in the fleet package's own tests could see it,
+// because they bind a no-op event sink.
+//
+// A claimed or completed record with no claimant chain predates the field, and
+// there the claimant was by construction the enqueuer.
+func publisherMatchesTransition(
+	decision auth.Decision, kind string, record fleet.ActionRecord,
+) bool {
+	switch kind {
+	case "action.claimed", "action.completed", "action.failed":
+		if record.ClaimantSubject != "" {
+			return decision.Subject() == record.ClaimantSubject &&
+				decision.Actor() == record.ClaimantActor &&
+				decision.ClientID() == record.ClaimantClientID &&
+				sameIDs(decision.OnBehalfOf(), record.ClaimantOnBehalfOf)
+		}
+	}
+	return decision.Subject() == record.Subject &&
+		decision.Actor() == record.Actor &&
+		decision.ClientID() == record.ClientID &&
+		sameIDs(decision.OnBehalfOf(), record.OnBehalfOf)
+}
+
 func actionEventAuthorization(
 	kind string, record fleet.ActionRecord,
 ) (auth.Operation, auth.Fingerprint, time.Time, error) {
@@ -206,7 +239,25 @@ func actionEventAuthorization(
 	case "action.canceled":
 		operation = auth.OperationDispatch
 	case "action.claimed", "action.completed", "action.failed":
-		operation = auth.OperationInvoke
+		// The operation the transition was actually authorized by, which since
+		// #437 is not always invoke: a principal granted OperationExecute on
+		// the descriptor may claim and complete work it did not enqueue, and
+		// it need not hold invoke at all.
+		//
+		// Hardcoding invoke here did not merely mislabel the event. The
+		// publishing decision is authorized against this operation below, so a
+		// claim taken under execute failed to publish — and a failed
+		// publication is returned as ErrActionCommitted, which means the
+		// transition was written and the worker was told its outcome needs
+		// reconciliation. The capability did not work end to end.
+		//
+		// Empty for a record written before the field existed, where the
+		// claimant was by construction the enqueuer and invoke is what
+		// authorized it.
+		operation = record.TransitionOperation
+		if operation == "" {
+			operation = auth.OperationInvoke
+		}
 	default:
 		return "", auth.Fingerprint{}, time.Time{}, shoal.NewError(
 			shoal.ErrorInvalidArgument, "fleet action event kind is invalid")

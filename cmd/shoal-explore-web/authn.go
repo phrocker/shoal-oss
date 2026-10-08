@@ -81,6 +81,12 @@ var workspaceOperations = []auth.Operation{
 	auth.OperationDelegate,
 	auth.OperationDispatch,
 	auth.OperationInvoke,
+	// Deliberately no OperationExecute. It would buy this principal nothing:
+	// -dev-auth mints one fixed identity, so it is always its own enqueuer and
+	// already passes the principal check that the execute routes skip. What it
+	// would add is access to those routes — the ones that answer without
+	// comparing the caller to the record — for no capability gain. See
+	// oidc_execute_grant_test.go, which asserts the absence here too.
 	auth.OperationSubscriptionCreate,
 	auth.OperationSubscriptionDelete,
 	auth.OperationSubscriptionDeliver,

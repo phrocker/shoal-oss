@@ -40,6 +40,7 @@ var legacyAuthorizationOperations = []auth.Operation{
 
 var productActionOperations = []auth.Operation{
 	auth.OperationInvoke,
+	auth.OperationExecute,
 	auth.OperationDispatch,
 	auth.OperationDelegate,
 	auth.OperationAgentRegister,
@@ -69,6 +70,7 @@ var authorizationServiceRoles = []auth.ServiceRole{
 	auth.ServiceRoleMigration,
 	auth.ServiceRoleSecurityAdmin,
 	auth.ServiceRoleActionInvocation,
+	auth.ServiceRoleActionExecution,
 	auth.ServiceRoleActionDispatch,
 	auth.ServiceRoleDelegation,
 	auth.ServiceRoleAgentRegistration,
@@ -117,6 +119,17 @@ var roleOperationCeilings = map[auth.ServiceRole]map[auth.Operation]bool{
 	),
 	auth.ServiceRoleActionInvocation: operationSet(
 		auth.OperationInvoke,
+		auth.OperationValidate,
+	),
+	// Execute and nothing else. The separation is the point of #437: a
+	// principal that may ask an agent to do something must not thereby be able
+	// to claim another principal's queued work and read its input. This matrix
+	// is where that is actually enforced — a service-level test that builds
+	// AllowedOperations directly never exercises ServiceRole.Allows, which is
+	// how a mutation granting execute to ServiceRoleActionInvocation survived
+	// the dispatch tests entirely.
+	auth.ServiceRoleActionExecution: operationSet(
+		auth.OperationExecute,
 		auth.OperationValidate,
 	),
 	auth.ServiceRoleActionDispatch: operationSet(
@@ -187,6 +200,7 @@ func TestProductActionOperationValuesAndParsingAreStable(t *testing.T) {
 		auth.OperationRetrieve:               "retrieve",
 		auth.OperationValidate:               "validation",
 		auth.OperationInvoke:                 "invoke",
+		auth.OperationExecute:                "execute",
 		auth.OperationDispatch:               "dispatch",
 		auth.OperationDelegate:               "delegate",
 		auth.OperationAgentRegister:          "agent_register",
@@ -242,6 +256,7 @@ func TestProductActionServiceRoleValuesAreStable(t *testing.T) {
 		auth.ServiceRoleMigration:              "migration",
 		auth.ServiceRoleSecurityAdmin:          "security_admin",
 		auth.ServiceRoleActionInvocation:       "action_invocation",
+		auth.ServiceRoleActionExecution:        "action_execution",
 		auth.ServiceRoleActionDispatch:         "action_dispatch",
 		auth.ServiceRoleDelegation:             "delegation",
 		auth.ServiceRoleAgentRegistration:      "agent_registration",
