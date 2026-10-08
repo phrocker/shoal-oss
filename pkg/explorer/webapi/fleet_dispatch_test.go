@@ -11,7 +11,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -20,6 +19,7 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/document"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/explorer/fleet"
+	"github.com/phrocker/shoal-oss/pkg/explorer/teamoverview"
 	"github.com/phrocker/shoal-oss/pkg/interaction"
 	"github.com/phrocker/shoal-oss/pkg/ontology"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
@@ -193,7 +193,8 @@ func (*stubDispatchProvider) Invoke(context.Context, fleet.InvokeRequest) (fleet
 }
 
 // TestFleetActionWireCarriesTheWorkAndItsIdempotencyKey pins the two fields
-// whose absence made an out-of-process worker impossible (#435).
+// whose absence made an out-of-process worker impossible (#435), and pins that
+// they ride the claim response alone.
 //
 // A worker could pull an action, claim it under a fence, and complete it
 // without ever receiving the parameters of the operation: Input was on the
@@ -226,7 +227,7 @@ func TestFleetActionWireCarriesTheWorkAndItsIdempotencyKey(t *testing.T) {
 		ExecutorKey: executorKey,
 	}
 
-	wire := encodeFleetAction(record)
+	wire := encodeClaimedFleetAction(record)
 
 	if string(wire.Input) != input {
 		t.Fatalf("input = %s, want it unchanged: a worker that does not receive "+
@@ -238,7 +239,9 @@ func TestFleetActionWireCarriesTheWorkAndItsIdempotencyKey(t *testing.T) {
 	// Unpadded base64url, like every other opaque identity on this wire. A
 	// padded or standard-alphabet spelling would be a second spelling of one
 	// identity, and this value is used as a deduplication key at a third party
-	// where two spellings are two keys.
+	// where two spellings are two keys. pkg/explorer/mcp returns the record
+	// whole and so emits the padded standard spelling; a worker must therefore
+	// compare decoded bytes and never one spelling against the other.
 	if strings.ContainsAny(wire.ExecutorKey, "=+/") {
 		t.Fatalf("executor_key %q is not unpadded base64url", wire.ExecutorKey)
 	}
@@ -259,10 +262,31 @@ func TestFleetActionWireCarriesTheWorkAndItsIdempotencyKey(t *testing.T) {
 		}
 	}
 
+	// The shared encoder carries neither, for the same record. This is the
+	// assertion that bounds both the disclosure and the response size: six of
+	// the seven routes encoding an action use it, five of those are
+	// commit-bearing, and an over-budget response on a commit-bearing route is
+	// reported as an indeterminate commit rather than a failure.
+	shared := encodeFleetAction(record)
+	if len(shared.Input) != 0 {
+		t.Fatalf("the shared encoder carries input %s, so every action response "+
+			"carries a payload bounded only by MaxActionPayloadBytes", shared.Input)
+	}
+	if shared.ExecutorKey != "" {
+		t.Fatalf("the shared encoder carries executor_key %q", shared.ExecutorKey)
+	}
+	// Everything else must survive the split, or the claim response would be
+	// the only one worth reading.
+	shared.Input, shared.ExecutorKey = wire.Input, wire.ExecutorKey
+	if !reflect.DeepEqual(shared, wire) {
+		t.Fatalf("the claim encoder differs from the shared one beyond the two "+
+			"claimant fields:\n claim  = %+v\n shared = %+v", wire, shared)
+	}
+
 	// An action with no input encodes nothing rather than a JSON null, because
 	// the field is omitempty and a literal null is not an absent value to a
 	// client distinguishing the two.
-	bare := encodeFleetAction(fleet.ActionRecord{ID: []byte("x"), Version: 1})
+	bare := encodeClaimedFleetAction(fleet.ActionRecord{ID: []byte("x"), Version: 1})
 	encoded, err := json.Marshal(bare)
 	if err != nil {
 		t.Fatal(err)
@@ -274,40 +298,110 @@ func TestFleetActionWireCarriesTheWorkAndItsIdempotencyKey(t *testing.T) {
 	}
 }
 
-// TestTheTeamOverviewDoesNotReadActionInput is the reason emitting input on
-// every action response is safe, and it is asserted rather than assumed.
+// TestOnlyTheClaimRouteEncodesTheWork pins the call sites, because the bound on
+// both the disclosure and the response size is "one record on one route" and
+// nothing else in the type system enforces it.
 //
-// All six existing-action routes reach the store through authorizedCurrent, and
-// Pull filters on sameActionPrincipal, so every consumer of fleetActionWire is
-// scoped to the action's own principal. The one dispatch read that is not —
-// DispatchService.TeamActions, which documents that it "does not require the
-// reader to be the action's originating principal" — projects its own view in
-// pkg/explorer/teamoverview and never touches Input.
-//
-// If that ever changes, adding Input here becomes a disclosure of one
-// principal's request parameters to a team-overview reader, so this test exists
-// to fail at that moment rather than to describe today.
-func TestTheTeamOverviewDoesNotReadActionInput(t *testing.T) {
-	sources, err := filepath.Glob("../teamoverview/*.go")
+// encodeClaimedFleetAction is one line away from being usable anywhere, and the
+// cost of using it on the wrong route is not a leak alone. requestMayCommit
+// reports enqueue, invoke, claim, complete and cancel as commit-bearing, so
+// writeResponse answers an over-budget response there with 503 and
+// X-Commit-Outcome: indeterminate. MaxActionPayloadBytes is a fixed 1 MiB and a
+// workspace's OutputBytes budget narrows to any non-zero value, so on the
+// enqueue echo that would be a successful enqueue reported as an unknown
+// outcome, repeatably, for as long as the record existed. On Pull it would be
+// up to MaxDispatchListResults — 256 — payloads in one page.
+func TestOnlyTheClaimRouteEncodesTheWork(t *testing.T) {
+	body, err := os.ReadFile("fleet_dispatch.go")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(sources) == 0 {
-		t.Fatal("no team overview sources found, so this guard checks nothing")
+	source := string(body)
+	// Count call sites, not definitions: the definition's own name and its one
+	// internal call to the shared encoder are excluded by requiring the "("
+	// and by subtracting the declaration.
+	claimed := strings.Count(source, "encodeClaimedFleetAction(") -
+		strings.Count(source, "func encodeClaimedFleetAction(")
+	if claimed != 1 {
+		t.Fatalf("encodeClaimedFleetAction has %d call sites, want exactly 1 "+
+			"(the claim route). Every added site is a route whose response "+
+			"carries a 1 MiB-bounded payload against a narrowable output "+
+			"budget, and five of the seven are commit-bearing", claimed)
 	}
-	for _, source := range sources {
-		if strings.HasSuffix(source, "_test.go") {
-			continue
+	// And it is the claim route specifically. Ordering the handlers by
+	// position, the one containing the call must be the claim registration.
+	call := strings.Index(source, "writeResponse(w, http.StatusOK, encodeClaimedFleetAction(")
+	if call < 0 {
+		t.Fatal("no route writes a claimed action; the claimant now gets no input")
+	}
+	handler := strings.LastIndex(source[:call], `mux.HandleFunc("`)
+	if handler < 0 {
+		t.Fatal("the claimed-action response is not inside a route registration")
+	}
+	route := source[handler : handler+strings.Index(source[handler:], "\n")]
+	if !strings.Contains(route, "/claim") {
+		t.Fatalf("the claimed-action encoder is used by %s, not the claim route", route)
+	}
+}
+
+// TestTheTeamOverviewDoesNotReadActionInput guards the one dispatch read that
+// does not require the reader to be the action's originating principal.
+//
+// DispatchService.TeamActions documents exactly that, and it projects its own
+// view rather than returning fleetActionWire. So the execute grant #437
+// introduced is the bound on who reads an action's input only for as long as
+// that projection stays a projection. If a field of type fleet.ActionRecord
+// ever appears in the response, Input and ExecutorKey ship with it: the record
+// carries no JSON tags, so encoding/json emits every exported field under its
+// Go name.
+//
+// This walks the real teamoverview.Response rather than grepping for ".Input".
+// The grep it replaced could not see the shape that actually matters — the
+// record marshalled whole, which names no field at all — and pkg/explorer/mcp
+// is the standing proof that the shape occurs: FleetActionToolResult embeds
+// fleet.ActionRecord and so already emits both values to its caller.
+func TestTheTeamOverviewDoesNotReadActionInput(t *testing.T) {
+	record := reflect.TypeOf(fleet.ActionRecord{})
+	visited := map[reflect.Type]bool{}
+	var walk func(path string, carrier reflect.Type)
+	walk = func(path string, carrier reflect.Type) {
+		for carrier.Kind() == reflect.Pointer || carrier.Kind() == reflect.Slice ||
+			carrier.Kind() == reflect.Array || carrier.Kind() == reflect.Map {
+			carrier = carrier.Elem()
 		}
-		body, readErr := os.ReadFile(source)
-		if readErr != nil {
-			t.Fatal(readErr)
+		if carrier == record {
+			t.Errorf("%s has type fleet.ActionRecord. The team overview is the "+
+				"one dispatch read that does not require the reader to be the "+
+				"action's principal, and that type has no JSON tags, so "+
+				"returning it whole discloses one principal's request "+
+				"parameters and its target-facing idempotency key to every "+
+				"reader of the team's overview", path)
+			return
 		}
-		if strings.Contains(string(body), ".Input") {
-			t.Fatalf("%s reads an action's Input. The team overview is the one "+
-				"dispatch read that does not require the reader to be the "+
-				"action's principal, so exposing Input through it discloses one "+
-				"principal's request parameters to another", source)
+		if carrier.Kind() != reflect.Struct || visited[carrier] {
+			return
 		}
+		visited[carrier] = true
+		for i := range carrier.NumField() {
+			field := carrier.Field(i)
+			if field.PkgPath != "" {
+				continue // unexported, so encoding/json never emits it
+			}
+			name, _, _ := strings.Cut(field.Tag.Get("json"), ",")
+			if name == "" {
+				name = field.Name
+			}
+			if name == "input" || name == "executor_key" ||
+				field.Name == "Input" || field.Name == "ExecutorKey" {
+				t.Errorf("%s.%s is named %q, so the team overview projects an "+
+					"action's input or its executor key to a reader who need "+
+					"not be the action's principal", path, field.Name, name)
+			}
+			walk(path+"."+field.Name, field.Type)
+		}
+	}
+	walk("teamoverview.Response", reflect.TypeOf(teamoverview.Response{}))
+	if len(visited) < 2 {
+		t.Fatalf("walked %d struct types, so this guard checks nothing", len(visited))
 	}
 }

@@ -151,7 +151,7 @@ func mountFleetDispatch(mux *http.ServeMux, provider FleetDispatchProvider) {
 			writeError(w, fleetDispatchError(err))
 			return
 		}
-		writeResponse(w, http.StatusOK, encodeFleetAction(result))
+		writeResponse(w, http.StatusOK, encodeClaimedFleetAction(result))
 	})
 	mux.HandleFunc("POST /api/v1/fleet/actions/{action}/complete", func(w http.ResponseWriter, r *http.Request) {
 		actionID, err := decodeWireBytes("action ID", r.PathValue("action"), false)
@@ -373,30 +373,34 @@ type fleetActionWire struct {
 	// parameters of an effect Shoal cannot undo, which is why the gap had to be
 	// closed here rather than worked around there.
 	//
-	// Emitted unconditionally, and what bounds who sees it is the
-	// authorization to take the work — not the identity of whoever enqueued
-	// it.
+	// Populated on the claim response alone — see encodeClaimedFleetAction, the
+	// one caller that sets it. Every other route uses encodeFleetAction and
+	// leaves it empty, which is both an exposure bound and a size bound.
 	//
-	// That distinction matters because an earlier version of this comment made
-	// the narrower claim: that every consumer of this wire is scoped to the
-	// action's own principal, since Pull filtered on sameActionPrincipal. True
-	// when written and false as of #437, which lets a principal granted
-	// OperationExecute on the action's descriptor pull and claim work it did
-	// not enqueue — and therefore read this field. Verified by composing the
-	// two branches and reading the input back as a non-enqueuing executor, so
-	// it is a measured consequence rather than a guess.
+	// The exposure bound: a claim is the point at which a principal takes
+	// responsibility for performing the work, so it is the one transition whose
+	// caller must have the parameters. An earlier version of this field was
+	// emitted unconditionally on the argument that every consumer of this wire
+	// is scoped to the action's own principal, since Pull filtered on
+	// sameActionPrincipal. That was true when written and false as of #437,
+	// which lets a principal granted OperationExecute on the descriptor pull
+	// work it did not enqueue. Verified by composing the two branches and
+	// reading the input back as a non-enqueuing executor.
 	//
-	// It is also the point: a worker that does not receive the operation's
-	// parameters cannot perform it, which is the whole of #435. So the honest
-	// statement of the exposure is that an action's input is readable by any
-	// principal authorized to execute that descriptor within the action's
-	// scope, and the thing to get right is that grant rather than this field.
-	//
-	// What remains true either way is the one read path that does not require
-	// the reader to be the originating principal: DispatchService.TeamActions
-	// does not use this encoder and pkg/explorer/teamoverview never reads
-	// Input. A test pins that, because if it changes this field becomes
-	// readable without any execute grant at all.
+	// The size bound is the reason it is not merely narrowed to Pull as well.
+	// MaxActionPayloadBytes is a fixed 1 MiB and a workspace's OutputBytes
+	// budget narrows to any non-zero value (workspace.ValidateBudgets rejects
+	// only zero), so a response carrying an input can exceed the budget that
+	// governs it. Pull returns up to MaxDispatchListResults — 256 — records,
+	// which would have put a quarter-gigabyte page against a 64 MiB default
+	// ceiling; and unlike Output, an Input is populated from enqueue onward, so
+	// it would have been present on every record of every page rather than only
+	// on completed ones. writeResponse answers an overflow on a route
+	// requestMayCommit reports as commit-bearing with 503 and
+	// X-Commit-Outcome: indeterminate, which on the enqueue echo would have
+	// meant a successful enqueue reported as an unknown outcome, repeatably,
+	// for as long as the record existed. One record on one route is the bound
+	// that keeps the page size independent of the payload ceiling.
 	Input         json.RawMessage `json:"input,omitempty"`
 	Output        json.RawMessage `json:"output,omitempty"`
 	ErrorCode     string          `json:"error_code,omitempty"`
@@ -419,6 +423,15 @@ type fleetActionWire struct {
 	// enqueue against two surfaces can make one key collide with another's, and
 	// a collision makes a provider return a cached success without performing
 	// the effect. That is worse than a duplicate, because nothing records it.
+	//
+	// Set on the claim response alone, for the same reason as Input: it is the
+	// claimant that performs the effect and therefore needs the key. It is not
+	// a new disclosure — pkg/explorer/mcp returns fleet.ActionRecord whole, and
+	// that type carries no JSON tags, so the MCP enqueue and invoke tools
+	// already emit this value to their caller as "ExecutorKey" in padded
+	// standard base64. This wire spells it raw-URL like every other byte field
+	// here. Both decode to the same key, so a worker must compare decoded bytes
+	// and never the two spellings against each other.
 	ExecutorKey          string              `json:"executor_key,omitempty"`
 	ClaimID              string              `json:"claim_id,omitempty"`
 	ClaimFence           uint64              `json:"claim_fence,omitempty"`
@@ -567,17 +580,34 @@ func encodeFleetAction(record fleet.ActionRecord) fleetActionWire {
 		ID: base64.RawURLEncoding.EncodeToString(record.ID), Version: record.Version, State: record.State,
 		AgentID: encodeFleetID(record.AgentID), AgentGeneration: record.AgentGeneration,
 		Capability: record.Capability, Action: record.Action,
-		Input:     append(json.RawMessage(nil), record.Input...),
 		Output:    append(json.RawMessage(nil), record.Output...),
 		ErrorCode: record.ErrorCode, RequestID: encodeFleetID(record.RequestID),
 		CorrelationID: encodeFleetID(record.CorrelationID), Deadline: record.Deadline,
 		CreatedAt: record.CreatedAt, UpdatedAt: record.UpdatedAt,
-		ExecutorKey: base64.RawURLEncoding.EncodeToString(record.ExecutorKey),
-		ClaimID:     base64.RawURLEncoding.EncodeToString(record.ClaimID), ClaimFence: record.ClaimFence,
+		ClaimID: base64.RawURLEncoding.EncodeToString(record.ClaimID), ClaimFence: record.ClaimFence,
 		ClaimLeaseUntil: record.ClaimLeaseUntil, EffectPossible: record.EffectPossible,
 		EvidenceSnapshotID:   encodeFleetID(record.EvidenceSnapshotID),
 		EvidenceSnapshotAsOf: record.EvidenceSnapshotAsOf, Evidence: evidence,
 	}
+}
+
+// encodeClaimedFleetAction is encodeFleetAction plus the two fields a claimant
+// needs in order to perform the work: the operation's parameters and the
+// idempotency key to present to the target. Only the claim route calls it.
+//
+// Keeping these off encodeFleetAction is deliberate rather than tidy. Six of
+// the seven routes that encode an action — enqueue, invoke, pull, complete,
+// cancel and status — hand the record back to a caller that either supplied
+// the input already or has no business performing the effect, and five of
+// those are commit-bearing under requestMayCommit, where an over-budget
+// response is reported as an indeterminate commit rather than a failure. So
+// the default has to be the encoder that cannot carry a payload, and the
+// exposure has to be one visible call site.
+func encodeClaimedFleetAction(record fleet.ActionRecord) fleetActionWire {
+	wire := encodeFleetAction(record)
+	wire.Input = append(json.RawMessage(nil), record.Input...)
+	wire.ExecutorKey = base64.RawURLEncoding.EncodeToString(record.ExecutorKey)
+	return wire
 }
 
 func encodeFleetIDs(values []shoal.ID) []string {
