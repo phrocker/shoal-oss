@@ -15,6 +15,7 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/decision"
 	"github.com/phrocker/shoal-oss/pkg/explorer/fleet"
 	"github.com/phrocker/shoal-oss/pkg/interaction"
+	"github.com/phrocker/shoal-oss/pkg/router"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
@@ -196,6 +197,12 @@ func goldenScenarios() map[string]scenario {
 				{subject: "subject3", reasons: []decision.InspectionReason{decision.SourceStale}},
 			}, Ref{Kind: "decision_request", ID: "dr-1"})
 			return b.finish()
+		},
+		"router_proposal_action_approval": func(t *testing.T, r *Renderer) ([]Sentence, error) {
+			return r.Proposal(routerProposal(t, router.KindAction, true), Options{})
+		},
+		"router_abstain_missing_slot": func(t *testing.T, r *Renderer) ([]Sentence, error) {
+			return r.Proposal(routerAbstention(t, router.ReasonMissingSlot), Options{})
 		},
 		"asserted_reason": func(t *testing.T, r *Renderer) ([]Sentence, error) {
 			return r.AssertedReason(interaction.Session{

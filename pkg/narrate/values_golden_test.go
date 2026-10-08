@@ -55,6 +55,7 @@ func valueFamilies(t *testing.T) []valueFamily {
 		{"decision_results", decisionResultCases(t)},
 		{"decision_gaps", decisionGapCases(t)},
 		{"decision_inspection", inspectionCases(t)},
+		{"router", routerCases(t)},
 	}
 }
 
