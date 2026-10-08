@@ -305,19 +305,33 @@ note "== a reference cannot carry a character that changes what the argument mea
 # they are written, which are two halves of one fix: quoting stops the
 # injection, and the guard stops the quoted remainder from silently matching no
 # executor while the pod starts and serves.
-refuses_citing "holds a control character" "a newline in an allowlisted reference" "${explorer_base[@]}" --set-string 'explorer.fleet.executorRefs[0]=deploy
+refuses_citing "holds a control or line-separator character" "a newline in an allowlisted reference" "${explorer_base[@]}" --set-string 'explorer.fleet.executorRefs[0]=deploy
             - -conceal-withholding=false'
-refuses_citing "holds a control character" "a newline in an external reference" "${explorer_base[@]}" --set-string 'explorer.fleet.executorRefs[0]=deploy' --set-string 'explorer.fleet.externalExecutorRefs[0]=deploy
+refuses_citing "holds a control or line-separator character" "a newline in an external reference" "${explorer_base[@]}" --set-string 'explorer.fleet.executorRefs[0]=deploy' --set-string 'explorer.fleet.externalExecutorRefs[0]=deploy
             - -conceal-withholding=false'
-refuses_citing "holds a control character" "a newline in a transmitting reference" "${explorer_base[@]}" --set-string 'explorer.fleet.executorRefs[0]=notify' --set-string 'explorer.fleet.externalEgressExecutorRefs[0]=notify
+refuses_citing "holds a control or line-separator character" "a newline in a transmitting reference" "${explorer_base[@]}" --set-string 'explorer.fleet.executorRefs[0]=notify' --set-string 'explorer.fleet.externalEgressExecutorRefs[0]=notify
             - -conceal-withholding=false'
-refuses_citing "holds a control character" "a newline in the ask reference" "${explorer_base[@]}" --set-string 'explorer.fleet.executorRefs[0]=ask' --set explorer.chat.provider=ollama,explorer.chat.model=m,explorer.chat.baseURL=http://localhost:11434 --set-string 'explorer.fleet.askExecutorRef=ask
+refuses_citing "holds a control or line-separator character" "a newline in the ask reference" "${explorer_base[@]}" --set-string 'explorer.fleet.executorRefs[0]=ask' --set explorer.chat.provider=ollama,explorer.chat.model=m,explorer.chat.baseURL=http://localhost:11434 --set-string 'explorer.fleet.askExecutorRef=ask
             - -conceal-withholding=false'
 # A comma is the separator. One entry of "a,b" reaches the workspace as two
 # references, so a single element silently becomes two bindings — and the
 # collision guards compare the unsplit string, which is how an entry of "a,b"
 # passes a check against an askExecutorRef of "b". The Go side refuses that at
 # startup, so this is defence in depth rather than the only line.
+# Not every line break is ASCII. go-yaml breaks lines on U+0085, U+2028 and
+# U+2029 as well as on LF, and RE2's [[:cntrl:]] is ASCII-only -- so the guard
+# these three cover used to pass them. The arguments are quoted, so none of
+# them injects anything; what they do is reach the workspace inside the
+# reference, match no registered executor, and bind nothing while the pod
+# starts and serves normally. That is the silent failure the guard exists to
+# refuse, which is why it is refused for the same reason a newline is.
+refuses_citing "holds a control or line-separator character" "U+0085 in an allowlisted reference" "${explorer_base[@]}" --set-string "explorer.fleet.executorRefs[0]=deploy"$''"- -conceal-withholding=false"
+refuses_citing "holds a control or line-separator character" "U+2028 in an allowlisted reference" "${explorer_base[@]}" --set-string "explorer.fleet.executorRefs[0]=deploy"$' '"- -conceal-withholding=false"
+refuses_citing "holds a control or line-separator character" "U+2029 in an external reference" "${explorer_base[@]}" --set-string 'explorer.fleet.executorRefs[0]=deploy' --set-string "explorer.fleet.externalExecutorRefs[0]=deploy"$' '"- -conceal-withholding=false"
+# And a character that is non-ASCII without being a line break must still
+# render, or the widened class would be refusing ordinary values.
+assert_renders "a non-ASCII reference still renders" '^ +- "-fleet-executor-refs=d.ploy"$' "${explorer_base[@]}" --set-string "explorer.fleet.executorRefs[0]=d"$'é'"ploy"
+
 refuses_citing "holds a comma" "a comma inside one allowlisted entry" "${explorer_base[@]}" --set-string 'explorer.fleet.executorRefs[0]=deploy\,restart'
 refuses_citing "holds a comma" "a comma inside one external entry" "${explorer_base[@]}" --set-string 'explorer.fleet.executorRefs[0]=deploy' --set-string 'explorer.fleet.externalExecutorRefs[0]=deploy\,restart'
 # And the injection itself, asserted as an absence rather than as a refusal.
