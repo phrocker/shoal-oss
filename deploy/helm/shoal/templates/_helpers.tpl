@@ -194,22 +194,22 @@ every request. 0440 is readable exactly because the pod declares fsGroup 65532
 alongside it; neither half works without the other.
 */ -}}
 {{- define "shoal.llmGatewayCredentialVolume" -}}
-- name: {{ .name }}
+- name: {{ .name | quote }}
   {{- if eq .source "projected" }}
   projected:
     defaultMode: 0440
     sources:
       - serviceAccountToken:
-          path: {{ base .path }}
-          audience: {{ .audience }}
+          path: {{ base .path | quote }}
+          audience: {{ .audience | quote }}
           expirationSeconds: {{ .expirationSeconds }}
   {{- else if eq .source "secret" }}
   secret:
-    secretName: {{ .secretName }}
+    secretName: {{ .secretName | quote }}
     defaultMode: 0440
     items:
-      - key: {{ .secretKey }}
-        path: {{ base .path }}
+      - key: {{ .secretKey | quote }}
+        path: {{ base .path | quote }}
   {{- else }}
   {{- toYaml .volume | nindent 2 }}
   {{- end }}

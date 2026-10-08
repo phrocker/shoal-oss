@@ -83,7 +83,7 @@ spec:
       # account. Left to the namespace's `default`, the identity the workspace
       # authorizes would be one every pod in the namespace can also obtain a
       # token for.
-      serviceAccountName: {{ . }}
+      serviceAccountName: {{ . | quote }}
       {{- end }}
       # No Kubernetes API credential in the process that handles untrusted
       # prompt text.
@@ -157,8 +157,8 @@ spec:
       {{- end }}
       containers:
         - name: shoal-llm-gateway
-          image: "{{ $gateway.image.repository }}:{{ $gateway.image.tag }}"
-          imagePullPolicy: {{ $gateway.image.pullPolicy }}
+          image: {{ printf "%v:%v" $gateway.image.repository $gateway.image.tag | quote }}
+          imagePullPolicy: {{ $gateway.image.pullPolicy | quote }}
           command: ["/usr/local/bin/shoal-llm-gateway"]
           # Every value is trimmed on the way into the argument, and the
           # allow-list comes from the same template validate.yaml counts.
@@ -168,10 +168,10 @@ spec:
           # only has a space in a YAML list. Trimming in the guard and not here
           # would let the chart pass its own check and still render that.
           args:
-            - -listen=0.0.0.0:{{ $gateway.containerPort }}
-            - -health-address=0.0.0.0:{{ $gateway.healthPort }}
-            - -allowed-host={{ include "shoal.llmGatewayAllowedHosts" . }}
-            - -admission-url={{ trim (default "" $gateway.admission.url) }}
+            - {{ printf "-listen=0.0.0.0:%v" ($gateway.containerPort) | quote }}
+            - {{ printf "-health-address=0.0.0.0:%v" ($gateway.healthPort) | quote }}
+            - {{ printf "-allowed-host=%v" (include "shoal.llmGatewayAllowedHosts" .) | quote }}
+            - {{ printf "-admission-url=%v" (trim (default "" $gateway.admission.url)) | quote }}
             # Rendered always and explicitly, including =false.
             #
             # The acknowledgement has to reach the process or it acknowledges
@@ -183,30 +183,30 @@ spec:
             # that request carries the prompt and the operator's provider
             # credential, and a mesh authenticating the hop to the explorer
             # says nothing about the hop to a third party.
-            - -allow-plaintext-admission={{ $gateway.admission.allowPlaintext }}
+            - {{ printf "-allow-plaintext-admission=%v" ($gateway.admission.allowPlaintext) | quote }}
             {{- if $tokenFile }}
-            - -admission-token-file={{ $tokenFile }}
+            - {{ printf "-admission-token-file=%v" ($tokenFile) | quote }}
             {{- else }}
-            - -admission-token-env={{ trim (default "" $gateway.admission.tokenEnv) }}
+            - {{ printf "-admission-token-env=%v" (trim (default "" $gateway.admission.tokenEnv)) | quote }}
             {{- end }}
-            - -upstream-base-url={{ trim (default "" $gateway.upstream.baseURL) }}
+            - {{ printf "-upstream-base-url=%v" (trim (default "" $gateway.upstream.baseURL)) | quote }}
             # Model names the declaration may report. Caller-controlled text
             # never travels: an unnamed model is reported as "other", which is
             # what makes an empty list safe rather than merely permissive.
-            - -model={{ include "shoal.llmGatewayModels" . }}
+            - {{ printf "-model=%v" (include "shoal.llmGatewayModels" .) | quote }}
             {{- if $apiKeyFile }}
-            - -upstream-api-key-file={{ $apiKeyFile }}
+            - {{ printf "-upstream-api-key-file=%v" ($apiKeyFile) | quote }}
             {{- else }}
-            - -upstream-api-key-env={{ trim (default "" $gateway.upstream.apiKeyEnv) }}
+            - {{ printf "-upstream-api-key-env=%v" (trim (default "" $gateway.upstream.apiKeyEnv)) | quote }}
             {{- end }}
-            - -agent-id={{ trim (default "" $gateway.identity.agentID) }}
-            - -agent-generation={{ $gateway.identity.agentGeneration }}
-            - -capability={{ trim (default "" $gateway.identity.capability) }}
-            - -action={{ trim (default "" $gateway.identity.action) }}
-            - -source-id={{ trim (default "" $gateway.identity.sourceID) }}
-            - -policy-id={{ trim (default "" $gateway.identity.policyID) }}
-            - -lease={{ trim (default "" $gateway.admission.lease) }}
-            - -request-timeout={{ trim (default "" $gateway.upstream.requestTimeout) }}
+            - {{ printf "-agent-id=%v" (trim (default "" $gateway.identity.agentID)) | quote }}
+            - {{ printf "-agent-generation=%v" ($gateway.identity.agentGeneration) | quote }}
+            - {{ printf "-capability=%v" (trim (default "" $gateway.identity.capability)) | quote }}
+            - {{ printf "-action=%v" (trim (default "" $gateway.identity.action)) | quote }}
+            - {{ printf "-source-id=%v" (trim (default "" $gateway.identity.sourceID)) | quote }}
+            - {{ printf "-policy-id=%v" (trim (default "" $gateway.identity.policyID)) | quote }}
+            - {{ printf "-lease=%v" (trim (default "" $gateway.admission.lease)) | quote }}
+            - {{ printf "-request-timeout=%v" (trim (default "" $gateway.upstream.requestTimeout)) | quote }}
           {{- if or $envAdmission $envUpstream }}
           # Emitted only when there is something to put in it. A loopback
           # upstream needs no credential and either credential may come from a
@@ -225,18 +225,18 @@ spec:
             # In the file form there is no entry here at all. Projecting one
             # would put a second credential in the pod that nothing reads,
             # which is the ambiguity the binary refuses the two flags over.
-            - name: {{ trim (default "" $gateway.admission.tokenEnv) }}
+            - name: {{ trim (default "" $gateway.admission.tokenEnv) | quote }}
               valueFrom:
                 secretKeyRef:
-                  name: {{ trim (default "" $gateway.admission.credentialSecretName) }}
-                  key: {{ trim (default "" $gateway.admission.credentialSecretKey) }}
+                  name: {{ trim (default "" $gateway.admission.credentialSecretName) | quote }}
+                  key: {{ trim (default "" $gateway.admission.credentialSecretKey) | quote }}
             {{- end }}
             {{- if $envUpstream }}
-            - name: {{ trim (default "" $gateway.upstream.apiKeyEnv) }}
+            - name: {{ trim (default "" $gateway.upstream.apiKeyEnv) | quote }}
               valueFrom:
                 secretKeyRef:
-                  name: {{ $upstreamSecret }}
-                  key: {{ trim (default "" $gateway.upstream.credentialSecretKey) }}
+                  name: {{ $upstreamSecret | quote }}
+                  key: {{ trim (default "" $gateway.upstream.credentialSecretKey) | quote }}
             {{- end }}
           {{- end }}
           {{- if or $tokenFile $apiKeyFile }}
@@ -248,12 +248,12 @@ spec:
             # which is the entire reason these forms exist.
             {{- if $tokenFile }}
             - name: admission-token
-              mountPath: {{ dir $tokenFile }}
+              mountPath: {{ dir $tokenFile | quote }}
               readOnly: true
             {{- end }}
             {{- if $apiKeyFile }}
             - name: upstream-api-key
-              mountPath: {{ dir $apiKeyFile }}
+              mountPath: {{ dir $apiKeyFile | quote }}
               readOnly: true
             {{- end }}
           {{- end }}

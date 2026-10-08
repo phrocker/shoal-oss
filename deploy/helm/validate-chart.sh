@@ -389,6 +389,82 @@ assert_renders "both ceilings on separate references" "\-fleet-external-egress-e
 assert_renders "the ask executor beside a gateway" "\-fleet-external-executor-refs=deploy\"$" "${explorer_base[@]}" --set 'explorer.fleet.executorRefs={ask,deploy}',explorer.fleet.askExecutorRef=ask,explorer.chat.provider=ollama,explorer.chat.model=m,explorer.chat.baseURL=http://localhost:11434 --set 'explorer.fleet.externalExecutorRefs={deploy}'
 assert_renders "and the ask binding survives it" "\-fleet-ask-executor-ref=ask\"$" "${explorer_base[@]}" --set 'explorer.fleet.executorRefs={ask,deploy}',explorer.fleet.askExecutorRef=ask,explorer.chat.provider=ollama,explorer.chat.model=m,explorer.chat.baseURL=http://localhost:11434 --set 'explorer.fleet.externalExecutorRefs={deploy}'
 
+note "== a gateway value cannot carry a character that changes what the pod is given =="
+# Every string the gateway pod is rendered from is a quoted scalar now, and a
+# control character in one is refused where it is written. Before the quoting, a
+# newline in identity.capability appended an argument of the operator's choosing
+# — -allow-plaintext-admission=true among them.
+assert_renders "gateway arguments are quoted scalars" '^ +- "-capability=chat\.completions"$' "${llm_gateway_base[@]}"
+refuses_citing "holds a control character" "a newline in the capability" "${llm_gateway_base[@]}" --set-string 'llmGateway.identity.capability=chat
+            - -allow-plaintext-admission=true'
+refuses_citing "holds a control character" "a newline in the admission token variable" "${llm_gateway_base[@]}" --set-string 'llmGateway.admission.tokenEnv=TOKEN
+            - name: OTHER'
+refuses_citing "holds a control character" "a newline in an allowed host" "${llm_gateway_base[@]}" --set-string 'llmGateway.allowedHosts[0]=llm.example.test
+            - -allow-plaintext-admission=true'
+refuses_citing "holds a control character" "a newline in a model" "${llm_gateway_base[@]}" --set-string 'llmGateway.models[0]=gpt-4o
+            - -allow-plaintext-admission=true'
+refuses_citing "holds a control character" "a newline in the image tag" "${llm_gateway_base[@]}" --set-string 'llmGateway.image.tag=v1
+          securityContext: {}'
+refuses_citing "holds a comma" "a comma inside one allowed host" "${llm_gateway_base[@]}" --set-string 'llmGateway.allowedHosts[0]=a.example.test\,b.example.test'
+refuses_citing "holds a comma" "a comma inside one model" "${llm_gateway_base[@]}" --set-string 'llmGateway.models[0]=gpt-4o\,claude-opus-5'
+# Structural, so a newly added field or argument cannot be left out of it: in
+# the rendered gateway Deployment no container argument is a bare scalar, and
+# every value-shaped field is double-quoted unless it is one of the template's
+# own constants.
+gateway_scalars_quoted() {
+  local description="$1"; shift
+  local rendered stray
+  if ! rendered=$(helm template shoal "$chart" "$@" -s templates/llm-gateway-deployment.yaml 2>&1); then
+    fail "should render but was refused: $description"
+    return
+  fi
+  stray=$(printf '%s\n' "$rendered" | grep -E '^ +- -' || true)
+  stray+=$'\n'$(printf '%s\n' "$rendered" |
+    grep -E '^ +(- )?(name|key|secretName|mountPath|audience|path|image|imagePullPolicy|serviceAccountName|type): [^"]' |
+    grep -vE ': (shoal-llm-gateway|RollingUpdate|RuntimeDefault|http|health|admission-token|upstream-api-key|/readyz|/healthz)$' || true)
+  stray=$(printf '%s\n' "$stray" | sed '/^$/d')
+  if [ -n "$stray" ]; then
+    fail "an unquoted value in the gateway Deployment: $description"
+    printf '%s\n' "$stray" | head -3 | sed 's/^/      /'
+  fi
+}
+gateway_scalars_quoted "env-form credentials" "${llm_gateway_base[@]}"
+
+# Each class of rendered value is asserted quoted, so reverting the quoting of
+# any one of them fails here rather than only behind the guard.
+both_files=("${llm_gateway_base[@]}" "${valid_token_file[@]}" --set llmGateway.upstream.apiKeyFile=/etc/shoal/upstream/api-key --set llmGateway.upstream.apiKeyFileSource=secret)
+assert_renders "the env variable name is quoted" '^ +- name: "SHOAL_ADMISSION_TOKEN"$' "${llm_gateway_base[@]}"
+assert_renders "the Secret reference is quoted" '^ +name: "shoal-admission-token"$' "${llm_gateway_base[@]}"
+assert_renders "the Secret key is quoted" '^ +key: "token"$' "${llm_gateway_base[@]}"
+assert_renders "the image is quoted" '^ +image: "[^"]+"$' "${llm_gateway_base[@]}"
+assert_renders "the pull policy is quoted" '^ +imagePullPolicy: "IfNotPresent"$' "${llm_gateway_base[@]}"
+assert_renders "the Service type is quoted" '^ +type: "ClusterIP"$' "${llm_gateway_base[@]}"
+assert_renders "the ServiceAccount is quoted" '^ +serviceAccountName: "shoal-llm-gateway"$' "${both_files[@]}"
+assert_renders "a mount path is quoted" '^ +mountPath: "/var/run/secrets/shoal"$' "${both_files[@]}"
+assert_renders "a projected token audience is quoted" '^ +audience: "shoal"$' "${both_files[@]}"
+assert_renders "a projected token path is quoted" '^ +path: "token"$' "${both_files[@]}"
+assert_renders "a credential volume's Secret is quoted" '^ +secretName: "shoal-upstream-key"$' "${both_files[@]}"
+assert_renders "a credential volume's item key is quoted" '^ +- key: "api-key"$' "${both_files[@]}"
+gateway_scalars_quoted "file-form credentials" "${both_files[@]}"
+# The credential volumes are built by a helper the arguments do not pass
+# through, so its inputs carry the payload too.
+refuses_citing "holds a control character" "a newline in a credential volume's Secret key" "${both_files[@]}" --set-string 'llmGateway.upstream.credentialSecretKey=other-key
+                path: decoy
+              - key: api-key'
+refuses_citing "holds a control character" "a newline in the projected token audience" "${both_files[@]}" --set-string 'llmGateway.admission.tokenAudience=shoal
+              - secret:
+                  name: injected-secret'
+# YAML breaks lines on NEL and the Unicode line and paragraph separators as
+# well, and [[:cntrl:]] is ASCII only.
+refuses_citing "holds a control character" "a NEL in the capability" "${llm_gateway_base[@]}" --set-string "llmGateway.identity.capability=chat$(printf '\u0085')- -allow-plaintext-admission=true"
+refuses_citing "holds a control character" "a line separator in an allowed host" "${llm_gateway_base[@]}" --set-string "llmGateway.allowedHosts[0]=llm.example.test$(printf '\u2028')x"
+refuses_citing "holds a control character" "a paragraph separator in a model" "${llm_gateway_base[@]}" --set-string "llmGateway.models[0]=gpt-4o$(printf '\u2029')x"
+# The contrast: a non-ASCII character that is not a line break still renders,
+# so widening the class did not start refusing ordinary values.
+assert_renders "a non-ASCII model name still renders" '\-model=modèle-é"$' "${llm_gateway_base[@]}" --set-string 'llmGateway.models[0]=modèle-é'
+renders "a trailing newline the template trims is not a control character in the value" "${llm_gateway_base[@]}" --set-string 'llmGateway.identity.action=complete
+'
+
 note "== llm gateway guards refuse =="
 # The gateway's failure mode is not a crash. It is required to fail closed, so
 # nearly every misconfiguration below renders a pod that passes every probe and
@@ -686,9 +762,9 @@ renders "one model named"        "${llm_gateway_base[@]}" --set 'llmGateway.mode
 renders "several models named"   "${llm_gateway_base[@]}" --set 'llmGateway.models={gpt-4o,claude-opus-5}'
 # Blank entries are dropped rather than rendered, since the list is joined into
 # one argument and a comma pair is an empty model name to the binary.
-assert_renders "a blank model entry is dropped" "\-model=gpt-4o$" "${llm_gateway_base[@]}" --set 'llmGateway.models={gpt-4o, }'
-assert_renders "models render as one joined argument" "\-model=gpt-4o,claude-opus-5$" "${llm_gateway_base[@]}" --set 'llmGateway.models={gpt-4o,claude-opus-5}'
-assert_renders "no models renders an empty flag" "\-model=$" "${llm_gateway_base[@]}"
+assert_renders "a blank model entry is dropped" "\-model=gpt-4o\"$" "${llm_gateway_base[@]}" --set 'llmGateway.models={gpt-4o, }'
+assert_renders "models render as one joined argument" "\-model=gpt-4o,claude-opus-5\"$" "${llm_gateway_base[@]}" --set 'llmGateway.models={gpt-4o,claude-opus-5}'
+assert_renders "no models renders an empty flag" "\-model=\"$" "${llm_gateway_base[@]}"
 
 note "== rollout and disruption values are validated as written =="
 # These reach the API server verbatim, and their only guard cast to int first —
@@ -735,7 +811,7 @@ refuses_citing "must name a file" "a token path with a trailing slash" "${token_
 # The same path without the slash still renders, or the guard refuses the
 # feature.
 renders "a token path naming a file"  "${token_file_base[@]}" --set 'llmGateway.admission.tokenFile=/var/run/secrets/shoal/token'
-assert_renders "and the flag matches the mount" "admission-token-file=/var/run/secrets/shoal/token$" "${token_file_base[@]}"
+assert_renders "and the flag matches the mount" "admission-token-file=/var/run/secrets/shoal/token\"$" "${token_file_base[@]}"
 
 note "== no Kubernetes API credential in the prompt-processing pod =="
 # This pod needs no API access: it speaks HTTP to the workspace and HTTP to the
@@ -753,7 +829,7 @@ assert_renders "the automatic token mount is off with an operator volume" "autom
 # if it were wrong the whole projected-token form would be dead on arrival and
 # every other check here would still pass.
 assert_renders "an explicit projection survives it" "serviceAccountToken:" "${token_file_base[@]}"
-assert_renders "and keeps its audience" "audience: shoal" "${token_file_base[@]}"
+assert_renders "and keeps its audience" "audience: \"shoal\"" "${token_file_base[@]}"
 
 note "== both URLs are parsed, not prefix-matched =="
 # These guards tested hasPrefix "http://" and hasPrefix "http://localhost",
@@ -845,7 +921,7 @@ refuses "both upstream key forms chosen explicitly" "${upstream_key_file[@]}" --
 # derives the mount from the directory and the item from the base, so the flag
 # would name a directory while the credential landed inside it.
 refuses_citing "must name a file" "a key path with a trailing slash" "${upstream_key_file[@]}" --set 'llmGateway.upstream.apiKeyFile=/var/run/secrets/upstream/'
-assert_renders "the key flag matches its mount" "upstream-api-key-file=/etc/shoal/upstream/api-key$" "${upstream_key_file[@]}"
+assert_renders "the key flag matches its mount" "upstream-api-key-file=/etc/shoal/upstream/api-key\"$" "${upstream_key_file[@]}"
 refuses "a relative upstream key file"      "${upstream_key_file[@]}" --set llmGateway.upstream.apiKeyFile=upstream/api-key
 refuses "an upstream key file at the filesystem root" "${upstream_key_file[@]}" --set llmGateway.upstream.apiKeyFile=/api-key
 # Cited: with the source guard gone the chart renders an empty volume source,
