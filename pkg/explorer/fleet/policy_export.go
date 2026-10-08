@@ -17,14 +17,19 @@
 
 package fleet
 
-import "time"
+import (
+	"encoding/json"
+	"time"
+)
 
 // The functions in this file expose the registry's own validators to the
 // policy compiler in pkg/atpl, so a policy file is refused for exactly the
-// reasons a registration would be. They are thin wrappers and change no
-// behaviour: each calls the unexported function Register calls. A compiler
-// that reimplemented these checks would drift from the registry the first
-// time either changed.
+// reasons a registration would be, and to the language router in pkg/router,
+// so a proposed action input is refused, and canonicalized, for exactly the
+// reasons and in exactly the form an enqueue would. They are thin wrappers and
+// change no behaviour: each calls the unexported function Register or Enqueue
+// calls. A compiler or router that reimplemented these checks would drift from
+// the registry the first time either changed.
 
 // Canonical validates a spec against the registry's bounds at now and returns
 // the canonical form Register stores: scopes sorted and unique, capabilities
@@ -62,4 +67,15 @@ func ScopesSubset(child, parent []Scope) bool {
 // with identical schemas and no wider effects. See capabilitiesSubset.
 func CapabilitiesSubset(child, parent []Capability) bool {
 	return capabilitiesSubset(child, parent)
+}
+
+// ValidateActionInput validates input against action's input schema exactly
+// as Enqueue does, argument for argument, and returns the canonical bytes
+// Enqueue would store on the action record: the document decoded and
+// re-encoded, so duplicate keys collapse to the last value and object members
+// are ordered by key. It grants nothing; the router uses it so that the input
+// it proposes is byte for byte what an enqueue would store. See
+// validateAgainstSchema.
+func ValidateActionInput(action Action, input json.RawMessage) (json.RawMessage, error) {
+	return validateAgainstSchema(action.InputSchema, input, "action input", MaxActionPayloadBytes)
 }

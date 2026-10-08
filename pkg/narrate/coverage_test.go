@@ -451,6 +451,11 @@ func coverRecords(t *testing.T, r *observed) {
 		}
 	}
 	coverDecision(t, r)
+	for _, c := range routerCases(t) {
+		if _, err := c.run(r.Renderer); err != nil {
+			t.Fatal(err)
+		}
+	}
 }
 
 func coverDecision(t *testing.T, r *observed) {

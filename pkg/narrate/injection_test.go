@@ -15,6 +15,7 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/decision"
 	"github.com/phrocker/shoal-oss/pkg/explorer/fleet"
 	"github.com/phrocker/shoal-oss/pkg/interaction"
+	"github.com/phrocker/shoal-oss/pkg/router"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
@@ -97,6 +98,25 @@ func injectionTargets() map[string]renderFn {
 			return r.Approval(fleet.ApprovalStatus{
 				Approval: record, State: fleet.ApprovalUnresolvable, Condition: fleet.ApprovalConditionTargetMoved,
 			}, Options{})
+		},
+		"router proposal identifiers": func(t *testing.T, v string) ([]Sentence, error) {
+			// A proposal holds no input text, but its identifiers come from
+			// the registry and the graph, which other principals write.
+			p := router.Proposal{Kind: router.KindAction, Target: &router.TargetRef{Kind: router.KindAction, Action: &router.ActionRef{
+				AgentID: shoal.ID(v), AgentGeneration: 1, Capability: v, Action: v, RequiresApproval: true,
+			}}, Slots: []router.Slot{
+				{Name: "mode", Enum: v},
+				{Name: "service", NodeIDs: []shoal.ID{shoal.ID(v)}},
+			}, Input: json.RawMessage(`{}`), Receipt: router.Receipt{Router: router.Version, CatalogDigest: v, GrammarSetDigest: v}}
+			p = sealProposal(t, p)
+			return r.Proposal(p, Options{})
+		},
+		"router abstention identifiers": func(t *testing.T, v string) ([]Sentence, error) {
+			p := router.Proposal{Kind: router.KindAbstain, Reasons: []router.Reason{router.ReasonMissingSlot},
+				Target:  &router.TargetRef{Kind: router.KindLookup, Lookup: &router.LookupRef{TemplateID: v}},
+				Missing: []string{v}, Receipt: router.Receipt{Router: router.Version}}
+			p = sealProposal(t, p)
+			return r.Proposal(p, Options{})
 		},
 		"caller-asserted reason": func(t *testing.T, v string) ([]Sentence, error) {
 			return r.AssertedReason(interaction.Session{

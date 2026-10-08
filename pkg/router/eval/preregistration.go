@@ -1,0 +1,25 @@
+// Licensed to the Apache Software Foundation (ASF) under one or more
+// contributor license agreements. See the NOTICE file distributed with this
+// work for additional information regarding copyright ownership.
+
+package eval
+
+import "fmt"
+
+// PreRegisteredTestDigest is the test split's SplitDigest as recorded in
+// docs/router-evaluation.md before the test split was first run. Until it is
+// set, the test split cannot be run; once set, a test split that differs from
+// what was registered cannot be run either.
+const PreRegisteredTestDigest = ""
+
+// PreRegistered returns a split's cases. The test split is released only when
+// its digest equals the pre-registered digest.
+func PreRegistered(cases []Case, split string) ([]Case, error) {
+	if split == "test" {
+		digest := SplitDigest(cases, "test")
+		if PreRegisteredTestDigest == "" || digest != PreRegisteredTestDigest {
+			return nil, fmt.Errorf("test split %s is not the pre-registered %q", digest, PreRegisteredTestDigest)
+		}
+	}
+	return Split(cases, split), nil
+}

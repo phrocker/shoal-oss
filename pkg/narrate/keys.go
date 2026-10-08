@@ -10,6 +10,7 @@ import (
 
 	"github.com/phrocker/shoal-oss/pkg/decision"
 	"github.com/phrocker/shoal-oss/pkg/explorer/fleet"
+	"github.com/phrocker/shoal-oss/pkg/router"
 )
 
 // RequiredKeys returns every catalog key the renderers use, sorted. It is
@@ -129,5 +130,17 @@ var requiredKeySet = sync.OnceValue(func() map[string]bool {
 
 	// Interaction.
 	add("interaction.asserted_reason")
+
+	// Router proposals.
+	for _, kind := range router.Kinds {
+		if kind == router.KindAbstain {
+			continue
+		}
+		add("router.proposal."+string(kind), "router.target."+string(kind), "router.next."+string(kind))
+	}
+	for _, reason := range router.Reasons {
+		add("router.abstain." + string(reason))
+	}
+	add("router.slot", "router.next.abstain")
 	return keys
 })

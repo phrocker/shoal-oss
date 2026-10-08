@@ -193,6 +193,27 @@
     "decision.ranking.outcome": "{eligible, number} of {total, number} {total, plural, one {subject was} other {subjects were}} scored; {held, plural, =0 {none is held for ordinary inspection} one {# is held for ordinary inspection and listed first} other {# are held for ordinary inspection and listed first}}.",
     "decision.ranking.next": "Priority orders inspection only; no score, threshold or position permits excluding a subject.",
 
-    "interaction.asserted_reason": "{by} asserted the reason code {code}{detail, select, source {, naming the source {source}} digest {, with free-form detail retained only as a digest} other {}}; Shoal records this but does not verify it."
+    "interaction.asserted_reason": "{by} asserted the reason code {code}{detail, select, source {, naming the source {source}} digest {, with free-form detail retained only as a digest} other {}}; Shoal records this but does not verify it.",
+
+    "router.target.action": "action {action} of capability {capability} on agent {agent}",
+    "router.target.decision": "decision profile {profile} revision {revision} (task {task})",
+    "router.target.lookup": "lookup template {template}",
+    "router.slot": "{name} {value}",
+    "router.proposal.action": "Proposed, not run: the router proposes {target}, with {slots, list}. Nothing has been executed, enqueued or decided{approval, select, yes {, and the action would still require approval} other {}}.",
+    "router.proposal.decision": "Proposed, not run: the router proposes {target}, with {slots, list}. Nothing has been executed, enqueued or decided; the decision’s own predictor decides over its own evidence, never over the text.",
+    "router.proposal.lookup": "Proposed, not run: the router proposes {target}, with {slots, list}. Nothing has been executed, enqueued or decided; the template is answered over the graph, never from the text.",
+    "router.next.action": "To act on it, a caller would request the action through dispatch, where {approval, select, yes {admission and approval still apply} other {admission still applies}}.",
+    "router.next.decision": "To answer it, a caller would request the decision from its registered task, which computes it from its own evidence.",
+    "router.next.lookup": "To answer it, a caller would run the lookup template over the graph as it is now.",
+    "router.next.abstain": "Nothing will run from this abstention; rephrase the request, or name a registered target and its subjects.",
+    "router.abstain.empty_text": "The router abstained because the text has no words. Nothing was proposed or run.",
+    "router.abstain.text_out_of_bounds": "The router abstained because the text is longer than it reads. Nothing was proposed or run.",
+    "router.abstain.no_target": "The router abstained because the text matched no target the caller can use. Nothing was proposed or run.",
+    "router.abstain.ambiguous_target": "The router abstained because the text matched more than one target, and it does not choose between them. Nothing was proposed or run.",
+    "router.abstain.ambiguous_executor": "The router abstained because more than one agent offers the action it matched, and it does not choose between them. Nothing was proposed or run.",
+    "router.abstain.ambiguous_mention": "The router abstained on {target} because a name in the text could mean more than one thing for {missing, list}; it does not guess. Nothing was proposed or run.",
+    "router.abstain.missing_slot": "The router abstained on {target} because the text does not name {missing, list}. Nothing was proposed or run.",
+    "router.abstain.slot_mismatch": "The router abstained on {target} because what the text names does not fit {missing, list}. Nothing was proposed or run.",
+    "router.abstain.invalid_input": "The router abstained on {target} because the filled input does not match the target’s input schema. Nothing was proposed or run."
   }
 }

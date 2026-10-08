@@ -12,6 +12,7 @@ without a model (#498). It is the renderer described in
 | `decision.PredictionRecord` | `Prediction` | the result, why a whole request abstained or failed, each answer, the picture's evidence gaps, the next step |
 | `decision.EvidenceEligibility`, `decision.InspectionRanking` | `Eligibility`, `Ranking` | which subjects may be scored, and every reason a subject is held for ordinary inspection |
 | `interaction.Session` | `AssertedReason` | the caller-asserted reason, quoted and attributed |
+| `router.Proposal` | `Proposal` | what the router proposes (action, decision or lookup, with its slots) or why it abstained, always stating that nothing ran, and what a caller would do next |
 
 Nothing else is narrated. The package reads no clock, network or model; a
 narration is a function of the record and `Options`.
@@ -200,6 +201,32 @@ quote), its meaning is conditional ("if accurate"), and its next step starts
 A success or failure is "reported as succeeded (failed) by" whoever reported
 it: the claimant, or, for an admission, the identity that requested it, which
 is also who an admission's history, references and output quote name.
+
+### Router proposals
+
+`Proposal` narrates a `pkg/router` proposal (#500). The outcome sentence is
+`router.proposal.<kind>` for an action, decision or lookup, or
+`router.abstain.<reason>` for each abstention reason, and every one of them
+says the proposal is only a proposal and that nothing ran: "Proposed, not run:
+… Nothing has been executed, enqueued or decided", or "Nothing was proposed or
+run". An action's sentence says when it would still require approval, a
+decision's that its own predictor decides over its own evidence, a lookup's
+that its template is answered over the graph. The next step
+(`router.next.<kind>`, `router.next.abstain`) names the route a caller would
+take; the router takes none of them.
+
+A proposal holds no input text. Its target and slot values (agent,
+capability, action, profile, template, node IDs, enum values) are registry or
+grammar identifiers and are rendered as identifiers, quoted when they are not
+plain tokens. The receipt is in the outcome's references: `proposal`,
+`router`, `catalog`, `grammar_set`, and, when a target-choice decision was
+made, `feature_schema`, `router_task`, `picture`, `decision_request`,
+`predictor` and `prediction`. A proposal that does not validate
+(`Proposal.Validate`: an unknown kind or reason, or an ID that does not match
+its content) is refused with an error, as an unknown decision value is. Kinds
+and reasons are read from `pkg/router`'s source by the parity test, and the
+value goldens (`testdata/golden/values/router.txt`) pin the sentence of every
+kind and every reason.
 
 ## State machines
 

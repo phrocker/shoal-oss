@@ -26,6 +26,7 @@ func TestNoModelNetworkOrClock(t *testing.T) {
 		"github.com/phrocker/shoal-oss/pkg/decision":       true,
 		"github.com/phrocker/shoal-oss/pkg/explorer/fleet": true,
 		"github.com/phrocker/shoal-oss/pkg/interaction":    true,
+		"github.com/phrocker/shoal-oss/pkg/router":         true,
 		"github.com/phrocker/shoal-oss/pkg/shoal":          true,
 	}
 	for _, f := range parseDir(t, ".") {
