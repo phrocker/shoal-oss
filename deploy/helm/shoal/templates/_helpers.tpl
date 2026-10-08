@@ -352,3 +352,76 @@ requireIntOrPercent exists for, in the guard that was already there.
 true
 {{- end -}}
 {{- end -}}
+
+{{- /*
+Refuse a line break anywhere in a values subtree, naming the key that holds it.
+
+Takes a dict of path (the dotted key, for the message), value, and two lists of
+paths: free, whose subtrees are not walked at all, and trimmed, whose strings
+are checked after trimming because the templates trim them before use. Recurses
+through maps and lists; every string leaf is checked. Every other scalar kind
+(number, boolean, null) renders through Go formatting and cannot carry one.
+
+The class is [\p{Cc}\p{Zl}\p{Zp}], in a raw string so the template does not
+unescape it: the ASCII and C1 controls, which take in LF, CR and NEL, plus the
+Unicode line and paragraph separators. go-yaml breaks lines on all of those,
+and RE2's [[:cntrl:]] is ASCII only, so a narrower class lets NEL through.
+
+objectStorage.gcsKeyJson is the one value in the chart that is multi-line by
+design: a service-account key file, rendered as the body of a `|` block scalar
+through `indent 4`. indent splits on LF only, so LF (and CRLF, and tab) stay
+inside the block. A CR alone, a NEL or a separator is a line break that YAML
+sees and indent does not, and the text after it lands at column zero — outside
+the block scalar and outside the Secret. So that value keeps LF, CRLF and tab
+and is refused everything else.
+*/ -}}
+{{- define "shoal.refuseLineBreaks" -}}
+{{- $context := . -}}
+{{- if not (has .path .free) -}}
+{{- if kindIs "map" .value -}}
+{{- range $key, $child := .value -}}
+{{- include "shoal.refuseLineBreaks" (dict "path" (printf "%s.%s" $context.path $key) "value" $child "free" $context.free "trimmed" $context.trimmed) -}}
+{{- end -}}
+{{- else if kindIs "slice" .value -}}
+{{- range $index, $child := .value -}}
+{{- include "shoal.refuseLineBreaks" (dict "path" (printf "%s[%d]" $context.path $index) "value" $child "free" $context.free "trimmed" $context.trimmed) -}}
+{{- end -}}
+{{- else if kindIs "string" .value -}}
+{{- $text := .value -}}
+{{- range $prefix := .trimmed -}}
+{{- if or (eq $context.path $prefix) (hasPrefix (printf "%s." $prefix) $context.path) (hasPrefix (printf "%s[" $prefix) $context.path) -}}
+{{- $text = trim $text -}}
+{{- end -}}
+{{- end -}}
+{{- if eq .path "objectStorage.gcsKeyJson" -}}
+{{- $text = $text | replace "\r\n" "" | replace "\n" "" | replace "\t" "" -}}
+{{- end -}}
+{{- /* The message names the character and not the value: the walk reaches
+       passwords and key files, and a refusal is printed to CI logs. */ -}}
+{{- $found := regexFind `[\p{Cc}\p{Zl}\p{Zp}]` $text -}}
+{{- if $found -}}
+{{- fail (printf "%s holds %q, a line break or other control character (NEL, U+2028 and U+2029 included): the chart renders it into the manifests as a YAML scalar, and a line break there ends the scalar, so the rest of the value becomes YAML of its own — another field, another container argument, another key. No value this chart renders may carry one. A value read with --set-file keeps the file's trailing newline, so strip it" .path $found) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{- /*
+A value with a fixed textual shape, validated as written: a Kubernetes quantity,
+a Go duration, a Secret name, an enumerated field. Takes a dict of name, value,
+pattern, what (the shape, for the message) and why. An empty value is left to
+whatever already owns that case.
+
+Each of these is rendered unquoted by a template the storage profiles also
+render, and those profiles must stay byte-identical, so quoting is not
+available; the value is held to a shape that contains no YAML syntax instead.
+That matters beyond line breaks in the accumulo templates, where the value sits
+inside a flow mapping and a comma or a brace ends it on the same line: a Secret
+name of "creds, key: other" names a different key.
+*/ -}}
+{{- define "shoal.requireShape" -}}
+{{- $raw := toString (default "" .value) -}}
+{{- if and $raw (not (regexMatch .pattern $raw)) -}}
+{{- fail (printf "%s must be %s (got %q): %s" .name .what $raw .why) -}}
+{{- end -}}
+{{- end -}}

@@ -11,7 +11,10 @@ metadata:
     {{- toYaml . | nindent 4 }}
   {{- end }}
 spec:
-  type: {{ .Values.explorer.service.type }}
+  {{- /* Quoted, and held to the four Service types in validate.yaml: unquoted,
+         "ClusterIP<newline>  externalIPs: [...]" gave this Service an external
+         IP (#468). No storage profile renders this template. */}}
+  type: {{ .Values.explorer.service.type | quote }}
   selector:
     {{- include "shoal.explorerSelectorLabels" . | nindent 4 }}
   ports:

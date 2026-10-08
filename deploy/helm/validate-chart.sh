@@ -222,6 +222,33 @@ if [ -n "$repository" ] &&
         head -20 "$reference/diff" | sed 's/^/      /'
       fi
     done
+    # The explorer and gateway profiles may change bytes — quoting a scalar
+    # does — but never meaning: every object must parse to exactly what the
+    # baseline's did. This is what lets a template outside the storage
+    # profiles be quoted without a reviewer diffing manifests by eye. The
+    # explorer case names a storage class and a chat credential, so the
+    # optional fields it quotes are rendered too.
+    reference_chart="$reference/deploy/helm/shoal"
+    explorer_parsed=(--set explorer.storageClassName=fast --set explorer.chat.provider=openai-compatible,explorer.chat.model=m,explorer.chat.baseURL=https://api.example.test/v1,explorer.chat.credentialSecretName=chat --set explorer.embedding.provider=voyage,explorer.embedding.model=v3,explorer.embedding.credentialSecretName=voyage)
+    for profile in explorer llm-gateway; do
+      if [ "$profile" = explorer ]; then
+        overrides=("${valid_explorer[@]}" "${explorer_parsed[@]}")
+      else
+        overrides=("${valid_llm_gateway[@]}")
+      fi
+      # Both must render, or two identical error messages would compare equal.
+      if ! helm template shoal "$reference_chart" -f "$reference_chart/values-$profile.yaml" "${overrides[@]}" > "$reference/before" 2>&1 ||
+        ! helm template shoal "$chart" -f "$chart/values-$profile.yaml" "${overrides[@]}" > "$reference/after" 2>&1; then
+        fail "values-$profile.yaml, filled in, does not render on both $baseline and this tree, so it cannot be compared"
+      elif ! python3 - "$reference/before" "$reference/after" <<'PARSED'
+import sys, yaml
+before, after = (list(yaml.safe_load_all(open(path))) for path in sys.argv[1:])
+raise SystemExit(0 if before == after else 1)
+PARSED
+      then
+        fail "values-$profile.yaml, filled in, no longer parses to the same objects as $baseline: quoting may change bytes, never meaning"
+      fi
+    done
   else
     fail "could not export the chart at $baseline to compare against"
   fi
@@ -504,6 +531,256 @@ refuses_citing "nameOverride" "beside a full name, a newline in the name overrid
 assert_renders "a numeric-looking name override stays a string label" 'app.kubernetes.io/name: "1.5"' -f "$chart/values.yaml" --set-string fullnameOverride=shoal --set-string nameOverride=1.5
 renders "an empty fullnameOverride is unset" -f "$chart/values.yaml" --set-string fullnameOverride=
 renders "a 63-character fullnameOverride still renders" -f "$chart/values.yaml" --set-string fullnameOverride=$(printf 'a%.0s' $(seq 1 63))
+
+note "== no chart value can carry a line break (#468) =="
+# Most of the storage tier's values are rendered as bare YAML scalars, and so
+# were several of the explorer's. A newline in any of them ended the scalar and
+# the remainder became YAML of the operator's choosing: explorer.service.type
+# "ClusterIP<newline>  externalIPs: [6.6.6.6]" gave the Service an external IP.
+# The storage profiles must stay byte-identical, so their templates cannot be
+# quoted; validate.yaml instead walks every value and refuses the character,
+# naming the key.
+#
+# First the values the issue found injecting, each in a configuration that
+# renders it, so the refusal is the one standing between the payload and a
+# manifest. Each is pinned to the walk's own sentence for that key: several are
+# also shape-checked, and a refusal from the shape check would keep this
+# passing with the walk gone.
+line_break_cases=(
+  "storage image.pullPolicy IfNotPresent"
+  "storage writeTier.storageSize 50Gi"
+  "storage writeTier.dataDir /var/lib/shoal"
+  "storage writeTier.quiesceDelay 10s"
+  "storage objectStorage.credentialsSecretName shoal-object-storage-credentials"
+  "write-tls writeTier.tls.secretName shoal-tls"
+  "distributed image.pullPolicy IfNotPresent"
+  "distributed objectStorage.credentialsSecretName shoal-object-storage-credentials"
+  "read-tls readFleet.tls.secretName shoal-tls"
+  "accumulo tserver.group default"
+  "accumulo tserver.drainTimeout 30s"
+  "accumulo tserver.walStorageSize 20Gi"
+  "accumulo tserver.credentialsSecretName shoal-accumulo-write-credentials"
+  "accumulo-tls tserver.tls.secretName shoal-tls"
+  "accumulo compactor.group shoal_default"
+  "accumulo compactor.hdfsNamenode hdfs://namenode:8020"
+  "accumulo compactor.shutdownTimeout 30s"
+  "accumulo compactor.stateStorageSize 5Gi"
+  "accumulo compactor.credentialsSecretName shoal-accumulo-write-credentials"
+  "accumulo-tls compactor.tls.secretName shoal-tls"
+  "explorer explorer.storageSize 20Gi"
+  "explorer explorer.storageClassName fast"
+  "explorer explorer.stateDir /var/lib/shoal"
+  "explorer explorer.image.pullPolicy IfNotPresent"
+  "explorer explorer.service.type ClusterIP"
+)
+for line_break_case in "${line_break_cases[@]}"; do
+  read -r profile key value <<<"$line_break_case"
+  case "$profile" in
+    storage) base=(-f "$chart/values.yaml") ;;
+    write-tls) base=(-f "$chart/values.yaml" --set writeTier.tls.enabled=true) ;;
+    distributed) base=(-f "$chart/values-distributed.yaml") ;;
+    read-tls) base=(-f "$chart/values-distributed.yaml" --set readFleet.tls.enabled=true) ;;
+    accumulo) base=(-f "$chart/values-accumulo.yaml") ;;
+    accumulo-tls) base=(-f "$chart/values-accumulo.yaml" --set tserver.tls.enabled=true --set compactor.tls.enabled=true --set-string tserver.tls.secretName=shoal-tls --set-string compactor.tls.secretName=shoal-tls) ;;
+    explorer) base=("${explorer_base[@]}") ;;
+  esac
+  # The valid value renders in that configuration, so the refusals below can
+  # only be about the character.
+  renders "$key=$value ($profile)" "${base[@]}" --set-string "$key=$value"
+  refuses_citing "$key holds \"\\n\"" "a newline in $key ($profile)" "${base[@]}" --set-string "$key=$value
+  injected: true"
+  refuses_citing "$key holds \"\\u0085\"" "a NEL in $key ($profile)" "${base[@]}" --set-string "$key=${value}$(printf '\u0085')injected: true"
+  refuses_citing "$key holds \"\\u2028\"" "a line separator in $key ($profile)" "${base[@]}" --set-string "$key=${value}$(printf '\u2028')injected: true"
+done
+# The injections themselves, asserted as absences under the payload, in the
+# manner of the explorer arguments above: these are what the walk prevents, and
+# they would fail if it and the explorer's quoting were both reverted.
+assert_absent_or_refused "a newline in the explorer Service type cannot add externalIPs" "externalIPs" "${explorer_base[@]}" --set-string 'explorer.service.type=ClusterIP
+  externalIPs: [6.6.6.6]'
+assert_absent_or_refused "a newline in the write tier's storage request cannot name a storage class" "storageClassName: attacker" -f "$chart/values.yaml" --set-string 'writeTier.storageSize=1Gi
+        storageClassName: attacker'
+assert_absent_or_refused "a newline in a Secret name cannot add a volume" "name: injected" -f "$chart/values.yaml" --set-string 'objectStorage.credentialsSecretName=creds
+        - name: injected'
+# Every explorer scalar a value reaches is quoted, so the property holds for a
+# field this file does not list. Structural, in the manner of the gateway's:
+# no bare container argument, and every value-shaped field double-quoted unless
+# it is one of the template's own constants. The configuration names a storage
+# class and a credential, so the optional fields are rendered and inspected.
+explorer_scalars_quoted() {
+  local rendered stray
+  if ! rendered=$(helm template shoal "$chart" "$@" -s templates/explorer-statefulset.yaml -s templates/explorer-service.yaml 2>&1); then
+    fail "should render but was refused: the explorer's quoted scalars"
+    return
+  fi
+  stray=$(printf '%s\n' "$rendered" | grep -E '^ +- -' || true)
+  stray+=$'\n'$(printf '%s\n' "$rendered" |
+    grep -E '^ +(- )?(name|key|secretName|mountPath|image|imagePullPolicy|type|storage|storageClassName): [^"]' |
+    grep -vE ': (shoal-explore-web|shoal-explorer|shoal-explorer-headless|state|tmp|http|health|/tmp|RollingUpdate|RuntimeDefault)$' || true)
+  stray=$(printf '%s\n' "$stray" | sed '/^$/d')
+  if [ -n "$stray" ]; then
+    fail "an unquoted value in the explorer's StatefulSet or Service"
+    printf '%s\n' "$stray" | head -3 | sed 's/^/      /'
+  fi
+}
+explorer_scalars_quoted "${explorer_base[@]}" --set explorer.storageClassName=fast --set explorer.chat.provider=openai-compatible,explorer.chat.model=m,explorer.chat.baseURL=https://api.example.test/v1,explorer.chat.credentialSecretName=chat --set explorer.embedding.provider=voyage,explorer.embedding.model=v3,explorer.embedding.credentialSecretName=voyage
+# The contrasts. A non-ASCII character that is not a line break still renders,
+# in a value rendered bare and in one the explorer now quotes.
+assert_renders "a non-ASCII data directory still renders" '^ +mountPath: /var/lib/données$' -f "$chart/values.yaml" --set-string 'writeTier.dataDir=/var/lib/données'
+assert_renders "a non-ASCII explorer state root still renders" '^ +mountPath: "/var/lib/données"$' "${explorer_base[@]}" --set-string 'explorer.stateDir=/var/lib/données'
+# The subtrees the walk leaves alone are rendered through toYaml, which keeps a
+# multi-line value inside its own scalar, and an annotation may hold one.
+assert_renders "a multi-line Service annotation still renders, as one value" '^    note: \|-$' "${explorer_base[@]}" --set-string 'explorer.service.annotations.note=first
+second'
+# The service-account key file is the one value that is multi-line by design.
+# LF, CRLF and tab stay inside its block scalar; a bare CR or a NEL is a line
+# break YAML sees and `indent` does not, so it would leave the block.
+key_file="$(mktemp)"
+printf 'objectStorage:\n  gcsKeyJson: "{\\r\\n\\t\\"type\\": \\"service_account\\"\\n}\\n"\n' > "$key_file"
+assert_renders "a multi-line key file stays inside its block scalar" '^    	"type": "service_account"' -f "$chart/values.yaml" -f "$key_file"
+printf 'objectStorage:\n  gcsKeyJson: "{}\\rkind: Injected"\n' > "$key_file"
+refuses_citing 'objectStorage.gcsKeyJson holds "\r"' "a bare CR in the key file" -f "$chart/values.yaml" -f "$key_file"
+printf 'objectStorage:\n  gcsKeyJson: "{}\\Nkind: Injected"\n' > "$key_file"
+refuses_citing 'objectStorage.gcsKeyJson holds "\u0085"' "a NEL in the key file" -f "$chart/values.yaml" -f "$key_file"
+rm -f "$key_file"
+# The walk covers values the chart's values.yaml does not list, so a key added
+# to a template before its default is covered from the start.
+refuses_citing 'explorer.extra holds "\n"' "a newline in a key values.yaml does not list" -f "$chart/values.yaml" --set-string 'explorer.extra=x
+y'
+# And the refusal names the character, never the value: the walk reaches the
+# accumulo password and the key file, and refusals are printed to CI logs.
+password_refusal=$(helm template shoal "$chart" -f "$chart/values.yaml" --set-string 'readFleet.accumuloPassword=hunter2-secret
+' 2>&1 || true)
+if printf '%s' "$password_refusal" | grep -qF 'hunter2-secret'; then
+  fail "a refused password is printed in the refusal"
+fi
+if ! printf '%s' "$password_refusal" | grep -qF 'readFleet.accumuloPassword holds'; then
+  fail "a trailing newline in the accumulo password is not refused by the walk"
+fi
+
+# Then every value in values.yaml, enumerated rather than listed, so a key added
+# there later is fuzzed without anyone adding a case for it. Each leaf (an empty
+# list's first element, an empty map's new key) gets a newline payload and a NEL
+# payload on the default values, where every optional component is off — so no
+# component's own guard can be what refuses it — and the refusal has to be the
+# walk's own sentence for that key (or, for mode, the mode guard's), since a
+# shape check names the key too and must not stand in for the walk. A non-ASCII
+# value that is not a line break must render for every string-valued leaf
+# except those held to a shape.
+if ! python3 - "$chart" <<'FUZZ'
+import concurrent.futures, subprocess, sys, yaml
+
+chart = sys.argv[1]
+values = yaml.safe_load(open(chart + "/values.yaml"))
+# Mirrors $lineBreakFree in validate.yaml: rendered through toYaml and
+# legitimately multi-line.
+free = {"explorer.service.annotations", "llmGateway.service.annotations",
+        "llmGateway.admission.tokenVolume", "llmGateway.upstream.apiKeyVolume"}
+# Held to a shape (or, for mode, an enumeration) on the default values, so a
+# non-ASCII value there is refused for that reason and not this one.
+shaped = {"mode", "image.pullPolicy", "objectStorage.credentialsSecretName",
+          "writeTier.storageSize", "writeTier.quiesceDelay"}
+
+leaves = []
+def walk(path, value):
+    if path in free:
+        return
+    if isinstance(value, dict):
+        if not value:
+            leaves.append((path + ".fuzz", None))
+        for key, child in value.items():
+            walk(f"{path}.{key}" if path else key, child)
+    elif isinstance(value, list):
+        if not value:
+            leaves.append((path + "[0]", None))
+        for index, child in enumerate(value):
+            walk(f"{path}[{index}]", child)
+    else:
+        leaves.append((path, value))
+walk("", values)
+
+def helm(path, payload):
+    return subprocess.run(
+        ["helm", "template", "shoal", chart, "-f", chart + "/values.yaml",
+         "--set-string", f"{path}={payload}"],
+        capture_output=True, text=True)
+
+# The walk's own sentence, so a shape check that also names the key cannot
+# stand in for it. mode is the exception: its guard runs first and names it.
+def expected(path):
+    return "mode must be one of" if path == "mode" else f"{path} holds "
+
+def check(leaf):
+    path, default = leaf
+    problems = []
+    payloads = [("a NEL", "x\u0085injected: true")]
+    if path != "objectStorage.gcsKeyJson":
+        payloads.append(("a newline", "x\n  injected: true"))
+    for label, payload in payloads:
+        result = helm(path, payload)
+        if result.returncode == 0:
+            problems.append(f"{label} in {path} renders")
+        elif expected(path) not in result.stderr:
+            problems.append(f"{label} in {path} is refused, but not by the walk: "
+                            + result.stderr.strip().splitlines()[0][:160])
+    if isinstance(default, str) and path not in shaped:
+        result = helm(path, "x\u00e9y")
+        if result.returncode != 0:
+            problems.append(f"a non-ASCII value in {path} is refused: "
+                            + result.stderr.strip().splitlines()[0][:160])
+    return problems
+
+with concurrent.futures.ThreadPoolExecutor(8) as pool:
+    problems = [p for found in pool.map(check, leaves) for p in found]
+for problem in problems:
+    print("      " + problem)
+if len(leaves) < 150:
+    print(f"      only {len(leaves)} leaves enumerated: the walk over values.yaml is broken")
+    raise SystemExit(1)
+raise SystemExit(1 if problems else 0)
+FUZZ
+then
+  fail "a value in values.yaml can carry a line break into the manifests, or a valid one is refused (see above)"
+fi
+
+note "== unquoted values are held to their shape =="
+# The storage templates cannot be quoted, and a bare scalar is cut short by
+# " #" or turned into a map by ": " without any line break; in the accumulo
+# templates' flow mappings a comma ends it. Values with a fixed form are held
+# to it, which refuses nothing the API server or the binary would accept.
+refuses_citing "writeTier.storageSize must be a Kubernetes quantity" "a storage request that is not a quantity" -f "$chart/values.yaml" --set-string 'writeTier.storageSize=50Gi #'
+refuses_citing "explorer.storageSize must be a Kubernetes quantity" "an explorer storage request that is not a quantity" "${explorer_base[@]}" --set-string 'explorer.storageSize=fast: 20Gi'
+refuses_citing "tserver.walStorageSize must be a Kubernetes quantity" "a WAL storage request that is not a quantity" -f "$chart/values-accumulo.yaml" --set-string 'tserver.walStorageSize=20Gi}'
+refuses_citing "compactor.stateStorageSize must be a Kubernetes quantity" "a compactor storage request that is not a quantity" -f "$chart/values-accumulo.yaml" --set-string 'compactor.stateStorageSize=5Gi}'
+refuses_citing "writeTier.quiesceDelay must be a Go duration" "a bare number as the quiesce delay" -f "$chart/values.yaml" --set-string writeTier.quiesceDelay=10
+refuses_citing "readFleet.drainTimeout must be a Go duration" "a read-fleet drain timeout with no unit" -f "$chart/values-distributed.yaml" --set-string readFleet.drainTimeout=30
+refuses_citing "tserver.drainTimeout must be a Go duration" "a tserver drain timeout that is not a duration" -f "$chart/values-accumulo.yaml" --set-string 'tserver.drainTimeout=30 seconds'
+refuses_citing "compactor.shutdownTimeout must be a Go duration" "a compactor timeout that is not a duration" -f "$chart/values-accumulo.yaml" --set-string 'compactor.shutdownTimeout=30s #'
+refuses_citing "explorer.auth.oidc.clockSkew must be a Go duration" "a clock skew that is not a duration" "${explorer_base[@]}" --set-string explorer.auth.oidc.clockSkew=1minute
+refuses_citing "explorer.disclosure.mosaic.window must be a Go duration" "a mosaic window that is not a duration" "${explorer_base[@]}" --set explorer.disclosure.mosaic.maxDomains=3 --set-string explorer.disclosure.mosaic.window=hourly
+# The flow-mapping injection a line break is not needed for: a comma ends the
+# Secret name inside {name: ..., key: ...} and the rest names another key.
+refuses_citing "tserver.credentialsSecretName must be a Secret name" "a comma in the tserver's Secret name" -f "$chart/values-accumulo.yaml" --set-string 'tserver.credentialsSecretName=creds\, key: other'
+refuses_citing "compactor.credentialsSecretName must be a Secret name" "a brace in the compactor's Secret name" -f "$chart/values-accumulo.yaml" --set-string 'compactor.credentialsSecretName=creds}'
+refuses_citing "compactor.tls.secretName must be a Secret name" "a brace in the compactor's TLS Secret" -f "$chart/values-accumulo.yaml" --set compactor.tls.enabled=true --set-string 'compactor.tls.secretName=tls}}'
+refuses_citing "objectStorage.credentialsSecretName must be a Secret name" "an upper-case Secret name" -f "$chart/values.yaml" --set-string objectStorage.credentialsSecretName=Shoal
+refuses_citing "writeTier.tls.secretName must be a Secret name" "a write-tier TLS Secret that is not a name" -f "$chart/values.yaml" --set writeTier.tls.enabled=true --set-string 'writeTier.tls.secretName=tls #'
+refuses_citing "readFleet.tls.secretName must be a Secret name" "a read-fleet TLS Secret that is not a name" -f "$chart/values-distributed.yaml" --set readFleet.tls.enabled=true --set-string 'readFleet.tls.secretName=tls: x'
+refuses_citing "explorer.chat.credentialSecretName must be a Secret name" "a chat credential Secret that is not a name" "${explorer_base[@]}" --set explorer.chat.provider=openai-compatible,explorer.chat.model=m,explorer.chat.baseURL=https://api.example.test/v1 --set-string 'explorer.chat.credentialSecretName=Chat Key'
+refuses_citing "image.pullPolicy must be one of Always, IfNotPresent or Never" "an unknown pull policy" -f "$chart/values.yaml" --set-string image.pullPolicy=Sometimes
+refuses_citing "explorer.image.pullPolicy must be one of Always, IfNotPresent or Never" "an unknown explorer pull policy" "${explorer_base[@]}" --set-string explorer.image.pullPolicy=always
+refuses_citing "explorer.service.type must be one of ClusterIP, NodePort, LoadBalancer or ExternalName" "an unknown Service type" "${explorer_base[@]}" --set-string explorer.service.type=Internal
+# The contrasts: every form those fields legitimately take still renders.
+renders "decimal, binary-SI and exponent quantities" -f "$chart/values-accumulo.yaml" --set-string writeTier.storageSize=1.5Gi,tserver.walStorageSize=500M,compactor.stateStorageSize=5e9
+renders "an integer storage request" -f "$chart/values.yaml" --set writeTier.storageSize=53687091200
+renders "compound and fractional durations" -f "$chart/values-accumulo.yaml" --set-string tserver.drainTimeout=1m30s,compactor.shutdownTimeout=1.5s
+renders "zero and sub-second durations" -f "$chart/values-distributed.yaml" --set-string readFleet.quiesceDelay=0,readFleet.drainTimeout=250ms,readFleet.readinessInterval=1h
+renders "dotted Secret names" -f "$chart/values-accumulo.yaml" --set-string tserver.credentialsSecretName=shoal.accumulo-write,compactor.credentialsSecretName=shoal.accumulo-write
+renders "every pull policy" -f "$chart/values.yaml" --set-string image.pullPolicy=Never
+renders "an empty pull policy is left to the API server's default" -f "$chart/values.yaml" --set-string image.pullPolicy=
+renders "every Service type" "${explorer_base[@]}" --set-string explorer.service.type=LoadBalancer
+# Checked only where rendered: a disabled component's leftovers do not stop an
+# install that never uses them.
+renders "a disabled component's shapes are not checked" -f "$chart/values.yaml" --set-string tserver.drainTimeout=later,compactor.stateStorageSize=big,explorer.service.type=Internal
 
 note "== llm gateway guards refuse =="
 # The gateway's failure mode is not a crash. It is required to fail closed, so

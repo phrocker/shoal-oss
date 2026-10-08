@@ -1,6 +1,18 @@
 {{- if eq (include "shoal.explorerEnabled" .) "true" }}
 {{- $explorer := .Values.explorer -}}
 {{- $oidc := $explorer.auth.oidc -}}
+{{- /* Every value-derived string in this template is a quoted scalar: the
+       container arguments as whole arguments, and the image, pull policy,
+       credential references, mount path and storage request each on its own.
+       Before that, a line break in explorer.storageSize or
+       explorer.storageClassName added fields of the operator's choosing to
+       the volume claim (#468). validate.yaml refuses the character as well;
+       quoting is the half that holds if a refusal is ever lost. This template
+       is not rendered by any storage profile, so quoting changes no byte of
+       an output that must stay identical. Numbers (replicas, ports, the grace
+       period, the partition) stay bare because the API server wants them as
+       numbers, and validate.yaml's walk refuses a line break in their string
+       form. */ -}}
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -56,8 +68,8 @@ spec:
       {{- end }}
       containers:
         - name: shoal-explore-web
-          image: "{{ $explorer.image.repository }}:{{ $explorer.image.tag }}"
-          imagePullPolicy: {{ $explorer.image.pullPolicy }}
+          image: {{ printf "%v:%v" $explorer.image.repository $explorer.image.tag | quote }}
+          imagePullPolicy: {{ $explorer.image.pullPolicy | quote }}
           command: ["/usr/local/bin/shoal-explore-web"]
           args:
             # One state root: -state-dir places the corpus and the durable
@@ -155,18 +167,18 @@ spec:
           {{- if or (and $explorer.chat.credentialSecretName $explorer.chat.provider) (and $explorer.embedding.credentialSecretName $explorer.embedding.provider) }}
           env:
             {{- if and $explorer.chat.credentialSecretName $explorer.chat.provider }}
-            - name: {{ $explorer.chat.apiKeyEnv }}
+            - name: {{ $explorer.chat.apiKeyEnv | quote }}
               valueFrom:
                 secretKeyRef:
-                  name: {{ $explorer.chat.credentialSecretName }}
-                  key: {{ $explorer.chat.credentialSecretKey }}
+                  name: {{ $explorer.chat.credentialSecretName | quote }}
+                  key: {{ $explorer.chat.credentialSecretKey | quote }}
             {{- end }}
             {{- if and $explorer.embedding.credentialSecretName $explorer.embedding.provider }}
-            - name: {{ $explorer.embedding.apiKeyEnv }}
+            - name: {{ $explorer.embedding.apiKeyEnv | quote }}
               valueFrom:
                 secretKeyRef:
-                  name: {{ $explorer.embedding.credentialSecretName }}
-                  key: {{ $explorer.embedding.credentialSecretKey }}
+                  name: {{ $explorer.embedding.credentialSecretName | quote }}
+                  key: {{ $explorer.embedding.credentialSecretKey | quote }}
             {{- end }}
           {{- end }}
           ports:
@@ -176,7 +188,7 @@ spec:
               containerPort: {{ $explorer.healthPort }}
           volumeMounts:
             - name: state
-              mountPath: {{ $explorer.stateDir }}
+              mountPath: {{ $explorer.stateDir | quote }}
             # The root filesystem is read-only, and the engine writes temporary
             # files outside the state root on some paths (for example
             # internal/engine/rfile_export.go, which creates its verification
@@ -228,9 +240,9 @@ spec:
         # ReadWriteOnce is the honest access mode: one process owns this engine.
         accessModes: ["ReadWriteOnce"]
         {{- with $explorer.storageClassName }}
-        storageClassName: {{ . }}
+        storageClassName: {{ . | quote }}
         {{- end }}
         resources:
           requests:
-            storage: {{ $explorer.storageSize }}
+            storage: {{ $explorer.storageSize | quote }}
 {{- end }}
