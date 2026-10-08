@@ -6,6 +6,9 @@ reason dispatch.evidence
   The executor returned 2 evidence references from snapshot snap-4 as of 2026-10-08 12:02:00 UTC.
   record=action:act-1 snapshot=snap-4 evidence=anchor-1 evidence=anchor-2
   identifiers snap-4
+gap dispatch.gap.effect_may
+  An external effect may have occurred; reconcile with the target.
+  record=action:act-1
 history dispatch.history.requested
   alice enqueued it at 2026-10-08 12:00:00 UTC, with a deadline of 2026-10-08 14:00:00 UTC.
   record=action:act-1 principal=alice request=req-1

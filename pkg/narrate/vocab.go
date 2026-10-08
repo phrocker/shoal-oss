@@ -63,6 +63,22 @@ var FleetErrorCodes = []string{
 	"executor_error",
 }
 
+// isGatewayCode reports whether code belongs to the effects gateway's closed
+// set: a fixed code or target_rejected_NNN, exactly as errorCodeKey places
+// it. Each is assigned only once a request to a target was being bound or
+// attempted.
+func isGatewayCode(code string) bool {
+	if _, ok := TargetRejectedStatus(code); ok {
+		return true
+	}
+	for _, known := range GatewayErrorCodes {
+		if code == known {
+			return true
+		}
+	}
+	return false
+}
+
 // Who assigned an error code, as the renderer narrates it (#508, #529).
 //
 // The three are the only template decisions there are: a code Shoal itself

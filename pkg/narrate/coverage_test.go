@@ -465,10 +465,24 @@ func coverRecords(t *testing.T, r *observed) {
 			}
 		}
 	}
+	for _, state := range DispatchStates {
+		for _, record := range []fleet.ActionRecord{action(state), admission(state)} {
+			for _, flag := range []bool{true, false} {
+				record.EffectPossible = flag
+				if _, err := r.Action(record, Options{}); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}
+	}
 	for _, origin := range errorCodeOriginCases(t) {
 		for _, code := range append(sourceErrorCodes(t), "made up by an executor") {
-			if _, err := r.Action(failedWith(code, origin), Options{}); err != nil {
-				t.Fatal(err)
+			for _, flag := range []bool{true, false} {
+				record := failedWith(code, origin)
+				record.EffectPossible = flag
+				if _, err := r.Action(record, Options{}); err != nil {
+					t.Fatal(err)
+				}
 			}
 		}
 	}

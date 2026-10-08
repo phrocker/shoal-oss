@@ -49,6 +49,7 @@ func valueFamilies(t *testing.T) []valueFamily {
 	t.Helper()
 	return []valueFamily{
 		{"dispatch_states", dispatchStateCases(t)},
+		{"dispatch_effects", dispatchEffectCases(t)},
 		{"dispatch_errors", dispatchErrorCases(t)},
 		{"dispatch_transitions", dispatchTransitionCases(t)},
 		{"approval", approvalCases(t)},
@@ -86,6 +87,36 @@ func dispatchStateCases(t *testing.T) []valueCase {
 	return out
 }
 
+// dispatchEffectCases renders every source dispatch state, as an action and
+// as an admission, with EffectPossible set and clear (#538), so every
+// (state × flag) combination — the open claim's "may already have happened",
+// a terminal record's "may have occurred", and a succeeded or failed record's
+// "could not have had an external effect" — is pinned by name. The other
+// families render the fixtures' own flag.
+func dispatchEffectCases(t *testing.T) []valueCase {
+	var out []valueCase
+	for _, state := range sourceDispatchStates(t) {
+		for _, kind := range []string{"action", "admission"} {
+			build := action
+			if kind == "admission" {
+				if state == string(fleet.DispatchQueued) {
+					continue // an admission is never queued
+				}
+				build = admission
+			}
+			for _, flag := range []bool{true, false} {
+				record := build(fleet.DispatchState(state))
+				record.EffectPossible = flag
+				out = append(out, valueCase{
+					name: fmt.Sprintf("%s %s effect_possible=%v", kind, state, flag),
+					run:  func(r *Renderer) ([]Sentence, error) { return r.Action(record, Options{}) },
+				})
+			}
+		}
+	}
+	return out
+}
+
 // originLabel names an error code origin in a case name.
 func originLabel(origin fleet.ErrorCodeOrigin) string {
 	if origin == fleet.ErrorCodeOriginUnknown {
@@ -96,8 +127,9 @@ func originLabel(origin fleet.ErrorCodeOrigin) string {
 
 // dispatchErrorCases renders a failed action for every gateway and fleet
 // error code in source, including every target-rejected status, and an
-// executor's own code, under every error code origin in source: the reason
-// and next-step sentences, which vary with the code and the origin. The
+// executor's own code, under every error code origin in source, with
+// EffectPossible set and clear: the reason, effect and next-step sentences,
+// which vary with the code, the origin and the flag. The
 // outcome and the failing transition vary with the origin alone, so they are
 // rendered once per origin. The rest of a failed action is pinned by
 // dispatch_states. An origin this build does not know is not pinned here:
@@ -108,20 +140,35 @@ func dispatchErrorCases(t *testing.T) []valueCase {
 	for _, s := range sourceErrorCodeOrigins(t) {
 		origin := fleet.ErrorCodeOrigin(s)
 		for _, code := range append(sourceErrorCodes(t), "made up by an executor") {
-			record := failedWith(code, origin)
-			out = append(out, valueCase{
-				name: "failed code=" + code + " origin=" + originLabel(origin),
-				run: func(r *Renderer) ([]Sentence, error) {
-					sentences, err := r.Action(record, Options{})
-					var kept []Sentence
-					for _, s := range sentences {
-						if s.Role == RoleReason || s.Role == RoleNext {
-							kept = append(kept, s)
+			// The fixture's flag is set. A clear one (#538: the action
+			// declared no external or egress effect) changes what the page
+			// says, so both are pinned. The clear case under a gateway code
+			// is the shape #541's review reproduced (effects nil, claimed,
+			// failed by the executor with target_rejected_409): its code
+			// contradicts the declaration, so it must keep reconciliation
+			// and say the declaration may be wrong.
+			for _, flag := range []bool{true, false} {
+				record := failedWith(code, origin)
+				record.EffectPossible = flag
+				name := "failed code=" + code + " origin=" + originLabel(origin)
+				if !flag {
+					name += " effect_possible=false"
+				}
+				out = append(out, valueCase{
+					name: name,
+					run: func(r *Renderer) ([]Sentence, error) {
+						sentences, err := r.Action(record, Options{})
+						var kept []Sentence
+						for _, s := range sentences {
+							if s.Role == RoleReason || s.Role == RoleNext ||
+								strings.HasPrefix(s.Key, "dispatch.gap.effect") {
+								kept = append(kept, s)
+							}
 						}
-					}
-					return kept, err
-				},
-			})
+						return kept, err
+					},
+				})
+			}
 		}
 		record := failedWith(GatewayOutcomeUnknown, origin)
 		out = append(out, valueCase{

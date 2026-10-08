@@ -60,7 +60,94 @@ func (b *builder) actionArgs(record fleet.ActionRecord) Args {
 		"reporter":   b.reporter(record),
 		"claimed":    yesNo(record.ClaimFence > 0),
 		"origin":     errorOrigin(record.ErrorCodeOrigin),
+		"effect":     effectMode(record),
 	}
+}
+
+// What a record says about whether its action could have had an external
+// effect, as the "effect" argument selects it.
+const (
+	// effectPossible: the flag is set, or the record is not succeeded or
+	// failed. Next steps reconcile with the target.
+	effectPossible Selector = "possible"
+	// effectContradicted: the flag is clear, but the failure's code is one
+	// only an effects gateway assigns, so a target was involved. The
+	// declaration is contradicted and the record reads as possible.
+	effectContradicted Selector = "contradicted"
+	// effectDeclaredNone: the flag is clear on a success with no code. If
+	// the declaration is accurate the whole outcome is in the record, and
+	// the sentence says it on that condition. A success never advised
+	// reconciling, so no next step changes.
+	effectDeclaredNone Selector = "none"
+	// effectUnsure: the flag is clear on a failure whose code is not a
+	// gateway code: reconcile if the action reached any external system.
+	effectUnsure Selector = "unsure"
+)
+
+// effectMode reads EffectPossible on a record (#510, #538).
+//
+// What the flag means: it is set when a claim is taken, from the action's
+// declared effects (EffectMutatesExternal or EffectEgressesContent), it can
+// only rise (#461), and since #538 completion carries it forward instead of
+// asserting it. So a clear flag on a succeeded or failed record means the
+// action DECLARED no external or egress effect. It does not mean none
+// happened: ExternalEffectBinding has no floor (a descriptor may declare less
+// than its binding permits), so a remote worker on a non-declaring action can
+// still do real work. Every sentence a clear flag produces is therefore
+// attributed to the declaration and conditional on it.
+//
+// No record written before #538 reads clear on a succeeded or failed record:
+// ActionRecord.Validate required the flag on both from the first build that
+// stored one. So no era marker is needed, and a set flag reads "may" in every
+// era. A set flag is never narrowed: it is monotonic, so even a declaring
+// action whose request demonstrably never left reads set. Only an ambiguity
+// report whose outcome is request_not_sent could assert the negative, an
+// absent report is not evidence (#514), and reports are not renderer input
+// yet.
+//
+// Only the flag can make a record anything but possible. A declaration on the
+// record (an admission's admitted effects) is never read for this. A clear
+// flag is then read with the state and the code:
+//
+//   - succeeded, with no code: the conditional declaration, "its whole
+//     outcome is in this record" if the declaration is accurate. No failure
+//     says that, because none is true of a failure even under an accurate
+//     declaration: invalid_executor_output discards the output and
+//     invalid_executor_evidence the evidence.
+//   - failed, with a gateway code (GatewayErrorCodes, target_rejected_NNN):
+//     the code contradicts the declaration, since the gateway assigns it only
+//     once a request to a target was bound or attempted. That reads as
+//     possible: reconcile with the target.
+//   - failed, with any other code — fleet's own codes at any origin
+//     included: the declaration, without the outcome claim, and reconcile if
+//     the action reached any external system. Fleet assigns its codes after
+//     the worker acted (applyExecutionResult): invalid_executor_output after
+//     a reported success whose output was refused, invalid_executor_error
+//     over a worker's own code (a malformed "target_rejected_409 ", say),
+//     executor_error over a failure reported without one. So none of them
+//     says the work did not reach a target, and reconciliation is never
+//     dropped on a failure.
+//
+// A canceled record is not narrowed: it may never have been claimed, so a
+// clear flag there says only that no claim set it, and claims before #396 did
+// not set it for egress. Its next step is decided by the claim fence.
+func effectMode(record fleet.ActionRecord) Selector {
+	if record.EffectPossible {
+		return effectPossible
+	}
+	switch record.State {
+	case fleet.DispatchSucceeded:
+		if record.ErrorCode == "" {
+			return effectDeclaredNone
+		}
+		return effectUnsure
+	case fleet.DispatchFailed:
+		if isGatewayCode(record.ErrorCode) {
+			return effectContradicted
+		}
+		return effectUnsure
+	}
+	return effectPossible
 }
 
 // reporter names who reports a claimed record's outcome: the admitted caller
@@ -204,14 +291,28 @@ func (r *Renderer) Action(record fleet.ActionRecord, opts Options) ([]Sentence, 
 		}), refs...)
 	}
 
+	// Whether the action declared an external effect (see effectMode). No
+	// sentence says an effect happened, and none says one could not have: a
+	// set flag is "may", and a clear one is attributed to the declaration and
+	// conditional on it.
+	mode := effectMode(record)
+	switch mode {
+	case effectDeclaredNone:
+		b.add(RoleReason, "dispatch.effect.declared_none", args)
+	case effectUnsure:
+		b.add(RoleReason, "dispatch.effect.declared_none_unsure", args)
+	}
+
 	// What the record cannot establish.
-	//
-	// EffectPossible is read only while a claim is open, where it is set from
-	// the action's declared effects when the claim is taken. On a completed
-	// record it says nothing: completion sets it unconditionally and Validate
-	// refuses a terminal record without it (#508; #510 makes it answerable).
+	if mode == effectContradicted {
+		b.add(RoleGap, "dispatch.gap.effect_contradicted", args)
+	}
 	if record.EffectPossible && state == fleet.DispatchClaimed {
 		b.add(RoleGap, "dispatch.gap.effect_possible", args)
+	}
+	if record.EffectPossible && (state == fleet.DispatchSucceeded ||
+		state == fleet.DispatchFailed || state == fleet.DispatchCanceled) {
+		b.add(RoleGap, "dispatch.gap.effect_may", args)
 	}
 	if state == fleet.DispatchSucceeded && len(record.Evidence) == 0 {
 		b.add(RoleGap, "dispatch.gap.no_evidence", args)

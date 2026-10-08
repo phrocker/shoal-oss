@@ -2,6 +2,9 @@ outcome dispatch.outcome.succeeded
   Action close-ticket on agent agent-7 was reported as succeeded by worker-1 at 2026-10-08 12:03:00 UTC.
   record=action:act-1 agent=agent-7 request=req-1 correlation=corr-1 principal=worker-1 claim=claim-1
   identifiers close-ticket agent-7 worker-1
+gap dispatch.gap.effect_may
+  An external effect may have occurred; reconcile with the target.
+  record=action:act-1
 gap dispatch.gap.no_evidence
   The result carries no evidence references.
   record=action:act-1
