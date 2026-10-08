@@ -1,8 +1,8 @@
 # Gateway proxy: reference design
 
 How Shoal governs what an agent is permitted to *do*, as opposed to what a model
-is permitted to be told. The second is `cmd/shoal-llm-gateway` (#390,
-`docs/llm-gateway-deploy.md`). This is the design for the first (#391).
+is permitted to be told. The second is `cmd/shoal-llm-proxy` (#390,
+`docs/llm-proxy-deploy.md`). This is the design for the first (#391).
 
 Nothing here is implemented yet. It exists because two decisions in #391 were
 underdetermined in a way that would have produced the wrong deployment, and one
@@ -307,7 +307,7 @@ document is positioned to state:
 
 ## The thing that makes this different
 
-The LLM gateway governs a disclosure. If it refuses, nothing left the host, and if
+The LLM proxy governs a disclosure. If it refuses, nothing left the host, and if
 it allows, the worst case is that content reached a provider. Withholding is
 meaningful right up to the moment of the call.
 
@@ -387,7 +387,7 @@ agent ──▶ gateway ──▶ /api/v1/admission/request
 ```
 
 For agents that want "may I do this, now" semantics and cannot restructure
-around a queue. It reuses the admission seam (#388) exactly as the LLM gateway
+around a queue. It reuses the admission seam (#388) exactly as the LLM proxy
 does, and the ceiling is enforced there too: `pkg/explorer/fleet/admission.go:401` refuses a
 declaration that exceeds the registered action's effects, so Path B cannot
 declare its way to something broader than it was registered for.
@@ -427,7 +427,7 @@ decides which operations can use Path B at all and this document never stated it
 
 **The shared principal is worse than "unresolved".** The admission identity is
 derived from the decision plus a caller-chosen `request.ID`
-(`pkg/explorer/fleet/admission.go:365`, and `admissionActionID` at `:774`). With the LLM gateway's answer — one
+(`pkg/explorer/fleet/admission.go:365`, and `admissionActionID` at `:774`). With the LLM proxy's answer — one
 configured descriptor for the whole gateway — every Path B caller shares one
 admission-ID namespace keyed on a value callers pick. Caller A submitting
 caller B's in-flight `request.ID` with a different declaration gets a conflict,
@@ -666,8 +666,8 @@ deliberately, to exercise renewal, which makes the right-hand side 605 seconds
 and the predicate false at every instant. The worker would claim and then refuse
 to perform, forever.
 
-The error was transplanting `validateDurations` from the LLM gateway
-(`cmd/shoal-llm-gateway/main.go:523`), where the shape is sound **because that
+The error was transplanting `validateDurations` from the LLM proxy
+(`cmd/shoal-llm-proxy/main.go:523`), where the shape is sound **because that
 proxy has no renewal** — its lease really is the bound on the whole call. A
 renewing worker's lease is a silence interval, and an operation is expected to
 span many of them, so no lease-relative predicate can gate the start of one.
@@ -835,7 +835,7 @@ total duration bounded by the action's Deadline
 `reportWindow` has to be a defined number before any of that is normative, since
 it appears in two invariants and a grace-period calculation. It is a **fixed
 conservative margin of 5 seconds**, not a setting: the same value and the same
-reasoning as `minimumReportWindow` in `cmd/shoal-llm-gateway/admission.go:108`,
+reasoning as `minimumReportWindow` in `cmd/shoal-llm-proxy/admission.go:108`,
 because it is the same act — one authenticated POST to the explorer after the
 work is done. Making it configurable would invite an operator to tune away the
 margin that keeps a completed effect reportable, which is the one thing here
@@ -847,7 +847,7 @@ If the two ever need to differ, that is the signal to export one constant from
 unexported fives drift apart.
 
 And the invariant to enforce **at claim time, before any effect** — the same
-shape as `validateDurations` in the LLM gateway:
+shape as `validateDurations` in the LLM proxy:
 
 ```
 operationTimeout + reportWindow < Deadline - now
@@ -918,7 +918,7 @@ shoal-gateway-github    descriptor B   ServiceAccount B   Secret B   egress → 
 shoal-gateway-postgres  descriptor C   ServiceAccount C   Secret C   egress → db:5432
 ```
 
-The argument is blast radius, and it is the same argument that put the LLM gateway
+The argument is blast radius, and it is the same argument that put the LLM proxy
 in a separate process from the explorer. A single pool is one pod that can mutate
 every external system Shoal governs, holding every credential, reachable by one
 compromise of whichever target has the weakest client library. Per-surface, a
@@ -990,7 +990,7 @@ transport-level `Authorization` header between its two destinations, the target
 harvests the explorer token — and with it `complete` on every action this
 principal owns. So: redirects not followed, two separate clients, two separate
 credential stores, and the target credential attached per request rather than per
-transport. This is the same rule #417 arrived at for the LLM gateway, for the same
+transport. This is the same rule #417 arrived at for the LLM proxy, for the same
 reason, and it transfers.
 
 **Response size.** `MaxActionOutputBytes` is enforced at the explorer, after the
@@ -1068,7 +1068,7 @@ than by a check:
 
 ## Kubernetes reference
 
-Shape only; the chart lands under #387 alongside the LLM gateway's, disabled by
+Shape only; the chart lands under #387 alongside the LLM proxy's, disabled by
 default.
 
 ```yaml
@@ -1191,7 +1191,7 @@ Deployment properties, with the reasoning that is not obvious:
   because it is what tells an operator the difference between an idle queue and
   an unreachable plane.
 
-That last point is a real asymmetry with the LLM gateway, and it needs splitting by
+That last point is a real asymmetry with the LLM proxy, and it needs splitting by
 what the worker was doing when the plane went away.
 
 **For work not yet claimed, Path A denies by construction.** There is no caller
@@ -1208,7 +1208,7 @@ target. An earlier draft of this document claimed the fail-closed property
 without that qualification, which was the same mistake as claiming the fence
 protects the target: true of the record, not of the world.
 
-Path B has to deny explicitly, exactly as the LLM gateway does.
+Path B has to deny explicitly, exactly as the LLM proxy does.
 
 ## Failure modes an operator will see
 
