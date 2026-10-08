@@ -11,11 +11,11 @@ is permitted to be told. The second is `cmd/shoal-llm-gateway` (#390,
 core/extension boundary, and where ATPL policy sits. Read that for why the
 surfaces are separate; read this for how the effects gateway is built.
 
-The gateway itself is not implemented. Three of the five prerequisites it was
-blocked on now are — #435, #436 and #437 — so what remains is #438 and #430 and
-then the gateway. This document exists because two decisions in #391 were
-underdetermined in a way that would have produced the wrong deployment, and one
-of its scope items asked for a mechanism that did not exist.
+The gateway itself is not implemented. All five prerequisites it was blocked on
+now are — #435, #436, #437, #438 and #430 — so what remains is the gateway. This
+document exists because two decisions in #391 were underdetermined in a way that
+would have produced the wrong deployment, and one of its scope items asked for a
+mechanism that did not exist.
 
 **Several of its claims turned out to be worse than underdetermined.** Two
 adversarial passes against the dispatch code found **four blockers**: the
@@ -32,13 +32,31 @@ problem produces, and a gateway implementer needs that difference more than a
 tidy document. They are read first, because everything after them is contingent
 on how they were resolved.
 
+Of the two still open, the heartbeat one now has an answer recorded here and not
+yet implemented (#486), and `ClaimID` uniqueness remains a worker-side
+obligation the service does not enforce.
+
+**A further round found three more, in the prerequisites themselves rather than
+in this document**, and they share a shape worth naming because it will recur
+while the gateway is built: a mechanism correct in the service and absent from
+the surface that uses it. The claim fence bound a completion to its claim
+generation and had no field on the completion wire, so every remote worker took
+the branch the binding existed to replace. The bound on a retained delegation
+chain was not applied to the incoming one, so a legal claim produced a record
+the store refuses and left the action permanently unclaimable. And the renewal
+route audited the record's operation rather than the authorizing one, so a
+renewal across a Shoal upgrade returned 503 and cost the worker its claim.
+
+None of those is visible from the service's own tests. All three were found by
+reading the surfaces, and the first two were reproduced before being believed.
+
 - [Resolved: the action's input reaches the worker, on the claim response](#resolved-the-actions-input-reaches-the-worker-on-the-claim-response)
 - [Resolved: the claimant need not be the enqueuer](#resolved-the-claimant-need-not-be-the-enqueuer)
 - [The second blocker: every heartbeat invalidates every claim](#the-second-blocker-every-heartbeat-invalidates-every-claim)
 - [Resolved: an executor may be bound to perform an external effect](#resolved-an-executor-may-be-bound-to-perform-an-external-effect)
-- [The fourth blocker: `ClaimID` uniqueness is load-bearing and unspecified](#the-fourth-blocker-claimid-uniqueness-is-load-bearing-and-unspecified)
+- [The fourth blocker: ClaimID uniqueness is load-bearing and unspecified](#the-fourth-blocker-claimid-uniqueness-is-load-bearing-and-unspecified)
 - [What a worker actually echoes: not the fence](#what-a-worker-actually-echoes-not-the-fence)
-- [Requirements this design places on #430](#requirements-this-design-places-on-430)
+- [Requirements this design placed on #430, and how they were met](#requirements-this-design-placed-on-430-and-how-they-were-met)
 - [The thing that makes this different](#the-thing-that-makes-this-different)
 - [Two paths, and why both](#two-paths-and-why-both)
 - [What the fence does not protect](#what-the-fence-does-not-protect)
@@ -463,25 +481,72 @@ happened, which is the exact post-effect ambiguity this design exists to avoid.
 `ClaimFence` remains the right predicate for an operator asking "was this
 claimed more than once"; it is not part of the worker's protocol.
 
-## Requirements this design places on #430
+## Requirements this design placed on #430, and how they were met
 
-Renewal is a prerequisite, and these are constraints on it that only this
-document is positioned to state:
+Renewal was a prerequisite, and these were constraints on it that only this
+document was positioned to state. All three are now answerable against the
+shipped route, and the second was answered in a better way than this document
+asked for — by the parent PR rather than by #430 at all.
 
-- **Renewal must not advance `ClaimFence`.** `applyClaim` is the only writer of
-  the claimed transition and it increments the fence unconditionally
-  (`pkg/explorer/fleet/dispatch_service.go:339` onward). If renewal reuses it —
-  the architecturally obvious implementation — then every renewal breaks the
-  identity an operator uses to count re-claims, and `ClaimFence > 1` stops
-  meaning "claimed twice".
-- **Either renewal must not advance `Version`, or it must return the new one.**
-  `completeClaim` refuses on a version mismatch. If renewal is a versioned
-  mutation like every other transition in that file, a worker's
-  `expected_version` — captured at claim — is stale by exactly the number of
-  renewals, and `complete` fails with `ErrClaimLost` **because of the worker's
-  own renewals.** Every long operation would then report a false ambiguity.
-- **A refused renewal must be distinguishable from a transport failure**, or a
-  worker cannot tell "my claim is gone, treat this as ambiguous" from "retry".
+**Renewal does not advance `ClaimFence`.** `ExtendClaim` asserts the fence
+unchanged rather than advancing it (`ExpectedFence: current.ClaimFence` in its
+store mutation), and a test pins it. The separation is the route's central
+invariant: the fence identifies *which* claim, so advancing it would invalidate
+the fence the claimant is holding and break the report-under-the-same-fence
+contract — a worker would renew its lease and lose the ability to complete under
+it.
+
+**Renewal does advance `Version`, and the question stopped mattering.** This
+document asked for "either not advance `Version`, or return the new one", on the
+grounds that `completeClaim` refused on a version mismatch and a worker's
+`expected_version` would be stale by exactly the number of renewals. #438 made
+`completeClaim` bind on the **fence** instead, so a worker that supplies the
+fence it was handed needs no fresh version at all, and the renewal count is
+irrelevant to it. `ExtendClaim` returns the updated record anyway, so a caller
+that supplies no fence is also covered — but a gateway should supply the fence
+and ignore the version entirely.
+
+Worth knowing *why* that is the better answer rather than merely a different
+one: comparing the version exactly was never a generation check. It behaved like
+one only because nothing could advance the version while leaving the claim
+intact — and both the ambiguity route and the renewal do exactly that. A gateway
+that renews is precisely the caller for which the old contract breaks.
+
+**A refused renewal is distinguishable from a transport failure, and only
+partly from itself.** `ErrClaimLost` and `ErrActionConflict` both map to
+**409**, `ErrRecordingUnavailable` to 503, and a transport failure is neither —
+so the first half holds. The two 409 causes are separated only by the `message`
+field in the body, which is not a contract worth keying on.
+
+The practical rule for a gateway: **treat any 409 on a renewal as "the claim is
+gone"** and go to the ambiguity path. Both causes mean the worker no longer
+holds what it thought it held, and conflating them conservatively costs nothing
+— whereas parsing the message to retry a "mere" version conflict risks
+continuing an operation whose claim another worker now owns.
+
+Two further constraints, discovered in review rather than design:
+
+- **The route must be registered everywhere a route is registered.** It was
+  added to `requestMayCommit` and not to `workspaceOperationForRequest`, and an
+  unlisted route in the latter is a *refusal* rather than a 404 —
+  `applyWorkspaceSettings` consults it before dispatching, so a caller sending a
+  workspace ID was told the route is not registered before the handler ran. A
+  long operation is the only reason the route exists, so a workspace-scoped
+  gateway lost its claim partway through exactly the operation the renewal
+  covers. The same omission had been made for the ambiguity route.
+- **It must audit the operation that authorized *this* call**, not the one the
+  record's last transition carried. Reading the record's field passes an empty
+  operation for a record claimed by a build before that field existed, which the
+  recorder validates first and refuses — a 503. A gateway mid-long-operation
+  across a Shoal upgrade could not renew, lost its claim, and landed in the
+  ambiguity case: the outcome the route exists to prevent. `ReportAmbiguity`
+  already guarded against this and `ExecuteClaim` has an explicit empty-operation
+  fallback; the renewal had neither.
+
+Both are fixed, and both are the same shape as the blockers in the sections
+above: a mechanism that is correct in the service and absent from the surface
+that uses it. A gateway implementer should read that as a standing hazard in
+this codebase rather than as three resolved incidents.
 
 ## The thing that makes this different
 
@@ -1065,12 +1130,40 @@ Part of this is already solved and part of it is not, and an earlier draft of
 this document got the division wrong by proposing a lifecycle event the public
 route cannot carry.
 
-**The fact survives without the worker doing anything.** `EffectPossible` is set
-at claim time for external-mutating and egressing actions and is never cleared —
-only ever set true (`pkg/explorer/fleet/dispatch_service.go:376`, `:698`). It
-therefore persists across lease expiry, requeue and re-claim. A record that has
-ever been claimed for an external effect carries "an effect may have happened"
-permanently, which is the part that matters most and costs nothing.
+**The fact survives without the worker doing anything — and carries less
+information than this document assumed.** `EffectPossible` is set at claim time
+for external-mutating and egressing actions and is never cleared, so it persists
+across lease expiry, requeue and re-claim. A record that has ever been claimed
+for an external effect carries "an effect may have happened" permanently, which
+is the part that matters most and costs nothing.
+
+What this said, and what is wrong with it, is that the claim-time narrowing
+survives. It does not. The claim path sets the flag only for an action that
+declares `EffectMutatesExternal` or `EffectEgressesContent`, with a careful
+comment explaining that an action which "neither mutates externally nor
+transmits leaves its whole outcome in Shoal's own record, so nothing has to be
+assumed about it". `applyExecutionResult` then sets it **unconditionally** on
+every completion, and `ActionRecord.Validate` *refuses* a terminal record that
+lacks it. So every terminal record asserts an effect may have happened, whether
+or not one may have, and the thoughtful write runs first while the careless one
+runs last and wins.
+
+Two consequences for a gateway, both practical:
+
+- **A reader cannot use the flag on a terminal record.** It is a constant there.
+  Reconciliation filtered on it degenerates to "reconcile every terminal
+  action". The flag is informative only while a claim is open, where it does
+  reflect the declaration.
+- **There is no way to record that a dispatch failed without reaching its
+  target.** Not through `complete`, whose error code is an unauthenticated
+  string the service does not distinguish from its own; and not through the
+  flag, which the model forbids from saying so. The only place the distinction
+  can be expressed is an ambiguity report whose outcome is `request_not_sent`.
+
+That is tracked as #510, with the error-code provenance half as #508. Until
+both land, a gateway should assume an operator will have to reconcile every
+terminal external-effect action, and should size its own local logging
+accordingly — the record will not narrow the set for them.
 
 **The detail does not, and the obvious route refuses it.**
 `/api/v1/fleet/events/publish` cannot publish a lifecycle event:
@@ -1115,8 +1208,57 @@ time pressure. A route authorized like `complete` but accepting a *lost-fence*
 report would attach the detail to the record that already carries
 `EffectPossible`, which is where someone reconciling will actually look.
 
+**That is what #438 built**, and it is the second shape rather than the first:
+`POST /api/v1/fleet/actions/{action}/ambiguity`, authorized through
+`beginClaimant` like `claim` and `complete`, recognising a *displaced* claimant
+by the claim fence it was handed. A report carries an outcome
+(`request_not_sent`, `outcome_unknown`, `effect_observed`), a bounded `Target`
+and a bounded `Reference` — the opaque handle the target returned, which is the
+thing an operator takes to the other system and the reason the route is worth
+more than `EffectPossible` alone. Its `Subject` and `Actor` are recorded from
+the *decision*, not from the request, so the report is attributed rather than
+self-asserted; `ErrorCode` on a completion is not, which is #508.
+
 Either way the gateway needs an authorization separate from its dispatch
 authorization, so losing a claim does not also cost it the ability to say so.
+
+### What the route does not guarantee, and what a gateway must do about it
+
+The recourse is not unconditional, and a gateway that assumes it is will lose
+reports silently. A displaced claimant is recognised only by its entry in the
+record's `ClaimHistory`, which is bounded at eight and drops its oldest on
+overflow, and the report list is bounded at eight *per record, shared across
+every principal the record has seen*. So the route can be denied two ways, both
+reproduced (#514):
+
+- another principal in the same execute scope fills the shared report budget,
+  and the worker that actually performed the effect is refused;
+- nine re-claims evict the worker from the history, after which its report is
+  `not_found`.
+
+**A dedicated execute scope narrows this and does not remove it.** A gateway's
+own replicas share one descriptor and one principal, and a displaced holder
+needs its history entry whether or not the current claimant shares its identity.
+So a crash-looping or repeatedly-rescheduled replica set evicts its own earlier
+holders — which is the worse variant, because the victim is the same deployment
+that performed the effect.
+
+The refusal cannot be made informative. #398's existence-oracle reasoning
+requires `not_found` for any caller without standing, so a distinguishable
+refusal would confirm the action exists to every execute-holder that can guess
+an action ID. The worker therefore cannot be told whether it was evicted, denied
+a budget, or simply wrong about the action.
+
+Which fixes the gateway's obligation rather than the service's: **treat a
+refused or not-found ambiguity report as unrecorded.** Log it locally with the
+full detail, and surface it for operator reconciliation through the gateway's
+own channel. Do not retry it as though the refusal were transient, and do not
+treat a successful claim sequence as evidence that the report will land. This is
+the one mitigation that holds regardless of how #514 is resolved.
+
+And a corollary for anything reading records: **the absence of a
+`request_not_sent` report is not evidence that a request was sent.** It may mean
+the worker was denied the route.
 
 ## The unit of deployment is the operational surface
 
