@@ -12,6 +12,10 @@ interface can accept versioned measured features from a code/ontology builder,
 but verifying that builder and its exported labels remains production integration
 work. The frozen V11 experiment and paid-inference budget are unchanged.
 
+The separate [frozen code conformance experiment](FROZEN_CODE.md) imports the
+retained V9 mixed TF-IDF model and checks its historical proposals through the
+same Go provider. It does not extend this synthetic authority into production.
+
 ## Run
 
 Use a Python environment matching `requirements.txt` (Python's exact version and
