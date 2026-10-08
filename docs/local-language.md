@@ -1,9 +1,10 @@
 # Language without an LLM
 
-Design note; roadmap #497. Shoal can take text in and give text out with no
-large language model and no GPU at the point of use. It does that with a vocabulary derived
-from the knowledge graph, small CPU models, and templates over Shoal's own
-records. Everything here is proposed; the parts it builds on are cited.
+Design note; roadmap #497. This note proposes how Shoal could take text in and
+give text out with no large language model and no GPU at the point of use: a
+vocabulary derived from the knowledge graph, small CPU models, and templates over
+Shoal's own records. Everything here is proposed; the parts it builds on are
+cited, and their status is stated where it is not yet merged.
 
 ## The loop
 
@@ -30,7 +31,9 @@ source of an answer or of authority.
 The proposal never carries authority. An action still goes through admission,
 effect ceilings and, where required, approval (`docs/approval.md`). A decision
 is computed by a registered predictor over a measured picture of evidence
-(`docs/decision-contracts.md`), not by interpreting the sentence. A misleading
+(`docs/decision-contracts.md`), not by interpreting the sentence. The router's
+own target choice is itself a decision whose evidence is the text, but it only
+selects; the downstream decision never sees the text. A misleading
 phrasing can change which question is asked, never its answer. This is #419's
 rule that model scores cannot assign policy authority, applied to language.
 
@@ -46,9 +49,10 @@ closed.
 - the lookup templates.
 
 It is served as a registered typed decision (a choice question with abstention)
-through `pkg/decision`, by the same local predictors the decision track already
-runs (`docs/local-decisions.md`, #439, #441). Confidence below a threshold
-**abstains**.
+through `pkg/decision`, on the local CPU predictor path the decision track has
+prototyped (`docs/local-decisions.md`; #439 is a synthetic CPU-SVM slice, #441 an
+offline replay of a frozen classifier; production serving is still open).
+Confidence below a threshold **abstains**.
 
 **Filling the parameters** is slot extraction against the target's declared
 input schema (an action's `input_schema`, a task's input schema, a template's
@@ -74,8 +78,10 @@ Everything below is built on CPU from a graph snapshot and a document corpus. It
 is packaged with the snapshot it came from.
 
 - **Lexicon.** Canonical names, aliases, abbreviations and types of graph nodes,
-  compiled into a finite-state matcher. It links mentions to node IDs in
-  microseconds and cannot invent an entity.
+  compiled into a finite-state matcher. It links mentions in short text to node
+  IDs in microseconds and cannot invent an entity. Exact matching misses typos
+  and inflections, and an alias shared by several nodes is ambiguous; both go to
+  slot abstention rather than a guess.
 - **Tokenizer.** A subword vocabulary trained on the corpus (documents, guides,
   code comments), so internal identifiers and jargon tokenize sensibly.
 - **Embeddings, CPU-trained.** Subword word vectors or count-based vectors for
@@ -89,18 +95,22 @@ is packaged with the snapshot it came from.
 ## Small models: trained where compute exists, run on CPU
 
 A bundle may carry quantized model weights, built elsewhere and run on CPU at the
-destination. This follows the pattern of the pinned local predictors (#404 Laya,
-#439, #441).
+destination. This follows the pinned-predictor pattern prototyped in #439 and
+#441; #404 (a pinned local Laya adapter) is planned.
 
 - **Small encoders, roughly 20–100M parameters (preferred).** Fine-tuned for
   target classification, slot tagging and semantic embeddings. Contrastive
   training on pairs derived from the graph (alias and canonical name, node and
   description, question template and relation) gives domain-aware semantic
-  matching. Fine-tuning at this size is feasible on CPU; inference takes
-  milliseconds.
+  matching. Fine-tuning at this size is feasible on CPU for modest labelled
+  sets; large contrastive runs over graph-derived pairs belong at the source.
+  Inference takes milliseconds.
 - **Small decoders, roughly 0.5–3B parameters (optional).** Useful only for
   rephrasing renderer output or for grounded answers with citations. Fine-tuning
-  practically needs a GPU at the source. Their output is never authority: the
+  practically needs a GPU at the source. Quantized to 4 bits, a model of about
+  3B parameters typically generates at single-digit to low tens of tokens per
+  second on a server CPU, which bounds it to short outputs; the hardware floor is
+  an open decision below. Their output is never authority: the
   template text and its receipt remain the source of truth.
 
 **Training data** comes from three sources:
@@ -151,10 +161,14 @@ Derived artifacts disclose the data they were derived from.
 
 - **A lexicon** reveals that entities exist. It must be built per authorization
   scope, or every match must be filtered against the caller's authorization
-  before use, so an unauthorized entity matches as nothing. #373 and #374
-  concern the same residue in grounded inference.
+  before use, so an unauthorized entity matches as nothing. #373 gates questions
+  whose entities resolve to unauthorized nodes, which is this rule; #374
+  measures the related residue in grounded responses.
 - **Embeddings** leak through similarity: a neighbour can hint at a hidden node.
   They are built only from data visible to the scope they serve.
+- **The tokenizer** is trained on the corpus, and its learned merges can reveal
+  frequent internal identifiers. **Templates** reveal relation types and
+  registered actions. Both are built per scope like embeddings.
 - **Model weights memorize, and cannot be filtered after training.** Deletion
   does not unlearn weights (#419). **A model's clearance is the union of
   everything it was trained on.** It may be shipped only to recipients cleared
@@ -165,8 +179,11 @@ models**, each pinned to the others.
 
 ## Provenance and promotion
 
-Bundles are release artifacts in the decision track's existing machinery
-(`docs/decision-artifacts.md`, #405, #406):
+Bundles will be release artifacts under the machinery the decision track plans
+in #405 and #406, which is still open. The existing artifact catalog
+(`docs/decision-artifacts.md`) retains request artifacts only; it neither runs
+nor promotes models, and model weights need their own retained artifacts.
+Requirements:
 
 - content-addressed, with pinned build identity and reproducible builds;
 - lineage to the graph snapshot and to each training source;
@@ -179,7 +196,7 @@ Automated training creates challengers only.
 ## Measurement
 
 Each stage is measured in shadow mode before anything depends on it, as #409
-measures triage:
+plans for triage:
 
 - **Router:** target accuracy, slot exact-match, abstention rate and coverage,
   with honest denominators, compared against the lexical baseline.
