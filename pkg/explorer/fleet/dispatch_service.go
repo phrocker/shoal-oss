@@ -248,7 +248,8 @@ func (s *DispatchService) Claim(ctx context.Context, request ClaimRequest) (Acti
 	if request.ExpectedVersion == 0 || request.Lease <= 0 || request.Lease > MaxActionClaimTTL {
 		return ActionRecord{}, shoal.NewError(shoal.ErrorInvalidArgument, "claim version or lease is invalid")
 	}
-	current, claimedAction, err := s.authorizedClaimant(ctx, decision, request.ID, now)
+	current, claimedAction, authorizing, err := s.authorizedClaimant(
+		ctx, decision, request.ID, now)
 	if err != nil {
 		return ActionRecord{}, err
 	}
@@ -349,11 +350,12 @@ func (s *DispatchService) Claim(ctx context.Context, request ClaimRequest) (Acti
 	next := cloneActionRecord(current)
 	next.Version++
 	next, err = applyClaim(
-		next, claimedAction, request.ClaimID, request.Lease, decision, now)
+		next, claimedAction, request.ClaimID, request.Lease,
+		decision, authorizing, now)
 	if err != nil {
 		return ActionRecord{}, err
 	}
-	if err := s.recorder.RecordAction(ctx, ActionAudit{Phase: "claim_admission", Operation: auth.OperationInvoke, Record: next}); err != nil {
+	if err := s.recorder.RecordAction(ctx, ActionAudit{Phase: "claim_admission", Operation: authorizing, Record: next}); err != nil {
 		return ActionRecord{}, errors.Join(ErrRecordingUnavailable, err)
 	}
 	stored, err := s.store.ApplyAction(ctx, DispatchMutation{
@@ -391,9 +393,11 @@ func applyClaim(
 	claimID []byte,
 	lease time.Duration,
 	decision auth.Decision,
+	authorizing auth.Operation,
 	now time.Time,
 ) (ActionRecord, error) {
 	record.State = DispatchClaimed
+	record.TransitionOperation = authorizing
 	// An external-effect action is possibly-effected from the moment it is
 	// claimed, not from the moment it is executed.
 	//
@@ -455,7 +459,7 @@ func applyClaim(
 	record.TransitionCorrelationID = decision.CorrelationID()
 	record.AuthorizedOperations = canonicalOperations(append(
 		record.AuthorizedOperations,
-		decisionOperations(decision, auth.OperationInvoke)...))
+		decisionOperations(decision, authorizing)...))
 	fingerprint, err := auth.AuthorizationFingerprint(decision)
 	if err != nil {
 		return ActionRecord{}, err
@@ -496,12 +500,15 @@ func (s *DispatchService) ExecuteClaim(ctx context.Context, claimed ActionRecord
 	// branch and answered with a 200 carrying the enqueuer's output. A worker
 	// that performed the work is told it was recorded, as something else.
 	//
-	// Verified by execution, and only reachable where an in-process executor
-	// is bound: a gateway reference is deliberately remote-bound, so
-	// ExecuteClaim refuses it earlier for want of an ActionExecutor. That
-	// makes this a pre-existing hazard for ordinary in-process actions rather
-	// than a gateway one, which is also why two earlier attempts to reproduce
-	// it against a gateway fixture came back clean.
+	// Verified by execution. An earlier version of this comment scoped it to
+	// "only reachable where an in-process executor is bound" and said a
+	// gateway reference is refused earlier for want of an ActionExecutor. Both
+	// halves are wrong and the second is wrong structurally: the executor type
+	// assertion lives in resolveAction, which this function reaches *after*
+	// these gates, so nothing about an executor binding can refuse ahead of
+	// them. And pkg/explorer/webapi.AskExecutor is a real in-process
+	// ActionExecutor for explorer.reason/ask, so the hole was live in the
+	// shipped configuration rather than confined to a hypothetical one.
 	if !holdsClaimOn(decision, claimed) {
 		return ActionRecord{}, shoal.NewError(
 			shoal.ErrorUnauthorized, "execution identity does not hold the claim")
@@ -533,6 +540,10 @@ func (s *DispatchService) ExecuteClaim(ctx context.Context, claimed ActionRecord
 		}
 		return ActionRecord{}, err
 	}
+	storedDecision, err := s.resolver.Resolve(ctx)
+	if err != nil {
+		return ActionRecord{}, err
+	}
 	// The durable marker identifies admissions regardless of their identity
 	// format, including admissions written before the reserved prefix existed.
 	// This check rejects those records without treating an ordinary action in
@@ -547,7 +558,37 @@ func (s *DispatchService) ExecuteClaim(ctx context.Context, claimed ActionRecord
 	if current.isAdmission() {
 		return ActionRecord{}, auth.ObjectNotFound()
 	}
-	if current.State.terminal() && current.Version == claimed.Version+1 &&
+	// Against the stored record, and above the replay branch below it.
+	//
+	// The gates at the top of this function compare against the argument, and
+	// the argument is the caller's. A caller that writes its own principal
+	// into both the action slots and the claimant slots of a fabricated record
+	// satisfies them both, and the branch below then returns the *stored*
+	// record — its input, its executor key, its claim ID and its claimant —
+	// for any (ID, ClaimID, version, fence) tuple it can produce. Pull hands
+	// every one of those to any execute-holder once a lease lapses.
+	//
+	// So the checks that matter are these, not those. The ones above stay as a
+	// cheap early refusal on the normal path, where the argument is a record
+	// this service just produced.
+	//
+	// Normalised to not-found rather than unauthorized, because distinguishing
+	// them tells a caller that the action exists — the same three-way oracle
+	// (absent / present with the wrong claim / present with the right one)
+	// that the refusals in Claim were normalised to close.
+	if !sameActionPrincipal(storedDecision, current) ||
+		!holdsClaimOn(storedDecision, current) {
+		return ActionRecord{}, auth.ObjectNotFound()
+	}
+	// Succeeded or failed only, matching completeClaim's replay branch and for
+	// its reason: Cancel also lands on a terminal state at exactly version+1
+	// while preserving the ClaimID it cancelled, so accepting any terminal
+	// state would hand a late caller the cancelled record and a success.
+	// Unreachable through Invoke today, since Cancel refuses a live claim and
+	// this function requires one, but it is the same asymmetry and it should
+	// not read differently in the two places.
+	if (current.State == DispatchSucceeded || current.State == DispatchFailed) &&
+		current.Version == claimed.Version+1 &&
 		current.ClaimFence == claimed.ClaimFence &&
 		bytes.Equal(current.ClaimID, claimed.ClaimID) {
 		if err := s.publishTransition(
@@ -563,7 +604,7 @@ func (s *DispatchService) ExecuteClaim(ctx context.Context, claimed ActionRecord
 		current.State != DispatchClaimed || !now.Before(current.ClaimLeaseUntil) {
 		return ActionRecord{}, ErrClaimLost
 	}
-	if err := s.recorder.RecordAction(ctx, ActionAudit{Phase: "effect_admission", Operation: auth.OperationInvoke, Record: current}); err != nil {
+	if err := s.recorder.RecordAction(ctx, ActionAudit{Phase: "effect_admission", Operation: current.TransitionOperation, Record: current}); err != nil {
 		return ActionRecord{}, errors.Join(ErrRecordingUnavailable, err)
 	}
 	invocationDecision, err := s.resolver.Resolve(ctx)
@@ -626,7 +667,10 @@ func (s *DispatchService) ExecuteClaim(ctx context.Context, claimed ActionRecord
 			CorrelationID: current.CorrelationID, Deadline: current.Deadline,
 		})
 	}()
-	return s.applyExecutionResult(ctx, current, action, result, executionErr)
+	// In-process execution reaches here only through the enqueuer, which is
+	// gated on sameActionPrincipal above, so invoke is what authorized it.
+	return s.applyExecutionResult(
+		ctx, current, action, result, auth.OperationInvoke, executionErr)
 }
 
 // CompleteClaim records the outcome of work a remote executor performed out of
@@ -698,7 +742,8 @@ func (s *DispatchService) completeClaim(
 		return ActionRecord{}, shoal.NewError(
 			shoal.ErrorInvalidArgument, "a failed completion requires an error code")
 	}
-	current, action, err := s.authorizedClaimant(ctx, decision, request.ID, now)
+	current, action, authorizing, err := s.authorizedClaimant(
+		ctx, decision, request.ID, now)
 	if err != nil {
 		return ActionRecord{}, err
 	}
@@ -817,7 +862,8 @@ func (s *DispatchService) completeClaim(
 	if request.Failed {
 		executionErr = shoal.NewError(shoal.ErrorInternal, "remote executor reported failure")
 	}
-	return s.applyExecutionResult(ctx, current, action, request.Result, executionErr)
+	return s.applyExecutionResult(
+		ctx, current, action, request.Result, authorizing, executionErr)
 }
 
 // applyExecutionResult is the terminal transition: it turns an ExecutionResult
@@ -837,10 +883,15 @@ func (s *DispatchService) applyExecutionResult(
 	current ActionRecord,
 	action Action,
 	result ExecutionResult,
+	authorizing auth.Operation,
 	executionErr error,
 ) (ActionRecord, error) {
 	finishNow := s.clock().UTC()
 	next := cloneActionRecord(current)
+	// The completion is a transition of its own and is authorized separately
+	// from the claim, so it records its own operation rather than inheriting
+	// the claim's.
+	next.TransitionOperation = authorizing
 	next.Version++
 	next.UpdatedAt = finishNow
 	next.EffectPossible = true
@@ -931,7 +982,7 @@ func (s *DispatchService) applyExecutionResult(
 	next.TransitionRequestID = finalDecision.RequestID()
 	next.TransitionCorrelationID = finalDecision.CorrelationID()
 	if err := s.recorder.RecordAction(ctx, ActionAudit{
-		Phase: "effect_outcome", Operation: auth.OperationInvoke, Record: next, EffectError: executionErr,
+		Phase: "effect_outcome", Operation: authorizing, Record: next, EffectError: executionErr,
 	}); err != nil {
 		return ActionRecord{}, errors.Join(ErrExecutionAmbiguous, ErrRecordingUnavailable, err)
 	}
@@ -1521,19 +1572,20 @@ func (s *DispatchService) deadline(ctx context.Context, request RequestContext) 
 // in is exactly how that gets reopened.
 func (s *DispatchService) authorizedClaimant(
 	ctx context.Context, decision auth.Decision, id []byte, now time.Time,
-) (ActionRecord, Action, error) {
+) (ActionRecord, Action, auth.Operation, error) {
 	record, action, err := s.authorizedCurrent(ctx, decision, id, auth.OperationExecute, false, now)
 	if err == nil {
-		return record, action, nil
+		return record, action, auth.OperationExecute, nil
 	}
 	// Only an authorization answer is worth a second attempt. A malformed ID or
 	// a store failure is the same answer either way, and retrying it would turn
 	// one fault into two store reads.
 	if !shoal.IsErrorCode(err, shoal.ErrorNotFound) &&
 		!shoal.IsErrorCode(err, shoal.ErrorUnauthorized) {
-		return ActionRecord{}, Action{}, err
+		return ActionRecord{}, Action{}, "", err
 	}
-	return s.authorizedCurrent(ctx, decision, id, auth.OperationInvoke, true, now)
+	record, action, err = s.authorizedCurrent(ctx, decision, id, auth.OperationInvoke, true, now)
+	return record, action, auth.OperationInvoke, err
 }
 
 // authorizedCurrent resolves an existing action for one operation.

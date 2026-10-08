@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -1294,12 +1295,19 @@ func TestCloningARecordDoesNotShareTheClaimantChain(t *testing.T) {
 
 // inProcessExecutor runs and returns a fixed result, changing nothing else.
 //
-// Needed because the fixture's default executor is remote-bound — which is what
-// a gateway reference is, deliberately — so ExecuteClaim refuses it before any
-// identity check. Two attempts to reproduce the defect below came back clean for
-// exactly that reason, and then for a second: breakingExecutor broke its own
-// descriptor, so the refusal came from the post-effect check instead. A fixture
-// that refuses for the wrong reason reads exactly like a fixed bug.
+// It is not what makes the branch below reachable, and an earlier version of
+// this comment claimed it was. The fixture's default remoteBoundExecutor does
+// implement ActionExecutor — it only errors when invoked — so resolveAction
+// resolves it fine, and the test still catches the both-gates-deleted mutation
+// without this binding. What it does is let the primary assertion fire directly
+// rather than through a post-condition, which is worth having and is a smaller
+// claim.
+//
+// The two failed reproductions that produced that wrong explanation are worth
+// keeping, because both refused for reasons unrelated to the defect: the
+// default executor errors on invocation, and breakingExecutor breaks its own
+// descriptor so the refusal comes from the post-effect check. A fixture that
+// refuses for the wrong reason reads exactly like a fixed bug.
 type inProcessExecutor struct{}
 
 func (*inProcessExecutor) Execute(
@@ -1437,4 +1445,167 @@ func TestAnEnqueuerCannotReplayAnotherPrincipalsClaim(t *testing.T) {
 		t.Fatalf("the replay branch handed the enqueuer a live claim it does "+
 			"not hold: state=%s claim=%q", replayed.State, replayed.ClaimID)
 	}
+}
+
+// TestAForgedRecordCannotRetrieveAnothersAction closes the door that opens when
+// a method takes a record instead of an ID.
+//
+// ExecuteClaim is handed an ActionRecord, and its two entry checks compare the
+// caller against *that argument*. A caller that writes its own principal into
+// both the action slots and the claimant slots satisfies both trivially. The
+// replay branch below then loads the record by ID and returns it — the victim's
+// input, executor key, claim ID and claimant chain — for any (ID, ClaimID,
+// version, fence) tuple the caller can produce, and Pull hands every one of
+// those to any execute-holder once a lease lapses.
+//
+// So the checks that bind are the ones below the load, and they have to sit
+// above the branch that returns the record. The entry checks stay as a cheap
+// early refusal on the normal path, where the argument is a record this service
+// just produced.
+//
+// The refusal is not-found rather than unauthorized, because the three answers
+// a forged argument would otherwise separate — absent, present under another
+// claim, present under this one — are the same oracle the refusals in Claim
+// were normalised to close.
+func TestAForgedRecordCannotRetrieveAnothersAction(t *testing.T) {
+	fixture := newExecutorClaimFixture(t)
+	fixture.bindExecutor(t, &inProcessExecutor{})
+	worker := fixture.namedWorker(t, "worker", auth.OperationExecute)
+
+	claimed, err := fixture.service.Claim(worker, ClaimRequest{
+		ID: fixture.queued.ID, ExpectedVersion: fixture.queued.Version,
+		ClaimID: []byte("worker-claim"), Lease: time.Minute,
+		Context: dispatchContext(fixture.now, "worker-request"),
+	})
+	if err != nil {
+		t.Fatalf("the worker could not claim: %v", err)
+	}
+	// Completed, so the record is terminal at claimed.Version+1 — the replay
+	// branch's own condition, and the state in which it returns the record.
+	if _, err := fixture.service.CompleteClaim(worker, CompletionRequest{
+		ID: fixture.queued.ID, ExpectedVersion: claimed.Version,
+		ClaimID: []byte("worker-claim"),
+		Result:  ExecutionResult{Output: json.RawMessage(`{"ok":true}`)},
+		Context: dispatchContext(fixture.now, "worker-request"),
+	}); err != nil {
+		t.Fatalf("the worker could not complete: %v", err)
+	}
+
+	stranger := bindDecision(t, fixture.authority, dispatchDecisionFor(t,
+		principal{
+			subject: "stranger-subject", actor: "stranger-actor",
+			request: "stranger-request",
+		}, auth.OperationExecute, auth.OperationInvoke))
+
+	// Every field here is either knowable from a pull page or chosen by the
+	// attacker. resolveAction is hardcoded to OperationInvoke, so the caller
+	// needs invoke as well as execute — which makes the reachable set wider
+	// than execute-holders, not narrower.
+	forged := ActionRecord{
+		ID: fixture.queued.ID, Version: claimed.Version,
+		ClaimFence: claimed.ClaimFence, ClaimID: []byte("worker-claim"),
+		State: DispatchClaimed, ClaimLeaseUntil: fixture.now.Add(time.Hour),
+		Deadline: fixture.now.Add(time.Hour), AgentID: claimed.AgentID,
+		AgentGeneration: claimed.AgentGeneration, Capability: claimed.Capability,
+		Action: claimed.Action, SourceID: claimed.SourceID,
+		PolicyID: claimed.PolicyID, ObjectID: claimed.ObjectID,
+		Subject: "stranger-subject", Actor: "stranger-actor",
+		ClaimantSubject: "stranger-subject", ClaimantActor: "stranger-actor",
+	}
+
+	got, err := fixture.service.ExecuteClaim(stranger, forged)
+	if err == nil {
+		t.Fatalf("a forged record argument returned another principal's "+
+			"action: input=%s output=%s claim=%q claimant=%q",
+			got.Input, got.Output, got.ClaimID, got.ClaimantSubject)
+	}
+	if !shoal.IsErrorCode(err, shoal.ErrorNotFound) {
+		t.Fatalf("the refusal separates an existing action from an absent one, "+
+			"which is the oracle a forged argument would otherwise probe: %v", err)
+	}
+}
+
+// TestARecordNamesTheOperationThatAuthorizedItsTransition joins the two halves
+// of the fix that made #437's capability work end to end.
+//
+// The event publisher authorizes the publishing decision against an operation
+// it selects per event kind. It used to hardcode invoke for a claim, which a
+// worker holding only execute does not have — so the publication failed, and a
+// failed publication is returned as ErrActionCommitted, meaning the transition
+// was durably written and the worker was told to reconcile an outcome that had
+// in fact been recorded. The publisher reads record.TransitionOperation now,
+// and this is the test that the record carries the truth for it to read.
+//
+// AuthorizedOperations cannot serve that purpose and this asserts why:
+// decisionOperations returns the operation it is handed without consulting the
+// decision, so the list asserts a capability rather than observing one. It
+// happened to be right while every claim was authorized under invoke.
+//
+// Without this, the whole plumbing from authorizedClaimant through applyClaim
+// could be replaced by a hardcoded invoke and only the publisher's own tests
+// would notice — and they set the field by hand, so they would not.
+func TestARecordNamesTheOperationThatAuthorizedItsTransition(t *testing.T) {
+	t.Run("a claim taken under execute", func(t *testing.T) {
+		fixture := newExecutorClaimFixture(t)
+		worker := fixture.namedWorker(t, "worker", auth.OperationExecute)
+
+		claimed, err := fixture.service.Claim(worker, ClaimRequest{
+			ID: fixture.queued.ID, ExpectedVersion: fixture.queued.Version,
+			ClaimID: []byte("worker-claim"), Lease: time.Minute,
+			Context: dispatchContext(fixture.now, "worker-request"),
+		})
+		if err != nil {
+			t.Fatalf("the worker could not claim: %v", err)
+		}
+		if claimed.TransitionOperation != auth.OperationExecute {
+			t.Fatalf("the claim records %q, so the publisher authorizes the "+
+				"worker against an operation it does not hold and the claim "+
+				"returns 503", claimed.TransitionOperation)
+		}
+		// And the record's operation list carries execute rather than
+		// asserting invoke, because the publisher cross-checks the two.
+		if !slices.Contains(claimed.AuthorizedOperations, auth.OperationExecute) {
+			t.Fatalf("AuthorizedOperations is %v and does not carry execute, "+
+				"so the publisher's provenance check refuses the operation the "+
+				"record names", claimed.AuthorizedOperations)
+		}
+		if slices.Contains(claimed.AuthorizedOperations, auth.OperationInvoke) {
+			t.Fatalf("AuthorizedOperations is %v and asserts invoke, which no "+
+				"principal in this record's history held",
+				claimed.AuthorizedOperations)
+		}
+
+		// The completion is its own transition and records its own operation.
+		done, err := fixture.service.CompleteClaim(worker, CompletionRequest{
+			ID: fixture.queued.ID, ExpectedVersion: claimed.Version,
+			ClaimID: []byte("worker-claim"),
+			Result:  ExecutionResult{Output: json.RawMessage(`{"ok":true}`)},
+			Context: dispatchContext(fixture.now, "worker-request"),
+		})
+		if err != nil {
+			t.Fatalf("the worker could not complete: %v", err)
+		}
+		if done.TransitionOperation != auth.OperationExecute {
+			t.Fatalf("the completion records %q", done.TransitionOperation)
+		}
+	})
+
+	t.Run("a claim taken by the enqueuer under invoke", func(t *testing.T) {
+		fixture := newExecutorClaimFixture(t)
+		claimed, err := fixture.service.Claim(fixture.enqueuer, ClaimRequest{
+			ID: fixture.queued.ID, ExpectedVersion: fixture.queued.Version,
+			ClaimID: []byte("own-claim"), Lease: time.Minute,
+			Context: dispatchContext(fixture.now, "request"),
+		})
+		if err != nil {
+			t.Fatalf("the enqueuer could not claim: %v", err)
+		}
+		// The enqueuer holds dispatch and invoke and not execute, so it takes
+		// the invoke route and the record must say so — asserting execute for
+		// everything would be as wrong as asserting invoke for everything.
+		if claimed.TransitionOperation != auth.OperationInvoke {
+			t.Fatalf("the enqueuer's own claim records %q, want invoke",
+				claimed.TransitionOperation)
+		}
+	})
 }

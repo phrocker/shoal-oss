@@ -1131,3 +1131,41 @@ func bytesOf(value byte, count int) []byte {
 	}
 	return result
 }
+
+// TestLifecyclePublicationPermitsEnumeratesEveryKind pins the operation set per
+// kind, including the two that accept more than one.
+//
+// This is the second gate the capability failed at, in pkg/explorer/fleetevents
+// rather than in the publisher, and it failed for the same reason: it named one
+// expected operation per kind with an ad-hoc exception beside it at the call
+// site. A table makes the whole rule visible in one place.
+func TestLifecyclePublicationPermitsEnumeratesEveryKind(t *testing.T) {
+	for _, probe := range []struct {
+		kind      string
+		operation auth.Operation
+		permitted bool
+	}{
+		{"action.enqueued", auth.OperationDispatch, true},
+		{"action.enqueued", auth.OperationInvoke, true},
+		{"action.enqueued", auth.OperationExecute, false},
+		{"action.canceled", auth.OperationDispatch, true},
+		{"action.canceled", auth.OperationInvoke, false},
+		{"action.canceled", auth.OperationExecute, false},
+		{"action.claimed", auth.OperationInvoke, true},
+		{"action.claimed", auth.OperationExecute, true},
+		{"action.claimed", auth.OperationDispatch, false},
+		{"action.completed", auth.OperationExecute, true},
+		{"action.failed", auth.OperationExecute, true},
+		{"action.completed", auth.OperationDispatch, false},
+		// Not a lifecycle kind at all, so no operation publishes it through
+		// the trusted path.
+		{"gateway.effect_ambiguous", auth.OperationExecute, false},
+		{"gateway.effect_ambiguous", auth.OperationEventPublish, false},
+	} {
+		if got := lifecyclePublicationPermits(
+			probe.kind, probe.operation); got != probe.permitted {
+			t.Errorf("lifecyclePublicationPermits(%q, %q) = %v, want %v",
+				probe.kind, probe.operation, got, probe.permitted)
+		}
+	}
+}

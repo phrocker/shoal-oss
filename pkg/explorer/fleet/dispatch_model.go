@@ -129,6 +129,26 @@ type ActionRecord struct {
 	// reload would change it for every worker at once and strand every
 	// in-flight claim — each one mid-effect, with no way to report. Identity
 	// is the question being asked, so identity is what is stored.
+	// TransitionOperation is the operation that authorized the transition this
+	// record is currently in, as distinct from the operations its enqueuer
+	// held.
+	//
+	// AuthorizedOperations cannot answer this. It accumulates across
+	// transitions and, worse, it accumulates a *claim* rather than a fact:
+	// applyClaim merges decisionOperations(decision, OperationInvoke), and
+	// decisionOperations does not consult the decision at all — it returns the
+	// operation it was handed. So before #437, when every claim was authorized
+	// under invoke, the field happened to be true; after it, a record claimed
+	// under execute still asserts invoke.
+	//
+	// That mattered beyond the audit trail. The event publisher selects an
+	// operation per event kind and then authorizes the publishing decision
+	// against it, so a claim authorized under execute was published under
+	// invoke — which the claimant does not hold — and the publication failed.
+	// A failed publication is reported as ErrActionCommitted, so the write
+	// landed and the worker was told to reconcile. Recording the real
+	// operation is what lets the publisher ask the right question.
+	TransitionOperation  auth.Operation
 	ClaimantSubject      shoal.ID
 	ClaimantActor        shoal.ID
 	ClaimantClientID     shoal.ID

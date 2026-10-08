@@ -27,6 +27,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -831,4 +832,182 @@ func (g *changingDispatchGeneration) CurrentPolicyGeneration(
 		return 1, nil
 	}
 	return 2, nil
+}
+
+// TestActionEventPublisherAllowsAForeignClaimant is the test whose absence let
+// #437's capability ship not working.
+//
+// The publisher compared the publishing decision against the record's own
+// principal for every event kind. applyClaim deliberately leaves that principal
+// alone — a record claimed by a worker still names its enqueuer — so a worker's
+// claim and completion both failed to publish. A failed publication is returned
+// as ErrActionCommitted, which the HTTP layer maps to 503 "fleet action outcome
+// requires reconciliation". The transition was durably written and the worker
+// was told to reconcile an outcome that had in fact been recorded.
+//
+// Nothing in pkg/explorer/fleet could see it: those tests bind a no-op event
+// sink, so the publisher they exercise is not this one. That is why this test
+// lives here, beside the real publisher, rather than there.
+func TestActionEventPublisherAllowsAForeignClaimant(t *testing.T) {
+	now := time.Date(2026, 9, 7, 10, 0, 0, 0, time.UTC)
+	config := runtimeConfig(t.TempDir())
+	runtime, err := explorercoord.Open(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.Close()
+	backend, err := New(runtime, config.Domain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The publishing identity holds execute and not invoke, as a gateway
+	// worker's does.
+	publisher := dispatchEventPublisher(
+		t, backend, now, restartGenerationReader{}, restartAuditor{},
+		auth.OperationExecute)
+
+	for _, kind := range []string{
+		"action.claimed", "action.completed", "action.failed",
+	} {
+		t.Run(kind, func(t *testing.T) {
+			record := foreignClaimantRecord(t, now, kind)
+			if err := publisher.PublishActionEvent(
+				context.Background(), kind, record); err != nil {
+				t.Fatalf("a worker that claimed work it did not enqueue cannot "+
+					"publish %s, so its claim returns 503 and the write it "+
+					"already made is reported as needing reconciliation: %v",
+					kind, err)
+			}
+		})
+	}
+}
+
+// TestActionEventPublisherRefusesANonClaimant is the other half: widening the
+// identity rule must not make it vacuous.
+//
+// The enqueuer is the right publisher for an enqueue and a cancellation and the
+// wrong one for a claim, because it did not perform that transition. Checked
+// explicitly, since the obvious way to make the test above pass is to compare
+// against both chains and accept either.
+func TestActionEventPublisherRefusesANonClaimant(t *testing.T) {
+	now := time.Date(2026, 9, 7, 10, 0, 0, 0, time.UTC)
+	config := runtimeConfig(t.TempDir())
+	runtime, err := explorercoord.Open(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.Close()
+	backend, err := New(runtime, config.Domain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// "dispatcher" is the publishing identity this helper mints. Below it is
+	// the record's enqueuer rather than its claimant.
+	publisher := dispatchEventPublisher(
+		t, backend, now, restartGenerationReader{}, restartAuditor{},
+		auth.OperationInvoke)
+
+	record := foreignClaimantRecord(t, now, "action.claimed")
+	record.Subject = "dispatcher"
+	record.Actor = "dispatcher"
+	record.ClaimantSubject = "worker-subject"
+	record.ClaimantActor = "worker-actor"
+	// Left as execute, matching AuthorizedOperations, so the refusal below can
+	// only come from the identity rule — the publishing decision here holds
+	// invoke, so naming invoke would refuse on provenance instead and the test
+	// would pass without exercising anything.
+	record.TransitionOperation = auth.OperationExecute
+
+	err = publisher.PublishActionEvent(
+		context.Background(), "action.claimed", record)
+	if err == nil {
+		t.Fatal("the record's enqueuer published a claim held by another " +
+			"principal, so the event attributes a transition to an identity " +
+			"that did not perform it")
+	}
+	if !strings.Contains(err.Error(), "does not match durable transition") {
+		t.Fatalf("refused for an unrelated reason, so this case does not "+
+			"exercise the identity rule: %v", err)
+	}
+}
+
+// TestActionEventPublisherStillRequiresTheEnqueuerForCancellation pins the kinds
+// the widening must not reach. A cancellation is the enqueuer's lever and no
+// execute-holder can reach Cancel at all.
+func TestActionEventPublisherStillRequiresTheEnqueuerForCancellation(t *testing.T) {
+	now := time.Date(2026, 9, 7, 10, 0, 0, 0, time.UTC)
+	config := runtimeConfig(t.TempDir())
+	runtime, err := explorercoord.Open(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.Close()
+	backend, err := New(runtime, config.Domain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	publisher := dispatchEventPublisher(
+		t, backend, now, restartGenerationReader{}, restartAuditor{},
+		auth.OperationDispatch)
+
+	// A claimant chain on the record must not let a claimant publish a
+	// cancellation it did not perform.
+	record := authorizedActionRecord(fleet.ActionRecord{
+		ID: []byte("action"), IdempotencyKey: []byte("k"), Version: 3,
+		State: fleet.DispatchCanceled, AgentID: "agent", AgentGeneration: 3,
+		SourceID: []byte("source"), PolicyID: []byte("policy"), ObjectID: "object",
+		UpdatedAt: now.Add(-time.Minute), ClaimID: []byte("worker-claim"),
+		ClaimFence: 1,
+	}, now, auth.OperationDispatch)
+	record.Subject = "enqueuer-subject"
+	record.Actor = "enqueuer-actor"
+	record.ClaimantSubject = "dispatcher"
+	record.ClaimantActor = "dispatcher"
+	record.TransitionOperation = auth.OperationDispatch
+
+	if err := publisher.PublishActionEvent(
+		context.Background(), "action.canceled", record); err == nil {
+		t.Fatal("a claimant published a cancellation, so the claimant rule " +
+			"reaches a kind the claimant never performs")
+	}
+}
+
+// foreignClaimantRecord builds a record whose enqueuer and claimant are
+// different principals, with the claimant being the identity
+// dispatchEventPublisher mints.
+func foreignClaimantRecord(
+	t *testing.T, now time.Time, kind string,
+) fleet.ActionRecord {
+	t.Helper()
+	state := fleet.DispatchClaimed
+	switch kind {
+	case "action.completed":
+		state = fleet.DispatchSucceeded
+	case "action.failed":
+		state = fleet.DispatchFailed
+	}
+	record := authorizedActionRecord(fleet.ActionRecord{
+		ID: []byte("action"), IdempotencyKey: []byte("k"), Version: 2,
+		State: state, AgentID: "agent", AgentGeneration: 3,
+		SourceID: []byte("source"), PolicyID: []byte("policy"), ObjectID: "object",
+		UpdatedAt: now.Add(-time.Minute), ClaimID: []byte("worker-claim"),
+		ClaimFence: 1,
+	}, now, auth.OperationExecute)
+	if state == fleet.DispatchFailed {
+		record.ErrorCode = "target_unreachable"
+	}
+	// The enqueuer is someone else entirely; the claimant is the publisher.
+	record.Subject = "enqueuer-subject"
+	record.Actor = "enqueuer-actor"
+	record.ClaimantSubject = "dispatcher"
+	record.ClaimantActor = "dispatcher"
+	record.TransitionOperation = auth.OperationExecute
+	// action.completed and action.failed carry the executor key as their
+	// transition identity, so a record without one is refused before the
+	// identity rule is reached.
+	record.ExecutorKey = []byte("executor-key")
+	record.ExecutionFingerprint = auth.Fingerprint{2}
+	record.ExecutionPolicyGeneration = 1
+	record.ExecutionExpiresAt = now.Add(time.Hour)
+	return record
 }

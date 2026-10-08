@@ -405,8 +405,11 @@ func (s *AdmissionService) Request(
 	if err != nil {
 		return AdmissionGrant{}, err
 	}
+	// An admission grant is requested and reported by one identity under
+	// invoke, so that is the operation its claim is authorized by.
 	record, err := applyClaim(
-		base, action, request.TokenID, request.Lease, decision, now)
+		base, action, request.TokenID, request.Lease,
+		decision, auth.OperationInvoke, now)
 	if err != nil {
 		return AdmissionGrant{}, err
 	}
