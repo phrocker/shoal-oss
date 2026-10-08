@@ -10,9 +10,11 @@
 package routershadow
 
 import (
+	"bytes"
 	"context"
 	"encoding/hex"
 	"encoding/json"
+	"strings"
 	"time"
 
 	"github.com/phrocker/shoal-oss/pkg/explorer"
@@ -26,9 +28,19 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
-// MaxListPages bounds the fleet pages one enumeration reads. A caller who can
-// see more descriptors than fit is refused, as for too many targets.
-const MaxListPages = 64
+// EnumerationTimeout bounds, in wall time, the fleet listing one routing
+// performs. Only what the caller can see is bounded by count (router.MaxTargets
+// targets and as many descriptors): fleet List scans a bounded number of
+// stored entries per call and may return an empty or short page with a
+// continuation when the entries it scanned were hidden, so counting pages
+// would let hidden descriptors decide the outcome. Pages are therefore read
+// until the listing ends, limited only by this timeout and the caller's
+// context. How long that takes, and how many store reads it makes, still
+// grows with hidden entries; that residual is documented in
+// docs/local-language.md.
+const EnumerationTimeout = 10 * time.Second
+
+var errEnumeration = shoal.NewError(shoal.ErrorUnavailable, "router target enumeration did not finish")
 
 // ReasonCode is the caller-asserted reason the router's fleet reads record.
 const ReasonCode = "router_shadow"
@@ -48,10 +60,71 @@ type DecisionTarget struct {
 
 // OntologyBinding names the published ontology the lexicon bundle's lookup
 // templates were derived from. Templates are visible only when the caller may
-// see that published identity.
+// see that published identity. The bundle does not record which ontology its
+// templates came from, so the operator supplies the published version itself:
+// New refuses a binding whose Published version does not have Identity, or
+// whose relationships do not derive exactly the bundle's templates. That
+// catches a bundle paired with the wrong ontology; it cannot catch an
+// operator who supplies a matching version that is not the one Identity's
+// catalog publishes, which AuthorizePublishedOntology then checks.
 type OntologyBinding struct {
 	Configured ontology.OntologyVersion
 	Identity   ontology.OntologyIdentity
+	Published  ontology.OntologyVersion
+}
+
+// MinHostKeyBytes and minHostKeyDistinct bound the utterance key. A key of
+// fewer distinct byte values than minHostKeyDistinct (an all-zero or
+// repeated-byte key, say) is refused as not random; a random 32-byte key has
+// about 30 distinct values, and fewer than 16 has negligible probability.
+const (
+	MinHostKeyBytes    = 32
+	minHostKeyDistinct = 16
+)
+
+func hostKeyValid(key []byte) bool {
+	if len(key) < MinHostKeyBytes {
+		return false
+	}
+	distinct := map[byte]bool{}
+	for _, b := range key {
+		distinct[b] = true
+	}
+	return len(distinct) >= minHostKeyDistinct
+}
+
+func checkOntologyBinding(b *OntologyBinding, bundle *lexicon.Bundle) error {
+	refuse := shoal.NewError(shoal.ErrorInvalidArgument, "router ontology binding does not match the lexicon bundle's templates")
+	identity, err := ontology.NewOntologyIdentity(b.Published)
+	if err != nil || identity != b.Identity {
+		return refuse
+	}
+	derived, err := lexicon.DeriveTemplates(b.Published.Relationships())
+	if err != nil || !sameTemplates(derived, bundle.Templates()) {
+		return refuse
+	}
+	return nil
+}
+
+func sameTemplates(a, b []lexicon.Template) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	ids := func(x []shoal.ID) string {
+		parts := make([]string, len(x))
+		for i, id := range x {
+			parts[i] = string(id)
+		}
+		return strings.Join(parts, "\x00")
+	}
+	for i := range a {
+		if a[i].ID != b[i].ID || a[i].RelationKey != b[i].RelationKey || a[i].Direction != b[i].Direction ||
+			a[i].PhraseKey != b[i].PhraseKey || ids(a[i].SubjectConcepts) != ids(b[i].SubjectConcepts) ||
+			ids(a[i].AnswerConcepts) != ids(b[i].AnswerConcepts) {
+			return false
+		}
+	}
+	return true
 }
 
 // Config wires the shadow router. Every dependency is the real authorized
@@ -80,8 +153,16 @@ type Service struct {
 func New(config Config) (*Service, error) {
 	if config.Client == nil || config.Fleet == nil || config.Resolver == nil || config.Lexicon == nil ||
 		config.Decider == nil || config.Decider.Provider == nil || config.Recorder == nil ||
-		config.Clock == nil || len(config.HostKey) < 32 {
+		config.Clock == nil {
 		return nil, shoal.NewError(shoal.ErrorInvalidArgument, "router shadow dependencies are required")
+	}
+	if !hostKeyValid(config.HostKey) {
+		return nil, shoal.NewError(shoal.ErrorInvalidArgument, "router shadow host key is too short or not random")
+	}
+	if config.Ontology != nil {
+		if err := checkOntologyBinding(config.Ontology, config.Lexicon); err != nil {
+			return nil, err
+		}
 	}
 	config.HostKey = append([]byte(nil), config.HostKey...)
 	config.Decisions = append([]DecisionTarget(nil), config.Decisions...)
@@ -193,13 +274,19 @@ func (s *Service) visibleTargets(ctx context.Context, decision auth.Decision) ([
 		targets = append(targets, t)
 		return nil
 	}
+	listCtx, cancel := context.WithTimeout(ctx, EnumerationTimeout)
+	defer cancel()
 	var cursor []byte
-	for page := 0; ; page++ {
-		if page == MaxListPages {
-			return nil, router.ErrTooManyTargets
+	descriptors := 0
+	for {
+		if listCtx.Err() != nil {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			return nil, errEnumeration
 		}
 		now := s.config.Clock().UTC()
-		listed, err := s.config.Fleet.List(ctx, fleet.ListRequest{
+		listed, err := s.config.Fleet.List(listCtx, fleet.ListRequest{
 			Context: fleet.RequestContext{
 				RequestID: decision.RequestID(), CorrelationID: decision.CorrelationID(),
 				ReasonCode: ReasonCode, Deadline: now.Add(30 * time.Second),
@@ -207,7 +294,14 @@ func (s *Service) visibleTargets(ctx context.Context, decision auth.Decision) ([
 			Cursor: cursor, Limit: fleet.MaxListResults,
 		})
 		if err != nil {
+			if listCtx.Err() != nil && ctx.Err() == nil {
+				return nil, errEnumeration
+			}
 			return nil, err
+		}
+		descriptors += len(listed.Descriptors)
+		if descriptors > router.MaxTargets {
+			return nil, router.ErrTooManyTargets
 		}
 		for _, d := range listed.Descriptors {
 			for _, c := range d.Capabilities {
@@ -227,6 +321,10 @@ func (s *Service) visibleTargets(ctx context.Context, decision auth.Decision) ([
 		}
 		if len(listed.Next) == 0 {
 			break
+		}
+		if bytes.Compare(listed.Next, cursor) <= 0 {
+			// A continuation that does not advance would never end.
+			return nil, errEnumeration
 		}
 		cursor = listed.Next
 	}

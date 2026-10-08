@@ -310,7 +310,7 @@ func TestUtteranceKeyIsScopedAndNormalized(t *testing.T) {
 	}
 	if UtteranceKey(hostKey, "alice", fa, tokens) == UtteranceKey(hostKey, "bob", fa, tokens) ||
 		UtteranceKey(hostKey, "alice", fa, tokens) == UtteranceKey(hostKey, "alice", fb, tokens) ||
-		UtteranceKey(hostKey, "alice", fa, tokens) == UtteranceKey(bytes.Repeat([]byte{8}, 32), "alice", fa, tokens) {
+		UtteranceKey(hostKey, "alice", fa, tokens) == UtteranceKey([]byte("another-router-shadow-host-key:fedcba9876543210"), "alice", fa, tokens) {
 		t.Fatal("utterance key is not scoped to host key, principal and fingerprint")
 	}
 }

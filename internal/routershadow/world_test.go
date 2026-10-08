@@ -46,7 +46,7 @@ var (
 	policyA  = []byte("policy-a")
 	sourceB  = []byte("source-b")
 	policyB  = []byte("policy-b")
-	hostKey  = bytes.Repeat([]byte{7}, 32)
+	hostKey  = []byte("router-shadow-test-host-key:0123456789abcdef")
 	modelRaw = func() []byte {
 		b, err := os.ReadFile(filepath.Join("..", "..", "pkg", "router", "testdata", "model", "router-pair-v1.json"))
 		if err != nil {
@@ -83,6 +83,7 @@ type world struct {
 	fleet      *fleet.Service
 	dispatch   *fleet.DispatchService
 	dispatched *memoryDispatchStore
+	registry   *memoryStore
 	bundle     *lexicon.Bundle
 	ids        map[string]shoal.ID
 	nodes      []graph.Node
@@ -403,8 +404,9 @@ func newWorld(t testing.TB, store authorized.PolicyStore, hidden bool) *world {
 		t.Fatal(err)
 	}
 
+	w.registry = newMemoryStore()
 	w.fleet, err = fleet.NewService(fleet.Config{
-		Store: newMemoryStore(), Resolver: authority.Resolver(), Recorder: &lifecycleRecorder{},
+		Store: w.registry, Resolver: authority.Resolver(), Recorder: &lifecycleRecorder{},
 		Snapshots: fixedSnapshot{}, Executors: executors{}, Clock: func() time.Time { return at },
 	})
 	if err != nil {
@@ -452,7 +454,7 @@ func newWorld(t testing.TB, store authorized.PolicyStore, hidden bool) *world {
 	w.service, err = New(Config{
 		Client: w.reader, Fleet: w.fleet, Resolver: authority.Resolver(), Lexicon: w.bundle,
 		Grammars: w.grammars, Decisions: w.decisionTargets(),
-		Ontology: &OntologyBinding{Configured: baseVersion, Identity: identity},
+		Ontology: &OntologyBinding{Configured: baseVersion, Identity: identity, Published: target},
 		Decider:  &Decider{Provider: provider, ReleaseID: "router-pair-v1:test", Clock: func() time.Time { return at }},
 		Recorder: w.recorder, HostKey: hostKey, Clock: func() time.Time { return at },
 	})
@@ -509,9 +511,12 @@ type events struct{}
 
 func (events) PublishActionEvent(context.Context, string, fleet.ActionRecord) error { return nil }
 
+// memoryStore keeps descriptors in ID order, so a listing is a binary search
+// and the many-hidden-descriptors test stays fast.
 type memoryStore struct {
 	mu      sync.Mutex
 	records map[shoal.ID]fleet.Stored
+	order   []shoal.ID
 	scans   int
 }
 
@@ -525,8 +530,19 @@ func (s *memoryStore) Apply(_ context.Context, m fleet.Mutation) (fleet.Stored, 
 		return fleet.Stored{}, shoal.NewError(shoal.ErrorConflict, "generation conflict")
 	}
 	stored := fleet.Stored{Descriptor: m.Descriptor, RegistrationDigest: sha256.Sum256([]byte(m.RegistrationKey)), Epoch: m.Descriptor.Generation}
-	s.records[m.Descriptor.ID] = stored
+	s.put([]fleet.Stored{stored})
 	return stored, nil
+}
+
+// put stores descriptors directly, as a registry holding them would.
+func (s *memoryStore) put(stored []fleet.Stored) {
+	for _, st := range stored {
+		if _, exists := s.records[st.Descriptor.ID]; !exists {
+			s.order = append(s.order, st.Descriptor.ID)
+		}
+		s.records[st.Descriptor.ID] = st
+	}
+	sort.Slice(s.order, func(i, j int) bool { return s.order[i] < s.order[j] })
 }
 
 func (s *memoryStore) Get(_ context.Context, id shoal.ID) (fleet.Stored, error) {
@@ -543,22 +559,22 @@ func (s *memoryStore) List(_ context.Context, cursor []byte, limit int) (fleet.S
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.scans++
-	ids := make([]string, 0, len(s.records))
-	for id := range s.records {
-		if id > shoal.ID(cursor) {
-			ids = append(ids, string(id))
-		}
-	}
-	sort.Strings(ids)
+	i := sort.Search(len(s.order), func(i int) bool { return s.order[i] > shoal.ID(cursor) })
 	page := fleet.StoredPage{}
-	for _, id := range ids {
+	for ; i < len(s.order); i++ {
 		if len(page.Entries) == limit {
 			page.Next = []byte(page.Entries[len(page.Entries)-1].Descriptor.ID)
 			break
 		}
-		page.Entries = append(page.Entries, s.records[shoal.ID(id)])
+		page.Entries = append(page.Entries, s.records[s.order[i]])
 	}
 	return page, nil
+}
+
+func (s *memoryStore) scanCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.scans
 }
 
 type memoryDispatchStore struct {
