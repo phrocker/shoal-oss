@@ -394,3 +394,77 @@ func f(r *ActionRecord, a *ApprovalRecord, other ActionRecord, s ApprovalState) 
 		t.Errorf("clean dispatch source reported %v", problems)
 	}
 }
+
+// An argument English reads with the same kind in every arm of a select is
+// not restricted by it: a translation may hoist it out.
+func TestCatalogAllowsHoistingSharedArguments(t *testing.T) {
+	parse := func(edits map[string]string) (*Catalog, error) {
+		var file CatalogFile
+		if err := json.Unmarshal(englishCatalog, &file); err != nil {
+			t.Fatal(err)
+		}
+		for k, v := range edits {
+			file.Messages[k] = v
+		}
+		return ParseCatalog(mustJSON(t, file))
+	}
+	hoisted := map[string]string{
+		"approval.outcome.expired":   "The request to run action {action} on agent {agent} {verdict, select, approve {was approved but expired at {expires, time} before it became work} other {expired at {expires, time} without a decision}}.",
+		"dispatch.history.requested": "{requester} {admission, select, yes {requested admission} other {enqueued it}} at {created, time}, with a deadline of {deadline, time}.",
+		"dispatch.outcome.canceled":  "{admission, select, yes {Admission of action} other {Action}} {action} on agent {agent} was {admission, select, yes {refused} other {canceled}} at {at, time}{admission, select, yes {; nothing was permitted} other {}}.",
+		"dispatch.outcome.claimed":   "Action {action} on agent {agent} {admission, select, yes {was admitted for {effects, list} and has not reported an outcome} other {is claimed and has not reported an outcome}}.",
+	}
+	c, err := parse(hoisted)
+	if err != nil {
+		t.Fatalf("hoisted shared arguments refused: %v", err)
+	}
+	// It renders identically to English.
+	english, translated := New(nil), New(c)
+	cases := map[string]func(*Renderer) ([]Sentence, error){
+		"approval expired undecided": func(r *Renderer) ([]Sentence, error) {
+			return r.Approval(fleet.ApprovalStatus{Approval: approvalRecord(fleet.ApprovalExpired, ""), State: fleet.ApprovalExpired}, Options{})
+		},
+		"approval expired unused": func(r *Renderer) ([]Sentence, error) {
+			return r.Approval(fleet.ApprovalStatus{Approval: approvalRecord(fleet.ApprovalExpired, fleet.ApprovalVerdictApprove), State: fleet.ApprovalExpired}, Options{})
+		},
+	}
+	for _, state := range []fleet.DispatchState{fleet.DispatchClaimed, fleet.DispatchCanceled} {
+		for _, build := range []func(fleet.DispatchState) fleet.ActionRecord{action, admission} {
+			record := build(state)
+			cases[string(state)+" admission="+string(yesNo(isAdmission(record)))] = func(r *Renderer) ([]Sentence, error) {
+				return r.Action(record, Options{})
+			}
+		}
+	}
+	for name, run := range cases {
+		want, err := run(english)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := run(translated)
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if dump(got) != dump(want) {
+			t.Errorf("%s renders differently:\n%s\nwant\n%s", name, dump(got), dump(want))
+		}
+	}
+	// An argument English reads in only some arms stays restricted, and the
+	// refusal names the arm.
+	for key, tc := range map[string]struct{ pattern, want string }{
+		"dispatch.outcome.claimed": {
+			"Action {action} on agent {agent}, effects {effects, list}{admission, select, yes {.} other {.}}",
+			`argument "effects": it is read outside select arm admission=yes, the only place English reads it`},
+		"approval.blocked.pending": {
+			"Waiting; {left, duration} remain.",
+			`argument "left": it is read outside select arm timed=yes, the only place English reads it`},
+		"dispatch.outcome.succeeded": {
+			"{at, duration}",
+			`argument "at": it is read as duration, but English reads it as time`},
+	} {
+		_, err := parse(map[string]string{key: tc.pattern})
+		if err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("%s: error %v, want %q", key, err, tc.want)
+		}
+	}
+}

@@ -121,8 +121,7 @@ func ParseCatalog(data []byte) (*Catalog, error) {
 			for _, use := range list {
 				if !compatibleUse(use, reference[key][name]) {
 					problems = append(problems, fmt.Sprintf(
-						"%s: argument %q read as %q under %v, where the renderer does not supply it",
-						key, name, use.kind, sortedConds(use.under)))
+						"%s: argument %q: %s", key, name, incompatibility(use, reference[key][name])))
 				}
 			}
 		}
@@ -355,13 +354,4 @@ func (c *Catalog) list(items []Fragment, style string) (Fragment, error) {
 		}
 	}
 	return acc, nil
-}
-
-func sortedConds(m map[string]bool) []string {
-	out := make([]string, 0, len(m))
-	for c := range m {
-		out = append(out, c)
-	}
-	sort.Strings(out)
-	return out
 }

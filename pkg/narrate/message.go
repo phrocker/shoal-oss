@@ -6,6 +6,7 @@ package narrate
 
 import (
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -320,16 +321,111 @@ func collectUses(nodes []node, under map[string]bool, into map[string][]argUse) 
 				continue
 			}
 			use(n.name, "select")
+			// Each arm is collected without its own condition first. A use
+			// that appears, with the same kind and enclosing conditions, in
+			// every arm (other included) is read whichever arm is taken, so
+			// it is not restricted by this select; any other use is.
+			arms := make(map[string]map[string][]argUse, len(n.cases))
 			for arm, body := range n.cases {
-				inner := make(map[string]bool, len(under)+1)
-				for c := range under {
-					inner[c] = true
+				uses := map[string][]argUse{}
+				collectUses(body, under, uses)
+				arms[arm] = uses
+			}
+			for arm, uses := range arms {
+				for name, list := range uses {
+					for _, u := range list {
+						if !inEveryArm(arms, name, u) {
+							scoped := make(map[string]bool, len(u.under)+1)
+							for c := range u.under {
+								scoped[c] = true
+							}
+							scoped[n.name+"="+arm] = true
+							u = argUse{kind: u.kind, under: scoped}
+						}
+						into[name] = appendUse(into[name], u)
+					}
 				}
-				inner[n.name+"="+arm] = true
-				collectUses(body, inner, into)
 			}
 		}
 	}
+}
+
+func sameUse(a, b argUse) bool {
+	if a.kind != b.kind || len(a.under) != len(b.under) {
+		return false
+	}
+	for c := range a.under {
+		if !b.under[c] {
+			return false
+		}
+	}
+	return true
+}
+
+func inEveryArm(arms map[string]map[string][]argUse, name string, u argUse) bool {
+	for _, uses := range arms {
+		found := false
+		for _, other := range uses[name] {
+			if sameUse(u, other) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
+}
+
+func appendUse(list []argUse, u argUse) []argUse {
+	for _, existing := range list {
+		if sameUse(existing, u) {
+			return list
+		}
+	}
+	return append(list, u)
+}
+
+// incompatibility explains why a translation's use is refused: the kinds
+// English reads the argument as, or the select arm English reads it under.
+func incompatibility(use argUse, english []argUse) string {
+	if len(english) == 0 {
+		return "the English message does not read it"
+	}
+	var arms []string
+	for _, e := range english {
+		if !kindCompatible(use.kind, e.kind) {
+			continue
+		}
+		var missing []string
+		for c := range e.under {
+			if !use.under[c] {
+				missing = append(missing, c)
+			}
+		}
+		sort.Strings(missing)
+		arms = append(arms, strings.Join(missing, " and "))
+	}
+	if len(arms) == 0 {
+		var kinds []string
+		for _, e := range english {
+			kinds = append(kinds, kindName(e.kind))
+		}
+		sort.Strings(kinds)
+		return fmt.Sprintf("it is read as %s, but English reads it as %s",
+			kindName(use.kind), strings.Join(kinds, " or "))
+	}
+	sort.Strings(arms)
+	return fmt.Sprintf("it is read outside select arm %s, the only place English reads it",
+		strings.Join(arms, " or "))
+}
+
+func kindName(kind string) string {
+	if kind == "" {
+		return "a simple value"
+	}
+	return kind
 }
 
 // compatibleUse reports whether a translation may read an argument the way

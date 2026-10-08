@@ -104,7 +104,11 @@ a template. It is enforced three ways:
   translation may read an argument only under every select arm English reads
   it under, because outside them the renderer omits it (`{left}` exists only
   when `timed=yes`) or passes a placeholder (a probability is 0 unless
-  `reported=yes`). A translation therefore cannot fall back to an unreviewed
+  `reported=yes`). An argument English reads, with the same kind, in every arm
+  of a select is not restricted by that select, so a translation may hoist it
+  out (`{action}` in `approval.outcome.expired`). A refusal names the select
+  arm the argument is restricted to, or the kind English reads it as.
+  A translation therefore cannot fall back to an unreviewed
   sentence, fail at run time, or print a value the record does not hold.
 - **Parity with source.** The vocabularies are read from their owners' source
   by AST, never from this package's lists: `DispatchState`, `ApprovalState`,
