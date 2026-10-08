@@ -21,8 +21,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
-	"encoding/binary"
-	"hash"
 	"math"
 	"reflect"
 	"strings"
@@ -114,7 +112,7 @@ func (s *Service) Register(ctx context.Context, request RegisterRequest) (Descri
 		// generation is unchanged.
 		if err := s.record(ctx, decision, request.Context,
 			auth.OperationAgentRegister, replay.ID,
-			registryMutationDigest(Mutation{
+			registryMutationDigests(Mutation{
 				RegistrationKey:    request.RegistrationKey,
 				ExpectedGeneration: request.ExpectedGeneration,
 				Descriptor:         replay,
@@ -208,7 +206,7 @@ func (s *Service) Register(ctx context.Context, request RegisterRequest) (Descri
 	mutation := Mutation{RegistrationKey: request.RegistrationKey,
 		ExpectedGeneration: request.ExpectedGeneration, Descriptor: descriptor}
 	if err := s.record(ctx, decision, request.Context, auth.OperationAgentRegister,
-		descriptor.ID, registryMutationDigest(mutation)); err != nil {
+		descriptor.ID, registryMutationDigests(mutation)); err != nil {
 		return Descriptor{}, err
 	}
 	stored, err := s.store.Apply(ctx, mutation)
@@ -307,7 +305,7 @@ func (s *Service) Heartbeat(ctx context.Context, request HeartbeatRequest) (Desc
 	mutation := Mutation{RegistrationKey: request.RegistrationKey,
 		ExpectedGeneration: request.ExpectedGeneration, Descriptor: next}
 	if err := s.record(ctx, decision, request.Context, auth.OperationAgentHeartbeat,
-		request.ID, registryMutationDigest(mutation)); err != nil {
+		request.ID, registryMutationDigests(mutation)); err != nil {
 		return Descriptor{}, err
 	}
 	stored, err := s.store.Apply(ctx, mutation)
@@ -351,7 +349,7 @@ func (s *Service) Revoke(ctx context.Context, request RevokeRequest) (Descriptor
 	mutation := Mutation{RegistrationKey: request.RegistrationKey,
 		ExpectedGeneration: request.ExpectedGeneration, Descriptor: next}
 	if err := s.record(ctx, decision, request.Context, auth.OperationAgentRevoke,
-		request.ID, registryMutationDigest(mutation)); err != nil {
+		request.ID, registryMutationDigests(mutation)); err != nil {
 		return Descriptor{}, err
 	}
 	stored, err := s.store.Apply(ctx, mutation)
@@ -376,7 +374,7 @@ func (s *Service) Resolve(ctx context.Context, request ResolveRequest) (Resolved
 		return Resolved{}, err
 	}
 	if err := s.record(ctx, decision, request.Context, auth.OperationAgentResolve,
-		request.ID, [sha256.Size]byte{}); err != nil {
+		request.ID, registryDigests{}); err != nil {
 		return Resolved{}, err
 	}
 	executor, ok := s.executors.ResolveExecutor(descriptor.ExecutorRef)
@@ -410,7 +408,7 @@ func (s *Service) List(ctx context.Context, request ListRequest) (ListPage, erro
 		return ListPage{}, err
 	}
 	if err := s.record(ctx, decision, request.Context, auth.OperationAgentResolve,
-		"fleet-list", [sha256.Size]byte{}); err != nil {
+		"fleet-list", registryDigests{}); err != nil {
 		return ListPage{}, err
 	}
 	result := ListPage{
@@ -636,7 +634,7 @@ func (s *Service) record(
 	request RequestContext,
 	operation auth.Operation,
 	id shoal.ID,
-	mutationDigest [sha256.Size]byte,
+	digests registryDigests,
 ) error {
 	fingerprint, err := auth.AuthorizationFingerprint(decision)
 	if err != nil {
@@ -651,8 +649,9 @@ func (s *Service) record(
 		CorrelationID: decision.CorrelationID(), Subject: decision.Subject(),
 		Actor: decision.Actor(), ClientID: decision.ClientID(),
 		OnBehalfOf: decision.OnBehalfOf(), AgentID: id,
-		MutationDigest: mutationDigest,
-		ReasonCode:     request.ReasonCode, ReasonDetail: request.ReasonDetail,
+		MutationDigest:       digests.current,
+		LegacyMutationDigest: digests.v1,
+		ReasonCode:           request.ReasonCode, ReasonDetail: request.ReasonDetail,
 		Deadline:                 request.Deadline.UnixNano(),
 		AuthorizationFingerprint: fingerprint,
 		AuthorizationExpiresAt:   decision.AuthenticationExpires(),
@@ -660,89 +659,6 @@ func (s *Service) record(
 		SnapshotID:               shoal.ID(snapshot.ID),
 		SnapshotAsOf:             snapshot.AsOf.UTC(),
 	})
-}
-
-func registryMutationDigest(mutation Mutation) [sha256.Size]byte {
-	digest := sha256.New()
-	writeRegistryDigestField(digest, []byte("shoal.fleet.registry-mutation.v1"))
-	writeRegistryDigestField(digest, []byte(mutation.RegistrationKey))
-	writeRegistryDigestInt64(digest, mutation.ExpectedGeneration)
-	descriptor := mutation.Descriptor
-	writeRegistryDigestField(digest, []byte(descriptor.ID))
-	writeRegistryDigestInt64(digest, descriptor.Generation)
-	writeRegistryDigestField(digest, []byte(descriptor.Subject))
-	writeRegistryDigestField(digest, []byte(descriptor.Actor))
-	writeRegistryDigestField(digest, []byte(descriptor.ParentID))
-	writeRegistryDigestField(digest, descriptor.AuthorizationDomain)
-	for _, scope := range descriptor.Scopes {
-		writeRegistryDigestField(digest, scope.SourceID)
-		writeRegistryDigestField(digest, scope.PolicyID)
-	}
-	writeRegistryDigestField(digest, []byte(descriptor.ExecutorRef))
-	for _, capability := range descriptor.Capabilities {
-		writeRegistryDigestField(digest, []byte(capability.Name))
-		for _, action := range capability.Actions {
-			writeRegistryDigestField(digest, []byte(action.Name))
-			// Appended only for a non-empty declaration, so an action that
-			// declares nothing hashes exactly as it did before this field
-			// existed, and one declaring only external mutation hashes as it
-			// did under the superseded two-value taxonomy.
-			//
-			// Hashing the zero value would have changed the bytes of every
-			// existing mutation, because an empty field still contributes its
-			// eight-byte length prefix, while the namespace above still says
-			// v1. This digest is embedded in the lifecycle QueryDigest, where
-			// a changed value reads as a divergent mutation, so a heartbeat or
-			// revoke retry that spans an upgrade would have been rejected.
-			//
-			// A non-empty declaration still differs from an empty one, because
-			// it appends bytes the empty one does not, which is what keeps a
-			// replay from quietly swapping one for the other under the same
-			// mutation identity. See Effects.digestBytes.
-			if bytes := action.Effects.digestBytes(); bytes != nil {
-				writeRegistryDigestField(digest, bytes)
-			}
-			writeRegistryDigestField(digest, action.InputSchema)
-			writeRegistryDigestField(digest, action.OutputSchema)
-			// Appended only when set, for the reason Effects is: every
-			// mutation digest written before the field existed must hash
-			// identically, or a heartbeat or revoke retry that spans the
-			// upgrade reads as a divergent mutation. A set flag still
-			// changes the digest, so a replay cannot quietly add or drop
-			// it under the same mutation identity. The tag keeps the
-			// appended field from being read as a schema.
-			if action.RequiresApproval {
-				writeRegistryDigestField(
-					digest, []byte("shoal.fleet.requires-approval.v1"))
-			}
-			// The same pattern, for the same reason: appended only when set,
-			// length-prefixed and tagged, so every digest written before the
-			// field existed is byte-identical and a replay cannot add or drop
-			// the requirement under one mutation identity.
-			if action.RequiresAttestation {
-				writeRegistryDigestField(
-					digest, []byte("shoal.fleet.requires-attestation.v1"))
-			}
-		}
-	}
-	writeRegistryDigestInt64(digest, descriptor.LeaseExpiresAt.UnixNano())
-	writeRegistryDigestInt64(digest, descriptor.RevokedAt.UnixNano())
-	var result [sha256.Size]byte
-	copy(result[:], digest.Sum(nil))
-	return result
-}
-
-func writeRegistryDigestField(digest hash.Hash, value []byte) {
-	var size [8]byte
-	binary.BigEndian.PutUint64(size[:], uint64(len(value)))
-	_, _ = digest.Write(size[:])
-	_, _ = digest.Write(value)
-}
-
-func writeRegistryDigestInt64(digest hash.Hash, value int64) {
-	var encoded [8]byte
-	binary.BigEndian.PutUint64(encoded[:], uint64(value))
-	writeRegistryDigestField(digest, encoded[:])
 }
 
 func authorizeScopes(decision auth.Decision, operation auth.Operation, id shoal.ID, domain []byte, scopes []Scope, now time.Time) error {

@@ -191,13 +191,15 @@ func (e Effects) exceeds(ceiling Effects) bool {
 	return false
 }
 
-// digestBytes returns what this set contributes to the registry mutation
-// digest, or nil to contribute nothing at all.
+// digestBytes returns what this set contributes to the v1 registry mutation
+// digest, or nil to contribute nothing at all. v1 is read, never written (see
+// registryMutationDigestV1); v2 hashes digestOrder as a counted list instead.
 //
 // Two cases must reproduce exactly what the superseded encoding produced,
-// because the digest namespace is still v1 and the value is embedded in the
-// lifecycle QueryDigest, where a changed digest reads as a divergent mutation.
-// A heartbeat or revoke retry that spans an upgrade would then be rejected.
+// because a v1 digest is embedded in the QueryDigest of every lifecycle
+// receipt written before v2, where a changed digest reads as a divergent
+// mutation. A heartbeat or revoke retry that spans an upgrade would then be
+// rejected.
 //
 //   - The empty set contributes nothing. That is the explicit branch below.
 //     Hashing an empty value is not the same thing: it still writes an
@@ -212,13 +214,24 @@ func (e Effects) exceeds(ceiling Effects) bool {
 // Any other set is new — no descriptor could have declared it before this
 // change — so it is free to hash as its canonical comma-joined form.
 func (e Effects) digestBytes() []byte {
-	// Sorted and deduplicated here rather than trusting the caller. The same
-	// classes declared in a different order are the same declaration and must
-	// not hash differently, and this is reached from registryMutationDigest,
-	// which is handed a Mutation that has not necessarily been through
-	// canonicalCapabilities yet. Unknown values are not rejected here — they
-	// are refused at registration and at resolution — but they are ordered, so
-	// a tampered record still hashes deterministically.
+	ordered := e.digestOrder()
+	if len(ordered) == 0 {
+		return nil
+	}
+	return []byte(strings.Join(ordered, ","))
+}
+
+// digestOrder returns the declared classes sorted and deduplicated, as both
+// registry digest versions hash them.
+//
+// Sorted and deduplicated here rather than trusting the caller. The same
+// classes declared in a different order are the same declaration and must
+// not hash differently, and this is reached from the registry digests, which
+// are handed a Mutation that has not necessarily been through
+// canonicalCapabilities yet. Unknown values are not rejected here — they are
+// refused at registration and at resolution — but they are ordered, so a
+// tampered record still hashes deterministically.
+func (e Effects) digestOrder() []string {
 	ordered := make([]string, 0, len(e))
 	seen := make(map[Effect]struct{}, len(e))
 	for _, effect := range e {
@@ -229,10 +242,7 @@ func (e Effects) digestBytes() []byte {
 		ordered = append(ordered, string(effect))
 	}
 	sort.Strings(ordered)
-	if len(ordered) == 0 {
-		return nil
-	}
-	return []byte(strings.Join(ordered, ","))
+	return ordered
 }
 
 // equalEffects reports exact set equality over two canonical declarations.

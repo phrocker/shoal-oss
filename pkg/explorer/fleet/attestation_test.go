@@ -199,21 +199,25 @@ func TestRegistryDigestIsUnchangedWithoutAttestation(t *testing.T) {
 	// The same golden TestRegistryDigestIsUnchangedWithoutApproval pins,
 	// computed by the build before either field existed.
 	const golden = "54af49ed8009c6c7c8d4862c19d5875176dfa8dbe51dd5188521a0c8b672138a"
-	plain := registryMutationDigest(approvalDigestMutation(false))
+	plain := registryMutationDigestV1(approvalDigestMutation(false))
 	if got := hex.EncodeToString(plain[:]); got != golden {
-		t.Fatalf("mutation digest without attestation = %s, want %s", got, golden)
+		t.Fatalf("v1 mutation digest without attestation = %s, want %s", got, golden)
 	}
 	attested := approvalDigestMutation(false)
 	attested.Descriptor.Capabilities[0].Actions[0].RequiresAttestation = true
-	attestedDigest := registryMutationDigest(attested)
-	if attestedDigest == plain {
-		t.Fatal("requiring attestation did not change the mutation digest")
-	}
 	both := approvalDigestMutation(true)
 	both.Descriptor.Capabilities[0].Actions[0].RequiresAttestation = true
-	if registryMutationDigest(both) == attestedDigest ||
-		registryMutationDigest(both) == registryMutationDigest(approvalDigestMutation(true)) {
-		t.Fatal("approval and attestation are not separately bound in the digest")
+	for _, version := range registryDigestVersions {
+		attestedDigest := version.digest(attested)
+		if attestedDigest == version.digest(approvalDigestMutation(false)) {
+			t.Fatalf("%s: requiring attestation did not change the mutation "+
+				"digest", version.name)
+		}
+		if version.digest(both) == attestedDigest ||
+			version.digest(both) == version.digest(approvalDigestMutation(true)) {
+			t.Fatalf("%s: approval and attestation are not separately bound "+
+				"in the digest", version.name)
+		}
 	}
 	encoded, err := json.Marshal(approvalDigestMutation(false).Descriptor.Capabilities[0].Actions[0])
 	if err != nil {

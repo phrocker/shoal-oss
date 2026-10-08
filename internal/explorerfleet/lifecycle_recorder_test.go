@@ -106,11 +106,17 @@ func TestLifecycleRecorderRetryIsByteStable(t *testing.T) {
 		t.Fatalf("record attempts = %d", len(store.requests))
 	}
 	expectedID := interaction.DerivedID(
-		"session", "fleet.lifecycle.v3", string(lifecycle.Operation),
+		"session", "fleet.lifecycle.v4", string(lifecycle.Operation),
 		string(lifecycle.RequestID), string(lifecycle.AgentID),
 	)
-	// The pre-asserted-reason identity is still derived exactly, because
-	// retries reconcile against receipts written under it.
+	// The earlier identities are still derived exactly, because retries
+	// reconcile against receipts written under them.
+	if v3LifecycleSessionID(lifecycle) != interaction.DerivedID(
+		"session", "fleet.lifecycle.v3", string(lifecycle.Operation),
+		string(lifecycle.RequestID), string(lifecycle.AgentID),
+	) {
+		t.Fatal("v3 lifecycle receipt identity drifted")
+	}
 	if v2LifecycleSessionID(lifecycle) != interaction.DerivedID(
 		"session", "fleet.lifecycle.v2", string(lifecycle.Operation),
 		string(lifecycle.RequestID), string(lifecycle.AgentID),

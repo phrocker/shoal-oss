@@ -104,21 +104,32 @@ func (r *LifecycleRecorder) RecordLifecycle(
 	}
 	requested := lifecycleSession(lifecycle, asserted)
 	if r.read != nil {
-		// Receipts written before this version live under the v1 and v2
-		// identities and never carry a caller-asserted reason. Reconcile a
-		// retry against one of those before writing a v3 receipt.
-		for _, legacyID := range []shoal.ID{
-			v1LifecycleSessionID(lifecycle),
-			v2LifecycleSessionID(lifecycle),
+		// Receipts written before this version live under the v1, v2 and v3
+		// identities. Reconcile a retry against one of those before writing a
+		// v4 receipt.
+		//
+		// Every one of them carries the v1 registry mutation digest, so the
+		// retry is compared as that version: the version is read from the
+		// receipt's identity, never guessed from the stored digest. v1 and v2
+		// receipts also never carry a caller-asserted reason; v3 receipts do.
+		legacy := lifecycleWithV1RegistryDigest(lifecycle)
+		for _, prior := range []struct {
+			id                shoal.ID
+			withoutAssertions bool
+		}{
+			{v1LifecycleSessionID(legacy), true},
+			{v2LifecycleSessionID(legacy), true},
+			{v3LifecycleSessionID(legacy), false},
 		} {
-			legacyRequested := requested
-			legacyRequested.ID = legacyID
+			priorRequested := lifecycleSession(legacy, asserted)
+			priorRequested.ID = prior.id
 			record, readErr := r.read(
-				context.WithoutCancel(ctx), legacyRequested.ID,
+				context.WithoutCancel(ctx), priorRequested.ID,
 			)
 			if readErr == nil {
 				return validateLifecycleReplay(
-					record.Session, legacyRequested, lifecycle, true,
+					record.Session, priorRequested, legacy,
+					prior.withoutAssertions,
 				)
 			}
 		}
@@ -219,7 +230,7 @@ func validateLifecycleReplay(
 		// binding. That shape still reconciles: the retry gains no authority
 		// from it, and the assertion simply was not kept. Tolerance is keyed on
 		// the receipt's identity version, not on the field being empty, so a
-		// v3 receipt stripped of its asserted reason is a conflict, and a
+		// v3 or v4 receipt stripped of its asserted reason is a conflict, and a
 		// legacy-ID receipt that does carry one is too.
 		expected.CallerAssertedReason = interaction.CallerAssertedReason{}
 		expected.QueryDigest = lifecycleQueryDigest(
@@ -323,18 +334,44 @@ func v2LifecycleSessionID(lifecycle fleet.Lifecycle) shoal.ID {
 	)
 }
 
+// v3LifecycleSessionID is the identity receipts had before the registry
+// mutation digest was versioned (#521). A receipt under it carries a v1
+// registry mutation digest. It is read, never written.
+func v3LifecycleSessionID(lifecycle fleet.Lifecycle) shoal.ID {
+	return interaction.DerivedID(
+		"session",
+		"fleet.lifecycle.v3",
+		string(lifecycle.Operation),
+		string(lifecycle.RequestID),
+		string(lifecycle.AgentID),
+	)
+}
+
+// lifecycleWithV1RegistryDigest returns the lifecycle as a build before #521
+// would have recorded it: with the v1 registry mutation digest. Only receipts
+// under a v1, v2 or v3 identity are compared against it.
+func lifecycleWithV1RegistryDigest(lifecycle fleet.Lifecycle) fleet.Lifecycle {
+	lifecycle.MutationDigest = lifecycle.LegacyMutationDigest
+	return lifecycle
+}
+
 // LifecycleReceiptID is the durable interaction session ID of the lifecycle
 // receipt for one registry operation, by request and agent. Reading it with
 // the corpus's InteractionRecord returns the receipt, including its
 // CallerAssertedReason (for an "atpl-apply" registration, the policy digest as
-// Source) and the trusted Actor who asserted it. Receipts written before
-// caller-asserted reasons were recorded have v1 or v2 identities instead.
+// Source) and the trusted Actor who asserted it.
+//
+// Receipts under this identity, fleet.lifecycle.v4, carry the v2 registry
+// mutation digest. Receipts written before it have v1, v2 or v3 identities
+// and carry the v1 digest; v1 and v2 receipts also predate caller-asserted
+// reasons. The identity, not the stored digest, says which version a receipt
+// holds.
 func LifecycleReceiptID(
 	operation auth.Operation, requestID, agentID shoal.ID,
 ) shoal.ID {
 	return interaction.DerivedID(
 		"session",
-		"fleet.lifecycle.v3",
+		"fleet.lifecycle.v4",
 		string(operation),
 		string(requestID),
 		string(agentID),
