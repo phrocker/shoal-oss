@@ -270,3 +270,80 @@ What this suggests for later slices, none of it done here:
 
 These are ideas, not results. Any rerun needs a new pre-registration and a
 new test split.
+
+## Erratum (added after review; the pre-registered result above is unchanged)
+
+Review of #519 found the following. The sections above are as they were
+when the results were committed. Nothing in this section changes the
+pre-registered numbers.
+
+### A test-only cue leaked into a grammar
+
+The fixtures section says the grammars were written from train and dev
+phrasings only. That is not quite true:
+
+- `grammars/breach_exposure.json` carries the cue `exposed`. The only text
+  that contains it is the test template "how exposed is {svc} to a breach"
+  (`generate.py`, the hidden-target block).
+- A word-level audit of every grammar cue, pattern word and enum phrase
+  against the train and dev texts finds one other word that occurs only in
+  test texts: `rolling` (the enum phrase "rolling back" in
+  `service_operation_risk.json`).
+  - This one is borderline rather than a leak. The phrase comes from the
+    generator's shared `OPS` table, which every split's decision templates
+    draw from. No train or dev case happened to draw the rollback operation
+    in its "-ing" form.
+  - Every grammar word occurs in some fixture text, except a few that occur
+    in none: `readiness`, `sev`, `1`, `2`, `3`, `forcefully`, `graceful` and
+    `bouncing`.
+
+**Re-run with the leak removed (exploratory, not pre-registered).** The
+committed grammars were left as they are. The re-run used a temporary copy of
+the fixtures, with the same test split (through the gate), model and code.
+
+| | router end-to-end | baseline end-to-end | discordant (router-only / baseline-only) |
+|---|---|---|---|
+| Pre-registered | 36 of 103 | 59 of 103 | 4 / 27 |
+| Without the cue `exposed` | 36 of 103 | 59 of 103 | 4 / 27 |
+| Without `exposed` and the phrase "rolling back" | 36 of 103 | 56 of 103 | 4 / 24 (p = 0.00018) |
+
+Removing `exposed` changes no number. The reviewer independently got the
+same 36 of 103 against 59 of 103. Removing "rolling back" as well only
+lowers the baseline, because the router abstained on those cases anyway. The
+conclusion stands: the router is worse than the baseline on held-out
+phrasings.
+
+### What the commit history can and cannot show
+
+- **What it shows:** the pre-registration commit `c9aa8bc3` fixed the test
+  digest before the results commit, and the gate refused the test split
+  until that digest was set.
+- **What it cannot show:** that the test split went unrun before
+  `c9aa8bc3`. The cases, grammars and model landed in `c48a54a6` 45 seconds
+  earlier, in the same working session. They could have been run against the
+  test split in that time, and only the author's account says they were not.
+- **Since this erratum, the test split is reachable only through the gate.**
+  Before it, `eval.Split(cases, "test")` bypassed the gate. Now:
+  - `Cases.Split` refuses it;
+  - `Cases.PreRegistered` is the only way to the test split;
+  - the gate is tested.
+
+**Protocol for v2.**
+1. Generate the test split's cases and commit their digest in a pull request
+   of its own, merged before any grammar, feature or model work for that
+   version begins.
+2. Write the grammars and train the model only from the train and dev splits
+   afterwards, and run the word audit above before the test run.
+3. Run the test split once, through the gate.
+
+### Predictor identity on other toolchains
+
+`TestGoldenPredictorID` used to pin the identity only on go1.26.4/linux/amd64,
+and on other toolchains only logged it. CI runs the go.mod version.
+`decisionlinear.IdentityFor` is now a pure function of (model SHA-256,
+feature schema, Go version, OS, architecture), and `New` uses it. The test
+checks two things on every toolchain:
+
+- the go1.26.4/linux/amd64 golden;
+- that the running provider's identity is `IdentityFor` of the running
+  environment.

@@ -22,7 +22,15 @@ func benchCases(b *testing.B) (*Runner, []Case) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	selected := append(Split(cases, "train"), Split(cases, "dev")...)
+	train, err := cases.Split("train")
+	if err != nil {
+		b.Fatal(err)
+	}
+	dev, err := cases.Split("dev")
+	if err != nil {
+		b.Fatal(err)
+	}
+	selected := append(train, dev...)
 	r := NewRunner(w, provider)
 	for _, caller := range w.Callers() {
 		if _, err := r.Catalog(caller); err != nil {

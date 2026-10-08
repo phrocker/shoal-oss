@@ -16,6 +16,7 @@ import (
 	"runtime"
 	"testing"
 
+	"github.com/phrocker/shoal-oss/internal/decisionlinear"
 	"github.com/phrocker/shoal-oss/pkg/decision"
 	"github.com/phrocker/shoal-oss/pkg/router"
 )
@@ -27,7 +28,7 @@ const (
 	modelPath  = "../testdata/model/router-pair-v1.json"
 )
 
-func load(t testing.TB) (*World, []Case) {
+func load(t testing.TB) (*World, *Cases) {
 	t.Helper()
 	w, err := LoadWorld(fixtureDir)
 	if err != nil {
@@ -40,12 +41,16 @@ func load(t testing.TB) (*World, []Case) {
 	return w, cases
 }
 
-func trainModel(t testing.TB, w *World, cases []Case) []byte {
+func trainModel(t testing.TB, w *World, cases *Cases) []byte {
 	t.Helper()
 	// Features do not depend on the model, so any provider serves the
 	// analysis; the runner's decider is not used here.
 	r := &Runner{World: w, catalogs: map[string]*router.Catalog{}}
-	examples, err := r.Examples(Split(cases, "train"))
+	train, err := cases.Split("train")
+	if err != nil {
+		t.Fatal(err)
+	}
+	examples, err := r.Examples(train)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -55,7 +60,7 @@ func trainModel(t testing.TB, w *World, cases []Case) []byte {
 	if err != nil {
 		t.Fatal(err)
 	}
-	model, err := router.ModelJSON(task, weights, bias, SplitDigest(cases, "train"), config)
+	model, err := router.ModelJSON(task, weights, bias, cases.Digest("train"), config)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -83,7 +88,7 @@ func TestModelArtifactIsReproducible(t *testing.T) {
 	if err := json.Unmarshal(model, &fields); err != nil {
 		t.Fatal(err)
 	}
-	if fields["dataset_sha256"] != SplitDigest(cases, "train") || fields["recipe_sha256"] != router.DefaultTrainConfig().Digest() {
+	if fields["dataset_sha256"] != cases.Digest("train") || fields["recipe_sha256"] != router.DefaultTrainConfig().Digest() {
 		t.Fatal("model does not pin the train split and recipe")
 	}
 }
@@ -93,10 +98,12 @@ const (
 	goldenModelSHA256 = "f11fa3aca2f97d33cbd72d674d26b01fe4c4dc074bf6068de312bc63c1d82a08"
 	// goldenPredictorID is the provider's predictor identity on the
 	// recorded environment. The identity includes the serving environment
-	// (Go version, OS, architecture), so another environment gets another
-	// ID by design; there the test checks every other pinned field.
-	goldenPredictorEnv = "go1.26.4/linux/amd64"
-	goldenPredictorID  = "decision:predictor:v1:b17d76b7609525501b7adce5fcd62cbab6de6e58217ad992634487ef486d3127"
+	// (Go version, OS, architecture), so it is computed for that environment
+	// with decisionlinear.IdentityFor and checked on every toolchain.
+	goldenGoVersion   = "go1.26.4"
+	goldenGOOS        = "linux"
+	goldenGOARCH      = "amd64"
+	goldenPredictorID = "decision:predictor:v1:b17d76b7609525501b7adce5fcd62cbab6de6e58217ad992634487ef486d3127"
 )
 
 func TestGoldenPredictorID(t *testing.T) {
@@ -118,13 +125,18 @@ func TestGoldenPredictorID(t *testing.T) {
 		string(config.PreprocessingID) != router.FeatureSchemaID || config.Device != "cpu" {
 		t.Fatalf("predictor config = %+v", config)
 	}
-	env := runtime.Version() + "/" + runtime.GOOS + "/" + runtime.GOARCH
-	if env != goldenPredictorEnv {
-		t.Logf("predictor ID %s on %s is not pinned (pinned for %s)", identity.ID(), env, goldenPredictorEnv)
-		return
+	pinned, err := decisionlinear.IdentityFor(goldenModelSHA256, router.FeatureSchemaID, goldenGoVersion, goldenGOOS, goldenGOARCH)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if identity.ID() != goldenPredictorID {
-		t.Fatalf("predictor ID = %s, want %s", identity.ID(), goldenPredictorID)
+	if pinned.ID() != goldenPredictorID {
+		t.Fatalf("predictor ID on %s/%s/%s = %s, want %s", goldenGoVersion, goldenGOOS, goldenGOARCH, pinned.ID(), goldenPredictorID)
+	}
+	// On the running toolchain the identity is the same function of its own
+	// environment.
+	running, err := decisionlinear.IdentityFor(goldenModelSHA256, router.FeatureSchemaID, runtime.Version(), runtime.GOOS, runtime.GOARCH)
+	if err != nil || identity.ID() != running.ID() {
+		t.Fatalf("provider identity %s, IdentityFor running %s (%v)", identity.ID(), running.ID(), err)
 	}
 	task, _ := router.TaskSpec()
 	if _, err := decision.NewTaskSpec(task.Config()); err != nil {
@@ -143,7 +155,7 @@ func runSplit(t *testing.T, split string) (*World, []Outcome) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	selected, err := PreRegistered(cases, split)
+	selected, err := cases.PreRegistered(split)
 	if err != nil {
 		t.Fatal(err)
 	}

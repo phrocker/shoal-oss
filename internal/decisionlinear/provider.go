@@ -130,12 +130,20 @@ func New(c Config) (*Provider, error) {
 	if err != nil || threshold != 0 {
 		return nil, errors.New("threshold must be zero")
 	}
-	environment, _ := json.Marshal(struct{ Runtime, Formatter, Go, OS, Arch string }{runtimeID, formatterID, runtime.Version(), runtime.GOOS, runtime.GOARCH})
-	p.identity, err = decision.NewPredictorIdentity(decision.PredictorConfig{Provider: "local-linear-svm", RuntimeID: runtimeID, WeightsDigest: c.ExpectedSHA256, TokenizerDigest: digest([]byte("decisionlinear:no-tokenizer:v1")), FormattingID: formatterID, PreprocessingID: shoal.ID(p.features), CalibrationID: "decisionlinear:uncalibrated-zero-margin:v1", EnvironmentDigest: digest(environment), Device: "cpu", Precision: "float64", BatchPolicyID: "decisionlinear:serial-subjects:v1", ReplayTolerance: 0})
+	p.identity, err = IdentityFor(c.ExpectedSHA256, p.features, runtime.Version(), runtime.GOOS, runtime.GOARCH)
 	if err != nil {
 		return nil, err
 	}
 	return p, nil
+}
+
+// IdentityFor is the predictor identity New gives a model with the given
+// SHA-256 and feature schema when served by the given Go toolchain version,
+// OS and architecture. It is a pure function, so a pinned identity can be
+// checked on any toolchain; New uses it for the running one.
+func IdentityFor(modelSHA256, featureSchemaID, goVersion, goos, goarch string) (decision.PredictorIdentity, error) {
+	environment, _ := json.Marshal(struct{ Runtime, Formatter, Go, OS, Arch string }{runtimeID, formatterID, goVersion, goos, goarch})
+	return decision.NewPredictorIdentity(decision.PredictorConfig{Provider: "local-linear-svm", RuntimeID: runtimeID, WeightsDigest: modelSHA256, TokenizerDigest: digest([]byte("decisionlinear:no-tokenizer:v1")), FormattingID: formatterID, PreprocessingID: shoal.ID(featureSchemaID), CalibrationID: "decisionlinear:uncalibrated-zero-margin:v1", EnvironmentDigest: digest(environment), Device: "cpu", Precision: "float64", BatchPolicyID: "decisionlinear:serial-subjects:v1", ReplayTolerance: 0})
 }
 func (p *Provider) Identity() decision.PredictorIdentity { return p.identity }
 func (p *Provider) Resolve(ctx context.Context, release, predictor shoal.ID) (decisionservice.Predictor, error) {

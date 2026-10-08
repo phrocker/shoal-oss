@@ -90,9 +90,26 @@ How it works:
   provider. Its only evidence is the numeric feature artifact.
 - An action's input is canonicalized by `fleet.ValidateActionInput`, which
   returns the exact bytes an enqueue stores.
-- A test fails if the router or the shadow service reaches `Enqueue`,
-  `Invoke`, `Evaluate` or `Register`. A deliberately violating fixture
-  proves that the check catches each way of reaching them.
+- An allowlist guards authority. Every package under `pkg/router` and
+  `internal/routershadow` is checked; `go list` finds them, so a new
+  subpackage is checked too. Each use of a function, method or func value
+  from the fleet, explorer, auth, decision and decision-service packages must
+  be on a named allowlist of reads, accessors and pure record constructors,
+  each with a reason. Also refused:
+  - `unsafe`, `reflect`, `os/exec` and network imports;
+  - `go:linkname`;
+  - module imports outside a short list;
+  - interface methods over controlled types;
+  - func values bound elsewhere.
+
+  A violating fixture reaches controlled operations every way the review
+  named: Enqueue, Invoke, Claim, ExecuteClaim, Cancel, Register, Heartbeat,
+  Revoke, CompleteClaim in a subpackage, a stored func variable, a variable
+  bound in another package, a local interface, reflection and linkname. A
+  test asserts each is flagged, and each rule was mutation-checked.
+  - **Residual:** the guard does not follow calls into the allowed
+    non-controlled packages (`pkg/lexicon`, `pkg/ontology` and the like). It
+    relies on their holding data and pure functions.
 - An approval-required proposal handed to `Enqueue` is still held.
 - Records hold no text: only an HMAC of the normalized text, scoped to the
   caller.
@@ -109,16 +126,38 @@ published ontology, and one where those do not exist. Alice's proposals,
 reasons, receipts (including the catalog digest) and errors are byte-equal
 in both. Residuals:
 
-- **Fleet list scans.** `fleet.Service.List` scans the registry store
-  entry by entry, so a hidden descriptor costs one store read and its
-  authorization check. Store traffic and time grow with hidden descriptors.
-  The pages returned and everything in the proposal do not.
+- **Fleet list scans.** `fleet.Service.List` scans the registry store entry
+  by entry, up to 1024 entries a call. When the entries it scanned are
+  hidden, it returns an empty or short page with a continuation.
+  - **What is bounded:** only what the caller sees: 256 targets and 256
+    descriptors.
+  - **What is not:** the pages read. They continue until the listing ends,
+    bounded by a 10-second wall-time budget (`EnumerationTimeout`) and the
+    caller's context.
+  - **What grows with hidden entries:** the number of scans and store reads,
+    and the time they take.
+  - **What does not change:** the outcome. A test holds 70,000 hidden
+    descriptors against none and gets byte-equal proposals. An earlier
+    page-count bound let them turn a one-descriptor caller's routing into a
+    "too many targets" error.
+  - A registry large enough to exceed the time budget makes routing fail
+    closed for every caller. That residual depends on registry size and
+    speed, not on any one caller's view.
 - **Timing.** The lexicon's per-candidate timing residual
   ([lexicon.md](lexicon.md#disclosure-residuals)) and the published-ontology
   catalog walk (which reads every proposal, visible or not) are inherited.
 - **Records.** The shadow record names the server-filtered lexicon bundle ID,
   which changes with hidden nodes. Records are host-internal. The proposal
   and its receipt never carry that ID.
+- **Configuration.** The operator must pair the lexicon bundle with the
+  ontology its lookup templates were derived from. The bundle does not
+  record that ontology, so `OntologyBinding` carries the published version
+  itself. `New` refuses a binding whose version does not have the bound
+  identity, or whose relationships do not derive exactly the bundle's
+  templates.
+- **Utterance key.** The host key must be random and secret. `New` refuses
+  a key shorter than 32 bytes or with fewer than 16 distinct byte values,
+  such as an all-zero or repeated-byte key.
 
 **Deferred:**
 

@@ -287,8 +287,15 @@ type Expected struct {
 // Answerable reports whether the case expects a proposal.
 func (c Case) Answerable() bool { return c.Expected.Kind != router.KindAbstain }
 
+// Cases is the loaded fixture set. Its splits are reachable only through
+// Split, which refuses the held-out test split, and PreRegistered, which
+// releases it only under the pre-registered digest.
+type Cases struct {
+	all []Case
+}
+
 // LoadCases reads cases.jsonl.
-func LoadCases(dir string) ([]Case, error) {
+func LoadCases(dir string) (*Cases, error) {
 	f, err := os.Open(filepath.Join(dir, "cases.jsonl"))
 	if err != nil {
 		return nil, err
@@ -313,14 +320,17 @@ func LoadCases(dir string) ([]Case, error) {
 		c.line = line
 		out = append(out, c)
 	}
-	return out, scanner.Err()
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+	return &Cases{all: out}, nil
 }
 
-// SplitDigest is the SHA-256 of a split's case lines, in file order, each
+// Digest is the SHA-256 of a split's case lines, in file order, each
 // followed by a newline. It pins exactly which cases a split holds.
-func SplitDigest(cases []Case, split string) string {
+func (cs *Cases) Digest(split string) string {
 	h := sha256.New()
-	for _, c := range cases {
+	for _, c := range cs.all {
 		if c.Split == split {
 			h.Write(c.line)
 			h.Write([]byte{'\n'})
@@ -329,10 +339,22 @@ func SplitDigest(cases []Case, split string) string {
 	return hex.EncodeToString(h.Sum(nil))
 }
 
-// Split returns the cases of one split, in file order.
-func Split(cases []Case, split string) []Case {
+// ErrHeldOut is returned when the test split is asked for outside the
+// pre-registration gate.
+var ErrHeldOut = fmt.Errorf("the test split is held out: use PreRegistered")
+
+// Split returns the cases of the train or dev split, in file order. It
+// refuses the test split.
+func (cs *Cases) Split(split string) ([]Case, error) {
+	if split != "train" && split != "dev" {
+		return nil, ErrHeldOut
+	}
+	return cs.selectSplit(split), nil
+}
+
+func (cs *Cases) selectSplit(split string) []Case {
 	var out []Case
-	for _, c := range cases {
+	for _, c := range cs.all {
 		if c.Split == split {
 			out = append(out, c)
 		}
