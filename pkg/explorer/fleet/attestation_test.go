@@ -513,14 +513,45 @@ func TestAnotherPrincipalsAttestationDoesNotCover(t *testing.T) {
 	}
 }
 
+// What "without standing" means in the tests below, precisely.
+//
+// A caller has standing on an action when it is authorized on the action's
+// *descriptor*: authorizedClaimant accepts it by one of its two routes —
+// OperationExecute on the record's source and policy (#437, no principal
+// requirement), or OperationInvoke as the enqueuing principal — and
+// resolveActionBinding then accepts it against the live descriptor: the same
+// authorization domain, a declared scope, and AuthorizeObject for the
+// operation (and for OperationDelegate when it acts on someone's behalf).
+//
+// A caller without standing fails one of those. It is NOT "anyone but the
+// enqueuer": an execute-holder in the descriptor's own scope and domain has
+// standing, is meant to reach the attestation gate, and is told the
+// requirement. A probe built from such a caller sees the conflict and reads as
+// an oracle when it is the probe that is wrong (the lesson of #533's approval
+// twin, TestAGateRefusalNeverPrecedesTheStandingCheck).
+//
+// The attestation gate's refusal is a distinguishable conflict, a deliberate
+// departure from #398's rule that every standing refusal is not-found. That is
+// sound only while the standing check runs first, so for every caller without
+// standing the answer on an attestation-required action must be byte-for-byte
+// what the same caller is told for an action that does not exist, and the
+// attestation store must never be read.
+
 // TestACallerWithoutStandingCannotTellTheRequirementExists: identical answers
-// with and without the requirement, and the store is never consulted.
+// with and without the requirement, and the store is never consulted. The
+// outsider holds only invoke and is not the enqueuer, so it fails both of
+// authorizedClaimant's routes.
 func TestACallerWithoutStandingCannotTellTheRequirementExists(t *testing.T) {
 	answers := make([]string, 0, 2)
 	for _, require := range []bool{true, false} {
 		f := newAttestationFixture(t, require)
-		outsider := bindDecision(t, f.authority, dispatchDecision(t,
-			"outsider", "outsider-actor", "outsider-request", auth.OperationInvoke))
+		// A client ID, so the store-count assertion below is not vacuous:
+		// claimAttestation never reads the store for a decision without one,
+		// so without it a gate that ran first would still count zero calls.
+		outsider := bindDecision(t, f.authority, dispatchDecisionFor(t, principal{
+			subject: "outsider", actor: "outsider-actor", request: "outsider-request",
+			clientID: "outsider-client",
+		}, auth.OperationInvoke))
 		_, err := f.service.Claim(outsider, ClaimRequest{
 			ID: f.queued.ID, ExpectedVersion: f.queued.Version, ClaimID: []byte("x"),
 			Lease: time.Minute, Context: dispatchContext(f.now(), "outsider-request"),
@@ -536,6 +567,234 @@ func TestACallerWithoutStandingCannotTellTheRequirementExists(t *testing.T) {
 	if answers[0] != answers[1] {
 		t.Fatalf("answers differ: %q vs %q", answers[0], answers[1])
 	}
+}
+
+// stranger is a caller that holds the operation the route needs, and whose
+// lack of standing on the fixture's descriptor is one specific thing.
+type stranger struct {
+	name string
+	// where names the check that refuses it, so a failure names the layer.
+	where      string
+	domain     string
+	source     string
+	policy     string
+	onBehalfOf []shoal.ID
+	// storeCountable is false where claimAttestation would skip the store
+	// even if the gate were reached (a delegated chain), so the count
+	// assertion would be vacuous; the byte comparison still bites there.
+	storeCountable bool
+}
+
+// strangers hold the operation and a client ID, so none is refused for
+// lacking the grant at begin and each would be attestation-checked if it
+// reached the gate. What none has is standing on *this descriptor*.
+//
+// Variants considered and not constructible here:
+//   - Failing AuthorizeObject on the domain. authorizedCurrentBinding passes
+//     the decision's own domain as the resource's, so that comparison cannot
+//     fail there; a foreign domain is refused by resolveActionBinding's
+//     descriptor comparison instead, which is the "other domain" case.
+//   - Inside the caller's grant but outside the descriptor's scopes. Enqueue
+//     writes only a record whose scope the descriptor declares, and the
+//     generation pin refuses a re-registration that narrows it, so every
+//     scope failure lands at AuthorizeObject first. That is also why
+//     weakening resolveActionBinding's scope loop alone is not a mutant these
+//     tests can kill: AuthorizeObject refuses the same caller regardless.
+var strangers = []stranger{
+	{
+		name: "other scope", where: "AuthorizeObject (source and policy)",
+		domain: "domain", source: "other-source", policy: "other-policy",
+		storeCountable: true,
+	},
+	{
+		name: "right source, other policy", where: "AuthorizeObject (policy)",
+		domain: "domain", source: "source", policy: "other-policy",
+		storeCountable: true,
+	},
+	{
+		name: "other domain", where: "resolveActionBinding (descriptor domain)",
+		domain: "other-domain", source: "source", policy: "policy",
+		storeCountable: true,
+	},
+	{
+		// In scope and in domain: refused by resolveActionBinding's second
+		// AuthorizeObject, for OperationDelegate.
+		name: "delegated without delegate", where: "AuthorizeObject (delegate)",
+		domain: "domain", source: "source", policy: "policy",
+		onBehalfOf: []shoal.ID{"delegator"},
+	},
+}
+
+func (s stranger) bind(
+	t *testing.T, f *attestationFixture, request string, operation auth.Operation,
+) context.Context {
+	t.Helper()
+	slug := "stranger-" + strings.NewReplacer(" ", "-", ",", "").Replace(s.name)
+	decision, err := auth.NewDecision(auth.DecisionConfig{
+		Subject: shoal.ID(slug), Actor: shoal.ID(slug + "-actor"),
+		ClientID: shoal.ID(slug + "-client"), OnBehalfOf: s.onBehalfOf,
+		AuthorizationDomain:   []byte(s.domain),
+		AllowedOperations:     []auth.Operation{operation},
+		PermittedSourceIDs:    [][]byte{[]byte(s.source)},
+		PermittedPolicyIDs:    [][]byte{[]byte(s.policy)},
+		PolicyGeneration:      1,
+		AuthenticationExpires: time.Date(2026, 9, 7, 0, 0, 0, 0, time.UTC),
+		RequestID:             shoal.ID(request), CorrelationID: "correlation",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return bindDecision(t, f.authority, decision)
+}
+
+// requireIndistinguishable is the comparison every case below makes.
+func requireIndistinguishable(
+	t *testing.T, s stranger, f *attestationFixture, route string,
+	refused, absent error, callsBefore int,
+) {
+	t.Helper()
+	if refused == nil || absent == nil {
+		t.Fatalf("%s: %s was not refused: %v / %v", route, s.name, refused, absent)
+	}
+	if refused.Error() != absent.Error() {
+		t.Fatalf("%s: an attestation-required action refuses %q (expected to "+
+			"stop at %s) as %q while an absent one refuses it as %q: the gate "+
+			"is an existence oracle", route, s.name, s.where, refused, absent)
+	}
+	if !shoal.IsErrorCode(refused, shoal.ErrorNotFound) {
+		t.Fatalf("%s: %s refusal is not a not-found: %v", route, s.name, refused)
+	}
+	if s.storeCountable && f.attestations.callCount() != callsBefore {
+		t.Fatalf("%s: the attestation store was read for %s", route, s.name)
+	}
+}
+
+// TestAnExecuteHolderWithoutStandingCannotReachTheClaimGate is the attestation
+// twin of TestAGateRefusalNeverPrecedesTheStandingCheck: callers holding
+// execute but without standing on the descriptor are told exactly what an
+// absent action ID is, and the store is never read.
+func TestAnExecuteHolderWithoutStandingCannotReachTheClaimGate(t *testing.T) {
+	for _, s := range strangers {
+		t.Run(s.name, func(t *testing.T) {
+			f := newAttestationFixture(t, true)
+			ctx := s.bind(t, f, "stranger-request", auth.OperationExecute)
+			probe := func(id []byte) error {
+				_, err := f.service.Claim(ctx, ClaimRequest{
+					ID: id, ExpectedVersion: f.queued.Version,
+					ClaimID: []byte("probe-claim"), Lease: time.Minute,
+					Context: dispatchContext(f.now(), "stranger-request"),
+				})
+				return err
+			}
+			refused, absent := probe(f.queued.ID), probe([]byte("no-such-action"))
+			requireIndistinguishable(t, s, f, "claim", refused, absent, 0)
+
+			// The control: the gate is armed. An unattested execute-holder
+			// *with* standing (in scope, in domain, not the enqueuer) is told
+			// the requirement, so the not-found above was standing.
+			_, err := f.claim(t, "insider", time.Minute)
+			requireAttestationRefusal(t, err)
+		})
+	}
+}
+
+// TestAnExecuteHolderWithoutStandingCannotReachTheExtensionGate: ExtendClaim
+// is reachable by every principal holding execute and gates the extension on
+// attestation, so it needs the same guarantee, here against a live attested
+// claim.
+func TestAnExecuteHolderWithoutStandingCannotReachTheExtensionGate(t *testing.T) {
+	for _, s := range strangers {
+		t.Run(s.name, func(t *testing.T) {
+			f := newAttestationFixture(t, true)
+			f.attest("alpha", f.now().Add(time.Hour))
+			claimed, err := f.claim(t, "alpha", time.Minute)
+			if err != nil {
+				t.Fatal(err)
+			}
+			callsAfterClaim := f.attestations.callCount()
+			ctx := s.bind(t, f, "stranger-request", auth.OperationExecute)
+			probe := func(id []byte) error {
+				_, err := f.service.ExtendClaim(ctx, ExtendRequest{
+					ID: id, ExpectedVersion: claimed.Version,
+					ClaimID: []byte("alpha-claim"), Lease: 2 * time.Minute,
+					Context: dispatchContext(f.now(), "stranger-request"),
+				})
+				return err
+			}
+			refused, absent := probe(f.queued.ID), probe([]byte("no-such-action"))
+			requireIndistinguishable(t, s, f, "extend", refused, absent, callsAfterClaim)
+		})
+	}
+}
+
+// TestAnInvokeHolderWithoutStandingCannotReachTheAdmissionGate: admission is
+// the other claim grant that reads attestation, under invoke. There is no
+// action ID to guess, because the durable one is derived from the caller, so
+// the absent probe names an agent that is not registered.
+//
+// The delegated variant is not compared byte for byte here, because it does
+// not hold and the reason is not attestation: queuedRecordBinding returns
+// resolveActionBinding's error unnormalised, so a delegated caller without
+// delegate authority is told unauthorized for a registered agent and
+// not-found for an unregistered one, with or without the requirement.
+// TestAdmissionDelegateRefusalDoesNotDependOnTheRequirement pins that the
+// gate plays no part in it; the split itself is an enqueue-path question.
+func TestAnInvokeHolderWithoutStandingCannotReachTheAdmissionGate(t *testing.T) {
+	for _, s := range strangers {
+		if len(s.onBehalfOf) > 0 {
+			continue
+		}
+		t.Run(s.name, func(t *testing.T) {
+			f := newAttestationFixture(t, true)
+			ctx := s.bind(t, f, "admission-stranger", auth.OperationInvoke)
+			refused := admissionProbe(f, ctx, "agent")
+			absent := admissionProbe(f, ctx, "no-such-agent")
+			requireIndistinguishable(t, s, f, "admission", refused, absent, 0)
+		})
+	}
+}
+
+// TestAdmissionDelegateRefusalDoesNotDependOnTheRequirement: whatever the
+// delegated stranger is told, it is told the same with the requirement on and
+// off, it is never the attestation denial, and the store is never read.
+func TestAdmissionDelegateRefusalDoesNotDependOnTheRequirement(t *testing.T) {
+	var delegated stranger
+	for _, s := range strangers {
+		if len(s.onBehalfOf) > 0 {
+			delegated = s
+		}
+	}
+	answers := make([]string, 0, 2)
+	for _, require := range []bool{true, false} {
+		f := newAttestationFixture(t, require)
+		ctx := delegated.bind(t, f, "admission-stranger", auth.OperationInvoke)
+		err := admissionProbe(f, ctx, "agent")
+		if err == nil {
+			t.Fatalf("require=%v: a delegated caller without delegate was admitted", require)
+		}
+		if f.recorder.recordedOperation(ClaimRefusedAttestationPhase) != "" {
+			t.Fatalf("require=%v: the refusal was audited as an attestation refusal", require)
+		}
+		answers = append(answers, err.Error())
+	}
+	if answers[0] != answers[1] {
+		t.Fatalf("the requirement changes the delegated answer: %q vs %q",
+			answers[0], answers[1])
+	}
+}
+
+// admissionProbe requests an admission against agent and returns only the
+// error, which is what these probes compare.
+func admissionProbe(f *attestationFixture, ctx context.Context, agent shoal.ID) error {
+	_, err := f.admission.Request(ctx, AdmissionRequest{
+		ID: []byte("probe"), IdempotencyKey: []byte("key-probe"),
+		TokenID: []byte("token-probe"), AgentID: agent, AgentGeneration: 1,
+		Capability: "search", Action: "query",
+		SourceID: []byte("source"), PolicyID: []byte("policy"), ObjectID: "object",
+		Effects: Effects{EffectMutatesExternal}, Input: json.RawMessage(`{"value":1}`),
+		Lease: time.Minute, Context: dispatchContext(f.now(), "admission-stranger"),
+	})
+	return err
 }
 
 func TestAdmissionWithoutAttestationIsADurableDenial(t *testing.T) {
