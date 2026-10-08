@@ -1283,3 +1283,167 @@ func TestEveryMutatingRouteSurvivesTheIdentityInvariant(t *testing.T) {
 		t.Fatalf("cancellation = %#v", canceled)
 	}
 }
+
+// TestAHeartbeatDoesNotStrandInFlightWork is #486, driven through the real
+// store because the defect was invisible to every fake.
+//
+// resolveActionBinding pinned the descriptor to the generation an action was
+// enqueued at, and Heartbeat advances that generation on every lease renewal.
+// So a single heartbeat made every in-flight action on that agent refuse with
+// ObjectNotFound — indistinguishable from an action that never existed. A
+// worker that had performed an effect and heartbeated on schedule could not
+// report it; a rolling restart stranded a draining replica's effect; and two
+// replicas could not share one descriptor identity.
+//
+// Unpinning alone would have been a bypass: Update refuses changes that *grow*
+// authority, but turning a requirement on is a narrowing and therefore
+// permitted, so a record enqueued under the laxer rule would have escaped the
+// stricter one. The requirement is now checked directly by approvalGate and
+// attestationGate against the current registration, which is what makes the
+// pin removable — and TestApprovalIsPerActionAndSurvivesRegistration covers
+// that half.
+//
+// This covers the half that was broken: claim, heartbeat, then renew, report
+// and complete, each of which resolves the descriptor again.
+func TestAHeartbeatDoesNotStrandInFlightWork(t *testing.T) {
+	now := time.Date(2026, 9, 6, 12, 0, 0, 0, time.UTC)
+	directory := t.TempDir()
+	runtime := openFleetDispatchRuntime(t, directory)
+	defer func() { _ = runtime.Close() }()
+	authority, err := auth.NewAuthorityWithClock(func() time.Time { return now })
+	if err != nil {
+		t.Fatal(err)
+	}
+	executor := &integratedExecutor{}
+	registry, dispatch := composeIntegratedServicesWithRecorder(
+		t, runtime, authority, executor, integratedActionRecorder{}, now,
+	)
+	decision := integratedDecision(t, now)
+	ctx, err := authority.Binder().Bind(context.Background(), decision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	descriptor := registerIntegratedAgent(t, registry, ctx, now)
+
+	queued, err := dispatch.Enqueue(ctx, integratedEnqueue(
+		now, descriptor, []byte("heartbeat-action"), []byte("heartbeat-key")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := dispatch.Claim(ctx, fleet.ClaimRequest{
+		ID: queued.ID, ExpectedVersion: queued.Version,
+		ClaimID: []byte("claim"), Lease: time.Minute,
+		Context: integratedContext(now),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The heartbeat needs its own operation, which integratedDecision does
+	// not carry — widening that shared fixture would change what every other
+	// test in this file is authorized to do.
+	beat, err := auth.NewDecision(auth.DecisionConfig{
+		Subject: "owner", Actor: "actor",
+		AuthorizationDomain: []byte("domain"),
+		AllowedOperations: []auth.Operation{
+			auth.OperationAgentHeartbeat,
+		},
+		PermittedSourceIDs: [][]byte{[]byte("source")},
+		PermittedPolicyIDs: [][]byte{[]byte("policy")}, PolicyGeneration: 1,
+		AuthenticationExpires: now.Add(2 * time.Hour),
+		RequestID:             "request", CorrelationID: "correlation",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	beatCtx, err := authority.Binder().Bind(context.Background(), beat)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// This is the whole premise: the heartbeat must move the generation, or
+	// the test proves nothing — the descriptor store requires every mutation
+	// to advance it by exactly one.
+	renewed, err := registry.Heartbeat(beatCtx, fleet.HeartbeatRequest{
+		Context: integratedContext(now), RegistrationKey: "beat-once",
+		ID: descriptor.ID, ExpectedGeneration: descriptor.Generation,
+		LeaseExpiresAt: now.Add(2 * time.Hour),
+	})
+	if err != nil {
+		t.Fatalf("the heartbeat this test needs was refused: %v", err)
+	}
+	if renewed.Generation == descriptor.Generation {
+		t.Fatalf("the heartbeat left the generation at %d, so nothing below "+
+			"exercises the pin and this test cannot fail",
+			renewed.Generation)
+	}
+
+	// Everything the worker does next resolves the descriptor again.
+	extended, err := dispatch.ExtendClaim(ctx, fleet.ExtendRequest{
+		ID: queued.ID, ExpectedVersion: claimed.Version,
+		ClaimID: []byte("claim"), Lease: 2 * time.Minute,
+		Context: integratedContext(now),
+	})
+	if err != nil {
+		t.Fatalf("a renewal after a heartbeat was refused, so a long "+
+			"operation cannot survive its own liveness signal: %v", err)
+	}
+	reported, err := dispatch.ReportAmbiguity(ctx, fleet.AmbiguityRequest{
+		ID: queued.ID, ClaimFence: extended.ClaimFence,
+		Outcome: fleet.AmbiguityOutcomeUnknown,
+		Context: integratedContext(now),
+	})
+	if err != nil {
+		t.Fatalf("an ambiguity report after a heartbeat was refused, so a "+
+			"worker cannot record an effect it may have caused: %v", err)
+	}
+	completed, err := dispatch.CompleteClaim(ctx, fleet.CompletionRequest{
+		ID: queued.ID, ExpectedVersion: reported.Version,
+		ClaimFence: reported.ClaimFence, ClaimID: []byte("claim"),
+		Result:  fleet.ExecutionResult{Output: json.RawMessage(`{"ok":true}`)},
+		Context: integratedContext(now),
+	})
+	if err != nil {
+		t.Fatalf("a completion after a heartbeat was refused, so a worker "+
+			"that performed an effect cannot report it: %v", err)
+	}
+	if completed.State != fleet.DispatchSucceeded {
+		t.Fatalf("completion state = %q", completed.State)
+	}
+
+	// And Pull still offers an unclaimed record on the same agent, which is
+	// how a second worker finds work after the first heartbeated.
+	// The enqueue pin is still exact, and this proves it both ways: the
+	// pre-heartbeat generation is refused, and the renewed one is accepted.
+	// A dispatcher asserting freshness about the descriptor it read should
+	// fail if the descriptor moved underneath, which is the one place the
+	// exact comparison is the right question.
+	if _, err := dispatch.Enqueue(ctx, integratedEnqueue(
+		now, descriptor, []byte("heartbeat-stale"), []byte("stale-key")),
+	); err == nil {
+		t.Fatal("an enqueue naming the pre-heartbeat generation was " +
+			"accepted, so the freshness assertion at enqueue is gone too")
+	}
+	second, err := dispatch.Enqueue(ctx, integratedEnqueue(
+		now, renewed, []byte("heartbeat-second"), []byte("second-key")))
+	if err != nil {
+		t.Fatalf("an enqueue naming the current generation was refused: %v",
+			err)
+	}
+	page, err := dispatch.Pull(ctx, fleet.PullActionsRequest{
+		Limit: fleet.MaxDispatchListResults, Context: integratedContext(now),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var offered bool
+	for _, action := range page.Actions {
+		if string(action.ID) == string(second.ID) {
+			offered = true
+		}
+	}
+	if !offered {
+		t.Fatal("Pull no longer offers work on an agent that has " +
+			"heartbeated, so a worker sees an empty page for staying alive")
+	}
+}

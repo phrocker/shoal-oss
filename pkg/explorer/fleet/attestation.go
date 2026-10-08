@@ -111,6 +111,10 @@ func attestationUnavailable() error {
 // It is one small shape so #486 can add approval to it the same way.
 type claimRequirements struct {
 	Attestation bool
+	// Approval is #486's term. Unlike Attestation, whose record side is
+	// claim-scoped, this one's is record-scoped and immutable: an action
+	// materialized from an approval carries its digest for life.
+	Approval bool
 }
 
 // effectiveClaimRequirements combines the record's snapshot with the current
@@ -130,6 +134,8 @@ type claimRequirements struct {
 func effectiveClaimRequirements(record ActionRecord, current Action) claimRequirements {
 	return claimRequirements{
 		Attestation: current.RequiresAttestation || record.ClaimAttestationID != "",
+		Approval: current.RequiresApproval ||
+			len(record.ApprovalRequestDigest) > 0,
 	}
 }
 
@@ -150,6 +156,55 @@ func attestationGate(required claimRequirements, attestation ExecutorAttestation
 		return attestationRequired()
 	}
 	return nil
+}
+
+// approvalGate refuses a claim on work the action's current registration
+// requires approval for, when the record carries no approval.
+//
+// This is what lets the generation pin come off. Before it, a record enqueued
+// while its capability did not require approval stayed claimable after the
+// requirement was turned on — and the only thing preventing that was
+// resolveActionBinding refusing *every* post-enqueue resolution of a
+// pre-enqueue generation, which is the same refusal a heartbeat caused. The
+// pin was preventing the bypass incidentally; this prevents it on purpose.
+//
+// It also refuses for the right reason. The pin's refusal was
+// ObjectNotFound on a generation number, which tells a worker the action does
+// not exist; this says approval is required, which is true and actionable.
+//
+// Stricter-wins, so there is no direction in which a flip loses: turning the
+// requirement on governs records enqueued before it, and an already-approved
+// record keeps its approval if the requirement is later turned off.
+func approvalGate(required claimRequirements, record ActionRecord) error {
+	if !required.Approval {
+		return nil
+	}
+	if len(record.ApprovalRequestDigest) == 0 {
+		return approvalRequiredForClaim()
+	}
+	return nil
+}
+
+// approvalRequiredForClaim mirrors attestationRequired: a conflict whose text
+// is static, naming no approver, digest or decision, so it tells a caller with
+// standing what to do next and nothing else.
+//
+// Distinguishable from ObjectNotFound, which is a deliberate departure from
+// this surface's usual rule that every standing refusal is indistinguishable
+// (#398). The sibling attestation gate made the same choice for the same
+// reason and the two must agree, because a caller cannot be expected to learn
+// that one requirement refuses visibly and the other invisibly.
+//
+// What it does concede: a caller holding execute on the descriptor, who guesses
+// an action ID, learns the action exists. That is narrower than it looks —
+// claimableBy filters such a record out of Pull, so a legitimate worker never
+// reaches this gate and only a guesser does — and it is the same concession
+// attestation already makes. Raised as a question about both gates rather than
+// resolved differently in one of them.
+func approvalRequiredForClaim() error {
+	return shoal.WrapError(shoal.ErrorConflict,
+		"action requires approval; it must be requested through the approval "+
+			"route before it can be claimed", ErrApprovalRequired)
 }
 
 // claimLeaseEnd is the lease end a claim taken at now for lease would carry:

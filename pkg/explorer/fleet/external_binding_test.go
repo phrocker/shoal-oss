@@ -297,7 +297,7 @@ func TestServiceAdmitsExternalWorkAgainstAnExternalBinding(t *testing.T) {
 	_, action, resolved, err := service.resolveActionBinding(
 		ctx, decision, descriptor.ID, descriptor.Generation,
 		"search", "query", []byte("source-a"), []byte("policy"), "object",
-		auth.OperationDispatch, now)
+		auth.OperationDispatch, now, true)
 	if err != nil {
 		t.Fatalf("resolve external work for dispatch: %v", err)
 	}

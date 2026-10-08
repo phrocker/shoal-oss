@@ -197,6 +197,9 @@ func (s *DispatchService) queuedRecordBinding(
 		ctx, decision, request.AgentID, request.AgentGeneration,
 		request.Capability, request.Action, request.SourceID, request.PolicyID,
 		request.ObjectID, operation, now,
+		// Pinned. The dispatcher read a descriptor and built this request
+		// from it, so it should fail if the descriptor moved underneath.
+		true,
 	)
 	if err != nil {
 		return ActionRecord{}, Action{}, "", err
@@ -461,6 +464,9 @@ func applyClaim(
 ) (ActionRecord, error) {
 	leaseUntil := claimLeaseEnd(now, lease, record.Deadline)
 	required := effectiveClaimRequirements(record, action)
+	if err := approvalGate(required, record); err != nil {
+		return ActionRecord{}, err
+	}
 	if err := attestationGate(required, attestation, leaseUntil); err != nil {
 		return ActionRecord{}, err
 	}
@@ -1505,6 +1511,9 @@ func (s *DispatchService) ExtendClaim(
 	// applies to its extension. The claim itself is not revoked — it runs to
 	// its current lease end — but it is renewed only for an attested holder.
 	required := effectiveClaimRequirements(current, claimedAction)
+	if err := approvalGate(required, current); err != nil {
+		return ActionRecord{}, err
+	}
 	attestation, err := s.claimAttestation(
 		ctx, decision, required, executorRef, now)
 	if err != nil {
@@ -2323,7 +2332,14 @@ func (s *DispatchService) authorizedCurrentBinding(ctx context.Context, decision
 	// removes the duplicate gate instead of teaching it the second operation.
 	descriptor, resolved, _, err := s.registry.resolveActionBinding(ctx, decision, current.AgentID, current.AgentGeneration,
 		current.Capability, current.Action, current.SourceID, current.PolicyID, current.ObjectID,
-		operation, now)
+		operation, now,
+		// Unpinned: this record already exists, so the question is
+		// whether it is still the same agent, still live, and still
+		// authorized for this scope and capability — none of which a
+		// heartbeat changes. The requirement itself is checked by
+		// approvalGate and attestationGate. See resolveActionBinding.
+		false,
+	)
 	if err != nil {
 		if shoal.IsErrorCode(err, shoal.ErrorUnauthorized) ||
 			shoal.IsErrorCode(err, shoal.ErrorNotFound) {
@@ -2381,12 +2397,31 @@ func (s *DispatchService) claimableBy(
 		if route.requirePrincipal && !sameActionPrincipal(decision, record) {
 			continue
 		}
-		_, _, _, err := s.registry.resolveActionBinding(
+		_, resolved, _, err := s.registry.resolveActionBinding(
 			ctx, decision, record.AgentID, record.AgentGeneration,
 			record.Capability, record.Action, record.SourceID, record.PolicyID,
 			record.ObjectID, route.operation, now,
+			// Unpinned: this record already exists, so the question is
+			// whether it is still the same agent, still live, and still
+			// authorized for this scope and capability — none of which a
+			// heartbeat changes. The requirement itself is checked by
+			// approvalGate and attestationGate. See resolveActionBinding.
+			false,
 		)
 		if err == nil {
+			// Offering work that cannot be claimed is a listing that lies.
+			// The claim gates are the authority on this; applying the same
+			// requirement here keeps Pull from handing a worker a record its
+			// very next call would refuse.
+			//
+			// The resolved Action is the *current* registration, which is why
+			// this needs no extra read: resolveActionBinding has just read the
+			// descriptor as it is now.
+			if approvalGate(
+				effectiveClaimRequirements(record, resolved), record,
+			) != nil {
+				return false, nil
+			}
 			return true, nil
 		}
 		if shoal.IsErrorCode(err, shoal.ErrorUnauthorized) ||
@@ -2645,6 +2680,12 @@ func (s *Service) resolveAction(
 	descriptor, action, raw, err := s.resolveActionBinding(
 		ctx, decision, agentID, generation, capabilityName, actionName,
 		sourceID, policyID, objectID, operation, now,
+		// Unpinned: this record already exists, so the question is
+		// whether it is still the same agent, still live, and still
+		// authorized for this scope and capability — none of which a
+		// heartbeat changes. The requirement itself is checked by
+		// approvalGate and attestationGate. See resolveActionBinding.
+		false,
 	)
 	if err != nil {
 		return Descriptor{}, Action{}, nil, err
@@ -2679,9 +2720,47 @@ func (s *Service) resolveActionBinding(
 	objectID shoal.ID,
 	operation auth.Operation,
 	now time.Time,
+	// pinned asks for the descriptor to be at exactly the generation the
+	// caller names. That is the right question at enqueue and the wrong one
+	// afterwards (#486).
+	//
+	// Heartbeat advances Generation, because the descriptor store requires
+	// every mutation to advance it by exactly one and relies on that for its
+	// replay detection and compare-and-set. So the counter cannot be made
+	// insensitive to a lease renewal without trading a liveness bug for a
+	// correctness one underneath. What had to become insensitive is the pin.
+	//
+	// Pinned everywhere, one heartbeat made every in-flight action on that
+	// agent refuse with ObjectNotFound: a worker that had performed an effect
+	// and heartbeated on schedule could not report it, a rolling restart
+	// stranded a draining replica's effect, and two replicas could not share
+	// one descriptor identity.
+	//
+	// Unpinning alone was tried and is a bypass. Update refuses any change
+	// that *grows* the authorization domain, the scopes, the capabilities or
+	// the parent — but turning a requirement *on* is a narrowing, so it is
+	// permitted, and a record enqueued under the laxer rule then escaped the
+	// stricter one. The authority gained was not the descriptor's; it was the
+	// record's, which kept the rule it was created under. The pin was
+	// preventing that incidentally, by refusing every post-enqueue resolution
+	// of a pre-enqueue generation — the same refusal a heartbeat caused.
+	//
+	// So the requirement is checked directly instead, by approvalGate and
+	// attestationGate against the Action this function returns, which is the
+	// registration as it is *now*. A pre-flip record is refused on the
+	// requirement, which is both correct and a better refusal than
+	// ObjectNotFound on a generation number. A heartbeat changes neither side
+	// of that test.
+	//
+	// What remains pinned is the freshness assertion at enqueue: a dispatcher
+	// that read a descriptor and built a request from it should fail if the
+	// descriptor moved underneath. Losing authority is handled by the scope
+	// and capability checks below, against the descriptor just read, and
+	// revocation by s.active regardless of generation.
+	pinned bool,
 ) (Descriptor, Action, any, error) {
 	descriptor, err := s.active(ctx, agentID, now)
-	if err != nil || descriptor.Generation != generation {
+	if err != nil || (pinned && descriptor.Generation != generation) {
 		return Descriptor{}, Action{}, nil, auth.ObjectNotFound()
 	}
 	if !bytes.Equal(descriptor.AuthorizationDomain, decision.AuthorizationDomain()) {

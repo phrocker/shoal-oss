@@ -1036,6 +1036,12 @@ func (s *AdmissionService) Report(
 		ctx, decision, current.AgentID, current.AgentGeneration,
 		current.Capability, current.Action, current.SourceID, current.PolicyID,
 		current.ObjectID, auth.OperationInvoke, now,
+		// Unpinned: this record already exists, so the question is
+		// whether it is still the same agent, still live, and still
+		// authorized for this scope and capability — none of which a
+		// heartbeat changes. The requirement itself is checked by
+		// approvalGate and attestationGate. See resolveActionBinding.
+		false,
 	)
 	if err != nil {
 		return ActionRecord{}, err
@@ -1181,6 +1187,11 @@ func (s *AdmissionService) Outstanding(
 			ctx, decision, record.AgentID, record.AgentGeneration,
 			record.Capability, record.Action, record.SourceID, record.PolicyID,
 			record.ObjectID, auth.OperationInvoke, now,
+			// Unpinned, and here the pin was worse than a refusal: this loop
+			// *skips* a record it cannot authorize, so a heartbeat silently
+			// emptied the caller's own outstanding list rather than failing
+			// visibly. See resolveActionBinding.
+			false,
 		); authorizeErr != nil {
 			if shoal.IsErrorCode(authorizeErr, shoal.ErrorUnauthorized) ||
 				shoal.IsErrorCode(authorizeErr, shoal.ErrorNotFound) {
