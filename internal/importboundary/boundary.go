@@ -318,43 +318,64 @@ func Extensions(fsys fs.FS) ([]string, error) {
 	return mods, err
 }
 
-// underExtensions reports whether a local replace or use target, relative to
-// the repository root, lies in extensions/.
-func underExtensions(target string) bool {
-	if !strings.HasPrefix(target, "./") && !strings.HasPrefix(target, "../") && target != "." {
-		return false
-	}
-	clean := path.Clean(target)
-	return clean == "extensions" || strings.HasPrefix(clean, "extensions/")
+// localTarget classifies a replace target. Go treats a target as a local
+// directory when it starts with ./ or ../ or is absolute. Backslashes and
+// drive letters are treated as local too, so a Windows spelling cannot slip
+// past as a module path.
+func localTarget(target string) bool {
+	return target == "." || target == ".." || strings.HasPrefix(target, "./") || strings.HasPrefix(target, "../") ||
+		strings.HasPrefix(target, "/") || strings.Contains(target, "\\") || (len(target) >= 2 && target[1] == ':')
 }
 
-// checkWorkspace applies rule A to the root go.mod and go.work, which can
-// link code into core without any import inside the root module's tree.
+// checkModuleFile applies rule A to one module's go.mod (the root's or a
+// nested module's, at dir). It may not require or replace an extension
+// module, and every local replace must resolve, relative to dir, to the root
+// module or a nested module that rule A walks. That rejects targets under
+// extensions/, fixture modules under FixtureRoot, separate checkouts, absolute
+// paths and anything outside the repository.
+func checkModuleFile(fsys fs.FS, dir string, nested []string) []Violation {
+	var out []Violation
+	extensions := Module + "/extensions"
+	name := path.Join(dir, "go.mod")
+	mod, err := parseGoMod(fsys, name)
+	if err != nil {
+		return []Violation{{"A", name, "(malformed go.mod: " + err.Error() + ")"}}
+	}
+	for _, r := range mod.requires {
+		if within(r, extensions) {
+			out = append(out, Violation{"A", name, "require " + r})
+		}
+	}
+	for _, r := range mod.replaces {
+		bad := within(r[0], extensions)
+		if localTarget(r[1]) {
+			relative := strings.HasPrefix(r[1], ".") && !strings.Contains(r[1], "\\")
+			resolved := path.Join(dir, r[1]) // Join cleans.
+			walked := resolved == "." || slices.Contains(nested, resolved)
+			bad = bad || !relative || !walked
+		}
+		if bad {
+			out = append(out, Violation{"A", name, "replace " + r[0] + " => " + r[1]})
+		}
+	}
+	return out
+}
+
+// checkWorkspace applies rule A to every go.mod rule A covers and to
+// go.work, which can link code into core without any import inside the
+// root module's tree.
 //
-//   - The root go.mod may not require an extension module, replace one, or
-//     replace anything with a directory under extensions/.
+//   - Each such go.mod is checked by checkModuleFile.
 //   - go.work may not replace anything, and may use only the root, extension
 //     modules and nested modules. Using an extension module is harmless
 //     only because rule A forbids every import of it; using a nested module
 //     is harmless only because rule A walks it.
 //
-// Either file failing to parse is a violation.
+// A file failing to parse is a violation.
 func checkWorkspace(fsys fs.FS, extensionDirs map[string]bool, nested []string) []Violation {
 	var out []Violation
-	extensions := Module + "/extensions"
-	root, err := parseGoMod(fsys, "go.mod")
-	if err != nil {
-		return []Violation{{"A", "go.mod", "(malformed go.mod: " + err.Error() + ")"}}
-	}
-	for _, r := range root.requires {
-		if within(r, extensions) {
-			out = append(out, Violation{"A", "go.mod", "require " + r})
-		}
-	}
-	for _, r := range root.replaces {
-		if within(r[0], extensions) || underExtensions(r[1]) {
-			out = append(out, Violation{"A", "go.mod", "replace " + r[0] + " => " + r[1]})
-		}
+	for _, dir := range append([]string{"."}, nested...) {
+		out = append(out, checkModuleFile(fsys, dir, nested)...)
 	}
 	if _, err := fs.Stat(fsys, "go.work"); err != nil {
 		return out

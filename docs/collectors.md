@@ -176,9 +176,13 @@ so it works with `GOWORK=off`) and fails when:
 
 - A. any package in the root module (not only `pkg/`, `internal/` and
   `cmd/`) or in any nested module outside `extensions/` (such as
-  `wal-quorum-sidecar`) imports `extensions/`; or the root `go.mod` requires
-  or replaces an extension module, or replaces anything with a directory
-  under `extensions/`; or `go.work` has any `replace`, or a `use` other than
+  `wal-quorum-sidecar`) imports `extensions/`; or the root `go.mod` or a
+  nested module's `go.mod` requires or replaces an extension module, or has a
+  local replace (`./`, `../`, absolute or backslash path) that does not
+  resolve to the root or a nested module the check walks. That rejects
+  replaces onto `extensions/`, onto fixture modules, onto separate checkouts
+  and onto paths outside the repository. Or `go.work` has any `replace`, or a
+  `use` other than
   the root, an extension module or a nested module. Nested modules are
   covered because a `require`/`replace` or a `go.work` `use` can link them,
   and through them extension code, into core. Using an extension module in

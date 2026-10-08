@@ -87,6 +87,15 @@ func TestFixturesDetectEachDirection(t *testing.T) {
 			{"A", "go.mod", "require " + m + "/extensions/e"},
 			{"A", "hidden/bridge/bridge.go", m + "/extensions/e"},
 		},
+		// A local replace may only point at code rule A walks; a fixture
+		// module under FixtureRoot and an absolute path are not.
+		"root-replace-to-fixture": {
+			{"A", "go.mod", "replace example.com/abs => /tmp/evil"},
+			{"A", "go.mod", "replace example.com/fx => ./" + FixtureRoot + "/fx"},
+		},
+		"nested-replace-to-fixture": {
+			{"A", "hidden/go.mod", "replace example.com/fx => ../" + FixtureRoot + "/fx"},
+		},
 		"gowork-bridge": {
 			{"A", "go.work", "replace " + m + "/extensions/e => ./extensions/e"},
 			{"A", "go.work", "use ../outside"},
