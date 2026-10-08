@@ -1,0 +1,400 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements. See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership. The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License. You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied. See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+package atpl
+
+import (
+	"bytes"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/phrocker/shoal-oss/pkg/explorer/fleet"
+	"github.com/phrocker/shoal-oss/pkg/shoal"
+)
+
+// The checks here exist to say *where* a policy is wrong. Whether it is wrong
+// is decided by the registry's own validators, called through
+// pkg/explorer/fleet/policy_export.go one capability or action at a time so a
+// refusal carries the offending path, and then once over the whole spec as
+// Register calls them. The per-item checks may refuse first with a more precise
+// message, but never refuse anything the whole-spec checks would accept: the
+// parity test in this package runs the same fixtures through Register.
+
+// knownEffects lists the classes for refusal messages, in the registry's wire
+// spellings.
+const knownEffects = "reads-corpus, egresses-content, external"
+
+type compiledAgent struct {
+	spec fleet.Spec
+	ttl  time.Duration
+}
+
+type compiler struct {
+	now       time.Time
+	executors map[string]ExecutorBound
+	live      LiveParents
+	declared  map[shoal.ID]declaredAgent
+	compiled  map[shoal.ID]compiledAgent
+}
+
+// parentView is what delegation is checked against: a parent compiled from
+// this policy, or a live registration it delegates from.
+type parentView struct {
+	label        string
+	domain       []byte
+	scopes       []fleet.Scope
+	capabilities []fleet.Capability
+	lease        time.Time
+	ttl          time.Duration
+	live         bool
+}
+
+func (c *compiler) agent(entry declaredAgent) (compiledAgent, error) {
+	agent := entry.agent
+	id := shoal.ID(agent.ID)
+	path := agentPath(id)
+	fail := func(sub, message string) error {
+		if sub == "" {
+			return refuse(entry.file, path, message)
+		}
+		return refuse(entry.file, path+"."+sub, message)
+	}
+
+	if err := shoal.ValidateRequiredID("agent ID", id); err != nil {
+		return compiledAgent{}, fail("id", errorMessage(err))
+	}
+	parentID := shoal.ID(agent.Parent)
+	if err := shoal.ValidateOptionalID("parent agent ID", parentID); err != nil {
+		return compiledAgent{}, fail("parent", errorMessage(err))
+	}
+	parent, err := c.parent(parentID)
+	if err != nil {
+		return compiledAgent{}, fail("parent", err.Error())
+	}
+
+	domain := []byte(agent.AuthorizationDomain)
+	if len(domain) == 0 || len(domain) > 1024 {
+		return compiledAgent{}, fail("authorization_domain", "authorization domain is outside its bound")
+	}
+	if parent != nil && !bytes.Equal(domain, parent.domain) {
+		return compiledAgent{}, fail("authorization_domain", fmt.Sprintf(
+			"differs from parent %s; delegation cannot change the authorization domain", parent.label))
+	}
+
+	if len(agent.Scopes) == 0 || len(agent.Scopes) > fleet.MaxScopes {
+		return compiledAgent{}, fail("scopes", fmt.Sprintf(
+			"must declare between 1 and %d scopes", fleet.MaxScopes))
+	}
+	scopes := make([]fleet.Scope, 0, len(agent.Scopes))
+	for i, scope := range agent.Scopes {
+		scopePath := fmt.Sprintf("scopes[%d]", i)
+		compiled := fleet.Scope{SourceID: []byte(scope.SourceID), PolicyID: []byte(scope.PolicyID)}
+		if len(compiled.SourceID) == 0 || len(compiled.SourceID) > 1024 ||
+			len(compiled.PolicyID) == 0 || len(compiled.PolicyID) > 1024 {
+			return compiledAgent{}, fail(scopePath, "agent scope identity is outside its bound")
+		}
+		for j, earlier := range scopes {
+			if bytes.Equal(earlier.SourceID, compiled.SourceID) &&
+				bytes.Equal(earlier.PolicyID, compiled.PolicyID) {
+				return compiledAgent{}, fail(scopePath, fmt.Sprintf("repeats scopes[%d]", j))
+			}
+		}
+		if parent != nil && !fleet.ScopesSubset([]fleet.Scope{compiled}, parent.scopes) {
+			return compiledAgent{}, fail(scopePath, fmt.Sprintf(
+				"source %s policy %s is not among parent %s's scopes",
+				pathValue(scope.SourceID), pathValue(scope.PolicyID), parent.label))
+		}
+		scopes = append(scopes, compiled)
+	}
+
+	executor, ok := c.executors[agent.ExecutorRef]
+	if !ok {
+		return compiledAgent{}, fail("executor_ref", fmt.Sprintf(
+			"%s is not declared in the policy's executors", pathValue(agent.ExecutorRef)))
+	}
+
+	ttl, err := time.ParseDuration(agent.LeaseTTL)
+	if err != nil {
+		return compiledAgent{}, fail("lease_ttl", "must be a duration such as \"12h\" or \"90m\"")
+	}
+	if ttl <= 0 || ttl > fleet.MaxLease {
+		return compiledAgent{}, fail("lease_ttl", fmt.Sprintf(
+			"must be positive and at most %s", fleet.MaxLease))
+	}
+	lease := c.now.Add(ttl)
+	if parent != nil && lease.After(parent.lease) {
+		bound := "lease_ttl " + parent.ttl.String()
+		if parent.live {
+			bound = "lease expiring at " + parent.lease.Format(time.RFC3339Nano)
+		}
+		return compiledAgent{}, fail("lease_ttl", fmt.Sprintf(
+			"%s outlasts parent %s's %s", ttl, parent.label, bound))
+	}
+
+	if len(agent.Capabilities) == 0 || len(agent.Capabilities) > fleet.MaxCapabilities {
+		return compiledAgent{}, fail("capabilities", fmt.Sprintf(
+			"must declare between 1 and %d capabilities", fleet.MaxCapabilities))
+	}
+	capabilities := make([]fleet.Capability, 0, len(agent.Capabilities))
+	for i, capability := range agent.Capabilities {
+		capabilityPath := "capabilities" + selector("name", capability.Name, i)
+		if len(capability.Actions) == 0 {
+			return compiledAgent{}, fail(capabilityPath+".actions", "capability actions are required")
+		}
+		var parentCapability *fleet.Capability
+		if parent != nil {
+			parentCapability = findCapability(parent.capabilities, capability.Name)
+			if parentCapability == nil {
+				return compiledAgent{}, fail(capabilityPath, fmt.Sprintf(
+					"parent %s has no capability %s", parent.label, pathValue(capability.Name)))
+			}
+		}
+		compiled := fleet.Capability{Name: capability.Name}
+		for j, action := range capability.Actions {
+			actionPath := capabilityPath + ".actions" + selector("name", action.Name, j)
+			declared, err := c.action(parent, parentCapability, action)
+			if err != nil {
+				var located *locatedError
+				if errors.As(err, &located) {
+					return compiledAgent{}, fail(actionPath+"."+located.field, located.message)
+				}
+				return compiledAgent{}, fail(actionPath, err.Error())
+			}
+			canonical, err := fleet.CanonicalCapabilities([]fleet.Capability{{
+				Name: capability.Name, Actions: []fleet.Action{declared},
+			}})
+			if err != nil {
+				return compiledAgent{}, fail(actionPath, errorMessage(err))
+			}
+			if err := fleet.ValidateDeclaredEffects(
+				canonical, executor.MinEffects, executor.MaxEffects,
+			); err != nil {
+				return compiledAgent{}, fail(actionPath+".effects", fmt.Sprintf(
+					"%s (executor %s declares max_effects %s, min_effects %s)",
+					errorMessage(err), pathValue(executor.Ref),
+					effectList(executor.MaxEffects), effectList(executor.MinEffects)))
+			}
+			canonicalAction := canonical[0].Actions[0]
+			if parentCapability != nil {
+				if err := delegatedAction(parent, parentCapability, canonical[0]); err != nil {
+					var located *locatedError
+					if errors.As(err, &located) && located.field != "" {
+						return compiledAgent{}, fail(actionPath+"."+located.field, located.message)
+					}
+					return compiledAgent{}, fail(actionPath, err.Error())
+				}
+			}
+			compiled.Actions = append(compiled.Actions, canonicalAction)
+		}
+		capabilities = append(capabilities, compiled)
+	}
+
+	spec, err := fleet.Spec{
+		ID: id, ParentID: parentID, AuthorizationDomain: domain, Scopes: scopes,
+		ExecutorRef: agent.ExecutorRef, Capabilities: capabilities, LeaseExpiresAt: lease,
+	}.Canonical(c.now)
+	if err != nil {
+		return compiledAgent{}, fail("", errorMessage(err))
+	}
+	// The whole-spec composition Register applies (service.go, the
+	// delegated-agent check). Every part was already checked per item above;
+	// this is the backstop that keeps the two from drifting apart.
+	if parent != nil && (!bytes.Equal(spec.AuthorizationDomain, parent.domain) ||
+		!fleet.ScopesSubset(spec.Scopes, parent.scopes) ||
+		!fleet.CapabilitiesSubset(spec.Capabilities, parent.capabilities) ||
+		spec.LeaseExpiresAt.After(parent.lease)) {
+		return compiledAgent{}, fail("", "delegated agent exceeds its parent "+parent.label)
+	}
+	return compiledAgent{spec: spec, ttl: ttl}, nil
+}
+
+func (c *compiler) parent(id shoal.ID) (*parentView, error) {
+	if id == "" {
+		return nil, nil
+	}
+	label := agentPath(id)
+	if compiled, ok := c.compiled[id]; ok {
+		return &parentView{
+			label: label, domain: compiled.spec.AuthorizationDomain,
+			scopes: compiled.spec.Scopes, capabilities: compiled.spec.Capabilities,
+			lease: compiled.spec.LeaseExpiresAt, ttl: compiled.ttl,
+		}, nil
+	}
+	if c.live == nil {
+		return nil, fmt.Errorf("%s is not declared in the policy, and no live registry "+
+			"was consulted; declare it, or plan against the registry", label)
+	}
+	descriptor, ok := c.live[id]
+	if !ok {
+		return nil, fmt.Errorf("%s is neither declared in the policy nor live in the registry", label)
+	}
+	if !descriptor.RevokedAt.IsZero() || !c.now.Before(descriptor.LeaseExpiresAt) {
+		return nil, fmt.Errorf("%s is revoked or expired; the registry refuses delegation from it", label)
+	}
+	return &parentView{
+		label: label + " (live)", domain: descriptor.AuthorizationDomain,
+		scopes: descriptor.Scopes, capabilities: descriptor.Capabilities,
+		lease: descriptor.LeaseExpiresAt, live: true,
+	}, nil
+}
+
+// locatedError is a refusal about one field of an action.
+type locatedError struct {
+	field   string
+	message string
+}
+
+func (e *locatedError) Error() string { return e.field + ": " + e.message }
+
+func located(field, message string) error {
+	return &locatedError{field: field, message: message}
+}
+
+// action resolves one file action to the registry's form: inherited actions
+// copy the parent's exactly, declared ones have each effect class checked so
+// an unknown one is named.
+func (c *compiler) action(
+	parent *parentView, parentCapability *fleet.Capability, action Action,
+) (fleet.Action, error) {
+	if action.Inherit {
+		if parent == nil {
+			return fleet.Action{}, located("inherit", "requires a parent to inherit from")
+		}
+		inherited := findAction(parentCapability, action.Name)
+		if inherited == nil {
+			return fleet.Action{}, located("inherit", fmt.Sprintf(
+				"parent %s has no action %s in this capability", parent.label, pathValue(action.Name)))
+		}
+		return fleet.Action{
+			Name:         action.Name,
+			Effects:      append(fleet.Effects(nil), inherited.Effects...),
+			InputSchema:  append(json.RawMessage(nil), inherited.InputSchema...),
+			OutputSchema: append(json.RawMessage(nil), inherited.OutputSchema...),
+		}, nil
+	}
+	effects := make(fleet.Effects, 0, len(action.Effects))
+	for _, effect := range action.Effects {
+		if _, err := fleet.CanonicalEffects(fleet.Effects{fleet.Effect(effect)}); err != nil {
+			return fleet.Action{}, located("effects", fmt.Sprintf(
+				"%q is not a known effect class (%s)", effect, knownEffects))
+		}
+		effects = append(effects, fleet.Effect(effect))
+	}
+	return fleet.Action{
+		Name: action.Name, Effects: effects,
+		InputSchema:  append(json.RawMessage(nil), action.InputSchema...),
+		OutputSchema: append(json.RawMessage(nil), action.OutputSchema...),
+	}, nil
+}
+
+// delegatedAction re-composes capabilitiesSubset for one canonical action so
+// the refusal names what differs.
+func delegatedAction(parent *parentView, parentCapability *fleet.Capability, capability fleet.Capability) error {
+	action := capability.Actions[0]
+	allowed := findAction(parentCapability, action.Name)
+	if allowed == nil {
+		return fmt.Errorf("parent %s has no action %s in this capability",
+			parent.label, pathValue(action.Name))
+	}
+	if !bytes.Equal(action.InputSchema, allowed.InputSchema) {
+		return located("input_schema", fmt.Sprintf(
+			"differs from parent %s's; a delegated action declares its parent's schema exactly", parent.label))
+	}
+	if !bytes.Equal(action.OutputSchema, allowed.OutputSchema) {
+		return located("output_schema", fmt.Sprintf(
+			"differs from parent %s's; a delegated action declares its parent's schema exactly", parent.label))
+	}
+	for _, effect := range action.Effects {
+		if !containsEffect(allowed.Effects, effect) {
+			return located("effects", fmt.Sprintf(
+				"%s is not among parent %s's effects %s", effect, parent.label, effectList(allowed.Effects)))
+		}
+	}
+	if !fleet.CapabilitiesSubset([]fleet.Capability{capability}, parent.capabilities) {
+		return fmt.Errorf("exceeds parent %s", parent.label)
+	}
+	return nil
+}
+
+func compileEffects(file, path string, declared []string) (fleet.Effects, error) {
+	effects := make(fleet.Effects, 0, len(declared))
+	for _, effect := range declared {
+		if _, err := fleet.CanonicalEffects(fleet.Effects{fleet.Effect(effect)}); err != nil {
+			return nil, refuse(file, path, fmt.Sprintf(
+				"%q is not a known effect class (%s)", effect, knownEffects))
+		}
+		effects = append(effects, fleet.Effect(effect))
+	}
+	canonical, err := fleet.CanonicalEffects(effects)
+	if err != nil {
+		return nil, refuse(file, path, errorMessage(err))
+	}
+	return canonical, nil
+}
+
+func findCapability(capabilities []fleet.Capability, name string) *fleet.Capability {
+	for i := range capabilities {
+		if capabilities[i].Name == name {
+			return &capabilities[i]
+		}
+	}
+	return nil
+}
+
+func findAction(capability *fleet.Capability, name string) *fleet.Action {
+	if capability == nil {
+		return nil
+	}
+	for i := range capability.Actions {
+		if capability.Actions[i].Name == name {
+			return &capability.Actions[i]
+		}
+	}
+	return nil
+}
+
+func containsEffect(effects fleet.Effects, effect fleet.Effect) bool {
+	for _, candidate := range effects {
+		if candidate == effect {
+			return true
+		}
+	}
+	return false
+}
+
+func effectList(effects fleet.Effects) string {
+	return "[" + strings.Join(effectStrings(effects), " ") + "]"
+}
+
+func agentPath(id shoal.ID) string {
+	return "agents" + selector("id", string(id), 0)
+}
+
+func trimmed(value string) string { return strings.TrimSpace(value) }
+
+// errorMessage returns a registry refusal's message without its code prefix,
+// so it reads naturally after a path.
+func errorMessage(err error) string {
+	var shoalErr *shoal.Error
+	if errors.As(err, &shoalErr) && shoalErr.Message != "" {
+		return shoalErr.Message
+	}
+	return err.Error()
+}
