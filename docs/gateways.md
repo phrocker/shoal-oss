@@ -5,7 +5,7 @@ reached by a separate gateway, built in this order:
 
 | gateway | governs | principal | state |
 | --- | --- | --- | --- |
-| LLM gateway | what an agent *discloses* to a model | agent or application | built: `cmd/shoal-llm-proxy`, `docs/llm-proxy-deploy.md` |
+| LLM gateway | what an agent *discloses* to a model | agent or application | built: `cmd/shoal-llm-gateway`, `docs/llm-gateway-deploy.md` |
 | Effects gateway | what an agent *does* to an external system | agent, through dispatch | designed: #391, `docs/gateway-proxy-design.md`; blocked |
 | Session gateway | what Shoal *learns* from what humans do | human operator | proposed: an extension under #401 (#447–#449) |
 
@@ -165,7 +165,7 @@ Three parts do not, and are adopted:
 - **A declarative policy format.** Policy is today spread across descriptor
   registration, chart route tables and `auth` configuration. A versioned file
   format that compiles to Shoal's primitives (capabilities, effects, scopes,
-  obligations, approval rules) makes policy reviewable and diffable. It may keep
+  obligations, approval rules) makes policy reviewable and diffable. It keeps
   the ATPL name; it does not keep ATPL's schema.
 
 Not adopted: `trust_score`. A hand-weighted sum that gates admission is the
@@ -195,16 +195,20 @@ the same reason.
 Enforcement in the session gateway is not on this list. It follows only after
 shadow results justify it, under the same gate #409 sets for exclusion.
 
+## Decided
+
+- **Naming.** The LLM gateway was `shoal-llm-proxy`. Its binary, image, chart
+  key (`llmGateway`) and Kubernetes resources are renamed to match.
+- **ATPL.** The declarative policy format (#452) keeps the ATPL name.
+
 ## Open decisions
 
-- **Naming.** The LLM gateway ships as `shoal-llm-proxy`. Rename the binary and
-  chart key, or keep the name and use "LLM gateway" only in documentation.
 - **Before building the proxy.** Whether imported recordings from existing
   tools, admitted as low-authority evidence, should first show that session data
   improves a typed decision in #421, with "it does not" an acceptable result.
 - **Repository.** When, if ever, extensions move to their own repositories.
-- **ATPL.** Whether the policy format keeps the name, and whether the ATPL
-  repository is archived with a pointer here once the format exists.
+- **ATPL repository.** Whether it is archived with a pointer here once the
+  format exists.
 - **Consent and retention.** Who may be recorded, for how long, and who may
   replay. This is a deployment policy Shoal must make expressible, not one it
   sets.
