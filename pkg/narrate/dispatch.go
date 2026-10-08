@@ -60,54 +60,92 @@ func (b *builder) actionArgs(record fleet.ActionRecord) Args {
 		"reporter":   b.reporter(record),
 		"claimed":    yesNo(record.ClaimFence > 0),
 		"origin":     errorOrigin(record.ErrorCodeOrigin),
-		"effect":     effectSelector(record),
+		"effect":     effectMode(record),
 	}
 }
 
-// effectRuledOut reports whether a record establishes that its action could
-// not have had an external effect. Only the flag can say so, and only on a
-// succeeded or failed record (#510, #538):
+// What a record says about whether its action could have had an external
+// effect, as the "effect" argument selects it.
+const (
+	// effectPossible: the flag is set, or the record is not succeeded or
+	// failed. Next steps reconcile with the target.
+	effectPossible Selector = "possible"
+	// effectContradicted: the flag is clear, but the failure's code is one
+	// only an effects gateway assigns, so a target was involved. The
+	// declaration is contradicted and the record reads as possible.
+	effectContradicted Selector = "contradicted"
+	// effectDeclaredNone: the flag is clear and nothing on the record
+	// implies a target. If the declaration is accurate, no reconciliation is
+	// needed, and the sentence says it on that condition.
+	effectDeclaredNone Selector = "none"
+	// effectUnsure: the flag is clear but the record's code is one the
+	// renderer cannot place: reconcile if the action reached any external
+	// system.
+	effectUnsure Selector = "unsure"
+)
+
+// effectMode reads EffectPossible on a record (#510, #538).
 //
-//   - The flag is set when a claim is taken, from the action's declared
-//     effects (EffectMutatesExternal or EffectEgressesContent), and it can
-//     only rise (#461). Since #538 completion carries it forward instead of
-//     asserting it, so false on a succeeded or failed record means the
-//     claimed action declared neither effect and its whole outcome is in the
-//     record.
-//   - No record written before #538 reads false here: completion set the
-//     flag unconditionally, and ActionRecord.Validate required it on every
-//     succeeded and failed record from the first build that stored one. So
-//     false is trustworthy whichever build wrote the record, and no era
-//     marker is needed. A pre-#538 record of a non-declaring action reads
-//     true, and true renders as "may", which is fail-safe. (A test fixture
-//     with a terminal state and a false flag described as pre-#538 would test
-//     a shape the old code could never store.)
-//   - True means "may", whatever the era, and is never strengthened: the flag
-//     is monotonic, so even a declaring action whose request demonstrably
-//     never left reads true. Only an ambiguity report whose outcome is
-//     request_not_sent could assert the negative, and an absent report is not
-//     evidence (#514). Reports are not renderer input yet.
-//   - Nothing is inferred from declarations. An admission's record carries
-//     its admitted effects, but a declaration is not the flag: a record whose
-//     declared effects include neither, with the flag set, reads "may", never
-//     "could not".
-//   - A canceled record is not read as false. It may never have been
-//     claimed, so false there says only that no claim set the flag, and
-//     claims before #396 did not set it for egress. Its next step is decided
-//     by the claim fence, as before.
-func effectRuledOut(record fleet.ActionRecord) bool {
-	return !record.EffectPossible &&
-		(record.State == fleet.DispatchSucceeded || record.State == fleet.DispatchFailed)
-}
-
-// effectSelector chooses the next-step wording on a failed record: "none"
-// drops reconciliation with the target, and any other value keeps it, so a
-// template arm that does not know a value fails safe.
-func effectSelector(record fleet.ActionRecord) Selector {
-	if effectRuledOut(record) {
-		return "none"
+// What the flag means: it is set when a claim is taken, from the action's
+// declared effects (EffectMutatesExternal or EffectEgressesContent), it can
+// only rise (#461), and since #538 completion carries it forward instead of
+// asserting it. So a clear flag on a succeeded or failed record means the
+// action DECLARED no external or egress effect. It does not mean none
+// happened: ExternalEffectBinding has no floor (a descriptor may declare less
+// than its binding permits), so a remote worker on a non-declaring action can
+// still do real work. Every sentence a clear flag produces is therefore
+// attributed to the declaration and conditional on it.
+//
+// No record written before #538 reads clear on a succeeded or failed record:
+// ActionRecord.Validate required the flag on both from the first build that
+// stored one. So no era marker is needed, and a set flag reads "may" in every
+// era. A set flag is never narrowed: it is monotonic, so even a declaring
+// action whose request demonstrably never left reads set. Only an ambiguity
+// report whose outcome is request_not_sent could assert the negative, an
+// absent report is not evidence (#514), and reports are not renderer input
+// yet.
+//
+// Only the flag can make a record anything but possible. A declaration on the
+// record (an admission's admitted effects) is never read for this. A clear
+// flag is then narrowed further by the code, and reconciliation is dropped
+// (conditionally) only where nothing on the record implies a target:
+//
+//   - succeeded, with no code;
+//   - failed with one of fleet's own codes (FleetErrorCodes: the executor's
+//     output, evidence or error code refused, or no code given) at service
+//     origin. Fleet assigns these itself and refuses them from an executor
+//     (#529); each adjudicates what the executor returned, not a target.
+//
+// A gateway code (GatewayErrorCodes, target_rejected_NNN) on a clear flag
+// contradicts the declaration: it is assigned only after a request to a
+// target was bound or attempted. That reads as possible. Anything else — a
+// code the renderer does not recognize, or a fleet code not at service
+// origin — keeps reconciliation, conditioned on reaching an external system.
+//
+// A canceled record is not narrowed: it may never have been claimed, so a
+// clear flag there says only that no claim set it, and claims before #396 did
+// not set it for egress. Its next step is decided by the claim fence.
+func effectMode(record fleet.ActionRecord) Selector {
+	if record.EffectPossible {
+		return effectPossible
 	}
-	return "possible"
+	switch record.State {
+	case fleet.DispatchSucceeded:
+		if record.ErrorCode == "" {
+			return effectDeclaredNone
+		}
+		return effectUnsure
+	case fleet.DispatchFailed:
+		switch {
+		case isGatewayCode(record.ErrorCode):
+			return effectContradicted
+		case isFleetCode(record.ErrorCode) &&
+			errorOrigin(record.ErrorCodeOrigin) == OriginService:
+			return effectDeclaredNone
+		}
+		return effectUnsure
+	}
+	return effectPossible
 }
 
 // reporter names who reports a claimed record's outcome: the admitted caller
@@ -251,14 +289,19 @@ func (r *Renderer) Action(record fleet.ActionRecord, opts Options) ([]Sentence, 
 		}), refs...)
 	}
 
-	// Whether an external effect was possible (see effectRuledOut). No
-	// sentence says an effect happened: a set flag is "may", and only a clear
-	// flag on a succeeded or failed record is "could not".
-	if effectRuledOut(record) {
-		b.add(RoleReason, "dispatch.effect.none", args)
+	// Whether the action declared an external effect (see effectMode). No
+	// sentence says an effect happened, and none says one could not have: a
+	// set flag is "may", and a clear one is attributed to the declaration and
+	// conditional on it.
+	mode := effectMode(record)
+	if mode == effectDeclaredNone || mode == effectUnsure {
+		b.add(RoleReason, "dispatch.effect.declared_none", args)
 	}
 
 	// What the record cannot establish.
+	if mode == effectContradicted {
+		b.add(RoleGap, "dispatch.gap.effect_contradicted", args)
+	}
 	if record.EffectPossible && state == fleet.DispatchClaimed {
 		b.add(RoleGap, "dispatch.gap.effect_possible", args)
 	}

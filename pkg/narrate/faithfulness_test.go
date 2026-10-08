@@ -26,14 +26,20 @@ import (
 //   - omitted, or a value this build does not know: attributed to neither, and
 //     conditional.
 //
-// Since #538 EffectPossible carries information on a terminal record, and a
-// failure's next step depends on it and on nothing inferred from it: with the
-// flag set it starts with reconciling with the target, whoever assigned the
-// code; with it clear (the action declared no external effect) it says no
-// reconciliation is needed, and keeps the rest of its advice. The error code
-// never decides it: request_not_sent with the flag set still reconciles.
+// Since #538 a failure's next step also depends on EffectPossible, which on a
+// terminal record says what the action DECLARED, not what happened:
+//
+//   - set: it starts with reconciling with the target, whoever assigned the
+//     code — request_not_sent included;
+//   - clear, with a gateway code: the code implies a target was involved, so
+//     the declaration is contradicted and it still starts with reconciling;
+//   - clear, with one of fleet's own codes at service origin: reconciliation
+//     is dropped, on the condition that the declaration is accurate;
+//   - clear, with anything else: reconcile if the action reached any external
+//     system.
 func TestErrorCodesAreReportsNotFindings(t *testing.T) {
 	r := New(nil)
+	families := sourceCodeFamilies(t)
 	codes := append(sourceErrorCodes(t), "made up by an executor")
 	for _, origin := range errorCodeOriginCases(t) {
 		for _, code := range codes {
@@ -56,13 +62,22 @@ func TestErrorCodesAreReportsNotFindings(t *testing.T) {
 						reasonIsFaithful(t, what, code, wantOrigin[origin], s)
 					case RoleNext:
 						nexts++
-						if effect && !strings.HasPrefix(text, "reconcile with the target") {
-							t.Errorf("%s: next step does not start with reconciliation: %s", what, s.Text)
-						}
-						if !effect && (strings.Contains(text, "reconcile with the target") ||
-							!strings.Contains(text, "no reconciliation with the target is needed")) {
-							t.Errorf("%s: an action that could not have had an external effect "+
-								"is still sent to reconcile: %s", what, s.Text)
+						switch {
+						case effect || families[code] == "gateway":
+							if !strings.HasPrefix(text, "reconcile with the target before") {
+								t.Errorf("%s: next step does not start with reconciliation: %s", what, s.Text)
+							}
+						case families[code] == "fleet" && wantOrigin[origin] == OriginService:
+							if strings.Contains(text, "reconcile with the target") ||
+								!strings.Contains(text, "if the action’s declaration is accurate, no reconciliation with the target is needed") {
+								t.Errorf("%s: reconciliation is not dropped on the declaration's "+
+									"condition: %s", what, s.Text)
+							}
+						default:
+							if !strings.HasPrefix(text, "reconcile with the target if the action reached any external system") {
+								t.Errorf("%s: a code the renderer cannot place does not keep "+
+									"reconciliation: %s", what, s.Text)
+							}
 						}
 						for _, unsafe := range []string{"without repeating", "safe to", "can be requested again"} {
 							if strings.Contains(text, unsafe) {

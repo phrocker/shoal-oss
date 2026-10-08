@@ -56,7 +56,7 @@ var requiredKeySet = sync.OnceValue(func() map[string]bool {
 		add("dispatch.error." + code + ".next")
 	}
 	add("dispatch.reason.canceled_after_lapse", "dispatch.evidence",
-		"dispatch.effect.none", "dispatch.gap.effect_may",
+		"dispatch.effect.declared_none", "dispatch.gap.effect_may", "dispatch.gap.effect_contradicted",
 		"dispatch.gap.effect_possible", "dispatch.gap.no_evidence",
 		"dispatch.history.requested", "dispatch.history.approved",
 		"dispatch.history.claims", "dispatch.history.claimant",

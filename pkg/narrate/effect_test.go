@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/phrocker/shoal-oss/pkg/explorer/fleet"
 )
@@ -17,31 +18,53 @@ import (
 // EffectPossible on a record, as #538 defines it and the renderer reads it:
 //
 //   - claimed, set: an effect may already have happened (unchanged);
-//   - succeeded or failed, clear: the action declared no external or egress
-//     effect, so it could not have had an external effect and its whole
-//     outcome is in the record. No record written before #538 has this shape:
-//     ActionRecord.Validate required the flag on both states;
 //   - any terminal state, set: an effect may have occurred. Never that it
 //     did: the flag is monotonic, so even a request that never left reads
 //     set;
+//   - succeeded or failed, clear: the action DECLARED no external or egress
+//     effect. Not that none happened: a descriptor may declare less than its
+//     binding permits, so a remote worker on a non-declaring action can still
+//     do real work. Every sentence is attributed to the declaration and
+//     conditional on it, and a gateway code on the record contradicts it.
+//     No record written before #538 has a clear flag here: Validate required
+//     it on both states;
 //   - canceled, clear: nothing is said. The record may never have been
 //     claimed, and a clear flag there says only that no claim set it.
 //
-// Only the flag decides. A declaration on the record (an admission's admitted
-// effects) is never read for this, in either direction.
+// Only the flag can make a record anything but possible. A declaration on the
+// record (an admission's admitted effects) is never read for this.
 
 const (
-	effectNoneKey = "dispatch.effect.none"
-	effectMayKey  = "dispatch.gap.effect_may"
-	effectOpenKey = "dispatch.gap.effect_possible"
+	effectDeclaredKey     = "dispatch.effect.declared_none"
+	effectContradictedKey = "dispatch.gap.effect_contradicted"
+	effectMayKey          = "dispatch.gap.effect_may"
+	effectOpenKey         = "dispatch.gap.effect_possible"
 )
+
+// sourceCodeFamilies maps every gateway and fleet error code, read from their
+// owners' source rather than from this package's mirror, to its family.
+func sourceCodeFamilies(t *testing.T) map[string]string {
+	t.Helper()
+	families := map[string]string{}
+	codes, prefix := sourceGatewayCodes(t)
+	for status := 400; status <= 599; status++ {
+		codes = append(codes, fmt.Sprintf("%s%03d", prefix, status))
+	}
+	for _, code := range codes {
+		families[code] = "gateway"
+	}
+	for _, code := range sourceFleetErrorCodes(t) {
+		families[code] = "fleet"
+	}
+	return families
+}
 
 // effectKeys returns which effect sentences a rendering carries.
 func effectKeys(sentences []Sentence) []string {
 	var keys []string
 	for _, s := range sentences {
 		switch s.Key {
-		case effectNoneKey, effectMayKey, effectOpenKey:
+		case effectDeclaredKey, effectContradictedKey, effectMayKey, effectOpenKey:
 			keys = append(keys, s.Key)
 		}
 	}
@@ -74,8 +97,15 @@ func TestEffectPossibleOnEveryState(t *testing.T) {
 					if flag {
 						want = []string{effectOpenKey}
 					}
-				case fleet.DispatchSucceeded, fleet.DispatchFailed:
-					want = []string{effectNoneKey}
+				case fleet.DispatchSucceeded:
+					want = []string{effectDeclaredKey}
+					if flag {
+						want = []string{effectMayKey}
+					}
+				case fleet.DispatchFailed:
+					// The fixture fails with outcome_unknown, a gateway
+					// code, which contradicts a clear flag.
+					want = []string{effectContradictedKey}
 					if flag {
 						want = []string{effectMayKey}
 					}
@@ -89,14 +119,14 @@ func TestEffectPossibleOnEveryState(t *testing.T) {
 				}
 				for _, s := range sentences {
 					text := strings.ToLower(s.Text)
-					if flag && strings.Contains(text, "could not have had") {
-						t.Errorf("%s: a set flag is rendered as no possible effect: %s", what, s.Text)
+					if flag && strings.Contains(text, "declares no external") {
+						t.Errorf("%s: a set flag is rendered as a declaration of none: %s", what, s.Text)
 					}
 					if s.Key == effectMayKey && !strings.Contains(text, "may have occurred") {
 						t.Errorf("%s: a possible effect is not hedged: %s", what, s.Text)
 					}
-					if s.Key == effectNoneKey && !strings.Contains(text, "could not have had an external effect") {
-						t.Errorf("%s: no possible effect is not said: %s", what, s.Text)
+					if s.Key == effectDeclaredKey && !strings.Contains(text, "if that declaration is accurate") {
+						t.Errorf("%s: the declaration is not conditional: %s", what, s.Text)
 					}
 				}
 			}
@@ -104,12 +134,12 @@ func TestEffectPossibleOnEveryState(t *testing.T) {
 	}
 }
 
-// TestEffectIsNeverInferredFromDeclarations: only the flag can say no effect
-// was possible. A record whose declared effects include neither external
-// mutation nor egress, with the flag set, still reads "may" — a pre-#538
-// record of a non-declaring action looks exactly like this, and so does any
-// record whose declaration the renderer cannot see (a dispatched action's
-// record does not carry its action's effects at all).
+// TestEffectIsNeverInferredFromDeclarations: only the flag can say the action
+// declared no effect. A record whose declared effects include neither
+// external mutation nor egress, with the flag set, still reads "may" — a
+// pre-#538 record of a non-declaring action looks exactly like this, and so
+// does any record whose declaration the renderer cannot see (a dispatched
+// action's record does not carry its action's effects at all).
 func TestEffectIsNeverInferredFromDeclarations(t *testing.T) {
 	r := New(nil)
 	declarations := map[string]fleet.Effects{
@@ -119,6 +149,9 @@ func TestEffectIsNeverInferredFromDeclarations(t *testing.T) {
 	for name, effects := range declarations {
 		for _, state := range []fleet.DispatchState{fleet.DispatchSucceeded, fleet.DispatchFailed} {
 			record := action(state)
+			if state == fleet.DispatchFailed {
+				record.ErrorCode, record.ErrorCodeOrigin = "executor_error", fleet.ErrorCodeOriginService
+			}
 			record.AdmittedEffects = effects
 			record.EffectPossible = true
 			what := fmt.Sprintf("%s declared=%s", state, name)
@@ -131,11 +164,85 @@ func TestEffectIsNeverInferredFromDeclarations(t *testing.T) {
 			}
 			for _, s := range sentences {
 				text := strings.ToLower(s.Text)
-				if strings.Contains(text, "could not have had") || strings.Contains(text, "no reconciliation") {
+				if strings.Contains(text, "declares no external") || strings.Contains(text, "no reconciliation") {
 					t.Errorf("%s: no effect inferred from the declaration: %s", what, s.Text)
 				}
 			}
 		}
+	}
+}
+
+// pages renders every action page this package can be asked for that bears
+// on EffectPossible: every state as an action and an admission with the flag
+// set and clear, and every failure code (gateway, fleet and free text) under
+// every origin with the flag set and clear — which includes the shape #541's
+// review reproduced: effects nil, claimed, then failed by the executor with
+// target_rejected_409, stored as failed/executor/EffectPossible=false.
+func pages(t *testing.T, r *Renderer) map[string]fleet.ActionRecord {
+	t.Helper()
+	out := map[string]fleet.ActionRecord{}
+	for _, state := range DispatchStates {
+		for _, build := range []func(fleet.DispatchState) fleet.ActionRecord{action, admission} {
+			for _, flag := range []bool{true, false} {
+				record := build(state)
+				record.EffectPossible = flag
+				out[fmt.Sprintf("%s admission=%v effect_possible=%v", state, isAdmission(record), flag)] = record
+			}
+		}
+	}
+	for _, origin := range errorCodeOriginCases(t) {
+		for _, code := range append(sourceErrorCodes(t), "made up by an executor") {
+			for _, flag := range []bool{true, false} {
+				record := failedWith(code, origin)
+				record.EffectPossible = flag
+				out[fmt.Sprintf("failed code=%s origin=%s effect_possible=%v", code, origin, flag)] = record
+			}
+		}
+	}
+	return out
+}
+
+// TestNoPageBothContactsATargetAndDropsReconciliation: a gateway code says a
+// request to a target was bound or attempted, so a page carrying one may not
+// also say no reconciliation is needed, whatever the flag says. More broadly,
+// reconciliation is dropped only where nothing on the record implies a
+// target: a success with no code, or one of fleet's own codes at service
+// origin — and then only on the declaration's condition.
+func TestNoPageBothContactsATargetAndDropsReconciliation(t *testing.T) {
+	r := New(nil)
+	families := sourceCodeFamilies(t)
+	dropped := 0
+	for what, record := range pages(t, r) {
+		sentences, err := r.Action(record, Options{Now: t0.Add(30 * time.Minute)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		contact := record.State == fleet.DispatchFailed && families[record.ErrorCode] == "gateway"
+		allowed := !record.EffectPossible &&
+			((record.State == fleet.DispatchSucceeded && record.ErrorCode == "") ||
+				(record.State == fleet.DispatchFailed && families[record.ErrorCode] == "fleet" &&
+					wantOrigin[record.ErrorCodeOrigin] == OriginService))
+		for _, s := range sentences {
+			text := strings.ToLower(s.Text)
+			if !strings.Contains(text, "no reconciliation") {
+				continue
+			}
+			dropped++
+			if contact {
+				t.Errorf("%s: the code says a target was contacted, and %s drops reconciliation: %s",
+					what, s.Key, s.Text)
+			}
+			if !allowed {
+				t.Errorf("%s: %s drops reconciliation on a record that does not allow it: %s",
+					what, s.Key, s.Text)
+			}
+		}
+		if contact && !record.EffectPossible && !hasKey(sentences, effectContradictedKey) {
+			t.Errorf("%s: a gateway code on a clear flag does not say the declaration is contradicted", what)
+		}
+	}
+	if dropped == 0 {
+		t.Fatal("no page drops reconciliation, so this test checks nothing")
 	}
 }
 
@@ -146,13 +253,26 @@ var (
 	effectVerb = regexp.MustCompile(`\b(occurred|happened|took place|took effect|was (sent|written|transmitted|applied|performed|delivered|egressed)|were (sent|written|transmitted|applied|performed)|been (sent|written|transmitted|applied|performed)|reached|left the host|egressed)\b`)
 	hedge      = regexp.MustCompile(`\b(may|might|whether|if|no|nothing|not|never|could not|cannot)\b`)
 	clauseEnd  = regexp.MustCompile(`[.;:,—]`)
+	// noEffect finds a clause saying no external effect was or could have
+	// been had, or that nothing needs reconciling. Such a clause must be
+	// attributed to the declaration or conditional on it: a clear flag says
+	// only what the action declared.
+	noEffect    = regexp.MustCompile(`\b(could not have|cannot have|couldn’t have|no (external|egress)( or egress)? effect|no reconciliation)\b`)
+	conditioned = regexp.MustCompile(`\b(if|declares|declared|declaration)\b`)
+	sentenceEnd = regexp.MustCompile(`[.;:—]`)
 )
 
-// affirmsEffect returns the clause of text that says an effect happened, if
-// any.
+// affirmsEffect returns the clause of text that says an effect happened, or
+// that one could not have, if any.
 func affirmsEffect(text string) string {
-	for _, clause := range clauseEnd.Split(strings.ToLower(text), -1) {
+	lower := strings.ToLower(text)
+	for _, clause := range clauseEnd.Split(lower, -1) {
 		if effectVerb.MatchString(clause) && !hedge.MatchString(clause) {
+			return strings.TrimSpace(clause)
+		}
+	}
+	for _, clause := range sentenceEnd.Split(lower, -1) {
+		if noEffect.MatchString(clause) && !conditioned.MatchString(clause) {
 			return strings.TrimSpace(clause)
 		}
 	}
@@ -165,6 +285,9 @@ func TestEffectScannerCatchesAffirmations(t *testing.T) {
 		"The effect happened at the target.",
 		"The request was sent, so reconcile with the target.",
 		"Content left the host.",
+		"This action could not have had an external effect; its whole outcome is in this record.",
+		"The action had no external effect.",
+		"No reconciliation with the target is needed before requesting the work again.",
 	} {
 		if affirmsEffect(text) == "" {
 			t.Errorf("not caught: %q", text)
@@ -172,7 +295,8 @@ func TestEffectScannerCatchesAffirmations(t *testing.T) {
 	}
 	for _, text := range []string{
 		"An external effect may have occurred; reconcile with the target.",
-		"This action could not have had an external effect; its whole outcome is in this record.",
+		"This action declares no external or egress effect, so if that declaration is accurate its whole outcome is in this record.",
+		"Fix the executor before requesting the work again; if the action’s declaration is accurate, no reconciliation with the target is needed.",
 		"which, if accurate, means no byte of the request reached a connection.",
 		"nothing establishes whether the effect happened.",
 	} {
@@ -183,9 +307,11 @@ func TestEffectScannerCatchesAffirmations(t *testing.T) {
 }
 
 // TestNoSentenceSaysAnEffectHappened scans every sentence the value goldens,
-// the scenario goldens and every (state × EffectPossible) combination render.
-// Nothing Shoal records establishes that an external effect happened — a set
-// flag says only that one may have — so no sentence may say it did.
+// the scenario goldens and every page above render, at every clock. Nothing
+// Shoal records establishes that an external effect happened — a set flag
+// says only that one may have — and nothing establishes that one could not
+// have: a clear flag says only what the action declared. So no sentence may
+// say either unconditionally.
 func TestNoSentenceSaysAnEffectHappened(t *testing.T) {
 	r := New(nil)
 	scanned := 0
@@ -197,7 +323,8 @@ func TestNoSentenceSaysAnEffectHappened(t *testing.T) {
 		for _, s := range sentences {
 			scanned++
 			if clause := affirmsEffect(s.Text); clause != "" {
-				t.Errorf("%s: %s says an effect happened (%q): %s", what, s.Key, clause, s.Text)
+				t.Errorf("%s: %s claims an effect, or its absence, unconditionally (%q): %s",
+					what, s.Key, clause, s.Text)
 			}
 		}
 	}
@@ -211,16 +338,10 @@ func TestNoSentenceSaysAnEffectHappened(t *testing.T) {
 		sentences, err := run(t, r)
 		scan(name, sentences, err)
 	}
-	for _, state := range DispatchStates {
-		for _, build := range []func(fleet.DispatchState) fleet.ActionRecord{action, admission} {
-			for _, flag := range []bool{true, false} {
-				for _, now := range times() {
-					record := build(state)
-					record.EffectPossible = flag
-					sentences, err := r.Action(record, Options{Now: now, QuoteInput: true, QuoteOutput: true})
-					scan(fmt.Sprintf("%s admission=%v effect_possible=%v", state, isAdmission(record), flag), sentences, err)
-				}
-			}
+	for what, record := range pages(t, r) {
+		for _, now := range times() {
+			sentences, err := r.Action(record, Options{Now: now, QuoteInput: true, QuoteOutput: true})
+			scan(what, sentences, err)
 		}
 	}
 	if scanned < 1000 {

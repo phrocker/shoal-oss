@@ -174,8 +174,9 @@ An `ErrorCode` outside the gateway and fleet sets is free text: an executor may
 record any bounded string. It is quoted, attributed to whoever the record's
 `ErrorCodeOrigin` says assigned it (`executor`, `service`, or
 `executor_or_service` when the record does not say), and its next step is to
-reconcile with the target, unless `EffectPossible` says no external effect
-was possible (see "Whether an external effect was possible"). The same holds for a predictor's own whole-request
+reconcile with the target; with `EffectPossible` clear, reconcile if the
+action reached any external system (see "Whether the action declared an
+external effect"). The same holds for a predictor's own whole-request
 or per-answer reason.
 
 ### Who assigned an error code
@@ -224,8 +225,8 @@ The origin is credited with the code, and only the code:
   does not say whether the reporter or Shoal assigned the code.
 - **The next step** is to reconcile with the target before requesting the
   work again, whatever the code and whoever assigned it, unless
-  `EffectPossible` is false (see "Whether an external effect was possible"
-  below): the code never decides it. Three change with
+  `EffectPossible` is clear and nothing on the record implies a target (see
+  "Whether the action declared an external effect" below). Three change with
   the origin, because their wording presumed who assigned the code:
   `request_not_sent` and `input_invalid` said "the report says nothing was
   sent, but the record cannot establish that". For an executor's code that
@@ -241,27 +242,57 @@ assign today (a gateway code, say): if fleet ever records one as its own, the
 sentence says so, and the parity tests on error codes flag the new
 assignment.
 
-### Whether an external effect was possible
+### Whether the action declared an external effect
 
 `EffectPossible` is set when a claim is taken, and only for an action that
 declares `EffectMutatesExternal` or `EffectEgressesContent`. The store lets it
 rise and never fall (#461), and since #538 completion carries it forward
-instead of setting it on every completion (#510). The renderer reads the flag,
-and only the flag:
+instead of setting it on every completion (#510).
 
-| State | `EffectPossible` | Sentence | Next step |
-| --- | --- | --- | --- |
-| claimed | true | "The action declares an external or egress effect and is claimed, so an effect may already have happened." (gap) | unchanged |
-| succeeded, failed | false | "This action could not have had an external effect; its whole outcome is in this record." (reason) | a failure's next step drops reconciliation: "No reconciliation with the target is needed …", keeping the rest of its advice (correct the input, fix the executor, review the refusal at the target) |
-| succeeded, failed, canceled | true | "An external effect may have occurred; reconcile with the target." (gap) | unchanged: a failure, and a canceled record that was claimed, reconcile with the target |
-| canceled | false | none | unchanged: decided by the claim fence |
+**A clear flag says what the action declared, not what happened.**
+`ExternalEffectBinding` has no floor: a descriptor may declare less than its
+binding permits, so a remote worker on a non-declaring action can still do
+real work at a target. Every sentence a clear flag produces is therefore
+attributed to the declaration and conditional on it, and a code on the record
+that implies a target overrides it.
 
-- **False is trustworthy on a succeeded or failed record, from any build.**
+| State | `EffectPossible` | Code | Sentence | Next step |
+| --- | --- | --- | --- | --- |
+| claimed | true | — | "The action declares an external or egress effect and is claimed, so an effect may already have happened." (gap) | unchanged |
+| succeeded, failed, canceled | true | any | "An external effect may have occurred; reconcile with the target." (gap) | unchanged: a failure, and a canceled record that was claimed, reconcile with the target |
+| failed | false | a gateway code (`request_not_sent`, `outcome_unknown`, `retry_exhausted`, `input_invalid`, `target_rejected_NNN`) | "The failure’s code implies an external target was involved, although the action declares no external or egress effect; the declaration may be wrong, and an external effect may have occurred." (gap) | unchanged: reconcile with the target |
+| succeeded | false | none | "This action declares no external or egress effect, so if that declaration is accurate its whole outcome is in this record." (reason) | unchanged (a success never advised reconciling) |
+| failed | false | a fleet code (`invalid_executor_output`, `invalid_executor_evidence`, `invalid_executor_error`, `executor_error`) at `service` origin | the same conditional sentence | reconciliation dropped on the declaration's condition: "…; if the action’s declaration is accurate, no reconciliation with the target is needed." |
+| failed | false | anything else: free text, or a fleet code not at `service` origin | the same conditional sentence | "Reconcile with the target if the action reached any external system before requesting the work again …" |
+| canceled | false | — | none | unchanged: decided by the claim fence |
+
+Why reconciliation is dropped (conditionally) only there:
+
+- **A gateway code contradicts the declaration.** The effects gateway assigns
+  its codes only once a request to a target was being bound or attempted, so
+  a page that said "target_rejected_409" and "no reconciliation needed" would
+  contradict itself. Membership is the gateway's closed set
+  (`GatewayErrorCodes` and `TargetRejectedStatus`), the same family
+  `errorCodeKey` uses, not string matching.
+- **Fleet's own codes at service origin adjudicate the executor, not a
+  target.** Fleet assigns them itself and refuses them from an executor
+  (#529): the executor's output, evidence or error code was refused, or it
+  failed without a code. Nothing in them implies a target, so if the
+  declaration is accurate there is nothing to reconcile. At any other origin
+  the record does not establish that Shoal assigned them.
+- **A code the renderer cannot interpret keeps reconciliation**, conditioned
+  on the action having reached an external system: the renderer cannot tell
+  whether the code implies a target.
+- **A success with no code** never advised reconciling; the sentence only
+  adds the conditional declaration.
+
+The rest of the rule:
+
+- **A clear flag on a succeeded or failed record comes from #538 or later.**
   `ActionRecord.Validate` required the flag on both states from the first
-  build that stored one until #538, so no earlier record can read false there,
-  and no era marker is needed. Never build a fixture with a succeeded or
-  failed state and a false flag and call it pre-#538: it tests a shape the old
-  code could never store.
+  build that stored one until #538, so no era marker is needed. Never build a
+  fixture with a succeeded or failed state and a false flag and call it
+  pre-#538: it tests a shape the old code could never store.
 - **True means "may", whatever the era.** Before #538 every succeeded or
   failed record read true, including actions that declare no effect, and the
   record does not carry a dispatched action's declared effects, so the two
@@ -269,23 +300,29 @@ and only the flag:
   flag is monotonic, a declaring action whose request demonstrably never left
   still reads true: the claim set it, and a worker could have acted at any
   time after.
-- **No sentence says an effect happened.** True is "may", never "did";
+- **No sentence says an effect happened, or that one could not have.** True
+  is "may", never "did"; false is "declares", never "could not".
   `TestNoSentenceSaysAnEffectHappened` scans every rendered sentence for an
-  unhedged one.
-- **False is never inferred.** Not from the declaration (an admission's
-  admitted effects are on the record, but a declaration is not the flag), not
-  from the error code (`request_not_sent` with the flag set still reconciles),
-  and not from the outcome.
-- **A canceled record says nothing about a false flag.** It may never have
-  been claimed, so false there says only that no claim set it; and claims
+  unhedged affirmation and for an unconditional "could not have", "no
+  external effect" or "no reconciliation".
+  `TestNoPageBothContactsATargetAndDropsReconciliation` checks that no page
+  carries a gateway code and "no reconciliation", and that reconciliation is
+  dropped only where the table allows it.
+- **The flag is never inferred.** Not from the declaration (an admission's
+  admitted effects are on the record, but a declaration is not the flag), and
+  not from the outcome. The code only ever widens it: `request_not_sent`
+  with the flag set still reconciles.
+- **A canceled record says nothing about a clear flag.** It may never have
+  been claimed, so clear there says only that no claim set it; and claims
   before #396 did not set it for egress, so a canceled-after-lapse record of
-  that era could read false for an egressing action. A canceled record
+  that era could read clear for an egressing action. A canceled record
   advises reconciliation when it was claimed before it was canceled, which the
   claim fence says.
 
 `dispatch_effects` in the value goldens pins every (state × flag)
-combination, and `dispatch_errors` pins every failure's next step with the
-flag clear as well as set.
+combination, and `dispatch_errors` pins every failure code under every origin
+with the flag clear as well as set, including each gateway code with the flag
+clear (the shape #541's review reproduced).
 
 ### Reports are not findings
 
@@ -406,9 +443,13 @@ selectors by import path to deny `Now`, `Since`, `Until`, `After`, `Tick`,
   services. A transition table exported by fleet would let the test check them.
 - `EffectPossible` on a terminal record is resolved by #538 (fleet #510):
   false on a succeeded or failed record means the action declared no external
-  or egress effect, and is rendered as such; true means an effect may have
-  occurred and is monotonic, so it stays true even when the request never
-  left. See "Whether an external effect was possible".
+  or egress effect — not that none happened, since a descriptor may declare
+  less than its binding permits — and is rendered conditionally, overridden by
+  a gateway code; true means an effect may have occurred and is monotonic, so
+  it stays true even when the request never left. See "Whether the action
+  declared an external effect". A floor on `ExternalEffectBinding` (a
+  descriptor that cannot declare less than its binding permits) would let a
+  clear flag be stated without the condition.
 - Ambiguity reports (#484) are not on main, so nothing here reads them. They
   are the only way to narrow a true `EffectPossible`. When
   they land, a failure's next step can say the target was not reached only

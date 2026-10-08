@@ -182,8 +182,8 @@ outcome dispatch.outcome.failed
 reason dispatch.error.outcome_unknown.either
   The failure was recorded as outcome_unknown, which either the executor reported or Shoal assigned; the record does not say which. If accurate, it means the request may have been written and nothing establishes whether the effect happened.
   record=action:act-1 principal=worker-1 claim=claim-1
-reason dispatch.effect.none
-  This action could not have had an external effect; its whole outcome is in this record.
+gap dispatch.gap.effect_contradicted
+  The failure’s code implies an external target was involved, although the action declares no external or egress effect; the declaration may be wrong, and an external effect may have occurred.
   record=action:act-1
 history dispatch.history.requested
   alice enqueued it at 2026-10-08 12:00:00 UTC, with a deadline of 2026-10-08 14:00:00 UTC.
@@ -197,7 +197,7 @@ history dispatch.history.claimant
   record=action:act-1 principal=worker-1 claim=claim-1
   identifiers worker-1
 next dispatch.error.outcome_unknown.next
-  No reconciliation with the target is needed before requesting the work again.
+  Reconcile with the target before requesting the work again.
   record=action:act-1
 
 == admission failed effect_possible=true
@@ -227,15 +227,15 @@ outcome dispatch.outcome.failed
 reason dispatch.error.outcome_unknown.either
   The failure was recorded as outcome_unknown, which either the executor reported or Shoal assigned; the record does not say which. If accurate, it means the request may have been written and nothing establishes whether the effect happened.
   record=action:act-1 principal=alice request=req-1
-reason dispatch.effect.none
-  This action could not have had an external effect; its whole outcome is in this record.
+gap dispatch.gap.effect_contradicted
+  The failure’s code implies an external target was involved, although the action declares no external or egress effect; the declaration may be wrong, and an external effect may have occurred.
   record=action:act-1
 history dispatch.history.requested
   alice requested admission at 2026-10-08 12:00:00 UTC, with a deadline of 2026-10-08 14:00:00 UTC.
   record=action:act-1 principal=alice request=req-1
   identifiers alice
 next dispatch.error.outcome_unknown.next
-  No reconciliation with the target is needed before requesting the work again.
+  Reconcile with the target before requesting the work again.
   record=action:act-1
 
 == action queued effect_possible=true
@@ -301,8 +301,8 @@ outcome dispatch.outcome.succeeded
   Action close-ticket on agent agent-7 was reported as succeeded by worker-1 at 2026-10-08 12:03:00 UTC.
   record=action:act-1 agent=agent-7 request=req-1 correlation=corr-1 principal=worker-1 claim=claim-1
   identifiers close-ticket agent-7 worker-1
-reason dispatch.effect.none
-  This action could not have had an external effect; its whole outcome is in this record.
+reason dispatch.effect.declared_none
+  This action declares no external or egress effect, so if that declaration is accurate its whole outcome is in this record.
   record=action:act-1
 gap dispatch.gap.no_evidence
   The result carries no evidence references.
@@ -346,8 +346,8 @@ outcome dispatch.outcome.succeeded
   Action close-ticket on agent agent-7 was reported as succeeded by alice at 2026-10-08 12:03:00 UTC.
   record=action:act-1 agent=agent-7 request=req-1 correlation=corr-1 principal=alice request=req-1
   identifiers close-ticket agent-7 alice
-reason dispatch.effect.none
-  This action could not have had an external effect; its whole outcome is in this record.
+reason dispatch.effect.declared_none
+  This action declares no external or egress effect, so if that declaration is accurate its whole outcome is in this record.
   record=action:act-1
 gap dispatch.gap.no_evidence
   The result carries no evidence references.

@@ -127,8 +127,9 @@ func originLabel(origin fleet.ErrorCodeOrigin) string {
 
 // dispatchErrorCases renders a failed action for every gateway and fleet
 // error code in source, including every target-rejected status, and an
-// executor's own code, under every error code origin in source: the reason
-// and next-step sentences, which vary with the code and the origin. The
+// executor's own code, under every error code origin in source, with
+// EffectPossible set and clear: the reason, effect and next-step sentences,
+// which vary with the code, the origin and the flag. The
 // outcome and the failing transition vary with the origin alone, so they are
 // rendered once per origin. The rest of a failed action is pinned by
 // dispatch_states. An origin this build does not know is not pinned here:
@@ -139,9 +140,13 @@ func dispatchErrorCases(t *testing.T) []valueCase {
 	for _, s := range sourceErrorCodeOrigins(t) {
 		origin := fleet.ErrorCodeOrigin(s)
 		for _, code := range append(sourceErrorCodes(t), "made up by an executor") {
-			// The fixture's flag is set; a clear one (#538: the action
-			// declared no external effect) changes the next step, so both
-			// are pinned.
+			// The fixture's flag is set. A clear one (#538: the action
+			// declared no external or egress effect) changes what the page
+			// says, so both are pinned. The clear case under a gateway code
+			// is the shape #541's review reproduced (effects nil, claimed,
+			// failed by the executor with target_rejected_409): its code
+			// contradicts the declaration, so it must keep reconciliation
+			// and say the declaration may be wrong.
 			for _, flag := range []bool{true, false} {
 				record := failedWith(code, origin)
 				record.EffectPossible = flag
@@ -155,7 +160,8 @@ func dispatchErrorCases(t *testing.T) []valueCase {
 						sentences, err := r.Action(record, Options{})
 						var kept []Sentence
 						for _, s := range sentences {
-							if s.Role == RoleReason || s.Role == RoleNext {
+							if s.Role == RoleReason || s.Role == RoleNext ||
+								strings.HasPrefix(s.Key, "dispatch.gap.effect") {
 								kept = append(kept, s)
 							}
 						}
