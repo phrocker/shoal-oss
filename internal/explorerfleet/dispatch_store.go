@@ -274,6 +274,9 @@ func (s *DispatchStore) ApplyAction(ctx context.Context, mutation fleet.Dispatch
 			current.ClaimFence != mutation.ExpectedFence {
 			return fleet.ActionRecord{}, fleet.ErrActionConflict
 		}
+		if err := refuseRewrittenIdentity(current, canonical); err != nil {
+			return fleet.ActionRecord{}, err
+		}
 		actionGuard.Mode = guard.ModeMutate
 		actionGuard.ExpectedEpoch = head.Epoch
 		actionGuard.ExpectedDigest = head.LogicalDigest
@@ -670,4 +673,143 @@ func decodeTransition(value []byte) (storedTransition, error) {
 			"fleet action transition completion time is not UTC")
 	}
 	return stored, nil
+}
+
+// refuseRewrittenIdentity refuses a mutation that changes what an action *is*
+// rather than what state it is in.
+//
+// The version and the fence give correct serialisation — one writer wins and a
+// stale writer is refused — but they say nothing about what the winner is
+// allowed to change. Before this, nothing below the service enforced any
+// immutability invariant at all, so a service bug could rewrite a record's
+// principal, its input, or its authorization provenance and the store would
+// write it.
+//
+// That is not hypothetical. #443 shipped `record.Actor = decision.Actor()` in
+// applyClaim. It was a no-op for as long as the claimant was by construction
+// the enqueuer, and became a third party overwriting the record's own
+// principal — permanently, since the completion path clones forward and never
+// restores it. The enqueuer was then refused Status and Cancel on its own
+// in-flight action. The only thing standing between the record's identity and
+// an accidental rewrite was the absence of an assignment in one function,
+// which is precisely the kind of guarantee that does not survive a refactor,
+// and this one did not.
+//
+// It sits in the store rather than the service because the service is where
+// the bug was, and because every path goes through here — Enqueue, Claim,
+// ExtendClaim, ReportAmbiguity, CompleteClaim, Cancel and the admission and
+// approval surfaces — so one invariant covers all of them and a route added
+// later gets it for free.
+func refuseRewrittenIdentity(current, next fleet.ActionRecord) error {
+	// What an action is: who asked for it, what was asked for, under what
+	// authority, and when. None of this is a function of the action's state,
+	// so no transition has any reason to change it.
+	//
+	// Deliberately absent, and listed here so the next reader does not add
+	// them: EvidenceSnapshotID, EvidenceSnapshotAsOf and Evidence are written
+	// by the completion path, which also *clears* them when the evidence
+	// fails validation; CancelKey is written by Cancel and by the admission
+	// denial; AuthorizedOperations is widened by Cancel and by the effect
+	// admission; TransitionOperation and the claimant fields move on every
+	// re-claim, which is what they are for; and the claim history and the
+	// ambiguity reports grow.
+	//
+	// ExecutorKey is absent for a different reason, and the omission is a
+	// deliberate limit rather than an oversight. It is immutable in the
+	// service — the only write is at enqueue — and #461 asked for it here.
+	// Enforcing it here makes one legitimate precondition unexpressible:
+	// TestDispatchDurableRestartPreservesStoredExecutorKeyAfterAmbiguousEffect
+	// plants a record carrying a *pre-v2* executor key, to prove the service
+	// hands the executor the stored key rather than its own derivation across
+	// a restart and an upgrade. The only way to plant a divergent stored key
+	// is to rewrite one, so the invariant would refuse the setup for the test
+	// that asserts the property.
+	//
+	// Gating on TransitionKind to tell a fixture from a transition was
+	// considered and is wrong: two production mutations set no kind —
+	// ExtendClaim and ReportAmbiguity, which deliberately publish no event —
+	// so that distinction would exempt the two newest routes from every check
+	// in this function.
+	//
+	// So the property is enforced where it can see more than the store can:
+	// that test asserts the executor is *handed* the stored key, before and
+	// after the restart, which is the thing that actually matters for
+	// idempotency at the target and is invisible from here.
+	for _, field := range []struct {
+		name  string
+		equal bool
+	}{
+		{"ID", bytes.Equal(current.ID, next.ID)},
+		{"idempotency key",
+			bytes.Equal(current.IdempotencyKey, next.IdempotencyKey)},
+		{"subject", current.Subject == next.Subject},
+		{"actor", current.Actor == next.Actor},
+		{"client ID", current.ClientID == next.ClientID},
+		{"delegation chain", sameActionIDs(current.OnBehalfOf, next.OnBehalfOf)},
+		{"object ID", current.ObjectID == next.ObjectID},
+		{"source ID", bytes.Equal(current.SourceID, next.SourceID)},
+		{"policy ID", bytes.Equal(current.PolicyID, next.PolicyID)},
+		{"agent ID", current.AgentID == next.AgentID},
+		{"agent generation", current.AgentGeneration == next.AgentGeneration},
+		{"capability", current.Capability == next.Capability},
+		{"action", current.Action == next.Action},
+		{"input", bytes.Equal(current.Input, next.Input)},
+		{"authorization fingerprint",
+			current.AuthorizationFingerprint == next.AuthorizationFingerprint},
+		{"policy generation",
+			current.PolicyGeneration == next.PolicyGeneration},
+		{"authorization expiry",
+			current.AuthorizationExpiresAt.Equal(next.AuthorizationExpiresAt)},
+		{"creation time", current.CreatedAt.Equal(next.CreatedAt)},
+		// The enqueue request's own identifiers. The per-transition
+		// equivalents exist as separate fields, which is exactly why these
+		// must not move: a transition that overwrote them would destroy the
+		// link back to the dispatch that created the record, and leave the
+		// field meant to carry the transition's own identity unused.
+		{"request ID", current.RequestID == next.RequestID},
+		{"correlation ID", current.CorrelationID == next.CorrelationID},
+		// A mutable deadline is the most dangerous of these: a transition
+		// that extended it would let an action outlive the bound its
+		// dispatcher accepted, and nothing below the service would notice.
+		{"deadline", current.Deadline.Equal(next.Deadline)},
+		{"reason", current.Reason == next.Reason},
+	} {
+		if !field.equal {
+			return shoal.NewError(
+				shoal.ErrorInvalidArgument,
+				"fleet action "+field.name+" is immutable")
+		}
+	}
+	// Monotonic rather than immutable, and asserted in the same place for the
+	// same reason.
+	//
+	// The fence identifies which claim, and applyClaim increments it, so it
+	// may rise and must never fall: a fence that went backwards would make a
+	// stale completion look current. EffectPossible says an effect may have
+	// happened; it may become true and must never become false, because
+	// nothing can establish that an effect did not occur after something has
+	// said it might have.
+	if next.ClaimFence < current.ClaimFence {
+		return shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			"fleet action claim fence may not move backwards")
+	}
+	if current.EffectPossible && !next.EffectPossible {
+		return shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			"fleet action possible effect may not be withdrawn")
+	}
+	return nil
+}
+
+func sameActionIDs(left, right []shoal.ID) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
 }
