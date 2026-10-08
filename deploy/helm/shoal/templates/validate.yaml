@@ -1,3 +1,27 @@
+{{- /* nameOverride and fullnameOverride become object names and label values
+       on every object this chart renders, and are rendered unquoted. A newline
+       in either ended the scalar and the remainder became YAML of the
+       operator's choosing: fullnameOverride "x<newline>  namespace: other"
+       moved objects into another namespace, and the same shape can add
+       finalizers or annotations to everything the chart owns.
+
+       They are refused unless they are names Kubernetes would accept in those
+       places, which excludes every line break and control character. A full
+       name is a Service name, so it must be an RFC 1035 label (start with a
+       letter). A name override is joined after the release name, so an RFC
+       1123 label suffices. Both stay within 63 characters, the label limit;
+       the components' own name stems already reserve room for their suffixes. */ -}}
+{{- range $setting, $pattern := dict "nameOverride" "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$" "fullnameOverride" "^[a-z]([-a-z0-9]*[a-z0-9])?$" -}}
+{{- $value := index $.Values $setting -}}
+{{- if $value -}}
+{{- if not (kindIs "string" $value) -}}
+{{- fail (printf "%s must be a string (got %v): it becomes object names and label values on every object the chart renders" $setting $value) -}}
+{{- end -}}
+{{- if or (gt (len $value) 63) (not (regexMatch $pattern $value)) -}}
+{{- fail (printf "%s %q is not a valid name: it becomes object names and label values on every object the chart renders, unquoted, so it must match %s and be at most 63 characters. A line break here made the remainder YAML of its own" $setting $value $pattern) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
 {{- $validModes := list "single" "distributed" "accumulo" -}}
 {{- if not (has .Values.mode $validModes) -}}
 {{- fail "mode must be one of: single, distributed, accumulo" -}}
