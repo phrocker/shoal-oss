@@ -201,8 +201,12 @@ walked on its own, stopping at the next module boundary. Three things are
 skipped:
 
 - the repository's `.git`;
-- the checker's own fixture root, `internal/importboundary/testdata`
-  (`importboundary.FixtureRoot`), the one explicit exemption;
+- the checker's own fixtures: only the direct children of
+  `internal/importboundary/testdata` (`importboundary.FixtureRoot`) that
+  have their own `go.mod`. Any other Go file under that directory belongs to
+  the root module, and Go builds it when it is imported by explicit path, so
+  it is checked like any other code. A test asserts that every fixture
+  directory is its own module;
 - separate checkouts nested in the working tree, meaning directories with
   their own `.git` entry, such as editor worktrees.
 

@@ -263,15 +263,17 @@ func walkGo(fsys fs.FS, root string, skip func(dir string) bool, visit func(file
 }
 
 // FixtureRoot holds this checker's own fixtures, deliberately violating
-// trees. It is the one directory exempt from the rules.
+// trees. Only its direct children that are their own modules (have a go.mod)
+// are exempt. Anything else under it belongs to the root module, which Go
+// builds when imported by explicit path, so it is checked like any other code.
 const FixtureRoot = "internal/importboundary/testdata"
 
 // NestedModules returns every directory outside extensions/ that holds its
 // own go.mod (wal-quorum-sidecar, for example). Their code can be linked into
 // core through go.mod requires or go.work, so rule A covers them too. The
-// repository .git, FixtureRoot, and separate checkouts (a directory with its
-// own .git entry, such as an editor's worktree) are not part of this
-// repository and are skipped.
+// repository .git, the fixture modules directly under FixtureRoot, and
+// separate checkouts (a directory with its own .git entry, such as an
+// editor's worktree) are skipped.
 func NestedModules(fsys fs.FS) ([]string, error) {
 	var dirs []string
 	err := fs.WalkDir(fsys, ".", func(name string, d fs.DirEntry, err error) error {
@@ -281,13 +283,16 @@ func NestedModules(fsys fs.FS) ([]string, error) {
 		if !d.IsDir() || name == "." {
 			return nil
 		}
-		if name == ".git" || name == "extensions" || name == FixtureRoot {
+		if name == ".git" || name == "extensions" {
 			return fs.SkipDir
 		}
 		if _, err := fs.Lstat(fsys, path.Join(name, ".git")); err == nil {
 			return fs.SkipDir
 		}
 		if info, err := fs.Lstat(fsys, path.Join(name, "go.mod")); err == nil && info.Mode().IsRegular() {
+			if path.Dir(name) == FixtureRoot {
+				return fs.SkipDir
+			}
 			dirs = append(dirs, name)
 		}
 		return nil
@@ -404,7 +409,9 @@ func Check(fsys fs.FS) ([]Violation, error) {
 	}
 	linkA := func(name string) { out = append(out, Violation{"A", name, "(symlink)"}) }
 	for _, dir := range append([]string{"."}, nested...) {
-		skip := func(d string) bool { return d == "extensions" || d == ".git" || d == FixtureRoot }
+		// Fixture modules under FixtureRoot stop the walk at their own go.mod
+		// like any nested module; FixtureRoot itself is not skipped.
+		skip := func(d string) bool { return d == "extensions" || d == ".git" }
 		if err := walkGo(fsys, dir, skip, ruleA, linkA); err != nil {
 			return nil, err
 		}
