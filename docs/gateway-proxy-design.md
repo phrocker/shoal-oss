@@ -1084,12 +1084,13 @@ certainly need to *do*, and cannot:
 
 **Find every action that may have double-executed.** This document leans on
 `EffectPossible` in several places as the reconciliation signal, and it is not
-one. `applyClaim` sets it on every claim of an external action, and
-`applyExecutionResult` sets it **unconditionally for every completion of any
-effect class** (`pkg/explorer/fleet/dispatch_service.go` — no declaration
-check). So it is true for the overwhelming majority of perfectly healthy actions.
-It is an honest answer to "could this have had an effect" and useless as an
-answer to "did this run twice".
+one. `applyClaim` sets it on every claim of an external action, and before
+#510 `applyExecutionResult` set it **unconditionally for every completion of
+any effect class**, so it was true for the overwhelming majority of perfectly
+healthy actions. Since #510 it is true only for actions that declared an
+external effect — which narrows the set considerably and still does not make it
+an answer to "did this run twice". It is an honest answer to "was this
+*declared* capable of an effect", and that is a different question.
 
 The predicate that answers the real question exists and this document never named
 it: the fence is incremented per claim, so **`ClaimFence > 1 ∧ EffectPossible`**
@@ -1198,25 +1199,63 @@ across lease expiry, requeue and re-claim. A record that has ever been claimed
 for an external effect carries "an effect may have happened" permanently, which
 is the part that matters most and costs nothing.
 
-What this said, and what is wrong with it, is that the claim-time narrowing
-survives. It does not. The claim path sets the flag only for an action that
+What this said, and what was wrong with it, is that the claim-time narrowing
+survives. It did not. The claim path sets the flag only for an action that
 declares `EffectMutatesExternal` or `EffectEgressesContent`, with a careful
 comment explaining that an action which "neither mutates externally nor
 transmits leaves its whole outcome in Shoal's own record, so nothing has to be
-assumed about it". `applyExecutionResult` then sets it **unconditionally** on
-every completion, and `ActionRecord.Validate` *refuses* a terminal record that
-lacks it. So every terminal record asserts an effect may have happened, whether
-or not one may have, and the thoughtful write runs first while the careless one
-runs last and wins.
+assumed about it". `applyExecutionResult` then set it **unconditionally** on
+every completion, and `ActionRecord.Validate` *refused* a terminal record that
+lacked it — so every terminal record asserted an effect may have happened
+whether or not one may have, and the thoughtful write ran first while the
+careless one ran last and won.
 
-Two consequences for a gateway, both practical:
+**#510 fixed that, and the fix was subtraction.** The completion carries the
+claim's value forward instead of asserting its own, and `Validate` no longer
+requires the flag on a terminal record. `applyClaim` already decides from the
+declaration and the store refuses to let the flag fall (#461), so monotonicity
+holds with no completion-side assertion.
 
-- **A reader cannot use the flag on a terminal record.** It is a constant there.
-  Reconciliation filtered on it degenerates to "reconcile every terminal
-  action". The flag is informative only while a claim is open, where it does
-  reflect the declaration.
-- **There is no way to record that a dispatch failed without reaching its
-  target.** Not through the flag, which the model forbids from saying so. And
+**What `false` means, stated precisely, because an earlier revision of this
+paragraph overstated it.** It means the action *declared* neither external
+mutation nor content egress. It does **not** mean no external effect was
+possible, and a gateway is exactly where the difference bites:
+`ExternalEffectBinding` implements `EffectBounded` and deliberately *not*
+`EffectFloored`, and its own comment says why — the bound is a permission
+envelope, one reference serves many actions performed by a worker Shoal does
+not run, and "a descriptor may therefore declare less than this permits, and
+that is the point". So a non-declaring action can resolve to a dispatch-only
+reference and a remote worker can do real external work against a target,
+reporting a failure on a record whose flag reads `false`.
+
+That is a declaration problem rather than a flag problem, and the binding's
+comment already states the limit it shares with every other declaration seam
+here: "a host that binds a reference for external mutation and points a worker
+at the wrong operational surface has misdescribed its own configuration, and no
+invariant in this package can detect that." The open question is whether
+registration should refuse it — whether binding an action to a dispatch-only
+reference should require it to declare at least one external effect. That would
+make `false` trustworthy for gateway-run actions and would break descriptors
+that under-declare today, so it wants an operator-facing decision rather than
+a quiet tightening. Recorded on #514 and #510.
+
+So for a reader:
+
+- **`false`** — the action declared no external effect. Trustworthy as a
+  statement about the *declaration*, and only as strong as the declaration is
+  honest. For an action bound to an in-process executor with a floor, that is
+  strong; for one bound to a dispatch-only reference, it is only as good as the
+  descriptor.
+- **`true`** — a declaring action was claimed, so an effect may have happened.
+  A *may*, never a *did*.
+- **A record written before #510** — `true`, always, including for
+  non-declaring actions, because `Validate` required it. So `true` on an old
+  record carries no information, while `false` cannot appear on one at all:
+  `false` is unambiguously post-#510.
+
+- **There is still no way to record that a dispatch failed without reaching its
+  target.** Not through the flag, which says what was declared rather than what
+  happened. And
   not through `complete`'s error code, which carries no such outcome in its
   vocabulary — though it is no longer indistinguishable from the service's own:
   #508 reserved the four codes the service assigns and added
@@ -1682,11 +1721,20 @@ Three things this table cannot do, which are design gaps rather than
 presentation ones:
 
 **It cannot distinguish "target unreachable" from "timed out after the request
-left".** Both produce `failed` with `EffectPossible` set, because that flag is
-assigned at claim and again unconditionally at completion. The only possible
-discriminator is `ErrorCode`, and this design does not specify one. Those two
-rows are the difference between "nothing happened" and "something may have", so
-the `ErrorCode` vocabulary is load-bearing and has to be enumerated.
+left".** Both produce `failed` with `EffectPossible` set — assigned at claim for
+any action declaring an external effect, which a gateway action does, and
+#510's fix does not change that: a declaring action's flag is true from the
+moment it is claimable, and it is monotonic.
+
+The discriminators that exist are `ErrorCode` and an ambiguity report.
+`ErrorCode` now carries provenance (#508), so a reader can tell the service's
+adjudication from the executor's account, but its *vocabulary* is still
+unspecified and nothing in it says whether the request left the host. The one
+thing that does is an ambiguity report whose outcome is `request_not_sent`,
+which is a worker's statement rather than an inference. So these two rows are
+the difference between "nothing happened" and "something may have", and
+answering them is the gateway's obligation to report rather than something the
+record can derive.
 
 **It cannot tell an operator that a horizon did not fit.** A worker should refuse
 *before* claiming, which leaves the action queued and re-offered and refused
