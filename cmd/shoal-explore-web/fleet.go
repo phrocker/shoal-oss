@@ -86,10 +86,34 @@ func (r configuredFleetExecutors) ResolveExecutor(
 func (r configuredFleetExecutors) bind(
 	reference string, executor fleet.Executor,
 ) error {
-	if _, allowed := r[reference]; !allowed {
+	current, allowed := r[reference]
+	if !allowed {
 		return fmt.Errorf(
 			"fleet executor reference %q is not in -fleet-executor-refs",
 			reference)
+	}
+	// Refuse a second binding rather than overwrite the first. The callers
+	// above each check the collisions they know about, but they check them
+	// against their own inputs: bindExternalFleetEffects compares its two
+	// lists and the ask reference, and nothing compares a future third
+	// binding against any of them. This is the seam every binding passes
+	// through, so it is the one place the invariant can be stated once.
+	//
+	// Silently overwriting is the specific failure worth refusing. Two
+	// bindings on one reference are two different effect ceilings, and which
+	// one survives would be decided by the order composition happens to run
+	// in — so a reference the operator configured as a dispatch-only gateway
+	// could resolve to the grounded-reasoning executor, or an external
+	// ceiling could replace a floor that deliberately excludes external
+	// mutation. Neither is visible at startup and both change what the
+	// registry permits.
+	if _, unbound := current.(configuredFleetExecutor); !unbound {
+		return fmt.Errorf(
+			"fleet executor reference %q is already bound to %T; one "+
+				"reference carries one executor and one effect ceiling, and "+
+				"binding it twice would let composition order decide which "+
+				"ceiling the registry enforces",
+			reference, current)
 	}
 	// fleet.Executor is an empty interface, so a typed nil would satisfy a
 	// plain nil check, resolve, satisfy the ActionExecutor assertion, and then
@@ -410,4 +434,100 @@ func (r *boundAdmission) Outstanding(
 	}
 	request.Context = bound
 	return r.service.Outstanding(ctx, request)
+}
+
+// externalFleetEffectBindings is the operator's per-reference opt-in to the
+// one binding in this process that admits external work.
+//
+// The three fields are separate rather than one list because they are three
+// different declarations and the difference is the whole control. A reference
+// in mutating may serve actions declaring {external}; a reference in
+// transmitting may also serve ones that transmit corpus content off the host;
+// askReference is here only so a collision with the grounded-reasoning
+// executor can be refused rather than resolved by binding order.
+//
+// Nothing here has a default that widens. An operator who sets neither list
+// gets what the explorer has always had: every allowlisted reference resolves
+// to a placeholder declaring no ceiling, which permits nothing.
+type externalFleetEffectBindings struct {
+	mutating     []string
+	transmitting []string
+	askReference string
+}
+
+// bindExternalFleetEffects attaches an external-mutation ceiling to each
+// reference the operator named for it.
+//
+// Two collisions are refused rather than resolved, because both are a values
+// file that says two things about one reference and both would otherwise be
+// settled silently by the order these loops happen to run in.
+//
+// A reference named in both lists is a contradiction about whether the
+// operation transmits. Binding order would pick one, and the wider set winning
+// would mean an operator acquires egress authority by listing a reference
+// twice — which is exactly the accidental widening this flag pair exists to
+// prevent.
+//
+// A reference that is also -fleet-ask-executor-ref is worse, because the two
+// bindings are not narrower and wider but incompatible. AskExecutor carries a
+// floor equal to its ceiling and deliberately excludes external mutation; this
+// binding carries an external ceiling and no floor. One reference cannot be
+// both, and whichever bound last would overwrite the other in the registry: an
+// ask descriptor would stop resolving, or a reasoning executor would be reached
+// through a reference the operator believes is a dispatch-only gateway.
+func bindExternalFleetEffects(
+	executors configuredFleetExecutors,
+	config externalFleetEffectBindings,
+) error {
+	claimedBy := make(
+		map[string]string, len(config.mutating)+len(config.transmitting))
+	for _, group := range []struct {
+		flag       string
+		references []string
+		ceiling    fleet.Effects
+	}{
+		{
+			flag:       "-fleet-external-executor-refs",
+			references: config.mutating,
+			ceiling:    fleet.Effects{fleet.EffectMutatesExternal},
+		},
+		{
+			flag:       "-fleet-external-egress-executor-refs",
+			references: config.transmitting,
+			ceiling: fleet.Effects{
+				fleet.EffectEgressesContent, fleet.EffectMutatesExternal,
+			},
+		},
+	} {
+		for _, reference := range group.references {
+			if config.askReference != "" &&
+				reference == config.askReference {
+				return fmt.Errorf(
+					"fleet executor reference %q is named by both %s and "+
+						"-fleet-ask-executor-ref; one reference cannot carry "+
+						"both an external-mutation ceiling with no floor and "+
+						"the grounded-reasoning executor's floor, which "+
+						"equals its ceiling and excludes external mutation",
+					reference, group.flag)
+			}
+			if previous, claimed := claimedBy[reference]; claimed &&
+				previous != group.flag {
+				return fmt.Errorf(
+					"fleet executor reference %q is named by both %s and %s; "+
+						"whether the operation transmits corpus content off "+
+						"the host is one declaration per reference, not a "+
+						"choice made by binding order",
+					reference, previous, group.flag)
+			}
+			claimedBy[reference] = group.flag
+			binding, err := fleet.NewExternalEffectBinding(group.ceiling)
+			if err != nil {
+				return err
+			}
+			if err := executors.bind(reference, binding); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }

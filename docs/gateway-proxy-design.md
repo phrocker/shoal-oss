@@ -171,25 +171,52 @@ which is a semantic change to what the pin is for.
 
 ## The third blocker: no executor may perform an external effect today
 
-A gateway descriptor cannot be registered against the shipped explorer.
+*Resolved by #436; kept because the reasoning is the design.*
+
+A gateway descriptor could not be registered against the shipped explorer.
 
 Registration resolves the executor reference and checks the declared effects
-against that executor's ceiling (`pkg/explorer/fleet/service.go:720`).
-`executorCeiling` returns `nil` for any executor that does not implement
-`EffectBounded` (`pkg/explorer/fleet/model.go:492-497`), and `exceeds(nil)` is
-true for any non-empty declaration — so an unbound reference permits nothing at
-all. The only bound executor in the binary is `AskExecutor`, whose ceiling is
-`{reads-corpus}` or `{reads-corpus, egresses-content}` and which **deliberately**
-excludes external mutation; its comment says declaring it "would raise the
-ceiling enough for genuinely external actions to resolve here"
-(`pkg/explorer/webapi/fleet_executor.go:217-219`). Its floor equals its ceiling,
-so `{external}` also fails the floor check.
+against that executor's ceiling (`pkg/explorer/fleet/service.go:120`, which
+calls `validateDeclaredEffects` at `:717`). `executorCeiling` returns `nil` for
+any executor that does not implement `EffectBounded`
+(`pkg/explorer/fleet/model.go:492-497`), and `exceeds(nil)` is true for any
+non-empty declaration — so an unbound reference permits nothing at all. The only
+bound executor was `AskExecutor`, whose ceiling is `{reads-corpus}` or
+`{reads-corpus, egresses-content}` and which **deliberately** excludes external
+mutation; its comment says declaring it "would raise the ceiling enough for
+genuinely external actions to resolve here"
+(`pkg/explorer/webapi/fleet_executor.go:217-219`).
 
-So the effect ceiling this document cites as the mechanism that makes the design
-safe currently refuses the entire gateway, at registration and again at
-resolution. The missing piece is a host-side executor binding that declares an
-external-mutation ceiling and no floor — which belongs in the explorer, not in
-the gateway, and is invisible from this document's own vantage point.
+An earlier draft added "its floor equals its ceiling, so `{external}` also fails
+the floor check". True in isolation and **operationally dead**, because
+`validateDeclaredEffects` tests the ceiling first and returns
+(`pkg/explorer/fleet/service.go:720-721`) before reaching the floor at `:727`.
+The floor is never the reason `{external}` is refused there.
+
+That is worth more than a footnote, because presenting the floor as a second
+independent barrier is a trap: a test asserting "`{external}` is refused against
+`AskExecutor`" passes against a **widened** `AskExecutor`, since the floor
+refuses the declaration anyway. #436's implementation hit exactly that — a
+mutation widening `AskExecutor` to include `{external}` survived its first
+acceptance test for this reason, and was caught only after the test pinned the
+ceiling's own error sentence and added a declaration the floor cannot object to.
+
+**And the ceiling is not the only gate, which this section originally implied.**
+A dispatch-only binding must **not** implement `ActionExecutor`.
+`resolveActionBinding` deliberately does not require one — its comment explains
+that "requiring it to supply an Execute method would force every remote
+deployment to bind a stub whose only job is to be refused"
+(`pkg/explorer/fleet/dispatch_service.go:1413-1418`) — while `resolveAction`
+is "`resolveActionBinding` plus the assertion that the bound reference can
+actually run the work here" (`:1378-1380`). So claiming, cancelling, inspecting
+and completing resolve through the first, and only in-process execution demands
+the second.
+
+That asymmetry is what keeps a wider ceiling from reopening #381's boundary, and
+it is enforced by an **absence**: `ExternalEffectBinding` implements `MaxEffects`
+and nothing else. An implementer reading only the ceiling requirement would
+plausibly add an `Execute` stub and quietly turn the gateway into an in-process
+external executor — which is the one thing #381 exists to refuse.
 
 ## The fourth blocker: `ClaimID` uniqueness is load-bearing and unspecified
 
@@ -1241,15 +1268,21 @@ unfinished work.
 
 ## Prerequisites
 
-Four, not one. Each blocks #391 and each lives outside the gateway.
+Five, not one. Each blocks #391 and each lives outside the gateway.
 
-| # | what | where |
-|---|---|---|
-| **new** | emit `input` and `executor_key` on the action read wire — without `input` a worker cannot learn what to do, and `executor_key` is the idempotency key the platform already derives | `fleetActionWire` |
-| **#430** | claim renewal, with the three constraints above (fence must not advance; version handling; a distinguishable refusal) | `DispatchService` |
-| **new** | a claimant that is not the enqueuer — see the first blocker. The only option that keeps attribution *and* isolation | the authorization predicate |
-| **new** | an executor binding that declares an external-mutation ceiling and no floor — see the third blocker | the explorer host |
-| **new** | a lost-fence ambiguity report attached to the action record | `DispatchService` |
+| # | what | where | state |
+|---|---|---|---|
+| **#435** | emit `input` and `executor_key` on the action read wire — without `input` a worker never receives the operation, and `executor_key` is the idempotency key the platform already derives | `fleetActionWire` | PR open |
+| **#436** | an executor binding declaring an external-mutation ceiling and no floor — **and not implementing `ActionExecutor`**, which is what keeps a wider ceiling from reopening #381 | the explorer host | **done** |
+| **#437** | a claimant that is not the enqueuer — see the first blocker. The only option that keeps attribution *and* isolation | the authorization predicate | open |
+| **#438** | a lost-fence ambiguity report attached to the action record | `DispatchService` | open |
+| **#430** | claim renewal, with the three constraints above (fence must not advance; version handling; a distinguishable refusal) | `DispatchService` | open |
+
+Order matters and is not the order they were filed. #435 and #436 are strictly
+upstream: without them there is no worker that can function at all, so #430 on
+its own unblocks nothing. #437 is the one that needs a decision rather than an
+implementation, and it rewrites the authorization path #430 and #438 both land
+in — so it should settle before either.
 
 And two that are smaller but have to be settled before an implementation starts,
 because getting them wrong is silent:

@@ -105,6 +105,40 @@
 {{- end -}}
 {{- end -}}
 
+{{- /* Every fleet executor reference reaches the container as part of a
+       single argument, and three of the four settings are comma-joined into
+       one. So two classes of character cannot appear in a reference without
+       changing what the argument means, and neither is refused anywhere else.
+
+       A newline used to end the YAML scalar and start a new sequence entry,
+       which made the rest of any list element an arbitrary container
+       argument. The container arguments in explorer-statefulset.yaml are
+       quoted now, so a newline stays inside the value; this guard is the
+       other half, because a reference carrying one matches no registered
+       executor and so binds nothing while the pod starts and serves
+       normally. Fail-closed, but silently, and the operator's first evidence
+       is a gateway descriptor refused for declaring an effect its executor is
+       not bound to perform, which reads as a bug in the descriptor.
+
+       A comma is the separator itself. One entry of "a,b" reaches the
+       workspace as two references, so a single list element silently becomes
+       two bindings — and the guards below compare the unsplit string, which
+       is how an entry of "a,b" passes a check against an askExecutorRef of
+       "b". The Go side refuses that collision at startup, so this is defence
+       in depth rather than the only line, but a values file that cannot mean
+       two things should be refused where it is written. */ -}}
+{{- range $setting, $references := dict "executorRefs" $explorer.fleet.executorRefs "askExecutorRef" (list $explorer.fleet.askExecutorRef) "externalExecutorRefs" $explorer.fleet.externalExecutorRefs "externalEgressExecutorRefs" $explorer.fleet.externalEgressExecutorRefs -}}
+{{- range $reference := $references -}}
+{{- $text := toString $reference -}}
+{{- if contains "," $text -}}
+{{- fail (printf "explorer.fleet.%s contains %q, which holds a comma: references are comma-joined into one container argument, so this single entry becomes two bindings and the collision guards below compare the unsplit string. Give each reference its own list entry" $setting $text) -}}
+{{- end -}}
+{{- if regexMatch "[[:cntrl:]]" $text -}}
+{{- fail (printf "explorer.fleet.%s contains %q, which holds a control character: the reference reaches the container inside one quoted argument, so it matches no registered executor and binds nothing while the pod starts and serves normally. Before those arguments were quoted, a newline here made the remainder of the entry an arbitrary argument of the explorer container" $setting $text) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
 {{- /* The ask executor is bound by reference, and the registry only accepts a
        reference the allow-list names. */ -}}
 {{- if $explorer.fleet.askExecutorRef -}}
@@ -113,6 +147,56 @@
 {{- end -}}
 {{- if not $explorer.chat.provider -}}
 {{- fail "explorer.fleet.askExecutorRef requires a configured explorer.chat.provider: the grounded-reasoning executor has no model to run without one" -}}
+{{- end -}}
+{{- end -}}
+
+{{- /* The external-effect bindings (#436).
+
+       These two lists are the only configuration in the chart that raises an
+       executor's effect ceiling to admit work whose consequences land outside
+       Shoal — the point at which Shoal stops containing an effect. Everything
+       else here is fail-closed by omission and stays that way: an allowlisted
+       reference nobody names below declares no ceiling, and a declaration of
+       {external} against it is refused at registration and again at
+       resolution.
+
+       So every guard in this block exists to stop a values file that *reads*
+       like that opt-in from quietly not being one, or from being one twice
+       over. None of them can be reached by leaving something unset. */ -}}
+{{- $claimedBy := dict -}}
+{{- range $key := list "externalExecutorRefs" "externalEgressExecutorRefs" -}}
+{{- range $reference := (index $explorer.fleet $key) -}}
+{{- /* Present but blank is not a configured reference. The workspace drops
+       empty entries when it splits the flag, so a list holding only "" or " "
+       binds nothing — and the failure is invisible, because the pod starts
+       and serves. The operator finds out when the gateway descriptor they
+       registered is refused for declaring an effect its executor is not bound
+       to perform, which reads as a bug in the descriptor. */ -}}
+{{- if not (trim (toString $reference)) -}}
+{{- fail (printf "explorer.fleet.%s contains a blank entry: the workspace drops empty entries when it splits the flag, so nothing is bound and the reference keeps permitting nothing. A descriptor declaring external effects against it would be refused at registration while the pod starts and serves normally" $key) -}}
+{{- end -}}
+{{- $trimmed := trim (toString $reference) -}}
+{{- /* Registration is fail-closed on the allow-list first, so a binding for a
+       reference the registry will not accept is unreachable. */ -}}
+{{- if not (has $trimmed $explorer.fleet.executorRefs) -}}
+{{- fail (printf "explorer.fleet.%s names %q, which is not in explorer.fleet.executorRefs: the registry refuses any descriptor naming a reference the allow-list does not carry, so this binding would never be reached and no external action could register at all" $key $trimmed) -}}
+{{- end -}}
+{{- /* One reference cannot carry both bindings, and these two are not narrower
+       and wider — they are incompatible. The grounded-reasoning executor's
+       floor equals its ceiling and deliberately excludes external mutation;
+       this binding has an external ceiling and no floor. Whichever bound last
+       at startup would overwrite the other. */ -}}
+{{- if and $explorer.fleet.askExecutorRef (eq $trimmed $explorer.fleet.askExecutorRef) -}}
+{{- fail (printf "explorer.fleet.%s names %q, which is also explorer.fleet.askExecutorRef: that reference carries the grounded-reasoning executor, whose effect floor equals its ceiling and excludes external mutation, so the two bindings cannot coexist and one would overwrite the other at startup — either ask descriptors stop resolving, or the reasoning executor answers through a reference configured as a dispatch-only gateway. Give the gateway its own reference" $key $trimmed) -}}
+{{- end -}}
+{{- /* Whether the operation transmits corpus content off the host is one
+       declaration per reference. Letting the wider ceiling win would mean
+       egress authority is acquired by listing a reference twice, which is
+       exactly the accidental widening the separate list exists to prevent. */ -}}
+{{- if and (hasKey $claimedBy $trimmed) (ne (get $claimedBy $trimmed) $key) -}}
+{{- fail (printf "explorer.fleet.%s names %q, which explorer.fleet.%s already names: the two lists declare different ceilings for one reference, and resolving that by binding order would hand it the wider one — so egress authority would be acquired by listing a reference twice. Name it in exactly one list" $key $trimmed (get $claimedBy $trimmed)) -}}
+{{- end -}}
+{{- $_ := set $claimedBy $trimmed $key -}}
 {{- end -}}
 {{- end -}}
 

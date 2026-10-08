@@ -376,6 +376,31 @@ comma-separated list. An empty list is valid but fail-closed: registry reads
 remain available while new registrations are rejected because no executor is
 known to the host.
 
+Allowlisting a reference does not grant it any effect authority. An allowlisted
+reference declares no effect ceiling, and a declaration that is not a subset of
+the ceiling is refused — so a descriptor declaring any effect class at all is
+rejected against it, at registration and again at resolution. Two settings
+raise that ceiling, each per reference and each an explicit opt-in:
+`-fleet-external-executor-refs` (`SHOAL_FLEET_EXTERNAL_EXECUTOR_REFS`) binds a
+ceiling of `{external}`, and `-fleet-external-egress-executor-refs`
+(`SHOAL_FLEET_EXTERNAL_EGRESS_EXECUTOR_REFS`) binds
+`{egresses-content, external}` for an external operation that also transmits
+corpus content off this host. Neither has a default and nothing else produces
+either ceiling.
+
+A reference bound this way carries **no effect floor**, so a descriptor may
+declare less than the ceiling permits, and it implements no action execution:
+nothing runs in process against it. Work reaches it over the dispatch queue —
+enqueue, pull, claim, perform elsewhere, report — and the completion report is
+what Shoal records. This is the point at which Shoal stops containing an
+effect; it dispatches the work and does not undo it.
+
+Each such reference must also appear in `-fleet-executor-refs`, must appear in
+at most one of the two lists, and must not be `-fleet-ask-executor-ref`. The
+grounded-reasoning executor's effect floor equals its ceiling and deliberately
+excludes external mutation, so one reference cannot carry both bindings; give
+the gateway its own reference. The chart refuses all three at render time.
+
 Dispatch transitions publish stable `action.enqueued`, `action.claimed`,
 `action.completed`, `action.canceled`, and `action.failed` events. Raw
 idempotency, claim, executor, and cancellation keys remain private; envelopes

@@ -261,6 +261,28 @@ explorer:
     # Bound to the built-in grounded-reasoning executor. Must also appear in
     # executorRefs and requires a configured chat provider.
     askExecutorRef: ""
+    # References bound with an effect ceiling of {external} and no floor: a
+    # descriptor may register an action whose consequences land outside Shoal
+    # against one of these, and may declare less than the ceiling permits.
+    #
+    # This is where Shoal stops containing an effect, so it is an explicit
+    # opt-in per reference and nothing else produces it. An allowlisted
+    # reference that is not named here resolves to a placeholder declaring no
+    # ceiling, which permits nothing — leaving these empty is the configuration
+    # the explorer has always had, not a weaker version of it.
+    #
+    # Nothing runs in process against them. The binding implements no action
+    # execution, so work is served over the dispatch queue — enqueue, pull,
+    # claim, perform elsewhere, report — and the report is what Shoal records.
+    # Each must also appear in executorRefs, and none may be the askExecutorRef:
+    # that executor's floor equals its ceiling and excludes external mutation,
+    # so one reference cannot be both.
+    externalExecutorRefs: []
+    # The same, widened to {egresses-content, external} for an external
+    # operation that also transmits corpus content off the host. A reference
+    # belongs in exactly one of the two lists: transmission is declared on its
+    # own so it is never acquired by naming a reference for mutation alone.
+    externalEgressExecutorRefs: []
   ontologyFile: ""
   resources:
     requests:
