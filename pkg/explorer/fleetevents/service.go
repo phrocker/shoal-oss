@@ -340,7 +340,18 @@ func lifecyclePublicationPermits(kind string, operation auth.Operation) bool {
 	case "action.enqueued":
 		permitted = []auth.Operation{auth.OperationDispatch, auth.OperationInvoke}
 	case "action.canceled":
-		permitted = []auth.Operation{auth.OperationDispatch}
+		// Dispatch for DispatchService.Cancel, invoke for
+		// AdmissionService.deny. Two legitimate writers, two operations.
+		//
+		// This said dispatch alone, justified as "a cancellation is dispatch
+		// only. It is the enqueuer's lever, and no execute-holder can reach
+		// Cancel." The first sentence is true of DispatchService.Cancel and
+		// false of the kind: deny produces an action.canceled under invoke,
+		// and the permitted set refused it — so every admission denial
+		// committed and then reported a publication failure.
+		permitted = []auth.Operation{
+			auth.OperationDispatch, auth.OperationInvoke,
+		}
 	case "action.claimed", "action.completed", "action.failed":
 		permitted = []auth.Operation{auth.OperationInvoke, auth.OperationExecute}
 	default:

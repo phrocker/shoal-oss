@@ -237,7 +237,33 @@ func actionEventAuthorization(
 			operation = auth.OperationInvoke
 		}
 	case "action.canceled":
-		operation = auth.OperationDispatch
+		// Two legitimate writers produce this kind under different
+		// operations, which hardcoding dispatch could not express.
+		// DispatchService.Cancel transitions under dispatch;
+		// AdmissionService.deny transitions under invoke, and its record's
+		// AuthorizedOperations is [invoke] — so the provenance check below
+		// refused every denial's publication, and a refused publication is
+		// ErrActionCommitted: a 503 for a refusal that had committed.
+		//
+		// My own comment on lifecyclePublicationPermits is why this survived
+		// #443. It said "a cancellation is dispatch only. It is the enqueuer's
+		// lever, and no execute-holder can reach Cancel." True of
+		// DispatchService.Cancel, and false as a statement about the *kind* —
+		// a property of one writer asserted as a property of the event, in a
+		// commit whose whole subject was that class of mismatch.
+		//
+		// Narrowed to the two operations a cancel can legitimately carry
+		// rather than read blindly. cloneActionRecord carries this field
+		// forward, so a record cancelled by a build before Cancel set it holds
+		// the *claim's* operation — which would pass the provenance check,
+		// because the claim put it in AuthorizedOperations, and mislabel the
+		// event. Dispatch is the fallback because that is what this arm
+		// hardcoded and what Cancel adds to AuthorizedOperations.
+		operation = record.TransitionOperation
+		if operation != auth.OperationDispatch &&
+			operation != auth.OperationInvoke {
+			operation = auth.OperationDispatch
+		}
 	case "action.claimed", "action.completed", "action.failed":
 		// The operation the transition was actually authorized by, which since
 		// #437 is not always invoke: a principal granted OperationExecute on

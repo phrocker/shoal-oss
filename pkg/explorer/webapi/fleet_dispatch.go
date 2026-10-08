@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/phrocker/shoal-oss/pkg/document"
+	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/explorer/fleet"
 	"github.com/phrocker/shoal-oss/pkg/interaction"
 	"github.com/phrocker/shoal-oss/pkg/ontology"
@@ -349,7 +350,39 @@ func fleetDispatchError(err error) error {
 		return shoal.WrapError(shoal.ErrorNotFound, "fleet action not found", err)
 	case errors.Is(err, fleet.ErrActionConflict), errors.Is(err, fleet.ErrClaimLost), errors.Is(err, fleet.ErrActionTerminal):
 		return shoal.WrapError(shoal.ErrorConflict, "fleet action conflict", err)
-	case errors.Is(err, fleet.ErrExecutionAmbiguous), errors.Is(err, fleet.ErrActionCommitted), errors.Is(err, fleet.ErrRecordingUnavailable):
+	// The two sentinels that mean something durable may have happened, marked
+	// so writeError sets Shoal-Commit-Outcome: indeterminate and the body
+	// flag. Before this arm existed all three below shared one, so a caller
+	// received a bare 503 and could not tell "retry, nothing happened" from
+	// "stop, something may have happened" — which is the single most important
+	// distinction this surface has to communicate, and the one a worker's
+	// behaviour differs most sharply on.
+	//
+	// ErrExecutionAmbiguous: the effect may have occurred and Shoal cannot
+	// tell. ErrActionCommitted: the transition was durably written and only
+	// its publication failed, so the write landed.
+	//
+	// This arm is ordered before the recording one deliberately.
+	// applyExecutionResult joins ErrExecutionAmbiguous *and*
+	// ErrRecordingUnavailable on the one recorder failure that happens after
+	// the effect, and that error has to be marked — matching here first is
+	// what marks it.
+	case errors.Is(err, fleet.ErrExecutionAmbiguous),
+		errors.Is(err, fleet.ErrActionCommitted):
+		return explorer.MarkIndeterminateCommit(shoal.WrapError(
+			shoal.ErrorUnavailable,
+			"fleet action outcome requires reconciliation", err))
+	// Deliberately *not* marked. Every ErrRecordingUnavailable site raises it
+	// from a RecordAction failure that sits immediately before the matching
+	// store write — checked at all nine of them — so the transition did not
+	// commit and the request is a clean refusal the caller should retry.
+	//
+	// Marking it would be worse than the silence it replaces: a caller told
+	// "this may have committed" about a request that provably did not would
+	// stop retrying work that never happened, and would reconcile against a
+	// record that does not exist. The one site that is post-effect carries
+	// ErrExecutionAmbiguous and is caught above.
+	case errors.Is(err, fleet.ErrRecordingUnavailable):
 		return shoal.WrapError(shoal.ErrorUnavailable, "fleet action outcome requires reconciliation", err)
 	default:
 		return err

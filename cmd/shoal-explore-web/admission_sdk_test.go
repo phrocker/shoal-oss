@@ -286,30 +286,32 @@ func TestSDKAdmissionAgainstTheRealComposition(t *testing.T) {
 	t.Run("path B approval required", func(t *testing.T) {
 		request := sdkAdmissionRequest(h, "sdk-held", "deploy",
 			[]string{admissionapi.EffectMutatesExternal}, nil)
-		// Pinned as it is, not as it should be (see
-		// TestApprovalHeldWorkIsNeverPerformedBeforeApproval and #480/#492):
-		// the denial commits a cancelled record whose publication the hosted
-		// publisher refuses, so the first answer is 503 "requires
-		// reconciliation". It must never be read as a grant or as a denial.
-		// When the publisher is fixed this becomes a plain denial and the
-		// assertion should be flipped.
+		// The first answer is the denial, which is what it always should have
+		// been. This was pinned as a 503 "requires reconciliation" carrying
+		// no indeterminate marker, with a note to flip it when the publisher
+		// was fixed (#505).
 		//
-		// Also pinned as it is: that 503 carries no Shoal-Commit-Outcome
-		// header and no indeterminate flag, although the denial it reports has
-		// committed. ErrActionCommitted reaches the transport through
-		// fleetDispatchError's "requires reconciliation" arm, not through the
-		// indeterminate-commit marker.
+		// What was wrong: the denial commits a cancelled record, and the
+		// publisher hardcoded OperationDispatch for action.canceled while the
+		// record's AuthorizedOperations is [invoke], so the provenance check
+		// refused the publication — and a refused publication is
+		// ErrActionCommitted. Every denial therefore reported a failure for a
+		// refusal that had committed and granted nothing. It went unnoticed
+		// because the retry answered "denied": the second attempt looked
+		// correct, which is exactly what the replay loop below asserts.
+		//
+		// Both gates are fixed. deny records its real transition operation,
+		// and both the publisher and lifecyclePublicationPermits admit invoke
+		// for action.canceled, because two legitimate writers produce that
+		// kind under different operations.
 		grant, err := admission.Request(ctx, request, options)
-		var status *admissionapi.HTTPError
-		if !errors.As(err, &status) || status.Status != http.StatusServiceUnavailable ||
-			status.Code != "unavailable" ||
-			status.Message != "unavailable: fleet action outcome requires reconciliation" ||
-			status.Indeterminate || errors.Is(err, admissionapi.ErrDenied) ||
-			grant.Token != nil {
+		if !errors.Is(err, admissionapi.ErrDenied) ||
+			grant.Outcome != admissionapi.OutcomeDenied || grant.Token != nil ||
+			grant.Withhold == nil || len(grant.Withhold) != 0 {
 			t.Fatalf("path B first answer = %#v, %#v", grant, err)
 		}
-		// The replay answers from the record: a 200 denial carrying no token,
-		// in exactly the shape every denial has.
+		// And the replay answers identically from the record, which is the
+		// property that masked the defect and is still worth pinning.
 		for attempt := 0; attempt < 2; attempt++ {
 			grant, err = admission.Request(ctx, request, options)
 			if !errors.Is(err, admissionapi.ErrDenied) ||

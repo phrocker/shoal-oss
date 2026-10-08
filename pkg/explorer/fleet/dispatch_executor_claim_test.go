@@ -3375,3 +3375,178 @@ func TestAClaimantChainTooLongToRetainIsRefusedAtClaimTime(t *testing.T) {
 			"attempted, so its retained chain was not recognised: %v", err)
 	}
 }
+
+// TestARecorderFailureLeavesTheRecordUnchanged is what licenses
+// fleetDispatchError to answer ErrRecordingUnavailable as a plain 503, with no
+// indeterminate marker, while marking ErrExecutionAmbiguous and
+// ErrActionCommitted.
+//
+// All three were one arm, so a caller got a bare 503 and could not tell "retry,
+// nothing happened" from "stop, something may have happened" — the sharpest
+// distinction this surface has. Splitting them rests entirely on the claim that
+// every ErrRecordingUnavailable is raised before its matching store write. That
+// was established by reading all nine raise sites, which is exactly the kind of
+// claim this repository has found wrong before, so it is asserted here instead.
+//
+// Each phase's recorder failure must leave the stored record byte-identical.
+// The one exception is deliberate and checked: the post-effect recorder failure
+// in applyExecutionResult joins ErrExecutionAmbiguous as well, because there the
+// effect may genuinely have happened — and fleetDispatchError's marked arm is
+// ordered first precisely so that error is marked.
+func TestARecorderFailureLeavesTheRecordUnchanged(t *testing.T) {
+	// setup performs whatever legitimate transitions the phase needs and
+	// returns the state act will work from. The snapshot is taken between the
+	// two: taking it before setup made two sub-cases fail on their own
+	// successful claim, which is a fixture error and not a product one.
+	for _, probe := range []struct {
+		phase string
+		// ambiguous is true where the failure is genuinely post-effect, so the
+		// error must also carry ErrExecutionAmbiguous and the record may move.
+		ambiguous bool
+		setup     func(t *testing.T, f *executorClaimFixture) (context.Context, ActionRecord)
+		act       func(t *testing.T, f *executorClaimFixture, who context.Context, from ActionRecord) error
+	}{
+		{
+			phase: "claim_admission",
+			setup: func(t *testing.T, f *executorClaimFixture) (context.Context, ActionRecord) {
+				return f.namedWorker(t, "worker", auth.OperationExecute), f.queued
+			},
+			act: func(_ *testing.T, f *executorClaimFixture, who context.Context, from ActionRecord) error {
+				_, err := f.service.Claim(who, ClaimRequest{
+					ID: f.queued.ID, ExpectedVersion: from.Version,
+					ClaimID: []byte("worker-claim"), Lease: time.Minute,
+					Context: dispatchContext(f.now, "worker-request"),
+				})
+				return err
+			},
+		},
+		{
+			phase: "cancel_admission",
+			setup: func(_ *testing.T, f *executorClaimFixture) (context.Context, ActionRecord) {
+				return f.enqueuer, f.queued
+			},
+			act: func(_ *testing.T, f *executorClaimFixture, who context.Context, from ActionRecord) error {
+				_, err := f.service.Cancel(who, CancelRequest{
+					ID: f.queued.ID, ExpectedVersion: from.Version,
+					MutationKey: []byte("cancel-key"),
+					Context:     dispatchContext(f.now, "request"),
+				})
+				return err
+			},
+		},
+		{
+			phase: "claim_extension",
+			setup: func(t *testing.T, f *executorClaimFixture) (context.Context, ActionRecord) {
+				worker := f.namedWorker(t, "worker", auth.OperationExecute)
+				claimed, err := f.service.Claim(worker, ClaimRequest{
+					ID: f.queued.ID, ExpectedVersion: f.queued.Version,
+					ClaimID: []byte("worker-claim"), Lease: time.Minute,
+					Context: dispatchContext(f.now, "worker-request"),
+				})
+				if err != nil {
+					t.Fatalf("the claim this phase needs was refused: %v", err)
+				}
+				return worker, claimed
+			},
+			act: func(_ *testing.T, f *executorClaimFixture, who context.Context, from ActionRecord) error {
+				_, err := f.service.ExtendClaim(who, ExtendRequest{
+					ID: f.queued.ID, ExpectedVersion: from.Version,
+					ClaimID: []byte("worker-claim"), Lease: 2 * time.Minute,
+					Context: dispatchContext(f.now, "worker-request"),
+				})
+				return err
+			},
+		},
+		{
+			phase: "ambiguity_report",
+			setup: func(t *testing.T, f *executorClaimFixture) (context.Context, ActionRecord) {
+				worker, _, claimed := f.lapsedClaimant(t, "worker")
+				return worker, claimed
+			},
+			act: func(_ *testing.T, f *executorClaimFixture, who context.Context, from ActionRecord) error {
+				_, err := f.service.ReportAmbiguity(who, AmbiguityRequest{
+					ID: f.queued.ID, ClaimFence: from.ClaimFence,
+					Outcome: AmbiguityOutcomeUnknown,
+					Context: dispatchContext(f.now, "worker-request"),
+				})
+				return err
+			},
+		},
+		{
+			phase:     "effect_outcome",
+			ambiguous: true,
+			setup: func(t *testing.T, f *executorClaimFixture) (context.Context, ActionRecord) {
+				worker := f.namedWorker(t, "worker", auth.OperationExecute)
+				claimed, err := f.service.Claim(worker, ClaimRequest{
+					ID: f.queued.ID, ExpectedVersion: f.queued.Version,
+					ClaimID: []byte("worker-claim"), Lease: time.Minute,
+					Context: dispatchContext(f.now, "worker-request"),
+				})
+				if err != nil {
+					t.Fatalf("the claim this phase needs was refused: %v", err)
+				}
+				return worker, claimed
+			},
+			act: func(_ *testing.T, f *executorClaimFixture, who context.Context, from ActionRecord) error {
+				_, err := f.service.CompleteClaim(who, CompletionRequest{
+					ID: f.queued.ID, ExpectedVersion: from.Version,
+					ClaimFence: from.ClaimFence, ClaimID: []byte("worker-claim"),
+					Result:  ExecutionResult{Output: json.RawMessage(`{"ok":true}`)},
+					Context: dispatchContext(f.now, "worker-request"),
+				})
+				return err
+			},
+		},
+	} {
+		t.Run(probe.phase, func(t *testing.T) {
+			fixture := newExecutorClaimFixture(t)
+			who, from := probe.setup(t, fixture)
+			// After setup, so the snapshot is the state act works from, and
+			// before failPhase, so setup's own audits are not the thing
+			// refused.
+			before := cloneActionRecord(
+				fixture.dispatchStore.records[string(fixture.queued.ID)])
+			fixture.recorder.failPhase = probe.phase
+
+			err := probe.act(t, fixture, who, from)
+			if err == nil {
+				t.Fatal("the recorder failure was not reported at all, so a " +
+					"transition committed with no privileged audit entry")
+			}
+			if !errors.Is(err, ErrRecordingUnavailable) {
+				t.Fatalf("the failure does not carry ErrRecordingUnavailable, "+
+					"so the transport cannot classify it: %v", err)
+			}
+			if got := errors.Is(err, ErrExecutionAmbiguous); got != probe.ambiguous {
+				t.Fatalf("ErrExecutionAmbiguous = %v, want %v: the transport "+
+					"marks a 503 indeterminate on exactly this sentinel, so "+
+					"getting it wrong either hides a possible effect or "+
+					"invents one", got, probe.ambiguous)
+			}
+
+			after := fixture.dispatchStore.records[string(fixture.queued.ID)]
+			if probe.ambiguous {
+				// Nothing is asserted about the record here beyond its
+				// continued existence: the point of the ambiguous case is that
+				// the service cannot promise what happened.
+				if len(after.ID) == 0 {
+					t.Fatal("the record vanished")
+				}
+				return
+			}
+			if after.Version != before.Version ||
+				after.State != before.State ||
+				after.ClaimFence != before.ClaimFence ||
+				!bytes.Equal(after.ClaimID, before.ClaimID) ||
+				len(after.AmbiguityReports) != len(before.AmbiguityReports) ||
+				!after.ClaimLeaseUntil.Equal(before.ClaimLeaseUntil) {
+				t.Fatalf("the recorder failed and the record moved anyway "+
+					"(version %d→%d, state %s→%s, fence %d→%d): this 503 is "+
+					"answered unmarked, so a caller is told to retry "+
+					"something that already committed",
+					before.Version, after.Version, before.State, after.State,
+					before.ClaimFence, after.ClaimFence)
+			}
+		})
+	}
+}

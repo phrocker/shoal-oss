@@ -640,6 +640,18 @@ func (s *AdmissionService) deny(
 ) (AdmissionGrant, error) {
 	record := base
 	record.State = DispatchCanceled
+	// Invoke, because that is what AdmissionService.Request authorized and
+	// what commit audits below — and because the publisher reads this field to
+	// decide which operation authorizes the action.canceled publication.
+	//
+	// Left unset, it was empty (nothing sets it at enqueue) while the
+	// publisher hardcoded dispatch for action.canceled. The record's
+	// AuthorizedOperations is [invoke], so the provenance check failed, the
+	// publication failed, and every denial was answered ErrActionCommitted —
+	// a 503 "requires reconciliation" for a refusal that had committed and
+	// granted nothing. The retry then answered "denied", which is why it went
+	// unnoticed: the second attempt looks correct.
+	record.TransitionOperation = auth.OperationInvoke
 	record.CancelKey = executorKey(
 		base.ID, []byte("shoal.fleet.admission-denied.v1"))
 	// Cancellation provenance is written even though this record is born

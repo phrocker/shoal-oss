@@ -1149,7 +1149,18 @@ func TestLifecyclePublicationPermitsEnumeratesEveryKind(t *testing.T) {
 		{"action.enqueued", auth.OperationInvoke, true},
 		{"action.enqueued", auth.OperationExecute, false},
 		{"action.canceled", auth.OperationDispatch, true},
-		{"action.canceled", auth.OperationInvoke, false},
+		// Invoke, because two legitimate writers produce this kind under
+		// different operations: DispatchService.Cancel under dispatch,
+		// AdmissionService.deny under invoke. This row was pinned false,
+		// justified by a comment asserting "a cancellation is dispatch only.
+		// It is the enqueuer's lever, and no execute-holder can reach Cancel"
+		// — true of one writer and false of the kind, which is what made
+		// every admission denial commit and then report a publication
+		// failure as a 503.
+		{"action.canceled", auth.OperationInvoke, true},
+		// Still false. No execute-holder cancels: Cancel requires dispatch
+		// and refuses a live claim, and deny is reached only through the
+		// admission surface under invoke.
 		{"action.canceled", auth.OperationExecute, false},
 		{"action.claimed", auth.OperationInvoke, true},
 		{"action.claimed", auth.OperationExecute, true},
