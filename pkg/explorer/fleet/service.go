@@ -692,6 +692,17 @@ func registryMutationDigest(mutation Mutation) [sha256.Size]byte {
 			}
 			writeRegistryDigestField(digest, action.InputSchema)
 			writeRegistryDigestField(digest, action.OutputSchema)
+			// Appended only when set, for the reason Effects is: every
+			// mutation digest written before the field existed must hash
+			// identically, or a heartbeat or revoke retry that spans the
+			// upgrade reads as a divergent mutation. A set flag still
+			// changes the digest, so a replay cannot quietly add or drop
+			// it under the same mutation identity. The tag keeps the
+			// appended field from being read as a schema.
+			if action.RequiresApproval {
+				writeRegistryDigestField(
+					digest, []byte("shoal.fleet.requires-approval.v1"))
+			}
 		}
 	}
 	writeRegistryDigestInt64(digest, descriptor.LeaseExpiresAt.UnixNano())
@@ -838,7 +849,15 @@ func capabilitiesSubset(child, parent []Capability) bool {
 				if wantedAction.Name == allowedAction.Name &&
 					bytes.Equal(wantedAction.InputSchema, allowedAction.InputSchema) &&
 					bytes.Equal(wantedAction.OutputSchema, allowedAction.OutputSchema) &&
-					!wantedAction.Effects.exceeds(allowedAction.Effects) {
+					!wantedAction.Effects.exceeds(allowedAction.Effects) &&
+					// Approval narrows in one direction only. A child or a
+					// later generation may add it; neither may drop it,
+					// because dropping it is exactly the widening this
+					// predicate exists to refuse — and a delegate that could
+					// shed its parent's approval would be the cheapest way
+					// round the control.
+					(wantedAction.RequiresApproval ||
+						!allowedAction.RequiresApproval) {
 					found = true
 					break
 				}

@@ -163,6 +163,9 @@ delegation, `auth.Decision`, #419 source authority and #403 outcome receipts.
 Three parts do not, and are adopted:
 
 - **Approval as an admission outcome.** ATPL's `on_marginal: require_ztat`.
+  Slice 1 is in `docs/approval.md`: a registered action can require approval,
+  and a held request becomes work only once an independent approver has
+  approved it.
   Admission today refuses, allows, or allows with obligations, and the only
   obligation is `Withhold` (`pkg/explorer/fleet/admission.go`). A held
   admission, granted by an approver in a role distinct from the requester,

@@ -208,6 +208,13 @@ var oidcFleetOperations = []auth.Operation{
 	// The consequence, stated plainly: #437's capability is real in the
 	// authorization model and not reachable by an OIDC-minted token yet. A
 	// claim mapping is a prerequisite for using it, not a refinement of it.
+	//
+	// OperationActionApprove is absent for a related reason (#451). This list
+	// also grants dispatch and invoke, and the approval service refuses any
+	// approver holding either on the scope, so approve here would be dead
+	// weight; on the reader or contributor list it would mint an approver of
+	// every mapped token. Approval needs a role mapping of its own, and
+	// oidc_approve_grant_test.go asserts its absence from every list.
 	auth.OperationSubscriptionCreate,
 	auth.OperationSubscriptionDelete,
 	auth.OperationSubscriptionDeliver,

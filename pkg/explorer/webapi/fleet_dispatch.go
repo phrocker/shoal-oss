@@ -261,6 +261,21 @@ func fleetDispatchError(err error) error {
 	switch {
 	case err == nil:
 		return nil
+	// Before the generic conflict arm, and explicit even though the service
+	// already returns it as a conflict: writeError starts from 500, so a bare
+	// sentinel from any provider would otherwise surface as an internal error.
+	// Conflict is deliberate — the caller is authorized and the request is
+	// well formed, but the action's registration requires the approval route
+	// (see fleet.approvalRequired). Not unauthorized: the work may well
+	// happen, pending somebody else's decision.
+	case errors.Is(err, fleet.ErrApprovalRequired):
+		if shoal.IsErrorCode(err, shoal.ErrorConflict) {
+			return err
+		}
+		return shoal.WrapError(
+			shoal.ErrorConflict,
+			"action requires approval; request it through the approval route",
+			err)
 	case errors.Is(err, fleet.ErrActionNotFound):
 		return shoal.WrapError(shoal.ErrorNotFound, "fleet action not found", err)
 	case errors.Is(err, fleet.ErrActionConflict), errors.Is(err, fleet.ErrClaimLost), errors.Is(err, fleet.ErrActionTerminal):

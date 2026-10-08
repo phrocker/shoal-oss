@@ -87,6 +87,11 @@ var workspaceOperations = []auth.Operation{
 	// would add is access to those routes — the ones that answer without
 	// comparing the caller to the record — for no capability gain. See
 	// oidc_execute_grant_test.go, which asserts the absence here too.
+	//
+	// And no OperationActionApprove (#451): one fixed identity is both every
+	// requester and every would-be approver, which is the self-approval the
+	// approval service exists to refuse. oidc_approve_grant_test.go asserts
+	// the absence.
 	auth.OperationSubscriptionCreate,
 	auth.OperationSubscriptionDelete,
 	auth.OperationSubscriptionDeliver,

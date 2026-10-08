@@ -394,6 +394,21 @@ func (s *AdmissionService) Request(
 	if readErr == nil {
 		return s.replay(request, disclosures, current, base, now)
 	}
+	// An action that requires approval cannot be served here (#451), and the
+	// answer is a durable denial like any other: no reason, so a caller cannot
+	// tell this control from the effect ceiling or anything else that refuses.
+	// Holding the call instead is not available on this path — the caller
+	// already holds the payload and is waiting on the answer, and a grant
+	// issued after a human decided would be a grant for a call whose moment
+	// has passed. Approval-required work goes through the approval route,
+	// where nothing is performed until an approver has decided.
+	//
+	// After the replay branch, so an admission granted or denied before the
+	// flag was registered keeps answering from its record, exactly as a queued
+	// dispatch record does.
+	if action.RequiresApproval {
+		return s.deny(ctx, base, decision)
+	}
 	// The declaration is checked against what the descriptor permits, resolved
 	// under this decision. The ceiling the executor was bound to is already
 	// enforced inside resolveActionBinding, so an action can neither declare

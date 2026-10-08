@@ -51,6 +51,17 @@ const (
 	codecVersion        uint16 = 3
 	codecVersionEffect  uint16 = 2
 	codecVersionEffects uint16 = 3
+	// codecVersionApproval adds one byte per action after its effects: whether
+	// the action requires approval (#451).
+	//
+	// It is written only for a descriptor in which some action requires
+	// approval. Every other descriptor is still written as version 3, byte for
+	// byte what an earlier build wrote, so rolling back reads it unchanged. A
+	// descriptor that does require approval is written as version 4, which an
+	// earlier build refuses to decode — and that refusal is the point: an
+	// earlier build would otherwise read the action, drop the flag it does not
+	// know, and serve approval-required work through enqueue.
+	codecVersionApproval uint16 = 4
 	// maxEncodedEffects bounds the decoded set. The taxonomy has three classes,
 	// so anything larger is a malformed or hostile record rather than a
 	// declaration, and it must not be able to allocate freely.
@@ -376,7 +387,11 @@ func encodeDescriptor(
 	registrationDigest [sha256.Size]byte,
 ) ([]byte, error) {
 	var buffer bytes.Buffer
-	writeU16(&buffer, codecVersion)
+	version := codecVersion
+	if descriptorRequiresApproval(descriptor) {
+		version = codecVersionApproval
+	}
+	writeU16(&buffer, version)
 	writeString(&buffer, string(descriptor.ID))
 	writeI64(&buffer, descriptor.Generation)
 	writeString(&buffer, string(descriptor.Subject))
@@ -398,6 +413,13 @@ func encodeDescriptor(
 			writeU32(&buffer, uint32(len(action.Effects)))
 			for _, effect := range action.Effects {
 				writeString(&buffer, string(effect))
+			}
+			if version >= codecVersionApproval {
+				flag := byte(0)
+				if action.RequiresApproval {
+					flag = 1
+				}
+				buffer.WriteByte(flag)
 			}
 			writeBytes(&buffer, action.InputSchema)
 			writeBytes(&buffer, action.OutputSchema)
@@ -424,7 +446,7 @@ func decodeDescriptor(value []byte) (
 	// written by an older build must keep decoding, and each version's effect
 	// encoding is handled explicitly below.
 	if err != nil || (version != 1 && version != codecVersionEffect &&
-		version != codecVersion) {
+		version != codecVersion && version != codecVersionApproval) {
 		return fleet.Descriptor{}, [sha256.Size]byte{},
 			errors.New("unknown descriptor encoding")
 	}
@@ -526,6 +548,20 @@ func decodeDescriptor(value []byte) (
 					action.Effects = fleet.Effects{fleet.Effect(effect)}
 				}
 			}
+			if version >= codecVersionApproval {
+				flag, flagErr := reader.ReadByte()
+				if flagErr != nil {
+					return fleet.Descriptor{}, [sha256.Size]byte{}, flagErr
+				}
+				// Exactly zero or one. Any other byte is a corrupt record,
+				// and reading it as "true" or "false" would be choosing
+				// which way to fail.
+				if flag > 1 {
+					return fleet.Descriptor{}, [sha256.Size]byte{},
+						errors.New("invalid action approval flag")
+				}
+				action.RequiresApproval = flag == 1
+			}
 			if action.InputSchema, err = readBytes(reader, fleet.MaxSchemaBytes); err != nil {
 				return fleet.Descriptor{}, [sha256.Size]byte{}, err
 			}
@@ -613,4 +649,17 @@ func equivalentReplay(existing, wanted fleet.Descriptor) bool {
 	existingValue, existingErr := encodeDescriptor(existing, [sha256.Size]byte{})
 	wantedValue, wantedErr := encodeDescriptor(wanted, [sha256.Size]byte{})
 	return existingErr == nil && wantedErr == nil && bytes.Equal(existingValue, wantedValue)
+}
+
+// descriptorRequiresApproval reports whether any action needs the approval
+// encoding.
+func descriptorRequiresApproval(descriptor fleet.Descriptor) bool {
+	for _, capability := range descriptor.Capabilities {
+		for _, action := range capability.Actions {
+			if action.RequiresApproval {
+				return true
+			}
+		}
+	}
+	return false
 }

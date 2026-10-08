@@ -81,7 +81,21 @@ const (
 	// principals without making every invoker an executor. An agent that may
 	// ask a gateway to post a message does not thereby gain the ability to
 	// claim another agent's queued work and read its input.
-	OperationExecute                Operation = "execute"
+	OperationExecute Operation = "execute"
+	// OperationActionApprove is permission to decide a held request for an
+	// action whose registration requires human approval (#451).
+	//
+	// It is a decision about somebody else's request and nothing more. It
+	// grants no ability to enqueue, invoke, claim or execute the work: an
+	// approved request still runs only through the requester's own record and
+	// the claim fence, so an approval is a record (a ZTAT), not a grant.
+	//
+	// Holding it is necessary and not sufficient. The approval service also
+	// requires the approver to fail the operations that create or perform the
+	// work on the same scope, and to share no identity with the requester or
+	// the agent — because under shared scopes, holding approve alone separates
+	// nothing.
+	OperationActionApprove          Operation = "action_approve"
 	OperationDispatch               Operation = "dispatch"
 	OperationDelegate               Operation = "delegate"
 	OperationAgentRegister          Operation = "agent_register"
@@ -113,7 +127,8 @@ func (o Operation) Validate() error {
 	case OperationIngest, OperationList, OperationRead, OperationConnect,
 		OperationGraphMaterialize,
 		OperationNeighborhood, OperationRetrieve, OperationValidate,
-		OperationInvoke, OperationExecute, OperationDispatch, OperationDelegate,
+		OperationInvoke, OperationExecute, OperationActionApprove,
+		OperationDispatch, OperationDelegate,
 		OperationAgentRegister, OperationAgentHeartbeat, OperationAgentRevoke,
 		OperationAgentResolve, OperationSubscriptionCreate,
 		OperationSubscriptionDelete, OperationSubscriptionDeliver,
@@ -143,7 +158,12 @@ const (
 	// finish queued work and do nothing else. Deliberately not granted by
 	// ServiceRoleActionInvocation, so a principal that may enqueue cannot
 	// thereby claim.
-	ServiceRoleActionExecution        ServiceRole = "action_execution"
+	ServiceRoleActionExecution ServiceRole = "action_execution"
+	// ServiceRoleActionApproval is the role an approver holds: it may decide
+	// held requests and do nothing else. It deliberately grants none of
+	// invoke, dispatch or execute, because an approver that can also create or
+	// perform the work it approves is not a second role.
+	ServiceRoleActionApproval         ServiceRole = "action_approval"
 	ServiceRoleActionDispatch         ServiceRole = "action_dispatch"
 	ServiceRoleDelegation             ServiceRole = "delegation"
 	ServiceRoleAgentRegistration      ServiceRole = "agent_registration"
@@ -163,7 +183,7 @@ func (r ServiceRole) Validate() error {
 	case ServiceRoleDataRead, ServiceRoleDataWrite, ServiceRoleCoordination,
 		ServiceRoleDerivation, ServiceRoleMigration, ServiceRoleSecurityAdmin,
 		ServiceRoleActionInvocation, ServiceRoleActionExecution,
-		ServiceRoleActionDispatch,
+		ServiceRoleActionApproval, ServiceRoleActionDispatch,
 		ServiceRoleDelegation, ServiceRoleAgentRegistration,
 		ServiceRoleAgentRevocation, ServiceRoleAgentResolution,
 		ServiceRoleSubscription, ServiceRoleEventPublication,
@@ -201,6 +221,9 @@ func (r ServiceRole) Allows(operation Operation) bool {
 		return operation == OperationInvoke || operation == OperationValidate
 	case ServiceRoleActionExecution:
 		return operation == OperationExecute || operation == OperationValidate
+	case ServiceRoleActionApproval:
+		return operation == OperationActionApprove ||
+			operation == OperationValidate
 	case ServiceRoleActionDispatch:
 		return operation == OperationDispatch || operation == OperationValidate
 	case ServiceRoleDelegation:

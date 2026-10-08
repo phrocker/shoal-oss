@@ -27,6 +27,7 @@ import (
 	"errors"
 	"hash"
 	"reflect"
+	"strings"
 	"time"
 
 	"github.com/phrocker/shoal-oss/internal/explorerfleetcap"
@@ -288,7 +289,7 @@ func (s *Service) PublishLifecycle(
 	return s.publish(ctx, operation, request, false, &receipt)
 }
 
-// isReservedLifecycleKind reports whether a kind is one of the five the public
+// isReservedLifecycleKind reports whether a kind is one the public
 // Publish route refuses outright. Reserved and permitted are two questions:
 // this one is about who may publish at all, the one below about which
 // operation authorizes a particular kind.
@@ -297,9 +298,15 @@ func isReservedLifecycleKind(kind string) bool {
 	case "action.enqueued", "action.canceled",
 		"action.claimed", "action.completed", "action.failed":
 		return true
-	default:
-		return false
 	}
+	// Every approval kind, including ones no build publishes yet (#451).
+	// Approval transitions publish nothing in this release — that needs the
+	// mixed-identity outbox fixed first (#480) — and reserving the namespace
+	// now is what stops a principal holding event_publish from forging
+	// "approval.approved" for a request nobody approved while the real events
+	// do not exist to contradict it. lifecyclePublicationPermits admits no
+	// operation for these kinds, so the reconciled path refuses them too.
+	return strings.HasPrefix(kind, "approval.")
 }
 
 // lifecyclePublicationPermits reports whether an operation may publish a

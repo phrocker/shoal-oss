@@ -215,6 +215,70 @@ type ActionRecord struct {
 	// record written before this field existed decodes with it absent, which is
 	// exactly the claim "produced by the superseded scheme".
 	AdmittedIdentityScheme uint32
+	// The approval this record was materialized under, when its action
+	// requires one (#451). All of these are zero on a record that was not
+	// approved, and all of them are set on one that was: Validate refuses a
+	// partial set.
+	//
+	// They are a record, not a grant. Nothing reads them to authorize a claim
+	// or an execution — the work still runs only through this record's own
+	// principal and the claim fence — so an approval written here cannot widen
+	// what anyone may do. What they make durable is which exact request was
+	// approved (the digest the approver reviewed, which covers every field
+	// equivalentEnqueue compares), under which policy generation, by whom and
+	// when.
+	ApprovalRequestDigest    []byte
+	ApprovalPolicyGeneration int64
+	ApproverSubject          shoal.ID
+	ApproverActor            shoal.ID
+	ApproverClientID         shoal.ID
+	ApprovedAt               time.Time
+}
+
+// validateApprovalProvenance checks that an approval on a record is complete
+// or entirely absent.
+func validateApprovalProvenance(record ActionRecord) error {
+	if len(record.ApprovalRequestDigest) == 0 {
+		if record.ApprovalPolicyGeneration != 0 ||
+			record.ApproverSubject != "" || record.ApproverActor != "" ||
+			record.ApproverClientID != "" || !record.ApprovedAt.IsZero() {
+			return shoal.NewError(
+				shoal.ErrorInvalidArgument,
+				"action approval provenance is incomplete")
+		}
+		return nil
+	}
+	if len(record.ApprovalRequestDigest) != sha256.Size ||
+		record.ApprovalPolicyGeneration <= 0 ||
+		record.ApprovalPolicyGeneration != record.PolicyGeneration ||
+		record.ApprovedAt.IsZero() ||
+		record.ApprovedAt.Location() != time.UTC {
+		return shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			"action approval provenance is incomplete")
+	}
+	if err := shoal.ValidateRequiredID(
+		"action approver", record.ApproverSubject); err != nil {
+		return err
+	}
+	if err := shoal.ValidateRequiredID(
+		"action approver actor", record.ApproverActor); err != nil {
+		return err
+	}
+	if err := shoal.ValidateOptionalID(
+		"action approver client", record.ApproverClientID); err != nil {
+		return err
+	}
+	// An approval is a held request becoming work, never an admission: the
+	// admission seam denies an approval-required action rather than holding
+	// it, so a record carrying both markers was assembled by something that
+	// skipped one of those paths.
+	if record.isAdmission() {
+		return shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			"an admission cannot carry an approval")
+	}
+	return nil
 }
 
 // AdmittedIdentitySchemeDerived marks an admission whose durable key is derived
@@ -773,6 +837,9 @@ func (r ActionRecord) Validate() error {
 	if err := validateAdmittedDeclaration(r); err != nil {
 		return err
 	}
+	if err := validateApprovalProvenance(r); err != nil {
+		return err
+	}
 	return validateEvidence(r.Evidence)
 }
 
@@ -1074,6 +1141,8 @@ func cloneActionRecord(input ActionRecord) ActionRecord {
 	// AdmittedIdentityScheme needs no line: the struct assignment above copies
 	// a scalar, and unlike the slices there is no backing array to share. An
 	// explicit copy for it would be a line no mutation could observe.
+	result.ApprovalRequestDigest = append(
+		[]byte(nil), input.ApprovalRequestDigest...)
 	return result
 }
 

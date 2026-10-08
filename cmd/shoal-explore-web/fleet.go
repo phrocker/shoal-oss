@@ -28,6 +28,7 @@ import (
 
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/explorer/fleet"
+	"github.com/phrocker/shoal-oss/pkg/explorer/webapi"
 	"github.com/phrocker/shoal-oss/pkg/interaction"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
@@ -434,6 +435,101 @@ func (r *boundAdmission) Outstanding(
 	}
 	request.Context = bound
 	return r.service.Outstanding(ctx, request)
+}
+
+// boundApproval binds the approval surface to the authenticated request as the
+// dispatch and admission surfaces are bound: request and correlation identity
+// come from the resolved decision, never from the body.
+//
+// It also refuses a decision made under workspace settings. A workspace
+// narrowing can only remove authority, and that is exactly the problem here:
+// the approval service requires an approver to *fail* dispatch, invoke and
+// execute on the scope, so an approver holding dispatch could narrow its own
+// decision through a workspace it owns, shed the dispatch, and pass the check.
+// Separation has to be judged on the authority the principal actually holds,
+// so a decision is only accepted outside any workspace narrowing.
+type boundApproval struct {
+	service  *fleet.ApprovalService
+	resolver auth.Resolver
+}
+
+func newBoundApproval(
+	service *fleet.ApprovalService,
+	resolver auth.Resolver,
+) (*boundApproval, error) {
+	if service == nil || isNilFleetDependency(resolver) {
+		return nil, shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			"bound approval dependencies are required",
+		)
+	}
+	return &boundApproval{service: service, resolver: resolver}, nil
+}
+
+func (r *boundApproval) requestContext(
+	ctx context.Context,
+	request fleet.RequestContext,
+) (fleet.RequestContext, error) {
+	decision, err := r.resolver.Resolve(ctx)
+	if err != nil {
+		return fleet.RequestContext{}, err
+	}
+	request.RequestID = decision.RequestID()
+	request.CorrelationID = decision.CorrelationID()
+	return request, nil
+}
+
+func (r *boundApproval) Request(
+	ctx context.Context,
+	request fleet.EnqueueRequest,
+) (fleet.ApprovalReceipt, error) {
+	bound, err := r.requestContext(ctx, request.Context)
+	if err != nil {
+		return fleet.ApprovalReceipt{}, err
+	}
+	request.Context = bound
+	return r.service.Request(ctx, request)
+}
+
+func (r *boundApproval) Decide(
+	ctx context.Context,
+	request fleet.ApprovalDecisionRequest,
+) (fleet.ApprovalRecord, error) {
+	if _, narrowed := webapi.EffectiveWorkspaceSettings(ctx); narrowed {
+		return fleet.ApprovalRecord{}, shoal.NewError(
+			shoal.ErrorUnauthorized,
+			"an approval cannot be decided under workspace settings")
+	}
+	bound, err := r.requestContext(ctx, request.Context)
+	if err != nil {
+		return fleet.ApprovalRecord{}, err
+	}
+	request.Context = bound
+	return r.service.Decide(ctx, request)
+}
+
+func (r *boundApproval) Pending(
+	ctx context.Context,
+	request fleet.PendingApprovalsRequest,
+) (fleet.PendingApprovalsPage, error) {
+	bound, err := r.requestContext(ctx, request.Context)
+	if err != nil {
+		return fleet.PendingApprovalsPage{}, err
+	}
+	request.Context = bound
+	return r.service.Pending(ctx, request)
+}
+
+func (r *boundApproval) Status(
+	ctx context.Context,
+	request fleet.ApprovalStatusRequest,
+) (fleet.ApprovalRecord, error) {
+	bound, err := r.requestContext(ctx, request.Context)
+	if err != nil {
+		return fleet.ApprovalRecord{}, err
+	}
+	request.Context = bound
+	return r.service.Status(ctx, request)
 }
 
 // externalFleetEffectBindings is the operator's per-reference opt-in to the

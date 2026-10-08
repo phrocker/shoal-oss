@@ -700,6 +700,9 @@ func isFleetAuthorization(value string) bool {
 		// Omitting it classified every such audit as a user interaction, which
 		// surfaced it in the activity feed beside its own fleet_action entry.
 		auth.OperationExecute,
+		// Deciding a held request is fleet activity: its audit is the
+		// approval transition, not a user interaction with the corpus.
+		auth.OperationActionApprove,
 		auth.OperationAgentRegister, auth.OperationAgentHeartbeat,
 		auth.OperationAgentRevoke, auth.OperationAgentResolve,
 		auth.OperationEventPublish:
