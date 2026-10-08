@@ -251,6 +251,16 @@ func TestProfileCollectorModeCannotBeLaundered(t *testing.T) {
 	if f.Sources[0].Mode != collector.Imported {
 		t.Fatal("mode lost")
 	}
+	m[0].Registration.Mode = collector.ServerObserved
+	observed, observedFrozen, err := buildRecord(context.Background(), d, p, s, m, now, "correlation")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if observed.Bundle.Request.ID() == r.Bundle.Request.ID() || observed.Bundle.Request.Picture().ID() == r.Bundle.Request.Picture().ID() || observedFrozen.Sources[0].Mode != collector.ServerObserved {
+		t.Fatal("mode absent from immutable identities")
+	}
+	m[0].Registration.Mode = collector.Imported
+
 	if e = validateRecord(context.Background(), p, f, r, m); e != nil {
 		t.Fatal(e)
 	}
