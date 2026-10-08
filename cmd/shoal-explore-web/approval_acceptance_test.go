@@ -854,7 +854,15 @@ func TestApprovalIsPerActionAndSurvivesRegistration(t *testing.T) {
 		t.Fatalf("enqueue before the flag: %v", err)
 	}
 	// Registering the flag is a new generation, and the old-generation record
-	// stops resolving for Pull and Claim with no change to either.
+	// stops being offered by Pull and stops being claimable.
+	//
+	// It used to stop *resolving*, because resolveActionBinding pinned the
+	// descriptor generation — which also meant a heartbeat stranded every
+	// in-flight action on the agent (#486). The pin is gone from the
+	// post-enqueue paths and the requirement is checked directly instead, so
+	// the record is refused on the approval requirement rather than on a
+	// generation number. Same outcome for this test's purpose, a different
+	// and more accurate reason, and a heartbeat no longer causes it.
 	descriptor, err := h.register("relay", "relay-approval", 1, true, "")
 	if err != nil || descriptor.Generation != 2 {
 		t.Fatalf("registering the flag = %+v, %v", descriptor, err)
@@ -873,8 +881,9 @@ func TestApprovalIsPerActionAndSurvivesRegistration(t *testing.T) {
 	if _, err := h.opened.fleetDispatch.Claim(h.as(requester), fleet.ClaimRequest{
 		ID: early.id, ExpectedVersion: 1, ClaimID: []byte("late-claim"),
 		Lease: time.Minute, Context: h.context(h.now().Add(time.Minute)),
-	}); !shoal.IsErrorCode(err, shoal.ErrorNotFound) {
-		t.Fatalf("claim of old-generation work = %v, want not found", err)
+	}); !errors.Is(err, fleet.ErrApprovalRequired) {
+		t.Fatalf("claim of old-generation work = %v, want approval required",
+			err)
 	}
 	// New work at the new generation is refused.
 	fresh := earlyRequest

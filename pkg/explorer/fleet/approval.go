@@ -1297,6 +1297,12 @@ func (s *ApprovalService) eligibility(
 		ctx, decision, request.AgentID, request.AgentGeneration,
 		request.Capability, request.Action, request.SourceID, request.PolicyID,
 		request.ObjectID, auth.OperationActionApprove, now,
+		// Unpinned. The request was made earlier and the approver is deciding
+		// now, so the descriptor will have moved for every agent that
+		// heartbeats — which would make an approval undecidable for exactly
+		// the long-lived agents approvals exist for. See
+		// resolveActionBinding.
+		false,
 	)
 	if err != nil {
 		if shoal.IsErrorCode(err, shoal.ErrorUnauthorized) ||
