@@ -110,6 +110,19 @@ func TestApproverTokenMintsApproveAndNothingElse(t *testing.T) {
 		t.Fatalf("approver operations = %v, want [action_approve]", got)
 	}
 	identity := shoal.ID("oidc:" + issuer.server.URL + "#bob")
+	// A correlation ID, because the approver branch mints its own decision and
+	// an approver's decide route is one of the routes that refuses a request
+	// without one (#524). The workspace branch is covered separately, so
+	// without this the newer of the two paths would be the uncovered one.
+	if !strings.HasPrefix(
+		string(decision.CorrelationID()), "oidc-correlation-") {
+		t.Fatalf("approver correlation ID = %q, so the decide route refuses "+
+			"this approver", decision.CorrelationID())
+	}
+	if decision.CorrelationID() == decision.RequestID() {
+		t.Fatal("the approver's request and correlation identities are one " +
+			"value, so the correlation threads nothing")
+	}
 	if decision.Subject() != identity || decision.Actor() != identity {
 		t.Fatalf("approver subject/actor = %q/%q, want %q for both",
 			decision.Subject(), decision.Actor(), identity)
