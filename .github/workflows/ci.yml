@@ -44,6 +44,9 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --yes bison flex
+          # Build outside the checkout: the tarball holds Go modules that are
+          # not part of this repository. Later steps use only $THRIFT.
+          cd "$RUNNER_TEMP"
           curl --fail --location --silent --show-error \
             https://archive.apache.org/dist/thrift/0.17.0/thrift-0.17.0.tar.gz \
             --output thrift-0.17.0.tar.gz
@@ -139,6 +142,34 @@ jobs:
 
       - name: Test (race)
         run: go test -race -count=1 ${{ steps.pkgs.outputs.list }}
+
+      # Protocol adapters (SSH, RDP, Guacamole) live in extensions/ with their
+      # own go.mod. Fail if any of them is linked into a core package. go list
+      # runs on its own so a listing failure fails the step instead of being
+      # mistaken for "nothing leaked".
+      - name: Core links no SSH, RDP or Guacamole package
+        run: |
+          set -euo pipefail
+          deps="$RUNNER_TEMP/core-deps.txt"
+          go list -deps ${{ steps.pkgs.outputs.list }} > "$deps"
+          test -s "$deps"
+          if grep -iE 'golang\.org/x/crypto/ssh|guacamole|freerdp|grdp' "$deps"; then
+            echo "Core packages depend on protocol adapter code (listed above)."
+            exit 1
+          fi
+
+      # Extension modules are outside the root package set. Build each on its
+      # own go.mod (GOWORK stays off) so it cannot lean on the workspace. Find
+      # modules at any depth, matching internal/importboundary.
+      - name: Extensions (vet / test)
+        run: |
+          set -euo pipefail
+          find extensions -name go.mod -type f -print0 \
+            | while IFS= read -r -d '' mod; do
+                dir=$(dirname "$mod")
+                echo "== $dir"
+                (cd "$dir" && go vet ./... && go test -race -count=1 ./...)
+              done
 
   docker:
     name: docker image
