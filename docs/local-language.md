@@ -73,6 +73,62 @@ from the graph schema. Each relation type yields questions in both directions
 (for example a dependency edge yields "what depends on X" and "what does X depend
 on"). The set of answerable questions is therefore explicit and enumerable.
 
+### Router v1 (slice 1 of #500): shadow mode
+
+Built:
+
+- `pkg/router` is pure. It holds the proposal contract, the
+  `shoal.router.grammar/v1` grammars, the `router.pair/v1` features, the
+  aggregation, slot validation, the lexical baseline and the trainer.
+- `internal/routershadow` is the authorized composition and the recorder.
+- `narrate.Proposal` renders proposals.
+
+How it works:
+
+- The target choice is a registered Choice decision over opaque candidate
+  subjects. It is served by the unchanged `internal/decisionlinear`
+  provider. Its only evidence is the numeric feature artifact.
+- An action's input is canonicalized by `fleet.ValidateActionInput`, which
+  returns the exact bytes an enqueue stores.
+- A test fails if the router or the shadow service reaches `Enqueue`,
+  `Invoke`, `Evaluate` or `Register`. A deliberately violating fixture
+  proves that the check catches each way of reaching them.
+- An approval-required proposal handed to `Enqueue` is still held.
+- Records hold no text: only an HMAC of the normalized text, scoped to the
+  caller.
+
+The pre-registered evaluation is in
+[router-evaluation.md](router-evaluation.md). On held-out phrasings this
+first model is more conservative than the lexical baseline and less
+accurate. It proposed nothing wrong.
+
+**Disclosure.** Tests compose the real authorized client (memory and durable
+policy stores), fleet registry and auth decisions. They build two worlds:
+one with a hidden descriptor, action executor, decision profile, node and
+published ontology, and one where those do not exist. Alice's proposals,
+reasons, receipts (including the catalog digest) and errors are byte-equal
+in both. Residuals:
+
+- **Fleet list scans.** `fleet.Service.List` scans the registry store
+  entry by entry, so a hidden descriptor costs one store read and its
+  authorization check. Store traffic and time grow with hidden descriptors.
+  The pages returned and everything in the proposal do not.
+- **Timing.** The lexicon's per-candidate timing residual
+  ([lexicon.md](lexicon.md#disclosure-residuals)) and the published-ontology
+  catalog walk (which reads every proposal, visible or not) are inherited.
+- **Records.** The shadow record names the server-filtered lexicon bundle ID,
+  which changes with hidden nodes. Records are host-internal. The proposal
+  and its receipt never carry that ID.
+
+**Deferred:**
+
+- durable registration and receipts (waits on #418);
+- a durable shadow store;
+- margin or multi-class providers and the encoder (#501);
+- typo tolerance;
+- free-text slots;
+- an HTTP route.
+
 ## Vocabulary bundle: derived from the graph, portable with it
 
 Everything below is built on CPU from a graph snapshot and a document corpus. It

@@ -154,4 +154,119 @@ use cue words no grammar has ("cycle", "kick", "evacuate", "resize").
 
 ## Results
 
-Not yet run.
+The test split was run once, on the tree of the pre-registration commit
+`c9aa8bc3`, with no change to code, fixtures or model. The results were
+committed in the commit after it. The full report is
+`pkg/router/testdata/eval/v1/report-test.md`.
+
+| Metric (test, 103 cases: 74 answerable, 29 unanswerable) | router | baseline |
+|---|---|---|
+| Target precision on non-abstained | 9 of 9 | 32 of 32 |
+| **End-to-end accuracy** | **36 of 103** | **59 of 103** |
+| Coverage over answerable | 9 of 74 | 32 of 74 |
+| Abstention rate | 94 of 103 | 71 of 103 |
+| Correct abstention on unanswerable | 29 of 29 | 29 of 29 |
+| Slot exact-match over target-correct | 7 of 9 | 30 of 32 |
+| Abstention reason agreement (secondary) | 24 of 29 | 23 of 29 |
+
+**Paired comparison (end-to-end):**
+
+| | count |
+|---|---|
+| Both right | 32 |
+| Router right, baseline wrong | 4 |
+| Baseline right, router wrong | 27 |
+| Both wrong | 40 |
+
+The exact two-sided McNemar p-value is 3.4 × 10⁻⁵.
+
+**The primary outcome is negative. On held-out phrasings the router is worse
+than the lexical baseline: 36 of 103 against 59 of 103.** Both systems
+proposed nothing wrong:
+
+- every non-abstained proposal had the right target (9 of 9, and 32 of 32);
+- every unanswerable case abstained, for both.
+
+The router is simply far more conservative. It covered 9 of 74 answerable
+cases; the baseline covered 32 of 74.
+
+Per-kind confusion. Rows are the expected kind, columns the proposed kind.
+
+| expected | router: action | router: decision | router: lookup | router: abstain | baseline: action | baseline: decision | baseline: lookup | baseline: abstain |
+|---|---|---|---|---|---|---|---|---|
+| action | 7 | 0 | 0 | 29 | 16 | 0 | 0 | 20 |
+| decision | 0 | 2 | 0 | 14 | 0 | 6 | 0 | 10 |
+| lookup | 0 | 0 | 0 | 22 | 0 | 0 | 10 | 12 |
+| abstain | 0 | 0 | 0 | 29 | 0 | 0 | 0 | 29 |
+
+End-to-end correctness by tag:
+
+| Tag | router | baseline |
+|---|---|---|
+| plain | 4 of 69 | 28 of 69 |
+| injection | 2 of 2 | 0 of 2 |
+| hidden_target | 2 of 4 | 3 of 4 |
+| every other tag | all | all |
+
+The other tags are hidden_node, nonexistent_target, nonexistent_node,
+missing_slot, ambiguous_mention, ambiguous_executor, slot_mismatch and
+unanswerable. Each has three or fewer cases, except unanswerable, which has
+16.
+
+Two of the router's nine target-correct proposals have wrong slots. Both are
+"hard restart ...": "hard" is a test-only phrase for the force mode, so the
+mode slot stayed empty.
+
+### Latency
+
+Host: AMD Ryzen 9 7950X, Go 1.26.4, linux/amd64. Run with
+`go test -bench . -benchtime 2s`, once.
+
+| Benchmark | ns/op | B/op | allocs/op |
+|---|---|---|---|
+| `BenchmarkAnalyze`: tokenize, mentions, 18 grammars, features | 8,789 | 3,208 | 29 |
+| `BenchmarkRoute`: plus the decision and its records, aggregation, slots and the baseline | 401,746 | 447,454 | 4,210 |
+| `BenchmarkServiceRoute`: the whole shadow path, memory policy store | 1,267,579 | 1,591,885 | 17,327 |
+
+Matching and featurizing take about 9 µs. Most of the 0.4 ms routing cost
+comes from building and validating the decision contracts. That work hashes
+the task, picture, request and prediction identities on every routing. The
+authorized composition adds about 0.9 ms more:
+
+- fleet enumeration;
+- the padded mention batch of 2048 IDs;
+- the published-ontology check.
+
+### Why the router lost (exploratory, not pre-registered)
+
+The train split holds the phrasings the grammars were written from. So on
+train, a whole-text pattern match (`pattern_full`) almost always marks the
+right target. The perceptron learned to rely on it:
+
+- `pattern_full` and `pattern_cover` carry large positive weights;
+- the intercept is −4.66.
+
+A text with no matching pattern therefore needs high cue and vocabulary
+overlap to reach a zero margin, and held-out phrasings rarely get there.
+
+The baseline falls back to token-overlap recall, which handles phrasings
+like "wipe the cache of ledger". Two kinds of text are not reached by either
+system:
+
+- texts whose cue word no grammar has ("cycle", "kick", "evacuate",
+  "dependents", "deployed");
+- texts whose only cue is a mention ("payments dependencies").
+
+The router's two wins on injection come from the decision: the injected text
+was outside the pattern, and the router still chose the decision. The
+baseline's vocabulary recall fell below 0.5 on the extra words.
+
+What this suggests for later slices, none of it done here:
+
+- train on data where patterns do not cover the positives, such as
+  paraphrases held out of the grammars, or drop `pattern_full`;
+- calibrate the threshold, or use a margin provider (#501);
+- add cue synonyms through the encoder tier.
+
+These are ideas, not results. Any rerun needs a new pre-registration and a
+new test split.
