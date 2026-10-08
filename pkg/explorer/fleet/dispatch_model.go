@@ -377,20 +377,23 @@ func validateAmbiguityText(name, value string) error {
 // outside Shoal, which is why so much of it exists to be read rather than
 // acted on.
 type ActionRecord struct {
-	ID                             []byte
-	IdempotencyKey                 []byte
-	Version                        uint64
-	State                          DispatchState
-	AgentID                        shoal.ID
-	AgentGeneration                int64
-	Capability                     string
-	Action                         string
-	SourceID                       []byte
-	PolicyID                       []byte
-	ObjectID                       shoal.ID
-	Input                          json.RawMessage
-	Output                         json.RawMessage
-	ErrorCode                      string
+	ID              []byte
+	IdempotencyKey  []byte
+	Version         uint64
+	State           DispatchState
+	AgentID         shoal.ID
+	AgentGeneration int64
+	Capability      string
+	Action          string
+	SourceID        []byte
+	PolicyID        []byte
+	ObjectID        shoal.ID
+	Input           json.RawMessage
+	Output          json.RawMessage
+	ErrorCode       string
+	// ErrorCodeOrigin says whether the service or the executor decided
+	// ErrorCode. Empty on a record written before the field existed.
+	ErrorCodeOrigin                ErrorCodeOrigin
 	Subject                        shoal.ID
 	Actor                          shoal.ID
 	ClientID                       shoal.ID
@@ -1252,9 +1255,74 @@ func (r ActionRecord) Validate() error {
 	return validateEvidence(r.Evidence)
 }
 
+// ErrorCodeOrigin says who decided an action's error code.
+//
+// Without it the field was an unauthenticated string that the service and the
+// executor both wrote, through the same assignment, with nothing recording
+// which. A worker could report "invalid_executor_output" — the code the
+// *service* assigns when it rejects an executor's output — and produce a
+// record reading as though Shoal had refused the work when Shoal accepted the
+// report without objection. The sharpest case is "invalid_executor_error",
+// which the service assigns *because* it rejected the worker's own code.
+//
+// Derived from which code path wrote the field, never from the request, for
+// the reason AmbiguityReport.Subject is: provenance a caller can set is not
+// provenance.
+type ErrorCodeOrigin string
+
+const (
+	// ErrorCodeOriginUnknown is a record written before this field existed.
+	// Its code may have come from either, which is exactly what a reader
+	// needs to be told rather than left to assume.
+	ErrorCodeOriginUnknown ErrorCodeOrigin = ""
+	// ErrorCodeOriginService is an adjudication: the service examined what the
+	// executor returned and refused it.
+	ErrorCodeOriginService ErrorCodeOrigin = "service"
+	// ErrorCodeOriginExecutor is the executor's own account of why the work
+	// failed. Untrusted, in the sense that the service neither chose it nor
+	// can verify it — only that it is bounded and printable.
+	ErrorCodeOriginExecutor ErrorCodeOrigin = "executor"
+)
+
+// reservedActionErrorCodes are the codes the service assigns itself, which no
+// executor may report.
+//
+// Reserving them is not merely tidiness. Each one is a statement about what
+// *Shoal* did, so a worker reporting one is asserting an adjudication that
+// never happened — and an operator reconciling a failure reads these to decide
+// whether the platform or the target refused the work.
+var reservedActionErrorCodes = map[string]struct{}{
+	"invalid_executor_output":   {},
+	"invalid_executor_evidence": {},
+	"invalid_executor_error":    {},
+	"executor_error":            {},
+}
+
 func validateActionRecordError(value string) error {
 	if len(value) > MaxActionErrorBytes || strings.TrimSpace(value) != value {
 		return shoal.NewError(shoal.ErrorInvalidArgument, "action error code is invalid")
+	}
+	return nil
+}
+
+// validateReportedActionErrorCode is validateActionRecordError plus the
+// reservation, for a code that arrived from an executor rather than from this
+// process.
+//
+// Refused rather than recorded-and-flagged, because the two defences answer
+// different questions and both are wanted: the reservation stops a worker
+// claiming an adjudication it cannot make, and the origin field tells a reader
+// which of the two wrote any code at all — including the next code someone
+// adds without remembering to reserve it.
+func validateReportedActionErrorCode(value string) error {
+	if err := validateActionRecordError(value); err != nil {
+		return err
+	}
+	if _, reserved := reservedActionErrorCodes[value]; reserved {
+		return shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			"action error code "+value+" is assigned by the service and may "+
+				"not be reported by an executor")
 	}
 	return nil
 }
