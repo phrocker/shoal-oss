@@ -429,8 +429,8 @@ func (s *AdmissionService) Request(
 	// consulted only for a request that would otherwise be granted. A store
 	// failure answers unavailable and writes nothing — it is not a denial,
 	// because a denial is durable and an outage is not a decision.
-	attestation, err := dispatch.claimAttestation(
-		ctx, decision, action, executorRef, now)
+	attestation, err := dispatch.claimAttestation(ctx, decision,
+		effectiveClaimRequirements(base, action), executorRef, now)
 	if err != nil {
 		return AdmissionGrant{}, err
 	}
@@ -443,7 +443,7 @@ func (s *AdmissionService) Request(
 		// The existing durable denial, with no reason on the wire, exactly as
 		// approval and the effect ceiling refuse: a caller cannot tell this
 		// control from any other. The reason is audited for the operator.
-		dispatch.auditAttestationRefusal(ctx, base, auth.OperationInvoke)
+		dispatch.auditAttestationRefusal(ctx, base, auth.OperationInvoke, decision)
 		return s.deny(ctx, base, decision)
 	}
 	if err != nil {

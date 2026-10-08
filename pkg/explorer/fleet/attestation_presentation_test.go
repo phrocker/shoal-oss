@@ -79,6 +79,30 @@ func TestAttestationPresentation(t *testing.T) {
 		}
 	}
 
+	t.Run("requires a correlation ID, like every execute route", func(t *testing.T) {
+		service, presenter, _ := setup()
+		decision, err := auth.NewDecision(auth.DecisionConfig{
+			Subject: "alpha", Actor: "alpha-actor", ClientID: "alpha-client",
+			AuthorizationDomain: []byte("domain"), AllowedOperations: []auth.Operation{auth.OperationExecute},
+			PermittedSourceIDs: [][]byte{[]byte("source")}, PermittedPolicyIDs: [][]byte{[]byte("policy")},
+			PolicyGeneration: 1, AuthenticationExpires: now.Add(time.Hour), RequestID: "no-correlation",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if decision.CorrelationID() != "" {
+			t.Fatal("fixture minted a correlation ID")
+		}
+		_, err = service.Present(bindDecision(t, authority, decision), presentation)
+		if err == nil || errors.Is(err, ErrAttestationRefused) || len(presenter.verified) != 0 {
+			t.Fatalf("a decision without a correlation ID = %v", err)
+		}
+		// And the minting helper every other subtest uses does set one.
+		if dispatchDecisionFor(t, principal{subject: "a", actor: "b", request: "c"},
+			auth.OperationExecute).CorrelationID() == "" {
+			t.Fatal("dispatchDecisionFor mints no correlation ID")
+		}
+	})
 	t.Run("requires execute", func(t *testing.T) {
 		service, presenter, _ := setup()
 		_, err := service.Present(caller(nil, auth.OperationInvoke, auth.OperationDispatch), presentation)

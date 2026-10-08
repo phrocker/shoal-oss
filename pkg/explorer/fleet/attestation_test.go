@@ -81,7 +81,7 @@ type attestationFixture struct {
 	registry     *Service
 	store        *memoryDispatchStore
 	registryRows *memoryStore
-	recorder     *dispatchRecorder
+	recorder     *auditCapture
 	attestations *fakeAttestations
 	authority    *auth.Authority
 	queued       ActionRecord
@@ -122,7 +122,7 @@ func newAttestationFixture(t *testing.T, require bool) *attestationFixture {
 	descriptor.Capabilities[0].Actions[0].RequiresAttestation = require
 	registryRows.records["agent"] = Stored{Descriptor: descriptor}
 	store := newMemoryDispatchStore()
-	recorder := &dispatchRecorder{}
+	recorder := &auditCapture{dispatchRecorder: &dispatchRecorder{}}
 	attestations := &fakeAttestations{}
 	service, err := NewDispatchService(DispatchConfig{
 		Store: store, Registry: registry, Resolver: authority.Resolver(),
@@ -640,9 +640,7 @@ func TestPolicyFlipGatesNewClaims(t *testing.T) {
 	stored.Descriptor.Capabilities[0].Actions[0].RequiresAttestation = true
 	f.registryRows.records["agent"] = stored
 	_, err := f.claim(t, "alpha", time.Minute)
-	if !shoal.IsErrorCode(err, shoal.ErrorNotFound) {
-		t.Fatalf("old-generation claim = %v, want not found", err)
-	}
+	requireFlipRefusal(t, err)
 	enqueuer := bindDecision(t, f.authority, dispatchDecision(t,
 		"owner", "actor", "request-2", auth.OperationDispatch, auth.OperationInvoke))
 	request := dispatchEnqueue(f.now(), "request-2")

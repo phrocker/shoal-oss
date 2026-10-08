@@ -173,8 +173,27 @@ never joined with `ErrExecutionAmbiguous` or `ErrActionCommitted`. No refusal
 names a verifier, digest, attestation ID or expiry.
 
 Every refused claim, extension and admission grant is audited as phase
-`claim_refused_attestation`. If that audit cannot be recorded, the refusal
-stands.
+`claim_refused_attestation`. The audited record is a copy that names the
+refused caller (claimant subject, actor, client and delegation chain, and its
+request and correlation IDs); the copy is never stored. That phase's session
+identity includes the refusing request ID, so two refusals at one record
+version are two entries. If the audit cannot be recorded, the refusal stands.
+
+**Stricter wins, independent of generation pinning.** The requirement is read
+from the action's *current* registration (`resolveActionBinding` returns the
+action from the stored descriptor, not from the record), ORed with the
+record's own side — an attestation its current claim was granted under
+(`effectiveClaimRequirements`; #486 can add approval to the same shape). So a
+record enqueued before the requirement was registered is governed by it
+whenever it resolves at all. Today generation pinning makes such a record stop
+resolving; if #486 lifts pinning, the record is refused with
+`ErrAttestationRequired` instead. Neither ordering grants an unattested claim.
+
+**A live claim when the requirement is registered** is not revoked. It runs to
+its current lease end — the end it was granted, already bounded by the action
+deadline — and no extension is granted unless the holder is attested (the
+extension itself would be clamped to the deadline, never to
+now + `MaxActionClaimTTL`).
 
 An attestation is for the executor process that presented it as itself. A
 claimant acting on behalf of others (a non-empty delegation chain), or one

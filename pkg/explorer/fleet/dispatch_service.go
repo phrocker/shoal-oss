@@ -390,8 +390,8 @@ func (s *DispatchService) Claim(ctx context.Context, request ClaimRequest) (Acti
 	// and state branch above, so a caller without standing never reaches the
 	// store and never learns the requirement exists. A store failure answers
 	// unavailable; it is never read as "not attested".
-	attestation, err := s.claimAttestation(
-		ctx, decision, claimedAction, executorRef, now)
+	attestation, err := s.claimAttestation(ctx, decision,
+		effectiveClaimRequirements(current, claimedAction), executorRef, now)
 	if err != nil {
 		return ActionRecord{}, err
 	}
@@ -402,7 +402,7 @@ func (s *DispatchService) Claim(ctx context.Context, request ClaimRequest) (Acti
 		decision, authorizing, now, attestation)
 	if err != nil {
 		if errors.Is(err, ErrAttestationRequired) {
-			s.auditAttestationRefusal(ctx, current, authorizing)
+			s.auditAttestationRefusal(ctx, current, authorizing, decision)
 		}
 		return ActionRecord{}, err
 	}
@@ -460,7 +460,8 @@ func applyClaim(
 	attestation ExecutorAttestation,
 ) (ActionRecord, error) {
 	leaseUntil := claimLeaseEnd(now, lease, record.Deadline)
-	if err := attestationGate(action, attestation, leaseUntil); err != nil {
+	required := effectiveClaimRequirements(record, action)
+	if err := attestationGate(required, attestation, leaseUntil); err != nil {
 		return ActionRecord{}, err
 	}
 	// The incoming claimant's chain is bounded here, by the bound a *retained*
@@ -581,7 +582,7 @@ func applyClaim(
 	// Claim-scoped: a re-claim moves it, and a claim of an action that does
 	// not require attestation carries none.
 	record.ClaimAttestationID = ""
-	if action.RequiresAttestation {
+	if required.Attestation {
 		record.ClaimAttestationID = attestation.ID
 	}
 	record.UpdatedAt = now
@@ -1477,20 +1478,25 @@ func (s *DispatchService) ExtendClaim(
 	// so only the holder of a live claim learns of the requirement. A refusal
 	// writes nothing, so the claim survives to its current lease end; the
 	// worker re-attests and extends again.
+	//
+	// Stricter wins: a requirement registered while this claim is live
+	// applies to its extension. The claim itself is not revoked — it runs to
+	// its current lease end — but it is renewed only for an attested holder.
+	required := effectiveClaimRequirements(current, claimedAction)
 	attestation, err := s.claimAttestation(
-		ctx, decision, claimedAction, executorRef, now)
+		ctx, decision, required, executorRef, now)
 	if err != nil {
 		return ActionRecord{}, err
 	}
-	if err := attestationGate(claimedAction, attestation, extended); err != nil {
-		s.auditAttestationRefusal(ctx, current, authorizing)
+	if err := attestationGate(required, attestation, extended); err != nil {
+		s.auditAttestationRefusal(ctx, current, authorizing, decision)
 		return ActionRecord{}, err
 	}
 	next := cloneActionRecord(current)
 	next.Version++
 	next.ClaimLease = request.Lease
 	next.ClaimLeaseUntil = extended
-	if claimedAction.RequiresAttestation {
+	if required.Attestation {
 		next.ClaimAttestationID = attestation.ID
 	}
 	next.UpdatedAt = now

@@ -106,6 +106,33 @@ func attestationUnavailable() error {
 		"executor attestation is unavailable", ErrAttestationUnavailable)
 }
 
+// claimRequirements is what a claim grant must satisfy, after combining what
+// the record carries with what the action's *current* registration requires.
+// It is one small shape so #486 can add approval to it the same way.
+type claimRequirements struct {
+	Attestation bool
+}
+
+// effectiveClaimRequirements combines the record's snapshot with the current
+// registration, and the stricter wins.
+//
+// current is the Action resolveActionBinding returned, which it reads from
+// the stored descriptor as it is now — not from anything the record carried
+// at enqueue. So a requirement registered after a record was enqueued governs
+// that record whenever it resolves, independently of generation pinning.
+// Pinning stops such a record resolving today; if #486 unpins it, the
+// requirement still applies.
+//
+// The record's side is the attestation its current claim was granted under:
+// a claim that stood on an attestation keeps requiring one for its renewal
+// and its re-claim. The record carries no enqueue-time snapshot of the
+// requirement; a record-level snapshot, if #486 adds one, ORs in here.
+func effectiveClaimRequirements(record ActionRecord, current Action) claimRequirements {
+	return claimRequirements{
+		Attestation: current.RequiresAttestation || record.ClaimAttestationID != "",
+	}
+}
+
 // attestationGate is the one predicate a claim grant passes. applyClaim
 // applies it to every claim (dispatch Claim and the admission grant), and
 // ExtendClaim applies it to the clamped extended lease end; nothing else
@@ -114,8 +141,8 @@ func attestationUnavailable() error {
 // The lease end it is handed must be the one the record will carry: clamped
 // to the action's deadline. A claim never outlives its attestation, so a
 // lapse coincides with a lease lapse and the fence covers it.
-func attestationGate(action Action, attestation ExecutorAttestation, leaseUntil time.Time) error {
-	if !action.RequiresAttestation {
+func attestationGate(required claimRequirements, attestation ExecutorAttestation, leaseUntil time.Time) error {
+	if !required.Attestation {
 		return nil
 	}
 	if !attestation.OK || attestation.ID == "" ||
@@ -147,10 +174,10 @@ func claimLeaseEnd(now time.Time, lease time.Duration, deadline time.Time) time.
 // and letting it stand for a chain it did not present under would let one
 // attested process lend its attestation to every principal it acts for.
 func (s *DispatchService) claimAttestation(
-	ctx context.Context, decision auth.Decision, action Action,
+	ctx context.Context, decision auth.Decision, required claimRequirements,
 	executorRef string, now time.Time,
 ) (ExecutorAttestation, error) {
-	if !action.RequiresAttestation {
+	if !required.Attestation {
 		return ExecutorAttestation{}, nil
 	}
 	if nilDependency(s.attestations) || len(decision.OnBehalfOf()) > 0 ||
@@ -178,16 +205,43 @@ func (s *DispatchService) claimAttestation(
 	return attestation, nil
 }
 
+// ClaimRefusedAttestationPhase is the audit phase of a claim, extension or
+// admission grant refused for want of attestation.
+const ClaimRefusedAttestationPhase = "claim_refused_attestation"
+
 // auditAttestationRefusal records a claim refused for want of attestation.
 // Best effort by design: the refusal stands whether or not it can be
 // recorded, because the alternative — answering a recorder outage instead —
 // would turn a policy refusal into a retryable 503 and invite the retry.
+//
+// The audited record is a copy that names the *refused* caller: the claimant
+// fields and the transition request and correlation IDs come from the
+// refusing decision. Auditing the stored record would name the enqueuer and
+// the previous holder, never who was refused, and every refusal at one
+// version would collapse into one session. The copy is never persisted; only
+// the audit sees it. The recorder keys this phase's session by the
+// transition request ID as well (explorerfleet.actionSessionID), so two
+// refusals are two entries.
 func (s *DispatchService) auditAttestationRefusal(
 	ctx context.Context, record ActionRecord, operation auth.Operation,
+	decision auth.Decision,
 ) {
+	refused := refusedClaimAudit(record, decision)
 	_ = s.recorder.RecordAction(ctx, ActionAudit{
-		Phase: "claim_refused_attestation", Operation: operation, Record: record,
+		Phase: ClaimRefusedAttestationPhase, Operation: operation, Record: refused,
 	})
+}
+
+// refusedClaimAudit is the audit-only copy auditAttestationRefusal records.
+func refusedClaimAudit(record ActionRecord, decision auth.Decision) ActionRecord {
+	refused := cloneActionRecord(record)
+	refused.ClaimantSubject = decision.Subject()
+	refused.ClaimantActor = decision.Actor()
+	refused.ClaimantClientID = decision.ClientID()
+	refused.ClaimantOnBehalfOf = append([]shoal.ID(nil), decision.OnBehalfOf()...)
+	refused.TransitionRequestID = decision.RequestID()
+	refused.TransitionCorrelationID = decision.CorrelationID()
+	return refused
 }
 
 // AttestationPresentation is one presentation. The principal is not here: it
