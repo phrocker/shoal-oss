@@ -349,8 +349,20 @@ func TestDispatchAuthorizationReplayConflictAndCancellationFence(t *testing.T) {
 		t.Fatal(err)
 	}
 	delegatedCtx := bindDecision(t, authority, delegatedWithoutGrant)
-	if _, err := service.Enqueue(delegatedCtx, dispatchEnqueue(now, "request")); !shoal.IsErrorCode(err, shoal.ErrorUnauthorized) {
-		t.Fatalf("delegation without grant = %v", err)
+	// Not-found, not unauthorized. This pinned unauthorized, and that was the
+	// existence oracle #536 reports: resolveActionBinding conceals a missing
+	// descriptor, a domain mismatch, a scope mismatch and an unregistered
+	// action as not-found, and returned AuthorizeObject's own error for the
+	// operation and delegate checks — so a caller that failed those learned
+	// the agent exists while one that failed the scope check a line earlier
+	// did not.
+	//
+	// The security property this test is about is unchanged: a delegated
+	// caller with no delegate grant is still refused. Only what it is told
+	// changed, and it is now told what a caller naming a nonexistent agent is
+	// told.
+	if _, err := service.Enqueue(delegatedCtx, dispatchEnqueue(now, "request")); !shoal.IsErrorCode(err, shoal.ErrorNotFound) {
+		t.Fatalf("delegation without grant = %v, want not found", err)
 	}
 	allowed := dispatchDecision(t, "owner", "actor", "request", auth.OperationDispatch, auth.OperationInvoke)
 	ctx := bindDecision(t, authority, allowed)

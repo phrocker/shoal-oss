@@ -2701,12 +2701,47 @@ func (s *Service) resolveActionBinding(
 		AuthorizationDomain: descriptor.AuthorizationDomain, SourceID: sourceID,
 		PolicyID: policyID, ObjectID: objectID,
 	}
+	// Normalized, like every other standing refusal in this function.
+	//
+	// AuthorizeObject conceals some of its own refusals and not others, and
+	// its doc says which: a source or policy projection denial becomes
+	// ObjectNotFound, while "whole-request failures remain unauthorized". A
+	// missing *operation grant* is a whole-request failure. So the delegate
+	// check below leaked: a caller holding invoke but lacking delegate
+	// authority altogether got "unauthorized" for a registered agent and
+	// "not found" for an unregistered one — an existence oracle for the
+	// descriptor, independent of anything attestation or approval does
+	// (#536).
+	//
+	// The operation check above it is normalized for symmetry and is defence
+	// in depth, not a second leak. Every caller reaching here has already
+	// passed begin or beginClaimant for that operation, so a whole-request
+	// failure on it is unreachable, and the projection denials that *are*
+	// reachable were already concealed by AuthorizeObject — which is why
+	// un-normalizing it changes no test. Said plainly because the convention
+	// in this file is to name the clauses no test can fail on.
+	//
+	// Concealing both is consistent with the decision made for the claim
+	// gates, not in tension with it: standing is checked first and refuses
+	// indistinguishably, and only a caller that *has* standing is then told
+	// which requirement it failed. The two layers answer different questions
+	// and conceal different things.
+	//
+	// The alternative, recorded because it is the better answer if the
+	// actionable message is ever wanted back: the oracle exists because these
+	// checks are *ordered after* the descriptor lookup, so reaching them
+	// implies the descriptor resolved. Both could run before it — the
+	// resource's source, policy and object come from the request, and its
+	// domain is already known equal to the decision's by the check above — in
+	// which case they would refuse identically whether or not the agent
+	// exists, and could say so. That reorders authorization logic, which is
+	// the riskier change, so it is not made here.
 	if err := decision.AuthorizeObject(operation, resource, now); err != nil {
-		return Descriptor{}, Action{}, nil, err
+		return Descriptor{}, Action{}, nil, auth.ObjectNotFound()
 	}
 	if len(decision.OnBehalfOf()) > 0 {
 		if err := decision.AuthorizeObject(auth.OperationDelegate, resource, now); err != nil {
-			return Descriptor{}, Action{}, nil, err
+			return Descriptor{}, Action{}, nil, auth.ObjectNotFound()
 		}
 	}
 	var selected *Action

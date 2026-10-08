@@ -740,10 +740,13 @@ func TestAnExecuteHolderWithoutStandingCannotReachTheExtensionGate(t *testing.T)
 // TestAdmissionDelegateRefusalDoesNotDependOnTheRequirement pins that the
 // gate plays no part in it; the split itself is an enqueue-path question.
 func TestAnInvokeHolderWithoutStandingCannotReachTheAdmissionGate(t *testing.T) {
+	// Every stranger, including the delegated ones. This loop used to skip
+	// those: a delegated caller holding invoke but lacking delegate authority
+	// was told "unauthorized" for a registered agent and "not found" for an
+	// unregistered one, because resolveActionBinding returned
+	// AuthorizeObject's error un-normalized while concealing every other
+	// standing refusal (#536). The skip is gone with the leak.
 	for _, s := range strangers {
-		if len(s.onBehalfOf) > 0 {
-			continue
-		}
 		t.Run(s.name, func(t *testing.T) {
 			f := newAttestationFixture(t, true)
 			ctx := s.bind(t, f, "admission-stranger", auth.OperationInvoke)
