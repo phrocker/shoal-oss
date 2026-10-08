@@ -448,6 +448,17 @@ caller is told the action committed and needs reconciliation, and a
 re-request once the clock has caught up replays the one record. Every dispatch
 transition reconciled on a lagging replica has the same property.
 
+## Testing
+
+New end-to-end tests of the approval path should go through the real
+authenticator: a signed token, real HTTP, the authenticated handler, the real
+binder and the bound providers, as `oidc_approver_e2e_test.go` does. A test
+that injects a bound context (`h.as(...)`) or re-mints the authenticator's
+decision cannot see a gap in the authenticator; #524, where neither shipped
+authenticator minted the correlation ID every fleet route requires, passed
+every such test while the whole surface was unreachable. Injected-context
+tests remain the right tool for service-level properties below the transport.
+
 ## Residuals
 
 - **Pre-existing: an admission denial cannot be published by the hosted
