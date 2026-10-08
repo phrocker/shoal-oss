@@ -520,12 +520,56 @@ func TestALegacyDescriptorStopsResolvingAgainstAFlooredExecutor(t *testing.T) {
 		}
 	}
 
-	// An executor that declares no floor is unaffected, which is why this
-	// breaks only the deployments where Shoal knows the executor transmits.
+	// An executor that declares no floor is still unaffected *here*, and that
+	// is deliberate rather than an oversight. A legacy descriptor declaring
+	// nothing against a floorless external ceiling is now refused — but only
+	// at registration, which is what
+	// TestRegisterRefusesADispatchOnlyActionThatDeclaresNothing covers.
+	// Resolution does not share this function: resolveAction in
+	// dispatch_service.go checks exceeds and omits directly,
+	// so already-stored descriptors keep resolving and are refused the next
+	// time they are registered or updated. Breaking them at resolution would
+	// strand in-flight work on an upgrade for a declaration the operator
+	// cannot amend without re-registering.
 	if err := validateDeclaredEffects(legacy,
-		executorFloor(ceilingExecutor{ceiling: everyEffect()}),
-		everyEffect()); err != nil {
-		t.Fatalf("a legacy descriptor broke against an unfloored executor: %v", err)
+		executorFloor(ceilingExecutor{ceiling: Effects{EffectReadsCorpus}}),
+		Effects{EffectReadsCorpus}); err != nil {
+		t.Fatalf("a legacy descriptor broke against an executor that reaches "+
+			"outside nothing: %v", err)
+	}
+}
+
+// TestAStoredLegacyDescriptorStillResolves is the other half of the migration
+// promise above. The declares-nothing rule is a registration boundary, so an
+// agent already in the store must keep running: an operator upgrading Shoal
+// does not get a fleet that stops mid-action, only registrations that start
+// being refused.
+func TestAStoredLegacyDescriptorStillResolves(t *testing.T) {
+	binding, err := NewExternalEffectBinding(everyEffect())
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored := Action{Name: "ask", InputSchema: anyObject, OutputSchema: anyObject}
+	if len(stored.Effects) > 0 {
+		t.Fatal("the fixture declares effects, so it is not the legacy shape")
+	}
+	// These two are what resolveAction applies. Neither may refuse, or every
+	// queued action against this binding fails on the upgrade.
+	if stored.Effects.exceeds(executorCeiling(binding)) {
+		t.Fatal("a stored descriptor declaring nothing stopped resolving " +
+			"against an external ceiling, so in-flight work breaks on upgrade")
+	}
+	if stored.Effects.omits(executorFloor(binding)) {
+		t.Fatal("a stored descriptor declaring nothing stopped resolving " +
+			"against an unfloored binding")
+	}
+	// And registering the same shape is refused, which is the boundary that
+	// moved. Without this the test would pass if the rule vanished entirely.
+	if err := validateDeclaredEffects(
+		[]Capability{{Name: "explorer.reason", Actions: []Action{stored}}},
+		executorFloor(binding), executorCeiling(binding)); err == nil {
+		t.Fatal("registering an action that declares nothing against an " +
+			"external ceiling was accepted")
 	}
 }
 
@@ -822,4 +866,72 @@ func (e Effects) equalForTest(other Effects) bool {
 		}
 	}
 	return true
+}
+
+// TestRegisterRefusesADispatchOnlyActionThatDeclaresNothing reaches the
+// declares-nothing requirement through Service.Register, because that is the
+// boundary that matters: the repro in #510 was a descriptor that registered
+// cleanly, resolved to a reference the host had bound for external effects,
+// and completed with EffectPossible false while a remote worker did real
+// external work. Registration is where that becomes stored state that looks
+// operable, so refusing anywhere later would leave the record already written.
+//
+// The requirement is narrow on purpose. It asks the action to declare
+// *something*, not to declare an external class: a dispatch-only reference may
+// legitimately reach outside nothing — a remote worker reading Shoal's own
+// corpus — and forcing an external declaration there would make EffectPossible
+// true where it should be false, which is the false claim #538 removed.
+func TestRegisterRefusesADispatchOnlyActionThatDeclaresNothing(t *testing.T) {
+	now := time.Date(2026, 9, 6, 8, 0, 0, 0, time.UTC)
+	authority, err := auth.NewAuthorityWithClock(func() time.Time { return now })
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A dispatch-only binding: a ceiling that reaches outside, and no floor.
+	binding, err := NewExternalEffectBinding(everyEffect())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if floor := executorFloor(binding); len(floor) > 0 {
+		t.Fatalf("the binding grew a floor (%v), so this test no longer "+
+			"covers the unfloored case it was written for", floor)
+	}
+	register := func(effects Effects) error {
+		service, err := NewService(Config{
+			Store: newMemoryStore(), Resolver: authority.Resolver(),
+			Recorder: &memoryRecorder{}, Snapshots: fixedSnapshot{now},
+			Executors: executorMap{"exec": binding},
+			Clock:     func() time.Time { return now },
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		decision := testDecision(t, "owner", "owner-actor", "effect-request",
+			[][]byte{[]byte("source-a")})
+		request := registerRequest(now, "effect-request", "agent", "", "source-a")
+		request.Spec.Capabilities[0].Actions[0].Effects = effects
+		_, err = service.Register(
+			bindDecision(t, authority, decision), request)
+		return err
+	}
+
+	if err := register(nil); err == nil {
+		t.Fatal("Register admitted an action declaring no effects against a " +
+			"reference the host bound for external work, so its completions " +
+			"will report EffectPossible false for work Shoal never performed")
+	} else if !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
+		t.Fatalf("refusal = %v, want invalid argument", err)
+	}
+
+	// Each class on its own is accepted, including the one that reaches
+	// outside nothing. This is what keeps the requirement from being a
+	// disguised "must declare external".
+	for _, alone := range []Effect{
+		EffectMutatesExternal, EffectEgressesContent, EffectReadsCorpus,
+	} {
+		if err := register(Effects{alone}); err != nil {
+			t.Fatalf("Register refused an action declaring only %q against a "+
+				"ceiling that permits it: %v", alone, err)
+		}
+	}
 }

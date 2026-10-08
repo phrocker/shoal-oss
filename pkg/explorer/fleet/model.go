@@ -576,6 +576,26 @@ func (e Effects) missingFrom(floor Effects) []string {
 	return missing
 }
 
+// externalClasses lists the declared classes that reach outside Shoal, sorted.
+//
+// The two of them are the whole of what EffectPossible is about: an action
+// that neither mutates externally nor transmits leaves its whole outcome in
+// Shoal's own record, and one that does either may have left a consequence
+// somewhere Shoal cannot read. Reading the pair through one helper keeps the
+// claim-time write, the registration requirement and the effect ceiling from
+// drifting to different answers about which classes count.
+func (e Effects) externalClasses() []string {
+	var external []string
+	for _, declared := range e {
+		if declared == EffectMutatesExternal ||
+			declared == EffectEgressesContent {
+			external = append(external, string(declared))
+		}
+	}
+	sort.Strings(external)
+	return external
+}
+
 func (e Effects) omits(floor Effects) bool {
 	for _, required := range floor {
 		if required.validate() != nil {

@@ -96,6 +96,17 @@ is one JSON object:
   `cmd/shoal-explore-web/fleet.go`), so the file declares them and compile
   checks every action against them. The server stays authoritative and refuses
   on its own binding. `min_effects` must be within `max_effects`.
+- **Declaring nothing** is refused on an action whose executor reference has a
+  ceiling permitting `external` or `egresses-content` and an empty
+  `min_effects` — the dispatch-only shape, where the host has said work may
+  reach outside and not said when. Any one class satisfies it, `reads-corpus`
+  included: the rule does not require an external class, because an action on
+  such a reference may legitimately reach outside nothing, and forcing the
+  claim would make `effect_possible` true where it should be false. What is
+  refused is silence (#510, #514). Compile and `Register` refuse it alike;
+  already-stored descriptors are not rewritten and keep resolving, so an
+  operator meets this in a `plan`, not mid-flight. See the migration note in
+  `shoal-explore-web-deploy.md`.
 
 Strictness, in `Decode`: UTF-8 only; `\u` escapes of unpaired UTF-16
 surrogates refused (they decode to U+FFFD, so two spellings would read as one);

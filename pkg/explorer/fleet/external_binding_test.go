@@ -68,10 +68,37 @@ func TestAnExternalBindingAdmitsExternalWork(t *testing.T) {
 		externalAction(), floor, ceiling); err != nil {
 		t.Fatalf("an external binding must admit external work: %v", err)
 	}
-	if err := validateDeclaredEffects(
-		evidenceAction(), floor, ceiling); err != nil {
+	// Declaring *less* than the ceiling is still allowed, and this is where
+	// that has room: a two-class ceiling admits an action declaring one.
+	wider, err := NewExternalEffectBinding(Effects{
+		EffectMutatesExternal, EffectEgressesContent,
+	})
+	if err != nil {
+		t.Fatalf("declare a two-class ceiling: %v", err)
+	}
+	if err := validateDeclaredEffects(externalAction(),
+		executorFloor(wider), executorCeiling(wider)); err != nil {
 		t.Fatalf("a descriptor must be allowed to declare less than the "+
 			"ceiling permits; the binding carries no floor: %v", err)
+	}
+
+	// Declaring *nothing* is not. This used to be allowed, with
+	// evidenceAction() standing in for it, and that is what let a
+	// non-declaring action resolve to a dispatch-only reference and complete
+	// with EffectPossible false while a remote worker did real external work
+	// (#510, #514). An action that declares nothing asserts its whole outcome
+	// is in Shoal's record, which is exactly what a reference bound for
+	// external effects cannot promise.
+	//
+	// Note what this does *not* require: an external class specifically. A
+	// dispatch-only action may legitimately reach outside nothing — a remote
+	// worker reading Shoal's own corpus — and forcing it to claim an external
+	// effect would be the same false claim pointing the other way.
+	if err := validateDeclaredEffects(
+		evidenceAction(), floor, ceiling); err == nil {
+		t.Fatal("an action declaring no effects at all resolved to a " +
+			"reference bound for external mutation, so its record will say " +
+			"no external effect was declared for work Shoal never performs")
 	}
 	// And it is a ceiling of exactly {external}, not a general widening. An
 	// action that reads the corpus is not doing less external work, it is
