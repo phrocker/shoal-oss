@@ -11,7 +11,15 @@
        letter). A name override is joined after the release name, so an RFC
        1123 label suffices. Both stay within 63 characters, the label limit;
        the components' own name stems already reserve room for their suffixes. */ -}}
-{{- range $setting, $pattern := dict "nameOverride" "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$" "fullnameOverride" "^[a-z]([-a-z0-9]*[a-z0-9])?$" -}}
+{{- /* With a full name set, the name override no longer names anything and
+       reaches only the app.kubernetes.io/name label, so a label value is
+       enough there: dots, underscores and upper case rendered before and still
+       do. */ -}}
+{{- $namePattern := "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$" -}}
+{{- if .Values.fullnameOverride -}}
+{{- $namePattern = "^[A-Za-z0-9]([-A-Za-z0-9_.]*[A-Za-z0-9])?$" -}}
+{{- end -}}
+{{- range $setting, $pattern := dict "nameOverride" $namePattern "fullnameOverride" "^[a-z]([-a-z0-9]*[a-z0-9])?$" -}}
 {{- $value := index $.Values $setting -}}
 {{- if $value -}}
 {{- if not (kindIs "string" $value) -}}
