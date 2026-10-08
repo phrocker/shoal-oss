@@ -147,8 +147,16 @@ The effects gateway's closed `ErrorCode` set is mirrored as constants
 public package does not depend on `internal/`; the parity test imports the
 gateway and checks `ValidErrorCode` agrees on every candidate code.
 
-Golden files under `pkg/narrate/testdata/golden` fix the wording. Change them
-with `go test ./pkg/narrate -run TestGolden -update` and review the diff.
+Golden files under `pkg/narrate/testdata/golden` fix the wording. The
+scenario goldens cover representative records; the value goldens under
+`testdata/golden/values` (`TestGoldenValues`) render every value of every
+enumerated set — each dispatch state, error code, transition, approval status
+and condition, decision result and abstention reason, disposition and
+inspection reason — from the same source-read lists the coverage tests use, one
+file per family. Coverage proves which key a value renders; the value goldens
+prove the sentence under that key is the one written for that value, so
+swapping the templates of two sibling keys fails. Change them with
+`go test ./pkg/narrate -run 'TestGolden' -update` and review the diff.
 
 ### Values the renderer does not know
 
