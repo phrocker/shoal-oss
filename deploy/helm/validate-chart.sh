@@ -495,10 +495,13 @@ refuses_citing "fullnameOverride" "a full name over 63 characters" -f "$chart/va
 refuses_citing "nameOverride" "a non-string name override" -f "$chart/values.yaml" --set nameOverride=7
 # The contrast: ordinary overrides still render, and an empty one is unset.
 assert_renders "a valid fullnameOverride names the gateway" '^  name: platform-llm-gateway$' "${llm_gateway_base[@]}" --set-string fullnameOverride=platform
-assert_renders "a valid nameOverride names the release's objects" 'app.kubernetes.io/name: lake' -f "$chart/values.yaml" --set-string nameOverride=lake
-assert_renders "beside a full name, a label-valid name override still renders" 'app.kubernetes.io/name: Shoal.App_v2' -f "$chart/values.yaml" --set-string fullnameOverride=shoal --set-string nameOverride=Shoal.App_v2
+assert_renders "a valid nameOverride names the release's objects" 'app.kubernetes.io/name: "lake"' -f "$chart/values.yaml" --set-string nameOverride=lake
+assert_renders "beside a full name, a label-valid name override still renders" 'app.kubernetes.io/name: "Shoal.App_v2"' -f "$chart/values.yaml" --set-string fullnameOverride=shoal --set-string nameOverride=Shoal.App_v2
 refuses_citing "nameOverride" "beside a full name, a newline in the name override" -f "$chart/values.yaml" --set-string fullnameOverride=shoal --set-string 'nameOverride=x
   namespace: kube-system'
+# A label must be a string: a name override that YAML would read as a number
+# or boolean stays one once quoted.
+assert_renders "a numeric-looking name override stays a string label" 'app.kubernetes.io/name: "1.5"' -f "$chart/values.yaml" --set-string fullnameOverride=shoal --set-string nameOverride=1.5
 renders "an empty fullnameOverride is unset" -f "$chart/values.yaml" --set-string fullnameOverride=
 renders "a 63-character fullnameOverride still renders" -f "$chart/values.yaml" --set-string fullnameOverride=$(printf 'a%.0s' $(seq 1 63))
 

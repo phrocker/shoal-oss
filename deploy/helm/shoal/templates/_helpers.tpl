@@ -17,7 +17,10 @@
 
 {{- define "shoal.labels" -}}
 helm.sh/chart: {{ .Chart.Name }}-{{ .Chart.Version | replace "+" "_" }}
-app.kubernetes.io/name: {{ include "shoal.name" . }}
+{{- /* Quoted only when overridden: an override such as "1.5" or "True" is
+       otherwise read as a number or boolean, which a label cannot be, and the
+       chart's own name renders exactly as it always has. */}}
+app.kubernetes.io/name: {{ if .Values.nameOverride }}{{ include "shoal.name" . | quote }}{{ else }}{{ include "shoal.name" . }}{{ end }}
 app.kubernetes.io/instance: {{ .Release.Name }}
 app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
 app.kubernetes.io/managed-by: {{ .Release.Service }}
