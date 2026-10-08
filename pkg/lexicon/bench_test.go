@@ -56,8 +56,8 @@ const benchmarkText = "does svc0000007 depend on word0003 term0000 or the " +
 func BenchmarkCandidates(b *testing.B) {
 	for _, terms := range []int{10_000, 100_000, 1_000_000} {
 		bundle, err := lexicon.Build(lexicon.Input{
-			Snapshot: fixedSnapshot, Scope: lexicon.ScopeServerFiltered{},
-			Nodes: syntheticNodes(terms),
+			Snapshot: fixedSnapshot,
+			Nodes:    syntheticNodes(terms),
 		}, lexicon.Limits{})
 		if err != nil {
 			b.Fatal(err)

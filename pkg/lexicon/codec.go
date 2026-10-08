@@ -24,10 +24,12 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"math"
+	"slices"
 	"strings"
 	"time"
 	"unicode/utf8"
 
+	"github.com/phrocker/shoal-oss/pkg/ontology"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
@@ -123,7 +125,7 @@ func encode(c *contents) ([]byte, error) {
 	e.u64(uint64(c.snapshot.AsOf.UTC().UnixNano()))
 	e.u8(c.scope.scopeKind())
 	if pinned, ok := c.scope.(ScopePinned); ok {
-		e.buf = append(e.buf, pinned.Digest[:]...)
+		e.buf = append(e.buf, pinned.digest[:]...)
 	}
 	e.count(len(c.tokens))
 	for _, token := range c.tokens {
@@ -281,7 +283,7 @@ func decode(data []byte) (*contents, error) {
 		c.scope = ScopeServerFiltered{}
 	case scopeKindPinned:
 		var pinned ScopePinned
-		copy(pinned.Digest[:], d.take(len(pinned.Digest)))
+		copy(pinned.digest[:], d.take(len(pinned.digest)))
 		c.scope = pinned
 	default:
 		return nil, malformed()
@@ -398,19 +400,35 @@ func canonicalToken(token string) bool {
 }
 
 func canonicalTemplate(template Template) bool {
-	if !template.Direction.valid() || template.RelationKey == "" ||
+	if !template.Direction.valid() || !wireString(template.RelationKey) ||
 		template.ID != templateID(template.RelationKey, template.Direction) ||
 		template.PhraseKey != phraseKey(template.RelationKey, template.Direction) {
 		return false
 	}
 	for _, ids := range [][]shoal.ID{template.SubjectConcepts, template.AnswerConcepts} {
+		if len(ids) == 0 {
+			return false
+		}
 		for index, id := range ids {
-			if id == "" || (index > 0 && id <= ids[index-1]) {
+			if shoal.ValidateRequiredID("lexicon template concept ID", id) != nil ||
+				!utf8.ValidString(string(id)) ||
+				ontology.IDNamespace(id) != "concept" ||
+				(index > 0 && id <= ids[index-1]) {
 				return false
 			}
 		}
 	}
+	if template.Direction == DirectionBoth &&
+		!slices.Equal(template.SubjectConcepts, template.AnswerConcepts) {
+		return false
+	}
 	return true
+}
+
+// wireString accepts exactly what ontology definition keys may be: non-empty,
+// valid UTF-8, without surrounding white space.
+func wireString(value string) bool {
+	return value != "" && utf8.ValidString(value) && strings.TrimSpace(value) == value
 }
 
 // BundleID is the SHA-256 of a bundle's canonical bytes.

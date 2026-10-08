@@ -177,12 +177,13 @@ type Candidate struct {
 // ones included, sorted by token start then end. It applies no visibility; a
 // caller must filter it before using or echoing anything. Callers that bound
 // text by token count should tokenize once and use CandidatesForTokens.
-func (b *Bundle) Candidates(text string) []Candidate {
-	return b.CandidatesForTokens(Tokenize(text))
+func (bb *Bundle) Candidates(text string) []Candidate {
+	return bb.CandidatesForTokens(Tokenize(text))
 }
 
 // CandidatesForTokens is Candidates over already-tokenized text.
-func (b *Bundle) CandidatesForTokens(tokens []Token) []Candidate {
+func (bb *Bundle) CandidatesForTokens(tokens []Token) []Candidate {
+	b := bb.get()
 	var out []Candidate
 	a := &b.automaton
 	state := int32(0)

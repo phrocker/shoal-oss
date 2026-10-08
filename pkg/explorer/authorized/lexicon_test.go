@@ -141,7 +141,7 @@ func (w *lexiconWorld) materialize(
 func (w *lexiconWorld) bundle(t testing.TB) *lexicon.Bundle {
 	t.Helper()
 	bundle, err := lexicon.Build(lexicon.Input{
-		Snapshot: w.snapshot, Scope: lexicon.ScopeServerFiltered{}, Nodes: w.nodes,
+		Snapshot: w.snapshot, Nodes: w.nodes,
 	}, lexicon.Limits{})
 	if err != nil {
 		t.Fatal(err)
@@ -368,7 +368,7 @@ func TestResolveMentionsRejectsUnboundableBundle(t *testing.T) {
 		"shoal.lexicon.alias.0": "a b c d e f g h i j k l m n o p",
 	}})
 	wide, err := lexicon.Build(lexicon.Input{
-		Snapshot: w.snapshot, Scope: lexicon.ScopeServerFiltered{}, Nodes: nodes,
+		Snapshot: w.snapshot, Nodes: nodes,
 	}, lexicon.Limits{
 		MaxTermTokens:      lexicon.HardMaxTermTokens,
 		MaxPostingsPerTerm: lexicon.HardMaxPostingsPerTerm,
@@ -385,58 +385,217 @@ func TestResolveMentionsRejectsUnboundableBundle(t *testing.T) {
 	}
 }
 
+func (w *lexiconWorld) scoped(
+	t *testing.T,
+	ctx context.Context,
+) lexicon.ScopedNodes {
+	t.Helper()
+	scoped, err := w.client.LexiconScopeNodes(ctx, w.snapshot, w.nodes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return scoped
+}
+
+func pinnedBytes(t *testing.T, scoped lexicon.ScopedNodes) (*lexicon.Bundle, []byte) {
+	t.Helper()
+	bundle, err := lexicon.Build(lexicon.Input{Scoped: &scoped}, lexicon.Limits{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	shippable, ok := bundle.ForShipping()
+	if !ok {
+		t.Fatal("pinned bundle is not shippable")
+	}
+	return bundle, shippable.Bytes()
+}
+
 func TestLexiconScopeBuildHoldsNoHiddenBytes(t *testing.T) {
 	withPolicyStores(t, func(t *testing.T, store authorized.PolicyStore) {
 		w := newLexiconWorld(t, store)
-		scoped, err := w.client.LexiconScopeNodes(w.f.alice(t), w.nodes)
-		if err != nil {
-			t.Fatal(err)
+		aliceScope := w.scoped(t, w.f.alice(t))
+		if aliceScope.Len() != len(visibleLexiconSpecs) {
+			t.Fatalf("scoped nodes = %d, want %d", aliceScope.Len(), len(visibleLexiconSpecs))
 		}
-		if len(scoped) != len(visibleLexiconSpecs) {
-			t.Fatalf("scoped nodes = %d, want %d", len(scoped), len(visibleLexiconSpecs))
+		adminScope := w.scoped(t, w.f.admin(t))
+		if adminScope.Len() != len(visibleLexiconSpecs)+len(hiddenLexiconSpecs) {
+			t.Fatalf("admin scoped nodes = %d", adminScope.Len())
 		}
-		build := func(nodes []graph.Node) []byte {
-			bundle, err := lexicon.Build(lexicon.Input{
-				Snapshot: w.snapshot, Scope: lexicon.ScopePinned{Digest: [32]byte{'a'}},
-				Nodes: nodes,
-			}, lexicon.Limits{})
-			if err != nil {
-				t.Fatal(err)
-			}
-			shippable, ok := bundle.ForShipping()
-			if !ok {
-				t.Fatal("pinned bundle is not shippable")
-			}
-			return shippable.Bytes()
-		}
+		aliceBundle, aliceBytes := pinnedBytes(t, aliceScope)
+		adminBundle, adminBytes := pinnedBytes(t, adminScope)
+
 		hiddenMarkers := [][]byte{
 			[]byte("secret"), []byte("nightjar"), []byte("router"),
 			[]byte(w.ids["secret"]), []byte(w.ids["router"]),
-			[]byte(w.ids["payments-api"]), []byte(ghostNode.ID), []byte("phantom"),
+			[]byte(w.ids["payments-api"]),
 		}
-		aliceBytes := build(scoped)
 		for _, marker := range hiddenMarkers {
 			if bytes.Contains(aliceBytes, marker) {
 				t.Fatalf("alice's bundle holds hidden bytes %q", marker)
 			}
-		}
-		// The check has teeth: the unfiltered build does hold them.
-		everything := build(w.nodes)
-		for _, marker := range hiddenMarkers {
-			if !bytes.Contains(everything, marker) {
-				t.Fatalf("unfiltered bundle lacks %q", marker)
+			// The check has teeth: the admin's scope holds them.
+			if !bytes.Contains(adminBytes, marker) {
+				t.Fatalf("admin bundle lacks %q", marker)
 			}
 		}
-		// Alice's own bundle still resolves her names.
-		local, err := lexicon.Load(aliceBytes)
-		if err != nil {
-			t.Fatal(err)
+		// The unregistered node is in nobody's scope.
+		for _, data := range [][]byte{aliceBytes, adminBytes} {
+			if bytes.Contains(data, []byte(ghostNode.ID)) || bytes.Contains(data, []byte("phantom")) {
+				t.Fatal("unregistered node reached a scoped bundle")
+			}
 		}
-		if got := w.resolve(w.f.alice(t), local, "PayGW"); got.err != nil ||
+
+		// The scope is computed per caller, not claimed.
+		if aliceBundle.Scope() == adminBundle.Scope() ||
+			aliceScope.Scope() != aliceBundle.Scope() {
+			t.Fatalf("scopes alice %v admin %v", aliceBundle.Scope(), adminBundle.Scope())
+		}
+		again := w.scoped(t, w.f.alice(t))
+		if again.Scope() != aliceScope.Scope() {
+			t.Fatal("one caller's scope is not stable")
+		}
+		otherSnapshot := w.snapshot
+		otherSnapshot.Frontier++
+		moved, err := w.client.LexiconScopeNodes(w.f.alice(t), otherSnapshot, w.nodes)
+		if err != nil || moved.Scope() == aliceScope.Scope() {
+			t.Fatalf("snapshot is not part of the scope: %v", err)
+		}
+		w.f.reader.Set(w.f.domain, 2)
+		later, err := w.client.LexiconScopeNodes(w.f.context(t, w.f.decisionAtGeneration(
+			t, "alice", [][]byte{w.f.sourceA}, [][]byte{w.f.policyA}, allOperations, 2,
+		)), w.snapshot, w.nodes)
+		if err != nil || later.Scope() == aliceScope.Scope() {
+			t.Fatalf("policy generation is not part of the scope: %v", err)
+		}
+		w.f.reader.Set(w.f.domain, 1)
+
+		// The scope round-trips through Load.
+		loaded, err := lexicon.Load(aliceBytes)
+		if err != nil || loaded.Scope() != aliceBundle.Scope() || loaded.ID() != aliceBundle.ID() {
+			t.Fatalf("scope lost on load: %v", err)
+		}
+		// An unfiltered pinned build is impossible: scoped nodes cannot be
+		// widened, and a hand-made ScopedNodes is refused.
+		if _, err := lexicon.Build(lexicon.Input{
+			Scoped: &aliceScope, Nodes: w.nodes,
+		}, lexicon.Limits{}); err == nil {
+			t.Fatal("scoped nodes widened with unfiltered nodes")
+		}
+		if _, err := lexicon.Build(lexicon.Input{
+			Snapshot: w.snapshot, Scoped: &lexicon.ScopedNodes{},
+		}, lexicon.Limits{}); err == nil {
+			t.Fatal("hand-made scoped nodes accepted")
+		}
+		// Alice's own bundle still resolves her names.
+		if got := w.resolve(w.f.alice(t), loaded, "PayGW"); got.err != nil ||
 			len(got.mentions) != 1 || got.mentions[0].Ambiguous {
 			t.Fatalf("scoped bundle resolve = %#v", got)
 		}
 	})
+}
+
+// neighborhoodOnly may use the neighborhood operation and nothing else.
+func (w *lexiconWorld) neighborhoodOnly(t *testing.T) context.Context {
+	t.Helper()
+	return w.f.context(t, w.f.decision(t, "walker",
+		[][]byte{w.f.sourceA}, [][]byte{w.f.policyA},
+		[]auth.Operation{auth.OperationNeighborhood}))
+}
+
+func TestLexiconNeedsOnlyNeighborhood(t *testing.T) {
+	w := newLexiconWorld(t, authorized.NewMemoryPolicyStore())
+	ctx := w.neighborhoodOnly(t)
+	got := w.resolve(ctx, w.bundle(t), "Payments and Core Platform")
+	if got.err != nil || len(got.mentions) != 2 {
+		t.Fatalf("neighborhood-only resolve = %#v", got)
+	}
+	scoped, err := w.client.LexiconScopeNodes(ctx, w.snapshot, w.nodes)
+	if err != nil || scoped.Len() != len(visibleLexiconSpecs) {
+		t.Fatalf("neighborhood-only scope = %d nodes, %v", scoped.Len(), err)
+	}
+}
+
+// generationBumpStore changes the policy generation while a lexicon call is
+// reading the catalog, after the call's first generation check.
+type generationBumpStore struct {
+	authorized.PolicyStore
+	bump func()
+}
+
+func (s generationBumpStore) Nodes(
+	ctx context.Context,
+	ids []shoal.ID,
+) (map[shoal.ID]authorized.NodeRegistration, error) {
+	resolved, err := s.PolicyStore.Nodes(ctx, ids)
+	s.bump()
+	return resolved, err
+}
+
+func TestLexiconCallsCatchAGenerationChangeMidCall(t *testing.T) {
+	w := newLexiconWorld(t, authorized.NewMemoryPolicyStore())
+	bundle := w.bundle(t)
+	client := w.f.newClient(t, w.f.base, generationBumpStore{
+		PolicyStore: w.store,
+		bump:        func() { w.f.reader.Set(w.f.domain, 2) },
+	}, w.f.sourceA, w.f.policyA, nil)
+
+	mentions, err := client.ResolveMentions(w.f.alice(t), bundle, "Payments")
+	if !shoal.IsErrorCode(err, shoal.ErrorUnavailable) || mentions != nil {
+		t.Fatalf("ResolveMentions across a generation change = %#v, %v", mentions, err)
+	}
+	w.f.reader.Set(w.f.domain, 1)
+	scoped, err := client.LexiconScopeNodes(w.f.alice(t), w.snapshot, w.nodes)
+	if !shoal.IsErrorCode(err, shoal.ErrorUnavailable) || scoped.Len() != 0 {
+		t.Fatalf("LexiconScopeNodes across a generation change = %d, %v", scoped.Len(), err)
+	}
+}
+
+func TestLexiconDropsDocumentNodesTheBaseNoLongerHolds(t *testing.T) {
+	w := newLexiconWorld(t, authorized.NewMemoryPolicyStore())
+	source := explorer.Source{
+		URI: "file:///quarterly.txt", Title: "Quarterly",
+		MediaType: explorer.MediaTypeText, Content: "quarterly report",
+	}
+	clientA := w.f.newClient(t, w.f.base, w.store, w.f.sourceA, w.f.policyA, nil)
+	registered, err := clientA.Ingest(w.f.admin(t), source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	document := graph.Node{
+		ID: registered.Document.ID, Kind: "document",
+		Properties: shoal.Metadata{"name": "Quarterly Report"},
+	}
+	w.nodes = append(w.nodes, document)
+	bundle := w.bundle(t)
+	alice := w.f.alice(t)
+	if got := w.resolve(alice, bundle, "Quarterly Report"); got.err != nil ||
+		len(got.mentions) != 1 || got.mentions[0].NodeIDs[0] != document.ID {
+		t.Fatalf("current document = %#v", got)
+	}
+	if scoped := w.scoped(t, alice); scoped.Len() != len(visibleLexiconSpecs)+1 {
+		t.Fatalf("current document not in scope: %d", scoped.Len())
+	}
+
+	// The base moves to an uncataloged revision: Neighborhood no longer finds
+	// the node, and neither does the lexicon.
+	if _, err := w.f.base.Ingest(context.Background(), explorer.Source{
+		URI: source.URI, Title: "Uncataloged", MediaType: source.MediaType,
+		Content: "uncataloged replacement",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := clientA.Neighborhood(alice, explorer.NeighborhoodRequest{
+		NodeIDs: []shoal.ID{document.ID},
+	}); !shoal.IsErrorCode(err, shoal.ErrorNotFound) {
+		t.Fatalf("diverged neighborhood error = %v", err)
+	}
+	got := w.resolve(alice, bundle, "Quarterly Report and Payments")
+	if got.err != nil || len(got.mentions) != 1 || got.mentions[0].NodeIDs[0] != w.ids["payments"] {
+		t.Fatalf("diverged document still matched: %#v", got)
+	}
+	if scoped := w.scoped(t, alice); scoped.Len() != len(visibleLexiconSpecs) {
+		t.Fatalf("diverged document still in scope: %d", scoped.Len())
+	}
 }
 
 func BenchmarkResolveMentions(b *testing.B) {

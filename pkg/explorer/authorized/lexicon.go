@@ -21,9 +21,13 @@ package authorized
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/binary"
 	"fmt"
 	"sort"
+	"time"
 
+	"github.com/phrocker/shoal-oss/internal/lexiconscope"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/graph"
 	"github.com/phrocker/shoal-oss/pkg/lexicon"
@@ -66,7 +70,8 @@ func mentionOverBound() error {
 // currently see, under the neighborhood operation.
 //
 // Every candidate the bundle reports is checked against the caller's current
-// node rules before any choice is made. A node the caller may not see is
+// node rules before any choice is made, and an allowed document-section node
+// must also pass the canonical-revision check Neighborhood applies to a seed. A node the caller may not see is
 // dropped silently, exactly as a node absent from the catalog is, so a hidden
 // entity matches as nothing: the result, the error, and the policy-store
 // traffic are the same as for an unknown name. Selection (leftmost-longest,
@@ -124,23 +129,18 @@ func (c *Client) ResolveMentions(
 	if err != nil {
 		return nil, policyCatalogReadError(ctx, err)
 	}
-	visible := make(map[shoal.ID]bool, len(distinct))
-	for _, id := range batch[:len(distinct)] {
-		registration, ok := registrations[id]
-		if !ok {
-			continue
-		}
-		allowed, err := ruleAllows(
-			registration.Rule, decision, auth.OperationNeighborhood, now)
-		if err != nil {
-			return nil, err
-		}
-		if allowed {
-			visible[id] = true
-		}
+	allowed, err := allowedRegistrations(
+		registrations, batch[:len(distinct)], decision, now)
+	if err != nil {
+		return nil, err
+	}
+	allowed, err = c.dropNonCanonical(ctx, allowed)
+	if err != nil {
+		return nil, err
 	}
 	mentions := lexicon.Select(candidates, func(id shoal.ID) bool {
-		return visible[id]
+		_, ok := allowed[id]
+		return ok
 	})
 	if err := guard.Check(ctx); err != nil {
 		return nil, err
@@ -148,48 +148,170 @@ func (c *Client) ResolveMentions(
 	return mentions, nil
 }
 
-// LexiconScopeNodes returns, in input order, copies of the nodes the caller
-// may currently see under the neighborhood operation. It is the filter for
-// building a lexicon.ScopePinned bundle for the caller's scope: such a bundle
-// is built from this output only, so its bytes hold nothing the caller cannot
-// already see. The node data itself is the builder's; only visibility comes
-// from the policy catalog, read in one batch.
-func (c *Client) LexiconScopeNodes(
+// allowedRegistrations keeps the registrations among ids whose current rule
+// allows the neighborhood operation. Registrations for other identifiers
+// (sentinels included) are never read.
+func allowedRegistrations(
+	registrations map[shoal.ID]NodeRegistration,
+	ids []shoal.ID,
+	decision auth.Decision,
+	now time.Time,
+) (map[shoal.ID]NodeRegistration, error) {
+	allowed := make(map[shoal.ID]NodeRegistration)
+	for _, id := range ids {
+		registration, ok := registrations[id]
+		if !ok {
+			continue
+		}
+		ok, err := ruleAllows(registration.Rule, decision, auth.OperationNeighborhood, now)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			allowed[id] = registration
+		}
+	}
+	return allowed, nil
+}
+
+// dropNonCanonical applies the check authorizedNode applies to a
+// document-section node: its catalog revision must still be the base's
+// current revision. A node failing it is dropped, as a stale seed is not
+// found by Neighborhood. Only nodes the caller may already see reach this
+// check, so the base reads it makes depend only on what the caller can see,
+// never on hidden or unknown names. Registered graph nodes need no base read.
+func (c *Client) dropNonCanonical(
 	ctx context.Context,
-	nodes []graph.Node,
-) ([]graph.Node, error) {
-	decision, guard, now, err := c.begin(ctx, auth.OperationNeighborhood)
+	allowed map[shoal.ID]NodeRegistration,
+) (map[shoal.ID]NodeRegistration, error) {
+	var documentNodes []shoal.ID
+	for id, registration := range allowed {
+		if registration.Node.ID == "" {
+			documentNodes = append(documentNodes, id)
+		}
+	}
+	if len(documentNodes) == 0 {
+		return allowed, nil
+	}
+	sort.Slice(documentNodes, func(i, j int) bool {
+		return documentNodes[i] < documentNodes[j]
+	})
+	indexed, err := c.withCanonicalDocumentIndex(ctx)
 	if err != nil {
 		return nil, err
+	}
+	canonical := make(map[shoal.ID]*canonicalRetrievalDocument)
+	for _, id := range documentNodes {
+		_, err := c.canonicalRegisteredNodesCached(
+			indexed, map[shoal.ID]NodeRegistration{id: allowed[id]}, canonical)
+		if shoal.IsErrorCode(err, shoal.ErrorNotFound) {
+			delete(allowed, id)
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+	}
+	return allowed, nil
+}
+
+// lexiconScopeDigest names one authorization scope for a pinned bundle: the
+// caller's exact authorization fingerprint, its policy generation and the
+// snapshot. Two callers with different grants, or one caller at another
+// generation or snapshot, get different digests.
+func lexiconScopeDigest(
+	decision auth.Decision,
+	snapshot lexicon.Snapshot,
+) ([32]byte, error) {
+	fingerprint, err := auth.AuthorizationFingerprint(decision)
+	if err != nil {
+		return [32]byte{}, authorizationDenied()
+	}
+	hash := sha256.New()
+	writeString := func(value string) {
+		var length [8]byte
+		binary.BigEndian.PutUint64(length[:], uint64(len(value)))
+		hash.Write(length[:])
+		hash.Write([]byte(value))
+	}
+	writeUint := func(value uint64) {
+		var buf [8]byte
+		binary.BigEndian.PutUint64(buf[:], value)
+		hash.Write(buf[:])
+	}
+	writeString("shoal-lexicon-scope-v1")
+	hash.Write(fingerprint[:])
+	// The fingerprint already covers the generation; it is written again so
+	// the digest states its inputs on its own.
+	writeUint(uint64(decision.PolicyGeneration()))
+	writeString(snapshot.ID)
+	writeUint(snapshot.Frontier)
+	writeUint(uint64(snapshot.AsOf.UTC().UnixNano()))
+	var digest [32]byte
+	copy(digest[:], hash.Sum(nil))
+	return digest, nil
+}
+
+// LexiconScopeNodes filters a builder's node set to the nodes the caller may
+// currently see under the neighborhood operation, and seals the result as
+// lexicon.ScopedNodes: the only input from which a pinned, shippable bundle
+// can be built. Its scope digest is computed from the caller's authorization
+// fingerprint, policy generation and snapshot, so it is never a caller's
+// claim, and two callers' scoped bundles carry different scopes.
+//
+// Visibility is the same as for ResolveMentions: the current node rule, and
+// for a document-section node the canonical-revision check. The catalog is
+// read in one batch; only the node data itself is the builder's.
+func (c *Client) LexiconScopeNodes(
+	ctx context.Context,
+	snapshot lexicon.Snapshot,
+	nodes []graph.Node,
+) (lexicon.ScopedNodes, error) {
+	decision, guard, now, err := c.begin(ctx, auth.OperationNeighborhood)
+	if err != nil {
+		return lexicon.ScopedNodes{}, err
+	}
+	if snapshot.ID == "" || snapshot.AsOf.IsZero() {
+		return lexicon.ScopedNodes{}, shoal.NewError(
+			shoal.ErrorInvalidArgument, "lexicon scope snapshot is required")
 	}
 	ids := make([]shoal.ID, len(nodes))
 	for index, node := range nodes {
 		if err := shoal.ValidateRequiredID("graph node ID", node.ID); err != nil {
-			return nil, err
+			return lexicon.ScopedNodes{}, err
 		}
 		ids[index] = node.ID
 	}
 	resolved, err := c.resolveNodes(ctx, ids)
 	if err != nil {
-		return nil, err
+		return lexicon.ScopedNodes{}, err
+	}
+	allowed, err := allowedRegistrations(resolved, ids, decision, now)
+	if err != nil {
+		return lexicon.ScopedNodes{}, err
+	}
+	allowed, err = c.dropNonCanonical(ctx, allowed)
+	if err != nil {
+		return lexicon.ScopedNodes{}, err
 	}
 	var visible []graph.Node
 	for _, node := range nodes {
-		registration, ok := resolved[node.ID]
-		if !ok {
-			continue
+		if _, ok := allowed[node.ID]; ok {
+			visible = append(visible, node)
 		}
-		allowed, err := ruleAllows(
-			registration.Rule, decision, auth.OperationNeighborhood, now)
-		if err != nil {
-			return nil, err
-		}
-		if allowed {
-			visible = append(visible, cloneGraphNode(node))
-		}
+	}
+	digest, err := lexiconScopeDigest(decision, snapshot)
+	if err != nil {
+		return lexicon.ScopedNodes{}, err
 	}
 	if err := guard.Check(ctx); err != nil {
-		return nil, err
+		return lexicon.ScopedNodes{}, err
 	}
-	return visible, nil
+	scoped, ok := lexiconscope.Seal(
+		visible, snapshot.ID, snapshot.AsOf, snapshot.Frontier, digest,
+	).(lexicon.ScopedNodes)
+	if !ok {
+		return lexicon.ScopedNodes{}, inconsistentBase()
+	}
+	return scoped, nil
 }

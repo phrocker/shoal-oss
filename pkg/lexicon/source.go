@@ -38,6 +38,7 @@ package lexicon
 import (
 	"time"
 
+	"github.com/phrocker/shoal-oss/internal/lexiconscope"
 	"github.com/phrocker/shoal-oss/pkg/graph"
 	"github.com/phrocker/shoal-oss/pkg/ontology"
 )
@@ -79,11 +80,67 @@ type Scope interface {
 // it cannot be exported.
 type ScopeServerFiltered struct{}
 
-// ScopePinned marks a bundle built from nodes already filtered for one
-// authorization scope, identified by Digest. Only such a bundle can be
-// shipped.
+// ScopePinned marks a bundle built from ScopedNodes: nodes an authorized
+// filter selected for one caller's authorization at one policy generation and
+// snapshot, identified by Digest. Only such a bundle can be shipped. A
+// ScopePinned value is read-only; it cannot be used to build a bundle.
 type ScopePinned struct {
-	Digest [32]byte
+	digest [32]byte
+}
+
+// Digest identifies the authorization scope, policy generation and snapshot
+// the bundle's nodes were filtered for.
+func (s ScopePinned) Digest() [32]byte { return s.digest }
+
+// ScopedNodes is a node set an authorized filter selected for one scope. It
+// can be made only by that filter (pkg/explorer/authorized
+// Client.LexiconScopeNodes), so a pinned bundle can be built only from nodes
+// that were actually filtered, and its scope digest is computed rather than
+// claimed. The zero value is refused by Build.
+type ScopedNodes struct {
+	nodes    []graph.Node
+	snapshot Snapshot
+	digest   [32]byte
+}
+
+// Len is the number of nodes in the scope.
+func (s ScopedNodes) Len() int { return len(s.nodes) }
+
+// Snapshot is the snapshot the scope was computed for.
+func (s ScopedNodes) Snapshot() Snapshot { return s.snapshot }
+
+// Scope is the pinned scope a bundle built from s will carry.
+func (s ScopedNodes) Scope() ScopePinned { return ScopePinned{digest: s.digest} }
+
+// sealScopedNodes is the only constructor of a non-zero ScopedNodes. It is
+// reachable from outside this package only through the module-internal
+// lexiconscope hook, which the authorized filter calls.
+func sealScopedNodes(
+	nodes []graph.Node, snapshot Snapshot, digest [32]byte,
+) ScopedNodes {
+	cloned := make([]graph.Node, len(nodes))
+	for index, node := range nodes {
+		node.Labels = append([]string(nil), node.Labels...)
+		properties := make(map[string]string, len(node.Properties))
+		for key, value := range node.Properties {
+			properties[key] = value
+		}
+		node.Properties = properties
+		cloned[index] = node
+	}
+	snapshot.AsOf = snapshot.AsOf.UTC()
+	return ScopedNodes{nodes: cloned, snapshot: snapshot, digest: digest}
+}
+
+func init() {
+	lexiconscope.Seal = func(
+		nodes []graph.Node, snapshotID string, asOf time.Time, frontier uint64,
+		digest [32]byte,
+	) any {
+		return sealScopedNodes(nodes, Snapshot{
+			ID: snapshotID, AsOf: asOf, Frontier: frontier,
+		}, digest)
+	}
 }
 
 const (
@@ -95,13 +152,18 @@ func (ScopeServerFiltered) scopeKind() byte { return scopeKindServerFiltered }
 func (ScopePinned) scopeKind() byte         { return scopeKindPinned }
 
 // Input is everything a build reads. Nothing in the graph lists every node, so
-// the caller supplies the node set; for a pinned scope it must already be
-// filtered to that scope. Order of Nodes, of their properties and of
+// the caller supplies the node set. Order of Nodes, of their properties and of
 // Relationships does not affect the result.
+//
+// With Scoped nil the bundle is ScopeServerFiltered and built from Nodes.
+// With Scoped set the bundle is ScopePinned: its nodes and snapshot come from
+// Scoped only, Nodes must be empty, Snapshot must be zero or equal Scoped's,
+// and Relationships must be empty, because lookup templates reveal relation
+// types and are not yet filtered by scope.
 type Input struct {
 	Snapshot      Snapshot
-	Scope         Scope
 	Nodes         []graph.Node
+	Scoped        *ScopedNodes
 	Relationships []ontology.RelationshipDefinition
 	// DeriveInitialisms adds, for each name or title of at least
 	// MinInitialismTokens tokens, the initialism of its tokens as a term with

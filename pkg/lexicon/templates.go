@@ -83,11 +83,19 @@ func DeriveTemplates(
 	relationships []ontology.RelationshipDefinition,
 ) ([]Template, error) {
 	templates := make([]Template, 0, 2*len(relationships))
+	keys := make(map[string]struct{}, len(relationships))
 	for _, relationship := range relationships {
 		if err := relationship.Validate(); err != nil {
 			return nil, shoal.WrapError(
 				shoal.ErrorInvalidArgument, "lexicon relationship is invalid", err)
 		}
+		// Checked on the key itself: a directed and an undirected definition
+		// with one key give template IDs that do not collide.
+		if _, duplicate := keys[relationship.Key()]; duplicate {
+			return nil, shoal.NewError(
+				shoal.ErrorInvalidArgument, "lexicon relationship keys must be unique")
+		}
+		keys[relationship.Key()] = struct{}{}
 		key := relationship.Key()
 		from := sortedIDs(relationship.FromConcepts())
 		to := sortedIDs(relationship.ToConcepts())

@@ -20,10 +20,12 @@
 package lexicon
 
 import (
+	"fmt"
 	"math"
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/phrocker/shoal-oss/pkg/graph"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
@@ -107,13 +109,30 @@ func Build(in Input, limits Limits) (*Bundle, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := validateSnapshot(in.Snapshot); err != nil {
+	snapshot, scope, inputNodes := in.Snapshot, Scope(ScopeServerFiltered{}), in.Nodes
+	if in.Scoped != nil {
+		if in.Scoped.digest == ([32]byte{}) {
+			return nil, invalid(
+				"lexicon scoped nodes must come from an authorized scope filter")
+		}
+		if len(in.Nodes) > 0 {
+			return nil, invalid("a pinned lexicon build takes its nodes from Scoped only")
+		}
+		if len(in.Relationships) > 0 {
+			// Templates reveal relation types and are not yet filtered by
+			// scope, so a shippable bundle carries none.
+			return nil, invalid("a pinned lexicon bundle cannot carry lookup templates")
+		}
+		if in.Snapshot != (Snapshot{}) && !sameSnapshot(in.Snapshot, in.Scoped.snapshot) {
+			return nil, invalid("lexicon snapshot differs from the scoped nodes' snapshot")
+		}
+		snapshot, scope, inputNodes = in.Scoped.snapshot,
+			ScopePinned{digest: in.Scoped.digest}, in.Scoped.nodes
+	}
+	if err := validateSnapshot(snapshot); err != nil {
 		return nil, err
 	}
-	if err := validateScope(in.Scope); err != nil {
-		return nil, err
-	}
-	if len(in.Nodes) > limits.MaxNodes {
+	if len(inputNodes) > limits.MaxNodes {
 		return nil, limitExceeded("node")
 	}
 
@@ -121,8 +140,8 @@ func Build(in Input, limits Limits) (*Bundle, error) {
 		kind  string
 		terms map[string]Origin
 	}
-	byNode := make(map[shoal.ID]*nodeTerms, len(in.Nodes))
-	for _, node := range in.Nodes {
+	byNode := make(map[shoal.ID]*nodeTerms, len(inputNodes))
+	for _, node := range inputNodes {
 		if err := node.Validate(); err != nil {
 			return nil, shoal.WrapError(
 				shoal.ErrorInvalidArgument, "lexicon node is invalid", err)
@@ -135,13 +154,20 @@ func Build(in Input, limits Limits) (*Bundle, error) {
 		}
 		entry := &nodeTerms{kind: node.Kind, terms: make(map[string]Origin)}
 		byNode[node.ID] = entry
-		for _, surface := range surfaces(node) {
-			tokens := tokenTexts(surface.text)
-			if len(tokens) == 0 {
-				continue
-			}
+		nodeSurfaces, err := surfaces(node)
+		if err != nil {
+			return nil, err
+		}
+		for _, surface := range nodeSurfaces {
+			tokens := surface.tokens
 			if err := checkTerm(tokens, limits); err != nil {
 				return nil, err
+			}
+			for _, token := range tokens {
+				if !canonicalToken(token) {
+					return nil, nodeError(node.ID, surface.property,
+						"does not normalize to a stable token")
+				}
 			}
 			addTerm(entry.terms, tokens, surface.origin)
 			if !in.DeriveInitialisms || surface.origin > OriginTitle ||
@@ -229,8 +255,8 @@ func Build(in Input, limits Limits) (*Bundle, error) {
 	}
 	encoded, err := encode(&contents{
 		flags:     flags,
-		snapshot:  in.Snapshot,
-		scope:     in.Scope,
+		snapshot:  snapshot,
+		scope:     scope,
 		tokens:    tokens,
 		nodes:     nodes,
 		terms:     terms,
@@ -251,29 +277,83 @@ func Build(in Input, limits Limits) (*Bundle, error) {
 const termSeparator = "\x00"
 
 type surface struct {
-	text   string
-	origin Origin
+	property string
+	tokens   []string
+	origin   Origin
 }
 
-func surfaces(node graph.Node) []surface {
+func nodeError(id shoal.ID, property, message string) error {
+	return invalid(fmt.Sprintf(
+		"lexicon node %q property %q %s", string(id), property, message))
+}
+
+// surfaces reads every term source of a node. Nothing is skipped: a name
+// that yields no tokens falls back to the title, and a node whose name and
+// title both yield none, or whose entity key or alias yields none, fails the
+// build. Invalid UTF-8 fails rather than being replaced, which could merge
+// distinct names.
+func surfaces(node graph.Node) ([]surface, error) {
+	read := func(property string, origin Origin) (surface, bool, error) {
+		value := node.Properties[property]
+		if value == "" {
+			return surface{}, false, nil
+		}
+		if !utf8.ValidString(value) {
+			return surface{}, false, nodeError(node.ID, property, "is not valid UTF-8")
+		}
+		tokens := tokenTexts(value)
+		return surface{property: property, tokens: tokens, origin: origin},
+			len(tokens) > 0, nil
+	}
 	var out []surface
-	if name := node.Properties[PropertyName]; name != "" {
-		out = append(out, surface{text: name, origin: OriginName})
-	} else if title := node.Properties[PropertyTitle]; title != "" {
-		out = append(out, surface{text: title, origin: OriginTitle})
+	name, nameOK, err := read(PropertyName, OriginName)
+	if err != nil {
+		return nil, err
 	}
-	if key := node.Properties[PropertyEntityKey]; key != "" {
-		out = append(out, surface{text: key, origin: OriginEntityKey})
+	title, titleOK, err := read(PropertyTitle, OriginTitle)
+	if err != nil {
+		return nil, err
 	}
-	for key, value := range node.Properties {
-		if len(key) > len(PropertyAliasPrefix) &&
-			strings.HasPrefix(key, PropertyAliasPrefix) && value != "" {
-			out = append(out, surface{text: value, origin: OriginAlias})
+	switch {
+	case nameOK:
+		out = append(out, name)
+	case titleOK:
+		out = append(out, title)
+	case name.property != "" || title.property != "":
+		property := name.property
+		if property == "" {
+			property = title.property
+		}
+		return nil, nodeError(node.ID, property, "yields no tokens and no usable title")
+	}
+	keys := []string{PropertyEntityKey}
+	for key := range node.Properties {
+		if len(key) > len(PropertyAliasPrefix) && strings.HasPrefix(key, PropertyAliasPrefix) {
+			keys = append(keys, key)
 		}
 	}
-	// Map iteration order is random; the result is order-independent because
-	// addTerm keeps the minimum origin per term.
-	return out
+	sort.Strings(keys[1:])
+	for _, key := range keys {
+		origin := OriginAlias
+		if key == PropertyEntityKey {
+			origin = OriginEntityKey
+		}
+		value, ok, err := read(key, origin)
+		if err != nil {
+			return nil, err
+		}
+		if value.property != "" && !ok {
+			return nil, nodeError(node.ID, key, "yields no tokens")
+		}
+		if ok {
+			out = append(out, value)
+		}
+	}
+	return out, nil
+}
+
+func sameSnapshot(a, b Snapshot) bool {
+	return a.ID == b.ID && a.Frontier == b.Frontier && a.AsOf.Equal(b.AsOf)
 }
 
 func checkTerm(tokens []string, limits Limits) error {
@@ -363,7 +443,7 @@ func validateScope(scope Scope) error {
 	case ScopeServerFiltered:
 		return nil
 	case ScopePinned:
-		if value.Digest == ([32]byte{}) {
+		if value.digest == ([32]byte{}) {
 			return invalid("lexicon pinned scope digest is required")
 		}
 		return nil
