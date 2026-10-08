@@ -18,29 +18,35 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
-	"github.com/phrocker/shoal-oss/pkg/explorer/fleet"
+	admissionapi "github.com/phrocker/shoal-oss/pkg/admission/api"
 )
 
 // The admission client is the proxy's whole relationship with Shoal.
 //
-// It speaks HTTP to the explorer rather than importing the fleet package,
-// because the proxy is a separate process on purpose: it handles untrusted
-// prompt content from arbitrary callers and talks to third-party endpoints, and
-// the explorer holds the policy store and the corpus. Linking them would put
-// prompt injection in the same address space as the decision plane (#390).
+// It speaks HTTP to the explorer through the public contract in
+// pkg/admission/api rather than importing the fleet package, because the proxy
+// is a separate process on purpose: it handles untrusted prompt content from
+// arbitrary callers and talks to third-party endpoints, and the explorer holds
+// the policy store and the corpus. Linking them would put prompt injection in
+// the same address space as the decision plane (#390).
+//
+// What follows is a thin adapter. The wire types, the grant checks (an unknown
+// outcome is not an allowance, a token must be reportable and must echo the
+// claim this proxy chose) and the transport rules (no redirects, no cookie
+// jar) live in the client; this file maps its answers on to the two errors the
+// proxy branches on.
 
 // ErrPlaneUnreachable means the decision could not be obtained at all.
 //
@@ -53,15 +59,6 @@ var ErrPlaneUnreachable = errors.New("shoal-llm-gateway: decision plane unreacha
 
 // ErrDenied means Shoal refused the call.
 var ErrDenied = errors.New("shoal-llm-gateway: admission denied")
-
-// admissionOutcome mirrors the three answers the seam can give. The proxy
-// compares against these strings rather than importing the fleet package, so a
-// value it does not recognise is handled below rather than silently accepted.
-const (
-	outcomeDenied    = "denied"
-	outcomeAllowed   = "allowed"
-	outcomeObligated = "allowed_with_obligations"
-)
 
 // admissionClient asks before the call and reports after it.
 type admissionClient struct {
@@ -81,6 +78,10 @@ type admissionClient struct {
 	sourceID []byte
 	policyID []byte
 	lease    time.Duration
+
+	once   sync.Once
+	plane  *admissionapi.Client
+	broken error
 }
 
 // grant is what the proxy acts on.
@@ -90,103 +91,30 @@ type grant struct {
 	// the whole call when the plane has said which part to drop would discard
 	// the useful answer for the blunt one (#390).
 	Withhold []string
-	token    admissionToken
+	token    admissionapi.Token
 }
 
-type admissionToken struct {
-	ActionID  string    `json:"action_id"`
-	TokenID   string    `json:"token_id"`
-	Version   uint64    `json:"version"`
-	ExpiresAt time.Time `json:"expires_at"`
-}
-
-// reportable reports whether a grant's token could actually close the loop.
-//
 // minimumReportWindow is the margin the report itself needs. A token that
 // expires while the upstream call is still running cannot be reported at all,
 // so a grant arriving with less than this left is refused rather than spent.
 const minimumReportWindow = 5 * time.Second
 
-func (t *admissionToken) reportable(now time.Time) error {
-	if t == nil {
-		return errors.New("allowed without a token")
-	}
-	for name, value := range map[string]string{
-		"action ID": t.ActionID, "token ID": t.TokenID,
-	} {
-		decoded, err := base64.RawURLEncoding.DecodeString(value)
-		if err != nil || len(decoded) == 0 {
-			return fmt.Errorf("token %s is not a usable identity", name)
+// client builds the public admission client once, from the configured base
+// URL, transport and credential. main builds it eagerly so a base URL the
+// client refuses fails at startup rather than on every call.
+func (c *admissionClient) client() (*admissionapi.Client, error) {
+	c.once.Do(func() {
+		if c.base == nil {
+			c.broken = errors.New("admission plane URL is not configured")
+			return
 		}
-		// The byte bound the report endpoint applies, applied before the
-		// egress instead of after it. AdmissionToken.validate runs both IDs
-		// through validateOpaque, which refuses anything over
-		// fleet.MaxActionIDBytes — so an over-long ID is a grant that passes
-		// here, is spent on the upstream call, and can then never be reported.
-		// That is the exact outcome this function exists to prevent, and
-		// checking decodability without checking length left half of it open.
-		if len(decoded) > fleet.MaxActionIDBytes {
-			return fmt.Errorf(
-				"token %s exceeds the %d-byte bound the report endpoint applies",
-				name, fleet.MaxActionIDBytes)
-		}
-	}
-	if t.Version == 0 {
-		return errors.New("token version is invalid")
-	}
-	// A missing expiry is refused rather than treated as "no deadline". The
-	// check read "if an expiry is set and it is too close", which let the one
-	// shape it most needed to catch straight through: a plane that answers
-	// without an expiry produced a token this function called reportable and
-	// nothing could establish a window for. Absent is not generous here, it is
-	// unknown, and an unknown deadline cannot be shown to leave room.
-	if t.ExpiresAt.IsZero() {
-		return errors.New("token carries no expiry, so no report window can be established")
-	}
-	if t.ExpiresAt.Sub(now) < minimumReportWindow {
-		return errors.New("token expires before the call could be reported")
-	}
-	return nil
-}
-
-type requestContextWire struct {
-	RequestID     string    `json:"request_id"`
-	CorrelationID string    `json:"correlation_id,omitempty"`
-	ReasonCode    string    `json:"reason_code"`
-	ReasonDetail  string    `json:"reason_detail,omitempty"`
-	Deadline      time.Time `json:"deadline"`
-}
-
-type admissionRequestWire struct {
-	Context         requestContextWire `json:"context"`
-	ID              string             `json:"id"`
-	IdempotencyKey  string             `json:"idempotency_key"`
-	TokenID         string             `json:"token_id"`
-	AgentID         string             `json:"agent_id"`
-	AgentGeneration int64              `json:"agent_generation"`
-	Capability      string             `json:"capability"`
-	Action          string             `json:"action"`
-	SourceID        []byte             `json:"source_id"`
-	PolicyID        []byte             `json:"policy_id"`
-	ObjectID        string             `json:"object_id"`
-	Effects         []string           `json:"effects"`
-	Input           json.RawMessage    `json:"input"`
-	Disclosures     []string           `json:"disclosures,omitempty"`
-	Lease           time.Duration      `json:"lease"`
-}
-
-type admissionGrantWire struct {
-	Outcome  string          `json:"outcome"`
-	Token    *admissionToken `json:"token,omitempty"`
-	Withhold []string        `json:"withhold"`
-}
-
-type admissionReportWire struct {
-	Context   requestContextWire `json:"context"`
-	Token     admissionToken     `json:"token"`
-	Outcome   json.RawMessage    `json:"outcome,omitempty"`
-	Failed    bool               `json:"failed,omitempty"`
-	ErrorCode string             `json:"error_code,omitempty"`
+		c.plane, c.broken = admissionapi.NewClient(admissionapi.Config{
+			BaseURL: c.base.String(), HTTPClient: c.http,
+			// Read per request, so a rotating credential file works.
+			Token: func(context.Context) (string, error) { return c.credential() },
+		})
+	})
+	return c.plane, c.broken
 }
 
 // request asks whether a call may happen.
@@ -202,8 +130,8 @@ func (c *admissionClient) request(
 	disclosures []string,
 	now time.Time,
 ) (grant, error) {
-	body := admissionRequestWire{
-		Context: requestContextWire{
+	body := admissionapi.Request{
+		Context: admissionapi.RequestContext{
 			RequestID:     identity.RequestID,
 			CorrelationID: identity.CorrelationID,
 			ReasonCode:    "llm_gateway_call",
@@ -227,49 +155,25 @@ func (c *admissionClient) request(
 		Disclosures: disclosures,
 		Lease:       c.lease,
 	}
-	var decoded admissionGrantWire
-	if err := c.post(ctx, "request", body, &decoded); err != nil {
-		return grant{}, err
-	}
-	switch decoded.Outcome {
-	case outcomeDenied:
-		return grant{}, ErrDenied
-	case outcomeAllowed, outcomeObligated:
-	default:
-		// An outcome this build does not recognise is not an allowance. A
-		// newer plane could answer in a vocabulary this proxy predates, and
-		// treating the unknown as permission would make every future outcome
-		// default to the permissive reading.
-		return grant{}, fmt.Errorf(
-			"%w: unrecognised admission outcome", ErrPlaneUnreachable)
-	}
-	// An allowance the proxy could not report is refused before the egress,
-	// not discovered after it. Checking only for a nil token left every other
-	// unreportable shape through — an empty object, unparseable identities, a
-	// zero version, a lease already spent — and in each case the call would
-	// have been forwarded and the report then rejected, which is precisely the
-	// unreportable grant this refusal exists to prevent.
-	if err := decoded.Token.reportable(c.clockNow()); err != nil {
+	plane, err := c.client()
+	if err != nil {
 		return grant{}, fmt.Errorf("%w: %v", ErrPlaneUnreachable, err)
 	}
-	// The token ID is an echo, so it is checked rather than trusted.
-	//
-	// The claim is created under the token ID this proxy chose and sent
-	// (dispatch_service.go:378 sets ClaimID from request.TokenID), and the
-	// report selects the claim by the ID that came back. So a response carrying
-	// a different one does not merely misdescribe this call: it makes the proxy
-	// forward the call and then close somebody else's outstanding admission.
-	//
-	// Structural validity could not catch that, because a swapped ID is
-	// perfectly well formed. This is the same rule as not trusting
-	// X-Forwarded-Host — a value we are told, which we can compare against a
-	// value we know, must be compared.
-	if decoded.Token.TokenID != identity.TokenID {
-		return grant{}, fmt.Errorf(
-			"%w: the grant names a different claim than the one requested",
-			ErrPlaneUnreachable)
+	// An allowance the proxy could not report is refused before the egress,
+	// not discovered after it: the client refuses an unknown outcome, a
+	// missing or unusable token (unparseable or over-long IDs, zero version,
+	// no expiry), a token naming a different claim than the one this proxy
+	// chose, and one expiring inside minimumReportWindow.
+	granted, err := plane.Request(ctx, body, admissionapi.RequestOptions{
+		MinReportWindow: minimumReportWindow, Clock: c.clockNow,
+	})
+	switch {
+	case errors.Is(err, admissionapi.ErrDenied):
+		return grant{}, ErrDenied
+	case err != nil:
+		return grant{}, planeError("request", err)
 	}
-	return grant{Withhold: decoded.Withhold, token: *decoded.Token}, nil
+	return grant{Withhold: granted.Withhold, token: *granted.Token}, nil
 }
 
 // report closes the loop.
@@ -281,14 +185,14 @@ func (c *admissionClient) request(
 // indistinguishable from a caller that went dark.
 func (c *admissionClient) report(
 	ctx context.Context,
-	token admissionToken,
+	token admissionapi.Token,
 	identity callerIdentity,
 	outcome json.RawMessage,
 	failure string,
 	now time.Time,
 ) error {
-	body := admissionReportWire{
-		Context: requestContextWire{
+	body := admissionapi.Report{
+		Context: admissionapi.RequestContext{
 			RequestID:     identity.RequestID,
 			CorrelationID: identity.CorrelationID,
 			ReasonCode:    "llm_gateway_report",
@@ -305,59 +209,38 @@ func (c *admissionClient) report(
 	} else {
 		body.Outcome = outcome
 	}
-	return c.post(ctx, "report", body, nil)
+	plane, err := c.client()
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrPlaneUnreachable, err)
+	}
+	if _, err := plane.Report(ctx, body); err != nil {
+		return planeError("report", err)
+	}
+	return nil
 }
 
-func (c *admissionClient) post(
-	ctx context.Context, route string, body any, out any,
-) error {
-	encoded, err := json.Marshal(body)
-	if err != nil {
+// planeError folds every way of not getting an answer into
+// ErrPlaneUnreachable.
+func planeError(route string, err error) error {
+	var status *admissionapi.HTTPError
+	if !errors.As(err, &status) {
 		return fmt.Errorf("%w: %v", ErrPlaneUnreachable, err)
 	}
-	endpoint := c.base.JoinPath("api", "v1", "admission", route)
-	request, err := http.NewRequestWithContext(
-		ctx, http.MethodPost, endpoint.String(), bytes.NewReader(encoded))
-	if err != nil {
-		return fmt.Errorf("%w: %v", ErrPlaneUnreachable, err)
-	}
-	credential, err := c.credential()
-	if err != nil {
-		return fmt.Errorf("%w: %v", ErrPlaneUnreachable, err)
-	}
-	request.Header.Set("Authorization", "Bearer "+credential)
-	request.Header.Set("Content-Type", "application/json")
-	response, err := c.http.Do(request)
-	if err != nil {
-		return fmt.Errorf("%w: %v", ErrPlaneUnreachable, err)
-	}
-	defer response.Body.Close()
-	switch {
-	case response.StatusCode == http.StatusOK,
-		response.StatusCode == http.StatusCreated:
-	case response.StatusCode == http.StatusForbidden,
-		response.StatusCode == http.StatusUnauthorized:
+	switch status.Status {
+	case http.StatusForbidden, http.StatusUnauthorized:
 		// The plane answered and refused this proxy's own credential. That is
 		// a denial of the proxy, not of the caller, and it is reported as
 		// unreachable rather than as a policy denial on the call: the caller's
 		// request was never adjudicated.
 		return fmt.Errorf("%w: proxy credential rejected", ErrPlaneUnreachable)
 	default:
-		// The body is deliberately not included. A plane error can carry
-		// detail the caller is not entitled to, and this error reaches a
+		// The plane's message is deliberately not included. A plane error can
+		// carry detail the caller is not entitled to, and this error reaches a
 		// caller-facing response.
 		return fmt.Errorf(
 			"%w: admission %s returned %d",
-			ErrPlaneUnreachable, route, response.StatusCode)
+			ErrPlaneUnreachable, route, status.Status)
 	}
-	if out == nil {
-		_, _ = io.Copy(io.Discard, response.Body)
-		return nil
-	}
-	if err := json.NewDecoder(response.Body).Decode(out); err != nil {
-		return fmt.Errorf("%w: %v", ErrPlaneUnreachable, err)
-	}
-	return nil
 }
 
 // encodeID renders an opaque identity the way every fleet wire field expects.
@@ -466,11 +349,11 @@ func planeURL(raw string, allowPlaintext bool) (*url.URL, error) {
 // declared whatever the provider is.
 func declaredEffects(upstream *url.URL) []string {
 	if upstream != nil && isLoopback(upstream.Hostname()) {
-		return []string{string(fleet.EffectReadsCorpus)}
+		return []string{admissionapi.EffectReadsCorpus}
 	}
 	return []string{
-		string(fleet.EffectEgressesContent),
-		string(fleet.EffectReadsCorpus),
+		admissionapi.EffectEgressesContent,
+		admissionapi.EffectReadsCorpus,
 	}
 }
 

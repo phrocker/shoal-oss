@@ -38,7 +38,7 @@ import (
 	"time"
 
 	"github.com/phrocker/shoal-oss/internal/healthsurface"
-	"github.com/phrocker/shoal-oss/pkg/explorer/fleet"
+	admissionapi "github.com/phrocker/shoal-oss/pkg/admission/api"
 )
 
 func main() {
@@ -148,7 +148,7 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 	lease := flags.Duration("lease", defaultLease,
 		"Admission lease. A call must be reported within it or the grant shows "+
 			"as outstanding. The fleet refuses a lease above "+
-			fleet.MaxActionClaimTTL.String()+" rather than shortening it, so a "+
+			admissionapi.MaxLease.String()+" rather than shortening it, so a "+
 			"larger value denies every call instead of degrading, and it must "+
 			"exceed -request-timeout by at least "+
 			minimumReportWindow.String()+" so the call can still be reported")
@@ -267,6 +267,11 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 		agentID:    *agentID, agentGeneration: *agentGeneration,
 		capability: *capability, action: *action,
 		sourceID: source, policyID: policy, lease: *lease,
+	}
+	// Built now so a plane URL the admission client refuses (credentials, a
+	// query or a fragment in it) stops startup instead of failing every call.
+	if _, err := admission.client(); err != nil {
+		return fmt.Errorf("-admission-url %v", err)
 	}
 	listener, err := listenTCP("tcp", *listen)
 	if err != nil {
@@ -446,8 +451,8 @@ func credentialSource(
 //
 // It mirrors validateName in pkg/explorer/fleet/model.go, which is unexported —
 // a duplication worth naming out loud, since the two can drift. The bound is
-// taken from fleet.MaxNameBytes rather than copied, so at least the number
-// cannot.
+// taken from admissionapi.MaxNameBytes, whose parity with the fleet's is
+// tested, so at least the number cannot.
 //
 // Without this, a name over the bound or carrying a stray space or an
 // unsupported character is static configuration that starts cleanly, passes
@@ -462,8 +467,8 @@ func fleetName(flagName, value string) error {
 	if value == "" {
 		return fmt.Errorf("%s is required", flagName)
 	}
-	if len(value) > fleet.MaxNameBytes {
-		return fmt.Errorf("%s must be at most %d bytes", flagName, fleet.MaxNameBytes)
+	if len(value) > admissionapi.MaxNameBytes {
+		return fmt.Errorf("%s must be at most %d bytes", flagName, admissionapi.MaxNameBytes)
 	}
 	if strings.TrimSpace(value) != value {
 		return fmt.Errorf("%s must not have leading or trailing whitespace", flagName)
@@ -517,8 +522,8 @@ func validateDurations(lease, requestTimeout time.Duration) error {
 	if lease <= 0 || requestTimeout <= 0 {
 		return errors.New("-lease and -request-timeout must be positive")
 	}
-	if lease > fleet.MaxActionClaimTTL {
-		return fmt.Errorf("-lease must not exceed %s", fleet.MaxActionClaimTTL)
+	if lease > admissionapi.MaxLease {
+		return fmt.Errorf("-lease must not exceed %s", admissionapi.MaxLease)
 	}
 	if lease <= requestTimeout+minimumReportWindow {
 		return fmt.Errorf(

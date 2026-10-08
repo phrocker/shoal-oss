@@ -28,6 +28,8 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	admissionapi "github.com/phrocker/shoal-oss/pkg/admission/api"
 )
 
 // refuseRedirect stops a redirect from escaping the transport rule.
@@ -358,7 +360,7 @@ func (p *proxy) relay(
 // drift from itself.
 func (p *proxy) reportOutcome(
 	ctx context.Context,
-	token admissionToken,
+	token admissionapi.Token,
 	identity callerIdentity,
 	status int,
 	transferred int64,
@@ -380,7 +382,7 @@ func (p *proxy) reportOutcome(
 }
 
 func (p *proxy) reportFailure(
-	ctx context.Context, token admissionToken, identity callerIdentity, code string,
+	ctx context.Context, token admissionapi.Token, identity callerIdentity, code string,
 ) {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), minimumReportWindow)
 	defer cancel()

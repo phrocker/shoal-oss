@@ -32,15 +32,15 @@ import (
 	"testing"
 	"time"
 
-	"github.com/phrocker/shoal-oss/pkg/explorer/fleet"
+	admissionapi "github.com/phrocker/shoal-oss/pkg/admission/api"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
 // fakePlane stands in for the explorer's admission surface.
 type fakePlane struct {
-	outcome  string
+	outcome  admissionapi.Outcome
 	withhold []string
-	token    *admissionToken
+	token    *admissionapi.Token
 	// echoTokenID mirrors what a real plane does: the claim is created under
 	// the token ID the caller sent, so the grant carries that ID back. The fake
 	// returned a fixed one, which made it unable to express the swapped-token
@@ -48,18 +48,18 @@ type fakePlane struct {
 	// this off, so the fixture does not repair the value under test.
 	echoTokenID bool
 	status      int
-	requests    []admissionRequestWire
-	reports     []admissionReportWire
+	requests    []admissionapi.Request
+	reports     []admissionapi.Report
 	server      *httptest.Server
 }
 
-func newFakePlane(t *testing.T, outcome string, withhold []string) *fakePlane {
+func newFakePlane(t *testing.T, outcome admissionapi.Outcome, withhold []string) *fakePlane {
 	t.Helper()
 	plane := &fakePlane{
 		outcome: outcome, withhold: withhold,
 		status: http.StatusOK, echoTokenID: true,
 	}
-	plane.token = &admissionToken{
+	plane.token = &admissionapi.Token{
 		ActionID: "YWN0aW9u", TokenID: "dG9rZW4", Version: 1,
 		ExpiresAt: time.Now().Add(time.Minute),
 	}
@@ -72,13 +72,14 @@ func newFakePlane(t *testing.T, outcome string, withhold []string) *fakePlane {
 			raw, _ := io.ReadAll(request.Body)
 			switch {
 			case strings.HasSuffix(request.URL.Path, "/request"):
-				var decoded admissionRequestWire
+				var decoded admissionapi.Request
 				_ = json.Unmarshal(raw, &decoded)
 				plane.requests = append(plane.requests, decoded)
-				body := admissionGrantWire{
-					Outcome: plane.outcome, Withhold: plane.withhold,
+				// As the handler does: withhold is always present.
+				body := admissionapi.Grant{
+					Outcome: plane.outcome, Withhold: append([]string{}, plane.withhold...),
 				}
-				if plane.outcome != outcomeDenied {
+				if plane.outcome != admissionapi.OutcomeDenied {
 					body.Token = plane.token
 					if plane.echoTokenID && plane.token != nil {
 						echoed := *plane.token
@@ -88,10 +89,19 @@ func newFakePlane(t *testing.T, outcome string, withhold []string) *fakePlane {
 				}
 				_ = json.NewEncoder(writer).Encode(body)
 			case strings.HasSuffix(request.URL.Path, "/report"):
-				var decoded admissionReportWire
+				var decoded admissionapi.Report
 				_ = json.Unmarshal(raw, &decoded)
 				plane.reports = append(plane.reports, decoded)
-				writer.WriteHeader(http.StatusOK)
+				// A real receipt, shaped as the handler encodes one: the client
+				// checks that it acknowledges the reported admission.
+				state := admissionapi.DispatchSucceeded
+				if decoded.Failed {
+					state = admissionapi.DispatchFailed
+				}
+				_ = json.NewEncoder(writer).Encode(admissionapi.Receipt{
+					ActionID: decoded.Token.ActionID, Version: decoded.Token.Version + 1,
+					State: state, ReportedAt: time.Now(),
+				})
 			default:
 				writer.WriteHeader(http.StatusNotFound)
 			}
@@ -205,7 +215,7 @@ const plainCall = `{"model":"gpt","messages":[{"role":"user","content":"hello"}]
 // TestAnUnmodifiedClientIsGoverned is the acceptance criterion the proxy exists
 // for: a caller that knows nothing about Shoal works through it unchanged.
 func TestAnUnmodifiedClientIsGoverned(t *testing.T) {
-	plane := newFakePlane(t, outcomeAllowed, nil)
+	plane := newFakePlane(t, admissionapi.OutcomeAllowed, nil)
 	upstream := newFakeUpstream(t)
 	governed, _ := newTestProxy(t, plane, upstream)
 
@@ -231,7 +241,7 @@ func TestAnUnmodifiedClientIsGoverned(t *testing.T) {
 // whether content may be transmitted does not hold a copy of it. A proxy that
 // forwarded the prompt for adjudication would defeat the thing it is built on.
 func TestShoalNeverReceivesThePrompt(t *testing.T) {
-	plane := newFakePlane(t, outcomeAllowed, nil)
+	plane := newFakePlane(t, admissionapi.OutcomeAllowed, nil)
 	upstream := newFakeUpstream(t)
 	governed, _ := newTestProxy(t, plane, upstream)
 
@@ -264,7 +274,7 @@ func TestShoalNeverReceivesThePrompt(t *testing.T) {
 // TestADenialNeverReachesTheUpstream is the stop this proxy is for. Everywhere
 // else in Shoal enforcement withholds from a response that is still produced.
 func TestADenialNeverReachesTheUpstream(t *testing.T) {
-	plane := newFakePlane(t, outcomeDenied, nil)
+	plane := newFakePlane(t, admissionapi.OutcomeDenied, nil)
 	upstream := newFakeUpstream(t)
 	governed, _ := newTestProxy(t, plane, upstream)
 
@@ -288,7 +298,7 @@ func TestADenialNeverReachesTheUpstream(t *testing.T) {
 // one told "unavailable" should, and an operator needs to tell an outage from a
 // policy change.
 func TestAnUnreachablePlaneDeniesAndSaysSo(t *testing.T) {
-	plane := newFakePlane(t, outcomeAllowed, nil)
+	plane := newFakePlane(t, admissionapi.OutcomeAllowed, nil)
 	plane.status = http.StatusInternalServerError
 	upstream := newFakeUpstream(t)
 	governed, logged := newTestProxy(t, plane, upstream)
@@ -335,7 +345,7 @@ func TestAnUnreachablePlaneDeniesAndSaysSo(t *testing.T) {
 // label stripped, and every assertion passed.
 func TestAWithholdObligationCannotBeSatisfiedOnThisRequestShape(t *testing.T) {
 	const material = "the restricted paragraph that doc-b actually contains"
-	plane := newFakePlane(t, outcomeObligated, []string{docB})
+	plane := newFakePlane(t, admissionapi.OutcomeObligated, []string{docB})
 	upstream := newFakeUpstream(t)
 	governed, _ := newTestProxy(t, plane, upstream)
 
@@ -364,7 +374,7 @@ func TestAWithholdObligationCannotBeSatisfiedOnThisRequestShape(t *testing.T) {
 	// An allow with no obligations still forwards, or this has turned the
 	// proxy into something that refuses everything the plane constrains and
 	// also everything it does not.
-	plane.withhold, plane.outcome = nil, outcomeAllowed
+	plane.withhold, plane.outcome = nil, admissionapi.OutcomeAllowed
 	plane.reports = nil
 	if response := post(t, governed, plainCall); response.Code != http.StatusOK {
 		t.Fatalf("an unobligated call was refused: %d", response.Code)
@@ -382,7 +392,7 @@ func TestAnUnsatisfiableObligationRefusesAndReports(t *testing.T) {
 	// different diagnosis from the case above — the plane and the caller
 	// disagree about what this call is, rather than the proxy being unable to
 	// locate content — and both refuse.
-	plane := newFakePlane(t, outcomeObligated, []string{docNeverDeclared})
+	plane := newFakePlane(t, admissionapi.OutcomeObligated, []string{docNeverDeclared})
 	upstream := newFakeUpstream(t)
 	governed, _ := newTestProxy(t, plane, upstream)
 
@@ -408,7 +418,7 @@ func TestAnUnsatisfiableObligationRefusesAndReports(t *testing.T) {
 // TestAnUpstreamFailureIsReportedAsOne keeps the loop honest: the plane must be
 // able to tell a call that happened and failed from one that never happened.
 func TestAnUpstreamFailureIsReportedAsOne(t *testing.T) {
-	plane := newFakePlane(t, outcomeAllowed, nil)
+	plane := newFakePlane(t, admissionapi.OutcomeAllowed, nil)
 	upstream := newFakeUpstream(t)
 	upstream.status = http.StatusTooManyRequests
 	governed, _ := newTestProxy(t, plane, upstream)
@@ -432,7 +442,7 @@ func TestAnUpstreamFailureIsReportedAsOne(t *testing.T) {
 // the report does not fail this test, and should not: it asserts that the
 // actual completion does not travel, which is the property that matters.
 func TestTheReportCarriesNoCompletion(t *testing.T) {
-	plane := newFakePlane(t, outcomeAllowed, nil)
+	plane := newFakePlane(t, admissionapi.OutcomeAllowed, nil)
 	upstream := newFakeUpstream(t)
 	const secret = "a-completion-nobody-should-store"
 	upstream.body = `{"choices":[{"text":"` + secret + `"}]}`
@@ -454,7 +464,7 @@ func TestTheReportCarriesNoCompletion(t *testing.T) {
 // TestNoPromptOrCompletionIsLogged pins the default configuration. An audit
 // record references the admission, not the payload.
 func TestNoPromptOrCompletionIsLogged(t *testing.T) {
-	plane := newFakePlane(t, outcomeAllowed, nil)
+	plane := newFakePlane(t, admissionapi.OutcomeAllowed, nil)
 	upstream := newFakeUpstream(t)
 	const prompt = "prompt-text-that-must-not-be-logged"
 	const completion = "completion-text-that-must-not-be-logged"
@@ -492,7 +502,7 @@ func TestAnUnrecognisedOutcomeIsNotAnAllowance(t *testing.T) {
 // call admitted with no token can never be reported, and an unreportable call
 // is one the plane can never learn the outcome of.
 func TestAnAllowanceWithoutATokenIsRefused(t *testing.T) {
-	plane := newFakePlane(t, outcomeAllowed, nil)
+	plane := newFakePlane(t, admissionapi.OutcomeAllowed, nil)
 	plane.token = nil
 	upstream := newFakeUpstream(t)
 	governed, _ := newTestProxy(t, plane, upstream)
@@ -514,7 +524,7 @@ func TestAnAllowanceWithoutATokenIsRefused(t *testing.T) {
 // form post with a text/plain content type reaches the same handler and needs
 // no preflight.
 func TestAForeignHostIsRefusedBeforeAnythingHappens(t *testing.T) {
-	plane := newFakePlane(t, outcomeAllowed, nil)
+	plane := newFakePlane(t, admissionapi.OutcomeAllowed, nil)
 	upstream := newFakeUpstream(t)
 	governed, _ := newTestProxy(t, plane, upstream)
 
@@ -590,7 +600,7 @@ func (d *deadlineRecorder) RoundTrip(request *http.Request) (*http.Response, err
 // looser is the bug. The lower bound is here too, because an unbounded report
 // hangs the goroutine that should be closing the grant.
 func TestTheReportFitsInTheWindowReservedForIt(t *testing.T) {
-	plane := newFakePlane(t, outcomeAllowed, nil)
+	plane := newFakePlane(t, admissionapi.OutcomeAllowed, nil)
 	upstream := newFakeUpstream(t)
 	governed, _ := newTestProxy(t, plane, upstream)
 	recorder := &deadlineRecorder{
@@ -634,7 +644,7 @@ func TestTheReportFitsInTheWindowReservedForIt(t *testing.T) {
 // unable to express the condition, rather than a missing assertion — so the
 // fake records the path now and this asserts it exactly.
 func TestTheUpstreamPathIsTheDocumentedOne(t *testing.T) {
-	plane := newFakePlane(t, outcomeAllowed, nil)
+	plane := newFakePlane(t, admissionapi.OutcomeAllowed, nil)
 	upstream := newFakeUpstream(t)
 	governed, _ := newTestProxy(t, plane, upstream)
 	// A base with the version segment, as every OpenAI-compatible client and
@@ -676,7 +686,7 @@ func TestARedirectCannotCarryThePromptOffTheCheckedTransport(t *testing.T) {
 	t.Cleanup(elsewhere.Close)
 
 	t.Run("upstream", func(t *testing.T) {
-		plane := newFakePlane(t, outcomeAllowed, nil)
+		plane := newFakePlane(t, admissionapi.OutcomeAllowed, nil)
 		upstream := newFakeUpstream(t)
 		upstream.status, upstream.location, upstream.body =
 			http.StatusTemporaryRedirect, elsewhere.URL+"/v1/chat/completions", ""
@@ -700,7 +710,7 @@ func TestARedirectCannotCarryThePromptOffTheCheckedTransport(t *testing.T) {
 
 	t.Run("admission", func(t *testing.T) {
 		landed = 0
-		plane := newFakePlane(t, outcomeAllowed, nil)
+		plane := newFakePlane(t, admissionapi.OutcomeAllowed, nil)
 		upstream := newFakeUpstream(t)
 		governed, _ := newTestProxy(t, plane, upstream)
 		redirecting := httptest.NewServer(http.HandlerFunc(
@@ -745,7 +755,7 @@ func TestALoopbackProviderNeedsNoCredential(t *testing.T) {
 	}
 
 	t.Run("loopback forwards unauthenticated", func(t *testing.T) {
-		plane := newFakePlane(t, outcomeAllowed, nil)
+		plane := newFakePlane(t, admissionapi.OutcomeAllowed, nil)
 		upstream := newFakeUpstream(t)
 		governed, _ := newTestProxy(t, plane, upstream)
 		governed.credential = absent
@@ -766,7 +776,7 @@ func TestALoopbackProviderNeedsNoCredential(t *testing.T) {
 	// absence forwarded the prompt with no Authorization header, and a comment
 	// claimed the opposite while nothing in the code could make it true.
 	t.Run("a broken credential is not an absent one", func(t *testing.T) {
-		plane := newFakePlane(t, outcomeAllowed, nil)
+		plane := newFakePlane(t, admissionapi.OutcomeAllowed, nil)
 		upstream := newFakeUpstream(t)
 		governed, _ := newTestProxy(t, plane, upstream)
 		governed.credential = broken
@@ -791,7 +801,7 @@ func TestALoopbackProviderNeedsNoCredential(t *testing.T) {
 	// two functions, so a test that writes the error itself cannot check that
 	// the producer honours it — only that the consumer reads it.
 	t.Run("the real readers classify themselves correctly", func(t *testing.T) {
-		plane := newFakePlane(t, outcomeAllowed, nil)
+		plane := newFakePlane(t, admissionapi.OutcomeAllowed, nil)
 		upstream := newFakeUpstream(t)
 		governed, _ := newTestProxy(t, plane, upstream)
 
@@ -825,7 +835,7 @@ func TestALoopbackProviderNeedsNoCredential(t *testing.T) {
 	// rather than being sent an unauthenticated prompt, which would reach a
 	// third party and be rejected — after the egress.
 	t.Run("a remote provider still requires one", func(t *testing.T) {
-		plane := newFakePlane(t, outcomeAllowed, nil)
+		plane := newFakePlane(t, admissionapi.OutcomeAllowed, nil)
 		upstream := newFakeUpstream(t)
 		governed, _ := newTestProxy(t, plane, upstream)
 		governed.credential = absent
@@ -864,7 +874,7 @@ func TestALoopbackProviderNeedsNoCredential(t *testing.T) {
 func TestAStreamedResponseReachesTheCallerAsItArrives(t *testing.T) {
 	released := make(chan struct{})
 	firstSeen := make(chan struct{})
-	plane := newFakePlane(t, outcomeAllowed, nil)
+	plane := newFakePlane(t, admissionapi.OutcomeAllowed, nil)
 
 	upstream := httptest.NewServer(http.HandlerFunc(
 		func(writer http.ResponseWriter, _ *http.Request) {
@@ -1015,7 +1025,7 @@ func TestAnInfrastructuralFailureIsNeverReportedAsAPolicyDenial(t *testing.T) {
 		{"the admission route is absent", http.StatusNotFound},
 		{"the plane is unavailable", http.StatusServiceUnavailable},
 	} {
-		plane := newFakePlane(t, outcomeAllowed, nil)
+		plane := newFakePlane(t, admissionapi.OutcomeAllowed, nil)
 		plane.status = probe.status
 		upstream := newFakeUpstream(t)
 		governed, logged := newTestProxy(t, plane, upstream)
@@ -1051,7 +1061,7 @@ func TestAnInfrastructuralFailureIsNeverReportedAsAPolicyDenial(t *testing.T) {
 	// The contrast, or the assertions above only prove the proxy refuses
 	// everything. A real policy denial is 403, shaped as denied, and logged as
 	// a denial.
-	plane := newFakePlane(t, outcomeDenied, nil)
+	plane := newFakePlane(t, admissionapi.OutcomeDenied, nil)
 	upstream := newFakeUpstream(t)
 	governed, logged := newTestProxy(t, plane, upstream)
 	recorder := post(t, governed, plainCall)
@@ -1092,7 +1102,7 @@ func TestAMalformedRequestIsRefusedWithoutSpendingAnAdmission(t *testing.T) {
 		// A readable name, which is what anyone would pass and what no
 		// reference can be: the plane decodes disclosures as unpadded
 		// base64url, so this is permanently malformed. Without the local
-		// check it reached the plane as a 400 that post() turns into
+		// check it reached the plane as a 400 that the admission client turns into
 		// ErrPlaneUnreachable, and the caller was told 503 — retry — for
 		// something no retry can fix.
 		{"a readable reference name", `{"model":"gpt",` +
@@ -1104,7 +1114,7 @@ func TestAMalformedRequestIsRefusedWithoutSpendingAnAdmission(t *testing.T) {
 		{"a blank reference", `{"model":"gpt",` +
 			`"messages":[{"role":"user","content":"hi"}],"shoal_references":["  "]}`},
 	} {
-		plane := newFakePlane(t, outcomeAllowed, nil)
+		plane := newFakePlane(t, admissionapi.OutcomeAllowed, nil)
 		upstream := newFakeUpstream(t)
 		governed, _ := newTestProxy(t, plane, upstream)
 
@@ -1123,7 +1133,7 @@ func TestAMalformedRequestIsRefusedWithoutSpendingAnAdmission(t *testing.T) {
 	// The bound. Without it a caller can make the proxy hold arbitrary memory
 	// before any decision is taken, and the refusal has to come from the limit
 	// rather than from the body failing to parse afterwards.
-	plane := newFakePlane(t, outcomeAllowed, nil)
+	plane := newFakePlane(t, admissionapi.OutcomeAllowed, nil)
 	upstream := newFakeUpstream(t)
 	governed, _ := newTestProxy(t, plane, upstream)
 	oversized := `{"model":"gpt","messages":[{"role":"user","content":"` +
@@ -1153,7 +1163,7 @@ func TestAMalformedRequestIsRefusedWithoutSpendingAnAdmission(t *testing.T) {
 // the same outcome. The proxy cannot recall tokens already sent, which is
 // exactly why it has to be accurate about how much went.
 func TestATruncatedStreamIsReportedAsTruncated(t *testing.T) {
-	plane := newFakePlane(t, outcomeAllowed, nil)
+	plane := newFakePlane(t, admissionapi.OutcomeAllowed, nil)
 	upstream := newFakeUpstream(t)
 	governed, _ := newTestProxy(t, plane, upstream)
 
@@ -1323,7 +1333,7 @@ func TestTheHostGateHonoursEveryClaimItsCommentMakes(t *testing.T) {
 		{"an allowed host with a foreign forwarded header", "example.test", "attacker.example", true},
 		{"an empty host with an allowed forwarded header", "", "example.test", false},
 	} {
-		plane := newFakePlane(t, outcomeAllowed, nil)
+		plane := newFakePlane(t, admissionapi.OutcomeAllowed, nil)
 		upstream := newFakeUpstream(t)
 		governed, _ := newTestProxy(t, plane, upstream)
 		governed.allowedHosts = allowed
@@ -1388,7 +1398,7 @@ func TestTheUpstreamCallFitsTheGrantItWasActuallyGiven(t *testing.T) {
 	// consume it afterwards. The proxy's clock is moved on to model it, which
 	// is what that seam is for.
 	t.Run("a grant with no room left is refused before the egress", func(t *testing.T) {
-		plane := newFakePlane(t, outcomeAllowed, nil)
+		plane := newFakePlane(t, admissionapi.OutcomeAllowed, nil)
 		upstream := newFakeUpstream(t)
 		governed, logged := newTestProxy(t, plane, upstream)
 		// Six seconds remaining when the plane answers, so reportable accepts
@@ -1420,7 +1430,7 @@ func TestTheUpstreamCallFitsTheGrantItWasActuallyGiven(t *testing.T) {
 	// slower than the grant's remaining life must be cut off while the report
 	// is still possible, rather than running to the configured timeout.
 	t.Run("the call is bounded by the grant, not the timeout", func(t *testing.T) {
-		plane := newFakePlane(t, outcomeAllowed, nil)
+		plane := newFakePlane(t, admissionapi.OutcomeAllowed, nil)
 		// Released by cleanup as well as by cancellation. Blocking only on the
 		// request context deadlocked Close, which waits for outstanding
 		// handlers: the proxy's client gives up on the grant's budget, and the
@@ -1469,7 +1479,7 @@ func TestTheUpstreamCallFitsTheGrantItWasActuallyGiven(t *testing.T) {
 	// And a healthy grant is untouched, or this is a refusal rather than a
 	// bound: the window must not shorten calls it has room for.
 	t.Run("a grant with room is not interfered with", func(t *testing.T) {
-		plane := newFakePlane(t, outcomeAllowed, nil)
+		plane := newFakePlane(t, admissionapi.OutcomeAllowed, nil)
 		upstream := newFakeUpstream(t)
 		governed, _ := newTestProxy(t, plane, upstream)
 		if recorder := post(t, governed, plainCall); recorder.Code != http.StatusOK {
@@ -1505,7 +1515,7 @@ func TestANonTwoHundredUpstreamStatusIsNeverReportedAsWork(t *testing.T) {
 		{http.StatusTooManyRequests, false},
 		{http.StatusInternalServerError, false},
 	} {
-		plane := newFakePlane(t, outcomeAllowed, nil)
+		plane := newFakePlane(t, admissionapi.OutcomeAllowed, nil)
 		upstream := newFakeUpstream(t)
 		upstream.status = probe.status
 		governed, _ := newTestProxy(t, plane, upstream)
@@ -1567,9 +1577,9 @@ func TestTheDeclaredEffectsFollowTheConfiguredProvider(t *testing.T) {
 		hasCorpus := false
 		for _, effect := range effects {
 			switch effect {
-			case string(fleet.EffectEgressesContent):
+			case admissionapi.EffectEgressesContent:
 				hasEgress = true
-			case string(fleet.EffectReadsCorpus):
+			case admissionapi.EffectReadsCorpus:
 				hasCorpus = true
 			}
 		}
@@ -1587,7 +1597,7 @@ func TestTheDeclaredEffectsFollowTheConfiguredProvider(t *testing.T) {
 
 	// And it reaches the wire, which testing declaredEffects alone does not
 	// prove — the same gap a mutation found between absoluteURL and newProxy.
-	plane := newFakePlane(t, outcomeAllowed, nil)
+	plane := newFakePlane(t, admissionapi.OutcomeAllowed, nil)
 	upstream := newFakeUpstream(t)
 	governed, _ := newTestProxy(t, plane, upstream)
 	// The harness upstream is a loopback httptest server, so this is the
@@ -1597,7 +1607,7 @@ func TestTheDeclaredEffectsFollowTheConfiguredProvider(t *testing.T) {
 		t.Fatalf("admissions = %d", len(plane.requests))
 	}
 	for _, effect := range plane.requests[0].Effects {
-		if effect == string(fleet.EffectEgressesContent) {
+		if effect == admissionapi.EffectEgressesContent {
 			t.Fatalf("a loopback provider declared egress on the wire: %v",
 				plane.requests[0].Effects)
 		}
@@ -1612,7 +1622,7 @@ func TestTheDeclaredEffectsFollowTheConfiguredProvider(t *testing.T) {
 	post(t, governed, plainCall)
 	found := false
 	for _, effect := range plane.requests[0].Effects {
-		if effect == string(fleet.EffectEgressesContent) {
+		if effect == admissionapi.EffectEgressesContent {
 			found = true
 		}
 	}
@@ -1631,7 +1641,7 @@ func TestTheDeclaredEffectsFollowTheConfiguredProvider(t *testing.T) {
 // proxy turning a well-behaved client into a badly-behaved one, which is the
 // opposite of "an unmodified client is governed unchanged".
 func TestRetryAfterReachesTheCaller(t *testing.T) {
-	plane := newFakePlane(t, outcomeAllowed, nil)
+	plane := newFakePlane(t, admissionapi.OutcomeAllowed, nil)
 	upstream := newFakeUpstream(t)
 	upstream.status = http.StatusTooManyRequests
 	upstream.headers = map[string]string{"Retry-After": "42"}
@@ -1654,14 +1664,14 @@ func TestRetryAfterReachesTheCaller(t *testing.T) {
 // contract that checking the encoding left open.
 //
 // A reference decoding to more than shoal.MaxIDBytes, or more references than
-// fleet.MaxAdmissionDisclosures, is refused by the plane with a 400 that post()
+// admissionapi.MaxDisclosures, is refused by the plane with a 400 that the admission client
 // turns into ErrPlaneUnreachable — so the caller is told 503, which means
 // retry, for a request no retry can fix. Exactly the failure the base64url
 // check was added for, in the dimension that check did not cover.
 func TestReferenceBoundsAreEnforcedLocally(t *testing.T) {
 	oversized := base64.RawURLEncoding.EncodeToString(
 		bytes.Repeat([]byte("a"), shoal.MaxIDBytes+1))
-	tooMany := make([]string, fleet.MaxAdmissionDisclosures+1)
+	tooMany := make([]string, admissionapi.MaxDisclosures+1)
 	for i := range tooMany {
 		tooMany[i] = base64.RawURLEncoding.EncodeToString(
 			[]byte(fmt.Sprintf("doc-%d", i)))
@@ -1679,7 +1689,7 @@ func TestReferenceBoundsAreEnforcedLocally(t *testing.T) {
 			`"messages":[{"role":"user","content":"hi"}],` +
 			`"shoal_references":` + string(encodedMany) + `}`},
 	} {
-		plane := newFakePlane(t, outcomeAllowed, nil)
+		plane := newFakePlane(t, admissionapi.OutcomeAllowed, nil)
 		upstream := newFakeUpstream(t)
 		governed, _ := newTestProxy(t, plane, upstream)
 
@@ -1695,7 +1705,7 @@ func TestReferenceBoundsAreEnforcedLocally(t *testing.T) {
 
 	// And the bounds themselves are still reachable, or this refuses the
 	// feature rather than bounding it.
-	atLimit := make([]string, fleet.MaxAdmissionDisclosures)
+	atLimit := make([]string, admissionapi.MaxDisclosures)
 	for i := range atLimit {
 		atLimit[i] = base64.RawURLEncoding.EncodeToString(
 			[]byte(fmt.Sprintf("doc-%d", i)))
@@ -1704,7 +1714,7 @@ func TestReferenceBoundsAreEnforcedLocally(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	plane := newFakePlane(t, outcomeAllowed, nil)
+	plane := newFakePlane(t, admissionapi.OutcomeAllowed, nil)
 	upstream := newFakeUpstream(t)
 	governed, _ := newTestProxy(t, plane, upstream)
 	recorder := post(t, governed,
@@ -1739,7 +1749,7 @@ func TestReferenceBoundsAreEnforcedLocally(t *testing.T) {
 // request body is a map rather than a struct precisely so the proxy is not the
 // reason a provider feature nobody here has heard of stops working.
 func TestTheShoalExtensionDoesNotReachTheProvider(t *testing.T) {
-	plane := newFakePlane(t, outcomeAllowed, nil)
+	plane := newFakePlane(t, admissionapi.OutcomeAllowed, nil)
 	upstream := newFakeUpstream(t)
 	governed, _ := newTestProxy(t, plane, upstream)
 
