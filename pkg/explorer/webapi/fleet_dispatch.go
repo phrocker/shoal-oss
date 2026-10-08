@@ -346,10 +346,6 @@ func fleetDispatchError(err error) error {
 			shoal.ErrorConflict,
 			"action requires approval; request it through the approval route",
 			err)
-	case errors.Is(err, fleet.ErrActionNotFound):
-		return shoal.WrapError(shoal.ErrorNotFound, "fleet action not found", err)
-	case errors.Is(err, fleet.ErrActionConflict), errors.Is(err, fleet.ErrClaimLost), errors.Is(err, fleet.ErrActionTerminal):
-		return shoal.WrapError(shoal.ErrorConflict, "fleet action conflict", err)
 	// The two sentinels that mean something durable may have happened, marked
 	// so writeError sets Shoal-Commit-Outcome: indeterminate and the body
 	// flag. Before this arm existed all three below shared one, so a caller
@@ -362,26 +358,66 @@ func fleetDispatchError(err error) error {
 	// tell. ErrActionCommitted: the transition was durably written and only
 	// its publication failed, so the write landed.
 	//
-	// This arm is ordered before the recording one deliberately.
-	// applyExecutionResult joins ErrExecutionAmbiguous *and*
-	// ErrRecordingUnavailable on the one recorder failure that happens after
-	// the effect, and that error has to be marked — matching here first is
-	// what marks it.
+	// Ordering. This arm has to come before *every* other arm that could
+	// match the same error, and the first version of it did not: it sat below
+	// the not-found and conflict arms, which shadowed the two cases that
+	// matter most.
+	//
+	// applyExecutionResult raises, after the external effect, either
+	// errors.Join(ErrExecutionAmbiguous, readErr) or
+	// errors.Join(ErrExecutionAmbiguous, ErrClaimLost) — a lease that lapsed
+	// while the effect was in flight. Measured against the old order:
+	//
+	//	ErrExecutionAmbiguous                        → 503, marked
+	//	Join(ErrExecutionAmbiguous, ErrClaimLost)    → 409 conflict, unmarked
+	//	Join(ErrExecutionAmbiguous, ErrActionNotFound) → 404, unmarked
+	//	Join(ErrActionCommitted, ErrActionTerminal)  → 409 conflict, unmarked
+	//
+	// So the single case the ambiguity sentinel exists for was answered 409
+	// "conflict", which is worse than the bare 503 this change set out to
+	// replace: a conflict reads as "your request did not apply", and the
+	// caller retries an external effect that may already have happened.
+	//
+	// It also has to come before the recording arm, because
+	// applyExecutionResult's post-effect recorder failure joins
+	// ErrExecutionAmbiguous and ErrRecordingUnavailable together and must be
+	// marked.
 	case errors.Is(err, fleet.ErrExecutionAmbiguous),
 		errors.Is(err, fleet.ErrActionCommitted):
 		return explorer.MarkIndeterminateCommit(shoal.WrapError(
 			shoal.ErrorUnavailable,
 			"fleet action outcome requires reconciliation", err))
-	// Deliberately *not* marked. Every ErrRecordingUnavailable site raises it
-	// from a RecordAction failure that sits immediately before the matching
-	// store write — checked at all nine of them — so the transition did not
-	// commit and the request is a clean refusal the caller should retry.
+	// Deliberately *not* marked, and the first version of this comment got
+	// the reason wrong in a way worth recording.
 	//
-	// Marking it would be worse than the silence it replaces: a caller told
-	// "this may have committed" about a request that provably did not would
-	// stop retrying work that never happened, and would reconcile against a
-	// record that does not exist. The one site that is post-effect carries
-	// ErrExecutionAmbiguous and is caught above.
+	// It said every site raises this from a RecordAction failure sitting
+	// immediately before the matching store write, "so the transition did not
+	// commit". There are ten sites, not the nine it claimed, one of them is a
+	// RecordApproval rather than a RecordAction failure, and one of the ten
+	// falsifies the sentence outright: ApprovalService.advance commits the
+	// approved → enqueued transition and then falls through to materialize,
+	// whose audit failure is raised with that approval write already durable.
+	//
+	// The answer is still an unmarked 503, for the reason the comment should
+	// have given. The marker means an *effect* may have happened — that is
+	// what Shoal-Commit-Outcome: indeterminate tells a caller, and what it
+	// must act on. At every one of the ten sites nothing external was
+	// contacted, and the one durable partial is resumable: the approval row
+	// sits at ApprovalEnqueued, a re-request re-enters at that case, and the
+	// materialization completes. Marking it would send a caller to reconcile
+	// against a target that was never reached.
+	//
+	// Both halves of that are asserted rather than argued.
+	// TestARecorderFailureLeavesTheRecordUnchanged covers the dispatch phases
+	// and TestAMaterializationRecorderFailureIsResumable covers the approval
+	// one, including that the partial commits and that the retry resolves it.
+	//
+	// The genuinely post-effect recorder failure carries
+	// ErrExecutionAmbiguous and is caught by the arm above.
+	case errors.Is(err, fleet.ErrActionNotFound):
+		return shoal.WrapError(shoal.ErrorNotFound, "fleet action not found", err)
+	case errors.Is(err, fleet.ErrActionConflict), errors.Is(err, fleet.ErrClaimLost), errors.Is(err, fleet.ErrActionTerminal):
+		return shoal.WrapError(shoal.ErrorConflict, "fleet action conflict", err)
 	case errors.Is(err, fleet.ErrRecordingUnavailable):
 		return shoal.WrapError(shoal.ErrorUnavailable, "fleet action outcome requires reconciliation", err)
 	default:

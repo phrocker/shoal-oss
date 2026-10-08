@@ -121,3 +121,90 @@ func TestApprovalRefusesASupersededApprovalBeforeCommitting(t *testing.T) {
 		t.Fatalf("control advance = %+v, %v", receipt, err)
 	}
 }
+
+// TestAMaterializationRecorderFailureIsResumable is the counterexample to a
+// claim I made in fleetDispatchError and should not have.
+//
+// That comment said every ErrRecordingUnavailable is raised from a RecordAction
+// failure sitting immediately before the matching store write, "so the
+// transition did not commit", and that this licenses answering it as a plain
+// 503 with no indeterminate marker. It is false here. advance's
+// ApprovalApproved arm commits the approved → enqueued transition and then
+// falls through to materialize, whose recorder failure is raised with that
+// approval write already durable.
+//
+// The 503 is still correct, and for a reason worth stating rather than
+// assuming: nothing external happened, and the partial state is resumable. The
+// approval row sits at ApprovalEnqueued, a re-request re-enters at that case,
+// and materialize completes. The marker means "an effect may have happened";
+// marking a resumable internal partial would tell a caller to reconcile
+// against a target that was never contacted.
+//
+// Both halves are asserted, because the first without the second would license
+// leaving a durable partial unreported, and the second without the first would
+// be the false claim again.
+func TestAMaterializationRecorderFailureIsResumable(t *testing.T) {
+	approval := decided(
+		validApprovalRecord(t), ApprovalApproved, ApprovalVerdictApprove)
+	now := approval.DecidedAt.Add(2 * time.Second)
+	store := &memoryApprovalStore{records: map[string]ApprovalRecord{
+		string(approval.ID): CloneApprovalRecord(approval),
+	}}
+	dispatchStore := newMemoryDispatchStore()
+	recorder := &dispatchRecorder{failPhase: "approval_enqueue"}
+	service := &ApprovalService{
+		dispatch: &DispatchService{
+			store: dispatchStore, outbox: dispatchStore,
+			recorder: recorder, events: dispatchEvents{},
+			clock: func() time.Time { return now },
+		},
+		store: store, recorder: unguardedApprovalRecorder{},
+		narrowed:    func(context.Context) bool { return false },
+		generations: fixedGenerations{generation: approval.PolicyGeneration},
+		window:      DefaultApprovalWindow,
+	}
+	decision := approvalBranchDecision(
+		t, approval.RequestedAt, auth.OperationDispatch)
+
+	_, err := service.advance(context.Background(), decision, approval, now)
+	if !errors.Is(err, ErrRecordingUnavailable) {
+		t.Fatalf("the materialization audit failure was not reported as a "+
+			"recording failure: %v", err)
+	}
+	// The half that falsifies the comment: a durable transition landed.
+	stored, _ := store.GetApproval(context.Background(), approval.ID)
+	if stored.State != ApprovalEnqueued {
+		t.Fatalf("approval state = %q, want %q: this test exists because "+
+			"this write commits before the recorder failure, and if it no "+
+			"longer does, fleetDispatchError's comment should be corrected "+
+			"back", stored.State, ApprovalEnqueued)
+	}
+	if stored.Version != approval.Version+1 {
+		t.Fatalf("approval version = %d, want %d",
+			stored.Version, approval.Version+1)
+	}
+	// And no work exists, which is why the caller must retry rather than
+	// reconcile: nothing was dispatched and nothing external was contacted.
+	if _, err := dispatchStore.GetAction(
+		context.Background(), approval.ID); !errors.Is(err, ErrActionNotFound) {
+		t.Fatalf("an action exists despite the refused audit: %v", err)
+	}
+
+	// The half that licenses the unmarked 503: the retry completes it.
+	recorder.failPhase = ""
+	if _, err := service.advance(
+		context.Background(), decision, stored, now,
+	); err != nil {
+		t.Fatalf("the retry did not resume the materialization, so the "+
+			"partial is not resumable and the 503 must carry the "+
+			"indeterminate marker after all: %v", err)
+	}
+	action, err := dispatchStore.GetAction(context.Background(), approval.ID)
+	if err != nil {
+		t.Fatalf("the resumed materialization created no work: %v", err)
+	}
+	if action.State != DispatchQueued {
+		t.Fatalf("resumed action state = %q, want %q",
+			action.State, DispatchQueued)
+	}
+}

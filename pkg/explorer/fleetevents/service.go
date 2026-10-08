@@ -313,7 +313,8 @@ func isReservedLifecycleKind(kind string) bool {
 // lifecycle event of this kind.
 //
 // Each kind lists every operation that can legitimately have authorized the
-// transition it describes, which is more than one for two of them.
+// transition it describes. All three kinds now list more than one; this said
+// "two of them", and the cancellation arm is why.
 //
 // An enqueue is authorized by dispatch or by invoke, because a synchronous
 // invoke enqueues as a side effect of running the work.
@@ -326,8 +327,23 @@ func isReservedLifecycleKind(kind string) bool {
 // returned as ErrActionCommitted, so the transition was durably written and
 // the worker was told to reconcile an outcome that had in fact been recorded.
 //
-// A cancellation is dispatch only. It is the enqueuer's lever, and no
-// execute-holder can reach Cancel.
+// A cancellation is authorized by dispatch or by invoke. This said "dispatch
+// only. It is the enqueuer's lever, and no execute-holder can reach Cancel."
+// The second sentence is true and the first does not follow from it: no
+// execute-holder reaches DispatchService.Cancel, and AdmissionService.deny is
+// a second writer of this kind, reached through the admission surface under
+// invoke. A property of one writer, asserted as a property of the event — in
+// the same documentation that explains that exact mistake for the claim kinds
+// two paragraphs above.
+//
+// The cost was that every admission denial committed a cancelled record and
+// then failed to publish it, and a refused publication is ErrActionCommitted,
+// so the caller was told a refusal that had granted nothing needed
+// reconciliation. The retry answered "denied", which is why it survived three
+// reviews.
+//
+// Still not execute: Cancel requires dispatch and refuses a live claim, and
+// deny is reachable only under invoke.
 //
 // Written as an explicit set rather than one expected operation with an ad-hoc
 // exception beside it, which is what it replaced: the exception for an

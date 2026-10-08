@@ -238,31 +238,48 @@ func actionEventAuthorization(
 		}
 	case "action.canceled":
 		// Two legitimate writers produce this kind under different
-		// operations, which hardcoding dispatch could not express.
+		// operations, which the hardcoded dispatch here could not express.
 		// DispatchService.Cancel transitions under dispatch;
 		// AdmissionService.deny transitions under invoke, and its record's
 		// AuthorizedOperations is [invoke] — so the provenance check below
 		// refused every denial's publication, and a refused publication is
 		// ErrActionCommitted: a 503 for a refusal that had committed.
 		//
-		// My own comment on lifecyclePublicationPermits is why this survived
-		// #443. It said "a cancellation is dispatch only. It is the enqueuer's
-		// lever, and no execute-holder can reach Cancel." True of
+		// A comment of mine on lifecyclePublicationPermits is why that
+		// survived #443. It said "a cancellation is dispatch only. It is the
+		// enqueuer's lever, and no execute-holder can reach Cancel." True of
 		// DispatchService.Cancel, and false as a statement about the *kind* —
 		// a property of one writer asserted as a property of the event, in a
 		// commit whose whole subject was that class of mismatch.
 		//
-		// Narrowed to the two operations a cancel can legitimately carry
-		// rather than read blindly. cloneActionRecord carries this field
-		// forward, so a record cancelled by a build before Cancel set it holds
-		// the *claim's* operation — which would pass the provenance check,
-		// because the claim put it in AuthorizedOperations, and mislabel the
-		// event. Dispatch is the fallback because that is what this arm
-		// hardcoded and what Cancel adds to AuthorizedOperations.
-		operation = record.TransitionOperation
-		if operation != auth.OperationDispatch &&
-			operation != auth.OperationInvoke {
-			operation = auth.OperationDispatch
+		// Derived from AuthorizedOperations rather than read from
+		// TransitionOperation. Reading the field is the fix the obvious
+		// reading produces, and a review found it wrong in both directions.
+		// cloneActionRecord carries the field forward, so a record cancelled
+		// by a build before Cancel set it holds the *claim's* operation:
+		// reading it published such a record under invoke, which the canceller
+		// — who needs only dispatch — cannot authorize, turning a committed
+		// cancel into a 503. And a denial written by a pre-fix build has an
+		// empty field, so any constant fallback outside its [invoke] set left
+		// it permanently unpublishable with an undrainable outbox row.
+		//
+		// AuthorizedOperations has neither problem. Cancel widens it with
+		// dispatch, precisely so the cancel's own authority is on the record;
+		// an admission denial carries [invoke] and nothing widens it. So
+		// preferring dispatch when present and falling to invoke when not
+		// names the operation that actually authorized the transition, for
+		// records written before and after this change, and repairs the
+		// legacy ones rather than stranding them.
+		//
+		// TransitionOperation is still written by both writers: it is correct
+		// provenance for the audit entry and for anything reading the record.
+		// It is simply not what this decision can be based on.
+		operation = auth.OperationDispatch
+		if !containsOperation(
+			record.AuthorizedOperations, auth.OperationDispatch) &&
+			containsOperation(
+				record.AuthorizedOperations, auth.OperationInvoke) {
+			operation = auth.OperationInvoke
 		}
 	case "action.claimed", "action.completed", "action.failed":
 		// The operation the transition was actually authorized by, which since

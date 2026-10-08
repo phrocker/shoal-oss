@@ -3383,10 +3383,21 @@ func TestAClaimantChainTooLongToRetainIsRefusedAtClaimTime(t *testing.T) {
 //
 // All three were one arm, so a caller got a bare 503 and could not tell "retry,
 // nothing happened" from "stop, something may have happened" — the sharpest
-// distinction this surface has. Splitting them rests entirely on the claim that
-// every ErrRecordingUnavailable is raised before its matching store write. That
-// was established by reading all nine raise sites, which is exactly the kind of
-// claim this repository has found wrong before, so it is asserted here instead.
+// distinction this surface has.
+//
+// Splitting them rested on a claim about the raise sites, and reading them was
+// not enough: the first version of this said "all nine", there are ten, one is
+// a RecordApproval rather than a RecordAction failure, and one of them commits
+// a durable approval transition before it raises. That one is covered by
+// TestAMaterializationRecorderFailureIsResumable, which asserts both that it
+// commits and that a retry resolves it.
+//
+// This table covers the five dispatch phases reachable from this fixture:
+// claim, cancel, extension, report and completion. The remaining sites —
+// enqueue_admission, effect_admission, the admission grant and denial, and the
+// two approval recorders — are not covered here, and the honest reading of
+// that is that the property is asserted where a fixture can reach it rather
+// than everywhere it holds.
 //
 // Each phase's recorder failure must leave the stored record byte-identical.
 // The one exception is deliberate and checked: the post-effect recorder failure
