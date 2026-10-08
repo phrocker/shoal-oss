@@ -452,22 +452,28 @@ type ApprovalConfig struct {
 	// decision. The host supplies the predicate because only it knows how it
 	// narrows; a host that never narrows supplies one returning false.
 	Narrowed func(context.Context) bool
+	// Generations is the current-policy authority. Required. A decision
+	// carries the generation it was minted under, which may be older than
+	// the one in force; deciding and reporting against the token's would
+	// approve, or call live, a request under a superseded policy.
+	Generations auth.GenerationReader
 	// Window is how long a request stays decidable. Zero means
 	// DefaultApprovalWindow. It is clamped to each request's deadline.
 	Window time.Duration
 }
 
 type ApprovalService struct {
-	dispatch *DispatchService
-	store    ApprovalStore
-	recorder ApprovalRecorder
-	narrowed func(context.Context) bool
-	window   time.Duration
+	dispatch    *DispatchService
+	store       ApprovalStore
+	recorder    ApprovalRecorder
+	narrowed    func(context.Context) bool
+	generations auth.GenerationReader
+	window      time.Duration
 }
 
 func NewApprovalService(config ApprovalConfig) (*ApprovalService, error) {
 	if config.Dispatch == nil || config.Store == nil || config.Recorder == nil ||
-		config.Narrowed == nil {
+		config.Narrowed == nil || config.Generations == nil {
 		return nil, shoal.NewError(
 			shoal.ErrorInvalidArgument, "fleet approval dependencies are required")
 	}
@@ -481,7 +487,8 @@ func NewApprovalService(config ApprovalConfig) (*ApprovalService, error) {
 	}
 	return &ApprovalService{
 		dispatch: config.Dispatch, store: config.Store,
-		recorder: config.Recorder, narrowed: config.Narrowed, window: window,
+		recorder: config.Recorder, narrowed: config.Narrowed,
+		generations: config.Generations, window: window,
 	}, nil
 }
 
@@ -529,6 +536,11 @@ const (
 	// ApprovalConditionDeadlinePassed: the request's action deadline has
 	// passed, so it can no longer be re-requested and so never materialized.
 	ApprovalConditionDeadlinePassed ApprovalCondition = "deadline_passed"
+	// ApprovalConditionIdentityTaken: committed to become work, but the
+	// action identity is occupied by something that is not this approval's
+	// work — an action another route enqueued there between the
+	// pre-commit check and the commit. The approval can never materialize.
+	ApprovalConditionIdentityTaken ApprovalCondition = "identity_taken"
 	// ApprovalConditionAwaitingAction: committed to become work (enqueued),
 	// but the action has not been written yet — the second write was lost.
 	// The requester's next re-request writes it while the target and the
@@ -646,7 +658,19 @@ func (s *ApprovalService) Request(
 			!bytes.Equal(current.RequestDigest, digest) {
 			return ApprovalReceipt{}, approvalConflict()
 		}
-		receipt, err := s.advance(ctx, decision, current, now)
+		// The time of this attempt, not of the request. A retry after a lost
+		// compare-and-set or a back-off is later than the first attempt, and
+		// using the first attempt's time would let the approved -> enqueued
+		// commit land after ExpiresAt while believing it was inside the
+		// window. hold keeps the request time, because the stored request's
+		// CreatedAt is that time.
+		attemptNow := now
+		if attempt > 0 {
+			if fresh := dispatch.clock().UTC(); fresh.After(attemptNow) {
+				attemptNow = fresh
+			}
+		}
+		receipt, err := s.advance(ctx, decision, current, attemptNow)
 		if errors.Is(err, ErrApprovalConflict) {
 			continue
 		}
@@ -739,8 +763,10 @@ func (s *ApprovalService) advance(
 		// held — means the approval can never become work. Found here, before
 		// the commit, the request stays approved (and expires) instead of
 		// becoming an enqueued approval that names work that does not exist.
-		// A race between this read and the commit is still possible and is
-		// reported by Status as enqueued without an action.
+		// A squat that lands between this read and the commit below is still
+		// possible: the approval then commits enqueued, materialize finds
+		// someone else's action and refuses, and Status reports it as
+		// unresolvable with condition identity_taken.
 		if existing, err := s.dispatch.store.GetAction(ctx, current.ID); err == nil {
 			if _, replayErr := s.replayMaterialized(
 				ctx, existing, current); replayErr != nil {
@@ -873,12 +899,7 @@ func (s *ApprovalService) materialize(
 func (s *ApprovalService) replayMaterialized(
 	ctx context.Context, current ActionRecord, approval ApprovalRecord,
 ) (ActionRecord, error) {
-	if !equivalentEnqueue(current, approval.Request) ||
-		!bytes.Equal(current.ApprovalRequestDigest, approval.RequestDigest) ||
-		current.ApproverSubject != approval.ApproverSubject ||
-		current.ApproverActor != approval.ApproverActor ||
-		current.ApproverClientID != approval.ApproverClientID ||
-		!current.ApprovedAt.Equal(approval.DecidedAt) {
+	if !isMaterializationOf(current, approval) {
 		// Something else is at the identity: an action enqueued there by
 		// another route while this request was held. The approval cannot
 		// become work at an identity it does not own.
@@ -890,6 +911,18 @@ func (s *ApprovalService) replayMaterialized(
 		return ActionRecord{}, errors.Join(ErrActionCommitted, err)
 	}
 	return cloneActionRecord(current), nil
+}
+
+// isMaterializationOf reports whether an action is the work this approval
+// materialized: the same request, under this approval's digest, approver and
+// decision time.
+func isMaterializationOf(action ActionRecord, approval ApprovalRecord) bool {
+	return equivalentEnqueue(action, approval.Request) &&
+		bytes.Equal(action.ApprovalRequestDigest, approval.RequestDigest) &&
+		action.ApproverSubject == approval.ApproverSubject &&
+		action.ApproverActor == approval.ApproverActor &&
+		action.ApproverClientID == approval.ApproverClientID &&
+		action.ApprovedAt.Equal(approval.DecidedAt)
 }
 
 // expire records that a request closed without becoming work.
@@ -1020,8 +1053,14 @@ func (s *ApprovalService) decide(
 	// The generation the approver reviewed under, and the one it holds now,
 	// must both be the request's. An approval under a superseded generation
 	// would be a statement about a policy that is no longer in force.
+	inForce, err := s.generations.CurrentPolicyGeneration(
+		ctx, decision.AuthorizationDomain())
+	if err != nil {
+		return ApprovalRecord{}, err
+	}
 	if request.PolicyGeneration != current.PolicyGeneration ||
-		decision.PolicyGeneration() != current.PolicyGeneration {
+		decision.PolicyGeneration() != current.PolicyGeneration ||
+		inForce != current.PolicyGeneration {
 		return ApprovalRecord{}, shoal.WrapError(
 			shoal.ErrorConflict,
 			"approval policy generation does not match the request",
@@ -1103,12 +1142,35 @@ func (s *ApprovalService) eligibleApprover(
 	record ApprovalRecord,
 	now time.Time,
 ) (Descriptor, error) {
-	request := record.Request
-	// First, and as a refusal rather than a concealment: the caller has done
-	// something no approver may do, whatever the record.
-	if s.narrowed(ctx) {
-		return Descriptor{}, approvalUnderNarrowing()
+	descriptor, err := s.eligibility(ctx, decision, record, now)
+	if !s.narrowed(ctx) {
+		return descriptor, err
 	}
+	// A narrowed caller is refused — but the refusal is only told to a caller
+	// that would otherwise be eligible on this record. Refusing every narrowed
+	// caller first, as an earlier version did, answered "unauthorized" for an
+	// approval ID that exists in any scope and "not found" for one that does
+	// not: an existence oracle over every held request. Every other failure
+	// therefore answers exactly as an absent record does.
+	if err != nil {
+		if shoal.IsErrorCode(err, shoal.ErrorUnauthorized) ||
+			shoal.IsErrorCode(err, shoal.ErrorNotFound) {
+			return Descriptor{}, auth.ObjectNotFound()
+		}
+		return Descriptor{}, err
+	}
+	return Descriptor{}, approvalUnderNarrowing()
+}
+
+// eligibility is every approver rule except the narrowing one; see
+// eligibleApprover, which is the only caller.
+func (s *ApprovalService) eligibility(
+	ctx context.Context,
+	decision auth.Decision,
+	record ApprovalRecord,
+	now time.Time,
+) (Descriptor, error) {
+	request := record.Request
 	if err := decision.AuthorizeObject(
 		auth.OperationActionApprove, auth.ResourceRequest{
 			AuthorizationDomain: decision.AuthorizationDomain(),
@@ -1242,7 +1304,7 @@ func (s *ApprovalService) Status(
 			return ApprovalStatus{}, err
 		}
 	}
-	state, condition, err := s.effectiveState(ctx, decision, current, now)
+	state, condition, err := s.effectiveState(ctx, current, now)
 	if err != nil {
 		return ApprovalStatus{}, err
 	}
@@ -1254,7 +1316,6 @@ func (s *ApprovalService) Status(
 // effectiveState computes what a stored approval amounts to now.
 func (s *ApprovalService) effectiveState(
 	ctx context.Context,
-	decision auth.Decision,
 	current ApprovalRecord,
 	now time.Time,
 ) (ApprovalState, ApprovalCondition, error) {
@@ -1262,16 +1323,26 @@ func (s *ApprovalService) effectiveState(
 	case ApprovalRefused, ApprovalExpired:
 		return current.State, ApprovalConditionNone, nil
 	case ApprovalEnqueued:
-		_, err := s.dispatch.store.GetAction(ctx, current.ID)
+		action, err := s.dispatch.store.GetAction(ctx, current.ID)
 		if err == nil {
+			// Something exists at the identity. It is this approval's work
+			// only if it is the materialization of this approval — the same
+			// predicate a replay applies — and otherwise the identity was
+			// taken and the approval can never become work.
+			if !isMaterializationOf(action, current) {
+				return ApprovalUnresolvable, ApprovalConditionIdentityTaken, nil
+			}
 			// The work exists; where it has got to is the action's status.
 			return ApprovalEnqueued, ApprovalConditionNone, nil
 		}
 		if !errors.Is(err, ErrActionNotFound) {
 			return "", "", err
 		}
-		if condition := s.unreachable(ctx, decision, current, now); condition !=
-			ApprovalConditionNone {
+		condition, err := s.unreachable(ctx, current, now)
+		if err != nil {
+			return "", "", err
+		}
+		if condition != ApprovalConditionNone {
 			return ApprovalUnresolvable, condition, nil
 		}
 		return ApprovalEnqueued, ApprovalConditionAwaitingAction, nil
@@ -1280,8 +1351,11 @@ func (s *ApprovalService) effectiveState(
 	if !now.Before(current.ExpiresAt) {
 		return ApprovalExpired, ApprovalConditionWindowClosed, nil
 	}
-	if condition := s.unreachable(ctx, decision, current, now); condition !=
-		ApprovalConditionNone {
+	condition, err := s.unreachable(ctx, current, now)
+	if err != nil {
+		return "", "", err
+	}
+	if condition != ApprovalConditionNone {
 		return ApprovalUnresolvable, condition, nil
 	}
 	return current.State, ApprovalConditionNone, nil
@@ -1292,24 +1366,33 @@ func (s *ApprovalService) effectiveState(
 // The agent is read without the caller's authority: whether the target still
 // exists at the request's generation is a fact about the registry, not about
 // who is asking, and the caller has already been admitted to this record.
+//
+// The policy generation compared is the one in force, read from the
+// generation authority, not the caller's token: a reader holding a token
+// minted before the policy moved would otherwise be told a superseded request
+// is live.
 func (s *ApprovalService) unreachable(
 	ctx context.Context,
-	decision auth.Decision,
 	current ApprovalRecord,
 	now time.Time,
-) ApprovalCondition {
+) (ApprovalCondition, error) {
 	if !now.Before(current.Request.Deadline) {
-		return ApprovalConditionDeadlinePassed
+		return ApprovalConditionDeadlinePassed, nil
 	}
 	descriptor, err := s.dispatch.registry.active(
 		ctx, current.Request.AgentID, now)
 	if err != nil || descriptor.Generation != current.Request.AgentGeneration {
-		return ApprovalConditionTargetMoved
+		return ApprovalConditionTargetMoved, nil
 	}
-	if decision.PolicyGeneration() != current.PolicyGeneration {
-		return ApprovalConditionPolicyMoved
+	inForce, err := s.generations.CurrentPolicyGeneration(
+		ctx, descriptor.AuthorizationDomain)
+	if err != nil {
+		return "", err
 	}
-	return ApprovalConditionNone
+	if inForce != current.PolicyGeneration {
+		return ApprovalConditionPolicyMoved, nil
+	}
+	return ApprovalConditionNone, nil
 }
 
 // Pending lists requests this caller may decide and that are still decidable.

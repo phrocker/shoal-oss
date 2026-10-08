@@ -57,7 +57,9 @@ approved request all receive the same enqueued action; exactly one
 `ActionRecord` is written. A materialization that collides with a concurrent
 one still landing is retried internally with a short jittered back-off, because
 the durable store reports that case as a conflict or a transient not-found
-rather than as the fleet sentinel.
+rather than as the fleet sentinel. Each attempt judges the window at its own
+time, so a retried `approved → enqueued` commit cannot land after
+`expires_at`.
 
 `POST /api/v1/fleet/approvals/pending` lists what the caller may decide;
 `POST /api/v1/fleet/approvals/{id}/status` returns one approval, with its
@@ -77,12 +79,15 @@ therefore reports three things: `state`, what the request effectively is now;
 | `expired` | `window_closed` | stored pending or approved, window closed, expiry not yet written |
 | `enqueued` | — | the action exists; its own status says where it is |
 | `enqueued` | `enqueued_without_action` | the second write was lost; the next re-request writes it |
+| `unresolvable` | `identity_taken` | committed to become work, but another route's action holds the identity |
 | `unresolvable` | `target_moved` | the agent's generation moved, or the agent is gone |
-| `unresolvable` | `policy_generation_moved` | the policy generation moved since the request |
+| `unresolvable` | `policy_generation_moved` | the policy generation in force (read from the generation authority, not the caller's token) moved since the request |
 | `unresolvable` | `deadline_passed` | the action deadline passed; it can no longer be re-requested |
 | `refused` / `expired` | — | final |
 
-`unresolvable` is never stored. An approver sees a request through Status and
+An action at the identity counts as this approval's work only if it is its
+materialization: the same request, digest, approver and decision time — the
+predicate a replay applies. `unresolvable` is never stored. An approver sees a request through Status and
 Pending only while its target still resolves at the request's generation; the
 requester always sees its own.
 
@@ -118,8 +123,11 @@ asked as an approver:
   answers from `webapi.EffectiveWorkspaceSettings`). A narrowing can only
   remove authority, so a principal holding approve and dispatch could narrow to
   approve alone and pass the next rule; separation is judged on the authority
-  it actually holds. Decide and Pending refuse outright (`401`); Status refuses
-  an approver the same way.
+  it actually holds. Pending refuses a narrowed caller outright (`401`). Decide
+  and Status-as-approver run every other rule first and return the narrowing
+  refusal only when the caller would otherwise be eligible on that record;
+  any other failure answers `404` exactly as a missing ID does, so a narrowed
+  caller cannot use the refusal to learn which approval IDs exist.
 - `action_approve` authorized on the request's scope, and the request's target
   still resolving at the generation it names. Failing either answers as an
   absent record does.
@@ -139,8 +147,10 @@ asked as an approver:
   approve the other's work. Execute is included because an approver that may
   claim and perform the work it approved has not been separated from the
   effect.
-- The same policy generation, both the one named in the decision and the one
-  the approver's credential is under.
+- The same policy generation: the one named in the decision, the one the
+  approver's credential is under, and the one in force according to the
+  generation authority (`ApprovalConfig.Generations`). A token minted before
+  the policy moved still carries the old generation.
 
 What these rules deliberately do not do:
 
@@ -261,8 +271,8 @@ transition reconciled on a lagging replica has the same property.
   are. A principal with dispatch on the scope can enqueue an ordinary action at
   the identity of someone's held request. Found before materialization, the
   approval stays `approved` and the re-request conflicts; landing between that
-  check and the commit leaves the approval `enqueued` with no action, which
-  Status reports. A conflict on request also reveals that something exists at
+  check and the commit leaves the approval `enqueued` under someone else's
+  action, which Status reports as `unresolvable` / `identity_taken`. A conflict on request also reveals that something exists at
   an identity. Both are the existing dispatch identity properties.
 - **Stranded rows.** A request whose target generation or policy generation
   moves, or whose deadline passes, stays in its stored state forever; nothing

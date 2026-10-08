@@ -1225,6 +1225,9 @@ func openService(
 				_, narrowed := webapi.EffectiveWorkspaceSettings(ctx)
 				return narrowed
 			},
+			// The same current-policy authority the authorized client and
+			// workspace settings use.
+			Generations: generationReader,
 		})
 		if err != nil {
 			store.Close()
