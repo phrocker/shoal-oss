@@ -532,8 +532,8 @@ silently stops firing is the failure they exist to catch.
 ## Upgrading: re-register reasoning descriptors
 
 The effect taxonomy became a set of classes — `reads-corpus`,
-`egresses-content`, `mutates-external` — replacing a two-value split that could
-only describe mutation. Durable records decode without a migration: a
+`egresses-content`, and external mutation, spelled `external` on the wire and
+in `effects` — replacing a two-value split that could only describe mutation. Durable records decode without a migration: a
 descriptor written before the change keeps its stored meaning, and the HTTP
 surface still accepts the superseded `"effect": "external"` spelling alongside
 the current `"effects": ["external"]`.
@@ -563,8 +563,49 @@ Re-register with those classes in `effects`. What to declare depends on where
 `-chat-base-url` points, not on the action — a loopback provider transmits
 nothing — so take it from the executor rather than hardcoding it.
 
-Descriptors bound to any other executor are unaffected: an executor that
-declares no floor imposes none.
+Descriptors bound to any other executor are mostly unaffected — an executor
+that declares no floor imposes none — with one narrow exception, below.
+
+**A second thing does not survive, for the same reason in a different shape.**
+An action that declares *nothing at all* is now refused when its executor's
+reference is bound to a ceiling that permits reaching outside Shoal
+(`external` or `egresses-content`) and declares no floor. That is the
+dispatch-only shape: the host has said work on this reference may reach
+outside, and declined to say when, so Shoal cannot know. A completion against
+such a reference reported `effect_possible: false` for an action that declared
+nothing, which reads as "no external effect was declared for work Shoal never
+performed" while a remote worker may have done anything the ceiling permits
+(#510, #514).
+
+The refusal names the classes the ceiling permits:
+
+```console
+invalid_argument: action declares no effects at all and is bound to an executor
+that may reach outside Shoal (external) without declaring when; declare what
+this action does — any class will do, including reads-corpus alone if it
+reaches outside nothing
+```
+
+Note what this does **not** require: an external class. A dispatch-only action
+may legitimately reach outside nothing — a remote worker reading Shoal's own
+corpus is the common case — and forcing it to claim an external effect would
+make `effect_possible` true where it should be false, which is the same false
+claim in the opposite direction. Any one class satisfies the requirement. What
+is refused is silence.
+
+**Already-registered descriptors keep running.** This is a registration
+boundary, not a resolution one: a stored descriptor declaring nothing still
+resolves and still completes, so an upgrade does not strand in-flight work or
+stop a running fleet. It is refused the next time it is registered or updated,
+and `shoal-atpl compile`/`plan` refuse the same shape before apply, so an
+operator sees it in a plan rather than at apply time. Nothing rewrites stored
+records.
+
+Residual gap, stated rather than implied: an action declaring `reads-corpus` on
+such a reference still completes with `effect_possible: false` while the worker
+may do anything the ceiling permits. Closing that needs either a floor on the
+binding or a per-action external declaration in the manifest; neither is in
+this change.
 
 ## Orchestrator probes: the health surface
 

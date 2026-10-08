@@ -364,6 +364,13 @@ func TestRefusalsNameThePathAndMatchRegister(t *testing.T) {
 		{"effects above executor max", "planner", func(d *Document) {
 			agentByID(d, "planner").Capabilities[0].Actions[0].Effects = []string{"egresses-content"}
 		}, "agents[id=planner].capabilities[name=search].actions[name=query].effects: action declares effects its executor is not bound to perform"},
+		// tickets.open rather than search.query, because searcher inherits
+		// query and would be refused for its own reason first. remote-exec
+		// has an external ceiling and no floor, so the action may not stay
+		// silent about what it does.
+		{"dispatch-only action declares nothing", "planner", func(d *Document) {
+			agentByID(d, "planner").Capabilities[1].Actions[0].Effects = nil
+		}, "agents[id=planner].capabilities[name=tickets].actions[name=open].effects: action declares no effects at all and is bound to an executor that may reach outside Shoal (external)"},
 		{"effects below executor min", "searcher", func(d *Document) {
 			agentByID(d, "searcher").Capabilities[0].Actions[0] = explicitQuery(nil, `{"type":"object"}`)
 		}, "agents[id=searcher].capabilities[name=search].actions[name=query].effects: action omits effects its executor causes on every invocation (reads-corpus)"},
@@ -574,7 +581,12 @@ func TestDecodeBounds(t *testing.T) {
 			agent.Capabilities = append(agent.Capabilities, Capability{
 				Name: fmt.Sprintf("capability-%02d", i),
 				Actions: []Action{{Name: "act", InputSchema: json.RawMessage(`{}`),
-					OutputSchema: json.RawMessage(`{}`)}},
+					OutputSchema: json.RawMessage(`{}`),
+					// planner binds to remote-exec, whose ceiling permits an
+					// external class, so an action must declare something.
+					// This test is about capability counts; declare the
+					// narrowest class that is in bounds.
+					Effects: []string{string(fleet.EffectReadsCorpus)}}},
 			})
 		}
 		document.Agents = document.Agents[:1]

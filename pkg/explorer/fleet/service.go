@@ -781,6 +781,65 @@ func validateDeclaredEffects(capabilities []Capability, floor, ceiling Effects) 
 						"perform; effects beyond the binding are dispatched, "+
 						"not performed in process")
 			}
+			// An executor whose ceiling permits an external effect and whose
+			// floor requires none has declined to say whether one happens.
+			// The host is telling Shoal "this may reach outside and I cannot
+			// tell you when" — so an action bound to it must declare that it
+			// may, or the record would assert the whole outcome is in Shoal
+			// for work Shoal cannot account for.
+			//
+			// That assertion is what EffectPossible makes. It is set at claim
+			// time from the declaration, so a non-declaring action bound to a
+			// dispatch-only reference completes with the flag false while a
+			// remote worker may have mutated a third-party system — and the
+			// flag reads "no external effect was declared", which an operator
+			// is entitled to mistake for "none was possible" (#510, #514).
+			//
+			// Keyed on floor-below-ceiling rather than on "runs in process",
+			// for two reasons. It is the property that actually matters: an
+			// in-process executor that declines to declare a floor is in the
+			// same position, because the flag is written at claim time before
+			// any invocation, so Shoal does not know then either. And it is
+			// derivable from the (floor, ceiling) pair, which is all pkg/atpl
+			// has — so validate and plan refuse this exactly as Register
+			// does, with no new manifest field for an operator to get wrong.
+			//
+			// AskExecutor is unaffected: its floor equals its ceiling, so the
+			// floor check below already forces the declaration.
+			//
+			// Narrowed to an action declaring *nothing*, which is weaker than
+			// requiring an external class and is the strongest rule that
+			// forces no false declaration. Requiring one was tried and is
+			// wrong: a dispatch-only action may legitimately reach outside
+			// nothing — a remote worker that reads Shoal's own corpus and
+			// returns — and the project's own ATPL fixture is exactly that
+			// shape, `search.query` declaring reads-corpus on a reference
+			// whose ceiling permits external. There is no narrower reference
+			// to bind it to, because NewExternalEffectBinding refuses a
+			// ceiling without EffectMutatesExternal. So the rule would have
+			// forced that action to claim an external effect it does not
+			// have, making EffectPossible true where it should be false —
+			// the same class of false claim, pointing the other way.
+			//
+			// An action declaring nothing is unambiguous: it asserts its
+			// whole outcome is in this record, on a reference whose host has
+			// said it may reach outside and declined to say when. That is the
+			// shape the reported case had, and it leaves the residual gap
+			// honestly open — an action declaring reads-corpus on such a
+			// reference still completes with EffectPossible false while a
+			// remote worker may have done anything the ceiling permits (#514).
+			if external := ceiling.externalClasses(); len(external) > 0 &&
+				len(floor.externalClasses()) == 0 &&
+				len(action.Effects) == 0 {
+				return shoal.NewError(
+					shoal.ErrorInvalidArgument,
+					"action declares no effects at all and is bound to an "+
+						"executor that may reach outside Shoal ("+
+						strings.Join(external, ", ")+") without declaring "+
+						"when; declare what this action does — any class "+
+						"will do, including "+string(EffectReadsCorpus)+
+						" alone if it reaches outside nothing")
+			}
 			if missing := action.Effects.missingFrom(floor); len(missing) > 0 {
 				// The missing classes are named. They are host configuration,
 				// not another principal's data, so this discloses nothing — and
