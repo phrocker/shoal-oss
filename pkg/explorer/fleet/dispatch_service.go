@@ -646,9 +646,26 @@ func applyClaim(
 	// provenance below, and leaves the record's own principal alone.
 	record.TransitionRequestID = decision.RequestID()
 	record.TransitionCorrelationID = decision.CorrelationID()
+	// Widened with the operation that authorized *this* claim and nothing
+	// else. The publisher needs it there — it authorizes a claim or
+	// completion event against record.TransitionOperation and refuses a
+	// publication whose operation is absent from this set, and a refused
+	// publication comes back as ErrActionCommitted, so an execute-authorized
+	// claim that did not widen the set would commit and then tell the worker
+	// its outcome needs reconciliation.
+	//
+	// What it no longer adds is OperationDelegate. decisionOperations appends
+	// that whenever the decision carries a non-empty OnBehalfOf, so a
+	// delegated claimant permanently added delegate to the AuthorizedOperations
+	// of a record it did not enqueue — asserting the enqueue was delegated on
+	// the strength of who claimed it. Nothing reads delegate back out of this
+	// field (the two authorizeScopes calls that name the operation check the
+	// live decision, not the record), so it bought nothing and misdescribed
+	// the record's own authority. Delegation of the enqueue is still recorded
+	// at creation, where the delegating decision is the enqueuer's own
+	// (#460).
 	record.AuthorizedOperations = canonicalOperations(append(
-		record.AuthorizedOperations,
-		decisionOperations(decision, authorizing)...))
+		record.AuthorizedOperations, authorizing))
 	fingerprint, err := auth.AuthorizationFingerprint(decision)
 	if err != nil {
 		return ActionRecord{}, err
@@ -1428,6 +1445,13 @@ func (s *DispatchService) Cancel(ctx context.Context, request CancelRequest) (Ac
 	next.UpdatedAt = now
 	next.TransitionRequestID = decision.RequestID()
 	next.TransitionCorrelationID = decision.CorrelationID()
+	// Left as decisionOperations, unlike the claim site. Cancel resolves
+	// through authorizedCurrent with requirePrincipal true, so only the
+	// record's own principal reaches here — a delegated canceller is
+	// therefore the delegated enqueuer, whose delegation creation already
+	// recorded. Narrowing this to dispatch alone would change nothing any
+	// test can distinguish, which is the reason it is not narrowed: it would
+	// read as a fix for a defect this path does not have (#460).
 	next.AuthorizedOperations = canonicalOperations(append(
 		next.AuthorizedOperations,
 		decisionOperations(decision, auth.OperationDispatch)...,
