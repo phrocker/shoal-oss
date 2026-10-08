@@ -263,6 +263,43 @@ func (s *DispatchService) Invoke(ctx context.Context, request InvokeRequest) (Ac
 		s.clock().UTC().Before(queued.ClaimLeaseUntil) {
 		return s.ExecuteClaim(ctx, queued)
 	}
+	// Refuse a dispatch-only binding *before* claiming, not after (#455).
+	//
+	// ExecuteClaim asserts the bound reference implements ActionExecutor, and
+	// an ExternalEffectBinding deliberately does not: the whole point is that
+	// the work reaches a gateway over the dispatch queue and the completion
+	// report is what Shoal records, so nothing runs in process. Reached
+	// through Invoke, that assertion failed *after* Claim had committed — and
+	// Claim sets EffectPossible for an action declaring external mutation or
+	// egress.
+	//
+	// So an accidental synchronous invoke against a gateway reference left a
+	// durable record saying an effect may have happened, for an action that
+	// provably did nothing: the claim committed and the executor resolution
+	// failed in this process, before anything was serialized and before
+	// anything left the host. The flag is monotonic, so the damage does not
+	// wash out — every such invoke permanently adds a record to the set an
+	// operator reconciles by hand.
+	//
+	// It is also easy to hit by accident rather than adversarially. The
+	// invoke route is the obvious one, the descriptor registers fine, and
+	// nothing about the configuration says this reference is dispatch-only.
+	//
+	// Resolving first makes it a clean deterministic refusal with no state
+	// written beyond the enqueue, which is not an effect. The same ordering
+	// argument as #536's: establish what the caller may do before touching
+	// anything that records a consequence.
+	decision, now, err := s.begin(ctx, auth.OperationInvoke, request.Enqueue.Context)
+	if err != nil {
+		return ActionRecord{}, err
+	}
+	if _, _, _, err := s.registry.resolveAction(
+		ctx, decision, queued.AgentID, queued.AgentGeneration,
+		queued.Capability, queued.Action, queued.SourceID, queued.PolicyID,
+		queued.ObjectID, auth.OperationInvoke, now,
+	); err != nil {
+		return ActionRecord{}, err
+	}
 	claimed, err := s.Claim(ctx, ClaimRequest{
 		ID: queued.ID, ExpectedVersion: queued.Version, ClaimID: request.ClaimID,
 		Lease: request.Lease, Context: request.Enqueue.Context,
