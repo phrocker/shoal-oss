@@ -5,11 +5,15 @@ import (
 	"context"
 	"crypto/ed25519"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
+
+	"filippo.io/edwards25519"
 
 	"github.com/phrocker/shoal-oss/internal/collectorattest"
 	"github.com/phrocker/shoal-oss/pkg/collector"
@@ -331,5 +335,103 @@ func TestParseTrust(t *testing.T) {
 	// The same verifier (ID and key) may serve several refs.
 	if _, e := ParseTrust([]byte(`{"executors":{"r":` + entry(v1, img) + `,"s":` + entry(v1, img) + `}}`)); e != nil {
 		t.Fatal(e)
+	}
+}
+
+// smallOrderKeys are the eight torsion points plus non-canonical encodings of
+// small-order points (libsodium's blocklist).
+func smallOrderKeys(t *testing.T) map[string][]byte {
+	t.Helper()
+	ff := func(first, last byte) []byte {
+		b := []byte(strings.Repeat("\xff", 32))
+		b[0], b[31] = first, last
+		return b
+	}
+	identity := append([]byte{1}, make([]byte, 31)...)
+	order8, _ := hex.DecodeString("26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc05")
+	gen, e := new(edwards25519.Point).SetBytes(order8)
+	if e != nil {
+		t.Fatal(e)
+	}
+	rows := map[string][]byte{
+		"identity with sign bit": append(append([]byte{1}, make([]byte, 30)...), 0x80),
+		"y = p":                  ff(0xed, 0x7f),
+		"y = p + 1":              ff(0xee, 0x7f),
+		"order 2 with sign bit":  ff(0xec, 0xff),
+	}
+	p := edwards25519.NewIdentityPoint()
+	for k := range 8 {
+		rows[fmt.Sprintf("torsion %d", k)] = p.Bytes()
+		p = new(edwards25519.Point).Add(p, gen)
+	}
+	if string(rows["torsion 0"]) != string(identity) {
+		t.Fatal("torsion 0 is not the identity")
+	}
+	return rows
+}
+
+func TestSmallOrderVerifierKeysRefused(t *testing.T) {
+	for name, key := range smallOrderKeys(t) {
+		x := ExecutorTrust{Verifiers: []VerifierTrust{{ID: verifierID, PublicKey: key, MaxValidity: time.Hour}}, ImageDigests: []string{image}}
+		if _, e := NewTrust(map[string]ExecutorTrust{ref: x}); e == nil {
+			t.Errorf("%s: accepted", name)
+		}
+		file := strings.Replace(validTrust, "%s", base64.StdEncoding.EncodeToString(key), 1)
+		if _, e := ParseTrust([]byte(file)); e == nil {
+			t.Errorf("%s: accepted from file", name)
+		}
+	}
+	// The forgery the check prevents: under the identity key, R = base point
+	// and S = 1 verify for any message.
+	identity := smallOrderKeys(t)["torsion 0"]
+	signature := append(edwards25519.NewGeneratorPoint().Bytes(), make([]byte, 32)...)
+	signature[32] = 1
+	body, _ := json.Marshal(statement(expectation()))
+	if !ed25519.Verify(identity, append([]byte(signingContext), body...), signature) {
+		t.Log("crypto/ed25519 refuses the identity key itself")
+	}
+}
+
+func TestTrustFileDuplicateAndCaseKeysRefused(t *testing.T) {
+	public, _ := keys('a')
+	key := base64.StdEncoding.EncodeToString(public)
+	v := `{"id":"operator-key:1","public_key":"` + key + `","max_validity":"1h","clock_skew":"1m"}`
+	img := `"` + image + `"`
+	entry := `{"verifiers":[` + v + `],"image_digests":[` + img + `]}`
+	for name, raw := range map[string]string{
+		"duplicate executor ref":      `{"executors":{"r":` + entry + `,"r":` + entry + `}}`,
+		"duplicate executors key":     `{"executors":{"r":` + entry + `},"executors":{}}`,
+		"repeated verifiers key":      `{"executors":{"r":{"verifiers":[` + v + `],"verifiers":[],"image_digests":[` + img + `]}}}`,
+		"repeated image_digests key":  `{"executors":{"r":{"verifiers":[` + v + `],"image_digests":[` + img + `],"image_digests":["sha256:` + strings.Repeat("d", 64) + `"]}}}`,
+		"repeated verifier field":     `{"executors":{"r":{"verifiers":[` + strings.TrimSuffix(v, "}") + `,"id":"operator-key:2"}],"image_digests":[` + img + `]}}}`,
+		"case alias executors":        `{"Executors":{"r":` + entry + `}}`,
+		"case alias image_digests":    `{"executors":{"r":{"verifiers":[` + v + `],"Image_Digests":[` + img + `]}}}`,
+		"case alias verifier id":      `{"executors":{"r":{"verifiers":[` + strings.Replace(v, `"id"`, `"ID"`, 1) + `],"image_digests":[` + img + `]}}}`,
+		"case alias beside exact key": `{"executors":{"r":` + entry + `},"EXECUTORS":{}}`,
+	} {
+		if _, e := ParseTrust([]byte(raw)); e == nil {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+	// Executor refs are map keys: refs differing only in case are distinct.
+	if trust, e := ParseTrust([]byte(`{"executors":{"r":` + entry + `,"R":` + entry + `}}`)); e != nil || !trust.Configured("r") || !trust.Configured("R") {
+		t.Fatalf("case-distinct refs: %v", e)
+	}
+}
+
+func TestEnvelopeDuplicateKeysRefused(t *testing.T) {
+	_, private := keys('a')
+	want := expectation()
+	evidence := string(sign(t, private, statement(want)))
+	for name, raw := range map[string]string{
+		"duplicate verifier_id": strings.Replace(evidence, `{"verifier_id":"operator-key:1",`, `{"verifier_id":"operator-key:9","verifier_id":"operator-key:1",`, 1),
+		"case alias signature":  strings.Replace(evidence, `"signature"`, `"Signature"`, 1),
+	} {
+		if raw == evidence {
+			t.Fatal(name, "not mutated")
+		}
+		if _, e := Verify(trustWith(t, nil), want, []byte(raw)); !reasonIs(e, ReasonMalformed) {
+			t.Errorf("%s: %v", name, e)
+		}
 	}
 }

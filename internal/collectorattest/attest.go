@@ -23,9 +23,10 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
-	"io"
 	"time"
 
+	"github.com/phrocker/shoal-oss/internal/ed25519key"
+	"github.com/phrocker/shoal-oss/internal/strictjson"
 	"github.com/phrocker/shoal-oss/pkg/collector"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
@@ -121,7 +122,7 @@ type Ed25519Config struct {
 type ed25519Statement struct{ config Ed25519Config }
 
 func NewEd25519Statement(c Ed25519Config) (Verifier, error) {
-	if shoal.ValidateRequiredID("verifier ID", c.VerifierID) != nil || len(c.PublicKey) != ed25519.PublicKeySize || c.MaxValidity <= 0 || c.ClockSkew < 0 || c.ClockSkew > time.Hour {
+	if shoal.ValidateRequiredID("verifier ID", c.VerifierID) != nil || ed25519key.Validate(c.PublicKey) != nil || c.MaxValidity <= 0 || c.ClockSkew < 0 || c.ClockSkew > time.Hour {
 		return nil, shoal.NewError(shoal.ErrorInvalidArgument, "invalid Ed25519 statement verifier")
 	}
 	c.PublicKey = bytes.Clone(c.PublicKey)
@@ -130,17 +131,9 @@ func NewEd25519Statement(c Ed25519Config) (Verifier, error) {
 
 func (ed25519Statement) Kind() string { return Ed25519StatementKind }
 
-func strictDecode(raw []byte, out any) error {
-	d := json.NewDecoder(bytes.NewReader(raw))
-	d.DisallowUnknownFields()
-	if e := d.Decode(out); e != nil {
-		return e
-	}
-	if _, e := d.Token(); e != io.EOF {
-		return ErrRefused
-	}
-	return nil
-}
+// strictDecode refuses duplicate keys and case-insensitive key matches at
+// every level, unknown fields and trailing data.
+func strictDecode(raw []byte, out any) error { return strictjson.Decode(raw, out) }
 
 func (v ed25519Statement) Verify(ctx context.Context, report collector.AttestationReport, want Expectation) (collector.AttestationResult, error) {
 	var zero collector.AttestationResult

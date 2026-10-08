@@ -55,7 +55,16 @@ request.
   }}}
 ```
 
-Parsing is strict: unknown fields and trailing data are refused. Each ref needs
+Parsing is strict (`internal/strictjson`). It refuses:
+
+- unknown fields and trailing data;
+- duplicate JSON keys at any level, including a repeated executor ref;
+- keys that match a field only up to case, because encoding/json would otherwise accept them last-wins and case-insensitively.
+
+Public keys must be canonical encodings of points in the prime-order subgroup
+(`internal/ed25519key`). crypto/ed25519's cofactorless `Verify` accepts forged
+signatures under a small-order key, such as the identity. collectorattest
+applies the same key check. Each ref needs
 at least one verifier and one image digest. `max_validity` must be in (0, 1h],
 and `clock_skew` must be in [0, 1m]. Verifier IDs and keys are unique within a
 ref. Across refs, an ID is always bound to the same key, so the `VerifierID`

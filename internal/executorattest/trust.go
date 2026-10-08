@@ -8,14 +8,13 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
-	"encoding/json"
-	"errors"
-	"io"
 	"slices"
 	"strings"
 	"time"
 	"unicode/utf8"
 
+	"github.com/phrocker/shoal-oss/internal/ed25519key"
+	"github.com/phrocker/shoal-oss/internal/strictjson"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
@@ -86,7 +85,7 @@ func NewTrust(executors map[string]ExecutorTrust) (*Trust, error) {
 		var c ExecutorTrust
 		seenID, seenKey := map[shoal.ID]bool{}, map[string]bool{}
 		for _, v := range t.Verifiers {
-			if shoal.ValidateRequiredID("verifier ID", v.ID) != nil || len(v.PublicKey) != ed25519.PublicKeySize {
+			if shoal.ValidateRequiredID("verifier ID", v.ID) != nil || ed25519key.Validate(v.PublicKey) != nil {
 				return nil, invalidTrust("verifier")
 			}
 			if v.MaxValidity <= 0 || v.MaxValidity > MaxValidityCeiling || v.ClockSkew < 0 || v.ClockSkew > ClockSkewCeiling {
@@ -154,8 +153,10 @@ type verifierFile struct {
 	ClockSkew   string `json:"clock_skew"`
 }
 
-// ParseTrust reads an operator trust file. Unknown fields, trailing data,
-// duplicate verifiers or keys, out-of-bound durations and malformed digests
+// ParseTrust reads an operator trust file. Duplicate JSON keys at any level
+// (including a repeated executor ref), keys matching a field only up to case,
+// unknown fields, trailing data, duplicate verifiers or keys, small-order or
+// non-canonical public keys, out-of-bound durations and malformed digests
 // are refused. Public keys are standard padded base64 of the 32-byte key;
 // durations use Go syntax ("1h", "30s").
 func ParseTrust(raw []byte) (*Trust, error) {
@@ -209,17 +210,9 @@ func (x ExecutorTrust) verifier(id shoal.ID) (VerifierTrust, bool) {
 	return VerifierTrust{}, false
 }
 
-func strictDecode(raw []byte, out any) error {
-	d := json.NewDecoder(bytes.NewReader(raw))
-	d.DisallowUnknownFields()
-	if e := d.Decode(out); e != nil {
-		return e
-	}
-	if _, e := d.Token(); e != io.EOF {
-		return errors.New("trailing data")
-	}
-	return nil
-}
+// strictDecode refuses duplicate keys and case-insensitive key matches at
+// every level, unknown fields and trailing data.
+func strictDecode(raw []byte, out any) error { return strictjson.Decode(raw, out) }
 
 func keyDigest(key ed25519.PublicKey) string {
 	sum := sha256.Sum256(key)
