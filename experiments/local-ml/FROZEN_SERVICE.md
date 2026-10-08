@@ -124,3 +124,19 @@ Regression tests cover cross-process lock contention, release on process exit,
 symlink refusal, rejection before state mutation, runtime drift, and legacy state
 admission. The original evidence above remains the initial implementation's run;
 final revised execution evidence is recorded separately below.
+
+
+A fresh full-PR review of `bfa5ee0..b203200` found **no actionable findings**
+after those fixes. Uncached targeted race tests covered the new contention,
+process-exit, state rejection and authorization cases. Requests that have not
+completed retain their original one-hour deadline; the command does not extend
+that deadline on retry. Committed receipts remain replayable under the matching
+runtime and current authorization. No power-loss simulation or hostile filesystem
+replacement test was performed.
+
+The [revised execution evidence](evidence/frozen-service-2026-10-08/reviewed-v2-summary.json)
+at `b203200` again records 188/188 matching decisions, 188 calls initially and
+zero after restart with identical per-subject records. A simultaneous full CLI
+invocation was rejected by the session lock. These reports use a new schema-2
+state directory; the original schema-1 evidence remains retained above. Only
+documentation and these execution reports changed after the fresh clean review.
