@@ -1312,6 +1312,150 @@ func (s *DispatchService) Cancel(ctx context.Context, request CancelRequest) (Ac
 	return cloneActionRecord(stored), nil
 }
 
+// ExtendClaim renews a live claim's lease so the fenced window can cover an
+// operation longer than MaxActionClaimTTL (#430).
+//
+// Without it the fenced window is whatever was asked for at claim time,
+// bounded by a hard five minutes that the service refuses rather than clamps.
+// A worker whose operation outruns that has done something the record says did
+// not happen, which is the outcome #391 exists to prevent — and raising the
+// ceiling is not the fix, because a long lease is a long window in which a
+// dead worker's action is stuck.
+//
+// Renewal separates the two concerns the single number conflated.
+// MaxActionClaimTTL becomes a heartbeat interval: how long a worker may be
+// silent before it is assumed gone. The action's Deadline remains the total
+// budget, already set by the enqueuer, already bounded by MaxActionDeadline,
+// and already clamping ClaimLeaseUntil. So the total bound needs no new
+// concept and no new ceiling.
+//
+// Four semantics, each decided rather than discovered.
+//
+// The fence does not increment. ClaimFence identifies *which* claim, and the
+// claim has not changed — only its deadline has. Incrementing would invalidate
+// the fence the claimant is holding and break the report-under-the-same-fence
+// contract the gateway design depends on. The record Version increments
+// instead, and ExpectedVersion guards the mutation.
+//
+// An expired lease is not renewable, and that is the point rather than a
+// limitation. Once ClaimLeaseUntil has passed the action may already have been
+// reclaimed under a new ClaimID and fence, so renewing would hand two workers
+// a live claim. A worker whose extension is refused mid-operation is in the
+// ambiguous case — it may be about to perform, or have performed, an effect it
+// can no longer report — which is what EffectPossible and the #438 ambiguity
+// route exist for. The refusal is ErrClaimLost, distinguishable from a
+// transport failure, because a worker must be able to tell "my claim is gone,
+// treat this as ambiguous" from "retry the renewal".
+//
+// Shortening is refused. A lease moving ClaimLeaseUntil backwards is a worker
+// bug, and honouring it costs the claim it was trying to keep.
+//
+// And no lifecycle event is published. A heartbeat on a long operation would
+// emit one every few minutes per action and drown the event log in liveness;
+// ClaimLeaseUntil and Version already carry it and Status already exposes
+// them. TransitionKind is empty, so the store writes without enqueuing an
+// outbox row — which also keeps a renewal out of the mixed-identity outbox
+// that #480 found can be left undrainable.
+func (s *DispatchService) ExtendClaim(
+	ctx context.Context, request ExtendRequest,
+) (ActionRecord, error) {
+	ctx, cancel := s.deadline(ctx, request.Context)
+	defer cancel()
+	decision, now, err := s.beginClaimant(ctx, request.Context)
+	if err != nil {
+		return ActionRecord{}, err
+	}
+	if request.ExpectedVersion == 0 || request.Lease <= 0 ||
+		request.Lease > MaxActionClaimTTL {
+		return ActionRecord{}, shoal.NewError(
+			shoal.ErrorInvalidArgument, "claim version or lease is invalid")
+	}
+	if err := validateOpaque(
+		"claim ID", request.ClaimID, false); err != nil {
+		return ActionRecord{}, err
+	}
+	current, _, authorizing, err := s.authorizedClaimant(
+		ctx, decision, request.ID, now)
+	if err != nil {
+		return ActionRecord{}, err
+	}
+	// An admission's grant is not a claim a worker renews. Refused as
+	// not-found for the same reason every other dispatch route refuses one.
+	if current.isAdmission() {
+		return ActionRecord{}, auth.ObjectNotFound()
+	}
+	// Only the claim's holder may renew it, and a caller without standing is
+	// told what an absent action is told — this route is reachable by every
+	// principal authorized to execute the descriptor, so a distinguishable
+	// refusal would confirm the action exists.
+	if !holdsClaimOn(decision, current) ||
+		!bytes.Equal(current.ClaimID, request.ClaimID) {
+		return ActionRecord{}, auth.ObjectNotFound()
+	}
+	if current.Version != request.ExpectedVersion {
+		return ActionRecord{}, ErrActionConflict
+	}
+	// Claimed and live, in that order. A terminal record has no claim to
+	// renew; an expired one may already belong to someone else.
+	if current.State != DispatchClaimed ||
+		!now.Before(current.ClaimLeaseUntil) ||
+		!now.Before(current.Deadline) {
+		return ActionRecord{}, ErrClaimLost
+	}
+	extended := now.Add(request.Lease)
+	if extended.After(current.Deadline) {
+		extended = current.Deadline
+	}
+	// Refused rather than silently ignored, so a worker that has miscomputed
+	// its own budget finds out while it still holds the claim.
+	if !extended.After(current.ClaimLeaseUntil) {
+		return ActionRecord{}, shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			"claim extension does not move the lease forward")
+	}
+	next := cloneActionRecord(current)
+	next.Version++
+	next.ClaimLease = request.Lease
+	next.ClaimLeaseUntil = extended
+	next.UpdatedAt = now
+	next.TransitionRequestID = decision.RequestID()
+	next.TransitionCorrelationID = decision.CorrelationID()
+	if err := s.recorder.RecordAction(ctx, ActionAudit{
+		// The operation that authorized *this* call, for the reason
+		// ReportAmbiguity's own comment gives: reading the record's field
+		// attributes the renewal to whatever claimed the action, and passes an
+		// empty operation for a record claimed by a build without the field,
+		// which RecordAction validates first and refuses — joined with
+		// ErrRecordingUnavailable, so a 503.
+		//
+		// This route had neither of the two defences its siblings have.
+		// ReportAmbiguity uses the authorizing operation; ExecuteClaim keeps
+		// the record's and falls back to invoke when it is empty. ExtendClaim
+		// used the record's with no fallback, so a worker mid-long-operation
+		// across an upgrade could not renew, lost its claim, and landed in the
+		// ambiguity case — the exact outcome this route exists to prevent.
+		// Reproduced before fixing: "fleet dispatch: recording is
+		// unavailable", with errors.Is(err, ErrRecordingUnavailable) true.
+		Phase: "claim_extension", Operation: authorizing,
+		Record: next,
+	}); err != nil {
+		return ActionRecord{}, errors.Join(ErrRecordingUnavailable, err)
+	}
+	stored, err := s.store.ApplyAction(ctx, DispatchMutation{
+		Token: transitionToken(
+			"extend", request.ID, request.ClaimID, next.Version),
+		ExpectedVersion: current.Version,
+		// Asserted unchanged, not advanced. This is the invariant the whole
+		// route turns on.
+		ExpectedFence: current.ClaimFence,
+		Record:        next,
+	})
+	if err != nil {
+		return ActionRecord{}, err
+	}
+	return cloneActionRecord(stored), nil
+}
+
 // ReportAmbiguity records what a worker attempted when it can no longer report
 // the outcome, which is the one case this dispatch surface could not express
 // (#438).

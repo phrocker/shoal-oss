@@ -27,6 +27,7 @@ type FleetDispatchProvider interface {
 	Invoke(context.Context, fleet.InvokeRequest) (fleet.ActionRecord, error)
 	CompleteClaim(context.Context, fleet.CompletionRequest) (fleet.ActionRecord, error)
 	ReportAmbiguity(context.Context, fleet.AmbiguityRequest) (fleet.ActionRecord, error)
+	ExtendClaim(context.Context, fleet.ExtendRequest) (fleet.ActionRecord, error)
 }
 
 // NewFleetDispatchHandler returns the fleet dispatch HTTP surface without
@@ -202,6 +203,40 @@ func mountFleetDispatch(mux *http.ServeMux, provider FleetDispatchProvider) {
 		}
 		writeResponse(w, http.StatusOK, encodeFleetAction(result))
 	})
+	// Renewing a live claim so the fenced window can cover an operation longer
+	// than MaxActionClaimTTL (#430). The fence does not advance, so the
+	// claimant keeps the fence it reports under.
+	mux.HandleFunc("POST /api/v1/fleet/actions/{action}/extend", func(w http.ResponseWriter, r *http.Request) {
+		actionID, err := decodeWireBytes("action ID", r.PathValue("action"), false)
+		if err != nil {
+			writeError(w, fleetDispatchError(err))
+			return
+		}
+		var wire fleetExtendWire
+		if err := decodeRequest(w, r, &wire); err != nil {
+			writeError(w, shoal.NewError(shoal.ErrorInvalidArgument, err.Error()))
+			return
+		}
+		contextValue, err := wire.Context.decode()
+		if err != nil {
+			writeError(w, fleetDispatchError(err))
+			return
+		}
+		claimID, err := decodeWireBytes("claim ID", wire.ClaimID, false)
+		if err != nil {
+			writeError(w, fleetDispatchError(err))
+			return
+		}
+		result, err := provider.ExtendClaim(r.Context(), fleet.ExtendRequest{
+			ID: actionID, ExpectedVersion: wire.ExpectedVersion,
+			ClaimID: claimID, Lease: wire.Lease, Context: contextValue,
+		})
+		if err != nil {
+			writeError(w, fleetDispatchError(err))
+			return
+		}
+		writeResponse(w, http.StatusOK, encodeFleetAction(result))
+	})
 	// A worker that lost its fence mid-effect cannot use /complete, which is
 	// gated on the fence it lost. This route records what it attempted without
 	// transitioning the action (#438).
@@ -363,6 +398,15 @@ type fleetCancelWire struct {
 // fleetCompletionWire is a remote worker reporting an outcome. It carries the
 // same fields an in-process ActionExecutor returns, and the service validates
 // them identically.
+// fleetExtendWire renews a live claim. It carries the claim ID so the renewal
+// is tied to the claim being held, not merely to the action.
+type fleetExtendWire struct {
+	Context         fleetRequestContextWire `json:"context"`
+	ExpectedVersion uint64                  `json:"expected_version"`
+	ClaimID         string                  `json:"claim_id"`
+	Lease           time.Duration           `json:"lease"`
+}
+
 // fleetAmbiguityWire is a lost-fence report.
 //
 // It names a fence rather than a claim ID: the record retains only the current
