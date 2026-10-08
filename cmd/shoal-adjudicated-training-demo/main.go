@@ -16,6 +16,9 @@ import (
 	"github.com/phrocker/shoal-oss/internal/decisionartifacts"
 	bases "github.com/phrocker/shoal-oss/internal/decisionbasisstore"
 	"github.com/phrocker/shoal-oss/internal/decisiondatasets"
+	admission "github.com/phrocker/shoal-oss/internal/decisioninventoryadmission"
+	inventoryset "github.com/phrocker/shoal-oss/internal/decisioninventoryset"
+	inventory "github.com/phrocker/shoal-oss/internal/decisioninventorystore"
 	outcomes "github.com/phrocker/shoal-oss/internal/decisionoutcomes"
 	"github.com/phrocker/shoal-oss/internal/decisionservice"
 	"github.com/phrocker/shoal-oss/internal/decisionstore"
@@ -72,7 +75,7 @@ func prepareRegistry(dir, name string) (*registry, *engine.Engine, *auth.Authori
 	if err = inquirySyncDir(filepath.Dir(dir)); err != nil {
 		return fail(err)
 	}
-	for _, sub := range []string{"sources", "witnesses", "state"} {
+	for _, sub := range []string{"sources", "witnesses", "captures", "state"} {
 		if err = os.Mkdir(filepath.Join(dir, sub), 0700); err != nil {
 			return fail(err)
 		}
@@ -81,7 +84,7 @@ func prepareRegistry(dir, name string) (*registry, *engine.Engine, *auth.Authori
 		return fail(err)
 	}
 	created := time.Now().UTC()
-	r := &registry{dir: dir, def: def, rows: map[shoal.ID]*registered{}, readable: true, training: true, generation: 1, bases: map[shoal.ID]decision.AdjudicationBasis{}, now: time.Now}
+	r := &registry{dir: dir, def: def, rows: map[shoal.ID]*registered{}, readable: true, training: true, bases: map[shoal.ID]decision.AdjudicationBasis{}, now: time.Now}
 	authority := auth.NewAuthority()
 	predictCtx, predictIdentity, err := bindRole(authority, "fixture-predictor")
 	if err != nil {
@@ -100,6 +103,7 @@ func prepareRegistry(dir, name string) (*registry, *engine.Engine, *auth.Authori
 		return fail(err)
 	}
 	r.reporterCtx = reportCtx
+	r.resolver = authority.Resolver()
 	provider, model, err := baseline(def)
 	if err != nil {
 		return fail(err)
@@ -107,7 +111,7 @@ func prepareRegistry(dir, name string) (*registry, *engine.Engine, *auth.Authori
 	if err = writeExclusive(filepath.Join(dir, "bootstrap-model.json"), model); err != nil {
 		return fail(err)
 	}
-	roles, _ := json.Marshal(map[string]any{"kind": "trusted-synthetic-role-registry", "authority": domain, "human_independence_claimed": false, "roles": []string{"fixture-predictor", "fixture-reporter", "fixture-judge", "fixture-witness", "fixture-source-controller", "fixture-exporter"}, "role_evidence_id": "fixture-judge-role-grant:v1"})
+	roles, _ := json.Marshal(map[string]any{"kind": "trusted-synthetic-role-registry", "authority": domain, "human_independence_claimed": false, "roles": []string{"fixture-predictor", "fixture-reporter", "fixture-reporter-secondary", "fixture-judge", "fixture-witness", "fixture-source-controller", "fixture-exporter"}, "role_evidence_id": "fixture-judge-role-grant:v1"})
 	r.roleBytes = append([]byte(nil), roles...)
 	if err = writeExclusive(filepath.Join(dir, "roles.json"), roles); err != nil {
 		return fail(err)
@@ -126,7 +130,7 @@ func prepareRegistry(dir, name string) (*registry, *engine.Engine, *auth.Authori
 	if err != nil {
 		return fail(err)
 	}
-	for _, table := range []string{decisionartifacts.Table, decisionstore.Table, outcomes.Table, journal.Table, bases.Table} {
+	for _, table := range []string{decisionartifacts.Table, decisionstore.Table, outcomes.Table, journal.Table, bases.Table, inventory.Table} {
 		if err = eng.CreateTable(table, engine.TableOptions{}); err != nil {
 			return fail(err)
 		}
@@ -155,7 +159,27 @@ func prepareRegistry(dir, name string) (*registry, *engine.Engine, *auth.Authori
 	if err != nil {
 		return fail(err)
 	}
-	r.outcomes, err = outcomes.New(outcomes.Config{Backend: ob, Resolver: authority.Resolver(), Authority: outcomeAuthority{r}, Clock: time.Now})
+	ib, err := explorercoord.NewEngineStore(eng, inventory.Table)
+	if err != nil {
+		return fail(err)
+	}
+	r.inventories, err = inventory.New(inventory.Config{Backend: ib, Clock: time.Now})
+	if err != nil {
+		return fail(err)
+	}
+	r.inventorySets, err = inventoryset.New(inventoryset.Config{Store: r.inventories, Clock: time.Now})
+	if err != nil {
+		return fail(err)
+	}
+	r.admission, err = admission.New(admission.Config{Store: r.inventories, Authority: inventoryAdmissionAuthority{r}})
+	if err != nil {
+		return fail(err)
+	}
+	r.registeredOutcomes, err = outcomes.NewRegisteredReader(outcomes.RegisteredReaderConfig{Backend: ob, Resolver: authority.Resolver(), Authority: registeredOutcomeAuthority{r}, Clock: time.Now})
+	if err != nil {
+		return fail(err)
+	}
+	r.outcomes, err = outcomes.New(outcomes.Config{Backend: ob, Resolver: authority.Resolver(), Authority: outcomeAuthority{r}, Admission: r.admission, Clock: time.Now})
 	if err != nil {
 		return fail(err)
 	}
@@ -199,6 +223,9 @@ func prepareRegistry(dir, name string) (*registry, *engine.Engine, *auth.Authori
 		if e != nil {
 			return fail(e)
 		}
+		if _, e = r.inventories.Register(predictCtx, inventory.Scope{Domain: []byte(domain)}, r.inventoryBinding(v)); e != nil {
+			return fail(e)
+		}
 		if f.Status == "unknown" {
 			continue
 		}
@@ -235,14 +262,14 @@ func prepareRegistry(dir, name string) (*registry, *engine.Engine, *auth.Authori
 		v.basis = r.bases[receipt.BasisID]
 	}
 	cutoff := time.Now().UTC()
-	r.cohort = decisiondatasets.Cohort{ID: shoal.ID("sealed-fixture-cohort:" + name), AuthorityRevisionID: "fixture-authority-revision:1", InventoryID: shoal.ID(fmtGeneration(r.generation)), Task: def.Task, Policy: def.Labels, QuestionID: question, FeatureSchemaID: def.FeatureSchema, FeatureBuilderID: shoal.ID("original-bytes:" + string(def.FeatureSchema)), SplitPolicyID: "compiled-family-disjoint-v1", SamplingPolicyID: "finite-fixture-census-only-v1", Cutoff: cutoff, Mode: "reconstructed"}
+	r.cohort = decisiondatasets.Cohort{ID: shoal.ID("sealed-fixture-cohort:" + name), AuthorityRevisionID: "fixture-authority-revision:1", InventoryID: "compiled-target-membership-v1", Task: def.Task, Policy: def.Labels, QuestionID: question, FeatureSchemaID: def.FeatureSchema, FeatureBuilderID: shoal.ID("original-bytes:" + string(def.FeatureSchema)), SplitPolicyID: "compiled-family-disjoint-v1", SamplingPolicyID: "finite-fixture-census-only-v1", Cutoff: cutoff, Mode: "reconstructed"}
 	for _, f := range fixtures(name) {
 		v := r.rows[f.ID]
 		one := float64(1)
 		r.cohort.Members = append(r.cohort.Members, decisiondatasets.Member{ID: f.ID, TargetID: v.target, RequestID: v.prediction.Request().ID(), PredictionID: v.prediction.ID(), SubjectID: f.ID, FamilyIDs: []shoal.ID{shoal.ID("synthetic-family:" + string(f.ID))}, Split: f.Split, InclusionProbability: &one})
 	}
 	r.sealed = true
-	for _, table := range []string{decisionartifacts.Table, decisionstore.Table, outcomes.Table, journal.Table, bases.Table} {
+	for _, table := range []string{decisionartifacts.Table, decisionstore.Table, outcomes.Table, journal.Table, bases.Table, inventory.Table} {
 		if err = eng.Flush(table); err != nil {
 			return fail(err)
 		}
@@ -255,12 +282,24 @@ func prepare(dir, name string) error {
 		return err
 	}
 	defer eng.Close()
-	exporter, err := decisiondatasets.New(decisiondatasets.Config{Resolver: authority.Resolver(), Authority: cohortAuthority{r}, Clock: time.Now})
+	exporter, session, err := exportSession(ctx, r, authority.Resolver(), r.cohort.ID)
 	if err != nil {
 		return err
 	}
 	bundle, err := exporter.Export(ctx, r.cohort.ID)
 	if err != nil {
+		return err
+	}
+	captureBytes, err := json.Marshal(struct {
+		Schema  int          `json:"schema"`
+		Kind    string       `json:"kind"`
+		Initial captureProof `json:"initial"`
+		Final   captureProof `json:"final"`
+	}{1, "registered-inventory-export-capture", proof(session.initialCapture), proof(session.finalCapture)})
+	if err != nil {
+		return err
+	}
+	if err = writeExclusive(filepath.Join(dir, "cohort-capture.json"), captureBytes); err != nil {
 		return err
 	}
 	if err = writeExclusive(filepath.Join(dir, "dataset.json"), bundle.Dataset); err != nil {

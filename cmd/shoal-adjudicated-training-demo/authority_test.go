@@ -22,11 +22,11 @@ func TestSealedReferenceExportUsesRealReceipts(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer e.Close()
-			service, err := decisiondatasets.New(decisiondatasets.Config{Resolver: a.Resolver(), Authority: cohortAuthority{r}, Clock: time.Now})
+			_, ca, err := exportSession(ctx, r, a.Resolver(), r.cohort.ID)
 			if err != nil {
 				t.Fatal(err)
 			}
-			bundle, err := service.Export(ctx, r.cohort.ID)
+			bundle, err := freshExport(ctx, r, a.Resolver(), r.cohort.ID)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -63,7 +63,6 @@ func TestSealedReferenceExportUsesRealReceipts(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			ca := cohortAuthority{r}
 			clone, err := ca.Resolve(ctx, d, r.cohort.ID)
 			if err != nil {
 				t.Fatal(err)
@@ -77,16 +76,16 @@ func TestSealedReferenceExportUsesRealReceipts(t *testing.T) {
 			}
 			bad := r.cohort.Members[0]
 			bad.TargetID = "unregistered"
-			if _, err = ca.Load(ctx, d, r.cohort, bad); err == nil {
+			if _, err = ca.Load(ctx, d, ca.cohort, bad); err == nil {
 				t.Fatal("unregistered target accepted")
 			}
 			r.training = false
-			if _, err = service.Export(ctx, r.cohort.ID); err == nil {
+			if _, err = freshExport(ctx, r, a.Resolver(), r.cohort.ID); err == nil {
 				t.Fatal("source read substituted for training permission")
 			}
 			r.training = true
 			r.readable = false
-			if _, err = service.Export(ctx, r.cohort.ID); err == nil {
+			if _, err = freshExport(ctx, r, a.Resolver(), r.cohort.ID); err == nil {
 				t.Fatal("revoked sources exported")
 			}
 			r.readable = true
@@ -94,13 +93,11 @@ func TestSealedReferenceExportUsesRealReceipts(t *testing.T) {
 			v := r.rows[r.cohort.Members[0].ID]
 			cfg := v.outcome.ObservationConfig
 			cfg.ObservedAt = time.Now().UTC()
-			late, err := r.outcomes.Append(r.reporterCtx, cfg.RequestID, cfg.PredictionID, []byte("late-report"), cfg)
+			_, err = r.outcomes.Append(r.reporterCtx, cfg.RequestID, cfg.PredictionID, []byte("late-report"), cfg)
 			if err != nil {
 				t.Fatal(err)
 			}
-			v.additional = append(v.additional, registeredReport{late, []byte("late-report")})
-			r.generation++
-			bundle, err = service.Export(ctx, r.cohort.ID)
+			bundle, err = freshExport(ctx, r, a.Resolver(), r.cohort.ID)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -121,7 +118,7 @@ func TestSealedReferenceExportUsesRealReceipts(t *testing.T) {
 			if err = os.WriteFile(path, []byte("substitute"), 0600); err != nil {
 				t.Fatal(err)
 			}
-			if _, err = service.Export(ctx, r.cohort.ID); err == nil {
+			if _, err = freshExport(ctx, r, a.Resolver(), r.cohort.ID); err == nil {
 				t.Fatal("substituted source exported")
 			}
 		})
@@ -129,7 +126,7 @@ func TestSealedReferenceExportUsesRealReceipts(t *testing.T) {
 }
 
 type changingAuthority struct {
-	cohortAuthority
+	*cohortAuthority
 	change func()
 }
 
@@ -143,12 +140,19 @@ func TestFinalInventoryAndTrainingRecheck(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer e.Close()
-	for _, change := range []func(){func() { r.generation++ }, func() { r.training = false }, func() { r.readable = false }, func() {
+	for _, change := range []func(){func() {
+		v := r.rows[r.cohort.Members[0].ID]
+		cfg := v.outcome.ObservationConfig
+		cfg.ObservedAt = time.Now().UTC()
+		if _, e := r.outcomes.Append(r.reporterCtx, cfg.RequestID, cfg.PredictionID, []byte("during-final-verify"), cfg); e != nil {
+			t.Fatal(e)
+		}
+	}, func() { r.training = false }, func() { r.readable = false }, func() {
 		calls := 0
 		r.now = func() time.Time {
 			calls++
 			if calls == 48 {
-				r.generation++
+				r.readable = false
 			}
 			return time.Now()
 		}
@@ -165,7 +169,11 @@ func TestFinalInventoryAndTrainingRecheck(t *testing.T) {
 		r.training = true
 		r.readable = true
 		r.now = time.Now
-		s, err := decisiondatasets.New(decisiondatasets.Config{Resolver: a.Resolver(), Authority: changingAuthority{cohortAuthority{r}, change}, Clock: time.Now})
+		_, ca, err := exportSession(ctx, r, a.Resolver(), r.cohort.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		s, err := decisiondatasets.New(decisiondatasets.Config{Resolver: a.Resolver(), Authority: changingAuthority{ca, change}, Clock: time.Now})
 		if err != nil {
 			t.Fatal(err)
 		}

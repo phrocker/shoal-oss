@@ -104,8 +104,9 @@ The demo authority proves completeness only within its sealed compiled registry.
 It checks retained role/witness/source bytes, reads actual durable outcome and
 adjudication receipts, and rechecks its generation and permissions after IO. It
 has no public registration endpoint and does not claim to enumerate all GitHub
-reports. The prediction/outcome/adjudication stores use the existing engine and
-are flushed to RFiles. The reference adjudication registry is constructed anew
+reports. The prediction/outcome/adjudication and target inventory stores use the existing
+engine and are flushed to RFiles. See [durable inventory training](DURABLE_TRAINING.md)
+for admission recovery, historical snapshot retention and measured export cuts. The reference adjudication registry is constructed anew
 for a prepare run; this is not a general reopened production authority.
 
 ## Training and provenance boundary
@@ -125,7 +126,9 @@ trusted offline datasets remain accepted without these optional manifest argumen
 that mode makes no authenticated-export claim. Both manifest flags are required
 together. Neither mode promotes the resulting model.
 
-Production mutable source/outcome authority, public dataset APIs, unbiased
+Authenticated dataset HTTP/Go SDK export is available through explicit host
+wiring; see [the API guide](../../docs/decision-dataset-http-api.md). Deployed
+production source/outcome authority, remaining registration APIs, unbiased
 operational cohorts, independent quality evaluation, promotion/rollback and
 withdrawal of previously trained models remain follow-on work. Full-review
 fallback and the paid-inference experiment budget are unchanged.

@@ -3,7 +3,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"path/filepath"
 	"reflect"
 	"time"
@@ -12,22 +11,20 @@ import (
 	journal "github.com/phrocker/shoal-oss/internal/decisionadjudicationstore"
 	"github.com/phrocker/shoal-oss/internal/decisionartifacts"
 	"github.com/phrocker/shoal-oss/internal/decisiondatasets"
+	admission "github.com/phrocker/shoal-oss/internal/decisioninventoryadmission"
+	inventoryset "github.com/phrocker/shoal-oss/internal/decisioninventoryset"
+	inventory "github.com/phrocker/shoal-oss/internal/decisioninventorystore"
 	outcomes "github.com/phrocker/shoal-oss/internal/decisionoutcomes"
 	"github.com/phrocker/shoal-oss/pkg/decision"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
-type registeredReport struct {
-	Receipt outcomes.Receipt
-	Key     []byte
-}
 type registered struct {
 	fixture      fixture
 	record       decisionartifacts.Record
 	prediction   decision.PredictionRecord
 	outcome      outcomes.Receipt
-	additional   []registeredReport
 	witness      decision.BasisWitness
 	witnessBytes []byte
 	target       shoal.ID
@@ -42,12 +39,16 @@ type registry struct {
 	rows               map[shoal.ID]*registered
 	sealed             bool
 	readable, training bool
-	generation         int
 	cohort             decisiondatasets.Cohort
 	service            *adjud.Service
 	reporterCtx        context.Context
 	outcomes           *outcomes.Store
 	bases              map[shoal.ID]decision.AdjudicationBasis
+	inventories        *inventory.Store
+	inventorySets      *inventoryset.Reader
+	registeredOutcomes *outcomes.RegisteredReader
+	admission          *admission.Adapter
+	resolver           auth.Resolver
 	now                func() time.Time
 }
 
@@ -55,10 +56,11 @@ func identity(id string) decision.BasisIdentity {
 	return decision.BasisIdentity{SubjectID: []byte(id), ActorID: []byte(id + "-actor"), ClientID: []byte(id + "-client")}
 }
 func (r *registry) permission(d auth.Decision, op auth.Operation, id shoal.ID) error {
+	now := r.now()
 	if !r.readable {
 		return auth.ObjectNotFound()
 	}
-	return d.AuthorizeObject(op, auth.ResourceRequest{AuthorizationDomain: []byte(domain), SourceID: []byte("fixtures"), PolicyID: []byte("fixture-policy"), ObjectID: id}, r.now())
+	return d.AuthorizeObject(op, auth.ResourceRequest{AuthorizationDomain: []byte(domain), SourceID: []byte("fixtures"), PolicyID: []byte("fixture-policy"), ObjectID: id}, now)
 }
 func (r *registry) byPrediction(request, pred shoal.ID) *registered {
 	for _, v := range r.rows {
@@ -126,7 +128,7 @@ type outcomeAuthority struct{ r *registry }
 
 func (a outcomeAuthority) Resolve(_ context.Context, d auth.Decision, request, pred shoal.ID, op auth.Operation) (decision.PredictionRecord, error) {
 	v := a.r.byPrediction(request, pred)
-	if v == nil || d.Subject() != "fixture-reporter" {
+	if v == nil || !reportingRole(d) {
 		return decision.PredictionRecord{}, auth.ObjectNotFound()
 	}
 	if err := a.r.allCurrent(d, v, op); err != nil {
@@ -138,7 +140,7 @@ func (a outcomeAuthority) Verify(_ context.Context, d auth.Decision, chain []dec
 	for _, o := range chain {
 		c := o.Config()
 		v := a.r.byPrediction(c.RequestID, c.PredictionID)
-		if v == nil || d.Subject() != "fixture-reporter" || c.AssertedProvenance.ReporterID != "fixture-reporter" || !reflect.DeepEqual(c.EvidenceIDs, []shoal.ID{v.fixture.ID}) {
+		if v == nil || !reportingRole(d) || c.AssertedProvenance.ReporterID != d.Subject() || !reflect.DeepEqual(c.EvidenceIDs, []shoal.ID{v.fixture.ID}) {
 			return auth.ObjectNotFound()
 		}
 		if err := a.r.allCurrent(d, v, auth.OperationRead); err != nil {
@@ -165,21 +167,38 @@ func (a adjudicationAuthority) Capture(ctx context.Context, d auth.Decision, p d
 	if v == nil || a.r.sealed || d.Subject() != "fixture-judge" {
 		return decision.AdjudicationBasis{}, auth.ObjectNotFound()
 	}
-	got, err := a.r.outcomes.Read(a.r.reporterCtx, v.prediction.Request().ID(), v.prediction.ID(), []byte(v.fixture.ID))
-	if err != nil || !reflect.DeepEqual(got, v.outcome) {
+	capture, e := a.r.inventorySets.CaptureSet(ctx, inventory.Scope{Domain: d.AuthorizationDomain()}, []inventory.Binding{a.r.inventoryBinding(v)})
+	if e != nil {
 		return decision.AdjudicationBasis{}, auth.ObjectNotFound()
 	}
-	c := decision.AdjudicationBasisConfig{AuthorityID: domain, AuthorityRevisionID: "fixture-authority-revision:1", EnumerationID: shoal.ID("sealed-target:" + string(v.fixture.ID)), CapturedAt: a.r.now().UTC(), Cutoff: a.r.now().UTC(), InventoryComplete: true, ControllersComplete: true, Outcomes: []decision.BasisOutcome{{ReceiptID: got.ID, ObservationID: got.ObservationID, RequestID: v.prediction.Request().ID(), PredictionID: v.prediction.ID(), TaskID: a.r.def.Task.ID(), PictureID: v.prediction.Request().Picture().ID(), SubjectID: v.fixture.ID, QuestionID: question, Kind: decision.OutcomeCorrectness, Reporter: identity("fixture-reporter"), ReceivedAt: got.ReceivedAt}}, Witnesses: []decision.BasisWitness{v.witness}, SourceControllers: []decision.BasisIdentity{identity("fixture-source-controller")}, RoleEvidenceIDs: []shoal.ID{"fixture-judge-role-grant:v1"}}
-	// Capture occurs after the immutable fixture inventory has been enumerated.
-	c.CapturedAt = c.Cutoff
-	basis, err := decision.NewAdjudicationBasis(p, c)
-	if err != nil {
-		return basis, err
+	receipts, e := a.r.publishedReceipts(ctx, d, v, capture.Snapshots[0])
+	if e != nil {
+		return decision.AdjudicationBasis{}, e
+	}
+	again, e := a.r.inventorySets.CaptureSet(ctx, inventory.Scope{Domain: d.AuthorizationDomain()}, []inventory.Binding{a.r.inventoryBinding(v)})
+	if e != nil || again.VectorID != capture.VectorID {
+		return decision.AdjudicationBasis{}, auth.ObjectNotFound()
+	}
+	enumeration, e := a.r.retainCapture(capture)
+	if e != nil {
+		return decision.AdjudicationBasis{}, e
+	}
+	cutoff := a.r.now().Round(0).UTC()
+	if cutoff.Before(capture.Window.CompletedAt) || cutoff.Before(capture.Snapshots[0].UpdatedAt) {
+		return decision.AdjudicationBasis{}, auth.ObjectNotFound()
+	}
+	c := decision.AdjudicationBasisConfig{AuthorityID: domain, AuthorityRevisionID: "fixture-authority-revision:1", EnumerationID: enumeration, CapturedAt: cutoff, Cutoff: cutoff, InventoryComplete: true, ControllersComplete: true, Witnesses: []decision.BasisWitness{v.witness}, SourceControllers: []decision.BasisIdentity{identity("fixture-source-controller")}, RoleEvidenceIDs: []shoal.ID{"fixture-judge-role-grant:v1"}}
+	for _, receipt := range receipts {
+		c.Outcomes = append(c.Outcomes, basisOutcome(a.r, v, receipt))
+	}
+	basis, e := decision.NewAdjudicationBasis(p, c)
+	if e != nil {
+		return basis, e
 	}
 	a.r.bases[basis.ID()] = basis
 	return basis, nil
 }
-func (a adjudicationAuthority) Verify(_ context.Context, d auth.Decision, op auth.Operation, target shoal.ID, history []adjud.Material, candidate *adjud.Candidate) error {
+func (a adjudicationAuthority) Verify(ctx context.Context, d auth.Decision, op auth.Operation, target shoal.ID, history []adjud.Material, candidate *adjud.Candidate) error {
 	v := a.r.byTarget(target)
 	if v == nil {
 		return auth.ObjectNotFound()
@@ -189,11 +208,17 @@ func (a adjudicationAuthority) Verify(_ context.Context, d auth.Decision, op aut
 		if !ok || !reflect.DeepEqual(expected.Config(), m.Basis.Config()) || m.Proposal.ID() != expected.Proposal().ID() {
 			return auth.ObjectNotFound()
 		}
+		if e := a.r.verifyHistoricalCapture(ctx, d, v, m.Basis); e != nil {
+			return e
+		}
 	}
 	if candidate != nil {
 		expected, ok := a.r.bases[candidate.Basis.ID()]
 		if !ok || !reflect.DeepEqual(expected.Config(), candidate.Basis.Config()) || d.Subject() != "fixture-judge" || !reflect.DeepEqual(candidate.Adjudicator, identity("fixture-judge")) {
 			return auth.ObjectNotFound()
+		}
+		if e := a.r.verifyHistoricalCapture(ctx, d, v, candidate.Basis); e != nil {
+			return e
 		}
 		for _, role := range candidate.RequiredRoles {
 			if role != "fixture-judge-role" && role != "fixture-resolver-role" {
@@ -208,110 +233,111 @@ func (a adjudicationAuthority) Verify(_ context.Context, d auth.Decision, op aut
 			return auth.ObjectNotFound()
 		}
 	}
-	if v.outcome.ID != "" {
-		got, err := a.r.outcomes.Read(a.r.reporterCtx, v.prediction.Request().ID(), v.prediction.ID(), []byte(v.fixture.ID))
-		if err != nil || !reflect.DeepEqual(got, v.outcome) {
-			return auth.ObjectNotFound()
-		}
-	}
 	// Read all retained inputs before the final current permission check.
 	return a.r.allCurrent(d, v, op)
 }
 
-type cohortAuthority struct{ r *registry }
+type cohortAuthority struct {
+	r                            *registry
+	cohort                       decisiondatasets.Cohort
+	initialCapture, finalCapture inventoryset.Capture
+}
 
-func (a cohortAuthority) Resolve(_ context.Context, d auth.Decision, id shoal.ID) (decisiondatasets.Cohort, error) {
-	if !a.r.sealed || id != a.r.cohort.ID || !a.r.training || d.Subject() != "fixture-exporter" {
+func (a *cohortAuthority) Resolve(_ context.Context, d auth.Decision, id shoal.ID) (decisiondatasets.Cohort, error) {
+	if !a.r.sealed || id != a.cohort.ID || !a.r.training || d.Subject() != "fixture-exporter" {
 		return decisiondatasets.Cohort{}, auth.ObjectNotFound()
 	}
 	for _, v := range a.r.rows {
-		if err := a.r.permission(d, auth.OperationRead, v.fixture.ID); err != nil {
-			return decisiondatasets.Cohort{}, err
+		if e := a.r.permission(d, auth.OperationRead, v.fixture.ID); e != nil {
+			return decisiondatasets.Cohort{}, e
 		}
 	}
-	return cloneCohort(a.r.cohort), nil
+	return cloneCohort(a.cohort), nil
 }
-func (a cohortAuthority) Load(ctx context.Context, d auth.Decision, c decisiondatasets.Cohort, m decisiondatasets.Member) (decisiondatasets.Target, error) {
+func (a *cohortAuthority) Load(ctx context.Context, d auth.Decision, c decisiondatasets.Cohort, m decisiondatasets.Member) (decisiondatasets.Target, error) {
 	var zero decisiondatasets.Target
-	if !reflect.DeepEqual(c, a.r.cohort) || !a.r.sealed {
+	if !reflect.DeepEqual(c, a.cohort) || !a.r.sealed {
 		return zero, auth.ObjectNotFound()
 	}
 	valid := false
 	for _, member := range c.Members {
-		if reflect.DeepEqual(m, member) {
-			valid = true
-		}
+		valid = valid || reflect.DeepEqual(m, member)
 	}
 	v := a.r.rows[m.ID]
 	if !valid || v == nil || v.target != m.TargetID {
 		return zero, auth.ObjectNotFound()
 	}
-	if err := a.r.allCurrent(d, v, auth.OperationRead); err != nil {
-		return zero, err
+	if e := a.r.allCurrent(d, v, auth.OperationRead); e != nil {
+		return zero, e
+	}
+	var snapshot inventory.Snapshot
+	for _, s := range a.initialCapture.Snapshots {
+		if s.Binding.TargetID == v.target {
+			snapshot = s
+		}
+	}
+	if snapshot.ID == "" {
+		return zero, auth.ObjectNotFound()
+	}
+	receipts, e := a.r.publishedReceipts(ctx, d, v, snapshot)
+	if e != nil {
+		return zero, e
 	}
 	var history []journal.Receipt
-	var err error
 	if len(v.admitted) > 0 {
-		history, err = a.r.service.History(ctx, v.target)
-		if err != nil {
-			return zero, err
+		history, e = a.r.service.History(ctx, v.target)
+		if e != nil {
+			return zero, e
 		}
 		if !reflect.DeepEqual(history, v.admitted) {
 			return zero, auth.ObjectNotFound()
 		}
 	}
-	fs, err := features(a.r.def.Name, v.fixture.Raw)
-	if err != nil {
-		return zero, err
+	fs, e := features(a.r.def.Name, v.fixture.Raw)
+	if e != nil {
+		return zero, e
 	}
 	ids := []shoal.ID{}
-	if v.outcome.ID != "" {
-		ids = append(ids, v.outcome.ID)
+	for _, receipt := range receipts {
+		ids = append(ids, receipt.ID)
 	}
-	for _, report := range v.additional {
-		got, e := a.r.outcomes.Read(a.r.reporterCtx, v.prediction.Request().ID(), v.prediction.ID(), report.Key)
-		if e != nil || !reflect.DeepEqual(got, report.Receipt) {
-			return zero, auth.ObjectNotFound()
-		}
-		ids = append(ids, got.ID)
-	}
-	return decisiondatasets.Target{Prediction: v.prediction, History: history, SelectedBasis: v.basis, Features: fs, FeatureInputDigest: v.record.Bundle.Request.Picture().Config().InputDigest, FeatureReceivedAt: v.record.Bundle.Request.Picture().Config().Sources[0].ReceivedAt, InventoryID: shoal.ID(fmtGeneration(a.r.generation)), OutcomeReceiptIDs: ids, InventoryComplete: true, SourceAvailable: true, TrainingAllowed: a.r.training}, nil
+	return decisiondatasets.Target{Prediction: v.prediction, History: history, SelectedBasis: v.basis, Features: fs, FeatureInputDigest: v.record.Bundle.Request.Picture().Config().InputDigest, FeatureReceivedAt: v.record.Bundle.Request.Picture().Config().Sources[0].ReceivedAt, InventoryID: snapshot.ID, OutcomeReceiptIDs: ids, InventoryComplete: true, SourceAvailable: true, TrainingAllowed: a.r.training}, nil
 }
-func fmtGeneration(g int) string {
-	b, _ := json.Marshal(g)
-	return "sealed-inventory-generation:" + string(b)
-}
-func (a cohortAuthority) Verify(_ context.Context, d auth.Decision, c decisiondatasets.Cohort, targets []decisiondatasets.Target) error {
-	if !a.r.sealed || !a.r.training || !reflect.DeepEqual(c, a.r.cohort) || len(targets) != len(c.Members) || d.Subject() != "fixture-exporter" {
+func (a *cohortAuthority) Verify(ctx context.Context, d auth.Decision, c decisiondatasets.Cohort, targets []decisiondatasets.Target) error {
+	if !a.r.sealed || !a.r.training || !reflect.DeepEqual(c, a.cohort) || len(targets) != len(c.Members) || d.Subject() != "fixture-exporter" {
 		return auth.ObjectNotFound()
 	}
-	generation := a.r.generation
+	pins := map[shoal.ID]shoal.ID{}
+	for _, s := range a.initialCapture.Snapshots {
+		pins[s.Binding.TargetID] = s.ID
+	}
 	for i, t := range targets {
 		v := a.r.rows[c.Members[i].ID]
-		if v == nil || t.InventoryID != shoal.ID(fmtGeneration(a.r.generation)) || t.Prediction.ID() != v.prediction.ID() {
+		if v == nil || t.InventoryID != pins[v.target] || t.Prediction.ID() != v.prediction.ID() {
 			return auth.ObjectNotFound()
 		}
-		if err := a.r.allCurrent(d, v, auth.OperationRead); err != nil {
-			return err
+		if e := a.r.allCurrent(d, v, auth.OperationRead); e != nil {
+			return e
 		}
 	}
-	// No IO follows this complete current permission/training-purpose check.
-	for _, v := range a.r.rows {
-		if err := a.r.permission(d, auth.OperationRead, v.fixture.ID); err != nil {
-			return err
-		}
-		if err := d.AuthorizeObject(auth.OperationIngest, auth.ResourceRequest{AuthorizationDomain: []byte(domain), SourceID: []byte("training"), PolicyID: []byte("fixture-training-purpose"), ObjectID: a.r.cohort.ID}, a.r.now()); err != nil {
-			return err
-		}
-	}
-	if generation != a.r.generation || !a.r.sealed || !a.r.readable || !a.r.training || !reflect.DeepEqual(c, a.r.cohort) {
+	final, e := a.r.inventorySets.CaptureSet(ctx, inventory.Scope{Domain: d.AuthorizationDomain()}, a.r.inventoryBindings())
+	if e != nil || final.VectorID != a.initialCapture.VectorID {
 		return auth.ObjectNotFound()
 	}
-	for _, t := range targets {
-		if t.InventoryID != shoal.ID(fmtGeneration(a.r.generation)) {
-			return auth.ObjectNotFound()
+	// All source/receipt/history/inventory IO is complete. These are current host
+	// grants over the synthetic closed registry; no filesystem or engine reads follow.
+	for _, v := range a.r.rows {
+		if e := a.r.permission(d, auth.OperationRead, v.fixture.ID); e != nil {
+			return e
+		}
+		if e := d.AuthorizeObject(auth.OperationIngest, auth.ResourceRequest{AuthorizationDomain: []byte(domain), SourceID: []byte("training"), PolicyID: []byte("fixture-training-purpose"), ObjectID: c.ID}, a.r.now()); e != nil {
+			return e
 		}
 	}
+	if ctx.Err() != nil || !a.r.sealed || !a.r.readable || !a.r.training || !reflect.DeepEqual(c, a.cohort) {
+		return auth.ObjectNotFound()
+	}
+	a.finalCapture = final
 	return nil
 }
 

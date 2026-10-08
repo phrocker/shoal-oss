@@ -14,6 +14,8 @@ import subprocess
 import sys
 import time
 
+from dataset import _stamp
+
 
 def digest(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
@@ -21,6 +23,14 @@ def digest(path):
 
 def command(args):
     return subprocess.check_output([str(arg) for arg in args], text=True).strip()
+
+
+def validate_window(window):
+    times = [_stamp(window[key], 'inventory window ' + key)
+             for key in ('StartedAt', 'FirstPassFinishedAt',
+                         'SecondPassStartedAt', 'CompletedAt')]
+    if times != sorted(times):
+        raise RuntimeError('invalid measured inventory window')
 
 
 def run(binary, output):
@@ -67,6 +77,24 @@ def run(binary, output):
         data = json.loads((folder / 'dataset.json').read_text())
         manifest = json.loads((folder / 'manifest.json').read_text())
         training = json.loads((folder / 'candidate' / 'training-receipt.json').read_text())
+        capture_path = folder / 'cohort-capture.json'
+        capture = json.loads(capture_path.read_text())
+        if (capture.get('schema') != 1
+                or capture.get('kind') != 'registered-inventory-export-capture'):
+            raise RuntimeError('invalid inventory capture proof')
+        initial, final = capture['initial'], capture['final']
+        if (initial['VectorID'] != manifest['inventory_id']
+                or final['VectorID'] != initial['VectorID']
+                or initial['Pins'] != final['Pins']):
+            raise RuntimeError('inventory changed across export')
+        pins = {pin['TargetID']: pin for pin in initial['Pins']}
+        if (len(pins) != len(initial['Pins']) or len(pins) != len(manifest['rows'])
+                or any(row['target_id'] not in pins
+                       or row['inventory_id'] != pins[row['target_id']]['SnapshotID']
+                       for row in manifest['rows'])):
+            raise RuntimeError('manifest lost target inventory bindings')
+        for recorded in (initial, final):
+            validate_window(recorded['Window'])
         if (training['authorized_export']['manifest_sha256'] != manifest_pin
                 or training['authorized_export']['dataset_sha256'] != digest(folder / 'dataset.json')
                 or training['model_sha256'] != fitted[0]):
@@ -87,6 +115,12 @@ def run(binary, output):
             'training_receipt_sha256': digest(folder / 'candidate' / 'training-receipt.json'),
             'repeat_model_identical': True, 'prepare_seconds': prepare_seconds,
             'fit_seconds': timings, 'inquiries': inquiries,
+            'inventory_vector_id': initial['VectorID'],
+            'inventory_capture_sha256': digest(capture_path),
+            'inventory_target_count': len(pins),
+            'initial_inventory_window': initial['Window'],
+            'final_inventory_window': final['Window'],
+            'inventory_unchanged_during_export': True,
         })
     report = {'schema': 1, 'kind': 'adjudicated-training-conformance',
               'synthetic': True, 'population_quality_claim': False,
