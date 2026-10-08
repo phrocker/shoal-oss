@@ -542,7 +542,7 @@ func TestAnotherPrincipalsAttestationDoesNotCover(t *testing.T) {
 // outsider holds only invoke and is not the enqueuer, so it fails both of
 // authorizedClaimant's routes.
 func TestACallerWithoutStandingCannotTellTheRequirementExists(t *testing.T) {
-	answers := make([]string, 0, 2)
+	answers := make([]string, 0, 4)
 	for _, require := range []bool{true, false} {
 		f := newAttestationFixture(t, require)
 		// A client ID, so the store-count assertion below is not vacuous:
@@ -583,6 +583,17 @@ type stranger struct {
 	// even if the gate were reached (a delegated chain), so the count
 	// assertion would be vacuous; the byte comparison still bites there.
 	storeCountable bool
+	// code is the error code the refusal must carry.
+	//
+	// Not always not-found, and the difference is the point. A refusal that
+	// answers a question about the *object* has to be indistinguishable from
+	// the object's absence, so it is not-found. A refusal that answers a
+	// question about the *caller* — it holds no delegate grant, it holds no
+	// operation — discloses nothing about any object, so it may say what it
+	// is, and #536's fix moved those checks ahead of the lookup precisely so
+	// they can. What both kinds must share is the byte comparison below:
+	// identical whether or not the agent exists.
+	code shoal.ErrorCode
 }
 
 // strangers hold the operation and a client ID, so none is refused for
@@ -602,24 +613,29 @@ type stranger struct {
 //     tests can kill: AuthorizeObject refuses the same caller regardless.
 var strangers = []stranger{
 	{
-		name: "other scope", where: "AuthorizeObject (source and policy)",
+		name: "other scope", code: shoal.ErrorNotFound, where: "AuthorizeObject (source and policy)",
 		domain: "domain", source: "other-source", policy: "other-policy",
 		storeCountable: true,
 	},
 	{
-		name: "right source, other policy", where: "AuthorizeObject (policy)",
+		name: "right source, other policy", code: shoal.ErrorNotFound, where: "AuthorizeObject (policy)",
 		domain: "domain", source: "source", policy: "other-policy",
 		storeCountable: true,
 	},
 	{
-		name: "other domain", where: "resolveActionBinding (descriptor domain)",
+		name: "other domain", code: shoal.ErrorNotFound, where: "resolveActionBinding (descriptor domain)",
 		domain: "other-domain", source: "source", policy: "policy",
 		storeCountable: true,
 	},
 	{
 		// In scope and in domain: refused by resolveActionBinding's second
 		// AuthorizeObject, for OperationDelegate.
-		name: "delegated without delegate", where: "AuthorizeObject (delegate)",
+		// Caller-only, so it is told what it is: it holds no delegate grant.
+		// Since #536 this check runs before the lookup, so the answer is the
+		// same whether or not the agent exists — which is what makes an
+		// honest message safe here.
+		name: "delegated without delegate", code: shoal.ErrorUnauthorized,
+		where:  "AuthorizeObject (delegate), before the lookup",
 		domain: "domain", source: "source", policy: "policy",
 		onBehalfOf: []shoal.ID{"delegator"},
 	},
@@ -651,6 +667,15 @@ func (s stranger) bind(
 func requireIndistinguishable(
 	t *testing.T, s stranger, f *attestationFixture, route string,
 	refused, absent error, callsBefore int,
+	// wantCode is the route's answer, not the stranger's, because the
+	// concealment is layered. resolveActionBinding answers a caller-only
+	// failure honestly since #536 — it runs before the lookup, so there is
+	// nothing to disclose. The claim and extension routes then normalize
+	// *everything* to not-found at authorizedCurrent, because those routes
+	// are about an existing action and must conceal its existence too. So the
+	// same stranger is told different things on different routes, and that is
+	// correct rather than inconsistent.
+	wantCode shoal.ErrorCode,
 ) {
 	t.Helper()
 	if refused == nil || absent == nil {
@@ -661,11 +686,35 @@ func requireIndistinguishable(
 			"stop at %s) as %q while an absent one refuses it as %q: the gate "+
 			"is an existence oracle", route, s.name, s.where, refused, absent)
 	}
-	if !shoal.IsErrorCode(refused, shoal.ErrorNotFound) {
-		t.Fatalf("%s: %s refusal is not a not-found: %v", route, s.name, refused)
+	if !shoal.IsErrorCode(refused, wantCode) {
+		t.Fatalf("%s: %s refusal is %v, want code %q", route, s.name,
+			refused, wantCode)
 	}
 	if s.storeCountable && f.attestations.callCount() != callsBefore {
 		t.Fatalf("%s: the attestation store was read for %s", route, s.name)
+	}
+}
+
+// requireNoDescriptorLookup asserts a refusal happened without the descriptor
+// being read at all.
+//
+// This is what licenses a caller-only failure to answer honestly. The oracle
+// in #536 was not the error code — it was that the check ran *after* the
+// lookup, so reaching it implied the agent existed. A refusal that never
+// touches the store cannot disclose anything about what is in it, whatever it
+// says.
+//
+// Asserted separately from the byte comparison because the two can fail
+// independently: a reordered check could still be reached after a lookup made
+// for some other reason, and byte-identical refusals would hide that.
+func requireNoDescriptorLookup(
+	t *testing.T, f *attestationFixture, route string, before int,
+) {
+	t.Helper()
+	if after := f.registryRows.getCount(); after != before {
+		t.Fatalf("%s: the descriptor was looked up %d time(s) before the "+
+			"refusal, so an honest caller-only error can still disclose "+
+			"whether the agent exists", route, after-before)
 	}
 }
 
@@ -687,7 +736,11 @@ func TestAnExecuteHolderWithoutStandingCannotReachTheClaimGate(t *testing.T) {
 				return err
 			}
 			refused, absent := probe(f.queued.ID), probe([]byte("no-such-action"))
-			requireIndistinguishable(t, s, f, "claim", refused, absent, 0)
+			// Not-found for every stranger: authorizedCurrent normalizes
+			// whatever resolveActionBinding returned, because this route is
+			// about an existing action and conceals its existence too.
+			requireIndistinguishable(
+				t, s, f, "claim", refused, absent, 0, shoal.ErrorNotFound)
 
 			// The control: the gate is armed. An unattested execute-holder
 			// *with* standing (in scope, in domain, not the enqueuer) is told
@@ -722,7 +775,9 @@ func TestAnExecuteHolderWithoutStandingCannotReachTheExtensionGate(t *testing.T)
 				return err
 			}
 			refused, absent := probe(f.queued.ID), probe([]byte("no-such-action"))
-			requireIndistinguishable(t, s, f, "extend", refused, absent, callsAfterClaim)
+			requireIndistinguishable(
+				t, s, f, "extend", refused, absent, callsAfterClaim,
+				shoal.ErrorNotFound)
 		})
 	}
 }
@@ -732,13 +787,14 @@ func TestAnExecuteHolderWithoutStandingCannotReachTheExtensionGate(t *testing.T)
 // action ID to guess, because the durable one is derived from the caller, so
 // the absent probe names an agent that is not registered.
 //
-// The delegated variant is not compared byte for byte here, because it does
-// not hold and the reason is not attestation: queuedRecordBinding returns
+// The delegated variant is compared byte for byte too, since #536. It used to
+// be excluded because it did not hold: queuedRecordBinding returned
 // resolveActionBinding's error unnormalised, so a delegated caller without
-// delegate authority is told unauthorized for a registered agent and
-// not-found for an unregistered one, with or without the requirement.
-// TestAdmissionDelegateRefusalDoesNotDependOnTheRequirement pins that the
-// gate plays no part in it; the split itself is an enqueue-path question.
+// delegate authority was told unauthorized for a registered agent and
+// not-found for an unregistered one. The caller-only checks now run *before*
+// the descriptor lookup, so that answer is identical either way — and may
+// therefore be honest about which grant is missing, which is what
+// requireIndistinguishable's per-route wantCode expresses.
 func TestAnInvokeHolderWithoutStandingCannotReachTheAdmissionGate(t *testing.T) {
 	// Every stranger, including the delegated ones. This loop used to skip
 	// those: a delegated caller holding invoke but lacking delegate authority
@@ -750,9 +806,24 @@ func TestAnInvokeHolderWithoutStandingCannotReachTheAdmissionGate(t *testing.T) 
 		t.Run(s.name, func(t *testing.T) {
 			f := newAttestationFixture(t, true)
 			ctx := s.bind(t, f, "admission-stranger", auth.OperationInvoke)
+			// Captured after the fixture has built itself, which reads the
+			// descriptor several times. Assuming zero here made the first
+			// version of the assertion fail on the fixture's own setup
+			// rather than on anything the probes did.
+			lookupsBefore := f.registryRows.getCount()
 			refused := admissionProbe(f, ctx, "agent")
 			absent := admissionProbe(f, ctx, "no-such-agent")
-			requireIndistinguishable(t, s, f, "admission", refused, absent, 0)
+			// The stranger's own code here: no action exists yet, so a
+			// caller-only failure discloses nothing and says what it is,
+			// while a scope or domain failure still answers as an absent
+			// object would.
+			requireIndistinguishable(
+				t, s, f, "admission", refused, absent, 0, s.code)
+			if s.code == shoal.ErrorUnauthorized {
+				// The honest answer is only safe because nothing was read.
+				requireNoDescriptorLookup(
+					t, f, "admission", lookupsBefore)
+			}
 		})
 	}
 }
@@ -760,6 +831,14 @@ func TestAnInvokeHolderWithoutStandingCannotReachTheAdmissionGate(t *testing.T) 
 // TestAdmissionDelegateRefusalDoesNotDependOnTheRequirement: whatever the
 // delegated stranger is told, it is told the same with the requirement on and
 // off, it is never the attestation denial, and the store is never read.
+//
+// Since #536 it also compares against a nonexistent agent, which this could
+// not do before: the answer used to differ by existence, so only the
+// requirement-invariance half held. Four answers now — requirement on and
+// off, agent present and absent — and all four must be identical. That
+// subsumes the byte comparison without losing what this test uniquely
+// asserts, which is that the attestation requirement plays no part in the
+// refusal at all.
 func TestAdmissionDelegateRefusalDoesNotDependOnTheRequirement(t *testing.T) {
 	var delegated stranger
 	for _, s := range strangers {
@@ -767,22 +846,29 @@ func TestAdmissionDelegateRefusalDoesNotDependOnTheRequirement(t *testing.T) {
 			delegated = s
 		}
 	}
-	answers := make([]string, 0, 2)
+	answers := make([]string, 0, 4)
 	for _, require := range []bool{true, false} {
 		f := newAttestationFixture(t, require)
 		ctx := delegated.bind(t, f, "admission-stranger", auth.OperationInvoke)
-		err := admissionProbe(f, ctx, "agent")
-		if err == nil {
-			t.Fatalf("require=%v: a delegated caller without delegate was admitted", require)
+		for _, agent := range []shoal.ID{"agent", "no-such-agent"} {
+			err := admissionProbe(f, ctx, agent)
+			if err == nil {
+				t.Fatalf("require=%v agent=%q: a delegated caller without "+
+					"delegate was admitted", require, agent)
+			}
+			if f.recorder.recordedOperation(
+				ClaimRefusedAttestationPhase) != "" {
+				t.Fatalf("require=%v agent=%q: the refusal was audited as "+
+					"an attestation refusal", require, agent)
+			}
+			answers = append(answers, err.Error())
 		}
-		if f.recorder.recordedOperation(ClaimRefusedAttestationPhase) != "" {
-			t.Fatalf("require=%v: the refusal was audited as an attestation refusal", require)
-		}
-		answers = append(answers, err.Error())
 	}
-	if answers[0] != answers[1] {
-		t.Fatalf("the requirement changes the delegated answer: %q vs %q",
-			answers[0], answers[1])
+	for index := 1; index < len(answers); index++ {
+		if answers[index] != answers[0] {
+			t.Fatalf("the delegated answer varies across requirement and "+
+				"agent existence: %q vs %q", answers[0], answers[index])
+		}
 	}
 }
 
