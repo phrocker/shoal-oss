@@ -25,7 +25,7 @@ session gateway differs from both again:
 | | LLM gateway | Effects gateway | Session gateway |
 | --- | --- | --- | --- |
 | unit | one request | one action, at most once | a long-lived stream yielding many observations |
-| inbound listener | HTTP | none on Path A if its probes are `exec`: the worker pulls | SSH; RDP through `guacd` |
+| inbound listener | HTTP | none on Path A if its probes are `exec`: the worker pulls | SSH; an HTTPS/WebSocket Guacamole tunnel for RDP, with `guacd` as an internal sidecar |
 | writes to Shoal | admission and report | dispatch completion | observations, shadow predictions, outcomes |
 | sensitive state | provider credential | one target credential | target credentials and raw session recordings |
 
@@ -34,7 +34,7 @@ Two rows settle that these are separate binaries, not modes of one:
 - **Inbound exposure.** A Path A effects worker pulls its work, and with `exec`
   probes it accepts no connections at all (`docs/gateway-proxy-design.md`,
   "Kubernetes reference"). Even with a health listener, putting an interactive
-  SSH server or `guacd` in the pod that holds an irreversible-effect credential
+  SSH server or an RDP tunnel endpoint in the pod that holds an irreversible-effect credential
   gives every operator-facing connection a route to that credential.
 - **Recordings.** Raw sessions carry typed secrets and customer data, and need
   their own storage, retention and replay access. Nothing about an effects
@@ -43,10 +43,12 @@ Two rows settle that these are separate binaries, not modes of one:
 This does not contradict `docs/sentrius-integration.md` §6 ("What must not move
 into Shoal"). §6 keeps session *transport* out of Shoal's dispatch and
 execution: a session is the wrong shape for an action, and SSH and RDP proxies
-effect change by definition. The session gateway is a separate binary that
-observes sessions and reports to Shoal through public contracts. Nothing in
-Shoal's executor performs a session, and the gateway enforces nothing until
-shadow results justify it.
+effect change by definition. The session gateway is such a proxy: it relays
+operator sessions and holds target credentials. It is also a separate binary
+that reports what it observes to Shoal through public contracts. The effects are
+the operator's, outside Shoal's dispatch and executor; nothing in Shoal's
+executor performs a session, and the gateway enforces nothing until shadow
+results justify it.
 
 All three follow the deployment rule in `docs/gateway-proxy-design.md` ("The unit
 of deployment is the operational surface"): one binary, deployed once per
@@ -81,7 +83,7 @@ protocol-specific beyond HTTP is an extension.
   command is one Path A action.
 
 Extensions live under `extensions/`, each with its own `go.mod` listed in
-`go.work`, as `wal-quorum-sidecar` is. They ship their own images and are not
+`go.work`, the pattern `wal-quorum-sidecar` already uses. They ship their own images and are not
 rendered by the core chart unless enabled. Core release gates do not cover them.
 They stay in this repository while the contracts settle, so a contract change and
 the extension that exposed it can land together.
@@ -197,14 +199,16 @@ the same reason.
    enqueuer), #438 (nowhere to record a lost-fence ambiguity) and #430 (claims
    cannot be extended), and on the decision the design doc requires about
    heartbeats moving the descriptor generation ("The second blocker: every
-   heartbeat invalidates every claim"), which has no issue of its own. Then #391. Approval as an admission outcome lands before
-   the gateway enforces any effect that requires it.
+   heartbeat invalidates every claim"), which has no issue of its own. Then
+   #391. Approval as an admission outcome lands before the gateway enforces any
+   effect that requires it.
 3. **Core extension contracts.** Collector registration and authority, extractor
    identity, runtime attestation, SDK, import boundary test. Rides on #403, #418
    and #419.
 4. **Session gateway, SSH.** Subject to the #421 open decision below, and
    tracked with it in #447. Shadow only. Begins emitting observations only once
-   step 3 and #418 exist; transport and recording can be built earlier.
+   step 3 and #418 exist. Transport and recording may be built before those,
+   but not before the #421 decision.
 5. **Session gateway, RDP.** Same pipeline, `guacd` adapter.
 6. **Extractors.** Commands first, then GUI events, vision and UI Automation.
 7. **`effects.ssh`.** After #391; needs #430 for long commands.
