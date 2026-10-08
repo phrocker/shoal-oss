@@ -18,6 +18,11 @@ same Go provider. The [source-backed service example](FROZEN_SERVICE.md) adds
 local source authorization and durable receipts for that frozen cohort. Neither
 example supplies a production registration authority.
 
+The [adjudicated training showcase](ADJUDICATED_TRAINING.md) now connects real
+source/review fixture receipts to authorized export, manifest-pinned fitting and
+durable inquiry. It exercises poisoning, withdrawal and provenance boundaries
+with a sealed synthetic census; it does not establish code-review quality.
+
 ## Run
 
 Use a Python environment matching `requirements.txt` (Python's exact version and

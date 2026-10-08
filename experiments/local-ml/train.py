@@ -30,6 +30,7 @@ import threadpoolctl
 from threadpoolctl import threadpool_info, threadpool_limits
 
 import dataset
+import authorized_manifest
 
 PINNED_VERSIONS = {"numpy": "2.4.6", "scipy": "1.17.1", "scikit-learn": "1.7.2", "threadpoolctl": "3.7.0"}
 RECIPE = {
@@ -85,7 +86,8 @@ def runtime_metadata():
             "dependencies": versions, "thread_environment": THREAD_ENV,
             "thread_pools": pools,
             "sources": {"train.py": sha256(Path(__file__).read_bytes()),
-                        "dataset.py": sha256(Path(dataset.__file__).read_bytes())}}
+                        "dataset.py": sha256(Path(dataset.__file__).read_bytes()),
+                        "authorized_manifest.py": sha256(Path(authorized_manifest.__file__).read_bytes())}}
 
 
 def publish_exclusive(staging, output):
@@ -101,13 +103,21 @@ def publish_exclusive(staging, output):
         raise OSError(error, os.strerror(error), str(output))
 
 
-def train(dataset_path, output_dir):
+def train(dataset_path, output_dir, *, authorized_manifest_path=None,
+          authorized_manifest_sha256=None):
+    if (authorized_manifest_path is None) != (authorized_manifest_sha256 is None):
+        raise ValueError('authorized manifest path and SHA-256 pin are required together')
     output = Path(os.path.abspath(output_dir))
     if os.path.lexists(output):
         raise FileExistsError(f"output already exists: {output}")
     if not output.parent.is_dir():
         raise ValueError("output parent must already exist")
-    data = dataset.load_dataset(dataset_path)
+    authorization = None
+    if authorized_manifest_path is not None:
+        data, authorization = authorized_manifest.load(
+            dataset_path, authorized_manifest_path, authorized_manifest_sha256)
+    else:
+        data = dataset.load_dataset(dataset_path)
     eligible, exclusions = dataset.eligible_training_rows(data)
     labels = data["labels"]
     if {row["label"] for row in eligible} != set(labels):
@@ -143,6 +153,8 @@ def train(dataset_path, output_dir):
                "fit_row_ids": [row["id"] for row in eligible], "excluded_rows": exclusions,
                "iterations": int(estimator.n_iter_), "converged": True,
                "warnings": [{"category": w.category.__name__, "message": str(w.message)} for w in observed]}
+    if authorization is not None:
+        receipt['authorized_export'] = authorization
     artifacts = {"model.json": model_bytes, "recipe.json": recipe_bytes,
                  "runtime.json": runtime_bytes, "training-receipt.json": dataset.canonical_bytes(receipt)}
     for name, content in artifacts.items():
@@ -171,9 +183,13 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset", required=True)
     parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--authorized-manifest")
+    parser.add_argument("--authorized-manifest-sha256")
     args = parser.parse_args()
     try:
-        receipt = train(args.dataset, args.output_dir)
+        receipt = train(args.dataset, args.output_dir,
+                        authorized_manifest_path=args.authorized_manifest,
+                        authorized_manifest_sha256=args.authorized_manifest_sha256)
     except PublishedDurabilityError as error:
         parser.exit(2, json.dumps({"status": "published-durability-indeterminate",
                                   "candidate_only": True, "output_dir": error.output_dir,
