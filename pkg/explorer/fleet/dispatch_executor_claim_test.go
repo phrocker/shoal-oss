@@ -3803,3 +3803,91 @@ func (s *DispatchService) claimAbsent(
 	})
 	return err
 }
+
+// TestEffectPossibleAnswersTheQuestionItNames is #510: the flag was
+// unconditionally true on every terminal record, so it carried no information
+// where an operator actually reads it.
+//
+// applyClaim sets it only for an action declaring EffectMutatesExternal or
+// EffectEgressesContent, with a comment explaining that an action which
+// "neither mutates externally nor transmits leaves its whole outcome in
+// Shoal's own record, so nothing has to be assumed about it".
+// applyExecutionResult then set it true for everything, and
+// ActionRecord.Validate *required* that — so the thoughtful write ran first
+// and the careless one ran last and won, and the model forbade the honest
+// answer.
+//
+// Both halves are asserted here, because asserting only the false case would
+// pass against a service that never set the flag at all.
+func TestEffectPossibleAnswersTheQuestionItNames(t *testing.T) {
+	declare := func(t *testing.T, f *executorClaimFixture, effects Effects) {
+		t.Helper()
+		stored := f.registryStore.records[f.queued.AgentID]
+		descriptor := cloneDescriptor(stored.Descriptor)
+		for capability := range descriptor.Capabilities {
+			for action := range descriptor.Capabilities[capability].Actions {
+				descriptor.Capabilities[capability].Actions[action].
+					Effects = effects
+			}
+		}
+		stored.Descriptor = descriptor
+		f.registryStore.records[f.queued.AgentID] = stored
+	}
+	complete := func(t *testing.T, f *executorClaimFixture) ActionRecord {
+		t.Helper()
+		worker := f.namedWorker(t, "worker", auth.OperationExecute)
+		claimed, err := f.service.Claim(worker, ClaimRequest{
+			ID: f.queued.ID, ExpectedVersion: f.queued.Version,
+			ClaimID: []byte("worker-claim"), Lease: time.Minute,
+			Context: dispatchContext(f.now, "worker-request"),
+		})
+		if err != nil {
+			t.Fatalf("the claim this test needs was refused: %v", err)
+		}
+		if _, err := f.service.CompleteClaim(worker, CompletionRequest{
+			ID: f.queued.ID, ExpectedVersion: claimed.Version,
+			ClaimFence: claimed.ClaimFence, ClaimID: []byte("worker-claim"),
+			Result:  ExecutionResult{Output: json.RawMessage(`{"ok":true}`)},
+			Context: dispatchContext(f.now, "worker-request"),
+		}); err != nil {
+			t.Fatalf("the completion was refused: %v", err)
+		}
+		return f.dispatchStore.records[string(f.queued.ID)]
+	}
+
+	t.Run("an action declaring no external effect", func(t *testing.T) {
+		fixture := newExecutorClaimFixture(t)
+		declare(t, fixture, nil)
+		completed := complete(t, fixture)
+		if completed.State != DispatchSucceeded {
+			t.Fatalf("state = %q", completed.State)
+		}
+		if completed.EffectPossible {
+			t.Fatal("a terminal record for an action that mutates nothing " +
+				"externally and transmits nothing still asserts an effect " +
+				"may have happened, so the flag tells an operator nothing " +
+				"and reconciliation cannot filter on it")
+		}
+	})
+
+	t.Run("an action declaring external mutation", func(t *testing.T) {
+		fixture := newExecutorClaimFixture(t)
+		declare(t, fixture, Effects{EffectMutatesExternal})
+		completed := complete(t, fixture)
+		if !completed.EffectPossible {
+			t.Fatal("a terminal record for an externally-mutating action " +
+				"does not assert that an effect may have happened, which is " +
+				"the one thing this flag has to get right")
+		}
+	})
+
+	t.Run("an action declaring egress", func(t *testing.T) {
+		fixture := newExecutorClaimFixture(t)
+		declare(t, fixture, Effects{EffectEgressesContent})
+		completed := complete(t, fixture)
+		if !completed.EffectPossible {
+			t.Fatal("content that left the host cannot be recalled, so an " +
+				"egressing action must assert a possible effect")
+		}
+	})
+}

@@ -1267,10 +1267,22 @@ func (r ActionRecord) Validate() error {
 		(r.ExecutionPolicyGeneration <= 0 || r.ExecutionExpiresAt.IsZero()) {
 		return shoal.NewError(shoal.ErrorInvalidArgument, "action execution authorization is incomplete")
 	}
-	if r.State == DispatchSucceeded && (len(r.Output) == 0 || !r.EffectPossible) {
+	// EffectPossible is deliberately not required here. It was, and that
+	// requirement enforced a falsehood: it made every terminal record assert
+	// an effect may have happened, including an action declaring no external
+	// effect at all, which is the case applyClaim goes out of its way to
+	// leave alone. A reader could not use the flag because it was a constant
+	// (#510).
+	//
+	// Nothing is lost by dropping it. applyClaim sets the flag from the
+	// action's declaration, the completion path carries it forward rather
+	// than asserting it, and the store refuses to let it fall (#461). So a
+	// terminal record carrying false now means something: this action could
+	// not have had an external effect.
+	if r.State == DispatchSucceeded && len(r.Output) == 0 {
 		return shoal.NewError(shoal.ErrorInvalidArgument, "successful action outcome is incomplete")
 	}
-	if r.State == DispatchFailed && (r.ErrorCode == "" || !r.EffectPossible) {
+	if r.State == DispatchFailed && r.ErrorCode == "" {
 		return shoal.NewError(shoal.ErrorInvalidArgument, "failed action outcome is incomplete")
 	}
 	if len(r.Evidence) > 0 {
