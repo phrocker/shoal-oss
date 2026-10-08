@@ -1082,23 +1082,21 @@ func (s *AdmissionService) Report(
 	if errors.Is(err, ErrClaimLost) {
 		return ActionRecord{}, ErrAdmissionSpent
 	}
-	// Reporting a failure is a successful report. The completion path is built
-	// for an executor, where a failed outcome is the executor's error and is
-	// returned alongside the committed record; here the failure is the news,
-	// not an error in delivering it.
+	// What used to be here: a branch converting a reported failure back into a
+	// receipt, because "reporting a failure is a successful report" and the
+	// completion path answered it with an error. Without it the first response
+	// to a reported failure was an error and the identical retry was a
+	// receipt, so what a caller saw depended on whether its own report
+	// committed — the exact confusion the one-shot token and the replay
+	// comparison exist to remove.
 	//
-	// Without this the first response to a reported failure is an error and the
-	// identical retry is a receipt, so what the caller sees depends on whether
-	// its own report committed — the exact confusion the one-shot token and the
-	// replay comparison exist to remove.
-	//
-	// The guard is the replay comparison itself, so only a record that is this
-	// report, committed, is converted. An ambiguous outcome returns a zero
-	// record and an output or evidence rejection stores an error code this
-	// report did not send; neither matches, and both stay errors.
-	if report.Failed && sameReportedOutcome(record, report, nil) {
-		return record, nil
-	}
+	// completeClaim answers that way itself now (#492), so the err == nil
+	// return above takes this case and the branch became unreachable:
+	// completeClaim returns a non-zero record only when it committed, and
+	// then with no error. Keeping it would have implied a guarantee that is
+	// no longer held here, which is worse than the duplication it saved —
+	// this surface had the right answer before the service did, and the
+	// service having it means this one should stop asserting it separately.
 	return ActionRecord{}, err
 }
 
