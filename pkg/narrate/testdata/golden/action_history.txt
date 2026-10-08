@@ -1,0 +1,9 @@
+history dispatch.transition.enqueue
+  At 2026-10-08 12:00:00 UTC, alice enqueued it with a deadline of 2026-10-08 14:00:00 UTC.
+  record=action:act-1 transition=t1
+history dispatch.transition.claim_run
+  Between 2026-10-08 12:01:00 UTC and 2026-10-08 12:13:00 UTC it was claimed 3 times by worker-1 and worker-2; each claim before the last lapsed without a report.
+  record=action:act-1 transition=t2 transition=t3 transition=t4
+history dispatch.transition.fail
+  At 2026-10-08 12:15:00 UTC, worker-2 reported failure with retry_exhausted.
+  record=action:act-1 transition=t5

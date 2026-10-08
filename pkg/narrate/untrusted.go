@@ -1,0 +1,188 @@
+// Licensed to the Apache Software Foundation (ASF) under one or more
+// contributor license agreements. See the NOTICE file distributed with this
+// work for additional information regarding copyright ownership.
+
+package narrate
+
+import (
+	"encoding/hex"
+	"fmt"
+	"strings"
+	"unicode"
+	"unicode/utf8"
+)
+
+// Fragment is a piece of sentence text whose presentation has already been
+// decided: catalog text, a formatted number or time, a safe identifier, or a
+// quoted span. Only this package constructs one, and message arguments accept
+// fragments rather than strings, so nothing reaches a sentence by accident.
+type Fragment struct {
+	text   string
+	quotes []Quote
+}
+
+// Attribution names who a quoted span came from. The catalog's sentence says
+// so in words; the Quote carries it as data for a reader that styles quotes.
+type Attribution string
+
+const (
+	// AttributedToRequester is text the action's requester supplied.
+	AttributedToRequester Attribution = "requester"
+	// AttributedToExecutor is text an executor or target returned.
+	AttributedToExecutor Attribution = "executor"
+	// AttributedToPredictor is text a decision predictor returned.
+	AttributedToPredictor Attribution = "predictor"
+	// AttributedToEvidenceBuilder is text a picture's builder recorded.
+	AttributedToEvidenceBuilder Attribution = "evidence_builder"
+	// AttributedToCaller is a caller-asserted reason, never verified.
+	AttributedToCaller Attribution = "caller"
+	// AttributedToRecord is an identifier or label stored on a record that
+	// cannot be shown bare.
+	AttributedToRecord Attribution = "record"
+)
+
+// Quote is one untrusted span inside a sentence. Text is exactly what appears
+// between the quotation marks in the sentence: escaped and bounded.
+type Quote struct {
+	Attribution Attribution
+	// By is the principal the span is attributed to, when one is known. It is
+	// data for the reader; the sentence shows it through the same rules.
+	By        string
+	Text      string
+	Truncated bool
+}
+
+const (
+	openQuote  = '“'
+	closeQuote = '”'
+	ellipsis   = '…'
+	// DefaultQuoteRunes bounds a quoted span when Options does not.
+	DefaultQuoteRunes = 120
+	// maxQuoteRunes is the hard ceiling whatever Options says.
+	maxQuoteRunes = 2048
+	// maxIdentifierBytes bounds an identifier shown bare.
+	maxIdentifierBytes = 64
+	// maxRecordIDBytes bounds a record ID kept as a token in RecordID and
+	// Refs, which are data rather than prose; it fits content-addressed IDs.
+	maxRecordIDBytes = 256
+)
+
+// quoted presents untrusted text as a delimited, escaped, bounded span.
+//
+// Inside the span:
+//   - a backslash is doubled, so every escape below is unambiguous;
+//   - the span's own delimiters, the ASCII quote and the ellipsis are escaped,
+//     so a value cannot close its quotation or fake a truncation;
+//   - every rune that is not printable — control characters, newlines,
+//     bidirectional and other format characters, separators other than the
+//     ASCII space, private-use and unassigned code points — is written as a
+//     \u{…} escape, so a value cannot start a line, reorder the text around
+//     it, or hide characters;
+//   - a combining mark is escaped where it would attach to the delimiter;
+//   - bytes that are not UTF-8 are written as \x escapes.
+//
+// At most limit runes of the value are shown; a longer value ends with an
+// unescaped ellipsis and is marked Truncated.
+func quoted(attribution Attribution, by, value string, limit int) Fragment {
+	if limit <= 0 {
+		limit = DefaultQuoteRunes
+	}
+	if limit > maxQuoteRunes {
+		limit = maxQuoteRunes
+	}
+	var b strings.Builder
+	shown := 0
+	truncated := false
+	for i := 0; i < len(value); {
+		if shown == limit {
+			truncated = true
+			break
+		}
+		r, size := utf8.DecodeRuneInString(value[i:])
+		if r == utf8.RuneError && size <= 1 {
+			fmt.Fprintf(&b, `\x%02x`, value[i])
+			i++
+			shown++
+			continue
+		}
+		switch {
+		case r == '\\':
+			b.WriteString(`\\`)
+		case r == '"':
+			b.WriteString(`\"`)
+		case r == '\n':
+			b.WriteString(`\n`)
+		case r == '\r':
+			b.WriteString(`\r`)
+		case r == '\t':
+			b.WriteString(`\t`)
+		case r == openQuote, r == closeQuote, r == ellipsis,
+			r == '‘', r == '’':
+			fmt.Fprintf(&b, `\u{%04x}`, r)
+		case shown == 0 && unicode.Is(unicode.M, r):
+			fmt.Fprintf(&b, `\u{%04x}`, r)
+		case !unicode.IsPrint(r):
+			fmt.Fprintf(&b, `\u{%04x}`, r)
+		default:
+			b.WriteRune(r)
+		}
+		i += size
+		shown++
+	}
+	text := b.String()
+	if truncated {
+		text += string(ellipsis)
+	}
+	return Fragment{
+		text: string(openQuote) + text + string(closeQuote),
+		quotes: []Quote{{
+			Attribution: attribution, By: by, Text: text, Truncated: truncated,
+		}},
+	}
+}
+
+// safeToken reports whether an identifier may be shown bare: short, starting
+// with a letter or digit, and drawn from a charset with no spaces, quotes,
+// brackets or sentence punctuation other than the separators identifiers use.
+func safeToken(s string) bool { return tokenOf(s, maxIdentifierBytes) }
+
+func tokenOf(s string, limit int) bool {
+	if s == "" || len(s) > limit {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
+		case i > 0 && (c == '.' || c == '_' || c == '-' || c == ':' ||
+			c == '@' || c == '/' || c == '+'):
+		default:
+			return false
+		}
+	}
+	// A trailing separator would read as punctuation of the sentence.
+	last := s[len(s)-1]
+	return (last >= 'a' && last <= 'z') || (last >= 'A' && last <= 'Z') ||
+		(last >= '0' && last <= '9')
+}
+
+// ident presents a stored identifier or registered name. A safe token is shown
+// bare; anything else is quoted exactly as untrusted text is, attributed to
+// the record.
+func ident(value string, limit int) Fragment {
+	if safeToken(value) {
+		return Fragment{text: value}
+	}
+	return quoted(AttributedToRecord, "", value, limit)
+}
+
+// opaqueID renders opaque record-ID bytes for a Sentence's RecordID or a Ref.
+// A safe token is kept; anything else, and any token that could be mistaken
+// for the encoding, is hex-encoded under a "hex:" prefix.
+func opaqueID(id []byte) string {
+	s := string(id)
+	if tokenOf(s, maxRecordIDBytes) && !strings.HasPrefix(s, "hex:") {
+		return s
+	}
+	return "hex:" + hex.EncodeToString(id)
+}

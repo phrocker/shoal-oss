@@ -156,6 +156,10 @@ cannot assert anything that is not in a record.
   attributed quotations ("…asserted by alice"). Otherwise the renderer becomes an
   injection channel.
 
+The renderer for approval, dispatch and decision records is `pkg/narrate`
+(#498); [narrate.md](narrate.md) describes its catalog, coverage rule and
+untrusted-text rule.
+
 ## Disclosure: the hard constraint
 
 Derived artifacts disclose the data they were derived from.
