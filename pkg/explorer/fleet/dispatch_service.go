@@ -284,7 +284,7 @@ func (s *DispatchService) Claim(ctx context.Context, request ClaimRequest) (Acti
 			current.Version == request.ExpectedVersion+1 &&
 			bytes.Equal(current.ClaimID, request.ClaimID) &&
 			current.ClaimLease == request.Lease &&
-			standingOn(decision, current) {
+			holdsClaimOn(decision, current) {
 			if err := s.publishTransition(
 				context.WithoutCancel(ctx), "action.claimed", current,
 			); err != nil {
@@ -293,36 +293,39 @@ func (s *DispatchService) Claim(ctx context.Context, request ClaimRequest) (Acti
 			return cloneActionRecord(current), nil
 		}
 		// A version mismatch is the first answer this route produces, so it is
-		// also the first place the record's existence can leak. A caller with
-		// standing gets the conflict it needs in order to re-read and retry; a
-		// caller without any is told what an absent action is told.
+		// also the first place the record's existence can leak.
 		//
-		// This costs an execute-holder nothing it should have. A record it may
-		// legitimately take is queued or has a lapsed claim, and Pull hands it
-		// that record with its current version — so it arrives here with the
-		// right version and never sees this branch. Reaching it at all means
-		// guessing, which is the probe being refused.
-		if !standingOn(decision, current) {
+		// Concealed only when Pull withholds the record. An earlier version of
+		// this concealed it unconditionally on the argument that a caller
+		// holding the right version never reaches this branch — which ignores
+		// the ordinary claim race. Two execute-holders pull the same page, one
+		// claims, and the other arrives here with the version it was handed.
+		// It needs a conflict so it re-pulls; a not-found for work it just saw
+		// in its own page is both useless and false.
+		if concealFrom(decision, current, now) {
 			return ActionRecord{}, auth.ObjectNotFound()
 		}
 		return ActionRecord{}, ErrActionConflict
 	}
+	// Each of the three remaining answers is the real reason for a caller with
+	// standing or a record Pull already shows, and the answer an absent action
+	// gets otherwise. The live-claimed branch had no such check at all until a
+	// review found it: Pull withholds a live-claimed record, so claiming one by
+	// a guessed ID was returning a distinguishable conflict.
 	if current.State == DispatchClaimed && now.Before(current.ClaimLeaseUntil) {
+		if concealFrom(decision, current, now) {
+			return ActionRecord{}, auth.ObjectNotFound()
+		}
 		return ActionRecord{}, ErrActionConflict
 	}
-	// Terminal and past-deadline records are the two states Pull does not
-	// return, so for a caller with no standing these are the only answers that
-	// disclose an action it could not otherwise observe. A live-claimed or
-	// queued record is already visible to every execute-holder in the scope
-	// through Pull, so ErrActionConflict above tells such a caller nothing new.
 	if current.State.terminal() {
-		if !standingOn(decision, current) {
+		if concealFrom(decision, current, now) {
 			return ActionRecord{}, auth.ObjectNotFound()
 		}
 		return ActionRecord{}, ErrActionTerminal
 	}
 	if !now.Before(current.Deadline) {
-		if !standingOn(decision, current) {
+		if concealFrom(decision, current, now) {
 			return ActionRecord{}, auth.ObjectNotFound()
 		}
 		return ActionRecord{}, ErrClaimLost
@@ -666,42 +669,41 @@ func (s *DispatchService) completeClaim(
 	// 200 carrying the hijacker's output, telling it the work it actually
 	// performed was recorded when the record says something else.
 	//
-	// ErrClaimLost rather than a bespoke error, and rather than
-	// ObjectNotFound. The caller demonstrably knows the action exists — it is
-	// presenting a version and a ClaimID for it — so concealing existence
-	// buys nothing here, while "the claim you are reporting under is not
-	// yours" is exactly what ErrClaimLost already means to a worker, and it is
-	// already the answer for a fence this caller has lost. A worker that
-	// receives it must treat the effect as ambiguous, which is the correct
-	// posture.
+	// Concealed rather than refused, for the same reason every other refusal
+	// on these routes is: this one is reachable by every principal authorized
+	// to execute the descriptor, so a distinguishable error is the #398
+	// oracle. An earlier version of this comment argued the opposite — that
+	// the caller demonstrably knows the action exists because it presented a
+	// version and a ClaimID — and the code three lines below it already did
+	// the concealing. The argument was also wrong: presenting a guessed ID
+	// with any version is exactly how the probe works.
 	//
-	// The record's own principal is accepted alongside the claimant, and that
-	// is not a loophole being left open — it is the pre-#437 contract, which
-	// has to keep working.
+	// The record's own principal is accepted only where the claim predates
+	// this field. That is narrower than it first shipped, and the narrowing
+	// closes a hole rather than tidying one.
 	//
-	// Claiming and completing were both gated on sameActionPrincipal, so the
-	// claimant was always the enqueuer. Every record written before
-	// ClaimantSubject existed therefore has an empty claimant chain and a
-	// legitimate reporter that is the record's own principal; requiring the
-	// claimant alone would refuse all of them. The admission surface relies on
-	// the same thing: AdmissionService.Report resolves with
-	// authorizedCurrent(..., OperationInvoke, true, ...), which already
-	// demands the record's principal, and its grants are claimed and reported
-	// by one identity.
+	// The reason to accept it at all is backward compatibility. Claiming and
+	// completing were both gated on sameActionPrincipal, so the claimant was
+	// always the enqueuer and no record needed to say so; every record written
+	// before ClaimantSubject existed therefore has an empty claimant chain and
+	// a legitimate reporter that is the record's own principal. Requiring the
+	// claimant alone would refuse all of them.
 	//
-	// What this costs is that an enqueuer can still commit an outcome for a
-	// claim a worker holds, if it presents the live ClaimID that Status shows
-	// it. That is worth stating plainly, and it is not the hole being closed:
-	// the enqueuer owns the work, can already cancel it at any moment, and
-	// fabricating its own action's outcome harms only itself. The hole was a
-	// *third* principal — neither the enqueuer nor the claimant — doing it to
-	// a worker that then received a success receipt for the fabrication.
+	// The reason to accept it *only* then is that the enqueuer is otherwise
+	// just another principal that is not the claimant. Two things an earlier
+	// version of this comment asserted to excuse it are false, and both were
+	// checked: the enqueuer cannot "cancel it at any moment", because Cancel
+	// refuses while a claim is live and it must wait for the lease to lapse;
+	// and fabricating its own action's outcome does not "harm only itself",
+	// because the replay branch below then hands the worker that performed the
+	// effect a 200 carrying the fabrication — the identical failure this gate
+	// exists to prevent, with a narrower attacker.
 	//
-	// Concealed rather than refused. ErrClaimLost would tell a caller with no
-	// standing that the action exists, which is the same oracle #398 closed —
-	// and this route is reachable by every principal authorized to execute the
-	// descriptor, not only by the record's own.
-	if !standingOn(decision, current) {
+	// Nothing needs the wider form. An admission grant is claimed through
+	// applyClaim like any other, so it carries a claimant chain, and
+	// AdmissionService.Report already demands the record's own principal — so
+	// for every admission this build writes, the claimant check alone passes.
+	if !holdsClaimOn(decision, current) {
 		return ActionRecord{}, auth.ObjectNotFound()
 	}
 	// A replayed report. The action is already terminal at the version this
@@ -1636,6 +1638,60 @@ func (s *DispatchService) claimableBy(
 		}
 	}
 	return false, nil
+}
+
+// observableThroughPull reports whether Pull would return this record to a
+// caller authorized to execute its descriptor. It mirrors the filter in Pull
+// exactly, and the two must not drift.
+//
+// It is the discriminator for whether concealing a refusal buys anything. A
+// record Pull already hands this caller cannot be concealed by any answer
+// Claim gives, so refusing with the real error discloses nothing and is far
+// more useful: the loser of an ordinary claim race needs a conflict, not a
+// not-found for work it just saw in its own page. A record Pull withholds is
+// the opposite — there, the error is the only channel, so it has to be the
+// same error an absent action produces.
+//
+// Note which states those are, because an earlier version of this reasoning
+// got it backwards and said a live-claimed record was already visible through
+// Pull. It is not: Pull returns a claimed record only once its lease has
+// lapsed. So live-claimed is withheld, and claiming one had been answering
+// with a distinguishable ErrActionConflict.
+func observableThroughPull(record ActionRecord, now time.Time) bool {
+	if record.State != DispatchQueued &&
+		!(record.State == DispatchClaimed && !now.Before(record.ClaimLeaseUntil)) {
+		return false
+	}
+	return now.Before(record.Deadline)
+}
+
+// concealFrom reports whether a refusal about this record must be replaced with
+// the answer an absent action gets, rather than the real reason.
+func concealFrom(
+	decision auth.Decision, record ActionRecord, now time.Time,
+) bool {
+	return !standingOn(decision, record) &&
+		!observableThroughPull(record, now)
+}
+
+// holdsClaimOn reports whether this caller may act as the holder of this
+// record's claim — which is what both writing a terminal outcome and replaying
+// a claim amount to.
+//
+// Narrower than standingOn on purpose. standingOn answers "may this caller be
+// told the record exists", where the enqueuer always qualifies because it is
+// the record's own principal. Reporting is a different question: it is a claim
+// to have performed the work, and the only principal that can have done so is
+// the one holding the claim.
+//
+// The enqueuer is admitted only when the record carries no claimant at all,
+// which happens for exactly one reason — the claim was taken by a build that
+// had no such field, and the claimant was by construction the enqueuer.
+func holdsClaimOn(decision auth.Decision, record ActionRecord) bool {
+	if sameClaimantPrincipal(decision, record) {
+		return true
+	}
+	return record.ClaimantSubject == "" && sameActionPrincipal(decision, record)
 }
 
 // standingOn reports whether this caller has any standing to be told that this

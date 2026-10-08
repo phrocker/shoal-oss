@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -432,6 +433,37 @@ func TestAnExecuteHolderCannotProbeForExistence(t *testing.T) {
 	}
 }
 
+// principal is the whole of what sameClaimantPrincipal compares, so a test can
+// vary one component at a time. dispatchDecision takes only subject, actor and
+// request, which is why three of the four components had no coverage.
+type principal struct {
+	subject    string
+	actor      string
+	request    string
+	clientID   shoal.ID
+	onBehalfOf []shoal.ID
+}
+
+func dispatchDecisionFor(
+	t *testing.T, who principal, operations ...auth.Operation,
+) auth.Decision {
+	t.Helper()
+	decision, err := auth.NewDecision(auth.DecisionConfig{
+		Subject: shoal.ID(who.subject), Actor: shoal.ID(who.actor),
+		ClientID: who.clientID, OnBehalfOf: who.onBehalfOf,
+		AuthorizationDomain: []byte("domain"),
+		AllowedOperations:   operations,
+		PermittedSourceIDs:  [][]byte{[]byte("source")},
+		PermittedPolicyIDs:  [][]byte{[]byte("policy")}, PolicyGeneration: 1,
+		AuthenticationExpires: time.Date(2026, 9, 7, 0, 0, 0, 0, time.UTC),
+		RequestID:             shoal.ID(who.request), CorrelationID: "correlation",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return decision
+}
+
 // namedWorker binds a decision for a specific principal, so two workers can be
 // told apart. The shared worker helper mints one identity, which is enough for
 // "not the enqueuer" and not enough for "not the other worker" — and the
@@ -755,10 +787,11 @@ func TestARevokedExecutorCannotCommitItsOutcome(t *testing.T) {
 // and removing the normalisation from either of the other two left the suite
 // green.
 //
-// Terminal and past-deadline are the states Pull does not return, so those are
-// the ones where this disclosed something a caller could not already see. A
-// queued or live-claimed record is in its page anyway; the mismatch branch is
-// normalised regardless, because reaching it means guessing.
+// Terminal and past-deadline are two of the three states Pull does not return;
+// the third is live-claimed, which an earlier version of this comment wrongly
+// listed as visible through Pull and which has its own test now
+// (TestALiveClaimIsNotVisibleToAStranger). A queued record is in the caller's
+// page, so a refusal about one conceals nothing and is left informative.
 func TestATerminalActionIsNotVisibleToAStranger(t *testing.T) {
 	t.Run("a stale version", func(t *testing.T) {
 		fixture := newExecutorClaimFixture(t)
@@ -864,5 +897,388 @@ func (f *executorClaimFixture) assertIndistinguishable(
 			t.Errorf("%s answers an existing action with %v, which is not the "+
 				"answer an absent one gets", probe.name, present)
 		}
+	}
+}
+
+// revokingExecutor performs the work and then deletes the agent's descriptor
+// outright, so resolution afterwards is a clean not-found rather than a fault.
+//
+// That distinction is the whole reason this type exists alongside
+// breakingExecutor. Pointing the descriptor at a missing executor reference
+// produces a bare Unavailable, which claimableBy returns as an *error* — so the
+// completion is refused by the `authorizeErr != nil` arm and the authorization
+// verdict below it is never consulted. A review found that deleting either arm
+// alone left the suite green. Deleting the descriptor exercises the verdict.
+type revokingExecutor struct {
+	store *memoryStore
+}
+
+func (e *revokingExecutor) Execute(
+	_ context.Context, _ Invocation,
+) (ExecutionResult, error) {
+	delete(e.store.records, "agent")
+	return ExecutionResult{Output: json.RawMessage(`{"ok":true}`)}, nil
+}
+
+// TestAnUnauthorizedExecutorCannotCommitItsOutcome covers the authorization
+// verdict of the post-effect re-authorization, as distinct from a fault in
+// reaching it.
+//
+// Both arms refuse, and both must: the work has happened either way, so the
+// caller has to be told the outcome is unreconciled rather than that it did not
+// occur. They are separate tests because they are separate lines, and a single
+// fixture that trips the fault arm leaves the verdict arm uncovered.
+func TestAnUnauthorizedExecutorCannotCommitItsOutcome(t *testing.T) {
+	fixture := newExecutorClaimFixture(t)
+	fixture.bindExecutor(t, &revokingExecutor{store: fixture.registryStore})
+
+	claimed, err := fixture.service.Claim(fixture.enqueuer, ClaimRequest{
+		ID: fixture.queued.ID, ExpectedVersion: fixture.queued.Version,
+		ClaimID: []byte("in-process-claim"), Lease: time.Minute,
+		Context: dispatchContext(fixture.now, "request"),
+	})
+	if err != nil {
+		t.Fatalf("the enqueuer could not claim: %v", err)
+	}
+
+	_, err = fixture.service.ExecuteClaim(fixture.enqueuer, claimed)
+	if err == nil {
+		t.Fatal("an executor no longer authorized for this action committed " +
+			"its outcome anyway")
+	}
+	if !errors.Is(err, ErrExecutionAmbiguous) {
+		t.Fatalf("the refusal does not tell the caller its effect is "+
+			"unreconciled: %v", err)
+	}
+	// Specifically the verdict, not the fault arm above it. If the descriptor
+	// had merely become unresolvable this would read "unavailable".
+	if !strings.Contains(err.Error(), "terminal execution identity changed") {
+		t.Fatalf("refused by the fault arm rather than by the authorization "+
+			"verdict, so the verdict is still uncovered: %v", err)
+	}
+}
+
+// TestTheClaimantIsComparedOnItsWholeChain covers the three components of
+// sameClaimantPrincipal that no test could see.
+//
+// The shared worker helper varies subject, actor and request together, so a
+// comparison checking only the subject passed every existing test.
+//
+// Each variant below differs from the claim's holder in **exactly one**
+// component. A first version of this test varied three at once — it left the
+// client ID and the delegation chain empty while changing the actor — so
+// dropping any single comparison still refused, and dropping the Actor, the
+// ClientID or the whole chain comparison from the production code left this
+// test green. One component at a time is the whole point: a fixture that
+// differs in three ways cannot tell you which of the three is checked.
+func TestTheClaimantIsComparedOnItsWholeChain(t *testing.T) {
+	holder := principal{
+		subject: "holder-subject", actor: "holder-actor",
+		request: "holder-request", clientID: "holder-client",
+		onBehalfOf: []shoal.ID{"delegator"},
+	}
+	// Derived from the holder so every field matches unless a case changes it.
+	differing := func(mutate func(*principal)) principal {
+		other := holder
+		other.onBehalfOf = append([]shoal.ID(nil), holder.onBehalfOf...)
+		other.request = "other-request"
+		mutate(&other)
+		return other
+	}
+
+	for _, variant := range []struct {
+		component string
+		who       principal
+	}{
+		{"Actor", differing(func(p *principal) { p.actor = "other-actor" })},
+		{"ClientID", differing(func(p *principal) { p.clientID = "other-client" })},
+		{"OnBehalfOf (chain emptied)", differing(func(p *principal) { p.onBehalfOf = nil })},
+		{"OnBehalfOf (different delegator)", differing(func(p *principal) {
+			p.onBehalfOf = []shoal.ID{"other-delegator"}
+		})},
+	} {
+		t.Run(variant.component, func(t *testing.T) {
+			fixture := newExecutorClaimFixture(t)
+			claimant := bindDecision(t, fixture.authority, dispatchDecisionFor(
+				t, holder, auth.OperationExecute, auth.OperationDelegate))
+
+			claimed, err := fixture.service.Claim(claimant, ClaimRequest{
+				ID: fixture.queued.ID, ExpectedVersion: fixture.queued.Version,
+				ClaimID: []byte("holder-claim"), Lease: time.Minute,
+				Context: dispatchContext(fixture.now, holder.request),
+			})
+			if err != nil {
+				t.Fatalf("the holder could not claim: %v", err)
+			}
+
+			other := bindDecision(t, fixture.authority, dispatchDecisionFor(
+				t, variant.who, auth.OperationExecute, auth.OperationDelegate))
+			_, err = fixture.service.CompleteClaim(other, CompletionRequest{
+				ID: fixture.queued.ID, ExpectedVersion: claimed.Version,
+				ClaimID: []byte("holder-claim"),
+				Result:  ExecutionResult{Output: json.RawMessage(`{"ok":false}`)},
+				Context: dispatchContext(fixture.now, variant.who.request),
+			})
+			if err == nil {
+				t.Fatalf("a principal differing from the claimant only in %s "+
+					"completed its claim, so that component is not compared",
+					variant.component)
+			}
+
+			// And the holder itself still completes, so the refusal above is
+			// about the differing component and not about the fixture having
+			// made the claim unreportable by anyone.
+			if _, err := fixture.service.CompleteClaim(
+				claimant, CompletionRequest{
+					ID: fixture.queued.ID, ExpectedVersion: claimed.Version,
+					ClaimID: []byte("holder-claim"),
+					Result: ExecutionResult{
+						Output: json.RawMessage(`{"ok":true}`),
+					},
+					Context: dispatchContext(fixture.now, holder.request),
+				}); err != nil {
+				t.Fatalf("the holder was refused too, so this case proves "+
+					"nothing about %s: %v", variant.component, err)
+			}
+		})
+	}
+}
+
+// TestTheEnqueuerCannotReportOnAWorkersClaim pins the narrowing of who may
+// report.
+//
+// The claimant check first shipped accepting the record's own principal
+// alongside the claimant, on two stated grounds that are both false: that the
+// enqueuer "can already cancel it at any moment", when Cancel refuses while a
+// claim is live; and that fabricating its own action's outcome "harms only
+// itself", when the replay branch then hands the worker that performed the
+// effect a success receipt carrying the fabrication. That is the same failure
+// the gate exists to prevent, with a narrower attacker.
+//
+// The enqueuer is admitted only where the record carries no claimant at all,
+// which is the pre-#437 encoding and nothing else.
+func TestTheEnqueuerCannotReportOnAWorkersClaim(t *testing.T) {
+	fixture := newExecutorClaimFixture(t)
+	worker := fixture.namedWorker(t, "worker", auth.OperationExecute)
+
+	claimed, err := fixture.service.Claim(worker, ClaimRequest{
+		ID: fixture.queued.ID, ExpectedVersion: fixture.queued.Version,
+		ClaimID: []byte("worker-claim"), Lease: time.Minute,
+		Context: dispatchContext(fixture.now, "worker-request"),
+	})
+	if err != nil {
+		t.Fatalf("the worker could not claim: %v", err)
+	}
+
+	// The enqueuer can read the ClaimID off Status, so presenting it is not the
+	// hard part.
+	status, err := fixture.service.Status(fixture.enqueuer, StatusRequest{
+		ID: fixture.queued.ID, Context: dispatchContext(fixture.now, "request"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(status.ClaimID, []byte("worker-claim")) {
+		t.Fatalf("Status does not disclose the claim ID (%q), so this test is "+
+			"not exercising the path it describes", status.ClaimID)
+	}
+
+	if _, err := fixture.service.CompleteClaim(
+		fixture.enqueuer, CompletionRequest{
+			ID: fixture.queued.ID, ExpectedVersion: claimed.Version,
+			ClaimID: status.ClaimID,
+			Result:  ExecutionResult{Output: json.RawMessage(`{"ok":false}`)},
+			Context: dispatchContext(fixture.now, "request"),
+		}); err == nil {
+		t.Fatal("the enqueuer committed an outcome for a claim a worker holds, " +
+			"and the worker would then receive a success receipt for it")
+	}
+
+	// And the worker still gets its own outcome recorded, which is what makes
+	// this a narrowing rather than a refusal of everything.
+	done, err := fixture.service.CompleteClaim(worker, CompletionRequest{
+		ID: fixture.queued.ID, ExpectedVersion: claimed.Version,
+		ClaimID: []byte("worker-claim"),
+		Result:  ExecutionResult{Output: json.RawMessage(`{"ok":true}`)},
+		Context: dispatchContext(fixture.now, "worker-request"),
+	})
+	if err != nil {
+		t.Fatalf("the claim's holder was refused: %v", err)
+	}
+	if string(done.Output) != `{"ok":true}` {
+		t.Fatalf("the holder's own outcome was not recorded: %s", done.Output)
+	}
+}
+
+// TestALiveClaimIsNotVisibleToAStranger is the fourth existence oracle, found
+// by a review after the first three were closed.
+//
+// Claiming a live-claimed record answered ErrActionConflict with no standing
+// check, on the stated grounds that such a record is already visible through
+// Pull. It is not: Pull returns a claimed record only once its lease has
+// lapsed. So an execute-holder could guess action IDs and tell a live-claimed
+// record from an absent one — cheaply, because a freshly claimed record is at
+// version 2 and every wrong guess answers not-found.
+func TestALiveClaimIsNotVisibleToAStranger(t *testing.T) {
+	fixture := newExecutorClaimFixture(t)
+	holder := fixture.namedWorker(t, "holder", auth.OperationExecute)
+	stranger := fixture.namedWorker(t, "stranger", auth.OperationExecute)
+
+	claimed, err := fixture.service.Claim(holder, ClaimRequest{
+		ID: fixture.queued.ID, ExpectedVersion: fixture.queued.Version,
+		ClaimID: []byte("holder-claim"), Lease: time.Minute,
+		Context: dispatchContext(fixture.now, "holder-request"),
+	})
+	if err != nil {
+		t.Fatalf("the holder could not claim: %v", err)
+	}
+
+	// Pull withholds it, which is what makes the error the only channel.
+	page, err := fixture.service.Pull(stranger, PullActionsRequest{
+		Limit: 10, Context: dispatchContext(fixture.now, "stranger-request"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Actions) != 0 {
+		t.Fatalf("Pull returned a live-claimed record, so this test is not "+
+			"about a record the stranger cannot otherwise see: %d actions",
+			len(page.Actions))
+	}
+
+	fixture.assertIndistinguishable(t, stranger, claimed.Version)
+}
+
+// TestTheLoserOfAClaimRaceIsToldNotFound pins a deliberate degradation, which
+// is worth a test precisely because it is the losing side of a trade.
+//
+// Two workers pull the same page and both claim. The winner's claim makes the
+// record live-claimed, and Pull withholds live-claimed records — so by the time
+// the loser asks, the error is the only channel through which that record's
+// existence could be learned, and it has to be the answer an absent action
+// gets. The loser therefore receives not-found for work it saw in its own page
+// moments earlier.
+//
+// The alternative was considered and rejected. Answering the loser with
+// ErrActionConflict would mean an execute-holder could guess action IDs and
+// distinguish a live-claimed record from a nonexistent one, which is cheap:
+// every wrong guess answers not-found and a freshly claimed record sits at
+// version 2. A misleading error for the loser of a race it can simply retry is
+// a smaller cost than a working existence oracle.
+//
+// **A worker must therefore treat not-found from Claim as "re-pull", not as
+// "this action is gone."** Operationally that is what it would do with a
+// conflict anyway, which is what makes the trade affordable.
+//
+// An earlier comment in dispatch_service.go claimed this case could not arise,
+// on the grounds that a caller holding the right version never reaches the
+// version-mismatch branch. That ignored the race.
+func TestTheLoserOfAClaimRaceIsToldNotFound(t *testing.T) {
+	fixture := newExecutorClaimFixture(t)
+	first := fixture.namedWorker(t, "first", auth.OperationExecute)
+	second := fixture.namedWorker(t, "second", auth.OperationExecute)
+
+	page, err := fixture.service.Pull(second, PullActionsRequest{
+		Limit: 10, Context: dispatchContext(fixture.now, "second-request"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Actions) != 1 {
+		t.Fatalf("the loser must have seen the record in its own page for this "+
+			"test to describe a race at all: %d actions", len(page.Actions))
+	}
+	offered := page.Actions[0]
+
+	if _, err := fixture.service.Claim(first, ClaimRequest{
+		ID: offered.ID, ExpectedVersion: offered.Version,
+		ClaimID: []byte("first-claim"), Lease: time.Minute,
+		Context: dispatchContext(fixture.now, "first-request"),
+	}); err != nil {
+		t.Fatalf("the winner could not claim: %v", err)
+	}
+
+	_, err = fixture.service.Claim(second, ClaimRequest{
+		ID: offered.ID, ExpectedVersion: offered.Version,
+		ClaimID: []byte("second-claim"), Lease: time.Minute,
+		Context: dispatchContext(fixture.now, "second-request"),
+	})
+	if err == nil {
+		t.Fatal("both workers claimed the same action")
+	}
+	if !shoal.IsErrorCode(err, shoal.ErrorNotFound) {
+		t.Fatalf("the loser of a claim race no longer receives not-found. If "+
+			"that is deliberate, confirm an execute-holder still cannot "+
+			"distinguish a live-claimed record from an absent one — see "+
+			"TestALiveClaimIsNotVisibleToAStranger: %v", err)
+	}
+
+	// The record itself is untouched by the losing attempt: the winner still
+	// holds it under its own claim.
+	status, err := fixture.service.Status(fixture.enqueuer, StatusRequest{
+		ID: fixture.queued.ID, Context: dispatchContext(fixture.now, "request"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(status.ClaimID, []byte("first-claim")) {
+		t.Fatalf("the losing claim changed the holder to %q", status.ClaimID)
+	}
+
+	// And a still-queued record does produce a conflict for a stale version,
+	// which is why the concealment keys on what Pull shows rather than on
+	// standing alone. Nothing is concealed that the caller can already pull.
+	fresh := newExecutorClaimFixture(t)
+	stale := fresh.namedWorker(t, "stale", auth.OperationExecute)
+	_, err = fresh.service.Claim(stale, ClaimRequest{
+		ID: fresh.queued.ID, ExpectedVersion: fresh.queued.Version + 7,
+		ClaimID: []byte("stale-claim"), Lease: time.Minute,
+		Context: dispatchContext(fresh.now, "stale-request"),
+	})
+	if err == nil {
+		t.Fatal("a claim at a version the record never had succeeded")
+	}
+	if shoal.IsErrorCode(err, shoal.ErrorNotFound) {
+		t.Fatalf("a queued record that Pull would hand this caller is "+
+			"concealed anyway, which costs an informative error for nothing: %v",
+			err)
+	}
+}
+
+// TestCloningARecordDoesNotShareTheClaimantChain covers the one deep copy the
+// claimant fields needed and nothing exercised.
+//
+// Three of the four are scalars that the struct assignment in
+// cloneActionRecord copies correctly on its own. ClaimantOnBehalfOf is a slice,
+// so without an explicit copy the clone shares its backing array — and clones
+// are what leave this package: Status, Pull and every completion return one. A
+// caller mutating the chain it was handed would be editing the record the
+// service still holds, and that chain is half of who may report on the claim.
+//
+// Asserted by mutating the clone, because a test that only compared the two
+// would pass against an aliased copy.
+func TestCloningARecordDoesNotShareTheClaimantChain(t *testing.T) {
+	original := ActionRecord{
+		ID:                 []byte("action"),
+		ClaimantSubject:    "holder",
+		ClaimantActor:      "holder-actor",
+		ClaimantOnBehalfOf: []shoal.ID{"delegator", "second"},
+	}
+
+	clone := cloneActionRecord(original)
+	if len(clone.ClaimantOnBehalfOf) != 2 {
+		t.Fatalf("the clone lost the claimant chain: %v", clone.ClaimantOnBehalfOf)
+	}
+	clone.ClaimantOnBehalfOf[0] = "attacker"
+	if original.ClaimantOnBehalfOf[0] != "delegator" {
+		t.Fatal("the clone shares the claimant delegation chain with the " +
+			"record it was built from, so a caller holding a clone can edit " +
+			"half of who may report on the claim")
+	}
+
+	// And the scalars survive, so this is not passing because the fields are
+	// simply absent from the clone.
+	if clone.ClaimantSubject != "holder" || clone.ClaimantActor != "holder-actor" {
+		t.Fatalf("the clone did not carry the claimant identity: %+v", clone)
 	}
 }

@@ -602,9 +602,11 @@ func (r ActionRecord) Validate() error {
 	}
 	// The claimant's chain is bounded and validated exactly like the
 	// enqueuer's. It reaches the record from a decision rather than from a
-	// request body, so this is defence in depth — but it is also what stops a
-	// decoded record from an older encoding passing Validate with a chain this
-	// build would refuse to write.
+	// request body, so this is defence in depth and nothing more — an earlier
+	// version of this comment claimed it guarded a record decoded from an
+	// older encoding, which cannot happen: such a record has no claimant chain
+	// at all, not an over-long one. What it does guard is a corrupt or
+	// tampered stored value.
 	if err := shoal.ValidateOptionalID(
 		"action claimant", r.ClaimantSubject); err != nil {
 		return err
