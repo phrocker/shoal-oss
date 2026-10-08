@@ -82,7 +82,9 @@ is packaged with the snapshot it came from.
   compiled into a finite-state matcher. It links mentions in short text to node
   IDs in microseconds and cannot invent an entity. Exact matching misses typos
   and inflections, and an alias shared by several nodes is ambiguous; both go to
-  slot abstention rather than a guess.
+  slot abstention rather than a guess. Slice 1 is built: see
+  [`lexicon.md`](lexicon.md) for the bundle format, scope-filtered matching
+  and measured latency.
 - **Tokenizer.** A subword vocabulary trained on the corpus (documents, guides,
   code comments), so internal identifiers and jargon tokenize sensibly.
 - **Embeddings, CPU-trained.** Subword word vectors or count-based vectors for
