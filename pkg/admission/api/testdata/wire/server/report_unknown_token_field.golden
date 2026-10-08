@@ -5,4 +5,4 @@ provider calls: 0
 status: 400
 content-type: application/json; charset=utf-8
 shoal-commit-outcome: 
-body: "{\"code\":\"invalid_argument\",\"message\":\"invalid_argument: decode request body: json: unknown field \\\"extra\\\"\"}\n"
+body: "{\"code\":\"invalid_argument\",\"message\":\"invalid_argument: decode request body: JSON key does not match a field exactly: \\\"extra\\\"\"}\n"

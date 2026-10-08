@@ -21,6 +21,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"reflect"
 	"strings"
@@ -90,7 +91,10 @@ func scanKeys(raw []byte) error {
 					return errors.New("invalid JSON key")
 				}
 				if seen[key] {
-					return ErrDuplicateKey
+					// Named, because a 400 that does not say which key is
+					// wrong leaves a caller to bisect its own payload. The
+					// sentinel is wrapped so errors.Is still matches.
+					return fmt.Errorf("%w: %q", ErrDuplicateKey, key)
 				}
 				seen[key] = true
 				if e := walk(depth + 1); e != nil {
@@ -160,7 +164,7 @@ func exactKeys(raw []byte, t reflect.Type, depth int) error {
 		for key, value := range fields {
 			ft, ok := byName[key]
 			if !ok {
-				return ErrKeyCase
+				return fmt.Errorf("%w: %q", ErrKeyCase, key)
 			}
 			if e := exactKeys(value, ft, depth+1); e != nil {
 				return e

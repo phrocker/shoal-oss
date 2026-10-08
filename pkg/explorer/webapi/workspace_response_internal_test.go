@@ -539,3 +539,66 @@ func TestErrorResponseOverflowPreservesDeterministicStatus(t *testing.T) {
 			response.Body.Len())
 	}
 }
+
+// TestDecodeRequestRefusesAmbiguousKeys pins the seam, not the walk.
+//
+// The walk itself is internal/strictjson's and has its own tests. What this
+// asserts is that decodeRequest uses it — because the defect was never that no
+// strict decoder existed, it was that the explorer's shared request decoder
+// used encoding/json directly, which accepts duplicate keys with
+// last-one-winning and matches field names case-insensitively, including
+// Unicode simple folding. DisallowUnknownFields does not help with either: the
+// fold happens during field matching, so a case-variant key is a *known* field
+// before the unknown-field check can see it (#495).
+func TestDecodeRequestRefusesAmbiguousKeys(t *testing.T) {
+	type nested struct {
+		Value int `json:"value"`
+	}
+	type body struct {
+		Lease  int      `json:"lease"`
+		Nested nested   `json:"nested"`
+		Items  []nested `json:"items"`
+	}
+	for _, probe := range []struct {
+		name    string
+		raw     string
+		refused bool
+	}{
+		{"an ordinary body", `{"lease":1,"nested":{"value":2}}`, false},
+		{"an exact duplicate", `{"lease":1,"lease":2}`, true},
+		{"a case variant", `{"lease":1,"Lease":2}`, true},
+		// U+017F folds to s, so encoding/json would have set Lease from it.
+		{"a Unicode fold", "{\"leaſe\":2}", true},
+		{"a duplicate one level down", `{"nested":{"value":1,"value":2}}`, true},
+		{"a case variant one level down", `{"nested":{"value":1,"Value":2}}`, true},
+		{"a duplicate inside an array element",
+			`{"items":[{"value":1},{"value":1,"Value":2}]}`, true},
+		// Legal shapes that a walk must not refuse: the same key appearing in
+		// two different objects is ordinary, and so is an array whose elements
+		// share key names.
+		{"the same key in two objects",
+			`{"nested":{"value":1},"items":[{"value":2}]}`, false},
+		{"array elements sharing key names",
+			`{"items":[{"value":1},{"value":2}]}`, false},
+		{"an empty object", `{}`, false},
+		{"an empty array", `{"items":[]}`, false},
+	} {
+		t.Run(probe.name, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodPost, "/api/v1/thing",
+				strings.NewReader(probe.raw))
+			request.Header.Set("Content-Type", "application/json")
+			var decoded body
+			err := decodeRequest(
+				httptest.NewRecorder(), request, &decoded)
+			if probe.refused && err == nil {
+				t.Fatalf("%s was accepted, so the same bytes can read one "+
+					"way to a reviewer or a proxy and decode another way "+
+					"here", probe.raw)
+			}
+			if !probe.refused && err != nil {
+				t.Fatalf("%s was refused, which breaks an ordinary request "+
+					"shape: %v", probe.raw, err)
+			}
+		})
+	}
+}
