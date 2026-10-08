@@ -114,8 +114,29 @@ How it works:
      port's methods; a test pins every method set, and another checks that
      no service type satisfies any port.
 
-  Also refused outright: `unsafe`, `reflect`, `plugin`, `os/exec`, `syscall`
-  and network imports, and `go:linkname`.
+  The standard library is allowlisted as well. A guarded package may import
+  only the standard packages it uses today, each listed exactly:
+  - `bufio`, `bytes`, `context`, `errors`, `fmt`;
+  - `crypto/hmac`, `crypto/sha256`;
+  - `encoding/binary`, `encoding/hex`, `encoding/json`;
+  - `io`, `io/fs`, `path`;
+  - `math`, `math/big`;
+  - `sort`, `strconv`, `strings`, `sync`, `time`, `unicode/utf8`.
+
+  Everything else is refused, including `os` and `os/*`, `net` and `net/*`,
+  `crypto/tls`, `runtime/debug`, `syscall`, `plugin`, `reflect`, `unsafe`
+  and cgo's `"C"`. `go:linkname` is refused too. The evaluation harness
+  reads its fixtures from an `fs.FS` its caller supplies, so no guarded
+  package imports `os`.
+
+  The rule-3 walk applies the same standard-library allowlist to the APIs
+  of allowed imports. A fixture whose API exposes an `*os.File`, an
+  `unsafe.Pointer` and a fleet service is flagged for each.
+
+  This is a source-level check of our own code under review. It runs on the
+  non-test files of the guarded packages. It does not constrain their test
+  files, which may import `os` and other packages, or the code of their
+  dependencies. It is not a runtime sandbox.
 
   **`internal/routerwire` is the reviewed surface.** It is about 300 lines.
   Every wrapper method is one of these:
@@ -138,6 +159,10 @@ How it works:
     Heartbeat, Revoke, CompleteClaim in a subpackage, a stored func
     variable, a variable bound elsewhere, a local interface, reflection and
     linkname. The import rule refuses them.
+  - **Round 3:** a probe importing `os`, `crypto/tls`, `net/smtp`,
+    `net/http/httputil`, `runtime/debug` and cgo's `"C"`. The
+    standard-library allowlist refuses it. The cgo half is only parsed,
+    because CI may build without cgo.
   - **Round 2:**
     - Asserting the Config's client to `Connect`. This no longer compiles:
       the Config holds no client. Asserting a wrapper finds nothing.

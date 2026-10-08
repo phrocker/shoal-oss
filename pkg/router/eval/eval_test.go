@@ -31,11 +31,11 @@ const (
 
 func load(t testing.TB) (*World, *Cases) {
 	t.Helper()
-	w, err := LoadWorld(fixtureDir)
+	w, err := LoadWorld(os.DirFS(fixtureDir))
 	if err != nil {
 		t.Fatal(err)
 	}
-	cases, err := LoadCases(fixtureDir)
+	cases, err := LoadCases(os.DirFS(fixtureDir))
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -15,8 +15,8 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"os"
-	"path/filepath"
+	"io/fs"
+	"path"
 	"sort"
 	"strconv"
 	"time"
@@ -97,9 +97,10 @@ type World struct {
 // NodeID is the fixture node ID for a node key.
 func NodeID(key string) shoal.ID { return shoal.ID("node:" + key) }
 
-// LoadWorld reads world.json and grammars/*.json from dir.
-func LoadWorld(dir string) (*World, error) {
-	raw, err := os.ReadFile(filepath.Join(dir, "world.json"))
+// LoadWorld reads world.json and grammars/*.json from fsys (os.DirFS or an
+// embed.FS); the package itself opens no file.
+func LoadWorld(fsys fs.FS) (*World, error) {
+	raw, err := fs.ReadFile(fsys, "world.json")
 	if err != nil {
 		return nil, err
 	}
@@ -153,14 +154,14 @@ func LoadWorld(dir string) (*World, error) {
 		return nil, err
 	}
 	w.templates = w.Bundle.Templates()
-	entries, err := filepath.Glob(filepath.Join(dir, "grammars", "*.json"))
+	entries, err := fs.Glob(fsys, path.Join("grammars", "*.json"))
 	if err != nil {
 		return nil, err
 	}
 	sort.Strings(entries)
 	var docs [][]byte
 	for _, path := range entries {
-		b, err := os.ReadFile(path)
+		b, err := fs.ReadFile(fsys, path)
 		if err != nil {
 			return nil, err
 		}
@@ -292,9 +293,9 @@ type Cases struct {
 	all []Case
 }
 
-// LoadCases reads cases.jsonl.
-func LoadCases(dir string) (*Cases, error) {
-	f, err := os.Open(filepath.Join(dir, "cases.jsonl"))
+// LoadCases reads cases.jsonl from fsys.
+func LoadCases(fsys fs.FS) (*Cases, error) {
+	f, err := fsys.Open("cases.jsonl")
 	if err != nil {
 		return nil, err
 	}

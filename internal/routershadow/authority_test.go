@@ -38,8 +38,18 @@ import (
 //
 // A value they cannot name or obtain cannot be asserted, instantiated or
 // called, whatever form the code takes. The checks below are therefore about
-// imports and API surfaces, not call sites. reflect, unsafe, linkname,
-// os/exec and network imports stay refused on their own account.
+// imports and API surfaces, not call sites.
+//
+// The standard library is allowlisted too (stdAllowed): a guarded package may
+// import only the standard packages listed there, so process, environment,
+// file, network, cgo and reflection access (os, os/*, net, net/*,
+// crypto/tls, runtime/debug, syscall, plugin, reflect, unsafe, "C", ...) is
+// refused by default. go:linkname is refused as well.
+//
+// This is a source-level guard against our own code under review, checked on
+// the non-test files of the guarded packages. It is not a runtime sandbox:
+// it does not constrain test files, the packages the guarded ones depend on,
+// or anything at run time.
 
 const module = "github.com/phrocker/shoal-oss/"
 
@@ -74,11 +84,20 @@ var serviceful = []string{
 // reached only through pkg/decision.
 const authExemption = module + "pkg/explorer/auth"
 
-// forbiddenImports are refused outright: they bypass the type system
-// (unsafe, reflect, plugin) or reach outside the process.
-var forbiddenImports = map[string]bool{
-	"unsafe": true, "reflect": true, "plugin": true, "os/exec": true, "syscall": true,
-	"net": true, "net/http": true, "net/rpc": true,
+// stdAllowed is every standard-library package a guarded package may import,
+// each listed exactly (no prefix wildcards): what the guarded packages import
+// today. None performs process, environment, file or network access by
+// itself. io/fs is the interface package only; the evaluation harness reads
+// fixtures from an fs.FS its caller supplies (os.DirFS in tests), so no
+// guarded package imports os. Anything else is refused.
+var stdAllowed = map[string]bool{
+	"bufio": true, "bytes": true, "context": true,
+	"crypto/hmac": true, "crypto/sha256": true,
+	"encoding/binary": true, "encoding/hex": true, "encoding/json": true,
+	"errors": true, "fmt": true, "io": true, "io/fs": true,
+	"math": true, "math/big": true, "path": true,
+	"sort": true, "strconv": true, "strings": true, "sync": true, "time": true,
+	"unicode/utf8": true,
 }
 
 type finding struct{ pos, what string }
@@ -141,7 +160,8 @@ func parseDir(fset *token.FileSet, dir string) ([]*ast.File, error) {
 	return files, nil
 }
 
-// importFindings applies rule 1 and the outright bans to one package's files.
+// importFindings applies rule 1 and the standard-library allowlist to one
+// package's files, and refuses go:linkname.
 func importFindings(fset *token.FileSet, files []*ast.File, guarded func(string) bool) []finding {
 	var out []finding
 	for _, f := range files {
@@ -150,14 +170,14 @@ func importFindings(fset *token.FileSet, files []*ast.File, guarded func(string)
 			pos := fset.Position(imp.Pos()).String()
 			first := strings.SplitN(p, "/", 2)[0]
 			switch {
-			case forbiddenImports[p]:
-				out = append(out, finding{pos, "import of " + p})
 			case strings.HasPrefix(p, module):
 				if !guarded(p) && !allowedDirect[p] {
 					out = append(out, finding{pos, "import of " + p})
 				}
 			case strings.Contains(first, "."):
 				out = append(out, finding{pos, "import of external package " + p})
+			case !stdAllowed[p]:
+				out = append(out, finding{pos, "import of " + p})
 			}
 		}
 		for _, group := range f.Comments {
@@ -249,7 +269,7 @@ var apiAllowed = map[string]bool{
 // TestImportedAPIsExposeNoService applies rule 3: walking every exported
 // function, method, field, variable and constant of each allowed import,
 // through every type they mention, finds no type from a package outside
-// apiAllowed or the safe standard library.
+// apiAllowed or stdAllowed, and no unsafe.Pointer.
 func TestImportedAPIsExposeNoService(t *testing.T) {
 	root := moduleRoot(t)
 	fset := token.NewFileSet()
@@ -259,6 +279,31 @@ func TestImportedAPIsExposeNoService(t *testing.T) {
 	}
 	sort.Strings(direct)
 	imp := exportImporter(t, root, fset, nil, direct...)
+	for typ, via := range apiFindings(t, imp, direct) {
+		t.Errorf("an allowed import's API exposes %s (via %s)", typ, via)
+	}
+}
+
+// TestAPIWalkerFlagsExposure is the walker's positive control: a fixture
+// package whose API returns an *os.File, an unsafe.Pointer and a fleet
+// service is flagged for each.
+func TestAPIWalkerFlagsExposure(t *testing.T) {
+	root := moduleRoot(t)
+	fset := token.NewFileSet()
+	dir := filepath.Join(root, "internal", "routershadow", "testdata", "round3", "api")
+	imp := exportImporter(t, root, fset, map[string]string{"example.test/round3/api": dir}, "./pkg/explorer/fleet", "os")
+	bad := apiFindings(t, imp, []string{"example.test/round3/api"})
+	for _, want := range []string{"os.File", "unsafe.Pointer", module + "pkg/explorer/fleet.Service"} {
+		if _, ok := bad[want]; !ok {
+			t.Errorf("walker did not flag %s (flagged %v)", want, bad)
+		}
+	}
+}
+
+// apiFindings walks the exported API of each package and returns every type
+// outside apiAllowed and stdAllowed it reaches, with the path it was reached by.
+func apiFindings(t *testing.T, imp types.Importer, paths []string) map[string]string {
+	t.Helper()
 	seen := map[types.Type]bool{}
 	bad := map[string]string{}
 	var walk func(types.Type, string)
@@ -278,7 +323,7 @@ func TestImportedAPIsExposeNoService(t *testing.T) {
 				switch {
 				case strings.HasPrefix(path, module) && !apiAllowed[path]:
 					bad[path+"."+t.Obj().Name()] = via
-				case forbiddenImports[path] || strings.HasPrefix(path, "net/"):
+				case !strings.HasPrefix(path, module) && !stdAllowed[path]:
 					bad[path+"."+t.Obj().Name()] = via
 				}
 			}
@@ -320,7 +365,7 @@ func TestImportedAPIsExposeNoService(t *testing.T) {
 			}
 		}
 	}
-	for _, path := range direct {
+	for _, path := range paths {
 		pkg, err := imp.Import(path)
 		if err != nil {
 			t.Fatal(err)
@@ -332,9 +377,7 @@ func TestImportedAPIsExposeNoService(t *testing.T) {
 			}
 		}
 	}
-	for typ, via := range bad {
-		t.Errorf("an allowed import's API exposes %s (via %s)", typ, via)
-	}
+	return bad
 }
 
 // exportImporter resolves imports from compiled export data located with go
@@ -395,6 +438,8 @@ type fixture struct {
 	// substring of the type-check error that must occur.
 	want         []string
 	compileError string
+	// parseOnly fixtures are not type-checked (cgo may be unavailable).
+	parseOnly bool
 }
 
 // TestViolationsAreImpossible proves the rules can fail: each fixture is
@@ -416,11 +461,17 @@ func TestViolationsAreImpossible(t *testing.T) {
 		// Round 2: generics instantiated with the registry and the dispatcher.
 		{dir: "round2/register", want: []string{"import of " + fleetPkg}},
 		{dir: "round2/enqueue", want: []string{"import of " + fleetPkg}},
+		// Round 3: process, environment, file and network access through
+		// standard packages a denylist did not name.
+		{dir: "round3/probe", want: []string{"import of os", "import of crypto/tls", "import of net/smtp",
+			"import of net/http/httputil", "import of runtime/debug"}},
+		// Round 3: cgo, parsed only.
+		{dir: "round3/cgo", want: []string{"import of C"}, parseOnly: true},
 	}
 	fset := token.NewFileSet()
 	base := filepath.Join(root, "internal", "routershadow", "testdata")
 	sources := map[string]string{"example.test/elsewhere": filepath.Join(base, "elsewhere")}
-	imp := exportImporter(t, root, fset, sources, "./pkg/explorer/fleet", "./internal/routershadow", "./pkg/graph", "context", "reflect", "os/exec")
+	imp := exportImporter(t, root, fset, sources, "./pkg/explorer/fleet", "./internal/routershadow", "./pkg/graph", "context", "reflect", "os/exec", "os", "crypto/tls", "net/smtp", "net/http/httputil", "runtime/debug")
 	for _, fx := range fixtures {
 		files, err := parseDir(fset, filepath.Join(base, fx.dir))
 		if err != nil {
@@ -434,6 +485,9 @@ func TestViolationsAreImpossible(t *testing.T) {
 			if !got[w] {
 				t.Errorf("%s: %q not flagged (findings %v)", fx.dir, w, got)
 			}
+		}
+		if fx.parseOnly {
+			continue
 		}
 		_, err = (&types.Config{Importer: imp}).Check("example.test/"+fx.dir, fset, files, nil)
 		switch {
