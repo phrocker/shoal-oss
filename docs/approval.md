@@ -196,8 +196,13 @@ conflict of interest #419 forbids.
 
 **Supported issuers, in this slice.** Approvers work only with an issuer
 that advertises public subject identifiers and nothing else, and that puts
-`azp` on its access tokens. Auth0 is one. Okta is one only once the operator
-adds an `azp` claim (below). **Keycloak and Microsoft Entra ID are
+`azp` on its access tokens. Startup checks the first from the issuer's
+discovery document and every mint checks the second, so an issuer that does
+not qualify is refused rather than trusted. The per-issuer notes below
+describe expected behaviour; they were not verified against each vendor, so
+confirm your issuer's discovery document and a sample token before relying
+on them. Auth0 is expected to qualify; Okta only once the operator adds an
+`azp` claim (below). **Keycloak and Microsoft Entra ID are
 unsupported** until the stable-identity follow-up (#526); startup refuses
 both.
 
@@ -224,13 +229,13 @@ this mapping documented `idtyp` absent, and a Keycloak service-account token
 passed it — Keycloak never emits `idtyp`, and its client-credentials tokens
 (like Entra's and Auth0's) have `sub != azp`. Per issuer:
 
-- **Auth0: supported.** Discovery states `["public"]` and access tokens
+- **Auth0: expected to qualify.** Discovery is expected to state `["public"]` and access tokens
   carry `azp`. Add the human assertion with a post-login Action that sets a
   namespaced claim (as in the example). A post-login Action does not run for
   `client_credentials` grants, which run the `credentials-exchange` trigger
   instead, so machine tokens never carry the claim. Those tokens also carry
   `gty: client-credentials`, which is refused anyway.
-- **Okta: supported only with an `azp` claim the operator adds.** Okta access
+- **Okta: expected to qualify only with an `azp` claim the operator adds.** Okta access
   tokens identify the client as `cid` (and the user as `uid`), not `azp`.
   This slice does not accept `cid`, so an Okta approver token is refused
   unless the authorization server has a custom claim named `azp` whose value
