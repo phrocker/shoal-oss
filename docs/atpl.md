@@ -339,8 +339,10 @@ receipt records only what that later caller asserted.
 
 Receipts are written under the identity `fleet.lifecycle.v4`. Receipts written
 before the asserted reason was recorded have v1 or v2 identities and no
-`CallerAssertedReason`; a retry of such a request reconciles with them, whatever
-it asserts, because they never recorded an assertion to compare. A v3 or v4
+`CallerAssertedReason`. The first retry of such a request reconciles with them,
+whatever it asserts, because they never recorded an assertion to compare. That
+retry also writes a v4 receipt, which does record its assertion, so later
+retries are held to it (see below). A v3 or v4
 receipt without an asserted reason, or a v1/v2 receipt with one, is a conflict.
 
 The query digest binds the registry mutation digest, which is versioned
@@ -354,6 +356,20 @@ that finds a v1–v3 receipt is compared using the v1 digest of its mutation, so
 a request admitted before the upgrade still reconciles after it, and a changed
 descriptor still conflicts. New receipts are only ever written as v4 with the
 v2 digest.
+
+Because the v1 digest can be shared by two different descriptors, matching a
+v1–v3 receipt is not enough. A retry that matches one also writes the v4
+receipt, recording the mutation actually being applied by its v2 digest. A
+repeat of that retry reconciles with the v4 receipt, and any other mutation
+under the same request ID conflicts with it, even one the v1 receipt cannot
+tell apart. A consequence for v1/v2 receipts is that the first retry's
+asserted reason is recorded in that v4 receipt, so a later retry asserting a
+different reason conflicts.
+
+During a rolling upgrade or a rollback, an old-build replica does not look for
+v4 receipts. A retry it handles writes a duplicate v3 receipt, and it will not
+flag a changed descriptor under the same request ID. That is the same gap the
+earlier v2→v3 switch had.
 
 The receipt's ID is `explorerfleet.LifecycleReceiptID(operation, request ID,
 agent ID)`, and it is read with the corpus's `InteractionRecord`.

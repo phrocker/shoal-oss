@@ -112,6 +112,17 @@ func (r *LifecycleRecorder) RecordLifecycle(
 		// retry is compared as that version: the version is read from the
 		// receipt's identity, never guessed from the stored digest. v1 and v2
 		// receipts also never carry a caller-asserted reason; v3 receipts do.
+		//
+		// A match is not the end of it. The v1 digest is not injective (#521):
+		// two different descriptors can share one, so a retry that matches a
+		// v1-era receipt may be a different mutation from the one that receipt
+		// admitted. If that receipt's own store write never landed, the retry
+		// is what gets applied. So a reconciled retry also writes the v4
+		// receipt, with the v2 digest of the mutation actually being applied,
+		// and falls through to the ordinary path below: the applied mutation
+		// is then recorded unambiguously, a repeat of the same retry
+		// reconciles with that v4 receipt, and any other mutation under the
+		// same request conflicts with it.
 		legacy := lifecycleWithV1RegistryDigest(lifecycle)
 		for _, prior := range []struct {
 			id                shoal.ID
@@ -127,10 +138,13 @@ func (r *LifecycleRecorder) RecordLifecycle(
 				context.WithoutCancel(ctx), priorRequested.ID,
 			)
 			if readErr == nil {
-				return validateLifecycleReplay(
+				if err := validateLifecycleReplay(
 					record.Session, priorRequested, legacy,
 					prior.withoutAssertions,
-				)
+				); err != nil {
+					return err
+				}
+				break
 			}
 		}
 	}

@@ -346,15 +346,19 @@ func TestPre477LifecycleReceiptReconcilesAcrossUpgrade(t *testing.T) {
 		previous = shoal.ID("pre477-apply-request")
 	)
 	// The same request retried after the upgrade reconciles with its v2
-	// receipt instead of writing a v3 one.
+	// receipt, which an old build wrote with a v1 registry digest. Because the
+	// v1 digest is not injective (#521), the reconciled retry also writes the
+	// current (v4) receipt, recording the mutation by its v2 digest and the
+	// retry's assertion.
 	h.expectStatus(h.register(previous, key, agentID, digest3c),
 		http.StatusCreated, "pre-#477 retry")
-	// A v2 receipt never recorded the assertion, so a retry asserting a
-	// different digest cannot be told apart from it; it still reconciles and
-	// writes nothing. This is the documented upgrade boundary.
+	// A v2 receipt never recorded the assertion, but the v4 receipt the first
+	// retry wrote did, so a later retry asserting a different digest conflicts.
 	h.expectStatus(h.register(previous, key, agentID, digestAb),
-		http.StatusCreated, "pre-#477 retry asserting another digest")
-	// A post-#477 request gets a v3 receipt, which binds its assertion.
+		http.StatusConflict, "pre-#477 retry asserting another digest")
+	h.expectStatus(h.register(previous, key, agentID, digest3c),
+		http.StatusCreated, "pre-#477 retry repeated")
+	// A post-#477 request gets a current receipt, which binds its assertion.
 	h.expectStatus(h.register("post477-request", key, agentID, digest3c),
 		http.StatusCreated, "post-#477 replay")
 	h.expectStatus(h.register("post477-request", key, agentID, digestAb),
@@ -362,15 +366,17 @@ func TestPre477LifecycleReceiptReconcilesAcrossUpgrade(t *testing.T) {
 
 	receipts, done := h.receipts()
 	defer done()
-	if _, ok := receipts[registerReceiptID(previous, agentID)]; ok {
-		t.Fatal("pre-#477 retry wrote a v3 receipt")
+	current, ok := receipts[registerReceiptID(previous, agentID)]
+	if !ok || current.CallerAssertedReason.Source != digest3c {
+		t.Fatalf("pre-#477 retry did not write the current receipt: %#v", current)
 	}
-	if len(receipts) != 2 {
+	if len(receipts) != 3 {
 		t.Fatalf("lifecycle receipts = %#v", receipts)
 	}
 	var legacy interaction.Session
 	for id, session := range receipts {
-		if id != registerReceiptID("post477-request", agentID) {
+		if id != registerReceiptID("post477-request", agentID) &&
+			id != registerReceiptID(previous, agentID) {
 			legacy = session
 		}
 	}

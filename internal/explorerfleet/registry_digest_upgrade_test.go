@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/phrocker/shoal-oss/internal/atpltest"
+	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/explorer/fleet"
 	"github.com/phrocker/shoal-oss/pkg/interaction"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
@@ -27,6 +28,13 @@ const (
 		"49fa84eb66ef6e56c8f69af46aea6637"
 	upgradeV1Approval = "1fa9069c3eeb9ab30df730b30bbf955d" +
 		"07de96fc4b94682428a2abc4b62b2a47"
+	// The v1 receipt identities that build derived for the same lifecycles
+	// (v1LifecycleSessionID hashes the whole lifecycle, digest included). A
+	// v1 receipt is found only at this exact key, so it is pinned too: a
+	// drifted identity derivation would otherwise silently stop finding
+	// every v1 receipt.
+	upgradeV1PlainReceiptID    = "interaction.session_629e0702168d59de7a4fd9a6dc005d54"
+	upgradeV1ApprovalReceiptID = "interaction.session_d30b7643cfad468a86fcf0e42e4a6b5a"
 )
 
 func upgradeSpec(requireApproval bool) fleet.Spec {
@@ -49,17 +57,55 @@ func upgradeSpec(requireApproval bool) fleet.Spec {
 
 // upgradeLifecycle registers upgradeSpec through this build's real
 // fleet.Service and returns the lifecycle it handed its recorder.
+//
+// The request ID is fixed (atpltest's own decisions draw a random one)
+// because a v1 receipt identity hashes the whole lifecycle, request ID
+// included; the old build's identities below were computed with this exact
+// harness.
 func upgradeLifecycle(t *testing.T, requireApproval bool) fleet.Lifecycle {
 	t.Helper()
-	registry := atpltest.NewRegistry(t,
-		atpltest.NewClock(time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC)),
+	return registeredLifecycle(t, upgradeSpec(requireApproval))
+}
+
+func registeredLifecycle(t *testing.T, spec fleet.Spec) fleet.Lifecycle {
+	t.Helper()
+	now := time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC)
+	registry := atpltest.NewRegistry(t, atpltest.NewClock(now),
 		atpltest.Executors{"local": atpltest.Executor{
 			Max: fleet.Effects{fleet.EffectMutatesExternal},
-		}},
+		},
+			// For descriptors with an action that declares no effects, which
+			// an executor that may reach outside Shoal refuses.
+			"corpus": atpltest.Executor{
+				Max: fleet.Effects{fleet.EffectReadsCorpus},
+			}},
 		[]string{"source"}, []string{"policy"})
-	if _, err := registry.Register(
-		t, upgradeSpec(requireApproval), 0, "upgrade-key",
-	); err != nil {
+	decision, err := auth.NewDecision(auth.DecisionConfig{
+		Subject: "owner", Actor: "owner-actor",
+		AuthorizationDomain: []byte(atpltest.Domain),
+		AllowedOperations: []auth.Operation{
+			auth.OperationAgentRegister, auth.OperationAgentResolve,
+		},
+		PermittedSourceIDs:    [][]byte{[]byte("source")},
+		PermittedPolicyIDs:    [][]byte{[]byte("policy")},
+		PolicyGeneration:      1,
+		AuthenticationExpires: now.Add(72 * time.Hour),
+		RequestID:             "upgrade-request",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, err := registry.Authority.Binder().Bind(context.Background(), decision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := registry.Service.Register(ctx, fleet.RegisterRequest{
+		Context: fleet.RequestContext{
+			RequestID: "upgrade-request", ReasonCode: "test",
+			Deadline: now.Add(time.Minute),
+		},
+		RegistrationKey: "upgrade-key", Spec: spec,
+	}); err != nil {
 		t.Fatal(err)
 	}
 	records := registry.Recorder.Records()
@@ -126,11 +172,11 @@ func TestRegistryDigestUpgradeReconcilesV1Receipt(t *testing.T) {
 			receipt.ID = v3LifecycleSessionID(old)
 			return receipt
 		}()},
-		// A v1 identity is itself derived from the v1 digest, so finding the
-		// receipt at all depends on recomputing it correctly.
+		// Stored at the key the old build derived, not at one this build
+		// derives, so the recorder must recompute that key exactly to find it.
 		{"v1", func() interaction.Session {
 			receipt := trustedReceipt(old, interaction.CallerAssertedReason{})
-			receipt.ID = v1LifecycleSessionID(old)
+			receipt.ID = upgradeV1PlainReceiptID
 			return receipt
 		}()},
 	} {
@@ -147,30 +193,94 @@ func TestRegistryDigestUpgradeReconcilesV1Receipt(t *testing.T) {
 		); err != nil {
 			t.Fatalf("%s receipt: retry across the upgrade = %v", prior.name, err)
 		}
-		if len(store.requests) != 0 || store.stored.ID != prior.receipt.ID {
-			t.Fatalf("%s receipt: the retry wrote a new receipt instead of "+
-				"reconciling with the stored one", prior.name)
+		if store.stored.ID != prior.receipt.ID {
+			t.Fatalf("%s receipt: the retry replaced the stored receipt",
+				prior.name)
 		}
+		// Reconciled, and the mutation actually applied is now recorded
+		// under v4 with its v2 digest.
+		requireV4Receipt(t, store, upgraded)
+		// A changed descriptor under the same request conflicts: with the
+		// v3 receipt directly, and with the v4 receipt where the v1 one is
+		// keyed by a digest it does not share.
 		err = recorder.RecordLifecycle(context.Background(), changed)
-		if prior.name == "v3" {
-			// The v3 identity does not depend on the digest, so the changed
-			// retry finds this receipt and must conflict with it.
-			if !shoal.IsErrorCode(err, shoal.ErrorConflict) ||
-				len(store.requests) != 0 {
-				t.Fatalf("%s receipt: changed descriptor across the upgrade "+
-					"= %v", prior.name, err)
-			}
-			continue
-		}
-		// A v1 identity is derived from the digest, so a changed descriptor
-		// is not a retry of that receipt at all (as before the upgrade): it
-		// is not reconciled with it, and is offered as a new receipt.
-		if len(store.requests) != 1 ||
-			store.requests[0].ID != LifecycleReceiptID(
-				changed.Operation, changed.RequestID, changed.AgentID) {
-			t.Fatalf("%s receipt: changed descriptor reconciled with it: %v",
+		if !shoal.IsErrorCode(err, shoal.ErrorConflict) {
+			t.Fatalf("%s receipt: changed descriptor across the upgrade = %v",
 				prior.name, err)
 		}
+	}
+	// The changed descriptor's v1 identity is the old build's too.
+	legacyChanged := lifecycleWithV1RegistryDigest(changed)
+	if got := v1LifecycleSessionID(legacyChanged); got != upgradeV1ApprovalReceiptID {
+		t.Fatalf("v1 receipt identity = %s, want the old build's %s",
+			got, upgradeV1ApprovalReceiptID)
+	}
+}
+
+// TestRegistryDigestLegacyReconcileRecordsTheAppliedMutation is the repro
+// for the v1 collision reaching the receipt path (#521). A and B are both
+// registrable and share a v1 digest. A v3 receipt records A; the request is
+// retried with B. B reconciles with A's receipt, since v1 cannot tell them
+// apart, but if A's store write never landed, B is what gets applied. So
+// the reconciliation must also write a v4 receipt recording B by its v2
+// digest, after which A under the same request conflicts.
+func TestRegistryDigestLegacyReconcileRecordsTheAppliedMutation(t *testing.T) {
+	schema := json.RawMessage(`{"type":"object"}`)
+	spec := func(actions []fleet.Action) fleet.Spec {
+		spec := upgradeSpec(false)
+		spec.ExecutorRef = "corpus"
+		spec.Capabilities = []fleet.Capability{{Name: "ops", Actions: actions}}
+		return spec
+	}
+	// Both registered through the real service, under the same request.
+	lifecycleA := registeredLifecycle(t, spec([]fleet.Action{
+		{Name: "a", InputSchema: schema, OutputSchema: schema,
+			RequiresApproval: true},
+		{Name: string(fleet.EffectReadsCorpus), InputSchema: schema,
+			OutputSchema: schema},
+	}))
+	lifecycleB := registeredLifecycle(t, spec([]fleet.Action{
+		{Name: "a", InputSchema: schema, OutputSchema: schema},
+		{Name: "shoal.fleet.requires-approval.v1",
+			Effects:     fleet.Effects{fleet.EffectReadsCorpus},
+			InputSchema: schema, OutputSchema: schema},
+	}))
+	if lifecycleA.LegacyMutationDigest != lifecycleB.LegacyMutationDigest {
+		t.Fatal("the repro descriptors no longer collide under v1")
+	}
+	if lifecycleA.MutationDigest == lifecycleB.MutationDigest {
+		t.Fatal("the repro descriptors collide under v2")
+	}
+	asserted, err := fleet.CallerAssertedRegistryReason(
+		lifecycleA.ReasonCode, lifecycleA.ReasonDetail)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldA := lifecycleWithV1RegistryDigest(lifecycleA)
+	receiptA := trustedReceipt(oldA, asserted)
+	receiptA.ID = v3LifecycleSessionID(oldA)
+	store := &reconcilingLifecycleStore{
+		trustedLifecycleRecorder: trustedLifecycleRecorder{lifecycle: lifecycleA},
+		stored:                   receiptA,
+	}
+	recorder, err := NewLifecycleRecorderWithReader(store, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// B, retried under A's request, reconciles with A's v1-era receipt...
+	if err := recorder.RecordLifecycle(context.Background(), lifecycleB); err != nil {
+		t.Fatalf("B retry against A's v3 receipt = %v", err)
+	}
+	// ...and is recorded under v4 by its own v2 digest.
+	requireV4Receipt(t, store, lifecycleB)
+	// B again reconciles with its own v4 receipt.
+	if err := recorder.RecordLifecycle(context.Background(), lifecycleB); err != nil {
+		t.Fatalf("repeated B retry = %v", err)
+	}
+	// A, which v1 cannot tell from B, now conflicts against v4.
+	err = recorder.RecordLifecycle(context.Background(), lifecycleA)
+	if !shoal.IsErrorCode(err, shoal.ErrorConflict) {
+		t.Fatalf("A retry after B was recorded under v4 = %v", err)
 	}
 }
 
