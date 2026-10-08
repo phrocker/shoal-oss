@@ -618,8 +618,10 @@ catch only the first:
   objects and creates new ones in the same upgrade, so the old Service stops
   answering at that moment, before the new pods are necessarily ready, and
   `maxUnavailable: 0` does not help because it applies within one Deployment.
-  Repoint callers in the same rollout and upgrade with `--wait`, or run the
-  gateway under a separate release until callers have moved.
+  `--wait` does not close the gap, because the old objects are deleted before
+  Helm waits; it only makes the upgrade block until the new pods are ready. For
+  no gap, run the gateway under a separate release until callers have moved,
+  then remove the old one.
 - Update anything outside the chart that selects the pods. Both selector labels
   changed: `app.kubernetes.io/name` from `shoal-llm-proxy` to
   `shoal-llm-gateway`, and `app.kubernetes.io/component` from `llm-proxy` to
