@@ -259,7 +259,10 @@
        guards below exist to keep. Quoting stops the injection; refusing the
        character is the other half, because a quoted value that still holds a
        control character names no descriptor, variable or Secret and the pod
-       starts and refuses every call.
+       starts and refuses every call. "Control character" here includes the
+       C1 controls and the Unicode line and paragraph separators (NEL, U+2028,
+       U+2029): YAML treats them as line breaks too, and [[:cntrl:]] is ASCII
+       only.
 
        The allow-list and the model list are comma-joined into one argument,
        so an entry holding a comma silently becomes two. */ -}}
@@ -296,14 +299,14 @@
 {{- if not (or (hasPrefix "image." $setting) (hasPrefix "service." $setting)) -}}
 {{- $text = trim $text -}}
 {{- end -}}
-{{- if regexMatch "[[:cntrl:]]" $text -}}
+{{- if regexMatch `[\p{Cc}\p{Zl}\p{Zp}]` $text -}}
 {{- fail (printf "llmGateway.%s contains %q, which holds a control character: it reaches the gateway pod as one quoted YAML scalar, so it names nothing the pod can use and every call is refused while the pod reports healthy. Before those values were quoted, a newline here made the remainder an arbitrary container argument" $setting $text) -}}
 {{- end -}}
 {{- end -}}
 {{- range $setting, $entries := dict "allowedHosts" $gateway.allowedHosts "models" $gateway.models -}}
 {{- range $entry := (default (list) $entries) -}}
 {{- $text := trim (toString (default "" $entry)) -}}
-{{- if regexMatch "[[:cntrl:]]" $text -}}
+{{- if regexMatch `[\p{Cc}\p{Zl}\p{Zp}]` $text -}}
 {{- fail (printf "llmGateway.%s contains %q, which holds a control character: entries reach the gateway inside one quoted argument, so this one matches nothing. Before that argument was quoted, a newline here made the remainder an arbitrary container argument" $setting $text) -}}
 {{- end -}}
 {{- if contains "," $text -}}

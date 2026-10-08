@@ -407,6 +407,34 @@ refuses_citing "holds a control character" "a newline in the image tag" "${llm_g
           securityContext: {}'
 refuses_citing "holds a comma" "a comma inside one allowed host" "${llm_gateway_base[@]}" --set-string 'llmGateway.allowedHosts[0]=a.example.test\,b.example.test'
 refuses_citing "holds a comma" "a comma inside one model" "${llm_gateway_base[@]}" --set-string 'llmGateway.models[0]=gpt-4o\,claude-opus-5'
+# Each class of rendered value is asserted quoted, so reverting the quoting of
+# any one of them fails here rather than only behind the guard.
+both_files=("${llm_gateway_base[@]}" "${valid_token_file[@]}" --set llmGateway.upstream.apiKeyFile=/etc/shoal/upstream/api-key --set llmGateway.upstream.apiKeyFileSource=secret)
+assert_renders "the env variable name is quoted" '^ +- name: "SHOAL_ADMISSION_TOKEN"$' "${llm_gateway_base[@]}"
+assert_renders "the Secret reference is quoted" '^ +name: "shoal-admission-token"$' "${llm_gateway_base[@]}"
+assert_renders "the Secret key is quoted" '^ +key: "token"$' "${llm_gateway_base[@]}"
+assert_renders "the image is quoted" '^ +image: "[^"]+"$' "${llm_gateway_base[@]}"
+assert_renders "the pull policy is quoted" '^ +imagePullPolicy: "IfNotPresent"$' "${llm_gateway_base[@]}"
+assert_renders "the Service type is quoted" '^ +type: "ClusterIP"$' "${llm_gateway_base[@]}"
+assert_renders "the ServiceAccount is quoted" '^ +serviceAccountName: "shoal-llm-gateway"$' "${both_files[@]}"
+assert_renders "a mount path is quoted" '^ +mountPath: "/var/run/secrets/shoal"$' "${both_files[@]}"
+assert_renders "a projected token audience is quoted" '^ +audience: "shoal"$' "${both_files[@]}"
+assert_renders "a projected token path is quoted" '^ +path: "token"$' "${both_files[@]}"
+assert_renders "a credential volume's Secret is quoted" '^ +secretName: "shoal-upstream-key"$' "${both_files[@]}"
+assert_renders "a credential volume's item key is quoted" '^ +- key: "api-key"$' "${both_files[@]}"
+# The credential volumes are built by a helper the arguments do not pass
+# through, so its inputs carry the payload too.
+refuses_citing "holds a control character" "a newline in a credential volume's Secret key" "${both_files[@]}" --set-string 'llmGateway.upstream.credentialSecretKey=other-key
+                path: decoy
+              - key: api-key'
+refuses_citing "holds a control character" "a newline in the projected token audience" "${both_files[@]}" --set-string 'llmGateway.admission.tokenAudience=shoal
+              - secret:
+                  name: injected-secret'
+# YAML breaks lines on NEL and the Unicode line and paragraph separators as
+# well, and [[:cntrl:]] is ASCII only.
+refuses_citing "holds a control character" "a NEL in the capability" "${llm_gateway_base[@]}" --set-string "llmGateway.identity.capability=chat$(printf '\u0085')- -allow-plaintext-admission=true"
+refuses_citing "holds a control character" "a line separator in an allowed host" "${llm_gateway_base[@]}" --set-string "llmGateway.allowedHosts[0]=llm.example.test$(printf '\u2028')x"
+refuses_citing "holds a control character" "a paragraph separator in a model" "${llm_gateway_base[@]}" --set-string "llmGateway.models[0]=gpt-4o$(printf '\u2029')x"
 renders "a trailing newline the template trims is not a control character in the value" "${llm_gateway_base[@]}" --set-string 'llmGateway.identity.action=complete
 '
 
@@ -774,7 +802,7 @@ assert_renders "the automatic token mount is off with an operator volume" "autom
 # if it were wrong the whole projected-token form would be dead on arrival and
 # every other check here would still pass.
 assert_renders "an explicit projection survives it" "serviceAccountToken:" "${token_file_base[@]}"
-assert_renders "and keeps its audience" "audience: shoal" "${token_file_base[@]}"
+assert_renders "and keeps its audience" "audience: \"shoal\"" "${token_file_base[@]}"
 
 note "== both URLs are parsed, not prefix-matched =="
 # These guards tested hasPrefix "http://" and hasPrefix "http://localhost",
