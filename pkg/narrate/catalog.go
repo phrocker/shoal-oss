@@ -189,15 +189,15 @@ func (c *Catalog) format(key string, args Args) (Fragment, error) {
 	if err := f.run(nodes, args, nil, 0); err != nil {
 		return Fragment{}, fmt.Errorf("narrate: message %q: %w", key, err)
 	}
-	return Fragment{text: f.out.String(), quotes: f.quotes}, nil
+	return Fragment{text: f.out.String(), quotes: f.quotes, spans: f.spans}, nil
 }
 
 func (c *Catalog) pluralCategory(n int64) string {
-	if n < 0 {
-		n = -n
-	}
-	if n > math.MaxInt32 {
+	// Clamp before negating: -math.MinInt64 overflows back to itself.
+	if n > math.MaxInt32 || n < -math.MaxInt32 {
 		n = math.MaxInt32
+	} else if n < 0 {
+		n = -n
 	}
 	switch plural.Cardinal.MatchPlural(c.tag, int(n), 0, 0, 0, 0) {
 	case plural.Zero:
@@ -276,10 +276,14 @@ func (c *Catalog) time(t time.Time) string {
 
 // duration renders the two most significant units, truncating toward zero so
 // a lease is never described as longer than it is.
+//
+// A negative duration is refused rather than printed: every duration the
+// renderer states (a lease, time left before a lease or window ends) is
+// positive on a valid record, and printing its magnitude would state a time
+// the record does not hold.
 func (c *Catalog) duration(d time.Duration) (Fragment, error) {
-	negative := d < 0
-	if negative {
-		d = -d
+	if d < 0 {
+		return Fragment{}, fmt.Errorf("negative duration %v", d)
 	}
 	if d < time.Second {
 		if d == 0 {

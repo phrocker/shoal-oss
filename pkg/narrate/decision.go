@@ -83,7 +83,7 @@ func (r *Renderer) Prediction(p decision.PredictionRecord, opts Options) ([]Sent
 			reasonKey = string(result.Status) + ".unrecognized"
 		}
 		b.add(RoleReason, "decision.reason."+reasonKey, withArgs(args, Args{
-			"reason": b.quote(AttributedToPredictor, "", result.Reason),
+			"reason": b.quote(AttributedToPredictorOrService, "", result.Reason),
 		}))
 	}
 
@@ -110,7 +110,9 @@ func (r *Renderer) Prediction(p decision.PredictionRecord, opts Options) ([]Sent
 	// What the picture could not establish.
 	b.pictureGaps(picture)
 
-	b.add(RoleHistory, "decision.history.requested", args, idRef("release", rc.ReleaseID))
+	b.add(RoleHistory, "decision.history.requested", args,
+		idRef("principal", rc.PrincipalID), idRef("release", rc.ReleaseID),
+		idRef("correlation", rc.CorrelationID))
 
 	// What next.
 	if result.Status == decision.Completed {

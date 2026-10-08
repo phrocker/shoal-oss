@@ -67,32 +67,13 @@ func stringLit(e ast.Expr) (string, bool) {
 	return s, err == nil
 }
 
-// typedConsts returns name → value for every string constant declared with
-// the given type.
+// typedConsts returns name → value for every constant of typeName in dir,
+// failing on any such constant it cannot read.
 func typedConsts(t *testing.T, dir, typeName string) map[string]string {
 	t.Helper()
-	out := map[string]string{}
-	for _, f := range parseDir(t, dir) {
-		for _, decl := range f.Decls {
-			gen, ok := decl.(*ast.GenDecl)
-			if !ok || gen.Tok != token.CONST {
-				continue
-			}
-			for _, spec := range gen.Specs {
-				vs := spec.(*ast.ValueSpec)
-				typ, ok := vs.Type.(*ast.Ident)
-				if !ok || typ.Name != typeName {
-					continue
-				}
-				for i, name := range vs.Names {
-					if i < len(vs.Values) {
-						if v, ok := stringLit(vs.Values[i]); ok {
-							out[name.Name] = v
-						}
-					}
-				}
-			}
-		}
+	out, problems := typedConstsIn(parseDir(t, dir), typeName)
+	for _, p := range problems {
+		t.Errorf("%s: %s", dir, p)
 	}
 	if len(out) == 0 {
 		t.Fatalf("no constants of type %s in %s", typeName, dir)
@@ -171,40 +152,15 @@ func sourceTransitionKinds(t *testing.T) []string {
 	return kinds
 }
 
-// sourceFleetErrorCodes reads every string literal assigned to a field named
-// ErrorCode in the fleet package.
+// sourceFleetErrorCodes reads every value the fleet package assigns to an
+// ErrorCode field, failing on any it cannot resolve.
 func sourceFleetErrorCodes(t *testing.T) []string {
 	t.Helper()
-	seen := map[string]bool{}
-	for _, f := range parseDir(t, fleetDir) {
-		ast.Inspect(f, func(n ast.Node) bool {
-			switch n := n.(type) {
-			case *ast.AssignStmt:
-				for i, lhs := range n.Lhs {
-					sel, ok := lhs.(*ast.SelectorExpr)
-					if !ok || sel.Sel.Name != "ErrorCode" || i >= len(n.Rhs) {
-						continue
-					}
-					if s, ok := stringLit(n.Rhs[i]); ok && s != "" {
-						seen[s] = true
-					}
-				}
-			case *ast.KeyValueExpr:
-				if key, ok := n.Key.(*ast.Ident); ok && key.Name == "ErrorCode" {
-					if s, ok := stringLit(n.Value); ok && s != "" {
-						seen[s] = true
-					}
-				}
-			}
-			return true
-		})
+	codes, problems := errorCodesIn(parseDir(t, fleetDir))
+	for _, p := range problems {
+		t.Errorf("fleet: %s", p)
 	}
-	out := make([]string, 0, len(seen))
-	for s := range seen {
-		out = append(out, s)
-	}
-	sort.Strings(out)
-	return out
+	return codes
 }
 
 // sourceGatewayCodes reads the effects gateway's error-code constants: every
@@ -434,5 +390,55 @@ func TestParityStateMachines(t *testing.T) {
 		if leaves[string(final)] {
 			t.Errorf("final approval state %q has an outgoing edge", final)
 		}
+	}
+}
+
+// TestParityEffectiveStateInCode checks EffectiveApprovals against the pairs
+// ApprovalService.effectiveState can actually return, read from its code,
+// not only against the documentation table.
+func TestParityEffectiveStateInCode(t *testing.T) {
+	pairs, problems := effectiveStatePairs(parseDir(t, fleetDir))
+	for _, p := range problems {
+		t.Error(p)
+	}
+	var code, mirror []string
+	seen := map[string]bool{}
+	for _, p := range pairs {
+		if key := p[0] + "/" + p[1]; !seen[key] {
+			seen[key] = true
+			code = append(code, key)
+		}
+	}
+	for _, row := range EffectiveApprovals {
+		mirror = append(mirror, string(row.State)+"/"+string(row.Condition))
+	}
+	sameSet(t, "effectiveState return pairs", code, mirror)
+}
+
+// TestParityDispatchDestinations checks DispatchEdges against what fleet
+// does: every state a record is set to is the destination of an edge, and
+// every edge's kind is the kind actionEventKind pairs with its destination.
+// The source states of each edge are guarded by conditions spread through
+// fleet's services and are not read here; see docs/narrate.md.
+func TestParityDispatchDestinations(t *testing.T) {
+	destinations, kinds, problems := dispatchDestinations(parseDir(t, fleetDir))
+	for _, p := range problems {
+		t.Error(p)
+	}
+	to := map[string]bool{}
+	for _, edge := range DispatchEdges {
+		to[edge.To] = true
+		if kinds[edge.To] != edge.Kind {
+			t.Errorf("edge %s has kind %q; actionEventKind gives %q for %s",
+				edge.Name, edge.Kind, kinds[edge.To], edge.To)
+		}
+	}
+	for state := range destinations {
+		if !to[state] {
+			t.Errorf("fleet sets records to %q, which no edge reaches", state)
+		}
+	}
+	if len(destinations) == 0 || len(kinds) == 0 {
+		t.Fatal("dispatch reader found nothing; it is stale")
 	}
 }

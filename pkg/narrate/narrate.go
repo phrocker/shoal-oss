@@ -72,6 +72,9 @@ type Sentence struct {
 	Refs     []Ref
 	// Quotes are the untrusted spans inside Text, in order.
 	Quotes []Quote
+	// Spans mark, by byte offset and in order, every quoted span and every
+	// bare identifier in Text.
+	Spans []Span
 }
 
 // Options adjusts a rendering. The zero value is valid.
@@ -166,7 +169,7 @@ func (b *builder) add(role Role, key string, args Args, refs ...Ref) {
 	}
 	b.out = append(b.out, Sentence{
 		Role: role, Key: key, Text: fr.text, RecordID: b.recordID,
-		Refs: safeRefs, Quotes: fr.quotes,
+		Refs: safeRefs, Quotes: fr.quotes, Spans: fr.spans,
 	})
 }
 

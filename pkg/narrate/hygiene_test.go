@@ -5,7 +5,6 @@
 package narrate
 
 import (
-	"go/ast"
 	"strconv"
 	"sync"
 	"testing"
@@ -36,23 +35,9 @@ func TestNoModelNetworkOrClock(t *testing.T) {
 				t.Errorf("%s imports %s", f.Name.Name, path)
 			}
 		}
-		// No clock or environment is read: a narration is a function of
-		// its record and options.
-		ast.Inspect(f, func(n ast.Node) bool {
-			sel, ok := n.(*ast.SelectorExpr)
-			if !ok {
-				return true
-			}
-			pkg, ok := sel.X.(*ast.Ident)
-			if !ok {
-				return true
-			}
-			switch pkg.Name + "." + sel.Sel.Name {
-			case "time.Now", "time.Since", "time.Until", "time.Tick", "time.After":
-				t.Errorf("%s reads the clock with %s.%s", f.Name.Name, pkg.Name, sel.Sel.Name)
-			}
-			return true
-		})
+	}
+	for _, v := range clockViolations(parseDir(t, ".")) {
+		t.Errorf("the renderer reads the clock: %s", v)
 	}
 }
 

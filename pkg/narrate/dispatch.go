@@ -81,6 +81,38 @@ func (b *builder) errorCode(code string) Fragment {
 	return b.quote(AttributedToExecutor, "", code)
 }
 
+func principalRef(actor, subject string) []Ref {
+	if id := firstNonEmpty(actor, subject); id != "" {
+		return []Ref{{Kind: "principal", ID: id}}
+	}
+	return nil
+}
+
+func requesterRefs(record fleet.ActionRecord) []Ref {
+	refs := principalRef(string(record.Actor), string(record.Subject))
+	if record.RequestID != "" {
+		refs = append(refs, Ref{Kind: "request", ID: string(record.RequestID)})
+	}
+	return refs
+}
+
+func claimantRefs(record fleet.ActionRecord) []Ref {
+	refs := principalRef(string(record.ClaimantActor), string(record.ClaimantSubject))
+	if len(record.ClaimID) > 0 {
+		refs = append(refs, Ref{Kind: "claim", ID: string(record.ClaimID)})
+	}
+	return refs
+}
+
+// reporterRefs names who reported a terminal outcome: the admitted caller
+// for an admission, the claimant otherwise.
+func reporterRefs(record fleet.ActionRecord) []Ref {
+	if isAdmission(record) {
+		return requesterRefs(record)
+	}
+	return claimantRefs(record)
+}
+
 func actionRefs(record fleet.ActionRecord) []Ref {
 	refs := []Ref{{Kind: "agent", ID: string(record.AgentID)}}
 	if record.RequestID != "" {
@@ -111,14 +143,18 @@ func (r *Renderer) Action(record fleet.ActionRecord, opts Options) ([]Sentence, 
 		}), actionRefs(record)...)
 		return b.finish()
 	}
-	b.add(RoleOutcome, "dispatch.outcome."+string(state), args, actionRefs(record)...)
+	outcomeRefs := actionRefs(record)
+	if state == fleet.DispatchSucceeded {
+		outcomeRefs = append(outcomeRefs, reporterRefs(record)...)
+	}
+	b.add(RoleOutcome, "dispatch.outcome."+string(state), args, outcomeRefs...)
 
 	// Why.
 	if state == fleet.DispatchFailed {
 		stem, status, _ := errorCodeKey(record.ErrorCode)
 		b.add(RoleReason, stem, withArgs(args, Args{
 			"status": status, "code": b.errorCode(record.ErrorCode),
-		}))
+		}), reporterRefs(record)...)
 	}
 	if state == fleet.DispatchCanceled && !admission && record.ClaimFence > 0 {
 		b.add(RoleReason, "dispatch.reason.canceled_after_lapse", args)
@@ -147,13 +183,14 @@ func (r *Renderer) Action(record fleet.ActionRecord, opts Options) ([]Sentence, 
 	}
 
 	// How it got here.
-	b.add(RoleHistory, "dispatch.history.requested", args)
+	b.add(RoleHistory, "dispatch.history.requested", args, requesterRefs(record)...)
 	if len(record.ApprovalRequestDigest) > 0 {
 		b.add(RoleHistory, "dispatch.history.approved", withArgs(args, Args{
 			"approver": b.principal(string(record.ApproverActor), string(record.ApproverSubject)),
 			"approved": record.ApprovedAt,
 			"policy":   record.ApprovalPolicyGeneration,
-		}), Ref{Kind: "approval_digest", ID: hex.EncodeToString(record.ApprovalRequestDigest)})
+		}), append(principalRef(string(record.ApproverActor), string(record.ApproverSubject)),
+			Ref{Kind: "approval_digest", ID: hex.EncodeToString(record.ApprovalRequestDigest)})...)
 	}
 	if record.ClaimFence > 0 && !admission {
 		lapsed := int64(record.ClaimFence) - 1
@@ -174,7 +211,8 @@ func (r *Renderer) Action(record fleet.ActionRecord, opts Options) ([]Sentence, 
 		} else if !opts.Now.IsZero() {
 			live = yesNo(opts.Now.Before(record.ClaimLeaseUntil))
 		}
-		b.add(RoleHistory, "dispatch.history.claimant", withArgs(args, Args{"live": live}))
+		b.add(RoleHistory, "dispatch.history.claimant", withArgs(args, Args{"live": live}),
+			claimantRefs(record)...)
 	}
 
 	// What blocks the next step, and what can happen next.
@@ -185,13 +223,13 @@ func (r *Renderer) Action(record fleet.ActionRecord, opts Options) ([]Sentence, 
 		b.add(RoleDetail, "dispatch.detail.input", withArgs(args, Args{
 			"input": b.quote(AttributedToRequester,
 				firstNonEmpty(string(record.Actor), string(record.Subject)), string(record.Input)),
-		}))
+		}), requesterRefs(record)...)
 	}
 	if opts.QuoteOutput && len(record.Output) > 0 {
 		b.add(RoleDetail, "dispatch.detail.output", withArgs(args, Args{
 			"output": b.quote(AttributedToExecutor,
 				firstNonEmpty(string(record.ClaimantActor), string(record.ClaimantSubject)), string(record.Output)),
-		}))
+		}), reporterRefs(record)...)
 	}
 	return b.finish()
 }
@@ -267,7 +305,7 @@ func (b *builder) dispatchNext(record fleet.ActionRecord, args Args) {
 	}
 	for _, reason := range []string{"lease_live", "lease_lapsed", "deadline_passed"} {
 		if blocked[reason] {
-			b.add(RoleBlocked, "dispatch.blocked."+reason, withArgs(args, left))
+			b.add(RoleBlocked, "dispatch.blocked."+reason, withArgs(args, left), claimantRefs(record)...)
 		}
 	}
 	if record.State == fleet.DispatchQueued && !deadlinePassed {
@@ -304,7 +342,7 @@ func (r *Renderer) ActionHistory(transitions []fleet.ActionTransition, opts Opti
 		admission := isAdmission(t.Record)
 		edge, ok := findEdge(prev, string(t.Record.State), t.Kind, admission)
 		args := b.actionArgs(t.Record)
-		refs := []Ref{{Kind: "transition", ID: opaqueID(t.ID)}}
+		refs := []Ref{{Kind: "transition", ID: string(t.ID)}}
 		if !ok {
 			b.add(RoleHistory, "dispatch.transition.unrecognized", withArgs(args, Args{
 				"kind": b.quote(AttributedToRecord, "", t.Kind),
@@ -323,7 +361,7 @@ func (r *Renderer) ActionHistory(transitions []fleet.ActionTransition, opts Opti
 				bytes.Equal(transitions[j].Record.ID, id) &&
 				transitions[j].Record.Version > transitions[j-1].Record.Version &&
 				transitions[j].Record.State == fleet.DispatchClaimed {
-				refs = append(refs, Ref{Kind: "transition", ID: opaqueID(transitions[j].ID)})
+				refs = append(refs, Ref{Kind: "transition", ID: string(transitions[j].ID)})
 				j++
 			}
 			if run := j - i; run > 1 {
@@ -331,6 +369,7 @@ func (r *Renderer) ActionHistory(transitions []fleet.ActionTransition, opts Opti
 				var claimants []Fragment
 				seen := map[string]bool{}
 				for _, c := range transitions[i:j] {
+					refs = append(refs, claimantRefs(c.Record)...)
 					name := firstNonEmpty(string(c.Record.ClaimantActor), string(c.Record.ClaimantSubject))
 					if name == "" || seen[name] {
 						continue
@@ -353,6 +392,12 @@ func (r *Renderer) ActionHistory(transitions []fleet.ActionTransition, opts Opti
 		}
 		if edge.Name == "cancel" && t.Record.ClaimFence > 0 {
 			edge = Edge{Name: "cancel_lapsed"}
+		}
+		switch edge.Name {
+		case "enqueue", "admit", "deny":
+			refs = append(refs, requesterRefs(t.Record)...)
+		case "claim", "reclaim", "complete", "fail":
+			refs = append(refs, claimantRefs(t.Record)...)
 		}
 		extra := Args{}
 		if edge.Name == "fail" {

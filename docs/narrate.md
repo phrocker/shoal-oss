@@ -26,8 +26,9 @@ type Sentence struct {
     Key      string   // the catalog message it was realized from
     Text     string
     RecordID string   // "<kind>:<id>"
-    Refs     []Ref    // evidence and records it was derived from
+    Refs     []Ref    // evidence, records and principals it was derived from
     Quotes   []Quote  // the untrusted spans inside Text, in order
+    Spans    []Span   // byte offsets of every quoted span and bare identifier
 }
 ```
 
@@ -42,6 +43,15 @@ per-answer sentences (`Options.MaxAnswers`).
 as caller-chosen action-ID bytes, is written as `hex:` and its bytes, so a
 reference can be printed safely and still resolved.
 
+A sentence that names a principal or a claim carries it as a reference: the
+requester (`principal`, `request`), the approver (`principal`, and the
+decision's `request`), the claimant (`principal`, `claim`), the decision
+requester (`principal`, `release`, `correlation`) and the asserting caller.
+
+`Spans` marks every bare identifier (`identifier`) and every quoted span
+(`quote`) by byte offset, so a reader can style record data apart from the
+catalog's words — an agent named `approved` is then visibly an identifier.
+
 ## The message catalog
 
 The catalog is data: [`pkg/narrate/catalog/en.json`](../pkg/narrate/catalog/en.json),
@@ -52,7 +62,7 @@ with `ParseCatalog`; no Go changes.
 {
   "locale": "en",
   "formats": { "time": "2006-01-02 15:04:05 UTC", "group": ",", "decimal": "." },
-  "messages": { "dispatch.error.outcome_unknown": "The executor reported …" }
+  "messages": { "dispatch.error.outcome_unknown": "The failure was reported as …" }
 }
 ```
 
@@ -68,7 +78,7 @@ plural categories come from `golang.org/x/text/feature/plural`, already in
 | `{name}` | a rendered fragment, number, time or duration |
 | `{n, number}` | integer (grouped per locale) or a probability |
 | `{t, time}` | always converted to UTC and formatted with the locale's layout; a zero time is "an unrecorded time" |
-| `{d, duration}` | the two most significant units, truncated toward zero |
+| `{d, duration}` | the two most significant units, truncated toward zero; a negative duration is refused, not printed as its magnitude |
 | `{xs, list}`, `{xs, list, or}` | joined with the locale's list patterns |
 | `{n, plural, =0 {…} one {# …} other {# …}}` | CLDR plural rules of the locale |
 | `{s, select, a {…} other {…}}` | a closed-set selector |
@@ -87,17 +97,28 @@ a template. It is enforced three ways:
 
 - **At load.** `ParseCatalog` refuses a catalog that lacks any key in
   `RequiredKeys()`, carries an extra key, has a pattern that does not parse, or
-  reads an argument the English message does not read (or reads it as a
-  different kind). A translation therefore cannot fall back to an unreviewed
-  sentence at run time.
+  reads an argument the English message does not read, or reads it as a kind
+  the renderer does not supply. A plural is allowed only where English reads
+  that argument as a plural, because `number` also carries probabilities and a
+  float cannot select a plural form. A translation therefore cannot fall back
+  to an unreviewed sentence, or fail, at run time.
 - **Parity with source.** The vocabularies are read from their owners' source
   by AST, never from this package's lists: `DispatchState`, `ApprovalState`,
   `ApprovalCondition`, the kinds `NewActionTransition` accepts and every
-  literal assigned to an `ErrorCode` in `pkg/explorer/fleet`; `ResultStatus`,
+  value assigned to an `ErrorCode` in `pkg/explorer/fleet` (literals and
+  constants; any other expression fails the test, except a copy of another
+  `ErrorCode` field); `ResultStatus`,
   `AnswerStatus`, `AnswerKind`, `Disposition` and `InspectionReason` in
   `pkg/decision`; the error-code constants of `internal/effectsgateway`; and the
   `terminal(…)` reasons of `internal/decisionservice`. The status table in
-  [approval.md](approval.md#status-reports-the-effective-state) is parsed too.
+  [approval.md](approval.md#status-reports-the-effective-state) is parsed too,
+  and so is `ApprovalService.effectiveState` itself: the (state, condition)
+  pairs it can return, with `current.State` and the `unreachable` conditions
+  resolved, must equal `EffectiveApprovals`. Every state fleet sets a record to
+  must be the destination of a `DispatchEdges` edge, and every edge's kind must
+  be the one `actionEventKind` gives its destination. Constants are read whether
+  declared with their type (`X T = "x"`) or converted (`X = T("x")`), and a
+  constant of the type the reader cannot evaluate fails the test.
   Adding a value in any of those places without a template here fails
   `TestParity*` and `TestCoverage*`.
 - **By rendering.** `TestCoverage*` renders a record for every value read from
@@ -129,6 +150,24 @@ An `ErrorCode` outside the gateway and fleet sets is the executor's own text:
 an executor may record any bounded string. It is quoted, attributed to the
 executor, and its next step is to reconcile with the target. The same holds for
 a predictor's own whole-request or per-answer reason.
+
+### Reports are not findings
+
+Fleet checks only an `ErrorCode`'s length and whitespace, so an executor can
+report any code, including a gateway code or one fleet itself writes
+(`invalid_executor_output`, `executor_error`). The record does not say who
+assigned it. Every error sentence is therefore phrased as a report — "The
+failure was reported as outcome_unknown, which, if accurate, means …" — and
+never states a gateway or fleet meaning as fact. Retry advice is derived only
+from the record's `EffectPossible` and state: while an effect is possible, the
+next step is always to reconcile with the target, whatever the code says.
+
+Likewise, the decision service writes its own whole-request reasons and passes
+a predictor's through unchanged. A whole-request abstention or failure reason
+is attributed to "the predictor or the service" (`predictor_or_service` on a
+quote), its meaning is conditional ("if accurate"), and its next step starts
+"If …". A success is "reported as succeeded by" the claimant, or the admitted
+caller for an admission.
 
 ## State machines
 
@@ -166,7 +205,8 @@ three constructors:
 
 A quoted span is attributed in the sentence ("Input supplied by alice: “…”",
 "alice asserted the reason code “…”; Shoal records this but does not verify
-it") and in its `Quote` (`Attribution`, `By`). Inside it a backslash is
+it") and in its `Quote` (`Attribution`, `By`). `By` is a principal ID from the
+record, so it is escaped by the same rules and bounded to 64 runes. Inside it a backslash is
 doubled; the quotation marks, the ASCII quote and the ellipsis are escaped;
 every non-printable rune (controls, newlines, bidirectional and other format
 characters, separators other than the ASCII space, private-use and unassigned
@@ -182,7 +222,15 @@ newlines, carriage returns, closing quotes, template syntax, bidi overrides,
 zero-width and tag characters, separators, controls, invalid UTF-8, combining
 marks, fake ellipses and escape look-alikes, private-use code points and
 28 KB strings, and requires the same sentences, roles and keys, identical text
-outside the quoted spans, and no unprintable character anywhere.
+outside the quoted spans, no unprintable character anywhere (including in
+`Quote.By`), spans that cut the text where they say, and token-only record and
+reference IDs.
+
+The renderer reads no clock. `TestNoModelNetworkOrClock` pins the package's
+direct imports, refuses `time` imported under any other name, and resolves
+selectors by import path to deny `Now`, `Since`, `Until`, `After`, `Tick`,
+`NewTimer`, `NewTicker`, `AfterFunc`, `Sleep`, `LoadLocation`, `Local` and
+`t.Local()`.
 
 ## Follow-ups
 
@@ -190,9 +238,12 @@ outside the quoted spans, and no unprintable character anywhere.
   `ActionRecord` on main; aggregation uses the claim fence. When attempt
   history lands (#438/#430), add an `ActionRecord` history sentence per
   attempt.
-- `ErrorCode` does not say which executor reported it. The gateway's meanings
-  are applied to its codes whatever reported them, and fleet-written codes are
-  phrased as "recorded as"; an executor could report either verbatim.
+- Neither `ErrorCode` nor a decision result records who assigned the code or
+  reason. Once fleet and the decision service record that, codes Shoal itself
+  assigned can be narrated as Shoal's determinations.
+- The source state of each `DispatchEdges` edge is checked against fleet's
+  guards by review, not by test: the guards are spread through fleet's
+  services. A transition table exported by fleet would let the test check them.
 - Decision-service reasons are string literals in `internal/decisionservice`;
   exporting them as constants would let this package reference them directly.
 - Only English ships. Wording should be reviewed by someone outside the

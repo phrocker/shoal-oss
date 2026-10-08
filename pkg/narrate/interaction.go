@@ -21,7 +21,7 @@ func (r *Renderer) AssertedReason(session interaction.Session, opts Options) ([]
 		return b.finish()
 	}
 	by := firstNonEmpty(string(session.Actor.ActorID), string(session.Actor.SubjectID))
-	var refs []Ref
+	refs := principalRef(string(session.Actor.ActorID), string(session.Actor.SubjectID))
 	if reason.DetailDigest != "" {
 		refs = append(refs, Ref{Kind: "detail_digest", ID: reason.DetailDigest})
 	}

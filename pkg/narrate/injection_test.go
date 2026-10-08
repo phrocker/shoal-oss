@@ -59,6 +59,12 @@ func injectionTargets() map[string]renderFn {
 			record.Input, record.Output = json.RawMessage(v), json.RawMessage(raw)
 			return r.Action(record, Options{QuoteInput: true, QuoteOutput: true})
 		},
+		"quote attribution": func(t *testing.T, v string) ([]Sentence, error) {
+			record := action(fleet.DispatchSucceeded)
+			record.Actor, record.Subject = shoal.ID(v), shoal.ID(v)
+			record.ClaimantActor, record.ClaimantSubject = shoal.ID(v), shoal.ID(v)
+			return r.Action(record, Options{QuoteInput: true, QuoteOutput: true})
+		},
 		"executor error code": func(t *testing.T, v string) ([]Sentence, error) {
 			record := action(fleet.DispatchFailed)
 			record.ErrorCode = v
@@ -214,6 +220,41 @@ func checkSentence(t *testing.T, s Sentence) {
 		if s.Quotes[i].Attribution == "" {
 			t.Errorf("%s: quote has no attribution", s.Key)
 		}
+		by := s.Quotes[i].By
+		if !utf8.ValidString(by) || utf8.RuneCountInString(by) > 12*maxByRunes {
+			t.Errorf("%s: quote attribution %q is not bounded", s.Key, by)
+		}
+		for _, r := range by {
+			if r != ' ' && !unicode.IsPrint(r) {
+				t.Errorf("%s: unprintable %U in quote attribution %q", s.Key, r, by)
+			}
+		}
+	}
+	// Spans cover every quote and every bare identifier, in order, without
+	// overlap, at offsets that cut the text where they say.
+	quotesSeen, end := 0, 0
+	for _, span := range s.Spans {
+		if span.Start < end || span.End <= span.Start || span.End > len(s.Text) {
+			t.Fatalf("%s: span %+v is out of order or range in %q", s.Key, span, s.Text)
+		}
+		end = span.End
+		region := s.Text[span.Start:span.End]
+		switch span.Kind {
+		case SpanQuote:
+			if quotesSeen >= len(spans) || region != spans[quotesSeen] {
+				t.Errorf("%s: quote span %q does not match the quotation", s.Key, region)
+			}
+			quotesSeen++
+		case SpanIdentifier:
+			if !safeToken(region) {
+				t.Errorf("%s: identifier span %q is not a token", s.Key, region)
+			}
+		default:
+			t.Errorf("%s: span kind %q", s.Key, span.Kind)
+		}
+	}
+	if quotesSeen != len(s.Quotes) {
+		t.Errorf("%s: %d quote spans for %d quotes", s.Key, quotesSeen, len(s.Quotes))
 	}
 	// Outside the spans, nothing a record supplied: only catalog text,
 	// numbers, times and plain tokens.

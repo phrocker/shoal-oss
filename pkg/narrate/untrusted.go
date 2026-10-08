@@ -19,6 +19,7 @@ import (
 type Fragment struct {
 	text   string
 	quotes []Quote
+	spans  []Span
 }
 
 // Attribution names who a quoted span came from. The catalog's sentence says
@@ -32,21 +33,48 @@ const (
 	AttributedToExecutor Attribution = "executor"
 	// AttributedToPredictor is text a decision predictor returned.
 	AttributedToPredictor Attribution = "predictor"
+	// AttributedToPredictorOrService is a whole-request decision reason:
+	// the decision service writes its own, and passes a predictor's through,
+	// and the record does not say which.
+	AttributedToPredictorOrService Attribution = "predictor_or_service"
 	// AttributedToEvidenceBuilder is text a picture's builder recorded.
 	AttributedToEvidenceBuilder Attribution = "evidence_builder"
 	// AttributedToCaller is a caller-asserted reason, never verified.
 	AttributedToCaller Attribution = "caller"
-	// AttributedToRecord is an identifier or label stored on a record that
-	// cannot be shown bare.
+	// AttributedToRecord is an identifier or label stored on a record.
 	AttributedToRecord Attribution = "record"
 )
+
+// SpanKind says what a marked region of a sentence holds.
+type SpanKind string
+
+const (
+	// SpanQuote is an untrusted quoted span, delimiters included.
+	SpanQuote SpanKind = "quote"
+	// SpanIdentifier is a stored identifier shown bare: an agent, action,
+	// principal, subject, label or unit. It is record data, not catalog
+	// wording, even when it happens to spell a word.
+	SpanIdentifier SpanKind = "identifier"
+)
+
+// Span marks a region of Sentence.Text by byte offsets, so a reader can
+// style record data apart from the catalog's words.
+type Span struct {
+	Kind        SpanKind
+	Start, End  int
+	Attribution Attribution
+	// By is the principal a quote is attributed to, escaped and bounded as
+	// Quote.By is.
+	By string
+}
 
 // Quote is one untrusted span inside a sentence. Text is exactly what appears
 // between the quotation marks in the sentence: escaped and bounded.
 type Quote struct {
 	Attribution Attribution
 	// By is the principal the span is attributed to, when one is known. It is
-	// data for the reader; the sentence shows it through the same rules.
+	// escaped by the same rules as Text and bounded to maxByRunes runes, so a
+	// principal ID cannot carry a line break or bidi override to a reader.
 	By        string
 	Text      string
 	Truncated bool
@@ -60,6 +88,8 @@ const (
 	DefaultQuoteRunes = 120
 	// maxQuoteRunes is the hard ceiling whatever Options says.
 	maxQuoteRunes = 2048
+	// maxByRunes bounds Quote.By.
+	maxByRunes = 64
 	// maxIdentifierBytes bounds an identifier shown bare.
 	maxIdentifierBytes = 64
 	// maxRecordIDBytes bounds a record ID kept as a token in RecordID and
@@ -82,8 +112,27 @@ const (
 //   - bytes that are not UTF-8 are written as \x escapes.
 //
 // At most limit runes of the value are shown; a longer value ends with an
-// unescaped ellipsis and is marked Truncated.
+// unescaped ellipsis and is marked Truncated. by gets the same treatment.
 func quoted(attribution Attribution, by, value string, limit int) Fragment {
+	text, truncated := escapeSpan(value, limit)
+	safeBy := ""
+	if by != "" {
+		safeBy, _ = escapeSpan(by, maxByRunes)
+	}
+	full := string(openQuote) + text + string(closeQuote)
+	return Fragment{
+		text: full,
+		quotes: []Quote{{
+			Attribution: attribution, By: safeBy, Text: text, Truncated: truncated,
+		}},
+		spans: []Span{{
+			Kind: SpanQuote, Start: 0, End: len(full), Attribution: attribution, By: safeBy,
+		}},
+	}
+}
+
+// escapeSpan applies the rules above, showing at most limit runes.
+func escapeSpan(value string, limit int) (string, bool) {
 	if limit <= 0 {
 		limit = DefaultQuoteRunes
 	}
@@ -133,12 +182,7 @@ func quoted(attribution Attribution, by, value string, limit int) Fragment {
 	if truncated {
 		text += string(ellipsis)
 	}
-	return Fragment{
-		text: string(openQuote) + text + string(closeQuote),
-		quotes: []Quote{{
-			Attribution: attribution, By: by, Text: text, Truncated: truncated,
-		}},
-	}
+	return text, truncated
 }
 
 // safeToken reports whether an identifier may be shown bare: short, starting
@@ -167,11 +211,14 @@ func tokenOf(s string, limit int) bool {
 }
 
 // ident presents a stored identifier or registered name. A safe token is shown
-// bare; anything else is quoted exactly as untrusted text is, attributed to
-// the record.
+// bare and marked as an identifier span, so a reader can tell it from the
+// catalog's words even when it spells one; anything else is quoted exactly as
+// untrusted text is, attributed to the record.
 func ident(value string, limit int) Fragment {
 	if safeToken(value) {
-		return Fragment{text: value}
+		return Fragment{text: value, spans: []Span{{
+			Kind: SpanIdentifier, Start: 0, End: len(value), Attribution: AttributedToRecord,
+		}}}
 	}
 	return quoted(AttributedToRecord, "", value, limit)
 }

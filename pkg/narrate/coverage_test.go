@@ -390,7 +390,7 @@ func TestCoverageEveryKeyIsReachable(t *testing.T) {
 	}
 	coverFallbacks(t, r)
 	// Formatting paths.
-	for _, d := range []time.Duration{0, time.Millisecond, 49 * time.Hour, 90 * time.Minute, 61 * time.Second, -time.Minute} {
+	for _, d := range []time.Duration{0, time.Millisecond, 49 * time.Hour, 90 * time.Minute, 61 * time.Second} {
 		if _, err := r.catalog.duration(d); err != nil {
 			t.Fatal(err)
 		}

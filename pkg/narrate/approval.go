@@ -80,10 +80,8 @@ func (r *Renderer) Approval(status fleet.ApprovalStatus, opts Options) ([]Senten
 	}
 
 	// History, one sentence per transition the record attests.
-	var requestRefs, decisionRefs []Ref
-	if request.RequestID != "" {
-		requestRefs = append(requestRefs, Ref{Kind: "request", ID: string(request.RequestID)})
-	}
+	requestRefs := requesterRefs(request)
+	decisionRefs := principalRef(string(record.ApproverActor), string(record.ApproverSubject))
 	b.add(RoleHistory, "approval.transition.requested", args, requestRefs...)
 	if record.DecisionRequestID != "" {
 		decisionRefs = append(decisionRefs, Ref{Kind: "request", ID: string(record.DecisionRequestID)})

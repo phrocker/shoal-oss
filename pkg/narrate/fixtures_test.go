@@ -250,6 +250,15 @@ func dump(sentences []Sentence) string {
 			}
 			b.WriteString("\n")
 		}
+		var ids []string
+		for _, span := range s.Spans {
+			if span.Kind == SpanIdentifier {
+				ids = append(ids, s.Text[span.Start:span.End])
+			}
+		}
+		if len(ids) > 0 {
+			b.WriteString("  identifiers " + strings.Join(ids, " ") + "\n")
+		}
 	}
 	return b.String()
 }

@@ -1,0 +1,283 @@
+// Licensed to the Apache Software Foundation (ASF) under one or more
+// contributor license agreements. See the NOTICE file distributed with this
+// work for additional information regarding copyright ownership.
+
+package narrate
+
+import (
+	"encoding/json"
+	"math"
+	"sort"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/phrocker/shoal-oss/pkg/explorer/fleet"
+	"github.com/phrocker/shoal-oss/pkg/interaction"
+	"github.com/phrocker/shoal-oss/pkg/shoal"
+)
+
+// Each source analyzer is run against synthetic code that hides a value the
+// way a later change might, so a reader that misses the form fails here.
+
+func TestAnalyzerTypedConstsReadsConversions(t *testing.T) {
+	got, problems := typedConstsIn(parseSource(t, `package p
+type T string
+const (
+	A T = "a"
+	B   = T("b")
+	C   = "untyped, not T"
+)
+const D = T("d")
+`), "T")
+	if len(problems) != 0 || len(got) != 3 || got["A"] != "a" || got["B"] != "b" || got["D"] != "d" {
+		t.Fatalf("got %v, problems %v", got, problems)
+	}
+	_, problems = typedConstsIn(parseSource(t, `package p
+type T string
+const base = "x"
+const E T = base + "y"
+`), "T")
+	if len(problems) != 1 {
+		t.Fatalf("an unreadable constant was skipped: %v", problems)
+	}
+}
+
+func TestAnalyzerErrorCodesResolvesConstants(t *testing.T) {
+	codes, problems := errorCodesIn(parseSource(t, `package p
+type R struct{ ErrorCode string }
+const held = "held_by_const"
+type Code string
+const typed Code = "typed_const"
+func f(r, other *R) {
+	r.ErrorCode = "literal"
+	r.ErrorCode = held
+	r.ErrorCode = string(typed)
+	r.ErrorCode = other.ErrorCode
+	_ = R{ErrorCode: held}
+}
+`))
+	sort.Strings(codes)
+	if strings.Join(codes, ",") != "held_by_const,literal" {
+		t.Errorf("codes %v", codes)
+	}
+	// string(typed) is a conversion of a constant through a call: unresolvable.
+	if len(problems) != 1 {
+		t.Errorf("problems %v", problems)
+	}
+	_, problems = errorCodesIn(parseSource(t, `package p
+type R struct{ ErrorCode string }
+func f(r *R, x string) {
+	r.ErrorCode = x
+	r.ErrorCode = "a" + x
+	_ = R{ErrorCode: x}
+}
+`))
+	if len(problems) != 3 {
+		t.Errorf("unresolvable assignments were not reported: %v", problems)
+	}
+}
+
+func TestAnalyzerClockCannotBeHidden(t *testing.T) {
+	for name, src := range map[string]string{
+		"direct":     `package p; import "time"; func f() { _ = time.Now() }`,
+		"alias":      `package p; import clock "time"; func f() { _ = clock.Date(1, 1, 1, 0, 0, 0, 0, clock.UTC) }`,
+		"alias call": `package p; import clock "time"; func f() { _ = clock.Now() }`,
+		"dot":        `package p; import . "time"; func f() { _ = Now() }`,
+		"since":      `package p; import "time"; func f(t time.Time) { _ = time.Since(t) }`,
+		"timer":      `package p; import "time"; func f() { _ = time.NewTimer(1) }`,
+		"afterfunc":  `package p; import "time"; func f() { time.AfterFunc(1, nil) }`,
+		"ticker":     `package p; import "time"; func f() { _ = time.NewTicker(1) }`,
+		"zone":       `package p; import "time"; func f() { _, _ = time.LoadLocation("x") }`,
+		"local var":  `package p; import "time"; func f() { _ = time.Local }`,
+		"to local":   `package p; import "time"; func f(t time.Time) { _ = t.Local() }`,
+	} {
+		if v := clockViolations(parseSource(t, src)); len(v) == 0 {
+			t.Errorf("%s: clock read not detected", name)
+		}
+	}
+	clean := `package p; import "time"; func f(t time.Time) { _ = time.Date(1, 1, 1, 0, 0, 0, 0, time.UTC); _ = t.UTC() }`
+	if v := clockViolations(parseSource(t, clean)); len(v) != 0 {
+		t.Errorf("clean source flagged: %v", v)
+	}
+	// Selectors resolve by import path, not by the name at the call site: a
+	// different package imported under the name "time" is not the clock, and
+	// the time package under any other name is refused by the alias rule and
+	// resolved by path as well.
+	other := `package p; import time "example.com/notclock"; func f() { _ = time.Now() }`
+	if v := clockViolations(parseSource(t, other)); len(v) != 0 {
+		t.Errorf("selector resolved by name, not path: %v", v)
+	}
+	if v := clockViolations(parseSource(t, `package p; import clock "time"; func f() { _ = clock.Now() }`)); len(v) != 2 {
+		t.Errorf("aliased clock read should be refused twice (alias and call): %v", v)
+	}
+}
+
+func TestAnalyzerEffectiveStatePicksUpNewPairs(t *testing.T) {
+	src := `package p
+type ApprovalState string
+type ApprovalCondition string
+const (
+	Pending ApprovalState = "pending"
+	Refused ApprovalState = "refused"
+	Held ApprovalState = "held"
+	Unresolvable ApprovalState = "unresolvable"
+)
+const (
+	None ApprovalCondition = ""
+	Moved ApprovalCondition = "moved"
+	Stuck ApprovalCondition = "stuck"
+)
+type S struct{}
+func (s *S) unreachable() (ApprovalCondition, error) {
+	if true { return Moved, nil }
+	return None, nil
+}
+func (s *S) effectiveState(current struct{ State ApprovalState }) (ApprovalState, ApprovalCondition, error) {
+	switch current.State {
+	case Refused:
+		return current.State, None, nil
+	case Held:
+		return Held, Stuck, nil
+	}
+	condition, err := s.unreachable()
+	if err != nil { return "", "", err }
+	if condition != None { return Unresolvable, condition, nil }
+	return current.State, None, nil
+}
+`
+	pairs, problems := effectiveStatePairs(parseSource(t, src))
+	var got []string
+	for _, p := range pairs {
+		got = append(got, p[0]+"/"+p[1])
+	}
+	sort.Strings(got)
+	if len(problems) != 0 || strings.Join(got, ",") != "held/stuck,pending/,refused/,unresolvable/moved" {
+		t.Errorf("pairs %v, problems %v", got, problems)
+	}
+}
+
+func TestAnalyzerDispatchDestinations(t *testing.T) {
+	destinations, kinds, problems := dispatchDestinations(parseSource(t, `package p
+type DispatchState string
+const (
+	DispatchQueued DispatchState = "queued"
+	DispatchHeld   DispatchState = "held"
+)
+type R struct{ State DispatchState }
+func f(r *R, x DispatchState) {
+	r.State = DispatchHeld
+	_ = R{State: DispatchQueued}
+}
+func actionEventKind(r R) string {
+	switch r.State {
+	case DispatchQueued:
+		return "action.enqueued"
+	}
+	return ""
+}
+`))
+	if len(problems) != 0 || !destinations["held"] || !destinations["queued"] || kinds["queued"] != "action.enqueued" {
+		t.Errorf("destinations %v kinds %v problems %v", destinations, kinds, problems)
+	}
+}
+
+// Engine edge cases.
+
+func TestEngineExtremes(t *testing.T) {
+	if got := format(t, "{n, plural, one {#} other {# x}}", Args{"n": int64(math.MinInt64)}); got != "-9,223,372,036,854,775,808 x" {
+		t.Errorf("MinInt64 plural: %q", got)
+	}
+	if got := format(t, "{n, number}", Args{"n": int64(math.MinInt64)}); got != "-9,223,372,036,854,775,808" {
+		t.Errorf("MinInt64 number: %q", got)
+	}
+	if got := format(t, "{n, plural, one {one} other {other}}", Args{"n": int64(-1)}); got != "one" {
+		t.Errorf("-1 plural: %q", got)
+	}
+	c := English()
+	for _, d := range []time.Duration{-time.Nanosecond, -time.Hour, math.MinInt64} {
+		if _, err := c.duration(d); err == nil {
+			t.Errorf("negative duration %d rendered", d)
+		}
+	}
+	// A record carrying a negative lease is refused, not misstated.
+	record := action(fleet.DispatchClaimed)
+	record.ClaimLease = -time.Minute
+	if _, err := New(nil).Action(record, Options{}); err == nil {
+		t.Error("a negative lease was narrated")
+	}
+}
+
+func TestCatalogRefusesPluralOnProbability(t *testing.T) {
+	var file CatalogFile
+	if err := json.Unmarshal(englishCatalog, &file); err != nil {
+		t.Fatal(err)
+	}
+	file.Messages["decision.answer.probability"] = "For {subject}, {question}: {p, plural, one {#} other {#}}."
+	if _, err := ParseCatalog(mustJSON(t, file)); err == nil {
+		t.Error("a plural over a probability was accepted")
+	}
+	// A count read as a number is still fine.
+	file.Messages["decision.answer.probability"] = "For {subject}, {question}: {p, number}."
+	file.Messages["dispatch.history.claims"] = "{claims, number} claims, {lapsed, number} lapsed."
+	if _, err := ParseCatalog(mustJSON(t, file)); err != nil {
+		t.Errorf("a count read as a number was refused: %v", err)
+	}
+}
+
+// Quote.By and identifier spans.
+
+func TestQuoteByIsEscapedAndBounded(t *testing.T) {
+	by := "mallory‮\n\x1b[31m" + strings.Repeat("x", 500)
+	fr := quoted(AttributedToCaller, by, "v", 0)
+	got := fr.quotes[0].By
+	if strings.ContainsAny(got, "‮\n\x1b") || len([]rune(got)) > maxByRunes+20 {
+		t.Errorf("By not escaped or bounded: %q", got)
+	}
+	if fr.spans[0].By != got {
+		t.Errorf("span By %q differs from quote By %q", fr.spans[0].By, got)
+	}
+	sentences, err := New(nil).AssertedReason(interaction.Session{
+		ID:                   "s",
+		Actor:                interaction.ActorContext{ActorID: shoal.ID(by)},
+		CallerAssertedReason: interaction.CallerAssertedReason{Code: "c"},
+	}, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range sentences {
+		checkSentence(t, s)
+	}
+}
+
+func TestIdentifierSpans(t *testing.T) {
+	record := action(fleet.DispatchQueued)
+	record.Actor, record.Action = "approved", "Nothing"
+	sentences, err := New(nil).Action(record, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := map[string]bool{}
+	for _, s := range sentences {
+		checkSentence(t, s)
+		for _, span := range s.Spans {
+			if span.Kind == SpanIdentifier {
+				found[s.Text[span.Start:span.End]] = true
+			}
+		}
+	}
+	for _, id := range []string{"approved", "Nothing", "agent-7"} {
+		if !found[id] {
+			t.Errorf("identifier %q has no span (found %v)", id, found)
+		}
+	}
+}
+
+func mustJSON(t *testing.T, v any) []byte {
+	t.Helper()
+	data, err := json.Marshal(v)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return data
+}

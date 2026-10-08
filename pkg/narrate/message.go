@@ -311,20 +311,27 @@ func argUses(nodes []node, into map[string]map[string]bool) {
 
 // compatibleUse reports whether a translation may read an argument as kind,
 // given the kinds the English message reads it as. The English message is
-// the contract for what the renderer passes: the same kind is always
-// compatible, a count may be read as a number or a plural, and a simple
-// reference accepts anything except a list or a selector.
+// the contract for what the renderer passes:
+//
+//   - the same kind is always compatible;
+//   - an argument English reads as a plural is an integer, so a translation
+//     may also read it as a number;
+//   - a plural is allowed only where English reads the argument as a plural,
+//     because "number" also carries probabilities, and a float cannot select
+//     a plural form;
+//   - a simple reference prints any value except a list or a selector.
 func compatibleUse(kind string, english map[string]bool) bool {
 	if english[kind] {
 		return true
 	}
-	count := func(k string) bool { return k == "number" || k == "plural" }
-	for e := range english {
-		switch {
-		case count(kind) && count(e):
-			return true
-		case kind == "" && e != "list" && e != "select":
-			return true
+	switch kind {
+	case "number":
+		return english["plural"]
+	case "":
+		for e := range english {
+			if e != "list" && e != "select" {
+				return true
+			}
 		}
 	}
 	return false
@@ -334,6 +341,7 @@ type formatter struct {
 	catalog *Catalog
 	out     strings.Builder
 	quotes  []Quote
+	spans   []Span
 }
 
 func (f *formatter) run(nodes []node, args Args, count *string, depth int) error {
@@ -415,8 +423,14 @@ func asInt(value any) (int64, bool) {
 }
 
 func (f *formatter) fragment(fr Fragment) {
+	offset := f.out.Len()
 	f.out.WriteString(fr.text)
 	f.quotes = append(f.quotes, fr.quotes...)
+	for _, span := range fr.spans {
+		span.Start += offset
+		span.End += offset
+		f.spans = append(f.spans, span)
+	}
 }
 
 func (f *formatter) argument(n argNode, value any, depth int) error {
