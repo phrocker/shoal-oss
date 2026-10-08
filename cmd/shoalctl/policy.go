@@ -179,7 +179,7 @@ func planAgainstLive(
 	if err != nil {
 		return nil, atpl.Plan{}, err
 	}
-	return policy, atpl.Diff(policy, live), nil
+	return policy, atpl.Diff(policy, live, client.registry), nil
 }
 
 func runPolicyPlan(args []string, stdout, stderr io.Writer) error {
@@ -242,6 +242,28 @@ func runPolicyApply(args []string, stdout, stderr io.Writer) error {
 	fmt.Fprintf(stdout, "policy digest: %s\n", policy.Digest())
 	for i, entry := range writes {
 		descriptor, err := client.register(ctx, policy.Digest(), entry)
+		var refused *registryError
+		if err != nil && entry.Kind.Updates() && errors.As(err, &refused) &&
+			refused.code == string(shoal.ErrorConflict) {
+			// The generation moved between the read and this write. A
+			// heartbeat does that without changing anything the policy
+			// governs, so re-read, and retry once only if the content the plan
+			// was reviewed against is still what is live.
+			current, readErr := client.resolve(ctx, entry.ID)
+			if readErr != nil {
+				return fmt.Errorf("%s: %w; re-reading after it: %v; stopped after %d of %d writes",
+					agentLabel(entry.ID), err, readErr, i, len(writes))
+			}
+			if atpl.ContentDigest(current) != entry.LiveContent {
+				return fmt.Errorf("%s: %w, and its live content changed since the plan; "+
+					"re-run policy plan; stopped after %d of %d writes",
+					agentLabel(entry.ID), err, i, len(writes))
+			}
+			fmt.Fprintf(stdout, "%s: generation moved from %d to %d with no change to its content; retrying once\n",
+				agentLabel(entry.ID), entry.LiveGeneration, current.Generation)
+			entry.LiveGeneration = current.Generation
+			descriptor, err = client.register(ctx, policy.Digest(), entry)
+		}
 		if err != nil {
 			return fmt.Errorf("%s: %w; stopped after %d of %d writes",
 				agentLabel(entry.ID), err, i, len(writes))
@@ -289,7 +311,7 @@ func runPolicyExport(args []string, stdout, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
-	document, err := atpl.Export(live, executors)
+	document, err := atpl.Export(live, executors, time.Now())
 	if err != nil {
 		return err
 	}
@@ -344,11 +366,10 @@ func agentFileName(id string) string {
 
 func exportFiles(document atpl.Document) ([]exportFile, error) {
 	encode := func(name string, value atpl.Document) (exportFile, error) {
-		data, err := json.MarshalIndent(value, "", "  ")
+		data, err := atpl.Encode(value)
 		if err != nil {
 			return exportFile{}, err
 		}
-		data = append(data, '\n')
 		if len(data) > atpl.MaxFileBytes {
 			return exportFile{}, fmt.Errorf("%s: exported file exceeds %d bytes", name, atpl.MaxFileBytes)
 		}
@@ -379,12 +400,16 @@ func writeExport(directory string, files []exportFile) error {
 	if err := os.MkdirAll(directory, 0o755); err != nil {
 		return err
 	}
-	existing, err := filepath.Glob(filepath.Join(directory, "*"+atpl.FileSuffix))
+	// Read the directory rather than globbing it: a directory name holding
+	// glob metacharacters would make a glob match nothing and the guard pass.
+	entries, err := os.ReadDir(directory)
 	if err != nil {
 		return err
 	}
-	if len(existing) > 0 {
-		return fmt.Errorf("%s already holds policy files; export into an empty directory", directory)
+	for _, entry := range entries {
+		if strings.HasSuffix(entry.Name(), atpl.FileSuffix) {
+			return fmt.Errorf("%s already holds policy files; export into an empty directory", directory)
+		}
 	}
 	for _, file := range files {
 		handle, err := os.OpenFile(filepath.Join(directory, file.name),
@@ -412,12 +437,20 @@ func loadPolicyDirectory(directory string) ([]atpl.Document, error) {
 		return nil, err
 	}
 	var documents []atpl.Document
+	var total int64
 	for _, entry := range entries {
 		if !strings.HasSuffix(entry.Name(), atpl.FileSuffix) {
 			continue
 		}
 		if !entry.Type().IsRegular() {
 			return nil, fmt.Errorf("%s: policy files must be regular files", entry.Name())
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return nil, err
+		}
+		if total += info.Size(); total > atpl.MaxPolicyBytes {
+			return nil, fmt.Errorf("%s holds more than %d bytes of policy files", directory, atpl.MaxPolicyBytes)
 		}
 		if len(documents) == atpl.MaxFiles {
 			return nil, fmt.Errorf("%s holds more than %d policy files", directory, atpl.MaxFiles)
@@ -465,6 +498,7 @@ func isPrintablePathValue(value string) bool {
 
 func printPolicyPlan(output io.Writer, plan atpl.Plan) {
 	fmt.Fprintf(output, "policy digest: %s\n", plan.PolicyDigest)
+	fmt.Fprintf(output, "registry: %s\n", plan.Registry)
 	counts := map[string]int{}
 	for _, entry := range plan.Entries {
 		line := fmt.Sprintf("%s %s %s", entry.Kind.Symbol(), agentLabel(entry.ID), entry.Kind)
@@ -489,9 +523,10 @@ func printPolicyPlan(output io.Writer, plan atpl.Plan) {
 			counts[string(entry.Kind)]++
 		}
 	}
-	fmt.Fprintf(output, "summary: %d create, %d narrow, %d unchanged, %d refused, %d unmanaged\n",
+	fmt.Fprintf(output, "summary: %d create, %d narrow, %d executor-change, %d unchanged, %d refused, %d unmanaged\n",
 		counts[string(atpl.KindCreate)], counts[string(atpl.KindNarrow)],
-		counts[string(atpl.KindUnchanged)], counts["refused"], counts[string(atpl.KindUnmanaged)])
+		counts[string(atpl.KindExecutorChange)], counts[string(atpl.KindUnchanged)],
+		counts["refused"], counts[string(atpl.KindUnmanaged)])
 	fmt.Fprintf(output, "plan digest: %s\n", plan.Digest)
 }
 
@@ -625,9 +660,11 @@ func (w fleetDescriptorWire) decode() (fleet.Descriptor, error) {
 
 // fleetClient reads and writes the fleet registry with a bearer token.
 type fleetClient struct {
-	base  string
-	token string
-	http  *http.Client
+	base string
+	// registry is the normalized endpoint bound into plan digests.
+	registry string
+	token    string
+	http     *http.Client
 }
 
 func newFleetClient(endpoint, tokenFile string) (*fleetClient, error) {
@@ -663,13 +700,30 @@ func newFleetClient(endpoint, tokenFile string) (*fleetClient, error) {
 		return nil, errors.New("token file must hold one bearer token")
 	}
 	return &fleetClient{
-		base: strings.TrimRight(parsed.String(), "/"), token: token,
+		base: strings.TrimRight(parsed.String(), "/"), registry: normalizeEndpoint(parsed),
+		token: token,
 		http: &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error {
 			// Following a redirect would resend the token to wherever it
 			// points.
 			return http.ErrUseLastResponse
 		}},
 	}, nil
+}
+
+// normalizeEndpoint spells one registry one way: lower-case scheme and host,
+// default port dropped, no trailing slash. A plan is bound to this string, so
+// it must not vary with how the operator typed the same URL.
+func normalizeEndpoint(endpoint *url.URL) string {
+	scheme := strings.ToLower(endpoint.Scheme)
+	host := strings.ToLower(endpoint.Hostname())
+	if strings.Contains(host, ":") {
+		host = "[" + host + "]"
+	}
+	if port := endpoint.Port(); port != "" &&
+		!(scheme == "https" && port == "443") && !(scheme == "http" && port == "80") {
+		host += ":" + port
+	}
+	return scheme + "://" + host + strings.TrimRight(endpoint.EscapedPath(), "/")
 }
 
 func loopbackHost(host string) bool {
@@ -771,6 +825,35 @@ func (c *fleetClient) register(ctx context.Context, policyDigest string, entry a
 	return response.decode()
 }
 
+// resolve reads one registration through the resolve route.
+func (c *fleetClient) resolve(ctx context.Context, id shoal.ID) (fleet.Descriptor, error) {
+	requestContext, err := c.context("")
+	if err != nil {
+		return fleet.Descriptor{}, err
+	}
+	requestContext.ReasonCode = "atpl-read"
+	var response fleetDescriptorWire
+	if err := c.post(ctx, "/api/v1/fleet/agents/"+encodeWireID(id)+"/resolve",
+		requestContext, http.StatusOK, &response); err != nil {
+		return fleet.Descriptor{}, err
+	}
+	return response.decode()
+}
+
+// registryError is a refusal the registry answered with.
+type registryError struct {
+	status  int
+	code    string
+	message string
+}
+
+func (e *registryError) Error() string {
+	if e.code == "" {
+		return fmt.Sprintf("registry answered %d", e.status)
+	}
+	return fmt.Sprintf("registry refused (%d %s): %s", e.status, e.code, e.message)
+}
+
 func (c *fleetClient) post(ctx context.Context, route string, input any, want int, output any) error {
 	body, err := json.Marshal(input)
 	if err != nil {
@@ -797,10 +880,10 @@ func (c *fleetClient) post(ctx context.Context, route string, input any, want in
 	}
 	if response.StatusCode != want {
 		var failure fleetErrorWire
-		if json.Unmarshal(data, &failure) == nil && failure.Code != "" {
-			return fmt.Errorf("registry refused (%d %s): %s", response.StatusCode, failure.Code, failure.Message)
+		if json.Unmarshal(data, &failure) != nil {
+			failure = fleetErrorWire{}
 		}
-		return fmt.Errorf("registry answered %d", response.StatusCode)
+		return &registryError{status: response.StatusCode, code: failure.Code, message: failure.Message}
 	}
 	if err := json.Unmarshal(data, output); err != nil {
 		return fmt.Errorf("registry response is not the expected JSON: %w", err)

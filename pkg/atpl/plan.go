@@ -30,8 +30,13 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
-// PlanDigestPrefix namespaces plan digests.
-const PlanDigestPrefix = "atpl:plan:v1:"
+// PlanDigestPrefix namespaces plan digests. v2 binds the registry and live
+// content rather than live generations, which heartbeats move.
+const PlanDigestPrefix = "atpl:plan:v2:"
+
+// LiveDigestPrefix namespaces the digest of a live registration's
+// policy-relevant content.
+const LiveDigestPrefix = "atpl:live:v1:"
 
 // Kind classifies what applying a policy would do to one agent.
 type Kind string
@@ -41,6 +46,11 @@ const (
 	KindCreate Kind = "create"
 	// KindNarrow re-registers a live agent within what it already holds.
 	KindNarrow Kind = "narrow"
+	// KindExecutorChange re-registers a live agent bound to a different
+	// executor, possibly narrowing it too. The registry treats it as an
+	// update like any other, but it changes what runs the agent's actions, so
+	// plan output marks it apart from a narrowing.
+	KindExecutorChange Kind = "executor-change"
 	// KindUnchanged leaves a live agent as it is. Leases are not compared:
 	// they are runtime state that heartbeats maintain.
 	KindUnchanged Kind = "unchanged"
@@ -51,22 +61,25 @@ const (
 	// which the registry denies.
 	KindRefusedParentMigration Kind = "refused-parent-migration"
 	// KindRefusedDelegation would leave a delegation link exceeding its
-	// parent: a write against a parent this plan does not rewrite, or a
-	// rewrite that a live child it does not rewrite would then exceed. The
-	// registry refuses the first and silently hides the child in the second.
+	// parent at some point during or after apply: a write against a parent as
+	// it stands when the write lands, or a rewrite that a live child this plan
+	// does not rewrite would then exceed. The registry refuses the first and
+	// silently hides the child in the second.
 	KindRefusedDelegation Kind = "refused-delegation"
 	// KindUnmanaged is a live agent the policy does not declare. Apply leaves
 	// it alone; it does not revoke.
 	KindUnmanaged Kind = "unmanaged"
 )
 
-// Symbol is the one-character marker plan output uses for the kind.
+// Symbol is the marker plan output uses for the kind.
 func (k Kind) Symbol() string {
 	switch k {
 	case KindCreate:
 		return "+"
 	case KindNarrow:
 		return "~"
+	case KindExecutorChange:
+		return "*"
 	case KindUnchanged:
 		return "="
 	case KindUnmanaged:
@@ -82,7 +95,10 @@ func (k Kind) Refused() bool {
 }
 
 // Writes reports whether apply registers the agent.
-func (k Kind) Writes() bool { return k == KindCreate || k == KindNarrow }
+func (k Kind) Writes() bool { return k == KindCreate || k.Updates() }
+
+// Updates reports whether apply re-registers a live agent.
+func (k Kind) Updates() bool { return k == KindNarrow || k == KindExecutorChange }
 
 // Change is one field-level difference: "+" added, "-" removed, "~" changed.
 type Change struct {
@@ -93,9 +109,16 @@ type Change struct {
 
 // Entry is the plan for one agent.
 type Entry struct {
-	ID             shoal.ID
-	Kind           Kind
+	ID shoal.ID
+	// Depth is the agent's depth in the policy's own delegation forest.
+	Depth int
+	Kind  Kind
+	// LiveGeneration is the generation the plan saw. Apply writes against the
+	// generation it reads when it applies, not this one; see LiveContent.
 	LiveGeneration int64
+	// LiveContent is ContentDigest of the live registration, or "" when there
+	// is none.
+	LiveContent string
 	// Spec is the compiled registration; zero for an unmanaged agent.
 	Spec    fleet.Spec
 	Reason  string
@@ -105,11 +128,14 @@ type Entry struct {
 // Plan is the difference between a compiled policy and the live registry.
 type Plan struct {
 	PolicyDigest string
+	Registry     string
 	Entries      []Entry
-	// Digest identifies the plan: the policy digest and, for every agent,
-	// its kind and the live generation it was computed against. Apply
-	// recomputes it and refuses on a mismatch, so it only ever writes the plan
-	// that was reviewed.
+	// Digest identifies the plan: the policy digest, the registry it was
+	// computed against, each managed agent's kind and live content, and the
+	// IDs of unmanaged agents. Generations, leases and update times are left
+	// out because heartbeats move them without changing anything a policy
+	// governs. Apply recomputes the digest and refuses on a mismatch, so it
+	// only writes a plan whose substance was reviewed.
 	Digest string
 }
 
@@ -124,15 +150,22 @@ func (p Plan) Refusals() []Entry {
 	return result
 }
 
-// Writes returns the entries apply registers, in apply order.
+// Writes returns the entries apply registers, in the order it must register
+// them so that every intermediate state is one the registry resolves: updates
+// deepest first, so a child is narrowed within its parent before the parent
+// narrows past it, then creates parents first.
 func (p Plan) Writes() []Entry {
-	var result []Entry
+	var updates, creates []Entry
 	for _, entry := range p.Entries {
-		if entry.Kind.Writes() {
-			result = append(result, entry)
+		switch {
+		case entry.Kind.Updates():
+			updates = append(updates, entry)
+		case entry.Kind == KindCreate:
+			creates = append(creates, entry)
 		}
 	}
-	return result
+	sort.SliceStable(updates, func(i, j int) bool { return updates[i].Depth > updates[j].Depth })
+	return append(updates, creates...)
 }
 
 // Diff compares a compiled policy with the live registry.
@@ -141,12 +174,23 @@ func (p Plan) Writes() []Entry {
 // registrations, so a revoked or expired agent is invisible: a policy agent
 // with such an ID plans as a create, and the registry then refuses it, because
 // a revoked or expired ID can never be registered again.
-func Diff(policy *Policy, live map[shoal.ID]fleet.Descriptor) Plan {
+//
+// registry names where live was read; it is bound into the plan digest so a
+// plan reviewed against one registry cannot be applied to another.
+func Diff(policy *Policy, live map[shoal.ID]fleet.Descriptor, registry string) Plan {
 	specs := policy.Agents()
-	plan := Plan{PolicyDigest: policy.Digest(), Entries: make([]Entry, 0, len(specs)+len(live))}
+	plan := Plan{
+		PolicyDigest: policy.Digest(), Registry: registry,
+		Entries: make([]Entry, 0, len(specs)+len(live)),
+	}
 	managed := make(map[shoal.ID]int, len(specs))
 	for _, spec := range specs {
 		entry := Entry{ID: spec.ID, Spec: spec}
+		if spec.ParentID != "" {
+			if position, ok := managed[spec.ParentID]; ok {
+				entry.Depth = plan.Entries[position].Depth + 1
+			}
+		}
 		current, exists := live[spec.ID]
 		ttl, _ := policy.LeaseTTL(spec.ID)
 		switch {
@@ -164,6 +208,9 @@ func Diff(policy *Policy, live map[shoal.ID]fleet.Descriptor) Plan {
 				entry.Changes = widening
 			} else if narrowing := narrowingChanges(spec, current); len(narrowing) > 0 {
 				entry.Kind = KindNarrow
+				if spec.ExecutorRef != current.ExecutorRef {
+					entry.Kind = KindExecutorChange
+				}
 				entry.Changes = narrowing
 			} else {
 				entry.Kind = KindUnchanged
@@ -171,6 +218,7 @@ func Diff(policy *Policy, live map[shoal.ID]fleet.Descriptor) Plan {
 		}
 		if exists {
 			entry.LiveGeneration = current.Generation
+			entry.LiveContent = ContentDigest(current)
 		}
 		managed[spec.ID] = len(plan.Entries)
 		plan.Entries = append(plan.Entries, entry)
@@ -193,18 +241,32 @@ func Diff(policy *Policy, live map[shoal.ID]fleet.Descriptor) Plan {
 			children[descriptor.ParentID] = append(children[descriptor.ParentID], id)
 		}
 	}
+	kinds := make(map[shoal.ID]Kind, len(plan.Entries))
+	for _, entry := range plan.Entries {
+		kinds[entry.ID] = entry.Kind
+	}
 	for index := range plan.Entries {
 		entry := &plan.Entries[index]
 		if !entry.Kind.Writes() {
 			continue
 		}
 		self := effective[entry.ID]
-		if entry.Spec.ParentID != "" {
-			if parent, ok := effective[entry.Spec.ParentID]; ok {
+		if parentID := entry.Spec.ParentID; parentID != "" {
+			if parent, ok := effective[parentID]; ok {
 				if reason := exceeds(self, parent); reason != "" {
 					entry.Kind = KindRefusedDelegation
-					entry.Reason = fmt.Sprintf("%s after apply: %s",
-						"would exceed parent "+agentPath(entry.Spec.ParentID), reason)
+					entry.Reason = fmt.Sprintf("would exceed parent %s after apply: %s",
+						agentPath(parentID), reason)
+					continue
+				}
+			}
+			// An update lands before its parent's update (Writes), so it must
+			// also sit within the parent as it is live until then.
+			if entry.Kind.Updates() && kinds[parentID].Updates() {
+				if reason := exceeds(self, linkFromDescriptor(live[parentID])); reason != "" {
+					entry.Kind = KindRefusedDelegation
+					entry.Reason = fmt.Sprintf("would exceed live parent %s before that parent's own update lands: %s",
+						agentPath(parentID), reason)
 					continue
 				}
 			}
@@ -212,7 +274,7 @@ func Diff(policy *Policy, live map[shoal.ID]fleet.Descriptor) Plan {
 		ids := children[entry.ID]
 		sort.Slice(ids, func(i, j int) bool { return shoal.CompareID(ids[i], ids[j]) < 0 })
 		for _, child := range ids {
-			if position, ok := managed[child]; ok && plan.Entries[position].Kind.Writes() {
+			if kinds[child].Writes() {
 				continue
 			}
 			if reason := exceeds(effective[child], self); reason != "" {
@@ -235,30 +297,92 @@ func Diff(policy *Policy, live map[shoal.ID]fleet.Descriptor) Plan {
 	for _, id := range unmanaged {
 		plan.Entries = append(plan.Entries, Entry{
 			ID: id, Kind: KindUnmanaged, LiveGeneration: live[id].Generation,
-			Reason: "live but not declared; apply leaves it as it is",
+			LiveContent: ContentDigest(live[id]),
+			Reason:      "live but not declared; apply leaves it as it is",
 		})
 	}
 	plan.Digest = planDigest(plan)
 	return plan
 }
 
+// ContentDigest identifies what a policy governs in a live registration:
+// parent, domain, scopes, executor and capabilities. Generation, subject,
+// actor, lease and update time are left out, because a heartbeat moves them
+// without changing any of that. Every value is hashed as hex of its bytes,
+// since a live value need not be UTF-8 and encoding/json would silently
+// replace invalid bytes.
+func ContentDigest(descriptor fleet.Descriptor) string {
+	type action struct {
+		Name    string   `json:"name"`
+		Effects []string `json:"effects"`
+		Input   string   `json:"input_schema"`
+		Output  string   `json:"output_schema"`
+	}
+	type capability struct {
+		Name    string   `json:"name"`
+		Actions []action `json:"actions"`
+	}
+	type scope struct {
+		Source string `json:"source_id"`
+		Policy string `json:"policy_id"`
+	}
+	text := func(value []byte) string { return hex.EncodeToString(value) }
+	body := struct {
+		Parent       string       `json:"parent"`
+		Domain       string       `json:"authorization_domain"`
+		Scopes       []scope      `json:"scopes"`
+		ExecutorRef  string       `json:"executor_ref"`
+		Capabilities []capability `json:"capabilities"`
+	}{
+		Parent: text([]byte(descriptor.ParentID)), Domain: text(descriptor.AuthorizationDomain),
+		ExecutorRef: text([]byte(descriptor.ExecutorRef)),
+		Scopes:      make([]scope, 0, len(descriptor.Scopes)),
+	}
+	for _, value := range descriptor.Scopes {
+		body.Scopes = append(body.Scopes, scope{text(value.SourceID), text(value.PolicyID)})
+	}
+	for _, value := range descriptor.Capabilities {
+		hashed := capability{Name: text([]byte(value.Name)), Actions: make([]action, 0, len(value.Actions))}
+		for _, declared := range value.Actions {
+			effects := make([]string, 0, len(declared.Effects))
+			for _, effect := range declared.Effects {
+				effects = append(effects, text([]byte(effect)))
+			}
+			hashed.Actions = append(hashed.Actions, action{
+				Name: text([]byte(declared.Name)), Effects: effects,
+				Input: text(declared.InputSchema), Output: text(declared.OutputSchema),
+			})
+		}
+		body.Capabilities = append(body.Capabilities, hashed)
+	}
+	encoded, _ := json.Marshal(body)
+	sum := sha256.Sum256(encoded)
+	return LiveDigestPrefix + hex.EncodeToString(sum[:])
+}
+
 func planDigest(plan Plan) string {
-	type digestEntry struct {
-		ID         string `json:"id"`
-		Kind       Kind   `json:"kind"`
-		Generation int64  `json:"generation"`
+	type managedEntry struct {
+		ID   string `json:"id"`
+		Kind Kind   `json:"kind"`
+		Live string `json:"live"`
 	}
 	body := struct {
-		Policy  string        `json:"policy"`
-		Entries []digestEntry `json:"entries"`
-	}{Policy: plan.PolicyDigest, Entries: make([]digestEntry, 0, len(plan.Entries))}
+		Policy    string         `json:"policy"`
+		Registry  string         `json:"registry"`
+		Managed   []managedEntry `json:"managed"`
+		Unmanaged []string       `json:"unmanaged"`
+	}{
+		Policy: plan.PolicyDigest, Registry: hex.EncodeToString([]byte(plan.Registry)),
+		Managed: []managedEntry{}, Unmanaged: []string{},
+	}
 	for _, entry := range plan.Entries {
-		body.Entries = append(body.Entries, digestEntry{
-			// Hex, not the raw ID: a live ID need not be UTF-8, and
-			// encoding/json would silently replace invalid bytes.
-			ID:   hex.EncodeToString([]byte(entry.ID)),
-			Kind: entry.Kind, Generation: entry.LiveGeneration,
-		})
+		// Hex, not the raw ID: a live ID need not be UTF-8.
+		id := hex.EncodeToString([]byte(entry.ID))
+		if entry.Kind == KindUnmanaged {
+			body.Unmanaged = append(body.Unmanaged, id)
+			continue
+		}
+		body.Managed = append(body.Managed, managedEntry{ID: id, Kind: entry.Kind, Live: entry.LiveContent})
 	}
 	encoded, _ := json.Marshal(body)
 	sum := sha256.Sum256(encoded)

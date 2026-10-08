@@ -32,9 +32,16 @@ import (
 // Export writes live registrations back as a policy document.
 //
 // Every action is written out in full, never as inherit, so the export reads
-// on its own. Each lease TTL is the live lease minus the time the registration
-// was last written, rounded to the second, which is the TTL it was registered
-// with until a heartbeat moves the lease.
+// on its own.
+//
+// Each lease TTL is the lease remaining at now, the one export time, rounded to
+// the second, then clamped to MaxLeaseTTL and to the parent's exported TTL.
+// That is what the live fleet holds at export time, not the TTL each agent was
+// first registered with: heartbeats move leases, and a heartbeat can leave a
+// parent with less remaining than its child was registered with. Measuring
+// every agent from one instant keeps each child within its parent, so a live
+// fleet always exports to a policy that compiles. Rounding is monotone, so the
+// clamp to the parent only absorbs rounding, never a live inversion.
 //
 // executors supplies the host's executor assertions. When it is nil there is
 // nothing to read them from, so each referenced executor is exported with the
@@ -45,7 +52,10 @@ import (
 // The file format holds IDs, domains and scope identities as UTF-8 strings. A
 // live value that is not UTF-8 cannot be written without changing it, so it is
 // refused, naming the field.
-func Export(live map[shoal.ID]fleet.Descriptor, executors []Executor) (Document, error) {
+func Export(live map[shoal.ID]fleet.Descriptor, executors []Executor, now time.Time) (Document, error) {
+	if now.IsZero() {
+		return Document{}, shoal.NewError(shoal.ErrorInvalidArgument, "export time is required")
+	}
 	document := Document{ATPL: Version, Origin: Origin}
 	ids := make([]shoal.ID, 0, len(live))
 	for id := range live {
@@ -59,13 +69,26 @@ func Export(live map[shoal.ID]fleet.Descriptor, executors []Executor) (Document,
 		return Document{}, err
 	}
 	used := make(map[string]fleet.Effects)
+	ttls := make(map[shoal.ID]time.Duration, len(ordered))
 	for _, id := range ordered {
-		agent, err := exportAgent(live[id])
+		descriptor := live[id]
+		ttl := descriptor.LeaseExpiresAt.Sub(now).Round(time.Second)
+		if ttl < time.Second {
+			return Document{}, refuse("", exportPath(id)+".lease_ttl",
+				"the live lease ends within a second of the export time")
+		}
+		if ttl > MaxLeaseTTL {
+			ttl = MaxLeaseTTL
+		}
+		if parentTTL, ok := ttls[descriptor.ParentID]; ok && ttl > parentTTL {
+			ttl = parentTTL
+		}
+		ttls[id] = ttl
+		agent, err := exportAgent(descriptor, ttl)
 		if err != nil {
 			return Document{}, err
 		}
 		document.Agents = append(document.Agents, agent)
-		descriptor := live[id]
 		effects := used[descriptor.ExecutorRef]
 		for _, capability := range descriptor.Capabilities {
 			for _, action := range capability.Actions {
@@ -148,7 +171,7 @@ func parentsFirst(live map[shoal.ID]fleet.Descriptor, ids []shoal.ID) ([]shoal.I
 	return ids, nil
 }
 
-func exportAgent(descriptor fleet.Descriptor) (Agent, error) {
+func exportAgent(descriptor fleet.Descriptor, ttl time.Duration) (Agent, error) {
 	path := exportPath(descriptor.ID)
 	text := func(field string, value []byte) (string, error) {
 		if !utf8.Valid(value) {
@@ -169,17 +192,13 @@ func exportAgent(descriptor fleet.Descriptor) (Agent, error) {
 	if err != nil {
 		return Agent{}, err
 	}
-	// Rounded to the second: the registry stamps UpdatedAt with its own
-	// clock while the lease was computed from the client's, so the raw
-	// difference carries the clock skew and request latency between them.
-	ttl := descriptor.LeaseExpiresAt.Sub(descriptor.UpdatedAt).Round(time.Second)
-	if ttl <= 0 || ttl > fleet.MaxLease {
-		return Agent{}, refuse("", path+".lease_ttl", fmt.Sprintf(
-			"live lease minus last write is %s, outside (0, %s]", ttl, fleet.MaxLease))
+	executorRef, err := text("executor_ref", []byte(descriptor.ExecutorRef))
+	if err != nil {
+		return Agent{}, err
 	}
 	agent := Agent{
 		ID: id, Parent: parent, AuthorizationDomain: domain,
-		ExecutorRef: descriptor.ExecutorRef, LeaseTTL: ttl.String(),
+		ExecutorRef: executorRef, LeaseTTL: ttl.String(),
 	}
 	for i, scope := range descriptor.Scopes {
 		source, err := text(fmt.Sprintf("scopes[%d].source_id", i), scope.SourceID)

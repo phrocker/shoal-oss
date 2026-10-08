@@ -187,13 +187,13 @@ func TestRoundTripThroughTheRegistryYieldsIdenticalRegistrations(t *testing.T) {
 	document := base(t)
 	policy := compileOne(t, document)
 	registry := newRegistry(t, document)
-	applyDirect(t, registry, Diff(policy, registry.Live(t)))
+	applyDirect(t, registry, Diff(policy, registry.Live(t), ""))
 
 	live := registry.Live(t)
 	if len(live) != 2 {
 		t.Fatalf("live agents = %d, want 2", len(live))
 	}
-	exported, err := Export(live, document.Executors)
+	exported, err := Export(live, document.Executors, testNow)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -220,7 +220,7 @@ func TestRoundTripThroughTheRegistryYieldsIdenticalRegistrations(t *testing.T) {
 			t.Fatalf("registry stored something other than the compiled spec for %s", spec.ID)
 		}
 	}
-	if plan := Diff(recompiled, live); len(plan.Writes()) != 0 || len(plan.Refusals()) != 0 {
+	if plan := Diff(recompiled, live, ""); len(plan.Writes()) != 0 || len(plan.Refusals()) != 0 {
 		t.Fatalf("recompiled export does not plan as unchanged: %+v", plan.Entries)
 	}
 }
@@ -360,7 +360,7 @@ func TestRefusalsNameThePathAndMatchRegister(t *testing.T) {
 		}, `agents[id=planner].capabilities[name=search].actions[name=query].effects: "teleport" is not a known effect class`},
 		{"lease beyond the registry bound", "planner", func(d *Document) {
 			agentByID(d, "planner").LeaseTTL = "25h"
-		}, "agents[id=planner].lease_ttl: must be positive and at most 24h0m0s"},
+		}, "agents[id=planner].lease_ttl: must be positive and at most 23h55m0s"},
 		{"capability name the registry refuses", "planner", func(d *Document) {
 			agentByID(d, "planner").Capabilities[0].Name = "bad name"
 		}, `agents[id=planner].capabilities[name="bad name"].actions[name=query]: capability name contains an unsupported character`},
@@ -471,7 +471,7 @@ func TestDecodeStrictness(t *testing.T) {
 	}{
 		{"unknown field", plannerField("color"), "agents[id=planner].color: unknown field"},
 		{"approval", plannerField("approval"), "agents[id=planner].approval: requires a later ATPL version (#451)"},
-		{"obligations", plannerField("obligations"), "agents[id=planner].obligations: requires a later ATPL version"},
+		{"obligations", plannerField("obligations"), "agents[id=planner].obligations: is not declared in policy: admission obligations are computed per request"},
 		{"attestation", plannerField("attestation"), "agents[id=planner].attestation: requires a later ATPL version (#446)"},
 		{"runtime", plannerField("runtime"), "agents[id=planner].runtime: requires a later ATPL version"},
 		{"trust_score", plannerField("trust_score"), "agents[id=planner].trust_score: is not part of ATPL in Shoal"},
@@ -577,7 +577,7 @@ func TestDecodeBounds(t *testing.T) {
 		t.Fatalf("files at the bound: %v", err)
 	}
 	if _, err := Compile(files(MaxFiles+1), testNow, nil); err == nil ||
-		!strings.Contains(err.Error(), "policy spans more than 256 files") {
+		!strings.Contains(err.Error(), "policy spans more than 4097 files") {
 		t.Fatalf("files over the bound = %v", err)
 	}
 }
@@ -604,7 +604,7 @@ func TestPlanKinds(t *testing.T) {
 	document := base(t)
 	registry := newRegistry(t, document)
 	policy, live := compileLive(t, document, registry)
-	plan := Diff(policy, live)
+	plan := Diff(policy, live, "")
 	if got := kinds(plan); got["planner"] != KindCreate || got["searcher"] != KindCreate {
 		t.Fatalf("empty registry kinds = %v", got)
 	}
@@ -617,7 +617,7 @@ func TestPlanKinds(t *testing.T) {
 	registry.Clock.Set(testNow.Add(time.Minute))
 
 	policy, live = compileLive(t, document, registry)
-	unchanged := Diff(policy, live)
+	unchanged := Diff(policy, live, "")
 	if got := kinds(unchanged); got["planner"] != KindUnchanged || got["searcher"] != KindUnchanged ||
 		got["legacy"] != KindUnmanaged {
 		t.Fatalf("unchanged kinds = %v", got)
@@ -634,7 +634,7 @@ func TestPlanKinds(t *testing.T) {
 	reviewer.ID = "reviewer"
 	narrowed.Agents = append(narrowed.Agents, reviewer)
 	policy, live = compileLive(t, narrowed, registry)
-	plan = Diff(policy, live)
+	plan = Diff(policy, live, "")
 	if got := kinds(plan); got["planner"] != KindNarrow || got["searcher"] != KindUnchanged ||
 		got["reviewer"] != KindCreate {
 		t.Fatalf("narrow kinds = %v", got)
@@ -655,7 +655,7 @@ func TestPlanKinds(t *testing.T) {
 	if plan.Digest == unchanged.Digest || !strings.HasPrefix(plan.Digest, PlanDigestPrefix) {
 		t.Fatal("plan digest does not distinguish plans")
 	}
-	if again := Diff(policy, registry.Live(t)); again.Digest != plan.Digest {
+	if again := Diff(policy, registry.Live(t), ""); again.Digest != plan.Digest {
 		t.Fatal("plan digest is not reproducible")
 	}
 
@@ -663,7 +663,7 @@ func TestPlanKinds(t *testing.T) {
 	agentByID(&widened, "planner").Scopes = append(agentByID(&widened, "planner").Scopes,
 		Scope{SourceID: "source-c", PolicyID: "policy"})
 	policy, live = compileLive(t, widened, registry)
-	plan = Diff(policy, live)
+	plan = Diff(policy, live, "")
 	if got := kinds(plan); got["planner"] != KindRefusedWidening {
 		t.Fatalf("widening kinds = %v", got)
 	}
@@ -677,7 +677,7 @@ func TestPlanKinds(t *testing.T) {
 		Effects: []string{"reads-corpus"}, InputSchema: json.RawMessage(`{"type":"object"}`),
 		OutputSchema: json.RawMessage(`{"type":"object"}`)}
 	policy, live = compileLive(t, migrated, registry)
-	if got := kinds(Diff(policy, live)); got["searcher"] != KindRefusedParentMigration {
+	if got := kinds(Diff(policy, live, "")); got["searcher"] != KindRefusedParentMigration {
 		t.Fatalf("migration kinds = %v", got)
 	}
 
@@ -688,7 +688,7 @@ func TestPlanKinds(t *testing.T) {
 	agentByID(&shortened, "planner").LeaseTTL = "1h"
 	agentByID(&shortened, "planner").Capabilities = agentByID(&shortened, "planner").Capabilities[:1]
 	policy, live = compileLive(t, shortened, registry)
-	plan = Diff(policy, live)
+	plan = Diff(policy, live, "")
 	if got := kinds(plan); got["planner"] != KindRefusedDelegation || got["searcher"] != KindUnmanaged {
 		t.Fatalf("delegation kinds = %v", got)
 	}
@@ -708,18 +708,18 @@ func TestExportRefusesNonUTF8AndDerivesExecutors(t *testing.T) {
 		}}}},
 		LeaseExpiresAt: testNow.Add(time.Hour), UpdatedAt: testNow,
 	}
-	if _, err := Export(map[shoal.ID]fleet.Descriptor{"agent": descriptor}, nil); err == nil ||
+	if _, err := Export(map[shoal.ID]fleet.Descriptor{"agent": descriptor}, nil, testNow); err == nil ||
 		!strings.Contains(err.Error(), "agents[id=agent].scopes[0].source_id: is not valid UTF-8") {
 		t.Fatalf("non-UTF-8 scope = %v", err)
 	}
 	descriptor.Scopes[0].SourceID = []byte("source")
 	descriptor.ID = "agent\xfe"
-	if _, err := Export(map[shoal.ID]fleet.Descriptor{descriptor.ID: descriptor}, nil); err == nil ||
+	if _, err := Export(map[shoal.ID]fleet.Descriptor{descriptor.ID: descriptor}, nil, testNow); err == nil ||
 		!strings.Contains(err.Error(), "agents[id(base64url)=YWdlbnT-].id: is not valid UTF-8") {
 		t.Fatalf("non-UTF-8 ID = %v", err)
 	}
 	descriptor.ID = "agent"
-	document, err := Export(map[shoal.ID]fleet.Descriptor{"agent": descriptor}, nil)
+	document, err := Export(map[shoal.ID]fleet.Descriptor{"agent": descriptor}, nil, testNow)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -730,7 +730,7 @@ func TestExportRefusesNonUTF8AndDerivesExecutors(t *testing.T) {
 		t.Fatalf("exported agent = %+v", document)
 	}
 	if _, err := Export(map[shoal.ID]fleet.Descriptor{"agent": descriptor},
-		[]Executor{{Ref: "other"}}); err == nil || !strings.Contains(err.Error(), "executor exec") {
+		[]Executor{{Ref: "other"}}, testNow); err == nil || !strings.Contains(err.Error(), "executor exec") {
 		t.Fatalf("manifest missing a referenced executor = %v", err)
 	}
 }
@@ -749,7 +749,7 @@ func TestTheFormatCreditsATPL(t *testing.T) {
 			t.Fatalf("package documentation does not mention %q", want)
 		}
 	}
-	document, err := Export(nil, nil)
+	document, err := Export(nil, nil, testNow)
 	if err != nil {
 		t.Fatal(err)
 	}

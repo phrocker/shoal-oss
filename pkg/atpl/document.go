@@ -19,6 +19,8 @@ package atpl
 
 import (
 	"bytes"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -26,6 +28,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"github.com/phrocker/shoal-oss/pkg/explorer/fleet"
@@ -43,15 +46,35 @@ const (
 	// FileSuffix names the files a policy directory is read from.
 	FileSuffix = ".atpl.json"
 
-	// MaxFiles bounds how many files one policy may span.
-	MaxFiles = 256
-	// MaxFileBytes bounds one file. It is the registry's bound on one encoded
-	// descriptor, so any single agent the registry accepts fits in a file.
-	MaxFileBytes = fleet.MaxDescriptorBytes
 	// MaxAgents bounds the agents one policy may declare.
 	MaxAgents = 4096
 	// MaxExecutors bounds the executors one policy may declare.
 	MaxExecutors = 1024
+	// MaxFiles bounds how many files one policy may span: one per agent plus
+	// one for executors, which is the layout export writes. One file per
+	// agent keeps a later export diffing against an earlier one agent by
+	// agent; MaxPolicyBytes bounds what that many files may hold together.
+	MaxFiles = MaxAgents + 1
+	// MaxFileBytes bounds one file, sized so any single agent the registry
+	// accepts fits in one file with headroom. The registry bounds an agent at
+	// fleet.MaxDescriptorBytes of its own JSON, where byte fields are base64
+	// (4/3 of their size). Here the same fields are JSON strings, which escape
+	// to at most 6 bytes per byte: at most 128 KiB of scope identity and 1 KiB
+	// of domain grow by under 800 KiB. Schemas are written compact, and
+	// indentation of the outer structure adds a few bytes per line. Twice the
+	// registry bound covers all of it; four times leaves room for a reviewer's
+	// own formatting.
+	MaxFileBytes = 4 * fleet.MaxDescriptorBytes
+	// MaxPolicyBytes bounds the files of one policy together.
+	MaxPolicyBytes = 256 << 20
+	// MaxLeaseTTL is the longest lease_ttl a policy may declare. It is the
+	// registry's bound less SkewMargin: apply computes absolute leases from the
+	// client's clock, and the registry checks them against its own, so a TTL
+	// of exactly fleet.MaxLease is refused by a server whose clock runs even
+	// slightly behind the client's.
+	MaxLeaseTTL = fleet.MaxLease - SkewMargin
+	// SkewMargin is the client-server clock skew a lease tolerates.
+	SkewMargin = 5 * time.Minute
 )
 
 // Document is one decoded policy file. Its fields are exactly the file's; no
@@ -151,6 +174,61 @@ func (a Action) MarshalJSON() ([]byte, error) {
 	})
 }
 
+// Encode writes a document as a policy file: the outer structure indented
+// for review, each schema compact on one line.
+//
+// encoding/json's indenting re-indents embedded schemas too, which can grow a
+// schema several times over and push a file the registry would accept past
+// MaxFileBytes. Schemas are therefore swapped for unique placeholder strings,
+// the document is indented, and the compact schemas are put back in one pass.
+// The placeholders carry a random nonce, so no value in the document can be
+// mistaken for one, and none survives into the output.
+func Encode(document Document) ([]byte, error) {
+	raw := make([]byte, 16)
+	if _, err := rand.Read(raw); err != nil {
+		return nil, shoal.WrapError(shoal.ErrorUnavailable, "policy file could not be encoded", err)
+	}
+	nonce := hex.EncodeToString(raw)
+	var replacements []string
+	placeholder := func(schema json.RawMessage) (json.RawMessage, error) {
+		var compact bytes.Buffer
+		if err := json.Compact(&compact, schema); err != nil {
+			return nil, shoal.WrapError(shoal.ErrorInvalidArgument, "action schema is not valid JSON", err)
+		}
+		token := strconv.Quote(fmt.Sprintf("atpl-schema-%s-%d", nonce, len(replacements)/2))
+		replacements = append(replacements, token, compact.String())
+		return json.RawMessage(token), nil
+	}
+	copied := document
+	copied.Agents = make([]Agent, len(document.Agents))
+	for i, agent := range document.Agents {
+		copied.Agents[i] = agent
+		copied.Agents[i].Capabilities = make([]Capability, len(agent.Capabilities))
+		for j, capability := range agent.Capabilities {
+			copied.Agents[i].Capabilities[j] = Capability{Name: capability.Name,
+				Actions: make([]Action, len(capability.Actions))}
+			for k, action := range capability.Actions {
+				if !action.Inherit {
+					var err error
+					if action.InputSchema, err = placeholder(action.InputSchema); err != nil {
+						return nil, err
+					}
+					if action.OutputSchema, err = placeholder(action.OutputSchema); err != nil {
+						return nil, err
+					}
+				}
+				copied.Agents[i].Capabilities[j].Actions[k] = action
+			}
+		}
+	}
+	indented, err := json.MarshalIndent(copied, "", "  ")
+	if err != nil {
+		return nil, shoal.WrapError(shoal.ErrorInvalidArgument, "policy file could not be encoded", err)
+	}
+	encoded := strings.NewReplacer(replacements...).Replace(string(indented))
+	return append([]byte(encoded), '\n'), nil
+}
+
 func nonNil(values []string) []string {
 	if values == nil {
 		return []string{}
@@ -162,8 +240,9 @@ func nonNil(values []string) []string {
 // the reason each is refused. A name refused generically would read as a typo;
 // these are deliberate, and the message says why.
 var reserved = map[string]string{
-	"approval":    "requires a later ATPL version (#451)",
-	"obligations": "requires a later ATPL version (admission obligations, #452)",
+	"approval": "requires a later ATPL version (#451)",
+	"obligations": "is not declared in policy: admission obligations are computed per " +
+		"request at admission, and expressing them here is deferred (see docs/atpl.md, \"Deferred\")",
 	"attestation": "requires a later ATPL version (#446)",
 	"runtime":     "requires a later ATPL version (runtime attestation, #446)",
 	"trust_score": "is not part of ATPL in Shoal: trust in an agent is a typed " +
@@ -195,6 +274,11 @@ func Decode(name string, reader io.Reader) (Document, error) {
 	}
 	if !utf8.Valid(data) {
 		return Document{}, refuse(name, "", "policy file is not valid UTF-8")
+	}
+	// Surrogates first: an unpaired one decodes to U+FFFD, so scanStrict
+	// would otherwise report two distinct keys as a duplicate.
+	if err := scanSurrogates(data); err != nil {
+		return Document{}, refuse(name, "", err.Error())
 	}
 	if err := scanStrict(data); err != nil {
 		return Document{}, refuse(name, "", err.Error())
@@ -297,6 +381,73 @@ func scanStrict(data []byte) error {
 	}
 	if !completed {
 		return errors.New("policy file is truncated")
+	}
+	return nil
+}
+
+// scanSurrogates refuses a \u escape naming half of a UTF-16 surrogate pair
+// without its other half. encoding/json decodes one to U+FFFD, so two files
+// spelling different keys or IDs would read as the same one: a false duplicate
+// key here, or two different policies with one digest. It runs before
+// scanStrict and does not assume the bytes are valid JSON: every read is
+// bounds-checked, and malformed JSON is left for scanStrict to refuse.
+func scanSurrogates(data []byte) error {
+	hexValue := func(at int) (int, bool) {
+		if at+4 > len(data) {
+			return 0, false
+		}
+		value := 0
+		for _, digit := range data[at : at+4] {
+			value <<= 4
+			switch {
+			case digit >= '0' && digit <= '9':
+				value |= int(digit - '0')
+			case digit >= 'a' && digit <= 'f':
+				value |= int(digit-'a') + 10
+			case digit >= 'A' && digit <= 'F':
+				value |= int(digit-'A') + 10
+			default:
+				return 0, false
+			}
+		}
+		return value, true
+	}
+	inString := false
+	for i := 0; i < len(data); i++ {
+		if !inString {
+			if data[i] == '"' {
+				inString = true
+			}
+			continue
+		}
+		switch data[i] {
+		case '"':
+			inString = false
+		case '\\':
+			if i+1 < len(data) && data[i+1] == 'u' {
+				value, ok := hexValue(i + 2)
+				if !ok {
+					return errors.New("policy file contains a malformed \\u escape")
+				}
+				switch {
+				case value >= 0xD800 && value <= 0xDBFF:
+					low, ok := -1, false
+					if i+7 < len(data) && data[i+6] == '\\' && data[i+7] == 'u' {
+						low, ok = hexValue(i + 8)
+					}
+					if !ok || low < 0xDC00 || low > 0xDFFF {
+						return fmt.Errorf("policy file contains an unpaired surrogate escape \\u%04x", value)
+					}
+					i += 11
+					continue
+				case value >= 0xDC00 && value <= 0xDFFF:
+					return fmt.Errorf("policy file contains an unpaired surrogate escape \\u%04x", value)
+				}
+				i += 5
+				continue
+			}
+			i++
+		}
 	}
 	return nil
 }

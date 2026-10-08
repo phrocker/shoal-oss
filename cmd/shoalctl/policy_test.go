@@ -19,8 +19,10 @@ package main
 
 import (
 	"bytes"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -94,6 +96,8 @@ type policyFixture struct {
 	// reaches the registry.
 	mu        sync.Mutex
 	interfere func()
+	// observe, when set, runs before every register request.
+	observe func()
 }
 
 func newPolicyFixture(t *testing.T) *policyFixture {
@@ -109,7 +113,11 @@ func newPolicyFixture(t *testing.T) *policyFixture {
 			fixture.mu.Lock()
 			interfere := fixture.interfere
 			fixture.interfere = nil
+			observe := fixture.observe
 			fixture.mu.Unlock()
+			if observe != nil {
+				observe()
+			}
 			if interfere != nil {
 				interfere()
 			}
@@ -147,7 +155,7 @@ func (f *policyFixture) registryArgs() []string {
 	return []string{"-endpoint", f.server.URL, "-token-file", f.tokenFile}
 }
 
-var planDigestLine = regexp.MustCompile(`(?m)^plan digest: (atpl:plan:v1:[0-9a-f]{64})$`)
+var planDigestLine = regexp.MustCompile(`(?m)^plan digest: (atpl:plan:v2:[0-9a-f]{64})$`)
 var policyDigestLine = regexp.MustCompile(`(?m)^policy digest: (atpl:policy:v1:[0-9a-f]{64})$`)
 
 func (f *policyFixture) plan(t *testing.T) (string, string) {
@@ -203,7 +211,7 @@ func TestPolicyPlanApplyRoundTrip(t *testing.T) {
 		"+ agents[id=planner] create",
 		"+ agents[id=searcher] create",
 		"    + capabilities[name=tickets].actions[name=open]: effects [external]",
-		"summary: 2 create, 0 narrow, 0 unchanged, 0 refused, 0 unmanaged",
+		"summary: 2 create, 0 narrow, 0 executor-change, 0 unchanged, 0 refused, 0 unmanaged",
 	} {
 		if !strings.Contains(planned, want) {
 			t.Fatalf("plan output missing %q:\n%s", want, planned)
@@ -212,7 +220,7 @@ func TestPolicyPlanApplyRoundTrip(t *testing.T) {
 	policyDigest := policyDigestLine.FindStringSubmatch(planned)[1]
 
 	if _, _, err := fixture.run(t, append([]string{"apply", fixture.directory, "-plan-digest",
-		"atpl:plan:v1:" + strings.Repeat("0", 64)}, fixture.registryArgs()...)...); err == nil ||
+		"atpl:plan:v2:" + strings.Repeat("0", 64)}, fixture.registryArgs()...)...); err == nil ||
 		!strings.Contains(err.Error(), "plan digest mismatch") {
 		t.Fatalf("apply with a stale digest = %v", err)
 	}
@@ -249,7 +257,7 @@ func TestPolicyPlanApplyRoundTrip(t *testing.T) {
 
 	unchanged, _ := fixture.plan(t)
 	if !strings.Contains(unchanged, "= agents[id=planner] unchanged (live generation 1)") ||
-		!strings.Contains(unchanged, "summary: 0 create, 0 narrow, 2 unchanged") {
+		!strings.Contains(unchanged, "summary: 0 create, 0 narrow, 0 executor-change, 2 unchanged") {
 		t.Fatalf("plan after apply:\n%s", unchanged)
 	}
 
@@ -279,50 +287,185 @@ func TestPolicyPlanApplyRoundTrip(t *testing.T) {
 	}
 }
 
-func TestPolicyApplyStopsAtAGenerationConflict(t *testing.T) {
+// narrowBoth narrows planner and searcher to source-a after both were
+// registered holding source-a and source-b.
+const searcherTwoScopes = `"scopes": [{"source_id": "source-a", "policy_id": "policy"}, {"source_id": "source-b", "policy_id": "policy"}],
+      "executor_ref": "search-exec"`
+
+func narrowedAgents() string {
+	narrowed := strings.Replace(policyAgents, `{"source_id": "source-b", "policy_id": "policy"}`, ``, 1)
+	return strings.Replace(narrowed, `{"source_id": "source-a", "policy_id": "policy"},`,
+		`{"source_id": "source-a", "policy_id": "policy"}`, 1)
+}
+
+func (f *policyFixture) applyReviewed(t *testing.T) (string, error) {
+	t.Helper()
+	_, digest := f.plan(t)
+	stdout, _, err := f.run(t, append([]string{"apply", f.directory, "-plan-digest", digest},
+		f.registryArgs()...)...)
+	return stdout, err
+}
+
+func (f *policyFixture) heartbeat(t *testing.T, id shoal.ID) {
+	t.Helper()
+	ctx, requestContext := f.registry.Context(t)
+	current := f.registry.Live(t)[id]
+	if _, err := f.registry.Service.Heartbeat(ctx, fleet.HeartbeatRequest{
+		Context: requestContext, RegistrationKey: shoal.ID(fmt.Sprintf("heartbeat-%d", current.Generation)),
+		ID: id, ExpectedGeneration: current.Generation, LeaseExpiresAt: current.LeaseExpiresAt,
+	}); err != nil {
+		t.Error(err)
+	}
+}
+
+func TestPolicyApplyRetriesAHeartbeatButNotAContentChange(t *testing.T) {
 	fixture := newPolicyFixture(t)
-	_, digest := fixture.plan(t)
-	if _, _, err := fixture.run(t, append([]string{"apply", fixture.directory, "-plan-digest", digest},
-		fixture.registryArgs()...)...); err != nil {
+	if _, err := fixture.applyReviewed(t); err != nil {
 		t.Fatal(err)
 	}
-
-	narrowed := strings.Replace(policyAgents, `{"source_id": "source-b", "policy_id": "policy"}`, ``, 1)
-	narrowed = strings.Replace(narrowed, `{"source_id": "source-a", "policy_id": "policy"},`,
-		`{"source_id": "source-a", "policy_id": "policy"}`, 1)
-	writeFile(t, filepath.Join(fixture.directory, "agents.atpl.json"), narrowed)
+	writeFile(t, filepath.Join(fixture.directory, "agents.atpl.json"), narrowedAgents())
 	planned, digest := fixture.plan(t)
 	if !strings.Contains(planned, "~ agents[id=planner] narrow (live generation 1)") ||
 		!strings.Contains(planned, "    - scopes[source_id=source-b,policy_id=policy]") {
 		t.Fatalf("narrow plan:\n%s", planned)
 	}
 
-	// Another writer moves the planner between apply's read and its write.
+	// A heartbeat between review and apply moves the generation but not the
+	// plan.
+	fixture.heartbeat(t, "planner")
+	// Another between apply's read and its write fails the compare-and-swap;
+	// apply re-reads, sees the same content, and retries once.
+	fixture.mu.Lock()
+	fixture.interfere = func() { fixture.heartbeat(t, "planner") }
+	fixture.mu.Unlock()
+	stdout, _, err := fixture.run(t, append([]string{"apply", fixture.directory, "-plan-digest", digest},
+		fixture.registryArgs()...)...)
+	if err != nil {
+		t.Fatalf("apply across heartbeats: %v\n%s", err, stdout)
+	}
+	if !strings.Contains(stdout, "agents[id=planner]: generation moved from 2 to 3 with no change to its content; retrying once") ||
+		!strings.Contains(stdout, "~ agents[id=planner] narrow: generation 4") {
+		t.Fatalf("apply output:\n%s", stdout)
+	}
+
+	// A concurrent write that changes content is not retried.
+	writeFile(t, filepath.Join(fixture.directory, "agents.atpl.json"),
+		strings.Replace(narrowedAgents(), `"lease_ttl": "6h"`, `"lease_ttl": "5h"`, 1))
+	dropped := strings.Replace(narrowedAgents(), `,
+        {"name": "tickets", "actions": [
+          {"name": "open", "effects": ["external"],
+           "input_schema": {"type": "object"}, "output_schema": {"type": "object"}}
+        ]}`, ``, 1)
+	if dropped == narrowedAgents() {
+		t.Fatal("fixture lacks the tickets capability")
+	}
+	writeFile(t, filepath.Join(fixture.directory, "agents.atpl.json"), dropped)
+	_, digest = fixture.plan(t)
 	fixture.mu.Lock()
 	fixture.interfere = func() {
-		ctx, requestContext := fixture.registry.Context(t)
 		current := fixture.registry.Live(t)["planner"]
-		if _, err := fixture.registry.Service.Heartbeat(ctx, fleet.HeartbeatRequest{
-			Context: requestContext, RegistrationKey: "concurrent-heartbeat", ID: "planner",
-			ExpectedGeneration: current.Generation, LeaseExpiresAt: current.LeaseExpiresAt,
-		}); err != nil {
+		spec := fleet.Spec{
+			ID: current.ID, AuthorizationDomain: current.AuthorizationDomain, Scopes: current.Scopes,
+			ExecutorRef: "search-exec", LeaseExpiresAt: current.LeaseExpiresAt,
+			Capabilities: current.Capabilities[:1],
+		}
+		if _, err := fixture.registry.Register(t, spec, current.Generation, "other-writer"); err != nil {
 			t.Error(err)
 		}
 	}
 	fixture.mu.Unlock()
-	stdout, _, err := fixture.run(t, append([]string{"apply", fixture.directory, "-plan-digest", digest},
+	stdout, _, err = fixture.run(t, append([]string{"apply", fixture.directory, "-plan-digest", digest},
 		fixture.registryArgs()...)...)
 	if err == nil || !strings.Contains(err.Error(), "agents[id=planner]: registry refused (409 conflict)") ||
+		!strings.Contains(err.Error(), "its live content changed since the plan") ||
 		!strings.Contains(err.Error(), "stopped after 0 of 1 writes") {
-		t.Fatalf("apply across a concurrent write = %v\n%s", err, stdout)
+		t.Fatalf("apply across a content change = %v\n%s", err, stdout)
 	}
-	if live := fixture.registry.Live(t)["planner"]; live.Generation != 2 || len(live.Scopes) != 2 {
-		t.Fatalf("planner after the refused apply = generation %d, %d scopes", live.Generation, len(live.Scopes))
-	}
-	// The registry moved, so the reviewed plan no longer applies.
 	if _, _, err := fixture.run(t, append([]string{"apply", fixture.directory, "-plan-digest", digest},
 		fixture.registryArgs()...)...); err == nil || !strings.Contains(err.Error(), "plan digest mismatch") {
 		t.Fatalf("apply of a superseded plan = %v", err)
+	}
+}
+
+func TestPolicyApplyKeepsChildrenResolvableWhileNarrowing(t *testing.T) {
+	fixture := newPolicyFixture(t)
+	wide := strings.Replace(policyAgents, `"scopes": [{"source_id": "source-a", "policy_id": "policy"}],
+      "executor_ref": "search-exec"`, searcherTwoScopes, 1)
+	if wide == policyAgents {
+		t.Fatal("fixture lacks the searcher scopes")
+	}
+	writeFile(t, filepath.Join(fixture.directory, "agents.atpl.json"), wide)
+	if _, err := fixture.applyReviewed(t); err != nil {
+		t.Fatal(err)
+	}
+	resolvable := func(when string) {
+		ctx, requestContext := fixture.registry.Context(t)
+		if _, err := fixture.registry.Service.Resolve(ctx, fleet.ResolveRequest{
+			Context: requestContext, ID: "searcher",
+		}); err != nil {
+			t.Errorf("searcher does not resolve %s: %v", when, err)
+		}
+	}
+	fixture.mu.Lock()
+	fixture.observe = func() { resolvable("between writes") }
+	fixture.mu.Unlock()
+	writeFile(t, filepath.Join(fixture.directory, "agents.atpl.json"), narrowedAgents())
+	stdout, err := fixture.applyReviewed(t)
+	if err != nil {
+		t.Fatalf("apply: %v\n%s", err, stdout)
+	}
+	if strings.Index(stdout, "agents[id=searcher] narrow") > strings.Index(stdout, "agents[id=planner] narrow") {
+		t.Fatalf("apply narrowed the parent first:\n%s", stdout)
+	}
+	resolvable("after apply")
+}
+
+func TestPolicyPlanShowsAnExecutorChangeApart(t *testing.T) {
+	fixture := newPolicyFixture(t)
+	if _, err := fixture.applyReviewed(t); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join(fixture.directory, "agents.atpl.json"),
+		strings.Replace(policyAgents, `"executor_ref": "search-exec"`, `"executor_ref": "remote-exec"`, 1))
+	planned, _ := fixture.plan(t)
+	if !strings.Contains(planned, "* agents[id=searcher] executor-change (live generation 1)") ||
+		!strings.Contains(planned, "    ~ executor_ref: search-exec -> remote-exec") ||
+		!strings.Contains(planned, "summary: 0 create, 0 narrow, 1 executor-change") {
+		t.Fatalf("executor change plan:\n%s", planned)
+	}
+	if !strings.Contains(planned, "registry: "+fixture.server.URL) {
+		t.Fatalf("plan does not name the registry:\n%s", planned)
+	}
+}
+
+func TestExportGuardIgnoresGlobMetacharacters(t *testing.T) {
+	fixture := newPolicyFixture(t)
+	out := filepath.Join(t.TempDir(), "odd[dir")
+	if err := os.Mkdir(out, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join(out, "kept.atpl.json"), policyExecutors)
+	if _, _, err := fixture.run(t, append([]string{"export", "-out", out}, fixture.registryArgs()...)...); err == nil ||
+		!strings.Contains(err.Error(), "already holds policy files") {
+		t.Fatalf("export into a glob-named directory holding policy files = %v", err)
+	}
+}
+
+func TestNormalizeEndpoint(t *testing.T) {
+	for input, want := range map[string]string{
+		"HTTPS://Registry.Example:443/":    "https://registry.example",
+		"https://registry.example/base/":   "https://registry.example/base",
+		"http://127.0.0.1:8080":            "http://127.0.0.1:8080",
+		"http://[::1]:80/":                 "http://[::1]",
+		"https://registry.example:8443/x/": "https://registry.example:8443/x",
+	} {
+		parsed, err := url.Parse(input)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := normalizeEndpoint(parsed); got != want {
+			t.Fatalf("normalizeEndpoint(%q) = %q, want %q", input, got, want)
+		}
 	}
 }
 

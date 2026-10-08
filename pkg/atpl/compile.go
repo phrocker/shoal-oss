@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"sort"
 	"time"
+	"unicode/utf8"
 
 	"github.com/phrocker/shoal-oss/pkg/explorer/fleet"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
@@ -246,6 +247,10 @@ func compileExecutors(documents []Document) (map[string]ExecutorBound, error) {
 	for _, document := range documents {
 		for i, executor := range document.Executors {
 			path := "executors" + selector("ref", executor.Ref, i)
+			if !utf8.ValidString(executor.Ref) {
+				return nil, refuse(document.name, "executors"+selector("", "", i)+".ref",
+					"is not valid UTF-8")
+			}
 			if executor.Ref == "" || len(executor.Ref) > fleet.MaxExecutorRefBytes ||
 				trimmed(executor.Ref) != executor.Ref {
 				return nil, refuse(document.name, path+".ref",

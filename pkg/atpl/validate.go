@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/phrocker/shoal-oss/pkg/explorer/fleet"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
@@ -44,6 +45,9 @@ const knownEffects = "reads-corpus, egresses-content, external"
 type compiledAgent struct {
 	spec fleet.Spec
 	ttl  time.Duration
+	// chain is how many registrations Register's activeChain walks from this
+	// agent to its root, this agent included.
+	chain int
 }
 
 type compiler struct {
@@ -64,6 +68,9 @@ type parentView struct {
 	lease        time.Time
 	ttl          time.Duration
 	live         bool
+	// chain is the parent's own chain length; Register refuses a child whose
+	// parent chain has already reached fleet.MaxDelegationDepth.
+	chain int
 }
 
 func (c *compiler) agent(entry declaredAgent) (compiledAgent, error) {
@@ -80,6 +87,15 @@ func (c *compiler) agent(entry declaredAgent) (compiledAgent, error) {
 	if err := shoal.ValidateRequiredID("agent ID", id); err != nil {
 		return compiledAgent{}, fail("id", errorMessage(err))
 	}
+	// Compile accepts documents built in code, which need not have come
+	// through Decode. Every string that reaches the digest must be UTF-8, or
+	// encoding/json would replace invalid bytes and two different policies
+	// would share one digest.
+	for _, field := range agentStrings(agent) {
+		if !utf8.ValidString(field.value) {
+			return compiledAgent{}, fail(field.path, "is not valid UTF-8")
+		}
+	}
 	parentID := shoal.ID(agent.Parent)
 	if err := shoal.ValidateOptionalID("parent agent ID", parentID); err != nil {
 		return compiledAgent{}, fail("parent", errorMessage(err))
@@ -87,6 +103,15 @@ func (c *compiler) agent(entry declaredAgent) (compiledAgent, error) {
 	parent, err := c.parent(parentID)
 	if err != nil {
 		return compiledAgent{}, fail("parent", err.Error())
+	}
+	chain := 1
+	if parent != nil {
+		if parent.chain >= fleet.MaxDelegationDepth {
+			return compiledAgent{}, fail("parent", fmt.Sprintf(
+				"delegation depth exceeds %d: %s already heads a chain of %d registrations",
+				fleet.MaxDelegationDepth, parent.label, parent.chain))
+		}
+		chain = parent.chain + 1
 	}
 
 	domain := []byte(agent.AuthorizationDomain)
@@ -134,9 +159,10 @@ func (c *compiler) agent(entry declaredAgent) (compiledAgent, error) {
 	if err != nil {
 		return compiledAgent{}, fail("lease_ttl", "must be a duration such as \"12h\" or \"90m\"")
 	}
-	if ttl <= 0 || ttl > fleet.MaxLease {
+	if ttl <= 0 || ttl > MaxLeaseTTL {
 		return compiledAgent{}, fail("lease_ttl", fmt.Sprintf(
-			"must be positive and at most %s", fleet.MaxLease))
+			"must be positive and at most %s (the registry's %s less %s for clock skew)",
+			MaxLeaseTTL, fleet.MaxLease, SkewMargin))
 	}
 	lease := c.now.Add(ttl)
 	if parent != nil && lease.After(parent.lease) {
@@ -222,7 +248,38 @@ func (c *compiler) agent(entry declaredAgent) (compiledAgent, error) {
 		spec.LeaseExpiresAt.After(parent.lease)) {
 		return compiledAgent{}, fail("", "delegated agent exceeds its parent "+parent.label)
 	}
-	return compiledAgent{spec: spec, ttl: ttl}, nil
+	return compiledAgent{spec: spec, ttl: ttl, chain: chain}, nil
+}
+
+type stringField struct {
+	path  string
+	value string
+}
+
+// agentStrings lists every string field of an agent with its path.
+func agentStrings(agent Agent) []stringField {
+	fields := []stringField{
+		{"id", agent.ID}, {"parent", agent.Parent},
+		{"authorization_domain", agent.AuthorizationDomain},
+		{"executor_ref", agent.ExecutorRef}, {"lease_ttl", agent.LeaseTTL},
+	}
+	for i, scope := range agent.Scopes {
+		fields = append(fields,
+			stringField{fmt.Sprintf("scopes[%d].source_id", i), scope.SourceID},
+			stringField{fmt.Sprintf("scopes[%d].policy_id", i), scope.PolicyID})
+	}
+	for i, capability := range agent.Capabilities {
+		capabilityPath := fmt.Sprintf("capabilities[%d]", i)
+		fields = append(fields, stringField{capabilityPath + ".name", capability.Name})
+		for j, action := range capability.Actions {
+			actionPath := fmt.Sprintf("%s.actions[%d]", capabilityPath, j)
+			fields = append(fields, stringField{actionPath + ".name", action.Name})
+			for k, effect := range action.Effects {
+				fields = append(fields, stringField{fmt.Sprintf("%s.effects[%d]", actionPath, k), effect})
+			}
+		}
+	}
+	return fields
 }
 
 func (c *compiler) parent(id shoal.ID) (*parentView, error) {
@@ -234,7 +291,7 @@ func (c *compiler) parent(id shoal.ID) (*parentView, error) {
 		return &parentView{
 			label: label, domain: compiled.spec.AuthorizationDomain,
 			scopes: compiled.spec.Scopes, capabilities: compiled.spec.Capabilities,
-			lease: compiled.spec.LeaseExpiresAt, ttl: compiled.ttl,
+			lease: compiled.spec.LeaseExpiresAt, ttl: compiled.ttl, chain: compiled.chain,
 		}, nil
 	}
 	if c.live == nil {
@@ -245,14 +302,62 @@ func (c *compiler) parent(id shoal.ID) (*parentView, error) {
 	if !ok {
 		return nil, fmt.Errorf("%s is neither declared in the policy nor live in the registry", label)
 	}
-	if !descriptor.RevokedAt.IsZero() || !c.now.Before(descriptor.LeaseExpiresAt) {
-		return nil, fmt.Errorf("%s is revoked or expired; the registry refuses delegation from it", label)
+	chain, err := c.liveChain(id)
+	if err != nil {
+		return nil, err
 	}
 	return &parentView{
 		label: label + " (live)", domain: descriptor.AuthorizationDomain,
 		scopes: descriptor.Scopes, capabilities: descriptor.Capabilities,
-		lease: descriptor.LeaseExpiresAt, live: true,
+		lease: descriptor.LeaseExpiresAt, live: true, chain: chain,
 	}, nil
+}
+
+// liveChain re-composes Register's activeChain over the live registrations a
+// policy delegates from: it walks from id to the root, refusing an ancestor
+// that is missing, revoked or expired, a cycle, a chain at the depth bound,
+// and any link that no longer narrows its parent (validateDelegationChain).
+// It returns the chain's length.
+func (c *compiler) liveChain(id shoal.ID) (int, error) {
+	chain := make([]fleet.Descriptor, 0, fleet.MaxDelegationDepth)
+	seen := make(map[shoal.ID]struct{}, fleet.MaxDelegationDepth)
+	for current := id; ; {
+		if len(chain) == fleet.MaxDelegationDepth {
+			return 0, fmt.Errorf("the live delegation chain above %s exceeds %d registrations",
+				agentPath(id), fleet.MaxDelegationDepth)
+		}
+		if _, cycle := seen[current]; cycle {
+			return 0, fmt.Errorf("the live delegation chain above %s forms a cycle", agentPath(id))
+		}
+		seen[current] = struct{}{}
+		descriptor, ok := c.live[current]
+		if !ok {
+			return 0, fmt.Errorf("live ancestor %s is not visible in the registry; "+
+				"the registry refuses delegation through it", agentPath(current))
+		}
+		if !descriptor.RevokedAt.IsZero() || !c.now.Before(descriptor.LeaseExpiresAt) {
+			return 0, fmt.Errorf("live ancestor %s is revoked or expired; "+
+				"the registry refuses delegation through it", agentPath(current))
+		}
+		chain = append(chain, descriptor)
+		if descriptor.ParentID == "" {
+			break
+		}
+		current = descriptor.ParentID
+	}
+	for i := 0; i+1 < len(chain); i++ {
+		child, parent := chain[i], chain[i+1]
+		reason := exceeds(linkFromDescriptor(child), linkFromDescriptor(parent))
+		if reason == "" && child.Subject != parent.Subject {
+			reason = "subjects differ"
+		}
+		if reason != "" {
+			return 0, fmt.Errorf("live link from %s to %s no longer narrows (%s); "+
+				"the registry refuses delegation through it",
+				agentPath(child.ID), agentPath(parent.ID), reason)
+		}
+	}
+	return len(chain), nil
 }
 
 // locatedError is a refusal about one field of an action.

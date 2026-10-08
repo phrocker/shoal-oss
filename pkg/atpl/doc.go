@@ -49,8 +49,9 @@
 // docs/gateways.md, "What comes from ATPL".
 //
 // ATPL's approval (marginal outcome) and runtime attestation are adopted but
-// not yet compiled: approval waits on admission approval (#451), attestation on
-// recorded runtime attestation (#446), and admission obligations on a later
-// slice of #452. Those fields are refused by name until a later format version
-// can compile them, so a file never appears to grant something it does not.
+// not yet compiled: approval waits on admission approval (#451) and
+// attestation on recorded runtime attestation (#446). Admission obligations are
+// computed per request at admission rather than declared per agent, and how a
+// policy would constrain them is deferred. Those fields are refused by name, so
+// a file never appears to grant something it does not.
 package atpl
