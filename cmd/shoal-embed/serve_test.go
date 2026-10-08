@@ -1190,3 +1190,69 @@ func TestMetricsAddrFromFlags(t *testing.T) {
 		})
 	}
 }
+
+// TestServeResultAttributesStoppedOnlyToARequestedStop pins the distinction
+// serveResult draws (#473): grpc.ErrServerStopped is a clean return only once
+// Stop was requested, and every other error is reported as is.
+func TestServeResultAttributesStoppedOnlyToARequestedStop(t *testing.T) {
+	other := errors.New("accept: too many open files")
+	for _, tc := range []struct {
+		name    string
+		stopped bool
+		err     error
+		want    error
+	}{
+		{"clean return", false, nil, nil},
+		{"stopped before Stop was requested", false, grpc.ErrServerStopped, grpc.ErrServerStopped},
+		{"stopped after Stop was requested", true, grpc.ErrServerStopped, nil},
+		{"another error after Stop was requested", true, other, other},
+		{"another error without Stop", false, other, other},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := &serveHandle{}
+			h.stopRequested.Store(tc.stopped)
+			if got := h.serveResult(tc.err); !errors.Is(got, tc.want) || (tc.want == nil) != (got == nil) {
+				t.Fatalf("serveResult(%v) with stop requested=%v = %v, want %v", tc.err, tc.stopped, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestServeHandleStopBeforeServeReachesGRPC is the race #473 reported, with
+// the ordering forced the bad way round: Stop is requested before Serve is
+// even called, so gRPC is stopped before Serve can reach its accept loop.
+// Serve and Stop must both still report a clean shutdown.
+func TestServeHandleStopBeforeServeReachesGRPC(t *testing.T) {
+	h := newRawTestServeHandle(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	stopErrCh := make(chan error, 1)
+	go func() { stopErrCh <- h.Stop(ctx) }()
+	deadline := time.Now().Add(5 * time.Second)
+	for !h.stopRequested.Load() {
+		if time.Now().After(deadline) {
+			t.Fatal("Stop did not record the request within 5s")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	serveErrCh := make(chan error, 1)
+	go func() { serveErrCh <- h.Serve() }()
+	select {
+	case err := <-serveErrCh:
+		if err != nil {
+			t.Fatalf("Serve() = %v after Stop was requested, want nil", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Serve did not return within 5s of a requested Stop")
+	}
+	select {
+	case err := <-stopErrCh:
+		if err != nil {
+			t.Fatalf("Stop(ctx) = %v, want nil", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Stop did not return within 5s")
+	}
+}
