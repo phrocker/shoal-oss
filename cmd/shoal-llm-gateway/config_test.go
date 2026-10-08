@@ -165,29 +165,35 @@ func TestAnUnreportableTokenIsRefusedBeforeTheEgress(t *testing.T) {
 	for _, probe := range []struct {
 		name  string
 		token *admissionapi.Token
+		// echo makes the fake carry back the token ID this proxy sent. Every
+		// probe not about the ID itself needs it: without it the probe is
+		// refused for naming a different claim before the property it names
+		// is ever checked, and the check under test could be deleted unseen.
+		echo bool
 	}{
-		{"absent", nil},
-		{"empty", &admissionapi.Token{}},
+		{"absent", nil, false},
+		{"empty", &admissionapi.Token{}, false},
 		{"unparseable action ID", &admissionapi.Token{
 			ActionID: "not base64!", TokenID: "dG9rZW4", Version: 1,
-			ExpiresAt: now.Add(time.Minute)}},
+			ExpiresAt: now.Add(time.Minute)}, true},
 		{"unparseable token ID", &admissionapi.Token{
 			ActionID: "YWN0aW9u", TokenID: "not base64!", Version: 1,
-			ExpiresAt: now.Add(time.Minute)}},
+			ExpiresAt: now.Add(time.Minute)}, false},
 		{"zero version", &admissionapi.Token{
 			ActionID: "YWN0aW9u", TokenID: "dG9rZW4", Version: 0,
-			ExpiresAt: now.Add(time.Minute)}},
+			ExpiresAt: now.Add(time.Minute)}, true},
 		{"already expired", &admissionapi.Token{
 			ActionID: "YWN0aW9u", TokenID: "dG9rZW4", Version: 1,
-			ExpiresAt: now.Add(-time.Second)}},
+			ExpiresAt: now.Add(-time.Second)}, true},
 		{"expiring inside the report window", &admissionapi.Token{
 			ActionID: "YWN0aW9u", TokenID: "dG9rZW4", Version: 1,
-			ExpiresAt: now.Add(minimumReportWindow / 2)}},
+			ExpiresAt: now.Add(minimumReportWindow / 2)}, true},
 		// The byte bound is covered separately, in
 		// TestAnOversizedActionIDIsRefusedBeforeTheEgress. Probes for it were
-		// here first and could not fail: this table disables token echo, so
-		// every token in it is already refused for naming a different claim,
-		// and the bound was never what the assertion measured.
+		// here first and could not fail: they ran without token echo, so every
+		// token was already refused for naming a different claim, and the
+		// bound was never what the assertion measured. The expiry probes had
+		// the same flaw until they were given an echoing plane (see echo).
 		//
 		// The shape the check was written to let through. It read "if an
 		// expiry is set and it is too close", so a plane answering without one
@@ -196,13 +202,11 @@ func TestAnUnreportableTokenIsRefusedBeforeTheEgress(t *testing.T) {
 		// unknown, and an unknown deadline cannot be shown to leave room —
 		// which makes this the one case the whole guard most needed to catch.
 		{"no expiry at all", &admissionapi.Token{
-			ActionID: "YWN0aW9u", TokenID: "dG9rZW4", Version: 1}},
+			ActionID: "YWN0aW9u", TokenID: "dG9rZW4", Version: 1}, true},
 	} {
 		plane := newFakePlane(t, admissionapi.OutcomeAllowed, nil)
 		plane.token = probe.token
-		// These probes are about the token's own shape, so the fixture must
-		// not echo a usable ID over the one under test.
-		plane.echoTokenID = false
+		plane.echoTokenID = probe.echo
 		upstream := newFakeUpstream(t)
 		governed, _ := newTestProxy(t, plane, upstream)
 
@@ -212,6 +216,14 @@ func TestAnUnreportableTokenIsRefusedBeforeTheEgress(t *testing.T) {
 		}
 		if upstream.calls != 0 {
 			t.Fatalf("%s token: the egress happened anyway", probe.name)
+		}
+		// Refused at admission, not discovered later: the proxy's own
+		// pre-egress budget check would also stop an expiring grant, but it
+		// spends a failure report doing so. No report means the grant never
+		// got past the reportability check this table exists to pin.
+		if len(plane.reports) != 0 {
+			t.Fatalf("%s token: refused only after admission (%d reports)",
+				probe.name, len(plane.reports))
 		}
 	}
 
