@@ -407,6 +407,29 @@ refuses_citing "holds a control character" "a newline in the image tag" "${llm_g
           securityContext: {}'
 refuses_citing "holds a comma" "a comma inside one allowed host" "${llm_gateway_base[@]}" --set-string 'llmGateway.allowedHosts[0]=a.example.test\,b.example.test'
 refuses_citing "holds a comma" "a comma inside one model" "${llm_gateway_base[@]}" --set-string 'llmGateway.models[0]=gpt-4o\,claude-opus-5'
+# Structural, so a newly added field or argument cannot be left out of it: in
+# the rendered gateway Deployment no container argument is a bare scalar, and
+# every value-shaped field is double-quoted unless it is one of the template's
+# own constants.
+gateway_scalars_quoted() {
+  local description="$1"; shift
+  local rendered stray
+  if ! rendered=$(helm template shoal "$chart" "$@" -s templates/llm-gateway-deployment.yaml 2>&1); then
+    fail "should render but was refused: $description"
+    return
+  fi
+  stray=$(printf '%s\n' "$rendered" | grep -E '^ +- -' || true)
+  stray+=$'\n'$(printf '%s\n' "$rendered" |
+    grep -E '^ +(- )?(name|key|secretName|mountPath|audience|path|image|imagePullPolicy|serviceAccountName|type): [^"]' |
+    grep -vE ': (shoal-llm-gateway|RollingUpdate|RuntimeDefault|http|health|admission-token|upstream-api-key|/readyz|/healthz)$' || true)
+  stray=$(printf '%s\n' "$stray" | sed '/^$/d')
+  if [ -n "$stray" ]; then
+    fail "an unquoted value in the gateway Deployment: $description"
+    printf '%s\n' "$stray" | head -3 | sed 's/^/      /'
+  fi
+}
+gateway_scalars_quoted "env-form credentials" "${llm_gateway_base[@]}"
+
 # Each class of rendered value is asserted quoted, so reverting the quoting of
 # any one of them fails here rather than only behind the guard.
 both_files=("${llm_gateway_base[@]}" "${valid_token_file[@]}" --set llmGateway.upstream.apiKeyFile=/etc/shoal/upstream/api-key --set llmGateway.upstream.apiKeyFileSource=secret)
@@ -422,6 +445,7 @@ assert_renders "a projected token audience is quoted" '^ +audience: "shoal"$' "$
 assert_renders "a projected token path is quoted" '^ +path: "token"$' "${both_files[@]}"
 assert_renders "a credential volume's Secret is quoted" '^ +secretName: "shoal-upstream-key"$' "${both_files[@]}"
 assert_renders "a credential volume's item key is quoted" '^ +- key: "api-key"$' "${both_files[@]}"
+gateway_scalars_quoted "file-form credentials" "${both_files[@]}"
 # The credential volumes are built by a helper the arguments do not pass
 # through, so its inputs carry the payload too.
 refuses_citing "holds a control character" "a newline in a credential volume's Secret key" "${both_files[@]}" --set-string 'llmGateway.upstream.credentialSecretKey=other-key
