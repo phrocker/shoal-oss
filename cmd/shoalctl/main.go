@@ -19,7 +19,7 @@ func main() {
 
 func run(args []string, stdout, stderr io.Writer) error {
 	if len(args) == 0 {
-		return errors.New("expected command: plan, status, transition, or embedding-backfill")
+		return errors.New("expected command: plan, status, transition, embedding-backfill, or policy")
 	}
 	switch args[0] {
 	case "plan":
@@ -30,8 +30,10 @@ func run(args []string, stdout, stderr io.Writer) error {
 		return runTransition(args[1:], stdout, stderr)
 	case "embedding-backfill":
 		return runEmbeddingBackfill(args[1:], stdout, stderr)
+	case "policy":
+		return runPolicy(args[1:], stdout, stderr)
 	default:
-		return fmt.Errorf("unknown command %q; expected plan, status, transition, or embedding-backfill", args[0])
+		return fmt.Errorf("unknown command %q; expected plan, status, transition, embedding-backfill, or policy", args[0])
 	}
 }
 
