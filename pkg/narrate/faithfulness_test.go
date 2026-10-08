@@ -15,12 +15,17 @@ import (
 
 // A failed record's ErrorCode is whatever the executor reported: fleet checks
 // only its length and whitespace, so an executor can report a gateway code or
-// one fleet itself writes. Every error sentence is therefore a report, never a
-// finding, and retry advice depends only on the record's EffectPossible.
+// one fleet itself writes (#508). Every error sentence is therefore a report,
+// never a finding. EffectPossible carries no information on a completed
+// record — completion sets it unconditionally and Validate requires it on a
+// failure (#510) — so retry advice never depends on it: a failure's next step
+// is always to reconcile with the target, and nothing a terminal record says
+// cites EffectPossible.
 func TestErrorCodesAreReportsNotFindings(t *testing.T) {
 	r := New(nil)
 	codes := append(sourceErrorCodes(t), "made up by an executor")
 	for _, code := range codes {
+		var nexts []string
 		for _, effect := range []bool{true, false} {
 			record := action(fleet.DispatchFailed)
 			record.ErrorCode = code
@@ -30,10 +35,13 @@ func TestErrorCodesAreReportsNotFindings(t *testing.T) {
 				t.Fatal(err)
 			}
 			for _, s := range sentences {
+				text := strings.ToLower(s.Text)
+				if strings.Contains(text, "effect as possible") || strings.Contains(text, "may already have happened") {
+					t.Errorf("%s: a terminal record cites EffectPossible: %s", code, s.Text)
+				}
 				if !strings.HasPrefix(s.Key, "dispatch.error.") {
 					continue
 				}
-				text := strings.ToLower(s.Text)
 				switch s.Role {
 				case RoleReason:
 					if !strings.Contains(text, "reported") {
@@ -46,22 +54,78 @@ func TestErrorCodesAreReportsNotFindings(t *testing.T) {
 						t.Errorf("%s: reason does not name the reporter", code)
 					}
 				case RoleNext:
-					possible := strings.Contains(text, "marks an effect as possible")
-					if possible != effect {
-						t.Errorf("%s effect=%v: next step ignores EffectPossible: %s", code, effect, s.Text)
+					nexts = append(nexts, s.Text)
+					if !strings.HasPrefix(text, "reconcile with the target") {
+						t.Errorf("%s: next step does not start with reconciliation: %s", code, s.Text)
 					}
-					if effect {
-						if !strings.Contains(text, "reconcile") && !strings.Contains(text, "confirm") {
-							t.Errorf("%s: next step does not require reconciliation: %s", code, s.Text)
-						}
-						for _, unsafe := range []string{"without repeating", "safe to", "can be requested again"} {
-							if strings.Contains(text, unsafe) {
-								t.Errorf("%s: next step advises a retry while an effect is possible: %s", code, s.Text)
-							}
+					for _, unsafe := range []string{"without repeating", "safe to", "can be requested again"} {
+						if strings.Contains(text, unsafe) {
+							t.Errorf("%s: next step advises a retry: %s", code, s.Text)
 						}
 					}
 				}
 			}
+		}
+		if len(nexts) != 2 || nexts[0] != nexts[1] {
+			t.Errorf("%s: next step depends on EffectPossible: %q", code, nexts)
+		}
+	}
+	// A succeeded record says nothing about EffectPossible either.
+	for _, effect := range []bool{true, false} {
+		record := action(fleet.DispatchSucceeded)
+		record.EffectPossible = effect
+		sentences, err := r.Action(record, Options{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, s := range sentences {
+			if strings.Contains(s.Text, "effect as possible") || strings.Contains(s.Text, "may already have happened") {
+				t.Errorf("succeeded record cites EffectPossible: %s", s.Text)
+			}
+		}
+	}
+}
+
+// Admissions are reported by the identity that requested them; histories and
+// outcomes name it, never an unrecorded claimant.
+func TestAdmissionReporterIsTheRequester(t *testing.T) {
+	r := New(nil)
+	granted := admission(fleet.DispatchClaimed)
+	for _, end := range []fleet.DispatchState{fleet.DispatchSucceeded, fleet.DispatchFailed} {
+		finished := admission(end)
+		finished.Version = granted.Version + 1
+		kind := "action.completed"
+		if end == fleet.DispatchFailed {
+			kind = "action.failed"
+		}
+		history, err := r.ActionHistory([]fleet.ActionTransition{
+			{ID: []byte("t1"), Kind: "action.claimed", Record: granted},
+			{ID: []byte("t2"), Kind: kind, Record: finished},
+		}, Options{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		last := history[len(history)-1]
+		if !strings.Contains(last.Text, "alice reported") || !hasRef(last, "principal", "alice") ||
+			strings.Contains(last.Text, "unrecorded") {
+			t.Errorf("%s: admission report not attributed to the requester: %s %v", end, last.Text, last.Refs)
+		}
+		sentences, err := r.Action(finished, Options{QuoteOutput: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, s := range sentences {
+			if strings.Contains(s.Text, "unrecorded principal") {
+				t.Errorf("%s: %s", end, s.Text)
+			}
+			for _, q := range s.Quotes {
+				if s.Key == "dispatch.detail.output" && q.By != "alice" {
+					t.Errorf("%s: output attributed to %q", end, q.By)
+				}
+			}
+		}
+		if !strings.Contains(sentences[0].Text, "reported as "+string(end)+" by alice") {
+			t.Errorf("%s: outcome %q", end, sentences[0].Text)
 		}
 	}
 }

@@ -164,12 +164,12 @@ const (
 	DispatchQueued DispatchState = "queued"
 	DispatchHeld   DispatchState = "held"
 )
-type R struct{ State DispatchState }
-func f(r *R, x DispatchState) {
+type ActionRecord struct{ State DispatchState }
+func f(r *ActionRecord) {
 	r.State = DispatchHeld
-	_ = R{State: DispatchQueued}
+	_ = ActionRecord{State: DispatchQueued}
 }
-func actionEventKind(r R) string {
+func actionEventKind(r ActionRecord) string {
 	switch r.State {
 	case DispatchQueued:
 		return "action.enqueued"
@@ -280,4 +280,117 @@ func mustJSON(t *testing.T, v any) []byte {
 		t.Fatal(err)
 	}
 	return data
+}
+
+// A translation may read an argument only under the select arms English
+// reads it under: outside them the renderer does not supply it, or supplies
+// a placeholder.
+func TestCatalogRefusesArgumentsOutsideTheirArm(t *testing.T) {
+	load := func(key, pattern string) error {
+		var file CatalogFile
+		if err := json.Unmarshal(englishCatalog, &file); err != nil {
+			t.Fatal(err)
+		}
+		file.Messages[key] = pattern
+		_, err := ParseCatalog(mustJSON(t, file))
+		return err
+	}
+	for key, pattern := range map[string]string{
+		// {left} exists only when timed=yes: a render would fail.
+		"approval.blocked.pending": "Waiting; {left, duration} remain.",
+		// p is a placeholder 0 unless reported=yes: a fabricated probability.
+		"decision.answer.choice": "{subject} {question}: {label} ({p, number}).",
+		// Under the wrong arm of the right selector.
+		"approval.blocked.approved": "Waiting{timed, select, yes {} other { {left, duration}}}.",
+	} {
+		if err := load(key, pattern); err == nil {
+			t.Errorf("%s: %q was accepted", key, pattern)
+		}
+	}
+	for key, pattern := range map[string]string{
+		// Same arm, reworded, and nested more deeply still encloses it.
+		"approval.blocked.pending":  "Waiting for an approver{timed, select, yes { ({left, duration} left)} other {}}.",
+		"decision.answer.choice":    "{subject}/{question}: {label}{reported, select, yes {{reported, select, yes { p={p, number}} other {}}} other {}}.",
+		"approval.blocked.approved": "Waiting.",
+	} {
+		if err := load(key, pattern); err != nil {
+			t.Errorf("%s: %q was refused: %v", key, pattern, err)
+		}
+	}
+}
+
+func TestAnalyzersFailClosedOnUnreadForms(t *testing.T) {
+	header := `package p
+type ApprovalState string
+type ApprovalCondition string
+const (
+	Pending ApprovalState = "pending"
+	Unresolvable ApprovalState = "unresolvable"
+)
+const (
+	None ApprovalCondition = ""
+	Moved ApprovalCondition = "moved"
+)
+type S struct{}
+`
+	for name, body := range map[string]string{
+		"helper return": `
+func (s *S) unreachable() (ApprovalCondition, error) { return Moved, nil }
+func (s *S) helper() (ApprovalState, ApprovalCondition, error) { return Pending, None, nil }
+func (s *S) effectiveState(x bool) (ApprovalState, ApprovalCondition, error) {
+	if x {
+		return s.helper()
+	}
+	return Pending, None, nil
+}
+`,
+		"unreachable variable": `
+func (s *S) unreachable() (ApprovalCondition, error) { c := Moved; return c, nil }
+func (s *S) effectiveState() (ApprovalState, ApprovalCondition, error) { return Pending, None, nil }
+`,
+		"unreachable helper": `
+func (s *S) other() (ApprovalCondition, error) { return Moved, nil }
+func (s *S) unreachable() (ApprovalCondition, error) { return s.other() }
+func (s *S) effectiveState() (ApprovalState, ApprovalCondition, error) { return Pending, None, nil }
+`,
+	} {
+		if _, problems := effectiveStatePairs(parseSource(t, header+body)); len(problems) == 0 {
+			t.Errorf("effectiveState %s: no problem reported", name)
+		}
+	}
+	dispatchHeader := `package p
+type DispatchState string
+const DispatchQueued DispatchState = "queued"
+type ActionRecord struct{ State DispatchState }
+func actionEventKind(r ActionRecord) string { switch r.State { case DispatchQueued: return "action.enqueued" }; return "" }
+func pick() DispatchState { return DispatchQueued }
+`
+	for name, body := range map[string]string{
+		"assign variable":  `func f(r *ActionRecord, next DispatchState) { r.State = next }`,
+		"literal variable": `func f(next DispatchState) { _ = ActionRecord{State: next} }`,
+		"assign call":      `func f(r *ActionRecord) { r.State = pick() }`,
+		"elided literal":   `func f(next DispatchState) { _ = []ActionRecord{{State: next}} }`,
+	} {
+		if _, _, problems := dispatchDestinations(parseSource(t, dispatchHeader+body)); len(problems) == 0 {
+			t.Errorf("dispatch %s: no problem reported", name)
+		}
+	}
+	// Approval states assigned in the same package are another vocabulary
+	// and are not problems; a copy of another State field carries a value
+	// read where it was set.
+	clean := dispatchHeader + `
+type ApprovalState string
+const Approved ApprovalState = "approved"
+type ApprovalRecord struct{ State ApprovalState }
+type ApprovalStatus struct{ State ApprovalState }
+func f(r *ActionRecord, a *ApprovalRecord, other ActionRecord, s ApprovalState) {
+	a.State = Approved
+	r.State = other.State
+	_ = ApprovalStatus{State: s}
+	_ = ApprovalRecord{State: Approved}
+}
+`
+	if _, _, problems := dispatchDestinations(parseSource(t, clean)); len(problems) != 0 {
+		t.Errorf("clean dispatch source reported %v", problems)
+	}
 }

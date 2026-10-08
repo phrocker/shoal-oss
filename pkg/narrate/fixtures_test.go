@@ -63,6 +63,10 @@ func action(state fleet.DispatchState) fleet.ActionRecord {
 func admission(state fleet.DispatchState) fleet.ActionRecord {
 	r := action(state)
 	r.AdmittedEffects = fleet.Effects{fleet.EffectEgressesContent, fleet.EffectMutatesExternal}
+	// The claimant fields action() copies are cleared: an admission is
+	// reported by the identity that requested it, and the renderer must name
+	// that identity whether or not the claim recorded a claimant.
+	r.ClaimantSubject, r.ClaimantActor = "", ""
 	if state == fleet.DispatchCanceled {
 		r.ClaimID, r.ClaimFence, r.ClaimLease = nil, 0, 0
 		r.ClaimLeaseUntil = time.Time{}

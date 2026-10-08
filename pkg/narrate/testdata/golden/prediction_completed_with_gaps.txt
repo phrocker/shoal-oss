@@ -15,7 +15,7 @@ reason decision.answer.probability
   record=prediction:decision:prediction:v1:ef2bab5d15280e1b629d3e35d648688b9a2e85aaac02fa81d3d7152d51f25d03 subject=subject1 evidence=evidence-anchor:201dfc0147b8fc3e13637619547ca21739ad1f1fa277371759250ed9237cd01f
   identifiers subject1 risk
 reason decision.answer.abstained.unavailable
-  For subject subject2, question priority, the predictor abstained: no answer was available.
+  For subject subject2, question priority, the predictor reported that no answer was available.
   record=prediction:decision:prediction:v1:ef2bab5d15280e1b629d3e35d648688b9a2e85aaac02fa81d3d7152d51f25d03 subject=subject2
   identifiers subject2 priority
 reason decision.answers.more

@@ -57,8 +57,26 @@ func (b *builder) actionArgs(record fleet.ActionRecord) Args {
 		"lease":      record.ClaimLease,
 		"requester":  b.principal(string(record.Actor), string(record.Subject)),
 		"claimant":   b.principal(string(record.ClaimantActor), string(record.ClaimantSubject)),
-		"effect":     yesNo(record.EffectPossible),
+		"reporter":   b.reporter(record),
+		"claimed":    yesNo(record.ClaimFence > 0),
 	}
+}
+
+// reporter names who reports a claimed record's outcome: the admitted caller
+// for an admission, which is reported by the identity that requested it, and
+// the claimant otherwise.
+func (b *builder) reporter(record fleet.ActionRecord) Fragment {
+	if isAdmission(record) {
+		return b.principal(string(record.Actor), string(record.Subject))
+	}
+	return b.principal(string(record.ClaimantActor), string(record.ClaimantSubject))
+}
+
+func reporterName(record fleet.ActionRecord) string {
+	if isAdmission(record) {
+		return firstNonEmpty(string(record.Actor), string(record.Subject))
+	}
+	return firstNonEmpty(string(record.ClaimantActor), string(record.ClaimantSubject))
 }
 
 func withArgs(base Args, extra Args) Args {
@@ -144,7 +162,7 @@ func (r *Renderer) Action(record fleet.ActionRecord, opts Options) ([]Sentence, 
 		return b.finish()
 	}
 	outcomeRefs := actionRefs(record)
-	if state == fleet.DispatchSucceeded {
+	if state == fleet.DispatchSucceeded || state == fleet.DispatchFailed {
 		outcomeRefs = append(outcomeRefs, reporterRefs(record)...)
 	}
 	b.add(RoleOutcome, "dispatch.outcome."+string(state), args, outcomeRefs...)
@@ -175,7 +193,12 @@ func (r *Renderer) Action(record fleet.ActionRecord, opts Options) ([]Sentence, 
 	}
 
 	// What the record cannot establish.
-	if record.EffectPossible && state != fleet.DispatchSucceeded {
+	//
+	// EffectPossible is read only while a claim is open, where it is set from
+	// the action's declared effects when the claim is taken. On a completed
+	// record it says nothing: completion sets it unconditionally and Validate
+	// refuses a terminal record without it (#508; #510 makes it answerable).
+	if record.EffectPossible && state == fleet.DispatchClaimed {
 		b.add(RoleGap, "dispatch.gap.effect_possible", args)
 	}
 	if state == fleet.DispatchSucceeded && len(record.Evidence) == 0 {
@@ -227,8 +250,7 @@ func (r *Renderer) Action(record fleet.ActionRecord, opts Options) ([]Sentence, 
 	}
 	if opts.QuoteOutput && len(record.Output) > 0 {
 		b.add(RoleDetail, "dispatch.detail.output", withArgs(args, Args{
-			"output": b.quote(AttributedToExecutor,
-				firstNonEmpty(string(record.ClaimantActor), string(record.ClaimantSubject)), string(record.Output)),
+			"output": b.quote(AttributedToExecutor, reporterName(record), string(record.Output)),
 		}), reporterRefs(record)...)
 	}
 	return b.finish()
@@ -396,8 +418,10 @@ func (r *Renderer) ActionHistory(transitions []fleet.ActionTransition, opts Opti
 		switch edge.Name {
 		case "enqueue", "admit", "deny":
 			refs = append(refs, requesterRefs(t.Record)...)
-		case "claim", "reclaim", "complete", "fail":
+		case "claim", "reclaim":
 			refs = append(refs, claimantRefs(t.Record)...)
+		case "complete", "fail":
+			refs = append(refs, reporterRefs(t.Record)...)
 		}
 		extra := Args{}
 		if edge.Name == "fail" {

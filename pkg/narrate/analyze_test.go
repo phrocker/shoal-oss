@@ -12,7 +12,6 @@ import (
 	"path"
 	"sort"
 	"strconv"
-	"strings"
 	"testing"
 )
 
@@ -272,11 +271,25 @@ func effectiveStatePairs(files []*ast.File) ([][2]string, []string) {
 	}
 	var conditions []string
 	ast.Inspect(unreachable.Body, func(n ast.Node) bool {
-		if ret, ok := n.(*ast.ReturnStmt); ok && len(ret.Results) == 2 {
-			name := identName(ret.Results[0])
-			if v, ok := consts[name]; ok && v != "" {
-				conditions = append(conditions, v)
-			}
+		ret, ok := n.(*ast.ReturnStmt)
+		if !ok {
+			return true
+		}
+		if len(ret.Results) != 2 {
+			problems = append(problems, "unreachable returns a form the reader cannot resolve")
+			return true
+		}
+		if s, ok := stringLit(ret.Results[0]); ok && s == "" {
+			return true // error return
+		}
+		v, ok := consts[identName(ret.Results[0])]
+		if !ok {
+			problems = append(problems, fmt.Sprintf(
+				"unreachable returns an unresolvable %T", ret.Results[0]))
+			return true
+		}
+		if v != "" {
+			conditions = append(conditions, v)
 		}
 		return true
 	})
@@ -299,6 +312,7 @@ func effectiveStatePairs(files []*ast.File) ([][2]string, []string) {
 	var walk func(stmts []ast.Stmt, caseStates []string)
 	resolve := func(ret *ast.ReturnStmt, caseStates []string) {
 		if len(ret.Results) != 3 {
+			problems = append(problems, "effectiveState returns a form the reader cannot resolve")
 			return
 		}
 		if s, ok := stringLit(ret.Results[0]); ok && s == "" {
@@ -357,40 +371,72 @@ func effectiveStatePairs(files []*ast.File) ([][2]string, []string) {
 	return pairs, problems
 }
 
-// dispatchDestinations reads every DispatchState a fleet record is set to
-// (`x.State = DispatchY` or `State: DispatchY`), and the kind actionEventKind
-// pairs with each state.
+// dispatchDestinations reads every DispatchState a fleet record is set to,
+// and the kind actionEventKind pairs with each state.
+//
+// It fails closed. A State field set by assignment, or in an ActionRecord
+// literal (or an element literal whose type is elided), must be set to a
+// DispatchState constant, a constant of another vocabulary (an approval's
+// state), or a copy of another State field; any other value — a variable, a
+// call, an expression — is a problem, since the reader cannot say which
+// states it produces. Literals of other named types are another record's
+// State and are skipped.
 func dispatchDestinations(files []*ast.File) (map[string]bool, map[string]string, []string) {
 	consts, _ := typedConstsIn(files, "DispatchState")
+	all := stringConsts(files)
 	destinations := map[string]bool{}
 	var problems []string
-	take := func(e ast.Expr) {
-		if v, ok := consts[identName(e)]; ok {
+	take := func(e ast.Expr, where string) {
+		name := identName(e)
+		if v, ok := consts[name]; ok {
 			destinations[v] = true
 			return
+		}
+		if _, ok := all[name]; ok {
+			return // a constant of another vocabulary
 		}
 		if sel, ok := e.(*ast.SelectorExpr); ok && sel.Sel.Name == "State" {
 			return // copied from another record
 		}
-		problems = append(problems, fmt.Sprintf("State set from an unresolvable %T", e))
+		problems = append(problems, fmt.Sprintf("State set %s from an unresolvable %T", where, e))
 	}
 	for _, f := range files {
 		ast.Inspect(f, func(n ast.Node) bool {
 			switch n := n.(type) {
 			case *ast.AssignStmt:
 				for i, lhs := range n.Lhs {
-					if sel, ok := lhs.(*ast.SelectorExpr); ok && sel.Sel.Name == "State" &&
-						len(n.Rhs) == len(n.Lhs) {
-						if _, isState := consts[identName(n.Rhs[i])]; isState ||
-							strings.HasPrefix(identName(n.Rhs[i]), "Dispatch") {
-							take(n.Rhs[i])
-						}
+					sel, ok := lhs.(*ast.SelectorExpr)
+					if !ok || sel.Sel.Name != "State" {
+						continue
 					}
+					if len(n.Rhs) != len(n.Lhs) {
+						problems = append(problems, "State set from a multi-value expression")
+						continue
+					}
+					take(n.Rhs[i], "by assignment")
 				}
-			case *ast.KeyValueExpr:
-				if key, ok := n.Key.(*ast.Ident); ok && key.Name == "State" &&
-					strings.HasPrefix(identName(n.Value), "Dispatch") {
-					take(n.Value)
+			case *ast.CompositeLit:
+				typeName := ""
+				switch typ := n.Type.(type) {
+				case *ast.Ident:
+					typeName = typ.Name
+				case *ast.SelectorExpr:
+					typeName = typ.Sel.Name
+				case nil:
+				default:
+					return true
+				}
+				if typeName != "" && typeName != "ActionRecord" {
+					return true
+				}
+				for _, elt := range n.Elts {
+					kv, ok := elt.(*ast.KeyValueExpr)
+					if !ok {
+						continue
+					}
+					if key, ok := kv.Key.(*ast.Ident); ok && key.Name == "State" {
+						take(kv.Value, "in a literal")
+					}
 				}
 			}
 			return true

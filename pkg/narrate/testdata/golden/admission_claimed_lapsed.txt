@@ -3,7 +3,7 @@ outcome dispatch.outcome.claimed
   record=action:act-1 agent=agent-7 request=req-1 correlation=corr-1
   identifiers close-ticket agent-7 egresses-content external
 gap dispatch.gap.effect_possible
-  The record marks an effect as possible, so Shoal cannot rule out that one happened.
+  The action declares an external or egress effect and is claimed, so an effect may already have happened.
   record=action:act-1
 history dispatch.history.requested
   alice requested admission at 2026-10-08 12:00:00 UTC, with a deadline of 2026-10-08 14:00:00 UTC.
@@ -11,7 +11,7 @@ history dispatch.history.requested
   identifiers alice
 blocked dispatch.blocked.lease_lapsed
   The lease ended at 2026-10-08 12:06:00 UTC, so the caller can no longer report on it.
-  record=action:act-1 principal=worker-1 claim=claim-1
+  record=action:act-1 claim=claim-1
 next dispatch.next.none
   Nothing further can happen to this action through dispatch.
   record=action:act-1

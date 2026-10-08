@@ -11,7 +11,7 @@ history approval.transition.approved
   record=approval:act-1 principal=bob request=req-2
   identifiers bob
 history approval.transition.expired_unused
-  Its window closed at 2026-10-08 13:00:00 UTC before the requester came back for it.
+  Its window closed at 2026-10-08 13:00:00 UTC, after it was approved and before it became work.
   record=approval:act-1
 next approval.next.final
   Nothing further can happen to this request; a new request needs its own approval.

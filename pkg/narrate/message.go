@@ -279,15 +279,28 @@ func pluralKeyword(s string) bool {
 // sentence except through a constructor that decided how to present it.
 type Args map[string]any
 
-// argUses maps every argument a pattern reads to the kinds it is read as:
-// "" for a simple argument, "number", "time", "duration", "list", "plural"
-// or "select".
-func argUses(nodes []node, into map[string]map[string]bool) {
+// argUse is one place a pattern reads an argument: the kind it reads it as
+// ("" for a simple argument, "number", "time", "duration", "list", "plural"
+// or "select") and the select arms it sits under, as "selector=arm"
+// conditions. An argument read only under an arm may be absent, or
+// meaningless, when that arm is not taken.
+type argUse struct {
+	kind  string
+	under map[string]bool
+}
+
+// argUses maps every argument a pattern reads to each place it reads it.
+func argUses(nodes []node, into map[string][]argUse) {
+	collectUses(nodes, map[string]bool{}, into)
+}
+
+func collectUses(nodes []node, under map[string]bool, into map[string][]argUse) {
 	use := func(name, kind string) {
-		if into[name] == nil {
-			into[name] = map[string]bool{}
+		copied := make(map[string]bool, len(under))
+		for c := range under {
+			copied[c] = true
 		}
-		into[name][kind] = true
+		into[name] = append(into[name], argUse{kind: kind, under: copied})
 	}
 	for _, n := range nodes {
 		switch n := n.(type) {
@@ -296,43 +309,70 @@ func argUses(nodes []node, into map[string]map[string]bool) {
 		case choiceNode:
 			if n.plural {
 				use(n.name, "plural")
-			} else {
-				use(n.name, "select")
+				// A plural chooses wording by count; every arm is given
+				// the same arguments.
+				for _, body := range n.exact {
+					collectUses(body, under, into)
+				}
+				for _, body := range n.cases {
+					collectUses(body, under, into)
+				}
+				continue
 			}
-			for _, body := range n.exact {
-				argUses(body, into)
-			}
-			for _, body := range n.cases {
-				argUses(body, into)
+			use(n.name, "select")
+			for arm, body := range n.cases {
+				inner := make(map[string]bool, len(under)+1)
+				for c := range under {
+					inner[c] = true
+				}
+				inner[n.name+"="+arm] = true
+				collectUses(body, inner, into)
 			}
 		}
 	}
 }
 
-// compatibleUse reports whether a translation may read an argument as kind,
-// given the kinds the English message reads it as. The English message is
-// the contract for what the renderer passes:
+// compatibleUse reports whether a translation may read an argument the way
+// use does, given every way the English message reads it. The English
+// message is the contract for what the renderer passes. Some English use must
+// match on both counts:
 //
-//   - the same kind is always compatible;
-//   - an argument English reads as a plural is an integer, so a translation
-//     may also read it as a number;
-//   - a plural is allowed only where English reads the argument as a plural,
-//     because "number" also carries probabilities, and a float cannot select
-//     a plural form;
-//   - a simple reference prints any value except a list or a selector.
-func compatibleUse(kind string, english map[string]bool) bool {
-	if english[kind] {
-		return true
-	}
-	switch kind {
-	case "number":
-		return english["plural"]
-	case "":
-		for e := range english {
-			if e != "list" && e != "select" {
-				return true
+//   - kind: the same kind is always compatible; an argument English reads as
+//     a plural is an integer, so it may also be read as a number; a plural is
+//     allowed only where English reads a plural, because "number" also
+//     carries probabilities and a float cannot select a plural form; a simple
+//     reference prints any value except a list or a selector;
+//   - scope: every select arm the English use sits under must enclose the
+//     translation's use too. English reads {left} only when timed=yes, and a
+//     probability only when reported=yes; outside those arms the value is
+//     absent or meaningless, so a translation may not read it there.
+func compatibleUse(use argUse, english []argUse) bool {
+	for _, e := range english {
+		if !kindCompatible(use.kind, e.kind) {
+			continue
+		}
+		enclosed := true
+		for c := range e.under {
+			if !use.under[c] {
+				enclosed = false
+				break
 			}
 		}
+		if enclosed {
+			return true
+		}
+	}
+	return false
+}
+
+func kindCompatible(kind, english string) bool {
+	switch {
+	case kind == english:
+		return true
+	case kind == "number":
+		return english == "plural"
+	case kind == "":
+		return english != "list" && english != "select"
 	}
 	return false
 }

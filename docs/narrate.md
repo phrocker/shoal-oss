@@ -100,8 +100,12 @@ a template. It is enforced three ways:
   reads an argument the English message does not read, or reads it as a kind
   the renderer does not supply. A plural is allowed only where English reads
   that argument as a plural, because `number` also carries probabilities and a
-  float cannot select a plural form. A translation therefore cannot fall back
-  to an unreviewed sentence, or fail, at run time.
+  float cannot select a plural form. Select arms are scoped too: a
+  translation may read an argument only under every select arm English reads
+  it under, because outside them the renderer omits it (`{left}` exists only
+  when `timed=yes`) or passes a placeholder (a probability is 0 unless
+  `reported=yes`). A translation therefore cannot fall back to an unreviewed
+  sentence, fail at run time, or print a value the record does not hold.
 - **Parity with source.** The vocabularies are read from their owners' source
   by AST, never from this package's lists: `DispatchState`, `ApprovalState`,
   `ApprovalCondition`, the kinds `NewActionTransition` accepts and every
@@ -117,8 +121,12 @@ a template. It is enforced three ways:
   resolved, must equal `EffectiveApprovals`. Every state fleet sets a record to
   must be the destination of a `DispatchEdges` edge, and every edge's kind must
   be the one `actionEventKind` gives its destination. Constants are read whether
-  declared with their type (`X T = "x"`) or converted (`X = T("x")`), and a
-  constant of the type the reader cannot evaluate fails the test.
+  declared with their type (`X T = "x"`) or converted (`X = T("x")`).
+  Every reader fails closed: a form it cannot resolve — a typed constant it
+  cannot evaluate, a `return s.helper()` or a returned variable in
+  `effectiveState` or `unreachable`, a `State` set from a variable, call or
+  expression by assignment or in an `ActionRecord` (or type-elided) literal —
+  is reported as a problem and fails the test rather than being skipped.
   Adding a value in any of those places without a template here fails
   `TestParity*` and `TestCoverage*`.
 - **By rendering.** `TestCoverage*` renders a record for every value read from
@@ -158,16 +166,28 @@ report any code, including a gateway code or one fleet itself writes
 (`invalid_executor_output`, `executor_error`). The record does not say who
 assigned it (#508). Every error sentence is therefore phrased as a report — "The
 failure was reported as outcome_unknown, which, if accurate, means …" — and
-never states a gateway or fleet meaning as fact. Retry advice is derived only
-from the record's `EffectPossible` and state: while an effect is possible, the
-next step is always to reconcile with the target, whatever the code says.
+never states a gateway or fleet meaning as fact. A failure's next step is
+always to reconcile with the target before requesting the work again, whatever
+the code says.
+
+`EffectPossible` is not evidence on a completed record. Completion sets it
+unconditionally and `ActionRecord.Validate` refuses a terminal record without
+it, so on a succeeded or failed record it says nothing (#508; #510 makes it
+answerable). The renderer reads it only while a claim is open, where it was set
+from the action's declared effects when the claim was taken ("The action
+declares an external or egress effect and is claimed, so an effect may already
+have happened."). A canceled record advises reconciliation when it was claimed
+before it was canceled, which the claim fence says.
 
 Likewise, the decision service writes its own whole-request reasons and passes
 a predictor's through unchanged, and the result does not say which (#509). A whole-request abstention or failure reason
 is attributed to "the predictor or the service" (`predictor_or_service` on a
 quote), its meaning is conditional ("if accurate"), and its next step starts
-"If …". A success is "reported as succeeded by" the claimant, or the admitted
-caller for an admission.
+"If …". A per-answer abstention is the predictor's own and is attributed to it.
+
+A success or failure is "reported as succeeded (failed) by" whoever reported
+it: the claimant, or, for an admission, the identity that requested it, which
+is also who an admission's history, references and output quote name.
 
 ## State machines
 
@@ -246,6 +266,19 @@ selectors by import path to deny `Now`, `Since`, `Until`, `After`, `Tick`,
 - The source state of each `DispatchEdges` edge is checked against fleet's
   guards by review, not by test: the guards are spread through fleet's
   services. A transition table exported by fleet would let the test check them.
+- `EffectPossible` carries no information on a terminal record (#508). The
+  fleet issue #510 makes it answerable; until then a failure always advises
+  reconciliation.
+- Ambiguity reports (#484) are not on main, so nothing here reads them. When
+  they land, a failure's next step can say the target was not reached only
+  where a report's outcome is `request_not_sent`. Rendering them:
+  - the reporter is trustworthy: its Subject and Actor come from the
+    authorization decision, not from the request;
+  - several reports are ordered by `ClaimFence`, not `ReportedAt`;
+  - `Reference` is surfaced most prominently on `request_not_sent` and
+    `outcome_unknown` reports, as the handle an operator takes to the target;
+  - `Target` and `Reference` are target-controlled. They are bounded and
+    printable-only, but are still rendered as attributed untrusted quotes.
 - Decision-service reasons are string literals in `internal/decisionservice`;
   exporting them as constants would let this package reference them directly.
 - Only English ships. Wording should be reviewed by someone outside the

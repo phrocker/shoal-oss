@@ -115,14 +115,14 @@ func ParseCatalog(data []byte) (*Catalog, error) {
 		return nil, err
 	}
 	for key, nodes := range c.messages {
-		uses := map[string]map[string]bool{}
+		uses := map[string][]argUse{}
 		argUses(nodes, uses)
-		for name, kinds := range uses {
-			for kind := range kinds {
-				if !compatibleUse(kind, reference[key][name]) {
+		for name, list := range uses {
+			for _, use := range list {
+				if !compatibleUse(use, reference[key][name]) {
 					problems = append(problems, fmt.Sprintf(
-						"%s: argument %q read as %q, which the renderer does not supply",
-						key, name, kind))
+						"%s: argument %q read as %q under %v, where the renderer does not supply it",
+						key, name, use.kind, sortedConds(use.under)))
 				}
 			}
 		}
@@ -136,18 +136,18 @@ func ParseCatalog(data []byte) (*Catalog, error) {
 
 // englishUses is the argument contract: for each key, the arguments the
 // English message reads and how. A translation may read only these.
-var englishUses = sync.OnceValues(func() (map[string]map[string]map[string]bool, error) {
+var englishUses = sync.OnceValues(func() (map[string]map[string][]argUse, error) {
 	var file CatalogFile
 	if err := json.Unmarshal(englishCatalog, &file); err != nil {
 		return nil, fmt.Errorf("narrate: built-in catalog: %w", err)
 	}
-	out := map[string]map[string]map[string]bool{}
+	out := map[string]map[string][]argUse{}
 	for key, pattern := range file.Messages {
 		nodes, err := parsePattern(pattern)
 		if err != nil {
 			return nil, fmt.Errorf("narrate: built-in catalog %s: %w", key, err)
 		}
-		uses := map[string]map[string]bool{}
+		uses := map[string][]argUse{}
 		argUses(nodes, uses)
 		out[key] = uses
 	}
@@ -166,7 +166,7 @@ func (c *Catalog) Keys() []string {
 
 // ArgumentNames returns the argument names a message reads, sorted.
 func (c *Catalog) ArgumentNames(key string) []string {
-	names := map[string]map[string]bool{}
+	names := map[string][]argUse{}
 	argUses(c.messages[key], names)
 	out := make([]string, 0, len(names))
 	for name := range names {
@@ -355,4 +355,13 @@ func (c *Catalog) list(items []Fragment, style string) (Fragment, error) {
 		}
 	}
 	return acc, nil
+}
+
+func sortedConds(m map[string]bool) []string {
+	out := make([]string, 0, len(m))
+	for c := range m {
+		out = append(out, c)
+	}
+	sort.Strings(out)
+	return out
 }
