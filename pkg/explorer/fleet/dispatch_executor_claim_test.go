@@ -3690,3 +3690,116 @@ func TestAnExecutorCannotClaimTheServicesAdjudication(t *testing.T) {
 		}
 	})
 }
+
+// TestAGateRefusalNeverPrecedesTheStandingCheck is the invariant that makes
+// the approval and attestation gates' distinguishable refusals safe.
+//
+// Both gates return a conflict naming the requirement rather than
+// auth.ObjectNotFound, which departs from this surface's rule that every
+// standing refusal is indistinguishable (#398). That is sound only while
+// #398's rule is doing its own job first: the rule is about callers *without*
+// standing, and such a caller must still be refused before any gate runs.
+//
+// So a caller who fails authorizedClaimant on an approval-required action has
+// to be told exactly what a caller probing a nonexistent action ID is told,
+// byte for byte. If the two ever differ, the gate has become an existence
+// oracle for the scope — and the gate's refusal, which is the useful half for
+// a legitimate worker, would have to go back to being not-found.
+//
+// The legitimate worker's side is the other half of the same decision: a
+// not-found there would be actively misleading, because it would retry or
+// reconcile rather than await an approval that is the actual answer.
+func TestAGateRefusalNeverPrecedesTheStandingCheck(t *testing.T) {
+	fixture := newExecutorClaimFixture(t)
+
+	// Turn the requirement on for the registered action, so the gate would
+	// fire for anyone who got past standing.
+	stored := fixture.registryStore.records[fixture.queued.AgentID]
+	descriptor := cloneDescriptor(stored.Descriptor)
+	for capability := range descriptor.Capabilities {
+		for action := range descriptor.Capabilities[capability].Actions {
+			descriptor.Capabilities[capability].Actions[action].
+				RequiresApproval = true
+		}
+	}
+	stored.Descriptor = descriptor
+	fixture.registryStore.records[fixture.queued.AgentID] = stored
+
+	// A caller with standing is told the requirement, which is the point of
+	// the distinguishable refusal.
+	worker := fixture.namedWorker(t, "worker", auth.OperationExecute)
+	withStanding := fixture.service.claimOnce(t, worker, "worker-request")
+	if !errors.Is(withStanding, ErrApprovalRequired) {
+		t.Fatalf("a caller with standing was not told the requirement: %v",
+			withStanding)
+	}
+
+	// A caller with no standing gets not-found, and must get exactly what a
+	// probe for an action that does not exist gets.
+	//
+	// "No standing" has to mean no standing on the *descriptor*, not merely
+	// "not the enqueuer". An execute-holder in the same scope does have
+	// standing — that is the whole of #437 — and the first version of this
+	// probe used one, got the conflict, and read as an oracle when it was
+	// the fixture that was wrong. This one is outside the scope entirely, so
+	// resolveActionBinding refuses it before any gate.
+	outsider, err := auth.NewDecision(auth.DecisionConfig{
+		Subject: "outsider", Actor: "outsider-actor",
+		AuthorizationDomain: []byte("domain"),
+		AllowedOperations:   []auth.Operation{auth.OperationExecute},
+		PermittedSourceIDs:  [][]byte{[]byte("other-source")},
+		PermittedPolicyIDs:  [][]byte{[]byte("other-policy")},
+		PolicyGeneration:    1,
+		AuthenticationExpires: time.Date(
+			2026, 9, 7, 0, 0, 0, 0, time.UTC),
+		RequestID: "outsider-request", CorrelationID: "correlation",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stranger := bindDecision(t, fixture.authority, outsider)
+	refused := fixture.service.claimOnce(t, stranger, "outsider-request")
+	absent := fixture.service.claimAbsent(t, stranger, "outsider-request")
+	if refused == nil || absent == nil {
+		t.Fatalf("a caller without standing was not refused: %v / %v",
+			refused, absent)
+	}
+	if refused.Error() != absent.Error() {
+		t.Fatalf("an approval-required action refuses a caller without "+
+			"standing as %q while an absent action refuses it as %q: the "+
+			"gate is an existence oracle for this scope",
+			refused, absent)
+	}
+	if !shoal.IsErrorCode(refused, shoal.ErrorNotFound) {
+		t.Fatalf("the standing refusal is not a not-found: %v", refused)
+	}
+}
+
+// claimOnce attempts a claim on the fixture's queued action and returns only
+// the error, which is what these probes compare.
+func (s *DispatchService) claimOnce(
+	t *testing.T, who context.Context, request string,
+) error {
+	t.Helper()
+	_, err := s.Claim(who, ClaimRequest{
+		ID: []byte("action"), ExpectedVersion: 1,
+		ClaimID: []byte("probe-claim"), Lease: time.Minute,
+		Context: dispatchContext(
+			time.Date(2026, 9, 6, 12, 0, 0, 0, time.UTC), request),
+	})
+	return err
+}
+
+// claimAbsent attempts a claim on an action ID that was never enqueued.
+func (s *DispatchService) claimAbsent(
+	t *testing.T, who context.Context, request string,
+) error {
+	t.Helper()
+	_, err := s.Claim(who, ClaimRequest{
+		ID: []byte("no-such-action"), ExpectedVersion: 1,
+		ClaimID: []byte("probe-claim"), Lease: time.Minute,
+		Context: dispatchContext(
+			time.Date(2026, 9, 6, 12, 0, 0, 0, time.UTC), request),
+	})
+	return err
+}
