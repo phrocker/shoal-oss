@@ -188,14 +188,26 @@ var oidcFleetOperations = []auth.Operation{
 	auth.OperationDelegate,
 	auth.OperationDispatch,
 	auth.OperationInvoke,
-	// Execute is permission to take queued work and finish it, which invoke
-	// deliberately no longer implies (#437). It is in this ceiling so the
-	// operation is reachable at all; note that one -oidc-fleet-values mapping
-	// grants both, so a token minted through it carries invoke and execute
-	// together. Expressing the split an operator actually wants — an agent
-	// that may enqueue and not claim, a worker that may claim and not enqueue
-	// — needs its own claim mapping, which this does not add.
-	auth.OperationExecute,
+	// OperationExecute is deliberately NOT here, and that is the whole point
+	// rather than an omission.
+	//
+	// This list is not a ceiling something else narrows: authority() grants it
+	// verbatim to any token whose claim matches -oidc-fleet-values. Every fleet
+	// principal is also minted with the same workspaceAuthorizationDomain,
+	// workspaceSourceID and workspaceGrantPolicyID, and authorizeResource
+	// compares only those three — AuthorizeObject validates ObjectID and never
+	// consults it. So the only thing separating two fleet principals' queued
+	// work is the principal check that execute skips.
+	//
+	// Adding execute here would therefore have granted every existing
+	// fleet-mapped token, on upgrade, the ability to pull another principal's
+	// records, claim them, and complete them with a fabricated outcome. That is
+	// the exact property the operation exists to prevent, so it stays
+	// unreachable through this mapping until it has one of its own.
+	//
+	// The consequence, stated plainly: #437's capability is real in the
+	// authorization model and not reachable by an OIDC-minted token yet. A
+	// claim mapping is a prerequisite for using it, not a refinement of it.
 	auth.OperationSubscriptionCreate,
 	auth.OperationSubscriptionDelete,
 	auth.OperationSubscriptionDeliver,

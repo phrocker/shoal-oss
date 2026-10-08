@@ -380,7 +380,21 @@ func applyClaim(
 		record.ClaimLeaseUntil = record.Deadline
 	}
 	record.UpdatedAt = now
-	record.Actor = decision.Actor()
+	// Actor is deliberately not written here. It names the principal the record
+	// belongs to, which sameActionPrincipal compares, and it is not a
+	// per-transition field however much the two lines below look like company.
+	//
+	// This used to assign decision.Actor() and was a no-op: the claimant was by
+	// construction the enqueuer, because claiming required the principal to
+	// match. #437 made a third party able to claim, and the same line then
+	// overwrote the record's principal — permanently, since the completion path
+	// clones the record forward and never restores it. The enqueuer was then
+	// refused Status and Cancel on its own in-flight action by the predicate
+	// that had just been handed the claimant's identity, with no fallback:
+	// TeamActions needs an operation fleet principals do not hold.
+	//
+	// So a claim records who holds the claim in ClaimID and the transition
+	// provenance below, and leaves the record's own principal alone.
 	record.TransitionRequestID = decision.RequestID()
 	record.TransitionCorrelationID = decision.CorrelationID()
 	record.AuthorizedOperations = canonicalOperations(append(
@@ -1445,6 +1459,23 @@ func (s *DispatchService) authorizedCurrent(ctx context.Context, decision auth.D
 			shoal.IsErrorCode(err, shoal.ErrorNotFound) {
 			return ActionRecord{}, Action{}, auth.ObjectNotFound()
 		}
+		// Without the principal check, every failure here is one answer.
+		//
+		// resolveActionBinding returns a bare ErrorUnavailable when the
+		// executor is unregistered or the effect ceiling has narrowed, and that
+		// surfaces as a 503 where an absent record is a 404. For the enqueuing
+		// principal that distinction is information it already has. For a
+		// caller reaching a record on the strength of an execute grant it is an
+		// existence oracle, and it reaches the admission namespace — those IDs
+		// are computable from a principal tuple, and Claim's isAdmission
+		// refusal runs after this, so the 503 would arrive first.
+		//
+		// That is #398 reopened through a route that did not exist when the
+		// normalisation was written, which is why it is collapsed here rather
+		// than at the one caller that noticed.
+		if !requirePrincipal {
+			return ActionRecord{}, Action{}, auth.ObjectNotFound()
+		}
 		return ActionRecord{}, Action{}, err
 	}
 	return cloneActionRecord(current), resolved, nil
@@ -1480,8 +1511,24 @@ func (s *DispatchService) claimableBy(
 		if err == nil {
 			return true, nil
 		}
-		if !shoal.IsErrorCode(err, shoal.ErrorUnauthorized) &&
-			!shoal.IsErrorCode(err, shoal.ErrorNotFound) {
+		if shoal.IsErrorCode(err, shoal.ErrorUnauthorized) ||
+			shoal.IsErrorCode(err, shoal.ErrorNotFound) {
+			continue
+		}
+		// A real fault, and whose record it is decides whether the caller is
+		// entitled to hear about it.
+		//
+		// On the enqueuer's own record it aborts, as it always has: a registry
+		// that cannot answer is not the same as a record that is not yours, and
+		// swallowing it would turn an outage into an empty queue.
+		//
+		// On somebody else's it is a skip. Before #437 the principal check ran
+		// first and such a record never reached this call, so one foreign
+		// action with an unregistered executor could not affect your page. With
+		// two routes it would abort the page of every execute-holder in the
+		// scope, on every pull, until that record expired — a shared-queue
+		// outage any principal able to enqueue could plant.
+		if sameActionPrincipal(decision, record) {
 			return false, err
 		}
 	}
