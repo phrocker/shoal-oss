@@ -393,7 +393,11 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 	if err := bindExternalFleetEffects(executors, externalFleetEffectBindings{
 		mutating:     splitCommaList(*fleetExternalExecutorRefs),
 		transmitting: splitCommaList(*fleetExternalEgressExecutorRefs),
-		askReference: *fleetAskExecutorRef,
+		// Trimmed, because splitCommaList trims the entries of the two lists
+		// above and comparing a trimmed entry against an untrimmed reference
+		// would miss a collision that newConfiguredFleetExecutors then
+		// reports as an unrelated allow-list failure.
+		askReference: strings.TrimSpace(*fleetAskExecutorRef),
 	}); err != nil {
 		return err
 	}

@@ -141,6 +141,18 @@ assert_absent() {
   fi
 }
 
+assert_absent_or_refused() {
+  local description="$1" pattern="$2"; shift 2
+  local rendered
+  if ! rendered=$(helm template shoal "$chart" "$@" 2>&1); then
+    return 0
+  fi
+  if printf '%s\n' "$rendered" | grep -qE -- "$pattern"; then
+    fail "the rendered output matches /$pattern/ and must not: $description"
+    printf '%s\n' "$rendered" | grep -E -- "$pattern" | head -3 | sed 's/^/      /'
+  fi
+}
+
 refuses_citing() {
   local expected="$1" description="$2"; shift 2
   local output
@@ -281,6 +293,51 @@ renders "lexical embedding"                 "${explorer_base[@]}" --set explorer
 renders "scaled to zero"                    "${explorer_base[@]}" --set explorer.replicas=0
 renders "values around the blanks are trimmed" "${explorer_base[@]}" --set 'explorer.allowedHosts={ shoal.example.test , }'
 
+note "== a reference cannot carry a character that changes what the argument means =="
+# Every executor reference reaches the container inside one argument, and three
+# of the four settings are comma-joined into it. Two characters therefore cannot
+# appear in a reference without changing what the argument says.
+#
+# A newline was the serious one. The container arguments were unquoted YAML
+# scalars, so a newline in any list entry ended the scalar and the remainder
+# became a new sequence entry — an arbitrary argument of the explorer
+# container. The arguments are quoted now and the characters are refused where
+# they are written, which are two halves of one fix: quoting stops the
+# injection, and the guard stops the quoted remainder from silently matching no
+# executor while the pod starts and serves.
+refuses_citing "holds a control character" "a newline in an allowlisted reference" "${explorer_base[@]}" --set-string 'explorer.fleet.executorRefs[0]=deploy
+            - -conceal-withholding=false'
+refuses_citing "holds a control character" "a newline in an external reference" "${explorer_base[@]}" --set-string 'explorer.fleet.executorRefs[0]=deploy' --set-string 'explorer.fleet.externalExecutorRefs[0]=deploy
+            - -conceal-withholding=false'
+refuses_citing "holds a control character" "a newline in a transmitting reference" "${explorer_base[@]}" --set-string 'explorer.fleet.executorRefs[0]=notify' --set-string 'explorer.fleet.externalEgressExecutorRefs[0]=notify
+            - -conceal-withholding=false'
+refuses_citing "holds a control character" "a newline in the ask reference" "${explorer_base[@]}" --set-string 'explorer.fleet.executorRefs[0]=ask' --set explorer.chat.provider=ollama,explorer.chat.model=m,explorer.chat.baseURL=http://localhost:11434 --set-string 'explorer.fleet.askExecutorRef=ask
+            - -conceal-withholding=false'
+# A comma is the separator. One entry of "a,b" reaches the workspace as two
+# references, so a single element silently becomes two bindings — and the
+# collision guards compare the unsplit string, which is how an entry of "a,b"
+# passes a check against an askExecutorRef of "b". The Go side refuses that at
+# startup, so this is defence in depth rather than the only line.
+refuses_citing "holds a comma" "a comma inside one allowlisted entry" "${explorer_base[@]}" --set-string 'explorer.fleet.executorRefs[0]=deploy\,restart'
+refuses_citing "holds a comma" "a comma inside one external entry" "${explorer_base[@]}" --set-string 'explorer.fleet.executorRefs[0]=deploy' --set-string 'explorer.fleet.externalExecutorRefs[0]=deploy\,restart'
+# And the injection itself, asserted as an absence rather than as a refusal.
+# This is the assertion that would fail if the guard above were deleted AND the
+# arguments were unquoted again, which is the state the chart was in: the guard
+# alone makes it unreachable, so without this the quoting could be reverted
+# with every check still passing.
+# The payload has to be in the value for this to mean anything: an earlier
+# version of this check passed a reference of "deploy" and so asserted the
+# absence of an argument nothing had tried to inject. It cannot use
+# refuses_citing, because the point is the state with the guard gone — so it
+# asserts the absence under a value the guard currently refuses, which is why
+# it is written as an absence and not as a render.
+assert_absent_or_refused "a newline cannot become a container argument" "^ +- -conceal-withholding=false$" "${explorer_base[@]}" --set-string 'explorer.fleet.executorRefs[0]=deploy
+            - -conceal-withholding=false'
+# Every explorer argument is a quoted scalar, which is what makes that true for
+# values this file does not enumerate. Pinned positively so the property is
+# asserted rather than assumed from the refusals above.
+assert_renders "explorer arguments are quoted scalars" '^ +- "-allowed-host=shoal\.example\.test"$' "${explorer_base[@]}"
+
 note "== the external-effect executor bindings =="
 # explorer.fleet.externalExecutorRefs and externalEgressExecutorRefs are the
 # only keys in this chart that raise an executor's effect ceiling to admit work
@@ -319,18 +376,18 @@ refuses_citing "already names" "one reference in both effect lists" "${explorer_
 # not just the absence of a refusal: a list joined into one argument is where a
 # dropped or mistyped element disappears quietly, and the whole point of the
 # pair of keys is that the two ceilings reach the process as different flags.
-assert_renders "an external gateway reference is bound" "\-fleet-external-executor-refs=deploy$" "${explorer_base[@]}" --set 'explorer.fleet.executorRefs={deploy}' --set 'explorer.fleet.externalExecutorRefs={deploy}'
-assert_renders "a transmitting external gateway is bound" "\-fleet-external-egress-executor-refs=notify$" "${explorer_base[@]}" --set 'explorer.fleet.executorRefs={notify}' --set 'explorer.fleet.externalEgressExecutorRefs={notify}'
+assert_renders "an external gateway reference is bound" "\-fleet-external-executor-refs=deploy\"$" "${explorer_base[@]}" --set 'explorer.fleet.executorRefs={deploy}' --set 'explorer.fleet.externalExecutorRefs={deploy}'
+assert_renders "a transmitting external gateway is bound" "\-fleet-external-egress-executor-refs=notify\"$" "${explorer_base[@]}" --set 'explorer.fleet.executorRefs={notify}' --set 'explorer.fleet.externalEgressExecutorRefs={notify}'
 assert_absent "a mutating reference does not acquire the egress flag" "fleet-external-egress-executor-refs" "${explorer_base[@]}" --set 'explorer.fleet.executorRefs={deploy}' --set 'explorer.fleet.externalExecutorRefs={deploy}'
-assert_renders "several external references join into one argument" "\-fleet-external-executor-refs=deploy,restart$" "${explorer_base[@]}" --set 'explorer.fleet.executorRefs={deploy,restart}' --set 'explorer.fleet.externalExecutorRefs={deploy,restart}'
+assert_renders "several external references join into one argument" "\-fleet-external-executor-refs=deploy,restart\"$" "${explorer_base[@]}" --set 'explorer.fleet.executorRefs={deploy,restart}' --set 'explorer.fleet.externalExecutorRefs={deploy,restart}'
 # Distinct references in the two lists are not a collision: a deployment can
 # have one gateway that only mutates and another that also transmits.
-assert_renders "both ceilings on separate references" "\-fleet-external-egress-executor-refs=notify$" "${explorer_base[@]}" --set 'explorer.fleet.executorRefs={deploy,notify}' --set 'explorer.fleet.externalExecutorRefs={deploy}' --set 'explorer.fleet.externalEgressExecutorRefs={notify}'
+assert_renders "both ceilings on separate references" "\-fleet-external-egress-executor-refs=notify\"$" "${explorer_base[@]}" --set 'explorer.fleet.executorRefs={deploy,notify}' --set 'explorer.fleet.externalExecutorRefs={deploy}' --set 'explorer.fleet.externalEgressExecutorRefs={notify}'
 # The reasoning executor and a gateway coexist on separate references, which is
 # the configuration #391 needs: Shoal answers from the corpus in process and
 # dispatches the external work.
-assert_renders "the ask executor beside a gateway" "\-fleet-external-executor-refs=deploy$" "${explorer_base[@]}" --set 'explorer.fleet.executorRefs={ask,deploy}',explorer.fleet.askExecutorRef=ask,explorer.chat.provider=ollama,explorer.chat.model=m,explorer.chat.baseURL=http://localhost:11434 --set 'explorer.fleet.externalExecutorRefs={deploy}'
-assert_renders "and the ask binding survives it" "\-fleet-ask-executor-ref=ask$" "${explorer_base[@]}" --set 'explorer.fleet.executorRefs={ask,deploy}',explorer.fleet.askExecutorRef=ask,explorer.chat.provider=ollama,explorer.chat.model=m,explorer.chat.baseURL=http://localhost:11434 --set 'explorer.fleet.externalExecutorRefs={deploy}'
+assert_renders "the ask executor beside a gateway" "\-fleet-external-executor-refs=deploy\"$" "${explorer_base[@]}" --set 'explorer.fleet.executorRefs={ask,deploy}',explorer.fleet.askExecutorRef=ask,explorer.chat.provider=ollama,explorer.chat.model=m,explorer.chat.baseURL=http://localhost:11434 --set 'explorer.fleet.externalExecutorRefs={deploy}'
+assert_renders "and the ask binding survives it" "\-fleet-ask-executor-ref=ask\"$" "${explorer_base[@]}" --set 'explorer.fleet.executorRefs={ask,deploy}',explorer.fleet.askExecutorRef=ask,explorer.chat.provider=ollama,explorer.chat.model=m,explorer.chat.baseURL=http://localhost:11434 --set 'explorer.fleet.externalExecutorRefs={deploy}'
 
 note "== llm proxy guards refuse =="
 # The proxy's failure mode is not a crash. It is required to fail closed, so

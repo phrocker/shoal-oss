@@ -86,10 +86,34 @@ func (r configuredFleetExecutors) ResolveExecutor(
 func (r configuredFleetExecutors) bind(
 	reference string, executor fleet.Executor,
 ) error {
-	if _, allowed := r[reference]; !allowed {
+	current, allowed := r[reference]
+	if !allowed {
 		return fmt.Errorf(
 			"fleet executor reference %q is not in -fleet-executor-refs",
 			reference)
+	}
+	// Refuse a second binding rather than overwrite the first. The callers
+	// above each check the collisions they know about, but they check them
+	// against their own inputs: bindExternalFleetEffects compares its two
+	// lists and the ask reference, and nothing compares a future third
+	// binding against any of them. This is the seam every binding passes
+	// through, so it is the one place the invariant can be stated once.
+	//
+	// Silently overwriting is the specific failure worth refusing. Two
+	// bindings on one reference are two different effect ceilings, and which
+	// one survives would be decided by the order composition happens to run
+	// in — so a reference the operator configured as a dispatch-only gateway
+	// could resolve to the grounded-reasoning executor, or an external
+	// ceiling could replace a floor that deliberately excludes external
+	// mutation. Neither is visible at startup and both change what the
+	// registry permits.
+	if _, unbound := current.(configuredFleetExecutor); !unbound {
+		return fmt.Errorf(
+			"fleet executor reference %q is already bound to %T; one "+
+				"reference carries one executor and one effect ceiling, and "+
+				"binding it twice would let composition order decide which "+
+				"ceiling the registry enforces",
+			reference, current)
 	}
 	// fleet.Executor is an empty interface, so a typed nil would satisfy a
 	// plain nil check, resolve, satisfy the ActionExecutor assertion, and then

@@ -105,6 +105,40 @@
 {{- end -}}
 {{- end -}}
 
+{{- /* Every fleet executor reference reaches the container as part of a
+       single argument, and three of the four settings are comma-joined into
+       one. So two classes of character cannot appear in a reference without
+       changing what the argument means, and neither is refused anywhere else.
+
+       A newline used to end the YAML scalar and start a new sequence entry,
+       which made the rest of any list element an arbitrary container
+       argument. The container arguments in explorer-statefulset.yaml are
+       quoted now, so a newline stays inside the value; this guard is the
+       other half, because a reference carrying one matches no registered
+       executor and so binds nothing while the pod starts and serves
+       normally. Fail-closed, but silently, and the operator's first evidence
+       is a gateway descriptor refused for declaring an effect its executor is
+       not bound to perform, which reads as a bug in the descriptor.
+
+       A comma is the separator itself. One entry of "a,b" reaches the
+       workspace as two references, so a single list element silently becomes
+       two bindings — and the guards below compare the unsplit string, which
+       is how an entry of "a,b" passes a check against an askExecutorRef of
+       "b". The Go side refuses that collision at startup, so this is defence
+       in depth rather than the only line, but a values file that cannot mean
+       two things should be refused where it is written. */ -}}
+{{- range $setting, $references := dict "executorRefs" $explorer.fleet.executorRefs "askExecutorRef" (list $explorer.fleet.askExecutorRef) "externalExecutorRefs" $explorer.fleet.externalExecutorRefs "externalEgressExecutorRefs" $explorer.fleet.externalEgressExecutorRefs -}}
+{{- range $reference := $references -}}
+{{- $text := toString $reference -}}
+{{- if contains "," $text -}}
+{{- fail (printf "explorer.fleet.%s contains %q, which holds a comma: references are comma-joined into one container argument, so this single entry becomes two bindings and the collision guards below compare the unsplit string. Give each reference its own list entry" $setting $text) -}}
+{{- end -}}
+{{- if regexMatch "[[:cntrl:]]" $text -}}
+{{- fail (printf "explorer.fleet.%s contains %q, which holds a control character: the reference reaches the container inside one quoted argument, so it matches no registered executor and binds nothing while the pod starts and serves normally. Before those arguments were quoted, a newline here made the remainder of the entry an arbitrary argument of the explorer container" $setting $text) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
 {{- /* The ask executor is bound by reference, and the registry only accepts a
        reference the allow-list names. */ -}}
 {{- if $explorer.fleet.askExecutorRef -}}

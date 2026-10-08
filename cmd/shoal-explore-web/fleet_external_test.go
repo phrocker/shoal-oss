@@ -378,3 +378,127 @@ func TestExternalDescriptorRegistersOnlyAgainstABoundReference(t *testing.T) {
 		t.Fatalf("the reasoning descriptor must still register: %v", err)
 	}
 }
+
+// TestOneReferenceCarriesOneBinding pins the invariant at the seam every
+// binding passes through, rather than only at the callers that happen to know
+// about each other.
+//
+// bindExternalFleetEffects compares its own two lists and the ask reference,
+// which covers the collisions reachable today. It cannot cover a third binding
+// added later, and the cost of a missed collision is not a startup error: the
+// map assignment used to overwrite, so which effect ceiling the registry
+// enforced would have been decided by the order composition runs in. A
+// reference an operator configured as a dispatch-only gateway could resolve to
+// the grounded-reasoning executor, whose floor deliberately excludes external
+// mutation — or the reverse, replacing that floor with an external ceiling.
+// Neither is visible at startup.
+func TestOneReferenceCarriesOneBinding(t *testing.T) {
+	ceiling := fleet.Effects{fleet.EffectMutatesExternal}
+	binding, err := fleet.NewExternalEffectBinding(ceiling)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	executors, err := newConfiguredFleetExecutors([]string{"gateway"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The first binding is the one the operator asked for.
+	if err := executors.bind("gateway", binding); err != nil {
+		t.Fatalf("the first binding was refused: %v", err)
+	}
+	resolved, ok := executors.ResolveExecutor("gateway")
+	if !ok || resolved != fleet.Executor(binding) {
+		t.Fatalf("the first binding did not take effect: %#v", resolved)
+	}
+
+	// A second is refused rather than silently winning.
+	second, err := fleet.NewExternalEffectBinding(fleet.Effects{
+		fleet.EffectEgressesContent, fleet.EffectMutatesExternal,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = executors.bind("gateway", second)
+	if err == nil {
+		t.Fatal("binding one reference twice was accepted, so the ceiling the " +
+			"registry enforces is decided by composition order")
+	}
+	if !strings.Contains(err.Error(), "already bound") {
+		t.Fatalf("refusal does not name the cause: %v", err)
+	}
+	// And the refusal left the first binding in place rather than half-applying.
+	after, ok := executors.ResolveExecutor("gateway")
+	if !ok || after != fleet.Executor(binding) {
+		t.Fatalf("the refused binding still replaced the first: %#v", after)
+	}
+
+	// An unbound reference is still bindable, so the check keys on "already
+	// bound" and not on the reference merely being present.
+	fresh, err := newConfiguredFleetExecutors([]string{"gateway", "other"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fresh.bind("other", binding); err != nil {
+		t.Fatalf("an allowlisted but unbound reference was refused: %v", err)
+	}
+}
+
+// TestAnUntrimmedAskReferenceStillCollides covers the gap between the two
+// spellings of a reference, through run() rather than through
+// bindExternalFleetEffects directly.
+//
+// splitCommaList trims the entries of both external lists, and the ask
+// reference reached the collision check untrimmed, so " gateway" compared
+// unequal to "gateway" and the check passed. It was never exploitable —
+// newConfiguredFleetExecutors refuses a reference it would have to trim, so
+// the padded spelling is not a key and the ask binding fails closed later —
+// but it failed closed citing the allow-list, about a reference the operator
+// did list. That is the kind of error an operator fixes by making the values
+// file worse.
+//
+// This goes through run() because the trim is at that call site. A first
+// version of this test called bindExternalFleetEffects with a value it had
+// already trimmed itself, which asserted that the function collides on equal
+// strings — true before the fix and after it, so reverting the trim left the
+// test passing.
+func TestAnUntrimmedAskReferenceStillCollides(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	// Buffered and read with a timeout: a mutation that drops the collision
+	// check entirely would let run() reach Serve and block forever.
+	done := make(chan error, 1)
+	go func() {
+		done <- run(ctx, []string{
+			"-data", t.TempDir(),
+			"-listen", "127.0.0.1:0",
+			"-dev-auth",
+			"-chat-provider", "ollama",
+			"-chat-model", "m",
+			"-chat-base-url", "http://127.0.0.1:11434",
+			"-fleet-executor-refs", "gateway",
+			"-fleet-ask-executor-ref", "  gateway  ",
+			"-fleet-external-executor-refs", "gateway",
+		}, &lockedBuffer{})
+	}()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("a whitespace-padded ask reference naming the same " +
+				"reference as the external list was accepted")
+		}
+		if !strings.Contains(err.Error(), "-fleet-ask-executor-ref") {
+			t.Fatalf("the refusal does not name the collision, so an operator "+
+				"is sent to the wrong setting: %v", err)
+		}
+		if strings.Contains(err.Error(), "is not in -fleet-executor-refs") {
+			t.Fatalf("the refusal still blames the allow-list for a reference "+
+				"the operator did list: %v", err)
+		}
+	case <-time.After(30 * time.Second):
+		cancel()
+		t.Fatal("run did not return, so the collision was not refused and the " +
+			"process went on to serve")
+	}
+}
