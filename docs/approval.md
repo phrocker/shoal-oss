@@ -283,6 +283,20 @@ transition reconciled on a lagging replica has the same property.
   specific refusal is what lets it see that it is the wrong approver. Only a
   narrowed caller is concealed, because the narrowing is what it could vary to
   probe.
+- **Response timing is an existence oracle for narrowed callers.** The error
+  bodies for a missing ID, a request in another scope and a request the caller
+  is not independent of are byte-identical, but the work behind them is not:
+  measured at roughly 65µs, 650µs and 1.5ms respectively, because each answer
+  is reached after a different number of store and registry reads. Closing it
+  would need constant-time answers, padded to the slowest path; that is not
+  done.
+- **A generation move inside the last window.** The in-force policy
+  generation is checked immediately before the `approved → enqueued` commit,
+  and the agent generation is resolved by the re-request just before that. A
+  generation that moves between those checks and the store's compare-and-set
+  is not seen. This is the same uncoordinated window a plain enqueue has: the
+  registry and the policy authority are not part of the dispatch store's
+  transaction.
 - **Stranded rows.** A request whose target generation or policy generation
   moves, or whose deadline passes, stays in its stored state forever; nothing
   sweeps it. Status reports it as `unresolvable`, Pending omits it, and neither

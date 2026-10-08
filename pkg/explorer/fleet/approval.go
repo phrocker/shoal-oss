@@ -775,6 +775,24 @@ func (s *ApprovalService) advance(
 		} else if !errors.Is(err, ErrActionNotFound) {
 			return ApprovalReceipt{}, materializeRead(err)
 		}
+		// The policy the approval was given under must still be the one in
+		// force when it is committed to become work. The re-request's own
+		// token proved its generation equals the request's, but a token can
+		// be older than the policy, and the hosted recorder's interaction pin
+		// is a deployment guard, not this service's: refusing a superseded
+		// approval must not depend on which recorder is wired. The row stays
+		// approved, and Status reports it as policy_generation_moved.
+		inForce, err := s.generations.CurrentPolicyGeneration(
+			ctx, decision.AuthorizationDomain())
+		if err != nil {
+			return ApprovalReceipt{}, err
+		}
+		if inForce != current.PolicyGeneration {
+			return ApprovalReceipt{}, shoal.WrapError(
+				shoal.ErrorConflict,
+				"the policy generation an approval was given under is no "+
+					"longer in force", ErrApprovalSuperseded)
+		}
 		next := CloneApprovalRecord(current)
 		next.Version++
 		next.State = ApprovalEnqueued
