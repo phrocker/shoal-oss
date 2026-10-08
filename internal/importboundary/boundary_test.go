@@ -39,7 +39,7 @@ func TestRepositoryRespectsBoundary(t *testing.T) {
 	}
 	// Rule A must reach root-module packages outside pkg/, internal/, cmd/.
 	outside := 0
-	if err := walkGo(root, ".", func(dir string) bool { return dir == "extensions" || dir == ".git" }, func(file string, _ []string) error {
+	if err := walkGo(root, ".", func(dir string) bool { return dir == "extensions" || dir == ".git" }, func(file string, _, _ []string) error {
 		if top, _, _ := strings.Cut(file, "/"); top != "pkg" && top != "internal" && top != "cmd" {
 			outside++
 		}
@@ -95,6 +95,23 @@ func TestFixturesDetectEachDirection(t *testing.T) {
 		},
 		"nested-replace-to-fixture": {
 			{"A", "hidden/go.mod", "replace example.com/fx => ../" + FixtureRoot + "/fx"},
+		},
+		// cgo compiles or links paths no Go import names. Each tree also
+		// carries the accepted shoal-capi pattern, which must pass.
+		"cgo-cflags-escape": {{"A", "pkg/core/core.go", "cgo ${SRCDIR}/../../extensions/e"}},
+		"cgo-include-escape": {
+			{"A", "pkg/core/core.go", "cgo ../../extensions/e/leak.h"},
+			{"A", "pkg/core/shim.c", "cgo ../../extensions/e/leak.h"},
+		},
+		"cgo-ldflags-archive": {
+			{"A", "pkg/core/core.go", "cgo ${SRCDIR}/../../extensions/e"},
+			{"A", "pkg/core/core.go", "cgo ${SRCDIR}/../../extensions/e/x.a"},
+			{"A", "pkg/core/core.go", "cgo /usr/include/evil"},
+		},
+		"extension-cgo-into-internal": {{"B", "extensions/e/cgo.go", "cgo ${SRCDIR}/../../internal/secret"}},
+		"gomod-tool-directive": {
+			{"A", "go.mod", "tool " + m + "/extensions/e"},
+			{"B", "extensions/e/go.mod", "tool " + m + "/internal/engine"},
 		},
 		"gowork-bridge": {
 			{"A", "go.work", "replace " + m + "/extensions/e => ./extensions/e"},

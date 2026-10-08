@@ -60,6 +60,10 @@ func (v Violation) String() string {
 }
 
 func within(p, prefix string) bool { return p == prefix || strings.HasPrefix(p, prefix+"/") }
+
+// withinDir is within for repository-relative directories, where "." is the
+// whole repository.
+func withinDir(p, dir string) bool { return dir == "." || within(p, dir) }
 func internalPath(p string) bool {
 	return strings.Contains("/"+p+"/", "/internal/")
 }
@@ -70,6 +74,7 @@ type goMod struct {
 	requires []string    // required module paths
 	replaces [][2]string // old path (version stripped), new path
 	uses     []string    // go.work use directories
+	tools    []string    // go.mod tool packages
 }
 
 // goModVerbs and goWorkVerbs are the directives the go command accepts in
@@ -175,6 +180,11 @@ func parseModFile(fsys fs.FS, name string, verbs []string) (goMod, error) {
 				return bad("malformed require directive")
 			}
 			out.requires = append(out.requires, fields[1])
+		case "tool":
+			if len(fields) != 2 {
+				return bad("malformed tool directive")
+			}
+			out.tools = append(out.tools, fields[1])
 		case "use":
 			if len(fields) != 2 {
 				return bad("malformed use directive")
@@ -229,7 +239,10 @@ func imports(fsys fs.FS, name string) ([]string, error) {
 // fs.WalkDir does not follow symlinks, but the go command and go.work do, so
 // a symlink could graft code into a module unseen. link receives every
 // symlink; Check reports each as a violation.
-func walkGo(fsys fs.FS, root string, skip func(dir string) bool, visit func(file string, imports []string) error, link func(name string)) error {
+//
+// visit receives each .go file's imports and, for .go and C-family source
+// files, the paths its cgo directives and quoted includes name (cgoRefs).
+func walkGo(fsys fs.FS, root string, skip func(dir string) bool, visit func(file string, imports, cgo []string) error, link func(name string)) error {
 	return fs.WalkDir(fsys, root, func(name string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
@@ -251,14 +264,25 @@ func walkGo(fsys fs.FS, root string, skip func(dir string) bool, visit func(file
 			}
 			return nil
 		}
-		if !strings.HasSuffix(name, ".go") {
+		goFile := strings.HasSuffix(name, ".go")
+		if !goFile && !isCSource(name) {
 			return nil
 		}
-		list, err := imports(fsys, name)
+		src, err := fs.ReadFile(fsys, name)
 		if err != nil {
 			return err
 		}
-		return visit(name, list)
+		var list []string
+		if goFile {
+			if list, err = imports(fsys, name); err != nil {
+				return err
+			}
+		}
+		refs, err := cgoRefs(name, src)
+		if err != nil {
+			return err
+		}
+		return visit(name, list, refs)
 	})
 }
 
@@ -346,6 +370,12 @@ func checkModuleFile(fsys fs.FS, dir string, nested []string) []Violation {
 			out = append(out, Violation{"A", name, "require " + r})
 		}
 	}
+	// A tool directive puts its package in the module's build graph.
+	for _, tool := range mod.tools {
+		if within(tool, extensions) {
+			out = append(out, Violation{"A", name, "tool " + tool})
+		}
+	}
 	for _, r := range mod.replaces {
 		bad := within(r[0], extensions)
 		if localTarget(r[1]) {
@@ -420,10 +450,18 @@ func Check(fsys fs.FS) ([]Violation, error) {
 	if err != nil {
 		return nil, err
 	}
-	ruleA := func(file string, list []string) error {
+	moduleOf := ""
+	ruleA := func(file string, list, cgo []string) error {
 		for _, p := range list {
 			if within(p, extensions) {
 				out = append(out, Violation{"A", file, p})
+			}
+		}
+		// cgo paths must stay in this module and out of extensions/.
+		for _, ref := range cgo {
+			p, ok := resolveCgo(path.Dir(file), ref)
+			if !ok || !withinDir(p, moduleOf) || withinDir(p, "extensions") {
+				out = append(out, Violation{"A", file, "cgo " + ref})
 			}
 		}
 		return nil
@@ -433,6 +471,7 @@ func Check(fsys fs.FS) ([]Violation, error) {
 		// Fixture modules under FixtureRoot stop the walk at their own go.mod
 		// like any nested module; FixtureRoot itself is not skipped.
 		skip := func(d string) bool { return d == "extensions" || d == ".git" }
+		moduleOf = dir
 		if err := walkGo(fsys, dir, skip, ruleA, linkA); err != nil {
 			return nil, err
 		}
@@ -450,8 +489,10 @@ func Check(fsys fs.FS) ([]Violation, error) {
 	// Go files under extensions/ outside every extension module would belong
 	// to the root module and escape rule B.
 	if _, statErr := fs.Stat(fsys, "extensions"); statErr == nil {
-		if err := walkGo(fsys, "extensions", func(dir string) bool { return moduleDirs[dir] }, func(file string, _ []string) error {
-			out = append(out, Violation{"B", file, "(file outside an extension module)"})
+		if err := walkGo(fsys, "extensions", func(dir string) bool { return moduleDirs[dir] }, func(file string, _, _ []string) error {
+			if strings.HasSuffix(file, ".go") {
+				out = append(out, Violation{"B", file, "(file outside an extension module)"})
+			}
 			return nil
 		}, func(name string) { out = append(out, Violation{"B", name, "(symlink)"}) }); err != nil {
 			return nil, err
@@ -482,13 +523,24 @@ func Check(fsys fs.FS) ([]Violation, error) {
 			}
 		}
 		own := parsed.module
-		if err := walkGo(fsys, dir, nil, func(file string, list []string) error {
+		for _, tool := range parsed.tools {
+			if within(tool, Module) && !within(tool, own) && !slices.Contains(Allowlist, tool) {
+				out = append(out, Violation{"B", mod, "tool " + tool})
+			}
+		}
+		if err := walkGo(fsys, dir, nil, func(file string, list, cgo []string) error {
 			for _, p := range list {
 				if within(p, own) || !within(p, Module) {
 					continue
 				}
 				if !slices.Contains(Allowlist, p) {
 					out = append(out, Violation{"B", file, p})
+				}
+			}
+			// cgo paths must stay inside this extension module.
+			for _, ref := range cgo {
+				if p, ok := resolveCgo(path.Dir(file), ref); !ok || !withinDir(p, dir) {
+					out = append(out, Violation{"B", file, "cgo " + ref})
 				}
 			}
 			return nil

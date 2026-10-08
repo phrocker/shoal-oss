@@ -220,6 +220,27 @@ repository contains none. The symlink fixture's links are created at test
 time in a temporary copy rather than committed, so a checkout without
 symlink support still runs the test, or skips it if the platform refuses.
 
+cgo can compile or link code that no Go import names. The check reads every
+`#cgo` directive argument and quoted `#include` in the preamble of
+`import "C"`, and every quoted `#include` in C-family and assembly sources.
+It resolves each path against the file's directory.
+
+- A core path, in the root or a nested module, must stay inside its module
+  and outside `extensions/`.
+- An extension path must stay inside its own module.
+- Absolute paths, variables other than `${SRCDIR}`, backslashes and paths
+  leaving the repository are violations.
+
+The accepted pattern is the one `cmd/shoal-capi` uses: a
+`${SRCDIR}`-relative path that leaves the package but stays in the module,
+such as `-I${SRCDIR}/../../capi/include`. Paths the build environment
+supplies (`CGO_CFLAGS`, `pkg-config` search paths) are outside a source
+check.
+
+A go.mod `tool` directive puts its package in the module's build graph. Core
+`go.mod` files may not name a tool under `extensions/`. An extension may
+name only its own packages or allowlisted ones.
+
 The root `go.mod`, `go.work` and every extension `go.mod` are parsed with every known directive recognized and
 parentheses split from adjacent tokens (`replace(` counts the same as
 `replace (`). An unknown directive, an unbalanced or nested block, or any
