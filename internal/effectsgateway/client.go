@@ -540,10 +540,11 @@ type Completion struct {
 // request whose outcome the resend was sent to learn, and reporting it would
 // turn "possibly committed" into a definite refusal.
 //
-// A 400 or 500 that follows a lost first attempt is not definite either: the
-// first attempt may have committed and this answer may hide the record, so it
-// is read once more, and an unanswered read is DispatchIndeterminate. A 400 or
-// 500 with no loss before it is answered by one resend whose result stands.
+// A resend answered 400 or 500 is not definite either (#492): the first
+// attempt may have committed, or — if the first answer was a genuine error
+// that committed nothing — the resend may have committed and had its record
+// discarded. So the record is read a third time through the replay branch,
+// and anything but a record is DispatchIndeterminate.
 //
 // The 400 and 500 triggers are a workaround for #492, to be removed when it
 // lands. On main, CompleteClaim returns the committed record together with an
@@ -603,18 +604,19 @@ func (c *DispatchClient) Complete(ctx context.Context, actionID []byte, completi
 			cause:  cause}
 	}
 	_, _, err = c.post(ctx, op, path, body, &response)
-	firstLost := responseLost(err)
-	if firstLost || hidesCommittedRecord(err) {
+	if responseLost(err) || hidesCommittedRecord(err) {
 		response = actionWire{}
 		_, _, err = c.post(ctx, op, path, body, &response)
 		switch {
 		case responseLost(err):
 			return Action{}, unconfirmed(err)
-		case firstLost && hidesCommittedRecord(err):
-			// The first attempt may or may not have committed, and this
-			// answer is the #492 shape that hides a committed record. It is
-			// definite only when nothing came before it; after a loss, read
-			// the record once more through the replay branch.
+		case hidesCommittedRecord(err):
+			// #492 workaround. A resend answered 400 or 500 is never
+			// definite: whatever preceded it — a lost response, or a 400/500
+			// that may have been a genuine error committing nothing — this
+			// resend may itself have committed the report and then had its
+			// record discarded. Read once more through the replay branch;
+			// only a record settles it.
 			response = actionWire{}
 			if _, _, err = c.post(ctx, op, path, body, &response); err != nil {
 				return Action{}, unconfirmed(err)

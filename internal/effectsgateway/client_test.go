@@ -323,8 +323,20 @@ func TestCompleteRecoversOnlyWhatTheResendConfirms(t *testing.T) {
 		// The resend's own definite answer describes the record now.
 		{"lost then conflict", success,
 			[]func() (*http.Response, error){lost, reply(409, `{"code":"conflict"}`)}, DispatchConflict, 2},
-		{"500 then 500", failure,
-			[]func() (*http.Response, error){reply(500, `{}`), reply(500, `{}`)}, DispatchStatus, 2},
+		// The first 500 may have been a genuine error that committed nothing
+		// while the resend committed and answered 500 (#492): not definite.
+		{"500 then 500 then 500", failure,
+			[]func() (*http.Response, error){reply(500, `{}`), reply(500, `{}`), reply(500, `{}`)},
+			DispatchIndeterminate, 3},
+		{"500 then 500 then the recorded failure", failure,
+			[]func() (*http.Response, error){reply(500, `{}`), reply(500, `{}`), reply(200, failedRecord)}, "", 3},
+		{"400 then 400 then 409", success,
+			[]func() (*http.Response, error){reply(400, `{}`), reply(400, `{}`), reply(409, `{}`)},
+			DispatchIndeterminate, 3},
+		{"500 then 400 then the record otherwise", success,
+			[]func() (*http.Response, error){reply(500, `{}`), reply(400, `{}`),
+				reply(200, committed(t, 3, fleet.DispatchFailed, "invalid_executor_output", ""))},
+			DispatchRecordedOtherwise, 3},
 		// Not a lost response: nothing is resent.
 		{"plain 503", success, []func() (*http.Response, error){reply(503, `{}`)}, DispatchUnavailable, 1},
 		{"404", success, []func() (*http.Response, error){reply(404, `{}`)}, DispatchNotFound, 1},

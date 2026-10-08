@@ -282,8 +282,11 @@ describes a request whose outcome the resend was sent to learn. A definite
 answer to the resend (409, 404, …) is returned as it is. A #492-shaped 400 or
 500 after a lost first attempt is *not* definite — the first attempt may have
 committed and that answer hides the record — so the record is read once more
-through the replay branch, and an unanswered read is `indeterminate`. A 400 or
-500 with no loss before it is answered by one resend whose result stands.
+through the replay branch, and an unanswered read is `indeterminate`. The same
+holds after a 400 or 500 with no loss before it: the first may have been a
+genuine error that committed nothing while the resend committed and answered
+400/500, so a resend answered 400/500 is always followed by a third read, and
+only a returned record settles it.
 
 **Recorded otherwise (permanent).** The committed record is compared with the
 report — state, error code, and for a success the output as a JSON value. Any
