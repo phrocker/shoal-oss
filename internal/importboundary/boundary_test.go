@@ -39,7 +39,7 @@ func TestRepositoryRespectsBoundary(t *testing.T) {
 	}
 	// Rule A must reach root-module packages outside pkg/, internal/, cmd/.
 	outside := 0
-	if err := walkGo(root, ".", func(dir string) bool { return dir == "extensions" || dir == ".git" }, func(file string, _, _ []string) error {
+	if err := walkGo(root, ".", func(dir string) bool { return dir == "extensions" || dir == ".git" }, func(file string, _ []string) error {
 		if top, _, _ := strings.Cut(file, "/"); top != "pkg" && top != "internal" && top != "cmd" {
 			outside++
 		}
@@ -98,17 +98,42 @@ func TestFixturesDetectEachDirection(t *testing.T) {
 		},
 		// cgo compiles or links paths no Go import names. Each tree also
 		// carries the accepted shoal-capi pattern, which must pass.
-		"cgo-cflags-escape": {{"A", "pkg/core/core.go", "cgo ${SRCDIR}/../../extensions/e"}},
-		"cgo-include-escape": {
-			{"A", "pkg/core/core.go", "cgo ../../extensions/e/leak.h"},
-			{"A", "pkg/core/shim.c", "cgo ../../extensions/e/leak.h"},
+		// The cgo allowlist: the compliant shoal-capi shape passes, and each
+		// preprocessor probe that beat the old deny-list is caught.
+		"cgo-allowed": nil,
+		"cgo-probe-angle": {
+			{"A", "cmd/shoal-capi/probe.go", "cgo flag ${SRCDIR}/../.."},
+			{"A", "cmd/shoal-capi/probe.go", "include <extensions/e/leak.h> (system header with a path)"},
 		},
-		"cgo-ldflags-archive": {
-			{"A", "pkg/core/core.go", "cgo ${SRCDIR}/../../extensions/e"},
-			{"A", "pkg/core/core.go", "cgo ${SRCDIR}/../../extensions/e/x.a"},
-			{"A", "pkg/core/core.go", "cgo /usr/include/evil"},
+		"cgo-probe-macro":        {{"A", "cmd/shoal-capi/probe.go", "include H (not a literal path)"}},
+		"cgo-probe-inc":          {{"A", "cmd/shoal-capi/p.inc", `include "../../extensions/e/leak.h" (not found in allowed directories)`}},
+		"cgo-probe-continuation": {{"A", "cmd/shoal-capi/probe.go", `include "../../extensions/e/leak.h" (not found in allowed directories)`}},
+		"cgo-probe-comment":      {{"A", "cmd/shoal-capi/probe.go", `include "../../extensions/e/leak.h" (not found in allowed directories)`}},
+		// A -include file and an angle include found through -I are scanned
+		// even without a C-family extension; #cgo lines cannot continue.
+		"cgo-probe-forced": {
+			{"A", "cmd/shoal-capi/forced.inc", `include "../../extensions/e/leak.h" (not found in allowed directories)`},
+			{"A", "cmd/shoal-capi/hidden.inc", `include "../../extensions/e/leak.h" (not found in allowed directories)`},
+			{"A", "cmd/shoal-capi/probe.go", "(#cgo line continuation)"},
 		},
-		"extension-cgo-into-internal": {{"B", "extensions/e/cgo.go", "cgo ${SRCDIR}/../../internal/secret"}},
+		"cgo-probe-flags": {
+			{"A", "cmd/shoal-capi/probe.go", "cgo flag ${SRCDIR}/../../extensions/e/x.a"},
+			{"A", "cmd/shoal-capi/probe.go", "cgo flag /usr/include"},
+		},
+		"cgo-outside-allowlist": {
+			{"A", "pkg/asm/asm_amd64.s", "(non-Go source outside the cgo allowlist)"},
+			{"A", "pkg/blob/rsrc.syso", "(non-Go source outside the cgo allowlist)"},
+			{"A", "pkg/core/core.go", "(cgo outside the allowlist)"},
+			{"A", "pkg/core/shim.c", "(non-Go source outside the cgo allowlist)"},
+			{"A", "pkg/swig/lib.swigcxx", "(non-Go source outside the cgo allowlist)"},
+		},
+		"extension-native-sources": {
+			{"B", "extensions/e/cgo.go", "(cgo in an extension)"},
+			{"B", "extensions/e/leak.h", "(non-Go source in an extension)"},
+			{"B", "extensions/e/testdata/x.s", "(non-Go source in an extension)"},
+			{"B", "extensions/e/x.swig", "(non-Go source in an extension)"},
+			{"B", "extensions/e/x.syso", "(non-Go source in an extension)"},
+		},
 		"gomod-tool-directive": {
 			{"A", "go.mod", "tool " + m + "/extensions/e"},
 			{"B", "extensions/e/go.mod", "tool " + m + "/internal/engine"},
@@ -118,6 +143,16 @@ func TestFixturesDetectEachDirection(t *testing.T) {
 			{"A", "go.work", "use ../outside"},
 			{"A", "hidden/bridge/bridge.go", m + "/extensions/e"},
 		},
+	}
+	// Every fixture is exercised: by this table or by a named test.
+	entries, err := os.ReadDir("testdata")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if _, ok := cases[e.Name()]; !ok && e.Name() != "symlinked-extension-dir" {
+			t.Errorf("fixture %s is not exercised", e.Name())
+		}
 	}
 	for name, want := range cases {
 		t.Run(name, func(t *testing.T) {

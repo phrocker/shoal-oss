@@ -3,25 +3,48 @@ package importboundary
 
 import (
 	"os"
+	"reflect"
 	"slices"
 	"testing"
 )
 
-func TestCgoRefsAndResolution(t *testing.T) {
-	src := []byte("package p\n\n// #cgo linux CFLAGS: -I${SRCDIR}/inc -DX=1 -isystem ../sys\n// #cgo LDFLAGS: -L${HOME}/lib -Wl,--whole-archive,${SRCDIR}/../a.a\n// #include \"local.h\"\n// #include <stdlib.h>\nimport \"C\"\n")
-	refs, err := cgoRefs("p/p.go", src)
-	if err != nil {
-		t.Fatal(err)
-	}
-	want := []string{"${SRCDIR}/inc", "../sys", "${HOME}/lib", "${SRCDIR}/../a.a", "local.h"}
-	if !slices.Equal(refs, want) {
-		t.Fatalf("refs %q, want %q", refs, want)
+// The preprocessor spellings that defeated the old deny-list either read as
+// the literal the compiler sees or fail closed.
+func TestIncludeParsing(t *testing.T) {
+	for name, tc := range map[string]struct {
+		src      string
+		includes []include
+		problems int
+	}{
+		"plain":            {"#include \"a.h\"\n#include <stdio.h>\n", []include{{"quote", "a.h"}, {"angle", "stdio.h"}}, 0},
+		"spaced":           {"  #  include   \"a.h\"  \n", []include{{"quote", "a.h"}}, 0},
+		"continuation":     {"#include \\\n\"../x.h\"\n", []include{{"quote", "../x.h"}}, 0},
+		"split directive":  {"#incl\\\nude \"../x.h\"\n", []include{{"quote", "../x.h"}}, 0},
+		"comment in #":     {"#/**/include \"../x.h\"\n", []include{{"quote", "../x.h"}}, 0},
+		"leading comment":  {"/* x */ #include \"../x.h\"\n", []include{{"quote", "../x.h"}}, 0},
+		"commented out":    {"// #include \"../x.h\"\n/* #include \"../y.h\" */\n", nil, 0},
+		"string with //":   {"char *s = \"//\";\n#include \"a.h\"\n", []include{{"quote", "a.h"}}, 0},
+		"macro":            {"#define H \"../x.h\"\n#include H\n", nil, 1},
+		"computed angle":   {"#include <a.h> extra\n", nil, 1},
+		"digraph":          {"%:include \"../x.h\"\n", nil, 1},
+		"trigraph":         {"??=include \"../x.h\"\n", nil, 1},
+		"unterminated":     {"/* never closed\n#include \"a.h\"\n", nil, 1},
+		"line marker":      {"# 1 \"x.h\"\n", nil, 1},
+		"embed":            {"#embed \"blob.bin\"\n", []include{{"quote", "blob.bin"}}, 0},
+		"null directive":   {"#\n#define X 1\n", nil, 0},
+		"include_next":     {"#include_next <a.h>\n", []include{{"angle", "a.h"}}, 0},
+		"objc import":      {"#import \"a.h\"\n", []include{{"quote", "a.h"}}, 0},
+		"trailing comment": {"#include \"a.h\" // why\n", []include{{"quote", "a.h"}}, 0},
+	} {
+		incs, problems := includes([]byte(tc.src))
+		if !reflect.DeepEqual(incs, tc.includes) || len(problems) != tc.problems {
+			t.Errorf("%s: includes %v problems %v", name, incs, problems)
+		}
 	}
 	for ref, want := range map[string]string{
 		"${SRCDIR}/inc":       "a/b/inc",
 		"${SRCDIR}":           "a/b",
 		"${SRCDIR}/../../x":   "x",
-		"local.h":             "a/b/local.h",
 		"../../../escape":     "",
 		"${SRCDIR}/../../../": "",
 		"${HOME}/lib":         "",
@@ -34,28 +57,29 @@ func TestCgoRefsAndResolution(t *testing.T) {
 			t.Errorf("%q resolved to %q ok=%v, want %q", ref, got, ok, want)
 		}
 	}
-	// A preamble on a grouped import, and a C file's quoted includes.
-	grouped := []byte("package p\n\nimport (\n\t\"fmt\"\n\n\t/*\n\t#cgo CFLAGS: -I${SRCDIR}/../evil\n\t*/\n\t\"C\"\n)\n")
-	if refs, err := cgoRefs("p/p.go", grouped); err != nil || !slices.Equal(refs, []string{"${SRCDIR}/../evil"}) {
-		t.Fatalf("grouped preamble: %q %v", refs, err)
-	}
-	if refs, _ := cgoRefs("p/x.c", []byte("#include \"../y.h\"\n#  include \"z.h\"\n#include <a.h>\n")); !slices.Equal(refs, []string{"../y.h", "z.h"}) {
-		t.Fatalf("C includes: %q", refs)
+	if got := cgoArgRefs("-Wl,-rpath,${SRCDIR}/lib"); !slices.Equal(got, []string{"${SRCDIR}/lib"}) {
+		t.Errorf("cgoArgRefs: %q", got)
 	}
 }
 
-// The real cgo user is examined, not skipped: shoal-capi's accepted
-// ${SRCDIR}/../../capi/include stays in the root module.
+// The real cgo user complies and is actually examined.
 func TestRepositoryCgoIsExamined(t *testing.T) {
+	root := os.DirFS("../..")
+	for _, pkg := range CgoPackages {
+		found, err := checkCgoPackage(root, pkg)
+		if err != nil || len(found) != 0 {
+			t.Fatalf("%s: %v %v", pkg, found, err)
+		}
+	}
 	src, err := os.ReadFile("../../cmd/shoal-capi/export.go")
 	if err != nil {
-		t.Skip("cmd/shoal-capi not present")
+		t.Fatal(err)
 	}
-	refs, err := cgoRefs("cmd/shoal-capi/export.go", src)
-	if err != nil || !slices.Contains(refs, "${SRCDIR}/../../capi/include") {
-		t.Fatalf("shoal-capi refs %q %v", refs, err)
+	text, usesC, err := preamble("export.go", src)
+	if err != nil || !usesC {
+		t.Fatal("shoal-capi preamble not found", err)
 	}
-	if p, ok := resolveCgo("cmd/shoal-capi", "${SRCDIR}/../../capi/include"); !ok || p != "capi/include" {
-		t.Fatalf("resolved %q %v", p, ok)
+	if incs, _ := includes([]byte(text)); !slices.Contains(incs, include{"quote", "bridge.h"}) {
+		t.Fatalf("shoal-capi includes %v", incs)
 	}
 }

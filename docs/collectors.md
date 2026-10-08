@@ -220,22 +220,45 @@ repository contains none. The symlink fixture's links are created at test
 time in a temporary copy rather than committed, so a checkout without
 symlink support still runs the test, or skips it if the platform refuses.
 
-cgo can compile or link code that no Go import names. The check reads every
-`#cgo` directive argument and quoted `#include` in the preamble of
-`import "C"`, and every quoted `#include` in C-family and assembly sources.
-It resolves each path against the file's directory.
+cgo, assembly, `.syso` and SWIG files let a package compile or link code that
+no Go import names. The C preprocessor has too many spellings to police with
+a deny-list, so these rules are an allowlist (`internal/importboundary/cgo.go`):
 
-- A core path, in the root or a nested module, must stay inside its module
-  and outside `extensions/`.
-- An extension path must stay inside its own module.
-- Absolute paths, variables other than `${SRCDIR}`, backslashes and paths
-  leaving the repository are violations.
+- **Extensions use no cgo or SWIG in this slice.** An extension module may
+  not contain `import "C"`. It may not contain any source the go command
+  builds besides `.go` files: C, C++, Objective-C, Fortran, headers,
+  assembly, `.syso`, `.swig` or `.swigcxx`, including under `testdata/`.
+  Module files and plain documentation and data (`.md`, `.txt`, `.json`,
+  YAML, CSV, golden files, and any non-buildable file under `testdata/`) are
+  fine. Allowing cgo in an extension later needs its own design.
+- **Core may use cgo only in `CgoPackages`**, which today is `cmd/shoal-capi`,
+  the only cgo package in the tree. For that package:
+  - every path in a `#cgo` argument (after `${SRCDIR}` expansion and
+    cleaning) must resolve into the package directory or `CgoIncludeDirs`.
+    These are `capi/include` and `capi/tests`, exactly what `cmd/shoal-capi`
+    uses;
+  - every `#include`, `#include_next`, `#import` and `#embed` must be a plain
+    quoted literal that resolves to an existing file in those directories, or
+    `<name.h>` with no path separator or `..`;
+  - the preamble and all C-family files in those directories are scanned, as
+    is every repository file they include, transitively, along with any file
+    named by a flag (`-include`) and any angle include found through `-I`.
+- Before parsing, line continuations are spliced and comments removed, as the
+  compiler does. So `#include \` followed by a new line, and `#/**/include`,
+  read as the directive the compiler sees. Macros as include targets,
+  digraphs, trigraphs, unterminated comments, line markers, `#cgo` line
+  continuations and any other form the parser cannot read are violations.
+- Any other core package with `import "C"`, or with a buildable non-Go file,
+  is a violation. A directory with no Go files is not a package, and the go
+  command never builds it. `InertCSourceDirs`
+  (`docs/testdata/validate_sharkbite_matrix`) holds C fixtures that a Go test
+  reads as data. Its C files are allowed because the go command refuses to
+  build C in a package without `import "C"`. Assembly, `.syso` and SWIG stay
+  forbidden even there.
 
-The accepted pattern is the one `cmd/shoal-capi` uses: a
-`${SRCDIR}`-relative path that leaves the package but stays in the module,
-such as `-I${SRCDIR}/../../capi/include`. Paths the build environment
-supplies (`CGO_CFLAGS`, `pkg-config` search paths) are outside a source
-check.
+Residual: flags and search paths supplied by the build environment
+(`CGO_CFLAGS`, `CGO_LDFLAGS` and the like, `pkg-config` search paths, system
+include directories) are outside a source check.
 
 A go.mod `tool` directive puts its package in the module's build graph. Core
 `go.mod` files may not name a tool under `extensions/`. An extension may
