@@ -42,6 +42,7 @@ type Config struct {
 	Backend    decisionstore.CAS
 	Resolver   auth.Resolver
 	Authority  Authority
+	Admission  Admission
 	Clock      func() time.Time
 	Visibility []byte
 }
@@ -65,7 +66,7 @@ type row struct {
 }
 
 func New(c Config) (*Store, error) {
-	if absent(c.Backend) || absent(c.Resolver) || absent(c.Authority) || c.Clock == nil || len(c.Visibility) > 4096 {
+	if (c.Admission != nil && absent(c.Admission)) || absent(c.Backend) || absent(c.Resolver) || absent(c.Authority) || c.Clock == nil || len(c.Visibility) > 4096 {
 		return nil, invalid()
 	}
 	c.Visibility = append([]byte(nil), c.Visibility...)
@@ -306,7 +307,13 @@ func (s *Store) check(ctx context.Context, before auth.Decision, o decision.Outc
 	return collectErr
 }
 
-func (s *Store) Append(ctx context.Context, request, prediction shoal.ID, key []byte, cfg decision.OutcomeObservationConfig) (Receipt, error) {
+func (s *Store) Append(ctx context.Context, request, prediction shoal.ID, key []byte, cfg decision.OutcomeObservationConfig) (receipt Receipt, err error) {
+	coordinated := false
+	defer func() {
+		if coordinated && err != nil {
+			err = errors.Join(ErrIndeterminate, err)
+		}
+	}()
 	if len(key) == 0 || len(key) > shoal.MaxIDBytes {
 		return Receipt{}, invalid()
 	}
@@ -328,7 +335,15 @@ func (s *Store) Append(ctx context.Context, request, prediction shoal.ID, key []
 		return Receipt{}, e
 	}
 	if readErr == nil {
-		return s.replay(ctx, d, p, id, raw, o, auth.OperationIngest)
+		original, e := s.replay(ctx, d, p, id, raw, o, auth.OperationIngest)
+		if e != nil || s.config.Admission == nil {
+			return original, e
+		}
+		coordinated = true
+		if e = s.beginAdmission(ctx, d, p, o, id, original.ReceivedAt); e != nil {
+			return Receipt{}, e
+		}
+		return s.publishAdmission(ctx, d, p, o, original)
 	}
 	if !shoal.IsErrorCode(readErr, shoal.ErrorNotFound) {
 		return Receipt{}, readErr
@@ -348,6 +363,12 @@ func (s *Store) Append(ctx context.Context, request, prediction shoal.ID, key []
 	encoded, e := encode(value)
 	if e != nil {
 		return Receipt{}, invalid()
+	}
+	if s.config.Admission != nil {
+		coordinated = true
+		if e = s.beginAdmission(ctx, d, p, o, id, now); e != nil {
+			return Receipt{}, e
+		}
 	}
 	coordinate := s.coordinate(id)
 	status, writeErr := s.config.Backend.CompareAndMutate(ctx, allocator.Mutation{Row: coordinate.Row, Conditions: []allocator.Condition{{Coordinate: coordinate, Absent: true}}, Updates: []allocator.Update{{Coordinate: coordinate, Timestamp: 1, Value: encoded}}})
@@ -369,6 +390,9 @@ func (s *Store) Append(ctx context.Context, request, prediction shoal.ID, key []
 		return Receipt{}, errors.Join(ErrIndeterminate, e)
 	}
 	// Exact authorized readback reconciles even an unknown acknowledgement.
+	if s.config.Admission != nil {
+		return s.publishAdmission(ctx, d, p, o, result)
+	}
 	return result, nil
 }
 func (s *Store) replay(ctx context.Context, d auth.Decision, p decision.PredictionRecord, id shoal.ID, raw []byte, want decision.OutcomeObservation, op auth.Operation) (Receipt, error) {
