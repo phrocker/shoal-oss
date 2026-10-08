@@ -599,22 +599,32 @@ created and no pod is ever made from it.
 ## Upgrading
 
 **From the LLM proxy.** This component was `shoal-llm-proxy`, under the chart
-key `llmProxy`. Moving to the gateway changes four things, and none of them is
-caught by the old configuration failing loudly unless the chart says so:
+key `llmProxy`. Moving to the gateway changes four things, and the chart can
+catch only the first:
 
 - Move the values from `llmProxy` to `llmGateway`, and `values-llm-proxy.yaml`
-  overlays to `values-llm-gateway.yaml`. The chart refuses to render while
-  `llmProxy` is still enabled, or still carries settings alongside an enabled
-  `llmGateway`. A leftover `llmProxy: {enabled: false}` or null is ignored.
+  overlays to `values-llm-gateway.yaml`, then delete the `llmProxy` block. The
+  chart refuses to render while `llmProxy` is enabled, or carries settings
+  beside an enabled `llmGateway` without saying `enabled: false`. A null or
+  empty `llmProxy`, or one whose `enabled` is literally `false` (as in a full
+  dump of the old defaults), is ignored.
 - Rebuild the image. The Deployment runs `/usr/local/bin/shoal-llm-gateway`; an
   image built before the rename contains only `shoal-llm-proxy` and the pod
   never starts.
-- Repoint callers. The Deployment, Service and PodDisruptionBudget are now named
-  `<release>-llm-gateway`, and Helm replaces the old objects rather than
-  renaming them.
-- Update anything outside the chart that selects the pods. The component label
-  is now `llm-gateway`, so a NetworkPolicy or monitor written against
-  `llm-proxy` silently stops matching.
+- Repoint callers. The Deployment, Service and PodDisruptionBudget are named
+  from the chart's full name: `<fullname>-llm-gateway`, which is
+  `<release>-shoal-llm-gateway` unless the release name already contains
+  `shoal` (`helm install shoal` gives `shoal-llm-gateway`). Helm deletes the old
+  objects and creates new ones in the same upgrade, so the old Service stops
+  answering at that moment, before the new pods are necessarily ready, and
+  `maxUnavailable: 0` does not help because it applies within one Deployment.
+  Repoint callers in the same rollout and upgrade with `--wait`, or run the
+  gateway under a separate release until callers have moved.
+- Update anything outside the chart that selects the pods. Both selector labels
+  changed: `app.kubernetes.io/name` from `shoal-llm-proxy` to
+  `shoal-llm-gateway`, and `app.kubernetes.io/component` from `llm-proxy` to
+  `llm-gateway`. A NetworkPolicy or monitor written against either old value
+  silently stops matching.
 
 Two things to know before any upgrade.
 

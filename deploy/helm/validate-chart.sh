@@ -404,6 +404,11 @@ refuses_citing "llmProxy has been renamed to llmGateway" \
 renders "a null llmProxy is ignored"     "${llm_gateway_base[@]}" --set llmProxy=null
 renders "an empty llmProxy is ignored"   "${llm_gateway_base[@]}" --set-json 'llmProxy={}'
 renders "a disabled llmProxy is ignored" "${llm_gateway_base[@]}" --set llmProxy.enabled=false
+renders "an old values dump with llmProxy disabled is ignored" "${llm_gateway_base[@]}" \
+  --set llmProxy.enabled=false,llmProxy.replicas=2,llmProxy.upstream.requestTimeout=30s
+refuses_citing "llmProxy has been renamed to llmGateway" \
+  "a string enabled under llmProxy is not a disabled one" -f "$chart/values.yaml" \
+  --set-string llmProxy.enabled=false
 refuses "no admission URL"              "${llm_gateway_base[@]}" --set llmGateway.admission.url=
 refuses "blank admission URL"           "${llm_gateway_base[@]}" --set llmGateway.admission.url=" "
 refuses "admission URL with no scheme"  "${llm_gateway_base[@]}" --set llmGateway.admission.url=shoal.example.test

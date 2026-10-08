@@ -211,21 +211,26 @@
        success: the gateway an operator configured simply absent, or enabled
        under the new key with half its settings left behind under the old one.
 
-       A null or empty llmProxy, or one that only says it is disabled, is
-       ignored: null is how Helm deletes a key, and a values dump taken from
-       the old chart's defaults carries `enabled: false` for operators who
-       never used it. */ -}}
+       A null or empty llmProxy is ignored, because null is how Helm deletes a
+       key. So is any llmProxy whose `enabled` is literally false: a full dump
+       of the old chart's values carries the whole block with `enabled: false`
+       for operators who never used it, and nothing in it was ever rendered.
+       An llmProxy that is enabled, is not a map, or carries settings with no
+       `enabled: false` beside an enabled llmGateway is refused. */ -}}
 {{- $legacyGateway := .Values.llmProxy -}}
 {{- if $legacyGateway -}}
-{{- $legacyMessage := "llmProxy has been renamed to llmGateway: move these values under llmGateway (and values-llm-proxy.yaml to values-llm-gateway.yaml), rebuild the image (it now runs /usr/local/bin/shoal-llm-gateway), and repoint callers of <release>-llm-proxy to <release>-llm-gateway. See docs/llm-gateway-deploy.md, Upgrading" -}}
+{{- $legacyMessage := "llmProxy has been renamed to llmGateway: move these values under llmGateway (and values-llm-proxy.yaml to values-llm-gateway.yaml) and delete the llmProxy block, rebuild the image (it now runs /usr/local/bin/shoal-llm-gateway), and repoint callers and selectors: resources are now named <fullname>-llm-gateway and labelled shoal-llm-gateway / llm-gateway. See docs/llm-gateway-deploy.md, Upgrading" -}}
 {{- if not (kindIs "map" $legacyGateway) -}}
 {{- fail $legacyMessage -}}
 {{- end -}}
+{{- $explicitlyDisabled := and (hasKey $legacyGateway "enabled") (kindIs "bool" $legacyGateway.enabled) (not $legacyGateway.enabled) -}}
+{{- if not $explicitlyDisabled -}}
 {{- if $legacyGateway.enabled -}}
 {{- fail $legacyMessage -}}
 {{- end -}}
 {{- if and (eq (include "shoal.llmGatewayEnabled" .) "true") (gt (len (omit $legacyGateway "enabled")) 0) -}}
 {{- fail $legacyMessage -}}
+{{- end -}}
 {{- end -}}
 {{- end -}}
 
