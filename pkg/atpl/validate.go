@@ -373,11 +373,18 @@ func located(field, message string) error {
 }
 
 // action resolves one file action to the registry's form: inherited actions
-// copy the parent's exactly, declared ones have each effect class checked so
-// an unknown one is named.
+// copy the parent's exactly, approval requirement included, and may add one;
+// declared ones have each effect class checked so an unknown one is named.
 func (c *compiler) action(
 	parent *parentView, parentCapability *fleet.Capability, action Action,
 ) (fleet.Action, error) {
+	// Decode refuses "required": false; a document built in code is held to
+	// the same rule, so no policy, however it was produced, carries a spelling
+	// that reads as switching a requirement off.
+	if action.Approval != nil && !action.Approval.Required {
+		return fleet.Action{}, located("approval.required", approvalNotRequired)
+	}
+	requiresApproval := action.Approval != nil
 	if action.Inherit {
 		if parent == nil {
 			return fleet.Action{}, located("inherit", "requires a parent to inherit from")
@@ -392,6 +399,9 @@ func (c *compiler) action(
 			Effects:      append(fleet.Effects(nil), inherited.Effects...),
 			InputSchema:  append(json.RawMessage(nil), inherited.InputSchema...),
 			OutputSchema: append(json.RawMessage(nil), inherited.OutputSchema...),
+			// The parent's requirement is inherited, never dropped; the
+			// child may add one the parent lacks.
+			RequiresApproval: inherited.RequiresApproval || requiresApproval,
 		}, nil
 	}
 	effects := make(fleet.Effects, 0, len(action.Effects))
@@ -404,8 +414,9 @@ func (c *compiler) action(
 	}
 	return fleet.Action{
 		Name: action.Name, Effects: effects,
-		InputSchema:  append(json.RawMessage(nil), action.InputSchema...),
-		OutputSchema: append(json.RawMessage(nil), action.OutputSchema...),
+		InputSchema:      append(json.RawMessage(nil), action.InputSchema...),
+		OutputSchema:     append(json.RawMessage(nil), action.OutputSchema...),
+		RequiresApproval: requiresApproval,
 	}, nil
 }
 
@@ -431,6 +442,14 @@ func delegatedAction(parent *parentView, parentCapability *fleet.Capability, cap
 			return located("effects", fmt.Sprintf(
 				"%s is not among parent %s's effects %s", effect, parent.label, effectList(allowed.Effects)))
 		}
+	}
+	// capabilitiesSubset: a delegate may add approval, never drop its
+	// parent's. Declare it, or inherit the action.
+	if allowed.RequiresApproval && !action.RequiresApproval {
+		return located("approval", fmt.Sprintf(
+			"is required by parent %s's action; a delegated action keeps its parent's "+
+				"approval requirement (declare \"approval\": {\"required\": true}, or inherit the action)",
+			parent.label))
 	}
 	if !fleet.CapabilitiesSubset([]fleet.Capability{capability}, parent.capabilities) {
 		return fmt.Errorf("exceeds parent %s", parent.label)

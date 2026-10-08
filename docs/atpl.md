@@ -33,6 +33,10 @@ is one JSON object:
         {"name": "search", "actions": [
           {"name": "query", "effects": ["reads-corpus"],
            "input_schema": {"type": "object"}, "output_schema": {"type": "object"}}
+        ]},
+        {"name": "ops", "actions": [
+          {"name": "deploy", "effects": ["external"], "approval": {"required": true},
+           "input_schema": {"type": "object"}, "output_schema": {"type": "object"}}
         ]}
       ]
     }
@@ -45,9 +49,27 @@ is one JSON object:
   file and the registry's opaque bytes unchanged on the wire.
 - **Effects** use the registry's wire spellings: `reads-corpus`,
   `egresses-content`, `external`. Omitted means the empty set.
+- **`approval: {"required": true}`** on an action compiles to
+  `fleet.Action.RequiresApproval` (#451, `docs/approval.md`): every new
+  request for the action is held for a human decision. It is accepted only on
+  an action (`agents[].capabilities[].actions[]`); anywhere else `approval` is
+  refused by name. The object is exactly `{"required": true}`. Omitting
+  `approval` means not required, and that is the only spelling for it:
+  `{"required": false}` is refused rather than read as absent, so no file
+  carries a line that reads as switching a requirement off, and every meaning
+  has one form for the digest and for review. `{}`, `null`, a bare boolean,
+  any other key and case-folded keys (`Approval`, `Required`) are refused, as
+  everywhere in the format.
 - **`inherit: true`** on an action copies the same-named action of the parent's
-  same-named capability, schemas and effects exactly. It is refused if the
-  parent has no such action, or if the action also declares its own fields.
+  same-named capability, schemas, effects and approval requirement exactly. It
+  is refused if the parent has no such action, or if the action also declares
+  its own effects or schemas. It may carry `approval: {"required": true}` to
+  add the requirement to what it inherits, which narrows. A delegated action
+  can add approval but never drop its parent's, as the registry's
+  `capabilitiesSubset` requires: a child that declares the action in full
+  without `approval` under a parent whose action requires it is refused at
+  `...actions[name=X].approval`. A parity test runs the same cases through
+  `fleet.Service.Register`.
 - **`lease_ttl`** is a Go duration in (0, 23h55m]. Compile adds it to one shared
   compile time, so a child and its parent compare TTLs exactly as the registry
   compares absolute leases. Leases are absolute and at most 24h ahead
@@ -70,7 +92,7 @@ refused by name with the reason:
 
 | Field | Refusal |
 | --- | --- |
-| `approval` | requires a later ATPL version (#451) |
+| `approval` (anywhere but an action) | declared per action only |
 | `obligations` | not declared in policy: admission obligations are computed per request; deferred |
 | `attestation`, `runtime` | requires a later ATPL version (#446) |
 | `trust_score` | not part of ATPL in Shoal; trust is a typed decision |
@@ -115,7 +137,11 @@ the invalid bytes and two different policies would share a digest.
 the version, executors and every registration without its absolute lease but
 with its TTL, as `pkg/decision` identities are computed. The same files give the
 same digest at any time and in any file, list or key order. `policy compile`
-prints those exact bytes.
+prints those exact bytes. An action that requires approval carries
+`"approval":{"required":true}` in them; every other action is encoded as it was
+before approval could be declared, so a policy without approval keeps its
+digest (a golden test pins it), while two policies that differ only in a
+requirement never share one.
 
 ## Commands
 
@@ -143,13 +169,29 @@ including a live child the plan does not rewrite that would stop resolving.
 Leases are not compared; heartbeats maintain them, and apply does not renew
 them.
 
+Approval is compared per action. A policy that requires approval on an action
+the live agent holds without it plans as a narrowing (`+ ...approval:
+required`): the registry accepts it as an update, because adding the
+requirement narrows authority, and the new generation stops records queued
+before it from resolving (`docs/approval.md`). A policy that omits approval on
+an action that requires it live plans as `refused-widening` (`-
+...approval`): the registry refuses dropping it, and so does plan. Adding a
+requirement to a parent that a live child this plan does not rewrite lacks is
+`refused-delegation`, since the child would stop resolving. Apply orders an
+approval change like any other narrowing. The `refused-approval` kind of
+#489, which refused any managed agent with a live approval requirement because
+the format could not express it, no longer exists.
+
 The plan digest (`atpl:plan:v2:`) binds the policy digest, the normalized
 endpoint (lower-case scheme and host, default port and trailing slash dropped),
 each managed agent's kind and `ContentDigest` of its live registration, and the
 IDs of unmanaged agents, and the write order below, two-step writes included.
 `ContentDigest` covers parent, domain, scopes, executor
-and capabilities, and leaves out generation, subject, actor, lease and update
-time, which heartbeats move. A heartbeat between plan and apply therefore does
+and capabilities, approval requirements included (appended only for an action
+that requires approval, so other registrations keep their earlier digests),
+and leaves out generation, subject, actor, lease and update
+time, which heartbeats move. A requirement added or removed between plan and
+apply therefore invalidates the reviewed plan, and stops apply's retry. A heartbeat between plan and apply therefore does
 not invalidate a reviewed plan, unless it changes the write order; a plan
 reviewed against one registry does not apply to another. The write order
 depends on leases, so on time and heartbeats: a plan reviewed long before apply
@@ -197,11 +239,10 @@ second remaining, measured before rounding, is refused. Without `-executors`, ea
 its actions' effects and `min_effects` is empty, and the command warns that this
 is not what the host binds. A live ID, domain, scope or executor reference that
 is not UTF-8 is refused, naming the field. A live action that requires approval
-(`docs/approval.md`) is refused by path, for example
-`agents[id=gateway].capabilities[name=ops].actions[name=deploy].approval`:
-this version cannot write approval into a policy file, and an export that
-silently left it out would be a policy that, re-applied, describes the agent
-without its control. Export refuses a directory that
+(`docs/approval.md`) is written with `"approval": {"required": true}`, and only
+such an action; export no longer refuses it, and the export recompiles to the
+same registrations and digest (tested through a real `fleet.Service`, and
+end to end through `shoalctl`). Export refuses a directory that
 already holds policy files, read with `os.ReadDir` so a directory name with glob
 metacharacters cannot defeat the check, and refuses before writing anything if
 the files together would exceed the 256 MiB a policy directory may hold.
@@ -262,13 +303,10 @@ agent ID)`, and it is read with the corpus's `InteractionRecord`.
 
 ## Deferred
 
-- Approval rules and attestation requirements (#446): refused by name until
-  they compile. The registry can require approval per action since #451
-  (`docs/approval.md`); accepting `approval: {required: true}` in policy files
-  is #452. Until then export refuses an approval-required action, and plan
-  refuses a managed agent whose live actions require approval
-  (`refused-approval`, naming each action), so apply never runs against an
-  agent the file cannot describe.
+- Attestation requirements (#446): refused by name until they compile.
+- Approval rules beyond the per-action requirement (approver sets, quorum,
+  conditions). The format holds only `approval: {"required": true}`, which is
+  everything the registry stores today; any other key in `approval` is refused.
 - Admission obligations. They are computed per request at admission, not
   declared per agent; how a policy would constrain them is undecided.
 - YAML. The repository has no YAML library, and every strict decoder here is

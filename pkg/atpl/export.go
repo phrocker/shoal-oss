@@ -218,25 +218,20 @@ func exportAgent(descriptor fleet.Descriptor, ttl time.Duration) (Agent, error) 
 	for _, capability := range descriptor.Capabilities {
 		exported := Capability{Name: capability.Name}
 		for _, action := range capability.Actions {
-			// Refused, not dropped. This version cannot write approval into a
-			// policy file, and an export that silently omitted it would be a
-			// policy that, re-applied, removes the control: the file would be
-			// the live fleet minus its approval requirement, and nothing in
-			// it would say so. Accepting approval in policy files is #452.
-			if action.RequiresApproval {
-				return Agent{}, refuse("", path+".capabilities"+
-					selector("name", capability.Name, 0)+".actions"+
-					selector("name", action.Name, 0)+".approval",
-					"requires approval, which this ATPL version cannot express; "+
-						"exporting the action without it would let a re-apply remove "+
-						"the control (see docs/atpl.md, \"Deferred\")")
-			}
-			exported.Actions = append(exported.Actions, Action{
+			written := Action{
 				Name:         action.Name,
 				Effects:      effectStrings(action.Effects),
 				InputSchema:  append(json.RawMessage(nil), action.InputSchema...),
 				OutputSchema: append(json.RawMessage(nil), action.OutputSchema...),
-			})
+			}
+			// Written whenever the live action holds it. An export that left
+			// it out would be a policy that, re-applied, describes the agent
+			// without its control; plan would refuse that as a widening, but
+			// the file itself would misstate the fleet.
+			if action.RequiresApproval {
+				written.Approval = &Approval{Required: true}
+			}
+			exported.Actions = append(exported.Actions, written)
 		}
 		agent.Capabilities = append(agent.Capabilities, exported)
 	}

@@ -324,6 +324,11 @@ type canonicalAction struct {
 	Effects      []string        `json:"effects"`
 	InputSchema  json.RawMessage `json:"input_schema"`
 	OutputSchema json.RawMessage `json:"output_schema"`
+	// Approval is omitted unless required, so every policy without an
+	// approval requirement keeps the digest it had before approval could be
+	// declared, under the same DigestPrefix, while a requirement still
+	// changes the digest: two policies differing only in it never share one.
+	Approval *Approval `json:"approval,omitempty"`
 }
 
 func canonicalPolicyJSON(policy *Policy) ([]byte, error) {
@@ -358,10 +363,14 @@ func canonicalPolicyJSON(policy *Policy) ([]byte, error) {
 				Name: capability.Name, Actions: make([]canonicalAction, 0, len(capability.Actions)),
 			}
 			for _, action := range capability.Actions {
-				compiled.Actions = append(compiled.Actions, canonicalAction{
+				canonical := canonicalAction{
 					Name: action.Name, Effects: effectStrings(action.Effects),
 					InputSchema: action.InputSchema, OutputSchema: action.OutputSchema,
-				})
+				}
+				if action.RequiresApproval {
+					canonical.Approval = &Approval{Required: true}
+				}
+				compiled.Actions = append(compiled.Actions, canonical)
 			}
 			agent.Capabilities = append(agent.Capabilities, compiled)
 		}
@@ -407,6 +416,9 @@ func cloneCapabilities(input []fleet.Capability) []fleet.Capability {
 				Effects:      append(fleet.Effects(nil), action.Effects...),
 				InputSchema:  append(json.RawMessage(nil), action.InputSchema...),
 				OutputSchema: append(json.RawMessage(nil), action.OutputSchema...),
+				// A clone without the flag would hand Agents, Writes and
+				// apply a registration that silently drops the requirement.
+				RequiresApproval: action.RequiresApproval,
 			}
 		}
 	}
