@@ -123,6 +123,11 @@ type serveHandle struct {
 	// Serve or Stop can run, construction has already finished and the
 	// field is immutable. nil when the HTTP surface is disabled.
 	httpServeDone chan struct{}
+
+	// stopRequested is set by Stop before it stops the gRPC server, so
+	// Serve can tell the one grpc.ErrServerStopped that means "stopped as
+	// asked" from one that means something else stopped it. See serveResult.
+	stopRequested atomic.Bool
 }
 
 // unaryInFlight counts currently-executing unary RPCs so Stop can report,
@@ -298,7 +303,23 @@ func (h *serveHandle) Serve() error {
 			}
 		}()
 	}
-	return h.grpcSrv.Serve(h.grpcLis)
+	return h.serveResult(h.grpcSrv.Serve(h.grpcLis))
+}
+
+// serveResult maps grpc.Server.Serve's return to what Serve reports.
+//
+// grpc.Server.Serve returns grpc.ErrServerStopped immediately when the server
+// was already stopped by the time it is invoked. Stop can win that race: a
+// caller that sees the HTTP surface answering knows Serve was entered, not
+// that it has reached the gRPC accept loop. After Stop was requested that
+// error is the requested outcome, so it is reported as a clean return; before
+// it, something else stopped the server, and the error stands (#473).
+// RunUntilSignal reconstructs the same distinction for its own callers.
+func (h *serveHandle) serveResult(err error) error {
+	if errors.Is(err, grpc.ErrServerStopped) && h.stopRequested.Load() {
+		return nil
+	}
+	return err
 }
 
 // Drain marks the server not-ready without closing anything. Call this
@@ -350,6 +371,7 @@ func (h *serveHandle) Drain() {
 // waiting for (gRPC's own Stop, the engine close) in that pathological
 // case.
 func (h *serveHandle) Stop(ctx context.Context) error {
+	h.stopRequested.Store(true)
 	var httpErrCh chan error
 	if h.httpSrv != nil {
 		httpErrCh = make(chan error, 1)
