@@ -217,8 +217,12 @@ field).
 base64url; the report is the signed envelope byte for byte) answers
 `{"attestation_id", "expires_at"}`, or for any verification failure one opaque
 `unauthorized` "attestation refused". The caller needs `OperationExecute`,
-gated exactly as the other execute routes (including the correlation ID, so
-it shares #524 until #527 lands). The row key comes from the authentication
+gated exactly as the other execute routes (including the correlation ID,
+which the built-in authenticators mint or take from `Shoal-Correlation-ID`
+since #527). No shipped authenticator grants `OperationExecute` until #480,
+so in the shipped binary the route answers every caller with an
+authorization refusal; the development principal also has no client ID and
+can never be attested. The row key comes from the authentication
 decision; the body cannot name a principal. Every presentation is audited
 (`attestation_presented`, or `attestation_refused` with the typed reason); an
 accepted one is audited before it is stored, and a refused one stays refused

@@ -436,38 +436,81 @@ func TestAttestationClaimDisclosesNothingToACallerWithoutStanding(t *testing.T) 
 	}
 }
 
-// attestationPlane serves the fleet and admission routes over HTTP for the
-// SDK. Each request's decision is minted here with a correlation ID and bound
-// onto the request — TEMPORARY for #524: the built-in HTTP authenticators send
-// no correlation ID, so the dispatch and presentation routes (which require
-// one, like every execute route) refuse over the real authenticator until
-// #527 lands. Re-minting is what #523's tests do in the meantime.
+// newAttestationPlane serves the fleet and admission routes through the
+// binary's authenticated transport: webapi.NewAuthenticatedHandler with the
+// workspace binder, mounted at the same prefixes main.go mounts. Nothing binds
+// a decision onto the request context directly.
+//
+// The authenticator is the one seam: no shipped authenticator can mint the
+// presenter, because none grants OperationExecute until #480, and the
+// development principal has no client ID (so it can never be attested). This
+// one maps a bearer token to a principal and mints like the shipped ones do,
+// with correlationIDFor (#527) supplying the correlation ID — honouring
+// Shoal-Correlation-ID when sent, generating one otherwise. The development
+// authenticator itself is driven in
+// TestTheShippedAuthenticatorReachesTheAttestationGate.
 func newAttestationPlane(t *testing.T, h *attestationHarness, tokens map[string]principal) *httptest.Server {
 	t.Helper()
+	server := httptest.NewUnstartedServer(nil)
+	authenticator := webapi.AuthenticatorFunc(func(request *http.Request) (auth.Decision, error) {
+		who, ok := tokens[strings.TrimPrefix(request.Header.Get("Authorization"), "Bearer ")]
+		if !ok {
+			return auth.Decision{}, shoal.NewError(shoal.ErrorUnauthorized, "unknown test token")
+		}
+		requestID, err := newRequestID()
+		if err != nil {
+			return auth.Decision{}, err
+		}
+		correlationID, err := correlationIDFor(request, "test-correlation-")
+		if err != nil {
+			return auth.Decision{}, err
+		}
+		decision, err := auth.NewDecision(auth.DecisionConfig{
+			Subject: who.subject, Actor: who.actor, ClientID: who.client,
+			OnBehalfOf: who.onBehalfOf, AuthorizationDomain: workspaceAuthorizationDomain,
+			AllowedOperations:     who.operations,
+			PermittedSourceIDs:    [][]byte{workspaceSourceID},
+			PermittedPolicyIDs:    [][]byte{workspaceGrantPolicyID},
+			PolicyGeneration:      workspacePolicyGeneration,
+			AuthenticationExpires: h.now().Add(time.Hour),
+			RequestID:             requestID, CorrelationID: correlationID,
+		})
+		if err == nil && decision.CorrelationID() == "" {
+			t.Error("the test mint produced no correlation ID")
+		}
+		return decision, err
+	})
+	mountAttestationPlane(t, h, server, authenticator)
+	return server
+}
+
+// mountAttestationPlane mounts the routes behind authenticator, exactly as
+// main.go does, and starts server.
+func mountAttestationPlane(t *testing.T, h *attestationHarness, server *httptest.Server, authenticator webapi.Authenticator) {
+	t.Helper()
+	handler, err := webapi.NewAuthenticatedHandler(h.opened.service, authenticator,
+		h.authority.Binder(), server.Listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
 	fleetHandler, err := webapi.NewFleetHandlerWithAttestation(
 		h.opened.fleetRegistry, h.opened.fleetDispatch, h.opened.attestation)
 	if err != nil {
+		t.Fatal(err)
+	}
+	if err := handler.MountAuthenticated(webapi.FleetRoutePrefix, fleetHandler); err != nil {
 		t.Fatal(err)
 	}
 	admissionHandler, err := webapi.NewAdmissionHandler(h.opened.admission)
 	if err != nil {
 		t.Fatal(err)
 	}
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		who, ok := tokens[strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")]
-		if !ok {
-			w.WriteHeader(http.StatusUnauthorized)
-			return
-		}
-		r = r.WithContext(h.as(who))
-		if strings.HasPrefix(r.URL.Path, admissionapi.RoutePrefix) {
-			admissionHandler.ServeHTTP(w, r)
-			return
-		}
-		fleetHandler.ServeHTTP(w, r)
-	}))
+	if err := handler.MountAuthenticated(webapi.AdmissionRoutePrefix, admissionHandler); err != nil {
+		t.Fatal(err)
+	}
+	server.Config.Handler = handler
+	server.Start()
 	t.Cleanup(server.Close)
-	return server
 }
 
 // TestSDKAttestationEffectsGatewayClaimAndComplete is the real composition:
