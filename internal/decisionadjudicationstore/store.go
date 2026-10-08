@@ -41,6 +41,9 @@ type Attribution struct {
 	AuthorizationFingerprint     string
 }
 type Receipt struct {
+	// BasisID references an immutable admission snapshot retained by the trusted
+	// caller BEFORE append. This store does not verify its availability or authority.
+	BasisID                                           shoal.ID
 	ID                                                shoal.ID
 	Version                                           int64
 	TargetID, TaskID, PictureID, PolicyID, ProposalID shoal.ID
@@ -177,10 +180,10 @@ func (s *Store) History(ctx context.Context, scope Scope, targetID shoal.ID) ([]
 	}
 	return result, nil
 }
-func lookup(j journal, id shoal.ID, proposal shoal.ID) (Receipt, bool, error) {
+func lookup(j journal, id shoal.ID, proposal shoal.ID, basis shoal.ID) (Receipt, bool, error) {
 	for _, e := range j.Entries {
 		if e.Receipt.ID == id {
-			if e.Receipt.ProposalID != proposal {
+			if e.Receipt.ProposalID != proposal || e.Receipt.BasisID != basis {
 				return Receipt{}, true, ErrConflict
 			}
 			return e.Receipt, true, nil
@@ -191,8 +194,9 @@ func lookup(j journal, id shoal.ID, proposal shoal.ID) (Receipt, bool, error) {
 
 // Append attempts one CAS only. Exact retries replay the original server time
 // and attribution even when later adjudications have advanced the target head.
-func (s *Store) Append(ctx context.Context, scope Scope, key []byte, proposal decision.AdjudicationProposal, attribution Attribution) (Receipt, error) {
-	if len(key) == 0 || len(key) > shoal.MaxIDBytes || proposal.Validate() != nil || !validAttribution(attribution) {
+// The proposal AND retained basis reference must match for an exact retry.
+func (s *Store) Append(ctx context.Context, scope Scope, key []byte, proposal decision.AdjudicationProposal, attribution Attribution, basisID shoal.ID) (Receipt, error) {
+	if len(key) == 0 || len(key) > shoal.MaxIDBytes || proposal.Validate() != nil || !validAttribution(attribution) || !textID(basisID) {
 		return Receipt{}, invalid()
 	}
 	sd, e := scopeDigest(scope)
@@ -206,7 +210,7 @@ func (s *Store) Append(ctx context.Context, scope Scope, key []byte, proposal de
 	if e != nil {
 		return Receipt{}, e
 	}
-	if r, found, e := lookup(j, id, proposal.ID()); found {
+	if r, found, e := lookup(j, id, proposal.ID(), basisID); found {
 		return r, e
 	}
 	cfg := proposal.Config()
@@ -227,7 +231,7 @@ func (s *Store) Append(ctx context.Context, scope Scope, key []byte, proposal de
 	if len(j.Entries) > 0 && now.Before(j.Entries[len(j.Entries)-1].Receipt.ReceivedAt) {
 		return Receipt{}, ErrUnavailable
 	}
-	receipt := Receipt{ID: id, Version: int64(len(j.Entries) + 1), TargetID: proposal.TargetID(), TaskID: proposal.TaskID(), PictureID: proposal.PictureID(), PolicyID: proposal.PolicyID(), ProposalID: proposal.ID(), ProposalConfig: cfg, Adjudicator: attribution, ReceivedAt: now}
+	receipt := Receipt{BasisID: basisID, ID: id, Version: int64(len(j.Entries) + 1), TargetID: proposal.TargetID(), TaskID: proposal.TaskID(), PictureID: proposal.PictureID(), PolicyID: proposal.PolicyID(), ProposalID: proposal.ID(), ProposalConfig: cfg, Adjudicator: attribution, ReceivedAt: now}
 	j.Entries = append(j.Entries, entry{receipt, kd, identity})
 	encoded, e := encode(j)
 	if e != nil {
@@ -251,7 +255,7 @@ func (s *Store) Append(ctx context.Context, scope Scope, key []byte, proposal de
 	if e != nil {
 		return Receipt{}, errors.Join(ErrIndeterminate, e)
 	}
-	replay, found, lookupErr := lookup(current, id, proposal.ID())
+	replay, found, lookupErr := lookup(current, id, proposal.ID(), basisID)
 	if found && lookupErr == nil {
 		return replay, nil
 	}

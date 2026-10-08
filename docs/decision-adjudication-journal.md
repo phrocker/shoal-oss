@@ -17,6 +17,14 @@ until the surrounding service has performed those checks. A stored receipt alone
 does not grant training eligibility. The contract and service requirements are
 described in [the adjudication boundary](decision-adjudication.md).
 
+Each receipt requires a `BasisID` for the exact retained evidence/authority
+snapshot used at admission. The service must durably retain that basis before
+appending the journal reference. It must bind the complete target inventory,
+verified witness provenance, role/conflict-check evidence and capture cutoff.
+The journal validates the reference's structure and immutable binding; it cannot
+establish that the referenced artifact is available or authoritative. Retention
+and current authorization remain explicit service prerequisites.
+
 ## One target, one ordered history
 
 The journal coordinate includes the authorization domain and the canonical
@@ -43,6 +51,8 @@ authenticated subject/actor/client/delegation identity. The raw key is not store
 An exact retry returns its original receipt, attribution and timestamp even when
 later entries have advanced the head. Changed content under the same key
 conflicts. Changing a grant fingerprint cannot rewrite the original attribution.
+Changing the basis under the same key also conflicts. An exact retry must resolve
+and reuse the original basis rather than capture a new inventory snapshot.
 
 Append attempts one CAS. An exact readback can reconcile a lost acknowledgment;
 an acknowledged rejection is a conflict. If storage or cancellation prevents

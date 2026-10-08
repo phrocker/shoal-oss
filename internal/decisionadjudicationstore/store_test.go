@@ -204,7 +204,7 @@ func TestHistoryAndExactRetryAfterHeadAdvances(t *testing.T) {
 	}
 	scope := Scope{[]byte("domain")}
 	firstProposal := proposed(t, policy, p, c)
-	first, e := s.Append(context.Background(), scope, []byte("key"), firstProposal, attribution())
+	first, e := s.Append(context.Background(), scope, []byte("key"), firstProposal, attribution(), "basis:fixture")
 	if e != nil {
 		t.Fatal(e)
 	}
@@ -213,19 +213,19 @@ func TestHistoryAndExactRetryAfterHeadAdvances(t *testing.T) {
 	c.ObservationReceiptIDs = []shoal.ID{shoal.ID("outcome-receipt:" + strings.Repeat("c", 64))}
 	secondAttrib := attribution()
 	secondAttrib.ActorID = "other-actor"
-	second, e := s.Append(context.Background(), scope, []byte("other-key"), proposed(t, policy, p, c), secondAttrib)
+	second, e := s.Append(context.Background(), scope, []byte("other-key"), proposed(t, policy, p, c), secondAttrib, "basis:fixture")
 	if e != nil || second.Version != 2 || second.TargetID != first.TargetID {
 		t.Fatal("report subset or principal forked target", e)
 	}
 	changedGrant := attribution()
 	changedGrant.AuthorizationFingerprint = "auth-sha256:" + strings.Repeat("d", 64)
-	retry, e := s.Append(context.Background(), scope, []byte("key"), firstProposal, changedGrant)
+	retry, e := s.Append(context.Background(), scope, []byte("key"), firstProposal, changedGrant, "basis:fixture")
 	if e != nil || !reflect.DeepEqual(first, retry) || b.writes.Load() != 2 {
 		t.Fatal("exact stale-head retry changed original receipt", e)
 	}
 	c.ExpectedHeadID = ""
 	c.ExpectedVersion = 0
-	if _, e = s.Append(context.Background(), scope, []byte("key"), proposed(t, policy, p, c), attribution()); !errors.Is(e, ErrConflict) {
+	if _, e = s.Append(context.Background(), scope, []byte("key"), proposed(t, policy, p, c), attribution(), "basis:fixture"); !errors.Is(e, ErrConflict) {
 		t.Fatal("same-key changed proposal accepted", e)
 	}
 	history, e := s.History(context.Background(), scope, first.TargetID)
@@ -253,7 +253,7 @@ func TestConcurrentExpectedHeadHasOneWinner(t *testing.T) {
 	results := make(chan error, 2)
 	for _, key := range []string{"one", "two"} {
 		go func(k string) {
-			_, e := s.Append(context.Background(), Scope{[]byte("domain")}, []byte(k), proposal, attribution())
+			_, e := s.Append(context.Background(), Scope{[]byte("domain")}, []byte(k), proposal, attribution(), "basis:fixture")
 			results <- e
 		}(key)
 	}
@@ -288,7 +288,7 @@ func TestAllDispositionsRemainInHistory(t *testing.T) {
 			c.Reason = ""
 		}
 		proposal := proposed(t, policy, p, c)
-		r, e := s.Append(context.Background(), Scope{[]byte("domain")}, []byte{byte(i)}, proposal, attribution())
+		r, e := s.Append(context.Background(), Scope{[]byte("domain")}, []byte{byte(i)}, proposal, attribution(), "basis:fixture")
 		if e != nil {
 			t.Fatal(e)
 		}
@@ -319,7 +319,7 @@ func TestUnknownAcknowledgementAndReadback(t *testing.T) {
 				ctx, cancel = context.WithCancel(ctx)
 				b.afterCAS = cancel
 			}
-			r, e := s.Append(ctx, Scope{[]byte("domain")}, []byte("key"), proposed(t, policy, p, c), attribution())
+			r, e := s.Append(ctx, Scope{[]byte("domain")}, []byte("key"), proposed(t, policy, p, c), attribution(), "basis:fixture")
 			if kind == "reconcile" {
 				if e != nil || r.ID == "" {
 					t.Fatal("lost acknowledgment not reconciled", e)
@@ -337,7 +337,7 @@ func TestBoundsAndClockNeverTruncateHistory(t *testing.T) {
 	scope := Scope{[]byte("domain")}
 	var first Receipt
 	for i := 0; i < MaxEntries; i++ {
-		r, e := s.Append(context.Background(), scope, []byte{byte(i)}, proposed(t, policy, p, c), attribution())
+		r, e := s.Append(context.Background(), scope, []byte{byte(i)}, proposed(t, policy, p, c), attribution(), "basis:fixture")
 		if e != nil {
 			t.Fatal(i, e)
 		}
@@ -347,7 +347,7 @@ func TestBoundsAndClockNeverTruncateHistory(t *testing.T) {
 		c.ExpectedHeadID = r.ID
 		c.ExpectedVersion = r.Version
 	}
-	if _, e := s.Append(context.Background(), scope, []byte("overflow"), proposed(t, policy, p, c), attribution()); !errors.Is(e, ErrLimit) || b.writes.Load() != MaxEntries {
+	if _, e := s.Append(context.Background(), scope, []byte("overflow"), proposed(t, policy, p, c), attribution(), "basis:fixture"); !errors.Is(e, ErrLimit) || b.writes.Load() != MaxEntries {
 		t.Fatal("entry bound not enforced", e)
 	}
 	history, e := s.History(context.Background(), scope, first.TargetID)
@@ -370,7 +370,7 @@ func TestByteBoundAndNondecreasingServerClock(t *testing.T) {
 	lastVersion := int64(0)
 	for i := 0; i < 25; i++ {
 		before := b.writes.Load()
-		r, e := s.Append(context.Background(), scope, []byte{byte(i)}, proposed(t, policy, p, c), attribution())
+		r, e := s.Append(context.Background(), scope, []byte{byte(i)}, proposed(t, policy, p, c), attribution(), "basis:fixture")
 		if errors.Is(e, ErrLimit) {
 			if b.writes.Load() != before || lastVersion == 0 {
 				t.Fatal("overflow changed journal")
@@ -392,7 +392,7 @@ func TestClockRollbackAndInvalidClock(t *testing.T) {
 	b := &memoryCAS{}
 	s, _ := New(Config{Backend: b, Clock: func() time.Time { return current }})
 	scope := Scope{[]byte("domain")}
-	r, e := s.Append(context.Background(), scope, []byte("first"), proposed(t, policy, p, c), attribution())
+	r, e := s.Append(context.Background(), scope, []byte("first"), proposed(t, policy, p, c), attribution(), "basis:fixture")
 	if e != nil {
 		t.Fatal(e)
 	}
@@ -400,7 +400,7 @@ func TestClockRollbackAndInvalidClock(t *testing.T) {
 	c.ExpectedVersion = 1
 	for _, bad := range []time.Time{current.Add(-time.Nanosecond), {}, time.Date(10000, 1, 1, 0, 0, 0, 0, time.UTC)} {
 		current = bad
-		if _, e = s.Append(context.Background(), scope, []byte("next"), proposed(t, policy, p, c), attribution()); !errors.Is(e, ErrUnavailable) || b.writes.Load() != 1 {
+		if _, e = s.Append(context.Background(), scope, []byte("next"), proposed(t, policy, p, c), attribution(), "basis:fixture"); !errors.Is(e, ErrUnavailable) || b.writes.Load() != 1 {
 			t.Fatal("invalid server clock accepted", e)
 		}
 	}
@@ -431,7 +431,7 @@ func TestRealEngineBinaryAttributionRestart(t *testing.T) {
 		if e != nil {
 			t.Fatal(e)
 		}
-		r, e := s.Append(context.Background(), domain, []byte("key"), proposal, a)
+		r, e := s.Append(context.Background(), domain, []byte("key"), proposal, a, "basis:fixture")
 		if e != nil {
 			t.Fatal(e)
 		}
@@ -469,13 +469,13 @@ func TestCorruptOrderingAndBindingFailClosed(t *testing.T) {
 	b := &memoryCAS{}
 	s, _ := New(Config{Backend: b, Clock: clock})
 	scope := Scope{[]byte("domain")}
-	r, e := s.Append(context.Background(), scope, []byte("one"), proposed(t, policy, p, c), attribution())
+	r, e := s.Append(context.Background(), scope, []byte("one"), proposed(t, policy, p, c), attribution(), "basis:fixture")
 	if e != nil {
 		t.Fatal(e)
 	}
 	c.ExpectedHeadID = r.ID
 	c.ExpectedVersion = 1
-	if _, e = s.Append(context.Background(), scope, []byte("two"), proposed(t, policy, p, c), attribution()); e != nil {
+	if _, e = s.Append(context.Background(), scope, []byte("two"), proposed(t, policy, p, c), attribution(), "basis:fixture"); e != nil {
 		t.Fatal(e)
 	}
 	sd, _ := scopeDigest(scope)
@@ -518,5 +518,49 @@ func TestCodecRejectsOversizedCollectionsBeforeWideDecode(t *testing.T) {
 	}
 	if e := boundedShape([]byte(`{"Entries":[],"Entries":[]}`)); e == nil {
 		t.Fatal("duplicate collection accepted")
+	}
+}
+
+func TestBasisIsRequiredAndPartOfExactReplay(t *testing.T) {
+	policy, p, c, clock := fixture(t)
+	b := &memoryCAS{unknown: true}
+	s, _ := New(Config{Backend: b, Clock: clock})
+	scope := Scope{[]byte("domain")}
+	proposal := proposed(t, policy, p, c)
+	for _, invalidBasis := range []shoal.ID{"", " ", shoal.ID(string([]byte{255})), shoal.ID(strings.Repeat("x", shoal.MaxIDBytes+1))} {
+		if _, e := s.Append(context.Background(), scope, []byte("key"), proposal, attribution(), invalidBasis); e == nil || b.writes.Load() != 0 {
+			t.Fatal("invalid basis admitted", e)
+		}
+	}
+	first, e := s.Append(context.Background(), scope, []byte("key"), proposal, attribution(), "basis:original")
+	if e != nil || first.BasisID != "basis:original" {
+		t.Fatal("lost-ack basis not retained", e)
+	}
+	if _, e = s.Append(context.Background(), scope, []byte("key"), proposal, attribution(), "basis:substituted"); !errors.Is(e, ErrConflict) || errors.Is(e, ErrIndeterminate) || b.writes.Load() != 1 {
+		t.Fatal("changed basis replay accepted", e)
+	}
+	replay, e := s.Append(context.Background(), scope, []byte("key"), proposal, attribution(), "basis:original")
+	if e != nil || !reflect.DeepEqual(first, replay) || b.writes.Load() != 1 {
+		t.Fatal("original basis replay changed receipt", e)
+	}
+	history, e := s.History(context.Background(), scope, proposal.TargetID())
+	if e != nil || len(history) != 1 || history[0].BasisID != "basis:original" {
+		t.Fatal("history lost basis", e)
+	}
+	sd, _ := scopeDigest(scope)
+	coord := s.coordinate(sd, proposal.TargetID())
+	cell := b.cells[string(coord.Row)]
+	j, e := decode(cell.Value)
+	if e != nil {
+		t.Fatal(e)
+	}
+	j.Entries[0].Receipt.BasisID = ""
+	cell.Value, e = encode(j)
+	if e != nil {
+		t.Fatal(e)
+	}
+	b.cells[string(coord.Row)] = cell
+	if _, e = s.History(context.Background(), scope, proposal.TargetID()); !errors.Is(e, ErrCorrupt) {
+		t.Fatal("missing persisted basis accepted", e)
 	}
 }

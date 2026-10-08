@@ -140,7 +140,7 @@ func validateJournal(j journal) error {
 	for i, e := range j.Entries {
 		r := e.Receipt
 		c := r.ProposalConfig
-		if !validHash(e.KeyDigest) || !validHash(e.IdentityDigest) || !validAttribution(r.Adjudicator) || identityDigest(r.Adjudicator) != e.IdentityDigest || r.ID != receiptID(j.ScopeDigest, j.TargetID, e.IdentityDigest, e.KeyDigest) || seen[r.ID] || r.Version != int64(i+1) || r.TargetID != j.TargetID || !validTime(r.ReceivedAt) {
+		if !textID(r.BasisID) || !validHash(e.KeyDigest) || !validHash(e.IdentityDigest) || !validAttribution(r.Adjudicator) || identityDigest(r.Adjudicator) != e.IdentityDigest || r.ID != receiptID(j.ScopeDigest, j.TargetID, e.IdentityDigest, e.KeyDigest) || seen[r.ID] || r.Version != int64(i+1) || r.TargetID != j.TargetID || !validTime(r.ReceivedAt) {
 			return ErrCorrupt
 		}
 		seen[r.ID] = true
