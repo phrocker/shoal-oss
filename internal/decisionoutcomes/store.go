@@ -250,14 +250,15 @@ func (s *Store) check(ctx context.Context, before auth.Decision, o decision.Outc
 	chain := []decision.OutcomeObservation{o}
 	// Collection has no outcome-evidence verification that a later storage read
 	// could invalidate. Even failures are withheld until current authorization of
-	// the collected observations has been rechecked.
+	// the collected observations has been rechecked. Incompatible or incomplete
+	// links remain opaque NotFound: uncollected ancestry may be unauthorized.
 	collectErr := func() error {
 		seen := map[shoal.ID]bool{receipt: true}
 		current := o.Config()
 		previousTime := received
 		for n := 0; current.Supersedes != ""; n++ {
 			if n >= MaxOutcomeAncestors || seen[current.Supersedes] {
-				return invalid()
+				return auth.ObjectNotFound()
 			}
 			seen[current.Supersedes] = true
 			d, p, e := s.resolve(ctx, &before, o.RequestID(), o.PredictionID(), auth.OperationRead)
@@ -278,7 +279,7 @@ func (s *Store) check(ctx context.Context, before auth.Decision, o decision.Outc
 			chain = append(chain, po) // Verify even a valid but incompatible predecessor before disclosing the link error.
 			pc := po.Config()
 			if pc.SubjectID != current.SubjectID || pc.QuestionID != current.QuestionID || pc.Kind != current.Kind || pc.ActionID != current.ActionID || predecessor.Receipt.ReceivedAt.After(previousTime) {
-				return invalid()
+				return auth.ObjectNotFound()
 			}
 			current = pc
 			previousTime = predecessor.Receipt.ReceivedAt

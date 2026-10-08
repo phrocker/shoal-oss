@@ -885,3 +885,67 @@ func TestDirectWrongPredictionLookupMasksExistingReceipt(t *testing.T) {
 		t.Fatal("append revealed wrong-prediction receipt or attempted write", e)
 	}
 }
+
+func TestIncompatibleCorrectionHidesRevokedGrandparent(t *testing.T) {
+	s, b, a, ctx, c := storeFixture(t)
+	execution := c
+	execution.Kind = decision.OutcomeExecution
+	execution.QuestionID = ""
+	execution.Label = ""
+	execution.ActionID = "action"
+	execution.ExecutionStatus = decision.ExecutionSucceeded
+	execution.EvidenceIDs = []shoal.ID{"oldest-private-evidence"}
+	oldest, e := appendCfg(s, ctx, "oldest", execution)
+	if e != nil {
+		t.Fatal(e)
+	}
+	execution.Supersedes = oldest.ID
+	execution.EvidenceIDs = []shoal.ID{"parent-visible-evidence"}
+	parent, e := appendCfg(s, ctx, "parent", execution)
+	if e != nil {
+		t.Fatal(e)
+	}
+	a.evidenceDenied.Store(shoal.ID("oldest-private-evidence"), true)
+	_, parentReadErr := s.Read(ctx, c.RequestID, c.PredictionID, []byte("parent"))
+	c.Supersedes = parent.ID
+	c.EvidenceIDs = []shoal.ID{"current-visible-evidence"}
+	before := b.writes.Load()
+	_, incompatibleErr := appendCfg(s, ctx, "current", c)
+	c.Supersedes = shoal.ID("outcome-receipt:" + strings.Repeat("0", 64))
+	_, absentErr := appendCfg(s, ctx, "current", c)
+	if !shoal.IsErrorCode(parentReadErr, shoal.ErrorNotFound) || !shoal.IsErrorCode(incompatibleErr, shoal.ErrorNotFound) || !shoal.IsErrorCode(absentErr, shoal.ErrorNotFound) || incompatibleErr.Error() != absentErr.Error() || incompatibleErr.Error() != parentReadErr.Error() {
+		t.Fatalf("incompatible link revealed hidden ancestry: read=%v incompatible=%v absent=%v", parentReadErr, incompatibleErr, absentErr)
+	}
+	if b.writes.Load() != before {
+		t.Fatal("incompatible correction attempted write")
+	}
+}
+
+func TestDepthLimitHidesRevokedOldestAncestor(t *testing.T) {
+	s, backend, authority, ctx, config := storeFixture(t)
+	config.EvidenceIDs = []shoal.ID{"oldest-private-evidence"}
+	last, err := appendCfg(s, ctx, "oldest", config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	config.EvidenceIDs = []shoal.ID{"visible-correction-evidence"}
+	for i := 0; i < MaxOutcomeAncestors; i++ {
+		config.Supersedes = last.ID
+		last, err = appendCfg(s, ctx, string(rune(100+i)), config)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	authority.evidenceDenied.Store(shoal.ID("oldest-private-evidence"), true)
+	before := backend.writes.Load()
+	config.Supersedes = last.ID
+	_, hiddenErr := appendCfg(s, ctx, "beyond-depth-limit", config)
+	config.Supersedes = shoal.ID("outcome-receipt:" + strings.Repeat("0", 64))
+	_, missingErr := appendCfg(s, ctx, "beyond-depth-limit", config)
+	if !shoal.IsErrorCode(hiddenErr, shoal.ErrorNotFound) || !shoal.IsErrorCode(missingErr, shoal.ErrorNotFound) || hiddenErr.Error() != missingErr.Error() {
+		t.Fatalf("depth limit disclosed hidden ancestry: hidden=%v missing=%v", hiddenErr, missingErr)
+	}
+	if backend.writes.Load() != before {
+		t.Fatal("over-depth correction attempted a write")
+	}
+}
