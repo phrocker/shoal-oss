@@ -4,7 +4,9 @@
 package fleet
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"testing"
 	"time"
@@ -25,22 +27,39 @@ type executorClaimFixture struct {
 	enqueuer      context.Context
 	authority     *auth.Authority
 	registryStore *memoryStore
+	executors     executorMap
 	now           time.Time
+	// clock is what the service and the authority both read, so advancing it
+	// moves them together. The fixture's own now is kept in step because every
+	// test builds its RequestContext from it.
+	clock *time.Time
+}
+
+// advance moves the fixture's clock forward. Tests that need a lease to lapse
+// need this rather than a short sleep: the service clock is frozen, so a
+// one-nanosecond lease is still live however long the test waits.
+func (f *executorClaimFixture) advance(t *testing.T, by time.Duration) {
+	t.Helper()
+	*f.clock = f.clock.Add(by)
+	f.now = *f.clock
 }
 
 func newExecutorClaimFixture(t *testing.T) *executorClaimFixture {
 	t.Helper()
 	now := time.Date(2026, 9, 6, 12, 0, 0, 0, time.UTC)
-	authority, err := auth.NewAuthorityWithClock(func() time.Time { return now })
+	clock := &now
+	authority, err := auth.NewAuthorityWithClock(
+		func() time.Time { return *clock })
 	if err != nil {
 		t.Fatal(err)
 	}
 	registryStore := newMemoryStore()
+	executors := executorMap{"exec": &remoteBoundExecutor{}}
 	registry, err := NewService(Config{
 		Store: registryStore, Resolver: authority.Resolver(), Recorder: &memoryRecorder{},
 		Snapshots: fixedSnapshot{now},
-		Executors: executorMap{"exec": &remoteBoundExecutor{}},
-		Clock:     func() time.Time { return now },
+		Executors: executors,
+		Clock:     func() time.Time { return *clock },
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -51,7 +70,7 @@ func newExecutorClaimFixture(t *testing.T) *executorClaimFixture {
 	service, err := NewDispatchService(DispatchConfig{
 		Store: newMemoryDispatchStore(), Registry: registry,
 		Resolver: authority.Resolver(), Recorder: &dispatchRecorder{},
-		Events: dispatchEvents{}, Clock: func() time.Time { return now },
+		Events: dispatchEvents{}, Clock: func() time.Time { return *clock },
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -66,7 +85,16 @@ func newExecutorClaimFixture(t *testing.T) *executorClaimFixture {
 	return &executorClaimFixture{
 		service: service, queued: queued, enqueuer: enqueuer,
 		authority: authority, registryStore: registryStore, now: now,
+		executors: executors, clock: clock,
 	}
+}
+
+// bindExecutor replaces the descriptor's bound executor with one that runs in
+// process, so ExecuteClaim reaches it instead of refusing for want of an
+// ActionExecutor implementation.
+func (f *executorClaimFixture) bindExecutor(t *testing.T, executor ActionExecutor) {
+	t.Helper()
+	f.executors["exec"] = executor
 }
 
 // breakExecutor makes the record's descriptor unresolvable for a reason that is
@@ -368,9 +396,13 @@ func TestCancelAndStatusStayEnqueuerOnly(t *testing.T) {
 // distinguishable error would arrive first.
 //
 // The existing foreign-claim test cannot catch this: a principal holding only
-// invoke is refused by the principal check before the registry is consulted, so
-// the bare error is never produced. This one holds execute, which is the whole
-// difference.
+// invoke never produces the bare error, because the route that would resolve
+// the binding without a principal check is the execute one, and it is not
+// authorized to take it. It is refused at decision.AuthorizeObject on the
+// execute route and then at the principal check on the invoke route — the
+// order matters only to the comment, not the conclusion, and an earlier
+// version of this one named the second mechanism alone. This test holds
+// execute, which is the whole difference.
 func TestAnExecuteHolderCannotProbeForExistence(t *testing.T) {
 	fixture := newExecutorClaimFixture(t)
 	worker := fixture.worker(t, auth.OperationExecute)
@@ -397,5 +429,440 @@ func TestAnExecuteHolderCannotProbeForExistence(t *testing.T) {
 	}
 	if !shoal.IsErrorCode(existing, shoal.ErrorNotFound) {
 		t.Fatalf("probe error = %v, want the not-found shape", existing)
+	}
+}
+
+// namedWorker binds a decision for a specific principal, so two workers can be
+// told apart. The shared worker helper mints one identity, which is enough for
+// "not the enqueuer" and not enough for "not the other worker" — and the
+// difference between those two is where this PR's worst defect lived.
+func (f *executorClaimFixture) namedWorker(
+	t *testing.T, name string, operations ...auth.Operation,
+) context.Context {
+	t.Helper()
+	return bindDecision(t, f.authority, dispatchDecision(t,
+		name+"-subject", name+"-actor", name+"-request", operations...))
+}
+
+// TestOneWorkerCannotCompleteAnotherWorkersClaim is the gate #437 removed
+// without replacing, and the reason this PR was held in draft a second time.
+//
+// Claiming and completing were both authorized under OperationInvoke and both
+// additionally required sameActionPrincipal, so the claimant was by
+// construction the enqueuer and the enqueuer's chain was already on the record.
+// Relaxing claiming to OperationExecute left the completion predicate as
+// version, state and ClaimID — and none of those is an identity.
+//
+// ClaimID cannot stand in for one. validateOpaque accepts any one to
+// MaxActionIDBytes bytes with no entropy requirement, dispatch_model.go calls
+// it "the durable claimant identity" — which invites a worker to reuse a
+// stable value — and it is published twice over: Status returns it to every
+// co-principal, and Pull returns a claimed record whose lease has lapsed, its
+// ClaimID intact, to every principal authorized to execute the descriptor.
+//
+// The result was worse than a fabricated outcome. The hijacker's write lands,
+// and then the replay branch recognises the real worker's report as its own
+// committed write and returns 200 carrying the hijacker's output. A worker that
+// performed an irreversible external effect is told the work was recorded and
+// handed someone else's result, which is the one failure mode it cannot detect.
+func TestOneWorkerCannotCompleteAnotherWorkersClaim(t *testing.T) {
+	fixture := newExecutorClaimFixture(t)
+	holder := fixture.namedWorker(t, "holder", auth.OperationExecute)
+	stranger := fixture.namedWorker(t, "stranger", auth.OperationExecute)
+
+	claimed, err := fixture.service.Claim(holder, ClaimRequest{
+		ID: fixture.queued.ID, ExpectedVersion: fixture.queued.Version,
+		ClaimID: []byte("holder-claim"), Lease: time.Minute,
+		Context: dispatchContext(fixture.now, "holder-request"),
+	})
+	if err != nil {
+		t.Fatalf("the holder could not claim: %v", err)
+	}
+
+	// The stranger holds execute on the same descriptor in the same scope and
+	// has claimed nothing. It presents the holder's ClaimID and version.
+	_, err = fixture.service.CompleteClaim(stranger, CompletionRequest{
+		ID: fixture.queued.ID, ExpectedVersion: claimed.Version,
+		ClaimID: []byte("holder-claim"),
+		Result:  ExecutionResult{Output: json.RawMessage(`{"ok":false}`)},
+		Context: dispatchContext(fixture.now, "stranger-request"),
+	})
+	if err == nil {
+		t.Fatal("a principal that never claimed this action completed it, " +
+			"which lets any execute-holder commit a fabricated outcome for " +
+			"work another worker is performing")
+	}
+	// Concealed, not refused: ErrClaimLost would confirm the action exists to
+	// a caller with no standing, which is the #398 oracle.
+	if !shoal.IsErrorCode(err, shoal.ErrorNotFound) {
+		t.Fatalf("the refusal discloses the action to a caller with no "+
+			"standing: %v", err)
+	}
+
+	// The record is untouched, which is the part that matters. A refusal that
+	// still wrote the output would be the same defect with an error attached.
+	after, err := fixture.service.Status(fixture.enqueuer, StatusRequest{
+		ID: fixture.queued.ID, Context: dispatchContext(fixture.now, "request"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.State != DispatchClaimed || len(after.Output) != 0 {
+		t.Fatalf("the refused completion still changed the record: state=%s "+
+			"output=%s", after.State, after.Output)
+	}
+
+	// And the real claimant still completes, with its own outcome rather than
+	// a receipt for someone else's. This is the half that makes the test about
+	// identity instead of about refusing everything.
+	done, err := fixture.service.CompleteClaim(holder, CompletionRequest{
+		ID: fixture.queued.ID, ExpectedVersion: claimed.Version,
+		ClaimID: []byte("holder-claim"),
+		Result:  ExecutionResult{Output: json.RawMessage(`{"ok":true}`)},
+		Context: dispatchContext(fixture.now, "holder-request"),
+	})
+	if err != nil {
+		t.Fatalf("the claim's actual holder was refused: %v", err)
+	}
+	if string(done.Output) != `{"ok":true}` {
+		t.Fatalf("the claimant's own outcome was not recorded: %s", done.Output)
+	}
+}
+
+// TestAReclaimMovesWhoMayReport covers the case the stored claimant has to get
+// right to be usable at all: a lease lapses, a second worker takes the record,
+// and the first worker must no longer be able to report on it.
+//
+// A claimant field that were only ever written once would pass the test above
+// and still leave the first worker able to complete after losing the fence.
+func TestAReclaimMovesWhoMayReport(t *testing.T) {
+	fixture := newExecutorClaimFixture(t)
+	first := fixture.namedWorker(t, "first", auth.OperationExecute)
+	second := fixture.namedWorker(t, "second", auth.OperationExecute)
+
+	claimed, err := fixture.service.Claim(first, ClaimRequest{
+		ID: fixture.queued.ID, ExpectedVersion: fixture.queued.Version,
+		ClaimID: []byte("first-claim"), Lease: time.Nanosecond,
+		Context: dispatchContext(fixture.now, "first-request"),
+	})
+	if err != nil {
+		t.Fatalf("the first worker could not claim: %v", err)
+	}
+
+	// The clock is frozen, so advance it past the lease rather than sleeping.
+	fixture.advance(t, time.Second)
+
+	reclaimed, err := fixture.service.Claim(second, ClaimRequest{
+		ID: fixture.queued.ID, ExpectedVersion: claimed.Version,
+		ClaimID: []byte("second-claim"), Lease: time.Minute,
+		Context: dispatchContext(fixture.now, "second-request"),
+	})
+	if err != nil {
+		t.Fatalf("the second worker could not take the lapsed claim: %v", err)
+	}
+	if reclaimed.ClaimFence <= claimed.ClaimFence {
+		t.Fatalf("the fence did not advance across claimants: %d then %d",
+			claimed.ClaimFence, reclaimed.ClaimFence)
+	}
+
+	// The first worker reports under its own, now-stale claim.
+	if _, err := fixture.service.CompleteClaim(first, CompletionRequest{
+		ID: fixture.queued.ID, ExpectedVersion: claimed.Version,
+		ClaimID: []byte("first-claim"),
+		Result:  ExecutionResult{Output: json.RawMessage(`{"ok":false}`)},
+		Context: dispatchContext(fixture.now, "first-request"),
+	}); err == nil {
+		t.Fatal("a worker whose claim was taken over still completed the " +
+			"action, so the stored claimant is not updated on re-claim")
+	}
+
+	// And the new holder can.
+	if _, err := fixture.service.CompleteClaim(second, CompletionRequest{
+		ID: fixture.queued.ID, ExpectedVersion: reclaimed.Version,
+		ClaimID: []byte("second-claim"),
+		Result:  ExecutionResult{Output: json.RawMessage(`{"ok":true}`)},
+		Context: dispatchContext(fixture.now, "second-request"),
+	}); err != nil {
+		t.Fatalf("the current holder was refused: %v", err)
+	}
+}
+
+// TestAStrangerCannotReplayAnotherWorkersClaim covers Claim's replay branch,
+// which is a second way into a live record.
+//
+// The branch exists so a worker whose response was lost receives the claim it
+// already holds instead of a conflict against its own write, and it keys on
+// ClaimID, version and lease — all three of which a second execute-holder
+// knows, because Pull hands it a lapsed-claim record carrying them. Without an
+// identity condition it returned the full record of a live claim, including the
+// action's input, which Pull withholds precisely by excluding live-claimed
+// records from the page.
+func TestAStrangerCannotReplayAnotherWorkersClaim(t *testing.T) {
+	fixture := newExecutorClaimFixture(t)
+	holder := fixture.namedWorker(t, "holder", auth.OperationExecute)
+	stranger := fixture.namedWorker(t, "stranger", auth.OperationExecute)
+
+	if _, err := fixture.service.Claim(holder, ClaimRequest{
+		ID: fixture.queued.ID, ExpectedVersion: fixture.queued.Version,
+		ClaimID: []byte("holder-claim"), Lease: time.Minute,
+		Context: dispatchContext(fixture.now, "holder-request"),
+	}); err != nil {
+		t.Fatalf("the holder could not claim: %v", err)
+	}
+
+	// Exactly the request the holder would replay, from the wrong principal.
+	replayed, err := fixture.service.Claim(stranger, ClaimRequest{
+		ID: fixture.queued.ID, ExpectedVersion: fixture.queued.Version,
+		ClaimID: []byte("holder-claim"), Lease: time.Minute,
+		Context: dispatchContext(fixture.now, "stranger-request"),
+	})
+	if err == nil {
+		t.Fatalf("the replay branch handed a live claim to a principal that "+
+			"does not hold it, input included: state=%s input=%s",
+			replayed.State, replayed.Input)
+	}
+
+	// The holder's own replay still works, so this is an identity condition
+	// rather than the branch being disabled.
+	again, err := fixture.service.Claim(holder, ClaimRequest{
+		ID: fixture.queued.ID, ExpectedVersion: fixture.queued.Version,
+		ClaimID: []byte("holder-claim"), Lease: time.Minute,
+		Context: dispatchContext(fixture.now, "holder-request"),
+	})
+	if err != nil {
+		t.Fatalf("the holder's own replay was refused, so a lost response is "+
+			"now an unrecoverable conflict: %v", err)
+	}
+	if !bytes.Equal(again.ClaimID, []byte("holder-claim")) {
+		t.Fatalf("the replay returned a different claim: %q", again.ClaimID)
+	}
+}
+
+// breakingExecutor performs the work and, as a side effect of performing it,
+// makes the action's descriptor stop resolving.
+//
+// That side effect is the only way to reach the post-effect re-authorization
+// from a test. Both authorization checks in a completion live inside one call —
+// the pre-effect resolve in authorizedClaimant and the post-effect one in
+// applyExecutionResult — so nothing outside can act between them. Breaking the
+// registry from inside Execute puts the change exactly where a revocation would
+// land in production: after the effect, before the record.
+type breakingExecutor struct {
+	store *memoryStore
+}
+
+func (e *breakingExecutor) Execute(
+	_ context.Context, invocation Invocation,
+) (ExecutionResult, error) {
+	stored := e.store.records["agent"]
+	stored.Descriptor.ExecutorRef = "no-such-executor"
+	e.store.records["agent"] = stored
+	return ExecutionResult{Output: json.RawMessage(`{"ok":true}`)}, nil
+}
+
+// TestARevokedExecutorCannotCommitItsOutcome covers the post-effect
+// re-authorization, which was the one line in this change that no test could
+// see. Deleting it left the whole repository green.
+//
+// It is also the most expensive check here to get wrong, because it runs
+// *after* the effect. An executor refused at this point has already performed
+// irreversible work and is then told the outcome is ambiguous — so it has to
+// refuse exactly the caller whose authorization genuinely went away and nobody
+// else. Before this PR it was sameActionPrincipal paired with a
+// resolveActionBinding hardcoded to OperationInvoke, which would have failed
+// every execute-authorized completion at the last step, indistinguishably from
+// the lease loss the ambiguity is reserved for.
+func TestARevokedExecutorCannotCommitItsOutcome(t *testing.T) {
+	fixture := newExecutorClaimFixture(t)
+	fixture.bindExecutor(t, &breakingExecutor{store: fixture.registryStore})
+
+	// Driven by the enqueuer, because ExecuteClaim is the in-process path and
+	// requires sameActionPrincipal at its entry — in-process execution runs on
+	// the enqueuer's behalf. That is also why this reaches the post-effect
+	// check at all: the remote completion path resolves before the effect and
+	// refuses a broken descriptor there, so a revocation can only be observed
+	// after the work when the work happens in process.
+	claimed, err := fixture.service.Claim(fixture.enqueuer, ClaimRequest{
+		ID: fixture.queued.ID, ExpectedVersion: fixture.queued.Version,
+		ClaimID: []byte("in-process-claim"), Lease: time.Minute,
+		Context: dispatchContext(fixture.now, "request"),
+	})
+	if err != nil {
+		t.Fatalf("the enqueuer could not claim: %v", err)
+	}
+
+	_, err = fixture.service.ExecuteClaim(fixture.enqueuer, claimed)
+	if err == nil {
+		t.Fatal("a worker whose authorization to execute this action was " +
+			"withdrawn mid-effect still committed its outcome")
+	}
+	// Ambiguous rather than a plain refusal, and that distinction is the
+	// point. The work happened, so "this did not happen" would be a lie;
+	// ErrExecutionAmbiguous is what tells a caller to treat the outcome as
+	// unknown and reconcile it.
+	if !errors.Is(err, ErrExecutionAmbiguous) {
+		t.Fatalf("the refusal does not tell the caller its effect is "+
+			"unreconciled, which is the only thing it can act on: %v", err)
+	}
+
+	// Put the descriptor back before reading the record. The executor broke it
+	// permanently, and Status resolves the binding too — so without this the
+	// read fails for the reason the test created rather than telling us
+	// anything about the record.
+	stored := fixture.registryStore.records["agent"]
+	stored.Descriptor.ExecutorRef = "exec"
+	fixture.registryStore.records["agent"] = stored
+
+	// The record did not quietly become terminal on the way out, and recorded
+	// no outcome. A refusal that still wrote the output would be the same
+	// defect with an error attached.
+	//
+	// EffectPossible is deliberately not asserted here: applyClaim sets it
+	// only for an action declaring external mutation or egress, and this
+	// fixture's action declares neither, so it is false for a reason that has
+	// nothing to do with this check. Asserting it would be asserting the
+	// fixture.
+	after, err := fixture.service.Status(fixture.enqueuer, StatusRequest{
+		ID: fixture.queued.ID, Context: dispatchContext(fixture.now, "request"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.State != DispatchClaimed {
+		t.Fatalf("the refused completion still moved the record to %s", after.State)
+	}
+	if len(after.Output) != 0 {
+		t.Fatalf("the refused completion recorded an outcome anyway: %s",
+			after.Output)
+	}
+}
+
+// TestATerminalActionIsNotVisibleToAStranger covers the #398 normalisation on
+// the routes this PR added, which is where it was reopened.
+//
+// Every route used to resolve through authorizedCurrent with
+// sameActionPrincipal required unconditionally, so a caller with no standing
+// was refused with ObjectNotFound before reaching any handler. The execute
+// routes removed that gate deliberately. What they then exposed is that the
+// handlers answer with ErrActionConflict, ErrActionTerminal and ErrClaimLost,
+// and an absent action answers with ObjectNotFound — so an execute-holder could
+// probe arbitrary action IDs, which are caller-chosen opaque bytes, and tell
+// the two apart.
+//
+// Three branches reach an answer before any of them compares the caller to the
+// record, and each is covered separately below. A first version of this test
+// covered only the version mismatch, because it probed with a stale version —
+// and removing the normalisation from either of the other two left the suite
+// green.
+//
+// Terminal and past-deadline are the states Pull does not return, so those are
+// the ones where this disclosed something a caller could not already see. A
+// queued or live-claimed record is in its page anyway; the mismatch branch is
+// normalised regardless, because reaching it means guessing.
+func TestATerminalActionIsNotVisibleToAStranger(t *testing.T) {
+	t.Run("a stale version", func(t *testing.T) {
+		fixture := newExecutorClaimFixture(t)
+		stranger := fixture.namedWorker(t, "stranger", auth.OperationExecute)
+		fixture.cancel(t)
+		fixture.assertIndistinguishable(t, stranger, 1)
+	})
+
+	t.Run("a terminal record at its current version", func(t *testing.T) {
+		fixture := newExecutorClaimFixture(t)
+		stranger := fixture.namedWorker(t, "stranger", auth.OperationExecute)
+		cancelled := fixture.cancel(t)
+		// Pull does not offer it, so this is a record the stranger has no
+		// other way to observe.
+		page, err := fixture.service.Pull(stranger, PullActionsRequest{
+			Limit: 10, Context: dispatchContext(fixture.now, "stranger-request"),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(page.Actions) != 0 {
+			t.Fatalf("a terminal action is still pullable, so this case is "+
+				"not about a hidden record: %d actions", len(page.Actions))
+		}
+		fixture.assertIndistinguishable(t, stranger, cancelled.Version)
+	})
+
+	t.Run("a record past its deadline", func(t *testing.T) {
+		fixture := newExecutorClaimFixture(t)
+		// Still queued rather than terminal, so this reaches the deadline
+		// check rather than the terminal one above it. The clock moves before
+		// the caller is minted, because a decision bound beforehand would
+		// expire with it and be refused at begin — both probes identically,
+		// which would make this case pass without reaching the branch at all.
+		// Two hours, not more: the action's deadline is an hour out and the
+		// agent descriptor's lease is twenty-four, so a larger jump expires
+		// the descriptor and the probe is refused for that instead — which
+		// refuses both probes identically and so passes without reaching the
+		// branch.
+		fixture.advance(t, 2*time.Hour)
+		stranger := fixture.namedWorker(t, "stranger", auth.OperationExecute)
+		fixture.assertIndistinguishable(t, stranger, fixture.queued.Version)
+	})
+}
+
+func (f *executorClaimFixture) cancel(t *testing.T) ActionRecord {
+	t.Helper()
+	cancelled, err := f.service.Cancel(f.enqueuer, CancelRequest{
+		ID: f.queued.ID, ExpectedVersion: f.queued.Version,
+		MutationKey: []byte("cancel-once"),
+		Context:     dispatchContext(f.now, "request"),
+	})
+	if err != nil {
+		t.Fatalf("the enqueuer could not cancel: %v", err)
+	}
+	return cancelled
+}
+
+// assertIndistinguishable requires that claiming and completing the fixture's
+// real action produce byte-identical refusals to claiming and completing an
+// action ID that was never used.
+func (f *executorClaimFixture) assertIndistinguishable(
+	t *testing.T, caller context.Context, version uint64,
+) {
+	t.Helper()
+	absentID := []byte("never-existed")
+	for _, probe := range []struct {
+		name string
+		call func(id []byte) error
+	}{
+		{"claim", func(id []byte) error {
+			_, err := f.service.Claim(caller, ClaimRequest{
+				ID: id, ExpectedVersion: version, ClaimID: []byte("probe"),
+				Lease:   time.Minute,
+				Context: dispatchContext(f.now, "stranger-request"),
+			})
+			return err
+		}},
+		{"complete", func(id []byte) error {
+			_, err := f.service.CompleteClaim(caller, CompletionRequest{
+				ID: id, ExpectedVersion: version, ClaimID: []byte("probe"),
+				Result:  ExecutionResult{Output: json.RawMessage(`{"ok":true}`)},
+				Context: dispatchContext(f.now, "stranger-request"),
+			})
+			return err
+		}},
+	} {
+		present, absent := probe.call(f.queued.ID), probe.call(absentID)
+		if present == nil {
+			t.Fatalf("%s succeeded against a record this caller has no "+
+				"standing on", probe.name)
+		}
+		if absent == nil {
+			t.Fatalf("%s succeeded against an action ID that was never used",
+				probe.name)
+		}
+		if present.Error() != absent.Error() {
+			t.Errorf("%s distinguishes an existing action from an absent one "+
+				"at version %d:\n existing: %v\n absent:   %v",
+				probe.name, version, present, absent)
+		}
+		if !shoal.IsErrorCode(present, shoal.ErrorNotFound) {
+			t.Errorf("%s answers an existing action with %v, which is not the "+
+				"answer an absent one gets", probe.name, present)
+		}
 	}
 }

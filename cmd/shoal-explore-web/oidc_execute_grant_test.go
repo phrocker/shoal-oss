@@ -37,12 +37,22 @@ func TestTheFleetMappingDoesNotGrantExecute(t *testing.T) {
 		{"fleet", oidcFleetOperations},
 		{"contributor", oidcContributorOperations},
 		{"reader", oidcReaderOperations},
+		// The fourth list in this command, and the one an earlier version of
+		// this test missed. workspaceOperations is the -dev-auth principal's
+		// ceiling, so it is not OIDC-minted — which is exactly why asserting
+		// only the three OIDC lists made the claim "unreachable by an
+		// OIDC-minted token" true and the conclusion wrong. The dev
+		// authenticator serves the same HTTP routes.
+		{"dev-auth workspace", workspaceOperations},
 	} {
 		for _, operation := range operations.set {
 			if operation == auth.OperationExecute {
 				t.Fatalf("the %s mapping grants OperationExecute. Every "+
-					"principal it mints shares one authorization scope, so this "+
-					"lets any of them claim and complete another's queued work",
+					"principal it mints shares one authorization scope — "+
+					"authorizeResource compares only domain, source and "+
+					"policy and never matches ObjectID — so this lets any of "+
+					"them take the routes that do not compare the caller to "+
+					"the record, and claim and complete another's queued work",
 					operations.name)
 			}
 		}
