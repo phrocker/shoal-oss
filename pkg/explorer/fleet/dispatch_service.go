@@ -639,8 +639,13 @@ func (s *DispatchService) ExecuteClaim(ctx context.Context, claimed ActionRecord
 	// Unreachable through Invoke today, since Cancel refuses a live claim and
 	// this function requires one, but it is the same asymmetry and it should
 	// not read differently in the two places.
+	// Keyed on the fence, not the version. This branch still compared
+	// version+1 after the first attempt at the stranding fix, so a report
+	// landing after a committed execution turned a retry into ErrClaimLost
+	// instead of returning the committed record — the same stranding, in the
+	// one place the fix did not reach. ReportAmbiguity does not check state,
+	// so a terminal record accepts one.
 	if (current.State == DispatchSucceeded || current.State == DispatchFailed) &&
-		current.Version == claimed.Version+1 &&
 		current.ClaimFence == claimed.ClaimFence &&
 		bytes.Equal(current.ClaimID, claimed.ClaimID) {
 		if err := s.publishTransition(
@@ -650,15 +655,12 @@ func (s *DispatchService) ExecuteClaim(ctx context.Context, claimed ActionRecord
 		}
 		return cloneActionRecord(current), nil
 	}
-	// Version drift that only ambiguity reports can explain is tolerated, for
-	// the reason completeClaim's own gate records: a report advances the
-	// version while leaving the claim, the fence, the state and the lease
-	// alone, and this caller's right to execute comes from those. Without
-	// this, a lapsed holder's report between Claim and ExecuteClaim would
-	// strand a synchronous invoke the same way it stranded a completion.
-	if (current.Version != claimed.Version &&
-		!onlyAmbiguityReportsAdvanced(current, claimed.Version)) ||
-		current.ClaimFence != claimed.ClaimFence ||
+	// The fence, the claim, the state and the lease — not the version. This
+	// caller holds a record it was handed; what must still be true is that
+	// the claim generation is the same one. A report advances the version
+	// while leaving all four alone, and so does a renewal, and neither
+	// changes whose claim it is.
+	if current.ClaimFence != claimed.ClaimFence ||
 		!bytes.Equal(current.ClaimID, claimed.ClaimID) ||
 		current.State != DispatchClaimed || !now.Before(current.ClaimLeaseUntil) {
 		return ActionRecord{}, ErrClaimLost
@@ -710,11 +712,9 @@ func (s *DispatchService) ExecuteClaim(ctx context.Context, claimed ActionRecord
 	if err != nil {
 		return ActionRecord{}, err
 	}
-	// Re-read immediately before the effect, and tolerant of the same drift
-	// for the same reason as the gate above it.
-	if (current.Version != claimed.Version &&
-		!onlyAmbiguityReportsAdvanced(current, claimed.Version)) ||
-		current.ClaimFence != claimed.ClaimFence ||
+	// Re-read immediately before the effect, on the same key as the gate
+	// above it.
+	if current.ClaimFence != claimed.ClaimFence ||
 		!bytes.Equal(current.ClaimID, claimed.ClaimID) ||
 		current.State != DispatchClaimed || !executionNow.Before(current.ClaimLeaseUntil) ||
 		!executionNow.Before(current.Deadline) {
@@ -892,8 +892,18 @@ func (s *DispatchService) completeClaim(
 	// ClaimID it cancelled, so accepting any terminal state here would hand a
 	// late reporter the cancelled record and a 200 — telling it the work it
 	// performed was recorded, when the record says the opposite.
+	// A replayed report, keyed on the claim generation for the same reason the
+	// gate below is.
+	//
+	// Dropping the version here without putting the fence in its place was
+	// the second defect of the first attempt: terminal plus a matching
+	// ClaimID is true of a *later* generation's completion, so a worker
+	// reusing one ClaimID was handed attempt two's committed outcome as
+	// though it were attempt one's. Verified by execution, and covered by
+	// nothing in the repository.
 	if (current.State == DispatchSucceeded || current.State == DispatchFailed) &&
-		bytes.Equal(current.ClaimID, request.ClaimID) {
+		bytes.Equal(current.ClaimID, request.ClaimID) &&
+		replayMatchesGeneration(current, request) {
 		if err := s.publishTransition(
 			context.WithoutCancel(ctx), actionEventKind(current), current,
 		); err != nil {
@@ -901,36 +911,42 @@ func (s *DispatchService) completeClaim(
 		}
 		return cloneActionRecord(current), nil
 	}
-	// The claim, not the version.
+	// The claim generation, not the version.
 	//
 	// A completion's right to write this record comes from holding its claim:
-	// the ClaimID matches, the state is still Claimed, the lease is still live
-	// (checked below), the caller is the claimant (checked above), and the
-	// store asserts ExpectedFence unchanged. The record version added "and
-	// nothing else changed", which is a stronger claim than a completion needs
-	// and one that a *non-transitioning* write breaks.
+	// the ClaimID matches, the fence identifies which claim, the state is
+	// still Claimed, the lease is still live (checked below), the caller is
+	// the claimant (checked above), and the store compare-and-sets on what it
+	// just read.
 	//
-	// #438's ambiguity route is exactly such a write. It advances the version
-	// while leaving the state, the claim, the fence and the lease alone — so a
-	// lapsed holder filing a report moved the version out from under a live
-	// claimant, whose completion then failed with ErrClaimLost while it held
-	// the claim at the right fence. Verified by execution before this change.
+	// The version was standing in for the fence and doing it badly. It only
+	// behaved like a generation check because nothing could advance the
+	// version while leaving the claim intact — and #438's ambiguity route
+	// does exactly that, which is how a lapsed holder's report came to strand
+	// a live claimant with ErrClaimLost on work it had performed.
 	//
-	// That worker had no recourse: Status requires OperationDispatch and the
-	// record's own principal, Pull withholds live-claimed records, and this
-	// route has no replay branch of its own. So an effect it had actually
-	// performed became permanently unreportable, which is the precise harm
-	// #438 exists to prevent — caused by #438.
+	// The first attempt at this widened the version comparison to tolerate
+	// drift that reports could account for. That was wrong in a way worth
+	// recording: the budget was the record's *lifetime* report count while
+	// the drift was measured from the caller's read, so reports filed before
+	// the read bought slack without adding drift. A worker reusing one
+	// ClaimID across two claim generations could then commit attempt one's
+	// outcome onto attempt two's generation — an ABA break, verified by
+	// execution, where the version was the only thing that had been binding
+	// a completion to a generation and widening it removed that binding
+	// altogether.
 	//
-	// ExpectedVersion stays on the request as an optional pin for a caller
-	// that wants strictness, and the replay branch above no longer keys on it
-	// for the same reason: a terminal state carrying this caller's ClaimID
-	// means this caller's own write landed, whatever the version has since
-	// done. Only applyExecutionResult produces succeeded or failed, and Cancel
-	// lands on cancelled, which that branch excludes deliberately.
-	if (request.ExpectedVersion != 0 &&
-		current.Version != request.ExpectedVersion &&
-		!onlyAmbiguityReportsAdvanced(current, request.ExpectedVersion)) ||
+	// So the fence is compared instead, and the version is not compared at
+	// all when it is supplied. A caller that does not supply a fence keeps
+	// the old exact-version behaviour, which is strandable but is the
+	// contract it was written against.
+	if request.ClaimFence != 0 {
+		if current.ClaimFence != request.ClaimFence ||
+			!bytes.Equal(current.ClaimID, request.ClaimID) ||
+			current.State != DispatchClaimed {
+			return ActionRecord{}, ErrClaimLost
+		}
+	} else if current.Version != request.ExpectedVersion ||
 		!bytes.Equal(current.ClaimID, request.ClaimID) ||
 		current.State != DispatchClaimed {
 		return ActionRecord{}, ErrClaimLost
@@ -1384,27 +1400,20 @@ func (s *DispatchService) ReportAmbiguity(
 	return cloneActionRecord(stored), nil
 }
 
-// onlyAmbiguityReportsAdvanced reports whether the record's version has moved
-// past what a caller expected by no more than the number of ambiguity reports
-// it carries.
+// replayMatchesGeneration reports whether a terminal record is the committed
+// outcome of the claim generation this caller is reporting under.
 //
-// This is what lets a pinning caller keep its pin without being stranded by
-// someone else's lost-fence report. A report is the only write on this surface
-// that advances the version while leaving the state, the claim, the fence and
-// the lease untouched, so a drift it can account for is a drift that cannot
-// have affected this caller's claim.
-//
-// Deliberately an upper bound rather than an exact accounting. It does not
-// prove *which* writes moved the version — it proves the drift is within what
-// reports alone could explain, and every other write on this surface changes
-// something the gate beside this one already checks.
-func onlyAmbiguityReportsAdvanced(
-	current ActionRecord, expected uint64,
+// The fence answers it exactly when supplied. Without one, the only thing
+// available is the pre-existing version arithmetic — a terminal record at
+// exactly the version this caller expected to produce — which is why a caller
+// that supplies no fence keeps that behaviour rather than a weaker one.
+func replayMatchesGeneration(
+	current ActionRecord, request CompletionRequest,
 ) bool {
-	if current.Version <= expected {
-		return false
+	if request.ClaimFence != 0 {
+		return current.ClaimFence == request.ClaimFence
 	}
-	return current.Version-expected <= uint64(len(current.AmbiguityReports))
+	return current.Version == request.ExpectedVersion+1
 }
 
 // refuseAmbiguityAdmission keeps the admission namespace out of this route.

@@ -42,20 +42,31 @@ const (
 	// unbounded list would eventually make the action *unwritable* rather than
 	// merely large, which bricks the record instead of degrading it. Eight is
 	// chosen to cover a lease that lapses and is re-taken several times during
-	// one long operation while staying far inside that ceiling.
+	// one long operation.
+	//
+	// "Far inside that ceiling" is what this said, and a measurement
+	// disagreed: eight holders with maximal delegation chains and eight
+	// maximal reports reach 18% of the limit on their own, and a record also
+	// carrying a maximal input, output and evidence set lands at 86% — which
+	// is why MaxClaimHolderChainBytes below exists. Eight is a bound on how
+	// many, and the bound on how large is separate.
 	//
 	// The claim history drops its oldest entry on overflow: the most recent
 	// claimants are the ones whose effects may be unreconciled. The report
 	// list refuses instead of dropping, because a report is evidence an
 	// operator is going to read and silently discarding the first one is worse
 	// than refusing the ninth.
-	MaxActionClaimHistory = 8
-	// MaxClaimHolderChainBytes bounds one retained holder's delegation chain
-	// in total bytes, not only in entries. Without it the chains dominate the
-	// record's worst-case size by an order of magnitude over everything else
-	// the history and the reports contribute.
-	MaxClaimHolderChainBytes  = 4096
+	MaxActionClaimHistory     = 8
 	MaxActionAmbiguityReports = 8
+	// MaxClaimHolderChainBytes bounds one retained holder's delegation chain
+	// in total bytes, not only in entries.
+	//
+	// Measured, because the entry bound alone left the record brickable: the
+	// chains are roughly eleven times everything else the history and the
+	// reports contribute — 524 KB against 47 KB — so bounding how many
+	// holders are retained without bounding how large each may be left the
+	// dominant term unbounded.
+	MaxClaimHolderChainBytes = 4096
 	// MaxAmbiguityTargetBytes bounds the worker's identifier for the third
 	// party it was talking to, and MaxAmbiguityReferenceBytes the opaque
 	// handle that party returned.
@@ -114,10 +125,6 @@ type EvidenceRef struct {
 	Visibility []string
 }
 
-// AmbiguityOutcome, ClaimHolder and AmbiguityReport are the #438 types. The
-// ActionRecord documentation that used to sit here moved down to the
-// declaration it describes, having been orphaned when these were inserted
-// above it.
 // AmbiguityOutcome is what a worker observed before it lost the right to
 // report through complete.
 //
@@ -335,6 +342,13 @@ func validateAmbiguityText(name, value string) error {
 	return nil
 }
 
+// ActionRecord is the durable source of truth for one dispatch: what was
+// asked for, who asked for it, who holds it now, what has been observed about
+// it, and the provenance of every transition it has been through.
+//
+// It is what an operator reconciles from when an effect may have happened
+// outside Shoal, which is why so much of it exists to be read rather than
+// acted on.
 type ActionRecord struct {
 	ID                             []byte
 	IdempotencyKey                 []byte
@@ -714,9 +728,28 @@ type CancelRequest struct {
 type CompletionRequest struct {
 	ID              []byte
 	ExpectedVersion uint64
-	// ClaimID must equal the claim currently held on the action.
+	// ClaimID must equal the claim currently held on the action. It is necessary and not
+	// sufficient: it is caller-chosen, nothing requires it to be unique
+	// across claim generations, and the design doc records that as a
+	// worker-side obligation rather than something the service enforces.
 	ClaimID []byte
-	Result  ExecutionResult
+	// ClaimFence binds this completion to the claim *generation* the caller
+	// was handed, which is the thing ClaimID cannot identify.
+	//
+	// Supply it. Without it this route falls back to comparing the record
+	// version exactly, which was never a generation check — it only behaved
+	// like one because nothing else could advance the version while leaving
+	// the claim intact. #438's ambiguity route can, so a version-only
+	// completion is both strandable by someone else's report and, if the
+	// version comparison is loosened to fix that, acceptable from a stale
+	// claim generation. The fence has neither problem: applyClaim increments
+	// it on every claim, so it is exactly "which claim", and Claim returns it
+	// to the worker that must present it.
+	//
+	// Zero means not supplied, and keeps the old exact-version behaviour for
+	// a caller that predates this field.
+	ClaimFence uint64
+	Result     ExecutionResult
 	// Failed reports that the work did not succeed. Result.ErrorCode carries
 	// the reason. The two are separate because a worker that fails with no
 	// error code is a protocol error, not a success.
