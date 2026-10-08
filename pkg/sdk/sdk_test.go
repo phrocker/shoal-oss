@@ -14,8 +14,13 @@ func TestNewValidatesSharedConfiguration(t *testing.T) {
 	if _, e := New(Config{BaseURL: "https://shoal.example"}); e == nil {
 		t.Fatal("missing token accepted")
 	}
+	// The shared facade addresses the plane's root. A path-prefixed admission
+	// plane uses pkg/admission/api.NewClient directly.
+	if _, e := New(Config{BaseURL: "https://shoal.example/prefix", Token: token}); e == nil {
+		t.Fatal("path-prefixed base URL accepted by the shared facade")
+	}
 	c, e := New(Config{BaseURL: "https://shoal.example", Token: token})
-	if e != nil || c.Collectors() == nil || c.Decisions() == nil {
+	if e != nil || c.Collectors() == nil || c.Decisions() == nil || c.Admission() == nil {
 		t.Fatalf("client: %v", e)
 	}
 	if ProtocolVersion != 1 {

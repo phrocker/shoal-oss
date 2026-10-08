@@ -63,6 +63,10 @@ func TestFixturesDetectEachDirection(t *testing.T) {
 			{"B", "extensions/bad/main.go", m + "/pkg/explorer/webapi"},
 		},
 		"sdk-leaks-internal": {{"C", "pkg/helper/helper.go", m + "/internal/secret"}},
+		// The admission contracts are allowlisted: an extension may import
+		// them, and they may not reach internal/ either.
+		"extension-imports-admission-api": nil,
+		"admission-api-leaks-internal":    {{"C", "pkg/admission/api/api.go", m + "/internal/secret"}},
 		// A module naming itself into the repository cannot exempt its imports.
 		"extension-module-spoof": {{"B", "extensions/spoof/go.mod", "module " + m + "/internal (want " + m + "/extensions/spoof)"}},
 		"extension-bad-replace": {

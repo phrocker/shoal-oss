@@ -74,6 +74,16 @@ protocol-specific beyond HTTP is an extension.
   provenance that policy may require.
 - A versioned client SDK that all three gateways use for the above.
 
+Admission and report are published as `pkg/admission/api`: the exact wire
+types of `/api/v1/admission/*`, the outcome and effect constants, the limits,
+and a client (`sdk.New(...).Admission()`, or `api.NewClient` directly where the
+plane sits behind a path prefix). `cmd/shoal-llm-gateway` speaks the seam only
+through it. Golden fixtures in `pkg/admission/api/testdata/wire` pin the bytes
+both the handler and the gateway put on the wire. The client's response decoder
+refuses duplicate and case-variant keys and trailing data but ignores unknown
+fields, so a deployed gateway keeps working against a newer plane. The dispatch
+client is not public yet (#446).
+
 **Extensions use only that public surface:**
 
 - The session gateway: an SSH adapter, then an RDP adapter.

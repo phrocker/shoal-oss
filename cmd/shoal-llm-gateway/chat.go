@@ -24,7 +24,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/phrocker/shoal-oss/pkg/explorer/fleet"
+	admissionapi "github.com/phrocker/shoal-oss/pkg/admission/api"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
@@ -154,7 +154,7 @@ func (r chatRequest) references() ([]string, error) {
 		// Validated here because these travel to the plane as disclosures, and
 		// it decodes them as unpadded base64url (webapi/wire.go). A reference
 		// like "doc-a" is a permanently malformed request, and without this it
-		// reached the plane as a 400 that post() turns into
+		// reached the plane as a 400 that the admission client turns into
 		// ErrPlaneUnreachable — so the caller was told 503, which means retry,
 		// for something no retry can fix. Classification is the whole point:
 		// an infrastructural failure and a bad request must not be the same
@@ -166,7 +166,7 @@ func (r chatRequest) references() ([]string, error) {
 				shoalReferencesField)
 		}
 		// The size bound the plane enforces, enforced here for the same reason
-		// the encoding is: over it the plane answers 400, post() turns that
+		// the encoding is: over it the plane answers 400, the admission client turns that
 		// into ErrPlaneUnreachable, and the caller is told 503 — retry — for a
 		// request no retry can fix. Checking the syntax and not the size left
 		// exactly half of that closed.
@@ -183,10 +183,10 @@ func (r chatRequest) references() ([]string, error) {
 	}
 	// The count bound, applied after de-duplication because that is the number
 	// the plane actually receives.
-	if len(result) > fleet.MaxAdmissionDisclosures {
+	if len(result) > admissionapi.MaxDisclosures {
 		return nil, fmt.Errorf(
 			"%s must name at most %d documents",
-			shoalReferencesField, fleet.MaxAdmissionDisclosures)
+			shoalReferencesField, admissionapi.MaxDisclosures)
 	}
 	return result, nil
 }

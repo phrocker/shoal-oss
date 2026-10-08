@@ -69,7 +69,7 @@ from a production incident to `helm template`.
 | `-listen` | OpenAI-compatible listen address, for example `0.0.0.0:8100`. |
 | `-health-address` | Separate probe listener serving `GET /healthz` and `GET /readyz`. |
 | `-allowed-host` | Comma-separated exact-match external authorities — the same gate as the Explorer's. |
-| `-admission-url` | Base URL of the Explorer's authenticated API. |
+| `-admission-url` | Base URL of the Explorer's authenticated API. A path prefix is allowed (the admission routes are joined onto it); user info, a query or a fragment is refused at startup. See below. |
 | `-allow-plaintext-admission` | Accept a remote `http://` `-admission-url`. Off by default, and the admission hop only. |
 | `-admission-token-env` | Environment variable holding the bearer token the gateway presents to the Explorer. Mutually exclusive with the file form. |
 | `-admission-token-file` | File holding that token instead, read per request. The only form a rotating credential has. |
@@ -92,6 +92,25 @@ the pod template and rolls the pod on its own. A ConfigMap would need a checksum
 annotation to get the same effect, and without one an edited `-admission-url`
 would leave the running gateway asking the old decision plane while the chart
 claimed the new one.
+
+The gateway speaks to the plane through the public admission client
+(`pkg/admission/api`), which is built at startup. Two consequences changed with
+that move:
+
+- An `-admission-url` carrying user info (`https://user:pass@host`), a query
+  (`?tenant=a`, or a bare `?`) or a fragment is refused at startup with
+  `-admission-url invalid admission client configuration`. Before, a query was
+  carried silently onto every admission path and user info was accepted; both
+  now fail before the pod reports ready rather than shaping every request.
+- A bearer token the client cannot send is refused locally, per call, without
+  a request: an empty value fails as `invalid bearer token`, as does one
+  containing a line break. In this binary an unset or empty variable and an
+  empty token file were already refused locally by the credential readers
+  (`no credential is configured`, `<path> is empty`), so the new check is the
+  client's backstop rather than a change an operator will normally see; had
+  an empty value reached the old transport, it would have gone out as
+  `Authorization: Bearer ` and come back a remote 401 (`proxy credential
+  rejected`). Either way the call is refused `plane_unavailable`.
 
 ### Credentials, and what "read per request" does and does not buy
 

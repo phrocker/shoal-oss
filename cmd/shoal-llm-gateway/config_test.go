@@ -33,7 +33,7 @@ import (
 	"time"
 
 	"github.com/phrocker/shoal-oss/internal/healthsurface"
-	"github.com/phrocker/shoal-oss/pkg/explorer/fleet"
+	admissionapi "github.com/phrocker/shoal-oss/pkg/admission/api"
 )
 
 // TestTheRoleFieldCannotCarryThePrompt closes the channel the declaration
@@ -45,7 +45,7 @@ import (
 // guarantee about shape has to hold for every string that travels, not the
 // obvious one.
 func TestTheRoleFieldCannotCarryThePrompt(t *testing.T) {
-	plane := newFakePlane(t, outcomeAllowed, nil)
+	plane := newFakePlane(t, admissionapi.OutcomeAllowed, nil)
 	upstream := newFakeUpstream(t)
 	governed, _ := newTestProxy(t, plane, upstream)
 
@@ -81,7 +81,7 @@ func TestTheRoleFieldCannotCarryThePrompt(t *testing.T) {
 // is sanitised. Rewriting the caller's role would make the proxy the reason an
 // unmodified client gets a different answer.
 func TestTheRequestKeepsTheCallersOwnRole(t *testing.T) {
-	plane := newFakePlane(t, outcomeAllowed, nil)
+	plane := newFakePlane(t, admissionapi.OutcomeAllowed, nil)
 	upstream := newFakeUpstream(t)
 	governed, _ := newTestProxy(t, plane, upstream)
 
@@ -164,30 +164,36 @@ func TestAnUnreportableTokenIsRefusedBeforeTheEgress(t *testing.T) {
 	now := time.Now()
 	for _, probe := range []struct {
 		name  string
-		token *admissionToken
+		token *admissionapi.Token
+		// echo makes the fake carry back the token ID this proxy sent. Every
+		// probe not about the ID itself needs it: without it the probe is
+		// refused for naming a different claim before the property it names
+		// is ever checked, and the check under test could be deleted unseen.
+		echo bool
 	}{
-		{"absent", nil},
-		{"empty", &admissionToken{}},
-		{"unparseable action ID", &admissionToken{
+		{"absent", nil, false},
+		{"empty", &admissionapi.Token{}, false},
+		{"unparseable action ID", &admissionapi.Token{
 			ActionID: "not base64!", TokenID: "dG9rZW4", Version: 1,
-			ExpiresAt: now.Add(time.Minute)}},
-		{"unparseable token ID", &admissionToken{
+			ExpiresAt: now.Add(time.Minute)}, true},
+		{"unparseable token ID", &admissionapi.Token{
 			ActionID: "YWN0aW9u", TokenID: "not base64!", Version: 1,
-			ExpiresAt: now.Add(time.Minute)}},
-		{"zero version", &admissionToken{
+			ExpiresAt: now.Add(time.Minute)}, false},
+		{"zero version", &admissionapi.Token{
 			ActionID: "YWN0aW9u", TokenID: "dG9rZW4", Version: 0,
-			ExpiresAt: now.Add(time.Minute)}},
-		{"already expired", &admissionToken{
+			ExpiresAt: now.Add(time.Minute)}, true},
+		{"already expired", &admissionapi.Token{
 			ActionID: "YWN0aW9u", TokenID: "dG9rZW4", Version: 1,
-			ExpiresAt: now.Add(-time.Second)}},
-		{"expiring inside the report window", &admissionToken{
+			ExpiresAt: now.Add(-time.Second)}, true},
+		{"expiring inside the report window", &admissionapi.Token{
 			ActionID: "YWN0aW9u", TokenID: "dG9rZW4", Version: 1,
-			ExpiresAt: now.Add(minimumReportWindow / 2)}},
+			ExpiresAt: now.Add(minimumReportWindow / 2)}, true},
 		// The byte bound is covered separately, in
 		// TestAnOversizedActionIDIsRefusedBeforeTheEgress. Probes for it were
-		// here first and could not fail: this table disables token echo, so
-		// every token in it is already refused for naming a different claim,
-		// and the bound was never what the assertion measured.
+		// here first and could not fail: they ran without token echo, so every
+		// token was already refused for naming a different claim, and the
+		// bound was never what the assertion measured. The expiry probes had
+		// the same flaw until they were given an echoing plane (see echo).
 		//
 		// The shape the check was written to let through. It read "if an
 		// expiry is set and it is too close", so a plane answering without one
@@ -195,14 +201,12 @@ func TestAnUnreportableTokenIsRefusedBeforeTheEgress(t *testing.T) {
 		// establish a window for it. Absent is not generous here, it is
 		// unknown, and an unknown deadline cannot be shown to leave room —
 		// which makes this the one case the whole guard most needed to catch.
-		{"no expiry at all", &admissionToken{
-			ActionID: "YWN0aW9u", TokenID: "dG9rZW4", Version: 1}},
+		{"no expiry at all", &admissionapi.Token{
+			ActionID: "YWN0aW9u", TokenID: "dG9rZW4", Version: 1}, true},
 	} {
-		plane := newFakePlane(t, outcomeAllowed, nil)
+		plane := newFakePlane(t, admissionapi.OutcomeAllowed, nil)
 		plane.token = probe.token
-		// These probes are about the token's own shape, so the fixture must
-		// not echo a usable ID over the one under test.
-		plane.echoTokenID = false
+		plane.echoTokenID = probe.echo
 		upstream := newFakeUpstream(t)
 		governed, _ := newTestProxy(t, plane, upstream)
 
@@ -213,10 +217,18 @@ func TestAnUnreportableTokenIsRefusedBeforeTheEgress(t *testing.T) {
 		if upstream.calls != 0 {
 			t.Fatalf("%s token: the egress happened anyway", probe.name)
 		}
+		// Refused at admission, not discovered later: the proxy's own
+		// pre-egress budget check would also stop an expiring grant, but it
+		// spends a failure report doing so. No report means the grant never
+		// got past the reportability check this table exists to pin.
+		if len(plane.reports) != 0 {
+			t.Fatalf("%s token: refused only after admission (%d reports)",
+				probe.name, len(plane.reports))
+		}
 	}
 
 	// A usable token is still accepted, or the check above is just a refusal.
-	plane := newFakePlane(t, outcomeAllowed, nil)
+	plane := newFakePlane(t, admissionapi.OutcomeAllowed, nil)
 	upstream := newFakeUpstream(t)
 	governed, _ := newTestProxy(t, plane, upstream)
 	if recorder := post(t, governed, plainCall); recorder.Code != 200 {
@@ -266,7 +278,7 @@ func TestTheLeaseMustOutlastTheCallItAdmits(t *testing.T) {
 		timeout time.Duration
 	}{
 		{"room to report", 4 * time.Minute, 90 * time.Second},
-		{"exactly the ceiling", fleet.MaxActionClaimTTL, time.Minute},
+		{"exactly the ceiling", admissionapi.MaxLease, time.Minute},
 	} {
 		if err := validateDurations(probe.lease, probe.timeout); err != nil {
 			t.Fatalf("%s was refused: %v", probe.name, err)
@@ -774,7 +786,7 @@ func TestAnAllowListEntryWithNoHostIsRefusedAtStartup(t *testing.T) {
 // anything else becomes a marker.
 func TestTheModelFieldCannotCarryThePrompt(t *testing.T) {
 	const secret = "a-prompt-smuggled-through-the-model-field"
-	plane := newFakePlane(t, outcomeAllowed, nil)
+	plane := newFakePlane(t, admissionapi.OutcomeAllowed, nil)
 	upstream := newFakeUpstream(t)
 	governed, _ := newTestProxy(t, plane, upstream)
 
@@ -837,12 +849,12 @@ func TestTheModelFieldCannotCarryThePrompt(t *testing.T) {
 // a plane that always disagreed and nothing noticed. It echoes now, which is
 // what a real plane does, and this probe is the one place that overrides it.
 func TestAGrantNamingAnotherClaimIsRefused(t *testing.T) {
-	plane := newFakePlane(t, outcomeAllowed, nil)
+	plane := newFakePlane(t, admissionapi.OutcomeAllowed, nil)
 	upstream := newFakeUpstream(t)
 	governed, _ := newTestProxy(t, plane, upstream)
 	// A well-formed, reportable token for a different claim.
 	plane.echoTokenID = false
-	plane.token = &admissionToken{
+	plane.token = &admissionapi.Token{
 		ActionID:  "YWN0aW9u",
 		TokenID:   "c29tZWJvZHktZWxzZQ",
 		Version:   1,
@@ -874,7 +886,7 @@ func TestAGrantNamingAnotherClaimIsRefused(t *testing.T) {
 //
 // The admission service applies a grammar to capability and action names
 // (validateName in pkg/explorer/fleet/model.go): non-empty, at most
-// fleet.MaxNameBytes, no surrounding whitespace, and only letters, digits and
+// admissionapi.MaxNameBytes, no surrounding whitespace, and only letters, digits and
 // _-.: — and a name outside it takes a 400 on every admission, which this
 // client reports as plane_unavailable. So static configuration started cleanly,
 // passed both probes, and told every caller to retry a configuration error
@@ -892,7 +904,7 @@ func TestFleetNamesAreValidatedAtStartup(t *testing.T) {
 		{"a space inside", "com plete", "letters, digits"},
 		{"a slash", "chat/completions", "letters, digits"},
 		{"an at sign", "complete@v1", "letters, digits"},
-		{"over the byte bound", strings.Repeat("a", fleet.MaxNameBytes+1), "at most"},
+		{"over the byte bound", strings.Repeat("a", admissionapi.MaxNameBytes+1), "at most"},
 	} {
 		detail := refusal(t, proxyArgs("-action", probe.value))
 		if !strings.Contains(detail, probe.refused) {
@@ -911,7 +923,7 @@ func TestFleetNamesAreValidatedAtStartup(t *testing.T) {
 	// feature. Every character class the service allows is covered.
 	for _, probe := range []string{
 		"complete", "chat.completions", "llm_gateway", "llm-gateway",
-		"chat:complete", "Complete9", strings.Repeat("a", fleet.MaxNameBytes),
+		"chat:complete", "Complete9", strings.Repeat("a", admissionapi.MaxNameBytes),
 	} {
 		if err := fleetName("-action", probe); err != nil {
 			t.Fatalf("%q was refused: %v", probe, err)
@@ -938,7 +950,7 @@ func TestTheAgentIDSentIsTheOneValidated(t *testing.T) {
 		t.Fatal("the premise no longer holds: an untrimmed ID now decodes")
 	}
 
-	plane := newFakePlane(t, outcomeAllowed, nil)
+	plane := newFakePlane(t, admissionapi.OutcomeAllowed, nil)
 	upstream := newFakeUpstream(t)
 	// run() reads this at request time, and without it the admission POST
 	// fails as unauthenticated before the agent ID is ever sent — which is
@@ -1031,7 +1043,7 @@ func TestTheAgentIDSentIsTheOneValidated(t *testing.T) {
 // Marking ready before the watcher starts means every cancellation transition
 // happens after it and wins.
 func TestReadinessIsNeverFlippedBackAfterShutdownBegins(t *testing.T) {
-	plane := newFakePlane(t, outcomeAllowed, nil)
+	plane := newFakePlane(t, admissionapi.OutcomeAllowed, nil)
 	upstream := newFakeUpstream(t)
 	t.Setenv("SHOAL_ADMISSION_TOKEN", "plane-token")
 
@@ -1099,7 +1111,7 @@ func TestReadinessIsNeverFlippedBackAfterShutdownBegins(t *testing.T) {
 // report endpoint applies, before the call rather than after it.
 //
 // AdmissionToken.validate runs both IDs through validateOpaque, which refuses
-// anything over fleet.MaxActionIDBytes. So an over-long ID is a grant that
+// anything over admissionapi.MaxIDBytes. So an over-long ID is a grant that
 // passes reportable, is spent on the upstream call, and can then never be
 // reported — the exact outcome reportable exists to prevent. Checking
 // decodability without checking length left half of its purpose open.
@@ -1116,11 +1128,11 @@ func TestReadinessIsNeverFlippedBackAfterShutdownBegins(t *testing.T) {
 // bound. The loop checks both because the cost is nothing and the guarantee
 // then does not depend on two other rules holding.
 func TestAnOversizedActionIDIsRefusedBeforeTheEgress(t *testing.T) {
-	plane := newFakePlane(t, outcomeAllowed, nil)
+	plane := newFakePlane(t, admissionapi.OutcomeAllowed, nil)
 	upstream := newFakeUpstream(t)
 	governed, _ := newTestProxy(t, plane, upstream)
 	plane.token.ActionID = base64.RawURLEncoding.EncodeToString(
-		bytes.Repeat([]byte("a"), fleet.MaxActionIDBytes+1))
+		bytes.Repeat([]byte("a"), admissionapi.MaxIDBytes+1))
 
 	recorder := post(t, governed, plainCall)
 	if upstream.calls != 0 {
@@ -1133,7 +1145,7 @@ func TestAnOversizedActionIDIsRefusedBeforeTheEgress(t *testing.T) {
 
 	// Exactly at the bound is accepted, or this refuses valid grants.
 	plane.token.ActionID = base64.RawURLEncoding.EncodeToString(
-		bytes.Repeat([]byte("a"), fleet.MaxActionIDBytes))
+		bytes.Repeat([]byte("a"), admissionapi.MaxIDBytes))
 	if recorder = post(t, governed, plainCall); recorder.Code != http.StatusOK {
 		t.Fatalf("an action ID exactly at the bound was refused: %d %s",
 			recorder.Code, recorder.Body.String())
@@ -1149,7 +1161,7 @@ func TestAnOversizedActionIDIsRefusedBeforeTheEgress(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(decoded) > fleet.MaxActionIDBytes {
+	if len(decoded) > admissionapi.MaxIDBytes {
 		t.Fatalf("the proxy generates a token ID of %d bytes, over the bound",
 			len(decoded))
 	}
