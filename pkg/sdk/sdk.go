@@ -7,8 +7,13 @@
 //
 // Covered today: collector enrollment, artifact and observation submission
 // and observation reads (pkg/collector/api); registered decision evaluation
-// and reads (pkg/decision/api). Admission and report move here in a later
-// slice of #446.
+// and reads (pkg/decision/api); pre-call admission, report and outstanding
+// admissions (pkg/admission/api).
+//
+// New refuses a base URL with a path, because the collector and decision
+// clients address the plane's root. A caller that reaches the admission seam
+// through a path-routed proxy (as shoal-llm-gateway may) constructs
+// pkg/admission/api.NewClient directly, which accepts a path prefix.
 package sdk
 
 import (
@@ -16,6 +21,7 @@ import (
 	"fmt"
 	"net/http"
 
+	admissionapi "github.com/phrocker/shoal-oss/pkg/admission/api"
 	collectorapi "github.com/phrocker/shoal-oss/pkg/collector/api"
 	decisionapi "github.com/phrocker/shoal-oss/pkg/decision/api"
 )
@@ -35,6 +41,7 @@ type Config struct {
 type Client struct {
 	collectors *collectorapi.Client
 	decisions  *decisionapi.Client
+	admission  *admissionapi.Client
 }
 
 func New(c Config) (*Client, error) {
@@ -46,8 +53,13 @@ func New(c Config) (*Client, error) {
 	if e != nil {
 		return nil, fmt.Errorf("sdk: %w", e)
 	}
-	return &Client{collectors: collectors, decisions: decisions}, nil
+	admission, e := admissionapi.NewClient(admissionapi.Config{BaseURL: c.BaseURL, HTTPClient: c.HTTPClient, Token: c.Token})
+	if e != nil {
+		return nil, fmt.Errorf("sdk: %w", e)
+	}
+	return &Client{collectors: collectors, decisions: decisions, admission: admission}, nil
 }
 
 func (c *Client) Collectors() *collectorapi.Client { return c.collectors }
 func (c *Client) Decisions() *decisionapi.Client   { return c.decisions }
+func (c *Client) Admission() *admissionapi.Client  { return c.admission }

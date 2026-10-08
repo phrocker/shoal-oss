@@ -15,7 +15,8 @@ and calls `MountCollectors` itself, as for decisions (`docs/decision-http-api.md
 | --- | --- | --- |
 | `pkg/collector` | Contracts: `Registration`, `EnrollRequest`, `ExtractorRef`, `ArtifactRef`, `Observation`, `Confidence`, `AttestationReport`, `AttestationResult` | stdlib, `pkg/shoal` |
 | `pkg/collector/api` | Wire types, strict decoding, Go client | `pkg/collector`, `pkg/shoal` |
-| `pkg/sdk` | Versioned facade: `sdk.New(...).Collectors()` and `.Decisions()`; `sdk.ProtocolVersion = 1` | `pkg/shoal`, `*/api` |
+| `pkg/admission/api` | Admission seam wire types (request, grant, report, receipt, outstanding page, error), limits and a Go client that accepts a path-prefixed base URL; see `docs/admission-seam.md` | stdlib, `pkg/shoal` |
+| `pkg/sdk` | Versioned facade: `sdk.New(...).Collectors()`, `.Decisions()` and `.Admission()`; `sdk.ProtocolVersion = 1` | `pkg/shoal`, `*/api` |
 | `internal/collectorregistry` | Engine-backed registry, `Provider` wire adapter, `Source` adapter | core |
 | `internal/collectorattest` | Attestation verifiers | core |
 | `pkg/explorer/webapi` (`collectors.go`) | HTTP routes | core |
@@ -190,7 +191,8 @@ so it works with `GOWORK=off`) and fails when:
   import it;
 - B. an extension module (any `go.mod` under `extensions/`, at any depth)
   imports a repository package outside `pkg/sdk`, `pkg/collector`,
-  `pkg/collector/api`, `pkg/decision/api`, `pkg/shoal`; or declares a module
+  `pkg/collector/api`, `pkg/decision/api`, `pkg/admission/api`, `pkg/shoal`;
+  or declares a module
   path other than the repository module plus its directory (a module naming
   itself `.../internal` would otherwise exempt its own imports, and Go's
   `internal` rule does not protect this tree from such a module); or replaces

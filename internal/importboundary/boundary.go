@@ -9,11 +9,12 @@
 //     go.work wires extension code in (see checkWorkspace).
 //   - Rule B: every extension module (any go.mod under extensions/, at any
 //     depth) imports from this repository only the public allowlist: pkg/sdk,
-//     pkg/collector, pkg/collector/api, pkg/decision/api and pkg/shoal. Its
-//     module path must be the repository module plus its directory, its only
-//     permitted replace is the repository onto this tree, and no Go file
-//     under extensions/ may sit outside an extension module. Standard library
-//     and third-party imports are the extension's own business.
+//     pkg/collector, pkg/collector/api, pkg/decision/api, pkg/admission/api
+//     and pkg/shoal. Its module path must be the repository module plus its
+//     directory, its only permitted replace is the repository onto this
+//     tree, and no Go file under extensions/ may sit outside an extension
+//     module. Standard library and third-party imports are the extension's
+//     own business.
 //   - Rule C: the in-repository import closure of the allowlist contains no
 //     internal/ package (and no extension), so the allowlist cannot leak
 //     internals transitively.
@@ -45,6 +46,7 @@ var Allowlist = []string{
 	Module + "/pkg/collector",
 	Module + "/pkg/collector/api",
 	Module + "/pkg/decision/api",
+	Module + "/pkg/admission/api",
 	Module + "/pkg/shoal",
 }
 
