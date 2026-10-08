@@ -40,8 +40,11 @@ import (
 // first registered with: heartbeats move leases, and a heartbeat can leave a
 // parent with less remaining than its child was registered with. Measuring
 // every agent from one instant keeps each child within its parent, so a live
-// fleet always exports to a policy that compiles. Rounding is monotone, so the
-// clamp to the parent only absorbs rounding, never a live inversion.
+// fleet always exports to a policy that compiles. The clamp to the parent does
+// two things: it absorbs rounding, and it absorbs a real inversion, where a
+// parent's own heartbeat left it with less lease remaining than its child.
+// In the second case the exported child TTL is shorter than what the child
+// holds live.
 //
 // executors supplies the host's executor assertions. When it is nil there is
 // nothing to read them from, so each referenced executor is exported with the
@@ -72,11 +75,12 @@ func Export(live map[shoal.ID]fleet.Descriptor, executors []Executor, now time.T
 	ttls := make(map[shoal.ID]time.Duration, len(ordered))
 	for _, id := range ordered {
 		descriptor := live[id]
-		ttl := descriptor.LeaseExpiresAt.Sub(now).Round(time.Second)
-		if ttl < time.Second {
+		remaining := descriptor.LeaseExpiresAt.Sub(now)
+		if remaining < time.Second {
 			return Document{}, refuse("", exportPath(id)+".lease_ttl",
 				"the live lease ends within a second of the export time")
 		}
+		ttl := remaining.Round(time.Second)
 		if ttl > MaxLeaseTTL {
 			ttl = MaxLeaseTTL
 		}

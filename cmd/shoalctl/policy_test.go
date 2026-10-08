@@ -507,6 +507,11 @@ func TestPolicyCommandArguments(t *testing.T) {
 		{"plan", fixture.directory, "-endpoint", fixture.server.URL, "-token-file", filepath.Join(t.TempDir(), "missing")},
 		{"apply", fixture.directory, "-endpoint", fixture.server.URL, "-token-file", fixture.tokenFile},
 		{"export", "-endpoint", fixture.server.URL, "-token-file", fixture.tokenFile},
+		// A bare "?" or "#" would turn every route into a query or fragment.
+		{"plan", fixture.directory, "-endpoint", fixture.server.URL + "/x?", "-token-file", fixture.tokenFile},
+		{"plan", fixture.directory, "-endpoint", fixture.server.URL + "?", "-token-file", fixture.tokenFile},
+		{"plan", fixture.directory, "-endpoint", fixture.server.URL + "#", "-token-file", fixture.tokenFile},
+		{"plan", fixture.directory, "-endpoint", "http://user:secret@127.0.0.1:1", "-token-file", fixture.tokenFile},
 	}
 	for _, args := range invalid {
 		if _, _, err := fixture.run(t, args...); err == nil {

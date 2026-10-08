@@ -123,6 +123,10 @@ type Entry struct {
 	Spec    fleet.Spec
 	Reason  string
 	Changes []Change
+	// TwoStep reports that apply writes this update twice: first with its
+	// lease clamped to its parent's live lease, then, once the parent's own
+	// update has landed, with its full lease. See orderWrites.
+	TwoStep bool
 }
 
 // Plan is the difference between a compiled policy and the live registry.
@@ -134,9 +138,12 @@ type Plan struct {
 	// computed against, each managed agent's kind and live content, and the
 	// IDs of unmanaged agents. Generations, leases and update times are left
 	// out because heartbeats move them without changing anything a policy
-	// governs. Apply recomputes the digest and refuses on a mismatch, so it
+	// governs. The write order is bound too, since it is part of what was
+	// reviewed. Apply recomputes the digest and refuses on a mismatch, so it
 	// only writes a plan whose substance was reviewed.
 	Digest string
+
+	writes []Write
 }
 
 // Refusals returns the entries that block apply.
@@ -150,22 +157,15 @@ func (p Plan) Refusals() []Entry {
 	return result
 }
 
-// Writes returns the entries apply registers, in the order it must register
-// them so that every intermediate state is one the registry resolves: updates
-// deepest first, so a child is narrowed within its parent before the parent
-// narrows past it, then creates parents first.
-func (p Plan) Writes() []Entry {
-	var updates, creates []Entry
-	for _, entry := range p.Entries {
-		switch {
-		case entry.Kind.Updates():
-			updates = append(updates, entry)
-		case entry.Kind == KindCreate:
-			creates = append(creates, entry)
-		}
+// Writes returns the registrations apply makes, in order. It is empty when
+// the plan has refusals. See orderWrites for how the order is chosen.
+func (p Plan) Writes() []Write {
+	result := make([]Write, len(p.writes))
+	for i, write := range p.writes {
+		result[i] = write
+		result[i].Spec = cloneSpec(write.Spec)
 	}
-	sort.SliceStable(updates, func(i, j int) bool { return updates[i].Depth > updates[j].Depth })
-	return append(updates, creates...)
+	return result
 }
 
 // Diff compares a compiled policy with the live registry.
@@ -260,16 +260,6 @@ func Diff(policy *Policy, live map[shoal.ID]fleet.Descriptor, registry string) P
 					continue
 				}
 			}
-			// An update lands before its parent's update (Writes), so it must
-			// also sit within the parent as it is live until then.
-			if entry.Kind.Updates() && kinds[parentID].Updates() {
-				if reason := exceeds(self, linkFromDescriptor(live[parentID])); reason != "" {
-					entry.Kind = KindRefusedDelegation
-					entry.Reason = fmt.Sprintf("would exceed live parent %s before that parent's own update lands: %s",
-						agentPath(parentID), reason)
-					continue
-				}
-			}
 		}
 		ids := children[entry.ID]
 		sort.Slice(ids, func(i, j int) bool { return shoal.CompareID(ids[i], ids[j]) < 0 })
@@ -301,6 +291,7 @@ func Diff(policy *Policy, live map[shoal.ID]fleet.Descriptor, registry string) P
 			Reason:      "live but not declared; apply leaves it as it is",
 		})
 	}
+	orderWrites(&plan, live)
 	plan.Digest = planDigest(plan)
 	return plan
 }
@@ -362,18 +353,24 @@ func ContentDigest(descriptor fleet.Descriptor) string {
 
 func planDigest(plan Plan) string {
 	type managedEntry struct {
-		ID   string `json:"id"`
-		Kind Kind   `json:"kind"`
-		Live string `json:"live"`
+		ID      string `json:"id"`
+		Kind    Kind   `json:"kind"`
+		Live    string `json:"live"`
+		TwoStep bool   `json:"two_step"`
 	}
 	body := struct {
 		Policy    string         `json:"policy"`
 		Registry  string         `json:"registry"`
 		Managed   []managedEntry `json:"managed"`
 		Unmanaged []string       `json:"unmanaged"`
+		Order     []string       `json:"order"`
 	}{
 		Policy: plan.PolicyDigest, Registry: hex.EncodeToString([]byte(plan.Registry)),
-		Managed: []managedEntry{}, Unmanaged: []string{},
+		Managed: []managedEntry{}, Unmanaged: []string{}, Order: []string{},
+	}
+	for _, write := range plan.writes {
+		body.Order = append(body.Order, fmt.Sprintf("%s/%d/%d",
+			hex.EncodeToString([]byte(write.ID)), write.Step, write.Steps))
 	}
 	for _, entry := range plan.Entries {
 		// Hex, not the raw ID: a live ID need not be UTF-8.
@@ -382,7 +379,9 @@ func planDigest(plan Plan) string {
 			body.Unmanaged = append(body.Unmanaged, id)
 			continue
 		}
-		body.Managed = append(body.Managed, managedEntry{ID: id, Kind: entry.Kind, Live: entry.LiveContent})
+		body.Managed = append(body.Managed, managedEntry{
+			ID: id, Kind: entry.Kind, Live: entry.LiveContent, TwoStep: entry.TwoStep,
+		})
 	}
 	encoded, _ := json.Marshal(body)
 	sum := sha256.Sum256(encoded)

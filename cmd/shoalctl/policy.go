@@ -240,7 +240,17 @@ func runPolicyApply(args []string, stdout, stderr io.Writer) error {
 	}
 	writes := plan.Writes()
 	fmt.Fprintf(stdout, "policy digest: %s\n", policy.Digest())
-	for i, entry := range writes {
+	written := make(map[shoal.ID]int64, len(writes))
+	for i, write := range writes {
+		entry := write.Entry
+		step := ""
+		if write.Steps > 1 {
+			step = fmt.Sprintf(" (step %d of %d)", write.Step, write.Steps)
+			if write.Step > 1 {
+				// A later step expects the generation the earlier one wrote.
+				entry.LiveGeneration = written[entry.ID]
+			}
+		}
 		descriptor, err := client.register(ctx, policy.Digest(), entry)
 		var refused *registryError
 		if err != nil && entry.Kind.Updates() && errors.As(err, &refused) &&
@@ -265,11 +275,12 @@ func runPolicyApply(args []string, stdout, stderr io.Writer) error {
 			descriptor, err = client.register(ctx, policy.Digest(), entry)
 		}
 		if err != nil {
-			return fmt.Errorf("%s: %w; stopped after %d of %d writes",
-				agentLabel(entry.ID), err, i, len(writes))
+			return fmt.Errorf("%s%s: %w; stopped after %d of %d writes",
+				agentLabel(entry.ID), step, err, i, len(writes))
 		}
-		fmt.Fprintf(stdout, "%s %s %s: generation %d\n",
-			entry.Kind.Symbol(), agentLabel(entry.ID), entry.Kind, descriptor.Generation)
+		written[entry.ID] = descriptor.Generation
+		fmt.Fprintf(stdout, "%s %s %s%s: generation %d\n",
+			entry.Kind.Symbol(), agentLabel(entry.ID), entry.Kind, step, descriptor.Generation)
 	}
 	fmt.Fprintf(stdout, "applied %d of %d writes\n", len(writes), len(writes))
 	return nil
@@ -320,7 +331,7 @@ func runPolicyExport(args []string, stdout, stderr io.Writer) error {
 			"union of its live actions' effects and min_effects is empty. That is the narrowest "+
 			"assertion the live registrations satisfy, not what the host binds.")
 	}
-	files, err := exportFiles(document)
+	files, err := exportFiles(document, atpl.MaxPolicyBytes)
 	if err != nil {
 		return err
 	}
@@ -364,7 +375,7 @@ func agentFileName(id string) string {
 	return "agent-sha256." + hex.EncodeToString(sum[:16]) + atpl.FileSuffix
 }
 
-func exportFiles(document atpl.Document) ([]exportFile, error) {
+func exportFiles(document atpl.Document, maxTotal int64) ([]exportFile, error) {
 	encode := func(name string, value atpl.Document) (exportFile, error) {
 		data, err := atpl.Encode(value)
 		if err != nil {
@@ -385,11 +396,18 @@ func exportFiles(document atpl.Document) ([]exportFile, error) {
 		return nil, err
 	}
 	files := []exportFile{executors}
+	total := int64(len(executors.data))
 	for _, agent := range document.Agents {
 		file, err := encode(agentFileName(agent.ID),
 			atpl.Document{ATPL: document.ATPL, Origin: document.Origin, Agents: []atpl.Agent{agent}})
 		if err != nil {
 			return nil, err
+		}
+		// Checked before anything is written: a directory over the bound
+		// would be refused by the very plan it was exported for.
+		if total += int64(len(file.data)); total > maxTotal {
+			return nil, fmt.Errorf("export needs more than %d bytes, more than one policy directory may hold",
+				maxTotal)
 		}
 		files = append(files, file)
 	}
@@ -527,6 +545,20 @@ func printPolicyPlan(output io.Writer, plan atpl.Plan) {
 		counts[string(atpl.KindCreate)], counts[string(atpl.KindNarrow)],
 		counts[string(atpl.KindExecutorChange)], counts[string(atpl.KindUnchanged)],
 		counts["refused"], counts[string(atpl.KindUnmanaged)])
+	if writes := plan.Writes(); len(writes) > 0 {
+		fmt.Fprintln(output, "apply order:")
+		for i, write := range writes {
+			step := ""
+			if write.Steps > 1 {
+				step = fmt.Sprintf(" (step %d of %d", write.Step, write.Steps)
+				if write.Step < write.Steps {
+					step += ", lease clamped to " + write.Spec.LeaseExpiresAt.Format(time.RFC3339)
+				}
+				step += ")"
+			}
+			fmt.Fprintf(output, "  %d. %s %s %s%s\n", i+1, write.Kind.Symbol(), agentLabel(write.ID), write.Kind, step)
+		}
+	}
 	fmt.Fprintf(output, "plan digest: %s\n", plan.Digest)
 }
 
@@ -669,8 +701,12 @@ type fleetClient struct {
 
 func newFleetClient(endpoint, tokenFile string) (*fleetClient, error) {
 	parsed, err := url.Parse(endpoint)
-	if err != nil || parsed.Host == "" || parsed.RawQuery != "" || parsed.Fragment != "" {
-		return nil, errors.New("-endpoint must be an absolute URL without query or fragment")
+	// ForceQuery catches a bare trailing "?", which leaves RawQuery empty but
+	// would turn every route appended to the base into a query string.
+	if err != nil || parsed.Host == "" || parsed.RawQuery != "" || parsed.ForceQuery ||
+		parsed.Fragment != "" || parsed.RawFragment != "" || strings.Contains(endpoint, "#") ||
+		parsed.User != nil || parsed.Opaque != "" {
+		return nil, errors.New("-endpoint must be an absolute URL without credentials, query or fragment")
 	}
 	switch parsed.Scheme {
 	case "https":
@@ -700,7 +736,10 @@ func newFleetClient(endpoint, tokenFile string) (*fleetClient, error) {
 		return nil, errors.New("token file must hold one bearer token")
 	}
 	return &fleetClient{
-		base: strings.TrimRight(parsed.String(), "/"), registry: normalizeEndpoint(parsed),
+		// Routes are appended to the normalized endpoint, built from its
+		// parts, so nothing the operator typed beyond scheme, host, port and
+		// path reaches a request.
+		base: normalizeEndpoint(parsed), registry: normalizeEndpoint(parsed),
 		token: token,
 		http: &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error {
 			// Following a redirect would resend the token to wherever it

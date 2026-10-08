@@ -333,6 +333,7 @@ func TestPlanDigestWriteOrderAndExecutorChange(t *testing.T) {
 	}
 
 	moved := base(t)
+	agentByID(&moved, "planner").Scopes = agentByID(&moved, "planner").Scopes[:1]
 	agentByID(&moved, "searcher").ExecutorRef = "remote-exec"
 	policy, live = compileLive(t, moved, registry)
 	plan = Diff(policy, live, "")

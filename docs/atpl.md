@@ -146,18 +146,38 @@ them.
 The plan digest (`atpl:plan:v2:`) binds the policy digest, the normalized
 endpoint (lower-case scheme and host, default port and trailing slash dropped),
 each managed agent's kind and `ContentDigest` of its live registration, and the
-IDs of unmanaged agents. `ContentDigest` covers parent, domain, scopes, executor
+IDs of unmanaged agents, and the write order below, two-step writes included.
+`ContentDigest` covers parent, domain, scopes, executor
 and capabilities, and leaves out generation, subject, actor, lease and update
 time, which heartbeats move. A heartbeat between plan and apply therefore does
-not invalidate a reviewed plan; a plan reviewed against one registry does not
-apply to another.
+not invalidate a reviewed plan, unless it changes the write order; a plan
+reviewed against one registry does not apply to another. The write order
+depends on leases, so on time and heartbeats: a plan reviewed long before apply
+can order differently by then, and apply refuses it rather than write an order
+nobody reviewed.
 
 `apply` recomputes the plan and refuses unless its digest equals
 `-plan-digest` and nothing is refused. It then registers with reason code
 `atpl-apply` and the policy digest as reason detail, in an order where every
-intermediate state resolves: updates deepest first, so a child narrows within
-its parent before the parent narrows past it, then creates parents first. Each
-write expects the generation apply read. If a heartbeat moves it before the
+intermediate state is one the registry accepts and resolves
+(`pkg/atpl/order.go`). Creates come last, parents first. Updates are ordered
+for each child updated together with its parent:
+
+1. the child's new registration, lease included, fits the parent's live one:
+   the child first;
+2. else the child's live registration fits the parent's new one: the parent
+   first;
+3. else only the lease prevents (1), because a narrowed child always fits its
+   parent's content: the child is written twice, first with its lease clamped
+   to the parent's live lease, then, after the parent, with its full lease.
+   Plan output lists the apply order and marks both steps;
+4. otherwise the child is refused.
+
+The resulting sequence is then replayed against the live state, checking every
+link each write touches, both to its parent and to its children; a plan
+whose replay leaves any link exceeding its parent, even between two writes, is
+refused. Chains of any depth are ordered the same way. Each write expects the
+generation apply read, or for a second step the one the first step wrote. If a heartbeat moves it before the
 write lands, the registry's compare-and-swap refuses; apply re-reads the agent
 through the resolve route and retries once if its `ContentDigest` is unchanged,
 and stops otherwise. The registration key hashes the policy digest, agent,
@@ -169,16 +189,22 @@ atomic across agents.
 are written in full, schemas compact. Each TTL is the lease remaining at one
 export time, rounded to the second and clamped to the policy's maximum and to
 the parent's exported TTL: export reflects what the live fleet holds at that
-moment, not the TTL each agent was first registered with, and a parent a
-heartbeat left with less time than its child still exports to a policy that
-compiles. Without `-executors`, each executor's `max_effects` is the union of
+moment, not the TTL each agent was first registered with. The clamp absorbs
+rounding and also a real inversion, where a parent's own heartbeat left it with
+less time than its child: the child then exports with the parent's TTL, shorter
+than what it holds live, and the export still compiles. A lease with under a
+second remaining, measured before rounding, is refused. Without `-executors`, each executor's `max_effects` is the union of
 its actions' effects and `min_effects` is empty, and the command warns that this
 is not what the host binds. A live ID, domain, scope or executor reference that
 is not UTF-8 is refused, naming the field. Export refuses a directory that
 already holds policy files, read with `os.ReadDir` so a directory name with glob
-metacharacters cannot defeat the check.
+metacharacters cannot defeat the check, and refuses before writing anything if
+the files together would exceed the 256 MiB a policy directory may hold.
 
-Endpoints must be `https`, or `http` on loopback. Redirects are not followed.
+Endpoints must be `https`, or `http` on loopback, with no credentials, query or
+fragment; a bare trailing `?` or `#` is refused too. Requests go to the
+normalized endpoint, built from scheme, host, port and path. Redirects are not
+followed.
 
 ## Limits
 
