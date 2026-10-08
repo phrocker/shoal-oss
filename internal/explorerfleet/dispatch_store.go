@@ -274,6 +274,9 @@ func (s *DispatchStore) ApplyAction(ctx context.Context, mutation fleet.Dispatch
 			current.ClaimFence != mutation.ExpectedFence {
 			return fleet.ActionRecord{}, fleet.ErrActionConflict
 		}
+		if err := refuseRewrittenIdentity(current, canonical); err != nil {
+			return fleet.ActionRecord{}, err
+		}
 		actionGuard.Mode = guard.ModeMutate
 		actionGuard.ExpectedEpoch = head.Epoch
 		actionGuard.ExpectedDigest = head.LogicalDigest
@@ -670,4 +673,219 @@ func decodeTransition(value []byte) (storedTransition, error) {
 			"fleet action transition completion time is not UTC")
 	}
 	return stored, nil
+}
+
+// refuseRewrittenIdentity refuses a mutation that changes what an action *is*
+// rather than what state it is in.
+//
+// The version and the fence give correct serialisation — one writer wins and a
+// stale writer is refused — but they say nothing about what the winner is
+// allowed to change. Before this, nothing below the service enforced any
+// immutability invariant at all, so a service bug could rewrite a record's
+// principal, its input, or its authorization provenance and the store would
+// write it.
+//
+// That is not hypothetical. #443 shipped `record.Actor = decision.Actor()` in
+// applyClaim. It was a no-op for as long as the claimant was by construction
+// the enqueuer, and became a third party overwriting the record's own
+// principal — permanently, since the completion path clones forward and never
+// restores it. The enqueuer was then refused Status and Cancel on its own
+// in-flight action. The only thing standing between the record's identity and
+// an accidental rewrite was the absence of an assignment in one function,
+// which is precisely the kind of guarantee that does not survive a refactor,
+// and this one did not.
+//
+// It sits in the store rather than the service because the service is where
+// the bug was. It covers every *mutating* path — Claim, ExecuteClaim,
+// CompleteClaim, Cancel, ExtendClaim, ReportAmbiguity and the admission
+// report, all of which build their next record with cloneActionRecord — and a
+// mutating route added later gets it for free. It does not cover the three
+// creating paths (enqueue, the admission grant and denial, and an approval's
+// materialization), which pass ExpectedVersion 0 and necessarily have no
+// stored record to compare against.
+//
+// ErrorInternal rather than ErrorInvalidArgument, for two reasons. The only
+// way to reach it is a service that rewrote its own record, so it is an
+// implementation fault and not a caller's bad request — which is what
+// shoal.ErrorInternal documents itself for. And it has to be distinguishable
+// from ActionRecord.Validate, which runs first inside encodeAction and also
+// returns ErrorInvalidArgument: sharing a code made two of this function's own
+// tests vacuous, because the probe was refused by Validate for an unrelated
+// reason and the assertion could not tell the difference.
+func refuseRewrittenIdentity(current, next fleet.ActionRecord) error {
+	// Short-circuiting rather than a table, so the common all-equal case does
+	// not compare a maximal Input and Output on every mutating write.
+	//
+	// ID is compared first and is belt-and-braces: ApplyAction reads current
+	// by canonical.ID, and the stored record's ID field always equals its row
+	// key, so a differing ID is already refused upstream as not-found. It is
+	// kept as a restatement of that binding rather than as a live check, and
+	// it is the one entry here with no probe for that reason.
+	switch {
+	case !bytes.Equal(current.ID, next.ID):
+		return rewrittenIdentity("ID")
+	case !bytes.Equal(current.IdempotencyKey, next.IdempotencyKey):
+		return rewrittenIdentity("idempotency key")
+
+	// Who asked. The #443 rewrite was Actor.
+	case current.Subject != next.Subject:
+		return rewrittenIdentity("subject")
+	case current.Actor != next.Actor:
+		return rewrittenIdentity("actor")
+	case current.ClientID != next.ClientID:
+		return rewrittenIdentity("client ID")
+	case !sameActionIDs(current.OnBehalfOf, next.OnBehalfOf):
+		return rewrittenIdentity("delegation chain")
+
+	// What was asked for, and within which scope.
+	case current.ObjectID != next.ObjectID:
+		return rewrittenIdentity("object ID")
+	case !bytes.Equal(current.SourceID, next.SourceID):
+		return rewrittenIdentity("source ID")
+	case !bytes.Equal(current.PolicyID, next.PolicyID):
+		return rewrittenIdentity("policy ID")
+	case current.AgentID != next.AgentID:
+		return rewrittenIdentity("agent ID")
+	case current.AgentGeneration != next.AgentGeneration:
+		return rewrittenIdentity("agent generation")
+	case current.Capability != next.Capability:
+		return rewrittenIdentity("capability")
+	case current.Action != next.Action:
+		return rewrittenIdentity("action")
+	case !bytes.Equal(current.Input, next.Input):
+		return rewrittenIdentity("input")
+	case !bytes.Equal(current.ExecutorKey, next.ExecutorKey):
+		return rewrittenIdentity("executor key")
+
+	// Under what authority, and until when.
+	case current.AuthorizationFingerprint != next.AuthorizationFingerprint:
+		return rewrittenIdentity("authorization fingerprint")
+	case current.PolicyGeneration != next.PolicyGeneration:
+		return rewrittenIdentity("policy generation")
+	case !current.AuthorizationExpiresAt.Equal(next.AuthorizationExpiresAt):
+		return rewrittenIdentity("authorization expiry")
+
+	// The admission grant, which is the authority an admission record carries
+	// in place of a dispatcher's. AdmittedEffects is the sharpest of the four
+	// and the closest structural analogue to #443: isAdmission keys on it
+	// being non-empty, and Claim, Cancel, ExtendClaim and completeClaim each
+	// refuse an admission on that basis — so a transition that cleared it
+	// would silently convert a grant into ordinary dispatch work and unlock
+	// all four routes. AdmittedObligation feeds obligationFromBitmap, so
+	// rewriting it weakens a live withholding obligation.
+	case !sameActionEffects(current.AdmittedEffects, next.AdmittedEffects):
+		return rewrittenIdentity("admitted effects")
+	case !bytes.Equal(current.AdmittedDisclosures, next.AdmittedDisclosures):
+		return rewrittenIdentity("admitted disclosures")
+	case !bytes.Equal(current.AdmittedObligation, next.AdmittedObligation):
+		return rewrittenIdentity("admitted obligation")
+	case current.AdmittedIdentityScheme != next.AdmittedIdentityScheme:
+		return rewrittenIdentity("admitted identity scheme")
+
+	// The approval an action was materialized under. Who approved it is as
+	// much a part of what the action is as who asked for it, and #451's
+	// separation-of-duty check is only as good as the record of it.
+	case !bytes.Equal(current.ApprovalRequestDigest, next.ApprovalRequestDigest):
+		return rewrittenIdentity("approval request digest")
+	case current.ApprovalPolicyGeneration != next.ApprovalPolicyGeneration:
+		return rewrittenIdentity("approval policy generation")
+	case current.ApproverSubject != next.ApproverSubject:
+		return rewrittenIdentity("approver subject")
+	case current.ApproverActor != next.ApproverActor:
+		return rewrittenIdentity("approver actor")
+	case current.ApproverClientID != next.ApproverClientID:
+		return rewrittenIdentity("approver client ID")
+	case !current.ApprovedAt.Equal(next.ApprovedAt):
+		return rewrittenIdentity("approval time")
+
+	// When, and why. The enqueue request's own identifiers, not the
+	// transition's: the per-transition equivalents exist as separate fields,
+	// which is exactly why these must not move — a transition that overwrote
+	// them would destroy the link back to the dispatch that created the
+	// record and leave the fields meant to carry its own identity unused.
+	case current.RequestID != next.RequestID:
+		return rewrittenIdentity("request ID")
+	case current.CorrelationID != next.CorrelationID:
+		return rewrittenIdentity("correlation ID")
+	case !current.CreatedAt.Equal(next.CreatedAt):
+		return rewrittenIdentity("creation time")
+	// A mutable deadline is the most dangerous of these: a transition that
+	// extended it would let an action outlive the bound its dispatcher
+	// accepted, and nothing below the service would notice.
+	case !current.Deadline.Equal(next.Deadline):
+		return rewrittenIdentity("deadline")
+	case current.Reason != next.Reason:
+		return rewrittenIdentity("reason")
+	}
+
+	// Monotonic rather than immutable, and asserted in the same place for the
+	// same reason.
+	//
+	// The fence identifies which claim, and applyClaim increments it, so it
+	// may rise and must never fall: a fence that went backwards would make a
+	// stale completion look current. This is not subsumed by the ExpectedFence
+	// compare-and-set above, which compares the *expected* value against the
+	// stored one and never looks at the fence the incoming record carries — a
+	// caller may pass a matching ExpectedFence and a lower Record.ClaimFence.
+	//
+	// EffectPossible says an effect may have happened; it may become true and
+	// must never become false, because nothing can establish that an effect
+	// did not occur after something has said it might have.
+	if next.ClaimFence < current.ClaimFence {
+		return shoal.NewError(
+			shoal.ErrorInternal,
+			"fleet action claim fence may not move backwards")
+	}
+	if current.EffectPossible && !next.EffectPossible {
+		return shoal.NewError(
+			shoal.ErrorInternal,
+			"fleet action possible effect may not be withdrawn")
+	}
+	return nil
+}
+
+// rewrittenIdentity names the field a mutation tried to change.
+//
+// Deliberately absent from the checks above, and listed here so the next
+// reader does not add them: EvidenceSnapshotID, EvidenceSnapshotAsOf and
+// Evidence are written by the completion path, which also *clears* them when
+// the evidence fails validation; CancelKey is written by Cancel and by the
+// admission denial; AuthorizedOperations is widened by Cancel and by the
+// effect admission; TransitionOperation and the claimant fields move on every
+// re-claim, which is what they are for; TransitionRequestID and
+// TransitionCorrelationID are per-transition by definition; the execution
+// fingerprint, its generation and its expiry are re-derived at each execution
+// boundary; the cancel authorization fields are written when a cancellation
+// is authorized; Output, ErrorCode, State, Version and UpdatedAt are the
+// outcome; and the claim history and the ambiguity reports grow.
+func rewrittenIdentity(field string) error {
+	return shoal.NewError(
+		shoal.ErrorInternal, "fleet action "+field+" is immutable")
+}
+
+// sameActionEffects compares two declared effect sets as stored, which is
+// order-sensitive on purpose: canonicalEffects sorts and deduplicates before
+// anything reaches the store, so two sets that differ in order differ.
+func sameActionEffects(left, right fleet.Effects) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
+}
+
+func sameActionIDs(left, right []shoal.ID) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
 }

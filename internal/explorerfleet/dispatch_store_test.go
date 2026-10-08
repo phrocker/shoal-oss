@@ -6,9 +6,11 @@ package explorerfleet
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -338,30 +340,54 @@ func TestDispatchDurableRestartPreservesStoredExecutorKeyAfterAmbiguousEffect(
 	request := integratedEnqueue(
 		now, descriptor, []byte("legacy-action"), []byte("legacy-request-key"),
 	)
-	queued, err := dispatch.Enqueue(ctx, request)
-	if err != nil {
-		t.Fatal(err)
-	}
 	store, err := NewDispatchStore(runtime, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The legacy record is planted as the action's *first* version rather than
+	// by mutating a service-written one.
+	//
+	// It used to enqueue through the service and then rewrite the executor
+	// key, which refuseRewrittenIdentity now refuses — correctly, since the
+	// key is immutable and the property this test asserts is that the service
+	// preserves it. Planting it as version 1 reaches the store's create path,
+	// which has no stored record to compare against, so the precondition is
+	// expressible without a rewrite and without exempting the field.
+	//
+	// A template enqueue under a different identity supplies a
+	// service-built record, so the planted one differs from what the service
+	// would write in exactly one field. Invoke then replays onto it, because
+	// equivalentEnqueue compares the request's own fields and not the
+	// executor key.
+	template := integratedEnqueue(
+		now, descriptor, []byte("template-action"), []byte("template-key"),
+	)
+	built, err := dispatch.Enqueue(ctx, template)
+	if err != nil {
+		t.Fatal(err)
+	}
 	legacyKey := []byte("persisted-pre-v2-executor-key")
-	withLegacyKey := queued
-	withLegacyKey.Version++
+	withLegacyKey := built
+	withLegacyKey.ID = append([]byte(nil), request.ID...)
+	withLegacyKey.IdempotencyKey = append(
+		[]byte(nil), request.IdempotencyKey...)
 	withLegacyKey.ExecutorKey = append([]byte(nil), legacyKey...)
 	withLegacyKey, err = store.ApplyAction(
 		ctx,
 		fleet.DispatchMutation{
 			Token:           []byte("install-legacy-executor-key"),
-			ExpectedVersion: queued.Version,
-			ExpectedFence:   queued.ClaimFence,
+			ExpectedVersion: 0,
+			TransitionKind:  "action.enqueued",
 			Record:          withLegacyKey,
 		},
 	)
 	if err != nil {
 		current, readErr := store.GetAction(ctx, request.ID)
 		t.Fatalf("install legacy key = %v; current = %#v, %v", err, current, readErr)
+	}
+	if !bytes.Equal(withLegacyKey.ExecutorKey, legacyKey) {
+		t.Fatalf("the planted record does not carry the legacy key: %x",
+			withLegacyKey.ExecutorKey)
 	}
 	_, err = dispatch.Invoke(ctx, fleet.InvokeRequest{
 		Enqueue: request, ClaimID: []byte("claim"), Lease: time.Minute,
@@ -779,5 +805,481 @@ func testActionRecord() fleet.ActionRecord {
 		RequestID:              "request", CorrelationID: "correlation",
 		Reason: interaction.Reason{Code: "test"}, Deadline: now.Add(time.Hour),
 		CreatedAt: now, UpdatedAt: now, ExecutorKey: []byte{'e', 0, 255},
+	}
+}
+
+// TestDispatchStoreRefusesARewrittenIdentity is the invariant that did not
+// exist, and #443 is why it should.
+//
+// The version and the fence give correct serialisation — one writer wins, a
+// stale writer is refused — but they say nothing about what the winner may
+// change. #443 shipped `record.Actor = decision.Actor()` in applyClaim. It was
+// a no-op while the claimant was by construction the enqueuer, and became a
+// third party overwriting the record's own principal, permanently, because the
+// completion path clones forward. The enqueuer was then refused Status and
+// Cancel on its own in-flight action, and nothing below the service could have
+// refused that write.
+//
+// Every probe below changes one field on an otherwise valid next-version
+// record, so a row that stops failing means that field stopped being immutable
+// rather than that the test drifted.
+func TestDispatchStoreRefusesARewrittenIdentity(t *testing.T) {
+	directory := t.TempDir()
+	runtime := openDispatchRuntime(t, directory)
+	defer func() {
+		if runtime != nil {
+			_ = runtime.Close()
+		}
+	}()
+	store, err := NewDispatchStore(runtime, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record := testActionRecord()
+	created, err := store.ApplyAction(
+		context.Background(), fleet.DispatchMutation{
+			Token: []byte("enqueue-key"), Record: record,
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The control. A transition that changes only state advances, so every
+	// refusal below is about the field it changed and not about the shape of
+	// the mutation.
+	advance := func() fleet.ActionRecord {
+		next := created
+		next.Version++
+		next.State = fleet.DispatchCanceled
+		next.CancelKey = []byte("cancel-key")
+		next.UpdatedAt = created.UpdatedAt.Add(time.Second)
+		return next
+	}
+	if _, err := store.ApplyAction(
+		context.Background(), fleet.DispatchMutation{
+			Token: []byte("control-advance"), Record: advance(),
+			ExpectedVersion: created.Version,
+			ExpectedFence:   created.ClaimFence,
+		}); err != nil {
+		t.Fatalf("a state-only transition was refused, so the probes below "+
+			"prove nothing: %v", err)
+	}
+
+	// Re-open on a fresh directory so each probe starts from the created
+	// record rather than from the control's cancellation.
+	// seed shapes the record before it is created, for fields that only a
+	// particular record shape may carry at all. Without it, nine probes were
+	// refused by ActionRecord.Validate for being malformed rather than by the
+	// invariant for being a rewrite — and because both once returned the same
+	// error code, the assertion could not tell. The invariant now returns
+	// ErrorInternal, and each probe validates its own rewritten record before
+	// applying it, so a fixture that cannot express its condition fails as a
+	// fixture rather than passing as a test.
+	for _, probe := range []struct {
+		field   string
+		seed    func(*fleet.ActionRecord)
+		rewrite func(*fleet.ActionRecord)
+	}{
+		{"subject", nil, func(r *fleet.ActionRecord) { r.Subject = "someone-else" }},
+		// The #443 rewrite, exactly.
+		{"actor", nil, func(r *fleet.ActionRecord) { r.Actor = "another-actor" }},
+		{"client ID", nil, func(r *fleet.ActionRecord) { r.ClientID = "another-client" }},
+		{"delegation chain", nil, func(r *fleet.ActionRecord) {
+			r.OnBehalfOf = []shoal.ID{"smuggled"}
+		}},
+		{"input", nil, func(r *fleet.ActionRecord) {
+			r.Input = json.RawMessage(`{"value":99}`)
+		}},
+		{"object ID", nil, func(r *fleet.ActionRecord) { r.ObjectID = "another-object" }},
+		{"source ID", nil, func(r *fleet.ActionRecord) { r.SourceID = []byte("other") }},
+		{"policy ID", nil, func(r *fleet.ActionRecord) { r.PolicyID = []byte("other") }},
+		{"agent ID", nil, func(r *fleet.ActionRecord) { r.AgentID = "another-agent" }},
+		{"agent generation", nil, func(r *fleet.ActionRecord) { r.AgentGeneration = 99 }},
+		{"capability", nil, func(r *fleet.ActionRecord) { r.Capability = "other" }},
+		{"action", nil, func(r *fleet.ActionRecord) { r.Action = "other" }},
+		{"idempotency key", nil, func(r *fleet.ActionRecord) {
+			r.IdempotencyKey = []byte("another-key")
+		}},
+		{"authorization fingerprint", nil, func(r *fleet.ActionRecord) {
+			r.AuthorizationFingerprint[0] ^= 1
+		}},
+		{"policy generation", nil, func(r *fleet.ActionRecord) {
+			r.PolicyGeneration = 99
+		}},
+		{"authorization expiry", nil, func(r *fleet.ActionRecord) {
+			r.AuthorizationExpiresAt = r.AuthorizationExpiresAt.Add(time.Hour)
+		}},
+		// Backwards, not forwards. Forwards pushed CreatedAt past UpdatedAt,
+		// which ActionRecord.Validate refuses inside encodeAction before this
+		// check runs — so the probe passed while covering nothing, and the
+		// assertion could not tell because both refusals shared one error
+		// code. The invariant now returns ErrorInternal and the probe moves
+		// the time the other way.
+		{"creation time", nil, func(r *fleet.ActionRecord) {
+			r.CreatedAt = r.CreatedAt.Add(-time.Hour)
+		}},
+		// The enqueue request's own identifiers, not the transition's. A
+		// transition that overwrote these would destroy the link back to the
+		// dispatch that created the record and leave the per-transition
+		// fields unused.
+		{"request ID", nil, func(r *fleet.ActionRecord) { r.RequestID = "other" }},
+		{"correlation ID", nil, func(r *fleet.ActionRecord) { r.CorrelationID = "other" }},
+		// The most dangerous of them: an extended deadline lets an action
+		// outlive the bound its dispatcher accepted.
+		{"deadline", nil, func(r *fleet.ActionRecord) {
+			r.Deadline = r.Deadline.Add(24 * time.Hour)
+		}},
+		// A real Reason, not a hand-built one with a bogus digest: Validate
+		// requires the digest to be 64 lowercase hex characters, so "x" was
+		// refused before this check and the probe covered nothing.
+		{"reason", nil, func(r *fleet.ActionRecord) {
+			r.Reason = testActionReason(t)
+		}},
+		{"executor key", nil, func(r *fleet.ActionRecord) {
+			r.ExecutorKey = []byte("rederived-key")
+		}},
+		// The admission grant, which only an admission-shaped record may
+		// carry: Validate refuses disclosures that are not a digest, an
+		// obligation with no declared references, and an identity scheme with
+		// no admitted effect. So these are seeded as a complete grant and
+		// rewritten to another *valid* value.
+		//
+		// AdmittedEffects is the sharpest and the closest structural
+		// analogue to #443: isAdmission keys on it being non-empty, and
+		// Claim, Cancel, ExtendClaim and completeClaim each refuse an
+		// admission on that basis, so a transition that changed it converts a
+		// grant into ordinary dispatch work and unlocks all four.
+		{"admitted effects", seedAdmittedGrant, func(r *fleet.ActionRecord) {
+			r.AdmittedEffects = fleet.Effects{fleet.EffectEgressesContent}
+		}},
+		{"admitted disclosures", seedAdmittedGrant, func(r *fleet.ActionRecord) {
+			other := sha256.Sum256([]byte("another-disclosure-set"))
+			r.AdmittedDisclosures = other[:]
+		}},
+		{"admitted obligation", seedAdmittedGrant, func(r *fleet.ActionRecord) {
+			r.AdmittedObligation = []byte{0x02}
+		}},
+		{"admitted identity scheme", seedAdmittedGrant, func(r *fleet.ActionRecord) {
+			r.AdmittedIdentityScheme = 2
+		}},
+		// The approval it was materialized under. #451's separation-of-duty
+		// check is only as good as the record of who decided, and Validate
+		// requires the provenance to be complete or entirely absent — so
+		// these are seeded complete and rewritten to another complete value.
+		{"approval request digest", seedApproval, func(r *fleet.ActionRecord) {
+			other := sha256.Sum256([]byte("another-request"))
+			r.ApprovalRequestDigest = other[:]
+		}},
+		{"approver subject", seedApproval, func(r *fleet.ActionRecord) {
+			r.ApproverSubject = "another-approver"
+		}},
+		{"approver actor", seedApproval, func(r *fleet.ActionRecord) {
+			r.ApproverActor = "another-approver-actor"
+		}},
+		{"approver client ID", seedApproval, func(r *fleet.ActionRecord) {
+			r.ApproverClientID = "another-approver-client"
+		}},
+		{"approval time", seedApproval, func(r *fleet.ActionRecord) {
+			r.ApprovedAt = r.ApprovedAt.Add(-time.Minute)
+		}},
+	} {
+		t.Run(probe.field, func(t *testing.T) {
+			probeDirectory := t.TempDir()
+			probeRuntime := openDispatchRuntime(t, probeDirectory)
+			defer func() { _ = probeRuntime.Close() }()
+			probeStore, err := NewDispatchStore(probeRuntime, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			seeded := testActionRecord()
+			if probe.seed != nil {
+				probe.seed(&seeded)
+			}
+			base, err := probeStore.ApplyAction(
+				context.Background(), fleet.DispatchMutation{
+					Token: []byte("enqueue-key"), Record: seeded,
+				})
+			if err != nil {
+				t.Fatalf("the seeded record was refused, so this probe "+
+					"cannot express its condition: %v", err)
+			}
+			next := base
+			next.Version++
+			next.State = fleet.DispatchCanceled
+			next.CancelKey = []byte("cancel-key")
+			next.UpdatedAt = base.UpdatedAt.Add(time.Second)
+			probe.rewrite(&next)
+			// The rewritten record must itself be valid, or Validate refuses
+			// it inside encodeAction before the invariant is reached and the
+			// probe proves nothing. Nine probes were in exactly that state.
+			if err := next.Validate(); err != nil {
+				t.Fatalf("the rewritten record is invalid for an unrelated "+
+					"reason, so this probe cannot reach the invariant: %v",
+					err)
+			}
+
+			_, err = probeStore.ApplyAction(
+				context.Background(), fleet.DispatchMutation{
+					Token: []byte("rewrite"), Record: next,
+					ExpectedVersion: base.Version,
+					ExpectedFence:   base.ClaimFence,
+				})
+			if err == nil {
+				t.Fatalf("a mutation rewrote the record's %s and the store "+
+					"wrote it: nothing below the service refuses this, which "+
+					"is how #443's Actor overwrite reached a durable record",
+					probe.field)
+			}
+			// Internal, not invalid-argument. ActionRecord.Validate runs
+			// first inside encodeAction and returns invalid-argument, so
+			// asserting that code cannot tell "the invariant refused this"
+			// from "the probe built a malformed record" — which is exactly
+			// how two of these probes came to cover nothing.
+			if !shoal.IsErrorCode(err, shoal.ErrorInternal) {
+				t.Fatalf("%s rewrite refused as %v, which is not this "+
+					"invariant refusing it: a record Validate rejects for "+
+					"an unrelated reason would look identical",
+					probe.field, err)
+			}
+			if !strings.Contains(err.Error(), "is immutable") {
+				t.Fatalf("%s refusal does not name the field: %v",
+					probe.field, err)
+			}
+			stored, readErr := probeStore.GetAction(
+				context.Background(), base.ID)
+			if readErr != nil || stored.Version != base.Version {
+				t.Fatalf("the refused mutation moved the record anyway: "+
+					"version %d, %v", stored.Version, readErr)
+			}
+		})
+	}
+}
+
+// TestDispatchStoreEnforcesMonotonicFenceAndEffect covers the two fields that
+// are monotonic rather than immutable, in the same place and for the same
+// reason: a fence that moved backwards would make a stale completion look
+// current, and nothing can establish that an effect did not occur after
+// something has said it might have.
+func TestDispatchStoreEnforcesMonotonicFenceAndEffect(t *testing.T) {
+	for _, probe := range []struct {
+		name    string
+		prepare func(*fleet.ActionRecord)
+		rewrite func(*fleet.ActionRecord)
+	}{
+		{
+			// A queued record may not carry claim state at all, so the seed
+			// has to be a valid claimed one. Getting this wrong is how the
+			// first version of this probe "passed": the seed was refused for
+			// an unrelated reason and the rewrite never ran.
+			name: "a fence may not move backwards",
+			prepare: func(r *fleet.ActionRecord) {
+				now := r.CreatedAt
+				r.State = fleet.DispatchClaimed
+				r.ClaimID = []byte("claim")
+				r.ClaimFence = 4
+				r.ClaimLease = time.Minute
+				r.ClaimLeaseUntil = now.Add(time.Minute)
+				r.ClaimantSubject = r.Subject
+				r.ClaimantActor = r.Actor
+				r.ClaimantClientID = r.ClientID
+				r.ClaimantOnBehalfOf = r.OnBehalfOf
+				r.TransitionOperation = auth.OperationInvoke
+				r.ExecutionPolicyGeneration = 1
+				r.ExecutionExpiresAt = now.Add(time.Hour)
+			},
+			rewrite: func(r *fleet.ActionRecord) { r.ClaimFence = 3 },
+		},
+		{
+			// A queued record may carry EffectPossible. Validate requires
+			// it on DispatchSucceeded and DispatchFailed specifically —
+			// DispatchCanceled is terminal and does not require it — and
+			// permits it anywhere.
+			name:    "a possible effect may not be withdrawn",
+			prepare: func(r *fleet.ActionRecord) { r.EffectPossible = true },
+			rewrite: func(r *fleet.ActionRecord) { r.EffectPossible = false },
+		},
+	} {
+		t.Run(probe.name, func(t *testing.T) {
+			directory := t.TempDir()
+			runtime := openDispatchRuntime(t, directory)
+			defer func() { _ = runtime.Close() }()
+			store, err := NewDispatchStore(runtime, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			seed := testActionRecord()
+			probe.prepare(&seed)
+			base, err := store.ApplyAction(
+				context.Background(), fleet.DispatchMutation{
+					Token: []byte("enqueue-key"), Record: seed,
+				})
+			if err != nil {
+				t.Fatalf("the seeded record was refused, so this probe "+
+					"cannot express its condition: %v", err)
+			}
+			next := base
+			next.Version++
+			next.UpdatedAt = base.UpdatedAt.Add(time.Second)
+			probe.rewrite(&next)
+			if err := next.Validate(); err != nil {
+				t.Fatalf("the rewritten record is invalid for an unrelated "+
+					"reason, so this probe cannot reach the monotonicity "+
+					"check: %v", err)
+			}
+			if _, err := store.ApplyAction(
+				context.Background(), fleet.DispatchMutation{
+					Token: []byte("rewrite"), Record: next,
+					ExpectedVersion: base.Version,
+					ExpectedFence:   base.ClaimFence,
+				}); err == nil {
+				t.Fatal("the store accepted a non-monotonic rewrite")
+			}
+		})
+	}
+}
+
+// testActionReason builds a Reason whose digest is real, because
+// ActionRecord.Validate requires 64 lowercase hex characters and a hand-built
+// digest is refused before any store invariant is reached.
+func testActionReason(t *testing.T) interaction.Reason {
+	t.Helper()
+	reason, err := interaction.NewReason("operator_request", "a detail")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return reason
+}
+
+// seedAdmittedGrant shapes a record as a complete admission grant, which is
+// the only shape that may carry the admitted fields at all.
+func seedAdmittedGrant(record *fleet.ActionRecord) {
+	disclosures := sha256.Sum256([]byte("a-disclosure-set"))
+	record.AdmittedEffects = fleet.Effects{fleet.EffectMutatesExternal}
+	record.AdmittedDisclosures = disclosures[:]
+	record.AdmittedObligation = []byte{0x01}
+	record.AdmittedIdentityScheme = 1
+}
+
+// seedApproval shapes a record as one materialized from an approval. The
+// provenance must be complete or entirely absent, and the approval's policy
+// generation must equal the record's.
+func seedApproval(record *fleet.ActionRecord) {
+	digest := sha256.Sum256([]byte("an-approval-request"))
+	record.ApprovalRequestDigest = digest[:]
+	record.ApprovalPolicyGeneration = record.PolicyGeneration
+	record.ApproverSubject = "approver"
+	record.ApproverActor = "approver-actor"
+	record.ApproverClientID = "approver-client"
+	record.ApprovedAt = record.CreatedAt
+}
+
+// TestEveryMutatingRouteSurvivesTheIdentityInvariant drives each mutating
+// route through the real store, because none of them was reaching the
+// invariant in any test.
+//
+// A false refusal here is the dominant risk of refuseRewrittenIdentity — it
+// would break a working path — and a green suite is not evidence against it if
+// no test exercises the path. ExtendClaim and ReportAmbiguity in particular
+// reached the durable store from nowhere in the repository: pkg/explorer/fleet
+// binds a fake store, and the webapi and mcp suites bind providers. So the two
+// newest routes, the two the invariant's own comment singles out as the ones a
+// TransitionKind-based exemption would have missed, were unguarded.
+//
+// Claim, extend, report and complete in sequence, then a separate cancel, each
+// asserting the version advanced — so a refusal shows up as a failure here
+// rather than as a 500 in production.
+func TestEveryMutatingRouteSurvivesTheIdentityInvariant(t *testing.T) {
+	now := time.Date(2026, 9, 6, 12, 0, 0, 0, time.UTC)
+	directory := t.TempDir()
+	runtime := openFleetDispatchRuntime(t, directory)
+	defer func() { _ = runtime.Close() }()
+	authority, err := auth.NewAuthorityWithClock(func() time.Time { return now })
+	if err != nil {
+		t.Fatal(err)
+	}
+	executor := &integratedExecutor{}
+	registry, dispatch := composeIntegratedServicesWithRecorder(
+		t, runtime, authority, executor, integratedActionRecorder{}, now,
+	)
+	decision := integratedDecision(t, now)
+	ctx, err := authority.Binder().Bind(context.Background(), decision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	descriptor := registerIntegratedAgent(t, registry, ctx, now)
+
+	queued, err := dispatch.Enqueue(ctx, integratedEnqueue(
+		now, descriptor, []byte("route-action"), []byte("route-key")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := dispatch.Claim(ctx, fleet.ClaimRequest{
+		ID: queued.ID, ExpectedVersion: queued.Version,
+		ClaimID: []byte("claim"), Lease: time.Minute,
+		Context: integratedContext(now),
+	})
+	if err != nil {
+		t.Fatalf("Claim was refused through the real store: %v", err)
+	}
+	if claimed.Version != queued.Version+1 {
+		t.Fatalf("claim version = %d", claimed.Version)
+	}
+	extended, err := dispatch.ExtendClaim(ctx, fleet.ExtendRequest{
+		ID: queued.ID, ExpectedVersion: claimed.Version,
+		ClaimID: []byte("claim"), Lease: 2 * time.Minute,
+		Context: integratedContext(now),
+	})
+	if err != nil {
+		t.Fatalf("ExtendClaim was refused through the real store, which no "+
+			"other test would have caught: %v", err)
+	}
+	if extended.Version != claimed.Version+1 ||
+		extended.ClaimFence != claimed.ClaimFence {
+		t.Fatalf("extension moved the wrong things: %#v", extended)
+	}
+	reported, err := dispatch.ReportAmbiguity(ctx, fleet.AmbiguityRequest{
+		ID: queued.ID, ClaimFence: extended.ClaimFence,
+		Outcome: fleet.AmbiguityOutcomeUnknown,
+		Target:  "payments.example.test", Reference: "ch_1",
+		Context: integratedContext(now),
+	})
+	if err != nil {
+		t.Fatalf("ReportAmbiguity was refused through the real store, which "+
+			"no other test would have caught: %v", err)
+	}
+	if reported.Version != extended.Version+1 ||
+		len(reported.AmbiguityReports) != 1 {
+		t.Fatalf("report moved the wrong things: %#v", reported)
+	}
+	completed, err := dispatch.CompleteClaim(ctx, fleet.CompletionRequest{
+		ID: queued.ID, ExpectedVersion: reported.Version,
+		ClaimFence: reported.ClaimFence, ClaimID: []byte("claim"),
+		Result:  fleet.ExecutionResult{Output: json.RawMessage(`{"ok":true}`)},
+		Context: integratedContext(now),
+	})
+	if err != nil {
+		t.Fatalf("CompleteClaim was refused through the real store: %v", err)
+	}
+	if completed.State != fleet.DispatchSucceeded {
+		t.Fatalf("completion state = %q", completed.State)
+	}
+
+	// Cancel needs its own action, since the one above is terminal.
+	second, err := dispatch.Enqueue(ctx, integratedEnqueue(
+		now, descriptor, []byte("cancel-action"), []byte("cancel-key")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	canceled, err := dispatch.Cancel(ctx, fleet.CancelRequest{
+		ID: second.ID, ExpectedVersion: second.Version,
+		MutationKey: []byte("mutation-key"),
+		Context:     integratedContext(now),
+	})
+	if err != nil {
+		t.Fatalf("Cancel was refused through the real store: %v", err)
+	}
+	if canceled.State != fleet.DispatchCanceled ||
+		canceled.Version != second.Version+1 {
+		t.Fatalf("cancellation = %#v", canceled)
 	}
 }
