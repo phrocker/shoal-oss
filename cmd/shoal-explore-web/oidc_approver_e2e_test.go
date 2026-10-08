@@ -685,17 +685,88 @@ func TestOIDCApproverApprovesAnOIDCRequest(t *testing.T) {
 // TestOIDCMalformedCorrelationIsRefusedAtTheEdge: a caller that meant to
 // thread a trace and sent a value the authenticator refuses learns so at
 // authentication, before any approval route runs.
+//
+// The 401 body is the generic "authentication required", so on its own it
+// would also pass for a broken token. The control sends the SAME token with a
+// valid header and requires success, which makes the refusal attributable to
+// the header alone.
 func TestOIDCMalformedCorrelationIsRefusedAtTheEdge(t *testing.T) {
 	w := newOIDCApprovalWorld(t, nil, nil)
 	request := w.h.held("oidc-malformed-trace")
-	got := w.request(call{
-		token: w.fleetToken("alice", nil), correlation: "two words",
-	}, request, "gateway")
+	token := w.fleetToken("alice", nil)
+	got := w.request(call{token: token, correlation: "two words"}, request, "gateway")
 	if got.status != http.StatusUnauthorized {
 		t.Fatalf("a malformed correlation = %d %s, want 401", got.status, got.raw)
 	}
 	if records := w.records(request.id); len(records) != 0 {
 		t.Fatalf("a refused request wrote %d approval records", len(records))
+	}
+
+	// Control: the same token, the same request, a valid header.
+	w.mustHold(call{token: token, correlation: "upstream-control-451"},
+		request, "gateway")
+	records := w.records(request.id)
+	if len(records) == 0 ||
+		records[0].Request.CorrelationID != "upstream-control-451" {
+		t.Fatalf("the control request's records = %+v", records)
+	}
+}
+
+// TestOIDCApproverWithoutTheHumanAssertionCannotDecide: a token on the
+// approver audience that is otherwise valid — signed, mapped issuer,
+// audience, client and approver value — but does not carry the human
+// assertion, or carries it with the wrong value, is not an approver. It is
+// refused at authentication, so /decide answers 401 and nothing is decided
+// or written. The control is the same claims with the assertion intact,
+// which decides; without it the 401 could be any broken token.
+//
+// Before this test, removing mapping.human.holds from mintApprover survived
+// every end-to-end test.
+func TestOIDCApproverWithoutTheHumanAssertionCannotDecide(t *testing.T) {
+	w := newOIDCApprovalWorld(t, nil, nil)
+	h := w.h
+	alice := call{token: w.fleetToken("alice", nil)}
+	request := h.held("oidc-not-human")
+	receipt := w.mustHold(alice, request, "gateway")
+	held := len(w.records(request.id))
+
+	for _, probe := range []struct {
+		name  string
+		claim func(jwt.MapClaims)
+	}{
+		{"absent", func(claims jwt.MapClaims) { delete(claims, testHumanClaim) }},
+		{"wrong value", func(claims jwt.MapClaims) { claims[testHumanClaim] = "service" }},
+	} {
+		t.Run(probe.name, func(t *testing.T) {
+			claims := approverClaims(w.issuer, h.now(), "bob")
+			probe.claim(claims)
+			got := w.decide(call{token: w.sign(claims)}, receipt)
+			if got.status != http.StatusUnauthorized ||
+				got.Code != string(shoal.ErrorUnauthorized) {
+				t.Fatalf("a non-human approver token = %d %s, want 401",
+					got.status, got.raw)
+			}
+			if records := w.records(request.id); len(records) != held {
+				t.Fatalf("a refused decision wrote %d approval records",
+					len(records)-held)
+			}
+			for _, record := range w.records(request.id) {
+				if record.Verdict != "" || record.ApproverSubject != "" {
+					t.Fatalf("a refused decision was recorded: %+v", record)
+				}
+			}
+			if status := w.status(alice, request.id); status.State != "pending" ||
+				status.Approver != "" {
+				t.Fatalf("after a refused decision = %s", status.raw)
+			}
+		})
+	}
+
+	// Control: the same claims with the assertion intact decide.
+	decided := w.mustDecide(
+		call{token: w.sign(approverClaims(w.issuer, h.now(), "bob"))}, receipt)
+	if decided.Approver != b64([]byte(w.identity("bob"))) {
+		t.Fatalf("the control decision = %s", decided.raw)
 	}
 }
 
