@@ -265,10 +265,10 @@ agent ID)`, and it is read with the corpus's `InteractionRecord`.
 - Approval rules and attestation requirements (#446): refused by name until
   they compile. The registry can require approval per action since #451
   (`docs/approval.md`); accepting `approval: {required: true}` in policy files
-  is #452. Until then export refuses an approval-required action, and plan does
-  not compare the flag, so a policy that omits it plans such an agent as
-  unchanged and an apply that would rewrite it is refused by the registry as a
-  widening.
+  is #452. Until then export refuses an approval-required action, and plan
+  refuses a managed agent whose live actions require approval
+  (`refused-approval`, naming each action), so apply never runs against an
+  agent the file cannot describe.
 - Admission obligations. They are computed per request at admission, not
   declared per agent; how a policy would constrain them is undecided.
 - YAML. The repository has no YAML library, and every strict decoder here is

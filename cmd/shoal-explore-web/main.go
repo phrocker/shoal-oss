@@ -1218,6 +1218,13 @@ func openService(
 		approvalService, err := fleet.NewApprovalService(fleet.ApprovalConfig{
 			Dispatch: fleetDispatch, Store: approvalStore,
 			Recorder: approvalRecorder,
+			// Workspace settings are the one narrowing this host applies.
+			// The approval service refuses an approver whose decision went
+			// through one, on every approver path.
+			Narrowed: func(ctx context.Context) bool {
+				_, narrowed := webapi.EffectiveWorkspaceSettings(ctx)
+				return narrowed
+			},
 		})
 		if err != nil {
 			store.Close()

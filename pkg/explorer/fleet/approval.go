@@ -9,6 +9,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
+	"math/rand/v2"
 	"time"
 
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
@@ -440,6 +441,17 @@ type ApprovalConfig struct {
 	Dispatch *DispatchService
 	Store    ApprovalStore
 	Recorder ApprovalRecorder
+	// Narrowed reports whether the request's decision was derived through a
+	// narrowing the host applies, such as workspace settings. Required.
+	//
+	// The approver-separation rule requires an approver to *fail* dispatch,
+	// invoke and execute, and a narrowing can only remove authority — so a
+	// principal holding approve and dispatch could narrow its own decision to
+	// approve alone and pass. Separation has to be judged on the authority a
+	// principal actually holds, so every approver path refuses a narrowed
+	// decision. The host supplies the predicate because only it knows how it
+	// narrows; a host that never narrows supplies one returning false.
+	Narrowed func(context.Context) bool
 	// Window is how long a request stays decidable. Zero means
 	// DefaultApprovalWindow. It is clamped to each request's deadline.
 	Window time.Duration
@@ -449,11 +461,13 @@ type ApprovalService struct {
 	dispatch *DispatchService
 	store    ApprovalStore
 	recorder ApprovalRecorder
+	narrowed func(context.Context) bool
 	window   time.Duration
 }
 
 func NewApprovalService(config ApprovalConfig) (*ApprovalService, error) {
-	if config.Dispatch == nil || config.Store == nil || config.Recorder == nil {
+	if config.Dispatch == nil || config.Store == nil || config.Recorder == nil ||
+		config.Narrowed == nil {
 		return nil, shoal.NewError(
 			shoal.ErrorInvalidArgument, "fleet approval dependencies are required")
 	}
@@ -467,7 +481,7 @@ func NewApprovalService(config ApprovalConfig) (*ApprovalService, error) {
 	}
 	return &ApprovalService{
 		dispatch: config.Dispatch, store: config.Store,
-		recorder: config.Recorder, window: window,
+		recorder: config.Recorder, narrowed: config.Narrowed, window: window,
 	}, nil
 }
 
@@ -494,6 +508,47 @@ type ApprovalDecisionRequest struct {
 	Context          RequestContext
 }
 
+// ApprovalCondition qualifies an approval's effective state with what a
+// reader needs to know and the stored state alone does not say.
+type ApprovalCondition string
+
+const (
+	// ApprovalConditionNone: the effective state is the whole answer.
+	ApprovalConditionNone ApprovalCondition = ""
+	// ApprovalConditionWindowClosed: stored as pending or approved, but the
+	// window has closed. Expiry is written lazily, by the next request or
+	// decision; Status reports it without writing it.
+	ApprovalConditionWindowClosed ApprovalCondition = "window_closed"
+	// ApprovalConditionTargetMoved: the agent's generation has moved, or the
+	// agent is gone, since the request was made. The request names the old
+	// generation and can never be decided or materialized again.
+	ApprovalConditionTargetMoved ApprovalCondition = "target_moved"
+	// ApprovalConditionPolicyMoved: the policy generation has moved since the
+	// request was made. Neither the approver nor the requester can act on it.
+	ApprovalConditionPolicyMoved ApprovalCondition = "policy_generation_moved"
+	// ApprovalConditionDeadlinePassed: the request's action deadline has
+	// passed, so it can no longer be re-requested and so never materialized.
+	ApprovalConditionDeadlinePassed ApprovalCondition = "deadline_passed"
+	// ApprovalConditionAwaitingAction: committed to become work (enqueued),
+	// but the action has not been written yet — the second write was lost.
+	// The requester's next re-request writes it while the target and the
+	// deadline still hold.
+	ApprovalConditionAwaitingAction ApprovalCondition = "enqueued_without_action"
+)
+
+// ApprovalUnresolvable is an effective state only, never stored: a pending,
+// approved or enqueued-without-action request that can no longer progress,
+// for the reason its Condition gives.
+const ApprovalUnresolvable ApprovalState = "unresolvable"
+
+// ApprovalStatus is what Status answers: the stored record, the state it is
+// effectively in now, and why the two differ when they do.
+type ApprovalStatus struct {
+	Approval  ApprovalRecord
+	State     ApprovalState
+	Condition ApprovalCondition
+}
+
 type ApprovalStatusRequest struct {
 	ID      []byte
 	Context RequestContext
@@ -514,7 +569,26 @@ type PendingApprovalsPage struct {
 // A loss means somebody else moved the record; re-reading once is normally
 // enough to see what they did, and the bound makes a pathological race an
 // error rather than a spin.
-const maxApprovalAttempts = 4
+const maxApprovalAttempts = 8
+
+// errMaterializeRaced is internal: a materialization lost to a concurrent one
+// that is not yet readable.
+var errMaterializeRaced = errors.New("fleet approval: materialization raced")
+
+// materializeRead classifies a failed read or write at the action identity
+// during materialization. The durable store answers a read that lands while a
+// concurrent write to the same identity is in flight with a not-found that is
+// not ErrActionNotFound — the guard head exists and the cell is not yet
+// committed — and a write that collides with one as a conflict. Both mean
+// "look again shortly", not "this failed", and are retried by Request.
+func materializeRead(err error) error {
+	if (shoal.IsErrorCode(err, shoal.ErrorNotFound) &&
+		!errors.Is(err, ErrActionNotFound)) ||
+		shoal.IsErrorCode(err, shoal.ErrorConflict) {
+		return errors.Join(errMaterializeRaced, err)
+	}
+	return err
+}
 
 // Request holds an approval-required action for a decision, or reports where
 // a request already made has got to, or materializes an approved one.
@@ -574,6 +648,18 @@ func (s *ApprovalService) Request(
 		}
 		receipt, err := s.advance(ctx, decision, current, now)
 		if errors.Is(err, ErrApprovalConflict) {
+			continue
+		}
+		if errors.Is(err, errMaterializeRaced) {
+			// Jittered so callers that collided do not collide again in
+			// lockstep. Bounded by the attempt count and the request context.
+			wait := time.Duration(attempt+1)*2*time.Millisecond +
+				time.Duration(rand.Int64N(int64(2*time.Millisecond)))
+			select {
+			case <-ctx.Done():
+				return ApprovalReceipt{}, err
+			case <-time.After(wait):
+			}
 			continue
 		}
 		return receipt, err
@@ -648,11 +734,26 @@ func (s *ApprovalService) advance(
 			}
 			return receiptFor(expired, ActionRecord{}), nil
 		}
+		// Something already at the identity that is not this approval's work
+		// — an action enqueued there by another route while the request was
+		// held — means the approval can never become work. Found here, before
+		// the commit, the request stays approved (and expires) instead of
+		// becoming an enqueued approval that names work that does not exist.
+		// A race between this read and the commit is still possible and is
+		// reported by Status as enqueued without an action.
+		if existing, err := s.dispatch.store.GetAction(ctx, current.ID); err == nil {
+			if _, replayErr := s.replayMaterialized(
+				ctx, existing, current); replayErr != nil {
+				return ApprovalReceipt{}, replayErr
+			}
+		} else if !errors.Is(err, ErrActionNotFound) {
+			return ApprovalReceipt{}, materializeRead(err)
+		}
 		next := CloneApprovalRecord(current)
 		next.Version++
 		next.State = ApprovalEnqueued
-		next.MaterializedAt = now
-		next.UpdatedAt = now
+		next.MaterializedAt = notBefore(now, current)
+		next.UpdatedAt = next.MaterializedAt
 		stored, err := s.commit(
 			ctx, "approval_materialize", auth.OperationDispatch,
 			decision, next, current.Version)
@@ -665,8 +766,13 @@ func (s *ApprovalService) advance(
 		// Past ExpiresAt is fine here and deliberate. The decision to make
 		// this work was committed inside the window by the write above; a
 		// crash between that write and the one below is recovered by the
-		// requester re-requesting, at any time, and refusing then would turn
-		// a crash into a lost approval.
+		// requester re-requesting, and refusing then would turn a crash into
+		// a lost approval. Recovery is bounded all the same, not by this
+		// window but by whether a re-request can reach here at all: before
+		// the action deadline (RequestContext refuses one after it) and while
+		// the agent and policy generations hold (queuedRecord resolves the
+		// request's generation). Past those the row stays enqueued with no
+		// action, and Status reports it as unresolvable.
 		action, err := s.materialize(ctx, decision, current)
 		if err != nil {
 			return ApprovalReceipt{}, err
@@ -716,7 +822,7 @@ func (s *ApprovalService) materialize(
 		return s.replayMaterialized(ctx, current, approval)
 	}
 	if !errors.Is(readErr, ErrActionNotFound) {
-		return ActionRecord{}, readErr
+		return ActionRecord{}, materializeRead(readErr)
 	}
 	if err := dispatch.recorder.RecordAction(ctx, ActionAudit{
 		Phase: "approval_enqueue", Operation: auth.OperationDispatch, Record: record,
@@ -730,15 +836,29 @@ func (s *ApprovalService) materialize(
 	})
 	if err != nil {
 		// A concurrent retry of this same materialization may have won; it
-		// wrote the same work under a different credential, and that is
-		// this request's record. Anything else at the identity is not.
-		if errors.Is(err, ErrActionConflict) {
-			if current, readErr := dispatch.store.GetAction(
-				ctx, record.ID); readErr == nil {
-				return s.replayMaterialized(ctx, current, approval)
-			}
+		// wrote the same work under a different credential, and that is this
+		// request's record. Anything else at the identity is not, and
+		// replayMaterialized says so.
+		//
+		// Re-read on any failure, not only on the fleet sentinel: the durable
+		// store reports a lost first write through the coordination guard as
+		// a shoal conflict ("fleet registry conflict"), which is not
+		// ErrActionConflict, so matching the sentinel alone sent concurrent
+		// re-requests of one approval home with a conflict for work that had
+		// in fact been created. The read decides, not the error.
+		if current, readErr := dispatch.store.GetAction(
+			context.WithoutCancel(ctx), record.ID); readErr == nil {
+			return s.replayMaterialized(ctx, current, approval)
 		}
-		return ActionRecord{}, err
+		// A conflict with nothing yet readable is a concurrent
+		// materialization still landing, or several that collided and all
+		// lost. Either way the next attempt reads what is there, so the
+		// caller retries rather than reporting a conflict for work that is
+		// about to exist.
+		if shoal.IsErrorCode(err, shoal.ErrorConflict) {
+			return ActionRecord{}, errors.Join(errMaterializeRaced, err)
+		}
+		return ActionRecord{}, materializeRead(err)
 	}
 	if err := dispatch.publishTransition(
 		context.WithoutCancel(ctx), "action.enqueued", stored,
@@ -783,7 +903,7 @@ func (s *ApprovalService) expire(
 	next := CloneApprovalRecord(current)
 	next.Version++
 	next.State = ApprovalExpired
-	next.UpdatedAt = now
+	next.UpdatedAt = notBefore(now, current)
 	return s.commit(ctx, "approval_expiry", operation, decision, next, current.Version)
 }
 
@@ -839,6 +959,27 @@ func (s *ApprovalService) Decide(
 		return result, err
 	}
 	return ApprovalRecord{}, approvalConflict()
+}
+
+// notBefore clamps a transition time to the record's latest, so a replica
+// whose clock is behind the one that wrote the record still writes a record
+// whose timestamps are ordered.
+//
+// The clamp moves time forward, never back, and only by the skew between two
+// replicas. It never reaches past ExpiresAt: every caller has already checked
+// now < ExpiresAt, and every timestamp on the record is also before it.
+// Refusing instead — which Validate did — turned a few seconds of skew into a
+// 400 for an approver that had done nothing wrong.
+func notBefore(now time.Time, record ApprovalRecord) time.Time {
+	for _, earlier := range []time.Time{
+		record.RequestedAt, record.UpdatedAt, record.DecidedAt,
+		record.MaterializedAt,
+	} {
+		if now.Before(earlier) {
+			now = earlier
+		}
+	}
+	return now
 }
 
 // errApprovalRaced is internal: the record moved under a compare-and-set and
@@ -905,10 +1046,10 @@ func (s *ApprovalService) decide(
 	next.ApproverClientID = decision.ClientID()
 	next.ApproverFingerprint = fingerprint
 	next.ApproverPolicyGeneration = decision.PolicyGeneration()
-	next.DecidedAt = now
+	next.DecidedAt = notBefore(now, current)
 	next.DecisionRequestID = decision.RequestID()
 	next.DecisionCorrelationID = decision.CorrelationID()
-	next.UpdatedAt = now
+	next.UpdatedAt = next.DecidedAt
 	stored, err := s.commit(
 		ctx, "approval_decision", auth.OperationActionApprove,
 		decision, next, current.Version)
@@ -963,6 +1104,11 @@ func (s *ApprovalService) eligibleApprover(
 	now time.Time,
 ) (Descriptor, error) {
 	request := record.Request
+	// First, and as a refusal rather than a concealment: the caller has done
+	// something no approver may do, whatever the record.
+	if s.narrowed(ctx) {
+		return Descriptor{}, approvalUnderNarrowing()
+	}
 	if err := decision.AuthorizeObject(
 		auth.OperationActionApprove, auth.ResourceRequest{
 			AuthorizationDomain: decision.AuthorizationDomain(),
@@ -996,6 +1142,21 @@ func (s *ApprovalService) eligibleApprover(
 	for _, identity := range request.OnBehalfOf {
 		involved[identity] = struct{}{}
 	}
+	// And every ancestor in the agent's delegation chain: its ID and the
+	// principal that registered it. A delegated agent acts with authority its
+	// parent granted, so the parent agent and the parent's registrant are as
+	// much a party to the work as the child's own registrant is. The chain is
+	// read from the registry rather than from the request, and a chain that
+	// cannot be read refuses rather than passes.
+	chain, err := s.dispatch.registry.activeChain(ctx, descriptor.ID, now)
+	if err != nil || len(chain) == 0 || chain[0].Generation != descriptor.Generation {
+		return Descriptor{}, auth.ObjectNotFound()
+	}
+	for _, ancestor := range chain {
+		involved[ancestor.ID] = struct{}{}
+		involved[ancestor.Subject] = struct{}{}
+		involved[ancestor.Actor] = struct{}{}
+	}
 	for _, identity := range []shoal.ID{decision.Subject(), decision.Actor()} {
 		if _, overlaps := involved[identity]; overlaps {
 			return Descriptor{}, shoal.NewError(
@@ -1023,50 +1184,132 @@ func (s *ApprovalService) eligibleApprover(
 
 // Status returns one approval to the requester or to a principal eligible to
 // decide it, and answers everyone else as though it did not exist.
+//
+// It reports the state the request is effectively in, not merely the one
+// stored. Expiry is written lazily, and a request whose target or policy
+// generation has moved, or whose deadline has passed, can never progress
+// although its row still says pending or approved; reporting the row would
+// tell a reader something live that is not. Nothing is written here.
 func (s *ApprovalService) Status(
 	ctx context.Context, request ApprovalStatusRequest,
-) (ApprovalRecord, error) {
+) (ApprovalStatus, error) {
 	dispatch := s.dispatch
 	ctx, cancel := dispatch.deadline(ctx, request.Context)
 	defer cancel()
 	decision, now, err := dispatch.begin(ctx, auth.OperationDispatch, request.Context)
 	if err != nil {
 		if !shoal.IsErrorCode(err, shoal.ErrorUnauthorized) {
-			return ApprovalRecord{}, err
+			return ApprovalStatus{}, err
 		}
 		decision, now, err = dispatch.begin(
 			ctx, auth.OperationActionApprove, request.Context)
 		if err != nil {
-			return ApprovalRecord{}, err
+			return ApprovalStatus{}, err
 		}
 	}
 	if err := validateOpaque("approval ID", request.ID, false); err != nil {
-		return ApprovalRecord{}, err
+		return ApprovalStatus{}, err
 	}
 	current, err := s.store.GetApproval(ctx, request.ID)
 	if err != nil {
 		if errors.Is(err, ErrApprovalNotFound) {
-			return ApprovalRecord{}, auth.ObjectNotFound()
+			return ApprovalStatus{}, auth.ObjectNotFound()
 		}
-		return ApprovalRecord{}, err
+		return ApprovalStatus{}, err
 	}
-	if sameActionPrincipal(decision, current.Request) &&
+	requester := sameActionPrincipal(decision, current.Request) &&
 		decision.AuthorizeObject(auth.OperationDispatch, auth.ResourceRequest{
 			AuthorizationDomain: decision.AuthorizationDomain(),
 			SourceID:            current.Request.SourceID,
 			PolicyID:            current.Request.PolicyID,
 			ObjectID:            shoal.ID(current.ID),
-		}, now) == nil {
-		return CloneApprovalRecord(current), nil
-	}
-	if _, err := s.eligibleApprover(ctx, decision, current, now); err != nil {
-		if shoal.IsErrorCode(err, shoal.ErrorUnauthorized) ||
-			shoal.IsErrorCode(err, shoal.ErrorNotFound) {
-			return ApprovalRecord{}, auth.ObjectNotFound()
+		}, now) == nil
+	if !requester {
+		// The approver path, which is also where a target that has moved
+		// stops being visible: eligibility resolves the binding at the
+		// request's generation. An approver therefore sees a request only
+		// while it is decidable in principle, and the requester always.
+		if _, err := s.eligibleApprover(ctx, decision, current, now); err != nil {
+			if shoal.IsErrorCode(err, shoal.ErrorNotFound) {
+				return ApprovalStatus{}, auth.ObjectNotFound()
+			}
+			if shoal.IsErrorCode(err, shoal.ErrorUnauthorized) {
+				if s.narrowed(ctx) {
+					return ApprovalStatus{}, err
+				}
+				return ApprovalStatus{}, auth.ObjectNotFound()
+			}
+			return ApprovalStatus{}, err
 		}
-		return ApprovalRecord{}, err
 	}
-	return CloneApprovalRecord(current), nil
+	state, condition, err := s.effectiveState(ctx, decision, current, now)
+	if err != nil {
+		return ApprovalStatus{}, err
+	}
+	return ApprovalStatus{
+		Approval: CloneApprovalRecord(current), State: state, Condition: condition,
+	}, nil
+}
+
+// effectiveState computes what a stored approval amounts to now.
+func (s *ApprovalService) effectiveState(
+	ctx context.Context,
+	decision auth.Decision,
+	current ApprovalRecord,
+	now time.Time,
+) (ApprovalState, ApprovalCondition, error) {
+	switch current.State {
+	case ApprovalRefused, ApprovalExpired:
+		return current.State, ApprovalConditionNone, nil
+	case ApprovalEnqueued:
+		_, err := s.dispatch.store.GetAction(ctx, current.ID)
+		if err == nil {
+			// The work exists; where it has got to is the action's status.
+			return ApprovalEnqueued, ApprovalConditionNone, nil
+		}
+		if !errors.Is(err, ErrActionNotFound) {
+			return "", "", err
+		}
+		if condition := s.unreachable(ctx, decision, current, now); condition !=
+			ApprovalConditionNone {
+			return ApprovalUnresolvable, condition, nil
+		}
+		return ApprovalEnqueued, ApprovalConditionAwaitingAction, nil
+	}
+	// Pending or approved.
+	if !now.Before(current.ExpiresAt) {
+		return ApprovalExpired, ApprovalConditionWindowClosed, nil
+	}
+	if condition := s.unreachable(ctx, decision, current, now); condition !=
+		ApprovalConditionNone {
+		return ApprovalUnresolvable, condition, nil
+	}
+	return current.State, ApprovalConditionNone, nil
+}
+
+// unreachable reports why a request can no longer progress, or none.
+//
+// The agent is read without the caller's authority: whether the target still
+// exists at the request's generation is a fact about the registry, not about
+// who is asking, and the caller has already been admitted to this record.
+func (s *ApprovalService) unreachable(
+	ctx context.Context,
+	decision auth.Decision,
+	current ApprovalRecord,
+	now time.Time,
+) ApprovalCondition {
+	if !now.Before(current.Request.Deadline) {
+		return ApprovalConditionDeadlinePassed
+	}
+	descriptor, err := s.dispatch.registry.active(
+		ctx, current.Request.AgentID, now)
+	if err != nil || descriptor.Generation != current.Request.AgentGeneration {
+		return ApprovalConditionTargetMoved
+	}
+	if decision.PolicyGeneration() != current.PolicyGeneration {
+		return ApprovalConditionPolicyMoved
+	}
+	return ApprovalConditionNone
 }
 
 // Pending lists requests this caller may decide and that are still decidable.
@@ -1085,6 +1328,12 @@ func (s *ApprovalService) Pending(
 		ctx, auth.OperationActionApprove, request.Context)
 	if err != nil {
 		return PendingApprovalsPage{}, err
+	}
+	// Refused outright rather than left to the per-record check, which would
+	// skip every record and answer with an empty queue — the wrong answer to
+	// a caller whose queue is not empty but whose credential is unfit.
+	if s.narrowed(ctx) {
+		return PendingApprovalsPage{}, approvalUnderNarrowing()
 	}
 	if request.Limit <= 0 || request.Limit > MaxApprovalListResults {
 		return PendingApprovalsPage{}, shoal.NewError(
@@ -1162,6 +1411,12 @@ func approvalConflict() error {
 	return shoal.WrapError(
 		shoal.ErrorConflict, "approval does not match the held request",
 		ErrApprovalConflict)
+}
+
+func approvalUnderNarrowing() error {
+	return shoal.NewError(
+		shoal.ErrorUnauthorized,
+		"an approval cannot be decided or listed under workspace settings")
 }
 
 func approvalExpired() error {

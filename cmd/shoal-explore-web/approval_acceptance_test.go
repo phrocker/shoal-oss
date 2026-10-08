@@ -293,14 +293,14 @@ func (h *approvalHarness) decide(
 	})
 }
 
-func (h *approvalHarness) status(id []byte) fleet.ApprovalRecord {
+func (h *approvalHarness) status(id []byte) fleet.ApprovalStatus {
 	h.t.Helper()
 	return h.statusAs(requester, id)
 }
 
 // statusAs reads one approval as the given principal: the requester, or an
 // approver eligible to decide it.
-func (h *approvalHarness) statusAs(who principal, id []byte) fleet.ApprovalRecord {
+func (h *approvalHarness) statusAs(who principal, id []byte) fleet.ApprovalStatus {
 	h.t.Helper()
 	record, err := h.opened.approvals.Status(h.as(who), fleet.ApprovalStatusRequest{
 		ID: id, Context: h.context(h.now().Add(time.Minute)),
@@ -579,8 +579,12 @@ func TestApprovalCrashBetweenTheTwoWritesRecovers(t *testing.T) {
 	if _, err := h.request(requester, request); err == nil {
 		t.Fatal("the injected crash did not surface")
 	}
-	if state := h.status(request.id).State; state != fleet.ApprovalEnqueued {
-		t.Fatalf("approval after crash = %q, want enqueued", state)
+	// Reported honestly: committed to become work, and the work not yet
+	// written.
+	if status := h.status(request.id); status.State != fleet.ApprovalEnqueued ||
+		status.Condition != fleet.ApprovalConditionAwaitingAction {
+		t.Fatalf("approval after crash = %q/%q, want enqueued without action",
+			status.State, status.Condition)
 	}
 	// The first write landed and the second did not: no work exists.
 	h.assertNotWork(request)
@@ -720,7 +724,8 @@ func TestApprovalExpiryBoundaries(t *testing.T) {
 		t.Fatalf("approval at ExpiresAt+1 = %v", err)
 	}
 	if record := h.status(late.id); record.State != fleet.ApprovalExpired ||
-		record.Verdict != "" {
+		record.Approval.State != fleet.ApprovalExpired ||
+		record.Approval.Verdict != "" {
 		t.Fatalf("late approval record = %+v", record)
 	}
 	h.mustRequest(requester, late, fleet.ApprovalExpired)
@@ -748,8 +753,8 @@ func TestApprovalExpiryBoundaries(t *testing.T) {
 	}
 	h.advance(30*time.Minute + time.Nanosecond)
 	h.mustRequest(requester, unused, fleet.ApprovalExpired)
-	if record := h.status(unused.id); record.Verdict != fleet.ApprovalVerdictApprove ||
-		record.ApproverSubject != approver.subject {
+	if record := h.status(unused.id); record.Approval.Verdict != fleet.ApprovalVerdictApprove ||
+		record.Approval.ApproverSubject != approver.subject {
 		t.Fatalf("approved-then-expired record = %+v", record)
 	}
 	h.assertNotWork(unused)
@@ -939,7 +944,7 @@ func TestApprovalPendingListsOnlyWhatTheCallerMayDecide(t *testing.T) {
 	if got := list(secondApprover); len(got) != 0 {
 		t.Fatalf("decided request still listed: %+v", got)
 	}
-	if !strings.Contains(string(h.status(request.id).Request.Input), "version") {
+	if !strings.Contains(string(h.status(request.id).Approval.Request.Input), "version") {
 		t.Fatal("status does not return the input an approver reviews")
 	}
 }

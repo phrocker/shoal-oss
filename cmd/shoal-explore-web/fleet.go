@@ -28,7 +28,6 @@ import (
 
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/explorer/fleet"
-	"github.com/phrocker/shoal-oss/pkg/explorer/webapi"
 	"github.com/phrocker/shoal-oss/pkg/interaction"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
@@ -441,13 +440,10 @@ func (r *boundAdmission) Outstanding(
 // dispatch and admission surfaces are bound: request and correlation identity
 // come from the resolved decision, never from the body.
 //
-// It also refuses a decision made under workspace settings. A workspace
-// narrowing can only remove authority, and that is exactly the problem here:
-// the approval service requires an approver to *fail* dispatch, invoke and
-// execute on the scope, so an approver holding dispatch could narrow its own
-// decision through a workspace it owns, shed the dispatch, and pass the check.
-// Separation has to be judged on the authority the principal actually holds,
-// so a decision is only accepted outside any workspace narrowing.
+// The refusal of a workspace-narrowed approver is not here. It used to be, on
+// Decide alone, which left Pending and Status open to the same narrowing; it
+// now lives in the approval service's eligibility check, fed by the Narrowed
+// predicate main.go supplies, so every approver path applies it.
 type boundApproval struct {
 	service  *fleet.ApprovalService
 	resolver auth.Resolver
@@ -495,11 +491,6 @@ func (r *boundApproval) Decide(
 	ctx context.Context,
 	request fleet.ApprovalDecisionRequest,
 ) (fleet.ApprovalRecord, error) {
-	if _, narrowed := webapi.EffectiveWorkspaceSettings(ctx); narrowed {
-		return fleet.ApprovalRecord{}, shoal.NewError(
-			shoal.ErrorUnauthorized,
-			"an approval cannot be decided under workspace settings")
-	}
 	bound, err := r.requestContext(ctx, request.Context)
 	if err != nil {
 		return fleet.ApprovalRecord{}, err
@@ -523,10 +514,10 @@ func (r *boundApproval) Pending(
 func (r *boundApproval) Status(
 	ctx context.Context,
 	request fleet.ApprovalStatusRequest,
-) (fleet.ApprovalRecord, error) {
+) (fleet.ApprovalStatus, error) {
 	bound, err := r.requestContext(ctx, request.Context)
 	if err != nil {
-		return fleet.ApprovalRecord{}, err
+		return fleet.ApprovalStatus{}, err
 	}
 	request.Context = bound
 	return r.service.Status(ctx, request)

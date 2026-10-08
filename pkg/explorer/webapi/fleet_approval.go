@@ -26,7 +26,7 @@ type FleetApprovalProvider interface {
 	Pending(
 		context.Context, fleet.PendingApprovalsRequest,
 	) (fleet.PendingApprovalsPage, error)
-	Status(context.Context, fleet.ApprovalStatusRequest) (fleet.ApprovalRecord, error)
+	Status(context.Context, fleet.ApprovalStatusRequest) (fleet.ApprovalStatus, error)
 }
 
 // NewFleetApprovalHandler returns the approval surface without adding another
@@ -163,14 +163,22 @@ func mountFleetApproval(mux *http.ServeMux, provider FleetApprovalProvider) {
 				writeError(w, fleetApprovalError(err))
 				return
 			}
-			record, err := provider.Status(r.Context(), fleet.ApprovalStatusRequest{
+			status, err := provider.Status(r.Context(), fleet.ApprovalStatusRequest{
 				ID: id, Context: contextValue,
 			})
 			if err != nil {
 				writeError(w, fleetApprovalError(err))
 				return
 			}
-			writeResponse(w, http.StatusOK, encodeApproval(record, true))
+			// state is what the request effectively is now; stored_state is
+			// the row. They differ when expiry has not been written yet, or
+			// when the request can no longer progress, and condition says
+			// which.
+			encoded := encodeApproval(status.Approval, true)
+			encoded.StoredState = encoded.State
+			encoded.State = status.State
+			encoded.Condition = status.Condition
+			writeResponse(w, http.StatusOK, encoded)
 		})
 }
 
@@ -231,18 +239,21 @@ func encodeApprovalReceipt(receipt fleet.ApprovalReceipt) fleetApprovalReceiptWi
 // PolicyGeneration are what it must send back to decide, so it can only ever
 // approve the request it was shown.
 type fleetApprovalWire struct {
-	ID               string              `json:"id"`
-	Version          uint64              `json:"version"`
-	State            fleet.ApprovalState `json:"state"`
-	RequestDigest    string              `json:"request_digest"`
-	PolicyGeneration int64               `json:"policy_generation"`
-	AgentID          string              `json:"agent_id"`
-	AgentGeneration  int64               `json:"agent_generation"`
-	Capability       string              `json:"capability"`
-	Action           string              `json:"action"`
-	SourceID         []byte              `json:"source_id"`
-	PolicyID         []byte              `json:"policy_id"`
-	ObjectID         string              `json:"object_id"`
+	ID      string              `json:"id"`
+	Version uint64              `json:"version"`
+	State   fleet.ApprovalState `json:"state"`
+	// StoredState and Condition are set by status alone; see the route.
+	StoredState      fleet.ApprovalState     `json:"stored_state,omitempty"`
+	Condition        fleet.ApprovalCondition `json:"condition,omitempty"`
+	RequestDigest    string                  `json:"request_digest"`
+	PolicyGeneration int64                   `json:"policy_generation"`
+	AgentID          string                  `json:"agent_id"`
+	AgentGeneration  int64                   `json:"agent_generation"`
+	Capability       string                  `json:"capability"`
+	Action           string                  `json:"action"`
+	SourceID         []byte                  `json:"source_id"`
+	PolicyID         []byte                  `json:"policy_id"`
+	ObjectID         string                  `json:"object_id"`
 	// Input is present on status only; see the pending route.
 	Input          json.RawMessage       `json:"input,omitempty"`
 	Requester      string                `json:"requester"`

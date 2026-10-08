@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/phrocker/shoal-oss/pkg/explorer/fleet"
 	"github.com/phrocker/shoal-oss/pkg/explorer/webapi"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
@@ -100,6 +101,25 @@ func TestApprovalRequiredOverHTTP(t *testing.T) {
 	if status != http.StatusAccepted || body["state"] != "pending" {
 		t.Fatalf("approval request = %d %v, want 202 pending", status, body)
 	}
+
+	// Status carries the effective state beside the stored one.
+	statusBody := map[string]any{
+		"request_id": encode([]byte("http-status")), "reason_code": "test",
+		"deadline": h.now().Add(2 * time.Hour).Format(time.RFC3339Nano),
+	}
+	statusPath := "/api/v1/fleet/approvals/" + encode([]byte("http-held")) + "/status"
+	status, body = serve(approvalHandler, h.as(requester), statusPath, statusBody)
+	if status != http.StatusOK || body["state"] != "pending" ||
+		body["stored_state"] != "pending" || body["condition"] != nil {
+		t.Fatalf("approval status = %d %v", status, body)
+	}
+	h.advance(fleet.DefaultApprovalWindow + time.Second)
+	status, body = serve(approvalHandler, h.as(requester), statusPath, statusBody)
+	if status != http.StatusOK || body["state"] != "expired" ||
+		body["stored_state"] != "pending" || body["condition"] != "window_closed" {
+		t.Fatalf("lapsed approval status = %d %v", status, body)
+	}
+	contextWire["deadline"] = h.now().Add(3 * time.Hour).Format(time.RFC3339Nano)
 
 	admission := map[string]any{
 		"context": contextWire, "id": encode([]byte("http-admission")),

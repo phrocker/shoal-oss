@@ -5,7 +5,7 @@ Issue #451, slice 1. Adopted from ATPL's `on_marginal: require_ztat`; see
 
 A registered action can require approval: `"requires_approval": true` on the
 action in a fleet registration. Every new request for that action is then held
-until a principal distinct from the requester has approved that exact request.
+until a principal independent of the requester has approved that exact request.
 Nothing is performed before then, across retry and restart.
 
 ## The model
@@ -41,7 +41,9 @@ The lifecycle is three compare-and-set steps on the approval record:
    identical to one already made replays; any other decision on a decided
    request conflicts.
 3. **Materialize** (requester re-requesting). The same request again. The
-   rebuilt request must equal the stored one field for field. The approval
+   rebuilt request must equal the stored one field for field. If something
+   other than this approval's work already occupies the identity, the request
+   is refused with a conflict and stays `approved`. Otherwise the approval
    moves `approved → enqueued`, and only then is the `ActionRecord` created
    (version 1, from the stored request) through the same audit and publication
    path an enqueue uses, carrying `ApprovalRequestDigest`,
@@ -50,18 +52,56 @@ The lifecycle is three compare-and-set steps on the approval record:
 
 Re-requesting is idempotent at every step: it answers `pending`, `refused`,
 `expired` or `enqueued`, or conflicts if anything about the request changed.
-Refused and expired are answers, not errors.
+Refused and expired are answers, not errors. Concurrent re-requests of one
+approved request all receive the same enqueued action; exactly one
+`ActionRecord` is written. A materialization that collides with a concurrent
+one still landing is retried internally with a short jittered back-off, because
+the durable store reports that case as a conflict or a transient not-found
+rather than as the fleet sentinel.
 
 `POST /api/v1/fleet/approvals/pending` lists what the caller may decide;
 `POST /api/v1/fleet/approvals/{id}/status` returns one approval, with its
 input, to the requester or to an eligible approver. Pending omits inputs to
 keep a page within the workspace output budget.
 
-**Crash safety.** The `approved → enqueued` write commits the decision to make
-the work; the `ActionRecord` is the second write. A crash between them is
-recovered by the requester re-requesting, at any later time, including after
-`expires_at`. The record is built from the stored request and the stored
-materialization time, so a retry builds the same work.
+### Status reports the effective state
+
+Expiry is written lazily, by the next request or decision, and a request whose
+target has moved can never progress although its row is unchanged. Status
+therefore reports three things: `state`, what the request effectively is now;
+`stored_state`, the row; and `condition`, why they differ. Nothing is written.
+
+| `state` | `condition` | meaning |
+| --- | --- | --- |
+| `pending` / `approved` | — | live |
+| `expired` | `window_closed` | stored pending or approved, window closed, expiry not yet written |
+| `enqueued` | — | the action exists; its own status says where it is |
+| `enqueued` | `enqueued_without_action` | the second write was lost; the next re-request writes it |
+| `unresolvable` | `target_moved` | the agent's generation moved, or the agent is gone |
+| `unresolvable` | `policy_generation_moved` | the policy generation moved since the request |
+| `unresolvable` | `deadline_passed` | the action deadline passed; it can no longer be re-requested |
+| `refused` / `expired` | — | final |
+
+`unresolvable` is never stored. An approver sees a request through Status and
+Pending only while its target still resolves at the request's generation; the
+requester always sees its own.
+
+### Recovery after a crash
+
+The `approved → enqueued` write commits the decision to make the work; the
+`ActionRecord` is the second write. A crash between them is recovered by the
+requester re-requesting — including after `expires_at` — **but only while the
+request can still be re-requested**: before the action deadline, while the
+agent is at the generation the request names, and while the policy generation
+holds. A re-request after the deadline is refused before it reaches the
+approval (`deadline_exceeded`), and one after the agent's generation moved
+cannot resolve its target (`not_found`). The approval then stays `enqueued`
+with no action, and Status reports it as `unresolvable` with the reason. No
+work is created in either case; the requester must make a new request under
+the new generation, which needs a new approval.
+
+The record is built from the stored request and the stored materialization
+time, so a retry builds the same work.
 
 **An approval is a record, not a grant.** It grants the approver nothing. The
 requester gets one queued record, which still runs only through its own
@@ -70,35 +110,56 @@ claim or an execution.
 
 ## Who may approve
 
-All of these, checked on every decision:
+All of these, checked on every approver path — decide, pending, and status
+asked as an approver:
 
+- Not under a narrowing the host applies, such as workspace settings. The host
+  supplies the predicate (`ApprovalConfig.Narrowed`; `cmd/shoal-explore-web`
+  answers from `webapi.EffectiveWorkspaceSettings`). A narrowing can only
+  remove authority, so a principal holding approve and dispatch could narrow to
+  approve alone and pass the next rule; separation is judged on the authority
+  it actually holds. Decide and Pending refuse outright (`401`); Status refuses
+  an approver the same way.
 - `action_approve` authorized on the request's scope, and the request's target
   still resolving at the generation it names. Failing either answers as an
   absent record does.
-- No identity in common with the request: the approver's subject and actor must
-  not equal the requester's subject, actor or any delegation identity, the
-  agent ID, or the agent's registrant. Equality is across fields, as in
-  `internal/decisionadjudication`: acting for someone, or changing only the
-  client, does not establish independence from them.
+- No identity in common with the request. The approver's subject and actor
+  must not equal any of: the requester's subject, actor or delegation
+  identities; the agent's ID; and, for the agent and every ancestor in its
+  delegation chain, read from the registry, that agent's ID and its
+  registrant's subject and actor. A delegated agent acts with authority its
+  parent granted, so the parent agent and the parent's registrant are parties
+  to the work. Equality is across fields, as in
+  `internal/decisionadjudication`: acting for someone does not establish
+  independence from them.
 - No delegation. A decision carrying `OnBehalfOf` is refused.
 - The approver must **fail** `dispatch`, `invoke` and `execute` on the scope.
   Under shared scopes, which every OIDC-minted principal has, holding approve
   alone separates nothing: two principals with dispatch and approve could each
-  approve the other's work. Execute is included as well as the two enqueue
-  operations because an approver that may claim and perform the work it
-  approved has not been separated from the effect.
+  approve the other's work. Execute is included because an approver that may
+  claim and perform the work it approved has not been separated from the
+  effect.
 - The same policy generation, both the one named in the decision and the one
   the approver's credential is under.
-- Not under workspace settings. A workspace narrowing can shed the dispatch an
-  approver holds and pass the check above, so the hosted binding refuses a
-  decision made under one.
+
+What these rules deliberately do not do:
+
+- **Client ID is not compared.** Independence is between people and agents,
+  not between client applications; two people using one console are
+  independent, and one person using two consoles is caught by subject and
+  actor. This matches `internal/decisionadjudication`.
+- **Separation is per credential.** An approver is judged on the credential it
+  presents. One that holds dispatch under another token is not detected; the
+  identity rule is what prevents it approving its own request in that case.
 
 `auth.OperationActionApprove` (`action_approve`) is granted by
 `auth.ServiceRoleActionApproval` (`action_approval`) and nothing else grants it.
 It is in **no** operation list the shipped binary mints — not the three OIDC
-mappings and not the `-dev-auth` principal — and
-`cmd/shoal-explore-web/oidc_approve_grant_test.go` asserts that over every
-`[]auth.Operation` the command defines. An approver role mapping is deferred.
+mappings, the unmapped fallback, or the `-dev-auth` principal. Two tests hold
+that: `oidc_approve_grant_test.go` parses every package-level
+`[]auth.Operation` in the command, and `oidc_approve_mint_test.go` mints a
+decision through each authenticator and asks it whether it authorizes approve.
+An approver role mapping is deferred.
 
 ## What enqueue, invoke and admission do
 
@@ -111,6 +172,14 @@ mappings and not the `-dev-auth` principal — and
   two routes and resubmit through the approval route. A refused enqueue is not
   audited: nothing is written, no action exists for an audit to name, and the
   approval route, which is audited at every transition, is where this work goes.
+- **Invoke on an identity an approval already materialized** reaches enqueue's
+  replay branch, which returns the existing record before the guard, and Invoke
+  then claims and runs it in process if an in-process executor is bound. That
+  is the one approved request, run once, by its requester under the claim
+  fence — the same work any worker would claim — and not a way round the
+  approval. It is the case "synchronous invoke of an approval-required action"
+  in Deferred refers to: it works by accident of the replay branch rather than
+  by design, and slice 1 neither relies on it nor forbids it.
 - **The pre-call admission seam (Path B)** denies an approval-required action
   durably with no reason, like any other denial. Holding is not available
   there: the caller is waiting on the answer with the payload in hand.
@@ -141,9 +210,8 @@ What an operator should expect when registering the flag on a live agent:
 
 The same generation rule applies to heartbeats: a heartbeat moves the agent's
 generation, so a request held across a heartbeat no longer matches its target
-and cannot be decided or materialized. Approval windows should be shorter than
-the heartbeat interval; this is the same property queued dispatch work already
-has.
+and becomes `unresolvable`. Approval windows should be shorter than the
+heartbeat interval; this is the same property queued dispatch work already has.
 
 ## Storage and compatibility
 
@@ -159,7 +227,25 @@ has.
 - `approval.*` event kinds are reserved: the public publish route refuses them
   and no operation may publish them through the trusted path. No approval
   events are published in this slice.
-- ATPL export refuses an approval-required action by path (`docs/atpl.md`).
+- ATPL: export refuses an approval-required action by path, and plan refuses a
+  managed agent whose live actions require approval (`refused-approval`)
+  rather than planning it as unchanged or as a narrowing (`docs/atpl.md`).
+
+## Clock skew between replicas
+
+A transition written on a replica whose clock is behind the one that wrote the
+row clamps its timestamps forward to the row's latest (`RequestedAt`,
+`UpdatedAt`, `DecidedAt`, `MaterializedAt`) instead of failing validation. The
+clamp moves time forward by at most the skew and never past `expires_at`,
+because every transition has already checked the window.
+
+The materialized action's `UpdatedAt` is the clamped materialization time. If
+the materializing replica is behind the deciding one, that time is ahead of
+its clock, and the lifecycle publisher, which bounds a publication's retry
+window from `UpdatedAt` against the local clock, refuses to publish: the
+caller is told the action committed and needs reconciliation, and a
+re-request once the clock has caught up replays the one record. Every dispatch
+transition reconciled on a lagging replica has the same property.
 
 ## Residuals
 
@@ -173,9 +259,15 @@ has.
   and it is pinned by the acceptance tests so a fix flips them visibly.
 - **Approval identities are caller-chosen**, as dispatch action identities
   are. A principal with dispatch on the scope can enqueue an ordinary action at
-  the identity of someone's held request, after which that request cannot
-  materialize (it conflicts), and a conflict on request reveals that something
-  exists at an identity. Both are the existing dispatch identity properties.
+  the identity of someone's held request. Found before materialization, the
+  approval stays `approved` and the re-request conflicts; landing between that
+  check and the commit leaves the approval `enqueued` with no action, which
+  Status reports. A conflict on request also reveals that something exists at
+  an identity. Both are the existing dispatch identity properties.
+- **Stranded rows.** A request whose target generation or policy generation
+  moves, or whose deadline passes, stays in its stored state forever; nothing
+  sweeps it. Status reports it as `unresolvable`, Pending omits it, and neither
+  decide nor re-request can move it. A sweeper is deferred.
 - **Audits record attempts.** Approval audits precede their write, and each
   attempt has its own session, keyed on the acting principal and request ID, so
   a lost compare-and-set or a crash cannot wedge the record. An audit whose
@@ -186,12 +278,6 @@ has.
   action write is recovered by a retry under the same credential; under a
   different one the audit session conflicts. This is the property every
   dispatch transition already has.
-- **Separation is judged on one credential.** An approver that holds dispatch
-  under another token is not detected; the identity rule is what prevents
-  self-approval in that case.
-- **ATPL plan** does not compare the flag, so a policy that omits it plans an
-  approval-required live agent as unchanged; an apply that rewrites it is
-  refused by the registry as a widening.
 
 ## Deferred
 
@@ -199,7 +285,8 @@ has.
   field it needs is stored on the approval record.
 - Approval lifecycle events (needs #480 item 1).
 - An approver role mapping for OIDC.
-- Synchronous invoke of an approval-required action.
+- Synchronous invoke of an approval-required action, by design rather than
+  through the replay branch.
 - A claim-time generation re-check (after #438/#430).
-- Requester withdrawal of a held request.
+- Requester withdrawal of a held request, and a sweeper for stranded rows.
 - `approval: {required: true}` in ATPL policy files (#452).
