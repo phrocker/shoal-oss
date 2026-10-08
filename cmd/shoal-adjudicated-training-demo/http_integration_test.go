@@ -13,7 +13,6 @@ import (
 	"testing"
 
 	"github.com/phrocker/shoal-oss/internal/decisiondatasethttp"
-	"github.com/phrocker/shoal-oss/internal/decisiondatasets"
 	"github.com/phrocker/shoal-oss/pkg/decision/api"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/explorer/webapi"
@@ -42,10 +41,7 @@ func TestDatasetHTTPRealAuthorizedExportAndSDK(t *testing.T) {
 				t.Fatal(e)
 			}
 			defer eng.Close()
-			exporter, e := decisiondatasets.New(decisiondatasets.Config{Resolver: authority.Resolver(), Authority: cohortAuthority{r}, Clock: r.now})
-			if e != nil {
-				t.Fatal(e)
-			}
+			exporter := freshDatasetExporter{r, authority.Resolver()}
 			adapter, e := decisiondatasethttp.New(exporter)
 			if e != nil {
 				t.Fatal(e)
