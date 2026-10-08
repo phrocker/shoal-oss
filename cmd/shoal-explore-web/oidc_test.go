@@ -281,12 +281,42 @@ func TestOIDCValidTokenMintsReaderDecision(t *testing.T) {
 	if !strings.HasPrefix(string(decision.RequestID()), "oidc-request-") {
 		t.Fatalf("request ID = %q", decision.RequestID())
 	}
+	// A correlation ID too, and not the same value as the request ID. Without
+	// one, every dispatch, admission and approval route refused every OIDC
+	// request with "dispatch correlation ID is required" (#524) — and nothing
+	// caught it, because no test drove an authenticated decision into those
+	// routes and this one asserted only the request identity.
+	if !strings.HasPrefix(
+		string(decision.CorrelationID()), "oidc-correlation-") {
+		t.Fatalf("correlation ID = %q, so the dispatch surface is "+
+			"unreachable through OIDC", decision.CorrelationID())
+	}
+	if decision.CorrelationID() == decision.RequestID() {
+		t.Fatal("the request and correlation identities are one value, so " +
+			"the correlation threads nothing")
+	}
 	second, err := authenticator.Authenticate(bearerRequest(token))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if second.RequestID() == decision.RequestID() {
 		t.Fatal("two requests shared one request identity")
+	}
+	if second.CorrelationID() == decision.CorrelationID() {
+		t.Fatal("two unrelated requests shared one correlation identity")
+	}
+
+	// And a caller threading an upstream trace is honoured, which is the
+	// field's purpose for a gateway or an agent acting for a user.
+	threaded := bearerRequest(token)
+	threaded.Header.Set(CorrelationIDHeader, "upstream-trace-9")
+	carried, err := authenticator.Authenticate(threaded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if carried.CorrelationID() != "upstream-trace-9" {
+		t.Fatalf("a supplied correlation was not honoured: %q",
+			carried.CorrelationID())
 	}
 }
 

@@ -21,16 +21,21 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"io"
 	"mime/multipart"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
+	"github.com/phrocker/shoal-oss/pkg/explorer/webapi"
+	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
 // TestListenAddressIsLoopback pins the classification that decides whether the
@@ -477,5 +482,158 @@ func uploadDevelopmentDocument(t *testing.T, address string) {
 	}
 	if response.StatusCode != http.StatusOK {
 		t.Fatalf("upload status = %s body = %s", response.Status, payload)
+	}
+}
+
+// TestEveryShippedAuthenticatorMintsACorrelationID is the test whose absence
+// let #524 ship.
+//
+// Every dispatch, admission and approval route requires a correlation ID, and
+// neither shipped authenticator set one, so every such request was refused
+// with "dispatch correlation ID is required". The bound wrappers overwrite the
+// request body's value with the decision's — correctly, so a body cannot forge
+// provenance — which meant no client-side workaround existed either.
+//
+// It survived because every end-to-end test in this package mints a decision
+// directly rather than going through an authenticator. So this asserts the
+// property at the mint, and TestTheDispatchSurfaceAcceptsAnAuthenticatedRequest
+// asserts it end to end.
+func TestEveryShippedAuthenticatorMintsACorrelationID(t *testing.T) {
+	now := time.Date(2026, 9, 6, 12, 0, 0, 0, time.UTC)
+	development, err := newDevelopmentAuthenticator(fixedClock(now))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/fleet/actions", nil)
+	decision, err := development.Authenticate(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decision.CorrelationID() == "" {
+		t.Fatal("the development authenticator mints no correlation ID, so " +
+			"every dispatch, admission and approval route refuses it")
+	}
+	if decision.RequestID() == decision.CorrelationID() {
+		t.Fatalf("the request and correlation identities are the same value "+
+			"(%q), so the correlation threads nothing and cannot be told "+
+			"apart in an audit record", decision.CorrelationID())
+	}
+
+	// Two requests are separate traces, which is what the authenticator's own
+	// doc comment promises about request identity.
+	second, err := development.Authenticate(
+		httptest.NewRequest(http.MethodPost, "/api/v1/fleet/actions", nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.CorrelationID() == decision.CorrelationID() {
+		t.Fatal("two unrelated requests were given one correlation ID")
+	}
+
+	// A supplied header threads the caller's trace across the hop, which is
+	// the field's entire purpose for a gateway or an agent acting for a user.
+	supplied := httptest.NewRequest(
+		http.MethodPost, "/api/v1/fleet/actions", nil)
+	supplied.Header.Set(CorrelationIDHeader, "upstream-trace-7")
+	threaded, err := development.Authenticate(supplied)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if threaded.CorrelationID() != "upstream-trace-7" {
+		t.Fatalf("a supplied correlation was not honoured: %q",
+			threaded.CorrelationID())
+	}
+
+	// And a malformed one is refused rather than silently replaced, so a
+	// caller that meant to thread a trace learns that it did not.
+	for _, probe := range []struct {
+		name   string
+		values []string
+	}{
+		{"empty", []string{""}},
+		{"padded", []string{" trace "}},
+		{"a space inside", []string{"two words"}},
+		{"a control character", []string{"trace\x00"}},
+		{"a bidi override", []string{"trace‮txt"}},
+		{"repeated", []string{"one", "two"}},
+	} {
+		t.Run(probe.name, func(t *testing.T) {
+			refused := httptest.NewRequest(
+				http.MethodPost, "/api/v1/fleet/actions", nil)
+			for _, value := range probe.values {
+				refused.Header.Add(CorrelationIDHeader, value)
+			}
+			if _, err := development.Authenticate(refused); err == nil {
+				t.Fatal("a malformed correlation ID was accepted into a " +
+					"decision, and from there into a durable audit record")
+			} else if !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
+				t.Fatalf("refused as %v, want an invalid argument", err)
+			}
+		})
+	}
+}
+
+// TestTheDispatchSurfaceAcceptsAnAuthenticatedRequest drives a real request
+// through the real development authenticator into the real bound dispatch
+// provider, which is the path #524 broke and which nothing exercised.
+//
+// Every other end-to-end test in this package injects a bound context instead
+// of authenticating — `h.as(who)` — so the authenticator's output never
+// reached a dispatch route. With no correlation ID minted, every such route
+// answered "dispatch correlation ID is required", and the bound wrappers
+// overwrite the body's value with the decision's, so no client could work
+// around it.
+//
+// The assertion is deliberately narrow: this decision is not scoped to the
+// harness's registered agent, so the request may well be refused for
+// authorization or for an unknown action. What it must not be refused for is a
+// missing correlation ID — that is the gate above all of those.
+func TestTheDispatchSurfaceAcceptsAnAuthenticatedRequest(t *testing.T) {
+	h := newApprovalHarness(t)
+	development, err := newDevelopmentAuthenticator(h.now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler, err := webapi.NewAuthenticatedHandler(
+		h.opened.service, development, h.authority.Binder(), "example.test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := handler.MountFleetDispatch(h.opened.fleetDispatch); err != nil {
+		t.Fatal(err)
+	}
+
+	body, err := json.Marshal(map[string]any{
+		"context": map[string]any{
+			"request_id": base64.RawURLEncoding.EncodeToString(
+				[]byte("authenticated-request")),
+			"reason_code": "operator_request",
+			"deadline":    h.now().Add(time.Hour).Format(time.RFC3339Nano),
+		},
+		"id": base64.RawURLEncoding.EncodeToString([]byte("authenticated")),
+		"idempotency_key": base64.RawURLEncoding.EncodeToString(
+			[]byte("authenticated-key")),
+		"agent_id":         base64.RawURLEncoding.EncodeToString([]byte("gateway")),
+		"agent_generation": 1, "capability": "ops", "action": "deploy",
+		"source_id": workspaceSourceID, "policy_id": workspaceGrantPolicyID,
+		"object_id": base64.RawURLEncoding.EncodeToString([]byte("release-7")),
+		"input":     json.RawMessage(`{"version":"7"}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodPost,
+		"http://example.test/api/v1/fleet/actions", bytes.NewReader(body))
+	request.Host = "example.test"
+	request.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+
+	if strings.Contains(recorder.Body.String(), "correlation ID is required") {
+		t.Fatalf("an authenticated request was refused for a missing "+
+			"correlation ID, so the whole dispatch surface is unreachable "+
+			"through the shipped authenticators: %d %s",
+			recorder.Code, recorder.Body)
 	}
 }

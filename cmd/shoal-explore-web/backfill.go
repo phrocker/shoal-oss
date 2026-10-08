@@ -94,7 +94,10 @@ func (b *developmentBackfill) run(
 		return 0, fmt.Errorf(
 			"refusing to serve: the development corpus backfill is misconfigured")
 	}
-	decision, err := b.authenticator.mint()
+	// No request, so no correlation header to thread: the backfill is a
+	// startup task and the root of its own trace, which is exactly the case
+	// correlationIDFor generates for.
+	decision, err := b.authenticator.mint(nil)
 	if err != nil {
 		return 0, fmt.Errorf(
 			"refusing to serve: minting the %s development decision failed: %w",
