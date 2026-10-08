@@ -469,6 +469,26 @@ resolution: it is the point at which Shoal permitted an effect and will never
 learn what happened. The record stays claimed — it never quietly becomes
 something else.
 
+## Actions that require approval
+
+An action registered with `requires_approval` (`docs/approval.md`) is denied
+here, durably and with no reason, exactly as any other denial: a caller cannot
+tell it from the effect ceiling. Holding is not available on this path. The
+caller is waiting on the answer with the payload in hand, and a grant issued
+after a human decided would be a grant for a call whose moment had passed.
+Approval-required work goes through `/api/v1/fleet/approvals/`, where nothing
+is performed until an approver has decided.
+
+The check sits after the replay branch, so an admission granted or denied
+before the flag was registered keeps answering from its record.
+
+The first answer to such a denial in the hosted build is currently a `503`
+"requires reconciliation", not the denial: the cancelled record carries
+`[invoke]` as its authorized operations and the hosted publisher admits
+`action.canceled` only under `dispatch`. The denial is committed and the replay
+answers `denied`. This is pre-existing — the effect-ceiling denial takes the
+same path — and is recorded in `docs/approval.md`, "Residuals".
+
 ## What this is not
 
 It does not enforce that a caller honours an obligation. No plane outside the

@@ -49,8 +49,10 @@
 // docs/gateways.md, "What comes from ATPL".
 //
 // ATPL's approval (marginal outcome) and runtime attestation are adopted but
-// not yet compiled: approval waits on admission approval (#451) and
-// attestation on recorded runtime attestation (#446). Admission obligations are
+// not yet compiled. The registry can require approval per action (#451), and
+// accepting it in policy files is #452; until then Export refuses an
+// approval-required action rather than writing it without the requirement.
+// Attestation waits on recorded runtime attestation (#446). Admission obligations are
 // computed per request at admission rather than declared per agent, and how a
 // policy would constrain them is deferred. Those fields are refused by name, so
 // a file never appears to grant something it does not.

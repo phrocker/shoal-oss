@@ -270,6 +270,19 @@ type Action struct {
 	// Effects declares where this action's consequences land. The empty set
 	// means they land nowhere this taxonomy names.
 	Effects Effects `json:"effects,omitempty"`
+	// RequiresApproval holds every new request for this action for a human
+	// decision (#451). Enqueue and invoke refuse it outright, the pre-call
+	// admission seam denies it durably, and the only way in is the approval
+	// route, which materializes the queued record once an approver distinct
+	// from the requester has approved that exact request.
+	//
+	// It gates new work only. A record queued before the flag was registered
+	// is not reached by it — but registering the flag is a new generation, and
+	// a queued record names the generation it was enqueued against, so such
+	// records stop resolving for Pull, Claim and completion the moment the
+	// flag lands. Delegation and re-registration cannot clear it: dropping it
+	// widens authority, which capabilitiesSubset refuses.
+	RequiresApproval bool `json:"requires_approval,omitempty"`
 }
 
 // legacyEffect projects a set onto the superseded scalar spelling.
@@ -315,11 +328,16 @@ func (a Action) MarshalJSON() ([]byte, error) {
 		OutputSchema json.RawMessage `json:"output_schema"`
 		Effects      Effects         `json:"effects,omitempty"`
 		LegacyEffect Effect          `json:"effect,omitempty"`
+		// Omitted when false, so a descriptor that does not require
+		// approval marshals byte-for-byte as it did before the field
+		// existed and descriptorDigest is unchanged for it.
+		RequiresApproval bool `json:"requires_approval,omitempty"`
 	}
 	return json.Marshal(actionFields{
 		Name: a.Name, InputSchema: a.InputSchema,
 		OutputSchema: a.OutputSchema, Effects: a.Effects,
-		LegacyEffect: a.Effects.legacyEffect(),
+		LegacyEffect:     a.Effects.legacyEffect(),
+		RequiresApproval: a.RequiresApproval,
 	})
 }
 
@@ -342,11 +360,12 @@ func (a Action) MarshalJSON() ([]byte, error) {
 // outer decoder cannot reach through a custom unmarshaler.
 func (a *Action) UnmarshalJSON(data []byte) error {
 	type actionFields struct {
-		Name         string          `json:"name"`
-		InputSchema  json.RawMessage `json:"input_schema"`
-		OutputSchema json.RawMessage `json:"output_schema"`
-		Effects      Effects         `json:"effects"`
-		LegacyEffect *Effect         `json:"effect"`
+		Name             string          `json:"name"`
+		InputSchema      json.RawMessage `json:"input_schema"`
+		OutputSchema     json.RawMessage `json:"output_schema"`
+		Effects          Effects         `json:"effects"`
+		LegacyEffect     *Effect         `json:"effect"`
+		RequiresApproval bool            `json:"requires_approval"`
 	}
 	var fields actionFields
 	decoder := json.NewDecoder(bytes.NewReader(data))
@@ -374,6 +393,7 @@ func (a *Action) UnmarshalJSON(data []byte) error {
 	*a = Action{
 		Name: fields.Name, InputSchema: fields.InputSchema,
 		OutputSchema: fields.OutputSchema, Effects: fields.Effects,
+		RequiresApproval: fields.RequiresApproval,
 	}
 	return nil
 }
@@ -676,6 +696,7 @@ func canonicalCapabilities(input []Capability) ([]Capability, error) {
 			result[i].Actions[j] = Action{
 				Name: action.Name, InputSchema: inputSchema,
 				OutputSchema: outputSchema, Effects: effects,
+				RequiresApproval: action.RequiresApproval,
 			}
 		}
 		sort.Slice(result[i].Actions, func(a, b int) bool {
@@ -757,6 +778,9 @@ func cloneDescriptor(input Descriptor) Descriptor {
 				Effects:      action.Effects.clone(),
 				InputSchema:  append(json.RawMessage(nil), action.InputSchema...),
 				OutputSchema: append(json.RawMessage(nil), action.OutputSchema...),
+				// A clone that dropped the flag would hand every reader of
+				// a descriptor an action that no longer requires approval.
+				RequiresApproval: action.RequiresApproval,
 			}
 		}
 	}

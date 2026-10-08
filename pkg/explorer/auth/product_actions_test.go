@@ -41,6 +41,7 @@ var legacyAuthorizationOperations = []auth.Operation{
 var productActionOperations = []auth.Operation{
 	auth.OperationInvoke,
 	auth.OperationExecute,
+	auth.OperationActionApprove,
 	auth.OperationDispatch,
 	auth.OperationDelegate,
 	auth.OperationAgentRegister,
@@ -71,6 +72,7 @@ var authorizationServiceRoles = []auth.ServiceRole{
 	auth.ServiceRoleSecurityAdmin,
 	auth.ServiceRoleActionInvocation,
 	auth.ServiceRoleActionExecution,
+	auth.ServiceRoleActionApproval,
 	auth.ServiceRoleActionDispatch,
 	auth.ServiceRoleDelegation,
 	auth.ServiceRoleAgentRegistration,
@@ -130,6 +132,12 @@ var roleOperationCeilings = map[auth.ServiceRole]map[auth.Operation]bool{
 	// the dispatch tests entirely.
 	auth.ServiceRoleActionExecution: operationSet(
 		auth.OperationExecute,
+		auth.OperationValidate,
+	),
+	// Approve and nothing else. An approver that could also enqueue, invoke
+	// or execute would be a second role in name only (#451).
+	auth.ServiceRoleActionApproval: operationSet(
+		auth.OperationActionApprove,
 		auth.OperationValidate,
 	),
 	auth.ServiceRoleActionDispatch: operationSet(
@@ -201,6 +209,7 @@ func TestProductActionOperationValuesAndParsingAreStable(t *testing.T) {
 		auth.OperationValidate:               "validation",
 		auth.OperationInvoke:                 "invoke",
 		auth.OperationExecute:                "execute",
+		auth.OperationActionApprove:          "action_approve",
 		auth.OperationDispatch:               "dispatch",
 		auth.OperationDelegate:               "delegate",
 		auth.OperationAgentRegister:          "agent_register",
@@ -257,6 +266,7 @@ func TestProductActionServiceRoleValuesAreStable(t *testing.T) {
 		auth.ServiceRoleSecurityAdmin:          "security_admin",
 		auth.ServiceRoleActionInvocation:       "action_invocation",
 		auth.ServiceRoleActionExecution:        "action_execution",
+		auth.ServiceRoleActionApproval:         "action_approval",
 		auth.ServiceRoleActionDispatch:         "action_dispatch",
 		auth.ServiceRoleDelegation:             "delegation",
 		auth.ServiceRoleAgentRegistration:      "agent_registration",
@@ -423,6 +433,7 @@ func TestProductActionServiceRolesRoundTripThroughPolicy(t *testing.T) {
 	primaryOperation := map[auth.ServiceRole]auth.Operation{
 		auth.ServiceRoleActionInvocation:       auth.OperationInvoke,
 		auth.ServiceRoleActionDispatch:         auth.OperationDispatch,
+		auth.ServiceRoleActionApproval:         auth.OperationActionApprove,
 		auth.ServiceRoleDelegation:             auth.OperationDelegate,
 		auth.ServiceRoleAgentRegistration:      auth.OperationAgentRegister,
 		auth.ServiceRoleAgentRevocation:        auth.OperationAgentRevoke,

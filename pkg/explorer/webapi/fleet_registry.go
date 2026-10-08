@@ -368,6 +368,9 @@ func cloneFleetCapabilities(input []fleet.Capability) []fleet.Capability {
 				Effects:      append(fleet.Effects(nil), input[i].Actions[j].Effects...),
 				InputSchema:  append(json.RawMessage(nil), input[i].Actions[j].InputSchema...),
 				OutputSchema: append(json.RawMessage(nil), input[i].Actions[j].OutputSchema...),
+				// Dropping it here would register, and report, an action
+				// that no longer requires approval.
+				RequiresApproval: input[i].Actions[j].RequiresApproval,
 			}
 		}
 	}

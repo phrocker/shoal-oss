@@ -82,7 +82,7 @@ func (s *DispatchService) enqueue(
 		return ActionRecord{}, shoal.NewError(
 			shoal.ErrorInvalidArgument, "action ID is reserved")
 	}
-	record, _, err := s.queuedRecord(ctx, decision, request, operation, now)
+	record, action, err := s.queuedRecord(ctx, decision, request, operation, now)
 	if err != nil {
 		return ActionRecord{}, err
 	}
@@ -98,6 +98,28 @@ func (s *DispatchService) enqueue(
 		return ActionRecord{}, ErrActionConflict
 	} else if !errors.Is(readErr, ErrActionNotFound) {
 		return ActionRecord{}, readErr
+	}
+	// An action that requires approval is never created here (#451). The only
+	// way to it is the approval route, which writes nothing an executor can
+	// see until an approver has approved this exact request.
+	//
+	// After the replay branch on purpose, and that placement is a decision
+	// about work that already exists. A record this caller already holds is
+	// returned as it is: either it was queued before the flag was registered —
+	// in which case registering the flag moved the agent's generation and the
+	// record no longer resolves for Pull, Claim or completion — or it is the
+	// record an approval materialized, which this call merely reads back. In
+	// neither case does the replay create work, so refusing it would only
+	// make a caller's retry fail where its first attempt succeeded.
+	//
+	// Not audited. Nothing is written and no action exists for an audit to
+	// name; the refusal is a static property of the registered descriptor that
+	// any caller with dispatch on the scope can already read, and the approval
+	// route — which is audited at every transition — is where approval-required
+	// work is supposed to go. Recording every refused attempt would let any
+	// dispatch holder write audit entries at will without producing anything.
+	if action.RequiresApproval {
+		return ActionRecord{}, approvalRequired()
 	}
 	if err := s.recorder.RecordAction(ctx, ActionAudit{Phase: "enqueue_admission", Operation: operation, Record: record}); err != nil {
 		return ActionRecord{}, errors.Join(ErrRecordingUnavailable, err)

@@ -74,6 +74,11 @@ func TestWorkspaceSettingsClampAnalyticsAndMarkResponseLoss(t *testing.T) {
 		// to retry an egress that already happened.
 		{http.MethodPost, "/api/v1/admission/request"},
 		{http.MethodPost, "/api/v1/admission/report"},
+		// An approval request writes the held record or materializes the
+		// action; a decision writes the verdict. Either response lost to the
+		// output limit must read as indeterminate.
+		{http.MethodPost, "/api/v1/fleet/approvals/request"},
+		{http.MethodPost, "/api/v1/fleet/approvals/approval/decide"},
 		{http.MethodPost, "/api/v1/fleet/events/subscriptions"},
 		{http.MethodDelete, "/api/v1/fleet/events/subscriptions/subscription"},
 		{http.MethodPost, "/api/v1/fleet/events/publish"},
@@ -91,6 +96,9 @@ func TestWorkspaceSettingsClampAnalyticsAndMarkResponseLoss(t *testing.T) {
 		{http.MethodPost, "/api/v1/fleet/actions/action/status"},
 		// Listing what is outstanding writes nothing.
 		{http.MethodPost, "/api/v1/admission/outstanding"},
+		// Listing what is decidable and reading one request write nothing.
+		{http.MethodPost, "/api/v1/fleet/approvals/pending"},
+		{http.MethodPost, "/api/v1/fleet/approvals/approval/status"},
 		{http.MethodPost, "/api/v1/fleet/agents/resolve"},
 		{http.MethodPost, "/api/v1/fleet/agents/agent/resolve"},
 	} {
@@ -139,6 +147,13 @@ func TestWorkspaceOperationForRequestUsesRouteOperation(t *testing.T) {
 		{http.MethodPost, "/api/v1/admission/request", auth.OperationInvoke, true},
 		{http.MethodPost, "/api/v1/admission/report", auth.OperationInvoke, true},
 		{http.MethodPost, "/api/v1/admission/outstanding", auth.OperationInvoke, true},
+		// All four approval routes, each under the authority it actually
+		// exercises: the requester's dispatch, the approver's approve.
+		{http.MethodPost, "/api/v1/fleet/approvals/request", auth.OperationDispatch, true},
+		{http.MethodPost, "/api/v1/fleet/approvals/approval/status", auth.OperationDispatch, true},
+		{http.MethodPost, "/api/v1/fleet/approvals/pending", auth.OperationActionApprove, true},
+		{http.MethodPost, "/api/v1/fleet/approvals/approval/decide", auth.OperationActionApprove, true},
+		{http.MethodGet, "/api/v1/fleet/approvals/pending", "", false},
 		{http.MethodGet, "/api/v1/admission/request", "", false},
 		{http.MethodPost, "/api/v1/admission/unknown", "", false},
 		{http.MethodPost, "/api/v1/fleet/agents/agent/heartbeat", auth.OperationAgentHeartbeat, true},

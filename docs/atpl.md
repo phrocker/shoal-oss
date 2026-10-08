@@ -196,7 +196,12 @@ than what it holds live, and the export still compiles. A lease with under a
 second remaining, measured before rounding, is refused. Without `-executors`, each executor's `max_effects` is the union of
 its actions' effects and `min_effects` is empty, and the command warns that this
 is not what the host binds. A live ID, domain, scope or executor reference that
-is not UTF-8 is refused, naming the field. Export refuses a directory that
+is not UTF-8 is refused, naming the field. A live action that requires approval
+(`docs/approval.md`) is refused by path, for example
+`agents[id=gateway].capabilities[name=ops].actions[name=deploy].approval`:
+this version cannot write approval into a policy file, and an export that
+silently left it out would be a policy that, re-applied, describes the agent
+without its control. Export refuses a directory that
 already holds policy files, read with `os.ReadDir` so a directory name with glob
 metacharacters cannot defeat the check, and refuses before writing anything if
 the files together would exceed the 256 MiB a policy directory may hold.
@@ -257,8 +262,13 @@ agent ID)`, and it is read with the corpus's `InteractionRecord`.
 
 ## Deferred
 
-- Approval rules (#451) and attestation requirements (#446): refused by name
-  until they compile.
+- Approval rules and attestation requirements (#446): refused by name until
+  they compile. The registry can require approval per action since #451
+  (`docs/approval.md`); accepting `approval: {required: true}` in policy files
+  is #452. Until then export refuses an approval-required action, and plan
+  refuses a managed agent whose live actions require approval
+  (`refused-approval`, naming each action), so apply never runs against an
+  agent the file cannot describe.
 - Admission obligations. They are computed per request at admission, not
   declared per agent; how a policy would constrain them is undecided.
 - YAML. The repository has no YAML library, and every strict decoder here is

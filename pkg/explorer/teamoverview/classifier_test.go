@@ -24,6 +24,7 @@ import (
 func TestFleetAuthorizationCoversEveryFleetOperation(t *testing.T) {
 	fleetOperations := []auth.Operation{
 		auth.OperationDispatch, auth.OperationInvoke, auth.OperationExecute,
+		auth.OperationActionApprove,
 		auth.OperationAgentRegister, auth.OperationAgentHeartbeat,
 		auth.OperationAgentRevoke, auth.OperationAgentResolve,
 		auth.OperationEventPublish,

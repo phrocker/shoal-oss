@@ -436,6 +436,93 @@ func (r *boundAdmission) Outstanding(
 	return r.service.Outstanding(ctx, request)
 }
 
+// boundApproval binds the approval surface to the authenticated request as the
+// dispatch and admission surfaces are bound: request and correlation identity
+// come from the resolved decision, never from the body.
+//
+// The refusal of a workspace-narrowed approver is not here. It used to be, on
+// Decide alone, which left Pending and Status open to the same narrowing; it
+// now lives in the approval service's eligibility check, fed by the Narrowed
+// predicate main.go supplies, so every approver path applies it.
+type boundApproval struct {
+	service  *fleet.ApprovalService
+	resolver auth.Resolver
+}
+
+func newBoundApproval(
+	service *fleet.ApprovalService,
+	resolver auth.Resolver,
+) (*boundApproval, error) {
+	if service == nil || isNilFleetDependency(resolver) {
+		return nil, shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			"bound approval dependencies are required",
+		)
+	}
+	return &boundApproval{service: service, resolver: resolver}, nil
+}
+
+func (r *boundApproval) requestContext(
+	ctx context.Context,
+	request fleet.RequestContext,
+) (fleet.RequestContext, error) {
+	decision, err := r.resolver.Resolve(ctx)
+	if err != nil {
+		return fleet.RequestContext{}, err
+	}
+	request.RequestID = decision.RequestID()
+	request.CorrelationID = decision.CorrelationID()
+	return request, nil
+}
+
+func (r *boundApproval) Request(
+	ctx context.Context,
+	request fleet.EnqueueRequest,
+) (fleet.ApprovalReceipt, error) {
+	bound, err := r.requestContext(ctx, request.Context)
+	if err != nil {
+		return fleet.ApprovalReceipt{}, err
+	}
+	request.Context = bound
+	return r.service.Request(ctx, request)
+}
+
+func (r *boundApproval) Decide(
+	ctx context.Context,
+	request fleet.ApprovalDecisionRequest,
+) (fleet.ApprovalRecord, error) {
+	bound, err := r.requestContext(ctx, request.Context)
+	if err != nil {
+		return fleet.ApprovalRecord{}, err
+	}
+	request.Context = bound
+	return r.service.Decide(ctx, request)
+}
+
+func (r *boundApproval) Pending(
+	ctx context.Context,
+	request fleet.PendingApprovalsRequest,
+) (fleet.PendingApprovalsPage, error) {
+	bound, err := r.requestContext(ctx, request.Context)
+	if err != nil {
+		return fleet.PendingApprovalsPage{}, err
+	}
+	request.Context = bound
+	return r.service.Pending(ctx, request)
+}
+
+func (r *boundApproval) Status(
+	ctx context.Context,
+	request fleet.ApprovalStatusRequest,
+) (fleet.ApprovalStatus, error) {
+	bound, err := r.requestContext(ctx, request.Context)
+	if err != nil {
+		return fleet.ApprovalStatus{}, err
+	}
+	request.Context = bound
+	return r.service.Status(ctx, request)
+}
+
 // externalFleetEffectBindings is the operator's per-reference opt-in to the
 // one binding in this process that admits external work.
 //

@@ -721,6 +721,19 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 			return err
 		}
 	}
+	if opened.approvals != nil {
+		approvalHandler, err := webapi.NewFleetApprovalHandler(opened.approvals)
+		if err != nil {
+			listener.Close()
+			return err
+		}
+		if err := handler.MountAuthenticated(
+			webapi.FleetApprovalRoutePrefix, approvalHandler,
+		); err != nil {
+			listener.Close()
+			return err
+		}
+	}
 	if opened.teamOverview != nil {
 		teamHandler, err := webapi.NewTeamOverviewHandler(opened.teamOverview)
 		if err != nil {
@@ -940,6 +953,13 @@ type serviceConfig struct {
 	// mosaic configures the sensitivity-domain co-occurrence budget. A zero
 	// MaxDomains disables the control.
 	mosaic authorized.MosaicBudget
+	// wrapApprovalStore is a test seam and nothing else: nil in every
+	// production path. It lets a test place a fault between the durable
+	// approval store and the approval service — a write that lands and then
+	// reports failure, which is what a crash between the approval's two
+	// compare-and-set writes looks like to the caller — while every other
+	// dependency stays the one this function composes.
+	wrapApprovalStore func(fleet.ApprovalStore) fleet.ApprovalStore
 }
 
 // openedService is the constructed workspace service together with what the
@@ -952,6 +972,7 @@ type openedService struct {
 	fleetDispatch webapi.FleetDispatchProvider
 	fleetEvents   webapi.FleetEventService
 	admission     webapi.AdmissionProvider
+	approvals     webapi.FleetApprovalProvider
 	teamOverview  webapi.TeamOverviewProvider
 	client        *authorized.Client
 	backfilled    int
@@ -1172,6 +1193,54 @@ func openService(
 			embedded.Close()
 			return closed, err
 		}
+		// Held requests (#451). The approval rows share the dispatch table
+		// under their own prefix; the recorder is the same interaction
+		// recorder the action audits use, attributing each transition to
+		// the principal that made it rather than to the requester.
+		var approvalStore fleet.ApprovalStore
+		approvalStore, err = explorerfleet.NewApprovalStore(
+			embedded.Runtime, nil)
+		if err != nil {
+			store.Close()
+			embedded.Close()
+			return closed, err
+		}
+		if config.wrapApprovalStore != nil {
+			approvalStore = config.wrapApprovalStore(approvalStore)
+		}
+		approvalRecorder, err := explorerfleet.NewApprovalRecorder(
+			interactionRecorder, snapshots)
+		if err != nil {
+			store.Close()
+			embedded.Close()
+			return closed, err
+		}
+		approvalService, err := fleet.NewApprovalService(fleet.ApprovalConfig{
+			Dispatch: fleetDispatch, Store: approvalStore,
+			Recorder: approvalRecorder,
+			// Workspace settings are the one narrowing this host applies.
+			// The approval service refuses an approver whose decision went
+			// through one, on every approver path.
+			Narrowed: func(ctx context.Context) bool {
+				_, narrowed := webapi.EffectiveWorkspaceSettings(ctx)
+				return narrowed
+			},
+			// The same current-policy authority the authorized client and
+			// workspace settings use.
+			Generations: generationReader,
+		})
+		if err != nil {
+			store.Close()
+			embedded.Close()
+			return closed, err
+		}
+		boundApprovalService, err := newBoundApproval(
+			approvalService, config.resolver)
+		if err != nil {
+			store.Close()
+			embedded.Close()
+			return closed, err
+		}
 		// The development-only backfill migrates a corpus whose documents were
 		// ingested before the policy catalog was durable: their authorization
 		// registrations are absent until re-registered once. A failure here is
@@ -1236,6 +1305,7 @@ func openService(
 			fleetDispatch: boundFleetDispatch,
 			fleetEvents:   fleetEvents,
 			admission:     boundAdmissionService,
+			approvals:     boundApprovalService,
 			teamOverview:  teamOverview,
 			client:        client,
 			backfilled:    backfilled,

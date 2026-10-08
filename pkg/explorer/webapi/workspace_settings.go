@@ -379,6 +379,23 @@ func workspaceOperationForRequest(
 			path == "/api/v1/admission/report" ||
 			path == "/api/v1/admission/outstanding"):
 		return auth.OperationInvoke, true
+	// Approvals (#451). Requesting, and reading a request back, is the
+	// requester's dispatch authority; deciding and listing what is decidable
+	// is the approver's. The bound approval service refuses a decision made
+	// under workspace settings, because a workspace narrowing could otherwise
+	// shed the dispatch an approver holds and pass the separation check it is
+	// there to fail — so a decide route listed here resolves the workspace and
+	// is then refused, rather than being refused as unregistered.
+	case method == http.MethodPost &&
+		(path == "/api/v1/fleet/approvals/request" ||
+			(strings.HasPrefix(path, "/api/v1/fleet/approvals/") &&
+				strings.HasSuffix(path, "/status"))):
+		return auth.OperationDispatch, true
+	case method == http.MethodPost &&
+		(path == "/api/v1/fleet/approvals/pending" ||
+			(strings.HasPrefix(path, "/api/v1/fleet/approvals/") &&
+				strings.HasSuffix(path, "/decide"))):
+		return auth.OperationActionApprove, true
 	case method == http.MethodPost &&
 		path == "/api/v1/fleet/events/subscriptions":
 		return auth.OperationSubscriptionCreate, true
@@ -658,6 +675,10 @@ func requestMayCommit(method, path string) bool {
 		// on /report it invites re-reporting an egress that already happened.
 		"/api/v1/admission/request",
 		"/api/v1/admission/report",
+		// A request may write the held record or materialize the action,
+		// so a lost response must read as indeterminate rather than as
+		// nothing having happened.
+		"/api/v1/fleet/approvals/request",
 		"/api/v1/fleet/events/subscriptions",
 		"/api/v1/fleet/events/publish":
 		return true
@@ -670,6 +691,9 @@ func requestMayCommit(method, path string) bool {
 			(strings.HasPrefix(path, "/api/v1/fleet/actions/") &&
 				(strings.HasSuffix(path, "/claim") ||
 					strings.HasSuffix(path, "/complete") ||
-					strings.HasSuffix(path, "/cancel")))
+					strings.HasSuffix(path, "/cancel"))) ||
+			// A decision commits; pending and status only read.
+			(strings.HasPrefix(path, "/api/v1/fleet/approvals/") &&
+				strings.HasSuffix(path, "/decide"))
 	}
 }
