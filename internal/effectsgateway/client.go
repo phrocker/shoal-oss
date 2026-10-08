@@ -28,6 +28,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"reflect"
 	"strings"
 	"time"
 
@@ -361,6 +362,7 @@ func (d Descriptor) Actions(capability string) ([]DescriptorAction, bool) {
 		for i, action := range declared.Actions {
 			actions[i] = DescriptorAction{
 				Name: action.Name, Effects: action.Effects,
+				InputSchema:  action.InputSchema,
 				OutputSchema: action.OutputSchema,
 			}
 		}
@@ -527,23 +529,29 @@ type Completion struct {
 // gateway is the first executor that is not trusted, and an evidence anchor is
 // a claim about the corpus it never read.
 //
-// A completion answered 400 or 500 is confirmed with one replay of the
-// identical body. That is not a retry policy; it is how the wire on main
-// reports a recorded outcome that is not a clean success. CompleteClaim
-// returns the stored record together with a non-nil error both for a reported
-// failure ("remote executor reported failure", HTTP 500) and for a success
-// whose output the explorer rejects (recorded as failed with
-// invalid_executor_output, HTTP 400), and the transport answers any error with
-// an error status. So a terminal record that was durably written arrives
-// indistinguishable from a refusal that wrote nothing. The replay branch keys
-// on (claim ID, version+1) and returns the committed record with 200, so
-// resending the same body settles which it was without being able to write
-// anything the first request did not.
+// A lost response is recovered by resending the identical body once: on a
+// transport error, or on 503 with Shoal-Commit-Outcome: indeterminate, the
+// report may have committed, and the completion route's replay branch answers
+// a resend with the committed record. That recovery is permanent.
 //
-// When the confirmed record is terminal under this claim but in a different
-// state from the one reported, Complete returns that record together with a
-// DispatchRecordedOtherwise error: the record is final, and the caller must
-// not report again.
+// If the resend's answer is itself lost — a transport error or another
+// indeterminate 503 — Complete returns DispatchIndeterminate. It never
+// returns the first attempt's status after a resend: that status describes a
+// request whose outcome the resend was sent to learn, and reporting it would
+// turn "possibly committed" into a definite refusal.
+//
+// The 400 and 500 triggers are a workaround for #492, to be removed when it
+// lands. On main, CompleteClaim returns the committed record together with an
+// error for a reported failure ("remote executor reported failure") and for a
+// success whose output the explorer refuses (recorded as failed,
+// invalid_executor_output), and the /complete handler discards the record and
+// answers 500 and 400 respectively — a terminal record that was durably
+// written, indistinguishable from a refusal that wrote nothing.
+//
+// When the committed record is terminal under this claim but differs from
+// what was reported — state, error code, or output — Complete returns it
+// together with DispatchRecordedOtherwise: the record is final, and the
+// caller must not report again. That check is permanent.
 func (c *DispatchClient) Complete(ctx context.Context, actionID []byte, completion Completion) (Action, error) {
 	const op = "complete"
 	if err := checkActionID(op, actionID); err != nil {
@@ -585,12 +593,13 @@ func (c *DispatchClient) Complete(ctx context.Context, actionID []byte, completi
 	path := actionPath(actionID, "complete")
 	var response actionWire
 	_, _, err = c.post(ctx, op, path, body, &response)
-	var dispatchErr *DispatchError
-	if errors.As(err, &dispatchErr) && (dispatchErr.Status == http.StatusInternalServerError ||
-		dispatchErr.Status == http.StatusBadRequest) {
+	if completionNeedsResend(err) {
 		response = actionWire{}
-		if _, _, replayErr := c.post(ctx, op, path, body, &response); replayErr == nil {
-			err = nil
+		_, _, err = c.post(ctx, op, path, body, &response)
+		if responseLost(err) {
+			return Action{}, &DispatchError{Op: op, Kind: DispatchIndeterminate,
+				reason: "the report may have committed and the resend could not confirm it",
+				cause:  err}
 		}
 	}
 	if err != nil {
@@ -600,20 +609,62 @@ func (c *DispatchClient) Complete(ctx context.Context, actionID []byte, completi
 	if err != nil {
 		return Action{}, &DispatchError{Op: op, Kind: DispatchProtocol, reason: err.Error()}
 	}
+	// The version is not compared for equality with ExpectedVersion+1: what
+	// authorizes a completion is holding the claim, and a record may carry
+	// versions written by reports the claim holder made (#484). It must only
+	// have moved past the version reported against.
 	if !bytes.Equal(action.ID, actionID) || !bytes.Equal(action.ClaimID, completion.ClaimID) ||
-		action.Version != completion.ExpectedVersion+1 ||
+		action.Version <= completion.ExpectedVersion ||
 		(action.State != fleet.DispatchSucceeded && action.State != fleet.DispatchFailed) {
 		return Action{}, &DispatchError{Op: op, Kind: DispatchProtocol,
 			reason: "completion response does not describe this claim's terminal record"}
 	}
-	want := fleet.DispatchSucceeded
-	if completion.Failed {
-		want = fleet.DispatchFailed
-	}
-	if action.State != want {
+	if !recordedAsReported(action, completion) {
 		return action, &DispatchError{Op: op, Kind: DispatchRecordedOtherwise}
 	}
 	return action, nil
+}
+
+// completionNeedsResend says whether a first completion attempt's answer
+// leaves the outcome unknown.
+func completionNeedsResend(err error) bool {
+	if err == nil {
+		return false
+	}
+	if responseLost(err) {
+		return true
+	}
+	// Workaround for #492; remove when the /complete handler returns the
+	// committed record it is given alongside an error.
+	var dispatchErr *DispatchError
+	return errors.As(err, &dispatchErr) &&
+		(dispatchErr.Status == http.StatusInternalServerError ||
+			dispatchErr.Status == http.StatusBadRequest)
+}
+
+// responseLost is a transport failure or an indeterminate commit: the request
+// may have been applied and its answer did not arrive.
+func responseLost(err error) bool {
+	kind := DispatchKind(err)
+	return kind == DispatchTransport || kind == DispatchIndeterminate
+}
+
+// recordedAsReported compares the committed record with the report: state,
+// error code, and for a success the output, compared as JSON values because
+// the explorer canonicalizes what it stores.
+func recordedAsReported(action Action, completion Completion) bool {
+	if completion.Failed {
+		return action.State == fleet.DispatchFailed && action.ErrorCode == completion.ErrorCode
+	}
+	if action.State != fleet.DispatchSucceeded || action.ErrorCode != "" {
+		return false
+	}
+	var recorded, reported any
+	if json.Unmarshal(action.Output, &recorded) != nil ||
+		json.Unmarshal(completion.Output, &reported) != nil {
+		return false
+	}
+	return reflect.DeepEqual(recorded, reported)
 }
 
 // Resolve reads the gateway's own descriptor, once at startup.

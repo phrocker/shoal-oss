@@ -41,12 +41,20 @@ func TestCheckAddress(t *testing.T) {
 		// The same destinations in IPv6 clothing.
 		"::ffff:169.254.169.254", "64:ff9b::a9fe:a9fe", "64:ff9b:1::a9fe:a9fe",
 		"2002:a9fe:a9fe::1",
+		// Zoned forms: netip.Prefix.Contains is false for any zoned address,
+		// so these passed every prefix check before the zone was stripped.
+		"64:ff9b::a9fe:a9fe%eth0", "2002:a9fe:a9fe::1%eth0", "fd00:ec2::254%eth0",
+		"fe80::1%eth0", "::ffff:169.254.169.254%eth0",
+		// RFC 8215 local-use NAT64: the embedding depends on an operator-
+		// chosen prefix length, so the whole /48 is refused.
+		"64:ff9b:1::1", "64:ff9b:1:a9fe:a9fe::", "64:ff9b:1:ffff::0808:0808",
 	}
 	private := []string{
 		"127.0.0.1", "127.255.0.1", "::1", "10.1.2.3", "172.16.0.1",
 		"172.31.255.255", "192.168.1.1", "fc00::1", "fd12:3456::1",
 		"100.64.0.1", "100.127.255.254", "198.18.0.1",
 		"::ffff:127.0.0.1", "::ffff:10.0.0.1", "64:ff9b::7f00:1", "2002:0a00:0001::1",
+		"fd12:3456::1%eth0", "::1%lo",
 	}
 	public := []string{"8.8.8.8", "1.1.1.1", "2606:4700:4700::1111", "172.32.0.1", "100.128.0.1"}
 

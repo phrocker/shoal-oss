@@ -87,8 +87,18 @@ func TestParseRoutesRefusals(t *testing.T) {
 		{"not JSON", `[`, "not valid JSON"},
 		{"an object, not an array", `{"action":"charge"}`, "JSON array"},
 		{"empty table", `[]`, "at least one route"},
-		{"trailing data", `[` + route(nil) + `] []`, "exactly one"},
-		{"unknown field", `[` + route(map[string]any{"timeout": 5}) + `]`, "unknown field"},
+		{"trailing data", `[` + route(nil) + `] []`, "JSON array"},
+		{"unknown field", `[` + route(map[string]any{"timeout": 5}) + `]`, "spelled exactly"},
+		// encoding/json folds case (and Unicode: ſ folds to s) when matching
+		// fields, so each of these decoded with the second spelling winning.
+		{"case-folded method", `[{"action":"charge","method":"GET","METHOD":"POST","path":"/v1/c","effects":` + remoteEffectsJSON + `,"idempotency":"key"}]`, "spelled exactly"},
+		{"case-folded idempotency", `[{"action":"charge","method":"POST","path":"/v1/c","effects":` + remoteEffectsJSON + `,"idempotency":"key","Idempotency":"unprotected"}]`, "spelled exactly"},
+		{"capitalized field alone", `[{"Action":"charge","method":"POST","path":"/v1/c","effects":` + remoteEffectsJSON + `,"idempotency":"key"}]`, "spelled exactly"},
+		{"unicode-folded field", `[{"action":"charge","method":"POST","path":"/v1/c","effects":` + remoteEffectsJSON + `,"idempotency":"key","effectſ":["external"]}]`, "spelled exactly"},
+		{"case-folded conflict field", `[` + route(map[string]any{"conflict": map[string]any{"status": []int{400}, "pointer": "/a", "equals": []string{"x"}, "Equals": []string{"y"}}}) + `]`, "spelled exactly"},
+		{"unicode-folded conflict field", `[` + route(map[string]any{"conflict": map[string]any{"ſtatus": []int{400}, "pointer": "/a", "equals": []string{"x"}}}) + `]`, "spelled exactly"},
+		{"case-folded reference field", `[` + route(map[string]any{"reference": map[string]any{"pointer": "/id", "Pattern": "x", "pattern": "y"}}) + `]`, "spelled exactly"},
+		{"status-only conflict", `[` + route(map[string]any{"conflict": map[string]any{"status": []int{409}}}) + `]`, "pointer and equals are required"},
 		{"duplicate key", `[{"action":"charge","method":"GET","method":"POST","path":"/v1/c","effects":` + remoteEffectsJSON + `,"idempotency":"key"}]`, "repeats a key"},
 		{"duplicate action", `[` + route(nil) + `,` + route(nil) + `]`, "declared twice"},
 		{"action missing", `[` + route(map[string]any{"action": nil}) + `]`, "action is required"},
@@ -132,12 +142,12 @@ func TestParseRoutesRefusals(t *testing.T) {
 		{"conflict 2xx", `[` + route(map[string]any{"conflict": map[string]any{"status": []int{200}}}) + `]`, "400-599"},
 		{"conflict also retryable", `[` + route(map[string]any{"retryable": []int{409}, "conflict": map[string]any{"status": []int{409}}}) + `]`, "both a conflict and retryable"},
 		{"conflict status duplicated", `[` + route(map[string]any{"conflict": map[string]any{"status": []int{409, 409}}}) + `]`, "declared twice"},
-		{"conflict equals without pointer", `[` + route(map[string]any{"conflict": map[string]any{"status": []int{400}, "equals": []string{"x"}}}) + `]`, "equals requires a pointer"},
+		{"conflict equals without pointer", `[` + route(map[string]any{"conflict": map[string]any{"status": []int{400}, "equals": []string{"x"}}}) + `]`, "pointer and equals are required"},
 		{"conflict pointer without equals", `[` + route(map[string]any{"conflict": map[string]any{"status": []int{400}, "pointer": "/error/type"}}) + `]`, "at least one value"},
 		{"conflict pointer malformed", `[` + route(map[string]any{"conflict": map[string]any{"status": []int{400}, "pointer": "error/type", "equals": []string{"x"}}}) + `]`, "beginning with /"},
 		{"conflict pointer bad escape", `[` + route(map[string]any{"conflict": map[string]any{"status": []int{400}, "pointer": "/a~2", "equals": []string{"x"}}}) + `]`, "~ must be followed"},
 		{"conflict empty equals value", `[` + route(map[string]any{"conflict": map[string]any{"status": []int{400}, "pointer": "/a", "equals": []string{""}}}) + `]`, "must not be empty"},
-		{"conflict unknown field", `[` + route(map[string]any{"conflict": map[string]any{"status": []int{400}, "regex": "x"}}) + `]`, "unknown field"},
+		{"conflict unknown field", `[` + route(map[string]any{"conflict": map[string]any{"status": []int{400}, "regex": "x"}}) + `]`, "spelled exactly"},
 		{"reference both sources", `[` + route(map[string]any{"reference": map[string]any{"pointer": "/id", "header": "Location", "pattern": "x"}}) + `]`, "exactly one"},
 		{"reference neither source", `[` + route(map[string]any{"reference": map[string]any{"pattern": "x"}}) + `]`, "exactly one"},
 		{"reference without pattern", `[` + route(map[string]any{"reference": map[string]any{"pointer": "/id"}}) + `]`, "pattern is required"},
@@ -153,6 +163,22 @@ func TestParseRoutesRefusals(t *testing.T) {
 		if !strings.Contains(err.Error(), refused.cites) {
 			t.Errorf("%s: refused, but not by the rule under test: %v", refused.name, err)
 		}
+	}
+}
+
+// TestEncodingJSONFoldsFieldNames pins the premise the exact-key check exists
+// for. If encoding/json ever stops folding, the check is still right, but this
+// test says why it was needed.
+func TestEncodingJSONFoldsFieldNames(t *testing.T) {
+	var decoded struct {
+		Method string `json:"method"`
+		Status []int  `json:"status"`
+	}
+	if err := json.Unmarshal([]byte(`{"method":"GET","METHOD":"POST","ſtatus":[409]}`), &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded.Method != "POST" || len(decoded.Status) != 1 {
+		t.Fatalf("encoding/json no longer folds field names: %#v", decoded)
 	}
 }
 
@@ -380,6 +406,11 @@ func TestBindRefusesInputItCannotBindExactly(t *testing.T) {
 		{"undeclared query", `{"path":{"account":"a"},"query":{"debug":"1"}}`, key},
 		{"non-string query value", `{"path":{"account":"a"},"query":{"mode":["a","b"]}}`, key},
 		{"null body", `{"path":{"account":"a"},"body":null}`, key},
+		// Case-folded envelope keys: encoding/json would have decoded the
+		// second spelling into the field, sending a body nobody read as "body".
+		{"case-folded body", `{"path":{"account":"a"},"body":{"amount":1},"BODY":{"amount":1000}}`, key},
+		{"capitalized path", `{"Path":{"account":"a"}}`, key},
+		{"mixed-case body", `{"path":{"account":"a"},"bOdY":{"amount":1000}}`, key},
 	} {
 		_, err := binder.Bind(charge, json.RawMessage(refused.input), refused.key)
 		var inputErr *InputError
@@ -391,6 +422,26 @@ func TestBindRefusesInputItCannotBindExactly(t *testing.T) {
 		if strings.Contains(err.Error(), `"b"`) || strings.Contains(err.Error(), "debug") {
 			t.Errorf("%s: refusal repeats input: %v", refused.name, err)
 		}
+	}
+}
+
+func TestBindRefusesABodyOnDelete(t *testing.T) {
+	table := mustParseRoutes(t, bindTable)
+	binder := mustBinder(t, "https://api.example.com")
+	remove := mustRoute(t, table, "remove")
+	_, err := binder.Bind(remove, json.RawMessage(`{"path":{"id":"7"},"body":{"cascade":true}}`), ExecutorKey{})
+	var inputErr *InputError
+	if !errors.As(err, &inputErr) {
+		t.Fatalf("a DELETE body = %v; InputSchema admits none, so the binder must not send one", err)
+	}
+}
+
+func TestBindRefusalsCarryNoParserText(t *testing.T) {
+	table := mustParseRoutes(t, bindTable)
+	binder := mustBinder(t, "https://api.example.com")
+	_, err := binder.Bind(mustRoute(t, table, "charge"), json.RawMessage(`{"path":{"account":"sekrit`), testKey(t))
+	if err == nil || strings.Contains(err.Error(), "sekrit") || strings.Contains(err.Error(), "unexpected") {
+		t.Fatalf("refusal = %v", err)
 	}
 }
 
@@ -420,6 +471,7 @@ func TestVerifyDescriptor(t *testing.T) {
 		for _, name := range table.Actions() {
 			actions = append(actions, DescriptorAction{
 				Name: name, Effects: fleet.Effects{fleet.EffectMutatesExternal, fleet.EffectEgressesContent},
+				InputSchema:  mustRoute(t, table, name).InputSchema(),
 				OutputSchema: OutputSchema(),
 			})
 		}
@@ -445,7 +497,7 @@ func TestVerifyDescriptor(t *testing.T) {
 	}{
 		{"route with no action", func(a []DescriptorAction) []DescriptorAction { return a[1:] }, "no registered action"},
 		{"action with no route", func(a []DescriptorAction) []DescriptorAction {
-			return append(a, DescriptorAction{Name: "extra", Effects: remoteEffects, OutputSchema: OutputSchema()})
+			return append(a, DescriptorAction{Name: "extra", Effects: remoteEffects, InputSchema: a[0].InputSchema, OutputSchema: OutputSchema()})
 		}, "registered with no route"},
 		{"duplicate action", func(a []DescriptorAction) []DescriptorAction { return append(a, a[0]) }, "twice"},
 		{"understated effects", func(a []DescriptorAction) []DescriptorAction {
@@ -457,6 +509,18 @@ func TestVerifyDescriptor(t *testing.T) {
 			a[0].OutputSchema = json.RawMessage(`{"type":"object"}`)
 			return a
 		}, "canonical closed schema"},
+		{"open input schema", func(a []DescriptorAction) []DescriptorAction {
+			a[0].InputSchema = json.RawMessage(`{"type":"object"}`)
+			return a
+		}, "input_schema"},
+		{"missing input schema", func(a []DescriptorAction) []DescriptorAction {
+			a[0].InputSchema = nil
+			return a
+		}, "input_schema"},
+		{"another route's input schema", func(a []DescriptorAction) []DescriptorAction {
+			a[0].InputSchema = a[1].InputSchema
+			return a
+		}, "input_schema"},
 		{"widened output schema", func(a []DescriptorAction) []DescriptorAction {
 			a[0].OutputSchema = json.RawMessage(strings.Replace(string(OutputSchema()),
 				`"additionalProperties":false`, `"additionalProperties":true`, 1))

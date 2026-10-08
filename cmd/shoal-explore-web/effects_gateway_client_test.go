@@ -461,17 +461,22 @@ func TestEffectsGatewayClientAgainstTheRealDispatchHandler(t *testing.T) {
 	}
 }
 
-// TestEffectsGatewayClientRecordsAFailureDespiteTheWire500 pins the wire
-// behaviour the client's failed-completion confirmation exists for, against
-// the real handler: a failure that is durably recorded is answered with HTTP
-// 500, and only a replay of the identical body says it was recorded.
+// TestEffectsGatewayClientRecordsAFailureDespiteTheWire500 drives a failed
+// completion through the real handler.
+//
+// CURRENT behaviour, not desired: on main a durably recorded failure is
+// answered with HTTP 500, because the /complete handler discards the
+// committed record CompleteClaim returns alongside its error (#492). The raw
+// assertion below pins that so it flips visibly when #492 lands — at which
+// point it should expect 2xx with the record, and the client's 400/500 resend
+// trigger should be removed. The client-level assertions hold either way.
 func TestEffectsGatewayClientRecordsAFailureDespiteTheWire500(t *testing.T) {
 	h := newGatewayHarness(t)
 	client := h.client()
 	ctx := context.Background()
 	const input = `{"path":{"account":"a"},"body":{"amount":1}}`
 
-	// The raw wire, first: a recorded failure is a 500.
+	// The raw wire, first. CURRENT behaviour (#492): a recorded failure is a 500.
 	h.enqueue("action-raw", input)
 	offered, _ := pulled(t, client, "action-raw")
 	rawClaim, _, _ := effectsgateway.NewClaimID("pod-0", nil)
@@ -494,8 +499,9 @@ func TestEffectsGatewayClientRecordsAFailureDespiteTheWire500(t *testing.T) {
 	path := "/api/v1/fleet/actions/" + base64.RawURLEncoding.EncodeToString(claimed.ID) + "/complete"
 	first := h.rawPost(path, failure)
 	if first.StatusCode != http.StatusInternalServerError {
-		t.Fatalf("a recorded failure answered %d (%s); if this changed, the "+
-			"client's confirmation replay may be removable", first.StatusCode, readAll(first))
+		t.Fatalf("a recorded failure answered %d (%s); if #492 has landed, "+
+			"expect 2xx here and remove the client's 400/500 resend trigger",
+			first.StatusCode, readAll(first))
 	}
 	first.Body.Close()
 	second := h.rawPost(path, failure)
@@ -563,9 +569,13 @@ func TestEffectsGatewayClientRecordsAFailureDespiteTheWire500(t *testing.T) {
 }
 
 // TestEffectsGatewayClientSurfacesAnOutcomeRecordedOtherwise: an output the
-// explorer refuses is recorded as failed and answered 400. The client must
-// not report that as a refusal that wrote nothing — the record is terminal —
-// and must not report it as the success it sent.
+// explorer refuses is recorded as failed. The client must not report that as
+// a refusal that wrote nothing — the record is terminal — and must not report
+// it as the success it sent.
+//
+// CURRENT behaviour (#492): main answers this 400 and the client recovers the
+// record by resending. After #492 the handler answers 2xx with the record;
+// recorded_otherwise is the permanent part and this test should keep passing.
 func TestEffectsGatewayClientSurfacesAnOutcomeRecordedOtherwise(t *testing.T) {
 	h := newGatewayHarness(t, fleet.Action{
 		Name:        "strict",

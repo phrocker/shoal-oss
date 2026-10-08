@@ -20,7 +20,10 @@ package effectsgateway
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/url"
 	"strings"
@@ -210,4 +213,150 @@ type countingTransport struct{ calls int }
 func (c *countingTransport) RoundTrip(*http.Request) (*http.Response, error) {
 	c.calls++
 	return nil, errors.New("no network in this test")
+}
+
+// scriptedTransport answers each request with the next scripted reply. The
+// completion recovery is about what the client does with a sequence of
+// answers, which the real handler cannot be made to produce on demand; the
+// wire shapes themselves are pinned against the real handler.
+type scriptedTransport struct {
+	replies []func() (*http.Response, error)
+	bodies  [][]byte
+}
+
+func (s *scriptedTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	body, _ := io.ReadAll(request.Body)
+	s.bodies = append(s.bodies, body)
+	if len(s.replies) == 0 {
+		return nil, errors.New("script exhausted")
+	}
+	next := s.replies[0]
+	s.replies = s.replies[1:]
+	return next()
+}
+
+func reply(status int, body string, header ...string) func() (*http.Response, error) {
+	return func() (*http.Response, error) {
+		h := http.Header{"Content-Type": {"application/json"}}
+		for i := 0; i+1 < len(header); i += 2 {
+			h.Set(header[i], header[i+1])
+		}
+		return &http.Response{StatusCode: status, Header: h,
+			Body: io.NopCloser(strings.NewReader(body))}, nil
+	}
+}
+
+func lost() (*http.Response, error) { return nil, io.ErrUnexpectedEOF }
+
+var indeterminate = []string{"Shoal-Commit-Outcome", "indeterminate"}
+
+func committed(t *testing.T, version uint64, state fleet.DispatchState, code, output string) string {
+	t.Helper()
+	record := map[string]any{
+		"id": base64.RawURLEncoding.EncodeToString([]byte("action")), "version": version,
+		"state": state, "agent_id": "", "claim_id": base64.RawURLEncoding.EncodeToString([]byte("claim")),
+		"effect_possible": true,
+	}
+	if code != "" {
+		record["error_code"] = code
+	}
+	if output != "" {
+		record["output"] = json.RawMessage(output)
+	}
+	encoded, err := json.Marshal(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(encoded)
+}
+
+func TestCompleteRecoversOnlyWhatTheResendConfirms(t *testing.T) {
+	failure := Completion{ExpectedVersion: 2, ClaimID: []byte("claim"), Failed: true,
+		ErrorCode: TargetRejected(422)}
+	success := Completion{ExpectedVersion: 2, ClaimID: []byte("claim"),
+		Output: json.RawMessage(`{"status":200,"idempotency":"key","reference":"ch_1"}`)}
+	failedRecord := committed(t, 3, fleet.DispatchFailed, "target_rejected_422", "")
+	successRecord := committed(t, 3, fleet.DispatchSucceeded, "", `{"idempotency":"key","reference":"ch_1","status":200}`)
+	for _, row := range []struct {
+		name       string
+		completion Completion
+		replies    []func() (*http.Response, error)
+		kind       DispatchErrorKind
+		calls      int
+	}{
+		{"clean success", success, []func() (*http.Response, error){reply(200, successRecord)}, "", 1},
+		{"stored output re-encoded is the same output", success,
+			[]func() (*http.Response, error){reply(200, successRecord)}, "", 1},
+		// The defect: the resend's lost answer was replaced by the first
+		// attempt's 500, a definite-looking status for a report that may
+		// have committed.
+		{"500 then indeterminate 503", failure,
+			[]func() (*http.Response, error){reply(500, `{"code":"internal"}`), reply(503, `{}`, indeterminate...)},
+			DispatchIndeterminate, 2},
+		{"500 then transport loss", failure,
+			[]func() (*http.Response, error){reply(500, `{}`), lost}, DispatchIndeterminate, 2},
+		{"400 then indeterminate 503", success,
+			[]func() (*http.Response, error){reply(400, `{}`), reply(503, `{}`, indeterminate...)},
+			DispatchIndeterminate, 2},
+		{"#492 workaround: 500 then the recorded failure", failure,
+			[]func() (*http.Response, error){reply(500, `{}`), reply(200, failedRecord)}, "", 2},
+		{"lost response then the committed record", success,
+			[]func() (*http.Response, error){lost, reply(200, successRecord)}, "", 2},
+		{"indeterminate then the committed record", failure,
+			[]func() (*http.Response, error){reply(503, `{}`, indeterminate...), reply(200, failedRecord)}, "", 2},
+		{"lost twice", success, []func() (*http.Response, error){lost, lost}, DispatchIndeterminate, 2},
+		{"indeterminate twice", success,
+			[]func() (*http.Response, error){reply(503, `{}`, indeterminate...), reply(503, `{}`, indeterminate...)},
+			DispatchIndeterminate, 2},
+		// The resend's own definite answer describes the record now.
+		{"lost then conflict", success,
+			[]func() (*http.Response, error){lost, reply(409, `{"code":"conflict"}`)}, DispatchConflict, 2},
+		{"500 then 500", failure,
+			[]func() (*http.Response, error){reply(500, `{}`), reply(500, `{}`)}, DispatchStatus, 2},
+		// Not a lost response: nothing is resent.
+		{"plain 503", success, []func() (*http.Response, error){reply(503, `{}`)}, DispatchUnavailable, 1},
+		{"404", success, []func() (*http.Response, error){reply(404, `{}`)}, DispatchNotFound, 1},
+		// Recorded otherwise: every reported field is compared.
+		{"failure recorded with another code", failure,
+			[]func() (*http.Response, error){reply(200, committed(t, 3, fleet.DispatchFailed, "outcome_unknown", ""))},
+			DispatchRecordedOtherwise, 1},
+		{"success recorded with other output", success,
+			[]func() (*http.Response, error){reply(200, committed(t, 3, fleet.DispatchSucceeded, "", `{"status":200,"idempotency":"key"}`))},
+			DispatchRecordedOtherwise, 1},
+		{"success recorded as failed", success,
+			[]func() (*http.Response, error){reply(400, `{}`), reply(200, committed(t, 3, fleet.DispatchFailed, "invalid_executor_output", ""))},
+			DispatchRecordedOtherwise, 2},
+		// Versions written by the claim holder's own reports are tolerated.
+		{"version drift past the report", failure,
+			[]func() (*http.Response, error){reply(200, committed(t, 5, fleet.DispatchFailed, "target_rejected_422", ""))}, "", 1},
+		{"version not past the report", failure,
+			[]func() (*http.Response, error){reply(200, committed(t, 2, fleet.DispatchFailed, "target_rejected_422", ""))},
+			DispatchProtocol, 1},
+	} {
+		transport := &scriptedTransport{replies: row.replies}
+		base, _ := url.Parse("https://explorer.invalid")
+		client, err := NewDispatchClient(base, &http.Client{Transport: transport},
+			func() (string, error) { return "token", nil }, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		completion := row.completion
+		completion.Context = RequestContext{RequestID: []byte("r"), ReasonCode: "gateway_complete",
+			Deadline: time.Now().Add(time.Minute)}
+		action, err := client.Complete(context.Background(), []byte("action"), completion)
+		if DispatchKind(err) != row.kind {
+			t.Errorf("%s: %v (kind %q), want kind %q", row.name, err, DispatchKind(err), row.kind)
+		}
+		if len(transport.bodies) != row.calls {
+			t.Errorf("%s: %d requests, want %d", row.name, len(transport.bodies), row.calls)
+		}
+		for i := 1; i < len(transport.bodies); i++ {
+			if !bytes.Equal(transport.bodies[i], transport.bodies[0]) {
+				t.Errorf("%s: the resend was not the identical body", row.name)
+			}
+		}
+		if row.kind == DispatchRecordedOtherwise && action.State == "" {
+			t.Errorf("%s: recorded_otherwise without the committed record", row.name)
+		}
+	}
 }

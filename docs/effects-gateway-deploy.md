@@ -18,7 +18,7 @@ it among the three gateways.
 |---|---|---|
 | **#480** | the lifecycle auditor, action recorder and reconciler refuse `OperationExecute`, so the grant cannot be turned on | a worker claims work it did not enqueue; until a principal can hold `OperationExecute` on one descriptor's scope, the only claimant is the enqueuer |
 | **#430** | claim renewal (`POST actions/{id}/extend`) | without it the fenced window is the claim lease, at most five minutes; `-renew` is parsed and refused |
-| **#484** | the lost-fence ambiguity route (`POST actions/{id}/ambiguity`) | a worker whose claim lapsed mid-effect has nowhere to record what it attempted; it also needs a way to learn the current `expected_version` after a lapse |
+| **#484** | the lost-fence ambiguity route (`POST actions/{id}/ambiguity`) | a worker whose claim lapsed mid-effect has nowhere to record what it attempted |
 | **#486** | a heartbeat moves the descriptor generation, so `/complete` and `/ambiguity` answer 404 after one heartbeat | until fixed, the gateway must never register or heartbeat while holding claims |
 
 The dispatch client has no `extend` or `ambiguity` method on purpose: a method
@@ -121,13 +121,16 @@ never performed.
     "path": "/v1/items/{id}",
     "effects": ["external", "egresses-content"],
     "idempotency": "natural",
-    "conflict": {"status": [404, 410]}
+    "conflict": {"status": [404], "pointer": "/error/code", "equals": ["resource_missing"]}
   }
 ]
 ```
 
 Decoding is strict: unknown fields, duplicate keys, trailing data and an empty
 table are refused, and every refusal names the route by index and action.
+Field names must be spelled exactly. `encoding/json` matches fields
+case-insensitively, with Unicode folding (`ſ` folds to `s`), so without this
+`{"method":"GET","METHOD":"POST"}` would decode as POST while reading as GET.
 
 - **Methods.** POST, PUT, PATCH, DELETE. GET, HEAD and OPTIONS are refused: a
   read performs no effect.
@@ -143,12 +146,17 @@ table are refused, and every refusal names the route by index and action.
   anything else. Over-declaring egress is not the safe direction — the effect
   floor refuses only understatement, so an overstated set is silently denied by
   a policy forbidding egress.
-- **Conflict** is allowed on `key` and `natural` routes. Use a status-only rule
-  only where the status cannot mean anything but "this already happened": some
-  providers answer a *concurrent* request with the same key with 409 while the
-  first is still in flight, and that 409 must be `retryable`, not a conflict.
-  For a natural DELETE, declaring 404 (or 410) as a conflict is what makes a
-  replayed delete succeed instead of failing.
+- **Conflict** is allowed on `key` and `natural` routes, and always needs
+  `status`, `pointer` **and** `equals`; a status-only rule is refused. The
+  commonest same-key conflict on a byte-identical retry means "the original is
+  still in flight" (409 `idempotency_key_in_use` and its relatives), and it
+  arrives exactly on the written → timeout → retry path. Reading it as success
+  records an effect that may yet fail. **In-progress codes must be configured
+  `retryable`, never `conflict`;** only a body value that means "this exact
+  request already succeeded" belongs in `equals`. For a natural DELETE, a
+  conflict on 404 needs the target's not-found marker in the body; a target
+  whose 404 carries none cannot have a replayed delete recognised, and it is
+  recorded as `target_rejected_404`.
 - **Reference** is a target-side identifier copied into the record. Exactly
   one of `pointer` or `header`; the pattern is anchored by the gateway and must
   not match the empty string; a value over 256 bytes is dropped.
@@ -159,8 +167,9 @@ table are refused, and every refusal names the route by index and action.
 {"path": {"account": "acct_1"}, "query": {"expand": "balance"}, "body": {"amount": 100}}
 ```
 
-Closed: no other top-level field, path and query values are strings, every
-template parameter is present and no undeclared one is. `Route.InputSchema()`
+Closed: no other top-level field, each spelled exactly; path and query values
+are strings; every template parameter is present and no undeclared one is; a
+DELETE route takes no body. `Route.InputSchema()`
 renders this as the action's `input_schema`, so the explorer refuses a malformed
 input at enqueue rather than after a claim.
 
@@ -177,9 +186,12 @@ happened. The credential is attached per request, outside the binder.
 ### Startup check
 
 `VerifyDescriptor` compares the resolved descriptor with the table: actions and
-routes one to one, each action's effects equal to its route's, and each
-`output_schema` equal to the canonical closed schema (`OutputSchema()`). Any
-mismatch fails closed.
+routes one to one, each action's effects equal to its route's, each
+`input_schema` equal to the route's `InputSchema()`, and each `output_schema`
+equal to the canonical closed schema (`OutputSchema()`). Any mismatch fails
+closed. The input-schema check matters because the explorer enforces it at
+enqueue: a looser one lets work be queued and claimed — setting
+`EffectPossible` — before the binder refuses it.
 
 ## Classification
 
@@ -190,7 +202,7 @@ mismatch fails closed.
 | not written (DNS, dial, TLS, egress refused) | retry | retry |
 | 2xx | success | success |
 | 2xx with `Idempotent-Replayed: true` | success, `replayed` (key only) | success |
-| configured conflict, confirmed | success, `conflict` | refused at config |
+| configured conflict: status and body value both match | success, `conflict` | refused at config |
 | conflict status, body unreadable or oversize | `failed/outcome_unknown` | refused at config |
 | configured retryable status | retry, same bytes, honouring `Retry-After` seconds | `failed/outcome_unknown` |
 | written, then error, timeout or reset | retry, same bytes | `failed/outcome_unknown` |
@@ -241,7 +253,11 @@ check and connect. Every resolved address must pass, not merely one.
 
 Always refused: `0.0.0.0/8`, `169.254.0.0/16`, `fe80::/10`, `fd00:ec2::254`,
 `100.100.100.200`, `168.63.129.16`, `192.0.0.192`, multicast, reserved and
-unspecified addresses, and the same addresses embedded in NAT64 or 6to4 form.
+unspecified addresses, and the same addresses embedded in NAT64 (`64:ff9b::/96`)
+or 6to4 form. The RFC 8215 local-use NAT64 prefix `64:ff9b:1::/48` is refused
+outright, because its embedding depends on a prefix length this code cannot
+know. A zone (`%eth0`) is stripped before any check: no prefix contains a
+zoned address.
 Refused unless `-target-allow-private`: loopback, RFC 1918, RFC 4193,
 `100.64.0.0/10` and `198.18.0.0/15`.
 
@@ -249,22 +265,33 @@ No proxy from the environment, no cookie jar, no redirects, no compression.
 The explorer client is a separate client with a separate transport, and shares
 the no-proxy, no-jar and no-redirect rules.
 
-## Dispatch wire, as found on main
+## Completion: lost responses, and the wire as found on main
 
-Two behaviours of the completion route that a worker must handle, both pinned
-by the real-handler tests:
+**Lost response (permanent).** On a transport error, or a 503 with
+`Shoal-Commit-Outcome: indeterminate`, the report may have committed. The
+client resends the identical body once; the completion route's replay branch
+answers it with the committed record. If the resend's answer is lost too, the
+client returns `indeterminate` — never the first attempt's status, which
+describes a request whose outcome the resend was sent to learn. A definite
+answer to the resend (409, 404, …) is returned as it is.
 
-- **A recorded failure is answered with HTTP 500.** `CompleteClaim` returns the
-  stored record together with a "remote executor reported failure" error, and
-  the transport turns any error into an error status.
-- **A success whose output the explorer refuses is recorded as failed
-  (`invalid_executor_output`) and answered with HTTP 400.**
+**Recorded otherwise (permanent).** The committed record is compared with the
+report — state, error code, and for a success the output as a JSON value. Any
+difference returns the record with a `recorded_otherwise` error: the record is
+final and must not be reported again. The version is only required to have
+moved past the one reported against; it is not compared for equality.
 
-In both cases the record is terminal and the response says otherwise. The
-client confirms any 400 or 500 completion with one replay of the identical
-body, which the replay branch answers with the committed record; a terminal
-record in a different state from the one reported comes back with a
-`recorded_otherwise` error, and must not be reported again.
+**#492 workaround (temporary).** Two behaviours of the completion route on
+main, pinned as *current* behaviour by the real-handler tests:
+
+- a durably recorded failure is answered HTTP 500;
+- a success whose output the explorer refuses is recorded as failed
+  (`invalid_executor_output`) and answered HTTP 400.
+
+Both come from the `/complete` handler discarding the committed record
+`CompleteClaim` returns alongside an error (#492). Until that is fixed the
+client also resends after a 400 or 500, with the same rule for a lost resend.
+When #492 lands the two pins flip to 2xx and the 400/500 trigger is removed.
 
 `not-found` from `Claim` means re-pull, never "gone": the loser of a claim race
 is told not-found deliberately.
@@ -302,5 +329,11 @@ another fails if a field is added to the log record outside the policy.
   The renewal arithmetic is implemented and tested.
 - **The send gate without renewal** requires `leaseLocal − now ≥ T + 5s`; the
   design states only the renewing form (`≥ renewAfter`).
-- **The completion confirmation replay** on 400 and 500 is not in the design;
-  it answers the two wire behaviours above.
+- **Conflict rules need a body value.** The design allows "status + optional
+  JSON pointer value"; a status-only rule is refused, because the commonest
+  same-key conflict on a retry means "still in flight".
+- **Field names must be spelled exactly**, in the route table and the action's
+  input, and the startup check also compares `input_schema`.
+- **A DELETE route takes no body**, matching its `InputSchema()`.
+- **The completion resend** recovers a lost response (permanent) and, until
+  #492, a 400 or 500; a lost resend is `indeterminate`. Not in the design.

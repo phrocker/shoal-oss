@@ -223,6 +223,9 @@ func ParseRoutes(raw []byte, derived fleet.Effects) (*RouteTable, error) {
 	if err := rejectDuplicateKeys(raw); err != nil {
 		return nil, fmt.Errorf("-routes: %w", err)
 	}
+	if err := exactRouteKeys(raw); err != nil {
+		return nil, err
+	}
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.DisallowUnknownFields()
 	var wires []routeWire
@@ -402,10 +405,14 @@ func (w *conflictWire) validate(retryable map[int]struct{}) (*conflictRule, erro
 		rule.status[status] = struct{}{}
 	}
 	if w.Pointer == "" {
-		if len(w.Equals) != 0 {
-			return nil, errors.New("equals requires a pointer")
-		}
-		return rule, nil
+		// A status alone is not evidence the effect happened. The commonest
+		// same-key conflict on a byte-identical retry is "the original is
+		// still in flight" (409 idempotency_key_in_use and its relatives),
+		// which arrives exactly on written → timeout → retry and means the
+		// outcome is not yet known. Reading it as success records an effect
+		// that may yet fail. So the body must name the conflict.
+		return nil, errors.New("pointer and equals are required: a status " +
+			"alone cannot tell \"already done\" from \"still in flight\"")
 	}
 	if err := validatePointer(w.Pointer); err != nil {
 		return nil, fmt.Errorf("pointer: %w", err)
@@ -608,7 +615,12 @@ func (b *Binder) Bind(route *Route, input json.RawMessage, key ExecutorKey) (Bou
 		}
 	}
 	if err := rejectDuplicateKeys(input); err != nil {
-		return BoundRequest{}, inputError("%s", err.Error())
+		return BoundRequest{}, inputError("input must be one JSON object " +
+			"with no repeated key")
+	}
+	if err := exactKeys(input, inputFields); err != nil {
+		return BoundRequest{}, inputError("input must be an object whose " +
+			"only fields are path, query and body, spelled exactly")
 	}
 	decoder := json.NewDecoder(bytes.NewReader(input))
 	decoder.DisallowUnknownFields()
@@ -675,6 +687,11 @@ func (b *Binder) Bind(route *Route, input json.RawMessage, key ExecutorKey) (Bou
 	header.Set("User-Agent", UserAgent)
 	header.Set("Accept", "application/json")
 	var body []byte
+	if wire.Body != nil && route.method == http.MethodDelete {
+		// InputSchema admits no body for a DELETE, and the binder agrees with
+		// it: a body the registered schema says cannot exist is not sent.
+		return BoundRequest{}, inputError("a DELETE route sends no body")
+	}
 	if wire.Body != nil {
 		if bytes.Equal(bytes.TrimSpace(wire.Body), []byte("null")) {
 			return BoundRequest{}, inputError("body must not be null; omit it " +
@@ -754,13 +771,14 @@ func (r *Route) InputSchema() json.RawMessage {
 type DescriptorAction struct {
 	Name         string
 	Effects      fleet.Effects
+	InputSchema  json.RawMessage
 	OutputSchema json.RawMessage
 }
 
 // VerifyDescriptor is the startup check against the resolved descriptor: the
 // capability exists, its actions and the route table correspond one to one,
-// each action's declared effects equal its route's, and each output schema is
-// the canonical closed schema. Any mismatch fails closed, because each one is
+// each action's declared effects equal its route's, each input schema is the
+// route's InputSchema, and each output schema is the canonical closed schema. Any mismatch fails closed, because each one is
 // a configuration in which the explorer and the gateway disagree about what an
 // action does.
 func VerifyDescriptor(table *RouteTable, actions []DescriptorAction) error {
@@ -798,6 +816,16 @@ func VerifyDescriptor(table *RouteTable, actions []DescriptorAction) error {
 			!reflect.DeepEqual(schema, canonical) {
 			return fmt.Errorf("action %q output_schema is not the gateway's "+
 				"canonical closed schema", name)
+		}
+		// The input schema is what the explorer enforces at enqueue. One that
+		// admits more than the binder accepts lets work be queued, claimed —
+		// setting EffectPossible — and only then refused as input_invalid.
+		var input, routeInput any
+		if err := json.Unmarshal(action.InputSchema, &input); err != nil ||
+			json.Unmarshal(route.InputSchema(), &routeInput) != nil ||
+			!reflect.DeepEqual(input, routeInput) {
+			return fmt.Errorf("action %q input_schema is not the route's "+
+				"InputSchema", name)
 		}
 	}
 	for name := range registered {
@@ -935,6 +963,73 @@ func validHeaderName(name string) bool {
 		}
 	}
 	return true
+}
+
+// The field names each strict object admits, spelled exactly.
+var (
+	routeFields     = []string{"action", "method", "path", "effects", "idempotency", "query", "conflict", "retryable", "reference"}
+	conflictFields  = []string{"status", "pointer", "equals"}
+	referenceFields = []string{"pointer", "header", "pattern"}
+	inputFields     = []string{"path", "query", "body"}
+)
+
+// exactKeys refuses an object carrying any key that is not exactly one of
+// allowed.
+//
+// encoding/json matches object keys to struct fields case-insensitively, with
+// Unicode folding ("ſ" folds to "s"), and DisallowUnknownFields does not
+// change that. So {"method":"GET","METHOD":"POST"} has no duplicate key in
+// the exact sense rejectDuplicateKeys checks, decodes without complaint, and
+// sends whichever spelling came last — a value a reviewer reading the first
+// line never sees. The same shape in an action's input would let
+// {"body":{"amount":1},"BODY":{"amount":1000}} pass a reading of "body" and
+// send the other one. Requiring the exact spelling closes both.
+func exactKeys(raw json.RawMessage, allowed []string) error {
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &object); err != nil {
+		return errors.New("must be a JSON object")
+	}
+	for key := range object {
+		known := false
+		for _, name := range allowed {
+			if key == name {
+				known = true
+				break
+			}
+		}
+		if !known {
+			return fmt.Errorf("field %q is not one of %s, spelled exactly",
+				key, strings.Join(allowed, ", "))
+		}
+	}
+	return nil
+}
+
+// exactRouteKeys applies exactKeys at every level of the route table.
+func exactRouteKeys(raw []byte) error {
+	var routes []json.RawMessage
+	if err := json.Unmarshal(raw, &routes); err != nil {
+		return fmt.Errorf("-routes must be a JSON array of routes: %w", err)
+	}
+	for index, route := range routes {
+		if err := exactKeys(route, routeFields); err != nil {
+			return fmt.Errorf("-routes[%d]: %w", index, err)
+		}
+		var nested map[string]json.RawMessage
+		_ = json.Unmarshal(route, &nested)
+		for name, fields := range map[string][]string{
+			"conflict": conflictFields, "reference": referenceFields,
+		} {
+			value, present := nested[name]
+			if !present || bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
+				continue
+			}
+			if err := exactKeys(value, fields); err != nil {
+				return fmt.Errorf("-routes[%d] %s: %w", index, name, err)
+			}
+		}
+	}
+	return nil
 }
 
 // rejectDuplicateKeys walks a JSON document and refuses any object that

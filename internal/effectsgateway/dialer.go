@@ -52,6 +52,10 @@ var alwaysRefused = []netip.Prefix{
 	netip.MustParsePrefix("fe80::/10"),          // IPv6 link-local
 	netip.MustParsePrefix("fd00:ec2::254/128"),  // AWS IMDS over IPv6
 	netip.MustParsePrefix("ff00::/8"),           // IPv6 multicast
+	// RFC 8215 local-use NAT64. Its embedding layout depends on a prefix
+	// length the operator chose and this code cannot know, so the IPv4
+	// address it carries cannot be checked; the whole prefix is refused.
+	netip.MustParsePrefix("64:ff9b:1::/48"),
 }
 
 // privateRanges are refused unless -target-allow-private is set. IsPrivate and
@@ -72,8 +76,7 @@ func embeddedIPv4(address netip.Addr) (netip.Addr, bool) {
 	}
 	raw := address.As16()
 	switch {
-	case netip.MustParsePrefix("64:ff9b::/96").Contains(address),
-		netip.MustParsePrefix("64:ff9b:1::/48").Contains(address):
+	case netip.MustParsePrefix("64:ff9b::/96").Contains(address):
 		return netip.AddrFrom4([4]byte{raw[12], raw[13], raw[14], raw[15]}), true
 	case netip.MustParsePrefix("2002::/16").Contains(address):
 		return netip.AddrFrom4([4]byte{raw[2], raw[3], raw[4], raw[5]}), true
@@ -88,7 +91,10 @@ func CheckAddress(address netip.Addr, allowPrivate bool) error {
 	if !address.IsValid() {
 		return fmt.Errorf("%w: invalid address", ErrEgressRefused)
 	}
-	address = address.Unmap()
+	// A zoned address ("fe80::1%eth0") is contained by no netip.Prefix, so
+	// without this every check below would pass it. The zone selects an
+	// interface, not a destination, and is irrelevant to where it goes.
+	address = address.WithZone("").Unmap()
 	if embedded, ok := embeddedIPv4(address); ok {
 		if err := CheckAddress(embedded, allowPrivate); err != nil {
 			return err
