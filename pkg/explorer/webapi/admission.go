@@ -9,8 +9,8 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
-	"time"
 
+	admissionapi "github.com/phrocker/shoal-oss/pkg/admission/api"
 	"github.com/phrocker/shoal-oss/pkg/explorer/fleet"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
@@ -23,7 +23,11 @@ import (
 // to a third-party endpoint must not share an address space with the policy
 // store and the corpus: that would put untrusted prompt content inside the
 // decision plane.
-const AdmissionRoutePrefix = "/api/v1/admission/"
+//
+// The wire types are pkg/admission/api's, so the contract an external caller
+// compiles against is the one served here. Golden fixtures in
+// pkg/admission/api/testdata/wire pin the bytes (admission_golden_test.go).
+const AdmissionRoutePrefix = admissionapi.RoutePrefix
 
 type AdmissionProvider interface {
 	Request(context.Context, fleet.AdmissionRequest) (fleet.AdmissionGrant, error)
@@ -48,14 +52,14 @@ func NewAdmissionHandler(provider AdmissionProvider) (http.Handler, error) {
 
 func mountAdmission(mux *http.ServeMux, provider AdmissionProvider) {
 	mux.HandleFunc(
-		"POST /api/v1/admission/request",
+		"POST "+admissionapi.RequestRoute,
 		func(w http.ResponseWriter, r *http.Request) {
 			var wire admissionRequestWire
 			if err := decodeRequest(w, r, &wire); err != nil {
 				writeError(w, shoal.NewError(shoal.ErrorInvalidArgument, err.Error()))
 				return
 			}
-			request, err := wire.decode()
+			request, err := decodeAdmissionRequest(admissionapi.Request(wire))
 			if err != nil {
 				writeError(w, admissionError(err))
 				return
@@ -73,14 +77,14 @@ func mountAdmission(mux *http.ServeMux, provider AdmissionProvider) {
 			writeResponse(w, http.StatusOK, encodeAdmissionGrant(grant))
 		})
 	mux.HandleFunc(
-		"POST /api/v1/admission/report",
+		"POST "+admissionapi.ReportRoute,
 		func(w http.ResponseWriter, r *http.Request) {
 			var wire admissionReportWire
 			if err := decodeRequest(w, r, &wire); err != nil {
 				writeError(w, shoal.NewError(shoal.ErrorInvalidArgument, err.Error()))
 				return
 			}
-			report, err := wire.decode()
+			report, err := decodeAdmissionReport(admissionapi.Report(wire))
 			if err != nil {
 				writeError(w, admissionError(err))
 				return
@@ -90,21 +94,17 @@ func mountAdmission(mux *http.ServeMux, provider AdmissionProvider) {
 				writeError(w, admissionError(err))
 				return
 			}
-			writeResponse(w, http.StatusOK, admissionReceiptWire{
-				ActionID: base64.RawURLEncoding.EncodeToString(record.ID),
-				Version:  record.Version, State: record.State,
-				ReportedAt: record.UpdatedAt,
-			})
+			writeResponse(w, http.StatusOK, encodeAdmissionReceipt(record))
 		})
 	mux.HandleFunc(
-		"POST /api/v1/admission/outstanding",
+		"POST "+admissionapi.OutstandingRoute,
 		func(w http.ResponseWriter, r *http.Request) {
 			var wire admissionOutstandingWire
 			if err := decodeRequest(w, r, &wire); err != nil {
 				writeError(w, shoal.NewError(shoal.ErrorInvalidArgument, err.Error()))
 				return
 			}
-			contextValue, err := wire.Context.decode()
+			contextValue, err := decodeAdmissionContext(wire.Context)
 			if err != nil {
 				writeError(w, admissionError(err))
 				return
@@ -122,25 +122,7 @@ func mountAdmission(mux *http.ServeMux, provider AdmissionProvider) {
 				writeError(w, admissionError(err))
 				return
 			}
-			admissions := make(
-				[]outstandingAdmissionWire, len(page.Admissions))
-			for i, admission := range page.Admissions {
-				admissions[i] = outstandingAdmissionWire{
-					ActionID: base64.RawURLEncoding.EncodeToString(
-						admission.ActionID),
-					TokenID: base64.RawURLEncoding.EncodeToString(
-						admission.TokenID),
-					Version: admission.Version, AdmittedAt: admission.AdmittedAt,
-					ExpiresAt: admission.ExpiresAt, Expired: admission.Expired,
-				}
-			}
-			writeResponse(w, http.StatusOK, struct {
-				Admissions []outstandingAdmissionWire `json:"admissions"`
-				Next       string                     `json:"next,omitempty"`
-			}{
-				Admissions: admissions,
-				Next:       base64.RawURLEncoding.EncodeToString(page.Next),
-			})
+			writeResponse(w, http.StatusOK, encodeOutstandingAdmissions(page))
 		})
 }
 
@@ -172,26 +154,31 @@ func admissionError(err error) error {
 	}
 }
 
-type admissionRequestWire struct {
-	Context         fleetRequestContextWire `json:"context"`
-	ID              string                  `json:"id"`
-	IdempotencyKey  string                  `json:"idempotency_key"`
-	TokenID         string                  `json:"token_id"`
-	AgentID         string                  `json:"agent_id"`
-	AgentGeneration int64                   `json:"agent_generation"`
-	Capability      string                  `json:"capability"`
-	Action          string                  `json:"action"`
-	SourceID        []byte                  `json:"source_id"`
-	PolicyID        []byte                  `json:"policy_id"`
-	ObjectID        string                  `json:"object_id"`
-	Effects         []string                `json:"effects"`
-	Input           json.RawMessage         `json:"input"`
-	Disclosures     []string                `json:"disclosures,omitempty"`
-	Lease           time.Duration           `json:"lease"`
+// The request bodies decode into these local names for the public types, and
+// nothing else. encoding/json names the destination type in its error text
+// ("cannot unmarshal array into Go value of type webapi.admissionRequestWire"),
+// decodeRequest forwards that text in the 400 body, and the golden fixtures
+// pin it. Decoding straight into admissionapi.Request would change a response
+// byte for no reason. Nested type-mismatch messages name the nested type and
+// do change (fleetRequestContextWire and admissionTokenWire became
+// api.RequestContext and api.Token); status and code do not.
+type (
+	admissionRequestWire     admissionapi.Request
+	admissionReportWire      admissionapi.Report
+	admissionOutstandingWire admissionapi.OutstandingRequest
+)
+
+// decodeAdmissionContext reuses the fleet routes' context decoding. The two
+// structs are field-for-field identical, which the conversion enforces at
+// compile time.
+func decodeAdmissionContext(
+	wire admissionapi.RequestContext,
+) (fleet.RequestContext, error) {
+	return fleetRequestContextWire(wire).decode()
 }
 
-func (w admissionRequestWire) decode() (fleet.AdmissionRequest, error) {
-	contextValue, err := w.Context.decode()
+func decodeAdmissionRequest(w admissionapi.Request) (fleet.AdmissionRequest, error) {
+	contextValue, err := decodeAdmissionContext(w.Context)
 	if err != nil {
 		return fleet.AdmissionRequest{}, err
 	}
@@ -243,14 +230,7 @@ func (w admissionRequestWire) decode() (fleet.AdmissionRequest, error) {
 	}, nil
 }
 
-type admissionTokenWire struct {
-	ActionID  string    `json:"action_id"`
-	TokenID   string    `json:"token_id"`
-	Version   uint64    `json:"version"`
-	ExpiresAt time.Time `json:"expires_at"`
-}
-
-func (w admissionTokenWire) decode() (fleet.AdmissionToken, error) {
+func decodeAdmissionToken(w admissionapi.Token) (fleet.AdmissionToken, error) {
 	actionID, err := decodeWireBytes("admission action ID", w.ActionID, false)
 	if err != nil {
 		return fleet.AdmissionToken{}, err
@@ -265,25 +245,21 @@ func (w admissionTokenWire) decode() (fleet.AdmissionToken, error) {
 	}, nil
 }
 
-type admissionGrantWire struct {
-	Outcome fleet.AdmissionOutcome `json:"outcome"`
-	Token   *admissionTokenWire    `json:"token,omitempty"`
-	// Withhold is the obligation. It is always present on an allowed response,
-	// empty when there is nothing to withhold, so a caller that reads the field
-	// without checking the outcome still sees the full obligation rather than a
-	// missing key it might read as "no obligation".
-	//
-	// Encoded exactly as the request's disclosures are, because the obligation
-	// is a subset of them and a caller has to be able to match the two by
-	// equality. Emitting raw identity bytes here against base64url on the way in
-	// would make every obligation unmatchable for any identity that is not
-	// already printable ASCII.
-	Withhold []string `json:"withhold"`
-}
-
-func encodeAdmissionGrant(grant fleet.AdmissionGrant) admissionGrantWire {
-	result := admissionGrantWire{
-		Outcome:  grant.Outcome,
+// encodeAdmissionGrant renders the answer.
+//
+// Withhold is the obligation. It is always present on an allowed response,
+// empty when there is nothing to withhold, so a caller that reads the field
+// without checking the outcome still sees the full obligation rather than a
+// missing key it might read as "no obligation".
+//
+// Encoded exactly as the request's disclosures are, because the obligation is
+// a subset of them and a caller has to be able to match the two by equality.
+// Emitting raw identity bytes here against base64url on the way in would make
+// every obligation unmatchable for any identity that is not already printable
+// ASCII.
+func encodeAdmissionGrant(grant fleet.AdmissionGrant) admissionapi.Grant {
+	result := admissionapi.Grant{
+		Outcome:  admissionapi.Outcome(grant.Outcome),
 		Withhold: make([]string, 0, len(grant.Obligations.Withhold)),
 	}
 	for _, reference := range grant.Obligations.Withhold {
@@ -294,7 +270,7 @@ func encodeAdmissionGrant(grant fleet.AdmissionGrant) admissionGrantWire {
 	if grant.Outcome == fleet.AdmissionDenied {
 		return result
 	}
-	result.Token = &admissionTokenWire{
+	result.Token = &admissionapi.Token{
 		ActionID: base64.RawURLEncoding.EncodeToString(grant.Token.ActionID),
 		TokenID:  base64.RawURLEncoding.EncodeToString(grant.Token.TokenID),
 		Version:  grant.Token.Version, ExpiresAt: grant.Token.ExpiresAt,
@@ -302,20 +278,12 @@ func encodeAdmissionGrant(grant fleet.AdmissionGrant) admissionGrantWire {
 	return result
 }
 
-type admissionReportWire struct {
-	Context   fleetRequestContextWire `json:"context"`
-	Token     admissionTokenWire      `json:"token"`
-	Outcome   json.RawMessage         `json:"outcome,omitempty"`
-	Failed    bool                    `json:"failed,omitempty"`
-	ErrorCode string                  `json:"error_code,omitempty"`
-}
-
-func (w admissionReportWire) decode() (fleet.AdmissionReport, error) {
-	contextValue, err := w.Context.decode()
+func decodeAdmissionReport(w admissionapi.Report) (fleet.AdmissionReport, error) {
+	contextValue, err := decodeAdmissionContext(w.Context)
 	if err != nil {
 		return fleet.AdmissionReport{}, err
 	}
-	token, err := w.Token.decode()
+	token, err := decodeAdmissionToken(w.Token)
 	if err != nil {
 		return fleet.AdmissionReport{}, err
 	}
@@ -326,24 +294,29 @@ func (w admissionReportWire) decode() (fleet.AdmissionReport, error) {
 	}, nil
 }
 
-type admissionReceiptWire struct {
-	ActionID   string              `json:"action_id"`
-	Version    uint64              `json:"version"`
-	State      fleet.DispatchState `json:"state"`
-	ReportedAt time.Time           `json:"reported_at"`
+func encodeAdmissionReceipt(record fleet.ActionRecord) admissionapi.Receipt {
+	return admissionapi.Receipt{
+		ActionID:   base64.RawURLEncoding.EncodeToString(record.ID),
+		Version:    record.Version,
+		State:      admissionapi.DispatchState(record.State),
+		ReportedAt: record.UpdatedAt,
+	}
 }
 
-type admissionOutstandingWire struct {
-	Context fleetRequestContextWire `json:"context"`
-	After   string                  `json:"after,omitempty"`
-	Limit   int                     `json:"limit"`
-}
-
-type outstandingAdmissionWire struct {
-	ActionID   string    `json:"action_id"`
-	TokenID    string    `json:"token_id"`
-	Version    uint64    `json:"version"`
-	AdmittedAt time.Time `json:"admitted_at"`
-	ExpiresAt  time.Time `json:"expires_at"`
-	Expired    bool      `json:"expired"`
+func encodeOutstandingAdmissions(
+	page fleet.OutstandingAdmissionsPage,
+) admissionapi.OutstandingPage {
+	admissions := make([]admissionapi.OutstandingAdmission, len(page.Admissions))
+	for i, admission := range page.Admissions {
+		admissions[i] = admissionapi.OutstandingAdmission{
+			ActionID: base64.RawURLEncoding.EncodeToString(admission.ActionID),
+			TokenID:  base64.RawURLEncoding.EncodeToString(admission.TokenID),
+			Version:  admission.Version, AdmittedAt: admission.AdmittedAt,
+			ExpiresAt: admission.ExpiresAt, Expired: admission.Expired,
+		}
+	}
+	return admissionapi.OutstandingPage{
+		Admissions: admissions,
+		Next:       base64.RawURLEncoding.EncodeToString(page.Next),
+	}
 }

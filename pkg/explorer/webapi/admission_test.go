@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	admissionapi "github.com/phrocker/shoal-oss/pkg/admission/api"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/explorer/fleet"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
@@ -110,9 +111,9 @@ func admissionPost(
 	return response
 }
 
-func admissionRequestBody(now time.Time) admissionRequestWire {
-	return admissionRequestWire{
-		Context: fleetRequestContextWire{
+func admissionRequestBody(now time.Time) admissionapi.Request {
+	return admissionapi.Request{
+		Context: admissionapi.RequestContext{
 			RequestID: encodeFleetID("request"), ReasonCode: "proxy_admission",
 			CorrelationID: encodeFleetID("correlation"),
 			Deadline:      now.Add(time.Minute),
@@ -145,11 +146,11 @@ func TestAdmissionDenialIsASuccessfulResponseWithNoToken(t *testing.T) {
 	if response.Code != http.StatusOK {
 		t.Fatalf("status = %d body = %s", response.Code, response.Body.String())
 	}
-	var decoded admissionGrantWire
+	var decoded admissionapi.Grant
 	if err := json.Unmarshal(response.Body.Bytes(), &decoded); err != nil {
 		t.Fatal(err)
 	}
-	if decoded.Outcome != fleet.AdmissionDenied {
+	if decoded.Outcome != admissionapi.OutcomeDenied {
 		t.Fatalf("outcome = %q", decoded.Outcome)
 	}
 	if decoded.Token != nil {
@@ -188,7 +189,7 @@ func TestAdmissionObligationsSurviveTheWire(t *testing.T) {
 	if response.Code != http.StatusOK {
 		t.Fatalf("status = %d body = %s", response.Code, response.Body.String())
 	}
-	var decoded admissionGrantWire
+	var decoded admissionapi.Grant
 	if err := json.Unmarshal(response.Body.Bytes(), &decoded); err != nil {
 		t.Fatal(err)
 	}
@@ -210,7 +211,7 @@ func TestAdmissionObligationsSurviveTheWire(t *testing.T) {
 	if decoded.Token == nil {
 		t.Fatal("obligated grant carried no token")
 	}
-	token, err := decoded.Token.decode()
+	token, err := decodeAdmissionToken(*decoded.Token)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -275,13 +276,13 @@ func TestAdmissionSpentTokenIsAConflict(t *testing.T) {
 	provider := &stubAdmissionProvider{err: fleet.ErrAdmissionSpent}
 	handler := admissionTestHandler(t, provider, now)
 	response := admissionPost(
-		t, handler, "/api/v1/admission/report", admissionReportWire{
-			Context: fleetRequestContextWire{
+		t, handler, "/api/v1/admission/report", admissionapi.Report{
+			Context: admissionapi.RequestContext{
 				RequestID: encodeFleetID("request"), ReasonCode: "proxy_report",
 				CorrelationID: encodeFleetID("correlation"),
 				Deadline:      now.Add(time.Minute),
 			},
-			Token: admissionTokenWire{
+			Token: admissionapi.Token{
 				ActionID: base64.RawURLEncoding.EncodeToString(
 					[]byte("admission")),
 				TokenID: base64.RawURLEncoding.EncodeToString([]byte("token")),
@@ -306,13 +307,13 @@ func TestAdmissionReportPreservesOpaqueTokenBytes(t *testing.T) {
 	}}
 	handler := admissionTestHandler(t, provider, now)
 	response := admissionPost(
-		t, handler, "/api/v1/admission/report", admissionReportWire{
-			Context: fleetRequestContextWire{
+		t, handler, "/api/v1/admission/report", admissionapi.Report{
+			Context: admissionapi.RequestContext{
 				RequestID: encodeFleetID("request"), ReasonCode: "proxy_report",
 				CorrelationID: encodeFleetID("correlation"),
 				Deadline:      now.Add(time.Minute),
 			},
-			Token: admissionTokenWire{
+			Token: admissionapi.Token{
 				ActionID: base64.RawURLEncoding.EncodeToString(actionID),
 				TokenID:  base64.RawURLEncoding.EncodeToString(tokenID),
 				Version:  2,
