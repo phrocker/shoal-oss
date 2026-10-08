@@ -161,7 +161,7 @@ jobs:
       - name: Extensions (vet / test)
         run: |
           set -euo pipefail
-          find extensions -name go.mod -not -path '*/testdata/*' -print0 \
+          find extensions -name go.mod -type f -print0 \
             | while IFS= read -r -d '' mod; do
                 dir=$(dirname "$mod")
                 echo "== $dir"

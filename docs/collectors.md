@@ -186,6 +186,21 @@ so it works with `GOWORK=off`) and fails when:
   tree; or a Go file under `extensions/` sits outside every extension module;
 - C. the in-repository import closure of those packages contains `internal/`.
 
+The scan descends into every directory, including `testdata`, `vendor` and
+names beginning with `_` or `.`. `go build ./...` skips those, but Go still
+compiles them when a package imports them by explicit path. The only
+directories skipped are nested modules (those with their own `go.mod`) and the
+repository's `.git`. The checker's fixtures need no special case, because each
+fixture tree is a nested module. Any symlink in the root module or under
+`extensions/` is a violation. The walk does not follow symlinks, but the go
+command and `go.work` do. The repository currently contains none.
+
+An extension's `go.mod` is parsed with every known directive recognized and
+parentheses split from adjacent tokens (`replace(` counts the same as
+`replace (`). An unknown directive, an unbalanced or nested block, or any
+other line the parser cannot read exactly is reported as a violation, never
+skipped.
+
 Fixtures under `internal/importboundary/testdata` prove each rule detects a
 violation. CI also vets and tests every module under `extensions/` on its own
 `go.mod`, and fails if a core package links `golang.org/x/crypto/ssh`, an RDP

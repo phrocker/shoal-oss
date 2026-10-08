@@ -38,12 +38,12 @@ func TestRepositoryRespectsBoundary(t *testing.T) {
 	}
 	// Rule A must reach root-module packages outside pkg/, internal/, cmd/.
 	outside := 0
-	if err := walkGo(root, ".", func(dir string) bool { return dir == "extensions" }, func(file string, _ []string) error {
+	if err := walkGo(root, ".", func(dir string) bool { return dir == "extensions" || dir == ".git" }, func(file string, _ []string) error {
 		if top, _, _ := strings.Cut(file, "/"); top != "pkg" && top != "internal" && top != "cmd" {
 			outside++
 		}
 		return nil
-	}); err != nil || outside == 0 {
+	}, nil); err != nil || outside == 0 {
 		t.Errorf("rule A scanned no files outside pkg/internal/cmd (%v)", err)
 	}
 	// And the scaffolding the rules exist for must be present.
@@ -71,6 +71,17 @@ func TestFixturesDetectEachDirection(t *testing.T) {
 		"nested-extension-module":        {{"B", "extensions/grp/evil/main.go", m + "/internal/engine"}},
 		"root-package-imports-extension": {{"A", "showcases/demo/main.go", m + "/extensions/good/lines"}},
 		"loose-extension-file":           {{"B", "extensions/loose/loose.go", "(file outside an extension module)"}},
+		// Go compiles _, ., testdata and vendor directories when imported by
+		// explicit path, so the walk must not skip them.
+		"extension-underscore-impl":  {{"B", "extensions/e/_impl/impl.go", m + "/internal/engine"}},
+		"extension-testdata-package": {{"B", "extensions/e/testdata/x/x.go", m + "/internal/engine"}},
+		"core-underscore-package":    {{"A", "pkg/_x/x.go", m + "/extensions/good/lines"}},
+		"symlinked-extension-dir": {
+			{"A", "pkg/alias", "(symlink)"},
+			{"B", "extensions/e/impl", "(symlink)"},
+		},
+		"gomod-glued-paren":       {{"B", "extensions/e/go.mod", "replace " + m + " => ../../../evil"}},
+		"gomod-unknown-directive": {{"B", "extensions/e/go.mod", "(malformed go.mod: extensions/e/go.mod:5: unknown directive substitute)"}},
 	}
 	for name, want := range cases {
 		t.Run(name, func(t *testing.T) {
