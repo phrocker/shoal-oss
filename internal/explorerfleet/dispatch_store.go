@@ -704,6 +704,10 @@ func decodeTransition(value []byte) (storedTransition, error) {
 // materialization), which pass ExpectedVersion 0 and necessarily have no
 // stored record to compare against.
 //
+// Claim state is deliberately absent: the claimant fields and
+// ClaimAttestationID (#446) move on every re-claim, and an extension under a
+// newer attestation replaces the latter. They are #461's mutable list.
+//
 // ErrorInternal rather than ErrorInvalidArgument, for two reasons. The only
 // way to reach it is a service that rewrote its own record, so it is an
 // implementation fault and not a caller's bad request — which is what

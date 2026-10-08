@@ -329,6 +329,9 @@ type canonicalAction struct {
 	// declared, under the same DigestPrefix, while a requirement still
 	// changes the digest: two policies differing only in it never share one.
 	Approval *Approval `json:"approval,omitempty"`
+	// Attestation likewise: omitted unless required, so the digest of every
+	// policy without it is unchanged.
+	Attestation *Attestation `json:"attestation,omitempty"`
 }
 
 func canonicalPolicyJSON(policy *Policy) ([]byte, error) {
@@ -369,6 +372,9 @@ func canonicalPolicyJSON(policy *Policy) ([]byte, error) {
 				}
 				if action.RequiresApproval {
 					canonical.Approval = &Approval{Required: true}
+				}
+				if action.RequiresAttestation {
+					canonical.Attestation = &Attestation{Required: true}
 				}
 				compiled.Actions = append(compiled.Actions, canonical)
 			}
@@ -418,7 +424,8 @@ func cloneCapabilities(input []fleet.Capability) []fleet.Capability {
 				OutputSchema: append(json.RawMessage(nil), action.OutputSchema...),
 				// A clone without the flag would hand Agents, Writes and
 				// apply a registration that silently drops the requirement.
-				RequiresApproval: action.RequiresApproval,
+				RequiresApproval:    action.RequiresApproval,
+				RequiresAttestation: action.RequiresAttestation,
 			}
 		}
 	}

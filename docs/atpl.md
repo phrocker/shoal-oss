@@ -60,6 +60,20 @@ is one JSON object:
   has one form for the digest and for review. `{}`, `null`, a bare boolean,
   any other key and case-folded keys (`Approval`, `Required`) are refused, as
   everywhere in the format.
+- **`attestation: {"required": true}`** on an action compiles to
+  `fleet.Action.RequiresAttestation` (#446, `docs/executor-attestation.md`):
+  a claim on the action (dispatch claim, extension, or the admission grant)
+  requires the claimant to hold a current verified executor attestation that
+  covers the lease. It has exactly approval's strictness and refusals: only on
+  an action, exactly `{"required": true}`, `{"required": false}`, `{}`, `null`,
+  a bare boolean, any other key and case-folded keys (`Attestation`,
+  `Required`) refused. It is refused on an action whose effects lack
+  `external` (at `...actions[name=X].attestation`), as the registry refuses
+  it. Inheritance carries it; an inherited action may add it; a delegated
+  action declared in full without it under a parent that requires it is
+  refused at `...actions[name=X].attestation`. Whether the host has a trust
+  root for the executor reference is host configuration the file cannot see;
+  the registry checks it at apply.
 - **`inherit: true`** on an action copies the same-named action of the parent's
   same-named capability, schemas, effects and approval requirement exactly. It
   is refused if the parent has no such action, or if the action also declares
@@ -94,7 +108,8 @@ refused by name with the reason:
 | --- | --- |
 | `approval` (anywhere but an action) | declared per action only |
 | `obligations` | not declared in policy: admission obligations are computed per request; deferred |
-| `attestation`, `runtime` | requires a later ATPL version (#446) |
+| `attestation` (anywhere but an action) | declared per action only |
+| `runtime` | requires a later ATPL version (runtime attestation, #446) |
 | `trust_score` | not part of ATPL in Shoal; trust is a typed decision |
 | `behavior` | not part of ATPL in Shoal; fixed thresholds are not gates |
 
@@ -138,8 +153,9 @@ the version, executors and every registration without its absolute lease but
 with its TTL, as `pkg/decision` identities are computed. The same files give the
 same digest at any time and in any file, list or key order. `policy compile`
 prints those exact bytes. An action that requires approval carries
-`"approval":{"required":true}` in them; every other action is encoded as it was
-before approval could be declared, so a policy without approval keeps its
+`"approval":{"required":true}` in them, and one that requires attestation
+`"attestation":{"required":true}`; every other action is encoded as it was
+before either could be declared, so a policy without them keeps its
 digest (a golden test pins it), while two policies that differ only in a
 requirement never share one.
 
@@ -182,13 +198,30 @@ approval change like any other narrowing. The `refused-approval` kind of
 #489, which refused any managed agent with a live approval requirement because
 the format could not express it, no longer exists.
 
+Attestation is compared per action in exactly the same way. Adding it plans as
+a narrowing (`+ ...attestation: required`), omitting it on an action that
+requires it live plans as `refused-widening` (`- ...attestation`), and adding
+it to a parent whose live child this plan does not rewrite is
+`refused-delegation`.
+
+**Flipping attestation on is a generation change.** Registering the
+requirement moves the agent's generation, and a dispatch record names the
+generation it was enqueued against, so records queued or claimed under the old
+generation stop resolving — the same stranding a heartbeat causes today
+(#486). Until #486 lands, flip with no live claims. Keep the two apart when
+reasoning about it: the stranding is the heartbeat/generation issue, not
+attestation. The requirement itself affects only *new* claims and extensions;
+a live claim is never re-checked, and an attestation cannot lapse inside a
+claim it covers.
+
 The plan digest (`atpl:plan:v2:`) binds the policy digest, the normalized
 endpoint (lower-case scheme and host, default port and trailing slash dropped),
 each managed agent's kind and `ContentDigest` of its live registration, and the
 IDs of unmanaged agents, and the write order below, two-step writes included.
 `ContentDigest` covers parent, domain, scopes, executor
-and capabilities, approval requirements included (appended only for an action
-that requires approval, so other registrations keep their earlier digests),
+and capabilities, approval and attestation requirements included (each
+appended only for an action that requires it, so other registrations keep
+their earlier digests),
 and leaves out generation, subject, actor, lease and update
 time, which heartbeats move. A requirement added or removed between plan and
 apply therefore invalidates the reviewed plan, and stops apply's retry. A heartbeat between plan and apply therefore does
@@ -241,7 +274,8 @@ is not what the host binds. A live ID, domain, scope or executor reference that
 is not UTF-8 is refused, naming the field. A live action that requires approval
 (`docs/approval.md`) is written with `"approval": {"required": true}`, and only
 such an action; export no longer refuses it, and the export recompiles to the
-same registrations and digest (tested through a real `fleet.Service`, and
+same registrations and digest. An action that requires attestation is written
+with `"attestation": {"required": true}` likewise (tested through a real `fleet.Service`, and
 end to end through `shoalctl`). Export refuses a directory that
 already holds policy files, read with `os.ReadDir` so a directory name with glob
 metacharacters cannot defeat the check, and refuses before writing anything if
@@ -303,7 +337,9 @@ agent ID)`, and it is read with the corpus's `InteractionRecord`.
 
 ## Deferred
 
-- Attestation requirements (#446): refused by name until they compile.
+- `runtime` (ATPL's runtime attestation declaration, #446): refused by name.
+  The per-action `attestation` requirement compiles; what a runtime must
+  attest to is host trust configuration (`-fleet-executor-attestation`).
 - Approval rules beyond the per-action requirement (approver sets, quorum,
   conditions). The format holds only `approval: {"required": true}`, which is
   everything the registry stores today; any other key in `approval` is refused.

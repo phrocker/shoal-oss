@@ -56,8 +56,12 @@
 // docs/gateways.md, "What comes from ATPL".
 //
 // ATPL's approval (marginal outcome) is adopted as the per-action
-// requirement above. Runtime attestation is adopted but not yet compiled; it
-// waits on recorded runtime attestation (#446). Admission obligations are
+// requirement above. Executor attestation is adopted as a per-action
+// requirement too: "attestation": {"required": true} compiles to
+// fleet.Action.RequiresAttestation (#446) with exactly approval's strictness,
+// and is refused on an action that does not declare the external effect.
+// ATPL's "runtime" section is not compiled: what a runtime must attest to is
+// host trust configuration. Admission obligations are
 // computed per request at admission rather than declared per agent, and how a
 // policy would constrain them is deferred. Those fields are refused by name, so
 // a file never appears to grant something it does not.

@@ -167,16 +167,18 @@ func rawSpec(agent Agent, now time.Time, parent *fleet.Spec) fleet.Spec {
 		for _, action := range capability.Actions {
 			converted := fleet.Action{
 				Name: action.Name, InputSchema: action.InputSchema, OutputSchema: action.OutputSchema,
-				RequiresApproval: action.Approval != nil && action.Approval.Required,
+				RequiresApproval:    action.Approval != nil && action.Approval.Required,
+				RequiresAttestation: action.Attestation != nil && action.Attestation.Required,
 			}
 			for _, effect := range action.Effects {
 				converted.Effects = append(converted.Effects, fleet.Effect(effect))
 			}
 			if action.Inherit && parent != nil {
 				if inherited := findAction(findCapability(parent.Capabilities, capability.Name), action.Name); inherited != nil {
-					adds := converted.RequiresApproval
+					adds, addsAttestation := converted.RequiresApproval, converted.RequiresAttestation
 					converted = *inherited
 					converted.RequiresApproval = converted.RequiresApproval || adds
+					converted.RequiresAttestation = converted.RequiresAttestation || addsAttestation
 				}
 			}
 			compiled.Actions = append(compiled.Actions, converted)
@@ -488,12 +490,14 @@ func TestDecodeStrictness(t *testing.T) {
 		{"unknown field", plannerField("color"), "agents[id=planner].color: unknown field"},
 		{"approval", plannerField("approval"), "agents[id=planner].approval: is declared per action only"},
 		{"obligations", plannerField("obligations"), "agents[id=planner].obligations: is not declared in policy: admission obligations are computed per request"},
-		{"attestation", plannerField("attestation"), "agents[id=planner].attestation: requires a later ATPL version (#446)"},
+		{"attestation", plannerField("attestation"), "agents[id=planner].attestation: is declared per action only"},
 		{"runtime", plannerField("runtime"), "agents[id=planner].runtime: requires a later ATPL version"},
 		{"trust_score", plannerField("trust_score"), "agents[id=planner].trust_score: is not part of ATPL in Shoal"},
 		{"behavior", plannerField("behavior"), "agents[id=planner].behavior: is not part of ATPL in Shoal"},
-		{"reserved on an action", actionField("attestation"),
-			"agents[id=planner].capabilities[name=search].actions[name=query].attestation: requires a later ATPL version (#446)"},
+		{"reserved on an action", actionField("runtime"),
+			"agents[id=planner].capabilities[name=search].actions[name=query].runtime: requires a later ATPL version (runtime attestation, #446)"},
+		{"attestation on an action is an object", actionField("attestation"),
+			"agents[id=planner].capabilities[name=search].actions[name=query].attestation: must be a JSON object"},
 		{"approval on an action is an object", actionField("approval"),
 			"agents[id=planner].capabilities[name=search].actions[name=query].approval: must be a JSON object"},
 		{"reserved at the top", replaceIn(`"executors": [`, `"trust_score": 0.9, "executors": [`),

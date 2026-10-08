@@ -316,6 +316,8 @@ func ContentDigest(descriptor fleet.Descriptor) string {
 		// requirement no longer applies once someone adds it, or removes it,
 		// and apply's retry stops instead of writing over the change.
 		RequiresApproval bool `json:"requires_approval,omitempty"`
+		// Omitted unless set, for the same reasons.
+		RequiresAttestation bool `json:"requires_attestation,omitempty"`
 	}
 	type capability struct {
 		Name    string   `json:"name"`
@@ -350,7 +352,8 @@ func ContentDigest(descriptor fleet.Descriptor) string {
 			hashed.Actions = append(hashed.Actions, action{
 				Name: text([]byte(declared.Name)), Effects: effects,
 				Input: text(declared.InputSchema), Output: text(declared.OutputSchema),
-				RequiresApproval: declared.RequiresApproval,
+				RequiresApproval:    declared.RequiresApproval,
+				RequiresAttestation: declared.RequiresAttestation,
 			})
 		}
 		body.Capabilities = append(body.Capabilities, hashed)
@@ -469,6 +472,9 @@ func creationChanges(spec fleet.Spec, ttl time.Duration) []Change {
 			if action.RequiresApproval {
 				add(actionLabel(capability.Name, action.Name)+".approval", "required")
 			}
+			if action.RequiresAttestation {
+				add(actionLabel(capability.Name, action.Name)+".attestation", "required")
+			}
 		}
 	}
 	return changes
@@ -517,6 +523,10 @@ func wideningChanges(spec fleet.Spec, live fleet.Descriptor) []Change {
 				changes = append(changes, Change{Op: "-", Path: path + ".approval",
 					Detail: "required live; the policy omits it, which would remove the control"})
 			}
+			if current.RequiresAttestation && !action.RequiresAttestation {
+				changes = append(changes, Change{Op: "-", Path: path + ".attestation",
+					Detail: "required live; the policy omits it, which would remove the control"})
+			}
 		}
 	}
 	return changes
@@ -557,6 +567,11 @@ func narrowingChanges(spec fleet.Spec, live fleet.Descriptor) []Change {
 			// new generation stops records queued before it from resolving.
 			if current.RequiresApproval && !action.RequiresApproval {
 				changes = append(changes, Change{Op: "+", Path: path + ".approval", Detail: "required"})
+			}
+			// Adding attestation narrows too: only new claims are affected,
+			// though registering it is a new generation (see docs/atpl.md).
+			if current.RequiresAttestation && !action.RequiresAttestation {
+				changes = append(changes, Change{Op: "+", Path: path + ".attestation", Detail: "required"})
 			}
 		}
 	}

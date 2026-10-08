@@ -54,12 +54,29 @@ func Compose(
 	visibility []byte,
 	clock func() time.Time,
 ) (*fleet.Service, error) {
+	return ComposeWithAttestationTrust(runtime, resolver, recorder, snapshots,
+		executors, visibility, clock, nil)
+}
+
+// ComposeWithAttestationTrust is Compose with the host's executor
+// attestation trust, which Register consults for actions that require
+// attestation. A nil trust configures none.
+func ComposeWithAttestationTrust(
+	runtime *explorercoord.Runtime,
+	resolver auth.Resolver,
+	recorder fleet.LifecycleRecorder,
+	snapshots fleet.InteractionSnapshotProvider,
+	executors fleet.ExecutorRegistry,
+	visibility []byte,
+	clock func() time.Time,
+	trust fleet.AttestationTrust,
+) (*fleet.Service, error) {
 	store, err := NewStore(runtime, visibility)
 	if err != nil {
 		return nil, err
 	}
 	return fleet.NewService(fleet.Config{
 		Store: store, Resolver: resolver, Recorder: recorder, Snapshots: snapshots,
-		Executors: executors, Clock: clock,
+		Executors: executors, Clock: clock, AttestationTrust: trust,
 	})
 }

@@ -205,6 +205,11 @@ type ClaimHolder struct {
 	// without any reconciliation of their own.
 	ClaimFence uint64
 	HeldAt     time.Time
+	// AttestationID is the attestation that holder's claim was granted under,
+	// carried from ActionRecord.ClaimAttestationID when it is displaced.
+	// Empty when the action did not require one. Bounded at
+	// MaxClaimAttestationIDBytes.
+	AttestationID shoal.ID
 }
 
 // AmbiguityReport is a worker's account of an effect it may have performed
@@ -286,7 +291,24 @@ func (h ClaimHolder) validate() error {
 		return shoal.NewError(
 			shoal.ErrorInvalidArgument, "claim holder time is not UTC")
 	}
+	if err := validateClaimAttestationID(
+		"claim holder attestation ID", h.AttestationID); err != nil {
+		return err
+	}
 	return nil
+}
+
+// validateClaimAttestationID checks an optional attestation ID against its
+// byte bound. The bound is also enforced where the ID enters the fleet
+// (DispatchService.claimAttestation); this is the backstop for a stored value.
+func validateClaimAttestationID(name string, id shoal.ID) error {
+	if id == "" {
+		return nil
+	}
+	if len(id) > MaxClaimAttestationIDBytes {
+		return shoal.NewError(shoal.ErrorInvalidArgument, name+" exceeds its bound")
+	}
+	return shoal.ValidateRequiredID(name, id)
 }
 
 func (r AmbiguityReport) validate() error {
@@ -466,14 +488,29 @@ type ActionRecord struct {
 	// report under the same fence is appended rather than replacing the first:
 	// two reports from one attempt mean the worker retried, and that is
 	// information an operator wants rather than noise to collapse.
-	AmbiguityReports     []AmbiguityReport
-	ClaimantSubject      shoal.ID
-	ClaimantActor        shoal.ID
-	ClaimantClientID     shoal.ID
-	ClaimantOnBehalfOf   []shoal.ID
-	ClaimFence           uint64
-	ClaimLease           time.Duration
-	ClaimLeaseUntil      time.Time
+	AmbiguityReports   []AmbiguityReport
+	ClaimantSubject    shoal.ID
+	ClaimantActor      shoal.ID
+	ClaimantClientID   shoal.ID
+	ClaimantOnBehalfOf []shoal.ID
+	ClaimFence         uint64
+	ClaimLease         time.Duration
+	ClaimLeaseUntil    time.Time
+	// ClaimAttestationID is the verified executor attestation the current
+	// claim (or its latest extension) was granted under, when the action
+	// requires attestation (#446). Empty otherwise.
+	//
+	// It is claim state, not record identity: a re-claim moves it, and an
+	// extension under a newer attestation replaces it. It belongs on #461's
+	// mutable list with the claimant fields (ClaimantSubject and friends),
+	// not with the fields the store holds immutable. It is a record, not a
+	// grant — nothing reads it to authorize anything.
+	//
+	// Bounded at MaxClaimAttestationIDBytes, at the boundary where it enters
+	// (DispatchService.claimAttestation) and again in Validate. A record
+	// written before the field existed decodes with it empty; gob ignores it
+	// when an earlier build reads a record that carries it.
+	ClaimAttestationID   shoal.ID
 	CancelKey            []byte
 	ExecutorKey          []byte
 	EvidenceSnapshotID   shoal.ID
@@ -1012,6 +1049,10 @@ type DispatchConfig struct {
 	Recorder ActionRecorder
 	Events   ActionEventPublisher
 	Clock    func() time.Time
+	// Attestations reads claimants' current executor attestations. Optional:
+	// nil means none is ever current, so every action that requires
+	// attestation is refused to every claimant (fail closed).
+	Attestations ExecutorAttestations
 }
 
 func (r ActionRecord) Validate() error {
@@ -1106,6 +1147,14 @@ func (r ActionRecord) Validate() error {
 			"action claimant delegation identity", identity); err != nil {
 			return err
 		}
+	}
+	if err := validateClaimAttestationID(
+		"action claim attestation ID", r.ClaimAttestationID); err != nil {
+		return err
+	}
+	if r.ClaimAttestationID != "" && r.ClaimFence == 0 {
+		return shoal.NewError(shoal.ErrorInvalidArgument,
+			"action carries a claim attestation without a claim")
 	}
 	if len(r.ClaimHistory) > MaxActionClaimHistory {
 		return shoal.NewError(

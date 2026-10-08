@@ -62,6 +62,16 @@ const (
 	// earlier build would otherwise read the action, drop the flag it does not
 	// know, and serve approval-required work through enqueue.
 	codecVersionApproval uint16 = 4
+	// codecVersionAttestation adds a second flag byte per action, after the
+	// approval byte: whether the action requires executor attestation (#446).
+	//
+	// The same rollout shape as approval. It is written only for a descriptor
+	// in which some action requires attestation; every other descriptor keeps
+	// the version and bytes it had, so rolling back reads it unchanged. An
+	// earlier build refuses version 5 rather than reading the action and
+	// dropping a requirement it does not know — which would let it grant
+	// claims on external work without an attestation.
+	codecVersionAttestation uint16 = 5
 	// maxEncodedEffects bounds the decoded set. The taxonomy has three classes,
 	// so anything larger is a malformed or hostile record rather than a
 	// declaration, and it must not be able to allocate freely.
@@ -391,6 +401,9 @@ func encodeDescriptor(
 	if descriptorRequiresApproval(descriptor) {
 		version = codecVersionApproval
 	}
+	if descriptorRequiresAttestation(descriptor) {
+		version = codecVersionAttestation
+	}
 	writeU16(&buffer, version)
 	writeString(&buffer, string(descriptor.ID))
 	writeI64(&buffer, descriptor.Generation)
@@ -421,6 +434,13 @@ func encodeDescriptor(
 				}
 				buffer.WriteByte(flag)
 			}
+			if version >= codecVersionAttestation {
+				flag := byte(0)
+				if action.RequiresAttestation {
+					flag = 1
+				}
+				buffer.WriteByte(flag)
+			}
 			writeBytes(&buffer, action.InputSchema)
 			writeBytes(&buffer, action.OutputSchema)
 		}
@@ -446,7 +466,8 @@ func decodeDescriptor(value []byte) (
 	// written by an older build must keep decoding, and each version's effect
 	// encoding is handled explicitly below.
 	if err != nil || (version != 1 && version != codecVersionEffect &&
-		version != codecVersion && version != codecVersionApproval) {
+		version != codecVersion && version != codecVersionApproval &&
+		version != codecVersionAttestation) {
 		return fleet.Descriptor{}, [sha256.Size]byte{},
 			errors.New("unknown descriptor encoding")
 	}
@@ -562,6 +583,17 @@ func decodeDescriptor(value []byte) (
 				}
 				action.RequiresApproval = flag == 1
 			}
+			if version >= codecVersionAttestation {
+				flag, flagErr := reader.ReadByte()
+				if flagErr != nil {
+					return fleet.Descriptor{}, [sha256.Size]byte{}, flagErr
+				}
+				if flag > 1 {
+					return fleet.Descriptor{}, [sha256.Size]byte{},
+						errors.New("invalid action attestation flag")
+				}
+				action.RequiresAttestation = flag == 1
+			}
 			if action.InputSchema, err = readBytes(reader, fleet.MaxSchemaBytes); err != nil {
 				return fleet.Descriptor{}, [sha256.Size]byte{}, err
 			}
@@ -649,6 +681,19 @@ func equivalentReplay(existing, wanted fleet.Descriptor) bool {
 	existingValue, existingErr := encodeDescriptor(existing, [sha256.Size]byte{})
 	wantedValue, wantedErr := encodeDescriptor(wanted, [sha256.Size]byte{})
 	return existingErr == nil && wantedErr == nil && bytes.Equal(existingValue, wantedValue)
+}
+
+// descriptorRequiresAttestation reports whether any action needs the
+// attestation encoding.
+func descriptorRequiresAttestation(descriptor fleet.Descriptor) bool {
+	for _, capability := range descriptor.Capabilities {
+		for _, action := range capability.Actions {
+			if action.RequiresAttestation {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // descriptorRequiresApproval reports whether any action needs the approval

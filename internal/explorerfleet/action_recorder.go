@@ -152,6 +152,13 @@ func actionSessionID(audit fleet.ActionAudit) shoal.ID {
 	writeActionField(digest, audit.Record.ID)
 	writeActionField(
 		digest, []byte(strconv.FormatUint(audit.Record.Version, 10)))
+	// A refusal writes no version, so (phase, ID, version) would collapse
+	// every refusal at one version into one session and name only the
+	// first refused caller. The refusing request distinguishes them. Only
+	// this phase, so every other session ID is unchanged.
+	if audit.Phase == fleet.ClaimRefusedAttestationPhase {
+		writeActionField(digest, []byte(audit.Record.TransitionRequestID))
+	}
 	return interaction.DerivedID(
 		"session", hex.EncodeToString(digest.Sum(nil)))
 }

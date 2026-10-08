@@ -39,6 +39,10 @@ type Config struct {
 	Snapshots InteractionSnapshotProvider
 	Executors ExecutorRegistry
 	Clock     func() time.Time
+	// AttestationTrust reports which executor refs the host has an
+	// attestation trust root for. Optional: nil means none is configured, so
+	// Register refuses every action that requires attestation.
+	AttestationTrust AttestationTrust
 }
 
 type Service struct {
@@ -48,6 +52,7 @@ type Service struct {
 	snapshots InteractionSnapshotProvider
 	executors ExecutorRegistry
 	clock     func() time.Time
+	trust     AttestationTrust
 }
 
 func NewService(config Config) (*Service, error) {
@@ -61,6 +66,7 @@ func NewService(config Config) (*Service, error) {
 		store: config.Store, resolver: config.Resolver, recorder: config.Recorder,
 		snapshots: config.Snapshots,
 		executors: config.Executors, clock: config.Clock,
+		trust: config.AttestationTrust,
 	}, nil
 }
 
@@ -135,6 +141,12 @@ func (s *Service) Register(ctx context.Context, request RegisterRequest) (Descri
 	// registered state that looks operable.
 	if err := validateDeclaredEffects(spec.Capabilities,
 		executorFloor(executor), executorCeiling(executor)); err != nil {
+		return Descriptor{}, err
+	}
+	// A requirement nothing could ever satisfy would register an agent whose
+	// attested actions can never be claimed. Refused here; the message names
+	// no ref, verifier or digest.
+	if err := s.validateAttestationTrust(spec); err != nil {
 		return Descriptor{}, err
 	}
 	if spec.ParentID != "" {
@@ -703,6 +715,14 @@ func registryMutationDigest(mutation Mutation) [sha256.Size]byte {
 				writeRegistryDigestField(
 					digest, []byte("shoal.fleet.requires-approval.v1"))
 			}
+			// The same pattern, for the same reason: appended only when set,
+			// length-prefixed and tagged, so every digest written before the
+			// field existed is byte-identical and a replay cannot add or drop
+			// the requirement under one mutation identity.
+			if action.RequiresAttestation {
+				writeRegistryDigestField(
+					digest, []byte("shoal.fleet.requires-attestation.v1"))
+			}
 		}
 	}
 	writeRegistryDigestInt64(digest, descriptor.LeaseExpiresAt.UnixNano())
@@ -773,6 +793,25 @@ func validateDeclaredEffects(capabilities []Capability, floor, ceiling Effects) 
 					"action omits effects its executor causes on every "+
 						"invocation ("+strings.Join(missing, ", ")+"); the "+
 						"declaration must not understate what running it does")
+			}
+		}
+	}
+	return nil
+}
+
+// validateAttestationTrust refuses a spec in which any action requires
+// attestation while the executor ref has no configured trust root. A nil trust
+// configures none.
+func (s *Service) validateAttestationTrust(spec Spec) error {
+	for _, capability := range spec.Capabilities {
+		for _, action := range capability.Actions {
+			if !action.RequiresAttestation {
+				continue
+			}
+			if nilDependency(s.trust) || !s.trust.Configured(spec.ExecutorRef) {
+				return shoal.NewError(shoal.ErrorInvalidArgument,
+					"action requires attestation but its executor reference "+
+						"has no configured attestation trust root")
 			}
 		}
 	}
@@ -857,7 +896,13 @@ func capabilitiesSubset(child, parent []Capability) bool {
 					// shed its parent's approval would be the cheapest way
 					// round the control.
 					(wantedAction.RequiresApproval ||
-						!allowedAction.RequiresApproval) {
+						!allowedAction.RequiresApproval) &&
+					// Attestation narrows the same way. A delegate that
+					// could drop it would be a claimant path round the
+					// requirement for exactly the external work it exists
+					// to gate.
+					(wantedAction.RequiresAttestation ||
+						!allowedAction.RequiresAttestation) {
 					found = true
 					break
 				}

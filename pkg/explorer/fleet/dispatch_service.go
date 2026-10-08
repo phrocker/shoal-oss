@@ -28,6 +28,8 @@ type DispatchService struct {
 	recorder ActionRecorder
 	events   ActionEventPublisher
 	clock    func() time.Time
+	// attestations is consulted only for actions that require attestation.
+	attestations ExecutorAttestations
 }
 
 func NewDispatchService(config DispatchConfig) (*DispatchService, error) {
@@ -44,7 +46,7 @@ func NewDispatchService(config DispatchConfig) (*DispatchService, error) {
 	service := &DispatchService{
 		store: config.Store, registry: config.Registry, resolver: config.Resolver,
 		recorder: config.Recorder, events: config.Events, clock: config.Clock,
-		outbox: outbox,
+		outbox: outbox, attestations: config.Attestations,
 	}
 	return service, nil
 }
@@ -157,23 +159,37 @@ func (s *DispatchService) queuedRecord(
 	operation auth.Operation,
 	now time.Time,
 ) (ActionRecord, Action, error) {
+	record, action, _, err := s.queuedRecordBinding(
+		ctx, decision, request, operation, now)
+	return record, action, err
+}
+
+// queuedRecordBinding is queuedRecord that also returns the bound
+// descriptor's executor ref, which admission needs for the attestation read.
+func (s *DispatchService) queuedRecordBinding(
+	ctx context.Context,
+	decision auth.Decision,
+	request EnqueueRequest,
+	operation auth.Operation,
+	now time.Time,
+) (ActionRecord, Action, string, error) {
 	if err := validateOpaque("action ID", request.ID, false); err != nil {
-		return ActionRecord{}, Action{}, err
+		return ActionRecord{}, Action{}, "", err
 	}
 	if err := validateOpaque("action idempotency key", request.IdempotencyKey, false); err != nil {
-		return ActionRecord{}, Action{}, err
+		return ActionRecord{}, Action{}, "", err
 	}
 	if request.AgentGeneration <= 0 {
-		return ActionRecord{}, Action{}, shoal.NewError(shoal.ErrorInvalidArgument, "agent generation must be positive")
+		return ActionRecord{}, Action{}, "", shoal.NewError(shoal.ErrorInvalidArgument, "agent generation must be positive")
 	}
 	if err := validateName("capability", request.Capability); err != nil {
-		return ActionRecord{}, Action{}, err
+		return ActionRecord{}, Action{}, "", err
 	}
 	if err := validateName("action", request.Action); err != nil {
-		return ActionRecord{}, Action{}, err
+		return ActionRecord{}, Action{}, "", err
 	}
 	if request.Context.Deadline.Sub(now) > MaxActionDeadline {
-		return ActionRecord{}, Action{}, shoal.NewError(shoal.ErrorInvalidArgument, "action deadline exceeds its bound")
+		return ActionRecord{}, Action{}, "", shoal.NewError(shoal.ErrorInvalidArgument, "action deadline exceeds its bound")
 	}
 	// Binding, not execution: queueing work for an executor that runs out of
 	// process must not require it to be runnable here.
@@ -183,19 +199,19 @@ func (s *DispatchService) queuedRecord(
 		request.ObjectID, operation, now,
 	)
 	if err != nil {
-		return ActionRecord{}, Action{}, err
+		return ActionRecord{}, Action{}, "", err
 	}
 	input, err := validateAgainstSchema(action.InputSchema, request.Input, "action input", MaxActionPayloadBytes)
 	if err != nil {
-		return ActionRecord{}, Action{}, err
+		return ActionRecord{}, Action{}, "", err
 	}
 	reason, err := interaction.NewReason(request.Context.ReasonCode, request.Context.ReasonDetail)
 	if err != nil {
-		return ActionRecord{}, Action{}, err
+		return ActionRecord{}, Action{}, "", err
 	}
 	fingerprint, err := auth.AuthorizationFingerprint(decision)
 	if err != nil {
-		return ActionRecord{}, Action{}, err
+		return ActionRecord{}, Action{}, "", err
 	}
 	return ActionRecord{
 		ID: append([]byte(nil), request.ID...), IdempotencyKey: append([]byte(nil), request.IdempotencyKey...),
@@ -210,7 +226,7 @@ func (s *DispatchService) queuedRecord(
 		RequestID:              decision.RequestID(), CorrelationID: decision.CorrelationID(),
 		Reason: reason, Deadline: request.Context.Deadline.UTC(), CreatedAt: now, UpdatedAt: now,
 		ExecutorKey: executorKey(request.ID, request.IdempotencyKey),
-	}, action, nil
+	}, action, descriptor.ExecutorRef, nil
 }
 
 func (s *DispatchService) Invoke(ctx context.Context, request InvokeRequest) (ActionRecord, error) {
@@ -270,7 +286,7 @@ func (s *DispatchService) Claim(ctx context.Context, request ClaimRequest) (Acti
 	if request.ExpectedVersion == 0 || request.Lease <= 0 || request.Lease > MaxActionClaimTTL {
 		return ActionRecord{}, shoal.NewError(shoal.ErrorInvalidArgument, "claim version or lease is invalid")
 	}
-	current, claimedAction, authorizing, err := s.authorizedClaimant(
+	current, claimedAction, executorRef, authorizing, err := s.authorizedClaimant(
 		ctx, decision, request.ID, now)
 	if err != nil {
 		return ActionRecord{}, err
@@ -369,12 +385,25 @@ func (s *DispatchService) Claim(ctx context.Context, request ClaimRequest) (Acti
 	// authorization — true while invoke was the only way in, and false the
 	// moment execute existed, because it then refused every worker authorized
 	// under execute.
+	//
+	// The attestation is read here, after every authorization, concealment
+	// and state branch above, so a caller without standing never reaches the
+	// store and never learns the requirement exists. A store failure answers
+	// unavailable; it is never read as "not attested".
+	attestation, err := s.claimAttestation(ctx, decision,
+		effectiveClaimRequirements(current, claimedAction), executorRef, now)
+	if err != nil {
+		return ActionRecord{}, err
+	}
 	next := cloneActionRecord(current)
 	next.Version++
 	next, err = applyClaim(
 		next, claimedAction, request.ClaimID, request.Lease,
-		decision, authorizing, now)
+		decision, authorizing, now, attestation)
 	if err != nil {
+		if errors.Is(err, ErrAttestationRequired) {
+			s.auditAttestationRefusal(ctx, current, authorizing, decision)
+		}
 		return ActionRecord{}, err
 	}
 	if err := s.recorder.RecordAction(ctx, ActionAudit{Phase: "claim_admission", Operation: authorizing, Record: next}); err != nil {
@@ -409,6 +438,17 @@ func (s *DispatchService) Claim(ctx context.Context, request ClaimRequest) (Acti
 //
 // The fence is incremented rather than assigned, so a re-claim advances it and
 // a record that has never been claimed lands on one.
+//
+// It is also the one place a claim's attestation is judged (#446). Callers do
+// the store read (DispatchService.claimAttestation) and pass the result in;
+// the gate refuses unless it is current and expires at or after the lease end
+// this claim would carry. ExtendClaim, which renews without going through
+// here, applies the same attestationGate to its clamped extended end.
+//
+// ExecuteClaim needs no re-check, and must not grow one: a claim is granted
+// only under an attestation that outlives its lease, so an attestation cannot
+// expire while its claim is live, and ExecuteClaim refuses a claim whose lease
+// has lapsed. A second gate there would be a second definition to drift.
 func applyClaim(
 	record ActionRecord,
 	action Action,
@@ -417,7 +457,13 @@ func applyClaim(
 	decision auth.Decision,
 	authorizing auth.Operation,
 	now time.Time,
+	attestation ExecutorAttestation,
 ) (ActionRecord, error) {
+	leaseUntil := claimLeaseEnd(now, lease, record.Deadline)
+	required := effectiveClaimRequirements(record, action)
+	if err := attestationGate(required, attestation, leaseUntil); err != nil {
+		return ActionRecord{}, err
+	}
 	// The incoming claimant's chain is bounded here, by the bound a *retained*
 	// holder's chain is subject to, because this is where the asymmetry between
 	// the two became a brick.
@@ -516,6 +562,9 @@ func applyClaim(
 			// consequence, because heldClaimAt keys on the fence, and wrong in
 			// evidence an operator reads.
 			HeldAt: record.ClaimLeaseUntil.Add(-record.ClaimLease),
+			// The attestation that holder's claim stood on, so the history
+			// says which statement covered each attempt.
+			AttestationID: record.ClaimAttestationID,
 		})
 	}
 	// Who holds the claim, as distinct from which claim is held. A re-claim
@@ -529,9 +578,12 @@ func applyClaim(
 		[]shoal.ID(nil), decision.OnBehalfOf()...)
 	record.ClaimFence++
 	record.ClaimLease = lease
-	record.ClaimLeaseUntil = now.Add(lease)
-	if record.ClaimLeaseUntil.After(record.Deadline) {
-		record.ClaimLeaseUntil = record.Deadline
+	record.ClaimLeaseUntil = leaseUntil
+	// Claim-scoped: a re-claim moves it, and a claim of an action that does
+	// not require attestation carries none.
+	record.ClaimAttestationID = ""
+	if required.Attestation {
+		record.ClaimAttestationID = attestation.ID
 	}
 	record.UpdatedAt = now
 	// Actor is deliberately not written here. It names the principal the record
@@ -882,7 +934,7 @@ func (s *DispatchService) completeClaim(
 		request.Result.ErrorCode); err != nil {
 		return ActionRecord{}, err
 	}
-	current, action, authorizing, err := s.authorizedClaimant(
+	current, action, _, authorizing, err := s.authorizedClaimant(
 		ctx, decision, request.ID, now)
 	if err != nil {
 		return ActionRecord{}, err
@@ -1403,7 +1455,7 @@ func (s *DispatchService) ExtendClaim(
 		"claim ID", request.ClaimID, false); err != nil {
 		return ActionRecord{}, err
 	}
-	current, _, authorizing, err := s.authorizedClaimant(
+	current, claimedAction, executorRef, authorizing, err := s.authorizedClaimant(
 		ctx, decision, request.ID, now)
 	if err != nil {
 		return ActionRecord{}, err
@@ -1442,10 +1494,33 @@ func (s *DispatchService) ExtendClaim(
 			shoal.ErrorInvalidArgument,
 			"claim extension does not move the lease forward")
 	}
+	// The same gate applyClaim applies, against the *clamped* end the record
+	// will carry: an extension is a grant of more lease, and a claim never
+	// outlives its attestation. After every standing and state branch above,
+	// so only the holder of a live claim learns of the requirement. A refusal
+	// writes nothing, so the claim survives to its current lease end; the
+	// worker re-attests and extends again.
+	//
+	// Stricter wins: a requirement registered while this claim is live
+	// applies to its extension. The claim itself is not revoked — it runs to
+	// its current lease end — but it is renewed only for an attested holder.
+	required := effectiveClaimRequirements(current, claimedAction)
+	attestation, err := s.claimAttestation(
+		ctx, decision, required, executorRef, now)
+	if err != nil {
+		return ActionRecord{}, err
+	}
+	if err := attestationGate(required, attestation, extended); err != nil {
+		s.auditAttestationRefusal(ctx, current, authorizing, decision)
+		return ActionRecord{}, err
+	}
 	next := cloneActionRecord(current)
 	next.Version++
 	next.ClaimLease = request.Lease
 	next.ClaimLeaseUntil = extended
+	if required.Attestation {
+		next.ClaimAttestationID = attestation.ID
+	}
 	next.UpdatedAt = now
 	next.TransitionRequestID = decision.RequestID()
 	next.TransitionCorrelationID = decision.CorrelationID()
@@ -1555,7 +1630,7 @@ func (s *DispatchService) ReportAmbiguity(
 		return ActionRecord{}, shoal.NewError(
 			shoal.ErrorInvalidArgument, "ambiguity reference exceeds its bound")
 	}
-	current, _, authorizing, err := s.authorizedClaimant(
+	current, _, _, authorizing, err := s.authorizedClaimant(
 		ctx, decision, request.ID, now)
 	if err != nil {
 		return ActionRecord{}, err
@@ -2158,22 +2233,25 @@ func (s *DispatchService) deadline(ctx context.Context, request RequestContext) 
 // distinguishable answers — the absent-versus-foreign normalisation is what
 // stops this surface being an existence oracle (#398), and adding a second way
 // in is exactly how that gets reopened.
+//
+// It also returns the descriptor's executor ref, which is what an attestation
+// is keyed by.
 func (s *DispatchService) authorizedClaimant(
 	ctx context.Context, decision auth.Decision, id []byte, now time.Time,
-) (ActionRecord, Action, auth.Operation, error) {
-	record, action, err := s.authorizedCurrent(ctx, decision, id, auth.OperationExecute, false, now)
+) (ActionRecord, Action, string, auth.Operation, error) {
+	record, action, ref, err := s.authorizedCurrentBinding(ctx, decision, id, auth.OperationExecute, false, now)
 	if err == nil {
-		return record, action, auth.OperationExecute, nil
+		return record, action, ref, auth.OperationExecute, nil
 	}
 	// Only an authorization answer is worth a second attempt. A malformed ID or
 	// a store failure is the same answer either way, and retrying it would turn
 	// one fault into two store reads.
 	if !shoal.IsErrorCode(err, shoal.ErrorNotFound) &&
 		!shoal.IsErrorCode(err, shoal.ErrorUnauthorized) {
-		return ActionRecord{}, Action{}, "", err
+		return ActionRecord{}, Action{}, "", "", err
 	}
-	record, action, err = s.authorizedCurrent(ctx, decision, id, auth.OperationInvoke, true, now)
-	return record, action, auth.OperationInvoke, err
+	record, action, ref, err = s.authorizedCurrentBinding(ctx, decision, id, auth.OperationInvoke, true, now)
+	return record, action, ref, auth.OperationInvoke, err
 }
 
 // authorizedCurrent resolves an existing action for one operation.
@@ -2184,8 +2262,16 @@ func (s *DispatchService) authorizedClaimant(
 // grant on the descriptor is the authorization and requiring the enqueuer's
 // identity is what made an out-of-process executor impossible.
 func (s *DispatchService) authorizedCurrent(ctx context.Context, decision auth.Decision, id []byte, operation auth.Operation, requirePrincipal bool, now time.Time) (ActionRecord, Action, error) {
+	record, action, _, err := s.authorizedCurrentBinding(
+		ctx, decision, id, operation, requirePrincipal, now)
+	return record, action, err
+}
+
+// authorizedCurrentBinding is authorizedCurrent that also returns the bound
+// descriptor's executor ref.
+func (s *DispatchService) authorizedCurrentBinding(ctx context.Context, decision auth.Decision, id []byte, operation auth.Operation, requirePrincipal bool, now time.Time) (ActionRecord, Action, string, error) {
 	if err := validateOpaque("action ID", id, false); err != nil {
-		return ActionRecord{}, Action{}, err
+		return ActionRecord{}, Action{}, "", err
 	}
 	current, err := s.store.GetAction(ctx, id)
 	if err != nil {
@@ -2203,12 +2289,12 @@ func (s *DispatchService) authorizedCurrent(ctx context.Context, decision auth.D
 		// this function, and a per-caller fix is a fix that the next caller
 		// forgets.
 		if errors.Is(err, ErrActionNotFound) {
-			return ActionRecord{}, Action{}, auth.ObjectNotFound()
+			return ActionRecord{}, Action{}, "", auth.ObjectNotFound()
 		}
-		return ActionRecord{}, Action{}, err
+		return ActionRecord{}, Action{}, "", err
 	}
 	if requirePrincipal && !sameActionPrincipal(decision, current) {
-		return ActionRecord{}, Action{}, auth.ObjectNotFound()
+		return ActionRecord{}, Action{}, "", auth.ObjectNotFound()
 	}
 	// Operation mapping is explicit: claim/complete/pull use execute and fall
 	// back to invoke for the enqueuing principal, while cancel/status use
@@ -2221,7 +2307,7 @@ func (s *DispatchService) authorizedCurrent(ctx context.Context, decision auth.D
 		PolicyID:            current.PolicyID,
 		ObjectID:            shoal.ID(current.ID),
 	}, now); err != nil {
-		return ActionRecord{}, Action{}, auth.ObjectNotFound()
+		return ActionRecord{}, Action{}, "", auth.ObjectNotFound()
 	}
 	// resolveActionBinding, not resolveAction: claiming, cancelling, inspecting
 	// and completing an action must work for an executor that runs out of
@@ -2235,13 +2321,13 @@ func (s *DispatchService) authorizedCurrent(ctx context.Context, decision auth.D
 	// became false the moment execute existed: a worker authorized under
 	// execute was refused by the second call. Handing back the declaration
 	// removes the duplicate gate instead of teaching it the second operation.
-	_, resolved, _, err := s.registry.resolveActionBinding(ctx, decision, current.AgentID, current.AgentGeneration,
+	descriptor, resolved, _, err := s.registry.resolveActionBinding(ctx, decision, current.AgentID, current.AgentGeneration,
 		current.Capability, current.Action, current.SourceID, current.PolicyID, current.ObjectID,
 		operation, now)
 	if err != nil {
 		if shoal.IsErrorCode(err, shoal.ErrorUnauthorized) ||
 			shoal.IsErrorCode(err, shoal.ErrorNotFound) {
-			return ActionRecord{}, Action{}, auth.ObjectNotFound()
+			return ActionRecord{}, Action{}, "", auth.ObjectNotFound()
 		}
 		// Without the principal check, every failure here is one answer.
 		//
@@ -2258,11 +2344,11 @@ func (s *DispatchService) authorizedCurrent(ctx context.Context, decision auth.D
 		// normalisation was written, which is why it is collapsed here rather
 		// than at the one caller that noticed.
 		if !requirePrincipal {
-			return ActionRecord{}, Action{}, auth.ObjectNotFound()
+			return ActionRecord{}, Action{}, "", auth.ObjectNotFound()
 		}
-		return ActionRecord{}, Action{}, err
+		return ActionRecord{}, Action{}, "", err
 	}
-	return cloneActionRecord(current), resolved, nil
+	return cloneActionRecord(current), resolved, descriptor.ExecutorRef, nil
 }
 
 // claimableBy reports whether this caller may take this record, by either

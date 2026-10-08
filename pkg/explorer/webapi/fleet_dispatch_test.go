@@ -715,6 +715,20 @@ func TestFleetDispatchErrorMarksEveryIndeterminateJoin(t *testing.T) {
 			false, shoal.ErrorUnavailable},
 		{"approval required", fleet.ErrApprovalRequired,
 			false, shoal.ErrorConflict},
+		// A pre-commit refusal: raised by the gate before any write, never
+		// joined with an indeterminate sentinel, so its 409 sits above the
+		// indeterminate arm without hiding a commit.
+		{"attestation required", fleet.ErrAttestationRequired,
+			false, shoal.ErrorConflict},
+		{"attestation required as the service returns it",
+			shoal.WrapError(shoal.ErrorConflict, "action requires a current executor attestation", fleet.ErrAttestationRequired),
+			false, shoal.ErrorConflict},
+		// A store failure: nothing written, a clean unavailable.
+		{"attestation store unavailable", fleet.ErrAttestationUnavailable,
+			false, shoal.ErrorUnavailable},
+		{"attestation store unavailable as the service returns it",
+			shoal.WrapError(shoal.ErrorUnavailable, "executor attestation is unavailable", fleet.ErrAttestationUnavailable),
+			false, shoal.ErrorUnavailable},
 	} {
 		t.Run(probe.name, func(t *testing.T) {
 			mapped := fleetDispatchError(probe.err)

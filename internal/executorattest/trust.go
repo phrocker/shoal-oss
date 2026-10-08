@@ -218,3 +218,17 @@ func keyDigest(key ed25519.PublicKey) string {
 	sum := sha256.Sum256(key)
 	return digestPrefix + hex.EncodeToString(sum[:])
 }
+
+// Refs returns the configured executor refs, sorted. Hosts use it to check
+// that every attested ref is also bound for external work.
+func (t *Trust) Refs() []string {
+	if t == nil {
+		return nil
+	}
+	refs := make([]string, 0, len(t.executors))
+	for ref := range t.executors {
+		refs = append(refs, ref)
+	}
+	slices.Sort(refs)
+	return refs
+}

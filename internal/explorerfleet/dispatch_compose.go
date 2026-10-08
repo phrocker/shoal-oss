@@ -24,6 +24,23 @@ func ComposeDispatch(
 	visibility []byte,
 	clock func() time.Time,
 ) (*fleet.DispatchService, error) {
+	return ComposeDispatchWithAttestations(runtime, registry, resolver,
+		recorder, events, visibility, clock, nil)
+}
+
+// ComposeDispatchWithAttestations is ComposeDispatch with the executor
+// attestation read every claim on an attestation-required action makes. Nil
+// means none is ever current, so those claims are refused.
+func ComposeDispatchWithAttestations(
+	runtime *explorercoord.Runtime,
+	registry *fleet.Service,
+	resolver auth.Resolver,
+	recorder fleet.ActionRecorder,
+	events fleet.ActionEventPublisher,
+	visibility []byte,
+	clock func() time.Time,
+	attestations fleet.ExecutorAttestations,
+) (*fleet.DispatchService, error) {
 	store, err := NewDispatchStore(runtime, visibility)
 	if err != nil {
 		return nil, err
@@ -31,5 +48,6 @@ func ComposeDispatch(
 	return fleet.NewDispatchService(fleet.DispatchConfig{
 		Store: store, Registry: registry, Resolver: resolver,
 		Recorder: recorder, Events: events, Clock: clock,
+		Attestations: attestations,
 	})
 }

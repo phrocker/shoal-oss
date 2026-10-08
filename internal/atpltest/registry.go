@@ -80,6 +80,13 @@ func (e Executors) ResolveExecutor(ref string) (fleet.Executor, bool) {
 	return executor, ok
 }
 
+type trustAll Executors
+
+func (t trustAll) Configured(ref string) bool {
+	_, ok := t[ref]
+	return ok
+}
+
 // Registry is a fleet.Service with everything it depends on held in memory.
 type Registry struct {
 	Service   *fleet.Service
@@ -106,6 +113,11 @@ func NewRegistry(t testing.TB, clock *Clock, executors Executors, sources, polic
 	registry.Service, err = fleet.NewService(fleet.Config{
 		Store: registry.Store, Resolver: authority.Resolver(), Recorder: registry.Recorder,
 		Snapshots: snapshot{clock}, Executors: executors, Clock: clock.Now,
+		// Every host executor has an attestation trust root here, so a
+		// policy requiring attestation registers as it would on a host
+		// configured with -fleet-executor-attestation. The no-trust-root
+		// refusal is pinned in pkg/explorer/fleet.
+		AttestationTrust: trustAll(executors),
 	})
 	if err != nil {
 		t.Fatal(err)

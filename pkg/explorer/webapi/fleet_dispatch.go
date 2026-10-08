@@ -346,6 +346,33 @@ func fleetDispatchError(err error) error {
 			shoal.ErrorConflict,
 			"action requires approval; request it through the approval route",
 			err)
+	// Beside approval, above the indeterminate arm, and safe there for one
+	// reason: ErrAttestationRequired is a pre-commit refusal. Claim,
+	// ExtendClaim and the admission grant raise it from the gate before any
+	// audit or store write, and nothing joins it with ErrExecutionAmbiguous or
+	// ErrActionCommitted — so matching it first can never hide a write that
+	// landed. TestFleetDispatchErrorMarksEveryIndeterminateJoin asserts it is
+	// unmarked. Conflict for approval's reason: the caller has standing and
+	// the request is well formed; the remedy is to present an attestation
+	// that covers the lease and retry. The message names no verifier, digest
+	// or attestation.
+	case errors.Is(err, fleet.ErrAttestationRequired):
+		if shoal.IsErrorCode(err, shoal.ErrorConflict) {
+			return err
+		}
+		return shoal.WrapError(
+			shoal.ErrorConflict,
+			"action requires a current executor attestation covering the claim lease; "+
+				"present one and retry",
+			err)
+	// A store failure is unavailable, unmarked: nothing was written, so a
+	// retry is safe, and it is never read as "not attested".
+	case errors.Is(err, fleet.ErrAttestationUnavailable):
+		if shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
+			return err
+		}
+		return shoal.WrapError(shoal.ErrorUnavailable,
+			"executor attestation is unavailable", err)
 	// The two sentinels that mean something durable may have happened, marked
 	// so writeError sets Shoal-Commit-Outcome: indeterminate and the body
 	// flag. Before this arm existed all three below shared one, so a caller

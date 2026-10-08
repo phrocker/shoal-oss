@@ -283,6 +283,21 @@ type Action struct {
 	// flag lands. Delegation and re-registration cannot clear it: dropping it
 	// widens authority, which capabilitiesSubset refuses.
 	RequiresApproval bool `json:"requires_approval,omitempty"`
+	// RequiresAttestation admits a claimant to this action only while it holds
+	// a current verified executor attestation for the descriptor's executor
+	// ref, covering the whole lease it is granted (#446). Every path that
+	// grants a claim — dispatch Claim, ExtendClaim and the born-claimed
+	// admission grant — goes through one gate (attestationCovers, applied in
+	// applyClaim); completion, ambiguity reports, status and cancel are never
+	// gated.
+	//
+	// It is accepted only on an action whose effects include
+	// EffectMutatesExternal, and Register refuses it for an executor ref the
+	// host has no attestation trust root for. Like approval it narrows in one
+	// direction: a delegate or a later generation may add it and never drop
+	// it (capabilitiesSubset). Registering it is a new generation; see
+	// docs/executor-attestation.md, "Policy flip".
+	RequiresAttestation bool `json:"requires_attestation,omitempty"`
 }
 
 // legacyEffect projects a set onto the superseded scalar spelling.
@@ -332,12 +347,16 @@ func (a Action) MarshalJSON() ([]byte, error) {
 		// approval marshals byte-for-byte as it did before the field
 		// existed and descriptorDigest is unchanged for it.
 		RequiresApproval bool `json:"requires_approval,omitempty"`
+		// Omitted when false for the same reason, so every descriptor
+		// without the requirement keeps its bytes and digest.
+		RequiresAttestation bool `json:"requires_attestation,omitempty"`
 	}
 	return json.Marshal(actionFields{
 		Name: a.Name, InputSchema: a.InputSchema,
 		OutputSchema: a.OutputSchema, Effects: a.Effects,
-		LegacyEffect:     a.Effects.legacyEffect(),
-		RequiresApproval: a.RequiresApproval,
+		LegacyEffect:        a.Effects.legacyEffect(),
+		RequiresApproval:    a.RequiresApproval,
+		RequiresAttestation: a.RequiresAttestation,
 	})
 }
 
@@ -360,12 +379,13 @@ func (a Action) MarshalJSON() ([]byte, error) {
 // outer decoder cannot reach through a custom unmarshaler.
 func (a *Action) UnmarshalJSON(data []byte) error {
 	type actionFields struct {
-		Name             string          `json:"name"`
-		InputSchema      json.RawMessage `json:"input_schema"`
-		OutputSchema     json.RawMessage `json:"output_schema"`
-		Effects          Effects         `json:"effects"`
-		LegacyEffect     *Effect         `json:"effect"`
-		RequiresApproval bool            `json:"requires_approval"`
+		Name                string          `json:"name"`
+		InputSchema         json.RawMessage `json:"input_schema"`
+		OutputSchema        json.RawMessage `json:"output_schema"`
+		Effects             Effects         `json:"effects"`
+		LegacyEffect        *Effect         `json:"effect"`
+		RequiresApproval    bool            `json:"requires_approval"`
+		RequiresAttestation bool            `json:"requires_attestation"`
 	}
 	var fields actionFields
 	decoder := json.NewDecoder(bytes.NewReader(data))
@@ -393,7 +413,8 @@ func (a *Action) UnmarshalJSON(data []byte) error {
 	*a = Action{
 		Name: fields.Name, InputSchema: fields.InputSchema,
 		OutputSchema: fields.OutputSchema, Effects: fields.Effects,
-		RequiresApproval: fields.RequiresApproval,
+		RequiresApproval:    fields.RequiresApproval,
+		RequiresAttestation: fields.RequiresAttestation,
 	}
 	return nil
 }
@@ -693,10 +714,20 @@ func canonicalCapabilities(input []Capability) ([]Capability, error) {
 			if err != nil {
 				return nil, err
 			}
+			// Attestation is a requirement on who may perform an external
+			// effect. On an action that declares none it would gate nothing
+			// Shoal does not already perform itself, and accepting it there
+			// would let a descriptor read as attested while asserting nothing.
+			if action.RequiresAttestation && !effects.contains(EffectMutatesExternal) {
+				return nil, shoal.NewError(shoal.ErrorInvalidArgument,
+					"action requires attestation but does not declare the "+
+						"external effect; attestation applies only to external work")
+			}
 			result[i].Actions[j] = Action{
 				Name: action.Name, InputSchema: inputSchema,
 				OutputSchema: outputSchema, Effects: effects,
-				RequiresApproval: action.RequiresApproval,
+				RequiresApproval:    action.RequiresApproval,
+				RequiresAttestation: action.RequiresAttestation,
 			}
 		}
 		sort.Slice(result[i].Actions, func(a, b int) bool {
@@ -781,6 +812,9 @@ func cloneDescriptor(input Descriptor) Descriptor {
 				// A clone that dropped the flag would hand every reader of
 				// a descriptor an action that no longer requires approval.
 				RequiresApproval: action.RequiresApproval,
+				// Likewise: a clone without it would hand every reader an
+				// action whose claims no longer need an attestation.
+				RequiresAttestation: action.RequiresAttestation,
 			}
 		}
 	}
