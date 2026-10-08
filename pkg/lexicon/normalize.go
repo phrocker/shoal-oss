@@ -198,7 +198,15 @@ func stripIgnorables(text string) (string, []int, []int) {
 	origEnd := make([]int, 0, len(text))
 	for index := 0; index < len(text); {
 		r, size := utf8.DecodeRuneInString(text[index:])
-		if !ignorable(r) {
+		switch {
+		case r == utf8.RuneError && size == 1:
+			// An invalid byte becomes 0xFF, which no UTF-8 sequence contains,
+			// so removing an ignorable between invalid bytes can never join
+			// them into a valid character.
+			cleaned = append(cleaned, 0xff)
+			origStart = append(origStart, index)
+			origEnd = append(origEnd, index+1)
+		case !ignorable(r):
 			cleaned = append(cleaned, text[index:index+size]...)
 			for range size {
 				origStart = append(origStart, index)

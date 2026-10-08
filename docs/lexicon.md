@@ -45,7 +45,7 @@ caller's current authorization.
 Fullwidth forms, ligatures and `ß` normalize (`ＡＢＣ` → `abc`, `ﬁle` → `file`,
 `Straße` → `strasse`). Camel case is not split. Folding does not depend on
 locale, so `İ` folds to `i` plus a combining dot, not to `i`. Every token is a
-fixed point: tokenizing it again gives exactly it. `FuzzTokenize` checks this.
+fixed point: tokenizing it again gives exactly it. `FuzzTokenize` checks this, and that each token's source span tokenizes back to exactly that token (or, for a span shared by two tokens of one compatibility expansion such as `¾`, still contains it).
 `NormalizationVersion` and the x/text and stdlib Unicode versions are written
 into every bundle, so a change to tokenization, or a toolchain that brings other
 Unicode tables, gives a new bundle ID. A bundle built under other tables is
@@ -121,6 +121,20 @@ chooses leftmost-longest spans. A span with two or more visible nodes is marked
   `Load`. Filtering at match time cannot protect bytes someone already holds, so
   only this kind ships.
 
+Inside the module, the hook is guarded twice. The sealer is set once:
+`pkg/lexicon` installs it at init, and any later `Install` panics. A test
+walks every Go file in the module and fails if any package other than
+`pkg/lexicon` and `pkg/explorer/authorized` imports `internal/lexiconscope`.
+
+**Only a freshly built bundle ships.** `ForShipping` succeeds only for a bundle
+that `Build` made from `ScopedNodes` in this process. A bundle obtained through
+`Load` never ships, even when its bytes say `ScopePinned`. The digest in bundle
+bytes is an **unauthenticated label**: anyone holding bytes can write any digest
+there, for example one copied from another caller's `Shippable.Scope()`. A
+recipient that needs to know a bundle's scope must get it from the authorized
+party that built the bundle, not from the bytes. `Load` also refuses pinned
+bytes that carry templates, which `Build` never produces.
+
 A pinned bundle carries **no lookup templates**: `Build` refuses relationships
 for it. Templates reveal relation types, and no authorized filter for published
 ontology exists yet (see Deferred).
@@ -171,11 +185,17 @@ those for an unknown name of the same shape. They also cover:
 - a caller with only `Neighborhood` (resolves);
 - a generation change during the call (fails);
 - scoped builds: no hidden bytes, different scopes per caller, generation and
-  snapshot, and no way to widen or forge a scope.
+  snapshot, and no way to widen or forge a scope;
+- relabeling the admin's bundle bytes with alice's digest: it loads, claims
+  alice's scope, and cannot ship;
+- reloading a freshly built bundle: it does not ship either.
 
 A mutation pass (one change at a time) checked that the security-relevant checks
-are covered. Three changes survive, each because a second check covers the
+are covered. Four changes survive, each because a second check covers the
 same case:
+
+- marking every built bundle as minted (`ForShipping` also requires a pinned
+  scope, which only a `ScopedNodes` build has);
 
 - dropping the generation term from the scope digest (the fingerprint already
   includes the generation);

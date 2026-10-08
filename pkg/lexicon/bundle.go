@@ -46,6 +46,9 @@ type bundleState struct {
 	maxTermTokens int
 	maxPostings   int
 	automaton     automaton
+	// minted is set only by Build from ScopedNodes. It is not serialized: a
+	// pinned digest read from bytes is an unauthenticated label.
+	minted bool
 }
 
 func newBundle(data []byte, c *contents) *Bundle {
@@ -118,10 +121,15 @@ type Shippable struct {
 	bundle Bundle
 }
 
-// ForShipping returns the shippable view of a pinned bundle, and false for a
-// server-filtered bundle.
+// ForShipping returns the shippable view of a pinned bundle that Build made
+// from ScopedNodes in this process, and false otherwise. A server-filtered
+// bundle never ships. Neither does a loaded bundle, even one whose bytes say
+// ScopePinned: the digest in bundle bytes is an unauthenticated label that
+// anyone holding bytes could have written, so shipping requires building the
+// bundle afresh from an authorized scope filter.
 func (bb *Bundle) ForShipping() (Shippable, bool) {
-	if _, ok := bb.get().contents.scope.(ScopePinned); !ok {
+	state := bb.get()
+	if _, ok := state.contents.scope.(ScopePinned); !ok || !state.minted {
 		return Shippable{}, false
 	}
 	return Shippable{bundle: *bb}, true

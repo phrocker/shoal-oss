@@ -22,6 +22,7 @@ package lexicon
 import (
 	"crypto/sha256"
 	"encoding/binary"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -178,6 +179,65 @@ func validTemplate(mutate func(*Template)) Template {
 	return template
 }
 
+func TestLoadedPinnedBundlesNeverShip(t *testing.T) {
+	server := internalBundle(t).get().contents
+	digest := [32]byte{7, 7, 7}
+
+	// Crafted bytes: a pinned scope over the server-filtered contents, with
+	// templates Build would never put there, are refused.
+	withTemplates := cloneContents(server)
+	withTemplates.scope = ScopePinned{digest: digest}
+	withTemplates.templates = []Template{validTemplate(func(*Template) {})}
+	data, err := encode(withTemplates)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(data); err == nil {
+		t.Fatal("pinned bundle with templates loaded")
+	}
+
+	// Without templates the bytes decode, but the claimed digest is only a
+	// label: the loaded bundle cannot ship.
+	claimed := cloneContents(server)
+	claimed.scope = ScopePinned{digest: digest}
+	data, err = encode(claimed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := Load(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := loaded.ForShipping(); ok {
+		t.Fatal("bundle loaded from crafted pinned bytes is shippable")
+	}
+
+	// A bundle Build makes from ScopedNodes ships; the same bytes loaded
+	// back do not.
+	built, err := Build(Input{Scoped: ptr(sealScopedNodes([]graph.Node{
+		{ID: "a", Properties: shoal.Metadata{"name": "alpha"}},
+	}, Snapshot{ID: "s", AsOf: time.Unix(1, 0)}, digest))}, Limits{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	shippable, ok := built.ForShipping()
+	if !ok {
+		t.Fatal("freshly built pinned bundle is not shippable")
+	}
+	reloaded, err := Load(shippable.Bytes())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reloaded.ID() != built.ID() || reloaded.Scope() != built.Scope() {
+		t.Fatal("reload changed the bundle")
+	}
+	if _, ok := reloaded.ForShipping(); ok {
+		t.Fatal("reloaded pinned bundle is shippable")
+	}
+}
+
+func ptr[T any](value T) *T { return &value }
+
 func TestLoadAcceptsValidTemplate(t *testing.T) {
 	c := cloneContents(internalBundle(t).get().contents)
 	c.templates = []Template{validTemplate(func(*Template) {})}
@@ -202,8 +262,27 @@ func FuzzTokenize(f *testing.F) {
 	f.Fuzz(func(t *testing.T, text string) {
 		// Two tokens from one compatibility expansion ("¾" is "3⁄4") share
 		// that source character, so spans may overlap but never go back.
+		tokens := Tokenize(text)
+		for index, token := range tokens {
+			// Coverage: a token's span re-tokenizes to exactly that token,
+			// unless the span is shared with a neighbour from the same
+			// compatibility expansion, in which case it still yields it.
+			again := Tokenize(text[token.Start:token.End])
+			shared := (index > 0 && tokens[index-1].End > token.Start) ||
+				(index+1 < len(tokens) && tokens[index+1].Start < token.End)
+			if !shared && (len(again) != 1 || again[0].Text != token.Text) {
+				t.Fatalf("span %q of token %q re-tokenizes to %#v",
+					text[token.Start:token.End], token.Text, again)
+			}
+			if shared && !slices.ContainsFunc(again, func(other Token) bool {
+				return other.Text == token.Text
+			}) {
+				t.Fatalf("shared span %q lost token %q: %#v",
+					text[token.Start:token.End], token.Text, again)
+			}
+		}
 		start, end := 0, 0
-		for _, token := range Tokenize(text) {
+		for _, token := range tokens {
 			if !canonicalToken(token.Text) && len(token.Text) <= HardMaxTokenBytes {
 				t.Fatalf("token %q of %q is not canonical", token.Text, text)
 			}

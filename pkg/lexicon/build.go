@@ -269,8 +269,15 @@ func Build(in Input, limits Limits) (*Bundle, error) {
 		return nil, limitExceeded("bundle byte")
 	}
 	// Loading the encoded bytes is the only way a Bundle is made, so a built
-	// bundle and a loaded one cannot differ.
-	return Load(encoded)
+	// bundle and a loaded one cannot differ in content.
+	bundle, err := Load(encoded)
+	if err != nil {
+		return nil, err
+	}
+	// Only a bundle built here from ScopedNodes may ship. Loaded bytes can
+	// claim any pinned digest, so a loaded bundle is never shippable.
+	bundle.get().minted = in.Scoped != nil
+	return bundle, nil
 }
 
 // termSeparator joins tokens into a map key. It is never a word rune.

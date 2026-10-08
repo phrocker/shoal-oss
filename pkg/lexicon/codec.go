@@ -365,6 +365,10 @@ func decode(data []byte) (*contents, error) {
 	}
 
 	c.templates = make([]Template, d.count(4+4+1+4+4+4))
+	if _, pinned := c.scope.(ScopePinned); pinned && len(c.templates) > 0 {
+		// Build never puts templates in a pinned bundle.
+		return nil, malformed()
+	}
 	for index := range c.templates {
 		template := Template{ID: d.str(), RelationKey: d.str(), Direction: Direction(d.u8())}
 		template.SubjectConcepts = decodeIDs(d)

@@ -486,6 +486,30 @@ func TestLexiconScopeBuildHoldsNoHiddenBytes(t *testing.T) {
 		}, lexicon.Limits{}); err == nil {
 			t.Fatal("hand-made scoped nodes accepted")
 		}
+		// Loaded bytes never ship, so copying alice's scope label onto the
+		// admin's bytes yields a bundle that claims alice's scope but cannot
+		// be shipped as hers.
+		aliceShippable, _ := aliceBundle.ForShipping()
+		adminShippable, _ := adminBundle.ForShipping()
+		aliceDigest := aliceShippable.Scope().Digest()
+		adminDigest := adminShippable.Scope().Digest()
+		forged := bytes.Replace(adminBytes, adminDigest[:], aliceDigest[:], 1)
+		if bytes.Equal(forged, adminBytes) {
+			t.Fatal("admin digest not found in its bytes")
+		}
+		relabeled, err := lexicon.Load(forged)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if relabeled.Scope() != aliceBundle.Scope() {
+			t.Fatal("relabeled bundle does not claim alice's scope")
+		}
+		if _, ok := relabeled.ForShipping(); ok {
+			t.Fatal("relabeled bundle is shippable")
+		}
+		if _, ok := loaded.ForShipping(); ok {
+			t.Fatal("alice's reloaded bundle is shippable")
+		}
 		// Alice's own bundle still resolves her names.
 		if got := w.resolve(w.f.alice(t), loaded, "PayGW"); got.err != nil ||
 			len(got.mentions) != 1 || got.mentions[0].Ambiguous {

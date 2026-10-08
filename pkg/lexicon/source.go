@@ -133,14 +133,14 @@ func sealScopedNodes(
 }
 
 func init() {
-	lexiconscope.Seal = func(
+	lexiconscope.Install(func(
 		nodes []graph.Node, snapshotID string, asOf time.Time, frontier uint64,
 		digest [32]byte,
 	) any {
 		return sealScopedNodes(nodes, Snapshot{
 			ID: snapshotID, AsOf: asOf, Frontier: frontier,
 		}, digest)
-	}
+	})
 }
 
 const (

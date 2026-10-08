@@ -18,10 +18,12 @@
  */
 
 // Package lexiconscope carries the one capability that turns an authorized
-// node filter's output into lexicon.ScopedNodes. pkg/lexicon installs Seal at
-// init; pkg/explorer/authorized calls it. Being internal to the module, it is
-// not reachable by API consumers, so a pinned lexicon bundle cannot be built
-// from a node set that did not pass the authorized filter.
+// node filter's output into lexicon.ScopedNodes. pkg/lexicon installs the
+// sealer once, at init; pkg/explorer/authorized calls Seal. Being internal to
+// the module, it is not reachable by API consumers, and
+// TestOnlyLexiconAndAuthorizedImportLexiconScope keeps every other package in
+// the module from importing it, so a pinned lexicon bundle cannot be built from
+// a node set that did not pass the authorized filter.
 package lexiconscope
 
 import (
@@ -30,10 +32,35 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/graph"
 )
 
-// Seal returns a lexicon.ScopedNodes (as any, to avoid an import cycle). It
-// is set when pkg/lexicon is initialized, which importing pkg/lexicon
-// guarantees happens first.
-var Seal func(
+// Sealer builds a lexicon.ScopedNodes, returned as any to avoid an import
+// cycle.
+type Sealer func(
 	nodes []graph.Node, snapshotID string, asOf time.Time, frontier uint64,
 	digest [32]byte,
 ) any
+
+var sealer Sealer
+
+// Install sets the sealer. pkg/lexicon calls it from init; any second call
+// panics, so nothing can replace the sealer afterwards.
+func Install(seal Sealer) {
+	if seal == nil {
+		panic("lexiconscope: nil sealer")
+	}
+	if sealer != nil {
+		panic("lexiconscope: sealer already installed")
+	}
+	sealer = seal
+}
+
+// Seal returns a lexicon.ScopedNodes. Importing pkg/lexicon guarantees its
+// init, and so Install, ran first.
+func Seal(
+	nodes []graph.Node, snapshotID string, asOf time.Time, frontier uint64,
+	digest [32]byte,
+) any {
+	if sealer == nil {
+		panic("lexiconscope: pkg/lexicon is not initialized")
+	}
+	return sealer(nodes, snapshotID, asOf, frontier, digest)
+}
