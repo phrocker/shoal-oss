@@ -10,7 +10,7 @@ import "fmt"
 // docs/router-evaluation.md before the test split was first run. Until it is
 // set, the test split cannot be run; once set, a test split that differs from
 // what was registered cannot be run either.
-const PreRegisteredTestDigest = ""
+const PreRegisteredTestDigest = "83b9411380288a69baf5cb5ffd97c4862c760921d96ecabee6a901d2c94ffab6"
 
 // PreRegistered returns a split's cases. The test split is released only when
 // its digest equals the pre-registered digest.
