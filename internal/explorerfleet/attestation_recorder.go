@@ -86,6 +86,9 @@ func (r *AttestationRecorder) RecordAttestation(
 		ClientID: audit.Principal.ClientID,
 	}
 	expected.Reason = persisted.Reason
+	// The presenting decision's correlation, stamped by the trusted sink
+	// (#532).
+	expected.CorrelationID = persisted.CorrelationID
 	expected, err = expected.Canonical()
 	if err != nil {
 		return explorer.MarkCommittedInteraction(err)

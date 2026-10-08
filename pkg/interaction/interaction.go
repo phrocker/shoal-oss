@@ -439,13 +439,33 @@ type Provenance struct {
 // Session is one recorded inference. It carries identities, digests, counts,
 // and the source node IDs it touched. It never carries the question, the
 // prompt, the answer text, evidence quotes, authorization grants, or
-// model-chosen correlation strings.
+// model-chosen correlation strings. Its one correlation string, CorrelationID,
+// is the authenticated decision's, never a model's.
 type Session struct {
 	ID         shoal.ID
 	RecordedAt time.Time
 	Operation  Operation
 	Actor      ActorContext
 	Reason     Reason
+	// CorrelationID is the correlation of the authenticated decision the
+	// session was recorded under: the Shoal-Correlation-ID a caller supplied,
+	// or the one its authenticator generated (#527, #532). It threads one
+	// operation across hops — an approval and its dispatch, a gateway acting
+	// for a user — which a request ID, naming one request, cannot.
+	//
+	// It is metadata only. It is caller-supplyable, so it is excluded from
+	// everything that decides what a session is: it is not an input to any
+	// session ID, it is not materialized into the interaction subgraph, and
+	// an exact retry that differs only in correlation is the same session
+	// (the first recorded correlation is kept). It is excluded from
+	// AuthorizationFingerprint, as it is on the decision. It is never
+	// authority and never attribution: Actor is who acted.
+	//
+	// A trusted sink stamps it from the decision, as it does Actor and
+	// Reason; a producer's own value is not trusted. Empty means the session
+	// was recorded before this field existed, without a decision correlation,
+	// or with one that was not recordable (see RecordableCorrelationID).
+	CorrelationID shoal.ID
 	// CallerAssertedReason is what the authenticated Actor asserted, recorded
 	// beside the trusted Reason and never in its place. It is not verified
 	// and never participates in authorization.
@@ -688,6 +708,9 @@ func (s Session) Validate() error {
 		return err
 	}
 	if err := s.CallerAssertedReason.Validate(); err != nil {
+		return err
+	}
+	if err := ValidateCorrelationID(s.CorrelationID); err != nil {
 		return err
 	}
 	if err := validateDigest(

@@ -132,6 +132,11 @@ func (r *ActionRecorder) RecordAction(
 		OnBehalfOf: append([]shoal.ID(nil), audit.Record.OnBehalfOf...),
 	}
 	expected.Reason = persisted.Reason
+	// The trusted sink stamps the recording decision's correlation (#532).
+	// It is accepted, not compared with the record's transition correlation:
+	// those can differ, as the record's actor and the caller can (#480 item
+	// 2), and correlation is metadata that must never fail an audit.
+	expected.CorrelationID = persisted.CorrelationID
 	expected, err = expected.Canonical()
 	if err != nil {
 		return explorer.MarkCommittedInteraction(err)

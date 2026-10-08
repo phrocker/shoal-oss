@@ -331,6 +331,30 @@ provenance; the trusted session commits to it (its query digest covers it) and
 the durable approval record holds the values. No token byte is recorded
 anywhere.
 
+**Correlation across hops.** Every interaction session an approval produces
+carries the correlation of the decision it was recorded under (#532): the
+request's hold, the approver's decision, the requester's return that
+materializes it, and the dispatched action's own audit (`approval_enqueue`)
+and lifecycle event audit. A gateway that threads one `Shoal-Correlation-ID`
+through all three hops can therefore join the whole approval-to-dispatch trail
+from the interaction audit alone; a caller that sends none gets a generated
+value per request, the same one the approval and action records hold. The
+correlation is metadata, never part of a session's identity — see the
+interaction contract in `explorer-public-contract.md`.
+
+**The action audit's actor and correlation (#480 items 2–3).** The action
+recorder still builds its expected actor from the record's enqueuer, which is
+wrong for a claimant that is not the enqueuer (#480 item 2), and the outbox
+still publishes under one caller's decision (#480 item 3). #532 deliberately
+does not touch either. It does not carry the acting decision on `ActionAudit`;
+the action recorder *accepts* the correlation the trusted sink stamps rather
+than comparing it with the record's transition correlation, because those can
+differ for the same reason the actors can, and correlation must never fail an
+audit. When #480 gives `ActionAudit` the acting principal, it can bind the
+correlation the same way. Until then a session's correlation and its actor are
+both the recording decision's, which for every request-scoped audit is the
+decision that caused it; for a reconciled transition it is the reconciler's.
+
 **Disclosure.** The mapping is never served: the browser login configuration
 is identical with and without it, and no approval response carries the
 provenance or the digest. Non-approvers keep their `404`s. The requester sees

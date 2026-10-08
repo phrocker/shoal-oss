@@ -265,6 +265,10 @@ func sameFleetReceipt(expected, persisted interaction.Session) bool {
 	expected.RecordedAt = persisted.RecordedAt
 	expected.Actor = persisted.Actor
 	expected.Reason = persisted.Reason
+	// The trusted sink stamps the recording decision's correlation (#532).
+	// It is metadata, so a receipt replayed or reconciled under another
+	// correlation is still this receipt.
+	expected.CorrelationID = persisted.CorrelationID
 	expected.SnapshotID = persisted.SnapshotID
 	expected.SnapshotAsOf = persisted.SnapshotAsOf
 	canonicalExpected, err := expected.Canonical()

@@ -49,11 +49,15 @@ type InteractionSummary struct {
 	Operation                interaction.Operation
 	Actor                    interaction.ActorContext
 	Reason                   interaction.Reason
-	Visibility               string
-	NodeCount                int
-	EdgeCount                int
-	Deleted                  bool
-	DeletedAt                time.Time
+	// CorrelationID is the typed session's decision correlation (#532). It is
+	// read from the typed record, so a legacy record without one, and a
+	// tombstone, carry none.
+	CorrelationID shoal.ID
+	Visibility    string
+	NodeCount     int
+	EdgeCount     int
+	Deleted       bool
+	DeletedAt     time.Time
 }
 
 // InteractionRecord is the bulk/point authorization view of one durable
@@ -528,6 +532,9 @@ func interactionRetryResult(
 	existingCanonical, err := existing.Session.Canonical()
 	retryCanonical := session
 	retryCanonical.RecordedAt = existingCanonical.RecordedAt
+	// Correlation is metadata, not content (#532): a retry under another
+	// correlation is the same session, and keeps the first one recorded.
+	retryCanonical.CorrelationID = existingCanonical.CorrelationID
 	if err == nil && reflect.DeepEqual(existingCanonical, retryCanonical) {
 		return nil
 	}
@@ -1293,6 +1300,7 @@ func interactionSummary(record persistedInteraction) InteractionSummary {
 		Operation:                record.Operation,
 		Actor:                    cloneActorContext(record.Actor),
 		Reason:                   record.Reason,
+		CorrelationID:            record.Session.CorrelationID,
 		Visibility:               record.Visibility,
 		NodeCount:                len(record.Nodes),
 		EdgeCount:                len(record.Edges),

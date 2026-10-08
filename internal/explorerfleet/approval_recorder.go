@@ -127,6 +127,8 @@ func (r *ApprovalRecorder) RecordApproval(
 		OnBehalfOf: append([]shoal.ID(nil), audit.OnBehalfOf...),
 	}
 	expected.Reason = persisted.Reason
+	// The acting decision's correlation, stamped by the trusted sink (#532).
+	expected.CorrelationID = persisted.CorrelationID
 	expected, err = expected.Canonical()
 	if err != nil {
 		return explorer.MarkCommittedInteraction(err)
