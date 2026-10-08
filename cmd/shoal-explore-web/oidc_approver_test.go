@@ -22,8 +22,8 @@ const (
 	testApproverAudience = "shoal-approvals"
 	testApproverClient   = "shoal-console"
 	testApproverValue    = "shoal-approvers"
-	// testHumanClaim is the user-only claim a Keycloak protocol mapper adds
-	// to user sessions and never to a service account's.
+	// testHumanClaim is a user-only claim, such as an Auth0 post-login
+	// Action adds and a client-credentials token never carries.
 	testHumanClaim = "shoal_principal_type"
 	testHumanValue = "human"
 )

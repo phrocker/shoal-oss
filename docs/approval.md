@@ -194,16 +194,26 @@ means no approvers.** It is never in ATPL: ATPL is written by registrants,
 and letting a registrant name who approves its own agents' work is the
 conflict of interest #419 forbids.
 
+**Supported issuers, in this slice.** Approvers work only with an issuer
+that advertises public subject identifiers and nothing else, and that puts
+`azp` on its access tokens. Auth0 is one. Okta is one only once the operator
+adds an `azp` claim (below). **Keycloak and Microsoft Entra ID are
+unsupported** until the stable-identity follow-up (#526); startup refuses
+both.
+
 ```json
 {
   "version": "shoal.approvers/v1",
-  "issuer": "https://idp.example.com/realms/shoal",
-  "audience": "shoal-approvals",
-  "client_ids": ["shoal-console"],
-  "claim": ["realm_access", "roles"],
+  "issuer": "https://shoal.example.auth0.com/",
+  "audience": "https://shoal.example.com/approvals",
+  "client_ids": ["shoal-console-client-id"],
+  "claim": ["https://shoal.example.com/roles"],
   "values": ["shoal-approvers"],
   "max_values": 64,
-  "human_assertion": {"claim": ["shoal_principal_type"], "equals": "human"}
+  "human_assertion": {
+    "claim": ["https://shoal.example.com/principal_type"],
+    "equals": "human"
+  }
 }
 ```
 
@@ -214,22 +224,33 @@ this mapping documented `idtyp` absent, and a Keycloak service-account token
 passed it — Keycloak never emits `idtyp`, and its client-credentials tokens
 (like Entra's and Auth0's) have `sub != azp`. Per issuer:
 
-- **Keycloak.** Add a protocol mapper to the console client that sets a
-  claim on user sessions only — for example a hard-coded claim
-  `shoal_principal_type` = `human` on a client scope the service account does
-  not get, or a user-attribute mapper — and name it in `human_assertion`.
-  Keycloak's discovery states `subject_types_supported: ["public"]` unless a
-  pairwise mapper is configured.
-- **Microsoft Entra ID: not supported for approvers in this slice.** Entra
-  issues pairwise `sub` values (a different `sub` per application) and says
-  so in discovery, so the same person would be a different `oidc:<iss>#<sub>`
-  as requester and as approver. Startup refuses it (below). A stable identity
-  claim (such as `oid`) used identically on the workspace and approver
-  branches is a follow-up.
-- **Auth0 / Okta.** Use a positive claim set only for interactive users — an
-  Auth0 Action that adds a namespaced claim on login flows (not on
-  `credentials-exchange`), or an Okta custom claim scoped to a user group —
-  and check that discovery states public subjects only.
+- **Auth0: supported.** Discovery states `["public"]` and access tokens
+  carry `azp`. Add the human assertion with a post-login Action that sets a
+  namespaced claim (as in the example). A post-login Action does not run for
+  `client_credentials` grants, which run the `credentials-exchange` trigger
+  instead, so machine tokens never carry the claim. Those tokens also carry
+  `gty: client-credentials`, which is refused anyway.
+- **Okta: supported only with an `azp` claim the operator adds.** Okta access
+  tokens identify the client as `cid` (and the user as `uid`), not `azp`.
+  This slice does not accept `cid`, so an Okta approver token is refused
+  unless the authorization server has a custom claim named `azp` whose value
+  is the client ID (`app.clientId`). Put the human assertion on a custom
+  claim that only user tokens get, for example one included only for a user
+  group.
+- **Keycloak: not supported for approvers in this slice** (follow-up #526).
+  Keycloak's discovery always advertises
+  `subject_types_supported: ["public", "pairwise"]`, whatever mappers a realm
+  has: `OIDCWellKnownProvider` sets it unconditionally. A realm can issue
+  pairwise `sub` values, and nothing in a token says which kind a `sub` is,
+  so startup refuses every Keycloak realm.
+- **Microsoft Entra ID: not supported for approvers in this slice**
+  (follow-up #526). Entra issues pairwise `sub` values (a different `sub` per
+  application) and says so in discovery. The same person would be a
+  different `oidc:<iss>#<sub>` as requester and as approver. Startup refuses
+  it.
+
+The follow-up (#526) is a stable identity claim, such as Entra's `oid`,
+used identically on the workspace and approver branches.
 
 **The issuer must state public subject identifiers only.** The approval
 service separates people by `oidc:<iss>#<sub>`. Under the pairwise subject
@@ -472,8 +493,8 @@ transition reconciled on a lagging replica has the same property.
   field it needs is stored on the approval record.
 - Approval lifecycle events (needs #480 item 1).
 - A stable identity claim (for example `oid`) used identically on the
-  workspace and approver branches, which would let a pairwise issuer such as
-  Entra back an approver mapping.
+  workspace and approver branches (#526). This would let Keycloak and Entra,
+  which advertise pairwise subjects, back an approver mapping.
 - Approver pools per action or descriptor (a later ATPL version may only
   reference an operator-defined pool), a second approver-only issuer, and
   quorum.

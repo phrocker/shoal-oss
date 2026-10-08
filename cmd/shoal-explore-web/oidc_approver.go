@@ -127,7 +127,8 @@ type approverMappingFile struct {
 
 // approverHumanAssertJSON says what makes a token a human's: a claim that
 // must equal a value exactly, on a claim only human tokens carry (for
-// example one a Keycloak protocol mapper adds to user sessions alone).
+// example one an Auth0 post-login Action adds, which never runs for a
+// client-credentials grant).
 //
 // It is positive by design. An earlier draft also accepted "this claim is
 // absent", and the documented example — idtyp absent — passed a Keycloak
@@ -627,8 +628,9 @@ func (h approverHumanAssertion) holds(claims jwt.MapClaims) error {
 // both are oidc:<iss>#<sub>. Under the pairwise subject type an issuer gives
 // one human a different sub per client, so the same person requesting through
 // one client and approving through another would look like two people, and
-// could approve their own request. Entra is such an issuer. Until a stable
-// identity claim is used identically on both branches, an issuer that offers
+// could approve their own request. Entra is such an issuer, and Keycloak
+// advertises ["public", "pairwise"] for every realm. Until a stable identity
+// claim is used identically on both branches (#526), an issuer that offers
 // pairwise identifiers — or does not say — cannot back an approver mapping.
 func approverSubjectTypesPublic(metadata oidcMetadata) bool {
 	return len(metadata.SubjectTypesSupported) == 1 &&

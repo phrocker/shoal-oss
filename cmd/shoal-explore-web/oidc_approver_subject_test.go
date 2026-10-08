@@ -74,3 +74,23 @@ func TestApproverMappingRequiresPublicSubjects(t *testing.T) {
 		t.Fatalf("no mapping, pairwise issuer: %v", err)
 	}
 }
+
+// TestKeycloakDiscoveryIsRefusedForApprovers pins that every Keycloak realm
+// is refused at startup. Keycloak's OIDCWellKnownProvider
+// (services/src/main/java/org/keycloak/protocol/oidc/OIDCWellKnownProvider.java)
+// declares DEFAULT_SUBJECT_TYPES_SUPPORTED = ["public", "pairwise"] (around
+// line 81) and sets it on every well-known document unconditionally (around
+// line 151), whatever mappers the realm configures. A realm may therefore
+// issue pairwise subjects, so Keycloak cannot back an approver mapping until
+// the stable-identity follow-up (#526).
+func TestKeycloakDiscoveryIsRefusedForApprovers(t *testing.T) {
+	issuer := newFakeOIDCIssuer(t)
+	issuer.subjectTypes = []string{"public", "pairwise"}
+	now := time.Now()
+	authenticator := newTestOIDCAuthenticator(t, approverTestConfig(
+		t, issuer, fixedClock(now), approverMappingDocument(issuer.server.URL)))
+	if err := authenticator.verifyApproverDiscovery(
+		context.Background()); !errors.Is(err, errApproverSubjectTypes) {
+		t.Fatalf("Keycloak's default discovery at startup = %v, want refusal", err)
+	}
+}
