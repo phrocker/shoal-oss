@@ -194,6 +194,9 @@ func validateUnicode(b []byte) error {
 // The external digest binds exact bytes; strict decoding also rejects ambiguous
 // duplicate fields and unsupported fields before interpreting the manifest.
 func strictJSON(b []byte, dst any) error {
+	return strictJSONShape(b, dst, validateManifestShape)
+}
+func strictJSONShape(b []byte, dst any, shape func([]byte) error) error {
 	if e := validateUnicode(b); e != nil {
 		return e
 	}
@@ -248,7 +251,7 @@ func strictJSON(b []byte, dst any) error {
 	if _, e := d.Token(); e != io.EOF {
 		return errors.New("trailing JSON")
 	}
-	if e := validateManifestShape(b); e != nil {
+	if e := shape(b); e != nil {
 		return e
 	}
 	d = json.NewDecoder(bytes.NewReader(b))
@@ -350,57 +353,79 @@ func validateProvenance(raw json.RawMessage) error {
 	}
 	return nil
 }
-func replay(dir, modelHash, manifestHash string, expectedRows int) (report, error) {
-	var out report
+
+type loadedBundle struct {
+	Root           *os.Root
+	Manifest       manifest
+	Provider       *decisionlinear.Provider
+	ManifestSHA256 string
+}
+
+func (b *loadedBundle) Close() error { return b.Root.Close() }
+func (b *loadedBundle) Input(index int) ([]byte, error) {
+	if index < 0 || index >= len(b.Manifest.Rows) {
+		return nil, errors.New("invalid row index")
+	}
+	r := b.Manifest.Rows[index]
+	input, e := readBound(b.Root, r.InputFile, inference.MaxContextPackBytes)
+	if e != nil {
+		return nil, e
+	}
+	if digest(input) != r.InputSHA256 {
+		return nil, errors.New("input SHA256 mismatch")
+	}
+	return input, nil
+}
+func loadBundle(dir, modelHash, manifestHash string, task decision.TaskSpec, expectedRows int) (*loadedBundle, error) {
 	if !validDigest(modelHash) || !validDigest(manifestHash) {
-		return out, errors.New("external SHA256 pins required")
+		return nil, errors.New("external SHA256 pins required")
 	}
 	root, e := os.OpenRoot(dir)
 	if e != nil {
-		return out, e
+		return nil, e
 	}
-	defer root.Close()
+	success := false
+	defer func() {
+		if !success {
+			root.Close()
+		}
+	}()
 	b, e := readBound(root, "manifest.json", 1<<20)
 	if e != nil {
-		return out, e
+		return nil, e
 	}
 	if digest(b) != manifestHash {
-		return out, errors.New("manifest SHA256 mismatch")
+		return nil, errors.New("manifest SHA256 mismatch")
 	}
 	var m manifest
 	if e = strictJSON(b, &m); e != nil {
-		return out, e
-	}
-	task, e := taskSpec()
-	if e != nil {
-		return out, e
+		return nil, e
 	}
 	if m.Schema != 1 || m.ModelSHA256 != modelHash || m.TaskID != string(task.ID()) || m.QuestionID != question || m.FeatureSchemaID != featureSchema || len(m.Rows) != expectedRows || expectedRows < 1 || expectedRows > cohortSize {
-		return out, errors.New("manifest contract or cohort mismatch")
+		return nil, errors.New("manifest contract or cohort mismatch")
 	}
 	if e = validateProvenance(m.Provenance); e != nil {
-		return out, e
+		return nil, e
 	}
 	model, e := readBound(root, "model.json", decisionlinear.MaxModelBytes)
 	if e != nil {
-		return out, e
+		return nil, e
 	}
 	p, e := decisionlinear.New(decisionlinear.Config{ModelBytes: model, ExpectedSHA256: modelHash, ReleaseID: release})
 	if e != nil {
-		return out, e
+		return nil, e
 	}
 	st, e := root.Lstat("inputs")
 	if e != nil {
-		return out, e
+		return nil, e
 	}
 	if !st.IsDir() {
-		return out, errors.New("inputs is not a directory")
+		return nil, errors.New("inputs is not a directory")
 	}
-	out = report{Kind: "offline-provider-conformance", Schema: 1, Count: len(m.Rows), AllFullReview: true, ModelSHA256: modelHash, ManifestSHA256: manifestHash, PredictorID: p.Identity().ID(), RuntimeID: string(p.Identity().Config().RuntimeID), EnvironmentDigest: p.Identity().Config().EnvironmentDigest, Labels: make([]string, 0, len(m.Rows))}
 	seen := map[string]bool{}
 	for i, r := range m.Rows {
 		if r.ID == "" || seen[r.ID] || r.InputFile != fmt.Sprintf("inputs/%04d.json", i) || !validDigest(r.InputSHA256) || (r.ExpectedLabel != "retain" && r.ExpectedLabel != "lower_priority") || math.IsNaN(r.OriginalScore) || math.IsInf(r.OriginalScore, 0) || r.OriginalScore < 0 || r.OriginalScore > 1 {
-			return report{}, errors.New("invalid manifest row")
+			return nil, errors.New("invalid manifest row")
 		}
 		seen[r.ID] = true
 		expected := "retain"
@@ -408,14 +433,29 @@ func replay(dir, modelHash, manifestHash string, expectedRows int) (report, erro
 			expected = "lower_priority"
 		}
 		if r.ExpectedLabel != expected {
-			return report{}, errors.New("original score and label disagree")
+			return nil, errors.New("original score and label disagree")
 		}
-		input, e := readBound(root, r.InputFile, inference.MaxContextPackBytes)
+	}
+	success = true
+	return &loadedBundle{root, m, p, manifestHash}, nil
+}
+func replay(dir, modelHash, manifestHash string, expectedRows int) (report, error) {
+	var out report
+	task, e := taskSpec()
+	if e != nil {
+		return out, e
+	}
+	bundle, e := loadBundle(dir, modelHash, manifestHash, task, expectedRows)
+	if e != nil {
+		return out, e
+	}
+	defer bundle.Close()
+	m, p := bundle.Manifest, bundle.Provider
+	out = report{Kind: "offline-provider-conformance", Schema: 1, Count: len(m.Rows), AllFullReview: true, ModelSHA256: modelHash, ManifestSHA256: manifestHash, PredictorID: p.Identity().ID(), RuntimeID: string(p.Identity().Config().RuntimeID), EnvironmentDigest: p.Identity().Config().EnvironmentDigest, Labels: make([]string, 0, len(m.Rows))}
+	for i, r := range m.Rows {
+		input, e := bundle.Input(i)
 		if e != nil {
 			return report{}, e
-		}
-		if digest(input) != r.InputSHA256 {
-			return report{}, errors.New("input SHA256 mismatch")
 		}
 		req, e := request(task, p, r.ID, input)
 		if e != nil {
@@ -444,6 +484,34 @@ func replay(dir, modelHash, manifestHash string, expectedRows int) (report, erro
 	return out, nil
 }
 func run(args []string, w io.Writer) error {
+	if len(args) == 1 && args[0] == "describe-service" {
+		task, _, _, e := serviceDefinitions()
+		if e != nil {
+			return e
+		}
+		return json.NewEncoder(w).Encode(map[string]any{"task_id": task.ID(), "question_id": question, "feature_schema_id": featureSchema, "labels": []string{"lower_priority", "retain"}})
+	}
+	if len(args) > 0 && args[0] == "inquire" {
+		f := flag.NewFlagSet("inquire", flag.ContinueOnError)
+		f.SetOutput(io.Discard)
+		dir := f.String("bundle", "", "source bundle directory")
+		model := f.String("model-sha256", "", "external model pin")
+		manifest := f.String("manifest-sha256", "", "external numeric manifest pin")
+		sources := f.String("source-manifest-sha256", "", "external source manifest pin")
+		state := f.String("state-dir", "", "persistent service state directory")
+		if e := f.Parse(args[1:]); e != nil {
+			return e
+		}
+		if f.NArg() != 0 || *dir == "" || *state == "" {
+			return errors.New("inquire requires bundle and state directory; no positional arguments")
+		}
+		out, e := inquireService(*dir, *model, *manifest, *sources, *state)
+		if e != nil {
+			return e
+		}
+		return json.NewEncoder(w).Encode(out)
+	}
+
 	if len(args) == 1 && args[0] == "describe" {
 		t, e := taskSpec()
 		if e != nil {
