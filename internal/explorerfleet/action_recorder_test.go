@@ -241,3 +241,154 @@ func (r *capturingActionRecorder) Record(
 	}
 	return canonical, nil
 }
+
+// callerStampingRecorder stamps the session actor the way the real trusted
+// sink does — from the *caller's* resolved decision, not from the record.
+//
+// This is the whole reason #480 item 2 survived five review rounds:
+// capturingActionRecorder stamps it from r.record.Subject/Actor, hard-coding
+// the same assumption the real sink breaks, so the package's own tests could
+// not see the defect. A test double that performs no attribution proves
+// nothing about attribution.
+type callerStampingRecorder struct {
+	caller   interaction.ActorContext
+	sessions []interaction.Session
+}
+
+func (r *callerStampingRecorder) Record(
+	_ context.Context, session interaction.Session,
+) (interaction.Session, error) {
+	session.RecordedAt = time.Date(2026, 9, 6, 9, 0, 0, 0, time.UTC)
+	session.Actor = r.caller
+	canonical, err := session.Canonical()
+	if err != nil {
+		return interaction.Session{}, err
+	}
+	r.sessions = append(r.sessions, canonical)
+	return canonical, nil
+}
+
+// TestAForeignClaimantsAuditIsNotAMismatch is #480 item 2.
+//
+// The recorder compared the sink's stamped actor against the record's own
+// Subject/Actor/ClientID/OnBehalfOf — the enqueuer's chain. The real sink
+// stamps the caller's. Those differ for any claimant that is not the
+// enqueuer, which since #437 is the ordinary case, and the mismatch raised
+// "fleet action recorder returned a mismatched trusted session" *before*
+// store.ApplyAction. So a worker granted execute could never claim at all:
+// not a mislabelled audit, a capability that did not work, with a growing
+// queue and no record of why.
+func TestAForeignClaimantsAuditIsNotAMismatch(t *testing.T) {
+	record := testActionRecord()
+	record.State = fleet.DispatchClaimed
+	record.ClaimID = []byte("worker-claim")
+	record.ClaimFence = 1
+	record.ClaimLease = time.Minute
+	record.ClaimLeaseUntil = record.UpdatedAt.Add(time.Minute).UTC()
+	record.ExecutionPolicyGeneration = 1
+	record.ExecutionExpiresAt = record.Deadline
+	record.ClaimantSubject = "worker-subject"
+	record.ClaimantActor = "worker-actor"
+	record.ClaimantClientID = "worker-client"
+	record.ClaimantOnBehalfOf = []shoal.ID{"worker-delegator"}
+	if record.Subject == record.ClaimantSubject {
+		t.Fatal("the claimant is the enqueuer, so this fixture cannot " +
+			"distinguish the two chains")
+	}
+
+	for _, probe := range []struct {
+		name   string
+		caller interaction.ActorContext
+		// refused says whether the recorder must reject the attribution.
+		refused bool
+	}{
+		{
+			// The case that was broken. A worker holding execute claims work
+			// it did not enqueue; the sink stamps the worker.
+			name: "the claimant",
+			caller: interaction.ActorContext{
+				SubjectID: record.ClaimantSubject,
+				ActorID:   record.ClaimantActor,
+				ClientID:  record.ClaimantClientID,
+				OnBehalfOf: append(
+					[]shoal.ID(nil), record.ClaimantOnBehalfOf...),
+			},
+		},
+		{
+			// Still accepted: the enqueuer reaching its own action, which is
+			// every phase before a foreign claim and Cancel after one.
+			name: "the action's own principal",
+			caller: interaction.ActorContext{
+				SubjectID: record.Subject, ActorID: record.Actor,
+				ClientID: record.ClientID,
+				OnBehalfOf: append(
+					[]shoal.ID(nil), record.OnBehalfOf...),
+			},
+		},
+		{
+			// And the check still has teeth. Accepting the stamped actor
+			// unchecked would let a sink attribute this action's audit to
+			// anyone, which is worse than the false assertion it replaced.
+			name: "a stranger",
+			caller: interaction.ActorContext{
+				SubjectID: "stranger", ActorID: "stranger-actor",
+			},
+			refused: true,
+		},
+		{
+			// One component off the claimant is a different principal, not a
+			// near-match. The chain is compared element for element because
+			// that is what identity means here.
+			name: "the claimant with a different delegator",
+			caller: interaction.ActorContext{
+				SubjectID:  record.ClaimantSubject,
+				ActorID:    record.ClaimantActor,
+				ClientID:   record.ClaimantClientID,
+				OnBehalfOf: []shoal.ID{"other-delegator"},
+			},
+			refused: true,
+		},
+		{
+			name: "the claimant with an emptied chain",
+			caller: interaction.ActorContext{
+				SubjectID: record.ClaimantSubject,
+				ActorID:   record.ClaimantActor,
+				ClientID:  record.ClaimantClientID,
+			},
+			refused: true,
+		},
+	} {
+		t.Run(probe.name, func(t *testing.T) {
+			sink := &callerStampingRecorder{caller: probe.caller}
+			recorder, err := NewActionRecorder(sink)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// claim_admission is the phase that fires before the write, so it
+			// is the one whose refusal stops the claim landing at all.
+			err = recorder.RecordAction(context.Background(), fleet.ActionAudit{
+				Phase: "claim_admission", Operation: auth.OperationExecute,
+				Record: record,
+			})
+			if probe.refused {
+				if err == nil {
+					t.Fatal("the recorder accepted an audit attributed to a " +
+						"principal with no standing on this action")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("a legitimate caller's audit was rejected as a "+
+					"mismatched trusted session, which refuses before the "+
+					"durable write: %v", err)
+			}
+			if len(sink.sessions) != 1 {
+				t.Fatalf("captured %d sessions, want 1", len(sink.sessions))
+			}
+			if sink.sessions[0].Actor.SubjectID != probe.caller.SubjectID {
+				t.Fatalf("recorded actor = %q, want the caller %q",
+					sink.sessions[0].Actor.SubjectID, probe.caller.SubjectID)
+			}
+		})
+	}
+}

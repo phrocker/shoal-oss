@@ -126,11 +126,27 @@ func (r *ActionRecorder) RecordAction(
 	}
 	expected := requested
 	expected.RecordedAt = persisted.RecordedAt
-	expected.Actor = interaction.ActorContext{
-		SubjectID: audit.Record.Subject, ActorID: audit.Record.Actor,
-		ClientID:   audit.Record.ClientID,
-		OnBehalfOf: append([]shoal.ID(nil), audit.Record.OnBehalfOf...),
+	// The actor is stamped by the trusted sink from the resolved decision —
+	// the *caller's* chain. This used to assert the record's own
+	// Subject/Actor/ClientID/OnBehalfOf instead, which is the *enqueuer's*,
+	// and the two differ for any claimant that is not the enqueuer. Since
+	// #437 that is the ordinary case, and the mismatch raised "fleet action
+	// recorder returned a mismatched trusted session" before
+	// store.ApplyAction — so a worker granted execute could never claim at
+	// all, and the queue grew with no record of why (#480 item 2).
+	//
+	// Not simply accepted from persisted, either. The recorder has no
+	// business asserting which identity performed a phase; it does have
+	// business refusing a sink that stamped someone who has nothing to do
+	// with this action. So the stamped actor must be one of the record's
+	// known identities: its own principal, or the claimant chain the claim
+	// durably recorded. A phase-to-identity table was considered and
+	// rejected — it re-derives what the decision already knows, and goes
+	// wrong the moment a phase is added.
+	if err := refuseUnknownAuditActor(audit.Record, persisted.Actor); err != nil {
+		return explorer.MarkCommittedInteraction(err)
 	}
+	expected.Actor = persisted.Actor
 	expected.Reason = persisted.Reason
 	expected, err = expected.Canonical()
 	if err != nil {
@@ -143,6 +159,56 @@ func (r *ActionRecorder) RecordAction(
 			"fleet action recorder returned a mismatched trusted session"))
 	}
 	return nil
+}
+
+// refuseUnknownAuditActor refuses a trusted session whose actor is neither
+// the action's own principal nor the principal that holds its claim.
+//
+// Both identities are on the record, and which one performed a given phase is
+// the decision's business rather than this function's: an enqueue and a cancel
+// are the principal, a claim and a completion are the claimant, and an
+// admission report is whichever of them the admission surface authorized. What
+// is checked here is the property that holds for every phase — that the sink
+// did not attribute this action's audit to a stranger.
+//
+// A record with no claimant chain predates the field or has never been
+// claimed; there the claimant was by construction the enqueuer.
+func refuseUnknownAuditActor(
+	record fleet.ActionRecord, actor interaction.ActorContext,
+) error {
+	if sameAuditActor(actor, record.Subject, record.Actor,
+		record.ClientID, record.OnBehalfOf) {
+		return nil
+	}
+	if record.ClaimantSubject != "" && sameAuditActor(
+		actor, record.ClaimantSubject, record.ClaimantActor,
+		record.ClaimantClientID, record.ClaimantOnBehalfOf) {
+		return nil
+	}
+	// Names neither chain: the message is read by an operator reconciling a
+	// committed action, and the identities are this record's own.
+	return shoal.NewError(
+		shoal.ErrorInternal,
+		"fleet action audit was attributed to a principal that is neither "+
+			"the action's own nor its claimant")
+}
+
+func sameAuditActor(
+	actor interaction.ActorContext,
+	subject, actorID, clientID shoal.ID,
+	onBehalfOf []shoal.ID,
+) bool {
+	if actor.SubjectID != subject || actor.ActorID != actorID ||
+		actor.ClientID != clientID ||
+		len(actor.OnBehalfOf) != len(onBehalfOf) {
+		return false
+	}
+	for index := range onBehalfOf {
+		if actor.OnBehalfOf[index] != onBehalfOf[index] {
+			return false
+		}
+	}
+	return true
 }
 
 func actionSessionID(audit fleet.ActionAudit) shoal.ID {
