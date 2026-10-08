@@ -21,7 +21,7 @@ import (
 )
 
 const Table = "_shoal_decision_outcomes"
-const MaxOutcomeAncestors = 32
+const MaxOutcomeAncestors = decision.MaxOutcomeAncestors
 
 var (
 	ErrConflict      = shoal.NewError(shoal.ErrorConflict, "outcome receipt conflict")
