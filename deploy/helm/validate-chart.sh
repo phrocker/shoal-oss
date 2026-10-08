@@ -1911,51 +1911,156 @@ fi
 # resolve fails, so a new toYaml cannot be added without being covered here.
 # (The templates' other loops over caller-supplied values are the gateway's
 # model and allowed-host lists, which hold strings and are walked as values.)
-if ! python3 - "$chart" <<'SITES'
-import json, os, re, subprocess, sys, tempfile, yaml
+#
+# The scan reads template actions, not lines: each {{ ... }} is joined across
+# the lines it spans before it is matched, so a toYaml whose argument is on the
+# next line, or inside a multi-line include (dict ...), is still found. `.` is
+# resolved through a stack of with/range/if/define ... end blocks, so a `with`
+# that has already closed does not lend its value to a later `toYaml .`;
+# variables ($explorer := .Values.explorer) are followed; and a helper's `.x`
+# is resolved through every include of that helper that passes "x". Anything
+# else it cannot resolve is a failure, not a skip.
+toyaml_scanner=$(cat <<'SCAN'
+import json, os, re, sys
+
+def scan(chart):
+    templates = os.path.join(chart, "templates")
+    comment = re.compile(r"\{\{-?\s*/\*.*?\*/\s*-?\}\}", re.S)
+    action = re.compile(r"\{\{-?(.*?)-?\}\}", re.S)
+    sites, includes = [], []
+    for name in sorted(os.listdir(templates)):
+        text = open(os.path.join(templates, name)).read()
+        # Comments are blanked to the same length so line numbers survive.
+        text = comment.sub(lambda m: re.sub(r"[^\n]", " ", m.group(0)), text)
+        stack, variables = [], {}
+        def resolve(expression):
+            expression = expression.strip("()")
+            if expression.startswith(".Values."):
+                return expression[len(".Values."):]
+            match = re.match(r"\$(\w+)((?:\.\w+)*)$", expression)
+            if match and variables.get(match.group(1)):
+                return variables[match.group(1)] + match.group(2)
+            if expression == ".":
+                # The innermost block that rebinds dot; at the top level, or
+                # under a range, dot is nothing a values path names.
+                for kind, value in reversed(stack):
+                    if kind == "with":
+                        return value
+                    if kind in ("range", "define"):
+                        return None
+                return None
+            match = re.match(r"\.(\w+)$", expression)
+            if match:
+                for kind, value in reversed(stack):
+                    if kind == "define":
+                        return ("helper", value, match.group(1))
+            return None
+        for found in action.finditer(text):
+            body = " ".join(found.group(1).split())
+            line = text.count("\n", 0, found.start()) + 1
+            site = f"{name}:{line}"
+            head = body.split(" ", 1)[0] if body else ""
+            if head in ("with", "range", "if", "define", "block"):
+                argument = body.split(" ", 1)[1] if " " in body else ""
+                if head == "with":
+                    stack.append(("with", resolve(argument.split(" ")[0])))
+                elif head == "define":
+                    stack.append(("define", argument.strip('"')))
+                else:
+                    stack.append((head, None))
+            elif head == "end":
+                if stack:
+                    stack.pop()
+            assignment = re.match(r"\$(\w+) :?= (\S+)$", body)
+            if assignment:
+                variables[assignment.group(1)] = resolve(assignment.group(2))
+            for call in re.finditer(r'include "([\w.]+)" \(dict (.*?)\)(?: \||$)', body):
+                for key, value in re.findall(r'"(\w+)" (\S+)', call.group(2)):
+                    includes.append((call.group(1), key, resolve(value), site))
+            arguments = re.findall(r"toYaml (\S+)", body) + re.findall(r"(\S+) \| toYaml\b", body)
+            for argument in arguments:
+                sites.append((site, argument, resolve(argument)))
+    resolved, unresolved = {}, []
+    for site, argument, target in sites:
+        if isinstance(target, tuple):
+            _, helper, key = target
+            paths = [path for name, k, path, _ in includes if name == helper and k == key]
+            if not paths or None in paths:
+                unresolved.append(f"{site}: toYaml {argument}")
+                continue
+        elif target is None:
+            unresolved.append(f"{site}: toYaml {argument}")
+            continue
+        else:
+            paths = [target]
+        for path in paths:
+            resolved.setdefault(path, []).append(site)
+    return resolved, unresolved
+
+if __name__ == "__main__":
+    resolved, unresolved = scan(sys.argv[1])
+    print(json.dumps({"resolved": resolved, "unresolved": unresolved}))
+SCAN
+)
+# The scanner is tested before it is trusted: a copy of the chart gains a
+# toYaml split across lines, one inside a multi-line include (dict ...), one
+# under a `with` that is still open, and a `toYaml .` after a `with` has
+# closed. The first three must resolve to their paths and the last must be
+# reported as unresolvable rather than borrowing the closed block's value.
+scanner_probe="$(mktemp -d)"
+cp -R "$chart" "$scanner_probe/shoal"
+cat > "$scanner_probe/shoal/templates/zz-scanner-probe.yaml" <<'PROBE'
+{{- if false }}
+metadata:
+  labels:
+    {{- toYaml
+          .Values.zzSplit | nindent 4 }}
+  {{- include "shoal.zzProbe" (dict
+        "rendered" (toYaml .Values.zzInclude)
+        "other" 1) }}
+  {{- with .Values.zzOpen }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with .Values.zzClosed }}{{ end }}
+  more:
+    {{- toYaml . | nindent 4 }}
+{{- end }}
+PROBE
+if ! python3 -c "$toyaml_scanner" "$scanner_probe/shoal" | python3 -c '
+import json, sys
+report = json.load(sys.stdin)
+resolved, unresolved = report["resolved"], report["unresolved"]
+problems = []
+for path in ("zzSplit", "zzInclude", "zzOpen"):
+    if not any(site.startswith("zz-scanner-probe.yaml:") for site in resolved.get(path, [])):
+        problems.append(f"the scanner did not resolve the probe site for {path}")
+if "zzClosed" in resolved:
+    problems.append("the scanner resolved `toYaml .` to a with block that had already closed")
+if not any(entry.startswith("zz-scanner-probe.yaml:15:") for entry in unresolved):
+    problems.append("the scanner did not report `toYaml .` outside any with block as unresolvable: " + repr(unresolved))
+for problem in problems:
+    print("      " + problem)
+raise SystemExit(1 if problems else 0)
+'; then
+  fail "the toYaml site scanner misses or misresolves a site (see above)"
+fi
+rm -rf "$scanner_probe"
+
+# The scan's report goes through a file: the check below is read from stdin.
+scanner_report="$(mktemp)"
+python3 -c "$toyaml_scanner" "$chart" > "$scanner_report" || printf '{"resolved": {}, "unresolved": ["the scanner itself failed"]}' > "$scanner_report"
+if ! python3 - "$chart" "$scanner_report" <<'SITES'
+import json, os, subprocess, sys, tempfile, yaml
 
 chart = sys.argv[1]
-templates = os.path.join(chart, "templates")
-defaults = yaml.safe_load(open(os.path.join(chart, "values.yaml")))
-sources = {}
-problems = []
-
-def resolve(expression):
-    for prefix, root in (("$explorer.", "explorer."), ("$gateway.", "llmGateway."), (".Values.", "")):
-        if expression.startswith(prefix):
-            return root + expression[len(prefix):]
-    return None
-
-texts = {name: open(os.path.join(templates, name)).read().splitlines()
-         for name in sorted(os.listdir(templates))}
-for name, lines in texts.items():
-    for number, line in enumerate(lines, 1):
-        match = re.search(r"toYaml\s+(\S+)", line)
-        if not match or "{{" not in line:
-            continue
-        expression = match.group(1)
-        site = f"{name}:{number}"
-        if expression == ".":
-            # The value of the nearest enclosing `with`.
-            for previous in reversed(lines[:number - 1]):
-                found = re.search(r"\{\{-?\s*with\s+(\S+)", previous)
-                if found:
-                    expression = found.group(1)
-                    break
-        if expression == ".volume":
-            # The credential-volume helper: whatever its callers pass as volume.
-            paths = [resolve(m) for other in texts.values() for l in other
-                     for m in re.findall(r'"volume"\s+(\$[\w.]+)', l)]
-        else:
-            paths = [resolve(expression)]
-        if not paths or None in paths:
-            problems.append(f"{site}: cannot tell which value `toYaml {match.group(1)}` renders; teach this check")
-            continue
-        for path in paths:
-            sources.setdefault(path, []).append(site)
-
+report = json.load(open(sys.argv[2]))
+sources, problems = report["resolved"], []
+for entry in report["unresolved"]:
+    problems.append(f"{entry}: cannot tell which value this renders; teach the scanner, or the walk cannot be shown to cover it")
 if len(sources) < 12:
     problems.append(f"only {len(sources)} toYaml sources found: the scan is broken")
+defaults = yaml.safe_load(open(os.path.join(chart, "values.yaml")))
 
 def default_at(path):
     node = defaults
@@ -1993,6 +2098,7 @@ SITES
 then
   fail "a toYaml site in the templates renders a values path the walk does not guard (see above)"
 fi
+rm -f "$scanner_report"
 
 note "== the guide's worked example still installs =="
 # The example in docs/llm-gateway-deploy.md is copied by operators verbatim, and a
