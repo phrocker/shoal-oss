@@ -631,6 +631,7 @@ func requestMayCommit(method, path string) bool {
 	}
 	switch path {
 	case "/api/v1/ingest",
+		"/api/v1/decisions",
 		"/api/v1/graph/materialize",
 		"/api/v1/extract",
 		"/api/v1/derivation/recompute",
