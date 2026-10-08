@@ -282,9 +282,10 @@ const FixtureRoot = "internal/importboundary/testdata"
 // NestedModules returns every directory outside extensions/ that holds its
 // own go.mod (wal-quorum-sidecar, for example). Their code can be linked into
 // core through go.mod requires or go.work, so rule A covers them too. The
-// repository .git, the fixture modules directly under FixtureRoot, and
-// separate checkouts (a directory with its own .git entry, such as an
-// editor's worktree) are skipped.
+// repository .git and the fixture modules directly under FixtureRoot are
+// skipped. Untracked content (an unpacked build dependency, an editor's
+// nested worktree) is excluded by the caller's FS: the real-tree tests pass
+// an FS of git-tracked files only.
 func NestedModules(fsys fs.FS) ([]string, error) {
 	var dirs []string
 	err := fs.WalkDir(fsys, ".", func(name string, d fs.DirEntry, err error) error {
@@ -295,9 +296,6 @@ func NestedModules(fsys fs.FS) ([]string, error) {
 			return nil
 		}
 		if name == ".git" || name == "extensions" {
-			return fs.SkipDir
-		}
-		if _, err := fs.Lstat(fsys, path.Join(name, ".git")); err == nil {
 			return fs.SkipDir
 		}
 		if info, err := fs.Lstat(fsys, path.Join(name, "go.mod")); err == nil && info.Mode().IsRegular() {
@@ -342,8 +340,8 @@ func localTarget(target string) bool {
 // nested module's, at dir). It may not require or replace an extension
 // module, and every local replace must resolve, relative to dir, to the root
 // module or a nested module that rule A walks. That rejects targets under
-// extensions/, fixture modules under FixtureRoot, separate checkouts, absolute
-// paths and anything outside the repository.
+// extensions/, fixture modules under FixtureRoot, untracked directories,
+// absolute paths and anything outside the repository.
 func checkModuleFile(fsys fs.FS, dir string, nested []string) []Violation {
 	var out []Violation
 	extensions := Module + "/extensions"

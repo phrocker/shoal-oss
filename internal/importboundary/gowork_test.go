@@ -2,7 +2,6 @@
 package importboundary
 
 import (
-	"os"
 	"slices"
 	"testing"
 	"testing/fstest"
@@ -32,7 +31,7 @@ func TestParseGoWorkFailsClosed(t *testing.T) {
 // The real repository's nested modules and go.work are actually examined, so
 // rule A's nested-module and workspace checks are not vacuous.
 func TestRepositoryWorkspaceIsExamined(t *testing.T) {
-	root := os.DirFS("../..")
+	root := repoFS(t)
 	nested, err := NestedModules(root)
 	if err != nil {
 		t.Fatal(err)

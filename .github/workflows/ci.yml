@@ -44,6 +44,9 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --yes bison flex
+          # Build outside the checkout: the tarball holds Go modules that are
+          # not part of this repository. Later steps use only $THRIFT.
+          cd "$RUNNER_TEMP"
           curl --fail --location --silent --show-error \
             https://archive.apache.org/dist/thrift/0.17.0/thrift-0.17.0.tar.gz \
             --output thrift-0.17.0.tar.gz

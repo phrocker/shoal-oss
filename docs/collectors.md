@@ -180,8 +180,8 @@ so it works with `GOWORK=off`) and fails when:
   nested module's `go.mod` requires or replaces an extension module, or has a
   local replace (`./`, `../`, absolute or backslash path) that does not
   resolve to the root or a nested module the check walks. That rejects
-  replaces onto `extensions/`, onto fixture modules, onto separate checkouts
-  and onto paths outside the repository. Or `go.work` has any `replace`, or a
+  replaces onto `extensions/`, onto fixture modules, onto untracked
+  directories and onto paths outside the repository. Or `go.work` has any `replace`, or a
   `use` other than
   the root, an extension module or a nested module. Nested modules are
   covered because a `require`/`replace` or a `go.work` `use` can link them,
@@ -201,7 +201,7 @@ so it works with `GOWORK=off`) and fails when:
 The scan descends into every directory, including `testdata`, `vendor` and
 names beginning with `_` or `.`. `go build ./...` skips those, but Go still
 compiles them when a package imports them by explicit path. Each module is
-walked on its own, stopping at the next module boundary. Three things are
+walked on its own, stopping at the next module boundary. Two things are
 skipped:
 
 - the repository's `.git`;
@@ -210,9 +210,14 @@ skipped:
   have their own `go.mod`. Any other Go file under that directory belongs to
   the root module, and Go builds it when it is imported by explicit path, so
   it is checked like any other code. A test asserts that every fixture
-  directory is its own module;
-- separate checkouts nested in the working tree, meaning directories with
-  their own `.git` entry, such as editor worktrees.
+  directory is its own module.
+
+The real-tree tests check what the repository contains: they read an FS of
+the files `git ls-files` lists, and fail if git is unavailable. Untracked
+content in a working tree, such as the Thrift source tarball CI unpacks or an
+editor's nested worktree, is therefore never checked, and a tracked copy of
+the same content would be. CI also unpacks Thrift under `$RUNNER_TEMP`, outside
+the checkout. Fixture tests use plain directory trees.
 
 Any symlink in a checked module or under `extensions/` is a violation. The
 walk does not follow symlinks, but the go command and `go.work` do. The

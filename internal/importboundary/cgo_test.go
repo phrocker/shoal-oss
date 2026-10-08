@@ -75,7 +75,7 @@ func TestIncludeParsing(t *testing.T) {
 
 // The real cgo user complies and is actually examined.
 func TestRepositoryCgoIsExamined(t *testing.T) {
-	root := os.DirFS("../..")
+	root := repoFS(t)
 	for _, pkg := range CgoPackages {
 		found, err := checkCgoPackage(root, pkg)
 		if err != nil || len(found) != 0 {

@@ -25,7 +25,7 @@ func check(t *testing.T, fsys fs.FS) []Violation {
 // TestRepositoryRespectsBoundary runs the rules over the real tree. It reads
 // source files directly, so it behaves the same with GOWORK=off.
 func TestRepositoryRespectsBoundary(t *testing.T) {
-	root := os.DirFS("../..")
+	root := repoFS(t)
 	for _, v := range check(t, root) {
 		t.Error(v)
 	}
