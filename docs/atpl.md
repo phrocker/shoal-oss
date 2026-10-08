@@ -211,6 +211,12 @@ followed.
 - The registry lists only active registrations. A revoked or expired agent is
   invisible to plan, which shows its ID as a create, and the registry then
   refuses it: a revoked or expired ID cannot be registered again.
+- If apply stops after the first step of a two-step write, that child keeps
+  its clamped lease, its parent's old lease, rather than its full TTL. A
+  re-plan does not compare leases, so it shows the child unchanged and does not
+  raise the lease; only a heartbeat or a later content change does. The
+  "stopped after N of M writes" error names each child left clamped and the
+  time its clamped lease ends.
 - `internal/explorerfleet`'s durable lifecycle recorder does not persist reason
   code or detail, so in a hosted deployment the policy digest reaches
   `fleet.Lifecycle` but not the durable interaction record.

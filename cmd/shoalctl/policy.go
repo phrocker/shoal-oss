@@ -241,6 +241,27 @@ func runPolicyApply(args []string, stdout, stderr io.Writer) error {
 	writes := plan.Writes()
 	fmt.Fprintf(stdout, "policy digest: %s\n", policy.Digest())
 	written := make(map[shoal.ID]int64, len(writes))
+	// stopped describes where apply stopped. A child whose first, clamped step
+	// landed but whose second did not keeps its parent's old lease, and a
+	// re-plan does not compare leases, so it shows that child unchanged:
+	// nothing raises it to its full TTL until a heartbeat or a later write.
+	stopped := func(done int) string {
+		message := fmt.Sprintf("stopped after %d of %d writes", done, len(writes))
+		finished := make(map[shoal.ID]bool)
+		for _, earlier := range writes[:done] {
+			if earlier.Steps > 1 && earlier.Step == earlier.Steps {
+				finished[earlier.ID] = true
+			}
+		}
+		for _, earlier := range writes[:done] {
+			if earlier.Steps > 1 && earlier.Step == 1 && !finished[earlier.ID] {
+				message += fmt.Sprintf("; %s holds its clamped lease until %s, not its full lease_ttl, "+
+					"and a re-plan will show it unchanged, so only a heartbeat or a later write raises it",
+					agentLabel(earlier.ID), earlier.Spec.LeaseExpiresAt.Format(time.RFC3339))
+			}
+		}
+		return message
+	}
 	for i, write := range writes {
 		entry := write.Entry
 		step := ""
@@ -261,22 +282,21 @@ func runPolicyApply(args []string, stdout, stderr io.Writer) error {
 			// was reviewed against is still what is live.
 			current, readErr := client.resolve(ctx, entry.ID)
 			if readErr != nil {
-				return fmt.Errorf("%s: %w; re-reading after it: %v; stopped after %d of %d writes",
-					agentLabel(entry.ID), err, readErr, i, len(writes))
+				return fmt.Errorf("%s%s: %w; re-reading after it: %v; %s",
+					agentLabel(entry.ID), step, err, readErr, stopped(i))
 			}
 			if atpl.ContentDigest(current) != entry.LiveContent {
-				return fmt.Errorf("%s: %w, and its live content changed since the plan; "+
-					"re-run policy plan; stopped after %d of %d writes",
-					agentLabel(entry.ID), err, i, len(writes))
+				return fmt.Errorf("%s%s: %w, and its live content changed since the plan; "+
+					"re-run policy plan; %s",
+					agentLabel(entry.ID), step, err, stopped(i))
 			}
-			fmt.Fprintf(stdout, "%s: generation moved from %d to %d with no change to its content; retrying once\n",
-				agentLabel(entry.ID), entry.LiveGeneration, current.Generation)
+			fmt.Fprintf(stdout, "%s%s: generation moved from %d to %d with no change to its content; retrying once\n",
+				agentLabel(entry.ID), step, entry.LiveGeneration, current.Generation)
 			entry.LiveGeneration = current.Generation
 			descriptor, err = client.register(ctx, policy.Digest(), entry)
 		}
 		if err != nil {
-			return fmt.Errorf("%s%s: %w; stopped after %d of %d writes",
-				agentLabel(entry.ID), step, err, i, len(writes))
+			return fmt.Errorf("%s%s: %w; %s", agentLabel(entry.ID), step, err, stopped(i))
 		}
 		written[entry.ID] = descriptor.Generation
 		fmt.Fprintf(stdout, "%s %s %s%s: generation %d\n",
@@ -756,7 +776,9 @@ func normalizeEndpoint(endpoint *url.URL) string {
 	scheme := strings.ToLower(endpoint.Scheme)
 	host := strings.ToLower(endpoint.Hostname())
 	if strings.Contains(host, ":") {
-		host = "[" + host + "]"
+		// Hostname() unescapes an IPv6 zone ("%25eth0" becomes "%eth0");
+		// re-escape it, or every request URL built on this fails to parse.
+		host = "[" + strings.ReplaceAll(host, "%", "%25") + "]"
 	}
 	if port := endpoint.Port(); port != "" &&
 		!(scheme == "https" && port == "443") && !(scheme == "http" && port == "80") {

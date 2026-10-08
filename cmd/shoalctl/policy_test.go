@@ -453,11 +453,12 @@ func TestExportGuardIgnoresGlobMetacharacters(t *testing.T) {
 
 func TestNormalizeEndpoint(t *testing.T) {
 	for input, want := range map[string]string{
-		"HTTPS://Registry.Example:443/":    "https://registry.example",
-		"https://registry.example/base/":   "https://registry.example/base",
-		"http://127.0.0.1:8080":            "http://127.0.0.1:8080",
-		"http://[::1]:80/":                 "http://[::1]",
-		"https://registry.example:8443/x/": "https://registry.example:8443/x",
+		"HTTPS://Registry.Example:443/":        "https://registry.example",
+		"https://registry.example/base/":       "https://registry.example/base",
+		"http://127.0.0.1:8080":                "http://127.0.0.1:8080",
+		"http://[::1]:80/":                     "http://[::1]",
+		"https://registry.example:8443/x/":     "https://registry.example:8443/x",
+		"https://[fe80::1%25eth0]:8443/shoal/": "https://[fe80::1%25eth0]:8443/shoal",
 	} {
 		parsed, err := url.Parse(input)
 		if err != nil {
