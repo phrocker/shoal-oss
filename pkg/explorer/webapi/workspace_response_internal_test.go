@@ -141,6 +141,10 @@ func TestWorkspaceOperationForRequestUsesRouteOperation(t *testing.T) {
 		// registered for the workspace, so the handler is never reached at all.
 		{http.MethodPost, "/api/v1/fleet/actions/action/complete", auth.OperationInvoke, true},
 		{http.MethodPost, "/api/v1/fleet/actions/action/cancel", auth.OperationDispatch, true},
+		// The ambiguity route, under the same authority as the claim and the
+		// completion it sits between. Unlisted, a workspace-scoped worker was
+		// refused before the handler ran.
+		{http.MethodPost, "/api/v1/fleet/actions/action/ambiguity", auth.OperationInvoke, true},
 		// All three admission routes, for the same reason: unlisted here, a
 		// caller sending a workspace ID is refused before the handler runs, so
 		// the whole surface is invisible to any workspace-scoped client.

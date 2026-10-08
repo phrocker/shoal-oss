@@ -359,6 +359,21 @@ func workspaceOperationForRequest(
 			path == "/api/v1/fleet/actions/pull" ||
 			(strings.HasPrefix(path, "/api/v1/fleet/actions/") &&
 				(strings.HasSuffix(path, "/claim") ||
+					// An ambiguity report is filed by the claim's holder
+					// between claiming and completing, and goes through
+					// beginClaimant, which prefers execute and falls back to
+					// invoke. So invoke is the authority a workspace-scoped
+					// holder must be bound under — the same one its claim and
+					// its completion are bound under, which is what makes the
+					// sequence usable at all.
+					//
+					// Unlisted, this route was not a 404 but a refusal: a
+					// caller sending a workspace ID was told the route is not
+					// registered before the handler ran, so the one route
+					// whose whole purpose is to let a worker report an effect
+					// it could not otherwise report was unreachable by a
+					// workspace-scoped worker.
+					strings.HasSuffix(path, "/ambiguity") ||
 					strings.HasSuffix(path, "/complete")))):
 		return auth.OperationInvoke, true
 	case method == http.MethodPost &&
